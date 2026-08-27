@@ -1,3 +1,4 @@
+// LOC-exempt: closed-format KV block reader/writer with one codec arm per persisted layout.
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
 #![allow(unsafe_code)]
 
@@ -57,16 +58,19 @@
     clippy::needless_pass_by_value
 )]
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
 use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::planarquant::PlanarBlocks;
+use rmlx_kv_quant::rotating::{RotatingStateSnapshot, RotatingTensorSnapshot};
 use rmlx_kv_quant::turboquant::TurboBlocks;
 use rmlx_mlx::{Array, Device, Dtype};
 use safetensors::tensor::{Dtype as StDtype, Metadata, View};
 use safetensors::SafeTensors;
 
+use crate::traits::ExactReplayMetadata;
 use rmlx_kv_quant::kvcache::KvCache;
 use rmlx_kv_quant::linear_attn::LinearAttnCache;
 use rmlx_kv_quant::mixed_quant::{MixedKvState, MixedTuple};
@@ -102,10 +106,30 @@ const META_KV_QUANT: &str = "kv_quant";
 const META_N_LAYERS: &str = "n_layers";
 const META_SEQ_LEN: &str = "seq_len";
 const META_N_LINEAR: &str = "n_linear";
+const META_FORMAT_VERSION: &str = "format_version";
+const META_PROMPT_IDS_TENSOR: &str = "prompt_ids_tensor";
+const META_EXACT_REPLAY_ID: &str = "exact_replay_id";
+const META_EXACT_REPLAY_PIECE: &str = "exact_replay_piece";
+const FORMAT_VERSION: &str = "2";
+
+/// Full prompt identity persisted with a format-v2 block.
+///
+/// The block hash only identifies the last complete block. This value keeps
+/// the non-block-aligned tail (and, for exact replay, the first decode token)
+/// alongside the KV state so hydrate can verify the request before promotion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockIdentity {
+    pub prompt_ids: Vec<u32>,
+    pub exact_replay: Option<ExactReplayMetadata>,
+}
 
 /// Per-layer geometry JSON key, `l{idx}.geom`.
 fn geom_key(idx: usize) -> String {
     format!("l{idx}.geom")
+}
+
+fn offset_key(idx: usize) -> String {
+    format!("l{idx}.offset")
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -190,6 +214,15 @@ impl OwnedTensor {
             bytes,
             shape: vec![v.len()],
             dtype: StDtype::F32,
+        }
+    }
+
+    fn from_u32(v: &[u32]) -> Self {
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        Self {
+            bytes,
+            shape: vec![v.len()],
+            dtype: StDtype::U32,
         }
     }
 }
@@ -313,8 +346,12 @@ pub fn write_caches(
 ) -> Result<()> {
     let layers: Vec<&KvStorage> = kv_caches.iter().map(KvCache::storage).collect();
     let none_bf16 = none_bf16_payloads(kv_caches)?;
+    let rotating: Vec<_> = kv_caches
+        .iter()
+        .map(KvCache::rotating_snapshot)
+        .collect::<Result<_>>()?;
     serialize_block_refs(
-        path, device, model_id, kv_quant, &layers, &none_bf16, lin_caches,
+        path, device, model_id, kv_quant, &layers, &none_bf16, &rotating, lin_caches,
     )
 }
 
@@ -396,10 +433,64 @@ pub(crate) fn write_caches_timed(
     kv_caches: &[KvCache],
     lin_caches: &[LinearAttnCache],
 ) -> Result<(u64, u64, u64)> {
+    let rotating: Vec<_> = kv_caches
+        .iter()
+        .map(KvCache::rotating_snapshot)
+        .collect::<Result<_>>()?;
+    write_caches_timed_with_snapshots(
+        path, device, model_id, kv_quant, kv_caches, lin_caches, &rotating,
+    )
+}
+
+/// Production spill entry point. Rotating snapshots must be captured on the
+/// inference thread; the drain thread only serializes host-owned bytes.
+pub(crate) fn write_caches_timed_with_snapshots(
+    path: &Path,
+    device: Device,
+    model_id: &str,
+    kv_quant: KvQuant,
+    kv_caches: &[KvCache],
+    lin_caches: &[LinearAttnCache],
+    rotating: &[Option<RotatingStateSnapshot>],
+) -> Result<(u64, u64, u64)> {
     let layers: Vec<&KvStorage> = kv_caches.iter().map(KvCache::storage).collect();
     let none_bf16 = none_bf16_payloads(kv_caches)?;
     serialize_block_refs_timed(
-        path, device, model_id, kv_quant, &layers, &none_bf16, lin_caches,
+        path, device, model_id, kv_quant, &layers, &none_bf16, rotating, lin_caches, None,
+    )
+}
+
+/// Timed production spill entry point carrying the full prompt identity.
+///
+/// `rotating` must have been captured on the inference owner thread. The
+/// drain thread only serializes the supplied snapshots and identity data.
+pub(crate) fn write_caches_timed_with_identity(
+    path: &Path,
+    device: Device,
+    model_id: &str,
+    kv_quant: KvQuant,
+    kv_caches: &[KvCache],
+    lin_caches: &[LinearAttnCache],
+    rotating: &[Option<RotatingStateSnapshot>],
+    prompt_ids: &[u32],
+    exact_replay: Option<&ExactReplayMetadata>,
+) -> Result<(u64, u64, u64)> {
+    let layers: Vec<&KvStorage> = kv_caches.iter().map(KvCache::storage).collect();
+    let none_bf16 = none_bf16_payloads(kv_caches)?;
+    let identity = BlockIdentity {
+        prompt_ids: prompt_ids.to_vec(),
+        exact_replay: exact_replay.cloned(),
+    };
+    serialize_block_refs_timed(
+        path,
+        device,
+        model_id,
+        kv_quant,
+        &layers,
+        &none_bf16,
+        rotating,
+        lin_caches,
+        Some(&identity),
     )
 }
 
@@ -422,7 +513,7 @@ pub(crate) fn read_caches(
     kv_quant: KvQuant,
     policy: DispatchPolicy,
 ) -> Result<(Vec<KvCache>, Vec<LinearAttnCache>)> {
-    let (kv_caches, lin_caches, _, _, _, _) =
+    let (kv_caches, lin_caches, _, _, _, _, _) =
         read_caches_inner(path, device, model_id, kv_quant, policy)?
             .ok_or_else(|| Error::Mlx(format!("KV block read: {} not found", path.display())))?;
     Ok((kv_caches, lin_caches))
@@ -431,6 +522,19 @@ pub(crate) fn read_caches(
 /// Reconstructed caches plus the hydrate phase timings:
 /// `(kv_caches, lin_caches, bytes_read, dur_read_us, dur_dequant_us, dur_finalize_us)`.
 type TimedCaches = (Vec<KvCache>, Vec<LinearAttnCache>, u64, u64, u64, u64);
+
+/// Timed hydrate result including the v2 prompt identity carried by the
+/// record. [`read_caches_timed`] intentionally drops the identity for callers
+/// that only need reconstructed caches.
+pub(crate) type TimedCachesWithIdentity = (
+    Vec<KvCache>,
+    Vec<LinearAttnCache>,
+    Option<BlockIdentity>,
+    u64,
+    u64,
+    u64,
+    u64,
+);
 
 /// Timed variant of [`read_caches`] for SSD-tier hydrate observability.
 ///
@@ -454,6 +558,23 @@ pub(crate) fn read_caches_timed(
     kv_quant: KvQuant,
     policy: DispatchPolicy,
 ) -> Result<Option<TimedCaches>> {
+    Ok(
+        read_caches_inner(path, device, model_id, kv_quant, policy)?.map(
+            |(kv_caches, lin_caches, _identity, bytes, read, dequant, finalize)| {
+                (kv_caches, lin_caches, bytes, read, dequant, finalize)
+            },
+        ),
+    )
+}
+
+/// Timed hydrate variant that also returns the persisted v2 prompt identity.
+pub(crate) fn read_caches_timed_with_identity(
+    path: &Path,
+    device: Device,
+    model_id: &str,
+    kv_quant: KvQuant,
+    policy: DispatchPolicy,
+) -> Result<Option<TimedCachesWithIdentity>> {
     read_caches_inner(path, device, model_id, kv_quant, policy)
 }
 
@@ -468,7 +589,7 @@ fn read_caches_inner(
     model_id: &str,
     kv_quant: KvQuant,
     policy: DispatchPolicy,
-) -> Result<Option<TimedCaches>> {
+) -> Result<Option<TimedCachesWithIdentity>> {
     use std::time::Instant;
 
     let bytes_read = std::fs::metadata(path).map_or(0, |m| m.len());
@@ -481,7 +602,15 @@ fn read_caches_inner(
 
     let t_dequant = Instant::now();
     let (storages, none_bf16, lin_caches) = reader.hydrate(model_id, kv_quant, device)?;
-    let offset = reader.seq_len()?;
+    let rotating = reader.rotating_snapshots()?;
+    let identity = reader.block_identity()?;
+    if rotating.iter().any(Option::is_some) && identity.is_none() {
+        return Err(BlockIoError::Header(
+            "format-v2 rotating payload is missing full prompt identity".into(),
+        )
+        .into());
+    }
+    let layer_offsets = reader.layer_offsets(storages.len())?;
     let dur_dequant_us = t_dequant.elapsed().as_micros() as u64;
 
     let t_finalize = Instant::now();
@@ -489,23 +618,43 @@ fn read_caches_inner(
     // layer-ordered at spill — see `write_caches` contract. A `None`-storage
     // layer that carried an off-storage bf16 prefix re-seeds the decode buffers
     // so an exact-hit replay reads the real K/V instead of zeros.
+    if rotating.len() != storages.len() {
+        return Err(BlockIoError::Header("rotating layer count mismatch".into()).into());
+    }
     let kv_caches: Vec<KvCache> = storages
         .into_iter()
         .zip(none_bf16)
+        .zip(rotating)
+        .zip(layer_offsets)
         .enumerate()
-        .map(|(layer_idx, (s, bf16))| {
-            let cache = KvCache::from_storage(s, kv_quant, offset, layer_idx, policy);
-            match bf16 {
-                Some((k, v)) => cache.with_decode_fp16_seed(k, v),
-                None => cache,
-            }
-        })
-        .collect();
+        .map(
+            |(layer_idx, (((s, bf16), rotating), layer_offset))| -> Result<KvCache> {
+                let mut cache = match rotating {
+                    Some(ref snapshot) => KvCache::with_quant_max_seq_window(
+                        kv_quant,
+                        snapshot.max_size,
+                        Some(snapshot.max_size),
+                    )
+                    .with_layer_idx(layer_idx)
+                    .with_dispatch_policy(policy),
+                    None => KvCache::from_storage(s, kv_quant, layer_offset, layer_idx, policy),
+                };
+                if let Some(snapshot) = rotating.as_ref() {
+                    cache.restore_rotating_snapshot(snapshot, device)?;
+                }
+                match bf16 {
+                    Some((k, v)) => Ok(cache.with_decode_fp16_seed(k, v)),
+                    None => Ok(cache),
+                }
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
     let dur_finalize_us = t_finalize.elapsed().as_micros() as u64;
 
     Ok(Some((
         kv_caches,
         lin_caches,
+        identity,
         bytes_read,
         dur_read_us,
         dur_dequant_us,
@@ -525,7 +674,7 @@ fn serialize_block(
     let refs: Vec<&KvStorage> = layers.iter().collect();
     // Storage-only callers (the `KvBlockWriter` struct path used by tests)
     // carry no off-storage bf16 — None layers serialize geometry-only.
-    serialize_block_refs(path, device, model_id, kv_quant, &refs, &[], linear)
+    serialize_block_refs(path, device, model_id, kv_quant, &refs, &[], &[], linear)
 }
 
 /// Shared serialization core over a slice of storage references.
@@ -540,10 +689,13 @@ fn serialize_block_refs(
     kv_quant: KvQuant,
     layers: &[&KvStorage],
     none_bf16: &[NoneBf16Seed],
+    rotating: &[Option<RotatingStateSnapshot>],
     linear: &[LinearAttnCache],
 ) -> Result<()> {
-    serialize_block_refs_timed(path, device, model_id, kv_quant, layers, none_bf16, linear)
-        .map(|_| ())
+    serialize_block_refs_timed(
+        path, device, model_id, kv_quant, layers, none_bf16, rotating, linear, None,
+    )
+    .map(|_| ())
 }
 
 /// Timed serialization core — splits the work into a tensor-build phase
@@ -557,7 +709,9 @@ fn serialize_block_refs_timed(
     kv_quant: KvQuant,
     layers: &[&KvStorage],
     none_bf16: &[NoneBf16Seed],
+    rotating: &[Option<RotatingStateSnapshot>],
     linear: &[LinearAttnCache],
+    identity: Option<&BlockIdentity>,
 ) -> Result<(u64, u64, u64)> {
     use std::time::Instant;
 
@@ -569,13 +723,55 @@ fn serialize_block_refs_timed(
     meta.insert(META_MODEL_ID.into(), model_id.to_string());
     meta.insert(META_KV_QUANT.into(), kv_quant.to_string());
     meta.insert(META_N_LAYERS.into(), layers.len().to_string());
+    meta.insert(META_FORMAT_VERSION.into(), FORMAT_VERSION.into());
+
+    if let Some(identity) = identity {
+        if rotating.iter().any(Option::is_some) && identity.prompt_ids.is_empty() {
+            return Err(BlockIoError::Header(
+                "rotating format-v2 payload requires non-empty prompt identity".into(),
+            )
+            .into());
+        }
+        meta.insert(META_PROMPT_IDS_TENSOR.into(), "__prompt_ids".into());
+        tensors.push((
+            "__prompt_ids".into(),
+            OwnedTensor::from_u32(&identity.prompt_ids),
+        ));
+        if let Some(replay) = &identity.exact_replay {
+            meta.insert(META_EXACT_REPLAY_ID.into(), replay.id.to_string());
+            meta.insert(META_EXACT_REPLAY_PIECE.into(), replay.piece.clone());
+        }
+    }
 
     let mut max_seq_len = 0i32;
+    let mut rotating_seq_len: Option<i32> = None;
     for (idx, storage) in layers.iter().enumerate() {
         let bf16 = none_bf16.get(idx).and_then(Option::as_ref);
-        let (geom, seq) = write_layer(idx, storage, bf16, device, &mut tensors)?;
+        let ring = rotating.get(idx).and_then(Option::as_ref);
+        if let Some(ring) = ring.filter(|ring| ring.offset > 0) {
+            if let Some(previous) = rotating_seq_len {
+                if previous != ring.offset {
+                    return Err(BlockIoError::Header(
+                        "rotating layers have inconsistent absolute offsets".into(),
+                    )
+                    .into());
+                }
+            } else {
+                rotating_seq_len = Some(ring.offset);
+            }
+        }
+        let (geom, seq) = write_layer(idx, storage, bf16, ring, device, &mut tensors)?;
         meta.insert(geom_key(idx), geom);
+        meta.insert(offset_key(idx), seq.to_string());
         max_seq_len = max_seq_len.max(seq);
+    }
+    if let Some(ring_offset) = rotating_seq_len {
+        if max_seq_len != ring_offset {
+            return Err(BlockIoError::Header(
+                "rotating snapshot offset does not match block seq_len".into(),
+            )
+            .into());
+        }
     }
     meta.insert(META_SEQ_LEN.into(), max_seq_len.to_string());
 
@@ -617,9 +813,67 @@ fn write_layer(
     idx: usize,
     storage: &KvStorage,
     none_bf16: Option<&(Array, Array)>,
+    rotating: Option<&RotatingStateSnapshot>,
     device: Device,
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<(String, i32)> {
+    if let Some(ring) = rotating {
+        if ring.offset < 0 || ring.max_size <= 0 || ring.valid_len != ring.offset.min(ring.max_size)
+        {
+            return Err(
+                BlockIoError::Header(format!("invalid rotating snapshot for layer {idx}")).into(),
+            );
+        }
+        let Some(keys) = ring.keys.as_ref() else {
+            if ring.values.is_some() {
+                return Err(
+                    BlockIoError::Header(format!("rotating layer {idx} has V without K")).into(),
+                );
+            }
+            return Ok((
+                format!(
+                    "{{\"tag\":\"rotating\",\"max_seq\":{},\"offset\":{},\"keep\":{},\"idx\":{},\"valid_len\":{},\"dtype\":\"bf16\"}}",
+                    ring.max_size, ring.offset, ring.keep, ring.idx, ring.valid_len
+                ),
+                ring.offset,
+            ));
+        };
+        let Some(values) = ring.values.as_ref() else {
+            return Err(
+                BlockIoError::Header(format!("rotating layer {idx} has K without V")).into(),
+            );
+        };
+        out.push((
+            format!("l{idx}.rotating.k"),
+            OwnedTensor::from_u8(&keys.bytes),
+        ));
+        out.push((
+            format!("l{idx}.rotating.v"),
+            OwnedTensor::from_u8(&values.bytes),
+        ));
+        let dtype = |d: Dtype| match d {
+            Dtype::Bf16 => "bf16",
+            Dtype::F16 => "f16",
+            Dtype::F32 => "f32",
+            Dtype::U8 => "u8",
+            Dtype::U32 => "u32",
+            Dtype::I32 => "i32",
+        };
+        return Ok((
+            format!(
+                "{{\"tag\":\"rotating\",\"max_seq\":{},\"offset\":{},\"keep\":{},\"idx\":{},\"valid_len\":{},\"k_shape\":[{}],\"v_shape\":[{}],\"dtype\":\"{}\"}}",
+                ring.max_size,
+                ring.offset,
+                ring.keep,
+                ring.idx,
+                ring.valid_len,
+                csv(&keys.shape),
+                csv(&values.shape),
+                dtype(keys.dtype)
+            ),
+            ring.offset,
+        ));
+    }
     // A layer with no packed payload has only its geometry to persist. Three
     // cases arrive here and the treatment is the same for all of them: a
     // rotating SWA layer (its KV lives in the bf16 ring, which is not
@@ -1948,6 +2202,221 @@ impl KvBlockReader {
         read_meta(&self.header()?, META_KV_QUANT)
     }
 
+    /// Return the supported on-disk format version. Missing, older, and future
+    /// versions are rejected rather than guessed at: a cache must miss and be
+    /// recomputed, never hydrated under an incompatible wire contract.
+    fn format_version(header: &Metadata) -> Result<u32> {
+        let Some(raw) = header
+            .metadata()
+            .as_ref()
+            .and_then(|m| m.get(META_FORMAT_VERSION))
+        else {
+            return Err(BlockIoError::Header("missing format_version".into()).into());
+        };
+        let version = raw
+            .parse::<u32>()
+            .map_err(|e| BlockIoError::Header(format!("bad format_version: {e}")))?;
+        match version {
+            2 => Ok(version),
+            _ => Err(BlockIoError::Header(format!("unsupported format_version {version}")).into()),
+        }
+    }
+
+    /// Read the full prompt identity embedded in a v2 record.
+    ///
+    /// A v2 record may omit identity for storage-only/test callers, but the
+    /// production hydrate bridge requires it before promotion.
+    fn block_identity(&self) -> Result<Option<BlockIdentity>> {
+        let header = self.header()?;
+        Self::format_version(&header)?;
+        let Some(tensor_name) = header
+            .metadata()
+            .as_ref()
+            .and_then(|m| m.get(META_PROMPT_IDS_TENSOR))
+        else {
+            if header.metadata().as_ref().is_some_and(|m| {
+                m.contains_key(META_EXACT_REPLAY_ID) || m.contains_key(META_EXACT_REPLAY_PIECE)
+            }) {
+                return Err(BlockIoError::Header(
+                    "exact replay metadata without prompt identity tensor".into(),
+                )
+                .into());
+            }
+            return Ok(None);
+        };
+        if tensor_name != "__prompt_ids" {
+            return Err(
+                BlockIoError::Header("invalid prompt identity tensor marker".into()).into(),
+            );
+        }
+        let st = self.parse()?;
+        let tensor = tensor_req(&st, tensor_name)?;
+        let view = st
+            .tensor(tensor_name)
+            .map_err(|e| Error::Mlx(format!("KV block identity tensor: {e}")))?;
+        if view.dtype() != StDtype::U32 || view.shape().len() != 1 {
+            return Err(
+                BlockIoError::Header("prompt identity tensor must be rank-1 U32".into()).into(),
+            );
+        }
+        let bytes = view.data();
+        if bytes.len() % size_of::<u32>() != 0 {
+            return Err(
+                BlockIoError::Header("prompt identity tensor has a partial U32".into()).into(),
+            );
+        }
+        let prompt_ids = bytes
+            .chunks_exact(size_of::<u32>())
+            .map(|chunk| {
+                let bytes: [u8; size_of::<u32>()] = chunk.try_into().map_err(|_| {
+                    BlockIoError::Header("prompt identity tensor has a partial U32".into())
+                })?;
+                Ok(u32::from_le_bytes(bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let shape_len =
+            view.shape().first().copied().ok_or_else(|| {
+                BlockIoError::Header("prompt identity tensor has no shape".into())
+            })?;
+        if prompt_ids.len() != shape_len {
+            return Err(BlockIoError::Header(
+                "prompt identity tensor shape does not match payload".into(),
+            )
+            .into());
+        }
+        // Keep `tensor` above as a required-tensor validation. The view is
+        // borrowed from the same parsed file and the conversion intentionally
+        // remains host-only.
+        let _ = tensor;
+        let metadata = header.metadata().as_ref();
+        let replay_id = metadata.and_then(|m| m.get(META_EXACT_REPLAY_ID));
+        let replay_piece = metadata.and_then(|m| m.get(META_EXACT_REPLAY_PIECE));
+        let exact_replay = match (replay_id, replay_piece) {
+            (None, None) => None,
+            (Some(id), Some(piece)) => Some(ExactReplayMetadata {
+                id: id
+                    .parse()
+                    .map_err(|e| BlockIoError::Header(format!("bad exact replay id: {e}")))?,
+                piece: piece.clone(),
+            }),
+            _ => {
+                return Err(BlockIoError::Header(
+                    "exact replay id and piece must be present together".into(),
+                )
+                .into())
+            }
+        };
+        Ok(Some(BlockIdentity {
+            prompt_ids,
+            exact_replay,
+        }))
+    }
+
+    /// Read restart-safe rotating-ring snapshots, if present.
+    fn rotating_snapshots(&self) -> Result<Vec<Option<RotatingStateSnapshot>>> {
+        let header = self.header()?;
+        let st = self.parse()?;
+        let n: usize = read_meta(&header, META_N_LAYERS)?
+            .parse()
+            .map_err(|e| BlockIoError::Header(format!("bad n_layers: {e}")))?;
+        Self::format_version(&header)?;
+        let mut out = Vec::with_capacity(n);
+        for idx in 0..n {
+            let geom = read_meta(&header, &geom_key(idx))?;
+            if geom_tag(&geom) != "rotating" {
+                out.push(None);
+                continue;
+            }
+            let shape = |side: &str| -> Result<Vec<i32>> {
+                let key = format!("{side}_shape");
+                let prefix = format!("\"{key}\":[");
+                let start = geom
+                    .find(&prefix)
+                    .ok_or_else(|| BlockIoError::Header(format!("rotating geom missing {key}")))?
+                    + prefix.len();
+                let rest = &geom[start..];
+                let end = rest
+                    .find(']')
+                    .ok_or_else(|| BlockIoError::Header("rotating shape unterminated".into()))?;
+                rest[..end]
+                    .split(',')
+                    .map(|s| {
+                        s.parse().map_err(|e| {
+                            Error::from(BlockIoError::Header(format!("bad rotating shape: {e}")))
+                        })
+                    })
+                    .collect::<Result<Vec<i32>>>()
+            };
+            let dtype = match geom_field(&geom, "dtype") {
+                Some("bf16") => Dtype::Bf16,
+                Some("f16") => Dtype::F16,
+                Some("f32") => Dtype::F32,
+                Some("u8") => Dtype::U8,
+                Some("u32") => Dtype::U32,
+                Some("i32") => Dtype::I32,
+                _ => return Err(BlockIoError::Header("bad rotating dtype".into()).into()),
+            };
+            let offset = geom_i32(&geom, "offset")?;
+            let key_name = format!("l{idx}.rotating.k");
+            let value_name = format!("l{idx}.rotating.v");
+            let has_keys = st.tensor(&key_name).is_ok();
+            let has_values = st.tensor(&value_name).is_ok();
+            if !has_keys && !has_values {
+                if offset != 0 {
+                    return Err(BlockIoError::Header(
+                        "non-empty rotating payload is missing K/V tensors".into(),
+                    )
+                    .into());
+                }
+                out.push(Some(RotatingStateSnapshot {
+                    keys: None,
+                    values: None,
+                    offset,
+                    max_size: geom_i32(&geom, "max_seq")?,
+                    keep: geom_i32(&geom, "keep")?,
+                    valid_len: geom_i32(&geom, "valid_len")?,
+                    idx: geom_i32(&geom, "idx")?,
+                }));
+                continue;
+            }
+            if has_keys != has_values {
+                return Err(BlockIoError::Header(
+                    "rotating payload must contain both K and V tensors".into(),
+                )
+                .into());
+            }
+            let tensor = |name: String, shape: Vec<i32>| -> Result<RotatingTensorSnapshot> {
+                let t = tensor_req(&st, &name)?;
+                let bytes = t.to_bytes()?;
+                let expected: usize =
+                    shape.iter().map(|&x| x.max(0) as usize).product::<usize>() * dtype.itemsize();
+                if bytes.len() != expected {
+                    return Err(BlockIoError::Header(format!(
+                        "rotating tensor {name} byte length mismatch"
+                    ))
+                    .into());
+                }
+                Ok(RotatingTensorSnapshot {
+                    bytes,
+                    shape,
+                    dtype,
+                })
+            };
+            let keys = tensor(format!("l{idx}.rotating.k"), shape("k")?)?;
+            let values = tensor(format!("l{idx}.rotating.v"), shape("v")?)?;
+            out.push(Some(RotatingStateSnapshot {
+                keys: Some(keys),
+                values: Some(values),
+                offset,
+                max_size: geom_i32(&geom, "max_seq")?,
+                keep: geom_i32(&geom, "keep")?,
+                valid_len: geom_i32(&geom, "valid_len")?,
+                idx: geom_i32(&geom, "idx")?,
+            }));
+        }
+        Ok(out)
+    }
+
     /// Read the recorded filled sequence length (`seq_len` header) — the number
     /// of prompt tokens this block was spilled at. Used by the hydrate
     /// path to set each reconstructed `KvCache`'s `offset`.
@@ -1955,6 +2424,35 @@ impl KvBlockReader {
         read_meta(&self.header()?, META_SEQ_LEN)?
             .parse()
             .map_err(|e| BlockIoError::Header(format!("bad seq_len: {e}")).into())
+    }
+
+    /// Read exact per-layer offsets for v2 records. Shared-KV consumer layers
+    /// are intentionally empty (`0`) while their producer carries the full
+    /// prompt offset; flattening both to the block maximum changes the cache
+    /// topology.
+    fn layer_offsets(&self, n_layers: usize) -> Result<Vec<i32>> {
+        let header = self.header()?;
+        Self::format_version(&header)?;
+        let metadata = header
+            .metadata()
+            .as_ref()
+            .ok_or_else(|| BlockIoError::Header("missing metadata".into()))?;
+        (0..n_layers)
+            .map(|idx| {
+                metadata
+                    .get(&offset_key(idx))
+                    .ok_or_else(|| {
+                        Error::from(BlockIoError::Header(format!(
+                            "missing per-layer offset for layer {idx}"
+                        )))
+                    })?
+                    .parse::<i32>()
+                    .map_err(|e| {
+                        BlockIoError::Header(format!("bad per-layer offset for layer {idx}: {e}"))
+                            .into()
+                    })
+            })
+            .collect()
     }
 
     fn parse(&self) -> Result<SafeTensors<'_>> {
@@ -1982,6 +2480,7 @@ impl KvBlockReader {
     ) -> Result<HydratedLayers> {
         let header = self.header()?;
         let st = self.parse()?;
+        Self::format_version(&header)?;
 
         let found_model = read_meta(&header, META_MODEL_ID)?;
         if found_model != expected_model_id {
@@ -2123,6 +2622,11 @@ fn geom_shape(geom: &str) -> Result<Vec<i32>> {
 )]
 fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> Result<KvStorage> {
     match geom_tag(geom) {
+        // The physical K/V for this layer is restored separately through
+        // `rotating_snapshots`; the storage slot remains geometry-only.
+        "rotating" => Ok(KvStorage::None {
+            max_seq: geom_i32(geom, "max_seq")?,
+        }),
         "k8v4" => {
             let max_seq = geom_i32(geom, "max_seq")?;
             let shape = geom_shape(geom)?;
@@ -3172,6 +3676,10 @@ fn read_quant_rotor_k4(
         0,
     ))
 }
+
+#[cfg(test)]
+#[path = "block_io_identity_codec_tests.rs"]
+mod identity_codec_tests;
 
 #[cfg(test)]
 #[path = "block_io_tests.rs"]

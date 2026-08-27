@@ -2,7 +2,7 @@ use super::*;
 use crate::kv_cache::kv_layer_quants;
 use rmlx_core::error::Result;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::chained_block_hashes;
+use rmlx_kv_ssd::{chained_block_hashes, ExactReplayMetadata};
 use rmlx_mlx::{Array, Device};
 
 // ── chained_block_hashes_seeded ────────────────────────────────────
@@ -75,6 +75,7 @@ struct TestEntry {
     kv_quant: Option<KvQuant>,
     hydrate_complete: bool,
     reuse_kind: Option<ReuseKind>,
+    exact_replay: Option<ExactReplayMetadata>,
 }
 
 impl TestEntry {
@@ -88,6 +89,7 @@ impl TestEntry {
             kv_quant: None,
             hydrate_complete: true,
             reuse_kind: None,
+            exact_replay: None,
         }
     }
 
@@ -105,6 +107,7 @@ impl TestEntry {
             kv_quant: None,
             hydrate_complete: true,
             reuse_kind: None,
+            exact_replay: None,
         }
     }
 
@@ -129,6 +132,7 @@ impl TestEntry {
             kv_quant: Some(kv_quant),
             hydrate_complete: true,
             reuse_kind: None,
+            exact_replay: None,
         }
     }
 
@@ -169,6 +173,7 @@ impl PromptCacheEntry for TestEntry {
             kv_quant: self.kv_quant,
             hydrate_complete: self.hydrate_complete,
             reuse_kind: self.reuse_kind,
+            exact_replay: self.exact_replay.clone(),
         })
     }
 
@@ -187,6 +192,10 @@ impl PromptCacheEntry for TestEntry {
 
     fn kv_quant(&self) -> Option<KvQuant> {
         self.kv_quant
+    }
+
+    fn exact_replay(&self) -> Option<&ExactReplayMetadata> {
+        self.exact_replay.as_ref()
     }
 
     fn is_ssd_hydrated(&self) -> bool {
@@ -1181,15 +1190,180 @@ impl SsdHydrate<TestEntry> for MockSource {
     }
 }
 
-/// (a)+(c): a RAM miss followed by `hydrate_from_ssd` promotes the
-/// SSD entry into RAM, bumps `ssd_hits`, and a subsequent `find_best_prefix`
-/// now serves it.
+/// Source fixture for exercising the full consume path. The production
+/// Gemma4 hydrator can return an entry that is admitted to RAM but incomplete.
+struct AccountingSource {
+    ids: Vec<u32>,
+    hydrate_complete: bool,
+}
+
+impl SsdHydrate<TestEntry> for AccountingSource {
+    fn hydrate(
+        &self,
+        prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
+        _policy: DispatchPolicy,
+    ) -> Result<Option<TestEntry>> {
+        if prompt_ids.len() < 2 * BLOCK_TOKENS || self.ids.len() < BLOCK_TOKENS {
+            return Ok(None);
+        }
+        Ok(Some(TestEntry {
+            ids: self.ids.clone(),
+            hashes: chained_block_hashes_seeded(&self.ids, seed),
+            truncated_to: std::cell::Cell::new(None),
+            is_ssd_hydrated: true,
+            kv_quant: Some(kv_quant),
+            hydrate_complete: self.hydrate_complete,
+            reuse_kind: Some(ReuseKind::StrictPrefix {
+                prefix_len: self.ids.len(),
+            }),
+            exact_replay: None,
+        }))
+    }
+}
+
+fn accounting_arch(source: AccountingSource) -> ArchPromptCache<TestEntry> {
+    accounting_arch_with_source(Box::new(source))
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "cache is installed immediately before access"
+)]
+fn accounting_arch_with_source(
+    source: Box<dyn SsdHydrate<TestEntry>>,
+) -> ArchPromptCache<TestEntry> {
+    let arch = ArchPromptCache::new("ssd-accounting", ReusePolicy::Partial);
+    arch.with_inner_mut(|guard| {
+        *guard = Some(PromptCache::new(4));
+        guard
+            .as_mut()
+            .expect("cache installed above")
+            .set_ssd_source(source);
+    });
+    arch
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "cache is installed by the test fixture")]
+fn ssd_hydrate_complete_reuse_counts_as_hit() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    let arch = accounting_arch(AccountingSource {
+        ids: make_ids(BLOCK_TOKENS),
+        hydrate_complete: true,
+    });
+
+    let consumed = arch.consume(&prompt, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
+    assert!(matches!(consumed, Consumed::Reuse { .. }));
+    let stats = arch.read_cache_stats().expect("cache installed above");
+    assert_eq!(stats.ssd_hits, 1, "reused complete hydrate is an SSD hit");
+    assert_eq!(stats.misses, 1, "the initial RAM lookup was a miss");
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "cache is installed by the test fixture")]
+fn ssd_hydrate_incomplete_is_not_counted_as_hit() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    let arch = accounting_arch(AccountingSource {
+        ids: make_ids(BLOCK_TOKENS),
+        hydrate_complete: false,
+    });
+
+    let consumed = arch.consume(&prompt, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
+    assert!(matches!(consumed, Consumed::Miss));
+    let stats = arch.read_cache_stats().expect("cache installed above");
+    assert_eq!(
+        stats.ssd_hits, 0,
+        "incomplete hydrate must not be an SSD hit"
+    );
+    assert_eq!(stats.misses, 1, "the request falls through to prefill");
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "cache is installed by the test fixture")]
+fn ssd_hydrate_source_miss_counts_only_miss() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    let arch = accounting_arch(AccountingSource {
+        ids: make_ids(BLOCK_TOKENS - 1),
+        hydrate_complete: true,
+    });
+
+    let consumed = arch.consume(&prompt, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
+    assert!(matches!(consumed, Consumed::Miss));
+    let stats = arch.read_cache_stats().expect("cache installed above");
+    assert_eq!(stats.ssd_hits, 0);
+    assert_eq!(stats.misses, 1, "a source miss remains an ordinary miss");
+}
+
+struct ExactReplaySource {
+    ids: Vec<u32>,
+    replay: Option<ExactReplayMetadata>,
+}
+
+impl SsdHydrate<TestEntry> for ExactReplaySource {
+    fn hydrate(
+        &self,
+        _prompt_ids: &[u32],
+        seed: u64,
+        kv_quant: KvQuant,
+        _policy: DispatchPolicy,
+    ) -> Result<Option<TestEntry>> {
+        Ok(Some(TestEntry {
+            ids: self.ids.clone(),
+            hashes: chained_block_hashes_seeded(&self.ids, seed),
+            truncated_to: std::cell::Cell::new(None),
+            is_ssd_hydrated: true,
+            kv_quant: Some(kv_quant),
+            hydrate_complete: true,
+            reuse_kind: None,
+            exact_replay: self.replay.clone(),
+        }))
+    }
+}
+
+#[test]
+#[allow(clippy::unwrap_used, reason = "cache is installed by the test fixture")]
+fn ssd_hydrate_exact_with_replay_is_exact_and_counted() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    let arch = accounting_arch_with_source(Box::new(ExactReplaySource {
+        ids: prompt.clone(),
+        replay: Some(ExactReplayMetadata {
+            id: 42,
+            piece: "answer".to_string(),
+        }),
+    }));
+
+    let consumed = arch.consume(&prompt, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
+    assert!(matches!(consumed, Consumed::Exact(_)));
+    assert_eq!(arch.read_cache_stats().unwrap().ssd_hits, 1);
+}
+
+#[test]
+#[allow(clippy::unwrap_used, reason = "cache is installed by the test fixture")]
+fn ssd_hydrate_exact_without_replay_fails_closed() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+    let arch = accounting_arch_with_source(Box::new(ExactReplaySource {
+        ids: prompt.clone(),
+        replay: None,
+    }));
+
+    let consumed = arch.consume(&prompt, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
+    assert!(matches!(consumed, Consumed::Miss));
+    let stats = arch.read_cache_stats().unwrap();
+    assert_eq!(stats.ssd_hits, 0);
+    assert_eq!(stats.misses, 1);
+}
+
+/// A RAM miss followed by `hydrate_from_ssd` promotes the SSD entry into RAM.
+/// Hydrate I/O alone is not an SSD hit: the counter is bumped by `consume`
+/// only after the promoted entry is actually reused.
 #[test]
 #[allow(
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-fn ssd_hydrate_populates_ram_and_bumps_counter() {
+fn ssd_hydrate_populates_ram_without_counting_io() {
     let prompt: Vec<u32> = make_ids(2 * BLOCK_TOKENS);
     let mut cache: PromptCache<TestEntry> = PromptCache::new(4);
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1205,10 +1379,14 @@ fn ssd_hydrate_populates_ram_and_bumps_counter() {
     );
     assert_eq!(cache.stats().ssd_hits, 0);
 
-    // Hydrate from SSD → promoted into RAM, counter bumped.
+    // Hydrate from SSD → promoted into RAM, but not yet reused.
     let slot = cache.hydrate_from_ssd(&prompt, FNV_OFFSET, TEST_QUANT, DispatchPolicy::default());
     assert!(slot.is_some(), "SSD hit must populate a RAM slot");
-    assert_eq!(cache.stats().ssd_hits, 1, "ssd_hits must increment on hit");
+    assert_eq!(
+        cache.stats().ssd_hits,
+        0,
+        "hydrate I/O is not a served SSD hit"
+    );
     assert_eq!(cache.slots.len(), 1, "one slot now populated");
 
     // The hydrated entry is now served by find_best_prefix.
@@ -1626,8 +1804,8 @@ fn codec_partitioned_key_blocks_cross_codec_serve() {
 // build the promoted entry's `block_hashes` from *that value*. Any source that
 // instead seeds from something it remembered — a codec or a model identity it
 // captured when it was installed — returns an entry `find_best_prefix` cannot
-// match. The block was read off disk, `ssd_hits` was incremented, an LRU slot
-// was evicted to make room, and the request re-prefills anyway. Nothing errors.
+// match. The block was read off disk, an LRU slot was evicted to make room,
+// and the request re-prefills anyway. Nothing errors.
 //
 // The source is installed once per architecture and outlives the model that
 // installed it, so "something it remembered" is not hypothetical: it is
@@ -1656,6 +1834,7 @@ impl SsdHydrate<TestEntry> for MockHydrateFromSeed {
             kv_quant: None,
             hydrate_complete: true,
             reuse_kind: None,
+            exact_replay: None,
         }))
     }
 }
@@ -1685,6 +1864,7 @@ impl SsdHydrate<TestEntry> for MockHydrateSelfSeeded {
             kv_quant: None,
             hydrate_complete: true,
             reuse_kind: None,
+            exact_replay: None,
         }))
     }
 }
@@ -1819,6 +1999,7 @@ impl SsdHydrate<TestEntry> for SeedKeyedStore {
             reuse_kind: Some(ReuseKind::StrictPrefix {
                 prefix_len: ids.len(),
             }),
+            exact_replay: None,
         }))
     }
 }

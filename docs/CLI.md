@@ -22,6 +22,7 @@ Subcommands:
 | `bench` | Repeated-run decode instrument: TTFT, ITL p50/p99, decode TPS, KV bytes with run-to-run spread; prints only |
 | `healthcheck` | Shell-able readiness probe; JSON or plain text output |
 | `metrics` | Metrics database management (schema, query, export) |
+| `daemon` | Local-only admin daemon for status, lifecycle, and menu-bar clients |
 | `eval ppl` | Offline perplexity evaluation over a text corpus |
 | `profile list` | List named `serve` launch profiles |
 
@@ -65,6 +66,59 @@ captured.
 ---
 
 ## Subcommands
+
+### `daemon`
+
+Starts the local admin daemon used by menu-bar and operator tooling. The daemon
+does not load MLX, does not hold the Metal claim, and does not proxy generation
+traffic. It supervises a daemon-owned `rmlx serve` child, reports normalized
+status, and proxies model load/unload actions to the local server.
+
+```bash
+rmlx daemon
+rmlx daemon --config "$RMLX_HOME/daemon.toml"
+rmlx daemon --serve-profile menu-default
+```
+
+The admin API is localhost-only:
+
+```http
+GET  /health
+GET  /admin/status
+POST /admin/server/start
+POST /admin/server/stop
+POST /admin/server/restart
+POST /admin/models/{id}/load
+POST /admin/models/{id}/unload
+```
+
+Config loads from `<RMLX_HOME>/daemon.toml` when present. An omitted default
+file is allowed; an explicit missing `--config` path is an error. CLI flags
+override the config file. Supported config shape:
+
+```toml
+[daemon]
+profile = "menu-default"
+admin_host = "127.0.0.1"
+admin_port = 6276
+server_host = "127.0.0.1"
+server_port = 8080
+```
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--config` | path | `<RMLX_HOME>/daemon.toml` | Optional daemon TOML. Explicit missing paths fail. |
+| `--admin-host` | string | `127.0.0.1` | Admin API bind host. Must be `localhost`, `::1`, or `127.*`. |
+| `--admin-port` | u16 | `6276` | Admin API port. `0` is rejected. |
+| `--server-host` | string | profile host or `127.0.0.1` | Local `rmlx serve` host to administer. Must be loopback. |
+| `--server-port` | u16 | profile port or `8080` | Local `rmlx serve` port to administer. `0` is rejected. |
+| `--serve-profile` | string | config `profile` | Named `rmlx serve --profile` to use on start/restart. |
+
+When `--serve-profile` / `profile` is set, the daemon resolves the profile from
+`<RMLX_HOME>/profiles.toml` and uses the profile host/port for status polling
+unless daemon config or CLI explicitly supplies server host/port overrides.
+`POST /admin/server/stop` only stops daemon-supervised children; it refuses to
+kill an external process or remove a live claim file.
 
 ### `serve`
 

@@ -204,6 +204,10 @@ fn arch_string_mapping() {
         Some(ToolCallFormat::Qwen3XmlFunction)
     );
     assert_eq!(
+        arch_to_tool_call_format("MapleForCausalLM"),
+        Some(ToolCallFormat::Qwen3XmlFunction)
+    );
+    assert_eq!(
         arch_to_tool_call_format("Gemma4ForConditionalGeneration"),
         None
     );

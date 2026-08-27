@@ -24,6 +24,7 @@ pub const KNOWN_ARCHS: &[&str] = &[
     "Qwen3_5ForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
     "BitNetForCausalLM",
+    "MapleForCausalLM",
     // jina-embeddings-v4 is an encoder, NOT a causal LM. It is accepted
     // by the registry/loader gate so the server can route it to the
     // `/v1/embeddings` embedding path, but it has no `Architecture` enum

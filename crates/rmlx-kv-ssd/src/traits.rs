@@ -9,6 +9,22 @@ use rmlx_core::error::Result;
 use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::KvQuant;
 
+/// The exact first decode token captured alongside a prompt-cache snapshot.
+///
+/// The pair is kept coherent as one value: an SSD record either carries both
+/// the token ID and its decoded piece, or carries no replay metadata at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "cross-crate SSD bridge value with intentionally public fields; rmlx-models constructs it at hydrate/spill boundaries and adding a field requires a coordinated API update"
+)]
+pub struct ExactReplayMetadata {
+    /// Token ID emitted by the snapshot's first decode step.
+    pub id: u32,
+    /// Tokenizer piece corresponding to [`Self::id`].
+    pub piece: String,
+}
+
 /// Source that reconstructs a prompt-cache entry from the SSD tier
 /// (`.kvb` + [`crate::SsdKvIndex`]) on a RAM-cache miss.
 ///

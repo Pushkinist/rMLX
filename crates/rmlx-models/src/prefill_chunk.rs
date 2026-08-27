@@ -115,6 +115,7 @@ pub fn module_key_for_class(arch_class: &str) -> &'static str {
         "LagunaForCausalLM" => "laguna",
         "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5ForConditionalGeneration" => "qwen3_5_moe",
         "BitNetForCausalLM" => "bitnet",
+        "MapleForCausalLM" => "maple",
         "Qwen3VLMoeForConditionalGeneration" => "qwen3_vl_moe",
         // Any unsupported class: no dedicated prefill-chunk row, fall through to
         // FALLBACK (safe, conservative).
@@ -164,6 +165,12 @@ fn arch_default(arch: &str) -> Option<usize> {
         // bitnet: max_position_embeddings=4096, no GDN prefill ops.
         // 64 is conservative but safe; no bench data yet to justify larger.
         "bitnet" => Some(64),
+        // maple: hybrid SWA-512 / full NoPE MoE; no GDN. Real-model sweep on
+        // maple-2bit-mlx (kv-none, 1040-token parity prompt): TTFT 64→1024
+        // 1135→528ms (2.1×), prefill 915→1970 tps; 2048 does not improve TTFT
+        // and decode slipped to 184 (1024 holds ~190). Override via
+        // `RMLX_PREFILL_CHUNK_MAPLE`.
+        "maple" => Some(1024),
         _ => None,
     }
 }

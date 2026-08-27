@@ -150,7 +150,18 @@ fn hydrated_truncate_keeps_prefix_and_correction(quant: KvQuant, kv_h: i32) {
     let path = dir.join(format!("{key}.kvb"));
 
     let cache = build_kvcache_quant(quant, kv_h, prefill, 0x7A1E);
-    write_caches(&path, device, MODEL_ID, quant, &[cache], &[]).unwrap();
+    write_caches_timed_with_identity(
+        &path,
+        device,
+        MODEL_ID,
+        quant,
+        &[cache],
+        &[],
+        &[None],
+        &prompt_ids,
+        None,
+    )
+    .unwrap();
     let size = std::fs::metadata(&path).unwrap().len();
     index
         .record(

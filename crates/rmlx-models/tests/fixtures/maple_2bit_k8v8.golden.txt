@@ -1,0 +1,35 @@
+# golden tokens — tag=maple_2bit_k8v8 kv_quant=k8v8
+# n_tokens=32
+# decoded: "<|im_start|>assistant\n<think>\nWe need to answer the question: \"Explain in one short sentence why the sky appears blue during the day.\" The user also gave"
+151644
+77091
+198
+151667
+198
+1654
+1184
+311
+4226
+279
+3405
+25
+330
+840
+20772
+304
+825
+2805
+11652
+3170
+279
+12884
+7952
+6303
+2337
+279
+1899
+1189
+576
+1196
+1083
+6551

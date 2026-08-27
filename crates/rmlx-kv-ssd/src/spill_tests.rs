@@ -19,6 +19,9 @@ const NO_BUDGET: u64 = 0;
 
 fn job(hash: u64) -> SpillJob {
     SpillJob {
+        prompt_ids: Vec::new(),
+        exact_replay: None,
+        rotating_snapshots: vec![None],
         hash,
         layout_key: TEST_LAYOUT_KEY,
         model_id: MODEL_ID.into(),
@@ -131,6 +134,92 @@ fn spill_failure_does_not_panic_and_drains_on() {
             .is_none(),
         "failed spill must not record an index row"
     );
+}
+
+/// A successful serialization followed by a failed SQLite insert must not
+/// leave an unreachable `.kvb`. Nothing scans or adopts orphan files on
+/// startup, so cleanup belongs to the spill failure path that created it.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "the temp directory, SQLite schema mutation, and drain-thread join are the fixture; any failure must fail the regression"
+)]
+fn index_record_failure_removes_serialized_block() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let db = dir.join("index.db");
+    let index = SsdKvIndex::open_at(&db).unwrap();
+
+    // Invalidate the already-open index after schema initialization. The
+    // writer can still serialize its block, but `record` must fail because
+    // the target table no longer exists.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("DROP TABLE kv_blocks", [])
+        .unwrap();
+
+    let hash = 0x1111_2222_3333_4444;
+    let path = dir.join(format!("{}.kvb", hash_to_hex(hash)));
+    let (spiller, handle) = SsdSpiller::spawn_with_index(
+        MODEL_ID,
+        TEST_LAYOUT_KEY,
+        Device::Cpu,
+        dir,
+        index,
+        NO_BUDGET,
+    );
+    spiller.try_spill(job(hash));
+    drop(spiller);
+    handle.join().unwrap();
+
+    assert!(
+        !path.exists(),
+        "an unindexed serialized block must be removed instead of becoming an orphan"
+    );
+}
+
+/// A rotating cache without a matching host snapshot must never reach the
+/// writer. Persisting only its `KvStorage` geometry would make hydrate build a
+/// non-rotating cache and could silently corrupt the next decode.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture and hermetic index are established before each assertion"
+)]
+fn malformed_rotating_spill_is_dropped_before_serialization() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let db = dir.join("index.db");
+    let index = SsdKvIndex::open_at(&db).unwrap();
+    let hash = 0x1222u64;
+
+    let mut malformed = job(hash);
+    malformed.kv_caches = vec![KvCache::with_quant_max_seq_window(
+        KvQuant::None,
+        8,
+        Some(8),
+    )];
+    // The cache is rotating but the producer failed to capture its state.
+    malformed.rotating_snapshots = vec![None];
+
+    let (spiller, handle) = SsdSpiller::spawn_with_index(
+        MODEL_ID,
+        TEST_LAYOUT_KEY,
+        Device::Cpu,
+        dir.clone(),
+        index,
+        NO_BUDGET,
+    );
+    spiller.try_spill(malformed);
+    drop(spiller);
+    handle.join().unwrap();
+
+    assert!(!dir.join(format!("{}.kvb", hash_to_hex(hash))).exists());
+    assert!(SsdKvIndex::open_at(&db)
+        .unwrap()
+        .lookup(&hash_to_hex(hash), TEST_LAYOUT_KEY)
+        .unwrap()
+        .is_none());
 }
 
 /// (b): `try_spill` is non-blocking even when the drain is stalled.

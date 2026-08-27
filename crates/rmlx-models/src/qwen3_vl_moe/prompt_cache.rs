@@ -160,7 +160,7 @@ impl SsdHydrate<Qwen3VlMoeEntry> for SsdHydrator {
         let HydratedBlock {
             prompt_ids,
             kv_caches,
-            lin_caches: _, // plain-attention text decoder has no GDN state
+            ..
         } = block;
         Ok(Some(Qwen3VlMoeEntry {
             prompt_token_ids: prompt_ids,

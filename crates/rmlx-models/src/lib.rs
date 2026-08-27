@@ -7,6 +7,7 @@
 //! `qwen2` — Qwen2ForCausalLM (dense, affine quantized).
 //! `qwen3` — Qwen3ForCausalLM (dense, affine quantized, adds per-head q/k RMSNorm).
 //! `laguna` — LagunaForCausalLM (sparse MoE, mxfp8, per-tensor overrides).
+//! `maple` — MapleForCausalLM (ternary MoE, hybrid SWA/NoPE, affine 2-bit `row_alpha`).
 //! `qwen3_5_moe` — Qwen3_5MoeForConditionalGeneration (hybrid GatedDeltaNet + full-attn, sparse MoE).
 //!
 //! `layers` — shared building blocks (RmsNorm, Linear, Embedding, Mlp, MoeBlock stub).
@@ -43,6 +44,7 @@ pub mod kv_cache;
 pub mod laguna;
 pub mod layers;
 pub(crate) mod load_util;
+pub mod maple;
 pub mod multimodal_cache;
 pub mod paroquant_msl;
 pub mod ppl;

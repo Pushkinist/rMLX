@@ -16,6 +16,10 @@ use rmlx_mlx::Device;
 
 use crate::kv_cache::kv_layer_quants;
 
+fn is_maple_ssd_attachment_target(arch: &str) -> bool {
+    matches!(arch, "MapleForCausalLM")
+}
+
 /// At model-load, run startup maintenance (prune + evict-to-budget) for the
 /// namespace and attach the spiller + hydrator onto the right per-arch
 /// `PROMPT_CACHE`. No-op when the tier is OFF.
@@ -134,6 +138,14 @@ pub fn attach_at_load(
                 info.device,
             );
         }
+        maple if is_maple_ssd_attachment_target(maple) => {
+            crate::maple::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.namespace,
+                info.kv_quant,
+                info.layout_key,
+                info.device,
+            );
+        }
         "Qwen3VLMoeForConditionalGeneration" => {
             crate::qwen3_vl_moe::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
                 &info.namespace,
@@ -159,3 +171,7 @@ pub fn attach_at_load(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ssd_tier_tests.rs"]
+mod tests;

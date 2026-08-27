@@ -157,3 +157,67 @@ fn snapshot_restore_multitoken_tail_wrapped() {
     assert_eq!(b.offset, a.offset);
     assert_eq!(b.idx, a.idx);
 }
+
+#[test]
+fn persistent_snapshot_roundtrip_and_next_append_wrapped() {
+    let device = Device::Cpu;
+    let mut source = RotatingState::new(4);
+    source
+        .update_and_fetch(&kv(7, 0.0), &kv(7, 70.0), device)
+        .unwrap();
+    let persisted = source.snapshot_persistent().unwrap();
+    assert_eq!(persisted.valid_len, 4);
+    assert_eq!(persisted.offset, 7);
+    assert_eq!(persisted.idx, source.idx);
+
+    let expected = source
+        .update_and_fetch(&kv(1, 9.0), &kv(1, 79.0), device)
+        .map(|(k, v)| (host(&k), host(&v), source.offset, source.idx))
+        .unwrap();
+    let mut restored = RotatingState::new(99);
+    restored.restore_persistent(&persisted, device).unwrap();
+    let actual = restored
+        .update_and_fetch(&kv(1, 9.0), &kv(1, 79.0), device)
+        .map(|(k, v)| (host(&k), host(&v), restored.offset, restored.idx))
+        .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn persistent_snapshot_roundtrip_and_next_append_unwrapped() {
+    let device = Device::Cpu;
+    let mut source = RotatingState::new(16);
+    source
+        .update_and_fetch(&kv(5, 0.0), &kv(5, 50.0), device)
+        .unwrap();
+    let persisted = source.snapshot_persistent().unwrap();
+    assert_eq!(persisted.valid_len, 5);
+    assert_eq!(persisted.offset, 5);
+
+    let expected = source
+        .update_and_fetch(&kv(1, 8.0), &kv(1, 58.0), device)
+        .map(|(k, v)| (host(&k), host(&v), source.offset, source.idx))
+        .unwrap();
+    let mut restored = RotatingState::new(16);
+    restored.restore_persistent(&persisted, device).unwrap();
+    let actual = restored
+        .update_and_fetch(&kv(1, 8.0), &kv(1, 58.0), device)
+        .map(|(k, v)| (host(&k), host(&v), restored.offset, restored.idx))
+        .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn persistent_restore_rejects_missing_payload_for_nonempty_ring() {
+    let snapshot = RotatingStateSnapshot {
+        keys: None,
+        values: None,
+        offset: 1,
+        max_size: 4,
+        keep: 0,
+        valid_len: 1,
+        idx: 1,
+    };
+    let mut state = RotatingState::new(4);
+    assert!(state.restore_persistent(&snapshot, Device::Cpu).is_err());
+}

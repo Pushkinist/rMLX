@@ -78,6 +78,7 @@
 //! hold this slug) stays a skip: a developer without the weights cannot run the
 //! gate, and must not be blocked by it.
 
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use rmlx_kv_quant::KvQuant;
@@ -553,6 +554,37 @@ fn resolve_bos_id(model_dir: &Path, tk: &tokenizers::Tokenizer) -> Option<u32> {
 /// * `RMLX_REGEN_GOLDENS=1` set → decode + WRITE the golden fixture, no assert.
 /// * otherwise → decode + ASSERT exact token-id equality.
 pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) {
+    run_golden_test_impl(fixture_tag, kv_quant, model_path, GOLDEN_PROMPT, None);
+}
+
+/// Run a golden-token gate with a caller-supplied prompt.
+///
+/// `expected_prompt_tokens` makes a boundary-focused gate prove that its
+/// fixture still exercises the intended token-length regime after tokenizer or
+/// prompt changes. The count includes the resolved BOS token.
+pub fn run_golden_test_with_prompt(
+    fixture_tag: &str,
+    kv_quant: KvQuant,
+    model_path: &Path,
+    prompt: &str,
+    expected_prompt_tokens: RangeInclusive<usize>,
+) {
+    run_golden_test_impl(
+        fixture_tag,
+        kv_quant,
+        model_path,
+        prompt,
+        Some(expected_prompt_tokens),
+    );
+}
+
+fn run_golden_test_impl(
+    fixture_tag: &str,
+    kv_quant: KvQuant,
+    model_path: &Path,
+    prompt: &str,
+    expected_prompt_tokens: Option<RangeInclusive<usize>>,
+) {
     let device = Device::Gpu;
     let model =
         arch::load_model(model_path, device, &arch::LoadOpts::default()).expect("arch::load_model");
@@ -566,20 +598,27 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
     let bos = resolve_bos_id(model_path, &tokenizer);
     let prompt_ids: Vec<u32> = match bos {
         Some(bos_id) => {
-            let enc = tokenizer
-                .encode(GOLDEN_PROMPT, false)
-                .expect("tokenize prompt");
+            let enc = tokenizer.encode(prompt, false).expect("tokenize prompt");
             let mut ids = Vec::with_capacity(1 + enc.get_ids().len());
             ids.push(bos_id);
             ids.extend_from_slice(enc.get_ids());
             ids
         }
         None => tokenizer
-            .encode(GOLDEN_PROMPT, true)
+            .encode(prompt, true)
             .expect("tokenize prompt")
             .get_ids()
             .to_vec(),
     };
+
+    if let Some(expected) = expected_prompt_tokens {
+        eprintln!("[{fixture_tag}] prompt_tokens={}", prompt_ids.len());
+        assert!(
+            expected.contains(&prompt_ids.len()),
+            "[{fixture_tag}] prompt token count {} is outside the required boundary range {expected:?}",
+            prompt_ids.len()
+        );
+    }
 
     // temp=0 greedy + fixed seed = fully deterministic (matches run_smoke_probe).
     let sampler_cfg = SamplerConfig {

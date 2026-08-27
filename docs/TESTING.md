@@ -52,7 +52,7 @@ variables above:
 
 | Variable | Used by | Purpose |
 |----------|---------|---------|
-| `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override for the SSD-restart smoke test. |
+| `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override (Gemma4 or another supported snapshot) for the SSD-restart smoke test. |
 | `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path. |
 | `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | Vision-language model snapshot for VL text-parity tests. |
@@ -137,10 +137,16 @@ nothing.
 
 ## Golden-token suites: how their snapshot resolves
 
-`crates/rmlx-models/tests/{bonsai,gemma4,qwen3,bitnet,medgemma}_golden_tokens.rs`
-each pin a 32-token temp=0 decode of one architecture against a committed
-fixture under `tests/fixtures/`. Each covers ONE arch and names its own snapshot
-by slug. `tests/common/mod.rs` reads exactly **two** variables:
+`crates/rmlx-models/tests/{bonsai,gemma4,qwen3,bitnet,medgemma,maple}_golden_tokens.rs`
+pin temp=0 decodes of one architecture against committed fixtures under
+`tests/fixtures/`. The standard gate for each architecture generates 32 tokens.
+Maple additionally carries `maple_long_prompt_chunk_1024_k8v8`: a K8V8 golden
+whose generated prompt is asserted to tokenize to 513..=1024 tokens, crossing
+the SWA-512 window while remaining inside Maple's 1024-token default prefill
+chunk. This protects the chunk-sensitive long-prompt path when that default or
+the rotating-ring prefill behavior changes. Each suite covers ONE arch and
+names its own snapshot by slug. `tests/common/mod.rs` reads exactly **two**
+variables:
 
 1. `RMLX_KV_TEST_MODEL`, **for the one golden whose architecture it serves**.
    Pointed at another architecture it is not a statement about this golden, and
@@ -442,8 +448,9 @@ runner would execute a handful of early returns, see no banner for the crate, an
 fail the suite over a missing model rather than a defect. `ssd_cache_restart`
 could not be listed on any machine: its Metal is in the child, so the in-process
 instrumentation covers nothing, and it additionally needs `cargo build -p
-rmlx-cli` first (`cargo test --tests` does not build that binary), `pkill`s every
-MLX process, and spends two 180 s readiness waits.
+rmlx-cli` first (`cargo test --tests` does not build that binary), owns only its
+spawned child (no indiscriminate process cleanup), and spends two 180 s
+readiness waits.
 
 Run the embeddings cells by hand:
 

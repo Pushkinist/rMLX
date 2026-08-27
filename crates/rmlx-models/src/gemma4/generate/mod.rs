@@ -674,6 +674,10 @@ pub fn generate_greedy<'a>(
                                 kv_caches: kvs,
                                 first_id: last_id,
                                 first_piece: piece.clone(),
+                                exact_replay: Some(rmlx_kv_ssd::ExactReplayMetadata {
+                                    id: last_id,
+                                    piece: piece.clone(),
+                                }),
                                 kv_quant: Some(kv_quant),
                                 is_ssd_hydrated: false,
                             });

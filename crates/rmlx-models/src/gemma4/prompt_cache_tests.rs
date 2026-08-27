@@ -4,6 +4,25 @@ use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::storage::KvStorage;
 use rmlx_kv_quant::KvQuant;
 
+/// Construct a wrapped SWA ring without a model.  Two prefill updates are
+/// enough to move the logical offset past the window, which is the state that
+/// must use strict-prefix snapshot reuse rather than block truncation.
+#[allow(clippy::unwrap_used, reason = "test fixture construction")]
+fn wrapped_swa(window: i32, seq: i32) -> KvCache {
+    use rmlx_mlx::{Array, Device, Dtype};
+
+    let mut cache = KvCache::with_quant_max_seq_window(KvQuant::K8V8, 4096, Some(window));
+    cache.enter_prefill();
+    for chunk in [window, seq - window] {
+        let bytes = vec![0u8; (chunk * 8 * 2) as usize];
+        let k = Array::from_bytes(&bytes, &[1, 1, chunk, 8], Dtype::Bf16).unwrap();
+        let v = Array::from_bytes(&bytes, &[1, 1, chunk, 8], Dtype::Bf16).unwrap();
+        cache.update(&k, &v, Device::Cpu).unwrap();
+    }
+    cache.exit_prefill(Device::Cpu).unwrap();
+    cache
+}
+
 fn entry_with(kv_caches: Vec<KvCache>, ids: Vec<u32>) -> Gemma4Entry {
     let block_hashes = rmlx_kv_ssd::chained_block_hashes(&ids);
     Gemma4Entry {
@@ -12,6 +31,7 @@ fn entry_with(kv_caches: Vec<KvCache>, ids: Vec<u32>) -> Gemma4Entry {
         kv_caches,
         first_id: 0,
         first_piece: String::new(),
+        exact_replay: None,
         kv_quant: Some(KvQuant::K8V8),
         is_ssd_hydrated: false,
     }
@@ -29,9 +49,27 @@ fn entry_with_quant(
         kv_caches,
         first_id: 0,
         first_piece: String::new(),
+        exact_replay: None,
         kv_quant,
         is_ssd_hydrated: false,
     }
+}
+
+/// The generic spill bridge only sees `PromptCacheEntry`; if Gemma4 does not
+/// expose its captured first token here, v2 SSD records lose exact-replay
+/// metadata and every successful disk hydrate is rejected as incomplete.
+#[test]
+fn exact_replay_is_exposed_to_generic_spill_bridge() {
+    let mut entry = entry_with(Vec::new(), (0..BLOCK_TOKENS as u32).collect());
+    entry.exact_replay = Some(ExactReplayMetadata {
+        id: 42,
+        piece: "answer".to_owned(),
+    });
+
+    assert_eq!(
+        PromptCacheEntry::exact_replay(&entry),
+        entry.exact_replay.as_ref()
+    );
 }
 
 /// A freshly built snapshot — every cache at offset 0 — is trimmable, so
@@ -185,11 +223,11 @@ fn hydrate_complete_for_resident_snapshot() {
     );
 }
 
-/// An SSD-hydrated entry whose SWA layer came back as a payload-less
-/// `KvStorage::None` (the rotating ring is not spilled) MUST be detected as
-/// hydrate-INCOMPLETE so the generate loop degrades the prefix reuse to a full
-/// re-prefill (Miss). The full-attention layer is reconstructed with real
-/// quantized payload; the SWA layer is empty `None`.
+/// An SSD-hydrated entry whose SWA layer has been manually degraded to a
+/// payload-less `KvStorage::None` must be detected as hydrate-INCOMPLETE so
+/// the generate loop degrades the prefix reuse to a full re-prefill (Miss).
+/// The full-attention layer is reconstructed with real quantized payload; the
+/// SWA layer is intentionally malformed here.
 #[test]
 fn hydrate_incomplete_when_swa_layer_empty() {
     // Full-attention layer: real K8V8 storage with a recorded offset (the
@@ -205,9 +243,8 @@ fn hydrate_incomplete_when_swa_layer_empty() {
         full.has_persistent_cache(),
         "K8V8 full-attn layer must report persistent cache"
     );
-    // SWA layer: payload-less None (rotating ring dropped on spill), no bf16
-    // seed restored — exactly what `block_io` reconstructs for a gemma4 SWA
-    // layer on hydrate.
+    // SWA layer: payload-less None with no bf16 seed restored. This is a
+    // deliberately malformed fixture, not the format-v2 happy path.
     let swa = KvCache::from_storage(
         KvStorage::None { max_seq: 512 },
         KvQuant::K8V8,
@@ -217,7 +254,7 @@ fn hydrate_incomplete_when_swa_layer_empty() {
     );
     assert!(
         !swa.has_persistent_cache() && swa.decode_fp16_kv().is_none(),
-        "dropped-SWA layer must be payload-less None with no bf16 seed"
+        "malformed SWA layer must be payload-less None with no bf16 seed"
     );
 
     let mut e = entry_with(vec![full, swa], (0..(2 * BLOCK_TOKENS) as u32).collect());
@@ -229,6 +266,138 @@ fn hydrate_incomplete_when_swa_layer_empty() {
         "a hydrated entry with an empty SWA None layer must be hydrate-INCOMPLETE \
          (excluded from the prefix reuse arms → Miss)"
     );
+}
+
+#[test]
+fn hydrate_complete_allows_explicitly_empty_shared_kv_consumer() {
+    let producer = KvCache::from_storage(
+        KvStorage::new(KvQuant::K8V8, 8192),
+        KvQuant::K8V8,
+        512,
+        0,
+        DispatchPolicy::default(),
+    );
+    let consumer = KvCache::from_storage(
+        KvStorage::None { max_seq: 8192 },
+        KvQuant::K8V8,
+        0,
+        1,
+        DispatchPolicy::default(),
+    );
+    let mut entry = entry_with(vec![producer, consumer], (0..512).collect());
+    entry.is_ssd_hydrated = true;
+    assert!(
+        entry.is_hydrate_complete(),
+        "a v2 shared-KV consumer must remain empty while its producer carries the prompt"
+    );
+}
+
+/// A wrapped SWA ring (>512 tokens here) is not block-trimmable, but its
+/// complete RAM snapshot remains valid for strict-prefix reuse.  This pins the
+/// B1 path that preserves the ring verbatim and forwards only the tail.
+#[test]
+fn wrapped_swa_over_512_uses_strict_prefix_snapshot() {
+    let cached: Vec<u32> = (0..768).collect();
+    let mut request = cached.clone();
+    request.extend([900, 901, 902]);
+    let swa = wrapped_swa(512, 768);
+    assert!(!swa.is_trimmable(), "ring must be wrapped at 768 tokens");
+    let entry = entry_with(vec![swa], cached);
+    assert!(entry.is_strict_prefix_of(&request));
+    assert_eq!(
+        entry.is_reusable_prefix_of(&request, false, 3),
+        Some(ReuseKind::StrictPrefix { prefix_len: 768 })
+    );
+}
+
+/// A complete SSD-hydrated 1024-token snapshot can be reused when the request
+/// has a non-empty tail.  The block-aligned request shape must not be mistaken
+/// for an exact hit (the SSD entry has no first-token metadata).
+#[test]
+fn hydrated_1024_block_prefix_with_tail_is_reusable() {
+    let ids: Vec<u32> = (0..1024).collect();
+    let mut request = ids.clone();
+    request.extend((1024..1088).map(|n| n + 7));
+    let kv = (0..4)
+        .map(|i| {
+            KvCache::from_storage(
+                KvStorage::new(KvQuant::K8V8, 4096),
+                KvQuant::K8V8,
+                1024,
+                i,
+                DispatchPolicy::default(),
+            )
+        })
+        .collect();
+    let mut entry = entry_with(kv, ids);
+    entry.is_ssd_hydrated = true;
+    assert!(entry.is_hydrate_complete());
+    assert_eq!(
+        entry.is_reusable_prefix_of(&request, true, 4),
+        Some(ReuseKind::StrictPrefix { prefix_len: 1024 })
+    );
+}
+
+/// Legacy and malformed hydrated payloads fail closed at the Gemma4 seam,
+/// even when a caller supplies matching block hashes and a token prefix.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "fixed-shape CPU test fixture construction"
+)]
+fn legacy_or_incomplete_hydrate_never_reuses_prefix() {
+    use rmlx_mlx::{Array, Dtype};
+
+    let ids: Vec<u32> = (0..512).collect();
+    let mut request = ids.clone();
+    request.push(99);
+
+    let mut empty = entry_with(Vec::new(), ids.clone());
+    empty.is_ssd_hydrated = true;
+    assert!(!empty.is_hydrate_complete());
+    assert!(empty.is_reusable_prefix_of(&request, true, 2).is_none());
+
+    let dropped_swa = KvCache::from_storage(
+        KvStorage::None { max_seq: 512 },
+        KvQuant::K8V8,
+        512,
+        0,
+        DispatchPolicy::default(),
+    );
+    let mut incomplete = entry_with(vec![dropped_swa], ids);
+    incomplete.is_ssd_hydrated = true;
+    assert!(!incomplete.is_hydrate_complete());
+    assert!(incomplete
+        .is_reusable_prefix_of(&request, true, 2)
+        .is_none());
+
+    // A decode mirror without the rotating-state metadata is still legacy /
+    // incomplete. It must not be mistaken for a restored SWA ring.
+    let bytes = vec![0u8; 512 * 8 * 2];
+    let fake_seed = KvCache::from_storage(
+        KvStorage::None { max_seq: 512 },
+        KvQuant::K8V8,
+        512,
+        0,
+        DispatchPolicy::default(),
+    )
+    .with_decode_fp16_seed(
+        Array::from_bytes(&bytes, &[1, 1, 512, 8], Dtype::Bf16).expect("fake K seed"),
+        Array::from_bytes(&bytes, &[1, 1, 512, 8], Dtype::Bf16).expect("fake V seed"),
+    );
+    let mut fake = entry_with(vec![fake_seed], vec![0; 512]);
+    fake.is_ssd_hydrated = true;
+    assert!(!fake.is_hydrate_complete());
+    assert!(fake.is_reusable_prefix_of(&request, true, 2).is_none());
+
+    // The same bf16 payload is valid for a v2 dense-attention cache when the
+    // exact record also carries its replay metadata. Rotating SWA layers are
+    // reconstructed as `is_rotating()` and do not rely on this branch.
+    fake.exact_replay = Some(ExactReplayMetadata {
+        id: 7,
+        piece: "x".into(),
+    });
+    assert!(fake.is_hydrate_complete());
 }
 
 /// / B1: `is_strict_prefix_of` is the SWA snapshot/restore "hook"
@@ -582,6 +751,7 @@ fn gemma4_consume_engine_migration_golden() {
                 kv_caches,
                 first_id: 0,
                 first_piece: String::new(),
+                exact_replay: None,
                 kv_quant: Some(kv_quant),
                 is_ssd_hydrated: true,
             });
@@ -600,9 +770,8 @@ fn gemma4_consume_engine_migration_golden() {
     );
 
     // Build a real snapshot of the first 256-token (1-block) prefix via a cold
-    // run, then read its KV back and rebuild the SWA layers as payload-less
-    // `KvStorage::None` — exactly what `block_io` reconstructs on hydrate (the
-    // rotating ring is not serialised to the SSD tier).
+    // run, then read its KV back and deliberately rebuild the SWA layers as
+    // payload-less `KvStorage::None` to simulate a malformed legacy hydrate.
     let prefix256: Vec<u32> = p336[..BLOCK_TOKENS].to_vec();
     clear_cache();
     let _ = run(&prefix256); // store-back leaves a RAM snapshot of the prefix
@@ -625,7 +794,7 @@ fn gemma4_consume_engine_migration_golden() {
             );
             assert!(
                 !c.has_persistent_cache() && c.decode_fp16_kv().is_none(),
-                "rebuilt SWA layer must be payload-less None"
+                "rebuilt malformed SWA layer must be payload-less None"
             );
         }
     }

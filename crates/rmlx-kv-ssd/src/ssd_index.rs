@@ -288,7 +288,7 @@ impl SsdKvIndex {
                     return Err(SsdKvIndexError::SchemaMismatch {
                         found: v,
                         expected: SCHEMA_VERSION,
-                    })
+                    });
                 }
                 None => {
                     // Pre-release v1 — the cross-namespace wipe in

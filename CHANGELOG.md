@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Maple decode: hoist f32 RMS scales and the router `Wᵀ` at load.**
+  MapleRMSNorm and the fp32 MoE gate were recasting (and the gate was
+  transposing) static weights every token — 97 RMS casts + 24 × 256×2048
+  router casts. They are now f32 (router also pre-transposed) at load.
+  Token digest on `maple_parity.json` is unchanged
+  (`0x67df31f040919162`). `compile_shapeless` of MapleRMSNorm / add+RMS /
+  QK-norm was A/B'd lossless (same digest, golden green) and **rejected**
+  (~123 vs ~190 decode TPS): `compiled.apply` per norm fragments the
+  already-lazy per-token graph the same way custom Metal did. FlashHead
+  still skipped.
+
+- **Maple prefill chunk default 64 → 1024.** Real-model sweep on
+  `maple-2bit-mlx` (kv-none, 1040-token `maple_parity.json`): TTFT
+  **1135 → 528 ms** (2.1×), prefill **915 → 1970 TPS**, matching mlx-lm's
+  ~2055 prefill / ~506 ms TTFT on the same prompt. Decode stays ~190 TPS.
+  2048 does not improve TTFT and decode slipped. Override:
+  `RMLX_PREFILL_CHUNK_MAPLE`. Custom decode Metal (add+RMS) was A/B'd and
+  **rejected** (~114 vs ~190 TPS): 49 extra `mlx_fast_metal_kernel` applies
+  per token lost to MLX `rms_norm`.
+
+- **Maple load-time QKV and MoE up+gate fusion.** Matches mlx-lm
+  `maple.py` `sanitize()`: concatenate affine `q/k/v_proj` along output rows
+  into one `quantized_matmul`, and concatenate stacked `up_proj`/`gate_proj`
+  along the expert out-dim into one `gather_qmm`. `maple_golden_tokens`
+  (K8V8, 32 tokens) still matches. Decode median **195.3 TPS** at chunk 64
+  (was 188.2, +3.8%); prefill/TTFT were unchanged until the chunk default
+  above.
+
 - **Prefill attention masks are built on device, not scalar-filled on the
   host.** `build_chunked_prefill_mask` and `build_swa_prefill_mask` allocated
   three full-size buffers per call — an `f32` `Vec`, its upload, and the bf16
@@ -63,6 +91,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   records both numbers and does not claim a mechanism for the gemma-4 one.
 
 ### Fixed
+
+- **Rotating Gemma4 and Maple prompt-cache snapshots now round-trip through the
+  SSD tier.** Format-v2 blocks persist physical SWA ring state, per-layer
+  offsets, full prompt identity, and exact first-token replay metadata. Hydrates
+  fail closed on malformed rings or divergent prompt tails, and an SSD hit is
+  counted only after the model accepts the restored entry. Maple's hybrid
+  SWA/full path passed process-restart qualification at exact 1K, 4K, and 8K
+  tokenizer-token lengths.
 
 - **Token selection resolved ties differently on the host than on the device,
   and `top_p` / `top_k` resolved them differently on every call.** MLX `argmax`
@@ -402,6 +438,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`MapleForCausalLM` architecture.** DeepGrove Maple-Preview (20B-A1B
+  ternary MoE) loads from an MLX snapshot: hybrid SWA-512 / full NoPE,
+  affine 2-bit `row_alpha` expanded to group scales + `biases = -scales`,
+  fp32 top-8 router, clamped expert SwiGLU, `<think>` reasoning via the
+  existing splitter. Exact `lm_head` (no FlashHead) and no fused Metal
+  decode kernels; QKV and MoE up+gate are concatenated at load like
+  mlx-lm `sanitize()`. Final `model.norm` uses MapleRMSNorm (fp32 weight)
+  multiply), matching maple.py — not the generic bf16 `rms_norm`.
+  Golden-token gate: `maple_golden_tokens`.
 - **Per-dispatch `trace!` on the two PlanarQuant kernels**
   (`planar_flash_decode_sdpa: dispatch`, `planar_fused_qk: dispatch`), matching
   every sibling KV kernel. Their in-process dispatch counters have no caller

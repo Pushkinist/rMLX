@@ -58,8 +58,9 @@ use crate::kv_cache::kv_layer_quants;
 use crate::prefix_index::{
     active_prefix_index_kind, build_active_index, PrefixIndex, PrefixIndexKind,
 };
+use rmlx_kv_quant::rotating::RotatingStateSnapshot;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::{SpillJob, SsdHydrator, SsdSpiller};
+use rmlx_kv_ssd::{ExactReplayMetadata, SpillJob, SsdHydrator, SsdSpiller};
 
 // The SSD-tier hashing primitives (`FNV_OFFSET`, `FNV_PRIME`,
 // `BLOCK_TOKENS`, `chained_block_hashes`, `chained_block_hashes_seeded`) and
@@ -228,10 +229,13 @@ pub struct CacheStats {
     /// Number of hit requests where at least one block was NOT matched
     /// (i.e., partial prefix hit: best_blocks > 0 && best_blocks < want_blocks).
     pub partial_hits: u64,
-    /// Number of RAM-cache misses that were served from the SSD tier.
+    /// Number of RAM-cache misses that were served by reusing an SSD-hydrated
+    /// entry.
     ///
-    /// Incremented by [`PromptCache::hydrate_from_ssd`] each time a longest-
-    /// prefix block was read back from a `.kvb` file and promoted into RAM.
+    /// This is deliberately incremented only after the hydrated entry passes
+    /// the reuse gate and `prepare_reuse` succeeds.  A disk read, or even a
+    /// successful RAM admission, is not itself a served SSD hit: Gemma4 can
+    /// reject an incomplete hydrated entry and fall through to full prefill.
     /// Zero when no SSD source is attached (the RAM-only default).
     pub ssd_hits: u64,
 }
@@ -303,12 +307,10 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// True when this entry was reconstructed from the SSD tier rather than
     /// produced by a live prefill.
     ///
-    /// An SSD-hydrated entry restores only the block-aligned prefix KV — the
-    /// first decode token was never serialized, so `first_id` / `first_piece`
-    /// are placeholders (id 0). The exact-hit fast path MUST exclude such an
-    /// entry (`!entry.is_ssd_hydrated()`) so it falls through to a full
-    /// re-prefill that recomputes the real first token; replaying the
-    /// placeholder poisons generation (a sentinel "!" first token).
+    /// Format-v2 SSD entries may restore a full-prompt snapshot and its exact
+    /// first decode token. Older or incomplete entries carry no replay
+    /// metadata and must fail closed to prefix reuse or full prefill; the
+    /// `is_ssd_hydrated` flag makes that distinction explicit.
     ///
     /// Defaults to `false` (a normal RAM-cached entry). Arch entries that can
     /// be hydrated from SSD override this to surface their stored flag. Do NOT
@@ -316,6 +318,28 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// some models.
     fn is_ssd_hydrated(&self) -> bool {
         false
+    }
+
+    /// Exact-replay metadata captured with a full-prompt SSD snapshot.
+    ///
+    /// A hydrated entry may take the exact fast path only when this metadata
+    /// is present: unlike prefix reuse, exact replay must restore the real
+    /// first decode token and piece rather than SSD's placeholder values.
+    /// Legacy entries return `None` and fail closed to strict-prefix reuse or
+    /// a full prefill.
+    fn exact_replay(&self) -> Option<&ExactReplayMetadata> {
+        None
+    }
+
+    /// Capture persistent rotating-attention state on the inference thread
+    /// before an SSD spill is queued. The returned vector is layer-aligned:
+    /// ordinary caches contribute `None`, while SWA caches contribute their
+    /// physical ring snapshot.
+    fn rotating_snapshots(&self) -> Result<Vec<Option<RotatingStateSnapshot>>> {
+        self.kv_caches()
+            .iter()
+            .map(KvCache::rotating_snapshot)
+            .collect()
     }
 
     /// The entry's linear-attention recurrent caches (GDN layers).
@@ -385,10 +409,9 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// architecture attends to.
     ///
     /// Default `true`: a fully RAM-resident snapshot (or a pure-attention arch
-    /// whose SSD blocks restore every layer) is always complete. gemma4 SWA
-    /// overrides this — its rotating-ring layers are not serialised to the SSD
-    /// tier, so a hydrated entry can come back with a payload-less attended
-    /// layer; the consume engine excludes such an entry from prefix reuse.
+    /// whose SSD blocks restore every layer) is always complete. Architectures
+    /// with additional topology rules override this to reject malformed or
+    /// legacy hydrated entries before reuse.
     fn is_hydrate_complete(&self) -> bool {
         true
     }
@@ -503,7 +526,18 @@ impl<E: PromptCacheEntry> SpillSink<E> for SsdSpiller {
                 "kv-spill: eval failed, skipping spill");
             return;
         }
+        let rotating_snapshots = match entry.rotating_snapshots() {
+            Ok(snapshots) => snapshots,
+            Err(e) => {
+                tracing::warn!(model_id = self.model_id(), error = %e,
+                    "kv-spill: rotating-state snapshot failed, skipping spill");
+                return;
+            }
+        };
         self.try_spill(SpillJob {
+            prompt_ids: entry.prompt_token_ids().to_vec(),
+            exact_replay: entry.exact_replay().cloned(),
+            rotating_snapshots,
             hash,
             layout_key: self.layout_key(),
             model_id: self.model_id().to_string(),
@@ -651,9 +685,10 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     /// Queries the attached [`SsdHydrate`] source for the longest matching
     /// block-hash prefix of `prompt_ids`. On a hit, the reconstructed entry is
     /// `push`ed into RAM (which may spill a different LRU entry via — the
-    /// symmetric path) and `stats.ssd_hits` is bumped; the new slot index is
-    /// returned. On a miss, or when no SSD source is attached, returns `None`
-    /// and the caller falls through to a full prefill.
+    /// symmetric path) and the new slot index is returned.  The SSD hit
+    /// counter is updated later, only if the consume path actually reuses the
+    /// admitted entry. On a miss, or when no SSD source is attached, returns
+    /// `None` and the caller falls through to a full prefill.
     ///
     /// Call this only after [`find_best_prefix`] returns `None`, and pass it
     /// the **same** `seed` that call used: the source probes the index with
@@ -693,7 +728,6 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         match result {
             Ok(Some(entry)) => {
                 if let Some(idx) = self.push(entry) {
-                    self.stats.ssd_hits += 1;
                     Some(idx)
                 } else {
                     // Reconstructed block's KV alone exceeds the RAM cap, so it
@@ -734,8 +768,10 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     ///
     /// RAM only. An attached SSD source ([`Self::set_ssd_source`]) survives, so
     /// the next lookup can still miss in RAM and be served by
-    /// [`Self::hydrate_from_ssd`] — which bumps `stats.ssd_hits`, not
-    /// `stats.hits`. This is not a guarantee that the next request prefills.
+    /// [`Self::hydrate_from_ssd`]. `stats.ssd_hits` is bumped only when the
+    /// consume path subsequently reuses that hydrated entry, not merely when
+    /// hydrate I/O succeeds. This is not a guarantee that the next request
+    /// prefills.
     pub(crate) fn clear(&mut self) {
         self.slots.clear();
         self.stats = CacheStats::default();
@@ -1406,11 +1442,13 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         // block into RAM; re-run find_best_prefix so the promoted slot is
         // matched + quant-checked by the path below.
         let mut raw_match = cache.find_best_prefix(prompt_ids, seed);
+        let mut hydrated_this_request = false;
         if raw_match.is_none()
             && cache
                 .hydrate_from_ssd(prompt_ids, seed, kv_quant, dispatch_policy)
                 .is_some()
         {
+            hydrated_this_request = true;
             raw_match = cache.find_best_prefix(prompt_ids, seed);
         }
 
@@ -1447,12 +1485,20 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         let entry = &cache.slots[slot_idx].entry;
         let is_ssd_hydrated = entry.is_ssd_hydrated();
 
-        // (5) Exact arm: full token-id equality AND a real (non-placeholder)
-        // first decode token. An SSD-hydrated entry is excluded — its
-        // first_id is the placeholder 0, replaying it poisons generation.
-        if !is_ssd_hydrated && entry.prompt_token_ids() == prompt_ids {
+        // (5) Exact arm: full token-id equality and valid replay metadata.
+        // A hydrated entry may use Exact only when the SSD record restored a
+        // complete snapshot plus its real first decode token; legacy/prefix-
+        // only records fail closed to strict-prefix reuse or prefill.
+        let exact_replay_eligible =
+            !is_ssd_hydrated || (entry.is_hydrate_complete() && entry.exact_replay().is_some());
+        if exact_replay_eligible && entry.prompt_token_ids() == prompt_ids {
             return match entry.deep_clone() {
-                Ok(cloned) => Consumed::Exact(cloned),
+                Ok(cloned) => {
+                    if hydrated_this_request && is_ssd_hydrated {
+                        cache.stats.ssd_hits += 1;
+                    }
+                    Consumed::Exact(cloned)
+                }
                 Err(e) => {
                     tracing::debug!(
                         arch,
@@ -1491,10 +1537,19 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
                 entry.is_reusable_prefix_of(prompt_ids, is_ssd_hydrated, block_count)
             {
                 return match entry.prepare_reuse(kind) {
-                    Ok(prepared) => Consumed::Reuse {
-                        entry: prepared,
-                        kind,
-                    },
+                    Ok(prepared) => {
+                        // Count an SSD hit only once the hydrated entry is
+                        // actually reusable.  In particular, Gemma4's
+                        // `is_hydrate_complete` gate above can turn a disk
+                        // read and RAM admission into a full-prefill miss.
+                        if hydrated_this_request && is_ssd_hydrated {
+                            cache.stats.ssd_hits += 1;
+                        }
+                        Consumed::Reuse {
+                            entry: prepared,
+                            kind,
+                        }
+                    }
                     Err(e) => {
                         tracing::debug!(
                             arch,

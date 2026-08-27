@@ -3,6 +3,7 @@
 pub(crate) mod baseline;
 pub(crate) mod bench;
 pub(crate) mod calibration_softmax;
+pub(crate) mod daemon;
 pub(crate) mod eval;
 #[cfg(feature = "metal-capture")]
 pub(crate) mod gpu_capture;
@@ -18,6 +19,7 @@ pub(crate) mod transcribe;
 
 pub(crate) use baseline::run_baseline;
 pub(crate) use bench::run_bench;
+pub(crate) use daemon::run_daemon;
 pub(crate) use eval::run_ppl;
 pub(crate) use healthcheck::run_healthcheck;
 pub(crate) use info::run_info;

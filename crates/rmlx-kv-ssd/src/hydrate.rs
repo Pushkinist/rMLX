@@ -46,10 +46,21 @@ use rmlx_kv_quant::kvcache::KvCache;
 use rmlx_kv_quant::linear_attn::LinearAttnCache;
 use rmlx_kv_quant::KvQuant;
 
-use crate::block_io::read_caches_timed;
+use crate::block_io::read_caches_timed_with_identity;
 use crate::hashing::{chained_block_hashes_seeded, BLOCK_TOKENS};
 use crate::hooks::{call_ssd_hydrate_prom_hook, ssd_event_recorder};
 use crate::ssd_index::{KvBlockRow, SsdKvIndex};
+use crate::traits::ExactReplayMetadata;
+
+/// Whether a request is safe to serve from a stored full-prompt snapshot.
+///
+/// A longest-full-block index hit is only a candidate. The request must carry
+/// every stored token, in order, and may then append a suffix. Equal prompts
+/// are accepted for exact replay; strict extensions are accepted for prefix
+/// reuse. Truncation and any divergent suffix fail closed.
+pub fn prompt_identity_matches(request: &[u32], stored: &[u32]) -> bool {
+    request.len() >= stored.len() && request.starts_with(stored)
+}
 
 /// A reconstructed SSD block ready to be wrapped as an arch prompt-cache entry.
 ///
@@ -62,8 +73,12 @@ use crate::ssd_index::{KvBlockRow, SsdKvIndex};
     reason = "promoted: internal SSD-tier bridge struct, was pub(crate); promoted to pub for cross-crate use by arch SsdHydrate impls in rmlx-models; adding a field is a coordinated update across both crates"
 )]
 pub struct HydratedBlock {
-    /// Token IDs of the matched block-aligned prefix (`block_count * 256`).
+    /// Complete token IDs stored with this snapshot, not a synthesized request
+    /// prefix. Legacy records without identity metadata remain unavailable to
+    /// this exact-identity path.
     pub prompt_ids: Vec<u32>,
+    /// Optional exact first-token replay captured with the stored prompt.
+    pub exact_replay: Option<ExactReplayMetadata>,
     /// Reconstructed attention KV caches (one per layer).
     pub kv_caches: Vec<KvCache>,
     /// Reconstructed GDN linear-attention recurrent state (empty for
@@ -232,6 +247,10 @@ impl SsdHydrator {
         reason = "the match folds a Result<Option<T>> through ? and None-return in one expression; \
                   let-else cannot express the ? chain on the same line without restructuring"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the hydrate path keeps its six timed phases and fail-closed cleanup in one transaction; splitting it would scatter the phase timing and cleanup invariants"
+    )]
     fn lookup_inner(
         &self,
         prompt_ids: &[u32],
@@ -270,15 +289,77 @@ impl SsdHydrator {
         // cannot produce a codec-B digest. Checking an attach-time codec here
         // instead would reject perfectly good rows written by a hot-swapped
         // request, and delete them as corrupt.
-        match read_caches_timed(&row.path, self.device, &self.model_id, kv_quant, policy) {
+        match read_caches_timed_with_identity(
+            &row.path,
+            self.device,
+            &self.model_id,
+            kv_quant,
+            policy,
+        ) {
             Ok(Some((
                 kv_caches,
                 lin_caches,
+                identity,
                 bytes_read,
                 dur_read_us,
                 dur_dequant_us,
                 dur_finalize_us,
             ))) => {
+                let prefix_len = block_count * BLOCK_TOKENS;
+
+                // A v2 record carries the complete prompt that produced its
+                // cache state. The index hash only identifies the final full
+                // block, so it is a candidate rather than proof of identity.
+                // Never manufacture identity from the request prefix: doing
+                // so would make a divergent SWA tail look reusable.
+                let stored_prompt_ids = if let Some(identity) = identity {
+                    if identity.prompt_ids.len() < prefix_len
+                        || identity.prompt_ids.len() > i32::MAX as usize
+                        || !prompt_identity_matches(prompt_ids, &identity.prompt_ids)
+                    {
+                        // A valid, differently-tailed record is simply not a
+                        // hit for this request. It must remain indexed so the
+                        // owning prompt can still hydrate it later.
+                        tracing::debug!(
+                            hash = %row.hash,
+                            block_count,
+                            stored_prompt_len = identity.prompt_ids.len(),
+                            request_prompt_len = prompt_ids.len(),
+                            "ssd-hydrate: block hash matched but full prompt identity did not"
+                        );
+                        return Ok(None);
+                    }
+
+                    // The cache offset is part of the state identity. If the
+                    // persisted prompt length and reconstructed cache disagree,
+                    // promoting it would attach a cache at the wrong absolute
+                    // position (especially unsafe for a rotating window).
+                    let stored_len = identity.prompt_ids.len() as i32;
+                    let has_producer = kv_caches.iter().any(|cache| cache.offset() == stored_len);
+                    let offsets_valid = kv_caches
+                        .iter()
+                        .all(|cache| matches!(cache.offset(), 0) || cache.offset() == stored_len);
+                    if !has_producer || !offsets_valid {
+                        tracing::warn!(
+                            hash = %row.hash,
+                            stored_prompt_len = stored_len,
+                            "ssd-hydrate: identity length does not match reconstructed cache offset; deleting block"
+                        );
+                        self.drop_row(&row);
+                        let _ = std::fs::remove_file(&row.path);
+                        return Ok(None);
+                    }
+                    (identity.prompt_ids, identity.exact_replay)
+                } else {
+                    tracing::warn!(
+                        hash = %row.hash,
+                        "ssd-hydrate: v2 production block has no full prompt identity; deleting block"
+                    );
+                    self.drop_row(&row);
+                    let _ = std::fs::remove_file(&row.path);
+                    return Ok(None);
+                };
+
                 // ── Phase 5: SQLite touch (LRU update) ────────────────────────
                 let t_touch = Instant::now();
                 if let Err(e) = self.index.touch(&row.hash, row.layout_key) {
@@ -292,7 +373,6 @@ impl SsdHydrator {
                 let dur_touch_us = t_touch.elapsed().as_micros() as u64;
                 let dur_us = t0.elapsed().as_micros() as u64;
 
-                let prefix_len = block_count * BLOCK_TOKENS;
                 tracing::info!(
                     hash = %row.hash,
                     path = %row.path.display(),
@@ -345,7 +425,8 @@ impl SsdHydrator {
                 call_ssd_hydrate_prom_hook(dur_us, bytes_read);
 
                 Ok(Some(HydratedBlock {
-                    prompt_ids: prompt_ids[..prefix_len].to_vec(),
+                    prompt_ids: stored_prompt_ids.0,
+                    exact_replay: stored_prompt_ids.1,
                     kv_caches,
                     lin_caches,
                 }))
@@ -399,3 +480,7 @@ impl SsdHydrator {
 #[cfg(test)]
 #[path = "hydrate_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "hydrate_identity_tests.rs"]
+mod identity_tests;

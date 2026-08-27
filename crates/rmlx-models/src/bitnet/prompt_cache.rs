@@ -156,7 +156,7 @@ impl SsdHydrate<BitNetEntry> for SsdHydrator {
         let HydratedBlock {
             prompt_ids,
             kv_caches,
-            lin_caches: _, // pure-attention arch has no GDN state
+            ..
         } = block;
         Ok(Some(BitNetEntry {
             prompt_token_ids: prompt_ids,

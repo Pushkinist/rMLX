@@ -101,6 +101,7 @@ impl From<PrefixIndexKindArg> for rmlx_models::prefix_index::PrefixIndexKind {
     }
 }
 
+use commands::daemon::DaemonConfigOverrides;
 use commands::parse::KvPresetArg;
 use commands::serve::{
     FusedQkMode, PlanarFlashDecodeMode, RotKFusedMode, SparseAttnMode, TurboFlashMode,
@@ -109,7 +110,7 @@ use commands::{
     acquire_claim_for_device, build_cache_type_spec, parse_device, parse_kv_bits_combo,
     parse_kv_bits_fractional, parse_kv_preset, parse_kv_quant, parse_max_ctx,
     parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg, run_baseline, run_bench,
-    run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
+    run_daemon, run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
 };
 
 /// Long-help body shared by `--cache-type-k` / `--cache-type-v` on every
@@ -945,6 +946,31 @@ enum Cmd {
     },
     /// Manage the metrics SQLite database (schema init, health checks, backup/restore).
     Metrics(MetricsCmd),
+    /// Run the local rMLX admin daemon skeleton.
+    ///
+    /// Exposes a localhost-only admin API for menu/admin clients. This command
+    /// does not load models, own inference, or acquire the Metal claim.
+    Daemon {
+        /// Path to daemon TOML config. Defaults to `<RMLX_HOME>/daemon.toml`
+        /// when omitted; the default file is optional.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Local host/IP for the daemon admin API. Must resolve to loopback.
+        #[arg(long)]
+        admin_host: Option<String>,
+        /// Local port for the daemon admin API.
+        #[arg(long)]
+        admin_port: Option<u16>,
+        /// Host where `rmlx serve` is expected to listen.
+        #[arg(long)]
+        server_host: Option<String>,
+        /// Port where `rmlx serve` is expected to listen.
+        #[arg(long)]
+        server_port: Option<u16>,
+        /// Named `rmlx serve --profile` to supervise on start/restart.
+        #[arg(long)]
+        serve_profile: Option<String>,
+    },
     /// Check rMLX readiness: claim file, HTTP /health, registry loadability,
     /// metrics DB, disk space, and process memory.
     ///
@@ -1530,6 +1556,31 @@ fn main() -> Result<()> {
         );
     }
 
+    // `rmlx daemon` is a local admin/supervisor surface only. It is MLX-free
+    // and owns no metrics recorder, so keep it out of inference startup paths.
+    if let Cmd::Daemon {
+        config,
+        admin_host,
+        admin_port,
+        server_host,
+        server_port,
+        serve_profile,
+    } = &cli.cmd
+    {
+        info!(version = env!("CARGO_PKG_VERSION"), %run_id, ?cli.cmd, "rmlx start");
+        let config = commands::daemon::resolve_daemon_config(
+            config.as_deref(),
+            DaemonConfigOverrides {
+                admin_host: admin_host.clone(),
+                admin_port: *admin_port,
+                server_host: server_host.clone(),
+                server_port: *server_port,
+                serve_profile: serve_profile.clone(),
+            },
+        )?;
+        return run_daemon(config);
+    }
+
     // Install the rotor-QJL toggle before any cache construction.
     // This is a process-wide one-shot OnceLock; safe to call once at startup.
     rmlx_kv_quant::rotor_qjl::install_rotor_qjl(cli.rotor_qjl.enabled());
@@ -1612,19 +1663,20 @@ fn main() -> Result<()> {
 
     #[allow(
         clippy::unreachable,
-        reason = "Cmd::Metrics, Cmd::Profile, and Cmd::KvCalibrate are handled by `return`-ing \
+        reason = "Cmd::Metrics, Cmd::Profile, Cmd::Daemon, and Cmd::KvCalibrate are handled by `return`-ing \
                   early blocks above; reaching these arms means the early-return guard was \
                   removed — a BUG"
     )]
     #[allow(
         clippy::match_same_arms,
-        reason = "Metrics + Profile + KvCalibrate arms are unreachable!() guards documenting \
+        reason = "Metrics + Profile + Daemon + KvCalibrate arms are unreachable!() guards documenting \
                   distinct early-return commands above; collapsing them would lose the \
                   Cmd-specific BUG narrative"
     )]
     match cli.cmd {
         Cmd::Metrics(_) => unreachable!("handled above"),
         Cmd::Profile { .. } => unreachable!("handled above"),
+        Cmd::Daemon { .. } => unreachable!("handled above"),
         Cmd::KvCalibrate { .. } => unreachable!("handled above"),
         Cmd::Serve {
             model,

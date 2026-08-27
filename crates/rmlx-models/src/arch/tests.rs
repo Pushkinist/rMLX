@@ -34,6 +34,8 @@ fn is_arch_supported_returns_true_for_known_archs() {
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "LagunaForCausalLM",
+        "BitNetForCausalLM",
+        "MapleForCausalLM",
         "JinaEmbeddingsV4Model",
     ];
     for arch in &known {

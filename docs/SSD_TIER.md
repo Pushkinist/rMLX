@@ -41,9 +41,15 @@ Supported architectures (spill + hydrate wired). These are **resolved** classes
   and `PROMPT_CACHE` static as the sparse-MoE class)
 - `Qwen3VLMoeForConditionalGeneration`
 - `BitNetForCausalLM`
+- `MapleForCausalLM` (Exact-only; hybrid SWA/full snapshots require format v2)
 
 Other architectures silently remain RAM-only when the tier is enabled; the SSD
 flag itself is not an error.
+
+Maple accepts only complete exact snapshots. Format-v2 records preserve the
+physical SWA rings alongside full-attention layers, full prompt identity, and
+first-token replay metadata; incomplete or inconsistent hydrates fail closed
+to a normal prefill.
 
 ---
 
@@ -778,29 +784,27 @@ every pre-change namespace is reclaimed by the `wipe_stale_schema_namespaces`
 pass at model load. Pinned by
 `ssd_tier_tests::wipe_removes_the_pre_none_bf16_block_format_namespace`.
 
-#### SWA layers are not spilled — hydrated entries degrade to re-prefill
+#### Gemma4 SWA rings use format-v2 exact snapshots
 
 Gemma4's sliding-window-attention (SWA) layers run a bf16 `RotatingKvCache`
-ring that is **not** serialised to the SSD tier (the rotating ring layout is not
-expressed in the `.kvb` format). On hydrate those layers are reconstructed as
-payload-less `KvStorage::None` — empty, carrying neither quantized storage nor a
-restored bf16 seed.
+ring. Format-v2 `.kvb` records persist each producer ring's physical K/V bytes,
+absolute offset, capacity, keep count, write index, full prompt token IDs, and
+exact first-token replay metadata. Hydration restores the physical ring and
+per-layer offsets before the entry can be admitted for reuse.
 
-Reusing such a hydrated entry as a **prefix** (re-prefilling only the tail on top
-of the hydrated block) would leave every SWA layer's prefix empty, giving them
-the wrong attention context and corrupting the output for a non-block-aligned
-prompt. `KvCache::is_trimmable()` returns `true` for a `None` layer, so it is the
-wrong predicate to detect this.
+The consume path still evaluates `Gemma4Entry::is_hydrate_complete`. Missing
+ring payload, inconsistent offsets, missing exact replay metadata, divergent
+prompt identity, and legacy geometry-only SWA records all fail closed to a full
+prefill. Shared-KV consumer slots legitimately remain empty; producer slots must
+carry the complete prompt state. Accepted exact hydrates increment the SSD-hit
+counter only after this gate and preserve output parity across restart.
 
-The consume path therefore evaluates a per-entry **hydrate-completeness** guard
-(`Gemma4Entry::is_hydrate_complete`) before the strict-prefix / block-truncate
-reuse arms: an entry is complete only if every attended layer holds payload
-(persistent storage, or a restored `decode_fp16_{k,v}` bf16 seed). A hydrated
-entry with an empty SWA `None` layer fails the check and is **degraded to a full
-re-prefill** (Miss), which recomputes the SWA prefix correctly. The guard is a
-no-op for RAM-resident snapshots (every layer holds payload), so non-SSD prefix
-reuse is unaffected. Serialising the SWA ring so hydrated entries could be reused
-as prefixes is a future enhancement.
+Maple uses the same format-v2 rotating representation for its hybrid SWA/full
+cache. Its acceptance gate requires every producer layer, the original
+per-layer offset, full prompt identity, and exact first-token replay metadata.
+The restored ring was qualified across process restarts at exact 1K, 4K, and
+8K tokenizer-token lengths, including prompts beyond Maple's 512-token SWA
+window.
 
 ---
 

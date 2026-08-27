@@ -9,11 +9,12 @@
 #![allow(unsafe_code)]
 #![allow(clippy::too_many_lines)]
 
+use rmlx_core::error::{Error, Result};
 use rmlx_core::DispatchPolicy;
-use rmlx_mlx::{Array, Dtype};
+use rmlx_mlx::{Array, Device, Dtype};
 
 use crate::kvcache::fused_qk_shadow::FusedQkShadow;
-use crate::rotating::RotatingState;
+use crate::rotating::{RotatingState, RotatingStateSnapshot};
 use crate::storage::KvStorage;
 use crate::KvQuant;
 use crate::KV_MAX_SEQ_DEFAULT;
@@ -373,6 +374,37 @@ impl KvCache {
     /// True if this cache is using the rotating ring-buffer path.
     pub fn is_rotating(&self) -> bool {
         self.rotating.is_some()
+    }
+
+    /// Capture the restart-safe state of a rotating cache. Non-rotating
+    /// caches return `None`; their storage has a separate persistence format.
+    pub fn rotating_snapshot(&self) -> Result<Option<RotatingStateSnapshot>> {
+        self.rotating
+            .as_ref()
+            .map(RotatingState::snapshot_persistent)
+            .transpose()
+    }
+
+    /// Restore a rotating cache snapshot onto `device` and synchronize the
+    /// cache-level absolute offset. The configured sliding-window capacity is
+    /// authoritative and must match the snapshot; it is never replaced by
+    /// untrusted persisted metadata.
+    pub fn restore_rotating_snapshot(
+        &mut self,
+        snapshot: &RotatingStateSnapshot,
+        device: Device,
+    ) -> Result<()> {
+        let rotating = self.rotating.as_mut().ok_or_else(|| {
+            Error::Mlx("cannot restore rotating snapshot into non-rotating cache".into())
+        })?;
+        if rotating.max_size() != snapshot.max_size {
+            return Err(Error::Mlx(
+                "rotating snapshot window does not match cache configuration".into(),
+            ));
+        }
+        rotating.restore_persistent(snapshot, device)?;
+        self.offset = snapshot.offset;
+        Ok(())
     }
 
     /// True if this cache can be losslessly rolled back via [`truncate_to`].
