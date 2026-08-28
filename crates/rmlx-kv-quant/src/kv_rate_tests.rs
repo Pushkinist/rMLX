@@ -5,8 +5,9 @@
 //! A KV codec advertises a codebook width. What matters for memory is what
 //! reaches the store: codes **plus** every per-group and per-token sideband.
 //! The two can differ by a lot — the rotor family quantizes to 3 bits and
-//! stores 21.75 bits per value, above the bf16 baseline it is supposed to
-//! compress — and nothing in the tree observed that until it was found by hand.
+//! stores 16.25 bits per value, above the bf16 baseline it is supposed to
+//! compress, and stored 21.75 before its sideband planes were narrowed — and
+//! nothing in the tree observed that until it was found by hand.
 //!
 //! So each codec family measures its rate here from the **actual bytes its own
 //! encoder produced** over a shared fixture, via
@@ -430,22 +431,14 @@ fn rotor_rate_splits_into_documented_code_scale_and_norm_bits() {
     assert!((norm_bits - 0.125).abs() < 1e-9, "norm rate {norm_bits}");
     assert!((total - 16.25).abs() < 1e-9, "total rate {total}");
 
-    // The codes are now the dominant term, and they are what keeps this family
-    // above the floor: the sideband could go to zero and rotor would still
-    // store 10.75 bits per value against bf16's 16, but its 4-bit sibling packs
-    // the same u32 for a 4-bit codebook, so there is no width at which the
-    // cadence pays. Stated as an assertion so a code-cadence change has to come
-    // back through here.
-    assert!(
-        code_bits > scale_bits + norm_bits,
-        "the u32-per-3-values code cadence is supposed to be the dominant term \
-         (codes {code_bits:.3} vs sideband {:.3})",
-        scale_bits + norm_bits
-    );
-    assert!(
-        total > BF16_BITS_PER_VALUE,
-        "rotor3 is exempt from the bf16 floor, so its split must sum to above it ({total:.3})"
-    );
+    // Two further assertions used to stand here — that the codes dominate the
+    // sideband, and that the total clears the bf16 floor — with comments saying
+    // they force a code-cadence change back through this test. They cannot: the
+    // four exact equalities above already fix every term, so both inequalities
+    // are implied by them and neither can fail while they hold. What the
+    // equalities do NOT prove is that the exemption is honest; that is
+    // `exempt_families_actually_exceed_the_floor`'s job, and it measures the
+    // family rather than restating a split.
 }
 
 /// Every `KvQuant` variant declares which store family each of its axes uses.

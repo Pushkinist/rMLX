@@ -148,11 +148,21 @@ pub struct QuantIsoV3 {
     /// in `isoquant_msl.rs`). `None` until first GPU `append_gpu` call, or
     /// when the [`gate`][crate::gpu_resident_iso_enabled] is disabled.
     pub(crate) gpu_codes_buf: Option<Array>,
-    /// Pre-allocated f32 scales buffer on GPU. Length
-    /// `B * kv_h * max_seq * n_groups` (one f32 per group).
+    /// Pre-allocated scales buffer on GPU, at
+    /// [`KV_SIDEBAND_DTYPE`][crate::storage::KV_SIDEBAND_DTYPE]. Length
+    /// `B * kv_h * max_seq * n_groups` (one scale per group).
+    ///
+    /// The width is the encode kernel's, not a choice made here: the iso
+    /// quantize kernel emits its scale plane at the sideband dtype, and the
+    /// dequant kernel declares it there. Allocating `f32` worked only because
+    /// `slice_update` converts on the way in and the dequant dispatcher
+    /// converts on the way out — two silent casts around a buffer stored at a
+    /// width nothing wanted.
     pub(crate) gpu_scales_buf: Option<Array>,
-    /// Pre-allocated f32 norms buffer on GPU, per-group layout (kernel
-    /// contract — one slot per `(token, group)`). Length matches scales.
+    /// Pre-allocated norms buffer on GPU at
+    /// [`KV_SIDEBAND_DTYPE`][crate::storage::KV_SIDEBAND_DTYPE], per-group
+    /// layout (kernel contract — one slot per `(token, group)`). Length matches
+    /// scales.
     pub(crate) gpu_norms_buf: Option<Array>,
     /// Number of u32 code-words written per single token (across `B * kv_h`).
     pub(crate) gpu_words_per_step: i32,
@@ -924,8 +934,8 @@ impl QuantIsoV3 {
             let codes_len = (words_per_step * init_cap as usize) as i32;
             let groups_len = (groups_per_step * init_cap as usize) as i32;
             let codes_buf = zeros(&[codes_len], Dtype::U32, device)?;
-            let scales_buf = zeros(&[groups_len], Dtype::F32, device)?;
-            let norms_buf = zeros(&[groups_len], Dtype::F32, device)?;
+            let scales_buf = zeros(&[groups_len], crate::storage::KV_SIDEBAND_DTYPE, device)?;
+            let norms_buf = zeros(&[groups_len], crate::storage::KV_SIDEBAND_DTYPE, device)?;
             // Commit locals only after all three allocs succeeded.
             self.gpu_codes_buf = Some(codes_buf);
             self.gpu_scales_buf = Some(scales_buf);
@@ -976,8 +986,8 @@ impl QuantIsoV3 {
             let codes_len = (words_per_step * new_cap as usize) as i32;
             let groups_len = (groups_per_step * new_cap as usize) as i32;
             let new_codes_blank = zeros(&[codes_len], Dtype::U32, device)?;
-            let new_scales_blank = zeros(&[groups_len], Dtype::F32, device)?;
-            let new_norms_blank = zeros(&[groups_len], Dtype::F32, device)?;
+            let new_scales_blank = zeros(&[groups_len], crate::storage::KV_SIDEBAND_DTYPE, device)?;
+            let new_norms_blank = zeros(&[groups_len], crate::storage::KV_SIDEBAND_DTYPE, device)?;
 
             // Copy the active prefix from the old buffers. Borrow `as_ref()`
             // — `slice_update` returns a new Array, the underlying buffer is

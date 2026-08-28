@@ -197,6 +197,7 @@ pub(crate) fn rotate_logs(dir: &std::path::Path, cap_mb: u64) {
     reason = "wildcard arm is the correct fallthrough for unsupported variants; exhaustive expansion would require updating on every new variant"
 )]
 pub(crate) fn print_cache_type_table() {
+    use rmlx_kv_quant::storage::ring_bits_per_value;
     use rmlx_models::kv_cache::CacheType;
     // Header.
     println!(
@@ -291,25 +292,33 @@ pub(crate) fn print_cache_type_table() {
     }
     // The nominal width in a rotation codec's name is its codebook, not what
     // the store spends. The iso and rotor tags decode from a shared GPU ring
-    // that costs one whole u32 code word plus one f32 scale per group whatever
-    // the codebook width, so a 3-bit and a 4-bit member of the same family
-    // occupy byte-identical space; planar spends an f32 per PAIR and is wider
-    // still. None of the three is a compression format at this layout. Said
-    // here because this listing is where the tags are chosen.
+    // that costs one whole u32 code word plus one sideband scale per group
+    // whatever the codebook width, so a 3-bit and a 4-bit member of the same
+    // family occupy byte-identical space; planar spends an f32 per PAIR and is
+    // wider than either. The two ring figures are computed from the ring's own
+    // `ring_bits_per_value`, the single producer of a stored-rate figure, so
+    // narrowing the sideband moves this listing without anyone editing it.
+    // Said here because this listing is where the tags are chosen.
+    let head_dim: u64 = 128;
+    let iso_rate = ring_bits_per_value(head_dim, head_dim / 4);
+    let rotor_rate = ring_bits_per_value(head_dim, head_dim.div_ceil(3));
     println!();
     println!("note: the bit width in an iso_*/rotor_*/planar* name is its codebook, not");
-    println!("      what it stores. None of the three is a compression format at the");
-    println!("      layout it ships: each spends a whole u32 code word and an f32 scale");
-    println!("      per group (planar, per PAIR), so all land ABOVE bf16's 16.00 bits");
-    println!("      per value. At head_dim 128:");
-    println!("        iso_k_3/4, iso_v_3/4         16.25   (16 + 32/head_dim)");
-    println!("        rotor_k_3/4, rotor_v_3/4     21.75   ((64*ceil(D/3)+32)/D)");
-    println!("        planar3, planar4, planar_k4  22.00   (at every head_dim)");
-    println!("      so planar is the widest cell on this menu, not iso or rotor. Each");
-    println!("      pair is byte-identical across its 3-bit and 4-bit member. The");
-    println!("      iso/rotor rates are derived from the ring allocation; the rotor and");
-    println!("      planar figures are also measured by the crate rate gate");
-    println!("      (kv_rate_tests), which measures iso in its wider CPU-block form.");
-    println!("      For which pairings actually build such a store see docs/KV_QUANT.md");
+    println!("      what it stores: each spends a whole u32 code word per group (planar,");
+    println!("      per PAIR), so the 3-bit and the 4-bit member of a family are");
+    println!("      byte-identical. Stored rate at head_dim {head_dim}, against bf16's 16.00:");
+    println!("        iso_k_3/4, iso_v_3/4 on the ring    {iso_rate:6.3}  (12 + 16/head_dim)");
+    println!("        rotor_k_3/4, rotor_v_3/4            {rotor_rate:6.3}  ((48*ceil(D/3)+16)/D)");
+    println!("        planar3, planar4, planar_k4         22.000  (at every head_dim)");
+    println!("      Only iso is under bf16, and only because its scale and norm planes");
+    println!("      are 16 bits: a sideband change cannot fix rotor's u32-per-3-values");
+    println!("      code cadence, and planar is the widest cell on this menu.");
+    println!("      The ring is what a served request holds for iso_k_*/rotor_k_* and");
+    println!("      for both axes of iso3_sym/iso4_sym/rotor3_sym/rotor4_sym. An");
+    println!("      iso_v_3/iso_v_4 chosen on its own (K stays q8) builds NO packed");
+    println!("      store at all and decodes from the bf16 mirror — it stores nothing");
+    println!("      and saves nothing. The rotor and planar figures are also measured");
+    println!("      from real encoder output by the crate rate gate (kv_rate_tests).");
+    println!("      For which pairings actually build a store see docs/KV_QUANT.md");
     println!("      \"Codec disposition\".");
 }

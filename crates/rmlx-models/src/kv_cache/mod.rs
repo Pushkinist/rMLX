@@ -288,9 +288,12 @@ pub struct KvLayerShape {
 /// fused decode step that drops the blocks; it is **permanent** on a layer
 /// whose shape that path's gate rejects (batch > 1, or a `head_dim` that is not
 /// a power of two at most 512 — `head_dim = 80` qualifies), because the ring is
-/// then never allocated and there is nothing to drop. The blocks are 2.97x the
-/// ring. The sign is what the warning is for; a reader must not size a buffer
-/// from the number.
+/// then never allocated and there is nothing to drop. The blocks are 3.98x the
+/// ring at `head_dim = 128` — 48.25 bits per value against the ring's 12.125 —
+/// because the blocks are a host `Vec` form that carries an `f32` scale, a
+/// replicated `f32` quaternion per group and an `f32` norm, none of which the
+/// ring stores. The sign is what the warning is for; a reader must not size a
+/// buffer from the number.
 pub fn warn_if_kv_codec_net_negative(quant: KvQuant, layers: &[KvLayerShape], eff_seq: u64) {
     let (total_saving, n_global, n_windowed) = kv_codec_net_saving_total(quant, layers, eff_seq);
     if total_saving < 0 {

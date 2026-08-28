@@ -247,26 +247,60 @@ fn quant_iso_v_truncate_to_keeps_first_n() {
 //   cargo test -p rmlx-kv-quant --lib -- --ignored quant_iso_v --test-threads=1
 //
 // The GPU mirror default is OFF (hardcoded; no env-var opt-in). The mirror
-// tests need it ON, so each test calls
-// `force_gpu_resident_iso_on()` before any call into `append_gpu` —
-// `gpu_resident_iso_enabled()` latches the value on first read via OnceLock,
-// so the very first test to set it wins for the rest of the test-binary
-// lifetime. The `--test-threads=1` invocation is required so there is no
-// concurrent reader/writer of the AtomicBool + OnceLock pair.
+// tests need it ON, so each binds a guard from `force_gpu_resident_iso_on()`
+// for its own body. The guard restores the previous state on drop, so a test
+// that needs the gate OFF — the ring tests below — gets OFF whatever ran
+// before it, in whatever order the harness picks. The `--test-threads=1`
+// invocation these already require is what makes that scoping exact: no two
+// GPU tests observe the flag at the same time.
 
-/// Enable the GPU-resident ISO mirror for the rest of this test binary.
+/// Enable the GPU-resident ISO mirror for the lifetime of the returned guard.
 ///
-/// Calls `crate::set_gpu_resident_iso_for_test(true)` so the OnceLock in
-/// `gpu_resident_iso_enabled()` latches `true` on first read. No-op if already
-/// latched ON (OnceLock is write-once after first read). Requires
-/// `--test-threads=1` — concurrent readers of the OnceLock must not race with
-/// this store.
+/// Bind it (`let _mirror = force_gpu_resident_iso_on();`) — dropping it
+/// immediately puts the gate straight back.
+#[must_use = "the gate reverts when the guard drops; bind it for the test body"]
+fn force_gpu_resident_iso_on() -> crate::GpuResidentIsoForTest {
+    crate::force_gpu_resident_iso(true)
+}
+
+/// The mirror gate is scoped to a guard, not latched for the test binary.
 ///
-/// Any future gate-OFF + GPU test must run in its own test binary
-/// (integration test in `tests/`) because the per-process OnceLock cannot
-/// be reset once latched.
-fn force_gpu_resident_iso_on() {
-    crate::set_gpu_resident_iso_for_test(true);
+/// This is the regression the three mirror tests could not state for
+/// themselves: under the latched shape they passed alone and failed in a group,
+/// so their own assertions carried no information about the gate. Here the
+/// property is asserted directly — a test that turns the gate on leaves it as
+/// it found it, and a test that does not touch it observes the default however
+/// many tests ran first.
+///
+/// `Device` never appears: this is the flag's own behaviour, not a dispatch, so
+/// ignoring it would only mean it never ran.
+#[test]
+fn the_mirror_gate_is_scoped_to_its_guard_and_restores_the_previous_state() {
+    let before = crate::gpu_resident_iso_enabled();
+    {
+        let _outer = force_gpu_resident_iso_on();
+        assert!(
+            crate::gpu_resident_iso_enabled(),
+            "the guard must turn the gate on for its own scope"
+        );
+        {
+            let _inner = crate::force_gpu_resident_iso(false);
+            assert!(
+                !crate::gpu_resident_iso_enabled(),
+                "a nested guard must win inside its own scope"
+            );
+        }
+        assert!(
+            crate::gpu_resident_iso_enabled(),
+            "dropping the inner guard must restore the outer scope's value, not the default"
+        );
+    }
+    assert_eq!(
+        crate::gpu_resident_iso_enabled(),
+        before,
+        "the gate must read the same after the guard drops as it did before — otherwise \
+         one test's setting decides another test's outcome"
+    );
 }
 
 /// Build a 4-D f32 `Array` from a row-major slice and shape `[B, kv_h, S, D]`.
@@ -295,7 +329,7 @@ fn iso_v3_gpu_mirror_populated_on_encode() {
     if skip_if_no_gpu_env() {
         return;
     }
-    force_gpu_resident_iso_on();
+    let _gpu_mirror = force_gpu_resident_iso_on();
     let b = 1;
     let kv_h = 2;
     let head_dim = 8;
@@ -344,7 +378,7 @@ fn iso_v3_dequant_gpu_uses_mirror_when_populated() {
     if skip_if_no_gpu_env() {
         return;
     }
-    force_gpu_resident_iso_on();
+    let _gpu_mirror = force_gpu_resident_iso_on();
     let b = 1;
     let kv_h = 2;
     let head_dim = 8;
@@ -408,7 +442,7 @@ fn iso_v3_dequant_gpu_falls_back_to_cpu_path_when_mirror_missing() {
     if skip_if_no_gpu_env() {
         return;
     }
-    force_gpu_resident_iso_on();
+    let _gpu_mirror = force_gpu_resident_iso_on();
     let b = 1;
     let kv_h = 1;
     let head_dim = 8;
@@ -446,7 +480,7 @@ fn iso_v3_reset_clears_gpu_mirror() {
     if skip_if_no_gpu_env() {
         return;
     }
-    force_gpu_resident_iso_on();
+    let _gpu_mirror = force_gpu_resident_iso_on();
     let b = 1;
     let kv_h = 1;
     let head_dim = 8;
@@ -481,7 +515,7 @@ fn iso_v3_gpu_multi_append_matches_single_shot_gqa() {
     if skip_if_no_gpu_env() {
         return;
     }
-    force_gpu_resident_iso_on();
+    let _gpu_mirror = force_gpu_resident_iso_on();
     let b = 1_i32;
     let kv_h = 3_i32;
     let head_dim = 8_i32;
@@ -631,7 +665,7 @@ fn iso_v3_ssd_roundtrip_preserves_dequant_output() {
     if skip_if_no_gpu_env() {
         return;
     }
-    force_gpu_resident_iso_on();
+    let _gpu_mirror = force_gpu_resident_iso_on();
     let b = 1;
     let kv_h = 1;
     let head_dim = 8;

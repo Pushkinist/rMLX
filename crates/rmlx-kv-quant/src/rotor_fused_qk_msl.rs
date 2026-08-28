@@ -469,10 +469,14 @@ pub fn rotor_fused_qk_sdpa_generic<const BITS: u8>(
     // flash-decode kernels, this body reads `scales` and `norms` directly
     // rather than through a header helper that declares them, so it is
     // dtype-agnostic — MSL widens either to `float` at the read. Its
-    // production feed is the head-major fused-QK shadow (`FusedQkShadow`,
-    // f32), not the GPU ring, and that buffer spans the whole context: casting
-    // it here would enqueue a conversion of tens of MB on every decode step,
-    // to no end.
+    // production feed is the head-major fused-QK shadow (`FusedQkShadow`),
+    // not the GPU ring, and that buffer spans the whole context: casting it
+    // here would enqueue a conversion of tens of MB on every decode step, to
+    // no end. That the shadow is f32 is a property of one allocation, not of
+    // this kernel — the rotor encoder now produces its planes at the ring's
+    // sideband dtype and `fused_qk_dispatch` casts them down to the shadow's
+    // width on the way in. Both widths are correct here; what would not be is
+    // this dispatcher assuming one.
     let scales_flat = k_scales.reshape(&[scales_total as i32], device)?;
     let norms_flat = k_norms.reshape(&[norms_total as i32], device)?;
     let rotors_flat = k_rotors.reshape(&[rotors_total as i32], device)?;

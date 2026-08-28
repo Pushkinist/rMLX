@@ -2,22 +2,23 @@
 //! dispatchers — [`crate::iso_flash_decode_symv_msl`] and
 //! [`crate::rotor_flash_decode_symv_msl`].
 //!
-//! Both bind a per-token `norms` array as a kernel input. MLX's custom-kernel
-//! builder binds a small input array's outer-kernel parameter in the
-//! **`constant`** address space instead of `device` (an internal size
-//! heuristic), but both codecs' shared per-lane/per-group decode helpers
-//! (`if_decode_k_lane` in [`crate::iso_flash_decode_msl`]; `rf_decode_k_group`
-//! — the symv P1 kernel body calls this directly rather than the
-//! `rf_decode_k_lane` wrapper, since the Cl(3,0) sandwich needs the group
-//! result, not a single lane — in [`crate::rotor_flash_decode_msl`]) declare
-//! their `norms` parameter in the `device` address space — a mismatch
-//! that fails the MSL compile at first dispatch. The threshold was originally
-//! **measured** at 8 (a ring-only decode at `kv_h == 1` aborted for `kv_seq`
-//! 2–7 and succeeded from 8 on, for every `head_dim`); [`NORMS_DEVICE_MIN`] is
-//! set above it for margin. Only `norms` (one scalar per token) crosses it at
-//! low `kv_seq` — `codes` / `scales` carry `n_groups` more elements per token,
-//! and rotor's `rotors` table is sized off `n_groups` alone, so both stay above
-//! the threshold at any `kv_seq >= 1`.
+//! Both bind a per-token `norms` array as a kernel input. On the MLX build this
+//! floor was measured against, the custom-kernel builder **bound** a small input
+//! array's outer-kernel parameter in the **`constant`** address space instead of
+//! `device` (an internal size heuristic), while both codecs' shared
+//! per-lane/per-group decode helpers (`if_decode_k_lane` in
+//! [`crate::iso_flash_decode_msl`]; `rf_decode_k_group` — the symv P1 kernel
+//! body calls this directly rather than the `rf_decode_k_lane` wrapper, since
+//! the Cl(3,0) sandwich needs the group result, not a single lane — in
+//! [`crate::rotor_flash_decode_msl`]) declare their `norms` parameter in the
+//! `device` address space. That mismatch failed the MSL compile at first
+//! dispatch. The threshold was **measured** at 8 (a ring-only decode at
+//! `kv_h == 1` aborted for `kv_seq` 2–7 and succeeded from 8 on, for every
+//! `head_dim`); [`NORMS_DEVICE_MIN`] was set above it for margin. Only `norms`
+//! (one scalar per token) came near it at low `kv_seq` — `codes` / `scales`
+//! carry `n_groups` more elements per token, and rotor's `rotors` table is
+//! sized off `n_groups` alone, so both stayed above the threshold at any
+//! `kv_seq >= 1`.
 //!
 //! **The abort no longer reproduces on the pinned MLX.** Re-measured by
 //! disabling [`pad_norms_to_device_floor`] and sweeping a `kv_h == 1`
@@ -105,3 +106,7 @@ pub(crate) fn pad_norms_to_device_floor(
         .map_err(|_| Error::Mlx("pad_norms_to_device_floor: pad amount overflowed i32".into()))?;
     pad(&norms, &[0], &[0], &[extra], device)
 }
+
+#[cfg(test)]
+#[path = "flash_decode_common_tests.rs"]
+mod flash_decode_common_tests;

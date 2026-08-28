@@ -654,9 +654,10 @@ pub(crate) const BF16_BITS_PER_VALUE: f64 = 16.0;
 /// any sideband — and `n_values` the number of input values those buffers
 /// describe. Deriving the rate this way rather than from a codec's advertised
 /// bit width is the point: rotor3 advertises
-/// [`crate::rotorquant::ROTOR3_BITS`] = 3 and stores 21.75 — a factor of
-/// **7.25** — because the nominal width counts only the codes, and only the 3
-/// of 8 codes per group that carry information.
+/// [`crate::rotorquant::ROTOR3_BITS`] = 3 and stores 16.25 — a factor of
+/// **5.4** — because the nominal width counts only the codes, and only the 3
+/// of 8 codes per group that carry information. It was a factor of 7.25 while
+/// the scale and norm planes were `f32`.
 ///
 /// Returns `f64::INFINITY` for `n_values == 0` — a store with no values has no
 /// meaningful rate, and an infinite one fails every ceiling rather than passing
