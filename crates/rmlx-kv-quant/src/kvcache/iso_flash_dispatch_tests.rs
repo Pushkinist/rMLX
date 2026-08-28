@@ -67,7 +67,7 @@ fn iso_cache_b(quant: KvQuant, b: i32, kv_h: i32, head_dim: i32) -> KvCache {
             max_seq: MAX_SEQ,
         }
     };
-    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default())
+    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false)
 }
 
 /// Whether the cache's iso store currently holds a live GPU ring.

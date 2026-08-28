@@ -58,6 +58,7 @@ fn seeded_cache() -> KvCache {
         0,
         0,
         DispatchPolicy::default(),
+        false,
     )
 }
 

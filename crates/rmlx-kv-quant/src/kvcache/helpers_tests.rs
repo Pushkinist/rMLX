@@ -44,6 +44,7 @@ fn hydrate_none_storage_k8v8_quant_update_no_panic() {
         256, // offset: 256 tokens already "cached"
         0,   // layer_idx: 0 for this test helper,
         DispatchPolicy::default(),
+        false,
     );
     // One decode step: shape [B=1, kv_h=2, seq=1, D=128]
     let shape = [1i32, 2, 1, 128];
@@ -80,6 +81,7 @@ fn hydrate_none_storage_k8v4_and_planar_quant_update_no_panic() {
             256,
             0,
             DispatchPolicy::default(),
+            false,
         );
         let result = cache.update(&k, &v, device);
         assert!(
@@ -108,6 +110,7 @@ fn hydrate_none_storage_k8v8_quant_exit_prefill_no_panic() {
         0,
         0,
         DispatchPolicy::default(),
+        false,
     );
     cache.enter_prefill();
     // Feed a 4-token prefill chunk: shape [B=1, kv_h=2, seq=4, D=128]

@@ -90,7 +90,7 @@ fn seeded_cache_b(quant: KvQuant, b: i32, kv_h: i32, head_dim: i32, use_qjl: boo
             max_seq: MAX_SEQ,
         }
     };
-    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default())
+    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false)
 }
 
 /// Drive one prefill chunk + 4 decode steps through the production
@@ -195,7 +195,7 @@ fn seeded_sym_cache(quant: KvQuant, kv_h: i32, head_dim: i32) -> KvCache {
             max_seq: MAX_SEQ,
         }
     };
-    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default())
+    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false)
 }
 
 /// `(cpu blocks, ring live)` for the K axis of the active symmetric rotor store.

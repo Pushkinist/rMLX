@@ -10,7 +10,7 @@ use super::*;
 //
 // On a normal serve these codecs never read their CPU block list at decode time:
 // `exit_prefill` materialises the bf16 `decode_fp16_{k,v}` seed for every quant
-// whose `feeds_bf16_k_at_decode()` is true, and every quantized `update_<codec>`
+// whose `feeds_bf16_k_at_decode` is true, and every quantized `update_<codec>`
 // early-returns into `update_decode_fp16` from then on — which is why
 // `exit_prefill` does not build the store for them at all
 // (`KvQuant::materialises_packed_store`). The fixtures below drive the codec
@@ -170,6 +170,7 @@ fn hydrated_truncate_keeps_prefix_and_correction(quant: KvQuant, kv_h: i32) {
             cache_seed(TEST_LAYOUT_KEY, quant, &[quant], TEST_MODEL_SIG),
             quant,
             DispatchPolicy::default(),
+            false,
         )
         .unwrap()
         .expect("SSD hit expected");

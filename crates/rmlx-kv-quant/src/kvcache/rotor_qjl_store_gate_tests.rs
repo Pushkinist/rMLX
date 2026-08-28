@@ -72,7 +72,7 @@ fn seeded_qjl_off_cache(quant: KvQuant, kv_h: i32, head_dim: i32) -> KvCache {
             max_seq: MAX_SEQ,
         }
     };
-    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default())
+    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false)
 }
 
 /// True once the cache's rotor K store has a live GPU ring — the witness that

@@ -951,12 +951,16 @@ mod tests {
         let (new_k, _) = make_lcg_array(step_shape, 0xD4D4_D4D4_u64);
         let (new_v, _) = make_lcg_array(step_shape, 0xE5E5_E5E5_u64);
 
+        // The shared-source wrapper is the cross-layer-KV producer entry point,
+        // so the cache this test drives is one: without the declaration the
+        // Mixed bf16 mirror it surfaces is never built and the call is refused.
         let mut cache = KvCache::with_quant(KvQuant::Mixed {
             k_bits: 8,
             v_bits: 4,
             k_group_size: 64,
             v_group_size: 64,
-        });
+        })
+        .with_shares_kv(true);
 
         // Prefill through the shared-KV wrapper — must NOT error for Mixed.
         cache.enter_prefill();
@@ -1042,12 +1046,15 @@ mod tests {
         let (v_pref, _) = make_lcg_array(prefill_shape, 0x2B2B_0002_u64);
         let (q_pref, _) = make_lcg_array(prefill_shape, 0x2B2B_0003_u64);
 
+        // Driven through the shared-source wrapper, so this is a cross-layer-KV
+        // producer layer and must say so.
         let mut cache = KvCache::with_quant(KvQuant::Mixed {
             k_bits: 8,
             v_bits: 2,
             k_group_size: 64,
             v_group_size: 64,
-        });
+        })
+        .with_shares_kv(true);
 
         cache.enter_prefill();
         let (out_pref, _k_full, v_full) = split_bf16_share(
@@ -1700,12 +1707,22 @@ mod tests {
         v
     }
 
-    /// A codec that keeps a packed store **and** both bf16 mirrors on the
-    /// windowed+global mix is net-negative: the global-layer codes + scales are
-    /// pure addition on top of mirrors that are already bf16-sized. The warn
-    /// must fire (total saving < 0) and the windowed layers must contribute 0.
+    /// On the windowed+global mix, `Mixed` warns exactly when the architecture
+    /// shares K/V — the same discriminator the allocation uses.
+    ///
+    /// The e2b mix is a Gemma4 shape, and Gemma4 does share: its global layers
+    /// keep both bf16 mirrors for their consumer layers, so the packed store's
+    /// codes and scales are pure addition on top of buffers that are already
+    /// bf16-sized and the advisory fires. Give the same mix to a stack that does
+    /// not share and the mirrors are not built, leaving the store alone — a
+    /// saving, and the advisory must stay silent.
+    ///
+    /// Both arms are asserted because the failure that matters is asymmetric: a
+    /// warn that fires on a dense stack is the estimator describing bytes
+    /// nothing allocated, which is exactly the drift the shared flag exists to
+    /// prevent. The windowed layers contribute 0 under both.
     #[test]
-    fn net_negative_warn_fires_on_store_plus_mirror_codec_swa_mix() {
+    fn net_negative_warn_on_swa_mix_follows_shared_kv() {
         let layers = e2b_layer_mix();
         let n_windowed = layers.iter().filter(|l| l.window.is_some()).count();
         let mixed = KvQuant::Mixed {
@@ -1714,13 +1731,35 @@ mod tests {
             k_group_size: 64,
             v_group_size: 64,
         };
-        let (saving, n_global, n_win) = kv_codec_net_saving_total(mixed, &layers, 4096);
+
+        let (shared, n_global, n_win) = kv_codec_net_saving_total(mixed, &layers, 4096, true);
         assert_eq!(n_win, n_windowed);
         assert_eq!(n_global, 35 - n_windowed);
         assert!(
-            saving < 0,
-            "a store + both-mirror codec on the SWA+global mix at 4096 ctx must be \
-             net-negative (warn fires); got {saving}"
+            shared < 0,
+            "shared-KV: a store + both-mirror codec on the SWA+global mix at 4096 ctx \
+             must be net-negative (warn fires); got {shared}"
+        );
+
+        let (dense, _, _) = kv_codec_net_saving_total(mixed, &layers, 4096, false);
+        assert!(
+            dense > 0,
+            "dense: with no mirror to keep, the same mix must be a net saving and the \
+             advisory must stay silent; got {dense}"
+        );
+
+        // The gap is the mirror pair on the global layers only — the windowed
+        // ones run the bf16 ring under both topologies and contribute nothing.
+        let mirror_pair: i64 = layers
+            .iter()
+            .filter(|l| l.window.is_none())
+            .map(|l| 2 * 4096 * l.head_dim * l.kv_heads * 2)
+            .sum::<u64>() as i64;
+        assert_eq!(
+            dense - shared,
+            mirror_pair,
+            "the whole difference between the two topologies is the global layers' \
+             bf16 mirror pair"
         );
     }
 
@@ -1733,7 +1772,7 @@ mod tests {
         let layers = e2b_layer_mix();
         for quant in [KvQuant::K8V4, KvQuant::K8V8, KvQuant::Planar] {
             for eff_seq in [512, 4096, 131_072] {
-                let (saving, _, _) = kv_codec_net_saving_total(quant, &layers, eff_seq);
+                let (saving, _, _) = kv_codec_net_saving_total(quant, &layers, eff_seq, false);
                 assert_eq!(
                     saving, 0,
                     "{quant:?} at eff_seq={eff_seq} holds exactly the bf16 bytes — the \
@@ -1747,7 +1786,7 @@ mod tests {
     #[test]
     fn net_negative_warn_silent_for_bf16() {
         let layers = e2b_layer_mix();
-        let (saving, _, _) = kv_codec_net_saving_total(KvQuant::None, &layers, 4096);
+        let (saving, _, _) = kv_codec_net_saving_total(KvQuant::None, &layers, 4096, false);
         assert_eq!(saving, 0, "bf16 must never be net-negative against itself");
     }
 
@@ -1774,7 +1813,7 @@ mod tests {
             })
             .collect();
         let (rotor, n_global, n_win) =
-            kv_codec_net_saving_total(KvQuant::RotorKOnly4, &layers, 16_384);
+            kv_codec_net_saving_total(KvQuant::RotorKOnly4, &layers, 16_384, false);
         assert_eq!(n_global, 16);
         assert_eq!(n_win, 0);
         assert!(
@@ -1782,7 +1821,7 @@ mod tests {
             "RotorKOnly4 stores 16.25 bits per value against bf16's 16 → net-negative even \
              all-global; got {rotor}"
         );
-        let (iso, _, _) = kv_codec_net_saving_total(KvQuant::IsoKOnly4, &layers, 16_384);
+        let (iso, _, _) = kv_codec_net_saving_total(KvQuant::IsoKOnly4, &layers, 16_384, false);
         assert!(
             iso > 0,
             "IsoKOnly4 stores 12.125 bits per value on the same mix → the advisory must stay \
@@ -1802,7 +1841,7 @@ mod tests {
             })
             .collect();
         for q in [KvQuant::K8V4, KvQuant::K8V8, KvQuant::Planar] {
-            let (saving, n_global, n_win) = kv_codec_net_saving_total(q, &layers, 4096);
+            let (saving, n_global, n_win) = kv_codec_net_saving_total(q, &layers, 4096, false);
             assert_eq!(n_global, 0);
             assert_eq!(n_win, 24);
             assert_eq!(saving, 0, "{q:?} all-windowed mix must net to 0 (no warn)");

@@ -2678,8 +2678,8 @@ impl KvCache {
         // that owns the Metal stream, is what makes the seed mean what its shape
         // says for every later reader.
         let is_bf16_storage = matches!(self.storage, KvStorage::None { .. });
-        let need_k_seed = is_bf16_storage || self.quant.feeds_bf16_k_at_decode();
-        let need_v_seed = is_bf16_storage || self.quant.feeds_bf16_v_at_decode();
+        let need_k_seed = is_bf16_storage || self.quant.feeds_bf16_k_at_decode(self.shares_kv);
+        let need_v_seed = is_bf16_storage || self.quant.feeds_bf16_v_at_decode(self.shares_kv);
         let k_buf = if need_k_seed {
             let k = k_full.contiguous(device)?;
             k.eval()?;
@@ -3909,6 +3909,10 @@ impl KvCache {
             layer_idx: _,
             in_prefill: _,
             stream_dtype: _,
+            // Model topology, not an allocation. It decides *whether* the two
+            // decode mirrors above exist; the bytes are then counted off the
+            // buffers themselves, so it must not be added a second time here.
+            shares_kv: _,
             flash_max_seq: _,
             flash_filled: _,
             max_seq_ceiling: _,
@@ -6512,8 +6516,12 @@ impl KvCache {
                 None => None,
             },
             // The clone serves the same model, so it inherits the stream dtype
-            // rather than re-learning it on its first append.
+            // rather than re-learning it on its first append. The same is true
+            // of the sharing topology: a branch of a producer layer is still a
+            // producer layer, and a clone that forgot it would drop the mirror
+            // its consumers read at the branch's first `exit_prefill`.
             stream_dtype: self.stream_dtype,
+            shares_kv: self.shares_kv,
             rotating: match &self.rotating {
                 Some(r) => Some(r.try_deep_clone()?),
                 None => None,

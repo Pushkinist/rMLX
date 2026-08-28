@@ -1508,6 +1508,7 @@ fn roundtrip_none_bf16_payload_via_spill_hydrate() {
             shape[2],
             layer as usize,
             DispatchPolicy::default(),
+            false,
         )
         .with_decode_fp16_seed(k_bf16, v_bf16);
         kv_caches.push(cache);
@@ -1550,6 +1551,7 @@ fn roundtrip_none_bf16_payload_via_spill_hydrate() {
         MODEL_ID,
         KvQuant::None,
         DispatchPolicy::default(),
+        false,
     )
     .unwrap();
     assert_eq!(hydrated.len(), 2, "bridge layer count");
@@ -1621,8 +1623,15 @@ fn roundtrip_mirror_codec_spills_and_hydrates_as_bf16() {
         let path = tmp_path(&format!("mirror_bf16_{label}"));
         write_caches(&path, device, MODEL_ID, quant, &[cache], &[]).unwrap();
 
-        let (hydrated, _lin) =
-            read_caches(&path, device, MODEL_ID, quant, DispatchPolicy::default()).unwrap();
+        let (hydrated, _lin) = read_caches(
+            &path,
+            device,
+            MODEL_ID,
+            quant,
+            DispatchPolicy::default(),
+            false,
+        )
+        .unwrap();
         assert_eq!(hydrated.len(), 1, "{label}: layer count");
         assert_eq!(
             hydrated[0].offset(),
@@ -1729,6 +1738,7 @@ fn tail_extended_store_backed_cache_does_not_spill_a_short_block() {
         MODEL_ID,
         KvQuant::K8V8,
         DispatchPolicy::default(),
+        false,
     )
     .unwrap();
     let hydrated_len = rebuilt[0].offset();
@@ -1954,6 +1964,7 @@ fn hydrate_carries_the_callers_dispatch_policy() {
                 shape[2],
                 layer as usize,
                 DispatchPolicy::default(),
+                false,
             )
             .with_decode_fp16_seed(k, v),
         );
@@ -1961,7 +1972,8 @@ fn hydrate_carries_the_callers_dispatch_policy() {
 
     let path = tmp_path("hydrate_policy");
     write_caches(&path, device, MODEL_ID, KvQuant::None, &kv_caches, &[]).unwrap();
-    let (hydrated, _lin) = read_caches(&path, device, MODEL_ID, KvQuant::None, requested).unwrap();
+    let (hydrated, _lin) =
+        read_caches(&path, device, MODEL_ID, KvQuant::None, requested, false).unwrap();
 
     assert_eq!(hydrated.len(), 2, "layer count");
     for (layer, cache) in hydrated.iter().enumerate() {
@@ -2155,8 +2167,14 @@ fn c3_k8v4_hydrate_round_trip_no_panic() {
     let (rebuilt, _bf16, _) = reader.hydrate(MODEL_ID, KvQuant::K8V4, device).unwrap();
     let storage = rebuilt.into_iter().next().unwrap();
 
-    let mut cache =
-        KvCache::from_storage(storage, KvQuant::K8V4, 300, 0, DispatchPolicy::default());
+    let mut cache = KvCache::from_storage(
+        storage,
+        KvQuant::K8V4,
+        300,
+        0,
+        DispatchPolicy::default(),
+        false,
+    );
     // One decode step — must not OOB-panic.
     // n1 = B*kv_h*S*D = 1*2*1*128 = 256.
     let n1 = 256usize;
@@ -2203,8 +2221,14 @@ fn c2_planar_hydrate_round_trip_no_panic() {
     let (rebuilt, _bf16, _) = reader.hydrate(MODEL_ID, KvQuant::Planar, device).unwrap();
     let storage = rebuilt.into_iter().next().unwrap();
 
-    let mut cache =
-        KvCache::from_storage(storage, KvQuant::Planar, 300, 0, DispatchPolicy::default());
+    let mut cache = KvCache::from_storage(
+        storage,
+        KvQuant::Planar,
+        300,
+        0,
+        DispatchPolicy::default(),
+        false,
+    );
     // n1 = B*kv_h*S*D = 1*2*1*128 = 256.
     let n1 = 256usize;
     let one_k = arr(&lcg(n1, 0xEEFF), &[1, 2, 1, 128]);
@@ -2289,6 +2313,7 @@ fn planar3_prefilled_gpu_spill_hydrate_is_bf16_and_exact() {
         MODEL_ID,
         KvQuant::Planar3,
         DispatchPolicy::default(),
+        false,
     )
     .unwrap();
     assert_eq!(rebuilt[0].offset(), shape[2], "spilled length");
@@ -2423,8 +2448,14 @@ fn h4_swa_prev_offset_exceeds_max_seq_reset_no_panic() {
     // Simulate a SWA layer hydrated with prev_offset=1023, max_seq=512.
     // The SWA ring buffer was not spilled; offset > max_seq triggers reset.
     let storage = KvStorage::None { max_seq: 512 };
-    let mut cache =
-        KvCache::from_storage(storage, KvQuant::None, 1023, 0, DispatchPolicy::default());
+    let mut cache = KvCache::from_storage(
+        storage,
+        KvQuant::None,
+        1023,
+        0,
+        DispatchPolicy::default(),
+        false,
+    );
 
     // n = B*kv_h*S*D = 1*2*1*128 = 256.
     let n = 256usize;
@@ -3144,6 +3175,7 @@ fn ssd_roundtrip_preserves_layer_idx_positional() {
             4,
             i,
             DispatchPolicy::default(),
+            false,
         ));
     }
 
@@ -3161,6 +3193,7 @@ fn ssd_roundtrip_preserves_layer_idx_positional() {
         MODEL_ID,
         KvQuant::Rotor3,
         DispatchPolicy::default(),
+        false,
     )
     .unwrap();
 
@@ -3216,6 +3249,7 @@ fn seeded_rotor_k3_cache(kv_h: i32, head_dim: i32, max_seq: i32) -> KvCache {
         0,
         0,
         DispatchPolicy::default(),
+        false,
     )
 }
 
@@ -3365,6 +3399,7 @@ fn rotor_k_only_ring_only_tail_ssd_round_trip() {
         MODEL_ID,
         KvQuant::RotorKOnly3,
         DispatchPolicy::default(),
+        false,
     )
     .unwrap();
     let _ = std::fs::remove_file(&path);
@@ -3412,7 +3447,14 @@ fn seeded_rotor_sym3_cache(kv_h: i32, head_dim: i32, max_seq: i32) -> KvCache {
         )),
         max_seq,
     };
-    KvCache::from_storage(storage, KvQuant::Rotor3Sym, 0, 0, DispatchPolicy::default())
+    KvCache::from_storage(
+        storage,
+        KvQuant::Rotor3Sym,
+        0,
+        0,
+        DispatchPolicy::default(),
+        false,
+    )
 }
 
 /// `(k_dequant, v_dequant, shape[2], k_block_tokens, v_block_tokens)` for a
@@ -3573,6 +3615,7 @@ fn rotor_sym_ring_only_tail_ssd_round_trip() {
         MODEL_ID,
         KvQuant::Rotor3Sym,
         DispatchPolicy::default(),
+        false,
     )
     .unwrap();
     let _ = std::fs::remove_file(&path);
@@ -3610,7 +3653,14 @@ fn seeded_iso_sym3_cache(kv_h: i32, head_dim: i32, max_seq: i32) -> KvCache {
         )),
         max_seq,
     };
-    KvCache::from_storage(storage, KvQuant::Iso3Sym, 0, 0, DispatchPolicy::default())
+    KvCache::from_storage(
+        storage,
+        KvQuant::Iso3Sym,
+        0,
+        0,
+        DispatchPolicy::default(),
+        false,
+    )
 }
 
 /// `(k_dequant, v_dequant, shape[2], k_block_tokens, v_block_tokens)` for an
@@ -3854,6 +3904,7 @@ fn iso_sym_transition_across_ring_norms_floor() {
         0,
         0,
         DispatchPolicy::default(),
+        false,
     );
 
     // Identical one-token prefill on both caches, matching a realistic short
@@ -3971,6 +4022,7 @@ fn rotor_sym_transition_across_ring_norms_floor() {
         0,
         0,
         DispatchPolicy::default(),
+        false,
     );
 
     let prefill = 1_i32;
@@ -4164,6 +4216,7 @@ fn iso_sym_ring_only_tail_ssd_round_trip() {
         MODEL_ID,
         KvQuant::Iso3Sym,
         DispatchPolicy::default(),
+        false,
     )
     .unwrap();
     let _ = std::fs::remove_file(&path);
