@@ -870,7 +870,12 @@ pub fn eagle3_generate_greedy(
     let mut v_caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
         .map(|i| {
             let window = verifier.layer_sliding_window(i);
-            KvCache::with_quant_max_seq_window(kv_quant, max_seq, window).with_layer_idx(i)
+            KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
+                .with_layer_idx(i)
+                // The verifier stack decides whether its layers read each
+                // other's K/V, and so whether Mixed/RotK keep their bf16
+                // mirror. A spec pair must not run two different caches.
+                .with_shares_kv(verifier.shares_kv_across_layers())
         })
         .collect();
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())

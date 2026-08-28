@@ -55,6 +55,31 @@ pub struct KvCache {
     /// [`KvCache::reset`] (the layer identity does not change between
     /// requests).
     pub(super) layer_idx: usize,
+    /// Does this layer's architecture hand its K/V to **other** layers?
+    ///
+    /// Set at construction by the arch builder (`KvCache::with_shares_kv`);
+    /// `false` by default, which is every architecture in the tree except
+    /// Gemma4. It is not a codec property and not a shape property — it is the
+    /// model's topology — so no predicate can derive it and no cache can guess
+    /// it.
+    ///
+    /// It is read for exactly one decision, in two places that must agree: the
+    /// `Mixed` / `RotK` bf16 mirror. Those codecs decode straight off their
+    /// affine 3-tuples and never read the mirror themselves; the only consumer
+    /// is the `want_kv` arm of `update_and_sdpa_mixed_inner`, reached solely
+    /// from [`KvCache::update_and_sdpa_shared_source`], plus the `SharedKv`
+    /// pair it hands a drafter. Where nothing shares, `exit_prefill` builds no
+    /// mirror and [`crate::KvQuant::estimated_resident_bytes_per_layer`]
+    /// estimates none — one flag, so the estimate cannot drift from the
+    /// allocation.
+    ///
+    /// A cache built without it that then reaches
+    /// [`KvCache::update_and_sdpa_shared_source`] is rejected there, before any
+    /// state moves. Silently allocating the mirror on demand instead would
+    /// zero-fill the whole prefix (the producer is already past prefill by
+    /// then) and answer with a K/V that is correct for one token and zeros for
+    /// every earlier one.
+    pub(super) shares_kv: bool,
     pub(super) prefill_raw_k: Option<Array>,
     pub(super) prefill_raw_v: Option<Array>,
     pub(super) in_prefill: bool,
@@ -189,6 +214,32 @@ impl KvCache {
         self
     }
 
+    /// Declare that this layer's K/V is read by **other** layers of the model.
+    ///
+    /// Call this in the arch builder loop, beside `with_layer_idx`, for every
+    /// layer of an architecture whose attention stack has a cross-layer-KV
+    /// topology — i.e. one whose forward reaches
+    /// [`KvCache::update_and_sdpa_shared_source`]. Architectures whose layers
+    /// each own their K/V need nothing: `false` is the default.
+    ///
+    /// The only effect is on the `Mixed` / `RotK` bf16 mirror; see the
+    /// [`shares_kv`](Self::shares_kv) accessor and the field's documentation
+    /// for what reads it and why no predicate can infer it.
+    #[must_use]
+    pub fn with_shares_kv(mut self, shares_kv: bool) -> Self {
+        self.shares_kv = shares_kv;
+        self
+    }
+
+    /// Whether this layer's K/V is read by other layers of the model.
+    ///
+    /// Set by [`Self::with_shares_kv`] or [`Self::from_storage`]. Callers pass
+    /// it to [`crate::KvQuant::feeds_bf16_k_at_decode`] and the byte estimate
+    /// so both answer for the topology this cache actually runs under.
+    pub fn shares_kv(&self) -> bool {
+        self.shares_kv
+    }
+
     /// Model-side layer index that seeds rotor3/rotor4 codec tables.
     ///
     /// Read-only accessor for the field set by [`Self::with_layer_idx`] or by
@@ -240,18 +291,27 @@ impl KvCache {
     /// paths it did. Reading the process default here instead would put the
     /// SSD tier back on process-global behaviour for that one path — invisible
     /// while every cache shares the default, wrong the moment two do not.
+    ///
+    /// `shares_kv` is threaded for the same reason `layer_idx` and `policy`
+    /// are, and matters more: a hydrated cache can be tail-extended, which
+    /// re-enters prefill and so re-runs the `exit_prefill` gate that decides
+    /// whether a `Mixed` / `RotK` layer keeps a bf16 mirror. Reading a default
+    /// here would drop the mirror a shared-KV arch's very next decode step
+    /// needs.
     pub fn from_storage(
         storage: KvStorage,
         quant: KvQuant,
         offset: i32,
         layer_idx: usize,
         policy: DispatchPolicy,
+        shares_kv: bool,
     ) -> Self {
         Self {
             storage,
             offset,
             quant,
             layer_idx,
+            shares_kv,
             prefill_raw_k: None,
             prefill_raw_v: None,
             in_prefill: false,
@@ -282,6 +342,10 @@ impl KvCache {
             offset: 0,
             quant,
             layer_idx: 0,
+            // Default: no cross-layer KV sharing. Chain `with_shares_kv(true)`
+            // in the builder of an architecture whose layers read each other's
+            // K/V — see the field's own documentation.
+            shares_kv: false,
             prefill_raw_k: None,
             prefill_raw_v: None,
             in_prefill: false,
@@ -434,7 +498,7 @@ impl KvCache {
     /// Used by regression tests to verify the bf16 K seed is
     /// populated for the warm-TTFT shortcut codecs at `exit_prefill`, and is
     /// **absent** for the K-only codecs (IsoKOnly3/4, RotorKOnly3/4) since
-    /// the K-only path gates materialisation on `KvQuant::feeds_bf16_k_at_decode()`
+    /// the K-only path gates materialisation on `KvQuant::feeds_bf16_k_at_decode`
     /// (dead memory otherwise).
     #[cfg(test)]
     pub fn decode_fp16_k_for_test(&self) -> Option<&Array> {

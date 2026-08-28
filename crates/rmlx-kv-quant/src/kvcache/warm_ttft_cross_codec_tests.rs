@@ -31,7 +31,7 @@
 //! window — dead memory.
 //!
 //! The fix gates the K-seed materialisation on
-//! `KvQuant::feeds_bf16_k_at_decode()`, which is `false` for the K-only family.
+//! `KvQuant::feeds_bf16_k_at_decode`, which is `false` for the K-only family.
 //! So the K-only tests below assert `decode_fp16_k` is **absent** after
 //! exit_prefill+decode (the V seed is still present, and the K codec still
 //! advances every decode step — correctness is byte-unchanged, only the dead
@@ -407,7 +407,7 @@ fn iso_sym3_fused_no_seed_at_decode() {
 
 /// K-only contract: IsoKOnly3 quantises K at every decode step and
 /// never reads the bf16 K seed. The K-seed materialisation is gated on
-/// `KvQuant::feeds_bf16_k_at_decode()`, which is `false` for the K-only family:
+/// `KvQuant::feeds_bf16_k_at_decode`, which is `false` for the K-only family:
 /// the K seed is ABSENT while the V seed stays live, the K codec still
 /// advances one position per decode step, and the reported residency drops by the
 /// bf16 K-seed cost. Output is byte-unchanged.
@@ -504,4 +504,194 @@ fn rotor_k_only3_quant_at_decode() {
         "RotorKOnly3: resident_bytes must equal the rotor3 K store plus the bf16 V seed's \
          filled prefix and nothing else",
     );
+}
+
+/// The `Mixed` / `RotK` bf16 mirror exists for a cross-layer-KV consumer and
+/// for nothing else, so `exit_prefill` builds it exactly when the cache says
+/// its architecture shares K/V.
+///
+/// The two arms are the same codec, the same geometry and the same prefill —
+/// only `with_shares_kv` differs. The dense arm must hold its packed store and
+/// nothing more; the shared arm must hold that store plus both mirrors, and the
+/// difference must be exactly the mirror pair. Anchoring the delta to the live
+/// buffers (rather than to a nominal bit-width) is what makes this fail if a
+/// mirror is half-elided, counted twice, or replaced by a shorter one.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn mixed_family_mirror_is_built_exactly_when_the_arch_shares_kv() {
+    let device = Device::Cpu;
+
+    let prefill = |quant: KvQuant, shares_kv: bool| -> KvCache {
+        let mut cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ).with_shares_kv(shares_kv);
+        cache.enter_prefill();
+        let shape = [1i32, TEST_KV_H, TEST_PREFILL_SEQ, TEST_HEAD_DIM];
+        let n: usize = shape.iter().map(|&d| d as usize).product();
+        cache
+            .update(
+                &f32_arr(&vec![0.123f32; n], &shape),
+                &f32_arr(&vec![0.456f32; n], &shape),
+                device,
+            )
+            .expect("prefill chunk");
+        cache.exit_prefill(device).expect("exit_prefill");
+        cache
+    };
+
+    // Both members of the Mixed machinery, at the codec shapes `--kv-bits 4`
+    // and `--kv-quant rot_k_v4g64` resolve to.
+    let codecs = [
+        KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        },
+        KvQuant::RotK {
+            v_bits: 4,
+            v_group_size: 64,
+        },
+    ];
+
+    for quant in codecs {
+        let dense = prefill(quant, false);
+        assert!(
+            dense.decode_fp16_k_for_test().is_none() && dense.decode_fp16_v_for_test().is_none(),
+            "{quant:?}: with no cross-layer KV sharing nothing reads the bf16 mirror, so \
+             exit_prefill must build neither axis"
+        );
+        let dense_store = dense.storage().resident_bytes();
+        assert!(
+            dense_store > 0,
+            "{quant:?}: the packed store is what decode reads and must still be built"
+        );
+        assert_eq!(
+            dense.resident_bytes(),
+            dense_store,
+            "{quant:?}: a dense cache holds its packed store and nothing else"
+        );
+
+        let shared = prefill(quant, true);
+        let k = shared
+            .decode_fp16_k_for_test()
+            .expect("shared-KV K mirror is the share handed to consumer layers");
+        let v = shared
+            .decode_fp16_v_for_test()
+            .expect("shared-KV V mirror is the share handed to consumer layers");
+        let mirror_pair =
+            filled_mirror_bytes(k, TEST_PREFILL_SEQ) + filled_mirror_bytes(v, TEST_PREFILL_SEQ);
+        assert_eq!(
+            shared.storage().resident_bytes(),
+            dense_store,
+            "{quant:?}: the packed store is identical under both topologies — the \
+             topology decides the mirror, never the store"
+        );
+        assert_eq!(
+            shared.resident_bytes(),
+            dense_store + mirror_pair,
+            "{quant:?}: a shared-KV cache holds the same store plus both mirrors"
+        );
+        assert_eq!(
+            shared.resident_bytes() - dense.resident_bytes(),
+            mirror_pair,
+            "{quant:?}: the whole difference between the two topologies is the mirror pair"
+        );
+    }
+}
+
+/// `shares_kv` moves the `Mixed` machinery and **nothing else**.
+///
+/// Every other codec's mirror disposition is a property of the codec alone, so
+/// building the same cache under both topologies must reproduce byte-identical
+/// residency for all of them. Without this, widening `shares_kv`'s reach — to a
+/// codec whose decode genuinely needs its mirror on every arch — would silently
+/// strand that codec's decode on zeros, and only a served model would say so.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn shares_kv_moves_only_the_mixed_machinery() {
+    let device = Device::Cpu;
+
+    let prefill = |quant: KvQuant, shares_kv: bool| -> KvCache {
+        let mut cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ).with_shares_kv(shares_kv);
+        cache.enter_prefill();
+        let shape = [1i32, TEST_KV_H, TEST_PREFILL_SEQ, TEST_HEAD_DIM];
+        let n: usize = shape.iter().map(|&d| d as usize).product();
+        cache
+            .update(
+                &f32_arr(&vec![0.123f32; n], &shape),
+                &f32_arr(&vec![0.456f32; n], &shape),
+                device,
+            )
+            .expect("prefill chunk");
+        cache.exit_prefill(device).expect("exit_prefill");
+        cache
+    };
+
+    for &quant in crate::ALL_KV_QUANTS {
+        let dense = prefill(quant, false);
+        let shared = prefill(quant, true);
+        let same_k =
+            dense.decode_fp16_k_for_test().is_some() == shared.decode_fp16_k_for_test().is_some();
+        let same_v =
+            dense.decode_fp16_v_for_test().is_some() == shared.decode_fp16_v_for_test().is_some();
+        if quant.uses_mixed_path() {
+            assert!(
+                !same_k && !same_v,
+                "{quant:?} is the Mixed machinery: its mirror must follow the topology"
+            );
+            assert!(
+                shared.resident_bytes() > dense.resident_bytes(),
+                "{quant:?}: the shared-KV arm holds strictly more (the mirror pair)"
+            );
+        } else {
+            assert!(
+                same_k && same_v,
+                "{quant:?} mirrors on its own codec properties — `shares_kv` must not \
+                 move either axis"
+            );
+            assert_eq!(
+                dense.resident_bytes(),
+                shared.resident_bytes(),
+                "{quant:?}: residency must be byte-identical under both topologies"
+            );
+        }
+    }
+}
+
+/// A branch clone of a shared-KV producer is still a shared-KV producer.
+///
+/// `try_deep_clone` is how a request branches (prompt-cache reuse, speculative
+/// rollback). A clone that forgot the topology would build no mirror at its
+/// next `exit_prefill`, and the branch's first shared-source decode step would
+/// then be refused — a live request failing on a field copy. Asserted in both
+/// directions so a clone that hard-codes either value fails.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn deep_clone_carries_the_sharing_topology() {
+    for shares in [false, true] {
+        let cache = KvCache::with_quant_max_seq(
+            KvQuant::Mixed {
+                k_bits: 8,
+                v_bits: 4,
+                k_group_size: 64,
+                v_group_size: 64,
+            },
+            TEST_MAX_SEQ,
+        )
+        .with_shares_kv(shares);
+        let clone = cache.try_deep_clone().expect("deep clone");
+        assert_eq!(
+            clone.shares_kv(),
+            shares,
+            "a branch clone must carry the producer's topology, not re-derive it"
+        );
+    }
 }

@@ -200,6 +200,7 @@ fn hydrate_incomplete_when_swa_layer_empty() {
         256,
         0,
         DispatchPolicy::default(),
+        true,
     );
     assert!(
         full.has_persistent_cache(),
@@ -214,6 +215,7 @@ fn hydrate_incomplete_when_swa_layer_empty() {
         256,
         1,
         DispatchPolicy::default(),
+        true,
     );
     assert!(
         !swa.has_persistent_cache() && swa.decode_fp16_kv().is_none(),
@@ -622,6 +624,7 @@ fn gemma4_consume_engine_migration_golden() {
                 BLOCK_TOKENS as i32,
                 i,
                 DispatchPolicy::default(),
+                true,
             );
             assert!(
                 !c.has_persistent_cache() && c.decode_fp16_kv().is_none(),

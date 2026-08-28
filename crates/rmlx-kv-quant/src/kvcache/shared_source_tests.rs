@@ -166,3 +166,59 @@ fn shared_source_cpu_device_legacy_fallback_surfaces_full_prefix_shape() {
         "surfaced V must span [0:offset] over the full prefix",
     );
 }
+
+/// A `Mixed` cache that was never declared a cross-layer-KV producer refuses
+/// `update_and_sdpa_shared_source` instead of answering with a zeroed prefix.
+///
+/// The mirror this path surfaces is built at `exit_prefill`, gated on the
+/// cache's own `shares_kv`. Reaching here without it means the model's topology
+/// and its cache construction disagree; prefill is over, so the mirror cannot
+/// be rebuilt — `update_decode_fp16` would allocate zeros and slice in only the
+/// current token. The refusal happens before any offset moves, so the caller
+/// sees an error rather than a silently wrong K/V.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn shared_source_refuses_a_mixed_cache_that_did_not_declare_sharing() {
+    let device = Device::Cpu;
+    let quant = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 4,
+        k_group_size: 64,
+        v_group_size: 64,
+    };
+    let mut cache = KvCache::with_quant_max_seq(quant, 512).with_shares_kv(false);
+
+    let seq = 32_i32;
+    let kv_h = 2_i32;
+    let head_dim = 64_i32;
+    let shape = [1_i32, kv_h, seq, head_dim];
+    let n: usize = shape.iter().map(|&d| d as usize).product();
+    let k = f32_arr(&vec![0.1_f32; n], &shape);
+    let v = f32_arr(&vec![0.2_f32; n], &shape);
+    let q = f32_arr(&vec![0.3_f32; n], &shape);
+
+    let offset_before = cache.offset();
+    let msg = match cache.update_and_sdpa_shared_source(&q, &k, &v, 1.0, "causal", None, device) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a Mixed cache with no declared sharing must refuse this path"),
+    };
+    assert!(
+        msg.contains("with_shares_kv"),
+        "the error must name the fix; got: {msg}"
+    );
+    assert_eq!(
+        cache.offset(),
+        offset_before,
+        "the refusal must happen before any state moves"
+    );
+
+    // The same call on a cache that did declare sharing goes through.
+    let mut shared = KvCache::with_quant_max_seq(quant, 512).with_shares_kv(true);
+    shared.enter_prefill();
+    shared
+        .update_and_sdpa_shared_source(&q, &k, &v, 1.0, "causal", None, device)
+        .expect("a declared shared-KV producer must be served");
+}

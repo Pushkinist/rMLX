@@ -656,6 +656,36 @@ impl Architecture {
         matches!(self, Architecture::Qwen3(_) | Architecture::Qwen3_5Moe(_))
     }
 
+    /// Whether this architecture's decoder layers read **each other's** K/V —
+    /// a cross-layer-KV (shared-KV) topology.
+    ///
+    /// `true` only for Gemma4, whose consumer layers project no K/V of their
+    /// own and attend over a designated producer layer's cache via
+    /// `KvCache::update_and_sdpa_shared_source`. Every other stack in the tree
+    /// gives each layer its own K/V.
+    ///
+    /// Every caller that builds a `KvCache` for an unknown architecture — the
+    /// speculative verifier stacks — must pass this to
+    /// `KvCache::with_shares_kv`. It is what decides whether the `Mixed` /
+    /// `RotK` codecs keep their bf16 K/V mirror: on a stack that shares, the
+    /// mirror is the share; on one that does not, nothing reads it and it is
+    /// two full bf16 buffers of dead memory per layer.
+    ///
+    /// The match is exhaustive so a new architecture is classified rather than
+    /// inheriting a default.
+    pub fn shares_kv_across_layers(&self) -> bool {
+        match self {
+            Architecture::Gemma4(_) => true,
+            Architecture::Gemma3(_)
+            | Architecture::Qwen2(_)
+            | Architecture::Qwen3(_)
+            | Architecture::Laguna(_)
+            | Architecture::Qwen3_5Moe(_)
+            | Architecture::Qwen3VlMoe(_)
+            | Architecture::BitNet(_) => false,
+        }
+    }
+
     /// SWA window size in tokens for layer `i`, or `None` if it is a
     /// full-attention layer. Used by the SWA logic to decide whether to
     /// instantiate a rotating ring-buffer KV cache for the layer.

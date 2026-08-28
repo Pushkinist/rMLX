@@ -311,6 +311,7 @@ fn rotor3_from_storage_records_layer_idx() {
         0,
         0,
         DispatchPolicy::default(),
+        false,
     );
     let cache_l7 = KvCache::from_storage(
         KvStorage::None { max_seq: 1024 },
@@ -318,6 +319,7 @@ fn rotor3_from_storage_records_layer_idx() {
         0,
         7,
         DispatchPolicy::default(),
+        false,
     );
 
     assert_eq!(cache_l0.layer_idx, 0, "from_storage layer_idx=0 preserved");

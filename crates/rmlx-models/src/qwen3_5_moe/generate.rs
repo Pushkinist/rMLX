@@ -521,7 +521,7 @@ pub fn generate_greedy<'a>(
             })
             .collect();
         let eff_seq = (max_seq_ceiling.max(0) as u64).max(prompt_ids.len() as u64);
-        warn_if_kv_codec_net_negative(kv_quant, &layer_shapes, eff_seq);
+        warn_if_kv_codec_net_negative(kv_quant, &layer_shapes, eff_seq, false);
     }
 
     // Fresh chunked prefill via the shared helper. It brackets the loop with

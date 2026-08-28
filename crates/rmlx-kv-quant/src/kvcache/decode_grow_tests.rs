@@ -101,7 +101,7 @@ fn seeded_cache(quant: KvQuant, max_seq: i32, ceiling: Option<i32>) -> KvCache {
             max_seq,
         }
     };
-    let cache = KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default());
+    let cache = KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false);
     match ceiling {
         Some(c) => cache.with_max_seq_ceiling(c),
         None => cache,

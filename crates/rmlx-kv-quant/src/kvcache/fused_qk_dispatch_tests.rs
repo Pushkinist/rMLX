@@ -87,7 +87,7 @@ fn fused_qk_layout_absent_for_codecs_that_keep_no_bf16_k() {
         KvQuant::RotorKOnly4,
     ] {
         assert!(
-            !codec.feeds_bf16_k_at_decode(),
+            !codec.feeds_bf16_k_at_decode(false),
             "{codec:?}: this test's premise is that the codec keeps no bf16 K"
         );
         assert!(
@@ -282,7 +282,7 @@ fn fused_qk_layout_coverage_matches_the_kernel_table() {
 fn fused_qk_table_matches_the_bf16_k_mirror_contract() {
     // `try_fused_qk_dispatch` seeds the head-major shadow by re-encoding
     // `decode_fp16_k`, and `exit_prefill` only materialises that seed when
-    // `feeds_bf16_k_at_decode()` is true. A codec listed here without the
+    // `feeds_bf16_k_at_decode` is true. A codec listed here without the
     // mirror is unreachable at every shape on every arch — the state this
     // table was in for `Iso{3,4}Sym`, `IsoKOnly{3,4}`, `Rotor{3,4}Sym` and
     // `RotorKOnly{3,4}`, all of which decode through their own
@@ -293,7 +293,7 @@ fn fused_qk_table_matches_the_bf16_k_mirror_contract() {
     for &codec in ALL_KV_QUANTS {
         if lookup_fused_qk_kernel(codec).is_some() {
             assert!(
-                codec.feeds_bf16_k_at_decode(),
+                codec.feeds_bf16_k_at_decode(false),
                 "{codec:?}: mapped to a fused-QK kernel but keeps no bf16 K mirror, so the \
                  shadow can never be seeded — the entry is unreachable"
             );

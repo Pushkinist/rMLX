@@ -803,11 +803,28 @@ impl KvQuant {
     /// `Rotor4Sym`): their decode is a flash kernel over both packed rings, so
     /// neither axis reads a mirror. See [`Self::feeds_bf16_v_at_decode`].
     ///
+    /// **`Mixed` / `RotK` answer `shares_kv`.** Their own decode
+    /// (`update_and_sdpa_mixed_inner`) appends to and reads the affine 3-tuples
+    /// every step and never touches a mirror. The one path that does is the
+    /// `want_kv` arm of that same function, reached only from
+    /// [`crate::KvCache::update_and_sdpa_shared_source`] — the cross-layer-KV
+    /// producer entry point — plus the `Bf16` share it hands on, which
+    /// [`crate::kvcache::SharedKv::materialise`] clones for a drafter. On an
+    /// architecture with no cross-layer KV sharing nothing reads the mirror at
+    /// all, and it is a full `seq * head_dim * kv_heads * 2` bytes per layer
+    /// per axis: on that arch it is what makes a codec whose packed store is
+    /// 2.5x smaller than bf16 measure *larger* than bf16 whole-cache.
+    ///
+    /// `shares_kv` is the cache's own [`crate::KvCache::shares_kv`], set by the
+    /// arch builder that knows its own topology. It is not a codec property, so
+    /// it is a parameter rather than a match arm: the same codec is mirrored on
+    /// Gemma4 and mirror-free on Qwen3, and both are correct.
+    ///
     /// The match is **exhaustive on purpose** (no wildcard `_`): adding a new
     /// `KvQuant` variant will produce a compile error until it is classified
     /// here, preventing a new K-only-style variant from silently defaulting to
     /// `true` and reintroducing the dead-seed leak.
-    pub fn feeds_bf16_k_at_decode(&self) -> bool {
+    pub fn feeds_bf16_k_at_decode(&self, shares_kv: bool) -> bool {
         match self {
             // Two families never read a bf16 K at decode, for two reasons:
             //
@@ -824,6 +841,8 @@ impl KvQuant {
             | KvQuant::Iso4Sym
             | KvQuant::Rotor3Sym
             | KvQuant::Rotor4Sym => false,
+            // Mixed machinery: mirrored only for a cross-layer-KV producer.
+            KvQuant::Mixed { .. } | KvQuant::RotK { .. } => shares_kv,
             // All other variants: decode reads the bf16 K seed materialised by
             // exit_prefill (the warm-TTFT shortcut codecs and bf16 KV).
             KvQuant::None
@@ -832,8 +851,6 @@ impl KvQuant {
             | KvQuant::Planar
             | KvQuant::Planar3
             | KvQuant::PlanarK
-            | KvQuant::Mixed { .. }
-            | KvQuant::RotK { .. }
             | KvQuant::K8VTurbo3
             | KvQuant::K8VTurbo3Tcq
             | KvQuant::K8VTurbo2
@@ -864,13 +881,20 @@ impl KvQuant {
     /// V (plus the same for K) is the *dominant* term in these codecs' residency
     /// and is what made a ~3-bits-per-axis codec cost more than plain bf16.
     ///
+    /// **`Mixed` / `RotK` answer `shares_kv`**, for the reason spelled out on
+    /// [`Self::feeds_bf16_k_at_decode`]: the mirror exists for a cross-layer-KV
+    /// consumer and nothing else reads it. Both axes move together — the
+    /// `want_kv` arm surfaces the pair, so half a mirror serves nobody.
+    ///
     /// Exhaustive on purpose, same reasoning as the K-side predicate: a new
     /// variant must be classified rather than silently inherit a mirror.
-    pub fn feeds_bf16_v_at_decode(&self) -> bool {
+    pub fn feeds_bf16_v_at_decode(&self, shares_kv: bool) -> bool {
         match self {
             // Fused symmetric: V is unpacked from the quant store inside the
             // flash kernel's SV loop; no bf16 V exists.
             KvQuant::Iso3Sym | KvQuant::Iso4Sym | KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => false,
+            // Mixed machinery: mirrored only for a cross-layer-KV producer.
+            KvQuant::Mixed { .. } | KvQuant::RotK { .. } => shares_kv,
             // Everything else reads the bf16 V seed at decode — including the
             // K-only family (via `update_decode_fp16_v_only`) and `None`, whose
             // bf16 V *is* this buffer.
@@ -880,8 +904,6 @@ impl KvQuant {
             | KvQuant::Planar
             | KvQuant::Planar3
             | KvQuant::PlanarK
-            | KvQuant::Mixed { .. }
-            | KvQuant::RotK { .. }
             | KvQuant::K8VTurbo3
             | KvQuant::K8VTurbo3Tcq
             | KvQuant::K8VTurbo2
@@ -999,11 +1021,24 @@ impl KvQuant {
     /// "payload is not an `Option`" arm would make the writer stamp a codec
     /// geometry with no tensors behind it. `a_storeless_codec_always_has_a_geometry_only_storage`
     /// is the only place that pairing is enforced.
+    ///
+    /// # Why this takes no `shares_kv`
+    ///
+    /// The two `feeds_bf16_*` predicates do, and `Mixed` / `RotK` are the only
+    /// variants whose answer moves with it. Both of those already read their
+    /// packed store at decode, so `decode_reads_packed_store()` decides them
+    /// before either mirror disjunct is consulted, and the result is the same
+    /// under both values. Passing `false` below is therefore not a default
+    /// standing in for an unknown — it is a value at which the expression is
+    /// constant. `materialises_packed_store_is_invariant_under_shares_kv`
+    /// sweeps every variant under both and pins that, so a future variant that
+    /// mirrors conditionally *without* reading its store fails there rather
+    /// than silently making this answer depend on an argument it does not take.
     #[must_use]
     pub fn materialises_packed_store(&self) -> bool {
         self.decode_reads_packed_store()
-            || !self.feeds_bf16_k_at_decode()
-            || !self.feeds_bf16_v_at_decode()
+            || !self.feeds_bf16_k_at_decode(false)
+            || !self.feeds_bf16_v_at_decode(false)
     }
 
     /// True when this codec dispatches at least one custom Metal
@@ -1432,12 +1467,22 @@ impl KvQuant {
     /// rotation/bias buffers are not modelled) used only for the resolve-time
     /// net-benefit `warn!` — the authoritative number is
     /// [`crate::KvCache::resident_bytes`] read after the first measurement.
+    ///
+    /// `shares_kv` is the layer's cross-layer-KV topology — the same flag its
+    /// [`crate::KvCache::shares_kv`] carries. It only moves `Mixed` / `RotK`,
+    /// and it moves them by two whole mirrors. Estimating those codecs at a
+    /// fixed `true` on an architecture that keeps no mirror would over-report
+    /// them by `2 * seq * head_dim * kv_heads * 2` bytes per layer, which is
+    /// exactly the estimator-versus-reality drift this function exists to
+    /// prevent, so the caller states its topology instead of the estimate
+    /// assuming one.
     #[must_use]
     pub fn estimated_resident_bytes_per_layer(
         &self,
         seq: u64,
         head_dim: u64,
         kv_heads: u64,
+        shares_kv: bool,
     ) -> u64 {
         let elems = seq.saturating_mul(head_dim).saturating_mul(kv_heads);
         if matches!(self, KvQuant::None) {
@@ -1481,8 +1526,8 @@ impl KvQuant {
         // so the estimate cannot drift from what is materialised. The K-only
         // re-quantize family drops the K seed; the fused rotor symmetric codecs
         // drop both.
-        let k_bytes = side_bytes(k_bits, self.feeds_bf16_k_at_decode(), k_store);
-        let v_bytes = side_bytes(v_bits, self.feeds_bf16_v_at_decode(), v_store);
+        let k_bytes = side_bytes(k_bits, self.feeds_bf16_k_at_decode(shares_kv), k_store);
+        let v_bytes = side_bytes(v_bits, self.feeds_bf16_v_at_decode(shares_kv), v_store);
         k_bytes.saturating_add(v_bytes)
     }
 
@@ -1509,14 +1554,18 @@ impl KvQuant {
         head_dim: u64,
         kv_heads: u64,
         is_windowed: bool,
+        shares_kv: bool,
     ) -> i64 {
         if is_windowed {
             // Windowed layer always runs the bf16 ring → codec is a no-op,
             // identical bytes either way.
             return 0;
         }
-        let bf16 = KvQuant::None.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads);
-        let codec = self.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads);
+        // The bf16 reference is `KvQuant::None`, which keeps its K/V in the
+        // decode buffers on every arch — `shares_kv` does not move it, and
+        // passing the caller's value through would read as though it might.
+        let bf16 = KvQuant::None.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, false);
+        let codec = self.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, shares_kv);
         // saving = bf16 - codec; negative when the codec is bigger.
         i64::try_from(bf16).unwrap_or(i64::MAX) - i64::try_from(codec).unwrap_or(i64::MAX)
     }

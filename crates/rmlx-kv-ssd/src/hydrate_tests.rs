@@ -109,9 +109,15 @@ fn prefilled_cache_spills_through_the_bf16_route_not_the_store() {
 
     let path = tmp.path().join("prefilled.kvb");
     write_caches(&path, device, MODEL_ID, QUANT, &[cache], &[]).unwrap();
-    let (rebuilt, _lin) =
-        crate::block_io::read_caches(&path, device, MODEL_ID, QUANT, DispatchPolicy::default())
-            .unwrap();
+    let (rebuilt, _lin) = crate::block_io::read_caches(
+        &path,
+        device,
+        MODEL_ID,
+        QUANT,
+        DispatchPolicy::default(),
+        false,
+    )
+    .unwrap();
     assert_eq!(
         rebuilt[0].offset(),
         shape[2],
@@ -181,6 +187,7 @@ fn ssd_hit_reconstructs_block_within_tolerance() {
             cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
+            false,
         )
         .unwrap()
         .expect("SSD hit expected");
@@ -260,6 +267,7 @@ fn salted_keyed_block_is_found_by_probe() {
             cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
+            false,
         )
         .unwrap()
         .expect("salted-keyed SSD block must be found by the probe");
@@ -350,6 +358,7 @@ fn probe_finds_own_models_block_and_not_another_models() {
             cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
+            false,
         )
         .unwrap()
         .expect("a block keyed by the RAM push seed must be found by the probe");
@@ -363,7 +372,8 @@ fn probe_finds_own_models_block_and_not_another_models() {
                 &prompt_ids,
                 cache_seed(LK, QUANT, &[QUANT], OTHER_MODEL_SIG),
                 QUANT,
-                DispatchPolicy::default()
+                DispatchPolicy::default(),
+                false
             )
             .unwrap()
             .is_none(),
@@ -378,7 +388,8 @@ fn probe_finds_own_models_block_and_not_another_models() {
                 &prompt_ids,
                 cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
                 QUANT,
-                DispatchPolicy::default()
+                DispatchPolicy::default(),
+                false
             )
             .unwrap()
             .is_some(),
@@ -460,6 +471,7 @@ fn lookup_seeded_matches_arch_recompute() {
             cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
+            false,
         )
         .unwrap()
         .expect("lookup_seeded must find the first-block prefix of the 2-block input");
@@ -538,6 +550,7 @@ fn corrupt_block_deletes_file_and_row_returns_miss() {
             cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
+            false,
         )
         .unwrap();
     assert!(res.is_none(), "corrupt block must surface as a miss");
@@ -607,6 +620,7 @@ fn metadata_mismatch_treated_as_corrupt() {
             ),
             KvQuant::K8V4,
             DispatchPolicy::default(),
+            false,
         )
         .unwrap()
         .is_none());
@@ -644,6 +658,7 @@ fn no_indexed_prefix_is_miss() {
             cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
+            false,
         )
         .unwrap()
         .is_none());
@@ -673,6 +688,7 @@ fn short_prompt_never_queried() {
             cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
+            false,
         )
         .unwrap()
         .is_none());
@@ -743,6 +759,7 @@ fn ssd_hit_lookup_emits_hydrate_event() {
             cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
+            false,
             &rec,
         )
         .unwrap()
@@ -873,6 +890,7 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
                     cache_seed(RACE_LK, QUANT, &[QUANT], TEST_MODEL_SIG),
                     QUANT,
                     DispatchPolicy::default(),
+                    false,
                 )
                 .unwrap()
                 .expect("quiet-state lookup must hit");
@@ -953,6 +971,7 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
                         cache_seed(RACE_LK, QUANT, &[QUANT], TEST_MODEL_SIG),
                         QUANT,
                         DispatchPolicy::default(),
+                        false,
                     ) {
                         Ok(Some(block)) => {
                             hits += 1;
@@ -1165,7 +1184,8 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
                 &prompt_ids,
                 cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
                 QUANT,
-                DispatchPolicy::default()
+                DispatchPolicy::default(),
+                false
             )
             .unwrap()
             .is_none(),
@@ -1187,6 +1207,7 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
             cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
             DispatchPolicy::default(),
+            false,
         )
         .unwrap()
         .expect("re-spilled block must hydrate");

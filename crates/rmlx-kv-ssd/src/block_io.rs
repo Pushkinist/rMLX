@@ -421,9 +421,10 @@ pub(crate) fn read_caches(
     model_id: &str,
     kv_quant: KvQuant,
     policy: DispatchPolicy,
+    shares_kv: bool,
 ) -> Result<(Vec<KvCache>, Vec<LinearAttnCache>)> {
     let (kv_caches, lin_caches, _, _, _, _) =
-        read_caches_inner(path, device, model_id, kv_quant, policy)?
+        read_caches_inner(path, device, model_id, kv_quant, policy, shares_kv)?
             .ok_or_else(|| Error::Mlx(format!("KV block read: {} not found", path.display())))?;
     Ok((kv_caches, lin_caches))
 }
@@ -453,8 +454,9 @@ pub(crate) fn read_caches_timed(
     model_id: &str,
     kv_quant: KvQuant,
     policy: DispatchPolicy,
+    shares_kv: bool,
 ) -> Result<Option<TimedCaches>> {
-    read_caches_inner(path, device, model_id, kv_quant, policy)
+    read_caches_inner(path, device, model_id, kv_quant, policy, shares_kv)
 }
 
 /// Shared core for [`read_caches`] and [`read_caches_timed`].
@@ -468,6 +470,7 @@ fn read_caches_inner(
     model_id: &str,
     kv_quant: KvQuant,
     policy: DispatchPolicy,
+    shares_kv: bool,
 ) -> Result<Option<TimedCaches>> {
     use std::time::Instant;
 
@@ -494,7 +497,7 @@ fn read_caches_inner(
         .zip(none_bf16)
         .enumerate()
         .map(|(layer_idx, (s, bf16))| {
-            let cache = KvCache::from_storage(s, kv_quant, offset, layer_idx, policy);
+            let cache = KvCache::from_storage(s, kv_quant, offset, layer_idx, policy, shares_kv);
             match bf16 {
                 Some((k, v)) => cache.with_decode_fp16_seed(k, v),
                 None => cache,

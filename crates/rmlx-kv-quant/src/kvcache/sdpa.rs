@@ -580,6 +580,24 @@ impl KvCache {
         // same path; the shared-KV consumer sees unrotated bf16 K (the SDPA
         // helper rotates Q internally, never the surfaced K).
         if self.quant.uses_mixed_path() {
+            // The mirror this arm surfaces is built by `exit_prefill` only when
+            // the cache was declared a cross-layer-KV producer. A cache that
+            // arrives here without that declaration has no mirror to surface
+            // and no way to reconstruct one: prefill is over, so
+            // `update_decode_fp16` would allocate zeros and slice in the single
+            // current token, answering with a K/V that is right for one
+            // position and zero for the whole prefix. Refuse instead, before
+            // any offset moves, and name the fix.
+            if !self.shares_kv {
+                return Err(Error::Mlx(format!(
+                    "update_and_sdpa_shared_source: cache for layer {} runs {} but was \
+                     not built with `with_shares_kv(true)`; its bf16 K/V mirror was \
+                     elided as dead memory and cannot be rebuilt after prefill. An \
+                     architecture whose layers share K/V must declare it at cache \
+                     construction.",
+                    self.layer_idx, self.quant,
+                )));
+            }
             tracing::Span::current().record("path", "mixed");
             let (out, kv) = self.update_and_sdpa_mixed_inner(
                 queries,
