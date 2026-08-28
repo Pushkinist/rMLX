@@ -196,7 +196,9 @@ _ISO = {"Iso3", "Iso4", "Iso3Sym", "Iso4Sym", "IsoKOnly3", "IsoKOnly4"}
 # seeds the ring from the prefill CPU blocks and then drops them
 # (`drop_blocks_when_ring_live_iso_*`, kvcache/update.rs), so the ring is the
 # sole resident copy from the first fused decode step. `Iso3` / `Iso4` have no
-# ring path and would hold the CPU-block form, 2.97x larger. Mirrors
+# ring path and would hold the CPU-block form, 3.98x larger (48.25 bits/value
+# against the ring's 12.125 at head_dim 128 -- the blocks carry f32 scales, a
+# replicated f32 quaternion per group and an f32 norm). Mirrors
 # `SideStore::IsoRing` vs `SideStore::IsoBlocks`.
 _ISO_RING = {"Iso3Sym", "Iso4Sym", "IsoKOnly3", "IsoKOnly4"}
 _ROTOR = {"Rotor3", "Rotor4", "Rotor3Sym", "Rotor4Sym", "RotorKOnly3",

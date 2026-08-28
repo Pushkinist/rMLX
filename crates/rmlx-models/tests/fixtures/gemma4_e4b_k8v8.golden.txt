@@ -1,14 +1,11 @@
 # golden tokens — tag=gemma4_e4b_k8v8 kv_quant=k8v8
 # n_tokens=32
-# decoded: "<turn|>The▁sky▁appears▁blue▁during▁the▁day▁because▁of▁a▁phenomenon▁called▁Rayleigh▁scattering,▁where▁shorter▁blue▁wavelengths▁of▁sunlight▁are▁scattered▁more▁effectively▁by▁the▁Earth's▁atmosphere"
+# decoded: "<turn|>The sky appears blue because of a phenomenon called Rayleigh scattering, where shorter blue wavelengths of sunlight are scattered more effectively by the Earth's atmosphere.<turn|><turn|>"
 106
 818
 7217
 7412
 3730
-1913
-506
-1719
 1547
 529
 496
@@ -33,3 +30,6 @@
 236789
 236751
 11661
+236761
+106
+106

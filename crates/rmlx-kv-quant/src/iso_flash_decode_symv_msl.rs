@@ -256,9 +256,13 @@ pub struct IsoPackedAxis<'a> {
     /// Packed iso codes, flat `u32 [B * kv_seq * kv_h * n_groups]`
     /// (sequence-major).
     pub codes: &'a Array,
-    /// Per-group f32 scales, same flat length as `codes`.
+    /// Per-group scales, same flat length as `codes`. Bound at
+    /// [`crate::storage::KV_SIDEBAND_DTYPE`], which the kernel declares; an
+    /// `f32` plane is accepted and narrowed on the way in
+    /// (`to_sideband_dtype`), not reinterpreted.
     pub scales: &'a Array,
-    /// Per-token f32 L2 norms, flat `[B * kv_seq * kv_h]`.
+    /// Per-token L2 norms, flat `[B * kv_seq * kv_h]`. Same dtype handling as
+    /// [`Self::scales`].
     pub norms: &'a Array,
 }
 

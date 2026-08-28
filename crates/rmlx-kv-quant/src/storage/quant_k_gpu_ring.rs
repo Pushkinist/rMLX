@@ -54,13 +54,35 @@ use super::KV_PAGE_SIZE;
 /// straight into a `float` accumulator by the decode kernels, so bf16's 8
 /// mantissa bits are the whole of what a consumer can use — an `f32` plane
 /// spends 16 bits per element that no reader reads. At `head_dim = 128` the
-/// two planes are 4.125 of iso's 16.25 stored bits per value and 5.5 of
-/// rotor's 21.75; halving them is what puts the iso family under bf16.
+/// two planes were 8.25 of iso's then-16.25 stored bits per value and 11.0 of
+/// rotor's then-21.75; halving them takes iso to 12.125 — under bf16 — and
+/// rotor to 16.25, which is still above it because a sideband change cannot
+/// fix a code cadence. [`ring_bits_per_value`] is where those figures come
+/// from.
 ///
 /// Single producer on purpose: `alloc`, `grow`, the upload path and every
 /// consumer that asserts a ring dtype read it from here, so the stored format
 /// cannot drift between the allocation and the reader.
 pub const KV_SIDEBAND_DTYPE: Dtype = Dtype::Bf16;
+
+/// Stored bits per input value for a ring holding `n_groups` code words per
+/// row of `head_dim` values.
+///
+/// One `u32` code word and one [`KV_SIDEBAND_DTYPE`] scale per group, plus one
+/// [`KV_SIDEBAND_DTYPE`] norm per row. `n_groups` is the codec's business —
+/// `head_dim / 4` for iso, `ceil(head_dim / 3)` for rotor.
+///
+/// This is the single producer of every ring rate figure the tree quotes: the
+/// operator's `--kv-quant` listing prints it rather than restating literals,
+/// and `kv_rate_tests` checks it against the bytes a real encoder produced. A
+/// sideband-width change therefore moves the printed figure, the measured one,
+/// and the check between them together.
+#[must_use]
+pub fn ring_bits_per_value(head_dim: u64, n_groups: u64) -> f64 {
+    let side = KV_SIDEBAND_DTYPE.itemsize() as u64;
+    let bytes_per_row = n_groups * (4 + side) + side;
+    (bytes_per_row * 8) as f64 / head_dim as f64
+}
 
 /// Round `x` to what [`KV_SIDEBAND_DTYPE`] can hold, as an `f32`.
 ///
@@ -73,7 +95,8 @@ pub const KV_SIDEBAND_DTYPE: Dtype = Dtype::Bf16;
 ///
 /// Round-to-nearest-even, matching MLX's `astype` and MSL's `bfloat(x)` — the
 /// two other places a sideband value is narrowed. `sideband_rounding_matches_mlx`
-/// pins that agreement against MLX rather than restating it.
+/// (in `quant_k_gpu_ring_tests.rs`) pins that agreement against MLX rather than
+/// restating it.
 #[must_use]
 pub fn bf16_round(x: f32) -> f32 {
     let bits = x.to_bits();

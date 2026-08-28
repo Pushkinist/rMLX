@@ -209,6 +209,22 @@ if [ "${RMLX_SKIP_GPU:-}" = "1" ]; then
     exit 1
 fi
 
+# A model-gated cell — every golden-token gate, and the snapshot-backed decode
+# suites — returns early and reports `ok` when its snapshot is not on disk, and
+# the coverage check below counts that as executed. That is the suite's own
+# documented contract (a developer without the weights must not be blocked by
+# this gate) and it is deliberately NOT a refusal. What it must not do is look
+# identical to a run that checked those cells: a `make ci-perf` on a machine
+# with no snapshot root reports exactly the same "OK: N GPU tests passed" as one
+# that ran every golden, which is how a green ci-perf came to be reported over a
+# red golden suite. So the state is captured here and printed with the result.
+snapshot_root_note=""
+if [ -z "${RMLX_O_MODELS_ROOT:-}" ]; then
+    snapshot_root_note="RMLX_O_MODELS_ROOT is UNSET — every snapshot-gated cell (all golden-token gates) skipped and counted as passed"
+elif [ ! -d "${RMLX_O_MODELS_ROOT}" ]; then
+    snapshot_root_note="RMLX_O_MODELS_ROOT='${RMLX_O_MODELS_ROOT}' does not exist — every snapshot-gated cell skipped and counted as passed"
+fi
+
 # CLAUDE.md hard rule 8 — a single MLX process per Mac. These tests build their
 # own Metal context; a co-resident server already holding the GPU makes any
 # failure here unattributable. Refuse rather than pkill: killing a process this
@@ -237,8 +253,10 @@ fi
 # run wastes the whole of it.
 if [ "${PREFLIGHT}" = "1" ]; then
     echo "preflight OK: GPU free, no skip variable, $(printf '%s\n' "${listing}" | grep -c '') tests classified."
+    [ -n "${snapshot_root_note}" ] && echo "preflight WARNING: ${snapshot_root_note}." >&2
     exit 0
 fi
+[ -n "${snapshot_root_note}" ] && echo "WARNING: ${snapshot_root_note}." >&2
 
 # Apply the narrowing options, then group what is left by crate.
 # The canary is the gate's own positive control, not part of the correctness
@@ -459,8 +477,16 @@ if [ -n "${failed_crates}" ]; then
     exit 1
 fi
 
-if [ "${SHADER_VALIDATION}" = "1" ]; then
-    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader validation clean."
+# The note rides on the OK line, not only on stderr: a summary an operator reads
+# as "green" has to say what it did not check, or the next reader repeats the
+# mistake of quoting the exit code.
+if [ -n "${snapshot_root_note}" ]; then
+    incomplete=" — INCOMPLETE: ${snapshot_root_note}"
 else
-    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s) (uninstrumented)."
+    incomplete=""
+fi
+if [ "${SHADER_VALIDATION}" = "1" ]; then
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader validation clean.${incomplete}"
+else
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s) (uninstrumented).${incomplete}"
 fi

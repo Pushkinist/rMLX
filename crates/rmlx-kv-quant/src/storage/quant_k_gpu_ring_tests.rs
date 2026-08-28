@@ -542,3 +542,177 @@ fn appending_past_the_fill_watermark_is_refused() {
     .expect("an append that starts exactly at `filled` is the healthy case");
     assert_eq!(ring.filled, 3, "the healthy append advances the watermark");
 }
+
+// ── sideband narrowing ───────────────────────────────────────────────────────
+
+/// Widen a plane back to `f32` for comparison, whatever width it is stored at.
+#[allow(clippy::expect_used, reason = "test oracle: invariants documented")]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test oracle: chunks_exact(4) guarantees the slice length"
+)]
+fn widen_to_f32(a: &Array) -> Vec<f32> {
+    let w = a.astype(Dtype::F32, Device::Cpu).expect("widen");
+    w.eval().expect("eval");
+    w.to_bytes()
+        .expect("to_bytes")
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
+}
+
+/// The four `f32` bit patterns that decide the rounding rule.
+///
+/// A tie is an `f32` whose low 16 bits are exactly `0x8000` — halfway between
+/// two bf16 values — and round-to-nearest-**even** then keeps whichever
+/// neighbour has an even low bit in the surviving half. That is the one input a
+/// half-up rounder and an RNE rounder disagree on, and a random `f32` lands on
+/// one with probability ~2^-16, so the cases are stated by bit pattern rather
+/// than swept for.
+const TIE_TRUNCATION_EVEN: u32 = 0x3F80_8000; // 1.00390625 -> 1.0
+const TIE_TRUNCATION_ODD: u32 = 0x3F81_8000; // 1.01171875 -> 1.015625
+const BELOW_TIE: u32 = 0x3F80_4000; // low 16 bits < 0x8000 -> rounds down
+const ABOVE_TIE: u32 = 0x3F80_C000; // low 16 bits > 0x8000 -> rounds up
+
+/// The values the two narrowing paths are compared over.
+///
+/// Both signs of each tie, because RNE ties-to-even is magnitude-symmetric and
+/// a rounder that broke ties away from zero would agree on the positives alone.
+/// The remaining entries are the magnitudes a scale or an L2 norm takes, the
+/// exponent extremes, and the value whose narrowing overflows to infinity.
+fn rounding_cases() -> Vec<f32> {
+    let tie_even = f32::from_bits(TIE_TRUNCATION_EVEN);
+    let tie_odd = f32::from_bits(TIE_TRUNCATION_ODD);
+    vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        tie_even,
+        -tie_even,
+        tie_odd,
+        -tie_odd,
+        f32::from_bits(BELOW_TIE),
+        f32::from_bits(ABOVE_TIE),
+        core::f32::consts::PI,
+        f32::from_bits(0x40C9_1234),
+        f32::from_bits(0x3800_1111),
+        f32::from_bits(0x449A_4321),
+        f32::from_bits(0xBB00_9999),
+        1e-30,
+        1e30,
+        f32::MAX,
+        f32::MIN_POSITIVE,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ]
+}
+
+/// [`bf16_round`] agrees with MLX's own narrowing, tie for tie.
+///
+/// Three places narrow a sideband value: the CPU encoders call `bf16_round`
+/// before quantizing against a scale, the upload path narrows through MLX
+/// `astype`, and the MSL encoders through `bfloat(x)`. They must agree in the
+/// last mantissa bit or a ring seeded from CPU blocks decodes differently from
+/// the tail appended into it after — a divergence with no error, on a prefix
+/// boundary, which is this crate's documented silent-corruption shape.
+///
+/// MLX is the oracle here rather than a second hand-rolled rounder: it is the
+/// path the shipped upload takes, so an agreement asserted against anything
+/// else would not be the agreement that matters.
+///
+/// `Device::Cpu` on purpose — this is arithmetic, not a Metal dispatch, and an
+/// `#[ignore]` here would mean it never ran under any gate.
+#[test]
+#[allow(clippy::expect_used, reason = "test: invariants documented")]
+fn sideband_rounding_matches_mlx() {
+    let cases = rounding_cases();
+    let src = Array::from_f32_slice(&cases, &[cases.len() as i32]).expect("build the f32 fixture");
+    let via_mlx = widen_to_f32(
+        &src.astype(KV_SIDEBAND_DTYPE, Device::Cpu)
+            .expect("MLX narrowing"),
+    );
+
+    assert_eq!(via_mlx.len(), cases.len());
+    for (i, (&x, &mlx)) in cases.iter().zip(via_mlx.iter()).enumerate() {
+        let ours = bf16_round(x);
+        assert_eq!(
+            ours.to_bits(),
+            mlx.to_bits(),
+            "case {i} ({x:e}): bf16_round gave {ours:e} (0x{:08x}), MLX gave {mlx:e} \
+             (0x{:08x}) — the CPU encoders and the upload path would store different \
+             values for the same input",
+            ours.to_bits(),
+            mlx.to_bits()
+        );
+    }
+
+    // The two tie outcomes, stated on their own so the rule is readable without
+    // re-deriving it from the sweep: the tie whose truncation is EVEN rounds
+    // down, the one whose truncation is ODD rounds up, at both signs.
+    let even_down = f32::from_bits(TIE_TRUNCATION_EVEN);
+    let odd_up = f32::from_bits(TIE_TRUNCATION_ODD);
+    assert_eq!(bf16_round(even_down).to_bits(), 0x3F80_0000);
+    assert_eq!(bf16_round(-even_down).to_bits(), 0xBF80_0000);
+    assert_eq!(bf16_round(odd_up).to_bits(), 0x3F82_0000);
+    assert_eq!(bf16_round(-odd_up).to_bits(), 0xBF82_0000);
+
+    // NaN is compared by class, not by bits: narrowing a NaN keeps a NaN but
+    // need not keep the payload, and `bf16_round` deliberately returns the
+    // input untouched rather than shifting a payload that could land on an
+    // infinity.
+    assert!(bf16_round(f32::NAN).is_nan());
+    let nan_via_mlx = widen_to_f32(
+        &Array::from_f32_slice(&[f32::NAN], &[1])
+            .expect("nan fixture")
+            .astype(KV_SIDEBAND_DTYPE, Device::Cpu)
+            .expect("MLX narrowing"),
+    );
+    assert!(nan_via_mlx[0].is_nan(), "MLX must keep a NaN a NaN");
+}
+
+/// A ring's stored rate is the arithmetic [`ring_bits_per_value`] states, read
+/// off a real allocation.
+///
+/// The formula is the single producer every rate figure in the tree is printed
+/// and asserted from, so it needs one place that checks it against bytes rather
+/// than against itself.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test quant_k_gpu_ring -- --ignored --test-threads=1"]
+fn ring_bits_per_value_is_what_the_allocation_holds() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    // iso geometry at head_dim 128: one quaternion group per 4 slots.
+    let head_dim: u64 = 128;
+    let n_groups: u64 = head_dim / 4;
+    let seq: u64 = 8;
+    let kv_h: u64 = 1;
+    let values = seq * kv_h * head_dim;
+
+    let codes: Vec<u32> = (0..(seq * kv_h * n_groups) as usize)
+        .map(|i| i as u32)
+        .collect();
+    let scales: Vec<f32> = vec![1.0; codes.len()];
+    let norms: Vec<f32> = vec![1.0; (seq * kv_h) as usize];
+
+    let mut ring = QuantKGpuRing::default();
+    ring.seed_from_cpu(
+        &codes,
+        &scales,
+        &norms,
+        kv_h as i32,
+        n_groups as i32,
+        seq as i32,
+        seq as i32,
+        Device::Gpu,
+    )
+    .expect("seed the ring");
+
+    let measured = (ring.byte_size() * 8) as f64 / values as f64;
+    let stated = ring_bits_per_value(head_dim, n_groups);
+    assert!(
+        (measured - stated).abs() < 1e-9,
+        "the ring holds {measured} bits per value, ring_bits_per_value states {stated}"
+    );
+}

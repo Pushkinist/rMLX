@@ -266,7 +266,16 @@ fn iso_v3_dequant_gpu_empty_cache_returns_zero_array() {
 }
 
 /// `dequant_gpu` with declared shape `[B, kv_h, N>0, D]` but zero accumulated
-/// blocks returns the shape-divergence error, not silently zero-padding or panicking.
+/// blocks refuses, rather than zero-padding the missing tail or panicking.
+///
+/// **Two guards can refuse this, and which one speaks is not the contract.**
+/// `synced_iso_v_blocks` runs first and rejects a blocks-vs-shape shortfall
+/// with no ring to cover it; the `actual_total != declared_total` accounting in
+/// the kernel-input builder is behind it and only sees inputs that already
+/// agree. This asserted the second guard's wording and went red when the first
+/// one was added, while the behaviour it exists to protect never moved. So it
+/// asserts the behaviour: an `Err` that names this store and says it is
+/// refusing, and no silently-padded array.
 #[test]
 #[ignore = "GPU Metal context — run in isolation: cargo test -p rmlx-kv-quant -- --ignored isoquant_msl --test-threads=1"]
 #[allow(
@@ -277,17 +286,19 @@ fn iso_v3_dequant_gpu_shape_divergence_errors() {
     if skip_if_no_gpu_env() {
         return;
     }
-    // Declare a non-empty shape but leave `blocks` empty — actual_total = 0,
-    // declared_total = 1 * 4 * 16 * 128 > 0, so the MEDIUM-1 guard must fire.
+    // Declare a non-empty shape but leave `blocks` empty: the shape claims
+    // 1 * 4 * 16 = 64 tokens and nothing holds them, on either the CPU or the
+    // (unallocated) ring.
     let storage_shape: Vec<i32> = vec![1, 4, 16, 128];
     let vs = QuantIsoV3::new(storage_shape);
     let err = vs
         .dequant_gpu(Device::Gpu)
-        .expect_err("shape divergence must error");
+        .expect_err("a declared tail nothing holds must error, not zero-pad");
     let msg = err.to_string();
     assert!(
-        msg.contains("dequant_gpu") && msg.contains("declared_total"),
-        "unexpected error variant/message: {msg}"
+        msg.contains("iso V store") && msg.contains("refusing"),
+        "the refusal must name this store and say it is refusing, so an operator can tell \
+         it from an unrelated failure; got: {msg}"
     );
 }
 

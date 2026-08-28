@@ -277,9 +277,11 @@ pub enum KvQuant {
     /// 16-centroid Lloyd-Max N(0,1) codebook and dense 8-vals-per-u32 pack
     /// (iso4 convention: 8 codes × 4 bits = 32 bits = 1 u32 per group).
     /// ~10.7 bpe in codes at bits=4 (single-codebook simplification; grade-aware
-    /// split deferred per spec) — but the per-group `f32` scale sits beside the
-    /// `u32` code word, so **21.75 bits per value reach the store**, above
-    /// bf16's 16.0. Not a memory win; see `crate::rotorquant` § "Effective bpe".
+    /// split deferred per spec) — but a whole `u32` code word goes to each group
+    /// of 3, so **16.25 bits per value reach the store**, above bf16's 16.0,
+    /// even with the scale and norm planes narrowed to
+    /// [`crate::storage::KV_SIDEBAND_DTYPE`]. Not a memory win; see
+    /// `crate::rotorquant` § "Effective bpe".
     ///
     /// **Implementation scope**: CPU codec only. SDPA falls through to the
     /// dequant-then-SDPA legacy fallback path. No MSL kernel (deferred). Single-
@@ -1250,13 +1252,14 @@ impl KvQuant {
     /// `RotorKOnly*`) report a quantized K and a 16-bit V.
     ///
     /// **Three families do not store at their codebook width.** The iso and
-    /// rotor stores spend one whole `u32` code word *and* one `f32` scale per
-    /// group — 4 head-dim slots for iso, 3 for rotor — and the planar store
+    /// rotor stores spend one whole `u32` code word *and* one sideband scale
+    /// per group — 4 head-dim slots for iso, 3 for rotor — and the planar store
     /// spends one `f32` scale per *pair*. A 3-bit and a 4-bit member of any of
-    /// the three therefore occupy byte-identical storage: 16.25 bits per value
-    /// for iso (on the ring), 21.75 for rotor and 22.00 for planar at
-    /// `head_dim = 128`, all against bf16's 16.0. The width below is what the
-    /// codebook quantizes to, not what reaches memory.
+    /// the three therefore occupy byte-identical storage, at `head_dim = 128`:
+    /// 12.125 bits per value for iso on the ring, 16.25 for rotor and 22.00 for
+    /// planar, against bf16's 16.0 — so iso is under the baseline and the other
+    /// two are over it. The width below is what the codebook quantizes to, not
+    /// what reaches memory.
     /// [`Self::estimated_resident_bytes_per_layer`] does not size those three
     /// families from this number at all — it sizes every side from
     /// [`SideStore`], the store's own group geometry.

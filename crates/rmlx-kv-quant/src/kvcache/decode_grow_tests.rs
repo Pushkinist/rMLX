@@ -356,20 +356,36 @@ fn decode_past_max_seq_lands_every_append_in_the_ring() {
             )]
             let got = norms[(seq * KV_H + head) as usize];
             // The re-encode is rounded to the width the ring stores, because
-            // that is what a decode reconstructs with. Rounding the reference
-            // rather than widening the tolerance keeps this an exact equality:
-            // a tolerance of one bf16 ulp would also admit a genuinely wrong
-            // norm that happened to land inside it.
+            // that is what a decode reconstructs with — comparing against an
+            // unrounded f32 would be measuring the narrowing, not the append.
+            //
+            // The allowance is exactly one bf16 step at the reference, and no
+            // more. The two sides are independent float reductions — an MSL
+            // kernel with fma contraction on against a sequential Rust sum — so
+            // they can disagree in the last f32 bit, and a disagreement that
+            // straddles a bf16 rounding boundary lands them on adjacent stored
+            // values. Pinning bit-equality would make that a red test on a
+            // toolchain bump rather than on a defect. It stays a *stored-width*
+            // bound rather than a relative epsilon: the failure this exists to
+            // catch is a dropped append, which reads back as 0.0 and is caught
+            // by the assertion above whatever the tolerance, and a mis-strided
+            // read, which would have to coincide with the neighbouring bf16
+            // value to survive.
             let want = bf16_round(cpu_norm(&k_row(seq, head, prefill_len)));
+            // The next representable bf16 above `want`: a bf16 value has zero
+            // low 16 bits as an f32, so the successor is one increment of the
+            // stored half.
+            let one_bf16_ulp = f32::from_bits(want.abs().to_bits() + (1 << 16)) - want.abs();
             assert!(
                 got > 0.0,
                 "ring slot (seq={seq}, head={head}) reads back as {got} — the append was \
                  dropped and attention would read a zeroed token"
             );
             assert!(
-                (got - want).abs() <= f32::EPSILON * want.abs(),
-                "ring slot (seq={seq}, head={head}) = {got} disagrees with the CPU \
-                 re-encode rounded to the stored sideband width ({want})"
+                (got - want).abs() <= one_bf16_ulp,
+                "ring slot (seq={seq}, head={head}) = {got} is more than one stored step \
+                 from the CPU re-encode rounded to the sideband width ({want}, step \
+                 {one_bf16_ulp})"
             );
         }
     }
