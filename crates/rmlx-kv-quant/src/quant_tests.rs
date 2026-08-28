@@ -238,6 +238,7 @@ fn windowed_layer_net_saving_is_zero_for_any_codec() {
             256,  // head_dim
             1,    // kv_heads
             true, // is_windowed
+            false,
         );
         assert_eq!(
             saving, 0,
@@ -246,38 +247,52 @@ fn windowed_layer_net_saving_is_zero_for_any_codec() {
     }
 }
 
-/// On a **global** layer a codec that keeps a packed store **and** both bf16
-/// mirrors is net-NEGATIVE: the codes and per-group scales are pure addition on
-/// top of a mirror pair that is already exactly bf16-sized. `Mixed` is that
-/// shape — its decode reads the packed 3-tuples, so the store is real, and it
-/// still hands both mirrors to a cross-layer-KV consumer.
+/// `Mixed` on a **global** layer, with the architecture's cross-layer-KV
+/// topology as the only discriminator.
+///
+/// The codec is one shape with two costs. On a stack that shares K/V the bf16
+/// mirror pair is the share, so it is retained and the packed store's codes and
+/// per-group scales are pure addition on top of a pair that is already exactly
+/// bf16-sized — net-NEGATIVE, the codec costs more than plain bf16. On a stack
+/// where each layer owns its K/V nothing reads that pair, `exit_prefill` builds
+/// none, and what is left is the store alone — net-POSITIVE.
+///
+/// Asserting only the negative arm is what let the mirror stay on every
+/// architecture: the estimate agreed with the allocation, and both were the
+/// dense case's dead memory.
 #[test]
-fn global_layer_store_plus_mirror_codec_is_net_negative() {
+fn global_layer_store_plus_mirror_codec_sign_follows_shared_kv() {
     let mixed = KvQuant::Mixed {
         k_bits: 8,
         v_bits: 8,
         k_group_size: 64,
         v_group_size: 64,
     };
-    // e2b global layer: global_head_dim=256, num_global_key_value_heads=1.
-    let saving = mixed.estimated_net_saving_per_layer(
-        4096,  // seq
-        256,   // head_dim
-        1,     // kv_heads
-        false, // global layer
-    );
-    assert!(
-        saving < 0,
-        "a store + both-mirror codec must be net-negative (codes + scales on top of \
-         bf16-sized mirrors); got {saving}"
-    );
-    // Bonsai-like geometry (head_dim=128, 8 kv heads) reports the same sign.
-    let saving_bonsai = mixed.estimated_net_saving_per_layer(2048, 128, 8, false);
-    assert!(
-        saving_bonsai < 0,
-        "store + both-mirror codec must be net-negative on the dense geometry too; \
-         got {saving_bonsai}"
-    );
+    // Two geometries, so the sign is not an artifact of one shape:
+    // e2b global layer (head_dim=256, kv_heads=1) and Bonsai (128, 8).
+    for (seq, head_dim, kv_heads) in [(4096_u64, 256_u64, 1_u64), (2048, 128, 8)] {
+        let shared = mixed.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, true);
+        assert!(
+            shared < 0,
+            "shared-KV: store + both mirrors must be net-negative (codes + scales on top \
+             of bf16-sized mirrors) at seq={seq} head_dim={head_dim} kv_heads={kv_heads}; \
+             got {shared}"
+        );
+        let dense = mixed.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
+        assert!(
+            dense > 0,
+            "dense: with no mirror to keep, the packed store alone must be net-positive \
+             at seq={seq} head_dim={head_dim} kv_heads={kv_heads}; got {dense}"
+        );
+        // The gap between the two arms is exactly the mirror pair the dense
+        // stack no longer holds: two bf16 buffers over the layer's elements.
+        let mirror_pair = 2 * seq * head_dim * kv_heads * 2;
+        assert_eq!(
+            dense - shared,
+            i64::try_from(mirror_pair).expect("mirror pair fits i64"),
+            "the whole difference between the two topologies is the bf16 mirror pair"
+        );
+    }
 }
 
 /// A codec whose decode reads only the bf16 mirrors builds no packed store, so
@@ -302,7 +317,7 @@ fn mirror_only_codec_is_exactly_break_even_with_bf16() {
         );
         for (seq, head_dim, kv_heads) in [(512u64, 256u64, 1u64), (8192, 128, 8), (131_072, 128, 8)]
         {
-            let saving = q.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false);
+            let saving = q.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
             assert_eq!(
                 saving, 0,
                 "{q:?} at seq={seq} head_dim={head_dim} kv_heads={kv_heads}: a mirror-only \
@@ -328,12 +343,14 @@ fn mirror_only_codec_is_exactly_break_even_with_bf16() {
 #[test]
 fn k_only_iso_and_rotor_codecs_split_on_the_bf16_floor() {
     let (seq, head_dim, kv_heads) = (16_384_u64, 128_u64, 8_u64);
-    let iso = KvQuant::IsoKOnly4.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false);
+    let iso =
+        KvQuant::IsoKOnly4.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
     assert!(
         iso > 0,
         "IsoKOnly4's ring is 12.125 bits per value against bf16's 16 → net-positive; got {iso}"
     );
-    let rotor = KvQuant::RotorKOnly4.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false);
+    let rotor =
+        KvQuant::RotorKOnly4.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
     assert!(
         rotor < 0,
         "RotorKOnly4's ring is 16.25 bits per value, still above bf16's 16 → net-negative; \
@@ -341,28 +358,47 @@ fn k_only_iso_and_rotor_codecs_split_on_the_bf16_floor() {
     );
 }
 
-/// A codec that keeps both bf16 mirrors **and** a packed store has a constant
-/// per-element overhead, so its net saving is negative and scales **more**
-/// negative with context — there is no crossover while both are retained. The
-/// warm mirror is the dominant term, not the window size.
+/// Every term in `Mixed` is per-token, so its net figure scales linearly with
+/// context — and the cross-layer-KV topology sets which way.
+///
+/// Retaining the mirrors alongside the store is a constant per-element
+/// overhead, so a sharing stack gets steadily *more* negative with context and
+/// never crosses over. Dropping them leaves the store alone, which is a
+/// constant per-element saving, so a dense stack gets steadily more positive.
+/// Both directions are asserted: a change that froze either arm at its
+/// prefill length would still pass a one-sided slope check.
 #[test]
-fn store_plus_mirror_codec_gets_more_negative_with_context() {
+fn store_plus_mirror_codec_slope_follows_shared_kv() {
     let mixed = KvQuant::Mixed {
         k_bits: 8,
         v_bits: 8,
         k_group_size: 64,
         v_group_size: 64,
     };
-    let small = mixed.estimated_net_saving_per_layer(512, 256, 1, false);
-    let large = mixed.estimated_net_saving_per_layer(8192, 256, 1, false);
+    let shared_small = mixed.estimated_net_saving_per_layer(512, 256, 1, false, true);
+    let shared_large = mixed.estimated_net_saving_per_layer(8192, 256, 1, false, true);
     assert!(
-        small < 0 && large < 0,
-        "both must be net-negative: small={small} large={large}"
+        shared_small < 0 && shared_large < 0,
+        "shared-KV must be net-negative at both contexts: \
+         small={shared_small} large={shared_large}"
     );
     assert!(
-        large < small,
-        "retaining both mirrors alongside the store → overhead scales with context \
-         (more negative): small={small} large={large}"
+        shared_large < shared_small,
+        "shared-KV: mirrors alongside the store → overhead scales with context \
+         (more negative): small={shared_small} large={shared_large}"
+    );
+
+    let dense_small = mixed.estimated_net_saving_per_layer(512, 256, 1, false, false);
+    let dense_large = mixed.estimated_net_saving_per_layer(8192, 256, 1, false, false);
+    assert!(
+        dense_small > 0 && dense_large > 0,
+        "dense must be net-positive at both contexts: \
+         small={dense_small} large={dense_large}"
+    );
+    assert!(
+        dense_large > dense_small,
+        "dense: the store alone is a per-element saving, so it grows with context: \
+         small={dense_small} large={dense_large}"
     );
 }
 
@@ -373,15 +409,16 @@ fn store_plus_mirror_codec_gets_more_negative_with_context() {
 /// and holds at every context.
 #[test]
 fn k_only_codec_net_figures_scale_with_context() {
-    let iso_small = KvQuant::IsoKOnly4.estimated_net_saving_per_layer(64, 128, 8, false);
-    let iso_large = KvQuant::IsoKOnly4.estimated_net_saving_per_layer(16_384, 128, 8, false);
+    let iso_small = KvQuant::IsoKOnly4.estimated_net_saving_per_layer(64, 128, 8, false, false);
+    let iso_large = KvQuant::IsoKOnly4.estimated_net_saving_per_layer(16_384, 128, 8, false, false);
     assert!(
         iso_small > 0 && iso_large > iso_small,
         "iso K-only saves at every context and saves more with it: \
          small={iso_small} large={iso_large}"
     );
-    let rot_small = KvQuant::RotorKOnly4.estimated_net_saving_per_layer(64, 128, 8, false);
-    let rot_large = KvQuant::RotorKOnly4.estimated_net_saving_per_layer(16_384, 128, 8, false);
+    let rot_small = KvQuant::RotorKOnly4.estimated_net_saving_per_layer(64, 128, 8, false, false);
+    let rot_large =
+        KvQuant::RotorKOnly4.estimated_net_saving_per_layer(16_384, 128, 8, false, false);
     assert!(
         rot_small < 0 && rot_large < rot_small,
         "rotor K-only's overrun is per-token, so it grows with context: \
@@ -392,10 +429,10 @@ fn k_only_codec_net_figures_scale_with_context() {
 /// bf16 (`None`) reports exactly the two bf16 buffers and zero saving vs itself.
 #[test]
 fn none_codec_zero_saving_vs_itself() {
-    let bytes = KvQuant::None.estimated_resident_bytes_per_layer(1024, 128, 8);
+    let bytes = KvQuant::None.estimated_resident_bytes_per_layer(1024, 128, 8, false);
     // 2 buffers × 1024 × 128 × 8 × 2 bytes.
     assert_eq!(bytes, 2 * 1024 * 128 * 8 * 2);
-    let saving = KvQuant::None.estimated_net_saving_per_layer(1024, 128, 8, false);
+    let saving = KvQuant::None.estimated_net_saving_per_layer(1024, 128, 8, false, false);
     assert_eq!(saving, 0, "None vs bf16 baseline must net to 0");
 }
 
@@ -461,7 +498,8 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
     // over both packed iso rings, so estimate = 2*side with no seed term.
     let elems = seq * head_dim as u64 * kv_heads;
     let seed = elems * 2;
-    let est = KvQuant::Iso3Sym.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads);
+    let est =
+        KvQuant::Iso3Sym.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads, false);
     let expected = 2 * iso_ring_actual;
     assert_eq!(
         est, expected,
@@ -484,8 +522,12 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
     let (r_codes, r_scales, r_norms) =
         crate::rotorquant::rotor3_encode(&v, &rotors, head_dim).unwrap();
     let rotor_side_actual = ring_side_bytes(&r_codes, &r_scales, &r_norms, kv_heads, n_groups, seq);
-    let est_r =
-        KvQuant::Rotor3Sym.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads);
+    let est_r = KvQuant::Rotor3Sym.estimated_resident_bytes_per_layer(
+        seq,
+        head_dim as u64,
+        kv_heads,
+        false,
+    );
     // Rotor3Sym quantizes BOTH sides and — like Iso3Sym — retains **no** bf16
     // seed on either: its decode is a flash kernel over the two packed rings, so
     // estimate = 2*side with no seed term. This is the codec's whole memory
@@ -510,8 +552,13 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
     // stored sideband dtype is what took it under. Anchored against the two
     // measured ring payloads so the number moves with the store, not with a
     // restated constant.
-    let saving =
-        KvQuant::Iso3Sym.estimated_net_saving_per_layer(seq, head_dim as u64, kv_heads, false);
+    let saving = KvQuant::Iso3Sym.estimated_net_saving_per_layer(
+        seq,
+        head_dim as u64,
+        kv_heads,
+        false,
+        false,
+    );
     assert_eq!(
         saving,
         2 * (elems * 2) as i64 - 2 * iso_ring_actual as i64,
@@ -527,8 +574,13 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
     // takes rotor from 21.75 to 16.25 bits per value, a 25% cut that still
     // leaves it above bf16, because rotor spends a whole u32 code word per 3
     // head-dim slots — 10.67 bits per value before any sideband.
-    let saving_r =
-        KvQuant::Rotor3Sym.estimated_net_saving_per_layer(seq, head_dim as u64, kv_heads, false);
+    let saving_r = KvQuant::Rotor3Sym.estimated_net_saving_per_layer(
+        seq,
+        head_dim as u64,
+        kv_heads,
+        false,
+        false,
+    );
     assert!(
         saving_r < 0,
         "rotor3 must still report net-negative at head_dim=128, got {saving_r}"
@@ -542,10 +594,10 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
     // against `None` rather than as an inequality, because "equals bf16" is the
     // property, and an inequality would have kept passing in either direction.
     let est_v_only =
-        KvQuant::Iso3.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads);
+        KvQuant::Iso3.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads, false);
     assert_eq!(
         est_v_only,
-        KvQuant::None.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads),
+        KvQuant::None.estimated_resident_bytes_per_layer(seq, head_dim as u64, kv_heads, false),
         "Iso3 builds no packed store, so it holds exactly the two bf16 mirrors"
     );
     assert!(
@@ -590,7 +642,8 @@ fn iso_k_codecs_win_and_rotor_k_codecs_do_not_at_every_geometry() {
         for kv_heads in [1_u64, 8] {
             for seq in [256_u64, 4096, 65_536] {
                 for q in iso {
-                    let saving = q.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false);
+                    let saving =
+                        q.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
                     assert!(
                         saving > 0,
                         "{q} at seq={seq} head_dim={head_dim} kv_heads={kv_heads} reports \
@@ -600,7 +653,8 @@ fn iso_k_codecs_win_and_rotor_k_codecs_do_not_at_every_geometry() {
                     );
                 }
                 for q in rotor {
-                    let saving = q.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false);
+                    let saving =
+                        q.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
                     assert!(
                         saving < 0,
                         "{q} at seq={seq} head_dim={head_dim} kv_heads={kv_heads} reports a \
@@ -773,7 +827,7 @@ fn a_storeless_codec_mirrors_both_axes() {
             continue;
         }
         assert!(
-            q.feeds_bf16_k_at_decode() && q.feeds_bf16_v_at_decode(),
+            q.feeds_bf16_k_at_decode(false) && q.feeds_bf16_v_at_decode(false),
             "{q:?} has no packed store and no mirror on one axis — that axis has \
              nowhere to decode from"
         );
@@ -1061,7 +1115,7 @@ fn an_inert_codec_has_no_quantised_read_path() {
             continue;
         }
         assert!(
-            q.feeds_bf16_k_at_decode() && q.feeds_bf16_v_at_decode(),
+            q.feeds_bf16_k_at_decode(false) && q.feeds_bf16_v_at_decode(false),
             "{q} is recorded inert but one axis is not fed from the bf16 mirror — \
              that axis has to decode from somewhere, and it is not the mirror"
         );
@@ -1239,8 +1293,8 @@ fn emit_kv_codec_disposition_manifest() {
                 "INERT"
             },
             u8::from(q.decode_reads_packed_store()),
-            u8::from(q.feeds_bf16_k_at_decode()),
-            u8::from(q.feeds_bf16_v_at_decode()),
+            u8::from(q.feeds_bf16_k_at_decode(false)),
+            u8::from(q.feeds_bf16_v_at_decode(false)),
         );
         stems.push(stem);
     }
@@ -1658,7 +1712,10 @@ fn every_codec_byte_model_matches_the_store_it_writes() {
             let (k_store, v_store) = q.side_stores();
             let stores = [k_store, v_store];
             let packs = q.materialises_packed_store();
-            let feeds = [q.feeds_bf16_k_at_decode(), q.feeds_bf16_v_at_decode()];
+            let feeds = [
+                q.feeds_bf16_k_at_decode(false),
+                q.feeds_bf16_v_at_decode(false),
+            ];
 
             let mut expected_total = 0u64;
             for axis in 0..2 {
@@ -1710,7 +1767,7 @@ fn every_codec_byte_model_matches_the_store_it_writes() {
             }
 
             assert_eq!(
-                q.estimated_resident_bytes_per_layer(geom.seq, geom.head_dim, geom.kv_heads),
+                q.estimated_resident_bytes_per_layer(geom.seq, geom.head_dim, geom.kv_heads, false),
                 expected_total,
                 "{q} at head_dim={}: whole-codec estimate disagrees with its own per-side \
                  model assembled through materialises_packed_store + feeds_bf16_k/v",
@@ -1910,4 +1967,70 @@ fn codec_side_layouts_has_one_arm_per_listed_codec() {
          layouts.",
         ALL_KV_QUANTS.len()
     );
+}
+
+/// [`KvQuant::materialises_packed_store`] takes no `shares_kv` because its
+/// answer does not move with one. This is the proof, and the guard.
+///
+/// The two `feeds_bf16_*` predicates do take it, and `materialises_packed_store`
+/// is defined over them — so the omission is only safe while every variant
+/// whose mirror follows the topology **also** reads its packed store at decode,
+/// which makes the first disjunct decide it before either mirror disjunct is
+/// consulted. A future variant that mirrors conditionally without reading its
+/// store would break that and make the function silently answer for one
+/// topology while running under the other; `exit_prefill` would then skip the
+/// store a shared-KV consumer's fallback needs.
+///
+/// Swept over every variant under both values, so the property is exhaustive as
+/// codecs land rather than a list someone has to extend.
+#[test]
+fn materialises_packed_store_is_invariant_under_shares_kv() {
+    for &q in ALL_KV_QUANTS {
+        let dense = q.decode_reads_packed_store()
+            || !q.feeds_bf16_k_at_decode(false)
+            || !q.feeds_bf16_v_at_decode(false);
+        let shared = q.decode_reads_packed_store()
+            || !q.feeds_bf16_k_at_decode(true)
+            || !q.feeds_bf16_v_at_decode(true);
+        assert_eq!(
+            dense, shared,
+            "{q:?}: materialises_packed_store must not depend on shares_kv — it takes no \
+             such argument. A codec whose mirror follows the topology must also read its \
+             packed store at decode, or this function needs the argument too."
+        );
+        assert_eq!(
+            q.materialises_packed_store(),
+            dense,
+            "{q:?}: materialises_packed_store must equal its own definition"
+        );
+    }
+}
+
+/// `shares_kv` is a property of the architecture, not of the codec, and it
+/// moves exactly the two `Mixed`-machinery variants.
+///
+/// Stated over `ALL_KV_QUANTS` so a new variant is classified rather than
+/// inheriting a value. Both predicates are checked: half a mirror serves
+/// nobody — the `want_kv` arm surfaces the pair or neither.
+#[test]
+fn only_the_mixed_machinery_reads_shares_kv() {
+    for &q in ALL_KV_QUANTS {
+        let k_moves = q.feeds_bf16_k_at_decode(false) != q.feeds_bf16_k_at_decode(true);
+        let v_moves = q.feeds_bf16_v_at_decode(false) != q.feeds_bf16_v_at_decode(true);
+        if q.uses_mixed_path() {
+            assert!(
+                k_moves && v_moves,
+                "{q:?} rides the Mixed path: both mirror axes must follow the topology"
+            );
+            assert!(
+                q.feeds_bf16_k_at_decode(true) && q.feeds_bf16_v_at_decode(true),
+                "{q:?}: the shared-KV arm is the one that keeps the mirror"
+            );
+        } else {
+            assert!(
+                !k_moves && !v_moves,
+                "{q:?} mirrors on its own codec properties; `shares_kv` must not move it"
+            );
+        }
+    }
 }

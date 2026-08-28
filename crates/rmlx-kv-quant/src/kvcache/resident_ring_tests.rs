@@ -104,7 +104,7 @@ fn ring_backed_cache(quant: KvQuant) -> KvCache {
         },
         _ => unreachable!("ring_backed_cache covers the K-only ring codecs only"),
     };
-    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default())
+    KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false)
 }
 
 /// Every ring-backed K-only codec, both bit widths of both families.
@@ -481,7 +481,8 @@ fn estimator_matches_a_live_ring_backed_cache() {
         let (cache, ring) = cache_with_live_ring(quant, PREFILL);
         assert!(ring > 0, "{quant}: the decode step must stand up the ring");
 
-        let estimate = quant.estimated_resident_bytes_per_layer(seq, HEAD_DIM as u64, KV_H as u64);
+        let estimate =
+            quant.estimated_resident_bytes_per_layer(seq, HEAD_DIM as u64, KV_H as u64, false);
         let expected = estimate + k_store_static_bytes(&cache);
         let actual = cache.resident_bytes();
         assert_eq!(

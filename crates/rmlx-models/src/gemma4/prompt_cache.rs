@@ -303,7 +303,13 @@ impl SsdHydrate<Gemma4Entry> for SsdHydrator {
         kv_quant: KvQuant,
         policy: DispatchPolicy,
     ) -> Result<Option<Gemma4Entry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids, seed, kv_quant, policy)?
+        let Some((block, block_hashes)) = self.lookup_seeded(
+            prompt_ids, seed, kv_quant, policy,
+            // Gemma4 shares K/V across layers, so a hydrated cache that is
+            // later tail-extended must rebuild the Mixed/RotK bf16 mirror its
+            // consumer layers read.
+            true,
+        )?
         else {
             return Ok(None);
         };

@@ -640,13 +640,19 @@ impl SpeculativeDispatcher {
         let mut verifier_caches: Vec<KvCache> = (0..self.verifier.num_hidden_layers())
             .map(|i| {
                 let window = self.verifier.layer_sliding_window(i);
-                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window).with_layer_idx(i)
+                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
+                    .with_layer_idx(i)
+                    // The stack decides whether its layers read each other's
+                    // K/V, and so whether Mixed/RotK keep their bf16 mirror.
+                    .with_shares_kv(self.verifier.shares_kv_across_layers())
             })
             .collect();
         let mut draft_caches: Vec<KvCache> = (0..self.draft.num_hidden_layers())
             .map(|i| {
                 let window = self.draft.layer_sliding_window(i);
-                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window).with_layer_idx(i)
+                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
+                    .with_layer_idx(i)
+                    .with_shares_kv(self.draft.shares_kv_across_layers())
             })
             .collect();
 
@@ -1087,13 +1093,19 @@ impl SpeculativeDispatcher {
         let mut verifier_caches: Vec<KvCache> = (0..self.verifier.num_hidden_layers())
             .map(|i| {
                 let window = self.verifier.layer_sliding_window(i);
-                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window).with_layer_idx(i)
+                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
+                    .with_layer_idx(i)
+                    // The stack decides whether its layers read each other's
+                    // K/V, and so whether Mixed/RotK keep their bf16 mirror.
+                    .with_shares_kv(self.verifier.shares_kv_across_layers())
             })
             .collect();
         let mut draft_caches: Vec<KvCache> = (0..self.draft.num_hidden_layers())
             .map(|i| {
                 let window = self.draft.layer_sliding_window(i);
-                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window).with_layer_idx(i)
+                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
+                    .with_layer_idx(i)
+                    .with_shares_kv(self.draft.shares_kv_across_layers())
             })
             .collect();
 

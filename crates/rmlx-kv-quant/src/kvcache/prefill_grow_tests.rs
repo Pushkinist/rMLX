@@ -427,3 +427,71 @@ fn next_pow2_seq_rounds_up() {
     // Saturating clamp at 2^30.
     assert_eq!(next_pow2_seq(i32::MAX), 1 << 30);
 }
+
+/// The resumed-cache grow refusal survives eliding the `Mixed` bf16 mirror.
+///
+/// `storage_has_materialised_payload` used to answer for a mirrored `Mixed`
+/// cache on its first clause — "a decode mirror exists" — and only fell through
+/// to `state.offset > 0` when there was none. On a dense architecture there is
+/// now never a mirror, so that second clause is the whole test, and it has to
+/// hold on its own: a cache that has been through `exit_prefill` must still
+/// refuse a grow rather than resize a buffer its packed payload was sized
+/// against.
+///
+/// Both halves are asserted, because a guard that stopped refusing and a guard
+/// that started refusing everything both "changed behaviour": a cache that has
+/// only *entered* prefill is in the window where the grow is legal, and must
+/// still be allowed to grow.
+#[test]
+fn dense_mixed_cache_still_refuses_a_grow_after_exit_prefill() {
+    let device = Device::Cpu;
+    let quant = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 4,
+        k_group_size: 64,
+        v_group_size: 64,
+    };
+    let chunk = |seq: i32, fill: f32| -> (Array, Array) {
+        let shape = [1_i32, TEST_KV_H, seq, TEST_HEAD_DIM];
+        let n: usize = shape.iter().map(|&d| d as usize).product();
+        (
+            f32_arr(&vec![fill; n], &shape),
+            f32_arr(&vec![fill + 0.1; n], &shape),
+        )
+    };
+
+    // A dense cache: no cross-layer KV sharing, so `exit_prefill` builds the
+    // packed store and no mirror.
+    let mut cache = KvCache::with_quant_max_seq(quant, TEST_INITIAL_MAX_SEQ).with_shares_kv(false);
+    cache.enter_prefill();
+    let (k, v) = chunk(TEST_CHUNK, 0.1);
+    cache.update(&k, &v, device).expect("first chunk");
+    cache.exit_prefill(device).expect("exit_prefill");
+    assert!(
+        cache.decode_fp16_k_for_test().is_none() && cache.decode_fp16_v_for_test().is_none(),
+        "precondition: the dense arm keeps no mirror, so the guard cannot key on one"
+    );
+
+    cache.enter_prefill();
+    let (k2, v2) = chunk(96, 0.3);
+    let err = cache
+        .update(&k2, &v2, device)
+        .expect_err("resumed-cache grow must error, not resize under a live payload");
+    assert!(
+        err.to_string()
+            .contains("grow not legal after exit_prefill"),
+        "expected the resumed-cache grow refusal, got: {err}"
+    );
+
+    // Converse: before any `exit_prefill` there is no payload to disagree with,
+    // and the grow is the legal lazy-ring expansion.
+    let mut fresh = KvCache::with_quant_max_seq(quant, TEST_INITIAL_MAX_SEQ).with_shares_kv(false);
+    fresh.enter_prefill();
+    let (k3, v3) = chunk(TEST_CHUNK, 0.5);
+    fresh.update(&k3, &v3, device).expect("first chunk");
+    let (k4, v4) = chunk(96, 0.7);
+    fresh
+        .update(&k4, &v4, device)
+        .expect("a cache that has not exited prefill must still be allowed to grow");
+    assert_eq!(fresh.offset(), TEST_CHUNK + 96);
+}

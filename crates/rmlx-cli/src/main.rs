@@ -177,7 +177,8 @@ See docs/KV_QUANT.md sections \"Preset semantics\" and \"Codec disposition\".";
 /// disposition, and three of the four this line used to name do nothing.
 const KV_QUANT_HELP: &str = "\
 KV cache quantization codec. Default \"auto\" = unquantised bf16 on every arch. \
-No codec in the tree holds less resident KV than bf16 — see --help.";
+Only mixed_* / rot_k_* hold less resident KV than bf16, and only where the \
+model's layers do not share K/V — see --help.";
 
 /// Long-help for `--kv-quant`, shared by every subcommand that takes it.
 ///
@@ -189,16 +190,17 @@ const KV_QUANT_LONG_HELP: &str = "\
 KV cache quantization codec. Default \"auto\", which resolves to unquantised
 bf16 (\"bf16\", alias \"none\") on every architecture and every context length.
 
-NO CODEC BELOW HOLDS LESS RESIDENT KV THAN bf16. bf16 is the smallest cache
-measured. Every codec that quantises something a served request touches measures
-LARGER than it, and the rest do not execute at all. Pick a name for what its
-decode does, not to save memory.
+Two codecs now hold LESS resident KV than bf16, and only on an architecture
+whose layers do not share K/V: mixed_* and rot_k_*. Every other codec here
+either measures larger than bf16 or does not execute at all. Pick a name for
+what its decode does, and read the per-codec ratios below before picking one
+to save memory.
 
 Mutually exclusive with `--kv-preset`, `--cache-type-k`, `--cache-type-v`,
 and `--kv-bits`.
 
   bf16 (alias none; what auto resolves to)
-      Unquantised bf16 K and V. The baseline, and the smallest resident KV.
+      Unquantised bf16 K and V. The reference every ratio below is against.
 
   INERT — accepted, but does nothing:
       k8v4, k8v8, planar, planar3, planar_k, k8vturbo2, k8vturbo2tcq,
@@ -210,13 +212,27 @@ and `--kv-bits`.
       throughput against it is INCONCLUSIVE, so selecting one is not known to
       cost anything either. It simply does not do what the name says.
 
+  Runs its codec — and measures SMALLER than bf16, on a dense architecture:
+      mixed_k<kb>g<kg>_v<vb>g<vg>, rot_k_v<vb>g<vg>.
+      Their bf16 K/V mirror serves one consumer only: a cross-layer-KV
+      (shared-KV) architecture's consumer layers. Where the model has none, the
+      mirror is not built and only the packed store remains. Resident KV
+      against bf16 on a prompt-sized request: 0.57x-0.59x on Bonsai-8B (4k,
+      16k, 32k), 0.75x on Qwen3.6-35B-A3B (4k). On Gemma4, which does share
+      K/V, the mirror is still the share and both stay above bf16: mixed
+      1.33x, rot_k 1.37x (e4b, 4k).
+      The saving is prompt-sized, not context-sized. On these architectures the
+      mirror is frozen at the prefill length, so a long generation off a short
+      prompt saves almost nothing (Bonsai-8B, 25-token prompt, 512 generated:
+      0.94x of the same codec before the mirror was elided).
+
   Runs its codec — and measures LARGER than bf16:
-      mixed_k<kb>g<kg>_v<vb>g<vg>, rot_k_v<vb>g<vg>, iso3_sym, iso4_sym,
-      k_iso3, k_iso4, rotor3_sym, rotor4_sym, k_rotor3, k_rotor4.
-      These decode over their own packed store. Resident KV against bf16:
-      k_iso3/k_iso4 1.00x-1.03x, iso3_sym/iso4_sym 1.01x-1.05x,
-      k_rotor3/k_rotor4 1.13x-1.17x, rotor3_sym/rotor4_sym 1.26x-1.33x,
-      mixed 1.29x-1.40x, rot_k 1.38x-1.54x.
+      iso3_sym, iso4_sym, k_iso3, k_iso4, rotor3_sym, rotor4_sym, k_rotor3,
+      k_rotor4.
+      These decode over their own packed store and keep no mirror to drop.
+      Resident KV against bf16: k_iso3/k_iso4 1.00x-1.03x,
+      iso3_sym/iso4_sym 1.01x-1.05x, k_rotor3/k_rotor4 1.13x-1.17x,
+      rotor3_sym/rotor4_sym 1.26x-1.33x.
 
 Per-codec detail and the measurements behind these numbers: docs/KV_QUANT.md,
 section \"Codec disposition — what every codec in the tree is for\".";
@@ -233,17 +249,22 @@ Mutually exclusive with `--kv-quant`, `--kv-preset`, `--cache-type-k`, and
 `--cache-type-v`. Pass `--kv-bits` + optionally `--kv-group-size` instead of a
 preset string.
 
-THIS FLAG DOES NOT SHRINK THE KV CACHE. Every value except (8, 128) resolves to
-the mixed_* codec, which keeps a full bf16 K and V mirror beside its packed
-store and so measures 1.287x-1.396x LARGER resident KV than plain bf16 (two
-architectures, two contexts). The single exception is not smaller either:
+WHAT THIS FLAG SHRINKS DEPENDS ON THE MODEL. Every value except (8, 128)
+resolves to the mixed_* codec. On an architecture whose layers do not share K/V
+it keeps only its packed store and measures 0.57x-0.75x of plain bf16 on a
+prompt-sized request (Bonsai-8B and Qwen3.6-35B-A3B, 4k-32k). On a shared-KV
+architecture (Gemma4) the bf16 K/V mirror beside that store *is* what the
+consumer layers read, so it is retained and the cache measures 1.33x LARGER
+than bf16. The saving is also prompt-sized, not context-sized: the mirror is
+frozen at the prefill length, so a long generation off a short prompt saves
+almost nothing. The single exception below is neither smaller nor larger:
 
   INERT — accepted, but does nothing:
       k8v8, which is what (8, 128) resolves to.
       Decode reads the bf16 mirror on both axes, so its packed store is never
       built: resident KV and generated tokens measure identical to bf16.
 
-For the smallest measured KV cache, pass `--kv-quant none`.
+On a shared-KV architecture the smallest measured KV cache is `--kv-quant none`.
 
 Integer mapping:
   --kv-bits 8 --kv-group-size 128  → k8v8 (see INERT above)

@@ -234,7 +234,12 @@ impl SsdHydrate<Qwen3Entry> for SsdHydrator {
         kv_quant: KvQuant,
         policy: DispatchPolicy,
     ) -> Result<Option<Qwen3Entry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids, seed, kv_quant, policy)?
+        let Some((block, block_hashes)) = self.lookup_seeded(
+            prompt_ids, seed, kv_quant, policy,
+            // No cross-layer KV sharing on this stack: nothing reads a
+            // Mixed/RotK bf16 mirror, so a hydrated cache builds none.
+            false,
+        )?
         else {
             return Ok(None);
         };
@@ -2031,7 +2036,7 @@ pub fn generate_greedy<'a>(
             })
             .collect();
         let eff_seq = (max_seq_ceiling.max(0) as u64).max(prompt_ids.len() as u64);
-        warn_if_kv_codec_net_negative(kv_quant, &layer_shapes, eff_seq);
+        warn_if_kv_codec_net_negative(kv_quant, &layer_shapes, eff_seq, false);
     }
 
     // Prefill: encode the prompt in fixed-size chunks via the shared Fresh

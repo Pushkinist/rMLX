@@ -183,7 +183,12 @@ impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
         kv_quant: KvQuant,
         policy: DispatchPolicy,
     ) -> Result<Option<Qwen35MoeEntry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(prompt_ids, seed, kv_quant, policy)?
+        let Some((block, block_hashes)) = self.lookup_seeded(
+            prompt_ids, seed, kv_quant, policy,
+            // No cross-layer KV sharing on this stack: nothing reads a
+            // Mixed/RotK bf16 mirror, so a hydrated cache builds none.
+            false,
+        )?
         else {
             return Ok(None);
         };

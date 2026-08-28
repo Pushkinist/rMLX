@@ -128,11 +128,39 @@ layers" condition is therefore already satisfied by the rotating-ring
 exemption, not by an extra gate.
 
 The residual net-negative is on the **global** layers, and only for the codecs
-that keep a packed store *and* a bf16 mirror. A quantized global layer keeps a
-warm-TTFT bf16 decode seed (`decode_fp16_k` / `decode_fp16_v`, gated by
+that keep a packed store *and* a bf16 mirror. A quantized global layer may keep
+a warm-TTFT bf16 decode seed (`decode_fp16_k` / `decode_fp16_v`, gated by
 [`KvQuant::feeds_bf16_k_at_decode`]); when the codec also builds a packed store,
 the codes + scales are pure overhead on top of a buffer the same size as bf16
 and the codec is strictly larger than `--kv-quant none`.
+
+`Mixed` / `RotK` are that shape **only on an architecture whose layers share
+K/V**. Their own decode reads the affine 3-tuples and never touches a mirror;
+the sole consumer is the `want_kv` arm of `update_and_sdpa_mixed_inner`, which
+`KvCache::update_and_sdpa_shared_source` reaches for a cross-layer-KV producer
+(Gemma4), plus the `SharedKv::Bf16` pair a drafter clones. So the two mirror
+predicates take the layer's own topology — `KvCache::shares_kv`, set by the arch
+builder — and where nothing shares, `exit_prefill` builds no mirror and the
+resident KV is the packed store alone. Measured `kv_cache_bytes` against `none`
+at a 3 770-token prompt on Ternary-Bonsai-8B: `mixed_k8g64_v4g64` 1.305x before,
+**0.589x** after; `rot_k_v4g64` 1.308x before, **0.589x** after. On Gemma4-e4b,
+which does share, both are byte-identical to before (1.327x / 1.374x): the
+mirror there is the share and is still built.
+
+Two properties of that saving matter to a reader sizing a cache:
+
+* **It is prompt-sized, not context-sized.** `KvCache::update` refuses a
+  `Mixed` storage outright, so `update_decode_fp16` never runs on these codecs
+  and the mirror — when there is one — is frozen at the length `exit_prefill`
+  set. Eliding it therefore removes bytes proportional to the *prefill* length,
+  not to the final offset. Bonsai-8B with a 25-token prompt and 512 generated
+  tokens moves only 47 849 728 → 45 187 328 bytes (0.944x), against 0.451x at a
+  3 770-token prompt.
+* **It is diluted by the per-layer codec vector.** `kv_layer_quants` promotes
+  the first `LAYER_ADAPTIVE_HEAD_N` and last `LAYER_ADAPTIVE_TAIL_N` layers to
+  `K8V8`, which is a mirror-family codec and keeps its mirror regardless. On
+  Bonsai-8B that is 10 of 36 layers, so at most 26/36 of the bf16 mirror is
+  ever available to elide.
 
 For the **bf16-mirror family** (`K8V4`, `K8V8`, `Planar*`, `PlanarK`,
 `K8VTurbo*`, `TurboSym*`, `Iso3/4`, `Rotor3/4`, `RotorK*Asym`) that overhead is
@@ -140,9 +168,12 @@ gone: no decode path reads their store, so `exit_prefill` does not build one
 (`KvQuant::materialises_packed_store()`, see `docs/KV_CACHE.md` §9.6 F3). Their
 resident KV is exactly the two bf16 mirrors — the same bytes as
 `--kv-quant none`, at every context and every geometry — and the warn never
-fires for them. It still fires for `Mixed` / `RotK`, which read
-their packed 3-tuples at decode and keep both mirrors as well, and for the
-K-only re-quantise families' sideband-heavy K store.
+fires for them. It still fires for the K-only re-quantise families'
+sideband-heavy K store, and for `Mixed` / `RotK` **on a shared-KV
+architecture**, where both mirrors are retained beside the packed 3-tuples.
+On a dense architecture those two now report a net *saving* and the warn does
+not fire; the estimate takes the same `shares_kv` the allocation does, so the
+two cannot disagree.
 
 Historical note: before that change, measured on Gemma4 e2b (7 global + 28
 windowed layers, head_dim 256, 1 KV head) at a 4096-token prompt, `k8v4` ≈
@@ -2925,20 +2956,32 @@ current tree rather than inherited:
   bf16 mirror and never read their packed store, so no store is built
   (§"Per-layer net-benefit decision" above). Their resident KV equals bf16's
   **byte for byte**, and so does their output at temp=0.
-* **The one store-reading codec a default ever picked loses on memory, and
-  does not win on speed.** `Mixed` really does read its packed 3-tuples at
-  decode — and holds them *beside* a bf16 mirror, so it is bf16 plus a store.
-  Measured against `none` on Ternary-Bonsai-8B it is 1.29x / 1.29x / 1.29x the
-  resident KV at 4k / 8k / 32k and lossy, while `none` is faster at 4k and 8k
-  (SEPARATED) and indistinguishable at 32k. Note the *decode* gap narrows with
-  context in that series rather than widening — the growing-with-context loss
-  recorded for this trade is a different cell, Qwen3.8-27B at 130 848 tokens
-  (§"Fused flash-decode over a quant store"), and is not what the Bonsai rows
-  below show.
+* **The one store-reading codec a default ever picked does not win on
+  speed.** `Mixed` really does read its packed 3-tuples at decode. The rows
+  below were recorded while it also held a bf16 mirror beside them on every
+  architecture — 1.29x / 1.29x / 1.29x the resident KV of `none` at 4k / 8k /
+  32k on Ternary-Bonsai-8B — and `none` was faster at 4k and 8k (SEPARATED) and
+  indistinguishable at 32k. Note the *decode* gap narrows with context in that
+  series rather than widening — the growing-with-context loss recorded for this
+  trade is a different cell, Qwen3.8-27B at 130 848 tokens (§"Fused
+  flash-decode over a quant store"), and is not what the Bonsai rows below
+  show.
+
+  **The memory half of that row no longer holds on a dense architecture.** The
+  mirror is now built only where a cross-layer-KV consumer reads it
+  (§"Per-layer net-benefit decision"), so on Bonsai-8B `mixed_k8g64_v4g64` is
+  **0.589x** `none` at a 3 770-token prompt, 0.575x at 16k and 0.573x at 32k,
+  and on Qwen3.6-35B-A3B 0.748x at 4k. The speed half is unchanged and was
+  re-measured across that change: ABBA-paired, same host, decode-TPS ratio
+  0.9957 (n=3, sd 0.0028) at a 32 768-token prompt against a same-code-path
+  `--kv-quant none` control band of 1.0061 (n=3, sd 0.0152) — the codec band
+  lies inside the control band, so the change is INCONCLUSIVE on throughput.
+  Greedy token ids are byte-identical across it on three architectures.
 
 So on every cell measured here — the bf16-mirror family and `Mixed`, three
-architectures, 4k to 32k — nothing is smaller than bf16 and nothing is faster.
-A default that picked one of those was charging for a label.
+architectures, 4k to 32k — nothing is faster than bf16. A default that picked
+one of those was charging for a label on speed; on memory, `mixed_*` and
+`rot_k_*` on a dense architecture are now the exception.
 
 That is a claim about the codecs a default could plausibly have picked, **not**
 about the whole codec axis. The fully symmetric families (`Iso3Sym`, `Iso4Sym`,

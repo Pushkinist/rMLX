@@ -269,9 +269,14 @@ pub struct KvLayerShape {
 /// gives the operator the byte math so they can pick `--kv-quant none` when the
 /// codec buys nothing at their context size.
 ///
-/// Keyed entirely on `(KvLayerShape, KvQuant, eff_seq)` — no arch branch. Call
-/// once per request from the arch `generate` path after the codec is resolved
-/// and the layer mix is known.
+/// Keyed on `(KvLayerShape, KvQuant, eff_seq, shares_kv)` — no arch *name*, but
+/// `shares_kv` is the caller's own cross-layer-KV topology, the same flag its
+/// caches carry (see [`rmlx_kv_quant::KvCache::shares_kv`]). It is what decides
+/// whether `Mixed` / `RotK` are estimated with their bf16 mirror; assuming one
+/// on a stack that keeps none would over-report those codecs by two full bf16
+/// buffers per layer and warn about bytes nothing allocates. Call once per
+/// request from the arch `generate` path after the codec is resolved and the
+/// layer mix is known.
 ///
 /// `layers` is the per-layer shape vector (one entry per decoder layer);
 /// `eff_seq` is the effective prompt+generate length the global layers will
@@ -294,8 +299,14 @@ pub struct KvLayerShape {
 /// replicated `f32` quaternion per group and an `f32` norm, none of which the
 /// ring stores. The sign is what the warning is for; a reader must not size a
 /// buffer from the number.
-pub fn warn_if_kv_codec_net_negative(quant: KvQuant, layers: &[KvLayerShape], eff_seq: u64) {
-    let (total_saving, n_global, n_windowed) = kv_codec_net_saving_total(quant, layers, eff_seq);
+pub fn warn_if_kv_codec_net_negative(
+    quant: KvQuant,
+    layers: &[KvLayerShape],
+    eff_seq: u64,
+    shares_kv: bool,
+) {
+    let (total_saving, n_global, n_windowed) =
+        kv_codec_net_saving_total(quant, layers, eff_seq, shares_kv);
     if total_saving < 0 {
         tracing::warn!(
             kv_quant = %quant,
@@ -322,6 +333,7 @@ pub fn kv_codec_net_saving_total(
     quant: KvQuant,
     layers: &[KvLayerShape],
     eff_seq: u64,
+    shares_kv: bool,
 ) -> (i64, usize, usize) {
     if matches!(quant, KvQuant::None) || layers.is_empty() {
         return (0, 0, 0);
@@ -345,6 +357,7 @@ pub fn kv_codec_net_saving_total(
             l.head_dim,
             l.kv_heads,
             is_windowed,
+            shares_kv,
         ));
     }
     (total_saving, n_global, n_windowed)
