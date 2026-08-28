@@ -3062,11 +3062,13 @@ of the rest at 3.78·D against 4·D, i.e. a 5% saving for a 4-bit name. `Mixed` 
 below the `None` row here and still measures larger resident, because it keeps
 both bf16 seeds beside its store — a residency fact this table does not carry.
 
-Each ring side spends one `u32` code word and one `f32` scale per group
-whatever the codebook width, so the nominal
-3-/4-bit label never reaches the store: iso is `16 + 32/head_dim` bits per
-value and rotor floors at `64/3` = 21.33, both strictly above bf16's 16.0 at
-every finite head dim (§ iso3 "Memory truth", § rotor3). The rate is a property
+Each ring side spends one `u32` code word and one `KV_SIDEBAND_DTYPE` scale per
+group whatever the codebook width, so the nominal
+3-/4-bit label never reaches the store: iso is `12 + 16/head_dim` bits per
+value and rotor floors at `48/3` = 16.0, so iso is below bf16's 16.0 at every
+finite head dim and rotor is above it at every finite one (§ iso3 "Memory
+truth", § rotor3). At the `f32` sideband those read `16 + 32/head_dim` and a
+floor of `64/3` = 21.33 respectively. The rate is a property
 of the ring layout, not of the algorithms; a layout that packs its scale plane
 separately is unbuilt and is the open question § "What this disposition does not
 decide" names.
@@ -4110,10 +4112,11 @@ GPU encode takes a `RingFeed` from its caller, one of three modes:
 - **`Skip`** — clear the ring. Used by the sym/asym mirrors, and as the `b > 1`
   fallback of a ring-only feed (which reverts to the block path).
 
-A ring for a non-eligible codec is not free —
-`capacity * kv_h * n_groups * 8 + capacity * kv_h * 4` bytes per layer, growing
-with context (order of a few hundred MB across a 36-layer model at 4k) — and
-nothing would ever read it.
+A ring for a non-eligible codec is not free — one `u32` code word plus one
+`KV_SIDEBAND_DTYPE` scale per group and one such norm per token, so
+`capacity * kv_h * (n_groups * (4 + sideband) + sideband)` bytes per layer,
+growing with context (order of a few hundred MB across a 36-layer model at 4k)
+— and nothing would ever read it.
 
 **Invariant: the CPU `blocks` track `shape[2]` exactly, or the GPU ring holds
 the tail and the blocks are rebuilt from it on demand — never a silent gap.**

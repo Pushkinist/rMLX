@@ -1386,11 +1386,6 @@ fn affine_tuple(data: &[f32], geom: Cadence, bits: u32, group: u32) -> MixedTupl
     }
 }
 
-/// Bytes this store holds for the fixture.
-#[allow(
-    clippy::unwrap_used,
-    reason = "every encoder here is called on the fixture with a shape and width it validates; a failure is a broken encoder and the panic names it"
-)]
 /// Bytes the shipped GPU ring holds for one already-encoded side.
 ///
 /// Built and measured, not restated: `QuantKGpuRing::byte_size` reads each
@@ -1402,6 +1397,10 @@ fn affine_tuple(data: &[f32], geom: Cadence, bits: u32, group: u32) -> MixedTupl
 /// `max_seq == seq` keeps `page_round` from rounding the allocation up to a
 /// whole `KV_PAGE_SIZE`, so what comes back is the payload and not a page
 /// ceiling.
+#[allow(
+    clippy::expect_used,
+    reason = "the seed is handed the lengths this fixture just encoded, so a rejection is a broken encoder and the message names which argument disagreed"
+)]
 fn ring_side_bytes(
     codes: &[u32],
     scales: &[f32],
@@ -1425,6 +1424,11 @@ fn ring_side_bytes(
     ring.byte_size()
 }
 
+/// Bytes this store holds for the fixture.
+#[allow(
+    clippy::unwrap_used,
+    reason = "every encoder here is called on the fixture with a shape and width it validates; a failure is a broken encoder and the panic names it"
+)]
 fn measured_side_bytes(layout: StoreLayout, data: &[f32], geom: Cadence) -> u64 {
     let elems = geom.values();
     let head_dim = geom.head_dim as usize;
@@ -1710,6 +1714,51 @@ fn every_codec_byte_model_matches_the_store_it_writes() {
                 expected_total,
                 "{q} at head_dim={}: whole-codec estimate disagrees with its own per-side \
                  model assembled through materialises_packed_store + feeds_bf16_k/v",
+                geom.head_dim
+            );
+        }
+    }
+}
+
+/// The estimator's iso and rotor side bytes are the ring's own arithmetic, at
+/// the ring's own sideband width.
+///
+/// [`SIDEBAND_BYTES`][super::SIDEBAND_BYTES] reads
+/// [`KV_SIDEBAND_DTYPE`][crate::storage::KV_SIDEBAND_DTYPE], so the two widths
+/// cannot disagree by construction. What that shared constant does **not**
+/// prevent is the estimator spending the sideband at the wrong *cadence* — per
+/// pair instead of per group, or dropping the per-token norm plane entirely —
+/// which is exactly the class of miscount that had the rotor family reported at
+/// its codebook width for as long as it did. So this checks the assembled
+/// figure against [`ring_bits_per_value`][crate::storage::ring_bits_per_value],
+/// the ring's own single producer of a stored rate, at every cadence geometry
+/// rather than at the one `head_dim` the published figures quote.
+#[test]
+fn iso_and_rotor_side_bytes_track_the_stored_sideband_dtype() {
+    assert_eq!(
+        super::SIDEBAND_BYTES,
+        crate::storage::KV_SIDEBAND_DTYPE.itemsize() as u64,
+        "the estimator's sideband width is only right because it is read off the stored \
+         dtype; a literal here is a second producer"
+    );
+
+    for &geom in CADENCE_GEOMETRIES {
+        let elems = geom.values();
+        let n_tokens = geom.rows();
+        // n_groups per row is the codec's rule, not the ring's: one quaternion
+        // block per 4 head-dim slots for iso, one multivector group per 3 for
+        // rotor (tail-padded).
+        for &(store, n_groups, name) in &[
+            (super::SideStore::IsoRing, geom.head_dim / 4, "iso"),
+            (super::SideStore::Rotor, geom.head_dim.div_ceil(3), "rotor"),
+        ] {
+            let modelled = super::packed_side_bytes(store, 3, elems, geom.head_dim, n_tokens);
+            let modelled_bits = (modelled * 8) as f64 / elems as f64;
+            let ring_bits = crate::storage::ring_bits_per_value(geom.head_dim, n_groups);
+            assert!(
+                (modelled_bits - ring_bits).abs() < 1e-9,
+                "{name} at head_dim={}: the byte model spends {modelled_bits} bits per value, \
+                 the ring it models spends {ring_bits}",
                 geom.head_dim
             );
         }

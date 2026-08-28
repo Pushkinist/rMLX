@@ -743,9 +743,13 @@ fn rotor4_v_sync_ring(
 /// Only the K-only codecs (`RotorKOnly3` / `RotorKOnly4`) have a kernel that
 /// reads the ring — `Rotor{3,4}Sym` and `RotorK{3,4}Asym` quantize V as well and
 /// the flash kernel takes bf16 V only, so a ring built for them is never read.
-/// It is not free: `capacity * kv_h * n_groups * 8 + capacity * kv_h * 4` bytes
-/// per layer, growing with context, which at 4k over a 36-layer model is on the
-/// order of a few hundred MB of pure waste.
+/// It is not free: one `u32` code word plus one
+/// [`crate::storage::KV_SIDEBAND_DTYPE`] scale per group and one such norm per
+/// token, so
+/// `capacity * kv_h * (n_groups * (4 + KV_SIDEBAND_DTYPE.itemsize()) + KV_SIDEBAND_DTYPE.itemsize())`
+/// bytes per layer, growing with context — at 4k over a 36-layer model, on the
+/// order of a few hundred MB of pure waste. Written as the expression rather
+/// than as bytes so a sideband-width change moves it.
 ///
 /// Passed down from the caller rather than inferred here, so eligibility lives
 /// with the dispatcher that knows it.

@@ -68,7 +68,8 @@ pub use quant_iso_v::{IsoBlocks, QuantIsoV3, ISO3_BITS, ISO3_GROUP_SIZE};
 pub use quant_iso_v4::{QuantIsoV4, ISO4_BITS, ISO4_GROUP_SIZE};
 pub use quant_k::QuantK;
 pub use quant_k_gpu_ring::{
-    bf16_round, sideband_to_f32_vec, to_sideband_dtype, QuantKGpuRing, KV_SIDEBAND_DTYPE,
+    bf16_round, ring_bits_per_value, sideband_to_f32_vec, to_sideband_dtype, QuantKGpuRing,
+    KV_SIDEBAND_DTYPE,
 };
 pub use quant_k_turbo3::{QuantKTurbo3, TURBO3_K_BITS};
 pub use quant_k_turbo4::QuantKTurbo4;

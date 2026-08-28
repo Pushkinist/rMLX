@@ -610,8 +610,18 @@ impl KvCache {
             &sl_strides,
             device,
         )?;
+        // The shadow's scale and norm planes are f32 and stay f32 (see
+        // `rotor_fused_qk_msl`: this buffer spans the whole context and the
+        // kernel reads it at whatever width it is bound at). The rotor encoder
+        // hands back its planes at the ring's sideband dtype, so the widths
+        // differ and the cast is a real conversion — made here rather than left
+        // to `slice_update`'s implicit one, so the store-format boundary is
+        // visible at the site that crosses it. Same shape as
+        // `QuantKGpuRing::write_range`, which crosses the same boundary the
+        // other way. No-op for an encoder already at the destination width.
+        let scales_src = cast_to(&encoded.scales, shadow_ref.k_scales.dtype(), device)?;
         let scales_new = shadow_ref.k_scales.slice_update(
-            &encoded.scales,
+            &scales_src,
             &sl_start,
             &scales_stop,
             &sl_strides,
@@ -620,13 +630,8 @@ impl KvCache {
         let norms_new = if let (Some(norms_buf), Some(encoded_norms)) =
             (shadow_ref.sideband_norms.as_ref(), encoded.norms)
         {
-            Some(norms_buf.slice_update(
-                &encoded_norms,
-                &sl_start,
-                &norms_stop,
-                &sl_strides,
-                device,
-            )?)
+            let norms_src = cast_to(&encoded_norms, norms_buf.dtype(), device)?;
+            Some(norms_buf.slice_update(&norms_src, &sl_start, &norms_stop, &sl_strides, device)?)
         } else {
             None
         };
@@ -644,6 +649,20 @@ impl KvCache {
             shadow.filled = start + n;
         }
         Ok(())
+    }
+}
+
+/// Cast `a` to `dtype` unless it is already there.
+///
+/// Used where an encoder's output width and a destination buffer's width are
+/// set independently: `slice_update` would convert silently, and a silent
+/// conversion is what lets a plane's stored width drift from the width its
+/// producer documents.
+fn cast_to(a: &Array, dtype: Dtype, device: Device) -> Result<Array> {
+    if a.dtype() == dtype {
+        a.try_clone()
+    } else {
+        a.astype(dtype, device)
     }
 }
 

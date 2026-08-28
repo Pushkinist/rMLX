@@ -143,27 +143,50 @@ pub fn gpu_resident_iso_enabled() -> bool {
     false
 }
 
-/// Test-only override for `gpu_resident_iso_enabled`. Latches the value for
-/// the lifetime of the test binary (OnceLock semantics preserved). Call before
-/// any `append_gpu` invocation. GPU mirror tests require `--test-threads=1`.
+/// Test-only override for `gpu_resident_iso_enabled`, scoped to whoever holds
+/// the [`GpuResidentIsoForTest`] guard.
+///
+/// **Not latched.** An earlier shape cached the first read in a `OnceLock`, so
+/// the first test in the binary to reach `append_gpu` decided the gate for
+/// every test after it — and the tests that need the mirror ON only pass when
+/// they sort alphabetically before every test that does not. They stopped
+/// doing so when a ring test was added whose name sorts first, and three
+/// mirror tests went red for a reason none of them names. A test's outcome
+/// must not depend on which other tests ran, so the read is now plain and the
+/// scope belongs to a guard.
+///
+/// Reading an `AtomicBool` per call is safe because the single production read
+/// site is inside `QuantIsoV3::append_gpu`, which dispatches a Metal kernel and
+/// is therefore only reachable from `#[ignore]`d GPU tests — and those run
+/// `--test-threads=1`, so no two of them observe the flag concurrently.
 #[cfg(test)]
 pub fn gpu_resident_iso_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| GPU_RESIDENT_ISO_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed))
+    GPU_RESIDENT_ISO_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Test-only setter for the GPU-resident ISO gate. Set to `true` before the
-/// first call to `gpu_resident_iso_enabled()` in the test binary. Requires
-/// `--test-threads=1` (OnceLock latches on first read).
+/// Test-only backing flag for the GPU-resident ISO gate. Set through
+/// [`force_gpu_resident_iso`], never directly, so every change is scoped.
 #[cfg(test)]
 pub(crate) static GPU_RESIDENT_ISO_FOR_TEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Enables the GPU-resident ISO mirror for the remainder of this test binary.
-/// Must be called before any `QuantIsoV3::append_gpu` (OnceLock latches on
-/// first read of `gpu_resident_iso_enabled`). Run tests with `--test-threads=1`.
+/// Restores the previous GPU-resident ISO gate state when dropped.
 #[cfg(test)]
-pub(crate) fn set_gpu_resident_iso_for_test(enabled: bool) {
-    GPU_RESIDENT_ISO_FOR_TEST.store(enabled, std::sync::atomic::Ordering::Relaxed);
+#[must_use = "the gate reverts as soon as this guard drops; bind it for the test's lifetime"]
+pub(crate) struct GpuResidentIsoForTest(bool);
+
+#[cfg(test)]
+impl Drop for GpuResidentIsoForTest {
+    fn drop(&mut self) {
+        GPU_RESIDENT_ISO_FOR_TEST.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Set the GPU-resident ISO mirror gate for as long as the returned guard
+/// lives, then put back whatever it was.
+#[cfg(test)]
+pub(crate) fn force_gpu_resident_iso(enabled: bool) -> GpuResidentIsoForTest {
+    GpuResidentIsoForTest(
+        GPU_RESIDENT_ISO_FOR_TEST.swap(enabled, std::sync::atomic::Ordering::Relaxed),
+    )
 }

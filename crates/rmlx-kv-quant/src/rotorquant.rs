@@ -60,8 +60,9 @@
 //!
 //! The single-codebook simplification ships at **~8 bpe pre-scale** — each
 //! group quantises 3 real grade-1 elements but stores 8 three-bit codes
-//! (24 bits) for the full 8-component multivector, plus one per-group f32
-//! scale and one per-token f32 norm. The grade-aware variant — which would
+//! (24 bits) for the full 8-component multivector, plus one per-group scale and
+//! one per-token norm, both at
+//! [`crate::storage::KV_SIDEBAND_DTYPE`]. The grade-aware variant — which would
 //! drop the bit budget for the high grades and bring the storage closer to
 //! the 3.25 bpe target reported by the Python `rotorquant` reference — is
 //! gated on the follow-up (deferred).
@@ -73,11 +74,18 @@
 //! | Component | Layout | Bits / value |
 //! |---|---|---|
 //! | codes | 43 `u32` per 128 values | **10.75** |
-//! | scales | 43 `f32` per 128 values | **10.75** |
-//! | norm | 1 `f32` per 128 values | **0.25** |
-//! | **total** | | **21.75** (bf16 is 16.0) |
+//! | scales | 43 `bf16` per 128 values | **5.375** |
+//! | norm | 1 `bf16` per 128 values | **0.125** |
+//! | **total** | | **16.25** (bf16 is 16.0) |
 //!
-//! Two independent overruns, with different fixes:
+//! `rotor_rate_splits_into_documented_code_scale_and_norm_bits` measures that
+//! split off a real encode rather than restating it, and
+//! [`crate::storage::ring_bits_per_value`] is where the total comes from.
+//!
+//! It was 21.75 while the scale and norm planes were `f32`. Halving them was a
+//! 25% saving that still does not reach bf16, which is the point of the split
+//! above: a sideband change cannot fix a code cadence. Two independent
+//! overruns remain, with different fixes:
 //!
 //! 1. **Dead components.** Only 3 of the 8 quantised components carry
 //!    information. A rotor sandwich is grade-preserving, so for the grade-1
@@ -87,10 +95,10 @@
 //!    code bits per group are therefore dead budget, not distortion — pinned by
 //!    `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` and
 //!    `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1`.
-//! 2. **Scale cadence.** One whole `f32` per 3 values is 10.75 bits per value on
-//!    its own — half the total, and the dominant term once (1) is fixed. A group
-//!    of 3 sharing a full `f32` scale is not a viable rate point at any code
-//!    width.
+//! 2. **Scale cadence.** One `bf16` per 3 values is 5.375 bits per value on its
+//!    own — a third of the total, and the dominant term after the codes. A
+//!    group of 3 sharing a whole scale is not a viable rate point at any code
+//!    width, at any sideband width.
 //!
 //! rotor4 fills all 32 code bits instead of 24 and therefore occupies
 //! *byte-identical* storage. No rotor codec is smaller than bf16 at any

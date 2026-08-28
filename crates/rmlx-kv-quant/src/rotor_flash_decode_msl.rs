@@ -534,8 +534,12 @@ fn p2_kernel() -> Result<&'static MetalKernel> {
 /// * `query`     — Q for the new token, shape `[B, n_q_heads, 1, head_dim]`.
 /// * `k_codes`   — packed rotor codes, flat `u32 [B * kv_seq * kv_h * n_groups]`
 ///   (sequence-major).
-/// * `k_scales`  — per-group f32 scales, same flat length as `k_codes`.
-/// * `k_norms`   — per-token f32 L2 norms, flat `[B * kv_seq * kv_h]`.
+/// * `k_scales`  — per-group scales, same flat length as `k_codes`. Bound at
+///   [`crate::storage::KV_SIDEBAND_DTYPE`], which the kernel declares; an `f32`
+///   plane is accepted and narrowed on the way in (`to_sideband_dtype`), not
+///   reinterpreted.
+/// * `k_norms`   — per-token L2 norms, flat `[B * kv_seq * kv_h]`, same dtype
+///   handling as `k_scales`.
 /// * `k_rotors`  — static per-(layer, head) rotor table, flat `[n_groups * 4]`
 ///   f32 in `[s, b12, b13, b23]` order.
 /// * `v`         — bf16 / f16 / f32 V, shape `[B, kv_h, kv_seq, head_dim]`.
