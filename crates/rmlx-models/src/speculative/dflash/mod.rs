@@ -576,16 +576,15 @@ impl DFlashRoundState {
         self.snapshots.is_empty()
     }
 
-    /// Restore all GDN caches to the round-start snapshot (partial acceptance).
+    /// Consume the round state and hand back the per-layer snapshots.
     ///
-    /// Consumes the snapshot — call once per round on partial rejection. The
-    /// caller then re-runs the verifier from the accepted prefix to advance the
-    /// recurrence (mirrors `lm.rollback_speculative_cache` followed by the next
-    /// round's verify in `_dflash_rounds`).
-    pub fn restore(self, lin_caches: &mut [LinearAttnCache]) {
-        for (cache, snap) in lin_caches.iter_mut().zip(self.snapshots) {
-            cache.restore_snapshot(snap);
-        }
+    /// Restoring them is only one third of a partial-accept rollback — it also
+    /// has to roll the KV caches back and replay the retained prefix through
+    /// them — so the snapshots are handed to the shared rollback rather than
+    /// restored here (mirrors `lm.rollback_speculative_cache` followed by the
+    /// next round's verify in `_dflash_rounds`).
+    pub fn into_snapshots(self) -> Vec<LinearAttnCache> {
+        self.snapshots
     }
 }
 
@@ -872,39 +871,17 @@ pub fn dflash_generate_greedy(
         // draft slots + the carry b). KV target = pre + accept + 1 carry-rows.
         let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
         if v_target < v_offset_before {
-            // The GDN recurrent state has no sequence axis, so it cannot be
-            // truncated — it is restored from the pre-round snapshot and
-            // replayed over the kept prefix. That replay runs the WHOLE layer
-            // stack, and in this hybrid the full-attention layers are
-            // interleaved between GDN layers: their output is the residual a
-            // later GDN layer consumes. So the replay must see the real KV
-            // caches at their real sequence offsets, not an empty scratch
-            // stack — otherwise the FA layers attend to a `v_kept`-token
-            // prefix at positions `0..v_kept` and every downstream GDN layer
-            // advances on a wrong hidden. Roll the FA caches back to the
-            // pre-round offset first, then replay into them; they land on
-            // `v_target` exactly as the direct truncation would have.
             let v_pre_round_offset = v_offset_before - v_k as i32;
-            let v_kept = (v_target - v_pre_round_offset).max(0) as usize;
-            for c in &mut v_caches {
-                // GDN layers never advance their KvCache offset (stays 0);
-                // truncating them would assert n>offset. Only roll back FA
-                // caches that actually accumulated this round's keys.
-                if c.offset() >= v_pre_round_offset {
-                    c.truncate_to(v_pre_round_offset);
-                }
-            }
-            // Restore the pre-round GDN snapshot, then replay the kept prefix.
-            round_snap.restore(&mut v_lin);
-            if v_kept > 0 && v_kept <= v_input.len() {
-                let _ = verifier.forward_seq_last_k_with_cache(
-                    &v_input[..v_kept],
-                    1,
-                    &mut v_caches,
-                    Some(&mut v_lin),
-                    device,
-                )?;
-            }
+            super::rollback_round_caches(
+                verifier,
+                &mut v_caches,
+                Some(&mut v_lin),
+                Some(round_snap.into_snapshots()),
+                &v_input,
+                v_pre_round_offset,
+                v_target,
+                device,
+            )?;
         } else {
             // Full accept — GDN already correct; drop the snapshot.
             drop(round_snap);

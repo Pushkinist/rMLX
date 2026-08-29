@@ -249,14 +249,24 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
         spec_ids.len(),
         plain_ids.len()
     );
-    // Greedy speculative decoding emits the verifier's own argmax at every
-    // position, so on this fixture the two streams agree over the whole answer.
-    // Measured on the documented pair: 31/31 with the partial-accept rollback
-    // replaying through the real KV caches, 4 shared tokens replaying through a
-    // fresh scratch stack.
-    assert_eq!(
-        common, shorter,
-        "MTP diverged from plain greedy after {common} of {shorter} tokens — the \
-         verifier state the round loop leaves behind does not match a sequential decode"
+    // The oracle is the module doc's: a *short* common prefix means the
+    // verifier state itself diverged. It is deliberately not bit-identity —
+    // the verify pass scores a whole block in one forward while plain decode
+    // steps one token at a time, and on this stack that is a different
+    // reduction order through 48 GDN layers, so one legitimate near-tie flip
+    // is expected behaviour and must not fail the gate.
+    //
+    // The bound sits in the gap between the two measured regimes on the
+    // documented pair: 31 of 31 shared tokens with the partial-accept rollback
+    // replaying through the real KV caches, 4 of 31 replaying through a fresh
+    // scratch stack. Half leaves both regimes a wide margin — the corrupted
+    // arm is 3.8x below it and the correct arm 2.1x above — which is what
+    // keeps one legitimate near-tie flip from failing the gate.
+    let floor = shorter / 2;
+    assert!(
+        common >= floor,
+        "MTP tracked plain greedy for only {common} of {shorter} tokens (floor {floor}) — \
+         a prefix this short means the verifier state the round loop leaves behind does \
+         not match a sequential decode, not that a near-tie flipped"
     );
 }

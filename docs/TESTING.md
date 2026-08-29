@@ -53,10 +53,24 @@ variables above:
 | Variable | Used by | Purpose |
 |----------|---------|---------|
 | `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override for the SSD-restart smoke test. |
-| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path. |
-| `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
+| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path; the Qwen3.5-family alignment tests take a **verifier** here instead (see below). |
+| `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | Vision-language model snapshot for VL text-parity tests. |
 | `RMLX_PROMPT_CACHE_TEST_MODEL_A` / `_B` | `rmlx-models/tests/prompt_cache_cross_model.rs` | **Two** snapshots of the same architecture with the same KV shape but different weights — the prompt cache is one static per arch, and this pair is what shows whether its key separates two resident models. `mlx-community__gemma-4-e2b-it-mxfp8` + `mlx-community__gemma-4-E2B-it-qat-4bit` fit (both `Gemma4ForConditionalGeneration`, 35 layers x 1 KV head x head_dim 256). Same-shape matters: a shape mismatch would fail for the wrong reason. Different weights matter: identical outputs make the comparison vacuous, and the test refuses rather than passing. |
+
+The three Qwen3.5-family alignment suites **return silently when their two
+variables are unset** (and the EAGLE-3 / two-model ones also when the drafter
+handed to them is of the wrong kind), so an unnamed consumer here is a gate that
+passes while never running. The pairs their thresholds are calibrated against:
+
+| Test | `RMLX_KV_TEST_MODEL` (verifier) | `RMLX_DRAFT_TEST_MODEL` (drafter) |
+|---|---|---|
+| `qwen3_5_mtp_drafter_alignment.rs` | `mlx-community__Qwen3.8-27B-mxfp8` | `mlx-community__Qwen3.8-27B-MTP-mxfp8` |
+| `qwen3_5_eagle3_alignment.rs` | `mlx-community__Qwen3.6-35B-A3B-8bit` | `Dogacel__specdrift-qwen3.6-35b-a3b-eagle3` |
+| `qwen3_5_two_model_alignment.rs` | `mlx-community__Qwen3.8-27B-mxfp8` | `sahilchachra__ornith-1.0-9b-mxfp8-mlx` (a full model, not a drafter head — both halves must be GDN hybrids sharing a vocabulary) |
+
+Point either at a different pair and re-measure both arms before reading a
+failure as a regression.
 
 The Whisper audio integration tests (`crates/rmlx-audio/tests/transcribe.rs`)
 deliberately use **no** dedicated env var — they resolve the

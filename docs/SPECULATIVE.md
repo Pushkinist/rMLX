@@ -73,15 +73,13 @@ loop until n_tokens emitted:
   emit v_tokens[0..=accept]   # accept + 1 tokens this round
   y = v_tokens[accept]        # next round's carry
 
-  # Phase D — cache rollback
+  # Phase D — cache rollback (one helper, both sides)
   v_drop = K - accept          # positions to discard from verifier cache
   d_drop = max(K - accept - 1, 0)
-  verifier_caches.truncate_to(offset - v_drop)
-  draft_caches.truncate_to(offset - d_drop)
-
-  if GDN partial accept:
-    restore_and_replay_lin(verifier_lin, verifier_lin_snap, v_input[..kept])
-    restore_and_replay_lin(draft_lin, draft_lin_snap, d_fed[..kept])
+  rollback_round_caches(verifier, verifier_caches, verifier_lin, verifier_lin_snap,
+                        v_input, v_pre_round_offset, offset - v_drop)
+  rollback_round_caches(draft, draft_caches, draft_lin, draft_lin_snap,
+                        d_fed, d_pre_round_offset, offset - d_drop)
 
   if accept == K:
     ds = [last_draft, y]   # draft cache lagged one position — prepend dK
@@ -253,6 +251,26 @@ appended count) → one combined verify forward → `walk_deferred_greedy` accep
 emit → GDN snapshot/restore verifier-KV rollback + sidecar-KV `truncate_to` on
 partial acceptance.
 
+`draft_n` proposes `block_size - 1` tokens but only ever feeds back `block_size - 2`
+of them, so the last one used to get no KV slot. A full-accept round then commits
+`block_size` verifier positions against `block_size - 1` sidecar slots, and
+`MtpDrafter::truncate_to` — which skips a layer already shorter than the target —
+absorbed the difference in silence. The gap grew one slot per full-accept round
+and the sidecar acquired a permanent context hole. It cannot corrupt an emitted
+token (every one of those is `walk_deferred_greedy`'s argmax over the verifier's
+own captured hidden, which never consults the drafter), so the only symptom was
+accept-rate decay. `draft_n` now runs one more `forward_token` at the end and
+discards the hidden, purely so the last drafted token gets its slot, and the skip
+in `truncate_to` warns instead of passing quietly.
+
+A dense sidecar omits `num_experts` / `num_experts_per_tok` entirely, and the two
+keys are not read the same way for that reason. `num_experts` has a sentinel — `0`
+means "dense, no experts", the same one `Qwen3_5MoeConfig` uses — so it defaults.
+`num_experts_per_tok` has none: every value it can take is a legal routing width,
+so a default would load a top-8 checkpoint at top-1 and show up only as a quietly
+worse accept rate. It is carried as an `Option` and refused by name in the MoE
+branch of `MtpLayer::load`, which is the only branch that reads it.
+
 The GDN half of that rollback is not a truncation: the recurrent state has no
 sequence axis, so it is restored from a pre-round snapshot and **replayed** over
 the kept prefix. That replay runs the whole layer stack, and on this hybrid the
@@ -262,10 +280,41 @@ back to the pre-round offset first, so the FA layers attend their true prefix at
 their true positions and land back on `v_target`. Replaying through a fresh
 scratch KV stack instead makes those FA layers attend a `v_kept`-token prefix at
 positions `0..v_kept`, and every downstream GDN layer advances on a wrong
-hidden: measured on the Qwen3.8-27B pair, greedy MTP shared 4 of 31 tokens with
-plain greedy decoding and degenerated into a repetition loop on longer prompts,
-against 31/31 with the real-cache replay. `dflash_generate_greedy` carries the
-identical rollback and the identical fix. Note the MTP sidecar config carries `model_type` but no
+hidden.
+
+Every round loop that can partially accept goes through **one** implementation of
+this — `speculative::rollback_round_caches`. It owns the whole rollback: the
+full-attention `truncate_to` loop, the GDN snapshot restore, and the replay.
+A full-attention arch (`lin` absent or empty) takes its short arm and truncates
+straight to the target; a GDN hybrid takes the replay arm. Its seven callers are
+`mtp_generate_greedy`, `dflash_generate_greedy`, `eagle3_generate_greedy`, and
+the classic two-model loop's four (verifier + drafter, greedy + stochastic).
+There is deliberately no second copy: the defect below lived in four independent
+implementations at once, and a rollback inlined per loop is how it got there.
+
+Measured, greedy, temp=0, one plain-greedy arm per pair (`common prefix` from the
+alignment suites in `crates/rmlx-models/tests/`), scratch-stack replay vs
+real-cache replay:
+
+| Round loop | Pair | Scratch stack | Real caches |
+|---|---|---|---|
+| MTP sidecar | Qwen3.8-27B + its MTP sidecar | 4 / 31 | 31 / 31 |
+| EAGLE-3 | Qwen3.6-35B-A3B + specdrift eagle3 | 13 / 96 | 93 / 96 |
+| Two-model | Qwen3.8-27B + ornith-1.0-9b | 17 / 96 | 96 / 96 |
+
+The corrupted arm also degenerated into a repetition loop on longer prompts. The
+remaining flips in the correct arms are ordinary near-ties — the verify pass
+scores a whole block in one forward, which is a different reduction order from a
+one-token-at-a-time decode — which is why those gates assert a threshold and not
+bit-identity.
+
+The classic two-model loop needed one more thing to reach the rollback at all: it
+read the pre-round offset from `caches[0]`, and on a GDN hybrid layer 0 is a
+recurrent layer whose `KvCache::offset` never leaves 0. That drove the truncation
+target negative on every round. It now takes the max across the stack, the way
+the other three loops already did.
+
+Note the MTP sidecar config carries `model_type` but no
 `architectures` array; `ModelConfig::architectures` is now `#[serde(default)]`
 so the standalone drafter config loads cleanly.
 
@@ -551,10 +600,12 @@ between chunks the KV cache state is flushed via `eval_prefill_state`. The
 `enter_prefill` / `exit_prefill` bracket optimises cache memory layout.
 
 GDN recurrent state is snapshotted before every draft round using
-`snapshot_lin`. On partial acceptance (`accept < K`), `restore_and_replay_lin`
-restores the pre-round GDN state and re-runs the forward over the kept token
-prefix through a throwaway scratch KV cache, leaving the GDN state byte-
-consistent with the truncated production KV.
+`snapshot_lin`. On partial acceptance (`accept < K`), `rollback_round_caches`
+rolls the KV caches back to the pre-round offset, restores the pre-round GDN
+state, and re-runs the forward over the kept token prefix **through those same
+production caches** — which lands them on the truncated target and the GDN state
+byte-consistent with them. It must not be a throwaway scratch stack; see the
+partial-accept rollback section above for what that costs.
 
 ## CLI
 

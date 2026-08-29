@@ -1006,6 +1006,13 @@ impl KvStorage {
         // matters on spill, where the layer geometry is derived from the K shape
         // while the V payload is written raw — the reconciliation guard on the
         // unclamped side is what surfaces it.
+        //
+        // `Mixed` is a third reading and belongs in the same list: it has no
+        // `shape[2]` to clamp, because `state.offset` IS its coverage. It keeps
+        // its fill on an over-long target and reports one through an error
+        // event (`MixedKvState::truncate_to`) — loud like the rotor / iso
+        // stores, but at the truncate rather than at the next read, since
+        // nothing downstream of it would notice.
         let n = n.max(0);
         match self {
             Self::K8V4 { k, v, .. } => {
