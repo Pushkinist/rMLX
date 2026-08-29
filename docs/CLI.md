@@ -151,7 +151,8 @@ mutually exclusive.
 > yet). Layout detail in `docs/KV_QUANT.md` § "Memory truth".
 
 > **`--kv-quant none` is a pure-bf16 control.** `kv_quant_for_layer` promotes
-> the first 2 and last 8 layers to `K8V8`, but only under a base mode that
+> the first 2 and last 8 layers to an 8-bit floor (`K8V8`, or the base's own
+> 8-bit form when its widths are parameters), but only under a base mode that
 > quantizes something — `none` is exempt, so no layer of a `none` run holds a
 > packed store. This is a behaviour change: before it, `none` was a bf16/K8V8
 > mixture measuring 1.145× true bf16 on Ternary-Bonsai-8B, 1.160× on

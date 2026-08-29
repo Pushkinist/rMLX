@@ -5,7 +5,7 @@
 #[allow(clippy::module_inception)]
 mod tests {
     use super::super::{
-        kv_codec_net_saving_total, kv_max_seq_and_ceiling, kv_quant_for_layer,
+        kv_codec_net_saving_total, kv_layer_quants, kv_max_seq_and_ceiling, kv_quant_for_layer,
         lookup_layer_calibration, KvCacheBuilder, KvLayerShape, LAYER_ADAPTIVE_HEAD_N,
         LAYER_ADAPTIVE_TAIL_N,
     };
@@ -638,10 +638,13 @@ mod tests {
         let n = 36;
         for &base in quantizing {
             for i in [0, 1, 28, 35] {
-                assert_eq!(
-                    kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N),
-                    KvQuant::K8V8,
-                    "boundary layer {i} of quantizing base {base} must be promoted"
+                let promoted =
+                    kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N);
+                let (k_bits, v_bits) = promoted.approx_code_bits();
+                assert!(
+                    k_bits >= 8 && v_bits >= 8,
+                    "boundary layer {i} of quantizing base {base} must be promoted to the \
+                     8-bit floor, got {promoted} ({k_bits}, {v_bits})"
                 );
             }
             assert_eq!(
@@ -650,6 +653,170 @@ mod tests {
                 "middle layer of {base} must stay on the base codec"
             );
         }
+    }
+
+    /// The promotion target, pinned per family.
+    ///
+    /// A base whose widths are parameters keeps its family and raises both axes
+    /// to 8 bits; everything else switches to `K8V8`. Companion to the property
+    /// assertion above, which only checks the width.
+    #[test]
+    fn kv_quant_for_layer_promotion_target_per_family() {
+        let n = 36;
+        let cases: &[(KvQuant, KvQuant)] = &[
+            (
+                KvQuant::Mixed {
+                    k_bits: 8,
+                    v_bits: 4,
+                    k_group_size: 64,
+                    v_group_size: 64,
+                },
+                KvQuant::Mixed {
+                    k_bits: 8,
+                    v_bits: 8,
+                    k_group_size: 64,
+                    v_group_size: 64,
+                },
+            ),
+            // Group geometry is the base's, not a constant: a 32/128 base is
+            // promoted to a 32/128 target.
+            (
+                KvQuant::Mixed {
+                    k_bits: 4,
+                    v_bits: 2,
+                    k_group_size: 32,
+                    v_group_size: 128,
+                },
+                KvQuant::Mixed {
+                    k_bits: 8,
+                    v_bits: 8,
+                    k_group_size: 32,
+                    v_group_size: 128,
+                },
+            ),
+            // Already at the floor on both axes → the promotion is a no-op.
+            (
+                KvQuant::Mixed {
+                    k_bits: 8,
+                    v_bits: 8,
+                    k_group_size: 64,
+                    v_group_size: 64,
+                },
+                KvQuant::Mixed {
+                    k_bits: 8,
+                    v_bits: 8,
+                    k_group_size: 64,
+                    v_group_size: 64,
+                },
+            ),
+            (
+                KvQuant::RotK {
+                    v_bits: 4,
+                    v_group_size: 64,
+                },
+                KvQuant::RotK {
+                    v_bits: 8,
+                    v_group_size: 64,
+                },
+            ),
+            // Non-parametric widths have no 8-bit form of their own family.
+            (KvQuant::K8V4, KvQuant::K8V8),
+            (KvQuant::Planar3, KvQuant::K8V8),
+            (KvQuant::TurboSym3, KvQuant::K8V8),
+            (KvQuant::IsoKOnly4, KvQuant::K8V8),
+        ];
+        for &(base, want) in cases {
+            for i in [0, 1, 28, 35] {
+                assert_eq!(
+                    kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N),
+                    want,
+                    "boundary layer {i} of {base}"
+                );
+            }
+        }
+    }
+
+    /// A parametric base's boundary layer must stay **cheaper than bf16**.
+    ///
+    /// This is the property the promotion target has to have and the one it
+    /// lost: `K8V8` materialises no packed store, so a layer promoted to it
+    /// holds two full bf16 mirrors — byte-identical to `none`, 16 bits per
+    /// value — and the promotion of a codec that stores 6.50 was a 2.46x
+    /// increase, not a floor. Swept over the parametric codecs in
+    /// `ALL_KV_QUANTS` at a full-attention layer shape, using each codec's own
+    /// byte model.
+    #[test]
+    fn parametric_boundary_promotion_stays_under_bf16() {
+        let (seq, head_dim, kv_heads) = (4096_u64, 128_u64, 8_u64);
+        let n = 36;
+        let bf16 = KvQuant::None.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, false);
+        let mut seen = 0_usize;
+        for &base in rmlx_kv_quant::ALL_KV_QUANTS {
+            if !matches!(base, KvQuant::Mixed { .. } | KvQuant::RotK { .. }) {
+                continue;
+            }
+            seen += 1;
+            let promoted =
+                kv_quant_for_layer(0, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N);
+            assert!(
+                promoted.materialises_packed_store(),
+                "{base} promotes to {promoted}, which builds no packed store — the \
+                 layer would hold two bf16 mirrors instead of the 8-bit floor"
+            );
+            let got = promoted.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, false);
+            assert!(
+                got < bf16,
+                "{base} promotes to {promoted} at {got} B/layer, not under bf16's {bf16} B"
+            );
+        }
+        assert!(
+            seen >= 2,
+            "expected the parametric codecs to be listed in ALL_KV_QUANTS, swept {seen}"
+        );
+    }
+
+    /// Whole-stack byte model for `mixed_k8g64_v4g64` at Qwen3-8B's geometry.
+    ///
+    /// The per-layer codec vector and the per-codec byte model are the two
+    /// halves of the cache's delivered density, and neither one alone shows it.
+    /// Pinned as bits per stored value so the figure is directly comparable to
+    /// a codebook width: this codec's codebook is 6.50 bits per value (K 8 +
+    /// 32/64 sideband, V 4 + 32/64), and what the stack delivers is that width
+    /// diluted by the boundary layers.
+    #[test]
+    fn mixed_layer_stack_delivered_bits_per_value() {
+        // Qwen3-8B: 36 full-attention layers, 8 KV heads, head_dim 128.
+        let (n_layers, seq, head_dim, kv_heads) = (36_usize, 4096_u64, 128_u64, 8_u64);
+        let base = KvQuant::Mixed {
+            k_bits: 8,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        };
+        let total: u64 = kv_layer_quants(n_layers, base)
+            .iter()
+            .map(|q| q.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, false))
+            .sum();
+        // Two axes (K and V) per stored position.
+        let values = seq * head_dim * kv_heads * 2 * n_layers as u64;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "byte and value counts are far below f64's exact-integer range"
+        )]
+        let bits_per_value = (total * 8) as f64 / values as f64;
+        // 26 layers at the 6.50 codebook width + 10 at the 8.50 floor.
+        let want = (26.0 * 6.50 + 10.0 * 8.50) / 36.0;
+        assert!(
+            (bits_per_value - want).abs() < 1e-9,
+            "delivered {bits_per_value:.4} bits/value, expected {want:.4}"
+        );
+        // The competitors' symmetric 8-bit KV cache, which this cell has to
+        // undercut to be worth its asymmetry.
+        assert!(
+            bits_per_value < 8.50,
+            "delivered {bits_per_value:.4} bits/value, not below the 8.50 both \
+             llama.cpp q8_0/q8_0 and mlx-lm q8 ship"
+        );
     }
 
     /// The byte consequence of the exemption, measured on a real cache vector.
