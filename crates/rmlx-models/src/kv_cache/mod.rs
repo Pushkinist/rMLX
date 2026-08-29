@@ -80,12 +80,13 @@ mod tests;
 // The re-export shim was dropped; import directly from
 // `rmlx_kv_quant::KV_MAX_SEQ_DEFAULT`.
 
-/// Default number of tail layers forced to `KvQuant::K8V8` by
-/// [`kv_quant_for_layer`]. Matches the N70 reference experiment.
+/// Default number of tail layers forced to the 8-bit floor
+/// ([`boundary_floor`]) by [`kv_quant_for_layer`]. Matches the N70 reference
+/// experiment.
 pub const LAYER_ADAPTIVE_TAIL_N: usize = 8;
 
-/// Default number of head layers forced to `KvQuant::K8V8` by
-/// [`kv_quant_for_layer`], at every context length.
+/// Default number of head layers forced to the 8-bit floor
+/// ([`boundary_floor`]) by [`kv_quant_for_layer`], at every context length.
 ///
 /// Bench findings show first-layer KV vectors carry the highest absolute magnitudes
 /// (embedding residual is large before deep normalisation) and that forcing
@@ -96,7 +97,7 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
 
 /// Layer-adaptive KV quantization.
 ///
-/// Returns `KvQuant::K8V8` for a **quantizing** `base_quant` on:
+/// Returns [`boundary_floor`] of a **quantizing** `base_quant` on:
 /// - the **first** `head_n` layers (by absolute layer index); and
 /// - the **last** `tail_n` layers (by absolute layer index).
 ///
@@ -141,6 +142,10 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
 /// the K-only families whose V side is bf16 but whose K side is below the
 /// floor.
 ///
+/// **The floor is 8 bits, not a codec switch** — which target delivers it is
+/// [`boundary_floor`]'s decision, and for a base whose widths are parameters it
+/// is that base's own 8-bit form.
+///
 /// Two per-arch filters can cancel the promotion independently of this
 /// function: a windowed layer runs the bf16 rotating ring regardless of the
 /// flag, and a shared-KV layer (Gemma4 `num_kv_shared_layers`) owns no cache
@@ -158,9 +163,106 @@ pub fn kv_quant_for_layer(
     let is_tail = tail_n > 0 && layer_idx >= n_layers.saturating_sub(tail_n);
     let is_head = head_n > 0 && layer_idx < head_n;
     if (is_tail || is_head) && !base_is_unquantized(base_quant) {
-        KvQuant::K8V8
+        boundary_floor(base_quant)
     } else {
         base_quant
+    }
+}
+
+/// The codec a boundary layer is promoted to, for a base that quantizes.
+///
+/// The promotion is an **8-bit floor**, not a codec switch. A base whose widths
+/// are parameters carries its own 8-bit form, so the floor is applied inside
+/// its family: same store, same group geometry, same K rotation, both axes
+/// raised to 8 bits. A base whose width is baked into its variant has no such
+/// form to raise to and falls back to [`KvQuant::K8V8`], which is what every
+/// base used to get.
+///
+/// # Why the family has to be kept
+///
+/// `KvQuant::K8V8` does not materialise a packed store: its decode reads the
+/// bf16 mirror on both axes, so `KvQuant::materialises_packed_store` is false
+/// for it and a layer holding it holds two full bf16 buffers and nothing else —
+/// **16 bits per value**, the same bytes as `KvQuant::None`. Sending a
+/// parametric base there did not apply a floor, it exempted the layer from
+/// quantization: `mixed_k8g64_v4g64` stores 8 + 32/64 bits on K and 4 + 32/64
+/// on V, 6.50 bits per value, so the "8-bit" promotion *raised* those layers by
+/// 2.46x. Over the standard 2 head + 8 tail layers that is the dominant term in
+/// the codec's whole-cache rate and it does not shrink with context.
+///
+/// The parametric families read their own store at decode
+/// (`KvQuant::decode_reads_packed_store` is true for `Mixed` and `RotK`), so
+/// raising them in-family delivers the floor from bytes the layer already
+/// spends: 8.50 bits per value at group 64, against the 16.00 of the fallback.
+///
+/// # Totality
+///
+/// Both rewritten variants are always valid. `validate_mixed_side` accepts 8
+/// bits at every group size it accepts at all (32, 64, 128) and `RotK`'s V slot
+/// is validated by that same function, so an 8-bit rewrite of an
+/// already-validated base cannot produce a codec the store will not build.
+/// Raising to 8 never lowers a side either — 8 is the widest width either
+/// validator accepts.
+///
+/// The match is **exhaustive on purpose** (no wildcard), same reasoning as the
+/// decode predicates on [`KvQuant`]: a new variant that carries its widths as
+/// parameters must state its own 8-bit form here rather than silently
+/// inheriting the `K8V8` fallback, which would put it back on two bf16 mirrors.
+fn boundary_floor(base_quant: KvQuant) -> KvQuant {
+    /// The width the boundary promotion floors both axes to.
+    const FLOOR_BITS: u8 = 8;
+    match base_quant {
+        KvQuant::Mixed {
+            k_bits,
+            v_bits,
+            k_group_size,
+            v_group_size,
+        } => KvQuant::Mixed {
+            k_bits: k_bits.max(FLOOR_BITS),
+            v_bits: v_bits.max(FLOOR_BITS),
+            k_group_size,
+            v_group_size,
+        },
+        // `RotK`'s K is fixed at 8-bit/group-64 by `MixedKvState::new_rotated`
+        // and is already at the floor; only its V carries a width.
+        KvQuant::RotK {
+            v_bits,
+            v_group_size,
+        } => KvQuant::RotK {
+            v_bits: v_bits.max(FLOOR_BITS),
+            v_group_size,
+        },
+        // Widths baked into the variant: no 8-bit form of their own family to
+        // raise to, so the floor is `K8V8` — what every base used to get.
+        KvQuant::None
+        | KvQuant::K8V4
+        | KvQuant::K8V8
+        | KvQuant::Planar
+        | KvQuant::Planar3
+        | KvQuant::PlanarK
+        | KvQuant::K8VTurbo3
+        | KvQuant::K8VTurbo3Tcq
+        | KvQuant::K8VTurbo2
+        | KvQuant::K8VTurbo2Tcq
+        | KvQuant::TurboSym3
+        | KvQuant::TurboSym4
+        | KvQuant::Iso3
+        | KvQuant::Iso4
+        | KvQuant::Iso3Sym
+        | KvQuant::Iso4Sym
+        | KvQuant::IsoKOnly3
+        | KvQuant::IsoKOnly4
+        | KvQuant::Rotor3
+        | KvQuant::Rotor4
+        | KvQuant::Rotor3Sym
+        | KvQuant::Rotor4Sym
+        | KvQuant::RotorKOnly3
+        | KvQuant::RotorKOnly4
+        // The `RotorK*Asym` V width is a parameter, but its K is a 3-/4-bit
+        // rotor that has no 8-bit form, so raising V alone would leave the
+        // layer below the floor on K. It takes the fallback.
+        | KvQuant::RotorK3Asym { .. }
+        | KvQuant::RotorK4Asym { .. } => KvQuant::K8V8,
     }
 }
 
