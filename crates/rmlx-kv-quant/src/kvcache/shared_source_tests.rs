@@ -24,6 +24,7 @@
 use super::core::KvCache;
 use super::SharedKv;
 use crate::kvcache::fused_qk_total_dispatch_count;
+use crate::storage::KvStorage;
 use crate::turbo_flash_msl::turbo_flash_dispatch_count;
 use crate::KvQuant;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -190,6 +191,9 @@ fn shared_source_refuses_a_mixed_cache_that_did_not_declare_sharing() {
         v_group_size: 64,
     };
     let mut cache = KvCache::with_quant_max_seq(quant, 512).with_shares_kv(false);
+    // Bracket the same way the positive control below does, so the two arms
+    // differ in `shares_kv` and in nothing else.
+    cache.enter_prefill();
 
     let seq = 32_i32;
     let kv_h = 2_i32;
@@ -221,4 +225,118 @@ fn shared_source_refuses_a_mixed_cache_that_did_not_declare_sharing() {
     shared
         .update_and_sdpa_shared_source(&q, &k, &v, 1.0, "causal", None, device)
         .expect("a declared shared-KV producer must be served");
+}
+
+/// A `Mixed` cache that **declared** cross-layer sharing but was rebuilt from
+/// its packed store alone is refused too — the declaration is not the mirror.
+///
+/// This is the SSD-hydrate shape, reproduced through the constructor the SSD
+/// reader itself calls: [`KvCache::from_storage`] restores the packed payload
+/// and the block's `seq_len` as the offset, threads the arch's `shares_kv`
+/// through, and leaves `decode_fp16_{k,v}` empty — the block carries no bf16
+/// mirror for a `Mixed` layer, because that spill path only persists a mirror
+/// for storages that hold no packed payload at all.
+///
+/// On the one architecture that shares K/V, such a block is tail-extended
+/// through the prefix branch, which appends in **decode** mode with no
+/// enter/exit prefill bracket. So `exit_prefill` never re-runs and the mirror
+/// is never rebuilt. A guard that tests only the declaration lets this cache
+/// straight into the zero-fill it exists to prevent: `update_decode_fp16` finds
+/// no buffer, allocates `zeros`, and slices in the current token alone, so the
+/// consumer layers attend a prefix of zeros with no error anywhere.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn shared_source_refuses_a_declared_producer_rebuilt_from_the_store_alone() {
+    let device = Device::Cpu;
+    let quant = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 4,
+        k_group_size: 64,
+        v_group_size: 64,
+    };
+    let kv_h = 2_i32;
+    let head_dim = 64_i32;
+    let prefix = 32_i32;
+
+    // A real producer: declared, prefilled, mirror built by `exit_prefill`.
+    let mut donor = KvCache::with_quant_max_seq(quant, 512).with_shares_kv(true);
+    donor.enter_prefill();
+    let shape = [1_i32, kv_h, prefix, head_dim];
+    let n: usize = shape.iter().map(|&d| d as usize).product();
+    donor
+        .update(
+            &f32_arr(&vec![0.125_f32; n], &shape),
+            &f32_arr(&vec![0.25_f32; n], &shape),
+            device,
+        )
+        .expect("prefill chunk");
+    donor.exit_prefill(device).expect("exit_prefill");
+    assert!(
+        donor.decode_fp16_k_for_test().is_some(),
+        "precondition: a declared producer holds its mirror after prefill"
+    );
+
+    // Spill + hydrate, structurally: the store survives, the mirror does not.
+    let offset = donor.offset();
+    let storage = std::mem::replace(&mut donor.storage, KvStorage::None { max_seq: 0 });
+    let mut hydrated = KvCache::from_storage(
+        storage,
+        quant,
+        offset,
+        donor.layer_idx(),
+        donor.dispatch_policy(),
+        true,
+    );
+    assert!(
+        hydrated.shares_kv() && hydrated.decode_fp16_k_for_test().is_none() && offset > 0,
+        "precondition: the hydrated shape is a declared producer, past prefill, with no mirror"
+    );
+
+    let step = [1_i32, kv_h, 1_i32, head_dim];
+    let m: usize = step.iter().map(|&d| d as usize).product();
+    let q1 = f32_arr(&vec![0.5_f32; m], &step);
+    let k1 = f32_arr(&vec![0.125_f32; m], &step);
+    let v1 = f32_arr(&vec![0.25_f32; m], &step);
+
+    let offset_before = hydrated.offset();
+    match hydrated.update_and_sdpa_shared_source(&q1, &k1, &v1, 1.0, "", None, device) {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("SSD hydrate") && msg.contains("zero"),
+                "the error must name the cause and the consequence; got: {msg}"
+            );
+            assert_eq!(
+                hydrated.offset(),
+                offset_before,
+                "the refusal must happen before any state moves"
+            );
+        }
+        Ok((_, SharedKv::Bf16(k_full, _))) => {
+            // `Array::to_bytes` reads by raw linear offset, and the surfaced
+            // mirror is a strided slice over the full `max_seq` buffer, so
+            // flatten the view first — otherwise the count describes the
+            // parent allocation rather than the share.
+            let flat = k_full
+                .contiguous(device)
+                .expect("flatten the surfaced mirror");
+            flat.eval().expect("materialise the surfaced mirror");
+            let bytes = flat.to_bytes().expect("surfaced mirror bytes");
+            let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+            let total = bytes.len();
+            panic!(
+                "the hydrated producer was served instead of refused: it surfaced a \
+                 {:?} mirror of {total} bytes of which only {nonzero} are non-zero — \
+                 every one of the {prefix} prefix tokens is the zero-fill this path \
+                 must never answer with",
+                flat.shape(),
+            );
+        }
+        Ok((_, SharedKv::Store { kv_len })) => {
+            panic!("the Mixed path must surface a bf16 share, got a store share of {kv_len} tokens")
+        }
+    }
 }

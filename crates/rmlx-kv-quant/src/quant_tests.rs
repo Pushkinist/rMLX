@@ -1698,6 +1698,16 @@ fn affine_sideband_is_thirty_two_bits_per_group() {
 ///    model re-assembled through `materialises_packed_store` and the two
 ///    `feeds_bf16_*` predicates. Independent of (2): this one moves when a
 ///    codec's mirror or store disposition changes, not when a cadence does.
+///
+/// (3) is swept over **both** cross-layer-KV topologies. `shares_kv` is the one
+/// input that moves `feeds_bf16_k/v_at_decode`, and the arm it moves them on is
+/// `true` — where `Mixed` / `RotK` add two full bf16 mirrors on top of their
+/// packed store. Checking only the `false` arm leaves the estimate's larger
+/// half unmeasured, and "one flag drives both the estimate and the allocation"
+/// is then a shape the code happens to have rather than a property under test.
+/// (1) and (2) are outside the sweep: they describe the store, and
+/// `materialises_packed_store_is_invariant_under_shares_kv` proves the store
+/// side is constant in the flag.
 #[test]
 fn every_codec_byte_model_matches_the_store_it_writes() {
     for &geom in CADENCE_GEOMETRIES {
@@ -1712,12 +1722,12 @@ fn every_codec_byte_model_matches_the_store_it_writes() {
             let (k_store, v_store) = q.side_stores();
             let stores = [k_store, v_store];
             let packs = q.materialises_packed_store();
-            let feeds = [
-                q.feeds_bf16_k_at_decode(false),
-                q.feeds_bf16_v_at_decode(false),
-            ];
 
-            let mut expected_total = 0u64;
+            // Per-axis store facts. Both are invariant in `shares_kv`, so they
+            // are established once and the topology sweep below re-assembles
+            // the total from them.
+            let mut side_modelled = [0u64; 2];
+            let mut side_unquantised = [false; 2];
             for axis in 0..2 {
                 let (layout, store, side_bits) = (layouts[axis], stores[axis], bits[axis]);
                 let side = if axis == 0 { "K" } else { "V" };
@@ -1732,14 +1742,14 @@ fn every_codec_byte_model_matches_the_store_it_writes() {
 
                 // (2) same cadence, byte for byte.
                 let actual = measured_side_bytes(layout, &data, geom);
-                expected_total += match store {
+                match store {
                     None => {
                         assert_eq!(
                             actual,
                             elems * 2,
                             "{q} {side}: an unquantised axis is two bytes per value"
                         );
-                        elems * 2
+                        side_unquantised[axis] = true;
                     }
                     Some(store) => {
                         let modelled = super::packed_side_bytes(
@@ -1756,23 +1766,44 @@ fn every_codec_byte_model_matches_the_store_it_writes() {
                              store it models.",
                             geom.head_dim
                         );
-                        // (3) gating: a codec that builds no store holds only mirrors.
-                        if packs {
-                            modelled + if feeds[axis] { elems * 2 } else { 0 }
-                        } else {
-                            elems * 2
-                        }
+                        side_modelled[axis] = modelled;
                     }
-                };
+                }
             }
 
-            assert_eq!(
-                q.estimated_resident_bytes_per_layer(geom.seq, geom.head_dim, geom.kv_heads, false),
-                expected_total,
-                "{q} at head_dim={}: whole-codec estimate disagrees with its own per-side \
-                 model assembled through materialises_packed_store + feeds_bf16_k/v",
-                geom.head_dim
-            );
+            // (3) gating, under both topologies. `shares_kv` is what decides
+            // whether `Mixed` / `RotK` carry their bf16 mirror on top of the
+            // store, so the `true` arm is where the estimate is largest and the
+            // drift it would hide is a whole mirror pair per layer.
+            for shares_kv in [false, true] {
+                let feeds = [
+                    q.feeds_bf16_k_at_decode(shares_kv),
+                    q.feeds_bf16_v_at_decode(shares_kv),
+                ];
+                let mut expected_total = 0u64;
+                for axis in 0..2 {
+                    // A codec that builds no store holds only mirrors.
+                    expected_total += if side_unquantised[axis] || !packs {
+                        elems * 2
+                    } else {
+                        side_modelled[axis] + if feeds[axis] { elems * 2 } else { 0 }
+                    };
+                }
+
+                assert_eq!(
+                    q.estimated_resident_bytes_per_layer(
+                        geom.seq,
+                        geom.head_dim,
+                        geom.kv_heads,
+                        shares_kv
+                    ),
+                    expected_total,
+                    "{q} at head_dim={} with shares_kv={shares_kv}: whole-codec estimate \
+                     disagrees with its own per-side model assembled through \
+                     materialises_packed_store + feeds_bf16_k/v",
+                    geom.head_dim
+                );
+            }
         }
     }
 }

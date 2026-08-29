@@ -79,6 +79,11 @@ pub struct KvCache {
     /// zero-fill the whole prefix (the producer is already past prefill by
     /// then) and answer with a K/V that is correct for one token and zeros for
     /// every earlier one.
+    ///
+    /// The declaration is not the artifact, and that path checks both. A cache
+    /// rebuilt by [`KvCache::from_storage`] carries this flag and the block's
+    /// offset but no mirror, so a *declared* producer can arrive past prefill
+    /// with nothing to surface — the same zero-fill, one field further along.
     pub(super) shares_kv: bool,
     pub(super) prefill_raw_k: Option<Array>,
     pub(super) prefill_raw_v: Option<Array>,
@@ -293,11 +298,24 @@ impl KvCache {
     /// while every cache shares the default, wrong the moment two do not.
     ///
     /// `shares_kv` is threaded for the same reason `layer_idx` and `policy`
-    /// are, and matters more: a hydrated cache can be tail-extended, which
-    /// re-enters prefill and so re-runs the `exit_prefill` gate that decides
-    /// whether a `Mixed` / `RotK` layer keeps a bf16 mirror. Reading a default
-    /// here would drop the mirror a shared-KV arch's very next decode step
-    /// needs.
+    /// are — it is this cache's own topology and no default can stand in for
+    /// it. It is what [`crate::KvQuant::estimated_resident_bytes_per_layer`]
+    /// and the `feeds_bf16_*` predicates answer for, what
+    /// [`Self::try_deep_clone`] carries into a branch, and what any *later*
+    /// prefill this object enters reads at its `exit_prefill`.
+    ///
+    /// **It does not restore the mirror here, and on the one architecture that
+    /// shares K/V nothing else does either.** A hydrated cache comes back with
+    /// `decode_fp16_{k,v}` empty — the spill path persists a bf16 payload only
+    /// for storages that hold no packed store at all, which `Mixed` / `RotK`
+    /// are not. Some architectures tail-extend a hydrated block through a
+    /// bracketed re-prefill, and those do rebuild it; Gemma4, the only stack
+    /// whose `shares_kv` is ever `true`, does not — its prefix branch appends
+    /// the tail in decode mode with no enter/exit bracket, so `exit_prefill`
+    /// never re-runs. A `Mixed` / `RotK` cache reconstructed here is therefore
+    /// a declared producer holding no mirror, and
+    /// [`Self::update_and_sdpa_shared_source`] refuses it on that shape rather
+    /// than serving a zero-filled prefix.
     pub fn from_storage(
         storage: KvStorage,
         quant: KvQuant,
