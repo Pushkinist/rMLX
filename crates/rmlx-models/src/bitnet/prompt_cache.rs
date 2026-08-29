@@ -185,8 +185,11 @@ impl SsdHydrate<BitNetEntry> for SsdHydrator {
 /// no recurrent state; the dominant workload is the Exact-hit warm-TTFT, so the
 /// single Exact / Miss arm set (no partial reuse) is the policy — matching Qwen2
 /// and Qwen3 dense.
-pub(crate) static PROMPT_CACHE: ArchPromptCache<BitNetEntry> =
-    ArchPromptCache::new("BitNetForCausalLM", ReusePolicy::ExactOnly);
+pub(crate) static PROMPT_CACHE: ArchPromptCache<BitNetEntry> = ArchPromptCache::new(
+    "BitNetForCausalLM",
+    ReusePolicy::ExactOnly,
+    crate::bitnet::SHARES_KV_ACROSS_LAYERS,
+);
 
 /// Active SSD-tier `layout_key` for the bitnet cache, or `0` when the tier is
 /// OFF. `FNV_OFFSET ^ 0 == FNV_OFFSET` ⇒ legacy un-salted digests when no SSD

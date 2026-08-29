@@ -224,8 +224,11 @@ impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
 /// partial match is forbidden, and the only permitted reuse is a hydrated
 /// strict-prefix (HydratedTail) via `is_reusable_prefix_of`; everything else
 /// degrades to a full re-prefill (Miss).
-pub(crate) static PROMPT_CACHE: ArchPromptCache<Qwen35MoeEntry> =
-    ArchPromptCache::new("Qwen3_5MoeForConditionalGeneration", ReusePolicy::ExactOnly);
+pub(crate) static PROMPT_CACHE: ArchPromptCache<Qwen35MoeEntry> = ArchPromptCache::new(
+    "Qwen3_5MoeForConditionalGeneration",
+    ReusePolicy::ExactOnly,
+    crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS,
+);
 
 /// active SSD-tier `layout_key`, or `0` when tier OFF.
 pub(crate) fn active_layout_key() -> u64 {

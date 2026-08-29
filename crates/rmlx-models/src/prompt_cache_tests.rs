@@ -25,14 +25,14 @@ fn request_cache_seed_folds_the_requests_own_mixture() {
     // Every codec a request can name for itself.
     for q in [KvQuant::K8V4, KvQuant::None, KvQuant::K8V8, KvQuant::Planar] {
         assert_eq!(
-            request_cache_seed(lk, q, TEST_LAYERS, TEST_SIG),
-            cache_seed(lk, q, &kv_layer_quants(TEST_LAYERS, q), TEST_SIG),
+            request_cache_seed(lk, q, TEST_LAYERS, false, TEST_SIG),
+            cache_seed(lk, q, &kv_layer_quants(TEST_LAYERS, q, false), TEST_SIG),
             "seed for {q} must be built from that codec's own per-layer mixture"
         );
     }
     assert_ne!(
-        request_cache_seed(lk, KvQuant::K8V4, TEST_LAYERS, TEST_SIG),
-        request_cache_seed(lk, KvQuant::K8V4, TEST_LAYERS + 4, TEST_SIG),
+        request_cache_seed(lk, KvQuant::K8V4, TEST_LAYERS, false, TEST_SIG),
+        request_cache_seed(lk, KvQuant::K8V4, TEST_LAYERS + 4, false, TEST_SIG),
         "the layer count sizes the folded mixture, so it must reach the seed"
     );
 }
@@ -119,7 +119,7 @@ impl TestEntry {
     /// consume seed for `kv_quant` on a RAM-only run (`layout_key == 0`), and
     /// tag the entry with that same `kv_quant` so the quant-guard accepts it.
     fn for_quant(ids: Vec<u32>, kv_quant: KvQuant) -> Self {
-        let seed = request_cache_seed(0, kv_quant, TEST_LAYERS, TEST_SIG);
+        let seed = request_cache_seed(0, kv_quant, TEST_LAYERS, false, TEST_SIG);
         let hashes = chained_block_hashes_seeded(&ids, seed);
         TestEntry {
             ids,
@@ -1438,9 +1438,9 @@ fn chained_hash_arch_agnostic() {
 #[test]
 fn arch_prompt_cache_policy_is_observable() {
     let partial: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-partial", ReusePolicy::Partial);
+        ArchPromptCache::new("test-partial", ReusePolicy::Partial, false);
     let exact: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-exact", ReusePolicy::ExactOnly);
+        ArchPromptCache::new("test-exact", ReusePolicy::ExactOnly, false);
     assert_eq!(partial.policy(), ReusePolicy::Partial);
     assert_eq!(exact.policy(), ReusePolicy::ExactOnly);
     assert_eq!(partial.arch_name(), "test-partial");
@@ -1465,7 +1465,7 @@ fn arch_cache_with_inner_mut_round_trip() {
     // No SsdSpiller/SsdHydrator impls for TestEntry, so we can't call
     // `ensure(...)`. Instead, install the cache manually inside the closure.
     let arch: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-roundtrip", ReusePolicy::Partial);
+        ArchPromptCache::new("test-roundtrip", ReusePolicy::Partial, false);
     let ids: Vec<u32> = (0..(2 * BLOCK_TOKENS) as u32).collect();
     arch.with_inner_mut(|g| {
         *g = Some(PromptCache::new(4));
@@ -1494,7 +1494,8 @@ fn arch_cache_with_inner_mut_round_trip() {
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
 )]
 fn arch_cache_stats_none_before_init() {
-    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test-stats", ReusePolicy::Partial);
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test-stats", ReusePolicy::Partial, false);
     assert!(
         arch.read_cache_stats().is_none(),
         "uninitialised arch cache must surface as None to /metrics/cache"
@@ -1522,7 +1523,7 @@ fn arch_cache_stats_none_before_init() {
 )]
 fn exact_only_policy_forces_partial_match_to_miss_semantics() {
     let arch: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-exact", ReusePolicy::ExactOnly);
+        ArchPromptCache::new("test-exact", ReusePolicy::ExactOnly, false);
     let cached: Vec<u32> = (0..(4 * BLOCK_TOKENS) as u32).collect();
     arch.with_inner_mut(|g| {
         *g = Some(PromptCache::new(4));
@@ -1715,8 +1716,8 @@ fn hydrated_entry_is_findable_only_when_seeded_from_the_query() {
     );
 
     // Two models of this arch; both seeds are what `consume` would compute.
-    let seed_a = request_cache_seed(layout_key, codec_a, TEST_LAYERS, TEST_SIG);
-    let seed_other_model = request_cache_seed(layout_key, codec_a, TEST_LAYERS, OTHER_SIG);
+    let seed_a = request_cache_seed(layout_key, codec_a, TEST_LAYERS, false, TEST_SIG);
+    let seed_other_model = request_cache_seed(layout_key, codec_a, TEST_LAYERS, false, OTHER_SIG);
 
     let prompt_ids: Vec<u32> = make_ids(2 * BLOCK_TOKENS);
 
@@ -1757,7 +1758,7 @@ fn hydrated_entry_is_findable_only_when_seeded_from_the_query() {
     );
 
     // ── Case 3: correct hydrate under codec A → codec-B query MISSes ────────
-    let seed_b = request_cache_seed(layout_key, codec_b, TEST_LAYERS, TEST_SIG);
+    let seed_b = request_cache_seed(layout_key, codec_b, TEST_LAYERS, false, TEST_SIG);
     assert!(
         cache_correct
             .find_best_prefix(&prompt_ids, seed_b)
@@ -1856,13 +1857,13 @@ fn two_models_of_one_arch_share_a_source_and_not_each_others_blocks() {
 
     // `active_layout_key()` is 0 here (no attach recorded), so these are the
     // seeds `consume` will compute for the two models.
-    let seed_a = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, TEST_SIG);
-    let seed_b = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, OTHER_SIG);
+    let seed_a = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
+    let seed_b = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, false, OTHER_SIG);
     assert_ne!(seed_a, seed_b, "two models must not share a seed");
 
     // ── Model A: its block is on disk under its own seed → hydrate. ──────────
     let arch: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-two-models-ssd", ReusePolicy::Partial);
+        ArchPromptCache::new("test-two-models-ssd", ReusePolicy::Partial, false);
     with_ssd_store(
         &arch,
         SeedKeyedStore {
@@ -1879,7 +1880,7 @@ fn two_models_of_one_arch_share_a_source_and_not_each_others_blocks() {
 
     // ── Model B: same source, same prompt, same codec, different model. ──────
     let arch_b: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-two-models-ssd", ReusePolicy::Partial);
+        ArchPromptCache::new("test-two-models-ssd", ReusePolicy::Partial, false);
     with_ssd_store(
         &arch_b,
         SeedKeyedStore {
@@ -1912,12 +1913,12 @@ fn each_resident_model_hydrates_its_own_block_from_the_shared_source() {
     // The block-aligned prefix a real spill would hold: `make_ids` is a
     // prefix-stable range, so this is exactly `prompt`'s first block.
     let stored = make_ids(BLOCK_TOKENS);
-    let seed_a = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, TEST_SIG);
-    let seed_b = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, OTHER_SIG);
+    let seed_a = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
+    let seed_b = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, false, OTHER_SIG);
 
     for (sig, label) in [(TEST_SIG, "model A"), (OTHER_SIG, "model B")] {
         let arch: ArchPromptCache<TestEntry> =
-            ArchPromptCache::new("test-both-resident", ReusePolicy::Partial);
+            ArchPromptCache::new("test-both-resident", ReusePolicy::Partial, false);
         // Both models' blocks are on disk, as they would be after both have
         // served the prompt once and been evicted from RAM.
         with_ssd_store(
@@ -1963,10 +1964,10 @@ fn hydrate_probes_under_the_requests_codec_not_the_launch_codec() {
     assert_ne!(launch, request);
 
     // Only the hot-swapped codec's block is on disk.
-    let seed_request = request_cache_seed(0, request, TEST_LAYERS, TEST_SIG);
+    let seed_request = request_cache_seed(0, request, TEST_LAYERS, false, TEST_SIG);
 
     let arch: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-codec-hotswap", ReusePolicy::Partial);
+        ArchPromptCache::new("test-codec-hotswap", ReusePolicy::Partial, false);
     with_ssd_store(
         &arch,
         SeedKeyedStore {
@@ -1983,7 +1984,7 @@ fn hydrate_probes_under_the_requests_codec_not_the_launch_codec() {
 
     // And the launch codec must not reach that block.
     let arch2: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-codec-hotswap", ReusePolicy::Partial);
+        ArchPromptCache::new("test-codec-hotswap", ReusePolicy::Partial, false);
     with_ssd_store(
         &arch2,
         SeedKeyedStore {
@@ -2051,7 +2052,7 @@ fn consume_one(
     prompt_ids: &[u32],
     has_image: bool,
 ) -> (ArchPromptCache<TestEntry>, Consumed<TestEntry>) {
-    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test", policy);
+    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test", policy, false);
     arch.with_inner_mut(|g| {
         *g = Some(PromptCache::new(4));
         g.as_mut().unwrap().push(pushed);
@@ -2076,7 +2077,7 @@ fn consume_one(
 fn consume_other_model_sig_is_miss() {
     let prompt = make_ids(2 * BLOCK_TOKENS);
     let arch: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-two-models", ReusePolicy::Partial);
+        ArchPromptCache::new("test-two-models", ReusePolicy::Partial, false);
     arch.ensure(4);
     arch.with_inner_mut(|g| {
         if let Some(cache) = g.as_mut() {
@@ -2231,7 +2232,8 @@ fn consume_incomplete_hydrate_partial_is_miss() {
 )]
 fn consume_has_image_is_miss_no_cache_touch() {
     let prompt = make_ids(2 * BLOCK_TOKENS);
-    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test", ReusePolicy::ExactOnly, false);
     arch.with_inner_mut(|g| {
         *g = Some(PromptCache::new(4));
         g.as_mut()
@@ -2293,11 +2295,12 @@ fn consume_quant_mismatch_evicts_and_misses() {
     let prompt = make_ids(2 * BLOCK_TOKENS);
     // Salt with the runtime seed so find_best_prefix matches, but tag a DIFFERENT
     // stored quant so the quant-guard rejects it.
-    let runtime_seed = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, TEST_SIG);
+    let runtime_seed = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
     let mut entry = TestEntry::new_seeded(prompt.clone(), runtime_seed);
     entry.kv_quant = Some(KvQuant::K8V4); // != TEST_QUANT (K8V8)
 
-    let arch: ArchPromptCache<TestEntry> = ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+    let arch: ArchPromptCache<TestEntry> =
+        ArchPromptCache::new("test", ReusePolicy::ExactOnly, false);
     arch.with_inner_mut(|g| {
         *g = Some(PromptCache::new(4));
         g.as_mut().unwrap().push(entry);
@@ -2428,17 +2431,17 @@ fn consume_degrade_branches_each_emit_one_debug() {
         // 1. has_image → "has_image" (no cache touch).
         {
             let arch: ArchPromptCache<TestEntry> =
-                ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+                ArchPromptCache::new("test", ReusePolicy::ExactOnly, false);
             arch.with_inner_mut(|g| *g = Some(PromptCache::new(4)));
             let _ = arch.consume(&prompt, TEST_QUANT, TEST_LAYERS, true, TEST_SIG);
         }
         // 2. quant_mismatch → "quant_mismatch".
         {
-            let runtime_seed = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, TEST_SIG);
+            let runtime_seed = request_cache_seed(0, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
             let mut entry = TestEntry::new_seeded(prompt.clone(), runtime_seed);
             entry.kv_quant = Some(KvQuant::K8V4);
             let arch: ArchPromptCache<TestEntry> =
-                ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+                ArchPromptCache::new("test", ReusePolicy::ExactOnly, false);
             arch.with_inner_mut(|g| {
                 *g = Some(PromptCache::new(4));
                 g.as_mut().unwrap().push(entry);
@@ -2456,7 +2459,7 @@ fn consume_degrade_branches_each_emit_one_debug() {
                     prefix_len: prompt.len(),
                 });
             let arch: ArchPromptCache<TestEntry> =
-                ArchPromptCache::new("test", ReusePolicy::Partial);
+                ArchPromptCache::new("test", ReusePolicy::Partial, false);
             arch.with_inner_mut(|g| {
                 *g = Some(PromptCache::new(4));
                 g.as_mut().unwrap().push(entry);
@@ -2470,7 +2473,7 @@ fn consume_degrade_branches_each_emit_one_debug() {
             req.extend(60_000..60_000 + BLOCK_TOKENS as u32);
             let entry = TestEntry::for_quant(cached, TEST_QUANT);
             let arch: ArchPromptCache<TestEntry> =
-                ArchPromptCache::new("test", ReusePolicy::Partial);
+                ArchPromptCache::new("test", ReusePolicy::Partial, false);
             arch.with_inner_mut(|g| {
                 *g = Some(PromptCache::new(4));
                 g.as_mut().unwrap().push(entry);
@@ -2485,7 +2488,7 @@ fn consume_degrade_branches_each_emit_one_debug() {
             req.extend(61_000..61_000 + BLOCK_TOKENS as u32);
             let entry = TestEntry::for_quant(cached, TEST_QUANT);
             let arch: ArchPromptCache<TestEntry> =
-                ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+                ArchPromptCache::new("test", ReusePolicy::ExactOnly, false);
             arch.with_inner_mut(|g| {
                 *g = Some(PromptCache::new(4));
                 g.as_mut().unwrap().push(entry);
@@ -2501,7 +2504,7 @@ fn consume_degrade_branches_each_emit_one_debug() {
                     prefix_len: prompt.len(),
                 });
             let arch: ArchPromptCache<TestEntry> =
-                ArchPromptCache::new("test", ReusePolicy::ExactOnly);
+                ArchPromptCache::new("test", ReusePolicy::ExactOnly, false);
             arch.with_inner_mut(|g| {
                 *g = Some(PromptCache::new(4));
                 g.as_mut().unwrap().push(entry);
@@ -2565,7 +2568,7 @@ fn misses(arch: &ArchPromptCache<TestEntry>) -> u64 {
 #[test]
 fn zero_slots_accumulates_misses_across_generations() {
     let arch: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-zero-slots", ReusePolicy::Partial);
+        ArchPromptCache::new("test-zero-slots", ReusePolicy::Partial, false);
     let prompt = make_ids(2 * BLOCK_TOKENS);
 
     arch.ensure(0);
@@ -2606,7 +2609,7 @@ fn zero_slots_accumulates_misses_across_generations() {
 )]
 fn zero_slots_stores_nothing() {
     let arch: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-zero-store", ReusePolicy::Partial);
+        ArchPromptCache::new("test-zero-store", ReusePolicy::Partial, false);
     let prompt = make_ids(2 * BLOCK_TOKENS);
 
     arch.ensure(0);
@@ -2637,7 +2640,7 @@ fn zero_slots_stores_nothing() {
 )]
 fn ensure_rebuilds_only_on_a_real_capacity_change() {
     let arch: ArchPromptCache<TestEntry> =
-        ArchPromptCache::new("test-ensure-rebuild", ReusePolicy::Partial);
+        ArchPromptCache::new("test-ensure-rebuild", ReusePolicy::Partial, false);
     let prompt = make_ids(2 * BLOCK_TOKENS);
 
     arch.ensure(4);

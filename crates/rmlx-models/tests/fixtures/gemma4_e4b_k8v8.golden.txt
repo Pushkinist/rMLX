@@ -1,4 +1,5 @@
 # golden tokens — tag=gemma4_e4b_k8v8 kv_quant=k8v8
+# layer_mixture=0x786f1abb816461d5
 # n_tokens=32
 # decoded: "<turn|>The sky appears blue because of a phenomenon called Rayleigh scattering, where shorter blue wavelengths of sunlight are scattered more effectively by the Earth's atmosphere.<turn|><turn|>"
 106

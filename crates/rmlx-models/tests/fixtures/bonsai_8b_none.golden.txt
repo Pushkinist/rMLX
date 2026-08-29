@@ -1,4 +1,5 @@
-# golden tokens — tag=bonsai_8b_mixed_k8g64_v4g64 kv_quant=mixed_k8g64_v4g64
+# golden tokens — tag=bonsai_8b_none kv_quant=none
+# layer_mixture=0x051ed7073314190a
 # n_tokens=32
 # decoded: " The sky appears blue during the day because sunlight is scattered by the atmosphere, with shorter wavelengths (blue) being scattered more than longer ones (red, orange)."
 576

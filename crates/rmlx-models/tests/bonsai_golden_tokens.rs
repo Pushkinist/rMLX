@@ -47,6 +47,23 @@ const MODEL: common::GoldenModel = common::GoldenModel {
     archs: &["Qwen3ForCausalLM"],
 };
 
+/// The production Mixed stack, at the codec every one of its layers runs.
+///
+/// The fixture tag carries `_floor8` because the ids are set by the *effective*
+/// per-layer vector, not by the requested base: `kv_layer_quants` promotes the
+/// first 2 and last 8 of Bonsai's 36 layers to `mixed_k8g64_v8g64`. The
+/// previous fixture, `bonsai_8b_mixed_k8g64_v4g64`, was recorded when that
+/// promotion landed on `K8V8` — a codec that materialises no store and decodes
+/// bf16 — so its ids came from a stack with 10 unquantized layers under a name
+/// that said `mixed_k8g64_v4g64`. It is retired rather than refreshed: its ids
+/// diverge at index 18 (320 -> 1075) at a top-2 margin of 0.1875, well above
+/// `REGEN_MAX_TIE_MARGIN`, and the regen guard refuses them. Widening that
+/// bound to admit a numerics change would retire the guard for every change it
+/// exists for.
+///
+/// What the old fixture actually pinned — that this codec agreed with bf16 on
+/// this prompt — is kept, under the name of the thing it was measuring, by
+/// [`bonsai_golden_tokens_none`].
 #[ignore]
 #[test]
 fn bonsai_golden_tokens_mixed() {
@@ -54,7 +71,7 @@ fn bonsai_golden_tokens_mixed() {
         return;
     };
     common::run_golden_test(
-        "bonsai_8b_mixed_k8g64_v4g64",
+        "bonsai_8b_mixed_k8g64_v4g64_floor8",
         KvQuant::Mixed {
             k_bits: 8,
             v_bits: 4,
@@ -63,6 +80,23 @@ fn bonsai_golden_tokens_mixed() {
         },
         &model_path,
     );
+}
+
+/// The bf16 control: `--kv-quant none`, every layer unquantized.
+///
+/// Exempt from the boundary promotion by construction (a base that quantizes
+/// neither side has no loss to buy back), so this fixture pins one codec on all
+/// 36 layers and is the reference any quantized stack is read against. It is
+/// also the gate the Mixed fixture used to be doubling as: its ids are the ones
+/// `bonsai_8b_mixed_k8g64_v4g64` held, which that codec could only produce
+/// while 10 of its 36 layers were secretly decoding bf16.
+#[ignore]
+#[test]
+fn bonsai_golden_tokens_none() {
+    let Some(model_path) = common::model_for(&MODEL, "bonsai_golden_tokens_none") else {
+        return;
+    };
+    common::run_golden_test("bonsai_8b_none", KvQuant::None, &model_path);
 }
 
 /// thinking_budget forced injection on the Exact-hit decode path (Qwen3ForCausalLM).

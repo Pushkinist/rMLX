@@ -1,4 +1,5 @@
 # golden tokens — tag=qwen3_moe_35b_k8v8 kv_quant=k8v8
+# layer_mixture=0x0fd63018a5a6762d
 # n_tokens=32
 # decoded: "\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - Statement 1: \"The capital of France is"
 271
