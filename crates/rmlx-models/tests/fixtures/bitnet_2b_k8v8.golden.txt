@@ -1,4 +1,5 @@
 # golden tokens — tag=bitnet_2b_k8v8 kv_quant=k8v8
+# layer_mixture=0xf41f1db832422ca5
 # n_tokens=32
 # decoded: " Answer: The sky appears blue during the day because of the scattering of sunlight by the atmosphere. This scattering causes shorter wavelengths of light, such as blue and violet"
 22559

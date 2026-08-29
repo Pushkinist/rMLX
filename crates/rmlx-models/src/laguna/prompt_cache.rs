@@ -185,8 +185,11 @@ impl SsdHydrate<LagunaEntry> for SsdHydrator {
 /// no recurrent state; the dominant workload is the Exact-hit warm-TTFT, so the
 /// single Exact / Miss arm set (no partial reuse) is the policy — matching Qwen2
 /// and BitNet.
-pub(crate) static PROMPT_CACHE: ArchPromptCache<LagunaEntry> =
-    ArchPromptCache::new("LagunaForCausalLM", ReusePolicy::ExactOnly);
+pub(crate) static PROMPT_CACHE: ArchPromptCache<LagunaEntry> = ArchPromptCache::new(
+    "LagunaForCausalLM",
+    ReusePolicy::ExactOnly,
+    crate::laguna::SHARES_KV_ACROSS_LAYERS,
+);
 
 /// Active SSD-tier `layout_key` for the Laguna cache, or `0` when the tier is
 /// OFF. `FNV_OFFSET ^ 0 == FNV_OFFSET` ⇒ legacy un-salted digests when no SSD

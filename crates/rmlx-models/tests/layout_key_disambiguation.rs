@@ -102,7 +102,7 @@ fn a_block_written_under_the_old_mixture_does_not_hydrate_into_a_none_request() 
 
     // What a `--kv-quant none` request builds today — from the single producer
     // the arch loops build their caches from, not a second copy of it.
-    let current: Vec<KvQuant> = kv_layer_quants(n_layers, KvQuant::None);
+    let current: Vec<KvQuant> = kv_layer_quants(n_layers, KvQuant::None, false);
     // What it used to build: boundary layers promoted to K8V8. Spelled out on
     // purpose — this arm is a frozen historical layout, so deriving it from the
     // live policy would make the comparison below vacuous by construction.

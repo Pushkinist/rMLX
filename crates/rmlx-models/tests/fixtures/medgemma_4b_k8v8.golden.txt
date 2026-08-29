@@ -1,4 +1,5 @@
 # golden tokens — tag=medgemma_4b_k8v8 kv_quant=k8v8
+# layer_mixture=0x20dad48e851dff35
 # n_tokens=32
 # decoded: "\n\nThe sky appears blue during the day because of the way Earth's atmosphere scatters sunlight. Blue light waves are shorter and more easily scattered by the tiny"
 108

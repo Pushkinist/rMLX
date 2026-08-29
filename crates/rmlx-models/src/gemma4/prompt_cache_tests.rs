@@ -547,6 +547,7 @@ fn gemma4_consume_engine_migration_golden() {
             active_layout_key(),
             kv_quant,
             model.cfg.num_hidden_layers,
+            crate::gemma4::SHARES_KV_ACROSS_LAYERS,
             model.model_sig,
         );
         PROMPT_CACHE.with_inner_mut(|guard| {
@@ -575,6 +576,7 @@ fn gemma4_consume_engine_migration_golden() {
                     active_layout_key(),
                     kv_quant,
                     model.cfg.num_hidden_layers,
+                    crate::gemma4::SHARES_KV_ACROSS_LAYERS,
                     model.model_sig,
                 ),
             );

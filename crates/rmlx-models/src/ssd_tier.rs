@@ -21,6 +21,10 @@ use crate::kv_cache::kv_layer_quants;
 /// `PROMPT_CACHE`. No-op when the tier is OFF.
 ///
 /// `(n_layers, n_kv_heads, head_dim)` are taken from the loaded model's config.
+/// `shares_kv` must be the loaded model's `Architecture::shares_kv_across_layers`
+/// — it selects the boundary-layer codec, so a key salted with the wrong one
+/// names a mixture the caches are not built at.
+///
 /// `n_layers` is expanded here into the **nominal per-layer codec vector** by
 /// [`kv_layer_quants`] — the one producer every arch's cache-construction loop
 /// also consumes — and that vector, not the base codec alone, is what
@@ -65,10 +69,11 @@ pub fn attach_at_load(
     n_layers: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    shares_kv: bool,
     device: Device,
 ) {
     let layer_quants: Vec<KvQuant> =
-        kv_quant.map_or_else(Vec::new, |base| kv_layer_quants(n_layers, base));
+        kv_quant.map_or_else(Vec::new, |base| kv_layer_quants(n_layers, base, shares_kv));
 
     let Some(info) = rmlx_kv_ssd::prepare_attach(
         arch,

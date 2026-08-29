@@ -111,6 +111,12 @@ use rmlx_kv_ssd::cache_seed;
 /// failure that matters here: a push seeded differently from the query does not
 /// return a wrong answer, it returns a cache that silently never hits.
 ///
+/// `shares_kv` is the same input for the same reason — it selects the
+/// boundary-layer codec, so two callers on one arch that disagree about it
+/// expand two different mixtures. Every caller reads its arch's
+/// `SHARES_KV_ACROSS_LAYERS`; the query side takes it from
+/// [`ArchPromptCache`], which is handed the same const.
+///
 /// Why per request, when `layout_key` already folds a vector: the layout key is
 /// fixed at attach from the launch codec, and a request may resolve a different
 /// one (an explicit per-request override).
@@ -122,12 +128,13 @@ pub(crate) fn request_cache_seed(
     layout_key: u64,
     kv_quant: KvQuant,
     n_layers: usize,
+    shares_kv: bool,
     model_sig: u64,
 ) -> u64 {
     cache_seed(
         layout_key,
         kv_quant,
-        &kv_layer_quants(n_layers, kv_quant),
+        &kv_layer_quants(n_layers, kv_quant, shares_kv),
         model_sig,
     )
 }
@@ -1120,6 +1127,15 @@ pub(crate) struct ArchPromptCache<E: PromptCacheEntry> {
     arch_name: &'static str,
     /// Reuse policy: `Partial` (Gemma4) or `ExactOnly` (Qwen3, Qwen3.5-MoE).
     policy: ReusePolicy,
+    /// The arch's cross-layer-KV topology — its `SHARES_KV_ACROSS_LAYERS`.
+    ///
+    /// Carried here rather than passed to [`Self::consume`] because it is a
+    /// property of the arch this static serves, not of a request, and because
+    /// `consume` already takes a `has_image` bool that an extra positional one
+    /// could be transposed with. It feeds
+    /// [`request_cache_seed`]: the per-layer codec mixture depends on it, and
+    /// the query seed has to expand the same mixture the arch's push side does.
+    shares_kv: bool,
     /// The actual prompt cache. `None` until `ensure_prompt_cache` builds it.
     inner: std::sync::Mutex<Option<PromptCache<E>>>,
     /// SSD-tier attach parameters (set once by `attach_ssd_tier`); replayed on
@@ -1131,10 +1147,11 @@ pub(crate) struct ArchPromptCache<E: PromptCacheEntry> {
 impl<E: PromptCacheEntry> ArchPromptCache<E> {
     /// Construct an empty per-arch cache. `const fn` so each arch can declare
     /// it as a `static`.
-    pub(crate) const fn new(arch_name: &'static str, policy: ReusePolicy) -> Self {
+    pub(crate) const fn new(arch_name: &'static str, policy: ReusePolicy, shares_kv: bool) -> Self {
         Self {
             arch_name,
             policy,
+            shares_kv,
             inner: std::sync::Mutex::new(None),
             attach: std::sync::Mutex::new(None),
         }
@@ -1354,7 +1371,13 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         // (2) Partitioned seed: identical to the per-arch push seed, so a slot
         // stored by a different model, or under a different KV codec / layout,
         // never matches.
-        let seed = request_cache_seed(self.active_layout_key(), kv_quant, n_layers, model_sig);
+        let seed = request_cache_seed(
+            self.active_layout_key(),
+            kv_quant,
+            n_layers,
+            self.shares_kv,
+            model_sig,
+        );
         let policy = self.policy;
         let arch = self.arch_name;
         // Kernel-path policy for the caches a hydrate would reconstruct. The

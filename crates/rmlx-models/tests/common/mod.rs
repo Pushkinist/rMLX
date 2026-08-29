@@ -654,7 +654,14 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
             REGEN_MAX_TIE_MARGIN,
         ) {
             Regen::Write(why) => {
-                write_golden(&fixture_path, fixture_tag, &kv_quant, &token_ids, &decoded);
+                write_golden(
+                    &fixture_path,
+                    fixture_tag,
+                    &kv_quant,
+                    layer_mixture(&model, kv_quant),
+                    &token_ids,
+                    &decoded,
+                );
                 eprintln!(
                     "[{fixture_tag}] WROTE golden ({} ids, kv={kv_quant}) -> {}\n  reason: {why}\n  decoded: {decoded:?}",
                     token_ids.len(),
@@ -676,9 +683,23 @@ pub fn run_golden_test(fixture_tag: &str, kv_quant: KvQuant, model_path: &Path) 
         )
     });
 
+    // A mismatch has two very different causes, and the fixture header tells
+    // them apart: the same per-layer mixture decoding differently is a decode
+    // regression, a different mixture is a policy change and the fixture was
+    // recorded under another one.
+    let mixture = layer_mixture(&model, kv_quant);
+    let recorded = read_golden_mixture(&fixture_path);
+    let provenance = match recorded {
+        Some(m) if m != mixture => format!(
+            " — the fixture was RECORDED UNDER A DIFFERENT PER-LAYER MIXTURE \
+             ({m:#018x}); this run resolves {mixture:#018x}, so the layer policy moved \
+             and this is not by itself a decode regression"
+        ),
+        _ => " — decode regression".to_owned(),
+    };
     assert_eq!(
         token_ids, golden,
-        "[{fixture_tag}] golden-token mismatch (kv={kv_quant}) — decode regression.\n  \
+        "[{fixture_tag}] golden-token mismatch (kv={kv_quant}){provenance}.\n  \
          got    = {token_ids:?}\n  golden = {golden:?}\n  decoded(got) = {decoded:?}"
     );
 }
@@ -765,13 +786,52 @@ fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
-/// Write the golden file: a header comment block (tag, kv_quant, decoded text)
-/// followed by one token id per line. The header is for human inspection; only
-/// the numeric lines are parsed back by `read_golden`.
-fn write_golden(path: &Path, tag: &str, kv: &KvQuant, ids: &[u32], decoded: &str) {
+/// Header key carrying the fold of the per-layer codec vector the ids were
+/// recorded under. Parsed back by [`read_golden_mixture`].
+const MIXTURE_KEY: &str = "# layer_mixture=";
+
+/// Fold of the per-layer codec vector `kv_quant` resolves to on this model.
+///
+/// The header records the *requested* base codec, but the ids are set by the
+/// effective per-layer vector: the boundary promotion rewrites some entries,
+/// and which target it rewrites them to is a policy that moves. Both the SSD
+/// `layout_key` and the prompt-cache seed already fold the whole vector for
+/// exactly this reason; this harness was the one consumer that did not, so a
+/// policy change reported as a decode regression.
+///
+/// Reuses `rmlx_kv_ssd::cache_seed` rather than folding by hand — one formula,
+/// and the zero `layout_key` / `model_sig` are the neutral elements of it.
+fn layer_mixture(model: &arch::Architecture, kv_quant: KvQuant) -> u64 {
+    let quants = rmlx_models::kv_cache::kv_layer_quants(
+        model.num_hidden_layers(),
+        kv_quant,
+        model.shares_kv_across_layers(),
+    );
+    rmlx_kv_ssd::cache_seed(0, kv_quant, &quants, 0)
+}
+
+/// The `# layer_mixture=` fold recorded in a committed fixture, if it carries
+/// one. `None` for a fixture written before the header existed, which is not an
+/// error — it just cannot discriminate.
+fn read_golden_mixture(path: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let line = text.lines().find(|l| l.starts_with(MIXTURE_KEY))?;
+    u64::from_str_radix(
+        line[MIXTURE_KEY.len()..].trim().trim_start_matches("0x"),
+        16,
+    )
+    .ok()
+}
+
+/// Write the golden file: a header comment block (tag, kv_quant, per-layer
+/// mixture, decoded text) followed by one token id per line. Only the numeric
+/// lines are parsed back by `read_golden`; `read_golden_mixture` reads one
+/// header key.
+fn write_golden(path: &Path, tag: &str, kv: &KvQuant, mixture: u64, ids: &[u32], decoded: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).expect("create fixtures dir");
     let mut out = String::new();
     out.push_str(&format!("# golden tokens — tag={tag} kv_quant={kv}\n"));
+    out.push_str(&format!("{MIXTURE_KEY}{mixture:#018x}\n"));
     out.push_str(&format!("# n_tokens={}\n", ids.len()));
     out.push_str(&format!("# decoded: {decoded:?}\n"));
     for id in ids {

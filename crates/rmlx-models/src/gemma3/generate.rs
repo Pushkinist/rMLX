@@ -242,17 +242,18 @@ pub fn generate_greedy<'a>(
     let sliding_window_i32 = model.cfg.sliding_window as i32;
     let n_layers = model.cfg.num_hidden_layers;
     // Force K8V8 for boundary layers (first head_n + last tail_n).
-    let mut caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
-        .into_iter()
-        .enumerate()
-        .map(|(i, q)| {
-            let window = match model.cfg.layer_types[i] {
-                LayerType::SlidingAttention => Some(sliding_window_i32),
-                LayerType::FullAttention => None,
-            };
-            KvCache::with_quant_max_seq_window(q, max_seq, window).with_layer_idx(i)
-        })
-        .collect();
+    let mut caches: Vec<KvCache> =
+        kv_layer_quants(n_layers, kv_quant, crate::gemma3::SHARES_KV_ACROSS_LAYERS)
+            .into_iter()
+            .enumerate()
+            .map(|(i, q)| {
+                let window = match model.cfg.layer_types[i] {
+                    LayerType::SlidingAttention => Some(sliding_window_i32),
+                    LayerType::FullAttention => None,
+                };
+                KvCache::with_quant_max_seq_window(q, max_seq, window).with_layer_idx(i)
+            })
+            .collect();
 
     // Prefill: encode the prompt in fixed-size chunks. Per chunk we
     // eval only the KV-cache prefill_raw buffers, not the logits, so MLX
@@ -404,6 +405,7 @@ pub fn generate_greedy<'a>(
                             lk,
                             kv_quant,
                             model.cfg.num_hidden_layers,
+                            crate::gemma3::SHARES_KV_ACROSS_LAYERS,
                             model.model_sig,
                         ),
                     );

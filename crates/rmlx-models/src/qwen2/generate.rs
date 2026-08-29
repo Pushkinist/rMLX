@@ -245,11 +245,12 @@ pub fn generate_greedy(
     // Allocate one KvCache per decoder layer using the selected quant mode.
     // Force K8V8 for boundary layers (first head_n + last tail_n).
     let n_layers = model.cfg.num_hidden_layers;
-    let mut caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
-        .into_iter()
-        .enumerate()
-        .map(|(i, q)| KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i))
-        .collect();
+    let mut caches: Vec<KvCache> =
+        kv_layer_quants(n_layers, kv_quant, crate::qwen2::SHARES_KV_ACROSS_LAYERS)
+            .into_iter()
+            .enumerate()
+            .map(|(i, q)| KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i))
+            .collect();
 
     // Prefill: encode the prompt in fixed-size chunks. Per chunk we
     // eval only the KV-cache prefill_raw buffers, not the logits, so MLX
@@ -434,6 +435,7 @@ pub fn generate_greedy(
                             lk,
                             kv_quant,
                             model.cfg.num_hidden_layers,
+                            crate::qwen2::SHARES_KV_ACROSS_LAYERS,
                             model.model_sig,
                         ),
                     );
