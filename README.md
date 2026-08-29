@@ -108,11 +108,17 @@ quantization surface in a single process.
 ³ affine 2–8 bit, fp8, mxfp/nvfp4, **plus** four rotation-KV families
 (TurboQuant, IsoQuant, PlanarQuant, RotorQuant) no other MLX server
 ships. ParoQuant is a weight quantizer, not a KV codec, and is counted in the
-weight column. Widest *matrix*, not a memory win: measured on two architectures at two
-contexts, no KV codec in the tree currently holds fewer resident bytes than
-plain bf16 — 17 of the 28 build no packed store at all and decode identically to
-it, bf16 itself is the 18th, and the other 10 are larger. The honest per-codec disposition, and why the
-families are kept anyway, is
+weight column. Widest *matrix*, and — as of the current tree — a narrow memory
+win: **17 of the 28 build no packed store at all** and decode byte-identically
+to bf16, bf16 itself is the 18th, and of the remaining 10 some now hold **fewer**
+resident bytes than plain bf16. Measured with `rmlx serve` at a 928-token prompt:
+`mixed_k8g64_v4g64` is **0.519×** `none` on Ternary-Bonsai-8B and `rot_k_v8g64`
+**0.641×** (both need an architecture whose layers do *not* share K/V — on
+shared-KV Gemma4 they are *larger*), while `iso3_sym` / `iso4_sym` are
+**0.876×** on gemma-4-e2b and **0.962×** on Bonsai-8B. The iso and rotor
+families pay for it in decode: 0.65–0.75× `none`'s TPS. Every other codec is at
+or above bf16's bytes. The honest per-codec disposition, the measured ratios,
+and why the families are kept anyway are in
 [`docs/KV_QUANT.md` § Codec disposition](docs/KV_QUANT.md). ⁴ oMLX has a tiered RAM+SSD KV cache, not KV-bit quantization.
 ⁵ `llama.cpp` offers per-tensor block KV types (`q8_0`…`q5_1`) but no
 rotation-KV families. Competitor cells verified against each project's README /

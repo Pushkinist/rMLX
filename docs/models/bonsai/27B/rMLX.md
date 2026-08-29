@@ -390,9 +390,13 @@ Ranked by impact:
    with no mirror. **They did not become viable.** Two independent reasons, both
    measured after the fact:
 
-   * The stores are not smaller than bf16 (16.25 bits/value for iso, 21.75 for
-     rotor, against bf16's 16.0), so there was never a bandwidth prize to
-     collect — see "Memory truth" in `docs/KV_QUANT.md`.
+   * The stores were not smaller than bf16 at the time of this measurement
+     (16.25 bits/value for iso, 21.75 for rotor, against bf16's 16.0), so there
+     was never a bandwidth prize to collect. **Both figures are superseded:**
+     narrowing the ring's scale and norm planes to `KV_SIDEBAND_DTYPE` took iso
+     to **12.125** (a genuine memory win) and rotor to **16.25** (still above
+     the floor). The kernel-shell reason below is unaffected and remains the
+     binding one — see "Memory truth" in `docs/KV_QUANT.md`.
    * The kernel shell itself achieves only 4–14 % of MLX `sdpa_vector`'s
      per-byte throughput. Its P1 grid is indexed by *query* head and so re-reads
      the whole KV stream `heads_per_kv` times, which caps the shell at
