@@ -156,11 +156,14 @@ Two properties of that saving matter to a reader sizing a cache:
   not to the final offset. Bonsai-8B with a 25-token prompt and 512 generated
   tokens moves only 47 849 728 → 45 187 328 bytes (0.944x), against 0.451x at a
   3 770-token prompt.
-* **It is diluted by the per-layer codec vector.** `kv_layer_quants` promotes
-  the first `LAYER_ADAPTIVE_HEAD_N` and last `LAYER_ADAPTIVE_TAIL_N` layers to
-  `K8V8`, which is a mirror-family codec and keeps its mirror regardless. On
-  Bonsai-8B that is 10 of 36 layers, so at most 26/36 of the bf16 mirror is
-  ever available to elide.
+* **It used to be diluted by the per-layer codec vector.** `kv_layer_quants`
+  promotes the first `LAYER_ADAPTIVE_HEAD_N` and last `LAYER_ADAPTIVE_TAIL_N`
+  layers — 10 of 36 on Bonsai-8B — and while that promotion landed on `K8V8`,
+  a mirror-family codec that keeps its mirror regardless, only 26/36 of the
+  bf16 mirror was ever available to elide. `boundary_floor` now raises a
+  parametric base inside its own family, so a promoted `Mixed` / `RotK` layer
+  is still `Mixed` / `RotK` and the elision reaches all 36. See
+  § "Which codec the floor is".
 
 For the **bf16-mirror family** (`K8V4`, `K8V8`, `Planar*`, `PlanarK`,
 `K8VTurbo*`, `TurboSym*`, `Iso3/4`, `Rotor3/4`, `RotorK*Asym`) that overhead is
@@ -1813,19 +1816,115 @@ Two policies modify the per-layer codec assignment independently of the
 request-level `KvQuant`:
 
 **Tail layers** (`kv_quant_for_layer`, `LAYER_ADAPTIVE_TAIL_N = 8`): the last
-8 layers are forced to `K8V8` under every **quantizing** base mode. Last-layer
-KV vectors carry the highest per-token information density; forcing 8-bit
-recovers PPL quality lost to aggressive V quantization.
+8 layers are forced to the **8-bit floor** under every **quantizing** base
+mode. Last-layer KV vectors carry the highest per-token information density;
+forcing 8-bit recovers PPL quality lost to aggressive V quantization.
 
 **Head layers** (`LAYER_ADAPTIVE_HEAD_N = 2`): the first 2 layers are forced to
-`K8V8`. First-layer K/V vectors carry large absolute magnitudes (embedding
-residual is large before deep normalisation). The reference sweep that set this
-constant measured 37–91% of turbo2's quality degradation recovered at ≥32K
-context — but that is the *evidence* for the constant, not a gate on it.
-`kv_quant_for_layer` is never handed a context length and promotes the first 2
-layers at every prompt size.
+the same floor. First-layer K/V vectors carry large absolute magnitudes
+(embedding residual is large before deep normalisation). The reference sweep
+that set this constant measured 37–91% of turbo2's quality degradation
+recovered at ≥32K context — but that is the *evidence* for the constant, not a
+gate on it. `kv_quant_for_layer` is never handed a context length and promotes
+the first 2 layers at every prompt size.
 
-When the base mode is already `K8V8`, both overrides are no-ops.
+When the base mode is already at the floor on both axes, both overrides are
+no-ops.
+
+### Which codec the floor is
+
+`boundary_floor` picks the target, and it is **not** unconditionally `K8V8`:
+
+* a base whose widths are **parameters** (`Mixed`, `RotK`) is raised inside its
+  own family — same store, same group geometry, same K rotation, both axes at
+  8 bits (`mixed_k8g64_v4g64` → `mixed_k8g64_v8g64`, `rot_k_v4g64` →
+  `rot_k_v8g64`);
+* every other quantizing base has no 8-bit form of its own family and falls
+  back to `K8V8`, which is what all of them used to get.
+
+The split exists because **`K8V8` is not an 8-bit layer.** It does not
+materialise a packed store (`materialises_packed_store()` is false: its decode
+reads the bf16 mirror on both axes), so a layer holding it holds two full bf16
+buffers and nothing else — 16.00 bits per value, byte-identical to `none`. The
+sentence "with the store gone a `K8V8` layer is a `None` layer under another
+name" appears further down this section and is exactly the problem: sending a
+parametric base there did not apply a floor, it *exempted* the layer from
+quantization, and charged 16.00 bits for a codec that stores 6.50.
+
+Measured on `mlx-community__Qwen3-8B-8bit` (36 full-attention layers, 8 KV
+heads, `head_dim = 128`, so 10 of 36 layers are promoted), `--kv-quant
+mixed_k8g64_v4g64`, `rmlx bench ... --max-tokens 128`, ABBA over two binaries:
+
+| ctx | promoted → `K8V8` | promoted → `mixed_k8g64_v8g64` | ratio |
+|---|---:|---:|---:|
+| 4k  | 333 465 088 B / **9.292** bits per value | 261 526 528 B / **7.288** | 0.784× |
+| 32k | 2 673 460 480 B / **9.158** | 2 068 088 320 B / **7.084** | 0.774× |
+
+Both figures are below the **8.50** bits per value that `llama.cpp`'s
+`-ctk q8_0 -ctv q8_0` and `mlx-lm`'s `--kv-bits 8` each deliver exactly, which
+the 9.2 was not. Decode TPS is unmoved on Qwen3-8B (ABBA ranges overlap at both
+contexts) and Qwen3.6-35B-A3B, and −1.3% on Ternary-Bonsai-8B (separated:
+139.00–140.81 against 137.04–138.56 t/s at 4k) — the ten boundary layers now
+run a quantized SDPA over their store where they used to run a bf16 SDPA over a
+mirror. Token ids are unchanged on Qwen3-8B at 32k and on Qwen3.6-35B-A3B, and
+change on Qwen3-8B at 4k and Bonsai-8B at 4k; that is the expected consequence
+of those layers becoming quantized, which is what the policy declares them to
+be.
+
+**The fidelity trade, stated plainly.** While the floor was `K8V8`, 10 of 36
+layers were *unquantized*, so on a short greedy probe the codec could reproduce
+bf16 token for token — `bonsai_golden_tokens_mixed` did exactly that, and its
+committed ids are byte-identical to a `--kv-quant none` run of the same prompt.
+That was never a general property: on Qwen3-8B the same codec already diverged
+from `none` at 4k (`0xaae2964c719b6140` vs `0x3fffb803aea9d999`) and at 32k
+(`0x00ad3cc58f0c6daf` vs `0xec00b11edb0ecee5`). What the old floor bought was
+bf16 *price* on 28% of the layers, and bf16 *agreement* only where the prompt
+happened to cooperate. Under the in-family floor the Bonsai probe diverges at
+index 18, where bf16 is a **documented exact tie** (margin `0.00000000`, the
+one case `REGEN_MAX_TIE_MARGIN`'s own derivation cites) and the added
+quantization noise resolves it the other way at a margin of 0.1875 — 1.5 ULP at
+that logit magnitude. A caller who needs bf16 agreement has `--kv-quant none`;
+a codec named for an 8-bit K and a 4-bit V should not be delivering it by
+leaving a quarter of the model unquantized.
+
+### Where the bytes of a `Mixed` layer stack go
+
+The per-layer codec vector and the per-codec byte model are the two halves of
+the delivered density and neither shows it alone. For a stack of `L`
+full-attention layers at prompt `P` and generation `G`, with `p` layers
+promoted:
+
+```
+bytes = p * bf16_rate * (P + G - 1)          bf16 mirrors, counted at the FILLED prefix
+      + (L - p) * base_rate  * C             packed store, counted at CAPACITY
+      + p * floor_rate * C                   (after the floor moved in-family)
+C = P + 256 * ceil(G / 256)                  MixedKvState grows in STEP = 256 rows
+```
+
+`bf16_rate = 2 * kv_h * head_dim * 2` B/token; a `Mixed` side is
+`kv_h * head_dim * (bits/8 + 4/group)` B/token. The two counting bases differ on
+purpose: `KvCache::resident_bytes` reports a mirror by its filled prefix
+(the allocation is ceiling-sized) and asks a store for its own total, and
+`MixedKvState::byte_size` answers with the whole allocated array.
+
+Reproduced to the byte on three geometries at `--max-tokens 128`:
+
+| model | measured | model |
+|---|---:|---|
+| Qwen3-8B 4k, promoted `K8V8` | 333 465 088 | `10*4096*3893 + 26*1664*4022` |
+| Qwen3-8B 4k, `--max-tokens 300` | 351 585 792 | `10*4096*4065 + 26*1664*4278` |
+| Ternary-Bonsai-8B 4k, promoted `K8V8` | 333 801 984 | `10*4096*3897 + 26*1664*4026` |
+| Qwen3.6-35B-A3B 4k, promoted `K8V8` | 108 051 456 | `2*2048*3981 + 8*832*4110 + 64 389 120` GDN |
+
+The last row's fixed term is the codec-independent GDN recurrent state already
+recorded below; the attention-KV part is what the codec moves.
+
+**The `STEP = 256` capacity slack is structural and amortizes.** The store is
+sized to the prompt at `exit_prefill` and grows by whole 256-row blocks
+afterwards, so a 128-token generation ends holding 128 unfilled rows. That is
+3.18% of the store at 4k (0.23 of the 7.29 bits per value) and 0.40% at 32k
+(0.03 of 7.08). Removing it means reallocating per decode step, which is what
+the increment exists to avoid.
 
 ### `--kv-quant none` is a bf16 control
 
