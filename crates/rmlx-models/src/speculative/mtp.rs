@@ -151,10 +151,22 @@ impl MtpDrafter {
     }
 
     /// Roll the head's KV cache back to `target` positions (partial accept).
+    ///
+    /// A layer holding fewer than `target` positions is skipped rather than
+    /// grown — but that is a fill the caller's accounting did not predict, and
+    /// silently skipping it lets a slot-vs-position gap open one step at a time
+    /// and show up only as a quietly decaying accept rate. Say so.
     pub fn truncate_to(&mut self, target: i32) {
         for c in &mut self.caches {
             if c.offset() >= target {
                 c.truncate_to(target);
+            } else {
+                tracing::warn!(
+                    target_positions = target,
+                    fill = c.offset(),
+                    "MtpDrafter::truncate_to: sidecar layer holds fewer positions than the \
+                     rollback target — the sidecar KV is behind the verifier prefix"
+                );
             }
         }
     }
@@ -189,6 +201,14 @@ impl MtpDrafter {
     /// KV write offset is `start_offset + step`. The first step conditions on the
     /// verifier hidden; subsequent steps condition on the head's own previous
     /// output hidden (mirrors `_forward_token` re-feeding `h_prev`).
+    ///
+    /// The loop produces `block_size - 1` tokens but the last one is never fed
+    /// back, so it would get no KV slot: a full-accept round then commits
+    /// `block_size` verifier positions against `block_size - 1` sidecar slots
+    /// and the two drift apart by one per round, permanently. One extra
+    /// `forward_token` at the end closes it — the hidden it returns is
+    /// discarded, only the KV write matters — so the sidecar always leaves this
+    /// call holding a slot for every token it has seen or proposed.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -227,6 +247,13 @@ impl MtpDrafter {
             tok = id;
             h_prev = h_next;
         }
+        // Give the last drafted token its slot (see the note above). The loop's
+        // last write was at `start_offset + tokens.len() - 1`, so this is both
+        // the next free slot and that token's position. The hidden it returns is
+        // discarded — the next round re-seeds from the verifier's captured one.
+        let last_offset = start_offset + tokens.len() as i32;
+        let tok_embed = self.embed_token(verifier, tok)?;
+        let _ = self.forward_token(&tok_embed, &h_prev, last_offset)?;
         Ok(tokens)
     }
 
@@ -339,6 +366,11 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
             .and_then(serde_json::Value::as_u64)
             .map_or(d, |v| v as usize)
     };
+    let tc_opt_u64 = |k: &str| {
+        tc.get(k)
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize)
+    };
 
     let rms_eps = tc_f64("rms_norm_eps", 1e-6) as f32;
     let num_attention_heads = tc_u64_req("num_attention_heads")?;
@@ -349,8 +381,15 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
     // them entirely. `num_experts == 0` is the shared "dense, no experts"
     // sentinel; `MtpLayer::load` decides dense-vs-MoE from tensor facts and
     // cross-checks it against this value.
+    //
+    // `num_experts_per_tok` has no such sentinel — every value it can take is a
+    // legal routing width, so a default would turn an omitted key into top-1
+    // routing on a top-8 checkpoint and collapse draft quality silently. Carry
+    // the absence instead and let the MoE branch of `MtpLayer::load` refuse it;
+    // the dense branch never reads it, so an absent key stays legal exactly
+    // where a dense sidecar needs it to be.
     let num_experts = tc_u64("num_experts", 0);
-    let num_experts_per_tok = tc_u64("num_experts_per_tok", 1);
+    let num_experts_per_tok = tc_opt_u64("num_experts_per_tok");
     let norm_topk_prob = tc_bool("norm_topk_prob", true);
 
     // RoPE: read rope_theta + partial_rotary_factor from `rope_parameters`
@@ -824,37 +863,17 @@ pub fn mtp_generate_greedy(
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
         let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
         if v_target < v_offset_before {
-            // The GDN recurrent state has no sequence axis, so it cannot be
-            // truncated — it is restored from the pre-round snapshot and
-            // replayed over the kept prefix. That replay runs the WHOLE layer
-            // stack, and in this hybrid the full-attention layers are
-            // interleaved between GDN layers: their output is the residual a
-            // later GDN layer consumes. So the replay must see the real KV
-            // caches at their real sequence offsets, not an empty scratch
-            // stack — otherwise the FA layers attend to a `v_kept`-token
-            // prefix at positions `0..v_kept` and every downstream GDN layer
-            // advances on a wrong hidden. Roll the FA caches back to the
-            // pre-round offset first, then replay into them; they land on
-            // `v_target` exactly as the direct truncation would have.
             let v_pre_round_offset = v_offset_before - v_k as i32;
-            let v_kept = (v_target - v_pre_round_offset).max(0) as usize;
-            for c in &mut v_caches {
-                // GDN layers never advance their KvCache offset (stays 0);
-                // truncating them would assert n > offset.
-                if c.offset() >= v_pre_round_offset {
-                    c.truncate_to(v_pre_round_offset);
-                }
-            }
-            round_snap.restore(&mut v_lin);
-            if v_kept > 0 && v_kept <= v_input.len() {
-                let _ = verifier.forward_seq_last_k_with_cache(
-                    &v_input[..v_kept],
-                    1,
-                    &mut v_caches,
-                    Some(&mut v_lin),
-                    device,
-                )?;
-            }
+            super::rollback_round_caches(
+                verifier,
+                &mut v_caches,
+                Some(&mut v_lin),
+                Some(round_snap.into_snapshots()),
+                &v_input,
+                v_pre_round_offset,
+                v_target,
+                device,
+            )?;
         } else {
             drop(round_snap);
         }

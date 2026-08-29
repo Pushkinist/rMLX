@@ -159,7 +159,9 @@ fn round_state_rollback_round_trip() {
     caches[0].delta_state = Some(arr(&[8.0, 8.0]));
 
     // Partial rejection -> restore.
-    round.restore(&mut caches);
+    for (c, snap) in caches.iter_mut().zip(round.into_snapshots()) {
+        c.restore_snapshot(snap);
+    }
     assert_eq!(
         read(caches[0].conv_state.as_ref().unwrap()),
         vec![1.0, 2.0, 3.0]

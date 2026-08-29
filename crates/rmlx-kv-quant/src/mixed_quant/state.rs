@@ -315,15 +315,30 @@ impl MixedKvState {
     /// positions while holding none. The next multi-token forward then attends
     /// `seq` keys against a mask sized `n + seq`, and a single-token decode —
     /// which needs no mask — silently attends the current token alone.
+    ///
+    /// An **over-long** target is the same defect in the other direction, and
+    /// this store cannot absorb it: `offset` is the coverage, so there is no
+    /// larger fill to clamp down to. `KvCache::truncate_to` sets `offset = n`
+    /// regardless of what the store did, and its `debug_assert` is compiled out
+    /// of `release-perf` — so accepting `n > offset` quietly would leave the
+    /// cache reporting positions no payload backs. Keep the fill and report it
+    /// as an error event: the caller's offsets do not describe this store.
     pub fn truncate_to(&mut self, n: i32) {
         let n = n.max(0);
+        if n > self.offset {
+            tracing::error!(
+                target_positions = n,
+                fill = self.offset,
+                "MixedKvState::truncate_to: target past the store's fill — keeping the fill; \
+                 the cache will report positions the store does not hold"
+            );
+            return;
+        }
         if n == 0 {
             self.reset();
             return;
         }
-        if n < self.offset {
-            self.offset = n;
-        }
+        self.offset = n;
     }
 
     #[allow(clippy::too_many_arguments)]

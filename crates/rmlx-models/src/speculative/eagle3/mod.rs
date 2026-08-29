@@ -1148,26 +1148,17 @@ pub fn eagle3_generate_greedy(
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
         let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
         if v_target < v_offset_before {
-            for c in &mut v_caches {
-                if c.offset() >= v_target {
-                    c.truncate_to(v_target);
-                }
-            }
             let v_pre_round_offset = v_offset_before - v_k as i32;
-            let v_kept = (v_target - v_pre_round_offset).max(0) as usize;
-            round_snap.restore(&mut v_lin);
-            if v_kept > 0 && v_kept <= v_input.len() {
-                let mut scratch: Vec<KvCache> = (0..verifier.num_hidden_layers())
-                    .map(|_| KvCache::with_quant(KvQuant::None))
-                    .collect();
-                let _ = verifier.forward_seq_last_k_with_cache(
-                    &v_input[..v_kept],
-                    1,
-                    &mut scratch,
-                    Some(&mut v_lin),
-                    device,
-                )?;
-            }
+            super::rollback_round_caches(
+                verifier,
+                &mut v_caches,
+                Some(&mut v_lin),
+                Some(round_snap.into_snapshots()),
+                &v_input,
+                v_pre_round_offset,
+                v_target,
+                device,
+            )?;
         } else {
             drop(round_snap);
         }
