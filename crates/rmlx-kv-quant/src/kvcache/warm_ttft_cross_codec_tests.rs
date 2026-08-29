@@ -695,3 +695,89 @@ fn deep_clone_carries_the_sharing_topology() {
         );
     }
 }
+
+/// The `with_quant*` constructors default `shares_kv` to `false`, and on every
+/// dense architecture in the tree that default is the only thing that decides.
+///
+/// No dense arch builder calls `with_shares_kv` at all — Gemma4's loop and the
+/// speculative verifier stacks are the whole caller set — so the constructor
+/// default alone keeps the `Mixed` / `RotK` bf16 mirror off Bonsai, Qwen3,
+/// Qwen3.5-MoE and everything else. Flipping it to `true` restores two full
+/// bf16 buffers per layer across the tree, which is the entire residency this
+/// codec family was carrying, and every other test in this file sets the flag
+/// explicitly, so none of them would notice. Pin the constructors, then pin the
+/// consequence the default exists for.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn with_quant_constructors_default_to_no_cross_layer_sharing() {
+    let device = Device::Cpu;
+    let mixed = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 4,
+        k_group_size: 64,
+        v_group_size: 64,
+    };
+
+    // Every public constructor that takes no topology argument. All three
+    // funnel through `with_quant_max_seq`, but a future one need not, and the
+    // windowed form is the one Gemma4 itself calls.
+    let defaults = [
+        ("with_quant", KvCache::with_quant(mixed)),
+        (
+            "with_quant_max_seq",
+            KvCache::with_quant_max_seq(mixed, TEST_MAX_SEQ),
+        ),
+        (
+            "with_quant_max_seq_window(None)",
+            KvCache::with_quant_max_seq_window(mixed, TEST_MAX_SEQ, None),
+        ),
+        (
+            "with_quant_max_seq_window(Some)",
+            KvCache::with_quant_max_seq_window(mixed, TEST_MAX_SEQ, Some(64)),
+        ),
+    ];
+    for (name, cache) in defaults {
+        assert!(
+            !cache.shares_kv(),
+            "{name}: cross-layer KV sharing is a per-arch declaration, so an \
+             undeclared cache must not claim it — this default is what every \
+             dense architecture runs under"
+        );
+    }
+
+    // The consequence, on both members of the Mixed machinery: a producer built
+    // through the default holds its packed store and nothing else.
+    for quant in [
+        mixed,
+        KvQuant::RotK {
+            v_bits: 4,
+            v_group_size: 64,
+        },
+    ] {
+        let mut cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ);
+        cache.enter_prefill();
+        let shape = [1i32, TEST_KV_H, TEST_PREFILL_SEQ, TEST_HEAD_DIM];
+        let n: usize = shape.iter().map(|&d| d as usize).product();
+        cache
+            .update(
+                &f32_arr(&vec![0.123f32; n], &shape),
+                &f32_arr(&vec![0.456f32; n], &shape),
+                device,
+            )
+            .expect("prefill chunk");
+        cache.exit_prefill(device).expect("exit_prefill");
+        assert!(
+            cache.decode_fp16_k_for_test().is_none() && cache.decode_fp16_v_for_test().is_none(),
+            "{quant:?}: a cache built through the default declares no sharing, so nothing \
+             reads the bf16 mirror and exit_prefill must build neither axis"
+        );
+        assert_eq!(
+            cache.resident_bytes(),
+            cache.storage().resident_bytes(),
+            "{quant:?}: a default-built producer holds its packed store and nothing else"
+        );
+    }
+}

@@ -672,10 +672,24 @@ impl Architecture {
     /// two full bf16 buffers of dead memory per layer.
     ///
     /// The match is exhaustive so a new architecture is classified rather than
-    /// inheriting a default.
+    /// inheriting a default. The `true` arm reads
+    /// [`crate::gemma4::SHARES_KV_ACROSS_LAYERS`] rather than restating it: that
+    /// const is also what Gemma4's own cache builder, its SSD hydrate and its
+    /// KV-residency advisory pass, so this accessor cannot drift from them. A
+    /// literal here could be flipped on its own, leaving Gemma4's generate path
+    /// working while Gemma4 speculative decoding lost the mirror.
+    ///
+    /// The `false` arms stay literals. `false` is the `KvCache` constructor
+    /// default (pinned by
+    /// `with_quant_constructors_default_to_no_cross_layer_sharing`), so those
+    /// arms restate a default rather than a per-arch fact; and none of those
+    /// stacks calls `update_and_sdpa_shared_source` at all, so the worst a
+    /// flipped `false` can do is allocate a mirror nothing reads — bounded to
+    /// residency, never to output. A const per non-sharing arch would be seven
+    /// constants spelling the default.
     pub fn shares_kv_across_layers(&self) -> bool {
         match self {
-            Architecture::Gemma4(_) => true,
+            Architecture::Gemma4(_) => crate::gemma4::SHARES_KV_ACROSS_LAYERS,
             Architecture::Gemma3(_)
             | Architecture::Qwen2(_)
             | Architecture::Qwen3(_)

@@ -96,6 +96,12 @@ fn dflash_round0_first_token_aligns() {
     let mut caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
         .map(|i| {
             KvCache::with_quant_max_seq_window(kv_quant, 4096, verifier.layer_sliding_window(i))
+                // Production's verifier stacks declare the topology off the
+                // architecture, and the Mixed/RotK codecs refuse a shared-source
+                // decode step without it. Reading it the same way here keeps the
+                // alignment property, not `DEFAULT_KV_QUANT`, the thing that can
+                // fail this test.
+                .with_shares_kv(verifier.shares_kv_across_layers())
         })
         .collect();
     let mut lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
