@@ -4026,8 +4026,9 @@ context.** That is the finding the dispositions follow from.
 >
 > Two qualifiers, both load-bearing. `mixed_*` / `rot_k_*` win only where layers
 > do **not** share K/V — on shared-KV gemma-4 they are larger (1.02–1.56×). And
-> the iso family buys its bytes with decode: 0.60–0.70× `none`'s TPS on
-> Bonsai-8B, 0.85–0.96× on the larger models. Nothing here is both smaller and
+> the iso family buys its bytes with decode: **0.64–0.69×** `none`'s TPS on
+> Bonsai-8B, 0.77–0.86× on gemma-4-e2b, 0.85–0.97× on the 27B/12B models
+> (rotor is worse on every one: 0.58–0.96×). Nothing here is both smaller and
 > faster than bf16.
 
 #### Class 1 — the baseline (1 codec)

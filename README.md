@@ -116,8 +116,9 @@ resident bytes than plain bf16. Measured with `rmlx serve` at a 928-token prompt
 **0.641×** (both need an architecture whose layers do *not* share K/V — on
 shared-KV Gemma4 they are *larger*), while `iso3_sym` / `iso4_sym` are
 **0.876×** on gemma-4-e2b and **0.962×** on Bonsai-8B. The iso and rotor
-families pay for it in decode: 0.65–0.75× `none`'s TPS. Every other codec is at
-or above bf16's bytes. The honest per-codec disposition, the measured ratios,
+families pay for it in decode — 0.58–0.97× `none`'s TPS, worst on Bonsai-8B
+(iso 0.64–0.69, rotor 0.58–0.62) and mildest on the 27B/12B models. Every other
+codec is at or above bf16's bytes. The honest per-codec disposition, the measured ratios,
 and why the families are kept anyway are in
 [`docs/KV_QUANT.md` § Codec disposition](docs/KV_QUANT.md). ⁴ oMLX has a tiered RAM+SSD KV cache, not KV-bit quantization.
 ⁵ `llama.cpp` offers per-tensor block KV types (`q8_0`…`q5_1`) but no

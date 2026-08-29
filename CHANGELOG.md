@@ -489,9 +489,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The two rows that matter for expectation-setting: `mixed_*` / `rot_k_*` are a
   win **only** on an architecture whose layers do not share K/V — on shared-KV
-  Gemma4 they are *larger* — and the iso family pays for its bytes in decode
-  (0.60–0.70× `none`'s TPS on Bonsai-8B, 0.85–0.96× on the larger models). No
-  codec in the tree is both smaller and faster than bf16.
+  Gemma4 they are *larger* — and the iso family pays for its bytes in decode:
+  **0.64–0.69×** `none`'s TPS on Bonsai-8B, 0.77–0.86× on gemma-4-e2b, and
+  0.85–0.97× on the 27B/12B models. Rotor is worse on every one (0.58–0.96×).
+  No codec in the tree is both smaller and faster than bf16.
 
 - **Qwen3.8-27B serves, including with its MTP sidecar.** The
   `Qwen3.8-27B-MTP-mxfp8` sidecar ships a plain SwiGLU `layers.0.mlp` and no
