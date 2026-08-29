@@ -64,3 +64,18 @@ pub use vision::{
     build_inputs_embeds, load_multimodal_embedder, load_vision_tower, MultimodalEmbedder,
     VisionModel, BOI_TOKEN_ID, EOI_TOKEN_ID, IMAGE_TOKEN_ID,
 };
+
+/// Gemma4's decoder layers read **each other's** K/V: layers 24-41 project no
+/// K/V of their own and attend over the last non-shared layer of the same
+/// attention type, through `KvCache::update_and_sdpa_shared_source`.
+///
+/// This is the single producer of that fact. It decides whether a `Mixed` /
+/// `RotK` cache keeps its bf16 K/V mirror — the tensors those consumer layers
+/// actually read — and it is consumed from four places that must agree: this
+/// module's own cache builder and prompt-cache hydrate, the KV-residency
+/// advisory, and `Architecture::shares_kv_across_layers`, which is what the
+/// four speculative verifier stacks key off. Restating it as four literals let
+/// the accessor be flipped on its own: Gemma4's own generate path would keep
+/// working while Gemma4 speculative decoding under `mixed_*` / `rot_k_*` lost
+/// the mirror and was refused at the first shared-source decode step.
+pub(crate) const SHARES_KV_ACROSS_LAYERS: bool = true;

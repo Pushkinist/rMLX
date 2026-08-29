@@ -365,7 +365,12 @@ pub fn generate_greedy<'a>(
         // Effective context the global layers will hold: the resolved ceiling
         // (or the prompt length if longer — either gives the correct sign).
         let eff_seq = (max_seq_ceiling.max(0) as u64).max(prompt_ids.len() as u64);
-        warn_if_kv_codec_net_negative(kv_quant, &layer_shapes, eff_seq, true);
+        warn_if_kv_codec_net_negative(
+            kv_quant,
+            &layer_shapes,
+            eff_seq,
+            crate::gemma4::SHARES_KV_ACROSS_LAYERS,
+        );
     }
 
     // `is_prefix` gates the enter_prefill/exit_prefill bracketing below: the
@@ -412,11 +417,9 @@ pub fn generate_greedy<'a>(
                     KvCache::with_quant_max_seq_window(q, initial_max_seq, window)
                         .with_max_seq_ceiling(max_seq_ceiling)
                         .with_layer_idx(i)
-                        // Gemma4 is the tree's one cross-layer-KV stack: its
-                        // consumer layers project no K/V and attend over a
-                        // producer layer's cache. That is what keeps the
-                        // Mixed/RotK bf16 mirror alive here.
-                        .with_shares_kv(true)
+                        // The module const is the one producer of this fact;
+                        // it is what keeps the Mixed/RotK bf16 mirror alive here.
+                        .with_shares_kv(crate::gemma4::SHARES_KV_ACROSS_LAYERS)
                 })
                 .collect();
             (fresh, prompt_ids, false)

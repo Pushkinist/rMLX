@@ -598,6 +598,32 @@ impl KvCache {
                     self.layer_idx, self.quant,
                 )));
             }
+            // Declaring the topology is not the same as holding the artifact.
+            // A cache reconstructed straight from a packed store — the SSD
+            // hydrate path, `KvCache::from_storage` — carries the declaration
+            // and the block's offset but no mirror, and on the one shared-KV
+            // architecture it never re-enters prefill: a hydrated block is
+            // tail-extended through the prefix branch, which appends in decode
+            // mode with no enter/exit bracket, so `exit_prefill` never re-runs
+            // and never rebuilds it. The declaration test above passes such a
+            // cache straight into the same zero-fill it exists to prevent. So
+            // test the mirror itself: past prefill, with tokens already behind
+            // this call and no mirror to extend, the arm below allocates zeros
+            // and slices in the current token alone.
+            if !self.in_prefill
+                && self.offset > 0
+                && (self.decode_fp16_k.is_none() || self.decode_fp16_v.is_none())
+            {
+                return Err(Error::Mlx(format!(
+                    "update_and_sdpa_shared_source: cache for layer {} runs {} at offset {} \
+                     and holds no bf16 K/V mirror. It was rebuilt from a packed store alone \
+                     (SSD hydrate) and prefill is over, so the mirror cannot be rebuilt; the \
+                     K/V surfaced to the shared-KV consumer layers would be zero for every \
+                     token before this one. Re-prefill the prompt instead of extending the \
+                     hydrated block.",
+                    self.layer_idx, self.quant, self.offset,
+                )));
+            }
             tracing::Span::current().record("path", "mixed");
             let (out, kv) = self.update_and_sdpa_mixed_inner(
                 queries,
