@@ -334,13 +334,23 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
     };
     let tc_bool = |k: &str, d: bool| tc.get(k).and_then(serde_json::Value::as_bool).unwrap_or(d);
     let tc_f64 = |k: &str, d: f64| tc.get(k).and_then(serde_json::Value::as_f64).unwrap_or(d);
+    let tc_u64 = |k: &str, d: usize| {
+        tc.get(k)
+            .and_then(serde_json::Value::as_u64)
+            .map_or(d, |v| v as usize)
+    };
 
     let rms_eps = tc_f64("rms_norm_eps", 1e-6) as f32;
     let num_attention_heads = tc_u64_req("num_attention_heads")?;
     let num_key_value_heads = tc_u64_req("num_key_value_heads")?;
     let head_dim = tc_u64_req("head_dim")?;
-    let num_experts = tc_u64_req("num_experts")?;
-    let num_experts_per_tok = tc_u64_req("num_experts_per_tok")?;
+    // MoE dims are optional for the same reason they are optional in
+    // `Qwen3_5MoeConfig`: a sidecar whose `layers.0` FFN is a plain SwiGLU omits
+    // them entirely. `num_experts == 0` is the shared "dense, no experts"
+    // sentinel; `MtpLayer::load` decides dense-vs-MoE from tensor facts and
+    // cross-checks it against this value.
+    let num_experts = tc_u64("num_experts", 0);
+    let num_experts_per_tok = tc_u64("num_experts_per_tok", 1);
     let norm_topk_prob = tc_bool("norm_topk_prob", true);
 
     // RoPE: read rope_theta + partial_rotary_factor from `rope_parameters`
@@ -814,22 +824,33 @@ pub fn mtp_generate_greedy(
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
         let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
         if v_target < v_offset_before {
-            for c in &mut v_caches {
-                if c.offset() >= v_target {
-                    c.truncate_to(v_target);
-                }
-            }
+            // The GDN recurrent state has no sequence axis, so it cannot be
+            // truncated — it is restored from the pre-round snapshot and
+            // replayed over the kept prefix. That replay runs the WHOLE layer
+            // stack, and in this hybrid the full-attention layers are
+            // interleaved between GDN layers: their output is the residual a
+            // later GDN layer consumes. So the replay must see the real KV
+            // caches at their real sequence offsets, not an empty scratch
+            // stack — otherwise the FA layers attend to a `v_kept`-token
+            // prefix at positions `0..v_kept` and every downstream GDN layer
+            // advances on a wrong hidden. Roll the FA caches back to the
+            // pre-round offset first, then replay into them; they land on
+            // `v_target` exactly as the direct truncation would have.
             let v_pre_round_offset = v_offset_before - v_k as i32;
             let v_kept = (v_target - v_pre_round_offset).max(0) as usize;
+            for c in &mut v_caches {
+                // GDN layers never advance their KvCache offset (stays 0);
+                // truncating them would assert n > offset.
+                if c.offset() >= v_pre_round_offset {
+                    c.truncate_to(v_pre_round_offset);
+                }
+            }
             round_snap.restore(&mut v_lin);
             if v_kept > 0 && v_kept <= v_input.len() {
-                let mut scratch: Vec<KvCache> = (0..verifier.num_hidden_layers())
-                    .map(|_| KvCache::with_quant(KvQuant::None))
-                    .collect();
                 let _ = verifier.forward_seq_last_k_with_cache(
                     &v_input[..v_kept],
                     1,
-                    &mut scratch,
+                    &mut v_caches,
                     Some(&mut v_lin),
                     device,
                 )?;

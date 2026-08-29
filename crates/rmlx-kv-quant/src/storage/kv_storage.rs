@@ -1035,9 +1035,12 @@ impl KvStorage {
             // None: bf16 buffers are sliced lazily on next read; nothing to
             // truncate here. KvCache::truncate_to drops the buffers itself.
             Self::None { .. } => {}
-            // Mixed: drop quant state (mlx-lm-tq's `is_trimmable` returns False;
-            // a fresh request resets the cache anyway).
-            Self::Mixed { state, .. } => state.reset(),
+            // Mixed: the store is a capacity buffer with `state.offset` as its
+            // fill marker, so rolling that marker back IS the truncation — see
+            // `MixedKvState::truncate_to`. Resetting instead dropped the kept
+            // prefix too, and `KvCache::truncate_to` then set `offset = n`,
+            // leaving a cache that reports `n` positions and holds none.
+            Self::Mixed { state, .. } => state.truncate_to(n),
             Self::Paged {
                 k, v_k8, v_planar, ..
             } => {

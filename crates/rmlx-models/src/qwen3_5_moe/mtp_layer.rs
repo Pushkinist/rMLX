@@ -1,11 +1,14 @@
-//! Reusable single Qwen3.5-MoE decoder layer for the MTP sidecar drafter.
+//! Reusable single Qwen3.5 decoder layer for the MTP sidecar drafter.
 //!
-//! The Qwen3.5 MTP drafter's `layers.0` is a *stock* Qwen3.5-MoE decoder layer
+//! The Qwen3.5 MTP drafter's `layers.0` is a *stock* Qwen3.5 decoder layer
 //! (`full_attention_interval = 1`, so the single layer is a full-attention
-//! layer + sparse-MoE FFN with identical tensor names to the main model). This
-//! module REUSES the existing [`FullAttention`] + [`SparseMoeBlock`] +
-//! [`DecoderLayer`] machinery rather than hand-porting a second attention /
-//! MoE implementation (CLAUDE.md general-solution mandate).
+//! layer) with identical tensor names to the main model. Its FFN follows the
+//! verifier family: sparse MoE for a MoE checkpoint (Qwen3.6-35B-A3B-MTP),
+//! plain dense SwiGLU for a dense one (Qwen3.8-27B-MTP). Which one is a
+//! *tensor fact*, probed the same way the main loader probes it per layer.
+//! This module REUSES the existing [`FullAttention`] + [`SparseMoeBlock`] /
+//! [`DenseMlp`] + [`DecoderLayer`] machinery rather than hand-porting a second
+//! attention / FFN implementation (CLAUDE.md general-solution mandate).
 //!
 //! [`MtpLayer`] wraps one loaded [`DecoderLayer`] plus the attention dims the
 //! sidecar's round-loop needs (head/kv counts are not exposed by
@@ -21,7 +24,7 @@ use rmlx_mlx::{Array, Device};
 use super::attention::FullAttention;
 use super::decoder_layer::{AttnBlock, DecoderLayer, MlpBlock};
 use super::layers::{Linear, RmsNorm};
-use super::moe::{SharedExpert, SparseMoeBlock, SwitchMlp};
+use super::moe::{DenseMlp, SharedExpert, SparseMoeBlock, SwitchMlp};
 use crate::layers::{resolve_quant, QuantParams};
 use rmlx_kv_quant::KvCache;
 
@@ -48,11 +51,12 @@ pub struct MtpLayerDims {
     pub rope_theta: f32,
     /// RMSNorm epsilon.
     pub rms_norm_eps: f32,
-    /// Total MoE experts.
+    /// Total MoE experts. `0` is the "dense, no experts" sentinel shared with
+    /// [`super::config::Qwen3_5MoeConfig`] — a dense sidecar omits the key.
     pub num_experts: usize,
-    /// Experts selected per token.
+    /// Experts selected per token. Unread when the FFN is dense.
     pub num_experts_per_tok: usize,
-    /// Normalize top-k routing weights to sum to 1.
+    /// Normalize top-k routing weights to sum to 1. Unread when the FFN is dense.
     pub norm_topk_prob: bool,
     /// Quantization group size (sidecar global).
     pub quant_group_size: i32,
@@ -73,16 +77,19 @@ pub struct MtpLayer {
 }
 
 impl MtpLayer {
-    /// Load a single full-attention + sparse-MoE Qwen3.5 decoder layer from a
-    /// sidecar shard set, keyed on `prefix` (`layers.0`).
+    /// Load a single full-attention Qwen3.5 decoder layer from a sidecar shard
+    /// set, keyed on `prefix` (`layers.0`).
     ///
-    /// REUSES [`FullAttention`] + [`SparseMoeBlock`] + [`DecoderLayer`]. The
-    /// tensor names match the main Qwen3.5-MoE loader exactly:
-    /// `{prefix}.self_attn.{q,k,v,o}_proj`, `{prefix}.self_attn.{q,k}_norm`,
-    /// `{prefix}.{input,post_attention}_layernorm`, `{prefix}.mlp.gate`,
-    /// `{prefix}.mlp.switch_mlp.{gate,up,down}_proj`,
-    /// `{prefix}.mlp.shared_expert.{gate,up,down}_proj`,
-    /// `{prefix}.mlp.shared_expert_gate`.
+    /// REUSES [`FullAttention`] + [`SparseMoeBlock`] / [`DenseMlp`] +
+    /// [`DecoderLayer`]. The tensor names match the main Qwen3.5 loader
+    /// exactly: `{prefix}.self_attn.{q,k,v,o}_proj`,
+    /// `{prefix}.self_attn.{q,k}_norm`,
+    /// `{prefix}.{input,post_attention}_layernorm`, and — depending on which
+    /// FFN the checkpoint carries — either `{prefix}.mlp.gate` +
+    /// `{prefix}.mlp.switch_mlp.{gate,up,down}_proj` +
+    /// `{prefix}.mlp.shared_expert.{gate,up,down}_proj` +
+    /// `{prefix}.mlp.shared_expert_gate` (MoE) or
+    /// `{prefix}.mlp.{gate,up,down}_proj` (dense).
     pub fn load(shards: &ShardSet, prefix: &str, dims: &MtpLayerDims) -> Result<Self> {
         let defaults =
             QuantParams::global(dims.quant_group_size, dims.quant_bits, &dims.quant_mode);
@@ -159,24 +166,43 @@ impl MtpLayer {
             rope_dims: dims.rope_dims,
         });
 
+        // Dense vs MoE is a checkpoint fact, not a config flag — the same
+        // `switch_mlp` witness the main loader probes per layer. A sparse FFN
+        // carries `mlp.switch_mlp.*` plus the `mlp.gate` router and
+        // `mlp.shared_expert*`; a dense SwiGLU FFN carries `mlp.{gate,up,down}_proj`
+        // directly.
         let m = format!("{prefix}.mlp");
-        let mlp = MlpBlock::Moe(Box::new(SparseMoeBlock {
-            gate: load_linear(&format!("{m}.gate"))?,
-            switch_mlp: SwitchMlp {
-                gate_proj: load_linear(&format!("{m}.switch_mlp.gate_proj"))?,
-                up_proj: load_linear(&format!("{m}.switch_mlp.up_proj"))?,
-                down_proj: load_linear(&format!("{m}.switch_mlp.down_proj"))?,
-            },
-            shared_expert: SharedExpert {
-                gate_proj: load_linear(&format!("{m}.shared_expert.gate_proj"))?,
-                up_proj: load_linear(&format!("{m}.shared_expert.up_proj"))?,
-                down_proj: load_linear(&format!("{m}.shared_expert.down_proj"))?,
-            },
-            shared_expert_gate: load_linear(&format!("{m}.shared_expert_gate"))?,
-            num_experts: dims.num_experts,
-            top_k: dims.num_experts_per_tok,
-            norm_topk_prob: dims.norm_topk_prob,
-        }));
+        let mlp = if has_tensor(&format!("{m}.switch_mlp.gate_proj.weight")) {
+            if dims.num_experts == 0 {
+                return Err(Error::Model(format!(
+                    "MtpLayer: '{m}' carries MoE tensors but the sidecar config \
+                     reports no experts (num_experts = 0)"
+                )));
+            }
+            MlpBlock::Moe(Box::new(SparseMoeBlock {
+                gate: load_linear(&format!("{m}.gate"))?,
+                switch_mlp: SwitchMlp {
+                    gate_proj: load_linear(&format!("{m}.switch_mlp.gate_proj"))?,
+                    up_proj: load_linear(&format!("{m}.switch_mlp.up_proj"))?,
+                    down_proj: load_linear(&format!("{m}.switch_mlp.down_proj"))?,
+                },
+                shared_expert: SharedExpert {
+                    gate_proj: load_linear(&format!("{m}.shared_expert.gate_proj"))?,
+                    up_proj: load_linear(&format!("{m}.shared_expert.up_proj"))?,
+                    down_proj: load_linear(&format!("{m}.shared_expert.down_proj"))?,
+                },
+                shared_expert_gate: load_linear(&format!("{m}.shared_expert_gate"))?,
+                num_experts: dims.num_experts,
+                top_k: dims.num_experts_per_tok,
+                norm_topk_prob: dims.norm_topk_prob,
+            }))
+        } else {
+            MlpBlock::Dense(Box::new(DenseMlp {
+                gate_proj: load_linear(&format!("{m}.gate_proj"))?,
+                up_proj: load_linear(&format!("{m}.up_proj"))?,
+                down_proj: load_linear(&format!("{m}.down_proj"))?,
+            }))
+        };
 
         let layer = DecoderLayer {
             input_layernorm: load_rms(&format!("{prefix}.input_layernorm"))?,
