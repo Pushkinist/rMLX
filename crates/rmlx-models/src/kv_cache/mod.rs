@@ -80,19 +80,35 @@ mod tests;
 // The re-export shim was dropped; import directly from
 // `rmlx_kv_quant::KV_MAX_SEQ_DEFAULT`.
 
-/// Default number of tail layers forced to the 8-bit floor
+/// Default number of tail layers forced to the boundary floor
 /// ([`boundary_floor`]) by [`kv_quant_for_layer`]. Matches the N70 reference
 /// experiment.
+///
+/// **What that experiment measured.** The N70 sweep, and the head-layer sweep
+/// on [`LAYER_ADAPTIVE_HEAD_N`], were both recorded when the promotion target
+/// was `KvQuant::K8V8` for every base — and `K8V8` materialises no packed store
+/// (`KvQuant::decode_reads_packed_store` is false, both `feeds_bf16_*` true),
+/// so a layer holding it decodes at model dtype. Those sweeps therefore measured
+/// **bf16 boundary layers**, not q8_0 ones, and the quality figures they produced
+/// are evidence for *how many* layers the exemption should span, not for what
+/// an 8-bit boundary layer costs in quality. The counts are carried over
+/// unchanged; the quality of the in-family 8-bit target has not been re-derived
+/// to that standard. See `docs/KV_QUANT.md` §Layer-adaptive overrides.
 pub const LAYER_ADAPTIVE_TAIL_N: usize = 8;
 
-/// Default number of head layers forced to the 8-bit floor
+/// Default number of head layers forced to the boundary floor
 /// ([`boundary_floor`]) by [`kv_quant_for_layer`], at every context length.
 ///
 /// Bench findings show first-layer KV vectors carry the highest absolute magnitudes
-/// (embedding residual is large before deep normalisation) and that forcing
-/// q8_0 on the first 2 layers recovers 37–91% of turbo2 quality loss at ≥32K
+/// (embedding residual is large before deep normalisation) and that exempting
+/// the first 2 layers recovers 37–91% of turbo2 quality loss at ≥32K
 /// context. That sweep is the evidence for the constant, not a gate on it:
 /// [`kv_quant_for_layer`] is never handed a context length.
+///
+/// The sweep was reported as "q8_0 on the first 2 layers", but the treatment it
+/// ran was `KvQuant::K8V8`, which stores nothing and decodes bf16 — see the
+/// provenance note on [`LAYER_ADAPTIVE_TAIL_N`]. Read it as evidence for the
+/// count, not for the width.
 pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
 
 /// Layer-adaptive KV quantization.
@@ -109,9 +125,10 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
 ///   Forcing 8-bit for the tail recovers PPL quality lost to aggressive
 ///   V-quant (turbo3/planar).
 /// - **Head**: first-layer K/V vectors carry large absolute magnitudes
-///   (embedding residual before deep normalisation). q8_0 on the first 2
+///   (embedding residual before deep normalisation). Exempting the first 2
 ///   layers was measured to recover 37–91% of turbo2 quality degradation at
-///   ≥32K ctx; the promotion itself is unconditional.
+///   ≥32K ctx — with a bf16 boundary layer, which is the treatment that sweep
+///   ran; see [`LAYER_ADAPTIVE_HEAD_N`]. The promotion itself is unconditional.
 ///
 /// # Usage
 ///
@@ -146,11 +163,22 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
 /// [`boundary_floor`]'s decision, and for a base whose widths are parameters it
 /// is that base's own 8-bit form.
 ///
+/// `shares_kv` is the calling stack's cross-layer-KV topology — the same value
+/// the arch passes to `KvCache::with_shares_kv`, and for every stack but Gemma4
+/// that is the constructor default `false`. It is an input to the policy, not
+/// decoration: on a stack that shares, `Mixed` / `RotK` keep their bf16 K/V
+/// mirror for the consumer layers to read, and promoting in-family would buy a
+/// packed store on top of a mirror that already decodes at model dtype. See
+/// [`boundary_floor`].
+///
 /// Two per-arch filters can cancel the promotion independently of this
 /// function: a windowed layer runs the bf16 rotating ring regardless of the
-/// flag, and a shared-KV layer (Gemma4 `num_kv_shared_layers`) owns no cache
-/// to promote. Per-arch counts and the measured byte ratios are in
-/// `docs/KV_QUANT.md` §Layer-adaptive overrides.
+/// flag, and a shared-KV *consumer* layer (Gemma4 `num_kv_shared_layers`) owns
+/// no cache to promote. Note that the second cancels nothing on the Gemma4
+/// checkpoints whose `num_kv_shared_layers` is 0 — every layer owns a cache
+/// there while `shares_kv` is still true for the stack, which is exactly the
+/// case the argument above exists for. Per-arch counts and the measured byte
+/// ratios are in `docs/KV_QUANT.md` §Layer-adaptive overrides.
 ///
 /// When `head_n == 0` and `tail_n == 0`, `base_quant` is always returned.
 pub fn kv_quant_for_layer(
@@ -159,11 +187,12 @@ pub fn kv_quant_for_layer(
     base_quant: KvQuant,
     tail_n: usize,
     head_n: usize,
+    shares_kv: bool,
 ) -> KvQuant {
     let is_tail = tail_n > 0 && layer_idx >= n_layers.saturating_sub(tail_n);
     let is_head = head_n > 0 && layer_idx < head_n;
     if (is_tail || is_head) && !base_is_unquantized(base_quant) {
-        boundary_floor(base_quant)
+        boundary_floor(base_quant, shares_kv)
     } else {
         base_quant
     }
@@ -171,12 +200,29 @@ pub fn kv_quant_for_layer(
 
 /// The codec a boundary layer is promoted to, for a base that quantizes.
 ///
-/// The promotion is an **8-bit floor**, not a codec switch. A base whose widths
-/// are parameters carries its own 8-bit form, so the floor is applied inside
-/// its family: same store, same group geometry, same K rotation, both axes
-/// raised to 8 bits. A base whose width is baked into its variant has no such
-/// form to raise to and falls back to [`KvQuant::K8V8`], which is what every
-/// base used to get.
+/// The promotion is a **quality floor at 8 bits**, not a codec switch. A base
+/// whose widths are parameters carries its own 8-bit form, so the floor is
+/// applied inside its family: same store, same group geometry, same K rotation,
+/// both axes raised to 8 bits. A base whose width is baked into its variant has
+/// no such form to raise to and falls back to [`KvQuant::K8V8`], which is what
+/// every base used to get.
+///
+/// # The mirror is a floor of its own
+///
+/// `shares_kv` decides whether the in-family target is reachable at all. On a
+/// cross-layer-KV stack the `Mixed` / `RotK` bf16 K/V mirror is what the
+/// consumer layers read, so it survives the promotion — and a layer then holds
+/// the packed store *plus* two full bf16 buffers. That is 24.50 bits per value
+/// at group 64 against `K8V8`'s 16.00, while dropping the layer's own decode
+/// from bf16 to 8-bit affine: more bytes and less precision, the inverse of
+/// the promotion on both axes. The final arm therefore diverts any target that
+/// still mirrors both axes back to `K8V8`, whose two mirrors *are* the layer's
+/// numerics and are above any 8-bit floor.
+///
+/// The divert reads the target's own `feeds_bf16_*` predicates rather than
+/// naming variants, so it is decided by the codec's decode disposition and
+/// stays correct for a codec added later. For every non-parametric base the
+/// target is already `K8V8` and the arm is an identity.
 ///
 /// # Why the family has to be kept
 ///
@@ -193,7 +239,24 @@ pub fn kv_quant_for_layer(
 /// The parametric families read their own store at decode
 /// (`KvQuant::decode_reads_packed_store` is true for `Mixed` and `RotK`), so
 /// raising them in-family delivers the floor from bytes the layer already
-/// spends: 8.50 bits per value at group 64, against the 16.00 of the fallback.
+/// spends: 8.50 bits per value at group 64, against the 16.00 of the fallback —
+/// **on a stack that does not share K/V**; see the mirror section above for the
+/// one that does.
+///
+/// # What the fallback still costs
+///
+/// "From bytes the layer already spends" is a property of the two parametric
+/// families and of no other base. Ten codecs materialise a packed store and
+/// eight of them take the `K8V8` fallback, so for those eight the floor is paid
+/// for, not free — and the price splits by side store. The `SideStore::IsoRing`
+/// four (`Iso{3,4}Sym`, `IsoKOnly{3,4}`) sit at 12.125 bits per value, so
+/// `K8V8`'s 16.00 is a 1.32x byte regression on their boundary layers, bought
+/// deliberately: an SO(4)-rotated 3-/4-bit ring has no 8-bit form, and the
+/// alternative to paying for the floor is not having one. The
+/// `SideStore::Rotor` four (`Rotor{3,4}Sym`, `RotorKOnly{3,4}`) are at 16.25,
+/// already above bf16, so their boundary layers are byte-neutral to favourable.
+/// Neither group is diverted by the arm below — they do not mirror both axes —
+/// and the trade is recorded in `docs/KV_QUANT.md` §Layer-adaptive overrides.
 ///
 /// # Totality
 ///
@@ -205,13 +268,18 @@ pub fn kv_quant_for_layer(
 /// validator accepts.
 ///
 /// The match is **exhaustive on purpose** (no wildcard), same reasoning as the
-/// decode predicates on [`KvQuant`]: a new variant that carries its widths as
-/// parameters must state its own 8-bit form here rather than silently
-/// inheriting the `K8V8` fallback, which would put it back on two bf16 mirrors.
-fn boundary_floor(base_quant: KvQuant) -> KvQuant {
+/// decode predicates on [`KvQuant`]: a new variant has to be *listed* here
+/// before the crate compiles. Listing is not deciding, though — a new
+/// parametric variant added to the fallback arm compiles cleanly and inherits
+/// `K8V8`. What catches that is
+/// `parametric_boundary_promotion_stays_under_bf16`, which sweeps every base in
+/// `ALL_KV_QUANTS` that materialises a packed store, names the eight that take
+/// the fallback deliberately, and fails on any other store-bearing base that
+/// lands there.
+fn boundary_floor(base_quant: KvQuant, shares_kv: bool) -> KvQuant {
     /// The width the boundary promotion floors both axes to.
     const FLOOR_BITS: u8 = 8;
-    match base_quant {
+    let target = match base_quant {
         KvQuant::Mixed {
             k_bits,
             v_bits,
@@ -263,6 +331,17 @@ fn boundary_floor(base_quant: KvQuant) -> KvQuant {
         // layer below the floor on K. It takes the fallback.
         | KvQuant::RotorK3Asym { .. }
         | KvQuant::RotorK4Asym { .. } => KvQuant::K8V8,
+    };
+    // A target that still reads a bf16 mirror on *both* axes decodes at model
+    // dtype whatever its packed store holds, so the store buys no floor and is
+    // charged on top of the mirrors. `K8V8` is those same two mirrors without
+    // the store: fewer bytes and, being bf16, above any 8-bit floor. Read off
+    // the target's own decode predicates rather than a variant list, so a codec
+    // whose mirror survives promotion is diverted here without being named.
+    if target.feeds_bf16_k_at_decode(shares_kv) && target.feeds_bf16_v_at_decode(shares_kv) {
+        KvQuant::K8V8
+    } else {
+        target
     }
 }
 
@@ -280,15 +359,25 @@ fn boundary_floor(base_quant: KvQuant) -> KvQuant {
 /// `scripts/check_kv_layer_quants.sh` (in `make ci`) keeps it that way by
 /// failing on a direct [`kv_quant_for_layer`] call outside this module.
 ///
+/// `shares_kv` is the stack's cross-layer-KV topology and must be the value the
+/// arch passes to `KvCache::with_shares_kv` — Gemma4's
+/// `SHARES_KV_ACROSS_LAYERS`, the constructor default `false` everywhere else.
+/// It changes the vector's contents (see [`boundary_floor`]), so a caller that
+/// seeds the prompt cache or salts an SSD layout key must pass the same value
+/// the caller that builds the caches passed, or the key describes a mixture
+/// nothing runs.
+///
 /// **Nominal, not effective.** Two per-arch filters can make an entry a no-op
 /// on the built cache and are deliberately *not* folded in here, because they
-/// are properties of the layer's geometry rather than of the codec policy: a
+/// are properties of one layer's geometry rather than of the codec policy: a
 /// windowed layer runs the bf16 rotating ring whatever codec it is handed, and
-/// a shared-KV layer (Gemma4 `num_kv_shared_layers`) owns no cache at all. A
+/// a shared-KV *consumer* layer (Gemma4 `num_kv_shared_layers`) owns no cache
+/// at all. `shares_kv` is not one of those — it is a whole-stack property that
+/// changes which codec the policy picks, not whether the picked one is used. A
 /// consumer that needs the effective codec of a *built* cache must read the
 /// cache, not this vector.
 #[must_use]
-pub fn kv_layer_quants(n_layers: usize, base: KvQuant) -> Vec<KvQuant> {
+pub fn kv_layer_quants(n_layers: usize, base: KvQuant, shares_kv: bool) -> Vec<KvQuant> {
     (0..n_layers)
         .map(|i| {
             kv_quant_for_layer(
@@ -297,6 +386,7 @@ pub fn kv_layer_quants(n_layers: usize, base: KvQuant) -> Vec<KvQuant> {
                 base,
                 LAYER_ADAPTIVE_TAIL_N,
                 LAYER_ADAPTIVE_HEAD_N,
+                shares_kv,
             )
         })
         .collect()

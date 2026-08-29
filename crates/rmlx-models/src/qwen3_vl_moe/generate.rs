@@ -321,11 +321,11 @@ pub fn generate_greedy(
                     // + KV codec so a slot stored under a different codec / layout
                     // never cross-serves. Identical to the consume() seed, so
                     // find_best_prefix matches what is stored here.
-                    let lk = active_layout_key();
                     let seed = crate::prompt_cache::request_cache_seed(
-                        lk,
+                        active_layout_key(),
                         kv_quant,
                         n_layers,
+                        super::SHARES_KV_ACROSS_LAYERS,
                         model.model_sig,
                     );
                     let block_hashes = chained_block_hashes_seeded(prompt_ids, seed);

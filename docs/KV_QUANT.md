@@ -162,7 +162,10 @@ Two properties of that saving matter to a reader sizing a cache:
   a mirror-family codec that keeps its mirror regardless, only 26/36 of the
   bf16 mirror was ever available to elide. `boundary_floor` now raises a
   parametric base inside its own family, so a promoted `Mixed` / `RotK` layer
-  is still `Mixed` / `RotK` and the elision reaches all 36. See
+  is still `Mixed` / `RotK` and the elision reaches all 36 — **on a stack that
+  has an elision to reach.** This whole saving is the mirror-free case; a
+  shared-KV stack keeps both mirrors on every `Mixed` / `RotK` layer, boundary
+  or not, and the promotion there stays on `K8V8`. See
   § "Which codec the floor is".
 
 For the **bf16-mirror family** (`K8V4`, `K8V8`, `Planar*`, `PlanarK`,
@@ -1831,16 +1834,105 @@ the first 2 layers at every prompt size.
 When the base mode is already at the floor on both axes, both overrides are
 no-ops.
 
+**What those two sweeps actually measured, and what they do not cover.** Both
+the N70 tail experiment and the "q8_0 on the first 2 layers" head sweep were run
+when the promotion target was `K8V8` for every base. `K8V8` materialises no
+packed store — its decode reads the bf16 mirror on both axes — so the treatment
+in those sweeps was a **bf16 boundary layer**, not a q8_0 one. The 37–91%
+recovery figure is therefore evidence for *how many* layers the exemption should
+span; it is not a quality measurement of an 8-bit boundary layer, because no
+8-bit boundary layer existed when it was taken. The counts are carried over
+unchanged and the in-family 8-bit target's quality has **not** been re-derived
+to that standard: what is recorded for it below is bytes, TPS, and token-id
+identity on four cells, which is a byte result and a coincidence-of-prompt
+observation, not a perplexity or long-context quality number. Read the section
+below with that boundary in mind, and do not cite the 37–91% as support for the
+8-bit floor.
+
 ### Which codec the floor is
 
 `boundary_floor` picks the target, and it is **not** unconditionally `K8V8`:
 
-* a base whose widths are **parameters** (`Mixed`, `RotK`) is raised inside its
-  own family — same store, same group geometry, same K rotation, both axes at
-  8 bits (`mixed_k8g64_v4g64` → `mixed_k8g64_v8g64`, `rot_k_v4g64` →
-  `rot_k_v8g64`);
+* a base whose widths are **parameters** (`Mixed`, `RotK`), **on a stack that
+  does not share K/V across layers**, is raised inside its own family — same
+  store, same group geometry, same K rotation, both axes at 8 bits
+  (`mixed_k8g64_v4g64` → `mixed_k8g64_v8g64`, `rot_k_v4g64` → `rot_k_v8g64`);
 * every other quantizing base has no 8-bit form of its own family and falls
   back to `K8V8`, which is what all of them used to get.
+
+**The cross-layer-KV stack takes the fallback.** `Mixed` / `RotK` are the only
+codecs whose `feeds_bf16_{k,v}_at_decode` consult `shares_kv`: on a stack whose
+layers read each other's K/V the bf16 mirror *is* the share, so it survives the
+promotion. An in-family target there would hold the packed store **on top of**
+both mirrors — 8.50 + 16.00 = **24.50** bits per value at group 64 against
+`K8V8`'s 16.00, a 1.53× byte regression — while dropping the layer's own decode
+from bf16 to 8-bit affine. More bytes and less precision: the inverse of the
+promotion on both axes. `boundary_floor` reads the target's own mirror
+predicates and diverts it to `K8V8`, whose two mirrors are the layer's numerics
+and are above any 8-bit floor.
+
+This is reachable, and it is not the shared-KV *consumer*-layer filter. Gemma4
+sets `SHARES_KV_ACROSS_LAYERS = true` for the whole stack, but
+`gemma-4-12B`, `gemma-4-26b-a4b`, `gemma-4-31b` and `z-lab__gemma-4-31B-it-PARO`
+all declare `num_kv_shared_layers = 0`, so every layer owns a cache and none is
+stood down by that filter. Each of those snapshots has exactly two
+`full_attention` layers inside the tail-8 window (12B: 41, 47; 26b: 23, 29;
+31b: 53, 59) — the head-2 layers are `sliding_attention` on all of them and run
+the bf16 rotating ring regardless. Those two layers per model are what the
+divert protects. `gemma-4-e2b` / `e4b` cancel the promotion for a different
+reason (`num_kv_shared_layers` 20 and 18 — every tail layer is a shared
+consumer), which is why a `gemma4-e2b`-only proof shows none of this.
+
+`store_bearing_boundary_promotion_never_costs_more` sweeps both topologies and
+asserts the boundary layer never costs more than the `K8V8` it replaces; it goes
+red on the shared-KV arm without the divert (25 690 112 B against bf16's
+16 777 216 B at seq 4096, `head_dim` 128, 8 KV heads).
+
+Measured end to end on `mlx-community__gemma-4-12B-it-mxfp8`, `--kv-quant
+mixed_k8g64_v4g64`, `longctx_4k` (4 121 prompt tokens) + 64 generated, two
+binaries differing only in this arm:
+
+| arm | `kv_cache_bytes` | decode TPS | digest |
+|---|---:|---:|---|
+| in-family always (no divert) | 435 469 312 | 34.970 (34.953–34.988) | `0x05a336f78c1ba5e4` |
+| divert to `K8V8` (shipped) | 425 944 960 | 33.851 (33.759–33.943) | `0x05a336f78c1ba5e4` |
+
+The 9 524 352 B difference is exactly the two boundary `full_attention` layers'
+packed store at its allocated capacity: `2 * 2 * (kv_h * head_dim = 512) *
+(1 + 4/64) * (4121 + 256) = 9 524 352`, to the byte. The divert costs ~3.2%
+decode TPS at this cell — an 8-bit SDPA over a store is cheaper per step than a
+bf16 SDPA over a mirror — and that is the trade being made deliberately:
+`boundary_floor` exists to hold *quality* on the layers where the base codec's
+loss costs most, so paying 2.2% of the cache to run those two layers at bf16 is
+the policy working, not a cost it failed to notice. A caller who wants the TPS
+instead wants a different base codec, not a boundary layer quantized below the
+floor. The TPS figure is two runs at one context and should be read as a sign,
+not a magnitude.
+
+Note the digest is unchanged across the two arms here: a 64-token greedy
+continuation on this prompt does not diverge over two of 48 layers. That is a
+property of this cell, not evidence that the arms are numerically equal — they
+are not.
+
+**Eight store-bearing codecs pay for the floor rather than getting it free.**
+"Delivered from bytes the layer already spends" is a property of `Mixed` and
+`RotK` and of no other base. Ten codecs materialise a packed store; eight of
+them take the `K8V8` fallback, and for those the floor has a price that splits
+by side store:
+
+| Fallback group | `SideStore` | bits/value | `K8V8` at 16.00 |
+|---|---|---:|---|
+| `iso3_sym`, `iso4_sym`, `k_iso3`, `k_iso4` | `IsoRing` | 12.125 | **1.32× byte regression** |
+| `rotor3_sym`, `rotor4_sym`, `k_rotor3`, `k_rotor4` | `Rotor` | 16.25 | neutral to favourable |
+
+Leaving all eight on the fallback is deliberate: an SO(4)-rotated or rotor
+3-/4-bit ring has no 8-bit form of its own, so the alternative to paying for the
+floor on the iso four is not having one on those layers at all — 10 of 36 layers
+at 1.32× is the price of the fidelity the boundary promotion exists to buy. The
+rotor four are already above bf16, so their boundary layers cost nothing extra.
+The gate names all eight explicitly rather than filtering by variant kind, so a
+new store-bearing codec dropped into the fallback arm fails there instead of
+inheriting this exemption.
 
 The split exists because **`K8V8` is not an 8-bit layer.** It does not
 materialise a packed store (`materialises_packed_store()` is false: its decode
@@ -1906,6 +1998,18 @@ C = P + 256 * ceil(G / 256)                  MixedKvState grows in STEP = 256 ro
 purpose: `KvCache::resident_bytes` reports a mirror by its filled prefix
 (the allocation is ceiling-sized) and asks a store for its own total, and
 `MixedKvState::byte_size` answers with the whole allocated array.
+
+**Name the cost of that split.** It is pre-existing, but this change moves 10 of
+36 layers from the filled-counted side to the capacity-counted side, so it now
+dominates a `Mixed` stack's report rather than a quarter of it. Consequence for
+a reader: **a reported `kv_cache_bytes` is not comparable across codecs at
+constant capacity slack.** A codec whose layers are filled-counted reports the
+prefix; one whose layers are capacity-counted reports `C = P + 256 * ceil(G/256)`
+including up to 255 unfilled rows. Comparing the two at a short generation
+charges the second for slack the first hides. The `STEP = 256` paragraph below
+quantifies it for this codec (3.18% at 4k, 0.40% at 32k); the general rule is to
+compare bits per value at a fixed `(P, G)`, never one raw byte count against
+another.
 
 Reproduced to the byte on three geometries at `--max-tokens 128`:
 
@@ -2052,7 +2156,16 @@ measured against that older arm and is not re-derivable now.
 
 Recording the effective per-layer mixture alongside `kv_bytes` was considered
 and not done: it is summed at 14 per-arch call sites, and with `none` meaning
-none the requested codec is simply a true label for the row.
+none the requested codec was a true label for the row.
+
+That last clause no longer holds and the decision is now a known gap. While the
+promotion target was `K8V8` regardless of base, "requested `mixed_k8g64_v4g64`"
+named a row whose boundary layers were the same codec for every requester. The
+promoted codec is now a function of the base's own parameters *and* of the
+stack's `shares_kv`, so two rows with the same requested label can hold two
+different mixtures. Recording the mixture's fold (as the SSD `layout_key` and
+the prompt-cache seed already do) is the fix if a row ever has to be compared
+across a policy change.
 
 ---
 

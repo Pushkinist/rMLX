@@ -56,3 +56,14 @@ pub use vision::{
     build_inputs_embeds, load_vision_tower, Gemma3ImageProcessor, Gemma3PixelValues,
     MultiModalProjector, VisionModel, BOI_TOKEN_ID, EOI_TOKEN_ID, IMAGE_TOKEN_ID,
 };
+
+/// Gemma3's decoder layers each project their own K/V — no cross-layer-KV
+/// topology. This is the single producer of that fact for this arch: it is what
+/// [`crate::kv_cache::kv_layer_quants`] resolves the boundary-layer codec
+/// against, what the prompt-cache seed folds, and what
+/// `Architecture::shares_kv_across_layers` reports. It is `false`, which is also
+/// `KvCache`'s constructor default, but it is named rather than spelled at each
+/// site because the value now selects a codec: a boundary layer of a `Mixed` /
+/// `RotK` base is promoted in-family only on a stack that keeps no bf16 mirror,
+/// so a flipped literal would change decoded output, not just residency.
+pub(crate) const SHARES_KV_ACROSS_LAYERS: bool = false;

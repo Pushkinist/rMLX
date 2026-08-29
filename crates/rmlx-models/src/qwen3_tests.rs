@@ -484,7 +484,7 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
     // ── Step 2: Build a real KV snapshot for the full block-aligned prompt ──
     let full_kv_caches = {
         use crate::kv_cache::kv_layer_quants;
-        let mut kv_caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
+        let mut kv_caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant, false)
             .into_iter()
             .enumerate()
             .map(|(i, q)| KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i))
@@ -528,6 +528,7 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
                     0,
                     kv_quant,
                     model.cfg.num_hidden_layers,
+                    SHARES_KV_ACROSS_LAYERS,
                     model.model_sig,
                 ),
             );
@@ -784,7 +785,7 @@ fn qwen3_consume_engine_migration_golden() {
     // equal-length case must drop it to Miss → WARM == COLD (never replay 0). ──
     let full_kv_caches = {
         use crate::kv_cache::kv_layer_quants;
-        let mut kv_caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
+        let mut kv_caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant, false)
             .into_iter()
             .enumerate()
             .map(|(i, q)| KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i))
@@ -825,6 +826,7 @@ fn qwen3_consume_engine_migration_golden() {
                     0,
                     kv_quant,
                     model.cfg.num_hidden_layers,
+                    SHARES_KV_ACROSS_LAYERS,
                     model.model_sig,
                 ),
             );

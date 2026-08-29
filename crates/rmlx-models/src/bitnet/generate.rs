@@ -191,11 +191,12 @@ pub fn generate_greedy(
     let max_seq = max_ctx_override.unwrap_or(KV_MAX_SEQ_DEFAULT);
 
     let n_layers = model.cfg.num_hidden_layers;
-    let mut caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
-        .into_iter()
-        .enumerate()
-        .map(|(i, q)| KvCache::with_quant_max_seq_window(q, max_seq, None).with_layer_idx(i))
-        .collect();
+    let mut caches: Vec<KvCache> =
+        kv_layer_quants(n_layers, kv_quant, crate::bitnet::SHARES_KV_ACROSS_LAYERS)
+            .into_iter()
+            .enumerate()
+            .map(|(i, q)| KvCache::with_quant_max_seq_window(q, max_seq, None).with_layer_idx(i))
+            .collect();
 
     // Prefill in chunks.
     let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("bitnet");
@@ -386,6 +387,7 @@ pub fn generate_greedy(
                             lk,
                             kv_quant,
                             model.cfg.num_hidden_layers,
+                            crate::bitnet::SHARES_KV_ACROSS_LAYERS,
                             model.model_sig,
                         ),
                     );

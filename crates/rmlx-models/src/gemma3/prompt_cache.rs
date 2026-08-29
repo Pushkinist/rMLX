@@ -242,8 +242,11 @@ impl SsdHydrate<Gemma3Entry> for SsdHydrator {
 /// gemma3's ring / SWA-mask differs from gemma4, so the prefix-reuse path is not
 /// wired here — the only reuse is a RAM Exact hit (full `deep_clone`, SWA ring
 /// included). Promotion to `Partial` is a separate follow-up.
-pub(crate) static PROMPT_CACHE: ArchPromptCache<Gemma3Entry> =
-    ArchPromptCache::new("Gemma3ForConditionalGeneration", ReusePolicy::ExactOnly);
+pub(crate) static PROMPT_CACHE: ArchPromptCache<Gemma3Entry> = ArchPromptCache::new(
+    "Gemma3ForConditionalGeneration",
+    ReusePolicy::ExactOnly,
+    crate::gemma3::SHARES_KV_ACROSS_LAYERS,
+);
 
 /// active SSD-tier `layout_key` for the gemma3 cache, or `0` when the tier is
 /// OFF. `FNV_OFFSET ^ 0 == FNV_OFFSET` ⇒ legacy un-salted digests when no SSD

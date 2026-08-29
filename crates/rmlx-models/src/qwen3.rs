@@ -197,8 +197,22 @@ impl PromptCacheEntry for Qwen3Entry {
 /// keeping a single `Some(_) => Miss` arm is simpler than the SWA-style
 /// partial path. The hard runtime gate enforces "no partial reuse" without a
 /// comment.
-pub(crate) static QWEN3_PROMPT_CACHE: ArchPromptCache<Qwen3Entry> =
-    ArchPromptCache::new("Qwen3ForCausalLM", ReusePolicy::ExactOnly);
+pub(crate) static QWEN3_PROMPT_CACHE: ArchPromptCache<Qwen3Entry> = ArchPromptCache::new(
+    "Qwen3ForCausalLM",
+    ReusePolicy::ExactOnly,
+    SHARES_KV_ACROSS_LAYERS,
+);
+
+/// Qwen3 (dense)'s decoder layers each project their own K/V — no cross-layer-KV
+/// topology. This is the single producer of that fact for this arch: it is what
+/// [`crate::kv_cache::kv_layer_quants`] resolves the boundary-layer codec
+/// against, what the prompt-cache seed folds, and what
+/// `Architecture::shares_kv_across_layers` reports. It is `false`, which is also
+/// `KvCache`'s constructor default, but it is named rather than spelled at each
+/// site because the value now selects a codec: a boundary layer of a `Mixed` /
+/// `RotK` base is promoted in-family only on a stack that keeps no bf16 mirror,
+/// so a flipped literal would change decoded output, not just residency.
+pub(crate) const SHARES_KV_ACROSS_LAYERS: bool = false;
 
 /// active SSD-tier `layout_key` for the qwen3 dense cache, or `0` when
 /// the tier is OFF. `FNV_OFFSET ^ 0 == FNV_OFFSET` ⇒ legacy un-salted digests
@@ -2011,7 +2025,7 @@ pub fn generate_greedy<'a>(
     // Allocate one KvCache per decoder layer using the selected quant mode.
     // Force K8V8 for boundary layers (first head_n + last tail_n).
     let n_layers = model.cfg.num_hidden_layers;
-    let mut caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
+    let mut caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant, SHARES_KV_ACROSS_LAYERS)
         .into_iter()
         .enumerate()
         .map(|(i, q)| {
@@ -2175,6 +2189,7 @@ pub fn generate_greedy<'a>(
                             lk,
                             kv_quant,
                             model.cfg.num_hidden_layers,
+                            SHARES_KV_ACROSS_LAYERS,
                             model.model_sig,
                         ),
                     );

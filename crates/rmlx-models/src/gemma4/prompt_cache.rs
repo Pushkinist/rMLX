@@ -341,8 +341,11 @@ impl SsdHydrate<Gemma4Entry> for SsdHydrator {
 /// Gemma4 uses [`ReusePolicy::Partial`] — block-aligned partial-prefix reuse
 /// is correct under the SWA `can_truncate_to_block` gate; the B1 strict-prefix
 /// path (`is_strict_prefix_of`) is also taken via the generate-loop match.
-pub(crate) static PROMPT_CACHE: ArchPromptCache<Gemma4Entry> =
-    ArchPromptCache::new("Gemma4ForConditionalGeneration", ReusePolicy::Partial);
+pub(crate) static PROMPT_CACHE: ArchPromptCache<Gemma4Entry> = ArchPromptCache::new(
+    "Gemma4ForConditionalGeneration",
+    ReusePolicy::Partial,
+    crate::gemma4::SHARES_KV_ACROSS_LAYERS,
+);
 
 /// the active `layout_key` for SSD tier seeding, or `0` when the tier
 /// is OFF. See [`ArchPromptCache::active_layout_key`].

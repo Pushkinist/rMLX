@@ -450,6 +450,10 @@ impl ArchGenerator {
             n_layers,
             n_kv_heads,
             head_dim,
+            // Same accessor the speculative verifier stacks pass to
+            // `KvCache::with_shares_kv`: it selects the boundary-layer codec,
+            // so the key has to be salted with the mixture the caches run.
+            model.shares_kv_across_layers(),
             device,
         );
 

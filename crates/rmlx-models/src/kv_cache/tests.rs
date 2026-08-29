@@ -495,7 +495,7 @@ mod tests {
         let n = 40;
         let base = KvQuant::K8V4;
         for i in 2..32 {
-            let q = kv_quant_for_layer(i, n, base, 8, 2);
+            let q = kv_quant_for_layer(i, n, base, 8, 2, false);
             assert_eq!(q, base, "middle layer {i} should return base quant");
         }
     }
@@ -506,7 +506,7 @@ mod tests {
         let n = 40;
         let base = KvQuant::K8V4;
         for i in 32..40 {
-            let q = kv_quant_for_layer(i, n, base, 8, 0);
+            let q = kv_quant_for_layer(i, n, base, 8, 0, false);
             assert_eq!(q, KvQuant::K8V8, "tail layer {i} should be K8V8");
         }
     }
@@ -517,12 +517,12 @@ mod tests {
         let n = 40;
         let base = KvQuant::K8V4;
         for i in 0..2 {
-            let q = kv_quant_for_layer(i, n, base, 0, 2);
+            let q = kv_quant_for_layer(i, n, base, 0, 2, false);
             assert_eq!(q, KvQuant::K8V8, "head layer {i} should be K8V8");
         }
         // Layer 2 is not a head layer.
         assert_eq!(
-            kv_quant_for_layer(2, n, base, 0, 2),
+            kv_quant_for_layer(2, n, base, 0, 2, false),
             base,
             "layer 2 should not be overridden"
         );
@@ -534,7 +534,7 @@ mod tests {
         let n = 10;
         let base = KvQuant::Planar;
         for i in 0..n {
-            let q = kv_quant_for_layer(i, n, base, 0, 0);
+            let q = kv_quant_for_layer(i, n, base, 0, 0, false);
             assert_eq!(q, base, "zero tail+head should not override layer {i}");
         }
     }
@@ -545,7 +545,14 @@ mod tests {
         let n = 10;
         let base = KvQuant::K8V8;
         for i in 0..n {
-            let q = kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N);
+            let q = kv_quant_for_layer(
+                i,
+                n,
+                base,
+                LAYER_ADAPTIVE_TAIL_N,
+                LAYER_ADAPTIVE_HEAD_N,
+                false,
+            );
             assert_eq!(q, KvQuant::K8V8, "K8V8 base should stay K8V8 at layer {i}");
         }
     }
@@ -564,7 +571,14 @@ mod tests {
         let base = KvQuant::None;
         let promoted: Vec<usize> = (0..n)
             .filter(|&i| {
-                kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N) != base
+                kv_quant_for_layer(
+                    i,
+                    n,
+                    base,
+                    LAYER_ADAPTIVE_TAIL_N,
+                    LAYER_ADAPTIVE_HEAD_N,
+                    false,
+                ) != base
             })
             .collect();
         assert!(
@@ -635,31 +649,93 @@ mod tests {
                 v_group_size: 64,
             },
         ];
+        // The width a side actually decodes at. `approx_code_bits` reports what
+        // the codebook quantizes to, which for a side whose decode reads the
+        // bf16 mirror is not what reaches the kernel — `planar_k` codes K at 4
+        // bits and decodes it at model dtype. Reading the mirror predicates
+        // first is what keeps this test from calling a bf16 side "8-bit".
+        let effective = |q: KvQuant, shares_kv: bool| -> (u32, u32) {
+            let (k, v) = q.approx_code_bits();
+            (
+                if q.feeds_bf16_k_at_decode(shares_kv) {
+                    16
+                } else {
+                    k
+                },
+                if q.feeds_bf16_v_at_decode(shares_kv) {
+                    16
+                } else {
+                    v
+                },
+            )
+        };
         let n = 36;
-        for &base in quantizing {
-            for i in [0, 1, 28, 35] {
-                let promoted =
-                    kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N);
-                let (k_bits, v_bits) = promoted.approx_code_bits();
-                assert!(
-                    k_bits >= 8 && v_bits >= 8,
-                    "boundary layer {i} of quantizing base {base} must be promoted to the \
-                     8-bit floor, got {promoted} ({k_bits}, {v_bits})"
+        for shares_kv in [false, true] {
+            for &base in quantizing {
+                let (base_k, base_v) = effective(base, shares_kv);
+                for i in [0, 1, 28, 35] {
+                    let promoted = kv_quant_for_layer(
+                        i,
+                        n,
+                        base,
+                        LAYER_ADAPTIVE_TAIL_N,
+                        LAYER_ADAPTIVE_HEAD_N,
+                        shares_kv,
+                    );
+                    let (k_bits, v_bits) = effective(promoted, shares_kv);
+                    // "At or above the floor", not "quantized to 8": a side
+                    // that decodes bf16 reports 16 and satisfies this — an
+                    // `IsoKOnly4` boundary layer does exactly that on V. Which
+                    // target delivers the floor is asserted per family by
+                    // `kv_quant_for_layer_promotion_target_per_family`, and its
+                    // byte consequence by
+                    // `store_bearing_boundary_promotion_never_costs_more`.
+                    assert!(
+                        k_bits >= 8 && v_bits >= 8,
+                        "boundary layer {i} of quantizing base {base} \
+                         (shares_kv={shares_kv}) must decode at or above the 8-bit floor, \
+                         got {promoted} ({k_bits}, {v_bits})"
+                    );
+                    // A floor may only raise a side. Distinct from the check
+                    // above, which a target that raised K to 8 while dropping a
+                    // bf16 V to 8 would still pass.
+                    assert!(
+                        k_bits >= base_k && v_bits >= base_v,
+                        "boundary layer {i} of {base} (shares_kv={shares_kv}) promoted to \
+                         {promoted}, decoding at ({k_bits}, {v_bits}) against the base's \
+                         ({base_k}, {base_v}) — a floor must not lower a side"
+                    );
+                }
+                assert_eq!(
+                    kv_quant_for_layer(
+                        10,
+                        n,
+                        base,
+                        LAYER_ADAPTIVE_TAIL_N,
+                        LAYER_ADAPTIVE_HEAD_N,
+                        shares_kv,
+                    ),
+                    base,
+                    "middle layer of {base} (shares_kv={shares_kv}) must stay on the base codec"
                 );
             }
-            assert_eq!(
-                kv_quant_for_layer(10, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N),
-                base,
-                "middle layer of {base} must stay on the base codec"
-            );
         }
     }
 
-    /// The promotion target, pinned per family.
+    /// The promotion target, pinned per family and per topology.
     ///
-    /// A base whose widths are parameters keeps its family and raises both axes
-    /// to 8 bits; everything else switches to `K8V8`. Companion to the property
-    /// assertion above, which only checks the width.
+    /// Off a stack that keeps no bf16 mirror, a base whose widths are
+    /// parameters keeps its family and raises both axes to 8 bits; everything
+    /// else switches to `K8V8`. On a stack that keeps the mirror there is no
+    /// in-family target — the store would be charged on top of two bf16
+    /// buffers — so every base takes `K8V8`.
+    ///
+    /// Companion to the property assertion above, which only checks the width.
+    /// This is also where the non-trivial parametric rewrites live:
+    /// `ALL_KV_QUANTS` carries a single `RotK`, already at `v_bits: 8`, so the
+    /// sweep in `store_bearing_boundary_promotion_never_costs_more` exercises
+    /// that arm only as a no-op. The `rot_k_v4g64` and `mixed_k4g32_v2g128`
+    /// cases below are the ones that actually move a width.
     #[test]
     fn kv_quant_for_layer_promotion_target_per_family() {
         let n = 36;
@@ -728,51 +804,172 @@ mod tests {
         for &(base, want) in cases {
             for i in [0, 1, 28, 35] {
                 assert_eq!(
-                    kv_quant_for_layer(i, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N),
+                    kv_quant_for_layer(
+                        i,
+                        n,
+                        base,
+                        LAYER_ADAPTIVE_TAIL_N,
+                        LAYER_ADAPTIVE_HEAD_N,
+                        false,
+                    ),
                     want,
-                    "boundary layer {i} of {base}"
+                    "boundary layer {i} of {base} on a stack that keeps no mirror"
+                );
+                assert_eq!(
+                    kv_quant_for_layer(
+                        i,
+                        n,
+                        base,
+                        LAYER_ADAPTIVE_TAIL_N,
+                        LAYER_ADAPTIVE_HEAD_N,
+                        true,
+                    ),
+                    KvQuant::K8V8,
+                    "boundary layer {i} of {base} on a stack that keeps the Mixed/RotK \
+                     mirror must take the fallback: the in-family store would be charged \
+                     on top of two bf16 buffers"
                 );
             }
         }
     }
 
-    /// A parametric base's boundary layer must stay **cheaper than bf16**.
+    /// A boundary layer must never cost more than the `K8V8` it replaces.
     ///
     /// This is the property the promotion target has to have and the one it
-    /// lost: `K8V8` materialises no packed store, so a layer promoted to it
-    /// holds two full bf16 mirrors — byte-identical to `none`, 16 bits per
-    /// value — and the promotion of a codec that stores 6.50 was a 2.46x
-    /// increase, not a floor. Swept over the parametric codecs in
-    /// `ALL_KV_QUANTS` at a full-attention layer shape, using each codec's own
-    /// byte model.
+    /// lost twice over. `K8V8` materialises no packed store, so a layer
+    /// promoted to it holds two full bf16 mirrors — byte-identical to `none`,
+    /// 16 bits per value — and promoting a codec that stores 6.50 there was a
+    /// 2.46x increase, not a floor. Promoting it in-family on a stack that
+    /// *keeps* the mirror is the inverse error: the store is charged on top of
+    /// the two mirrors, 24.50 bits per value, 1.53x the fallback.
+    ///
+    /// Swept over every base in `ALL_KV_QUANTS` that materialises a packed
+    /// store — the population for which the promotion is a byte question at all
+    /// — at both cross-layer-KV topologies, using each codec's own byte model
+    /// at a full-attention layer shape.
+    ///
+    /// Driven off `materialises_packed_store` rather than a variant list, so a
+    /// new store-bearing codec that lands in `boundary_floor`'s fallback arm
+    /// fails here instead of inheriting the exemption. The eight that take that
+    /// arm today are named below and nowhere else.
     #[test]
-    fn parametric_boundary_promotion_stays_under_bf16() {
+    fn store_bearing_boundary_promotion_never_costs_more() {
+        /// Store-bearing bases with no 8-bit form of their own family: an
+        /// SO(4)-rotated or rotor 3-/4-bit ring cannot be widened to 8 without
+        /// leaving the family, so their floor is bought at the fallback rather
+        /// than delivered from bytes they already spend. `SideStore::IsoRing`
+        /// is 12.125 bits per value, so the iso four pay a 1.32x byte
+        /// regression for it; `SideStore::Rotor` is 16.25, above bf16, so the
+        /// rotor four are neutral-to-favourable. Recorded in
+        /// `docs/KV_QUANT.md` §Layer-adaptive overrides.
+        const FALLBACK_BY_DESIGN: &[KvQuant] = &[
+            KvQuant::Iso3Sym,
+            KvQuant::Iso4Sym,
+            KvQuant::IsoKOnly3,
+            KvQuant::IsoKOnly4,
+            KvQuant::Rotor3Sym,
+            KvQuant::Rotor4Sym,
+            KvQuant::RotorKOnly3,
+            KvQuant::RotorKOnly4,
+        ];
         let (seq, head_dim, kv_heads) = (4096_u64, 128_u64, 8_u64);
         let n = 36;
-        let bf16 = KvQuant::None.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, false);
-        let mut seen = 0_usize;
-        for &base in rmlx_kv_quant::ALL_KV_QUANTS {
-            if !matches!(base, KvQuant::Mixed { .. } | KvQuant::RotK { .. }) {
-                continue;
+        let mut store_bearing = 0_usize;
+        let mut named_hit = vec![false; FALLBACK_BY_DESIGN.len()];
+        for shares_kv in [false, true] {
+            // `K8V8` is two bf16 mirrors and nothing else, so this is both the
+            // fallback's cost and plain bf16's.
+            let fallback = KvQuant::K8V8
+                .estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, shares_kv);
+            let mut in_family = 0_usize;
+            for &base in rmlx_kv_quant::ALL_KV_QUANTS {
+                if !base.materialises_packed_store() {
+                    continue;
+                }
+                store_bearing += 1;
+                let promoted = kv_quant_for_layer(
+                    0,
+                    n,
+                    base,
+                    LAYER_ADAPTIVE_TAIL_N,
+                    LAYER_ADAPTIVE_HEAD_N,
+                    shares_kv,
+                );
+                let got =
+                    promoted.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, shares_kv);
+                assert!(
+                    got <= fallback,
+                    "{base} (shares_kv={shares_kv}) promotes to {promoted} at {got} B/layer, \
+                     above the {fallback} B of the K8V8 fallback it replaces"
+                );
+                if promoted == KvQuant::K8V8 {
+                    // Landing on the storeless fallback is a decision, so it has
+                    // to be one of the two recorded ones: a family with no 8-bit
+                    // form, or a target whose bf16 mirror survives the promotion
+                    // and already decodes above the floor.
+                    let mirrors_both = promoted.feeds_bf16_k_at_decode(shares_kv)
+                        && promoted.feeds_bf16_v_at_decode(shares_kv)
+                        && base.feeds_bf16_k_at_decode(shares_kv)
+                        && base.feeds_bf16_v_at_decode(shares_kv);
+                    match FALLBACK_BY_DESIGN
+                        .iter()
+                        .position(|&q| q == base)
+                        .and_then(|i| named_hit.get_mut(i))
+                    {
+                        Some(hit) => *hit = true,
+                        None => assert!(
+                            mirrors_both,
+                            "{base} (shares_kv={shares_kv}) materialises a packed store but \
+                             promotes to the storeless K8V8, and is neither named as a family \
+                             without an 8-bit form nor mirroring both axes at this topology — \
+                             it would hold two bf16 mirrors instead of a floor"
+                        ),
+                    }
+                } else {
+                    in_family += 1;
+                    assert!(
+                        promoted.materialises_packed_store(),
+                        "{base} (shares_kv={shares_kv}) promotes to {promoted}, which builds \
+                         no packed store"
+                    );
+                    assert!(
+                        got < fallback,
+                        "{base} (shares_kv={shares_kv}) promotes in-family to {promoted} at \
+                         {got} B/layer, not under the fallback's {fallback} B — an in-family \
+                         target only pays off when the layer keeps no mirror"
+                    );
+                }
             }
-            seen += 1;
-            let promoted =
-                kv_quant_for_layer(0, n, base, LAYER_ADAPTIVE_TAIL_N, LAYER_ADAPTIVE_HEAD_N);
+            // The topology is what decides whether an in-family target is
+            // reachable: with the mirror retained there is no such target for
+            // any base, and every store-bearing one takes the fallback.
+            if shares_kv {
+                assert_eq!(
+                    in_family, 0,
+                    "a stack that keeps the Mixed/RotK mirror has no in-family target to \
+                     promote to, but {in_family} base(s) were promoted in-family"
+                );
+            } else {
+                assert!(
+                    in_family >= 2,
+                    "expected the parametric bases to promote in-family off a mirror-less \
+                     stack, promoted {in_family}"
+                );
+            }
+        }
+        assert_eq!(
+            store_bearing,
+            2 * 10,
+            "expected ten store-bearing codecs in ALL_KV_QUANTS at each topology, swept \
+             {store_bearing}"
+        );
+        for (named, hit) in FALLBACK_BY_DESIGN.iter().zip(&named_hit) {
             assert!(
-                promoted.materialises_packed_store(),
-                "{base} promotes to {promoted}, which builds no packed store — the \
-                 layer would hold two bf16 mirrors instead of the 8-bit floor"
-            );
-            let got = promoted.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, false);
-            assert!(
-                got < bf16,
-                "{base} promotes to {promoted} at {got} B/layer, not under bf16's {bf16} B"
+                *hit,
+                "{named} is named as a deliberate fallback but never took it — drop it from \
+                 the list"
             );
         }
-        assert!(
-            seen >= 2,
-            "expected the parametric codecs to be listed in ALL_KV_QUANTS, swept {seen}"
-        );
     }
 
     /// Whole-stack byte model for `mixed_k8g64_v4g64` at Qwen3-8B's geometry.
@@ -793,19 +990,19 @@ mod tests {
             k_group_size: 64,
             v_group_size: 64,
         };
-        let total: u64 = kv_layer_quants(n_layers, base)
+        let total: u64 = kv_layer_quants(n_layers, base, false)
             .iter()
             .map(|q| q.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, false))
             .sum();
         // Two axes (K and V) per stored position.
         let values = seq * head_dim * kv_heads * 2 * n_layers as u64;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "byte and value counts are far below f64's exact-integer range"
-        )]
         let bits_per_value = (total * 8) as f64 / values as f64;
-        // 26 layers at the 6.50 codebook width + 10 at the 8.50 floor.
-        let want = (26.0 * 6.50 + 10.0 * 8.50) / 36.0;
+        // The boundary layers at the 8.50 floor, the rest at the 6.50 codebook
+        // width. Derived from the constants rather than restated as 10 and 26,
+        // so moving either one moves the expectation with it.
+        let boundary = (LAYER_ADAPTIVE_HEAD_N + LAYER_ADAPTIVE_TAIL_N) as f64;
+        let interior = n_layers as f64 - boundary;
+        let want = (interior * 6.50 + boundary * 8.50) / n_layers as f64;
         assert!(
             (bits_per_value - want).abs() < 1e-9,
             "delivered {bits_per_value:.4} bits/value, expected {want:.4}"
@@ -845,6 +1042,7 @@ mod tests {
                 KvQuant::None,
                 LAYER_ADAPTIVE_TAIL_N,
                 LAYER_ADAPTIVE_HEAD_N,
+                false,
             );
             let mut cache = KvCache::with_quant_max_seq(q, 4096);
             cache.enter_prefill();
@@ -876,34 +1074,34 @@ mod tests {
         let base = KvQuant::Planar;
         // Head layers become K8V8.
         assert_eq!(
-            kv_quant_for_layer(0, n, base, 8, 2),
+            kv_quant_for_layer(0, n, base, 8, 2, false),
             KvQuant::K8V8,
             "head layer 0"
         );
         assert_eq!(
-            kv_quant_for_layer(1, n, base, 8, 2),
+            kv_quant_for_layer(1, n, base, 8, 2, false),
             KvQuant::K8V8,
             "head layer 1"
         );
         // Middle layers stay Planar.
         assert_eq!(
-            kv_quant_for_layer(2, n, base, 8, 2),
+            kv_quant_for_layer(2, n, base, 8, 2, false),
             KvQuant::Planar,
             "middle layer 2"
         );
         assert_eq!(
-            kv_quant_for_layer(31, n, base, 8, 2),
+            kv_quant_for_layer(31, n, base, 8, 2, false),
             KvQuant::Planar,
             "middle layer 31"
         );
         // Tail layers become K8V8.
         assert_eq!(
-            kv_quant_for_layer(32, n, base, 8, 2),
+            kv_quant_for_layer(32, n, base, 8, 2, false),
             KvQuant::K8V8,
             "tail layer 32"
         );
         assert_eq!(
-            kv_quant_for_layer(39, n, base, 8, 2),
+            kv_quant_for_layer(39, n, base, 8, 2, false),
             KvQuant::K8V8,
             "tail layer 39"
         );

@@ -679,24 +679,26 @@ impl Architecture {
     /// literal here could be flipped on its own, leaving Gemma4's generate path
     /// working while Gemma4 speculative decoding lost the mirror.
     ///
-    /// The `false` arms stay literals. `false` is the `KvCache` constructor
-    /// default (pinned by
-    /// `with_quant_constructors_default_to_no_cross_layer_sharing`), so those
-    /// arms restate a default rather than a per-arch fact; and none of those
-    /// stacks calls `update_and_sdpa_shared_source` at all, so the worst a
-    /// flipped `false` can do is allocate a mirror nothing reads — bounded to
-    /// residency, never to output. A const per non-sharing arch would be seven
-    /// constants spelling the default.
+    /// The non-sharing arms read their own arch's const for the same reason,
+    /// even though every one of them is `false` and `false` is also the
+    /// `KvCache` constructor default (pinned by
+    /// `with_quant_constructors_default_to_no_cross_layer_sharing`). They were
+    /// literals while the value only decided whether a mirror nothing reads got
+    /// allocated — bounded to residency. It now also selects the
+    /// boundary-layer codec (`kv_cache::boundary_floor`), so it reaches decoded
+    /// output, and it is read from three places per arch: the cache-building
+    /// loop, the prompt-cache seed, and here. One const per arch is what keeps
+    /// those three from disagreeing.
     pub fn shares_kv_across_layers(&self) -> bool {
         match self {
             Architecture::Gemma4(_) => crate::gemma4::SHARES_KV_ACROSS_LAYERS,
-            Architecture::Gemma3(_)
-            | Architecture::Qwen2(_)
-            | Architecture::Qwen3(_)
-            | Architecture::Laguna(_)
-            | Architecture::Qwen3_5Moe(_)
-            | Architecture::Qwen3VlMoe(_)
-            | Architecture::BitNet(_) => false,
+            Architecture::Gemma3(_) => crate::gemma3::SHARES_KV_ACROSS_LAYERS,
+            Architecture::Qwen2(_) => crate::qwen2::SHARES_KV_ACROSS_LAYERS,
+            Architecture::Qwen3(_) => crate::qwen3::SHARES_KV_ACROSS_LAYERS,
+            Architecture::Laguna(_) => crate::laguna::SHARES_KV_ACROSS_LAYERS,
+            Architecture::Qwen3_5Moe(_) => crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS,
+            Architecture::Qwen3VlMoe(_) => crate::qwen3_vl_moe::SHARES_KV_ACROSS_LAYERS,
+            Architecture::BitNet(_) => crate::bitnet::SHARES_KV_ACROSS_LAYERS,
         }
     }
 

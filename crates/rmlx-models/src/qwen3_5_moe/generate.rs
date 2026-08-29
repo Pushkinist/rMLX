@@ -412,6 +412,7 @@ pub fn generate_greedy<'a>(
                             lk,
                             kv_quant,
                             model.cfg.num_hidden_layers,
+                            crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS,
                             model.model_sig,
                         ),
                                 ),
@@ -491,15 +492,19 @@ pub fn generate_greedy<'a>(
     let n_layers = model.cfg.num_hidden_layers;
     // Force K8V8 for boundary layers (first head_n + last tail_n)
     // to protect output quality with aggressive V compression (planar/k8v4).
-    let mut kv_caches: Vec<KvCache> = kv_layer_quants(n_layers, kv_quant)
-        .into_iter()
-        .enumerate()
-        .map(|(i, q)| {
-            KvCache::with_quant_max_seq(q, initial_max_seq)
-                .with_max_seq_ceiling(max_seq_ceiling)
-                .with_layer_idx(i)
-        })
-        .collect();
+    let mut kv_caches: Vec<KvCache> = kv_layer_quants(
+        n_layers,
+        kv_quant,
+        crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(i, q)| {
+        KvCache::with_quant_max_seq(q, initial_max_seq)
+            .with_max_seq_ceiling(max_seq_ceiling)
+            .with_layer_idx(i)
+    })
+    .collect();
     let mut lin_caches: Vec<LinearAttnCache> = (0..model.cfg.num_hidden_layers)
         .map(|_| LinearAttnCache::new())
         .collect();
@@ -642,6 +647,7 @@ pub fn generate_greedy<'a>(
                                         lk,
                                         kv_quant,
                                         model.cfg.num_hidden_layers,
+                                        crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS,
                                         model.model_sig,
                                     ),
                                 ),

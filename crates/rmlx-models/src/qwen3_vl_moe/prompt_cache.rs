@@ -189,8 +189,11 @@ impl SsdHydrate<Qwen3VlMoeEntry> for SsdHydrator {
 /// pure-attention with no recurrent state; the dominant workload is the
 /// Exact-hit warm-TTFT, so the single Exact / Miss arm set (no partial reuse) is
 /// the policy — matching Qwen2 / Qwen3 dense.
-pub(crate) static PROMPT_CACHE: ArchPromptCache<Qwen3VlMoeEntry> =
-    ArchPromptCache::new("Qwen3VLMoeForConditionalGeneration", ReusePolicy::ExactOnly);
+pub(crate) static PROMPT_CACHE: ArchPromptCache<Qwen3VlMoeEntry> = ArchPromptCache::new(
+    "Qwen3VLMoeForConditionalGeneration",
+    ReusePolicy::ExactOnly,
+    crate::qwen3_vl_moe::SHARES_KV_ACROSS_LAYERS,
+);
 
 /// active SSD-tier `layout_key` for the qwen3-vl-moe cache, or `0` when the tier
 /// is OFF. `FNV_OFFSET ^ 0 == FNV_OFFSET` ⇒ legacy un-salted digests when no SSD
