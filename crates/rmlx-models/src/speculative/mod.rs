@@ -866,29 +866,29 @@ impl SpeculativeDispatcher {
             // (the last emitted = correction = v_tokens[accept], which is
             // a *prediction* — verifier hasn't actually processed it
             // yet). Trim by (v_k - (accept+1)) = num_draft - accept.
-            let v_offset_before = verifier_caches[0].offset();
+            // `max()` and not `[0]`: on a GDN hybrid the recurrent layers'
+            // KvCache never advances, so layer 0 may sit at 0 while the
+            // full-attention layers carry the round.
+            let v_offset_before = verifier_caches
+                .iter()
+                .map(KvCache::offset)
+                .max()
+                .unwrap_or(0);
             let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
-            for c in &mut verifier_caches {
-                c.truncate_to(v_target);
-            }
-            // GDN rollback (Qwen3.5MoE): the verifier forward advanced its
-            // recurrent state by `v_k` positions; the KV state was just
-            // truncated to `v_target`. On a PARTIAL accept the GDN state is
-            // now ahead of the KV state — restore the pre-round GDN snapshot
-            // and replay the retained `v_input[..kept]` prefix so the GDN
-            // matches the truncated KV exactly. On a FULL accept nothing was
-            // dropped (`v_target == v_offset_before`), so the GDN is already
-            // correct and we skip the replay (and drop the snapshot). No-op
-            // for Gemma4 (verifier_lin is None).
+            // On a PARTIAL accept the KV keeps `v_target` positions and the GDN
+            // recurrent state — which advanced by `v_k` and cannot be sliced —
+            // is rebuilt from the pre-round snapshot by replaying the retained
+            // prefix through the real caches. On a FULL accept nothing was
+            // dropped and the snapshot is discarded.
             if v_target < v_offset_before {
-                let v_pre_round_offset = v_offset_before - v_k as i32;
-                let v_kept = (v_target - v_pre_round_offset).max(0) as usize;
-                restore_and_replay_lin(
+                rollback_round_caches(
                     &self.verifier,
+                    &mut verifier_caches,
                     verifier_lin.as_deref_mut(),
                     verifier_lin_snap,
                     &v_input,
-                    v_kept,
+                    v_offset_before - v_k as i32,
+                    v_target,
                     device,
                 )?;
             } else {
@@ -901,18 +901,13 @@ impl SpeculativeDispatcher {
             // truncate to L_initial + 1 + accept = original_offset_before
             // - num_draft + accept + 1. Per mlx-lm:
             // trim_prompt_cache(draft_cache, max(num_draft - accept - 1, 0))
-            let d_offset_before = draft_caches[0].offset();
+            let d_offset_before = draft_caches.iter().map(KvCache::offset).max().unwrap_or(0);
             let d_drop = (draft_tokens.len() as i32 - accept as i32 - 1).max(0);
             let d_target = d_offset_before - d_drop;
-            for c in &mut draft_caches {
-                c.truncate_to(d_target);
-            }
-            // GDN rollback for the draft (Qwen3.5MoE). Only when the draft KV
-            // actually dropped positions (`d_target < d_offset_before`).
             // `draft_decode_n` fed `d_seed ++ draft_tokens[..num_draft-1]`
-            // (each step's input is the prior step's output; the last output
-            // is never fed back). Replay the retained prefix of that fed
-            // sequence from the pre-round snapshot. No-op for Gemma4.
+            // (each step's input is the prior step's output; the last output is
+            // never fed back), so that is the token sequence the rollback
+            // replays the retained prefix of.
             if d_target < d_offset_before {
                 let mut d_fed: Vec<u32> = Vec::with_capacity(d_seed.len() + draft_tokens.len());
                 d_fed.extend_from_slice(&d_seed);
@@ -920,13 +915,14 @@ impl SpeculativeDispatcher {
                     d_fed.extend_from_slice(&draft_tokens[..draft_tokens.len() - 1]);
                 }
                 let d_pre_round_offset = d_offset_before - d_fed.len() as i32;
-                let d_kept = (d_target - d_pre_round_offset).max(0) as usize;
-                restore_and_replay_lin(
+                rollback_round_caches(
                     &self.draft,
+                    &mut draft_caches,
                     draft_lin.as_deref_mut(),
                     draft_lin_snap,
                     &d_fed,
-                    d_kept,
+                    d_pre_round_offset,
+                    d_target,
                     device,
                 )?;
             } else {
@@ -1301,32 +1297,30 @@ impl SpeculativeDispatcher {
             // prefix + the extra, which the verifier has NOT yet processed as
             // input — `extra` is a prediction). Trim v_k - (accept+1).
             let next_y_token = extra;
-            let v_offset_before = verifier_caches[0].offset();
+            let v_offset_before = verifier_caches
+                .iter()
+                .map(KvCache::offset)
+                .max()
+                .unwrap_or(0);
             let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
-            for c in &mut verifier_caches {
-                c.truncate_to(v_target);
-            }
             if v_target < v_offset_before {
-                let v_pre_round_offset = v_offset_before - v_k as i32;
-                let v_kept = (v_target - v_pre_round_offset).max(0) as usize;
-                restore_and_replay_lin(
+                rollback_round_caches(
                     &self.verifier,
+                    &mut verifier_caches,
                     verifier_lin.as_deref_mut(),
                     verifier_lin_snap,
                     &v_input,
-                    v_kept,
+                    v_offset_before - v_k as i32,
+                    v_target,
                     device,
                 )?;
             } else {
                 drop(verifier_lin_snap);
             }
 
-            let d_offset_before = draft_caches[0].offset();
+            let d_offset_before = draft_caches.iter().map(KvCache::offset).max().unwrap_or(0);
             let d_drop = (draft_tokens.len() as i32 - accept as i32 - 1).max(0);
             let d_target = d_offset_before - d_drop;
-            for c in &mut draft_caches {
-                c.truncate_to(d_target);
-            }
             if d_target < d_offset_before {
                 let mut d_fed: Vec<u32> = Vec::with_capacity(d_seed.len() + draft_tokens.len());
                 d_fed.extend_from_slice(&d_seed);
@@ -1334,13 +1328,14 @@ impl SpeculativeDispatcher {
                     d_fed.extend_from_slice(&draft_tokens[..draft_tokens.len() - 1]);
                 }
                 let d_pre_round_offset = d_offset_before - d_fed.len() as i32;
-                let d_kept = (d_target - d_pre_round_offset).max(0) as usize;
-                restore_and_replay_lin(
+                rollback_round_caches(
                     &self.draft,
+                    &mut draft_caches,
                     draft_lin.as_deref_mut(),
                     draft_lin_snap,
                     &d_fed,
-                    d_kept,
+                    d_pre_round_offset,
+                    d_target,
                     device,
                 )?;
             } else {
@@ -1520,63 +1515,93 @@ fn snapshot_lin(lin: Option<&[LinearAttnCache]>) -> Result<Option<Vec<LinearAttn
     }
 }
 
-/// Roll a per-layer GDN recurrent state back to a `target_offset` after
-/// partial acceptance, by restoring the pre-round `snapshot` and replaying
-/// the kept tokens forward through `arch`.
+/// Roll one speculative round's caches back to `target_offset` after a partial
+/// acceptance — both the full-attention `kv` stack and, when the arch has one,
+/// the GDN recurrent state in `lin`.
 ///
-/// The GDN recurrent state cannot be sliced to an intermediate sequence
-/// position (no sequence axis — see `LinearAttnCache::truncate_to`). The
-/// correct rollback is: restore the snapshot taken before the round (state
-/// at `pre_round_offset`), then re-run the forward over exactly the tokens
-/// the truncated `KvCache` retained — `round_tokens[..kept]` where
-/// `kept = target_offset - pre_round_offset`. This leaves the GDN state
-/// byte-consistent with the KV state at `target_offset`.
+/// `pre_round_offset` is the KV offset before this round's verify forward ran;
+/// `round_tokens` are the tokens that forward consumed, in order, so that
+/// `round_tokens[..target_offset - pre_round_offset]` is exactly the retained
+/// prefix.
 ///
-/// No-op when `lin` is `None` (FullAttention arch) or `kept == 0` (nothing
-/// retained beyond the pre-round state — the snapshot is already correct).
+/// **Full-attention arch** (`lin` empty or absent): every layer's KvCache
+/// carries the whole round, so dropping the rejected tail is the entire
+/// rollback — `kv` is truncated straight to `target_offset`.
 ///
-/// The GDN recurrence depends only on the input tokens and the prior
-/// conv/delta state, NOT on the KvCache RoPE offset (that drives only the FA
-/// layers' rotation + mask, whose K/V output is discarded here). So the
-/// replay runs on a *throwaway* zero-offset `KvCache`: the real, already
-/// correctly-truncated KV state is never touched.
+/// **GDN hybrid**: the recurrent state has no sequence axis (see
+/// `LinearAttnCache::truncate_to`), so it cannot be sliced to an intermediate
+/// position. It is restored from the pre-round `snapshot` and replayed over the
+/// retained prefix instead. That replay runs the WHOLE layer stack, and in this
+/// hybrid the full-attention layers are interleaved between the GDN layers:
+/// their output is the residual a later GDN layer consumes. So the replay must
+/// see the real KV caches at their real sequence offsets — replaying through a
+/// fresh scratch stack makes those FA layers attend a `kept`-token prefix at
+/// positions `0..kept`, and every downstream GDN layer then advances on a wrong
+/// hidden. The rollback therefore truncates `kv` to `pre_round_offset` and
+/// replays into it; the caches land on `target_offset` exactly as the direct
+/// truncation would have, and the GDN state lands byte-consistent with them.
+///
+/// Truncation is guarded by `offset() >= n` because a GDN layer's KvCache never
+/// advances (it stays at 0); truncating it to a positive `n` would leave it
+/// reporting positions it does not hold.
+///
+/// Call this only when the round actually dropped positions
+/// (`target_offset < offset_before`); on a full accept there is nothing to roll
+/// back and the snapshot is simply dropped.
+#[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
-fn restore_and_replay_lin(
+fn rollback_round_caches(
     arch: &Architecture,
+    kv: &mut [KvCache],
     lin: Option<&mut [LinearAttnCache]>,
     snapshot: Option<Vec<LinearAttnCache>>,
     round_tokens: &[u32],
-    kept: usize,
+    pre_round_offset: i32,
+    target_offset: i32,
     device: Device,
 ) -> Result<()> {
-    let (lin, snapshot) = match (lin, snapshot) {
-        (Some(l), Some(s)) => (l, s),
-        // FullAttention arch (Gemma4) — nothing to roll back.
-        _ => return Ok(()),
+    let Some((lin, snapshot)) = lin.zip(snapshot).filter(|(l, _)| !l.is_empty()) else {
+        truncate_kv_to(kv, target_offset);
+        return Ok(());
     };
 
-    // Restore the pre-round recurrent state in every layer.
+    let kept = (target_offset - pre_round_offset).max(0) as usize;
+    if kept > round_tokens.len() {
+        return Err(Error::Model(format!(
+            "rollback_round_caches: retained prefix {kept} exceeds the {} tokens the \
+             round consumed (pre_round_offset={pre_round_offset}, \
+             target_offset={target_offset}) — the caller's offsets do not describe \
+             this round",
+            round_tokens.len(),
+        )));
+    }
+
+    truncate_kv_to(kv, pre_round_offset);
     for (c, snap) in lin.iter_mut().zip(snapshot) {
         c.restore_snapshot(snap);
     }
-
-    if kept == 0 || kept > round_tokens.len() {
-        // kept==0: snapshot already correct. kept>len would be a bug.
+    if kept == 0 {
+        // Nothing retained beyond the pre-round state — the snapshot is
+        // already the answer and the caches are already at `target_offset`.
         return Ok(());
     }
-
-    // Replay the retained tokens through the GDN, advancing the recurrent
-    // state to the truncated KV position. Throwaway zero-offset KV cache.
-    let n_layers = arch.num_hidden_layers();
-    let mut scratch_kv: Vec<KvCache> = (0..n_layers)
-        .map(|_| KvCache::with_quant(KvQuant::None))
-        .collect();
-    let replay = &round_tokens[..kept];
-    let _ = arch.forward_seq_last_k_with_cache(replay, 1, &mut scratch_kv, Some(lin), device)?;
+    let _ = arch.forward_seq_last_k_with_cache(&round_tokens[..kept], 1, kv, Some(lin), device)?;
     Ok(())
+}
+
+/// Truncate every KV cache in `kv` that actually holds `n` or more positions.
+///
+/// A GDN layer's KvCache never advances past 0, so an unguarded truncate would
+/// set it to a positive offset over an empty store.
+fn truncate_kv_to(kv: &mut [KvCache], n: i32) {
+    for c in kv.iter_mut() {
+        if c.offset() >= n {
+            c.truncate_to(n);
+        }
+    }
 }
 
 /// Run `n` greedy decode steps through `model` with persistent `caches`.

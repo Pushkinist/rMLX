@@ -341,11 +341,109 @@ fn shared_source_refuses_a_declared_producer_rebuilt_from_the_store_alone() {
     }
 }
 
+/// The Mixed KV codec both arms of the truncation test run.
+const MIXED_TRUNCATE_QUANT: KvQuant = KvQuant::Mixed {
+    k_bits: 8,
+    v_bits: 4,
+    k_group_size: 64,
+    v_group_size: 64,
+};
+const MIXED_TRUNCATE_KV_H: i32 = 2;
+const MIXED_TRUNCATE_HEAD_DIM: i32 = 64;
+
+/// Position-dependent K/V/Q payload for `[1, MIXED_TRUNCATE_KV_H, seq, D]`,
+/// head-major. Row `s` of head `h` is distinct from every other row, so a
+/// truncation that keeps the wrong rows — or the right count in the wrong
+/// order — changes the attention output.
+fn ramp(seq: i32, base: f32) -> Array {
+    let (kv_h, d) = (MIXED_TRUNCATE_KV_H, MIXED_TRUNCATE_HEAD_DIM);
+    let mut data = Vec::with_capacity((kv_h * seq * d) as usize);
+    for h in 0..kv_h {
+        for s in 0..seq {
+            for i in 0..d {
+                data.push(
+                    base + (h as f32) * 0.5 + (s as f32) * 0.015_625 + (i as f32) * 0.001_953_125,
+                );
+            }
+        }
+    }
+    f32_arr(&data, &[1, kv_h, seq, d])
+}
+
+/// A `Mixed` cross-layer-KV cache holding exactly `seq` prefilled positions.
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn mixed_cache_prefilled(seq: i32, device: Device) -> KvCache {
+    let mut cache = KvCache::with_quant_max_seq(MIXED_TRUNCATE_QUANT, 512).with_shares_kv(true);
+    cache.enter_prefill();
+    cache
+        .update_and_sdpa_shared_source(
+            &ramp(seq, 0.5),
+            &ramp(seq, 0.125),
+            &ramp(seq, 0.25),
+            1.0,
+            "causal",
+            None,
+            device,
+        )
+        .expect("prefill shared source");
+    cache.exit_prefill(device).expect("exit_prefill");
+    assert_eq!(cache.offset(), seq, "prefill must land on `seq` positions");
+    cache
+}
+
+/// One decode step scored against a mask sized from the offset the cache
+/// reports. Returns the attention output as f32.
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible `<[u8; 4]>::try_from` on a 4-byte chunk of an f32 `to_bytes()` slice; the width is fixed by the dtype assertion above it"
+)]
+fn mixed_decode_step(cache: &mut KvCache, device: Device) -> (Vec<f32>, i32) {
+    let kv_len = cache.offset() + 1;
+    let mask_shape = [1_i32, 1, 1, kv_len];
+    let n_mask: usize = mask_shape.iter().map(|&d| d as usize).product();
+    let mask = f32_arr(&vec![0.0_f32; n_mask], &mask_shape);
+    let (out, share) = cache
+        .update_and_sdpa_shared_source(
+            &ramp(1, 0.375),
+            &ramp(1, 0.75),
+            &ramp(1, 0.875),
+            1.0,
+            "array",
+            Some(&mask),
+            device,
+        )
+        .expect(
+            "decode after truncate must attend the kept prefix — a broadcast error here means \
+             the truncate dropped the store the mask was sized for",
+        );
+    out.eval().expect("eval decode output");
+    assert_eq!(
+        out.dtype(),
+        Dtype::F32,
+        "the f32 inputs must produce an f32 output for the comparison below"
+    );
+    let vals: Vec<f32> = out
+        .to_bytes()
+        .expect("to_bytes")
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    (vals, share.kv_len().expect("share kv_len"))
+}
+
 /// A `Mixed` cache keeps its accepted prefix across `truncate_to`.
 ///
 /// `truncate_to` is what a speculative round-loop calls to drop the rejected
 /// tail of a draft block, and what the prompt cache calls to trim a slot. It
-/// must leave the cache holding exactly the `n` positions the caller kept.
+/// must leave the cache holding exactly the `n` positions the caller kept —
+/// those `n`, in that order, and not merely `n` rows of something.
 ///
 /// The Mixed store used to answer it by dropping the whole quant state, while
 /// `KvCache::truncate_to` went on to set `offset = n`. The cache then reported
@@ -357,12 +455,22 @@ fn shared_source_refuses_a_declared_producer_rebuilt_from_the_store_alone() {
 /// * the next **single-token** decode needs no mask, so it silently attends
 ///   the current token alone with no error anywhere.
 ///
-/// The assertion has to reach the **quant store**, not the surfaced share: the
-/// bf16 mirror this path hands to consumer layers is rebuilt from
-/// `KvCache::offset`, so it spans the kept prefix either way and cannot tell
-/// the two behaviours apart. An additive mask sized to the kept prefix does
-/// reach it — that mask is added to the scores the store's own keys produce,
+/// The oracle is a second cache prefilled to exactly `keep` and never
+/// over-filled: after the truncate the two must decode the same next token to
+/// the same output. That reaches the **quant store** and not the surfaced
+/// share — the decode output is `mixed_quantized_sdpa` over the store's own
+/// K/V tuples, whereas the bf16 mirror is rebuilt from `KvCache::offset` and
+/// spans the kept prefix either way. Every prefix row carries a distinct,
+/// position-dependent value, so a store that kept the right *number* of rows
+/// with the wrong contents — or the right rows in the wrong order — moves the
+/// output and fails here. The mask sized to the kept prefix is the second
+/// half of the check: a store that kept nothing cannot broadcast against it,
 /// which is exactly the production failure.
+///
+/// Mutation check: `MixedKvState::truncate_to` reduced to `self.reset()` fails
+/// on the mask broadcast; reduced to a no-op (leave `offset` alone) it fails
+/// the output comparison, because the step then lands at row `prefix` and
+/// attends the rejected tail.
 #[test]
 #[allow(
     clippy::expect_used,
@@ -370,66 +478,46 @@ fn shared_source_refuses_a_declared_producer_rebuilt_from_the_store_alone() {
 )]
 fn mixed_truncate_to_keeps_the_prefix_it_was_told_to_keep() {
     let device = Device::Cpu;
-    let quant = KvQuant::Mixed {
-        k_bits: 8,
-        v_bits: 4,
-        k_group_size: 64,
-        v_group_size: 64,
-    };
-    let kv_h = 2_i32;
-    let head_dim = 64_i32;
     let prefix = 32_i32;
     let keep = 27_i32;
 
-    let mut cache = KvCache::with_quant_max_seq(quant, 512).with_shares_kv(true);
-    cache.enter_prefill();
-    let shape = [1_i32, kv_h, prefix, head_dim];
-    let n: usize = shape.iter().map(|&d| d as usize).product();
-    let k_pref = f32_arr(&vec![0.125_f32; n], &shape);
-    let v_pref = f32_arr(&vec![0.25_f32; n], &shape);
-    let q_pref = f32_arr(&vec![0.5_f32; n], &shape);
-    cache
-        .update_and_sdpa_shared_source(&q_pref, &k_pref, &v_pref, 1.0, "causal", None, device)
-        .expect("prefill shared source");
-    cache.exit_prefill(device).expect("exit_prefill");
-    assert_eq!(cache.offset(), prefix, "precondition: prefix is resident");
-
-    // Roll back a rejected draft tail.
-    cache.truncate_to(keep);
+    let mut truncated = mixed_cache_prefilled(prefix, device);
+    truncated.truncate_to(keep);
     assert_eq!(
-        cache.offset(),
+        truncated.offset(),
         keep,
         "precondition: the cache reports the kept prefix"
     );
 
-    // One more token, scored against a mask sized the way the caller sizes it:
-    // from the offset the cache reports. The store must hold `keep + 1` keys
-    // for that mask to apply.
-    let step_shape = [1_i32, kv_h, 1, head_dim];
-    let n_step: usize = step_shape.iter().map(|&d| d as usize).product();
-    let k_step = f32_arr(&vec![0.75_f32; n_step], &step_shape);
-    let v_step = f32_arr(&vec![0.875_f32; n_step], &step_shape);
-    let q_step = f32_arr(&vec![0.375_f32; n_step], &step_shape);
-    let mask_shape = [1_i32, 1, 1, keep + 1];
-    let n_mask: usize = mask_shape.iter().map(|&d| d as usize).product();
-    let mask = f32_arr(&vec![0.0_f32; n_mask], &mask_shape);
+    // Never over-filled: the state the truncated cache is supposed to be in.
+    let mut reference = mixed_cache_prefilled(keep, device);
 
-    let (out, share) = cache
-        .update_and_sdpa_shared_source(&q_step, &k_step, &v_step, 1.0, "array", Some(&mask), device)
-        .expect(
-            "decode after truncate must attend the kept prefix — a broadcast error here means \
-             the truncate dropped the store the mask was sized for",
-        );
-    out.eval().expect("eval decode output");
+    let (got, got_len) = mixed_decode_step(&mut truncated, device);
+    let (want, want_len) = mixed_decode_step(&mut reference, device);
 
     assert_eq!(
-        cache.offset(),
+        truncated.offset(),
         keep + 1,
         "the append must land on top of the kept prefix"
     );
     assert_eq!(
-        share.kv_len().expect("share kv_len"),
-        keep + 1,
+        (got_len, want_len),
+        (keep + 1, keep + 1),
         "the surfaced K/V must span the kept prefix plus the new token"
+    );
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "both arms must produce the same output shape"
+    );
+    let worst = got
+        .iter()
+        .zip(want.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        worst == 0.0,
+        "a cache truncated to {keep} must decode identically to one prefilled to {keep}; \
+         worst element differs by {worst} — the truncate kept the wrong rows"
     );
 }

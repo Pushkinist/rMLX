@@ -54,8 +54,11 @@ pub struct MtpLayerDims {
     /// Total MoE experts. `0` is the "dense, no experts" sentinel shared with
     /// [`super::config::Qwen3_5MoeConfig`] — a dense sidecar omits the key.
     pub num_experts: usize,
-    /// Experts selected per token. Unread when the FFN is dense.
-    pub num_experts_per_tok: usize,
+    /// Experts selected per token. `None` when the sidecar's `text_config`
+    /// omits the key — legal for a dense sidecar, refused by [`MtpLayer::load`]
+    /// for a sparse one, because every value the key can take is a legal
+    /// routing width and a default would collapse draft quality in silence.
+    pub num_experts_per_tok: Option<usize>,
     /// Normalize top-k routing weights to sum to 1. Unread when the FFN is dense.
     pub norm_topk_prob: bool,
     /// Quantization group size (sidecar global).
@@ -179,6 +182,15 @@ impl MtpLayer {
                      reports no experts (num_experts = 0)"
                 )));
             }
+            // No sentinel and no default: `1` is a legal declared top-k, so an
+            // omitted key would load a top-8 checkpoint with top-1 routing and
+            // show up only as a quietly worse accept rate.
+            let top_k = dims.num_experts_per_tok.ok_or_else(|| {
+                Error::Model(format!(
+                    "MtpLayer: '{m}' carries MoE tensors but the sidecar \
+                     text_config omits `num_experts_per_tok`"
+                ))
+            })?;
             MlpBlock::Moe(Box::new(SparseMoeBlock {
                 gate: load_linear(&format!("{m}.gate"))?,
                 switch_mlp: SwitchMlp {
@@ -193,7 +205,7 @@ impl MtpLayer {
                 },
                 shared_expert_gate: load_linear(&format!("{m}.shared_expert_gate"))?,
                 num_experts: dims.num_experts,
-                top_k: dims.num_experts_per_tok,
+                top_k,
                 norm_topk_prob: dims.norm_topk_prob,
             }))
         } else {

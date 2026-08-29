@@ -4468,7 +4468,22 @@ silently attended the current token alone with no error anywhere. Pinned by
 which asserts through the store (an additive mask sized to the kept prefix) and
 not through the surfaced share — the bf16 mirror is rebuilt from
 `KvCache::offset` and spans the kept prefix either way, so an assertion on it
-cannot tell the two behaviours apart.
+cannot tell the two behaviours apart. Its oracle is a second cache prefilled to
+exactly the kept length and never over-filled: the two must decode the next token
+to the same output. Every prefix row carries a distinct position-dependent value,
+so a store that kept the right *number* of rows with the wrong contents fails it
+too — with a constant fill the same defect moves the output by 2.4e-7, at the
+f32 noise floor, against 9.7e-4 with the ramp.
+
+**And an over-long target is loud.** `n > offset` is the same defect in the other
+direction and this store cannot absorb it: `offset` *is* the coverage, so unlike
+the turbo / planar / affine stores there is no larger `shape[2]` to clamp down to.
+`KvCache::truncate_to` sets `offset = n` regardless of what the store did, and its
+`debug_assert` is compiled out of `release-perf`, so accepting it quietly would
+leave the cache reporting positions no payload backs. `MixedKvState::truncate_to`
+keeps its fill and emits an `error!` naming both numbers — loud like the rotor /
+iso stores, but at the truncate rather than at the next read, because nothing
+downstream of it would notice.
 
 Tests: `storage/cpu_block_truncate_tests.rs` — the partial-accept round trip per
 store (`QuantV`, `QuantKTurbo3`, `QuantKTurbo4`, `QuantPlanarK`, `QuantPlanarV`,
