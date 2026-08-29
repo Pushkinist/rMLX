@@ -4002,6 +4002,34 @@ conditions on this machine).
 **No codec in the tree reduces resident KV, on either architecture, at either
 context.** That is the finding the dispositions follow from.
 
+> **Superseded on the store-materialising half of the table.** The four cells
+> above were recorded while `Mixed` / `RotK` held a full bf16 mirror beside
+> their packed store on *every* architecture, and while the iso/rotor ring's
+> scale and norm planes were `f32`. Both are gone. Re-measured with
+> `rmlx serve` at a 928-token prompt (`kv_cache_bytes`, the server's own N16
+> event), the "smaller than `none`" count is no longer 0:
+>
+> | model | smaller than `none` | best cell |
+> |---|---|---|
+> | Ternary-Bonsai-8B | 6 of 10 | `mixed_k8g64_v4g64` **0.519×** |
+> | Ternary-Bonsai-27B | 6 of 10 | `mixed_k8g64_v4g64` 0.843× |
+> | Qwen3.8-27B | 6 of 10 | `mixed_k8g64_v4g64` 0.838× |
+> | Qwen3.6-35B-A3B | 2 of 2 permitted | `mixed_k8g64_v4g64` 0.876× |
+> | gemma-4-e2b | 4 of 10 | `iso3_sym` **0.876×** |
+> | gemma-4-12B | 5 of 10 | `iso3_sym` 0.980× |
+>
+> The **inert half is unchanged and re-verified**: all 17 store-less codecs
+> served Ternary-Bonsai-8B at `kv_cache_bytes` 151 584 768 — byte-identical to
+> `none` — with greedy token digest `4f26f49e2b3529f6`, also byte-identical.
+> 18/18 cells, both axes. The dispositions below follow from *that* half, which
+> is why they still stand.
+>
+> Two qualifiers, both load-bearing. `mixed_*` / `rot_k_*` win only where layers
+> do **not** share K/V — on shared-KV gemma-4 they are larger (1.02–1.56×). And
+> the iso family buys its bytes with decode: 0.60–0.70× `none`'s TPS on
+> Bonsai-8B, 0.85–0.96× on the larger models. Nothing here is both smaller and
+> faster than bf16.
+
 #### Class 1 — the baseline (1 codec)
 
 `none`. bf16 both sides, the resolved `auto` default, the smallest resident KV
@@ -4056,6 +4084,39 @@ bytes); output token ids identical (4 cells); decode throughput INCONCLUSIVE
 passes `--kv-quant iso3` gets bf16 KV under another name — no better, no worse,
 just not what the name says — which is why `validate_resolved` says so at
 `warn!` and why no `--kv-preset` row is described as a memory setting any more.
+
+##### Retirement policy: a preservation branch, never a plain delete
+
+An inert codec that is removed from the mainline is **retired, not deleted.**
+Removal only lands together with a **preservation branch** that keeps the codec
+intact — its encoder/decoder, its MSL kernels, its storage variant, its tests
+and its docs section — at a commit where it still builds and still passes its
+own suite. The point is revival: these families are research ports, and the
+reason a codec is inert today (no fused decode kernel over its own store, a
+sideband that eats the code width, a grid geometry that caps the shell) is a
+reason that a future kernel or layout change can remove. A codec deleted with no
+branch behind it cannot be re-measured against the change that would have made
+it viable.
+
+Rules:
+
+* **One preservation branch per family**, named `preserve/kv-<family>` and
+  pushed. Its tip must build and pass `make ci`.
+* **The removal PR names the branch and its tip SHA** in its description, and
+  the retired codec's row here is replaced by a line saying where it went.
+* **The retired CLI name keeps failing.** `KvQuant::FromStr` already has the
+  `Retired` arm used for `rot_k_tq4v` — a retired name must return that error
+  and name its successor (or say "retired, see `preserve/kv-<family>`"), never
+  become an alias and never silently parse. A recorded bench cell or a saved CLI
+  line must not keep running under a codec it does not name.
+* **Deletion has zero behavioural blast radius** — an inert codec's math never
+  executes on a prefill-bracketed flow, and the measurement above proves both
+  axes — but it is **not a small diff**. Each family touches 5–9 files of
+  exhaustive `match` arms (`quant.rs`, `storage/kv_storage.rs`, the `kvcache`
+  update/sdpa dispatchers, the SSD `layout_key`, the CLI parse + preset table,
+  and the disposition gate's expectations).
+
+To find a retired codec: `git branch -a --list 'preserve/kv-*'`.
 
 **What this does to the dominated-vs-unused split.** The word belongs to
 Class 3, not here. On the axes anything is measured on, `none` is strictly

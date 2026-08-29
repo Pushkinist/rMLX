@@ -231,15 +231,20 @@ table used to carry. Every other row is the earlier sweep (its `none` reads
 absolute is the comparable number).
 
 `k_iso3/4` and `iso3_sym/4_sym` dropped to essentially **1.00–1.01× `none`**
-(from 1.64× / 2.91×) once the GPU ring became their sole resident store. That
-is a large improvement on the previous figure but it is **not a memory win**:
-1.00× `none` means "ties bf16", and the format cannot do better than tie. iso
-spends one whole `u32` code word **and** one `f32` scale per 4-element group
-(16.25 bits/value at head\_dim=128) and rotor one of each per 3-element group
-(21.75), against bf16's 16.0 — so the nominal 3-bit / 4-bit width never
-reaches storage, and the 3-bit and 4-bit member of each family measure
-byte-identical here. `none` is the memory floor at every context and no member
-of this family can undercut it. See `docs/KV_QUANT.md` § "Memory truth".
+(from 1.64× / 2.91×) once the GPU ring became their sole resident store. At the
+time that was read as "ties bf16, and the format cannot do better than tie",
+because the ring spent one whole `u32` code word **and** one `f32` scale per
+group: 16.25 bits/value for iso (a `u32` per 4 head-dim slots) and 21.75 for
+rotor (a `u32` per 3), against bf16's 16.0.
+
+**Both numbers are superseded.** Narrowing the ring's scale and norm planes from
+`f32` to `KV_SIDEBAND_DTYPE` took 4.125 bits per value off iso and 5.5 off
+rotor. iso now stores **12.125** bits/value at head\_dim=128 and **is** a memory
+win — the first sub-bf16 KV store in the tree. rotor stores **16.25** and is
+still above the floor, because a sideband change cannot fix a code cadence: one
+`u32` per 3 slots is 10.67 bits per value before any sideband at all. The 3-bit
+and 4-bit member of each family still measure byte-identical. See
+`docs/KV_QUANT.md` § "Memory truth" for the per-family table.
 
 `k_rotor3/4`'s 1.54× was a **defect, not the layout**: the K-only rotor append
 never dropped its CPU blocks once the ring was live, so the prefill prefix

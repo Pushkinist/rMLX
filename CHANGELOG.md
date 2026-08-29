@@ -64,6 +64,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`KvStorage::truncate_to` reset the `Mixed` store instead of truncating it,
+  so a cache reported `n` positions and held zero.** `KvCache::truncate_to` sets
+  `offset = n` immediately afterwards, and the reset was never needed — the
+  store is a capacity buffer whose `offset` *is* the fill marker, so rolling the
+  marker back is the truncation. This is the whole of the gemma4-assistant MTP
+  crash under `--kv-quant mixed_k8g64_v4g64`: the first partial-accept round
+  scored `seq` keys against an `n+seq`-wide mask. **The crash was the lucky
+  case.** A single-token decode needs no mask, so an ordinary decode after a
+  prompt-cache trim silently attended the current token alone and produced
+  wrong output with no error. `MixedKvState::truncate_to` was likewise silent in
+  the over-long direction, and the `debug_assert` that would have caught it is
+  compiled out of `release-perf`; `Mixed` cannot clamp — `offset` *is* its
+  coverage — so it keeps its fill and says so.
+
+- **The GDN speculative rollback replayed through a scratch KV stack, corrupting
+  the verifier on every partial-accept round.** The recurrent state has no
+  sequence axis, so it is restored from a snapshot and replayed over the kept
+  prefix — but that replay runs the whole layer stack, and on a GDN hybrid the
+  full-attention layers sit between the GDN layers and feed them. Replaying
+  through fresh caches made those FA layers attend a `kept`-token prefix at
+  positions `0..kept`, so every downstream GDN layer advanced on a wrong hidden.
+  The rollback now rolls the *real* caches back to the pre-round offset and
+  replays into them.
+
+  **It was live at six of seven call sites.** Two round loops had been fixed and
+  four left; `eagle3_generate_greedy` carried the pre-fix block verbatim, and
+  the shared helper `restore_and_replay_lin` — whose own doc argued *for* the
+  scratch stack — sat behind the classic two-model loop's four call sites.
+  `speculative::rollback_round_caches` now owns the whole rollback (the FA
+  `truncate_to` loop, the GDN snapshot restore, and the replay) and picks its
+  arm from the arch: seven callers, one implementation.
+
+  Measured greedy at temp=0 against a plain greedy arm on the same verifier,
+  scratch-stack replay vs real-cache replay — tokens shared with the
+  no-drafter reference:
+
+  | path | before | after |
+  |---|---|---|
+  | MTP sidecar (Qwen3.8-27B) | 4/31 | 31/31 |
+  | EAGLE-3 (Qwen3.6-35B-A3B) | 13/96 | 93/96 |
+  | two-model (Qwen3.8-27B + ornith-1.0-9b) | 17/96 | 96/96 |
+  | Gemma4-e4b + e2b (full-attention arm) | 96/96 | 96/96 |
+
+  The two-model loop could not have reached the rollback at all: it read the
+  pre-round offset from `caches[0]`, and on a GDN hybrid layer 0 is a recurrent
+  layer whose `KvCache::offset` never leaves 0, so the truncation target went
+  negative every round.
+
 - **Token selection resolved ties differently on the host than on the device,
   and `top_p` / `top_k` resolved them differently on every call.** MLX `argmax`
   resolves a tie to the lowest token id. The host greedy path
@@ -402,6 +450,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The first KV codecs in this tree's history that hold fewer resident bytes
+  than bf16.** Two independent changes, and neither is universal — read the
+  architecture column before picking one.
+
+  *The iso ring cleared the floor.* `QuantKGpuRing`'s scale and norm planes were
+  `f32`; they are stored at `KV_SIDEBAND_DTYPE` now. That takes 4.125 bits per
+  value off iso and 5.5 off rotor: **iso 16.25 → 12.125** bits/value at
+  `head_dim = 128` (0.758× bf16, the first member under 16.0) and **rotor
+  21.75 → 16.25**, which is still above the floor and always will be — rotor
+  spends one whole `u32` code word per 3 head-dim slots, 10.67 bits per value
+  before any sideband, and no sideband change can fix a code cadence. Planar is
+  unchanged at 22.00. The affine sideband is **32 bits per group** (bf16 scale +
+  bf16 bias), measured, not the 64 the byte model previously assumed.
+
+  *The `Mixed` mirror is built only where something reads it.* `mixed_*` and
+  `rot_k_*` held a full bf16 K/V mirror beside their packed store on every
+  architecture, which is why they measured **1.29× `none`**. The mirror exists
+  for a cross-layer-KV consumer, so it is now built only where a layer reads
+  another layer's K/V; combined with an 8-bit in-family boundary floor,
+  `mixed_k8g64_v4g64` on Ternary-Bonsai-8B went **9.29 → 7.29** bits per value
+  at 4k and **9.16 → 7.08** at 32k, 0.784× / 0.774× `none`, at no resolvable
+  decode cost (ABBA-paired decode-TPS ratio 0.9957, n=3, sd 0.0028, inside a
+  same-code-path control band of 1.0061 ± 0.0152 — INCONCLUSIVE on throughput,
+  greedy token ids byte-identical on three architectures).
+
+  Measured end-to-end with `rmlx serve` at a 928-token prompt, `kv_cache_bytes`
+  from the server's own N16 event, temp=0, ×`none` in parentheses:
+
+  | model | `mixed_k8g64_v4g64` | `rot_k_v8g64` | `iso3_sym` | `k_iso3` |
+  |---|---|---|---|---|
+  | Ternary-Bonsai-8B | 78 679 040 (**0.519**) | 97 145 856 (0.641) | 145 858 560 (0.962) | 148 496 384 (0.980) |
+  | Ternary-Bonsai-27B | 187 011 072 (0.843) | 199 778 304 (0.901) | 217 759 744 (0.982) | 219 766 784 (0.991) |
+  | Qwen3.8-27B | 188 172 288 (0.838) | 201 240 576 (0.896) | 218 103 808 (0.971) | 221 315 072 (0.986) |
+  | Qwen3.6-35B-A3B | 74 952 192 (0.876) | 80 023 040 (0.935) | arch-refused | arch-refused |
+  | gemma-4-e2b | 15 495 168 (1.232) | 19 556 352 (1.555) | 11 022 336 (**0.876**) | 11 784 192 (0.937) |
+  | gemma-4-12B | 357 219 840 (1.021) | 365 336 064 (1.044) | 342 896 640 (0.980) | 348 395 520 (0.996) |
+
+  The two rows that matter for expectation-setting: `mixed_*` / `rot_k_*` are a
+  win **only** on an architecture whose layers do not share K/V — on shared-KV
+  Gemma4 they are *larger* — and the iso family pays for its bytes in decode
+  (0.60–0.70× `none`'s TPS on Bonsai-8B, 0.85–0.96× on the larger models). No
+  codec in the tree is both smaller and faster than bf16.
+
+- **Qwen3.8-27B serves, including with its MTP sidecar.** The
+  `Qwen3.8-27B-MTP-mxfp8` sidecar ships a plain SwiGLU `layers.0.mlp` and no
+  expert keys; `num_experts` was read as a required key (rejecting it at config
+  parse) and `MlpBlock::Moe` was built unconditionally (rejecting it at tensor
+  load). Both key off facts now — the counts read against the same
+  `num_experts == 0` "dense, no experts" sentinel `Qwen3_5MoeConfig` already
+  uses, and `MtpLayer` probes `mlp.switch_mlp.gate_proj.weight` exactly as
+  `build_mlp` does per layer. Read the MTP throughput note under **Changed**
+  before enabling it.
+
 - **Per-dispatch `trace!` on the two PlanarQuant kernels**
   (`planar_flash_decode_sdpa: dispatch`, `planar_fused_qk: dispatch`), matching
   every sibling KV kernel. Their in-process dispatch counters have no caller
@@ -550,6 +651,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counters, which is what the Xcode GUI replay is for.
 
 ### Changed
+
+- **MTP on Qwen3.8-27B is a net decode loss, and the 1.28× previously recorded
+  was an artefact of the corrupted verifier.** Before the GDN rollback fix (see
+  **Fixed**) this pair reported accept_rate 0.755 and 23.9 decode TPS against an
+  18.6 no-drafter baseline. Correct, it is **accept_rate 0.485 and 16.0 TPS —
+  0.86× baseline** at `block_size 3`. The old "win" was the corrupted verifier
+  state agreeing with the drafter more often than the correct one does. Nothing
+  about the drafter got slower; the number was never real.
+
+  **This invalidates more than one cell.** Every speculative-decoding accept
+  rate recorded on a **GDN hybrid** before this branch is inflated by the same
+  mechanism — MTP, EAGLE-3 and the classic two-model loop all took the scratch
+  stack, and the inflation is proportional to how often a round partially
+  accepts. Historical accept-rate and spec-decode-speedup figures on those
+  architectures need re-deriving before they are quoted again. Figures on a
+  pure full-attention arch (Gemma4) are unaffected — that arm was byte-identical
+  across the fix.
+
+- **Gemma4 with `mixed_*` / `rot_k_*` and an SSD-tier hit now fails loudly where
+  it previously produced silently-wrong output.** `none_bf16_payloads` never
+  persists a bf16 mirror for `KvStorage::Mixed`, so a hydrated cache on a
+  cross-layer-KV architecture has no mirror to rebuild and no way to serve the
+  layers that read another layer's K/V. That combination used to hydrate anyway
+  and decode off a mirror that was not there. It is refused now, on the artifact
+  rather than on the declaration. This is a **behaviour regression for anyone
+  running that exact combination** — the remedy is `--kv-quant none` (or any
+  mirror-fed codec) on Gemma4 with the SSD tier enabled, and the better end
+  state (persist the mirror, or refuse to hydrate and re-prefill) is filed
+  separately.
+
+- **`--kv-quant` help states each codec's real disposition, and is gated against
+  it.** The help text used to name codecs without saying that 17 of the 28 build
+  no packed store and decode byte-identically to bf16. It now carries INERT
+  banners derived from `ALL_KV_QUANTS` + `decode_reads_packed_store` /
+  `feeds_bf16_{k,v}_at_decode`, and `make check-kv-codec-disposition` (in
+  `make ci`) fails the build when the help or `docs/KV_QUANT.md` disagrees with
+  the runtime disposition. `auto` and `DEFAULT_KV_QUANT` resolve to unquantised
+  bf16 on every architecture and every context length, and the help says so.
+
+  Verified end-to-end, not just in the type: all **17** inert codecs served
+  Ternary-Bonsai-8B at a 928-token prompt with `kv_cache_bytes` **151 584 768**
+  — byte-identical to `none` — and greedy token digest `4f26f49e2b3529f6`,
+  byte-identical to `none`. 18/18 cells, both axes.
 
 - **`xctrace`'s "no rows" refusal splits into the two states it was
   conflating.** A table with no rows at all (the recording captured nothing)

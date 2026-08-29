@@ -251,11 +251,16 @@ Fitted across this binary pair: `a` 41.14 → **7.01 ms/step (−83%)**, `b` 2.4
 eval over the layer count, a textbook round trip. A published ms/1k table stays
 valid; do not discard one on the strength of this fix.
 
-**Neither tier competes with `none` on either axis.** The whole iso/rotor
-family stores one `u32` code word plus one `f32` scale per group, so it is
-never smaller than bf16 (see `docs/KV_QUANT.md` "Memory truth"), and its
-decode is several times `none`'s. Bench them for kernel work and quality
-study, not as memory or throughput candidates.
+**Neither tier competes with `none` on throughput; the memory half of this
+claim is superseded.** When these rows were recorded the whole iso/rotor family
+stored one `u32` code word plus one **`f32`** scale per group, so no member was
+ever smaller than bf16. The ring's scale and norm planes have since been
+narrowed to `KV_SIDEBAND_DTYPE`: **iso now stores 12.125 bits/value at
+head\_dim=128 and is under bf16's 16.0**, rotor 16.25 and is still above it (see
+`docs/KV_QUANT.md` "Memory truth"). Decode is still several times `none`'s for
+every member, which is the part that has not moved. Bench them for kernel work
+and quality study; iso is now a memory candidate, neither tier is a throughput
+one.
 
 **A denser store would not rescue them either.** Post-fix marginal cost puts the
 hand-written flash-decode shell at 4–14% of MLX `sdpa_vector`'s per-byte
@@ -294,6 +299,15 @@ throughput: `k_iso3/4` measures **1.003–1.006×** `none` and `k_rotor3/4`
 **1.11–1.17×**. A codec that is not smaller than the bf16 it replaces has no
 bandwidth prize to collect, so parity is the ceiling, not a milestone on the
 way past it.
+
+**The KV-bytes column is pre-sideband-narrowing.** Re-measured on the current
+tree at a 928-token prompt (`rmlx serve`, `kv_cache_bytes`), `k_iso3` is
+**0.980×** `none` on Bonsai-8B and **0.937×** on gemma-4-e2b, and `iso3_sym` /
+`iso4_sym` reach **0.962×** and **0.876×** on the same pair. `k_rotor3/4` is
+still above `none` (1.098× Bonsai-8B, 1.001× e2b). The throughput conclusion
+above is unchanged and is still the binding one; the memory conclusion is not —
+iso is now under bf16 and the remaining gap to its 12.125 bits/value store is
+the boundary-layer `K8V8` promotion, not the codec.
 
 **`none` was not bf16 on Bonsai when these rows were recorded — read the ratios
 accordingly.** `kv_quant_for_layer` then promoted the first 2 and last 8 layers
