@@ -158,7 +158,10 @@ store-backed caches; a seeded bf16-mirror cache spills its mirror instead. See
 any arm — `K8V4`, `K8V8`, `Planar`, `PlanarK`, `TurboSym3/4`, `K8VTurbo2/3`, both
 TCQ variants, `IsoV3/4`, `RotorV3/4` and **both** axes of `RotorKAsym3/4`
 delegate to a store-level `truncate_to`, so no codec truncates its two axes with
-different semantics any more. `KvStorage::reset` had the identical defect and is
+different semantics any more. `Mixed` no longer drops its store either: it rolls
+the fill marker back instead, which is what makes a partial-accept rollback
+under `--kv-quant mixed_*` keep the prefix it was told to keep. See
+`docs/KV_QUANT.md` § "The `Mixed` arm truncates, it no longer resets". `KvStorage::reset` had the identical defect and is
 rewired the same way. Truncation is also clamped to be monotone-decreasing on
 these six stores: a rollback into the decode window arrives with a target past
 the frozen store's fill, and raising `shape[2]` to meet it would invent coverage
@@ -191,16 +194,34 @@ rather than a second independent model. For each draft step it:
    state independently.
 3. Concatenates them along the feature axis (`[embed_norm; hidden_norm]`,
    width `2H`) and projects through a `fc` linear (`2H -> H`).
-4. Runs one small Qwen3.5-MoE decoder layer (full-attention GQA, per-head q/k
-   RMSNorm, partial RoPE, sparse MoE FFN) over the drafter's own KV cache.
+4. Runs one small Qwen3.5 decoder layer (full-attention GQA, per-head q/k
+   RMSNorm, partial RoPE, and whichever FFN the sidecar carries — sparse MoE or
+   dense SwiGLU) over the drafter's own KV cache.
 5. Applies a final RMSNorm, then re-uses the verifier's LM head
    (`Architecture::logits_from_hidden`) to pick the next draft token greedily.
 
-The single decoder layer is the **reused** Qwen3.5-MoE `DecoderLayer`
-(`crate::qwen3_5_moe::MtpLayer` — `FullAttention` + `SparseMoeBlock`), not a
-second hand-ported attention/MoE implementation: the sidecar's `layers.0` has
-identical tensor names to the verifier (`full_attention_interval = 1` so the
-single layer is full-attention + 256-expert MoE). The conditioning hidden is
+The single decoder layer is the **reused** Qwen3.5 `DecoderLayer`
+(`crate::qwen3_5_moe::MtpLayer` — `FullAttention` + `SparseMoeBlock` or
+`DenseMlp`), not a second hand-ported attention/FFN implementation: the
+sidecar's `layers.0` has identical tensor names to the verifier
+(`full_attention_interval = 1`, so the single layer is full-attention).
+
+Its FFN follows the verifier family, and **which one is a tensor fact, not a
+config flag**. `MtpLayer::load` probes `layers.0.mlp.switch_mlp.gate_proj.weight`
+— the same witness `qwen3_5_moe::loader::build_mlp` probes per layer — and
+builds `MlpBlock::Moe` when it is present, `MlpBlock::Dense` when it is not.
+`DecoderLayer::forward` already handles both. A dense sidecar also omits
+`num_experts` / `num_experts_per_tok` from its `text_config` entirely, so those
+are read against the same `num_experts == 0` "dense, no experts" sentinel
+`Qwen3_5MoeConfig` uses; a checkpoint that carries MoE tensors while reporting
+no experts is refused by name rather than mis-built. Concretely:
+
+| Sidecar | `layers.0.mlp` tensors | `text_config` expert keys | Loaded FFN |
+|---|---|---|---|
+| `Qwen3.6-35B-A3B-MTP-5bit` | `gate`, `switch_mlp.*`, `shared_expert*` | present (`num_experts` 256) | `MlpBlock::Moe` |
+| `Qwen3.8-27B-MTP-mxfp8` | `{gate,up,down}_proj` only | absent | `MlpBlock::Dense` |
+
+The conditioning hidden is
 the verifier's last-decoder-layer residual stream (pre-final-norm), captured in
 the same combined `Architecture::forward_verify_capture` pass that yields the
 verify logits (`capture_layer_ids = [num_hidden_layers - 1]`).
@@ -216,18 +237,35 @@ Weight layout (Qwen3.5 `mtp.*` prefix, stripped by `qwen3_5_mtp/split.py`):
 | `layers.{i}.self_attn.{q,k,v,o}_proj` | — | Gated GQA (`q_proj` out = `n_heads*head_dim*2`) |
 | `layers.{i}.self_attn.{q,k}_norm` | `[head_dim]` | Per-head RMSNorm |
 | `layers.{i}.{input,post_attention}_layernorm` | `[H]` | Pre/post norms |
-| `layers.{i}.mlp.gate` / `switch_mlp.{gate,up,down}_proj` | — | 256-expert top-8 MoE |
-| `layers.{i}.mlp.shared_expert.{gate,up,down}_proj` / `shared_expert_gate` | — | Shared expert |
+| `layers.{i}.mlp.gate` / `switch_mlp.{gate,up,down}_proj` | — | MoE sidecar only — router + expert stack |
+| `layers.{i}.mlp.shared_expert.{gate,up,down}_proj` / `shared_expert_gate` | — | MoE sidecar only — shared expert |
+| `layers.{i}.mlp.{gate,up,down}_proj` | — | Dense sidecar only — plain SwiGLU, no router |
 
-Status: **fully wired + live-validated** against
-`mlx-community/Qwen3.6-35B-A3B-MTP-5bit` (sidecar) +
-`mlx-community/Qwen3.6-35B-A3B-8bit` (verifier). The round-loop
+Status: **fully wired + live-validated** against two pairs — the MoE sidecar
+`mlx-community/Qwen3.6-35B-A3B-MTP-5bit` + `mlx-community/Qwen3.6-35B-A3B-8bit`,
+and the dense sidecar `mlx-community/Qwen3.8-27B-MTP-mxfp8` +
+`mlx-community/Qwen3.8-27B-mxfp8`. `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs`
+gates both the FFN-shape probe and the greedy-tracking property. The round-loop
 (`mtp_generate_greedy`) mirrors the DFlash loop structurally: verifier prefill →
 round-0 penultimate-hidden + first-bonus capture → per-round autoregressive
 `draft_n` (RoPE offset = sidecar `_next_position` = verifier prefix length +
 appended count) → one combined verify forward → `walk_deferred_greedy` accept →
 emit → GDN snapshot/restore verifier-KV rollback + sidecar-KV `truncate_to` on
-partial acceptance. Note the MTP sidecar config carries `model_type` but no
+partial acceptance.
+
+The GDN half of that rollback is not a truncation: the recurrent state has no
+sequence axis, so it is restored from a pre-round snapshot and **replayed** over
+the kept prefix. That replay runs the whole layer stack, and on this hybrid the
+full-attention layers sit between GDN layers — layer 3's output is the residual
+layers 4-6 consume. It therefore replays through the **real** KV caches, rolled
+back to the pre-round offset first, so the FA layers attend their true prefix at
+their true positions and land back on `v_target`. Replaying through a fresh
+scratch KV stack instead makes those FA layers attend a `v_kept`-token prefix at
+positions `0..v_kept`, and every downstream GDN layer advances on a wrong
+hidden: measured on the Qwen3.8-27B pair, greedy MTP shared 4 of 31 tokens with
+plain greedy decoding and degenerated into a repetition loop on longer prompts,
+against 31/31 with the real-cache replay. `dflash_generate_greedy` carries the
+identical rollback and the identical fix. Note the MTP sidecar config carries `model_type` but no
 `architectures` array; `ModelConfig::architectures` is now `#[serde(default)]`
 so the standalone drafter config loads cleanly.
 
@@ -545,7 +583,8 @@ never a substring guess:
 
 | Draft family (`model_type` / `architectures[0]`) | Drafter loaded | Notes |
 |---|---|---|
-| `qwen3_5_mtp` | `MtpDrafter` (Qwen3.5/3.6-MoE sidecar head) | The MTP head reuses the verifier's embedding, LM head, and one Qwen3.5-MoE decoder layer. |
+| `qwen3_5_mtp`, MoE sidecar (`layers.0.mlp.switch_mlp.*` present) | `MtpDrafter` (Qwen3.5-family sidecar head) | The MTP head reuses the verifier's embedding, LM head, and one Qwen3.5 decoder layer with a sparse-MoE FFN. E.g. `Qwen3.6-35B-A3B-MTP-5bit`. |
+| `qwen3_5_mtp`, dense sidecar (no `switch_mlp`, no `num_experts`) | `MtpDrafter` (same loader) | Same head; the reused decoder layer takes a plain SwiGLU FFN. E.g. `Qwen3.8-27B-MTP-mxfp8`. |
 | `gemma4_assistant` / `Gemma4Assistant*` | `Gemma4AssistantDrafter` | The dedicated `*-it-assistant-bf16` snapshot — a small Gemma4 decoder stack that reads the verifier's own K/V cache. |
 | anything else (incl. plain `Gemma4ForConditionalGeneration`) | **rejected at load** | Typed `Error::SpeculativePairing`; for a plain Gemma4 draft the message points at the assistant snapshot. |
 
@@ -593,16 +632,25 @@ tends to reduce the rate by 5-15 percentage points for equivalent block sizes.
 | Verifier | Drafter | Draft kind | Block size | Accept rate |
 |----------|---------|------------|-----------|-------------|
 | Gemma4-31B-mxfp8 | Gemma4-E2B-mxfp8 | MTP (assistant) | 6 | ~0.70 |
-| Qwen3.6-35B-A3B-8bit | Qwen3.6-35B-A3B-MTP-5bit | MTP (sidecar) | 3 | ~0.86 |
+| Qwen3.6-35B-A3B-8bit | Qwen3.6-35B-A3B-MTP-5bit | MTP (sidecar, MoE) | 3 | ~0.83 |
+| Qwen3.8-27B-mxfp8 | Qwen3.8-27B-MTP-mxfp8 | MTP (sidecar, dense) | 3 | ~0.49 |
 | Qwen3.6-35B-A3B-8bit | Qwen3.6-35B-A3B-DFlash | DFlash | 16 | ~0.515 |
 | Qwen3.6-35B-A3B-8bit | Qwen3.6-35B-A3B-Eagle3 | EAGLE-3 | 5 | ~0.21 (restricted) |
 
 Notes:
 - Two distinct MTP paths: the Gemma4 assistant shared-K/V path
-  (`mtp_assistant_generate_greedy`) and the Qwen3.5-MoE sidecar path
-  (`mtp_generate_greedy` / `MtpDrafter`). The sidecar ~0.86 is measured at
-  temp=0 on the "capital of France" probe (block_size 3 = 2 drafts/round,
-  190/220 accepted, ~95 decode-TPS).
+  (`mtp_assistant_generate_greedy`) and the Qwen3.5-family sidecar path
+  (`mtp_generate_greedy` / `MtpDrafter`). Both sidecar rates are read off the
+  `mtp_generate_greedy: done` serve-log line at temp=0, never from a bench
+  wrapper — no done-line means the round loop never ran.
+  - Qwen3.6-35B-A3B, "capital of France" probe: 187/224 accepted over 112
+    rounds, ~86 decode-TPS.
+  - Qwen3.8-27B, a 200-token prose prompt: 98/202 accepted over 101 rounds,
+    16.0 decode-TPS median (n=5, 15.7-16.3) against 18.6 without a drafter
+    (n=5, 18.6-18.7). **MTP is a net decode loss on this pair at block_size 3.**
+    The 23.9 TPS / 0.75 accept rate this path reported before the GDN-replay fix
+    was an artefact: the corrupted verifier state agreed with the drafter more
+    often than the correct one does.
 - The DFlash rate of ~0.515 matches the mlx-vlm `_dflash_rounds` reference
   exactly on the test prompt.
 - The EAGLE-3 rate of ~0.21 is with the `fcs` per-aux norms active

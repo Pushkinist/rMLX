@@ -340,3 +340,96 @@ fn shared_source_refuses_a_declared_producer_rebuilt_from_the_store_alone() {
         }
     }
 }
+
+/// A `Mixed` cache keeps its accepted prefix across `truncate_to`.
+///
+/// `truncate_to` is what a speculative round-loop calls to drop the rejected
+/// tail of a draft block, and what the prompt cache calls to trim a slot. It
+/// must leave the cache holding exactly the `n` positions the caller kept.
+///
+/// The Mixed store used to answer it by dropping the whole quant state, while
+/// `KvCache::truncate_to` went on to set `offset = n`. The cache then reported
+/// `n` positions and held none, which surfaces two different ways:
+///
+/// * the next **multi-token** forward (a speculative verify block) attends
+///   `seq` keys against a mask sized from the reported offset — the opaque
+///   `add: [broadcast_shapes] (1,kv,rep,seq,seq) and (1,1,seq,n+seq)` crash;
+/// * the next **single-token** decode needs no mask, so it silently attends
+///   the current token alone with no error anywhere.
+///
+/// The assertion has to reach the **quant store**, not the surfaced share: the
+/// bf16 mirror this path hands to consumer layers is rebuilt from
+/// `KvCache::offset`, so it spans the kept prefix either way and cannot tell
+/// the two behaviours apart. An additive mask sized to the kept prefix does
+/// reach it — that mask is added to the scores the store's own keys produce,
+/// which is exactly the production failure.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn mixed_truncate_to_keeps_the_prefix_it_was_told_to_keep() {
+    let device = Device::Cpu;
+    let quant = KvQuant::Mixed {
+        k_bits: 8,
+        v_bits: 4,
+        k_group_size: 64,
+        v_group_size: 64,
+    };
+    let kv_h = 2_i32;
+    let head_dim = 64_i32;
+    let prefix = 32_i32;
+    let keep = 27_i32;
+
+    let mut cache = KvCache::with_quant_max_seq(quant, 512).with_shares_kv(true);
+    cache.enter_prefill();
+    let shape = [1_i32, kv_h, prefix, head_dim];
+    let n: usize = shape.iter().map(|&d| d as usize).product();
+    let k_pref = f32_arr(&vec![0.125_f32; n], &shape);
+    let v_pref = f32_arr(&vec![0.25_f32; n], &shape);
+    let q_pref = f32_arr(&vec![0.5_f32; n], &shape);
+    cache
+        .update_and_sdpa_shared_source(&q_pref, &k_pref, &v_pref, 1.0, "causal", None, device)
+        .expect("prefill shared source");
+    cache.exit_prefill(device).expect("exit_prefill");
+    assert_eq!(cache.offset(), prefix, "precondition: prefix is resident");
+
+    // Roll back a rejected draft tail.
+    cache.truncate_to(keep);
+    assert_eq!(
+        cache.offset(),
+        keep,
+        "precondition: the cache reports the kept prefix"
+    );
+
+    // One more token, scored against a mask sized the way the caller sizes it:
+    // from the offset the cache reports. The store must hold `keep + 1` keys
+    // for that mask to apply.
+    let step_shape = [1_i32, kv_h, 1, head_dim];
+    let n_step: usize = step_shape.iter().map(|&d| d as usize).product();
+    let k_step = f32_arr(&vec![0.75_f32; n_step], &step_shape);
+    let v_step = f32_arr(&vec![0.875_f32; n_step], &step_shape);
+    let q_step = f32_arr(&vec![0.375_f32; n_step], &step_shape);
+    let mask_shape = [1_i32, 1, 1, keep + 1];
+    let n_mask: usize = mask_shape.iter().map(|&d| d as usize).product();
+    let mask = f32_arr(&vec![0.0_f32; n_mask], &mask_shape);
+
+    let (out, share) = cache
+        .update_and_sdpa_shared_source(&q_step, &k_step, &v_step, 1.0, "array", Some(&mask), device)
+        .expect(
+            "decode after truncate must attend the kept prefix — a broadcast error here means \
+             the truncate dropped the store the mask was sized for",
+        );
+    out.eval().expect("eval decode output");
+
+    assert_eq!(
+        cache.offset(),
+        keep + 1,
+        "the append must land on top of the kept prefix"
+    );
+    assert_eq!(
+        share.kv_len().expect("share kv_len"),
+        keep + 1,
+        "the surfaced K/V must span the kept prefix plus the new token"
+    );
+}

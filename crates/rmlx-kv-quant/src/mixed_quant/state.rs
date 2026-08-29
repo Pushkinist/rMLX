@@ -298,6 +298,34 @@ impl MixedKvState {
         self.values = None;
     }
 
+    /// Roll the fill marker back to `n` positions (speculative partial-accept
+    /// rollback, prompt-cache trim).
+    ///
+    /// The quant store is a capacity-allocated buffer that grows in `STEP`
+    /// increments: `update_and_fetch` writes the new rows at
+    /// `[offset .. offset + seq)` via `write_at` and hands back
+    /// `slice_seq_to(offset)`. `offset` is therefore the whole definition of
+    /// "how many positions this store holds" — moving it back to `n` makes
+    /// rows `[n..]` dead capacity that the next append overwrites, which is a
+    /// complete and lossless truncation.
+    ///
+    /// Dropping the buffers instead would discard the accepted prefix as well:
+    /// the caller has already committed to keeping `n` positions and sets
+    /// `KvCache::offset = n` right after, so the cache would claim `n`
+    /// positions while holding none. The next multi-token forward then attends
+    /// `seq` keys against a mask sized `n + seq`, and a single-token decode —
+    /// which needs no mask — silently attends the current token alone.
+    pub fn truncate_to(&mut self, n: i32) {
+        let n = n.max(0);
+        if n == 0 {
+            self.reset();
+            return;
+        }
+        if n < self.offset {
+            self.offset = n;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         k_bits: i32,

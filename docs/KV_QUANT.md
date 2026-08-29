@@ -4443,6 +4443,33 @@ bare `shape[2] = 0` on exactly these six store types, leaving the payload
 covering the sequence just discarded. Every arm now delegates to the store's own
 `truncate_to(0)` / `reset()`; the GPU buffers are still kept for reuse.
 
+**The `Mixed` arm truncates, it no longer resets.** `Mixed` was the one storage
+whose `truncate_to` arm answered by dropping the whole quant state
+(`state.reset()`), on the reading that mlx-lm-tq's `is_trimmable` returns
+`False` for it. That is not the same contract: `KvCache::truncate_to` goes on to
+set `self.offset = n`, so the cache reported `n` positions and held none. The
+store does not need the reset — it is a capacity buffer that grows in `STEP`
+increments, with `MixedKvState::offset` as the fill marker
+(`update_and_fetch` writes the new rows at `[offset .. offset + seq)` via
+`write_at` and hands back `slice_seq_to(offset)`), so rolling the marker back to
+`n` **is** the truncation: rows `[n..]` become dead capacity the next append
+overwrites. The bf16 K/V mirror a shared-KV producer keeps
+(`decode_fp16_{k,v}`) is capacity-allocated against the same offset and follows
+for free.
+
+The reset surfaced two ways, and only one of them was loud. A multi-token
+forward — a speculative verify block — attends `seq` keys against a mask the
+caller sized from the reported offset, which is the opaque
+`add: [broadcast_shapes] Shapes (1,kv,rep,seq,seq) and (1,1,seq,n+seq) cannot be
+broadcast` that Gemma4-assistant MTP hit under `--kv-quant mixed_k8g64_v4g64` on
+its first partial-accept round. A single-token decode needs no mask, so it
+silently attended the current token alone with no error anywhere. Pinned by
+`kvcache/shared_source_tests.rs::mixed_truncate_to_keeps_the_prefix_it_was_told_to_keep`,
+which asserts through the store (an additive mask sized to the kept prefix) and
+not through the surfaced share — the bf16 mirror is rebuilt from
+`KvCache::offset` and spans the kept prefix either way, so an assertion on it
+cannot tell the two behaviours apart.
+
 Tests: `storage/cpu_block_truncate_tests.rs` — the partial-accept round trip per
 store (`QuantV`, `QuantKTurbo3`, `QuantKTurbo4`, `QuantPlanarK`, `QuantPlanarV`,
 `QuantK`) at `kv_h` 1 and 3; the `b > 1` and q8-group refusals; the zero,
