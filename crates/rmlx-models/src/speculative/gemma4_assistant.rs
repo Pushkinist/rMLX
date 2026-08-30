@@ -75,6 +75,7 @@ use rmlx_mlx::{
     Array, Device, Dtype,
 };
 
+use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
@@ -766,6 +767,7 @@ pub fn mtp_assistant_generate_greedy(
     let mut total_accept: usize = 0;
     let mut rounds: usize = 0;
     let t_total = Instant::now();
+    let mut window = DecodeWindow::new();
     let mut draft_ns: u128 = 0;
     let mut verifier_ns: u128 = 0;
 
@@ -791,18 +793,7 @@ pub fn mtp_assistant_generate_greedy(
 
     // Emit the first bonus.
     {
-        let piece = tokenizer
-            .id_to_token(b)
-            .unwrap_or_else(|| format!("<unk:{b}>"));
-        let step = ProbeStep {
-            token_id: b,
-            piece: piece.into_boxed_str(),
-            max_abs_logit: 0.0,
-            nan_count: 0,
-            logprobs: None,
-        };
-        step_fn(&step);
-        emitted.push(step);
+        emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
         if eos_ids.contains(&b) {
             return Ok(emitted);
         }
@@ -877,18 +868,7 @@ pub fn mtp_assistant_generate_greedy(
             if emitted.len() >= n_tokens {
                 break;
             }
-            let piece = tokenizer
-                .id_to_token(id)
-                .unwrap_or_else(|| format!("<unk:{id}>"));
-            let step = ProbeStep {
-                token_id: id,
-                piece: piece.into_boxed_str(),
-                max_abs_logit: 0.0,
-                nan_count: 0,
-                logprobs: None,
-            };
-            step_fn(&step);
-            emitted.push(step);
+            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
             if eos_ids.contains(&id) {
                 hit_eos = true;
                 break;
@@ -959,6 +939,7 @@ pub fn mtp_assistant_generate_greedy(
         } else {
             0.0
         },
+        decode_tps = ?window.tps(),
         elapsed_ms,
         draft_ms = (draft_ns as f64) / 1.0e6,
         verifier_ms = (verifier_ns as f64) / 1.0e6,
