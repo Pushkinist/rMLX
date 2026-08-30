@@ -1353,9 +1353,11 @@ Green. Validated against `jinaai/jina-embeddings-v4`.
 
 ## Speculative drafters
 
-rMLX implements three speculative drafter families. All share the same
-`SpeculativeDispatcher` infrastructure (persistent verifier + draft KV caches,
-`truncate_to`-based rollback, optional GDN snapshot/restore).
+rMLX implements three speculative drafter families. Each is a sidecar head
+with its own round loop; the shared parts are the verifier the
+`SpeculativeDispatcher` holds, its persistent KV caches, `truncate_to`-based
+rollback, and optional GDN snapshot/restore. There is no second full model —
+a sidecar dispatcher's `draft` slot is empty.
 
 ### MTP head (`mtp`)
 
