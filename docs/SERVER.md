@@ -209,7 +209,7 @@ Expired requests return HTTP 408 `timeout`.
 | `messages` | array (required) | `role` + `content`; also `tool_calls`, `tool_call_id`, `name`. |
 | `stream` | bool | Default false. |
 | `temperature` | f32 | Four-tier fallback: request → `--default-temperature` → `generation_config.json` → 1.0. |
-| `max_tokens` | u32 | Capped at `--max-tokens-cap` (default unlimited). |
+| `max_tokens` | u32 | Capped at `--max-tokens-cap`, itself bounded by the structural ceiling of 1 048 576 completion tokens. Over-cap requests are rejected with HTTP 400, never clamped. |
 | `top_p` | f32 | Same four-tier fallback as temperature. |
 | `top_k` | u32 | Falls back to `generation_config.json`. |
 | `seed` | u64 | |
