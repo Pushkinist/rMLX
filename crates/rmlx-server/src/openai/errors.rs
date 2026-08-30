@@ -195,11 +195,17 @@ pub fn parse_logit_bias(raw: Option<&HashMap<String, f32>>) -> Result<Vec<(u32, 
 ///
 /// `_model_id` is accepted for symmetry with other server helpers but not
 /// embedded in the message (the user already knows which model they POSTed to).
+///
+/// The operator `cap` can only lower the structural ceiling
+/// [`crate::bounds::MAX_COMPLETION_TOKENS`], never raise it: `max_tokens`
+/// sizes the generator's pre-allocations, so an uncapped server must still
+/// refuse a request-chosen allocation size.
 pub(crate) fn enforce_max_tokens_cap(
     requested: u32,
     cap: u32,
     _model_id: &str,
 ) -> Result<u32, Box<Response>> {
+    let cap = cap.min(crate::bounds::MAX_COMPLETION_TOKENS);
     if requested > cap {
         let msg = format!("max_tokens {requested} exceeds server cap {cap}");
         Err(Box::new(bad_request(&msg)))

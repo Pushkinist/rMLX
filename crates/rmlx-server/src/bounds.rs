@@ -16,6 +16,7 @@
 //! | [`MAX_CONTENT_PARTS`] | 1024 | No published cap; 1024 allows large vision batches while bounding memory |
 //! | [`MAX_INPUT_AUDIO_BYTES`] | 16 MiB | Practical voice-turn limit; larger uploads should use the files API |
 //! | [`MAX_TOTAL_INPUT_TOKENS_ESTIMATE`] | 1 048 576 | 1M-token coarse bound (bytes ÷ 3); prevents 100 GB JSON payloads |
+//! | [`MAX_COMPLETION_TOKENS`] | 1 048 576 | A completion cannot outgrow the context holding it; sizes the generator pre-allocation |
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -63,6 +64,17 @@ pub const MAX_INPUT_AUDIO_BYTES: usize = 16 * 1024 * 1024;
 /// on average (UTF-8 prose is slightly above; code is slightly below). This
 /// prevents a pathological 3 GB JSON payload from reaching the tokeniser.
 pub const MAX_TOTAL_INPUT_TOKENS_ESTIMATE: usize = 1_048_576;
+
+/// Structural ceiling on a single request's `max_tokens` (1 Mi tokens).
+///
+/// `max_tokens` sizes generator pre-allocations — `Vec::with_capacity(n_tokens)`
+/// for the per-step timestamps and the per-arch `steps` vector — so an
+/// unbounded value is an unbounded allocation. A completion can never outgrow
+/// the context window that holds it, and 1 Mi is above every context window in
+/// scope; it is the same ceiling the input side uses
+/// ([`MAX_TOTAL_INPUT_TOKENS_ESTIMATE`]) and that the Anthropic route reports
+/// `ctx_max` against. `--max-tokens-cap` can lower it, never raise it.
+pub const MAX_COMPLETION_TOKENS: u32 = 1_048_576;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 

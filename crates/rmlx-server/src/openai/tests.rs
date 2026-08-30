@@ -2721,3 +2721,18 @@ fn bare_json_to_tool_call_empty_name_returns_none() {
     let json = r#"{"name":"","arguments":{}}"#;
     assert!(bare_json_to_tool_call(json).is_none());
 }
+
+/// `max_tokens` is the request field that sizes the generator's
+/// pre-allocations — `Vec::with_capacity(n_tokens)` for the per-step
+/// timestamps and the per-arch `steps` vector. The boundary refuses a value
+/// past the structural completion ceiling even when the operator configured no
+/// `--max-tokens-cap`, so no request can pick the allocation size.
+#[test]
+fn max_tokens_past_structural_ceiling_is_refused_without_an_operator_cap() {
+    use crate::bounds::MAX_COMPLETION_TOKENS;
+    use crate::openai::errors::enforce_max_tokens_cap;
+
+    assert!(enforce_max_tokens_cap(MAX_COMPLETION_TOKENS, u32::MAX, "m").is_ok());
+    assert!(enforce_max_tokens_cap(MAX_COMPLETION_TOKENS + 1, u32::MAX, "m").is_err());
+    assert!(enforce_max_tokens_cap(u32::MAX, u32::MAX, "m").is_err());
+}

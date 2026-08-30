@@ -561,8 +561,10 @@ pub struct AppState {
     /// CLI: `--idle-timeout-secs` (accepts `0` / `-1` / `30s` / `15m` / `2h`).
     pub idle_policy: KeepAlivePolicy,
     /// Per-request `max_tokens` ceiling. Requests exceeding this return HTTP 400
-    /// (`invalid_request_error`). Default `u32::MAX` (no cap). Configurable via
-    /// the `--max-tokens-cap` CLI flag. Replaces the Stage-1 hardcoded cap of 64.
+    /// (`invalid_request_error`). Configurable via the `--max-tokens-cap` CLI
+    /// flag; it can only lower the structural ceiling
+    /// [`crate::bounds::MAX_COMPLETION_TOKENS`], which applies whatever this
+    /// field holds.
     pub max_tokens_cap: u32,
     /// Server-startup cap on per-request wall-clock timeout, in seconds.
     ///
