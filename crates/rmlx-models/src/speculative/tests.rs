@@ -9,24 +9,29 @@ fn dispatcher_module_compiles() {
     fn _assert_signatures() {
         let _: fn(&Path, &Path, Device) -> Result<SpeculativeDispatcher> =
             SpeculativeDispatcher::load_speculative;
+        let _: fn(&Path, Device) -> Result<SpeculativeDispatcher> =
+            SpeculativeDispatcher::load_verifier_only;
         let _: fn(&SpeculativeDispatcher, &[u32], usize) -> Result<Array> =
             SpeculativeDispatcher::spec_forward;
     }
     _assert_signatures();
 }
 
-/// Live constructor test using a single small snapshot as both
-/// verifier and draft (sanity-only — same model, vocab match
-/// trivially holds).
+/// A sidecar drafter costs one resident copy of the verifier, not two.
 ///
-/// Only runs locally when Open Models is present. Gated `#[ignore]`.
+/// `load_verifier_only` is the constructor the MTP / EAGLE-3 / DFlash serve
+/// branches take; the empty draft slot is what makes the second `load_model`
+/// impossible rather than merely unused. The two-model generators must then
+/// say so rather than silently drafting with the verifier.
+///
+/// Loads on `Device::Cpu` and dispatches no Metal, so it is not `#[ignore]`d —
+/// the snapshot guards below skip it cleanly when Open Models is absent.
 #[test]
-#[ignore]
 #[allow(
     clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+    reason = "test-only: a snapshot this process has already checked for existence but cannot load is a broken checkout, and the panic names it"
 )]
-fn load_speculative_same_model_constructs() {
+fn load_verifier_only_holds_no_draft_model() {
     let Some(path_buf) =
         std::env::var_os("RMLX_TEST_MODEL_GEMMA4_E2B").map(std::path::PathBuf::from)
     else {
@@ -39,14 +44,59 @@ fn load_speculative_same_model_constructs() {
         return;
     }
 
-    let disp = SpeculativeDispatcher::load_speculative(path, path, Device::Cpu)
-        .expect("load_speculative same-model");
+    let disp =
+        SpeculativeDispatcher::load_verifier_only(path, Device::Cpu).expect("load_verifier_only");
     assert_eq!(disp.vocab_size(), disp.verifier.vocab_size());
-    assert_eq!(disp.vocab_size(), disp.draft.vocab_size());
+
+    let msg = disp
+        .draft_model()
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(
+        msg.contains("needs a draft model"),
+        "sidecar dispatcher must hold no draft model; got: {msg:?}"
+    );
 }
 
-/// Live spec_forward(K=4) on a single small snapshot used as both
-/// draft and verifier. Only checks shape `[1, K, vocab]`.
+/// `load_speculative` refuses a verifier and draft that name one snapshot.
+///
+/// That call shape materialises the weights twice for no speedup. It is the
+/// shape every sidecar serve branch used to have, and the one a new drafter
+/// kind would re-introduce by copy. The rejection is a path check, so it fires
+/// before any I/O and needs no snapshot on disk.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: a temp dir this process cannot create is an environment failure, and the panic names it"
+)]
+fn load_speculative_rejects_one_snapshot_on_both_sides() {
+    // An empty directory: reaching `load_model` at all would fail on the
+    // missing config.json, so a bare `is_err()` would pass either way. The
+    // assertions below name the rejection instead. `TempDir` gives this run
+    // its own path and removes it on drop, panic included.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path();
+    let name = dir.file_name().expect("tempdir path has a final component");
+
+    // Two spellings of one directory are still one directory. `Path` equality
+    // alone does not see through the second one — canonicalisation does.
+    let aliased = dir.join("..").join(name);
+    assert_ne!(dir, aliased.as_path());
+    for draft in [dir, aliased.as_path()] {
+        let msg = SpeculativeDispatcher::load_speculative(dir, draft, Device::Cpu)
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
+        assert!(
+            msg.contains("same snapshot directory"),
+            "draft={}: expected the same-snapshot rejection, got: {msg:?}",
+            draft.display()
+        );
+    }
+}
+
+/// Live spec_forward(K=4) on a single small snapshot. `spec_forward` routes
+/// the verifier only, so a verifier-only dispatcher is the right shape.
+/// Only checks shape `[1, K, vocab]`.
 #[test]
 #[ignore]
 #[allow(
@@ -71,7 +121,7 @@ fn spec_forward_k4_returns_correct_shape() {
     }
 
     let disp =
-        SpeculativeDispatcher::load_speculative(path, path, Device::Cpu).expect("load_speculative");
+        SpeculativeDispatcher::load_verifier_only(path, Device::Cpu).expect("load_verifier_only");
     // BOS + a few synthetic tokens from gemma vocab range.
     let ids: Vec<u32> = vec![2, 105, 2364, 107, 4368, 105];
     let k = 4_usize;

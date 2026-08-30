@@ -64,6 +64,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The speculative serve path loaded the verifier twice.** The MTP / EAGLE-3 /
+  DFlash branches each called `load_speculative(verifier_dir, verifier_dir, ..)`
+  to fill a draft slot their round loops never read, and `load_speculative` has
+  no reuse path — so `load_model` ran twice on one directory and MLX took an
+  owning copy each time. Resident memory measured 52.5 GB for
+  `Qwen3.8-27B-mxfp8` and 9.7 GB for `gemma-4-e2b-it-mxfp8`, roughly double what
+  a single copy needs, leaving no headroom for a second model or long-context
+  prefill scratch on a 128 GB machine. The dispatcher's draft slot is now
+  optional and the sidecar branches load the verifier once, so the second copy
+  is impossible rather than merely unused: 52.5 GB → 26.7 GB and 9.7 GB →
+  5.2 GB, with temp=0 output byte-identical either side. Qwen3.6-35B-A3B holds
+  one 35 GB copy across all three drafter kinds.
+
+  `--draft-model` naming the same snapshot as `--model` is now refused at load
+  rather than silently doubling the weights — a draft that is the verifier costs
+  exactly as much to run as the verifier it is meant to outrun. The affected
+  configuration is a **profile-supplied `draft_model`**: clap's
+  `requires = "draft_kind"` only binds CLI-supplied flags, so a `profiles.toml`
+  / `projects.toml` that sets `draft_model` to the `--model` path reached the
+  two-model path and now fails at startup with a message naming the fix. Point
+  `draft_model` at a smaller model, or drop the key.
+
 - **`KvStorage::truncate_to` reset the `Mixed` store instead of truncating it,
   so a cache reported `n` positions and held zero.** `KvCache::truncate_to` sets
   `offset = n` immediately afterwards, and the reset was never needed — the

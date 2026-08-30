@@ -262,33 +262,21 @@ impl SpeculativeGenerator {
             "SpeculativeGenerator: parsed EOS token ids from verifier config"
         );
 
-        // branch on draft kind. For MTP the `--draft-model` folder is a
-        // sidecar HEAD (not a full model), so it cannot go through
-        // `load_speculative` (which `load_model`s both sides). We load the
-        // verifier once for the dispatcher, the MTP head separately, and — until
-        // the on-device MTP decode loop's decoder-layer step is wired against a
-        // real checkpoint — reuse the verifier snapshot for the dispatcher's
-        // draft slot so the struct is valid and the legacy two-model spec path
-        // still serves. The MTP loop, when enabled, ignores that draft slot.
+        // branch on draft kind. For MTP / EAGLE-3 / DFlash the `--draft-model`
+        // folder is a sidecar HEAD, not a full model: the dispatcher holds the
+        // verifier alone (`load_verifier_only`) and the head is loaded beside
+        // it, driven by its own round loop. Only the final `else` arm — the
+        // `--draft-model` full-model case — has two models to load.
         let (dispatcher, mtp_drafter, mtp_assistant, dflash_drafter, eagle3_drafter) = if matches!(
             draft_kind,
             Some(rmlx_models::DraftKind::Eagle3)
         ) {
-            // the `--draft-model` is a standalone EAGLE-3 drafter (not
-            // a full model), so it cannot go through `load_speculative`. Load
-            // the verifier once for the dispatcher, the EAGLE-3 drafter
-            // separately, and reuse the verifier snapshot for the dispatcher's
-            // draft slot so the struct is valid (the EAGLE-3 round-loop ignores
-            // it).
             tracing::info!(
                 draft = %draft_dir.display(),
                 "SpeculativeGenerator: EAGLE-3 drafter — loading drafter"
             );
-            let dispatcher = rmlx_models::SpeculativeDispatcher::load_speculative(
-                verifier_dir,
-                verifier_dir,
-                device,
-            )?;
+            let dispatcher =
+                rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
             let hidden_size = dispatcher.verifier.hidden_size();
             let vocab_size = dispatcher.verifier.vocab_size();
             let drafter = rmlx_models::speculative::eagle3::Eagle3Drafter::load(
@@ -306,20 +294,12 @@ impl SpeculativeGenerator {
                 Some(Arc::new(Mutex::new(drafter))),
             )
         } else if matches!(draft_kind, Some(rmlx_models::DraftKind::DFlash)) {
-            // the `--draft-model` is a standalone DFlash drafter (not a
-            // full model), so it cannot go through `load_speculative`. Load the
-            // verifier once for the dispatcher, the DFlash drafter separately,
-            // and reuse the verifier snapshot for the dispatcher's draft slot
-            // so the struct is valid (the DFlash round-loop ignores it).
             tracing::info!(
                 draft = %draft_dir.display(),
                 "SpeculativeGenerator: DFlash drafter — loading drafter"
             );
-            let dispatcher = rmlx_models::SpeculativeDispatcher::load_speculative(
-                verifier_dir,
-                verifier_dir,
-                device,
-            )?;
+            let dispatcher =
+                rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
             let hidden_size = dispatcher.verifier.hidden_size();
             let drafter = rmlx_models::speculative::dflash::DFlashDrafter::load(
                 draft_dir,
@@ -338,11 +318,8 @@ impl SpeculativeGenerator {
                 draft = %draft_dir.display(),
                 "SpeculativeGenerator: MTP drafter — loading sidecar head"
             );
-            let dispatcher = rmlx_models::SpeculativeDispatcher::load_speculative(
-                verifier_dir,
-                verifier_dir,
-                device,
-            )?;
+            let dispatcher =
+                rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
             let hidden_size = dispatcher.verifier.hidden_size();
             // Route by the draft model's detected architecture family — never
             // by a substring leak. `--draft-kind mtp` covers two distinct

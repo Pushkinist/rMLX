@@ -562,16 +562,24 @@ layer are precomputed at load time.
 
 ## SpeculativeDispatcher
 
-`SpeculativeDispatcher` is the top-level (verifier, draft) container for the
+`SpeculativeDispatcher` is the top-level container for the
 two-independent-model speculative path (Gemma4 31B + Gemma4 E2B). The
 drafter-conditioned paths (MTP, DFlash, EAGLE-3) each have their own
 round-loop function and are dispatched from the serve layer based on the
 `draft_kind` parameter.
 
-Construction (`SpeculativeDispatcher::new`) asserts:
+Two constructors, because the two shapes hold different numbers of models:
 
-- `verifier.vocab_size() == draft.vocab_size()` — mismatched vocabularies
-  make speculation meaningless.
+- `load_speculative(verifier_dir, draft_dir, device)` — the two-model path.
+  `SpeculativeDispatcher::new` asserts
+  `verifier.vocab_size() == draft.vocab_size()`; mismatched vocabularies make
+  speculation meaningless. Naming the *same* directory on both sides is
+  refused: it materialises the weights twice, and a draft that is the verifier
+  costs exactly as much to run as the verifier it is meant to outrun.
+- `load_verifier_only(verifier_dir, device)` — the sidecar path taken by every
+  `draft_kind`. MTP / DFlash / EAGLE-3 drafters are small heads the serve layer
+  loads and drives itself, so `draft` is `None` and the verifier weights are
+  resident once. `spec_generate_*` refuses to run on such a dispatcher.
 
 `spec_generate_greedy` is the public entry point:
 
@@ -580,9 +588,9 @@ Construction (`SpeculativeDispatcher::new`) asserts:
 - Otherwise routes to `spec_generate_greedy_cached` (deterministic argmax,
   temperature == 0).
 
-Both paths share the same KV cache structure and rollback logic. The
-`spec_generate_greedy_no_cache` method (full re-prefill every round, no
-persistent KV cache) is retained as a fallback reference.
+Both paths share the same KV cache structure and rollback logic. There is no
+re-prefill fallback: an architecture whose `forward_seq_last_k_with_cache` is
+unwired surfaces that error.
 
 ## Accept-rate Gates and Verifier-prefill Chunking
 
