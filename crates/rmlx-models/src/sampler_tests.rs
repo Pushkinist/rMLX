@@ -1998,3 +1998,17 @@ fn host_greedy_matches_device_argmax_on_a_bf16_tie() {
         "BF16 tie: host greedy picked {host_id}, device argmax picked {device_id}"
     );
 }
+
+/// `k` is caller-supplied, so it must not size the result vector: the
+/// selection is clamped to the vocabulary before the allocation, and a `k`
+/// past the vocabulary yields exactly `vocab` ranks.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture: compute_top_logprobs over a [1, 4] F32 row built in the same fn"
+)]
+fn compute_top_logprobs_clamps_k_to_vocab() {
+    let logits = f32_row(&[5.0, 7.0, 5.0, 9.0]);
+    let out = compute_top_logprobs(&logits, 3, usize::MAX).unwrap();
+    assert_eq!(out.top.len(), 4, "k must be clamped to the vocabulary");
+}

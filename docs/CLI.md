@@ -103,7 +103,7 @@ mutually exclusive.
 | `--draft-model` | path | — | Path to a draft model for speculative decoding. Requires `--draft-kind`. |
 | `--draft-kind` | `mtp \| dflash \| eagle3` | — | Drafter architecture. Requires `--draft-model`. Env: `MLX_VLM_DRAFT_KIND`. |
 | `--draft-block-size` | usize | 4 | Tokens proposed per speculative round. Env: `MLX_VLM_DRAFT_BLOCK_SIZE`. |
-| `--max-tokens-cap` | u32 | `u32::MAX` | Per-request `max_tokens` ceiling. Requests exceeding this receive HTTP 400. |
+| `--max-tokens-cap` | u32 | `1048576` | Per-request `max_tokens` ceiling. Requests exceeding this receive HTTP 400. Only lowers the structural 1 048 576-token ceiling. |
 | `--max-timeout-secs` | u64 | 600 | Server-startup wall-clock timeout cap per request in seconds. `0` disables. |
 | `--require-smoke-probe` | bool flag | off | Run 8-token smoke probe on every model load; reject `BrokenPunctLoop` / `BrokenNan` results with HTTP 503. In practice only `BrokenPunctLoop` fires: every path that can see a NaN logit row now aborts the request where it is detected, so no `ProbeStep` reaching the classifier carries a non-zero `nan_count`. A NaN surfaces as a failed request with an `error = %e` / `nan_count` event, not as a smoke verdict. |
 | `--max-loaded-models` | usize | 1 | Maximum models held resident in GPU memory. LRU eviction when exceeded. Also bounds registry eager-preload: only the alphabetically-first `min(cap, N)` model ids are warmed at boot (anything beyond the cap would be evicted by the next load, so preloading it is pure waste). |

@@ -559,8 +559,8 @@ enum Cmd {
         draft_block_size: Option<usize>,
         /// Per-request `max_tokens` ceiling. Requests with a higher value
         /// receive HTTP 400 `invalid_request_error` instead of being silently
-        /// clamped. Default `u32::MAX` (no cap). Replaces the Stage-1 hardcoded
-        /// cap of 64 (A1).
+        /// clamped. Only lowers the server's structural ceiling of 1 048 576
+        /// completion tokens, which applies when this flag is absent.
         #[arg(long)]
         max_tokens_cap: Option<u32>,
         /// Server-startup cap on per-request wall-clock timeout, in seconds (A8).
@@ -1503,7 +1503,7 @@ const DEFAULT_SERVE_HOST: &str = "127.0.0.1";
 const DEFAULT_SERVE_DEVICE: &str = "gpu";
 const DEFAULT_SERVE_KV_QUANT: &str = "auto";
 const DEFAULT_PROMPT_CACHE_SLOTS: usize = 4;
-const DEFAULT_MAX_TOKENS_CAP: u32 = u32::MAX;
+const DEFAULT_MAX_TOKENS_CAP: u32 = rmlx_server::bounds::MAX_COMPLETION_TOKENS;
 const DEFAULT_MAX_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_MAX_LOADED_MODELS: usize = 1;
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 64;
