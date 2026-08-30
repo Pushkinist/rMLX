@@ -30,9 +30,9 @@ Step-by-step execution — one cell per run.
   ~3050 tok/s; the cited 28000 tok/s exceeds the M5 Max bandwidth ceiling and is
   non-physical. Prefill is bandwidth-bound; both backends sit at ~the same level.
   The §2a grid below is the pre-fix `rmlx baseline` record. See §4 ①.
-- **Speculative barely helps:** MTP +4.2% (best drafter), DFlash −37%, Eagle3
-  −39% (now works after the crash fix, but low accept ~0.27 → net loss). Spec-loop
-  overhead eats the accept gain.
+- **Speculative: MTP pays, the other two do not.** MTP sidecar +2% to +34%
+  depending on prompt class (accept 0.65–0.90); DFlash −3% to −22% (accept
+  0.49–0.61); Eagle3 −26% to −39% (accept 0.26–0.36). See §2d.
 - **SSD tier** decode-neutral (−0.5% / −3.1%); spill now persists correctly; the
   **hydrate-doesn't-skip-prefill** gap remains (#9, deferred).
 - **PARO 27B:** rMLX runs it (26.3 TPS) but −5.6% vs the paroquant reference.
@@ -154,41 +154,43 @@ purpose is **capacity** (KV that outgrows RAM), not speed; at 128k single-stream
    post-fix: WARN gone, `kv-spill: block written + indexed` confirmed (2.34 GB
    blocks persisted), decode 56.41 TPS (−3.1%, within noise).
 
-### 2d. Phase E — speculative (drafter × KV anchor)
+### 2d. Phase E — speculative (drafter × prompt class)
 
-Verifier = 35B-A3B-8bit, kv none, 4k, temp 0 (greedy accept). Baseline none@4k = 97.68.
+Verifier = 35B-A3B-8bit, kv none, `--max-ctx 16384`, temp 0 (greedy accept),
+200 completion tokens. Decode TPS is measured client-side over the streamed
+tokens — first token to last, prefill excluded — so the drafter and no-drafter
+arms mean the same thing. One warmup + three measured requests per cell, the
+four configurations run in palindromic order across two passes and pooled (n=6),
+median reported; within-cell spread 1.6–5.6%. Every cell is a `runs.db` row.
 
-| Drafter | decode TPS @4k | speedup vs none | accept-rate | vs champion 84.88 |
-|---|---|---|---|---|
-| MTP-5bit (block 3, k=4) | 101.77 | +4.2% (1.04×) | 66.4% | +20% |
-| DFlash (block 16, k=4) | 61.86 | **−37% (regression)** | 47.2% | −27% |
-| Eagle3 (block 5) | 59.61 | **−39% (regression)** | 26.5% | −30% |
+Baselines (no drafter): 102.7 code / 102.7 prose / 100.0 paris / 98.7 4k.
 
-_DFlash: the `z-lab__…-DFlash` snapshot loads as a heavy ~full-size MoE (72.6 GB
-dual-model peak) — draft cost ≈ verify cost, so spec backfires. Decode-only
-number; engine overall (incl. 6.5s prefill) was ~23 TPS. Dead end for this snapshot._
+| Drafter | Block | code | prose | paris | 4k |
+|---|---|---|---|---|---|
+| MTP-5bit | 3 | **1.34×** (0.895) | 1.02× (0.653) | **1.29×** (0.847) | **1.23×** (0.809) |
+| DFlash | 16 | 0.97× (0.608) | 0.78× (0.488) | 0.86× (0.491) | 0.84× (0.524) |
+| Eagle3 | 5 | 0.66× (0.305) | 0.62× (0.263) | 0.74× (0.362) | 0.61× (0.270) |
 
-_Eagle3: **the crash is fixed** (PR #8 / 0.1.1 — the drafter KV cache was
-hardcoded to 4096; now sized to the verifier `max_seq`). Re-tested post-fix:
-256 tokens complete, coherent, no `slice_update` crash. But decode is **59.61 TPS
-(−39% vs none)** at a low **26.5% accept-rate** — the small accept can't offset the
-spec-loop overhead, so Eagle3 is a net decode loss for this model (same shape as
-DFlash). Functional now, but not worth using here without a higher-accept drafter._
+Speedup vs no drafter, accept rate in parentheses. `code` / `prose` are
+`prompts/spec_bench/{code,prose}.json`, `4k` is `prompts/longctx_4k.json`,
+`paris` is the bare "What is the capital of France?" probe.
 
-**Phase E verdict (post-0.1.1):** all three drafters now RUN (Eagle3 crash fixed),
-but speculative is **not a net win** for Qwen3.6: MTP +4.2% (only positive),
-DFlash −37%, Eagle3 −39%. The accept-rates (MTP 66%, DFlash 47%, Eagle3 27%)
-don't clear the spec-loop overhead. Gains live behind (a) reducing per-round
-overhead, (b) a higher-accept / truly-lightweight drafter, (c) block-size / KV-
-anchor tuning — deferred to the improvement plan.
+**Phase E verdict:** the MTP sidecar is a net win on every prompt class, from
++2% on free prose up to +34% on code, and its accept rate tracks the prompt
+(0.65–0.90) rather than the codec. DFlash and Eagle3 both run correctly and
+accept real tokens but neither clears its own round-loop overhead: DFlash loses
+3–22%, Eagle3 26–39%. Use `--draft-kind mtp`; the other two are for reference
+alignment, not for serving this verifier.
 
-**Finding (forming):** MTP spec gives only **+4.2%** despite a 66% accept rate —
-the speculative round overhead (draft-model forwards + multi-position verify)
-nearly cancels the decode-step savings. With 66% accept + block 3, theory is
-~1.5×; rMLX realizes 1.04×. → **rMLX's spec path has overhead to recover**
-(improvement-plan target). Spec currently adds little over rMLX's already-winning
-kv-none. Testing DFlash / Eagle3 + block-size tuning to see if any drafter clears
-the overhead.
+**Where the older, much worse numbers came from.** An earlier grid recorded MTP
+at +4.2%, DFlash at −37% and Eagle3 at −39% here, at accept rates read as
+66% / 47% / 27%. Two measurement faults, both since fixed, account for the gap.
+The serve path loaded the verifier a second time for every sidecar drafter, so a
+DFlash run held three ~35 GB copies on a 128 GB machine and a plain MTP run two;
+and the throughput was scraped from a round-loop `decode_tps` field that divided
+the emitted tokens by prefill-plus-decode, which understates a 4k-prompt rate by
+more than half. Neither figure survives re-measurement, so neither is quoted
+anywhere any more.
 
 ---
 
@@ -240,11 +242,11 @@ Ranked by impact:
    (≈340 GB/s of ~600). llama.cpp/ollama saturate more. Tighter MoE decode kernels
    (expert gather + dequant fusion) could extend the lead. `--fused-qk` is
    default-OFF — turning it on may also let quant codecs win on decode.
-3. **Speculative overhead.** MTP only +4.2% despite 66% accept — the spec-round
-   cost (draft forwards + multi-position verify) nearly cancels the savings. The
-   Eagle3 MoE KV crash is **fixed (#8 / 0.1.1)** — Eagle3 now runs but at −39%
-   (27% accept). Remaining work: reduce per-round overhead; source a higher-accept
-   / truly-lightweight drafter (the DFlash snapshot is full-size).
+3. **Speculative overhead outside MTP.** The MTP sidecar clears its round cost
+   at every prompt class (+2% to +34%). DFlash and Eagle3 do not: they lose 3–22%
+   and 26–39% respectively, at accept rates of 0.49–0.61 and 0.26–0.36. Remaining
+   work: reduce per-round overhead; source a higher-accept / truly-lightweight
+   drafter (the DFlash snapshot is full-size).
 4. **SSD prompt-cache not skipping prefill (#9, open).** Hydrate restores KV but
    `prompt_cache_hits=0` → full prefill still runs. Wiring the hydrated prefix into
    the cache-hit path would turn SSD into a real cross-restart TTFT win (and helps

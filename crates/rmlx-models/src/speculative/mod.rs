@@ -436,6 +436,7 @@ impl SpeculativeDispatcher {
         let mut total_accept_count: usize = 0;
         let mut rounds: usize = 0;
         let t_total = Instant::now();
+        let mut window = DecodeWindow::new();
         let mut draft_ns: u128 = 0;
         let mut verifier_ns: u128 = 0;
 
@@ -653,18 +654,7 @@ impl SpeculativeDispatcher {
                 if emitted.len() >= n_tokens {
                     break;
                 }
-                let piece = tokenizer
-                    .id_to_token(id)
-                    .unwrap_or_else(|| format!("<unk:{id}>"));
-                let step = ProbeStep {
-                    token_id: id,
-                    piece: piece.into_boxed_str(),
-                    max_abs_logit: 0.0,
-                    nan_count: 0,
-                    logprobs: None,
-                };
-                step_fn(&step);
-                emitted.push(step);
+                emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
                 if eos_ids.contains(&id) {
                     hit_eos = true;
                     break;
@@ -801,6 +791,7 @@ impl SpeculativeDispatcher {
             } else {
                 0.0
             },
+            decode_tps = ?window.tps(),
             elapsed_ms,
             prefill_ms = (prefill_ns as f64) / 1.0e6,
             draft_ms = (draft_ns as f64) / 1.0e6,
@@ -894,6 +885,7 @@ impl SpeculativeDispatcher {
         let mut total_accept_count: usize = 0;
         let mut rounds: usize = 0;
         let t_total = Instant::now();
+        let mut window = DecodeWindow::new();
         let mut draft_ns: u128 = 0;
         let mut verifier_ns: u128 = 0;
 
@@ -1090,18 +1082,7 @@ impl SpeculativeDispatcher {
                 if emitted.len() >= n_tokens {
                     break;
                 }
-                let piece = tokenizer
-                    .id_to_token(id)
-                    .unwrap_or_else(|| format!("<unk:{id}>"));
-                let step = ProbeStep {
-                    token_id: id,
-                    piece: piece.into_boxed_str(),
-                    max_abs_logit: 0.0,
-                    nan_count: 0,
-                    logprobs: None,
-                };
-                step_fn(&step);
-                emitted.push(step);
+                emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
                 if eos_ids.contains(&id) {
                     hit_eos = true;
                     break;
@@ -1211,6 +1192,7 @@ impl SpeculativeDispatcher {
             } else {
                 0.0
             },
+            decode_tps = ?window.tps(),
             elapsed_ms,
             prefill_ms = (prefill_ns as f64) / 1.0e6,
             draft_ms = (draft_ns as f64) / 1.0e6,
@@ -1233,6 +1215,107 @@ impl SpeculativeDispatcher {
 // ---------------------------------------------------------------------------
 // Cached round-loop helpers
 // ---------------------------------------------------------------------------
+
+/// The wall-clock window a round loop spends decoding, first emitted token to
+/// last.
+///
+/// A round loop's total elapsed time also covers prompt prefill, so
+/// `emitted / elapsed` shrinks as the prompt grows and cannot be compared with
+/// the non-speculative `decode_tps` that `rmlx baseline` records. This measures
+/// the same window that one does — `(marks - 1) / (last - first)`.
+///
+/// The window counts its own marks rather than trusting a caller-supplied
+/// token total: the two can only agree if every emitted token went through
+/// [`emit_step`], and a count passed in from outside would let a loop that
+/// emits without marking report a rate faster than it ran.
+///
+/// One divergence from `rmlx baseline` remains, and it is deliberate: where
+/// that path falls back to an overall (prefill-inclusive) rate when it has
+/// fewer than two tokens to work with, this returns `None`. There is no
+/// second rate here that would be honest to substitute.
+#[derive(Debug, Default)]
+pub(crate) struct DecodeWindow {
+    first: Option<Instant>,
+    last: Option<Instant>,
+    marks: usize,
+}
+
+impl DecodeWindow {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a token about to be handed to the sink.
+    ///
+    /// Both endpoints are taken *before* the `step_fn` callback, so the sink
+    /// cost of tokens `1..N-1` (tokenizer decode, think-splitter, channel
+    /// backpressure) falls inside the window and the Nth token's does not —
+    /// the same convention as the first/last callback stamps `rmlx baseline`
+    /// measures between.
+    fn mark(&mut self) {
+        self.mark_at(Instant::now());
+    }
+
+    /// [`Self::mark`] at a caller-supplied instant, so a test can drive the
+    /// window without sleeping.
+    fn mark_at(&mut self, at: Instant) {
+        self.first.get_or_insert(at);
+        self.last = Some(at);
+        self.marks += 1;
+    }
+
+    /// How many tokens this window has seen. Test accessor: production code
+    /// reads the count only through [`Self::tps`].
+    #[cfg(test)]
+    fn marks(&self) -> usize {
+        self.marks
+    }
+
+    /// Tokens per second over the window, or `None` when fewer than two tokens
+    /// were emitted and there is no interval to measure.
+    ///
+    /// `None` rather than `0.0`: a zero in this slot prints, averages and wins
+    /// a champion cell exactly like a real throughput of zero.
+    pub(crate) fn tps(&self) -> Option<f64> {
+        let (Some(first), Some(last)) = (self.first, self.last) else {
+            return None;
+        };
+        let secs = last.duration_since(first).as_secs_f64();
+        (self.marks >= 2 && secs > 0.0).then(|| ((self.marks - 1) as f64) / secs)
+    }
+}
+
+/// Emit a single token through `step_fn` + the running `emitted` buffer.
+///
+/// Every speculative round loop emits through here, which is what keeps
+/// [`DecodeWindow::tps`] honest — a loop that pushed to `emitted` directly
+/// would leave the window short and the rate wrong.
+///
+/// The `Option<u32>` force-next signal `step_fn` may return is **discarded**:
+/// the ordinary decode loop folds it into `forced_next` to close an
+/// over-budget thinking block, so that force-close is inert on every
+/// speculative path.
+pub(crate) fn emit_step(
+    tokenizer: &tokenizers::Tokenizer,
+    id: u32,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    emitted: &mut Vec<ProbeStep>,
+    window: &mut DecodeWindow,
+) {
+    let piece = tokenizer
+        .id_to_token(id)
+        .unwrap_or_else(|| format!("<unk:{id}>"));
+    let step = ProbeStep {
+        token_id: id,
+        piece: piece.into_boxed_str(),
+        max_abs_logit: 0.0,
+        nan_count: 0,
+        logprobs: None,
+    };
+    window.mark();
+    step_fn(&step);
+    emitted.push(step);
+}
 
 /// Chunked prefill of `tokens` into `caches`, mirroring the gemma4 generate
 /// path (enter_prefill / exit_prefill brackets, per-arch chunk size).
