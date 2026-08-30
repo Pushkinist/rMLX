@@ -2,6 +2,8 @@
 
 use super::*;
 
+use std::time::{Duration, Instant};
+
 /// Compile-check: ensure the public type and methods exist with
 /// the expected signatures. No runtime work.
 #[test]
@@ -207,4 +209,106 @@ fn spec_prefill_chunked_reports_first_cause() {
         err.to_string().contains("simulated spec prefill cause"),
         "the underlying cause must reach the caller verbatim, got: {err}"
     );
+}
+
+/// The reported decode rate covers the emitted tokens, not the prefill.
+///
+/// A round loop's total elapsed time starts before the verifier prefill, so
+/// dividing the emitted count by it reports a rate that falls as the prompt
+/// grows — on a 4k prompt that understated the measured rate by more than
+/// half. The window opens at the first emitted token, which is what makes a
+/// speculative rate comparable with the ordinary `decode_tps`.
+///
+/// Instants are injected rather than slept for: a sleep-calibrated bound is a
+/// nondeterministic gate under a loaded `cargo test --workspace`.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: two marks were just made on the line above, so `tps` returning None would itself be the failure this asserts"
+)]
+fn decode_window_excludes_the_time_before_the_first_token() {
+    let t0 = Instant::now();
+    let mut w = DecodeWindow::new();
+    // Stand-in for prefill: real time passes before any token is emitted.
+    w.mark_at(t0 + Duration::from_millis(120));
+    w.mark_at(t0 + Duration::from_millis(160));
+
+    // One 40 ms inter-token gap is exactly 25 tok/s. Counting the 120 ms
+    // prefill as well would give 1/0.160 = 6.25.
+    let tps = w.tps().expect("two marks span a measurable interval");
+    assert!(
+        (tps - 25.0).abs() < 1e-9,
+        "decode rate {tps} is not the inter-token rate; the window must open at the first emitted token"
+    );
+}
+
+/// A window with fewer than two marks reports nothing, not zero.
+///
+/// `0.0` in that slot prints, averages and wins a champion cell exactly like a
+/// real throughput of zero, which is the same reason `rmlx baseline` carries
+/// its phase timings as `Option`.
+#[test]
+fn decode_window_reports_none_before_two_tokens() {
+    let mut w = DecodeWindow::new();
+    assert!(w.tps().is_none(), "an empty window has no rate to report");
+    w.mark_at(Instant::now());
+    assert!(w.tps().is_none(), "one token spans no interval");
+}
+
+/// Every token a round loop emits also advances the window.
+///
+/// This is the property the reported rate rests on: the window derives its
+/// numerator from its own mark count, so the count is only right if
+/// `emit_step` is the single door into `emitted`. Dropping the `mark()` from
+/// `emit_step`, or pushing to `emitted` around it, shows up here as a
+/// mismatch.
+///
+/// What this does **not** gate: that each round loop logs `window.tps()`
+/// rather than recomputing a rate from `elapsed_ms`. That is one line per
+/// loop with no server-free oracle. The structural guard there is that `tps`
+/// takes no token count, so the old expression cannot be restored by
+/// substituting an argument.
+#[test]
+fn emit_step_advances_the_window_once_per_token() {
+    let tk = tiny_tokenizer();
+    let mut emitted: Vec<ProbeStep> = Vec::new();
+    let mut window = DecodeWindow::new();
+    let mut seen = 0_usize;
+    let mut step_fn = |_: &ProbeStep| -> Option<u32> {
+        seen += 1;
+        None
+    };
+
+    for id in [1_u32, 2, 3, 4, 5] {
+        emit_step(&tk, id, &mut step_fn, &mut emitted, &mut window);
+    }
+
+    assert_eq!(emitted.len(), 5, "every call must push a step");
+    assert_eq!(
+        window.marks(),
+        emitted.len(),
+        "the window fell behind the emitted buffer — a rate built on its mark count would run fast"
+    );
+    assert_eq!(seen, 5, "every emitted token must reach the sink");
+}
+
+/// A minimal in-memory tokenizer: `emit_step` only calls `id_to_token`.
+///
+/// Built from a literal vocabulary rather than a snapshot on disk — a helper
+/// that returned `None` when the checkout has no models would make the test
+/// above skip silently, and a test that skips is not a gate.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the vocabulary is the literal three lines above, so a build failure is a broken `tokenizers` dependency and the panic names it"
+)]
+fn tiny_tokenizer() -> tokenizers::Tokenizer {
+    use tokenizers::models::wordlevel::WordLevel;
+
+    let vocab = (0_u32..8).map(|i| (format!("tok{i}"), i)).collect();
+    let model = WordLevel::builder()
+        .vocab(vocab)
+        .unk_token("tok0".to_owned())
+        .build()
+        .expect("literal vocabulary builds a WordLevel model");
+    tokenizers::Tokenizer::new(model)
 }

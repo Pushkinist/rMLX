@@ -240,9 +240,14 @@ is mandatory — only one MLX process per Mac.
   `Qwen3.6-35B-A3B-8bit` verifier. The `spec_decode` assert serves with
   `--draft-model`/`--draft-kind` under verbose logging, drives a 300-token
   generation, and scrapes the `<kind>_generate_greedy: done` round-loop summary
-  for `accept_rate`. **Result: 2/2 PASS** — DFlash accept_rate≈0.75 (52 rounds),
-  MTP accept_rate≈0.89 (108 rounds), both coherent ("Paris" in the thinking
-  block). Unlike the earlier recommendation, accept-rate IS externally
+  for `accept_rate`. **Result: 2/2 PASS** — both round loops fired and both are
+  coherent ("Paris" in the thinking block). The rates that run recorded (DFlash
+  ≈0.75, MTP ≈0.89) do not survive re-measurement on the same probe: DFlash is
+  0.491 and MTP 0.847, and the drafters differ by more than the gate can see —
+  MTP is +29% decode there and DFlash −14%. The gate asserts `accept_rate > 0`
+  and coherence, so it passes either way; read the numbers from
+  `docs/SPECULATIVE.md`, not from this line. Unlike the earlier recommendation,
+  accept-rate IS externally
   observable via the round-loop's `tracing::info!` summary in the run jsonl — no
   HTTP surface needed, same log-scrape mechanism as `dispatch_fired`. This
   supersedes the old `p2_speculative_decode` Bonsai/MTP `phase2` stub (Bonsai is

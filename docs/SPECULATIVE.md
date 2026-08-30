@@ -396,9 +396,11 @@ Weight layout:
 | `layers.{i}.mlp.{gate,up,down}_proj.weight` | — | SwiGLU MLP |
 
 Status: fully wired and live-validated against `z-lab/Qwen3.6-35B-A3B-DFlash`
-plus `mlx-community/Qwen3.6-35B-A3B-8bit` verifier. The numeric alignment
-(round-0 first proposal and full-run accept rate of ~0.515 on the test prompt)
-matches the mlx-vlm `_dflash_rounds` reference.
+plus `mlx-community/Qwen3.6-35B-A3B-8bit` verifier. The round-0 first proposal
+matches the mlx-vlm `_dflash_rounds` reference; that is a per-round alignment
+check and says nothing about the full-run rate, which is prompt-dependent
+(0.488-0.608 measured, see Reference Accept Rates) and a net decode loss at
+every prompt class measured.
 
 ### EAGLE-3 (Qwen3.6-MoE target)
 
@@ -416,8 +418,9 @@ along the feature axis (`3*H = 6144`) and projected to `H = 2048` through `fc`
 (`[2048, 6144]`, no bias). A per-aux RMSNorm variant (`fcs.{0,1,2}`) applies
 an individual norm to each aux slice before re-concatenating; this is
 auto-detected from tensor presence (`RMLX_EAGLE3_NO_FCS=1` forces raw concat).
-Applying `fcs` more than doubled the measured greedy accept rate on the Dogacel
-checkpoint (0.09 → 0.21).
+Applying `fcs` raises the measured greedy accept rate on the Dogacel checkpoint
+by a factor of 1.04-1.52 depending on the prompt (0.263-0.362 with it,
+0.173-0.292 without).
 
 **2. Eagle3FirstLayer embed/hidden fusion.** The single decoder layer
 (`Eagle3FirstLayer`) takes `concat(input_layernorm(embed), hidden_norm(h_proj))`
@@ -624,7 +627,7 @@ subcommands by supplying `--draft-model` together with `--draft-kind`.
 |------|--------|---------|-------------|
 | `--draft-model <PATH>` | directory | (none) | Path to the drafter snapshot directory. Requires `--draft-kind`. |
 | `--draft-kind <KIND>` | `mtp`, `dflash`, `eagle3` | (none) | Drafter architecture family. Requires `--draft-model`. |
-| `--draft-block-size <N>` | integer ≥ 1 | 4 | Tokens the drafter proposes per round. Upper-bounded by the drafter's trained `block_size`. |
+| `--draft-block-size <N>` | integer ≥ 1 | 4 | Tokens the drafter proposes per round. Upper-bounded by the drafter's own `block_size`; an MTP sidecar config without that key takes the loader default of 3, which is what both shipped Qwen3.5-family sidecars do. |
 
 Environment variable fallbacks: `MLX_VLM_DRAFT_KIND` and
 `MLX_VLM_DRAFT_BLOCK_SIZE` for `--draft-kind` and `--draft-block-size`
@@ -683,39 +686,101 @@ rmlx serve \
 
 ## Reference Accept Rates
 
-Accept rates depend on the prompt distribution and temperature. The values
-below are measured at temperature 0 (greedy) on a representative coding prompt
-against the local Open Models snapshots. Stochastic acceptance (temperature > 0)
-tends to reduce the rate by 5-15 percentage points for equivalent block sizes.
+**Accept rate is a property of the (verifier, drafter, prompt) triple, not of
+the engine.** The same pair swings from ~0.17 to ~0.90 across prompt classes
+below, and decode throughput swings with it — so a single-prompt figure says
+nothing about whether a drafter pays. Every row is quoted per prompt class for
+that reason. Stochastic acceptance (temperature > 0) tends to reduce the rate by
+5-15 percentage points for equivalent block sizes.
 
-| Verifier | Drafter | Draft kind | Block size | Accept rate |
-|----------|---------|------------|-----------|-------------|
-| Gemma4-31B-mxfp8 | Gemma4-E2B-mxfp8 | MTP (assistant) | 6 | ~0.70 |
-| Qwen3.6-35B-A3B-8bit | Qwen3.6-35B-A3B-MTP-5bit | MTP (sidecar, MoE) | 3 | ~0.83 |
-| Qwen3.8-27B-mxfp8 | Qwen3.8-27B-MTP-mxfp8 | MTP (sidecar, dense) | 3 | ~0.49 |
-| Qwen3.6-35B-A3B-8bit | Qwen3.6-35B-A3B-DFlash | DFlash | 16 | ~0.515 |
-| Qwen3.6-35B-A3B-8bit | Qwen3.6-35B-A3B-Eagle3 | EAGLE-3 | 5 | ~0.21 (restricted) |
+**Measurement basis.** Temperature 0, `--kv-quant none`, `--max-ctx 16384`,
+200 completion tokens, one warmup plus three measured requests per cell, the
+configurations run in palindromic order across two passes and pooled (n=6),
+median reported. Decode throughput is measured client-side over the streamed
+tokens — first emitted token to last, prefill excluded — which is the same
+window `rmlx baseline` reports, so the speculative and no-drafter arms mean the
+same thing. Accept rate is read off the `<kind>_generate_greedy: done` serve-log
+line; no done-line means the round loop never ran. Every cell below is also a
+row in `runs.db` (metrics `accept_rate` and `decode_tps_warm`).
 
-Notes:
-- Two distinct MTP paths: the Gemma4 assistant shared-K/V path
+That same `done` line carries a `decode_tps` field, on the same
+first-token-to-last basis, for every one of the five round loops. It is an
+`Option` and renders `Some(20.98)` or `None` — `None` when the run emitted
+fewer than two tokens and there is no interval to measure, which is the honest
+answer where a `0.0` would be averaged as a real rate. A scrape must expect
+that shape.
+
+Three prompt classes: `prose` and `code` are `prompts/spec_bench/{prose,code}.json`,
+`4k` is `prompts/longctx_4k.json`, `paris` is the bare "What is the capital of
+France?" probe.
+
+### Qwen3.8-27B-mxfp8 — MTP sidecar (GDN hybrid, dense)
+
+No-drafter baseline 18.98 (code) / 18.77 (prose) / 18.74 (4k) decode TPS.
+
+| Block | Prompt | Accept rate | Decode vs no drafter |
+|---|---|---|---|
+| 2 | code | 0.877 | **1.36×** |
+| 2 | 4k | 0.716 | **1.14×** |
+| 2 | prose | 0.672 | **1.09×** |
+| 3 | code | 0.728 | 1.23× |
+| 3 | prose | 0.559 | 0.98× |
+| 3 | 4k | 0.526 | 0.92× |
+
+### Qwen3.6-35B-A3B-8bit — three drafters (GDN hybrid, MoE)
+
+No-drafter baseline 102.7 (code) / 102.7 (prose) / 100.0 (paris) / 98.7 (4k)
+decode TPS.
+
+| Drafter | Block | Prompt | Accept rate | Decode vs no drafter |
+|---|---|---|---|---|
+| MTP-5bit | 3 | code | 0.895 | **1.34×** |
+| MTP-5bit | 3 | paris | 0.847 | **1.29×** |
+| MTP-5bit | 3 | 4k | 0.809 | **1.23×** |
+| MTP-5bit | 3 | prose | 0.653 | 1.02× |
+| DFlash | 16 | code | 0.608 | 0.97× |
+| DFlash | 16 | 4k | 0.524 | 0.84× |
+| DFlash | 16 | paris | 0.491 | 0.86× |
+| DFlash | 16 | prose | 0.488 | 0.78× |
+| Eagle3 | 5 | paris | 0.362 | 0.74× |
+| Eagle3 | 5 | code | 0.305 | 0.66× |
+| Eagle3 | 5 | 4k | 0.270 | 0.61× |
+| Eagle3 | 5 | prose | 0.263 | 0.62× |
+
+### Gemma4-e4b-it-mxfp8 + E4B-it-assistant-bf16 — MTP assistant (full attention)
+
+No-drafter baseline 83.6 (code) / 83.2 (prose) / 79.1 (4k) decode TPS.
+
+| Block | Prompt | Accept rate | Decode vs no drafter |
+|---|---|---|---|
+| 6 | code | 0.731 | **1.90×** |
+| 6 | 4k | 0.289 | 0.79× |
+| 6 | prose | 0.238 | 0.88× |
+
+### What these say
+
+- **MTP pays on both GDN hybrids and is the only drafter that does.** On the MoE
+  it wins every prompt class at the shipped block size. On the dense 27B it wins
+  every prompt class at block 2 and only the code class at block 3.
+- **`--draft-block-size` is capped by the sidecar's own `block_size`, and both
+  shipped Qwen3.5-family MTP sidecars omit that key** — so they take the loader
+  default of 3 and any request above 3 is silently the same run. Block 2 and
+  block 3 are the only two settings those pairs have, and 2 measured faster than
+  3 on all three prompt classes for Qwen3.8-27B. The `block_size` field on the
+  `mtp_generate_greedy: done` line reports the value actually used.
+- **DFlash and EAGLE-3 are net decode losses on this verifier at every prompt
+  class measured**, DFlash by 3-22% and EAGLE-3 by 26-39%. Both run correctly and
+  accept real tokens; neither clears its own round-loop overhead.
+- **Two distinct MTP paths**: the Gemma4 assistant shared-K/V path
   (`mtp_assistant_generate_greedy`) and the Qwen3.5-family sidecar path
-  (`mtp_generate_greedy` / `MtpDrafter`). Both sidecar rates are read off the
-  `mtp_generate_greedy: done` serve-log line at temp=0, never from a bench
-  wrapper — no done-line means the round loop never ran.
-  - Qwen3.6-35B-A3B, "capital of France" probe: 187/224 accepted over 112
-    rounds, ~86 decode-TPS.
-  - Qwen3.8-27B, a 200-token prose prompt: 98/202 accepted over 101 rounds,
-    16.0 decode-TPS median (n=5, 15.7-16.3) against 18.6 without a drafter
-    (n=5, 18.6-18.7). **MTP is a net decode loss on this pair at block_size 3.**
-    The 23.9 TPS / 0.75 accept rate this path reported before the GDN-replay fix
-    was an artefact: the corrupted verifier state agreed with the drafter more
-    often than the correct one does.
-- The DFlash rate of ~0.515 matches the mlx-vlm `_dflash_rounds` reference
-  exactly on the test prompt.
-- The EAGLE-3 rate of ~0.21 is with the `fcs` per-aux norms active
-  (Dogacel speculators-format checkpoint). Without `fcs` the rate drops to
-  ~0.09. The restricted-vocab hot path does not change the accepted token IDs;
-  it only avoids materialising the full-vocab logit tensor for accepted positions.
+  (`mtp_generate_greedy` / `MtpDrafter`). The Gemma4 arm is full-attention and
+  never touches the GDN rollback.
+- **The `fcs` per-aux norms help EAGLE-3, but modestly.** With `fcs` active
+  (Dogacel speculators-format checkpoint) the rate is 0.263-0.362 against
+  0.173-0.292 with `RMLX_EAGLE3_NO_FCS=1` — a factor of 1.04-1.52 depending on
+  the prompt, and never a doubling. The restricted-vocab hot path does not change
+  the accepted token IDs; it only avoids materialising the full-vocab logit
+  tensor for accepted positions.
 
 ## See also
 

@@ -72,6 +72,7 @@ use rmlx_mlx::{
     tanh, Array, Device,
 };
 
+use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};
@@ -623,27 +624,6 @@ pub fn walk_block_greedy(
 
 use crate::decode_loop::ProbeStep;
 
-/// Emit a single token through `step_fn` + the running `emitted` buffer.
-fn emit_step(
-    tokenizer: &tokenizers::Tokenizer,
-    id: u32,
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
-    emitted: &mut Vec<ProbeStep>,
-) {
-    let piece = tokenizer
-        .id_to_token(id)
-        .unwrap_or_else(|| format!("<unk:{id}>"));
-    let step = ProbeStep {
-        token_id: id,
-        piece: piece.into_boxed_str(),
-        max_abs_logit: 0.0,
-        nan_count: 0,
-        logprobs: None,
-    };
-    step_fn(&step);
-    emitted.push(step);
-}
-
 /// DFlash speculative-decoding round-loop (greedy / temp=0).
 ///
 /// Port of `_dflash_rounds` (mlx-vlm). Wires the three verifier-side
@@ -733,6 +713,7 @@ pub fn dflash_generate_greedy(
     let mut rounds = 0usize;
     let mut recent: Vec<(usize, usize)> = Vec::new();
     let t_total = Instant::now();
+    let mut window = DecodeWindow::new();
     let mut draft_ns: u128 = 0;
     let mut verifier_ns: u128 = 0;
 
@@ -771,7 +752,7 @@ pub fn dflash_generate_greedy(
         u32::from_le_bytes(am.to_bytes()?[..4].try_into().unwrap())
     };
     // Emit the first bonus.
-    emit_step(tokenizer, b, step_fn, &mut emitted);
+    emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
     if eos_ids.contains(&b) {
         return Ok(emitted);
     }
@@ -842,7 +823,7 @@ pub fn dflash_generate_greedy(
             if emitted.len() >= n_tokens {
                 break;
             }
-            emit_step(tokenizer, id, step_fn, &mut emitted);
+            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
             if eos_ids.contains(&id) {
                 hit_eos = true;
                 break;
@@ -922,18 +903,14 @@ pub fn dflash_generate_greedy(
     } else {
         0.0
     };
-    let decode_tps = if elapsed_ms > 0.0 {
-        (emitted.len() as f64) / (elapsed_ms / 1000.0)
-    } else {
-        0.0
-    };
+
     tracing::info!(
         rounds,
         emitted = emitted.len(),
         total_draft,
         total_accept,
         accept_rate,
-        decode_tps,
+        decode_tps = ?window.tps(),
         elapsed_ms,
         draft_ms = (draft_ns as f64) / 1.0e6,
         verifier_ms = (verifier_ns as f64) / 1.0e6,
@@ -946,7 +923,7 @@ pub fn dflash_generate_greedy(
         total_draft,
         total_accept,
         accept_rate,
-        decode_tps,
+        decode_tps = ?window.tps(),
         elapsed_ms,
         "[dflash] debug summary"
     );

@@ -72,6 +72,14 @@ passes while never running. The pairs their thresholds are calibrated against:
 Point either at a different pair and re-measure both arms before reading a
 failure as a regression.
 
+`dflash_drafter_alignment.rs` is **not** one of those three and does not gate the
+same property. It asserts that the drafter's round-0 first-block proposal aligns
+with the verifier's greedy continuation (`accept > 0`) and that the live loop
+emits coherent prose — a round-0 check, taken before any partial-accept rollback
+has happened. It cannot see a rollback that corrupts the verifier state part-way
+through a run, which is what the three suites above exist to catch. DFlash on a
+GDN hybrid therefore has no greedy-tracking gate.
+
 The Whisper audio integration tests (`crates/rmlx-audio/tests/transcribe.rs`)
 deliberately use **no** dedicated env var — they resolve the
 `mlx-community__whisper-large-v3-mlx` + `openai__whisper-large-v3-tokenizer`

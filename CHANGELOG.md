@@ -64,6 +64,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A speculative round loop's `decode_tps` counted the prompt prefill.** The
+  MTP, DFlash and EAGLE-3 round loops started their timer before the verifier
+  prefill and then divided the emitted token count by the whole elapsed window,
+  so the field named `decode_tps` was not a decode rate. On a short prompt that
+  cost 1–3%; on a 4k prompt the loop reported 13.8 tok/s where the streamed
+  tokens arrived at 21.3 — an understatement of 55%, and it grows with the
+  prompt. Every published speculative throughput figure was scraped from that
+  line, and each was being compared against `rmlx baseline`'s `decode_tps`,
+  which excludes prefill — so the speculative arm wore a penalty the arm it was
+  measured against did not. Every round loop now reports the window between the
+  first and last emitted token, `(marks - 1) / (last - first)`, which is the
+  same window `rmlx baseline` reports. `elapsed_ms` still covers the whole call.
+  Emitted tokens, accept rates and throughput are unchanged; only the reported
+  number moves.
+
+  Three details of the new field. It is carried as an `Option` and rendered
+  `Some(x)` / `None`, because a one-token generation has no interval to measure
+  and `0.0` in that slot prints, averages and wins a champion cell exactly like
+  a real throughput of zero — the same reason `rmlx baseline` carries its phase
+  timings as `Option`. The window counts the tokens it saw rather than trusting
+  a total passed in, so a loop that emits without going through the shared
+  `emit_step` cannot report a rate faster than it ran. And **all five**
+  speculative round loops now carry the field on that one basis:
+  `spec_generate_greedy_cached`, `spec_generate_stochastic_cached` and
+  `mtp_assistant_generate_greedy` previously logged `elapsed_ms` and no rate at
+  all, which left the Gemma4 assistant pair — a published row in
+  `docs/SPECULATIVE.md` — with no serve-log decode rate to read.
+
 - **The speculative serve path loaded the verifier twice.** The MTP / EAGLE-3 /
   DFlash branches each called `load_speculative(verifier_dir, verifier_dir, ..)`
   to fill a draft slot their round loops never read, and `load_speculative` has
@@ -675,22 +703,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **MTP on Qwen3.8-27B is a net decode loss, and the 1.28× previously recorded
-  was an artefact of the corrupted verifier.** Before the GDN rollback fix (see
-  **Fixed**) this pair reported accept_rate 0.755 and 23.9 decode TPS against an
-  18.6 no-drafter baseline. Correct, it is **accept_rate 0.485 and 16.0 TPS —
-  0.86× baseline** at `block_size 3`. The old "win" was the corrupted verifier
-  state agreeing with the drafter more often than the correct one does. Nothing
-  about the drafter got slower; the number was never real.
+- **Every speculative accept rate and speedup in the docs is re-derived, and
+  the MTP sidecar is a net win on both GDN hybrids.** Three faults had to be
+  cleared before any of these numbers meant anything: the GDN rollback replaying
+  through a scratch KV stack, the sidecar serve path holding a second copy of
+  the verifier, and a round-loop `decode_tps` field that divided emitted tokens
+  by prefill-plus-decode (all three in **Fixed**). Re-measured on this branch at
+  temperature 0, `--kv-quant none`, n=6 pooled over two passes in palindromic
+  order, decode measured first-emitted-token to last:
 
-  **This invalidates more than one cell.** Every speculative-decoding accept
-  rate recorded on a **GDN hybrid** before this branch is inflated by the same
-  mechanism — MTP, EAGLE-3 and the classic two-model loop all took the scratch
-  stack, and the inflation is proportional to how often a round partially
-  accepts. Historical accept-rate and spec-decode-speedup figures on those
-  architectures need re-deriving before they are quoted again. Figures on a
-  pure full-attention arch (Gemma4) are unaffected — that arm was byte-identical
-  across the fix.
+  | Verifier | Drafter | Block | Accept | Decode vs no drafter |
+  |---|---|---|---|---|
+  | Qwen3.8-27B-mxfp8 | MTP sidecar | 2 | 0.67–0.88 | **1.09–1.36×** |
+  | Qwen3.8-27B-mxfp8 | MTP sidecar | 3 | 0.53–0.73 | 0.92–1.23× |
+  | Qwen3.6-35B-A3B-8bit | MTP-5bit | 3 | 0.65–0.90 | **1.02–1.34×** |
+  | Qwen3.6-35B-A3B-8bit | DFlash | 16 | 0.49–0.61 | 0.78–0.97× |
+  | Qwen3.6-35B-A3B-8bit | Eagle3 | 5 | 0.26–0.36 | 0.61–0.74× |
+  | gemma-4-e4b-it-mxfp8 | E4B assistant | 6 | 0.24–0.73 | 0.79–1.90× |
+
+  Each range spans the prompt classes `prose`, `code` and a 4k-context prompt;
+  accept rate is a property of the (verifier, drafter, prompt) triple and a
+  single-prompt figure predicts nothing. **`--draft-block-size` above 3 is a
+  no-op on both shipped Qwen3.5-family MTP sidecars** — neither config carries a
+  `block_size` key, so both take the loader default of 3 — and block 2 measured
+  faster than block 3 on every prompt class for Qwen3.8-27B. Every cell is now a
+  row in `runs.db`; before this change the database held no speculative
+  observation on any GDN hybrid at all, which is why the drift went unnoticed.
+
+  Two previously published figures do not survive and are removed rather than
+  footnoted: **Qwen3.8-27B MTP at `block_size 3` is not 0.86× baseline** (0.92×
+  on a 4k prompt, 0.98× on prose, 1.23× on code — that reading was taken with
+  the doubled verifier load live), and **Qwen3.6-35B-A3B MTP is not +4.2%**
+  (+2% to +34%, with DFlash at −3% to −22% rather than −37% and Eagle3 at −26%
+  to −39%). The pre-rollback-fix `0.755 / 23.9 TPS / 1.28×` reading for
+  Qwen3.8-27B stays retracted — a corrupted verifier agrees with its drafter
+  more often than a correct one does — but the correction to it was itself
+  measured on the doubled load and is superseded by the table above. The EAGLE-3
+  `fcs` norms raise accept by 1.04–1.52×, not the "more than doubled" previously
+  claimed.
 
 - **Gemma4 with `mixed_*` / `rot_k_*` and an SSD-tier hit now fails loudly where
   it previously produced silently-wrong output.** `none_bf16_payloads` never

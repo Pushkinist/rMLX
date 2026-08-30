@@ -1397,8 +1397,9 @@ Properties:
 - Target verifier: `Qwen3_5Moe` (`Architecture::forward_verify_capture`,
   `embed_tokens_raw`, `logits_from_hidden`).
 - Status: fully wired. Live-validated against `z-lab/Qwen3.6-35B-A3B-DFlash` +
-  `mlx-community/Qwen3.6-35B-A3B-8bit` verifier. Accept rate matches mlx-vlm
-  reference (0.515 on test prompt).
+  `mlx-community/Qwen3.6-35B-A3B-8bit` verifier. Accept rate is prompt-dependent
+  (0.488-0.608 measured) and the drafter is a net decode loss at every prompt
+  class measured — see `docs/SPECULATIVE.md` Reference Accept Rates.
 
 See `docs/SPECULATIVE.md` for algorithm details.
 
@@ -1424,7 +1425,9 @@ Properties:
 - **GDN rollback** reuses `DFlashRoundState` infrastructure.
 - Target verifier: `Qwen3_5Moe`.
 - Status: reference-alignment pass complete (three structural divergences from
-  mlx-vlm patched). Live accept-rate measurement pending.
+  mlx-vlm patched). Measured accept rate 0.263-0.362 against the
+  `Qwen3.6-35B-A3B-8bit` verifier, and a 26-39% net decode loss at every prompt
+  class — see `docs/SPECULATIVE.md` Reference Accept Rates.
 
 See `docs/SPECULATIVE.md` for algorithm details.
 
