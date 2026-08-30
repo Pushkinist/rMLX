@@ -2,21 +2,17 @@
 //!
 //! Wraps a (verifier, draft) pair of `Architecture` instances.
 //!
-//! - Phase 1: plumbing only — `spec_forward(input_ids, k)` runs the
-//!   verifier on `input_ids` and returns logits for the last `k` positions.
-//! - Phase 2: `spec_generate_greedy_no_cache` runs end-to-end greedy
-//!   speculative decoding via per-round full re-prefill. Correct but
-//!   structurally bottlenecked by O(prompt_len) verifier cost per round.
-//! - Phase 3 (this file): `spec_generate_greedy_cached` runs the same greedy
-//!   algorithm with persistent verifier + draft KV caches and
-//!   `KvCache::truncate_to`-based rollback on partial acceptance. Mirrors
-//!   mlx-lm's `speculative_generate_step`. Cuts per-round verifier cost
-//!   from O(prompt_len) to O(K), unlocking 24+ TPS on `gemma-4-31b-mxfp8`
-//!   at 4k context (vs Phase 2's 0.45 TPS structural ceiling).
+//! - `spec_forward(input_ids, k)` runs the verifier on `input_ids` and
+//!   returns logits for the last `k` positions.
+//! - `spec_generate_greedy_cached` runs greedy speculative decoding with
+//!   persistent verifier + draft KV caches and `KvCache::truncate_to`-based
+//!   rollback on partial acceptance. Mirrors mlx-lm's
+//!   `speculative_generate_step`. Per-round verifier cost is O(K), not
+//!   O(prompt_len) — 24+ TPS on `gemma-4-31b-mxfp8` at 4k context, against a
+//!   0.45 TPS structural ceiling for per-round full re-prefill.
 //!
-//! Phase 3 is the production path; the Phase-2 method is retained as a
-//! fallback for architectures whose `forward_seq_last_k_with_cache` is not
-//! yet wired.
+//! An architecture whose `forward_seq_last_k_with_cache` is unwired surfaces
+//! that error; there is no re-prefill fallback path.
 //!
 //! Design and measurement reports are in `docs/reports/`.
 
@@ -101,22 +97,37 @@ pub(crate) fn verifier_kv_bytes(kv: &[KvCache], lin: Option<&[LinearAttnCache]>)
         + lin.map_or(0, |l| l.iter().map(LinearAttnCache::resident_bytes).sum())
 }
 
-/// Holds a (verifier, draft) pair for speculative decoding.
+/// Whether two snapshot paths name the same directory.
 ///
-/// Phase 1 invariants:
+/// Compares canonical paths so `.`-relative and symlinked spellings of one
+/// snapshot still match; falls back to the literal paths when either side
+/// cannot be canonicalised (e.g. it does not exist).
+fn same_snapshot(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
+/// Holds a verifier and, for the two-model path, a draft `Architecture`.
+///
+/// When a draft is present:
 /// - `verifier.vocab_size() == draft.vocab_size()` (asserted in `new`).
-/// - The two architectures are loaded from independent snapshot dirs.
+/// - The two architectures come from distinct snapshot dirs (enforced in
+///   `load_speculative`).
 /// - Both share the same `Device` at construction time.
-#[allow(
-    clippy::exhaustive_structs,
-    reason = "internal closed dispatcher struct — fields are verifier + draft architectures; public API is new() and spec_generate_*(); adding a field requires updating SpeculativeDispatcher::new"
-)]
 #[allow(missing_debug_implementations)]
 pub struct SpeculativeDispatcher {
     /// The full verifier model that scores and accepts/rejects draft tokens.
     pub verifier: Architecture,
     /// The lightweight draft model that proposes candidate tokens.
-    pub draft: Architecture,
+    ///
+    /// `None` for a sidecar drafter (MTP / EAGLE-3 / DFlash): those are small
+    /// heads owned by the serve layer and driven by their own round loops,
+    /// which read only the verifier. A sidecar dispatcher has no second full
+    /// model to hold, and `spec_generate_*` refuses to run on one. Private so
+    /// the empty slot cannot be filled from outside the constructors.
+    draft: Option<Architecture>,
     device: Device,
 }
 
@@ -136,16 +147,57 @@ impl SpeculativeDispatcher {
         }
         Ok(Self {
             verifier,
-            draft,
+            draft: Some(draft),
+            device,
+        })
+    }
+
+    /// Load a verifier from a snapshot directory, with no draft model.
+    ///
+    /// The sidecar-drafter counterpart to [`Self::load_speculative`]: MTP /
+    /// EAGLE-3 / DFlash drafters are small heads the serve layer loads and
+    /// drives itself, so there is no second full model. One `load_model` call,
+    /// one resident copy of the weights, and `spec_generate_*` is unavailable
+    /// on the result.
+    ///
+    /// # Errors
+    /// Propagates any [`load_model`] failure.
+    pub fn load_verifier_only(verifier_dir: &Path, device: Device) -> Result<Self> {
+        tracing::info!(
+            verifier = %verifier_dir.display(),
+            "speculative: load_verifier_only — loading verifier (no draft model)"
+        );
+        let verifier = load_model(verifier_dir, device, &LoadOpts::default())?;
+        tracing::info!(
+            verifier_summary = %verifier.config_summary(),
+            "speculative: load_verifier_only — loaded"
+        );
+        Ok(Self {
+            verifier,
+            draft: None,
             device,
         })
     }
 
     /// Load both verifier and draft from snapshot directories.
     ///
-    /// Phase 1 convenience constructor. The two `load_model` calls run
-    /// sequentially under the single Apple Silicon Metal context.
+    /// The two `load_model` calls run sequentially under the single Apple
+    /// Silicon Metal context.
+    ///
+    /// # Errors
+    /// Returns `Error::Model` when both sides name the same directory: that
+    /// materialises the weights twice for no benefit — the draft would cost
+    /// exactly as much to run as the verifier it is meant to outrun. A caller
+    /// wanting one model wants [`Self::load_verifier_only`].
     pub fn load_speculative(verifier_dir: &Path, draft_dir: &Path, device: Device) -> Result<Self> {
+        if same_snapshot(verifier_dir, draft_dir) {
+            return Err(Error::Model(format!(
+                "load_speculative: verifier and draft name the same snapshot directory ({}) — \
+                 that loads the weights twice for no speedup. Use load_verifier_only for a \
+                 sidecar drafter, or point --draft-model at a smaller model.",
+                verifier_dir.display()
+            )));
+        }
         tracing::info!(
             verifier = %verifier_dir.display(),
             draft = %draft_dir.display(),
@@ -165,16 +217,14 @@ impl SpeculativeDispatcher {
         Self::new(verifier, draft, device)
     }
 
-    /// Speculative forward step (Phase 1: verifier-only routing).
+    /// Speculative forward step — verifier-only routing.
     ///
     /// Runs the verifier on `input_ids` (length L) and returns logits
     /// for the last `k` positions: shape `[1, k, vocab_size]`.
     /// The verifier's existing prefill path produces all positions'
     /// logits internally; this method routes the last-`k` slice
-    /// instead of the last-1 slice.
-    ///
-    /// Phase 2 will add: draft-proposes-K + verifier-evaluates-K +
-    /// argmax-acceptance-loop.
+    /// instead of the last-1 slice. It proposes and accepts nothing —
+    /// `spec_generate_greedy` is the full round loop.
     pub fn spec_forward(&self, input_ids: &[u32], k: usize) -> Result<Array> {
         if input_ids.is_empty() {
             return Err(Error::Model("spec_forward: empty input_ids".to_owned()));
@@ -193,13 +243,24 @@ impl SpeculativeDispatcher {
         self.verifier.vocab_size()
     }
 
+    /// The draft model, or an error when this dispatcher holds only a verifier.
+    fn draft_model(&self) -> Result<&Architecture> {
+        self.draft.as_ref().ok_or_else(|| {
+            Error::Model(
+                "speculative: two-model generation needs a draft model, but this dispatcher \
+                 holds only a verifier — a sidecar drafter runs its own round loop instead"
+                    .to_owned(),
+            )
+        })
+    }
+
     /// The compute device both models were loaded on (— the assistant
     /// MTP round-loop needs it to issue verifier + drafter forwards).
     pub fn device(&self) -> Device {
         self.device
     }
 
-    /// Greedy speculative decoding (Phase 2, no KV cache).
+    /// Greedy speculative decoding over persistent verifier + draft caches.
     ///
     /// Algorithm (Leviathan 2023, greedy variant). The verifier holds a
     /// persistent KV cache; each round it re-feeds only the K new draft
@@ -224,11 +285,10 @@ impl SpeculativeDispatcher {
     /// L = new prefix length
     /// ```
     ///
-    /// Phase 2 simplification: draft is still re-prefilled fresh on every
-    /// round. Phase 3 will keep a persistent draft cache too. Per-round
-    /// draft cost = full prefill on (L0 + emitted) tokens but at draft-model
-    /// speed (≈10× verifier speed); for 31b+e2b this is ~1/4 of verifier
-    /// cost in practice.
+    /// The draft keeps its own persistent cache, rolled back alongside the
+    /// verifier's on partial acceptance, so per-round draft cost is K decode
+    /// steps at draft-model speed (≈10× verifier speed) rather than a
+    /// re-prefill; for 31b+e2b that is ~1/4 of verifier cost in practice.
     ///
     /// `step_fn` is called once per emitted token (verifier-confirmed) so
     /// the SSE consumer can stream output.
@@ -285,11 +345,10 @@ impl SpeculativeDispatcher {
                     .into(),
             ));
         }
-        // Phase 3: persistent verifier + draft KV caches with truncate_to
-        // rollback on partial acceptance. Replaces the Phase-2 re-prefill
-        // bottleneck. Falls back to the no-cache path only when the verifier
-        // architecture doesn't yet implement `forward_seq_last_k_with_cache`
-        // (returns Error::Model for unwired architectures).
+        // Persistent verifier + draft KV caches with truncate_to rollback on
+        // partial acceptance. There is no no-cache fallback — an architecture
+        // whose `forward_seq_last_k_with_cache` is unwired surfaces
+        // `Error::Model` from the cached path.
         let _ = prompt_cache_slots;
         if sampler_cfg.sampling_active() {
             // stochastic acceptance (temperature > 0).
@@ -319,232 +378,7 @@ impl SpeculativeDispatcher {
         }
     }
 
-    /// Phase-2 spec generation without verifier KV cache (full re-prefill
-    /// every round). See `spec_generate_greedy` for algorithm.
-    ///
-    /// Retained as a fallback / reference implementation. The Phase-3
-    /// path (`spec_generate_greedy_cached`) is the production target.
-    #[allow(clippy::too_many_arguments, dead_code)]
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-    )]
-    fn spec_generate_greedy_no_cache(
-        &self,
-        tokenizer: &tokenizers::Tokenizer,
-        prompt_ids: &[u32],
-        n_tokens: usize,
-        k: usize,
-        kv_quant_override: Option<KvQuant>,
-        max_ctx_override: Option<i32>,
-        prompt_cache_slots: usize,
-        eos_ids: &[u32],
-        step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
-    ) -> Result<Vec<ProbeStep>> {
-        let vocab = self.vocab_size();
-        let device = self.device;
-        let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
-        let mut prefix: Vec<u32> = prompt_ids.to_vec();
-
-        // Diagnostic counters (written via tracing::info! at end).
-        let mut total_draft_tokens: usize = 0;
-        let mut total_accept_count: usize = 0;
-        let mut rounds: usize = 0;
-        let t_total = Instant::now();
-        let mut draft_ns: u128 = 0;
-        let mut verifier_ns: u128 = 0;
-
-        // A7.2: the spec path is greedy-only (temp>0 rejected above). The
-        // internal draft `generate_greedy` calls require the sampler params;
-        // a temperature-0 config keeps them on the untouched argmax branch.
-        let draft_sampler_cfg = crate::sampler::SamplerConfig {
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 0,
-            min_p: 0.0,
-            seed: None,
-            top_logprobs_k: 0,
-        };
-        let mut draft_rng = crate::sampler::Pcg32::new(draft_sampler_cfg.seed_or_default());
-
-        tracing::info!(
-            k,
-            prompt_len = prompt_ids.len(),
-            n_tokens,
-            ?kv_quant_override,
-            ?max_ctx_override,
-            "spec_generate_greedy: starting (Phase 2 — no verifier cache)"
-        );
-
-        while emitted.len() < n_tokens {
-            rounds += 1;
-            // -- Phase A: draft proposes K tokens via re-prefill. -----
-            let t0 = Instant::now();
-            let mut draft_token_history: Vec<u32> = Vec::new();
-            let draft_penalty_cfg = crate::sampler::PenaltyConfig::default();
-            let draft_steps = self.draft.generate_greedy(
-                tokenizer,
-                &prefix,
-                k,
-                device,
-                kv_quant_override,
-                max_ctx_override,
-                prompt_cache_slots,
-                // Don't let draft EOS-stop short of K — verifier might
-                // disagree on which token is EOS.
-                &[],
-                &mut |_| None,
-                // A6.2: speculative does not yet support sampler constraints.
-                // The K+1-position acceptance check has no single-token
-                // semantics that match `ConstraintEngine`. The public
-                // `spec_generate_greedy` rejects constraint != None upstream.
-                None,
-                // A7.2: spec path is greedy-only; temp>0 already rejected at
-                // the public boundary. Force the untouched greedy argmax
-                // branch for the draft (temperature 0.0).
-                &draft_sampler_cfg,
-                &mut draft_rng,
-                // A7.3: no penalties on the speculative draft path.
-                &draft_penalty_cfg,
-                &mut draft_token_history,
-            )?;
-            draft_ns += t0.elapsed().as_nanos();
-
-            if draft_steps.is_empty() {
-                tracing::warn!(
-                    round = rounds,
-                    "spec_generate_greedy: draft produced 0 tokens; stopping"
-                );
-                break;
-            }
-            let draft_tokens: Vec<u32> = draft_steps.iter().map(|s| s.token_id).collect();
-            let k_actual = draft_tokens.len().min(k);
-            total_draft_tokens += k_actual;
-
-            // -- Phase B: verifier scores K+1 logits via re-prefill. --
-            // forward_seq_last_k(prefix+draft, K+1) returns last K+1
-            // logits. The first one is verifier's prediction after the
-            // last prompt token (compare to d1); subsequent ones predict
-            // after each draft token.
-            let mut combined = prefix.clone();
-            combined.extend_from_slice(&draft_tokens[..k_actual]);
-            let v_k = k_actual + 1;
-            if v_k > combined.len() {
-                return Err(Error::Model(format!(
-                    "spec_generate_greedy: k+1={v_k} > prefix+draft len={}",
-                    combined.len()
-                )));
-            }
-
-            let t0 = Instant::now();
-            let v_logits = self.verifier.forward_seq_last_k(&combined, v_k, device)?;
-            let v_argmax = argmax(&v_logits, -1, device)?;
-            v_argmax.eval()?;
-            let bytes = v_argmax.to_bytes()?;
-            verifier_ns += t0.elapsed().as_nanos();
-
-            if bytes.len() < 4 * v_k {
-                return Err(Error::Model(format!(
-                    "spec_generate_greedy: argmax bytes={} expected={}",
-                    bytes.len(),
-                    4 * v_k
-                )));
-            }
-            let mut v_tokens: Vec<u32> = Vec::with_capacity(v_k);
-            for i in 0..v_k {
-                let off = i * 4;
-                let id = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-                v_tokens.push(id);
-            }
-
-            // -- Phase C: greedy acceptance. -------------------------
-            let mut accept = 0usize;
-            for i in 0..k_actual {
-                if v_tokens[i] == draft_tokens[i] {
-                    accept += 1;
-                } else {
-                    break;
-                }
-            }
-            total_accept_count += accept;
-
-            // Emit accept+1 tokens: v_tokens[0..=accept].
-            let to_emit = (accept + 1).min(v_tokens.len());
-            for &id in v_tokens.iter().take(to_emit) {
-                if emitted.len() >= n_tokens {
-                    break;
-                }
-                let piece = tokenizer
-                    .id_to_token(id)
-                    .unwrap_or_else(|| format!("<unk:{id}>"));
-                let step = ProbeStep {
-                    token_id: id,
-                    piece: piece.into_boxed_str(),
-                    max_abs_logit: 0.0,
-                    nan_count: 0,
-                    logprobs: None,
-                };
-                step_fn(&step);
-                emitted.push(step);
-                prefix.push(id);
-                if eos_ids.contains(&id) {
-                    let elapsed_ms = (t_total.elapsed().as_nanos() as f64) / 1.0e6;
-                    tracing::info!(
-                        rounds,
-                        emitted = emitted.len(),
-                        total_draft = total_draft_tokens,
-                        total_accept_count,
-                        accept_rate = if total_draft_tokens > 0 {
-                            (total_accept_count as f64) / (total_draft_tokens as f64)
-                        } else {
-                            0.0
-                        },
-                        elapsed_ms,
-                        draft_ms = (draft_ns as f64) / 1.0e6,
-                        verifier_ms = (verifier_ns as f64) / 1.0e6,
-                        k,
-                        "spec_generate_greedy: EOS — stopping"
-                    );
-                    return Ok(emitted);
-                }
-            }
-
-            tracing::debug!(
-                round = rounds,
-                accept,
-                emitted_round = to_emit,
-                emitted_total = emitted.len(),
-                vocab,
-                "spec round"
-            );
-        }
-
-        let elapsed_ms = (t_total.elapsed().as_nanos() as f64) / 1.0e6;
-        tracing::info!(
-            rounds,
-            emitted = emitted.len(),
-            total_draft = total_draft_tokens,
-            total_accept_count,
-            accept_rate = if total_draft_tokens > 0 {
-                (total_accept_count as f64) / (total_draft_tokens as f64)
-            } else {
-                0.0
-            },
-            elapsed_ms,
-            draft_ms = (draft_ns as f64) / 1.0e6,
-            verifier_ms = (verifier_ns as f64) / 1.0e6,
-            k,
-            "spec_generate_greedy: done"
-        );
-
-        Ok(emitted)
-    }
-
-    /// Phase-3 spec generation with persistent verifier + draft KV
+    /// Greedy spec generation with persistent verifier + draft KV
     /// caches and `truncate_to`-based rollback.
     ///
     /// Algorithm (mirrors mlx-lm `speculative_generate_step`):
@@ -564,9 +398,9 @@ impl SpeculativeDispatcher {
     /// L = new prefix length
     /// ```
     ///
-    /// Phase 3 wires Gemma4 only (verifier + draft both Gemma4Text). Other
-    /// architectures fall through to `spec_generate_greedy_no_cache` via the
-    /// trait method `forward_seq_last_k_with_cache` returning Error::Model.
+    /// Wires Gemma4 only (verifier + draft both Gemma4Text). An architecture
+    /// whose `forward_seq_last_k_with_cache` is unwired returns `Error::Model`
+    /// from here; there is no fallback path.
     #[allow(clippy::too_many_arguments)]
     #[allow(
         clippy::indexing_slicing,
@@ -587,6 +421,7 @@ impl SpeculativeDispatcher {
         eos_ids: &[u32],
         step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     ) -> Result<Vec<ProbeStep>> {
+        let draft = self.draft_model()?;
         let device = self.device;
         let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
 
@@ -626,7 +461,7 @@ impl SpeculativeDispatcher {
             n_tokens,
             ?kv_quant,
             max_seq,
-            "spec_generate_greedy_cached: starting (Phase 3 — persistent caches + truncate_to)"
+            "spec_generate_greedy_cached: starting — persistent caches + truncate_to"
         );
 
         // --- Allocate per-layer caches for verifier and draft. ---------
@@ -647,12 +482,12 @@ impl SpeculativeDispatcher {
                     .with_shares_kv(self.verifier.shares_kv_across_layers())
             })
             .collect();
-        let mut draft_caches: Vec<KvCache> = (0..self.draft.num_hidden_layers())
+        let mut draft_caches: Vec<KvCache> = (0..draft.num_hidden_layers())
             .map(|i| {
-                let window = self.draft.layer_sliding_window(i);
+                let window = draft.layer_sliding_window(i);
                 KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
                     .with_layer_idx(i)
-                    .with_shares_kv(self.draft.shares_kv_across_layers())
+                    .with_shares_kv(draft.shares_kv_across_layers())
             })
             .collect();
 
@@ -670,9 +505,9 @@ impl SpeculativeDispatcher {
         } else {
             None
         };
-        let mut draft_lin: Option<Vec<LinearAttnCache>> = if self.draft.needs_lin_caches() {
+        let mut draft_lin: Option<Vec<LinearAttnCache>> = if draft.needs_lin_caches() {
             Some(
-                (0..self.draft.num_hidden_layers())
+                (0..draft.num_hidden_layers())
                     .map(|_| LinearAttnCache::new())
                     .collect(),
             )
@@ -697,7 +532,7 @@ impl SpeculativeDispatcher {
             device,
         )?;
         prefill_chunked(
-            &self.draft,
+            draft,
             prefill_slice,
             &mut draft_caches,
             draft_lin.as_deref_mut(),
@@ -742,7 +577,7 @@ impl SpeculativeDispatcher {
             // -- Phase A: draft generates `num_draft` tokens via cache. -
             let t0 = Instant::now();
             let draft_tokens = draft_decode_n(
-                &self.draft,
+                draft,
                 &d_seed,
                 num_draft,
                 &mut draft_caches,
@@ -916,7 +751,7 @@ impl SpeculativeDispatcher {
                 }
                 let d_pre_round_offset = d_offset_before - d_fed.len() as i32;
                 rollback_round_caches(
-                    &self.draft,
+                    draft,
                     &mut draft_caches,
                     draft_lin.as_deref_mut(),
                     draft_lin_snap,
@@ -1035,6 +870,7 @@ impl SpeculativeDispatcher {
             sample_index, sampling_distribution, stochastic_accept, AcceptDecision, Pcg32,
         };
 
+        let draft = self.draft_model()?;
         let device = self.device;
         let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
 
@@ -1096,12 +932,12 @@ impl SpeculativeDispatcher {
                     .with_shares_kv(self.verifier.shares_kv_across_layers())
             })
             .collect();
-        let mut draft_caches: Vec<KvCache> = (0..self.draft.num_hidden_layers())
+        let mut draft_caches: Vec<KvCache> = (0..draft.num_hidden_layers())
             .map(|i| {
-                let window = self.draft.layer_sliding_window(i);
+                let window = draft.layer_sliding_window(i);
                 KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
                     .with_layer_idx(i)
-                    .with_shares_kv(self.draft.shares_kv_across_layers())
+                    .with_shares_kv(draft.shares_kv_across_layers())
             })
             .collect();
 
@@ -1114,9 +950,9 @@ impl SpeculativeDispatcher {
         } else {
             None
         };
-        let mut draft_lin: Option<Vec<LinearAttnCache>> = if self.draft.needs_lin_caches() {
+        let mut draft_lin: Option<Vec<LinearAttnCache>> = if draft.needs_lin_caches() {
             Some(
-                (0..self.draft.num_hidden_layers())
+                (0..draft.num_hidden_layers())
                     .map(|_| LinearAttnCache::new())
                     .collect(),
             )
@@ -1135,7 +971,7 @@ impl SpeculativeDispatcher {
             device,
         )?;
         prefill_chunked(
-            &self.draft,
+            draft,
             prefill_slice,
             &mut draft_caches,
             draft_lin.as_deref_mut(),
@@ -1158,7 +994,7 @@ impl SpeculativeDispatcher {
             // -- Phase A: draft samples `num_draft` tokens, recording q_i. ---
             let t0 = Instant::now();
             let (draft_tokens, draft_q) = draft_decode_n_stochastic(
-                &self.draft,
+                draft,
                 &d_seed,
                 num_draft,
                 &mut draft_caches,
@@ -1329,7 +1165,7 @@ impl SpeculativeDispatcher {
                 }
                 let d_pre_round_offset = d_offset_before - d_fed.len() as i32;
                 rollback_round_caches(
-                    &self.draft,
+                    draft,
                     &mut draft_caches,
                     draft_lin.as_deref_mut(),
                     draft_lin_snap,
@@ -1395,7 +1231,7 @@ impl SpeculativeDispatcher {
 }
 
 // ---------------------------------------------------------------------------
-// Phase-3 helpers
+// Cached round-loop helpers
 // ---------------------------------------------------------------------------
 
 /// Chunked prefill of `tokens` into `caches`, mirroring the gemma4 generate

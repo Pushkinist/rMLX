@@ -115,6 +115,13 @@ fn two_model_greedy_tracks_plain_greedy_for_a_long_prefix() {
         );
         return;
     }
+    if model_path.canonicalize().ok() == draft_path.canonicalize().ok() {
+        eprintln!(
+            "[qwen35_two_model_align] verifier and draft name one snapshot - skipping \
+             (load_speculative refuses that pair; point the two vars at different models)"
+        );
+        return;
+    }
     let device = Device::Gpu;
     let dispatcher = SpeculativeDispatcher::load_speculative(&model_path, &draft_path, device)
         .expect("load verifier + draft");
