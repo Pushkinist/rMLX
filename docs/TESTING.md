@@ -751,6 +751,15 @@ out-of-bounds device store is dropped rather than raised, so the tests can pass
 while the GPU reads or writes memory it does not own — which is precisely a
 result no test result can be read for.
 
+Read the diagnostic's own wording before assuming that is what happened. A
+*store* is corruption; a *load* is illegal but can only affect the result if the
+lanes it fills are ones the kernel keeps, and whether they are is a property of
+the kernel, not of the diagnostic. The aggregate makes no distinction, and the
+one standing hit in this tree is 160/160 loads — see the entry below on
+`affine_qmm_t_splitk`. The converse does not hold either: a clean scan does not
+establish that nothing read out of bounds, for the buffer-versus-array reason
+recorded with that entry.
+
 #### Where it runs: `make ci-perf`, not `make ci`
 
 `make ci-perf` is three lines, and it is the only shared gate that executes the
@@ -972,8 +981,31 @@ command encoder models read-after-write hazards only — see ml-explore/mlx#3630
 and ml-explore/mlx#3461). Still a hypothesis, and tracked outside this
 document.
 
-Current state: the whole GPU suite — all five crates, `rmlx-kv-quant` included —
-runs clean under validation, zero invalid accesses.
+Current state: four of the five crates run clean under validation.
+`rmlx-models` does not — it reports 160 invalid device **loads**, all in MLX's
+own `affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false`, so the aggregate fails
+and `make ci-perf` has no green state. The cause is in
+`mlx/backend/metal/kernels/quantized.h`: `QuantizedBlockLoader::load_safe`
+bounds its row index against the tile's column extent, so the guard never fires
+and a transposed quantized matmul whose `N` is not a multiple of the kernel's
+output tile width reads the out-of-range rows of the packed weight and the
+scales. That width is **not** always 32: the non-batched `qmm_splitk` path
+tiles at 32, the batched and gather `*_nax` paths at 64, so an `N` of 32 is
+unaligned there and trips it too. rMLX passes correctly sized operands; the
+reads are loads only and are shown bitwise not to reach the output — including
+with the out-of-range rows held at NaN under the same kernel instantiation.
+
+Two cautions that generalise beyond this kernel. A diagnostic names a *load* or
+a *store* and the two differ in severity, but the aggregate does not
+distinguish them. And **absence of a diagnostic is not absence of an
+out-of-bounds access**: the validation layer bounds against the MTLBuffer, not
+the logical array, and MLX recycles buffers from size buckets, so a read past
+an array's end that lands inside a roomier recycled allocation is silent. A
+clean scan is evidence about reporting, not about memory safety.
+
+The full investigation, the reproducer, the pinned-MLX `PYTHONPATH` needed to
+repeat it, and the reason no caller-side workaround was taken live in
+`.rmlx/mlx-qmm-t-tail-row-oob.md`.
 
 ### `#[ignore]` is not a place to park a broken test
 
