@@ -981,7 +981,12 @@ command encoder models read-after-write hazards only — see ml-explore/mlx#3630
 and ml-explore/mlx#3461). Still a hypothesis, and tracked outside this
 document.
 
-Current state: four of the five crates run clean under validation.
+Current state: four of the five crates run clean under validation. That is an
+inference from matching totals (a narrowed `CRATE=rmlx-models` run and the
+full five-crate run both total 160, and `rmlx-models` is the only crate a
+narrowed run can attribute anything to), not a directly observed clean pass
+over each of the other four individually — `run_gpu_tests.sh` prints a
+per-crate line only for a crate with a nonzero hit count.
 `rmlx-models` does not — it reports 160 invalid device **loads**, all in MLX's
 own `affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false`, so the aggregate fails
 and `make ci-perf` has no green state. The cause is in
