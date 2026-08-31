@@ -167,6 +167,50 @@ that used the signed-E4M3 path.
 
 Source: `crates/rmlx-quant/src/mxfp.rs`, `crates/rmlx-quant/src/fp8.rs`
 
+#### Group 16 and MLX's split-K partition
+
+nvfp4 is the only codec here whose group (16) is narrower than the 32-wide K
+tile MLX's `qmm_t_splitk` kernels step the contracted dimension by. MLX aligns
+each split-K partition to `group_size` alone, so at group 16 it can hand the
+kernel a partition that is not a whole number of tiles — the kernel then reads
+past it into the following group's codes and scales and silently returns wrong
+values for **every** element, at full magnitude, with no error raised.
+
+Whether it fires is decided by shape, not by the weights: it needs
+`transpose=true`, a 2-D weight (more precisely `out.size() / M / N == 1`), a
+batch at or above MLX's vector-kernel limit, and a partition `K / split_k` that
+is not a multiple of 32. That makes it a
+**prefill** and speculative-verify defect — single-token decode runs the vector
+kernel and is unaffected. On a gemma-4-class nvfp4 checkpoint
+(`hidden_size` 2560) the `k_proj` / `v_proj` pair at `N=512` is corrupt for
+batches of 10–32 tokens and the per-layer input gate at `N=256` for 33–64, so
+any prompt of roughly 10–64 tokens is affected.
+
+`rmlx_mlx::ops::quantized_matmul` mirrors MLX's split-K arithmetic and, when
+the partition would not be tile-whole, grows the batch with zero rows onto a
+partition that is — then slices them off. Zero rows cannot change the rows that
+are kept. It is inert for every group at or above 32, and for batches below the
+smallest vector-kernel limit any Apple GPU uses for the shape (14, 10 or 6,
+from the minimum over every branch of MLX's `get_qmv_batch_limit`).
+
+That floor is deliberately pessimistic, and the cost is worth stating plainly:
+mlx-c exposes no GPU-architecture query, and MLX's real crossover is 10–32
+depending on architecture and shape, so between the floor and the device's
+actual limit the guard pads batches MLX would have run on the vector kernel.
+Erring low is the only safe direction — the opposite error leaves a tiled
+matmul unguarded and silently wrong. The over-pad is bounded at 4.64x of an
+already-small batch and is pinned by a test.
+
+Reproduction, per-shape exposure tables and the end-to-end measurements are in
+`.rmlx/nvfp4-splitk-partition.md`, which is runtime state and not checked in;
+the mechanism above is the checked-in account, and the guard's own tests
+(`crates/rmlx-mlx/src/ops/matmul_tests.rs`) pin every number it depends on.
+
+Upstream fixed this by aligning the partition to `max(group_size, 32)`; that fix
+is on MLX `main` and in neither 0.31.2 nor 0.32.0. When a release carrying it is
+pinned, `linked_mlx_still_carries_the_misaligned_split_k_partition` fails and
+the guard should be deleted rather than carried.
+
 ---
 
 ## 4. Affine quants — block-affine weight quantization
