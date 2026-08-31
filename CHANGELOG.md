@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-31
+
+This release is the KV-cache subsystem measured against its own claims, and the
+silent-corruption class that was hiding behind them. Seventeen of the
+twenty-eight KV codecs never built a packed store and decoded byte-identically
+to bf16; the ten that did held *more* resident bytes than plain bf16, not fewer;
+and two `auto` resolvers disagreed about which one a request got. `--kv-quant
+auto` is now unquantised bf16 on every architecture and every context length,
+the `--kv-quant` help and `docs/KV_QUANT.md` state each codec's runtime
+disposition and a CI gate fails the build when they drift from it, and — after
+the sideband and mirror work — the first codecs in this tree's history hold
+fewer bytes than bf16, on the architectures whose topology pays for them.
+
+Running alongside that is a set of silent-wrong-output fixes. `quantized_matmul`
+read past its split-K partition on every nvfp4 checkpoint, corrupting prefill; a
+sparse-V kernel corrupted every `mixed_*` / `rot_k_*` decode above 8 192 tokens;
+the GDN speculative rollback replayed through a scratch KV stack at six of seven
+call sites; a `Mixed` truncate reported positions it did not hold; and the
+speculative serve path kept a second full copy of the verifier. Every published
+speculative accept rate and speedup is re-derived on the fixed tree, and several
+moved in both directions.
+
+The HTTP surface keeps its shape. The behaviour changes to read before upgrading
+are in **Changed**: `auto` no longer quantises, `--paged-kv` requires an explicit
+codec, Gemma4 with `mixed_*` / `rot_k_*` and an SSD-tier hit is refused rather
+than silently wrong, `--turbo-flash auto` holds OFF, and a `projects.toml`
+`draft_model` naming the served model fails at load.
+
 ### Performance
 
 - **Prefill attention masks are built on device, not scalar-filled on the
@@ -62,7 +90,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (inside run-to-run spread). No hoist was added or removed here. `mask.rs`
   records both numbers and does not claim a mechanism for the gemma-4 one.
 
+- **KV kernel dispatchers stop blocking the host per layer — up to 3.06×
+  decode.** All four iso/rotor flash-decode dispatchers called `Array::eval()`
+  on their kernel inputs immediately before dispatch. That is a synchronous
+  graph evaluation, and it ran once per attention layer per decode step — 26
+  host waits per token on Ternary-Bonsai-8B, with the forward pass advancing one
+  layer at a time and nothing queued ahead. It bought nothing: the row
+  contiguity the kernels need already comes from `MetalKernel::new`, which
+  passes `ensure_row_contiguous`. Paired A/B on one binary pair, `rmlx bench`
+  n=3 per cell, token digest / KV bytes / TTFT identical in every cell. Decode
+  TPS:
+
+  | cell | before | after |
+  |---|---:|---:|
+  | Bonsai-8B `iso3_sym` @4k | 19.09 | 55.15 |
+  | Bonsai-8B `iso3_sym` @16k | 11.00 | 19.01 |
+  | Bonsai-8B `k_iso3` @16k | 14.90 | 24.37 |
+  | Bonsai-8B `rotor3_sym` @16k | 10.13 | 16.03 |
+  | gemma-4-e2b `iso3_sym` @4k | 65.57 | 100.20 |
+
+  Absolute decode figures recorded on these codecs before this change are not
+  comparable with figures taken after it (#292, #334).
+
+- **The rotor / iso flash-decode shell was rewritten, and the rotor fused decode
+  stopped downloading its tail to the host each step.** The per-token QK dot
+  used a `log2(head_dim)`-round threadgroup barrier tree with 127 of 128 lanes
+  idle; it now folds through simdgroup reductions (~8 → 2–3 barriers per token),
+  and the rotor's ~64-FMA inverse Clifford sandwich is decoded once per group by
+  the block leader rather than once per lane. Separately, the rotor K-only fused
+  path ran `rotor_gpu_outputs_to_cpu` inside every decode step, building a
+  per-layer per-token CPU block the flash kernel never read — a host copy and a
+  GPU sync per layer per step, in the path whose whole purpose is removing host
+  work from decode. The GPU ring is now the source of truth for the decode tail
+  and the CPU blocks are rebuilt on demand at the two consumer boundaries,
+  `dequant()` and the SSD-spill / prompt-cache clone. Long-context kernel
+  microbenchmark 1.5–1.8× at 32k on both codecs; 4k decode TPS improves on every
+  cell (Bonsai `k_iso3` 17.9 → 22.5, `k_rotor3` 21.3 → 22.5; gemma-4-e2b
+  `k_iso3` 60.7 → 72.2, `k_rotor3` 62.3 → 70.4). Keyed off codec and shape
+  (`head_dim`, `kv_heads`, `bits`), never an architecture (#231, #234, #278,
+  #280).
+
 ### Fixed
+
+- **`quantized_matmul` silently corrupted prefill on every nvfp4 checkpoint.**
+  MLX's `qmm_splitk` aligns each split-K partition to `group_size`, but the
+  `qmm_t_splitk` kernels step K by a fixed 32-wide tile and do not bound that
+  loop. At nvfp4's group of 16 a partition can be 16 or 80 — not a whole number
+  of tiles — so the kernel reads past its partition into the next group's codes
+  and scales. Upstream aligns to `max(group_size, 32)` on main; neither 0.31.2
+  nor 0.32.0 carries that fix.
+
+  It is live by dispatch, not by inference: a 16-token chat prompt on
+  `gemma-4-E4B-it-qat-nvfp4` issues 40 `qmm_t_splitk` calls at N=512, K=2560,
+  partition 80 — `k_proj` and `v_proj` in 20 of 42 layers — at 43–63% relative
+  error. Decode is unaffected: M=1 routes to `qmv`, which is correct, and that is
+  why it hid. The predictor is `K/split_k % 32 != 0` rather than the partition
+  being narrower than the tile — at K=2560 the partition is 80, wider than the
+  tile and still not tile-whole — and over a 216-cell sweep that predicate has no
+  false positives and no false negatives.
+
+  `quantized_matmul` now mirrors MLX's partition choice and, where the resulting
+  partition is not tile-whole, pads the batch with zero rows onto one that is and
+  slices them off. Both gating tests are scalar and run before any array access,
+  so a wide-group model pays one modulo and one branch. On a 600-prompt
+  ground-truth-scored greedy battery, accuracy on corrupting shapes goes
+  31.5% → 49.5% (McNemar 98 vs 26, p=5e-11) while tile-whole shapes are unchanged
+  at 12.0% and 200/200 byte-identical; gemma-4-e4b-mxfp8 and Ternary-Bonsai-8B
+  are each 600/600 byte-identical across the change, and mxfp4 / mxfp8 / affine
+  show only bf16 noise across the sweep. **Anyone who evaluated an nvfp4 model on
+  a previous release got degraded results.** A test fails the build once the
+  linked MLX is past the last version carrying the defect, so the guard is
+  deleted on a bump rather than degrading into a prefill tax on a kernel that no
+  longer needs it.
 
 - **A speculative round loop's `decode_tps` counted the prompt prefill.** The
   MTP, DFlash and EAGLE-3 round loops started their timer before the verifier
@@ -498,6 +597,382 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consequence of the bf16 uniformity cast; regenerating it is a separate change
   so the arming and the fixture stay independently revertable.
 
+- **A shared-KV architecture forced every codec onto the legacy bf16 route.**
+  The cross-layer-KV producer path was missing the two fused-over-quant-store
+  arms `update_and_sdpa` has, so any model declaring shared-KV layers fell
+  through to `update()`'s O(`seq`) CPU dequant with the GPU idle, whatever the
+  codec supported — the same rotor kernel that lifts a non-sharing model 4–7×
+  logged zero dispatches on one that shares KV. A consumer never needed bf16
+  *tensors*; it needed access to the producer's K/V, which the quant store
+  already provides. The codec now says which it can offer: `SharedKv::Bf16`
+  reuses the tensors the producer's own SDPA materialised (rotating rings,
+  `Mixed` / `RotK`, TurboFlash / fused-QK and the legacy fallback all keep their
+  behaviour bit for bit), and `SharedKv::Store` re-enters the same fused kernel.
+  Keyed off sharing topology and codec, never an arch name (#228, #232).
+
+- **Generation died the moment it crossed the window the prompt happened to
+  provision.** `max_seq` is provisioned lazily and only the prefill path grew
+  it, so the cap froze at what the prompt needed even when `--max-ctx` allowed
+  the sequence. The surviving headroom was incidental — `next_pow2(prompt) -
+  prompt` — which is why it looked healthy: a prompt well under the bound
+  generates for thousands of tokens first, while one that saturates it dies on
+  the first generated token. Measured on Ternary-Bonsai-8B at `--max-ctx 65536`,
+  tokens generated before decode died were exactly `headroom + 2` at every
+  power-of-two boundary (4096 → 2, 8190 → 4, 16380 → 6, 32760 → 10). Each store
+  failed differently — the packed rotor ring raised a shape error, the paged
+  code buffers clamped and sliced to zero length, and the bf16 mirrors
+  `slice_update` out of bounds, a silent no-op that drops the token while
+  `offset` marches on — so `ensure_decode_capacity` sits at the shared decode
+  seam, with the `--max-ctx` ceiling and the hard cap kept as loud, typed
+  backstops (#233, #238). The K8V4 head-major TurboFlash path bypasses that seam
+  and needed the same call plus a re-size of its latched head-major buffers: it
+  died with `reshape: Cannot reshape array of size 0` at the next power-of-two
+  boundary, and because a deterministic crash reproduces on replay, the retry
+  envelope was replacing the real error with a synthetic "replay prefix
+  divergence" message. The engine error is now preserved across replay attempts
+  and reaches the client (#261, #271).
+
+- **A speculative partial accept left four different KV stores holding the wrong
+  prefix.** Four defects at one seam, all reachable from an ordinary partial
+  accept or a prompt-cache trim:
+
+  - `truncate_to` compared a block store's `n_tokens` — a row count,
+    `b · kv_h · seq` — against a *sequence* target, dropping valid blocks at
+    `kv_h > 1` and staying invisible at `b · kv_h == 1` (#284).
+  - It kept only the blocks that fit whole, but a verifier writes its
+    `K + 1`-token chunk as one block, so every partial accept cuts inside it.
+    `blocks` then covered fewer rows than `shape[2]` and the next `dequant` /
+    `try_deep_clone` aborted the request. `truncate_plan` now splits the
+    trailing block, and each block type cuts every per-row buffer — codes,
+    per-group scales, per-group quaternions, per-token norms, and the rotor QJL
+    sideband (#378, #391).
+  - Twelve arms of `KvStorage::truncate_to` did nothing but set `shape[2] = n`,
+    while those stores accumulate their CPU payload independently of it. The
+    payload kept over-covering the target, the next append stacked on top, and
+    the dequant read back a prefix of the stale buffer: attention over the
+    tokens the verifier *rejected*, with the accepted correction missing. Every
+    arm now delegates to a store-level `truncate_to` (#382, #393).
+  - Every block-accumulating store ended `dequant` by reordering the
+    *concatenation* of its blocks as one `[B, S_total, kv_h, D]` run. Each block
+    is only `[B, S_block, kv_h, D]`, so above one batch element every block
+    restarts at batch 0 and the blocks interleave — measured on `QuantRotorV3`
+    at `b = 2`, exactly the batch-1 half of a two-block store disagreed with a
+    one-block control, while the `b = 1` control matched bit for bit (#383,
+    #392, #400).
+
+- **Short prompts aborted at MSL compile on the `iso*_sym` / `rotor*_sym`
+  quant-V kernels.** MLX binds the small per-token norms buffer as `constant`
+  where the kernel header wants `device const float*`, which at `kv_h == 1`
+  (Gemma4 global layers) killed the dispatch. A shared
+  `pad_norms_to_device_floor` zero-pads norms to 16 elements to force the
+  `device` binding, so decode stays on-GPU at every `kv_seq >= 1` rather than
+  falling back to the host (#220, #279, #286).
+
+- **`--rotor-qjl` defaults to off, and a store's QJL decision is sticky.** The
+  rotor update path gated its GPU encode on the process-global flag while the
+  SDPA fast path read the store's own decision, so a later toggle reinterpreted
+  bytes already written; the update path now reads the store, matching SDPA
+  (#230). And QJL forces the rotor fused decode off — there is no MSL kernel for
+  it — putting both axes on the CPU at stock defaults. Measured at temp=0 on
+  Ternary-Bonsai-8B and gemma-4-e2b across a 4k–32k sweep, QJL-on cost 16–71×
+  decode and up to ~3.7× TTFT while buying zero measured accuracy:
+  byte-identical short-context output and identical 6k-context needle retrieval,
+  on and off. It is the opt-in fidelity knob now, and the loud CPU-path warning
+  fires only when it is chosen (#245, #268).
+
+- **A KV kernel returned f32 to a caller holding bf16, re-instantiating the
+  decode graph at f32.** `turbo_flash_sdpa` declared f32 kernel outputs —
+  correct for online-softmax accumulation — and returned that f32 up. MLX then
+  did what it is designed to do: the attention output promoted the residual add,
+  and the promotion propagated through the next layer's RMSNorm, its weight
+  GEMV, its elementwise ops and the sampler, at no point erroring or warning.
+  Proven by kernel identity rather than by timing — two GPU captures one
+  `astype` apart show nine f32 kernels leave the `--turbo-flash on` arm's list,
+  each replaced by its bf16 twin, and nothing new appears.
+  `rot_k_fwht_quantize_gpu` had the same defect by a second mechanism, returning
+  f32 *scales and biases* where `mx.quantize` returns them at K's dtype, which
+  promoted the graph just as effectively and made the fused and non-fused arms
+  of one codec run at different widths. The six flash-decode dispatchers now
+  restore the query dtype themselves (#413, #421).
+
+- **The Qwen-MoE KV guard read the declared architecture, not the one the loader
+  built.** Both Qwen3.5 arch strings load through one loader into one
+  `Architecture`, and that loader decides dense-versus-sparse from a per-layer
+  tensor witness, so `architectures[0]` and the model that gets built can
+  disagree. The guard rejects rotor / iso / low-bit-K codecs because they were
+  measured to destroy perplexity on Qwen sparse MoE — and a checkpoint declaring
+  the dense name while shipping MoE tensors ran every one of them to completion:
+  no error, a correct-looking run, wrong output. Verified against a real
+  256-expert snapshot whose only modification was `architectures[0]`;
+  `rotor3_sym` completed at 11.4 TPS. `arch_class()` now reports the resolved
+  class and the invariant table is re-run against it after load, which also
+  closes a wider hole — the server's resolver never called the guard at all, so
+  an explicit `--kv-quant` and a per-request `kv_quant` override reached the
+  model unvalidated on every architecture (#352, #379).
+
+- **K8V8 `exit_prefill` could throw "There is no Stream(cpu, 0) in current
+  thread"** on an axum worker, once per layer, yielding zero tokens and HTTP
+  503. Since MLX 0.31 the default CPU and GPU streams are thread-local, and the
+  generate entry points registered the worker's GPU stream but not its CPU one.
+  `ensure_cpu_default_stream` is now called at every worker-thread eval entry
+  point — generation, embeddings, image, audio, transcribe, speculative (#206,
+  #210).
+
+- **Choosing a KV codec to fit a longer context measured *larger* than
+  `--kv-quant none`.** `exit_prefill` bulk-encoded the codec store for every
+  quant, including the whole family whose decode reads only the bf16 mirror. For
+  those codecs the store was written once and then held, unread, for the entire
+  decode window — a second full copy of the context per layer, on top of a
+  mirror that is already exactly bf16-sized, and monotonically worse as context
+  grew. The bulk encode is gated on an exhaustive `decode_reads_packed_store()`
+  classifier now; the store is still built for the families whose decode reads
+  it and for any cache with no mirror to read (SSD hydrate, `Device::Cpu`, a
+  cache that never bracketed a prefill). Measured on Ternary-Bonsai-8B and
+  gemma-4-e2b at 4k/8k/32k/64k, every `k8v8` / `k8v4` / `planar` cell now equals
+  its `none` cell exactly — ratio 1.0000 at all 32 cells, against 1.33 / 1.60
+  flat on Bonsai and 1.43 → 1.92 rising on gemma before. Process memory follows
+  where the store was the allocator peak: Bonsai 32k `planar` 9 052 → 5 671 MB,
+  64k 17 347 → 10 568 MB. Token ids are byte-identical at temp=0 (#404, #420).
+
+- **`--kv-quant none` allocated a packed q8 store that nothing read.**
+  `kv_quant_for_layer` promoted the first two and last eight layers to `K8V8`
+  under every base codec, `None` included — on top of the bf16 buffers those
+  layers already hold, and a `K8V8` layer early-returns into the bf16 mirror
+  anyway. The store could not change an output bit and was pure residency:
+  +14.3% on Ternary-Bonsai-8B and +16.0% on gemma-4-26b at 32k, 2.6 GiB at 128k.
+  The promotion exists to recover quantization loss, so it is applied only where
+  there is loss to recover — a codec property (both sides already at model
+  dtype), not an arch or head-count branch, and the K-only families stay
+  promoted because their K is 3- or 4-bit. Token ids byte-identical in every
+  pair (#411, #419).
+
+- **Rotor K-only appends kept the prefill prefix resident twice.** `k_rotor3` /
+  `k_rotor4` never called `drop_blocks_when_ring_live`, so once the GPU ring
+  went live the CPU blocks stayed for the whole request — which is why they read
+  ~1.5× bf16 while `rotor3_sym` / `rotor4_sym` read ~1.24×. Measured A/B on one
+  binary pair, 3 runs per cell: Ternary-Bonsai-8B 990.0 → 717.2 MB at 4k
+  (−27.6%) and 8 227.6 → 5 943.7 MB at 32k (−27.8%); gemma-4-e2b 53.9 →
+  37.0 MB at 4k (−31.4%) and 395.6 → 254.2 MB at 32k (−35.8%). Every other codec
+  measured byte-identical, temp=0 output hashes match across 16 cells, and
+  decode TPS is unchanged. The reduced figure is still above bf16, and that is
+  the format rather than a bug (#310, #315).
+
+- **`kv_bytes` could not see the GPU ring, and three accountings of the same
+  memory had drifted apart.** `KvCache::approx_bytes` — the source of the
+  `kv_bytes` trace event — was a per-codec bits-per-element formula that never
+  read the store: on Ternary-Bonsai-8B it reported byte-identical KV for
+  `k_iso3`, `k_rotor3` and `k8v4`, three storage layouts and one number. Each
+  store also had its own `byte_size`, which did count the ring, but nothing in
+  production called it. The store is the single source now
+  (`KvCache::resident_bytes` → `KvStorage::resident_bytes` →
+  `<Store>::byte_size`), built from `Array` shape × dtype and `Vec` length ×
+  element size, so a buffer that grows or changes dtype reports the truth with
+  nothing to update, and adding one anywhere in the chain fails to compile until
+  it is classified as payload or metadata (#246, #258). The metric is sampled at
+  one lifecycle point too — post-decode, behind a witness minted by a completed
+  decode loop. Five architectures recorded it at the prefill snapshot, before the
+  decode-time ring was allocated, and one recorded either figure depending on
+  whether the prompt cache hit: on ring-backed codecs one process read 9 228 480
+  bytes pre-decode against 35 047 808 post-decode (#259, #273).
+
+- **A decode step that errored was reported as a clean stop.** The loop logged a
+  warning, broke, and handed back the tokens produced so far; the server read
+  the last token, found it was not EOS, and reported `finish_reason="length"` —
+  byte-identical to hitting the token cap, so a caller could not tell "generated
+  2 tokens then crashed" from "hit `max_tokens`". That defeats every automated
+  gate in the repo, because they all read exactly those two signals: measured
+  with decode dying at step 140 of 300, `rmlx baseline` exited 0 and printed
+  `decode_tps=138.312`, a plausible number that would have been recorded as a
+  legitimate measurement. The forward error now propagates out of the shared
+  decode loop and the three per-arch copies. `finish_reason="error"` is
+  deliberately not introduced — it is not in the OpenAI enum, and Anthropic's
+  `map_stop_reason` catch-all resolves unknown reasons to `end_turn`, so it
+  would re-create the same bug on another surface — and each surface instead
+  reports the failure the way its own protocol already does: HTTP 503 with the
+  standard envelope when blocking, an error event in place of the terminal chunk
+  on OpenAI streaming, and the native `error` event on Anthropic streaming
+  (#235, #244).
+
+- **A failed prefill completed as a successful run with an empty step list.**
+  The shared `chunked_prefill` returned `Ok(None)` on a chunk failure,
+  destroying the cause at the boundary, and all five arch callers answered that
+  `None` identically. This shipped fabricated zeros as data: `rmlx baseline`
+  over the max-ctx ceiling exited 0 and printed
+  `ttft_ms=0 decode_tps=0.000 prefill_tps=0.0` as a measurement, which the perf
+  canary read, exited green on, appended to its CSV and recorded into `runs.db`.
+  The signature is `Result<Array>` now and the cause reaches the caller verbatim,
+  which also fixes classification — a `KvCeilingExceeded` is Fatal, where the
+  swallowed path degraded to `Error::Other` and was replayed as Migratable
+  (#243, #253). The speculative `prefill_chunked` gets the same mandatory
+  `exit_prefill` sweep on failure; it previously `?`-returned mid-prefill,
+  stranding every cache with `in_prefill = true` so a retained `Vec<KvCache>`
+  decoded on un-finalized caches (#251, #263).
+
+- **A `NaN` prefill returned one junk token and reported success.** Every
+  architecture detected `NaN` in its prefill logit row and then discarded the
+  finding — `if nan_count > 0 { return Ok(steps) }`, logging nothing at any
+  level. Greedy selection over an all-`NaN` row returns index 0 whatever the
+  model computed, so the run emitted one fixed token, skipped the post-decode
+  KV-byte store, and returned success: `rmlx baseline` printed a summary and
+  under `--record` wrote a permanent row to the append-only store, and the
+  server returned HTTP 200 carrying that token. All six prefill sites go through
+  a shared `reject_nan_prefill` now, which logs `nan_count`, `max_abs_logit` and
+  `prompt_len` and propagates, raised before the poisoned token is handed to
+  `step_fn`. It is classified Migratable: the fault is intermittent, a temp=0
+  replay has a real chance of completing, and raising before any delivery is what
+  makes that replay safe. `qwen3_5_moe` and `qwen3_vl_moe` hard-coded
+  `nan_count: 0` and never computed it, so the guard would have been unreachable
+  on Qwen3.6 (#346, #380).
+
+- **`json_schema` could return HTTP 200 with the schema unenforced.**
+  `SchemaGrammar::step` treated whitespace as an unconditional no-op wherever it
+  was legal, and withholding EOS until the value is complete turns any
+  accept-without-progress byte into a cycle a greedy decoder never leaves: the
+  mask kept offering whitespace, kept refusing EOS, and the request ran to
+  `max_tokens` carrying nothing but indentation. Both JSON engines now cap a run
+  of insignificant whitespace at 16 bytes, reset by any content or structural
+  byte, so no document becomes unreachable — only indentation deeper than the
+  cap is clipped. Whitespace was also being swallowed *inside object key
+  strings*, which re-opened the cycle there and made a schema property name
+  containing a space unmatchable; raw C0 control bytes are now rejected inside
+  any string, key or value, in both engines, matching RFC 8259. The initial
+  reasoning channel is no longer inferred from the architecture (#388, #399).
+
+- **`max_tokens` reached `Vec::with_capacity` with no ceiling at all**, in
+  `ArchGenerator`, in the speculative path and in every per-arch step vector,
+  because the default `--max-tokens-cap` was `u32::MAX`. A request asking for
+  4 294 967 295 picked a 275 GB pre-allocation. `enforce_max_tokens_cap` takes
+  `cap.min(MAX_COMPLETION_TOKENS)` now, so the operator flag can only lower the
+  ceiling, and both routes reject with HTTP 400 rather than clamping. The
+  ceiling is 1 Mi tokens: a completion cannot outgrow the context holding it,
+  and that is the ceiling the input side and the Anthropic `ctx_max` report
+  already use.
+
+- **The retry envelope re-issues the original prompt.** `build_request` appended
+  the already-delivered tokens to the prompt *and* the replay loop skipped
+  `delivered.len()` engine-output tokens, so on a partial-delivery replay those
+  tokens were consumed as prompt and skipped on output. The skip then compared
+  mismatched positions and reported a spurious prefix divergence, turning a
+  recoverable mid-stream migratable error into a hard failure. The engine
+  re-generates the delivered prefix deterministically at temp=0 and the replay
+  loop skips it; genuine divergence detection is preserved (#272, #276).
+
+- **`KvCeilingExceeded` no longer calls decode "prefill", and two catch-alls
+  stop laundering unknowns into success.** Since decode grows the window too,
+  both ceiling errors fire on the decode path, and their message still said
+  "prefill" — which the response payload carries, so a user whose prompt fit
+  comfortably was told their "prefill request" exceeded the ceiling when
+  generation crossed it. The phase word is dropped. Separately, Anthropic's
+  `map_stop_reason` mapped an unrecognised finish reason to the successful
+  `end_turn`, and retry classification had a `_ => Fatal` arm; classification now
+  delegates to an exhaustive match in the crate that defines the error type, so
+  a new variant fails the build until it is explicitly classified (#239, #240,
+  #264).
+
+- **A single over-cap prompt-cache snapshot stalled the next warm request.** The
+  RAM-cap eviction loop only evicted *other* slots and never refused the
+  incoming entry, so an empty cache silently accepted a snapshot many times
+  larger than the cap. The next identical request deep-cloned it and
+  copy-on-wrote the whole KV on the first decode append — a second full-size
+  residency, which at long context pushed total residency past physical RAM and
+  stalled decode with one multi-hundred-second pause while steady-state ITL
+  stayed healthy. Admission is refused when the incoming entry alone exceeds the
+  cap, so the repeat request re-prefills exactly like the cold one and peak
+  residency is bounded to one live copy; an SSD hydrate of an over-cap block is
+  treated as a miss. Keyed off `kv_bytes` against the cap, never an arch or
+  codec name (#212, #225).
+
+- **`--prompt-cache-slots 0` rebuilt the cache instead of disabling it.**
+  `PromptCache::new` clamped capacity to `max(1)` on the way in while
+  `ArchPromptCache::ensure` compared the unclamped argument, so the rebuild arm
+  fired on every call — once per generation on all eight architectures. A
+  "zero-slot" run therefore discarded a freshly built cache each time,
+  re-installing the SSD sinks with it, and reset the hit/miss counters, which
+  silently zeroes any measurement taken as `after - before` around a generation.
+  Capacity is stored as asked now and `push` refuses admission at 0. In the same
+  area, the KV-byte counter was a per-arch-type static: two models of the same
+  architecture resident at once wrote the same location, so model B's store could
+  advance the sequence model A's recording bracket was watching and be returned
+  as A's — into the append-only `events` table, where a wrong row is permanent.
+  It lives on each arch's model struct now (#319, #321, #348).
+
+- **The SSD KV tier hydrated nothing, and enforced its budget only at attach.**
+  The prompt-cache key gained a model term and the hydrate probe did not; chained
+  digests are seeded, so one missing term made block 0 differ and every candidate
+  prefix miss — not an error and not a wrong answer, just `ssd_hits=0` forever
+  and a full re-prefill on every repeat. `cache_seed` now lives in
+  `rmlx_kv_ssd::hashing`, below both consumers, with the model's own signature
+  threaded through `attach_at_load` rather than re-derived from a name string,
+  so there is no formula left to retype (#350). Separately, `evict_lru_until` was
+  reachable only from the once-per-load attach path, so a `serve` that stayed up
+  ran past `--kv-ssd-cache-gb` for its whole lifetime and `rmlx_ssd_bytes_used`
+  froze at the figure measured when the model loaded: on a 4-request session at
+  a ceiling that holds one block, gemma-4-e2b held 2.2× over and
+  Ternary-Bonsai-8B 3.0× over, with zero evictions in both. The spill drain
+  thread — the only writer that grows the tier, and off the inference path — now
+  runs the evict-to-budget pass after every block it records (#30, #342, #344).
+  And `last_used` was unix seconds against an `ORDER BY last_used ASC` with no
+  tiebreak, so under any realistic request rate many blocks shared a second and
+  LRU degraded toward random replacement exactly when the tier matters most;
+  stamps are wall-clock microseconds clamped above the highest the process has
+  already issued, which is a strict total order across threads and survives a
+  restart (#343, #349).
+
+- **A checkpoint whose affine weight-quant bit width has no dequant kernel in
+  this build's mlx-c "loaded" successfully**, then failed per token at first
+  prefill, spamming a buried Metal kernel-load error 48× per request before
+  returning a generic 503. `arch::load_model` pre-flights the resolved affine
+  bits — the global default and every `tensor_overrides` entry — against
+  `rmlx_quant::affine::SUPPORTED_BITS` before any tensor I/O, so the model fails
+  once with one actionable error naming the offending tensor instead of
+  advertising itself as loaded (#208, #209).
+
+- **`rmlx baseline` silently truncated an over-length prompt on the GPU.** The
+  65 536-token cap has an O(N²) CPU-forward rationale that does not apply to
+  `--device gpu`, and truncation was logged at WARN only, so an over-length run
+  recorded a shorter measurement that looked like a valid full-length one.
+  `--device gpu` hard-errors now unless the caller opts in with an explicit
+  `--max-prompt-tokens` or the new `--allow-truncate`; `--device cpu` keeps the
+  historical behaviour, where the rationale is real (#213, #223). It also read a
+  chat-JSON prompt fixture with a plain string read and tokenized the envelope,
+  keys and syntax along with the content, so `--prompt-tokens N` measured N raw
+  *file* tokens — inflating counts past both the model's context ceiling and the
+  prompt cap on long-context fixtures. It renders the messages through the
+  model's own `chat_template.jinja` first now, the same render-then-tokenize path
+  the HTTP chat-completions route uses, and hard-errors on a chat-shaped fixture
+  it cannot parse rather than falling back to the envelope (#291, #312).
+
+- **`kv_quant` and `model_namespace` are recorded labels, not validated enums.**
+  The metrics-side allow-list was a stale hand-maintained mirror of the codec
+  grammar, missing roughly 18 real tokens, so every observation and event row for
+  the rotation / sym / planar / turbo families was silently rejected at ingest.
+  `canonicalize_kv_quant` no longer rejects anything: it lowercases, trims,
+  normalizes a tiny alias set, and records everything else verbatim — including a
+  codec name this binary has never heard of. The grammar-mirroring helpers are
+  deleted with it, because the mirror could only drift again (#214, #224).
+
+- **An implausible row could win a `bests` cell and publish.** `observations`
+  held 20 `prefill_tps` rows storing `(prompt_tokens - 242) * 1000` under
+  `unit='tps'` — up to 998× any real rate — plus 95 rows across four metrics
+  whose value is exactly `0.0`, and four of them had published into
+  `BENCHMARK_CHAMPIONS.md`. The view ranks by magnitude and nothing on the way in
+  bounded the number; the registry carried `(unit, direction)` only, and
+  `doctor`'s unit check compares the label, never the value. The registry gains a
+  per-metric `Bounds` — a ceiling, plus whether `0.0` is itself a measurement, as
+  a rate is zero only when nothing was produced — enforced at ingest, *generated*
+  into the `bests` view so the two cannot drift, and reported by `doctor`.
+  `rmlx baseline` no longer fabricates `0.0` for an unmeasured phase:
+  `PhaseTiming` is `Option` per phase, prints `n/a`, writes an empty CSV field
+  and serializes to `null` (#401, #418).
+
+- **The missing-nax-kernel warning fired on every build regardless of
+  hardware**, including runners that never had a Neural Accelerator and
+  legitimately ship none of the kernels — while asserting, in the same breath as
+  reporting a confirmed absence, that the pinned metallib ships them. The
+  warn-or-stay-silent decision is a pure function over (NA-class host, kernels
+  present) now, and the message no longer asserts what an uninspected bottle
+  contains (#262).
+
 ### Added
 
 - **The first KV codecs in this tree's history that hold fewer resident bytes
@@ -563,6 +1038,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `try_fused_qk_dispatch` now names the gate that rejected, and the `head_dim`
   gate carries the observed value. This is what identified the Gemma4 result
   below in one run instead of by reading the dispatcher.
+
+- **Fused flash-decode kernels for the iso and rotor KV families.** `k_iso3` /
+  `k_iso4` and `k_rotor3` / `k_rotor4` decoded by CPU-dequantizing the whole K
+  prefix on every step — O(`seq`) host work per token with the GPU idle, which is
+  what pinned them at single-digit TPS. Three MSL kernels close it:
+  `rotor_flash_decode` (QK over the packed rotor store, online softmax, bf16-V
+  SV, in two dispatches per step; the Cl(3,0) rotor decode runs inside the
+  attention inner loop, so no bf16 or f32 K is materialised and nothing restages
+  through the host — #217, #229), `iso_flash_decode` (one left Hamilton product
+  per lane, no threadgroup staging and no barrier, sharing the codec-agnostic
+  pass-2 LSE merge with the rotor and planar kernels — #218, #247), and
+  `rotor_flash_decode_symv`, which reads V straight from its own packed ring so
+  `rotor3_sym` / `rotor4_sym` need no bf16 mirror on either axis (#219, #281).
+  Each carries a GPU-versus-CPU-dequant numerical oracle across `head_dim`
+  64/128/256/512, GQA and additive masks.
+
+- **`rmlx bench`** — a repeated-run decode instrument. It serves one (model, KV
+  codec, context, generation length) cell `--warmup` + `--runs` times in-process
+  and reports TTFT, ITL p50/p99, decode TPS, prefill TPS and filled-prefix KV
+  bytes as a median with the observed min/max and range%. It writes nothing;
+  `baseline --record` remains the path to the append-only store. It also refuses
+  to produce a number it cannot stand behind: `Architecture::kv_cache_bytes()`
+  returned a bare `u64` in which `0` was both the never-written initialiser and a
+  legal reading, and in which a generation that returned before its KV-byte store
+  left the *previous* generation's figure readable, indistinguishable from a
+  fresh one. The accessor returns `KvBytesSample { bytes, seq }` now, and an
+  unadvanced sequence and a reported zero are two differently-worded hard errors
+  (#303, #322).
+
+- **GPU profiling that works headlessly.** `rmlx baseline --gpu-capture` (with
+  `--gpu-capture-skip` / `--gpu-capture-steps`) captures a bounded decode window
+  as a replayable Metal trace. The window is selected in the shared decode loop,
+  so it is model- and codec-agnostic with no per-arch wiring, and the whole path
+  sits behind the `metal-capture` cargo feature — an ordinary build has no flag,
+  no branch and no undefined reference to `mlx_metal_start_capture`, so it cannot
+  capture accidentally. It conflicts with `--record`, because capture drops
+  decode to single-digit TPS and that number must never reach `runs.db` (#307,
+  #324). `make build-capture` signs the binary with
+  `com.apple.security.get-task-allow`, since Cargo's linker-signed ad-hoc
+  signature carries no entitlements and a freshly built binary is not attachable
+  by Apple's GPU tools, and a preflight checks the toolchain before a run writes
+  several GB (#325, #329). GPU time itself comes from `xctrace`, and
+  `make gpu-test` now pins the whole `MTL_SHADER_VALIDATION_*` environment rather
+  than inheriting it and asserts the validation banner appeared — an
+  out-of-bounds device store from a Metal kernel is otherwise dropped silently,
+  the command buffer completes, the process exits 0, and the assertions over the
+  frozen buffer still pass (#328, #330, #347).
+
+- **MLX identity is recorded, and checked at run time.** The build stamps whether
+  the resolved MLX metallib carries the `steel_gemm_fused_nax` GEMM family, and
+  migration `004` records `mlx_nax` on every `events` row as a free-form label
+  (#275). That stamp describes the machine that *built* the binary, which is the
+  wrong answer for anything shipped: the bottle and the release tarball both link
+  `libmlx.dylib` through the moving `opt` symlink, so they run against the
+  installing user's MLX. A runtime probe now walks dyld's image list for the
+  library actually loaded, scans its colocated metallib, and warns only when the
+  host has a GPU Neural Accelerator and the kernels are confirmed absent — on
+  M5-class hardware that absence is a silent 2.2–3.7× prefill and TTFT loss with
+  correct output, which reads as a model-code defect rather than a toolchain one.
+  Host-class gating runs first and short-circuits before any file access, because
+  M1–M4 legitimately ship zero of these kernels and warning there would bury the
+  one host where the absence costs something (#305, #339). A version skew between
+  the MLX compiled against and the MLX loaded warns for the same reason (#216,
+  #249).
 
 ### Documentation
 
@@ -701,6 +1240,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is removed and the real boundary stated: MST carries no kernel names and no
   counters, which is what the Xcode GUI replay is for.
 
+- **The GPU suite is not clean, and `docs/TESTING.md` said it was.** The Metal
+  shader-validation aggregate reports 160 invalid accesses in MLX's own
+  `affine_qmm_t_splitk`, so the first reader to hit the aggregate had nothing to
+  compare against. They are out-of-bounds device *loads* in
+  `QuantizedBlockLoader::load_safe`, which bounds its row index against the
+  compile-time `BK` instead of the runtime `num_outs`, so the guard cannot fire
+  and a transposed quantized matmul over an unaligned N dequantizes the tile's
+  out-of-range rows straight from device memory. Reads only: the store side is
+  clipped by the sole reachable store branch for that instantiation, and the
+  block MMA performs no reduction across n. The values are shown bitwise not to
+  reach the output over 66 controlled cells spanning bits, group size, codec,
+  dtype and both kernel families, with the primary control striding a view over a
+  NaN-padded quantized triple so the same instantiation runs with the
+  out-of-range rows provably poisoned; end to end, `eval ppl` on two
+  architectures is identical across validation off, zerofill and allow. Two rules
+  go with it, both got wrong once: the unaligned unit is 32 on the non-batched
+  path and 64 on the batched and gather paths, and no diagnostic never licenses
+  no out-of-bounds read. The suite's own totals are corrected with it — 352 GPU
+  tests passed in a full run, not 3 532; the runner does not print that total
+  when a validation hit makes it exit early, so it has to be summed from cargo's
+  per-crate result lines.
+
+- **Two Bonsai-27B benchmark corrections.** The `k8v4` crater is real: a clean,
+  boundary-safe re-measurement reproduces 50.4 / 15.5 / 5.0 TPS at 4k/32k/128k
+  against a same-machine `k8v8` control of 45.1 / 37.3 / 21.4, so the tq4-V
+  dequant cost stands. But the same re-measurement surfaced that every recorded
+  256-token `k8v4` cell was a truncated crashing run — 242–250 of 256 tokens, at
+  the power-of-two decode boundary, masked to the streaming client — so the row
+  is marked as a crashing cell and "avoid 4-bit V (slow)" becomes "broken and
+  slow" (#241, #260). The reported 2.6–3.4× prefill deficit against the sibling
+  backends does *not* survive: the campaign ran on a Homebrew MLX bottle that
+  silently shipped zero NAX GEMM kernels on this host, a prefill-only ~3.8×
+  matmul loss. Re-measured with the pin verified active, cold TTFT is
+  4.8 / 10.7 / 24.4 / 53.4 / 136.6 / 408.8 s from 4k to 128k against the
+  published 14.8 / 32.0 / 67.9 / 147.5 / 335.0 / 815.4 — a 3.08× deficit becomes
+  1.99×, and roughly 1.0–1.3× against the NAX-correct mlx-lm champion, parity at
+  4k–8k. The GDN-recurrence explanation was numerology; the recurrence is ~2% of
+  prefill. Decode TPS and KV bytes are NAX-independent and unaffected (#248,
+  #274).
+
 ### Changed
 
 - **Every speculative accept rate and speedup in the docs is re-derived, and
@@ -738,9 +1317,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to −39%). The pre-rollback-fix `0.755 / 23.9 TPS / 1.28×` reading for
   Qwen3.8-27B stays retracted — a corrupted verifier agrees with its drafter
   more often than a correct one does — but the correction to it was itself
-  measured on the doubled load and is superseded by the table above. The EAGLE-3
-  `fcs` norms raise accept by 1.04–1.52×, not the "more than doubled" previously
-  claimed.
+  measured on the doubled load and is superseded by the table above. The blanket
+  form of that retraction does not survive either: DFlash (0.488–0.608) and
+  EAGLE-3 (0.263–0.362) reproduce close to their recorded accept rates, so the
+  claim that *every* accept rate taken on a GDN hybrid before this branch is
+  inflated is withdrawn. The EAGLE-3 `fcs` norms raise accept by 1.04–1.52×, not
+  the "more than doubled" previously claimed.
 
 - **Gemma4 with `mixed_*` / `rot_k_*` and an SSD-tier hit now fails loudly where
   it previously produced silently-wrong output.** `none_bf16_payloads` never
@@ -993,6 +1575,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copy that nothing reads can only drift from the one that runs — which is
   what had happened. Same "nothing runs it" criterion as the iso kernel above.
   The module keeps its sparse-attention dispatch, which does have callers.
+- **`rot_k_tq4v` retired.** Its decode appended to the packed store and then
+  rebuilt a full bf16 K *and* a full bf16 V of the whole prefix on every step
+  before running ordinary SDPA. `mx.quantized_matmul` cannot consume a Lloyd-Max
+  codebook, so the affine-V pairing's fused route was never available to it, and
+  the one kernel in tree that reads a tq4 V at decode is `auto`-OFF and slower
+  than the generic path. Re-measured against its affine sibling `rot_k_v4g64` at
+  the same shape on Ternary-Bonsai-8B and gemma-4-e2b at 4k/8k/32k, it is slower
+  at all six cells (per-slot ABBA ranges disjoint by 1.53× at the Bonsai 8k
+  cell), never reproduces the sibling's token ids on the shared-KV architecture,
+  and holds more resident KV. The name is rejected at parse and at
+  `--ctk rot_k --ctv tq4`, each naming its successor. Its memory headline
+  reproduces but its attribution does not: the +27–45% over `--kv-quant none` is
+  a whole-`Mixed` / `RotK`-family property, of which tq4-V against affine-4-V is
+  0.5–1.0% (#408, #409, #422).
+- **`tcq_v2_msl` removed** — a GPU Viterbi kernel with zero production dispatch
+  path. `K8VTurbo2Tcq` forces `Device::Cpu` on its hot V-side update and
+  `tcq_quantize_v2_gpu` had no caller outside its own test file, so repairing its
+  kernel-load failure would only have re-hidden the same rot (#265).
+
+### Dependencies
+
+- `spin` 0.9.8 → 0.9.9, off the yanked release (#257).
+- Two `cargo-minor-patch` group bumps, 9 crates and 6 crates (#287, #302).
 
 ## [0.3.0] - 2026-07-13
 
@@ -1698,7 +2303,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.3.0
 [0.2.8]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.8
 [0.2.7]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.7
