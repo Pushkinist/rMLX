@@ -22,6 +22,96 @@ pub fn matmul(a: &Array, b: &Array, device: Device) -> Result<Array> {
     Ok(Array { inner: res })
 }
 
+/// Width of the K tile the `qmm_t_splitk` kernels step the contracted
+/// dimension by.
+const SPLITK_K_TILE: i32 = 32;
+
+/// Smallest batch that could reach a tiled `qmm` kernel for this shape.
+///
+/// MLX picks the vector/tiled crossover in `get_qmv_batch_limit`, keyed off the
+/// GPU architecture as well as the shape. mlx-c exposes no architecture query,
+/// so take the minimum over every branch of that function for the shape: below
+/// it the vector kernel runs on every Apple GPU and split-K never applies.
+///
+/// Erring low is the safe direction — it can only pad a batch the vector kernel
+/// would have handled, never leave a tiled one unguarded. Between this floor
+/// and the device's real limit (10-32) the guard does pad batches MLX would
+/// have run on the vector kernel; that cost is the price of not knowing the
+/// architecture, and the per-shape floor keeps it far narrower than a flat one.
+fn qmv_batch_limit_floor(k: i32, n: i32) -> i32 {
+    if k <= 2048 && n <= 2048 {
+        14
+    } else if k <= 4096 && n <= 4096 {
+        10
+    } else {
+        6
+    }
+}
+
+/// The K partition MLX's `qmm_t_splitk` would use for this shape, or `None`
+/// when it falls back to the unsplit `qmm` kernel.
+///
+/// Mirrors the split-K choice in MLX's Metal `quantized.cpp`.
+fn splitk_k_partition(m: i32, n: i32, k: i32, group_size: i32) -> Option<i32> {
+    if group_size <= 0 || k < group_size {
+        return None;
+    }
+    let n_tiles = (n + SPLITK_K_TILE - 1) / SPLITK_K_TILE;
+    let m_tiles = (m + SPLITK_K_TILE - 1) / SPLITK_K_TILE;
+    let tiles = n_tiles.checked_mul(m_tiles)?;
+    if tiles <= 0 {
+        return None;
+    }
+    let mut split_k = (512 / tiles).max(1).min(k / group_size);
+    while split_k > 1 && k % (split_k * group_size) != 0 {
+        split_k -= 1;
+    }
+    (split_k > 1).then(|| k / split_k)
+}
+
+/// Row count to run this quantized matmul at so MLX's split-K partition is a
+/// whole number of K tiles, or `None` when `m` already is one.
+///
+/// MLX aligns each split-K partition to `group_size`, but the `qmm_t_splitk`
+/// kernels tile the contracted dimension by [`SPLITK_K_TILE`] and do not bound
+/// that loop. A codec whose group is narrower than the tile — nvfp4's 16 — can
+/// therefore be handed a partition that is not a whole number of tiles, and the
+/// kernel reads past it into the following group's codes and scales, silently
+/// corrupting every output element. Growing the batch moves MLX onto a coarser
+/// split whose partition divides the tile evenly; appended zero rows cannot
+/// change the rows that are kept.
+///
+/// Upstream fixed this by aligning the partition to `max(group_size, 32)`; the
+/// fix is on MLX `main` and in no release this builds against.
+fn splitk_safe_rows(m: i32, n: i32, k: i32, group_size: i32) -> Option<i32> {
+    if group_size % SPLITK_K_TILE == 0 || m < qmv_batch_limit_floor(k, n) {
+        return None;
+    }
+    let tiles_whole = |rows: i32| {
+        splitk_k_partition(rows, n, k, group_size).is_none_or(|p| p % SPLITK_K_TILE == 0)
+    };
+    if tiles_whole(m) {
+        return None;
+    }
+    // Once the tile grid alone reaches MLX's 512-threadgroup target the split
+    // collapses to one partition and the unsplit kernel runs, so the answer is
+    // always inside this bound.
+    let n_tiles = (n + SPLITK_K_TILE - 1) / SPLITK_K_TILE;
+    let unsplit_rows = SPLITK_K_TILE * (512 / n_tiles.max(1) + 1);
+    let rows = (m + 1..=m.max(unsplit_rows)).find(|&rows| tiles_whole(rows));
+    if rows.is_none() {
+        tracing::warn!(
+            m,
+            n,
+            k,
+            group_size,
+            "no tile-whole row count below the unsplit bound; dispatching a \
+             partition MLX will over-read"
+        );
+    }
+    rows
+}
+
 /// Integer-affine or mxfp8 quantized matrix multiply.
 ///
 /// `w` is the packed weight (U32 for affine/mxfp8, U8 for raw mxfp8 E4M3).
@@ -42,6 +132,107 @@ pub fn matmul(a: &Array, b: &Array, device: Device) -> Result<Array> {
 /// integer affine uses uniform scale * code + bias; mxfp8 uses E8M0 scales
 /// and E4M3 element codes.
 pub fn quantized_matmul(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    biases: Option<&Array>,
+    group_size: i32,
+    bits: i32,
+    mode: &str,
+    transpose_w: bool,
+    device: Device,
+) -> Result<Array> {
+    // Split-K only runs on the transposed path, and only a group narrower than
+    // the K tile can land on a partition that is not tile-whole. Both are
+    // decidable from the arguments, so test them before touching the arrays:
+    // this is every projection of every layer of every decode step, and each
+    // `Array::dim` costs two FFI calls.
+    if !transpose_w || group_size % SPLITK_K_TILE == 0 {
+        return quantized_matmul_packed(
+            x,
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+            mode,
+            transpose_w,
+            device,
+        );
+    }
+
+    // MLX reaches the split kernel only when `out.size() / M / N == 1`. A 2-D
+    // weight is the sub-case where that holds and MLX's own `M` is `x` flattened
+    // against its last axis, which is what `rows` computes. A weight of rank 3
+    // with unit leading dims also satisfies MLX's test, but there `M` becomes
+    // `x.shape(-2)` instead, so matching on it would need a different `rows`;
+    // no caller builds one (every site passes a 2-D `Linear`/`Embedding`
+    // weight). `rows` further assumes `x` is row-contiguous, as MLX does; when
+    // it is not, MLX stays on the unsplit kernel and this guard can pad a shape
+    // that never needed it — wasteful, never wrong.
+    let x_ndim = x.ndim();
+    let mut padded_rows = None;
+    if w.ndim() == 2 && x_ndim >= 2 {
+        let k = x.dim(x_ndim - 1)?;
+        if k > 0 {
+            let mut rows: i32 = 1;
+            for axis in 0..x_ndim - 1 {
+                rows = rows.saturating_mul(x.dim(axis)?);
+            }
+            let n = w.dim(0)?;
+            padded_rows =
+                splitk_safe_rows(rows, n, k, group_size).map(|padded| (rows, k, n, padded));
+        }
+    }
+
+    let Some((rows, k, n, padded)) = padded_rows else {
+        return quantized_matmul_packed(
+            x,
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+            mode,
+            transpose_w,
+            device,
+        );
+    };
+
+    tracing::debug!(
+        rows,
+        padded,
+        n,
+        k,
+        group_size,
+        bits,
+        mode,
+        "quantized_matmul: padding rows off MLX's misaligned split-K partition"
+    );
+
+    let flat = x.reshape(&[rows, k], device)?;
+    let grown = crate::ops::pad(&flat, &[0], &[0], &[padded - rows], device)?;
+    let out = quantized_matmul_packed(
+        &grown,
+        w,
+        scales,
+        biases,
+        group_size,
+        bits,
+        mode,
+        transpose_w,
+        device,
+    )?;
+    let kept = out.slice(&[0, 0], &[rows, n], &[1, 1], device)?;
+
+    let mut out_shape = x.shape();
+    if let [.., last] = out_shape.as_mut_slice() {
+        *last = n;
+    }
+    kept.reshape(&out_shape, device)
+}
+
+fn quantized_matmul_packed(
     x: &Array,
     w: &Array,
     scales: &Array,
@@ -360,3 +551,7 @@ pub fn gather_qmm(
     unsafe { check_status(status, "gather_qmm") }?;
     Ok(Array { inner: res })
 }
+
+#[cfg(test)]
+#[path = "matmul_tests.rs"]
+mod matmul_tests;
