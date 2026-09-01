@@ -1,8 +1,9 @@
 // Synthetic stand-in for crates/rmlx-cli/src/main.rs, read only by
 // scripts/check_kv_codec_disposition_fixtures.sh. It is not compiled and is not
-// part of any crate: the gate reads three help constants and the `--kv-quant` /
-// `--kv-bits` argument declarations out of the source, and each fixture makes
-// one edit to this file, to KV_QUANT.md beside it, or to manifest.raw.
+// part of any crate: the gate reads four help constants and the `--kv-quant` /
+// `--kv-bits` / `--kv-preset` argument declarations out of the source, and each
+// fixture makes one edit to this file, to KV_QUANT.md beside it, or to
+// manifest.raw.
 //
 // The codec names are invented (`fixbase`, `fixinert`, `fixinert2`, `fixlive`)
 // so a fixture can never collide with a real codec's stem. `fixinert2` extends
@@ -29,6 +30,16 @@ const KV_BITS_LONG_HELP: &str = "\
 Bit-width alias for KV cache quantization. Names no codec of its own; see
 --kv-quant for what each one does.";
 
+const KV_PRESET_LONG_HELP: &str = "\
+Named KV-cache preset. Each name resolves to a codec.
+
+  INERT — every preset target except the baseline:
+      fixslow resolves to fixinert.
+
+Presets:
+  fixbaseline -- the unquantised baseline
+  fixslow     -- resolves to fixinert; see INERT above";
+
 enum Cmd {
     Serve {
         #[arg(long, help = KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
@@ -40,6 +51,13 @@ enum Cmd {
             long_help = KV_BITS_LONG_HELP,
         )]
         kv_bits: Option<f32>,
+        /// Named KV-cache preset. See long-help.
+        #[arg(
+            long,
+            value_name = "NAME",
+            long_help = KV_PRESET_LONG_HELP,
+        )]
+        kv_preset: Option<KvPresetArg>,
     },
     Chat {
         #[arg(
@@ -56,5 +74,12 @@ enum Cmd {
             long_help = KV_BITS_LONG_HELP,
         )]
         kv_bits: Option<f32>,
+        /// Named KV-cache preset. See long-help.
+        #[arg(
+            long,
+            value_name = "NAME",
+            long_help = KV_PRESET_LONG_HELP,
+        )]
+        kv_preset: Option<KvPresetArg>,
     },
 }

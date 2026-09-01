@@ -43,9 +43,12 @@
 #   list. Nothing here is hand-written per codec.
 #
 # RULE 1 (CLI help, coverage)
-#   Every inert codec named anywhere in the `--kv-quant` / `--kv-bits` help
-#   text must also appear inside an INERT block in that text. A name that is
-#   only listed beside the live codecs is a name the help says works.
+#   Every inert codec named anywhere in the `--kv-quant` / `--kv-bits` /
+#   `--kv-preset` help text must also appear inside an INERT block in that text.
+#   A name that is only listed beside the live codecs is a name the help says
+#   works. `--kv-preset` is in scope because a preset is a codec under another
+#   name: five of its seven targets are inert, and while the block sat outside
+#   this list it said so nowhere.
 #
 # RULE 2 (CLI help, converse)
 #   Nothing inside an INERT block may be a codec that is NOT inert. A block
@@ -66,11 +69,21 @@
 #   head of the section it qualifies, not buried in one.
 #
 # RULE 6 (the help is actually reached)
-#   Every `--kv-quant` and every `--kv-bits` argument in the CLI must take its
-#   help from the shared constants. Copies drift; one that is checked does not.
-#   Checked per argument, not by comparing two counts: "five arguments and five
-#   `help =` attributes" is also what one argument carrying two of them and
-#   another carrying none looks like.
+#   Every `--kv-quant`, `--kv-bits` and `--kv-preset` argument in the CLI must
+#   take its help from the shared constants. Copies drift; one that is checked
+#   does not. Checked per argument, not by comparing two counts: "five arguments
+#   and five `help =` attributes" is also what one argument carrying two of them
+#   and another carrying none looks like.
+#
+# RULE 7 (no ratio is written into the help)
+#   No `N.NNx`-shaped resident-KV ratio may appear in any of these constants.
+#   Such a figure has one producer — `KvQuant::estimated_resident_bytes_per_layer`,
+#   which `rmlx info --list-cache-types` prints — and a second copy of it in a
+#   string literal is correct only by hand. The four that used to sit here were
+#   carried unchanged through the two commits that moved the stores underneath
+#   them, and ended up filing the four codecs that compress most under a heading
+#   that said they were larger than bf16. Rules 1-5 could not see it: they are
+#   all set-membership rules on codec names and none of them reads a number.
 #
 # SCOPE
 #   Rules 3-5 check that an inert codec carries a banner *somewhere* in
@@ -184,20 +197,26 @@ extract_const() {
     ' "${CLI_MAIN}"
 }
 
+HELP_CONSTS="KV_QUANT_HELP KV_QUANT_LONG_HELP KV_BITS_LONG_HELP KV_PRESET_LONG_HELP"
+
 : >"${WORK}/help.txt"
-for c in KV_QUANT_HELP KV_QUANT_LONG_HELP KV_BITS_LONG_HELP; do
+: >"${WORK}/help_inert.txt"
+for c in ${HELP_CONSTS}; do
     extract_const "$c" >"${WORK}/const.$c"
     [ -s "${WORK}/const.$c" ] ||
         die_env "could not extract const ${c} from ${CLI_LABEL}"
     cat "${WORK}/const.$c" >>"${WORK}/help.txt"
+    # The INERT blocks inside this one constant: from a marker line to the next
+    # blank line. Kept per constant, not pooled: a codec declared inert in the
+    # `--kv-preset` block must not launder a `--kv-quant` block that lists it
+    # beside the live codecs. Those are two surfaces and an operator reads one.
+    awk '
+        /^[[:space:]]*INERT[[:space:]]*—/ { inside = 1 }
+        inside && /^[[:space:]]*$/        { inside = 0 }
+        inside                            { print }
+    ' "${WORK}/const.$c" >"${WORK}/inert.$c"
+    cat "${WORK}/inert.$c" >>"${WORK}/help_inert.txt"
 done
-
-# The INERT blocks inside the help: from a marker line to the next blank line.
-awk '
-    /^[[:space:]]*INERT[[:space:]]*—/ { inside = 1 }
-    inside && /^[[:space:]]*$/        { inside = 0 }
-    inside                            { print }
-' "${WORK}/help.txt" >"${WORK}/help_inert.txt"
 
 if [ ! -s "${WORK}/help_inert.txt" ]; then
     die_violation "the --kv-quant/--kv-bits help declares no INERT block.
@@ -229,15 +248,22 @@ awk '
             printf "MISS\t%d\t--kv-bits\tlong_help = KV_BITS_LONG_HELP\n", NR
         }
     }
-    END { printf "COUNT\t%d\t%d\n", quant_args, bits_args }
+    /^[[:space:]]+kv_preset: Option<KvPresetArg>,$/ {
+        preset_args++
+        if (block !~ /long_help = KV_PRESET_LONG_HELP/) {
+            printf "MISS\t%d\t--kv-preset\tlong_help = KV_PRESET_LONG_HELP\n", NR
+        }
+    }
+    END { printf "COUNT\t%d\t%d\t%d\n", quant_args, bits_args, preset_args }
 ' "${CLI_MAIN}" >"${WORK}/argcheck"
 
 quant_args=$(awk -F'\t' '$1 == "COUNT" { print $2 }' "${WORK}/argcheck")
 bits_args=$(awk -F'\t' '$1 == "COUNT" { print $3 }' "${WORK}/argcheck")
-if [ "${quant_args}" -eq 0 ] || [ "${bits_args}" -eq 0 ]; then
-    die_env "found ${quant_args} --kv-quant and ${bits_args} --kv-bits argument \
-declarations in ${CLI_LABEL} — one of the two shapes stopped matching, so the \
-gate would be checking nothing"
+preset_args=$(awk -F'\t' '$1 == "COUNT" { print $4 }' "${WORK}/argcheck")
+if [ "${quant_args}" -eq 0 ] || [ "${bits_args}" -eq 0 ] || [ "${preset_args}" -eq 0 ]; then
+    die_env "found ${quant_args} --kv-quant, ${bits_args} --kv-bits and \
+${preset_args} --kv-preset argument declarations in ${CLI_LABEL} — one of the \
+three shapes stopped matching, so the gate would be checking nothing"
 fi
 
 grep '^MISS	' "${WORK}/argcheck" >"${WORK}/argmiss" || true
@@ -248,6 +274,27 @@ if [ -s "${WORK}/argmiss" ]; then
     done <"${WORK}/argmiss"
     echo >&2
     echo "An argument with its own help text is one this gate does not read." >&2
+    exit 1
+fi
+
+# ── Rule 7: no resident-KV ratio is written into the help ───────────────────
+# A ratio in these constants is a hand-maintained copy of
+# `KvQuant::estimated_resident_bytes_per_layer`, and the copy is what goes
+# stale. `rmlx info --list-cache-types` prints the computed figure; the help
+# points at it. The pattern is deliberately the *shape* of such a figure
+# (`0.44x`, `1.406x`), not a list of the ones that were there — a corrected
+# number is the same defect as a stale one.
+grep -nE '[0-9]+\.[0-9]+x' "${WORK}/help.txt" >"${WORK}/ratios" || true
+if [ -s "${WORK}/ratios" ]; then
+    echo "ERROR: the --kv-quant/--kv-bits/--kv-preset help writes a resident-KV \
+ratio:" >&2
+    while IFS= read -r line; do
+        echo "  RULE 7  ${line}" >&2
+    done <"${WORK}/ratios"
+    echo >&2
+    echo "That figure has one producer. Quote none and point the operator at" >&2
+    echo "\`rmlx info --list-cache-types\`, which computes it per codec and per" >&2
+    echo "topology from the same byte model the engine allocates against." >&2
     exit 1
 fi
 
@@ -318,11 +365,14 @@ report() {
 while IFS=$'\t' read -r _ _idx display stem mode class _rs _bk _bv; do
     case "${class}" in
         INERT)
-            # Rule 1: named in the help at all → must be in an INERT block.
-            if match_stem "${stem}" "${mode}" "${WORK}/help.txt" &&
-                ! match_stem "${stem}" "${mode}" "${WORK}/help_inert.txt"; then
-                report "RULE 1  '${display}' is inert but the CLI help names it outside the INERT block"
-            fi
+            # Rule 1: named in a help constant at all → that same constant must
+            # carry an INERT block naming it.
+            for c in ${HELP_CONSTS}; do
+                if match_stem "${stem}" "${mode}" "${WORK}/const.$c" &&
+                    ! match_stem "${stem}" "${mode}" "${WORK}/inert.$c"; then
+                    report "RULE 1  '${display}' is inert but ${c} names it outside an INERT block"
+                fi
+            done
             # Rule 3: must carry a docs banner.
             if ! match_stem "${stem}" "${mode}" "${WORK}/banners.txt"; then
                 report "RULE 3  '${display}' is inert but no ${DOC_LABEL} INERT banner names it"

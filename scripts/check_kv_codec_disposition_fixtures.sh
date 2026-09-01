@@ -2,7 +2,7 @@
 # scripts/check_kv_codec_disposition_fixtures.sh — recall test for
 # `check_kv_codec_disposition.sh`.
 #
-# That gate has six rules and two exit codes, and every one of them is one regex
+# That gate has seven rules and two exit codes, and every one of them is one regex
 # edit away from matching nothing and going permanently green. This repo has
 # shipped three gates that were each individually unable to fail, so a gate's
 # detection power is measured here rather than assumed.
@@ -16,7 +16,7 @@
 #   only the manifest's source differs from a production run.
 #
 # WHY THE EXPECTED MESSAGE IS CHECKED, NOT JUST THE EXIT CODE
-#   All six rules exit 1, so a corpus that asserts only the exit code cannot
+#   All seven rules exit 1, so a corpus that asserts only the exit code cannot
 #   tell "RULE 3 fired" from "RULE 3 is dead and the fixture happened to trip
 #   RULE 1" — which is how a gate gets redder for the wrong reason and still
 #   looks like it works. The two manifest cases assert
@@ -80,6 +80,18 @@ build_case() {
         rule6_kv_bits_inline_help)
             edit "$dir/main.rs" 's/long_help = KV_BITS_LONG_HELP/long_help = "Bit-width alias."/'
             ;;
+        rule6_kv_preset_inline_help)
+            edit "$dir/main.rs" 's/long_help = KV_PRESET_LONG_HELP/long_help = "Named preset."/'
+            ;;
+        rule1_inert_named_only_in_preset_help)
+            # The preset help's INERT block loses its only line; fixinert stays
+            # named in that same constant's Presets list. Nothing fires unless
+            # the --kv-preset constant is read as a surface of its own.
+            edit "$dir/main.rs" '/^      fixslow resolves to fixinert\.$/d'
+            ;;
+        rule7_ratio_written_into_the_help)
+            edit "$dir/main.rs" 's/^      fixlive\.";$/      fixlive, at 1.05x the baseline.";/'
+            ;;
         manifest_truncated)
             # One codec line lost; the END sentinel still claims four.
             edit "$dir/manifest.raw" '/	fixlive	/d'
@@ -105,6 +117,9 @@ CASES=(
     "rule5_banner_buried_in_the_section|1|RULE 5|a banner pushed 4 lines below its heading is caught"
     "rule6_kv_quant_inline_help|1|RULE 6|a --kv-quant argument with its own help text is caught"
     "rule6_kv_bits_inline_help|1|RULE 6|a --kv-bits argument with its own long help is caught"
+    "rule6_kv_preset_inline_help|1|RULE 6|a --kv-preset argument with its own long help is caught"
+    "rule1_inert_named_only_in_preset_help|1|RULE 1  'fixinert'|the --kv-preset help is read, not just the --kv-quant one"
+    "rule7_ratio_written_into_the_help|1|RULE 7|a resident-KV ratio typed into the help is caught"
 
     "manifest_truncated|2|manifest truncated|a short manifest is an environment error, not a violation"
     "manifest_unknown_class|2|unknown disposition class|a class the gate cannot read is an environment error"
