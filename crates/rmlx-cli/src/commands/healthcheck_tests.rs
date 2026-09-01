@@ -250,27 +250,51 @@ fn j6_detail_escaping() {
 
 // ── MLX pin ─────────────────────────────────────────────────────────────────
 
-/// The verdict is red only where the pin binds, and never for a host it does
-/// not: on pre-Neural-Accelerator hardware the pinned kernels buy nothing, so
-/// reporting a failure there would be noise on the majority of Macs.
-///
-/// The pin itself is gated by `linked_mlx_matches_the_pinned_pair`
-/// (`crates/rmlx-mlx/src/pin_tests.rs`); this covers only the mapping from a
-/// verdict to a check line.
+/// Every cell of the mapping, including the three this machine can never
+/// reach. Written as literal expectations rather than recomputed from the
+/// inputs: a second copy of the mapping would agree with the first no matter
+/// what either says.
 #[test]
-fn j6_mlx_pin_is_red_only_where_the_pin_binds() {
+fn j6_mlx_pin_status_covers_every_cell() {
+    use rmlx_mlx::PinEnforcement;
+
+    let binding = PinEnforcement::Binding;
+    let not_applicable = PinEnforcement::NotApplicable { gpu_family: 7 };
+    let unknown = PinEnforcement::UnknownHost;
+
+    // A match is green wherever it is found, including on a host that could
+    // not be identified — nothing is wrong there regardless of who is bound.
+    assert_eq!(mlx_pin_status(true, binding), Status::Green);
+    assert_eq!(mlx_pin_status(true, not_applicable), Status::Green);
+    assert_eq!(mlx_pin_status(true, unknown), Status::Green);
+
+    // The failure the pin exists for.
+    assert_eq!(mlx_pin_status(false, binding), Status::Red);
+
+    // Identified pre-Neural-Accelerator hardware: the pinned kernels do not
+    // exist for it, so a mismatch is reportable but not a failure.
+    assert_eq!(mlx_pin_status(false, not_applicable), Status::Info);
+
+    // Unidentified host with a mismatch: whether it matters is unknown, and an
+    // unknown must not render as the clean pass the previous cell gets.
+    assert_eq!(mlx_pin_status(false, unknown), Status::Red);
+}
+
+/// The check line carries the mapping's answer and a detail naming the host
+/// class, so an inapplicable gate cannot be read as a disarmed one.
+#[test]
+fn j6_mlx_pin_line_reports_the_host_class() {
     let line = check_mlx_pin();
     assert_eq!(line.check, "mlx_pin");
-    assert!(
-        !line.detail.is_empty(),
-        "the verdict must say what it found"
-    );
-
     let check = rmlx_mlx::pin_check();
-    let expected = match (check.matches, check.enforced) {
-        (true, _) => Status::Green,
-        (false, true) => Status::Red,
-        (false, false) => Status::Info,
-    };
-    assert_eq!(line.status, expected, "detail: {}", line.detail);
+    assert_eq!(
+        line.status,
+        mlx_pin_status(check.matches, check.enforcement)
+    );
+    assert!(
+        line.detail.contains("Neural Accelerator")
+            || line.detail.contains("could not be identified"),
+        "the detail must say whether the pin binds this host: {}",
+        line.detail
+    );
 }

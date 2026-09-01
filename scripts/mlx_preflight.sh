@@ -6,7 +6,9 @@
 #
 #   1. Portable checks (every Apple Silicon host): the `opt` symlinks resolve,
 #      Mach-O install names are relocated, and the built binary can launch.
-#      A broken stack here means `rmlx` does not run at all.
+#      A broken stack here means `rmlx` does not run at all. These read the
+#      package manager's view, which is a pre-filter and not the truth — see
+#      step 4.
 #
 #   2. NA-class hosts only (M5 and later): `mlx.metallib` must actually contain
 #      `steel_gemm_fused_nax` GEMM kernels, and the linked pair must be the one
@@ -28,21 +30,11 @@ set -uo pipefail
 
 PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
 
-# The pinned pair, read from its one declaration. A copy here would drift the
-# moment the pin moves, and the drift would be silent.
-PIN_FILE="$(cd "$(dirname "$0")/.." && pwd)/crates/rmlx-mlx/mlx-pin.txt"
-[ -f "$PIN_FILE" ] || {
-	echo "FAIL: no MLX pin at $PIN_FILE" >&2
-	exit 1
-}
-PIN_MLX=$(awk '$1 == "mlx" { print $2; n++ } END { exit n != 1 }' "$PIN_FILE") ||
-	PIN_MLX=""
-PIN_MLXC=$(awk '$1 == "mlx-c" { print $2; n++ } END { exit n != 1 }' "$PIN_FILE") ||
-	PIN_MLXC=""
-[ -n "$PIN_MLX" ] && [ -n "$PIN_MLXC" ] || {
-	echo "FAIL: $PIN_FILE must declare exactly one 'mlx <version>' and one 'mlx-c <version>' line" >&2
-	exit 1
-}
+# The pinned pair, read from its one declaration by the one parser. A copy
+# here would drift the moment the pin moves, and the drift would be silent.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO_ROOT/scripts/lib/mlx_pin.sh"
+mlx_pin_load "$REPO_ROOT/crates/rmlx-mlx/mlx-pin.txt" || exit 1
 
 fail() {
 	echo "PREFLIGHT FAIL: $*" >&2
@@ -101,7 +93,17 @@ if [ "$na_class" = "1" ]; then
 		hint_restore
 		exit 1
 	fi
-	nax=$(strings "$metallib" | grep -c steel_gemm_fused_nax)
+	# `grep -c` prints 0 whether the file has no kernels or `strings` could not
+	# read it at all, and the exit status that tells them apart is swallowed by
+	# the pipe. Take the reader's status first: "could not look" must not be
+	# reported as "ships none", which sends the operator to restore a bottle
+	# over a broken toolchain.
+	if ! symbols=$(strings "$metallib"); then
+		fail "cannot read $metallib (is \`strings\` present?) — the nax kernel check" \
+			"could not run, so this is not a finding about the bottle"
+		exit 1
+	fi
+	nax=$(printf '%s\n' "$symbols" | grep -c steel_gemm_fused_nax)
 	if [ "$nax" -lt 1 ]; then
 		fail "$brand has a Neural Accelerator but mlx $mlx_ver ships 0 nax GEMM kernels" \
 			"— GEMM-bound prefill would be ~2-3.8x slow (pinned: mlx $PIN_MLX + mlx-c $PIN_MLXC)"
@@ -120,7 +122,14 @@ if [ "$na_class" = "1" ]; then
 	fi
 fi
 
-# --- 4. portable: the binary actually launches ------------------------------
+# --- 4. the binary's own answer, which outranks everything above ------------
+# Steps 1-3 read the package manager's symlinks. That is a cheap pre-filter,
+# not the truth: `MLX_PREFIX` / `MLX_C_PREFIX` (crates/rmlx-mlx/build.rs) can
+# link a build against an install nothing above inspects. Only the binary can
+# say what dyld resolved for it, so when one exists it is the authority.
+#
+# `rmlx baseline` and `rmlx bench` refuse on their own if this is wrong; asking
+# here just moves the failure before the model load.
 bin="target/release-perf/rmlx"
 if [ -x "$bin" ]; then
 	if ! "$bin" --version >/dev/null 2>&1; then
@@ -128,6 +137,24 @@ if [ -x "$bin" ]; then
 		hint_restore
 		exit 1
 	fi
+	# Only the mlx_pin line: a red elsewhere in healthcheck (no registry, no
+	# metrics DB) is not this gate's business.
+	pin_line=$("$bin" healthcheck --human 2>/dev/null | grep '^mlx_pin:')
+	if [ -z "$pin_line" ]; then
+		fail "$bin reported no mlx_pin line — cannot confirm what the binary loaded"
+		exit 1
+	fi
+	case "$pin_line" in
+	*"GREEN"*) echo "binary agrees: $pin_line" ;;
+	*)
+		fail "the built binary did not load the pinned pair: $pin_line"
+		hint_restore
+		exit 1
+		;;
+	esac
+else
+	echo "note: no $bin yet — the symlink checks above are a pre-filter; the binary's" \
+		"own verdict is what gates the measurement (rmlx baseline / rmlx bench)."
 fi
 
 if [ "$na_class" = "1" ]; then

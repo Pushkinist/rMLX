@@ -120,10 +120,11 @@ Conventions:
 
 | Script | Via | What it does |
 |---|---|---|
-| `mlx_preflight.sh` | `make mlx-preflight` | Refuse to bench unless the linked MLX is the pinned, nax-capable pair (reads `crates/rmlx-mlx/mlx-pin.txt`). |
+| `mlx_preflight.sh` | `make mlx-preflight` | Refuse to bench unless the MLX the built binary loaded is the pinned, nax-capable pair. Pre-filters on the `opt` symlinks, then asks the binary; `rmlx baseline` / `rmlx bench` refuse on their own regardless. |
 | `mlx_restore_pin.sh` | `make mlx-restore-pin` | Restore the pair `crates/rmlx-mlx/mlx-pin.txt` names. |
 | `target_gc.sh` | `make target-gc` | Prune stale build profiles from `target/`. |
 | `lib/env.sh` | — | Load repo `.env`, validate `RMLX_O_MODELS_ROOT`. **Source it.** |
+| `lib/mlx_pin.sh` | — | Parse `crates/rmlx-mlx/mlx-pin.txt` (same grammar as `parse_pin`, version shape allowlisted). **Source it.** |
 | `lib/cpu_snapshot.sh` | — | Per-process cumulative CPU seconds, for interference gates. **Source it.** |
 | `lib/busiest_between.awk` | — | Which process burned the most CPU between two `cpu_snapshot` files. |
 

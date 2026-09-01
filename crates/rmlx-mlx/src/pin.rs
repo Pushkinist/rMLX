@@ -26,9 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::nax::{
-    loaded_library_path, loaded_metallib_path, metallib_has_nax_kernels, NAX_GEMM_KERNEL,
-};
+use crate::nax::{loaded_library_path, loaded_metallib_scan, KernelScan, NAX_GEMM_KERNEL};
 
 /// The validated pair, as checked in. Read at compile time from the same file
 /// the maintainer edits, so there is no second declaration to drift.
@@ -54,9 +52,14 @@ pub(crate) struct MlxPin {
 /// Parse the pinned pair out of `mlx-pin.txt`.
 ///
 /// Format: one `<formula> <version>` per line, `#` comments and blank lines
-/// ignored. Both formulas are mandatory and any other line is an error: the
-/// pair is the unit that was validated, so a half-declared or typo'd pin would
-/// quietly stop checking the very coupling it exists to enforce.
+/// ignored. Both formulas are mandatory, neither may repeat, and any other
+/// line is an error: the pair is the unit that was validated, so a
+/// half-declared, doubled or typo'd pin would quietly stop checking the very
+/// coupling it exists to enforce.
+///
+/// `scripts/lib/mlx_pin.sh` applies the same grammar for the bench preflight
+/// and the restore script, which run before any binary exists to ask. They are
+/// held together by `the_shell_pin_parser_agrees_with_the_rust_one`.
 pub(crate) fn parse_pin(src: &str) -> Option<MlxPin> {
     let mut mlx = None;
     let mut mlx_c = None;
@@ -66,16 +69,34 @@ pub(crate) fn parse_pin(src: &str) -> Option<MlxPin> {
             continue;
         }
         let mut fields = line.split_whitespace();
-        match (fields.next(), fields.next(), fields.next()) {
-            (Some("mlx"), Some(v), None) => mlx = Some(v.to_owned()),
-            (Some("mlx-c"), Some(v), None) => mlx_c = Some(v.to_owned()),
+        let slot = match (fields.next(), fields.next(), fields.next()) {
+            (Some("mlx"), Some(v), None) => (&mut mlx, v),
+            (Some("mlx-c"), Some(v), None) => (&mut mlx_c, v),
             _ => return None,
+        };
+        let (slot, version) = slot;
+        if slot.is_some() || !is_keg_version(version) {
+            return None;
         }
+        *slot = Some(version.to_owned());
     }
     Some(MlxPin {
         mlx: mlx?,
         mlx_c: mlx_c?,
     })
+}
+
+/// Whether a token is shaped like a Homebrew keg directory name.
+///
+/// An allowlist, not a sanity check. These values name directories under the
+/// Cellar that `scripts/mlx_restore_pin.sh` removes, copies over and repoints
+/// symlinks at, so a token such as `..` would reach far outside a keg. Keeping
+/// the rule here as well as in the shell means neither parser can be the one
+/// that accepts it.
+fn is_keg_version(token: &str) -> bool {
+    let mut chars = token.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
 }
 
 /// The Homebrew keg version an already-canonicalized prefix points at, e.g.
@@ -99,34 +120,27 @@ pub(crate) fn keg_version_from(real: &Path, formula: &str) -> Option<String> {
 /// found nothing".
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct LinkedPair {
-    /// Where dyld says `libmlx.dylib` came from, canonicalized.
-    pub(crate) mlx_path: Option<PathBuf>,
-    /// Where dyld says `libmlxc.dylib` came from, canonicalized.
-    pub(crate) mlx_c_path: Option<PathBuf>,
-    /// Keg version of the resolved `libmlx.dylib`, when it lives in a keg.
-    pub(crate) mlx_keg: Option<String>,
-    /// Keg version of the resolved `libmlxc.dylib`, when it lives in a keg.
-    pub(crate) mlx_c_keg: Option<String>,
+    /// What the resolved `libmlx.dylib` turned out to be.
+    pub(crate) mlx: Library,
+    /// What the resolved `libmlxc.dylib` turned out to be.
+    pub(crate) mlx_c: Library,
     /// What the metallib scan established.
     pub(crate) kernels: KernelScan,
 }
 
-/// The metallib scan, carrying the file that answered.
+/// One half of the pair, as dyld resolved it.
 ///
-/// The path lives in the variant rather than beside it so a verdict can never
-/// name a file the scan did not read — and so "no metallib, or it would not
-/// open" cannot be paired with a scan result at all.
+/// A state rather than a pair of `Option`s: "not loaded" has no path to name
+/// and "not a keg" has no version, and spelling those as variants is what
+/// stops a verdict from rendering an empty path where a real one was assumed.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum KernelScan {
-    /// Nothing to inspect, or it would not read. Establishes nothing.
-    Unverified { metallib: Option<PathBuf> },
-    /// The metallib answered.
-    Scanned {
-        /// Whether it carries [`NAX_GEMM_KERNEL`].
-        present: bool,
-        /// The file that answered.
-        metallib: PathBuf,
-    },
+pub(crate) enum Library {
+    /// dyld listed no image with this file name.
+    NotLoaded,
+    /// Resolved, but not inside a Homebrew keg, so it has no version.
+    NotAKeg { resolved: PathBuf },
+    /// Resolved inside a keg, whose directory name is the version.
+    Keg { version: String, resolved: PathBuf },
 }
 
 /// What the probe concluded about the loaded pair.
@@ -167,7 +181,7 @@ pub(crate) enum PinVerdict {
     /// compare. Distinct from a mismatch: nothing was established.
     NotAKeg {
         formula: &'static str,
-        resolved: Option<PathBuf>,
+        resolved: PathBuf,
     },
     /// The metallib could not be inspected, so the capability is unknown.
     KernelsUnverified { metallib: Option<PathBuf> },
@@ -185,53 +199,78 @@ impl LinkedPair {
     /// disagreement is reported ahead of the inconclusive states because it is
     /// the one that is actually known to be wrong.
     pub(crate) fn classify(&self, pin: &MlxPin) -> PinVerdict {
-        for (path, library) in [(&self.mlx_path, MLX_LIB), (&self.mlx_c_path, MLX_C_LIB)] {
-            if path.is_none() {
+        for (half, library) in [(&self.mlx, MLX_LIB), (&self.mlx_c, MLX_C_LIB)] {
+            if matches!(half, Library::NotLoaded) {
                 return PinVerdict::NotLoaded { library };
             }
         }
-        if let KernelScan::Scanned {
-            present: false,
-            metallib,
-        } = &self.kernels
-        {
-            return PinVerdict::KernelsMissing {
-                metallib: metallib.clone(),
-                mlx: self.mlx_keg.clone(),
-            };
-        }
-        for (keg, path, formula, pinned) in [
-            (&self.mlx_keg, &self.mlx_path, MLX_FORMULA, &pin.mlx),
-            (&self.mlx_c_keg, &self.mlx_c_path, MLX_C_FORMULA, &pin.mlx_c),
-        ] {
-            match keg {
-                Some(resolved) if resolved != pinned => {
-                    return PinVerdict::VersionMismatch {
-                        formula,
-                        resolved: resolved.clone(),
-                        pinned: pinned.clone(),
-                    };
-                }
-                Some(_) => {}
-                // `path` is `Some` here: a `None` would have returned
-                // `NotLoaded` above, before any version was looked at.
-                None => {
-                    return PinVerdict::NotAKeg {
-                        formula,
-                        resolved: path.clone(),
-                    };
-                }
+        let metallib = match &self.kernels {
+            KernelScan::Scanned {
+                present: false,
+                metallib,
+            } => {
+                return PinVerdict::KernelsMissing {
+                    metallib: metallib.clone(),
+                    mlx: self.mlx.version().map(ToOwned::to_owned),
+                };
             }
+            KernelScan::Scanned {
+                present: true,
+                metallib,
+            } => Some(metallib),
+            KernelScan::Unverified { .. } => None,
+        };
+        let mlx = match self.mlx.against(MLX_FORMULA, &pin.mlx) {
+            Ok(version) => version,
+            Err(verdict) => return verdict,
+        };
+        let mlx_c = match self.mlx_c.against(MLX_C_FORMULA, &pin.mlx_c) {
+            Ok(version) => version,
+            Err(verdict) => return verdict,
+        };
+        match metallib {
+            Some(metallib) => PinVerdict::Match {
+                // What dyld resolved, never the pinned strings. They agree only
+                // because `against` returned on disagreement, and a verdict has
+                // to report what it observed.
+                mlx: mlx.to_owned(),
+                mlx_c: mlx_c.to_owned(),
+                metallib: metallib.clone(),
+            },
+            None => PinVerdict::KernelsUnverified {
+                metallib: self.kernels.metallib().cloned(),
+            },
         }
-        match &self.kernels {
-            KernelScan::Scanned { metallib, .. } => PinVerdict::Match {
-                mlx: pin.mlx.clone(),
-                mlx_c: pin.mlx_c.clone(),
-                metallib: metallib.clone(),
-            },
-            KernelScan::Unverified { metallib } => PinVerdict::KernelsUnverified {
-                metallib: metallib.clone(),
-            },
+    }
+}
+
+impl Library {
+    /// The keg version, when this half resolved into a keg.
+    pub(crate) fn version(&self) -> Option<&str> {
+        match self {
+            Self::Keg { version, .. } => Some(version),
+            Self::NotLoaded | Self::NotAKeg { .. } => None,
+        }
+    }
+
+    /// The version this half resolved to, or the verdict that stops the check.
+    ///
+    /// Returning `&str` rather than `Option<&str>` is what lets the caller
+    /// build a `Match` without a fallback: every way of not having a comparable
+    /// version leaves through `Err`.
+    fn against(&self, formula: &'static str, pinned: &str) -> Result<&str, PinVerdict> {
+        match self {
+            Self::Keg { version, .. } if version == pinned => Ok(version),
+            Self::Keg { version, .. } => Err(PinVerdict::VersionMismatch {
+                formula,
+                resolved: version.clone(),
+                pinned: pinned.to_owned(),
+            }),
+            Self::NotAKeg { resolved } => Err(PinVerdict::NotAKeg {
+                formula,
+                resolved: resolved.clone(),
+            }),
+            Self::NotLoaded => Err(PinVerdict::NotLoaded { library: formula }),
         }
     }
 }
@@ -281,9 +320,7 @@ impl PinVerdict {
             Self::NotAKeg { formula, resolved } => format!(
                 "the loaded {formula} is {}, which is not a Homebrew keg, so its version \
                  cannot be read and the pin cannot be verified here",
-                resolved
-                    .as_ref()
-                    .map_or_else(|| "<unnamed>".to_owned(), |p| p.display().to_string())
+                resolved.display()
             ),
             Self::KernelsUnverified { metallib } => match metallib {
                 Some(path) => format!(
@@ -311,24 +348,87 @@ pub struct PinCheck {
     /// Whether the loaded MLX is the pair `mlx-pin.txt` declares, with a
     /// metallib that carries the kernels the pin exists to buy.
     pub matches: bool,
-    /// Whether this Mac has a GPU Neural Accelerator, which is the only
-    /// hardware the pinned kernels exist for and therefore the only hardware
-    /// the pin binds. Earlier Apple Silicon ships zero of them at every MLX
-    /// version, so requiring the pinned pair there would be noise.
-    pub enforced: bool,
+    /// Whether the pin binds this host, and whether that could be established.
+    pub enforcement: PinEnforcement,
     /// One line naming what was found, and what disagreed or could not be
-    /// established.
+    /// established — including the host class, which decides whether any of it
+    /// is a failure.
     pub detail: String,
+}
+
+/// Whether the pin binds this host.
+///
+/// Three states, not a bool. "This is an M1, the pinned kernels do not exist
+/// for it" and "the chip could not be identified, so nobody knows whether they
+/// would" are both *not binding*, but only the first is a clean pass — the
+/// second is the gate unable to tell what it is looking at, which is how the
+/// host scoping turns into a way to succeed without checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PinEnforcement {
+    /// Neural-Accelerator-class hardware: the pinned kernels exist for it, so
+    /// the pair is required.
+    Binding,
+    /// Identified as pre-Neural-Accelerator Apple Silicon, which ships zero of
+    /// these kernels at every MLX version. The pin buys nothing here.
+    NotApplicable {
+        /// The Apple GPU family, as `rmlx_core::apple_gpu` numbers them.
+        gpu_family: u8,
+    },
+    /// The chip could not be identified, so whether the pin binds is unknown.
+    UnknownHost,
+}
+
+impl PinEnforcement {
+    /// Whether a mismatch is a failure on this host.
+    #[must_use]
+    pub const fn is_binding(self) -> bool {
+        matches!(self, Self::Binding)
+    }
+
+    /// Whether the host class itself could be established.
+    #[must_use]
+    pub const fn host_is_known(self) -> bool {
+        !matches!(self, Self::UnknownHost)
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Self::Binding => "this Mac has a GPU Neural Accelerator, so the pinned pair is \
+                              required"
+                .to_owned(),
+            Self::NotApplicable { gpu_family } => format!(
+                "Apple GPU family {gpu_family} has no Neural Accelerator, so the pinned \
+                 kernels do not exist for it and the pin does not bind here"
+            ),
+            Self::UnknownHost => "the chip could not be identified, so whether the pin binds \
+                                  here is unknown"
+                .to_owned(),
+        }
+    }
 }
 
 /// Check the MLX this process loaded against the checked-in pin.
 #[must_use]
 pub fn pin_check() -> PinCheck {
     let found = verdict();
+    let enforcement = enforcement_for(rmlx_core::apple_gpu::apple_silicon_generation());
     PinCheck {
         matches: found.is_match(),
-        enforced: crate::nax::is_na_class(rmlx_core::apple_gpu::apple_silicon_generation()),
-        detail: found.report(),
+        enforcement,
+        // The host class is in the operator-facing line, not only in the
+        // status: without it an inapplicable gate and a gate that could not
+        // tell read identically.
+        detail: format!("{} ({})", found.report(), enforcement.describe()),
+    }
+}
+
+/// Map the probed Apple GPU family onto whether the pin binds.
+fn enforcement_for(gpu_family: Option<u8>) -> PinEnforcement {
+    match gpu_family {
+        None => PinEnforcement::UnknownHost,
+        Some(family) if crate::nax::is_na_class(Some(family)) => PinEnforcement::Binding,
+        Some(gpu_family) => PinEnforcement::NotApplicable { gpu_family },
     }
 }
 
@@ -340,40 +440,32 @@ fn verdict() -> PinVerdict {
     observe().classify(&pin)
 }
 
-/// Read the two loaded libraries and the metallib beside `libmlx.dylib`.
+/// Read both loaded libraries, and the metallib the shared probe scanned.
 fn observe() -> LinkedPair {
-    let resolve =
-        |file: &str| loaded_library_path(file).and_then(|path| std::fs::canonicalize(path).ok());
-    let mlx_path = resolve(MLX_LIB);
-    let mlx_c_path = resolve(MLX_C_LIB);
     LinkedPair {
-        mlx_keg: keg_prefix(mlx_path.as_deref())
-            .and_then(|prefix| keg_version_from(prefix, MLX_FORMULA)),
-        mlx_c_keg: keg_prefix(mlx_c_path.as_deref())
-            .and_then(|prefix| keg_version_from(prefix, MLX_C_FORMULA)),
-        kernels: scan_loaded_metallib(),
-        mlx_path,
-        mlx_c_path,
+        mlx: resolve_library(MLX_LIB, MLX_FORMULA),
+        mlx_c: resolve_library(MLX_C_LIB, MLX_C_FORMULA),
+        kernels: loaded_metallib_scan().clone(),
     }
 }
 
-/// Scan the `mlx.metallib` beside the loaded `libmlx.dylib`.
-fn scan_loaded_metallib() -> KernelScan {
-    let Some(metallib) = loaded_metallib_path() else {
-        return KernelScan::Unverified { metallib: None };
+/// Ask dyld for `file`, canonicalize it once, and read its keg version from
+/// that same canonical path.
+///
+/// Canonicalizing once matters: the path dyld reports runs through the package
+/// manager's `opt` symlink, which is the thing this module exists to distrust.
+/// Deriving the version from one read and anything else from another would
+/// straddle it.
+fn resolve_library(file: &str, formula: &str) -> Library {
+    let Some(reported) = loaded_library_path(file) else {
+        return Library::NotLoaded;
     };
-    match metallib_has_nax_kernels(&metallib) {
-        Ok(present) => KernelScan::Scanned { present, metallib },
-        Err(e) => {
-            tracing::debug!(
-                metallib = %metallib.display(),
-                error = %e,
-                "MLX pin probe could not read the metallib; capability unverified"
-            );
-            KernelScan::Unverified {
-                metallib: Some(metallib),
-            }
-        }
+    let Ok(resolved) = std::fs::canonicalize(&reported) else {
+        return Library::NotAKeg { resolved: reported };
+    };
+    match keg_prefix(&resolved).and_then(|prefix| keg_version_from(prefix, formula)) {
+        Some(version) => Library::Keg { version, resolved },
+        None => Library::NotAKeg { resolved },
     }
 }
 
@@ -381,8 +473,8 @@ fn scan_loaded_metallib() -> KernelScan {
 ///
 /// Two parents up from the dylib, which is the layout every Homebrew keg has.
 /// Anything shallower is not a keg and yields `None` rather than a guess.
-fn keg_prefix(dylib: Option<&Path>) -> Option<&Path> {
-    dylib?.parent()?.parent()
+fn keg_prefix(dylib: &Path) -> Option<&Path> {
+    dylib.parent()?.parent()
 }
 
 #[cfg(test)]

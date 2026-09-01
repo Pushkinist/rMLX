@@ -134,38 +134,27 @@ pub(crate) const fn is_na_class(gpu_family: Option<u8>) -> bool {
     matches!(gpu_family, Some(family) if family >= NA_CLASS_GPU_FAMILY)
 }
 
-/// Probe the host class, then — only if it matters — the metallib.
+/// Decide what, if anything, to say about a scan on a given host class.
 ///
 /// Both inputs are injected rather than read here so the full host-class x
 /// kernel-presence matrix is testable on one machine: this crate only ever
 /// runs on one Mac at a time, and the case that must never regress (a pre-M5
 /// host staying silent about a metallib with no nax kernels) is unreachable on
 /// the hardware that would run the tests.
-fn evaluate(gpu_family: Option<u8>, metallib: Option<&Path>) -> NaxFinding {
+///
+/// The host class gates the *report*, not the scan. The scan is shared and has
+/// already happened by the time this is called; suppressing it here would put
+/// the warning and run identity on two different observations.
+fn evaluate(gpu_family: Option<u8>, scan: &KernelScan) -> NaxFinding {
     if !is_na_class(gpu_family) {
-        // Returns before touching the filesystem, not merely before deciding
-        // to speak: on a host with no Neural Accelerator the answer cannot
-        // change any outcome, so the scan must not cost anything either. The
-        // variant is what proves it — a scan that had run would have produced
-        // `Scanned`.
         return NaxFinding::NotNaClass;
     }
-    let Some(path) = metallib else {
-        return NaxFinding::Unverified;
-    };
-    match metallib_has_nax_kernels(path) {
-        Ok(kernels_present) => NaxFinding::Scanned {
-            kernels_present,
-            metallib: path.to_path_buf(),
+    match scan {
+        KernelScan::Unverified { .. } => NaxFinding::Unverified,
+        KernelScan::Scanned { present, metallib } => NaxFinding::Scanned {
+            kernels_present: *present,
+            metallib: metallib.clone(),
         },
-        Err(e) => {
-            tracing::debug!(
-                metallib = %path.display(),
-                error = %e,
-                "MLX nax-kernel probe could not read the metallib; capability unverified"
-            );
-            NaxFinding::Unverified
-        }
     }
 }
 
@@ -178,12 +167,8 @@ fn evaluate(gpu_family: Option<u8>, metallib: Option<&Path>) -> NaxFinding {
 /// is the expected one but was built without the kernels.
 pub(crate) fn warn_if_nax_kernels_missing() {
     let gpu_family = rmlx_core::apple_gpu::apple_silicon_generation();
-    let metallib = metallib_to_scan(gpu_family);
-    // `evaluate` applies the host-class gate again. That is not redundant
-    // bookkeeping: it has to stay a total function of its inputs, which is what
-    // makes the host-class x kernel-presence matrix testable on a machine that
-    // is only ever one of those hosts.
-    let finding = evaluate(gpu_family, metallib.as_deref());
+    let scan = loaded_metallib_scan();
+    let finding = evaluate(gpu_family, scan);
 
     if let Some(path) = finding.warning_target() {
         tracing::warn!(
@@ -207,47 +192,91 @@ pub(crate) fn warn_if_nax_kernels_missing() {
         tracing::debug!(
             gpu_family = ?gpu_family,
             finding = ?finding,
-            metallib = ?metallib,
+            metallib = ?scan.metallib(),
             "MLX nax-kernel probe: nothing to report"
         );
     }
 }
 
-/// Whether the loaded `mlx.metallib` carries the nax GEMM kernels, scanned
-/// once per process — `"present"` / `"absent"` / `"unknown"`.
+/// The metallib scan, carrying the file that answered.
 ///
-/// Ungated by host class, unlike the warning above: "does this MLX ship the
-/// kernels" has a true answer on every Mac, and this is the answer recorded in
-/// run identity. The host class decides who is *told*, not what is true.
+/// The path lives in the variant rather than beside it so a reader can never
+/// name a file the scan did not read, and so "no metallib, or it would not
+/// open" cannot be paired with a scan result at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KernelScan {
+    /// Nothing to inspect, or it would not read. Establishes nothing.
+    Unverified { metallib: Option<PathBuf> },
+    /// The metallib answered.
+    Scanned {
+        /// Whether it carries [`NAX_GEMM_KERNEL`].
+        present: bool,
+        /// The file that answered.
+        metallib: PathBuf,
+    },
+}
+
+impl KernelScan {
+    /// The metallib this scan looked at, when there was one.
+    pub(crate) fn metallib(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Scanned { metallib, .. } => Some(metallib),
+            Self::Unverified { metallib } => metallib.as_ref(),
+        }
+    }
+}
+
+/// The one metallib observation this process makes.
+///
+/// Every reader — run identity, the startup warning, and the pin verdict —
+/// shares it. Three independent walks of dyld's image list would be three
+/// observations of a symlink this module exists to distrust, and could
+/// disagree with each other inside a single process; the file is also ~157 MB,
+/// which no process should read three times.
+///
+/// Ungated by host class: "does this MLX ship the kernels" has a true answer
+/// on every Mac. The host class decides who is *told*, not what is true.
+pub(crate) fn loaded_metallib_scan() -> &'static KernelScan {
+    static SCAN: std::sync::OnceLock<KernelScan> = std::sync::OnceLock::new();
+    SCAN.get_or_init(|| {
+        let Some(metallib) = loaded_metallib_path() else {
+            tracing::debug!(
+                "no mlx.metallib beside the loaded libmlx.dylib; nax capability unverified"
+            );
+            return KernelScan::Unverified { metallib: None };
+        };
+        match metallib_has_nax_kernels(&metallib) {
+            Ok(present) => KernelScan::Scanned { present, metallib },
+            Err(e) => {
+                // The only place this cause is ever stated. The tri-state it
+                // collapses into reaches `events.mlx_nax`, which is
+                // append-only, so a row that says "unknown" can never be
+                // annotated with why afterwards.
+                tracing::warn!(
+                    metallib = %metallib.display(),
+                    error = %e,
+                    "could not read the loaded mlx.metallib; nax capability will be \
+                     recorded as unknown for this run"
+                );
+                KernelScan::Unverified {
+                    metallib: Some(metallib),
+                }
+            }
+        }
+    })
+}
+
+/// Whether the loaded `mlx.metallib` carries the nax GEMM kernels —
+/// `"present"` / `"absent"` / `"unknown"`.
 ///
 /// `"unknown"` is reserved for a metallib that could not be inspected. A run
 /// that could not look must not record a capability it never observed.
 pub(crate) fn loaded_nax_capability() -> &'static str {
-    static SCAN: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    match SCAN.get_or_init(|| {
-        loaded_metallib_path()
-            .as_deref()
-            .and_then(|path| metallib_has_nax_kernels(path).ok())
-    }) {
-        Some(true) => "present",
-        Some(false) => "absent",
-        None => "unknown",
+    match loaded_metallib_scan() {
+        KernelScan::Scanned { present: true, .. } => "present",
+        KernelScan::Scanned { present: false, .. } => "absent",
+        KernelScan::Unverified { .. } => "unknown",
     }
-}
-
-/// The metallib worth scanning on this host, or `None` when there is none.
-///
-/// The host-class gate sits here, ahead of the dyld image walk, so a host with
-/// no Neural Accelerator skips the walk as well as the metallib open. Walking
-/// every loaded image is not "nothing runs", which is what the module claims
-/// pre-M5 hosts pay.
-///
-/// Named rather than folded into its one caller so that skip is observable:
-/// the caller does I/O and emits tracing, but this is a total function of the
-/// host class, and in a process that has MLX loaded a `None` here can only mean
-/// the walk did not happen.
-fn metallib_to_scan(gpu_family: Option<u8>) -> Option<PathBuf> {
-    is_na_class(gpu_family).then(loaded_metallib_path).flatten()
 }
 
 /// Path of the `mlx.metallib` belonging to the `libmlx.dylib` dyld loaded.

@@ -186,6 +186,14 @@ a pass:
 | `KernelsUnverified` | the metallib could not be read; the capability is unknown |
 | `PinUnparsable` | `mlx-pin.txt` declares no pair, so there is nothing to check against |
 
+The pin file's grammar is enforced in two places, because the preflight and the
+restore script run before any binary exists to ask: `parse_pin`
+(`crates/rmlx-mlx/src/pin.rs`) and `scripts/lib/mlx_pin.sh`, held together by
+`the_shell_pin_parser_agrees_with_the_rust_one`. Versions are allowlisted to
+the shape of a keg directory name — the restore script interpolates them into
+`rm -rf`, `cp -R` and `ln -sfn` targets under the Cellar, where a value like
+`..` would reach well outside a keg.
+
 **Scoped to Neural-Accelerator-class hosts**, derived from the chip rather than
 from a list of machines: earlier Apple Silicon ships zero of these kernels at
 every MLX version, so the pinned pair buys nothing there. That scoping is
@@ -194,8 +202,20 @@ cannot be identified, because a gate that cannot tell whether it applies can
 pass by accident, and on a host it does not bind the probe must still have
 worked.
 
-`rmlx healthcheck` reports the same verdict as an `mlx_pin` check line, red on
-the hosts the gate binds.
+**And it runs where the numbers are made.** `rmlx baseline` and `rmlx bench`
+call the same verdict before anything else and refuse outright when the pin
+binds and the loaded pair is wrong — a measurement taken across the pin
+boundary is not comparable to any recorded number, so producing it is worse
+than not running. `rmlx healthcheck` reports the same verdict as an `mlx_pin`
+check line.
+
+`scripts/mlx_preflight.sh` (`make canary`, `canary-ab`, `bench-codec-cell`)
+reads the package manager's `opt` symlinks as a cheap pre-filter and then asks
+the built binary for its own verdict. The symlinks are not the truth:
+`MLX_PREFIX` / `MLX_C_PREFIX` can link a build against an install the preflight
+never inspects, and `DYLD_LIBRARY_PATH` can redirect a launch without touching
+them at all. Only the process that will take the measurement can say what dyld
+resolved for it.
 
 #### Run identity: `events.mlx_nax`
 

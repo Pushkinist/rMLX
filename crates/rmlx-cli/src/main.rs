@@ -1570,6 +1570,39 @@ const fn gpu_capture_requested(_cmd: &Cmd) -> bool {
     false
 }
 
+/// Refuse to measure against an MLX that is not the validated pair.
+///
+/// The pin exists because a drifted MLX changes prefill throughput by ~3.8x
+/// while leaving output correct and decode flat — so the number a bench
+/// produces is wrong and nothing about the run looks wrong. Any prefill or
+/// TTFT figure measured across the pin boundary is not comparable to one from
+/// the other side, which makes recording it worse than not measuring.
+///
+/// Checked here, in the process that is about to take the measurement, because
+/// that is the only place the answer describes the library actually loaded.
+/// `scripts/mlx_preflight.sh` reads the package manager's symlinks, which are
+/// not necessarily what this binary was linked against: `MLX_PREFIX` and
+/// `MLX_C_PREFIX` (`crates/rmlx-mlx/build.rs`) can point a build at an install
+/// the preflight never inspects.
+fn refuse_to_measure_off_the_pin(command: &str) -> Result<()> {
+    let check = rmlx_mlx::pin_check();
+    if check.matches || !check.enforcement.is_binding() {
+        tracing::debug!(
+            detail = %check.detail,
+            enforcement = ?check.enforcement,
+            command,
+            "MLX pin check cleared the measurement path"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{command} refuses to measure: {}. Prefill and TTFT measured against an \
+         unvalidated MLX are not comparable to any recorded number. Restore the pair \
+         with `make mlx-restore-pin`, or see docs/FFI.md.",
+        check.detail
+    )
+}
+
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
@@ -1613,13 +1646,6 @@ fn main() -> Result<()> {
         cli.metrics_mode.mode()
     });
 
-    // Record the nax-GEMM-kernel capability of the MLX this process loaded,
-    // before the first `RunIdentity::get()` / `EventRecorder::record`.
-    // `rmlx-metrics` cannot read this itself (see `identity::set_mlx_nax`
-    // doc) — `rmlx-cli` is the one binary that links both `rmlx-mlx` and
-    // `rmlx-metrics`, so it is the only place that can supply it.
-    rmlx_metrics::identity::set_mlx_nax(rmlx_mlx::nax_capability());
-
     // Set RUST_BACKTRACE before init_tracing so the call happens while the
     // process is genuinely single-threaded — no background threads exist yet
     // (the tracing_appender non-blocking writer is spawned inside init_tracing
@@ -1638,6 +1664,17 @@ fn main() -> Result<()> {
         }
     }
     let _guard = init_tracing(&run_id, cli.log, cli.log_cap_mb)?;
+
+    // Record the nax-GEMM-kernel capability of the MLX this process loaded.
+    // `rmlx-metrics` cannot read this itself (see `identity::set_mlx_nax`
+    // doc) — `rmlx-cli` is the one binary that links both `rmlx-mlx` and
+    // `rmlx-metrics`, so it is the only place that can supply it.
+    //
+    // After `init_tracing` on purpose, and still well before the first
+    // `RunIdentity::get()` / `EventRecorder::record`: the probe warns when it
+    // cannot read the metallib, and that warning is the only record of *why* a
+    // run ends up stamped `unknown` in an append-only table.
+    rmlx_metrics::identity::set_mlx_nax(rmlx_mlx::nax_capability());
 
     // Reported after tracing is up, since the decision above predates it.
     if capture_forces_metrics_off {
@@ -2313,6 +2350,8 @@ fn main() -> Result<()> {
             #[cfg(feature = "metal-capture")]
             gpu_capture_steps,
         } => {
+            refuse_to_measure_off_the_pin("rmlx baseline")?;
+
             // Arm the GPU-capture window before anything expensive happens: a
             // request that cannot be honoured must cost seconds, not a full
             // weight load followed by a failure at the first decode step.
@@ -2482,6 +2521,8 @@ fn main() -> Result<()> {
             )?;
             // Same KV resolution ladder as `baseline`, so a cell benched here
             // and a cell recorded there name the same codec.
+            refuse_to_measure_off_the_pin("rmlx bench")?;
+
             let (dev, kv_quant_resolved, max_ctx_override) = if let Some(preset_arg) = kv_preset {
                 let max_ctx_override = parse_max_ctx(max_ctx)?;
                 let dev = parse_device(&device)?;

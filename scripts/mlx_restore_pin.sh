@@ -20,21 +20,11 @@ STORE="${RMLX_BOTTLE_STORE:-$HOME/.rmlx/bottles}"
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
-# The pinned pair, read from its one declaration. A copy here would drift the
-# moment the pin moves, and the drift would be silent.
-PIN_FILE="$(cd "$(dirname "$0")/.." && pwd)/crates/rmlx-mlx/mlx-pin.txt"
-[ -f "$PIN_FILE" ] || {
-	echo "FAIL: no MLX pin at $PIN_FILE" >&2
-	exit 1
-}
-PIN_MLX=$(awk '$1 == "mlx" { print $2; n++ } END { exit n != 1 }' "$PIN_FILE") ||
-	PIN_MLX=""
-PIN_MLXC=$(awk '$1 == "mlx-c" { print $2; n++ } END { exit n != 1 }' "$PIN_FILE") ||
-	PIN_MLXC=""
-[ -n "$PIN_MLX" ] && [ -n "$PIN_MLXC" ] || {
-	echo "FAIL: $PIN_FILE must declare exactly one 'mlx <version>' and one 'mlx-c <version>' line" >&2
-	exit 1
-}
+# The pinned pair, read from its one declaration by the one parser. A copy
+# here would drift the moment the pin moves, and the drift would be silent.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO_ROOT/scripts/lib/mlx_pin.sh"
+mlx_pin_load "$REPO_ROOT/crates/rmlx-mlx/mlx-pin.txt" || exit 1
 MLX_VER="$PIN_MLX"
 MLXC_VER="$PIN_MLXC"
 # sha256 from the homebrew-core *bottle-update* commits (cbfd9632d44 / b2763d78a34),
@@ -83,7 +73,11 @@ tar -xzf "$STAGE/mlx-c.tar.gz" -C "$STAGE" || die "extract mlx-c"
 [ -d "$STAGE/mlx/$MLX_VER" ] || die "bottle is not mlx $MLX_VER (got: $(ls "$STAGE/mlx"))"
 [ -d "$STAGE/mlx-c/$MLXC_VER" ] || die "bottle is not mlx-c $MLXC_VER (got: $(ls "$STAGE/mlx-c"))"
 
-staged_nax=$(strings "$STAGE/mlx/$MLX_VER/lib/mlx.metallib" | grep -c steel_gemm_fused_nax)
+# Reader status first: a `strings` that could not run also prints no matches,
+# and pouring a bottle on the strength of that would defeat the check.
+staged_symbols=$(strings "$STAGE/mlx/$MLX_VER/lib/mlx.metallib") ||
+	die "cannot read the staged mlx.metallib — the nax check could not run"
+staged_nax=$(printf '%s\n' "$staged_symbols" | grep -c steel_gemm_fused_nax)
 [ "$staged_nax" -ge 1 ] || die "staged mlx $MLX_VER has $staged_nax nax kernels — wrong bottle"
 echo "[ok] staged mlx has $staged_nax nax GEMM kernel occurrences"
 

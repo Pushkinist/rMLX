@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use rmlx_core::apple_gpu::apple_silicon_generation;
 
 use super::{
-    keg_version_from, parse_pin, pin_check, verdict, KernelScan, LinkedPair, MlxPin, PinVerdict,
-    PIN_SRC,
+    is_keg_version, keg_version_from, parse_pin, pin_check, verdict, Library, LinkedPair, MlxPin,
+    PinVerdict, PIN_SRC,
 };
+use crate::nax::KernelScan;
 use crate::nax::{loaded_library_path, NAX_GEMM_KERNEL};
 
 // ---------------------------------------------------------------------------
@@ -32,18 +33,22 @@ fn pin() -> MlxPin {
 /// about that one thing and not about the fixture.
 fn pinned_pair() -> LinkedPair {
     LinkedPair {
-        mlx_path: Some(PathBuf::from(
-            "/opt/homebrew/Cellar/mlx/0.31.2/lib/libmlx.dylib",
-        )),
-        mlx_c_path: Some(PathBuf::from(
-            "/opt/homebrew/Cellar/mlx-c/0.6.0_2/lib/libmlxc.dylib",
-        )),
-        mlx_keg: Some("0.31.2".to_owned()),
-        mlx_c_keg: Some("0.6.0_2".to_owned()),
+        mlx: keg("mlx", "0.31.2", "libmlx.dylib"),
+        mlx_c: keg("mlx-c", "0.6.0_2", "libmlxc.dylib"),
         kernels: KernelScan::Scanned {
             present: true,
             metallib: PathBuf::from("/opt/homebrew/Cellar/mlx/0.31.2/lib/mlx.metallib"),
         },
+    }
+}
+
+/// A half resolved into the keg Homebrew would have laid it out in.
+fn keg(formula: &str, version: &str, dylib: &str) -> Library {
+    Library::Keg {
+        version: version.to_owned(),
+        resolved: PathBuf::from(format!(
+            "/opt/homebrew/Cellar/{formula}/{version}/lib/{dylib}"
+        )),
     }
 }
 
@@ -89,6 +94,97 @@ fn an_unparsable_pin_says_so_rather_than_checking_nothing() {
     let report = PinVerdict::PinUnparsable.report();
     assert!(report.contains("mlx-pin.txt"), "{report}");
     assert!(!PinVerdict::PinUnparsable.is_match());
+}
+
+#[test]
+fn parse_pin_rejects_a_repeated_formula() {
+    // Two `mlx` lines leave "which one is the pin?" to line order. The pair is
+    // the validated unit; a doubled half is not one.
+    assert_eq!(parse_pin("mlx 0.31.2\nmlx 0.32.0\nmlx-c 0.6.0_2\n"), None);
+    assert_eq!(
+        parse_pin("mlx 0.31.2\nmlx-c 0.6.0_2\nmlx-c 0.6.0_3\n"),
+        None
+    );
+}
+
+#[test]
+fn parse_pin_rejects_versions_that_are_not_keg_names() {
+    // These strings name directories the restore script removes, copies over
+    // and repoints symlinks at. `..` is the one that matters: it reaches the
+    // whole Cellar. The rest close the same door from other directions.
+    for hostile in ["..", ".", "../mlx", "a/b", "-rf", "$(id)", "", "\u{7f}"] {
+        assert!(
+            !is_keg_version(hostile),
+            "{hostile:?} must not be accepted as a keg version"
+        );
+        let src = format!("mlx {hostile}\nmlx-c 0.6.0_2\n");
+        assert_eq!(parse_pin(&src), None, "pin file accepted {hostile:?}");
+    }
+    // ...while the shapes Homebrew actually produces stay accepted.
+    for real in ["0.31.2", "0.6.0_2", "1.2.3_1", "2026.1", "1.0.0-rc.1", "3"] {
+        assert!(is_keg_version(real), "{real:?} is a real keg name");
+    }
+}
+
+/// The shell parser and this one must call the same files usable.
+///
+/// The bench preflight and the restore script run before any binary exists to
+/// ask, so they carry their own parser. If it were the more permissive of the
+/// two, a pin the Rust gate refuses to check would still drive a restore.
+#[test]
+fn the_shell_pin_parser_agrees_with_the_rust_one() {
+    let dir = std::env::temp_dir().join(format!("rmlx-pin-parity-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/lib/mlx_pin.sh");
+
+    let corpus = [
+        "mlx 0.31.2\nmlx-c 0.6.0_2\n",
+        "# c\n\n  mlx    0.31.2  \n# c\nmlx-c  0.6.0_2\n",
+        "mlx 0.31.2\n",
+        "mlx-c 0.6.0_2\n",
+        "",
+        "mlx 0.31.2\nmlx-c 0.6.0_2\nmlx-rs 1.0\n",
+        "mlx\nmlx-c 0.6.0_2\n",
+        "mlx 0.31.2 extra\nmlx-c 0.6.0_2\n",
+        "mlx 0.31.2\nmlx 0.32.0\nmlx-c 0.6.0_2\n",
+        "mlx ..\nmlx-c 0.6.0_2\n",
+        "mlx 0.31.2\nmlx-c ../../etc\n",
+        "mlx -rf\nmlx-c 0.6.0_2\n",
+        "mlx 0.31.2\nmlx-c 0.6.0_2 # trailing\n",
+    ];
+    let mut accepted = 0_usize;
+    for (index, src) in corpus.iter().enumerate() {
+        let path = dir.join(format!("pin-{index}.txt"));
+        std::fs::write(&path, src).expect("write fixture");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                r#"source "{script}"; mlx_pin_load "{}" >/dev/null 2>&1"#,
+                path.display()
+            ))
+            .output()
+            .expect("bash must run");
+        let shell_accepts = out.status.success();
+        let rust = parse_pin(src);
+        assert_eq!(
+            shell_accepts,
+            rust.is_some(),
+            "parsers disagree on {src:?}: shell accepts={shell_accepts}, rust={rust:?}"
+        );
+        accepted += usize::from(shell_accepts);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+
+    // Controls: a corpus that is accepted everywhere, or rejected everywhere,
+    // would agree for the wrong reason.
+    assert!(
+        accepted > 0,
+        "no fixture was accepted; agreement is vacuous"
+    );
+    assert!(
+        accepted < corpus.len(),
+        "no fixture was rejected; agreement is vacuous"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -146,10 +242,7 @@ fn a_metallib_without_the_kernels_outranks_every_other_finding() {
     // The expensive, invisible failure. It is reported even when the version
     // also disagrees, because the version is the cheaper thing to notice.
     let observed = LinkedPair {
-        mlx_keg: Some("0.32.0".to_owned()),
-        mlx_path: Some(PathBuf::from(
-            "/opt/homebrew/Cellar/mlx/0.32.0/lib/libmlx.dylib",
-        )),
+        mlx: keg("mlx", "0.32.0", "libmlx.dylib"),
         kernels: KernelScan::Scanned {
             present: false,
             metallib: PathBuf::from("/opt/homebrew/Cellar/mlx/0.32.0/lib/mlx.metallib"),
@@ -172,7 +265,7 @@ fn a_metallib_without_the_kernels_outranks_every_other_finding() {
 fn either_half_of_the_pair_drifting_is_a_mismatch() {
     // The pair is the validated unit: mlx and mlx-c are ABI-coupled.
     let drifted_mlx = LinkedPair {
-        mlx_keg: Some("0.32.0".to_owned()),
+        mlx: keg("mlx", "0.32.0", "libmlx.dylib"),
         ..pinned_pair()
     };
     assert_eq!(
@@ -184,7 +277,7 @@ fn either_half_of_the_pair_drifting_is_a_mismatch() {
         }
     );
     let drifted_mlx_c = LinkedPair {
-        mlx_c_keg: Some("0.6.0_3".to_owned()),
+        mlx_c: keg("mlx-c", "0.6.0_3", "libmlxc.dylib"),
         ..pinned_pair()
     };
     assert_eq!(
@@ -203,14 +296,14 @@ fn a_library_dyld_never_listed_is_not_a_version_finding() {
     for (broken, library) in [
         (
             LinkedPair {
-                mlx_path: None,
+                mlx: Library::NotLoaded,
                 ..pinned_pair()
             },
             "libmlx.dylib",
         ),
         (
             LinkedPair {
-                mlx_c_path: None,
+                mlx_c: Library::NotLoaded,
                 ..pinned_pair()
             },
             "libmlxc.dylib",
@@ -227,27 +320,29 @@ fn a_non_keg_layout_is_unverifiable_rather_than_matching() {
     // A hand-built tree or a wheel has no version to compare. Passing it would
     // be a green that means "I could not check".
     let mlx_hand_built = LinkedPair {
-        mlx_keg: None,
-        mlx_path: Some(PathBuf::from("/usr/local/mlx/lib/libmlx.dylib")),
+        mlx: Library::NotAKeg {
+            resolved: PathBuf::from("/usr/local/mlx/lib/libmlx.dylib"),
+        },
         ..pinned_pair()
     };
     assert_eq!(
         mlx_hand_built.classify(&pin()),
         PinVerdict::NotAKeg {
             formula: "mlx",
-            resolved: Some(PathBuf::from("/usr/local/mlx/lib/libmlx.dylib")),
+            resolved: PathBuf::from("/usr/local/mlx/lib/libmlx.dylib"),
         }
     );
     let mlx_c_hand_built = LinkedPair {
-        mlx_c_keg: None,
-        mlx_c_path: Some(PathBuf::from("/usr/local/mlx-c/lib/libmlxc.dylib")),
+        mlx_c: Library::NotAKeg {
+            resolved: PathBuf::from("/usr/local/mlx-c/lib/libmlxc.dylib"),
+        },
         ..pinned_pair()
     };
     assert_eq!(
         mlx_c_hand_built.classify(&pin()),
         PinVerdict::NotAKeg {
             formula: "mlx-c",
-            resolved: Some(PathBuf::from("/usr/local/mlx-c/lib/libmlxc.dylib")),
+            resolved: PathBuf::from("/usr/local/mlx-c/lib/libmlxc.dylib"),
         }
     );
     assert!(!mlx_c_hand_built.classify(&pin()).is_match());
@@ -307,7 +402,7 @@ fn no_two_verdicts_read_the_same() {
         },
         PinVerdict::NotAKeg {
             formula: "mlx",
-            resolved: Some(PathBuf::from("/usr/local/mlx/lib/libmlx.dylib")),
+            resolved: PathBuf::from("/usr/local/mlx/lib/libmlx.dylib"),
         },
         PinVerdict::KernelsUnverified { metallib: None },
         PinVerdict::KernelsUnverified {
@@ -328,41 +423,76 @@ fn no_two_verdicts_read_the_same() {
     assert_eq!(all.iter().filter(|v| v.is_match()).count(), 1);
 }
 
-/// The pin file is the only place the pair is written down.
+/// No script writes the pinned versions down itself.
 ///
 /// The bench preflight and the restore script both act on these versions, and
 /// each used to carry its own copy — so a pin bump silently left them
-/// restoring and validating the previous pair. Both now read the pin.
+/// restoring and validating the previous pair.
 ///
-/// Fail-closed by construction: the scripts are pulled in with `include_str!`,
-/// so a renamed or deleted one is a compile error rather than a scan that
-/// quietly matches nothing.
+/// Scoped to `scripts/`, and the set is read from the directory rather than
+/// listed here, so a *new* script hardcoding the pair is caught too. Prose in
+/// `docs/` legitimately names concrete versions when explaining which bottle
+/// regressed; that is documentation, not a second declaration something acts
+/// on.
 #[test]
-fn no_other_file_writes_the_pinned_versions_down() {
-    const PREFLIGHT: &str = include_str!("../../../scripts/mlx_preflight.sh");
-    const RESTORE: &str = include_str!("../../../scripts/mlx_restore_pin.sh");
-
+fn no_script_writes_the_pinned_versions_down() {
+    let scripts_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts"));
     let Some(pinned) = parse_pin(PIN_SRC) else {
         panic!("the checked-in mlx-pin.txt must parse for this gate to have needles");
     };
-    for needle in [pinned.mlx.as_str(), pinned.mlx_c.as_str()] {
+    let needles = [pinned.mlx.as_str(), pinned.mlx_c.as_str()];
+    for needle in needles {
         // Positive control: a needle the pin file itself does not contain would
         // make every assertion below pass for the wrong reason.
         assert!(
             PIN_SRC.contains(needle),
             "{needle:?} is not in the pin file, so searching for it proves nothing"
         );
-        for (name, body) in [
-            ("scripts/mlx_preflight.sh", PREFLIGHT),
-            ("scripts/mlx_restore_pin.sh", RESTORE),
-        ] {
-            assert!(
-                !body.contains(needle),
-                "{name} writes {needle:?} down itself; read it from mlx-pin.txt instead, \
-                 or a pin bump leaves this file on the old pair"
-            );
+    }
+
+    let mut scanned = 0_usize;
+    let mut offenders: Vec<String> = Vec::new();
+    for entry in walk_shell_scripts(scripts_dir) {
+        let Ok(body) = std::fs::read_to_string(&entry) else {
+            panic!("could not read {}", entry.display());
+        };
+        scanned += 1;
+        for needle in needles {
+            if body.contains(needle) {
+                offenders.push(format!("{} writes {needle:?}", entry.display()));
+            }
         }
     }
+
+    // An empty walk — a moved directory, a changed extension — would report
+    // success having looked at nothing.
+    assert!(
+        scanned >= 2,
+        "walked {scanned} scripts under {}; the scan found nothing to check",
+        scripts_dir.display()
+    );
+    assert!(
+        offenders.is_empty(),
+        "read the pair from crates/rmlx-mlx/mlx-pin.txt instead, or a pin bump leaves \
+         these on the old pair: {offenders:?}"
+    );
+}
+
+/// Every `.sh` under `dir`, recursively. Panics rather than skipping on an
+/// unreadable directory: a walk that cannot look must not report zero hits.
+fn walk_shell_scripts(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot walk {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("readable dir entry").path();
+        if path.is_dir() {
+            found.extend(walk_shell_scripts(&path));
+        } else if path.extension().is_some_and(|ext| ext == "sh") {
+            found.push(path);
+        }
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +529,51 @@ fn the_gate_can_tell_which_host_it_is_on() {
         apple_silicon_generation().is_some(),
         "the chip could not be identified, so the pin gate cannot tell whether it applies"
     );
+    assert!(
+        pin_check().enforcement.host_is_known(),
+        "the verdict must carry the same answer the probe gave"
+    );
+}
+
+/// Every enforcement state is reachable from a host class, and the three are
+/// distinct. Asserted over injected families, so the two cells this machine
+/// cannot be are covered too.
+#[test]
+fn host_class_maps_onto_whether_the_pin_binds() {
+    use super::{enforcement_for, PinEnforcement};
+
+    assert_eq!(enforcement_for(Some(10)), PinEnforcement::Binding);
+    assert_eq!(enforcement_for(Some(11)), PinEnforcement::Binding);
+    assert_eq!(
+        enforcement_for(Some(9)),
+        PinEnforcement::NotApplicable { gpu_family: 9 }
+    );
+    assert_eq!(
+        enforcement_for(Some(7)),
+        PinEnforcement::NotApplicable { gpu_family: 7 }
+    );
+    assert_eq!(enforcement_for(None), PinEnforcement::UnknownHost);
+
+    // "Does not bind" and "cannot tell" must not be the same answer, and only
+    // one of them is a host the gate may quietly pass.
+    assert!(!enforcement_for(Some(7)).is_binding());
+    assert!(!enforcement_for(None).is_binding());
+    assert!(enforcement_for(Some(7)).host_is_known());
+    assert!(!enforcement_for(None).host_is_known());
+
+    // Each state says something different out loud.
+    let described: Vec<String> = [Some(10), Some(7), None]
+        .into_iter()
+        .map(|family| enforcement_for(family).describe())
+        .collect();
+    assert_eq!(
+        described
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3,
+        "an operator must be able to tell the three apart: {described:?}"
+    );
 }
 
 /// The MLX this process loaded is the pair `mlx-pin.txt` declares, and its
@@ -415,7 +590,7 @@ fn the_gate_can_tell_which_host_it_is_on() {
 #[test]
 fn linked_mlx_matches_the_pinned_pair() {
     let found = pin_check();
-    if found.enforced {
+    if found.enforcement.is_binding() {
         assert!(
             found.matches,
             "this Mac has a GPU Neural Accelerator and is not running the validated MLX pair: {}",

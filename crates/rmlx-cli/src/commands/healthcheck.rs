@@ -594,28 +594,45 @@ fn check_disk(dir: &Path, min_gb: u64, label: &str) -> CheckLine {
     }
 }
 
-/// Check 7: process RSS + phys_footprint via `rmlx_core::mach_mem` (info-only).
 /// Is the MLX dyld resolved for this process the validated pair?
 ///
 /// Reads the loaded library, not a config file or a build-time constant: the
 /// `opt` symlink both dylibs' install names point at can move after the build,
 /// and nothing in the build system can see it move backwards.
-///
-/// Red only where the pin binds — a Mac with a GPU Neural Accelerator. Earlier
-/// Apple Silicon ships none of the pinned kernels at any MLX version, so the
-/// finding is reported there but is not a failure.
 fn check_mlx_pin() -> CheckLine {
     let check = rmlx_mlx::pin_check();
-    let status = if check.matches {
-        Status::Green
-    } else if check.enforced {
+    CheckLine::new(
+        "mlx_pin",
+        mlx_pin_status(check.matches, check.enforcement),
+        check.detail,
+    )
+}
+
+/// Map a pin verdict onto a check status.
+///
+/// Pure, and separate from the probe, because on any one machine the probe
+/// only ever produces the cell that machine is in — asserting the mapping
+/// against a second copy of itself over that one cell is an assertion that
+/// cannot fail.
+///
+/// A mismatch is red only where the pinned kernels exist to be missed. On
+/// hardware without a Neural Accelerator they do not, so the finding is worth
+/// printing but is not a failure. On a host that could not be identified the
+/// answer is unknown either way, and an unknown that renders as a clean pass
+/// is how the host scoping becomes a way to succeed without checking — so it
+/// is red as well.
+const fn mlx_pin_status(matches: bool, enforcement: rmlx_mlx::PinEnforcement) -> Status {
+    if matches {
+        return Status::Green;
+    }
+    if enforcement.is_binding() || !enforcement.host_is_known() {
         Status::Red
     } else {
         Status::Info
-    };
-    CheckLine::new("mlx_pin", status, check.detail)
+    }
 }
 
+/// Check 7: process RSS + phys_footprint via `rmlx_core::mach_mem` (info-only).
 fn check_mem() -> CheckLine {
     #[cfg(target_os = "macos")]
     {
