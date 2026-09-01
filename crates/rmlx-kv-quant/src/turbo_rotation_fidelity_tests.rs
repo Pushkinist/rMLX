@@ -96,23 +96,56 @@
 //!
 //! # Result, against the buckets above
 //!
-//! **The gate detects a missing rotation.** With the transform present it
-//! reads `+2.077` / `+2.004` / `+1.574` / `+0.961` bits at 1 / 2 / 3 / 4 bits
-//! on the outlier fixture; with it removed, exactly `0.000` at every width.
-//! Called at the wrong width — a block-4 truncation of the same Hadamard — it
-//! reads `+0.995` / `+1.062` / `+1.074` / `+0.686`, below the full-dimension
-//! figure at every width, so the gate separates a degraded rotation from a
-//! correct one and not merely a present one from an absent one.
+//! **FAIL of the magnitude criterion.** The buckets are an `iff` over four
+//! conditions at every supported width, and two of them are not met, so the
+//! PASS bucket does not apply and is not claimed. Condition by condition:
 //!
-//! **The magnitude criterion is met at three of the four widths.** turbo4's
-//! `+0.961` misses the inherited `1.5`-bit threshold. The threshold is not
-//! lowered; the shortfall is recorded, and the mechanism —
-//! [`the_rotation_is_worth_less_the_wider_the_codebook`] — is asserted rather
-//! than narrated. The block-`b` ceiling that makes 1.5 a *theorem* for `rot_k`
-//! is confirmed not to transfer: at turbo4 the block-4 truncation reaches
-//! `+0.686` of a `+0.961` full-dimension gain, so no threshold in that
-//! neighbourhood separates them and the gate rests on the parameter-free
-//! ordering instead.
+//! | declared condition | outcome |
+//! |---|---|
+//! | `G(H_full) >= 1.5` on outlier | **not met** at 4 bits: `+0.961` |
+//! | `G(H_full) < 0` on the i.i.d. fixture | **not met** on i.i.d. Gaussian: `+0.020` / `+0.015` / `+0.015` / `+0.003` |
+//! | `G(identity) == 0` | met, exactly, at every width |
+//! | `G(H_block4) < 1.5` | met: `+0.995` / `+1.062` / `+1.074` / `+0.686` |
+//!
+//! `0 < G(H_full) < 1.5` at 4 bits is the FAIL bucket verbatim. The threshold
+//! was not lowered and the bucket list above is unedited; what is recorded here
+//! is the bucket the measurement lands in.
+//!
+//! The i.i.d. condition was declared over one fixture and run on two, and it
+//! **splits** — so the discrimination paragraph above, which says the transform
+//! must "lose on the i.i.d. one", is right about uniform and wrong about
+//! Gaussian. On i.i.d. **uniform** the Hadamard is the declared net loss:
+//! uniform is sub-Gaussian, and mixing the row raises the peak-to-RMS ratio the
+//! group scale is set by. On i.i.d. **Gaussian** it is not: an isotropic
+//! Gaussian is rotation-invariant, so the transform cannot change the source it
+//! is quantizing, and the only residual is that mixing equalises variance
+//! across the four groups of 32, which a per-group max scale rewards very
+//! slightly. `< 0` was the wrong sign to demand there, and demanding it was a
+//! mistake in the pre-declaration rather than a defect in the codec. The
+//! condition is enforced unchanged where it was right (uniform, absolutely) and
+//! replaced by an explicit negligibility bound where it was wrong (Gaussian,
+//! [`IID_NEGLIGIBLE_GAIN_BITS`]) — a substitution made after measuring and
+//! labelled as such, not folded back into the criterion.
+//!
+//! **PASS of the ordering, which is what the gate itself asserts.** With the
+//! transform present the gate reads `+2.077` / `+2.004` / `+1.574` / `+0.961`
+//! bits at 1 / 2 / 3 / 4 bits on the outlier fixture; called at the wrong width
+//! — a block-4 truncation of the same Hadamard — `+0.995` / `+1.062` / `+1.074`
+//! / `+0.686`, below the full-dimension figure at every width; with no
+//! transform at all, `0.000`. So the gate separates a degraded rotation from a
+//! correct one and not merely a present one from an absent one. The evidence
+//! that it rejects an absent rotation is the `block4 > none` term inside the
+//! gate, **not** [`the_gain_of_an_absent_transform_is_exactly_zero`], which
+//! establishes determinism rather than power.
+//!
+//! The block-`b` ceiling that makes 1.5 a *theorem* for `rot_k` is confirmed
+//! not to transfer: at turbo4 the block-4 truncation reaches `+0.686` of a
+//! `+0.961` full-dimension gain, so no threshold in that neighbourhood
+//! separates them and the gate rests on the parameter-free ordering instead.
+//! The inherited threshold is met at **three of the four** widths, and that
+//! count — not just its two endpoints — is asserted against
+//! [`WIDTHS_MEETING_THE_INHERITED_THRESHOLD`]. turbo3 carries it by `+0.074`
+//! bits, the narrowest margin in the module.
 //!
 //! **What the missing rotation is worth**, on this fixture and this metric:
 //!
@@ -135,7 +168,7 @@
 //! measurement, for any real checkpoint. Producing the latter needs a forward
 //! pass, which is a serving cell and not reachable from a CPU unit test.
 
-use crate::isoquant::{iso_decode_fast, iso_encode_fast};
+use crate::isoquant::{iso_decode_fast, iso_encode_fast, IsoQuantError};
 use crate::rotation_fidelity_tests::ROT_K_MIN_OUTLIER_GAIN_BITS;
 use crate::test_utils::{
     cosine_similarity_per_row, fwht_normalize, gaussian_data, incoherence_per_row, lcg_data,
@@ -210,6 +243,22 @@ fn hadamard_block4(buf: &mut [f32]) {
 /// No transform: the mutation that models the codec as it ships today.
 fn identity_rotation(_buf: &mut [f32]) {}
 
+/// Absolute bound below which a gain on unconcentrated data counts as nothing.
+///
+/// **This is not a pre-declared condition.** The criterion demanded
+/// `G(H_full) < 0` on the i.i.d. fixture, which holds on i.i.d. uniform and is
+/// falsified on i.i.d. Gaussian, where an isotropic source is rotation-invariant
+/// and the residual is a small positive rather than a loss. The demand was the
+/// wrong sign, so it is replaced here — after measuring, and labelled as
+/// replaced — by the claim the K-versus-V argument actually needs: that the
+/// transform is worth *nothing* on V-shaped data.
+///
+/// One tenth of a bit is 0.60 dB. No KV codec decision in this tree is taken at
+/// that resolution, and the metric's own quantum is a whole bit. The value is a
+/// constant rather than a figure computed from the outlier fixture so that this
+/// arm cannot be moved by the axis it is evidence about.
+const IID_NEGLIGIBLE_GAIN_BITS: f64 = 0.1;
+
 // ── Coverage, derived from the codec ────────────────────────────────────────
 
 /// Every width [`lloyd_gaussian_codebook`] accepts, discovered by probing it.
@@ -217,10 +266,21 @@ fn identity_rotation(_buf: &mut [f32]) {}
 /// Derived rather than listed so that adding or removing a codebook moves this
 /// module's coverage with it. `8` is deliberately rejected by the codec (K8 is
 /// affine `q8_0`, not turbo) and so is absent here without being named.
+///
+/// The non-empty check lives here rather than in each caller: every gate in
+/// this module iterates this set, and a gate that iterates zero times asserts
+/// nothing while reporting green. "Could not look" must not be representable as
+/// "looked and found nothing".
 fn supported_turbo_widths() -> Vec<u8> {
-    (u8::MIN..=u8::MAX)
+    let widths: Vec<u8> = (u8::MIN..=u8::MAX)
         .filter(|&bits| lloyd_gaussian_codebook(bits).is_ok())
-        .collect()
+        .collect();
+    assert!(
+        !widths.is_empty(),
+        "the turbo codec accepts no bit width at all, so every gate in this module would \
+         iterate zero times and pass having measured nothing"
+    );
+    widths
 }
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -327,13 +387,16 @@ fn the_full_dimension_hadamard_buys_turbo_bits_that_a_block_local_one_cannot() {
         assert!(
             full > block4,
             "turbo{bits}: the full-head_dim Hadamard bought {full:+.3} bits, no more than the \
-             block-4 truncation of the same transform at {block4:+.3}. The gate cannot tell a \
-             full-dimension rotation from a block-local one"
+             block-4 truncation of the same transform at {block4:+.3}. Either the gate cannot \
+             tell a full-dimension rotation from a block-local one, or the codec now applies a \
+             rotation of its own — in which case the test-side transform composes with it and \
+             this harness has to be retired, not repaired"
         );
         assert!(
             block4 > none,
             "turbo{bits}: a block-4 Hadamard bought {block4:+.3} bits against {none:+.3} for no \
-             transform at all. The measurement is not seeing the transform"
+             transform at all. Either the measurement is not seeing the transform, or the codec \
+             now applies one and the harness must be retired"
         );
     }
 }
@@ -354,17 +417,18 @@ fn the_full_dimension_hadamard_buys_turbo_bits_that_a_block_local_one_cannot() {
 ///   load-bearing asymmetry for any decision to wire one in: turbo's K
 ///   spellings are the ones a rotation would pay for.
 ///
-/// The Gaussian bound is stated against the gate's own smallest outlier-fixture
-/// gain rather than a constant, so it cannot be tuned: measured `+0.003` to
-/// `+0.020` bits against an outlier-fixture minimum of `+0.961`.
+/// The two arms are enforced differently, and the difference is not a
+/// convenience. Uniform carries the declared `< 0` condition unchanged, as an
+/// absolute sign test. Gaussian does not: the declared sign is **falsified**
+/// there, for the reason in the module's Result section, so it carries
+/// [`IID_NEGLIGIBLE_GAIN_BITS`] instead — also absolute, so it stays
+/// independent of the outlier axis it is evidence about. Measured `+0.003` to
+/// `+0.020` bits against a `0.100`-bit bound.
 #[test]
 fn the_same_hadamard_does_not_pay_on_either_iid_fixture() {
     let outlier = outlier_fixture();
     let uniform = iid_uniform_fixture();
     let gaussian = iid_gaussian_fixture();
-
-    let mut worst_outlier = f64::INFINITY;
-    let mut best_gaussian = f64::NEG_INFINITY;
 
     for bits in supported_turbo_widths() {
         let on_outlier = turbo_rotation_gain_bits(&outlier, bits, hadamard_full, hadamard_full);
@@ -383,28 +447,32 @@ fn the_same_hadamard_does_not_pay_on_either_iid_fixture() {
              measure rotation quality needs re-checking if it does not"
         );
 
-        worst_outlier = worst_outlier.min(on_outlier);
-        best_gaussian = best_gaussian.max(on_gaussian);
+        assert!(
+            on_gaussian.abs() < IID_NEGLIGIBLE_GAIN_BITS,
+            "turbo{bits}: the Hadamard moved i.i.d. Gaussian data by {on_gaussian:+.3} bits, past \
+             the {IID_NEGLIGIBLE_GAIN_BITS:.3}-bit bound below which the V-side conclusion treats \
+             it as nothing. Either the transform now pays on unconcentrated data or it now costs \
+             there; both make the K-versus-V asymmetry in this module's docs a different claim"
+        );
     }
-
-    assert!(
-        best_gaussian < worst_outlier,
-        "the Hadamard's best i.i.d. Gaussian gain {best_gaussian:+.3} bits reached its worst \
-         outlier-fixture gain {worst_outlier:+.3}. The measurement is responding to the codec, \
-         not to the concentration the fixture puts in front of it"
-    );
 }
 
-/// The mutation the codec ships today: no transform buys exactly nothing, on
-/// every fixture and at every width.
+/// With no transform the two arms are the same pure function on a bit-identical
+/// input, so the gain is exactly zero.
 ///
-/// Exact by construction — [`turbo_rotation_gain_bits`] subtracts a
-/// deterministic value from itself — so this pins the comparison the gate rests
-/// on rather than estimating it. The guards that mutate a real transform are
-/// the block-4 term inside the gate itself and
-/// [`the_rotation_gain_survives_every_outlier_density`].
+/// **This establishes determinism, not gate power, and it is not evidence for
+/// any verdict.** The zero is an IEEE identity — [`turbo_rotation_gain_bits`]
+/// subtracts a value from itself — so the test would stay green under a
+/// mutation it ought to catch: wire a real `fwht_normalize` into
+/// `turbo_quantize_v_with_codebook` and both arms shift by the same amount, the
+/// gain stays `0.000`, and this passes. It is kept because a non-zero result
+/// here would mean the codec is not deterministic, which would invalidate every
+/// figure in the module.
+///
+/// The guard that rejects an absent rotation is the `block4 > none` term inside
+/// [`the_full_dimension_hadamard_buys_turbo_bits_that_a_block_local_one_cannot`].
 #[test]
-fn removing_the_rotation_buys_turbo_exactly_nothing() {
+fn the_gain_of_an_absent_transform_is_exactly_zero() {
     for (name, data) in [
         ("outlier", outlier_fixture()),
         ("i.i.d. uniform", iid_uniform_fixture()),
@@ -414,8 +482,9 @@ fn removing_the_rotation_buys_turbo_exactly_nothing() {
             let gain = turbo_rotation_gain_bits(&data, bits, identity_rotation, identity_rotation);
             assert!(
                 gain == 0.0,
-                "{name} turbo{bits}: an absent transform reported {gain:+.6} bits of rotation \
-                 gain — the gate cannot fail"
+                "{name} turbo{bits}: two identical calls to the same codec differed by \
+                 {gain:+.6} bits. The codec is not deterministic and every measurement in this \
+                 module is unreliable"
             );
         }
     }
@@ -438,10 +507,17 @@ fn removing_the_rotation_buys_turbo_exactly_nothing() {
 ///   no longer models sparse outlier channels at all. The gate is therefore
 ///   stated on the canonical fixture, and this test pins where the ordering
 ///   stops holding so the scope cannot go stale unnoticed.
+///
+/// The boundary is decided by a narrow margin at 4 bits (`+0.508` against
+/// `+0.498`, i.e. `0.010` bits), which is why every margin is printed. The
+/// likeliest cause of a move is not the fixture: the 4-bit Lloyd-Max table is
+/// known to be under-converged, and re-deriving it shifts these figures.
 #[test]
 fn the_rotation_gain_survives_every_outlier_density() {
+    const LAST_DENSITY_HOLDING_THE_ORDERING: usize = 32;
     let n_groups = HEAD_DIM / GROUP_SIZE;
     let mut ordering_holds_up_to = 0usize;
+    let mut ordering_still_holding = true;
 
     for channels in [1usize, 2, 4, 8, 16, 32, 64] {
         let data = outlier_channel_data(OUTLIER_ROWS, HEAD_DIM, channels, OUTLIER_RATIO, TEST_SEED);
@@ -457,26 +533,34 @@ fn the_rotation_gain_survives_every_outlier_density() {
             let block4 = turbo_rotation_gain_bits(&data, bits, hadamard_block4, hadamard_block4);
             println!(
                 "channels={channels:<3} groups_hit={groups_hit}/{n_groups} turbo{bits}: \
-                 H_full {full:+.3} bits | H_block4 {block4:+.3} bits"
+                 H_full {full:+.3} bits | H_block4 {block4:+.3} bits | margin {:+.3}",
+                full - block4
             );
             assert!(
                 full > 0.0,
                 "channels={channels} turbo{bits}: the Hadamard bought {full:+.3} bits. The \
                  rotation's worth to turbo is not supposed to depend on the fixture's density \
-                 for its sign"
+                 for its sign — unless the codec now applies a rotation of its own, in which \
+                 case the two compose and this harness has to be retired rather than fixed"
             );
             ordering &= full > block4;
         }
-        if ordering {
+        // Once the ordering has failed at one density it has failed, whatever a
+        // later density does. Recording the last success unconditionally would
+        // let an intermediate regression be overwritten by a later pass.
+        ordering_still_holding &= ordering;
+        if ordering_still_holding {
             ordering_holds_up_to = channels;
         }
     }
 
     assert_eq!(
-        ordering_holds_up_to, 32,
-        "the density at which a full-dimension Hadamard stops beating its own block-4 \
-         truncation moved. The gate is scoped to the canonical fixture on the strength of \
-         where that boundary sits, and the scope note is now wrong"
+        ordering_holds_up_to, LAST_DENSITY_HOLDING_THE_ORDERING,
+        "a full-dimension Hadamard stops beating its own block-4 truncation at a different \
+         density than the recorded one. The margin at the boundary is 0.010 bits at 4 bits, so \
+         a change to the Lloyd-Max codebook constants moves this before the fixture does — \
+         check those first. The gate is scoped to the canonical fixture on the strength of \
+         where this boundary sits, and that scope note is now wrong"
     );
 }
 
@@ -496,12 +580,24 @@ fn the_rotation_gain_survives_every_outlier_density() {
 /// against `iso3`'s `0.0032` — the rotation closes **87%** of the distance.
 /// The claim under test is that the rotation is the dominant term, so the
 /// assertion is "more than half", not the measured figure.
+///
+/// Printed to four significant figures because that is what survives: the
+/// cosine mean is `f32`, and subtracting it from 1.0 near 0.997 cancels away
+/// about four digits. The share is unaffected — both terms lose the same
+/// digits.
 #[test]
 fn the_missing_rotation_is_most_of_the_turbo_iso_cosine_gap() {
     let data = outlier_fixture();
 
+    // `UnsupportedBits` means iso has no such width and the width is skipped;
+    // every other variant is a real encode failure and must not shrink coverage
+    // silently.
     let iso = |bits: u8| -> Option<CosineStats> {
-        let (codes, scales, quats, norms) = iso_encode_fast(&data, HEAD_DIM, 4, bits).ok()?;
+        let (codes, scales, quats, norms) = match iso_encode_fast(&data, HEAD_DIM, 4, bits) {
+            Ok(encoded) => encoded,
+            Err(IsoQuantError::UnsupportedBits { .. }) => return None,
+            Err(other) => panic!("iso_encode_fast failed at {bits} bits: {other}"),
+        };
         let decoded = iso_decode_fast(&codes, &scales, &quats, &norms, HEAD_DIM, 4, bits)
             .expect("iso_decode_fast accepted an encode iso_encode_fast produced");
         Some(cosine_similarity_per_row(&data, &decoded, HEAD_DIM))
@@ -532,8 +628,8 @@ fn the_missing_rotation_is_most_of_the_turbo_iso_cosine_gap() {
         let share = closed / gap;
 
         println!(
-            "turbo{bits} reconstruction error 1-cos: {:.6} plain -> {:.6} rotated, against \
-             iso{bits} {:.6}: the rotation closes {:.1}% of the gap",
+            "turbo{bits} reconstruction error 1-cos: {:.4e} plain -> {:.4e} rotated, against \
+             iso{bits} {:.4e}: the rotation closes {:.1}% of the gap",
             error(&plain),
             error(&rotated),
             error(&reference),
@@ -572,7 +668,16 @@ fn the_missing_rotation_is_most_of_the_turbo_iso_cosine_gap() {
 ///
 /// This pins the limitation so a later change cannot pass silently on a premise
 /// that no longer holds: if the widest width ever clears the inherited
-/// threshold, the recorded conclusion goes red rather than green.
+/// threshold, or the count of widths that clear it moves, the recorded
+/// conclusion goes red rather than green. turbo3's `+0.074`-bit margin is the
+/// narrowest of them, and is why the count is asserted rather than left to the
+/// two endpoints.
+///
+/// Widths clearing [`ROT_K_MIN_OUTLIER_GAIN_BITS`] on the outlier fixture, as
+/// measured. A recorded count, not a target: the module's Result section says
+/// "three of the four", and this is what makes that sentence falsifiable.
+const WIDTHS_MEETING_THE_INHERITED_THRESHOLD: usize = 3;
+
 #[test]
 fn the_rotation_is_worth_less_the_wider_the_codebook() {
     let data = outlier_fixture();
@@ -590,9 +695,23 @@ fn the_rotation_is_worth_less_the_wider_the_codebook() {
     for (bits, gain) in &gains {
         println!(
             "turbo{bits}: {gain:+.3} bits against the inherited \
-             {ROT_K_MIN_OUTLIER_GAIN_BITS:.1}-bit threshold"
+             {ROT_K_MIN_OUTLIER_GAIN_BITS:.1}-bit threshold, margin {:+.3}",
+            gain - ROT_K_MIN_OUTLIER_GAIN_BITS
         );
     }
+
+    let met = gains
+        .iter()
+        .filter(|&&(_, gain)| gain >= ROT_K_MIN_OUTLIER_GAIN_BITS)
+        .count();
+    assert_eq!(
+        met,
+        WIDTHS_MEETING_THE_INHERITED_THRESHOLD,
+        "{met} of {} widths now clear the inherited {ROT_K_MIN_OUTLIER_GAIN_BITS:.1}-bit \
+         threshold, not {WIDTHS_MEETING_THE_INHERITED_THRESHOLD}. The partial verdict recorded \
+         in this module's docs counts them, and the count is what has changed",
+        gains.len(),
+    );
 
     for pair in gains.windows(2) {
         let (narrow_bits, narrow_gain) = pair[0];
