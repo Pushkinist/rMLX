@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """TurboQuant cross-arm decode + KV-residency probe.
 
 Runs an identical decode loop under either the stock `mlx-lm` venv or the
@@ -309,7 +309,7 @@ def run_cell(model, tokens, mode, gen, chunk, est_kv_bytes=0):
         "gen_tokens": gen,
         "ttft_s": round(t_prefill, 4),
         "prefill_tps": round((tokens.size - 1) / t_prefill, 2) if t_prefill else 0,
-        "decode_tps": round(gen / t_decode, 4),
+        "decode_tps": round(gen / t_decode, 4) if t_decode else 0,
         "decode_s": round(t_decode, 4),
         "kv_bytes_true": kv_true,
         "kv_bytes_claimed": kv_claim,
@@ -370,6 +370,7 @@ def main():
     # token on a short prompt, then scale linearly to the real prompt to decide
     # whether the real cell fits in the host's free memory.
     est = {}
+    unrunnable = {}
     for mode in dict.fromkeys(seq):
         try:
             w = run_cell(model, warm, mode, args.warmup_gen, args.chunk)
@@ -377,21 +378,38 @@ def main():
             print(f"warmed {mode}  est KV @{tokens.size} = "
                   f"{est[mode] / 1024**3:.2f} GB", flush=True)
         except Exception as e:
-            print(f"WARMUP FAILED {mode}: {type(e).__name__}: {e}", flush=True)
+            # The warmup is also the sizing pass, and its result is the ONLY
+            # input to the guard that keeps a full-length cell from pushing this
+            # host into a reclaim livelock. Continuing would run that cell with
+            # an estimate of zero, and an OOM on the short prompt is precisely
+            # the failure that makes the long one unsafe.
+            unrunnable[mode] = f"{type(e).__name__}: {e}"
+            print(f"WARMUP FAILED {mode}: {unrunnable[mode]} -- "
+                  "its cells will be skipped, not run unsized", flush=True)
             with open(args.out, "a") as f:
                 f.write(json.dumps({"record": "error", "arm": args.arm,
                                     "mode": mode, "phase": "warmup",
-                                    "error": f"{type(e).__name__}: {e}"}) + "\n")
+                                    "error": unrunnable[mode]}) + "\n")
 
     for rep in range(args.reps):
         for pos, mode in enumerate(seq):
+            if mode in unrunnable:
+                r = {"mode": mode, "skipped": "warmup_failed",
+                     "error": unrunnable[mode]}
+                print(f"SKIP {mode}: warmup failed, no size estimate to guard on",
+                      flush=True)
+                r.update({"record": "cell", "arm": args.arm, "rep": rep,
+                          "pos": pos, "t_wall": time.time()})
+                with open(args.out, "a") as f:
+                    f.write(json.dumps(r) + "\n")
+                continue
             try:
                 r = run_cell(model, tokens, mode, args.gen, args.chunk,
-                             est_kv_bytes=est.get(mode, 0))
+                             est_kv_bytes=est[mode])
             except InsufficientMemory as e:
                 # Not a failure of the codec -- a measurement of the ceiling.
                 r = {"mode": mode, "skipped": "insufficient_memory",
-                     "error": str(e), "est_kv_bytes": est.get(mode, 0),
+                     "error": str(e), "est_kv_bytes": est[mode],
                      **system_state()}
                 print(f"SKIP {mode}: {e}", flush=True)
             except Exception as e:
