@@ -91,6 +91,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         file-size-report check-no-inline-tests check-no-scalar-f32-leak \
         check-kv-layer-quants check-kv-codec-disposition \
         check-kv-codec-disposition-fixtures \
+        check-kv-byte-model-parity check-kv-byte-model-parity-fixtures \
         check-no-decode-swallow check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress \
@@ -381,6 +382,12 @@ check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or
 check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — 10 synthetic scan roots, each asserting which rule fired
 	@bash scripts/check_kv_codec_disposition_fixtures.sh
 
+check-kv-byte-model-parity: ## CI gate: fail if scripts/perf_ceiling.py's KV byte model disagrees with the engine's
+	@bash scripts/check_kv_byte_model_parity.sh
+
+check-kv-byte-model-parity-fixtures: ## CI gate: recall test for the above — 8 synthetic manifests, each asserting which check fired
+	@bash scripts/check_kv_byte_model_parity_fixtures.sh
+
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check_no_decode_swallow.sh
 
@@ -429,6 +436,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kv_layer_quants.sh
 	@bash scripts/check_kv_codec_disposition.sh
 	@bash scripts/check_kv_codec_disposition_fixtures.sh
+	@bash scripts/check_kv_byte_model_parity.sh
+	@bash scripts/check_kv_byte_model_parity_fixtures.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_eval_lock.sh
 	@bash scripts/check_eval_lock_fixtures.sh

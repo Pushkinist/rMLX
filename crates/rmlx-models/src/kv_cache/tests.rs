@@ -2194,6 +2194,67 @@ mod tests {
         );
     }
 
+    /// Shapes the byte-model manifest is emitted at: `(seq, head_dim, kv_heads)`.
+    ///
+    /// Two head dimensions on purpose. The ring and rotor cadences carry a
+    /// per-row term (`16 / head_dim` and `(48*ceil(D/3) + 16) / D`), so a model
+    /// that got the sideband width wrong and a model that got the per-row term
+    /// wrong agree at exactly one head dimension and disagree at two.
+    const BYTE_MODEL_SHAPES: &[(u64, u64, u64)] = &[(4096, 128, 8), (4096, 256, 2)];
+
+    /// Layer count the per-layer codec vector is emitted at.
+    const BYTE_MODEL_LAYERS: usize = 36;
+
+    /// Print the per-layer KV byte model, swept over the type, for
+    /// `scripts/check_kv_byte_model_parity.sh` to hold `scripts/perf_ceiling.py`
+    /// against.
+    ///
+    /// That script carries a second, hand-maintained copy of this arithmetic so
+    /// it can price a codec without building the workspace. Nothing else holds
+    /// the copy to the original, and a divergence between them is invisible: it
+    /// does not fail, it just prices a codec at a rate the allocation never had.
+    ///
+    /// The sweep is [`rmlx_kv_quant::ALL_KV_QUANTS`], whose completeness against
+    /// the compiler-checked `variant_index` is pinned in `rmlx-kv-quant`, so a
+    /// new codec reaches this manifest without anyone adding it to a list. Both
+    /// topologies are emitted because `shares_kv` moves `Mixed` / `RotK` by two
+    /// whole mirrors, on the per-codec estimate and on the boundary floor alike.
+    ///
+    /// Sentinels bracket the block: a run that reaches `BEGIN` and stops failed
+    /// an assertion here, which is a violation; a run with no `BEGIN` never got
+    /// far enough to have an opinion, which is an environment error.
+    #[test]
+    fn emit_kv_byte_model_manifest() {
+        println!("KVBYTES-BEGIN");
+        let mut rows = 0_usize;
+        for &q in rmlx_kv_quant::ALL_KV_QUANTS {
+            for shares_kv in [false, true] {
+                let flag = u8::from(shares_kv);
+                for &(seq, head_dim, kv_heads) in BYTE_MODEL_SHAPES {
+                    let bytes =
+                        q.estimated_resident_bytes_per_layer(seq, head_dim, kv_heads, shares_kv);
+                    assert!(bytes > 0, "{q} priced a layer at zero bytes");
+                    println!("KVBYTES\t{q}\t{flag}\t{seq}\t{head_dim}\t{kv_heads}\t{bytes}");
+                    rows += 1;
+                }
+                let vector = kv_layer_quants(BYTE_MODEL_LAYERS, q, shares_kv);
+                let boundary = vector.first().map(ToString::to_string).unwrap_or_default();
+                let interior = vector
+                    .get(BYTE_MODEL_LAYERS / 2)
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                assert!(
+                    !boundary.is_empty() && !interior.is_empty(),
+                    "the layer vector is shorter than the layer count it was built for"
+                );
+                let layers = BYTE_MODEL_LAYERS;
+                println!("KVFLOOR\t{q}\t{flag}\t{layers}\t{boundary}\t{interior}");
+                rows += 1;
+            }
+        }
+        println!("KVBYTES-END\t{rows}");
+    }
+
     /// An all-windowed mix can never be net-negative for any codec: every
     /// windowed layer runs the bf16 ring, so the codec is a no-op (saving 0).
     #[test]

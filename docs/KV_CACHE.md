@@ -1363,7 +1363,7 @@ against, are a tensor census of what a step streams at
 
 | Model | §10 cell (combined) | decode-only (PERF_BASELINE.md) | ceiling @614 GB/s | ratio vs ceiling |
 |---|---:|---:|---:|---|
-| Bonsai 8B 2bit | 15.88 TPS | 115.21 TPS | 248.2 | 2.15x |
+| Bonsai 8B 2bit | 15.88 TPS | 115.21 TPS | 256.3 | 2.23x |
 | Gemma4-e4b mxfp8 | 27.50 TPS | 72.92 TPS | 123.5 | 1.69x |
 | Gemma4-26b MoE | 3.47 TPS | 72.19 TPS | 144.4 | 2.00x |
 | Qwen3.6-35B MoE | 4.46 TPS | 94.96 TPS | 191.1 | 2.01x |

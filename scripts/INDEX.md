@@ -25,8 +25,10 @@ Conventions:
 | `check_kernel_dtype_contract.sh` | A custom-Metal-kernel dispatcher returns the caller's dtype, not the kernel's working precision. |
 | `check_kernel_dtype_contract_fixtures.sh` | Recall test for the above. |
 | `check_kv_layer_quants.sh` | The per-layer KV codec vector has one producer; every per-layer cache stack uses it or declares itself uniform. |
-| `check_kv_codec_disposition.sh` | The `--kv-quant` / `--kv-bits` help and every `docs/KV_QUANT.md` INERT banner agree with the codec's runtime disposition, derived from `ALL_KV_QUANTS` + the three decode predicates. |
-| `check_kv_codec_disposition_fixtures.sh` | Recall test for the above — 10 synthetic scan roots (one edit each), asserting which rule fired and exit 2 vs exit 1. |
+| `check_kv_codec_disposition.sh` | The `--kv-quant` / `--kv-bits` / `--kv-preset` help and every `docs/KV_QUANT.md` INERT banner agree with the codec's runtime disposition, derived from `ALL_KV_QUANTS` + the three decode predicates. Also rejects any resident-KV ratio written into those help constants — that figure has one producer, `rmlx info --list-cache-types`. |
+| `check_kv_codec_disposition_fixtures.sh` | Recall test for the above — 13 synthetic scan roots (one edit each), asserting which rule fired and exit 2 vs exit 1. |
+| `check_kv_byte_model_parity.sh` | `scripts/perf_ceiling.py`'s KV byte model agrees with the engine's, per codec, per topology and per head dimension, over the sweep the engine emits. |
+| `check_kv_byte_model_parity_fixtures.sh` | Recall test for the above — 8 synthetic manifests, each asserting which check fired and exit 2 vs exit 1. |
 | `check_metal_compiles.sh` | Every `.metal` kernel compiles natively at `-std=metal3.1` and `-std=metal4.0`, and is named by its `probes/kernels.manifest`. |
 | `check_metal_format.sh` | Every `.metal` file is formatted. |
 | `check_no_decode_swallow.sh` | A failed decode step or failed sampler call cannot be swallowed into a silent success. |
@@ -64,7 +66,7 @@ Conventions:
 | `regression_gate.sh` | — | Compare a committed baseline against the latest canary row. Exit 125 = `git bisect skip`, 1 = regression. |
 | `perf-iter/bench_decode_tps.sh` | — | Per-iteration regression bench for a perf-fix campaign. |
 | `perf-iter/diff_baseline.sh` | — | Compare two perf-iter JSONL files, emit per-cell deltas. |
-| `perf_ceiling.py` | — | Static roofline calculator: bytes/step and the theoretical ceiling from a snapshot's `config.json` + safetensors index. |
+| `perf_ceiling.py` | — | Static roofline calculator: bytes/step and the theoretical ceiling from a snapshot's `config.json` + safetensors index. Its KV byte model is a second copy of the engine's and is held to it by `check_kv_byte_model_parity.sh`; `--byte-model` is that gate's entry point. |
 | `sdpa_headdim_bench.py` | — | What MLX's SDPA dispatch costs as a function of `head_dim`. |
 | `aggregate_decode_profile.py` | — | Aggregate per-model `decode_profile` lines from `profile_<MODEL>.txt`. |
 
@@ -76,10 +78,15 @@ Conventions:
 | `bench_codec_cell.sh` | Single-codec × single-model bench runner. |
 | `bench_cache_types.sh` | Drive the cache-type combo matrix for one model. |
 | `bench-records-sweep.sh` | 5-model × 4-KV-quant `BENCHMARK_CHAMPIONS` regression sweep. |
+| `bench/tri_engine_same_model.sh` | **llama.cpp vs rMLX vs stock mlx-lm on ONE checkpoint**, across each engine's KV options. Refuses to emit a llama.cpp row unless that binary's Metal tensor API probes live (an inert one reads ~3x low on prefill), and refuses any cell whose KV would push this host into swap. |
+| `bench/tri_engine_summarize.py` | Ingest one raw artifact from `tri_engine_same_model.sh` into a normalized cell record, or print the comparison table. Owns the single definition of the cross-engine record shape, incl. the KV bits/value normalization that makes an allocated-for-n_ctx figure comparable to a filled-prefix one. |
 | `spec_bench.sh` | Bench a model in normal vs MTP speculative-decode mode. |
 | `baseline/run_mlx-lm.sh` | Baseline measurement via Apple's stock `mlx-lm` loader. |
 | `baseline/run_mlx-lm-turboquant.sh` | Baseline measurement via the `mlx-lm-turboquant` fork. |
 | `baseline/run_oMLX.sh` | Baseline measurement via the oMLX Python server. |
+| `baseline/turbo_probe.py` | One identical decode loop run under either mlx-lm venv: decode TPS plus **true** KV residency (packed store *and* any dense dequant mirror) vs the cache's self-reported `nbytes`. `--seq` palindrome gives single-process ABBA. |
+| `baseline/turbo_abba.sh` | Process-level ABBA (stock, fork, fork, stock) around `turbo_probe.py` for the cross-venv leg, with a per-arm source-tree sha256 so the two arms are proven distinct before any ratio is quoted. |
+| `baseline/turbo_summarize.py` | Median / min / max / spread and per-mode ratios from `turbo_probe.py` jsonl. |
 | `baseline/group-A-baseline.sh` | Measure the rMLX baseline TPS for the Group-A regression gate. |
 | `baseline/c1-gemma4-cold-equal.sh` | C1 acceptance: gemma4 partial-prefix reuse. |
 | `baseline/d8-phase1-measure.sh` | Quantify the first-dispatch MSL-compile tax. |
