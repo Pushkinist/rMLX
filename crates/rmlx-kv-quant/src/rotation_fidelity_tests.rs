@@ -572,7 +572,7 @@ fn rotation_gain_bits(
 /// truncation of the same Hadamard. Both bounds are asserted —
 /// [`identity_rotation_excluded_by_the_rot_k_gain_threshold`] and
 /// [`non_full_dimension_rotations_fail_the_rot_k_gain_gate`].
-const ROT_K_MIN_OUTLIER_GAIN_BITS: f64 = 1.5;
+pub(crate) const ROT_K_MIN_OUTLIER_GAIN_BITS: f64 = 1.5;
 
 /// The decisive `rot_k` measurement: the Hadamard is worth bits on outlier
 /// data, and is a **net loss** on the i.i.d. fixture the older gate uses.
