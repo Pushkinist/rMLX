@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use rmlx_core::apple_gpu::parse_apple_generation;
 
 use super::{
-    contains_nax_kernel, evaluate, is_na_class, loaded_libmlx_path, loaded_metallib_path,
+    contains_nax_kernel, evaluate, is_na_class, loaded_library_path, loaded_metallib_path,
     metallib_to_scan, NaxFinding, LIBMLX_FILE, METALLIB_FILE, NAX_GEMM_KERNEL,
 };
 
@@ -408,30 +408,6 @@ fn scan_reads_a_file_on_disk() {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel-family name drift
-// ---------------------------------------------------------------------------
-
-/// The kernel family is spelled twice — here for the runtime probe, and in
-/// `build_support.rs` for the build-time scan — because a build script cannot
-/// import from the crate it builds. Nothing in the compiler couples the two.
-///
-/// Renaming one copy alone leaves the runtime probe scanning for a string no
-/// metallib ever contained, so it would report a confirmed absence on every
-/// host: a permanent false warning on exactly the M5 machines this exists for,
-/// with everything still compiling and every other test still passing. Pin them.
-#[test]
-fn build_side_names_the_same_kernel_family() {
-    const BUILD_SUPPORT: &str = include_str!("../build_support.rs");
-
-    let declaration = format!("const NAX_GEMM_KERNEL: &str = \"{NAX_GEMM_KERNEL}\";");
-    assert!(
-        BUILD_SUPPORT.contains(&declaration),
-        "build_support.rs must declare `{declaration}`: the build-time scan and this \
-         runtime probe have to name one family, or their answers describe different things"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // dyld image lookup
 // ---------------------------------------------------------------------------
 
@@ -441,7 +417,8 @@ fn build_side_names_the_same_kernel_family() {
 /// the build machine's prefix is the wrong answer.
 #[test]
 fn dyld_names_the_loaded_libmlx() {
-    let path = loaded_libmlx_path().expect("libmlx.dylib is linked, so dyld must list it");
+    let path =
+        loaded_library_path(LIBMLX_FILE).expect("libmlx.dylib is linked, so dyld must list it");
 
     assert_eq!(
         path.file_name().and_then(|n| n.to_str()),
@@ -458,7 +435,7 @@ fn dyld_names_the_loaded_libmlx() {
 /// it and therefore where MLX itself will load kernels from.
 #[test]
 fn metallib_path_is_the_sibling_of_the_loaded_libmlx() {
-    let libmlx = loaded_libmlx_path().expect("libmlx.dylib is linked");
+    let libmlx = loaded_library_path(LIBMLX_FILE).expect("libmlx.dylib is linked");
     let metallib = loaded_metallib_path().expect("a located libmlx always yields a metallib path");
 
     assert_eq!(metallib.parent(), libmlx.parent());

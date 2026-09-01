@@ -1,16 +1,18 @@
 -- Migration 004: MLX nax-GEMM-kernel capability on the `events` table.
 --
--- The Homebrew `mlx` bottle a run was compiled against sometimes ships zero
+-- The `mlx` bottle a run loads sometimes ships zero
 -- `steel_gemm_fused_nax*` kernels in `lib/mlx.metallib` (see
--- `crates/rmlx-mlx/build.rs` and `.rmlx/mlx-homebrew-nax-regression.md`) —
+-- `crates/rmlx-mlx/src/nax.rs` and `.rmlx/mlx-homebrew-nax-regression.md`) —
 -- on Neural-Accelerator-class hardware (M5-family and later) that costs
 -- ~3.8x GPU-matmul throughput and 2.2-3.7x slower prefill; decode is
 -- bandwidth-bound and looks normal. Without this column a bench row gives no
 -- way to tell whether it ran against a nax-capable build.
 --
--- `mlx_nax` is `"present"` / `"absent"` / `"unknown"` — the same tri-state
--- `check_mlx_pin`'s metallib scan already computes and stamps into
--- `RMLX_MLX_NAX` at compile time (`build.rs`), not a second detection path.
+-- `mlx_nax` is `"present"` / `"absent"` / `"unknown"` — from
+-- `rmlx_mlx::nax_capability()`, which scans the metallib beside the
+-- `libmlx.dylib` dyld resolved for the running process. Not a build-time
+-- constant: a binary loads MLX through a moving `opt` symlink, so anything
+-- baked in at compile time describes the wrong machine.
 -- Free-form TEXT, not an enum/CHECK constraint: identity columns in this
 -- schema are recorded strings, never validated against a closed set (see
 -- `canonicalize_kv_quant`'s doc in `rmlx-metrics::identity` and #214).

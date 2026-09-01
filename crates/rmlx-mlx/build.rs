@@ -18,14 +18,8 @@
 use std::env;
 use std::path::PathBuf;
 
-// Pure resolution/parsing logic, shared with `tests/mlx_pin.rs`.
+// Pure parsing logic, shared with `tests/mlx_build_version.rs`.
 include!("build_support.rs");
-
-/// Declares the MLX / mlx-c pair this build is validated against.
-const PIN_FILE: &str = "mlx-pin.txt";
-
-/// Read size for the metallib scan.
-const SCAN_CHUNK: usize = 1 << 20;
 
 /// Resolve the install prefix of a Homebrew formula.
 ///
@@ -58,9 +52,9 @@ fn resolve_prefix(env_key: &str, formula: &str) -> String {
 /// Note what this can and cannot catch: cargo compares mtimes and re-runs only
 /// for a *newer* one, and it stats through symlinks. Repointing `opt/mlx` at an
 /// older keg therefore moves the observed mtime backwards and does **not**
-/// trigger a re-run — recovering from a bad stack needs an explicit
-/// `cargo clean -p rmlx-mlx`, and the runtime version-skew warning is the
-/// backstop for a binary that was never rebuilt.
+/// trigger a re-run, so the bindings and the baked version stay stale until an
+/// explicit `cargo clean -p rmlx-mlx`. Nothing that has to *detect* a moved
+/// symlink may live in this script; that is `src/pin.rs`.
 fn rerun_if_present(path: &str) {
     if std::path::Path::new(path).exists() {
         println!("cargo:rerun-if-changed={path}");
@@ -79,119 +73,6 @@ fn brew_prefix(formula: &str) -> Option<String> {
     }
     let prefix = String::from_utf8(out.stdout).ok()?.trim().to_owned();
     (!prefix.is_empty() && std::path::Path::new(&prefix).exists()).then_some(prefix)
-}
-
-/// Ask `sysctl` for this Mac's chip marketing name, e.g. `"Apple M5 Max"`.
-///
-/// `None` when the command is unavailable or its output is empty/not valid
-/// UTF-8 — anything that means the chip cannot be identified, which
-/// `is_na_class_host` (in `build_support.rs`) treats the same as "not
-/// NA-class": a probe that cannot look must stay quiet, not guess.
-fn brand_string() -> Option<String> {
-    let out = std::process::Command::new("sysctl")
-        .args(["-n", "machdep.cpu.brand_string"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let brand = String::from_utf8(out.stdout).ok()?.trim().to_owned();
-    (!brand.is_empty()).then_some(brand)
-}
-
-/// Compare the resolved MLX / mlx-c against the pinned pair, and check that the
-/// metallib actually carries the fast GEMM kernels.
-///
-/// Warn, never fail. The pin records what was validated here; it is not a
-/// statement that anything else is broken. A correct non-bottle build of
-/// another version must still build, so a hard error would be wrong.
-///
-/// `na_class_host` gates how loudly a missing-kernel finding is reported: the
-/// kernels only matter on Neural-Accelerator-class hardware (M5-family and
-/// later), so their absence on anything else — including every GitHub
-/// `macos-14` (M1) runner — is expected and silent.
-///
-/// Returns the raw metallib-scan result (`Some(true)` present, `Some(false)`
-/// confirmed absent, `None` unreadable) so the caller can record it in run
-/// identity via `RMLX_MLX_NAX` — the same detection this function already
-/// does for the warning above, not a second scan.
-fn check_mlx_pin(
-    mlx_prefix: &str,
-    mlx_c_prefix: &str,
-    mlx_version: &str,
-    na_class_host: bool,
-) -> Option<bool> {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let pin_path = format!("{manifest_dir}/{PIN_FILE}");
-    println!("cargo:rerun-if-changed={pin_path}");
-
-    let pin_src = std::fs::read_to_string(&pin_path)
-        .unwrap_or_else(|e| panic!("rmlx-mlx: cannot read the MLX pin at {pin_path}: {e}"));
-    let pin = parse_pin(&pin_src).unwrap_or_else(|| {
-        panic!(
-            "rmlx-mlx: {pin_path} must declare one `mlx <version>` line and one \
-             `mlx-c <version>` line (plus `#` comments). The two are pinned as a \
-             pair — see docs/FFI.md."
-        )
-    });
-    let (pin_mlx, pin_mlx_c) = (pin.mlx.as_str(), pin.mlx_c.as_str());
-
-    // mlx-c ships no version header, so its identity is the keg directory name
-    // — which is also the only place the Homebrew revision suffix appears, and
-    // that suffix is the whole point (0.6.0_2 and 0.6.0_3 are the same upstream
-    // release built against different mlx).
-    let mlx_c_version = std::fs::canonicalize(mlx_c_prefix)
-        .ok()
-        .and_then(|real| keg_version_from(&real, "mlx-c"))
-        .unwrap_or_else(|| "unknown".to_owned());
-
-    // The capability itself, read off the library that will be loaded. This is
-    // the ground truth the version pin only proxies for, and it keeps passing
-    // on its own once a fixed bottle ships. `None` = no metallib to inspect.
-    let metallib = format!("{mlx_prefix}/lib/mlx.metallib");
-    rerun_if_present(&metallib);
-    let fast_gemm = std::fs::File::open(&metallib)
-        .ok()
-        .and_then(|f| contains_needle(f, NAX_GEMM_KERNEL.as_bytes(), SCAN_CHUNK).ok());
-
-    let drift = pin_drift(mlx_version, &mlx_c_version, &pin);
-    // A confirmed absence (not `None` — an unreadable metallib has nothing
-    // concrete to report) is the only thing that gates both the nax report
-    // and, via `should_report_drift`, the separate pin-drift note.
-    let kernels_missing = fast_gemm == Some(false);
-    let level = nax_warning_level(na_class_host, !kernels_missing);
-
-    match level {
-        NaxWarningLevel::Loud => {
-            let pin_file_display = format!("crates/rmlx-mlx/{PIN_FILE}");
-            for line in nax_missing_kernel_lines(
-                mlx_prefix,
-                mlx_version,
-                &mlx_c_version,
-                &pin,
-                NAX_GEMM_KERNEL,
-                &pin_file_display,
-            ) {
-                println!("cargo:warning={line}");
-            }
-        }
-        NaxWarningLevel::Silent => {
-            if should_report_drift(kernels_missing, drift) {
-                println!(
-                    "cargo:warning=MLX pin drift: resolved mlx {mlx_version} + mlx-c {mlx_c_version}, but \
-                     rMLX pins mlx {pin_mlx} + mlx-c {pin_mlx_c} (crates/rmlx-mlx/{PIN_FILE})."
-                );
-                println!(
-                    "cargo:warning=  The {NAX_GEMM_KERNEL} kernels the pin exists for are present, so GEMM \
-                     throughput should be unaffected. mlx and mlx-c are ABI-coupled though: an unvalidated \
-                     pair can abort at load with a dyld \"Symbol not found\". If this pair checks out, bump \
-                     both pin lines together. See docs/FFI.md."
-                );
-            }
-        }
-    }
-
-    fast_gemm
 }
 
 fn main() {
@@ -244,25 +125,6 @@ fn main() {
     let build_version =
         read_mlx_version(&std::fs::read_to_string(&version_header).unwrap_or_default());
     println!("cargo:rustc-env=RMLX_MLX_BUILD_VERSION={build_version}");
-
-    // Whether this Mac is Neural-Accelerator-class hardware (M5-family and
-    // later) — the audience the missing-kernel warning exists for. Every
-    // GitHub `macos-14` runner is M1 and answers false here, which is why
-    // the kernels' absence there is expected rather than alarming.
-    let na_class_host = brand_string().as_deref().is_some_and(is_na_class_host);
-
-    // Report a resolved stack that is not the validated one, or that cannot
-    // reach the fast GEMM path at all.
-    let fast_gemm = check_mlx_pin(&mlx_prefix, &mlx_c_prefix, &build_version, na_class_host);
-
-    // Record the same metallib-scan result in run identity, so bench rows are
-    // self-describing about whether they ran against the nax GEMM kernels
-    // (present), a confirmed-missing bottle (absent), or an unreadable
-    // metallib (unknown) — see docs/METRICS_DB.md.
-    println!(
-        "cargo:rustc-env=RMLX_MLX_NAX={}",
-        nax_capability_str(fast_gemm)
-    );
 
     // Link search paths.
     println!("cargo:rustc-link-search=native={mlx_c_prefix}/lib");

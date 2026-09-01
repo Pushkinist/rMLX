@@ -115,22 +115,18 @@ impl RunIdentity {
 /// [`set_mlx_nax`] before [`RunIdentity::get`] first runs.
 ///
 /// This crate cannot compute the value itself: the metallib scan that knows
-/// it lives in `crates/rmlx-mlx/build.rs` (`RMLX_MLX_NAX`, stamped from the
-/// same `kernels_present` detection the missing-kernel warning uses), and
-/// `rmlx-metrics` deliberately does not depend on `rmlx-mlx` — that crate's
-/// build script hard-requires a working Homebrew MLX/mlx-c install, which
-/// would make this generic, cross-backend metrics crate un-buildable without
-/// one. `env!("RMLX_MLX_NAX")` also would not help here even with the
-/// dependency: `cargo:rustc-env` only reaches the compiler invocation of the
-/// package whose build script set it, never a different crate's. So the
-/// value is supplied at runtime instead, exactly once, by the only binary
-/// that actually links `rmlx-mlx` (`rmlx-cli`), the same way it installs its
-/// other process-wide one-shot toggles (`install_rotor_qjl`,
-/// `install_planar_fused_qk`) — before any metrics recording starts.
+/// it lives in `rmlx-mlx`, and `rmlx-metrics` deliberately does not depend on
+/// that crate — its build script hard-requires a working Homebrew MLX/mlx-c
+/// install, which would make this generic, cross-backend metrics crate
+/// un-buildable without one. So the value is supplied at runtime instead,
+/// exactly once, by the only binary that actually links `rmlx-mlx`
+/// (`rmlx-cli`), the same way it installs its other process-wide one-shot
+/// toggles (`install_rotor_qjl`, `install_planar_fused_qk`) — before any
+/// metrics recording starts.
 static MLX_NAX: OnceLock<String> = OnceLock::new();
 
-/// Record the MLX nax-GEMM-kernel capability baked into `rmlx-mlx` at compile
-/// time (`rmlx_mlx::NAX_CAPABILITY` — `"present"` / `"absent"` / `"unknown"`).
+/// Record the nax-GEMM-kernel capability of the MLX the process loaded
+/// (`rmlx_mlx::nax_capability()` — `"present"` / `"absent"` / `"unknown"`).
 ///
 /// Call once, from `main()`, before the first [`RunIdentity::get`] /
 /// `EventRecorder::record`. A call after `RunIdentity::get()` has already run

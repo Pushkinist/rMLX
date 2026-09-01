@@ -9,14 +9,17 @@
 #      A broken stack here means `rmlx` does not run at all.
 #
 #   2. NA-class hosts only (M5 and later): `mlx.metallib` must actually contain
-#      `steel_gemm_fused_nax` GEMM kernels. The homebrew-core `arm64_tahoe`
-#      bottle of mlx 0.32.0 ships ZERO of them where 0.31.2 ships 145, costing
-#      ~2-3.8x on GEMM-bound prefill. Decode is largely unaffected, so the
-#      failure is silent: benches still run and still look plausible.
+#      `steel_gemm_fused_nax` GEMM kernels, and the linked pair must be the one
+#      the pin names. Some homebrew-core `arm64_tahoe` bottles ship ZERO nax
+#      kernels, costing ~2-3.8x on GEMM-bound prefill. Decode is largely
+#      unaffected, so the failure is silent: benches still run and still look
+#      plausible. See docs/FFI.md for which bottles and the measured cost.
 #
-# On M1-M4 the nax check is skipped, not failed — those bottles legitimately
-# contain no nax kernels because the hardware has no Neural Accelerator. Nothing
-# here pins a version on those hosts.
+# On M1-M4 both the nax check and the pinned-pair check are skipped, not failed
+# — those bottles legitimately contain no nax kernels because the hardware has
+# no Neural Accelerator, so the pinned pair buys nothing there.
+#
+# The pinned pair is read from crates/rmlx-mlx/mlx-pin.txt, never restated here.
 #
 # Run before any measurement. Exits non-zero and names the fix on failure.
 # Background: .rmlx/mlx-homebrew-nax-regression.md
@@ -24,9 +27,22 @@
 set -uo pipefail
 
 PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
-# Known-good nax-capable pair for NA-class hosts (see the report).
-GOOD_MLX="0.31.2"
-GOOD_MLXC="0.6.0_2"
+
+# The pinned pair, read from its one declaration. A copy here would drift the
+# moment the pin moves, and the drift would be silent.
+PIN_FILE="$(cd "$(dirname "$0")/.." && pwd)/crates/rmlx-mlx/mlx-pin.txt"
+[ -f "$PIN_FILE" ] || {
+	echo "FAIL: no MLX pin at $PIN_FILE" >&2
+	exit 1
+}
+PIN_MLX=$(awk '$1 == "mlx" { print $2; n++ } END { exit n != 1 }' "$PIN_FILE") ||
+	PIN_MLX=""
+PIN_MLXC=$(awk '$1 == "mlx-c" { print $2; n++ } END { exit n != 1 }' "$PIN_FILE") ||
+	PIN_MLXC=""
+[ -n "$PIN_MLX" ] && [ -n "$PIN_MLXC" ] || {
+	echo "FAIL: $PIN_FILE must declare exactly one 'mlx <version>' and one 'mlx-c <version>' line" >&2
+	exit 1
+}
 
 fail() {
 	echo "PREFLIGHT FAIL: $*" >&2
@@ -88,7 +104,17 @@ if [ "$na_class" = "1" ]; then
 	nax=$(strings "$metallib" | grep -c steel_gemm_fused_nax)
 	if [ "$nax" -lt 1 ]; then
 		fail "$brand has a Neural Accelerator but mlx $mlx_ver ships 0 nax GEMM kernels" \
-			"— GEMM-bound prefill would be ~2-3.8x slow (known good: mlx $GOOD_MLX + mlx-c $GOOD_MLXC)"
+			"— GEMM-bound prefill would be ~2-3.8x slow (pinned: mlx $PIN_MLX + mlx-c $PIN_MLXC)"
+		hint_restore
+		exit 1
+	fi
+	# The pair is the validated unit even when the kernels are present: mlx and
+	# mlx-c are ABI-coupled, and any prefill number measured across the pin
+	# boundary is not comparable to one from the other side. On a host the pin
+	# binds, that is a refusal to measure, not a note.
+	if [ "$mlx_ver" != "$PIN_MLX" ] || [ "$mlxc_ver" != "$PIN_MLXC" ]; then
+		fail "linked mlx $mlx_ver + mlx-c $mlxc_ver is not the pinned pair" \
+			"(mlx $PIN_MLX + mlx-c $PIN_MLXC, crates/rmlx-mlx/mlx-pin.txt)"
 		hint_restore
 		exit 1
 	fi
@@ -105,11 +131,7 @@ if [ -x "$bin" ]; then
 fi
 
 if [ "$na_class" = "1" ]; then
-	echo "preflight ok: $brand (NA-class), mlx $mlx_ver + mlx-c $mlxc_ver, $nax nax GEMM kernel occurrences"
-	if [ "$mlx_ver" != "$GOOD_MLX" ] || [ "$mlxc_ver" != "$GOOD_MLXC" ]; then
-		echo "  note: not the recorded known-good pair (mlx $GOOD_MLX + mlx-c $GOOD_MLXC);" \
-			"nax kernels are present, so this is informational only."
-	fi
+	echo "preflight ok: $brand (NA-class), pinned mlx $mlx_ver + mlx-c $mlxc_ver, $nax nax GEMM kernel occurrences"
 else
 	echo "preflight ok: $brand (no Neural Accelerator), mlx $mlx_ver + mlx-c $mlxc_ver, nax check skipped"
 fi

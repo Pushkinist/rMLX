@@ -24,11 +24,10 @@ crates are `publish = false`). There is no separate `VERSION` file.
 > `depends_on "mlx-c"` resolves to the current release. Two consequences worth
 > holding onto when reading a user report:
 >
-> - The `RMLX_MLX_NAX` baked into the artifact describes the **release
->   machine**, not the user's. `events.mlx_nax` from a distributed binary is
->   the builder's answer. The user-facing answer is the runtime probe in
->   `crates/rmlx-mlx/src/nax.rs`, which reads the metallib actually loaded and
->   warns only on Neural-Accelerator hosts (see `docs/FFI.md`).
+>   - `events.mlx_nax` is read at run time from the metallib the user's
+>     machine actually loaded (`crates/rmlx-mlx/src/nax.rs`), so a row from a
+>     distributed binary is the *user's* answer, not the builder's. Nothing
+>     about the nax capability is baked into the artifact.
 > - Run `make mlx-preflight` on the release machine before step 8's keg build.
 >   It does not change what users get, but it keeps the release machine's own
 >   published prefill numbers honest.

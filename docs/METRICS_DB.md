@@ -352,8 +352,8 @@ amended. It is harmless — nothing selects it (every query names its columns
 explicitly) — and is not something to "fix" by hand-editing that database's
 schema.
 
-**`mlx_nax` (migration `004_events_mlx_nax.sql`).** Whether the Homebrew MLX
-this binary linked against ships the `steel_gemm_fused_nax*` GEMM kernels:
+**`mlx_nax` (migration `004_events_mlx_nax.sql`).** Whether the MLX this
+process **loaded** ships the `steel_gemm_fused_nax*` GEMM kernels:
 `"present"` / `"absent"` / `"unknown"`. On Neural-Accelerator-class hardware
 (M5-family and later) their absence costs ~3.8x GPU-matmul throughput and
 2.2-3.7x slower prefill — decode is bandwidth-bound and unaffected, which is
@@ -363,23 +363,28 @@ say whether it ran against a nax-capable build.
 
 Same "binary genuinely knows this about itself" category as
 `backend_version` / `build_profile`, but the fact originates in a different
-crate: `crates/rmlx-mlx/build.rs` scans `lib/mlx.metallib` at compile time
-(the same `kernels_present` detection the missing-kernel build warning uses,
-not a second detection path) and stamps `RMLX_MLX_NAX` via
-`cargo:rustc-env`. `rmlx-metrics` cannot read that constant directly —
-`cargo:rustc-env` only reaches the compiler invocation of the crate whose
-build script set it, and `rmlx-metrics` deliberately does not depend on
+crate: `rmlx_mlx::nax_capability()` scans the `mlx.metallib` beside the
+`libmlx.dylib` **dyld resolved for this process**, once per process. It is
+read at run time, not baked in at compile time, because a binary links MLX
+through a package-manager `opt` symlink — so it loads whatever the installing
+user has, and that symlink can move after the build on the same machine.
+Anything stamped by a build script answers for the machine that compiled the
+binary, which is the wrong machine, and cargo cannot even re-run that script
+when the symlink moves backwards.
+
+`rmlx-metrics` cannot call it directly: it deliberately does not depend on
 `rmlx-mlx` (whose build script hard-requires a working Homebrew MLX/mlx-c
 install — a dependency this generic, cross-backend metrics crate must not
 carry). `rmlx-cli::main()` is the one binary that links both, so it calls
-`rmlx_metrics::identity::set_mlx_nax(rmlx_mlx::NAX_CAPABILITY)` once at
+`rmlx_metrics::identity::set_mlx_nax(rmlx_mlx::nax_capability())` once at
 startup — the same process-wide one-shot-`OnceLock` pattern already used for
 `install_rotor_qjl` / `install_planar_fused_qk` — before the first
 `RunIdentity::get()` / `EventRecorder::record`. A process that never calls it
 (unit tests, tools that don't link `rmlx-mlx`) reads `"unknown"`, which is
-honest: no capability was ever supplied. Free-form TEXT, not validated
-against an enum — same rule as every other recorded label (kv_quant/model,
-#214).
+honest: no capability was ever supplied. `"unknown"` also covers a metallib
+that could not be inspected — "did not look" is never recorded as either
+presence or absence. Free-form TEXT, not validated against an enum — same rule
+as every other recorded label (kv_quant/model, #214).
 
 Nullable: rows written before migration 004 keep NULL. Append-only — no
 backfill, no UPDATE. Historical rows recorded roughly 2026-07-13 through the

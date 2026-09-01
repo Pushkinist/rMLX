@@ -1,9 +1,15 @@
 # The MLX / mlx-c pair rMLX is validated against. Single source of truth:
-# build.rs reads this file, and nothing else declares these versions.
+# src/pin.rs reads this file, and nothing else declares these versions.
 #
 # Bump BOTH lines together, never one alone. mlx-c is compiled against a
 # specific mlx and both resolve the moving `opt` symlink at run time, so a
 # mismatched pair aborts at load with a dyld "Symbol not found".
+#
+# The gate that enforces this is `linked_mlx_matches_the_pinned_pair`
+# (crates/rmlx-mlx/src/pin_tests.rs). It reads the library dyld resolved for
+# the running process and scans that metallib for the kernel family the pin
+# exists to buy — a version match alone is not evidence, because bottle
+# contents vary by build runner.
 #
 # Why these versions, and how to un-pin once Homebrew's bottle is fixed:
 # docs/FFI.md -> "Pinned MLX / mlx-c pair".

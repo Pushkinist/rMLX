@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restore the pinned, nax-capable MLX pair (mlx 0.31.2 + mlx-c 0.6.0_2).
+# Restore the nax-capable MLX pair named by crates/rmlx-mlx/mlx-pin.txt.
 #
 # Needed because `brew pin` does NOT protect a keg from `brew cleanup`: the
 # pinned versions can disappear entirely, leaving only the nax-less 0.32.0
@@ -20,9 +20,27 @@ STORE="${RMLX_BOTTLE_STORE:-$HOME/.rmlx/bottles}"
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
-MLX_VER="0.31.2"
-MLXC_VER="0.6.0_2"
-# sha256 from the homebrew-core *bottle-update* commits (cbfd9632d44 / b2763d78a34).
+# The pinned pair, read from its one declaration. A copy here would drift the
+# moment the pin moves, and the drift would be silent.
+PIN_FILE="$(cd "$(dirname "$0")/.." && pwd)/crates/rmlx-mlx/mlx-pin.txt"
+[ -f "$PIN_FILE" ] || {
+	echo "FAIL: no MLX pin at $PIN_FILE" >&2
+	exit 1
+}
+PIN_MLX=$(awk '$1 == "mlx" { print $2; n++ } END { exit n != 1 }' "$PIN_FILE") ||
+	PIN_MLX=""
+PIN_MLXC=$(awk '$1 == "mlx-c" { print $2; n++ } END { exit n != 1 }' "$PIN_FILE") ||
+	PIN_MLXC=""
+[ -n "$PIN_MLX" ] && [ -n "$PIN_MLXC" ] || {
+	echo "FAIL: $PIN_FILE must declare exactly one 'mlx <version>' and one 'mlx-c <version>' line" >&2
+	exit 1
+}
+MLX_VER="$PIN_MLX"
+MLXC_VER="$PIN_MLXC"
+# sha256 from the homebrew-core *bottle-update* commits (cbfd9632d44 / b2763d78a34),
+# for the pair the pin currently names. Moving the pin without moving these makes
+# the extracted version directory disagree with the requested one, which the
+# check below turns into a hard failure rather than a wrong restore.
 # NOTE: the version-bump commit still carries the PREVIOUS release's hashes —
 # taking the sha from there silently yields mlx 0.31.1.
 MLX_SHA="def8a7ae1e6a6506eed4dea45bf52b55be0f52f8364f8a928da6e65b1204a371"

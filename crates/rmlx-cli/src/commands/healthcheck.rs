@@ -171,6 +171,13 @@ pub(crate) fn run_healthcheck(
     let mem_line = check_mem();
     mem_line.emit(human);
 
+    // ── 8. The MLX this process loaded ───────────────────────────────────────
+    let pin_line = check_mlx_pin();
+    if pin_line.status == Status::Red {
+        red_checks.push(pin_line.check.clone());
+    }
+    pin_line.emit(human);
+
     // ── Aggregate ─────────────────────────────────────────────────────────────
     let agg_status = if red_checks.is_empty() {
         Status::Green
@@ -588,6 +595,27 @@ fn check_disk(dir: &Path, min_gb: u64, label: &str) -> CheckLine {
 }
 
 /// Check 7: process RSS + phys_footprint via `rmlx_core::mach_mem` (info-only).
+/// Is the MLX dyld resolved for this process the validated pair?
+///
+/// Reads the loaded library, not a config file or a build-time constant: the
+/// `opt` symlink both dylibs' install names point at can move after the build,
+/// and nothing in the build system can see it move backwards.
+///
+/// Red only where the pin binds — a Mac with a GPU Neural Accelerator. Earlier
+/// Apple Silicon ships none of the pinned kernels at any MLX version, so the
+/// finding is reported there but is not a failure.
+fn check_mlx_pin() -> CheckLine {
+    let check = rmlx_mlx::pin_check();
+    let status = if check.matches {
+        Status::Green
+    } else if check.enforced {
+        Status::Red
+    } else {
+        Status::Info
+    };
+    CheckLine::new("mlx_pin", status, check.detail)
+}
+
 fn check_mem() -> CheckLine {
     #[cfg(target_os = "macos")]
     {

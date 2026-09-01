@@ -120,8 +120,8 @@ Conventions:
 
 | Script | Via | What it does |
 |---|---|---|
-| `mlx_preflight.sh` | `make mlx-preflight` | Verify the linked MLX stack is sane before benching. |
-| `mlx_restore_pin.sh` | `make mlx-restore-pin` | Restore the pinned, nax-capable MLX pair. |
+| `mlx_preflight.sh` | `make mlx-preflight` | Refuse to bench unless the linked MLX is the pinned, nax-capable pair (reads `crates/rmlx-mlx/mlx-pin.txt`). |
+| `mlx_restore_pin.sh` | `make mlx-restore-pin` | Restore the pair `crates/rmlx-mlx/mlx-pin.txt` names. |
 | `target_gc.sh` | `make target-gc` | Prune stale build profiles from `target/`. |
 | `lib/env.sh` | — | Load repo `.env`, validate `RMLX_O_MODELS_ROOT`. **Source it.** |
 | `lib/cpu_snapshot.sh` | — | Per-process cumulative CPU seconds, for interference gates. **Source it.** |

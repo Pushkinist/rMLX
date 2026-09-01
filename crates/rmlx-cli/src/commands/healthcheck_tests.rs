@@ -247,3 +247,30 @@ fn j6_detail_escaping() {
     let json = format!(r#"{{"check":"esc","status":"info","detail":"{escaped}"}}"#);
     serde_json::from_str::<serde_json::Value>(&json).expect("escaped JSON must be valid");
 }
+
+// ── MLX pin ─────────────────────────────────────────────────────────────────
+
+/// The verdict is red only where the pin binds, and never for a host it does
+/// not: on pre-Neural-Accelerator hardware the pinned kernels buy nothing, so
+/// reporting a failure there would be noise on the majority of Macs.
+///
+/// The pin itself is gated by `linked_mlx_matches_the_pinned_pair`
+/// (`crates/rmlx-mlx/src/pin_tests.rs`); this covers only the mapping from a
+/// verdict to a check line.
+#[test]
+fn j6_mlx_pin_is_red_only_where_the_pin_binds() {
+    let line = check_mlx_pin();
+    assert_eq!(line.check, "mlx_pin");
+    assert!(
+        !line.detail.is_empty(),
+        "the verdict must say what it found"
+    );
+
+    let check = rmlx_mlx::pin_check();
+    let expected = match (check.matches, check.enforced) {
+        (true, _) => Status::Green,
+        (false, true) => Status::Red,
+        (false, false) => Status::Info,
+    };
+    assert_eq!(line.status, expected, "detail: {}", line.detail);
+}
