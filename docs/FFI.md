@@ -66,8 +66,8 @@ mlx    0.31.2
 mlx-c  0.6.0_2
 ```
 
-Nothing else in the tree declares these versions — `build.rs` reads that file,
-and bumping a line there is the whole change.
+Nothing else in the tree declares these versions — `src/pin.rs` reads that
+file, and bumping a line there is the whole change.
 
 **They bump together.** mlx-c is compiled against a specific mlx, and both
 resolve the moving `opt` symlink at run time, so a mismatched pair aborts at
@@ -117,15 +117,23 @@ two are easy to conflate:
 
 | Path | NAX? | Why |
 |---|---|---|
-| Prefill attention, `head_dim` 64 or 128, Q not f32 | **yes**, `steel_attention_<dtype>_bq64_…` | MLX's `sdpa_full` takes the NAX branch unless `head_dim == 80` or Q is f32 without TF32 |
+| Prefill attention, `head_dim` 64 or 128, Q not f32 | **yes**, `steel_attention_<dtype>_bq64_…` | MLX's `sdpa_full` takes the NAX branch unless `head_dim == 80` or Q is f32 without TF32. The two widths lists differ: `sdpa_full` supports 64/80/128, and the NAX branch then excludes 80 explicitly, so an 80-wide head takes the `bq32` steel path |
 | Prefill attention, `head_dim` 256 or 512 | no | MLX has no fused prefill kernel at either width, NAX or otherwise. See [Head-dim dispatch](#head-dim-dispatch-and-the-unfused-fallback) — that gap is about a missing kernel *shape*, not about NAX |
 | Decode attention, any `head_dim`, any codec | no | `bq64` is a query tile of 64, and decode is `q_seq = 1`. At `head_dim` ≤ 256 MLX routes `q_seq <= 8` to `sdpa_vector`, which has no NAX variant; at 512 there is no vector kernel either and decode falls to the composite path. Neither reaches NAX |
-| Our own `.metal` kernels | no | all of them are `q_seq = 1` decode kernels. NAX's one matmul tile shape has an M floor of 16; at `q_seq = 1` the only M available is `heads_per_kv` (4–8 on our models), so the tile can never be more than half filled |
+| Our own `.metal` kernels | no | all of them are `q_seq = 1` decode kernels, and decode attention is bandwidth-bound — it streams the whole KV cache at O(1) FLOPs per byte, so raising arithmetic throughput cannot help. A per-query-head decode grid is separately capped at `1 / heads_per_kv`, because that many threadgroups stream identical KV bytes; that is grid geometry and NAX does not touch it |
 
 So the bf16 mirror's decode advantage over a quantized codec is bandwidth and
 kernel quality, **not** NAX — no decode path on any codec reaches it, and a
-hand-written decode kernel could not either. Only prefill is in play, and only
-for a 64- or 128-wide head.
+hand-written decode kernel would gain nothing from it either. Only prefill is
+in play, and only for a 64- or 128-wide head.
+
+The tile shape is not what rules it out. `mpp::tensor_ops::matmul2d` is public
+and its shape rules are permissive — `m % 8 == 0` at simdgroup scope,
+`m ∈ {1, 2, 4, 8k}` at `execution_thread` scope — so our decode `M`
+(`heads_per_kv`, 4–8) is legal. What is fixed at 16 is *MLX's shipped tile*:
+every one of the 5,670 `matmul2d_descriptor` instantiations in the 0.31.2
+metallib is `<M=16, N=32, K=16>`. That is a property of the bottle, not of the
+instruction set, and it is not the reason decode cannot use NAX.
 
 Measured on this host (M5 Max, mlx 0.31.2), from the per-pipeline binary
 archives inside a GPU capture — the whole `mlx.metallib` is also embedded in a
@@ -144,55 +152,108 @@ pipeline:
 Which widths reach which kernel, and what the fallback costs, is
 [Head-dim dispatch](#head-dim-dispatch-and-the-unfused-fallback).
 
-#### What the build checks
+#### The gate: `linked_mlx_matches_the_pinned_pair`
 
-`build.rs` warns — never fails — on two independent things:
+`crates/rmlx-mlx/src/pin.rs` reads the two dylibs **dyld resolved for this
+process**, canonicalizes them to their kegs, compares both versions against
+`mlx-pin.txt`, and scans the `mlx.metallib` beside the resolved `libmlx.dylib`
+for `steel_gemm_fused_nax`. `linked_mlx_matches_the_pinned_pair`
+(`crates/rmlx-mlx/src/pin_tests.rs`) fails unless all of that agrees.
 
-| Check | Fires when | Meaning |
-|---|---|---|
-| **Capability** | the resolved `mlx.metallib` contains no `steel_gemm_fused_nax` | the real defect; names both versions and the fix command |
-| **Pin drift** | resolved mlx/mlx-c ≠ the pinned pair, but the kernels are present | informational; the pair is unvalidated, and bumping the pin may be due |
+**The metallib scan is the load-bearing half.** Bottle contents vary by build
+runner, so a version match is not evidence the kernels are there — only the
+scan is. The version comparison covers the other hazard: mlx and mlx-c are
+ABI-coupled, and an unvalidated pair is not known to work together.
 
-Warning rather than failing is deliberate: the pin records what *was validated
-here*, not a claim that everything else is broken. A correct non-bottle build
-of another version must still compile.
+**Not in a build script, deliberately.** Cargo re-runs a build script only when
+a `rerun-if-changed` path is *newer* than the last run, and it stats through
+symlinks. Repointing `opt/mlx` at an older keg moves the observed mtime
+backwards, so the script does not re-run — and cargo replays its cached output,
+printing a stale verdict about a stack that has since changed. On this machine
+the 0.32.0 keg's files predate the 0.31.2 keg's, so the drift direction that
+costs something is exactly the direction a build script cannot see.
 
-#### Run identity: `RMLX_MLX_NAX`
+Every failure is its own verdict, so an inconclusive probe can never be read as
+a pass:
 
-The same metallib scan also stamps `cargo:rustc-env=RMLX_MLX_NAX=<present|absent|unknown>`
-(exposed as `rmlx_mlx::NAX_CAPABILITY`) — not a second detection path, the same
-`fast_gemm` result the two warnings above already computed. `rmlx-cli::main()`
-forwards it into `rmlx-metrics`'s run identity
-(`rmlx_metrics::identity::set_mlx_nax`), so every `events` row records whether
-that run built against a nax-capable MLX. See `docs/METRICS_DB.md` §3.6 for
-the column and why the propagation goes through a runtime setter rather than
-a second `env!()` read (`cargo:rustc-env` only reaches the compiler
-invocation of the crate whose build script set it).
+| Verdict | Means |
+|---|---|
+| `Match` | both kegs are the pinned pair and the metallib carries the kernels |
+| `KernelsMissing` | the metallib was read and has none — the expensive, invisible failure, reported ahead of everything else |
+| `VersionMismatch` | a keg version was read and disagrees with the pin |
+| `NotLoaded` | dyld listed no such image; the loaded MLX cannot be identified at all |
+| `NotAKeg` | the resolved library is not in a keg, so it has no version to compare |
+| `KernelsUnverified` | the metallib could not be read; the capability is unknown |
+| `PinUnparsable` | `mlx-pin.txt` declares no pair, so there is nothing to check against |
 
-The capability probe is the ground truth; the version pin only proxies for it.
-The probe is what keeps this from nagging forever once a fixed bottle ships —
-it simply passes. Neither check can be verified from a version number alone,
-which is why both exist.
+The pin file's grammar is enforced in two places, because the preflight and the
+restore script run before any binary exists to ask: `parse_pin`
+(`crates/rmlx-mlx/src/pin.rs`) and `scripts/lib/mlx_pin.sh`, held together by
+`the_shell_pin_parser_agrees_with_the_rust_one`. Versions are allowlisted to
+the shape of a keg directory name — the restore script interpolates them into
+`rm -rf`, `cp -R` and `ln -sfn` targets under the Cellar, where a value like
+`..` would reach well outside a keg.
+
+**Scoped to Neural-Accelerator-class hosts**, derived from the chip rather than
+from a list of machines: earlier Apple Silicon ships zero of these kernels at
+every MLX version, so the pinned pair buys nothing there. That scoping is
+itself guarded — `the_gate_can_tell_which_host_it_is_on` fails if the chip
+cannot be identified, because a gate that cannot tell whether it applies can
+pass by accident, and on a host it does not bind the probe must still have
+worked.
+
+**And it runs where the numbers are made.** `rmlx baseline` and `rmlx bench`
+call the same verdict before anything else and refuse outright when the pin
+binds and the loaded pair is wrong — a measurement taken across the pin
+boundary is not comparable to any recorded number, so producing it is worse
+than not running. `rmlx healthcheck` reports the same verdict as an `mlx_pin`
+check line.
+
+`scripts/mlx_preflight.sh` (`make canary`, `canary-ab`, `bench-codec-cell`)
+reads the package manager's `opt` symlinks as a cheap pre-filter and then asks
+the built binary for its own verdict. The symlinks are not the truth:
+`MLX_PREFIX` / `MLX_C_PREFIX` can link a build against an install the preflight
+never inspects, and `DYLD_LIBRARY_PATH` can redirect a launch without touching
+them at all. Only the process that will take the measurement can say what dyld
+resolved for it.
+
+#### Run identity: `events.mlx_nax`
+
+`rmlx_mlx::nax_capability()` returns `present` / `absent` / `unknown` from the
+same runtime scan, once per process. `rmlx-cli::main()` forwards it into
+`rmlx-metrics`'s run identity (`rmlx_metrics::identity::set_mlx_nax`), so every
+`events` row records whether **that run** had the kernels — not whether the
+machine that compiled the binary did. `unknown` is reserved for a metallib that
+could not be inspected; a run that could not look must not claim a capability.
+See `docs/METRICS_DB.md` §3.6.
 
 Version identity comes from different places per formula, of necessity: mlx
 ships `include/mlx/version.h` (authoritative, and works on non-Homebrew
 layouts), while mlx-c ships no version header at all — its identity is the keg
 directory name, which is also the only place the load-bearing revision suffix
-appears. A non-keg layout (a wheel, a hand-built tree) yields no version and
-the pin stays quiet rather than guessing.
+appears.
 
 #### Fixing a machine that drifted
 
 Both kegs must already be in the Cellar (`ls /opt/homebrew/Cellar/mlx`):
 
 ```sh
+brew unpin mlx mlx-c && \
 ln -sfn ../Cellar/mlx/0.31.2 /opt/homebrew/opt/mlx && \
 ln -sfn ../Cellar/mlx-c/0.6.0_2 /opt/homebrew/opt/mlx-c && \
 brew pin mlx mlx-c && \
 cargo clean -p rmlx-mlx        # required — see below
 ```
 
-`brew pin` stops a later `brew upgrade` from repointing the symlinks back.
+**`brew unpin` first, and it is not optional.** `brew pin` pins whatever is
+linked *at the time it runs*. Pinning while a newer keg is linked produces a
+split state: `opt/mlx` on the validated keg, `<brew-prefix>/lib/libmlx.dylib`
+and Homebrew's own records on the newer one. rMLX still loads the right
+library, because `opt` is the `install_name` baked into the dylibs — but the
+pin is then guarding the wrong version, and any `brew link` or `brew reinstall`
+triggered by an unrelated formula would repoint `opt/mlx` and silently drop the
+kernels. Verify afterwards with `brew list --pinned --versions`, which must
+name the pinned pair, and with `linked_mlx_matches_the_pinned_pair`.
 
 **The `cargo clean` is required, not hygiene.** Cargo re-runs a build script
 only when a `rerun-if-changed` path is *newer* than the last run, and it stats
@@ -248,14 +309,13 @@ catches a stack that changed underneath a built binary.
 
 ### Runtime NAX capability (`src/nax.rs`)
 
-A version match is not a capability match, and neither survives distribution.
-`RMLX_MLX_NAX` describes the machine that *built* the binary; a Homebrew bottle
-or release tarball links `libmlx.dylib` through the moving `opt` symlink, so it
-runs against the installing user's MLX, which may be a different bottle of the
-same version. `src/nax.rs` therefore repeats the metallib scan at run time, on
-the same one-shot init as the skew warning, against the library **dyld actually
-loaded** (found by walking dyld's image list for `libmlx.dylib`, then reading
-its colocated `mlx.metallib`).
+A version match is not a capability match, and nothing derived at build time
+survives distribution: a bottle or release tarball links `libmlx.dylib` through
+the moving `opt` symlink, so it runs against the installing user's MLX, which
+may be a different bottle of the same version. `src/nax.rs` therefore scans the
+metallib at run time, on the same one-shot init as the skew warning, against
+the library **dyld actually loaded** (found by walking dyld's image list for
+`libmlx.dylib`, then reading its colocated `mlx.metallib`).
 
 **Host-class gated, and that gate is the point.** The kernels only exist for
 the GPU Neural Accelerator, which arrives with M5 — Apple GPU family 10 in
@@ -294,29 +354,26 @@ warning implying a general slowdown would be wrong.
 3. `build.rs` post-processes `bindings.rs` to strip any `#![...]` inner
    attributes bindgen 0.71 emits at the file head — these are illegal inside
    the `include!()` call site in `sys.rs`.
-4. The resolved MLX / mlx-c pair is checked against `mlx-pin.txt`, and the
-   resolved `mlx.metallib` is scanned for the fast GEMM kernels. Both warn,
-   neither fails — see "Pinned MLX / mlx-c pair" above.
+4. The MLX version being compiled against is read from `version.h` and baked
+   in as `RMLX_MLX_BUILD_VERSION`, for the runtime skew warning below.
 5. Rebuild is triggered on `MLX_C_PREFIX`, `MLX_PREFIX`, `wrapper.h`,
-   `build_support.rs`, `mlx-pin.txt`, or a *newer* resolved
-   `version.h` / `mlx.metallib` (each registered only when it exists — cargo
-   treats a missing trigger path as permanently dirty, which would re-run
-   bindgen on every build of a non-keg layout).
+   `build_support.rs`, or a *newer* resolved `version.h` / `mlx.metallib`
+   (each registered only when it exists — cargo treats a missing trigger path
+   as permanently dirty, which would re-run bindgen on every build of a
+   non-keg layout).
 
-   **Repointing the `opt` symlink does not reliably re-run these checks.** Cargo
+   **Repointing the `opt` symlink does not reliably re-run this script.** Cargo
    compares mtimes through the symlink and re-runs only for a newer one, so
-   moving to an *older* keg — the recovery direction — looks like nothing
-   changed. Use `cargo clean -p rmlx-mlx` when repointing; the runtime
-   version-skew warning below is the backstop for a binary that was never
-   rebuilt.
+   moving to an *older* keg looks like nothing changed and the bindings stay
+   stale. Use `cargo clean -p rmlx-mlx` when repointing. Nothing that has to
+   *detect* a moved symlink lives here — that is the pin gate, above.
 6. rpath entries are emitted so the binary finds both dylibs at runtime
    without `DYLD_LIBRARY_PATH`.
 
-`build.rs`'s pure logic (pin parsing, keg-version and header-version
-resolution, the metallib scan) lives in `build_support.rs`, `include!`d by both
-the build script and `tests/mlx_pin.rs`. A build script cannot be imported by
-the crate it builds, and this logic decides whether a known 3.8× perf cliff is
-reported at all — so it is covered by tests `cargo test` actually runs.
+`build.rs`'s one pure parse (`read_mlx_version`) lives in `build_support.rs`,
+`include!`d by both the build script and `tests/mlx_build_version.rs`. A build
+script cannot be imported by the crate it builds, so that is how it gets
+coverage `cargo test` actually runs.
 
 ### `sys.rs` — raw bindings
 

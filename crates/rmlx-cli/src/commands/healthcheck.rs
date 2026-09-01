@@ -171,6 +171,13 @@ pub(crate) fn run_healthcheck(
     let mem_line = check_mem();
     mem_line.emit(human);
 
+    // ── 8. The MLX this process loaded ───────────────────────────────────────
+    let pin_line = check_mlx_pin();
+    if pin_line.status == Status::Red {
+        red_checks.push(pin_line.check.clone());
+    }
+    pin_line.emit(human);
+
     // ── Aggregate ─────────────────────────────────────────────────────────────
     let agg_status = if red_checks.is_empty() {
         Status::Green
@@ -584,6 +591,44 @@ fn check_disk(dir: &Path, min_gb: u64, label: &str) -> CheckLine {
             Status::Green,
             format!("{} free_gb={free_gb}", target.display()),
         )
+    }
+}
+
+/// Is the MLX dyld resolved for this process the validated pair?
+///
+/// Reads the loaded library, not a config file or a build-time constant: the
+/// `opt` symlink both dylibs' install names point at can move after the build,
+/// and nothing in the build system can see it move backwards.
+fn check_mlx_pin() -> CheckLine {
+    let check = rmlx_mlx::pin_check();
+    CheckLine::new(
+        "mlx_pin",
+        mlx_pin_status(check.matches, check.enforcement),
+        check.detail,
+    )
+}
+
+/// Map a pin verdict onto a check status.
+///
+/// Pure, and separate from the probe, because on any one machine the probe
+/// only ever produces the cell that machine is in — asserting the mapping
+/// against a second copy of itself over that one cell is an assertion that
+/// cannot fail.
+///
+/// A mismatch is red only where the pinned kernels exist to be missed. On
+/// hardware without a Neural Accelerator they do not, so the finding is worth
+/// printing but is not a failure. On a host that could not be identified the
+/// answer is unknown either way, and an unknown that renders as a clean pass
+/// is how the host scoping becomes a way to succeed without checking — so it
+/// is red as well.
+const fn mlx_pin_status(matches: bool, enforcement: rmlx_mlx::PinEnforcement) -> Status {
+    if matches {
+        return Status::Green;
+    }
+    if enforcement.is_binding() || !enforcement.host_is_known() {
+        Status::Red
+    } else {
+        Status::Info
     }
 }
 

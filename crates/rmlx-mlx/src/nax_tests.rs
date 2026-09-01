@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use rmlx_core::apple_gpu::parse_apple_generation;
 
 use super::{
-    contains_nax_kernel, evaluate, is_na_class, loaded_libmlx_path, loaded_metallib_path,
-    metallib_to_scan, NaxFinding, LIBMLX_FILE, METALLIB_FILE, NAX_GEMM_KERNEL,
+    contains_nax_kernel, evaluate, is_na_class, loaded_library_path, loaded_metallib_path,
+    loaded_metallib_scan, loaded_nax_capability, KernelScan, NaxFinding, LIBMLX_FILE,
+    METALLIB_FILE, NAX_GEMM_KERNEL,
 };
 
 // ---------------------------------------------------------------------------
@@ -130,8 +131,12 @@ fn unidentifiable_hosts_are_not_na_class() {
 #[test]
 fn na_class_host_with_no_kernels_warns() {
     let fixture = Fixture::new("na-absent", &without_nax());
+    let scan = KernelScan::Scanned {
+        present: false,
+        metallib: fixture.path().to_path_buf(),
+    };
     for brand in ["Apple M5", "Apple M5 Max", "Apple M6 Ultra"] {
-        let finding = evaluate(parse_apple_generation(brand), Some(fixture.path()));
+        let finding = evaluate(parse_apple_generation(brand), &scan);
         assert_eq!(
             finding,
             NaxFinding::Scanned {
@@ -154,7 +159,13 @@ fn na_class_host_with_no_kernels_warns() {
 #[test]
 fn na_class_host_with_kernels_is_silent() {
     let fixture = Fixture::new("na-present", &with_nax());
-    let finding = evaluate(parse_apple_generation("Apple M5 Max"), Some(fixture.path()));
+    let finding = evaluate(
+        parse_apple_generation("Apple M5 Max"),
+        &KernelScan::Scanned {
+            present: true,
+            metallib: fixture.path().to_path_buf(),
+        },
+    );
 
     assert_eq!(
         finding,
@@ -180,8 +191,12 @@ fn na_class_host_with_kernels_is_silent() {
 #[test]
 fn pre_m5_host_with_no_kernels_is_silent() {
     let fixture = Fixture::new("pre-m5-absent", &without_nax());
+    let scan = KernelScan::Scanned {
+        present: false,
+        metallib: fixture.path().to_path_buf(),
+    };
     for brand in ["Apple M1", "Apple M2 Pro", "Apple M3 Max", "Apple M4 Pro"] {
-        let finding = evaluate(parse_apple_generation(brand), Some(fixture.path()));
+        let finding = evaluate(parse_apple_generation(brand), &scan);
         assert_eq!(
             finding.warning_target(),
             None,
@@ -190,47 +205,52 @@ fn pre_m5_host_with_no_kernels_is_silent() {
     }
 }
 
-/// A pre-M5 host does not merely ignore the metallib — it never opens it. The
-/// fixture here *does* carry the kernels, so a scan that had run would have
-/// produced `Scanned`; `NotNaClass` is the proof that the host-class gate
-/// short-circuits ahead of the file access, which is what makes the probe free
-/// on the hardware it has nothing to say about.
+/// The host class gates the report, never the observation. A pre-M5 host is
+/// `NotNaClass` even when handed a scan that says the kernels are *present* —
+/// so the verdict carries no claim about the file, and the same shared scan
+/// can still be reported truthfully in run identity.
 #[test]
-fn pre_m5_host_never_scans_the_metallib() {
+fn pre_m5_host_reports_nothing_about_a_scan_it_was_given() {
     let fixture = Fixture::new("pre-m5-present", &with_nax());
+    let scan = KernelScan::Scanned {
+        present: true,
+        metallib: fixture.path().to_path_buf(),
+    };
     for brand in ["Apple M1", "Apple M2 Pro", "Apple M3 Max", "Apple M4 Pro"] {
         assert_eq!(
-            evaluate(parse_apple_generation(brand), Some(fixture.path())),
+            evaluate(parse_apple_generation(brand), &scan),
             NaxFinding::NotNaClass,
-            "{brand} must not read the metallib at all"
+            "{brand} must make no claim about the metallib"
         );
     }
 }
 
-/// …and the gate sits ahead of the dyld image walk as well, not only ahead of
-/// the metallib open. Walking every loaded image is real work, and the module
-/// claims a pre-M5 host pays none.
+/// Every reader shares one observation.
 ///
-/// This test binary links `libmlx.dylib`, so the walk *can* find it — the
-/// precondition below states that outright. A `None` for a pre-M5 host can
-/// therefore only mean the walk never ran.
+/// Three separate dyld walks would be three readings of a symlink this module
+/// exists to distrust, and could disagree inside a single process. The cache
+/// is what makes the run-identity row, the startup warning and the pin verdict
+/// the same fact.
 #[test]
-fn pre_m5_host_never_walks_the_image_list() {
+fn the_metallib_observation_is_made_once_and_shared() {
     assert!(
         loaded_metallib_path().is_some(),
         "precondition: this binary links libmlx, so the walk must be able to name it"
     );
-    for brand in ["Apple M1", "Apple M2 Pro", "Apple M3 Max", "Apple M4 Pro"] {
-        assert_eq!(
-            metallib_to_scan(parse_apple_generation(brand)),
-            None,
-            "{brand} must not pay for the image walk either"
-        );
-    }
+    let first = loaded_metallib_scan();
+    let second = loaded_metallib_scan();
     assert!(
-        metallib_to_scan(parse_apple_generation("Apple M5 Max")).is_some(),
-        "an NA-class host must still get the path it has to scan"
+        std::ptr::eq(first, second),
+        "repeat calls must hand back the same observation, not a fresh scan"
     );
+    // The tri-state recorded in run identity is a reading of that same value,
+    // not a second detection path.
+    let expected = match first {
+        KernelScan::Scanned { present: true, .. } => "present",
+        KernelScan::Scanned { present: false, .. } => "absent",
+        KernelScan::Unverified { .. } => "unknown",
+    };
+    assert_eq!(loaded_nax_capability(), expected);
 }
 
 /// An unidentifiable chip is handled as not-NA-class end to end, not just in
@@ -240,7 +260,10 @@ fn unidentified_host_neither_scans_nor_warns() {
     let fixture = Fixture::new("unknown-host", &without_nax());
     let finding = evaluate(
         parse_apple_generation("Intel(R) Xeon(R) W-2191B"),
-        Some(fixture.path()),
+        &KernelScan::Scanned {
+            present: false,
+            metallib: fixture.path().to_path_buf(),
+        },
     );
 
     assert_eq!(finding, NaxFinding::NotNaClass);
@@ -256,7 +279,12 @@ fn na_class_host_with_unreadable_metallib_is_silent() {
         "rmlx-nax-{}-does-not-exist/{METALLIB_FILE}",
         std::process::id()
     ));
-    let finding = evaluate(parse_apple_generation("Apple M5 Max"), Some(&missing));
+    let finding = evaluate(
+        parse_apple_generation("Apple M5 Max"),
+        &KernelScan::Unverified {
+            metallib: Some(missing),
+        },
+    );
 
     assert_eq!(
         finding,
@@ -270,7 +298,10 @@ fn na_class_host_with_unreadable_metallib_is_silent() {
 /// same "cannot verify" state.
 #[test]
 fn na_class_host_with_no_metallib_path_is_silent() {
-    let finding = evaluate(parse_apple_generation("Apple M5 Max"), None);
+    let finding = evaluate(
+        parse_apple_generation("Apple M5 Max"),
+        &KernelScan::Unverified { metallib: None },
+    );
 
     assert_eq!(finding, NaxFinding::Unverified);
     assert_eq!(finding.warning_target(), None, "{finding:?}");
@@ -408,30 +439,6 @@ fn scan_reads_a_file_on_disk() {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel-family name drift
-// ---------------------------------------------------------------------------
-
-/// The kernel family is spelled twice — here for the runtime probe, and in
-/// `build_support.rs` for the build-time scan — because a build script cannot
-/// import from the crate it builds. Nothing in the compiler couples the two.
-///
-/// Renaming one copy alone leaves the runtime probe scanning for a string no
-/// metallib ever contained, so it would report a confirmed absence on every
-/// host: a permanent false warning on exactly the M5 machines this exists for,
-/// with everything still compiling and every other test still passing. Pin them.
-#[test]
-fn build_side_names_the_same_kernel_family() {
-    const BUILD_SUPPORT: &str = include_str!("../build_support.rs");
-
-    let declaration = format!("const NAX_GEMM_KERNEL: &str = \"{NAX_GEMM_KERNEL}\";");
-    assert!(
-        BUILD_SUPPORT.contains(&declaration),
-        "build_support.rs must declare `{declaration}`: the build-time scan and this \
-         runtime probe have to name one family, or their answers describe different things"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // dyld image lookup
 // ---------------------------------------------------------------------------
 
@@ -441,7 +448,8 @@ fn build_side_names_the_same_kernel_family() {
 /// the build machine's prefix is the wrong answer.
 #[test]
 fn dyld_names_the_loaded_libmlx() {
-    let path = loaded_libmlx_path().expect("libmlx.dylib is linked, so dyld must list it");
+    let path =
+        loaded_library_path(LIBMLX_FILE).expect("libmlx.dylib is linked, so dyld must list it");
 
     assert_eq!(
         path.file_name().and_then(|n| n.to_str()),
@@ -458,7 +466,7 @@ fn dyld_names_the_loaded_libmlx() {
 /// it and therefore where MLX itself will load kernels from.
 #[test]
 fn metallib_path_is_the_sibling_of_the_loaded_libmlx() {
-    let libmlx = loaded_libmlx_path().expect("libmlx.dylib is linked");
+    let libmlx = loaded_library_path(LIBMLX_FILE).expect("libmlx.dylib is linked");
     let metallib = loaded_metallib_path().expect("a located libmlx always yields a metallib path");
 
     assert_eq!(metallib.parent(), libmlx.parent());
