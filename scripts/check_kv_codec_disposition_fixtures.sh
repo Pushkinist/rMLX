@@ -103,11 +103,26 @@ build_case() {
             # symbol is still imported and the renderer still has its tests.
             edit "$dir/main.rs" '/^        print_kv_quant_residency_table();$/d'
             ;;
-        rule8_unscoped_help_constant)
-            # A seventh operator help constant appears and nobody scoped it.
-            # Rules 1, 2 and 7 would read past it in silence. Appended rather
-            # than substituted: the point is a NEW constant, not an edited one.
-            printf '\n%s\n' 'const FIXTURE_EXTRA_LONG_HELP: &str = "unscoped";' \
+        rule8_help_reference_without_a_readable_const)
+            # clap renders this argument's long help and the gate cannot read
+            # it: no `const FIXTURE_MISSING_LONG_HELP: &str` exists. A ratio or
+            # a dead codec name in that text would be invisible to rules 1, 2
+            # and 7, which read only what the derivation found.
+            printf '\n%s\n' \
+                '        #[arg(long, long_help = other::FIXTURE_MISSING_LONG_HELP)]' \
+                >>"$dir/main.rs"
+            ;;
+        rule7_ratio_in_a_constant_from_another_module)
+            # The constant lives in a second file and is referenced from the
+            # first, BY PATH -- which is the shape a cross-module reference
+            # actually takes, and the one a bare-identifier scan reads past. A
+            # gate that scans a single source file misses this outright.
+            cat >"$dir/other.rs" <<'OTHER'
+pub(crate) const FIXTURE_MODULE_LONG_HELP: &str = "\
+A help text that lives in its own module and measures 1.42x the baseline.";
+OTHER
+            printf '\n%s\n' \
+                '        #[arg(long, long_help = other::FIXTURE_MODULE_LONG_HELP)]' \
                 >>"$dir/main.rs"
             ;;
         rule7_integer_ratio)
@@ -144,7 +159,8 @@ CASES=(
     "rule7_ratio_written_into_the_help|1|RULE 7|a resident-KV ratio typed into the help is caught"
     "rule7_ratio_with_multiplication_sign|1|RULE 7|the same ratio spelled with U+00D7 is caught"
     "rule7_integer_ratio|1|RULE 7|an integer ratio with no decimal point is caught"
-    "rule8_unscoped_help_constant|1|RULE 8|a help constant outside the gate's scope list is caught"
+    "rule8_help_reference_without_a_readable_const|1|RULE 8|clap help the gate cannot read is caught"
+    "rule7_ratio_in_a_constant_from_another_module|1|RULE 7|a ratio in a help constant from a second module is caught"
     "rule9_listing_pointer_without_call_site|1|RULE 9|the help's --list-cache-types pointer with no call site is caught"
 
     "manifest_truncated|2|manifest truncated|a short manifest is an environment error, not a violation"

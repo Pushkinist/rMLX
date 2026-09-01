@@ -82,13 +82,23 @@
 #   that only checks the rendering. So whenever a scoped help constant names
 #   `--list-cache-types`, both listing functions must have a live call.
 #
-# RULE 8 (the scope list is fail-closed)
-#   Every `const *_HELP: &str` in the CLI source must be declared in this gate's
-#   `HELP_CONSTS`. Rules 1, 2 and 7 read only what is in that list, so a list
-#   that is merely hand-maintained gives them a blind spot that grows every time
-#   someone adds a flag. `CACHE_TYPE_K_LONG_HELP` and `CACHE_TYPE_V_LONG_HELP`
-#   are operator-facing KV help and were in no rule at all until this rule
-#   found them.
+# RULE 8 (every text clap shows an operator is a text this gate reads)
+#   Rules 1, 2 and 7 read a set of help constants, and the set used to be typed
+#   into this script. A hand-written scope list is the same disease those rules
+#   exist to cure: it was missing `--kv-preset` for as long as nobody remembered
+#   the flag existed, then `CACHE_TYPE_K_LONG_HELP` and `CACHE_TYPE_V_LONG_HELP`
+#   after that, and a constant defined outside `main.rs` would have been next.
+#
+#   So there is no list. The set is DERIVED from the clap attributes across the
+#   whole CLI crate: every identifier used as `help = X` or `long_help = X` is a
+#   string an operator is shown, and that is the definition of in scope. Scoped
+#   by shape, so it needs no exclusions either — a constant clap never renders
+#   is not help, and a help constant in a new module is picked up by being
+#   referenced, whichever file it lives in.
+#
+#   The rule itself is then the one thing that derivation can still get wrong:
+#   an identifier clap renders whose definition this gate cannot extract. That
+#   is a text shown to an operator and read by nothing, so it fails.
 #
 # RULE 7 (no ratio is written into the help)
 #   No resident-KV ratio may appear in any of these constants, in any spelling
@@ -126,10 +136,13 @@ SCAN_ROOT="${1:-}"
 
 if [ -n "${SCAN_ROOT}" ]; then
     CLI_MAIN="${SCAN_ROOT}/main.rs"
+    CLI_SRC="${SCAN_ROOT}"
     KV_DOC="${SCAN_ROOT}/KV_QUANT.md"
     MANIFEST_SRC="${SCAN_ROOT}/manifest.raw"
 else
     CLI_MAIN="${REPO_ROOT}/crates/rmlx-cli/src/main.rs"
+    # The whole crate, not one file: a help constant is wherever its module is.
+    CLI_SRC="${REPO_ROOT}/crates/rmlx-cli/src"
     KV_DOC="${REPO_ROOT}/docs/KV_QUANT.md"
     MANIFEST_SRC=""
 fi
@@ -207,53 +220,80 @@ actual=$(grep -c '^KVQUANT-DISPOSITION	' "${WORK}/manifest.raw")
 inert_count=$(awk -F'\t' '$6 == "INERT" { n++ } END { print n + 0 }' "${WORK}/manifest")
 
 # ── Surface 1: the CLI help constants ────────────────────────────────────────
-# Extract each named `const X: &str = "..."` body. The consts are the whole
-# `--kv-quant` / `--kv-bits` help surface: rule 6 pins that the arguments take
-# their text from them and nowhere else.
+# Every `.rs` in the CLI crate. A help constant lives wherever its module does,
+# and a gate that reads one file is a gate with a move away from a blind spot.
+find "${CLI_SRC}" -name '*.rs' -type f | sort >"${WORK}/cli_sources"
+[ -s "${WORK}/cli_sources" ] ||
+    die_env "no .rs sources under ${CLI_SRC#"${REPO_ROOT}/"}"
+
+# Extract one `const X: &str = "..."` body from wherever in the crate it is
+# defined. `pub` / `pub(crate)` and an indented definition are accepted: the
+# gate must not care which module a constant sits in.
 extract_const() {
+    # shellcheck disable=SC2046  # the source list is newline-free by construction
     awk -v name="$1" '
-        $0 ~ ("^const " name ": &str = ") { inside = 1; next }
+        $0 ~ ("^[[:space:]]*(pub(\\([a-z]+\\))?[[:space:]]+)?const " name ": &str = ") {
+            inside = 1; next
+        }
         inside { print }
         inside && /";$/ { exit }
-    ' "${CLI_MAIN}"
+    ' $(cat "${WORK}/cli_sources")
 }
 
-# The operator-facing help constants this gate reads. Declared, but NOT trusted:
-# the block below discovers every `*_HELP` constant in the CLI source and fails
-# on one that is not named here. A hand-maintained scope list is the same shape
-# of hole `--kv-preset` sat in — it was outside every rule for as long as nobody
-# remembered it existed, and nothing said so.
-HELP_CONSTS="CACHE_TYPE_K_LONG_HELP CACHE_TYPE_V_LONG_HELP KV_PRESET_LONG_HELP \
-KV_QUANT_HELP KV_QUANT_LONG_HELP KV_BITS_LONG_HELP"
+# Which file defines it, for an error message that can be acted on.
+const_home() {
+    grep -lE "^[[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?const $1: &str = " \
+        $(cat "${WORK}/cli_sources") 2>/dev/null | head -1
+}
 
-# RULE 8: scope is fail-closed.
-printf '%s\n' ${HELP_CONSTS} | sort >"${WORK}/scoped"
-grep -oE '^const [A-Z0-9_]+_HELP: &str = ' "${CLI_MAIN}" |
-    awk '{ print $2 }' | tr -d ':' | sort >"${WORK}/discovered"
-[ -s "${WORK}/discovered" ] ||
-    die_env "found no \`const *_HELP: &str\` in ${CLI_LABEL} — the declaration \
-shape stopped matching, so this gate would be reading nothing"
-comm -13 "${WORK}/scoped" "${WORK}/discovered" >"${WORK}/unscoped"
-if [ -s "${WORK}/unscoped" ]; then
-    echo "ERROR: an operator help constant is outside every rule of this gate:" >&2
+# RULE 8: the scope is derived, not declared.
+#
+# In scope = every identifier clap renders as help. That is what "operator
+# facing" means; it needs no exclusion list, because a constant clap never
+# renders is not help. A reference may be a bare identifier or a path
+# (`startup::X`, `crate::a::X`) — a constant outside the argument's own module
+# is referenced by path, and both forms put the same text in front of an
+# operator — so the last path segment is taken as the constant's name. A
+# `help = "literal"` is not collected on purpose: rule 6 already refuses one on
+# the arguments this gate is about.
+grep -rhoE '(long_)?help = (([A-Za-z_][A-Za-z0-9_]*)::)*[A-Z][A-Z0-9_]*' \
+    $(cat "${WORK}/cli_sources") |
+    awk '{ print $3 }' | sed 's/.*:://' | sort -u >"${WORK}/referenced"
+[ -s "${WORK}/referenced" ] ||
+    die_env "found no \`help = IDENT\` clap attribute under \
+${CLI_SRC#"${REPO_ROOT}/"} — the attribute shape stopped matching, so this \
+gate would be reading nothing"
+
+: >"${WORK}/unreadable"
+while IFS= read -r c; do
+    [ -n "$(const_home "$c")" ] || printf '%s\n' "$c" >>"${WORK}/unreadable"
+done <"${WORK}/referenced"
+if [ -s "${WORK}/unreadable" ]; then
+    echo "ERROR: clap renders help this gate cannot read:" >&2
     while IFS= read -r c; do
-        echo "  RULE 8  ${CLI_LABEL}  ${c} is not in HELP_CONSTS" >&2
-    done <"${WORK}/unscoped"
+        echo "  RULE 8  ${c} is used as clap help but no \`const ${c}: &str\` \
+was found in ${CLI_SRC#"${REPO_ROOT}/"}" >&2
+    done <"${WORK}/unreadable"
     echo >&2
-    echo "Add it to HELP_CONSTS. A ratio or a dead codec name written into a" >&2
-    echo "constant nobody scoped is invisible to rules 1, 2 and 7 — which is" >&2
-    echo "exactly how --kv-preset came to name five inert codecs unchallenged." >&2
-    echo "This is a violation and not an environment error: the constant is in" >&2
-    echo "the change that added it, and the author is who can scope it." >&2
+    echo "Rules 1, 2 and 7 read the constants named here and nothing else, so" >&2
+    echo "a ratio or a dead codec name in that text is invisible to all three." >&2
+    echo "Give it the \`const NAME: &str = \"...\";\` shape the extractor reads," >&2
+    echo "or the gate is scanning past a surface an operator is shown." >&2
+    echo "A violation and not an environment error: the text arrives in the" >&2
+    echo "change that added it, and its author is who can shape it." >&2
     exit 1
 fi
+
+HELP_CONSTS="$(tr '\n' ' ' <"${WORK}/referenced")"
 
 : >"${WORK}/help.txt"
 : >"${WORK}/help_inert.txt"
 for c in ${HELP_CONSTS}; do
     extract_const "$c" >"${WORK}/const.$c"
     [ -s "${WORK}/const.$c" ] ||
-        die_env "could not extract const ${c} from ${CLI_LABEL}"
+        die_env "const ${c}, defined in $(const_home "$c"), has a definition \
+this gate can find but a body it cannot read — the opening and closing shape \
+the extractor keys on stopped matching"
     cat "${WORK}/const.$c" >>"${WORK}/help.txt"
     # The INERT blocks inside this one constant: from a marker line to the next
     # blank line. Kept per constant, not pooled: a codec declared inert in the
@@ -274,7 +314,10 @@ that stopped being true, this gate's manifest would say so — check its output
 first. A block opens with a line matching: ${HELP_INERT_MARKER}"
 fi
 
-# Rule 6: every --kv-quant / --kv-bits argument reaches the shared constants.
+# Rule 6: every --kv-quant / --kv-bits / --kv-preset argument reaches the shared
+# constants. Read from main.rs, where the arguments are declared; if they move,
+# the COUNT check below finds zero of a shape and stops the gate rather than
+# passing over an empty scan.
 # Per argument, not by comparing counts: N arguments and N `help =` attributes
 # is also what one argument carrying two and another carrying none looks like.
 # The attribute block that belongs to an argument opens at its `#[` and runs to
@@ -360,8 +403,9 @@ fi
 if grep -q -- '--list-cache-types' "${WORK}/help.txt"; then
     missing_call=0
     for fn in print_cache_type_table print_kv_quant_residency_table; do
-        if ! grep -qE "^[[:space:]]*${fn}\(\);" "${CLI_MAIN}"; then
-            echo "  RULE 9  ${CLI_LABEL}  ${fn}() is never called" >&2
+        # shellcheck disable=SC2046
+        if ! grep -qE "^[[:space:]]*${fn}\(\);" $(cat "${WORK}/cli_sources"); then
+            echo "  RULE 9  ${CLI_SRC#"${REPO_ROOT}/"}  ${fn}() is never called" >&2
             missing_call=$((missing_call + 1))
         fi
     done
