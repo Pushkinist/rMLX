@@ -25,17 +25,17 @@ KV byte accounting mirrors the engine, not a re-invention:
     crates/rmlx-kv-quant/src/quant.rs  KvQuant::side_stores / SideStore /
         packed_side_bytes -- the per-side store layout and its byte cadence.
         `_PLANAR` / `_ISO` / `_ISO_RING` / `_ROTOR` / `_K_FAMILY` / `_V_FAMILY`
-        below are that split transcribed; same no-gate caveat as the store
-        predicates.
+        below are that split transcribed.
     crates/rmlx-kv-quant/src/quant.rs  KvQuant::approx_code_bits
     crates/rmlx-kv-quant/src/quant.rs  KvQuant::feeds_bf16_k_at_decode
     crates/rmlx-kv-quant/src/quant.rs  KvQuant::feeds_bf16_v_at_decode
+        -- both take the stack's `shares_kv`, which moves Mixed / RotK by two
+        whole bf16 mirrors and moves nothing else.
     crates/rmlx-kv-quant/src/quant.rs      KvQuant::decode_reads_packed_store /
         materialises_packed_store -- a codec that reads no store gets none
         built, so its resident KV is the two bf16 mirrors and nothing more.
         `_DECODE_READS_PACKED_STORE` below is that match transcribed arm for
-        arm; it is a second producer with no gate keeping it in sync, so diff
-        it against the Rust when either moves.
+        arm.
     crates/rmlx-models/src/kv_cache/mod.rs:229  kv_codec_net_saving_total
         (per-layer loop: windowed layers clamp seq to the window and are
         always bf16; global layers take the codec formula)
@@ -43,11 +43,19 @@ KV byte accounting mirrors the engine, not a re-invention:
         ("uses the RotatingKvCache code path ... regardless of the `quant`
         flag") -- an SWA layer is bf16 at `sliding_window` tokens, always.
     crates/rmlx-kv-quant/src/rotating.rs:7  ring is `[B, kv_h, max_size, D]`
-    crates/rmlx-models/src/kv_cache/mod.rs  kv_quant_for_layer
-        (first HEAD_N=2 and last TAIL_N=8 layers are forced to K8V8 for every
-        base codec that quantizes a side; `none` is exempt)
+    crates/rmlx-models/src/kv_cache/mod.rs  kv_quant_for_layer / boundary_floor
+        (first HEAD_N=2 and last TAIL_N=8 layers take an 8-bit quality floor for
+        every base codec that quantizes a side; a base whose widths are
+        parameters is raised inside its own family, one whose width is baked
+        into the variant falls back to K8V8, and a target that still mirrors
+        both axes is diverted to K8V8; `none` is exempt)
     crates/rmlx-kv-quant/src/kvcache/update.rs:7982  next_pow2_seq
         (ring capacity = min(next_pow2(needed), --max-ctx ceiling))
+
+Every one of those is a SECOND producer of arithmetic the engine already owns, so
+`make check-kv-byte-model-parity` diffs the two models per codec, per topology
+and per head dimension, over the codec sweep the engine emits. Move the engine
+and this script goes red until it follows.
 
 PREFILL_ACHIEVED_FLOPS has NO hard-coded default on purpose. A single
 "achieved GEMM throughput" constant is not defensible on this host: the
@@ -93,6 +101,13 @@ LAYER_ADAPTIVE_TAIL_N = 8
 LAYER_ADAPTIVE_HEAD_N = 2
 
 BF16 = 2  # bytes per bf16 element
+
+# Bytes one scale -- or one norm -- occupies in a GPU-resident iso/rotor ring.
+# Mirror of `SIDEBAND_BYTES` (quant.rs), which reads `KV_SIDEBAND_DTYPE`
+# (storage/quant_k_gpu_ring.rs). It is bf16, not f32: a ring modelled at 4 bytes
+# prices iso at 16.25 bits per value against the stored 12.125 and rotor at
+# 21.75 against 16.25 -- 34% over on both, and on the wrong side of bf16 for iso.
+_RING_SIDEBAND_BYTES = 2
 
 DTYPE_BYTES = {
     "BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1,
@@ -176,19 +191,40 @@ def _affine_side_bytes(bits: int, group: int, elems: int) -> int:
     return int(elems * (bits + _AFFINE_SIDEBAND_BITS / group) / 8)
 
 
-# quant.rs -- feeds_bf16_k/v_at_decode.
+# quant.rs -- feeds_bf16_k/v_at_decode, the two arms that answer a constant.
 #
-# CAUTION: this predicate is a SEED-ALLOCATION gate, not a decode-read flag. Its
-# only behavioural caller is `need_k_seed`/`need_v_seed` (kvcache/update.rs)
-# -- "must exit_prefill materialise this buffer for SOME consumer?" -- and Mixed
-# keeps the seed for the shared-KV handoff, the fused-QK shadow, SSD hydrate and
-# speculative decode while its own decode reads packed. The doc comment at
-# quant.rs states the narrow reading and this script previously acted on
-# it. Membership below is therefore necessary but NOT sufficient for reads-mirror;
-# _READS_PACKED overrides it.
+# CAUTION: this predicate is a SEED-ALLOCATION gate, not a decode-read flag --
+# "must exit_prefill materialise this buffer for SOME consumer?" Membership is
+# therefore necessary but NOT sufficient for reads-mirror; _READS_PACKED
+# overrides it.
 _NO_BF16_K = {"IsoKOnly3", "IsoKOnly4", "RotorKOnly3", "RotorKOnly4",
               "Iso3Sym", "Iso4Sym", "Rotor3Sym", "Rotor4Sym"}
 _NO_BF16_V = {"Iso3Sym", "Iso4Sym", "Rotor3Sym", "Rotor4Sym"}
+
+# The two variants whose mirror is not a codec property: their bf16 K/V pair
+# exists for a cross-layer-KV consumer and nothing else reads it, so the answer
+# is the cache's own `shares_kv` on both axes. Every other variant answers a
+# constant from the sets above.
+_MIRROR_FOLLOWS_SHARES_KV = {"Mixed", "RotK"}
+
+
+def feeds_bf16_k_at_decode(kind: str, shares_kv: bool) -> bool:
+    """Mirror of `KvQuant::feeds_bf16_k_at_decode` (quant.rs)."""
+    if kind in _NO_BF16_K:
+        return False
+    if kind in _MIRROR_FOLLOWS_SHARES_KV:
+        return shares_kv
+    return True
+
+
+def feeds_bf16_v_at_decode(kind: str, shares_kv: bool) -> bool:
+    """Mirror of `KvQuant::feeds_bf16_v_at_decode` (quant.rs)."""
+    if kind in _NO_BF16_V:
+        return False
+    if kind in _MIRROR_FOLLOWS_SHARES_KV:
+        return shares_kv
+    return True
+
 
 _ISO = {"Iso3", "Iso4", "Iso3Sym", "Iso4Sym", "IsoKOnly3", "IsoKOnly4"}
 # The iso codecs whose resident form is the GPU ring (codes/scales/norms, no
@@ -265,15 +301,20 @@ def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
         groups = elems // TURBO_GROUP_SIZE
         stored = groups * 4 * 4 + (elems // 2) * 4 + groups * 2 * 4
     elif uses_family and c.kind in _ISO:
-        # 4B code + 4B scale per quaternion group, plus one 4B norm per token.
-        # The ring-backed members stop there; a block-backed one also carries a
-        # 16B quaternion per group (see _ISO_RING).
-        per_group = (4 + 4) if c.kind in _ISO_RING else (4 + 4 + 16)
-        stored = (elems // 4) * per_group + n_tokens * 4
+        # Ring-backed: a 4B code word plus one sideband scale per quaternion
+        # group, and one sideband norm per token. Block-backed: the host `Vec`
+        # form, whose scale, norm and the 16B quaternion it replicates per group
+        # are all f32 and not the ring's dtype (`SideStore::IsoBlocks`).
+        if c.kind in _ISO_RING:
+            stored = ((elems // 4) * (4 + _RING_SIDEBAND_BYTES)
+                      + n_tokens * _RING_SIDEBAND_BYTES)
+        else:
+            stored = (elems // 4) * (4 + 4 + 16) + n_tokens * 4
     elif uses_family and c.kind in _ROTOR:
         # group size 3: per-token ceil(head_dim/3), NOT elems/3
         groups = -(-head_dim // 3) * n_tokens
-        stored = groups * (4 + 4) + n_tokens * 4
+        stored = (groups * (4 + _RING_SIDEBAND_BYTES)
+                  + n_tokens * _RING_SIDEBAND_BYTES)
     else:
         codes = elems * bits // 8
         # Sideband cadence is per-store, not a single constant, and the Rust
@@ -307,10 +348,10 @@ def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
 
 
 # quant.rs -- KvQuant::decode_reads_packed_store. Transcribed ARM FOR ARM from
-# the Rust match so the two can be diffed by eye; do not derive it from the
-# _NO_BF16_* sets, which happen to overlap it today and would silently
-# misclassify the first codec that reads its store AND keeps both mirrors --
-# precisely the case the Rust predicate exists to express.
+# the Rust match; do not derive it from the _NO_BF16_* sets, which happen to
+# overlap it today and would silently misclassify the first codec that reads its
+# store AND keeps both mirrors -- precisely the case the Rust predicate exists to
+# express.
 _DECODE_READS_PACKED_STORE = {
     # quantized-SDPA over the affine 3-tuples, appended per step
     "Mixed", "RotK",
@@ -340,13 +381,20 @@ def materialises_packed_store(kind: str) -> bool:
     per layer, silently, in a direction that flatters the codec.
     """
     return (decode_reads_packed_store(kind)
-            or kind in _NO_BF16_K
-            or kind in _NO_BF16_V)
+            or not feeds_bf16_k_at_decode(kind, False)
+            or not feeds_bf16_v_at_decode(kind, False))
 
 
 def resident_bytes_per_layer(c: Codec, seq: int, head_dim: int,
-                             kv_heads: int) -> int:
-    """Mirror of `KvQuant::estimated_resident_bytes_per_layer` (quant.rs)."""
+                             kv_heads: int, shares_kv: bool) -> int:
+    """Mirror of `KvQuant::estimated_resident_bytes_per_layer` (quant.rs).
+
+    `shares_kv` is the stack's cross-layer-KV topology, the same flag the cache
+    carries. It moves `Mixed` / `RotK` and nothing else, and it moves them by two
+    whole bf16 mirrors -- 6.50 against 22.50 bits per value at group 64. Pricing
+    them at a fixed `True` reports the one compressing family in the tree as a
+    memory regression on every dense architecture.
+    """
     elems = seq * head_dim * kv_heads
     if c.kind == "None":
         return elems * BF16 * 2
@@ -355,9 +403,11 @@ def resident_bytes_per_layer(c: Codec, seq: int, head_dim: int,
         return elems * BF16 * 2
     n_tokens = seq * kv_heads
     k = _side_bytes(c, c.k_bits, elems, n_tokens, head_dim,
-                    c.kind in _K_FAMILY, c.kind not in _NO_BF16_K, c.k_group)
+                    c.kind in _K_FAMILY,
+                    feeds_bf16_k_at_decode(c.kind, shares_kv), c.k_group)
     v = _side_bytes(c, c.v_bits, elems, n_tokens, head_dim,
-                    c.kind in _V_FAMILY, c.kind not in _NO_BF16_V, c.v_group)
+                    c.kind in _V_FAMILY,
+                    feeds_bf16_v_at_decode(c.kind, shares_kv), c.v_group)
     return k + v
 
 
@@ -399,12 +449,12 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
     if c.kind in _READS_PACKED:
         return (_affine_side_bytes(c.k_bits, c.k_group, elems)
                 + _affine_side_bytes(c.v_bits, c.v_group, elems))
-    if c.kind not in _NO_BF16_K:
+    if feeds_bf16_k_at_decode(c.kind, False):
         k = elems * BF16
     else:
         k = _side_bytes(c, c.k_bits, elems, n_tokens, head_dim,
                         c.kind in _K_FAMILY, False, c.k_group)
-    if c.kind not in _NO_BF16_V:
+    if feeds_bf16_v_at_decode(c.kind, False):
         v = elems * BF16
     else:
         v = _side_bytes(c, c.v_bits, elems, n_tokens, head_dim,
@@ -412,9 +462,53 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
     return k + v
 
 
-def kv_quant_for_layer(idx: int, n_layers: int, base: Codec) -> Codec:
+# The width the boundary promotion floors both axes to. Mirror of
+# `boundary_floor`'s FLOOR_BITS (kv_cache/mod.rs).
+_BOUNDARY_FLOOR_BITS = 8
+
+
+def boundary_floor(base: Codec, shares_kv: bool) -> Codec:
+    """Mirror of `boundary_floor` (kv_cache/mod.rs).
+
+    The promotion is a quality floor at 8 bits, not a codec switch. A base whose
+    widths are parameters carries its own 8-bit form and is raised inside its
+    family -- same store, same group geometry, same K rotation. A base whose
+    width is baked into its variant has no such form and falls back to `k8v8`.
+
+    A target that still mirrors both axes decodes at model dtype whatever its
+    store holds, so the store buys no floor and is charged on top of the
+    mirrors; `k8v8` is those same mirrors without the store. The final arm
+    diverts such a target, read off the target's own predicates rather than a
+    variant list.
+    """
+    if base.kind == "Mixed":
+        target = Codec(
+            f"mixed_k{max(base.k_bits, _BOUNDARY_FLOOR_BITS)}g{base.k_group}"
+            f"_v{max(base.v_bits, _BOUNDARY_FLOOR_BITS)}g{base.v_group}",
+            "Mixed",
+            max(base.k_bits, _BOUNDARY_FLOOR_BITS),
+            max(base.v_bits, _BOUNDARY_FLOOR_BITS),
+            base.k_group,
+            base.v_group,
+        )
+    elif base.kind == "RotK":
+        # RotK's K is fixed at 8-bit/group-64 and is already at the floor; only
+        # its V carries a width.
+        v_bits = max(base.v_bits, _BOUNDARY_FLOOR_BITS)
+        target = Codec(f"rot_k_v{v_bits}g{base.v_group}", "RotK", 8, v_bits,
+                       64, base.v_group)
+    else:
+        target = parse_codec("k8v8")
+    if (feeds_bf16_k_at_decode(target.kind, shares_kv)
+            and feeds_bf16_v_at_decode(target.kind, shares_kv)):
+        return parse_codec("k8v8")
+    return target
+
+
+def kv_quant_for_layer(idx: int, n_layers: int, base: Codec,
+                       shares_kv: bool) -> Codec:
     """Mirror of `kv_quant_for_layer` (kv_cache/mod.rs). The first HEAD_N and
-    last TAIL_N layers are forced to K8V8 for every base codec that quantizes
+    last TAIL_N layers take `boundary_floor` for every base codec that quantizes
     at least one side. A base that keeps both sides at model dtype (16 bits —
     `none`) is exempt: the promotion recovers quantization loss, and there is
     none to recover."""
@@ -422,7 +516,7 @@ def kv_quant_for_layer(idx: int, n_layers: int, base: Codec) -> Codec:
         return base
     is_tail = LAYER_ADAPTIVE_TAIL_N > 0 and idx >= n_layers - LAYER_ADAPTIVE_TAIL_N
     is_head = LAYER_ADAPTIVE_HEAD_N > 0 and idx < LAYER_ADAPTIVE_HEAD_N
-    return parse_codec("k8v8") if (is_tail or is_head) else base
+    return boundary_floor(base, shares_kv) if (is_tail or is_head) else base
 
 
 def next_pow2(n: int) -> int:
@@ -654,6 +748,13 @@ def weight_census(snapshot: Path, cfg: dict, spec_layers: list[KvLayer],
 
 # ── KV totals per context ────────────────────────────────────────────────────
 
+def stack_shares_kv(spec: ModelSpec) -> bool:
+    """The stack's cross-layer-KV topology -- the flag the arch builder hands
+    `KvCache::with_shares_kv`. True when any layer attends over another layer's
+    cache, which is what `build_layers` records as `kv_source != idx`."""
+    return any(l.kv_source != l.idx for l in spec.layers)
+
+
 def kv_at_ctx(spec: ModelSpec, base: Codec, ctx: int,
               max_ctx: int | None) -> tuple[int, int, dict]:
     """Return (decode_read_bytes_per_step, resident_bytes, detail).
@@ -663,6 +764,7 @@ def kv_at_ctx(spec: ModelSpec, base: Codec, ctx: int,
     layer per step. Resident bytes count only layers that own a cache.
     """
     ceiling = max_ctx if max_ctx else ctx
+    shares_kv = stack_shares_kv(spec)
     by_idx = {l.idx: l for l in spec.layers}
     read = 0
     resident = 0
@@ -676,7 +778,7 @@ def kv_at_ctx(spec: ModelSpec, base: Codec, ctx: int,
         # An SWA layer always runs the bf16 rotating ring regardless of the
         # codec flag (kvcache/core.rs:346).
         codec_r = parse_codec("none") if src.window else \
-            kv_quant_for_layer(src.idx, spec.n_layers, base)
+            kv_quant_for_layer(src.idx, spec.n_layers, base, shares_kv)
         read += decode_read_bytes_per_layer(codec_r, seq_r, src.head_dim, src.kv_heads)
 
     for l in spec.layers:
@@ -690,9 +792,9 @@ def kv_at_ctx(spec: ModelSpec, base: Codec, ctx: int,
         else:
             n_global += 1
             cap = min(next_pow2(ctx), ceiling)
-            codec = kv_quant_for_layer(l.idx, spec.n_layers, base)
+            codec = kv_quant_for_layer(l.idx, spec.n_layers, base, shares_kv)
         resident += resident_bytes_per_layer(codec, cap, l.head_dim,
-                                             l.kv_heads)
+                                             l.kv_heads, shares_kv)
     return read, resident, {"n_global": n_global, "n_windowed": n_windowed}
 
 
@@ -882,12 +984,50 @@ def print_table(res: dict) -> None:
               f"{r['kv_total_mb']:10.1f} {pf} {tt} {r['kv_frac']:8.3f}")
 
 
+def emit_byte_model(lines: list[str]) -> int:
+    """Re-emit a Rust byte-model manifest from this script's own arithmetic.
+
+    Input is the manifest `emit_kv_byte_model_manifest` (rmlx-models) prints:
+    the codec sweep, the shapes and the layer count all come from the Rust side,
+    so this mode adds no second list of what to cover. Output carries the same
+    key fields with this script's value in the last column, which is what
+    `scripts/check_kv_byte_model_parity.sh` diffs.
+    """
+    rows = 0
+    for raw in lines:
+        f = raw.rstrip("\n").split("\t")
+        if f[0] == "KVBYTES":
+            name, flag, seq, head_dim, kv_heads = f[1], f[2], int(f[3]), int(f[4]), int(f[5])
+            shares_kv = flag == "1"
+            got = resident_bytes_per_layer(parse_codec(name), seq, head_dim,
+                                           kv_heads, shares_kv)
+            print(f"KVBYTES\t{name}\t{flag}\t{seq}\t{head_dim}\t{kv_heads}\t{got}")
+            rows += 1
+        elif f[0] == "KVFLOOR":
+            name, flag, n_layers = f[1], f[2], int(f[3])
+            shares_kv = flag == "1"
+            base = parse_codec(name)
+            # Every layer, not a sample: LAYER_ADAPTIVE_HEAD_N and
+            # LAYER_ADAPTIVE_TAIL_N are copied by hand into this file, and only
+            # a full vector puts both of them inside the diff.
+            per_layer = ",".join(
+                kv_quant_for_layer(i, n_layers, base, shares_kv).name
+                for i in range(n_layers)
+            )
+            print(f"KVFLOOR\t{name}\t{flag}\t{n_layers}\t{per_layer}")
+            rows += 1
+    return rows
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Theoretical decode/prefill ceiling for an rMLX model x KV codec.")
-    p.add_argument("--model", required=True, help="model snapshot directory")
-    p.add_argument("--kv-quant", required=True, help=f"KvQuant name; one of: {VALID_CODECS}")
-    p.add_argument("--ctx", type=int, action="append", required=True,
+    p.add_argument("--byte-model", action="store_true",
+                   help="read a Rust byte-model manifest on stdin and re-emit it "
+                        "from this script's arithmetic; takes no model")
+    p.add_argument("--model", help="model snapshot directory")
+    p.add_argument("--kv-quant", help=f"KvQuant name; one of: {VALID_CODECS}")
+    p.add_argument("--ctx", type=int, action="append",
                    help="context length in tokens (repeatable)")
     p.add_argument("--max-ctx", type=int, default=None,
                    help="ring ceiling for the resident figure (default: --ctx)")
@@ -900,6 +1040,16 @@ def main() -> None:
     p.add_argument("--json", action="store_true")
     args = p.parse_args()
 
+    if args.byte_model:
+        rows = emit_byte_model(sys.stdin.readlines())
+        if rows == 0:
+            raise SystemExit("--byte-model read no manifest rows on stdin")
+        return
+
+    for required in ("model", "kv_quant", "ctx"):
+        if not getattr(args, required):
+            raise SystemExit(f"--{required.replace('_', '-')} is required "
+                             "unless --byte-model is passed")
     snapshot = Path(args.model).expanduser()
     if not (snapshot / "config.json").is_file():
         raise SystemExit(f"no config.json under {snapshot}")

@@ -2416,14 +2416,22 @@ Three cases, and they differ:
 The per-group figures are the store density and are unaffected by which of the
 three a cache is in.
 
-**No iso codec is a memory win, at any head_dim.** 8 B per 4 values is exactly
-bf16's density before the per-token norm is added, so the packed side is
-strictly larger than the bf16 side it replaces for every shape. These are
-research codecs for quality experiments and kernel work, not size wins. The
-sign is pinned by `iso_and_rotor_k_codecs_are_never_a_memory_win`
-(`crates/rmlx-kv-quant/src/quant_tests.rs`) and surfaced to the operator by
-the resolve-time net-negative warn, which the Gemma4, Qwen3 and Qwen3.5-MoE
-generate paths call (the remaining arches do not call it yet).
+**The iso ring is under bf16 at every head_dim; the rotor ring is over it at
+every head_dim.** A `u32` code word per 4-element group is 8 bits per value on
+its own; what decides the sign is the sideband, and the ring's scale and norm
+planes are at `KV_SIDEBAND_DTYPE` — 6 B per 4 values plus one norm per row,
+`12 + 16/head_dim` bits per value. Rotor's group is 3 rather than 4, so the same
+word costs 10.67 bits per value before any sideband and no sideband width brings
+it under the floor: a sideband change cannot fix a code cadence. Both signs are
+pinned, from real encoder bytes, by
+`every_store_family_is_at_or_below_the_bf16_floor_or_exempt` and its
+reverse-direction guard `exempt_families_actually_exceed_the_floor`
+(`crates/rmlx-kv-quant/src/kv_rate_tests.rs`), which between them refuse both a
+family that drifts over the floor and an exemption for a family that no longer
+exceeds it. The operator sees the same sign through the resolve-time
+net-negative warn, which the Gemma4, Qwen3 and Qwen3.5-MoE generate paths call
+(the remaining arches do not call it yet), and as a computed figure from `rmlx
+info --list-cache-types`.
 `estimated_resident_bytes_per_layer` models the group layout directly (never
 the codebook width) and sizes the four store-reading members from the **ring**,
 which is what a served request holds: their fused append seeds the ring from the
@@ -4156,7 +4164,10 @@ and indistinguishable today.
 `k_iso3`, `k_iso4`, `rotor3_sym`, `rotor4_sym`, `k_rotor3`, `k_rotor4`.
 
 These are the only codecs whose quantization a served request touches. **The
-iso family is now smaller than bf16; the rotor family is still larger.**
+iso family is smaller than bf16 on every architecture; the rotor family is
+larger on every architecture; `mixed` / `rot_k` are smaller on one topology and
+larger on the other, because their bf16 mirror is retained exactly where a
+consumer layer reads it.**
 
 Measured as `kv_cache_bytes` from `rmlx baseline`, both arms in one harness on
 one host, at `--max-tokens 32`. The "was" column is the same measurement taken
@@ -4174,8 +4185,22 @@ byte-for-byte across runs — so these are exact, not medians.
 | `k_rotor3` / `k_rotor4` — now | 1.022× | 1.004× | 1.009× | 1.008× |
 | `rotor3_sym` / `rotor4_sym` — was | 1.326× | 1.337× | 1.270× | 1.265× |
 | `rotor3_sym` / `rotor4_sym` — now | 1.043× | 1.009× | 1.019× | 1.015× |
-| `mixed_k8g64_v4g64` | 1.339× | 1.396× | 1.287× | 1.293× |
-| `rot_k_v8g64` | 1.541× | 1.533× | 1.384× | 1.384× |
+| `mixed_k8g64_v4g64` | 1.339× | 1.396× | withdrawn† | withdrawn† |
+| `rot_k_v8g64` | 1.541× | 1.533× | withdrawn† | withdrawn† |
+
+† The two Bonsai cells for `mixed` / `rot_k` were measured on a binary that
+built the bf16 K/V mirror on **every** architecture. `exit_prefill` now builds
+each mirror only where a decode path reads it, and `feeds_bf16_{k,v}_at_decode`
+answers the cache's own `shares_kv` for exactly these two variants — so on a
+stack whose layers do not share K/V nothing reads the mirror and it is not
+allocated. Bonsai is such a stack; gemma-4-e2b is not, which is why its two
+columns stand unchanged and are the *reason* the mirror is kept at all. The
+cells are withdrawn rather than re-typed: what these codecs now hold is
+computed per topology by `rmlx info --list-cache-types`, and the whole-stack
+figure by `mixed_layer_stack_delivered_bits_per_value`
+(`crates/rmlx-models/src/kv_cache/tests.rs`), which derives it from
+`LAYER_ADAPTIVE_HEAD_N` / `LAYER_ADAPTIVE_TAIL_N` rather than restating it. A
+re-measurement on this arch belongs in this table when one is taken.
 
 The iso / rotor rows are the ring-layout result restated on real serving. Both
 families spend one whole `u32` code word per group; iso's group is 4 head-dim
@@ -4195,23 +4220,32 @@ i.e. slot ranges overlap and the point estimate is not evidence of a
 difference. No cell regressed. The e2b `k_rotor3` cell also generated
 **identical token ids** in every one of its 12 slots.
 
-The `mixed` / `rot_k` rows still carry both bf16 seeds beside
-their store, which is a separate, unlanded elision; their decode result does
-not depend on it (returning an unread seed frees memory, it does not speed a
-quantized-matmul decode) and is measured at 0.763× of `none` at 130 848 tokens
-with the arms' ranges disjoint.
+The `mixed` / `rot_k` seed elision has landed, and it is topology-conditional
+rather than unconditional: the bf16 K/V mirror is what a cross-layer-KV
+architecture's consumer layers read, so it is retained there and elided
+everywhere else. Their **decode** result does not depend on which side of that
+they fall — returning an unread seed frees memory, it does not speed a
+quantized-matmul decode — and is measured at 0.763× of `none` at 130 848 tokens
+with the arms' ranges disjoint. That claim is asserted from the mechanism, not
+measured against a pre-elision arm; the decode cell that would settle it is
+open.
 
-**Disposition: keep. The four iso rows are now memory levers; the rest are
-not.** `k_iso3/4` and `iso3_sym/4_sym` hold 0.76–0.92× `none`'s resident KV in
-all four cells at no measured decode cost, which is the first time any codec in
-this tree has been smaller than bf16 on a served request. The rotor, `mixed` and
-`rot_k` rows remain dominated by `none` on the measured axes — strictly larger
-resident KV in all four cells, and for `mixed` also slower (0.763× at 130 848
-tokens, ranges disjoint). Those are kept anyway, and the reason is not that they
-are competitive: they are the only other codecs in the tree that decode over a
-packed store at all, so they are the substrate any fused-decode work has to
-stand on, and a dominated codec with a function is not the same object as a
-beaten one with none.
+**Disposition: keep. The four iso rows are memory levers on every
+architecture; `mixed` / `rot_k` are one on a dense architecture and the
+opposite on a shared-KV one; the rotor rows are neither.** `k_iso3/4` and
+`iso3_sym/4_sym` hold 0.76–0.92× `none`'s resident KV in all four cells at no
+measured decode cost, and they hold it unconditionally: their `feeds_bf16_*`
+arms are constants and never consult `shares_kv`. `mixed` / `rot_k` hold their
+packed store alone where nothing reads the mirror and the store *plus* two full
+bf16 buffers where something does — one codec, two answers, and the sign of
+each is pinned by `global_layer_store_plus_mirror_codec_sign_follows_shared_kv`
+(`crates/rmlx-kv-quant/src/quant_tests.rs`). The rotor rows are above `none` on
+every topology, and `mixed` is also slower at long context (0.763× at 130 848
+tokens, ranges disjoint). The dominated ones are kept anyway, and the reason is
+not that they are competitive: they are the only other codecs in the tree that
+decode over a packed store at all, so they are the substrate any fused-decode
+work has to stand on, and a dominated codec with a function is not the same
+object as a beaten one with none.
 
 Being dominated today is a statement about the ring layout and about ε (the
 byte-to-time conversion efficiency, ≈0.04–0.135 on every path measured, and
@@ -4293,10 +4327,20 @@ docs/PERF_BASELINE.md for per-cell conditions and spreads):
 
 | model | prompt tok | `kv_frac` | predicted ceiling B/A | measured decode B/A | measured resident B/A |
 |---|---:|---:|---:|---|---:|
-| Ternary-Bonsai-8B | 3 770 | 0.211 | 1.099 | 0.975 ranges disjoint | 1.287 |
-| Ternary-Bonsai-8B | 31 553 | **0.687** | **1.419** | 1.002 INCONCLUSIVE | 1.293 |
-| Qwen3.8-27B | 3 892 | 0.010 | 1.004 | 0.977 SEPARATED | 1.219 |
-| Qwen3.8-27B | 130 848 | 0.245 | 1.149 | **0.763 SEPARATED** | 1.349 |
+| Ternary-Bonsai-8B | 3 770 | 0.211 | 1.099 | 0.975 ranges disjoint | withdrawn† |
+| Ternary-Bonsai-8B | 31 553 | **0.687** | **1.419** | 1.002 INCONCLUSIVE | withdrawn† |
+| Qwen3.8-27B | 3 892 | 0.010 | 1.004 | 0.977 SEPARATED | withdrawn† |
+| Qwen3.8-27B | 130 848 | 0.245 | 1.149 | **0.763 SEPARATED** | withdrawn† |
+
+† All four are dense stacks, and arm B's resident figures were measured before
+the `Mixed` / `RotK` mirror became conditional on `shares_kv`. Every one of them
+is a measurement of two bf16 buffers this arch no longer allocates. The `kv_frac`
+and `predicted ceiling B/A` columns are arm A (`none`) and arm B respectively,
+from `scripts/perf_ceiling.py` at the measured cache offset
+(`prompt_tokens + max_tokens - 1`); arm A is unaffected, arm B's prediction was
+produced by the same pre-elision model and reads **low** — it is being
+re-derived with the corrected model, and the decode columns, which are the
+argument this table carries, are untouched by any of it.
 
 Two rows carry the argument. The Bonsai **31 553** row is the high-`kv_frac`
 end: at 0.687 — the largest any release-set model reaches *at a context this
@@ -4311,14 +4355,16 @@ per-slot ranges disjoint in the losing direction**, and +35% resident
 whole-cache — which on that hybrid arch understates the attention-KV ratio,
 1.355 excluding its codec-independent GDN state.
 
-**Scope on arm B.** It is `mixed_k8g64_v4g64` as it stands here: still
-materialising a packed store *and* retaining both bf16 seeds, because the change
-that stopped building a store for a mirror-fed codec excluded the Mixed / RotK
-family (whose decode does read its store). Its **resident** figures are
-therefore pre-seed-elision and say nothing about a seed-elided variant. Its
-**decode** figures need no such variant — returning an unread seed frees memory,
-it does not speed a quantized-matmul decode — so the throughput result stands
-for the family either way.
+**Scope on arm B.** It is `mixed_k8g64_v4g64` measured while it retained both
+bf16 seeds on every architecture. It still materialises a packed store — that
+family's decode reads it, so `materialises_packed_store()` is invariant for it —
+but the seeds are now built only where `shares_kv`, and none of these four cells
+is such an arch. Its **resident** figures are therefore pre-elision and are
+withdrawn above. Its **decode** figures need no post-elision arm — returning an
+unread seed frees memory, it does not speed a quantized-matmul decode — so the
+throughput result stands for the family either way. That last step is reasoning
+from the mechanism, not a measurement: no decode cell has been run against a
+pre-elision Mixed arm.
 
 The byte model is not what is wrong. At those offsets `perf_ceiling.py` puts
 arm A's resident KV at 4 667.3 MB against 4 667.3 MB measured on Bonsai, and on
