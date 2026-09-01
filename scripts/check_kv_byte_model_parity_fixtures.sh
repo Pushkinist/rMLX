@@ -41,16 +41,16 @@ trap 'rm -rf "${WORK}"' EXIT
 cat >"${WORK}/skeleton" <<'EOF'
 KVBYTES	iso3_sym	0	4096	128	8	0
 KVBYTES	iso3_sym	0	4096	256	2	0
-KVFLOOR	iso3_sym	0	36	x	x
+KVFLOOR	iso3_sym	0	36	-
 KVBYTES	iso3_sym	1	4096	128	8	0
 KVBYTES	iso3_sym	1	4096	256	2	0
-KVFLOOR	iso3_sym	1	36	x	x
+KVFLOOR	iso3_sym	1	36	-
 KVBYTES	mixed_k8g64_v4g64	0	4096	128	8	0
 KVBYTES	mixed_k8g64_v4g64	0	4096	256	2	0
-KVFLOOR	mixed_k8g64_v4g64	0	36	x	x
+KVFLOOR	mixed_k8g64_v4g64	0	36	-
 KVBYTES	mixed_k8g64_v4g64	1	4096	128	8	0
 KVBYTES	mixed_k8g64_v4g64	1	4096	256	2	0
-KVFLOOR	mixed_k8g64_v4g64	1	36	x	x
+KVFLOOR	mixed_k8g64_v4g64	1	36	-
 EOF
 
 python3 "${PERF_CEILING}" --byte-model <"${WORK}/skeleton" >"${WORK}/rows" ||
@@ -58,6 +58,17 @@ python3 "${PERF_CEILING}" --byte-model <"${WORK}/skeleton" >"${WORK}/rows" ||
 n_rows=$(awk 'END { print NR }' "${WORK}/rows")
 [ "${n_rows}" -eq 12 ] ||
     { echo "ERROR: skeleton produced ${n_rows} rows, expected 12" >&2; exit 2; }
+
+# A KVFLOOR row carries the whole per-layer codec vector, one entry per layer.
+# Checked here because every case below that edits a tail entry is vacuous if
+# the row is a two-index sample instead.
+short_floor=$(awk -F'\t' '$1 == "KVFLOOR" {
+        n = split($5, v, ",")
+        if (n != $4 + 0) { bad++ }
+    } END { print bad + 0 }' "${WORK}/rows")
+[ "${short_floor}" -eq 0 ] ||
+    { echo "ERROR: ${short_floor} KVFLOOR row(s) are not one entry per layer -- \
+a fixture that edits a tail entry would be testing nothing" >&2; exit 2; }
 
 wrap() { # wrap ROWS_FILE OUT_FILE [DECLARED_COUNT]
     local rows="$1" out="$2" declared="${3:-}"
@@ -102,36 +113,58 @@ awk -F'\t' 'BEGIN { OFS = "\t" }
 wrap "${WORK}/rows.wrongbyte" "${WORK}/wrongbyte.manifest"
 check "one wrong byte count" "${WORK}/wrongbyte.manifest" 1 "disagrees with the engine"
 
-# 2 — one boundary codec off: the layer vector is checked, not just the bytes.
+# 2 — the FIRST entry of one layer vector off: the vector is checked, not just
+# the bytes.
 awk -F'\t' 'BEGIN { OFS = "\t" }
-    $1 == "KVFLOOR" && $2 ~ /^mixed_/ && $3 == "0" { $5 = "k8v8" }
-    { print }' "${WORK}/rows" >"${WORK}/rows.wrongfloor"
-wrap "${WORK}/rows.wrongfloor" "${WORK}/wrongfloor.manifest"
-check "one wrong boundary codec" "${WORK}/wrongfloor.manifest" 1 "disagrees with the engine"
+    $1 == "KVFLOOR" && $2 ~ /^mixed_/ && $3 == "0" {
+        n = split($5, v, ",")
+        v[1] = "k8v8"
+        out = v[1]
+        for (i = 2; i <= n; i++) { out = out "," v[i] }
+        $5 = out
+    }
+    { print }' "${WORK}/rows" >"${WORK}/rows.wronghead"
+wrap "${WORK}/rows.wronghead" "${WORK}/wronghead.manifest"
+check "wrong head-layer codec" "${WORK}/wronghead.manifest" 1 "disagrees with the engine"
 
-# 3 — only the dense topology swept. The Mixed family's mirror is the whole
+# 3 — the LAST entry off, and nothing else. This is the case a row that sampled
+# index 0 and index n/2 could not see, which is how LAYER_ADAPTIVE_TAIL_N sat
+# outside the gate that exists to bind it.
+awk -F'\t' 'BEGIN { OFS = "\t" }
+    $1 == "KVFLOOR" && $2 ~ /^mixed_/ && $3 == "0" {
+        n = split($5, v, ",")
+        v[n] = "k8v4"
+        out = v[1]
+        for (i = 2; i <= n; i++) { out = out "," v[i] }
+        $5 = out
+    }
+    { print }' "${WORK}/rows" >"${WORK}/rows.wrongtail"
+wrap "${WORK}/rows.wrongtail" "${WORK}/wrongtail.manifest"
+check "wrong tail-layer codec" "${WORK}/wrongtail.manifest" 1 "disagrees with the engine"
+
+# 4 — only the dense topology swept. The Mixed family's mirror is the whole
 # difference between the two, so a one-sided manifest checks half the model.
 awk -F'\t' '$3 == "0"' "${WORK}/rows" >"${WORK}/rows.onetopology"
 wrap "${WORK}/rows.onetopology" "${WORK}/onetopology.manifest"
 check "single topology" "${WORK}/onetopology.manifest" 2 "topologies"
 
-# 4 — only one head dimension. A wrong sideband width and a wrong per-row term
+# 5 — only one head dimension. A wrong sideband width and a wrong per-row term
 # agree at exactly one head_dim.
 awk -F'\t' '$1 == "KVFLOOR" || $5 == "128"' "${WORK}/rows" >"${WORK}/rows.oneshape"
 wrap "${WORK}/rows.oneshape" "${WORK}/oneshape.manifest"
 check "single head_dim" "${WORK}/oneshape.manifest" 2 "shape"
 
-# 5 — the END sentinel over-counts: the manifest was truncated in transit and a
+# 6 — the END sentinel over-counts: the manifest was truncated in transit and a
 # diff over what survived would pass.
 wrap "${WORK}/rows" "${WORK}/truncated.manifest" 999
 check "truncated manifest" "${WORK}/truncated.manifest" 2 "truncated"
 
-# 6 — no BEGIN sentinel: the emitter never ran. Must not read as "no
+# 7 — no BEGIN sentinel: the emitter never ran. Must not read as "no
 # disagreements found".
 cat "${WORK}/rows" >"${WORK}/nobegin.manifest"
 check "no BEGIN sentinel" "${WORK}/nobegin.manifest" 2 "did not run"
 
-# 7 — sentinels but no rows.
+# 8 — sentinels but no rows.
 : >"${WORK}/rows.empty"
 wrap "${WORK}/rows.empty" "${WORK}/empty.manifest" 0
 check "empty manifest" "${WORK}/empty.manifest" 2 "the manifest is empty"

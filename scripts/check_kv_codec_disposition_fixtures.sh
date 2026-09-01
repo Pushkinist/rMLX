@@ -2,7 +2,7 @@
 # scripts/check_kv_codec_disposition_fixtures.sh — recall test for
 # `check_kv_codec_disposition.sh`.
 #
-# That gate has seven rules and two exit codes, and every one of them is one regex
+# That gate has nine rules and two exit codes, and every one of them is one regex
 # edit away from matching nothing and going permanently green. This repo has
 # shipped three gates that were each individually unable to fail, so a gate's
 # detection power is measured here rather than assumed.
@@ -16,7 +16,7 @@
 #   only the manifest's source differs from a production run.
 #
 # WHY THE EXPECTED MESSAGE IS CHECKED, NOT JUST THE EXIT CODE
-#   All seven rules exit 1, so a corpus that asserts only the exit code cannot
+#   All nine rules exit 1, so a corpus that asserts only the exit code cannot
 #   tell "RULE 3 fired" from "RULE 3 is dead and the fixture happened to trip
 #   RULE 1" — which is how a gate gets redder for the wrong reason and still
 #   looks like it works. The two manifest cases assert
@@ -92,6 +92,28 @@ build_case() {
         rule7_ratio_written_into_the_help)
             edit "$dir/main.rs" 's/^      fixlive\.";$/      fixlive, at 1.05x the baseline.";/'
             ;;
+        rule7_ratio_with_multiplication_sign)
+            # The spelling docs/KV_QUANT.md's own ratio tables use. A pattern
+            # keyed on `x` alone is a gate a reviewer walks past by typing this.
+            edit "$dir/main.rs" 's/^      fixlive\.";$/      fixlive, at 1.05× the baseline.";/'
+            ;;
+        rule9_listing_pointer_without_call_site)
+            # The help still tells the operator to run --list-cache-types; the
+            # listing it points at no longer prints. Nothing else notices: the
+            # symbol is still imported and the renderer still has its tests.
+            edit "$dir/main.rs" '/^        print_kv_quant_residency_table();$/d'
+            ;;
+        rule8_unscoped_help_constant)
+            # A seventh operator help constant appears and nobody scoped it.
+            # Rules 1, 2 and 7 would read past it in silence. Appended rather
+            # than substituted: the point is a NEW constant, not an edited one.
+            printf '\n%s\n' 'const FIXTURE_EXTRA_LONG_HELP: &str = "unscoped";' \
+                >>"$dir/main.rs"
+            ;;
+        rule7_integer_ratio)
+            # No decimal point. `2x bf16` is a ratio and reads as one.
+            edit "$dir/main.rs" 's/^      fixlive\.";$/      fixlive, at 2x the baseline.";/'
+            ;;
         manifest_truncated)
             # One codec line lost; the END sentinel still claims four.
             edit "$dir/manifest.raw" '/	fixlive	/d'
@@ -120,6 +142,10 @@ CASES=(
     "rule6_kv_preset_inline_help|1|RULE 6|a --kv-preset argument with its own long help is caught"
     "rule1_inert_named_only_in_preset_help|1|RULE 1  'fixinert'|the --kv-preset help is read, not just the --kv-quant one"
     "rule7_ratio_written_into_the_help|1|RULE 7|a resident-KV ratio typed into the help is caught"
+    "rule7_ratio_with_multiplication_sign|1|RULE 7|the same ratio spelled with U+00D7 is caught"
+    "rule7_integer_ratio|1|RULE 7|an integer ratio with no decimal point is caught"
+    "rule8_unscoped_help_constant|1|RULE 8|a help constant outside the gate's scope list is caught"
+    "rule9_listing_pointer_without_call_site|1|RULE 9|the help's --list-cache-types pointer with no call site is caught"
 
     "manifest_truncated|2|manifest truncated|a short manifest is an environment error, not a violation"
     "manifest_unknown_class|2|unknown disposition class|a class the gate cannot read is an environment error"

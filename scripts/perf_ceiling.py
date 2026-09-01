@@ -1007,9 +1007,14 @@ def emit_byte_model(lines: list[str]) -> int:
             name, flag, n_layers = f[1], f[2], int(f[3])
             shares_kv = flag == "1"
             base = parse_codec(name)
-            boundary = kv_quant_for_layer(0, n_layers, base, shares_kv).name
-            interior = kv_quant_for_layer(n_layers // 2, n_layers, base, shares_kv).name
-            print(f"KVFLOOR\t{name}\t{flag}\t{n_layers}\t{boundary}\t{interior}")
+            # Every layer, not a sample: LAYER_ADAPTIVE_HEAD_N and
+            # LAYER_ADAPTIVE_TAIL_N are copied by hand into this file, and only
+            # a full vector puts both of them inside the diff.
+            per_layer = ",".join(
+                kv_quant_for_layer(i, n_layers, base, shares_kv).name
+                for i in range(n_layers)
+            )
+            print(f"KVFLOOR\t{name}\t{flag}\t{n_layers}\t{per_layer}")
             rows += 1
     return rows
 

@@ -75,8 +75,29 @@
 #   and five `help =` attributes" is also what one argument carrying two of them
 #   and another carrying none looks like.
 #
+# RULE 9 (the listing the help points at is still printed)
+#   The help carries no ratio; it tells the operator to run
+#   `rmlx info --list-cache-types`. That makes the listing's call site part of
+#   the help, and a call site is deletable without breaking a build or a test
+#   that only checks the rendering. So whenever a scoped help constant names
+#   `--list-cache-types`, both listing functions must have a live call.
+#
+# RULE 8 (the scope list is fail-closed)
+#   Every `const *_HELP: &str` in the CLI source must be declared in this gate's
+#   `HELP_CONSTS`. Rules 1, 2 and 7 read only what is in that list, so a list
+#   that is merely hand-maintained gives them a blind spot that grows every time
+#   someone adds a flag. `CACHE_TYPE_K_LONG_HELP` and `CACHE_TYPE_V_LONG_HELP`
+#   are operator-facing KV help and were in no rule at all until this rule
+#   found them.
+#
 # RULE 7 (no ratio is written into the help)
-#   No `N.NNx`-shaped resident-KV ratio may appear in any of these constants.
+#   No resident-KV ratio may appear in any of these constants, in any spelling
+#   this tree uses: `0.44x`, `1.406x`, `2x`, and the same three with the Unicode
+#   multiplication sign `×`, which is what docs/KV_QUANT.md's own ratio
+#   tables are written with. Keyed on the SHAPE of such a figure, not on a list
+#   of the ones that were there -- a corrected number is the same defect as a
+#   stale one, and a pattern that matches one spelling is a gate that a reviewer
+#   can walk past by typing the other.
 #   Such a figure has one producer — `KvQuant::estimated_resident_bytes_per_layer`,
 #   which `rmlx info --list-cache-types` prints — and a second copy of it in a
 #   string literal is correct only by hand. The four that used to sit here were
@@ -197,7 +218,35 @@ extract_const() {
     ' "${CLI_MAIN}"
 }
 
-HELP_CONSTS="KV_QUANT_HELP KV_QUANT_LONG_HELP KV_BITS_LONG_HELP KV_PRESET_LONG_HELP"
+# The operator-facing help constants this gate reads. Declared, but NOT trusted:
+# the block below discovers every `*_HELP` constant in the CLI source and fails
+# on one that is not named here. A hand-maintained scope list is the same shape
+# of hole `--kv-preset` sat in — it was outside every rule for as long as nobody
+# remembered it existed, and nothing said so.
+HELP_CONSTS="CACHE_TYPE_K_LONG_HELP CACHE_TYPE_V_LONG_HELP KV_PRESET_LONG_HELP \
+KV_QUANT_HELP KV_QUANT_LONG_HELP KV_BITS_LONG_HELP"
+
+# RULE 8: scope is fail-closed.
+printf '%s\n' ${HELP_CONSTS} | sort >"${WORK}/scoped"
+grep -oE '^const [A-Z0-9_]+_HELP: &str = ' "${CLI_MAIN}" |
+    awk '{ print $2 }' | tr -d ':' | sort >"${WORK}/discovered"
+[ -s "${WORK}/discovered" ] ||
+    die_env "found no \`const *_HELP: &str\` in ${CLI_LABEL} — the declaration \
+shape stopped matching, so this gate would be reading nothing"
+comm -13 "${WORK}/scoped" "${WORK}/discovered" >"${WORK}/unscoped"
+if [ -s "${WORK}/unscoped" ]; then
+    echo "ERROR: an operator help constant is outside every rule of this gate:" >&2
+    while IFS= read -r c; do
+        echo "  RULE 8  ${CLI_LABEL}  ${c} is not in HELP_CONSTS" >&2
+    done <"${WORK}/unscoped"
+    echo >&2
+    echo "Add it to HELP_CONSTS. A ratio or a dead codec name written into a" >&2
+    echo "constant nobody scoped is invisible to rules 1, 2 and 7 — which is" >&2
+    echo "exactly how --kv-preset came to name five inert codecs unchallenged." >&2
+    echo "This is a violation and not an environment error: the constant is in" >&2
+    echo "the change that added it, and the author is who can scope it." >&2
+    exit 1
+fi
 
 : >"${WORK}/help.txt"
 : >"${WORK}/help_inert.txt"
@@ -281,10 +330,15 @@ fi
 # A ratio in these constants is a hand-maintained copy of
 # `KvQuant::estimated_resident_bytes_per_layer`, and the copy is what goes
 # stale. `rmlx info --list-cache-types` prints the computed figure; the help
-# points at it. The pattern is deliberately the *shape* of such a figure
-# (`0.44x`, `1.406x`), not a list of the ones that were there — a corrected
-# number is the same defect as a stale one.
-grep -nE '[0-9]+\.[0-9]+x' "${WORK}/help.txt" >"${WORK}/ratios" || true
+# points at it.
+#
+# The pattern is the *shape* of such a figure, across every spelling in the
+# tree: an integer or decimal followed by `x`, `X` or the Unicode multiplication
+# sign, on a digit boundary so a version or a group size is not a ratio.
+# `RATIO_SHAPE` is one definition shared with the reason string, so the rule and
+# the message it prints cannot describe different patterns.
+RATIO_SHAPE='(^|[^0-9.])[0-9]+(\.[0-9]+)?(x|X|×)([^A-Za-z0-9_]|$)'
+grep -nE "${RATIO_SHAPE}" "${WORK}/help.txt" >"${WORK}/ratios" || true
 if [ -s "${WORK}/ratios" ]; then
     echo "ERROR: the --kv-quant/--kv-bits/--kv-preset help writes a resident-KV \
 ratio:" >&2
@@ -295,7 +349,31 @@ ratio:" >&2
     echo "That figure has one producer. Quote none and point the operator at" >&2
     echo "\`rmlx info --list-cache-types\`, which computes it per codec and per" >&2
     echo "topology from the same byte model the engine allocates against." >&2
+    echo "Shape matched: ${RATIO_SHAPE}" >&2
     exit 1
+fi
+
+# ── Rule 9: the pointer the help hands the operator still resolves ──────────
+# `grep -qE '^[[:space:]]*fn\(\);'` matches a statement, not the `use` that
+# imports the name and not the `fn` that defines it — so removing the call is
+# caught even though the symbol is still in the file.
+if grep -q -- '--list-cache-types' "${WORK}/help.txt"; then
+    missing_call=0
+    for fn in print_cache_type_table print_kv_quant_residency_table; do
+        if ! grep -qE "^[[:space:]]*${fn}\(\);" "${CLI_MAIN}"; then
+            echo "  RULE 9  ${CLI_LABEL}  ${fn}() is never called" >&2
+            missing_call=$((missing_call + 1))
+        fi
+    done
+    if [ "${missing_call}" -gt 0 ]; then
+        echo >&2
+        echo "ERROR: the help sends the operator to \`rmlx info --list-cache-types\`" >&2
+        echo "for a figure it deliberately does not quote, and ${missing_call} of the" >&2
+        echo "listings that command prints has no call site. The pointer is the only" >&2
+        echo "place those numbers are published; a dangling one is worse than the" >&2
+        echo "stale literals it replaced." >&2
+        exit 1
+    fi
 fi
 
 # ── Surface 2: the docs banners ──────────────────────────────────────────────

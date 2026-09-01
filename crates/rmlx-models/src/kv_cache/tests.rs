@@ -2237,18 +2237,24 @@ mod tests {
                     println!("KVBYTES\t{q}\t{flag}\t{seq}\t{head_dim}\t{kv_heads}\t{bytes}");
                     rows += 1;
                 }
-                let vector = kv_layer_quants(BYTE_MODEL_LAYERS, q, shares_kv);
-                let boundary = vector.first().map(ToString::to_string).unwrap_or_default();
-                let interior = vector
-                    .get(BYTE_MODEL_LAYERS / 2)
+                // The WHOLE vector, one entry per layer, not a sample of it.
+                // `LAYER_ADAPTIVE_HEAD_N` and `LAYER_ADAPTIVE_TAIL_N` are the
+                // two constants the second byte model copies by hand, and a row
+                // that reads only index 0 and index n/2 cannot see either of
+                // them move: index 0 is head under any positive head count and
+                // index n/2 is interior under any tail count below it.
+                let vector: Vec<String> = kv_layer_quants(BYTE_MODEL_LAYERS, q, shares_kv)
+                    .iter()
                     .map(ToString::to_string)
-                    .unwrap_or_default();
-                assert!(
-                    !boundary.is_empty() && !interior.is_empty(),
-                    "the layer vector is shorter than the layer count it was built for"
+                    .collect();
+                assert_eq!(
+                    vector.len(),
+                    BYTE_MODEL_LAYERS,
+                    "the layer vector is not the length it was built for"
                 );
                 let layers = BYTE_MODEL_LAYERS;
-                println!("KVFLOOR\t{q}\t{flag}\t{layers}\t{boundary}\t{interior}");
+                let per_layer = vector.join(",");
+                println!("KVFLOOR\t{q}\t{flag}\t{layers}\t{per_layer}");
                 rows += 1;
             }
         }
