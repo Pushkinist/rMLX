@@ -60,6 +60,11 @@ mod kv_rate_tests;
 #[cfg(test)]
 mod mxfp8_fidelity_tests;
 
+/// What a rotation would be worth to the TurboQuant family, which applies none:
+/// the same codec with and without a full-`head_dim` Walsh-Hadamard.
+#[cfg(test)]
+mod turbo_rotation_fidelity_tests;
+
 pub(crate) mod bytes;
 pub mod clifford;
 pub(crate) mod flash_decode_common;
