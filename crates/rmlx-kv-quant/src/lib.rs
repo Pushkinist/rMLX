@@ -55,6 +55,11 @@ mod rate_distortion_tests;
 #[cfg(test)]
 mod kv_rate_tests;
 
+/// Fidelity of MLX's `mxfp8` KV encoding against MLX affine 8-bit at the same
+/// bits/value.
+#[cfg(test)]
+mod mxfp8_fidelity_tests;
+
 pub(crate) mod bytes;
 pub mod clifford;
 pub(crate) mod flash_decode_common;
