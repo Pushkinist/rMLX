@@ -156,11 +156,14 @@ const LOG_UNIFORM_DECADES: [f32; 2] = [3.0, 6.0];
 const SEEDS: [u64; 3] = [TEST_SEED, TEST_SEED ^ 0x5DEE_CE66, TEST_SEED ^ 0x0BAD_C0DE];
 
 /// Cells the sweep must visit: two head dims x three seeds x (uniform +
-/// gaussian + 4 densities x 3 ratios + 2 decade spans).
+/// gaussian + 4 densities x 3 ratios + 2 decade spans) = 96.
 ///
-/// Pinned so that emptying an axis fails loudly rather than passing an
-/// assertion vacuously on an accumulator that never moved.
-const EXPECTED_CELLS: usize = 2 * 3 * (1 + 1 + OUTLIER_DENSITIES.len() * OUTLIER_RATIOS.len() + 2);
+/// A **literal**, deliberately not `OUTLIER_DENSITIES.len() * ...`. Derived
+/// from the axes it would move with them, so shrinking an axis would still
+/// match and every assertion below would pass on a sweep that no longer covers
+/// what the module documents. Update it by hand when an axis changes, which is
+/// the point.
+const EXPECTED_CELLS: usize = 96;
 
 // ── Metrics ──────────────────────────────────────────────────────────────────
 
