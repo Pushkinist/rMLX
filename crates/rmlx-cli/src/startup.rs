@@ -322,3 +322,146 @@ pub(crate) fn print_cache_type_table() {
     println!("      For which pairings actually build a store see docs/KV_QUANT.md");
     println!("      \"Codec disposition\".");
 }
+
+// ---------------------------------------------------------------------------
+// print_kv_quant_residency_table
+// ---------------------------------------------------------------------------
+
+/// Head dimension the `--kv-quant` residency listing is computed at.
+///
+/// The iso and rotor rings carry a per-row sideband term (`16 / head_dim` at a
+/// bf16 sideband), so their rate — and only theirs — moves with this. Every
+/// other cadence is per-value and this figure is head-dim-invariant.
+const RESIDENCY_HEAD_DIM: u64 = 128;
+
+/// KV heads and token count the listing is computed at. The ratio is invariant
+/// in both: every term in the byte model is linear in `seq * kv_heads`.
+const RESIDENCY_KV_HEADS: u64 = 8;
+const RESIDENCY_SEQ: u64 = 4096;
+
+/// Marker that opens the residency listing. The disposition gate binds the
+/// help's `rmlx info --list-cache-types` pointer to a live call site; this is
+/// what a test asserts the rendered listing starts with.
+const RESIDENCY_TABLE_HEADING: &str =
+    "--kv-quant codecs — resident KV one GLOBAL (full-attention) layer holds,";
+
+/// Render what each `--kv-quant` codec holds on a global layer, computed.
+///
+/// This is the **one** place a resident-KV ratio is published to an operator.
+/// Every figure comes out of
+/// [`rmlx_kv_quant::KvQuant::estimated_resident_bytes_per_layer`], the same
+/// producer the resolve-time net-benefit warning and the crate's byte-model
+/// gates read, so narrowing a store, dropping a mirror or adding a codec moves
+/// this listing without anyone editing it. `--kv-quant`'s help quotes no ratio
+/// and points here instead; `make check-kv-codec-disposition` keeps it that way
+/// and binds the pointer to [`print_kv_quant_residency_table`]'s call site.
+///
+/// Both topologies are rendered because `shares_kv` is not a codec property. The
+/// `mixed_*` / `rot_k_*` bf16 K/V mirror is what a cross-layer-KV architecture's
+/// consumer layers read, so it is retained there and elided everywhere else —
+/// the same codec is well under bf16 on one stack and well over it on the
+/// other, and a single column could only be right about one of them.
+///
+/// Separate from the printing so `startup_tests.rs` can hold the rendered text
+/// to the type: a listing checked only by eye is a listing that can quietly
+/// stop covering a codec.
+pub(crate) fn kv_quant_residency_table() -> String {
+    use std::fmt::Write as _;
+
+    use rmlx_kv_quant::ALL_KV_QUANTS;
+
+    let bf16 = rmlx_kv_quant::KvQuant::None.estimated_resident_bytes_per_layer(
+        RESIDENCY_SEQ,
+        RESIDENCY_HEAD_DIM,
+        RESIDENCY_KV_HEADS,
+        false,
+    );
+    // Two axes (K and V) per stored position.
+    let values = RESIDENCY_SEQ * RESIDENCY_HEAD_DIM * RESIDENCY_KV_HEADS * 2;
+
+    let mut out = String::new();
+    // Every `write!` into a `String` is infallible; the `Result` is discarded
+    // once here rather than at each call site.
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{RESIDENCY_TABLE_HEADING}");
+    let _ = writeln!(
+        out,
+        "computed at head_dim {RESIDENCY_HEAD_DIM} from the engine's own byte model. A windowed"
+    );
+    let _ = writeln!(
+        out,
+        "(SWA) layer runs the bf16 rotating ring whatever codec is set, so a"
+    );
+    let _ = writeln!(
+        out,
+        "whole-model figure on such an arch is this diluted toward 1.00x."
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{:<26} {:^19}  {:^19}  disposition",
+        "codec", "dense arch", "shared-KV arch"
+    );
+    let _ = writeln!(
+        out,
+        "{:<26} {:^19}  {:^19}  -----------",
+        "-----", "bits/value  x bf16", "bits/value  x bf16"
+    );
+    for &q in ALL_KV_QUANTS {
+        let cell = |shares_kv: bool| {
+            let bytes = q.estimated_resident_bytes_per_layer(
+                RESIDENCY_SEQ,
+                RESIDENCY_HEAD_DIM,
+                RESIDENCY_KV_HEADS,
+                shares_kv,
+            );
+            let bits_per_value = (bytes * 8) as f64 / values as f64;
+            let ratio = bytes as f64 / bf16 as f64;
+            format!("{bits_per_value:10.3}  {ratio:5.3}x")
+        };
+        let disposition = if q == rmlx_kv_quant::KvQuant::None {
+            "unquantised reference"
+        } else if q.materialises_packed_store() {
+            "runs its codec"
+        } else {
+            "INERT — no store built"
+        };
+        let _ = writeln!(
+            out,
+            "{:<26} {:>19}  {:>19}  {}",
+            q.to_string(),
+            cell(false),
+            cell(true),
+            disposition
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "A parametric name (mixed_*, rot_k_v*, rotor_k_*_asym_*) is listed at one"
+    );
+    let _ = writeln!(
+        out,
+        "representative width; pass your own and the arithmetic follows it."
+    );
+    let _ = writeln!(
+        out,
+        "An INERT codec decodes from the bf16 mirror on both axes, so its packed"
+    );
+    let _ = writeln!(
+        out,
+        "store is never built and it holds exactly what bf16 holds."
+    );
+    out
+}
+
+/// Print [`kv_quant_residency_table`] to stdout. Triggered by
+/// `rmlx info --list-cache-types`, which is where the `--kv-quant` help sends
+/// an operator who wants a resident-KV figure.
+pub(crate) fn print_kv_quant_residency_table() {
+    print!("{}", kv_quant_residency_table());
+}
+
+#[cfg(test)]
+#[path = "startup_tests.rs"]
+mod startup_tests;

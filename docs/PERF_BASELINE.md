@@ -108,7 +108,7 @@ harder, so they were even lower.
 
 | model | git_sha | kv_quant_resolved | decode_tps | combined_tps_old | ratio_vs_ceiling | date |
 |---|---|---|---:|---:|---:|---|
-| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 877da73 | mixed_k8g64_v4g64 | 115.21 | 38.20 | 2.15x (vs 248.2) | 2026-05-21 |
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 877da73 | mixed_k8g64_v4g64 | 115.21 | 38.20 | 2.23x (vs 256.3) | 2026-05-21 |
 | mlx-community__gemma-4-e4b-it-mxfp8 | 877da73 | k8v8 | 72.92 | 47.31 | 1.69x (vs 123.5) | 2026-05-21 |
 | mlx-community__gemma-4-26b-a4b-it-mxfp8 | 877da73 | k8v8 | 72.19 | 9.57 | 2.00x (vs 144.4) | 2026-05-21 |
 | mlx-community__Qwen3.6-35B-A3B-8bit | 877da73 | k8v8 | 94.96 | 12.59 | 2.01x (vs 191.1) | 2026-05-21 |
@@ -131,10 +131,10 @@ is excluded:
   max-tokens 100 was 9.57; decode-only is ~7.5x higher than that combined
   value. Ratio vs ceiling collapses from ~50x to **2.00x**.
 - **Qwen3.6 35B MoE**: 4.46 → **94.96** decode_tps. Ratio ~40x → **2.01x**.
-- **Bonsai 8B 2bit**: 15.88 → **115.21**. Ratio ~19x → **2.15x**.
+- **Bonsai 8B 2bit**: 15.88 → **115.21**. Ratio ~19x → **2.23x**.
 - **Gemma4-e4b dense**: 27.50 → **72.92**. Ratio ~5.6x → **1.69x**.
 
-All four now sit in the **1.7x–2.2x** band. The dramatic "MoE is 40-50x slow"
+All four now sit in the **1.7x–2.3x** band. The dramatic "MoE is 40-50x slow"
 signal was a **bench-harness measurement artifact** (prefill in the TPS
 denominator), not an inference-path defect.
 
@@ -1469,12 +1469,12 @@ decode-only TPS (decode-only re-baseline, `release`, n=3 median):
 
 | Model (KV codec) | weights GB/step | KV GB/step | total GB/step | ceiling @614 GB/s | measured decode_tps | ratio vs ceiling | KV share |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Bonsai 8B 2bit (`mixed_k8g64_v4g64`) | 2.129 | 0.345 | **2.474** | **248.2** | 115.21 | **2.15x** | 13.9% |
+| Bonsai 8B 2bit (`mixed_k8g64_v4g64`) | 2.129 | 0.266 | **2.395** | **256.3** | 115.21 | **2.23x** | 11.1% |
 | Gemma4-e4b mxfp8 dense (`k8v8`) | 4.817 | 0.154 | **4.971** | **123.5** | 72.92 | **1.69x** | 3.1% |
 | Gemma4-26b MoE (`k8v8`) | 3.960 | 0.294 | **4.253** | **144.4** | 72.19 | **2.00x** | 6.9% |
 | Qwen3.6-35B-A3B MoE (`k8v8`) | 3.130 | 0.084 | **3.214** | **191.1** | 94.96 | **2.01x** | 2.6% |
 
-All four sit in a **1.7x–2.2x** band. **ACCEPT** — decode is bandwidth-bound.
+All four sit in a **1.7x–2.3x** band. **ACCEPT** — decode is bandwidth-bound.
 This is the headline answer to the question "why is decode so low?": it was
 *not* low in the sense first suspected — the matrix numbers were
 prefill-contaminated (see the decode-only re-baseline section). The residual
@@ -1505,34 +1505,35 @@ scripts/perf_ceiling.py --model "$RMLX_O_MODELS_ROOT/<snapshot>" \
 `--no-db` keeps the row independent of `runs.db` — it only suppresses the
 prefill anchor, which this table does not use.
 
-The KV column is what a step **streams**, not what the cache holds, and for
-`mixed_k8g64_v4g64` those differ: that codec decodes over its packed store
-while still keeping both bf16 seeds resident, so its 0.345 GB/step sits well
-below the `kv_cache_bytes` the same run reports. A bandwidth ceiling wants the
-streamed figure; a memory question wants the resident one. Do not read one as
-the other.
+The KV column is what a step **streams**, not what the cache holds. For
+`mixed_k8g64_v4g64` the two differ, and by how much depends on the
+architecture: the codec decodes over its packed store on both, and keeps the
+bf16 K/V mirror beside it only where the model's layers share K/V — Bonsai's do
+not. A bandwidth ceiling wants the streamed figure; a memory question wants the
+resident one. Do not read one as the other.
 
 The correction is not a constant bias, so it does not cancel out of the ratio:
 three ceilings fall and Qwen3.6-35B's **rises** 9%, because 30 of its 40 layers
 are GDN and hold no attention projections, so its active weight footprint was
 overstated at `~3.5 GB` (census: 3.130 GB). The band tightens from
-1.84x–2.66x to 1.69x–2.15x, and with it the reading that Bonsai is a
+1.84x–2.66x to 1.69x–2.23x, and with it the reading that Bonsai is a
 factor-of-1.4 outlier with arch-specific decode overhead worth hunting: most of
-its apparent excess was the missing KV term, 13.9% of its stream at this shape
+its apparent excess was the missing KV term, 11.1% of its stream at this shape
 against under 7% for the other three.
 
-**The KV term is a second producer, and nothing gates it against the first.**
+**The KV term is a second producer, and it is gated against the first.**
 It is *not* read from the engine — `scripts/perf_ceiling.py` transcribes the
 Rust predicates into Python by hand:
 `KvQuant::decode_reads_packed_store`, `KvQuant::feeds_bf16_{k,v}_at_decode` and
-the per-layer promotion in `kv_quant_for_layer`, mirrored as
-`_DECODE_READS_PACKED_STORE`, `_NO_BF16_{K,V}` and `kv_quant_for_layer` in the
-script. The script says so itself and names the failure mode: when a codec is
-added or reclassified, both copies move together or this column is off "by a
-full store per layer, silently, in a direction that flatters the codec". That
-is the same shape as the cache-seed formula that drifted once a consumer crate
-could not depend on it. Diff the two whenever either moves; a divergence is
-invisible here and changes the ceiling, not just a caveat on it.
+the per-layer promotion in `kv_quant_for_layer` / `boundary_floor`. It drifted
+from all three at once, which is how the Bonsai row above first read 0.345
+GB/step: the script priced that codec's boundary layers as `k8v8` after the
+engine started raising them inside their own family, and modelled the ring
+sideband at 4 bytes after the store narrowed to 2. `make
+check-kv-byte-model-parity` now diffs the two models per codec, per topology and
+per head dimension over the codec sweep the engine emits, so neither can move
+without the other going red. The column still inherits any error in the Rust it
+mirrors; it can no longer inherit an error the Rust does not have.
 
 Three further caveats. It counts bytes a decode step **must** stream, not bytes
 moved — cache residency, dequant scratch, MoE gather inefficiency and the gap
@@ -1577,7 +1578,7 @@ The reproducible band is **1.26x–1.30x**.
 
 ##### Ratio-vs-ceiling is not comparable across models of different size
 
-It is tempting to set 1.26x–1.30x against rMLX's 1.7x–2.2x and conclude
+It is tempting to set 1.26x–1.30x against rMLX's 1.7x–2.3x and conclude
 llama.cpp is the more efficient runtime. **That inference is invalid**, and the
 reason generalises well beyond this page.
 
@@ -1589,8 +1590,8 @@ ratio = measured_ms / ideal_ms = 1 + fixed_overhead_ms / ideal_ms
 
 so *the same* fixed per-step cost produces a large ratio on a small model and a
 small ratio on a large one. The two tables are not close in scale: llama.cpp's
-cells move **9.3–13.4 GB/step**, rMLX's H2 rows **2.5–5.0 GB/step** — 1.9x to
-5.4x apart. That difference alone moves the ratio in exactly the observed
+cells move **9.3–13.4 GB/step**, rMLX's H2 rows **2.4–5.0 GB/step** — 1.9x to
+5.6x apart. That difference alone moves the ratio in exactly the observed
 direction, before any question of runtime quality.
 
 The scale-free quantity is the **absolute per-step overhead**,
@@ -1601,7 +1602,7 @@ The scale-free quantity is the **absolute per-step overhead**,
 | llama.cpp | Qwen3-8B-Q8_0 @3 753 | 9.26 GB | 15.09 | 19.21 | **4.12** | 1.27x |
 | llama.cpp | Qwen3-8B-Q8_0 @7 722 | 9.85 GB | 16.04 | 18.22 / 20.30 | **2.18 / 4.26** | 1.14x / 1.26x |
 | llama.cpp | Qwen3-8B-Q8_0 @31 536 | 13.36 GB | 21.76 | 28.37 | **6.61** | 1.30x |
-| rMLX | Bonsai 8B 2bit | 2.474 GB | 4.03 | 8.68 | **4.65** | 2.15x |
+| rMLX | Bonsai 8B 2bit | 2.395 GB | 3.90 | 8.68 | **4.78** | 2.23x |
 | rMLX | Qwen3.6-35B-A3B MoE | 3.214 GB | 5.23 | 10.53 | **5.30** | 2.01x |
 | rMLX | Gemma4-e4b mxfp8 | 4.971 GB | 8.10 | 13.71 | **5.62** | 1.69x |
 | rMLX | Gemma4-26b MoE | 4.253 GB | 6.93 | 13.85 | **6.93** | 2.00x |
@@ -1609,7 +1610,7 @@ The scale-free quantity is the **absolute per-step overhead**,
 The rMLX `bytes/step` column is the H2 census, so the overhead figures moved
 when the denominator did; llama.cpp's are unchanged.
 
-llama.cpp 2.18–6.61 ms against rMLX 4.65–6.93 ms. **The ranges overlap**, so by
+llama.cpp 2.18–6.61 ms against rMLX 4.78–6.93 ms. **The ranges overlap**, so by
 the same rule this repo applies to its own A/B arms the comparison is
 **INCONCLUSIVE**: the medians differ (~4.2 ms vs ~5.5 ms) but no separation is
 demonstrated at n=3 vs n=4, across two frameworks, two weight formats and two

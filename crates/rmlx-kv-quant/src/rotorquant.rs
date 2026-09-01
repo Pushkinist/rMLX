@@ -102,9 +102,10 @@
 //!
 //! rotor4 fills all 32 code bits instead of 24 and therefore occupies
 //! *byte-identical* storage. No rotor codec is smaller than bf16 at any
-//! `head_dim`; see `docs/KV_QUANT.md` § "Memory truth", the
-//! `iso_and_rotor_k_codecs_are_never_a_memory_win` guard, and the crate-wide
-//! stored-rate ceiling in `kv_rate_tests.rs`.
+//! `head_dim`; see `docs/KV_QUANT.md` § "Memory truth" and the crate-wide
+//! stored-rate ceiling in `kv_rate_tests.rs`, where this family's overrun is a
+//! written exemption that `exempt_families_actually_exceed_the_floor` will
+//! reject the day it stops being one.
 //!
 //! # No QJL residual
 //!

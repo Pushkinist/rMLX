@@ -43,9 +43,12 @@
 #   list. Nothing here is hand-written per codec.
 #
 # RULE 1 (CLI help, coverage)
-#   Every inert codec named anywhere in the `--kv-quant` / `--kv-bits` help
-#   text must also appear inside an INERT block in that text. A name that is
-#   only listed beside the live codecs is a name the help says works.
+#   Every inert codec named anywhere in the `--kv-quant` / `--kv-bits` /
+#   `--kv-preset` help text must also appear inside an INERT block in that text.
+#   A name that is only listed beside the live codecs is a name the help says
+#   works. `--kv-preset` is in scope because a preset is a codec under another
+#   name: five of its seven targets are inert, and while the block sat outside
+#   this list it said so nowhere.
 #
 # RULE 2 (CLI help, converse)
 #   Nothing inside an INERT block may be a codec that is NOT inert. A block
@@ -66,11 +69,52 @@
 #   head of the section it qualifies, not buried in one.
 #
 # RULE 6 (the help is actually reached)
-#   Every `--kv-quant` and every `--kv-bits` argument in the CLI must take its
-#   help from the shared constants. Copies drift; one that is checked does not.
-#   Checked per argument, not by comparing two counts: "five arguments and five
-#   `help =` attributes" is also what one argument carrying two of them and
-#   another carrying none looks like.
+#   Every `--kv-quant`, `--kv-bits` and `--kv-preset` argument in the CLI must
+#   take its help from the shared constants. Copies drift; one that is checked
+#   does not. Checked per argument, not by comparing two counts: "five arguments
+#   and five `help =` attributes" is also what one argument carrying two of them
+#   and another carrying none looks like.
+#
+# RULE 9 (the listing the help points at is still printed)
+#   The help carries no ratio; it tells the operator to run
+#   `rmlx info --list-cache-types`. That makes the listing's call site part of
+#   the help, and a call site is deletable without breaking a build or a test
+#   that only checks the rendering. So whenever a scoped help constant names
+#   `--list-cache-types`, both listing functions must have a live call.
+#
+# RULE 8 (every text clap shows an operator is a text this gate reads)
+#   Rules 1, 2 and 7 read a set of help constants, and the set used to be typed
+#   into this script. A hand-written scope list is the same disease those rules
+#   exist to cure: it was missing `--kv-preset` for as long as nobody remembered
+#   the flag existed, then `CACHE_TYPE_K_LONG_HELP` and `CACHE_TYPE_V_LONG_HELP`
+#   after that, and a constant defined outside `main.rs` would have been next.
+#
+#   So there is no list. The set is DERIVED from the clap attributes across the
+#   whole CLI crate: every identifier used as `help = X` or `long_help = X` is a
+#   string an operator is shown, and that is the definition of in scope. Scoped
+#   by shape, so it needs no exclusions either — a constant clap never renders
+#   is not help, and a help constant in a new module is picked up by being
+#   referenced, whichever file it lives in.
+#
+#   The rule itself is then the one thing that derivation can still get wrong:
+#   an identifier clap renders whose definition this gate cannot extract. That
+#   is a text shown to an operator and read by nothing, so it fails.
+#
+# RULE 7 (no ratio is written into the help)
+#   No resident-KV ratio may appear in any of these constants, in any spelling
+#   this tree uses: `0.44x`, `1.406x`, `2x`, and the same three with the Unicode
+#   multiplication sign `×`, which is what docs/KV_QUANT.md's own ratio
+#   tables are written with. Keyed on the SHAPE of such a figure, not on a list
+#   of the ones that were there -- a corrected number is the same defect as a
+#   stale one, and a pattern that matches one spelling is a gate that a reviewer
+#   can walk past by typing the other.
+#   Such a figure has one producer — `KvQuant::estimated_resident_bytes_per_layer`,
+#   which `rmlx info --list-cache-types` prints — and a second copy of it in a
+#   string literal is correct only by hand. The four that used to sit here were
+#   carried unchanged through the two commits that moved the stores underneath
+#   them, and ended up filing the four codecs that compress most under a heading
+#   that said they were larger than bf16. Rules 1-5 could not see it: they are
+#   all set-membership rules on codec names and none of them reads a number.
 #
 # SCOPE
 #   Rules 3-5 check that an inert codec carries a banner *somewhere* in
@@ -92,10 +136,13 @@ SCAN_ROOT="${1:-}"
 
 if [ -n "${SCAN_ROOT}" ]; then
     CLI_MAIN="${SCAN_ROOT}/main.rs"
+    CLI_SRC="${SCAN_ROOT}"
     KV_DOC="${SCAN_ROOT}/KV_QUANT.md"
     MANIFEST_SRC="${SCAN_ROOT}/manifest.raw"
 else
     CLI_MAIN="${REPO_ROOT}/crates/rmlx-cli/src/main.rs"
+    # The whole crate, not one file: a help constant is wherever its module is.
+    CLI_SRC="${REPO_ROOT}/crates/rmlx-cli/src"
     KV_DOC="${REPO_ROOT}/docs/KV_QUANT.md"
     MANIFEST_SRC=""
 fi
@@ -173,31 +220,92 @@ actual=$(grep -c '^KVQUANT-DISPOSITION	' "${WORK}/manifest.raw")
 inert_count=$(awk -F'\t' '$6 == "INERT" { n++ } END { print n + 0 }' "${WORK}/manifest")
 
 # ── Surface 1: the CLI help constants ────────────────────────────────────────
-# Extract each named `const X: &str = "..."` body. The consts are the whole
-# `--kv-quant` / `--kv-bits` help surface: rule 6 pins that the arguments take
-# their text from them and nowhere else.
+# Every `.rs` in the CLI crate. A help constant lives wherever its module does,
+# and a gate that reads one file is a gate with a move away from a blind spot.
+find "${CLI_SRC}" -name '*.rs' -type f | sort >"${WORK}/cli_sources"
+[ -s "${WORK}/cli_sources" ] ||
+    die_env "no .rs sources under ${CLI_SRC#"${REPO_ROOT}/"}"
+
+# Extract one `const X: &str = "..."` body from wherever in the crate it is
+# defined. `pub` / `pub(crate)` and an indented definition are accepted: the
+# gate must not care which module a constant sits in.
 extract_const() {
+    # shellcheck disable=SC2046  # the source list is newline-free by construction
     awk -v name="$1" '
-        $0 ~ ("^const " name ": &str = ") { inside = 1; next }
+        $0 ~ ("^[[:space:]]*(pub(\\([a-z]+\\))?[[:space:]]+)?const " name ": &str = ") {
+            inside = 1; next
+        }
         inside { print }
         inside && /";$/ { exit }
-    ' "${CLI_MAIN}"
+    ' $(cat "${WORK}/cli_sources")
 }
 
+# Which file defines it, for an error message that can be acted on.
+const_home() {
+    grep -lE "^[[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?const $1: &str = " \
+        $(cat "${WORK}/cli_sources") 2>/dev/null | head -1
+}
+
+# RULE 8: the scope is derived, not declared.
+#
+# In scope = every identifier clap renders as help. That is what "operator
+# facing" means; it needs no exclusion list, because a constant clap never
+# renders is not help. A reference may be a bare identifier or a path
+# (`startup::X`, `crate::a::X`) — a constant outside the argument's own module
+# is referenced by path, and both forms put the same text in front of an
+# operator — so the last path segment is taken as the constant's name. A
+# `help = "literal"` is not collected on purpose: rule 6 already refuses one on
+# the arguments this gate is about.
+grep -rhoE '(long_)?help = (([A-Za-z_][A-Za-z0-9_]*)::)*[A-Z][A-Z0-9_]*' \
+    $(cat "${WORK}/cli_sources") |
+    awk '{ print $3 }' | sed 's/.*:://' | sort -u >"${WORK}/referenced"
+[ -s "${WORK}/referenced" ] ||
+    die_env "found no \`help = IDENT\` clap attribute under \
+${CLI_SRC#"${REPO_ROOT}/"} — the attribute shape stopped matching, so this \
+gate would be reading nothing"
+
+: >"${WORK}/unreadable"
+while IFS= read -r c; do
+    [ -n "$(const_home "$c")" ] || printf '%s\n' "$c" >>"${WORK}/unreadable"
+done <"${WORK}/referenced"
+if [ -s "${WORK}/unreadable" ]; then
+    echo "ERROR: clap renders help this gate cannot read:" >&2
+    while IFS= read -r c; do
+        echo "  RULE 8  ${c} is used as clap help but no \`const ${c}: &str\` \
+was found in ${CLI_SRC#"${REPO_ROOT}/"}" >&2
+    done <"${WORK}/unreadable"
+    echo >&2
+    echo "Rules 1, 2 and 7 read the constants named here and nothing else, so" >&2
+    echo "a ratio or a dead codec name in that text is invisible to all three." >&2
+    echo "Give it the \`const NAME: &str = \"...\";\` shape the extractor reads," >&2
+    echo "or the gate is scanning past a surface an operator is shown." >&2
+    echo "A violation and not an environment error: the text arrives in the" >&2
+    echo "change that added it, and its author is who can shape it." >&2
+    exit 1
+fi
+
+HELP_CONSTS="$(tr '\n' ' ' <"${WORK}/referenced")"
+
 : >"${WORK}/help.txt"
-for c in KV_QUANT_HELP KV_QUANT_LONG_HELP KV_BITS_LONG_HELP; do
+: >"${WORK}/help_inert.txt"
+for c in ${HELP_CONSTS}; do
     extract_const "$c" >"${WORK}/const.$c"
     [ -s "${WORK}/const.$c" ] ||
-        die_env "could not extract const ${c} from ${CLI_LABEL}"
+        die_env "const ${c}, defined in $(const_home "$c"), has a definition \
+this gate can find but a body it cannot read — the opening and closing shape \
+the extractor keys on stopped matching"
     cat "${WORK}/const.$c" >>"${WORK}/help.txt"
+    # The INERT blocks inside this one constant: from a marker line to the next
+    # blank line. Kept per constant, not pooled: a codec declared inert in the
+    # `--kv-preset` block must not launder a `--kv-quant` block that lists it
+    # beside the live codecs. Those are two surfaces and an operator reads one.
+    awk '
+        /^[[:space:]]*INERT[[:space:]]*—/ { inside = 1 }
+        inside && /^[[:space:]]*$/        { inside = 0 }
+        inside                            { print }
+    ' "${WORK}/const.$c" >"${WORK}/inert.$c"
+    cat "${WORK}/inert.$c" >>"${WORK}/help_inert.txt"
 done
-
-# The INERT blocks inside the help: from a marker line to the next blank line.
-awk '
-    /^[[:space:]]*INERT[[:space:]]*—/ { inside = 1 }
-    inside && /^[[:space:]]*$/        { inside = 0 }
-    inside                            { print }
-' "${WORK}/help.txt" >"${WORK}/help_inert.txt"
 
 if [ ! -s "${WORK}/help_inert.txt" ]; then
     die_violation "the --kv-quant/--kv-bits help declares no INERT block.
@@ -206,7 +314,10 @@ that stopped being true, this gate's manifest would say so — check its output
 first. A block opens with a line matching: ${HELP_INERT_MARKER}"
 fi
 
-# Rule 6: every --kv-quant / --kv-bits argument reaches the shared constants.
+# Rule 6: every --kv-quant / --kv-bits / --kv-preset argument reaches the shared
+# constants. Read from main.rs, where the arguments are declared; if they move,
+# the COUNT check below finds zero of a shape and stops the gate rather than
+# passing over an empty scan.
 # Per argument, not by comparing counts: N arguments and N `help =` attributes
 # is also what one argument carrying two and another carrying none looks like.
 # The attribute block that belongs to an argument opens at its `#[` and runs to
@@ -229,15 +340,22 @@ awk '
             printf "MISS\t%d\t--kv-bits\tlong_help = KV_BITS_LONG_HELP\n", NR
         }
     }
-    END { printf "COUNT\t%d\t%d\n", quant_args, bits_args }
+    /^[[:space:]]+kv_preset: Option<KvPresetArg>,$/ {
+        preset_args++
+        if (block !~ /long_help = KV_PRESET_LONG_HELP/) {
+            printf "MISS\t%d\t--kv-preset\tlong_help = KV_PRESET_LONG_HELP\n", NR
+        }
+    }
+    END { printf "COUNT\t%d\t%d\t%d\n", quant_args, bits_args, preset_args }
 ' "${CLI_MAIN}" >"${WORK}/argcheck"
 
 quant_args=$(awk -F'\t' '$1 == "COUNT" { print $2 }' "${WORK}/argcheck")
 bits_args=$(awk -F'\t' '$1 == "COUNT" { print $3 }' "${WORK}/argcheck")
-if [ "${quant_args}" -eq 0 ] || [ "${bits_args}" -eq 0 ]; then
-    die_env "found ${quant_args} --kv-quant and ${bits_args} --kv-bits argument \
-declarations in ${CLI_LABEL} — one of the two shapes stopped matching, so the \
-gate would be checking nothing"
+preset_args=$(awk -F'\t' '$1 == "COUNT" { print $4 }' "${WORK}/argcheck")
+if [ "${quant_args}" -eq 0 ] || [ "${bits_args}" -eq 0 ] || [ "${preset_args}" -eq 0 ]; then
+    die_env "found ${quant_args} --kv-quant, ${bits_args} --kv-bits and \
+${preset_args} --kv-preset argument declarations in ${CLI_LABEL} — one of the \
+three shapes stopped matching, so the gate would be checking nothing"
 fi
 
 grep '^MISS	' "${WORK}/argcheck" >"${WORK}/argmiss" || true
@@ -249,6 +367,57 @@ if [ -s "${WORK}/argmiss" ]; then
     echo >&2
     echo "An argument with its own help text is one this gate does not read." >&2
     exit 1
+fi
+
+# ── Rule 7: no resident-KV ratio is written into the help ───────────────────
+# A ratio in these constants is a hand-maintained copy of
+# `KvQuant::estimated_resident_bytes_per_layer`, and the copy is what goes
+# stale. `rmlx info --list-cache-types` prints the computed figure; the help
+# points at it.
+#
+# The pattern is the *shape* of such a figure, across every spelling in the
+# tree: an integer or decimal followed by `x`, `X` or the Unicode multiplication
+# sign, on a digit boundary so a version or a group size is not a ratio.
+# `RATIO_SHAPE` is one definition shared with the reason string, so the rule and
+# the message it prints cannot describe different patterns.
+RATIO_SHAPE='(^|[^0-9.])[0-9]+(\.[0-9]+)?(x|X|×)([^A-Za-z0-9_]|$)'
+grep -nE "${RATIO_SHAPE}" "${WORK}/help.txt" >"${WORK}/ratios" || true
+if [ -s "${WORK}/ratios" ]; then
+    echo "ERROR: the --kv-quant/--kv-bits/--kv-preset help writes a resident-KV \
+ratio:" >&2
+    while IFS= read -r line; do
+        echo "  RULE 7  ${line}" >&2
+    done <"${WORK}/ratios"
+    echo >&2
+    echo "That figure has one producer. Quote none and point the operator at" >&2
+    echo "\`rmlx info --list-cache-types\`, which computes it per codec and per" >&2
+    echo "topology from the same byte model the engine allocates against." >&2
+    echo "Shape matched: ${RATIO_SHAPE}" >&2
+    exit 1
+fi
+
+# ── Rule 9: the pointer the help hands the operator still resolves ──────────
+# `grep -qE '^[[:space:]]*fn\(\);'` matches a statement, not the `use` that
+# imports the name and not the `fn` that defines it — so removing the call is
+# caught even though the symbol is still in the file.
+if grep -q -- '--list-cache-types' "${WORK}/help.txt"; then
+    missing_call=0
+    for fn in print_cache_type_table print_kv_quant_residency_table; do
+        # shellcheck disable=SC2046
+        if ! grep -qE "^[[:space:]]*${fn}\(\);" $(cat "${WORK}/cli_sources"); then
+            echo "  RULE 9  ${CLI_SRC#"${REPO_ROOT}/"}  ${fn}() is never called" >&2
+            missing_call=$((missing_call + 1))
+        fi
+    done
+    if [ "${missing_call}" -gt 0 ]; then
+        echo >&2
+        echo "ERROR: the help sends the operator to \`rmlx info --list-cache-types\`" >&2
+        echo "for a figure it deliberately does not quote, and ${missing_call} of the" >&2
+        echo "listings that command prints has no call site. The pointer is the only" >&2
+        echo "place those numbers are published; a dangling one is worse than the" >&2
+        echo "stale literals it replaced." >&2
+        exit 1
+    fi
 fi
 
 # ── Surface 2: the docs banners ──────────────────────────────────────────────
@@ -318,11 +487,14 @@ report() {
 while IFS=$'\t' read -r _ _idx display stem mode class _rs _bk _bv; do
     case "${class}" in
         INERT)
-            # Rule 1: named in the help at all → must be in an INERT block.
-            if match_stem "${stem}" "${mode}" "${WORK}/help.txt" &&
-                ! match_stem "${stem}" "${mode}" "${WORK}/help_inert.txt"; then
-                report "RULE 1  '${display}' is inert but the CLI help names it outside the INERT block"
-            fi
+            # Rule 1: named in a help constant at all → that same constant must
+            # carry an INERT block naming it.
+            for c in ${HELP_CONSTS}; do
+                if match_stem "${stem}" "${mode}" "${WORK}/const.$c" &&
+                    ! match_stem "${stem}" "${mode}" "${WORK}/inert.$c"; then
+                    report "RULE 1  '${display}' is inert but ${c} names it outside an INERT block"
+                fi
+            done
             # Rule 3: must carry a docs banner.
             if ! match_stem "${stem}" "${mode}" "${WORK}/banners.txt"; then
                 report "RULE 3  '${display}' is inert but no ${DOC_LABEL} INERT banner names it"

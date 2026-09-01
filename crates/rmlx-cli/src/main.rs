@@ -47,7 +47,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rmlx_core::runinfo::make_run_id;
 use rmlx_metrics::events::EventRecorder;
 use rmlx_server::SENTINEL_PORT;
-use startup::{init_tracing, print_cache_type_table, LogLevel, MetricsArg};
+use startup::{
+    init_tracing, print_cache_type_table, print_kv_quant_residency_table, LogLevel, MetricsArg,
+};
 use tracing::info;
 
 use commands::metrics::{dispatch as metrics_dispatch, MetricsCmd};
@@ -136,6 +138,13 @@ per-side codecs (`--cache-type-k`/`--cache-type-v`), never both.
   Note for llama.cpp users: rMLX uses double-dash --ctv (not single-dash -ctv).";
 
 /// Long-help for `--kv-preset`. Documents the preset table and conflict rules.
+///
+/// Read by `make check-kv-codec-disposition` alongside the `--kv-quant` and
+/// `--kv-bits` help: every preset here resolves to a codec, and the gate holds
+/// the disposition this text claims against the one the runtime classifiers
+/// give. The `--kv-quant` name of each target is spelled out for that reason as
+/// much as for the reader's — a gate that searches for a codec cannot find it
+/// under a variant name that never reaches the command line.
 const KV_PRESET_LONG_HELP: &str = "\
 Named KV-cache preset. Bundles K+V codec choice into a single flag.
 
@@ -146,11 +155,18 @@ clap error (exit 2).
 NO PRESET BELOW REDUCES MEMORY BELOW fp16 — fp16 is the unquantised reference,
 and every other name resolves to a codec whose decode reads the bf16 mirror, so
 its packed store is never built: the served request holds the same resident KV
-as fp16 and emits the same tokens. Measured on two architectures at two
-contexts; decode throughput against fp16 is INCONCLUSIVE, so they are not
-known to cost anything either. They are kept because the names appear in
-recorded bench rows and each is its codec's entry point, not because one of
-them is a smaller cache.
+as fp16 and emits the same tokens. Pinned by `no_preset_is_a_memory_lever`,
+which sweeps the preset table and fails the build the day one of these targets
+starts building a store. Decode throughput against fp16 is INCONCLUSIVE, so
+they are not known to cost anything either. They are kept because the names
+appear in recorded bench rows and each is its codec's entry point, not because
+one of them is a smaller cache.
+
+  INERT — every preset target except fp16:
+      speed resolves to tsym3, quality to tsym4, planar to planar, planar3 to
+      planar3, k_only_planar to planar_k. q8 resolves to k8v8, which is inert
+      too. Decode reads the bf16 mirror on both axes for all six, so the packed
+      store is never built and the codec math never runs.
 
 Special value:
   auto      -- the same codec `--kv-quant auto` resolves to (unquantised bf16).
@@ -173,34 +189,39 @@ See docs/KV_QUANT.md sections \"Preset semantics\" and \"Codec disposition\".";
 
 /// Short help for `--kv-quant`, shared by every subcommand that takes it.
 ///
-/// Names no codec on purpose — a name in a one-line help cannot carry its
-/// disposition, and three of the four this line used to name do nothing.
+/// Names no codec and quotes no ratio on purpose. A name in a one-line help
+/// cannot carry its disposition, and a ratio typed into a help string is a
+/// second copy of a number the engine already computes — the one this line used
+/// to carry named two codec families as the only ones under bf16 when six are.
 const KV_QUANT_HELP: &str = "\
 KV cache quantization codec. Default \"auto\" = unquantised bf16 on every arch. \
-Only mixed_* / rot_k_* hold less resident KV than bf16, and only where the \
-model's layers do not share K/V — see --help.";
+Which codecs hold less resident KV than bf16 depends on the architecture — \
+`rmlx info --list-cache-types` prints the computed figure per codec. See --help.";
 
 /// Long-help for `--kv-quant`, shared by every subcommand that takes it.
 ///
 /// The codec lists here are checked against the runtime classifiers by
 /// `make check-kv-codec-disposition`: a name in the INERT block that starts
 /// reading its own packed store, or an inert name listed anywhere else, fails
-/// the build.
+/// the build. The same gate rejects a resident-KV ratio written into this text
+/// at all — that figure has one producer, `rmlx info --list-cache-types`, which
+/// computes it from the engine's byte model instead of quoting it.
 const KV_QUANT_LONG_HELP: &str = "\
 KV cache quantization codec. Default \"auto\", which resolves to unquantised
 bf16 (\"bf16\", alias \"none\") on every architecture and every context length.
 
-Two codecs now hold LESS resident KV than bf16, and only on an architecture
-whose layers do not share K/V: mixed_* and rot_k_*. Every other codec here
-either measures larger than bf16 or does not execute at all. Pick a name for
-what its decode does, and read the per-codec ratios below before picking one
-to save memory.
+HOW MUCH RESIDENT KV A CODEC HOLDS IS NOT PRINTED HERE. It is architecture-
+conditional, and `rmlx info --list-cache-types` computes it per codec, for a
+dense stack and a cross-layer-KV (shared-KV) stack side by side, from the same
+byte model the engine allocates against. Read that listing before picking a
+name to save memory; pick a name here for what its decode does.
 
 Mutually exclusive with `--kv-preset`, `--cache-type-k`, `--cache-type-v`,
 and `--kv-bits`.
 
   bf16 (alias none; what auto resolves to)
-      Unquantised bf16 K and V. The reference every ratio below is against.
+      Unquantised bf16 K and V. The reference the listing's ratios are
+      against.
 
   INERT — accepted, but does nothing:
       k8v4, k8v8, planar, planar3, planar_k, k8vturbo2, k8vturbo2tcq,
@@ -212,30 +233,23 @@ and `--kv-bits`.
       throughput against it is INCONCLUSIVE, so selecting one is not known to
       cost anything either. It simply does not do what the name says.
 
-  Runs its codec — and measures SMALLER than bf16, on a dense architecture:
-      mixed_k<kb>g<kg>_v<vb>g<vg>, rot_k_v<vb>g<vg>.
-      Their bf16 K/V mirror serves one consumer only: a cross-layer-KV
-      (shared-KV) architecture's consumer layers. Where the model has none, the
-      mirror is not built and only the packed store remains. Resident KV
-      against bf16 on a prompt-sized request: 0.57x-0.59x on Bonsai-8B (4k,
-      16k, 32k), 0.75x on Qwen3.6-35B-A3B (4k). On Gemma4, which does share
-      K/V, the mirror is still the share and both stay above bf16: mixed
-      1.33x, rot_k 1.37x (e4b, 4k).
-      The saving is prompt-sized, not context-sized. On these architectures the
-      mirror is frozen at the prefill length, so a long generation off a short
-      prompt saves almost nothing (Bonsai-8B, 25-token prompt, 512 generated:
-      0.94x of the same codec before the mirror was elided).
+  Runs its codec, decoding over its own packed store:
+      mixed_k<kb>g<kg>_v<vb>g<vg>, rot_k_v<vb>g<vg>, iso3_sym, iso4_sym,
+      k_iso3, k_iso4, rotor3_sym, rotor4_sym, k_rotor3, k_rotor4.
+      Two mechanisms decide what that costs, and they pull opposite ways:
+      * mixed_* / rot_k_* keep a bf16 K/V mirror beside their store only where
+        the model's layers share K/V, because that mirror is what the consumer
+        layers read. There they hold the store AND two full bf16 buffers;
+        everywhere else the mirror is not built and the store is the whole cost.
+        One codec, two answers — the listing prints both.
+      * The iso and rotor families keep no mirror on any architecture. Their
+        rate is the ring's, which is fixed by head_dim and by the sideband
+        width — not by the bit width in the name, which is a codebook. The two
+        members of a family are byte-identical for that reason.
+      Whether either is *below* bf16 is the listing's business, not this text's.
 
-  Runs its codec — and measures LARGER than bf16:
-      iso3_sym, iso4_sym, k_iso3, k_iso4, rotor3_sym, rotor4_sym, k_rotor3,
-      k_rotor4.
-      These decode over their own packed store and keep no mirror to drop.
-      Resident KV against bf16: k_iso3/k_iso4 1.00x-1.03x,
-      iso3_sym/iso4_sym 1.01x-1.05x, k_rotor3/k_rotor4 1.13x-1.17x,
-      rotor3_sym/rotor4_sym 1.26x-1.33x.
-
-Per-codec detail and the measurements behind these numbers: docs/KV_QUANT.md,
-section \"Codec disposition — what every codec in the tree is for\".";
+Per-codec detail: docs/KV_QUANT.md, section \"Codec disposition — what every
+codec in the tree is for\".";
 
 /// Long-help for `--kv-bits`. Mirrors mlx-lm's `kv_bits` / `kv_group_size` ergonomics.
 ///
@@ -250,21 +264,23 @@ Mutually exclusive with `--kv-quant`, `--kv-preset`, `--cache-type-k`, and
 preset string.
 
 WHAT THIS FLAG SHRINKS DEPENDS ON THE MODEL. Every value except (8, 128)
-resolves to the mixed_* codec. On an architecture whose layers do not share K/V
-it keeps only its packed store and measures 0.57x-0.75x of plain bf16 on a
-prompt-sized request (Bonsai-8B and Qwen3.6-35B-A3B, 4k-32k). On a shared-KV
-architecture (Gemma4) the bf16 K/V mirror beside that store *is* what the
-consumer layers read, so it is retained and the cache measures 1.33x LARGER
-than bf16. The saving is also prompt-sized, not context-sized: the mirror is
-frozen at the prefill length, so a long generation off a short prompt saves
-almost nothing. The single exception below is neither smaller nor larger:
+resolves to the mixed_* codec, whose bf16 K/V mirror is retained on exactly one
+kind of architecture: one whose layers share K/V across layers (Gemma4), where
+that mirror is what the consumer layers read. There the cache holds the packed
+store AND both mirrors and is LARGER than plain bf16. Where the layers do not
+share K/V, the mirror is not built and the packed store is the whole cache.
+`rmlx info --list-cache-types` computes both figures per codec; this flag names
+no ratio because the answer is not one number. The single exception below is
+neither smaller nor larger:
 
   INERT — accepted, but does nothing:
       k8v8, which is what (8, 128) resolves to.
       Decode reads the bf16 mirror on both axes, so its packed store is never
       built: resident KV and generated tokens measure identical to bf16.
 
-On a shared-KV architecture the smallest measured KV cache is `--kv-quant none`.
+`--kv-bits` cannot reach a codec smaller than bf16 on a shared-KV architecture:
+every value it maps to is in the mirrored family. The codecs that compress there
+are reached through `--kv-quant`; `rmlx info --list-cache-types` names which.
 
 Integer mapping:
   --kv-bits 8 --kv-group-size 128  → k8v8 (see INERT above)
@@ -2180,6 +2196,7 @@ fn main() -> Result<()> {
             // `model` is Some whenever this flag is absent.
             if list_cache_types {
                 print_cache_type_table();
+                print_kv_quant_residency_table();
                 return Ok(());
             }
             let model = model.expect("clap required_unless_present guarantees model is Some");
