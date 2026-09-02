@@ -769,7 +769,8 @@ relays a non-row-contiguous array out before reading it (`docs/FFI.md`
 §"Data readback"), so a view reaching the spill writer costs a copy on the drain
 thread rather than corrupting the block. Pinned by
 `block_io_tests::roundtrip_mirror_codec_spills_and_hydrates_as_bf16`, which
-drives the mirror through a real prefill, and by
+drives the mirror through a real prefill (a fixture that installs an
+already-compact array cannot see this failure), and by
 `decode_expanded_mirror_is_refused_rather_than_spilled_with_its_tail` and
 `expanded_mirror_in_one_layer_fails_the_whole_block` for the refusal.
 

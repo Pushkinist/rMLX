@@ -998,36 +998,41 @@ impl Array {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         install_error_handler();
         self.eval()?;
+        let nbytes = unsafe { sys::mlx_array_nbytes(self.inner) };
+        if nbytes == 0 {
+            return Ok(Vec::new());
+        }
         if self.is_row_contiguous()? {
-            return self.copy_row_major_bytes();
+            return self.copy_row_major_bytes(nbytes);
         }
         // The bytes are bound for host memory and the caller is already
         // blocking on them, so relaying out on the CPU stream keeps the read
         // path free of a GPU dispatch to wait on. Reading an evaluated array's
         // buffer from the host is what this method does either way.
+        tracing::debug!(
+            shape = ?self.shape(),
+            nbytes,
+            "to_bytes: relaying out a non-row-contiguous array"
+        );
         let dense = self.contiguous(Device::Cpu)?;
         dense.eval()?;
-        dense.copy_row_major_bytes()
+        dense.copy_row_major_bytes(nbytes)
     }
 
     /// Copy `nbytes` straight off the data pointer.
     ///
     /// Callers must have evaluated the array and established that it is
-    /// row-contiguous; otherwise the read follows the parent allocation's
-    /// layout instead of this array's, and for a broadcast it runs past the
-    /// end of that allocation.
-    fn copy_row_major_bytes(&self) -> Result<Vec<u8>> {
-        let nbytes = unsafe { sys::mlx_array_nbytes(self.inner) };
-        if nbytes == 0 {
-            return Ok(Vec::new());
-        }
-
+    /// row-contiguous, and must pass this array's own `mlx_array_nbytes`;
+    /// otherwise the read follows the parent allocation's layout instead of
+    /// this array's, and for a broadcast it runs past the end of that
+    /// allocation.
+    fn copy_row_major_bytes(&self, nbytes: usize) -> Result<Vec<u8>> {
         // SAFETY: mlx_array_data_uint8 returns a raw pointer valid while the
         // array is alive and evaluated. We copy out immediately.
         let ptr = unsafe { sys::mlx_array_data_uint8(self.inner) };
         if ptr.is_null() {
             return Err(Error::Mlx(
-                "Array::to_bytes: data pointer is null — was eval() called?".into(),
+                "Array::to_bytes: data pointer is null after eval".into(),
             ));
         }
         // SAFETY: ptr is non-null and points to `nbytes` contiguous bytes
@@ -1049,6 +1054,11 @@ impl Array {
     /// **Evaluate first.** The flag describes a materialised buffer, and MLX
     /// only sets it when one is attached; on an unevaluated array it reports
     /// the layout of nothing and answers `true` for a view that is not dense.
+    ///
+    /// `mlx/c/array.h` declares `_mlx_array_is_row_contiguous` an internal
+    /// function with no stability promise, so every host readback now rests on
+    /// an mlx-c internal. The behaviour pin is the layout-flag test in
+    /// `lib_tests.rs`; re-run it whenever the pinned mlx / mlx-c pair moves.
     fn is_row_contiguous(&self) -> Result<bool> {
         install_error_handler();
         let mut res = false;
@@ -1131,9 +1141,12 @@ impl Array {
     /// linear index, so they see the un-permuted physical order and silently
     /// produce scrambled results. Call this before feeding a transposed (or
     /// otherwise non-contiguous) array to such a kernel so the physical layout
-    /// matches the logical shape. `mlx_reshape` to the same element count does
-    /// not guarantee this — a flattened strided view can still report as
-    /// "contiguous" while its bytes follow the original strides.
+    /// matches the logical shape. The case that needs it is a transpose or a
+    /// strided slice fed straight to the kernel: a `reshape` that changes the
+    /// shape already relayouts, because MLX copies a non-row-contiguous
+    /// reshape input dense instead of sharing its buffer. A reshape to the
+    /// shape the array already has returns the array itself and relayouts
+    /// nothing.
     pub fn contiguous(&self, device: Device) -> Result<Array> {
         install_error_handler();
         let mut res = unsafe { sys::mlx_array_new() };

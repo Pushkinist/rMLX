@@ -849,6 +849,19 @@ The CPU stream is the right one because the bytes are bound for host memory and
 the caller is already blocking on them, so no GPU dispatch is added to a read
 path that already dereferences the buffer from the host.
 
+`_mlx_array_is_row_contiguous` is declared in `mlx/c/array.h` as an **internal
+function** — "use at your own risk", no stability promise — so every host
+readback in the workspace now depends on one. That is a deliberate trade: the
+alternative is recomputing the predicate from `mlx_array_strides` and
+`mlx_array_shape`, which duplicates MLX's own definition of the flag and drifts
+from it silently. `layout_flag_classifies_views_once_they_are_evaluated`
+(`crates/rmlx-mlx/src/lib_tests.rs`) is the behaviour pin: it asserts the flag's
+answer for a dense array, a transpose, and a `contiguous()` result, and must be
+re-run whenever the pinned mlx / mlx-c pair moves (`crates/rmlx-mlx/src/pin.rs`). Note what
+it pins and why the order in `to_bytes` is eval → classify → read: before
+evaluation the flag describes a buffer that is not attached yet and answers
+`true` for a transpose.
+
 Callers therefore never need a defensive `.contiguous()` purely to make a
 readback correct. Sites that call it before `to_bytes` for a *different* reason
 — compacting a slice so the parent allocation can be dropped, or handing the
