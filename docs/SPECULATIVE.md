@@ -707,8 +707,17 @@ That same `done` line carries a `decode_tps` field, on the same
 first-token-to-last basis, for every one of the five round loops. It is an
 `Option` and renders `Some(20.98)` or `None` — `None` when the run emitted
 fewer than two tokens and there is no interval to measure, which is the honest
-answer where a `0.0` would be averaged as a real rate. A scrape must expect
-that shape.
+answer where a `0.0` would be averaged as a real rate.
+
+`scripts/lib/spec_round_log.py` is the only thing that reads that line, and
+`scripts/spec_bench.sh` takes its speculative `decode_tps_warm` from there.
+The `emitted` and `elapsed_ms` on the same line are **not** a second spelling of
+it: `elapsed_ms` covers the prompt prefill, so `emitted / elapsed_ms` is a
+different and lower number, and rows carrying that form are named in
+`docs/METRICS_DB.md` under "Known-bad rows already in the DB". A reader that
+finds a bare number in `decode_tps` rather than `Some(x)` / `None` is looking at
+a log from before the field was corrected and is looking at exactly that lower
+number; it must refuse it rather than read it.
 
 Three prompt classes: `prose` and `code` are `prompts/spec_bench/{prose,code}.json`,
 `4k` is `prompts/longctx_4k.json`, `paris` is the bare "What is the capital of

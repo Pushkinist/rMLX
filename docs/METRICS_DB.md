@@ -528,8 +528,11 @@ run, and counted in the migrate report as `metrics_dropped_implausible`.
 #### Known-bad rows already in the DB
 
 Rows written before these gates existed are still there — `observations` is
-append-only and nothing is deleted. Two known populations, both excluded from
-`bests` by the bound and reported by `doctor`:
+append-only and nothing is deleted. Three known populations. The first two fall
+outside the plausible-value bound, so `bests` already drops them and `doctor`
+reports them. The third does not: it is the wrong-but-in-range case §4.1 says a
+bound cannot reach, so the predicate that identifies it is written down here
+because nothing enforces it.
 
 - **`prefill_tps` ≥ 1e5** — 20 rows from a legacy buffer replay storing
   `(prompt_tokens - 242) * 1000` under `unit='tps'`. The producing script
@@ -541,6 +544,20 @@ append-only and nothing is deleted. Two known populations, both excluded from
 - **rate metrics `= 0.0`** — an early-stopped run recording a fabricated zero
   instead of nothing. These win any cell whose rows are all zeros, so an
   upper-only bound would have *promoted* them; the bound has to be two-sided.
+- **`spec_bench.sh` `decode_tps_warm` with no `decode_window=` in `notes`** —
+  both arms of that script once derived a decode rate of their own over a window
+  that started before the prompt prefill: the speculative arm divided the round
+  loop's `emitted` by its `elapsed_ms`, the no-drafter arm divided the
+  completion tokens by the whole curl request. Neither is warm-cache decode
+  throughput — the second is `overall_tps` under the wrong name — and both read
+  low by however much prefill the prompt carried, which for the round-loop form
+  is 35-62% on the 4k-prompt runs still in `<RMLX_HOME>/logs`. Some of these
+  rows win their `bests` cell today. Both arms now report the
+  first-token-to-last window and record which one they measured, so
+  `description LIKE 'spec_bench%' AND metric = 'decode_tps_warm' AND notes NOT
+  LIKE '%decode_window=%'` names exactly the rows that predate that. Re-measuring
+  out-ranks them on merit only where the corrected number is larger; the
+  predicate covers the rest.
 
 Anything anchoring on a recorded rate — a roofline, a champion table, a
 `rmlx metrics rank` — should read `bests`, or one of the `query::*` functions,

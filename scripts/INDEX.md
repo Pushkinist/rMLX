@@ -64,6 +64,7 @@ Conventions:
 | `perf_ab_host_gate_fixtures.sh` | `make canary-ab-host-gate-fixtures` | Recall test for the measurement/logic boundary: the host gates still fire on a shimmed hostile host, `--synthetic-arms` makes the verdict identical on a hostile and a quiet one, and it waives no arm-reading guard. In `make ci`. |
 | `perf_ab_ingest_selftest.sh` | `make canary-ab-ingest-selftest` | Mutation check for `ingest/perf_ab_ingest.py` — 17 cases over synthetic result files, one per refusal. Never writes `runs.db`. In `make ci`. |
 | `bench_llama_ab_selftest.sh` | `make llama-ab-selftest` | Mutation check for `bench_llama_ab.sh` against a stub `llama-server` — 19 cases, one per guard. Every case declares `--synthetic-arms` and asserts a literal exit code; the taint-path and quiescence-gate cases supply a `ps` shim, and the count of cases that could reach this host is tallied and must be zero. In `make ci`. |
+| `spec_bench_selftest.sh` | `make spec-bench-selftest` | Mutation check for `spec_bench.sh` against a stub server — 8 cases over canned SSE responses and canned round-loop `done` lines, asserting the value each arm ingests and the reason behind every refusal. No GPU, no model, and the stub answers `metrics record` without writing `runs.db`. In `make ci`. |
 | `bench_llama_ab.sh` | — | **ABBA-interleaved A/B of two `llama-server` arms** (fork vs upstream, codec vs codec). Same quiescence discipline as `perf_ab.sh` and the same `--synthetic-arms` boundary, both from `lib/cpu_snapshot.sh`, reported over the server's own `timings` plus KV-buffer and peak-RSS columns. Never writes `runs.db`. |
 | `perf_canary.sh` | `make perf-canary` | Fast decode-TPS canary over the three standard test-target models. |
 | `regression_gate.sh` | — | Compare a committed baseline against the latest canary row. Exit 125 = `git bisect skip`, 1 = regression. |
@@ -83,7 +84,7 @@ Conventions:
 | `bench-records-sweep.sh` | 5-model × 4-KV-quant `BENCHMARK_CHAMPIONS` regression sweep. |
 | `bench/tri_engine_same_model.sh` | **llama.cpp vs rMLX vs stock mlx-lm on ONE checkpoint**, across each engine's KV options. Refuses to emit a llama.cpp row unless that binary's Metal tensor API probes live (an inert one reads ~3x low on prefill), and refuses any cell whose KV would push this host into swap. |
 | `bench/tri_engine_summarize.py` | Ingest one raw artifact from `tri_engine_same_model.sh` into a normalized cell record, print the comparison table, or (`--geometry`) read the benched checkpoint's KV geometry out of its `config.json`. Owns the single definition of the cross-engine record shape, incl. the KV bits/value normalization that makes an allocated-for-n_ctx figure comparable to a filled-prefix one. |
-| `spec_bench.sh` | Bench a model in normal vs MTP speculative-decode mode. |
+| `spec_bench.sh` | Bench a model in normal vs MTP speculative-decode mode. Both arms report decode throughput over the first-emitted-token to last-emitted-token window: the speculative arm takes the rate the round loop logged, the no-drafter arm is timed client-side. |
 | `baseline/run_mlx-lm.sh` | Baseline measurement via Apple's stock `mlx-lm` loader. |
 | `baseline/run_mlx-lm-turboquant.sh` | Baseline measurement via the `mlx-lm-turboquant` fork. |
 | `baseline/run_oMLX.sh` | Baseline measurement via the oMLX Python server. |
@@ -105,6 +106,8 @@ Conventions:
 | `ingest/codec_inertness_ingest.py` | Promote `bench/codec_inertness_probe.sh` cells into §8.5 RunRecords. Records `kv_cache_bytes` only — the probe's unpaired throughput columns are not comparable and are deliberately dropped; the token-id digest travels in `notes`. |
 | `lib/identity.sh` | Shared §8.5 run-identity (`rmlx metrics identity --json`) for bench scripts. **Source it.** |
 | `lib/prefill_ms.py` | Read `decode_profile{prefill_ms}` back out of an rmlx run log. |
+| `lib/spec_round_log.py` | Read a speculative round loop's own `done` line — round counts, draft/accept totals, and the `decode_tps` the engine measured. The only reader of that line: `emitted / elapsed_ms` off it counts the prefill, and a `decode_tps` that is a bare number instead of `Some(x)` / `None` came from a binary that had not yet stopped reporting it that way, so it is refused rather than read. |
+| `lib/sse_decode_window.py` | Time a streamed chat-completions response over its decode window — first content token to last — plus the token count and a preview. Reports no rate at all for a response too short to have a window. |
 
 ## Profiling / GPU capture
 

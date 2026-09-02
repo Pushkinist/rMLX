@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The speculative-decode bench records the decode rate the engine measured,
+  not one it derives itself.** `scripts/spec_bench.sh` read the round loop's
+  `done` line and divided `emitted` by `elapsed_ms` for its speculative arm.
+  That elapsed covers the prompt prefill, so the quotient is not decode
+  throughput and reads low — 233.6 tok/s against the 276.3 the round loop
+  measured, on a code prompt, on this host. The engine has reported the
+  prefill-excluded rate on that same line as `decode_tps` since the round loops
+  were corrected; nothing was reading it. Its no-drafter arm had the matching
+  defect from the other side, dividing the completion tokens by the whole curl
+  request, which is `overall_tps` recorded under `decode_tps_warm`.
+
+  Both arms now report the first-emitted-token to last-emitted-token window
+  `docs/SPECULATIVE.md` has always claimed for these tables, so the
+  normal-vs-speculative delta the script prints is a decode-rate delta.
+  `scripts/lib/spec_round_log.py` is now the only reader of that `done` line and
+  refuses a `decode_tps` that is a bare number instead of `Some(x)` / `None` —
+  that shape means an older binary wrote the log and the only rate in it is the
+  contaminated one. A `None` is refused rather than replaced with a wall clock:
+  the engine reports it when there was no interval to measure, and no other
+  number is honest in that slot. `scripts/spec_bench_selftest.sh` drives the
+  whole script against a stub server over canned responses and canned `done`
+  lines and is a hard-fail step of `make ci`. The rows written before this are
+  named by a predicate in `docs/METRICS_DB.md`, since `observations` is
+  append-only and the values sit inside the metric's plausible-value bound where
+  no gate can reach them.
+
 - **The Homebrew formula no longer advertises a bottle it does not have.** A
   `bottle do` block names a `root_url` pinned to one release, but Homebrew
   derives the bottle *filename* from the formula's current version — so a block
