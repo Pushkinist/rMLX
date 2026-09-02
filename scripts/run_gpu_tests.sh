@@ -321,7 +321,7 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
     #
     # The canary kernel stores out of bounds on purpose and lives behind its own
     # feature, so it is not built into any ordinary test run.
-    canary_log="$(mktemp -t rmlx-gpu-canary)"
+    canary_log="$(mktemp "${TMPDIR:-/tmp}/rmlx-gpu-canary.XXXXXX")"
     "${validation_prefix_canary[@]}" cargo test --no-fail-fast -p rmlx-kv-quant \
         --features shader-validation-canary --lib -- \
         --ignored --test-threads=1 "${CANARY_TEST}" >"${canary_log}" 2>&1
@@ -358,7 +358,7 @@ for crate in "${crates[@]}"; do
     done < <(printf '%s' "${selected}" | awk -F'\t' -v c="${crate}" '$1 == c {print $2}' | sort -u)
     echo "── ${crate} (${classified} GPU tests) ──────────────────────────"
 
-    log="$(mktemp -t "rmlx-gpu-test-${crate}")"
+    log="$(mktemp "${TMPDIR:-/tmp}/rmlx-gpu-test-${crate}.XXXXXX")"
     # `--tests` selects every target with `test = true` — the lib's unit tests,
     # each bin's unit tests, and the `tests/*.rs` integration binaries. That is
     # exactly the set the classifier scans, so the runner cannot be pointed at
@@ -405,10 +405,15 @@ for crate in "${crates[@]}"; do
     # Harvest the failing test names while the log still exists — a red gate
     # that only names the crate leaves an operator unable to tell their own
     # regression from the known baseline without re-running by hand.
+    # libtest prints the region twice: a captured-output block per failure, then
+    # the plain name list. `---- <name> stdout ----` opens the first, so it ends
+    # the harvest; a panic detail or a line the test itself printed is indented
+    # exactly like a name and would otherwise be reported as a failing test.
     crate_fails="$(awk '
         /^failures:$/ { f = 1; next }
+        /^---- / { f = 0 }
         /^test result:/ { f = 0 }
-        f && /^    [A-Za-z_]/ { print $1 }
+        f && /^    [A-Za-z_][A-Za-z0-9_:]*$/ { print $1 }
     ' "${log}" | sort -u)"
 
     if [ "${SHADER_VALIDATION}" = "1" ]; then
@@ -421,13 +426,18 @@ for crate in "${crates[@]}"; do
         # Report the kernel each hit names, deduped — a codec's kernel name is
         # the actionable identifier here. The buffer field is not: MLX owns the
         # allocator, so KV stores come through as `buffer: <unnamed>`.
-        hits="$(grep -Eo "${VALIDATION_DIAGNOSTIC}[^\"]*\"[^\"]*\"" "${log}" \
+        # Split first, then match. The layer writes to stderr while libtest is
+        # mid-line, so reports routinely share an output line, and the detector's
+        # bounded `.{0,120}` is greedy: with a short kernel name the second
+        # report starts inside that window and both collapse into one match,
+        # losing the second one's kernel, kind and count. Everything below is
+        # then per diagnostic rather than per line, so the mix in the final
+        # banner sums to the count printed beside it.
+        one_per_line="$(awk '{ gsub(/Invalid /, "\n&"); print }' "${log}")"
+        hits="$(printf '%s\n' "${one_per_line}" \
+                | grep -Eo "${VALIDATION_DIAGNOSTIC}[^\"]*\"[^\"]*\"" \
                 | grep -Eo 'kernel function: "[^"]*"' | sort | uniq -c | sort -rn)"
-        # Counted per diagnostic, not per line: the layer writes to stderr while
-        # libtest is mid-line, so two reports routinely share one output line and
-        # a line count scores them as one. The kind tally comes off the same
-        # extraction, so the mix in the final banner sums to this count.
-        diagnostics="$(grep -Eo "${VALIDATION_DIAGNOSTIC}" "${log}")"
+        diagnostics="$(printf '%s\n' "${one_per_line}" | grep -Eo "${VALIDATION_DIAGNOSTIC}")"
         n_hits="$(printf '%s' "${diagnostics}" | grep -c '.')"
         if [ "${n_hits}" -gt 0 ]; then
             validation_hits="${validation_hits}  ${crate}: ${n_hits} invalid access(es)"$'\n'
@@ -449,10 +459,14 @@ for crate in "${crates[@]}"; do
     # built, a test compiled out behind a feature — which is silence, not
     # success. Over-matching inflates `executed` and is harmless, so this is a
     # one-sided `-lt`.
+    #
+    # It records and falls through rather than skipping the rest of the crate: a
+    # test binary that aborts produces both a shortfall and a non-zero exit, and
+    # reporting only the shortfall sends the reader after a renamed fn instead of
+    # the test that took the binary down.
     if [ "${executed}" -lt "${classified}" ]; then
         echo "ERROR: ${crate} classified ${classified} GPU tests but executed ${executed} — a filter stopped matching." >&2
         failed_crates="${failed_crates}  ${crate}: under-matched (${executed}/${classified} executed)"$'\n'
-        continue
     fi
     if [ "${rc}" -ne 0 ]; then
         failed_crates="${failed_crates}  ${crate}:"$'\n'

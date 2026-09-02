@@ -38,6 +38,7 @@ CASE_ROOT=""
 OUT=""
 STATUS=0
 REPORT=""
+MIX=""
 
 # new_case <name> — build a throwaway repo root: a copy of the runner, a stub
 # classifier reading this case's population, and a stub PATH. Sets CASE_ROOT.
@@ -107,12 +108,17 @@ crate_log() {
     printf '%s\n' "${rc}" >"${root}/logs/${crate}.rc"
 }
 
-# run_case <root> — run this case's runner; set OUT, STATUS and REPORT.
+# run_case <root> — run this case's runner; set OUT, STATUS, REPORT and MIX.
 #
 # REPORT is the final block only: everything from the first post-loop ERROR
 # header on. The crate logs are teed to the same stream, so asserting against
 # OUT would pass on a failing test name that only ever appeared in the 1000-line
 # scroll the operator is not reading.
+#
+# MIX is narrower still — the counted access-kind lines alone. The prose around
+# them is static and mentions neither kind, but asserting a kind's ABSENCE over
+# the whole report would be a statement about that prose as much as about the
+# tally, and would start passing for the wrong reason the day the wording moves.
 run_case() {
     local root="$1"
     OUT="$(PATH="${root}/bin:${PATH}" env -u RMLX_SKIP_GPU \
@@ -122,6 +128,10 @@ run_case() {
         /^ERROR: Metal shader validation reported invalid memory access:/ { seen = 1 }
         /^ERROR: GPU tests failed in:/ { seen = 1 }
         seen')"
+    MIX="$(printf '%s\n' "${REPORT}" | awk '
+        /^Access mix over the hits above:$/ { in_mix = 1; next }
+        in_mix && /^[[:space:]]+[0-9]+[[:space:]]/ { print; next }
+        in_mix { in_mix = 0 }')"
 }
 
 fail() {
@@ -143,6 +153,19 @@ expect_report() {
 expect_no_report() {
     case "${REPORT}" in
         *"$1"*) fail "final report should not mention: $1" ;;
+    esac
+}
+
+expect_mix() {
+    case "${MIX}" in
+        *"$1"*) ;;
+        *) fail "access mix does not count: $1" ;;
+    esac
+}
+
+expect_no_mix() {
+    case "${MIX}" in
+        *"$1"*) fail "access mix should not count: $1" ;;
     esac
 }
 
@@ -176,6 +199,13 @@ test kv::gpu_beta ... FAILEDInvalid device load at offset 4000068, executing ker
 
 failures:
 
+---- kv::gpu_beta stdout ----
+    Divergence
+thread 'kv::gpu_beta' panicked at crates/rmlx-kv-quant/src/codec_tests.rs:165:5:
+sorted vs broadcast diverge beyond atol+rtol*|b| by 0.059472658
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+failures:
     kv::gpu_beta
 
 test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
@@ -183,9 +213,13 @@ LOG
 run_case "${CASE_ROOT}"
 expect_status 1
 expect_report "ERROR: Metal shader validation reported invalid memory access:"
-expect_report "1 device load"
+expect_mix "1 device load"
 expect_report "ERROR: GPU tests failed in:"
 expect_report "kv::gpu_beta"
+# The captured-stdout block sits between the same two markers the failing names
+# are harvested from, and a panic detail can be indented exactly like a name. A
+# harvester that scrapes it reports lines that are not tests as if they were.
+expect_no_report "Divergence"
 
 # ---------------------------------------------------------------------------
 # A failing test with no validation hit still reports as itself.
@@ -199,6 +233,13 @@ test kv::gpu_beta ... FAILED
 
 failures:
 
+---- kv::gpu_beta stdout ----
+    Divergence
+thread 'kv::gpu_beta' panicked at crates/rmlx-kv-quant/src/codec_tests.rs:165:5:
+sorted vs broadcast diverge beyond atol+rtol*|b| by 0.059472658
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+failures:
     kv::gpu_beta
 
 test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
@@ -207,6 +248,7 @@ run_case "${CASE_ROOT}"
 expect_status 1
 expect_report "ERROR: GPU tests failed in:"
 expect_report "kv::gpu_beta"
+expect_no_report "Divergence"
 expect_no_report "Metal shader validation reported"
 
 # ---------------------------------------------------------------------------
@@ -229,8 +271,8 @@ LOG
 run_case "${CASE_ROOT}"
 expect_status 1
 expect_report "rmlx-kv-quant: 4 invalid access(es)"
-expect_report "4 device load"
-expect_no_report "device store"
+expect_mix "4 device load"
+expect_no_mix "device store"
 expect_no_report "ERROR: GPU tests failed in:"
 
 # ---------------------------------------------------------------------------
@@ -247,11 +289,13 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 LOG
 run_case "${CASE_ROOT}"
 expect_status 1
-expect_report "2 device store"
-expect_no_report "device load"
+expect_mix "2 device store"
+expect_no_mix "device load"
 
 # ---------------------------------------------------------------------------
-# Both kinds of access across two crates: every kind is counted, not the first.
+# Every kind of access across two crates is counted, not just the first — and
+# `device` is not the only spelling the layer emits, so a threadgroup access
+# rides along to keep the tally from being read off a hardcoded pair.
 new_case mixed_kinds || exit 1
 classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
 classify "${CASE_ROOT}" rmlx-models models_gpu_alpha
@@ -268,13 +312,67 @@ Metal GPU Validation Enabled
 running 1 test
 Invalid device store at offset 512, executing kernel function: "custom_kernel_rmlx_q8_quantize"
 Invalid device load at offset 640, executing kernel function: "custom_kernel_rmlx_q8_quantize"
+Invalid threadgroup load at offset 96, executing kernel function: "custom_kernel_rmlx_q8_quantize"
 test models::gpu_alpha ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
 LOG
 run_case "${CASE_ROOT}"
 expect_status 1
-expect_report "3 device load"
-expect_report "1 device store"
+expect_mix "3 device load"
+expect_mix "1 device store"
+expect_mix "1 threadgroup load"
+
+# ---------------------------------------------------------------------------
+# Two diagnostics adjacent on one output line, under a kernel name short enough
+# that the second one starts within the detector's bounded window. The pattern
+# is greedy, so a single match spans both and the second access — a store, the
+# severe kind — disappears from the count and the mix. Kernel names in this tree
+# run from about 20 to 50 characters, so which of the two shapes a run produces
+# is not something the reader controls.
+new_case adjacent_hits_short_kernel_name || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test kv::gpu_alpha ... okInvalid device load at offset 4096, executing kernel function: "custom_kernel_rmlx_q8_quantize"Invalid device store at offset 8192, executing kernel function: "custom_kernel_rmlx_q8_quantize"
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "rmlx-kv-quant: 2 invalid access(es)"
+expect_mix "1 device load"
+expect_mix "1 device store"
+
+# ---------------------------------------------------------------------------
+# A crate that both under-matched and failed tests: an aborting test binary
+# produces exactly that pair, since the tests after the abort never run. Both
+# lines have to reach the report — the under-match alone says a filter stopped
+# matching, which sends the reader looking for a renamed fn rather than at the
+# test that took the binary down.
+new_case undermatch_plus_failing_test || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta kv_gpu_gamma
+crate_log "${CASE_ROOT}" rmlx-kv-quant 101 <<'LOG'
+Metal GPU Validation Enabled
+running 3 tests
+test kv::gpu_alpha ... ok
+test kv::gpu_beta ... FAILED
+
+failures:
+
+---- kv::gpu_beta stdout ----
+thread 'kv::gpu_beta' panicked at crates/rmlx-kv-quant/src/codec_tests.rs:165:5:
+sorted vs broadcast diverge beyond atol+rtol*|b| by 0.059472658
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+failures:
+    kv::gpu_beta
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "under-matched (2/3 executed)"
+expect_report "kv::gpu_beta"
 
 # ---------------------------------------------------------------------------
 # A crate that under-matched its classified population is a second kind of

@@ -755,27 +755,36 @@ Read the diagnostic's own wording before assuming that is what happened. A
 *store* is corruption; a *load* is illegal but can only affect the result if the
 lanes it fills are ones the kernel keeps, and whether they are is a property of
 the kernel, not of the diagnostic. The final banner prints the mix it actually
-saw — each hit's own `device load` / `device store` wording, counted — so it is
+saw — each hit's own `device load` / `device store` wording, counted per
+diagnostic rather than per output line, since the layer writes while libtest is
+mid-line and reports routinely share a line — so it is
 read off the run rather than assumed; the one standing hit in this tree is
 160/160 loads, see the entry below on `affine_qmm_t_splitk`. The converse does
 not hold either: a clean scan does not establish that nothing read out of
 bounds, for the buffer-versus-array reason recorded with that entry.
 
-**Both kinds of red are reported in the same run.** Shader-validation hits and
-crate failures — a failing test, a crate that executed fewer tests than were
+**Every red the run found is reported, at both levels.** Shader-validation hits
+and crate failures — a failing test, a crate that executed fewer tests than were
 classified for it, a crate that produced no validation banner — accumulate
 independently across the crate loop, and every one of them is printed before the
-runner exits. That ordering is load-bearing rather than cosmetic: while any
-standing diagnostic exists, reporting the validation aggregate and exiting would
-discard the failing test names the runner already extracted, and each crate's log
-is deleted inside the loop, so nothing would survive to re-read. The failing-test
-oracle would be real, working, and starved of execution by an earlier,
-less-specific exit — the same "gate that cannot fail" shape as a vacuous oracle
-or a golden that skips silently. `scripts/run_gpu_tests_selftest.sh`
-(`make gpu-runner-selftest`, in `make ci`) pins it against stub crates, with no
-GPU: a canned libtest log per crate carrying a validation hit, a failing test, an
-under-match and a missing banner, each case asserting the reason that reaches the
-final report rather than only the exit code.
+runner exits. Within a crate the same holds: a shortfall is recorded and falls
+through to the exit-code check rather than skipping the rest, because an aborting
+test binary produces both, and a shortfall alone reads as "a filter stopped
+matching" and sends the reader after a renamed fn instead of the test that took
+the binary down.
+
+That ordering is load-bearing rather than cosmetic: while any standing diagnostic
+exists, reporting the validation aggregate and exiting would discard the failing
+test names the runner already extracted, and each crate's log is deleted inside
+the loop, so nothing would survive to re-read. The failing-test oracle would be
+real, working, and starved of execution by an earlier, less-specific exit — the
+same "gate that cannot fail" shape as a vacuous oracle or a golden that skips
+silently. `scripts/run_gpu_tests_selftest.sh` (`make gpu-runner-selftest`, in
+`make ci` and in the hosted `source gates` job) pins it against stub crates, with
+no GPU: a canned libtest log per crate carries a validation hit, a failing test,
+an under-match, a missing banner and two diagnostics sharing one output line, and
+each case asserts the reason that reaches the final report rather than only the
+exit code.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 

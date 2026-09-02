@@ -314,6 +314,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make check-kv-codec-disposition-fixtures` | CI gate (in `make ci`): recall test for the above, 18 synthetic scan roots (one edit each), each asserting which rule fired and exit 2 vs exit 1. |
 | `make check-kv-byte-model-parity` | CI gate (in `make ci`): `scripts/perf_ceiling.py`'s KV byte model against the engine's, swept from `ALL_KV_QUANTS` across both topologies and two shapes. The engine is the oracle — this does not check either model is right, only that there is effectively one of them. |
 | `make check-kv-byte-model-parity-fixtures` | CI gate (in `make ci`): recall test for the above, synthetic scan roots asserting the reason as well as exit 2 vs exit 1. |
+| `make gpu-runner-selftest` | CI gate (in `make ci` and hosted CI): the GPU runner reports a shader-validation hit and a crate failure found in the same run, and the access mix it prints is the one the diagnostics named. Stub crates, no GPU. |
 | `make check-doc-source-citations` | CI gate (in `make ci`): every `crates/...` path cited in `docs/` resolves. Covers paths only, not identifiers — telling a test name from a variable needs a parser. |
 | `make check-eval-lock` | CI gate (in `make ci`): every MLX eval FFI call is made under the process-wide evaluation lock (25-symbol reach-set). |
 | `make check-eval-lock-fixtures` | CI gate (in `make ci`): recall test for the above, 26 synthetic scan roots, each asserting which rule fired. |
