@@ -2672,13 +2672,12 @@ impl KvCache {
         // strided view over the parent allocation — `eval` does not flatten it.
         // Two things follow that the seed's own contract denies. It is not
         // compact: the whole `max_seq` parent stays resident behind it until the
-        // first decode step expands the mirror. And anything that reads the
-        // buffer by raw linear offset rather than by stride — `Array::to_bytes`,
-        // which is how the SSD tier serialises it — sees the parent's leading
-        // bytes under the slice's shape, i.e. head 0's whole row window in place
-        // of every head. Materialising row-major here, on the inference thread
-        // that owns the Metal stream, is what makes the seed mean what its shape
-        // says for every later reader.
+        // first decode step expands the mirror. And a raw-linear MSL kernel —
+        // which is what the flash-decode paths feed this seed to — reads the
+        // parent's leading bytes under the slice's shape, i.e. head 0's whole
+        // row window in place of every head. Materialising row-major here, on
+        // the inference thread that owns the Metal stream, is what makes the
+        // seed mean what its shape says for every later reader.
         let is_bf16_storage = matches!(self.storage, KvStorage::None { .. });
         let need_k_seed = is_bf16_storage || self.quant.feeds_bf16_k_at_decode(self.shares_kv);
         let need_v_seed = is_bf16_storage || self.quant.feeds_bf16_v_at_decode(self.shares_kv);

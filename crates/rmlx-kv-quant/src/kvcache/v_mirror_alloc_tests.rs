@@ -649,11 +649,6 @@ fn slice_v_prefix_cuts_the_valid_rows_at_a_non_pow2_head_dim() {
 
     let cut = slice_v_prefix(&mirror, valid, Device::Cpu).expect("slice_v_prefix");
     assert_eq!(cut.shape(), vec![B, kv_h, valid, head_dim]);
-    // Materialise before reading: `to_bytes` hands back the backing buffer, so
-    // a strided view read straight out of it reports the allocation's leading
-    // elements rather than the view's.
-    let cut = cut.contiguous(Device::Cpu).expect("cut contiguous");
-    cut.eval().expect("cut eval");
     let got: Vec<f32> = cut
         .to_bytes()
         .expect("cut bytes")

@@ -222,6 +222,140 @@ fn slice_1d() {
     assert_eq!(out, vec![20.0, 30.0, 40.0]);
 }
 
+// ── to_bytes over non-contiguous views ────────────────────────────────────
+//
+// Every array below shares its parent's allocation and differs from it only in
+// strides, so a reader that walks the data pointer linearly returns the
+// parent's leading elements under the view's shape — right length, right
+// dtype, wrong values, no error. `slice_1d` above cannot cover this: a rank-1
+// stride-1 slice is dense by construction because its offset lands in the data
+// pointer.
+
+#[test]
+fn to_bytes_of_a_strided_slice_reads_the_slice() {
+    let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+    let a = Array::from_bytes(f32_as_bytes(&data), &[1, 2, 4, 2], Dtype::F32).unwrap();
+    // Take the first two of four sequence positions in both heads.
+    let view = a
+        .slice(&[0, 0, 0, 0], &[1, 2, 2, 2], &[1, 1, 1, 1], Device::Cpu)
+        .unwrap();
+    let out = bytes_to_f32(&view.to_bytes().unwrap());
+    assert_eq!(
+        out,
+        vec![0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0],
+        "head 1 must start at element 8; [4..8] is the parent's tail of head 0"
+    );
+}
+
+#[test]
+fn to_bytes_of_a_rank2_slice_reads_the_window() {
+    let data: Vec<f32> = (0..9).map(|i| i as f32).collect();
+    let a = Array::from_bytes(f32_as_bytes(&data), &[3, 3], Dtype::F32).unwrap();
+    // Two leading columns of every row.
+    let view = a.slice(&[0, 0], &[3, 2], &[1, 1], Device::Cpu).unwrap();
+    let out = bytes_to_f32(&view.to_bytes().unwrap());
+    assert_eq!(out, vec![0.0, 1.0, 3.0, 4.0, 6.0, 7.0]);
+}
+
+#[test]
+fn to_bytes_of_a_transpose_reads_the_permuted_order() {
+    let data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let a = Array::from_bytes(f32_as_bytes(&data), &[2, 3], Dtype::F32).unwrap();
+    let view = a.transpose(&[1, 0], Device::Cpu).unwrap();
+    assert_eq!(view.shape(), vec![3, 2]);
+    let out = bytes_to_f32(&view.to_bytes().unwrap());
+    assert_eq!(out, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+}
+
+#[test]
+fn to_bytes_of_an_attention_v_transpose_reads_head_major_order() {
+    // The shape every attention block hands to the KV cache: `[b, seq, kv_h,
+    // head_dim]` permuted to `[b, kv_h, seq, head_dim]`. Dense at seq == 1 —
+    // the permuted axis has extent 1 — and strided for every longer step.
+    let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+    let a = Array::from_bytes(f32_as_bytes(&data), &[1, 3, 2, 2], Dtype::F32).unwrap();
+    let view = a.transpose(&[0, 2, 1, 3], Device::Cpu).unwrap();
+    assert_eq!(view.shape(), vec![1, 2, 3, 2]);
+    let out = bytes_to_f32(&view.to_bytes().unwrap());
+    assert_eq!(
+        out,
+        vec![0.0, 1.0, 4.0, 5.0, 8.0, 9.0, 2.0, 3.0, 6.0, 7.0, 10.0, 11.0]
+    );
+}
+
+#[test]
+fn to_bytes_of_a_broadcast_reads_the_expanded_shape() {
+    // A broadcast view is the one case where the linear read is not merely
+    // wrong: its logical size exceeds the elements the parent actually owns.
+    let data: [f32; 3] = [1.0, 2.0, 3.0];
+    let a = Array::from_bytes(f32_as_bytes(&data), &[1, 3], Dtype::F32).unwrap();
+    let view = broadcast_to(&a, &[2, 3], Device::Cpu).unwrap();
+    let out = bytes_to_f32(&view.to_bytes().unwrap());
+    assert_eq!(out, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn reshape_of_a_transposed_view_is_relaid_out_and_says_so() {
+    // `to_bytes` skips the relayout on the strength of the layout flag, so the
+    // flag has to be right about the one op that quietly materialises a copy:
+    // MLX reshapes a non-row-contiguous input by copying it dense.
+    let data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let a = Array::from_bytes(f32_as_bytes(&data), &[2, 3], Dtype::F32).unwrap();
+    let flat = a
+        .transpose(&[1, 0], Device::Cpu)
+        .unwrap()
+        .reshape(&[6], Device::Cpu)
+        .unwrap();
+    flat.eval().unwrap();
+    assert!(flat.is_row_contiguous().unwrap());
+    assert_eq!(
+        bytes_to_f32(&flat.to_bytes().unwrap()),
+        vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+    );
+}
+
+/// GPU variant — the relayout runs on the CPU stream while the view it reads
+/// was evaluated on the Metal one, which is the one thing the CPU cases above
+/// cannot show.
+#[test]
+#[ignore = "requires Metal GPU; run with `-- --ignored` in a GPU-capable environment"]
+fn to_bytes_of_a_gpu_transpose_reads_the_permuted_order() {
+    let data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let a = Array::from_bytes(f32_as_bytes(&data), &[2, 3], Dtype::F32).unwrap();
+    let view = a.transpose(&[1, 0], Device::Gpu).unwrap();
+    view.eval().unwrap();
+    let out = bytes_to_f32(&view.to_bytes().unwrap());
+    assert_eq!(out, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+}
+
+#[test]
+fn to_bytes_of_an_empty_array_is_empty() {
+    // The load-path warmup evaluates a `[0]` array through this method.
+    let a = Array::from_bytes(&[], &[0], Dtype::F32).unwrap();
+    assert!(a.to_bytes().unwrap().is_empty());
+}
+
+#[test]
+fn layout_flag_classifies_views_once_they_are_evaluated() {
+    // The flag describes a materialised buffer, so it is only meaningful after
+    // `eval` — which is the order `to_bytes` reads it in.
+    let data: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let a = Array::from_bytes(f32_as_bytes(&data), &[2, 3], Dtype::F32).unwrap();
+    a.eval().unwrap();
+    assert!(a.is_row_contiguous().unwrap());
+
+    let view = a.transpose(&[1, 0], Device::Cpu).unwrap();
+    view.eval().unwrap();
+    assert!(!view.is_row_contiguous().unwrap());
+
+    let dense = view.contiguous(Device::Cpu).unwrap();
+    dense.eval().unwrap();
+    assert!(
+        dense.is_row_contiguous().unwrap(),
+        "the relayout to_bytes falls back to must itself be readable linearly"
+    );
+}
+
 // ── slice_update ──────────────────────────────────────────────────────────
 
 #[test]

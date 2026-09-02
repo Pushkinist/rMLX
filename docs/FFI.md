@@ -829,6 +829,48 @@ returns `Err` if the pointer is null.
 let bytes = unsafe { std::slice::from_raw_parts(ptr, nbytes) }.to_vec();
 ```
 
+**The contract is the array's logical elements in row-major order, for any
+input.** Evaluating is not enough to earn that: a transpose, a strided slice
+and a broadcast all evaluate to the *parent's* allocation with adjusted strides
+— the same "`eval` materialises but does not relayout" fact the MSL-kernel
+rules above turn on — while `mlx_array_nbytes` reports the *logical*
+`size * itemsize`. Reading that many bytes linearly off such a
+view returns the parent's leading elements under the view's shape — right
+length, right dtype, wrong values, and for a broadcast a read past the end of
+the allocation, since the logical size exceeds the elements the parent owns.
+
+So `to_bytes` reads `_mlx_array_is_row_contiguous` after evaluating and, when
+it is false, relays the array out through `contiguous()` on the CPU stream and
+reads the copy. The flag is only meaningful once the array is evaluated, which
+is why the order is eval → classify → read. Cost: a dense array — every
+reduction, elementwise, matmul and kernel output — pays one extra layout-flag
+read; the copy falls only on inputs whose linear read would otherwise be wrong.
+The CPU stream is the right one because the bytes are bound for host memory and
+the caller is already blocking on them, so no GPU dispatch is added to a read
+path that already dereferences the buffer from the host.
+
+`_mlx_array_is_row_contiguous` is declared in `mlx/c/array.h` as an **internal
+function** — "use at your own risk", no stability promise — so every host
+readback in the workspace now depends on one. That is a deliberate trade: the
+alternative is recomputing the predicate from `mlx_array_strides` and
+`mlx_array_shape`, which duplicates MLX's own definition of the flag and drifts
+from it silently. `layout_flag_classifies_views_once_they_are_evaluated`
+(`crates/rmlx-mlx/src/lib_tests.rs`) is the behaviour pin: it asserts the flag's
+answer for a dense array, a transpose, and a `contiguous()` result, and must be
+re-run whenever the pinned mlx / mlx-c pair moves (`crates/rmlx-mlx/src/pin.rs`). Note what
+it pins and why the order in `to_bytes` is eval → classify → read: before
+evaluation the flag describes a buffer that is not attached yet and answers
+`true` for a transpose.
+
+Callers therefore never need a defensive `.contiguous()` purely to make a
+readback correct. Sites that call it before `to_bytes` for a *different* reason
+— compacting a slice so the parent allocation can be dropped, or handing the
+same array to a raw-linear MSL kernel — keep it. Pinned by the non-contiguous
+readback cases in `crates/rmlx-mlx/src/lib_tests.rs` (strided slice, rank-2
+window, transpose, the `[b, seq, kv_h, head_dim]` attention permutation, and
+broadcast), plus `reshape_of_a_transposed_view_is_relaid_out_and_says_so`,
+which pins the flag's honesty about the one op that quietly copies.
+
 ---
 
 ## Core Ops
