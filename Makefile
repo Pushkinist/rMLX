@@ -94,7 +94,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-kv-codec-disposition-fixtures \
         check-kv-byte-model-parity check-kv-byte-model-parity-fixtures \
         check-no-decode-swallow check-gpu-tests-ignored \
-        check-gpu-tests-ignored-fixtures \
+        check-gpu-tests-ignored-fixtures gpu-runner-selftest \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
         check-kernel-dtype-contract check-kernel-dtype-contract-fixtures \
@@ -410,6 +410,9 @@ check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspac
 check-gpu-tests-ignored-fixtures: ## CI gate: the #[ignore] gate still fires on macro-generated and helper-reached GPU tests
 	@bash scripts/check_gpu_tests_ignored_fixtures.sh
 
+gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a shader-validation hit in the same run, and reports the access mix it saw (stubbed crates, no GPU)
+	@bash scripts/run_gpu_tests_selftest.sh
+
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
 	@bash scripts/check_no_kernel_input_eval.sh
 
@@ -448,6 +451,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_eval_lock_fixtures.sh
 	@bash scripts/check_gpu_tests_ignored.sh
 	@bash scripts/check_gpu_tests_ignored_fixtures.sh
+	@bash scripts/run_gpu_tests_selftest.sh
 	@bash scripts/check_no_kernel_input_eval.sh
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
 	@bash scripts/check_kernel_dtype_contract.sh

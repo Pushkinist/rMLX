@@ -191,6 +191,18 @@ VALIDATION_BANNER='Metal GPU Validation Enabled'
 # is what keeps a test's own "invalid" wording from forging a hit.
 VALIDATION_DIAGNOSTIC='Invalid .{0,120}(at offset [0-9]+|executing kernel function:)'
 
+# The access kind as the layer itself worded it — `device load`, `device store`
+# and the threadgroup spellings all arrive through the pattern above, and they
+# differ in severity: a dropped write is corruption outright, a zero-filled read
+# only matters if the kernel keeps the lanes it filled. Reads diagnostics on
+# stdin, one per line, and writes one kind per line.
+access_kind() {
+    sed -E -e 's/^Invalid[[:space:]]+//' \
+           -e 's/[[:space:]]*(at offset [0-9]+|executing kernel function:).*$//' \
+           -e 's/[[:space:]]*,[[:space:]]*$//' \
+           -e 's/^$/unnamed access/'
+}
+
 # Same environment the crates run under, hoisted so the canary above can use it.
 # `${arr[@]+"${arr[@]}"}` is the portable spelling: mtl_unset is empty whenever
 # the caller exported no MTL_* names, and expanding an empty array is an
@@ -296,6 +308,7 @@ failed_crates=""
 total_passed=0
 total_failed=0
 validation_hits=""
+validation_kinds=""
 
 if [ "${SHADER_VALIDATION}" = "1" ]; then
     echo "shader validation: ON (invalid Metal memory access fails this run)"
@@ -308,7 +321,7 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
     #
     # The canary kernel stores out of bounds on purpose and lives behind its own
     # feature, so it is not built into any ordinary test run.
-    canary_log="$(mktemp -t rmlx-gpu-canary)"
+    canary_log="$(mktemp "${TMPDIR:-/tmp}/rmlx-gpu-canary.XXXXXX")"
     "${validation_prefix_canary[@]}" cargo test --no-fail-fast -p rmlx-kv-quant \
         --features shader-validation-canary --lib -- \
         --ignored --test-threads=1 "${CANARY_TEST}" >"${canary_log}" 2>&1
@@ -345,7 +358,7 @@ for crate in "${crates[@]}"; do
     done < <(printf '%s' "${selected}" | awk -F'\t' -v c="${crate}" '$1 == c {print $2}' | sort -u)
     echo "── ${crate} (${classified} GPU tests) ──────────────────────────"
 
-    log="$(mktemp -t "rmlx-gpu-test-${crate}")"
+    log="$(mktemp "${TMPDIR:-/tmp}/rmlx-gpu-test-${crate}.XXXXXX")"
     # `--tests` selects every target with `test = true` — the lib's unit tests,
     # each bin's unit tests, and the `tests/*.rs` integration binaries. That is
     # exactly the set the classifier scans, so the runner cannot be pointed at
@@ -392,10 +405,15 @@ for crate in "${crates[@]}"; do
     # Harvest the failing test names while the log still exists — a red gate
     # that only names the crate leaves an operator unable to tell their own
     # regression from the known baseline without re-running by hand.
+    # libtest prints the region twice: a captured-output block per failure, then
+    # the plain name list. `---- <name> stdout ----` opens the first, so it ends
+    # the harvest; a panic detail or a line the test itself printed is indented
+    # exactly like a name and would otherwise be reported as a failing test.
     crate_fails="$(awk '
         /^failures:$/ { f = 1; next }
+        /^---- / { f = 0 }
         /^test result:/ { f = 0 }
-        f && /^    [A-Za-z_]/ { print $1 }
+        f && /^    [A-Za-z_][A-Za-z0-9_:]*$/ { print $1 }
     ' "${log}" | sort -u)"
 
     if [ "${SHADER_VALIDATION}" = "1" ]; then
@@ -408,14 +426,25 @@ for crate in "${crates[@]}"; do
         # Report the kernel each hit names, deduped — a codec's kernel name is
         # the actionable identifier here. The buffer field is not: MLX owns the
         # allocator, so KV stores come through as `buffer: <unnamed>`.
-        hits="$(grep -Eo "${VALIDATION_DIAGNOSTIC}[^\"]*\"[^\"]*\"" "${log}" \
+        # Split first, then match. The layer writes to stderr while libtest is
+        # mid-line, so reports routinely share an output line, and the detector's
+        # bounded `.{0,120}` is greedy: with a short kernel name the second
+        # report starts inside that window and both collapse into one match,
+        # losing the second one's kernel, kind and count. Everything below is
+        # then per diagnostic rather than per line, so the mix in the final
+        # banner sums to the count printed beside it.
+        one_per_line="$(awk '{ gsub(/Invalid /, "\n&"); print }' "${log}")"
+        hits="$(printf '%s\n' "${one_per_line}" \
+                | grep -Eo "${VALIDATION_DIAGNOSTIC}[^\"]*\"[^\"]*\"" \
                 | grep -Eo 'kernel function: "[^"]*"' | sort | uniq -c | sort -rn)"
-        n_hits="$(grep -Ec "${VALIDATION_DIAGNOSTIC}" "${log}")"
+        diagnostics="$(printf '%s\n' "${one_per_line}" | grep -Eo "${VALIDATION_DIAGNOSTIC}")"
+        n_hits="$(printf '%s' "${diagnostics}" | grep -c '.')"
         if [ "${n_hits}" -gt 0 ]; then
             validation_hits="${validation_hits}  ${crate}: ${n_hits} invalid access(es)"$'\n'
             if [ -n "${hits}" ]; then
                 validation_hits="${validation_hits}$(printf '%s\n' "${hits}" | sed 's/^/    /')"$'\n'
             fi
+            validation_kinds="${validation_kinds}$(printf '%s\n' "${diagnostics}" | access_kind)"$'\n'
         fi
     fi
     rm -f "${log}"
@@ -430,10 +459,14 @@ for crate in "${crates[@]}"; do
     # built, a test compiled out behind a feature — which is silence, not
     # success. Over-matching inflates `executed` and is harmless, so this is a
     # one-sided `-lt`.
+    #
+    # It records and falls through rather than skipping the rest of the crate: a
+    # test binary that aborts produces both a shortfall and a non-zero exit, and
+    # reporting only the shortfall sends the reader after a renamed fn instead of
+    # the test that took the binary down.
     if [ "${executed}" -lt "${classified}" ]; then
         echo "ERROR: ${crate} classified ${classified} GPU tests but executed ${executed} — a filter stopped matching." >&2
         failed_crates="${failed_crates}  ${crate}: under-matched (${executed}/${classified} executed)"$'\n'
-        continue
     fi
     if [ "${rc}" -ne 0 ]; then
         failed_crates="${failed_crates}  ${crate}:"$'\n'
@@ -449,16 +482,30 @@ for crate in "${crates[@]}"; do
 done
 
 echo
+# Every kind of red this run found is printed before the single exit at the end.
+# The two accumulators fill independently across the crate loop and co-occur
+# routinely: exiting inside the first block would compute the failing test names,
+# hold them in a shell variable, and discard them, leaving an operator who is
+# triaging a standing validation diagnostic no sign that a test also went red in
+# the same run. Each crate's log is deleted inside the loop, so what is not
+# printed here is gone.
+red=0
+
 # An invalid access is a failure even though every test reported `ok` and cargo
-# exited 0 — that is the whole point: the store is dropped, the buffer freezes,
-# and the assertions downstream of it still pass.
+# exited 0 — that is the whole point: the access never reaches the buffer, and
+# the assertions downstream of it still pass.
 if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${validation_hits}" ]; then
     echo "ERROR: Metal shader validation reported invalid memory access:" >&2
     printf '%s' "${validation_hits}" >&2
     echo >&2
-    echo "An out-of-bounds device store is DROPPED, not raised: the tests above" >&2
-    echo "still passed and cargo still exited 0. Treat this as corruption." >&2
-    exit 1
+    echo "Access mix over the hits above:" >&2
+    printf '%s' "${validation_kinds}" | sort | uniq -c | sort -rn | sed 's/^ */    /' >&2
+    echo "An invalid access is DROPPED, not raised — an invalid write is discarded," >&2
+    echo "an invalid read is zero-filled — so the tests over it can still report ok" >&2
+    echo "with cargo exiting 0. A write that never landed is corruption outright; a" >&2
+    echo "read only matters if the kernel keeps the lanes it filled, so read the mix." >&2
+    echo >&2
+    red=1
 fi
 
 if [ -n "${failed_crates}" ]; then
@@ -474,6 +521,10 @@ if [ -n "${failed_crates}" ]; then
     echo "from one you inherited, and it is cheap. See docs/TESTING.md." >&2
     echo "A crate reported as 'ran uninstrumented' usually failed to BUILD: no test" >&2
     echo "binary means no Metal device and therefore no validation banner." >&2
+    red=1
+fi
+
+if [ "${red}" = "1" ]; then
     exit 1
 fi
 
