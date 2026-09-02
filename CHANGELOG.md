@@ -7,6 +7,254 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-02
+
+A patch release carrying one decode-path fix, one correction to what the
+operator surfaces claim, and the gates that keep both honest. The HTTP surface
+is unchanged and no default moves.
+
+The decode fix is narrow and its boundary is worth stating up front: it removes
+a per-layer, per-step copy of the bf16 V prefix that only the iso / rotor /
+planar flash-decode dispatchers reached, and only at `kv_h > 1`. The default is
+still `DEFAULT_KV_QUANT = KvQuant::None`, which dispatches none of those
+kernels, so a run that does not name one of those codecs sees no change — the
+`kv_h == 1` control cell measures exactly zero. Alongside it, a silent
+wrong-output check that had degraded to a `debug_assert` — compiled out of
+`release-perf` and executed by no gate — is a real error again in every profile.
+
+The correction is to what rMLX told operators about its own KV codecs. Four
+`iso*` codecs were filed under "measures LARGER than bf16" while holding 0.758x
+and 0.879x of it, and `--kv-bits` recommended `--kv-quant none` as the smallest
+cache on shared-KV architectures where `iso3_sym` is three quarters of that.
+Rather than retype the numbers, the help now points at a table a program
+computes.
+
+### Fixed
+
+- **The flash-decode dispatchers stride over the bf16 V mirror instead of
+  materialising its prefix.** `update_decode_fp16_v_only` returned a `..offset`
+  cut of a head-major `[b, kv_h, max_seq, head_dim]` allocation, cut on axis 2.
+  That view is row-contiguous only when `b * kv_h == 1`, so the iso / rotor /
+  planar dispatchers' flatten of it materialised the whole valid V prefix — once
+  per layer per decode step, with no `contiguous()` call anywhere to make the
+  copy visible. The site straddles two files, which is why two earlier
+  investigations each got it half right: the slice is in `kvcache/update.rs`,
+  the reshape in the dispatcher.
+
+  All three now take the mirror whole and carry its sequence extent as a `dims`
+  slot the kernel indexes V's sequence axis with; `kv_seq` still bounds the tile
+  loop, the seq-major K index and the mask index. One helper, `flatten_v_mirror`,
+  owns the shape contract for all three, and `VMirror` pairs the allocation with
+  its valid prefix so the two cannot drift apart among five same-typed `i32`
+  parameters.
+
+  Measured on Ternary-Bonsai-8B at 4k / 16 tokens, `--emit-token-ids`, binaries
+  snapshotted and verified distinct by sha256 **and** by a symbol present in
+  only one — `metal_gen_alloc_mb`:
+
+  | model | `kv_h` | codec | before | after | token ids |
+  |---|---|---|---|---|---|
+  | Ternary-Bonsai-8B | 8 | `k_iso3` | 2 176.2 | **1 886.5** | identical |
+  | Ternary-Bonsai-8B | 8 | `k_rotor3` | 2 307.1 | **2 003.8** | identical |
+  | gemma-4-e2b | 1 | `k_iso3` | 1 077.6 | 1 077.6 | identical |
+
+  −289.7 MB against a shape-derived prediction of
+  `36 x 8 x 3786 x 128 x 2 B = 279.2 MB`. The `kv_h == 1` row is the negative
+  control: unchanged in bytes and in output, because that slice was already
+  contiguous.
+
+  **No throughput claim is made.** At the gate shape the ABBA ranges overlap at
+  n=6 per arm and TPS drifts 11% across runs on this host, so the oracle is
+  resident growth per decoded token — where every `max_seq`-sized buffer is
+  allocated before the window and cancels, leaving only prefix-scaled terms.
+  Over 1 024 decode steps at `kv_h=8`: 1.86 MB with the mirror passed whole,
+  6.05 MB with the cut passed instead, against a 3.15 MB budget. Its first
+  design was vacuous and only mutation-checking caught it — a peak-memory
+  bracket reads green against a deliberately reintroduced copy, because Metal
+  releases a dispatch's buffers on the *next* dispatch. Each codec's clean floor
+  is measured rather than shared (886 per mille of one V prefix for `iso3`,
+  1 144 for `rotor3`), so K-side drift gets its own named failure instead of
+  eating the V-side margin. (#469, closes #467)
+
+- **The V mirror's valid length is checked in every profile.** Striding over the
+  mirror removed an always-on check without replacing it: the old flatten
+  targeted `b * kv_h * kv_seq * head_dim` elements, and MLX's `reshape` rejects
+  an element-count mismatch, so a mirror shorter than the attended length could
+  not reach the kernel anywhere. Flattening the allocation matches whatever was
+  passed, leaving only a `debug_assert` — compiled out of `release-perf`, and
+  behind no gate, since `make ci` runs `dev` with no `--ignored` and `test-perf`
+  executes no `Device::Gpu` test. A step whose store ran ahead of its mirror
+  would have attended the mirror's tail and returned plausible-but-wrong output
+  with no error. `flatten_v_mirror` now rejects `valid != kv_seq` as an
+  `Error::Quant`, and its regression test is `Device::Cpu` and deliberately not
+  `#[ignore]`d, so it runs under `make test`, `make ci` and `make test-perf`.
+  (#469)
+
+- **The operator surfaces stop quoting hand-written residency ratios.** The
+  `--kv-quant` help filed `iso3_sym`, `iso4_sym`, `k_iso3` and `k_iso4` under
+  "Runs its codec — and measures LARGER than bf16" at 1.00x–1.05x. All four are
+  under it: 12.125 and 14.0625 bits per value at `head_dim` 128, 0.758x and
+  0.879x of bf16 on a global layer, on both topologies. `--kv-bits` closed by
+  recommending `--kv-quant none` as the smallest cache on a shared-KV
+  architecture, where `iso3_sym` is three quarters of it. The rotor ratios were
+  roughly twenty times their true distance from 1.0.
+
+  The stale numbers were the symptom: all six wrong figures were written when
+  they were correct and carried unchanged through the two commits that moved the
+  stores underneath them, because no rule in `check_kv_codec_disposition.sh`
+  reads a number. So the ratios are gone rather than corrected —
+  `rmlx info --list-cache-types` now prints, per codec and for both topologies,
+  what `estimated_resident_bytes_per_layer` says a global layer holds, and the
+  help points at it. (#461)
+
+- **The MLX pin gate keys on what dyld resolved, and runs where measurements are
+  taken.** The pin was checked only where it cannot fail: `build.rs` warned on
+  keg drift and on a metallib without `steel_gemm_fused_nax`, but cargo re-runs
+  a build script only for a *newer* mtime and stats through symlinks, so
+  repointing `opt/mlx` at an older keg moves the observed mtime backwards and
+  cargo replays its cached output. The drift costs ~3.8x on GPU matmul while
+  output stays correct and decode stays flat, so only prefill numbers go quietly
+  wrong. The gate now reads the two dylibs dyld resolved for the running
+  process, compares both keg versions to `mlx-pin.txt`, and scans the resolved
+  metallib for the kernel family — the load-bearing half, because bottle
+  contents vary by build runner and a version match is not evidence. `rmlx
+  baseline` and `rmlx bench` call it before anything else, which is
+  dyld-truthful by construction: the preflight's `readlink` oracle can read
+  green while the process loads something else entirely. (#462)
+
+- **The pin parsers are fenced.** Pin versions reached `rm -rf`, `cp -R` and
+  `ln -sfn` targets under the Cellar after nothing but a non-empty check; a pin
+  line of `mlx ..` yielded `rm -rf "$CELLAR/mlx/.."`. Both parsers now allowlist
+  the shape of a keg directory name, and the shell one moved into
+  `scripts/lib/mlx_pin.sh` so there is a single grammar, held to the Rust one by
+  a differential test with controls in both directions. (#462)
+
+### Tested
+
+- **mxfp8 measured against MLX affine 8-bit at equal rate.** Both spend 8.250
+  bits per value, measured from the arrays MLX returns (mxfp8 at group 32 ties
+  affine at group 128 exactly), which is the only rate at which the comparison
+  means anything. At that rate mxfp8 is 4.39x–10.24x worse on relative Frobenius
+  error across 42 cells spanning three fixtures, two head dims, five outlier
+  magnitudes and three seeds. A best-case E4M3 arm is carried alongside, because
+  MLX's encoder rounds its E8M0 shared exponent to nearest and clips the group
+  maximum in 46.7% of groups when that rounds down; under a non-clipping scale
+  the format still never reaches the declared 0.85x material threshold. The
+  fixture's power is measured rather than assumed — the outlier fixture
+  separates affine-g32 from affine-g128 at 0.53–0.58x where a uniform LCG
+  fixture reads 1.06x and sees nothing. (#464)
+
+- **A rotation-sensitive fidelity gate for the turbo family.** Neither committed
+  turbo fidelity surface could price the transform the family lacks: the
+  rate-distortion fixture is i.i.d. Gaussian, where the Lloyd-Max codebook's
+  assumption already holds and an identity rotation passes, and the
+  outlier-fixture comparison against iso / rotor / planar confounds the missing
+  rotation with four-times-coarser scale granularity. The new gate holds codec,
+  width and group size fixed and moves only a full-`head_dim` Walsh-Hadamard.
+  Measured on the outlier fixture, in bits of SQNR the rotation buys: +2.077 /
+  +2.004 / +1.574 / +0.961 at 1 / 2 / 3 / 4 bits, against exactly 0.000 with the
+  transform removed. It accounts for 87.5% of `turbo3`'s reconstruction-error
+  deficit against `iso3` and 79.4% of `turbo4`'s against `iso4`, and is worth
+  about 0.01 bits on i.i.d. Gaussian — the shape the literature reports for the
+  Value cache.
+
+  The criterion was declared before measuring, and the result is recorded in the
+  bucket it landed in rather than the one it was hoped for: two of four
+  pre-declared conditions are unmet, so the verdict is **FAIL**, stated as such
+  and reconciled condition by condition. The shortfall at the widest width is
+  pinned rather than tuned away. (#465)
+
+### Changed
+
+- `rmlx baseline` and `rmlx bench` refuse to run when the pin binds and the
+  loaded MLX pair is wrong, rather than producing numbers from an unknown
+  library. `mlx_preflight.sh` likewise refuses an unpinned pair on the hosts it
+  binds; both it and `mlx_restore_pin.sh` read `mlx-pin.txt` instead of carrying
+  their own copies of the versions.
+- `perf_ceiling.py`'s KV byte model is held to the engine's by
+  `make check-kv-byte-model-parity`, which sweeps `ALL_KV_QUANTS` across both
+  topologies and two shapes. The second copy had drifted on three axes at once —
+  up to 3.46x on `mixed_k8g64_v4g64`. The engine is the oracle; the Python half
+  chooses nothing about what is covered, so a new codec reaches the gate without
+  anyone adding it to a list. (#461)
+- The KV-codec disposition gate's help scope is derived from the clap attributes
+  across the whole CLI crate rather than from a hand-written list, so a help
+  constant in any module is in scope. It found `CACHE_TYPE_K_LONG_HELP` and
+  `CACHE_TYPE_V_LONG_HELP` — operator-facing KV help under no rule at all — and
+  `KV_PRESET_LONG_HELP`, which named five inert codecs outside any INERT marker.
+  A new rule rejects any ratio-shaped figure in those constants outright: a
+  corrected number is the same defect. (#461)
+- `make check-doc-source-citations` gates that every `crates/...` path cited in
+  `docs/` resolves. Nine such paths named files that had moved crate or become
+  `mod.rs`. (#471, #472)
+
+### Removed
+
+- `RMLX_MLX_NAX`. It was a `cargo:rustc-env` set by the build script, not an
+  operator knob; `events.mlx_nax` now comes from the runtime metallib scan, so a
+  bench row cannot claim a capability the run did not have. (#462)
+
+### Documentation
+
+- **"Quantized KV always loses at decode" is retired.** It was a statement about
+  8-bit K that had been reading as a statement about codecs. The same harness,
+  the same model and the same ABBA design run with K at 4 bits
+  (`mixed_k4g64_v4g64`) change the sign: on the dense 8B target the 4-bit-K arm
+  beats `none` with the arms' per-slot ranges disjoint, at a 32k prompt and again
+  at a 63k one — where the 8-bit-K arm at identical shapes returns INCONCLUSIVE.
+  The earlier null is sound and was not a measurement error; one of the new cells
+  independently reproduces the old Bonsai row in a different session. It was
+  measured at the wrong K width, and no 4-bit-K cell existed anywhere in this
+  tree until then.
+
+  Read the consequence narrowly. The win is on the `Mixed` path through MLX's
+  `quantized_matmul`, not on a fused flash-decode kernel over a packed store, so
+  it does not transfer to the iso / rotor / planar ring. It is not a
+  long-context effect — it holds at 32k as well as 63k. No default changes on
+  this result; acting on it is a preset question, not a patch-release one.
+  `docs/PERF_BASELINE.md`'s codec-cell section is scoped to 8-bit K accordingly.
+  (#471)
+
+- **The decode ceiling.** An ablation ladder that deletes 100% of a fused codec's
+  decode math still leaves it far short of `none`, so the kernel *shell* — not
+  codec arithmetic — is the majority of the gap. That puts every decode-math
+  proposal under one ceiling below parity and redirects the next measurement to a
+  shell variant. Three of the ladder's four arms are throwaway instrumented
+  binaries reproducible from no committed ref, so no ratio from it is written
+  down: the rung ordering is the durable result. (#471)
+
+- The residency cells withdrawn in 0.4.0 now point at the `runs.db` rows that
+  measured them, with the query, in both pages that carried them.
+  `docs/PERF_BASELINE.md` was still carrying pre-elision ratios in four table
+  cells and five sentences while `docs/KV_QUANT.md` had withdrawn them — one
+  number, two pages, two answers. The attribution is corrected: the mirror
+  elision moves part of the distance and the later in-family boundary floor moves
+  the rest. (#471)
+
+- The turbo family's docs stop claiming a Walsh-Hadamard transform the encoder
+  does not have — `turboquant.rs` contains no Hadamard code, and the `_wht_`
+  layout tags are SSD geometry identifiers. Turbo is primarily a V codec, and the
+  rotation is worth ~a bit or two on K-shaped data against ~a hundredth of a bit
+  on V-shaped, so its value and its cost are inverted. (#471)
+
+- Architecture facts corrected against the checkpoints and the loader: e2b's
+  depth is not e4b's and its alternation period differs, so `layer_types` is the
+  only authority; Gemma4 splits KV heads by layer class on every size, not just
+  where the override field ships; Bonsai-8B's context caps below the 131k column
+  its `kv_frac` row projects. The GQA screen does not reproduce on 8:1, and the
+  dilution arithmetic was backwards — sliding layers short-circuit to bf16, so
+  only full-attention layers carry a K codec and the treatment there is total.
+  (#471)
+
+- `docs/FFI.md`: NAX's M floor of 16 is MLX's one shipped tile, not an
+  instruction-set limit, and it is not why decode cannot reach NAX — decode is
+  bandwidth-bound and capped at `1/heads_per_kv` by grid geometry. The
+  drift-recovery command needs `brew unpin` first; pinning while a newer keg is
+  linked is what produced the split link it was meant to prevent. (#462)
+
+- The gate table in `CLAUDE.md` names the three checks added with the KV
+  campaign. (#472)
+
 ## [0.4.0] - 2026-08-31
 
 This release is the KV-cache subsystem measured against its own claims, and the
@@ -2303,7 +2551,8 @@ inference + conversion backend for Apple Silicon — no Python at runtime.
 - Speculative drafters validated against their verifiers: Qwen 3.6 MTP sidecar
   and the Gemma 4 assistant drafter.
 
-[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Pushkinist/rMLX/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Pushkinist/rMLX/releases/tag/v0.3.0
 [0.2.8]: https://github.com/Pushkinist/rMLX/releases/tag/v0.2.8
