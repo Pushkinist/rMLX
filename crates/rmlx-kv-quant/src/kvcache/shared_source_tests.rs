@@ -316,15 +316,7 @@ fn shared_source_refuses_a_declared_producer_rebuilt_from_the_store_alone() {
             );
         }
         Ok((_, SharedKv::Bf16(k_full, _))) => {
-            // `Array::to_bytes` reads by raw linear offset, and the surfaced
-            // mirror is a strided slice over the full `max_seq` buffer, so
-            // flatten the view first — otherwise the count describes the
-            // parent allocation rather than the share.
-            let flat = k_full
-                .contiguous(device)
-                .expect("flatten the surfaced mirror");
-            flat.eval().expect("materialise the surfaced mirror");
-            let bytes = flat.to_bytes().expect("surfaced mirror bytes");
+            let bytes = k_full.to_bytes().expect("surfaced mirror bytes");
             let nonzero = bytes.iter().filter(|&&b| b != 0).count();
             let total = bytes.len();
             panic!(
@@ -332,7 +324,7 @@ fn shared_source_refuses_a_declared_producer_rebuilt_from_the_store_alone() {
                  {:?} mirror of {total} bytes of which only {nonzero} are non-zero — \
                  every one of the {prefix} prefix tokens is the zero-fill this path \
                  must never answer with",
-                flat.shape(),
+                k_full.shape(),
             );
         }
         Ok((_, SharedKv::Store { kv_len })) => {

@@ -975,7 +975,7 @@ impl Array {
         unsafe { check_status(status, "Array::async_eval") }
     }
 
-    /// Copy array contents into a fresh `Vec<u8>`.
+    /// Copy the array's logical elements, row-major, into a fresh `Vec<u8>`.
     ///
     /// Forces evaluation first so the read is always of materialized data.
     /// MLX is lazy and `async_eval` only *schedules* compute; the data pointer
@@ -985,6 +985,16 @@ impl Array {
     /// it, reading the pointer can race the asynchronous evaluation and return
     /// stale/recycled buffer bytes (another array's data) rather than this
     /// array's value.
+    ///
+    /// Evaluation is not enough on its own: a transpose, a strided slice and a
+    /// broadcast all evaluate to the *parent's* allocation with adjusted
+    /// strides, and a linear read of one returns the parent's leading elements
+    /// under the view's shape — right length, right dtype, wrong values. Such
+    /// an input is relaid out row-major before the read, so the returned bytes
+    /// always mean what the array's shape says. The relayout costs a copy, and
+    /// only on inputs whose linear read would otherwise be wrong; a dense array
+    /// — every reduction, elementwise, matmul and kernel output — pays one
+    /// layout-flag read on top of what it paid before.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         install_error_handler();
         self.eval()?;
@@ -992,19 +1002,73 @@ impl Array {
         if nbytes == 0 {
             return Ok(Vec::new());
         }
+        if self.is_row_contiguous()? {
+            return self.copy_row_major_bytes(nbytes);
+        }
+        // The bytes are bound for host memory and the caller is already
+        // blocking on them, so relaying out on the CPU stream keeps the read
+        // path free of a GPU dispatch to wait on. Reading an evaluated array's
+        // buffer from the host is what this method does either way.
+        tracing::debug!(
+            shape = ?self.shape(),
+            nbytes,
+            "to_bytes: relaying out a non-row-contiguous array"
+        );
+        let dense = self.contiguous(Device::Cpu)?;
+        dense.eval()?;
+        dense.copy_row_major_bytes(nbytes)
+    }
 
+    /// Copy `nbytes` straight off the data pointer.
+    ///
+    /// Callers must have evaluated the array and established that it is
+    /// row-contiguous, and must pass this array's own `mlx_array_nbytes`;
+    /// otherwise the read follows the parent allocation's layout instead of
+    /// this array's, and for a broadcast it runs past the end of that
+    /// allocation.
+    fn copy_row_major_bytes(&self, nbytes: usize) -> Result<Vec<u8>> {
         // SAFETY: mlx_array_data_uint8 returns a raw pointer valid while the
         // array is alive and evaluated. We copy out immediately.
         let ptr = unsafe { sys::mlx_array_data_uint8(self.inner) };
         if ptr.is_null() {
             return Err(Error::Mlx(
-                "Array::to_bytes: data pointer is null — was eval() called?".into(),
+                "Array::to_bytes: data pointer is null after eval".into(),
             ));
         }
         // SAFETY: ptr is non-null and points to `nbytes` contiguous bytes
         // owned by the mlx array. Copied into Vec before returning.
         let bytes = unsafe { std::slice::from_raw_parts(ptr, nbytes) }.to_vec();
         Ok(bytes)
+    }
+
+    /// Whether the elements are laid out row-major and dense from the data
+    /// pointer — i.e. whether reading `nbytes` linearly off that pointer yields
+    /// the logical elements in logical order.
+    ///
+    /// False for a transpose, a strided slice, and a broadcast: MLX gives each
+    /// of those the parent's allocation with adjusted strides rather than a
+    /// copy, and `eval` materialises the graph without relaying anything out.
+    /// A broadcast is the sharpest case — its logical size exceeds the elements
+    /// the parent owns, so a linear read of `nbytes` runs off the buffer.
+    ///
+    /// **Evaluate first.** The flag describes a materialised buffer, and MLX
+    /// only sets it when one is attached; on an unevaluated array it reports
+    /// the layout of nothing and answers `true` for a view that is not dense.
+    ///
+    /// `mlx/c/array.h` declares `_mlx_array_is_row_contiguous` an internal
+    /// function with no stability promise, so every host readback now rests on
+    /// an mlx-c internal. The behaviour pin is the layout-flag test in
+    /// `lib_tests.rs`; re-run it whenever the pinned mlx / mlx-c pair moves.
+    fn is_row_contiguous(&self) -> Result<bool> {
+        install_error_handler();
+        let mut res = false;
+        // SAFETY: inner is a valid mlx_array. The call reads the array's layout
+        // flags and never touches the data buffer, so it cannot fault on an
+        // unevaluated array — it just answers about a buffer that is not there.
+        let status = unsafe { sys::_mlx_array_is_row_contiguous(&raw mut res, self.inner) };
+        // SAFETY: called immediately after the C function on the same thread.
+        unsafe { check_status(status, "Array::is_row_contiguous") }?;
+        Ok(res)
     }
 
     /// Create a logical copy of this array using `mlx_array_set`.
@@ -1077,9 +1141,12 @@ impl Array {
     /// linear index, so they see the un-permuted physical order and silently
     /// produce scrambled results. Call this before feeding a transposed (or
     /// otherwise non-contiguous) array to such a kernel so the physical layout
-    /// matches the logical shape. `mlx_reshape` to the same element count does
-    /// not guarantee this — a flattened strided view can still report as
-    /// "contiguous" while its bytes follow the original strides.
+    /// matches the logical shape. The case that needs it is a transpose or a
+    /// strided slice fed straight to the kernel: a `reshape` that changes the
+    /// shape already relayouts, because MLX copies a non-row-contiguous
+    /// reshape input dense instead of sharing its buffer. A reshape to the
+    /// shape the array already has returns the array itself and relayouts
+    /// nothing.
     pub fn contiguous(&self, device: Device) -> Result<Array> {
         install_error_handler();
         let mut res = unsafe { sys::mlx_array_new() };
