@@ -41,7 +41,7 @@ use crate::rotorquant::{n_groups_for, rotor3_encode};
 use crate::storage::{KvStorage, QuantRotorK3, ISO_QUAT_BLOCK_SIZE};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
 use rmlx_core::DispatchPolicy;
-use rmlx_mlx::{mlx_active_memory_bytes, Array, Device, Dtype, PeakBracket};
+use rmlx_mlx::{mlx_active_memory_bytes, Array, Device, Dtype};
 
 /// `b * kv_h > 1` — the shape the copy exists at.
 const KV_H: i32 = 8;
@@ -322,30 +322,37 @@ fn the_slice_the_dispatchers_no_longer_take_costs_a_measurable_prefix_copy() {
     );
 }
 
-// ── The production decode step does not pay it either ─────────────────────────
+// ── The production decode loop does not pay it either ────────────────────────
 
-const MAX_SEQ: i32 = 1024;
-const PREFILL: i32 = 1016;
-const WARMUP_STEPS: u64 = 2;
+const MAX_SEQ: i32 = 4096;
+const PREFILL: i32 = 512;
+const SETTLE_STEPS: u64 = 256;
+const MEASURED_STEPS: u64 = 1024;
 
-/// What one bracketed decode step observed.
+/// How much resident memory a decode loop grew over a run of steps.
 #[derive(Debug)]
-struct StepProbe {
-    headroom: u64,
-    kv_seq: i32,
+struct GrowthProbe {
+    grown_bytes: u64,
+    tokens: i32,
 }
 
-/// Prefill a cache, warm it, then bracket exactly one steady-state decode step.
+/// Drive `update_and_sdpa` on `cache` and report how many bytes stay resident
+/// per token decoded.
 ///
-/// `dispatch_count` is the codec's own kernel counter; a step that did not
-/// advance it never reached the kernel, and its allocation reading would
+/// A slope, not a level: every buffer sized at `max_seq` — the mirror, the
+/// packed ring — is allocated before the measurement starts and cancels out.
+/// What is left grows with the attended prefix, and a re-materialised V prefix
+/// is `kv_h * kv_seq * head_dim * 2` bytes of exactly that.
+///
+/// `dispatch_count` is the codec's own kernel counter: a run that did not
+/// advance it once per step never reached the kernel, and its slope would
 /// describe a CPU-dequant fallback instead.
 #[allow(clippy::expect_used, reason = "test helper: invariants documented")]
-fn bracket_one_decode_step(
+fn resident_growth_over_decode(
     codec: &str,
     mut cache: KvCache,
     dispatch_count: fn() -> u64,
-) -> StepProbe {
+) -> GrowthProbe {
     let device = Device::Gpu;
     let scale = 1.0_f32 / (HEAD_DIM as f32).sqrt();
 
@@ -374,60 +381,77 @@ fn bracket_one_decode_step(
             .expect("decode update_and_sdpa");
         out.eval().expect("decode out eval");
     };
-    for s in 0..WARMUP_STEPS {
+
+    for s in 0..SETTLE_STEPS {
         step(&mut cache, s);
     }
+    let live_before = mlx_active_memory_bytes()
+        .expect("no Metal allocator reading — the bound below would be vacuous");
+    let offset_before = cache.offset();
+    let dispatches_before = dispatch_count();
 
-    let before = dispatch_count();
-    let bracket = PeakBracket::open();
-    step(&mut cache, 99);
-    let reading = bracket.close();
+    for s in SETTLE_STEPS..SETTLE_STEPS + MEASURED_STEPS {
+        step(&mut cache, s);
+    }
+    let live_after = mlx_active_memory_bytes().expect("no Metal allocator reading");
+    let tokens = cache.offset() - offset_before;
 
-    assert!(
-        dispatch_count() > before,
-        "{codec}: the bracketed step never reached the flash-decode kernel — the \
-         reading describes a CPU-dequant fallback, not the dispatch this gate is about"
+    assert_eq!(
+        tokens, MEASURED_STEPS as i32,
+        "{codec}: the cache advanced {tokens} positions over {MEASURED_STEPS} decode steps"
     );
     assert!(
-        reading.measurable(),
-        "{codec}: peak mark could not be zeroed — the reading is not scoped to the step"
+        dispatch_count() - dispatches_before >= MEASURED_STEPS,
+        "{codec}: the measured steps did not each reach the flash-decode kernel — \
+         the slope describes a CPU-dequant fallback, not the dispatch this gate is about"
     );
     assert!(
-        reading.observed_allocation(),
-        "{codec}: the bracketed decode step allocated nothing: {reading:?}"
+        live_after > live_before,
+        "{codec}: resident memory did not grow at all over {MEASURED_STEPS} steps \
+         ({live_before} -> {live_after}); the bound below would pass by measuring nothing"
     );
-    StepProbe {
-        headroom: reading.headroom_bytes(),
-        kv_seq: cache.offset(),
+    GrowthProbe {
+        grown_bytes: live_after - live_before,
+        tokens,
     }
 }
 
-/// One decode step must allocate far less than one V-mirror prefix copy.
-fn assert_step_pays_no_prefix_copy(codec: &str, probe: &StepProbe) {
-    let copy = prefix_copy_bytes(probe.kv_seq);
+/// A decode loop must not grow resident memory by a V prefix per step.
+///
+/// Budget: one and a half V-prefix copies over the measured run. The packed K
+/// view has its own prefix-sized materialisation, measured at ~0.9 copies at
+/// this shape, so the budget clears it; a re-materialised V prefix takes the
+/// total to ~2.9 (the live copy plus the previous step's, released one dispatch
+/// late). Both terms scale with `kv_h * head_dim`, so the ratio, and this
+/// budget, hold at any shape.
+fn assert_growth_holds_no_v_prefix(codec: &str, probe: &GrowthProbe) {
+    let copy = prefix_copy_bytes(probe.tokens);
+    let budget = copy * 3 / 2;
     assert!(
-        probe.headroom < copy / 2,
-        "{codec}: one decode step allocated {} B, on the order of the {copy} B it \
-         costs to flatten a non-contiguous `..kv_seq` cut of the bf16 V mirror at \
-         kv_h={KV_H} — the mirror is being copied per layer per step again ({probe:?})",
-        probe.headroom
+        probe.grown_bytes <= budget,
+        "{codec}: {} B stayed resident over {} decoded tokens, above the {budget} B \
+         budget — a V prefix of {copy} B is being re-materialised per step, which \
+         is what flattening a non-contiguous `..kv_seq` cut of the head-major bf16 \
+         mirror at kv_h={KV_H} costs ({probe:?})",
+        probe.grown_bytes,
+        probe.tokens
     );
 }
 
 #[test]
 #[ignore = "GPU Metal context — run explicitly"]
-fn iso_decode_step_does_not_copy_the_v_mirror() {
+fn iso_decode_does_not_copy_the_v_mirror() {
     if skip_if_no_gpu_env() {
         return;
     }
     let cache = KvCache::with_quant_max_seq(KvQuant::IsoKOnly3, MAX_SEQ);
-    let probe = bracket_one_decode_step("iso3", cache, iso_flash_decode_dispatch_count);
-    assert_step_pays_no_prefix_copy("iso3", &probe);
+    let probe = resident_growth_over_decode("iso3", cache, iso_flash_decode_dispatch_count);
+    assert_growth_holds_no_v_prefix("iso3", &probe);
 }
 
 #[test]
 #[ignore = "GPU Metal context — run explicitly"]
-fn rotor_decode_step_does_not_copy_the_v_mirror() {
+fn rotor_decode_does_not_copy_the_v_mirror() {
     if skip_if_no_gpu_env() {
         return;
     }
@@ -454,6 +478,6 @@ fn rotor_decode_step_does_not_copy_the_v_mirror() {
         DispatchPolicy::default(),
         false,
     );
-    let probe = bracket_one_decode_step("rotor3", cache, rotor_flash_decode_dispatch_count);
-    assert_step_pays_no_prefix_copy("rotor3", &probe);
+    let probe = resident_growth_over_decode("rotor3", cache, rotor_flash_decode_dispatch_count);
+    assert_growth_holds_no_v_prefix("rotor3", &probe);
 }
