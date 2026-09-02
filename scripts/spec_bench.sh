@@ -15,11 +15,14 @@
 #   - Final comparison table printed to stdout
 #
 # Measurement basis (docs/SPECULATIVE.md):
-#   Both arms report decode throughput over the window from the first emitted
-#   token to the last, prefill excluded, so the two rows mean the same thing and
-#   the delta between them is a decode-rate delta. The speculative arm takes the
-#   rate the round loop measured and logged; the no-drafter arm has no such
-#   engine-side figure and is timed client-side over the streamed tokens.
+#   Both arms report the decode rate the engine measured, over the window from
+#   the first emitted token to the last, prefill excluded — so the two rows mean
+#   the same thing and the delta between them is a decode-rate delta. The
+#   speculative arm takes the rate the round loop logged; the no-drafter arm
+#   takes the one the server derives from that request's inter-token gaps and
+#   publishes at GET /metrics/cache. Each arm is cross-checked against the same
+#   window timed client-side, and a disagreement past CROSS_CHECK_BAND_PCT is a
+#   refusal, not a choice between them.
 #
 # Hard constraints honoured:
 #   - Preflight (pkill + claim-file delete) before each server start
@@ -75,6 +78,10 @@ SEED=42
 DRAFT_KIND="mtp"
 DRAFT_BLOCK_SIZE=5
 HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
+# How far the client-observed decode window may sit from the engine's own
+# reading of the same window before the run is refused. One network hop on
+# loopback, not a measurement difference.
+CROSS_CHECK_BAND_PCT=10
 
 DRY_RUN=false
 BENCH_TAG=""
@@ -214,9 +221,42 @@ field_of() {
     echo "${block}" | sed -n "s/^${key}=//p" | tail -1
 }
 
-# Compute median of space-separated values.
+# How many ITL samples the server has recorded so far.
+ring_len() {
+    field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_decode_tps.py" \
+        "http://127.0.0.1:${PORT}")" ring_len
+}
+
+# The rate the server measured for the request that just finished, given the
+# ring length observed before it. Empty when the server could not attribute one.
+server_rate_after() {
+    field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_decode_tps.py" \
+        "http://127.0.0.1:${PORT}" --after "$1")" decode_tps
+}
+
+# Two readings of the same window, one from the engine and one from the client,
+# have to agree or one of them is not measuring what it claims. Refuse rather
+# than pick: the disagreement is the finding.
+cross_check() {
+    local arm="$1" engine="$2" client="$3"
+    LC_ALL=C python3 -c '
+import sys
+arm, engine, client, band = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+off = abs(client - engine) / engine * 100.0
+if off > band:
+    sys.exit(
+        f"ERROR: {arm} engine rate {engine:.3f} and client-observed rate "
+        f"{client:.3f} differ by {off:.1f}%, past the {band:.0f}% band these "
+        "two readings of one window are allowed"
+    )
+print(f"  [{arm}] cross-check ok: engine {engine:.3f} vs client {client:.3f} ({off:.1f}%)")
+' "${arm}" "${engine}" "${client}" "${CROSS_CHECK_BAND_PCT}" >&2
+}
+
+# Compute median of space-separated values. LC_ALL=C so `sort -n` and awk read
+# the decimal point the same way this script writes it.
 median() {
-    echo "$@" | tr ' ' '\n' | sort -n | awk '
+    echo "$@" | tr ' ' '\n' | LC_ALL=C sort -n | LC_ALL=C awk '
     { a[NR]=$1 }
     END {
         n=NR
@@ -227,7 +267,7 @@ median() {
 
 # Compute sample stddev.
 stddev() {
-    echo "$@" | tr ' ' '\n' | awk '
+    echo "$@" | tr ' ' '\n' | LC_ALL=C awk '
     NR==1 { first=$1 }
     { sum+=$1; sumsq+=$1*$1; n++ }
     END {
@@ -356,10 +396,10 @@ obj = {
     # tellable apart from rows that carry the measured window
     # (docs/METRICS_DB.md, "Known-bad rows already in the DB").
     "notes": (
-        f"config={config} draft_kind=none{tag_suffix} decode_window=client_sse"
+        f"config={config} draft_kind=none{tag_suffix} decode_window=engine_itl"
         if config == "normal"
         else f"config={config} draft_kind={draft_kind} "
-        f"block_size={draft_block_size}{tag_suffix} decode_window=engine"
+        f"block_size={draft_block_size}{tag_suffix} decode_window=engine_round_loop"
     ),
     "description": f"spec_bench {config} sha={git_sha}",
     "metrics": metrics,
@@ -428,18 +468,20 @@ for i in $(seq 1 ${WARMUP_RUNS}); do
 done
 
 echo "  [normal] measured runs..." >&2
-NORMAL_TPS_VALUES=()
+NORMAL_ENGINE_TPS_VALUES=()
+NORMAL_CLIENT_TPS_VALUES=()
 NORMAL_PREVIEW=""
 
 for i in $(seq 1 ${MEASURED_RUNS}); do
     echo "  [normal] measured run ${i}/${MEASURED_RUNS}..." >&2
 
+    RING_BEFORE="$(ring_len)"
     RUN_BLOCK="$(measured_request "${SCRATCH_DIR}/normal_resp.txt")" || RUN_BLOCK=""
     N_TOKENS="$(field_of "${RUN_BLOCK}" tokens)"
-    TPS="$(field_of "${RUN_BLOCK}" decode_tps)"
+    CLIENT_TPS="$(field_of "${RUN_BLOCK}" decode_tps)"
     PREVIEW="$(field_of "${RUN_BLOCK}" preview)"
 
-    if [[ -z "${TPS}" ]]; then
+    if [[ -z "${CLIENT_TPS}" ]]; then
         echo "ERROR: normal run ${i} produced no measurable decode window" \
              "(tokens=${N_TOKENS:-0}); response head:" >&2
         head -c 200 "${SCRATCH_DIR}/normal_resp.txt" >&2 || true
@@ -447,9 +489,22 @@ for i in $(seq 1 ${MEASURED_RUNS}); do
         exit 1
     fi
 
-    echo "  [normal] run ${i}: tokens=${N_TOKENS} decode_tps=${TPS}" >&2
+    # The no-drafter arm has no round-loop record, but the server times every
+    # generation's inter-token gaps and publishes the aggregate. That is the
+    # same window, measured by the engine, so this arm is comparable with the
+    # speculative one rather than being a client stopwatch beside it.
+    ENGINE_TPS="$(server_rate_after "${RING_BEFORE:-0}")" || ENGINE_TPS=""
+    if [[ -z "${ENGINE_TPS}" ]]; then
+        echo "ERROR: normal run ${i}: the server attributed no decode rate to it" >&2
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
 
-    NORMAL_TPS_VALUES+=("${TPS}")
+    echo "  [normal] run ${i}: tokens=${N_TOKENS} decode_tps=${ENGINE_TPS}" \
+         "(client-observed: ${CLIENT_TPS})" >&2
+
+    NORMAL_ENGINE_TPS_VALUES+=("${ENGINE_TPS}")
+    NORMAL_CLIENT_TPS_VALUES+=("${CLIENT_TPS}")
     [[ -n "${PREVIEW}" ]] && NORMAL_PREVIEW="${PREVIEW}"
     sleep 5
 done
@@ -459,8 +514,16 @@ kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
 sleep 3
 
-NORMAL_MEDIAN_TPS=$(median "${NORMAL_TPS_VALUES[@]}")
-NORMAL_STDDEV_TPS=$(stddev "${NORMAL_TPS_VALUES[@]}")
+if [[ ${#NORMAL_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
+    echo "ERROR: ${#NORMAL_ENGINE_TPS_VALUES[@]} normal decode rates for" \
+         "${MEASURED_RUNS} measured runs" >&2
+    exit 1
+fi
+
+NORMAL_MEDIAN_TPS=$(median "${NORMAL_ENGINE_TPS_VALUES[@]}")
+NORMAL_STDDEV_TPS=$(stddev "${NORMAL_ENGINE_TPS_VALUES[@]}")
+cross_check normal "${NORMAL_MEDIAN_TPS}" \
+    "$(median "${NORMAL_CLIENT_TPS_VALUES[@]}")"
 
 echo "  [normal] median_tps=${NORMAL_MEDIAN_TPS} stddev=${NORMAL_STDDEV_TPS}" >&2
 
@@ -518,7 +581,9 @@ for i in $(seq 1 ${WARMUP_RUNS}); do
     sleep 5
 done
 
-# Reset ref AFTER warmup so log parsing only sees measured requests.
+# Re-touch the ref so the log search picks this server's file, not the previous
+# phase's. Which events in it are the measured ones is settled by the counts
+# spec_round_log.py is given, not by this timestamp.
 touch "${SCRATCH_DIR}/ts_ref"
 sleep 1
 
@@ -568,9 +633,14 @@ echo "  [mtp] parsing spec metrics from: ${MTP_LOG}" >&2
 
 # Round counts, draft/accept totals and the engine's own decode rate all come
 # off the round-loop `done` line, and scripts/lib/spec_round_log.py is the only
-# thing that reads it. Skips the warmup by taking the last MEASURED_RUNS events.
+# thing that reads it. Every request served against this log left one event, so
+# the total is the warmups plus the measured runs; anything else means the
+# events that survive do not line up with the runs being measured, and the last
+# MEASURED_RUNS of them are somebody else's.
 if ! MTP_SPEC_DATA=$(python3 "${REPO_ROOT}/scripts/lib/spec_round_log.py" \
-        "${MTP_LOG}" --last "${MEASURED_RUNS}"); then
+        "${MTP_LOG}" \
+        --expect-total "$((WARMUP_RUNS + MEASURED_RUNS))" \
+        --last "${MEASURED_RUNS}"); then
     echo "ERROR: no usable speculative round-loop record in ${MTP_LOG}" >&2
     exit 1
 fi
@@ -592,14 +662,16 @@ while IFS= read -r rate; do
     MTP_ENGINE_TPS_VALUES+=("${rate}")
 done < <(echo "${MTP_SPEC_DATA}" | sed -n 's/^decode_tps=//p')
 
-if [[ ${#MTP_ENGINE_TPS_VALUES[@]} -eq 0 ]]; then
-    echo "ERROR: the round loop reported no measurable decode rate in ${MTP_LOG}" >&2
+if [[ ${#MTP_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
+    echo "ERROR: the round loop reported ${#MTP_ENGINE_TPS_VALUES[@]} measurable" \
+         "decode rates for ${MEASURED_RUNS} measured runs in ${MTP_LOG}" >&2
     exit 1
 fi
 
 MTP_MEDIAN_TPS=$(median "${MTP_ENGINE_TPS_VALUES[@]}")
 MTP_STDDEV_TPS=$(stddev "${MTP_ENGINE_TPS_VALUES[@]}")
 MTP_CLIENT_MEDIAN_TPS=$(median "${MTP_CLIENT_TPS_VALUES[@]}")
+cross_check mtp "${MTP_MEDIAN_TPS}" "${MTP_CLIENT_MEDIAN_TPS}"
 
 echo "  [mtp] median_tps=${MTP_MEDIAN_TPS} stddev=${MTP_STDDEV_TPS}" \
      "(client-observed median: ${MTP_CLIENT_MEDIAN_TPS})" >&2

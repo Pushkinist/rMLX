@@ -35,7 +35,8 @@ Aggregating the `decode_tps` lines is the caller's job: a bench script that
 already has a median/stddev helper must not grow a second one here.
 
 Exit codes: 0 — read; 2 — log unreadable; 3 — a `done` event's `decode_tps` is
-not the documented shape; 4 — no `done` event in the log.
+not the documented shape; 4 — no `done` event in the log; 5 — the log holds a
+different number of `done` events than the caller served requests.
 """
 
 import argparse
@@ -139,6 +140,18 @@ def main():
         default=0,
         help="consider only the last N done events (0 = all)",
     )
+    parser.add_argument(
+        "--expect-total",
+        type=int,
+        default=0,
+        help=(
+            "the exact number of done events the log must hold (0 = any). "
+            "One per request served against this log, warmups included: a "
+            "smaller number means a request produced no round-loop record and "
+            "the events that remain do not line up with the runs the caller "
+            "thinks it measured."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -154,7 +167,22 @@ def main():
         )
         return 4
 
+    if args.expect_total > 0 and len(events) != args.expect_total:
+        print(
+            f"spec_round_log: {args.log} holds {len(events)} round-loop 'done' "
+            f"events, expected {args.expect_total}",
+            file=sys.stderr,
+        )
+        return 5
+
     if args.last > 0:
+        if len(events) < args.last:
+            print(
+                f"spec_round_log: {args.log} holds {len(events)} round-loop "
+                f"'done' events, fewer than the {args.last} asked for",
+                file=sys.stderr,
+            )
+            return 5
         events = events[-args.last :]
 
     try:

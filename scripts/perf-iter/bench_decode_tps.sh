@@ -25,6 +25,13 @@
 #   pkill -f "rmlx serve"; pkill -f mlx_lm; pkill -f paroquant; pkill -f omlx;
 #   sleep 5; rm -f /tmp/rmlx.<port>.claim
 #
+# Measurement basis:
+#   decode_tps is the rate the server measured for each request over that
+#   request's own inter-token gaps — first token to last, prefill excluded —
+#   read back through scripts/lib/server_decode_tps.py. Dividing the completion
+#   tokens by the whole request would count the prefill and the connection and
+#   is a different quantity (overall_tps), not this one.
+#
 # Output:
 #   Prints decode_tps_mean / decode_tps_stddev / ttft_ms per run to stdout.
 #   Appends one JSONL line per measurement call to $METRICS_OUT.
@@ -105,6 +112,22 @@ fi
 
 log() { echo "[bench_decode_tps] $*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
+
+# Read one `key=value` out of a block, or the empty string when absent.
+field_of() { echo "$1" | sed -n "s/^$2=//p" | tail -1; }
+
+# How many ITL samples the server has recorded so far.
+ring_len() {
+    field_of "$(python3 "${_RMLX_ROOT}/scripts/lib/server_decode_tps.py" \
+        "http://127.0.0.1:${PORT}")" ring_len
+}
+
+# The rate the server measured for the request that just finished, given the
+# ring length observed before it. Empty when it could not attribute one.
+server_rate_after() {
+    field_of "$(python3 "${_RMLX_ROOT}/scripts/lib/server_decode_tps.py" \
+        "http://127.0.0.1:${PORT}" --after "$1")" decode_tps
+}
 
 # Check required tools.
 for tool in curl python3 awk; do
@@ -203,6 +226,9 @@ print(json.dumps({
 }))
 ")"
 
+    local ring_before
+    ring_before="$(ring_len)"
+
     local t_start t_end elapsed_ms
     t_start="$(python3 -c 'import time; print(int(time.time() * 1000))')"
     local response
@@ -211,6 +237,9 @@ print(json.dumps({
         -d "${payload}")"
     t_end="$(python3 -c 'import time; print(int(time.time() * 1000))')"
     elapsed_ms=$(( t_end - t_start ))
+
+    local decode_tps
+    decode_tps="$(server_rate_after "${ring_before:-0}")" || decode_tps=""
 
     # Parse completion_tokens from usage field.
     local completion_tokens generated_text
@@ -228,7 +257,7 @@ if choices:
     print(choices[0].get('message', {}).get('content', ''))
 " 2>/dev/null || echo '')"
 
-    echo "elapsed_ms=${elapsed_ms} tokens=${completion_tokens} text=${generated_text}"
+    echo "elapsed_ms=${elapsed_ms} decode_tps=${decode_tps} tokens=${completion_tokens} text=${generated_text}"
 }
 
 # ── Warmup ────────────────────────────────────────────────────────────────────
@@ -253,27 +282,15 @@ for i in $(seq 1 "${MEASURE_RUNS}"); do
     result="$(completion_request "${MAX_TOKENS_MEASURE}")"
 
     elapsed_ms="$(echo "${result}" | grep -oE 'elapsed_ms=[0-9]+' | cut -d= -f2)"
+    tps="$(echo "${result}" | grep -oE 'decode_tps=[0-9.]+' | cut -d= -f2)"
     n_tokens="$(echo "${result}" | grep -oE 'tokens=[0-9]+' | cut -d= -f2)"
-    text="$(echo "${result}" | sed 's/elapsed_ms=[0-9]* tokens=[0-9]* text=//')"
+    text="$(echo "${result}" | sed 's/^elapsed_ms=[0-9]* decode_tps=[0-9.]* tokens=[0-9]* text=//')"
 
-    # decode_tps = completion_tokens / (elapsed_ms / 1000)
-    # ttft_ms: we don't have true first-token time from the non-streaming API.
-    # Report wall-time/n_tokens as mean-step-latency (honest label).
-    tps="$(python3 -c "
-ms=${elapsed_ms}; n=${n_tokens}
-if n > 0 and ms > 0:
-    print(f'{n / (ms / 1000):.2f}')
-else:
-    print('0.0')
-")"
+    [[ -n "${tps}" ]] || die "run ${i}: the server attributed no decode rate to it"
 
-    step_ms="$(python3 -c "
-ms=${elapsed_ms}; n=${n_tokens}
-if n > 0:
-    print(f'{ms / n:.1f}')
-else:
-    print('0.0')
-")"
+    # The mean inter-token gap is the reciprocal of that rate, so it is the same
+    # measurement rather than a second one derived from the wall clock.
+    step_ms="$(LC_ALL=C python3 -c "print(f'{1000.0 / ${tps}:.1f}')")"
 
     tps_values+=("${tps}")
     ttft_values+=("${step_ms}")
@@ -282,8 +299,12 @@ else:
         first_text="${text}"
     fi
 
-    log "    elapsed_ms=${elapsed_ms} tokens=${n_tokens} tps=${tps} step_ms=${step_ms}"
+    log "    elapsed_ms=${elapsed_ms} tokens=${n_tokens} decode_tps=${tps} step_ms=${step_ms}"
 done
+
+if [[ ${#tps_values[@]} -ne ${MEASURE_RUNS} ]]; then
+    die "${#tps_values[@]} decode rates for ${MEASURE_RUNS} measured runs"
+fi
 
 # ── Statistics ────────────────────────────────────────────────────────────────
 
@@ -318,7 +339,7 @@ echo "  model:           ${MODEL_ID}"
 echo "  kv_quant:        ${KV_QUANT}"
 echo "  decode_tps_mean: ${tps_mean}"
 echo "  decode_tps_std:  ${tps_stddev}"
-echo "  step_ms_mean:    ${ttft_mean}  (wall_ms / completion_tokens — not true TTFT)"
+echo "  step_ms_mean:    ${ttft_mean}  (mean inter-token gap, from the server)"
 echo "  first_text:      ${first_text:0:120}"
 
 # ── Write JSONL metrics ────────────────────────────────────────────────────────
@@ -347,7 +368,7 @@ record = {
     'step_ms_mean':       ${ttft_mean},
     'first_32_words':     ${first_32_words},
     ${GIT_SHA_KV}
-    'notes':              'step_ms_mean=wall/completion_tokens; first_32_words from temp=0 decode',
+    'notes':              'decode_window=engine_itl; first_32_words from temp=0 decode',
 }
 print(json.dumps(record))
 " >> "${METRICS_OUT}"
@@ -433,7 +454,7 @@ rec = {
     'n_warmups':       int('${WARMUP_RUNS}'),
     'n_measure':       int('${MEASURE_RUNS}'),
     'output_first_64': output_first_64,
-    'notes':           'step_ms_mean=wall/completion_tokens; perf-iter bench script',
+    'notes':           'decode_window=engine_itl; perf-iter bench script',
     'description':     None,
     'metrics': [
         {'name': 'decode_tps_warm', 'value': float('${tps_mean}'),   'stddev': float('${tps_stddev}')},

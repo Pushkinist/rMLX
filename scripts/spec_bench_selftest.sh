@@ -66,15 +66,25 @@ cat >"$SERVER_PY" <<'PYEOF'
 """Canned OpenAI-compatible server for the spec_bench selftest.
 
 Streams STUB_TOKENS content chunks STUB_GAP_S apart, after a STUB_PREFILL_S
-pause that stands in for prompt prefill. When the serve argv carried a drafter
-it also appends one round-loop `done` line per request to the run log, taking
-the `decode_tps` field from the next entry of STUB_DECODE_TPS_SEQ — a
-comma-separated list of raw JSON values, the last one repeating, empty for a
-line that carries no such field at all.
+pause that stands in for prompt prefill, then a usage block. It times its own
+sends and publishes the aggregate at /metrics/cache in the shape the real
+server's ITL ring has, so the engine-side figure the bench reads and the client
+window it cross-checks against describe the same gaps. STUB_ITL_MEAN_MS
+overrides that aggregate, which is how a disagreement is staged;
+STUB_ITL_SUPPRESS leaves the ring untouched, as the real server does for a
+response too short to have an interval.
+
+When the serve argv carried a drafter it also appends a round-loop `done` line
+per request to the run log — written before the final flush, so a reader that
+sees `[DONE]` sees the line too. `decode_tps` comes from the next entry of
+STUB_DECODE_TPS_SEQ, a comma-separated list of raw JSON values with the last one
+repeating, empty for a line carrying no such field. STUB_DONE_LINES caps how
+many requests get a line at all.
 """
 
 import json
 import os
+import statistics
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -87,15 +97,20 @@ ELAPSED_MS = float(os.environ["STUB_ELAPSED_MS"])
 LOG_PATH = os.environ.get("STUB_LOG", "")
 SPECULATIVE = os.environ.get("STUB_SPECULATIVE", "") == "1"
 SEQ = [s for s in os.environ.get("STUB_DECODE_TPS_SEQ", "").split(",") if s]
+DONE_LINES = int(os.environ.get("STUB_DONE_LINES", "-1"))
+ITL_MEAN_OVERRIDE = os.environ.get("STUB_ITL_MEAN_MS", "")
+ITL_SUPPRESS = os.environ.get("STUB_ITL_SUPPRESS", "") == "1"
+ITL_SUPPRESS_AFTER = int(os.environ.get("STUB_ITL_SUPPRESS_AFTER", "-1"))
+USAGE_TOKENS = int(os.environ.get("STUB_USAGE_TOKENS", "-1"))
+BOUND_FLAG = os.environ.get("STUB_BOUND_FLAG", "")
 
 served = 0
+itl_ring = []
 
 
 def done_line():
     """One round-loop `done` record, as tracing's JSON layer renders it."""
-    global served
     raw = SEQ[min(served, len(SEQ) - 1)] if SEQ else ""
-    served += 1
     fields = {
         "message": "mtp_generate_greedy: done",
         "rounds": 30,
@@ -113,44 +128,87 @@ def done_line():
     )
 
 
+def push_itl(sends):
+    """Append this request's ITL aggregate, as the engine's ring holds it."""
+    if ITL_SUPPRESS or len(sends) < 2:
+        return
+    if 0 <= ITL_SUPPRESS_AFTER <= served:
+        return
+    gaps = [(b - a) * 1000.0 for a, b in zip(sends, sends[1:])]
+    mean_ms = float(ITL_MEAN_OVERRIDE) if ITL_MEAN_OVERRIDE else statistics.fmean(gaps)
+    itl_ring.append(
+        {
+            "model_id": "stub",
+            "p50_ms": statistics.median(gaps),
+            "p95_ms": max(gaps),
+            "step_mean_ms": mean_ms,
+            "step_count": len(sends),
+        }
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-    def do_GET(self):
-        body = json.dumps({"object": "list", "data": []}).encode()
+    def _json(self, body):
+        raw = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        if self.path.startswith("/metrics/cache"):
+            self._json({"models": [], "ttft": [], "itl": itl_ring})
+        else:
+            self._json({"object": "list", "data": []})
 
     def do_POST(self):
+        global served
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
 
-        def chunk(delta):
-            payload = json.dumps({"choices": [{"delta": delta, "index": 0}]})
-            self.wfile.write(f"data: {payload}\n\n".encode())
+        def chunk(payload):
+            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
             self.wfile.flush()
 
-        chunk({"role": "assistant"})
+        sends = []
+        chunk({"choices": [{"delta": {"role": "assistant"}, "index": 0}]})
         time.sleep(PREFILL_S)
+        # Send against a fixed schedule rather than sleeping between chunks:
+        # the per-chunk framing cost then falls inside the gap instead of being
+        # added to it, so the stub really does stream at 1/GAP_S and the rate it
+        # reports is the rate the client can observe.
+        start = time.monotonic()
         for i in range(TOKENS):
-            if i:
-                time.sleep(GAP_S)
-            chunk({"content": f"t{i} "})
+            due = start + i * GAP_S
+            remaining = due - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            chunk({"choices": [{"delta": {"content": f"t{i} "}, "index": 0}]})
+            sends.append(time.monotonic())
+        reported = USAGE_TOKENS if USAGE_TOKENS >= 0 else TOKENS
+        chunk({"choices": [], "usage": {"completion_tokens": reported}})
+
+        push_itl(sends)
+        if SPECULATIVE and LOG_PATH and (DONE_LINES < 0 or served < DONE_LINES):
+            with open(LOG_PATH, "a", encoding="utf-8") as handle:
+                handle.write(done_line() + "\n")
+        served += 1
+
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
-        if SPECULATIVE and LOG_PATH:
-            with open(LOG_PATH, "a", encoding="utf-8") as handle:
-                handle.write(done_line() + "\n")
 
-
-HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+if BOUND_FLAG:
+    with open(BOUND_FLAG, "a", encoding="utf-8") as handle:
+        handle.write(f"{os.getpid()}\n")
+server.serve_forever()
 PYEOF
 
 # ── Stub binary ───────────────────────────────────────────────────────────────
@@ -191,15 +249,34 @@ chmod +x "$STUB"
 
 mkdir -p "$WORK/verifier" "$WORK/drafter"
 
-# A port nothing else on this host is likely to hold.
-PORT=$((18000 + RANDOM % 2000))
+# A port this host is not already using. Probed rather than assumed: a foreign
+# listener would answer the script's readiness poll and the suite would measure
+# it instead of the stub. The stub also records the pid that bound the port, so
+# a case whose server never came up is a failure and not a silent substitution.
+PORT="$(python3 -c '
+import random, socket, sys
+for _ in range(200):
+    port = random.randint(18000, 19999)
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError:
+        continue
+    finally:
+        probe.close()
+    print(port)
+    sys.exit(0)
+sys.exit("no free port in 18000-19999")
+')"
 
 # ── Case driver ───────────────────────────────────────────────────────────────
 
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [GREP:pat ...]
 #
-# Stub defaults describe a run whose engine-reported rate (200) and whose
-# emitted / elapsed_ms on the same line (128 / 2.56 s = 50) cannot be confused.
+# Stub defaults describe a run streaming eight tokens 50 ms apart, so the rate
+# the engine reports (20) is what the wire actually carried and the client
+# cross-check passes on its own. The emitted / elapsed_ms on the same line
+# (128 / 2.56 s = 50) is 2.5x away from it and cannot be confused with it.
 run_case() {
 	CASE_NAME="$1"
 	local want="$2"
@@ -221,17 +298,18 @@ run_case() {
 	local got=0
 	set +e
 	env -i \
-		PATH="$SHIM_DIR:/usr/bin:/bin:/usr/sbin:/sbin" \
+		PATH="$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 		HOME="$WORK" \
 		RMLX_HOME="$CASE_HOME" \
 		VERIFIER_MODEL="$WORK/verifier" \
 		DRAFTER_MODEL="$WORK/drafter" \
-		STUB_TOKENS=6 \
-		STUB_GAP_S=0.01 \
+		STUB_TOKENS=8 \
+		STUB_GAP_S=0.05 \
 		STUB_PREFILL_S=0.05 \
 		STUB_EMITTED=128 \
 		STUB_ELAPSED_MS=2560 \
-		STUB_DECODE_TPS_SEQ='"Some(200.0)"' \
+		STUB_DECODE_TPS_SEQ='"Some(20.0)"' \
+		STUB_BOUND_FLAG="$CASE_HOME/stub_bound" \
 		${env_pairs[@]+"${env_pairs[@]}"} \
 		bash "$FAKE_ROOT/scripts/spec_bench.sh" --port "$PORT" >"$CASE_OUT" 2>&1
 	got=$?
@@ -240,6 +318,8 @@ run_case() {
 
 	CASE_BAD=""
 	[ "$got" -ne "$want" ] && CASE_BAD="exit=$got (want $want)"
+	[ -s "$CASE_HOME/stub_bound" ] ||
+		note_bad "the stub never bound port $PORT — something else answered"
 	local g
 	for g in ${greps[@]+"${greps[@]}"}; do
 		grep -qE "$g" "$CASE_OUT" || note_bad "missing /$g/"
@@ -318,22 +398,22 @@ echo
 
 # ── Cases ─────────────────────────────────────────────────────────────────────
 
-# The engine measured 200 tok/s over its decode window; emitted / elapsed_ms on
+# The engine measured 20 tok/s over its decode window; emitted / elapsed_ms on
 # the same line is 50. Ingesting 50 is the defect.
 run_case engine_rate_is_ingested 0 \
 	"mtp row carries the engine's rate, not emitted/elapsed_ms"
 got="$(metric_of mtp value)"
-close_to "$got" 200.0 0.001 || note_bad "mtp decode_tps_warm=$got (want 200.0)"
+close_to "$got" 20.0 0.001 || note_bad "mtp decode_tps_warm=$got (want 20.0)"
 verdict
 
 run_case window_is_declared 0 \
-	"each row says which window its rate was measured over"
+	"each row says which engine surface its rate came from"
 case "$(notes_of mtp)" in
-*decode_window=engine*) ;;
+*decode_window=engine_round_loop*) ;;
 *) note_bad "mtp notes=$(notes_of mtp)" ;;
 esac
 case "$(notes_of normal)" in
-*decode_window=client_sse*) ;;
+*decode_window=engine_itl*) ;;
 *) note_bad "normal notes=$(notes_of normal)" ;;
 esac
 verdict
@@ -342,11 +422,11 @@ verdict
 # stddev of 10. A hard 0.0 in that column claims a spread never measured.
 run_case stddev_is_measured 0 \
 	"the mtp spread comes from the measured runs" \
-	'STUB_DECODE_TPS_SEQ="Some(1.0)","Some(190.0)","Some(200.0)","Some(210.0)"'
+	'STUB_DECODE_TPS_SEQ="Some(2.0)","Some(19.0)","Some(20.0)","Some(21.0)"'
 got="$(metric_of mtp value)"
-close_to "$got" 200.0 0.001 || note_bad "mtp decode_tps_warm=$got (want median 200.0)"
+close_to "$got" 20.0 0.001 || note_bad "mtp decode_tps_warm=$got (want median 20.0)"
 got="$(metric_of mtp stddev)"
-close_to "$got" 10.0 0.001 || note_bad "mtp stddev=$got (want 10.0)"
+close_to "$got" 1.0 0.001 || note_bad "mtp stddev=$got (want 1.0)"
 verdict
 
 # The first done event is the warmup and must not reach the ingested value. Its
@@ -354,9 +434,31 @@ verdict
 # them could not move the median it is supposed to be kept out of.
 run_case warmup_event_excluded 0 \
 	"the warmup request's rate is not aggregated" \
-	'STUB_DECODE_TPS_SEQ="Some(300.0)","Some(190.0)","Some(200.0)","Some(210.0)"'
+	'STUB_DECODE_TPS_SEQ="Some(30.0)","Some(19.0)","Some(20.0)","Some(21.0)"'
 got="$(metric_of mtp value)"
-close_to "$got" 200.0 0.001 || note_bad "mtp decode_tps_warm=$got (want 200.0, not 205.0)"
+close_to "$got" 20.0 0.001 || note_bad "mtp decode_tps_warm=$got (want 20.0, not 20.5)"
+verdict
+
+# One done event where four requests ran. Taking the last three of one event
+# leaves a single reading, whose sample stddev is the 0.0 that the rows this
+# whole change is about are identified by — with n_measure=3 recorded beside it.
+run_case truncated_log_refused 1 \
+	"a log holding fewer events than requests served is refused" \
+	'STUB_DONE_LINES=1' \
+	'GREP:holds 1 round-loop' \
+	'GREP:expected 4'
+no_row mtp
+verdict
+
+# Three events where four requests ran: the count check is what catches this,
+# because the three that survive are the warmup and the first two measured runs
+# and nothing in the line distinguishes them.
+run_case dropped_last_event_refused 1 \
+	"a log missing the last request's event is refused" \
+	'STUB_DONE_LINES=3' \
+	'GREP:holds 3 round-loop' \
+	'GREP:expected 4'
+no_row mtp
 verdict
 
 # A binary older than the corrected field logs decode_tps as a bare number, and
@@ -364,7 +466,7 @@ verdict
 # field's name.
 run_case bare_number_refused 1 \
 	"a bare-number decode_tps is refused, not read" \
-	'STUB_DECODE_TPS_SEQ=200.0' \
+	'STUB_DECODE_TPS_SEQ=20.0' \
 	'GREP:bare number' \
 	'GREP:still counted prefill'
 no_row mtp
@@ -382,20 +484,81 @@ verdict
 run_case none_rate_refused 1 \
 	"an unmeasurable rate is refused, not substituted" \
 	'STUB_DECODE_TPS_SEQ="None"' \
-	'GREP:no measurable decode rate'
+	'GREP:decode rates for 3 measured runs'
 no_row mtp
 verdict
 
-# Eight tokens 0.1 s apart behind a 1.5 s prefill: roughly 9.3 tok/s over the
-# decode window against 3.5 over the whole request. The no-drafter arm has to
-# report the window, or its row is not comparable with the speculative one it is
-# subtracted from. The band is wide because each chunk carries a few ms of HTTP
-# framing; it is nowhere near the whole-request figure.
+# The no-drafter arm has no round-loop record. Its rate is the one the server
+# derived from that request's own inter-token gaps, which the stub reports at
+# 1000/50 = 20 tok/s.
+run_case normal_arm_uses_server_figure 0 \
+	"the no-drafter row carries the server's rate" \
+	'STUB_ITL_MEAN_MS=50' \
+	'GREP:.normal. cross-check ok'
+got="$(metric_of normal value)"
+close_to "$got" 20.0 0.0001 || note_bad "normal decode_tps_warm=$got (want 20.0)"
+verdict
+
+# Eight tokens 50 ms apart behind a 1.5 s prefill: 20 tok/s over the
+# decode window against 4.3 over the whole request. What pins the window's
+# (n-1)/span convention is not this band but the cross-check above: over eight
+# tokens, n/span is 1/7 = 14% out and the 10% band refuses it.
 run_case normal_arm_excludes_prefill 0 \
 	"the no-drafter arm times the decode window only" \
-	'STUB_TOKENS=8' 'STUB_GAP_S=0.1' 'STUB_PREFILL_S=1.5'
+	'STUB_PREFILL_S=1.5' \
+	'GREP:.normal. cross-check ok'
 got="$(metric_of normal value)"
-close_to "$got" 9.3 0.3 || note_bad "normal decode_tps_warm=$got (want ~9.3, not ~3.5)"
+close_to "$got" 20.0 0.15 || note_bad "normal decode_tps_warm=$got (want ~20, not ~4.3)"
+verdict
+
+# Two readings of one window that disagree are a finding, not a choice. The stub
+# reports half the gap it actually sent, so the engine claims twice the rate.
+run_case cross_check_refuses_disagreement 1 \
+	"engine and client readings that disagree stop the run" \
+	'STUB_ITL_MEAN_MS=25' \
+	'GREP:client-observed rate' \
+	'GREP:past the 10% band'
+no_row normal
+verdict
+
+# A round-loop record that reports no rate still counts as an event, so the
+# totals line up while one measured run has no reading. Aggregating whatever is
+# left would publish two runs' median under n_measure=3.
+run_case partial_rates_refused 1 \
+	"a measured run with no reading is not aggregated around" \
+	'STUB_DECODE_TPS_SEQ="Some(20.0)","Some(20.0)","None","Some(20.0)"' \
+	'GREP:reported 2 measurable'
+no_row mtp
+verdict
+
+# A response the server could not time leaves the ring where it was, and the
+# newest entry is then the previous request's. Reading it would file that
+# request's rate under this one's name.
+run_case stale_ring_entry_refused 1 \
+	"a rate belonging to an earlier request is refused" \
+	'STUB_ITL_SUPPRESS_AFTER=2' \
+	'GREP:ITL ring went from'
+no_row normal
+verdict
+
+# Chunk arrivals only time tokens if the tokens arrived one per chunk. A server
+# that batched them would make the client window read low by the batching
+# factor, and the cross-check would then be comparing two different things.
+run_case batched_chunks_refused 1 \
+	"a response whose tokens did not arrive one per chunk is refused" \
+	'STUB_USAGE_TOKENS=4' \
+	'GREP:arrived one per chunk'
+no_row normal
+verdict
+
+# A response too short for the server to time leaves the ITL ring untouched, so
+# the newest entry belongs to an earlier request. Reading it would report that
+# request's rate under this one's name.
+run_case server_rate_unattributable_refused 1 \
+	"a rate the server cannot attribute to this request is refused" \
+	'STUB_ITL_SUPPRESS=1' \
+	'GREP:the server attributed no decode rate'
+no_row normal
 verdict
 
 echo

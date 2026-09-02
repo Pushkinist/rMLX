@@ -544,20 +544,41 @@ because nothing enforces it.
 - **rate metrics `= 0.0`** — an early-stopped run recording a fabricated zero
   instead of nothing. These win any cell whose rows are all zeros, so an
   upper-only bound would have *promoted* them; the bound has to be two-sided.
-- **`spec_bench.sh` `decode_tps_warm` with no `decode_window=` in `notes`** —
-  both arms of that script once derived a decode rate of their own over a window
-  that started before the prompt prefill: the speculative arm divided the round
-  loop's `emitted` by its `elapsed_ms`, the no-drafter arm divided the
-  completion tokens by the whole curl request. Neither is warm-cache decode
-  throughput — the second is `overall_tps` under the wrong name — and both read
-  low by however much prefill the prompt carried, which for the round-loop form
-  is 35-62% on the 4k-prompt runs still in `<RMLX_HOME>/logs`. Some of these
-  rows win their `bests` cell today. Both arms now report the
-  first-token-to-last window and record which one they measured, so
-  `description LIKE 'spec_bench%' AND metric = 'decode_tps_warm' AND notes NOT
-  LIKE '%decode_window=%'` names exactly the rows that predate that. Re-measuring
-  out-ranks them on merit only where the corrected number is larger; the
-  predicate covers the rest.
+- **`decode_tps_warm` from a whole-request or prefill-inclusive stopwatch** —
+  several bench scripts wrote this column from a rate whose window started
+  before the prompt prefill, which is `overall_tps` under another metric's name
+  and reads low by whatever the prefill cost. The producers:
+  `scripts/spec_bench.sh` on both arms (the speculative one divided the round
+  loop's `emitted` by its `elapsed_ms`, 35-62% low on the 4k-prompt runs still
+  in `<RMLX_HOME>/logs`; the no-drafter one divided the completion tokens by the
+  whole curl request, 9.6% low on the 14-token prompt those rows used);
+  `scripts/perf-iter/bench_decode_tps.sh`; and six `scripts/bench/` campaign
+  drivers now deleted (`t1`/`t2`/`t3_final_bench.sh`,
+  `fullctx_regression_bench.sh`, `gemma_matrix_bench.sh`,
+  `final_matrix_bench.sh`). Some of the `spec_bench` rows win their `bests` cell
+  today.
+
+  Every one of these producers now takes the rate from the engine and records
+  `decode_window=` in `notes` — `engine_round_loop` for a speculative round
+  loop's own figure, `engine_itl` for the server's per-request inter-token
+  aggregate. That marker is a **positive** provenance claim, so its absence is
+  "no window was recorded", not "the value is wrong": rows from
+  `rmlx baseline`-driven producers (`ingest/perf_ab_ingest.py`, `bench_cell.sh`)
+  and `llama-bench` token-generation rows are prefill-excluded at the source and
+  also lack it. The predicate that identifies the population above is therefore
+  producer-scoped, not marker-scoped alone:
+
+  ```sql
+  SELECT * FROM observations
+  WHERE metric = 'decode_tps_warm'
+    AND (notes IS NULL OR notes NOT LIKE '%decode_window=%')
+    AND description LIKE 'spec_bench%';
+  ```
+
+  The `perf-iter` and deleted-campaign rows carry no `description` to key on;
+  they are identified only by `ts_utc` predating this change, which is why the
+  marker exists from here on. Re-measuring out-ranks any of them on merit only
+  where the corrected number is larger.
 
 Anything anchoring on a recorded rate — a roofline, a champion table, a
 `rmlx metrics rank` — should read `bests`, or one of the `query::*` functions,

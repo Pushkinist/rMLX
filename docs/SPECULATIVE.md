@@ -696,10 +696,10 @@ that reason. Stochastic acceptance (temperature > 0) tends to reduce the rate by
 **Measurement basis.** Temperature 0, `--kv-quant none`, `--max-ctx 16384`,
 200 completion tokens, one warmup plus three measured requests per cell, the
 configurations run in palindromic order across two passes and pooled (n=6),
-median reported. Decode throughput is measured client-side over the streamed
-tokens — first emitted token to last, prefill excluded — which is the same
-window `rmlx baseline` reports, so the speculative and no-drafter arms mean the
-same thing. Accept rate is read off the `<kind>_generate_greedy: done` serve-log
+median reported. Decode throughput is the engine's own reading over the window
+from the first emitted token to the last, prefill excluded — the same window
+`rmlx baseline` reports, so the speculative and no-drafter arms mean the same
+thing. Accept rate is read off the `<kind>_generate_greedy: done` serve-log
 line; no done-line means the round loop never ran. Every cell below is also a
 row in `runs.db` (metrics `accept_rate` and `decode_tps_warm`).
 
@@ -710,7 +710,14 @@ fewer than two tokens and there is no interval to measure, which is the honest
 answer where a `0.0` would be averaged as a real rate.
 
 `scripts/lib/spec_round_log.py` is the only thing that reads that line, and
-`scripts/spec_bench.sh` takes its speculative `decode_tps_warm` from there.
+`scripts/spec_bench.sh` takes its speculative `decode_tps_warm` from there. Its
+no-drafter arm has no round-loop record, but the server times every generation's
+inter-token gaps and publishes the aggregate at `GET /metrics/cache`, where
+`1000 / step_mean_ms` is the same `(n - 1) / (t_last - t_first)` — that is the
+no-drafter arm's figure, read through `scripts/lib/server_decode_tps.py`. Both
+arms are then cross-checked against the same window timed client-side, and a
+disagreement past the stated band stops the run rather than choosing between
+them.
 The `emitted` and `elapsed_ms` on the same line are **not** a second spelling of
 it: `elapsed_ms` covers the prompt prefill, so `emitted / elapsed_ms` is a
 different and lower number, and rows carrying that form are named in

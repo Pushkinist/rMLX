@@ -9,51 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The speculative-decode bench records the decode rate the engine measured,
-  not one it derives itself.** `scripts/spec_bench.sh` read the round loop's
-  `done` line and divided `emitted` by `elapsed_ms` for its speculative arm.
-  That elapsed covers the prompt prefill, so the quotient is not decode
-  throughput and reads low — 233.6 tok/s against the 276.3 the round loop
-  measured, on a code prompt, on this host. The engine has reported the
-  prefill-excluded rate on that same line as `decode_tps` since the round loops
-  were corrected; nothing was reading it. Its no-drafter arm had the matching
-  defect from the other side, dividing the completion tokens by the whole curl
-  request, which is `overall_tps` recorded under `decode_tps_warm`.
+- **The bench scripts record the decode rate the engine measured, not one they
+  derive themselves.** `scripts/spec_bench.sh` read the speculative round loop's
+  `done` line and divided `emitted` by `elapsed_ms`. That elapsed covers the
+  prompt prefill, so the quotient is not decode throughput and reads low —
+  233.6 tok/s against the 276.3 the round loop measured, on a code prompt, on
+  this host. The engine has reported the prefill-excluded rate on that same line
+  as `decode_tps` since the round loops were corrected; nothing was reading it.
+  Its no-drafter arm divided the completion tokens by the whole curl request,
+  which is `overall_tps` recorded under `decode_tps_warm` and measured 9.6% low
+  on the prompt those rows used. `scripts/perf-iter/bench_decode_tps.sh`, which
+  `make perf-iter` runs across three models, had the same whole-request form.
 
-  Both arms now report the first-emitted-token to last-emitted-token window
-  `docs/SPECULATIVE.md` has always claimed for these tables, so the
-  normal-vs-speculative delta the script prints is a decode-rate delta.
-  `scripts/lib/spec_round_log.py` is now the only reader of that `done` line and
-  refuses a `decode_tps` that is a bare number instead of `Some(x)` / `None` —
-  that shape means an older binary wrote the log and the only rate in it is the
-  contaminated one. A `None` is refused rather than replaced with a wall clock:
-  the engine reports it when there was no interval to measure, and no other
-  number is honest in that slot. `scripts/spec_bench_selftest.sh` drives the
-  whole script against a stub server over canned responses and canned `done`
-  lines and is a hard-fail step of `make ci`. The rows written before this are
-  named by a predicate in `docs/METRICS_DB.md`, since `observations` is
-  append-only and the values sit inside the metric's plausible-value bound where
-  no gate can reach them.
+  All of them now report the first-emitted-token to last-emitted-token window
+  `docs/SPECULATIVE.md` has always claimed for these tables. Two readers own it:
+  `scripts/lib/spec_round_log.py` for a round loop's own logged rate, and
+  `scripts/lib/server_decode_tps.py` for the rate the server derives from a
+  request's inter-token gaps and publishes at `GET /metrics/cache`, which is the
+  same quantity for an arm that has no round loop. Each reading is cross-checked
+  against the same window timed client-side, and a disagreement past a stated
+  band stops the run instead of choosing between them.
 
-- **The Homebrew formula no longer advertises a bottle it does not have.** A
-  `bottle do` block names a `root_url` pinned to one release, but Homebrew
-  derives the bottle *filename* from the formula's current version — so a block
-  left in place across a version bump sends `brew install` after a bottle that
-  was never built, under the previous release's URL. The block shipped pinned to
-  `v0.3.0` through both 0.3.0 and 0.4.0 while the only bottle asset in existence
-  was `rmlx-0.3.0.arm64_tahoe.bottle.tar.gz`, and `brew info` reported
-  `(bottled)` the whole time. Nothing in the release flow regenerated it and
-  nothing failed when it went stale.
+  The readers refuse rather than guess: a `decode_tps` that is a bare number
+  instead of `Some(x)` / `None` means an older binary wrote the log and the only
+  rate in it is the contaminated one; a `None` is the engine saying there was no
+  interval to measure; a log holding fewer round-loop records than requests
+  served no longer silently averages whatever is left; and a request the server
+  cannot attribute an inter-token sample to is not read off the previous one.
 
-  The block is removed rather than refreshed, so `brew install rmlx` builds from
-  source — which is what `depends_on "rust" => :build` always described.
-  Reinstating a bottle needs the ABI coupling solved first, not a fresh sha: a
-  bottle is linked against the builder's `mlx-c`, that dependency is
-  deliberately unversioned, and `mlx-pin.txt` records that a mismatched
-  mlx / mlx-c pair aborts at load with a dyld `Symbol not found`. A source build
-  links the user's own pair and cannot hit that. `docs/RELEASING.md` step 8
-  records the decision; `scripts/release/build_bottle.sh` and `make bottle` are
-  kept but are no longer part of the flow.
+  Six `scripts/bench/` campaign drivers that wrote the same wrong column
+  (`t1`/`t2`/`t3_final_bench.sh`, `fullctx_regression_bench.sh`,
+  `gemma_matrix_bench.sh`, `final_matrix_bench.sh`) are deleted rather than
+  fixed: none had a caller, and a driver nobody invokes that writes an
+  uncorrectable row when someone does is not reproducibility.
+
+  `scripts/spec_bench_selftest.sh` drives the whole script against a stub server
+  and is a hard-fail step of `make ci`. The rows written before this are named
+  by a predicate in `docs/METRICS_DB.md`, since `observations` is append-only
+  and the values sit inside the metric's plausible-value bound where no gate can
+  reach them.
 
 ## [0.4.1] - 2026-09-02
 

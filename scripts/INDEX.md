@@ -64,11 +64,11 @@ Conventions:
 | `perf_ab_host_gate_fixtures.sh` | `make canary-ab-host-gate-fixtures` | Recall test for the measurement/logic boundary: the host gates still fire on a shimmed hostile host, `--synthetic-arms` makes the verdict identical on a hostile and a quiet one, and it waives no arm-reading guard. In `make ci`. |
 | `perf_ab_ingest_selftest.sh` | `make canary-ab-ingest-selftest` | Mutation check for `ingest/perf_ab_ingest.py` — 17 cases over synthetic result files, one per refusal. Never writes `runs.db`. In `make ci`. |
 | `bench_llama_ab_selftest.sh` | `make llama-ab-selftest` | Mutation check for `bench_llama_ab.sh` against a stub `llama-server` — 19 cases, one per guard. Every case declares `--synthetic-arms` and asserts a literal exit code; the taint-path and quiescence-gate cases supply a `ps` shim, and the count of cases that could reach this host is tallied and must be zero. In `make ci`. |
-| `spec_bench_selftest.sh` | `make spec-bench-selftest` | Mutation check for `spec_bench.sh` against a stub server — 8 cases over canned SSE responses and canned round-loop `done` lines, asserting the value each arm ingests and the reason behind every refusal. No GPU, no model, and the stub answers `metrics record` without writing `runs.db`. In `make ci`. |
+| `spec_bench_selftest.sh` | `make spec-bench-selftest` | Mutation check for `spec_bench.sh` against a stub server — 16 cases over canned SSE responses, a canned ITL ring and canned round-loop `done` lines, asserting the value each arm ingests and the reason behind every refusal. The stub streams on a fixed schedule so its reported rate is the rate the wire carried, and records the pid that bound the port so a foreign listener cannot stand in for it. No GPU, no model, and the stub answers `metrics record` without writing `runs.db`. In `make ci`. |
 | `bench_llama_ab.sh` | — | **ABBA-interleaved A/B of two `llama-server` arms** (fork vs upstream, codec vs codec). Same quiescence discipline as `perf_ab.sh` and the same `--synthetic-arms` boundary, both from `lib/cpu_snapshot.sh`, reported over the server's own `timings` plus KV-buffer and peak-RSS columns. Never writes `runs.db`. |
 | `perf_canary.sh` | `make perf-canary` | Fast decode-TPS canary over the three standard test-target models. |
 | `regression_gate.sh` | — | Compare a committed baseline against the latest canary row. Exit 125 = `git bisect skip`, 1 = regression. |
-| `perf-iter/bench_decode_tps.sh` | — | Per-iteration regression bench for a perf-fix campaign. |
+| `perf-iter/bench_decode_tps.sh` | `make perf-iter` | Per-iteration regression bench for a perf-fix campaign. Takes each request's decode rate from the server via `lib/server_decode_tps.py`. |
 | `perf-iter/diff_baseline.sh` | — | Compare two perf-iter JSONL files, emit per-cell deltas. |
 | `perf_ceiling.py` | — | Static roofline calculator: bytes/step and the theoretical ceiling from a snapshot's `config.json` + safetensors index. Its KV byte model is a second copy of the engine's and is held to it by `check_kv_byte_model_parity.sh`; `--byte-model` is that gate's entry point. |
 | `sdpa_headdim_bench.py` | — | What MLX's SDPA dispatch costs as a function of `head_dim`. |
@@ -84,7 +84,7 @@ Conventions:
 | `bench-records-sweep.sh` | 5-model × 4-KV-quant `BENCHMARK_CHAMPIONS` regression sweep. |
 | `bench/tri_engine_same_model.sh` | **llama.cpp vs rMLX vs stock mlx-lm on ONE checkpoint**, across each engine's KV options. Refuses to emit a llama.cpp row unless that binary's Metal tensor API probes live (an inert one reads ~3x low on prefill), and refuses any cell whose KV would push this host into swap. |
 | `bench/tri_engine_summarize.py` | Ingest one raw artifact from `tri_engine_same_model.sh` into a normalized cell record, print the comparison table, or (`--geometry`) read the benched checkpoint's KV geometry out of its `config.json`. Owns the single definition of the cross-engine record shape, incl. the KV bits/value normalization that makes an allocated-for-n_ctx figure comparable to a filled-prefix one. |
-| `spec_bench.sh` | Bench a model in normal vs MTP speculative-decode mode. Both arms report decode throughput over the first-emitted-token to last-emitted-token window: the speculative arm takes the rate the round loop logged, the no-drafter arm is timed client-side. |
+| `spec_bench.sh` | Bench a model in normal vs MTP speculative-decode mode. Both arms report the decode rate the engine measured over the first-emitted-token to last-emitted-token window — the speculative arm from the round loop's log line, the no-drafter arm from the server's ITL ring — and each is cross-checked against the same window timed client-side. |
 | `baseline/run_mlx-lm.sh` | Baseline measurement via Apple's stock `mlx-lm` loader. |
 | `baseline/run_mlx-lm-turboquant.sh` | Baseline measurement via the `mlx-lm-turboquant` fork. |
 | `baseline/run_oMLX.sh` | Baseline measurement via the oMLX Python server. |
@@ -107,7 +107,8 @@ Conventions:
 | `lib/identity.sh` | Shared §8.5 run-identity (`rmlx metrics identity --json`) for bench scripts. **Source it.** |
 | `lib/prefill_ms.py` | Read `decode_profile{prefill_ms}` back out of an rmlx run log. |
 | `lib/spec_round_log.py` | Read a speculative round loop's own `done` line — round counts, draft/accept totals, and the `decode_tps` the engine measured. The only reader of that line: `emitted / elapsed_ms` off it counts the prefill, and a `decode_tps` that is a bare number instead of `Some(x)` / `None` came from a binary that had not yet stopped reporting it that way, so it is refused rather than read. |
-| `lib/sse_decode_window.py` | Time a streamed chat-completions response over its decode window — first content token to last — plus the token count and a preview. Reports no rate at all for a response too short to have a window. |
+| `lib/sse_decode_window.py` | Time a streamed chat-completions response over its decode window — first content token to last — plus the token count and a preview. Reports no rate at all for a response too short to have a window, and refuses a response whose tokens did not arrive one per chunk. |
+| `lib/server_decode_tps.py` | Read one request's decode rate off a running server's ITL ring (`GET /metrics/cache`), where `1000 / step_mean_ms` is the same first-token-to-last window the round loops report. Refuses unless exactly one new sample is attributable to the request. |
 
 ## Profiling / GPU capture
 
@@ -170,10 +171,20 @@ specific report. They hard-code models, contexts and flags for the campaign they
 were written for. Read one before reusing it; prefer extending the general
 drivers above.
 
-`b1_turbo_flash_validate.sh`, `final_matrix_bench.sh`,
-`fullctx_regression_bench.sh`, `gemma_matrix_bench.sh`, `p0b_prefill_bench.sh`,
-`p0b_ttft_only.sh`, `p0b_vg2_niah.sh`, `p1a4_turbo_flash_lock_bench.sh`,
+`b1_turbo_flash_validate.sh`, `p0b_prefill_bench.sh`, `p0b_ttft_only.sh`,
+`p0b_vg2_niah.sh`, `p1a4_turbo_flash_lock_bench.sh`,
 `p2a_turbo_flash_bench.sh`, `p2c1_remaining_cells.sh`,
-`p2c1_spec_128k_bench.sh`, `t1_final_bench.sh`, `t2_final_bench.sh`,
-`t3_final_bench.sh`, `turboquant_v3_bench.sh`, `vg2_niah_surrogate.sh`,
+`p2c1_spec_128k_bench.sh`, `turboquant_v3_bench.sh`, `vg2_niah_surrogate.sh`,
 `vg2_turbo_flash_lock_qwen35b.sh`, `vg2_turbo_flash_qwen35b.sh`.
+
+Six of these are gone rather than frozen: `t1_final_bench.sh`,
+`t2_final_bench.sh`, `t3_final_bench.sh`, `fullctx_regression_bench.sh`,
+`gemma_matrix_bench.sh` and `final_matrix_bench.sh` each wrote a permanent
+`decode_tps_warm` row into `runs.db` from a whole-request stopwatch — a rate
+that counts the prompt prefill, which is `overall_tps` under another metric's
+name. None had a caller: no Makefile target, no doc, nothing but the row above.
+A driver nobody invokes and that writes an uncorrectable wrong row when someone
+does is not reproducibility, and the reports they produced are already written.
+Git holds them. A campaign script that is meant to stay runnable takes its
+decode rate from `lib/server_decode_tps.py` or `lib/spec_round_log.py` like the
+live drivers do.
