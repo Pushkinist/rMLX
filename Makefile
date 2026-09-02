@@ -80,6 +80,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         build-perf build-debug test-perf ci-perf gpu-test model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest \
+        canary-ab-host-gate-fixtures llama-ab-selftest \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
@@ -457,6 +458,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh
+	@bash scripts/perf_ab_host_gate_fixtures.sh
 	@bash scripts/perf_ab_ingest_selftest.sh
 	@bash scripts/bench_llama_ab_selftest.sh
 	@bash scripts/check_metal_format.sh
@@ -630,6 +632,9 @@ canary-ab: mlx-preflight build-perf  ## interleaved A/B of two arms (ARGS='--bin
 
 canary-ab-selftest: ## mutation-check the A/B harness against stub binaries (no GPU, no model)
 	bash scripts/perf_ab_selftest.sh
+
+canary-ab-host-gate-fixtures: ## recall-check the A/B harness's host gates against shimmed hosts (no GPU, no model)
+	bash scripts/perf_ab_host_gate_fixtures.sh
 
 canary-ab-ingest-selftest: ## mutation-check the A/B -> runs.db promoter (no GPU, no model, no DB write)
 	bash scripts/perf_ab_ingest_selftest.sh

@@ -30,6 +30,26 @@
 #     same invocation that measures speed, so an arm that is fast and wrong
 #     fails there rather than in a later correctness pass.
 #
+# MEASUREMENT VS LOGIC
+#
+# Two kinds of precondition live here and they are not the same kind of fact.
+# One reads the arms: the slot count, the arm digests, the fields a slot
+# emitted, the token ids it generated. The other reads the machine: is a
+# foreign process burning CPU, does something else hold the Metal context.
+# Only the second can change its answer between two runs of identical inputs.
+#
+# `--synthetic-arms` declares that the arms are stub binaries, so the run is an
+# exercise of this script's own logic and not a measurement of anything. The
+# machine is then not consulted at all -- no quiescence probe, no interference
+# sampling, no Metal-exclusivity check -- and the run says so on stdout and in
+# `waivers.synthetic_arms`, which `ingest/perf_ab_ingest.py` refuses outright.
+# The arm-reading preconditions are untouched by it. The machine is read in
+# exactly four places -- `probe_host`, `snapshot_ok`, the exclusivity gate, and
+# the load average recorded as context -- and the flag guards each of them;
+# everywhere else it is only printed or recorded. The load average is the one
+# that looks harmless: it feeds no gate, but a run claiming it consulted nothing
+# must not file a number it read off this host.
+#
 # WHAT IT DOES NOT DO
 #
 # The arms run as separate processes, one per slot. Alternating two kernel
@@ -53,11 +73,12 @@
 # directory when that matters.
 #
 # Exit codes:
-#   0   — ran cleanly; the verdict is on stdout
+#   0   — ran cleanly; the verdict is on stdout. Under --synthetic-arms this
+#         says the logic ran, not that a measurement was clean.
 #   1   — correctness failure: the arms produced different token ids
-#   125 — the comparison is not usable: a measurement precondition failed
-#         (busy host, indistinguishable arms, missing binary/model, unparseable
-#         output), or the run completed but was TAINTED by interference.
+#   125 — the comparison is not usable: a precondition failed (busy host,
+#         indistinguishable arms, missing binary/model, unparseable output), or
+#         the run completed but was TAINTED by interference.
 
 # No `pipefail`: several parses here legitimately end in `| head -1`, which
 # SIGPIPEs its producer once it has what it needs. Under pipefail that reads as
@@ -84,6 +105,7 @@ INVERT=false
 ALLOW_NULL_ARMS=false
 ALLOW_BUSY_HOST=false
 ALLOW_TOKEN_DIVERGENCE=false
+SYNTHETIC_ARMS=false
 BUSY_PCT=25
 MODELS=()
 
@@ -129,6 +151,14 @@ Escape hatches (each one weakens a guard; each is reported in the output):
   --allow-token-divergence   permit arms that generate different tokens
                              (e.g. two different KV codecs)
   --busy-pct PCT             foreign-process CPU%% that counts as busy (default 25)
+
+Not a measurement:
+  --synthetic-arms           the arms are stub binaries, so this run exercises
+                             this script's logic and measures nothing. The
+                             machine is not consulted: no quiescence probe, no
+                             interference sampling, no Metal-exclusivity check.
+                             Recorded in the result file and refused by the
+                             runs.db promoter.
 USAGE
 }
 
@@ -159,6 +189,7 @@ while [[ $# -gt 0 ]]; do
 	--allow-null-arms) ALLOW_NULL_ARMS=true; shift ;;
 	--allow-busy-host) ALLOW_BUSY_HOST=true; shift ;;
 	--allow-token-divergence) ALLOW_TOKEN_DIVERGENCE=true; shift ;;
+	--synthetic-arms) SYNTHETIC_ARMS=true; shift ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "unknown flag: $1" >&2; usage >&2; exit 125 ;;
 	esac
@@ -320,6 +351,8 @@ RESULT_JSON="${OUT_DIR}/${TS}.json"
 # basenames.
 CPU_SNAPSHOT_SKIP="$(basename "$BIN_A") $(basename "$BIN_B")"
 export CPU_SNAPSHOT_SKIP
+# `snapshot_ok` and `window_not_sampled` come from here too, and both read
+# SYNTHETIC_ARMS -- which is why this is sourced after the flags are parsed.
 # shellcheck source=scripts/lib/cpu_snapshot.sh
 . "${REPO_ROOT}/scripts/lib/cpu_snapshot.sh"
 
@@ -327,18 +360,8 @@ load_averages() {
 	uptime | sed -e 's/.*load averages*: *//' -e 's/,/ /g' | awk '{printf "%s %s %s", $1, $2, $3}'
 }
 
-# Take a snapshot into $1, recording whether it succeeded. A snapshot that
-# could not be taken must never read back as an empty-but-valid one.
-snapshot_ok() {
-	if cpu_snapshot "$1"; then
-		return 0
-	fi
-	: >"$1.failed"
-	return 1
-}
-
 # "<state> <pct> <comm>" for the window between two snapshots $3 seconds apart.
-# state is one of busy | quiet | unmeasured.
+# state is one of busy | quiet | unmeasured | not-sampled.
 #
 # `unmeasured` stays distinct from `quiet` all the way into the report, and it
 # covers three different ways of not knowing: the window was too short to divide
@@ -346,6 +369,10 @@ snapshot_ok() {
 # "nothing was running" is how an interference gate quietly stops gating.
 classify_window() {
 	local raw pct
+	if window_not_sampled "$1" "$2"; then
+		echo "not-sampled - -"
+		return
+	fi
 	if [[ -e "$1.failed" || -e "$2.failed" ]]; then
 		echo "unmeasured - -"
 		return
@@ -393,16 +420,20 @@ json_num() {
 # Render a "<state> <pct> <comm>" triple for a human.
 host_detail() {
 	local rest="${1#* }"
-	if [[ "${1%% *}" == "unmeasured" ]]; then
-		echo "unmeasured (window too short to sample)"
-	else
-		echo "${rest%% *}% ${rest#* }"
-	fi
+	case "${1%% *}" in
+	unmeasured) echo "unmeasured (window too short to sample)" ;;
+	not-sampled) echo "not sampled (--synthetic-arms)" ;;
+	*) echo "${rest%% *}% ${rest#* }" ;;
+	esac
 }
 
 # Sample a dedicated one-second window. Used before anything is measured.
 probe_host() {
 	local a b
+	if $SYNTHETIC_ARMS; then
+		echo "not-sampled - -"
+		return
+	fi
 	a="${WORK_DIR}/probe_a"
 	b="${WORK_DIR}/probe_b"
 	snapshot_ok "$a" || true
@@ -637,6 +668,26 @@ kv_arm_bytes() {
 
 # ---- run ---------------------------------------------------------------------
 
+# What this run did with the machine, stated in the run's own output. The two
+# dispositions are different kinds of run, not two settings of one gate: one is
+# a measurement that refuses interference, the other measures nothing and so
+# reads nothing.
+if $SYNTHETIC_ARMS; then
+	HOST_DISPOSITION="INTERFERENCE GATE: OFF — --synthetic-arms. The arms are stub binaries, so this
+  run exercises this script's scheduling, guards and arithmetic and measures
+  nothing. The machine is not consulted at all: no quiescence probe, no per-slot
+  interference sampling, no Metal-exclusivity check. No number below describes
+  this host or any model, and the runs.db promoter refuses this result."
+else
+	# One awk, not `awk && echo`: this is an assignment, so a false test would
+	# be the assignment's exit status and `set -e` would end the run here.
+	HOST_DISPOSITION="INTERFERENCE GATE: a foreign process at or above ${BUSY_PCT}% of one core taints the
+  run.$(awk -v t="$BUSY_PCT" 'BEGIN { if (t > 25) printf "  RAISED from the 25%% default -- the gate is correspondingly weaker." }')
+  It is measured from cumulative CPU time across each slot and across the
+  comparison, so it sees anything running at the start, the end, or throughout.
+  It does NOT see a process that both starts and exits inside one window."
+fi
+
 cat <<HEADER
 ========================================================================
 rMLX A/B — ABBA-interleaved, $SLOTS slots per model ($((SLOTS / 2)) per arm)
@@ -670,11 +721,7 @@ WHAT THE NUMBERS LICENSE:
   no p-value beyond the pre-declared rank test above are computed, and none
   should be read into the ratio.
 
-INTERFERENCE GATE: a foreign process at or above ${BUSY_PCT}% of one core taints the
-  run.$( awk -v t="$BUSY_PCT" 'BEGIN { exit !(t > 25) }' && echo "  RAISED from the 25% default -- the gate is correspondingly weaker." )
-  It is measured from cumulative CPU time across each slot and across the
-  comparison, so it sees anything running at the start, the end, or throughout.
-  It does NOT see a process that both starts and exits inside one window.
+$HOST_DISPOSITION
 
 Every slot runs with --metrics off, so runs.db is never opened. This run writes
 its result to $RESULT_JSON. Each slot is a full rmlx process
@@ -685,8 +732,16 @@ matters.
 HEADER
 
 INITIAL_HOST="$(probe_host)"
-INITIAL_LOAD="$(load_averages)"
-echo "host at start: load(1,5,15)=$INITIAL_LOAD  busiest foreign process over a 1s window: $(host_detail "$INITIAL_HOST")"
+# The load average is context, but it is still a reading taken off this machine,
+# and a run that says it consulted nothing must not carry one. Recorded beside a
+# "not sampled" host line it is the number a reader would reach for.
+if $SYNTHETIC_ARMS; then
+	INITIAL_LOAD="not sampled (--synthetic-arms)"
+	echo "host at start: not sampled (--synthetic-arms)"
+else
+	INITIAL_LOAD="$(load_averages)"
+	echo "host at start: load(1,5,15)=$INITIAL_LOAD  busiest foreign process over a 1s window: $(host_detail "$INITIAL_HOST")"
+fi
 
 if [[ "${INITIAL_HOST%% *}" == "busy" ]]; then
 	if ! $ALLOW_BUSY_HOST; then
@@ -703,7 +758,10 @@ fi
 # context throughout, which is exactly the confound this harness exists to
 # exclude -- so it is reported, not killed. Killing it here would destroy
 # someone else's work to make our number look better.
-if pgrep -f "rmlx serve" >/dev/null 2>&1; then
+#
+# A stub arm dispatches no Metal, so under --synthetic-arms whoever holds the
+# context is not a fact about the run.
+if ! $SYNTHETIC_ARMS && pgrep -f "rmlx serve" >/dev/null 2>&1; then
 	echo "ERROR: an 'rmlx serve' process is running and holds the Metal context." >&2
 	echo "  Stop it before measuring:  pkill -f 'rmlx serve'" >&2
 	exit 125
@@ -952,7 +1010,7 @@ cat >"$RESULT_JSON" <<JSON
   "arm_b": {"label": "$(json_str "$LABEL_B")", "binary": "$(json_str "$BIN_B")", "sha256_16": "$SHA_B", "args": "$(json_str "$ARGS_B")"},
   "host": {"load_at_start": "$INITIAL_LOAD", "busiest_at_start": "$(json_str "$(host_detail "$INITIAL_HOST")")", "busiest_at_end": "$(json_str "$(host_detail "$FINAL_HOST")")", "busy_pct_threshold": $BUSY_PCT},
   "statistics": {"null_p_per_comparison": $NULL_P, "comparisons": ${#MODELS[@]}, "null_p_family": $FAMILY_P, "stddev_rel_std_err_pct": $SD_RSE_PCT},
-  "waivers": {"null_arms": $ALLOW_NULL_ARMS, "busy_host": $ALLOW_BUSY_HOST, "token_divergence": $ALLOW_TOKEN_DIVERGENCE, "busy_pct_raised": $(awk -v t="$BUSY_PCT" 'BEGIN { print (t > 25) ? "true" : "false" }')},
+  "waivers": {"null_arms": $ALLOW_NULL_ARMS, "busy_host": $ALLOW_BUSY_HOST, "token_divergence": $ALLOW_TOKEN_DIVERGENCE, "busy_pct_raised": $(awk -v t="$BUSY_PCT" 'BEGIN { print (t > 25) ? "true" : "false" }'), "synthetic_arms": $SYNTHETIC_ARMS},
   "results": [
 ${JSON_MODELS%,}
   ]
@@ -960,6 +1018,10 @@ ${JSON_MODELS%,}
 JSON
 
 echo ""
-echo "host at end:   busiest foreign process over a 1s window: $(host_detail "$FINAL_HOST")"
+if [[ "${FINAL_HOST%% *}" == "not-sampled" ]]; then
+	echo "host at end:   not sampled (--synthetic-arms)"
+else
+	echo "host at end:   busiest foreign process over a 1s window: $(host_detail "$FINAL_HOST")"
+fi
 echo "result: $RESULT_JSON"
 exit "$OVERALL_EXIT"

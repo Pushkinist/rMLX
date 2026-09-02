@@ -183,6 +183,21 @@ def main() -> int:
     args = p.parse_args()
 
     result = json.loads(Path(args.result).read_text(encoding="utf-8"))
+    # A run made with --synthetic-arms drove stub servers, so its numbers
+    # describe nothing that exists. That is not a host condition anyone can
+    # choose to accept, so this refusal has no waiver -- unlike taint, which is
+    # a real measurement taken under interference.
+    if result.get("synthetic_arms"):
+        print(
+            "refusing: the run was made with --synthetic-arms, so its arms were "
+            "stub servers\n"
+            "  and its numbers measure nothing. There is no waiver for this: "
+            "re-run the\n"
+            "  comparison against real binaries.",
+            file=sys.stderr,
+        )
+        return 2
+
     if result.get("tainted") and not args.accept_tainted:
         print(
             f"refusing: run is TAINTED ({result['tainted']}).\n"
