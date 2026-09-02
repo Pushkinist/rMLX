@@ -108,7 +108,7 @@ use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
 
 use crate::clifford::MV_DIM;
-use crate::flash_decode_common::flatten_v_mirror;
+use crate::flash_decode_common::{flatten_v_mirror, VMirror};
 use crate::rotorquant::{n_groups_for, ROTOR3_GROUP_SIZE};
 use crate::turboquant::lloyd_gaussian_codebook;
 
@@ -544,11 +544,11 @@ fn p2_kernel() -> Result<&'static MetalKernel> {
 ///   handling as `k_scales`.
 /// * `k_rotors`  — static per-(layer, head) rotor table, flat `[n_groups * 4]`
 ///   f32 in `[s, b12, b13, b23]` order.
-/// * `v`         — bf16 / f16 / f32 V, shape `[B, kv_h, v_seq, head_dim]` with
-///   `v_seq >= kv_seq`: pass the whole mirror allocation rather than a
-///   `..kv_seq` slice of it, and the kernel strides over it (see
-///   [`flatten_v_mirror`]). Read in its native dtype; the dispatcher does NOT
-///   astype-upcast.
+/// * `v`         — the bf16 / f16 / f32 V mirror, `[B, kv_h, v_seq, head_dim]`,
+///   passed whole rather than as a `..kv_seq` slice, with the number of valid
+///   positions in it. The kernel strides over the allocation and
+///   [`flatten_v_mirror`] checks `valid == kv_seq`. Read in its native dtype;
+///   the dispatcher does NOT astype-upcast.
 /// * `additive_mask` — optional `f32 [B, n_q_heads, 1, kv_seq]`.
 /// * `b`, `kv_h`, `kv_seq`, `head_dim`, `heads_per_kv` — shape metadata.
 /// * `scale`     — softmax pre-scale (typically `1/sqrt(head_dim)`).
@@ -571,7 +571,7 @@ pub fn rotor_flash_decode_sdpa<const BITS: u8>(
     k_scales: &Array,
     k_norms: &Array,
     k_rotors: &Array,
-    v: &Array,
+    v: VMirror<'_>,
     additive_mask: Option<&Array>,
     b: i32,
     kv_h: i32,

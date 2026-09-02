@@ -121,7 +121,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
 
-use crate::flash_decode_common::flatten_v_mirror;
+use crate::flash_decode_common::{flatten_v_mirror, VMirror};
 use crate::isoquant::FIXED_QUAT;
 use crate::storage::{iso_n_groups_for, ISO_QUAT_BLOCK_SIZE};
 use crate::turboquant::lloyd_gaussian_codebook;
@@ -472,11 +472,11 @@ fn p2_kernel() -> Result<&'static MetalKernel> {
 ///   reinterpreted.
 /// * `k_norms`   — per-token L2 norms, flat `[B * kv_seq * kv_h]`, same dtype
 ///   handling as `k_scales`.
-/// * `v`         — bf16 / f16 / f32 V, shape `[B, kv_h, v_seq, head_dim]` with
-///   `v_seq >= kv_seq`: pass the whole mirror allocation rather than a
-///   `..kv_seq` slice of it, and the kernel strides over it (see
-///   [`flatten_v_mirror`]). Read in its native dtype; the dispatcher does NOT
-///   astype-upcast.
+/// * `v`         — the bf16 / f16 / f32 V mirror, `[B, kv_h, v_seq, head_dim]`,
+///   passed whole rather than as a `..kv_seq` slice, with the number of valid
+///   positions in it. The kernel strides over the allocation and
+///   [`flatten_v_mirror`] checks `valid == kv_seq`. Read in its native dtype;
+///   the dispatcher does NOT astype-upcast.
 /// * `additive_mask` — optional `f32 [B, n_q_heads, 1, kv_seq]`.
 /// * `b`, `kv_h`, `kv_seq`, `head_dim`, `heads_per_kv` — shape metadata.
 /// * `scale`     — softmax pre-scale (typically `1/sqrt(head_dim)`).
@@ -499,7 +499,7 @@ pub fn iso_flash_decode_sdpa<const BITS: u8>(
     k_codes: &Array,
     k_scales: &Array,
     k_norms: &Array,
-    v: &Array,
+    v: VMirror<'_>,
     additive_mask: Option<&Array>,
     b: i32,
     kv_h: i32,

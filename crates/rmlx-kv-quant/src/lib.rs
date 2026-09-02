@@ -113,6 +113,9 @@ pub mod turbo_k4_fused_qk_msl;
 pub mod turboquant;
 pub mod turboquant_msl;
 
+// The V-mirror pair the three flash-decode dispatchers take. Re-exported rather
+// than opening the whole module: the rest of `flash_decode_common` is internal.
+pub use flash_decode_common::VMirror;
 pub use kvcache::{KvCache, SharedKv};
 pub use linear_attn::LinearAttnCache;
 pub use quant::{

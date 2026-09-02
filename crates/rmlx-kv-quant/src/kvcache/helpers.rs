@@ -219,13 +219,18 @@ pub(super) fn array_to_f32_vec(a: &Array, device: Device) -> Result<Vec<f32>> {
 /// `b * kv_h == 1` and flattening it anywhere else copies the whole prefix.
 /// Those dispatchers take the mirror whole and stride over it instead — see
 /// `crate::flash_decode_common::flatten_v_mirror`.
+///
+/// # Errors
+///
+/// [`Error::Quant`] for a non-rank-4 `v` or an out-of-range `seq_len` — the
+/// same shape-contract kind `flatten_v_mirror` raises for the same faults.
 pub(super) fn slice_v_prefix(v: &Array, seq_len: i32, device: Device) -> Result<Array> {
     let shape = v.shape();
     let [b, kv_h, v_seq, head_dim] = shape[..] else {
-        return Err(Error::Mlx(format!("V mirror rank != 4, got {shape:?}")));
+        return Err(Error::Quant(format!("V mirror rank != 4, got {shape:?}")));
     };
     if seq_len < 0 || seq_len > v_seq {
-        return Err(Error::Mlx(format!(
+        return Err(Error::Quant(format!(
             "V mirror prefix {seq_len} out of range for sequence extent {v_seq}"
         )));
     }

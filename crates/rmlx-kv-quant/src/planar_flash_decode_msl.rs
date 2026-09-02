@@ -56,7 +56,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-use crate::flash_decode_common::flatten_v_mirror;
+use crate::flash_decode_common::{flatten_v_mirror, VMirror};
 use crate::planarquant::{planar_rotation_codebook, N_ROTATIONS};
 use crate::turboquant::{lloyd_gaussian_codebook, GROUP_SIZE};
 use rmlx_core::error::{Error, Result};
@@ -291,12 +291,12 @@ fn p2_kernel() -> Result<&'static MetalKernel> {
 ///   `B * kv_h * kv_seq * head_dim/2`).
 /// * `k_rot32`   — 4-bit rotation indices (`u32`, flat
 ///   `B * kv_h * kv_seq * head_dim/16`).
-/// * `v`         — bf16 / f16 / f32 V, shape `[B, kv_h, v_seq, head_dim]` with
-///   `v_seq >= kv_seq`: pass the whole mirror allocation rather than a
-///   `..kv_seq` slice of it, and the kernel strides over it (see
-///   [`flatten_v_mirror`]). Read in its native dtype via implicit promotion to
-///   `float` inside MSL; the dispatcher does NOT astype-upcast.  Other dtypes
-///   are rejected.
+/// * `v`         — the bf16 / f16 / f32 V mirror, `[B, kv_h, v_seq, head_dim]`,
+///   passed whole rather than as a `..kv_seq` slice, with the number of valid
+///   positions in it. The kernel strides over the allocation and
+///   [`flatten_v_mirror`] checks `valid == kv_seq`. Read in its native dtype
+///   via implicit promotion to `float` inside MSL; the dispatcher does NOT
+///   astype-upcast.  Other dtypes are rejected.
 /// * `additive_mask` — optional `f32 [B, n_q_heads, 1, kv_seq]`.
 /// * `b`, `kv_h`, `kv_seq`, `head_dim`, `heads_per_kv` — shape metadata.
 /// * `bits`      — K code bit-width.  Must be `4` (only PlanarK 4-bit storage
@@ -320,7 +320,7 @@ pub fn planar_flash_decode_sdpa(
     k_codes: &Array,
     k_scales: &Array,
     k_rot32: &Array,
-    v: &Array,
+    v: VMirror<'_>,
     additive_mask: Option<&Array>,
     b: i32,
     kv_h: i32,

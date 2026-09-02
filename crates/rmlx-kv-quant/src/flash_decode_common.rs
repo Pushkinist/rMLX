@@ -86,12 +86,40 @@
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{pad, Array, Device, Dtype};
 
-/// Flatten a bf16 / f16 / f32 V mirror for a flash-decode kernel, and report
-/// the stride the kernel must index its sequence axis with.
+/// A bf16 / f16 / f32 V accumulator, paired with the number of sequence
+/// positions in it that hold real data.
 ///
-/// `v` is `[b, kv_h, v_seq, head_dim]` with `v_seq >= kv_seq`: the caller hands
-/// over the **whole** mirror allocation, not a `..kv_seq` slice of it, and
-/// `kv_seq` stays the attended length. Only the stride changes.
+/// The two travel together because the buffer alone cannot carry the second
+/// half. A flash-decode kernel indexes the mirror at its **allocation** stride
+/// while attending only its valid prefix, so a caller that hands over the
+/// buffer without saying how much of it is live has silently asked the kernel
+/// to read whatever the tail happens to hold — zeros, or a previous, longer
+/// sequence's V. Carrying `valid` makes that a checked error instead
+/// ([`flatten_v_mirror`]).
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct VMirror<'a> {
+    /// The whole `[b, kv_h, v_seq, head_dim]` allocation.
+    pub buf: &'a Array,
+    /// Sequence positions of `buf` that hold appended data, `<= v_seq`.
+    pub valid: i32,
+}
+
+impl<'a> VMirror<'a> {
+    /// Pair a mirror allocation with the number of positions in it that hold
+    /// appended data.
+    #[must_use]
+    pub const fn new(buf: &'a Array, valid: i32) -> Self {
+        Self { buf, valid }
+    }
+}
+
+/// Flatten a V mirror for a flash-decode kernel, and report the stride the
+/// kernel must index its sequence axis with.
+///
+/// `v.buf` is `[b, kv_h, v_seq, head_dim]`: the caller hands over the **whole**
+/// allocation, not a `..kv_seq` slice of it, and `kv_seq` stays the attended
+/// length. Only the stride changes.
 ///
 /// That distinction is the point of this helper. The mirror is head-major, so
 /// cutting a `..kv_seq` prefix out of it leaves a gap between heads: the view is
@@ -100,15 +128,29 @@ use rmlx_mlx::{pad, Array, Device, Dtype};
 /// `contiguous()` call at the site to make it visible. Flattening the
 /// allocation itself copies nothing at any `kv_h`.
 ///
+/// # The `valid == kv_seq` check is load-bearing
+///
+/// It is not a redundant assertion. Attending a `..kv_seq` cut used to enforce
+/// this implicitly: the flatten was to `b * kv_h * kv_seq * head_dim` elements
+/// and MLX's `reshape` rejects an element-count mismatch, so a V shorter than
+/// the attended length could not reach the kernel. Striding over the allocation
+/// removes that coupling — the element count now matches whatever was passed —
+/// so the check has to be made explicitly, and in every profile: the two
+/// lengths come from independent producers (the packed K store's accumulated
+/// sequence against the mirror's own append accounting), and they have gone out
+/// of step before. A `debug_assert` would not do, being compiled out of
+/// `release-perf`; the failure mode it would miss is plausible-but-wrong output
+/// with no error.
+///
 /// # Errors
 ///
-/// [`Error::Quant`] when `v` is not rank 4, when its `b` / `kv_h` / `head_dim`
-/// axes disagree with the passed shape metadata, when its sequence axis is
-/// shorter than `kv_seq` (the kernel would read past the buffer), when the flat
-/// element count overflows `i32`, or for a non-float dtype. Forwards `reshape`
-/// errors otherwise.
+/// [`Error::Quant`] when `v.buf` is not rank 4, when its `b` / `kv_h` /
+/// `head_dim` axes disagree with the passed shape metadata, when `v.valid`
+/// differs from `kv_seq` or exceeds the allocation, when the flat element count
+/// overflows `i32`, or for a non-float dtype. Forwards `reshape` errors
+/// otherwise.
 pub(crate) fn flatten_v_mirror(
-    v: &Array,
+    v: VMirror<'_>,
     kernel: &str,
     b: i32,
     kv_h: i32,
@@ -116,7 +158,7 @@ pub(crate) fn flatten_v_mirror(
     head_dim: i32,
     device: Device,
 ) -> Result<(Array, i32)> {
-    let shape = v.shape();
+    let shape = v.buf.shape();
     let [v_b, v_kv_h, v_seq, v_head_dim] = shape[..] else {
         return Err(Error::Quant(format!(
             "{kernel}: V rank != 4, got {shape:?}"
@@ -127,12 +169,21 @@ pub(crate) fn flatten_v_mirror(
             "{kernel}: V shape {shape:?} disagrees with b={b}, kv_h={kv_h}, head_dim={head_dim}"
         )));
     }
-    if v_seq < kv_seq {
+    if v.valid != kv_seq {
         return Err(Error::Quant(format!(
-            "{kernel}: V sequence extent {v_seq} is shorter than the attended kv_seq={kv_seq}"
+            "{kernel}: the V mirror holds {} valid positions but {kv_seq} are being attended — \
+             the store and the mirror are out of step, and the kernel would read the mirror's \
+             tail as if it were V",
+            v.valid
         )));
     }
-    match v.dtype() {
+    if v.valid > v_seq {
+        return Err(Error::Quant(format!(
+            "{kernel}: the V mirror claims {} valid positions in an allocation of {v_seq}",
+            v.valid
+        )));
+    }
+    match v.buf.dtype() {
         Dtype::F32 | Dtype::Bf16 | Dtype::F16 => {}
         other @ (Dtype::U8 | Dtype::U32 | Dtype::I32) => {
             return Err(Error::Quant(format!(
@@ -146,7 +197,7 @@ pub(crate) fn flatten_v_mirror(
             "{kernel}: V element count {total} overflows i32 at v_seq={v_seq}"
         ))
     })?;
-    Ok((v.reshape(&[total], device)?, v_seq))
+    Ok((v.buf.reshape(&[total], device)?, v_seq))
 }
 
 /// Minimum per-token `norms` element count (`b * kv_h * kv_seq`) a symmetric

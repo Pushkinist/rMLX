@@ -7,6 +7,7 @@
 //! replaces — not merely that it is self-consistent.
 
 use super::*;
+use crate::flash_decode_common::VMirror;
 use crate::isoquant::{iso_decode_fast, iso_encode_fast};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
 use rmlx_mlx::{Array, Device, Dtype};
@@ -205,7 +206,7 @@ fn run_oracle_masked(
             &codes,
             &scales,
             &norms,
-            &v_arr,
+            VMirror::new(&v_arr, kv_seq as i32),
             mask_arr.as_ref(),
             b as i32,
             kv_h as i32,
@@ -220,7 +221,7 @@ fn run_oracle_masked(
             &codes,
             &scales,
             &norms,
-            &v_arr,
+            VMirror::new(&v_arr, kv_seq as i32),
             mask_arr.as_ref(),
             b as i32,
             kv_h as i32,
@@ -304,7 +305,7 @@ fn bench_iso(
                 &codes,
                 &scales,
                 &norms,
-                &v_arr,
+                VMirror::new(&v_arr, kv_seq as i32),
                 None,
                 b as i32,
                 kv_h as i32,
@@ -319,7 +320,7 @@ fn bench_iso(
                 &codes,
                 &scales,
                 &norms,
-                &v_arr,
+                VMirror::new(&v_arr, kv_seq as i32),
                 None,
                 b as i32,
                 kv_h as i32,
@@ -554,7 +555,7 @@ fn iso_decode_with_transposed_mask(bits: u8, mask_bf16: bool, prep: MaskPrep) ->
             &codes,
             &scales,
             &norms,
-            &v_arr,
+            VMirror::new(&v_arr, kv_seq as i32),
             Some(&mask),
             b as i32,
             kv_h as i32,
@@ -569,7 +570,7 @@ fn iso_decode_with_transposed_mask(bits: u8, mask_bf16: bool, prep: MaskPrep) ->
             &codes,
             &scales,
             &norms,
-            &v_arr,
+            VMirror::new(&v_arr, kv_seq as i32),
             Some(&mask),
             b as i32,
             kv_h as i32,
@@ -694,7 +695,7 @@ fn iso_flash_decode_rejects_non_pow2_head_dim() {
         &codes,
         &dummy,
         &dummy,
-        &dummy,
+        VMirror::new(&dummy, 8),
         None,
         1,
         1,
@@ -719,7 +720,7 @@ fn iso_flash_decode_rejects_head_dim_above_max() {
         &codes,
         &dummy,
         &dummy,
-        &dummy,
+        VMirror::new(&dummy, 8),
         None,
         1,
         1,
@@ -746,7 +747,7 @@ fn iso_flash_decode_rejects_unsupported_bits() {
         &codes,
         &dummy,
         &dummy,
-        &dummy,
+        VMirror::new(&dummy, 8),
         None,
         1,
         1,
