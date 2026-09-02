@@ -44,11 +44,6 @@ class Rmlx < Formula
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/Pushkinist/rMLX.git", branch: "main"
 
-  bottle do
-    root_url "https://github.com/Pushkinist/rMLX/releases/download/v0.3.0"
-    sha256 cellar: :any, arm64_tahoe: "4bd5ad4f87cdac86646e2da43015b1fd9b376ada0516ed6bca79d47dd7ac3aa7"
-  end
-
   depends_on "rust" => :build
   depends_on arch: :arm64
   depends_on :macos

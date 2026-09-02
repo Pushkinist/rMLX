@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Homebrew formula no longer advertises a bottle it does not have.** A
+  `bottle do` block names a `root_url` pinned to one release, but Homebrew
+  derives the bottle *filename* from the formula's current version — so a block
+  left in place across a version bump sends `brew install` after a bottle that
+  was never built, under the previous release's URL. The block shipped pinned to
+  `v0.3.0` through both 0.3.0 and 0.4.0 while the only bottle asset in existence
+  was `rmlx-0.3.0.arm64_tahoe.bottle.tar.gz`, and `brew info` reported
+  `(bottled)` the whole time. Nothing in the release flow regenerated it and
+  nothing failed when it went stale.
+
+  The block is removed rather than refreshed, so `brew install rmlx` builds from
+  source — which is what `depends_on "rust" => :build` always described.
+  Reinstating a bottle needs the ABI coupling solved first, not a fresh sha: a
+  bottle is linked against the builder's `mlx-c`, that dependency is
+  deliberately unversioned, and `mlx-pin.txt` records that a mismatched
+  mlx / mlx-c pair aborts at load with a dyld `Symbol not found`. A source build
+  links the user's own pair and cannot hit that. `docs/RELEASING.md` step 8
+  records the decision; `scripts/release/build_bottle.sh` and `make bottle` are
+  kept but are no longer part of the flow.
+
 ## [0.4.1] - 2026-09-02
 
 A patch release carrying one decode-path fix, one correction to what the
