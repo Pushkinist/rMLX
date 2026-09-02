@@ -191,6 +191,18 @@ VALIDATION_BANNER='Metal GPU Validation Enabled'
 # is what keeps a test's own "invalid" wording from forging a hit.
 VALIDATION_DIAGNOSTIC='Invalid .{0,120}(at offset [0-9]+|executing kernel function:)'
 
+# The access kind as the layer itself worded it — `device load`, `device store`
+# and the threadgroup spellings all arrive through the pattern above, and they
+# differ in severity: a dropped write is corruption outright, a zero-filled read
+# only matters if the kernel keeps the lanes it filled. Reads diagnostics on
+# stdin, one per line, and writes one kind per line.
+access_kind() {
+    sed -E -e 's/^Invalid[[:space:]]+//' \
+           -e 's/[[:space:]]*(at offset [0-9]+|executing kernel function:).*$//' \
+           -e 's/[[:space:]]*,[[:space:]]*$//' \
+           -e 's/^$/unnamed access/'
+}
+
 # Same environment the crates run under, hoisted so the canary above can use it.
 # `${arr[@]+"${arr[@]}"}` is the portable spelling: mtl_unset is empty whenever
 # the caller exported no MTL_* names, and expanding an empty array is an
@@ -296,6 +308,7 @@ failed_crates=""
 total_passed=0
 total_failed=0
 validation_hits=""
+validation_kinds=""
 
 if [ "${SHADER_VALIDATION}" = "1" ]; then
     echo "shader validation: ON (invalid Metal memory access fails this run)"
@@ -410,12 +423,18 @@ for crate in "${crates[@]}"; do
         # allocator, so KV stores come through as `buffer: <unnamed>`.
         hits="$(grep -Eo "${VALIDATION_DIAGNOSTIC}[^\"]*\"[^\"]*\"" "${log}" \
                 | grep -Eo 'kernel function: "[^"]*"' | sort | uniq -c | sort -rn)"
-        n_hits="$(grep -Ec "${VALIDATION_DIAGNOSTIC}" "${log}")"
+        # Counted per diagnostic, not per line: the layer writes to stderr while
+        # libtest is mid-line, so two reports routinely share one output line and
+        # a line count scores them as one. The kind tally comes off the same
+        # extraction, so the mix in the final banner sums to this count.
+        diagnostics="$(grep -Eo "${VALIDATION_DIAGNOSTIC}" "${log}")"
+        n_hits="$(printf '%s' "${diagnostics}" | grep -c '.')"
         if [ "${n_hits}" -gt 0 ]; then
             validation_hits="${validation_hits}  ${crate}: ${n_hits} invalid access(es)"$'\n'
             if [ -n "${hits}" ]; then
                 validation_hits="${validation_hits}$(printf '%s\n' "${hits}" | sed 's/^/    /')"$'\n'
             fi
+            validation_kinds="${validation_kinds}$(printf '%s\n' "${diagnostics}" | access_kind)"$'\n'
         fi
     fi
     rm -f "${log}"
@@ -449,16 +468,30 @@ for crate in "${crates[@]}"; do
 done
 
 echo
+# Every kind of red this run found is printed before the single exit at the end.
+# The two accumulators fill independently across the crate loop and co-occur
+# routinely: exiting inside the first block would compute the failing test names,
+# hold them in a shell variable, and discard them, leaving an operator who is
+# triaging a standing validation diagnostic no sign that a test also went red in
+# the same run. Each crate's log is deleted inside the loop, so what is not
+# printed here is gone.
+red=0
+
 # An invalid access is a failure even though every test reported `ok` and cargo
-# exited 0 — that is the whole point: the store is dropped, the buffer freezes,
-# and the assertions downstream of it still pass.
+# exited 0 — that is the whole point: the access never reaches the buffer, and
+# the assertions downstream of it still pass.
 if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${validation_hits}" ]; then
     echo "ERROR: Metal shader validation reported invalid memory access:" >&2
     printf '%s' "${validation_hits}" >&2
     echo >&2
-    echo "An out-of-bounds device store is DROPPED, not raised: the tests above" >&2
-    echo "still passed and cargo still exited 0. Treat this as corruption." >&2
-    exit 1
+    echo "Access mix over the hits above:" >&2
+    printf '%s' "${validation_kinds}" | sort | uniq -c | sort -rn | sed 's/^ */    /' >&2
+    echo "An invalid access is DROPPED, not raised — an invalid write is discarded," >&2
+    echo "an invalid read is zero-filled — so the tests over it can still report ok" >&2
+    echo "with cargo exiting 0. A write that never landed is corruption outright; a" >&2
+    echo "read only matters if the kernel keeps the lanes it filled, so read the mix." >&2
+    echo >&2
+    red=1
 fi
 
 if [ -n "${failed_crates}" ]; then
@@ -474,6 +507,10 @@ if [ -n "${failed_crates}" ]; then
     echo "from one you inherited, and it is cheap. See docs/TESTING.md." >&2
     echo "A crate reported as 'ran uninstrumented' usually failed to BUILD: no test" >&2
     echo "binary means no Metal device and therefore no validation banner." >&2
+    red=1
+fi
+
+if [ "${red}" = "1" ]; then
     exit 1
 fi
 

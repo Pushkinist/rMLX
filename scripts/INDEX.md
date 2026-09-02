@@ -46,6 +46,7 @@ Conventions:
 | Script | Via | What it does |
 |---|---|---|
 | `run_gpu_tests.sh` | `make gpu-test` | Runs the `#[ignore]` Metal tests per member crate, `--test-threads=1`. |
+| `run_gpu_tests_selftest.sh` | `make gpu-runner-selftest` | Recall test for the runner's reporting: a shader-validation hit and a crate failure in the same run are both reported, and the access mix is the one observed. Stubbed crates, no GPU. |
 | `eval_lock_stress.sh` | `make eval-lock-stress` | Drives the evaluation-lock reproducer across N fresh processes. Deliberately out of `make ci`. |
 | `schema_constraint_canary.sh` | — | Real-model proof for the `json_schema` constrained-decoding path. |
 | `ssd_canary.sh` | — | End-to-end long-session SSD prompt-cache tier canary (see `docs/SSD_CANARY.md`). |

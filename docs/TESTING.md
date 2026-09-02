@@ -754,11 +754,28 @@ result no test result can be read for.
 Read the diagnostic's own wording before assuming that is what happened. A
 *store* is corruption; a *load* is illegal but can only affect the result if the
 lanes it fills are ones the kernel keeps, and whether they are is a property of
-the kernel, not of the diagnostic. The aggregate makes no distinction, and the
-one standing hit in this tree is 160/160 loads — see the entry below on
-`affine_qmm_t_splitk`. The converse does not hold either: a clean scan does not
-establish that nothing read out of bounds, for the buffer-versus-array reason
-recorded with that entry.
+the kernel, not of the diagnostic. The final banner prints the mix it actually
+saw — each hit's own `device load` / `device store` wording, counted — so it is
+read off the run rather than assumed; the one standing hit in this tree is
+160/160 loads, see the entry below on `affine_qmm_t_splitk`. The converse does
+not hold either: a clean scan does not establish that nothing read out of
+bounds, for the buffer-versus-array reason recorded with that entry.
+
+**Both kinds of red are reported in the same run.** Shader-validation hits and
+crate failures — a failing test, a crate that executed fewer tests than were
+classified for it, a crate that produced no validation banner — accumulate
+independently across the crate loop, and every one of them is printed before the
+runner exits. That ordering is load-bearing rather than cosmetic: while any
+standing diagnostic exists, reporting the validation aggregate and exiting would
+discard the failing test names the runner already extracted, and each crate's log
+is deleted inside the loop, so nothing would survive to re-read. The failing-test
+oracle would be real, working, and starved of execution by an earlier,
+less-specific exit — the same "gate that cannot fail" shape as a vacuous oracle
+or a golden that skips silently. `scripts/run_gpu_tests_selftest.sh`
+(`make gpu-runner-selftest`, in `make ci`) pins it against stub crates, with no
+GPU: a canned libtest log per crate carrying a validation hit, a failing test, an
+under-match and a missing banner, each case asserting the reason that reaches the
+final report rather than only the exit code.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 
@@ -1001,8 +1018,8 @@ reads are loads only and are shown bitwise not to reach the output — including
 with the out-of-range rows held at NaN under the same kernel instantiation.
 
 Two cautions that generalise beyond this kernel. A diagnostic names a *load* or
-a *store* and the two differ in severity, but the aggregate does not
-distinguish them. And **absence of a diagnostic is not absence of an
+a *store* and the two differ in severity, so read the access mix the banner
+prints rather than the total. And **absence of a diagnostic is not absence of an
 out-of-bounds access**: the validation layer bounds against the MTLBuffer, not
 the logical array, and MLX recycles buffers from size buckets, so a read past
 an array's end that lands inside a roomier recycled allocation is silent. A
