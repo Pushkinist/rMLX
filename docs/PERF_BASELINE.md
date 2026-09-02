@@ -66,7 +66,7 @@ across all three test-target arches.
   `model.forward_arr(&y, 1, Some(&mut kv_caches), Some(&mut lin_caches), …)`
   (line 197 / 595); prefill via `forward_seq_with_cache` (line 413).
 
-- **Gemma4** (`crates/rmlx-models/src/gemma4/generate.rs`): decode loop
+- **Gemma4** (`crates/rmlx-models/src/gemma4/generate/mod.rs`): decode loop
   `for step_idx in 1..n_tokens` (line 375 / 970) calls
   `model.forward_arr(&y, 1, Some(&mut caches), device)` (line 379 / 973);
   prefill via `forward_seq_with_cache` (line 755).
@@ -673,7 +673,17 @@ and Qwen3.6 (separate arch files) are unchanged. On the `none` path the gain
 widens with context as KV bandwidth dominates: Bonsai `none` decode_tps
 ~101→~135 at 4 k, ~48→~83 at 16 k, ~19→~38 at 64 k.
 
-## Codec cells across context — `none` vs `mixed_k8g64_v4g64` (2026-08-21)
+## Codec cells across context — `none` vs `mixed_k8g64_v4g64`, **8-bit K** (2026-08-21)
+
+> **Scope, added after the fact and load-bearing.** Every cell here holds K at
+> **8 bits**. A later campaign ran the same harness, the same model and the same
+> ABBA design at `mixed_k4g64_v4g64` and got the opposite sign, on this file's
+> own Bonsai shapes. The null below is sound — one of those later cells
+> reproduces this section's 31 553 row independently — but it is a result about
+> **8-bit K**, not about quantized KV. Do not carry any conclusion from this
+> section to a different K width. See docs/KV_QUANT.md, "The null was a
+> bit-width result, not a context result", and read the cells out of `runs.db`
+> rather than out of prose.
 
 Why this section exists: every earlier codec cell in this file and in
 `docs/KV_QUANT.md` was taken at 4 096–32 768 tokens, and the standing objection
@@ -713,19 +723,39 @@ spread, which is not a coin flip — but read a single separated row against
 is uncancelled: the ABBA schedule already equalises the arms' mean slot
 position, but the pairing that would confirm it was not done.
 
-| model | prompt tok | `kv_frac` | predicted B/A | decode B/A | A range (CoV) | B range (CoV) | verdict | resident KV A → B | resident B/A |
-|---|---:|---:|---:|---:|---|---|---|---|---:|
-| Ternary-Bonsai-8B-2bit | 3 770 | 0.211 | 1.099 | 0.975 | 141.45–143.03 (0.52 %) | 137.32–139.28 (0.66 %) | ranges disjoint | 570.5 → 734.1 MB | 1.287 |
-| Ternary-Bonsai-8B-2bit | 31 553 | **0.687** | **1.419** | 1.002 | 68.60–68.67 (0.04 %) | 68.56–68.77 (0.15 %) | INCONCLUSIVE | 4 667.3 → 6 032.9 MB | 1.293 |
-| Qwen3.8-27B-mxfp8 | 3 892 | 0.010 | 1.004 | 0.977 | 18.49–18.64 (0.37 %) | 18.06–18.13 (0.21 %) | SEPARATED | 415.5 → 506.5 MB | 1.219 |
-| Qwen3.8-27B-mxfp8 | 130 848 | 0.245 | 1.149 | **0.763** | 13.74–14.02 (0.89 %) | 10.61–10.72 (0.49 %) | SEPARATED | 8 735.7 → 11 784.2 MB | 1.349 |
+| model | prompt tok | `kv_frac` | predicted B/A | decode B/A | A range (CoV) | B range (CoV) | verdict | resident KV A → B |
+|---|---:|---:|---:|---:|---|---|---|---|
+| Ternary-Bonsai-8B-2bit | 3 770 | 0.211 | 1.099 | 0.975 | 141.45–143.03 (0.52 %) | 137.32–139.28 (0.66 %) | ranges disjoint | withdrawn† |
+| Ternary-Bonsai-8B-2bit | 31 553 | **0.687** | **1.419** | 1.002 | 68.60–68.67 (0.04 %) | 68.56–68.77 (0.15 %) | INCONCLUSIVE | withdrawn† |
+| Qwen3.8-27B-mxfp8 | 3 892 | 0.010 | 1.004 | 0.977 | 18.49–18.64 (0.37 %) | 18.06–18.13 (0.21 %) | SEPARATED | withdrawn† |
+| Qwen3.8-27B-mxfp8 | 130 848 | 0.245 | 1.149 | **0.763** | 13.74–14.02 (0.89 %) | 10.61–10.72 (0.49 %) | SEPARATED | withdrawn† |
+
+† Arm B's resident figures were taken on a binary that built the bf16 K/V mirror
+on **every** architecture. All four cells are dense stacks, where that mirror is
+no longer allocated, so each figure measured two buffers these arches no longer
+hold. They are withdrawn rather than corrected in place — the same withdrawal
+docs/KV_QUANT.md §"Class 3" records, so the two pages agree.
+
+The Bonsai cells have since been re-measured post-elision. Read them from
+`runs.db`, not from prose:
+
+```bash
+rmlx metrics query "SELECT model, prompt_tokens, kv_quant, value \
+  FROM observations WHERE id BETWEEN 122793 AND 122804 \
+    AND metric = 'kv_cache_bytes' \
+  ORDER BY model, prompt_tokens, kv_quant"
+```
+
+The Qwen3.8 cells have **not** been re-measured and no substitute figure is
+offered for them. The **decode** columns are unaffected by any of this: an
+unread bf16 seed costs memory, not decode time, and arm B already read its
+packed store. They are the argument this table carries.
 
 **What the 130 848-token Qwen3.8 row settles, and what it does not.** This is
 the cell a long-context codec claim was meant to turn on: `kv_frac` 0.245 and a
 predicted **+14.9 %** ceiling for arm B. Measured on a quiet host, arm B is
-**23.7 % slower**, every `none` slot faster than every `mixed` slot, while
-holding **35 % more** resident KV and 6 034 MB more generation-scoped
-allocation.
+**23.7 % slower**, every `none` slot faster than every `mixed` slot. Its
+resident figure is withdrawn per † and this row does not rest on one.
 
 **Scope, because the two halves are not equally load-bearing.** Arm B is
 `mixed_k8g64_v4g64` **as it stands on this tree**, which still materialises a
@@ -735,10 +765,11 @@ whose decode really does read its store, so `materialises_packed_store()` is
 still true for it (`crates/rmlx-kv-quant/src/quant.rs`). The seed is exactly
 what a seed-elision projection removes.
 
-* The **resident** figure is therefore the *pre-elision* number and settles
-  nothing about a post-elision codec. It reproduces what the byte model already
-  predicts for today's `Mixed` (1.349 measured whole-cache; 1.355 attention-only
-  from `perf_ceiling.py`) — a confirmation, not a refutation.
+* The **resident** figure was therefore a *pre-elision* number and settled
+  nothing about a post-elision codec. It is withdrawn per †; the arch has not
+  been re-measured, and `perf_ceiling.py` — now bound to the engine's byte model
+  by `make check-kv-byte-model-parity` — is where a prediction for it comes
+  from.
 * The **decode** figure needs no post-elision arm and is the new evidence.
   Returning an unread bf16 seed frees memory; it does not make a
   quantized-matmul decode path faster, and arm B already reads its packed store.
@@ -754,16 +785,19 @@ without the packed-path throughput work, which is open.
 **What the 31 553-token Bonsai row settles.** 0.687 is the largest `kv_frac`
 any release-set model reaches at a context this tree can serve. Arm B cuts the
 decode KV stream to 0.571× of arm A's and the roofline predicts +42 %.
-Measured: **+0.2 %, ranges overlapping** — no measured effect — while resident
-KV goes *up* 29 %. The arm spreads here are 0.04 % and 0.15 %, so this is a null
-with the power to have seen a 1 % effect. The short-context basis was not what
-made the earlier codec cells come back null: the null survives at the
-high-`kv_frac` end of the same axis.
+Measured: **+0.2 %, ranges overlapping** — no measured effect. The arm spreads
+here are 0.04 % and 0.15 %, so this is a null with the power to have seen a 1 %
+effect. The short-context basis was not what made the earlier codec cells come
+back null: the null survives at the high-`kv_frac` end of the same axis. What it
+*was* is the K bit width — see the scope banner at the head of this section.
 
 **The byte model is not what fails; it is exact where it is complete.** At the
 measured offsets `perf_ceiling.py` puts arm A's resident KV at 570.5 MB and
-4 667.3 MB on Bonsai — the measured figures, to the digit — and arm B within
-0.5 % and 0.06 %.
+4 667.3 MB on Bonsai — the measured figures, to the digit. Arm A is unaffected
+by the mirror elision. Its arm-B agreement is not quoted here: the model that
+produced it has since been corrected on three axes and is now diffed against the
+engine's by `make check-kv-byte-model-parity`, so re-run the script rather than
+trusting a transcribed agreement.
 
 **The Qwen3.8 resident ratio is diluted, not smaller.** That arch is hybrid:
 48 of its 64 layers hold a fixed-size GDN recurrent state the codec never
@@ -774,14 +808,16 @@ it, and the gap between its prediction and the measurement is that state — the
 | prompt tok | arm | predicted (attention KV) | measured | gap |
 |---:|---|---:|---:|---:|
 | 3 892 | `none` | 261.6 MB | 415.5 MB | +153.9 |
-| 3 892 | `mixed` | 354.5 MB | 506.5 MB | +152.0 |
+| 3 892 | `mixed` (pre-elision) | 354.5 MB | 506.5 MB | +152.0 |
 | 130 848 | `none` | 8 581.7 MB | 8 735.7 MB | +154.0 |
-| 130 848 | `mixed` | 11 632.3 MB | 11 784.2 MB | +151.9 |
+| 130 848 | `mixed` (pre-elision) | 11 632.3 MB | 11 784.2 MB | +151.9 |
 
-Read the whole-cache ratio on a hybrid arch as a lower bound on the
-attention-KV ratio (1.219 measured against 1.355 attention-only at 3 892; 1.349
-against 1.355 at 130 848), the same way the `--kv-quant none` section reads
-Qwen3.6-35B's 1.060× against its 1.109× attention-only figure.
+The two `mixed` rows are pre-elision and are shown only to demonstrate that the
+GDN gap is the *same constant* on both arms — which is the point of the table,
+and is unaffected by the withdrawal. Read a whole-cache ratio on a hybrid arch as
+a lower bound on the attention-KV ratio, the same way the `--kv-quant none`
+section reads Qwen3.6-35B's 1.060× against its 1.109× attention-only figure; the
+codec ratios themselves are withdrawn per †.
 
 **`none`'s non-bandwidth overhead is flat across context; arm B's is not.**
 Same runs, against `perf_ceiling.py`'s bandwidth-bound floor for the same cell.
@@ -848,8 +884,25 @@ against this section's numbers:
   (`DEFAULT_KV_QUANT = KvQuant::None`), so no user reaches this path unless
   they ask for it by name.
 
+Two later results bear on this disposition and neither overturns it:
+
+* **The fused-kernel side is bounded harder than this argued.** An ablation
+  ladder that deletes 100% of a fused codec's decode math still leaves it far
+  short of `none`, which puts every decode-math item — the ε work included —
+  under one ceiling below parity, and identifies the kernel *shell* as the
+  majority of the gap. See docs/KV_QUANT.md, "The decode ceiling". This
+  strengthens the negative verdict and redirects the next measurement to a
+  shell variant.
+* **The `Mixed` side's verdict is scoped to 8-bit K.** At 4-bit K the same
+  harness measures the same model *winning* against `none` with disjoint
+  ranges — on the `quantized_matmul` path, not a fused kernel, so it does not
+  transfer to the bullets above. It does mean this section's rows must not be
+  cited as "quantized KV loses at decode". See docs/KV_QUANT.md, "The null was
+  a bit-width result, not a context result".
+
 The `none` rows in this section keep their standing as anchors. What is retired
-is the expectation that the packed-store arms in them have collectable headroom.
+is the expectation that the **8-bit-K** packed-store arms in them have
+collectable headroom.
 
 ## Host-sampler cost — PROVISIONAL, NOT AN ANCHOR (2026-08-16)
 
@@ -1115,10 +1168,10 @@ Equivalent diagnostic emitted for `iso4_sym`, `k_iso3`, `k_iso4`. The codec smok
 - K-only variants (`k_iso3` / `k_iso4`) are bottlenecked by the CPU-only K-side iso decode path (no GPU q8_0 affine fast path on K). Bonsai `k_iso4` shows wide cross-run variance (32–58 TPS); first reading should not be treated as a regression floor without a paired re-bench on identical binary/build/host.
 - All four variants are opt-in only — never an auto baseline.
 
-## TurboSym3 (WHT-3 K + WHT-3 V) decode-TPS anchor (2026-05-31)
+## TurboSym3 (turbo-3 K + turbo-3 V) decode-TPS anchor (2026-05-31)
 
 **Binary**: `target/release/rmlx` (debug-assertions on — ship-quality builds use release-perf, these numbers are the ceiling, not the floor).
-**Codec**: TurboSym3 (WHT 3-bit K + WHT 3-bit V, symmetric). Both K and V sides use the same WHT + Lloyd-Max 3-bit codebook path.
+**Codec**: TurboSym3 (3-bit K + 3-bit V, symmetric). Both K and V sides use the same Lloyd-Max 3-bit codebook path. **No rotation is applied on either axis** — the family's name and the `_wht_` substring in its layout tag imply one that the encoder does not have; see docs/KV_QUANT.md, "The turbo family's missing rotation".
 **Shape**: 2-token prompt ("Hello world") + `--max-tokens 100`. Single-MLX preflight between each run. Hardware: M5 Max.
 **Protocol**: 3 measured runs per model. Mean decode TPS reported. No warmup run (short prompt; all runs included).
 
@@ -1140,7 +1193,7 @@ k8vturbo3' (K=8-bit, V=turbo3).
 - Reference `k8vturbo3` anchors (4k-prompt shape, mean n=3): Bonsai 98.95 TPS, Gemma4 73.16 TPS. The short-prompt shape here inflates TPS vs the 4k-prompt shape for both codecs; this table is directly comparable to the iso3_sym / iso4_sym and rotor3_sym / rotor4_sym anchors which also used the 2-token short-prompt shape.
 - tsym3 Bonsai (143.20) is close to `iso3_sym` (142.64) and `rotor3_sym` (145.49) — all three symmetric 3-bit variants cluster in the 140-146 TPS band on this shape and arch.
 - tsym3 Gemma4 (79.93) aligns with `iso3_sym` (80.12) and `rotor3_sym` (81.53) — consistent with the ~80 TPS band for symmetric 3-bit codecs on Gemma4-e4b at this shape.
-- TurboSym3 is **CPU-only** on the hot path (same precedent as iso3_sym, rotor3_sym). Both K and V sides dispatch through the WHT + Lloyd-Max CPU encode/dequant path; no MSL kernel at this revision.
+- TurboSym3 is **CPU-only** on the hot path (same precedent as iso3_sym, rotor3_sym). Both K and V sides dispatch through the Lloyd-Max CPU encode/dequant path; no MSL kernel at this revision.
 - All variants are opt-in only — `tsym3` is never an auto baseline.
 
 ## Symmetric / K-only rotor K-side variants (2026-05-31)
@@ -1847,7 +1900,7 @@ at the same preset.
 
 Head-to-head bench of `LinearScan` vs `RadixTree` (NVIDIA Dynamo positional
 radix tree port) at the longest-prefix match path. Both implement the
-`PrefixIndex` trait in `crates/rmlx-models/src/prefix_index.rs`; the CLI
+`PrefixIndex` trait in `crates/rmlx-models/src/prefix_index/mod.rs`; the CLI
 flag `--prefix-index {linear|radix}` selects which one each freshly built
 `PromptCache<E>` uses.
 
