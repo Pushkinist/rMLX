@@ -164,7 +164,12 @@ of the 48 cases it then had. A gate that fails for the environment trains
 contributors to re-run it until green, which does the same damage as one that
 cannot fail. The
 fix was to split the two kinds of precondition rather than to loosen a
-threshold; see `docs/PERF_BASELINE.md` under `--synthetic-arms`.
+threshold; see `docs/PERF_BASELINE.md` under `--synthetic-arms`. The same
+boundary now covers `scripts/bench_llama_ab_selftest.sh`, whose verdict cases
+used to resolve their expected exit code from the run's own output — an
+expectation that agrees with whatever happened cannot catch anything. Both
+suites count, rather than claim, how many of their cases could reach this
+machine, and fail when that count is not zero.
 
 ---
 

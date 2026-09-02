@@ -46,7 +46,10 @@ AB="${REPO_ROOT}/scripts/perf_ab.sh"
 	exit 2
 }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_ab_hostgate.XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_ab_hostgate.XXXXXX")" || {
+	echo "ERROR: could not create a scratch directory" >&2
+	exit 2
+}
 trap 'rm -rf "${WORK}"' EXIT
 
 MODEL="${WORK}/model"
@@ -70,6 +73,10 @@ STUB
 }
 SLOW="$(make_arm slow 100.0)"
 FAST="$(make_arm fast 110.0)"
+[ -x "${SLOW}" ] && [ -x "${FAST}" ] || {
+	echo "ERROR: could not build the stub arms" >&2
+	exit 2
+}
 
 # ---- hosts -------------------------------------------------------------------
 #
@@ -105,19 +112,36 @@ printf '#!/bin/sh\nexit 1\n' >"${WORK}/hostile/pgrep"
 cp "${WORK}/quiet/ps" "${WORK}/metalheld/ps"
 printf '#!/bin/sh\necho 4243\nexit 0\n' >"${WORK}/metalheld/pgrep"
 
-chmod +x "${WORK}"/quiet/* "${WORK}"/hostile/* "${WORK}"/metalheld/*
+chmod +x "${WORK}"/quiet/* "${WORK}"/hostile/* "${WORK}"/metalheld/* || {
+	echo "ERROR: could not build the host shims" >&2
+	exit 2
+}
+for shim in quiet/ps quiet/pgrep hostile/ps hostile/pgrep metalheld/ps metalheld/pgrep; do
+	[ -x "${WORK}/${shim}" ] || {
+		echo "ERROR: host shim ${shim} is missing or not executable" >&2
+		exit 2
+	}
+done
 
 # ---- cases -------------------------------------------------------------------
 
 failures=0
 LAST_LOG=""
+RESULT_PATHS=()
 
+# Each case gets its own RMLX_HOME. The result file is named from a
+# whole-second UTC stamp, so under one shared home two cases that finish inside
+# the same second write the same path and the later silently replaces the
+# earlier -- an assertion on "the result file" would then be reading a file some
+# other case produced.
+RUN_SEQ=0
 run_ab() { # run_ab HOST_DIR [args...] -> exit code, output in $LAST_LOG
 	local host="$1"
 	shift
+	RUN_SEQ=$((RUN_SEQ + 1))
 	LAST_LOG="${WORK}/last.log"
 	rm -f "${WORK}/hog.cnt"
-	PATH="${host}:${PATH}" RMLX_HOME="${WORK}/home" \
+	PATH="${host}:${PATH}" RMLX_HOME="${WORK}/home/run${RUN_SEQ}" \
 		bash "${AB}" --model "${MODEL}" --slots 8 --max-tokens 5 "$@" \
 		>"${LAST_LOG}" 2>&1
 }
@@ -128,6 +152,9 @@ check() { # check LABEL HOST_DIR WANT_EXIT WANT_PATTERN [-- args...]
 	[ "${1:-}" = "--" ] && shift
 	run_ab "${host}" "$@"
 	local rc=$?
+	local produced
+	produced="$(sed -n 's/^result: //p' "${LAST_LOG}" | tail -1)"
+	[ -n "${produced}" ] && RESULT_PATHS+=("${produced}")
 	if [ "${rc}" -ne "${want_exit}" ]; then
 		echo "FAIL  ${label}: exit ${rc}, expected ${want_exit}" >&2
 		sed 's/^/      | /' "${LAST_LOG}" | tail -12 >&2
@@ -197,6 +224,32 @@ if [ -n "${HOSTILE_JSON}" ] && [ -r "${HOSTILE_JSON}" ] &&
 	echo "ok    the result file records the synthetic-arms waiver"
 else
 	echo "FAIL  the result file does not record the synthetic-arms waiver: ${HOSTILE_JSON:-<no result line>}" >&2
+	failures=$((failures + 1))
+fi
+
+# 8 — the run carries no reading of this machine, not even a contextual one. A
+# load average recorded beside a "not sampled" host line is still a number taken
+# off this host, and it is the field a reader reaches for when the other one
+# says nothing.
+if [ -n "${HOSTILE_JSON}" ] && [ -r "${HOSTILE_JSON}" ] &&
+	! grep -qE '"load_at_start": "[0-9]' "${HOSTILE_JSON}"; then
+	echo "ok    the result file records no host load reading"
+else
+	echo "FAIL  the result file carries a load average taken from this machine:" >&2
+	grep -o '"load_at_start": "[^"]*"' "${HOSTILE_JSON}" 2>/dev/null | sed 's/^/      | /' >&2
+	failures=$((failures + 1))
+fi
+
+# 9 — every case above must have written its own result file. The name is a
+# whole-second UTC stamp, so two runs that finish inside one second land on the
+# same path and the later one silently replaces the earlier: case 7 would then
+# be asserting on a file some other case produced.
+distinct=$(printf '%s\n' "${RESULT_PATHS[@]}" | sort -u | grep -c .)
+if [ "${distinct}" -eq "${#RESULT_PATHS[@]}" ] && [ "${distinct}" -gt 1 ]; then
+	echo "ok    each case wrote its own result file (${distinct} of ${#RESULT_PATHS[@]})"
+else
+	echo "FAIL  result files collided: ${distinct} distinct path(s) for ${#RESULT_PATHS[@]} runs -- a case asserted on another case's file" >&2
+	printf '      | %s\n' "${RESULT_PATHS[@]}" >&2
 	failures=$((failures + 1))
 fi
 

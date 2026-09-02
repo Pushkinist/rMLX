@@ -44,9 +44,11 @@
 # sampling, no Metal-exclusivity check -- and the run says so on stdout and in
 # `waivers.synthetic_arms`, which `ingest/perf_ab_ingest.py` refuses outright.
 # The arm-reading preconditions are untouched by it. The machine is read in
-# exactly three places -- `probe_host`, `snapshot_ok`, and the exclusivity gate
-# -- and the flag guards each of them; everywhere else it is only printed or
-# recorded.
+# exactly four places -- `probe_host`, `snapshot_ok`, the exclusivity gate, and
+# the load average recorded as context -- and the flag guards each of them;
+# everywhere else it is only printed or recorded. The load average is the one
+# that looks harmless: it feeds no gate, but a run claiming it consulted nothing
+# must not file a number it read off this host.
 #
 # WHAT IT DOES NOT DO
 #
@@ -349,26 +351,13 @@ RESULT_JSON="${OUT_DIR}/${TS}.json"
 # basenames.
 CPU_SNAPSHOT_SKIP="$(basename "$BIN_A") $(basename "$BIN_B")"
 export CPU_SNAPSHOT_SKIP
+# `snapshot_ok` and `window_not_sampled` come from here too, and both read
+# SYNTHETIC_ARMS -- which is why this is sourced after the flags are parsed.
 # shellcheck source=scripts/lib/cpu_snapshot.sh
 . "${REPO_ROOT}/scripts/lib/cpu_snapshot.sh"
 
 load_averages() {
 	uptime | sed -e 's/.*load averages*: *//' -e 's/,/ /g' | awk '{printf "%s %s %s", $1, $2, $3}'
-}
-
-# Take a snapshot into $1, recording whether it succeeded. A snapshot that
-# could not be taken must never read back as an empty-but-valid one, and a
-# snapshot that was deliberately not taken must not read back as either.
-snapshot_ok() {
-	if $SYNTHETIC_ARMS; then
-		: >"$1.not-sampled"
-		return 0
-	fi
-	if cpu_snapshot "$1"; then
-		return 0
-	fi
-	: >"$1.failed"
-	return 1
 }
 
 # "<state> <pct> <comm>" for the window between two snapshots $3 seconds apart.
@@ -380,7 +369,7 @@ snapshot_ok() {
 # "nothing was running" is how an interference gate quietly stops gating.
 classify_window() {
 	local raw pct
-	if [[ -e "$1.not-sampled" || -e "$2.not-sampled" ]]; then
+	if window_not_sampled "$1" "$2"; then
 		echo "not-sampled - -"
 		return
 	fi
@@ -743,10 +732,14 @@ matters.
 HEADER
 
 INITIAL_HOST="$(probe_host)"
-INITIAL_LOAD="$(load_averages)"
-if [[ "${INITIAL_HOST%% *}" == "not-sampled" ]]; then
-	echo "host at start: not sampled (--synthetic-arms); load(1,5,15)=$INITIAL_LOAD is context only"
+# The load average is context, but it is still a reading taken off this machine,
+# and a run that says it consulted nothing must not carry one. Recorded beside a
+# "not sampled" host line it is the number a reader would reach for.
+if $SYNTHETIC_ARMS; then
+	INITIAL_LOAD="not sampled (--synthetic-arms)"
+	echo "host at start: not sampled (--synthetic-arms)"
 else
+	INITIAL_LOAD="$(load_averages)"
 	echo "host at start: load(1,5,15)=$INITIAL_LOAD  busiest foreign process over a 1s window: $(host_detail "$INITIAL_HOST")"
 fi
 
@@ -1025,6 +1018,10 @@ ${JSON_MODELS%,}
 JSON
 
 echo ""
-echo "host at end:   busiest foreign process over a 1s window: $(host_detail "$FINAL_HOST")"
+if [[ "${FINAL_HOST%% *}" == "not-sampled" ]]; then
+	echo "host at end:   not sampled (--synthetic-arms)"
+else
+	echo "host at end:   busiest foreign process over a 1s window: $(host_detail "$FINAL_HOST")"
+fi
 echo "result: $RESULT_JSON"
 exit "$OVERALL_EXIT"

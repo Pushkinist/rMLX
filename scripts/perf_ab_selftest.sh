@@ -112,6 +112,7 @@ PASSED=0
 FAILED=0
 SYNTHETIC_CASES=0
 REAL_HOST_CASES=0
+HOST_READING_CASES=0
 
 # check <name> <expected-exit> <what-it-proves> -- <perf_ab.sh args...>
 #
@@ -136,7 +137,9 @@ REAL_HOST_CASES=0
 #
 # The cases whose subject IS the host gating say REALHOST, and supply the whole
 # machine as `ps` and `pgrep` shims on PATH. That is enforced below rather than
-# trusted -- a REALHOST case missing either shim would read this host again.
+# trusted -- a REALHOST case missing either shim would read this host again, and
+# is counted into the tally the suite fails on at the end rather than merely
+# reported.
 check() {
 	local name="$1" want="$2" what="$3"
 	shift 3
@@ -154,6 +157,7 @@ check() {
 	if [[ "$real_host" -eq 1 ]]; then
 		if [[ ! -x "$path_prefix/ps" || ! -x "$path_prefix/pgrep" ]]; then
 			FAILED=$((FAILED + 1))
+			HOST_READING_CASES=$((HOST_READING_CASES + 1))
 			printf '  FAIL %-26s        — REALHOST without both a ps and a pgrep shim: the case would read this machine\n' "$name"
 			return
 		fi
@@ -699,11 +703,24 @@ else
 fi
 
 echo ""
-# What this suite did and did not look at, printed on every run. It covers the
-# harness's logic and the logic of its host gates; it does not and cannot tell
-# anyone whether this machine is quiet, which is perf_ab.sh's job on a real run.
-printf 'host inputs: %d cases declared synthetic arms (the machine is not consulted); %d drove the host gates against a shimmed ps and pgrep; 0 read this machine.\n' \
-	"$SYNTHETIC_CASES" "$REAL_HOST_CASES"
+# What this suite did and did not look at, printed on every run and COUNTED
+# rather than asserted -- a hand-typed "0 read this machine" is a claim about
+# the file as its author last read it. Every case falls in exactly one bucket:
+# it ran a comparison with synthetic arms, ran one against a shimmed host, ran
+# no comparison at all (arithmetic over hand-written snapshots and over result
+# files, with `ps` shimmed wherever a snapshot is taken), or -- the bucket that
+# must stay empty -- reached this machine.
+LOCAL_CASES=$((PASSED + FAILED - SYNTHETIC_CASES - REAL_HOST_CASES - HOST_READING_CASES))
+printf 'host inputs: %d synthetic-arm cases (the machine is not consulted); %d against a shimmed ps and pgrep; %d ran no comparison; %d read this machine.\n' \
+	"$SYNTHETIC_CASES" "$REAL_HOST_CASES" "$LOCAL_CASES" "$HOST_READING_CASES"
+if [[ "$HOST_READING_CASES" -ne 0 ]]; then
+	echo "perf_ab selftest: FAIL — $HOST_READING_CASES case(s) can read this machine, so this suite's answer is not a property of the code" >&2
+	exit 1
+fi
+if [[ "$LOCAL_CASES" -lt 0 ]]; then
+	echo "perf_ab selftest: FAIL — the case buckets do not add up ($LOCAL_CASES); the disposition line is not describing this run" >&2
+	exit 1
+fi
 if [[ "$FAILED" -ne 0 ]]; then
 	echo "perf_ab selftest: FAIL ($FAILED of $((PASSED + FAILED)))" >&2
 	exit 1

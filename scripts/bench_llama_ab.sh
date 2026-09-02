@@ -39,10 +39,27 @@
 # NEVER WRITES TO runs.db. An A/B run is an experiment. Feed an accepted cell
 # to `rmlx metrics record --file` yourself, from the emitted JSON.
 #
+# MEASUREMENT VS LOGIC
+#
+# The preconditions here divide by what they read. Most read the arms: the pair
+# count, the arm digests, a flag this harness pins, the fields a slot's server
+# reported. One reads the machine: foreign CPU use, at the entry gate and across
+# every measured window. Only the second can answer differently for identical
+# inputs.
+#
+# `--synthetic-arms` declares that the arms are stub servers, so the run is an
+# exercise of this script's own logic and not a measurement. The machine is then
+# not consulted at all, the run says so on stdout and in `synthetic_arms` in the
+# result file, and `ingest/llama_ab_ingest.py` refuses to promote it. The
+# arm-reading preconditions are untouched. The boundary itself is shared with
+# `perf_ab.sh` through `scripts/lib/cpu_snapshot.sh` rather than restated here.
+#
 # Exit codes:
 #   0   — ran cleanly; verdict on stdout
 #   125 — not usable: busy host, indistinguishable arms, missing binary or
 #         model, a slot that produced no parseable timing, or TAINTED.
+#         Under --synthetic-arms a 0 says the logic ran, not that a measurement
+#         was clean.
 
 set -eu
 
@@ -56,6 +73,7 @@ LABEL_A="A"; LABEL_B="B"
 MODEL=""; PROMPT_FILE=""
 N_CTX=8192; N_PREDICT=128; PAIRS=2
 PORT=8199; BUSY_PCT=25; ALLOW_BUSY_HOST=false
+SYNTHETIC_ARMS=false
 READY_TIMEOUT=600
 OUT_DIR="${RMLX_HOME}/bench/llama_ab"
 
@@ -77,6 +95,11 @@ bench_llama_ab.sh --bin-a P --bin-b P --model GGUF --prompt-file F [options]
   --port N                 loopback port for the server (default 8199)
   --busy-pct N             foreign-CPU taint threshold, % of one core (default 25)
   --allow-busy-host        start anyway on a busy host; output is marked TAINTED
+  --synthetic-arms         the arms are stub servers, so this run exercises this
+                           script's logic and measures nothing. The machine is
+                           not consulted: no entry quiescence gate, no
+                           interference sampling. Recorded in the result file
+                           and refused by the runs.db promoter.
   --ready-timeout S        seconds to wait for /health per slot (default 600)
   --out-dir PATH           JSON result directory (default $RMLX_HOME/bench/llama_ab)
 USAGE
@@ -102,6 +125,7 @@ while [ $# -gt 0 ]; do
 	--port) need_value "$1" $#; PORT="$2"; shift 2 ;;
 	--busy-pct) need_value "$1" $#; BUSY_PCT="$2"; shift 2 ;;
 	--allow-busy-host) ALLOW_BUSY_HOST=true; shift ;;
+	--synthetic-arms) SYNTHETIC_ARMS=true; shift ;;
 	--ready-timeout) need_value "$1" $#; READY_TIMEOUT="$2"; shift 2 ;;
 	--out-dir) need_value "$1" $#; OUT_DIR="$2"; shift 2 ;;
 	-h | --help) usage; exit 0 ;;
@@ -165,6 +189,8 @@ refuse_pinned --args-b "$ARGS_B"
 
 CPU_SNAPSHOT_SKIP="$(basename "$BIN_A") $(basename "$BIN_B") llama-server"
 export CPU_SNAPSHOT_SKIP
+# `snapshot_ok` and `window_not_sampled` come from here too, and both read
+# SYNTHETIC_ARMS -- which is why this is sourced after the flags are parsed.
 # shellcheck source=scripts/lib/cpu_snapshot.sh
 . "${REPO_ROOT}/scripts/lib/cpu_snapshot.sh"
 
@@ -191,6 +217,7 @@ trap cleanup EXIT
 
 host_busiest() { # <before> <after> <window_s> -> "<state> <pct> <comm>"
 	local raw
+	if window_not_sampled "$1" "$2"; then echo "not-sampled - -"; return; fi
 	if [ -e "$1.failed" ] || [ -e "$2.failed" ]; then echo "unmeasured - -"; return; fi
 	raw="$(awk -v window="$3" -f "$AWK_BUSIEST" "$1" "$2")"
 	case "${raw%% *}" in
@@ -206,26 +233,36 @@ host_busiest() { # <before> <after> <window_s> -> "<state> <pct> <comm>"
 	esac
 }
 
-snapshot_ok() { cpu_snapshot "$1" && return 0; : >"$1.failed"; return 1; }
-
 # ---- entry gate --------------------------------------------------------------
-snapshot_ok "$TMP/entry_a" || true
-sleep 5
-snapshot_ok "$TMP/entry_b" || true
-ENTRY="$(host_busiest "$TMP/entry_a" "$TMP/entry_b" 5)"
-ENTRY_STATE="${ENTRY%% *}"
-if [ "$ENTRY_STATE" != "quiet" ]; then
-	echo "host is not quiescent: ${ENTRY}" >&2
-	if ! $ALLOW_BUSY_HOST; then
-		echo "  Quiesce the host, or pass --allow-busy-host to see the numbers anyway." >&2
-		exit 125
-	fi
-	echo "  --allow-busy-host: every number below is suspect." >&2
-fi
-
+#
+# The only place this script reads the machine, besides the per-slot windows.
+# Under --synthetic-arms neither happens: a stub server is not a workload, so
+# nothing about this host belongs in the answer.
 TAINT=""
 note_taint() { TAINT="${TAINT}$1; "; }
-[ "$ENTRY_STATE" != "quiet" ] && note_taint "entry gate: $ENTRY"
+
+if $SYNTHETIC_ARMS; then
+	echo "INTERFERENCE GATE: OFF -- --synthetic-arms. The arms are stub servers, so" >&2
+	echo "  this run exercises this script's scheduling, guards and arithmetic and" >&2
+	echo "  measures nothing. The machine is not consulted: no entry quiescence gate," >&2
+	echo "  no per-slot interference sampling. No number below describes this host," >&2
+	echo "  and the runs.db promoter refuses this result." >&2
+else
+	snapshot_ok "$TMP/entry_a" || true
+	sleep 5
+	snapshot_ok "$TMP/entry_b" || true
+	ENTRY="$(host_busiest "$TMP/entry_a" "$TMP/entry_b" 5)"
+	ENTRY_STATE="${ENTRY%% *}"
+	if [ "$ENTRY_STATE" != "quiet" ]; then
+		echo "host is not quiescent: ${ENTRY}" >&2
+		if ! $ALLOW_BUSY_HOST; then
+			echo "  Quiesce the host, or pass --allow-busy-host to see the numbers anyway." >&2
+			exit 125
+		fi
+		echo "  --allow-busy-host: every number below is suspect." >&2
+		note_taint "entry gate: $ENTRY"
+	fi
+fi
 
 # ---- one slot ----------------------------------------------------------------
 # Emits "<decode_tps> <prompt_n> <predicted_n> <prompt_tps> <kv_mib> <peak_rss_mb>".
@@ -394,7 +431,10 @@ for arm in $ORDER; do
 		echo "slot $SLOT ($label): generation capture is empty" >&2
 		exit 125
 	fi
-	[ "${win%% *}" = "quiet" ] || note_taint "slot $SLOT ($label): $win"
+	case "${win%% *}" in
+	quiet | not-sampled) ;;
+	*) note_taint "slot $SLOT ($label): $win" ;;
+	esac
 	echo "  decode ${tps} tok/s | prompt_n ${pn} | predicted ${dn} | kv ${kv} MiB | peak_rss ${rss} MB | host ${win}" >&2
 	echo "  out: ${first64}" >&2
 	ROWS="${ROWS}${arm}|${label}|${tps}|${pn}|${dn}|${ptps}|${kv}|${rss}|${win}|${first64}
@@ -441,10 +481,10 @@ TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RESULT="${OUT_DIR}/${TS_FILE}.json"
 python3 - "$RESULT" "$LABEL_A" "$LABEL_B" "$SHA_A" "$SHA_B" "$ARGS_A" "$ARGS_B" \
 	"$MODEL" "$PROMPT_FILE" "$N_CTX" "$N_PREDICT" "$SA" "$SB" "$VERDICT" "${TAINT%; }" "$TS" \
-	"$ENV_A" "$ENV_B" <<'PY'
+	"$ENV_A" "$ENV_B" "$SYNTHETIC_ARMS" <<'PY'
 import json, os, sys
 (out, la, lb, sa, sb, aa, ab, model, prompt, nctx, npred, statsa, statsb,
- verdict, taint, ts, ea, eb) = sys.argv[1:19]
+ verdict, taint, ts, ea, eb, synthetic) = sys.argv[1:20]
 rows = []
 for line in os.environ.get("ROWS", "").splitlines():
     if not line.strip():
@@ -464,6 +504,10 @@ json.dump({
     "arms": {"A": {"label": la, "sha256": sa, "args": aa, "env": ea, "decode_tps": st(statsa)},
              "B": {"label": lb, "sha256": sb, "args": ab, "env": eb, "decode_tps": st(statsb)}},
     "slots": rows, "verdict": verdict, "tainted": taint or None,
+    # A stub-armed run is not a measurement taken badly; it is not a
+    # measurement. The promoter refuses it outright, which is only enforceable
+    # because the run says so here.
+    "synthetic_arms": synthetic == "true",
 }, open(out, "w"), indent=2)
 PY
 
@@ -476,6 +520,9 @@ printf 'decode A   min %s  median %s  max %s  mean %s\n' $SA
 printf 'decode B   min %s  median %s  max %s  mean %s\n' $SB
 echo "verdict    $VERDICT   (B/A on medians)"
 echo "result     $RESULT"
+if $SYNTHETIC_ARMS; then
+	echo "host       not sampled (--synthetic-arms): stub arms, so nothing above measures this machine or any model"
+fi
 if [ -n "$TAINT" ]; then
 	echo "TAINTED    ${TAINT%; }"
 	exit 125
