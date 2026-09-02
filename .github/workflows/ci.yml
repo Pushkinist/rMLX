@@ -54,6 +54,14 @@ jobs:
       # recall in both directions — violations caught, legitimate shapes left be.
       - name: the #[ignore] gate still catches what it is for
         run: make check-gpu-tests-ignored-fixtures
+      # The runner those tests execute under accumulates shader-validation
+      # diagnostics and crate failures independently, and both have to reach the
+      # operator in the same run — while any diagnostic stands, reporting one and
+      # exiting turns every genuine GPU failure into silence. The check drives
+      # the real runner over stub crates, so it needs neither Metal nor a Rust
+      # toolchain and belongs on this Linux job rather than the macOS one.
+      - name: the GPU runner reports every red it found
+        run: make gpu-runner-selftest
       # A Metal-kernel dispatcher that blocks on Array::eval() produces exactly
       # the right tokens, so no test can see it — it only shows up as a decode
       # rate several times below what the codec should reach. Static gate.
