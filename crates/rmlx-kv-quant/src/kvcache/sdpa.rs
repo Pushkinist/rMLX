@@ -10,6 +10,7 @@
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{add, matmul, scaled_dot_product_attention, softmax_precise, Array, Device, Dtype};
 
+use crate::flash_decode_common::VMirror;
 use crate::iso_flash_decode_msl::{iso_flash_decode_sdpa, ISO_FLASH_HEAD_DIM_MAX};
 use crate::iso_flash_decode_symv_msl::{iso_flash_decode_symv_sdpa, IsoFlashShape, IsoPackedAxis};
 use crate::mixed_quant::mixed_quantized_sdpa;
@@ -22,7 +23,7 @@ use crate::rotor_flash_decode_symv_msl::{
 };
 use crate::storage::{KvStorage, ISO_QUAT_BLOCK_SIZE};
 
-use super::helpers::{f32_vec_to_array, storage_variant_name};
+use super::helpers::{f32_vec_to_array, slice_v_prefix, storage_variant_name};
 use super::shared_kv::SharedKv;
 use super::KvCache;
 
@@ -962,10 +963,10 @@ impl KvCache {
             KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. } => {
                 let kv_seq = rotor_k_accumulated_seq(&self.storage)?;
                 Self::check_shared_kv_len(kv_len, kv_seq)?;
-                let v_full = self.slice_decode_fp16_v(kv_seq, device)?;
+                let v_mirror = self.decode_fp16_v_mirror()?;
                 self.rotor_k_flash_over_store(
                     queries,
-                    &v_full,
+                    v_mirror,
                     scale,
                     additive_mask,
                     kv_seq,
@@ -975,8 +976,8 @@ impl KvCache {
             KvStorage::IsoKOnly3 { .. } | KvStorage::IsoKOnly4 { .. } => {
                 let kv_seq = iso_k_accumulated_seq(&self.storage)?;
                 Self::check_shared_kv_len(kv_len, kv_seq)?;
-                let v_full = self.slice_decode_fp16_v(kv_seq, device)?;
-                self.iso_k_flash_over_store(queries, &v_full, scale, additive_mask, kv_seq, device)
+                let v_mirror = self.decode_fp16_v_mirror()?;
+                self.iso_k_flash_over_store(queries, v_mirror, scale, additive_mask, kv_seq, device)
             }
             // Both axes come from the quant store — no `slice_decode_fp16_v`,
             // because this codec keeps no bf16 V to slice.
@@ -993,10 +994,10 @@ impl KvCache {
             KvStorage::PlanarK { .. } => {
                 let kv_seq = planar_k_accumulated_seq(&self.storage)?;
                 Self::check_shared_kv_len(kv_len, kv_seq)?;
-                let v_full = self.slice_decode_fp16_v(kv_seq, device)?;
+                let v_mirror = self.decode_fp16_v_mirror()?;
                 self.planar_k_flash_over_store(
                     queries,
-                    &v_full,
+                    v_mirror,
                     scale,
                     additive_mask,
                     kv_seq,
@@ -1190,40 +1191,38 @@ impl KvCache {
         }
     }
 
-    /// Read-only slice of the bf16 V accumulator to `kv_seq` positions.
+    /// The whole bf16 V accumulator, paired with how much of it is valid.
     ///
-    /// Matches what `update_decode_fp16_v_only` returns to the producer on the
-    /// same step, so producer and consumer attend the identical V window.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by the rank-4 check immediately above"
-    )]
-    fn slice_decode_fp16_v(&self, kv_seq: i32, device: Device) -> Result<Array> {
-        let v_buf = self.decode_fp16_v.as_ref().ok_or_else(|| {
+    /// The read-only consumer counterpart of `update_decode_fp16_v_slab`: the
+    /// flash-decode kernels stride over the mirror rather than take a `..kv_seq`
+    /// cut of it, so producer and consumer hand them the identical buffer and
+    /// attend the identical window.
+    ///
+    /// The valid length is the cache's own `offset`, reported rather than
+    /// assumed: the dispatcher checks it against the length the K store says is
+    /// being attended, and a producer/consumer desync fails there instead of
+    /// attending the mirror's tail.
+    fn decode_fp16_v_mirror(&self) -> Result<VMirror<'_>> {
+        let buf = self.decode_fp16_v.as_ref().ok_or_else(|| {
             Error::Mlx(
                 "decode_fp16_v missing on a store-backed share — the fused arms maintain it on \
                  every append, so this is an internal invariant violation"
                     .to_owned(),
             )
         })?;
-        let v_shape = v_buf.shape();
+        let v_shape = buf.shape();
         if v_shape.len() != 4 {
             return Err(Error::Mlx(format!(
                 "decode_fp16_v rank != 4, got {v_shape:?}"
             )));
         }
-        if kv_seq > v_shape[2] {
-            return Err(Error::Mlx(format!(
-                "shared-KV length {kv_seq} exceeds the bf16 V mirror (v_seq={})",
-                v_shape[2]
-            )));
-        }
-        v_buf.slice(
-            &[0_i32; 4],
-            &[v_shape[0], v_shape[1], kv_seq, v_shape[3]],
-            &[1_i32; 4],
-            device,
-        )
+        Ok(VMirror::new(buf, self.offset))
+    }
+
+    /// Read-only slice of the bf16 V accumulator to `kv_seq` positions, for
+    /// consumers that need an exactly-sized tensor.
+    fn slice_decode_fp16_v(&self, kv_seq: i32, device: Device) -> Result<Array> {
+        slice_v_prefix(self.decode_fp16_v_mirror()?.buf, kv_seq, device)
     }
 
     /// Slice the bf16 K/V mirror to the current `self.offset` so a
@@ -1417,15 +1416,21 @@ impl KvCache {
         // shadow, and allocating it via the full `update_decode_fp16` would
         // waste an O(seq) bf16 K buffer every decode step.  Mirrors the
         // pattern from `update_iso_k_only_3`/`_4`.
-        let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
+        let (v_slab, v_valid) = self.update_decode_fp16_v_slab(new_v, max_seq, device)?;
 
         // Past this point the cache is already mutated (store appended, offset
         // advanced, bf16 V accumulated), so `Ok(None)` is no longer available —
         // it would send the caller into the legacy `update()` path, which
         // appends a second time. Every not-eligible condition is screened
         // above.
-        let out =
-            self.planar_k_flash_over_store(queries, &v_full, scale, additive_mask, kv_seq, device)?;
+        let out = self.planar_k_flash_over_store(
+            queries,
+            VMirror::new(&v_slab, v_valid),
+            scale,
+            additive_mask,
+            kv_seq,
+            device,
+        )?;
         Ok(Some(out))
     }
 
@@ -1437,9 +1442,10 @@ impl KvCache {
     /// same kernels the producer used, instead of the producer having to
     /// materialise bf16 K/V for it.
     ///
-    /// `kv_seq` is the accumulated store length and `v_full` the matching bf16
-    /// V prefix; both come from the caller so producer and consumer read the
-    /// identical window.
+    /// `kv_seq` is the accumulated store length and `v_mirror` the whole bf16 V
+    /// accumulator with its valid length; both come from the caller so producer
+    /// and consumer read the identical window, and the dispatcher rejects the
+    /// pair if they disagree.
     #[allow(clippy::too_many_arguments)]
     #[allow(
         clippy::indexing_slicing,
@@ -1448,7 +1454,7 @@ impl KvCache {
     fn planar_k_flash_over_store(
         &self,
         queries: &Array,
-        v_full: &Array,
+        v_mirror: VMirror<'_>,
         scale: f32,
         additive_mask: Option<&Array>,
         kv_seq: i32,
@@ -1527,7 +1533,7 @@ impl KvCache {
                 &codes_arr,
                 &scales_arr,
                 &rot32_arr,
-                v_full,
+                v_mirror,
                 additive_mask,
                 b,
                 kv_h,
@@ -1569,9 +1575,12 @@ impl KvCache {
         // SV path: probs `[B, n_q_heads, 1, kv_seq]` × V `[B, kv_h, kv_seq, head_dim]`.
         // GQA broadcast: reshape probs to `[B, kv_h, heads_per_kv, 1, kv_seq]`
         // and V to `[B, kv_h, 1, kv_seq, head_dim]`, then matmul along the
-        // last two dims (the kv_seq contraction), then reshape back.
+        // last two dims (the kv_seq contraction), then reshape back. Unlike the
+        // flash kernel above, this arm cannot stride over the mirror, so it
+        // takes the `..kv_seq` cut and pays for making it contiguous.
         let probs_g = probs.reshape(&[b, kv_h, heads_per_kv, 1, kv_seq], device)?;
-        let v_g = v_full.reshape(&[b, kv_h, 1, kv_seq, head_dim], device)?;
+        let v_att = slice_v_prefix(v_mirror.buf, kv_seq, device)?;
+        let v_g = v_att.reshape(&[b, kv_h, 1, kv_seq, head_dim], device)?;
         let out_g = matmul(&probs_g, &v_g, device)?;
         let out = out_g.reshape(&[b, n_q_heads, 1, head_dim], device)?;
         // Match the legacy SDPA output dtype (bf16/f16 callers); softmax may
@@ -1658,19 +1667,13 @@ impl KvCache {
         // appending. Same ordering as `update_and_sdpa_planar_k_fused`.
         self.offset = prev_seq + new_seq;
         let max_seq = rotor_k_max_seq(&self.storage)?;
-        let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
+        let (v_slab, v_valid) = self.update_decode_fp16_v_slab(new_v, max_seq, device)?;
 
         // Take `kv_seq` from the store the ring was written from, not from
-        // `self.offset` — one source of truth. They must agree; a divergence
-        // would silently attend over the wrong prefix length rather than error.
-        // Same precedent as `update_and_sdpa_planar_k_fused` (`k_shape[2]`).
+        // `self.offset` — one source of truth. The dispatcher checks it against
+        // the mirror's valid length, so a divergence errors rather than
+        // silently attending over the wrong prefix.
         let kv_seq = rotor_k_accumulated_seq(&self.storage)?;
-        debug_assert_eq!(
-            kv_seq, self.offset,
-            "rotor_k_fused: store seq {kv_seq} != cache offset {} — the ring write \
-             and the attention length disagree",
-            self.offset
-        );
         // Past this point the cache is already mutated (store appended, offset
         // advanced, bf16 V accumulated), so `Ok(None)` is NOT available: it
         // would send the caller into the legacy `update()` path, which appends
@@ -1678,8 +1681,14 @@ impl KvCache {
         // condition is screened at the call-site gate and by
         // `rotor_flash_shape_ok` BEFORE any mutation; reaching here without a
         // ring means an internal invariant broke, so fail loudly.
-        let out =
-            self.rotor_k_flash_over_store(queries, &v_full, scale, additive_mask, kv_seq, device)?;
+        let out = self.rotor_k_flash_over_store(
+            queries,
+            VMirror::new(&v_slab, v_valid),
+            scale,
+            additive_mask,
+            kv_seq,
+            device,
+        )?;
         Ok(Some(out))
     }
 
@@ -1691,9 +1700,10 @@ impl KvCache {
     /// same kernel the producer used, instead of the producer having to
     /// materialise bf16 K/V for it.
     ///
-    /// `kv_seq` is the accumulated store length and `v_full` the matching bf16
-    /// V prefix; both come from the caller so producer and consumer read the
-    /// identical window.
+    /// `kv_seq` is the accumulated store length and `v_mirror` the whole bf16 V
+    /// accumulator with its valid length; both come from the caller so producer
+    /// and consumer read the identical window, and the dispatcher rejects the
+    /// pair if they disagree.
     #[allow(clippy::too_many_arguments)]
     #[allow(
         clippy::indexing_slicing,
@@ -1702,7 +1712,7 @@ impl KvCache {
     fn rotor_k_flash_over_store(
         &self,
         queries: &Array,
-        v_full: &Array,
+        v_mirror: VMirror<'_>,
         scale: f32,
         additive_mask: Option<&Array>,
         kv_seq: i32,
@@ -1728,15 +1738,15 @@ impl KvCache {
             )));
         };
 
-        let v_shape = v_full.shape();
-        if v_shape.len() != 4 {
+        // From the K store, not from V: the dispatcher cross-checks V's own
+        // axes against these, and a metadata triple read off V would compare V
+        // with itself.
+        let k_shape = rotor_k_store_shape(&self.storage)?;
+        let [b, kv_h, _, head_dim] = k_shape[..] else {
             return Err(Error::Mlx(format!(
-                "rotor_k_fused: V rank != 4, got {v_shape:?}"
+                "rotor_k_fused: K store shape rank != 4, got {k_shape:?}"
             )));
-        }
-        let b = v_shape[0];
-        let kv_h = v_shape[1];
-        let head_dim = v_shape[3];
+        };
 
         let q_shape = queries.shape();
         if q_shape.len() != 4 {
@@ -1771,7 +1781,7 @@ impl KvCache {
                 &scales,
                 &norms,
                 &rotors,
-                v_full,
+                v_mirror,
                 additive_mask,
                 b,
                 kv_h,
@@ -1787,7 +1797,7 @@ impl KvCache {
                 &scales,
                 &norms,
                 &rotors,
-                v_full,
+                v_mirror,
                 additive_mask,
                 b,
                 kv_h,
@@ -2225,24 +2235,26 @@ impl KvCache {
         // appending. Same ordering as `update_and_sdpa_rotor_k_fused`.
         self.offset = prev_seq + new_seq;
         let max_seq = iso_k_max_seq(&self.storage)?;
-        let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
+        let (v_slab, v_valid) = self.update_decode_fp16_v_slab(new_v, max_seq, device)?;
 
         // Take `kv_seq` from the store the ring was written from, not from
-        // `self.offset` — one source of truth.
+        // `self.offset` — one source of truth. The dispatcher checks it against
+        // the mirror's valid length, so a divergence errors rather than
+        // silently attending over the wrong prefix.
         let kv_seq = iso_k_accumulated_seq(&self.storage)?;
-        debug_assert_eq!(
-            kv_seq, self.offset,
-            "iso_k_fused: store seq {kv_seq} != cache offset {} — the ring write \
-             and the attention length disagree",
-            self.offset
-        );
         // Past this point the cache is already mutated, so `Ok(None)` is NOT
         // available: it would send the caller into the legacy `update()` path,
         // which appends K/V a second time and advances `offset` again. Every
         // not-eligible condition is screened at the call-site gate and by
         // `iso_flash_shape_ok` BEFORE any mutation.
-        let out =
-            self.iso_k_flash_over_store(queries, &v_full, scale, additive_mask, kv_seq, device)?;
+        let out = self.iso_k_flash_over_store(
+            queries,
+            VMirror::new(&v_slab, v_valid),
+            scale,
+            additive_mask,
+            kv_seq,
+            device,
+        )?;
         Ok(Some(out))
     }
 
@@ -2261,7 +2273,7 @@ impl KvCache {
     fn iso_k_flash_over_store(
         &self,
         queries: &Array,
-        v_full: &Array,
+        v_mirror: VMirror<'_>,
         scale: f32,
         additive_mask: Option<&Array>,
         kv_seq: i32,
@@ -2286,15 +2298,15 @@ impl KvCache {
             )));
         };
 
-        let v_shape = v_full.shape();
-        if v_shape.len() != 4 {
+        // From the K store, not from V: the dispatcher cross-checks V's own
+        // axes against these, and a metadata triple read off V would compare V
+        // with itself.
+        let k_shape = iso_k_store_shape(&self.storage)?;
+        let [b, kv_h, _, head_dim] = k_shape[..] else {
             return Err(Error::Mlx(format!(
-                "iso_k_fused: V rank != 4, got {v_shape:?}"
+                "iso_k_fused: K store shape rank != 4, got {k_shape:?}"
             )));
-        }
-        let b = v_shape[0];
-        let kv_h = v_shape[1];
-        let head_dim = v_shape[3];
+        };
 
         let q_shape = queries.shape();
         if q_shape.len() != 4 {
@@ -2328,7 +2340,7 @@ impl KvCache {
                 &codes,
                 &scales,
                 &norms,
-                v_full,
+                v_mirror,
                 additive_mask,
                 b,
                 kv_h,
@@ -2343,7 +2355,7 @@ impl KvCache {
                 &codes,
                 &scales,
                 &norms,
-                v_full,
+                v_mirror,
                 additive_mask,
                 b,
                 kv_h,
@@ -2766,21 +2778,27 @@ fn rotor_sym_accumulated_seq(storage: &KvStorage) -> Result<i32> {
     Ok(k_seq)
 }
 
+/// The K store's accumulated `[B, kv_h, S, D]` shape for the active rotor
+/// K-only variant.
+fn rotor_k_store_shape(storage: &KvStorage) -> Result<&[i32]> {
+    if let KvStorage::RotorKOnly3 { k: Some(ks), .. } = storage {
+        Ok(&ks.shape)
+    } else if let KvStorage::RotorKOnly4 { k: Some(ks), .. } = storage {
+        Ok(&ks.shape)
+    } else {
+        Err(Error::KvStorageMismatch {
+            expected: "RotorKOnly3 | RotorKOnly4 with a live K buffer",
+            got: storage_variant_name(storage),
+        })
+    }
+}
+
 /// Accumulated sequence length held by the active rotor K-only store.
 ///
 /// The store's own `shape[2]` — the length the GPU ring was written against —
 /// so callers do not have to trust that `KvCache::offset` still agrees.
 fn rotor_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
-    let shape = if let KvStorage::RotorKOnly3 { k: Some(ks), .. } = storage {
-        &ks.shape
-    } else if let KvStorage::RotorKOnly4 { k: Some(ks), .. } = storage {
-        &ks.shape
-    } else {
-        return Err(Error::KvStorageMismatch {
-            expected: "RotorKOnly3 | RotorKOnly4 with a live K buffer",
-            got: storage_variant_name(storage),
-        });
-    };
+    let shape = rotor_k_store_shape(storage)?;
     shape.get(2).copied().ok_or_else(|| {
         Error::Mlx(format!(
             "rotor_k_fused: rotor K store shape {shape:?} has no seq axis"
@@ -2816,21 +2834,27 @@ fn planar_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
 /// is what the kernel attends and what a shared-KV consumer sizes its mask
 /// from.
 fn iso_k_accumulated_seq(storage: &KvStorage) -> Result<i32> {
-    let shape = if let KvStorage::IsoKOnly3 { k: Some(ks), .. } = storage {
-        &ks.shape
-    } else if let KvStorage::IsoKOnly4 { k: Some(ks), .. } = storage {
-        &ks.shape
-    } else {
-        return Err(Error::KvStorageMismatch {
-            expected: "IsoKOnly3 | IsoKOnly4 with a live K buffer",
-            got: storage_variant_name(storage),
-        });
-    };
+    let shape = iso_k_store_shape(storage)?;
     shape.get(2).copied().ok_or_else(|| {
         Error::Mlx(format!(
             "iso_k_fused: iso K store shape {shape:?} has no seq axis"
         ))
     })
+}
+
+/// The K store's accumulated `[B, kv_h, S, D]` shape for the active iso K-only
+/// variant.
+fn iso_k_store_shape(storage: &KvStorage) -> Result<&[i32]> {
+    if let KvStorage::IsoKOnly3 { k: Some(ks), .. } = storage {
+        Ok(&ks.shape)
+    } else if let KvStorage::IsoKOnly4 { k: Some(ks), .. } = storage {
+        Ok(&ks.shape)
+    } else {
+        Err(Error::KvStorageMismatch {
+            expected: "IsoKOnly3 | IsoKOnly4 with a live K buffer",
+            got: storage_variant_name(storage),
+        })
+    }
 }
 
 /// The K store's accumulated `[B, kv_h, S, D]` shape for the active iso

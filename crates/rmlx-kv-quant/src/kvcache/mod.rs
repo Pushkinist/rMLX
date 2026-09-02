@@ -115,6 +115,12 @@ mod rotor_flash_dispatch_tests;
 #[path = "iso_flash_dispatch_tests.rs"]
 mod iso_flash_dispatch_tests;
 
+// A flash-decode step strides over the bf16 V mirror instead of copying its
+// `..kv_seq` prefix.
+#[cfg(test)]
+#[path = "v_mirror_alloc_tests.rs"]
+mod v_mirror_alloc_tests;
+
 // The rotor K-only `update()` decode path gates its GPU encode on the store's
 // sticky QJL flag, not the process-global env.
 #[cfg(test)]

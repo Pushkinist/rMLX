@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::clifford::make_rotor_table;
+use crate::flash_decode_common::VMirror;
 use crate::rotorquant::{rotor3_decode, rotor3_encode, rotor4_decode, rotor4_encode};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
 use rmlx_mlx::{Array, Device, Dtype};
@@ -206,7 +207,7 @@ fn run_oracle_masked(
             &scales,
             &norms,
             &rotors,
-            &v_arr,
+            VMirror::new(&v_arr, kv_seq as i32),
             mask_arr.as_ref(),
             b as i32,
             kv_h as i32,
@@ -222,7 +223,7 @@ fn run_oracle_masked(
             &scales,
             &norms,
             &rotors,
-            &v_arr,
+            VMirror::new(&v_arr, kv_seq as i32),
             mask_arr.as_ref(),
             b as i32,
             kv_h as i32,
@@ -303,7 +304,7 @@ fn bench_rotor(
                 &scales,
                 &norms,
                 &rotors,
-                &v_arr,
+                VMirror::new(&v_arr, kv_seq as i32),
                 None,
                 b as i32,
                 kv_h as i32,
@@ -319,7 +320,7 @@ fn bench_rotor(
                 &scales,
                 &norms,
                 &rotors,
-                &v_arr,
+                VMirror::new(&v_arr, kv_seq as i32),
                 None,
                 b as i32,
                 kv_h as i32,
@@ -462,7 +463,7 @@ fn rotor_flash_decode_rejects_non_pow2_head_dim() {
         &dummy,
         &dummy,
         &dummy,
-        &dummy,
+        VMirror::new(&dummy, 8),
         None,
         1,
         1,
@@ -489,7 +490,7 @@ fn rotor_flash_decode_rejects_head_dim_above_max() {
         &dummy,
         &dummy,
         &dummy,
-        &dummy,
+        VMirror::new(&dummy, 8),
         None,
         1,
         1,
@@ -517,7 +518,7 @@ fn rotor_flash_decode_rejects_unsupported_bits() {
         &dummy,
         &dummy,
         &dummy,
-        &dummy,
+        VMirror::new(&dummy, 8),
         None,
         1,
         1,

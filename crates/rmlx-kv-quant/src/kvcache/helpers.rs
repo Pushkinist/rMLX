@@ -1,7 +1,7 @@
 //! Free helper functions, test-only probes, and unit tests for `KvCache`.
 #![allow(clippy::too_many_lines)]
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device, Dtype};
 
 use super::KvCache;
@@ -209,6 +209,37 @@ pub(super) fn array_to_f32_vec(a: &Array, device: Device) -> Result<Vec<f32>> {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap())),
     );
     Ok(out)
+}
+
+/// Cut the first `seq_len` sequence positions out of a rank-4 bf16 V mirror
+/// `[b, kv_h, v_seq, head_dim]`.
+///
+/// For consumers that need an exactly-sized tensor. The flash-decode kernels do
+/// not: the mirror is head-major, so this view is row-contiguous only when
+/// `b * kv_h == 1` and flattening it anywhere else copies the whole prefix.
+/// Those dispatchers take the mirror whole and stride over it instead — see
+/// `crate::flash_decode_common::flatten_v_mirror`.
+///
+/// # Errors
+///
+/// [`Error::Quant`] for a non-rank-4 `v` or an out-of-range `seq_len` — the
+/// same shape-contract kind `flatten_v_mirror` raises for the same faults.
+pub(super) fn slice_v_prefix(v: &Array, seq_len: i32, device: Device) -> Result<Array> {
+    let shape = v.shape();
+    let [b, kv_h, v_seq, head_dim] = shape[..] else {
+        return Err(Error::Quant(format!("V mirror rank != 4, got {shape:?}")));
+    };
+    if seq_len < 0 || seq_len > v_seq {
+        return Err(Error::Quant(format!(
+            "V mirror prefix {seq_len} out of range for sequence extent {v_seq}"
+        )));
+    }
+    v.slice(
+        &[0_i32; 4],
+        &[b, kv_h, seq_len, head_dim],
+        &[1_i32; 4],
+        device,
+    )
 }
 
 pub(super) fn f32_vec_to_array(data: &[f32], shape: &[i32]) -> Result<Array> {

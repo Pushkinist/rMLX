@@ -24,6 +24,7 @@ use super::phase1_score_msl::{phase1_score, phase1_score_dispatch_count, TOP_PER
 use super::phase2_sparse_attend_msl::{
     phase2_lse_merge, phase2_sparse_attend, phase2_sparse_attend_dispatch_count,
 };
+use crate::flash_decode_common::VMirror;
 use crate::planar_flash_decode_msl::planar_flash_decode_sdpa;
 use crate::planarquant_msl::planar_quantize_v4_gpu;
 use crate::test_utils::{cosine_similarity_per_row, lcg_data, skip_if_no_gpu_env};
@@ -186,7 +187,7 @@ fn run_parity(
         &k_codes,
         &k_scales,
         &k_rot32,
-        &v_arr,
+        VMirror::new(&v_arr, kv_seq),
         None,
         b,
         kv_h,
