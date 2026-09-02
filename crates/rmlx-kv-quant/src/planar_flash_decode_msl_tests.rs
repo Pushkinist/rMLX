@@ -10,6 +10,7 @@
 //! `cargo test planar_flash_decode -- --include-ignored --test-threads=1`.
 
 use super::*;
+use crate::flash_decode_common::VMirror;
 use crate::planar_fused_qk_msl::planar_fused_qk;
 use crate::planarquant_msl::planar_quantize_v4_gpu;
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env};
@@ -193,7 +194,7 @@ fn run_parity_with_v_dtype(
         &codes,
         &scales,
         &rot32,
-        &v_arr,
+        VMirror::new(&v_arr, kv_seq),
         None,
         b,
         kv_h,
@@ -358,7 +359,7 @@ fn planar_flash_decode_rejects_non_pow2_head_dim() {
         &dummy_codes,
         &dummy_scales,
         &dummy_rot,
-        &dummy_v,
+        VMirror::new(&dummy_v, 1),
         None,
         1,
         1,
@@ -513,7 +514,7 @@ fn flash_vs_split_chain(
         &codes,
         &scales,
         &rot32,
-        &v_arr,
+        VMirror::new(&v_arr, kv_seq),
         None,
         b,
         kv_h,
@@ -753,7 +754,7 @@ fn planar_flash_decode_returns_query_dtype() {
         &codes,
         &scales,
         &rot32,
-        &v_arr,
+        VMirror::new(&v_arr, kv_seq),
         None,
         b,
         kv_h,

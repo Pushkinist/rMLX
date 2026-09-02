@@ -108,6 +108,7 @@ use rmlx_mlx::metal_kernel::{MetalKernel, MetalKernelInvoke};
 use rmlx_mlx::{Array, Device, Dtype};
 
 use crate::clifford::MV_DIM;
+use crate::flash_decode_common::{flatten_v_mirror, VMirror};
 use crate::rotorquant::{n_groups_for, ROTOR3_GROUP_SIZE};
 use crate::turboquant::lloyd_gaussian_codebook;
 
@@ -437,11 +438,12 @@ pub(crate) fn build_rotor_flash_header(bits: u8) -> Result<String> {
 // 2. scales    : f32  [B * kv_seq * kv_h * n_groups]
 // 3. norms     : f32  [B * kv_seq * kv_h]
 // 4. rotors    : f32  [n_groups * 4]
-// 5. v_flat    : bf16 / f16 / f32 [B * kv_h * kv_seq * head_dim] (native dtype)
+// 5. v_flat    : bf16 / f16 / f32 [B * kv_h * v_seq_stride * head_dim]
+//               (native dtype; `v_seq_stride >= kv_seq`)
 // 6. mask_flat : f32  [B * n_q_heads * kv_seq] or [1] dummy when no mask
 // 7. scale_arr : f32  [1]
-// 8. dims      : u32  [8] — {head_dim, kv_seq, n_bh, kv_h, heads_per_kv,
-//                            n_tiles, has_mask, n_groups}
+// 8. dims      : u32  [9] — {head_dim, kv_seq, n_bh, kv_h, heads_per_kv,
+//                            n_tiles, has_mask, n_groups, v_seq_stride}
 //
 // P1 outputs:
 // 0. partial_o     : f32 [n_tiles * n_bh * head_dim]
@@ -542,8 +544,11 @@ fn p2_kernel() -> Result<&'static MetalKernel> {
 ///   handling as `k_scales`.
 /// * `k_rotors`  — static per-(layer, head) rotor table, flat `[n_groups * 4]`
 ///   f32 in `[s, b12, b13, b23]` order.
-/// * `v`         — bf16 / f16 / f32 V, shape `[B, kv_h, kv_seq, head_dim]`.
-///   Read in its native dtype; the dispatcher does NOT astype-upcast.
+/// * `v`         — the bf16 / f16 / f32 V mirror, `[B, kv_h, v_seq, head_dim]`,
+///   passed whole rather than as a `..kv_seq` slice, with the number of valid
+///   positions in it. The kernel strides over the allocation and
+///   [`flatten_v_mirror`] checks `valid == kv_seq`. Read in its native dtype;
+///   the dispatcher does NOT astype-upcast.
 /// * `additive_mask` — optional `f32 [B, n_q_heads, 1, kv_seq]`.
 /// * `b`, `kv_h`, `kv_seq`, `head_dim`, `heads_per_kv` — shape metadata.
 /// * `scale`     — softmax pre-scale (typically `1/sqrt(head_dim)`).
@@ -566,7 +571,7 @@ pub fn rotor_flash_decode_sdpa<const BITS: u8>(
     k_scales: &Array,
     k_norms: &Array,
     k_rotors: &Array,
-    v: &Array,
+    v: VMirror<'_>,
     additive_mask: Option<&Array>,
     b: i32,
     kv_h: i32,
@@ -640,16 +645,8 @@ pub fn rotor_flash_decode_sdpa<const BITS: u8>(
     let rotors_flat = k_rotors.reshape(&[rotors_total as i32], device)?;
 
     // ── V flat — keep native dtype (bf16 / f16 / f32) ─────────────────────
-    let v_total: i64 = tok_count * i64::from(head_dim);
-    let v_flat = match v.dtype() {
-        Dtype::F32 | Dtype::Bf16 | Dtype::F16 => v.reshape(&[v_total as i32], device)?,
-        Dtype::U8 | Dtype::U32 | Dtype::I32 => {
-            let dt = v.dtype();
-            return Err(Error::Quant(format!(
-                "rotor_flash_decode: V dtype must be F32 / Bf16 / F16, got {dt:?}"
-            )));
-        }
-    };
+    let (v_flat, v_seq_stride) =
+        flatten_v_mirror(v, "rotor_flash_decode", b, kv_h, kv_seq, head_dim, device)?;
 
     // ── Mask ──────────────────────────────────────────────────────────────
     let (mask_flat, has_mask) = if let Some(m) = additive_mask {
@@ -674,11 +671,11 @@ pub fn rotor_flash_decode_sdpa<const BITS: u8>(
         Array::from_bytes(&bytes, &[1], Dtype::F32)?
     };
 
-    // ── dims (8 u32) ──────────────────────────────────────────────────────
+    // ── dims (9 u32) ──────────────────────────────────────────────────────
     // `bits` is not carried — the dispatcher selects the per-BITS kernel and
     // its header supplies RF_BITS / RF_MASK.
     let dims_arr = {
-        let dims: [u32; 8] = [
+        let dims: [u32; 9] = [
             head_dim as u32,
             kv_seq as u32,
             n_bh as u32,
@@ -687,15 +684,16 @@ pub fn rotor_flash_decode_sdpa<const BITS: u8>(
             n_tiles as u32,
             has_mask,
             n_groups as u32,
+            v_seq_stride as u32,
         ];
         // SAFETY:
-        // * `dims` is a stack-local `[u32; 8]` fully initialised above.
+        // * `dims` is a stack-local `[u32; 9]` fully initialised above.
         // * `u32` has stricter alignment than `u8`, so the cast is sound.
-        // * The byte length `8 * 4` equals `size_of::<[u32; 8]>()`.
+        // * The byte length `9 * 4` equals `size_of::<[u32; 9]>()`.
         // * The borrow is bounded by the enclosing block; `Array::from_bytes`
         //   copies into mlx storage before this scope ends.
-        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(dims.as_ptr().cast::<u8>(), 8 * 4) };
-        Array::from_bytes(bytes, &[8], Dtype::U32)
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(dims.as_ptr().cast::<u8>(), 9 * 4) };
+        Array::from_bytes(bytes, &[9], Dtype::U32)
             .map_err(|e| Error::Mlx(format!("rotor_flash_decode dims: {e}")))?
     };
 

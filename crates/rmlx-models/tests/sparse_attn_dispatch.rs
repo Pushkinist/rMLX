@@ -29,6 +29,7 @@ use rmlx_kv_quant::planar_flash_decode_msl::planar_flash_decode_sdpa;
 use rmlx_kv_quant::planar_fused_qk_msl::planar_fused_qk_dispatch_count;
 use rmlx_kv_quant::planarquant_msl::planar_quantize_v4_gpu;
 use rmlx_kv_quant::sparse_attn::sparse_attn_total_dispatch_count;
+use rmlx_kv_quant::VMirror;
 use rmlx_kv_quant::{KvCache, KvQuant};
 use rmlx_loader::HeadBudgets;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -312,7 +313,7 @@ fn sparse_attn_dispatches_on_seedless_planar_k() {
         &k_codes,
         &k_scales,
         &k_rot32,
-        &v_arr,
+        VMirror::new(&v_arr, kv_seq),
         None,
         b,
         kv_h,
@@ -462,7 +463,7 @@ fn sparse_attn_seedless_planar_k_v2_budgets_wire_through() {
         &k_codes,
         &k_scales,
         &k_rot32,
-        &v_arr,
+        VMirror::new(&v_arr, kv_seq),
         None,
         b,
         kv_h,
@@ -652,7 +653,7 @@ fn sparse_attn_seedless_planar_k_competing_keys_v2_vs_v1() {
         &k_codes,
         &k_scales,
         &k_rot32,
-        &v_arr,
+        VMirror::new(&v_arr, kv_seq),
         None,
         b,
         kv_h,

@@ -2948,3 +2948,52 @@ so the per-cache K-seed delta is below RSS noise there; the deterministic
 `resident_bytes` accounting is the authoritative measure and is regression-locked
 by the warm-TTFT K-only tests, which assert the seed is absent and that the
 reported total is the K store plus the surviving V seed and nothing else.)
+
+## V-mirror stride: allocation anchors and output identity (2026-09-02)
+
+The three bf16-V flash-decode dispatchers (iso, rotor, planar) used to be
+handed a `..kv_seq` cut of the head-major `[b, kv_h, max_seq, head_dim]` bf16 V
+mirror. That view is row-contiguous only at `b * kv_h == 1`, so flattening it
+for the kernel materialised the whole attended prefix once per layer per decode
+step. They now take the allocation whole and index it at its own sequence
+stride.
+
+The saving is an allocation, not a rate: it is `kv_h * kv_seq * head_dim * 2`
+bytes per layer per step, exact from the shape. `metal_gen_alloc_mb` is the
+anchor; decode TPS at the cell below moved inside its own run-to-run spread and
+**no rate claim is recorded here**.
+
+Command per cell (one process per arm, two snapshotted binaries, verified
+distinct by symbol before use):
+
+```bash
+rmlx baseline --model <snapshot> --kv-quant <codec> \
+  --prompt-tokens 4096 --max-ctx 8192 --max-tokens 16 --emit-token-ids
+```
+
+| Model | arch | `kv_h` | codec | `metal_gen_alloc_mb` before → after | token ids |
+|---|---|---|---|---|---|
+| Ternary-Bonsai-8B-mlx-2bit | `Qwen3ForCausalLM` | 8 | `k_iso3` | 2176.2 → **1886.5** (−289.7) | identical |
+| Ternary-Bonsai-8B-mlx-2bit | `Qwen3ForCausalLM` | 8 | `k_rotor3` | 2307.1 → **2003.8** (−303.3) | identical |
+| gemma-4-e2b-it-mxfp8 | `Gemma4ForConditionalGeneration` | 1 | `k_iso3` | 1077.6 → 1077.6 | identical |
+
+Prompt 3770 tokens, 16 generated, greedy. The iso row matches its prediction
+from shape: 36 layers × 8 kv-heads × 3786 positions × 128 head_dim × 2 B =
+279.2 MB against 289.7 MB measured. The `kv_h == 1` row is the control and is
+expected to be unchanged in both columns — at one KV head the cut is already
+contiguous, so there was no copy to remove. Both architectures are the pair
+CLAUDE.md's regression-bench discipline names for a KV-indexing change.
+
+Generated ids, for a later re-check without re-running the old binary:
+
+* Bonsai-8B `k_iso3` — `654,3029,7208,25,30811,11682,9705,323,5333,4344,11,18860,16376,2390,6891,13`
+* Bonsai-8B `k_rotor3` — `654,3029,7208,25,30811,11682,9705,323,5333,4344,11,18860,16376,2213,13,2303`
+* gemma-4-e2b `k_iso3` — `212922,236761,12362,236787,8099,598,122170,3004,236761,107,2182,236746,13422,236743,236770,236761`
+
+A longer-context run of the same cell (10867-token prompt, 32 generated,
+`--max-ctx 16384`) reads 4698.9 on both arms: there the prefill working set,
+not the decode-step transients, sets the generation peak, so the saving is real
+but not visible in this metric. `ornith-1.0-9b-mxfp8`
+(`Qwen3_5ForConditionalGeneration`, `kv_h == 4`) likewise reads 1795.1 on both
+arms with identical ids — the arch is mostly linear-attention layers, so few
+full-attention layers hold a bf16 V mirror at all.

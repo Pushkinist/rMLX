@@ -56,6 +56,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+use crate::flash_decode_common::{flatten_v_mirror, VMirror};
 use crate::planarquant::{planar_rotation_codebook, N_ROTATIONS};
 use crate::turboquant::{lloyd_gaussian_codebook, GROUP_SIZE};
 use rmlx_core::error::{Error, Result};
@@ -173,10 +174,11 @@ fn build_flash_header(bits: u8) -> Result<String> {
 // 1. k_codes   : u32  [B * kv_seq * kv_h * (head_dim / 32) * 4]
 // 2. k_scales  : f32  [B * kv_seq * kv_h * (head_dim / 2)]
 // 3. k_rot32   : u32  [B * kv_seq * kv_h * (head_dim / 16)]
-// 4. v_flat    : bf16 / f16 / f32 [B * kv_h * kv_seq * head_dim] (native dtype)
+// 4. v_flat    : bf16 / f16 / f32 [B * kv_h * v_seq_stride * head_dim]
+//               (native dtype; `v_seq_stride >= kv_seq`)
 // 5. mask_flat : f32  [B * n_q_heads * kv_seq] or [1] dummy when no mask
 // 6. scale_arr : f32  [1]
-// 7. dims      : u32  [7] — see below
+// 7. dims      : u32  [8] — see below
 //
 // `dims` layout:
 //   dims[0] = head_dim                (D, also threadgroup size)
@@ -186,6 +188,7 @@ fn build_flash_header(bits: u8) -> Result<String> {
 //   dims[4] = heads_per_kv            (n_q_heads / kv_h)
 //   dims[5] = n_tiles                 (ceil_div(kv_seq, TILE_SIZE))
 //   dims[6] = has_mask                (0 or 1)
+//   dims[7] = v_seq_stride            (V's own seq extent, >= kv_seq)
 //
 // Outputs (P1):
 // 0. partial_o     : f32 [n_tiles * n_bh * head_dim]
@@ -288,9 +291,12 @@ fn p2_kernel() -> Result<&'static MetalKernel> {
 ///   `B * kv_h * kv_seq * head_dim/2`).
 /// * `k_rot32`   — 4-bit rotation indices (`u32`, flat
 ///   `B * kv_h * kv_seq * head_dim/16`).
-/// * `v`         — bf16 / f16 / f32 V, shape `[B, kv_h, kv_seq, head_dim]`.
-///   Read in its native dtype via implicit promotion to `float` inside MSL;
-///   the dispatcher does NOT astype-upcast.  Other dtypes are rejected.
+/// * `v`         — the bf16 / f16 / f32 V mirror, `[B, kv_h, v_seq, head_dim]`,
+///   passed whole rather than as a `..kv_seq` slice, with the number of valid
+///   positions in it. The kernel strides over the allocation and
+///   [`flatten_v_mirror`] checks `valid == kv_seq`. Read in its native dtype
+///   via implicit promotion to `float` inside MSL; the dispatcher does NOT
+///   astype-upcast.  Other dtypes are rejected.
 /// * `additive_mask` — optional `f32 [B, n_q_heads, 1, kv_seq]`.
 /// * `b`, `kv_h`, `kv_seq`, `head_dim`, `heads_per_kv` — shape metadata.
 /// * `bits`      — K code bit-width.  Must be `4` (only PlanarK 4-bit storage
@@ -314,7 +320,7 @@ pub fn planar_flash_decode_sdpa(
     k_codes: &Array,
     k_scales: &Array,
     k_rot32: &Array,
-    v: &Array,
+    v: VMirror<'_>,
     additive_mask: Option<&Array>,
     b: i32,
     kv_h: i32,
@@ -390,17 +396,9 @@ pub fn planar_flash_decode_sdpa(
     // The kernel param is auto-typed by mlx-c from the array dtype and the
     // MSL body uses `float v_val = v_flat[v_off];` to rely on implicit
     // promotion to float.  This halves V bandwidth vs. an f32 astype upcast
-    // on the bf16/f16 hot paths (halves V bandwidth vs. an f32 astype upcast).
-    let v_total: i64 = tok_count * i64::from(head_dim);
-    let v_flat = match v.dtype() {
-        Dtype::F32 | Dtype::Bf16 | Dtype::F16 => v.reshape(&[v_total as i32], device)?,
-        Dtype::U8 | Dtype::U32 | Dtype::I32 => {
-            let dt = v.dtype();
-            return Err(Error::Quant(format!(
-                "planar_flash_decode: V dtype must be F32 / Bf16 / F16, got {dt:?}"
-            )));
-        }
-    };
+    // on the bf16/f16 hot paths.
+    let (v_flat, v_seq_stride) =
+        flatten_v_mirror(v, "planar_flash_decode", b, kv_h, kv_seq, head_dim, device)?;
 
     // ── Mask ──────────────────────────────────────────────────────────────
     let (mask_flat, has_mask) = if let Some(m) = additive_mask {
@@ -425,12 +423,12 @@ pub fn planar_flash_decode_sdpa(
         Array::from_bytes(&bytes, &[1], Dtype::F32)?
     };
 
-    // ── dims (7 u32) ──────────────────────────────────────────────────────
+    // ── dims (8 u32) ──────────────────────────────────────────────────────
     // Layout mirrors the kernel buffer-layout comment above.  `bits` is no
     // longer carried — the dispatcher validates `bits == 4` up-front and the
     // kernel statics only have a 4-bit variant.
     let dims_arr = {
-        let dims: [u32; 7] = [
+        let dims: [u32; 8] = [
             head_dim as u32,
             kv_seq as u32,
             n_bh as u32,
@@ -438,15 +436,16 @@ pub fn planar_flash_decode_sdpa(
             heads_per_kv as u32,
             n_tiles as u32,
             has_mask,
+            v_seq_stride as u32,
         ];
         // SAFETY:
-        // * `dims` is a stack-local `[u32; 7]` fully initialised above.
+        // * `dims` is a stack-local `[u32; 8]` fully initialised above.
         // * `u32` has stricter alignment than `u8`, so the cast is sound.
-        // * The byte length `7 * 4` equals `size_of::<[u32; 7]>()`.
+        // * The byte length `8 * 4` equals `size_of::<[u32; 8]>()`.
         // * The borrow is bounded by the enclosing block; `Array::from_bytes`
         //   copies into mlx storage before this scope ends.
-        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(dims.as_ptr().cast::<u8>(), 7 * 4) };
-        Array::from_bytes(bytes, &[7], Dtype::U32)
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(dims.as_ptr().cast::<u8>(), 8 * 4) };
+        Array::from_bytes(bytes, &[8], Dtype::U32)
             .map_err(|e| Error::Mlx(format!("planar_flash_decode dims: {e}")))?
     };
 

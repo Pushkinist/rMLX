@@ -8,6 +8,10 @@ uint heads_per_kv = dims[4];
 uint n_tiles      = dims[5];
 uint has_mask     = dims[6];
 uint n_groups     = dims[7];
+// V's own sequence extent, which may exceed `kv_seq`: the caller hands over the
+// whole bf16 mirror allocation rather than a `..kv_seq` slice of it, so that no
+// partial-slice view has to be made row-contiguous before dispatch.
+uint v_seq_stride = dims[8];
 
 uint tile_idx = threadgroup_position_in_grid.x;
 uint bh       = threadgroup_position_in_grid.y;
@@ -122,14 +126,14 @@ for (uint t = tile_start; t < tile_end; t++) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ── V read + softmax-weighted accumulation ──────────────────────
-    // V layout: [B, kv_h, kv_seq, head_dim], flat. Read in V's native dtype
+    // V layout: [B, kv_h, v_seq_stride, head_dim], flat. Read in V's native dtype
     // (bf16 / f16 / f32) — the pointer is auto-typed by mlx-c from the array
     // dtype and MSL promotes to float at the read site, halving V bandwidth
     // vs. an f32 astype upcast.
     float corr = s_corr[0];
     float es   = s_expsc[0];
 
-    uint v_off  = ((b * kv_h + kv_h_idx) * kv_seq + t) * head_dim + tid;
+    uint v_off  = ((b * kv_h + kv_h_idx) * v_seq_stride + t) * head_dim + tid;
     float v_val = v_flat[v_off];
 
     acc_v = acc_v * corr + es * v_val;
