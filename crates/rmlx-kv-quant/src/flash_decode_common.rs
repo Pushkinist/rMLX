@@ -1,5 +1,9 @@
-//! Shared scaffold for the symmetric (quant-K + quant-V) flash-decode MSL
-//! dispatchers — [`crate::iso_flash_decode_symv_msl`] and
+//! Shared scaffold for the flash-decode MSL dispatchers.
+//!
+//! # The `norms` device-address-space floor
+//!
+//! Scoped to the symmetric (quant-K + quant-V) dispatchers —
+//! [`crate::iso_flash_decode_symv_msl`] and
 //! [`crate::rotor_flash_decode_symv_msl`].
 //!
 //! Both bind a per-token `norms` array as a kernel input. On the MLX build this
@@ -80,7 +84,70 @@
 //! `// eval-ok: <reason>` marker.
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{pad, Array, Device};
+use rmlx_mlx::{pad, Array, Device, Dtype};
+
+/// Flatten a bf16 / f16 / f32 V mirror for a flash-decode kernel, and report
+/// the stride the kernel must index its sequence axis with.
+///
+/// `v` is `[b, kv_h, v_seq, head_dim]` with `v_seq >= kv_seq`: the caller hands
+/// over the **whole** mirror allocation, not a `..kv_seq` slice of it, and
+/// `kv_seq` stays the attended length. Only the stride changes.
+///
+/// That distinction is the point of this helper. The mirror is head-major, so
+/// cutting a `..kv_seq` prefix out of it leaves a gap between heads: the view is
+/// row-contiguous only when `b * kv_h == 1`, and flattening it anywhere else
+/// materialises the whole prefix — once per layer per decode step, with no
+/// `contiguous()` call at the site to make it visible. Flattening the
+/// allocation itself copies nothing at any `kv_h`.
+///
+/// # Errors
+///
+/// [`Error::Quant`] when `v` is not rank 4, when its `b` / `kv_h` / `head_dim`
+/// axes disagree with the passed shape metadata, when its sequence axis is
+/// shorter than `kv_seq` (the kernel would read past the buffer), when the flat
+/// element count overflows `i32`, or for a non-float dtype. Forwards `reshape`
+/// errors otherwise.
+pub(crate) fn flatten_v_mirror(
+    v: &Array,
+    kernel: &str,
+    b: i32,
+    kv_h: i32,
+    kv_seq: i32,
+    head_dim: i32,
+    device: Device,
+) -> Result<(Array, i32)> {
+    let shape = v.shape();
+    let [v_b, v_kv_h, v_seq, v_head_dim] = shape[..] else {
+        return Err(Error::Quant(format!(
+            "{kernel}: V rank != 4, got {shape:?}"
+        )));
+    };
+    if v_b != b || v_kv_h != kv_h || v_head_dim != head_dim {
+        return Err(Error::Quant(format!(
+            "{kernel}: V shape {shape:?} disagrees with b={b}, kv_h={kv_h}, head_dim={head_dim}"
+        )));
+    }
+    if v_seq < kv_seq {
+        return Err(Error::Quant(format!(
+            "{kernel}: V sequence extent {v_seq} is shorter than the attended kv_seq={kv_seq}"
+        )));
+    }
+    match v.dtype() {
+        Dtype::F32 | Dtype::Bf16 | Dtype::F16 => {}
+        other @ (Dtype::U8 | Dtype::U32 | Dtype::I32) => {
+            return Err(Error::Quant(format!(
+                "{kernel}: V dtype must be F32 / Bf16 / F16, got {other:?}"
+            )))
+        }
+    }
+    let total: i64 = i64::from(b) * i64::from(kv_h) * i64::from(v_seq) * i64::from(head_dim);
+    let total = i32::try_from(total).map_err(|_| {
+        Error::Quant(format!(
+            "{kernel}: V element count {total} overflows i32 at v_seq={v_seq}"
+        ))
+    })?;
+    Ok((v.reshape(&[total], device)?, v_seq))
+}
 
 /// Minimum per-token `norms` element count (`b * kv_h * kv_seq`) a symmetric
 /// flash-decode kernel (iso or rotor) is dispatched with. See the module doc

@@ -20,7 +20,9 @@ use crate::storage::{
 use crate::turbo_flash_msl::{turbo_flash_sdpa, turbo_flash_should_run};
 use crate::KvQuant;
 
-use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array, storage_variant_name};
+use super::helpers::{
+    array_to_f32_vec, arrays_to_f32, f32_vec_to_array, slice_v_prefix, storage_variant_name,
+};
 use super::KvCache;
 
 /// Narrow `layer_idx` (`usize`) to `u32` for rotor-seed APIs.
@@ -4492,7 +4494,8 @@ impl KvCache {
         Ok((k_full, v_full))
     }
 
-    /// V-only bf16 update helper for IsoKOnly variants.
+    /// V-only bf16 update helper for IsoKOnly variants, returning the whole
+    /// mirror allocation and the number of valid positions in it.
     ///
     /// Mirrors [`Self::update_decode_fp16`] but **only** manages the V side
     /// (`decode_fp16_v`). It deliberately does NOT touch `self.decode_fp16_k`.
@@ -4504,6 +4507,14 @@ impl KvCache {
     /// `decode_fp16_k.is_some()` early-return guard in `update_iso3_sym` /
     /// `update_iso4_sym` to short-circuit the codec on the *next* decode step
     /// (silent bf16-K regression guarded by regression test).
+    ///
+    /// The mirror is `[b, kv_h, max_seq, head_dim]` and the returned length is
+    /// its valid prefix on axis 2. Callers that dispatch a flash-decode kernel
+    /// pass the allocation on whole, because cutting the prefix out of a
+    /// head-major mirror yields a view that is row-contiguous only when
+    /// `b * kv_h == 1` — flattening it anywhere else copies the prefix, once
+    /// per layer per decode step. Callers that need an exactly-sized tensor use
+    /// [`Self::update_decode_fp16_v_only`].
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -4512,12 +4523,12 @@ impl KvCache {
         clippy::unwrap_used,
         reason = "decode_fp16_v is Some by construction: the needs_expand branch above always sets it, and this path is only reached after that guard"
     )]
-    pub(super) fn update_decode_fp16_v_only(
+    pub(super) fn update_decode_fp16_v_slab(
         &mut self,
         new_v: &Array,
         max_seq: i32,
         device: Device,
-    ) -> Result<Array> {
+    ) -> Result<(Array, i32)> {
         let shape = new_v.shape();
         let b = shape[0];
         let kv_h = shape[1];
@@ -4570,12 +4581,19 @@ impl KvCache {
         *v_buf = v_updated;
         let _ = v_buf.async_eval();
 
-        let slice_start = vec![0i32; ndim];
-        let slice_stop: Vec<i32> = [b, kv_h, new_offset, head_dim].into();
-        let slice_strides = vec![1i32; ndim];
-        let v_full = v_buf.slice(&slice_start, &slice_stop, &slice_strides, device)?;
+        Ok((v_buf.try_clone()?, new_offset))
+    }
 
-        Ok(v_full)
+    /// [`Self::update_decode_fp16_v_slab`] cut to its valid prefix, for callers
+    /// that need an exactly-sized `[b, kv_h, offset, head_dim]` V tensor.
+    pub(super) fn update_decode_fp16_v_only(
+        &mut self,
+        new_v: &Array,
+        max_seq: i32,
+        device: Device,
+    ) -> Result<Array> {
+        let (v_slab, v_seq) = self.update_decode_fp16_v_slab(new_v, max_seq, device)?;
+        slice_v_prefix(&v_slab, v_seq, device)
     }
 
     #[allow(
