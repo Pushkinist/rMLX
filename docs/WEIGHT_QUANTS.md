@@ -299,15 +299,36 @@ in `rows × cols` and is dominated by the cache-coherent scan of
 per field per group), then amortized across `group_size` elements.
 
 Source: `crates/rmlx-quant/src/affine.rs`
-MSL kernel (q8_g128): `crates/rmlx-models/src/q8_msl.rs`
+MSL kernel (q8_g128): `crates/rmlx-kv-quant/src/q8_msl.rs`
 
 ---
 
-## 5. TurboQuant — rotation-based Lloyd-Max codebook
+## 5. TurboQuant — Lloyd-Max codebook, **no rotation**
 
 TurboQuant is used in rMLX primarily for the V side of the KV cache
 (4-bit) and for weight quantization experiments. It uses a fixed-codebook
 scalar quantizer with a per-block scale rather than affine scale + bias.
+
+**The name promises a rotation this implementation does not have.** Upstream
+TurboQuant decorrelates before quantizing — that is the point of the family, and
+it is what IsoQuant, PlanarQuant and RotorQuant all do. rMLX's turbo encoder
+applies no transform on either axis at any width: §5.2 and §5.3 below are the
+whole codec, and the source contains no Hadamard or Walsh-Hadamard code. The
+`_wht_` substring in the `tsym3` / `tsym4` SSD layout tags is a geometry
+identifier for the block reader, not a description of the encoder.
+
+What the missing transform would be worth has been measured, by a controlled
+test-side ablation around the shipped encoder
+(`crates/rmlx-kv-quant/src/turbo_rotation_fidelity_tests.rs`). The short form:
+it is worth roughly a bit to two bits on **K**-shaped data with channel
+outliers, roughly a hundredth of a bit on **V**-shaped i.i.d. data, and the
+payoff shrinks as the codebook widens. Since rMLX uses turbo primarily on the V
+axis, and the V-side implementation is the expensive one — it needs an explicit
+inverse transform after the SV accumulation, across the P2 kernel, four dequant
+kernels and both fused-QK kernels — the value and the cost are inverted with
+respect to each other. Full account, including the scope limits:
+docs/KV_QUANT.md, "The turbo family's missing rotation — what it is worth, and
+where".
 
 ### 5.1 Codebook
 
@@ -356,9 +377,9 @@ path) for 8-bit K-cache or weight quantization.
 All — TurboQuant is arch-agnostic. Primary production use: V-cache at 4-bit
 in the K8V4 asymmetric config; see [KV_CACHE.md](KV_CACHE.md).
 
-Source: `crates/rmlx-quant/src/turboquant.rs`
-MSL kernel: `crates/rmlx-models/src/turboquant_msl.rs`
-TurboFlash kernel (K8+V4, split-K FlashAttention): `crates/rmlx-models/src/turbo_flash_msl.rs`
+Source: `crates/rmlx-kv-quant/src/turboquant.rs`
+MSL kernel: `crates/rmlx-kv-quant/src/turboquant_msl.rs`
+TurboFlash kernel (K8+V4, split-K FlashAttention): `crates/rmlx-kv-quant/src/turbo_flash_msl.rs`
 
 ---
 
@@ -432,8 +453,8 @@ reconstruction error is guaranteed to be ≤ TurboQuant on any input.
 All — PlanarQuant is arch-agnostic. Primarily used for the V side of the
 KV cache; see [KV_CACHE.md](KV_CACHE.md).
 
-Source: `crates/rmlx-quant/src/planarquant.rs`
-MSL kernel: `crates/rmlx-models/src/planarquant_msl.rs`
+Source: `crates/rmlx-kv-quant/src/planarquant.rs`
+MSL kernel: `crates/rmlx-kv-quant/src/planarquant_msl.rs`
 
 ---
 

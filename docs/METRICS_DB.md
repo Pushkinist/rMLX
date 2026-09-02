@@ -1688,7 +1688,7 @@ startup; the decode hot path holds no cross-namespace lock. Per sweep, one
 `--prefix-index {linear|radix}` (default `linear`) selects how the in-RAM
 prompt cache resolves the longest-prefix block-hash match. Both paths
 implement the `PrefixIndex` trait in
-`crates/rmlx-models/src/prefix_index.rs`:
+`crates/rmlx-models/src/prefix_index/mod.rs`:
 
 - `linear` — O(slots × n_blocks) scan over `Vec<Slot>`. Bisect-safe fallback.
 - `radix` — NVIDIA Dynamo positional radix tree port (single-payload

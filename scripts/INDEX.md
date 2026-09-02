@@ -31,6 +31,7 @@ Conventions:
 | `check_kv_byte_model_parity_fixtures.sh` | Recall test for the above — 9 synthetic manifests, each asserting which check fired and exit 2 vs exit 1, including head- and tail-layer edits that a sampled codec vector could not see. |
 | `check_metal_compiles.sh` | Every `.metal` kernel compiles natively at `-std=metal3.1` and `-std=metal4.0`, and is named by its `probes/kernels.manifest`. |
 | `check_metal_format.sh` | Every `.metal` file is formatted. |
+| `check_doc_source_citations.sh` | Every `crates/...` source path cited in a tracked `docs/*.md` file resolves. The subsystem docs replace figures with citations; the trade only holds while the citations do. |
 | `check_no_decode_swallow.sh` | A failed decode step or failed sampler call cannot be swallowed into a silent success. |
 | `check_no_inline_tests.sh` | No inline `#[cfg(test)] mod tests` outside `*_tests.rs` / `tests.rs`. |
 | `check_no_kernel_input_eval.sh` | No blocking `Array::eval()` on a kernel input inside a dispatcher. |
