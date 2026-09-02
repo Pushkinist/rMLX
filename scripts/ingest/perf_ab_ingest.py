@@ -25,7 +25,8 @@ Usage:
 A run the harness marked TAINTED is refused unless `--accept-tainted` is given,
 and the taint text is then carried into `notes`: on a host where the quiescence
 gate never clears, an unmarked row is a claim of a clean measurement that was
-never made.
+never made. A run made with `--synthetic-arms` is refused with no waiver at
+all: its arms were stub binaries, so there is no measurement in it to accept.
 
 `--arm-*-kv-quant` is required and then *checked* against the `--kv-quant` in
 that arm's recorded arguments. It is not parsed out of them: a result whose arm
@@ -278,6 +279,22 @@ def main() -> int:
         )
     cell = cells[0]
 
+    # A run made with --synthetic-arms drove stub binaries, so its numbers
+    # describe nothing that exists. That is not a host condition anyone can
+    # choose to accept, so this refusal has no waiver -- unlike taint, which is
+    # a real measurement taken under interference.
+    waivers = result.get("waivers") or {}
+    if waivers.get("synthetic_arms"):
+        print(
+            "refusing: the run was made with --synthetic-arms, so its arms were "
+            "stub binaries\n"
+            "  and its numbers measure nothing. There is no waiver for this: "
+            "re-run the\n"
+            "  comparison against real binaries.",
+            file=sys.stderr,
+        )
+        return 2
+
     if cell.get("taint") and not args.accept_tainted:
         print(
             f"refusing: run is TAINTED ({cell['taint']}).\n"
@@ -290,7 +307,6 @@ def main() -> int:
     # A raised --busy-pct does not taint: it removes the gate that would have
     # tainted. The result then looks clean for the one reason a result must
     # never look clean, and the taint check above cannot see it.
-    waivers = result.get("waivers") or {}
     if waivers.get("busy_pct_raised") and not args.accept_tainted:
         print(
             "refusing: the run raised --busy-pct above the default, so the "

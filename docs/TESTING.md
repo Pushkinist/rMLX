@@ -155,6 +155,17 @@ out of — is a hard failure in the golden-token suites (below), not a skip.
 Skipping there is how a stale export turns into a green run that asserted
 nothing.
 
+The mirror image is a step whose result depends on the machine rather than on
+the code. `make ci` contains shell gates as well as `cargo test`, and one of
+them — `scripts/perf_ab_selftest.sh` — used to inherit `perf_ab.sh`'s
+host-quiescence and Metal-exclusivity preconditions while checking a property
+that has nothing to do with runtime, so an `rmlx serve` left running failed 27
+of the 48 cases it then had. A gate that fails for the environment trains
+contributors to re-run it until green, which does the same damage as one that
+cannot fail. The
+fix was to split the two kinds of precondition rather than to loosen a
+threshold; see `docs/PERF_BASELINE.md` under `--synthetic-arms`.
+
 ---
 
 ## Golden-token suites: how their snapshot resolves

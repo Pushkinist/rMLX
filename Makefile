@@ -457,6 +457,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kernel_dtype_contract.sh
 	@bash scripts/check_kernel_dtype_contract_fixtures.sh
 	@bash scripts/perf_ab_selftest.sh
+	@bash scripts/perf_ab_host_gate_fixtures.sh
 	@bash scripts/perf_ab_ingest_selftest.sh
 	@bash scripts/bench_llama_ab_selftest.sh
 	@bash scripts/check_metal_format.sh
@@ -630,6 +631,9 @@ canary-ab: mlx-preflight build-perf  ## interleaved A/B of two arms (ARGS='--bin
 
 canary-ab-selftest: ## mutation-check the A/B harness against stub binaries (no GPU, no model)
 	bash scripts/perf_ab_selftest.sh
+
+canary-ab-host-gate-fixtures: ## recall-check the A/B harness's host gates against shimmed hosts (no GPU, no model)
+	bash scripts/perf_ab_host_gate_fixtures.sh
 
 canary-ab-ingest-selftest: ## mutation-check the A/B -> runs.db promoter (no GPU, no model, no DB write)
 	bash scripts/perf_ab_ingest_selftest.sh

@@ -110,33 +110,58 @@ reset_state() { rm -f "$STATE"/*.cnt; }
 
 PASSED=0
 FAILED=0
+SYNTHETIC_CASES=0
+REAL_HOST_CASES=0
 
 # check <name> <expected-exit> <what-it-proves> -- <perf_ab.sh args...>
-# Optional trailing `GREP:<pattern>` entries assert on the captured output.
 #
-# <expected-exit> may be the sentinel RC_REPORT instead of a number. Use it for
-# any case whose subject is what the harness REPORTED, rather than a refusal it
-# chose. For a run that reaches its report the exit code is 0 on a quiet host
-# and 125 on a tainted one, so a literal `0` there is an assertion about the
-# machine: it holds until the interference sampler happens to fire and then
-# fails while the behaviour under test is still correct. RC_REPORT asserts
-# instead that the code agrees with the harness's OWN verdict line -- `VERDICT:
-# TAINTED` means 125, anything else means 0 -- which still catches a harness
-# that stops signalling taint, without importing the host into the expectation.
+# Optional trailing entries: `GREP:<pattern>` and `NOGREP:<pattern>` assert on
+# the captured output, `PATHPRE:<dir>` puts a directory of shims at the front of
+# PATH, and `REALHOST` turns off the --synthetic-arms default.
 #
-# A refusal case keeps its literal number: there the code is the behaviour.
+# WHY --synthetic-arms IS THE DEFAULT HERE
+#
+# perf_ab.sh refuses to run on a host it does not have to itself: a foreign
+# process over the CPU threshold, or an `rmlx serve` holding the Metal context.
+# That is right for a measurement and wrong for this file, whose arms are shell
+# stubs emitting canned numbers and whose every expectation is a fact about the
+# harness's logic. Inheriting a runtime precondition for a logic property makes
+# the outcome a function of the machine -- which is the shape of a gate people
+# learn to re-run until it goes green.
+#
+# So every case declares the arms synthetic and the machine is not consulted at
+# all. The expected exit code is then a literal again: a case that reaches its
+# report exits 0, and one that refuses exits with the code for that refusal.
+# There is no host left for either to depend on.
+#
+# The cases whose subject IS the host gating say REALHOST, and supply the whole
+# machine as `ps` and `pgrep` shims on PATH. That is enforced below rather than
+# trusted -- a REALHOST case missing either shim would read this host again.
 check() {
 	local name="$1" want="$2" what="$3"
 	shift 3
-	local args=() greps=() path_prefix=""
+	local args=() greps=() path_prefix="" real_host=0
 	for a in "$@"; do
 		case "$a" in
 		GREP:*) greps+=("${a#GREP:}") ;;
 		NOGREP:*) greps+=("!${a#NOGREP:}") ;;
 		PATHPRE:*) path_prefix="${a#PATHPRE:}" ;;
+		REALHOST) real_host=1 ;;
 		*) args+=("$a") ;;
 		esac
 	done
+
+	if [[ "$real_host" -eq 1 ]]; then
+		if [[ ! -x "$path_prefix/ps" || ! -x "$path_prefix/pgrep" ]]; then
+			FAILED=$((FAILED + 1))
+			printf '  FAIL %-26s        — REALHOST without both a ps and a pgrep shim: the case would read this machine\n' "$name"
+			return
+		fi
+		REAL_HOST_CASES=$((REAL_HOST_CASES + 1))
+	else
+		args+=(--synthetic-arms)
+		SYNTHETIC_CASES=$((SYNTHETIC_CASES + 1))
+	fi
 
 	reset_state
 	local out="$WORK/$name.log"
@@ -146,12 +171,6 @@ check() {
 	RMLX_HOME="$WORK/home" PATH="${path_prefix:+$path_prefix:}$PATH" \
 		bash "$AB" ${args[@]+"${args[@]}"} >"$out" 2>&1
 	local got=$?
-
-	# RC_REPORT: the expected code is whatever the harness's own verdict line
-	# implies, resolved after the run rather than assumed before it.
-	if [[ "$want" == "RC_REPORT" ]]; then
-		if grep -q '^  TAINTED:' "$out"; then want=125; else want=0; fi
-	fi
 
 	local ok=1
 	[[ "$got" -eq "$want" ]] || ok=0
@@ -207,9 +226,6 @@ KV_PARTIAL="$(make_stub kv_partial "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" ""
 KV_NAN="$(make_stub kv_nan "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "nan")"
 KV_ABSENT="$(make_stub kv_absent "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN")"
 
-# Nothing on this host counts as busy unless a case says otherwise; the CPU
-# gate has its own cases below and must not make the others flaky.
-QUIET=(--busy-pct 100000)
 # The stubs emit 5 token ids, so --max-tokens matches: the harness refuses a
 # slot whose generation is shorter than asked for.
 COMMON=(--model "$MODEL" --slots 12 --max-tokens 5)
@@ -218,30 +234,30 @@ echo "perf_ab selftest: mutation checks"
 
 # ---- can it see a difference that is there? ----------------------------------
 
-check planted_10pct RC_REPORT \
+check planted_10pct 0 \
 	"a planted +9.95% arm is reported as +9.95% and SEPARATED" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
 	"GREP:ratio B/A = 1\.0995" \
 	"GREP:median= *100\.5000" \
 	"GREP:median= *110\.5000" \
 	"GREP:VERDICT: SEPARATED"
 
-check planted_inverted RC_REPORT \
+check planted_inverted 0 \
 	"--invert swaps the pattern and still reports the same ratio" \
-	--binary-a "$SLOW" --binary-b "$FAST" --invert "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" --invert "${COMMON[@]}" \
 	"GREP:ratio B/A = 1\.0995" \
 	"GREP:VERDICT: SEPARATED" \
 	"GREP:pattern: BAAB ABBA BAAB"
 
-check planted_memory RC_REPORT \
+check planted_memory 0 \
 	"a planted +15 MB allocation shows up in the peak-memory column" \
-	--binary-a "$SLOW" --binary-b "$HUNGRY" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$HUNGRY" --allow-null-arms "${COMMON[@]}" \
 	"GREP:A median=40\.0000  B median=55\.0000  delta=\+15\.0 MB" \
 	"GREP:ratio B/A = 1\.0000"
 
-check planted_kv_residency RC_REPORT \
+check planted_kv_residency 0 \
 	"a 2x resident-KV arm is reported as ratio 2.0000, in MB" \
-	--binary-a "$KV_SMALL" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$KV_SMALL" --binary-b "$KV_BIG" "${COMMON[@]}" \
 	"GREP:kv_cache_bytes      A median=1000\.0 MB  B median=2000\.0 MB  ratio B/A=2\.0000" \
 	"GREP:result: "
 
@@ -264,23 +280,23 @@ fi
 # The two ways this column can be absent must both read as "not measured".
 # A 0 here would divide into a residency ratio as a cache of no bytes, which
 # is the shape of every silent-fallback defect this repo has had to unpick.
-check kv_residency_refusal_is_not_zero RC_REPORT \
+check kv_residency_refusal_is_not_zero 0 \
 	"a slot whose KV accounting refused reports n/a, never 0" \
-	--binary-a "$KV_NA" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$KV_NA" --binary-b "$KV_BIG" "${COMMON[@]}" \
 	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a" \
 	"NOGREP:A median=0\.0 MB"
 
-check kv_residency_absent_column_is_not_zero RC_REPORT \
+check kv_residency_absent_column_is_not_zero 0 \
 	"a binary that emits no KV column reports n/a, never 0" \
-	--binary-a "$KV_ABSENT" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$KV_ABSENT" --binary-b "$KV_BIG" "${COMMON[@]}" \
 	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a"
 
 # The invariant is "n/a if ANY slot refused", and an all-refuse stub cannot tell
 # that apart from "n/a if EVERY slot refused" -- both rules agree on it. Only a
 # mixture separates them.
-check kv_residency_any_refusal_taints_the_arm RC_REPORT \
+check kv_residency_any_refusal_taints_the_arm 0 \
 	"one refusing slot makes the whole arm n/a, not a median of the rest" \
-	--binary-a "$KV_PARTIAL" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$KV_PARTIAL" --binary-b "$KV_BIG" "${COMMON[@]}" \
 	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a" \
 	"NOGREP:A median=1000\.0 MB"
 
@@ -288,21 +304,21 @@ check kv_residency_any_refusal_taints_the_arm RC_REPORT \
 # median of 0 bytes and record as the smallest cache ever measured.
 check kv_residency_non_numeric_refused 125 \
 	"a kv_cache_bytes token that is neither a number nor n/a is refused" \
-	--binary-a "$KV_NAN" --binary-b "$KV_BIG" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$KV_NAN" --binary-b "$KV_BIG" "${COMMON[@]}" \
 	"GREP:reported kv_cache_bytes=nan"
 
 # ---- does it stay quiet when there is nothing there? -------------------------
 
-check null_arms RC_REPORT \
+check null_arms 0 \
 	"two arms with identical numbers report ratio 1.0000 and INCONCLUSIVE" \
-	--binary-a "$SLOW" --binary-b "$SLOW_TWIN" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$SLOW_TWIN" "${COMMON[@]}" \
 	"GREP:ratio B/A = 1\.0000" \
 	"GREP:VERDICT: INCONCLUSIVE" \
 	"NOGREP:VERDICT: SEPARATED"
 
-check overlapping_ranges RC_REPORT \
+check overlapping_ranges 0 \
 	"a 1% median gap whose ranges overlap is INCONCLUSIVE, not a result" \
-	--binary-a "$SLOW" --binary-b "$OVERLAP" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$OVERLAP" "${COMMON[@]}" \
 	"GREP:ratio B/A = 1\.0149" \
 	"GREP:VERDICT: INCONCLUSIVE" \
 	"GREP:is not evidence that the arms differ"
@@ -311,70 +327,86 @@ check overlapping_ranges RC_REPORT \
 
 check same_binary_refused 125 \
 	"the same binary with the same args on both arms is refused" \
-	--binary-a "$SLOW" --binary-b "$SLOW" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$SLOW" "${COMMON[@]}" \
 	"GREP:indistinguishable"
 
-check same_binary_waived RC_REPORT \
+check same_binary_waived 0 \
 	"--allow-null-arms permits it deliberately and says so" \
-	--binary-a "$SLOW" --binary-b "$SLOW" --allow-null-arms "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$SLOW" --allow-null-arms "${COMMON[@]}" \
 	"GREP:null calibration" \
 	"GREP:VERDICT: INCONCLUSIVE"
 
 check token_divergence 1 \
 	"arms that generate different tokens fail instead of being timed" \
-	--binary-a "$SLOW" --binary-b "$WRONG" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$WRONG" "${COMMON[@]}" \
 	"GREP:the arms generate different tokens"
 
-check token_divergence_waived RC_REPORT \
+check token_divergence_waived 0 \
 	"--allow-token-divergence permits it and labels the ratio" \
-	--binary-a "$SLOW" --binary-b "$WRONG" --allow-token-divergence "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$WRONG" --allow-token-divergence "${COMMON[@]}" \
 	"GREP:DIVERGED between arms"
 
 check token_drift_within_arm 1 \
 	"a slot that stops reproducing its own arm's tokens fails" \
-	--binary-a "$DRIFTER" --binary-b "$FAST" --allow-token-divergence "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$DRIFTER" --binary-b "$FAST" --allow-token-divergence "${COMMON[@]}" \
 	"GREP:did not reproduce its own arm"
 
 check missing_tps 125 \
 	"an arm that emits no decode_tps is a failed measurement, not a zero" \
-	--binary-a "$NO_TPS" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$NO_TPS" --binary-b "$FAST" "${COMMON[@]}" \
 	"GREP:produced no decode_tps"
 
 check missing_token_ids 125 \
 	"an arm that emits no token_ids is refused rather than timed blind" \
-	--binary-a "$NO_IDS" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$NO_IDS" --binary-b "$FAST" "${COMMON[@]}" \
 	"GREP:emitted no token_ids line"
 
 check unbalanced_slots 125 \
 	"a slot count that cannot form whole ABBA blocks is refused" \
-	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 6 --max-tokens 5 "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 6 --max-tokens 5 \
 	"GREP:multiple of 4"
 
 check missing_model 125 \
 	"a model path that does not exist stops the run" \
-	--binary-a "$SLOW" --binary-b "$FAST" --model "$WORK/nope" --slots 8 --max-tokens 5 "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$WORK/nope" --slots 8 --max-tokens 5 \
 	"GREP:model path not found"
 
-# The refusal is the central guard, so its end-to-end coverage must not depend
-# on what this machine happens to be doing. A `ps` shim reports a process whose
-# cumulative CPU time advances on every call, which is a busy host by
-# construction; the earlier form used `--busy-pct 0` and would have gone QUIET
-# on an idle CI runner, because `classify_window` short-circuits `idle` before
-# the threshold is applied.
+# ---- the host gates, against a machine this file supplies --------------------
+#
+# These are the only cases that leave the host gating on, and none of them looks
+# at this machine: `ps` and `pgrep` are both shimmed, so the host is whatever
+# the case says it is. A `--busy-pct 0` would not do instead -- `classify_window`
+# short-circuits `idle` before the threshold is applied, so on a genuinely quiet
+# runner the refusal would never fire and the case would pass having tested
+# nothing.
+
+# 40 rows of nothing: `cpu_snapshot` refuses a process table under 20 rows, so
+# every shim has to look like a real one before it can look like anything else.
+idle_rows='for i in $(seq 1 40); do printf "%6d %12s %s\\n" $((5000 + i)) "0:00.10" "/usr/sbin/idle$i"; done'
+
+# A machine with a hog on it: one process whose cumulative CPU time advances by
+# 100 s on every call.
 mkdir -p "$WORK/busybin"
 cat >"$WORK/busybin/ps" <<PSHOG
 #!/usr/bin/env bash
 n=\$(cat "$STATE/pshog.cnt" 2>/dev/null || echo 0)
 echo \$((n + 1)) >"$STATE/pshog.cnt"
 printf '%6d %12s %s\n' 4242 "0:\$((n * 100)).00" /usr/local/bin/hog
-for i in \$(seq 1 40); do printf '%6d %12s %s\n' \$((5000 + i)) "0:00.10" "/usr/sbin/idle\$i"; done
+$idle_rows
 PSHOG
-chmod +x "$WORK/busybin/ps"
+printf '#!/bin/sh\nexit 1\n' >"$WORK/busybin/pgrep"
+
+# A quiet machine on which something else holds the Metal context.
+mkdir -p "$WORK/servebin"
+printf '#!/usr/bin/env bash\n%s\n' "$idle_rows" >"$WORK/servebin/ps"
+printf '#!/bin/sh\necho 4243\nexit 0\n' >"$WORK/servebin/pgrep"
+
+chmod +x "$WORK"/busybin/* "$WORK"/servebin/*
 
 check busy_host_refused 125 \
 	"a host over the CPU threshold is refused before anything is measured" \
 	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
-	"PATHPRE:$WORK/busybin" \
+	REALHOST "PATHPRE:$WORK/busybin" \
 	"GREP:host is not quiescent" \
 	"GREP:hog"
 
@@ -384,9 +416,20 @@ check busy_host_refused 125 \
 check busy_host_taints 125 \
 	"--allow-busy-host prints the numbers but a tainted run is still not clean" \
 	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" --allow-busy-host \
-	"PATHPRE:$WORK/busybin" \
+	REALHOST "PATHPRE:$WORK/busybin" \
 	"GREP:^  TAINTED:" \
 	"GREP:VERDICT: SEPARATED"
+
+# Exclusivity is a host precondition like quiescence, and it had no case at all
+# until it started failing every other one on a developer machine with a server
+# up. It is reported, never killed: stopping someone else's server to make our
+# number look better is not the harness's call.
+check metal_holder_refused 125 \
+	"a host where something else holds the Metal context is refused" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	REALHOST "PATHPRE:$WORK/servebin" \
+	"GREP:holds the Metal context" \
+	"NOGREP:VERDICT:"
 
 # ---- the runs.db escape ------------------------------------------------------
 #
@@ -397,14 +440,14 @@ check busy_host_taints 125 \
 
 check metrics_flag_in_arm_refused 125 \
 	"--metrics in an arm's arguments is refused before anything runs" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
 	--arm-b "--metrics full" \
 	"GREP:--metrics may not appear in arm arguments" \
 	"GREP:append-only"
 
 check metrics_flag_equals_form_refused 125 \
 	"the --metrics=VALUE spelling is refused too" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
 	--arm-a "--metrics=full" \
 	"GREP:--metrics may not appear in arm arguments"
 
@@ -413,20 +456,20 @@ check metrics_flag_equals_form_refused 125 \
 ZEROPEAK="$(make_stub zeropeak "100.0,100.5,101.0" 0.0 "$TOKENS_MAIN" "" zeropeak)"
 check vacuous_memory_refused 125 \
 	"a slot whose peak bracket measured nothing is refused, not averaged as 0" \
-	--binary-a "$ZEROPEAK" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$ZEROPEAK" --binary-b "$FAST" "${COMMON[@]}" \
 	"GREP:metal_peak_mb=0"
 
 SHORT="$(make_stub short "100.0,100.5,101.0" 40.0 "1,2")"
 check short_generation_refused 125 \
 	"a slot that generated fewer tokens than asked for is refused" \
-	--binary-a "$SHORT" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SHORT" --binary-b "$FAST" "${COMMON[@]}" \
 	"GREP:emitted 2 token ids, expected 5"
 
 # ---- option validation -------------------------------------------------------
 
 check non_numeric_slots 125 \
 	"--slots abc exits 125, not the 1 reserved for token divergence" \
-	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots abc "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots abc \
 	"GREP:--slots must be a number"
 
 check non_numeric_busy_pct 125 \
@@ -436,21 +479,21 @@ check non_numeric_busy_pct 125 \
 
 check slots_too_few_for_a_verdict 125 \
 	"--slots 4 is refused: SEPARATED would carry a 1-in-3 null probability" \
-	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 4 --max-tokens 5 "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 4 --max-tokens 5 \
 	"GREP:null probability of 0\.33333"
 
 # ---- the reported statistics must be computed, not asserted ------------------
 
-check stddev_uncertainty_tracks_n RC_REPORT \
+check stddev_uncertainty_tracks_n 0 \
 	"the stddev's relative standard error is computed from n, not a fixed 30%" \
-	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 8 --max-tokens 5 "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 8 --max-tokens 5 \
 	"GREP:over 4 values is ~1/sqrt\(2\(n-1\)\) = 41%" \
 	"NOGREP:= 32%"
 
-check family_size_is_stated RC_REPORT \
+check family_size_is_stated 0 \
 	"the family-wise rate is stated for a run that makes two comparisons" \
 	--binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --model "$MODEL2" \
-	--slots 12 --max-tokens 5 "${QUIET[@]}" \
+	--slots 12 --max-tokens 5 \
 	"GREP:this run makes 2 independent comparisons" \
 	"GREP:1-\(1-0\.00216\)\^2 = 0\.00432"
 
@@ -535,7 +578,10 @@ cpu_case cpu_both_empty_is_unmeasured "unmeasured - -" \
 # to `set -e` and to every caller that does not check.
 mkdir -p "$WORK/failbin"
 printf '#!/bin/sh\nexit 1\n' >"$WORK/failbin/ps"
-chmod +x "$WORK/failbin/ps"
+# The end-to-end case below runs with host gating on, so this directory must
+# stand in for the whole machine, not just for `ps`.
+printf '#!/bin/sh\nexit 1\n' >"$WORK/failbin/pgrep"
+chmod +x "$WORK/failbin/ps" "$WORK/failbin/pgrep"
 if PATH="$WORK/failbin:$PATH" cpu_snapshot "$WORK/snap_fail" 2>/dev/null; then
 	FAILED=$((FAILED + 1))
 	printf '  FAIL %-26s        — cpu_snapshot returned success for a failing ps\n' "cpu_snapshot_reports_failure"
@@ -561,8 +607,8 @@ fi
 # End to end: a failing `ps` must taint the run rather than let it report clean.
 check failing_ps_taints 125 \
 	"a slot whose interference could not be sampled taints the comparison" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
-	"PATHPRE:$WORK/failbin" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	REALHOST "PATHPRE:$WORK/failbin" \
 	"GREP:^  TAINTED:" \
 	"GREP:could not be sampled" \
 	"GREP:VERDICT: SEPARATED"
@@ -589,9 +635,9 @@ fi
 
 # ---- the pattern itself ------------------------------------------------------
 
-check pattern_is_balanced RC_REPORT \
+check pattern_is_balanced 0 \
 	"the default 12-slot pattern is the balanced ABBA BAAB ABBA schedule" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
 	"GREP:pattern: ABBA BAAB ABBA" \
 	"GREP:n=6"
 
@@ -620,9 +666,9 @@ fi
 # file verbatim. A quote in any of them would emit JSON that no reader can
 # parse, and nothing downstream would say so.
 
-check json_result_parses RC_REPORT \
+check json_result_parses 0 \
 	"the result file is valid JSON even with quotes and backslashes in a label" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" "${QUIET[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
 	--label-a 'he said "fast"' --label-b 'back\slash' \
 	"GREP:result: "
 
@@ -653,6 +699,11 @@ else
 fi
 
 echo ""
+# What this suite did and did not look at, printed on every run. It covers the
+# harness's logic and the logic of its host gates; it does not and cannot tell
+# anyone whether this machine is quiet, which is perf_ab.sh's job on a real run.
+printf 'host inputs: %d cases declared synthetic arms (the machine is not consulted); %d drove the host gates against a shimmed ps and pgrep; 0 read this machine.\n' \
+	"$SYNTHETIC_CASES" "$REAL_HOST_CASES"
 if [[ "$FAILED" -ne 0 ]]; then
 	echo "perf_ab selftest: FAIL ($FAILED of $((PASSED + FAILED)))" >&2
 	exit 1
