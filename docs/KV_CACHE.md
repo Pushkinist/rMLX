@@ -388,7 +388,7 @@ dynamic range, lowering affine-K quant PPL.
 plain MLX `matmul` against a precomputed `[D,D]` `R` — correct + coherent,
 but O(D²) arithmetic and materialises an intermediate `K_rot` tensor.
 
-**Fused FWHT kernel:** `crates/rmlx-models/src/kv_cache/rot_k_msl.rs`
+**Fused FWHT kernel:** `crates/rmlx-kv-quant/src/rot_k_msl.rs`
 implements a fused Metal kernel using the Fast Walsh-Hadamard Transform (FWHT),
 which is O(D log₂D) instead of O(D²). For D=128 (Bonsai): 896 ops vs 16 384 —
 ~18× fewer arithmetic ops plus elimination of the intermediate `K_rot` DRAM
@@ -404,7 +404,7 @@ Default-OFF. Enable via `--rot-k-fused on` (or `RMLX_ROT_K_FUSED=1`).
 Supported D: {32, 64, 128, 256, 512}.
 Falls back to v1 matmul on unsupported D or kernel error.
 
-Reference math: `crates/rmlx-models/src/kv_cache/rot_k.rs`; rotorquant README
+Reference math: `crates/rmlx-kv-quant/src/rot_k.rs`; rotorquant README
 (`../rotorquant/`).
 
 Example: `--ctk rot_k --ctv q4_g64` on Bonsai → coherent.
@@ -749,7 +749,7 @@ probe and is **not recommended for production use**.
 
 **Decision**: GPU dispatch wiring **reverted** at `update_k8vturbo3` (V-side
 stays on CPU as in the first pass).  The Metal kernel source is kept under
-`crates/rmlx-models/src/kv_cache/k8vturbo3_append_msl.rs` as a
+`crates/rmlx-kv-quant/src/k8vturbo3_append_msl.rs` as a
 future-reference hook with full bit-equivalence unit-test coverage (CPU
 vs GPU max abs diff < 1e-3 on a fixed-seed input).  Re-wiring it later is
 a one-line dispatch-site change once Gemma4-arch PPL coverage exists.

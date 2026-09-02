@@ -181,11 +181,18 @@ On a dense architecture those two now report a net *saving* and the warn does
 not fire; the estimate takes the same `shares_kv` the allocation does, so the
 two cannot disagree.
 
-Historical note: before that change, measured on Gemma4 e2b (7 global + 28
-windowed layers, head_dim 256, 1 KV head) at a 4096-token prompt, `k8v4` ≈
-125.0 MB vs `none` ≈ 113.2 MB (`kv_cache_bytes`) — `k8v4` was +11.7 MB on the
-global layers, zero delta on the windowed layers. Those two numbers are equal
-now.
+Historical note: before that change, measured on Gemma4 e2b at a 4096-token
+prompt, `k8v4` reported a larger `kv_cache_bytes` than `none` — all of the
+excess on the global layers, zero delta on the windowed ones. Those two
+numbers are equal now.
+
+Size a Gemma4 layer from the **class** it is in. Windowed layers are
+`head_dim` × `num_key_value_heads`; global layers are `global_head_dim` ×
+`num_global_key_value_heads`, which is a different and wider shape (see
+docs/MODELS.md, "Attention geometry splits by layer class"). Both figures come
+off the snapshot's `text_config`, and `gemma4/generate/mod.rs` builds the
+per-layer `KvLayerShape` vector from exactly that pair — read it there rather
+than assuming one width for the stack.
 
 rMLX emits one structured `warn!` at request build time when the resolved codec
 is estimated to increase resident KV vs bf16 on the active layer mix:
@@ -202,8 +209,10 @@ they are never dropped. Consider --kv-quant none if memory is the goal.
   kv_quant=mixed_k8g64_v8g64 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes=31195136
 ```
 
-(Gemma4 e2b: 7 global layers at `head_dim` 256, 1 KV head, 8192 tokens — each
-holds 12 845 056 B under the codec against 8 388 608 B of bf16.)
+`n_global` and `n_windowed` are the two layer classes; `est_extra_bytes` is
+`estimated_resident_bytes_per_layer` summed over the mix, so the per-class
+per-layer figures behind it are recomputed rather than recorded here. To see
+them for a codec, run `rmlx info --list-cache-types`.
 
 Only the **sign** of that number is exact; size nothing from its magnitude.
 
@@ -1553,7 +1562,7 @@ tail/head candidate set; the fallback to `K8V8` is the correct safety net.
 
 ---
 
-### `KvStorage::TurboSym3` — symmetric WHT-3 K + turbo3 V
+### `KvStorage::TurboSym3` — symmetric turbo-3 K + turbo-3 V
 
 > **INERT on this build** — `tsym3` decodes from the bf16 mirror on both
 > axes, so `exit_prefill` never builds the packed store described below and the
@@ -1575,6 +1584,12 @@ regressed −2% TPS; see K8VTurbo3 finding).
 
 Both K and V use the **same codebook** — the symmetric designation is
 literal: the codec treats K and V identically.
+
+**No rotation is applied on either axis**, despite the family's name and the
+`_wht_` substring in the layout tag below; that substring is an SSD geometry
+identifier, not a description of the encoder. See §"The turbo family's missing
+rotation — what it is worth, and where" for what the absent transform would buy
+and on which axis.
 
 The K buffer is `QuantKTurbo3` (independent type from `QuantK` and
 `QuantKTurbo4`), decoupled from V to keep append paths separate.
@@ -2183,7 +2198,7 @@ across a policy change.
 | `planar` | `KvQuant::Planar` |
 | `k8vturbo3` | `KvQuant::K8VTurbo3` |
 | `k8vturbo3tcq` | `KvQuant::K8VTurbo3Tcq` (Viterbi trellis 3-bit V; reuses turbo3 codebook) |
-| `tsym4` | `KvQuant::TurboSym4` (symmetric WHT-4 K + tq4 V; rejected on Qwen MoE) |
+| `tsym4` | `KvQuant::TurboSym4` (symmetric 4-bit K + tq4 V, no rotation; rejected on Qwen MoE) |
 | `k8vturbo2` | `KvQuant::K8VTurbo2` |
 | `mixed_k<kb>g<kg>_v<vb>g<vg>` | `KvQuant::Mixed { .. }` |
 
@@ -2205,8 +2220,8 @@ is a clap hard error (caught before the subcommand body runs).
 |---|---|---|
 | `fp16` | `KvQuant::None` | bf16 unquantized both sides (`KvQuant` variant named `None`, not `Option::None`) |
 | `q8` | `KvQuant::K8V8` | symmetric 8-bit K+V |
-| `speed` | `KvQuant::TurboSym3` | symmetric WHT-3 K+V, matches mtq `speed`; rejected on Qwen MoE |
-| `quality` | `KvQuant::TurboSym4` | symmetric WHT-4 K + tq4 V, matches mtq `quality` byte-for-byte; rejected on Qwen MoE arch guard |
+| `speed` | `KvQuant::TurboSym3` | symmetric 3-bit K+V, no rotation; matches mtq `speed`; rejected on Qwen MoE |
+| `quality` | `KvQuant::TurboSym4` | symmetric 4-bit K + tq4 V, no rotation; matches mtq `quality` byte-for-byte; rejected on Qwen MoE arch guard |
 | `planar` | `KvQuant::Planar` | PlanarQuant V-side |
 | `planar3` | `KvQuant::Planar3` | PlanarQuant 3-bit V-side |
 | `k_only_planar` | `KvQuant::PlanarK` | PlanarQuant K-side, V bf16; rejected on Qwen MoE |
@@ -2223,14 +2238,18 @@ reads its own packed store; before that it is another spelling of `fp16`.
 
 #### Preset semantics — divergence from mtq
 
-rMLX `speed` maps to `TurboSym3` — symmetric WHT-3 K+V, matching mtq `speed`
-preset definition exactly. Both K and V use the Lloyd-Max N(0,1) 8-centroid
+rMLX `speed` maps to `TurboSym3` — symmetric 3-bit K+V, matching mtq `speed`
+preset definition. Both K and V use the Lloyd-Max N(0,1) 8-centroid
 3-bit codebook; K-side uses the GPU turbo3 MSL kernel. Arch guard: rejected on
 Qwen MoE (K-side 3-bit is the PPL-disaster zone).
 
-rMLX `quality` maps to `TurboSym4` (symmetric WHT-4 K + tq4 V),
+rMLX `quality` maps to `TurboSym4` (symmetric 4-bit K + tq4 V),
 matching mtq `quality` byte-for-byte. Both retain their historical CLI aliases —
 no flag changes.
+
+Neither preset applies a rotation — rMLX's turbo encoder has none on either
+axis. Where the upstream name implies one, §"The turbo family's missing
+rotation — what it is worth, and where" records what it would be worth.
 
 Examples:
 
@@ -3967,6 +3986,64 @@ The LLC-limiter decision rule that stood here is therefore retired unfired: the
 per-kernel limiter split it asked for is not what the Counters export provides,
 and the disposition no longer depends on it.
 
+### The decode ceiling — deleting the codec's arithmetic does not reach bf16
+
+The section above answers "is lifting ε worth funding?" from evidence gathered
+for other purposes. The question was then put directly, with an **ablation
+ladder**: one serving cell, one packed-store codec, four binaries that
+progressively *delete* decode work rather than optimise it, each rung
+ABBA-interleaved against the same baseline arm.
+
+| rung | what it deletes | output |
+|---|---|---|
+| (a) | nothing — the shipped codec | correct |
+| (b) | **all** per-step decode math and all K-store traffic | deliberately wrong |
+| (c) | the rotation only | deliberately wrong |
+| (d) | the V-slab copy only | bit-identical to (a) |
+
+Rungs (b) and (c) compute the wrong answer on purpose. They are cost probes: no
+number taken from them describes a working configuration. Rung (b) is the
+load-bearing one, because it is an **upper bound on every decode-math item
+combined** — a rotation hoist, a narrower K store, a better codebook, vector
+loads on the code plane, and anything not yet proposed. Whatever the codec could
+compute more cheaply, (b) has already deleted.
+
+**Rung (b) does not reach `none`, and it is not close.** With 100% of the decode
+math and the whole K-store read gone, the codec is still far short of bf16, and
+the majority of the per-step gap survives into the rung that computes nothing.
+That surviving majority is the **kernel shell** — dispatch, grid geometry,
+barriers, the fixed per-layer cost of running a custom kernel at all — not codec
+arithmetic.
+
+Three consequences, and they are what this result is for:
+
+1. **Every decode-math proposal shares one ceiling, and the ceiling is below
+   parity.** They cannot be justified individually against a parity target,
+   because their *sum* does not reach it. "The codec is slow because of what it
+   computes" is retired as a fundable theory.
+2. **The next measurement is a shell variant** — tokens per iteration, barrier
+   count, dispatches per layer — not another decode-math one. The ladder shows
+   where the cost is; it does **not** show that a shell rewrite would collect
+   it, and nothing here licenses that assumption.
+3. **Rung (d) is the exception, and it shipped.** A bounded fix, output
+   bit-identical to the baseline, no stored-format change, covering the three
+   dispatchers that shared the defect (`iso_flash_decode_msl.rs`,
+   `rotor_flash_decode_msl.rs`, `planar_flash_decode_msl.rs`). Its anchors,
+   command line and control cell are in docs/PERF_BASELINE.md, "V-mirror
+   stride".
+
+**No figure from the ladder is transcribed here.** Three of its four arms are
+instrumented throwaway binaries not reproducible from any committed ref, so
+nothing was ingested into `runs.db` and a ratio written into this page would
+have no producer to check it against. The raw transcripts, the per-slot result
+JSONs and the three variant patches are in `.rmlx/analysis/r4-ceiling-ladder/`
+(gitignored scratch); the *ordering* of the rungs, which is the durable result,
+is what this section carries.
+
+This supersedes argument 1's headroom ladder in scope rather than contradicting
+it: that one deletes the query-head class, this one deletes the whole
+decode-math class, and the two agree in direction.
+
 ### Codec disposition — what every codec in the tree is for
 
 The KV enum spells **28 codecs**. This section gives each one an explicit
@@ -4185,22 +4262,64 @@ byte-for-byte across runs — so these are exact, not medians.
 | `k_rotor3` / `k_rotor4` — now | 1.022× | 1.004× | 1.009× | 1.008× |
 | `rotor3_sym` / `rotor4_sym` — was | 1.326× | 1.337× | 1.270× | 1.265× |
 | `rotor3_sym` / `rotor4_sym` — now | 1.043× | 1.009× | 1.019× | 1.015× |
-| `mixed_k8g64_v4g64` | 1.339× | 1.396× | withdrawn† | withdrawn† |
-| `rot_k_v8g64` | 1.541× | 1.533× | withdrawn† | withdrawn† |
+| `mixed_k8g64_v4g64` | 1.339× | 1.396× | in `runs.db`† | in `runs.db`† |
+| `rot_k_v8g64` | 1.541× | 1.533× | in `runs.db`† | in `runs.db`† |
 
-† The two Bonsai cells for `mixed` / `rot_k` were measured on a binary that
-built the bf16 K/V mirror on **every** architecture. `exit_prefill` now builds
-each mirror only where a decode path reads it, and `feeds_bf16_{k,v}_at_decode`
-answers the cache's own `shares_kv` for exactly these two variants — so on a
-stack whose layers do not share K/V nothing reads the mirror and it is not
-allocated. Bonsai is such a stack; gemma-4-e2b is not, which is why its two
-columns stand unchanged and are the *reason* the mirror is kept at all. The
-cells are withdrawn rather than re-typed: what these codecs now hold is
-computed per topology by `rmlx info --list-cache-types`, and the whole-stack
-figure by `mixed_layer_stack_delivered_bits_per_value`
-(`crates/rmlx-models/src/kv_cache/tests.rs`), which derives it from
-`LAYER_ADAPTIVE_HEAD_N` / `LAYER_ADAPTIVE_TAIL_N` rather than restating it. A
-re-measurement on this arch belongs in this table when one is taken.
+† The two Bonsai cells for `mixed` / `rot_k` were first measured on a binary
+that built the bf16 K/V mirror on **every** architecture. `exit_prefill` now
+builds each mirror only where a decode path reads it, and
+`feeds_bf16_{k,v}_at_decode` answers the cache's own `shares_kv` for exactly
+these two variants — so on a stack whose layers do not share K/V nothing reads
+the mirror and it is not allocated. Bonsai is such a stack; gemma-4-e2b is not,
+which is why its two columns stand and are the *reason* the mirror is kept at
+all.
+
+Those cells have since been re-measured on a dense stack. They are **not**
+re-typed here — both arms are rows in `runs.db`, which is where to read them:
+
+```bash
+rmlx metrics query "SELECT model, prompt_tokens, kv_quant, value \
+  FROM observations WHERE id BETWEEN 122793 AND 122804 \
+    AND metric = 'kv_cache_bytes' \
+  ORDER BY model, prompt_tokens, kv_quant"
+```
+
+Both architectures, both contexts, `--max-tokens 200`. `kv_cache_bytes` is
+`KvCache::resident_bytes` — a sum over live allocations, not the estimator — and
+residency is deterministic for a given (model, offset, codec), so one row per
+cell is the whole measurement. The result is the **sign flip**: on the dense
+stack these two now hold materially *less* than `none`; on the shared-KV stack
+they still hold more. One codec, two answers, exactly as
+`global_layer_store_plus_mirror_codec_sign_follows_shared_kv` predicts. For a
+codec outside that query, `rmlx info --list-cache-types` computes the
+per-topology figure and `mixed_layer_stack_delivered_bits_per_value`
+(`crates/rmlx-models/src/kv_cache/tests.rs`) pins the whole-stack rate from
+`LAYER_ADAPTIVE_HEAD_N` / `LAYER_ADAPTIVE_TAIL_N` rather than restating it.
+
+**The mirror elision is not the whole cause; the earlier attribution was
+wrong.** Walking one dense cell across the two commits shows the elision moves
+part of the distance and the later **in-family boundary floor** moves the rest.
+Read "the mirror elision inverted `mixed` on dense stacks" as an overstatement
+of a two-step change. Across the elision alone the token ids are bit-identical
+and `store_skipped` is unchanged — it moved bytes and nothing else — and its
+decode-neutrality, asserted when it landed, has since been measured
+INCONCLUSIVE against a pre-elision arm, i.e. no difference resolvable at that
+design's power.
+
+**The elision is not over-broad**, and this is measured rather than read off the
+`shares_kv` condition: gemma-4-e2b is byte-identical *and*
+greedy-digest-identical across the commit's parent, the commit, and main — all
+three codecs, both contexts, both generation lengths. The e2b columns above also
+reproduced on the post-elision binary, which is the instrument check on the arm
+that did not move.
+
+**Do not certify a codec inert from a short generation.** At `--max-tokens 32`
+these cells give `mixed` and `rot_k` the same greedy digest on Bonsai at 4k, and
+`rot_k` reproduces `none`'s digest exactly at 32k; at 200 tokens all three
+separate. A digest match at 32 tokens is not evidence of an inert codec, and
+`scripts/bench/codec_inertness_probe.sh` is wrong on main where it says `mixed_*`
+sets `store_skipped` on Bonsai — the in-family floor promotes it to a
+store-reading variant.
 
 The iso / rotor rows are the ring-layout result restated on real serving. Both
 families spend one whole `u32` code word per group; iso's group is 4 head-dim
@@ -4287,8 +4406,14 @@ misled by is worth more than one name fewer.
 * **Whether any codec should eventually be deleted.** That turns on whether the
   re-enable path can be made to pay. It is decided by a fused decode kernel over
   a packed store that beats bf16 at a context this tree can serve — not by
-  another residency measurement, which is now saturated at "no codec is
-  smaller".
+  another residency measurement. The residency axis is **settled, not
+  saturated**: iso is under bf16 on every topology, `mixed` / `rot_k` are under
+  it on a dense stack and over it on a shared-KV one, and rotor is over it
+  everywhere. An earlier revision of this bullet read "saturated at *no codec is
+  smaller*", which the table above already contradicted.
+  What that kernel has to beat is now bounded from the other side too — see
+  "The decode ceiling", which measures the shell rather than the codec
+  arithmetic as the majority of the gap.
 * **Whether a better ring layout clears 16 bits/value for iso/rotor.** Nothing
   measured here touches it; the layout, not the algorithm, is what fails.
 * **Which member of a byte-identical 3-bit/4-bit pair survives a fold.** The
@@ -4312,15 +4437,25 @@ no model launched — unlike the measured cells below it:
 | Qwen3.8-27B-mxfp8 (26.4 GB/step of weights) | 0.010 | 0.020 | 0.075 | 0.245 |
 | Qwen3.6-35B-A3B-8bit (MoE, 3.1 GB/step) | 0.026 | 0.051 | 0.177 | 0.462 |
 | gemma-4-e2b-mxfp8 (SWA on most layers) | 0.030 | 0.053 | 0.170 | 0.445 |
-| Ternary-Bonsai-8B-2bit (2.1 GB/step) | **0.221** | **0.362** | **0.694** | 0.901 |
+| Ternary-Bonsai-8B-2bit (2.1 GB/step) | **0.221** | **0.362** | **0.694** | 0.901 ‡ |
+
+‡ Arithmetic only. Bonsai-8B's `max_position_embeddings` is below 131 072 and
+the engine refuses a prompt past it with no override, so no cell at that column
+can be run on this model — the projection is not a target anyone can measure.
+Check the ceiling in the snapshot's `config.json` before designing a
+long-context cell around a model; a second, independent cap
+(`--max-prompt-tokens`) hard-errors on the GPU path and is easy to hit first.
 
 So "measured at 4k" and "measured where the codec axis is near-zero" are not
 the same qualifier, and a claim scoped by the first is not scoped by the
 second. A 2-bit 8B model at a 4k prompt already puts 22% of its decode bytes on
 the codec axis; a dense 27B at 131k puts 25%.
 
-**A large `kv_frac` is necessary, not sufficient.** Measured on this tree,
-`none` vs `mixed_k8g64_v4g64` ABBA-paired (`scripts/perf_ab.sh`, n=4/arm; the
+**A large `kv_frac` is necessary, not sufficient — at 8-bit K.** Every cell in
+this table is `mixed_k8g64_v4g64`, so every conclusion drawn from it is scoped
+to a **K side of 8 bits**. That scope turned out to be load-bearing; see "The
+null was a bit-width result" below before generalising any of it. Measured on
+this tree, `none` vs `mixed_k8g64_v4g64` ABBA-paired (`scripts/perf_ab.sh`, n=4/arm; the
 two Qwen3.8 cells untainted at 7.0–7.3 % foreign CPU, the two Bonsai cells
 tainted only by a monitoring process at their entry gate — see
 docs/PERF_BASELINE.md for per-cell conditions and spreads):
@@ -4334,26 +4469,28 @@ docs/PERF_BASELINE.md for per-cell conditions and spreads):
 
 † All four are dense stacks, and arm B's resident figures were measured before
 the `Mixed` / `RotK` mirror became conditional on `shares_kv`. Every one of them
-is a measurement of two bf16 buffers this arch no longer allocates. The `kv_frac`
-and `predicted ceiling B/A` columns are arm A (`none`) and arm B respectively,
-from `scripts/perf_ceiling.py` at the measured cache offset
-(`prompt_tokens + max_tokens - 1`); arm A is unaffected, arm B's prediction was
-produced by the same pre-elision model and reads **low** — it is being
-re-derived with the corrected model, and the decode columns, which are the
-argument this table carries, are untouched by any of it.
+was a measurement of two bf16 buffers a dense arch no longer allocates, so they
+are withdrawn rather than corrected in place. The Bonsai cells have since been
+re-measured post-elision — read them from `runs.db` via the query in
+§"Class 3", not from prose. The Qwen3.8 cells have not been re-measured and no
+substitute figure is offered for them. The `kv_frac` and `predicted ceiling B/A`
+columns are arm A (`none`) and arm B respectively, from
+`scripts/perf_ceiling.py` at the measured cache offset (`prompt_tokens +
+max_tokens - 1`); arm A is unaffected, arm B's prediction came from the same
+pre-elision byte model and reads **low** — `make check-kv-byte-model-parity`
+now binds that model to the engine's, so the re-derivation is a re-run of the
+script rather than a re-typing. The decode columns, which are the argument this
+table carries, are untouched by any of it.
 
 Two rows carry the argument. The Bonsai **31 553** row is the high-`kv_frac`
 end: at 0.687 — the largest any release-set model reaches *at a context this
-tree can serve*; the static table above projects 0.901 for the same model at
-131 072, which no measured cell reaches — a codec that cuts the decode KV
-stream to 0.571× and is predicted +42% moves decode by +0.3%, inside the noise,
-while costing +29% resident KV — a null with the power to have seen a 1%
-effect, since the arm spreads there are 0.04% and 0.15%. The Qwen3.8
-**130 848** row is the long-context
-end: `kv_frac` 0.245, predicted +14.9%, measured **−23.7% with the arms'
-per-slot ranges disjoint in the losing direction**, and +35% resident
-whole-cache — which on that hybrid arch understates the attention-KV ratio,
-1.355 excluding its codec-independent GDN state.
+tree can serve* — a codec that cuts the decode KV stream to 0.571× and is
+predicted +42% moves decode by +0.3%, inside the noise: a null with the power
+to have seen a 1% effect, since the arm spreads there are 0.04% and 0.15%. The
+Qwen3.8 **130 848** row is the long-context end: `kv_frac` 0.245, predicted
++14.9%, measured **−23.7% with the arms' per-slot ranges disjoint in the losing
+direction**. Both rows' resident columns are withdrawn per † and neither
+conclusion rests on one.
 
 **Scope on arm B.** It is `mixed_k8g64_v4g64` measured while it retained both
 bf16 seeds on every architecture. It still materialises a packed store — that
@@ -4376,9 +4513,56 @@ packed path does not merely fail to convert: its non-bandwidth per-step cost
 grows 12.0 → 44.2 ms between 3 892 and 130 848 tokens while `none`'s stays flat
 at 10.5 → 14.7, so halving the byte stream still loses.
 
+#### The null was a bit-width result, not a context result
+
+Every cell above holds K at 8 bits. The same harness, the same model and the
+same ABBA design were later run with **K at 4 bits** (`mixed_k4g64_v4g64`), and
+the sign changes: on the dense 8B target the 4-bit-K arm beats `none` with the
+arms' per-slot ranges disjoint, at a 32k prompt and again at a 63k one — where
+the 8-bit-K arm at the identical shapes returns INCONCLUSIVE.
+
+The earlier null is **sound, and was not a measurement error.** One of the new
+cells independently reproduces this table's Bonsai 31 553 row — same model,
+same context, same shape, a different session — and lands on the same verdict.
+It was measured at the wrong K width. No 4-bit-K cell existed anywhere in this
+tree until then.
+
+Read the consequence narrowly, because it is narrower than "quantized KV wins":
+
+* **"Quantized KV always loses at decode" is retired.** That was a statement
+  about 8-bit K which had been reading as a statement about codecs.
+* **The win is on the `Mixed` path, through MLX's `quantized_matmul`** — not on
+  a fused flash-decode kernel over a packed store. It does not transfer to the
+  iso / rotor / planar ring, and it is neither evidence for nor against §"The
+  decode ceiling".
+* **It is not a long-context effect.** It holds at 32k as well as 63k. On a
+  low-`kv_frac` substrate the 8→4 bit change moves decode by a rounding error
+  while cutting the store substantially, so the gain is not bandwidth being
+  converted. On that same substrate the `Mixed` path *loses*, and loses harder
+  at longer context — which localises a per-step cost that grows with `kv_seq`
+  and does **not** shrink when the store shrinks. That cost is inferred from the
+  pairing, not localised in code; localising it is the open item, not
+  re-encoding the codec.
+
+Cells, arms, per-slot values and byte counts:
+
+```bash
+rmlx metrics query "SELECT id, model, prompt_tokens, kv_quant, metric, value \
+  FROM observations WHERE id BETWEEN 122807 AND 122836 \
+  ORDER BY model, prompt_tokens, kv_quant, metric, id"
+```
+
+One binary for both arms of every comparison, `--kv-quant` and `--max-ctx`
+explicit per slot, arm A `none`, six measured slots per arm after one untimed
+warmup. Two of the comparisons deliberately returned INCONCLUSIVE on a clean
+host, which is the negative control: the harness is not merely emitting
+SEPARATED.
+
 Read together with the ε table: **`kv_frac` bounds the prize, ε decides how much
-of it is collectable, and ε is the binding term.** State `kv_frac` next to a
-codec cell so a reader can see the bound; do not infer an effect from it.
+of it is collectable, and ε is the binding term on the fused-kernel path.**
+State `kv_frac` next to a codec cell so a reader can see the bound; do not infer
+an effect from it — and state the **K bit width** too, since a cell that omits
+it cannot be compared with one that chose differently.
 
 ---
 
@@ -5846,11 +6030,55 @@ The startup resolvers (`rmlx-cli` `resolve_kv_quant`, the server's
 the model is loaded, so it is the only value available. They stay as the
 fast-feedback path (`exit 78` at launch); they are no longer the only check.
 
-Empirical positive test: `validate_resolved_qwen_moe_low_k_bits_rejected_post_decompose`
+Empirical positive test: `qwen_moe_low_k_bits_rejected_post_decompose`
 in `crates/rmlx-models/src/kv_cache/cache_type_tests.rs` verifies the
 runtime rejection path. The declared-vs-resolved bypass is covered by
 `crates/rmlx-models/tests/resolved_arch_class.rs`, which builds a snapshot
 that declares dense while shipping MoE tensors and asserts the guard fires.
+
+#### The guard's stated premise does not reproduce on 8:1 GQA
+
+The K-side bit floor is justified upstream by a claim that GQA *amplifies*
+K-side quantization error — one K head serving many query heads, so its error
+is said to compound with the ratio. That prediction was tested directly, as a
+needle-in-a-haystack retrieval screen across the rotation-based K codecs at two
+architectures (an 8:1 shared-KV Gemma4 and a 4:1 dense Qwen3), two contexts and
+five needle depths, against a criterion declared before any cell ran.
+
+**It does not fire.** Retrieval is perfect in every treatment cell, on both
+ratios, and the precondition arm (`none`) passed, so the run is valid rather
+than void. The 8:1 arm was in fact *less* perturbed than the 4:1 arm by greedy
+digest — the opposite of the amplification prediction, and the direction the
+rotation predicts, since these codecs decorrelate before quantizing. That is
+reported as direction only: the two arms are not coverage-matched and their
+head widths differ, so it is not a ratio.
+
+Codec liveness was confirmed on device rather than inferred from the enum —
+`decode_reads_packed_store` true for the K-only iso variant, no bf16 K seed
+allocated, and per-cell dispatch counters equal to decode steps × the arch's
+quantized-layer count exactly, against zero for `none` and `k8v8`.
+
+**No guard was added and none is warranted**: a geometry-keyed screen built on
+this would gate a variable with no measured effect. The upstream perplexity
+figure behind the bit floor remains an unbacked external claim, and byte-exact
+needle retrieval at 8:1 is incompatible with catastrophic degradation. The
+floor itself stays — this measurement removes a *rationale*, not a rejection
+rule, and re-litigating the rule needs a perplexity cell, which NIAH is not.
+
+One limit, stated because it bounds the claim: NIAH excludes catastrophic
+degradation outright but cannot resolve *subtle* degradation on the shared-KV
+arch, where the greedy digest separated in too few cells to carry a null.
+The verdict rests on retrieval rate and the dispatch counter, never on digest
+divergence — the digest was not leaned on where it was measured blind.
+
+**Two premises this section used to imply are false.** Sliding layers
+short-circuit to bf16 before any K-codec arm, so **only full-attention layers
+carry the codec** on a Gemma4 stack, and boundary promotion protects none of
+the long-range ones — it lands on cacheless consumers and sliding layers. The
+treatment on those layers is therefore total, not diluted; an argument that
+reasons from a whole-stack layer count will get the dilution backwards. And
+digest identity does not imply a void cell: see §"Class 3" for the same trap
+measured from the other side.
 
 ---
 
@@ -5930,6 +6158,59 @@ buy at most `0.5·log2(b)` bits. That is what makes the 1.5-bit gate a
 separation rather than a fitted number — it demands an effective block of 8 or
 more. Substitutes measure 0.91 bits (the same Hadamard truncated to blocks of
 4) and 0.47 (the iso quaternion), both rejected.
+
+### The turbo family's missing rotation — what it is worth, and where
+
+TurboQuant is named for a rotation this tree does not apply. The shipped codec
+quantizes raw KV against a Lloyd-Max codebook with no decorrelating transform,
+at any width, on either axis: `crates/rmlx-kv-quant/src/turboquant.rs` contains
+no Hadamard or Walsh-Hadamard code at all. The `_wht_` substring inside
+`TURBOSYM3_LAYOUT_TAG` / `TURBOSYM4_LAYOUT_TAG` is an on-disk geometry
+identifier for the SSD reader, **not** a claim about the encoder; do not read it
+as one.
+
+Whether adding the transform is worth its implementation cost was measured
+*before* any transform code was written, by
+`crates/rmlx-kv-quant/src/turbo_rotation_fidelity_tests.rs`. It holds the turbo
+codec, the width and the group size fixed and moves only a full-`head_dim`
+normalized FWHT in and out around the shipped CPU encoder. A test-side reference
+rotation is a controlled ablation and needs no codec change — which is why the
+gate could precede the implementation, and why "there cannot be an ablation
+until the rotation exists" was wrong.
+
+**The result inverts the family's cost structure.** Run the gate for the
+figures; the ordering is what matters here:
+
+| data shape | rotation is worth | implementing it costs |
+|---|---|---|
+| K-shaped (outlier channels) | order of a bit to two bits | reuses `maybe_pre_rotate_q_gpu` — close to wiring |
+| V-shaped (i.i.d. Gaussian) | order of a hundredth of a bit | an explicit inverse transform after SV accumulation: the P2 kernel, four dequant kernels, both fused-QK kernels |
+
+Turbo is primarily a **V** codec. So the measured payoff lands on the smaller
+half of the family, and the expensive half is the half where the measurement
+says there is nothing to recover. The payoff also shrinks monotonically as the
+codebook widens, which puts what value there is at the *narrow* spellings, not
+the wide ones. Anyone scoping the transform should read that as: K axis, narrow
+widths, and a separate justification demanded for the V-side kernel work.
+
+This also settles a confound the older per-codec cosine comparison could not:
+holding group size fixed, the absent rotation — not the difference in scale
+cadence — is the dominant term in turbo's reconstruction-error deficit against
+a rotated sibling at the same width.
+
+Scope it honestly: this is measured on a **model** of K-cache structure, not on
+a K/V tensor captured from a forward pass. Read it as an estimate for a real
+checkpoint; the honest check is a serving cell and has not been run. The
+threshold is imported from `ROT_K_MIN_OUTLIER_GAIN_BITS` rather than retyped,
+and the gate carries its own mutation check.
+
+**Read the gate's verdict, not only its magnitudes.** It records a FAIL of the
+magnitude criterion together with a PASS of the ordering, and both halves are
+the result: the rotation helps on exactly the data it was predicted to help on,
+and by less than the imported threshold at the widest codebook. An earlier draft
+reported PASS from these same numbers by moving the verdict into a friendlier
+bucket with the threshold untouched. Committing the criterion first protects the
+numbers; it does not protect the conclusion.
 
 ### Rate-distortion — is the bit width delivering
 

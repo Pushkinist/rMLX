@@ -722,11 +722,11 @@ audio fields under `audio_config`.
 
 | Field | Type | Notes |
 |---|---|---|
-| `num_hidden_layers` | int | 42 for e4b/e2b, larger for 26B/31B |
+| `num_hidden_layers` | int | differs per size, including between e2b and e4b — read the snapshot's `text_config`, do not carry one size's depth to another |
 | `hidden_size` | int | 2560 for e4b |
 | `num_attention_heads` | int | 8 for e4b |
 | `num_key_value_heads` | int | SWA-layer KV heads |
-| `num_global_key_value_heads` | int | full-attention KV heads (26B/31B) |
+| `num_global_key_value_heads` | int | full-attention KV heads. Absent on e2b/e4b, where `gemma4/config.rs` falls back to `num_key_value_heads` — the split by layer class exists on every size, the override only on some |
 | `head_dim` | int | 256 for SWA layers |
 | `global_head_dim` | int | 512 for full-attention layers (every size: e2b, e4b, 26B, 31B) |
 | `intermediate_size` | int | dense MLP width |
@@ -800,10 +800,13 @@ behaviour rather than the bare-prompt artifact.
 
 ### Key structural properties
 
-**SWA + FullAttention alternation.** Per-layer `layer_types` array determines
-the attention type. The default pattern is 5 sliding + 1 full, repeated. SWA
-layers use a rotating ring-buffer KV cache; full-attention layers use the full
-buffer.
+**SWA + FullAttention alternation.** The per-layer `layer_types` array
+determines the attention type and is the only authority for it. **The
+alternation period is not a constant across sizes** — e2b and e4b differ — so
+a period read off one size mis-places every full-attention layer on the other.
+Derive the full-attention indices from the array, never from a repeat count.
+SWA layers use a rotating ring-buffer KV cache; full-attention layers use the
+full buffer.
 
 **Cross-layer KV sharing.** `num_kv_shared_layers` sets the number of trailing
 SWA layers whose K/V is produced by the model but immediately overwritten with
@@ -814,16 +817,29 @@ footprint for those layers.
 
 **K=V sharing for full-attention layers (26B/31B).** When `attention_k_eq_v=true`,
 the snapshot stores only `k_proj` for full-attention layers; `v_proj` is
-absent and the loader reuses `k_proj` weights as `v_proj`. The KV head count
-for full-attention layers is taken from `num_global_key_value_heads` in this
-case.
+absent and the loader reuses `k_proj` weights as `v_proj`.
 
-**Dual head dimensions.** SWA layers use `head_dim` (256); full-attention
-layers use `global_head_dim` (512 on every size, e2b through 31B — see
-`gemma4/loader.rs`). Partial rotary factor applies to `global_head_dim` for
-the full-attention RoPE. No gemma-4 layer is 128 wide, which is why none of
-them reaches MLX's fused attention kernel — see `docs/FFI.md`
-§`scaled_dot_product_attention`.
+**Attention geometry splits by layer class — both axes.** A Gemma4 layer's KV
+shape depends on which class it is in, and *both* the head width and the KV
+head count switch:
+
+| axis | SWA layers | full-attention layers |
+|---|---|---|
+| head width | `head_dim` | `global_head_dim` |
+| KV heads | `num_key_value_heads` | `num_global_key_value_heads` |
+
+`gemma4/loader.rs` selects the width (`LayerType::FullAttention =>
+cfg.global_head_dim`) and `gemma4/generate/mod.rs` builds the per-layer
+`KvLayerShape` vector from the same pair. The KV-head split is **not** a
+26B/31B special case: it applies on every size, and on e2b/e4b — which do not
+ship `num_global_key_value_heads` — the full-attention count falls back to
+`num_key_value_heads`, so the two happen to coincide there. Sizing a global
+layer from `head_dim` / `num_key_value_heads` is the recurring mistake; it
+reads the SWA geometry.
+
+Partial rotary factor applies to `global_head_dim` for the full-attention
+RoPE. No gemma-4 layer is 128 wide, which is why none of them reaches MLX's
+fused attention kernel — see `docs/FFI.md` §`scaled_dot_product_attention`.
 
 **AltUp residual.** `hidden_size_per_layer_input` enables an AltUp-style
 residual gate when non-zero.

@@ -36,11 +36,19 @@ serve), so rMLX cells compare directly. Bar (§0.1): WIN / TIE-on-CI-overlap / L
   to −4…+1 % (🟢 WIN @16k) and halved its KV.** Only **31b dense still trails
   −2…−12 %** (dense-bandwidth physics, near the ceiling). Headline: **#44 + #51 made
   e2b/e4b/26b competitive with mlx-lm decode; only 31b dense trails.**
-- **KV codec is a decode no-op on every model** (all mainstream codecs ≈ `none`)
-  **AND memory-inflating** (1.2–4× resident KV) — **EXCEPT 31b dense**, the lone
-  model where KV quant pays a small decode win (k8vturbo2/tsym +3–4 % @32k–64k,
-  bandwidth-bound; n=2, soft). The quant block keeps its bf16 warm-decode seed
-  *alongside* the packed blocks, so every codec is larger than `none`.
+- **KV codec is a decode no-op on every Gemma4 model** (all mainstream codecs ≈
+  `none`) — **EXCEPT 31b dense**, the lone model here where KV quant pays a small
+  decode win (k8vturbo2/tsym +3–4 % @32k–64k, bandwidth-bound; n=2, soft).
+  Scope this to Gemma4 and to the K widths swept: on a *dense* arch at **4-bit
+  K** the `Mixed` path has since been measured beating `none` with disjoint
+  ranges (docs/KV_QUANT.md, "The null was a bit-width result").
+  **The memory half of this claim was wrong and is withdrawn.** It read "every
+  codec is larger than `none`", reasoning from a bf16 warm-decode seed that is
+  now built only where a decode path reads it. Gemma4 is a shared-KV arch, so
+  `mixed` / `rot_k` do keep their mirror here — but the iso family is under
+  `none` on this arch too. Per-codec, per-topology figures come from `rmlx info
+  --list-cache-types` and the Class 3 table in docs/KV_QUANT.md; do not carry a
+  ratio out of this bullet.
 - **TTFT exposes per-codec prefill cost invisible in decode.** `rotor*_sym`
   catastrophic (e4b 102 s, 31b 528 s @64k cold — QJL prefill); turbo*tcq elevated;
   K-only `k_iso* / k_rotor*` crawl (host CPU dequant, capped early).
