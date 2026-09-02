@@ -479,10 +479,34 @@ above are computed, and none should be read into the ratio.
 | A slot reports `metal_peak_mb=0` — the bracket measured nothing | exit 125 | none |
 | A slot generates fewer tokens than `--max-tokens` | exit 125 | none |
 
+Four of those rows read the machine — host quiescence, per-slot and
+whole-comparison interference, and the Metal-exclusivity check — as does the
+load average recorded beside them as context. Every other row reads the arms.
+That split is what `--synthetic-arms` acts on, below.
+
 `--metrics` is refused in arm arguments because it is declared `global = true`:
 an occurrence after the subcommand overrides the leading `--metrics off` and the
 slot opens the real append-only `runs.db`. Verified against the built binary,
 including on a failure path where the model never loaded.
+
+**`--synthetic-arms` is not an escape hatch — it says the run is not a
+measurement.** Only a machine-reading guard can change its answer between two
+runs of identical inputs, and that is exactly wrong for a caller driving stub
+binaries to check this script's own logic. `--synthetic-arms` declares the arms
+are stubs, and the machine is then not consulted at all: no quiescence probe,
+no interference sampling, no exclusivity check, and no load average — that last
+one feeds no gate, but a run claiming it consulted nothing must not file a
+number it read off this host. The run says so in its header, on every slot line,
+and in `waivers.synthetic_arms` — and `perf_ab_ingest.py` refuses such a result
+with no waiver, because there is no measurement in it to accept. The arm-reading
+guards are untouched by it.
+
+The boundary itself lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok`
+and `window_not_sampled`, and `scripts/bench_llama_ab.sh` takes the same
+`--synthetic-arms` flag through it rather than restating the rule. A window
+there is `not-sampled` for the same reason and by the same marker, its result
+file carries `synthetic_arms`, and `ingest/llama_ab_ingest.py` refuses that
+result with no waiver.
 
 **Interference measurement, and what it cannot see.** The figure is the change
 in a process's cumulative CPU time across a known window, taken per slot and
@@ -552,6 +576,28 @@ just another `--arm-a` / `--arm-b` argument and the harness does not change.
 with planted differences: it must report a planted ratio exactly, and must
 report nothing for two arms that are the same. It needs no GPU, no model and no
 metrics DB.
+
+**The selftest measures nothing, so it reads nothing.** Every case passes
+`--synthetic-arms`, and the machine is then not consulted at all. Without that
+the suite inherited the harness's runtime preconditions for a property that has
+nothing to do with runtime: an `rmlx serve` left running on a developer machine
+failed 27 of the 48 cases it then had, and a `make ci` whose answer depends on
+what else the host is doing teaches everyone to re-run it until it goes green —
+the same damage as a gate that cannot fail, inverted. The cases whose subject *is* the
+host gating supply the whole machine as `ps` and `pgrep` shims on PATH, which
+the suite enforces rather than trusts. Every run prints how many cases took each
+route, **counted** — a case that could reach this machine is tallied and fails
+the suite, rather than the disposition line asserting a hand-typed zero.
+`bench_llama_ab_selftest.sh` carries the same boundary and the same tally;
+there `ps` is the whole host surface (that harness has no exclusivity gate), and
+the shim hands `ps -o rss= -p <pid>` back to the real `ps`, because that form is
+the harness measuring its own arm rather than the host.
+
+`bash scripts/perf_ab_host_gate_fixtures.sh` (`make canary-ab-host-gate-fixtures`,
+also in `make ci`) pins that boundary from both sides: the quiescence and
+Metal-exclusivity gates still refuse a shimmed hostile host, a hostile and a
+quiet host produce the *same* verdict under `--synthetic-arms` — compared as
+text, not merely asserted green — and the flag waives no arm-reading guard.
 
 **Canary protocol**:
 - Profile: `release-perf` (debug-assertions=false, overflow-checks=false, stripped)

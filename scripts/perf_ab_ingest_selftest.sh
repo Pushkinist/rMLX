@@ -64,7 +64,8 @@ res = {
     "arm_a": arm("none", "--kv-quant none"),
     "arm_b": arm("mixed", "--kv-quant mixed_k8g64_v4g64"),
     "waivers": {"null_arms": False, "busy_host": False,
-                "token_divergence": False, "busy_pct_raised": False},
+                "token_divergence": False, "busy_pct_raised": False,
+                "synthetic_arms": False},
     "results": [{"model": "snap", "prompt_tokens": 3770,
                  "arm_a": cell_arm(), "arm_b": cell_arm(),
                  "ratio_b_over_a": 1.0, "kv_cache_ratio_b_over_a": 1.0,
@@ -149,6 +150,18 @@ check raised_busy_pct_refused 2 \
 check waivers_reach_notes 0 \
 	"a waived guard is named in the recorded notes" "$WAIVED" \
 	--accept-tainted "GREP:guards waived: busy_pct_raised"
+
+# A stub-armed run is not a measurement taken badly; it is not a measurement.
+# The refusal therefore has no waiver, and the second case is the one that
+# matters: --accept-tainted must not reach it.
+SYNTHETIC="$(make_result synthetic '{"waivers.synthetic_arms": true}')"
+check synthetic_arms_refused 2 \
+	"a run whose arms were stub binaries is refused" "$SYNTHETIC" \
+	"GREP:stub binaries"
+
+check synthetic_arms_has_no_waiver 2 \
+	"--accept-tainted does not turn a stub run into a measurement" "$SYNTHETIC" \
+	--accept-tainted "GREP:no waiver for this"
 
 # --- identity ----------------------------------------------------------------
 

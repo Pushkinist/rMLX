@@ -70,3 +70,35 @@ cpu_snapshot() {
 	fi
 	return 0
 }
+
+# Take a snapshot into $1 and record WHY it holds nothing when it holds nothing.
+# The three outcomes are different facts and a caller that cannot tell them
+# apart is how an interference gate stops gating:
+#
+#   taken            the file has the process table in it
+#   $1.failed        `ps` failed, was blocked or was truncated -- not knowing
+#   $1.not-sampled   nobody looked, because the caller set SYNTHETIC_ARMS
+#
+# `SYNTHETIC_ARMS` is the shared boundary between an A/B harness that MEASURES
+# and one exercising its own logic against stub arms. A stub arm is not a
+# workload, so no fact about this machine belongs in that run's answer -- and a
+# gate whose result depends on what else the machine is doing teaches everyone
+# to re-run it until it goes green. Both harnesses (`perf_ab.sh`,
+# `bench_llama_ab.sh`) set it from their own `--synthetic-arms` flag; it is read
+# here and in each harness's window classifier, via `window_not_sampled`.
+snapshot_ok() {
+	if ${SYNTHETIC_ARMS:-false}; then
+		: >"$1.not-sampled"
+		return 0
+	fi
+	if cpu_snapshot "$1"; then
+		return 0
+	fi
+	: >"$1.failed"
+	return 1
+}
+
+# True when the window between snapshots $1 and $2 was deliberately not sampled.
+window_not_sampled() {
+	[ -e "$1.not-sampled" ] || [ -e "$2.not-sampled" ]
+}

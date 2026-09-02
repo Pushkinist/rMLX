@@ -59,11 +59,12 @@ Conventions:
 
 | Script | Via | What it does |
 |---|---|---|
-| `perf_ab.sh` | `perf_canary.sh --ab` | **ABBA-interleaved A/B of two `rmlx baseline` arms.** Host-quiescence gate, arm-distinguishability guard, token-id comparison, per-arm `metal_gen_alloc_mb` + resident `kv_cache_bytes`. Never writes `runs.db` — promote a result with `ingest/perf_ab_ingest.py`. |
-| `perf_ab_selftest.sh` | `make canary-ab-selftest` | Mutation check for `perf_ab.sh` — every guard must fail when broken. |
-| `perf_ab_ingest_selftest.sh` | `make canary-ab-ingest-selftest` | Mutation check for `ingest/perf_ab_ingest.py` — 15 cases over synthetic result files, one per refusal. Never writes `runs.db`. In `make ci`. |
-| `bench_llama_ab_selftest.sh` | `make llama-ab-selftest` | Mutation check for `bench_llama_ab.sh` against a stub `llama-server` — 13 cases, one per guard. In `make ci`. |
-| `bench_llama_ab.sh` | — | **ABBA-interleaved A/B of two `llama-server` arms** (fork vs upstream, codec vs codec). Same quiescence discipline as `perf_ab.sh`, reported over the server's own `timings` plus KV-buffer and peak-RSS columns. Never writes `runs.db`. |
+| `perf_ab.sh` | `perf_canary.sh --ab` | **ABBA-interleaved A/B of two `rmlx baseline` arms.** Host-quiescence gate, Metal-exclusivity gate, arm-distinguishability guard, token-id comparison, per-arm `metal_gen_alloc_mb` + resident `kv_cache_bytes`. `--synthetic-arms` declares the arms are stubs, so the run measures nothing and the machine is not consulted. Never writes `runs.db` — promote a result with `ingest/perf_ab_ingest.py`, which refuses a `--synthetic-arms` run outright. |
+| `perf_ab_selftest.sh` | `make canary-ab-selftest` | Mutation check for `perf_ab.sh` — every guard must fail when broken. Runs under `--synthetic-arms`, so no case reads this machine; the host-gate cases supply `ps` and `pgrep` shims, and the count of cases that could reach this host is tallied and must be zero. In `make ci`. |
+| `perf_ab_host_gate_fixtures.sh` | `make canary-ab-host-gate-fixtures` | Recall test for the measurement/logic boundary: the host gates still fire on a shimmed hostile host, `--synthetic-arms` makes the verdict identical on a hostile and a quiet one, and it waives no arm-reading guard. In `make ci`. |
+| `perf_ab_ingest_selftest.sh` | `make canary-ab-ingest-selftest` | Mutation check for `ingest/perf_ab_ingest.py` — 17 cases over synthetic result files, one per refusal. Never writes `runs.db`. In `make ci`. |
+| `bench_llama_ab_selftest.sh` | `make llama-ab-selftest` | Mutation check for `bench_llama_ab.sh` against a stub `llama-server` — 19 cases, one per guard. Every case declares `--synthetic-arms` and asserts a literal exit code; the taint-path and quiescence-gate cases supply a `ps` shim, and the count of cases that could reach this host is tallied and must be zero. In `make ci`. |
+| `bench_llama_ab.sh` | — | **ABBA-interleaved A/B of two `llama-server` arms** (fork vs upstream, codec vs codec). Same quiescence discipline as `perf_ab.sh` and the same `--synthetic-arms` boundary, both from `lib/cpu_snapshot.sh`, reported over the server's own `timings` plus KV-buffer and peak-RSS columns. Never writes `runs.db`. |
 | `perf_canary.sh` | `make perf-canary` | Fast decode-TPS canary over the three standard test-target models. |
 | `regression_gate.sh` | — | Compare a committed baseline against the latest canary row. Exit 125 = `git bisect skip`, 1 = regression. |
 | `perf-iter/bench_decode_tps.sh` | — | Per-iteration regression bench for a perf-fix campaign. |
@@ -99,8 +100,8 @@ Conventions:
 | Script | What it does |
 |---|---|
 | `ingest/llama_bench_ingest.py` | Convert `llama-bench -o json` rows into the §8.5 universal RunRecord and ingest them. |
-| `ingest/llama_ab_ingest.py` | Promote one accepted `bench_llama_ab.sh` result into two §8.5 RunRecords (one per arm). Refuses a TAINTED run unless told otherwise. |
-| `ingest/perf_ab_ingest.py` | Promote one accepted `perf_ab.sh` result into two §8.5 RunRecords (one per arm), carrying `decode_tps_warm` + `kv_cache_bytes`. Identity comes from the measured binary and is digest-checked against the run; refuses a TAINTED run, a weakened interference gate, or a cell key that disagrees with the measurement. |
+| `ingest/llama_ab_ingest.py` | Promote one accepted `bench_llama_ab.sh` result into two §8.5 RunRecords (one per arm). Refuses a TAINTED run unless told otherwise, and a `--synthetic-arms` run with no waiver at all. |
+| `ingest/perf_ab_ingest.py` | Promote one accepted `perf_ab.sh` result into two §8.5 RunRecords (one per arm), carrying `decode_tps_warm` + `kv_cache_bytes`. Identity comes from the measured binary and is digest-checked against the run; refuses a TAINTED run, a weakened interference gate, or a cell key that disagrees with the measurement, and refuses a `--synthetic-arms` run with no waiver at all. |
 | `ingest/codec_inertness_ingest.py` | Promote `bench/codec_inertness_probe.sh` cells into §8.5 RunRecords. Records `kv_cache_bytes` only — the probe's unpaired throughput columns are not comparable and are deliberately dropped; the token-id digest travels in `notes`. |
 | `lib/identity.sh` | Shared §8.5 run-identity (`rmlx metrics identity --json`) for bench scripts. **Source it.** |
 | `lib/prefill_ms.py` | Read `decode_profile{prefill_ms}` back out of an rmlx run log. |
@@ -127,7 +128,7 @@ Conventions:
 | `target_gc.sh` | `make target-gc` | Prune stale build profiles from `target/`. |
 | `lib/env.sh` | — | Load repo `.env`, validate `RMLX_O_MODELS_ROOT`. **Source it.** |
 | `lib/mlx_pin.sh` | — | Parse `crates/rmlx-mlx/mlx-pin.txt` (same grammar as `parse_pin`, version shape allowlisted). **Source it.** |
-| `lib/cpu_snapshot.sh` | — | Per-process cumulative CPU seconds, for interference gates. **Source it.** |
+| `lib/cpu_snapshot.sh` | — | Per-process cumulative CPU seconds, for interference gates, plus the `snapshot_ok` / `window_not_sampled` pair that both A/B harnesses share: it separates "nobody looked" (`--synthetic-arms`) from "the look failed" from a quiet host. **Source it.** |
 | `lib/busiest_between.awk` | — | Which process burned the most CPU between two `cpu_snapshot` files. |
 
 ## Release
