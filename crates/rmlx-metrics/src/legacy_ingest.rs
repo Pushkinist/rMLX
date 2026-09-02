@@ -184,6 +184,7 @@ impl LegacyRunRecord {
             output_first_64,
             notes: Some("ingested from legacy buffer (schema pre-§8.5)".to_string()),
             description: None,
+            decode_config: None,
             metrics,
         })
     }
@@ -367,6 +368,7 @@ impl LegacyCbbRecord {
                 None => "ingested from CBB May-10 buffer (compound weight_quant)".to_string(),
             }),
             description: self.description,
+            decode_config: None,
             metrics: self.metrics,
         })
     }

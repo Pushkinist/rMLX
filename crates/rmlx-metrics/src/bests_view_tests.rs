@@ -43,6 +43,7 @@ fn make_run(metric: &str, value: f64, kv_quant: &str) -> RunRecord {
         output_first_64: None,
         notes: None,
         description: None,
+        decode_config: None,
         metrics: vec![MetricEntry {
             name: metric.into(),
             value: Some(value),
@@ -207,4 +208,71 @@ fn generated_predicate_renders_the_registry_bound() {
 #[test]
 fn read_side_predicate_is_the_view_predicate() {
     assert!(super::create_sql().contains(&super::plausible_sql("value")));
+}
+
+/// A speculative-decode arm must not take the champion cell of a plain-decode
+/// one. The drafter's rate is not a better measurement of the same thing — it
+/// answers a different question, and largest-wins only means something inside
+/// one configuration.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "in-memory DB and fixed fixtures: every step is infallible by construction"
+)]
+fn a_speculative_arm_does_not_win_the_plain_decode_cell() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.1.0");
+        rec.record_run(&make_run("decode_tps_warm", 142.5, "k8v8"))
+            .unwrap();
+        let mut spec = make_run("decode_tps_warm", 275.7, "k8v8");
+        spec.decode_config = Some("mtp/block=5".into());
+        rec.record_run(&spec).unwrap();
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT decode_config, value FROM bests
+             WHERE metric = 'decode_tps_warm' ORDER BY value",
+        )
+        .unwrap();
+    let cells: Vec<(Option<String>, f64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(
+        cells,
+        vec![(None, 142.5), (Some("mtp/block=5".to_string()), 275.7),],
+        "each configuration keeps its own champion"
+    );
+}
+
+/// Two arms of the same configuration still rank against each other — the
+/// partition separates configurations, not measurements.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "in-memory DB and fixed fixtures: every step is infallible by construction"
+)]
+fn the_same_configuration_still_ranks_largest_first() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.1.0");
+        for value in [142.5, 151.0] {
+            let mut run = make_run("decode_tps_warm", value, "k8v8");
+            run.decode_config = Some("mtp/block=5".into());
+            rec.record_run(&run).unwrap();
+        }
+    }
+
+    let winner: f64 = conn
+        .query_row(
+            "SELECT value FROM bests WHERE metric = 'decode_tps_warm'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!((winner - 151.0).abs() < 1e-9, "got {winner}");
 }

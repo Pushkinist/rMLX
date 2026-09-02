@@ -40,6 +40,7 @@ fn base_run() -> RunRecord {
         output_first_64: Some("hello world".into()),
         notes: Some("auto-summary".into()),
         description: Some("abc1234: test run".into()),
+        decode_config: None,
         metrics: vec![
             MetricEntry {
                 name: "decode_tps_warm".into(),

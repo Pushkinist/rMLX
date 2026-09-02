@@ -77,6 +77,10 @@ TEMPERATURE=0
 SEED=42
 DRAFT_KIND="mtp"
 DRAFT_BLOCK_SIZE=5
+# Empty means "let the engine resolve one", which it always does and always
+# names in its startup log. Either way the recorded kv_quant is read back from
+# that log, never assumed here. Set with --kv-quant.
+KV_QUANT=""
 HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
 # How far the client-observed decode window may sit from the engine's own
 # reading of the same window before the run is refused. One network hop on
@@ -85,6 +89,7 @@ CROSS_CHECK_BAND_PCT=10
 
 DRY_RUN=false
 BENCH_TAG=""
+KV_QUANT_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=true; shift ;;
@@ -92,9 +97,15 @@ while [[ $# -gt 0 ]]; do
         --port) shift; PORT="${1:?--port requires a value}"; shift ;;
         --tag=*) BENCH_TAG="${1#--tag=}"; shift ;;
         --tag) shift; BENCH_TAG="${1:?--tag requires a value}"; shift ;;
+        --kv-quant=*) KV_QUANT="${1#--kv-quant=}"; shift ;;
+        --kv-quant) shift; KV_QUANT="${1:?--kv-quant requires a value}"; shift ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
+
+if [[ -n "${KV_QUANT}" ]]; then
+    KV_QUANT_ARGS=(--kv-quant "${KV_QUANT}")
+fi
 
 # ── Prompt body ───────────────────────────────────────────────────────────────
 #
@@ -134,6 +145,9 @@ print(json.dumps({
     "temperature": float(os.environ["TEMPERATURE"]),
     "seed": int(os.environ["SEED"]),
     "stream": True,
+    # The prompt length recorded with the run is the one the server counted,
+    # and it only says so when asked.
+    "stream_options": {"include_usage": True},
 }))
 '
 )
@@ -221,6 +235,27 @@ field_of() {
     echo "${block}" | sed -n "s/^${key}=//p" | tail -1
 }
 
+# Which run logs exist right now. Called before a phase starts its server.
+snapshot_logs() {
+    { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
+        > "${SCRATCH_DIR}/logs_before"
+}
+
+# The run log this phase's server created — the one that was not there before
+# it started. Identity, not mtime: a log the phase never wrote can be the most
+# recently *modified* file for reasons that have nothing to do with this run,
+# and reading spec metrics out of the wrong file is not detectable afterwards.
+phase_log() {
+    { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
+        > "${SCRATCH_DIR}/logs_after"
+    comm -13 "${SCRATCH_DIR}/logs_before" "${SCRATCH_DIR}/logs_after" | tail -1
+}
+
+# The KV codec that log says the run resolved. Empty when it does not say.
+log_kv_quant() {
+    field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_kv_quant.py" "$1")" kv_quant
+}
+
 # How many ITL samples the server has recorded so far.
 ring_len() {
     field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_decode_tps.py" \
@@ -281,7 +316,13 @@ stddev() {
 
 # Emit a §8.5 RunRecord JSON and ingest it.
 # Args: config_name decode_tps stddev accept_rate draft_tokens_total
-#        accept_tokens_total draft_rounds_total accepted_per_step output_preview kv_quant
+#        accept_tokens_total draft_rounds_total accepted_per_step output_preview
+#        kv_quant prompt_tokens
+#
+# `kv_quant` and `prompt_tokens` are measured facts about the run, not settings
+# this script may assume: the codec is whatever the engine resolved and said so
+# in its log, and the prompt length is whatever the server counted. A record
+# missing either is refused rather than filed under a guess.
 emit_and_ingest() {
     local config="$1"
     local decode_tps="$2"
@@ -292,7 +333,17 @@ emit_and_ingest() {
     local draft_rounds_total="$7"
     local accepted_per_step="$8"
     local preview="$9"
-    local kv_quant="${10:-k8v8}"
+    local kv_quant="${10}"
+    local prompt_tokens="${11}"
+
+    if [[ -z "${kv_quant}" ]]; then
+        echo "ERROR: ${config}: the run did not report which KV codec it resolved" >&2
+        return 1
+    fi
+    if [[ -z "${prompt_tokens}" ]]; then
+        echo "ERROR: ${config}: the server reported no prompt_tokens for this run" >&2
+        return 1
+    fi
 
     local ts_utc
     ts_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -311,6 +362,7 @@ emit_and_ingest() {
         BENCH_ACCEPTED_PER_STEP="${accepted_per_step}" \
         BENCH_PREVIEW="${preview}" \
         BENCH_KV_QUANT="${kv_quant}" \
+        BENCH_PROMPT_TOKENS="${prompt_tokens}" \
         BENCH_TS_UTC="${ts_utc}" \
         BENCH_GIT_SHA="${GIT_SHA}" \
         BENCH_HARDWARE_TAG="${HARDWARE_TAG}" \
@@ -337,6 +389,7 @@ draft_rounds_total = int(os.environ["BENCH_DRAFT_ROUNDS_TOTAL"])
 accepted_per_step = float(os.environ["BENCH_ACCEPTED_PER_STEP"])
 preview = os.environ["BENCH_PREVIEW"]
 kv_quant = os.environ["BENCH_KV_QUANT"]
+prompt_tokens = int(os.environ["BENCH_PROMPT_TOKENS"])
 ts_utc = os.environ["BENCH_TS_UTC"]
 git_sha = os.environ["BENCH_GIT_SHA"]
 hardware_tag = os.environ["BENCH_HARDWARE_TAG"]
@@ -383,8 +436,11 @@ obj = {
         "name": prompt_name,
         "body": prompt_body,
     },
+    # The bests cell key partitions on this: a speculative arm is a different
+    # configuration, not a better measurement of the plain-decode one.
+    "decode_config": None if config == "normal" else f"{draft_kind}/block={draft_block_size}",
     "ts_utc": ts_utc,
-    "prompt_tokens": 14,
+    "prompt_tokens": prompt_tokens,
     "max_tokens": max_tokens,
     "temperature": temperature,
     "seed": seed,
@@ -439,15 +495,14 @@ echo ""
 
 preflight
 
-# Timestamp reference file for finding the new log.
-touch "${SCRATCH_DIR}/ts_ref"
-sleep 1
+snapshot_logs
 
 echo "  [server] starting..." >&2
 RMLX_HOME="${RMLX_HOME}" \
 RMLX_LOG_CAP_MB=200 \
     "${BINARY}" serve \
         --model "${VERIFIER_MODEL}" \
+        ${KV_QUANT_ARGS[@]+"${KV_QUANT_ARGS[@]}"} \
         --port "${PORT}" \
         --log info \
         > "${SCRATCH_DIR}/normal_stdout.txt" 2>&1 &
@@ -456,9 +511,6 @@ SERVER_PID=$!
 echo "  [server] pid=${SERVER_PID}" >&2
 
 wait_for_server
-
-# Update ref timestamp after server is up.
-touch "${SCRATCH_DIR}/ts_ref"
 
 echo "  [normal] warmup..." >&2
 for i in $(seq 1 ${WARMUP_RUNS}); do
@@ -480,6 +532,7 @@ for i in $(seq 1 ${MEASURED_RUNS}); do
     N_TOKENS="$(field_of "${RUN_BLOCK}" tokens)"
     CLIENT_TPS="$(field_of "${RUN_BLOCK}" decode_tps)"
     PREVIEW="$(field_of "${RUN_BLOCK}" preview)"
+    NORMAL_PROMPT_TOKENS="$(field_of "${RUN_BLOCK}" prompt_tokens)"
 
     if [[ -z "${CLIENT_TPS}" ]]; then
         echo "ERROR: normal run ${i} produced no measurable decode window" \
@@ -503,6 +556,13 @@ for i in $(seq 1 ${MEASURED_RUNS}); do
     echo "  [normal] run ${i}: tokens=${N_TOKENS} decode_tps=${ENGINE_TPS}" \
          "(client-observed: ${CLIENT_TPS})" >&2
 
+    if [[ -z "${NORMAL_PROMPT_TOKENS}" ]]; then
+        echo "ERROR: normal run ${i}: the response carried no usage.prompt_tokens," \
+             "so the prompt length is not a measured fact" >&2
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
     NORMAL_ENGINE_TPS_VALUES+=("${ENGINE_TPS}")
     NORMAL_CLIENT_TPS_VALUES+=("${CLIENT_TPS}")
     [[ -n "${PREVIEW}" ]] && NORMAL_PREVIEW="${PREVIEW}"
@@ -513,6 +573,14 @@ echo "  [server] killing pid=${SERVER_PID}" >&2
 kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
 sleep 3
+
+NORMAL_LOG="$(phase_log)"
+if [[ -z "${NORMAL_LOG}" ]]; then
+    echo "ERROR: the no-drafter server left no new run log in ${LOG_DIR}" >&2
+    exit 1
+fi
+NORMAL_KV_QUANT="$(log_kv_quant "${NORMAL_LOG}")" || NORMAL_KV_QUANT=""
+echo "  [normal] resolved kv_quant=${NORMAL_KV_QUANT:-<unreported>}" >&2
 
 if [[ ${#NORMAL_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
     echo "ERROR: ${#NORMAL_ENGINE_TPS_VALUES[@]} normal decode rates for" \
@@ -538,7 +606,8 @@ NORMAL_BUF_PATH=$(emit_and_ingest \
     "0" \
     "0.0" \
     "${NORMAL_PREVIEW}" \
-    "k8v8")
+    "${NORMAL_KV_QUANT}" \
+    "${NORMAL_PROMPT_TOKENS}")
 
 echo ""
 echo "==> Phase 1 complete. Median decode TPS: ${NORMAL_MEDIAN_TPS}"
@@ -551,8 +620,7 @@ echo ""
 
 preflight
 
-touch "${SCRATCH_DIR}/ts_ref"
-sleep 1
+snapshot_logs
 
 echo "  [server] starting MTP server..." >&2
 RMLX_HOME="${RMLX_HOME}" \
@@ -562,6 +630,7 @@ RMLX_LOG_CAP_MB=200 \
         --draft-model "${DRAFTER_MODEL}" \
         --draft-kind "${DRAFT_KIND}" \
         --draft-block-size "${DRAFT_BLOCK_SIZE}" \
+        ${KV_QUANT_ARGS[@]+"${KV_QUANT_ARGS[@]}"} \
         --port "${PORT}" \
         --log info \
         > "${SCRATCH_DIR}/mtp_stdout.txt" 2>&1 &
@@ -571,21 +640,12 @@ echo "  [server] pid=${SERVER_PID}" >&2
 
 wait_for_server
 
-touch "${SCRATCH_DIR}/ts_ref"
-sleep 1
-
 echo "  [mtp] warmup..." >&2
 for i in $(seq 1 ${WARMUP_RUNS}); do
     measured_request "${SCRATCH_DIR}/warmup_resp.txt" > /dev/null || true
     echo "  [mtp] warmup ${i} done" >&2
     sleep 5
 done
-
-# Re-touch the ref so the log search picks this server's file, not the previous
-# phase's. Which events in it are the measured ones is settled by the counts
-# spec_round_log.py is given, not by this timestamp.
-touch "${SCRATCH_DIR}/ts_ref"
-sleep 1
 
 echo "  [mtp] measured runs..." >&2
 MTP_CLIENT_TPS_VALUES=()
@@ -598,6 +658,7 @@ for i in $(seq 1 ${MEASURED_RUNS}); do
     N_TOKENS="$(field_of "${RUN_BLOCK}" tokens)"
     CLIENT_TPS="$(field_of "${RUN_BLOCK}" decode_tps)"
     PREVIEW="$(field_of "${RUN_BLOCK}" preview)"
+    MTP_PROMPT_TOKENS="$(field_of "${RUN_BLOCK}" prompt_tokens)"
 
     if [[ -z "${CLIENT_TPS}" ]]; then
         echo "ERROR: mtp run ${i} produced no measurable decode window" \
@@ -609,6 +670,13 @@ for i in $(seq 1 ${MEASURED_RUNS}); do
 
     echo "  [mtp] run ${i}: tokens=${N_TOKENS} client_decode_tps=${CLIENT_TPS}" >&2
 
+    if [[ -z "${MTP_PROMPT_TOKENS}" ]]; then
+        echo "ERROR: mtp run ${i}: the response carried no usage.prompt_tokens," \
+             "so the prompt length is not a measured fact" >&2
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
     MTP_CLIENT_TPS_VALUES+=("${CLIENT_TPS}")
     [[ -n "${PREVIEW}" ]] && MTP_PREVIEW="${PREVIEW}"
     sleep 5
@@ -619,17 +687,20 @@ kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
 sleep 3
 
-# Find the MTP server's JSONL log (the most recent one).
+# The log this phase's server created. No fallback to "the newest one": a
+# different file would be read as this run's, and every number taken from it
+# would be somebody else's with nothing to show for it.
 sleep 2  # let log flush
-MTP_LOG=$(find "${LOG_DIR}" -name "*.jsonl" -newer "${SCRATCH_DIR}/ts_ref" \
-    2>/dev/null | sort | tail -1)
-
+MTP_LOG="$(phase_log)"
 if [[ -z "${MTP_LOG}" ]]; then
-    echo "  WARN: could not find MTP log file after timestamp; trying latest overall" >&2
-    MTP_LOG=$(ls -t "${LOG_DIR}"/*.jsonl 2>/dev/null | head -1)
+    echo "ERROR: the MTP server left no new run log in ${LOG_DIR}" >&2
+    exit 1
 fi
 
 echo "  [mtp] parsing spec metrics from: ${MTP_LOG}" >&2
+
+MTP_KV_QUANT="$(log_kv_quant "${MTP_LOG}")" || MTP_KV_QUANT=""
+echo "  [mtp] resolved kv_quant=${MTP_KV_QUANT:-<unreported>}" >&2
 
 # Round counts, draft/accept totals and the engine's own decode rate all come
 # off the round-loop `done` line, and scripts/lib/spec_round_log.py is the only
@@ -686,7 +757,8 @@ MTP_BUF_PATH=$(emit_and_ingest \
     "${MTP_ROUNDS_TOTAL}" \
     "${MTP_ACCEPTED_PER_STEP}" \
     "${MTP_PREVIEW}" \
-    "k8v8")
+    "${MTP_KV_QUANT}" \
+    "${MTP_PROMPT_TOKENS}")
 
 echo ""
 echo "==> Phase 2 complete. Median decode TPS: ${MTP_MEDIAN_TPS}"

@@ -41,6 +41,7 @@ fn seed_one(conn: &mut Connection, value: f64, description: Option<&str>) {
         output_first_64: None,
         notes: None,
         description: description.map(ToOwned::to_owned),
+        decode_config: None,
         metrics: vec![MetricEntry {
             name: "decode_tps_warm".into(),
             value: Some(value),
@@ -88,6 +89,7 @@ fn seed_named(
         output_first_64: None,
         notes: None,
         description: None,
+        decode_config: None,
         metrics: vec![MetricEntry {
             name: metric.into(),
             value: Some(value),

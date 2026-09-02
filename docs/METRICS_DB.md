@@ -125,6 +125,7 @@ CREATE TABLE observations (
     ctx_max          INTEGER NOT NULL,             -- server max-ctx setting at run time
     prompt_id        INTEGER NOT NULL REFERENCES prompts(id),
     metric           TEXT    NOT NULL,             -- see §4 metric registry
+    decode_config    TEXT,                         -- how the tokens were produced; NULL = ordinary decode, e.g. 'mtp/block=5' (migration 005)
     -- value
     value            REAL    NOT NULL,             -- numeric measurement
     unit             TEXT    NOT NULL,             -- 'tps', 'ms', 'mb', 'bytes', 'count', 'ratio'
@@ -154,7 +155,7 @@ CREATE TABLE observations (
     inserted_by      TEXT    NOT NULL              -- audit: tool@semver
 );
 
-CREATE INDEX obs_cell_idx       ON observations(backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id, metric);
+CREATE INDEX obs_cell_idx       ON observations(backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id, metric, decode_config);
 CREATE INDEX obs_metric_idx     ON observations(metric);
 CREATE INDEX obs_ts_idx         ON observations(ts_utc);
 CREATE INDEX obs_git_sha_idx    ON observations(git_sha);
@@ -162,6 +163,15 @@ CREATE INDEX obs_run_id_idx     ON observations(run_id);
 CREATE INDEX obs_backend_idx    ON observations(backend);
 CREATE INDEX obs_inserted_idx   ON observations(inserted_utc);
 ```
+
+**`decode_config` is cell identity, not context.** A speculative-decode arm and
+a plain-decode arm of one model at one quant and one prompt are not two
+measurements of the same thing — the drafter changes what produced the tokens,
+and ranking one against the other publishes the drafter's rate as the model's
+decode throughput. It is `NULL` for ordinary decode, which is also what every
+row written before migration 005 carries, so legacy plain-decode rows keep
+their cells unchanged. The population that column cannot sort out — speculative
+rows written before it existed — is named in §4.1.
 
 **No PK on the cell columns.** A cell can have N observations over time — that's the whole point. PK is the surrogate `id`.
 
@@ -175,7 +185,7 @@ WITH ranked AS (
     SELECT
         o.*,
         ROW_NUMBER() OVER (
-            PARTITION BY backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id, metric
+            PARTITION BY backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id, metric, decode_config
             ORDER BY
                 CASE WHEN direction = 'higher_better' THEN  value END DESC,
                 CASE WHEN direction = 'lower_better'  THEN -value END DESC,
@@ -579,6 +589,20 @@ because nothing enforces it.
   they are identified only by `ts_utc` predating this change, which is why the
   marker exists from here on. Re-measuring out-ranks any of them on merit only
   where the corrected number is larger.
+- **`spec_bench.sh` rows labelled `kv_quant = 'k8v8'` with `prompt_tokens = 14`**
+  — the same rows, from the other direction. That script wrote both as
+  constants: it started its server with no `--kv-quant` and recorded `k8v8`
+  regardless, while the engine resolved `none` and said so in its startup log,
+  and it recorded a 14-token prompt for all three prompt files it is run with.
+  So those rows are filed under a codec the run did not use, at a prompt length
+  it did not have, and no re-measurement can out-rank them because a correctly
+  labelled run lands in a different cell. Both fields are now read back from the
+  run — the codec from the `cache-type resolved` event, the length from the
+  response's `usage.prompt_tokens` — and a run reporting neither is refused
+  rather than recorded. The predicate is
+  `description LIKE 'spec_bench%' AND kv_quant = 'k8v8' AND prompt_tokens = 14`;
+  no correctly-labelled row can match it, because the script no longer emits
+  either constant.
 
 Anything anchoring on a recorded rate — a roofline, a champion table, a
 `rmlx metrics rank` — should read `bests`, or one of the `query::*` functions,
@@ -1130,6 +1154,7 @@ Single JSON object per run. The recorder fans out into N `observations` rows (on
   "weight_quant":    "mxfp8",
   "kv_quant":        "k8v8",
   "ctx_max":         8192,
+  "decode_config":   null,
   "prompt": {
     "name":  "longctx_4k",
     "body":  "You are an expert ...",
@@ -1176,6 +1201,10 @@ Single JSON object per run. The recorder fans out into N `observations` rows (on
 **Optional fields** (recorder accepts missing or null):
 
 `schema_version` (defaults to 1), `git_sha`, `build_profile`, `prompt_tokens`, `max_tokens`, `temperature`, `seed`, `n_warmups`, `n_measure`, `output_first_64`, `notes`, `description`. Also `backend_version` — but only for non-rMLX backends (§8.5.1).
+
+`decode_config` is optional but is **cell identity, not context** (§3.2): absent
+or null means ordinary decode, and an emitter measuring a speculative arm must
+set it or its rows land in the plain-decode cell and rank against it.
 
 ### 8.5.1 Run identity (hard rule)
 

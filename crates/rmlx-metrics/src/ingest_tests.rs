@@ -30,6 +30,7 @@ fn valid_record() -> RunRecord {
         output_first_64: None,
         notes: None,
         description: None,
+        decode_config: None,
         metrics: vec![MetricEntry {
             name: "decode_tps_warm".to_string(),
             value: Some(100.0),

@@ -52,6 +52,7 @@ fn make_run(
         output_first_64: None,
         notes: None,
         description: None,
+        decode_config: None,
         metrics: vec![MetricEntry {
             name: metric.into(),
             value: Some(value),

@@ -351,10 +351,15 @@ pub(crate) fn resolve_kv_quant(
         }
     };
 
+    // Display, not Debug: this is the one place a run states which codec it
+    // resolved, and a reader of the log has to get the same spelling the CLI
+    // accepts and the metrics DB records. `Debug` gives `None` for the `none`
+    // codec and a whole struct body for the parametric families, neither of
+    // which is that name.
     tracing::info!(
         arch = arch_class,
         head_dim = ?head_dim_opt,
-        kv_quant = ?final_kv_quant,
+        kv_quant = %final_kv_quant,
         "cache-type resolved"
     );
 

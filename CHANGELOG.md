@@ -49,6 +49,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the values sit inside the metric's plausible-value bound where no gate can
   reach them.
 
+- **A speculative-decode arm no longer takes the champion cell of a plain-decode
+  one.** The `bests` cell key named what was measured but nothing about how the
+  tokens were produced, so a drafter's rate and a plain rate for the same model,
+  quant and prompt ranked against each other and the larger published as that
+  model's decode throughput — 276 tok/s standing in for the 142 a request
+  without a drafter gets. Migration 005 adds `observations.decode_config` and
+  the view partitions on it; `NULL` is ordinary decode, which is what every
+  earlier row carries, so no existing plain-decode cell moves.
+
+- **`spec_bench.sh` records the codec and prompt length the run actually had.**
+  It wrote `kv_quant = "k8v8"` and `prompt_tokens = 14` as constants while
+  starting its server with no `--kv-quant` at all — the engine resolved `none`
+  and said so — and while being run against three different prompt files. The
+  codec now comes from the run's `cache-type resolved` event and the length from
+  the response's `usage.prompt_tokens`; a run that reports neither is refused
+  rather than filed under a guess. That event now names the codec through
+  `Display` rather than `Debug`, so what it prints is the name the flag accepts
+  and the DB records instead of `None` or `Mixed { .. }`.
+
+- **`perf-iter/bench_decode_tps.sh` keeps its state under `<RMLX_HOME>`.** It
+  created `metrics/buffer/` relative to the working directory, so running it
+  from anywhere but the repo root left a stray tree there, and it stamped a
+  `git_sha` with a `-dirty` suffix — not a commit, and nothing can look the row's
+  code up by it. Identity comes from `lib/identity.sh` like every other bench
+  script, and a dirty tree now records no `git_sha` at all.
+
 ## [0.4.1] - 2026-09-02
 
 A patch release carrying one decode-path fix, one correction to what the

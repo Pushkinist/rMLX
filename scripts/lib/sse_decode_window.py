@@ -14,19 +14,28 @@ A response with fewer than two content chunks has no interval and no rate; the
 `decode_tps` line is then absent rather than zero, because a zero in that slot
 is averaged and ranked as a real throughput.
 
-The window is timed from chunk arrivals, so it is only a window over tokens if
-the tokens arrived one per chunk. When the response carries a usage block that
-disagrees with the number of content chunks, this refuses rather than reporting
-a rate that is low by the batching factor.
+The window is timed from content-chunk arrivals. A completion's token count is
+normally *larger* than that — a stop token is counted and carries no content —
+so the two disagreeing is not by itself a fault. More content chunks than
+counted tokens is: the two numbers are then describing different things and
+neither can be trusted, so that direction is refused.
+
+The opposite hazard, a server batching several tokens into one chunk, makes the
+window read low by the batching factor and is **not** detectable from these
+counts — a batched stream looks exactly like one with uncounted stop tokens.
+What catches it is the caller comparing this rate against the engine's own
+reading of the same window; see `scripts/spec_bench.sh`.
 
 Output (stdout), one `key=value` per line:
 
     tokens=<n>          completion tokens, from the usage chunk when present
+    content_chunks=<n>  chunks that carried text — the window's token count
+    prompt_tokens=<n>   from the usage chunk; omitted when it carried none
     decode_tps=<f>      omitted when the response has no measurable window
     preview=<text>      first 64 characters of the completion, newlines folded
 
-Exit codes: 0 — read; 2 — `--raw` could not be written; 3 — the tokens did not
-arrive one per chunk.
+Exit codes: 0 — read; 2 — `--raw` could not be written; 3 — more content chunks
+arrived than the completion had tokens.
 """
 
 import argparse
@@ -52,10 +61,11 @@ def read_stamped(stream):
 
 
 def parse(stamped):
-    """Content-chunk arrival times, the completion text, and any usage count."""
+    """Content-chunk arrival times, the completion text, and any usage counts."""
     arrivals = []
     text = []
     usage_tokens = None
+    prompt_tokens = None
     for arrival, line in stamped:
         line = line.strip()
         if not line.startswith("data:"):
@@ -74,25 +84,30 @@ def parse(stamped):
             arrivals.append(arrival)
             text.append(piece)
         usage = chunk.get("usage")
-        if isinstance(usage, dict) and "completion_tokens" in usage:
-            usage_tokens = usage["completion_tokens"]
-    return arrivals, "".join(text), usage_tokens
+        if isinstance(usage, dict):
+            if "completion_tokens" in usage:
+                usage_tokens = usage["completion_tokens"]
+            if "prompt_tokens" in usage:
+                prompt_tokens = usage["prompt_tokens"]
+    return arrivals, "".join(text), usage_tokens, prompt_tokens
 
 
 class ChunkCountMismatch(Exception):
-    """The response batched tokens into chunks, so arrivals cannot time them."""
+    """More content chunks arrived than the completion is said to have tokens."""
 
 
-def report(arrivals, text, usage_tokens):
+def report(arrivals, text, usage_tokens, prompt_tokens):
     """The `key=value` lines for one response."""
-    if usage_tokens is not None and usage_tokens != len(arrivals):
+    if usage_tokens is not None and len(arrivals) > usage_tokens:
         raise ChunkCountMismatch(
-            f"usage reports {usage_tokens} completion tokens against "
-            f"{len(arrivals)} content chunks; chunk arrivals can only time a "
-            "window whose tokens arrived one per chunk"
+            f"{len(arrivals)} content chunks arrived for a completion of "
+            f"{usage_tokens} tokens; a chunk cannot carry less than a token, so "
+            "these two counts are not describing the same stream"
         )
     tokens = usage_tokens if usage_tokens is not None else len(arrivals)
-    lines = [f"tokens={tokens}"]
+    lines = [f"tokens={tokens}", f"content_chunks={len(arrivals)}"]
+    if prompt_tokens is not None:
+        lines.append(f"prompt_tokens={prompt_tokens}")
     if len(arrivals) >= 2:
         window = arrivals[-1] - arrivals[0]
         if window > 0:
@@ -122,7 +137,7 @@ def main():
 
         stamped = tee(stamped)
 
-    arrivals, text, usage_tokens = parse(stamped)
+    arrivals, text, usage_tokens, prompt_tokens = parse(stamped)
 
     if args.raw:
         try:
@@ -133,7 +148,7 @@ def main():
             return 2
 
     try:
-        lines = report(arrivals, text, usage_tokens)
+        lines = report(arrivals, text, usage_tokens, prompt_tokens)
     except ChunkCountMismatch as exc:
         print(f"sse_decode_window: {exc}", file=sys.stderr)
         return 3

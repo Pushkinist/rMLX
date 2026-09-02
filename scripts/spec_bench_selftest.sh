@@ -102,6 +102,7 @@ ITL_MEAN_OVERRIDE = os.environ.get("STUB_ITL_MEAN_MS", "")
 ITL_SUPPRESS = os.environ.get("STUB_ITL_SUPPRESS", "") == "1"
 ITL_SUPPRESS_AFTER = int(os.environ.get("STUB_ITL_SUPPRESS_AFTER", "-1"))
 USAGE_TOKENS = int(os.environ.get("STUB_USAGE_TOKENS", "-1"))
+PROMPT_TOKENS = int(os.environ.get("STUB_PROMPT_TOKENS", "-1"))
 BOUND_FLAG = os.environ.get("STUB_BOUND_FLAG", "")
 
 served = 0
@@ -192,7 +193,10 @@ class Handler(BaseHTTPRequestHandler):
             chunk({"choices": [{"delta": {"content": f"t{i} "}, "index": 0}]})
             sends.append(time.monotonic())
         reported = USAGE_TOKENS if USAGE_TOKENS >= 0 else TOKENS
-        chunk({"choices": [], "usage": {"completion_tokens": reported}})
+        usage = {"completion_tokens": reported}
+        if PROMPT_TOKENS >= 0:
+            usage["prompt_tokens"] = PROMPT_TOKENS
+        chunk({"choices": [], "usage": usage})
 
         push_itl(sends)
         if SPECULATIVE and LOG_PATH and (DONE_LINES < 0 or served < DONE_LINES):
@@ -240,6 +244,9 @@ serve)
 	done
 	log="\$RMLX_HOME/logs/\$(date +%s)-\$\$.jsonl"
 	: >"\$log"
+	if [ -z "\${STUB_KV_QUANT_SUPPRESS:-}" ]; then
+		printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"\${STUB_KV_QUANT:-mixed_k8g64_v4g64}\"}}" >>"\$log"
+	fi
 	export STUB_LOG="\$log" STUB_SPECULATIVE="\$speculative"
 	exec python3 "$SERVER_PY" "\$port"
 	;;
@@ -309,6 +316,7 @@ run_case() {
 		STUB_EMITTED=128 \
 		STUB_ELAPSED_MS=2560 \
 		STUB_DECODE_TPS_SEQ='"Some(20.0)"' \
+		STUB_PROMPT_TOKENS=1234 \
 		STUB_BOUND_FLAG="$CASE_HOME/stub_bound" \
 		${env_pairs[@]+"${env_pairs[@]}"} \
 		bash "$FAKE_ROOT/scripts/spec_bench.sh" --port "$PORT" >"$CASE_OUT" 2>&1
@@ -367,14 +375,22 @@ for m in rec.get("metrics", []):
         break' "$path" "$2"
 }
 
-# notes_of <config>
-notes_of() {
+# field_of_record <config> <top-level field> — "" when absent, "null" for JSON null.
+field_of_record() {
 	local path
 	path="$(record_of "$1")"
 	[ -z "$path" ] && return 0
-	python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("notes", ""))' \
-		"$path"
+	python3 -c 'import json, sys
+rec = json.load(open(sys.argv[1]))
+if sys.argv[2] not in rec:
+    print("")
+else:
+    v = rec[sys.argv[2]]
+    print("null" if v is None else v)' "$path" "$2"
 }
+
+# notes_of <config>
+notes_of() { field_of_record "$1" notes; }
 
 # close_to <got> <want> <tolerance-fraction>
 close_to() {
@@ -521,6 +537,66 @@ run_case cross_check_refuses_disagreement 1 \
 no_row normal
 verdict
 
+# The record's kv_quant has to be the codec the run resolved. Passing no
+# --kv-quant does not make it unknown: the engine resolves one and says so.
+run_case kv_quant_is_the_resolved_codec 0 \
+	"both rows carry the codec the run resolved" \
+	'STUB_KV_QUANT=mixed_k8g64_v4g64'
+[ "$(field_of_record mtp kv_quant)" = "mixed_k8g64_v4g64" ] ||
+	note_bad "mtp kv_quant=$(field_of_record mtp kv_quant)"
+[ "$(field_of_record normal kv_quant)" = "mixed_k8g64_v4g64" ] ||
+	note_bad "normal kv_quant=$(field_of_record normal kv_quant)"
+verdict
+
+run_case unreported_kv_quant_refused 1 \
+	"a run that never said which codec it used is not recorded" \
+	'STUB_KV_QUANT_SUPPRESS=1' \
+	'GREP:no .cache-type resolved. event'
+no_row normal
+no_row mtp
+verdict
+
+# `KvQuant` renders `None` / `K8V8` / `Mixed { .. }` under Debug and
+# `none` / `k8v8` / `mixed_...` under Display. Only the second is a name the
+# flag accepts and the DB records, so a log written the other way is refused
+# rather than filed under a cell nothing else reaches.
+run_case debug_spelled_kv_quant_refused 1 \
+	"a Debug-rendered codec name is refused" \
+	'STUB_KV_QUANT=K8V8' \
+	'GREP:Debug rendering'
+no_row normal
+no_row mtp
+verdict
+
+# The prompt length is what the server counted, not a constant in the script:
+# the same script runs three different prompt files.
+run_case prompt_tokens_is_measured 0 \
+	"both rows carry the prompt length the server counted" \
+	'STUB_PROMPT_TOKENS=1234'
+[ "$(field_of_record mtp prompt_tokens)" = "1234" ] ||
+	note_bad "mtp prompt_tokens=$(field_of_record mtp prompt_tokens)"
+[ "$(field_of_record normal prompt_tokens)" = "1234" ] ||
+	note_bad "normal prompt_tokens=$(field_of_record normal prompt_tokens)"
+verdict
+
+run_case missing_prompt_tokens_refused 1 \
+	"a response with no usage.prompt_tokens is not recorded" \
+	'STUB_PROMPT_TOKENS=-1' \
+	'GREP:no usage.prompt_tokens'
+no_row normal
+no_row mtp
+verdict
+
+# The bests cell key partitions on this, so the speculative arm has to say it
+# is one and the plain arm has to say it is not.
+run_case decode_config_names_the_arm 0 \
+	"the speculative row declares its arm and the plain one does not"
+[ "$(field_of_record mtp decode_config)" = "mtp/block=5" ] ||
+	note_bad "mtp decode_config=$(field_of_record mtp decode_config)"
+[ "$(field_of_record normal decode_config)" = "null" ] ||
+	note_bad "normal decode_config=$(field_of_record normal decode_config)"
+verdict
+
 # A round-loop record that reports no rate still counts as an event, so the
 # totals line up while one measured run has no reading. Aggregating whatever is
 # left would publish two runs' median under n_measure=3.
@@ -541,14 +617,23 @@ run_case stale_ring_entry_refused 1 \
 no_row normal
 verdict
 
-# Chunk arrivals only time tokens if the tokens arrived one per chunk. A server
-# that batched them would make the client window read low by the batching
-# factor, and the cross-check would then be comparing two different things.
-run_case batched_chunks_refused 1 \
-	"a response whose tokens did not arrive one per chunk is refused" \
+# More content chunks than the completion has tokens: a chunk cannot carry less
+# than a token, so the two counts are not describing the same stream.
+run_case impossible_chunk_count_refused 1 \
+	"more content chunks than tokens is refused" \
 	'STUB_USAGE_TOKENS=4' \
-	'GREP:arrived one per chunk'
+	'GREP:not describing the same stream'
 no_row normal
+verdict
+
+# The other direction is ordinary: a stop token is counted and carries no
+# content, so a real completion has more tokens than content chunks. Refusing
+# that would refuse every real run.
+run_case uncounted_content_tokens_accepted 0 \
+	"a completion with more tokens than content chunks is measured, not refused" \
+	'STUB_USAGE_TOKENS=10'
+got="$(metric_of normal value)"
+close_to "$got" 20.0 0.15 || note_bad "normal decode_tps_warm=$got (want ~20)"
 verdict
 
 # A response too short for the server to time leaves the ITL ring untouched, so

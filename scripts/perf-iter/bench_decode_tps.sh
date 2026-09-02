@@ -15,7 +15,8 @@
 #   WARMUP_RUNS  — warmup completions before measurement (default: 1)
 #   MEASURE_RUNS — completions to measure (default: 3); overridden by --repeat N
 #   RMLX_BIN    — path to rmlx binary (default: ./target/release/rmlx)
-#   METRICS_OUT  — JSONL file to append to (default: metrics/perf-iter/baseline.jsonl)
+#   METRICS_OUT  — JSONL file to append to
+#                  (default: <RMLX_HOME>/metrics/perf-iter/baseline.jsonl)
 #
 # Flags:
 #   --repeat N   — override MEASURE_RUNS (useful for stable per-finding numbers;
@@ -66,19 +67,24 @@ done
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH env var is required}"
 KV_QUANT="${KV_QUANT:?KV_QUANT env var is required (e.g. k8v8, k8v4, planar)}"
 PORT="${PORT:-62265}"
+# All on-disk state lives under one root (CLAUDE.md, "Runtime data root"), so
+# nothing here names `metrics` relative to the working directory — that is how
+# a run from a sub-directory leaves a stray tree behind.
+RMLX_HOME="${RMLX_HOME:-$PWD/.rmlx}"
+RMLX_METRICS_DIR="${RMLX_HOME}/metrics"
 MAX_CTX="${MAX_CTX:-8192}"
 WARMUP_RUNS="${WARMUP_RUNS:-1}"
 MEASURE_RUNS="${MEASURE_RUNS:-3}"
 # --repeat N flag overrides MEASURE_RUNS when provided.
 [[ -n "${_REPEAT_OVERRIDE}" ]] && MEASURE_RUNS="${_REPEAT_OVERRIDE}"
-METRICS_OUT="${METRICS_OUT:-metrics/perf-iter/baseline.jsonl}"
+METRICS_OUT="${METRICS_OUT:-${RMLX_METRICS_DIR}/perf-iter/baseline.jsonl}"
 
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
 COMPLETIONS_URL="http://127.0.0.1:${PORT}/v1/chat/completions"
 MODEL_ID="$(basename "${MODEL_PATH}")"
 
 # ── Buffer dirs (§8.4) ────────────────────────────────────────────────────────
-mkdir -p metrics/buffer/pending metrics/buffer/failed
+mkdir -p "${RMLX_METRICS_DIR}/buffer/pending" "${RMLX_METRICS_DIR}/buffer/failed"
 
 # ── Prompt fixture ─────────────────────────────────────────────────────────────
 # 32-token-ish prompt that is short enough to give clean decode TPS numbers.
@@ -92,17 +98,21 @@ MAX_TOKENS_WARMUP=10
 # ── Git metadata ──────────────────────────────────────────────────────────────
 
 _RMLX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# `git_sha` is a commit this run is attributed to, so a working tree with
+# uncommitted edits has none to give: `-dirty` is not a commit and nothing can
+# look the row's code up by it. Backend, version, build profile and hardware tag
+# all come from the measured binary via lib/identity.sh, never from constants
+# here — see docs/METRICS_DB.md on caller-supplied identity.
 GIT_SHA="$(git -C "${_RMLX_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-# Append -dirty if working tree has uncommitted changes.
-if ! git -C "${_RMLX_ROOT}" diff --quiet 2>/dev/null || ! git -C "${_RMLX_ROOT}" diff --cached --quiet 2>/dev/null; then
-    GIT_SHA="${GIT_SHA}-dirty"
+if ! git -C "${_RMLX_ROOT}" diff --quiet 2>/dev/null ||
+    ! git -C "${_RMLX_ROOT}" diff --cached --quiet 2>/dev/null; then
+    GIT_SHA="unknown"
 fi
-BUILD_PROFILE="release"
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RUN_ID="$(date -u +%Y%m%d-%H%M%S)-${GIT_SHA}"
-# `unknown` (or `unknown-dirty`) is a fallback for run-ids and labels, never
-# provenance — gate the git_sha JSON key so a checkout without `.git` writes
-# NULL into observations.git_sha instead of the literal string "unknown".
+# `unknown` is a fallback for run-ids and labels, never provenance — gate the
+# git_sha JSON key so a checkout without `.git`, or one with uncommitted edits,
+# writes NULL into observations.git_sha instead of a string nothing resolves.
 GIT_SHA_KV=""
 if [[ "${GIT_SHA}" != unknown* ]]; then
     GIT_SHA_KV="'git_sha': '${GIT_SHA}',"
@@ -381,7 +391,7 @@ log "Appended JSONL record to ${METRICS_OUT}"
 # This runs AFTER the legacy JSONL write so a recorder failure never blocks the bench.
 
 _PROMPT_FILE="prompts/longctx_4k.json"
-_METRICS_DB="${METRICS_DB:-${RMLX_HOME:-$PWD/.rmlx}/metrics/runs.db}"
+_METRICS_DB="${METRICS_DB:-${RMLX_METRICS_DIR}/runs.db}"
 _BUF_TS="$(date -u +%Y%m%d%H%M%S)"
 
 # Generate a short random hex suffix (lowercase 8 chars) for the buffer filename.
@@ -390,7 +400,7 @@ if command -v uuidgen >/dev/null 2>&1; then
 else
     _BUF_UUID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
 fi
-_RECORD_PATH="metrics/buffer/pending/${_BUF_TS}-${_BUF_UUID}.json"
+_RECORD_PATH="${RMLX_METRICS_DIR}/buffer/pending/${_BUF_TS}-${_BUF_UUID}.json"
 
 # Build the §8.5 JSON using Python (jq falls back to python3 — avoids hard dep).
 # model_namespace + model: split on '__' separator per §5.1.
@@ -473,7 +483,7 @@ if [[ -f "${_RECORD_PATH}" ]]; then
         rm -f "${_RECORD_PATH}"
         log "§8.5 record ingested into ${_METRICS_DB}"
     else
-        mv "${_RECORD_PATH}" "metrics/buffer/failed/"
+        mv "${_RECORD_PATH}" "${RMLX_METRICS_DIR}/buffer/failed/"
         log "WARN: recorder rejected the record; see metrics/buffer/failed/${_BUF_TS}-${_BUF_UUID}.json"
         log "WARN: bench results are still valid; only DB recording failed."
     fi
