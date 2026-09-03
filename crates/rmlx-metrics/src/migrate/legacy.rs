@@ -373,6 +373,7 @@ fn ingest_jsonl_row(
         output_first_64,
         notes,
         description: None,
+        decode_config: None,
         metrics,
     };
 
@@ -652,6 +653,7 @@ fn migrate_cbb_csv(
             output_first_64,
             notes,
             description: None,
+            decode_config: None,
             metrics,
         };
 
@@ -838,6 +840,7 @@ fn migrate_records_md(
             output_first_64: None,
             notes,
             description: Some("migrated from BENCHMARK_RECORDS.md".to_string()),
+            decode_config: None,
             metrics: vec![MetricEntry {
                 name: "decode_tps_warm".to_string(),
                 value: Some(decode_tps),

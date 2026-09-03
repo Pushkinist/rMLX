@@ -1,5 +1,13 @@
 //! The `bests` view — champion per cell (docs/METRICS_DB.md §3.3).
 //!
+//! The partition is [`crate::cell::partition_columns`], shared with every query
+//! that looks a cell up. It includes `decode_config`, so a speculative-decode
+//! arm does not out-rank a plain-decode one: they are different
+//! configurations, not two measurements of the same one, and the largest-wins
+//! rule only means something within a single configuration. `NULL` is ordinary
+//! decode, which is also what every row written before that column existed
+//! carries.
+//!
 //! The view ranks `observations` within each cell partition, so whatever the
 //! largest `higher_better` value in a partition is becomes that cell's
 //! published champion. That is the right rule *for measurements*, and the
@@ -53,6 +61,7 @@ pub fn plausible_sql(column: &str) -> String {
 /// Renders the `CREATE VIEW` statement for `bests` from the §4 registry.
 pub fn create_sql() -> String {
     let plausible = plausible_sql("value");
+    let partition = crate::cell::partition_columns();
 
     format!(
         "CREATE VIEW bests AS
@@ -60,8 +69,7 @@ WITH ranked AS (
     SELECT
         o.*,
         ROW_NUMBER() OVER (
-            PARTITION BY backend, model_namespace, model, weight_quant, kv_quant,
-                         ctx_max, prompt_id, metric
+            PARTITION BY {partition}
             ORDER BY
                 CASE WHEN direction = 'higher_better' THEN  value END DESC,
                 CASE WHEN direction = 'lower_better'  THEN -value END DESC,

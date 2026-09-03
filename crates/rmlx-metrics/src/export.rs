@@ -22,7 +22,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::error::Result;
-use crate::query::{BestRow, Cell};
+use crate::query::BestRow;
 use crate::scope::{ScopeFile, ScopeModel};
 
 // ── Static header (lifted from BENCHMARK_RECORDS(old).md, scope section + methodology + backend + quant tables). ──
@@ -236,7 +236,7 @@ pub fn export_csv(conn: &Connection) -> Result<String> {
     let mut out = String::with_capacity(4 * 1024);
     out.push_str(
         "backend,model_namespace,model,weight_quant,kv_quant,ctx_max,prompt_id,\
-         metric,value,unit,direction,run_id,ts_utc,git_sha,backend_version,\
+         decode_config,metric,value,unit,direction,run_id,ts_utc,git_sha,backend_version,\
          hardware_tag,description,notes,inserted_by\n",
     );
 
@@ -324,6 +324,11 @@ fn resolve_from_db(all: &[BestRow]) -> Vec<ResolvedModel> {
         .collect()
 }
 
+/// One row of the per-model table: backend, KV codec, and how the tokens were
+/// produced. All three are cell identity, so all three have to be in the key —
+/// grouping without the last one merges two configurations under one label.
+type RowKey = (String, String, Option<String>);
+
 /// Render the per-model pivoted table.
 ///
 /// `kv_map` is the pre-built `(namespace, model, ctx_max, kv_quant) → bytes`
@@ -334,16 +339,23 @@ fn render_model_table(
     kv_map: &KvBytesMap,
     total_cells: &mut usize,
 ) -> String {
-    // Group bests for this model by (backend, kv_quant) → metric → row.
-    // When alias namespaces produce multiple champions for the same
-    // (backend, kv_quant, metric), keep the better one per `direction`.
-    let mut cells: BTreeMap<(String, String), BTreeMap<String, &BestRow>> = BTreeMap::new();
+    // Group bests for this model by (backend, kv_quant, decode_config) →
+    // metric → row. `decode_config` is in the key because it is in the cell
+    // key: without it a speculative arm and a plain one become one row whose
+    // label describes only one of them, and `best_of` keeps the drafter's
+    // number. When alias namespaces produce multiple champions for the same
+    // group and metric, keep the better one per `direction`.
+    let mut cells: BTreeMap<RowKey, BTreeMap<String, &BestRow>> = BTreeMap::new();
     for r in all {
         if !rm.matches(&r.cell.model_namespace, &r.cell.model) {
             continue;
         }
         let entry = cells
-            .entry((r.cell.backend.clone(), r.cell.kv_quant.clone()))
+            .entry((
+                r.cell.backend.clone(),
+                r.cell.kv_quant.clone(),
+                r.cell.decode_config.clone(),
+            ))
             .or_default();
         match entry.get(&r.metric) {
             None => {
@@ -358,13 +370,13 @@ fn render_model_table(
     }
 
     let mut out = String::new();
-    out.push_str("| Backend | KV-quant ");
+    out.push_str("| Backend | KV-quant | Decode ");
     for label in METRIC_HEADER_LABELS {
         // write!(String) is infallible — let _ discards the unit Ok.
         let _ = write!(out, "| {label} ");
     }
     out.push_str("| KV GB | reduction vs bf16 | Updated |\n");
-    out.push_str("|---|---");
+    out.push_str("|---|---|---");
     for _ in METRIC_HEADER_LABELS {
         out.push_str("|---:");
     }
@@ -372,7 +384,7 @@ fn render_model_table(
 
     // Order rows: BACKEND_DISPLAY_ORDER first, then alphabetic for unknown
     // backends. Within a backend, sort kv_quant alphabetically.
-    let mut row_keys: Vec<(String, String)> = cells.keys().cloned().collect();
+    let mut row_keys: Vec<RowKey> = cells.keys().cloned().collect();
     row_keys.sort_by(|a, b| {
         let aa = BACKEND_DISPLAY_ORDER
             .iter()
@@ -385,15 +397,18 @@ fn render_model_table(
         aa.cmp(&bb)
             .then_with(|| a.0.cmp(&b.0))
             .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
     });
 
-    for (backend, kv_quant) in &row_keys {
-        let Some(metric_map) = cells.get(&(backend.clone(), kv_quant.clone())) else {
+    for key in &row_keys {
+        let (backend, kv_quant, decode_config) = key;
+        let Some(metric_map) = cells.get(key) else {
             continue;
         };
 
         let backend_label = backend_display(backend);
         let kv_label = kv_quant_display(kv_quant);
+        let decode_label = decode_config.as_deref().unwrap_or("plain");
 
         // Derive ctx_max from any row in this (backend, kv_quant) cell.
         let ctx_max = metric_map.values().next().map_or(8192, |r| r.cell.ctx_max);
@@ -415,7 +430,7 @@ fn render_model_table(
             .copied()
             .reduce(f64::min);
 
-        let mut row = format!("| {backend_label} | {kv_label} ");
+        let mut row = format!("| {backend_label} | {kv_label} | {decode_label} ");
         for col in METRIC_COLUMNS {
             match metric_map.get(col.db_name) {
                 Some(r) => {
@@ -433,7 +448,7 @@ fn render_model_table(
 
     // Append N/A rows for unsupported backends not already present.
     for (backend, reason) in &rm.unsupported {
-        let already_present = row_keys.iter().any(|(b, _)| b == backend);
+        let already_present = row_keys.iter().any(|(b, _, _)| b == backend);
         if already_present {
             continue;
         }
@@ -569,46 +584,21 @@ fn all_bests(conn: &Connection) -> Result<Vec<BestRow>> {
     let mut stmt = conn.prepare(
         "SELECT
              id, backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
-             metric, value, unit, direction,
+             decode_config, metric, value, unit, direction,
              run_id, ts_utc, git_sha, backend_version, hardware_tag,
              description, notes, inserted_by
          FROM bests
-         ORDER BY backend, model_namespace, model, weight_quant, kv_quant, metric",
+         ORDER BY backend, model_namespace, model, weight_quant, kv_quant, decode_config, metric",
     )?;
 
     let rows = stmt
-        .query_map([], |r| {
-            Ok(BestRow {
-                observation_id: r.get(0)?,
-                cell: Cell {
-                    backend: r.get(1)?,
-                    model_namespace: r.get(2)?,
-                    model: r.get(3)?,
-                    weight_quant: r.get(4)?,
-                    kv_quant: r.get(5)?,
-                    ctx_max: r.get(6)?,
-                    prompt_id: r.get(7)?,
-                },
-                metric: r.get(8)?,
-                value: r.get(9)?,
-                unit: r.get(10)?,
-                direction: r.get(11)?,
-                run_id: r.get(12)?,
-                ts_utc: r.get(13)?,
-                git_sha: r.get(14)?,
-                backend_version: r.get(15)?,
-                hardware_tag: r.get(16)?,
-                description: r.get(17)?,
-                notes: r.get(18)?,
-                inserted_by: r.get(19)?,
-            })
-        })?
+        .query_map([], crate::query::read::row_to_best)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(rows)
 }
 
-/// Sort order for CSV/JSONL: backend, model_namespace, model, weight_quant, kv_quant, metric.
+/// Sort order for CSV/JSONL: the cell key, then metric.
 fn sorted_rows(mut rows: Vec<BestRow>) -> Vec<BestRow> {
     rows.sort_by(|a, b| {
         a.cell
@@ -618,6 +608,7 @@ fn sorted_rows(mut rows: Vec<BestRow>) -> Vec<BestRow> {
             .then_with(|| a.cell.model.cmp(&b.cell.model))
             .then_with(|| a.cell.weight_quant.cmp(&b.cell.weight_quant))
             .then_with(|| a.cell.kv_quant.cmp(&b.cell.kv_quant))
+            .then_with(|| a.cell.decode_config.cmp(&b.cell.decode_config))
             .then_with(|| a.metric.cmp(&b.metric))
     });
     rows
@@ -647,7 +638,7 @@ fn csv_opt(opt: Option<&str>) -> String {
 
 fn csv_row(r: &BestRow) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         csv_escape(&r.cell.backend),
         csv_escape(&r.cell.model_namespace),
         csv_escape(&r.cell.model),
@@ -655,6 +646,7 @@ fn csv_row(r: &BestRow) -> String {
         csv_escape(&r.cell.kv_quant),
         r.cell.ctx_max,
         r.cell.prompt_id,
+        csv_opt(r.cell.decode_config.as_deref()),
         csv_escape(&r.metric),
         r.value,
         csv_escape(&r.unit),
@@ -681,6 +673,7 @@ struct SerCell {
     kv_quant: String,
     ctx_max: i64,
     prompt_id: i64,
+    decode_config: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -713,6 +706,7 @@ impl SerBestRow {
                 kv_quant: r.cell.kv_quant.clone(),
                 ctx_max: r.cell.ctx_max,
                 prompt_id: r.cell.prompt_id,
+                decode_config: r.cell.decode_config.clone(),
             },
             metric: r.metric.clone(),
             value: r.value,

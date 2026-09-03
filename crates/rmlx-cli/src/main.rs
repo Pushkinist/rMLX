@@ -1714,7 +1714,17 @@ fn main() -> Result<()> {
     // The hook is idempotent (Once guard inside install()).
     panic_hook::install(rmlx_core::paths::logs_dir());
 
-    info!(version = env!("CARGO_PKG_VERSION"), %run_id, ?cli.cmd, "rmlx start");
+    // `pid` so a log can be attributed to the process that wrote it. Two runs
+    // starting in the same second share a run-id, and therefore a log path;
+    // a reader that has to know whose numbers it is holding needs an identity
+    // the filename cannot give it.
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        %run_id,
+        pid = std::process::id(),
+        ?cli.cmd,
+        "rmlx start"
+    );
 
     // `rmlx metrics` subcommands are DB-admin only: they own their own
     // connection (possibly to a different DB via `--db`/`RMLX_METRICS_DB`)

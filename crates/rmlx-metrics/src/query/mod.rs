@@ -20,7 +20,7 @@
 //!
 //! - `docs/METRICS_DB.md` — schema, query API contract, §8.2.
 
-mod read;
+pub(crate) mod read;
 mod types;
 
 pub use read::{best, champions, compare, deltas, history, rank, regress, timeseries};

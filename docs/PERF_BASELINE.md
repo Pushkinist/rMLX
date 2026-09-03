@@ -392,6 +392,16 @@ Each new codec: invoke `scripts/bench_codec_cell.sh --kv-quant <codec> --model <
 one release. Use `make canary-gate` (DB-backed) for new regression gates.
 `scripts/regression_gate.sh` (CSV-backed) is also preserved as a legacy fallback.
 
+**The `kv_quant` column changed spelling, not meaning.** Rows written before
+2026-09 carry the Rust `Debug` rendering of the codec — `None`, `K8V8`,
+`Mixed { k_bits: 8, … }` — because the canary scraped it off a log line that was
+formatted that way and then translated it with a chain of `sed` rules. The
+engine now writes that field through `Display`, so the column holds the
+canonical name the `--kv-quant` flag accepts and `runs.db` records (`none`,
+`k8v8`, `mixed_k8g64_v4g64`) and the canary reads it verbatim. A CSV history
+spanning the changeover therefore has two spellings of the same codec; the
+tables below quote the Debug form because that is what those rows say.
+
 **The canary tracks one build over time. It cannot compare two.** All of a
 model's measured runs happen together, so when it is pointed at two builds in
 turn, whichever ran second wears any drift — and on a contended host that drift

@@ -20,6 +20,7 @@
 )]
 
 pub mod bests_view;
+pub mod cell;
 pub mod error;
 pub mod events;
 pub mod export;

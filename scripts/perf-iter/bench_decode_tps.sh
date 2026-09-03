@@ -15,7 +15,8 @@
 #   WARMUP_RUNS  — warmup completions before measurement (default: 1)
 #   MEASURE_RUNS — completions to measure (default: 3); overridden by --repeat N
 #   RMLX_BIN    — path to rmlx binary (default: ./target/release/rmlx)
-#   METRICS_OUT  — JSONL file to append to (default: metrics/perf-iter/baseline.jsonl)
+#   METRICS_OUT  — JSONL file to append to
+#                  (default: <RMLX_HOME>/metrics/perf-iter/baseline.jsonl)
 #
 # Flags:
 #   --repeat N   — override MEASURE_RUNS (useful for stable per-finding numbers;
@@ -24,6 +25,13 @@
 # CLAUDE.md mandatory pre-flight (single-MLX-process rule):
 #   pkill -f "rmlx serve"; pkill -f mlx_lm; pkill -f paroquant; pkill -f omlx;
 #   sleep 5; rm -f /tmp/rmlx.<port>.claim
+#
+# Measurement basis:
+#   decode_tps is the rate the server measured for each request over that
+#   request's own inter-token gaps — first token to last, prefill excluded —
+#   read back through scripts/lib/server_decode_tps.py. Dividing the completion
+#   tokens by the whole request would count the prefill and the connection and
+#   is a different quantity (overall_tps), not this one.
 #
 # Output:
 #   Prints decode_tps_mean / decode_tps_stddev / ttft_ms per run to stdout.
@@ -59,19 +67,24 @@ done
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH env var is required}"
 KV_QUANT="${KV_QUANT:?KV_QUANT env var is required (e.g. k8v8, k8v4, planar)}"
 PORT="${PORT:-62265}"
+# All on-disk state lives under one root (CLAUDE.md, "Runtime data root"), so
+# nothing here names `metrics` relative to the working directory — that is how
+# a run from a sub-directory leaves a stray tree behind.
+RMLX_HOME="${RMLX_HOME:-$PWD/.rmlx}"
+RMLX_METRICS_DIR="${RMLX_HOME}/metrics"
 MAX_CTX="${MAX_CTX:-8192}"
 WARMUP_RUNS="${WARMUP_RUNS:-1}"
 MEASURE_RUNS="${MEASURE_RUNS:-3}"
 # --repeat N flag overrides MEASURE_RUNS when provided.
 [[ -n "${_REPEAT_OVERRIDE}" ]] && MEASURE_RUNS="${_REPEAT_OVERRIDE}"
-METRICS_OUT="${METRICS_OUT:-metrics/perf-iter/baseline.jsonl}"
+METRICS_OUT="${METRICS_OUT:-${RMLX_METRICS_DIR}/perf-iter/baseline.jsonl}"
 
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
 COMPLETIONS_URL="http://127.0.0.1:${PORT}/v1/chat/completions"
 MODEL_ID="$(basename "${MODEL_PATH}")"
 
 # ── Buffer dirs (§8.4) ────────────────────────────────────────────────────────
-mkdir -p metrics/buffer/pending metrics/buffer/failed
+mkdir -p "${RMLX_METRICS_DIR}/buffer/pending" "${RMLX_METRICS_DIR}/buffer/failed"
 
 # ── Prompt fixture ─────────────────────────────────────────────────────────────
 # 32-token-ish prompt that is short enough to give clean decode TPS numbers.
@@ -85,17 +98,21 @@ MAX_TOKENS_WARMUP=10
 # ── Git metadata ──────────────────────────────────────────────────────────────
 
 _RMLX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# `git_sha` is a commit this run is attributed to, so a working tree with
+# uncommitted edits has none to give: `-dirty` is not a commit and nothing can
+# look the row's code up by it. Backend, version, build profile and hardware tag
+# all come from the measured binary via lib/identity.sh, never from constants
+# here — see docs/METRICS_DB.md on caller-supplied identity.
 GIT_SHA="$(git -C "${_RMLX_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-# Append -dirty if working tree has uncommitted changes.
-if ! git -C "${_RMLX_ROOT}" diff --quiet 2>/dev/null || ! git -C "${_RMLX_ROOT}" diff --cached --quiet 2>/dev/null; then
-    GIT_SHA="${GIT_SHA}-dirty"
+if ! git -C "${_RMLX_ROOT}" diff --quiet 2>/dev/null ||
+    ! git -C "${_RMLX_ROOT}" diff --cached --quiet 2>/dev/null; then
+    GIT_SHA="unknown"
 fi
-BUILD_PROFILE="release"
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RUN_ID="$(date -u +%Y%m%d-%H%M%S)-${GIT_SHA}"
-# `unknown` (or `unknown-dirty`) is a fallback for run-ids and labels, never
-# provenance — gate the git_sha JSON key so a checkout without `.git` writes
-# NULL into observations.git_sha instead of the literal string "unknown".
+# `unknown` is a fallback for run-ids and labels, never provenance — gate the
+# git_sha JSON key so a checkout without `.git`, or one with uncommitted edits,
+# writes NULL into observations.git_sha instead of a string nothing resolves.
 GIT_SHA_KV=""
 if [[ "${GIT_SHA}" != unknown* ]]; then
     GIT_SHA_KV="'git_sha': '${GIT_SHA}',"
@@ -105,6 +122,22 @@ fi
 
 log() { echo "[bench_decode_tps] $*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
+
+# Read one `key=value` out of a block, or the empty string when absent.
+field_of() { echo "$1" | sed -n "s/^$2=//p" | tail -1; }
+
+# How many ITL samples the server has recorded so far.
+ring_len() {
+    field_of "$(python3 "${_RMLX_ROOT}/scripts/lib/server_decode_tps.py" \
+        "http://127.0.0.1:${PORT}")" ring_len
+}
+
+# The rate the server measured for the request that just finished, given the
+# ring length observed before it. Empty when it could not attribute one.
+server_rate_after() {
+    field_of "$(python3 "${_RMLX_ROOT}/scripts/lib/server_decode_tps.py" \
+        "http://127.0.0.1:${PORT}" --after "$1")" decode_tps
+}
 
 # Check required tools.
 for tool in curl python3 awk; do
@@ -203,6 +236,9 @@ print(json.dumps({
 }))
 ")"
 
+    local ring_before
+    ring_before="$(ring_len)"
+
     local t_start t_end elapsed_ms
     t_start="$(python3 -c 'import time; print(int(time.time() * 1000))')"
     local response
@@ -211,6 +247,9 @@ print(json.dumps({
         -d "${payload}")"
     t_end="$(python3 -c 'import time; print(int(time.time() * 1000))')"
     elapsed_ms=$(( t_end - t_start ))
+
+    local decode_tps
+    decode_tps="$(server_rate_after "${ring_before:-0}")" || decode_tps=""
 
     # Parse completion_tokens from usage field.
     local completion_tokens generated_text
@@ -228,7 +267,7 @@ if choices:
     print(choices[0].get('message', {}).get('content', ''))
 " 2>/dev/null || echo '')"
 
-    echo "elapsed_ms=${elapsed_ms} tokens=${completion_tokens} text=${generated_text}"
+    echo "elapsed_ms=${elapsed_ms} decode_tps=${decode_tps} tokens=${completion_tokens} text=${generated_text}"
 }
 
 # ── Warmup ────────────────────────────────────────────────────────────────────
@@ -253,27 +292,15 @@ for i in $(seq 1 "${MEASURE_RUNS}"); do
     result="$(completion_request "${MAX_TOKENS_MEASURE}")"
 
     elapsed_ms="$(echo "${result}" | grep -oE 'elapsed_ms=[0-9]+' | cut -d= -f2)"
+    tps="$(echo "${result}" | grep -oE 'decode_tps=[0-9.]+' | cut -d= -f2)"
     n_tokens="$(echo "${result}" | grep -oE 'tokens=[0-9]+' | cut -d= -f2)"
-    text="$(echo "${result}" | sed 's/elapsed_ms=[0-9]* tokens=[0-9]* text=//')"
+    text="$(echo "${result}" | sed 's/^elapsed_ms=[0-9]* decode_tps=[0-9.]* tokens=[0-9]* text=//')"
 
-    # decode_tps = completion_tokens / (elapsed_ms / 1000)
-    # ttft_ms: we don't have true first-token time from the non-streaming API.
-    # Report wall-time/n_tokens as mean-step-latency (honest label).
-    tps="$(python3 -c "
-ms=${elapsed_ms}; n=${n_tokens}
-if n > 0 and ms > 0:
-    print(f'{n / (ms / 1000):.2f}')
-else:
-    print('0.0')
-")"
+    [[ -n "${tps}" ]] || die "run ${i}: the server attributed no decode rate to it"
 
-    step_ms="$(python3 -c "
-ms=${elapsed_ms}; n=${n_tokens}
-if n > 0:
-    print(f'{ms / n:.1f}')
-else:
-    print('0.0')
-")"
+    # The mean inter-token gap is the reciprocal of that rate, so it is the same
+    # measurement rather than a second one derived from the wall clock.
+    step_ms="$(LC_ALL=C python3 -c "print(f'{1000.0 / ${tps}:.1f}')")"
 
     tps_values+=("${tps}")
     ttft_values+=("${step_ms}")
@@ -282,8 +309,12 @@ else:
         first_text="${text}"
     fi
 
-    log "    elapsed_ms=${elapsed_ms} tokens=${n_tokens} tps=${tps} step_ms=${step_ms}"
+    log "    elapsed_ms=${elapsed_ms} tokens=${n_tokens} decode_tps=${tps} step_ms=${step_ms}"
 done
+
+if [[ ${#tps_values[@]} -ne ${MEASURE_RUNS} ]]; then
+    die "${#tps_values[@]} decode rates for ${MEASURE_RUNS} measured runs"
+fi
 
 # ── Statistics ────────────────────────────────────────────────────────────────
 
@@ -318,7 +349,7 @@ echo "  model:           ${MODEL_ID}"
 echo "  kv_quant:        ${KV_QUANT}"
 echo "  decode_tps_mean: ${tps_mean}"
 echo "  decode_tps_std:  ${tps_stddev}"
-echo "  step_ms_mean:    ${ttft_mean}  (wall_ms / completion_tokens — not true TTFT)"
+echo "  step_ms_mean:    ${ttft_mean}  (mean inter-token gap, from the server)"
 echo "  first_text:      ${first_text:0:120}"
 
 # ── Write JSONL metrics ────────────────────────────────────────────────────────
@@ -347,7 +378,7 @@ record = {
     'step_ms_mean':       ${ttft_mean},
     'first_32_words':     ${first_32_words},
     ${GIT_SHA_KV}
-    'notes':              'step_ms_mean=wall/completion_tokens; first_32_words from temp=0 decode',
+    'notes':              'decode_window=engine_itl; first_32_words from temp=0 decode',
 }
 print(json.dumps(record))
 " >> "${METRICS_OUT}"
@@ -360,7 +391,7 @@ log "Appended JSONL record to ${METRICS_OUT}"
 # This runs AFTER the legacy JSONL write so a recorder failure never blocks the bench.
 
 _PROMPT_FILE="prompts/longctx_4k.json"
-_METRICS_DB="${METRICS_DB:-${RMLX_HOME:-$PWD/.rmlx}/metrics/runs.db}"
+_METRICS_DB="${METRICS_DB:-${RMLX_METRICS_DIR}/runs.db}"
 _BUF_TS="$(date -u +%Y%m%d%H%M%S)"
 
 # Generate a short random hex suffix (lowercase 8 chars) for the buffer filename.
@@ -369,7 +400,7 @@ if command -v uuidgen >/dev/null 2>&1; then
 else
     _BUF_UUID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
 fi
-_RECORD_PATH="metrics/buffer/pending/${_BUF_TS}-${_BUF_UUID}.json"
+_RECORD_PATH="${RMLX_METRICS_DIR}/buffer/pending/${_BUF_TS}-${_BUF_UUID}.json"
 
 # Build the §8.5 JSON using Python (jq falls back to python3 — avoids hard dep).
 # model_namespace + model: split on '__' separator per §5.1.
@@ -433,7 +464,7 @@ rec = {
     'n_warmups':       int('${WARMUP_RUNS}'),
     'n_measure':       int('${MEASURE_RUNS}'),
     'output_first_64': output_first_64,
-    'notes':           'step_ms_mean=wall/completion_tokens; perf-iter bench script',
+    'notes':           'decode_window=engine_itl; perf-iter bench script',
     'description':     None,
     'metrics': [
         {'name': 'decode_tps_warm', 'value': float('${tps_mean}'),   'stddev': float('${tps_stddev}')},
@@ -452,7 +483,7 @@ if [[ -f "${_RECORD_PATH}" ]]; then
         rm -f "${_RECORD_PATH}"
         log "§8.5 record ingested into ${_METRICS_DB}"
     else
-        mv "${_RECORD_PATH}" "metrics/buffer/failed/"
+        mv "${_RECORD_PATH}" "${RMLX_METRICS_DIR}/buffer/failed/"
         log "WARN: recorder rejected the record; see metrics/buffer/failed/${_BUF_TS}-${_BUF_UUID}.json"
         log "WARN: bench results are still valid; only DB recording failed."
     fi

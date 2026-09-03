@@ -40,6 +40,8 @@ BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 CSV_DIR="${RMLX_HOME}/bench"
 CSV="${CSV_DIR}/perf_canary.csv"
+LOG_DIR="${RMLX_HOME}/logs"
+SCRATCH_DIR="${RMLX_HOME}/tmp"
 
 PROMPT_TOKENS=4096
 MAX_TOKENS=100
@@ -114,22 +116,38 @@ run_once() {
         | cut -d= -f2
 }
 
-# Helper: parse kv_quant from stderr of a single run
-# Strips ANSI codes, then extracts from the "cache-type resolved" INFO line.
+# Which KV codec a one-token run resolves, read out of that run's own log.
+#
+# Read from the log rather than scraped off stderr, and through
+# `lib/server_kv_quant.py` rather than a private parser: the engine states the
+# codec once, in one field, and one reader owns it. The old scrape also carried
+# a chain of `sed` rules translating a Rust `Debug` rendering (`K8V8`,
+# `Mixed { k_bits: 8, … }`) into a tag — the field is written through `Display`
+# now, so every one of those branches was dead and any that still fired would
+# have written a spelling nothing else uses.
 resolve_kv_quant() {
     local model_path="$1"
+    mkdir -p "${LOG_DIR}" "${SCRATCH_DIR}"
+    { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
+        > "${SCRATCH_DIR}/canary_logs_before"
+
     RMLX_HOME="${RMLX_HOME}" "${BINARY}" baseline \
         --model "${model_path}" \
         --prompt-tokens "${PROMPT_TOKENS}" \
         --max-tokens 1 \
         --max-ctx "${MAX_CTX}" \
-        2>&1 1>/dev/null \
-        | sed 's/\x1b\[[0-9;]*m//g' \
-        | grep 'cache-type resolved' \
-        | grep -o 'kv_quant=.*' \
-        | head -1 \
-        | sed 's/kv_quant=//' \
-        | sed 's/[[:space:]]*$//'
+        > /dev/null 2>&1 &
+    local probe_pid=$!
+    wait "${probe_pid}" || true
+
+    local log
+    log="$({ ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
+        | comm -13 "${SCRATCH_DIR}/canary_logs_before" - \
+        | python3 "${REPO_ROOT}/scripts/lib/run_log_for_pid.py" --pid "${probe_pid}")" ||
+        return 1
+
+    python3 "${REPO_ROOT}/scripts/lib/server_kv_quant.py" "${log}" \
+        | sed -n 's/^kv_quant=//p'
 }
 
 # Compute median of space-separated values (sort via sort(1), compute via awk)
@@ -190,16 +208,9 @@ for entry in "${MODELS[@]}"; do
     med="$(median "${tps_values[@]}")"
     sd="$(stddev "${tps_values[@]}")"
 
-    # Resolve kv_quant (fast single run, max-tokens 1)
-    kv_quant="$(resolve_kv_quant "${model_path}" 2>/dev/null || echo "auto")"
-    # Normalize to simple tag; extract the inner struct name if it's a Rust Debug form
-    kv_quant_tag="$(echo "${kv_quant}" | sed -E \
-        's/Mixed \{ k_bits: ([0-9]+), v_bits: ([0-9]+), k_group_size: ([0-9]+), v_group_size: ([0-9]+) \}/mixed_k\1g\3_v\2g\4/' \
-        | sed -E 's/K8VTurbo3.*/k8vturbo3/' \
-        | sed -E 's/K8V8.*/k8v8/' \
-        | sed -E 's/K8V4.*/k8v4/' \
-        | sed -E 's/BF16.*/bf16/' \
-        | sed -E 's/^$/auto/')"
+    # Resolve kv_quant (fast single run, max-tokens 1). The engine's own name
+    # for the codec goes into the row verbatim.
+    kv_quant_tag="$(resolve_kv_quant "${model_path}" 2>/dev/null || true)"
     [[ -z "${kv_quant_tag}" ]] && kv_quant_tag="auto"
 
     ts_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"

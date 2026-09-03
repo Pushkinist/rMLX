@@ -52,6 +52,7 @@ fn make_run(
         output_first_64: None,
         notes: None,
         description: None,
+        decode_config: None,
         metrics: vec![MetricEntry {
             name: metric.into(),
             value: Some(value),
@@ -165,6 +166,7 @@ fn default_cell(backend: &str, model: &str) -> Cell {
         kv_quant: "k8v8".into(),
         ctx_max: 8192,
         prompt_id: 1,
+        decode_config: None,
     }
 }
 
@@ -488,6 +490,7 @@ fn timeseries_mean_excludes_an_implausible_row() {
         kv_quant: "k8v8".into(),
         ctx_max: 8192,
         prompt_id: 1,
+        decode_config: None,
     };
     let points = timeseries(&conn, &cell, "prefill_tps", None, Bucket::Day).unwrap();
     assert_eq!(points.len(), 1, "expected one day bucket: {points:?}");
@@ -827,4 +830,228 @@ fn deltas_regression_flagged() {
     let reg = reg_row.unwrap();
     assert!(reg.regressed, "should be flagged as regressed");
     assert!(reg.delta_pct.unwrap() < -5.0);
+}
+
+// ── cell key reaches every consumer ───────────────────────────────────────
+
+/// The gate for the cell key. Every SQL body that looks a cell up is rendered
+/// from one column list; this asserts each body actually binds every column in
+/// it, so adding a column cannot reach `bests` and stop there.
+#[test]
+fn cell_predicate_reaches_every_consumer() {
+    for (name, sql) in read::cell_keyed_sql() {
+        for col in crate::cell::CELL_COLUMNS {
+            let op = if col.nullable { "IS" } else { "=" };
+            let want = format!("{} {op} ?", col.name);
+            assert!(
+                sql.contains(&want),
+                "{name} does not bind the cell column `{}`; \
+                 a query keyed on fewer columns than the view reads two \
+                 configurations as one:\n{sql}",
+                col.name
+            );
+        }
+    }
+}
+
+/// `best()` must answer for the cell it was asked about. With two arms in one
+/// (model, quant, prompt), a lookup that ignores `decode_config` returns
+/// whichever row the view happens to yield first.
+#[test]
+fn best_distinguishes_decode_configurations() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.1.0");
+        rec.record_run(&make_run(
+            "rmlx",
+            "m",
+            "decode_tps_warm",
+            142.5,
+            "2026-05-10T07:30:00Z",
+            None,
+        ))
+        .unwrap();
+        let mut spec = make_run(
+            "rmlx",
+            "m",
+            "decode_tps_warm",
+            275.7,
+            "2026-05-10T07:31:00Z",
+            None,
+        );
+        spec.decode_config = Some("mtp/block=5".into());
+        rec.record_run(&spec).unwrap();
+    }
+
+    let plain = default_cell("rmlx", "m");
+    let mut spec_cell = plain.clone();
+    spec_cell.decode_config = Some("mtp/block=5".into());
+
+    let got_plain = best(&conn, &plain, "decode_tps_warm").unwrap().unwrap();
+    let got_spec = best(&conn, &spec_cell, "decode_tps_warm").unwrap().unwrap();
+
+    assert!(
+        (got_plain.value - 142.5).abs() < 1e-9,
+        "plain cell got {}",
+        got_plain.value
+    );
+    assert!(
+        (got_spec.value - 275.7).abs() < 1e-9,
+        "speculative cell got {}",
+        got_spec.value
+    );
+}
+
+/// A mean over a cell must not average two configurations together.
+#[test]
+fn timeseries_does_not_average_across_decode_configurations() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.1.0");
+        rec.record_run(&make_run(
+            "rmlx",
+            "m",
+            "decode_tps_warm",
+            100.0,
+            "2026-05-10T07:30:00Z",
+            None,
+        ))
+        .unwrap();
+        let mut spec = make_run(
+            "rmlx",
+            "m",
+            "decode_tps_warm",
+            300.0,
+            "2026-05-10T07:31:00Z",
+            None,
+        );
+        spec.decode_config = Some("mtp/block=5".into());
+        rec.record_run(&spec).unwrap();
+    }
+
+    let points = timeseries(
+        &conn,
+        &default_cell("rmlx", "m"),
+        "decode_tps_warm",
+        None,
+        Bucket::Day,
+    )
+    .unwrap();
+
+    assert_eq!(points.len(), 1, "{points:?}");
+    assert_eq!(points[0].n, 1, "the speculative row is a different cell");
+    assert!((points[0].mean_value - 100.0).abs() < 1e-9, "{points:?}");
+}
+
+/// `history` is the same lookup and has the same hazard.
+#[test]
+fn history_does_not_mix_decode_configurations() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.1.0");
+        rec.record_run(&make_run(
+            "rmlx",
+            "m",
+            "decode_tps_warm",
+            100.0,
+            "2026-05-10T07:30:00Z",
+            None,
+        ))
+        .unwrap();
+        let mut spec = make_run(
+            "rmlx",
+            "m",
+            "decode_tps_warm",
+            300.0,
+            "2026-05-10T07:31:00Z",
+            None,
+        );
+        spec.decode_config = Some("mtp/block=5".into());
+        rec.record_run(&spec).unwrap();
+    }
+
+    let rows = history(&conn, &default_cell("rmlx", "m"), None, None).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!((rows[0].value - 100.0).abs() < 1e-9, "{rows:?}");
+}
+
+/// `compare` groups per cell; two arms must stay two rows rather than one
+/// overwriting the other in the per-backend map.
+#[test]
+fn compare_keeps_the_two_arms_apart() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.1.0");
+        rec.record_run(&make_run(
+            "rmlx",
+            "m",
+            "decode_tps_warm",
+            142.5,
+            "2026-05-10T07:30:00Z",
+            None,
+        ))
+        .unwrap();
+        let mut spec = make_run(
+            "rmlx",
+            "m",
+            "decode_tps_warm",
+            275.7,
+            "2026-05-10T07:31:00Z",
+            None,
+        );
+        spec.decode_config = Some("mtp/block=5".into());
+        rec.record_run(&spec).unwrap();
+    }
+
+    let rows = compare(&conn, &["rmlx"], "decode_tps_warm").unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let mut values: Vec<f64> = rows
+        .iter()
+        .filter_map(|r| r.per_backend.first().and_then(|(_, b)| b.as_ref()))
+        .map(|b| b.value)
+        .collect();
+    values.sort_by(f64::total_cmp);
+    assert!(
+        (values[0] - 142.5).abs() < 1e-9 && (values[1] - 275.7).abs() < 1e-9,
+        "{values:?}"
+    );
+}
+
+/// `deltas --exit-code` is a CI gate: it must not read the drafter's rate as
+/// this cell's improvement.
+#[test]
+fn deltas_does_not_compare_across_decode_configurations() {
+    let mut conn = test_conn();
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.1.0");
+        rec.record_run(&make_run(
+            "rmlx",
+            "m",
+            "decode_tps_warm",
+            100.0,
+            "2026-05-10T07:30:00Z",
+            Some("aaaaaaa"),
+        ))
+        .unwrap();
+        let mut spec = make_run(
+            "rmlx",
+            "m",
+            "decode_tps_warm",
+            300.0,
+            "2026-05-12T07:30:00Z",
+            Some("bbbbbbb"),
+        );
+        spec.decode_config = Some("mtp/block=5".into());
+        rec.record_run(&spec).unwrap();
+    }
+
+    let rows = deltas(&conn, "aaaaaaa", Some(3.0)).unwrap();
+    for row in &rows {
+        if row.cell.decode_config.is_none() {
+            assert!(
+                row.current_value < 200.0,
+                "the plain cell read the speculative rate as its current value: {row:?}"
+            );
+        }
+    }
 }

@@ -125,6 +125,7 @@ CREATE TABLE observations (
     ctx_max          INTEGER NOT NULL,             -- server max-ctx setting at run time
     prompt_id        INTEGER NOT NULL REFERENCES prompts(id),
     metric           TEXT    NOT NULL,             -- see §4 metric registry
+    decode_config    TEXT,                         -- how the tokens were produced; NULL = ordinary decode, e.g. 'mtp/block=5' (migration 005)
     -- value
     value            REAL    NOT NULL,             -- numeric measurement
     unit             TEXT    NOT NULL,             -- 'tps', 'ms', 'mb', 'bytes', 'count', 'ratio'
@@ -154,7 +155,7 @@ CREATE TABLE observations (
     inserted_by      TEXT    NOT NULL              -- audit: tool@semver
 );
 
-CREATE INDEX obs_cell_idx       ON observations(backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id, metric);
+CREATE INDEX obs_cell_idx       ON observations(backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id, metric, decode_config);
 CREATE INDEX obs_metric_idx     ON observations(metric);
 CREATE INDEX obs_ts_idx         ON observations(ts_utc);
 CREATE INDEX obs_git_sha_idx    ON observations(git_sha);
@@ -162,6 +163,15 @@ CREATE INDEX obs_run_id_idx     ON observations(run_id);
 CREATE INDEX obs_backend_idx    ON observations(backend);
 CREATE INDEX obs_inserted_idx   ON observations(inserted_utc);
 ```
+
+**`decode_config` is cell identity, not context.** A speculative-decode arm and
+a plain-decode arm of one model at one quant and one prompt are not two
+measurements of the same thing — the drafter changes what produced the tokens,
+and ranking one against the other publishes the drafter's rate as the model's
+decode throughput. It is `NULL` for ordinary decode, which is also what every
+row written before migration 005 carries, so legacy plain-decode rows keep
+their cells unchanged. The population that column cannot sort out — speculative
+rows written before it existed — is named in §4.1.
 
 **No PK on the cell columns.** A cell can have N observations over time — that's the whole point. PK is the surrogate `id`.
 
@@ -175,7 +185,7 @@ WITH ranked AS (
     SELECT
         o.*,
         ROW_NUMBER() OVER (
-            PARTITION BY backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id, metric
+            PARTITION BY backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id, metric, decode_config
             ORDER BY
                 CASE WHEN direction = 'higher_better' THEN  value END DESC,
                 CASE WHEN direction = 'lower_better'  THEN -value END DESC,
@@ -528,8 +538,11 @@ run, and counted in the migrate report as `metrics_dropped_implausible`.
 #### Known-bad rows already in the DB
 
 Rows written before these gates existed are still there — `observations` is
-append-only and nothing is deleted. Two known populations, both excluded from
-`bests` by the bound and reported by `doctor`:
+append-only and nothing is deleted. Three known populations. The first two fall
+outside the plausible-value bound, so `bests` already drops them and `doctor`
+reports them. The third does not: it is the wrong-but-in-range case §4.1 says a
+bound cannot reach, so the predicate that identifies it is written down here
+because nothing enforces it.
 
 - **`prefill_tps` ≥ 1e5** — 20 rows from a legacy buffer replay storing
   `(prompt_tokens - 242) * 1000` under `unit='tps'`. The producing script
@@ -541,6 +554,91 @@ append-only and nothing is deleted. Two known populations, both excluded from
 - **rate metrics `= 0.0`** — an early-stopped run recording a fabricated zero
   instead of nothing. These win any cell whose rows are all zeros, so an
   upper-only bound would have *promoted* them; the bound has to be two-sided.
+- **`decode_tps_warm` from a whole-request or prefill-inclusive stopwatch** —
+  several bench scripts wrote this column from a rate whose window started
+  before the prompt prefill, which is `overall_tps` under another metric's name
+  and reads low by whatever the prefill cost. The producers:
+  `scripts/spec_bench.sh` on both arms (the speculative one divided the round
+  loop's `emitted` by its `elapsed_ms`, 35-62% low on the 4k-prompt runs still
+  in `<RMLX_HOME>/logs`; the no-drafter one divided the completion tokens by the
+  whole curl request, 9.6% low on the 14-token prompt those rows used);
+  `scripts/perf-iter/bench_decode_tps.sh`; and six `scripts/bench/` campaign
+  drivers now deleted (`t1`/`t2`/`t3_final_bench.sh`,
+  `fullctx_regression_bench.sh`, `gemma_matrix_bench.sh`,
+  `final_matrix_bench.sh`). Some of the `spec_bench` rows win their `bests` cell
+  today.
+
+  Every one of these producers now takes the rate from the engine and records
+  `decode_window=` in `notes` — `engine_round_loop` for a speculative round
+  loop's own figure, `engine_itl` for the server's per-request inter-token
+  aggregate. That marker is a **positive** provenance claim, so its absence is
+  "no window was recorded", not "the value is wrong": rows from
+  `rmlx baseline`-driven producers (`ingest/perf_ab_ingest.py`, `bench_cell.sh`)
+  and `llama-bench` token-generation rows are prefill-excluded at the source and
+  also lack it. The predicate that identifies the population above is therefore
+  producer-scoped, not marker-scoped alone:
+
+  ```sql
+  SELECT * FROM observations
+  WHERE metric = 'decode_tps_warm'
+    AND (notes IS NULL OR notes NOT LIKE '%decode_window=%')
+    AND description LIKE 'spec_bench%';
+  ```
+
+  The `perf-iter` and deleted-campaign rows carry no `description` to key on;
+  they are identified only by `ts_utc` predating this change, which is why the
+  marker exists from here on. Re-measuring out-ranks any of them on merit only
+  where the corrected number is larger.
+- **`spec_bench.sh` rows labelled `kv_quant = 'k8v8'` with `prompt_tokens = 14`**
+  — the same rows, from the other direction. That script wrote both as
+  constants: it started its server with no `--kv-quant` and recorded `k8v8`
+  regardless, while the engine resolved `none` and said so in its startup log,
+  and it recorded a 14-token prompt for all three prompt files it is run with.
+  So those rows are filed under a codec the run did not use, at a prompt length
+  it did not have, and no re-measurement can out-rank them because a correctly
+  labelled run lands in a different cell. Both fields are now read back from the
+  run — the codec from the `cache-type resolved` event, the length from the
+  response's `usage.prompt_tokens` — and a run reporting neither is refused
+  rather than recorded. `k8v8` is a codec a run can legitimately use and 14 is a
+  length a prompt can legitimately have, so the constants alone do not identify
+  the population — the predicate is bounded by the same provenance marker as the
+  row above:
+
+  ```sql
+  SELECT * FROM observations
+  WHERE description LIKE 'spec_bench%'
+    AND kv_quant = 'k8v8'
+    AND prompt_tokens = 14
+    AND (notes IS NULL OR notes NOT LIKE '%decode_window=%');
+  ```
+
+  No row written after this change matches: every row the script emits now
+  carries `decode_window=`, whatever codec and prompt length it measured.
+- **`decode_config IS NULL` on a row that was speculative and never said so** —
+  migration 005 added the column and left every existing row NULL, which is what
+  ordinary decode carries, so a speculative row from before it kept sharing a
+  cell with the plain row it ranks against and kept winning it. Migration 006
+  reads the drafter back out of `notes`, which the bench scripts have recorded
+  since long before the column existed
+  (`rmlx_metrics::cell::decode_config_from_notes`), and classifies every row
+  whose own fields say what it was. What it cannot reach is a speculative run
+  that recorded no drafter marker anywhere: nothing distinguishes it from
+  ordinary decode, so it stays in the plain cell and no predicate finds it. That
+  the backfill is complete over what *is* recorded is checkable, and the check
+  is that this returns no rows:
+
+  ```sql
+  SELECT * FROM observations
+  WHERE decode_config IS NULL
+    AND notes LIKE '%draft_kind=%'
+    AND notes NOT LIKE '%draft_kind=none%'
+    AND notes NOT LIKE '%config=normal%'
+    AND notes NOT LIKE '%config=base%';
+  ```
+
+  Filling this column is not an exception to append-only. It classifies a row
+  from that row's own fields into a column that was NULL for want of existing;
+  no measurement is written, corrected or moved.
 
 Anything anchoring on a recorded rate — a roofline, a champion table, a
 `rmlx metrics rank` — should read `bests`, or one of the `query::*` functions,
@@ -1092,6 +1190,7 @@ Single JSON object per run. The recorder fans out into N `observations` rows (on
   "weight_quant":    "mxfp8",
   "kv_quant":        "k8v8",
   "ctx_max":         8192,
+  "decode_config":   null,
   "prompt": {
     "name":  "longctx_4k",
     "body":  "You are an expert ...",
@@ -1138,6 +1237,10 @@ Single JSON object per run. The recorder fans out into N `observations` rows (on
 **Optional fields** (recorder accepts missing or null):
 
 `schema_version` (defaults to 1), `git_sha`, `build_profile`, `prompt_tokens`, `max_tokens`, `temperature`, `seed`, `n_warmups`, `n_measure`, `output_first_64`, `notes`, `description`. Also `backend_version` — but only for non-rMLX backends (§8.5.1).
+
+`decode_config` is optional but is **cell identity, not context** (§3.2): absent
+or null means ordinary decode, and an emitter measuring a speculative arm must
+set it or its rows land in the plain-decode cell and rank against it.
 
 ### 8.5.1 Run identity (hard rule)
 
