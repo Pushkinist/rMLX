@@ -83,23 +83,56 @@ pub fn runtime_override() -> Option<usize> {
 /// `"laguna"`, `"qwen2"`). New archs slot in by adding a row to
 /// `arch_default()`.
 pub fn prefill_chunk_for(arch: &str) -> usize {
-    // Runtime override (adaptive prefill chunk) — highest precedence.
-    let rt = RUNTIME_OVERRIDE.load(Ordering::Acquire);
-    if rt != 0 {
-        return rt;
-    }
+    resolve(arch).0
+}
 
+/// The chunk [`prefill_chunk_for`] returns for `arch`, and the rule that
+/// produced it.
+///
+/// The number alone cannot say why a run used it, and a prefill log that
+/// records only the number leaves a reader unable to tell a tuned default from
+/// an override — which is the difference between a measurement of the shipped
+/// configuration and a measurement of somebody's environment. Both halves come
+/// from this one walk of the resolution order so they cannot disagree.
+pub fn resolve(arch: &str) -> (usize, &'static str) {
     let per_arch_var = format!("RMLX_PREFILL_CHUNK_{}", arch.to_uppercase());
-    if let Some(v) = env::var(&per_arch_var).ok().and_then(|s| s.parse().ok()) {
-        return v;
+    resolve_from(
+        RUNTIME_OVERRIDE.load(Ordering::Acquire),
+        env::var(&per_arch_var).ok().and_then(|s| s.parse().ok()),
+        env::var("RMLX_PREFILL_CHUNK")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        arch,
+    )
+}
+
+/// The resolution order itself, with its three inputs passed in.
+///
+/// Split from [`resolve`] so every rule — including the two override rules —
+/// can be driven in a test without setting a process-wide environment variable
+/// that other tests read concurrently. A label that named the wrong rule would
+/// be worse than no label: it would put an override's number in a run's record
+/// under the shipped default's name.
+fn resolve_from(
+    runtime: usize,
+    per_arch_env: Option<usize>,
+    global_env: Option<usize>,
+    arch: &str,
+) -> (usize, &'static str) {
+    // Runtime override (adaptive prefill chunk) — highest precedence.
+    if runtime != 0 {
+        return (runtime, "adaptive");
     }
-    if let Some(v) = env::var("RMLX_PREFILL_CHUNK")
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        return v;
+    if let Some(v) = per_arch_env {
+        return (v, "env_arch");
     }
-    arch_default(arch).unwrap_or(FALLBACK)
+    if let Some(v) = global_env {
+        return (v, "env_global");
+    }
+    match arch_default(arch) {
+        Some(v) => (v, "arch_default"),
+        None => (FALLBACK, "fallback"),
+    }
 }
 
 /// Map a config `architectures[0]` class name (e.g. `"Qwen3ForCausalLM"`) to

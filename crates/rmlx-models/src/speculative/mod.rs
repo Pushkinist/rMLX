@@ -1317,19 +1317,6 @@ pub(crate) fn emit_step(
     emitted.push(step);
 }
 
-/// The prefill chunk the speculative verifier uses for a checkpoint's
-/// `architectures[0]` class name.
-///
-/// The verifier prefills the same weights over the same prompt as the
-/// architecture's own generate path, so it takes the same chunk: the class
-/// resolves to its module key and then through the ordinary resolution order,
-/// which is what makes a retuned per-arch default and an
-/// `RMLX_PREFILL_CHUNK_<ARCH>` override reach speculative prefill too. An
-/// unregistered class resolves to the conservative fallback chunk.
-pub(crate) fn verifier_prefill_chunk(arch_class: &str) -> usize {
-    crate::prefill_chunk::prefill_chunk_for(crate::prefill_chunk::module_key_for_class(arch_class))
-}
-
 /// Chunked prefill of `tokens` into `caches`, mirroring the gemma4 generate
 /// path (enter_prefill / exit_prefill brackets, per-arch chunk size).
 ///
@@ -1374,13 +1361,16 @@ fn prefill_chunked_for_class(
     device: Device,
     forward: impl FnMut(&[u32], &mut [KvCache]) -> Result<()>,
 ) -> Result<()> {
-    prefill_chunked_with(
-        tokens,
-        caches,
-        verifier_prefill_chunk(arch_class),
-        device,
-        forward,
-    )
+    let (chunk_size, source) =
+        crate::prefill_chunk::resolve(crate::prefill_chunk::module_key_for_class(arch_class));
+    tracing::debug!(
+        arch = arch_class,
+        prefill_chunk = chunk_size,
+        prefill_chunk_source = source,
+        prompt_len = tokens.len(),
+        "spec prefill: chunking prompt"
+    );
+    prefill_chunked_with(tokens, caches, chunk_size, device, forward)
 }
 
 /// Bracket-and-sweep engine behind [`prefill_chunked`]: `enter_prefill` on every

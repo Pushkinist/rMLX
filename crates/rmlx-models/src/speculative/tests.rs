@@ -370,8 +370,10 @@ fn verifier_prefill_chunk_is_the_architectures_own() {
             *key,
             "{class} does not resolve to the {key} prefill-chunk key"
         );
+        let (chunk, _source) =
+            crate::prefill_chunk::resolve(crate::prefill_chunk::module_key_for_class(class));
         assert_eq!(
-            verifier_prefill_chunk(class),
+            chunk,
             crate::prefill_chunk::prefill_chunk_for(key),
             "verifier prefill chunk for {class} is not {key}'s"
         );
@@ -392,9 +394,13 @@ fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
     }
 
     for class in ["Qwen3ForCausalLM", "Gemma3ForConditionalGeneration"] {
-        let chunk = crate::prefill_chunk::prefill_chunk_for(
-            crate::prefill_chunk::module_key_for_class(class),
-        );
+        let key = crate::prefill_chunk::module_key_for_class(class);
+        // A per-arch override outranks the arch default, so under one the
+        // source assertion below would fail on a correct resolver.
+        if std::env::var(format!("RMLX_PREFILL_CHUNK_{}", key.to_uppercase())).is_ok() {
+            continue;
+        }
+        let chunk = crate::prefill_chunk::prefill_chunk_for(key);
         let tokens: Vec<u32> = (0..(chunk * 2 + 3) as u32).collect();
         let mut seen: Vec<usize> = Vec::new();
         let result =
@@ -408,5 +414,12 @@ fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
             vec![chunk, chunk, 3],
             "{class} prefill did not cut the prompt at its own chunk"
         );
+        // The `prefill_chunk` field the prefill logs is the size it actually
+        // cut at, not a second opinion — a log that can disagree with the run
+        // is what made the chunk unrecoverable from a run's record before.
+        let (logged, source) =
+            crate::prefill_chunk::resolve(crate::prefill_chunk::module_key_for_class(class));
+        assert_eq!(logged, chunk, "{class}: logged chunk is not the one used");
+        assert_eq!(source, "arch_default", "{class}: unexpected chunk source");
     }
 }

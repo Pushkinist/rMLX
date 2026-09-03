@@ -721,6 +721,12 @@ arch default > 64 fallback**):
 - `RMLX_PREFILL_CHUNK_<ARCH>=<n>` — per-arch, ARCH upper-cased, e.g.
   `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256`.
 
+Every chunked prefill emits the resolved size and the rule that produced it as
+`debug!` fields — `prefill_chunk` plus `prefill_chunk_source`
+(`arch_default` / `env_arch` / `env_global` / `adaptive`) — so a run's log says
+what it chunked at instead of leaving it to be inferred from timings. Two
+sweeps had to infer it by collapsing the environment before this existed.
+
 `scripts/prefill_chunk_sweep.sh` drives the per-arch sweep those overrides
 exist for, and records its cells in the metrics DB under
 `decode_config = 'prefill_chunk=<n>'`.

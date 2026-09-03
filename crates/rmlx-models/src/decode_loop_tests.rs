@@ -1024,3 +1024,53 @@ fn reject_nan_prefill_only_trusts_dtypes_the_scan_actually_reads() {
         );
     }
 }
+
+/// The chunk the generate-path prefill logs is the one it cut the prompt at.
+///
+/// `chunked_prefill` re-derives the resolved chunk to label its event, so the
+/// label can disagree with the `chunk_size` it was handed. That disagreement is
+/// the whole failure mode the field exists to prevent: a run's record has no
+/// other trace of the chunk, so a wrong label is worse than none. Both cases
+/// are pinned — the caller that passes the resolved chunk is reported as its
+/// own source, and one that passes anything else is reported as `caller`.
+#[test]
+fn chunked_prefill_logs_the_chunk_it_cut_at() {
+    let _g = mlx_guard();
+    let arch = "Qwen3ForCausalLM";
+    let key = crate::prefill_chunk::module_key_for_class(arch);
+    // Both override rules outrank the arch default, and the per-arch one is
+    // the easy miss: with it set the source really is `env_arch`, so asserting
+    // `arch_default` would fail on a correct resolver and pass on one that
+    // mislabels an override.
+    if std::env::var("RMLX_PREFILL_CHUNK").is_ok()
+        || std::env::var(format!("RMLX_PREFILL_CHUNK_{}", key.to_uppercase())).is_ok()
+    {
+        return;
+    }
+    let (resolved, source) = crate::prefill_chunk::resolve(key);
+    assert_eq!(source, "arch_default");
+    assert_eq!(resolved, crate::prefill_chunk::prefill_chunk_for(key));
+
+    let mut caches: Vec<KvCache> = (0..2)
+        .map(|_| KvCache::with_quant_max_seq(KvQuant::None, 8))
+        .collect();
+    let ids: Vec<u32> = (0..(resolved as u32 * 2 + 3)).collect();
+    let mut seen: Vec<usize> = Vec::new();
+    let forward_chunk = |chunk: &[u32], _caches: &mut Vec<KvCache>| -> Result<Array> {
+        seen.push(chunk.len());
+        Err(Error::Other("stop after recording the slice".to_owned()))
+    };
+    let _ = chunked_prefill(
+        &mut caches,
+        &ids,
+        resolved,
+        Device::Cpu,
+        arch,
+        forward_chunk,
+    );
+    assert_eq!(
+        seen,
+        vec![resolved],
+        "prefill did not cut at the resolved chunk"
+    );
+}

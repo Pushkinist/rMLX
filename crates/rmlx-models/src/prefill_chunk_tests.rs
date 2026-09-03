@@ -90,3 +90,37 @@ fn unknown_arch_falls_back() {
     }
     assert_eq!(prefill_chunk_for("bogus"), FALLBACK);
 }
+
+/// Every rule in the resolution order reports its own name.
+///
+/// The chunk a run prefilled at is logged with the rule that produced it, and
+/// the two are read together: a label that named the arch default while an
+/// override supplied the number would describe a measurement of somebody's
+/// environment as a measurement of the shipped configuration. Driven through
+/// `resolve_from` so the override rules are covered without setting a
+/// process-wide variable that the tests above read.
+#[test]
+fn each_resolution_rule_reports_its_own_source() {
+    // Precedence order, each rule winning in turn with every lower rule also
+    // supplied — so a label is pinned to its rule, not to "the only input set".
+    assert_eq!(
+        resolve_from(1024, Some(512), Some(256), "qwen3"),
+        (1024, "adaptive")
+    );
+    assert_eq!(
+        resolve_from(0, Some(512), Some(256), "qwen3"),
+        (512, "env_arch")
+    );
+    assert_eq!(
+        resolve_from(0, None, Some(256), "qwen3"),
+        (256, "env_global")
+    );
+    assert_eq!(
+        resolve_from(0, None, None, "qwen3"),
+        (arch_default("qwen3").unwrap_or(FALLBACK), "arch_default")
+    );
+    assert_eq!(
+        resolve_from(0, None, None, "no_such_arch"),
+        (FALLBACK, "fallback")
+    );
+}
