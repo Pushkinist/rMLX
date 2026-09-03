@@ -15,7 +15,22 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 # Local config: copy .env.example → .env and set your machine paths there.
 # `-include` is silent when absent. Values become make variables (and the model
 # root is exported below so bench scripts inherit it).
+#
+# A makefile assignment outranks the environment, so a `.env` line would silently
+# beat `export RMLX_O_MODELS_ROOT=…` — the very form the comment below calls
+# equivalent, and a shell override would appear to work while the run used the
+# `.env` path. The environment value is captured before the include and put back
+# after it, leaving the precedence: command line > environment > `.env` >
+# repo-local `models/` fallback. `origin` is what makes that exact — a value
+# given on the command line is not captured here, and make refuses to let a
+# makefile assignment override one anyway.
+ifeq ($(origin RMLX_O_MODELS_ROOT),environment)
+RMLX_O_MODELS_ROOT_FROM_ENV := $(RMLX_O_MODELS_ROOT)
+endif
 -include $(REPO_ROOT)/.env
+ifneq ($(strip $(RMLX_O_MODELS_ROOT_FROM_ENV)),)
+RMLX_O_MODELS_ROOT := $(RMLX_O_MODELS_ROOT_FROM_ENV)
+endif
 
 # Model-snapshot root — the single directory holding your downloaded
 # mlx-community__* / prism-ml__* / z-lab__* snapshots. Set it once:

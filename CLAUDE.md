@@ -88,8 +88,9 @@ repos rather than reinventing.
 ## Test targets
 
 Under `RMLX_O_MODELS_ROOT` (the dev checkout uses `../../O-Models/`; public
-users set it via `.env`). At minimum these three families must serve
-end-to-end at every change:
+users set it via `.env`, a shell export, or a `make` command-line variable —
+in that order of increasing precedence). At minimum these three families must
+serve end-to-end at every change:
 
 | Family | Example snapshot | Arch |
 |---|---|---|

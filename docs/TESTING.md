@@ -94,6 +94,18 @@ former `RMLX_TEST_MODEL_WHISPER` knob was removed.
 |----------|---------|---------|
 | `RMLX_O_MODELS_ROOT` | Root directory containing all model snapshots. Used by fixture generators and integration helpers that resolve snapshots by slug. | `./models` (repo-local fallback; set RMLX_O_MODELS_ROOT) |
 
+**Precedence through `make`:** command-line variable > environment > `.env` >
+the repo-local `models/` fallback. A makefile assignment normally outranks the
+environment, so the `-include`d `.env` used to win over a shell export and the
+run would quietly use the `.env` path while looking redirected. The Makefile now
+captures the environment value before the include and restores it after, so
+these two mean the same thing:
+
+```bash
+RMLX_O_MODELS_ROOT=/tmp/empty make gpu-test CRATE=rmlx-models
+make gpu-test CRATE=rmlx-models RMLX_O_MODELS_ROOT=/tmp/empty
+```
+
 ## E2E harness — data-driven model specs
 
 The E2E harness (`crates/rmlx-cli/tests/e2e/`, `make e2e`) resolves a manifest
@@ -1136,6 +1148,13 @@ bounds the MTLBuffer rather than the array, so absence of a diagnostic is not
 absence of an out-of-bounds access. A count that came in low is never edited down
 to fit the run in front of you — re-derive it from a full run and record what
 changed.
+
+To exercise the skipped-entry path on a machine that *does* hold the snapshots,
+point the root at an empty directory — `make gpu-test CRATE=rmlx-models
+RMLX_O_MODELS_ROOT=/tmp/empty`, or the same as an environment prefix; both forms
+redirect it (see "Directory root variable" above for the precedence, and for why
+the prefix form used to be ignored whenever a `.env` existed). Every pinned test
+then skips, and the run reports each entry as not enforced rather than going red.
 
 `scripts/run_gpu_tests_selftest.sh` (in `make ci`, no GPU) pins every verdict and
 every pin-file refusal above against a stub runner, and one of its cases parses
