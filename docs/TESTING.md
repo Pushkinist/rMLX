@@ -94,6 +94,18 @@ former `RMLX_TEST_MODEL_WHISPER` knob was removed.
 |----------|---------|---------|
 | `RMLX_O_MODELS_ROOT` | Root directory containing all model snapshots. Used by fixture generators and integration helpers that resolve snapshots by slug. | `./models` (repo-local fallback; set RMLX_O_MODELS_ROOT) |
 
+**Precedence through `make`:** command-line variable > environment > `.env` >
+the repo-local `models/` fallback. A makefile assignment normally outranks the
+environment, so the `-include`d `.env` used to win over a shell export and the
+run would quietly use the `.env` path while looking redirected. The Makefile now
+captures the environment value before the include and restores it after, so
+these two mean the same thing:
+
+```bash
+RMLX_O_MODELS_ROOT=/tmp/empty make gpu-test CRATE=rmlx-models
+make gpu-test CRATE=rmlx-models RMLX_O_MODELS_ROOT=/tmp/empty
+```
+
 ## E2E harness — data-driven model specs
 
 The E2E harness (`crates/rmlx-cli/tests/e2e/`, `make e2e`) resolves a manifest
@@ -750,8 +762,11 @@ It is fail-closed in three ways:
 * **Exclusive GPU.** It refuses to start while another MLX process holds the
   Metal context (CLAUDE.md hard rule 8).
 
-**The suite is not known to be green on `main`, and this runner tracks no
-known-red list.** It used to claim the opposite, in the failure banner and here.
+**No test in this suite is known-red on `main`, and this runner tracks no
+known-red list of tests.** (Shader-validation hits are the one thing it does
+track a baseline for, and that baseline is exact — see the census pin below. It
+covers hits, never a failing test.) It used to claim the opposite, in the failure
+banner and here.
 That claim is what turns an inherited failure into a waved-through one — either
 direction: a real regression read as "the known one", or hours spent on a red
 that predates the branch. A failure is attributable only after the same crate
@@ -761,11 +776,11 @@ separates the two cases. A list of currently-known failures is deliberately not
 kept here — it would rot into exactly the false assurance it replaced, and a
 comparison against the base commit is always current.
 
-Note that a failure of this runner is not only a failing test: the Metal
-shader-validation aggregate fails it too, on a crate whose tests all passed. An
-out-of-bounds device store is dropped rather than raised, so the tests can pass
-while the GPU reads or writes memory it does not own — which is precisely a
-result no test result can be read for.
+Note that a failure of this runner is not only a failing test: a Metal
+shader-validation hit the census pin does not account for fails it too, on a
+crate whose tests all passed. An out-of-bounds device store is dropped rather
+than raised, so the tests can pass while the GPU reads or writes memory it does
+not own — which is precisely a result no test result can be read for.
 
 Read the diagnostic's own wording before assuming that is what happened. A
 *store* is corruption; a *load* is illegal but can only affect the result if the
@@ -800,7 +815,8 @@ silently. `scripts/run_gpu_tests_selftest.sh` (`make gpu-runner-selftest`, in
 no GPU: a canned libtest log per crate carries a validation hit, a failing test,
 an under-match, a missing banner and two diagnostics sharing one output line, and
 each case asserts the reason that reaches the final report rather than only the
-exit code.
+exit code. The census-pin verdicts are pinned in the same file, by the same
+means.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 
@@ -1030,8 +1046,9 @@ narrowed run can attribute anything to), not a directly observed clean pass
 over each of the other four individually — `run_gpu_tests.sh` prints a
 per-crate line only for a crate with a nonzero hit count.
 `rmlx-models` does not — it reports 160 invalid device **loads**, all in MLX's
-own `affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false`, so the aggregate fails
-and `make ci-perf` has no green state. The cause is in
+own `affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false`. Those 160 are pinned
+(next section), so a run that reproduces them exactly is green and prints the
+census it accepted. The cause is in
 `mlx/backend/metal/kernels/quantized.h`: `QuantizedBlockLoader::load_safe`
 bounds its row index against the tile's column extent, so the guard never fires
 and a transposed quantized matmul whose `N` is not a multiple of the kernel's
@@ -1053,6 +1070,97 @@ clean scan is evidence about reporting, not about memory safety.
 The full investigation, the reproducer, the pinned-MLX `PYTHONPATH` needed to
 repeat it, and the reason no caller-side workaround was taken live in
 `.rmlx/mlx-qmm-t-tail-row-oob.md`.
+
+#### The census pin
+
+A gate that is red on every run is the inverse of a vacuous one: its exit code
+stops carrying information, everyone learns to read `Error 1` as background
+noise, and the next real hit arrives inside the standing one. That is what a
+diagnostic from a kernel this repo neither compiles nor can fix would otherwise
+do to `make gpu-test` and `make ci-perf`.
+
+So the accepted hits are pinned, in `scripts/gpu_validation_census.txt`, **one
+entry per originating test** carrying that test's own count, the crate it
+belongs to, and the reference to the analysis that says the hit is benign. The
+three entries there were measured one test at a time
+(`make gpu-test CRATE=rmlx-models FILTER=<test>`) and sum to the 160 a full run
+reports: 40 from `qwen3_5_moe_forward_seq_last_k_equals_reference`, 80 from
+`thinking_budget_exact_hit_qwen3_5_moe`, 40 from `qwen3_moe_golden_tokens_k8v8`.
+A fourth Qwen3.5-MoE cell contributes nothing: it resolves only from
+`RMLX_TEST_MODEL_QWEN36` and skips here.
+
+For each `(crate, access kind, kernel)` the runner expects **the sum of the
+pinned counts whose test actually ran in this run**. A test the selection
+dropped, and a test that announced its own skip, each contribute 0. That is what
+keeps the comparison exact in a narrowed run and on a machine with no snapshots,
+instead of waived there — the most targeted run of all, a `FILTER=` on the very
+test an entry names, is enforced against that entry's own count.
+
+Whether a test skipped is **observed, not inferred**: the runner harvests the
+`SKIP <test>: <why>` notice the test's own model gate prints. Inferring it from
+whether a directory exists gets it wrong in both directions — a variable can
+point at a snapshot outside the models root (the test runs, the directory is
+absent, a real down-move would be swallowed), and a half-written slug directory
+exists while the test skips on it. Harvesting the notice is why the suite runs
+under `--nocapture`: libtest discards a passing test's output, and a cell that
+skips is a passing test. An entry's test must therefore print a **named** skip
+notice; `SKIP: <why>` without the name is invisible to this.
+
+| observed | verdict |
+|---|---|
+| the expectation exactly, nothing else | pass, printing the census it accepted |
+| a kernel the pin does not name | fail — `not pinned: N <kind> "<kernel>" in <crate>` |
+| the same total in a different crate | fail — `not pinned` there, `no longer fires` where it was pinned |
+| above the expectation | fail — `count moved up: … expected N, observed M` |
+| below the expectation | fail — the pin is stale, re-derive it |
+| nothing, where the expectation is positive | fail — `no longer fires`, same reason from the pin's side |
+| any store, pinned kernel or not | fail — a dropped write is corruption |
+| an entry whose test was not selected | pass, reported as `not enforced in full` |
+| an entry whose test skipped | pass, reported as `not enforced in full` |
+
+The pin file itself is checked as it is read, and each of these is a failure
+rather than a dropped line — a silently dropped entry turns its kernel's hits
+into unpinned ones on the next run, and a silently dropped *test name* would
+remove that entry's count from every expectation for ever, leaving an entry that
+can no longer fail:
+
+| pin defect | reason reported |
+|---|---|
+| not six `\|`-separated fields | `line N: expected 6 fields — …` |
+| count not a positive integer | `line N: count '<x>' is not a positive integer` |
+| a kind naming a store | `line N: a store is never pinnable — …` |
+| a test that is not a classified GPU test of that crate | `line N: <crate> has no classified GPU test '<test>'` |
+| the same kernel, kind and test twice | `line N: … is pinned twice …` |
+| the file missing altogether | `<path> not found — the census pin is tracked` |
+
+A run that accepted every entry says `census matches the pin`; a run that could
+not check them all says `census NOT enforced in full` and names each entry it
+did not count, on the summary line as well. The two never share wording, because
+a reader who sees the same sentence either way learns nothing from it.
+
+**Updating the pin** takes one of two things and nothing else: a linked upstream
+reference showing the defect is not ours and does not reach our output, or an
+analysis of the standard of the one above — the symbol's provenance, a
+load/store census over *every* diagnostic rather than a sample, and a
+demonstration that the loaded lanes do not reach the output. A passing test
+suite is not that demonstration, and neither is a quiet run: the validation layer
+bounds the MTLBuffer rather than the array, so absence of a diagnostic is not
+absence of an out-of-bounds access. A count that came in low is never edited down
+to fit the run in front of you — re-derive it from a full run and record what
+changed.
+
+To exercise the skipped-entry path on a machine that *does* hold the snapshots,
+point the root at an empty directory — `make gpu-test CRATE=rmlx-models
+RMLX_O_MODELS_ROOT=/tmp/empty`, or the same as an environment prefix; both forms
+redirect it (see "Directory root variable" above for the precedence, and for why
+the prefix form used to be ignored whenever a `.env` existed). Every pinned test
+then skips, and the run reports each entry as not enforced rather than going red.
+
+`scripts/run_gpu_tests_selftest.sh` (in `make ci`, no GPU) pins every verdict and
+every pin-file refusal above against a stub runner, and one of its cases parses
+the **tracked** pin against the real classifier's population, so a committed pin
+that is malformed or names a renamed test fails `make ci` rather than waiting for
+a machine with a GPU.
 
 ### `#[ignore]` is not a place to park a broken test
 

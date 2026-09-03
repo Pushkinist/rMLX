@@ -1,0 +1,73 @@
+# gpu_validation_census.txt — the Metal shader-validation hits this tree accepts.
+#
+# `scripts/run_gpu_tests.sh` instruments every Metal pipeline and scans for
+# invalid-access diagnostics. Some of them come from a kernel this repo neither
+# compiles nor can fix, and failing every run on those teaches their readers to
+# read `Error 1` as background noise — at which point the next real hit is
+# invisible. This file is what makes the two distinguishable.
+#
+# ONE ENTRY PER ORIGINATING TEST, carrying that test's own hit count. The runner
+# expects, for a given (crate, kind, kernel), the sum of the counts whose test
+# actually ran in this run — a test the selection dropped, or one that announced
+# its own skip for want of a model, contributes 0. So a narrowed run and a
+# machine with no snapshots are compared exactly, against a smaller number,
+# rather than waived. Then:
+#
+#   * observed == expected, with no unpinned hit and no store, passes and prints
+#     the census it accepted;
+#   * a new kernel, a count above the expectation, a count below it, a kernel
+#     that stopped firing, a hit in a different crate, or any store at all,
+#     fails and names the delta.
+#
+# A count that came in low is a failure because a pin that drifts downward one
+# hit at a time ends up describing whatever the tree does today rather than what
+# was validated. Re-derive it from a full run instead.
+#
+# Fields, `|`-separated, six of them:
+#
+#   kernel    | the kernel function named in the diagnostic, verbatim
+#   kind      | the access as the layer worded it (`device load`); a store is
+#             | never pinnable — an invalid write is corruption, not a
+#             | validated-benign read, so the runner refuses such an entry
+#   count     | this test's own number of diagnostics, measured by running that
+#             | test alone (`make gpu-test CRATE=<crate> FILTER=<test>`)
+#   crate     | the workspace member the test belongs to
+#   test      | exactly one test fn name. It must be a classified GPU test, and
+#             | it must print a NAMED `SKIP <test>: <why>` notice when it skips,
+#             | or its count will be expected on a machine that cannot produce it
+#   reference | where the analysis lives that says this hit is benign
+#
+# The reference field is the one place in this repo where an issue link is
+# deliberate rather than forbidden: an accepted invalid access has to carry the
+# evidence that accepted it, the runtime output prints that field so the reader
+# never has to go looking, and a URL — unlike a bare ticket number — still
+# resolves once the ticket is out of anyone's working memory.
+#
+# TO ADD OR CHANGE AN ENTRY you need one of two things, and nothing else counts:
+# a linked upstream reference showing the defect is not ours and not reachable
+# into our output, or an analysis of the same standard as the one below —
+# provenance of the symbol, a load/store census over every diagnostic, and a
+# demonstration that the loaded lanes do not reach the output. Neither a passing
+# test suite nor a quiet run is evidence: the validation layer bounds the
+# MTLBuffer rather than the array, so absence of a diagnostic is not absence of
+# an out-of-bounds access.
+#
+# kernel | kind | count | crate | test | reference
+#
+# The three entries below are MLX's own quantized matmul, not a kernel this repo
+# compiles or can specialise. `QuantizedBlockLoader::load_safe` in
+# `mlx/backend/metal/kernels/quantized.h` bounds its row index against the
+# tile's COLUMN extent, so the guard can never fire and a transposed quantized
+# matmul whose N is not a multiple of the output tile width reads the
+# out-of-range rows of the packed weight and the scales. rMLX passes correctly
+# sized operands; the reachable tensor is a 1-row quantized `shared_expert_gate`,
+# which is legal input. Every diagnostic is a load, and the loaded lanes were
+# shown bitwise not to reach the output — including with the out-of-range rows
+# held at NaN under the same kernel instantiation. The selector is identical in
+# the next MLX release, so moving the pinned MLX does not remove it.
+#
+# All three run `mlx-community__Qwen3.6-35B-A3B-8bit`; the counts were measured
+# one test at a time and sum to the 160 a full run reports.
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_5_moe_forward_seq_last_k_equals_reference | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 80 | rmlx-models | thinking_budget_exact_hit_qwen3_5_moe | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_moe_golden_tokens_k8v8 | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
