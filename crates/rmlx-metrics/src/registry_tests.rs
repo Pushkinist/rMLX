@@ -66,6 +66,9 @@ fn every_spec_metric_present() {
         "tpot_p50_ms",
         "tpot_p95_ms",
         "tpot_p99_ms",
+        // one per `rmlx eval ppl` scorer: the cacheless full-window forward and
+        // the cache-bearing teacher-forced one do not measure the same thing.
+        "ppl_wikitext2_cached",
     ];
     for name in spec_names {
         assert!(
@@ -74,7 +77,7 @@ fn every_spec_metric_present() {
         );
     }
     // METRICS row count — bump when adding new metric ops.
-    assert_eq!(METRICS.len(), 55, "METRICS should have exactly 55 rows");
+    assert_eq!(METRICS.len(), 56, "METRICS should have exactly 56 rows");
 }
 
 #[test]
