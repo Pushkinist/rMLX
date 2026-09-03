@@ -9,25 +9,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The Homebrew formula no longer advertises a bottle it does not have.** A
-  `bottle do` block names a `root_url` pinned to one release, but Homebrew
-  derives the bottle *filename* from the formula's current version — so a block
-  left in place across a version bump sends `brew install` after a bottle that
-  was never built, under the previous release's URL. The block shipped pinned to
-  `v0.3.0` through both 0.3.0 and 0.4.0 while the only bottle asset in existence
-  was `rmlx-0.3.0.arm64_tahoe.bottle.tar.gz`, and `brew info` reported
-  `(bottled)` the whole time. Nothing in the release flow regenerated it and
-  nothing failed when it went stale.
+- **The bench scripts record the decode rate the engine measured, not one they
+  derive themselves.** `scripts/spec_bench.sh` read the speculative round loop's
+  `done` line and divided `emitted` by `elapsed_ms`. That elapsed covers the
+  prompt prefill, so the quotient is not decode throughput and reads low —
+  233.6 tok/s against the 276.3 the round loop measured, on a code prompt, on
+  this host. The engine has reported the prefill-excluded rate on that same line
+  as `decode_tps` since the round loops were corrected; nothing was reading it.
+  Its no-drafter arm divided the completion tokens by the whole curl request,
+  which is `overall_tps` recorded under `decode_tps_warm` and measured 9.6% low
+  on the prompt those rows used. `scripts/perf-iter/bench_decode_tps.sh`, which
+  `make perf-iter` runs across three models, had the same whole-request form.
 
-  The block is removed rather than refreshed, so `brew install rmlx` builds from
-  source — which is what `depends_on "rust" => :build` always described.
-  Reinstating a bottle needs the ABI coupling solved first, not a fresh sha: a
-  bottle is linked against the builder's `mlx-c`, that dependency is
-  deliberately unversioned, and `mlx-pin.txt` records that a mismatched
-  mlx / mlx-c pair aborts at load with a dyld `Symbol not found`. A source build
-  links the user's own pair and cannot hit that. `docs/RELEASING.md` step 8
-  records the decision; `scripts/release/build_bottle.sh` and `make bottle` are
-  kept but are no longer part of the flow.
+  All of them now report the first-emitted-token to last-emitted-token window
+  `docs/SPECULATIVE.md` has always claimed for these tables. Two readers own it:
+  `scripts/lib/spec_round_log.py` for a round loop's own logged rate, and
+  `scripts/lib/server_decode_tps.py` for the rate the server derives from a
+  request's inter-token gaps and publishes at `GET /metrics/cache`, which is the
+  same quantity for an arm that has no round loop. Each reading is cross-checked
+  against the same window timed client-side, and a disagreement past a stated
+  band stops the run instead of choosing between them.
+
+  The readers refuse rather than guess: a `decode_tps` that is a bare number
+  instead of `Some(x)` / `None` means an older binary wrote the log and the only
+  rate in it is the contaminated one; a `None` is the engine saying there was no
+  interval to measure; a log holding fewer round-loop records than requests
+  served no longer silently averages whatever is left; and a request the server
+  cannot attribute an inter-token sample to is not read off the previous one.
+
+  Six `scripts/bench/` campaign drivers that wrote the same wrong column
+  (`t1`/`t2`/`t3_final_bench.sh`, `fullctx_regression_bench.sh`,
+  `gemma_matrix_bench.sh`, `final_matrix_bench.sh`) are deleted rather than
+  fixed: none had a caller, and a driver nobody invokes that writes an
+  uncorrectable row when someone does is not reproducibility.
+
+  `scripts/spec_bench_selftest.sh` drives the whole script against a stub server
+  and is a hard-fail step of `make ci`. The rows written before this are named
+  by a predicate in `docs/METRICS_DB.md`, since `observations` is append-only
+  and the values sit inside the metric's plausible-value bound where no gate can
+  reach them.
+
+- **A speculative-decode arm no longer takes the champion cell of a plain-decode
+  one.** The `bests` cell key named what was measured but nothing about how the
+  tokens were produced, so a drafter's rate and a plain rate for the same model,
+  quant and prompt ranked against each other and the larger published as that
+  model's decode throughput — 276 tok/s standing in for the 142 a request
+  without a drafter gets. Migration 005 adds `observations.decode_config` and
+  the view partitions on it; `NULL` is ordinary decode, which is what every
+  earlier row carries, so no existing plain-decode cell moves.
+
+- **`spec_bench.sh` records the codec and prompt length the run actually had.**
+  It wrote `kv_quant = "k8v8"` and `prompt_tokens = 14` as constants while
+  starting its server with no `--kv-quant` at all — the engine resolved `none`
+  and said so — and while being run against three different prompt files. The
+  codec now comes from the run's `cache-type resolved` event and the length from
+  the response's `usage.prompt_tokens`; a run that reports neither is refused
+  rather than filed under a guess. That event now names the codec through
+  `Display` rather than `Debug`, so what it prints is the name the flag accepts
+  and the DB records instead of `None` or `Mixed { .. }`. `perf_canary.sh` was
+  the other reader of that event and carried a chain of `sed` rules translating
+  the `Debug` form into a tag; every branch of it is dead now, so it is gone and
+  the canary reads the field through the same one reader. Its CSV therefore
+  changes spelling at this commit — `docs/PERF_BASELINE.md` records the
+  changeover.
+
+- **Rows written before `decode_config` existed say what they were.** Adding the
+  column left every existing row NULL, which is what ordinary decode carries, so
+  a speculative row from before it kept sharing a cell with the plain row it
+  ranks against and kept winning it — on `gemma-4-e4b-it-mxfp8 / none / 16384` a
+  drafter's 160.32 tok/s published as that model's decode throughput against the
+  83.70 a request without one gets. The bench scripts have recorded the drafter
+  in `notes` since long before there was a column for it, so migration 006 reads
+  it back and classifies every row whose own fields say what it was: 140 rows
+  across six drafter configurations. It writes no measurement — the column was
+  NULL for want of existing, not because anything measured it. A run that
+  recorded no drafter marker anywhere is indistinguishable from ordinary decode
+  and stays in the plain cell; `docs/METRICS_DB.md` says so and gives the query
+  that shows nothing recoverable was left behind.
+
+- **Everything that looks a cell up keys on the whole cell.** `decode_config`
+  reached the `bests` view and none of its consumers: `rmlx metrics best`
+  returned whichever arm the view yielded first, `compare` overwrote one arm
+  with the other, `history` and `timeseries` mixed and averaged them, and
+  `deltas --exit-code` — a CI gate — read the drafter's rate as the plain cell's
+  improvement. The cell key now lives in one place, `rmlx_metrics::cell`, and
+  every one of those SQL bodies renders its `WHERE` from it. A test enumerates
+  the bodies and asserts each binds every column, so the next column cannot
+  reach the view and stop there. The nullable column is compared with `IS`: a
+  `= NULL` would make an ordinary-decode cell match no row at all. `export`
+  carries the column in its CSV and gives the markdown table a `Decode` column
+  rather than emitting two identically-labelled rows.
+
+- **`spec_bench.sh` describes the snapshot it served.** `model_namespace`,
+  `model`, `weight_quant` and `ctx_max` were constants naming one checkpoint.
+  The first three now come from the snapshot — the `__` split of its directory
+  name and its own `config.json` — and `ctx_max` is passed to the server with
+  `--max-ctx` and recorded. Its run log is now identified by the pid its
+  `rmlx start` event reports rather than by being the last new file in the
+  directory, so another rmlx process writing there cannot supply the log a phase
+  reads as its own.
+
+- **`perf-iter/bench_decode_tps.sh` keeps its state under `<RMLX_HOME>`.** It
+  created `metrics/buffer/` relative to the working directory, so running it
+  from anywhere but the repo root left a stray tree there, and it stamped a
+  `git_sha` with a `-dirty` suffix — not a commit, and nothing can look the row's
+  code up by it. Identity comes from `lib/identity.sh` like every other bench
+  script, and a dirty tree now records no `git_sha` at all.
 
 ## [0.4.1] - 2026-09-02
 

@@ -132,6 +132,10 @@ pub(crate) enum MetricsAction {
         /// Server max-ctx at run time (default 8192).
         #[arg(long, default_value_t = 8192)]
         ctx_max: i64,
+        /// How the tokens were produced; omit for ordinary decode. Part of the
+        /// cell key, so a speculative arm is a different cell from a plain one.
+        #[arg(long)]
+        decode_config: Option<String>,
         /// Prompt id (FK into prompts table). Mutually exclusive with --prompt-name.
         #[arg(long, conflicts_with = "prompt_name")]
         prompt_id: Option<i64>,
@@ -184,6 +188,10 @@ pub(crate) enum MetricsAction {
         kv_quant: String,
         #[arg(long, default_value_t = 8192)]
         ctx_max: i64,
+        /// How the tokens were produced; omit for ordinary decode. Part of the
+        /// cell key, so a speculative arm is a different cell from a plain one.
+        #[arg(long)]
+        decode_config: Option<String>,
         #[arg(long, conflicts_with = "prompt_name")]
         prompt_id: Option<i64>,
         #[arg(long, conflicts_with = "prompt_id")]
@@ -210,6 +218,10 @@ pub(crate) enum MetricsAction {
         kv_quant: String,
         #[arg(long, default_value_t = 8192)]
         ctx_max: i64,
+        /// How the tokens were produced; omit for ordinary decode. Part of the
+        /// cell key, so a speculative arm is a different cell from a plain one.
+        #[arg(long)]
+        decode_config: Option<String>,
         #[arg(long, conflicts_with = "prompt_name")]
         prompt_id: Option<i64>,
         #[arg(long, conflicts_with = "prompt_id")]
@@ -383,6 +395,7 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
             weight_quant,
             kv_quant,
             ctx_max,
+            decode_config,
             prompt_id,
             prompt_name,
             metric,
@@ -394,6 +407,7 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
             &weight_quant,
             &kv_quant,
             ctx_max,
+            decode_config,
             prompt_id,
             prompt_name.as_deref(),
             &metric,
@@ -426,6 +440,7 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
             weight_quant,
             kv_quant,
             ctx_max,
+            decode_config,
             prompt_id,
             prompt_name,
             metric,
@@ -438,6 +453,7 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
             &weight_quant,
             &kv_quant,
             ctx_max,
+            decode_config,
             prompt_id,
             prompt_name.as_deref(),
             metric.as_deref(),
@@ -450,6 +466,7 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
             weight_quant,
             kv_quant,
             ctx_max,
+            decode_config,
             prompt_id,
             prompt_name,
             metric,
@@ -463,6 +480,7 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
             &weight_quant,
             &kv_quant,
             ctx_max,
+            decode_config,
             prompt_id,
             prompt_name.as_deref(),
             &metric,

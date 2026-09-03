@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spec_bench.sh — bench gemma-4-e2b-it-mxfp8 in normal vs MTP speculative-decode mode.
+# spec_bench.sh — bench one model in normal vs MTP speculative-decode mode.
 #
 # Usage:
 #   bash scripts/spec_bench.sh [--port N] [--dry-run]
@@ -13,6 +13,16 @@
 # Output:
 #   - Two RunRecord JSON files written + ingested into runs.db
 #   - Final comparison table printed to stdout
+#
+# Measurement basis (docs/SPECULATIVE.md):
+#   Both arms report the decode rate the engine measured, over the window from
+#   the first emitted token to the last, prefill excluded — so the two rows mean
+#   the same thing and the delta between them is a decode-rate delta. The
+#   speculative arm takes the rate the round loop logged; the no-drafter arm
+#   takes the one the server derives from that request's inter-token gaps and
+#   publishes at GET /metrics/cache. Each arm is cross-checked against the same
+#   window timed client-side, and a disagreement past CROSS_CHECK_BAND_PCT is a
+#   refusal, not a choice between them.
 #
 # Hard constraints honoured:
 #   - Preflight (pkill + claim-file delete) before each server start
@@ -35,6 +45,7 @@ RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 LOG_DIR="${RMLX_HOME}/logs"
 BUFFER_DIR="${RMLX_HOME}/metrics/buffer/pending"
 DB_PATH="${RMLX_HOME}/metrics/runs.db"
+SCRATCH_DIR="${RMLX_HOME}/tmp"
 GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
 
 # Model paths — must be set via env. Concrete absolute paths live in LOCAL.md
@@ -66,10 +77,22 @@ TEMPERATURE=0
 SEED=42
 DRAFT_KIND="mtp"
 DRAFT_BLOCK_SIZE=5
+# Empty means "let the engine resolve one", which it always does and always
+# names in its startup log. Either way the recorded kv_quant is read back from
+# that log, never assumed here. Set with --kv-quant.
+KV_QUANT=""
+# Passed to the server and recorded, so the ctx_max column describes the run
+# rather than the value this script was written against.
+MAX_CTX=8192
 HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
+# How far the client-observed decode window may sit from the engine's own
+# reading of the same window before the run is refused. One network hop on
+# loopback, not a measurement difference.
+CROSS_CHECK_BAND_PCT=10
 
 DRY_RUN=false
 BENCH_TAG=""
+KV_QUANT_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=true; shift ;;
@@ -77,9 +100,17 @@ while [[ $# -gt 0 ]]; do
         --port) shift; PORT="${1:?--port requires a value}"; shift ;;
         --tag=*) BENCH_TAG="${1#--tag=}"; shift ;;
         --tag) shift; BENCH_TAG="${1:?--tag requires a value}"; shift ;;
+        --kv-quant=*) KV_QUANT="${1#--kv-quant=}"; shift ;;
+        --kv-quant) shift; KV_QUANT="${1:?--kv-quant requires a value}"; shift ;;
+        --max-ctx=*) MAX_CTX="${1#--max-ctx=}"; shift ;;
+        --max-ctx) shift; MAX_CTX="${1:?--max-ctx requires a value}"; shift ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
+
+if [[ -n "${KV_QUANT}" ]]; then
+    KV_QUANT_ARGS=(--kv-quant "${KV_QUANT}")
+fi
 
 # ── Prompt body ───────────────────────────────────────────────────────────────
 #
@@ -103,7 +134,7 @@ fi
 
 # The server registers models by their full snapshot directory basename
 # (namespace__model), so the "model" field in OpenAI requests must use that.
-MODEL_ID="mlx-community__gemma-4-e2b-it-mxfp8"
+MODEL_ID="$(basename "${VERIFIER_MODEL%/}")"
 
 # JSON-escape PROMPT_CONTENT via python3 so quotes/backslashes in canonical
 # prompt files don't corrupt the curl payload.
@@ -119,9 +150,26 @@ print(json.dumps({
     "temperature": float(os.environ["TEMPERATURE"]),
     "seed": int(os.environ["SEED"]),
     "stream": True,
+    # The prompt length recorded with the run is the one the server counted,
+    # and it only says so when asked.
+    "stream_options": {"include_usage": True},
 }))
 '
 )
+
+# ── Snapshot identity ─────────────────────────────────────────────────────────
+#
+# Namespace, model and weight quant describe the checkpoint being served, and
+# the caller chooses that. Reading them from the snapshot is what keeps the row
+# in its own cell when this script is pointed at a different one.
+
+SNAPSHOT_ID="$(python3 "${REPO_ROOT}/scripts/lib/snapshot_identity.py" "${VERIFIER_MODEL}")" || {
+    echo "ERROR: cannot read the identity of ${VERIFIER_MODEL}" >&2
+    exit 1
+}
+MODEL_NAMESPACE="$(echo "${SNAPSHOT_ID}" | sed -n 's/^model_namespace=//p')"
+MODEL_NAME="$(echo "${SNAPSHOT_ID}" | sed -n 's/^model=//p')"
+WEIGHT_QUANT="$(echo "${SNAPSHOT_ID}" | sed -n 's/^weight_quant=//p')"
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 
@@ -140,7 +188,7 @@ if [[ ! -d "${DRAFTER_MODEL}" ]]; then
     exit 1
 fi
 
-mkdir -p "${LOG_DIR}" "${BUFFER_DIR}"
+mkdir -p "${LOG_DIR}" "${BUFFER_DIR}" "${SCRATCH_DIR}"
 
 echo "==> spec_bench.sh"
 echo "    verifier : ${VERIFIER_MODEL}"
@@ -183,129 +231,92 @@ wait_for_server() {
     done
 }
 
-# Run one chat-completions request, return the full SSE response body.
-# Also measures wall-clock time from first byte to last byte (used for TPS calc).
-# Writes timing to ${TIMING_FILE} set by caller.
-run_request() {
-    local start_ns end_ns
-    start_ns=$(python3 -c "import time; print(int(time.time_ns()))")
-    curl -sf \
+# Fire one measured chat-completions request and report what the client saw.
+#
+# Prints the `key=value` block of scripts/lib/sse_decode_window.py: `tokens`,
+# `preview`, and `decode_tps` over the first-content-token to last-content-token
+# window. A rate over the whole request instead would count the prefill and the
+# curl spawn and read low, and would not be comparable with the rate the engine
+# logs for the speculative arm.
+measured_request() {
+    local raw_file="$1"
+    curl -s \
         -H "Content-Type: application/json" \
         -d "${CURL_PAYLOAD}" \
         "http://127.0.0.1:${PORT}/v1/chat/completions" \
-        --no-buffer 2>/dev/null
-    end_ns=$(python3 -c "import time; print(int(time.time_ns()))")
-    # elapsed in seconds
-    python3 -c "print(($end_ns - $start_ns) / 1e9)"
+        --no-buffer 2>/dev/null \
+        | python3 "${REPO_ROOT}/scripts/lib/sse_decode_window.py" --raw "${raw_file}"
 }
 
-# Parse completion_tokens from a streaming SSE response file.
-# Prints: <token_count>\n<first_64_chars_of_text>
-parse_response_file() {
-    local resp_file="$1"
-    python3 - "${resp_file}" <<'PYEOF'
-import json, sys
-
-resp_file = sys.argv[1]
-tokens = 0
-text = ""
-
-try:
-    with open(resp_file) as f:
-        lines = f.readlines()
-except Exception:
-    lines = []
-
-for line in lines:
-    line = line.strip()
-    if not line.startswith("data:"):
-        continue
-    payload = line[5:].strip()
-    if payload == "[DONE]":
-        break
-    try:
-        obj = json.loads(payload)
-        delta = obj.get("choices", [{}])[0].get("delta", {})
-        piece = delta.get("content") or delta.get("reasoning_content") or ""
-        if piece:
-            tokens += 1
-            text += piece
-        # check usage in any chunk
-        usage = obj.get("usage")
-        if usage and "completion_tokens" in usage:
-            tokens = usage["completion_tokens"]
-    except Exception:
-        pass
-
-print(tokens)
-print(text[:64].replace("\n", " "))
-PYEOF
+# Read one `key=value` out of a block, or the empty string when absent.
+field_of() {
+    local block="$1" key="$2"
+    echo "${block}" | sed -n "s/^${key}=//p" | tail -1
 }
 
-# Get the most-recently-modified .jsonl file in ${LOG_DIR} that was modified
-# after a given epoch-second timestamp. Retries up to 10s.
-find_log_after() {
-    local after_epoch="$1"
-    local attempts=0
-    while true; do
-        local found
-        found=$(find "${LOG_DIR}" -name "*.jsonl" -newer /tmp/spec_bench_ts_ref \
-            2>/dev/null | sort | tail -1)
-        if [[ -n "${found}" ]]; then
-            echo "${found}"
-            return 0
-        fi
-        attempts=$((attempts + 1))
-        if [[ ${attempts} -ge 10 ]]; then
-            echo "" ; return 1
-        fi
-        sleep 1
-    done
+# Which run logs exist right now. Called before a phase starts its server.
+snapshot_logs() {
+    { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
+        > "${SCRATCH_DIR}/logs_before"
 }
 
-# Parse spec fields from a JSONL log file.
-# Extracts from the last occurrence of "spec_generate_greedy_cached: done"
-# or "spec_generate_greedy: done".
-parse_spec_log() {
-    local log_file="$1"
-    python3 - <<PYEOF
-import json, sys
-
-log_file = "${log_file}"
-last = None
-try:
-    with open(log_file) as f:
-        for line in f:
-            try:
-                obj = json.loads(line)
-                msg = obj.get("fields", {}).get("message", "")
-                if "spec_generate_greedy" in msg and "done" in msg:
-                    last = obj["fields"]
-            except Exception:
-                pass
-except Exception:
-    pass
-
-if last:
-    print(f"rounds={last.get('rounds', 0)}")
-    print(f"total_draft={last.get('total_draft', 0)}")
-    print(f"total_accept_count={last.get('total_accept_count', 0)}")
-    print(f"accept_rate={last.get('accept_rate', 0.0):.6f}")
-    print(f"emitted={last.get('emitted', 0)}")
-    print(f"elapsed_ms={last.get('elapsed_ms', 0.0):.3f}")
-else:
-    print("rounds=0")
-    print("total_draft=0")
-    print("total_accept_count=0")
-    print("accept_rate=0.0")
-    print("emitted=0")
-    print("elapsed_ms=0.0")
-PYEOF
+# The run log a given pid wrote, among those that appeared since snapshot_logs.
+#
+# Identity, not order: "the newest" and "the last new one" both answer a
+# different question, and any other rmlx process writing to this directory
+# supplies a candidate. The server states its own pid in its `rmlx start`
+# event, so the phase reads the log that names the server it started or none at
+# all — reading spec metrics out of somebody else's log leaves no trace in the
+# output.
+phase_log() {
+    local pid="$1"
+    { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
+        > "${SCRATCH_DIR}/logs_after"
+    comm -13 "${SCRATCH_DIR}/logs_before" "${SCRATCH_DIR}/logs_after" \
+        | python3 "${REPO_ROOT}/scripts/lib/run_log_for_pid.py" --pid "${pid}"
 }
 
-# Compute median of space-separated values.
+# The KV codec that log says the run resolved. Empty when it does not say.
+log_kv_quant() {
+    field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_kv_quant.py" "$1")" kv_quant
+}
+
+# How many ITL samples the server has recorded so far.
+ring_len() {
+    field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_decode_tps.py" \
+        "http://127.0.0.1:${PORT}")" ring_len
+}
+
+# The rate the server measured for the request that just finished, given the
+# ring length observed before it. Empty when the server could not attribute one.
+server_rate_after() {
+    field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_decode_tps.py" \
+        "http://127.0.0.1:${PORT}" --after "$1")" decode_tps
+}
+
+# Two readings of the same window, one from the engine and one from the client,
+# have to agree or one of them is not measuring what it claims. Refuse rather
+# than pick: the disagreement is the finding.
+cross_check() {
+    local arm="$1" engine="$2" client="$3"
+    LC_ALL=C python3 -c '
+import sys
+arm, engine, client, band = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+off = abs(client - engine) / engine * 100.0
+if off > band:
+    sys.exit(
+        f"ERROR: {arm} engine rate {engine:.3f} and client-observed rate "
+        f"{client:.3f} differ by {off:.1f}%, past the {band:.0f}% band these "
+        "two readings of one window are allowed"
+    )
+print(f"  [{arm}] cross-check ok: engine {engine:.3f} vs client {client:.3f} ({off:.1f}%)")
+' "${arm}" "${engine}" "${client}" "${CROSS_CHECK_BAND_PCT}" >&2
+}
+
+# Compute median of space-separated values. LC_ALL=C so `sort -n` and awk read
+# the decimal point the same way this script writes it.
 median() {
-    echo "$@" | tr ' ' '\n' | sort -n | awk '
+    echo "$@" | tr ' ' '\n' | LC_ALL=C sort -n | LC_ALL=C awk '
     { a[NR]=$1 }
     END {
         n=NR
@@ -316,7 +327,7 @@ median() {
 
 # Compute sample stddev.
 stddev() {
-    echo "$@" | tr ' ' '\n' | awk '
+    echo "$@" | tr ' ' '\n' | LC_ALL=C awk '
     NR==1 { first=$1 }
     { sum+=$1; sumsq+=$1*$1; n++ }
     END {
@@ -329,20 +340,35 @@ stddev() {
 }
 
 # Emit a §8.5 RunRecord JSON and ingest it.
-# Args: config_name notes_str decode_tps stddev accept_rate draft_tokens_total
-#        accept_tokens_total draft_rounds_total accepted_per_step output_preview kv_quant
+# Args: config_name decode_tps stddev accept_rate draft_tokens_total
+#        accept_tokens_total draft_rounds_total accepted_per_step output_preview
+#        kv_quant prompt_tokens
+#
+# `kv_quant` and `prompt_tokens` are measured facts about the run, not settings
+# this script may assume: the codec is whatever the engine resolved and said so
+# in its log, and the prompt length is whatever the server counted. A record
+# missing either is refused rather than filed under a guess.
 emit_and_ingest() {
     local config="$1"
-    local notes="$2"
-    local decode_tps="$3"
-    local decode_tps_stddev="$4"
-    local accept_rate="$5"
-    local draft_tokens_total="$6"
-    local accept_tokens_total="$7"
-    local draft_rounds_total="$8"
-    local accepted_per_step="$9"
-    local preview="${10}"
-    local kv_quant="${11:-k8v8}"
+    local decode_tps="$2"
+    local decode_tps_stddev="$3"
+    local accept_rate="$4"
+    local draft_tokens_total="$5"
+    local accept_tokens_total="$6"
+    local draft_rounds_total="$7"
+    local accepted_per_step="$8"
+    local preview="$9"
+    local kv_quant="${10}"
+    local prompt_tokens="${11}"
+
+    if [[ -z "${kv_quant}" ]]; then
+        echo "ERROR: ${config}: the run did not report which KV codec it resolved" >&2
+        return 1
+    fi
+    if [[ -z "${prompt_tokens}" ]]; then
+        echo "ERROR: ${config}: the server reported no prompt_tokens for this run" >&2
+        return 1
+    fi
 
     local ts_utc
     ts_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -361,6 +387,11 @@ emit_and_ingest() {
         BENCH_ACCEPTED_PER_STEP="${accepted_per_step}" \
         BENCH_PREVIEW="${preview}" \
         BENCH_KV_QUANT="${kv_quant}" \
+        BENCH_PROMPT_TOKENS="${prompt_tokens}" \
+        BENCH_MODEL_NAMESPACE="${MODEL_NAMESPACE}" \
+        BENCH_MODEL="${MODEL_NAME}" \
+        BENCH_WEIGHT_QUANT="${WEIGHT_QUANT}" \
+        BENCH_CTX_MAX="${MAX_CTX}" \
         BENCH_TS_UTC="${ts_utc}" \
         BENCH_GIT_SHA="${GIT_SHA}" \
         BENCH_HARDWARE_TAG="${HARDWARE_TAG}" \
@@ -387,6 +418,11 @@ draft_rounds_total = int(os.environ["BENCH_DRAFT_ROUNDS_TOTAL"])
 accepted_per_step = float(os.environ["BENCH_ACCEPTED_PER_STEP"])
 preview = os.environ["BENCH_PREVIEW"]
 kv_quant = os.environ["BENCH_KV_QUANT"]
+prompt_tokens = int(os.environ["BENCH_PROMPT_TOKENS"])
+model_namespace = os.environ["BENCH_MODEL_NAMESPACE"]
+model_name = os.environ["BENCH_MODEL"]
+weight_quant = os.environ["BENCH_WEIGHT_QUANT"]
+ctx_max = int(os.environ["BENCH_CTX_MAX"])
 ts_utc = os.environ["BENCH_TS_UTC"]
 git_sha = os.environ["BENCH_GIT_SHA"]
 hardware_tag = os.environ["BENCH_HARDWARE_TAG"]
@@ -424,27 +460,35 @@ obj = {
     # "unknown" is a fallback for the description label below, never
     # provenance — a checkout without .git must not stamp git_sha at all.
     **({"git_sha": git_sha} if not git_sha.startswith("unknown") else {}),
-    "model_namespace": "mlx-community",
-    "model": "gemma-4-e2b-it-mxfp8",
-    "weight_quant": "mxfp8",
+    "model_namespace": model_namespace,
+    "model": model_name,
+    "weight_quant": weight_quant,
     "kv_quant": kv_quant,
-    "ctx_max": 8192,
+    "ctx_max": ctx_max,
     "prompt": {
         "name": prompt_name,
         "body": prompt_body,
     },
+    # The bests cell key partitions on this: a speculative arm is a different
+    # configuration, not a better measurement of the plain-decode one.
+    "decode_config": None if config == "normal" else f"{draft_kind}/block={draft_block_size}",
     "ts_utc": ts_utc,
-    "prompt_tokens": 14,
+    "prompt_tokens": prompt_tokens,
     "max_tokens": max_tokens,
     "temperature": temperature,
     "seed": seed,
     "n_warmups": warmup_runs,
     "n_measure": measured_runs,
     "output_first_64": preview,
+    # `decode_window` names where this row's decode_tps_warm came from, so rows
+    # written while the script derived a prefill-inclusive rate of its own stay
+    # tellable apart from rows that carry the measured window
+    # (docs/METRICS_DB.md, "Known-bad rows already in the DB").
     "notes": (
-        f"config={config} draft_kind=none{tag_suffix}"
+        f"config={config} draft_kind=none{tag_suffix} decode_window=engine_itl"
         if config == "normal"
-        else f"config={config} draft_kind={draft_kind} block_size={draft_block_size}{tag_suffix}"
+        else f"config={config} draft_kind={draft_kind} "
+        f"block_size={draft_block_size}{tag_suffix} decode_window=engine_round_loop"
     ),
     "description": f"spec_bench {config} sha={git_sha}",
     "metrics": metrics,
@@ -484,77 +528,77 @@ echo ""
 
 preflight
 
-# Timestamp reference file for finding the new log.
-touch /tmp/spec_bench_ts_ref
-sleep 1
+snapshot_logs
 
 echo "  [server] starting..." >&2
 RMLX_HOME="${RMLX_HOME}" \
 RMLX_LOG_CAP_MB=200 \
     "${BINARY}" serve \
         --model "${VERIFIER_MODEL}" \
+        ${KV_QUANT_ARGS[@]+"${KV_QUANT_ARGS[@]}"} \
+        --max-ctx "${MAX_CTX}" \
         --port "${PORT}" \
         --log info \
-        > /tmp/spec_bench_normal_stdout.txt 2>&1 &
+        > "${SCRATCH_DIR}/normal_stdout.txt" 2>&1 &
 
 SERVER_PID=$!
 echo "  [server] pid=${SERVER_PID}" >&2
 
 wait_for_server
 
-# Update ref timestamp after server is up.
-touch /tmp/spec_bench_ts_ref
-
 echo "  [normal] warmup..." >&2
 for i in $(seq 1 ${WARMUP_RUNS}); do
-    curl -s \
-        -H "Content-Type: application/json" \
-        -d "${CURL_PAYLOAD}" \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" \
-        --no-buffer 2>/dev/null > /tmp/spec_bench_req.txt || true
+    measured_request "${SCRATCH_DIR}/warmup_resp.txt" > /dev/null || true
     echo "  [normal] warmup ${i} done" >&2
     sleep 5
 done
 
 echo "  [normal] measured runs..." >&2
-NORMAL_TPS_VALUES=()
-NORMAL_TOKENS_LIST=()
-NORMAL_ELAPSED_LIST=()
+NORMAL_ENGINE_TPS_VALUES=()
+NORMAL_CLIENT_TPS_VALUES=()
 NORMAL_PREVIEW=""
 
 for i in $(seq 1 ${MEASURED_RUNS}); do
     echo "  [normal] measured run ${i}/${MEASURED_RUNS}..." >&2
-    # Time the request.
-    REQ_START_NS=$(python3 -c "import time; print(int(time.time_ns()))")
-    curl -s \
-        -H "Content-Type: application/json" \
-        -d "${CURL_PAYLOAD}" \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" \
-        --no-buffer 2>/dev/null > /tmp/spec_bench_normal_resp.txt || true
-    REQ_END_NS=$(python3 -c "import time; print(int(time.time_ns()))")
 
-    ELAPSED_S=$(python3 -c "print(($REQ_END_NS - $REQ_START_NS) / 1e9)")
+    RING_BEFORE="$(ring_len)"
+    RUN_BLOCK="$(measured_request "${SCRATCH_DIR}/normal_resp.txt")" || RUN_BLOCK=""
+    N_TOKENS="$(field_of "${RUN_BLOCK}" tokens)"
+    CLIENT_TPS="$(field_of "${RUN_BLOCK}" decode_tps)"
+    PREVIEW="$(field_of "${RUN_BLOCK}" preview)"
+    NORMAL_PROMPT_TOKENS="$(field_of "${RUN_BLOCK}" prompt_tokens)"
 
-    # Parse token count from SSE stream.
-    PARSE_OUT=$(parse_response_file /tmp/spec_bench_normal_resp.txt)
-    N_TOKENS=$(echo "${PARSE_OUT}" | head -1)
-    PREVIEW=$(echo "${PARSE_OUT}" | tail -1)
-
-    N_TOKENS="${N_TOKENS:-0}"
-    if [[ -z "${N_TOKENS}" ]] || ! [[ "${N_TOKENS}" =~ ^[0-9]+$ ]] || [[ "${N_TOKENS}" -eq 0 ]]; then
-        echo "  WARN: could not parse token count for run ${i}, response: $(head -c 200 /tmp/spec_bench_normal_resp.txt)" >&2
-        N_TOKENS=1
+    if [[ -z "${CLIENT_TPS}" ]]; then
+        echo "ERROR: normal run ${i} produced no measurable decode window" \
+             "(tokens=${N_TOKENS:-0}); response head:" >&2
+        head -c 200 "${SCRATCH_DIR}/normal_resp.txt" >&2 || true
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
     fi
 
-    # TPS: tokens / elapsed. For max_tokens=128, use full elapsed as approximation.
-    TPS=$(python3 -c "print(${N_TOKENS} / ${ELAPSED_S})" 2>/dev/null || echo "0")
-    ELAPSED_FMT=$(python3 -c "print(f'{float(\"${ELAPSED_S}\"):.2f}')" 2>/dev/null || echo "${ELAPSED_S}")
-    TPS_FMT=$(python3 -c "print(f'{float(\"${TPS}\"):.2f}')" 2>/dev/null || echo "${TPS}")
-    echo "  [normal] run ${i}: tokens=${N_TOKENS} elapsed=${ELAPSED_FMT}s tps=${TPS_FMT}" >&2
+    # The no-drafter arm has no round-loop record, but the server times every
+    # generation's inter-token gaps and publishes the aggregate. That is the
+    # same window, measured by the engine, so this arm is comparable with the
+    # speculative one rather than being a client stopwatch beside it.
+    ENGINE_TPS="$(server_rate_after "${RING_BEFORE:-0}")" || ENGINE_TPS=""
+    if [[ -z "${ENGINE_TPS}" ]]; then
+        echo "ERROR: normal run ${i}: the server attributed no decode rate to it" >&2
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
 
-    NORMAL_TPS_VALUES+=("${TPS}")
-    NORMAL_TOKENS_LIST+=("${N_TOKENS}")
-    NORMAL_ELAPSED_LIST+=("${ELAPSED_S}")
+    echo "  [normal] run ${i}: tokens=${N_TOKENS} decode_tps=${ENGINE_TPS}" \
+         "(client-observed: ${CLIENT_TPS})" >&2
+
+    if [[ -z "${NORMAL_PROMPT_TOKENS}" ]]; then
+        echo "ERROR: normal run ${i}: the response carried no usage.prompt_tokens," \
+             "so the prompt length is not a measured fact" >&2
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
+    NORMAL_ENGINE_TPS_VALUES+=("${ENGINE_TPS}")
+    NORMAL_CLIENT_TPS_VALUES+=("${CLIENT_TPS}")
     [[ -n "${PREVIEW}" ]] && NORMAL_PREVIEW="${PREVIEW}"
     sleep 5
 done
@@ -564,15 +608,31 @@ kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
 sleep 3
 
-NORMAL_MEDIAN_TPS=$(median "${NORMAL_TPS_VALUES[@]}")
-NORMAL_STDDEV_TPS=$(stddev "${NORMAL_TPS_VALUES[@]}")
+NORMAL_LOG="$(phase_log "${SERVER_PID}")" || NORMAL_LOG=""
+if [[ -z "${NORMAL_LOG}" ]]; then
+    echo "ERROR: no run log in ${LOG_DIR} is attributable to the no-drafter" \
+         "server (pid ${SERVER_PID})" >&2
+    exit 1
+fi
+NORMAL_KV_QUANT="$(log_kv_quant "${NORMAL_LOG}")" || NORMAL_KV_QUANT=""
+echo "  [normal] resolved kv_quant=${NORMAL_KV_QUANT:-<unreported>}" >&2
+
+if [[ ${#NORMAL_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
+    echo "ERROR: ${#NORMAL_ENGINE_TPS_VALUES[@]} normal decode rates for" \
+         "${MEASURED_RUNS} measured runs" >&2
+    exit 1
+fi
+
+NORMAL_MEDIAN_TPS=$(median "${NORMAL_ENGINE_TPS_VALUES[@]}")
+NORMAL_STDDEV_TPS=$(stddev "${NORMAL_ENGINE_TPS_VALUES[@]}")
+cross_check normal "${NORMAL_MEDIAN_TPS}" \
+    "$(median "${NORMAL_CLIENT_TPS_VALUES[@]}")"
 
 echo "  [normal] median_tps=${NORMAL_MEDIAN_TPS} stddev=${NORMAL_STDDEV_TPS}" >&2
 
 # Ingest normal record.
 NORMAL_BUF_PATH=$(emit_and_ingest \
     "normal" \
-    "baseline no-spec" \
     "${NORMAL_MEDIAN_TPS}" \
     "${NORMAL_STDDEV_TPS}" \
     "0.0" \
@@ -581,7 +641,8 @@ NORMAL_BUF_PATH=$(emit_and_ingest \
     "0" \
     "0.0" \
     "${NORMAL_PREVIEW}" \
-    "k8v8")
+    "${NORMAL_KV_QUANT}" \
+    "${NORMAL_PROMPT_TOKENS}")
 
 echo ""
 echo "==> Phase 1 complete. Median decode TPS: ${NORMAL_MEDIAN_TPS}"
@@ -594,8 +655,7 @@ echo ""
 
 preflight
 
-touch /tmp/spec_bench_ts_ref
-sleep 1
+snapshot_logs
 
 echo "  [server] starting MTP server..." >&2
 RMLX_HOME="${RMLX_HOME}" \
@@ -605,74 +665,55 @@ RMLX_LOG_CAP_MB=200 \
         --draft-model "${DRAFTER_MODEL}" \
         --draft-kind "${DRAFT_KIND}" \
         --draft-block-size "${DRAFT_BLOCK_SIZE}" \
+        ${KV_QUANT_ARGS[@]+"${KV_QUANT_ARGS[@]}"} \
+        --max-ctx "${MAX_CTX}" \
         --port "${PORT}" \
         --log info \
-        > /tmp/spec_bench_mtp_stdout.txt 2>&1 &
+        > "${SCRATCH_DIR}/mtp_stdout.txt" 2>&1 &
 
 SERVER_PID=$!
 echo "  [server] pid=${SERVER_PID}" >&2
 
 wait_for_server
 
-touch /tmp/spec_bench_ts_ref
-sleep 1
-
 echo "  [mtp] warmup..." >&2
 for i in $(seq 1 ${WARMUP_RUNS}); do
-    curl -s \
-        -H "Content-Type: application/json" \
-        -d "${CURL_PAYLOAD}" \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" \
-        --no-buffer 2>/dev/null > /tmp/spec_bench_req.txt || true
+    measured_request "${SCRATCH_DIR}/warmup_resp.txt" > /dev/null || true
     echo "  [mtp] warmup ${i} done" >&2
     sleep 5
 done
 
-# Reset ref AFTER warmup so log parsing only sees measured requests.
-touch /tmp/spec_bench_ts_ref
-sleep 1
-
 echo "  [mtp] measured runs..." >&2
-MTP_TPS_VALUES=()
-MTP_SPEC_ROUNDS=()
-MTP_SPEC_DRAFT_TOKENS=()
-MTP_SPEC_ACCEPT_TOKENS=()
-MTP_SPEC_ACCEPT_RATES=()
+MTP_CLIENT_TPS_VALUES=()
 MTP_PREVIEW=""
-LAST_MTP_LOG=""
 
 for i in $(seq 1 ${MEASURED_RUNS}); do
     echo "  [mtp] measured run ${i}/${MEASURED_RUNS}..." >&2
 
-    # Mark timestamp before this request so we can find its log entry.
-    touch /tmp/spec_bench_req_ts
+    RUN_BLOCK="$(measured_request "${SCRATCH_DIR}/mtp_resp.txt")" || RUN_BLOCK=""
+    N_TOKENS="$(field_of "${RUN_BLOCK}" tokens)"
+    CLIENT_TPS="$(field_of "${RUN_BLOCK}" decode_tps)"
+    PREVIEW="$(field_of "${RUN_BLOCK}" preview)"
+    MTP_PROMPT_TOKENS="$(field_of "${RUN_BLOCK}" prompt_tokens)"
 
-    REQ_START_NS=$(python3 -c "import time; print(int(time.time_ns()))")
-    curl -s \
-        -H "Content-Type: application/json" \
-        -d "${CURL_PAYLOAD}" \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" \
-        --no-buffer 2>/dev/null > /tmp/spec_bench_mtp_resp.txt || true
-    REQ_END_NS=$(python3 -c "import time; print(int(time.time_ns()))")
-
-    ELAPSED_S=$(python3 -c "print(($REQ_END_NS - $REQ_START_NS) / 1e9)")
-
-    PARSE_OUT=$(parse_response_file /tmp/spec_bench_mtp_resp.txt)
-    N_TOKENS=$(echo "${PARSE_OUT}" | head -1)
-    PREVIEW=$(echo "${PARSE_OUT}" | tail -1)
-
-    N_TOKENS="${N_TOKENS:-0}"
-    if [[ -z "${N_TOKENS}" ]] || ! [[ "${N_TOKENS}" =~ ^[0-9]+$ ]] || [[ "${N_TOKENS}" -eq 0 ]]; then
-        echo "  WARN: could not parse token count for MTP run ${i}, response: $(head -c 200 /tmp/spec_bench_mtp_resp.txt)" >&2
-        N_TOKENS=1
+    if [[ -z "${CLIENT_TPS}" ]]; then
+        echo "ERROR: mtp run ${i} produced no measurable decode window" \
+             "(tokens=${N_TOKENS:-0}); response head:" >&2
+        head -c 200 "${SCRATCH_DIR}/mtp_resp.txt" >&2 || true
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
     fi
 
-    TPS=$(python3 -c "print(${N_TOKENS} / ${ELAPSED_S})" 2>/dev/null || echo "0")
-    ELAPSED_FMT=$(python3 -c "print(f'{float(\"${ELAPSED_S}\"):.2f}')" 2>/dev/null || echo "${ELAPSED_S}")
-    TPS_FMT=$(python3 -c "print(f'{float(\"${TPS}\"):.2f}')" 2>/dev/null || echo "${TPS}")
-    echo "  [mtp] run ${i}: tokens=${N_TOKENS} elapsed=${ELAPSED_FMT}s tps=${TPS_FMT}" >&2
+    echo "  [mtp] run ${i}: tokens=${N_TOKENS} client_decode_tps=${CLIENT_TPS}" >&2
 
-    MTP_TPS_VALUES+=("${TPS}")
+    if [[ -z "${MTP_PROMPT_TOKENS}" ]]; then
+        echo "ERROR: mtp run ${i}: the response carried no usage.prompt_tokens," \
+             "so the prompt length is not a measured fact" >&2
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
+    MTP_CLIENT_TPS_VALUES+=("${CLIENT_TPS}")
     [[ -n "${PREVIEW}" ]] && MTP_PREVIEW="${PREVIEW}"
     sleep 5
 done
@@ -682,111 +723,69 @@ kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
 sleep 3
 
-# Find the MTP server's JSONL log (the most recent one).
+# The log this phase's server created. No fallback to "the newest one": a
+# different file would be read as this run's, and every number taken from it
+# would be somebody else's with nothing to show for it.
 sleep 2  # let log flush
-MTP_LOG=$(find "${LOG_DIR}" -name "*.jsonl" -newer /tmp/spec_bench_ts_ref \
-    2>/dev/null | sort | tail -1)
-
+MTP_LOG="$(phase_log "${SERVER_PID}")" || MTP_LOG=""
 if [[ -z "${MTP_LOG}" ]]; then
-    echo "  WARN: could not find MTP log file after timestamp; trying latest overall" >&2
-    MTP_LOG=$(ls -t "${LOG_DIR}"/*.jsonl 2>/dev/null | head -1)
+    echo "ERROR: no run log in ${LOG_DIR} is attributable to the MTP server" \
+         "(pid ${SERVER_PID})" >&2
+    exit 1
 fi
 
 echo "  [mtp] parsing spec metrics from: ${MTP_LOG}" >&2
 
-# Parse aggregate spec metrics from the measured spec_generate events in log.
-# Matches any of:
-#   "spec_generate_greedy_cached: done"
-#   "spec_generate_greedy: done"
-#   "mtp_assistant_generate_greedy: done"
-#   "eagle3_generate_greedy: done"
-# Skips the first event (warmup), uses the last MEASURED_RUNS events.
-MTP_SPEC_DATA=$(BENCH_MEASURED_RUNS="${MEASURED_RUNS}" python3 - "${MTP_LOG}" <<'PYEOF'
-import json, sys, os
+MTP_KV_QUANT="$(log_kv_quant "${MTP_LOG}")" || MTP_KV_QUANT=""
+echo "  [mtp] resolved kv_quant=${MTP_KV_QUANT:-<unreported>}" >&2
 
-log_file = sys.argv[1]
-measured_runs = int(os.environ.get("BENCH_MEASURED_RUNS", "3"))
-events = []
-try:
-    with open(log_file) as f:
-        for line in f:
-            try:
-                obj = json.loads(line)
-                msg = obj.get("fields", {}).get("message", "")
-                if ("generate_greedy" in msg or "generate_stochastic" in msg) and "done" in msg:
-                    events.append(obj["fields"])
-            except Exception:
-                pass
-except Exception:
-    pass
-
-# Use the last measured_runs events (skip warmup at index 0).
-if len(events) > measured_runs:
-    events = events[-measured_runs:]
-
-if not events:
-    print("rounds_total=0")
-    print("draft_tokens_total=0")
-    print("accept_tokens_total=0")
-    print("accept_rate=0.0")
-    print("accepted_per_step=0.0")
-    print("decode_tps_from_log=0.0")
-else:
-    rounds_total = sum(e.get("rounds", 0) for e in events)
-    draft_total = sum(e.get("total_draft", 0) for e in events)
-    # MTP uses "total_accept", Phase-2/3 use "total_accept_count"
-    accept_total = sum(
-        e.get("total_accept", e.get("total_accept_count", 0)) for e in events
-    )
-    accept_rate = accept_total / draft_total if draft_total > 0 else 0.0
-    accepted_per_step = accept_total / rounds_total if rounds_total > 0 else 0.0
-    # TPS from log: emitted tokens / elapsed_ms * 1000 (averaged across events)
-    tps_list = [
-        e.get("emitted", 0) / (e.get("elapsed_ms", 1) / 1000.0)
-        for e in events if e.get("elapsed_ms", 0) > 0
-    ]
-    decode_tps_log = sum(tps_list) / len(tps_list) if tps_list else 0.0
-
-    print(f"rounds_total={rounds_total}")
-    print(f"draft_tokens_total={draft_total}")
-    print(f"accept_tokens_total={accept_total}")
-    print(f"accept_rate={accept_rate:.6f}")
-    print(f"accepted_per_step={accepted_per_step:.6f}")
-    print(f"decode_tps_from_log={decode_tps_log:.6f}")
-PYEOF
-)
-
-echo "  [mtp] spec metrics: ${MTP_SPEC_DATA}" >&2
-
-# Parse individual values.
-MTP_ROUNDS_TOTAL=$(echo "${MTP_SPEC_DATA}" | grep "^rounds_total=" | cut -d= -f2)
-MTP_DRAFT_TOTAL=$(echo "${MTP_SPEC_DATA}" | grep "^draft_tokens_total=" | cut -d= -f2)
-MTP_ACCEPT_TOTAL=$(echo "${MTP_SPEC_DATA}" | grep "^accept_tokens_total=" | cut -d= -f2)
-MTP_ACCEPT_RATE=$(echo "${MTP_SPEC_DATA}" | grep "^accept_rate=" | cut -d= -f2)
-MTP_ACCEPTED_PER_STEP=$(echo "${MTP_SPEC_DATA}" | grep "^accepted_per_step=" | cut -d= -f2)
-MTP_TPS_FROM_LOG=$(echo "${MTP_SPEC_DATA}" | grep "^decode_tps_from_log=" | cut -d= -f2)
-
-# Use the log-derived TPS (emitted / elapsed_ms) if available — more accurate
-# than wall-clock curl timing which includes network overhead.
-# Compute wall-clock median/stddev for context; use log TPS for DB ingest.
-MTP_WALLCLOCK_MEDIAN_TPS=$(median "${MTP_TPS_VALUES[@]}")
-MTP_WALLCLOCK_STDDEV_TPS=$(stddev "${MTP_TPS_VALUES[@]}")
-
-if [[ -n "${MTP_TPS_FROM_LOG}" ]] && [[ "${MTP_TPS_FROM_LOG}" != "0.0" ]]; then
-    MTP_MEDIAN_TPS="${MTP_TPS_FROM_LOG}"
-    MTP_STDDEV_TPS="0.0"
-    echo "  [mtp] using log-derived TPS: ${MTP_MEDIAN_TPS} (wall-clock: ${MTP_WALLCLOCK_MEDIAN_TPS})" >&2
-else
-    MTP_MEDIAN_TPS="${MTP_WALLCLOCK_MEDIAN_TPS}"
-    MTP_STDDEV_TPS="${MTP_WALLCLOCK_STDDEV_TPS}"
-    echo "  [mtp] using wall-clock TPS: ${MTP_MEDIAN_TPS}" >&2
+# Round counts, draft/accept totals and the engine's own decode rate all come
+# off the round-loop `done` line, and scripts/lib/spec_round_log.py is the only
+# thing that reads it. Every request served against this log left one event, so
+# the total is the warmups plus the measured runs; anything else means the
+# events that survive do not line up with the runs being measured, and the last
+# MEASURED_RUNS of them are somebody else's.
+if ! MTP_SPEC_DATA=$(python3 "${REPO_ROOT}/scripts/lib/spec_round_log.py" \
+        "${MTP_LOG}" \
+        --expect-total "$((WARMUP_RUNS + MEASURED_RUNS))" \
+        --last "${MEASURED_RUNS}"); then
+    echo "ERROR: no usable speculative round-loop record in ${MTP_LOG}" >&2
+    exit 1
 fi
 
-echo "  [mtp] median_tps=${MTP_MEDIAN_TPS} stddev=${MTP_STDDEV_TPS}" >&2
+echo "  [mtp] spec metrics: $(echo "${MTP_SPEC_DATA}" | tr '\n' ' ')" >&2
+
+MTP_ROUNDS_TOTAL="$(field_of "${MTP_SPEC_DATA}" rounds_total)"
+MTP_DRAFT_TOTAL="$(field_of "${MTP_SPEC_DATA}" draft_tokens_total)"
+MTP_ACCEPT_TOTAL="$(field_of "${MTP_SPEC_DATA}" accept_tokens_total)"
+MTP_ACCEPT_RATE="$(field_of "${MTP_SPEC_DATA}" accept_rate)"
+MTP_ACCEPTED_PER_STEP="$(field_of "${MTP_SPEC_DATA}" accepted_per_step)"
+
+# The engine measures the speculative decode rate over the window from the first
+# emitted token to the last and reports it per request; the script's job is to
+# aggregate those, not to derive a rate of its own. An `emitted / elapsed_ms`
+# off the same line would count the prefill and read low.
+MTP_ENGINE_TPS_VALUES=()
+while IFS= read -r rate; do
+    MTP_ENGINE_TPS_VALUES+=("${rate}")
+done < <(echo "${MTP_SPEC_DATA}" | sed -n 's/^decode_tps=//p')
+
+if [[ ${#MTP_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
+    echo "ERROR: the round loop reported ${#MTP_ENGINE_TPS_VALUES[@]} measurable" \
+         "decode rates for ${MEASURED_RUNS} measured runs in ${MTP_LOG}" >&2
+    exit 1
+fi
+
+MTP_MEDIAN_TPS=$(median "${MTP_ENGINE_TPS_VALUES[@]}")
+MTP_STDDEV_TPS=$(stddev "${MTP_ENGINE_TPS_VALUES[@]}")
+MTP_CLIENT_MEDIAN_TPS=$(median "${MTP_CLIENT_TPS_VALUES[@]}")
+cross_check mtp "${MTP_MEDIAN_TPS}" "${MTP_CLIENT_MEDIAN_TPS}"
+
+echo "  [mtp] median_tps=${MTP_MEDIAN_TPS} stddev=${MTP_STDDEV_TPS}" \
+     "(client-observed median: ${MTP_CLIENT_MEDIAN_TPS})" >&2
 
 MTP_BUF_PATH=$(emit_and_ingest \
     "mtp" \
-    "mtp spec draft_kind=${DRAFT_KIND} block_size=${DRAFT_BLOCK_SIZE}" \
     "${MTP_MEDIAN_TPS}" \
     "${MTP_STDDEV_TPS}" \
     "${MTP_ACCEPT_RATE}" \
@@ -795,7 +794,8 @@ MTP_BUF_PATH=$(emit_and_ingest \
     "${MTP_ROUNDS_TOTAL}" \
     "${MTP_ACCEPTED_PER_STEP}" \
     "${MTP_PREVIEW}" \
-    "k8v8")
+    "${MTP_KV_QUANT}" \
+    "${MTP_PROMPT_TOKENS}")
 
 echo ""
 echo "==> Phase 2 complete. Median decode TPS: ${MTP_MEDIAN_TPS}"
@@ -808,7 +808,7 @@ if ! $DRY_RUN; then
     sqlite3 "${DB_PATH}" \
         "SELECT backend, model, kv_quant, metric, ROUND(value,3) as value
          FROM observations
-         WHERE model='gemma-4-e2b-it-mxfp8'
+         WHERE model='${MODEL_NAME}'
            AND ts_utc >= datetime('now','-30 minutes')
          ORDER BY metric, ts_utc;" \
         2>/dev/null || echo "  (sqlite3 not available or DB empty)"
@@ -831,7 +831,7 @@ NORMAL_SD_FMT=$(python3 -c "print(f'{float(\"${NORMAL_STDDEV_TPS}\"):.2f}')" 2>/
 MTP_SD_FMT=$(python3 -c "print(f'{float(\"${MTP_STDDEV_TPS}\"):.2f}')" 2>/dev/null || echo "${MTP_STDDEV_TPS}")
 
 echo "============================================================"
-echo "  SPEC BENCH RESULTS — gemma-4-e2b-it-mxfp8"
+echo "  SPEC BENCH RESULTS — ${MODEL_NAME}"
 echo "============================================================"
 printf "%-10s  %-16s  %-13s  %-20s  %-22s  %s\n" \
     "Config" "decode_tps_warm" "accept_rate" "accepted_per_step" "draft_tokens_total" "notes"
@@ -858,8 +858,8 @@ echo "Buffer files:"
 [[ -n "${MTP_BUF_PATH}" ]] && echo "  mtp    : ${MTP_BUF_PATH}" || echo "  mtp    : (dry-run or failed)"
 echo ""
 echo "Logs:"
-echo "  normal server : /tmp/spec_bench_normal_stdout.txt"
-echo "  mtp server    : /tmp/spec_bench_mtp_stdout.txt"
+echo "  normal server : ${SCRATCH_DIR}/normal_stdout.txt"
+echo "  mtp server    : ${SCRATCH_DIR}/mtp_stdout.txt"
 [[ -n "${MTP_LOG}" ]] && echo "  mtp spec log  : ${MTP_LOG}"
 echo ""
 echo "DB: ${DB_PATH}"

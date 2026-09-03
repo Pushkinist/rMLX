@@ -148,15 +148,15 @@ impl<'a> Recorder<'a> {
                     metric, value, unit, direction,
                     run_id, ts_utc, git_sha, build_profile, backend_version, hardware_tag,
                     prompt_tokens, max_tokens, temperature, seed, n_warmups, n_measure,
-                    output_first_64, decode_stddev, notes, description,
+                    output_first_64, decode_stddev, notes, description, decode_config,
                     inserted_utc, inserted_by
                 ) VALUES (
                     ?1,  ?2,  ?3,  ?4,  ?5,  ?6,  ?7,
                     ?8,  ?9,  ?10, ?11,
                     ?12, ?13, ?14, ?15, ?16, ?17,
                     ?18, ?19, ?20, ?21, ?22, ?23,
-                    ?24, ?25, ?26, ?27,
-                    ?28, ?29
+                    ?24, ?25, ?26, ?27, ?28,
+                    ?29, ?30
                 )",
                 params![
                     // cell identity
@@ -194,6 +194,7 @@ impl<'a> Recorder<'a> {
                     entry.stddev,
                     run.notes,
                     run.description,
+                    run.decode_config,
                     // bookkeeping
                     inserted_utc,
                     self.inserted_by,

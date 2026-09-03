@@ -30,6 +30,7 @@ fn valid_record() -> RunRecord {
         output_first_64: None,
         notes: None,
         description: None,
+        decode_config: None,
         metrics: vec![MetricEntry {
             name: "decode_tps_warm".to_string(),
             value: Some(100.0),
@@ -619,4 +620,74 @@ fn drop_implausible_metrics_leaves_an_unregistered_name_for_validate() {
         "an unknown name is validate's to reject, not this function's to hide"
     );
     assert!(matches!(r.validate().unwrap_err(), Error::UnknownMetric(_)));
+}
+
+/// The §8.5 wire key has to reach the column. Asserting it through the struct
+/// only proves the struct: a `#[serde(rename)]` on that field, or a column
+/// dropped from the INSERT, leaves the row NULL and every cell keyed on it
+/// collapses back into one — silently, because NULL is also what ordinary
+/// decode writes.
+#[test]
+fn the_decode_config_wire_key_reaches_the_column() {
+    let json_str = r#"{
+        "backend": "rmlx",
+        "backend_version": "0.2.8",
+        "model_namespace": "mlx-community",
+        "model": "gemma-4-e2b-it-mxfp8",
+        "weight_quant": "mxfp8",
+        "kv_quant": "none",
+        "ctx_max": 8192,
+        "decode_config": "mtp/block=5",
+        "prompt": { "name": "p", "body": "hi" },
+        "ts_utc": "2026-05-10T07:30:00Z",
+        "hardware_tag": "m5_max_128gb",
+        "metrics": [{ "name": "decode_tps_warm", "value": 275.7 }]
+    }"#;
+
+    let record: RunRecord = serde_json::from_str(json_str).unwrap();
+    assert_eq!(record.decode_config.as_deref(), Some("mtp/block=5"));
+
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::migrate::run_pending(&mut conn).unwrap();
+    {
+        let mut rec = crate::recorder::Recorder::new(&mut conn, "test@0.1.0");
+        rec.record_run(&record).unwrap();
+    }
+
+    let stored: Option<String> = conn
+        .query_row("SELECT decode_config FROM observations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some("mtp/block=5"));
+}
+
+/// An emitter that says nothing writes NULL, which is ordinary decode — not a
+/// missing value to be filled in later.
+#[test]
+fn an_absent_decode_config_stores_null() {
+    let json_str = r#"{
+        "backend": "rmlx",
+        "backend_version": "0.2.8",
+        "model_namespace": "mlx-community",
+        "model": "gemma-4-e2b-it-mxfp8",
+        "weight_quant": "mxfp8",
+        "kv_quant": "none",
+        "ctx_max": 8192,
+        "prompt": { "name": "p", "body": "hi" },
+        "ts_utc": "2026-05-10T07:30:00Z",
+        "hardware_tag": "m5_max_128gb",
+        "metrics": [{ "name": "decode_tps_warm", "value": 142.5 }]
+    }"#;
+
+    let record: RunRecord = serde_json::from_str(json_str).unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::migrate::run_pending(&mut conn).unwrap();
+    {
+        let mut rec = crate::recorder::Recorder::new(&mut conn, "test@0.1.0");
+        rec.record_run(&record).unwrap();
+    }
+
+    let stored: Option<String> = conn
+        .query_row("SELECT decode_config FROM observations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, None);
 }

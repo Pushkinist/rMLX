@@ -145,6 +145,16 @@ pub struct RunRecord {
     /// First ≤64 characters of the model's output, for coherence checks.
     #[serde(default)]
     pub output_first_64: Option<String>,
+    /// How the tokens were produced, when that is not ordinary decode.
+    ///
+    /// Part of the `bests` cell key: a speculative-decode arm answers a
+    /// different question from a plain-decode one at the same model, quant and
+    /// prompt, so ranking their rates against each other publishes the
+    /// drafter's number as the model's decode throughput. `None` is ordinary
+    /// decode; a speculative arm records its drafter and block size, e.g.
+    /// `"mtp/block=5"`.
+    #[serde(default)]
+    pub decode_config: Option<String>,
     /// Free-form run notes (auto-summary, legacy keys, etc.).
     #[serde(default)]
     pub notes: Option<String>,
@@ -524,6 +534,7 @@ impl RunRecordBuilder {
                 output_first_64: None,
                 notes: None,
                 description: None,
+                decode_config: None,
                 metrics: Vec::new(),
             },
         })
