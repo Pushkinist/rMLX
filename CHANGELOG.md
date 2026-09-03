@@ -66,7 +66,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the response's `usage.prompt_tokens`; a run that reports neither is refused
   rather than filed under a guess. That event now names the codec through
   `Display` rather than `Debug`, so what it prints is the name the flag accepts
-  and the DB records instead of `None` or `Mixed { .. }`.
+  and the DB records instead of `None` or `Mixed { .. }`. `perf_canary.sh` was
+  the other reader of that event and carried a chain of `sed` rules translating
+  the `Debug` form into a tag; every branch of it is dead now, so it is gone and
+  the canary reads the field through the same one reader. Its CSV therefore
+  changes spelling at this commit — `docs/PERF_BASELINE.md` records the
+  changeover.
+
+- **Everything that looks a cell up keys on the whole cell.** `decode_config`
+  reached the `bests` view and none of its consumers: `rmlx metrics best`
+  returned whichever arm the view yielded first, `compare` overwrote one arm
+  with the other, `history` and `timeseries` mixed and averaged them, and
+  `deltas --exit-code` — a CI gate — read the drafter's rate as the plain cell's
+  improvement. The cell key now lives in one place, `rmlx_metrics::cell`, and
+  every one of those SQL bodies renders its `WHERE` from it. A test enumerates
+  the bodies and asserts each binds every column, so the next column cannot
+  reach the view and stop there. The nullable column is compared with `IS`: a
+  `= NULL` would make an ordinary-decode cell match no row at all. `export`
+  carries the column in its CSV and gives the markdown table a `Decode` column
+  rather than emitting two identically-labelled rows.
+
+- **`spec_bench.sh` describes the snapshot it served.** `model_namespace`,
+  `model`, `weight_quant` and `ctx_max` were constants naming one checkpoint.
+  The first three now come from the snapshot — the `__` split of its directory
+  name and its own `config.json` — and `ctx_max` is passed to the server with
+  `--max-ctx` and recorded. Its run log is now identified by the pid its
+  `rmlx start` event reports rather than by being the last new file in the
+  directory, so another rmlx process writing there cannot supply the log a phase
+  reads as its own.
 
 - **`perf-iter/bench_decode_tps.sh` keeps its state under `<RMLX_HOME>`.** It
   created `metrics/buffer/` relative to the working directory, so running it

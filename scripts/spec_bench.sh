@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# spec_bench.sh — bench gemma-4-e2b-it-mxfp8 in normal vs MTP speculative-decode mode.
+# spec_bench.sh — bench one model in normal vs MTP speculative-decode mode.
 #
 # Usage:
 #   bash scripts/spec_bench.sh [--port N] [--dry-run]
@@ -81,6 +81,9 @@ DRAFT_BLOCK_SIZE=5
 # names in its startup log. Either way the recorded kv_quant is read back from
 # that log, never assumed here. Set with --kv-quant.
 KV_QUANT=""
+# Passed to the server and recorded, so the ctx_max column describes the run
+# rather than the value this script was written against.
+MAX_CTX=8192
 HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
 # How far the client-observed decode window may sit from the engine's own
 # reading of the same window before the run is refused. One network hop on
@@ -99,6 +102,8 @@ while [[ $# -gt 0 ]]; do
         --tag) shift; BENCH_TAG="${1:?--tag requires a value}"; shift ;;
         --kv-quant=*) KV_QUANT="${1#--kv-quant=}"; shift ;;
         --kv-quant) shift; KV_QUANT="${1:?--kv-quant requires a value}"; shift ;;
+        --max-ctx=*) MAX_CTX="${1#--max-ctx=}"; shift ;;
+        --max-ctx) shift; MAX_CTX="${1:?--max-ctx requires a value}"; shift ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
@@ -129,7 +134,7 @@ fi
 
 # The server registers models by their full snapshot directory basename
 # (namespace__model), so the "model" field in OpenAI requests must use that.
-MODEL_ID="mlx-community__gemma-4-e2b-it-mxfp8"
+MODEL_ID="$(basename "${VERIFIER_MODEL%/}")"
 
 # JSON-escape PROMPT_CONTENT via python3 so quotes/backslashes in canonical
 # prompt files don't corrupt the curl payload.
@@ -151,6 +156,20 @@ print(json.dumps({
 }))
 '
 )
+
+# ── Snapshot identity ─────────────────────────────────────────────────────────
+#
+# Namespace, model and weight quant describe the checkpoint being served, and
+# the caller chooses that. Reading them from the snapshot is what keeps the row
+# in its own cell when this script is pointed at a different one.
+
+SNAPSHOT_ID="$(python3 "${REPO_ROOT}/scripts/lib/snapshot_identity.py" "${VERIFIER_MODEL}")" || {
+    echo "ERROR: cannot read the identity of ${VERIFIER_MODEL}" >&2
+    exit 1
+}
+MODEL_NAMESPACE="$(echo "${SNAPSHOT_ID}" | sed -n 's/^model_namespace=//p')"
+MODEL_NAME="$(echo "${SNAPSHOT_ID}" | sed -n 's/^model=//p')"
+WEIGHT_QUANT="$(echo "${SNAPSHOT_ID}" | sed -n 's/^weight_quant=//p')"
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 
@@ -241,14 +260,20 @@ snapshot_logs() {
         > "${SCRATCH_DIR}/logs_before"
 }
 
-# The run log this phase's server created — the one that was not there before
-# it started. Identity, not mtime: a log the phase never wrote can be the most
-# recently *modified* file for reasons that have nothing to do with this run,
-# and reading spec metrics out of the wrong file is not detectable afterwards.
+# The run log a given pid wrote, among those that appeared since snapshot_logs.
+#
+# Identity, not order: "the newest" and "the last new one" both answer a
+# different question, and any other rmlx process writing to this directory
+# supplies a candidate. The server states its own pid in its `rmlx start`
+# event, so the phase reads the log that names the server it started or none at
+# all — reading spec metrics out of somebody else's log leaves no trace in the
+# output.
 phase_log() {
+    local pid="$1"
     { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
         > "${SCRATCH_DIR}/logs_after"
-    comm -13 "${SCRATCH_DIR}/logs_before" "${SCRATCH_DIR}/logs_after" | tail -1
+    comm -13 "${SCRATCH_DIR}/logs_before" "${SCRATCH_DIR}/logs_after" \
+        | python3 "${REPO_ROOT}/scripts/lib/run_log_for_pid.py" --pid "${pid}"
 }
 
 # The KV codec that log says the run resolved. Empty when it does not say.
@@ -363,6 +388,10 @@ emit_and_ingest() {
         BENCH_PREVIEW="${preview}" \
         BENCH_KV_QUANT="${kv_quant}" \
         BENCH_PROMPT_TOKENS="${prompt_tokens}" \
+        BENCH_MODEL_NAMESPACE="${MODEL_NAMESPACE}" \
+        BENCH_MODEL="${MODEL_NAME}" \
+        BENCH_WEIGHT_QUANT="${WEIGHT_QUANT}" \
+        BENCH_CTX_MAX="${MAX_CTX}" \
         BENCH_TS_UTC="${ts_utc}" \
         BENCH_GIT_SHA="${GIT_SHA}" \
         BENCH_HARDWARE_TAG="${HARDWARE_TAG}" \
@@ -390,6 +419,10 @@ accepted_per_step = float(os.environ["BENCH_ACCEPTED_PER_STEP"])
 preview = os.environ["BENCH_PREVIEW"]
 kv_quant = os.environ["BENCH_KV_QUANT"]
 prompt_tokens = int(os.environ["BENCH_PROMPT_TOKENS"])
+model_namespace = os.environ["BENCH_MODEL_NAMESPACE"]
+model_name = os.environ["BENCH_MODEL"]
+weight_quant = os.environ["BENCH_WEIGHT_QUANT"]
+ctx_max = int(os.environ["BENCH_CTX_MAX"])
 ts_utc = os.environ["BENCH_TS_UTC"]
 git_sha = os.environ["BENCH_GIT_SHA"]
 hardware_tag = os.environ["BENCH_HARDWARE_TAG"]
@@ -427,11 +460,11 @@ obj = {
     # "unknown" is a fallback for the description label below, never
     # provenance — a checkout without .git must not stamp git_sha at all.
     **({"git_sha": git_sha} if not git_sha.startswith("unknown") else {}),
-    "model_namespace": "mlx-community",
-    "model": "gemma-4-e2b-it-mxfp8",
-    "weight_quant": "mxfp8",
+    "model_namespace": model_namespace,
+    "model": model_name,
+    "weight_quant": weight_quant,
     "kv_quant": kv_quant,
-    "ctx_max": 8192,
+    "ctx_max": ctx_max,
     "prompt": {
         "name": prompt_name,
         "body": prompt_body,
@@ -503,6 +536,7 @@ RMLX_LOG_CAP_MB=200 \
     "${BINARY}" serve \
         --model "${VERIFIER_MODEL}" \
         ${KV_QUANT_ARGS[@]+"${KV_QUANT_ARGS[@]}"} \
+        --max-ctx "${MAX_CTX}" \
         --port "${PORT}" \
         --log info \
         > "${SCRATCH_DIR}/normal_stdout.txt" 2>&1 &
@@ -574,9 +608,10 @@ kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
 sleep 3
 
-NORMAL_LOG="$(phase_log)"
+NORMAL_LOG="$(phase_log "${SERVER_PID}")" || NORMAL_LOG=""
 if [[ -z "${NORMAL_LOG}" ]]; then
-    echo "ERROR: the no-drafter server left no new run log in ${LOG_DIR}" >&2
+    echo "ERROR: no run log in ${LOG_DIR} is attributable to the no-drafter" \
+         "server (pid ${SERVER_PID})" >&2
     exit 1
 fi
 NORMAL_KV_QUANT="$(log_kv_quant "${NORMAL_LOG}")" || NORMAL_KV_QUANT=""
@@ -631,6 +666,7 @@ RMLX_LOG_CAP_MB=200 \
         --draft-kind "${DRAFT_KIND}" \
         --draft-block-size "${DRAFT_BLOCK_SIZE}" \
         ${KV_QUANT_ARGS[@]+"${KV_QUANT_ARGS[@]}"} \
+        --max-ctx "${MAX_CTX}" \
         --port "${PORT}" \
         --log info \
         > "${SCRATCH_DIR}/mtp_stdout.txt" 2>&1 &
@@ -691,9 +727,10 @@ sleep 3
 # different file would be read as this run's, and every number taken from it
 # would be somebody else's with nothing to show for it.
 sleep 2  # let log flush
-MTP_LOG="$(phase_log)"
+MTP_LOG="$(phase_log "${SERVER_PID}")" || MTP_LOG=""
 if [[ -z "${MTP_LOG}" ]]; then
-    echo "ERROR: the MTP server left no new run log in ${LOG_DIR}" >&2
+    echo "ERROR: no run log in ${LOG_DIR} is attributable to the MTP server" \
+         "(pid ${SERVER_PID})" >&2
     exit 1
 fi
 
@@ -771,7 +808,7 @@ if ! $DRY_RUN; then
     sqlite3 "${DB_PATH}" \
         "SELECT backend, model, kv_quant, metric, ROUND(value,3) as value
          FROM observations
-         WHERE model='gemma-4-e2b-it-mxfp8'
+         WHERE model='${MODEL_NAME}'
            AND ts_utc >= datetime('now','-30 minutes')
          ORDER BY metric, ts_utc;" \
         2>/dev/null || echo "  (sqlite3 not available or DB empty)"
@@ -794,7 +831,7 @@ NORMAL_SD_FMT=$(python3 -c "print(f'{float(\"${NORMAL_STDDEV_TPS}\"):.2f}')" 2>/
 MTP_SD_FMT=$(python3 -c "print(f'{float(\"${MTP_STDDEV_TPS}\"):.2f}')" 2>/dev/null || echo "${MTP_STDDEV_TPS}")
 
 echo "============================================================"
-echo "  SPEC BENCH RESULTS — gemma-4-e2b-it-mxfp8"
+echo "  SPEC BENCH RESULTS — ${MODEL_NAME}"
 echo "============================================================"
 printf "%-10s  %-16s  %-13s  %-20s  %-22s  %s\n" \
     "Config" "decode_tps_warm" "accept_rate" "accepted_per_step" "draft_tokens_total" "notes"

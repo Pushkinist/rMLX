@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// Cell coordinates — the 7 columns that form the PK of a cell.
+/// Cell coordinates — the columns of [`crate::cell::CELL_COLUMNS`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(
     clippy::exhaustive_structs,
-    reason = "closed cell-coordinate struct — seven fields are the complete PK of a metrics cell; constructed with struct-literal from rmlx-cli; adding a column requires updating all Cell construction sites and the DB schema"
+    reason = "closed cell-coordinate struct — these fields are the complete PK of a metrics cell, mirroring crate::cell::CELL_COLUMNS; constructed with struct-literal from rmlx-cli, so adding a column has to reach every construction site"
 )]
 pub struct Cell {
     /// Canonical backend identifier (e.g. `"rmlx"`, `"mlx_lm"`).
@@ -28,6 +28,11 @@ pub struct Cell {
     pub ctx_max: i64,
     /// Row ID of the prompt in the `prompts` table.
     pub prompt_id: i64,
+    /// How the tokens were produced; `None` is ordinary decode. Part of the
+    /// key: a speculative arm is a different configuration, not a better
+    /// measurement of the plain one.
+    #[serde(default)]
+    pub decode_config: Option<String>,
 }
 
 /// One row from the `bests` VIEW (champion per cell+metric).
@@ -105,6 +110,8 @@ pub struct CompareRow {
     pub ctx_max: i64,
     /// Prompt ID for this comparison cell.
     pub prompt_id: i64,
+    /// Decode configuration for this comparison cell; `None` is ordinary decode.
+    pub decode_config: Option<String>,
     /// Champion per backend: `(backend, Option<BestRow>)`, ordered by `backends` slice.
     pub per_backend: Vec<(String, Option<BestRow>)>,
 }

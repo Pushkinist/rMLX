@@ -244,6 +244,13 @@ serve)
 	done
 	log="\$RMLX_HOME/logs/\$(date +%s)-\$\$.jsonl"
 	: >"\$log"
+	if [ -z "\${STUB_PID_SUPPRESS:-}" ]; then
+		printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"rmlx start\",\"version\":\"9.9.9\",\"run_id\":\"stub\",\"pid\":\$\$}}" >>"\$log"
+	fi
+	if [ -n "\${STUB_DECOY_LOG:-}" ]; then
+		printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"rmlx start\",\"version\":\"9.9.9\",\"run_id\":\"decoy\",\"pid\":999999}}" \
+			>"\$RMLX_HOME/logs/zzz-decoy-\$\$.jsonl"
+	fi
 	if [ -z "\${STUB_KV_QUANT_SUPPRESS:-}" ]; then
 		printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"\${STUB_KV_QUANT:-mixed_k8g64_v4g64}\"}}" >>"\$log"
 	fi
@@ -254,7 +261,16 @@ esac
 STUBEOF
 chmod +x "$STUB"
 
-mkdir -p "$WORK/verifier" "$WORK/drafter"
+# A snapshot the identity reader can actually read: `ns__model` plus the
+# `config.json` the weight-quant label comes from.
+VERIFIER_DIR="$WORK/models/stub-ns__stub-model"
+mkdir -p "$VERIFIER_DIR" "$WORK/drafter"
+printf '%s\n' '{"quantization": {"mode": "mxfp8", "bits": 8, "group_size": 32}}' \
+	>"$VERIFIER_DIR/config.json"
+
+# A second snapshot with no config.json at all, for the refusal case.
+BARE_DIR="$WORK/models/bare-ns__bare-model"
+mkdir -p "$BARE_DIR"
 
 # A port this host is not already using. Probed rather than assumed: a foreign
 # listener would answer the script's readiness poll and the suite would measure
@@ -278,7 +294,8 @@ sys.exit("no free port in 18000-19999")
 
 # ── Case driver ───────────────────────────────────────────────────────────────
 
-# run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [GREP:pat ...]
+# run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
+#          [GREP:pat ...]
 #
 # Stub defaults describe a run streaming eight tokens 50 ms apart, so the rate
 # the engine reports (20) is what the wire actually carried and the client
@@ -293,10 +310,11 @@ run_case() {
 	CASE_HOME="$WORK/home_$CASE_NAME"
 	mkdir -p "$CASE_HOME/logs" "$CASE_HOME/metrics/buffer/pending"
 
-	local env_pairs=() greps=() a
+	local env_pairs=() greps=() extra_args=() a
 	for a in "$@"; do
 		case "$a" in
 		GREP:*) greps+=("${a#GREP:}") ;;
+		ARGS:*) extra_args+=("${a#ARGS:}") ;;
 		*) env_pairs+=("$a") ;;
 		esac
 	done
@@ -308,7 +326,7 @@ run_case() {
 		PATH="$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 		HOME="$WORK" \
 		RMLX_HOME="$CASE_HOME" \
-		VERIFIER_MODEL="$WORK/verifier" \
+		VERIFIER_MODEL="$VERIFIER_DIR" \
 		DRAFTER_MODEL="$WORK/drafter" \
 		STUB_TOKENS=8 \
 		STUB_GAP_S=0.05 \
@@ -319,15 +337,20 @@ run_case() {
 		STUB_PROMPT_TOKENS=1234 \
 		STUB_BOUND_FLAG="$CASE_HOME/stub_bound" \
 		${env_pairs[@]+"${env_pairs[@]}"} \
-		bash "$FAKE_ROOT/scripts/spec_bench.sh" --port "$PORT" >"$CASE_OUT" 2>&1
+		bash "$FAKE_ROOT/scripts/spec_bench.sh" --port "$PORT" \
+		${extra_args[@]+"${extra_args[@]}"} >"$CASE_OUT" 2>&1
 	got=$?
 	set -e
 	pkill -f "$SERVER_PY" 2>/dev/null || true
 
 	CASE_BAD=""
 	[ "$got" -ne "$want" ] && CASE_BAD="exit=$got (want $want)"
-	[ -s "$CASE_HOME/stub_bound" ] ||
-		note_bad "the stub never bound port $PORT — something else answered"
+	# Only meaningful for a case that got as far as starting a server: one
+	# that refuses before then has no port to have bound.
+	if grep -q '\[server\] starting' "$CASE_OUT"; then
+		[ -s "$CASE_HOME/stub_bound" ] ||
+			note_bad "the stub never bound port $PORT — something else answered"
+	fi
 	local g
 	for g in ${greps[@]+"${greps[@]}"}; do
 		grep -qE "$g" "$CASE_OUT" || note_bad "missing /$g/"
@@ -554,6 +577,54 @@ run_case unreported_kv_quant_refused 1 \
 	'GREP:no .cache-type resolved. event'
 no_row normal
 no_row mtp
+verdict
+
+# Namespace, model and weight quant describe the checkpoint being served, and
+# the caller chooses that. A constant here files every run under whatever the
+# script was written against.
+run_case snapshot_identity_is_read 0 \
+	"the row describes the snapshot that was served"
+for f in model_namespace:stub-ns model:stub-model weight_quant:mxfp8; do
+	key="${f%%:*}"
+	want="${f#*:}"
+	[ "$(field_of_record mtp "$key")" = "$want" ] ||
+		note_bad "mtp $key=$(field_of_record mtp "$key") (want $want)"
+done
+verdict
+
+run_case unreadable_snapshot_refused 1 \
+	"a snapshot whose identity cannot be read is not benched" \
+	"VERIFIER_MODEL=$BARE_DIR" \
+	'GREP:cannot read the identity'
+no_row normal
+no_row mtp
+verdict
+
+# ctx_max is what the server was started with, so the script passes it rather
+# than recording the value it was written against.
+run_case ctx_max_is_the_served_value 0 \
+	"the row carries the context the server was given" \
+	'ARGS:--max-ctx=4096'
+[ "$(field_of_record mtp ctx_max)" = "4096" ] ||
+	note_bad "mtp ctx_max=$(field_of_record mtp ctx_max)"
+verdict
+
+# A log the phase cannot attribute to its own server is not this run's log.
+run_case unattributable_log_refused 1 \
+	"a run log with no pid is not read as this server's" \
+	'STUB_PID_SUPPRESS=1' \
+	"GREP:no run log in .* is attributable"
+no_row normal
+no_row mtp
+verdict
+
+# Another rmlx process writing to the same directory supplies a candidate that
+# sorts last. Selection is by pid, so it is not the one that gets read.
+run_case decoy_log_ignored 0 \
+	"a log another process wrote is not mistaken for this server's" \
+	'STUB_DECOY_LOG=1'
+got="$(metric_of mtp value)"
+close_to "$got" 20.0 0.001 || note_bad "mtp decode_tps_warm=$got (want 20.0)"
 verdict
 
 # `KvQuant` renders `None` / `K8V8` / `Mixed { .. }` under Debug and

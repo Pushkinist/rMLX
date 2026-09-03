@@ -16,37 +16,98 @@ use super::types::{
 
 // ── Query functions ───────────────────────────────────────────────────────────
 
+/// The `SELECT` list every `bests` read shares.
+const BEST_COLUMNS: &str = "id, backend, model_namespace, model, weight_quant, kv_quant, ctx_max, \
+     prompt_id, decode_config, metric, value, unit, direction, run_id, ts_utc, git_sha, \
+     backend_version, hardware_tag, description, notes, inserted_by";
+
+/// Bind [`crate::cell::CELL_COLUMNS`] in order, for a query built from
+/// [`crate::cell::predicate`].
+fn cell_params(cell: &Cell) -> Vec<Box<dyn rusqlite::ToSql>> {
+    vec![
+        Box::new(cell.backend.clone()),
+        Box::new(cell.model_namespace.clone()),
+        Box::new(cell.model.clone()),
+        Box::new(cell.weight_quant.clone()),
+        Box::new(cell.kv_quant.clone()),
+        Box::new(cell.ctx_max),
+        Box::new(cell.prompt_id),
+        Box::new(cell.decode_config.clone()),
+    ]
+}
+
+/// SQL for [`best`], with `metric` bound after the cell key.
+fn best_sql() -> String {
+    let (cell_pred, next) = crate::cell::predicate(1);
+    format!("SELECT {BEST_COLUMNS} FROM bests WHERE {cell_pred}\n           AND metric = ?{next}")
+}
+
+/// SQL for [`history`], before the optional metric / since filters are appended.
+fn history_sql() -> String {
+    let (cell_pred, _) = crate::cell::predicate(1);
+    format!(
+        "SELECT id, backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
+                decode_config, metric, value, ts_utc, git_sha, run_id, description
+         FROM observations
+         WHERE {cell_pred}"
+    )
+}
+
+/// SQL for [`timeseries`], before the optional since filter is appended.
+fn timeseries_sql(bucket_expr: &str, plausible: &str) -> String {
+    let (cell_pred, metric_idx) = crate::cell::predicate(1);
+    format!(
+        "SELECT {bucket_expr} AS bucket_start,
+                AVG(value)              AS mean_value,
+                COUNT(*)               AS n
+         FROM observations
+         WHERE {cell_pred}
+           AND metric = ?{metric_idx}
+           AND ({plausible})"
+    )
+}
+
+/// SQL for one side of [`deltas`]' before/after comparison.
+///
+/// Ranks `observations` directly rather than reading `bests`, because it ranks
+/// *within a time window* the view does not know about — so it carries both the
+/// §4.1 plausibility predicate and the cell key itself.
+fn window_sql(
+    ts_cmp: &str,
+    cell_pred: &str,
+    metric_idx: usize,
+    ts_idx: usize,
+    plausible: &str,
+) -> String {
+    format!(
+        "
+        SELECT value FROM (
+            SELECT value,
+                ROW_NUMBER() OVER (
+                    ORDER BY
+                        CASE WHEN direction = 'higher_better' THEN value END DESC,
+                        CASE WHEN direction = 'lower_better'  THEN value END ASC,
+                        ts_utc DESC
+                ) AS rn
+            FROM observations
+            WHERE {cell_pred}
+              AND metric = ?{metric_idx}
+              AND ts_utc {ts_cmp} ?{ts_idx}
+              AND ({plausible})
+        ) WHERE rn = 1"
+    )
+}
+
 /// `best(cell, metric)` — single champion row, or None if no observations match.
 pub fn best(conn: &Connection, cell: &Cell, metric: &str) -> Result<Option<BestRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT
-             id, backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
-             metric, value, unit, direction,
-             run_id, ts_utc, git_sha, backend_version, hardware_tag,
-             description, notes, inserted_by
-         FROM bests
-         WHERE backend        = ?1
-           AND model_namespace = ?2
-           AND model           = ?3
-           AND weight_quant    = ?4
-           AND kv_quant        = ?5
-           AND ctx_max         = ?6
-           AND prompt_id       = ?7
-           AND metric          = ?8",
-    )?;
+    let mut stmt = conn.prepare(&best_sql())?;
+
+    let mut params = cell_params(cell);
+    params.push(Box::new(metric.to_owned()));
 
     let row = stmt
         .query_row(
-            rusqlite::params![
-                cell.backend,
-                cell.model_namespace,
-                cell.model,
-                cell.weight_quant,
-                cell.kv_quant,
-                cell.ctx_max,
-                cell.prompt_id,
-                metric,
-            ],
+            params_from_iter(params.iter().map(AsRef::as_ref)),
             row_to_best,
         )
         .optional()?;
@@ -65,12 +126,8 @@ pub fn rank(
     backend_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<BestRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT
-             id, backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
-             metric, value, unit, direction,
-             run_id, ts_utc, git_sha, backend_version, hardware_tag,
-             description, notes, inserted_by
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BEST_COLUMNS}
          FROM bests
          WHERE metric = ?1
            AND (?2 IS NULL OR backend = ?2)
@@ -79,8 +136,8 @@ pub fn rank(
                  WHEN 'higher_better' THEN -value
                  ELSE value
              END ASC
-         LIMIT ?3",
-    )?;
+         LIMIT ?3"
+    ))?;
 
     let rows = stmt
         .query_map(
@@ -98,8 +155,11 @@ pub fn rank(
 /// ctx_max, prompt_id). Each row carries a `per_backend` vec whose entries
 /// are ordered to match the `backends` slice; missing backends get `None`.
 pub fn compare(conn: &Connection, backends: &[&str], metric: &str) -> Result<Vec<CompareRow>> {
-    // Group key: (model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id).
-    type CellKey = (String, String, String, String, i64, i64);
+    // Group key: every cell column except `backend`, which is what the row
+    // compares across. Dropping `decode_config` here would collapse a
+    // speculative arm and a plain one into one row, and whichever was inserted
+    // second would silently replace the other.
+    type CellKey = (String, String, String, String, i64, i64, Option<String>);
 
     if backends.is_empty() {
         return Ok(vec![]);
@@ -112,15 +172,12 @@ pub fn compare(conn: &Connection, backends: &[&str], metric: &str) -> Result<Vec
         .join(", ");
 
     let sql = format!(
-        "SELECT
-             id, backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
-             metric, value, unit, direction,
-             run_id, ts_utc, git_sha, backend_version, hardware_tag,
-             description, notes, inserted_by
+        "SELECT {BEST_COLUMNS}
          FROM bests
          WHERE metric = ?1
            AND backend IN ({placeholders})
-         ORDER BY model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id, backend"
+         ORDER BY model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
+                  decode_config, backend"
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -152,6 +209,7 @@ pub fn compare(conn: &Connection, backends: &[&str], metric: &str) -> Result<Vec
             best.cell.kv_quant.clone(),
             best.cell.ctx_max,
             best.cell.prompt_id,
+            best.cell.decode_config.clone(),
         );
         if !groups.contains_key(&key) {
             order.push(key.clone());
@@ -182,6 +240,7 @@ pub fn compare(conn: &Connection, backends: &[&str], metric: &str) -> Result<Vec
                 kv_quant: key.3,
                 ctx_max: key.4,
                 prompt_id: key.5,
+                decode_config: key.6,
                 per_backend,
             }
         })
@@ -198,28 +257,8 @@ pub fn history(
     since_iso8601: Option<&str>,
 ) -> Result<Vec<ObservationRow>> {
     // Build query dynamically depending on optional filters.
-    let mut sql = String::from(
-        "SELECT id, backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
-                metric, value, ts_utc, git_sha, run_id, description
-         FROM observations
-         WHERE backend        = ?1
-           AND model_namespace = ?2
-           AND model           = ?3
-           AND weight_quant    = ?4
-           AND kv_quant        = ?5
-           AND ctx_max         = ?6
-           AND prompt_id       = ?7",
-    );
-
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-        Box::new(cell.backend.clone()),
-        Box::new(cell.model_namespace.clone()),
-        Box::new(cell.model.clone()),
-        Box::new(cell.weight_quant.clone()),
-        Box::new(cell.kv_quant.clone()),
-        Box::new(cell.ctx_max),
-        Box::new(cell.prompt_id),
-    ];
+    let mut sql = history_sql();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = cell_params(cell);
 
     if let Some(m) = metric {
         let idx = params.len() + 1;
@@ -249,13 +288,14 @@ pub fn history(
                     kv_quant: r.get(5)?,
                     ctx_max: r.get(6)?,
                     prompt_id: r.get(7)?,
+                    decode_config: r.get(8)?,
                 },
-                metric: r.get(8)?,
-                value: r.get(9)?,
-                ts_utc: r.get(10)?,
-                git_sha: r.get(11)?,
-                run_id: r.get(12)?,
-                description: r.get(13)?,
+                metric: r.get(9)?,
+                value: r.get(10)?,
+                ts_utc: r.get(11)?,
+                git_sha: r.get(12)?,
+                run_id: r.get(13)?,
+                description: r.get(14)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -288,32 +328,9 @@ pub fn timeseries(
     // bucket it lands in. Same §4.1 predicate as `bests`.
     let plausible = crate::bests_view::plausible_sql("value");
 
-    let mut sql = format!(
-        "SELECT {bucket_expr} AS bucket_start,
-                AVG(value)              AS mean_value,
-                COUNT(*)               AS n
-         FROM observations
-         WHERE backend        = ?1
-           AND model_namespace = ?2
-           AND model           = ?3
-           AND weight_quant    = ?4
-           AND kv_quant        = ?5
-           AND ctx_max         = ?6
-           AND prompt_id       = ?7
-           AND metric          = ?8
-           AND ({plausible})"
-    );
-
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-        Box::new(cell.backend.clone()),
-        Box::new(cell.model_namespace.clone()),
-        Box::new(cell.model.clone()),
-        Box::new(cell.weight_quant.clone()),
-        Box::new(cell.kv_quant.clone()),
-        Box::new(cell.ctx_max),
-        Box::new(cell.prompt_id),
-        Box::new(metric.to_owned()),
-    ];
+    let mut sql = timeseries_sql(&bucket_expr, &plausible);
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = cell_params(cell);
+    params.push(Box::new(metric.to_owned()));
 
     if let Some(s) = since_iso8601 {
         let idx = params.len() + 1;
@@ -378,14 +395,7 @@ pub fn deltas(
     // Step 2: collect all distinct (cell, metric, direction) tuples from bests.
     // We need to enumerate all cells+metrics that have observations.
     // Pull the full bests view for current bests.
-    let mut stmt = conn.prepare(
-        "SELECT
-             id, backend, model_namespace, model, weight_quant, kv_quant, ctx_max, prompt_id,
-             metric, value, unit, direction,
-             run_id, ts_utc, git_sha, backend_version, hardware_tag,
-             description, notes, inserted_by
-         FROM bests",
-    )?;
+    let mut stmt = conn.prepare(&format!("SELECT {BEST_COLUMNS} FROM bests"))?;
     let current_bests: Vec<BestRow> = stmt
         .query_map([], row_to_best)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -405,53 +415,11 @@ pub fn deltas(
     // champion view refuses is worse than no gate.
     let plausible = crate::bests_view::plausible_sql("value");
 
-    let best_in_window_sql = format!(
-        "
-        SELECT value FROM (
-            SELECT value,
-                ROW_NUMBER() OVER (
-                    ORDER BY
-                        CASE WHEN direction = 'higher_better' THEN value END DESC,
-                        CASE WHEN direction = 'lower_better'  THEN value END ASC,
-                        ts_utc DESC
-                ) AS rn
-            FROM observations
-            WHERE backend        = ?1
-              AND model_namespace = ?2
-              AND model           = ?3
-              AND weight_quant    = ?4
-              AND kv_quant        = ?5
-              AND ctx_max         = ?6
-              AND prompt_id       = ?7
-              AND metric          = ?8
-              AND ts_utc          <= ?9
-              AND ({plausible})
-        ) WHERE rn = 1"
-    );
+    let (cell_pred, metric_idx) = crate::cell::predicate(1);
+    let ts_idx = metric_idx + 1;
 
-    let best_after_sql = format!(
-        "
-        SELECT value FROM (
-            SELECT value,
-                ROW_NUMBER() OVER (
-                    ORDER BY
-                        CASE WHEN direction = 'higher_better' THEN value END DESC,
-                        CASE WHEN direction = 'lower_better'  THEN value END ASC,
-                        ts_utc DESC
-                ) AS rn
-            FROM observations
-            WHERE backend        = ?1
-              AND model_namespace = ?2
-              AND model           = ?3
-              AND weight_quant    = ?4
-              AND kv_quant        = ?5
-              AND ctx_max         = ?6
-              AND prompt_id       = ?7
-              AND metric          = ?8
-              AND ts_utc          > ?9
-              AND ({plausible})
-        ) WHERE rn = 1"
-    );
+    let best_in_window_sql = window_sql("<=", &cell_pred, metric_idx, ts_idx, &plausible);
+    let best_after_sql = window_sql(">", &cell_pred, metric_idx, ts_idx, &plausible);
 
     let mut baseline_stmt = conn.prepare(&best_in_window_sql)?;
     let mut after_stmt = conn.prepare(&best_after_sql)?;
@@ -459,19 +427,13 @@ pub fn deltas(
     let mut result = Vec::new();
 
     for current in current_bests {
+        let mut window_params = cell_params(&current.cell);
+        window_params.push(Box::new(current.metric.clone()));
+        window_params.push(Box::new(baseline_ts.clone()));
+
         let baseline_value: Option<f64> = baseline_stmt
             .query_row(
-                rusqlite::params![
-                    current.cell.backend,
-                    current.cell.model_namespace,
-                    current.cell.model,
-                    current.cell.weight_quant,
-                    current.cell.kv_quant,
-                    current.cell.ctx_max,
-                    current.cell.prompt_id,
-                    current.metric,
-                    baseline_ts,
-                ],
+                params_from_iter(window_params.iter().map(AsRef::as_ref)),
                 |r| r.get(0),
             )
             .optional()?;
@@ -479,17 +441,7 @@ pub fn deltas(
         // "current" value = best after baseline_ts. Fall back to all-time best if no post-baseline obs.
         let post_baseline_value: Option<f64> = after_stmt
             .query_row(
-                rusqlite::params![
-                    current.cell.backend,
-                    current.cell.model_namespace,
-                    current.cell.model,
-                    current.cell.weight_quant,
-                    current.cell.kv_quant,
-                    current.cell.ctx_max,
-                    current.cell.prompt_id,
-                    current.metric,
-                    baseline_ts,
-                ],
+                params_from_iter(window_params.iter().map(AsRef::as_ref)),
                 |r| r.get(0),
             )
             .optional()?;
@@ -790,7 +742,37 @@ pub fn champions(conn: &Connection, backend_filter: Option<&str>) -> Result<Vec<
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-pub(super) fn row_to_best(r: &rusqlite::Row<'_>) -> rusqlite::Result<BestRow> {
+/// Every SQL body in this module whose `WHERE` is a cell lookup, paired with a
+/// name for the failure message.
+///
+/// This exists so the cell key can be checked rather than reviewed. Adding a
+/// column to [`crate::cell::CELL_COLUMNS`] reaches the `bests` view for free —
+/// the view is generated — but each of these is a separate string, and the last
+/// column was added to the view and to none of them without anything failing.
+/// `cell_predicate_reaches_every_consumer` asserts each body binds every column.
+#[cfg(test)]
+pub(super) fn cell_keyed_sql() -> Vec<(&'static str, String)> {
+    let plausible = crate::bests_view::plausible_sql("value");
+    let (cell_pred, metric_idx) = crate::cell::predicate(1);
+    let ts_idx = metric_idx + 1;
+    let bucket_expr = "substr(ts_utc, 1, 10)";
+
+    vec![
+        ("best", best_sql()),
+        ("history", history_sql()),
+        ("timeseries", timeseries_sql(bucket_expr, &plausible)),
+        (
+            "deltas:best_in_window",
+            window_sql("<=", &cell_pred, metric_idx, ts_idx, &plausible),
+        ),
+        (
+            "deltas:best_after",
+            window_sql(">", &cell_pred, metric_idx, ts_idx, &plausible),
+        ),
+    ]
+}
+
+pub(crate) fn row_to_best(r: &rusqlite::Row<'_>) -> rusqlite::Result<BestRow> {
     Ok(BestRow {
         observation_id: r.get(0)?,
         cell: Cell {
@@ -801,18 +783,19 @@ pub(super) fn row_to_best(r: &rusqlite::Row<'_>) -> rusqlite::Result<BestRow> {
             kv_quant: r.get(5)?,
             ctx_max: r.get(6)?,
             prompt_id: r.get(7)?,
+            decode_config: r.get(8)?,
         },
-        metric: r.get(8)?,
-        value: r.get(9)?,
-        unit: r.get(10)?,
-        direction: r.get(11)?,
-        run_id: r.get(12)?,
-        ts_utc: r.get(13)?,
-        git_sha: r.get(14)?,
-        backend_version: r.get(15)?,
-        hardware_tag: r.get(16)?,
-        description: r.get(17)?,
-        notes: r.get(18)?,
-        inserted_by: r.get(19)?,
+        metric: r.get(9)?,
+        value: r.get(10)?,
+        unit: r.get(11)?,
+        direction: r.get(12)?,
+        run_id: r.get(13)?,
+        ts_utc: r.get(14)?,
+        git_sha: r.get(15)?,
+        backend_version: r.get(16)?,
+        hardware_tag: r.get(17)?,
+        description: r.get(18)?,
+        notes: r.get(19)?,
+        inserted_by: r.get(20)?,
     })
 }

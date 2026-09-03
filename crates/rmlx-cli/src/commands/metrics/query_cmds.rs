@@ -44,6 +44,7 @@ pub(super) fn cmd_best(
     weight_quant: &str,
     kv_quant: &str,
     ctx_max: i64,
+    decode_config: Option<String>,
     prompt_id: Option<i64>,
     prompt_name: Option<&str>,
     metric: &str,
@@ -59,6 +60,7 @@ pub(super) fn cmd_best(
         kv_quant: kv_quant.to_owned(),
         ctx_max,
         prompt_id: pid,
+        decode_config,
     };
     let row = query::best(&conn, &cell, metric).map_err(|e| anyhow::anyhow!("{e}"))?;
     match row {
@@ -129,6 +131,7 @@ pub(super) fn cmd_history(
     weight_quant: &str,
     kv_quant: &str,
     ctx_max: i64,
+    decode_config: Option<String>,
     prompt_id: Option<i64>,
     prompt_name: Option<&str>,
     metric: Option<&str>,
@@ -145,6 +148,7 @@ pub(super) fn cmd_history(
         kv_quant: kv_quant.to_owned(),
         ctx_max,
         prompt_id: pid,
+        decode_config,
     };
     let rows = query::history(&conn, &cell, metric, since).map_err(|e| anyhow::anyhow!("{e}"))?;
     for r in &rows {
@@ -166,6 +170,7 @@ pub(super) fn cmd_timeseries(
     weight_quant: &str,
     kv_quant: &str,
     ctx_max: i64,
+    decode_config: Option<String>,
     prompt_id: Option<i64>,
     prompt_name: Option<&str>,
     metric: &str,
@@ -183,6 +188,7 @@ pub(super) fn cmd_timeseries(
         kv_quant: kv_quant.to_owned(),
         ctx_max,
         prompt_id: pid,
+        decode_config,
     };
     let bucket = match bucket_str.to_lowercase().as_str() {
         "week" => query::Bucket::Week,

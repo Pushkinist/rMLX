@@ -523,6 +523,7 @@ fn build_kv_bytes_map_keeps_minimum() {
             kv_quant: kv_quant.into(),
             ctx_max: 8192,
             prompt_id: 1,
+            decode_config: None,
         },
         metric: "kv_cache_bytes".into(),
         value: bytes,
@@ -550,4 +551,71 @@ fn build_kv_bytes_map_keeps_minimum() {
         "k8v8".to_owned(),
     );
     assert_eq!(map[&key], three_gib);
+}
+
+/// Two arms of one cell are two rows in the published table, each labelled with
+/// the configuration it measured. Merging them puts the drafter's number under a
+/// label that describes plain decode, and the reader has nothing to notice with.
+#[test]
+fn the_markdown_table_keeps_the_two_arms_apart() {
+    let mut conn = test_conn();
+    seed_one(&mut conn, 142.5, None);
+    {
+        let mut rec = Recorder::new(&mut conn, "test@0.0.1");
+        let mut run = RunRecord {
+            schema_version: crate::ingest::RECORD_SCHEMA_VERSION,
+            backend: "rmlx".into(),
+            backend_version: Some("0.0.1".into()),
+            model_namespace: "mlx-community".into(),
+            model: "gemma-4-e2b-it-mxfp8".into(),
+            weight_quant: "mxfp8".into(),
+            kv_quant: "k8v8".into(),
+            ctx_max: 8192,
+            prompt: PromptRef::ByBody {
+                name: "test_prompt".into(),
+                body: json!("the quick brown fox"),
+                notes: None,
+                tokens_approx: Some(4),
+            },
+            ts_utc: "2026-05-10T07:31:00Z".into(),
+            git_sha: Some("abc1234".into()),
+            build_profile: Some("release".into()),
+            hardware_tag: "m5_max_128gb".into(),
+            prompt_tokens: Some(4),
+            max_tokens: Some(32),
+            temperature: Some(0.0),
+            seed: Some(0),
+            n_warmups: Some(1),
+            n_measure: Some(3),
+            output_first_64: None,
+            notes: None,
+            description: None,
+            decode_config: Some("mtp/block=5".into()),
+            metrics: vec![MetricEntry {
+                name: "decode_tps_warm".into(),
+                value: Some(275.7),
+                stddev: None,
+            }],
+        };
+        run.decode_config = Some("mtp/block=5".into());
+        rec.record_run(&run).unwrap();
+    }
+
+    let md = export_markdown(&conn, None).unwrap();
+    assert!(md.contains("| Decode "), "no Decode column:\n{md}");
+    assert!(md.contains("| plain "), "no plain-decode row:\n{md}");
+    assert!(md.contains("| mtp/block=5 "), "no speculative row:\n{md}");
+    assert!(md.contains("142.5"), "plain value missing:\n{md}");
+    assert!(md.contains("275.7"), "speculative value missing:\n{md}");
+}
+
+/// The CSV carries the column too, so a consumer reading it can tell the rows
+/// apart without re-deriving anything.
+#[test]
+fn the_csv_carries_the_decode_configuration() {
+    let mut conn = test_conn();
+    seed_one(&mut conn, 142.5, None);
+    let csv = export_csv(&conn).unwrap();
+    let header = csv.lines().next().unwrap();
+    assert!(header.contains("decode_config"), "{header}");
 }

@@ -599,10 +599,21 @@ because nothing enforces it.
   labelled run lands in a different cell. Both fields are now read back from the
   run — the codec from the `cache-type resolved` event, the length from the
   response's `usage.prompt_tokens` — and a run reporting neither is refused
-  rather than recorded. The predicate is
-  `description LIKE 'spec_bench%' AND kv_quant = 'k8v8' AND prompt_tokens = 14`;
-  no correctly-labelled row can match it, because the script no longer emits
-  either constant.
+  rather than recorded. `k8v8` is a codec a run can legitimately use and 14 is a
+  length a prompt can legitimately have, so the constants alone do not identify
+  the population — the predicate is bounded by the same provenance marker as the
+  row above:
+
+  ```sql
+  SELECT * FROM observations
+  WHERE description LIKE 'spec_bench%'
+    AND kv_quant = 'k8v8'
+    AND prompt_tokens = 14
+    AND (notes IS NULL OR notes NOT LIKE '%decode_window=%');
+  ```
+
+  No row written after this change matches: every row the script emits now
+  carries `decode_window=`, whatever codec and prompt length it measured.
 
 Anything anchoring on a recorded rate — a roofline, a champion table, a
 `rmlx metrics rank` — should read `bests`, or one of the `query::*` functions,
