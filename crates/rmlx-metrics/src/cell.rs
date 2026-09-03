@@ -202,7 +202,21 @@ pub fn decode_config_from_notes(notes: &str) -> NotesVerdict {
     match (kind, block) {
         (Some(kind), Some(block)) if kind != "none" => {
             match block.parse::<u32>() {
-                Ok(block) => NotesVerdict::Speculative(decode_config(kind, block)),
+                // The drafter name is lifted verbatim out of free-form notes,
+                // so it can be anything a bench script wrote — `Eagle3`, a
+                // typo, a word with a space in it. Composing that into a
+                // `decode_config` and storing it would put an out-of-grammar
+                // string into the append-only table, where nothing can take it
+                // back out. A row whose notes do not compose to a legal
+                // configuration does not say what it was.
+                Ok(block) => {
+                    let config = decode_config(kind, block);
+                    if decode_config_is_well_formed(&config) {
+                        NotesVerdict::Speculative(config)
+                    } else {
+                        NotesVerdict::Silent
+                    }
+                }
                 // A block size that is not a number is not a block size; the
                 // row does not say what it was.
                 Err(_) => NotesVerdict::Silent,

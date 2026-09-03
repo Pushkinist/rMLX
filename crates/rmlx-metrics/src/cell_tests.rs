@@ -146,3 +146,27 @@ fn a_malformed_decode_configuration_is_refused() {
         assert!(!decode_config_is_well_formed(config), "{config}");
     }
 }
+
+/// The backfill is the grammar's second writer, and it composes its value out
+/// of free-form notes. A drafter name the notes spell in any other way must
+/// leave the row unclassified rather than store a string the ingest path would
+/// have refused — `observations` is append-only, so a wrong value there stays.
+#[test]
+fn notes_that_compose_an_illegal_configuration_are_not_classified() {
+    for notes in [
+        "config=mtp draft_kind=Eagle3 block_size=5",
+        "config=mtp draft_kind=mtp-v2! block_size=5",
+        "config=mtp draft_kind=/block block_size=5",
+    ] {
+        assert_eq!(
+            decode_config_from_notes(notes),
+            NotesVerdict::Silent,
+            "{notes}"
+        );
+    }
+    // The spelling the bench scripts actually write still classifies.
+    assert_eq!(
+        decode_config_from_notes("config=mtp draft_kind=mtp block_size=5"),
+        NotesVerdict::Speculative("mtp/block=5".to_string())
+    );
+}

@@ -319,17 +319,28 @@ fn tiny_tokenizer() -> tokenizers::Tokenizer {
 /// A verifier that prefilled a qwen3 checkpoint at gemma4's chunk would put
 /// speculative decoding on a chunk no sweep ever measured for it, and a
 /// retuned per-arch default or an `RMLX_PREFILL_CHUNK_<ARCH>` override would
-/// never reach speculative prefill at all. The expected key per registered
-/// class is written out here rather than read back from `module_key_for_class`,
-/// so this fails if the verifier's lookup moves or that mapping does. The
-/// table is compared against the registry first, so a newly registered
+/// never reach speculative prefill at all.
+///
+/// The **key** is asserted before the chunk it resolves to. Most registered
+/// classes share a chunk value with some other class, so a table compared on
+/// values alone leaves the mapping unpinned: routing `Qwen3ForCausalLM` to
+/// `gemma4` — the exact defect this lookup removes — is invisible to a
+/// value-only assertion while the two defaults happen to agree.
+///
+/// The table is compared against the registry as a set, so a newly registered
 /// architecture fails here rather than being skipped.
 #[test]
 fn verifier_prefill_chunk_is_the_architectures_own() {
-    // In registry order. `JinaEmbeddingsV4Model` is an encoder with no
-    // `Architecture` variant and so no verifier; the empty key is the
-    // conservative fallback chunk, which is the right answer for a class that
-    // has no prefill path of its own.
+    // A global override collapses every class onto one chunk, which would make
+    // the value half of this test vacuous. Same guard as the resolution tests
+    // in `prefill_chunk_tests.rs`.
+    if std::env::var("RMLX_PREFILL_CHUNK").is_ok() {
+        return;
+    }
+
+    // `JinaEmbeddingsV4Model` is an encoder with no `Architecture` variant and
+    // so no verifier; the empty key is the conservative fallback chunk, which
+    // is the right answer for a class that has no prefill path of its own.
     let expected: &[(&str, &str)] = &[
         ("Gemma4ForConditionalGeneration", "gemma4"),
         ("Gemma4UnifiedForConditionalGeneration", "gemma4"),
@@ -344,18 +355,58 @@ fn verifier_prefill_chunk_is_the_architectures_own() {
         ("JinaEmbeddingsV4Model", ""),
     ];
 
-    let covered: Vec<&str> = expected.iter().map(|(class, _)| *class).collect();
+    let mut covered: Vec<&str> = expected.iter().map(|(class, _)| *class).collect();
+    covered.sort_unstable();
+    let mut registered: Vec<&str> = crate::arch::registry::KNOWN_ARCHS.to_vec();
+    registered.sort_unstable();
     assert_eq!(
-        covered,
-        crate::arch::registry::KNOWN_ARCHS.to_vec(),
-        "a registered architecture is missing from this table"
+        covered, registered,
+        "this table and the architecture registry describe different sets"
     );
 
     for (class, key) in expected {
         assert_eq!(
+            crate::prefill_chunk::module_key_for_class(class),
+            *key,
+            "{class} does not resolve to the {key} prefill-chunk key"
+        );
+        assert_eq!(
             verifier_prefill_chunk(class),
             crate::prefill_chunk::prefill_chunk_for(key),
             "verifier prefill chunk for {class} is not {key}'s"
+        );
+    }
+}
+
+/// The chunk sizes the verifier prefill actually cuts the prompt into are the
+/// architecture's own.
+///
+/// The test above pins the lookup; this one pins the wiring, by observing the
+/// slices `prefill_chunked_for_class` hands its forward. Without it the lookup
+/// could be correct and unused — the call site is one argument, and an
+/// argument that stopped naming the architecture would fail no assertion.
+#[test]
+fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
+    if std::env::var("RMLX_PREFILL_CHUNK").is_ok() {
+        return;
+    }
+
+    for class in ["Qwen3ForCausalLM", "Gemma3ForConditionalGeneration"] {
+        let chunk = crate::prefill_chunk::prefill_chunk_for(
+            crate::prefill_chunk::module_key_for_class(class),
+        );
+        let tokens: Vec<u32> = (0..(chunk * 2 + 3) as u32).collect();
+        let mut seen: Vec<usize> = Vec::new();
+        let result =
+            prefill_chunked_for_class(class, &tokens, &mut [], Device::Cpu, |slice, _caches| {
+                seen.push(slice.len());
+                Ok(())
+            });
+        assert!(result.is_ok(), "{class}: {result:?}");
+        assert_eq!(
+            seen,
+            vec![chunk, chunk, 3],
+            "{class} prefill did not cut the prompt at its own chunk"
         );
     }
 }

@@ -71,6 +71,7 @@ ROWS=0
 GEN_TOKENS=100
 KV_QUANT="none"
 RUNS=2
+WARMUP=1
 BUSY_PCT=25
 OUT_DIR=""
 DB_PATH=""
@@ -93,6 +94,7 @@ Options:
                                                     (default: 4096 32768)
   --rows N               Latin-square rows          (default: one per level)
   --runs N               measured runs per slot     (default: 2)
+  --warmup N             warmup runs per slot       (default: 1)
   --gen-tokens N         tokens generated per run   (default: 100)
   --kv-quant NAME        codec for every slot       (default: none)
   --binary PATH          rmlx binary                (default: target/release-perf/rmlx)
@@ -118,6 +120,7 @@ while [[ $# -gt 0 ]]; do
 	--prompt-tokens) need_value "$1" $#; PROMPT_TOKENS="$2"; shift 2 ;;
 	--rows) need_value "$1" $#; ROWS="$2"; shift 2 ;;
 	--runs) need_value "$1" $#; RUNS="$2"; shift 2 ;;
+	--warmup) need_value "$1" $#; WARMUP="$2"; shift 2 ;;
 	--gen-tokens) need_value "$1" $#; GEN_TOKENS="$2"; shift 2 ;;
 	--kv-quant) need_value "$1" $#; KV_QUANT="$2"; shift 2 ;;
 	--binary) need_value "$1" $#; BINARY="$2"; shift 2 ;;
@@ -139,8 +142,18 @@ read -r -a LEVEL_LIST <<<"$LEVELS"
 read -r -a PTOK_LIST <<<"$PROMPT_TOKENS"
 N_LEVELS=${#LEVEL_LIST[@]}
 [[ $N_LEVELS -ge 2 ]] || { echo "ERROR: --levels needs at least two levels" >&2; exit 125; }
+# `rmlx bench` refuses a single measured run (no observable run-to-run spread),
+# and finding that out one slot at a time costs a model load per level.
+[[ $RUNS -ge 2 ]] || { echo "ERROR: --runs must be at least 2 — rmlx bench reports no median without a spread" >&2; exit 125; }
 [[ ${#PTOK_LIST[@]} -ge 1 ]] || { echo "ERROR: --prompt-tokens needs at least one length" >&2; exit 125; }
 [[ $ROWS -gt 0 ]] || ROWS=$N_LEVELS
+# The square is only balanced when the rows complete whole cycles: with
+# `rows % levels != 0` some levels occupy one more slot position than others,
+# and the positional term this design exists to cancel comes back weighted.
+if [[ $((ROWS % N_LEVELS)) -ne 0 ]]; then
+	echo "ERROR: --rows $ROWS is not a multiple of the ${N_LEVELS} levels — the square would be unbalanced" >&2
+	exit 125
+fi
 
 for ptok in "${PTOK_LIST[@]}"; do
 	k=$((ptok / 1024))
@@ -206,7 +219,7 @@ rMLX prefill-chunk sweep — cyclic Latin square, ${ROWS} rows x ${N_LEVELS} lev
   arch key   $ARCH_KEY  ->  $ENV_VAR
   levels     ${LEVEL_LIST[*]}   (baseline $BASELINE_LEVEL)
   prompts    ${PTOK_LIST[*]} tokens
-  kv-quant   $KV_QUANT   gen-tokens $GEN_TOKENS   runs/slot $RUNS
+  kv-quant   $KV_QUANT   gen-tokens $GEN_TOKENS   warmup/slot $WARMUP   runs/slot $RUNS
   binary     $BINARY
   out        $OUT_DIR
 
@@ -242,7 +255,7 @@ for ptok in "${PTOK_LIST[@]}"; do
 			env "$ENV_VAR=$level" "$BINARY" bench --metrics off \
 				--model "$MODEL" --prompt-tokens "$ptok" --kv-quant "$KV_QUANT" \
 				--max-ctx "$max_ctx" --gen-tokens "$GEN_TOKENS" \
-				--warmup 1 --runs "$RUNS" --json \
+				--warmup "$WARMUP" --runs "$RUNS" --json \
 				>"$out" 2>"${out%.json}.err"
 			rc=$?
 			set -e
@@ -292,6 +305,7 @@ RMLX_SWEEP_LEVELS="$LEVELS" \
 RMLX_SWEEP_PTOKS="$PROMPT_TOKENS" \
 RMLX_SWEEP_ARCH_KEY="$ARCH_KEY" \
 RMLX_SWEEP_KV_QUANT="$KV_QUANT" \
+RMLX_SWEEP_WARMUP="$WARMUP" \
 RMLX_SWEEP_REPO="$REPO_ROOT" \
 	python3 - <<'PY'
 import datetime
@@ -341,10 +355,27 @@ for ptok in ptoks:
         for detail in run["runs_detail"]:
             for name, (field, _) in METRICS.items():
                 value = detail.get(field)
-                if value:
+                # A measured 0 is a measurement, and it is what a request the
+                # engine rejected reads as. Dropping it as absent deletes that
+                # from the median instead of failing the run.
+                if value is not None:
                     runs[(level, row)][name].append(float(value))
     if not meta:
         continue
+
+    zeroed = sorted({
+        (level, name)
+        for (level, _row), by_name in runs.items()
+        for name, values in by_name.items()
+        if any(v == 0.0 for v in values)
+    })
+    if zeroed:
+        print("\nMEASUREMENT FAILURE: a slot reported zero, which is what a "
+              "request the engine rejected reads as.", file=sys.stderr)
+        for level, name in zeroed:
+            print(f"  level {level}: {name}", file=sys.stderr)
+        print("  Nothing was recorded.", file=sys.stderr)
+        sys.exit(1)
 
     all_digests = set().union(*digests.values())
     if len(all_digests) > 1:
@@ -413,7 +444,7 @@ for ptok in ptoks:
             "max_tokens": meta["gen_tokens"],
             "temperature": 0.0,
             "seed": 0,
-            "n_warmups": len(rows),
+            "n_warmups": int(os.environ["RMLX_SWEEP_WARMUP"]),
             "n_measure": len(pooled["ttft_warm_ms"]),
             "notes": (f"prefill_chunk sweep; {os.environ['RMLX_SWEEP_ARCH_KEY']} level {lvl}; "
                       f"cyclic Latin square, {len(rows)} rows x {len(levels)} levels, "

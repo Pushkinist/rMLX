@@ -79,10 +79,12 @@ const TTFT_REJECT_MULT: f64 = 2.0;
 
 // ── Adaptive prefill-chunk constants ─────────────────────────────────────────
 
-/// Prefill-chunk bounds for adaptive adjustment. Mirror `PREFILL_CHUNK_MIN/MAX`
-/// from `rmlx_models::prefill_chunk` but kept local to avoid a cross-crate dep
-/// on those constants (the setter is in the models crate; the values travel here
-/// as plain `usize`).
+/// Prefill-chunk bounds for adaptive adjustment.
+///
+/// Read from `rmlx_models::prefill_chunk` rather than restated, because they
+/// are the bounds `set_prefill_chunk` clamps to: a local literal that drifted
+/// low would make the controller compute raises it cannot reach, and one that
+/// drifted high would have it report a chunk the setter silently reduced.
 const ADAPTIVE_CHUNK_MIN: usize = rmlx_models::prefill_chunk::PREFILL_CHUNK_MIN;
 const ADAPTIVE_CHUNK_MAX: usize = rmlx_models::prefill_chunk::PREFILL_CHUNK_MAX;
 
