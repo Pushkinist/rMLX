@@ -10,12 +10,17 @@
 -- number is wrong; they are answers to different questions, and ranking them
 -- against each other is a category error the bound in §4.1 cannot see.
 --
--- `decode_config` names the arm: NULL (or absent) is ordinary decode, and a
--- speculative arm records its drafter and block size, e.g. `mtp/block=5`.
--- Free-form TEXT, not an enum or CHECK: identity columns in this schema are
--- recorded strings, never validated against a closed set, so a drafter this
--- binary has never heard of still records honestly (see
--- `canonicalize_kv_quant`'s doc in `rmlx-metrics::identity`).
+-- `decode_config` names the non-default engine configuration: NULL (or absent)
+-- is every setting at its default, a speculative arm records its drafter and
+-- block size (`mtp/block=5`), and a swept prefill chunk records the level
+-- (`prefill_chunk=1024`). METRICS_DB.md §3.2 has the grammar.
+--
+-- TEXT, not an enum or CHECK: the set of settings that can appear is open, so
+-- a configuration this binary has never heard of still records honestly (see
+-- `canonicalize_kv_quant`'s doc in `rmlx-metrics::identity`). What is closed
+-- is the *shape* — `rmlx_metrics::cell::decode_config_is_well_formed` holds
+-- the spelling at ingest, and the backfill in migration 006 applies the same
+-- rule, so no writer can put a private spelling into this append-only table.
 --
 -- Nullable: every row written before this keeps NULL, which is also what
 -- ordinary decode writes — so legacy plain-decode rows keep their cells and

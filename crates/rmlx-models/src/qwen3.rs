@@ -2059,9 +2059,10 @@ pub fn generate_greedy<'a>(
     // being quantize-dequantized on every chunk, evals only the cache state
     // (not the logits) on non-final chunks, and returns None on rejection.
     //
-    // Chunk size is per-arch; default 256 for qwen3, override via
-    // `RMLX_PREFILL_CHUNK` (global) or `RMLX_PREFILL_CHUNK_QWEN3` (per-arch).
-    let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3");
+    // Chunk size is per-arch — `arch_default` in `prefill_chunk.rs` holds the
+    // value and what it was measured on. Override via `RMLX_PREFILL_CHUNK`
+    // (global) or `RMLX_PREFILL_CHUNK_QWEN3` (per-arch).
+    let prefill_chunk = crate::prefill_chunk::resolve("qwen3");
     let prefill_logits = chunked_prefill(
         &mut caches,
         prompt_ids,

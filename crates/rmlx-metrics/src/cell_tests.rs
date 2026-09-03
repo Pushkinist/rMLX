@@ -1,4 +1,7 @@
-use super::{decode_config, decode_config_from_notes, predicate, NotesVerdict, CELL_COLUMNS};
+use super::{
+    decode_config, decode_config_from_notes, decode_config_is_well_formed, predicate, NotesVerdict,
+    CELL_COLUMNS,
+};
 
 #[test]
 fn the_predicate_binds_every_cell_column_once() {
@@ -103,4 +106,67 @@ fn notes_that_say_nothing_are_not_guessed_at() {
             "{notes}"
         );
     }
+}
+
+// ── The `decode_config` grammar ───────────────────────────────────────────────
+
+/// Every spelling an emitter in this tree produces is a term of the grammar,
+/// including the speculative arm's, which predates it.
+#[test]
+fn the_shipped_decode_configurations_are_well_formed() {
+    for config in [
+        "mtp/block=5",
+        "dflash/block=16",
+        "eagle/block=5",
+        "prefill_chunk=1024",
+        "prefill_chunk=1024,spec/block=5",
+    ] {
+        assert!(decode_config_is_well_formed(config), "{config}");
+    }
+    assert!(decode_config_is_well_formed(&decode_config("mtp", 5)));
+}
+
+/// The rejections that protect cell identity: a term order that would split
+/// one configuration across two cells, a repeated key that says two things at
+/// once, and the shapes that are not terms at all.
+#[test]
+fn a_malformed_decode_configuration_is_refused() {
+    for config in [
+        "",                                      // empty is not "no configuration"; NULL is
+        "plain",                                 // no `=`
+        "prefill_chunk=",                        // no value
+        "=1024",                                 // no key
+        "prefill chunk=1024",                    // whitespace in a key
+        "prefill_chunk = 1024",                  // whitespace around `=`
+        "PrefillChunk=1024",                     // upper case in a key
+        "spec/block=5,prefill_chunk=1024",       // terms out of key order
+        "prefill_chunk=1024,prefill_chunk=2048", // one key, two values
+        "prefill_chunk=1024,",                   // empty trailing term
+    ] {
+        assert!(!decode_config_is_well_formed(config), "{config}");
+    }
+}
+
+/// The backfill is the grammar's second writer, and it composes its value out
+/// of free-form notes. A drafter name the notes spell in any other way must
+/// leave the row unclassified rather than store a string the ingest path would
+/// have refused — `observations` is append-only, so a wrong value there stays.
+#[test]
+fn notes_that_compose_an_illegal_configuration_are_not_classified() {
+    for notes in [
+        "config=mtp draft_kind=Eagle3 block_size=5",
+        "config=mtp draft_kind=mtp-v2! block_size=5",
+        "config=mtp draft_kind=/block block_size=5",
+    ] {
+        assert_eq!(
+            decode_config_from_notes(notes),
+            NotesVerdict::Silent,
+            "{notes}"
+        );
+    }
+    // The spelling the bench scripts actually write still classifies.
+    assert_eq!(
+        decode_config_from_notes("config=mtp draft_kind=mtp block_size=5"),
+        NotesVerdict::Speculative("mtp/block=5".to_string())
+    );
 }

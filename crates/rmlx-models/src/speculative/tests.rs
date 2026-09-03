@@ -312,3 +312,91 @@ fn tiny_tokenizer() -> tokenizers::Tokenizer {
         .expect("literal vocabulary builds a WordLevel model");
     tokenizers::Tokenizer::new(model)
 }
+
+/// Every registered architecture class maps to its own prefill-chunk key.
+///
+/// The chunk is keyed on this mapping, so a class routed to another
+/// architecture's key prefills at a size no sweep ever measured for it. Keys
+/// are asserted rather than the chunks they resolve to: most classes share a
+/// chunk value with some other class, so a value-only comparison stays green
+/// through exactly the misrouting this pins — `Qwen3ForCausalLM` to `gemma4`
+/// is invisible while their defaults agree.
+///
+/// The table is compared against the registry as a set, so a newly registered
+/// architecture fails here rather than being skipped.
+#[test]
+fn verifier_prefill_chunk_is_the_architectures_own() {
+    // `JinaEmbeddingsV4Model` is an encoder with no `Architecture` variant and
+    // so no verifier; the empty key is the conservative fallback chunk, which
+    // is the right answer for a class that has no prefill path of its own.
+    let expected: &[(&str, &str)] = &[
+        ("Gemma4ForConditionalGeneration", "gemma4"),
+        ("Gemma4UnifiedForConditionalGeneration", "gemma4"),
+        ("Gemma3ForConditionalGeneration", "gemma3"),
+        ("Qwen2ForCausalLM", "qwen2"),
+        ("Qwen3ForCausalLM", "qwen3"),
+        ("LagunaForCausalLM", "laguna"),
+        ("Qwen3_5MoeForConditionalGeneration", "qwen3_5_moe"),
+        ("Qwen3_5ForConditionalGeneration", "qwen3_5_moe"),
+        ("Qwen3VLMoeForConditionalGeneration", "qwen3_vl_moe"),
+        ("BitNetForCausalLM", "bitnet"),
+        ("JinaEmbeddingsV4Model", ""),
+    ];
+
+    let mut covered: Vec<&str> = expected.iter().map(|(class, _)| *class).collect();
+    covered.sort_unstable();
+    let mut registered: Vec<&str> = crate::arch::registry::KNOWN_ARCHS.to_vec();
+    registered.sort_unstable();
+    assert_eq!(
+        covered, registered,
+        "this table and the architecture registry describe different sets"
+    );
+
+    for (class, key) in expected {
+        assert_eq!(
+            crate::prefill_chunk::module_key_for_class(class),
+            *key,
+            "{class} does not resolve to the {key} prefill-chunk key"
+        );
+    }
+}
+
+/// The chunk sizes the verifier prefill actually cuts the prompt into are the
+/// architecture's own.
+///
+/// The test above pins the lookup; this one pins the wiring, by observing the
+/// slices `prefill_chunked_for_class` hands its forward. Without it the lookup
+/// could be correct and unused — the call site is one argument, and an
+/// argument that stopped naming the architecture would fail no assertion.
+#[test]
+fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
+    if std::env::var("RMLX_PREFILL_CHUNK").is_ok() {
+        return;
+    }
+
+    for class in ["Qwen3ForCausalLM", "Gemma3ForConditionalGeneration"] {
+        let key = crate::prefill_chunk::module_key_for_class(class);
+        // A per-arch override outranks the arch default, so under one the
+        // source assertion below would fail on a correct resolver.
+        if std::env::var(format!("RMLX_PREFILL_CHUNK_{}", key.to_uppercase())).is_ok() {
+            continue;
+        }
+        // Against the shipped constant, not against a second call to the
+        // resolver: comparing the resolver to itself would hold whatever it
+        // returned.
+        let chunk = crate::prefill_chunk::arch_default(key).unwrap_or(64);
+        let tokens: Vec<u32> = (0..(chunk * 2 + 3) as u32).collect();
+        let mut seen: Vec<usize> = Vec::new();
+        let result =
+            prefill_chunked_for_class(class, &tokens, &mut [], Device::Cpu, |slice, _caches| {
+                seen.push(slice.len());
+                Ok(())
+            });
+        assert!(result.is_ok(), "{class}: {result:?}");
+        assert_eq!(
+            seen,
+            vec![chunk, chunk, 3],
+            "{class} prefill did not cut the prompt at its own chunk"
+        );
+    }
+}

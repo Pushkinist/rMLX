@@ -9,7 +9,7 @@ fn defaults_match_recommendations() {
     if env::var("RMLX_PREFILL_CHUNK").is_ok() {
         return;
     }
-    assert_eq!(arch_default("qwen3"), Some(256));
+    assert_eq!(arch_default("qwen3"), Some(1024));
     assert_eq!(arch_default("qwen3_5_moe"), Some(2048));
     assert_eq!(arch_default("qwen3_vl_moe"), Some(512));
     assert_eq!(arch_default("gemma3"), Some(256));
@@ -89,4 +89,39 @@ fn unknown_arch_falls_back() {
         return;
     }
     assert_eq!(prefill_chunk_for("bogus"), FALLBACK);
+}
+
+/// Every rule in the resolution order reports its own name, and reads the
+/// variable that belongs to it.
+///
+/// The chunk a run prefilled at is logged with the rule that produced it, and
+/// the two are read together: a label naming the arch default while an
+/// override supplied the number would describe a measurement of somebody's
+/// environment as a measurement of the shipped configuration. The env reader
+/// is injected, so the two variables can both be set at once — the only way to
+/// separate them, since swapping two `Option<usize>` arguments compiles.
+#[test]
+fn each_resolution_rule_reports_its_own_source() {
+    // Both variables set, per-arch differing from global, so precedence is
+    // decided rather than defaulted.
+    let both = |name: &str| match name {
+        "RMLX_PREFILL_CHUNK_QWEN3" => Some(512),
+        "RMLX_PREFILL_CHUNK" => Some(256),
+        _ => None,
+    };
+    let global_only = |name: &str| (name == "RMLX_PREFILL_CHUNK").then_some(256);
+    let none = |_: &str| None;
+
+    assert_eq!(resolve_with(1024, "qwen3", both), (1024, "adaptive"));
+    assert_eq!(resolve_with(0, "qwen3", both), (512, "env_arch"));
+    assert_eq!(resolve_with(0, "qwen3", global_only), (256, "env_global"));
+    assert_eq!(resolve_with(0, "qwen3", none), (1024, "arch_default"));
+    assert_eq!(
+        resolve_with(0, "no_such_arch", none),
+        (FALLBACK, "fallback")
+    );
+
+    // The per-arch name is built from the arch, so another arch does not see
+    // qwen3's variable.
+    assert_eq!(resolve_with(0, "gemma4", both), (256, "env_global"));
 }

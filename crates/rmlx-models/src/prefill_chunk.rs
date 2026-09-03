@@ -83,23 +83,52 @@ pub fn runtime_override() -> Option<usize> {
 /// `"laguna"`, `"qwen2"`). New archs slot in by adding a row to
 /// `arch_default()`.
 pub fn prefill_chunk_for(arch: &str) -> usize {
-    // Runtime override (adaptive prefill chunk) — highest precedence.
-    let rt = RUNTIME_OVERRIDE.load(Ordering::Acquire);
-    if rt != 0 {
-        return rt;
-    }
+    resolve(arch).0
+}
 
-    let per_arch_var = format!("RMLX_PREFILL_CHUNK_{}", arch.to_uppercase());
-    if let Some(v) = env::var(&per_arch_var).ok().and_then(|s| s.parse().ok()) {
-        return v;
+/// The chunk [`prefill_chunk_for`] returns for `arch`, and the rule that
+/// produced it.
+///
+/// The number alone cannot say why a run used it, and a prefill log that
+/// records only the number leaves a reader unable to tell a tuned default from
+/// an override — which is the difference between a measurement of the shipped
+/// configuration and a measurement of somebody's environment. Both halves come
+/// from this one walk of the resolution order so they cannot disagree.
+pub fn resolve(arch: &str) -> (usize, &'static str) {
+    resolve_with(RUNTIME_OVERRIDE.load(Ordering::Acquire), arch, |name| {
+        env::var(name).ok().and_then(|s| s.parse().ok())
+    })
+}
+
+/// The resolution order itself, reading the runtime override and the
+/// environment through its arguments.
+///
+/// Split from [`resolve`] so every rule — including the two override rules and
+/// the variable *names* they read — can be driven in a test without mutating
+/// this process's environment, which other tests read concurrently and which
+/// cannot be set from safe Rust. Both are worth pinning: a label naming the
+/// wrong rule files an override's number under the shipped default's name, and
+/// a resolver reading the global variable where the per-arch one belongs makes
+/// the per-arch override silently inert.
+fn resolve_with(
+    runtime: usize,
+    arch: &str,
+    read_env: impl Fn(&str) -> Option<usize>,
+) -> (usize, &'static str) {
+    // Runtime override (adaptive prefill chunk) — highest precedence.
+    if runtime != 0 {
+        return (runtime, "adaptive");
     }
-    if let Some(v) = env::var("RMLX_PREFILL_CHUNK")
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        return v;
+    if let Some(v) = read_env(&format!("RMLX_PREFILL_CHUNK_{}", arch.to_uppercase())) {
+        return (v, "env_arch");
     }
-    arch_default(arch).unwrap_or(FALLBACK)
+    if let Some(v) = read_env("RMLX_PREFILL_CHUNK") {
+        return (v, "env_global");
+    }
+    match arch_default(arch) {
+        Some(v) => (v, "arch_default"),
+        None => (FALLBACK, "fallback"),
+    }
 }
 
 /// Map a config `architectures[0]` class name (e.g. `"Qwen3ForCausalLM"`) to
@@ -122,9 +151,23 @@ pub fn module_key_for_class(arch_class: &str) -> &'static str {
     }
 }
 
-fn arch_default(arch: &str) -> Option<usize> {
+pub(crate) fn arch_default(arch: &str) -> Option<usize> {
     match arch {
-        "qwen3" => Some(256),
+        // qwen3 default 1024. A real-model kv-none sweep over
+        // {256,512,1024,2048,4096}, run as a cyclic Latin square so this
+        // host's per-slot drift cancels rather than landing on one level:
+        // Ternary-Bonsai-8B 2-bit at 4k / 16k / 32k prompts, Qwen3-8B-8bit at
+        // 4k / 32k. 1024 is the fastest level measured at every length above
+        // 4k on both snapshots, and at 32k its gain is the largest whose
+        // pooled ranges are disjoint from the old default's. 4096 is the
+        // fastest level at 4k on both, but that advantage is gone by 32k
+        // (ranges overlapping, rows disagreeing), so it is not the shared
+        // default. Decode rate is unchanged at every level and the token
+        // digest is identical within each cell. The cells: `SELECT model,
+        // ctx_max, decode_config, metric, value FROM observations WHERE
+        // decode_config LIKE 'prefill_chunk=%'`. Override via
+        // `RMLX_PREFILL_CHUNK_QWEN3`.
+        "qwen3" => Some(1024),
         // qwen3_5_moe: 2048, matching mlx-lm's prefill_step_size. The GDN
         // recurrence now always runs the `gated_delta_step_gpu` Metal kernel
         // (one dispatch, T-loop in registers) instead of flipping to the
