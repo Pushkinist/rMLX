@@ -741,3 +741,44 @@ fn an_absent_decode_config_stores_null() {
         .unwrap();
     assert_eq!(stored, None);
 }
+
+/// A record that declares itself synthetic is refused, from either field.
+///
+/// This is the escape hatch a refusal probe needs. Without it the shortest way
+/// to ask "does `validate` still reject X?" is to hand it a near-real record,
+/// and a probe whose expectation is wrong then writes a placeholder into a live
+/// cell — which `observations` being append-only makes permanent. Two rows
+/// reached this DB exactly that way.
+#[test]
+fn a_record_that_marks_itself_synthetic_is_refused() {
+    for field in ["notes", "description"] {
+        let mut r = valid_record();
+        let marked = format!("ingest-refusal probe; {SYNTHETIC_MARKER}");
+        match field {
+            "notes" => r.notes = Some(marked),
+            _ => r.description = Some(marked),
+        }
+        let err = r.validate().unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidIngestField { field: ref f, .. } if f == field),
+            "expected a {field} refusal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("--dry-run"),
+            "the refusal must name the route that does work: {err}"
+        );
+    }
+}
+
+/// The marker is a declaration, not a word filter: an ordinary record that
+/// merely talks about synthetic arms still lands.
+#[test]
+fn an_unmarked_record_is_not_refused_for_mentioning_synthesis() {
+    let mut r = valid_record();
+    r.notes = Some("paired against a synthetic-arms calibration run".to_string());
+    r.description = Some("synthetic arms were not used here".to_string());
+    assert!(
+        r.validate().is_ok(),
+        "only the marker refuses, not the word"
+    );
+}

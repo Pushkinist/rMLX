@@ -1073,8 +1073,14 @@ of `--inline`, `--file`, `--stdin`, or `--replay-pending` must be provided.
 | `--inline <JSON>` | — | Inline JSON object. |
 | `--file <path>` | — | Read JSON from file (preferred; follows the §8.4 buffer pattern). |
 | `--stdin` | off | Read JSON from stdin. |
-| `--dry-run` | off | Validate and show what would be written without committing. |
+| `--dry-run` | off | Validate and show what would be written without committing. Runs the whole of `RunRecord::validate`, then returns before the transaction — the row count and the `--file` buffer are both untouched. This is the route for a probe that only needs to know whether a record would be accepted. |
 | `--replay-pending` | off | Walk `metrics/buffer/pending/`, ingest each file, move failures to `failed/`. |
+
+A record whose `notes` or `description` contains `synthetic=true` is refused,
+whatever else is right about it. `observations` is append-only, so a record
+built to exercise a refusal and accepted by mistake lands a placeholder in a
+live cell and wins it; the marker lets such a record say so. Two rows reached
+the DB before it existed — see `docs/METRICS_DB.md`, "Known-bad rows".
 
 #### `metrics identity`
 

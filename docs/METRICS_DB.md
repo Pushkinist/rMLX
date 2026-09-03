@@ -703,6 +703,29 @@ because nothing enforces it.
     AND prompt_id IN (SELECT id FROM prompts WHERE name LIKE 'wikitext-2_ctx2048%');
   ```
 
+- **Two synthetic rows from an ingest-refusal probe** — a review of the
+  boundary-layer work exercised the ingest path's refusals by handing it
+  near-real records, and two of them were accepted instead of refused. They
+  carry real identity, a real cell, and a placeholder `kv_cache_bytes` of
+  `123456`, so **124693 currently wins `bests`** for
+  `Ternary-Bonsai-8B-mlx-2bit / iso3_sym / 40960 /
+  kv_boundary/head=2,kv_boundary/tail=4` on the smallest-cache ranking. Nothing
+  measured them. Deleting rows is an ask-before item and the table is
+  append-only, so they stay and are named:
+
+  ```sql
+  SELECT * FROM observations WHERE id IN (124693, 124694);
+  ```
+
+  The general fix is on both sides. `RunRecord::validate` now refuses any record
+  whose `notes` or `description` carries
+  [`rmlx_metrics::ingest::SYNTHETIC_MARKER`] (`synthetic=true`), so a probe can
+  declare itself and be turned away before a transaction opens. And a probe that
+  only needs to know *whether* a record would be accepted does not need a record
+  at all: `rmlx metrics record --dry-run` runs the whole of `validate` and
+  returns before the commit — verified to leave both the row count and the
+  buffer file untouched.
+
 - **`perf_ab.sh` rows whose `notes` say `ABBA` for an inverted leg** — the
   ingester asserted the interleave pattern as a constant instead of reading the
   result file's own `pattern` field, so a `--invert` leg (BAAB) was recorded as
