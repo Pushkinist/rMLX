@@ -88,8 +88,9 @@ repos rather than reinventing.
 ## Test targets
 
 Under `RMLX_O_MODELS_ROOT` (the dev checkout uses `../../O-Models/`; public
-users set it via `.env`). At minimum these three families must serve
-end-to-end at every change:
+users set it via `.env`, a shell export, or a `make` command-line variable —
+in that order of increasing precedence). At minimum these three families must
+serve end-to-end at every change:
 
 | Family | Example snapshot | Arch |
 |---|---|---|
@@ -300,7 +301,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make build` | `cargo build --workspace --release`. |
 | `make check` | `cargo check --workspace --all-targets` (fast). |
 | `make test` | `cargo test --workspace` — **skips every `#[ignore]` GPU test**. |
-| `make gpu-test` | Run the GPU/Metal `#[ignore]` tests, `--test-threads=1` (`CRATE=` / `FILTER=` narrow). Needs exclusive machine access. Part of `make ci-perf`, not `make ci`. |
+| `make gpu-test` | Run the GPU/Metal `#[ignore]` tests, `--test-threads=1` (`CRATE=` / `FILTER=` narrow). Needs exclusive machine access. Under Metal shader validation (`--nocapture`, so the tests' own skip notices reach the scan): the hits it observes are diffed against `scripts/gpu_validation_census.txt`, which pins one count per originating test; the expectation is the sum over the tests that ran, an exact match passes and prints what it accepted, any deviation fails naming the delta. Part of `make ci-perf`, not `make ci`. |
 | `make fmt` / `make fmt-check` | Write / check `cargo fmt`. |
 | `make lint` | `cargo clippy -D warnings`. |
 | `make audit` | `cargo audit` with RustSec ignores from `deny.toml`. |
@@ -308,13 +309,13 @@ hand — keeps the CI gate and the local gate identical.
 | `make precommit` | `pre-commit run --all-files`. |
 | `make hooks` | Install the git `pre-commit` hook. |
 | `make ci` | `fmt-check + lint + test + deny + audit` — pre-merge gate. |
-| `make ci-perf` | `test-perf` under `release-perf` + the serialized GPU/Metal suite. Requires an idle GPU. Run before merging perf-sensitive or codec-layer changes (~21 min). |
+| `make ci-perf` | `test-perf` under `release-perf` + the serialized GPU/Metal suite. Requires an idle GPU; without the snapshots the pinned entries' tests skip and are reported as not enforced in full rather than failing. Run before merging perf-sensitive or codec-layer changes (~21 min). |
 | `make check-kv-layer-quants` | CI gate (in `make ci`): the per-layer KV codec vector has one producer (`kv_layer_quants`) — no second `kv_quant_for_layer` loop, and every per-layer cache stack either uses it or declares itself uniform. |
 | `make check-kv-codec-disposition` | CI gate (in `make ci`): the `--kv-quant` / `--kv-bits` help and the `docs/KV_QUANT.md` INERT banners agree with each codec's runtime disposition, derived from `ALL_KV_QUANTS` + `decode_reads_packed_store` / `feeds_bf16_{k,v}_at_decode`. |
 | `make check-kv-codec-disposition-fixtures` | CI gate (in `make ci`): recall test for the above, 18 synthetic scan roots (one edit each), each asserting which rule fired and exit 2 vs exit 1. |
 | `make check-kv-byte-model-parity` | CI gate (in `make ci`): `scripts/perf_ceiling.py`'s KV byte model against the engine's, swept from `ALL_KV_QUANTS` across both topologies and two shapes. The engine is the oracle — this does not check either model is right, only that there is effectively one of them. |
 | `make check-kv-byte-model-parity-fixtures` | CI gate (in `make ci`): recall test for the above, synthetic scan roots asserting the reason as well as exit 2 vs exit 1. |
-| `make gpu-runner-selftest` | CI gate (in `make ci` and hosted CI): the GPU runner reports a shader-validation hit and a crate failure found in the same run, and the access mix it prints is the one the diagnostics named. Stub crates, no GPU. |
+| `make gpu-runner-selftest` | CI gate (in `make ci` and hosted CI): the GPU runner reports a shader-validation hit and a crate failure found in the same run, the access mix it prints is the one the diagnostics named, and every census-pin verdict — exact match, new kernel, count above or below the expectation, a silent entry, a hit that moved crate, any store, an entry whose test was not selected or skipped, and each way the pin file itself can be malformed — reaches the report as itself, the tracked pin included. Stub crates, no GPU. |
 | `make canary-ab-selftest` | CI gate (in `make ci`): mutation check for `scripts/perf_ab.sh` against stub binaries. Every case declares `--synthetic-arms`, so the machine is not consulted and the outcome cannot depend on host load; the cases that exercise the host gates supply `ps` and `pgrep` shims instead. |
 | `make canary-ab-host-gate-fixtures` | CI gate (in `make ci`): recall test for that boundary — the quiescence and Metal-exclusivity gates still fire on a shimmed hostile host, a hostile and a quiet host give `--synthetic-arms` the same verdict, the flag waives no arm-reading guard, and the result file carries no reading taken off this machine. |
 | `make llama-ab-selftest` | CI gate (in `make ci`): mutation check for `scripts/bench_llama_ab.sh` against a stub `llama-server`. Same `--synthetic-arms` boundary, shared through `scripts/lib/cpu_snapshot.sh`; every case asserts a literal exit code, and the count of cases that could reach this host must be zero. |
