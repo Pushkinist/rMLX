@@ -224,7 +224,9 @@ for codec in "${CODECS[@]}"; do
 		skipped=1
 	fi
 
-	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+	# `kv_boundary` is a `<head>,<tail>` pair, so it is quoted: an unquoted
+	# comma inside a field makes it two columns and every later column shift.
+	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MODEL_NAME" "$PROMPT_TOKENS" "${measured:-}" \
 		"$MAX_CTX" "$MAX_TOKENS" "$codec" "$rc" "${kv_bytes:-}" "${ids_sha:-}" "$skipped" \
 		"${ttft:-}" "${dtps:-}" "${ptps:-}" "$BINARY_SHA" "$KV_BOUNDARY" >>"$OUT"
