@@ -617,7 +617,7 @@ pub(crate) async fn messages(
         Ok(pair) => pair,
         Err(e) => {
             state.error_counts.increment(ApiErrorCategory::Upstream);
-            return service_unavailable(&e);
+            return service_unavailable(&e.to_string());
         }
     };
     // Acquire the active-decode lease (drops on stream-end / fn-exit).

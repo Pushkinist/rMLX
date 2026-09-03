@@ -128,9 +128,13 @@ pub struct SpeculativeGenerator {
     eos_ids: Arc<Vec<u32>>,
     /// Draft K (number of speculative tokens proposed per round).
     k: usize,
-    /// A2: effective max prompt-context length for the per-request guard.
-    /// Derived from verifier's max_position_embeddings clamped by --max-ctx.
+    /// Effective max prompt-context length for the per-request guard — the
+    /// ceiling `rmlx_models::context::resolve_context` produced at load from
+    /// the verifier's limits.
     effective_max_ctx: usize,
+    /// The verifier's context limits. A per-request `max_ctx` override is
+    /// resolved against these by the route layer.
+    context_limits: rmlx_models::context::ContextLimits,
     /// A10: detokenization family from the verifier's `tokenizer.json`.
     tokenizer_kind: crate::detokenizer::TokenizerKind,
     /// drafter architecture family (`--draft-kind`).
@@ -410,15 +414,15 @@ impl SpeculativeGenerator {
         // round block size below (defaulting to k+1) — the two are decoupled.
         let k: usize = 4;
 
-        // A2: derive effective_max_ctx from the verifier's positional limit.
-        // Same formula as ArchGenerator above. Speculative inherits the
-        // verifier's KV-cache sizing, so its positional bound is what matters.
-        let mpe_raw = dispatcher.verifier.max_position_embeddings();
-        let mpe: usize = if mpe_raw <= 0 { 4096 } else { mpe_raw as usize };
-        let effective_max_ctx: usize = match max_ctx_override {
-            Some(n) if n > 0 => (n as usize).min(mpe),
-            _ => mpe.min(4096),
-        };
+        // Speculative inherits the verifier's KV-cache sizing, so the
+        // verifier's positional capacity is what the shared resolver bounds
+        // this generator by.
+        let resolved_ctx = rmlx_models::context::resolve_context(
+            &dispatcher.verifier.context_limits(),
+            max_ctx_override,
+        )?;
+        let effective_max_ctx: usize = resolved_ctx.ceiling_tokens();
+        let context_limits = dispatcher.verifier.context_limits();
 
         // Fail fast on a codec the verifier's resolved architecture refuses.
         // The round loop builds the verifier's KV caches itself rather than
@@ -436,6 +440,7 @@ impl SpeculativeGenerator {
             ?kv_quant_resolved,
             ?max_ctx_override,
             effective_max_ctx,
+            positional_max = resolved_ctx.positional_max,
             ?draft_kind,
             ?draft_block_size,
             "SpeculativeGenerator: ready"
@@ -454,6 +459,7 @@ impl SpeculativeGenerator {
             eos_ids: Arc::new(eos_ids),
             k,
             effective_max_ctx,
+            context_limits,
             tokenizer_kind,
             // drafter metadata for /14/15 loaders.
             draft_kind,
@@ -478,6 +484,10 @@ impl SpeculativeGenerator {
 impl Generator for SpeculativeGenerator {
     fn effective_max_ctx(&self) -> usize {
         self.effective_max_ctx
+    }
+
+    fn context_limits(&self) -> Option<rmlx_models::context::ContextLimits> {
+        Some(self.context_limits)
     }
 
     fn cache_stats(&self) -> Option<rmlx_models::CacheStats> {

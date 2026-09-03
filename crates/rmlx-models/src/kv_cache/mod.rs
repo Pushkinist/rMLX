@@ -20,7 +20,7 @@
 //! none` (alias `bf16`), as the closest available comparison against mlx-lm's
 //! bf16-KV champion. It holds a `[B, kv_h, S, D]` bf16 K and V buffer per
 //! layer. On the arches that adopted the lazy ring — gemma4, qwen3,
-//! qwen3_5_moe, qwen3_vl_moe, the ones that call `kv_max_seq_and_ceiling` and
+//! qwen3_5_moe, qwen3_vl_moe, the ones that call `context::resolve_context` and
 //! `with_max_seq_ceiling` — that buffer starts small and grows toward the
 //! `--max-ctx` ceiling instead of being allocated at it. laguna, gemma3,
 //! qwen2 and bitnet still construct at the resolved `--max-ctx`
@@ -555,70 +555,18 @@ pub fn kv_codec_net_saving_total(
     (total_saving, n_global, n_windowed)
 }
 
-/// Resolve `(initial_max_seq, ceiling)` for a request from `--max-ctx`.
-///
-/// This is the shared policy that makes `--max-ctx` a **virtual ceiling**
-/// rather than an eager allocation, fixing the short-prompt decode penalty
-/// (issue #25): a server started with a large `--max-ctx` must serve short
-/// requests at full speed by growing the KV ring lazily up to the ceiling,
-/// not by allocating the whole ceiling up front.
-///
-/// - `initial_max_seq` is what the per-layer `KvCache` is *first* sized to.
-///   It is always the small lazy default ([`rmlx_kv_quant::KV_MAX_SEQ_DEFAULT`]),
-///   capped by the ceiling so a sub-default ceiling is honoured. The codec's
-///   power-of-two grow path ([`KvCache::ensure_prefill_capacity`]) takes it
-///   from there up to the ceiling as the prompt fills.
-/// - `ceiling` is the resolved bound: `min(max_ctx_override, mpe)` when an
-///   override is given, else `min(mpe, KV_MAX_SEQ_DEFAULT)` — the same chain
-///   the server's `effective_max_ctx` uses, so the per-cache ceiling and the
-///   per-request prompt-length guard agree. `mpe <= 0` means the arch does not
-///   expose `max_position_embeddings`; treat it as "unknown" and ignore it.
-/// - `max_ctx_override = Some(n)` where `n <= 0` is treated as "unset" (falls
-///   through to the arch-default path) and emits a `warn!` event so the caller
-///   can diagnose unexpected zero/negative values from config parsing.
-///
-/// Wire it in an arch `generate` as:
-/// ```ignore
-/// let (initial_max_seq, ceiling) = kv_max_seq_and_ceiling(max_ctx_override, mpe);
-/// KvCache::with_quant_max_seq(q, initial_max_seq).with_max_seq_ceiling(ceiling)
-/// ```
-#[must_use]
-pub fn kv_max_seq_and_ceiling(max_ctx_override: Option<i32>, mpe: i32) -> (i32, i32) {
-    let default = rmlx_kv_quant::KV_MAX_SEQ_DEFAULT;
-    let ceiling = match max_ctx_override {
-        Some(n) if n > 0 => {
-            if mpe > 0 {
-                n.min(mpe)
-            } else {
-                n
-            }
-        }
-        Some(n) => {
-            // n <= 0: treat as unset; log so the caller can diagnose
-            // unexpected zero/negative values from CLI or config parsing.
-            tracing::warn!(
-                max_ctx_override = n,
-                "max_ctx_override <= 0 treated as unset; using arch default"
-            );
-            if mpe > 0 {
-                mpe.min(default)
-            } else {
-                default
-            }
-        }
-        None => {
-            if mpe > 0 {
-                mpe.min(default)
-            } else {
-                default
-            }
-        }
-    };
-    // Start the ring at the lazy default, but never above the ceiling (a
-    // sub-default ceiling must not be pre-grown past).
-    let initial_max_seq = default.min(ceiling);
-    (initial_max_seq, ceiling)
-}
+// The `--max-ctx` virtual ceiling (issue #25) is resolved by
+// [`crate::context::resolve_context`], the one producer of every context
+// bound in the tree. `initial_max_seq` is the small lazy start
+// ([`rmlx_kv_quant::KV_MAX_SEQ_DEFAULT`], capped by the ceiling); the codec's
+// power-of-two grow path ([`rmlx_kv_quant::KvCache::ensure_prefill_capacity`])
+// takes it up to the ceiling as the prompt fills. Wire it in an arch
+// `generate` as:
+//
+// ```ignore
+// let ctx = resolve_context(&limits, max_ctx_override)?;
+// KvCache::with_quant_max_seq(q, ctx.initial_max_seq).with_max_seq_ceiling(ctx.ceiling)
+// ```
 
 // ── The auto default ──────────────────────────────────────────────────────────
 

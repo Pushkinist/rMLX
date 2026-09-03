@@ -48,19 +48,30 @@ pub trait Generator: Send + Sync {
     }
 
     /// Effective per-process maximum prompt-context length for this generator
-    /// (A2 — context_length_exceeded guard).
+    /// (the `context_length_exceeded` guard).
     ///
-    /// Captured at load time as `min(--max-ctx override, model
-    /// max_position_embeddings, KV_MAX_SEQ_DEFAULT=4096)` — i.e. the
-    /// actually-allocated KV-cache capacity, not the model's theoretical max.
-    /// The route handler compares `prompt_tokens.len()` against this value and
-    /// returns HTTP 400 `context_length_exceeded` when the prompt overflows.
+    /// Captured at load time as the `ceiling` of
+    /// `rmlx_models::context::resolve_context` — the KV-ring bound in force,
+    /// not the checkpoint's theoretical max. The route handler compares
+    /// `prompt_tokens.len()` against this value and returns HTTP 400
+    /// `context_length_exceeded` when the prompt overflows.
     ///
     /// Default `usize::MAX` makes the guard a no-op for generators that don't
     /// participate in KV-cache sizing (e.g. `NotReadyGenerator`); the
     /// fall-through 503 path still catches actual runtime overflows there.
     fn effective_max_ctx(&self) -> usize {
         usize::MAX
+    }
+
+    /// The checkpoint's context limits — the input
+    /// `rmlx_models::context::resolve_context` reads. The route layer resolves
+    /// a per-request `max_ctx` override against these, so an over-capacity
+    /// request is refused with exactly the message the launch flag would get.
+    ///
+    /// Default `None` disables the per-request resolution for generators that
+    /// do not participate in KV-cache sizing.
+    fn context_limits(&self) -> Option<rmlx_models::context::ContextLimits> {
+        None
     }
 }
 

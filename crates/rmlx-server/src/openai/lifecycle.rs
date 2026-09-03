@@ -48,6 +48,24 @@ pub(crate) struct LoadBody {
 
 // ── Route: GET /v1/models ─────────────────────────────────────────────────────
 
+/// The per-slot numbers `GET /v1/models` reports for a resident model.
+///
+/// `max_ctx` is the ceiling in force (what the admission guard enforces and
+/// what the KV ring may grow to); `positional_max` is what the checkpoint can
+/// address, RoPE scaling included, and is therefore the highest a per-request
+/// `max_ctx` may ask for.
+///
+/// `context` is `None`, and neither number is reported, when the generator
+/// does not participate in KV-cache sizing **or** when the architecture does
+/// not expose `max_position_embeddings`. In that second case the resolver
+/// accepts any `max_ctx`, so publishing a bound would state the opposite of
+/// the behaviour — the field's absence is what says "no limit known".
+struct ResidentInfo {
+    loaded_at: u64,
+    last_used: u64,
+    context: Option<(usize, usize)>,
+}
+
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or validated before call"
@@ -61,17 +79,21 @@ pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let resident: std::collections::HashMap<String, (u64, u64)> = {
+    let resident: std::collections::HashMap<String, ResidentInfo> = {
         let slots = state.slots.read();
         slots
             .iter()
             .map(|m| {
                 (
                     m.id.clone(),
-                    (
-                        now_unix.saturating_sub(m.loaded_at.elapsed().as_secs()),
-                        now_unix.saturating_sub(m.last_used.elapsed().as_secs()),
-                    ),
+                    ResidentInfo {
+                        loaded_at: now_unix.saturating_sub(m.loaded_at.elapsed().as_secs()),
+                        last_used: now_unix.saturating_sub(m.last_used.elapsed().as_secs()),
+                        context: m
+                            .context_limits
+                            .and_then(|l| l.positional_tokens())
+                            .map(|positional| (m.effective_max_ctx, positional)),
+                    },
                 )
             })
             .collect()
@@ -89,9 +111,13 @@ pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
                 "owned_by": "rmlx",
                 "loaded": resident.contains_key(&e.id),
             });
-            if let Some((loaded_at, last_used)) = resident.get(&e.id) {
-                obj["loaded_at"] = (*loaded_at).into();
-                obj["last_used"] = (*last_used).into();
+            if let Some(info) = resident.get(&e.id) {
+                obj["loaded_at"] = info.loaded_at.into();
+                obj["last_used"] = info.last_used.into();
+                if let Some((max_ctx, positional_max)) = info.context {
+                    obj["max_ctx"] = max_ctx.into();
+                    obj["positional_max"] = positional_max.into();
+                }
             }
             obj
         })
@@ -150,7 +176,7 @@ pub(crate) async fn load_model(
         Err(e) => {
             tracing::error!(model_id = %id, error = %e, "load: failed");
             state.error_counts.increment(ApiErrorCategory::Upstream);
-            service_unavailable(&e)
+            service_unavailable(&e.to_string())
         }
     }
 }

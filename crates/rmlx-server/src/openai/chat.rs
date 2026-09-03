@@ -1085,7 +1085,11 @@ pub(crate) async fn chat_completions(
         Ok(pair) => pair,
         Err(e) => {
             state.error_counts.increment(ApiErrorCategory::Upstream);
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", &e);
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                &e.to_string(),
+            );
         }
     };
 
@@ -1098,23 +1102,37 @@ pub(crate) async fn chat_completions(
     // routes — but the lease still protects in-flight decodes.
     let decode_lease_guard = state.decode_lease_guard(&req.model);
 
-    // A2: enforce per-request prompt length ceiling against the loaded
-    // model's effective_max_ctx (= min of --max-ctx, model's
-    // max_position_embeddings, fallback 4096). Without this guard, a prompt
-    // that overflows the KV-cache capacity bottoms out as either a 503
-    // "generation produced zero tokens" or a 200 with completion_tokens=0 —
-    // surfaced by the Gemma4-26b longctx_4k baseline bug.
+    // Enforce the per-request prompt-length ceiling. Without this guard a
+    // prompt that overflows the KV-cache capacity bottoms out as either a 503
+    // "generation produced zero tokens" or a 200 with completion_tokens=0.
     // Slot=None (cold-start race) or NotReadyGenerator default → usize::MAX,
     // letting the existing 503 path catch real runtime overflows there.
     {
-        // Issue #26: when a per-request `max_ctx` override is present, the guard
-        // ceiling is the requested value (the engine sizes the KV-ring virtual
-        // ceiling to it, #25), not the load-time `--max-ctx`. The engine clamps
-        // by the model's max_position_embeddings during cache build, so an
-        // over-mpe request is bounded there; this guard only prevents a runaway
-        // prompt from bottoming out as a 503 / zero-token response.
-        let effective_max_ctx = req_max_ctx_override
-            .map_or_else(|| state.effective_max_ctx_for(&req.model), |n| n as usize);
+        // A per-request `max_ctx` override (issue #26) re-sizes the KV-ring
+        // ceiling for this one request, so it becomes the guard's ceiling —
+        // but only after the same resolution the launch flag goes through
+        // refuses one above the model's positional capacity. Refusing here
+        // keeps the operator's own numbers in the message instead of surfacing
+        // the engine's post-resolution ceiling as if it were the request.
+        let effective_max_ctx = match req_max_ctx_override {
+            Some(n) => match state.context_limits_for(&req.model) {
+                Some(limits) => match rmlx_models::context::resolve_context(&limits, Some(n)) {
+                    Ok(ctx) => ctx.ceiling_tokens(),
+                    Err(e) => {
+                        state
+                            .error_counts
+                            .increment(ApiErrorCategory::ContextOverflow);
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "context_length_exceeded",
+                            &e.to_string(),
+                        );
+                    }
+                },
+                None => n as usize,
+            },
+            None => state.effective_max_ctx_for(&req.model),
+        };
         let prompt_len = gen_req.prompt_tokens.len();
         if prompt_len > effective_max_ctx {
             state

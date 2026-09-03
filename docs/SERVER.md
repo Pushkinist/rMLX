@@ -223,7 +223,7 @@ Expired requests return HTTP 408 `timeout`.
 | `enable_thinking` | bool | `false` suppresses the open `<think>` block on Qwen3-family models. |
 | `thinking_budget` | u32 | Cap the reasoning channel at N tokens. |
 | `kv_quant` | string | **Issue #26 — per-request KV-codec hot-swap.** Override the KV-cache codec for this request on the resident model, no weight reload. Accepts the same grammar as the `--kv-quant` CLI flag (`"none"`/`"bf16"`, `"k8v4"`, `"k8v8"`, `"planar"`, `"mixed"`, `"mixed_k<kb>g<kg>_v<vb>g<vg>"`, …). `"auto"` selects the per-arch/per-ctx default. Omitted → the server's launch `--kv-quant`. A malformed codec string returns HTTP 400 `invalid_request_error`. |
-| `max_ctx` | i32 | **Issue #26 — per-request context-ceiling override.** Re-size the KV-ring virtual ceiling (lazy-grow, #25) for this request only; must be `> 0`. Omitted → the server's launch `--max-ctx`. No weight touch — a ring realloc only. |
+| `max_ctx` | i32 | **Issue #26 — per-request context-ceiling override.** Re-size the KV-ring virtual ceiling (lazy-grow, #25) for this request only; must be `> 0`, and is bounded by the checkpoint's positional capacity — a larger value returns HTTP 400 `context_length_exceeded` naming the capacity and the flag that would raise it, never a silent clamp. Omitted → the server's launch `--max-ctx`. No weight touch — a ring realloc only. |
 | `image_max_tokens` | u32 | **Issue #180 — per-request image-token budget for Gemma4-unified vision.** Raises the per-image soft-token budget so dense images (e.g. tables) keep more resolution; must be `> 0`, clamped to the model's safe upper bound (1120). A larger value yields a higher `num_soft_tokens` for the same image (visible in the serve log `Gemma4-unified image preprocessed` / `preprocess: done` lines). Resolution order: this field > `--image-max-tokens` launch flag > the snapshot's `processor_config.json` `max_soft_tokens` (typically 280). Omitted → launch default / config default (behaviour unchanged). No-op for text-only requests and non-Gemma4-unified vision archs. |
 | `logit_bias` | object | Token-id (string key) → logit bias (float). |
 | `frequency_penalty` | f32 | |
@@ -256,9 +256,11 @@ quant for a 128k request, `none` for a short chat) with zero downtime.
   codec switch is a clean cross-codec miss, not a thrash-eviction. See
   `docs/PROMPT_CACHE.md` § "Codec namespacing".
 - **`max_ctx`** re-sizes the KV-ring virtual ceiling (#25 lazy-grow) for the
-  request; the engine clamps it by the model's `max_position_embeddings` during
-  cache build. The `context_length_exceeded` prompt-length guard uses the
-  per-request ceiling when the override is present.
+  request. The route resolves it through `rmlx_models::context::resolve_context`
+  — the same function the launch `--max-ctx` goes through — so a value above the
+  checkpoint's positional capacity is refused with that function's message
+  rather than clamped. The `context_length_exceeded` prompt-length guard then
+  uses the resolved per-request ceiling.
 - **Single-MLX claim is unaffected** — one model stays resident throughout.
 - **Anthropic `/v1/messages`** does not expose these fields (stricter wire
   spec); it always uses the launch default.
@@ -464,10 +466,25 @@ always yields `"end_turn"` with `stop_sequence:null`.
 Returns the OpenAI-shaped model list:
 
 ```json
-{"object":"list","data":[{"id":"my-model","object":"model","owned_by":"rmlx","permission":[]}]}
+{"object":"list","data":[{"id":"my-model","object":"model","owned_by":"rmlx","loaded":false}]}
 ```
 
-All models in the registry are listed regardless of resident status.
+All models in the registry are listed regardless of resident status. A
+**resident** entry additionally carries `loaded_at`, `last_used`, and the two
+context numbers the run resolved:
+
+| Field | Meaning |
+|---|---|
+| `max_ctx` | The context ceiling in force — what the admission guard enforces and what the KV ring may grow to. |
+| `positional_max` | What the checkpoint can address, RoPE scaling included; the highest a per-request `max_ctx` may ask for. |
+
+Both are **omitted** when the architecture does not expose
+`max_position_embeddings`: the resolver then accepts any `max_ctx`, so
+publishing a bound would state the opposite of the behaviour. The field's
+absence is what says "no limit known".
+
+This is the surface that reports the effective ceiling; the same pair is on the
+`slots: model loaded` log line. See `docs/CLI.md` § "Context ceiling".
 
 ### Model lifecycle endpoints
 
@@ -550,7 +567,7 @@ Common `error_type` values:
 | HTTP | `error_type` | Condition |
 |---|---|---|
 | 400 | `invalid_request_error` | Bad field, out-of-range param, unsupported feature. |
-| 400 | `context_length_exceeded` | Prompt exceeds the model's effective max context. |
+| 400 | `context_length_exceeded` | Prompt exceeds the model's effective max context, or a per-request `max_ctx` exceeds the checkpoint's positional capacity. See `docs/CLI.md` § "Context ceiling". |
 | 404 | `not_found_error` | Model id not in registry. |
 | 408 | `timeout` | Per-request wall-clock timeout exceeded. |
 | 429 | `rate_limit_error` | GPU admission queue full. |

@@ -66,6 +66,10 @@ pub struct Qwen3VlMoeTextConfig {
     pub mrope_interleaved: bool,
     /// Maximum sequence length from config.
     pub max_position_embeddings: u32,
+    /// Positional capacity of this checkpoint. The generate paths read this
+    /// rather than `max_position_embeddings`, so the fold from raw field to
+    /// context bound happens once, here.
+    pub context: crate::context::ContextLimits,
     // Quant (shared global config).
     /// Quantization group size.
     pub quant_group_size: i32,
@@ -238,6 +242,11 @@ fn parse_text(
         })
         .unwrap_or_default();
 
+    let mpe = e
+        .get("max_position_embeddings")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |v| v as u32);
+
     Ok(Qwen3VlMoeTextConfig {
         num_hidden_layers: req_u64!("num_hidden_layers"),
         hidden_size,
@@ -272,10 +281,10 @@ fn parse_text(
             .unwrap_or(5_000_000.0) as f32,
         mrope_section,
         mrope_interleaved,
-        max_position_embeddings: e
-            .get("max_position_embeddings")
-            .and_then(serde_json::Value::as_u64)
-            .map_or(0, |v| v as u32),
+        max_position_embeddings: mpe,
+        // Qwen3-VL-MoE implements no RoPE scaling: its trained window is the
+        // limit.
+        context: crate::context::ContextLimits::trained_only(mpe as i32),
         quant_group_size: quant.0,
         quant_bits: quant.1,
         quant_mode: quant.2,

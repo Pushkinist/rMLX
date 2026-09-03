@@ -166,6 +166,7 @@ fn recording_state(template: &str) -> (AppState, Arc<Mutex<Option<bool>>>, tempf
         loaded_at: now,
         last_used: now,
         effective_max_ctx: usize::MAX,
+        context_limits: None,
         decode_lease: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         unload_handle: Arc::new(Mutex::new(None)),
         keep_alive: rmlx_server::KeepAlivePolicy::Pin,
