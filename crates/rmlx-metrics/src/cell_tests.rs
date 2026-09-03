@@ -1,6 +1,6 @@
 use super::{
-    decode_config, decode_config_from_notes, decode_config_is_well_formed, predicate, NotesVerdict,
-    CELL_COLUMNS,
+    decode_config, decode_config_from_notes, decode_config_is_all_defaults,
+    decode_config_is_well_formed, predicate, NotesVerdict, CELL_COLUMNS,
 };
 
 #[test]
@@ -169,4 +169,46 @@ fn notes_that_compose_an_illegal_configuration_are_not_classified() {
         decode_config_from_notes("config=mtp draft_kind=mtp block_size=5"),
         NotesVerdict::Speculative("mtp/block=5".to_string())
     );
+}
+
+// ── Spellings of the engine's own defaults ───────────────────────────────────
+
+/// `NULL` is the engine at its defaults, so a string saying the same thing is a
+/// second spelling of one configuration — and two spellings are two cells.
+#[test]
+fn a_configuration_spelling_only_defaults_is_recognised() {
+    let head = rmlx_core::kv_boundary::DEFAULT_BOUNDARY_HEAD_N;
+    let tail = rmlx_core::kv_boundary::DEFAULT_BOUNDARY_TAIL_N;
+    assert!(decode_config_is_all_defaults(&format!(
+        "kv_boundary/head={head},kv_boundary/tail={tail}"
+    )));
+}
+
+/// A term off its default, a key with no single default, and a malformed
+/// string are all not "the engine as shipped" — the first two say something the
+/// column exists to record, and the third is the grammar check's business.
+#[test]
+fn a_configuration_that_says_something_is_not_all_defaults() {
+    let head = rmlx_core::kv_boundary::DEFAULT_BOUNDARY_HEAD_N;
+    let tail = rmlx_core::kv_boundary::DEFAULT_BOUNDARY_TAIL_N;
+    for config in [
+        format!("kv_boundary/head={head},kv_boundary/tail={}", tail + 1),
+        format!("kv_boundary/head={},kv_boundary/tail={tail}", head + 1),
+        "kv_boundary/head=0,kv_boundary/tail=0".to_string(),
+        // No default in the table: absence means no drafter at all, so no
+        // spelling of `mtp/block` is redundant.
+        "mtp/block=5".to_string(),
+        // A per-architecture default cannot be recognised from the term.
+        "prefill_chunk=1024".to_string(),
+        // Mixed: one term at its default, one not.
+        format!("kv_boundary/head={head},kv_boundary/tail=4"),
+        // Malformed — a different question, answered by the grammar check.
+        "kv boundary head=2".to_string(),
+        String::new(),
+    ] {
+        assert!(
+            !decode_config_is_all_defaults(&config),
+            "{config:?} must not be read as the engine at its defaults"
+        );
+    }
 }

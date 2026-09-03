@@ -1,0 +1,28 @@
+-- Migration 007: a `decode_config` that spells the engine's own defaults is
+-- NULL.
+--
+-- §3.2 says NULL is the engine at its defaults. A row that instead spells the
+-- defaults out is a second spelling of one configuration, and two spellings are
+-- two cells: neither ranks against the other, and both look like champions of
+-- whatever they contain. A boundary-layer campaign filed 61 rows as
+-- `kv_boundary/head=2,kv_boundary/tail=8` — an explicit spelling of the shipped
+-- `2,8` — so its `kv_cache_bytes` and `decode_tps_warm` measurements sat beside
+-- the default-configuration rows they were taken to be compared with and were
+-- compared with nothing.
+--
+-- **This writes no measurement.** It moves rows between classification cells by
+-- rewriting a column that says how the engine was configured, from a redundant
+-- spelling to the canonical one, on rows whose configuration was the default
+-- all along. The append-only rule is about measurements; migration 006 filled
+-- the same column on the same grounds.
+--
+-- The rule is `rmlx_metrics::cell::decode_config_is_all_defaults`, run from
+-- `migrate::schema_runner::null_default_decode_config` — one predicate, shared
+-- with `RunRecord::validate`, which refuses a record carrying such a spelling
+-- so no new row can arrive in this state. It is not expressed in SQL here
+-- because the default values are the engine's own constants
+-- (`rmlx_core::kv_boundary`) and a SQL literal would be a second copy of them,
+-- which is the drift this whole column exists to prevent.
+--
+-- This file itself is a no-op statement; the work is the post-hook.
+SELECT 1;

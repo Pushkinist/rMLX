@@ -433,6 +433,27 @@ impl RunRecord {
                     ),
                 });
             }
+            // Refused rather than normalised, and loudly: a caller that spells
+            // out the shipped default has misunderstood what the column is
+            // for, and silently rewriting the value to NULL would let the next
+            // campaign make the same mistake at scale. The message names the
+            // defaults so the fix is obvious.
+            if crate::cell::decode_config_is_all_defaults(config) {
+                return Err(Error::InvalidIngestField {
+                    field: "decode_config".to_string(),
+                    message: format!(
+                        "{config:?} spells the engine's own defaults ({}); NULL is how a \
+                         run at the defaults is recorded, and a second spelling of one \
+                         configuration puts its measurements in a cell that ranks against \
+                         nothing. Omit the field.",
+                        rmlx_core::kv_boundary::DECODE_CONFIG_NUMERIC_DEFAULTS
+                            .iter()
+                            .map(|&(key, value)| format!("{key}={value}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                });
+            }
         }
 
         // temperature range (strict)
