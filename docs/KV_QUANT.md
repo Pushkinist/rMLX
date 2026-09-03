@@ -1929,25 +1929,126 @@ continuation on this prompt does not diverge over two of 48 layers. That is a
 property of this cell, not evidence that the arms are numerically equal — they
 are not.
 
-**Eight store-bearing codecs pay for the floor rather than getting it free.**
-"Delivered from bytes the layer already spends" is a property of `Mixed` and
-`RotK` and of no other base. Ten codecs materialise a packed store; eight of
-them take the `K8V8` fallback, and for those the floor has a price that splits
-by side store:
+### What the floor costs, measured
 
-| Fallback group | `SideStore` | bits/value | `K8V8` at 16.00 |
-|---|---|---:|---|
-| `iso3_sym`, `iso4_sym`, `k_iso3`, `k_iso4` | `IsoRing` | 12.125 | **1.32× byte regression** |
-| `rotor3_sym`, `rotor4_sym`, `k_rotor3`, `k_rotor4` | `Rotor` | 16.25 | neutral to favourable |
+**The floor is never free. In-family is cheaper, not free.** "Delivered from
+bytes the layer already spends" was the wrong claim: the in-family target is a
+*wider* store than the base, and the extra width is paid for like any other.
+
+**A `K8V8`-floored layer is a bf16 layer.** `K8V8` materialises no packed store,
+so a promoted layer under the fallback holds two full bf16 buffers and nothing
+else — 16.00 bits per value, byte-identical to `none`. That is the whole price
+mechanism: the fallback does not quantize the boundary layer at 8 bits, it takes
+it out of quantization and charges bf16 for it.
+
+Measured with `scripts/bench/codec_inertness_probe.sh` at `--max-tokens 200`,
+`kv_cache_bytes` from `rmlx baseline`, recorded in `runs.db` under
+`decode_config = 'kv_boundary/head=2,kv_boundary/tail=8'`. The price column is
+the linear decomposition `p/(F-p) * (bytes(none) - bytes(codec))` over the
+`F` codec-bearing layers of which `p` are promoted, checked against a direct
+`--kv-boundary-layers 0,0` run:
+
+| model | codec | whole-cache ÷ `none` | floor's share of that cache |
+|---|---|---:|---:|
+| Ternary-Bonsai-8B 4k (F=36, p=10) | `iso3_sym` / `iso4_sym` | 0.8426× | **+7.18%** |
+| Ternary-Bonsai-8B 32k | `iso3_sym` / `iso4_sym` | 0.8294× | **+7.91%** |
+| Ternary-Bonsai-8B 4k | `k_iso3` / `k_iso4` | 0.9213× | +3.29% |
+| Ternary-Bonsai-8B 4k | `rotor3_sym` | 1.0348× | **−1.29%** |
+| Ternary-Bonsai-8B 4k | `k_rotor3` | 1.0174× | −0.66% |
+| Ternary-Bonsai-8B 4k | `mixed_k4g64_v4g64` (in-family) | 0.3557× | **+19.80%** |
+| Ternary-Bonsai-8B 32k | `mixed_k4g64_v4g64` (in-family) | 0.3513× | **+19.80%** |
+| gemma-4-e2b, any ctx | every codec | — | **0.00%** (p = 0) |
+
+Three things that table settles:
+
+* **The iso four pay, and it is what separates the store rate from the
+  whole-cache rate.** `iso3_sym`'s ring is 12.125 bits per value — 0.758× bf16 —
+  and its whole-cache ratio is 0.829× at 32k. The 7.9% gap is the ten promoted
+  layers at bf16. Undoing it would take the ratio to 0.764×, which is the ring
+  rate plus the accounting slack, and is what a `--kv-boundary-layers 0,0` run
+  measures directly.
+* **Rotor is byte-favourable, not merely neutral.** Its ring is 16.25 bits per
+  value, *above* bf16, so replacing a rotor layer with a bf16 one gives bytes
+  back. The floor is free on this family in the byte sense and always has been.
+* **In-family costs 19.80% of `mixed_k4g64_v4g64`'s cache**, invariant in
+  context. The comparison in-family wins is against the fallback, not against
+  nothing: the same ten layers at `K8V8` would be 0.484× where in-family is
+  0.356×, so keeping the family is worth ~27% of the cache.
+
+**`gemma-4-e2b` has zero power for any boundary-count question.** Its
+`num_kv_shared_layers = 20` makes every tail layer a consumer that owns no
+cache, and its head-2 layers are sliding-attention, so **p = 0**: three
+full-attention layers (4, 9, 14) carry the codec and none of them is promoted.
+Every boundary measurement taken on e2b reads 0.00% by construction. Use
+`Ternary-Bonsai-8B` (dense, p = 10 of 36) with a Gemma4 checkpoint whose
+`num_kv_shared_layers = 0` (`gemma-4-12B`: p = 2 of 8; `gemma-4-26b-a4b`:
+p = 2 of 5) as the pair.
 
 Leaving all eight on the fallback is deliberate: an SO(4)-rotated or rotor
 3-/4-bit ring has no 8-bit form of its own, so the alternative to paying for the
-floor on the iso four is not having one on those layers at all — 10 of 36 layers
-at 1.32× is the price of the fidelity the boundary promotion exists to buy. The
-rotor four are already above bf16, so their boundary layers cost nothing extra.
-The gate names all eight explicitly rather than filtering by variant kind, so a
-new store-bearing codec dropped into the fallback arm fails there instead of
+floor on the iso four is not having one on those layers at all. The gate names
+all eight explicitly rather than filtering by variant kind, so a new
+store-bearing codec dropped into the fallback arm fails there instead of
 inheriting this exemption.
+
+**The counts are settable.** `--kv-boundary-layers <head>,<tail>` (default
+`2,8`) moves them on `rmlx serve`, `baseline`, `bench` and `eval ppl`; `0,0`
+turns the promotion off. Runs at a non-default value carry
+`decode_config = 'kv_boundary/head=<h>,kv_boundary/tail=<t>'` so they rank as
+their own cell.
+
+### What the floor buys, measured
+
+`rmlx eval ppl --kv-quant iso3_sym --kv-boundary-layers <h>,<t>`, wikitext-2
+raw test split, `--ctx-window 2048 --stride 2048 --max-tokens 4096` (4 094
+scored positions, 2 windows). The scorer teacher-forces every scored position
+through a real per-layer cache, so each number is read off the decode path a
+request runs; a run is deterministic, so one run per arm is the whole
+measurement.
+
+| model | `p` | `none` (bf16 cache) | `2,8` (shipped) | `2,4` | `0,0` |
+|---|---:|---:|---:|---:|---:|
+| Ternary-Bonsai-8B | 10 of 36 | 10.68495 | **10.74565** | 10.77574 | 10.74358 |
+| gemma-4-12B | 2 of 8 | 441.4090 | **433.7515** | 432.1616 | 433.7264 |
+
+Against the shipped `2,8`:
+
+| model | `2,4` | `0,0` | codec vs bf16 (`2,8` ÷ `none`) |
+|---|---:|---:|---:|
+| Ternary-Bonsai-8B | **+0.280%** | −0.019% | +0.568% |
+| gemma-4-12B | **−0.366%** | −0.006% | −1.735% |
+
+Three readings, in order of what they license:
+
+* **Cutting the tail to 4 costs nothing measurable.** The change is 0.28% on
+  Bonsai and −0.37% on 12B — different signs on the two architectures, which is
+  what a perturbation with no systematic direction looks like.
+* **The floor buys nothing measurable on this codec.** Turning it off entirely
+  moves perplexity by 0.019% and 0.006%. Whatever `boundary_floor` is holding
+  for `iso3_sym`, it is not visible here — and the byte price it charges for it
+  is 7.9% of Bonsai's cache.
+* **The instrument has power for the effect it is measuring.** `iso3_sym`
+  against a bf16 cache is 0.57% on Bonsai, the same order as the boundary
+  effect, so a null above is a null and not a floor on resolution.
+
+This does **not** license removing the floor. The counts were set by a sweep of
+turbo2 quality at ≥32K context and the numbers above are a 2 048-token window on
+one corpus and one codec family; a 4 096-token corpus cannot see a long-context
+failure. What it does license is treating the counts as a knob with a known
+byte price and no measured quality return on `iso3_sym`, rather than as a
+constant nobody has priced. Note also that both Gemma4 checkpoints are
+instruction-tuned and score raw wikitext at 4 × 10² and up (26b at 5 × 10⁴,
+which is why it is not in the table): read the Gemma4 row as a
+perturbation-sensitivity measurement, not as a quality one.
+
+**A greedy token digest is not this measurement.** On `gemma-4-26b-a4b` at
+`--max-tokens 600`, `mixed_k4g64_v4g64` reproduces `none`'s ids exactly while
+`mixed_k8g64_v8g64` diverges at index 22 — the *coarser* codec agreeing with
+bf16 and the finer one not. On `gemma-4-12B` at `--kv-boundary-layers 0,0` the
+same pair is the other way round. The digest reports whether a near-tie
+resolved the same way on one prompt; it is not ordered by fidelity, and a
+codec's own perplexity is. Use the digest to tell a codec that changes nothing
+from one that changes something, never to rank two that both do.
 
 The split exists because **`K8V8` is not an 8-bit layer.** It does not
 materialise a packed store (`materialises_packed_store()` is false: its decode

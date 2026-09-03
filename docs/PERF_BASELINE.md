@@ -301,13 +301,30 @@ bandwidth prize to collect, so parity is the ceiling, not a milestone on the
 way past it.
 
 **The KV-bytes column is pre-sideband-narrowing.** Re-measured on the current
-tree at a 928-token prompt (`rmlx serve`, `kv_cache_bytes`), `k_iso3` is
-**0.980×** `none` on Bonsai-8B and **0.937×** on gemma-4-e2b, and `iso3_sym` /
-`iso4_sym` reach **0.962×** and **0.876×** on the same pair. `k_rotor3/4` is
-still above `none` (1.098× Bonsai-8B, 1.001× e2b). The throughput conclusion
-above is unchanged and is still the binding one; the memory conclusion is not —
-iso is now under bf16 and the remaining gap to its 12.125 bits/value store is
-the boundary-layer `K8V8` promotion, not the codec.
+tree at bench-scale prompts (`scripts/bench/codec_inertness_probe.sh`,
+`kv_cache_bytes` from `rmlx baseline`, `--max-tokens 200`):
+
+| model | ctx | `k_iso3` ÷ `none` | `iso3_sym` ÷ `none` | `k_rotor3` ÷ `none` |
+|---|---|---:|---:|---:|
+| Bonsai-8B | 3.8k | 0.921× | **0.843×** | 1.017× |
+| Bonsai-8B | 31.5k | 0.915× | **0.829×** | 1.009× |
+| gemma-4-e2b | 4.1k | 0.902× | **0.805×** | 1.005× |
+| gemma-4-e2b | 34.4k | 0.880× | **0.759×** | 1.002× |
+
+An earlier restatement of this paragraph quoted 0.980× / 0.962× (Bonsai-8B) and
+0.937× / 0.876× (e2b) from a **928-token** `rmlx serve` prompt. Those are that
+prompt's numbers, not the codecs': at 928 tokens the per-layer allocation floors
+and the ring's grow-step rounding are a large fraction of a small cache, so the
+ratio is pushed toward 1. Read the table above instead — the win is 15.7–17.1%
+on Bonsai-8B and 19.5–24.1% on e2b, not 2–4%.
+
+The throughput conclusion above is unchanged and is still the binding one; the
+memory conclusion is not — iso is under bf16, and the remaining gap between the
+whole-cache ratio and the 12.125 bits/value ring rate (0.758×) is the
+boundary-layer `K8V8` promotion, not the codec. On Bonsai-8B that gap is 7.9% of
+the cache at 32k; on e2b it is zero, because `num_kv_shared_layers = 20` leaves
+no promoted layer that owns a cache. See `docs/KV_QUANT.md` §Layer-adaptive
+overrides.
 
 **`none` was not bf16 on Bonsai when these rows were recorded — read the ratios
 accordingly.** `kv_quant_for_layer` then promoted the first 2 and last 8 layers

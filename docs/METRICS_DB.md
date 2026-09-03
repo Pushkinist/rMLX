@@ -203,6 +203,23 @@ speculative arm's `mtp/block=5` a term of this grammar rather than an
 exception to it. `NULL` is the engine at its defaults; the empty string is not
 a spelling of that and is refused.
 
+**Settings that currently use it.**
+
+| Terms | Setting | Emitted by |
+|---|---|---|
+| `mtp/block=<n>` | speculative-decode arm and its block size | `rmlx_metrics::cell::decode_config` |
+| `prefill_chunk=<n>` | non-default prefill chunk size | prefill-chunk sweeps |
+| `kv_boundary/head=<h>,kv_boundary/tail=<t>` | `--kv-boundary-layers` off its `2,8` default | `rmlx baseline --record`, `rmlx eval ppl`, `scripts/ingest/{codec_inertness,perf_ab}_ingest.py` |
+
+The `kv_boundary/*` pair is always written together and always in that order
+(`head` sorts before `tail`), because a head count without a tail count does
+not name a boundary. `NULL` is the shipped `2,8`, which is what keeps a default
+run ranking against every row recorded before the flag existed. The two Python
+ingesters derive the terms from the run's own recorded arguments — the probe's
+`kv_boundary` CSV column and `perf_ab.sh`'s per-arm `args` string — rather than
+from a flag on the ingester, so the term cannot describe a configuration the
+run did not use.
+
 `rmlx_metrics::cell::decode_config_is_well_formed` is the one implementation,
 enforced at ingest (`RunRecord::validate`) so a private spelling is rejected
 rather than stored. `bests`, `rmlx metrics best` / `compare` / `history` /
@@ -651,6 +668,25 @@ because nothing enforces it.
 
   No row written after this change matches: every row the script emits now
   carries `decode_window=`, whatever codec and prompt length it measured.
+- **`rmlx eval ppl` rows from the first cache-bearing sweep, filed without
+  `ppl/scorer=cached`** — the scorer gained a second mode (teacher-forcing each
+  window through a real per-layer KV cache) and the first sweep through it
+  recorded no term saying so, which puts a cacheless number and a bf16-cache
+  number in one cell. Ten rows, `2026-09-04`, `ppl_wikitext2` on
+  `Ternary-Bonsai-8B-mlx-2bit` and `gemma-4-12B-it-mxfp8` at `ctx_max = 2048`.
+  No migration reaches them: nothing in the row says which scorer produced it,
+  and guessing from the value is exactly the substitution this list exists to
+  refuse. Every later cached run carries the term, so a correctly labelled
+  re-measurement lands in a different cell and cannot out-rank them; they are
+  superseded, not corrected. The population is:
+
+  ```sql
+  SELECT * FROM observations
+  WHERE metric = 'ppl_wikitext2'
+    AND ts_utc LIKE '2026-09-04%'
+    AND (decode_config IS NULL OR decode_config NOT LIKE '%ppl/scorer=%');
+  ```
+
 - **`decode_config IS NULL` on a row that was speculative and never said so** —
   migration 005 added the column and left every existing row NULL, which is what
   ordinary decode carries, so a speculative row from before it kept sharing a
