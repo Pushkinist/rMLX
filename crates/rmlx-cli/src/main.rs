@@ -300,11 +300,6 @@ Valid bits: 2, 3, 4, 5, 6, 8 for integers, 3..8 for the floor and ceil of a
 fraction. Valid group sizes: 32, 64, 128 — the set the MLX affine
 quantizer implements. Anything else is a parse error, not a mode.";
 
-/// Short help for `--kv-quant` on `rmlx eval ppl`, where it is opt-in rather
-/// than defaulted: the scorer's own default runs no KV cache at all.
-const PPL_KV_QUANT_HELP: &str = "KV cache codec to score through (default: no \
-KV cache — a fresh full-window forward per window)";
-
 /// Long-help for `--kv-boundary-layers`, shared by every subcommand that takes it.
 const KV_BOUNDARY_LAYERS_LONG_HELP: &str = "\
 How many leading and trailing decoder layers are held at the boundary floor,
@@ -312,9 +307,9 @@ as `<head>,<tail>`. Default `2,8`.
 
 A boundary layer runs the quality floor instead of the requested codec. For a
 codec whose widths are parameters (`mixed_*`, `rot_k_*`) the floor is that
-codec's own 8-bit form; for every other quantizing codec it is `k8v8`, which
-stores nothing and decodes bf16 — so on those the boundary layers are bf16
-layers and cost bf16 bytes.
+codec's own 8-bit form. For every other quantizing codec the floor is a target
+that materialises no packed store and decodes at model dtype, so those boundary
+layers are bf16 layers and cost bf16 bytes.
 
 The counts are therefore a memory knob as well as a quality one, and the
 default is inherited rather than derived: raising `head` or `tail` spends more
@@ -1540,6 +1535,15 @@ enum EvalCmd {
     /// When `--corpus wikitext-2` (or any non-empty value) is supplied, also
     /// ingests one §8.5 universal `RunRecord` into `<RMLX_HOME>/metrics/runs.db`
     /// under op `ppl_wikitext2`.
+    ///
+    /// **A KV cache is opt-in here.** With no KV flag the scorer forwards each
+    /// window once and reads every position's logits out of that pass — no
+    /// cache exists, so no codec and no layer policy can affect the number.
+    /// Passing `--kv-quant` (or `--kv-preset` / `--kv-bits` /
+    /// `--cache-type-*`) switches it to teacher-forcing the window through a
+    /// real per-layer cache, one forward per scored token, so each NLL comes
+    /// off the decode path a request runs. The two modes are recorded as
+    /// different `decode_config` cells.
     Ppl {
         /// Path to the model snapshot directory (MLX format).
         #[arg(long)]
@@ -1572,7 +1576,7 @@ enum EvalCmd {
         /// guessed. Absent by default (`git_sha` is `NULL`).
         #[arg(long, value_name = "SHA")]
         git_sha: Option<String>,
-        #[arg(long, help = PPL_KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
+        #[arg(long, help = KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
         kv_quant: Option<String>,
         /// Named KV-cache preset (see long-help). Mutually exclusive with
         /// `--kv-quant`, `--cache-type-k`, `--cache-type-v`, and `--kv-bits`.
