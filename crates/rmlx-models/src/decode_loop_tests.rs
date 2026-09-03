@@ -3,7 +3,7 @@ use super::*;
 use std::cell::Cell;
 use std::fmt::Write as _;
 use std::str::FromStr as _;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rmlx_core::error::Error;
 use rmlx_kv_quant::KvQuant;
@@ -840,8 +840,15 @@ fn chunked_prefill_propagates_chunk_failure() {
             "simulated over-ceiling prefill rejection".to_owned(),
         ))
     };
-    let err = chunked_prefill(&mut caches, &ids, 4, Device::Cpu, "test", forward_chunk)
-        .expect_err("a rejected prefill must surface as Err, not a zero-token Ok run");
+    let err = chunked_prefill(
+        &mut caches,
+        &ids,
+        (4, "arch_default"),
+        Device::Cpu,
+        "test",
+        forward_chunk,
+    )
+    .expect_err("a rejected prefill must surface as Err, not a zero-token Ok run");
     assert!(
         err.to_string()
             .contains("simulated over-ceiling prefill rejection"),
@@ -874,7 +881,14 @@ fn chunked_prefill_runs_exit_sweep_on_failure() {
         );
         Err(Error::Other("simulated first-chunk failure".to_owned()))
     };
-    let _ = chunked_prefill(&mut caches, &ids, 4, Device::Cpu, "test", forward_chunk);
+    let _ = chunked_prefill(
+        &mut caches,
+        &ids,
+        (4, "arch_default"),
+        Device::Cpu,
+        "test",
+        forward_chunk,
+    );
     for (i, c) in caches.iter().enumerate() {
         assert!(
             !c.in_prefill(),
@@ -900,8 +914,15 @@ fn chunked_prefill_rejects_empty_prompt() {
     let forward_chunk = |_chunk: &[u32], _caches: &mut Vec<KvCache>| -> Result<Array> {
         Err(Error::Other("forward must not be called".to_owned()))
     };
-    let err = chunked_prefill(&mut caches, &ids, 4, Device::Cpu, "test", forward_chunk)
-        .expect_err("an empty prompt must surface as Err, not a zero-token Ok run");
+    let err = chunked_prefill(
+        &mut caches,
+        &ids,
+        (4, "arch_default"),
+        Device::Cpu,
+        "test",
+        forward_chunk,
+    )
+    .expect_err("an empty prompt must surface as Err, not a zero-token Ok run");
     assert!(
         err.to_string().contains("prefill produced no logits"),
         "the empty-prompt cause must name itself, got: {err}"
@@ -1025,52 +1046,113 @@ fn reject_nan_prefill_only_trusts_dtypes_the_scan_actually_reads() {
     }
 }
 
-/// The chunk the generate-path prefill logs is the one it cut the prompt at.
+/// A capturing subscriber, so the prefill event's fields are read rather than
+/// assumed.
 ///
-/// `chunked_prefill` re-derives the resolved chunk to label its event, so the
-/// label can disagree with the `chunk_size` it was handed. That disagreement is
-/// the whole failure mode the field exists to prevent: a run's record has no
-/// other trace of the chunk, so a wrong label is worse than none. Both cases
-/// are pinned — the caller that passes the resolved chunk is reported as its
-/// own source, and one that passes anything else is reported as `caller`.
+/// `tracing`'s own `Subscriber` is implemented here instead of pulling in a
+/// `tracing-subscriber` Layer: the whole need is "collect the fields of the
+/// events this thread emits", and that is a smaller thing than a dependency.
+struct CapturedEvents(Mutex<Vec<Vec<(String, String)>>>);
+
+impl tracing::field::Visit for FieldMap {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.push((field.name().to_owned(), value.to_string()));
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.push((field.name().to_owned(), value.to_string()));
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.push((field.name().to_owned(), value.to_owned()));
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push((field.name().to_owned(), format!("{value:?}")));
+    }
+}
+
+struct FieldMap(Vec<(String, String)>);
+
+impl tracing::Subscriber for CapturedEvents {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = FieldMap(Vec::new());
+        event.record(&mut fields);
+        #[allow(
+            clippy::unwrap_used,
+            reason = "test-only: a poisoned capture mutex means another assertion already panicked, and hiding that would report a pass"
+        )]
+        self.0.lock().unwrap().push(fields.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Run `f` with the capturing subscriber installed, and return the event whose
+/// fields include `prefill_chunk`.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: a poisoned capture mutex means another assertion already panicked, and hiding that would report a pass"
+)]
+fn capture_prefill_event(f: impl FnOnce()) -> Vec<(String, String)> {
+    let captured = Arc::new(CapturedEvents(Mutex::new(Vec::new())));
+    tracing::subscriber::with_default(Arc::clone(&captured), f);
+    let events = captured.0.lock().unwrap();
+    events
+        .iter()
+        .find(|fields| fields.iter().any(|(k, _)| k == "prefill_chunk"))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The generate-path prefill reports the chunk it cut at, and the rule behind
+/// it, as fields a reader can find.
+///
+/// Asserted off the emitted event, not off the resolver: the failure this
+/// field exists to prevent is a run whose record does not say what it chunked
+/// at, and only the event can show that. The chunk is threaded in already
+/// resolved, so the value logged is the value used by construction — the test
+/// pins that it is emitted at all, under the names a log search uses.
 #[test]
 fn chunked_prefill_logs_the_chunk_it_cut_at() {
     let _g = mlx_guard();
-    let arch = "Qwen3ForCausalLM";
-    let key = crate::prefill_chunk::module_key_for_class(arch);
-    // Both override rules outrank the arch default, and the per-arch one is
-    // the easy miss: with it set the source really is `env_arch`, so asserting
-    // `arch_default` would fail on a correct resolver and pass on one that
-    // mislabels an override.
-    if std::env::var("RMLX_PREFILL_CHUNK").is_ok()
-        || std::env::var(format!("RMLX_PREFILL_CHUNK_{}", key.to_uppercase())).is_ok()
-    {
-        return;
-    }
-    let (resolved, source) = crate::prefill_chunk::resolve(key);
-    assert_eq!(source, "arch_default");
-    assert_eq!(resolved, crate::prefill_chunk::prefill_chunk_for(key));
-
     let mut caches: Vec<KvCache> = (0..2)
         .map(|_| KvCache::with_quant_max_seq(KvQuant::None, 8))
         .collect();
-    let ids: Vec<u32> = (0..(resolved as u32 * 2 + 3)).collect();
+    let ids: Vec<u32> = (0..9).collect();
     let mut seen: Vec<usize> = Vec::new();
-    let forward_chunk = |chunk: &[u32], _caches: &mut Vec<KvCache>| -> Result<Array> {
-        seen.push(chunk.len());
-        Err(Error::Other("stop after recording the slice".to_owned()))
+    let fields = capture_prefill_event(|| {
+        let forward_chunk = |chunk: &[u32], _caches: &mut Vec<KvCache>| -> Result<Array> {
+            seen.push(chunk.len());
+            Err(Error::Other("stop after recording the slice".to_owned()))
+        };
+        let _ = chunked_prefill(
+            &mut caches,
+            &ids,
+            (4, "arch_default"),
+            Device::Cpu,
+            "Qwen3ForCausalLM",
+            forward_chunk,
+        );
+    });
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
     };
-    let _ = chunked_prefill(
-        &mut caches,
-        &ids,
-        resolved,
-        Device::Cpu,
-        arch,
-        forward_chunk,
-    );
+    assert_eq!(field("prefill_chunk").as_deref(), Some("4"));
     assert_eq!(
-        seen,
-        vec![resolved],
-        "prefill did not cut at the resolved chunk"
+        field("prefill_chunk_source").as_deref(),
+        Some("arch_default")
     );
+    assert_eq!(field("prompt_len").as_deref(), Some("9"));
+    assert_eq!(field("n_chunks").as_deref(), Some("3"));
+    assert_eq!(field("arch").as_deref(), Some("Qwen3ForCausalLM"));
+    assert_eq!(seen, vec![4], "prefill did not cut at the chunk it logged");
 }

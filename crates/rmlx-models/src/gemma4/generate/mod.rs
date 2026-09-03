@@ -333,7 +333,7 @@ pub fn generate_greedy<'a>(
     // put the TTFT sweet spot at 1024 — 2048 regresses the e4b dense path).
     // Override via `RMLX_PREFILL_CHUNK` (global) or `RMLX_PREFILL_CHUNK_GEMMA4`
     // (per-arch).
-    let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("gemma4");
+    let prefill_chunk = crate::prefill_chunk::resolve("gemma4");
     let prefill_t0 = Instant::now();
 
     use super::config::LayerType;
@@ -427,8 +427,8 @@ pub fn generate_greedy<'a>(
         };
 
     // ------------------------------------------------------------------
-    // Prefill: encode the prompt in `prefill_chunk` token chunks (default
-    // 1024 for gemma4; see binding at top of path-B section). Per chunk we
+    // Prefill: encode the prompt in `prefill_chunk` token chunks (the
+    // per-arch default; see binding at top of path-B section). Per chunk we
     // eval the KV-cache prefill_raw buffers (not the logits) to flush the
     // Metal command buffer under the ~10s watchdog while letting MLX skip
     // the wasted lm_head matmul for non-final chunks via lazy graph
@@ -517,8 +517,8 @@ pub fn generate_greedy<'a>(
         // failure returns its cause immediately (unlike the shared helper, which
         // must capture and sweep first).
         let mut last_logits: Option<Array> = None;
-        let n_chunks = prefill_ids.len().div_ceil(prefill_chunk);
-        for (chunk_idx, chunk) in prefill_ids.chunks(prefill_chunk).enumerate() {
+        let n_chunks = prefill_ids.len().div_ceil(prefill_chunk.0);
+        for (chunk_idx, chunk) in prefill_ids.chunks(prefill_chunk.0).enumerate() {
             let is_last = chunk_idx + 1 == n_chunks;
             match model.forward_seq_with_cache(chunk, Some(&mut caches), device) {
                 Ok(logits) => {

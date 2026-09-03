@@ -280,7 +280,7 @@ pub fn generate_greedy(
         })
         .collect();
 
-    let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_vl_moe");
+    let prefill_chunk = crate::prefill_chunk::resolve("qwen3_vl_moe");
     let logits = crate::decode_loop::chunked_prefill(
         &mut kv,
         prompt_ids,

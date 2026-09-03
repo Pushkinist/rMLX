@@ -475,8 +475,8 @@ pub fn generate_greedy<'a>(
     // `max_seq_ceiling` caps growth and rejects over-long prompts.
     let (initial_max_seq, max_seq_ceiling) =
         kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
-    // Prefill chunk for qwen3_5_moe defaults to 2048 (see prefill_chunk.rs for
-    // the sweep behind that number). The GDN recurrence runs the
+    // Prefill chunk for qwen3_5_moe comes from `arch_default` in
+    // `prefill_chunk.rs`, which records the sweep behind it. The GDN recurrence runs the
     // `gated_delta_step_gpu` kernel at any T, so a large chunk does NOT route to
     // the ops-graph path that used to explode the lazy graph — it just means
     // fewer, bigger forward passes and far fewer per-chunk KV-state evals, which
@@ -485,7 +485,7 @@ pub fn generate_greedy<'a>(
     // (per-arch); the GDN kernel pre-warm in `arch::load_model` reads the same
     // resolved chunk, so set the env BEFORE `rmlx serve` for the warmup shape to
     // match.
-    let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe");
+    let prefill_chunk = crate::prefill_chunk::resolve("qwen3_5_moe");
 
     // Path C: cache miss — full prefill from scratch
     let prefill_t0 = Instant::now();

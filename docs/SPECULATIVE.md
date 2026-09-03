@@ -610,9 +610,10 @@ verifier's own: `prefill_chunked_for_class` resolves the verifier's
 prefills at the chunk that architecture's generate path uses, and a retuned
 default or an `RMLX_PREFILL_CHUNK_<ARCH>` override reaches speculative prefill
 too. The resolved size and the rule that produced it (`arch_default`,
-`env_arch`, `env_global`, `adaptive`) are `debug!` fields on both prefill
-paths, so a run's log says what it chunked at rather than leaving it to be
-inferred from timings. Non-final chunks
+`env_arch`, `env_global`, `adaptive`, `fallback`) are `debug!` fields here and
+on the shared cold-prefill engine, so a run's log says what it chunked at
+rather than leaving it to be inferred from timings. The hand-rolled per-arch
+prefill loops are not covered — `docs/PROFILING.md` §10 lists them. Non-final chunks
 forward with `forward_seq_last_k_with_cache` discarding the returned logits;
 between chunks the KV cache state is flushed via `eval_prefill_state`. The
 `enter_prefill` / `exit_prefill` bracket optimises cache memory layout.

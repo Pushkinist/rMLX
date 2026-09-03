@@ -95,38 +95,34 @@ pub fn prefill_chunk_for(arch: &str) -> usize {
 /// configuration and a measurement of somebody's environment. Both halves come
 /// from this one walk of the resolution order so they cannot disagree.
 pub fn resolve(arch: &str) -> (usize, &'static str) {
-    let per_arch_var = format!("RMLX_PREFILL_CHUNK_{}", arch.to_uppercase());
-    resolve_from(
-        RUNTIME_OVERRIDE.load(Ordering::Acquire),
-        env::var(&per_arch_var).ok().and_then(|s| s.parse().ok()),
-        env::var("RMLX_PREFILL_CHUNK")
-            .ok()
-            .and_then(|s| s.parse().ok()),
-        arch,
-    )
+    resolve_with(RUNTIME_OVERRIDE.load(Ordering::Acquire), arch, |name| {
+        env::var(name).ok().and_then(|s| s.parse().ok())
+    })
 }
 
-/// The resolution order itself, with its three inputs passed in.
+/// The resolution order itself, reading the runtime override and the
+/// environment through its arguments.
 ///
-/// Split from [`resolve`] so every rule — including the two override rules —
-/// can be driven in a test without setting a process-wide environment variable
-/// that other tests read concurrently. A label that named the wrong rule would
-/// be worse than no label: it would put an override's number in a run's record
-/// under the shipped default's name.
-fn resolve_from(
+/// Split from [`resolve`] so every rule — including the two override rules and
+/// the variable *names* they read — can be driven in a test without mutating
+/// this process's environment, which other tests read concurrently and which
+/// cannot be set from safe Rust. Both are worth pinning: a label naming the
+/// wrong rule files an override's number under the shipped default's name, and
+/// a resolver reading the global variable where the per-arch one belongs makes
+/// the per-arch override silently inert.
+fn resolve_with(
     runtime: usize,
-    per_arch_env: Option<usize>,
-    global_env: Option<usize>,
     arch: &str,
+    read_env: impl Fn(&str) -> Option<usize>,
 ) -> (usize, &'static str) {
     // Runtime override (adaptive prefill chunk) — highest precedence.
     if runtime != 0 {
         return (runtime, "adaptive");
     }
-    if let Some(v) = per_arch_env {
+    if let Some(v) = read_env(&format!("RMLX_PREFILL_CHUNK_{}", arch.to_uppercase())) {
         return (v, "env_arch");
     }
-    if let Some(v) = global_env {
+    if let Some(v) = read_env("RMLX_PREFILL_CHUNK") {
         return (v, "env_global");
     }
     match arch_default(arch) {
@@ -155,7 +151,7 @@ pub fn module_key_for_class(arch_class: &str) -> &'static str {
     }
 }
 
-fn arch_default(arch: &str) -> Option<usize> {
+pub(crate) fn arch_default(arch: &str) -> Option<usize> {
     match arch {
         // qwen3 default 1024. A real-model kv-none sweep over
         // {256,512,1024,2048,4096}, run as a cyclic Latin square so this

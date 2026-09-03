@@ -1361,14 +1361,15 @@ fn prefill_chunked_for_class(
     device: Device,
     forward: impl FnMut(&[u32], &mut [KvCache]) -> Result<()>,
 ) -> Result<()> {
-    let (chunk_size, source) =
+    let (chunk_size, chunk_source) =
         crate::prefill_chunk::resolve(crate::prefill_chunk::module_key_for_class(arch_class));
     tracing::debug!(
         arch = arch_class,
         prefill_chunk = chunk_size,
-        prefill_chunk_source = source,
+        prefill_chunk_source = chunk_source,
         prompt_len = tokens.len(),
-        "spec prefill: chunking prompt"
+        n_chunks = tokens.len().div_ceil(chunk_size.max(1)),
+        "prefill: chunking prompt"
     );
     prefill_chunked_with(tokens, caches, chunk_size, device, forward)
 }

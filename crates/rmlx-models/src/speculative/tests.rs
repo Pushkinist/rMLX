@@ -313,31 +313,19 @@ fn tiny_tokenizer() -> tokenizers::Tokenizer {
     tokenizers::Tokenizer::new(model)
 }
 
-/// The verifier prefills at each architecture's own chunk, not at one
-/// architecture's chunk for all of them.
+/// Every registered architecture class maps to its own prefill-chunk key.
 ///
-/// A verifier that prefilled a qwen3 checkpoint at gemma4's chunk would put
-/// speculative decoding on a chunk no sweep ever measured for it, and a
-/// retuned per-arch default or an `RMLX_PREFILL_CHUNK_<ARCH>` override would
-/// never reach speculative prefill at all.
-///
-/// The **key** is asserted before the chunk it resolves to. Most registered
-/// classes share a chunk value with some other class, so a table compared on
-/// values alone leaves the mapping unpinned: routing `Qwen3ForCausalLM` to
-/// `gemma4` — the exact defect this lookup removes — is invisible to a
-/// value-only assertion while the two defaults happen to agree.
+/// The chunk is keyed on this mapping, so a class routed to another
+/// architecture's key prefills at a size no sweep ever measured for it. Keys
+/// are asserted rather than the chunks they resolve to: most classes share a
+/// chunk value with some other class, so a value-only comparison stays green
+/// through exactly the misrouting this pins — `Qwen3ForCausalLM` to `gemma4`
+/// is invisible while their defaults agree.
 ///
 /// The table is compared against the registry as a set, so a newly registered
 /// architecture fails here rather than being skipped.
 #[test]
 fn verifier_prefill_chunk_is_the_architectures_own() {
-    // A global override collapses every class onto one chunk, which would make
-    // the value half of this test vacuous. Same guard as the resolution tests
-    // in `prefill_chunk_tests.rs`.
-    if std::env::var("RMLX_PREFILL_CHUNK").is_ok() {
-        return;
-    }
-
     // `JinaEmbeddingsV4Model` is an encoder with no `Architecture` variant and
     // so no verifier; the empty key is the conservative fallback chunk, which
     // is the right answer for a class that has no prefill path of its own.
@@ -370,13 +358,6 @@ fn verifier_prefill_chunk_is_the_architectures_own() {
             *key,
             "{class} does not resolve to the {key} prefill-chunk key"
         );
-        let (chunk, _source) =
-            crate::prefill_chunk::resolve(crate::prefill_chunk::module_key_for_class(class));
-        assert_eq!(
-            chunk,
-            crate::prefill_chunk::prefill_chunk_for(key),
-            "verifier prefill chunk for {class} is not {key}'s"
-        );
     }
 }
 
@@ -400,7 +381,10 @@ fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
         if std::env::var(format!("RMLX_PREFILL_CHUNK_{}", key.to_uppercase())).is_ok() {
             continue;
         }
-        let chunk = crate::prefill_chunk::prefill_chunk_for(key);
+        // Against the shipped constant, not against a second call to the
+        // resolver: comparing the resolver to itself would hold whatever it
+        // returned.
+        let chunk = crate::prefill_chunk::arch_default(key).unwrap_or(64);
         let tokens: Vec<u32> = (0..(chunk * 2 + 3) as u32).collect();
         let mut seen: Vec<usize> = Vec::new();
         let result =
@@ -414,12 +398,5 @@ fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
             vec![chunk, chunk, 3],
             "{class} prefill did not cut the prompt at its own chunk"
         );
-        // The `prefill_chunk` field the prefill logs is the size it actually
-        // cut at, not a second opinion — a log that can disagree with the run
-        // is what made the chunk unrecoverable from a run's record before.
-        let (logged, source) =
-            crate::prefill_chunk::resolve(crate::prefill_chunk::module_key_for_class(class));
-        assert_eq!(logged, chunk, "{class}: logged chunk is not the one used");
-        assert_eq!(source, "arch_default", "{class}: unexpected chunk source");
     }
 }

@@ -771,34 +771,27 @@ fn resolve_piece(ctx: &DecodeCtx<'_>, id: u32) -> Box<str> {
     }
 }
 
-/// Which resolution rule produced `chunk_size` for `arch_class`.
-///
-/// Re-derived rather than passed down, so the label is self-checking: a caller
-/// prefilling at some size the resolver does not produce is reported as
-/// `caller` instead of being mislabelled as the arch default it did not use. A
-/// wrong label here is worse than none — the chunk has no other trace in a
-/// run's record, so nothing downstream could contradict it.
-fn chunk_source_for(arch_class: &str, chunk_size: usize) -> &'static str {
-    let (resolved, source) =
-        crate::prefill_chunk::resolve(crate::prefill_chunk::module_key_for_class(arch_class));
-    if resolved == chunk_size {
-        source
-    } else {
-        "caller"
-    }
-}
-
 /// Record what this prefill is about to do, before it does it.
 ///
-/// The chunk a run prefilled at has no other trace in its record, so without
-/// this it can only be inferred from timings — which is how two sweeps ended up
-/// collapsing the environment to find out. Emitted from here rather than inline
-/// so the bracket loop below stays one readable pass.
-fn log_prefill_plan(arch_class: &str, chunk_size: usize, prompt_len: usize, n_chunks: usize) {
+/// The chunk a run prefilled at is not recoverable from any other field, so
+/// reading it back afterwards means inferring it from timings.
+///
+/// Every value arrives already decided — this function resolves nothing and
+/// branches on nothing, so it cannot disagree with the prefill it describes.
+/// It is a function only because the event's macro expansion carries enough
+/// branches to push `chunked_prefill` past the cognitive-complexity gate on
+/// its own; inline, it costs the bracket loop about seven.
+fn log_prefill_plan(
+    arch: &'static str,
+    chunk_size: usize,
+    chunk_source: &'static str,
+    prompt_len: usize,
+    n_chunks: usize,
+) {
     tracing::debug!(
-        arch = arch_class,
+        arch,
         prefill_chunk = chunk_size,
-        prefill_chunk_source = chunk_source_for(arch_class, chunk_size),
+        prefill_chunk_source = chunk_source,
         prompt_len,
         n_chunks,
         "prefill: chunking prompt"
@@ -814,6 +807,13 @@ fn log_prefill_plan(arch_class: &str, chunk_size: usize, prompt_len: usize, n_ch
 /// final-position `Array` carries an `Err` naming why. Returning the cause is
 /// what keeps a rejected prefill from surfacing as a successful run reporting
 /// zeros — a bench harness reads throughput fields, not the log.
+///
+/// `resolved_chunk` is the `(size, source)` pair from
+/// [`crate::prefill_chunk::resolve`], threaded in rather than re-derived here.
+/// One walk of the resolution order per prefill is the point: the adaptive
+/// controller can install a process-wide override between two walks, so a
+/// second one can disagree with the size this prefill is actually using and
+/// would log the wrong provenance for an ordinary adaptive run.
 ///
 /// `caches` is borrowed `&mut` by this fn (it brackets enter/exit and evals
 /// non-final chunk state) AND re-borrowed into `forward_chunk` per chunk — the
@@ -832,23 +832,19 @@ fn log_prefill_plan(arch_class: &str, chunk_size: usize, prompt_len: usize, n_ch
 pub(crate) fn chunked_prefill(
     caches: &mut Vec<KvCache>,
     ids: &[u32],
-    chunk_size: usize,
+    resolved_chunk: (usize, &'static str),
     device: Device,
     arch: &'static str,
     mut forward_chunk: impl FnMut(&[u32], &mut Vec<KvCache>) -> Result<Array>,
 ) -> Result<Array> {
+    let (chunk_size, chunk_source) = resolved_chunk;
     for c in caches.iter_mut() {
         c.enter_prefill();
     }
     let mut last_logits: Option<Array> = None;
     let mut first_err: Option<Error> = None;
     let n_chunks = ids.len().div_ceil(chunk_size.max(1));
-    // The chunk a run prefilled at is not recoverable from any other field, so
-    // reading it back afterwards means inferring it from timings. The source is
-    // re-derived here rather than passed in, which also makes it self-checking:
-    // a caller that prefills at some other size is reported as `caller`, not
-    // mislabelled as the arch default it did not use.
-    log_prefill_plan(arch, chunk_size, ids.len(), n_chunks);
+    log_prefill_plan(arch, chunk_size, chunk_source, ids.len(), n_chunks);
     for (chunk_idx, chunk) in ids.chunks(chunk_size.max(1)).enumerate() {
         let is_last = chunk_idx + 1 == n_chunks;
         match forward_chunk(chunk, caches) {

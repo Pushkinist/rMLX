@@ -91,36 +91,37 @@ fn unknown_arch_falls_back() {
     assert_eq!(prefill_chunk_for("bogus"), FALLBACK);
 }
 
-/// Every rule in the resolution order reports its own name.
+/// Every rule in the resolution order reports its own name, and reads the
+/// variable that belongs to it.
 ///
 /// The chunk a run prefilled at is logged with the rule that produced it, and
-/// the two are read together: a label that named the arch default while an
+/// the two are read together: a label naming the arch default while an
 /// override supplied the number would describe a measurement of somebody's
-/// environment as a measurement of the shipped configuration. Driven through
-/// `resolve_from` so the override rules are covered without setting a
-/// process-wide variable that the tests above read.
+/// environment as a measurement of the shipped configuration. The env reader
+/// is injected, so the two variables can both be set at once — the only way to
+/// separate them, since swapping two `Option<usize>` arguments compiles.
 #[test]
 fn each_resolution_rule_reports_its_own_source() {
-    // Precedence order, each rule winning in turn with every lower rule also
-    // supplied — so a label is pinned to its rule, not to "the only input set".
+    // Both variables set, per-arch differing from global, so precedence is
+    // decided rather than defaulted.
+    let both = |name: &str| match name {
+        "RMLX_PREFILL_CHUNK_QWEN3" => Some(512),
+        "RMLX_PREFILL_CHUNK" => Some(256),
+        _ => None,
+    };
+    let global_only = |name: &str| (name == "RMLX_PREFILL_CHUNK").then_some(256);
+    let none = |_: &str| None;
+
+    assert_eq!(resolve_with(1024, "qwen3", both), (1024, "adaptive"));
+    assert_eq!(resolve_with(0, "qwen3", both), (512, "env_arch"));
+    assert_eq!(resolve_with(0, "qwen3", global_only), (256, "env_global"));
+    assert_eq!(resolve_with(0, "qwen3", none), (1024, "arch_default"));
     assert_eq!(
-        resolve_from(1024, Some(512), Some(256), "qwen3"),
-        (1024, "adaptive")
-    );
-    assert_eq!(
-        resolve_from(0, Some(512), Some(256), "qwen3"),
-        (512, "env_arch")
-    );
-    assert_eq!(
-        resolve_from(0, None, Some(256), "qwen3"),
-        (256, "env_global")
-    );
-    assert_eq!(
-        resolve_from(0, None, None, "qwen3"),
-        (arch_default("qwen3").unwrap_or(FALLBACK), "arch_default")
-    );
-    assert_eq!(
-        resolve_from(0, None, None, "no_such_arch"),
+        resolve_with(0, "no_such_arch", none),
         (FALLBACK, "fallback")
     );
+
+    // The per-arch name is built from the arch, so another arch does not see
+    // qwen3's variable.
+    assert_eq!(resolve_with(0, "gemma4", both), (256, "env_global"));
 }
