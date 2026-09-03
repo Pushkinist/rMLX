@@ -771,6 +771,33 @@ fn resolve_piece(ctx: &DecodeCtx<'_>, id: u32) -> Box<str> {
     }
 }
 
+/// Record what this prefill is about to do, before it does it.
+///
+/// The chunk a run prefilled at is not recoverable from any other field, so
+/// reading it back afterwards means inferring it from timings.
+///
+/// Every value arrives already decided — this function resolves nothing and
+/// branches on nothing, so it cannot disagree with the prefill it describes.
+/// It is a function only because the event's macro expansion carries enough
+/// branches to push `chunked_prefill` past the cognitive-complexity gate on
+/// its own; inline, it costs the bracket loop about seven.
+fn log_prefill_plan(
+    arch: &'static str,
+    chunk_size: usize,
+    chunk_source: &'static str,
+    prompt_len: usize,
+    n_chunks: usize,
+) {
+    tracing::debug!(
+        arch,
+        prefill_chunk = chunk_size,
+        prefill_chunk_source = chunk_source,
+        prompt_len,
+        n_chunks,
+        "prefill: chunking prompt"
+    );
+}
+
 /// Fresh chunked prefill: `enter_prefill` → per-chunk forward + `eval_prefill_state`
 /// → `exit_prefill`. Returns the final-position logits, or the cause of the
 /// failure that prevented them.
@@ -780,6 +807,13 @@ fn resolve_piece(ctx: &DecodeCtx<'_>, id: u32) -> Box<str> {
 /// final-position `Array` carries an `Err` naming why. Returning the cause is
 /// what keeps a rejected prefill from surfacing as a successful run reporting
 /// zeros — a bench harness reads throughput fields, not the log.
+///
+/// `resolved_chunk` is the `(size, source)` pair from
+/// [`crate::prefill_chunk::resolve`], threaded in rather than re-derived here.
+/// One walk of the resolution order per prefill is the point: the adaptive
+/// controller can install a process-wide override between two walks, so a
+/// second one can disagree with the size this prefill is actually using and
+/// would log the wrong provenance for an ordinary adaptive run.
 ///
 /// `caches` is borrowed `&mut` by this fn (it brackets enter/exit and evals
 /// non-final chunk state) AND re-borrowed into `forward_chunk` per chunk — the
@@ -798,17 +832,19 @@ fn resolve_piece(ctx: &DecodeCtx<'_>, id: u32) -> Box<str> {
 pub(crate) fn chunked_prefill(
     caches: &mut Vec<KvCache>,
     ids: &[u32],
-    chunk_size: usize,
+    resolved_chunk: (usize, &'static str),
     device: Device,
     arch: &'static str,
     mut forward_chunk: impl FnMut(&[u32], &mut Vec<KvCache>) -> Result<Array>,
 ) -> Result<Array> {
+    let (chunk_size, chunk_source) = resolved_chunk;
     for c in caches.iter_mut() {
         c.enter_prefill();
     }
     let mut last_logits: Option<Array> = None;
     let mut first_err: Option<Error> = None;
     let n_chunks = ids.len().div_ceil(chunk_size.max(1));
+    log_prefill_plan(arch, chunk_size, chunk_source, ids.len(), n_chunks);
     for (chunk_idx, chunk) in ids.chunks(chunk_size.max(1)).enumerate() {
         let is_last = chunk_idx + 1 == n_chunks;
         match forward_chunk(chunk, caches) {

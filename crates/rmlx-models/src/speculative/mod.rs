@@ -1330,22 +1330,48 @@ pub fn prefill_chunked(
     mut lin_caches: Option<&mut [LinearAttnCache]>,
     device: Device,
 ) -> Result<()> {
-    // Dispatch the chunk size off the actual arch family: Gemma4 and the
-    // Qwen3.5MoE hybrid use their own per-arch prefill chunk size.
-    let prefill_chunk = if arch.needs_lin_caches() {
-        crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe")
-    } else {
-        crate::prefill_chunk::prefill_chunk_for("gemma4")
-    };
-    prefill_chunked_with(tokens, caches, prefill_chunk, device, |chunk, caches| {
-        // Single-position last_k=1 forward — we only need cache update, not
-        // logits. The lazy graph drops the lm_head matmul on non-final chunks;
-        // on the final chunk we discard the returned Array. For GDN-bearing
-        // archs the recurrent lin_caches advance alongside kv_caches; Gemma4
-        // passes None. `as_deref_mut` reborrows per chunk.
-        arch.forward_seq_last_k_with_cache(chunk, 1, caches, lin_caches.as_deref_mut(), device)
-            .map(|_| ())
-    })
+    prefill_chunked_for_class(
+        arch.arch_class(),
+        tokens,
+        caches,
+        device,
+        |chunk, caches| {
+            // Single-position last_k=1 forward — we only need cache update, not
+            // logits. The lazy graph drops the lm_head matmul on non-final chunks;
+            // on the final chunk we discard the returned Array. For GDN-bearing
+            // archs the recurrent lin_caches advance alongside kv_caches; Gemma4
+            // passes None. `as_deref_mut` reborrows per chunk.
+            arch.forward_seq_last_k_with_cache(chunk, 1, caches, lin_caches.as_deref_mut(), device)
+                .map(|_| ())
+        },
+    )
+}
+
+/// [`prefill_chunked`] with the architecture reduced to its class name.
+///
+/// This is where the chunk is chosen, and it is separate from
+/// `prefill_chunked` so a test can drive the choice with an injected forward
+/// and read back the slices the prompt was actually cut into — building an
+/// `Architecture` needs a snapshot, so a chunk selected inside
+/// `prefill_chunked` would be observable only on a machine with the weights.
+fn prefill_chunked_for_class(
+    arch_class: &str,
+    tokens: &[u32],
+    caches: &mut [KvCache],
+    device: Device,
+    forward: impl FnMut(&[u32], &mut [KvCache]) -> Result<()>,
+) -> Result<()> {
+    let (chunk_size, chunk_source) =
+        crate::prefill_chunk::resolve(crate::prefill_chunk::module_key_for_class(arch_class));
+    tracing::debug!(
+        arch = arch_class,
+        prefill_chunk = chunk_size,
+        prefill_chunk_source = chunk_source,
+        prompt_len = tokens.len(),
+        n_chunks = tokens.len().div_ceil(chunk_size.max(1)),
+        "prefill: chunking prompt"
+    );
+    prefill_chunked_with(tokens, caches, chunk_size, device, forward)
 }
 
 /// Bracket-and-sweep engine behind [`prefill_chunked`]: `enter_prefill` on every

@@ -127,6 +127,52 @@ pub fn decode_config(draft_kind: &str, block_size: u32) -> String {
     format!("{draft_kind}/block={block_size}")
 }
 
+/// Whether `value` is a well-formed `decode_config` — see `docs/METRICS_DB.md`
+/// §3.2 for the grammar and why it is a grammar and not a free-form label.
+///
+/// One or more `key=value` terms joined by `,`, no whitespace, terms strictly
+/// ordered by key. A key is one or more lower-case `[a-z0-9_]` segments joined
+/// by `/`, which is what makes the speculative arm's `mtp/block=5` and a
+/// prefill setting's `prefill_chunk=1024` terms of one shape. A value is a
+/// non-empty run of `[A-Za-z0-9_.+-]`.
+///
+/// The ordering requirement is the part that carries weight: `decode_config`
+/// is cell identity, so two emitters describing the same engine configuration
+/// in different term orders would split one cell in two and rank neither
+/// against the other. Absence (`NULL`) is the engine at its defaults and is
+/// not spelled here.
+pub fn decode_config_is_well_formed(value: &str) -> bool {
+    let key_ok = |key: &str| {
+        !key.is_empty()
+            && key.split('/').all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            })
+    };
+    let value_ok = |v: &str| {
+        !v.is_empty()
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'))
+    };
+
+    let mut previous_key: Option<&str> = None;
+    for term in value.split(',') {
+        let Some((key, term_value)) = term.split_once('=') else {
+            return false;
+        };
+        if !key_ok(key) || !value_ok(term_value) {
+            return false;
+        }
+        if previous_key.is_some_and(|previous| previous >= key) {
+            return false;
+        }
+        previous_key = Some(key);
+    }
+    previous_key.is_some()
+}
+
 /// Read the value of `key=` out of a `notes` string, up to the next space.
 fn note_value<'a>(notes: &'a str, key: &str) -> Option<&'a str> {
     let rest = notes.split(key).nth(1)?;
@@ -156,7 +202,21 @@ pub fn decode_config_from_notes(notes: &str) -> NotesVerdict {
     match (kind, block) {
         (Some(kind), Some(block)) if kind != "none" => {
             match block.parse::<u32>() {
-                Ok(block) => NotesVerdict::Speculative(decode_config(kind, block)),
+                // The drafter name is lifted verbatim out of free-form notes,
+                // so it can be anything a bench script wrote — `Eagle3`, a
+                // typo, a word with a space in it. Composing that into a
+                // `decode_config` and storing it would put an out-of-grammar
+                // string into the append-only table, where nothing can take it
+                // back out. A row whose notes do not compose to a legal
+                // configuration does not say what it was.
+                Ok(block) => {
+                    let config = decode_config(kind, block);
+                    if decode_config_is_well_formed(&config) {
+                        NotesVerdict::Speculative(config)
+                    } else {
+                        NotesVerdict::Silent
+                    }
+                }
                 // A block size that is not a number is not a block size; the
                 // row does not say what it was.
                 Err(_) => NotesVerdict::Silent,

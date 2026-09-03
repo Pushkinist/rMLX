@@ -145,14 +145,21 @@ pub struct RunRecord {
     /// First ≤64 characters of the model's output, for coherence checks.
     #[serde(default)]
     pub output_first_64: Option<String>,
-    /// How the tokens were produced, when that is not ordinary decode.
+    /// The engine settings this run moved off their defaults.
     ///
-    /// Part of the `bests` cell key: a speculative-decode arm answers a
-    /// different question from a plain-decode one at the same model, quant and
-    /// prompt, so ranking their rates against each other publishes the
-    /// drafter's number as the model's decode throughput. `None` is ordinary
-    /// decode; a speculative arm records its drafter and block size, e.g.
-    /// `"mtp/block=5"`.
+    /// Part of the `bests` cell key: a run at a non-default configuration
+    /// answers a different question from one at the defaults for the same
+    /// model, quant and prompt, so ranking their rates against each other
+    /// publishes the one as the other's. A speculative arm was the first
+    /// setting to need this and is not the only one — a swept prefill chunk
+    /// files here too, e.g. `"mtp/block=5"` or `"prefill_chunk=1024"`.
+    ///
+    /// `None` is every setting at its default. A value is validated against
+    /// the §3.2 grammar by
+    /// [`crate::cell::decode_config_is_well_formed`] in [`RunRecord::validate`]:
+    /// the column is cell identity, so two spellings of one configuration
+    /// would split its measurements into two cells that never rank against
+    /// each other.
     #[serde(default)]
     pub decode_config: Option<String>,
     /// Free-form run notes (auto-summary, legacy keys, etc.).
@@ -410,6 +417,21 @@ impl RunRecord {
                         "sha256 must be a 64-character hex string, got {sha256:?}"
                     )));
                 }
+            }
+        }
+
+        // decode_config — cell identity, so its spelling is a contract and not
+        // a label. Two emitters describing one engine configuration in two
+        // spellings put its measurements in two cells, where neither ranks
+        // against the other and both look like champions.
+        if let Some(config) = self.decode_config.as_deref() {
+            if !crate::cell::decode_config_is_well_formed(config) {
+                return Err(Error::InvalidIngestField {
+                    field: "decode_config".to_string(),
+                    message: format!(
+                        "must be `key=value` terms joined by `,` and ordered by key, got {config:?}"
+                    ),
+                });
             }
         }
 

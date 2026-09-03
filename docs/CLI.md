@@ -111,7 +111,7 @@ mutually exclusive.
 | `--adaptive-admission` | bool flag | off | Enable the in-process adaptive admission controller. When set, the controller adjusts `max_queue_depth` dynamically based on SLA telemetry and rejects requests with HTTP 503 + `Retry-After: 5` when the end-to-end step estimate exceeds `2 × step-target-ms`. When absent, the static `--max-queue-depth` is used unchanged. |
 | `--step-target-ms` | u64 | 500 | End-to-end step SLA target in milliseconds for the adaptive controller. Anticipatory 503 fires when `est_step > 2 × this`. Requires `--adaptive-admission`. `--ttft-target-ms` is accepted as a hidden alias for backward compatibility. |
 | `--itl-target-ms` | u64 | 50 | ITL SLA target in milliseconds for the adaptive controller. Queue depth is lowered after `HOLD_TICKS` (3) consecutive ticks above target and raised when below `0.80 × target`. Requires `--adaptive-admission`. |
-| `--adaptive-prefill-chunk` | bool flag | off | Enable adaptive prefill-chunk sizing. Requires `--adaptive-admission`. Adjusts the process-wide prefill chunk within `[32, 2048]` tokens using the same deadband shape: raises when `est_itl < 0.80 × --itl-target-ms`, lowers after 3 consecutive overload ticks. OFF by default — defaults are locked from p0b-ttft bench. |
+| `--adaptive-prefill-chunk` | bool flag | off | Enable adaptive prefill-chunk sizing. Requires `--adaptive-admission`. Adjusts the process-wide prefill chunk within `[32, 2048]` tokens using the same deadband shape: raises when `est_itl < 0.80 × --itl-target-ms`, lowers after 3 consecutive overload ticks. OFF by default, because the per-arch defaults are bench-tuned and this overrides them — see the note below. |
 | `--default-temperature` | f32 | — | Server-wide default temperature when a request omits the field. Must be in `[0.0, 2.0]`. |
 | `--enable-thinking` | bool | — | Server-wide default for Qwen3-family thinking mode. Per-request `enable_thinking` overrides this. |
 | `--image-max-tokens` | usize | — (model config) | Server-wide default image-token budget for **Gemma4-unified** vision (issue #180). Raises the per-image soft-token budget the preprocessor allocates, preserving more resolution for dense inputs (e.g. tables); clamped to the model's safe upper bound (1120). When absent, the snapshot's `processor_config.json` `max_soft_tokens` (typically 280) is used — behaviour unchanged. Per-request `image_max_tokens` overrides this. No-op for text-only requests and non-Gemma4-unified vision archs. |
@@ -129,6 +129,20 @@ mutually exclusive.
 | `--rotor-qjl` | `on \| off` | `off` | Toggle the K-side 1-bit QJL residual for the `rotor3_sym` / `rotor4_sym` / `k_rotor3` / `k_rotor4` / `rotor_k_{3,4}_asym_v*_g*` codecs. Default `off`: QJL has no Metal kernel, so `on` forces the rotor K path onto CPU (single-digit TPS) with no measured accuracy gain across a two-arch context sweep; `off` routes the rotor K encode + decode through the Metal fused kernels. `--rotor-qjl on` opts into the residual for fidelity / ablation study. Env fallback: `RMLX_ROTOR_QJL=1`. No effect on non-rotor-K-side quant variants. |
 | `--planar-fused-qk` | `on \| off` | `on` | Route pre-softmax QK over PlanarQuant-packed K (`KvStorage::PlanarK`) through the `planar_fused_qk` MSL kernel instead of dequant+SDPA. Decode-step only (prefill chunks fall through to the legacy path). No effect on any non-PlanarK cache. **No env fallback — CLI-only**; tests do not need an env lock. See `docs/KV_QUANT.md` §"Fused-QK kernels". |
 | `--prefix-index` | `linear \| radix` | `linear` | Longest-prefix index strategy for the prompt cache. `linear` is O(slots × n\_blocks); `radix` is O(n\_blocks). |
+
+> **`--adaptive-prefill-chunk` replaces the per-arch default, in one
+> direction only.** The first tick seeds from the primary model's per-arch
+> chunk (`rmlx_models::prefill_chunk::prefill_chunk_for`) and then installs a
+> *process-wide* runtime override, which takes precedence over every per-arch
+> default and every `RMLX_PREFILL_CHUNK_<ARCH>` for the rest of the process.
+> Nothing clears it back to "no override", so once the controller has acted
+> the bench-tuned per-arch defaults no longer apply — including on a second
+> architecture loaded later under `--registry`, whose own default is never
+> consulted again. The override is clamped to `[32, 2048]`
+> (`PREFILL_CHUNK_MIN` / `PREFILL_CHUNK_MAX`), so an architecture whose default
+> already sits at the ceiling can only be moved downwards from it —
+> `arch_default` in `crates/rmlx-models/src/prefill_chunk.rs` says which ones
+> do.
 
 > **The rotor codecs are not memory wins; the iso ring is.** `iso3`, `iso4`,
 > `iso3_sym`, `iso4_sym`, `k_iso3`, `k_iso4`, `rotor3`, `rotor4`,
@@ -1328,7 +1342,7 @@ default at any point, and a cache can carry its own policy regardless.
 | `RMLX_ROT_K_FUSED` | `--rot-k-fused` | unset (resolves OFF) | Set to `1` to route rot_k decode steps through the fused FWHT MSL path. `--rot-k-fused on` / `off` override it. Prefer `--rot-k-fused`. |
 | `RMLX_ROTOR_QJL` | `--rotor-qjl` | unset (default OFF for rotor codecs) | Set to `1` to enable the K-side 1-bit QJL residual for rotor-K codecs (opt-in — forces the CPU path). Prefer `--rotor-qjl on`. |
 | `RMLX_EAGLE3_NO_FCS` | — | unset | Set to any value to make the Eagle3 drafter raw-concatenate its three auxiliary hidden slices instead of applying the per-slice `fcs.{0,1,2}` RMSNorms it carries. Ablation only — the norms are worth 1.04–1.52× accept rate. |
-| `RMLX_PREFILL_CHUNK` | — | (per-arch default) | Override the global prefill chunk size (tokens per forward pass). Also accepts per-arch form `RMLX_PREFILL_CHUNK_<ARCH>` (e.g. `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256`). Per-arch override takes precedence over the global. Dev tuning. |
+| `RMLX_PREFILL_CHUNK` | — | (per-arch default) | Override the global prefill chunk size (tokens per forward pass). Also accepts per-arch form `RMLX_PREFILL_CHUNK_<ARCH>` (e.g. `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256`). Per-arch override takes precedence over the global. A cold prefill through the shared engine, and a speculative verifier prefill, log the size they resolved and which rule produced it (`prefill_chunk` / `prefill_chunk_source` at `--log debug`, one of `arch_default` / `env_arch` / `env_global` / `adaptive` / `fallback`), so a run started under one of these says so. The hand-rolled prefill loops (laguna, qwen2, bitnet, the gemma4 and qwen3_5_moe prefix-append tails, the qwen3_vl_moe image path) do not — see `docs/PROFILING.md` §10. Dev tuning. |
 | `RMLX_KV_MAX_SEQ_HARD_CAP` | — | unset (no cap) | Opt-in hard cap on KV sequence length. When set, the KV cache rejects any extension beyond this token count. `--max-ctx` is the normal gate; this env is a last-resort safety guard. |
 | `RMLX_HARDWARE_TAG` | — | `m5_max_128gb` | Hardware tag embedded in `rmlx baseline` and `rmlx eval ppl` result rows. Set to match your machine (e.g. `m4_max_64gb`) when recording bench results for cross-machine comparison. |
 | `RMLX_REPO_ROOT` | — | (auto-detected) | Root directory of the rMLX workspace, used by `rmlx metrics export` when resolving the `BENCHMARK_CHAMPIONS.md` output path. Typically set automatically; override when running from a non-standard working directory. |

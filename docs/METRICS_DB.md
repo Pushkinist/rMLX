@@ -125,7 +125,7 @@ CREATE TABLE observations (
     ctx_max          INTEGER NOT NULL,             -- server max-ctx setting at run time
     prompt_id        INTEGER NOT NULL REFERENCES prompts(id),
     metric           TEXT    NOT NULL,             -- see §4 metric registry
-    decode_config    TEXT,                         -- how the tokens were produced; NULL = ordinary decode, e.g. 'mtp/block=5' (migration 005)
+    decode_config    TEXT,                         -- non-default engine configuration; NULL = every setting at its default, e.g. 'mtp/block=5', 'prefill_chunk=1024' (migration 005)
     -- value
     value            REAL    NOT NULL,             -- numeric measurement
     unit             TEXT    NOT NULL,             -- 'tps', 'ms', 'mb', 'bytes', 'count', 'ratio'
@@ -172,6 +172,43 @@ decode throughput. It is `NULL` for ordinary decode, which is also what every
 row written before migration 005 carries, so legacy plain-decode rows keep
 their cells unchanged. The population that column cannot sort out — speculative
 rows written before it existed — is named in §4.1.
+
+**It is the general discriminator for a non-default engine configuration, not
+a speculative-only field.** The drafter was the first setting to need one, but
+the argument is not about drafters: any engine setting a run deliberately moved
+off its default produces measurements that are not alternatives to the default
+configuration's, and a column per setting would mean a migration, a `bests`
+partition change and an edit to every consumer in `cell.rs` each time one
+appears. A prefill-chunk sweep is the same shape as a drafter arm — its cells
+are `prefill_chunk=<n>` — and lands here for the same reason. Settings that
+merely describe the run rather than change what was measured (`ctx_max`,
+`kv_quant`, `prompt`) have their own columns and do not belong here.
+
+**Grammar.** Because it is cell identity, the spelling is a contract: two
+emitters describing one configuration in two spellings put its measurements in
+two cells, where neither ranks against the other and both look like champions.
+
+```
+decode_config := term ("," term)*
+term          := key "=" value
+key           := segment ("/" segment)*
+segment       := [a-z0-9_]+
+value         := [A-Za-z0-9_.+-]+
+```
+
+No whitespace anywhere, and terms are **strictly ordered by key** — that
+ordering is what makes one configuration one string. A key may carry a `/`-path
+when the setting belongs to a named subsystem, which is what makes the
+speculative arm's `mtp/block=5` a term of this grammar rather than an
+exception to it. `NULL` is the engine at its defaults; the empty string is not
+a spelling of that and is refused.
+
+`rmlx_metrics::cell::decode_config_is_well_formed` is the one implementation,
+enforced at ingest (`RunRecord::validate`) so a private spelling is rejected
+rather than stored. `bests`, `rmlx metrics best` / `compare` / `history` /
+`timeseries` / `deltas` and the CSV / Markdown exports need nothing beyond
+this: they already partition on the whole cell key from `CELL_COLUMNS`, so a
+new setting's cells separate the moment its rows carry the term.
 
 **No PK on the cell columns.** A cell can have N observations over time — that's the whole point. PK is the surrogate `id`.
 
@@ -1239,8 +1276,10 @@ Single JSON object per run. The recorder fans out into N `observations` rows (on
 `schema_version` (defaults to 1), `git_sha`, `build_profile`, `prompt_tokens`, `max_tokens`, `temperature`, `seed`, `n_warmups`, `n_measure`, `output_first_64`, `notes`, `description`. Also `backend_version` — but only for non-rMLX backends (§8.5.1).
 
 `decode_config` is optional but is **cell identity, not context** (§3.2): absent
-or null means ordinary decode, and an emitter measuring a speculative arm must
-set it or its rows land in the plain-decode cell and rank against it.
+or null means every engine setting at its default, and an emitter measuring any
+non-default configuration — a speculative arm, a swept prefill chunk — must set
+it or its rows land in the default cell and rank against it. It is validated
+against the §3.2 grammar and a record outside that grammar is refused.
 
 ### 8.5.1 Run identity (hard rule)
 

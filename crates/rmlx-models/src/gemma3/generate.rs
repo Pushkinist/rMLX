@@ -266,7 +266,7 @@ pub fn generate_greedy<'a>(
     //
     // Chunk size is per-arch; default 256 for gemma3, override via
     // `RMLX_PREFILL_CHUNK` (global) or `RMLX_PREFILL_CHUNK_GEMMA3` (per-arch).
-    let prefill_chunk = crate::prefill_chunk::prefill_chunk_for("gemma3");
+    let prefill_chunk = crate::prefill_chunk::resolve("gemma3");
     // Two prefill flush protocols, kept per-arch:
     //   - image : one forward over the scatter-merged embeds, fresh caches
     //             enter_prefill → forward → exit_prefill (one-shot prompt,
