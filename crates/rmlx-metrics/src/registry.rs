@@ -461,8 +461,21 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
     ),
     // -- offline perplexity scorer (`rmlx eval ppl`). Op family `ppl`;
     // one `ppl_<corpus>` metric per supported corpus + audit fields.
+    //
+    // The scorer has two modes and they do not measure the same quantity: the
+    // default forwards each window once with no KV cache, and `--kv-quant`
+    // teacher-forces the window through a real per-layer cache, one forward
+    // per scored token. `_cached` is therefore a metric of its own rather than
+    // a `decode_config` term — a term would also fence these rows off from
+    // every `mlx_lm` row, which can never carry one this engine invented.
     (
         "ppl_wikitext2",
+        "ppl",
+        Direction::LowerBetter,
+        Bounds::positive(1e6),
+    ),
+    (
+        "ppl_wikitext2_cached",
         "ppl",
         Direction::LowerBetter,
         Bounds::positive(1e6),

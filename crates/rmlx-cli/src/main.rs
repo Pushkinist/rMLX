@@ -109,9 +109,9 @@ use commands::serve::{
 };
 use commands::{
     acquire_claim_for_device, build_cache_type_spec, kv_bits_u8, parse_device, parse_kv_bits_combo,
-    parse_kv_bits_fractional, parse_kv_preset, parse_kv_quant, parse_max_ctx,
-    parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg, run_baseline, run_bench,
-    run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
+    parse_kv_bits_fractional, parse_kv_boundary_layers, parse_kv_preset, parse_kv_quant,
+    parse_max_ctx, parse_max_prompt_tokens, resolve_model_flags, resolve_preset_arg, run_baseline,
+    run_bench, run_healthcheck, run_info, run_kv_calibrate, run_ppl, run_serve,
 };
 
 /// Long-help body shared by `--cache-type-k` / `--cache-type-v` on every
@@ -299,6 +299,32 @@ When --kv-group-size is omitted, group_size defaults to 64.
 Valid bits: 2, 3, 4, 5, 6, 8 for integers, 3..8 for the floor and ceil of a
 fraction. Valid group sizes: 32, 64, 128 — the set the MLX affine
 quantizer implements. Anything else is a parse error, not a mode.";
+
+/// Long-help for `--kv-boundary-layers`, shared by every subcommand that takes it.
+const KV_BOUNDARY_LAYERS_LONG_HELP: &str = "\
+How many leading and trailing decoder layers are held at the boundary floor,
+as `<head>,<tail>`. Default `2,8`.
+
+A boundary layer runs the quality floor instead of the requested codec. For a
+codec whose widths are parameters (`mixed_*`, `rot_k_*`) the floor is that
+codec's own 8-bit form. For every other quantizing codec the floor is a target
+that materialises no packed store and decodes at model dtype, so those boundary
+layers are bf16 layers and cost bf16 bytes.
+
+The counts are therefore a memory knob as well as a quality one, and the
+default is inherited rather than derived: raising `head` or `tail` spends more
+bytes at the floor, and `0,0` turns the promotion off entirely and runs the
+requested codec on every layer.
+
+How many layers this actually moves is a property of the model, not the flag.
+A windowed (sliding-attention) layer runs the bf16 rotating ring whatever it is
+handed, and a shared-KV consumer layer owns no cache at all, so on an
+architecture whose head and tail are all windowed or all consumers the flag
+changes nothing. `rmlx info --list-cache-types` reports the per-layer mix.
+
+Runs at a non-default value are recorded in `decode_config` as
+`kv_boundary/head=<h>,kv_boundary/tail=<t>`, so they rank as their own cell and
+never against a default-boundary run.";
 
 #[derive(Parser, Debug)]
 #[command(name = "rmlx", version, about = "Rust-native MLX inference server")]
@@ -532,6 +558,14 @@ enum Cmd {
         /// Group size for --kv-bits (default 64). See --kv-bits long-help.
         #[arg(long, value_name = "N", requires = "kv_bits")]
         kv_group_size: Option<usize>,
+        /// Head/tail layer counts held at the KV boundary floor (see long-help).
+        #[arg(
+            long,
+            value_name = "HEAD,TAIL",
+            value_parser = parse_kv_boundary_layers,
+            long_help = KV_BOUNDARY_LAYERS_LONG_HELP,
+        )]
+        kv_boundary_layers: Option<rmlx_models::kv_cache::KvBoundary>,
         /// Maximum context length (tokens) the run may address. Bounded by the
         /// checkpoint's positional capacity — `max_position_embeddings`,
         /// extended by a `rope_scaling` the config declares or by
@@ -1170,6 +1204,14 @@ enum Cmd {
         /// Group size for --kv-bits (default 64). See --kv-bits long-help.
         #[arg(long, value_name = "N", requires = "kv_bits")]
         kv_group_size: Option<usize>,
+        /// Head/tail layer counts held at the KV boundary floor (see long-help).
+        #[arg(
+            long,
+            value_name = "HEAD,TAIL",
+            value_parser = parse_kv_boundary_layers,
+            long_help = KV_BOUNDARY_LAYERS_LONG_HELP,
+        )]
+        kv_boundary_layers: Option<rmlx_models::kv_cache::KvBoundary>,
         /// Maximum context length (tokens) the run may address. Visible alias
         /// `--ctx-max`. Bounded by the
         /// checkpoint's positional capacity — `max_position_embeddings`,
@@ -1355,6 +1397,14 @@ enum Cmd {
         /// Group size for --kv-bits (default 64). See --kv-bits long-help.
         #[arg(long, value_name = "N", requires = "kv_bits")]
         kv_group_size: Option<usize>,
+        /// Head/tail layer counts held at the KV boundary floor (see long-help).
+        #[arg(
+            long,
+            value_name = "HEAD,TAIL",
+            value_parser = parse_kv_boundary_layers,
+            long_help = KV_BOUNDARY_LAYERS_LONG_HELP,
+        )]
+        kv_boundary_layers: Option<rmlx_models::kv_cache::KvBoundary>,
         /// Maximum context length (tokens) the run may address. Visible alias
         /// `--ctx-max`. Bounded by the
         /// checkpoint's positional capacity — `max_position_embeddings`,
@@ -1485,6 +1535,15 @@ enum EvalCmd {
     /// When `--corpus wikitext-2` (or any non-empty value) is supplied, also
     /// ingests one §8.5 universal `RunRecord` into `<RMLX_HOME>/metrics/runs.db`
     /// under op `ppl_wikitext2`.
+    ///
+    /// **A KV cache is opt-in here.** With no KV flag the scorer forwards each
+    /// window once and reads every position's logits out of that pass — no
+    /// cache exists, so no codec and no layer policy can affect the number.
+    /// Passing `--kv-quant` (or `--kv-preset` / `--kv-bits` /
+    /// `--cache-type-*`) switches it to teacher-forcing the window through a
+    /// real per-layer cache, one forward per scored token, so each NLL comes
+    /// off the decode path a request runs. The two modes are recorded as
+    /// different `decode_config` cells.
     Ppl {
         /// Path to the model snapshot directory (MLX format).
         #[arg(long)]
@@ -1517,6 +1576,57 @@ enum EvalCmd {
         /// guessed. Absent by default (`git_sha` is `NULL`).
         #[arg(long, value_name = "SHA")]
         git_sha: Option<String>,
+        #[arg(long, help = KV_QUANT_HELP, long_help = KV_QUANT_LONG_HELP)]
+        kv_quant: Option<String>,
+        /// Named KV-cache preset (see long-help). Mutually exclusive with
+        /// `--kv-quant`, `--cache-type-k`, `--cache-type-v`, and `--kv-bits`.
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = &["kv_quant", "cache_type_k", "cache_type_v", "kv_bits"],
+            value_parser = parse_kv_preset,
+            long_help = KV_PRESET_LONG_HELP,
+        )]
+        kv_preset: Option<KvPresetArg>,
+        /// Per-side KV cache codec for K (see long-help).
+        #[arg(
+            long = "cache-type-k",
+            visible_alias = "ctk",
+            value_name = "TAG",
+            conflicts_with = "kv_quant",
+            long_help = CACHE_TYPE_K_LONG_HELP,
+        )]
+        cache_type_k: Option<String>,
+        /// Per-side KV cache codec for V (see long-help).
+        #[arg(
+            long = "cache-type-v",
+            visible_alias = "ctv",
+            value_name = "TAG",
+            conflicts_with = "kv_quant",
+            long_help = CACHE_TYPE_V_LONG_HELP,
+        )]
+        cache_type_v: Option<String>,
+        /// Integer bit-width KV quantization alias. See long-help.
+        #[arg(
+            long,
+            value_name = "BITS",
+            conflicts_with_all = &["kv_quant", "cache_type_k", "cache_type_v"],
+            long_help = KV_BITS_LONG_HELP,
+        )]
+        kv_bits: Option<f32>,
+        /// Group size for --kv-bits (default 64). See --kv-bits long-help.
+        #[arg(long, value_name = "N", requires = "kv_bits")]
+        kv_group_size: Option<usize>,
+        /// Head/tail layer counts held at the KV boundary floor (see long-help).
+        /// Only meaningful alongside a KV codec — the cacheless scorer has no
+        /// per-layer cache to apply it to.
+        #[arg(
+            long,
+            value_name = "HEAD,TAIL",
+            value_parser = parse_kv_boundary_layers,
+            long_help = KV_BOUNDARY_LAYERS_LONG_HELP,
+        )]
+        kv_boundary_layers: Option<rmlx_models::kv_cache::KvBoundary>,
     },
 }
 
@@ -1854,7 +1964,9 @@ fn main() -> Result<()> {
             session_cache_max_sessions,
             yarn_factor,
             yarn_original_max,
+            kv_boundary_layers,
         } => {
+            rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
             // load + merge the named profile (if any). Precedence is
             // CLI > profile > hard-coded default. Each bindable flag is `Option`
             // at the clap layer, so `cli.or(profile)` honours "flag not passed"
@@ -2375,7 +2487,9 @@ fn main() -> Result<()> {
             gpu_capture_skip,
             #[cfg(feature = "metal-capture")]
             gpu_capture_steps,
+            kv_boundary_layers,
         } => {
+            rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
             refuse_to_measure_off_the_pin("rmlx baseline")?;
 
             // Arm the GPU-capture window before anything expensive happens: a
@@ -2523,7 +2637,9 @@ fn main() -> Result<()> {
             top_p,
             top_k,
             repetition_penalty,
+            kv_boundary_layers,
         } => {
+            rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
             let max_prompt_tokens = max_prompt_tokens.map(parse_max_prompt_tokens).transpose()?;
             // Same KV resolution ladder as `baseline`, so a cell benched here
             // and a cell recorded there name the same codec.
@@ -2586,12 +2702,68 @@ fn main() -> Result<()> {
                 device,
                 max_tokens,
                 git_sha,
+                kv_quant,
+                kv_preset,
+                cache_type_k,
+                cache_type_v,
+                kv_bits,
+                kv_group_size,
+                kv_boundary_layers,
             } => {
+                // A KV codec is opt-in here: with none of these flags the
+                // scorer keeps its cacheless full-window forward, which is what
+                // every PPL row already in the DB was measured with. Asking for
+                // one switches it to the teacher-forced path that runs the
+                // cache the decode loop runs.
+                let kv_requested = kv_quant.is_some()
+                    || kv_preset.is_some()
+                    || kv_bits.is_some()
+                    || cache_type_k.is_some()
+                    || cache_type_v.is_some();
+                if kv_boundary_layers.is_some() && !kv_requested {
+                    return Err(anyhow::anyhow!(
+                        "--kv-boundary-layers needs a KV codec: the default scorer runs no \
+                         per-layer cache, so the boundary counts would change nothing. Pass \
+                         --kv-quant (or --kv-preset / --kv-bits) as well."
+                    ));
+                }
+                rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
+                // Same KV resolution ladder as `baseline` and `bench`, so a
+                // codec scored here is the codec those two measure.
+                let (dev, kv_quant_resolved) = if !kv_requested {
+                    (parse_device(&device)?, None)
+                } else if let Some(preset_arg) = kv_preset {
+                    let dev = parse_device(&device)?;
+                    let cfg = rmlx_loader::load_config(&model)
+                        .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
+                    let preset_kq = resolve_preset_arg(preset_arg);
+                    info!(kv_quant = ?preset_kq, "--kv-preset resolved");
+                    (
+                        dev,
+                        Some(commands::parse::resolve_kv_quant(
+                            &cfg,
+                            Some(preset_kq),
+                            None,
+                        )),
+                    )
+                } else {
+                    let (dev, kq, _) = resolve_model_flags(
+                        &model,
+                        kv_quant.as_deref().unwrap_or("auto"),
+                        cache_type_k.as_deref(),
+                        cache_type_v.as_deref(),
+                        None,
+                        &device,
+                        "rmlx eval ppl",
+                        kv_bits,
+                        kv_group_size,
+                    )?;
+                    (dev, Some(kq))
+                };
                 // claim the Metal GPU before loading the model so a
                 // running `rmlx serve` does not contend on the single-process
                 // claim file. Mirrors `run_baseline`'s acquire pattern --
                 // `SENTINEL_PORT` flags the CLI-side (non-HTTP) claim holder.
-                let dev = parse_device(&device)?;
                 let _claim = acquire_claim_for_device(dev, SENTINEL_PORT)?;
                 run_ppl(
                     &model,
@@ -2603,6 +2775,7 @@ fn main() -> Result<()> {
                     max_tokens,
                     &run_id,
                     git_sha.as_deref(),
+                    kv_quant_resolved,
                 )?;
             }
         },

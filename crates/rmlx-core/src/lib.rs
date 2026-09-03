@@ -27,6 +27,7 @@ pub mod apple_gpu;
 mod build_info;
 pub mod dispatch_policy;
 pub mod error;
+pub mod kv_boundary;
 pub mod kvcache;
 pub mod mach_mem;
 pub mod paths;

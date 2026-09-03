@@ -173,6 +173,39 @@ pub fn decode_config_is_well_formed(value: &str) -> bool {
     previous_key.is_some()
 }
 
+/// Whether every term of `value` spells a setting's own shipped default.
+///
+/// `NULL` is the engine at its defaults (`docs/METRICS_DB.md` §3.2), so a
+/// string that says the same thing is a second spelling of one configuration —
+/// and two spellings are two cells that never rank against each other. This is
+/// how a whole campaign's rows can sit beside the rows they were meant to be
+/// compared with and win nothing.
+///
+/// The defaults come from [`rmlx_core::kv_boundary::DECODE_CONFIG_NUMERIC_DEFAULTS`],
+/// the same constants the engine applies. A key that is not in that table has
+/// no single default — `mtp/block` has none (absence means no drafter at all)
+/// and `prefill_chunk`'s is per-architecture — so a `decode_config` containing
+/// one is never all-defaults, whatever its other terms say.
+///
+/// Returns `false` for a malformed value: this answers "is it redundant", not
+/// "is it legal", and [`decode_config_is_well_formed`] is the one that answers
+/// the second.
+pub fn decode_config_is_all_defaults(value: &str) -> bool {
+    if !decode_config_is_well_formed(value) {
+        return false;
+    }
+    value.split(',').all(|term| {
+        let Some((key, term_value)) = term.split_once('=') else {
+            return false;
+        };
+        rmlx_core::kv_boundary::DECODE_CONFIG_NUMERIC_DEFAULTS
+            .iter()
+            .any(|&(default_key, default)| {
+                default_key == key && term_value.parse::<u64>() == Ok(default)
+            })
+    })
+}
+
 /// Read the value of `key=` out of a `notes` string, up to the next space.
 fn note_value<'a>(notes: &'a str, key: &str) -> Option<&'a str> {
     let rest = notes.split(key).nth(1)?;
