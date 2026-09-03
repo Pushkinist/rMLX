@@ -133,6 +133,7 @@ fn make_test_config(
         top_k_experts: 0,
         moe_intermediate_size: 0,
         max_position_embeddings: 0,
+        context: crate::context::ContextLimits::trained_only(0),
     }
 }
 

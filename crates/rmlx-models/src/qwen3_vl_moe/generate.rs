@@ -42,8 +42,8 @@ use rmlx_mlx::{Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::constraint::ConstraintEngine;
+use crate::context::{resolve_context, ResolvedContext};
 use crate::decode_loop::{reject_nan_prefill, ProbeStep};
-use crate::kv_cache::kv_max_seq_and_ceiling;
 use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_kv_quant::{KvCache, KvQuant};
@@ -138,6 +138,15 @@ fn guard_prefill_logits(logits: &Array, prompt_len: usize) -> Result<()> {
         max_abs_logit,
         prompt_len,
     )
+}
+
+/// Resolve this checkpoint's context bounds. Qwen3-VL declares no RoPE
+/// scaling, so its positional capacity is the trained window.
+fn resolved_context(
+    model: &Qwen3VlMoeText,
+    max_ctx_override: Option<i32>,
+) -> Result<ResolvedContext> {
+    resolve_context(&model.cfg.context, max_ctx_override)
 }
 
 /// Emit one decode step (token id + piece). Logit stats are left at defaults —
@@ -270,8 +279,8 @@ pub fn generate_greedy(
     // each chunk's command buffer under the ~10s Metal GPU watchdog — a
     // single-shot forward over a multi-thousand-token prompt trips it. Mirrors
     // the other arch text paths (qwen3_5_moe / gemma4).
-    let (initial_max_seq, max_seq_ceiling) =
-        kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
+    let ctx = resolved_context(model, max_ctx_override)?;
+    let (initial_max_seq, max_seq_ceiling) = (ctx.initial_max_seq, ctx.ceiling);
     let mut kv: Vec<KvCache> = (0..n_layers)
         .map(|i| {
             KvCache::with_quant_max_seq(kv_quant, initial_max_seq)
@@ -529,8 +538,8 @@ pub fn generate_image(
     // `slice_update` broadcast. Bracketing the chunked forward with
     // enter_prefill()/exit_prefill() routes the prefill through the lazy-grow
     // raw buffer (mirrors the Gemma4 image path) so it grows to fit.
-    let (initial_max_seq, max_seq_ceiling) =
-        kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
+    let ctx = resolved_context(model, max_ctx_override)?;
+    let (initial_max_seq, max_seq_ceiling) = (ctx.initial_max_seq, ctx.ceiling);
     let n_layers = model.cfg.num_hidden_layers;
     let mut kv: Vec<KvCache> = (0..n_layers)
         .map(|i| {

@@ -28,9 +28,10 @@ use super::{Architecture, LoadPhases};
     reason = "open extension point — callers construct via struct literal with named fields; adding a field requires updating all construction sites anyway"
 )]
 pub struct LoadOpts {
-    /// YARN RoPE override for Qwen3 models that lack `rope_scaling` in
-    /// `config.json`. Forwarded to `qwen3::load_from_path`. Has no effect on
-    /// non-Qwen3 architectures.
+    /// Operator-requested YARN RoPE extension. Forwarded to
+    /// `qwen3::load_from_path`; Qwen3 is the only architecture that
+    /// implements RoPE scaling, and `load_model` warns when the flag reaches
+    /// any other one.
     pub yarn: Option<crate::qwen3::YarnOverride>,
 }
 
@@ -327,6 +328,24 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = phases;
     }
+
+    // A `--yarn-factor` that reaches an architecture with no RoPE-scaling
+    // implementation changes nothing, including the context ceiling. Say so
+    // rather than let the operator read the unchanged refusal as a bug.
+    let limits = arch.context_limits();
+    if opts.yarn.is_some() && !limits.scaling_supported {
+        tracing::warn!(
+            arch = arch_str,
+            "--yarn-factor ignored: this architecture has no RoPE-scaling support, so the \
+             context ceiling stays at max_position_embeddings"
+        );
+    }
+    tracing::info!(
+        arch = arch_str,
+        trained_max = limits.trained_max,
+        positional_max = limits.positional_max(),
+        "arch::load_model: positional capacity resolved"
+    );
 
     Ok(arch)
 }

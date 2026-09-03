@@ -176,7 +176,6 @@ fn build_record_git_sha_survives_stamp_json() {
         prompt_id: Some("longctx_4k"),
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
-        ctx_max: 4096,
         git_sha: Some("cafebabe"),
     };
 
@@ -189,6 +188,7 @@ fn build_record_git_sha_survives_stamp_json() {
         "bf16",
         16,
         8,
+        4096,
         0.0,
         Some(120.0),
         Some(40.0),
@@ -220,7 +220,6 @@ fn build_record_git_sha_absent_is_null() {
         prompt_id: Some("longctx_4k"),
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
-        ctx_max: 4096,
         git_sha: None,
     };
 
@@ -233,6 +232,7 @@ fn build_record_git_sha_absent_is_null() {
         "bf16",
         16,
         8,
+        4096,
         0.0,
         Some(120.0),
         Some(40.0),
@@ -261,7 +261,6 @@ fn build_record_git_sha_blank_string_is_null() {
         prompt_id: Some("longctx_4k"),
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
-        ctx_max: 4096,
         git_sha: Some(""),
     };
 
@@ -274,6 +273,7 @@ fn build_record_git_sha_blank_string_is_null() {
         "bf16",
         16,
         8,
+        4096,
         0.0,
         Some(120.0),
         Some(40.0),
@@ -290,21 +290,59 @@ fn build_record_git_sha_blank_string_is_null() {
 }
 
 // ── resolve_prompt_truncation ────────────────────────────────────────────
-// Model-agnostic: pure function over (prompt_len, cap, device, flags), no
-// model load / GPU context involved.
+// Model-agnostic: pure function over (prompt_len, explicit cap, ceiling,
+// device, flag), no model load / GPU context involved. `None` for the cap
+// means "follow the resolved context ceiling".
 
 // gpu-test-gate: exempt
 #[test]
 fn resolve_prompt_truncation_under_cap_is_a_noop_on_gpu() {
     let len =
-        resolve_prompt_truncation(1_000, 65_536, Device::Gpu, false, false).expect("under cap");
+        resolve_prompt_truncation(1_000, None, 65_536, Device::Gpu, false).expect("under cap");
     assert_eq!(len, 1_000);
 }
 
 #[test]
 fn resolve_prompt_truncation_under_cap_is_a_noop_on_cpu() {
     let len =
-        resolve_prompt_truncation(1_000, 65_536, Device::Cpu, false, false).expect("under cap");
+        resolve_prompt_truncation(1_000, None, 65_536, Device::Cpu, false).expect("under cap");
+    assert_eq!(len, 1_000);
+}
+
+/// The default cap follows the resolved context ceiling, so a prompt a model
+/// can serve is accepted on a model whose ceiling reaches it — the same
+/// prompt length that a 65 536 ceiling refuses.
+// gpu-test-gate: exempt
+#[test]
+fn default_prompt_cap_follows_the_resolved_ceiling() {
+    let len = resolve_prompt_truncation(100_000, None, 131_072, Device::Gpu, false)
+        .expect("a 131072 ceiling admits a 100000-token prompt");
+    assert_eq!(len, 100_000);
+    resolve_prompt_truncation(100_000, None, 65_536, Device::Gpu, false)
+        .expect_err("a 65536 ceiling must refuse the same prompt");
+}
+
+/// An explicit `--max-prompt-tokens` above the resolved context ceiling is
+/// refused. Admitting it only moves the failure into prefill, where it
+/// surfaces as a `KvCeilingExceeded` naming a number the operator never typed.
+// gpu-test-gate: exempt
+#[test]
+fn explicit_cap_above_the_ceiling_is_refused() {
+    let err = resolve_prompt_truncation(1_000, Some(131_072), 65_536, Device::Gpu, false)
+        .expect_err("a cap above the ceiling cannot be honoured");
+    let msg = err.to_string();
+    assert!(msg.contains("131072"), "cap missing: {msg}");
+    assert!(msg.contains("65536"), "ceiling missing: {msg}");
+    assert!(msg.contains("--max-ctx"), "lift missing: {msg}");
+}
+
+/// An explicit cap exactly at the ceiling is fine — pins the `>` boundary
+/// against a `>=` mutation.
+// gpu-test-gate: exempt
+#[test]
+fn explicit_cap_at_the_ceiling_is_accepted() {
+    let len = resolve_prompt_truncation(1_000, Some(65_536), 65_536, Device::Gpu, false)
+        .expect("a cap equal to the ceiling is honourable");
     assert_eq!(len, 1_000);
 }
 
@@ -313,23 +351,24 @@ fn resolve_prompt_truncation_under_cap_is_a_noop_on_cpu() {
 // gpu-test-gate: exempt
 #[test]
 fn resolve_prompt_truncation_gpu_at_cap_exactly_is_a_noop() {
-    let len = resolve_prompt_truncation(65_536, 65_536, Device::Gpu, false, false)
+    let len = resolve_prompt_truncation(65_536, None, 65_536, Device::Gpu, false)
         .expect("prompt exactly at the default cap must not error");
     assert_eq!(len, 65_536);
 }
 
-/// The bug this fixes: a >65536-token prompt on `--device gpu` with the
-/// default cap and no opt-in must fail loudly, not silently truncate down to
-/// a shorter measurement that looks like a full-length one.
+/// A prompt past the ceiling on `--device gpu` with no opt-in must fail
+/// loudly, not silently truncate down to a shorter measurement that looks
+/// like a full-length one. The message names the ceiling and the flag that
+/// raises it.
 // gpu-test-gate: exempt
 #[test]
 fn resolve_prompt_truncation_gpu_default_cap_over_limit_errors_loudly() {
-    let err = resolve_prompt_truncation(131_072, 65_536, Device::Gpu, false, false)
+    let err = resolve_prompt_truncation(131_072, None, 65_536, Device::Gpu, false)
         .expect_err("must error, not silently truncate");
     let msg = err.to_string();
     assert!(msg.contains("131072"), "{msg}");
     assert!(msg.contains("65536"), "{msg}");
-    assert!(msg.contains("--max-prompt-tokens"), "{msg}");
+    assert!(msg.contains("--max-ctx"), "{msg}");
     assert!(msg.contains("--allow-truncate"), "{msg}");
 }
 
@@ -337,7 +376,7 @@ fn resolve_prompt_truncation_gpu_default_cap_over_limit_errors_loudly() {
 #[test]
 fn resolve_prompt_truncation_gpu_explicit_cap_over_limit_truncates() {
     // An explicit `--max-prompt-tokens` is itself the opt-in.
-    let len = resolve_prompt_truncation(131_072, 65_536, Device::Gpu, true, false)
+    let len = resolve_prompt_truncation(131_072, Some(65_536), 131_072, Device::Gpu, false)
         .expect("explicit cap truncates instead of erroring");
     assert_eq!(len, 65_536);
 }
@@ -345,18 +384,18 @@ fn resolve_prompt_truncation_gpu_explicit_cap_over_limit_truncates() {
 // gpu-test-gate: exempt
 #[test]
 fn resolve_prompt_truncation_gpu_allow_truncate_over_limit_truncates() {
-    let len = resolve_prompt_truncation(131_072, 65_536, Device::Gpu, false, true)
+    let len = resolve_prompt_truncation(131_072, None, 65_536, Device::Gpu, true)
         .expect("--allow-truncate opts into truncation");
     assert_eq!(len, 65_536);
 }
 
-/// `--device gpu` measuring the full length requires raising the cap; when
-/// the caller does that, the full prompt is measured (not truncated).
+/// `--device gpu` measuring the full length requires a ceiling that reaches
+/// it; when the run has one, the full prompt is measured (not truncated).
 // gpu-test-gate: exempt
 #[test]
-fn resolve_prompt_truncation_gpu_full_length_when_cap_raised() {
-    let len = resolve_prompt_truncation(131_072, 131_072, Device::Gpu, true, false)
-        .expect("prompt exactly at the raised cap");
+fn resolve_prompt_truncation_gpu_full_length_when_ceiling_reaches_it() {
+    let len = resolve_prompt_truncation(131_072, None, 131_072, Device::Gpu, false)
+        .expect("prompt exactly at the ceiling");
     assert_eq!(len, 131_072);
 }
 
@@ -364,7 +403,7 @@ fn resolve_prompt_truncation_gpu_full_length_when_cap_raised() {
 fn resolve_prompt_truncation_cpu_over_limit_always_truncates() {
     // CPU forward is genuinely O(N^2); the historical silent-truncate
     // behavior is preserved regardless of explicit/allow-truncate flags.
-    let len = resolve_prompt_truncation(131_072, 65_536, Device::Cpu, false, false)
+    let len = resolve_prompt_truncation(131_072, None, 65_536, Device::Cpu, false)
         .expect("cpu always truncates");
     assert_eq!(len, 65_536);
 }

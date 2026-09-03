@@ -104,6 +104,20 @@ fn loaded_state_with_max_ctx(
     model_id: &str,
     effective_max_ctx: usize,
 ) -> AppState {
+    loaded_state_with_context(registry, model_id, effective_max_ctx, None)
+}
+
+/// Build an `AppState` with the slot pre-populated by a `LoadedModel`
+/// carrying both the resolved ceiling and the checkpoint's
+/// [`ContextLimits`]. The limits are what a per-request `max_ctx` override is
+/// resolved against, so a fixture that leaves them `None` cannot reach the
+/// refusal branch or the `/v1/models` context fields.
+fn loaded_state_with_context(
+    registry: ModelRegistry,
+    model_id: &str,
+    effective_max_ctx: usize,
+    context_limits: Option<rmlx_models::context::ContextLimits>,
+) -> AppState {
     let state = not_ready_state(registry);
     let now = std::time::Instant::now();
     state.slots.write().push(LoadedModel {
@@ -112,11 +126,23 @@ fn loaded_state_with_max_ctx(
         loaded_at: now,
         last_used: now,
         effective_max_ctx,
+        context_limits,
         decode_lease: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         unload_handle: Arc::new(parking_lot::Mutex::new(None)),
         keep_alive: rmlx_server::KeepAlivePolicy::Pin,
     });
     state
+}
+
+/// Write a minimal snapshot directory the registry will accept, so a test can
+/// exercise `/v1/models` without a real model on disk.
+fn write_stub_snapshot(dir: &std::path::Path, arch: &str) {
+    std::fs::create_dir_all(dir).expect("create stub snapshot dir");
+    std::fs::write(
+        dir.join("config.json"),
+        format!(r#"{{"architectures":["{arch}"]}}"#),
+    )
+    .expect("write stub config.json");
 }
 
 /// Start a test server using the provided `AppState`.
@@ -729,6 +755,177 @@ async fn real_generation_anthropic_messages() {
     assert!(output_tokens >= 1, "usage.output_tokens must be >= 1");
 
     tracing::info!(text, output_tokens, "real_generation_anthropic: OK");
+}
+
+/// A model whose load is refused by the context resolver surfaces that error
+/// **typed**, not flattened into a string. `rmlx serve`'s eager preload keys
+/// off the variant to abort startup, and a `String` error would leave it
+/// unable to tell an unsatisfiable `--max-ctx` from a transient load failure.
+#[tokio::test]
+async fn ensure_loaded_preserves_the_context_refusal_variant() {
+    let tmp = std::env::temp_dir().join(format!(
+        "rmlx-typed-load-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let snap = tmp.join("refusing-model");
+    write_stub_snapshot(&snap, "Gemma4ForConditionalGeneration");
+    let reg = ModelRegistry::from_paths(std::slice::from_ref(&snap));
+
+    let mut state = not_ready_state(reg);
+    state.loader = Arc::new(|_path, _id| {
+        Err(rmlx_core::error::Error::ContextCeilingExceeded {
+            requested: 131_072,
+            positional_max: 40_960,
+            trained_max: 40_960,
+            lift: "raise --yarn-factor".to_owned(),
+        })
+    });
+
+    let err = state
+        .ensure_loaded("refusing-model")
+        .err()
+        .expect("the loader refuses");
+    assert!(
+        matches!(err, rmlx_core::error::Error::ContextCeilingExceeded { .. }),
+        "the variant must survive ensure_loaded, got: {err}"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+// ── Per-request `max_ctx` vs the checkpoint's positional capacity ────────────
+
+/// A per-request `max_ctx` above the checkpoint's positional capacity is
+/// refused with the context resolver's own message — the same one the launch
+/// flag produces — instead of being taken verbatim and dying later in the
+/// cache build.
+#[tokio::test]
+async fn per_request_max_ctx_over_capacity_returns_400() {
+    let Some(snap) = primary_snapshot_dir() else {
+        tracing::warn!(
+            "RMLX_TEST_MODEL_GEMMA4_E4B not set — skipping per_request_max_ctx_over_capacity_returns_400"
+        );
+        return;
+    };
+    if !snap.exists() {
+        tracing::warn!("primary snapshot absent — skipping");
+        return;
+    }
+    let reg = ModelRegistry::from_paths(std::slice::from_ref(&snap));
+    let model_id = "mlx-community__gemma-4-e4b-it-mxfp8";
+    let state = loaded_state_with_context(
+        reg,
+        model_id,
+        4096,
+        Some(rmlx_models::context::ContextLimits::trained_only(40_960)),
+    );
+    let port = start_server_with_state(state).await;
+
+    let payload = r#"{"model":"mlx-community__gemma-4-e4b-it-mxfp8","messages":[{"role":"user","content":"hi"}],"max_tokens":4,"max_ctx":131072}"#;
+    let (status, body) = http(port, "POST", "/v1/chat/completions", Some(payload)).await;
+
+    assert_eq!(
+        status, 400,
+        "expected 400 for over-capacity max_ctx: {body}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["type"], "context_length_exceeded");
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("131072"), "requested value missing: {msg}");
+    assert!(msg.contains("40960"), "capacity missing: {msg}");
+    assert!(
+        msg.contains("max_position_embeddings"),
+        "cause missing: {msg}"
+    );
+}
+
+/// A per-request `max_ctx` inside the capacity passes the guard and reaches
+/// the generator (503 from `NotReadyGenerator`) — pins that the refusal does
+/// not over-fire.
+#[tokio::test]
+async fn per_request_max_ctx_within_capacity_passes_guard() {
+    let Some(snap) = primary_snapshot_dir() else {
+        tracing::warn!(
+            "RMLX_TEST_MODEL_GEMMA4_E4B not set — skipping per_request_max_ctx_within_capacity_passes_guard"
+        );
+        return;
+    };
+    if !snap.exists() {
+        tracing::warn!("primary snapshot absent — skipping");
+        return;
+    }
+    let reg = ModelRegistry::from_paths(std::slice::from_ref(&snap));
+    let model_id = "mlx-community__gemma-4-e4b-it-mxfp8";
+    let state = loaded_state_with_context(
+        reg,
+        model_id,
+        4096,
+        Some(rmlx_models::context::ContextLimits::trained_only(40_960)),
+    );
+    let port = start_server_with_state(state).await;
+
+    let payload = r#"{"model":"mlx-community__gemma-4-e4b-it-mxfp8","messages":[{"role":"user","content":"hi"}],"max_tokens":4,"max_ctx":32768}"#;
+    let (status, body) = http(port, "POST", "/v1/chat/completions", Some(payload)).await;
+    assert_eq!(
+        status, 503,
+        "an in-capacity max_ctx must reach the generator: {body}"
+    );
+}
+
+/// `GET /v1/models` reports the ceiling in force and the checkpoint's
+/// positional capacity for a resident model, and reports neither when the
+/// capacity is unknown — the resolver accepts any `max_ctx` in that case, so a
+/// published bound would say the opposite of the behaviour.
+#[tokio::test]
+async fn models_report_context_numbers_only_when_capacity_is_known() {
+    let tmp = std::env::temp_dir().join(format!(
+        "rmlx-ctx-report-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let known = tmp.join("known-model");
+    write_stub_snapshot(&known, "Gemma4ForConditionalGeneration");
+
+    // Known capacity → both numbers reported.
+    let reg = ModelRegistry::from_paths(std::slice::from_ref(&known));
+    let state = loaded_state_with_context(
+        reg,
+        "known-model",
+        32_768,
+        Some(rmlx_models::context::ContextLimits::trained_only(131_072)),
+    );
+    let port = start_server_with_state(state).await;
+    let (status, body) = http(port, "GET", "/v1/models", None).await;
+    assert_eq!(status, 200, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let entry = &v["data"][0];
+    assert_eq!(entry["loaded"], true, "body: {body}");
+    assert_eq!(entry["max_ctx"], 32_768, "body: {body}");
+    assert_eq!(entry["positional_max"], 131_072, "body: {body}");
+
+    // Unknown capacity (arch does not expose max_position_embeddings) →
+    // neither number is published.
+    let reg = ModelRegistry::from_paths(std::slice::from_ref(&known));
+    let state = loaded_state_with_context(
+        reg,
+        "known-model",
+        4096,
+        Some(rmlx_models::context::ContextLimits::trained_only(0)),
+    );
+    let port = start_server_with_state(state).await;
+    let (status, body) = http(port, "GET", "/v1/models", None).await;
+    assert_eq!(status, 200, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let entry = &v["data"][0];
+    assert!(entry["max_ctx"].is_null(), "body: {body}");
+    assert!(entry["positional_max"].is_null(), "body: {body}");
+
+    std::fs::remove_dir_all(&tmp).ok();
 }
 
 // ── A2: context_length_exceeded guard (HTTP 400) ─────────────────────────────
@@ -1560,6 +1757,7 @@ async fn idle_eviction_clears_session_cache() {
         loaded_at: old_instant,
         last_used: old_instant,
         effective_max_ctx: 4096,
+        context_limits: None,
         decode_lease: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         unload_handle: Arc::new(parking_lot::Mutex::new(None)),
         keep_alive: rmlx_server::KeepAlivePolicy::Pin,

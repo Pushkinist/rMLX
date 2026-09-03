@@ -532,9 +532,12 @@ enum Cmd {
         /// Group size for --kv-bits (default 64). See --kv-bits long-help.
         #[arg(long, value_name = "N", requires = "kv_bits")]
         kv_group_size: Option<usize>,
-        /// Maximum context length (tokens) for the KV cache buffer.
-        /// When unset, derives from model.max_position_embeddings (capped at 4096).
-        /// Must be >= 256 when set.
+        /// Maximum context length (tokens) the run may address. Bounded by the
+        /// checkpoint's positional capacity — `max_position_embeddings`,
+        /// extended by a `rope_scaling` the config declares or by
+        /// `--yarn-factor`. A value above that capacity is refused, naming
+        /// both numbers; it is never clamped. When unset, the ceiling is
+        /// `min(capacity, 4096)`. Must be >= 256 when set.
         #[arg(long)]
         max_ctx: Option<u32>,
         /// Idle keep-alive — unload the model after this much idle time.
@@ -850,20 +853,20 @@ enum Cmd {
             default_value_t = 64usize
         )]
         session_cache_max_sessions: usize,
-        /// YARN RoPE scale factor for Qwen3 models whose `config.json` lacks
-        /// `rope_scaling`. When set, synthesises a YarnConfig with the paper
-        /// defaults (`beta_fast=32, beta_slow=1`), extending the effective
-        /// context window. Must be > 1.0 to take effect; values ≤ 1.0 are
-        /// ignored. Has no effect when `rope_scaling` is already present in
-        /// the model config (JSON path always wins).
+        /// YARN RoPE scale factor. Extends the context window a Qwen3-family
+        /// checkpoint can address to `factor * original` and raises the
+        /// ceiling `--max-ctx` is bounded by. Overrides a `rope_scaling` the
+        /// config declares; must be > 1.0 to take effect. Output quality past
+        /// the checkpoint's trained window is the operator's risk, and every
+        /// run past it is logged.
         ///
         /// Env: `RMLX_YARN_FACTOR`.
         #[arg(long, env = "RMLX_YARN_FACTOR", value_name = "FLOAT")]
         yarn_factor: Option<f32>,
-        /// Original max position embeddings for YARN context extension
-        /// (`--yarn-factor`). Sets the pre-extension context size used to
-        /// compute the YARN interpolation parameters. When absent (0), the
-        /// model's `max_position_embeddings` is used as the fallback.
+        /// Pre-extension context size `--yarn-factor` interpolates from.
+        /// When absent, the checkpoint's declared
+        /// `original_max_position_embeddings` is used, falling back to its
+        /// `max_position_embeddings`.
         ///
         /// Env: `RMLX_YARN_ORIGINAL_MAX`.
         #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
@@ -923,19 +926,14 @@ enum Cmd {
         /// Group size for --kv-bits (default 64). See --kv-bits long-help.
         #[arg(long, value_name = "N", requires = "kv_bits")]
         kv_group_size: Option<usize>,
-        /// Maximum context length (tokens) for the KV cache buffer.
-        /// When unset, derives from model.max_position_embeddings (capped at 4096).
-        /// Must be >= 256 when set.
+        /// Maximum context length (tokens) the run may address. Bounded by the
+        /// checkpoint's positional capacity — `max_position_embeddings`,
+        /// extended by a `rope_scaling` the config declares or by
+        /// `--yarn-factor`. A value above that capacity is refused, naming
+        /// both numbers; it is never clamped. When unset, the ceiling is
+        /// `min(capacity, 4096)`. Must be >= 256 when set.
         #[arg(long)]
         max_ctx: Option<u32>,
-        /// YARN RoPE scale factor for Qwen3 models whose `config.json` lacks
-        /// `rope_scaling`. Advanced / long-context use. Env: `RMLX_YARN_FACTOR`.
-        #[arg(long, env = "RMLX_YARN_FACTOR", value_name = "FLOAT")]
-        yarn_factor: Option<f32>,
-        /// Original max position embeddings for YARN context extension.
-        /// Env: `RMLX_YARN_ORIGINAL_MAX`.
-        #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
-        yarn_original_max: Option<u32>,
     },
     /// Transcribe an audio file to text / subtitles (speech-to-text).
     ///
@@ -1047,9 +1045,12 @@ enum Cmd {
         /// No model load is attempted when this flag is set.
         #[arg(long, default_value_t = false)]
         list_cache_types: bool,
-        /// Maximum context length (tokens) for the KV cache buffer.
-        /// When unset, derives from model.max_position_embeddings (capped at 4096).
-        /// Must be >= 256 when set.
+        /// Maximum context length (tokens) the run may address. Bounded by the
+        /// checkpoint's positional capacity — `max_position_embeddings`,
+        /// extended by a `rope_scaling` the config declares or by
+        /// `--yarn-factor`. A value above that capacity is refused, naming
+        /// both numbers; it is never clamped. When unset, the ceiling is
+        /// `min(capacity, 4096)`. Must be >= 256 when set.
         #[arg(long)]
         max_ctx: Option<u32>,
     },
@@ -1169,20 +1170,23 @@ enum Cmd {
         /// Group size for --kv-bits (default 64). See --kv-bits long-help.
         #[arg(long, value_name = "N", requires = "kv_bits")]
         kv_group_size: Option<usize>,
-        /// Maximum context length (tokens) for the KV cache buffer. Visible
-        /// alias `--ctx-max`. When unset, derives from
-        /// model.max_position_embeddings (capped at 4096). Must be >= 256 when
-        /// set.
+        /// Maximum context length (tokens) the run may address. Visible alias
+        /// `--ctx-max`. Bounded by the
+        /// checkpoint's positional capacity — `max_position_embeddings`,
+        /// extended by a `rope_scaling` the config declares or by
+        /// `--yarn-factor`. A value above that capacity is refused, naming
+        /// both numbers; it is never clamped. When unset, the ceiling is
+        /// `min(capacity, 4096)`. Must be >= 256 when set.
         #[arg(long, visible_alias = "ctx-max")]
         max_ctx: Option<u32>,
-        /// Truncate the tokenized prompt to at most this many tokens. Defaults to
-        /// the built-in cap (65536). Passing this flag explicitly opts into
-        /// truncation on `--device gpu`; raise it to bench longer contexts
-        /// (e.g. 128k) without truncation. Must be >= 1.
+        /// Truncate the tokenized prompt to at most this many tokens.
+        /// Defaults to the run's resolved context ceiling (see `--max-ctx`),
+        /// so raising the ceiling is what admits a longer prompt. Passing this
+        /// flag explicitly opts into truncation on `--device gpu`. Must be >= 1.
         #[arg(long, value_name = "N")]
         max_prompt_tokens: Option<usize>,
-        /// Opt into silently truncating a too-long prompt to the default
-        /// `--max-prompt-tokens` cap on `--device gpu` instead of erroring.
+        /// Opt into silently truncating a too-long prompt to the resolved
+        /// context ceiling on `--device gpu` instead of erroring.
         /// `--device cpu` always truncates (real O(N^2) forward cost) regardless
         /// of this flag. Has no effect when `--max-prompt-tokens` is passed
         /// explicitly (that is itself an opt-in to truncation).
@@ -1214,11 +1218,19 @@ enum Cmd {
         /// Env: `RMLX_PROMPTS_DIR`.
         #[arg(long, env = "RMLX_PROMPTS_DIR", value_name = "PATH")]
         prompts_dir: Option<PathBuf>,
-        /// YARN RoPE scale factor for Qwen3 models whose `config.json` lacks
-        /// `rope_scaling`. Advanced / long-context use. Env: `RMLX_YARN_FACTOR`.
+        /// YARN RoPE scale factor. Extends the context window a Qwen3-family
+        /// checkpoint can address to `factor * original` and raises the
+        /// ceiling `--max-ctx` is bounded by. Overrides a `rope_scaling` the
+        /// config declares; must be > 1.0 to take effect. Output quality past
+        /// the checkpoint's trained window is the operator's risk, and every
+        /// run past it is logged.
+        /// Env: `RMLX_YARN_FACTOR`.
         #[arg(long, env = "RMLX_YARN_FACTOR", value_name = "FLOAT")]
         yarn_factor: Option<f32>,
-        /// Original max position embeddings for YARN context extension.
+        /// Pre-extension context size `--yarn-factor` interpolates from.
+        /// When absent, the checkpoint's declared
+        /// `original_max_position_embeddings` is used, falling back to its
+        /// `max_position_embeddings`.
         /// Env: `RMLX_YARN_ORIGINAL_MAX`.
         #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
         yarn_original_max: Option<u32>,
@@ -1343,12 +1355,18 @@ enum Cmd {
         /// Group size for --kv-bits (default 64). See --kv-bits long-help.
         #[arg(long, value_name = "N", requires = "kv_bits")]
         kv_group_size: Option<usize>,
-        /// Maximum context length (tokens) for the KV cache buffer. Visible
-        /// alias `--ctx-max`. Must be >= 256 when set.
+        /// Maximum context length (tokens) the run may address. Visible alias
+        /// `--ctx-max`. Bounded by the
+        /// checkpoint's positional capacity — `max_position_embeddings`,
+        /// extended by a `rope_scaling` the config declares or by
+        /// `--yarn-factor`. A value above that capacity is refused, naming
+        /// both numbers; it is never clamped. When unset, the ceiling is
+        /// `min(capacity, 4096)`. Must be >= 256 when set.
         #[arg(long, visible_alias = "ctx-max")]
         max_ctx: Option<u32>,
-        /// Truncate the tokenized prompt to at most this many tokens. Defaults
-        /// to the built-in cap (65536). Same device-dependent semantics as
+        /// Truncate the tokenized prompt to at most this many tokens.
+        /// Defaults to the run's resolved context ceiling (see `--max-ctx`).
+        /// Same device-dependent semantics as
         /// `rmlx baseline --max-prompt-tokens`.
         #[arg(long, value_name = "N")]
         max_prompt_tokens: Option<usize>,
@@ -2158,8 +2176,6 @@ fn main() -> Result<()> {
             kv_bits,
             kv_group_size,
             max_ctx,
-            yarn_factor: _yarn_factor,
-            yarn_original_max: _yarn_original_max,
         } => {
             // Load config + run the cache-type resolver before any model
             // load. Even though `chat` is a stub today, validating the flag
@@ -2373,10 +2389,7 @@ fn main() -> Result<()> {
                 max_tokens,
             )?;
 
-            let cap_is_explicit = max_prompt_tokens.is_some();
-            let max_prompt_tokens = parse_max_prompt_tokens(
-                max_prompt_tokens.unwrap_or(commands::baseline::MAX_PROMPT_TOKENS),
-            )?;
+            let max_prompt_tokens = max_prompt_tokens.map(parse_max_prompt_tokens).transpose()?;
             // --kv-preset pre-resolution. resolve_preset_arg turns
             // KvPresetArg::Auto into DEFAULT_KV_QUANT.
             let (dev, kv_quant_resolved, max_ctx_override) = if let Some(preset_arg) = kv_preset {
@@ -2442,18 +2455,6 @@ fn main() -> Result<()> {
                 prompt_label
             };
 
-            // Resolved final ctx_max for the record (mirrors the engine's
-            // derivation: explicit override → model max → 4096 fallback).
-            let resolved_ctx_max = max_ctx_override
-                .map(i64::from)
-                .or_else(|| {
-                    rmlx_loader::load_config(&model)
-                        .ok()
-                        .and_then(|c| c.text_config.and_then(|tc| tc.max_position_embeddings))
-                        .map(i64::from)
-                })
-                .unwrap_or(4096);
-
             let bench_label_ref = bench_label.as_deref();
             let prompt_id_ref = prompt_id_opt.as_deref();
             let git_sha_ref = git_sha.as_deref();
@@ -2463,7 +2464,6 @@ fn main() -> Result<()> {
                     prompt_id: prompt_id_ref,
                     prompt_body: prompt_body_opt,
                     kv_quant: kv_quant_resolved,
-                    ctx_max: resolved_ctx_max,
                     git_sha: git_sha_ref,
                 })
             } else {
@@ -2485,7 +2485,6 @@ fn main() -> Result<()> {
                 Some(kv_quant_resolved),
                 max_ctx_override,
                 max_prompt_tokens,
-                cap_is_explicit,
                 allow_truncate,
                 yarn_override,
                 emit_token_ids,
@@ -2525,10 +2524,7 @@ fn main() -> Result<()> {
             top_k,
             repetition_penalty,
         } => {
-            let cap_is_explicit = max_prompt_tokens.is_some();
-            let max_prompt_tokens = parse_max_prompt_tokens(
-                max_prompt_tokens.unwrap_or(commands::baseline::MAX_PROMPT_TOKENS),
-            )?;
+            let max_prompt_tokens = max_prompt_tokens.map(parse_max_prompt_tokens).transpose()?;
             // Same KV resolution ladder as `baseline`, so a cell benched here
             // and a cell recorded there name the same codec.
             refuse_to_measure_off_the_pin("rmlx bench")?;
@@ -2572,7 +2568,6 @@ fn main() -> Result<()> {
                 kv_quant: kv_quant_resolved,
                 max_ctx: max_ctx_override,
                 max_prompt_tokens,
-                cap_is_explicit,
                 allow_truncate,
                 json,
                 temperature,

@@ -134,6 +134,29 @@ pub enum Error {
         ceiling: i32,
     },
 
+    /// A requested context length is above the checkpoint's positional
+    /// capacity — `max_position_embeddings`, extended by an active RoPE
+    /// scaling. Raised by the single context resolver
+    /// (`rmlx_models::context::resolve_context`) before any cache is built, so
+    /// an unsatisfiable `--max-ctx` fails at startup rather than clamping the
+    /// window and failing a later request for an unrelated-looking reason.
+    /// `lift` names the mechanism that would raise the capacity.
+    #[error(
+        "requested context {requested} tokens exceeds the model's positional capacity of \
+         {positional_max} tokens (max_position_embeddings={trained_max}); {lift}"
+    )]
+    ContextCeilingExceeded {
+        /// The requested context length (from `--max-ctx` or a per-request
+        /// `max_ctx` field).
+        requested: i32,
+        /// The checkpoint's positional capacity, RoPE scaling included.
+        positional_max: i32,
+        /// The checkpoint's `max_position_embeddings`, before any scaling.
+        trained_max: i32,
+        /// What would lift the capacity, worded for the active configuration.
+        lift: String,
+    },
+
     /// A `--draft-model` + `--draft-kind` combination is structurally
     /// unsupported. Raised at load (before first inference) when the draft
     /// model's detected architecture family cannot back the requested draft
@@ -189,6 +212,7 @@ impl Error {
             | Error::Unimplemented(_)
             | Error::KvHardCapExceeded { .. }
             | Error::KvCeilingExceeded { .. }
+            | Error::ContextCeilingExceeded { .. }
             | Error::SpeculativePairing { .. } => false,
         }
     }

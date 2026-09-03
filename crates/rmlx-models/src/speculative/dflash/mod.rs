@@ -75,7 +75,7 @@ use rmlx_mlx::{
 use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};
+use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Choose the next DFlash verify block size from recent acceptance.
 ///
@@ -681,19 +681,16 @@ pub fn dflash_generate_greedy(
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.
     let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    let max_seq = max_ctx_override.unwrap_or_else(|| {
-        let v_mpe = verifier.max_position_embeddings();
-        if v_mpe <= 0 || v_mpe > KV_MAX_SEQ_DEFAULT {
-            KV_MAX_SEQ_DEFAULT
-        } else {
-            v_mpe
-        }
-    });
+    // The verifier's limits bound the pair; an over-capacity `--max-ctx` is
+    // refused here rather than overflowing a cache mid-round.
+    let ctx = crate::speculative::verifier_context(verifier, max_ctx_override)?;
+    let max_seq = ctx.ceiling;
 
     let mut v_caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
         .map(|i| {
             let window = verifier.layer_sliding_window(i);
             KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
+                .with_max_seq_ceiling(ctx.ceiling)
                 .with_layer_idx(i)
                 // The verifier stack decides whether its layers read each
                 // other's K/V, and so whether Mixed/RotK keep their bf16

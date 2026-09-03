@@ -9,7 +9,7 @@
 //! `slice_update: [broadcast_shapes] Shapes (1,4,6776,128) and (1,4,4096,128)`.
 //!
 //! The fix sizes the ring from the effective `--max-ctx` via
-//! [`kv_max_seq_and_ceiling`] and brackets the one-shot prefill with
+//! [`crate::context::resolve_context`] and brackets the one-shot prefill with
 //! `enter_prefill()` / `exit_prefill()` so the lazy-grow path is used. These
 //! tests reproduce that exact cache-construction + prefill pattern at the
 //! cache level (CPU, `KvQuant::None`, the model's real head_dim=128 /
@@ -19,7 +19,7 @@
 //! * an over-cap prefill is rejected with a clean `KvCeilingExceeded`
 //!   (→ HTTP `context_overflow`), not a `slice_update` broadcast panic.
 
-use crate::kv_cache::kv_max_seq_and_ceiling;
+use crate::context::{resolve_context, ContextLimits};
 use rmlx_kv_quant::{KvCache, KvQuant};
 use rmlx_mlx::{Array, Device, Dtype};
 
@@ -50,9 +50,9 @@ fn f32_arr(data: &[f32], shape: &[i32]) -> Array {
 /// do, then run a single-shot prefill chunk of `seq` tokens.
 fn prefill_one_shot(max_ctx_override: Option<i32>, seq: i32) -> rmlx_core::Result<KvCache> {
     let device = Device::Cpu;
-    let (initial_max_seq, max_seq_ceiling) = kv_max_seq_and_ceiling(max_ctx_override, QWEN3VL_MPE);
-    let mut cache = KvCache::with_quant_max_seq(KvQuant::None, initial_max_seq)
-        .with_max_seq_ceiling(max_seq_ceiling)
+    let ctx = resolve_context(&ContextLimits::trained_only(QWEN3VL_MPE), max_ctx_override)?;
+    let mut cache = KvCache::with_quant_max_seq(KvQuant::None, ctx.initial_max_seq)
+        .with_max_seq_ceiling(ctx.ceiling)
         .with_layer_idx(0);
 
     cache.enter_prefill();
@@ -88,14 +88,19 @@ fn image_prompt_over_4096_fits_under_max_ctx() {
 /// would overflow; with the ceiling resolved from `--max-ctx` it does not. Pin
 /// that the resolved ceiling is the requested value, not the 4096 default.
 #[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test asserts the resolution succeeds; .expect() surfaces the failure as the test message"
+)]
 fn max_ctx_override_sizes_ceiling_not_default() {
-    let (initial, ceiling) = kv_max_seq_and_ceiling(Some(16_384), QWEN3VL_MPE);
+    let ctx = resolve_context(&ContextLimits::trained_only(QWEN3VL_MPE), Some(16_384))
+        .expect("16384 is under this checkpoint's positional capacity");
     assert_eq!(
-        ceiling, 16_384,
+        ctx.ceiling, 16_384,
         "ceiling honors --max-ctx, not the 4096 default"
     );
     assert_eq!(
-        initial, 4096,
+        ctx.initial_max_seq, 4096,
         "ring still starts lazily at the 4096 default and grows up to the ceiling",
     );
 }

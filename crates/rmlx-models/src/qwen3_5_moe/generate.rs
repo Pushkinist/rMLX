@@ -27,9 +27,7 @@ use crate::decode_loop::{
     capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
     DecodeCtx,
 };
-use crate::kv_cache::{
-    kv_layer_quants, kv_max_seq_and_ceiling, warn_if_kv_codec_net_negative, KvLayerShape,
-};
+use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 use super::model::Qwen3_5MoeText;
@@ -473,8 +471,8 @@ pub fn generate_greedy<'a>(
     // Issue #25: `--max-ctx` is a virtual ceiling the KV ring grows lazily up
     // to, not an eager allocation. `initial_max_seq` is the lazy start;
     // `max_seq_ceiling` caps growth and rejects over-long prompts.
-    let (initial_max_seq, max_seq_ceiling) =
-        kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
+    let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
+    let (initial_max_seq, max_seq_ceiling) = (resolved_ctx.initial_max_seq, resolved_ctx.ceiling);
     // Prefill chunk for qwen3_5_moe comes from `arch_default` in
     // `prefill_chunk.rs`, which records the sweep behind it. The GDN recurrence runs the
     // `gated_delta_step_gpu` kernel at any T, so a large chunk does NOT route to

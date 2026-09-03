@@ -1180,9 +1180,12 @@ pub(crate) fn run_serve(
         // handles them on first request.
         // `ensure_loaded` is synchronous (CPU-bound disk + dequant); run it in
         // the blocking-thread pool so we do not stall the async runtime.
-        // Best-effort: a load failure logs a warning but does not abort startup
-        // (the first real request will attempt the load again via the normal
-        // on-demand path and surface a 503 if it still fails).
+        // Best-effort for a *transient* failure: it logs a warning and does not
+        // abort startup, since the first real request will attempt the load
+        // again and surface a 503 if it still fails. A context-ceiling refusal
+        // is not transient — the launch `--max-ctx` is above what the
+        // checkpoint can address, so every request would 503 forever — and it
+        // aborts startup here, before the port is bound.
         {
             let cap = max_loaded_models.max(1);
             let ids: Vec<String> = state
@@ -1193,7 +1196,7 @@ pub(crate) fn run_serve(
                 .map(|e| e.id.clone())
                 .collect();
             let state_ref = state.clone();
-            tokio::task::spawn_blocking(move || {
+            let fatal: Option<String> = tokio::task::spawn_blocking(move || {
                 for id in &ids {
                     tracing::info!(model_id = %id, "eager preload starting");
                     let t = std::time::Instant::now();
@@ -1203,6 +1206,15 @@ pub(crate) fn run_serve(
                             load_ms = t.elapsed().as_millis(),
                             "eager preload complete"
                         ),
+                        Err(e @ rmlx_core::error::Error::ContextCeilingExceeded { .. }) => {
+                            tracing::error!(
+                                model_id = %id,
+                                error = %e,
+                                "eager preload: --max-ctx is above this model's positional \
+                                 capacity; refusing to serve"
+                            );
+                            return Some(format!("model '{id}': {e}"));
+                        }
                         Err(e) => tracing::warn!(
                             model_id = %id,
                             error = %e,
@@ -1210,11 +1222,16 @@ pub(crate) fn run_serve(
                         ),
                     }
                 }
+                None
             })
             .await
-            .unwrap_or_else(
-                |e| tracing::warn!(error = %e, "eager preload: spawn_blocking panicked"),
-            );
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "eager preload: spawn_blocking panicked");
+                None
+            });
+            if let Some(msg) = fatal {
+                return Err(anyhow::anyhow!(msg));
+            }
         }
 
         // Install the adaptive admission controller when --adaptive-admission is set.

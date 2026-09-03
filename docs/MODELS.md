@@ -233,17 +233,28 @@ Text only.
 
 ### Maximum context
 
-`max_position_embeddings` from config. YARN (arXiv 2309.00071) is wired
-when `rope_scaling.rope_type == "yarn"` is present in config.json (Bonsai
-ships `factor=4.0, original_max_position_embeddings=16384`, extending
-the effective context to 65 536 tokens). Without `rope_scaling` the model
-runs un-scaled RoPE.
+`max_position_embeddings` from config, extended by an active YARN (arXiv
+2309.00071) scaling. Qwen3 is the **only** architecture in the tree that
+implements RoPE scaling; the others report their trained window and refuse
+anything past it.
 
-Forward-looking lever: for Qwen3-family models that lack `rope_scaling`
-but want context extension, set `RMLX_YARN_FACTOR=<f>` (and optionally
-`RMLX_YARN_ORIGINAL_MAX=<u>`, defaulting to `max_position_embeddings`)
-before `arch::load_model`. Synthesises a YARN config with the paper
-defaults `beta_fast=32, beta_slow=1`.
+YARN is wired when `rope_scaling.rope_type == "yarn"` is present in
+config.json (Bonsai ships `factor=4.0,
+original_max_position_embeddings=16384`, extending the effective context to
+65 536 tokens). Without `rope_scaling` the model runs un-scaled RoPE.
+
+`--yarn-factor <f>` (`--yarn-original-max <n>`, env `RMLX_YARN_FACTOR` /
+`RMLX_YARN_ORIGINAL_MAX`) requests the extension from the operator side. It
+**overrides** a `rope_scaling` the config declares rather than deferring to it,
+so it extends a checkpoint that already ships one — `--yarn-factor 8` on
+Bonsai's declared ×4-over-16384 reaches 131 072. `<n>` defaults to the
+checkpoint's declared `original_max_position_embeddings`, falling back to
+`max_position_embeddings`. Only the window changes: a checkpoint that declares
+its own `beta_fast` / `beta_slow` keeps them, since those set where the YaRN
+ramp starts and ends at every position, including inside the trained window;
+the paper defaults `beta_fast=32, beta_slow=1` apply only when the checkpoint
+declares no `rope_scaling` at all. The resulting window is the capacity
+`--max-ctx` is bounded by — see `docs/CLI.md` § "Context ceiling".
 
 ### Special features
 
@@ -561,7 +572,7 @@ Native Qwen3-VL image tiling produces thousands of image soft tokens (a
 2560×2560 image → ~6400 soft tokens at `patch_size=16`, `merge_size=2`), so the
 augmented image prompt routinely exceeds the lazy `KV_MAX_SEQ_DEFAULT = 4096`
 ring start. Both the image and text generate paths size the KV ring from the
-effective `--max-ctx` (via `kv_max_seq_and_ceiling`, same as the other arches):
+effective `--max-ctx` (via `context::resolve_context`, same as the other arches):
 the ring grows lazily up to that ceiling so a prompt up to `--max-ctx` fits, and
 a prompt over the ceiling is rejected with a clean `context_overflow` rather
 than a `slice_update` broadcast error. Serve a long prompt with `--max-ctx N` ≥

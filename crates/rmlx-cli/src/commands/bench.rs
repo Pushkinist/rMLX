@@ -606,10 +606,9 @@ pub(crate) struct BenchArgs {
     pub kv_quant: rmlx_kv_quant::KvQuant,
     /// KV ring capacity override, when given.
     pub max_ctx: Option<i32>,
-    /// Cap on tokenized prompt length.
-    pub max_prompt_tokens: usize,
-    /// Whether `--max-prompt-tokens` was passed explicitly.
-    pub cap_is_explicit: bool,
+    /// Explicit cap on tokenized prompt length. `None` defaults it to the
+    /// run's resolved context ceiling.
+    pub max_prompt_tokens: Option<usize>,
     /// Opt into truncating an over-cap prompt on GPU.
     pub allow_truncate: bool,
     /// Emit the summary as one JSON object instead of a table.
@@ -966,8 +965,12 @@ fn summarize(samples: &[RunSample]) -> anyhow::Result<BenchSummary> {
     })
 }
 
-/// Tokenize the prompt and apply the length cap.
-fn prepare_prompt(args: &BenchArgs, tokenizer: &tokenizers::Tokenizer) -> anyhow::Result<Vec<u32>> {
+/// Tokenize the prompt and apply the length cap, which defaults to `ceiling`.
+fn prepare_prompt(
+    args: &BenchArgs,
+    tokenizer: &tokenizers::Tokenizer,
+    ceiling: usize,
+) -> anyhow::Result<Vec<u32>> {
     let prompt_text = std::fs::read_to_string(&args.prompt)
         .map_err(|e| anyhow::anyhow!("cannot read prompt file {}: {e}", args.prompt.display()))?;
     let (mut prompt_ids, template_used) =
@@ -975,8 +978,8 @@ fn prepare_prompt(args: &BenchArgs, tokenizer: &tokenizers::Tokenizer) -> anyhow
     let effective_len = super::baseline::resolve_prompt_truncation(
         prompt_ids.len(),
         args.max_prompt_tokens,
+        ceiling,
         args.device,
-        args.cap_is_explicit,
         args.allow_truncate,
     )?;
     prompt_ids.truncate(effective_len);
@@ -985,6 +988,7 @@ fn prepare_prompt(args: &BenchArgs, tokenizer: &tokenizers::Tokenizer) -> anyhow
         device = ?args.device,
         kv_quant = %args.kv_quant,
         prompt_tokens = prompt_ids.len(),
+        max_ctx = ceiling,
         max_tokens = args.max_tokens,
         runs = args.runs,
         warmup = args.warmup,
@@ -1113,7 +1117,6 @@ pub(crate) fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
 
     let tokenizer = tokenizers::Tokenizer::from_file(args.model.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("cannot load tokenizer.json: {e}"))?;
-    let prompt_ids = prepare_prompt(&args, &tokenizer)?;
 
     let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let load_before = load_average_1m();
@@ -1129,6 +1132,12 @@ pub(crate) fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("arch::load_model: {e}"))?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
     info!(load_ms, arch = model.arch_class(), "bench: model loaded");
+
+    // The prompt cap defaults to the run's resolved context ceiling, so the
+    // prompt is capped after the checkpoint's limits are known.
+    let resolved_ctx = rmlx_models::context::resolve_context(&model.context_limits(), args.max_ctx)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let prompt_ids = prepare_prompt(&args, &tokenizer, resolved_ctx.ceiling_tokens())?;
 
     let samples = collect_samples(&model, &tokenizer, &prompt_ids, &args)?;
     let summary = summarize(&samples)?;

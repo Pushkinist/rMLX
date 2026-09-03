@@ -97,7 +97,7 @@ mutually exclusive.
 | `--cache-type-v` / `--ctv` | string | — | Per-side codec for the V (value) tensor. Mutually exclusive with `--kv-quant`. |
 | `--kv-bits` | float | — | Bit-width alias (integer or fractional, e.g. `4`, `3.5`). Mutually exclusive with `--kv-quant` and `--cache-type-*`. See KV-bits mapping below. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. Requires `--kv-bits`. |
-| `--max-ctx` | u32 | (from model) | **Virtual ceiling** on context length, in tokens — NOT an eager allocation. The KV ring starts small (`KV_MAX_SEQ_DEFAULT = 4096`) and grows lazily up to this ceiling as the prompt fills; prompts over the ceiling are rejected. Short requests on a large-`--max-ctx` server thus decode at full speed (no long-context working-set tax — see `docs/KV_CACHE.md` §4.6). Derives from `max_position_embeddings` capped at 4096 when unset. Must be ≥ 256 when set. |
+| `--max-ctx` | u32 | (from model) | **Virtual ceiling** on context length, in tokens — NOT an eager allocation. The KV ring starts small (`KV_MAX_SEQ_DEFAULT = 4096`) and grows lazily up to this ceiling as the prompt fills; prompts over the ceiling are rejected. Short requests on a large-`--max-ctx` server thus decode at full speed (no long-context working-set tax — see `docs/KV_CACHE.md` §4.6). Bounded by the checkpoint's **positional capacity** (`max_position_embeddings`, extended by a declared `rope_scaling` or by `--yarn-factor`); a value above it is **refused**, never clamped — see §Context ceiling. Resolves to `min(capacity, 4096)` when unset. Must be ≥ 256 when set. |
 | `--idle-timeout-secs` | string | `15m` | Idle time before the model is unloaded. Accepts an integer count of seconds (`30`, `900`) OR a Go-style duration (`30s`, `15m`, `2h`, `24h`). Negative (`-1`) pins the model forever; `0` unloads after each response. Per-request override on **native** routes only (`POST /v1/models/{id}/load` body field `keep_alive`); OpenAI/Anthropic compat routes do not parse the field but still reset the timer on use. **Interaction with the single-MLX claim file:** the timer never bypasses the claim — when TTL fires it unloads the slot in-process; the cross-process claim file (`/tmp/rmlx.<port>.claim`) remains held for the lifetime of the `rmlx serve` process. |
 | `--prompt-cache-slots` | usize | 4 | Number of prompt-cache slots for multi-slot prefix matching. Set to `1` for legacy single-slot exact-match behaviour. **`0` disables the prompt cache**: no snapshot is ever stored, so every request runs a full prefill. It is a real state, not a one-slot cache — see `docs/PROMPT_CACHE.md` §Zero slots. A request carrying an `X-Session-Id` header widens this number by one slot per active session (session KV-reuse); `0` is not widened — a disabled cache stays disabled. |
 | `--draft-model` | path | — | Path to a draft model for speculative decoding. Requires `--draft-kind`. Must be a **different snapshot** from `--model`: a draft that is the verifier is refused at load, because it doubles the resident weights for no speedup. Sidecar drafters (`mtp` / `dflash` / `eagle3`) point here at the small head, not at a second full model. |
@@ -186,6 +186,61 @@ mutually exclusive.
 > value it is set to is enforced continuously, not only at model load, so the
 > ceiling holds for the life of the process (`docs/SSD_TIER.md` §
 > "Evict-to-budget (runtime)").
+
+### Context ceiling
+
+Every context cap in the binary comes out of one function,
+`rmlx_models::context::resolve_context`. Its consumers are the per-architecture
+KV ring sizing, the server's `context_length_exceeded` admission guard, the
+per-request `max_ctx` override, and the default `--max-prompt-tokens` cap;
+`crates/rmlx-models/src/context_tests.rs` enumerates them so a second formula
+cannot appear unnoticed.
+
+**Positional capacity** is what the checkpoint's RoPE can address:
+
+| Situation | Capacity | Behaviour |
+|---|---|---|
+| plain RoPE | `max_position_embeddings` | — |
+| `rope_scaling` declared in `config.json` | `max(mpe, factor × original_max)` | extended silently; the checkpoint author declared the window |
+| `--yarn-factor <f>` (`--yarn-original-max <n>`) | `max(mpe, f × n)` | extended, and every run past the trained window is logged at `warn!` |
+
+`--max-ctx` above the capacity is **refused**, not clamped. RoPE extrapolated
+past the trained window without scaling produces incoherent output, so serving
+a shorter window instead hid both the truncation and its cause. The refusal
+fires when the model loads, and it is fatal: `rmlx baseline` / `rmlx bench`
+exit non-zero, and `rmlx serve` aborts during the eager preload **before it
+binds the port** rather than coming up healthy and 503-ing every request.
+(Other preload failures stay best-effort — only a ceiling refusal, which no
+retry can fix, aborts startup.) The message names the request, the capacity,
+the trained window and the mechanism that would lift it:
+
+```
+requested context 131072 tokens exceeds the model's positional capacity of
+40960 tokens (max_position_embeddings=40960); the checkpoint declares no
+rope_scaling; extend the window with --yarn-factor <f> (and
+--yarn-original-max <n>, default 40960) so that f * n covers the request, or
+lower the requested context to 40960
+```
+
+An explicit `--yarn-factor` **overrides** a `rope_scaling` the config declares
+— this is llama.cpp's precedence for `--rope-scaling` / `--yarn-*`, and it is
+what lets an operator serve a window the checkpoint does not ship. Qwen3 is
+the only architecture that implements RoPE scaling; on any other the flag is
+ignored, with a `warn!` at load and a refusal that says so rather than
+offering a flag that does nothing.
+
+The effective numbers are reported in two places: the `slots: model loaded`
+log line (`effective_max_ctx`, `positional_max`) and `GET /v1/models`, which
+carries `max_ctx` and `positional_max` for each resident model whose capacity
+is known. An architecture that does not expose `max_position_embeddings` has
+no capacity to enforce — the resolver accepts any `--max-ctx` — so neither
+field is published for it, rather than publishing a `0` that reads as the
+opposite.
+
+Reference points: `mlx-lm` applies no cap and extrapolates; `llama.cpp` warns
+(`possible training context overflow`) and proceeds; vLLM refuses a
+`max_model_len` above the derived window and names the override. rMLX takes
+vLLM's refusal with llama.cpp's flag precedence.
 
 **KV-bits mapping** (`--kv-bits` + `--kv-group-size`):
 
@@ -374,9 +429,9 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --label "8k-bench"
 | `--cache-type-v` / `--ctv` | string | — | Per-side V codec. Mutually exclusive with `--kv-quant`. |
 | `--kv-bits` | float | — | Bit-width alias. Mutually exclusive with `--kv-quant` and `--cache-type-*`. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. |
-| `--max-ctx` / `--ctx-max` | u32 | (from model) | KV cache buffer token capacity. Must be ≥ 256 when set. |
-| `--max-prompt-tokens` | usize | 65536 | Cap on the tokenized prompt length. See "Prompt-length cap" below — behavior differs by `--device`. Must be ≥ 1 when set. |
-| `--allow-truncate` | bool flag | off | Opt into silently truncating a too-long prompt to the `--max-prompt-tokens` cap on `--device gpu` instead of erroring. No effect on `--device cpu` (always truncates) or when `--max-prompt-tokens` is passed explicitly (that is itself an opt-in). |
+| `--max-ctx` / `--ctx-max` | u32 | (from model) | Context ceiling the KV ring may grow to. Bounded by the checkpoint's positional capacity; a value above it is refused, not clamped — see §Context ceiling. Must be ≥ 256 when set. |
+| `--max-prompt-tokens` | usize | (resolved context ceiling) | Cap on the tokenized prompt length. Defaults to the run's resolved `--max-ctx` ceiling, so raising the ceiling is what admits a longer prompt. See "Prompt-length cap" below — behavior differs by `--device`. Must be ≥ 1 when set. |
+| `--allow-truncate` | bool flag | off | Opt into silently truncating a too-long prompt to the prompt cap on `--device gpu` instead of erroring. No effect on `--device cpu` (always truncates) or when `--max-prompt-tokens` is passed explicitly (that is itself an opt-in). |
 | `--label` | string | — | Free-form campaign label stamped into the metrics record's `notes` column. |
 | `--record` | bool flag | off | Emit a §8.5 `RunRecord` to the metrics buffer and ingest into `runs.db` in-process. |
 | `--git-sha` | string | — | Commit SHA to stamp on the emitted record's `git_sha` column (only meaningful with `--record`). Provenance the caller supplies — the binary does not and cannot determine the commit it was built from. Absent by default (`git_sha` is `NULL`). |
@@ -506,32 +561,38 @@ wrong `prompt_tokens` measurement with no indication anything went wrong.
 
 #### Prompt-length cap
 
-`--max-prompt-tokens` guards against pathologically long prompts inflating
-bench time. The two devices have genuinely different behavior once the
-tokenized prompt exceeds the cap:
+The prompt cap **defaults to the run's resolved context ceiling** — the same
+number `--max-ctx` produces (§Context ceiling), read after the model loads.
+There is no separate constant: a prompt the engine could serve is never
+refused by the cap, and one it could not is refused by the cap first, with the
+ceiling named. `--max-prompt-tokens <N>` overrides the default with a smaller
+sanity guard. The two devices behave differently once the tokenized prompt
+exceeds the cap:
 
-- **`--device cpu`**: always truncates (with a `tracing::warn!`), matching the
-  historical behavior. CPU forward is O(N²), so the cap is a real sanity
-  guard against unbounded per-step cost.
-- **`--device gpu`** with the **default** cap (`--max-prompt-tokens` not
-  passed) and no `--allow-truncate`: **hard error**, not a truncation. Per-step
-  time no longer scales with raw prompt length on GPU once the KV cache and
-  chunked prefill are in place, so silently truncating would record a
-  shorter run that looks like a valid full-length measurement — a
-  long-context bench footgun. Raise the cap explicitly
-  (`--max-prompt-tokens <N>`) to measure the full prompt, or pass
-  `--allow-truncate` to opt into the old silent-truncate behavior.
+- **`--device cpu`**: always truncates (with a `tracing::warn!`). CPU forward
+  is O(N²), so the cap is a real sanity guard against unbounded per-step cost.
+- **`--device gpu`** on the **default** cap and no `--allow-truncate`: **hard
+  error**, not a truncation. Per-step time no longer scales with raw prompt
+  length on GPU once the KV cache and chunked prefill are in place, so
+  silently truncating would record a shorter run that looks like a valid
+  full-length measurement — a long-context bench footgun. Raise `--max-ctx`
+  (bounded by the checkpoint's positional capacity) to measure the full
+  prompt, or pass `--allow-truncate` to opt into truncation.
 - **`--device gpu`** with an **explicit** `--max-prompt-tokens` or with
   `--allow-truncate` set: truncates with a `tracing::warn!`, same as CPU —
   the caller has explicitly opted in.
+- An explicit `--max-prompt-tokens` **above** the ceiling is refused outright,
+  on either device: the engine cannot serve a prompt past the ceiling, so
+  admitting the cap would only move the failure into prefill and report it
+  against a number the operator never typed. Raise `--max-ctx` instead.
 
 ```bash
-# 128k prompt on GPU: raise the cap to measure it in full (no truncation).
+# 128k prompt on GPU: raise the ceiling so the cap follows it (no truncation).
 rmlx baseline --model /path/to/snapshot --prompt-tokens 131072 \
-  --device gpu --max-ctx 131072 --max-prompt-tokens 131072
+  --device gpu --max-ctx 131072
 
-# 128k prompt on GPU, default cap: errors loudly instead of silently
-# recording a 65536-token run under a 128k label.
+# 128k prompt on GPU at the default 4096 ceiling: errors loudly instead of
+# silently recording a short run under a 128k label.
 rmlx baseline --model /path/to/snapshot --prompt-tokens 131072 --device gpu
 ```
 
@@ -623,8 +684,8 @@ agree; see the drift refusal below.
 | `--cache-type-k` / `--ctk`, `--cache-type-v` / `--ctv` | string | — | Per-side KV codec. Mutually exclusive with `--kv-quant`. |
 | `--kv-bits` | float | — | Bit-width alias. Mutually exclusive with `--kv-quant` and `--cache-type-*`. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. |
-| `--max-ctx` / `--ctx-max` | u32 | (from model) | KV cache buffer token capacity. Must be ≥ 256 when set. |
-| `--max-prompt-tokens` | usize | 65536 | Cap on the tokenized prompt length. Same device-dependent semantics as `baseline`. |
+| `--max-ctx` / `--ctx-max` | u32 | (from model) | Context ceiling the KV ring may grow to. Bounded by the checkpoint's positional capacity; a value above it is refused, not clamped — see §Context ceiling. Must be ≥ 256 when set. |
+| `--max-prompt-tokens` | usize | (resolved context ceiling) | Cap on the tokenized prompt length. Same device-dependent semantics as `baseline`. |
 | `--allow-truncate` | bool flag | off | Opt into truncating an over-cap prompt on `--device gpu`. |
 | `--json` | bool flag | off | Emit one JSON object (per-metric spreads plus every individual run) instead of the table. |
 | `--prompts-dir` | path | (cwd walk) | Root to search for `longctx_<N>k.json`. Env: `RMLX_PROMPTS_DIR`. |
@@ -1313,8 +1374,8 @@ persistent shell configuration.
 | `RMLX_TTS_TOKENIZER_PATH` | `--tts-tokenizer-path` | — | Path to the Qwen3-TTS speech tokenizer snapshot directory. Flag wins. |
 | `RMLX_MM_CACHE_BYTES` | `--mm-cache-bytes` | `536870912` (512 MiB) | Byte budget for the multimodal encoder-output cache. `0` disables. Flag wins. |
 | `RMLX_SESSION_CACHE_MAX_SESSIONS` | `--session-cache-max-sessions` | `8` | Maximum number of prompt-cache sessions held resident. Flag wins. |
-| `RMLX_YARN_FACTOR` | `--yarn-factor` | — | For Qwen3-family models that ship without `rope_scaling` in `config.json`, set this to a float `> 1.0` to synthesise a YARN config at model load. Default `beta_fast=32, beta_slow=1` (per the YARN paper). Models that already declare `rope_scaling.rope_type == "yarn"` (Bonsai) ignore this var — config wins. Flag wins. |
-| `RMLX_YARN_ORIGINAL_MAX` | `--yarn-original-max` | (model `max_position_embeddings`) | Optional companion to `RMLX_YARN_FACTOR`: the training-time `original_max_position_embeddings`. Flag wins. |
+| `RMLX_YARN_FACTOR` | `--yarn-factor` | — | Qwen3-family YARN RoPE extension: a float `> 1.0` synthesises a YARN config at model load **and raises the positional capacity `--max-ctx` is bounded by** to `factor × original`. Only the window changes: a checkpoint that declares its own `beta_fast` / `beta_slow` keeps them; the paper defaults (`beta_fast=32, beta_slow=1`) apply only when the checkpoint declares no `rope_scaling`. It **overrides** a `rope_scaling` the config declares, so it also extends a checkpoint that already ships one. Architectures other than Qwen3 implement no RoPE scaling and log a warning that the flag was ignored. Flag wins over the env var. |
+| `RMLX_YARN_ORIGINAL_MAX` | `--yarn-original-max` | (checkpoint's declared `original_max_position_embeddings`, else `max_position_embeddings`) | Optional companion to `RMLX_YARN_FACTOR`: the pre-extension context size the scaling interpolates from. Flag wins. |
 | `RMLX_PROMPTS_DIR` | `--prompts-dir` | `<repo>/prompts/` | Directory containing prompt JSON files used by `rmlx baseline` and bench scripts. Flag wins. |
 | `MLX_VLM_DRAFT_KIND` | `--draft-kind` | — | Drafter architecture for speculative decoding. Values: `mtp`, `dflash`, `eagle3`. Flag wins. |
 | `MLX_VLM_DRAFT_BLOCK_SIZE` | `--draft-block-size` | `4` | Draft block size (tokens per speculative round). Flag wins. |
