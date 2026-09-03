@@ -31,6 +31,7 @@
 
 #![allow(clippy::cognitive_complexity)]
 use rmlx_mlx::Device;
+use rmlx_models::kv_cache::KvBoundary;
 use rmlx_server::{try_claim, ClaimError};
 use tracing::error;
 
@@ -178,6 +179,16 @@ pub(crate) fn resolve_preset_arg(arg: KvPresetArg) -> rmlx_kv_quant::KvQuant {
         KvPresetArg::Resolved(kq) => kq,
         KvPresetArg::Auto => rmlx_models::kv_cache::DEFAULT_KV_QUANT,
     }
+}
+
+/// Parse a `--kv-boundary-layers <head>,<tail>` value.
+///
+/// Both counts are required; `0,0` turns the boundary promotion off entirely.
+/// A malformed value is refused here rather than silently falling back to the
+/// shipped counts — a run that believes it moved the boundary and did not is a
+/// measurement of the default wearing another label.
+pub(crate) fn parse_kv_boundary_layers(s: &str) -> Result<KvBoundary, String> {
+    KvBoundary::parse(s).map_err(|e| format!("--kv-boundary-layers: {e}"))
 }
 
 /// Parse a `--cache-type-k` / `--cache-type-v` tag string into a [`CacheType`].

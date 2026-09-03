@@ -16,6 +16,12 @@ belongs to `scripts/perf_ab.sh` and `perf_ab_ingest.py`.
 The greedy token-id digest travels in `notes`, not as a metric: it is an
 identity, not a measurement, and `observations` stores reals.
 
+A sweep run at non-default `--kv-boundary-layers` lands in a cell of its own:
+the probe records the counts in a `kv_boundary` column and the record carries
+them as `decode_config` (`docs/METRICS_DB.md` §3.2). Those cells do not rank
+against a default-boundary sweep, which is the point — a different head/tail
+count is a different engine configuration, not another sample of one.
+
 `notes` also carries `any_layer_skipped_store`, which is a per-RUN flag and not
 a codec classification — see the field's comment below. Rows written before that
 rename spell it `packed_store_skipped` and carry no caveat; `observations` is
@@ -85,6 +91,36 @@ def weight_quant_of(model: str) -> str:
     return "bf16"
 
 
+# The engine's own default, `rmlx_models::kv_cache::KvBoundary::default`.
+KV_BOUNDARY_DEFAULT = (2, 8)
+
+
+def decode_config_of(row: dict[str, str]) -> str | None:
+    """The `decode_config` cell term this row's boundary-layer counts imply.
+
+    Read off the `kv_boundary` column the probe writes from its own argument,
+    so the term describes the sweep that ran rather than one the operator
+    typed. `None` is the engine at its defaults — which is also the right
+    answer for a CSV written before the probe had the column, because there was
+    no way to run at anything else then. That is a fact about those sweeps, not
+    a substituted value.
+    """
+    raw = (row.get("kv_boundary") or "").strip()
+    if not raw:
+        return None
+    try:
+        head, tail = (int(x) for x in raw.split(","))
+    except ValueError:
+        raise SystemExit(
+            f"unparseable kv_boundary column {raw!r}: expected '<head>,<tail>'. "
+            "Refusing rather than recording the row under the default cell — a "
+            "sweep filed in the wrong cell is permanent."
+        ) from None
+    if (head, tail) == KV_BOUNDARY_DEFAULT:
+        return None
+    return f"kv_boundary/head={head},kv_boundary/tail={tail}"
+
+
 def prompt_for(fixture_tokens: int, prompts_dir: Path) -> tuple[str, str]:
     """Resolve the canonical bench prompt the probe's `--prompt-tokens` names.
 
@@ -140,6 +176,7 @@ def build_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Pat
         "model": model,
         "weight_quant": weight_quant_of(model),
         "kv_quant": row["codec"],
+        "decode_config": decode_config_of(row),
         "ctx_max": max_ctx,
         "prompt": {"name": prompt_name, "body": prompt_body, "notes": None},
         "ts_utc": row["timestamp"],

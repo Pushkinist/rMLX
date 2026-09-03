@@ -37,8 +37,12 @@ use rmlx_mlx::{Array, Device, Dtype};
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
+use rmlx_kv_quant::{KvCache, KvQuant};
+
 use crate::arch::Architecture;
-use crate::gemma4::Gemma4Text;
+use crate::decode_loop::chunked_prefill;
+use crate::gemma4::{Gemma4Text, LayerType};
+use crate::kv_cache::kv_layer_quants;
 use crate::qwen3::Qwen3Text;
 
 /// Errors that can short-circuit a PPL scoring run.
@@ -96,7 +100,18 @@ pub struct PplReport {
 /// `tokens` must be the corpus tokenized end-to-end. Returns
 /// `Err(PplError::ArchUnsupported)` for any architecture other than Qwen3 or
 /// Gemma4.
-#[instrument(skip(arch, tokens), fields(arch_class = arch.arch_class(), n_tokens = tokens.len(), ctx_window, stride))]
+///
+/// `kv_quant` selects between the two scorers:
+///
+/// * `None` — the cacheless full-window forward described above. Every KV codec
+///   is out of the picture: nothing is stored, so nothing is quantized.
+/// * `Some(codec)` — the window is teacher-forced through a real per-layer KV
+///   cache built at `codec` by [`kv_layer_quants`], the same vector the decode
+///   loop builds. The prompt prefix is prefilled and every scored position is a
+///   single-token step, so each NLL is read off the decode path the served
+///   model runs. This is the only shape in which a KV codec can affect a
+///   perplexity number at all — a scorer that keeps no cache cannot measure one.
+#[instrument(skip(arch, tokens), fields(arch_class = arch.arch_class(), n_tokens = tokens.len(), ctx_window, stride, ?kv_quant))]
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
@@ -107,14 +122,109 @@ pub fn compute_ppl(
     ctx_window: usize,
     stride: usize,
     device: Device,
+    kv_quant: Option<KvQuant>,
 ) -> std::result::Result<PplReport, PplError> {
     match arch {
-        Architecture::Qwen3(m) => compute_ppl_qwen3(m, tokens, ctx_window, stride, device),
-        Architecture::Gemma4(m) => compute_ppl_gemma4(m, tokens, ctx_window, stride, device),
+        Architecture::Qwen3(m) => {
+            compute_ppl_qwen3(m, tokens, ctx_window, stride, device, kv_quant)
+        }
+        Architecture::Gemma4(m) => {
+            compute_ppl_gemma4(m, tokens, ctx_window, stride, device, kv_quant)
+        }
         other => Err(PplError::ArchUnsupported {
             arch: other.arch_class().to_string(),
         }),
     }
+}
+
+/// Accumulate the NLL of `win[t + 1]` under the logit row at window position
+/// `t`, skipping an out-of-vocab target or a non-finite result.
+///
+/// One implementation for four loops (two architectures × cached / cacheless):
+/// the skip rules are what decides the denominator of `mean_nll`, so two copies
+/// of them are two perplexities.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+fn accumulate_position_nll(
+    row: &[f32],
+    next_id: usize,
+    vocab: usize,
+    t: usize,
+    sum_nll: &mut f64,
+    count: &mut usize,
+) {
+    if next_id >= vocab {
+        warn!(
+            token_id = next_id,
+            vocab, "ppl: token id out of vocab range -- skipping position"
+        );
+        return;
+    }
+    let nll = neg_log_softmax_at(row, next_id);
+    if nll.is_finite() {
+        *sum_nll += f64::from(nll);
+        *count += 1;
+    } else {
+        warn!(
+            t,
+            token_id = next_id,
+            nll,
+            "ppl: non-finite NLL at position -- skipping"
+        );
+    }
+}
+
+/// Score one window by teacher-forcing it through `caches`.
+///
+/// `win[0..=warmup]` is prefilled through the arch's own chunked-prefill
+/// protocol; its final-position logits score position `warmup`. Every later
+/// scored position is a single-token forward — the decode step, with the
+/// cache's codec on the read path.
+///
+/// `forward` is the arch's cache-taking forward returning last-position logits.
+#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+fn score_window_through_cache(
+    win: &[u32],
+    warmup: usize,
+    vocab: usize,
+    caches: &mut Vec<KvCache>,
+    arch: &'static str,
+    device: Device,
+    sum_nll: &mut f64,
+    count: &mut usize,
+    mut forward: impl FnMut(&[u32], &mut Vec<KvCache>) -> Result<Array>,
+) -> Result<()> {
+    let last_scored = win.len() - 1; // exclusive: position t predicts win[t+1]
+    let prefill_logits = chunked_prefill(
+        caches,
+        &win[..=warmup],
+        crate::prefill_chunk::resolve(arch),
+        device,
+        arch,
+        &mut forward,
+    )?;
+    let host = logits_3d_to_host_f32(&prefill_logits, 1, vocab)?;
+    accumulate_position_nll(
+        &host,
+        win[warmup + 1] as usize,
+        vocab,
+        warmup,
+        sum_nll,
+        count,
+    );
+
+    for t in (warmup + 1)..last_scored {
+        let logits = forward(&win[t..=t], caches)?;
+        let host = logits_3d_to_host_f32(&logits, 1, vocab)?;
+        accumulate_position_nll(&host, win[t + 1] as usize, vocab, t, sum_nll, count);
+    }
+    Ok(())
 }
 
 #[instrument(skip(model, tokens), fields(n_tokens = tokens.len(), ctx_window, stride))]
@@ -128,6 +238,7 @@ fn compute_ppl_qwen3(
     ctx_window: usize,
     stride: usize,
     device: Device,
+    kv_quant: Option<KvQuant>,
 ) -> std::result::Result<PplReport, PplError> {
     if ctx_window < 2 {
         return Err(PplError::InvalidWindow {
@@ -159,10 +270,6 @@ fn compute_ppl_qwen3(
             break;
         }
 
-        // Forward this window -> [1, S, vocab] logits.
-        let logits = model.forward_seq_logits_all(window, device)?;
-        let host = logits_3d_to_host_f32(&logits, window.len(), vocab)?;
-
         // warmup = number of leading positions whose NLL was already counted
         // in the previous window. First window: 0. Subsequent windows: the
         // overlap = ctx_window - stride.
@@ -174,27 +281,35 @@ fn compute_ppl_qwen3(
 
         // Score positions [warmup .. window.len() - 1) -- predicting token at
         // window[t+1] from logits[t].
-        for t in warmup..(window.len() - 1) {
-            let next_id = window[t + 1] as usize;
-            if next_id >= vocab {
-                warn!(
-                    token_id = next_id,
-                    vocab, "ppl: token id out of vocab range -- skipping position"
-                );
-                continue;
+        match kv_quant {
+            None => {
+                let logits = model.forward_seq_logits_all(window, device)?;
+                let host = logits_3d_to_host_f32(&logits, window.len(), vocab)?;
+                for t in warmup..(window.len() - 1) {
+                    let row = &host[t * vocab..(t + 1) * vocab];
+                    accumulate_position_nll(
+                        row,
+                        window[t + 1] as usize,
+                        vocab,
+                        t,
+                        &mut sum_nll,
+                        &mut count,
+                    );
+                }
             }
-            let row = &host[t * vocab..(t + 1) * vocab];
-            let nll = neg_log_softmax_at(row, next_id);
-            if nll.is_finite() {
-                sum_nll += f64::from(nll);
-                count += 1;
-            } else {
-                warn!(
-                    t,
-                    token_id = next_id,
-                    nll,
-                    "ppl: non-finite NLL at position -- skipping"
-                );
+            Some(q) => {
+                let mut caches = qwen3_ppl_caches(model, q, window.len());
+                score_window_through_cache(
+                    window,
+                    warmup,
+                    vocab,
+                    &mut caches,
+                    "qwen3",
+                    device,
+                    &mut sum_nll,
+                    &mut count,
+                    |ids, cs| model.forward_seq_with_cache(ids, Some(cs.as_mut_slice()), device),
+                )?;
             }
         }
 
@@ -282,6 +397,7 @@ fn compute_ppl_gemma4(
     ctx_window: usize,
     stride: usize,
     device: Device,
+    kv_quant: Option<KvQuant>,
 ) -> std::result::Result<PplReport, PplError> {
     if ctx_window < 2 {
         return Err(PplError::InvalidWindow {
@@ -332,10 +448,6 @@ fn compute_ppl_gemma4(
 
         // BOS guarantees win_len = 1 + content_len >= 2 (content_len >= 1).
 
-        // Forward this window -> [1, win_len, vocab] logits.
-        let logits = model.forward_seq_logits_all(&bos_window, device)?;
-        let host = logits_3d_to_host_f32(&logits, win_len, vocab)?;
-
         // warmup = leading positions to skip (already scored in the previous window).
         // First window: 0. Subsequent windows: the overlap region is
         // ctx_window - stride positions, but the prepended BOS shifts every
@@ -352,27 +464,35 @@ fn compute_ppl_gemma4(
 
         // Score positions [warmup .. win_len-1) predicting bos_window[t+1].
         // bos_window[t+1] = tokens[start + t]  (for t >= 0, since bos_window[1..] = tokens[start..]).
-        for t in warmup..(win_len - 1) {
-            let next_id = bos_window[t + 1] as usize;
-            if next_id >= vocab {
-                warn!(
-                    token_id = next_id,
-                    vocab, "ppl: token id out of vocab range -- skipping position"
-                );
-                continue;
+        match kv_quant {
+            None => {
+                let logits = model.forward_seq_logits_all(&bos_window, device)?;
+                let host = logits_3d_to_host_f32(&logits, win_len, vocab)?;
+                for t in warmup..(win_len - 1) {
+                    let row = &host[t * vocab..(t + 1) * vocab];
+                    accumulate_position_nll(
+                        row,
+                        bos_window[t + 1] as usize,
+                        vocab,
+                        t,
+                        &mut sum_nll,
+                        &mut count,
+                    );
+                }
             }
-            let row = &host[t * vocab..(t + 1) * vocab];
-            let nll = neg_log_softmax_at(row, next_id);
-            if nll.is_finite() {
-                sum_nll += f64::from(nll);
-                count += 1;
-            } else {
-                warn!(
-                    t,
-                    token_id = next_id,
-                    nll,
-                    "ppl: non-finite NLL at position -- skipping"
-                );
+            Some(q) => {
+                let mut caches = gemma4_ppl_caches(model, q, win_len);
+                score_window_through_cache(
+                    &bos_window,
+                    warmup,
+                    vocab,
+                    &mut caches,
+                    "gemma4",
+                    device,
+                    &mut sum_nll,
+                    &mut count,
+                    |ids, cs| model.forward_seq_with_cache(ids, Some(cs.as_mut_slice()), device),
+                )?;
             }
         }
 
@@ -421,6 +541,56 @@ fn compute_ppl_gemma4(
         scored_tokens: count,
         windows,
     })
+}
+
+/// The per-layer cache stack the Qwen3 scorer teacher-forces a window through.
+///
+/// Mirrors `qwen3::generate_greedy`'s fresh-cache construction: the same
+/// producer, the same `shares_kv`, the same per-layer codec vector. `max_seq`
+/// is the window length because a window is the whole sequence this stack ever
+/// sees — the scorer builds a fresh stack per window rather than resetting one,
+/// which is what "fresh window each call" means once there is a cache.
+fn qwen3_ppl_caches(model: &Qwen3Text, kv_quant: KvQuant, win_len: usize) -> Vec<KvCache> {
+    kv_layer_quants(
+        model.cfg.num_hidden_layers,
+        kv_quant,
+        crate::qwen3::SHARES_KV_ACROSS_LAYERS,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(i, q)| KvCache::with_quant_max_seq(q, win_len as i32).with_layer_idx(i))
+    .collect()
+}
+
+/// The per-layer cache stack the Gemma4 scorer teacher-forces a window through.
+///
+/// Mirrors `gemma4::generate_greedy`'s fresh-cache construction, windows
+/// included: a sliding-attention layer gets its rotating ring here exactly as
+/// it does when serving, so the scored NLL sees the same layer mix a request
+/// would.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+fn gemma4_ppl_caches(model: &Gemma4Text, kv_quant: KvQuant, win_len: usize) -> Vec<KvCache> {
+    let sliding_window_i32 = model.cfg.sliding_window as i32;
+    kv_layer_quants(
+        model.cfg.num_hidden_layers,
+        kv_quant,
+        crate::gemma4::SHARES_KV_ACROSS_LAYERS,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(i, q)| {
+        let window = match model.cfg.layer_types[i] {
+            LayerType::SlidingAttention => Some(sliding_window_i32),
+            LayerType::FullAttention => None,
+        };
+        KvCache::with_quant_max_seq_window(q, win_len as i32, window)
+            .with_layer_idx(i)
+            .with_shares_kv(crate::gemma4::SHARES_KV_ACROSS_LAYERS)
+    })
+    .collect()
 }
 
 /// Returns the set of corpus-target indices scored by `compute_ppl_gemma4` for a

@@ -1,4 +1,5 @@
 use super::*;
+use rmlx_kv_quant::KvQuant;
 use std::collections::HashSet;
 
 /// DoD #4 -- five-token toy prompt + hand-rolled logits against an
@@ -196,6 +197,7 @@ fn gemma4_error_message_advertises_support() {
             usize,
             usize,
             Device,
+            Option<KvQuant>,
         ) -> std::result::Result<PplReport, PplError>;
 }
 

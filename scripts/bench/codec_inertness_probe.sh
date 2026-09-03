@@ -30,12 +30,17 @@
 # Usage:
 #   scripts/bench/codec_inertness_probe.sh --model <snapshot-abs-path> \
 #       --prompt-tokens 4096 [--max-tokens 100] [--max-ctx N] [--out CSV] \
-#       [--codecs "none k8v8 ..."]
+#       [--codecs "none k8v8 ..."] [--kv-boundary-layers H,T]
 #
 # Output CSV (appended, header written once):
 #   timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,
 #   codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,
-#   prefill_tps,binary_sha
+#   prefill_tps,binary_sha,kv_boundary
+#
+# `kv_boundary` is the `--kv-boundary-layers` value the sweep ran at, empty for
+# the engine default. It is a cell-identity term, not context: a sweep at a
+# different head/tail count is not another measurement of the same cell, and
+# `codec_inertness_ingest.py` reads this column to say so.
 #
 # `prompt_tokens` is the fixture NAME (`--prompt-tokens 4096` selects
 # `prompts/longctx_4k.json`); `prompt_tokens_measured` is what the run actually
@@ -68,6 +73,7 @@ MODEL=""
 PROMPT_TOKENS=4096
 MAX_TOKENS=100
 MAX_CTX=""
+KV_BOUNDARY=""
 # `rmlx baseline` is a single-shot GPU op: it takes the claim at
 # `rmlx_server::claim::SENTINEL_PORT` (0xCAFE = 51966), not at a server port.
 # An earlier version of this preflight removed `/tmp/rmlx.62265.claim` only —
@@ -116,8 +122,12 @@ while [[ $# -gt 0 ]]; do
 		read -r -a CODECS <<<"$2"
 		shift 2
 		;;
+	--kv-boundary-layers)
+		KV_BOUNDARY="$2"
+		shift 2
+		;;
 	-h | --help)
-		sed -n '2,46p' "$0"
+		sed -n '2,52p' "$0"
 		exit 0
 		;;
 	*)
@@ -157,7 +167,7 @@ MODEL_NAME="$(basename "$MODEL")"
 
 mkdir -p "$(dirname "$OUT")"
 if [[ ! -f "$OUT" ]]; then
-	echo "timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha" >"$OUT"
+	echo "timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha,kv_boundary" >"$OUT"
 fi
 
 preflight() {
@@ -171,8 +181,13 @@ preflight() {
 }
 
 echo "probe: binary=$BINARY ($BINARY_SHA)"
-echo "probe: model=$MODEL_NAME prompt_tokens=$PROMPT_TOKENS max_tokens=$MAX_TOKENS max_ctx=$MAX_CTX"
+echo "probe: model=$MODEL_NAME prompt_tokens=$PROMPT_TOKENS max_tokens=$MAX_TOKENS max_ctx=$MAX_CTX kv_boundary=${KV_BOUNDARY:-default}"
 echo "probe: ${#CODECS[@]} codecs -> $OUT"
+
+boundary_args=()
+if [[ -n "$KV_BOUNDARY" ]]; then
+	boundary_args=(--kv-boundary-layers "$KV_BOUNDARY")
+fi
 
 for codec in "${CODECS[@]}"; do
 	preflight
@@ -183,6 +198,7 @@ for codec in "${CODECS[@]}"; do
 		--prompt-tokens "$PROMPT_TOKENS" \
 		--max-tokens "$MAX_TOKENS" \
 		--max-ctx "$MAX_CTX" \
+		"${boundary_args[@]+"${boundary_args[@]}"}" \
 		--emit-token-ids \
 		--metrics off \
 		--log debug >"$raw" 2>&1
@@ -208,10 +224,10 @@ for codec in "${CODECS[@]}"; do
 		skipped=1
 	fi
 
-	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MODEL_NAME" "$PROMPT_TOKENS" "${measured:-}" \
 		"$MAX_CTX" "$MAX_TOKENS" "$codec" "$rc" "${kv_bytes:-}" "${ids_sha:-}" "$skipped" \
-		"${ttft:-}" "${dtps:-}" "${ptps:-}" "$BINARY_SHA" >>"$OUT"
+		"${ttft:-}" "${dtps:-}" "${ptps:-}" "$BINARY_SHA" "$KV_BOUNDARY" >>"$OUT"
 
 	printf '  %-24s rc=%-3s bytes=%-12s ids=%-16s skipped=%s\n' \
 		"$codec" "$rc" "${kv_bytes:-NONE}" "${ids_sha:-NONE}" "$skipped"

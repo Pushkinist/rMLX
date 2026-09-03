@@ -61,6 +61,29 @@ BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
 STAGING = RMLX_HOME / "bench" / "perf_ab" / "records"
 
 _KV_FLAG = re.compile(r"--kv-quant[= ]+(\S+)")
+_KV_BOUNDARY_FLAG = re.compile(r"--kv-boundary-layers[= ]+(\d+),(\d+)")
+# The engine's own default, `rmlx_models::kv_cache::KvBoundary::default`.
+_KV_BOUNDARY_DEFAULT = (2, 8)
+
+
+def _decode_config_of(arm_args: str) -> str | None:
+    """The `decode_config` cell term this arm's own arguments imply.
+
+    Read off the recorded argument string rather than taken from a flag on this
+    script: the arguments are what ran, and an operator-typed term can describe
+    a configuration the slot never used. `None` is the engine at its defaults,
+    which is what keeps a default-boundary arm ranking against every row
+    recorded before the flag existed.
+
+    The LAST occurrence wins, matching how clap resolves a repeated flag.
+    """
+    matches = _KV_BOUNDARY_FLAG.findall(arm_args or "")
+    if not matches:
+        return None
+    head, tail = (int(x) for x in matches[-1])
+    if (head, tail) == _KV_BOUNDARY_DEFAULT:
+        return None
+    return f"kv_boundary/head={head},kv_boundary/tail={tail}"
 
 
 def _kv_quant_of(arm_args: str, declared: str, arm: str) -> str:
@@ -202,6 +225,7 @@ def _arm_record(
         "model": args.model,
         "weight_quant": args.weight_quant,
         "kv_quant": kv_quant,
+        "decode_config": _decode_config_of(top.get("args", "")),
         "ctx_max": result["shape"]["max_ctx"],
         "prompt": {
             "name": prompt_name,

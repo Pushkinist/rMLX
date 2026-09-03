@@ -94,7 +94,11 @@ mod tests;
 /// an 8-bit boundary layer costs in quality. The counts are carried over
 /// unchanged; the quality of the in-family 8-bit target has not been re-derived
 /// to that standard. See `docs/KV_QUANT.md` §Layer-adaptive overrides.
-pub const LAYER_ADAPTIVE_TAIL_N: usize = 8;
+///
+/// The value itself lives in `rmlx_core::kv_boundary` so `rmlx-metrics` can
+/// recognise a `decode_config` that spells it out without a second copy; the
+/// policy that reads it stays here.
+pub const LAYER_ADAPTIVE_TAIL_N: usize = rmlx_core::kv_boundary::DEFAULT_BOUNDARY_TAIL_N;
 
 /// Default number of head layers forced to the boundary floor
 /// ([`boundary_floor`]) by [`kv_quant_for_layer`], at every context length.
@@ -109,7 +113,10 @@ pub const LAYER_ADAPTIVE_TAIL_N: usize = 8;
 /// ran was `KvQuant::K8V8`, which stores nothing and decodes bf16 — see the
 /// provenance note on [`LAYER_ADAPTIVE_TAIL_N`]. Read it as evidence for the
 /// count, not for the width.
-pub const LAYER_ADAPTIVE_HEAD_N: usize = 2;
+///
+/// The value lives in `rmlx_core::kv_boundary`, for the reason given on
+/// [`LAYER_ADAPTIVE_TAIL_N`].
+pub const LAYER_ADAPTIVE_HEAD_N: usize = rmlx_core::kv_boundary::DEFAULT_BOUNDARY_HEAD_N;
 
 /// Layer-adaptive KV quantization.
 ///
@@ -238,25 +245,45 @@ pub fn kv_quant_for_layer(
 ///
 /// The parametric families read their own store at decode
 /// (`KvQuant::decode_reads_packed_store` is true for `Mixed` and `RotK`), so
-/// raising them in-family delivers the floor from bytes the layer already
-/// spends: 8.50 bits per value at group 64, against the 16.00 of the fallback —
-/// **on a stack that does not share K/V**; see the mirror section above for the
-/// one that does.
+/// raising them in-family costs 8.50 bits per value at group 64 against the
+/// 16.00 of the fallback — **on a stack that does not share K/V**; see the
+/// mirror section above for the one that does.
 ///
-/// # What the fallback still costs
+/// # The floor is never free — it is cheaper in-family
 ///
-/// "From bytes the layer already spends" is a property of the two parametric
-/// families and of no other base. Ten codecs materialise a packed store and
-/// eight of them take the `K8V8` fallback, so for those eight the floor is paid
-/// for, not free — and the price splits by side store. The `SideStore::IsoRing`
-/// four (`Iso{3,4}Sym`, `IsoKOnly{3,4}`) sit at 12.125 bits per value, so
-/// `K8V8`'s 16.00 is a 1.32x byte regression on their boundary layers, bought
-/// deliberately: an SO(4)-rotated 3-/4-bit ring has no 8-bit form, and the
-/// alternative to paying for the floor is not having one. The
-/// `SideStore::Rotor` four (`Rotor{3,4}Sym`, `RotorKOnly{3,4}`) are at 16.25,
-/// already above bf16, so their boundary layers are byte-neutral to favourable.
-/// Neither group is diverted by the arm below — they do not mirror both axes —
-/// and the trade is recorded in `docs/KV_QUANT.md` §Layer-adaptive overrides.
+/// The in-family target is not delivered "from bytes the layer already spends":
+/// it is a wider store than the base, and the extra width is paid for. Measured
+/// on `Ternary-Bonsai-8B` (36 full-attention layers, 10 promoted) at
+/// `mixed_k4g64_v4g64`, the promotion is **19.80% of the whole cache** at both
+/// 4k and 32k — the boundary layers hold 8.50 bits per value where the base
+/// holds 4.50. What in-family buys is the comparison against the fallback: the
+/// same ten layers at `K8V8` would be 16.00 bits per value, a whole-cache ratio
+/// of 0.484x against the in-family 0.356x, so the family is worth about 27% of
+/// the cache. Cheaper, not free.
+///
+/// # What the fallback costs
+///
+/// Ten codecs materialise a packed store and eight of them take the `K8V8`
+/// fallback, so for those eight the floor is paid at the full bf16 rate — the
+/// promoted layer materialises no store at all and holds two bf16 buffers. The
+/// price splits by side store. The `SideStore::IsoRing` four (`Iso{3,4}Sym`,
+/// `IsoKOnly{3,4}`) sit at 12.125 bits per value, so `K8V8`'s 16.00 is a 1.32x
+/// byte regression on their boundary layers, bought deliberately: an
+/// SO(4)-rotated 3-/4-bit ring has no 8-bit form, and the alternative to paying
+/// for the floor is not having one. On Bonsai-8B that is +7.2% of `iso3_sym`'s
+/// cache at 4k and +7.9% at 32k. The `SideStore::Rotor` four (`Rotor{3,4}Sym`,
+/// `RotorKOnly{3,4}`) are at 16.25, already above bf16, so their boundary
+/// layers are byte-**favourable** — measured at −1.3% of `rotor3_sym`'s cache
+/// at 4k and −0.6% at 32k. Neither group is diverted by the arm below — they do
+/// not mirror both axes — and the trade is recorded in `docs/KV_QUANT.md`
+/// §Layer-adaptive overrides.
+///
+/// How many layers this reaches is a property of the model, not of the policy:
+/// a windowed layer runs the bf16 rotating ring whatever it is handed and a
+/// shared-KV consumer layer owns no cache, so on `gemma-4-e2b` the promotion
+/// reaches zero layers and no measurement taken there can say anything about
+/// it. `--kv-boundary-layers` moves the counts for a run that wants to price
+/// them; see [`KvBoundary`].
 ///
 /// # Totality
 ///
@@ -376,20 +403,194 @@ fn boundary_floor(base_quant: KvQuant, shares_kv: bool) -> KvQuant {
 /// changes which codec the policy picks, not whether the picked one is used. A
 /// consumer that needs the effective codec of a *built* cache must read the
 /// cache, not this vector.
+///
+/// The head/tail counts come from [`active_kv_boundary`], not from the
+/// constants directly, so `--kv-boundary-layers` moves every consumer at once.
 #[must_use]
 pub fn kv_layer_quants(n_layers: usize, base: KvQuant, shares_kv: bool) -> Vec<KvQuant> {
+    kv_layer_quants_at(n_layers, base, shares_kv, active_kv_boundary())
+}
+
+/// [`kv_layer_quants`] at an explicit boundary rather than the installed one.
+///
+/// Private on purpose: the public producer is the one that reads the process
+/// configuration, and a second public entry point would let a caller build a
+/// cache stack at one boundary while the SSD layout key and the prompt-cache
+/// seed describe another. Tests use it to compare boundaries inside one
+/// process, which the install-once accessor cannot do.
+fn kv_layer_quants_at(
+    n_layers: usize,
+    base: KvQuant,
+    shares_kv: bool,
+    boundary: KvBoundary,
+) -> Vec<KvQuant> {
     (0..n_layers)
         .map(|i| {
             kv_quant_for_layer(
                 i,
                 n_layers,
                 base,
-                LAYER_ADAPTIVE_TAIL_N,
-                LAYER_ADAPTIVE_HEAD_N,
+                boundary.tail_n,
+                boundary.head_n,
                 shares_kv,
             )
         })
         .collect()
+}
+
+/// How many head and tail layers [`kv_layer_quants`] holds at the boundary
+/// floor.
+///
+/// `head_n = 0, tail_n = 0` turns the promotion off entirely: every layer runs
+/// the base codec.
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "closed two-field pair — a head count and a tail count are the whole contract, and a caller that names both has named the boundary"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvBoundary {
+    /// Number of leading layers held at [`boundary_floor`].
+    pub head_n: usize,
+    /// Number of trailing layers held at [`boundary_floor`].
+    pub tail_n: usize,
+}
+
+impl Default for KvBoundary {
+    fn default() -> Self {
+        Self {
+            head_n: LAYER_ADAPTIVE_HEAD_N,
+            tail_n: LAYER_ADAPTIVE_TAIL_N,
+        }
+    }
+}
+
+/// Largest head or tail count [`KvBoundary::parse`] accepts.
+///
+/// No shipped decoder stack is anywhere near this deep; the bound exists so a
+/// mistyped count is refused at the CLI rather than silently flooring every
+/// layer of every model.
+const MAX_BOUNDARY_LAYERS: usize = 512;
+
+/// Why a `--kv-boundary-layers` value was refused.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum KvBoundaryParseError {
+    /// The value was not two comma-separated fields.
+    #[error("expected '<head>,<tail>', got '{0}'")]
+    Shape(String),
+    /// One of the two fields was not a non-negative integer.
+    #[error("'{field}' is not a non-negative integer (in '{value}')")]
+    NotANumber {
+        /// The offending field as written.
+        field: String,
+        /// The whole value the operator passed.
+        value: String,
+    },
+    /// One of the two counts was above [`MAX_BOUNDARY_LAYERS`].
+    #[error("{field}={count} exceeds the {max}-layer maximum")]
+    TooLarge {
+        /// Which side was too large (`head` or `tail`).
+        field: &'static str,
+        /// The count that was refused.
+        count: usize,
+        /// The accepted maximum.
+        max: usize,
+    },
+}
+
+impl KvBoundary {
+    /// Parse a `<head>,<tail>` pair.
+    ///
+    /// Both counts are required and both may be `0`; `0,0` is the valid
+    /// spelling of "no boundary promotion at all".
+    pub fn parse(value: &str) -> Result<Self, KvBoundaryParseError> {
+        let mut fields = value.split(',');
+        let (Some(head), Some(tail), None) = (fields.next(), fields.next(), fields.next()) else {
+            return Err(KvBoundaryParseError::Shape(value.to_string()));
+        };
+        let parse_one = |s: &str| -> Result<usize, KvBoundaryParseError> {
+            s.trim()
+                .parse::<usize>()
+                .map_err(|_| KvBoundaryParseError::NotANumber {
+                    field: s.to_string(),
+                    value: value.to_string(),
+                })
+        };
+        let head_n = parse_one(head)?;
+        let tail_n = parse_one(tail)?;
+        for (field, count) in [("head", head_n), ("tail", tail_n)] {
+            if count > MAX_BOUNDARY_LAYERS {
+                return Err(KvBoundaryParseError::TooLarge {
+                    field,
+                    count,
+                    max: MAX_BOUNDARY_LAYERS,
+                });
+            }
+        }
+        Ok(Self { head_n, tail_n })
+    }
+
+    /// The `docs/METRICS_DB.md` §3.2 `decode_config` terms for this boundary,
+    /// or `None` when it is the shipped default.
+    ///
+    /// `None` is what keeps a default run's cell identical to every row
+    /// recorded before the flag existed; only a run that moved the setting off
+    /// its default gets a cell of its own.
+    #[must_use]
+    pub fn decode_config(self) -> Option<String> {
+        (self != Self::default()).then(|| {
+            use rmlx_core::kv_boundary::{BOUNDARY_HEAD_KEY, BOUNDARY_TAIL_KEY};
+            format!(
+                "{BOUNDARY_HEAD_KEY}={},{BOUNDARY_TAIL_KEY}={}",
+                self.head_n, self.tail_n
+            )
+        })
+    }
+}
+
+static KV_BOUNDARY: std::sync::OnceLock<KvBoundary> = std::sync::OnceLock::new();
+
+/// Install the process-global [`KvBoundary`] read by [`kv_layer_quants`].
+///
+/// First call wins. Called once at command startup before any model loads;
+/// `None` means the flag was not passed and the default applies. A second call
+/// with a different value is dropped with a `warn!` (mirrors
+/// `prompt_cache::install_ram_cap` and `ssd_tier::install_config`).
+///
+/// The boundary is process-global rather than a parameter because three places
+/// must agree on it — the arch loops that build the caches, the SSD layout key
+/// and the per-request prompt-cache seed — and a per-call parameter is exactly
+/// how two of them come to describe a mixture the third does not build.
+pub fn install_kv_boundary(boundary: Option<KvBoundary>) {
+    let boundary = boundary.unwrap_or_default();
+    if KV_BOUNDARY.set(boundary).is_err() {
+        let existing = KV_BOUNDARY.get().copied().unwrap_or_default();
+        if existing != boundary {
+            tracing::warn!(
+                ?existing,
+                requested = ?boundary,
+                "install_kv_boundary called more than once; keeping the first value"
+            );
+        }
+        return;
+    }
+    tracing::info!(
+        head_n = boundary.head_n,
+        tail_n = boundary.tail_n,
+        source = if boundary == KvBoundary::default() {
+            "default"
+        } else {
+            "cli"
+        },
+        "kv boundary-layer counts installed"
+    );
+}
+
+/// The active [`KvBoundary`] — the installed one, or the default when
+/// [`install_kv_boundary`] has not been called (tests / unit paths).
+#[must_use]
+pub fn active_kv_boundary() -> KvBoundary {
+    KV_BOUNDARY.get().copied().unwrap_or_default()
 }
 
 /// Code width [`KvQuant::approx_code_bits`] reports for a side that is kept at

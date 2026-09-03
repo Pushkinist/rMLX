@@ -5,8 +5,9 @@
 #[allow(clippy::module_inception)]
 mod tests {
     use super::super::{
-        kv_codec_net_saving_total, kv_layer_quants, kv_quant_for_layer, lookup_layer_calibration,
-        KvCacheBuilder, KvLayerShape, LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+        active_kv_boundary, kv_codec_net_saving_total, kv_layer_quants, kv_layer_quants_at,
+        kv_quant_for_layer, lookup_layer_calibration, KvBoundary, KvCacheBuilder, KvLayerShape,
+        LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
     };
     use rmlx_kv_quant::kvcache::KvCache;
     use rmlx_kv_quant::storage::KvStorage;
@@ -2220,6 +2221,177 @@ mod tests {
             assert_eq!(n_global, 0);
             assert_eq!(n_win, 24);
             assert_eq!(saving, 0, "{q:?} all-windowed mix must net to 0 (no warn)");
+        }
+    }
+    // ── Boundary-layer counts (`--kv-boundary-layers`) ───────────────────────
+
+    /// A `mixed_k4g64_v4g64` base whose boundary layers are promoted in-family.
+    /// Its promotion target is distinguishable from the base by value, which is
+    /// what lets these tests read the vector rather than count layers.
+    fn boundary_probe_base() -> KvQuant {
+        KvQuant::Mixed {
+            k_bits: 4,
+            v_bits: 4,
+            k_group_size: 64,
+            v_group_size: 64,
+        }
+    }
+
+    /// The promoted entries of a vector at `base`, as layer indices.
+    fn promoted_indices(vector: &[KvQuant], base: KvQuant) -> Vec<usize> {
+        vector
+            .iter()
+            .enumerate()
+            .filter_map(|(i, q)| (*q != base).then_some(i))
+            .collect()
+    }
+
+    /// The vector moves with the boundary: a different `(head, tail)` promotes
+    /// a different set of layers, and `0,0` promotes none.
+    #[test]
+    fn kv_layer_quants_follows_the_boundary_counts() {
+        let base = boundary_probe_base();
+        let n = 36;
+
+        let default_vec = kv_layer_quants_at(n, base, false, KvBoundary::default());
+        assert_eq!(
+            promoted_indices(&default_vec, base),
+            vec![0, 1, 28, 29, 30, 31, 32, 33, 34, 35],
+            "the shipped 2 head + 8 tail layers"
+        );
+
+        let cut = kv_layer_quants_at(
+            n,
+            base,
+            false,
+            KvBoundary {
+                head_n: 2,
+                tail_n: 4,
+            },
+        );
+        assert_eq!(
+            promoted_indices(&cut, base),
+            vec![0, 1, 32, 33, 34, 35],
+            "a 4-layer tail promotes four, not eight"
+        );
+
+        let off = kv_layer_quants_at(
+            n,
+            base,
+            false,
+            KvBoundary {
+                head_n: 0,
+                tail_n: 0,
+            },
+        );
+        assert!(
+            promoted_indices(&off, base).is_empty(),
+            "0,0 is the spelling of no boundary promotion: {off:?}"
+        );
+
+        let head_only = kv_layer_quants_at(
+            n,
+            base,
+            false,
+            KvBoundary {
+                head_n: 3,
+                tail_n: 0,
+            },
+        );
+        assert_eq!(promoted_indices(&head_only, base), vec![0, 1, 2]);
+    }
+
+    /// With nothing installed, the public producer is the shipped default —
+    /// this is the test that fails if the flag ever changes behaviour for a
+    /// caller that did not pass it.
+    #[test]
+    fn default_boundary_is_the_shipped_constants() {
+        assert_eq!(
+            active_kv_boundary(),
+            KvBoundary {
+                head_n: LAYER_ADAPTIVE_HEAD_N,
+                tail_n: LAYER_ADAPTIVE_TAIL_N,
+            }
+        );
+        let base = boundary_probe_base();
+        assert_eq!(
+            kv_layer_quants(36, base, false),
+            kv_layer_quants_at(36, base, false, KvBoundary::default()),
+        );
+    }
+
+    /// Well-formed values parse; malformed ones are refused rather than
+    /// silently falling back to the default.
+    #[test]
+    fn boundary_parse_accepts_pairs_and_refuses_everything_else() {
+        assert_eq!(
+            KvBoundary::parse("2,8").ok(),
+            Some(KvBoundary {
+                head_n: 2,
+                tail_n: 8
+            })
+        );
+        assert_eq!(
+            KvBoundary::parse("0,0").ok(),
+            Some(KvBoundary {
+                head_n: 0,
+                tail_n: 0
+            })
+        );
+        for bad in [
+            "", "2", "2,", ",8", "2,8,4", "-1,8", "2,-8", "a,8", "2,b", "2 8", "2;8", "513,0",
+            "0,513",
+        ] {
+            assert!(
+                KvBoundary::parse(bad).is_err(),
+                "'{bad}' must be refused, not silently accepted"
+            );
+        }
+    }
+
+    /// The default boundary carries no `decode_config`, so a default run's cell
+    /// is the same cell every pre-flag row was written into. Anything else gets
+    /// a cell of its own, spelled in the §3.2 grammar and ordered by key.
+    #[test]
+    fn boundary_decode_config_is_none_at_the_default() {
+        assert_eq!(KvBoundary::default().decode_config(), None);
+        assert_eq!(
+            KvBoundary {
+                head_n: 2,
+                tail_n: 4
+            }
+            .decode_config()
+            .as_deref(),
+            Some("kv_boundary/head=2,kv_boundary/tail=4")
+        );
+        assert_eq!(
+            KvBoundary {
+                head_n: 0,
+                tail_n: 0
+            }
+            .decode_config()
+            .as_deref(),
+            Some("kv_boundary/head=0,kv_boundary/tail=0")
+        );
+        for b in [
+            KvBoundary {
+                head_n: 2,
+                tail_n: 4,
+            },
+            KvBoundary {
+                head_n: 0,
+                tail_n: 0,
+            },
+            KvBoundary {
+                head_n: 4,
+                tail_n: 16,
+            },
+        ] {
+            let config = b.decode_config().unwrap_or_default();
+            assert!(
+                rmlx_metrics::cell::decode_config_is_well_formed(&config),
+                "'{config}' is not a well-formed decode_config"
+            );
         }
     }
 }
