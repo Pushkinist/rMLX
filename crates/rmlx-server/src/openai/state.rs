@@ -806,11 +806,18 @@ impl AppState {
     /// Returns a clone of the `Arc<dyn Generator>` for the caller to use,
     /// plus a `bool` that is `true` when the model was just loaded (cold) and
     /// `false` when it was already resident (warm).
-    pub fn ensure_loaded(&self, model_id: &str) -> Result<(Arc<dyn Generator>, bool), String> {
-        let entry = self
-            .registry
-            .get(model_id)
-            .ok_or_else(|| format!("model '{model_id}' not found in registry"))?;
+    /// The error type is `rmlx_core::Error`, not a formatted string: a load
+    /// failure the operator can only fix by changing a flag —
+    /// [`rmlx_core::error::Error::ContextCeilingExceeded`] — must stay
+    /// distinguishable from a transient one, so the eager preload can fail
+    /// startup on the first and warn on the second.
+    pub fn ensure_loaded(
+        &self,
+        model_id: &str,
+    ) -> Result<(Arc<dyn Generator>, bool), rmlx_core::error::Error> {
+        let entry = self.registry.get(model_id).ok_or_else(|| {
+            rmlx_core::error::Error::Model(format!("model '{model_id}' not found in registry"))
+        })?;
 
         // First, check resident / collect any LRU eviction target under the
         // slots write lock. We finalize the eviction OUTSIDE the lock so
@@ -914,7 +921,7 @@ impl AppState {
                 None, // use model default max_ctx
                 templated_prompt,
             )
-            .map_err(|e| format!("smoke probe error for '{model_id}': {e}"))?;
+            .map_err(|e| rmlx_core::error::Error::SmokeProbe(format!("{model_id}: {e}")))?;
 
             use rmlx_models::SmokeVerdict;
             match &verdict {
@@ -931,10 +938,10 @@ impl AppState {
                         distinct_ids,
                         "B5: smoke probe FAILED — BrokenPunctLoop; refusing to serve"
                     );
-                    return Err(format!(
+                    return Err(rmlx_core::error::Error::SmokeProbe(format!(
                         "smoke probe failed for '{model_id}': broken_punct_loop \
                          (dominant='{dominant_piece}', distinct_ids={distinct_ids})"
-                    ));
+                    )));
                 }
                 SmokeVerdict::BrokenNan { at_step } => {
                     tracing::error!(
@@ -942,17 +949,18 @@ impl AppState {
                         at_step,
                         "B5: smoke probe FAILED — BrokenNan; refusing to serve"
                     );
-                    return Err(format!(
+                    return Err(rmlx_core::error::Error::SmokeProbe(format!(
                         "smoke probe failed for '{model_id}': broken_nan at step {at_step}"
-                    ));
+                    )));
                 }
             }
         }
 
         // Load the requested model.
         tracing::info!(model_id, "slots: loading model");
-        let gen = (self.loader)(&entry.abs_path, model_id)
-            .map_err(|e| format!("failed to load model '{model_id}': {e}"))?;
+        // The loader's error passes through unwrapped: the caller decides what
+        // to do with it, and a `ContextCeilingExceeded` must stay recognisable.
+        let gen = (self.loader)(&entry.abs_path, model_id)?;
         let gen: Arc<dyn Generator> = Arc::from(gen);
         let now = Instant::now();
         // Snapshot the resolved context bounds once at load time.

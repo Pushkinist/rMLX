@@ -53,8 +53,13 @@ pub(crate) struct LoadBody {
 /// `max_ctx` is the ceiling in force (what the admission guard enforces and
 /// what the KV ring may grow to); `positional_max` is what the checkpoint can
 /// address, RoPE scaling included, and is therefore the highest a per-request
-/// `max_ctx` may ask for. Both are `None` for a generator that does not
-/// participate in KV-cache sizing, and then neither is reported.
+/// `max_ctx` may ask for.
+///
+/// `context` is `None`, and neither number is reported, when the generator
+/// does not participate in KV-cache sizing **or** when the architecture does
+/// not expose `max_position_embeddings`. In that second case the resolver
+/// accepts any `max_ctx`, so publishing a bound would state the opposite of
+/// the behaviour — the field's absence is what says "no limit known".
 struct ResidentInfo {
     loaded_at: u64,
     last_used: u64,
@@ -86,7 +91,8 @@ pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
                         last_used: now_unix.saturating_sub(m.last_used.elapsed().as_secs()),
                         context: m
                             .context_limits
-                            .map(|l| (m.effective_max_ctx, l.positional_max().max(0) as usize)),
+                            .and_then(|l| l.positional_tokens())
+                            .map(|positional| (m.effective_max_ctx, positional)),
                     },
                 )
             })
@@ -170,7 +176,7 @@ pub(crate) async fn load_model(
         Err(e) => {
             tracing::error!(model_id = %id, error = %e, "load: failed");
             state.error_counts.increment(ApiErrorCategory::Upstream);
-            service_unavailable(&e)
+            service_unavailable(&e.to_string())
         }
     }
 }

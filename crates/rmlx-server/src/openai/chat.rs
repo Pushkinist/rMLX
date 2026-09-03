@@ -1085,7 +1085,11 @@ pub(crate) async fn chat_completions(
         Ok(pair) => pair,
         Err(e) => {
             state.error_counts.increment(ApiErrorCategory::Upstream);
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", &e);
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                &e.to_string(),
+            );
         }
     };
 
@@ -1113,7 +1117,7 @@ pub(crate) async fn chat_completions(
         let effective_max_ctx = match req_max_ctx_override {
             Some(n) => match state.context_limits_for(&req.model) {
                 Some(limits) => match rmlx_models::context::resolve_context(&limits, Some(n)) {
-                    Ok(ctx) => ctx.ceiling.max(0) as usize,
+                    Ok(ctx) => ctx.ceiling_tokens(),
                     Err(e) => {
                         state
                             .error_counts

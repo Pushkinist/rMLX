@@ -478,6 +478,11 @@ context numbers the run resolved:
 | `max_ctx` | The context ceiling in force — what the admission guard enforces and what the KV ring may grow to. |
 | `positional_max` | What the checkpoint can address, RoPE scaling included; the highest a per-request `max_ctx` may ask for. |
 
+Both are **omitted** when the architecture does not expose
+`max_position_embeddings`: the resolver then accepts any `max_ctx`, so
+publishing a bound would state the opposite of the behaviour. The field's
+absence is what says "no limit known".
+
 This is the surface that reports the effective ceiling; the same pair is on the
 `slots: model loaded` log line. See `docs/CLI.md` § "Context ceiling".
 

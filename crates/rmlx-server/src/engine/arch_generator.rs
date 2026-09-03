@@ -260,9 +260,9 @@ impl ArchGenerator {
         // message, rather than clamping the window and surfacing later as an
         // unrelated-looking overflow.
         let context_limits = model.context_limits();
-        let resolved_ctx = rmlx_models::context::resolve_context(&context_limits, max_ctx_override)
-            .map_err(|e| Error::Model(e.to_string()))?;
-        let effective_max_ctx: usize = resolved_ctx.ceiling.max(0) as usize;
+        let resolved_ctx =
+            rmlx_models::context::resolve_context(&context_limits, max_ctx_override)?;
+        let effective_max_ctx: usize = resolved_ctx.ceiling_tokens();
 
         // load the Gemma4 vision tower once when the snapshot ships a
         // `vision_config` (multimodal checkpoint). Text-only models return

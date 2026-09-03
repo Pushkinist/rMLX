@@ -420,9 +420,8 @@ impl SpeculativeGenerator {
         let resolved_ctx = rmlx_models::context::resolve_context(
             &dispatcher.verifier.context_limits(),
             max_ctx_override,
-        )
-        .map_err(|e| Error::Model(e.to_string()))?;
-        let effective_max_ctx: usize = resolved_ctx.ceiling.max(0) as usize;
+        )?;
+        let effective_max_ctx: usize = resolved_ctx.ceiling_tokens();
         let context_limits = dispatcher.verifier.context_limits();
 
         // Fail fast on a codec the verifier's resolved architecture refuses.
