@@ -75,6 +75,10 @@ pub struct Qwen3_5MoeConfig {
     /// From `text_config.max_position_embeddings`. Used to size the KV buffer.
     /// 0 if absent (falls back to `KV_MAX_SEQ_DEFAULT`).
     pub max_position_embeddings: u32,
+    /// Positional capacity of this checkpoint. The generate path reads this
+    /// rather than `max_position_embeddings`, so the fold from raw field to
+    /// context bound happens once, here.
+    pub context: crate::context::ContextLimits,
 }
 
 impl Qwen3_5MoeConfig {
@@ -176,6 +180,8 @@ impl Qwen3_5MoeConfig {
             .map(|v| v as u32)
             .or_else(|| cfg.text_config.as_ref()?.max_position_embeddings)
             .unwrap_or(0);
+        // Qwen3.5-MoE implements no RoPE scaling: its trained window is the limit.
+        let context = crate::context::ContextLimits::trained_only(max_position_embeddings as i32);
 
         Ok(Qwen3_5MoeConfig {
             num_hidden_layers,
@@ -204,6 +210,7 @@ impl Qwen3_5MoeConfig {
             quant_mode,
             quant_overrides,
             max_position_embeddings,
+            context,
         })
     }
 }

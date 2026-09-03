@@ -254,21 +254,54 @@ const CEILING_CONSUMERS: &[&str] = &[
     // CLI: the default `--max-prompt-tokens` cap.
     "crates/rmlx-cli/src/commands/baseline.rs",
     "crates/rmlx-cli/src/commands/bench.rs",
-];
-
-/// The only places allowed to read the raw `max_position_embeddings()`
-/// accessor. Everything else must go through [`resolve_context`], because a
-/// second `min(mpe, …)` chain is exactly the drift this module removed.
-///
-/// The speculative entries compare a drafter's positional limit against its
-/// verifier's — a pairing check, not a context bound.
-const RAW_MPE_READERS: &[&str] = &[
-    "crates/rmlx-models/src/arch/mod.rs",
+    // Speculative: the verifier's limits bound the pair. `speculative/mod.rs`
+    // holds the `verifier_context` wrapper the four sidecar drivers call.
     "crates/rmlx-models/src/speculative/dflash/mod.rs",
     "crates/rmlx-models/src/speculative/eagle3/mod.rs",
     "crates/rmlx-models/src/speculative/gemma4_assistant.rs",
     "crates/rmlx-models/src/speculative/mod.rs",
     "crates/rmlx-models/src/speculative/mtp.rs",
+];
+
+/// The only places allowed to name `max_position_embeddings` at all — the
+/// field, the accessor, or a message that quotes it. Everything else must go
+/// through [`resolve_context`], because a second `min(mpe, …)` chain is exactly
+/// the drift this module removed.
+///
+/// Scanning the bare identifier rather than the `max_position_embeddings()`
+/// accessor form is deliberate: the field read
+/// (`model.cfg.max_position_embeddings`) was the dominant shape, so an
+/// accessor-only scan let a hand-rolled clamp into any generate path
+/// unnoticed. Every architecture now folds its raw field into a
+/// [`ContextLimits`] inside its config parser, and the generate paths read
+/// that.
+///
+/// Three kinds of entry belong on this list and nothing else:
+/// * **config parsers and the arch accessor** — where the raw field is read
+///   once and folded into [`ContextLimits`];
+/// * **`rmlx info`** — it prints the config field verbatim;
+/// * **message text** — `error.rs` and `arch/loader.rs` quote the field name
+///   to the operator. A string is not a formula.
+///
+/// YaRN's `original_max_position_embeddings` is a different quantity and is
+/// masked out of the scan, so `rope.rs` and the drafter RoPE code stay off it.
+const RAW_MPE_READERS: &[&str] = &[
+    // Config parsers: the one fold from raw field to ContextLimits.
+    "crates/rmlx-loader/src/config.rs",
+    "crates/rmlx-models/src/arch/mod.rs",
+    "crates/rmlx-models/src/bitnet/config.rs",
+    "crates/rmlx-models/src/gemma4/config.rs",
+    "crates/rmlx-models/src/jina_v4/config.rs",
+    "crates/rmlx-models/src/qwen3.rs",
+    "crates/rmlx-models/src/qwen3_5_moe/config.rs",
+    "crates/rmlx-models/src/qwen3_vl_moe/config.rs",
+    "crates/rmlx-models/src/qwen3_vl_moe/loader.rs",
+    "crates/rmlx-models/src/qwen3_vl_moe/model.rs",
+    // Operator-facing text that quotes the field name.
+    "crates/rmlx-core/src/error.rs",
+    "crates/rmlx-models/src/arch/loader.rs",
+    // `rmlx info` prints the config field verbatim.
+    "crates/rmlx-cli/src/commands/info.rs",
 ];
 
 /// Workspace root, from this crate's manifest directory.
@@ -279,8 +312,24 @@ fn workspace_root() -> std::path::PathBuf {
         .expect("workspace root resolves from CARGO_MANIFEST_DIR")
 }
 
+/// Is `path` test source? Test files are excluded from every scan: a fixture
+/// naming a field is not a production consumer of it.
+fn is_test_source(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("");
+    name.ends_with("_tests.rs")
+        || name == "tests.rs"
+        || path.components().any(|c| c.as_os_str() == "tests")
+}
+
 /// Workspace-relative paths of every `.rs` file under `crates/` containing
-/// `needle`, excluding this module's own source and any `*_tests.rs`.
+/// `needle`, excluding this module's own source and every test source.
+///
+/// `original_max_position_embeddings` is masked out before the search so a
+/// scan for `max_position_embeddings` does not collect YaRN's anchor field,
+/// which is a different quantity.
 fn files_containing(needle: &str) -> Vec<String> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -305,11 +354,12 @@ fn files_containing(needle: &str) -> Vec<String> {
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str)
                 .unwrap_or("");
-            name != "context.rs" && name != "context_tests.rs" && !name.ends_with("_tests.rs")
+            name != "context.rs" && name != "context_tests.rs" && !is_test_source(p)
         })
         .filter(|p| {
             std::fs::read_to_string(p).is_ok_and(|body| {
                 body.lines()
+                    .map(|l| l.replace("original_max_position_embeddings", ""))
                     .any(|l| l.contains(needle) && !l.trim_start().starts_with("//"))
             })
         })
@@ -325,7 +375,10 @@ fn files_containing(needle: &str) -> Vec<String> {
 /// every entry on the list still resolves one.
 #[test]
 fn ceiling_consumers_are_enumerated() {
-    let found = files_containing("resolve_context(");
+    let mut found = files_containing("resolve_context(");
+    found.extend(files_containing("verifier_context("));
+    found.sort();
+    found.dedup();
     let mut expected: Vec<String> = CEILING_CONSUMERS.iter().map(|s| (*s).to_owned()).collect();
     expected.sort();
     assert_eq!(
@@ -335,16 +388,17 @@ fn ceiling_consumers_are_enumerated() {
     );
 }
 
-/// No second ceiling formula: the raw `max_position_embeddings()` accessor is
-/// read only where a context bound is not what is being computed.
+/// No second ceiling formula: `max_position_embeddings` is named only where a
+/// context bound is not what is being computed.
 #[test]
 fn raw_positional_limit_has_no_unlisted_readers() {
-    let found = files_containing("max_position_embeddings()");
+    let found = files_containing("max_position_embeddings");
     let mut expected: Vec<String> = RAW_MPE_READERS.iter().map(|s| (*s).to_owned()).collect();
     expected.sort();
     assert_eq!(
         found, expected,
-        "a new reader of the raw max_position_embeddings() accessor appeared; route context \
-         bounds through resolve_context instead of clamping to it by hand"
+        "a new reader of max_position_embeddings appeared; fold it into a ContextLimits in \
+         the architecture's config parser and route context bounds through resolve_context \
+         instead of clamping to the raw field by hand"
     );
 }

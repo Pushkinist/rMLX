@@ -46,7 +46,28 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 pub use draft_kind::DraftKind;
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};
+use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+
+/// Resolve the context bounds a speculative pair runs under.
+///
+/// The verifier owns the KV geometry — the drafter inherits its cache sizing
+/// and its positional limit — so the verifier's [`crate::context::ContextLimits`]
+/// are what bound the round loop. Routing through
+/// [`crate::context::resolve_context`] keeps the speculative path on the one
+/// resolution every other context cap reads, and gives it the same refusal:
+/// a `--max-ctx` above the verifier's positional capacity used to be taken
+/// verbatim here and only surfaced as a cache overflow mid-round.
+///
+/// # Errors
+///
+/// [`rmlx_core::error::Error::ContextCeilingExceeded`] when `max_ctx_override`
+/// is above the verifier's positional capacity.
+pub(crate) fn verifier_context(
+    verifier: &Architecture,
+    max_ctx_override: Option<i32>,
+) -> Result<crate::context::ResolvedContext> {
+    crate::context::resolve_context(&verifier.context_limits(), max_ctx_override)
+}
 
 /// Guard the one verifier logit row a speculative driver selects from at
 /// prefill.
@@ -444,17 +465,10 @@ impl SpeculativeDispatcher {
         // stack resolves its own default, so it must read the same constant the
         // verifier does or a spec pair runs two different caches.
         let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-        // Derive max_seq from override, else KV_MAX_SEQ_DEFAULT (the
-        // verifier's max_position_embeddings is the safer bound, but for
-        // the spec test target they match).
-        let max_seq = max_ctx_override.unwrap_or_else(|| {
-            let v_mpe = self.verifier.max_position_embeddings();
-            if v_mpe <= 0 || v_mpe > KV_MAX_SEQ_DEFAULT {
-                KV_MAX_SEQ_DEFAULT
-            } else {
-                v_mpe
-            }
-        });
+        // The verifier's limits bound the pair; an over-capacity `--max-ctx`
+        // is refused here rather than overflowing a cache mid-round.
+        let ctx = verifier_context(&self.verifier, max_ctx_override)?;
+        let max_seq = ctx.ceiling;
 
         tracing::info!(
             k,
@@ -477,6 +491,7 @@ impl SpeculativeDispatcher {
             .map(|i| {
                 let window = self.verifier.layer_sliding_window(i);
                 KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
+                    .with_max_seq_ceiling(ctx.ceiling)
                     .with_layer_idx(i)
                     // The stack decides whether its layers read each other's
                     // K/V, and so whether Mixed/RotK keep their bf16 mirror.
@@ -487,6 +502,7 @@ impl SpeculativeDispatcher {
             .map(|i| {
                 let window = draft.layer_sliding_window(i);
                 KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
+                    .with_max_seq_ceiling(ctx.ceiling)
                     .with_layer_idx(i)
                     .with_shares_kv(draft.shares_kv_across_layers())
             })
@@ -892,14 +908,8 @@ impl SpeculativeDispatcher {
         // Same constant the verifier resolves — a spec pair must not run two
         // different caches.
         let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-        let max_seq = max_ctx_override.unwrap_or_else(|| {
-            let v_mpe = self.verifier.max_position_embeddings();
-            if v_mpe <= 0 || v_mpe > KV_MAX_SEQ_DEFAULT {
-                KV_MAX_SEQ_DEFAULT
-            } else {
-                v_mpe
-            }
-        });
+        let ctx = verifier_context(&self.verifier, max_ctx_override)?;
+        let max_seq = ctx.ceiling;
 
         tracing::info!(
             k,
@@ -918,6 +928,7 @@ impl SpeculativeDispatcher {
             .map(|i| {
                 let window = self.verifier.layer_sliding_window(i);
                 KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
+                    .with_max_seq_ceiling(ctx.ceiling)
                     .with_layer_idx(i)
                     // The stack decides whether its layers read each other's
                     // K/V, and so whether Mixed/RotK keep their bf16 mirror.
@@ -928,6 +939,7 @@ impl SpeculativeDispatcher {
             .map(|i| {
                 let window = draft.layer_sliding_window(i);
                 KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
+                    .with_max_seq_ceiling(ctx.ceiling)
                     .with_layer_idx(i)
                     .with_shares_kv(draft.shares_kv_across_layers())
             })

@@ -42,7 +42,7 @@ use rmlx_mlx::{Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::constraint::ConstraintEngine;
-use crate::context::{resolve_context, ContextLimits, ResolvedContext};
+use crate::context::{resolve_context, ResolvedContext};
 use crate::decode_loop::{reject_nan_prefill, ProbeStep};
 use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
@@ -146,10 +146,7 @@ fn resolved_context(
     model: &Qwen3VlMoeText,
     max_ctx_override: Option<i32>,
 ) -> Result<ResolvedContext> {
-    resolve_context(
-        &ContextLimits::trained_only(model.cfg.max_position_embeddings as i32),
-        max_ctx_override,
-    )
+    resolve_context(&model.cfg.context, max_ctx_override)
 }
 
 /// Emit one decode step (token id + piece). Logit stats are left at defaults —

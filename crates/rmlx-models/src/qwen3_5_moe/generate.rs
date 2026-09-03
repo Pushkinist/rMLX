@@ -471,10 +471,7 @@ pub fn generate_greedy<'a>(
     // Issue #25: `--max-ctx` is a virtual ceiling the KV ring grows lazily up
     // to, not an eager allocation. `initial_max_seq` is the lazy start;
     // `max_seq_ceiling` caps growth and rejects over-long prompts.
-    let resolved_ctx = crate::context::resolve_context(
-        &crate::context::ContextLimits::trained_only(model.cfg.max_position_embeddings as i32),
-        max_ctx_override,
-    )?;
+    let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
     let (initial_max_seq, max_seq_ceiling) = (resolved_ctx.initial_max_seq, resolved_ctx.ceiling);
     // Prefill chunk for qwen3_5_moe comes from `arch_default` in
     // `prefill_chunk.rs`, which records the sweep behind it. The GDN recurrence runs the

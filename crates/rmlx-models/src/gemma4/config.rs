@@ -95,6 +95,10 @@ pub struct Gemma4TextConfig {
     /// From `text_config.max_position_embeddings`. Used to size the pre-allocated
     /// KV buffer (Stage-3.1). Capped to `KV_MAX_SEQ_DEFAULT` at runtime if absent.
     pub max_position_embeddings: u32,
+    /// Positional capacity of this checkpoint. The generate path reads this
+    /// rather than `max_position_embeddings`, so the fold from raw field to
+    /// context bound happens once, here.
+    pub context: crate::context::ContextLimits,
 }
 
 #[allow(
@@ -488,6 +492,8 @@ impl Gemma4TextConfig {
             .unwrap_or(0) as usize;
 
         let max_position_embeddings = tc.max_position_embeddings.unwrap_or(0);
+        // Gemma4 implements no RoPE scaling: its trained window is the limit.
+        let context = crate::context::ContextLimits::trained_only(max_position_embeddings as i32);
 
         // Parse per-tensor quant overrides from the raw quantization dict.
         // Keys like "language_model.model.layers.N.router.proj" carry {group_size, bits} overrides.
@@ -555,6 +561,7 @@ impl Gemma4TextConfig {
             top_k_experts,
             moe_intermediate_size,
             max_position_embeddings,
+            context,
             quant_overrides,
         })
     }

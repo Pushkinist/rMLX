@@ -40,7 +40,6 @@ use rmlx_mlx::{Array, Device};
 use tracing::info_span;
 
 use crate::constraint::ConstraintEngine;
-use crate::context::ContextLimits;
 use crate::decode_loop::{
     capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
     DecodeCtx,
@@ -234,10 +233,7 @@ pub fn generate_greedy<'a>(
     // `--max-ctx` is a ceiling the ring grows lazily up to, not an eager
     // allocation. `initial_max_seq` is the small lazy start; `max_seq_ceiling`
     // caps growth and rejects over-long prompts.
-    let resolved_ctx = crate::context::resolve_context(
-        &ContextLimits::trained_only(model.cfg.max_position_embeddings as i32),
-        max_ctx_override,
-    )?;
+    let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
     let (initial_max_seq, max_seq_ceiling) = (resolved_ctx.initial_max_seq, resolved_ctx.ceiling);
 
     // ------------------------------------------------------------------

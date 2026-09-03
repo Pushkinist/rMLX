@@ -120,6 +120,18 @@ impl ContextLimits {
             .max(self.scaling.map_or(0, |s| s.extended_max()))
     }
 
+    /// Largest position the checkpoint can address, as a token count.
+    ///
+    /// `None` when the architecture does not expose `max_position_embeddings`
+    /// — the resolver then accepts any `--max-ctx`, so publishing a number
+    /// here would state the opposite of the behaviour.
+    #[must_use]
+    pub fn positional_tokens(&self) -> Option<usize> {
+        usize::try_from(self.positional_max())
+            .ok()
+            .filter(|n| *n > 0)
+    }
+
     /// The half of a refusal that tells the operator what to do next.
     fn lift_hint(&self, positional_max: i32) -> String {
         if let Some(s) = self.scaling {
@@ -165,6 +177,24 @@ pub struct ResolvedContext {
     /// Size the per-layer KV ring is first allocated at. The ring grows from
     /// here toward `ceiling` as the prompt fills.
     pub initial_max_seq: i32,
+}
+
+impl ResolvedContext {
+    /// [`Self::ceiling`] as a token count.
+    ///
+    /// [`resolve_context`] never produces a non-positive ceiling — every
+    /// branch yields either a positive `--max-ctx` or a positive fallback — so
+    /// callers converting for an admission check or a report do not clamp.
+    #[must_use]
+    pub fn ceiling_tokens(&self) -> usize {
+        usize::try_from(self.ceiling).unwrap_or(0)
+    }
+
+    /// [`Self::positional_max`] as a token count, `None` when unknown.
+    #[must_use]
+    pub fn positional_tokens(&self) -> Option<usize> {
+        usize::try_from(self.positional_max).ok().filter(|n| *n > 0)
+    }
 }
 
 /// Resolve the context bounds for one run.
