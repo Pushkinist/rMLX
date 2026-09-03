@@ -51,6 +51,8 @@ from pathlib import Path
 from typing import Any
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
+from kv_boundary_default import kv_boundary_default  # noqa: E402
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default.
@@ -91,8 +93,11 @@ def weight_quant_of(model: str) -> str:
     return "bf16"
 
 
-# The engine's own default, `rmlx_models::kv_cache::KvBoundary::default`.
-KV_BOUNDARY_DEFAULT = (2, 8)
+# Column the probe records its `--kv-boundary-layers` value in.
+KV_BOUNDARY_FIELD = "kv_boundary"
+# Where `csv.DictReader` puts fields the header does not name. Checked, not
+# ignored: a non-empty bucket means the columns are shifted.
+EXTRA_FIELDS_KEY = "__unnamed_fields__"
 
 
 def decode_config_of(row: dict[str, str]) -> str | None:
@@ -105,7 +110,7 @@ def decode_config_of(row: dict[str, str]) -> str | None:
     no way to run at anything else then. That is a fact about those sweeps, not
     a substituted value.
     """
-    raw = (row.get("kv_boundary") or "").strip()
+    raw = (row.get(KV_BOUNDARY_FIELD) or "").strip()
     if not raw:
         return None
     try:
@@ -116,7 +121,7 @@ def decode_config_of(row: dict[str, str]) -> str | None:
             "Refusing rather than recording the row under the default cell — a "
             "sweep filed in the wrong cell is permanent."
         ) from None
-    if (head, tail) == KV_BOUNDARY_DEFAULT:
+    if (head, tail) == kv_boundary_default():
         return None
     return f"kv_boundary/head={head},kv_boundary/tail={tail}"
 
@@ -231,7 +236,32 @@ def main() -> int:
     args = p.parse_args()
 
     prompts_dir = Path(args.prompts_dir)
-    rows = list(csv.DictReader(Path(args.csv).open(encoding="utf-8")))
+    with Path(args.csv).open(encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, restkey=EXTRA_FIELDS_KEY)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+    # A row wider than the header means the file was appended to under a header
+    # of a different shape. The reader maps by NAME, so the surplus lands in
+    # the leftover bucket and whichever column it belonged to reads as absent —
+    # for `kv_boundary`, that files a non-default sweep under the DEFAULT cell,
+    # permanently, in an append-only table. Refuse rather than guess which
+    # column shifted.
+    surplus = [i for i, r in enumerate(rows, start=2) if r.get(EXTRA_FIELDS_KEY)]
+    if surplus:
+        raise SystemExit(
+            f"{args.csv} line(s) {surplus[:5]} carry more fields than the header names "
+            f"({len(fieldnames)}: {','.join(fieldnames)}). The file was appended to under "
+            "a header of a different shape, so every column past the first mismatch is "
+            "read under the wrong name. Refusing; split the sweep into its own file."
+        )
+    if KV_BOUNDARY_FIELD not in fieldnames:
+        # Legitimately possible: a sweep from before the probe recorded the
+        # column, when the boundary could not be anything but the default.
+        # `decode_config_of` says so; this only makes it visible.
+        print(
+            f"note: {args.csv} has no `{KV_BOUNDARY_FIELD}` column, so it predates the "
+            "flag and every row is recorded at the default boundary"
+        )
     # A failed cell emits an empty `kv_cache_bytes` and an empty digest — the
     # sha256 of nothing, which reads exactly like a real result. The exit code
     # is the column that tells the two apart, so it is the filter.

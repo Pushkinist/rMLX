@@ -1325,8 +1325,26 @@ rmlx eval ppl --model /path/to/snapshot --text-file wiki.txt \
   is the only shape in which a KV codec can move a perplexity number. It costs
   one forward per scored token, so keep `--max-tokens` modest.
 
-The emitted record carries the codec in `kv_quant` and, at a non-default
-boundary, `decode_config = 'kv_boundary/head=<h>,kv_boundary/tail=<t>'`.
+The emitted record carries the codec in `kv_quant`, the scorer in the metric
+name (`ppl_<corpus>` cacheless, `ppl_<corpus>_cached` through a cache — the two
+do not measure the same quantity and do not share a cell), and, at a
+non-default boundary, `decode_config = 'kv_boundary/head=<h>,kv_boundary/tail=<t>'`.
+
+**The two scorers are not interchangeable on Gemma4, and the metric names are
+not the only reason.** Run against each other with a bf16 cache (`--kv-quant
+none`), where they should differ only by floating-point noise, they agree
+bit-for-bit at `--ctx-window 8` on every architecture — but on Gemma4 they part
+by a margin that grows with the attended context, reaching `mean_nll` −0.123 at
+`--ctx-window 512` on `gemma-4-12B-it-mxfp8`. Qwen3 stays within ±0.003 at
+every window from 32 up. The disagreement is therefore between
+`Gemma4Text::forward_seq_logits_all` and `Gemma4Text::forward_seq_with_cache`,
+two forwards that both predate the cache-bearing scorer. Tracked as its own
+defect; the sweep that measured it is the reproduction.
+
+Consequence for a reader: compare a cached number only against another cached
+number of the same architecture. Do not read a `ppl_<corpus>_cached` value
+against a `ppl_<corpus>` one on a Gemma4 model, and do not treat either as the
+absolute perplexity of the checkpoint until that is resolved.
 
 ---
 

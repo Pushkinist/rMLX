@@ -49,6 +49,9 @@ from pathlib import Path
 from typing import Any
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
+from kv_boundary_default import kv_boundary_default  # noqa: E402
+
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default.
@@ -62,8 +65,6 @@ STAGING = RMLX_HOME / "bench" / "perf_ab" / "records"
 
 _KV_FLAG = re.compile(r"--kv-quant[= ]+(\S+)")
 _KV_BOUNDARY_FLAG = re.compile(r"--kv-boundary-layers[= ]+(\d+),(\d+)")
-# The engine's own default, `rmlx_models::kv_cache::KvBoundary::default`.
-_KV_BOUNDARY_DEFAULT = (2, 8)
 
 
 def _decode_config_of(arm_args: str) -> str | None:
@@ -81,7 +82,7 @@ def _decode_config_of(arm_args: str) -> str | None:
     if not matches:
         return None
     head, tail = (int(x) for x in matches[-1])
-    if (head, tail) == _KV_BOUNDARY_DEFAULT:
+    if (head, tail) == kv_boundary_default():
         return None
     return f"kv_boundary/head={head},kv_boundary/tail={tail}"
 
@@ -190,8 +191,13 @@ def _arm_record(
     kv_bytes, kv_note = _kv_bytes(stats)
     tainted = cell.get("taint") or ""
 
+    # The interleave pattern is read from the result file, never asserted: an
+    # `--invert` leg is BAAB and a row that calls it ABBA describes a protocol
+    # the run did not follow. A result file written before the field existed
+    # says so rather than being given a plausible value.
+    pattern = result.get("pattern") or "pattern-unrecorded"
     notes = (
-        f"perf_ab.sh ABBA n={stats['n']}/arm; decode_tps median over slots, "
+        f"perf_ab.sh {pattern} n={stats['n']}/arm; decode_tps median over slots, "
         f"min={stats['min_tps']:.3f} max={stats['max_tps']:.3f}; "
         f"verdict={cell['verdict']}; "
         f"paired arm {top['label']!r} vs "

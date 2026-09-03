@@ -1966,7 +1966,7 @@ fn main() -> Result<()> {
             yarn_original_max,
             kv_boundary_layers,
         } => {
-            rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers);
+            rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
             // load + merge the named profile (if any). Precedence is
             // CLI > profile > hard-coded default. Each bindable flag is `Option`
             // at the clap layer, so `cli.or(profile)` honours "flag not passed"
@@ -2489,7 +2489,7 @@ fn main() -> Result<()> {
             gpu_capture_steps,
             kv_boundary_layers,
         } => {
-            rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers);
+            rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
             refuse_to_measure_off_the_pin("rmlx baseline")?;
 
             // Arm the GPU-capture window before anything expensive happens: a
@@ -2639,7 +2639,7 @@ fn main() -> Result<()> {
             repetition_penalty,
             kv_boundary_layers,
         } => {
-            rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers);
+            rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
             let max_prompt_tokens = max_prompt_tokens.map(parse_max_prompt_tokens).transpose()?;
             // Same KV resolution ladder as `baseline`, so a cell benched here
             // and a cell recorded there name the same codec.
@@ -2727,7 +2727,7 @@ fn main() -> Result<()> {
                          --kv-quant (or --kv-preset / --kv-bits) as well."
                     ));
                 }
-                rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers);
+                rmlx_models::kv_cache::install_kv_boundary(kv_boundary_layers)?;
                 // Same KV resolution ladder as `baseline` and `bench`, so a
                 // codec scored here is the codec those two measure.
                 let (dev, kv_quant_resolved) = if !kv_requested {

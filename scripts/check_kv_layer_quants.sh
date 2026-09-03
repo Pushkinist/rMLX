@@ -16,12 +16,20 @@
 #   built differently.
 #
 # RULE 1 (single producer)
-#   `kv_quant_for_layer(` may only be called inside
+#   `kv_quant_for_layer(` and `active_kv_boundary(` may only be called inside
 #   crates/rmlx-models/src/kv_cache/ — the function, its producer
 #   `kv_layer_quants`, and their unit tests. Everywhere else, including tests,
 #   calls `kv_layer_quants(n_layers, base)`: an arch test that mirrors
 #   production construction has to mirror it through the same producer or it
 #   stops being a mirror.
+#
+#   `active_kv_boundary` is in the rule because it is the OTHER route to a
+#   hand-rolled loop. `kv_quant_for_layer` is not the only way to write
+#   `if i < b.head_n { floor } else { base }` — reading the counts is enough,
+#   and a copy written that way is invisible to a rule that only watches the
+#   first name. The allow-list below is the set of call sites that read the
+#   counts to REPORT them (a `decode_config` cell term), never to build a
+#   vector; each is named, so a new one is a decision rather than an accident.
 #
 # RULE 2 (declared uniformity)
 #   A non-test file under crates/rmlx-models/src that constructs per-layer
@@ -43,25 +51,47 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 POLICY_DIR="crates/rmlx-models/src/kv_cache/"
 
 # ── Rule 1 ────────────────────────────────────────────────────────────────
+# Call sites that read the boundary counts to REPORT them — the `decode_config`
+# cell term for a run — and never to build a per-layer vector. Named one by one
+# so adding another is a decision.
+BOUNDARY_REPORTERS=(
+    "crates/rmlx-cli/src/commands/baseline.rs"
+    "crates/rmlx-cli/src/commands/bench.rs"
+    "crates/rmlx-cli/src/commands/eval.rs"
+    "crates/rmlx-models/tests/kv_boundary_latch.rs"
+)
+
+is_boundary_reporter() {
+    local candidate="$1"
+    for allowed in "${BOUNDARY_REPORTERS[@]}"; do
+        [ "${candidate}" = "${allowed}" ] && return 0
+    done
+    return 1
+}
+
 rule1=()
 while IFS= read -r f; do
     rel="${f#"${REPO_ROOT}/"}"
     case "${rel}" in
         "${POLICY_DIR}"*) continue ;;
     esac
+    is_boundary_reporter "${rel}" && continue
     rule1+=("${rel}")
 done < <(
-    grep -rl --include='*.rs' 'kv_quant_for_layer(' "${REPO_ROOT}/crates" 2>/dev/null || true
+    grep -rlE --include='*.rs' '(kv_quant_for_layer|active_kv_boundary)\(' \
+        "${REPO_ROOT}/crates" 2>/dev/null || true
 )
 
 if [ ${#rule1[@]} -gt 0 ]; then
-    echo "ERROR: kv_quant_for_layer( called outside ${POLICY_DIR}:" >&2
+    echo "ERROR: kv_quant_for_layer( or active_kv_boundary( called outside ${POLICY_DIR}:" >&2
     for f in "${rule1[@]}"; do echo "  $f" >&2; done
     echo >&2
     echo "Use the single producer instead:" >&2
     echo "  let quants = kv_layer_quants(n_layers, kv_quant);   // crate::kv_cache" >&2
     echo "Two copies of the loop let the SSD layout key and the prompt-cache seed" >&2
-    echo "describe a per-layer mixture the arch no longer builds." >&2
+    echo "describe a per-layer mixture the arch no longer builds — and reading the" >&2
+    echo "boundary counts is enough to write the second copy, so that reaches here" >&2
+    echo "too. A site that only REPORTS the counts belongs in BOUNDARY_REPORTERS." >&2
     exit 1
 fi
 

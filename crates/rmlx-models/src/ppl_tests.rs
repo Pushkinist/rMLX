@@ -245,3 +245,45 @@ fn gemma4_dispatch_reaches_compute_fn() {
         "supported-arches list must mention both Qwen3 and Gemma4: {msg}"
     );
 }
+
+/// A window whose warm-up prefix reaches its last position scores nothing, and
+/// says so instead of indexing past the end.
+///
+/// `warmup == win.len() - 1` is reachable from both callers: they clamp
+/// `warmup` to `win.len() - 1`, so the final window of a corpus hits the
+/// equality whenever it is exactly one token longer than the overlap
+/// (`--ctx-window 4 --stride 2` on a 7-token corpus is the smallest case).
+/// The cacheless path's loop is already empty there; the cached path used to
+/// read `win[warmup + 1]` unconditionally and panic.
+///
+/// No model and no GPU: the guard runs before any forward, so the stub below
+/// asserts the stronger property that nothing is dispatched at all.
+#[test]
+fn a_window_with_no_scored_position_dispatches_nothing() {
+    let win = [11_u32, 22, 33];
+    let mut caches: Vec<KvCache> = Vec::new();
+    let mut sum_nll = 7.5_f64;
+    let mut count = 3_usize;
+
+    let out = score_window_through_cache(
+        &win,
+        win.len() - 1,
+        128,
+        &mut caches,
+        "qwen3",
+        Device::Cpu,
+        &mut sum_nll,
+        &mut count,
+        |_ids, _caches| unreachable!("no scored position, so no forward may run"),
+    );
+
+    assert!(out.is_ok(), "an empty window is not an error: {out:?}");
+    assert_eq!(
+        count, 3,
+        "nothing was scored, so the denominator cannot move"
+    );
+    assert!(
+        (sum_nll - 7.5).abs() < f64::EPSILON,
+        "nothing was scored, so the accumulator cannot move"
+    );
+}

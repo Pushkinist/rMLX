@@ -550,46 +550,117 @@ impl KvBoundary {
 
 static KV_BOUNDARY: std::sync::OnceLock<KvBoundary> = std::sync::OnceLock::new();
 
+/// Set the first time [`active_kv_boundary`] answers. See
+/// [`install_kv_boundary`] for what it protects.
+static KV_BOUNDARY_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Why an [`install_kv_boundary`] call was refused.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum KvBoundaryInstallError {
+    /// Something already built a per-layer vector at the default.
+    #[error(
+        "the boundary was already read (something built a per-layer vector, an SSD layout key \
+         or a prompt-cache seed at {read:?}) before this install of {requested:?}; those \
+         describe a mixture this process would no longer build"
+    )]
+    AlreadyRead {
+        /// The value the earlier reader was answered with.
+        read: KvBoundary,
+        /// The value this call tried to install.
+        requested: KvBoundary,
+    },
+    /// A second install disagrees with the first.
+    #[error("the boundary is already installed as {installed:?}; refusing to change it to {requested:?}")]
+    AlreadyInstalled {
+        /// The value in force.
+        installed: KvBoundary,
+        /// The value this call tried to install.
+        requested: KvBoundary,
+    },
+}
+
 /// Install the process-global [`KvBoundary`] read by [`kv_layer_quants`].
 ///
-/// First call wins. Called once at command startup before any model loads;
-/// `None` means the flag was not passed and the default applies. A second call
-/// with a different value is dropped with a `warn!` (mirrors
-/// `prompt_cache::install_ram_cap` and `ssd_tier::install_config`).
+/// Called once at command startup, before any model loads; `None` means the
+/// flag was not passed and the default applies. Installing the same value
+/// twice is a no-op.
 ///
 /// The boundary is process-global rather than a parameter because three places
 /// must agree on it — the arch loops that build the caches, the SSD layout key
 /// and the per-request prompt-cache seed — and a per-call parameter is exactly
 /// how two of them come to describe a mixture the third does not build.
-pub fn install_kv_boundary(boundary: Option<KvBoundary>) {
-    let boundary = boundary.unwrap_or_default();
-    if KV_BOUNDARY.set(boundary).is_err() {
-        let existing = KV_BOUNDARY.get().copied().unwrap_or_default();
-        if existing != boundary {
-            tracing::warn!(
-                ?existing,
-                requested = ?boundary,
-                "install_kv_boundary called more than once; keeping the first value"
-            );
+///
+/// # Why a read latches it
+///
+/// [`active_kv_boundary`] answers with the default when nothing is installed,
+/// so a read before the install is **indistinguishable from a default run**.
+/// Move an eager preload above the install and it builds its caches at the
+/// default while every key written afterwards describes the requested
+/// boundary: no error, no warning, and a stored block handed to a request whose
+/// layers were built differently. That is the same shape as the cache-seed
+/// drift this vector's single-producer rule exists to prevent, so a late
+/// install is an error rather than a warning — the caller cannot repair it
+/// afterwards, and continuing means running a configuration nobody asked for.
+///
+/// # Errors
+///
+/// [`KvBoundaryInstallError::AlreadyRead`] when the value has already been
+/// handed out, and [`KvBoundaryInstallError::AlreadyInstalled`] when a
+/// different value is already in force.
+pub fn install_kv_boundary(boundary: Option<KvBoundary>) -> Result<(), KvBoundaryInstallError> {
+    let requested = boundary.unwrap_or_default();
+    if let Some(&installed) = KV_BOUNDARY.get() {
+        if installed == requested {
+            return Ok(());
         }
-        return;
+        return Err(KvBoundaryInstallError::AlreadyInstalled {
+            installed,
+            requested,
+        });
+    }
+    // Checked BEFORE storing: a refused install that had already written the
+    // value would govern every later read, which is the failure this refusal
+    // exists to prevent rather than a milder version of it. Nothing is
+    // installed at this point, so the earlier reader was answered with the
+    // default.
+    if KV_BOUNDARY_READ.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(KvBoundaryInstallError::AlreadyRead {
+            read: KvBoundary::default(),
+            requested,
+        });
+    }
+    if KV_BOUNDARY.set(requested).is_err() {
+        let installed = KV_BOUNDARY.get().copied().unwrap_or_default();
+        if installed == requested {
+            return Ok(());
+        }
+        return Err(KvBoundaryInstallError::AlreadyInstalled {
+            installed,
+            requested,
+        });
     }
     tracing::info!(
-        head_n = boundary.head_n,
-        tail_n = boundary.tail_n,
-        source = if boundary == KvBoundary::default() {
+        head_n = requested.head_n,
+        tail_n = requested.tail_n,
+        source = if requested == KvBoundary::default() {
             "default"
         } else {
             "cli"
         },
         "kv boundary-layer counts installed"
     );
+    Ok(())
 }
 
 /// The active [`KvBoundary`] — the installed one, or the default when
 /// [`install_kv_boundary`] has not been called (tests / unit paths).
+///
+/// Latches: after this answers, a later install is refused rather than
+/// silently arriving too late to govern what was already built.
 #[must_use]
 pub fn active_kv_boundary() -> KvBoundary {
+    KV_BOUNDARY_READ.store(true, std::sync::atomic::Ordering::Release);
     KV_BOUNDARY.get().copied().unwrap_or_default()
 }
 

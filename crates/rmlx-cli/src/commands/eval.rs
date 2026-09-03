@@ -117,7 +117,10 @@ pub(crate) fn run_ppl(
         },
     )?;
     let score_ms = ts_score.elapsed().as_millis() as f64;
-    let decode_config = ppl_decode_config(kv_quant);
+    // `decode_config` carries the boundary and nothing else. Which scorer ran
+    // is in the metric name — see `ppl_metric_name`.
+    let decode_config =
+        kv_quant.and_then(|_| rmlx_models::kv_cache::active_kv_boundary().decode_config());
     info!(
         ppl = report.ppl,
         mean_nll = report.mean_nll,
@@ -175,28 +178,27 @@ pub(crate) fn run_ppl(
     })
 }
 
-/// The `decode_config` cell term for one PPL run (`docs/METRICS_DB.md` §3.2).
+/// The metric name for a PPL run, which says which scorer produced the number.
 ///
-/// The scorer has two modes and they are two engine configurations, not two
-/// samples of one: the default forwards each window once with no cache at all,
-/// and asking for a codec teacher-forces the window through a real per-layer
-/// cache. Both would otherwise land as `kv_quant = 'none'` with no
-/// `decode_config`, in one cell, where a cacheless number and a bf16-cache
-/// number rank against each other.
+/// The two scorers do not measure the same quantity. The default forwards each
+/// window once with no cache at all; asking for a codec teacher-forces the
+/// window through a real per-layer cache, one forward per scored token. That is
+/// a change to what the number *means*, not an engine setting a run moved off
+/// its default — so it belongs in the metric name and not in `decode_config`,
+/// which stays the boundary's alone. Keeping one name for both would rank a
+/// cacheless number against a cached one in `bests` and in
+/// `metrics export --markdown`, and against `mlx_lm` rows that can never carry
+/// a term this engine invented.
 ///
-/// `None` is the default scorer at the default boundary, which is what every
-/// PPL row recorded before either flag existed carries.
-fn ppl_decode_config(kv_quant: Option<rmlx_kv_quant::KvQuant>) -> Option<String> {
-    kv_quant?;
-    // Terms are ordered by key: `kv_boundary/*` sorts before `ppl/scorer`.
-    let mut terms = rmlx_models::kv_cache::active_kv_boundary()
-        .decode_config()
-        .unwrap_or_default();
-    if !terms.is_empty() {
-        terms.push(',');
+/// `ppl_<corpus_id>` so multiple corpora coexist (`ppl_wikitext2`, future
+/// `ppl_c4`); `_cached` suffixed for the cache-bearing scorer.
+fn ppl_metric_name(corpus: &str, kv_quant: Option<rmlx_kv_quant::KvQuant>) -> String {
+    let base = format!("ppl_{}", corpus.replace('-', ""));
+    if kv_quant.is_some() {
+        format!("{base}_cached")
+    } else {
+        base
     }
-    terms.push_str("ppl/scorer=cached");
-    Some(terms)
 }
 
 /// Everything [`record_ppl_run`] needs to emit one §8.5 record.
@@ -324,9 +326,7 @@ fn build_ppl_run_record(
         .map_err(|e| anyhow::anyhow!("split_model_path({snapshot_str}): {e}"))?;
     let ts_utc = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    // Op-name pattern: `ppl_<corpus_id>` so multiple corpora can coexist in
-    // the same table (`ppl_wikitext2`, future `ppl_c4`, ...).
-    let op_name = format!("ppl_{}", corpus.replace('-', ""));
+    let op_name = ppl_metric_name(corpus, kv_quant);
 
     let metrics = serde_json::json!([
         { "name": op_name,         "value": report.ppl },

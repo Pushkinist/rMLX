@@ -200,26 +200,66 @@ fn build_record_reports_the_codec_and_boundary_it_scored_at() {
     );
 }
 
-/// The two scorers are two engine configurations, so they do not share a cell.
+/// The two scorers measure different quantities, so they carry different
+/// metric names — not one name plus a `decode_config` term.
 ///
-/// Without the `ppl/scorer` term a cacheless run and a bf16-cache run both land
-/// as `kv_quant = 'none'` with `decode_config` NULL, and `bests` ranks a number
-/// produced by a full-window forward against one produced by a decode loop.
+/// Sharing a name would rank a full-window-forward number against a decode-loop
+/// number in `bests` and in `metrics export --markdown`, and a `decode_config`
+/// discriminator would additionally split those cells away from every `mlx_lm`
+/// row, which can never carry a term this engine invented.
 #[test]
-fn the_two_scorers_do_not_share_a_cell() {
+fn the_two_scorers_do_not_share_a_metric() {
+    assert_eq!(ppl_metric_name("wikitext-2", None), "ppl_wikitext2");
     assert_eq!(
-        ppl_decode_config(None),
+        ppl_metric_name("wikitext-2", Some(rmlx_kv_quant::KvQuant::Iso3Sym)),
+        "ppl_wikitext2_cached"
+    );
+    assert_ne!(
+        ppl_metric_name("wikitext-2", None),
+        ppl_metric_name("wikitext-2", Some(rmlx_kv_quant::KvQuant::None)),
+        "a bf16 cache is still a cache: it does not share the cacheless metric"
+    );
+}
+
+/// `decode_config` is the boundary's alone. A cached run at the default
+/// boundary carries none, so it ranks against every row of its own metric
+/// rather than being fenced off in a cell of one.
+#[test]
+fn the_scorer_mode_is_not_a_decode_config_term() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("m5");
+    std::fs::create_dir_all(&model_dir).expect("mkdir m5");
+    let report = ppl::PplReport {
+        ppl: 1.0,
+        mean_nll: 0.0,
+        scored_tokens: 1,
+        windows: 1,
+    };
+    let rec = build_ppl_run_record(
+        "20260526-120000-0.2.8",
+        &model_dir,
+        "wikitext-2",
+        16,
+        8,
+        1,
+        &report,
+        0.0,
+        0.0,
+        "bf16",
         None,
-        "the default scorer is the default"
-    );
-    assert_eq!(
-        ppl_decode_config(Some(rmlx_kv_quant::KvQuant::None)).as_deref(),
-        Some("ppl/scorer=cached"),
-    );
-    let config = ppl_decode_config(Some(rmlx_kv_quant::KvQuant::Iso3Sym))
-        .expect("a cached run carries a term");
+        Some(rmlx_kv_quant::KvQuant::Iso3Sym),
+        None,
+    )
+    .expect("record builds");
+    assert!(rec["decode_config"].is_null());
+    let names: Vec<&str> = rec["metrics"]
+        .as_array()
+        .expect("metrics array")
+        .iter()
+        .filter_map(|m| m["name"].as_str())
+        .collect();
     assert!(
-        rmlx_metrics::cell::decode_config_is_well_formed(&config),
-        "{config} is not a well-formed decode_config"
+        names.contains(&"ppl_wikitext2_cached"),
+        "the cached scorer names its own metric: {names:?}"
     );
 }

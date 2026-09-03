@@ -111,6 +111,18 @@ pub struct PplReport {
 ///   single-token step, so each NLL is read off the decode path the served
 ///   model runs. This is the only shape in which a KV codec can affect a
 ///   perplexity number at all — a scorer that keeps no cache cannot measure one.
+///
+/// **The two are not interchangeable on Gemma4.** At a bf16 cache the modes
+/// should differ only by floating-point noise, and they agree bit-for-bit at
+/// `ctx_window = 8` on every architecture. On Qwen3 they stay within ±0.003 of
+/// `mean_nll` at every window from 32 up. On Gemma4 they part by a margin that
+/// grows with the attended context, reaching −0.123 at `ctx_window = 512` on
+/// `gemma-4-12B-it-mxfp8` — a disagreement between
+/// [`Gemma4Text::forward_seq_logits_all`] and
+/// `Gemma4Text::forward_seq_with_cache`, both of which predate this parameter
+/// and neither of which this parameter changes. Compare a cached number only
+/// against another cached number of the same architecture until that is
+/// resolved.
 #[instrument(skip(arch, tokens), fields(arch_class = arch.arch_class(), n_tokens = tokens.len(), ctx_window, stride, ?kv_quant))]
 #[allow(
     clippy::wildcard_enum_match_arm,
@@ -187,7 +199,7 @@ fn accumulate_position_nll(
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    reason = "every index below is behind the `warmup + 1 < win.len()` guard at the top or the loop's own `t < last_scored` bound"
 )]
 fn score_window_through_cache(
     win: &[u32],
@@ -200,6 +212,16 @@ fn score_window_through_cache(
     count: &mut usize,
     mut forward: impl FnMut(&[u32], &mut Vec<KvCache>) -> Result<Array>,
 ) -> Result<()> {
+    // A window whose warm-up prefix reaches its last position has no scored
+    // position at all: `t` predicts `win[t + 1]`, and there is no `t + 1`. The
+    // callers clamp `warmup` to `win.len() - 1`, so the final window of a
+    // corpus hits that equality whenever it is one token longer than the
+    // overlap. The cacheless path's `for t in warmup..(win.len() - 1)` is
+    // already empty there; this is the same statement, made before any GPU
+    // work rather than by indexing past the end.
+    if win.get(warmup + 1).is_none() {
+        return Ok(());
+    }
     let last_scored = win.len() - 1; // exclusive: position t predicts win[t+1]
     let prefill_logits = chunked_prefill(
         caches,

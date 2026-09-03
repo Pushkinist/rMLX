@@ -8,7 +8,9 @@
 //! `kv_layer_quants` reads.
 
 use rmlx_kv_quant::KvQuant;
-use rmlx_models::kv_cache::{install_kv_boundary, kv_layer_quants, KvBoundary};
+use rmlx_models::kv_cache::{
+    install_kv_boundary, kv_layer_quants, KvBoundary, KvBoundaryInstallError,
+};
 
 const BASE: KvQuant = KvQuant::Mixed {
     k_bits: 4,
@@ -18,18 +20,16 @@ const BASE: KvQuant = KvQuant::Mixed {
 };
 
 #[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test asserts the install contract itself: an unexpected Err must fail loudly with the reason attached"
+)]
 fn installed_boundary_is_the_one_the_producer_uses() {
-    let default_promoted = promoted_indices(&kv_layer_quants(12, BASE, false));
-    assert_eq!(
-        default_promoted,
-        vec![0, 1, 4, 5, 6, 7, 8, 9, 10, 11],
-        "before any install the producer runs the shipped 2 head + 8 tail counts"
-    );
-
     install_kv_boundary(Some(KvBoundary {
         head_n: 1,
         tail_n: 2,
-    }));
+    }))
+    .expect("the first install, before any read, is accepted");
 
     assert_eq!(
         promoted_indices(&kv_layer_quants(12, BASE, false)),
@@ -37,15 +37,30 @@ fn installed_boundary_is_the_one_the_producer_uses() {
         "the producer reads the installed counts, not the constants"
     );
 
-    // First call wins: a later, different install is dropped rather than
-    // re-pointing a stack that is already built.
+    // Re-installing the same value is a no-op, not a conflict: two startup
+    // paths agreeing about the configuration is not an error.
     install_kv_boundary(Some(KvBoundary {
+        head_n: 1,
+        tail_n: 2,
+    }))
+    .expect("an install that agrees with the one in force changes nothing");
+
+    // A later, different install is refused. Accepting it would re-point a
+    // policy that has already built caches, an SSD layout key and a
+    // prompt-cache seed.
+    let err = install_kv_boundary(Some(KvBoundary {
         head_n: 5,
         tail_n: 5,
-    }));
+    }))
+    .expect_err("a second, different install must be refused");
+    assert!(
+        matches!(err, KvBoundaryInstallError::AlreadyInstalled { .. }),
+        "expected AlreadyInstalled, got {err:?}"
+    );
     assert_eq!(
         promoted_indices(&kv_layer_quants(12, BASE, false)),
         vec![0, 10, 11],
+        "the refused install changed nothing"
     );
 }
 

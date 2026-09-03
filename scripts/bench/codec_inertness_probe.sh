@@ -165,9 +165,26 @@ fi
 BINARY_SHA="$(shasum -a 256 "$BINARY" | cut -c1-12)"
 MODEL_NAME="$(basename "$MODEL")"
 
+HEADER="timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha,kv_boundary"
+
 mkdir -p "$(dirname "$OUT")"
 if [[ ! -f "$OUT" ]]; then
-	echo "timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha,kv_boundary" >"$OUT"
+	echo "$HEADER" >"$OUT"
+else
+	# Appending rows of one shape under a header of another is silent: the
+	# reader maps by NAME, so an extra trailing field lands in the leftover
+	# bucket and the column it belonged to reads as absent. For `kv_boundary`
+	# that means a `0,0` sweep filed under the DEFAULT cell, permanently, in
+	# an append-only table. Refuse instead; a second file costs nothing.
+	existing="$(head -1 "$OUT")"
+	if [[ "$existing" != "$HEADER" ]]; then
+		echo "ERROR: $OUT has a header this probe does not write." >&2
+		echo "  on disk: $existing" >&2
+		echo "  writing: $HEADER" >&2
+		echo "Appending would put every row's columns under the wrong names." >&2
+		echo "Pass --out with a new path." >&2
+		exit 2
+	fi
 fi
 
 preflight() {
