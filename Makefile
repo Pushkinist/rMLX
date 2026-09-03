@@ -274,11 +274,13 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 # whose numbers get recorded. VALIDATE=0 opts out.
 #
 # The hits it observes are compared against scripts/gpu_validation_census.txt,
-# which pins the ones this tree has already accounted for. An exact match passes
-# and prints what it accepted; a new kernel, a count that moved either way, a
-# pinned kernel that went silent, or any store fails and names the delta. That
-# is what keeps a standing diagnostic from a kernel we do not own out of the
-# exit code, where it would train everyone to read a red run as noise.
+# which pins the ones this tree has already accounted for, one count per
+# originating test. The expectation is the sum over the tests that actually ran,
+# so a narrowed run and a machine with no snapshots are still compared exactly;
+# a new kernel, a count that moved either way, a pinned kernel that went silent,
+# or any store fails and names the delta. That is what keeps a standing
+# diagnostic from a kernel we do not own out of the exit code, where it would
+# train everyone to read a red run as noise.
 gpu-test:        ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation (CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation); needs exclusive machine access
 	@bash scripts/run_gpu_tests.sh $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
 		$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)

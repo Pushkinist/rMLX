@@ -89,13 +89,22 @@
 #   A tree can carry a diagnostic from a kernel it does not own and cannot fix.
 #   Failing every run on it is the inverse of a vacuous gate: the exit code stops
 #   carrying information, and the next real hit arrives inside a standing one.
-#   So `scripts/gpu_validation_census.txt` pins the accepted hits — kernel,
-#   access kind, exact count, and the analysis each rests on — and this script
+#   So `scripts/gpu_validation_census.txt` pins the accepted hits and this script
 #   diffs the tally it just computed against that file. An exact match is a pass
 #   that prints the census it accepted. A new kernel, a count that moved in
 #   either direction, any store, or a pinned kernel that stopped firing is a
 #   failure naming the delta. The diff is over the file's contents alone; no
 #   kernel name appears in this script.
+#
+#   One entry per ORIGINATING TEST, with that test's own hit count, and the
+#   expectation for a (crate, kind, kernel) is the sum over the entries whose
+#   test actually ran. That is what makes the comparison exact in a narrowed run
+#   and on a machine with no snapshots, instead of waived there: a test that was
+#   filtered out, or that skipped for want of its model, contributes 0 to the
+#   expectation and nothing is excused. Whether a test skipped is OBSERVED, from
+#   the `SKIP <test>: <why>` notice its own gate prints — which is why the tests
+#   run under `--nocapture`, since libtest discards a passing test's output.
+#   An entry's test must therefore print a NAMED skip notice.
 #
 # USAGE
 #   bash scripts/run_gpu_tests.sh
@@ -252,27 +261,6 @@ trim() {
     printf '%s' "${s}"
 }
 
-# Why this entry's count cannot be required to be met in full on this run, if it
-# cannot. Empty output = it can, and a shortfall is a stale pin.
-#
-# Two reasons, and both are structural rather than a waiver. A narrowed run
-# visits a subset of the population and observes fewer hits by construction —
-# enforcing the pinned total there would make every `CRATE=`-narrowed iteration
-# red, which is the state this mechanism exists to remove. And an entry reached
-# only through a model snapshot cannot fire on a machine that does not hold that
-# snapshot; the suite's contract is already that such a cell skips and counts as
-# passed. Neither exemption touches the other direction: an excess count, an
-# unpinned kernel and any store fail in every run.
-census_downward_exemption() {
-    local snapshot="$1"
-    if [ -n "${ONLY_CRATE}" ] || [ -n "${FILTER}" ]; then
-        printf 'narrowed run'
-    elif [ "${snapshot}" != "-" ] &&
-         { [ -z "${RMLX_O_MODELS_ROOT:-}" ] || [ ! -d "${RMLX_O_MODELS_ROOT}/${snapshot}" ]; }; then
-        printf 'snapshot %s is not under RMLX_O_MODELS_ROOT' "${snapshot}"
-    fi
-}
-
 # Same environment the crates run under, hoisted so the canary above can use it.
 # `${arr[@]+"${arr[@]}"}` is the portable spelling: mtl_unset is empty whenever
 # the caller exported no MTL_* names, and expanding an empty array is an
@@ -380,6 +368,7 @@ total_failed=0
 validation_hits=""
 validation_kinds=""
 validation_records=""
+validation_skips=""
 
 if [ "${SHADER_VALIDATION}" = "1" ]; then
     echo "shader validation: ON (invalid Metal memory access fails this run)"
@@ -460,8 +449,13 @@ for crate in "${crates[@]}"; do
     validation_prefix=(env)
     [ "${SHADER_VALIDATION}" = "1" ] &&
         validation_prefix=(env ${mtl_unset[@]+"${mtl_unset[@]}"} "${mtl_validation_env[@]}")
+    # `--nocapture` because this gate reads the tests' own words. libtest
+    # discards a passing test's output, and a model-gated cell that skips is a
+    # passing test — so without it the `SKIP <name>:` notice the census
+    # expectation is built from never reaches the log, and every skipped cell
+    # would look like one that ran and found nothing.
     "${validation_prefix[@]}" cargo test --no-fail-fast -p "${crate}" --tests -- \
-        --ignored --test-threads=1 "${filters[@]}" 2>&1 | tee "${log}"
+        --ignored --test-threads=1 --nocapture "${filters[@]}" 2>&1 | tee "${log}"
     rc=${PIPESTATUS[0]}
 
     counts="$(awk '
@@ -513,8 +507,18 @@ for crate in "${crates[@]}"; do
             validation_hits="${validation_hits}${hits}"$'\n'
             validation_kinds="${validation_kinds}$(printf '%s\n' "${records}" \
                                                   | awk -F'\t' 'NF == 2 { print $1 }')"$'\n'
-            validation_records="${validation_records}${records}"$'\n'
+            validation_records="${validation_records}$(printf '%s\n' "${records}" \
+                                                      | awk -F'\t' -v c="${crate}" \
+                                                            'NF == 2 { print c "\t" $0 }')"$'\n'
         fi
+        # A model-gated cell announces its own skip. Harvesting it is what lets
+        # the census expectation drop that cell's count instead of waiving the
+        # whole entry on a guess about which snapshots are installed. The notice
+        # routinely shares a line with libtest's `test <name> ... ` prefix under
+        # --nocapture, so this is not line-anchored.
+        validation_skips="${validation_skips}$(grep -Eo 'SKIP [A-Za-z_][A-Za-z0-9_]*:' "${log}" \
+            | awk -v c="${crate}" '{ sub(/^SKIP /, ""); sub(/:$/, ""); print c "\t" $0 }' \
+            | sort -u)"$'\n'
     fi
     rm -f "${log}"
     crate_passed=${counts% *}
@@ -568,27 +572,30 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
     # Parse the pin. A malformed entry is a failure rather than a skipped line:
     # a typo that silently drops an entry would turn its kernel's hits into
     # unpinned ones on the next run, and the reader would chase a delta the file
-    # only appears to cover.
+    # only appears to cover. A test name that no longer exists is refused for the
+    # same reason in reverse — it would drop that entry's count from every
+    # expectation for ever, and the entry would stop being able to fail.
     pin_entries=""
     pin_errors=""
     pin_lineno=0
-    if [ -f "${CENSUS_PIN}" ]; then
+    if [ ! -f "${CENSUS_PIN}" ]; then
+        pin_errors="    ${CENSUS_PIN} not found — the census pin is tracked; restore it rather than running without one"$'\n'
+    else
         while IFS= read -r pin_line || [ -n "${pin_line}" ]; do
             pin_lineno=$((pin_lineno + 1))
             case "$(trim "${pin_line}")" in ''|'#'*) continue ;; esac
-            IFS='|' read -r p_kernel p_kind p_count p_crate p_test p_snapshot p_ref p_extra \
+            IFS='|' read -r p_kernel p_kind p_count p_crate p_test p_ref p_extra \
                 <<< "${pin_line}"
             p_kernel="$(trim "${p_kernel}")"
             p_kind="$(trim "${p_kind}")"
             p_count="$(trim "${p_count}")"
             p_crate="$(trim "${p_crate}")"
             p_test="$(trim "${p_test}")"
-            p_snapshot="$(trim "${p_snapshot}")"
             p_ref="$(trim "${p_ref}")"
             if [ -z "${p_kernel}" ] || [ -z "${p_kind}" ] || [ -z "${p_count}" ] ||
-               [ -z "${p_crate}" ] || [ -z "${p_test}" ] || [ -z "${p_snapshot}" ] ||
-               [ -z "${p_ref}" ] || [ -n "${p_extra}" ]; then
-                pin_errors="${pin_errors}    line ${pin_lineno}: expected 7 fields — kernel | kind | count | crate | test | snapshot | reference"$'\n'
+               [ -z "${p_crate}" ] || [ -z "${p_test}" ] || [ -z "${p_ref}" ] ||
+               [ -n "${p_extra}" ]; then
+                pin_errors="${pin_errors}    line ${pin_lineno}: expected 6 fields — kernel | kind | count | crate | test | reference"$'\n'
                 continue
             fi
             case "${p_count}" in
@@ -602,72 +609,96 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
                 *store*) pin_errors="${pin_errors}    line ${pin_lineno}: a store is never pinnable — an invalid write is corruption, not a validated-benign read"$'\n'
                          continue ;;
             esac
+            case "${p_test}" in
+                *[!A-Za-z0-9_]*) pin_errors="${pin_errors}    line ${pin_lineno}: test '${p_test}' is not a single test fn name — one entry per originating test"$'\n'
+                                 continue ;;
+            esac
+            case $'\n'"${listing}"$'\n' in
+                *$'\n'"${p_crate}"$'\t'"${p_test}"$'\n'*) ;;
+                *) pin_errors="${pin_errors}    line ${pin_lineno}: ${p_crate} has no classified GPU test '${p_test}' — a renamed or deleted test would silently drop this entry from every expectation"$'\n'
+                   continue ;;
+            esac
             case "${pin_entries}" in
-                *"${p_kind}"$'\t'"${p_kernel}"$'\t'*)
-                    pin_errors="${pin_errors}    line ${pin_lineno}: \"${p_kernel}\" ${p_kind} is pinned twice — one entry per kernel and kind, or the counts cannot be compared"$'\n'
+                *"${p_crate}"$'\t'"${p_kind}"$'\t'"${p_kernel}"$'\t'"${p_test}"$'\t'*)
+                    pin_errors="${pin_errors}    line ${pin_lineno}: \"${p_kernel}\" ${p_kind} in ${p_crate} is pinned twice for ${p_test} — one entry per kernel, kind and test"$'\n'
                     continue ;;
             esac
-            pin_entries="${pin_entries}${p_kind}"$'\t'"${p_kernel}"$'\t'"${p_count}"$'\t'"${p_crate}"$'\t'"${p_test}"$'\t'"${p_snapshot}"$'\t'"${p_ref}"$'\n'
+            pin_entries="${pin_entries}${p_crate}"$'\t'"${p_kind}"$'\t'"${p_kernel}"$'\t'"${p_test}"$'\t'"${p_count}"$'\t'"${p_ref}"$'\n'
         done < "${CENSUS_PIN}"
     fi
 
     census_deviations=""
     census_accepted=""
     census_notes=""
-    census_matched=""
 
+    # Per (crate, kind, kernel): a hit that moved from one crate to another at
+    # the same total is a change in what the suite does, not a match.
     observed_tally="$(printf '%s' "${validation_records}" \
-        | awk -F'\t' 'NF == 2 { n[$0]++ } END { for (k in n) printf "%d\t%s\n", n[k], k }')"
+        | awk -F'\t' 'NF == 3 { n[$0]++ } END { for (k in n) printf "%s\t%d\n", k, n[k] }')"
 
-    while IFS=$'\t' read -r o_count o_kind o_kernel; do
-        [ -z "${o_kind}" ] && continue
-        case "${o_kind}" in
+    census_keys="$(printf '%s\n%s\n' \
+        "$(printf '%s' "${observed_tally}" | awk -F'\t' 'NF == 4 { print $1 "\t" $2 "\t" $3 }')" \
+        "$(printf '%s' "${pin_entries}" | awk -F'\t' 'NF == 6 { print $1 "\t" $2 "\t" $3 }')" \
+        | grep -v '^$' | sort -u)"
+
+    while IFS=$'\t' read -r k_crate k_kind k_kernel; do
+        [ -z "${k_kernel}" ] && continue
+        observed=0
+        while IFS=$'\t' read -r o_crate o_kind o_kernel o_count; do
+            if [ "${o_crate}" = "${k_crate}" ] && [ "${o_kind}" = "${k_kind}" ] &&
+               [ "${o_kernel}" = "${k_kernel}" ]; then
+                observed="${o_count}"
+            fi
+        done <<< "${observed_tally}"
+
+        case "${k_kind}" in
             *store*)
-                census_deviations="${census_deviations}    never accepted: ${o_count} ${o_kind} \"${o_kernel}\" — an invalid write is corruption, not a validated-benign read"$'\n'
+                census_deviations="${census_deviations}    never accepted: ${observed} ${k_kind} \"${k_kernel}\" in ${k_crate} — an invalid write is corruption, not a validated-benign read"$'\n'
                 continue ;;
         esac
-        entry=""
-        while IFS= read -r pin_entry; do
-            case "${pin_entry}" in
-                "${o_kind}"$'\t'"${o_kernel}"$'\t'*) entry="${pin_entry}" ;;
-            esac
-        done <<< "${pin_entries}"
-        if [ -z "${entry}" ]; then
-            census_deviations="${census_deviations}    not pinned: ${o_count} ${o_kind} \"${o_kernel}\""$'\n'
-            continue
-        fi
-        IFS=$'\t' read -r e_kind e_kernel e_count e_crate e_test e_snapshot e_ref <<< "${entry}"
-        census_matched="${census_matched}${e_kind}"$'\t'"${e_kernel}"$'\n'
-        if [ "${o_count}" -gt "${e_count}" ]; then
-            census_deviations="${census_deviations}    count moved up: \"${o_kernel}\" ${o_kind} — pinned ${e_count}, observed ${o_count}"$'\n'
-        elif [ "${o_count}" -lt "${e_count}" ]; then
-            exemption="$(census_downward_exemption "${e_snapshot}")"
-            if [ -z "${exemption}" ]; then
-                census_deviations="${census_deviations}    count moved down: \"${o_kernel}\" ${o_kind} — pinned ${e_count}, observed ${o_count}"$'\n'
-            else
-                census_notes="${census_notes}    not enforced downward: \"${o_kernel}\" ${o_kind} — pinned ${e_count}, observed ${o_count} (${exemption})"$'\n'
-            fi
-        else
-            census_accepted="${census_accepted}    ${o_count} ${o_kind} \"${o_kernel}\""$'\n'
-            census_accepted="${census_accepted}        reached from: ${e_crate} / ${e_test}"$'\n'
-            census_accepted="${census_accepted}        validated by: ${e_ref}"$'\n'
-        fi
-    done <<< "${observed_tally}"
 
-    # A pinned kernel that stopped firing is only visible from the pin's side:
-    # the observed tally has no line to carry it. It means the pin is stale, and
-    # a stale pin is one that no longer describes what it claims to have
-    # validated.
-    while IFS=$'\t' read -r e_kind e_kernel e_count e_crate e_test e_snapshot e_ref; do
-        [ -z "${e_kind}" ] && continue
-        case "${census_matched}" in *"${e_kind}"$'\t'"${e_kernel}"$'\n'*) continue ;; esac
-        exemption="$(census_downward_exemption "${e_snapshot}")"
-        if [ -z "${exemption}" ]; then
-            census_deviations="${census_deviations}    no longer fires: \"${e_kernel}\" ${e_kind} — pinned ${e_count}, observed 0"$'\n'
-        else
-            census_notes="${census_notes}    not enforced downward: \"${e_kernel}\" ${e_kind} — pinned ${e_count}, observed 0 (${exemption})"$'\n'
+        # The expectation is the sum over the entries whose test RAN. A test the
+        # selection dropped, or one that announced its own skip, contributes 0 —
+        # so a narrowed run and a machine with no snapshots are both compared
+        # exactly, against a smaller number.
+        expected=0
+        pinned_here=0
+        key_accepted=""
+        while IFS=$'\t' read -r e_crate e_kind e_kernel e_test e_count e_ref; do
+            [ -z "${e_kernel}" ] && continue
+            [ "${e_crate}" = "${k_crate}" ] || continue
+            [ "${e_kind}" = "${k_kind}" ] || continue
+            [ "${e_kernel}" = "${k_kernel}" ] || continue
+            pinned_here=$((pinned_here + 1))
+            case $'\n'"${selected}" in
+                *$'\n'"${e_crate}"$'\t'"${e_test}"$'\n'*) ;;
+                *) census_notes="${census_notes}    not enforced in full: \"${e_kernel}\" ${e_kind} in ${e_crate} — ${e_test} was not selected, so its ${e_count} are not expected"$'\n'
+                   continue ;;
+            esac
+            case $'\n'"${validation_skips}" in
+                *$'\n'"${e_crate}"$'\t'"${e_test}"$'\n'*)
+                   census_notes="${census_notes}    not enforced in full: \"${e_kernel}\" ${e_kind} in ${e_crate} — ${e_test} skipped, so its ${e_count} are not expected"$'\n'
+                   continue ;;
+            esac
+            expected=$((expected + e_count))
+            key_accepted="${key_accepted}        ${e_test} = ${e_count} — ${e_ref}"$'\n'
+        done <<< "${pin_entries}"
+
+        if [ "${pinned_here}" -eq 0 ]; then
+            census_deviations="${census_deviations}    not pinned: ${observed} ${k_kind} \"${k_kernel}\" in ${k_crate}"$'\n'
+        elif [ "${observed}" -gt "${expected}" ]; then
+            census_deviations="${census_deviations}    count moved up: \"${k_kernel}\" ${k_kind} in ${k_crate} — expected ${expected}, observed ${observed}"$'\n'
+        elif [ "${observed}" -lt "${expected}" ]; then
+            if [ "${observed}" -eq 0 ]; then
+                census_deviations="${census_deviations}    no longer fires: \"${k_kernel}\" ${k_kind} in ${k_crate} — expected ${expected}, observed 0"$'\n'
+            else
+                census_deviations="${census_deviations}    count moved down: \"${k_kernel}\" ${k_kind} in ${k_crate} — expected ${expected}, observed ${observed}"$'\n'
+            fi
+        elif [ "${observed}" -gt 0 ]; then
+            census_accepted="${census_accepted}    ${observed} ${k_kind} \"${k_kernel}\" in ${k_crate}"$'\n'
+            census_accepted="${census_accepted}${key_accepted}"
         fi
-    done <<< "${pin_entries}"
+    done <<< "${census_keys}"
 
     if [ -n "${pin_errors}${census_deviations}" ]; then
         if [ -n "${validation_hits}" ]; then
@@ -686,16 +717,23 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
         printf '%s' "${pin_errors}${census_deviations}${census_notes}" >&2
         echo >&2
         echo "Pin: ${CENSUS_PIN}" >&2
-        echo "A hit that matches the pin exactly is accepted; anything else is new." >&2
-        echo "Extend the pin only for a hit whose analysis says it is benign, with the" >&2
-        echo "reference to that analysis in the entry. A count that moved down, or a" >&2
-        echo "kernel that stopped firing, means the pin is stale: re-derive it from a" >&2
-        echo "full run rather than editing it to fit this one. See docs/TESTING.md." >&2
+        echo "The expectation is the sum of the pinned counts whose test ran; anything" >&2
+        echo "else observed is new. Extend the pin only for a hit whose analysis says it" >&2
+        echo "is benign, with the reference to that analysis in the entry. A count that" >&2
+        echo "came in under the expectation, or a kernel that stopped firing, means the" >&2
+        echo "pin is stale: re-derive it from a full run rather than editing it to fit" >&2
+        echo "this one. See docs/TESTING.md." >&2
         echo >&2
         red=1
-    elif [ -n "${census_accepted}${census_notes}" ]; then
-        echo "shader validation: census matches the pin (${CENSUS_PIN#"${REPO_ROOT}"/})"
+    elif [ -n "${census_notes}" ]; then
+        # Deliberately not the wording of a full match: this run could not check
+        # every entry, and a reader who sees the same sentence either way learns
+        # nothing from it.
+        echo "shader validation: census NOT enforced in full (${CENSUS_PIN#"${REPO_ROOT}"/})"
         printf '%s' "${census_accepted}${census_notes}"
+    elif [ -n "${census_accepted}" ]; then
+        echo "shader validation: census matches the pin (${CENSUS_PIN#"${REPO_ROOT}"/})"
+        printf '%s' "${census_accepted}"
     fi
 fi
 
@@ -728,7 +766,9 @@ if [ -n "${snapshot_root_note}" ]; then
 else
     incomplete=""
 fi
-if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${validation_records}" ]; then
+if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${census_notes}" ]; then
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader-validation census NOT enforced in full (see above).${incomplete}"
+elif [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${census_accepted}" ]; then
     echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader validation matches the pinned census.${incomplete}"
 elif [ "${SHADER_VALIDATION}" = "1" ]; then
     echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader validation clean.${incomplete}"
