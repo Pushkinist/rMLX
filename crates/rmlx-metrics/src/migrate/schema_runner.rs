@@ -44,6 +44,9 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
         if target_version == 6 {
             backfill_decode_config(conn)?;
         }
+        if target_version == 7 {
+            null_default_decode_config(conn)?;
+        }
 
         applied += 1;
     }
@@ -104,6 +107,49 @@ fn backfill_decode_config(conn: &Connection) -> Result<usize> {
     }
 
     Ok(filled)
+}
+
+/// Replace a `decode_config` that spells the engine's own defaults with NULL.
+///
+/// §3.2 makes `NULL` the engine at its defaults, so a row spelling them out is
+/// a second spelling of one configuration — and two spellings are two cells
+/// that never rank against each other. `RunRecord::validate` refuses such a
+/// record now; this brings the rows written before it did into the same cell
+/// they always belonged in.
+///
+/// Writes no measurement: it rewrites how a row says the engine was configured,
+/// on rows whose configuration was the default. The predicate is
+/// [`crate::cell::decode_config_is_all_defaults`], reading the engine's own
+/// constants — not a SQL literal, which would be a second copy of the values
+/// this column exists to keep honest.
+///
+/// Returns how many rows were moved to the default cell.
+fn null_default_decode_config(conn: &Connection) -> Result<usize> {
+    let spellings: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT decode_config FROM observations WHERE decode_config IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut moved = 0_usize;
+    for spelling in spellings {
+        if !crate::cell::decode_config_is_all_defaults(&spelling) {
+            continue;
+        }
+        let n = conn.execute(
+            "UPDATE observations SET decode_config = NULL WHERE decode_config = ?1",
+            rusqlite::params![spelling],
+        )?;
+        tracing::info!(
+            rows = n,
+            %spelling,
+            "migrate: decode_config spelled the engine defaults; moved to the default cell"
+        );
+        moved += n;
+    }
+    Ok(moved)
 }
 
 /// Insert the well-known `schema_meta` seed rows.

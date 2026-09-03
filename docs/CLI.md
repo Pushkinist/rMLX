@@ -97,6 +97,7 @@ mutually exclusive.
 | `--cache-type-v` / `--ctv` | string | — | Per-side codec for the V (value) tensor. Mutually exclusive with `--kv-quant`. |
 | `--kv-bits` | float | — | Bit-width alias (integer or fractional, e.g. `4`, `3.5`). Mutually exclusive with `--kv-quant` and `--cache-type-*`. See KV-bits mapping below. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. Requires `--kv-bits`. |
+| `--kv-boundary-layers` | `HEAD,TAIL` | `2,8` | Head and tail layer counts held at the KV boundary floor. `0,0` turns the promotion off. How many layers it actually moves is a property of the model — a windowed layer runs the bf16 rotating ring whatever it is handed and a shared-KV consumer layer owns no cache. Recorded as `decode_config` when non-default. See `docs/KV_QUANT.md` § "Layer-adaptive overrides". |
 | `--max-ctx` | u32 | (from model) | **Virtual ceiling** on context length, in tokens — NOT an eager allocation. The KV ring starts small (`KV_MAX_SEQ_DEFAULT = 4096`) and grows lazily up to this ceiling as the prompt fills; prompts over the ceiling are rejected. Short requests on a large-`--max-ctx` server thus decode at full speed (no long-context working-set tax — see `docs/KV_CACHE.md` §4.6). Bounded by the checkpoint's **positional capacity** (`max_position_embeddings`, extended by a declared `rope_scaling` or by `--yarn-factor`); a value above it is **refused**, never clamped — see §Context ceiling. Resolves to `min(capacity, 4096)` when unset. Must be ≥ 256 when set. |
 | `--idle-timeout-secs` | string | `15m` | Idle time before the model is unloaded. Accepts an integer count of seconds (`30`, `900`) OR a Go-style duration (`30s`, `15m`, `2h`, `24h`). Negative (`-1`) pins the model forever; `0` unloads after each response. Per-request override on **native** routes only (`POST /v1/models/{id}/load` body field `keep_alive`); OpenAI/Anthropic compat routes do not parse the field but still reset the timer on use. **Interaction with the single-MLX claim file:** the timer never bypasses the claim — when TTL fires it unloads the slot in-process; the cross-process claim file (`/tmp/rmlx.<port>.claim`) remains held for the lifetime of the `rmlx serve` process. |
 | `--prompt-cache-slots` | usize | 4 | Number of prompt-cache slots for multi-slot prefix matching. Set to `1` for legacy single-slot exact-match behaviour. **`0` disables the prompt cache**: no snapshot is ever stored, so every request runs a full prefill. It is a real state, not a one-slot cache — see `docs/PROMPT_CACHE.md` §Zero slots. A request carrying an `X-Session-Id` header widens this number by one slot per active session (session KV-reuse); `0` is not widened — a disabled cache stays disabled. |
@@ -429,6 +430,7 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --label "8k-bench"
 | `--cache-type-v` / `--ctv` | string | — | Per-side V codec. Mutually exclusive with `--kv-quant`. |
 | `--kv-bits` | float | — | Bit-width alias. Mutually exclusive with `--kv-quant` and `--cache-type-*`. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. |
+| `--kv-boundary-layers` | `HEAD,TAIL` | `2,8` | Head and tail layer counts held at the KV boundary floor. `0,0` turns the promotion off. How many layers it actually moves is a property of the model — a windowed layer runs the bf16 rotating ring whatever it is handed and a shared-KV consumer layer owns no cache. Recorded as `decode_config` when non-default. See `docs/KV_QUANT.md` § "Layer-adaptive overrides". |
 | `--max-ctx` / `--ctx-max` | u32 | (from model) | Context ceiling the KV ring may grow to. Bounded by the checkpoint's positional capacity; a value above it is refused, not clamped — see §Context ceiling. Must be ≥ 256 when set. |
 | `--max-prompt-tokens` | usize | (resolved context ceiling) | Cap on the tokenized prompt length. Defaults to the run's resolved `--max-ctx` ceiling, so raising the ceiling is what admits a longer prompt. See "Prompt-length cap" below — behavior differs by `--device`. Must be ≥ 1 when set. |
 | `--allow-truncate` | bool flag | off | Opt into silently truncating a too-long prompt to the prompt cap on `--device gpu` instead of erroring. No effect on `--device cpu` (always truncates) or when `--max-prompt-tokens` is passed explicitly (that is itself an opt-in). |
@@ -684,6 +686,7 @@ agree; see the drift refusal below.
 | `--cache-type-k` / `--ctk`, `--cache-type-v` / `--ctv` | string | — | Per-side KV codec. Mutually exclusive with `--kv-quant`. |
 | `--kv-bits` | float | — | Bit-width alias. Mutually exclusive with `--kv-quant` and `--cache-type-*`. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. |
+| `--kv-boundary-layers` | `HEAD,TAIL` | `2,8` | Head and tail layer counts held at the KV boundary floor. `0,0` turns the promotion off. How many layers it actually moves is a property of the model — a windowed layer runs the bf16 rotating ring whatever it is handed and a shared-KV consumer layer owns no cache. Recorded as `decode_config` when non-default. See `docs/KV_QUANT.md` § "Layer-adaptive overrides". |
 | `--max-ctx` / `--ctx-max` | u32 | (from model) | Context ceiling the KV ring may grow to. Bounded by the checkpoint's positional capacity; a value above it is refused, not clamped — see §Context ceiling. Must be ≥ 256 when set. |
 | `--max-prompt-tokens` | usize | (resolved context ceiling) | Cap on the tokenized prompt length. Same device-dependent semantics as `baseline`. |
 | `--allow-truncate` | bool flag | off | Opt into truncating an over-cap prompt on `--device gpu`. |
@@ -1070,8 +1073,14 @@ of `--inline`, `--file`, `--stdin`, or `--replay-pending` must be provided.
 | `--inline <JSON>` | — | Inline JSON object. |
 | `--file <path>` | — | Read JSON from file (preferred; follows the §8.4 buffer pattern). |
 | `--stdin` | off | Read JSON from stdin. |
-| `--dry-run` | off | Validate and show what would be written without committing. |
+| `--dry-run` | off | Validate and show what would be written without committing. Runs the whole of `RunRecord::validate`, then returns before the transaction — the row count and the `--file` buffer are both untouched. This is the route for a probe that only needs to know whether a record would be accepted. |
 | `--replay-pending` | off | Walk `metrics/buffer/pending/`, ingest each file, move failures to `failed/`. |
+
+A record whose `notes` or `description` contains `synthetic=true` is refused,
+whatever else is right about it. `observations` is append-only, so a record
+built to exercise a refusal and accepted by mistake lands a placeholder in a
+live cell and wins it; the marker lets such a record say so. Two rows reached
+the DB before it existed — see `docs/METRICS_DB.md`, "Known-bad rows".
 
 #### `metrics identity`
 
@@ -1301,6 +1310,47 @@ rmlx eval ppl --model /path/to/snapshot --text-file wiki.txt \
 | `--device` | `cpu \| gpu` | `gpu` | Inference device. |
 | `--max-tokens` | usize | 0 | Cap on tokens fed to the scorer. `0` = use the whole corpus. |
 | `--git-sha` | string | — | Commit SHA to stamp on the emitted record's `git_sha` column (only meaningful with a non-empty `--corpus`). Provenance the caller supplies — the binary does not and cannot determine the commit it was built from. Absent by default (`git_sha` is `NULL`). |
+| `--kv-quant` | string | — | KV codec to score **through**. Unset means no KV cache at all: the default scorer runs a fresh full-window forward per window, which is how every PPL row already in `runs.db` was measured. |
+| `--kv-preset` | string | — | Named KV-cache preset. Mutually exclusive with `--kv-quant`, `--cache-type-k`, `--cache-type-v`, `--kv-bits`. |
+| `--cache-type-k` / `--ctk` | string | — | Per-side K codec. Mutually exclusive with `--kv-quant`. |
+| `--cache-type-v` / `--ctv` | string | — | Per-side V codec. Mutually exclusive with `--kv-quant`. |
+| `--kv-bits` | float | — | Bit-width alias. Mutually exclusive with `--kv-quant` and `--cache-type-*`. |
+| `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. Requires `--kv-bits`. |
+| `--kv-boundary-layers` | `HEAD,TAIL` | `2,8` | Layers held at the KV boundary floor. Requires one of the flags above — without a cache there is nothing to apply it to, and the command refuses rather than accepting an inert flag. |
+
+**Two scorers, chosen by whether a codec was asked for.**
+
+* **No KV flag** — the sliding window is forwarded in one pass with no cache,
+  and every position's logits come out of that pass. Fast, and completely
+  independent of the KV codec layer.
+* **A KV flag** — each window is *teacher-forced* through a real per-layer
+  cache built by `kv_layer_quants`, the same vector `generate_greedy` builds:
+  the window's warm-up prefix is prefilled through the arch's chunked-prefill
+  protocol and every scored position after it is a single-token decode step.
+  Each NLL is therefore read off the decode path a served request runs, which
+  is the only shape in which a KV codec can move a perplexity number. It costs
+  one forward per scored token, so keep `--max-tokens` modest.
+
+The emitted record carries the codec in `kv_quant`, the scorer in the metric
+name (`ppl_<corpus>` cacheless, `ppl_<corpus>_cached` through a cache — the two
+do not measure the same quantity and do not share a cell), and, at a
+non-default boundary, `decode_config = 'kv_boundary/head=<h>,kv_boundary/tail=<t>'`.
+
+**The two scorers are not interchangeable on Gemma4, and the metric names are
+not the only reason.** Run against each other with a bf16 cache (`--kv-quant
+none`), where they should differ only by floating-point noise, they agree
+bit-for-bit at `--ctx-window 8` on every architecture — but on Gemma4 they part
+by a margin that grows with the attended context, reaching `mean_nll` −0.123 at
+`--ctx-window 512` on `gemma-4-12B-it-mxfp8`. Qwen3 stays within ±0.003 at
+every window from 32 up. The disagreement is therefore between
+`Gemma4Text::forward_seq_logits_all` and `Gemma4Text::forward_seq_with_cache`,
+two forwards that both predate the cache-bearing scorer. Tracked as its own
+defect; the sweep that measured it is the reproduction.
+
+Consequence for a reader: compare a cached number only against another cached
+number of the same architecture. Do not read a `ppl_<corpus>_cached` value
+against a `ppl_<corpus>` one on a Gemma4 model, and do not treat either as the
+absolute perplexity of the checkpoint until that is resolved.
 
 ---
 

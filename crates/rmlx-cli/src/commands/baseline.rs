@@ -1097,6 +1097,10 @@ fn build_run_record(
         "model": model,
         "weight_quant": weight_quant,
         "kv_quant": kv_quant_str,
+        // Cell identity for a run that moved the boundary-layer counts off
+        // their default; `None` at the default, which is what keeps a default
+        // run ranking against every row recorded before the flag existed.
+        "decode_config": rmlx_models::kv_cache::active_kv_boundary().decode_config(),
         "ctx_max": ctx_max,
         "prompt": {
             "name": prompt_name,

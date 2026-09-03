@@ -1203,6 +1203,9 @@ fn emit_json(ctx: &ReportCtx<'_>, s: &BenchSummary, samples: &[RunSample]) -> an
         "model": ctx.model_name,
         "arch": ctx.arch_class,
         "kv_quant": ctx.args.kv_quant.to_string(),
+        // `bench` does not record, so this is for whatever ingests its JSON:
+        // the same cell-identity term `baseline --record` writes.
+        "decode_config": rmlx_models::kv_cache::active_kv_boundary().decode_config(),
         "prompt": ctx.args.prompt_label,
         "prompt_tokens": ctx.prompt_tokens,
         "gen_tokens": ctx.gen_tokens,

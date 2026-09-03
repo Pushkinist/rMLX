@@ -203,6 +203,35 @@ speculative arm's `mtp/block=5` a term of this grammar rather than an
 exception to it. `NULL` is the engine at its defaults; the empty string is not
 a spelling of that and is refused.
 
+**Settings that currently use it.**
+
+| Terms | Setting | Emitted by |
+|---|---|---|
+| `mtp/block=<n>` | speculative-decode arm and its block size | `rmlx_metrics::cell::decode_config` |
+| `prefill_chunk=<n>` | non-default prefill chunk size | prefill-chunk sweeps |
+| `kv_boundary/head=<h>,kv_boundary/tail=<t>` | `--kv-boundary-layers` off its default | `rmlx baseline --record`, `rmlx eval ppl`, `scripts/ingest/{codec_inertness,perf_ab}_ingest.py` |
+
+The `kv_boundary/*` pair is always written together and always in that order
+(`head` sorts before `tail`), because a head count without a tail count does
+not name a boundary. `NULL` is the shipped default, which is what keeps a
+default run ranking against every row recorded before the flag existed. The two
+Python ingesters derive the terms from the run's own recorded arguments — the
+probe's `kv_boundary` CSV column and `perf_ab.sh`'s per-arm `args` string —
+rather than from a flag on the ingester, so the term cannot describe a
+configuration the run did not use, and they read the default itself from
+`rmlx_core::kv_boundary` rather than restating it
+(`scripts/lib/kv_boundary_default.py`, gated by
+`make check-kv-boundary-default-parity`).
+
+**What does not belong here: a change to what the number means.** `rmlx eval
+ppl` has two scorers — a cacheless full-window forward and a cache-bearing
+teacher-forced one — and they do not measure the same quantity. That is a
+*metric*, `ppl_<corpus>` against `ppl_<corpus>_cached`, not a `decode_config`
+term. Putting it here would have fenced both off from every `mlx_lm` row, which
+can never carry a term this engine invented. The test is the one stated above:
+a setting the engine moved off its default belongs here; a different
+measurement is a different metric.
+
 `rmlx_metrics::cell::decode_config_is_well_formed` is the one implementation,
 enforced at ingest (`RunRecord::validate`) so a private spelling is rejected
 rather than stored. `bests`, `rmlx metrics best` / `compare` / `history` /
@@ -651,6 +680,68 @@ because nothing enforces it.
 
   No row written after this change matches: every row the script emits now
   carries `decode_window=`, whatever codec and prompt length it measured.
+- **`ppl_wikitext2` rows from the first two cache-bearing sweeps** — the scorer
+  gained a second mode (teacher-forcing each window through a real per-layer KV
+  cache), and it took two attempts to file it correctly. The first sweep said
+  nothing at all, putting a cacheless number and a bf16-cache number in one
+  cell. The second said it in `decode_config` (`ppl/scorer=cached`), which is
+  the wrong column: which scorer ran changes what the number *means*, not how
+  the engine was configured, and a `decode_config` term additionally fences
+  those rows off from every `mlx_lm` row, which can never carry a term this
+  engine invented. Both are now `ppl_wikitext2_cached`, a metric of its own.
+  Eighteen rows, `2026-09-03`/`2026-09-04`, on `Ternary-Bonsai-8B-mlx-2bit` and
+  `gemma-4-12B-it-mxfp8` at `ctx_max = 2048`. No migration reaches the first
+  batch: nothing in those rows says which scorer produced them, and guessing
+  from the value is the substitution this list exists to refuse. They are
+  superseded, not corrected — a correctly named re-measurement lands under a
+  different metric and cannot out-rank them.
+
+  ```sql
+  SELECT * FROM observations
+  WHERE metric = 'ppl_wikitext2'
+    AND ts_utc >= '2026-09-03'
+    AND prompt_id IN (SELECT id FROM prompts WHERE name LIKE 'wikitext-2_ctx2048%');
+  ```
+
+- **Two synthetic rows from an ingest-refusal probe** — a review of the
+  boundary-layer work exercised the ingest path's refusals by handing it
+  near-real records, and two of them were accepted instead of refused. They
+  carry real identity, a real cell, and a placeholder `kv_cache_bytes` of
+  `123456`, so **124693 currently wins `bests`** for
+  `Ternary-Bonsai-8B-mlx-2bit / iso3_sym / 40960 /
+  kv_boundary/head=2,kv_boundary/tail=4` on the smallest-cache ranking. Nothing
+  measured them. Deleting rows is an ask-before item and the table is
+  append-only, so they stay and are named:
+
+  ```sql
+  SELECT * FROM observations WHERE id IN (124693, 124694);
+  ```
+
+  The general fix is on both sides. `RunRecord::validate` now refuses any record
+  whose `notes` or `description` carries
+  [`rmlx_metrics::ingest::SYNTHETIC_MARKER`] (`synthetic=true`), so a probe can
+  declare itself and be turned away before a transaction opens. And a probe that
+  only needs to know *whether* a record would be accepted does not need a record
+  at all: `rmlx metrics record --dry-run` runs the whole of `validate` and
+  returns before the commit — verified to leave both the row count and the
+  buffer file untouched.
+
+- **`perf_ab.sh` rows whose `notes` say `ABBA` for an inverted leg** — the
+  ingester asserted the interleave pattern as a constant instead of reading the
+  result file's own `pattern` field, so a `--invert` leg (BAAB) was recorded as
+  ABBA. Only that one word is wrong: the medians, spreads, `n` and verdicts are
+  per-leg and correct, and the arms are still correctly paired. The ingester now
+  interpolates the recorded pattern and writes `pattern-unrecorded` when a
+  result file predates the field, so no new row asserts one. Affected:
+  ids 124477–124480 and 124553–124556. The predicate cannot be written from the
+  notes alone — `ABBA` is also what a genuine straight leg says — so it is the
+  id range, bounded by the fix:
+
+  ```sql
+  SELECT * FROM observations
+  WHERE id IN (124477, 124478, 124479, 124480, 124553, 124554, 124555, 124556);
+  ```
+
 - **`decode_config IS NULL` on a row that was speculative and never said so** —
   migration 005 added the column and left every existing row NULL, which is what
   ordinary decode carries, so a speculative row from before it kept sharing a

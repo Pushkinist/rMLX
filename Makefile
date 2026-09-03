@@ -414,6 +414,9 @@ check-kv-byte-model-parity: ## CI gate: fail if scripts/perf_ceiling.py's KV byt
 check-kv-byte-model-parity-fixtures: ## CI gate: recall test for the above — 8 synthetic manifests, each asserting which check fired
 	@bash scripts/check_kv_byte_model_parity_fixtures.sh
 
+check-kv-boundary-default-parity: ## CI gate: fail if the CLI help, docs/CLI.md or the ingest resolver names a different default KV boundary than the engine
+	@bash scripts/check_kv_boundary_default_parity.sh
+
 check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited in docs/ does not exist
 	@bash scripts/check_doc_source_citations.sh
 
@@ -470,6 +473,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kv_codec_disposition_fixtures.sh
 	@bash scripts/check_kv_byte_model_parity.sh
 	@bash scripts/check_kv_byte_model_parity_fixtures.sh
+	@bash scripts/check_kv_boundary_default_parity.sh
 	@bash scripts/check_doc_source_citations.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_eval_lock.sh

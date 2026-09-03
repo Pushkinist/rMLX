@@ -172,6 +172,27 @@ pub struct RunRecord {
     pub metrics: Vec<MetricEntry>,
 }
 
+/// The marker a record carries to say it is not a measurement.
+///
+/// A probe that exercises the ingest path — "does `validate` still refuse a
+/// malformed `decode_config`?" — needs a record to hand it, and the shortest
+/// way to build one is to copy a real record and change a field. That record
+/// still carries real identity, so if the probe's expectation is wrong the row
+/// lands in a live cell under a placeholder value and wins it. Two such rows
+/// reached this DB that way; they are named in docs/METRICS_DB.md and cannot be
+/// taken back out, because the table is append-only.
+///
+/// So a record may declare itself. Put this anywhere in `notes` or
+/// `description` and [`RunRecord::validate`] refuses it, whatever else is
+/// right about it — the refusal is the point, and it happens before any
+/// transaction opens.
+///
+/// The other route, and the better one when it fits, is `rmlx metrics record
+/// --dry-run`: it runs the whole of `validate` and returns before the commit,
+/// so a probe that only needs to know *whether* a record is accepted never
+/// builds a writing path at all.
+pub const SYNTHETIC_MARKER: &str = "synthetic=true";
+
 impl RunRecord {
     /// Canonical backend identifier (e.g. `"rmlx"`, `"mlx_lm"`).
     pub fn backend(&self) -> &str {
@@ -337,6 +358,28 @@ impl RunRecord {
             });
         }
 
+        // A record that says it is not a measurement is not stored, however
+        // well-formed the rest of it is. Checked first: every other rule below
+        // asks whether the record describes a real run correctly, and this one
+        // asks whether it claims to describe a run at all.
+        for (field, value) in [
+            ("notes", self.notes.as_deref()),
+            ("description", self.description.as_deref()),
+        ] {
+            if value.is_some_and(|v| v.contains(SYNTHETIC_MARKER)) {
+                return Err(Error::InvalidIngestField {
+                    field: field.to_string(),
+                    message: format!(
+                        "record is marked `{SYNTHETIC_MARKER}`, so it is not a measurement and \
+                         is not stored. `observations` is append-only: a placeholder value that \
+                         reaches a live cell wins it and cannot be removed. To check whether a \
+                         record would be accepted, use `rmlx metrics record --dry-run`, which \
+                         runs this whole validation and returns before the commit."
+                    ),
+                });
+            }
+        }
+
         // backend
         identity::canonicalize("backend", &self.backend, identity::BACKEND_WHITELIST)?;
 
@@ -430,6 +473,27 @@ impl RunRecord {
                     field: "decode_config".to_string(),
                     message: format!(
                         "must be `key=value` terms joined by `,` and ordered by key, got {config:?}"
+                    ),
+                });
+            }
+            // Refused rather than normalised, and loudly: a caller that spells
+            // out the shipped default has misunderstood what the column is
+            // for, and silently rewriting the value to NULL would let the next
+            // campaign make the same mistake at scale. The message names the
+            // defaults so the fix is obvious.
+            if crate::cell::decode_config_is_all_defaults(config) {
+                return Err(Error::InvalidIngestField {
+                    field: "decode_config".to_string(),
+                    message: format!(
+                        "{config:?} spells the engine's own defaults ({}); NULL is how a \
+                         run at the defaults is recorded, and a second spelling of one \
+                         configuration puts its measurements in a cell that ranks against \
+                         nothing. Omit the field.",
+                        rmlx_core::kv_boundary::DECODE_CONFIG_NUMERIC_DEFAULTS
+                            .iter()
+                            .map(|&(key, value)| format!("{key}={value}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
                     ),
                 });
             }

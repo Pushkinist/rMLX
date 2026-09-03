@@ -679,6 +679,37 @@ fn a_decode_configuration_outside_the_grammar_is_rejected() {
     assert!(r.validate().is_ok());
 }
 
+/// A record spelling out the engine's own defaults is refused, not normalised.
+///
+/// Refused rather than quietly rewritten because a caller who spells a default
+/// has misunderstood the column, and a silent rewrite lets the next campaign
+/// make the same mistake at scale — which is how 61 rows came to sit in a cell
+/// that ranked against nothing. The message names the defaults.
+#[test]
+fn a_decode_configuration_spelling_the_defaults_is_refused() {
+    let head = rmlx_core::kv_boundary::DEFAULT_BOUNDARY_HEAD_N;
+    let tail = rmlx_core::kv_boundary::DEFAULT_BOUNDARY_TAIL_N;
+    let mut r = valid_record();
+    r.decode_config = Some(format!("kv_boundary/head={head},kv_boundary/tail={tail}"));
+    let err = r.validate().unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidIngestField { ref field, .. } if field == "decode_config"),
+        "expected decode_config rejection, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("kv_boundary/head="),
+        "the refusal must name the defaults it is comparing against: {err}"
+    );
+
+    // One term off its default is a real configuration and lands.
+    r.decode_config = Some(format!("kv_boundary/head={head},kv_boundary/tail=4"));
+    assert!(r.validate().is_ok());
+
+    // Omitting the field is how a default run is recorded.
+    r.decode_config = None;
+    assert!(r.validate().is_ok());
+}
+
 /// An emitter that says nothing writes NULL, which is ordinary decode — not a
 /// missing value to be filled in later.
 #[test]
@@ -709,4 +740,45 @@ fn an_absent_decode_config_stores_null() {
         .query_row("SELECT decode_config FROM observations", [], |r| r.get(0))
         .unwrap();
     assert_eq!(stored, None);
+}
+
+/// A record that declares itself synthetic is refused, from either field.
+///
+/// This is the escape hatch a refusal probe needs. Without it the shortest way
+/// to ask "does `validate` still reject X?" is to hand it a near-real record,
+/// and a probe whose expectation is wrong then writes a placeholder into a live
+/// cell — which `observations` being append-only makes permanent. Two rows
+/// reached this DB exactly that way.
+#[test]
+fn a_record_that_marks_itself_synthetic_is_refused() {
+    for field in ["notes", "description"] {
+        let mut r = valid_record();
+        let marked = format!("ingest-refusal probe; {SYNTHETIC_MARKER}");
+        match field {
+            "notes" => r.notes = Some(marked),
+            _ => r.description = Some(marked),
+        }
+        let err = r.validate().unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidIngestField { field: ref f, .. } if f == field),
+            "expected a {field} refusal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("--dry-run"),
+            "the refusal must name the route that does work: {err}"
+        );
+    }
+}
+
+/// The marker is a declaration, not a word filter: an ordinary record that
+/// merely talks about synthetic arms still lands.
+#[test]
+fn an_unmarked_record_is_not_refused_for_mentioning_synthesis() {
+    let mut r = valid_record();
+    r.notes = Some("paired against a synthetic-arms calibration run".to_string());
+    r.description = Some("synthetic arms were not used here".to_string());
+    assert!(
+        r.validate().is_ok(),
+        "only the marker refuses, not the word"
+    );
 }
