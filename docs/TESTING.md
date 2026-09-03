@@ -750,8 +750,11 @@ It is fail-closed in three ways:
 * **Exclusive GPU.** It refuses to start while another MLX process holds the
   Metal context (CLAUDE.md hard rule 8).
 
-**The suite is not known to be green on `main`, and this runner tracks no
-known-red list.** It used to claim the opposite, in the failure banner and here.
+**No test in this suite is known-red on `main`, and this runner tracks no
+known-red list of tests.** (Shader-validation hits are the one thing it does
+track a baseline for, and that baseline is exact — see the census pin below. It
+covers hits, never a failing test.) It used to claim the opposite, in the failure
+banner and here.
 That claim is what turns an inherited failure into a waved-through one — either
 direction: a real regression read as "the known one", or hours spent on a red
 that predates the branch. A failure is attributable only after the same crate
@@ -761,11 +764,11 @@ separates the two cases. A list of currently-known failures is deliberately not
 kept here — it would rot into exactly the false assurance it replaced, and a
 comparison against the base commit is always current.
 
-Note that a failure of this runner is not only a failing test: the Metal
-shader-validation aggregate fails it too, on a crate whose tests all passed. An
-out-of-bounds device store is dropped rather than raised, so the tests can pass
-while the GPU reads or writes memory it does not own — which is precisely a
-result no test result can be read for.
+Note that a failure of this runner is not only a failing test: a Metal
+shader-validation hit the census pin does not account for fails it too, on a
+crate whose tests all passed. An out-of-bounds device store is dropped rather
+than raised, so the tests can pass while the GPU reads or writes memory it does
+not own — which is precisely a result no test result can be read for.
 
 Read the diagnostic's own wording before assuming that is what happened. A
 *store* is corruption; a *load* is illegal but can only affect the result if the
@@ -800,7 +803,8 @@ silently. `scripts/run_gpu_tests_selftest.sh` (`make gpu-runner-selftest`, in
 no GPU: a canned libtest log per crate carries a validation hit, a failing test,
 an under-match, a missing banner and two diagnostics sharing one output line, and
 each case asserts the reason that reaches the final report rather than only the
-exit code.
+exit code. The census-pin verdicts are pinned in the same file, by the same
+means.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 
@@ -1030,8 +1034,9 @@ narrowed run can attribute anything to), not a directly observed clean pass
 over each of the other four individually — `run_gpu_tests.sh` prints a
 per-crate line only for a crate with a nonzero hit count.
 `rmlx-models` does not — it reports 160 invalid device **loads**, all in MLX's
-own `affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false`, so the aggregate fails
-and `make ci-perf` has no green state. The cause is in
+own `affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false`. Those 160 are pinned
+(next section), so a run that reproduces them exactly is green and prints the
+census it accepted. The cause is in
 `mlx/backend/metal/kernels/quantized.h`: `QuantizedBlockLoader::load_safe`
 bounds its row index against the tile's column extent, so the guard never fires
 and a transposed quantized matmul whose `N` is not a multiple of the kernel's
@@ -1053,6 +1058,62 @@ clean scan is evidence about reporting, not about memory safety.
 The full investigation, the reproducer, the pinned-MLX `PYTHONPATH` needed to
 repeat it, and the reason no caller-side workaround was taken live in
 `.rmlx/mlx-qmm-t-tail-row-oob.md`.
+
+#### The census pin
+
+A gate that is red on every run is the inverse of a vacuous one: its exit code
+stops carrying information, everyone learns to read `Error 1` as background
+noise, and the next real hit arrives inside the standing one. That is what a
+diagnostic from a kernel this repo neither compiles nor can fix would otherwise
+do to `make gpu-test` and `make ci-perf`.
+
+So the accepted hits are pinned, in `scripts/gpu_validation_census.txt`. One
+line per (kernel, access kind), each carrying the exact count over a full run,
+the crate and test it is reached from, the model snapshot it needs, and the
+reference to the analysis that says it is benign. `run_gpu_tests.sh` diffs the
+per-kernel tally it computed against that file:
+
+| observed | verdict |
+|---|---|
+| every pinned entry at its exact count, nothing else | pass, printing the census it accepted |
+| a kernel the pin does not name | fail — `not pinned: N <kind> "<kernel>"` |
+| a pinned count that moved **up** | fail — `count moved up: … pinned N, observed M` |
+| a pinned count that moved **down** | fail — the pin is stale, re-derive it |
+| a pinned kernel that stopped firing | fail — same reason, from the pin's side |
+| any store, pinned kernel or not | fail — a dropped write is corruption |
+
+The comparison is a tally diff over the file's contents; no kernel name appears
+in the script. A store is refused on the pin side too: there is no analysis that
+makes an invalid write acceptable, so the runner rejects an entry that names one
+rather than comparing it.
+
+Two structural exemptions, both one-directional — an excess count, an unpinned
+kernel and any store fail in every run:
+
+* A **narrowed** run (`CRATE=` / `FILTER=`) visits a subset of the population and
+  observes fewer hits by construction, so its shortfall says nothing about the
+  pin. Enforcing the pinned total there would make every narrowed iteration red.
+* An entry whose **snapshot is not on this machine** cannot fire. The suite's
+  contract is already that a model-gated cell skips and counts as passed, so a
+  developer without the weights is not told the pin is stale.
+
+Both print `not enforced downward: …` with the reason, so a run that could not
+check an entry never looks like one that did.
+
+**Updating the pin** takes one of two things and nothing else: a linked upstream
+reference showing the defect is not ours and does not reach our output, or an
+analysis of the standard of the one above — the symbol's provenance, a
+load/store census over *every* diagnostic rather than a sample, and a
+demonstration that the loaded lanes do not reach the output. A passing test
+suite is not that demonstration, and neither is a quiet run: the validation layer
+bounds the MTLBuffer rather than the array, so absence of a diagnostic is not
+absence of an out-of-bounds access. A count that dropped is never edited down to
+fit the run in front of you — re-derive it from a full run and record what
+changed.
+
+`scripts/run_gpu_tests_selftest.sh` (in `make ci`, no GPU) pins each of those
+verdicts against a stub runner, including the two exemptions and the pin-file
+refusals, so the mechanism cannot quietly become one that only passes.
 
 ### `#[ignore]` is not a place to park a broken test
 

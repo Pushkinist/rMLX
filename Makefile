@@ -272,6 +272,13 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 # target cannot see the repo's documented silent-corruption class at all. It
 # costs throughput, which is why it lives on this target and not on any cell
 # whose numbers get recorded. VALIDATE=0 opts out.
+#
+# The hits it observes are compared against scripts/gpu_validation_census.txt,
+# which pins the ones this tree has already accounted for. An exact match passes
+# and prints what it accepted; a new kernel, a count that moved either way, a
+# pinned kernel that went silent, or any store fails and names the delta. That
+# is what keeps a standing diagnostic from a kernel we do not own out of the
+# exit code, where it would train everyone to read a red run as noise.
 gpu-test:        ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation (CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation); needs exclusive machine access
 	@bash scripts/run_gpu_tests.sh $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
 		$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
@@ -411,7 +418,7 @@ check-gpu-tests-ignored: ## CI gate: fail if a GPU-touching test in ANY workspac
 check-gpu-tests-ignored-fixtures: ## CI gate: the #[ignore] gate still fires on macro-generated and helper-reached GPU tests
 	@bash scripts/check_gpu_tests_ignored_fixtures.sh
 
-gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a shader-validation hit in the same run, and reports the access mix it saw (stubbed crates, no GPU)
+gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a shader-validation hit in the same run, reports the access mix it saw, and reaches every census-pin verdict (stubbed crates, no GPU)
 	@bash scripts/run_gpu_tests_selftest.sh
 
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)

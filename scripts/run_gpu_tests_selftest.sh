@@ -11,11 +11,19 @@
 # held in a shell variable, and thrown away at exit, and each crate's log is
 # deleted inside the loop, so nothing survives to re-read.
 #
+# It also decides which validation hits are a failure at all. The runner accepts
+# exactly the census pinned in `scripts/gpu_validation_census.txt` and fails on
+# any deviation from it, so both halves of that — the pass and each kind of
+# deviation — are checked here too. A pin that could only fail would leave the
+# gate as red as it was without one; a pin that could only pass would be a gate
+# that cannot fire.
+#
 # That is a property of the reporting code, not of the GPU, so it is checked
-# here against stubs: a stub `cargo` replays a canned libtest log per crate and
-# a stub classifier names the population. No Metal device, no snapshot, no
-# compile. The runner is copied into a throwaway root per case rather than
-# reimplemented, so this file cannot drift from what the gate runs.
+# here against stubs: a stub `cargo` replays a canned libtest log per crate, a
+# stub classifier names the population, and each case writes its own pin. No
+# Metal device, no snapshot, no compile. The runner is copied into a throwaway
+# root per case rather than reimplemented, so this file cannot drift from what
+# the gate runs.
 #
 # Every case asserts the REASON — the strings an operator triages a red gate
 # from, taken only from the final report block, not from the interleaved `tee`
@@ -108,7 +116,13 @@ crate_log() {
     printf '%s\n' "${rc}" >"${root}/logs/${crate}.rc"
 }
 
-# run_case <root> — run this case's runner; set OUT, STATUS, REPORT and MIX.
+# pin <root> — write this case's shader-validation census pin, contents on stdin.
+pin() {
+    cat >"$1/scripts/gpu_validation_census.txt"
+}
+
+# run_case <root> [runner args...] — run this case's runner; set OUT, STATUS,
+# REPORT and MIX.
 #
 # REPORT is the final block only: everything from the first post-loop ERROR
 # header on. The crate logs are teed to the same stream, so asserting against
@@ -121,11 +135,13 @@ crate_log() {
 # tally, and would start passing for the wrong reason the day the wording moves.
 run_case() {
     local root="$1"
+    shift
     OUT="$(PATH="${root}/bin:${PATH}" env -u RMLX_SKIP_GPU \
-        RMLX_O_MODELS_ROOT="${WORK}" bash "${root}/scripts/run_gpu_tests.sh" 2>&1)"
+        RMLX_O_MODELS_ROOT="${WORK}" bash "${root}/scripts/run_gpu_tests.sh" "$@" 2>&1)"
     STATUS=$?
     REPORT="$(printf '%s\n' "${OUT}" | awk '
         /^ERROR: Metal shader validation reported invalid memory access:/ { seen = 1 }
+        /^ERROR: the shader-validation census does not match the pin:/ { seen = 1 }
         /^ERROR: GPU tests failed in:/ { seen = 1 }
         seen')"
     MIX="$(printf '%s\n' "${REPORT}" | awk '
@@ -415,6 +431,268 @@ expect_report "Metal shader validation reported"
 expect_report "ran uninstrumented (no validation banner)"
 
 # ---------------------------------------------------------------------------
+# The census pin. A tree can carry a validated-benign diagnostic from a kernel
+# it does not own, and a gate that stays red on it teaches its readers that
+# `Error 1` is background noise. The pin records that census exactly, so a hit
+# that matches it passes and anything else — a new kernel, a count that moved in
+# either direction, any store, a pinned kernel that stopped firing — is a
+# failure naming the delta.
+#
+# Every case below writes its own pin, so none of them depends on what the tree
+# happens to accept today.
+
+CENSUS_KERNEL="mlx_qmm_stub"
+CENSUS_SNAPSHOT="stub-snapshot"
+
+# census_pin <root> <count> [snapshot] — a one-entry pin for CENSUS_KERNEL.
+census_pin() {
+    local root="$1" count="$2" snapshot="${3:-${CENSUS_SNAPSHOT}}"
+    mkdir -p "${WORK}/${CENSUS_SNAPSHOT}"
+    pin "${root}" <<PIN
+# kernel | kind | count | crate | test | snapshot | reference
+${CENSUS_KERNEL} | device load | ${count} | rmlx-kv-quant | kv_gpu_alpha | ${snapshot} | validated benign
+PIN
+}
+
+# census_log <root> <crate> <n> — a clean libtest log carrying <n> loads of
+# CENSUS_KERNEL.
+census_log() {
+    local root="$1" crate="$2" n="$3" i=0
+    {
+        echo 'Metal GPU Validation Enabled'
+        echo 'running 1 test'
+        while [ "${i}" -lt "${n}" ]; do
+            echo "Invalid device load at offset $((4096 + i * 64)), executing kernel function: \"${CENSUS_KERNEL}\""
+            i=$((i + 1))
+        done
+        echo 'test kv::gpu_alpha ... ok'
+        echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s'
+    } | crate_log "${root}" "${crate}" 0
+}
+
+# The accepted case: the observed tally is exactly the pinned one, so the run is
+# green and prints the census it accepted. Without this the pin would be a
+# gate that can only fail, which is the bug it was written against.
+new_case census_exact_match || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+census_log "${CASE_ROOT}" rmlx-kv-quant 4
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "census matches the pin"
+expect_out "4 device load \"${CENSUS_KERNEL}\""
+expect_no_out "ERROR:"
+# A run that accepted four invalid accesses is not a clean one, and saying so
+# would put the operator back where a permanently red gate left them.
+expect_no_out "shader validation clean"
+
+# A kernel the pin does not name is a new hit, whatever the pinned ones did.
+new_case census_new_kernel || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<LOG
+Metal GPU Validation Enabled
+running 1 test
+Invalid device load at offset 4096, executing kernel function: "${CENSUS_KERNEL}"
+Invalid device load at offset 4160, executing kernel function: "${CENSUS_KERNEL}"
+Invalid device load at offset 4224, executing kernel function: "${CENSUS_KERNEL}"
+Invalid device load at offset 4288, executing kernel function: "${CENSUS_KERNEL}"
+Invalid device load at offset 8192, executing kernel function: "custom_kernel_rmlx_q8_quantize"
+test kv::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "not pinned: 1 device load \"custom_kernel_rmlx_q8_quantize\""
+# The pinned kernel matched, so the report must not send the reader after it.
+expect_no_report "\"${CENSUS_KERNEL}\" device load"
+
+# A count that moved up is a hit the validated analysis does not cover.
+new_case census_count_up || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+census_log "${CASE_ROOT}" rmlx-kv-quant 5
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count moved up: \"${CENSUS_KERNEL}\" device load — pinned 4, observed 5"
+
+# A count that moved DOWN is a failure too: the pin is then stale, and accepting
+# it silently would let the census drift down one hit at a time until it fits
+# whatever the tree does today.
+new_case census_count_down || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+census_log "${CASE_ROOT}" rmlx-kv-quant 3
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count moved down: \"${CENSUS_KERNEL}\" device load — pinned 4, observed 3"
+
+# The limit of that: a pinned kernel that stopped firing entirely. The tally is
+# empty, so nothing in the observed set can carry this — it is only visible from
+# the pin's side.
+new_case census_pinned_kernel_silent || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test kv::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "no longer fires: \"${CENSUS_KERNEL}\" device load — pinned 4, observed 0"
+
+# A store from a pinned kernel is corruption outright, and the pin's counts say
+# nothing about it. It fails even while every pinned load matches.
+new_case census_store_on_a_pinned_kernel || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<LOG
+Metal GPU Validation Enabled
+running 1 test
+Invalid device load at offset 4096, executing kernel function: "${CENSUS_KERNEL}"
+Invalid device load at offset 4160, executing kernel function: "${CENSUS_KERNEL}"
+Invalid device load at offset 4224, executing kernel function: "${CENSUS_KERNEL}"
+Invalid device load at offset 4288, executing kernel function: "${CENSUS_KERNEL}"
+Invalid device store at offset 8192, executing kernel function: "${CENSUS_KERNEL}"
+test kv::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "never accepted: 1 device store \"${CENSUS_KERNEL}\""
+
+# And the pin cannot be edited into accepting one.
+new_case census_pin_naming_a_store_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+mkdir -p "${WORK}/${CENSUS_SNAPSHOT}"
+pin "${CASE_ROOT}" <<PIN
+${CENSUS_KERNEL} | device store | 1 | rmlx-kv-quant | kv_gpu_alpha | ${CENSUS_SNAPSHOT} | validated benign
+PIN
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<LOG
+Metal GPU Validation Enabled
+running 1 test
+Invalid device store at offset 8192, executing kernel function: "${CENSUS_KERNEL}"
+test kv::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "a store is never pinnable"
+
+# A malformed entry is refused rather than skipped. A dropped line would turn
+# its kernel's hits into unpinned ones on the next run, sending the reader after
+# a delta the file only appears to cover.
+new_case census_pin_line_missing_fields_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+pin "${CASE_ROOT}" <<PIN
+${CENSUS_KERNEL} | device load | 4 | rmlx-kv-quant
+PIN
+census_log "${CASE_ROOT}" rmlx-kv-quant 4
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "line 1: expected 7 fields"
+
+new_case census_pin_with_a_bad_count_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+mkdir -p "${WORK}/${CENSUS_SNAPSHOT}"
+pin "${CASE_ROOT}" <<PIN
+${CENSUS_KERNEL} | device load | some | rmlx-kv-quant | kv_gpu_alpha | ${CENSUS_SNAPSHOT} | validated benign
+PIN
+census_log "${CASE_ROOT}" rmlx-kv-quant 4
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "count 'some' is not a positive integer"
+
+# One entry per kernel and kind: with two, which count the tally is compared
+# against depends on parse order, and the second silently decides it.
+new_case census_pin_with_a_duplicate_entry_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+mkdir -p "${WORK}/${CENSUS_SNAPSHOT}"
+pin "${CASE_ROOT}" <<PIN
+${CENSUS_KERNEL} | device load | 4 | rmlx-kv-quant | kv_gpu_alpha | ${CENSUS_SNAPSHOT} | validated benign
+${CENSUS_KERNEL} | device load | 7 | rmlx-kv-quant | kv_gpu_alpha | ${CENSUS_SNAPSHOT} | validated benign
+PIN
+census_log "${CASE_ROOT}" rmlx-kv-quant 4
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "is pinned twice"
+
+# An empty pin accepts nothing. This is also the state of a tree that has no
+# census to carry, where every hit is new by definition.
+new_case census_empty_pin_with_hits || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+pin "${CASE_ROOT}" <<'PIN'
+# kernel | kind | count | crate | test | snapshot | reference
+PIN
+census_log "${CASE_ROOT}" rmlx-kv-quant 4
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "not pinned: 4 device load \"${CENSUS_KERNEL}\""
+
+# A narrowed run visits a subset of the population, so it observes fewer hits by
+# construction and its shortfall says nothing about the pin. Enforcing the
+# downward direction there would make every `CRATE=`-narrowed iteration red,
+# which is the failure this whole mechanism exists to remove.
+new_case census_narrowed_run_does_not_enforce_downward || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+classify "${CASE_ROOT}" rmlx-models models_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test kv::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}" --crate rmlx-kv-quant
+expect_status 0
+expect_out "not enforced downward"
+
+# The exemption is one-directional: a narrowed run still fails on a count that
+# moved up, and on a kernel the pin does not name.
+new_case census_narrowed_run_fails_on_excess || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+classify "${CASE_ROOT}" rmlx-models models_gpu_alpha
+census_pin "${CASE_ROOT}" 3
+census_log "${CASE_ROOT}" rmlx-kv-quant 4
+run_case "${CASE_ROOT}" --crate rmlx-kv-quant
+expect_status 1
+expect_report "count moved up: \"${CENSUS_KERNEL}\" device load — pinned 3, observed 4"
+
+new_case census_narrowed_run_fails_on_an_unpinned_kernel || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+classify "${CASE_ROOT}" rmlx-models models_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+Invalid device load at offset 8192, executing kernel function: "custom_kernel_rmlx_q8_quantize"
+test kv::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}" --crate rmlx-kv-quant
+expect_status 1
+expect_report "not pinned: 1 device load \"custom_kernel_rmlx_q8_quantize\""
+
+# The other way an entry legitimately stops firing: the snapshot that reaches it
+# is not on this machine. The suite's own contract is that a model-gated cell
+# skips and counts as passed, so a developer without the weights must not be
+# told the pin is stale.
+new_case census_missing_snapshot_does_not_enforce_downward || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4 a-snapshot-this-host-does-not-have
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test kv::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "not enforced downward"
+
+# ---------------------------------------------------------------------------
 # The harness's own positive control: with nothing wrong, the same stubs produce
 # a green run. Without this, every case above could be passing because the stub
 # crates never ran at all.
@@ -440,4 +718,4 @@ if [ "${failures}" -ne 0 ]; then
     exit 1
 fi
 
-echo "run_gpu_tests_selftest: OK — every kind of red is reported, and the access mix is the one observed."
+echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, and the census pin accepts only what it names."

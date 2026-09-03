@@ -85,6 +85,18 @@
 #   Validation costs throughput, so it belongs here and not in any cell whose
 #   numbers get recorded. Pass --no-shader-validation to opt out.
 #
+# THE CENSUS PIN
+#   A tree can carry a diagnostic from a kernel it does not own and cannot fix.
+#   Failing every run on it is the inverse of a vacuous gate: the exit code stops
+#   carrying information, and the next real hit arrives inside a standing one.
+#   So `scripts/gpu_validation_census.txt` pins the accepted hits — kernel,
+#   access kind, exact count, and the analysis each rests on — and this script
+#   diffs the tally it just computed against that file. An exact match is a pass
+#   that prints the census it accepted. A new kernel, a count that moved in
+#   either direction, any store, or a pinned kernel that stopped firing is a
+#   failure naming the delta. The diff is over the file's contents alone; no
+#   kernel name appears in this script.
+#
 # USAGE
 #   bash scripts/run_gpu_tests.sh
 #   bash scripts/run_gpu_tests.sh --crate rmlx-kv-quant
@@ -98,8 +110,9 @@
 #   cannot tell a narrowed run from a complete one, and `--no-shader-validation`
 #   disarms the instrumentation entirely.
 #
-# Exit 0 = every selected GPU test passed. Exit 1 = a failure, a shader
-# validation diagnostic, or a run that executed nothing.
+# Exit 0 = every selected GPU test passed and every shader-validation hit was
+# one the census pin accounts for. Exit 1 = a failing test, a hit the pin does
+# not account for, or a run that executed nothing.
 
 # No `-e`: cargo's exit code is captured explicitly via PIPESTATUS, and one
 # failing crate must not abort the remaining crates. The `[ ... ] && echo` guard
@@ -191,16 +204,73 @@ VALIDATION_BANNER='Metal GPU Validation Enabled'
 # is what keeps a test's own "invalid" wording from forging a hit.
 VALIDATION_DIAGNOSTIC='Invalid .{0,120}(at offset [0-9]+|executing kernel function:)'
 
-# The access kind as the layer itself worded it — `device load`, `device store`
-# and the threadgroup spellings all arrive through the pattern above, and they
-# differ in severity: a dropped write is corruption outright, a zero-filled read
-# only matters if the kernel keeps the lanes it filled. Reads diagnostics on
-# stdin, one per line, and writes one kind per line.
-access_kind() {
-    sed -E -e 's/^Invalid[[:space:]]+//' \
-           -e 's/[[:space:]]*(at offset [0-9]+|executing kernel function:).*$//' \
-           -e 's/[[:space:]]*,[[:space:]]*$//' \
-           -e 's/^$/unnamed access/'
+# One `<kind><TAB><kernel>` record per diagnostic, read from stdin one
+# diagnostic per line.
+#
+# The kind is the layer's own wording — `device load`, `device store` and the
+# threadgroup spellings — and the two halves differ in severity: a dropped write
+# is corruption outright, a zero-filled read only matters if the kernel keeps the
+# lanes it filled. The kernel name is the attribution; MLX owns the allocator, so
+# the buffer field arrives as `<unnamed>` and carries nothing.
+#
+# Both come out of ONE pass on purpose. The count, the kind mix and the
+# per-kernel tally are all compared against the census pin below, and three
+# separate extractions can disagree about which line was a diagnostic — which
+# would show up as a census that never quite matches.
+diagnostic_records() {
+    awk '
+        {
+            kind = $0
+            sub(/^Invalid[[:space:]]+/, "", kind)
+            sub(/[[:space:]]*(at offset [0-9]+|executing kernel function:).*$/, "", kind)
+            sub(/[[:space:]]*,[[:space:]]*$/, "", kind)
+            if (kind == "") kind = "unnamed access"
+            kernel = "<unnamed kernel>"
+            if (match($0, /kernel function: "[^"]*"/))
+                kernel = substr($0, RSTART + 18, RLENGTH - 19)
+            printf "%s\t%s\n", kind, kernel
+        }
+    '
+}
+
+# The hits this tree accepts, exactly — kernel, access kind and count, with the
+# analysis each entry rests on. The file's own header carries the format and the
+# rule for changing it.
+#
+# Without it the gate is red on every run, which trains its readers to treat
+# `Error 1` as background noise and hides the next real hit inside a standing
+# one. With it, an accepted census is a pass that prints what it accepted, and
+# every deviation from the pin is a failure naming the delta. The comparison is
+# a tally diff — this script knows no kernel name.
+CENSUS_PIN="${REPO_ROOT}/scripts/gpu_validation_census.txt"
+
+# Strip leading and trailing whitespace, so the pin can be laid out as a table.
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "${s}"
+}
+
+# Why this entry's count cannot be required to be met in full on this run, if it
+# cannot. Empty output = it can, and a shortfall is a stale pin.
+#
+# Two reasons, and both are structural rather than a waiver. A narrowed run
+# visits a subset of the population and observes fewer hits by construction —
+# enforcing the pinned total there would make every `CRATE=`-narrowed iteration
+# red, which is the state this mechanism exists to remove. And an entry reached
+# only through a model snapshot cannot fire on a machine that does not hold that
+# snapshot; the suite's contract is already that such a cell skips and counts as
+# passed. Neither exemption touches the other direction: an excess count, an
+# unpinned kernel and any store fail in every run.
+census_downward_exemption() {
+    local snapshot="$1"
+    if [ -n "${ONLY_CRATE}" ] || [ -n "${FILTER}" ]; then
+        printf 'narrowed run'
+    elif [ "${snapshot}" != "-" ] &&
+         { [ -z "${RMLX_O_MODELS_ROOT:-}" ] || [ ! -d "${RMLX_O_MODELS_ROOT}/${snapshot}" ]; }; then
+        printf 'snapshot %s is not under RMLX_O_MODELS_ROOT' "${snapshot}"
+    fi
 }
 
 # Same environment the crates run under, hoisted so the canary above can use it.
@@ -309,6 +379,7 @@ total_passed=0
 total_failed=0
 validation_hits=""
 validation_kinds=""
+validation_records=""
 
 if [ "${SHADER_VALIDATION}" = "1" ]; then
     echo "shader validation: ON (invalid Metal memory access fails this run)"
@@ -423,9 +494,6 @@ for crate in "${crates[@]}"; do
         if ! grep -qF "${VALIDATION_BANNER}" "${log}"; then
             failed_crates="${failed_crates}  ${crate}: ran uninstrumented (no validation banner)"$'\n'
         fi
-        # Report the kernel each hit names, deduped — a codec's kernel name is
-        # the actionable identifier here. The buffer field is not: MLX owns the
-        # allocator, so KV stores come through as `buffer: <unnamed>`.
         # Split first, then match. The layer writes to stderr while libtest is
         # mid-line, so reports routinely share an output line, and the detector's
         # bounded `.{0,120}` is greedy: with a short kernel name the second
@@ -434,17 +502,18 @@ for crate in "${crates[@]}"; do
         # then per diagnostic rather than per line, so the mix in the final
         # banner sums to the count printed beside it.
         one_per_line="$(awk '{ gsub(/Invalid /, "\n&"); print }' "${log}")"
-        hits="$(printf '%s\n' "${one_per_line}" \
-                | grep -Eo "${VALIDATION_DIAGNOSTIC}[^\"]*\"[^\"]*\"" \
-                | grep -Eo 'kernel function: "[^"]*"' | sort | uniq -c | sort -rn)"
-        diagnostics="$(printf '%s\n' "${one_per_line}" | grep -Eo "${VALIDATION_DIAGNOSTIC}")"
-        n_hits="$(printf '%s' "${diagnostics}" | grep -c '.')"
+        records="$(printf '%s\n' "${one_per_line}" \
+                   | grep -E "^${VALIDATION_DIAGNOSTIC}" | diagnostic_records)"
+        n_hits="$(printf '%s' "${records}" | grep -c '.')"
         if [ "${n_hits}" -gt 0 ]; then
+            hits="$(printf '%s\n' "${records}" \
+                    | awk -F'\t' 'NF == 2 { printf "%s \"%s\"\n", $1, $2 }' \
+                    | sort | uniq -c | sort -rn | sed 's/^ */    /')"
             validation_hits="${validation_hits}  ${crate}: ${n_hits} invalid access(es)"$'\n'
-            if [ -n "${hits}" ]; then
-                validation_hits="${validation_hits}$(printf '%s\n' "${hits}" | sed 's/^/    /')"$'\n'
-            fi
-            validation_kinds="${validation_kinds}$(printf '%s\n' "${diagnostics}" | access_kind)"$'\n'
+            validation_hits="${validation_hits}${hits}"$'\n'
+            validation_kinds="${validation_kinds}$(printf '%s\n' "${records}" \
+                                                  | awk -F'\t' 'NF == 2 { print $1 }')"$'\n'
+            validation_records="${validation_records}${records}"$'\n'
         fi
     fi
     rm -f "${log}"
@@ -493,19 +562,141 @@ red=0
 
 # An invalid access is a failure even though every test reported `ok` and cargo
 # exited 0 — that is the whole point: the access never reaches the buffer, and
-# the assertions downstream of it still pass.
-if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${validation_hits}" ]; then
-    echo "ERROR: Metal shader validation reported invalid memory access:" >&2
-    printf '%s' "${validation_hits}" >&2
-    echo >&2
-    echo "Access mix over the hits above:" >&2
-    printf '%s' "${validation_kinds}" | sort | uniq -c | sort -rn | sed 's/^ */    /' >&2
-    echo "An invalid access is DROPPED, not raised — an invalid write is discarded," >&2
-    echo "an invalid read is zero-filled — so the tests over it can still report ok" >&2
-    echo "with cargo exiting 0. A write that never landed is corruption outright; a" >&2
-    echo "read only matters if the kernel keeps the lanes it filled, so read the mix." >&2
-    echo >&2
-    red=1
+# the assertions downstream of it still pass. The census pin says which hits this
+# tree has already accounted for; everything else is a new one.
+if [ "${SHADER_VALIDATION}" = "1" ]; then
+    # Parse the pin. A malformed entry is a failure rather than a skipped line:
+    # a typo that silently drops an entry would turn its kernel's hits into
+    # unpinned ones on the next run, and the reader would chase a delta the file
+    # only appears to cover.
+    pin_entries=""
+    pin_errors=""
+    pin_lineno=0
+    if [ -f "${CENSUS_PIN}" ]; then
+        while IFS= read -r pin_line || [ -n "${pin_line}" ]; do
+            pin_lineno=$((pin_lineno + 1))
+            case "$(trim "${pin_line}")" in ''|'#'*) continue ;; esac
+            IFS='|' read -r p_kernel p_kind p_count p_crate p_test p_snapshot p_ref p_extra \
+                <<< "${pin_line}"
+            p_kernel="$(trim "${p_kernel}")"
+            p_kind="$(trim "${p_kind}")"
+            p_count="$(trim "${p_count}")"
+            p_crate="$(trim "${p_crate}")"
+            p_test="$(trim "${p_test}")"
+            p_snapshot="$(trim "${p_snapshot}")"
+            p_ref="$(trim "${p_ref}")"
+            if [ -z "${p_kernel}" ] || [ -z "${p_kind}" ] || [ -z "${p_count}" ] ||
+               [ -z "${p_crate}" ] || [ -z "${p_test}" ] || [ -z "${p_snapshot}" ] ||
+               [ -z "${p_ref}" ] || [ -n "${p_extra}" ]; then
+                pin_errors="${pin_errors}    line ${pin_lineno}: expected 7 fields — kernel | kind | count | crate | test | snapshot | reference"$'\n'
+                continue
+            fi
+            case "${p_count}" in
+                ''|*[!0-9]*|0) pin_errors="${pin_errors}    line ${pin_lineno}: count '${p_count}' is not a positive integer"$'\n'
+                               continue ;;
+            esac
+            # The pin holds validated-benign READS. A dropped write is
+            # corruption, so there is no analysis that makes one acceptable and
+            # no way to write one into this file.
+            case "${p_kind}" in
+                *store*) pin_errors="${pin_errors}    line ${pin_lineno}: a store is never pinnable — an invalid write is corruption, not a validated-benign read"$'\n'
+                         continue ;;
+            esac
+            case "${pin_entries}" in
+                *"${p_kind}"$'\t'"${p_kernel}"$'\t'*)
+                    pin_errors="${pin_errors}    line ${pin_lineno}: \"${p_kernel}\" ${p_kind} is pinned twice — one entry per kernel and kind, or the counts cannot be compared"$'\n'
+                    continue ;;
+            esac
+            pin_entries="${pin_entries}${p_kind}"$'\t'"${p_kernel}"$'\t'"${p_count}"$'\t'"${p_crate}"$'\t'"${p_test}"$'\t'"${p_snapshot}"$'\t'"${p_ref}"$'\n'
+        done < "${CENSUS_PIN}"
+    fi
+
+    census_deviations=""
+    census_accepted=""
+    census_notes=""
+    census_matched=""
+
+    observed_tally="$(printf '%s' "${validation_records}" \
+        | awk -F'\t' 'NF == 2 { n[$0]++ } END { for (k in n) printf "%d\t%s\n", n[k], k }')"
+
+    while IFS=$'\t' read -r o_count o_kind o_kernel; do
+        [ -z "${o_kind}" ] && continue
+        case "${o_kind}" in
+            *store*)
+                census_deviations="${census_deviations}    never accepted: ${o_count} ${o_kind} \"${o_kernel}\" — an invalid write is corruption, not a validated-benign read"$'\n'
+                continue ;;
+        esac
+        entry=""
+        while IFS= read -r pin_entry; do
+            case "${pin_entry}" in
+                "${o_kind}"$'\t'"${o_kernel}"$'\t'*) entry="${pin_entry}" ;;
+            esac
+        done <<< "${pin_entries}"
+        if [ -z "${entry}" ]; then
+            census_deviations="${census_deviations}    not pinned: ${o_count} ${o_kind} \"${o_kernel}\""$'\n'
+            continue
+        fi
+        IFS=$'\t' read -r e_kind e_kernel e_count e_crate e_test e_snapshot e_ref <<< "${entry}"
+        census_matched="${census_matched}${e_kind}"$'\t'"${e_kernel}"$'\n'
+        if [ "${o_count}" -gt "${e_count}" ]; then
+            census_deviations="${census_deviations}    count moved up: \"${o_kernel}\" ${o_kind} — pinned ${e_count}, observed ${o_count}"$'\n'
+        elif [ "${o_count}" -lt "${e_count}" ]; then
+            exemption="$(census_downward_exemption "${e_snapshot}")"
+            if [ -z "${exemption}" ]; then
+                census_deviations="${census_deviations}    count moved down: \"${o_kernel}\" ${o_kind} — pinned ${e_count}, observed ${o_count}"$'\n'
+            else
+                census_notes="${census_notes}    not enforced downward: \"${o_kernel}\" ${o_kind} — pinned ${e_count}, observed ${o_count} (${exemption})"$'\n'
+            fi
+        else
+            census_accepted="${census_accepted}    ${o_count} ${o_kind} \"${o_kernel}\""$'\n'
+            census_accepted="${census_accepted}        reached from: ${e_crate} / ${e_test}"$'\n'
+            census_accepted="${census_accepted}        validated by: ${e_ref}"$'\n'
+        fi
+    done <<< "${observed_tally}"
+
+    # A pinned kernel that stopped firing is only visible from the pin's side:
+    # the observed tally has no line to carry it. It means the pin is stale, and
+    # a stale pin is one that no longer describes what it claims to have
+    # validated.
+    while IFS=$'\t' read -r e_kind e_kernel e_count e_crate e_test e_snapshot e_ref; do
+        [ -z "${e_kind}" ] && continue
+        case "${census_matched}" in *"${e_kind}"$'\t'"${e_kernel}"$'\n'*) continue ;; esac
+        exemption="$(census_downward_exemption "${e_snapshot}")"
+        if [ -z "${exemption}" ]; then
+            census_deviations="${census_deviations}    no longer fires: \"${e_kernel}\" ${e_kind} — pinned ${e_count}, observed 0"$'\n'
+        else
+            census_notes="${census_notes}    not enforced downward: \"${e_kernel}\" ${e_kind} — pinned ${e_count}, observed 0 (${exemption})"$'\n'
+        fi
+    done <<< "${pin_entries}"
+
+    if [ -n "${pin_errors}${census_deviations}" ]; then
+        if [ -n "${validation_hits}" ]; then
+            echo "ERROR: Metal shader validation reported invalid memory access:" >&2
+            printf '%s' "${validation_hits}" >&2
+            echo >&2
+            echo "Access mix over the hits above:" >&2
+            printf '%s' "${validation_kinds}" | sort | uniq -c | sort -rn | sed 's/^ */    /' >&2
+            echo "An invalid access is DROPPED, not raised — an invalid write is discarded," >&2
+            echo "an invalid read is zero-filled — so the tests over it can still report ok" >&2
+            echo "with cargo exiting 0. A write that never landed is corruption outright; a" >&2
+            echo "read only matters if the kernel keeps the lanes it filled, so read the mix." >&2
+            echo >&2
+        fi
+        echo "ERROR: the shader-validation census does not match the pin:" >&2
+        printf '%s' "${pin_errors}${census_deviations}${census_notes}" >&2
+        echo >&2
+        echo "Pin: ${CENSUS_PIN}" >&2
+        echo "A hit that matches the pin exactly is accepted; anything else is new." >&2
+        echo "Extend the pin only for a hit whose analysis says it is benign, with the" >&2
+        echo "reference to that analysis in the entry. A count that moved down, or a" >&2
+        echo "kernel that stopped firing, means the pin is stale: re-derive it from a" >&2
+        echo "full run rather than editing it to fit this one. See docs/TESTING.md." >&2
+        echo >&2
+        red=1
+    elif [ -n "${census_accepted}${census_notes}" ]; then
+        echo "shader validation: census matches the pin (${CENSUS_PIN#"${REPO_ROOT}"/})"
+        printf '%s' "${census_accepted}${census_notes}"
+    fi
 fi
 
 if [ -n "${failed_crates}" ]; then
@@ -514,11 +705,12 @@ if [ -n "${failed_crates}" ]; then
     echo >&2
     echo "Reproduce one crate with:" >&2
     echo "  cargo test --no-fail-fast -p <crate> --tests -- --ignored --test-threads=1 <filter>" >&2
-    echo "This suite is NOT known to be green on main, and this runner tracks no" >&2
-    echo "known-red list. Before attributing a failure above to your change, re-run" >&2
-    echo "the same crate and filter on a clean checkout of your base commit and" >&2
-    echo "compare: that is the only thing that separates a regression you caused" >&2
-    echo "from one you inherited, and it is cheap. See docs/TESTING.md." >&2
+    echo "A failing TEST is not covered by the census pin — that pin accounts for" >&2
+    echo "shader-validation hits only, and nothing here is a known-red list. Before" >&2
+    echo "attributing a failure above to your change, re-run the same crate and" >&2
+    echo "filter on a clean checkout of your base commit and compare: that is the" >&2
+    echo "only thing that separates a regression you caused from one you inherited," >&2
+    echo "and it is cheap. See docs/TESTING.md." >&2
     echo "A crate reported as 'ran uninstrumented' usually failed to BUILD: no test" >&2
     echo "binary means no Metal device and therefore no validation banner." >&2
     red=1
@@ -536,7 +728,9 @@ if [ -n "${snapshot_root_note}" ]; then
 else
     incomplete=""
 fi
-if [ "${SHADER_VALIDATION}" = "1" ]; then
+if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${validation_records}" ]; then
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader validation matches the pinned census.${incomplete}"
+elif [ "${SHADER_VALIDATION}" = "1" ]; then
     echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader validation clean.${incomplete}"
 else
     echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s) (uninstrumented).${incomplete}"

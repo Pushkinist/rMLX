@@ -1,0 +1,55 @@
+# gpu_validation_census.txt — the Metal shader-validation hits this tree accepts.
+#
+# `scripts/run_gpu_tests.sh` instruments every Metal pipeline and scans for
+# invalid-access diagnostics. Some of them come from a kernel this repo neither
+# compiles nor can fix, and failing every run on those teaches their readers to
+# read `Error 1` as background noise — at which point the next real hit is
+# invisible. This file is what makes the two distinguishable: the runner diffs
+# the per-kernel tally it just observed against these entries, and
+#
+#   * an exact match on every entry, with no unpinned hit and no store, passes
+#     and prints the census it accepted;
+#   * a new kernel, a count that moved UP, a count that moved DOWN, a pinned
+#     kernel that stopped firing, or any store at all, fails and names the delta.
+#
+# A count that moved down is a failure because a pin that drifts downward one hit
+# at a time ends up describing whatever the tree does today rather than what was
+# validated. Re-derive it from a full run instead.
+#
+# Fields, `|`-separated, seven of them:
+#
+#   kernel    | the kernel function named in the diagnostic, verbatim
+#   kind      | the access as the layer worded it (`device load`); a store is
+#             | never pinnable — an invalid write is corruption, not a
+#             | validated-benign read, so the runner refuses such an entry
+#   count     | the exact number of diagnostics, over a full unnarrowed run
+#   crate     | the workspace member whose GPU tests reach it
+#   test      | the test(s) it is reached from, for the reader's triage
+#   snapshot  | the model snapshot under RMLX_O_MODELS_ROOT the entry needs, or
+#             | `-` for none. Absent from the machine, the entry cannot fire, so
+#             | the runner does not treat a shortfall as a stale pin there.
+#   reference | where the analysis lives that says this hit is benign
+#
+# TO ADD OR CHANGE AN ENTRY you need one of two things, and nothing else counts:
+# a linked upstream reference showing the defect is not ours and not reachable
+# into our output, or an analysis of the same standard as the one below —
+# provenance of the symbol, a load/store census over every diagnostic, and a
+# demonstration that the loaded lanes do not reach the output. Neither a passing
+# test suite nor a quiet run is evidence: the validation layer bounds the
+# MTLBuffer rather than the array, so absence of a diagnostic is not absence of
+# an out-of-bounds access.
+#
+# kernel | kind | count | crate | test | snapshot | reference
+#
+# The entry below is MLX's own quantized matmul, not a kernel this repo compiles
+# or can specialise. `QuantizedBlockLoader::load_safe` in
+# `mlx/backend/metal/kernels/quantized.h` bounds its row index against the tile's
+# COLUMN extent, so the guard can never fire and a transposed quantized matmul
+# whose N is not a multiple of the output tile width reads the out-of-range rows
+# of the packed weight and the scales. rMLX passes correctly sized operands; the
+# reachable tensor is a 1-row quantized `shared_expert_gate`, which is legal
+# input. Every diagnostic is a load, and the loaded lanes were shown bitwise not
+# to reach the output — including with the out-of-range rows held at NaN under
+# the same kernel instantiation. The selector is identical in the next MLX
+# release, so moving the pinned MLX does not remove it.
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 160 | rmlx-models | qwen3_5_moe_forward_seq_last_k_equals_reference + qwen3_5_moe_consume_engine_migration_golden + thinking_budget_exact_hit_qwen3_5_moe | mlx-community__Qwen3.6-35B-A3B-8bit | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
