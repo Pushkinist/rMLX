@@ -1317,6 +1317,19 @@ pub(crate) fn emit_step(
     emitted.push(step);
 }
 
+/// The prefill chunk the speculative verifier uses for a checkpoint's
+/// `architectures[0]` class name.
+///
+/// The verifier prefills the same weights over the same prompt as the
+/// architecture's own generate path, so it takes the same chunk: the class
+/// resolves to its module key and then through the ordinary resolution order,
+/// which is what makes a retuned per-arch default and an
+/// `RMLX_PREFILL_CHUNK_<ARCH>` override reach speculative prefill too. An
+/// unregistered class resolves to the conservative fallback chunk.
+pub(crate) fn verifier_prefill_chunk(arch_class: &str) -> usize {
+    crate::prefill_chunk::prefill_chunk_for(crate::prefill_chunk::module_key_for_class(arch_class))
+}
+
 /// Chunked prefill of `tokens` into `caches`, mirroring the gemma4 generate
 /// path (enter_prefill / exit_prefill brackets, per-arch chunk size).
 ///
@@ -1330,14 +1343,8 @@ pub fn prefill_chunked(
     mut lin_caches: Option<&mut [LinearAttnCache]>,
     device: Device,
 ) -> Result<()> {
-    // Dispatch the chunk size off the actual arch family: Gemma4 and the
-    // Qwen3.5MoE hybrid use their own per-arch prefill chunk size.
-    let prefill_chunk = if arch.needs_lin_caches() {
-        crate::prefill_chunk::prefill_chunk_for("qwen3_5_moe")
-    } else {
-        crate::prefill_chunk::prefill_chunk_for("gemma4")
-    };
-    prefill_chunked_with(tokens, caches, prefill_chunk, device, |chunk, caches| {
+    let chunk_size = verifier_prefill_chunk(arch.arch_class());
+    prefill_chunked_with(tokens, caches, chunk_size, device, |chunk, caches| {
         // Single-position last_k=1 forward — we only need cache update, not
         // logits. The lazy graph drops the lm_head matmul on non-final chunks;
         // on the final chunk we discard the returned Array. For GDN-bearing

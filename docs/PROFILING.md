@@ -9,6 +9,37 @@ Per-bench TPS / TTFT / RSS land in `metrics/runs.db` (see `docs/METRICS_DB.md`).
 - `rmlx metrics deltas --since-sha <git-sha> --threshold-pct 5` — what regressed since a commit.
 - `rmlx metrics rank --metric decode_tps_warm --limit 20` — top-20 champions.
 
+## Ordering on this host: ABBA is not enough
+
+Any comparison of two or more configurations runs them in slots, and a slot's
+position in the run affects what it measures. The usual defence is an
+ABBA-interleaved block, which cancels drift that is **linear** in slot
+position: whatever the host does monotonically over the run — warming up,
+a background process ramping — contributes equally to both arms.
+
+This host's drift is not linear. Slot 2 of a block runs slow for whichever arm
+occupies it, by a margin comparable to the effects being chased. ABBA puts the
+same arm in slot 2 of every block, so that penalty does not cancel — it lands
+entirely on one arm, and it lands there consistently enough to look like a
+clean result with a tight range. A single ABBA block has produced two confident
+wrong calls here, both later overturned by re-running with the arms exchanged.
+
+The rule, therefore:
+
+- **Two arms** — pair every ABBA block with a BAAB block, so each arm occupies
+  each slot position equally often. `scripts/perf_ab.sh` alternates
+  ABBA / BAAB / ABBA for this reason.
+- **Three or more levels** — a Latin square over the levels: level index
+  `(position + row) % n_levels`, one row per cycle, so every level occupies
+  every slot position exactly once per `n_levels` rows.
+  `scripts/prefill_chunk_sweep.sh` runs this shape.
+- **Report the paired statistic, not the pooled one.** Compare each level to
+  the baseline *within a row* and take the median over rows. A pooled median
+  across all slots re-admits the positional term the design just removed.
+
+An unpaired block, or a paired block reported pooled, is not evidence here
+regardless of how tight its range looks.
+
 ## Prerequisites (already shipped)
 
 `Cargo.toml [profile.release]` has:
@@ -671,31 +702,28 @@ When weights are evicted by the compressor, `external_bytes` drops and `compress
 ## 10. Prefill-chunk size knob (J9)
 
 Cold prefill is chunked per-arch by `rmlx_models::prefill_chunk::prefill_chunk_for(arch)`
-(all 7 archs route through it). The chunk size trades per-chunk lazy-graph
-overhead against MLX scheduler pipelining and the GatedDeltaNet `ts<256`
-fast-path (Qwen3.5-MoE). Tuned per-arch from follow-up bench data —
-**do not change defaults without an executor-bench sweep** (CLAUDE.md
-§"Executor-bench discipline").
+(every arch routes through it). The chunk size trades per-chunk lazy-graph and
+command-buffer overhead against the per-chunk attention and KV work, which
+grows with the chunk. Each default is tuned from a real-model sweep and the
+`arch_default` row in `crates/rmlx-models/src/prefill_chunk.rs` records what it
+was measured on — **do not change one without a sweep** (CLAUDE.md
+§"Regression-bench discipline"), and run that sweep as a Latin square, not an
+ABBA block (see §"Ordering on this host").
 
-Per-arch defaults: `qwen3=256`, `qwen3_5_moe=64`, `gemma3=256`,
-`gemma4=512`, `qwen2=256`, `laguna=256`.
+The defaults themselves are that `arch_default` table; they are not restated
+here, because a second copy is a copy that goes stale.
 
-Override at runtime (resolution order: **per-arch env > global env >
+Override at runtime (resolution order: **runtime override
+(`set_prefill_chunk`, the adaptive controller) > per-arch env > global env >
 arch default > 64 fallback**):
 
 - `RMLX_PREFILL_CHUNK=<n>` — global, all archs.
 - `RMLX_PREFILL_CHUNK_<ARCH>=<n>` — per-arch, ARCH upper-cased, e.g.
   `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256`.
 
-Notes:
-- `qwen3_5_moe=64` is deliberately low: a larger chunk pushes
-  GatedDeltaNet past the `ts<256` fused-kernel fast-path into the slow
-  MLX-graph recurrence. The 256 variant is reachable via
-  `RMLX_PREFILL_CHUNK_QWEN3_5_MOE=256` for users who want to A/B it.
-- `gemma4=512` is bench-justified (−30% cold TTFT at 8K vs 256).
-- The 64-is-best-for-qwen3_5_moe verdict was last measured 2026-05-12;
-  re-confirm in the next bench sweep that touches the MoE path (J9.5,
-  backlog).
+`scripts/prefill_chunk_sweep.sh` drives the per-arch sweep those overrides
+exist for, and records its cells in the metrics DB under
+`decode_config = 'prefill_chunk=<n>'`.
 
 ## Quick reference
 

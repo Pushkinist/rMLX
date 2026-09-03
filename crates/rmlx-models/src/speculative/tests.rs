@@ -312,3 +312,50 @@ fn tiny_tokenizer() -> tokenizers::Tokenizer {
         .expect("literal vocabulary builds a WordLevel model");
     tokenizers::Tokenizer::new(model)
 }
+
+/// The verifier prefills at each architecture's own chunk, not at one
+/// architecture's chunk for all of them.
+///
+/// A verifier that prefilled a qwen3 checkpoint at gemma4's chunk would put
+/// speculative decoding on a chunk no sweep ever measured for it, and a
+/// retuned per-arch default or an `RMLX_PREFILL_CHUNK_<ARCH>` override would
+/// never reach speculative prefill at all. The expected key per registered
+/// class is written out here rather than read back from `module_key_for_class`,
+/// so this fails if the verifier's lookup moves or that mapping does. The
+/// table is compared against the registry first, so a newly registered
+/// architecture fails here rather than being skipped.
+#[test]
+fn verifier_prefill_chunk_is_the_architectures_own() {
+    // In registry order. `JinaEmbeddingsV4Model` is an encoder with no
+    // `Architecture` variant and so no verifier; the empty key is the
+    // conservative fallback chunk, which is the right answer for a class that
+    // has no prefill path of its own.
+    let expected: &[(&str, &str)] = &[
+        ("Gemma4ForConditionalGeneration", "gemma4"),
+        ("Gemma4UnifiedForConditionalGeneration", "gemma4"),
+        ("Gemma3ForConditionalGeneration", "gemma3"),
+        ("Qwen2ForCausalLM", "qwen2"),
+        ("Qwen3ForCausalLM", "qwen3"),
+        ("LagunaForCausalLM", "laguna"),
+        ("Qwen3_5MoeForConditionalGeneration", "qwen3_5_moe"),
+        ("Qwen3_5ForConditionalGeneration", "qwen3_5_moe"),
+        ("Qwen3VLMoeForConditionalGeneration", "qwen3_vl_moe"),
+        ("BitNetForCausalLM", "bitnet"),
+        ("JinaEmbeddingsV4Model", ""),
+    ];
+
+    let covered: Vec<&str> = expected.iter().map(|(class, _)| *class).collect();
+    assert_eq!(
+        covered,
+        crate::arch::registry::KNOWN_ARCHS.to_vec(),
+        "a registered architecture is missing from this table"
+    );
+
+    for (class, key) in expected {
+        assert_eq!(
+            verifier_prefill_chunk(class),
+            crate::prefill_chunk::prefill_chunk_for(key),
+            "verifier prefill chunk for {class} is not {key}'s"
+        );
+    }
+}

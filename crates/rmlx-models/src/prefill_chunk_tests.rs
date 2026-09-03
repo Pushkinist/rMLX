@@ -9,7 +9,7 @@ fn defaults_match_recommendations() {
     if env::var("RMLX_PREFILL_CHUNK").is_ok() {
         return;
     }
-    assert_eq!(arch_default("qwen3"), Some(256));
+    assert_eq!(arch_default("qwen3"), Some(1024));
     assert_eq!(arch_default("qwen3_5_moe"), Some(2048));
     assert_eq!(arch_default("qwen3_vl_moe"), Some(512));
     assert_eq!(arch_default("gemma3"), Some(256));

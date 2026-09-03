@@ -124,7 +124,18 @@ pub fn module_key_for_class(arch_class: &str) -> &'static str {
 
 fn arch_default(arch: &str) -> Option<usize> {
     match arch {
-        "qwen3" => Some(256),
+        // qwen3 default 1024. A real-model kv-none sweep over
+        // {256,512,1024,2048,4096} on two qwen3 snapshots (Ternary-Bonsai-8B
+        // 2-bit and Qwen3-8B-8bit) at 4k / 16k / 32k prompts, run as a cyclic
+        // Latin square so this host's per-slot drift cancels rather than
+        // landing on one level, made 1024 the only level that lowers TTFT at
+        // every measured prompt length on both snapshots, with decode rate
+        // unchanged and the token digest identical. 4096 is faster at 4k on
+        // one snapshot and regresses at 16k and 32k on both, so it is not the
+        // shared default. The cells: `SELECT model, ctx_max, decode_config,
+        // metric, value FROM observations WHERE decode_config LIKE
+        // 'prefill_chunk=%'`. Override via `RMLX_PREFILL_CHUNK_QWEN3`.
+        "qwen3" => Some(1024),
         // qwen3_5_moe: 2048, matching mlx-lm's prefill_step_size. The GDN
         // recurrence now always runs the `gated_delta_step_gpu` Metal kernel
         // (one dispatch, T-loop in registers) instead of flipping to the

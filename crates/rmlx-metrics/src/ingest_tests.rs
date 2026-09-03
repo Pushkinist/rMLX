@@ -660,6 +660,25 @@ fn the_decode_config_wire_key_reaches_the_column() {
     assert_eq!(stored.as_deref(), Some("mtp/block=5"));
 }
 
+/// A spelling outside the grammar is refused at ingest rather than stored.
+///
+/// The column is cell identity, so a record that reaches the DB in a private
+/// spelling is not a bad label — it is a cell nothing else will ever land in,
+/// and its rows read as champions of a configuration no one measured twice.
+#[test]
+fn a_decode_configuration_outside_the_grammar_is_rejected() {
+    let mut r = valid_record();
+    r.decode_config = Some("prefill chunk 1024".to_string());
+    let err = r.validate().unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidIngestField { ref field, .. } if field == "decode_config"),
+        "expected decode_config rejection, got {err:?}"
+    );
+
+    r.decode_config = Some("prefill_chunk=1024".to_string());
+    assert!(r.validate().is_ok());
+}
+
 /// An emitter that says nothing writes NULL, which is ordinary decode — not a
 /// missing value to be filled in later.
 #[test]

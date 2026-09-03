@@ -603,9 +603,12 @@ layers receive their layer-specific `window` value; full-attention layers
 receive `max_seq`. The `max_seq` bound is derived from the verifier's
 `max_position_embeddings` (clamped to `KV_MAX_SEQ_DEFAULT`).
 
-Verifier prefill (all paths) uses `prefill_chunked`: per-arch chunk sizes
-(Gemma4 and Qwen3.5-MoE have different Metal-optimal chunk sizes) gate how
-much sequence length is dispatched per Metal command buffer. Non-final chunks
+Verifier prefill (all paths) uses `prefill_chunked`, which gates how much
+sequence length is dispatched per Metal command buffer. The chunk is the
+verifier's own: `verifier_prefill_chunk` resolves the verifier's `arch_class()`
+through `prefill_chunk::module_key_for_class`, so a verifier prefills at the
+chunk that architecture's generate path uses, and a retuned default or an
+`RMLX_PREFILL_CHUNK_<ARCH>` override reaches speculative prefill too. Non-final chunks
 forward with `forward_seq_last_k_with_cache` discarding the returned logits;
 between chunks the KV cache state is flushed via `eval_prefill_state`. The
 `enter_prefill` / `exit_prefill` bracket optimises cache memory layout.

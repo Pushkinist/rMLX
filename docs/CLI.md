@@ -111,7 +111,7 @@ mutually exclusive.
 | `--adaptive-admission` | bool flag | off | Enable the in-process adaptive admission controller. When set, the controller adjusts `max_queue_depth` dynamically based on SLA telemetry and rejects requests with HTTP 503 + `Retry-After: 5` when the end-to-end step estimate exceeds `2 × step-target-ms`. When absent, the static `--max-queue-depth` is used unchanged. |
 | `--step-target-ms` | u64 | 500 | End-to-end step SLA target in milliseconds for the adaptive controller. Anticipatory 503 fires when `est_step > 2 × this`. Requires `--adaptive-admission`. `--ttft-target-ms` is accepted as a hidden alias for backward compatibility. |
 | `--itl-target-ms` | u64 | 50 | ITL SLA target in milliseconds for the adaptive controller. Queue depth is lowered after `HOLD_TICKS` (3) consecutive ticks above target and raised when below `0.80 × target`. Requires `--adaptive-admission`. |
-| `--adaptive-prefill-chunk` | bool flag | off | Enable adaptive prefill-chunk sizing. Requires `--adaptive-admission`. Adjusts the process-wide prefill chunk within `[32, 2048]` tokens using the same deadband shape: raises when `est_itl < 0.80 × --itl-target-ms`, lowers after 3 consecutive overload ticks. OFF by default — defaults are locked from p0b-ttft bench. |
+| `--adaptive-prefill-chunk` | bool flag | off | Enable adaptive prefill-chunk sizing. Requires `--adaptive-admission`. Adjusts the process-wide prefill chunk within `[32, 2048]` tokens using the same deadband shape: raises when `est_itl < 0.80 × --itl-target-ms`, lowers after 3 consecutive overload ticks. OFF by default, because the per-arch defaults are bench-tuned and this overrides them — see the note below. |
 | `--default-temperature` | f32 | — | Server-wide default temperature when a request omits the field. Must be in `[0.0, 2.0]`. |
 | `--enable-thinking` | bool | — | Server-wide default for Qwen3-family thinking mode. Per-request `enable_thinking` overrides this. |
 | `--image-max-tokens` | usize | — (model config) | Server-wide default image-token budget for **Gemma4-unified** vision (issue #180). Raises the per-image soft-token budget the preprocessor allocates, preserving more resolution for dense inputs (e.g. tables); clamped to the model's safe upper bound (1120). When absent, the snapshot's `processor_config.json` `max_soft_tokens` (typically 280) is used — behaviour unchanged. Per-request `image_max_tokens` overrides this. No-op for text-only requests and non-Gemma4-unified vision archs. |
@@ -129,6 +129,20 @@ mutually exclusive.
 | `--rotor-qjl` | `on \| off` | `off` | Toggle the K-side 1-bit QJL residual for the `rotor3_sym` / `rotor4_sym` / `k_rotor3` / `k_rotor4` / `rotor_k_{3,4}_asym_v*_g*` codecs. Default `off`: QJL has no Metal kernel, so `on` forces the rotor K path onto CPU (single-digit TPS) with no measured accuracy gain across a two-arch context sweep; `off` routes the rotor K encode + decode through the Metal fused kernels. `--rotor-qjl on` opts into the residual for fidelity / ablation study. Env fallback: `RMLX_ROTOR_QJL=1`. No effect on non-rotor-K-side quant variants. |
 | `--planar-fused-qk` | `on \| off` | `on` | Route pre-softmax QK over PlanarQuant-packed K (`KvStorage::PlanarK`) through the `planar_fused_qk` MSL kernel instead of dequant+SDPA. Decode-step only (prefill chunks fall through to the legacy path). No effect on any non-PlanarK cache. **No env fallback — CLI-only**; tests do not need an env lock. See `docs/KV_QUANT.md` §"Fused-QK kernels". |
 | `--prefix-index` | `linear \| radix` | `linear` | Longest-prefix index strategy for the prompt cache. `linear` is O(slots × n\_blocks); `radix` is O(n\_blocks). |
+
+> **`--adaptive-prefill-chunk` replaces the per-arch default, in one
+> direction only.** The first tick seeds from the primary model's per-arch
+> chunk (`rmlx_models::prefill_chunk::prefill_chunk_for`) and then installs a
+> *process-wide* runtime override, which takes precedence over every per-arch
+> default and every `RMLX_PREFILL_CHUNK_<ARCH>` for the rest of the process.
+> Nothing clears it back to "no override", so once the controller has acted
+> the bench-tuned per-arch defaults no longer apply — including on a second
+> architecture loaded later under `--registry`, whose own default is never
+> consulted again. The override is clamped to `[32, 2048]`
+> (`PREFILL_CHUNK_MIN` / `PREFILL_CHUNK_MAX`), so an architecture whose default
+> already sits at the ceiling can only be moved downwards from it —
+> `arch_default` in `crates/rmlx-models/src/prefill_chunk.rs` says which ones
+> do.
 
 > **The rotor codecs are not memory wins; the iso ring is.** `iso3`, `iso4`,
 > `iso3_sym`, `iso4_sym`, `k_iso3`, `k_iso4`, `rotor3`, `rotor4`,

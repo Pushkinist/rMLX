@@ -413,6 +413,21 @@ impl RunRecord {
             }
         }
 
+        // decode_config — cell identity, so its spelling is a contract and not
+        // a label. Two emitters describing one engine configuration in two
+        // spellings put its measurements in two cells, where neither ranks
+        // against the other and both look like champions.
+        if let Some(config) = self.decode_config.as_deref() {
+            if !crate::cell::decode_config_is_well_formed(config) {
+                return Err(Error::InvalidIngestField {
+                    field: "decode_config".to_string(),
+                    message: format!(
+                        "must be `key=value` terms joined by `,` and ordered by key, got {config:?}"
+                    ),
+                });
+            }
+        }
+
         // temperature range (strict)
         if let Some(t) = self.temperature {
             if !(0.0..=2.0).contains(&t) {
