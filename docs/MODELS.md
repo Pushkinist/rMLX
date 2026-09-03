@@ -249,9 +249,12 @@ original_max_position_embeddings=16384`, extending the effective context to
 so it extends a checkpoint that already ships one — `--yarn-factor 8` on
 Bonsai's declared ×4-over-16384 reaches 131 072. `<n>` defaults to the
 checkpoint's declared `original_max_position_embeddings`, falling back to
-`max_position_embeddings`; the paper defaults `beta_fast=32, beta_slow=1`
-apply. The resulting window is the capacity `--max-ctx` is bounded by — see
-`docs/CLI.md` § "Context ceiling".
+`max_position_embeddings`. Only the window changes: a checkpoint that declares
+its own `beta_fast` / `beta_slow` keeps them, since those set where the YaRN
+ramp starts and ends at every position, including inside the trained window;
+the paper defaults `beta_fast=32, beta_slow=1` apply only when the checkpoint
+declares no `rope_scaling` at all. The resulting window is the capacity
+`--max-ctx` is bounded by — see `docs/CLI.md` § "Context ceiling".
 
 ### Special features
 

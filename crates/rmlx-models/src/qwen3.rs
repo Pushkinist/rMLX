@@ -798,7 +798,20 @@ impl Qwen3Config {
             if ov.factor <= 1.0 || original <= 0.0 {
                 return None;
             }
-            Some(crate::rope::YarnConfig::new(ov.factor, original))
+            // Only the window changes. A checkpoint that declares its own
+            // `beta_fast` / `beta_slow` keeps them: those set where the YaRN
+            // ramp starts and ends at every position, including inside the
+            // trained window, so replacing them would re-parameterise RoPE the
+            // operator never asked about. Paper defaults apply only when the
+            // checkpoint declares nothing.
+            Some(declared.map_or_else(
+                || crate::rope::YarnConfig::new(ov.factor, original),
+                |d| crate::rope::YarnConfig {
+                    factor: ov.factor,
+                    original_max_position_embeddings: original,
+                    ..d
+                },
+            ))
         });
         let scaling_source = if requested.is_some() {
             crate::context::ScalingSource::Operator

@@ -1092,6 +1092,66 @@ fn operator_yarn_factor_overrides_the_declared_scaling() {
     assert!((yarn.factor - 8.0).abs() < f32::EPSILON);
 }
 
+/// A checkpoint that declares non-default YaRN betas keeps them when the
+/// operator asks for a different window. `--yarn-factor` requests a wider
+/// context, not a different interpolation shape, and the betas set where the
+/// ramp starts and ends at *every* position — including inside the trained
+/// window.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test asserts the config parses; .expect() surfaces the failure as the test message"
+)]
+fn operator_yarn_factor_keeps_the_declared_betas() {
+    let declared = serde_json::json!({
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 16384,
+        "beta_fast": 16.0,
+        "beta_slow": 2.0,
+    });
+    let ov = YarnOverride {
+        factor: 8.0,
+        original_max: 0.0,
+    };
+    let cfg = Qwen3Config::from_model_config(&qwen3_cfg(65_536, Some(declared)), Some(&ov))
+        .expect("config parses");
+    let yarn = cfg.yarn.expect("operator scaling is active");
+    assert!(
+        (yarn.factor - 8.0).abs() < f32::EPSILON,
+        "factor is replaced"
+    );
+    assert!(
+        (yarn.beta_fast - 16.0).abs() < f32::EPSILON,
+        "declared beta_fast must survive, got {}",
+        yarn.beta_fast
+    );
+    assert!(
+        (yarn.beta_slow - 2.0).abs() < f32::EPSILON,
+        "declared beta_slow must survive, got {}",
+        yarn.beta_slow
+    );
+}
+
+/// Without a declared `rope_scaling` there are no betas to inherit, so the
+/// operator path uses the paper defaults.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test asserts the config parses; .expect() surfaces the failure as the test message"
+)]
+fn operator_yarn_factor_uses_paper_betas_when_none_declared() {
+    let ov = YarnOverride {
+        factor: 4.0,
+        original_max: 0.0,
+    };
+    let cfg =
+        Qwen3Config::from_model_config(&qwen3_cfg(40_960, None), Some(&ov)).expect("config parses");
+    let yarn = cfg.yarn.expect("operator scaling is active");
+    assert!((yarn.beta_fast - 32.0).abs() < f32::EPSILON);
+    assert!((yarn.beta_slow - 1.0).abs() < f32::EPSILON);
+}
+
 /// With no declared `rope_scaling` the anchor falls back to
 /// `max_position_embeddings`.
 #[test]
