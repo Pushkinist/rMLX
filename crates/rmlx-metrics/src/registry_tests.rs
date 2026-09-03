@@ -235,3 +235,24 @@ fn bounds_describe_shows_the_open_end() {
     assert_eq!(Bounds::positive(1e5).describe(), "(0, 100000.0]");
     assert_eq!(Bounds::non_negative(1.0).describe(), "[0, 1.0]");
 }
+
+/// Both PPL scorers' metrics are registered, with the same unit and direction.
+///
+/// An unregistered name is refused at `RunRecord::validate`, so the run's
+/// number never reaches the store — the command still exits 0 and leaves a
+/// buffer file, which is exactly what happened to the first eight cache-bearing
+/// sweeps. A metric the CLI can emit and the registry does not know is a
+/// measurement thrown away quietly.
+#[test]
+fn both_ppl_scorers_have_a_registered_metric() {
+    let (cacheless_unit, cacheless_dir) =
+        lookup("ppl_wikitext2").expect("the cacheless scorer's metric");
+    let (cached_unit, cached_dir) =
+        lookup("ppl_wikitext2_cached").expect("the cached scorer's metric");
+    assert_eq!(
+        (cacheless_unit, cacheless_dir),
+        (cached_unit, cached_dir),
+        "the two scorers measure perplexity in the same unit and rank the same way; \
+         only what produced the number differs"
+    );
+}
