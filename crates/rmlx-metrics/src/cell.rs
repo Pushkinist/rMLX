@@ -101,6 +101,71 @@ pub fn predicate(first_param: usize) -> (String, usize) {
     (sql, first_param + CELL_COLUMNS.len())
 }
 
+// ── Deriving `decode_config` from a row's own fields ──────────────────────────
+
+/// What a row's `notes` say about how its tokens were produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed classification — a row's notes either name a drafter, say there was none, or say nothing"
+)]
+pub enum NotesVerdict {
+    /// The notes name a drafter and its block size.
+    Speculative(String),
+    /// The notes say there was no drafter, or name the plain arm of a bench.
+    Plain,
+    /// The notes carry no statement either way.
+    Silent,
+}
+
+/// The canonical `decode_config` for a drafter and block size.
+///
+/// One definition of the format. `scripts/spec_bench.sh` writes the same string
+/// when it records a speculative arm, and `decode_config_format_is_stable` pins
+/// the spelling so the two cannot drift apart unnoticed.
+pub fn decode_config(draft_kind: &str, block_size: u32) -> String {
+    format!("{draft_kind}/block={block_size}")
+}
+
+/// Read the value of `key=` out of a `notes` string, up to the next space.
+fn note_value<'a>(notes: &'a str, key: &str) -> Option<&'a str> {
+    let rest = notes.split(key).nth(1)?;
+    let value = rest.split_whitespace().next()?;
+    (!value.is_empty()).then_some(value)
+}
+
+/// Classify a row by what its own `notes` say.
+///
+/// Bench scripts have recorded the drafter in `notes` since long before there
+/// was a column for it, so most rows written before that column existed can say
+/// what they were. The order matters: an early `spec_bench.sh` put the run's
+/// drafter flags on *both* arms, so a row saying `config=normal` alongside
+/// `draft_kind=mtp` is the no-drafter arm of a speculative bench — and its own
+/// `draft_tokens_total` is zero. "It says there was no drafter" therefore wins
+/// over "it names one".
+pub fn decode_config_from_notes(notes: &str) -> NotesVerdict {
+    if notes.contains("draft_kind=none")
+        || notes.contains("config=normal")
+        || notes.contains("config=base")
+    {
+        return NotesVerdict::Plain;
+    }
+
+    let kind = note_value(notes, "draft_kind=");
+    let block = note_value(notes, "block_size=");
+    match (kind, block) {
+        (Some(kind), Some(block)) if kind != "none" => {
+            match block.parse::<u32>() {
+                Ok(block) => NotesVerdict::Speculative(decode_config(kind, block)),
+                // A block size that is not a number is not a block size; the
+                // row does not say what it was.
+                Err(_) => NotesVerdict::Silent,
+            }
+        }
+        _ => NotesVerdict::Silent,
+    }
+}
+
 #[cfg(test)]
 #[path = "cell_tests.rs"]
 mod tests;

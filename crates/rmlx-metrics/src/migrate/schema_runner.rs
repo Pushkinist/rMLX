@@ -41,6 +41,9 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
         if target_version == 1 {
             seed_schema_meta(conn)?;
         }
+        if target_version == 6 {
+            backfill_decode_config(conn)?;
+        }
 
         applied += 1;
     }
@@ -51,6 +54,56 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
     bests_view::ensure(conn)?;
 
     Ok(applied)
+}
+
+/// Fill `decode_config` for rows whose own `notes` say what they were.
+///
+/// Migration 005 added the column and left every existing row NULL, which is
+/// what ordinary decode carries — so a speculative row written before the
+/// column kept sharing a cell with the plain row it should rank apart from, and
+/// kept winning it. The bench scripts recorded the drafter in `notes` long
+/// before there was a column for it, so most of those rows can say what they
+/// were.
+///
+/// This writes no measurement: it classifies a row from that row's own fields
+/// into a column that was NULL for want of existing. `notes` that say nothing
+/// either way stay NULL and are named in docs/METRICS_DB.md.
+///
+/// The rule itself is [`crate::cell::decode_config_from_notes`] — one parser,
+/// not a second spelling in SQL.
+///
+/// Returns how many rows were classified as speculative.
+fn backfill_decode_config(conn: &Connection) -> Result<usize> {
+    use crate::cell::{decode_config_from_notes, NotesVerdict};
+
+    let pending: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, notes FROM observations
+             WHERE decode_config IS NULL AND notes IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut filled = 0_usize;
+    for (id, notes) in pending {
+        if let NotesVerdict::Speculative(config) = decode_config_from_notes(&notes) {
+            conn.execute(
+                "UPDATE observations SET decode_config = ?1 WHERE id = ?2",
+                rusqlite::params![config, id],
+            )?;
+            filled += 1;
+        }
+    }
+
+    if filled > 0 {
+        tracing::info!(
+            rows = filled,
+            "migrate: classified pre-existing rows by the drafter their notes name"
+        );
+    }
+
+    Ok(filled)
 }
 
 /// Insert the well-known `schema_meta` seed rows.
@@ -72,3 +125,7 @@ fn seed_schema_meta(conn: &Connection) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "schema_runner_tests.rs"]
+mod tests;

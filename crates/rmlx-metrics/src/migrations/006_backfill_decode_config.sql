@@ -1,0 +1,29 @@
+-- Migration 006: say what the rows written before `decode_config` existed were.
+--
+-- Migration 005 added the column and left every existing row NULL, which is the
+-- value ordinary decode carries — so a speculative row from before the column
+-- kept sharing a cell with the plain row it should be ranked apart from, and
+-- kept winning it. On `gemma-4-e4b-it-mxfp8 / none / 16384` that is a drafter's
+-- 160.32 tok/s published as the model's decode throughput against the 83.70 a
+-- request without one gets, with nothing in the row to say which it was.
+--
+-- Except there is: the bench scripts have recorded `draft_kind=` and
+-- `block_size=` in `notes` since long before there was a column for them. This
+-- migration reads that back. **It writes no measurement.** `decode_config` is a
+-- classification of a row, derived from that row's own fields, into a column
+-- that was NULL because it did not exist yet — not a value being corrected, and
+-- not a number being changed. The append-only rule is about measurements.
+--
+-- The classification is a parser, not an expression — the order of its rules
+-- matters (an early `spec_bench.sh` put the run's drafter flags on *both* arms,
+-- so "says there was no drafter" has to beat "names one") — so it lives in
+-- `rmlx_metrics::cell::decode_config_from_notes` and runs from
+-- `migrate::schema_runner::backfill_decode_config`, the post-hook for this
+-- version. One parser, shared with anything else that has to read a row's arm
+-- back out of it. A row whose notes say nothing either way stays NULL and is
+-- named in docs/METRICS_DB.md under "Known-bad rows already in the DB".
+--
+-- The index is what this file contributes directly: `decode_config` is now part
+-- of the cell key and of the predicates that identify those remaining rows.
+
+CREATE INDEX IF NOT EXISTS obs_decode_config_idx ON observations(decode_config);

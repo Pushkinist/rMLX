@@ -22,6 +22,7 @@ pub static MIGRATIONS: &[(u32, &str)] = &[
         5,
         include_str!("migrations/005_observations_decode_config.sql"),
     ),
+    (6, include_str!("migrations/006_backfill_decode_config.sql")),
 ];
 
 // ---------------------------------------------------------------------------

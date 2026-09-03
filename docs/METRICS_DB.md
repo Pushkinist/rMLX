@@ -614,6 +614,31 @@ because nothing enforces it.
 
   No row written after this change matches: every row the script emits now
   carries `decode_window=`, whatever codec and prompt length it measured.
+- **`decode_config IS NULL` on a row that was speculative and never said so** —
+  migration 005 added the column and left every existing row NULL, which is what
+  ordinary decode carries, so a speculative row from before it kept sharing a
+  cell with the plain row it ranks against and kept winning it. Migration 006
+  reads the drafter back out of `notes`, which the bench scripts have recorded
+  since long before the column existed
+  (`rmlx_metrics::cell::decode_config_from_notes`), and classifies every row
+  whose own fields say what it was. What it cannot reach is a speculative run
+  that recorded no drafter marker anywhere: nothing distinguishes it from
+  ordinary decode, so it stays in the plain cell and no predicate finds it. That
+  the backfill is complete over what *is* recorded is checkable, and the check
+  is that this returns no rows:
+
+  ```sql
+  SELECT * FROM observations
+  WHERE decode_config IS NULL
+    AND notes LIKE '%draft_kind=%'
+    AND notes NOT LIKE '%draft_kind=none%'
+    AND notes NOT LIKE '%config=normal%'
+    AND notes NOT LIKE '%config=base%';
+  ```
+
+  Filling this column is not an exception to append-only. It classifies a row
+  from that row's own fields into a column that was NULL for want of existing;
+  no measurement is written, corrected or moved.
 
 Anything anchoring on a recorded rate — a roofline, a champion table, a
 `rmlx metrics rank` — should read `bests`, or one of the `query::*` functions,

@@ -73,6 +73,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes spelling at this commit — `docs/PERF_BASELINE.md` records the
   changeover.
 
+- **Rows written before `decode_config` existed say what they were.** Adding the
+  column left every existing row NULL, which is what ordinary decode carries, so
+  a speculative row from before it kept sharing a cell with the plain row it
+  ranks against and kept winning it — on `gemma-4-e4b-it-mxfp8 / none / 16384` a
+  drafter's 160.32 tok/s published as that model's decode throughput against the
+  83.70 a request without one gets. The bench scripts have recorded the drafter
+  in `notes` since long before there was a column for it, so migration 006 reads
+  it back and classifies every row whose own fields say what it was: 140 rows
+  across six drafter configurations. It writes no measurement — the column was
+  NULL for want of existing, not because anything measured it. A run that
+  recorded no drafter marker anywhere is indistinguishable from ordinary decode
+  and stays in the plain cell; `docs/METRICS_DB.md` says so and gives the query
+  that shows nothing recoverable was left behind.
+
 - **Everything that looks a cell up keys on the whole cell.** `decode_config`
   reached the `bests` view and none of its consumers: `rmlx metrics best`
   returned whichever arm the view yielded first, `compare` overwrote one arm
