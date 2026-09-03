@@ -83,9 +83,12 @@ pub struct ArchGenerator {
     /// EOS token ids parsed from config.json at load time. Empty when the
     /// field is missing — generate_greedy then runs to max_tokens.
     eos_ids: Arc<Vec<u32>>,
-    /// A2: effective max prompt-context length used by the per-request guard.
-    /// `min(max_ctx_override, max_position_embeddings, KV_MAX_SEQ_DEFAULT=4096)`.
+    /// Effective max prompt-context length used by the per-request guard —
+    /// the ceiling `rmlx_models::context::resolve_context` produced at load.
     effective_max_ctx: usize,
+    /// The checkpoint's context limits. A per-request `max_ctx` override is
+    /// resolved against these by the route layer.
+    context_limits: rmlx_models::context::ContextLimits,
     /// A10: detokenization family classified from `tokenizer.json`'s
     /// `decoder` node (mirrors mlx-lm). Drives the per-arch leading-space
     /// rule in the streaming UTF-8 token-healer. The byte-level withholding
@@ -250,20 +253,16 @@ impl ArchGenerator {
             "ArchGenerator: classified detokenizer family (A10)"
         );
 
-        // A2: derive effective_max_ctx for the per-request prompt-length guard.
-        // Mirrors the KV-cache allocation logic in gemma4/generate.rs::max_seq:
-        // - If --max-ctx given, take min(override, mpe) so the guard never
-        // exceeds the model's positional capacity even when the operator
-        // over-sized the KV buffer.
-        // - Otherwise take min(mpe, 4096) — same fallback chain the cache uses.
-        // Archs that don't expose mpe (Gemma3/Qwen2/Qwen3/Laguna) report 0 from
-        // `max_position_embeddings()`; treat 0 as "unknown" and fall back to 4096.
-        let mpe_raw = model.max_position_embeddings();
-        let mpe: usize = if mpe_raw <= 0 { 4096 } else { mpe_raw as usize };
-        let effective_max_ctx: usize = match max_ctx_override {
-            Some(n) if n > 0 => (n as usize).min(mpe),
-            _ => mpe.min(4096),
-        };
+        // Resolve the context bounds through the single resolver, so the
+        // per-request prompt-length guard, the KV ring the arch builds and the
+        // ceiling `/v1/models` reports are all the same number. An
+        // unsatisfiable `--max-ctx` fails the model load with the resolver's
+        // message, rather than clamping the window and surfacing later as an
+        // unrelated-looking overflow.
+        let context_limits = model.context_limits();
+        let resolved_ctx = rmlx_models::context::resolve_context(&context_limits, max_ctx_override)
+            .map_err(|e| Error::Model(e.to_string()))?;
+        let effective_max_ctx: usize = resolved_ctx.ceiling.max(0) as usize;
 
         // load the Gemma4 vision tower once when the snapshot ships a
         // `vision_config` (multimodal checkpoint). Text-only models return
@@ -463,6 +462,7 @@ impl ArchGenerator {
             ?max_ctx_override,
             prompt_cache_slots,
             effective_max_ctx,
+            positional_max = context_limits.positional_max(),
             has_vision = vision.is_some(),
             "ArchGenerator: ready"
         );
@@ -482,6 +482,7 @@ impl ArchGenerator {
             prompt_cache_slots,
             eos_ids: Arc::new(eos_ids),
             effective_max_ctx,
+            context_limits,
             tokenizer_kind,
             vision,
             audio,
@@ -499,6 +500,10 @@ impl ArchGenerator {
 impl Generator for ArchGenerator {
     fn effective_max_ctx(&self) -> usize {
         self.effective_max_ctx
+    }
+
+    fn context_limits(&self) -> Option<rmlx_models::context::ContextLimits> {
+        Some(self.context_limits)
     }
 
     fn cache_stats(&self) -> Option<rmlx_models::CacheStats> {

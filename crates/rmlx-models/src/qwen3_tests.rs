@@ -1005,3 +1005,124 @@ fn bf16_param_casts_fp16_to_bf16() {
         "bf16_param must pass through an already-bf16 array unchanged"
     );
 }
+
+// ── YARN precedence + the context limits it produces ─────────────────────────
+
+/// Build a minimal Qwen3 `config.json` blob with the given
+/// `max_position_embeddings` and optional `rope_scaling`.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test fixture builder: the JSON root is an object by construction, and a parse failure must surface as a test panic"
+)]
+fn qwen3_cfg(mpe: u64, rope_scaling: Option<serde_json::Value>) -> rmlx_loader::ModelConfig {
+    let mut root = serde_json::json!({
+        "architectures": ["Qwen3ForCausalLM"],
+        "hidden_size": 4096,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "intermediate_size": 12288,
+        "vocab_size": 151936,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_000_000.0,
+        "max_position_embeddings": mpe,
+    });
+    if let Some(rs) = rope_scaling {
+        root["rope_scaling"] = rs;
+    }
+    serde_json::from_value(root).expect("synthetic Qwen3 config parses")
+}
+
+/// Bonsai's declared scaling: YaRN ×4 over 16 384.
+fn bonsai_rope_scaling() -> serde_json::Value {
+    serde_json::json!({
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 16384,
+    })
+}
+
+/// A checkpoint-declared `rope_scaling` sets the context limits with no flag.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test asserts the config parses; .expect() surfaces the failure as the test message"
+)]
+fn declared_rope_scaling_becomes_the_context_limits() {
+    let cfg = Qwen3Config::from_model_config(&qwen3_cfg(65_536, Some(bonsai_rope_scaling())), None)
+        .expect("config parses");
+    assert_eq!(cfg.context.trained_max, 65_536);
+    assert_eq!(cfg.context.positional_max(), 65_536);
+    let scaling = cfg.context.scaling.expect("declared scaling is recorded");
+    assert_eq!(scaling.source, crate::context::ScalingSource::Config);
+    assert!((scaling.factor - 4.0).abs() < f32::EPSILON);
+}
+
+/// An explicit `--yarn-factor` **overrides** the checkpoint's own
+/// `rope_scaling` and raises the capacity. Deferring to the config instead
+/// would make the flag a no-op on exactly the checkpoints it exists for.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test asserts the config parses; .expect() surfaces the failure as the test message"
+)]
+fn operator_yarn_factor_overrides_the_declared_scaling() {
+    let ov = YarnOverride {
+        factor: 8.0,
+        original_max: 0.0,
+    };
+    let cfg =
+        Qwen3Config::from_model_config(&qwen3_cfg(65_536, Some(bonsai_rope_scaling())), Some(&ov))
+            .expect("config parses");
+    let scaling = cfg.context.scaling.expect("operator scaling is recorded");
+    assert_eq!(scaling.source, crate::context::ScalingSource::Operator);
+    assert!((scaling.factor - 8.0).abs() < f32::EPSILON);
+    assert!(
+        (scaling.original_max - 16_384.0).abs() < f32::EPSILON,
+        "the anchor defaults to the checkpoint's declared original, not its mpe",
+    );
+    assert_eq!(
+        cfg.context.positional_max(),
+        131_072,
+        "8 x 16384 is the window the operator asked for"
+    );
+    let yarn = cfg.yarn.expect("RoPE uses the operator's factor");
+    assert!((yarn.factor - 8.0).abs() < f32::EPSILON);
+}
+
+/// With no declared `rope_scaling` the anchor falls back to
+/// `max_position_embeddings`.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test asserts the config parses; .expect() surfaces the failure as the test message"
+)]
+fn yarn_factor_without_declared_scaling_anchors_on_mpe() {
+    let ov = YarnOverride {
+        factor: 4.0,
+        original_max: 0.0,
+    };
+    let cfg =
+        Qwen3Config::from_model_config(&qwen3_cfg(40_960, None), Some(&ov)).expect("config parses");
+    let scaling = cfg.context.scaling.expect("operator scaling is recorded");
+    assert!((scaling.original_max - 40_960.0).abs() < f32::EPSILON);
+    assert_eq!(cfg.context.positional_max(), 163_840);
+}
+
+/// Without any scaling the capacity is the trained window, and the
+/// architecture still reports that it *can* scale — so a refusal may offer
+/// `--yarn-factor`.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test asserts the config parses; .expect() surfaces the failure as the test message"
+)]
+fn unscaled_checkpoint_reports_the_trained_window() {
+    let cfg =
+        Qwen3Config::from_model_config(&qwen3_cfg(40_960, None), None).expect("config parses");
+    assert!(cfg.context.scaling.is_none());
+    assert_eq!(cfg.context.positional_max(), 40_960);
+    assert!(cfg.context.scaling_supported);
+}

@@ -225,12 +225,15 @@ cache sized to the ceiling.
 
 ### Mechanism
 
-* The resolved ceiling is `min(--max-ctx, max_position_embeddings)` when an
-  override is given, else `min(max_position_embeddings, KV_MAX_SEQ_DEFAULT)`.
-  Computed once per request by `rmlx_models::kv_cache::kv_max_seq_and_ceiling`,
-  which returns `(initial_max_seq, ceiling)`. This is the same chain the
-  server's `effective_max_ctx` uses for the per-request prompt-length guard,
-  so cache ceiling and request guard agree.
+* The resolved ceiling is `--max-ctx` when an override is given, else
+  `min(positional capacity, KV_MAX_SEQ_DEFAULT)`. An override **above** the
+  checkpoint's positional capacity is refused, not clamped — see
+  `docs/CLI.md` § "Context ceiling". Computed by
+  `rmlx_models::context::resolve_context`, which returns
+  `{ positional_max, ceiling, initial_max_seq }` and is the single producer of
+  every context bound in the tree: the server's `effective_max_ctx`, the
+  per-request `max_ctx` override, and the default `--max-prompt-tokens` cap all
+  read it, so cache ceiling and request guard cannot drift.
 * The ceiling is recorded on each `KvCache` via
   `KvCache::with_max_seq_ceiling(ceiling)` (field `max_seq_ceiling`). It is
   preserved across branch clones (`try_deep_clone`).
@@ -320,11 +323,13 @@ every arch, with or without a prompt-cache snapshot resident.
 
 ### Per-request `max_ctx` override (issue #26)
 
-Because the ceiling is resolved **per request** (`kv_max_seq_and_ceiling`), it
-can be overridden per request without reloading weights. The OpenAI route
-accepts an optional `max_ctx` field that supplies the override for that one
-request (else the launch `--max-ctx`); the server's `context_length_exceeded`
-prompt-length guard uses the per-request ceiling when present. This pairs with
+Because the ceiling is resolved **per request** (`resolve_context`), it can be
+overridden per request without reloading weights. The OpenAI route accepts an
+optional `max_ctx` field that supplies the override for that one request (else
+the launch `--max-ctx`); the server's `context_length_exceeded` prompt-length
+guard resolves the per-request value through the same function, so a request
+asking for more than the checkpoint can address is refused with the same
+message the launch flag would have produced. This pairs with
 the per-request KV-codec hot-swap (also issue #26) so a resident model can sweep
 `(codec × ctx)` cells with no reload. See `docs/SERVER.md` § "Per-request
 KV-config hot-swap".

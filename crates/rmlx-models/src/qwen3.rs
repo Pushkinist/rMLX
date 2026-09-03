@@ -70,9 +70,7 @@ use crate::decode_loop::{
     capture_logprobs, choose_token, chunked_prefill, pipelined_decode, reject_nan_prefill,
     DecodeCtx,
 };
-use crate::kv_cache::{
-    kv_layer_quants, kv_max_seq_and_ceiling, warn_if_kv_codec_net_negative, KvLayerShape,
-};
+use crate::kv_cache::{kv_layer_quants, warn_if_kv_codec_net_negative, KvLayerShape};
 use crate::layers::{resolve_quant, QuantParams};
 use crate::load_util::{bf16_param, bf16_scales, Weights};
 use crate::prompt_cache::{
@@ -613,13 +611,14 @@ fn qwen_embedding_lookup(
 // YarnOverride
 // ---------------------------------------------------------------------------
 
-/// Runtime YARN RoPE override for Qwen3 models that lack `rope_scaling` in
-/// their `config.json` but need context extension.
+/// Operator-requested YARN RoPE extension for Qwen3 models.
 ///
-/// Passed through `ModelLoadConfig` → `load_from_path` →
-/// `Qwen3Config::from_model_config`. When `Some`, it is tried as a fallback
-/// after the JSON-parsed `rope_scaling` path; the JSON path always wins when
-/// present.
+/// Passed through `LoadOpts` → `load_from_path` →
+/// `Qwen3Config::from_model_config`. An explicit override takes precedence
+/// over the checkpoint's own `rope_scaling`, and raises the positional
+/// capacity the context resolver enforces
+/// ([`crate::context::resolve_context`]), so it is the operator's way to
+/// serve a context the checkpoint does not declare.
 ///
 /// Set via `--yarn-factor` / `--yarn-original-max` CLI flags
 /// (env: `RMLX_YARN_FACTOR` / `RMLX_YARN_ORIGINAL_MAX`).
@@ -631,8 +630,9 @@ fn qwen_embedding_lookup(
 pub struct YarnOverride {
     /// YARN scale factor (must be > 1.0 to activate).
     pub factor: f32,
-    /// Original max position embeddings before YARN extension.
-    /// When 0.0, the model's `max_position_embeddings` is used as the fallback.
+    /// Pre-extension context size the scaling interpolates from. When 0.0,
+    /// the checkpoint's declared `original_max_position_embeddings` is used,
+    /// falling back to its `max_position_embeddings`.
     pub original_max: f32,
 }
 
@@ -678,18 +678,24 @@ pub struct Qwen3Config {
     /// From `max_position_embeddings`. Used to size the pre-allocated KV buffer.
     /// 0 if absent (caller falls back to `KV_MAX_SEQ_DEFAULT`).
     pub max_position_embeddings: u32,
-    /// YARN RoPE config (parsed from `rope_scaling`). `Some` triggers
-    /// the [`rmlx_mlx::rope_with_freqs`] path with the precomputed inv-freq
-    /// table + `mscale`; `None` keeps the plain `rope_theta`-only path.
+    /// YARN RoPE config (parsed from `rope_scaling`, or requested with
+    /// `--yarn-factor`). `Some` triggers the [`rmlx_mlx::rope_with_freqs`]
+    /// path with the precomputed inv-freq table + `mscale`; `None` keeps the
+    /// plain `rope_theta`-only path.
     pub yarn: Option<crate::rope::YarnConfig>,
+    /// Positional capacity of this checkpoint under the active RoPE
+    /// configuration. Fed to [`crate::context::resolve_context`], the one
+    /// producer of every context bound.
+    pub context: crate::context::ContextLimits,
 }
 
 impl Qwen3Config {
     /// Parse from a [`rmlx_loader::ModelConfig`] loaded from `config.json`.
     ///
-    /// `yarn_override` provides a runtime YARN config for models whose
-    /// `config.json` lacks `rope_scaling`. When `None`, only the JSON-parsed
-    /// path is active. JSON-parsed YARN always takes precedence over the override.
+    /// `yarn_override` carries `--yarn-factor` / `--yarn-original-max`. An
+    /// explicit override wins over the checkpoint's own `rope_scaling` (the
+    /// operator asked for a specific window); when it is absent the JSON
+    /// `rope_scaling` is used, and when neither is present RoPE is unscaled.
     pub fn from_model_config(
         cfg: &rmlx_loader::ModelConfig,
         yarn_override: Option<&YarnOverride>,
@@ -764,36 +770,42 @@ impl Qwen3Config {
             .or_else(|| cfg.text_config.as_ref()?.max_position_embeddings)
             .unwrap_or(0);
 
-        // YARN: parse `rope_scaling.rope_type == "yarn"` if present.
-        // Bonsai ships `{ rope_type: "yarn", factor: 4.0,
+        // YARN: `rope_scaling.rope_type == "yarn"` in config.json (Bonsai
+        // ships `{ rope_type: "yarn", factor: 4.0,
         // original_max_position_embeddings: 16384 }` with
-        // max_position_embeddings = 65536. Models without YARN keep
-        // `yarn = None` and use the plain `rope_theta`-only path
-        // (byte-identical to develop tip).
+        // max_position_embeddings = 65536), or an operator-requested
+        // extension via `--yarn-factor` / `--yarn-original-max`.
         //
-        // Runtime override path: for Qwen3 models that lack `rope_scaling` in
-        // config.json but want context extension, pass a `YarnOverride` via
-        // `--yarn-factor` / `--yarn-original-max` CLI flags. JSON-parsed YARN
-        // always takes precedence over the runtime override.
-        let yarn = e
+        // An explicit `--yarn-factor` wins over the checkpoint's own
+        // `rope_scaling`: it is how an operator asks for a window the
+        // checkpoint does not declare, so letting the JSON silence it would
+        // make the flag a no-op on exactly the models it exists for. This is
+        // llama.cpp's precedence for `--rope-scaling` / `--yarn-*`. The
+        // pre-extension anchor defaults to the checkpoint's declared
+        // `original_max_position_embeddings` when it has one, else to
+        // `max_position_embeddings`.
+        let declared = e
             .get("rope_scaling")
-            .and_then(crate::rope::YarnConfig::from_extras)
-            .or_else(|| {
-                let ov = yarn_override?;
-                let factor = ov.factor;
-                let original = if ov.original_max > 0.0 {
-                    ov.original_max
-                } else {
-                    max_position_embeddings as f32
-                };
-                if factor <= 1.0 || original <= 0.0 {
-                    return None;
-                }
-                Some(crate::rope::YarnConfig::new(factor, original))
-            });
-        // Single info log covers both the
-        // JSON-parsed and env-override paths; the inner or_else closure no
-        // longer emits its own line.
+            .and_then(crate::rope::YarnConfig::from_extras);
+        let requested = yarn_override.and_then(|ov| {
+            let original = if ov.original_max > 0.0 {
+                ov.original_max
+            } else {
+                declared.map_or(max_position_embeddings as f32, |d| {
+                    d.original_max_position_embeddings
+                })
+            };
+            if ov.factor <= 1.0 || original <= 0.0 {
+                return None;
+            }
+            Some(crate::rope::YarnConfig::new(ov.factor, original))
+        });
+        let scaling_source = if requested.is_some() {
+            crate::context::ScalingSource::Operator
+        } else {
+            crate::context::ScalingSource::Config
+        };
+        let yarn = requested.or(declared);
         if let Some(y) = yarn {
             tracing::info!(
                 factor = y.factor,
@@ -801,9 +813,19 @@ impl Qwen3Config {
                 beta_fast = y.beta_fast,
                 beta_slow = y.beta_slow,
                 max_position_embeddings,
-                "qwen3: YARN RoPE config detected"
+                ?scaling_source,
+                "qwen3: YARN RoPE config active"
             );
         }
+        let context = crate::context::ContextLimits {
+            trained_max: max_position_embeddings as i32,
+            scaling: yarn.map(|y| crate::context::ContextScaling {
+                factor: y.factor,
+                original_max: y.original_max_position_embeddings,
+                source: scaling_source,
+            }),
+            scaling_supported: true,
+        };
 
         Ok(Qwen3Config {
             num_hidden_layers,
@@ -821,6 +843,7 @@ impl Qwen3Config {
             quant_mode,
             max_position_embeddings,
             yarn,
+            context,
         })
     }
 }
@@ -2019,8 +2042,8 @@ pub fn generate_greedy<'a>(
     // ceiling the ring grows lazily up to, not an eager allocation.
     // `initial_max_seq` is the small lazy start; `max_seq_ceiling` caps growth
     // and rejects over-long prompts.
-    let (initial_max_seq, max_seq_ceiling) =
-        kv_max_seq_and_ceiling(max_ctx_override, model.cfg.max_position_embeddings as i32);
+    let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;
+    let (initial_max_seq, max_seq_ceiling) = (resolved_ctx.initial_max_seq, resolved_ctx.ceiling);
 
     // Allocate one KvCache per decoder layer using the selected quant mode.
     // Force K8V8 for boundary layers (first head_n + last tail_n).
@@ -2284,8 +2307,8 @@ pub fn generate_greedy<'a>(
 
 /// Load a Qwen3 model from a snapshot directory.
 ///
-/// `yarn_override` provides a runtime YARN config for models whose
-/// `config.json` lacks `rope_scaling`. See [`YarnOverride`].
+/// `yarn_override` carries an operator-requested YARN extension, which wins
+/// over the checkpoint's own `rope_scaling`. See [`YarnOverride`].
 pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) -> Result<Qwen3Text> {
     let cfg_raw = load_config(model_dir)?;
     let cfg = Qwen3Config::from_model_config(&cfg_raw, yarn_override)?;

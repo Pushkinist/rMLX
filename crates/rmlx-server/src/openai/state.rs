@@ -69,11 +69,16 @@ pub struct LoadedModel {
     pub loaded_at: Instant,
     /// Timestamp of the most recent request served by this model.
     pub last_used: Instant,
-    /// A2: per-process effective max prompt-context length for this loaded
+    /// Per-process effective max prompt-context length for this loaded
     /// model. Cached here at load time so the per-request guard in
     /// `/v1/chat/completions` and `/v1/messages` can read it without paying
     /// for a trait dispatch on every request. See `Generator::effective_max_ctx`.
     pub effective_max_ctx: usize,
+    /// The checkpoint's context limits, cached alongside `effective_max_ctx`.
+    /// A per-request `max_ctx` override is resolved against them. `None` for
+    /// generators that do not participate in KV-cache sizing. See
+    /// `Generator::context_limits`.
+    pub context_limits: Option<rmlx_models::context::ContextLimits>,
     /// Active-decode lease for this slot.
     ///
     /// Counter incremented by `DecodeLeaseGuard::acquire` at the start of every
@@ -773,6 +778,23 @@ impl AppState {
             .map_or(usize::MAX, |m| m.effective_max_ctx)
     }
 
+    /// Context limits of the resident model `model_id` — what a per-request
+    /// `max_ctx` override is resolved against.
+    ///
+    /// Returns `None` when the model is not resident or the generator does not
+    /// participate in KV-cache sizing, which makes the per-request resolution a
+    /// no-op exactly where `effective_max_ctx_for` is one too.
+    pub fn context_limits_for(
+        &self,
+        model_id: &str,
+    ) -> Option<rmlx_models::context::ContextLimits> {
+        self.slots
+            .read()
+            .iter()
+            .find(|m| m.id == model_id)
+            .and_then(|m| m.context_limits)
+    }
+
     /// Load model `id` into a resident slot.
     ///
     /// If the model is already resident, updates its `last_used` and returns
@@ -933,8 +955,9 @@ impl AppState {
             .map_err(|e| format!("failed to load model '{model_id}': {e}"))?;
         let gen: Arc<dyn Generator> = Arc::from(gen);
         let now = Instant::now();
-        // A2: snapshot the effective max ctx once at load time.
+        // Snapshot the resolved context bounds once at load time.
         let effective_max_ctx = gen.effective_max_ctx();
+        let context_limits = gen.context_limits();
         // Fresh decode-lease counter + empty unload-handle slot.
         let decode_lease: DecodeLease = Arc::new(AtomicUsize::new(0));
         let unload_handle: Arc<PLMutex<Option<JoinHandle<()>>>> = Arc::new(PLMutex::new(None));
@@ -948,13 +971,20 @@ impl AppState {
                 loaded_at: now,
                 last_used: now,
                 effective_max_ctx,
+                context_limits,
                 decode_lease: Arc::clone(&decode_lease),
                 unload_handle: Arc::clone(&unload_handle),
                 keep_alive,
             });
             slots.len()
         };
-        tracing::info!(model_id, effective_max_ctx, resident, "slots: model loaded");
+        tracing::info!(
+            model_id,
+            effective_max_ctx,
+            positional_max = context_limits.map_or(0, |l| l.positional_max()),
+            resident,
+            "slots: model loaded"
+        );
         self.arm_or_reset_timer(
             model_id,
             keep_alive,

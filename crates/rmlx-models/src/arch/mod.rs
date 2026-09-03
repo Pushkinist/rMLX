@@ -746,6 +746,28 @@ impl Architecture {
         }
     }
 
+    /// Positional capacity of the loaded checkpoint, RoPE scaling included.
+    ///
+    /// The input to [`crate::context::resolve_context`], the one producer of
+    /// every context bound in the tree. Qwen3 is the only architecture that
+    /// implements RoPE scaling, so it is the only one whose limits can carry
+    /// a [`crate::context::ContextScaling`]; the rest report their trained
+    /// window and say so.
+    pub fn context_limits(&self) -> crate::context::ContextLimits {
+        match self {
+            Architecture::Qwen3(m) => m.cfg.context,
+            Architecture::Gemma4(_)
+            | Architecture::Gemma3(_)
+            | Architecture::Qwen2(_)
+            | Architecture::Laguna(_)
+            | Architecture::Qwen3_5Moe(_)
+            | Architecture::Qwen3VlMoe(_)
+            | Architecture::BitNet(_) => {
+                crate::context::ContextLimits::trained_only(self.max_position_embeddings())
+            }
+        }
+    }
+
     /// Hidden (model) size -- width of the decoder-trunk hidden state.
     ///
     /// Used by to size the MTP drafter (its `fc` consumes `2 * hidden`)

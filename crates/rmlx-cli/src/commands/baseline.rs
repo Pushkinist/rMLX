@@ -18,59 +18,52 @@ use rmlx_mlx::Device;
 use rmlx_models::arch;
 use tracing::{info, info_span, warn};
 
-/// Default prompt token cap.
+/// Decide how to handle a tokenized prompt longer than the prompt cap.
 ///
-/// Raised from the historical 4096 (which silently truncated CPU-mode runs to
-/// keep per-step times sane) to 65_536 so the bench harness can submit
-/// full 8k+ canonical prompts. On `--device cpu` this remains a genuine sanity
-/// guard: CPU forward is O(N^2), so a pathologically long prompt makes a bench
-/// run take pathologically long. On `--device gpu` that rationale does not
-/// apply -- per-step time no longer scales with raw prompt length once the KV
-/// cache and chunked prefill are in place -- so exceeding this default on GPU
-/// is treated as a hard error rather than a silent truncation (see
-/// `resolve_prompt_truncation`).
-pub(crate) const MAX_PROMPT_TOKENS: usize = 65_536;
-
-/// Decide how to handle a tokenized prompt longer than `max_prompt_tokens`.
+/// `max_prompt_tokens` is the explicit `--max-prompt-tokens`; when it is
+/// `None` the cap is `ceiling` — the context ceiling
+/// `rmlx_models::context::resolve_context` produced for this run, so the
+/// default cap is exactly what the engine will actually serve rather than a
+/// constant unrelated to the model.
 ///
 /// Returns the effective prompt length to use (`Ok`), or an error when
 /// silently truncating would misrepresent the measurement.
 ///
 /// - Prompt fits under the cap: no-op, returns the prompt length unchanged.
 /// - `--device cpu`: always silently truncates (with a `warn!`) -- CPU
-///   forward is genuinely O(N^2), so the cap is a real sanity guard and the
-///   historical behavior is preserved.
+///   forward is genuinely O(N^2), so the cap is a real sanity guard.
 /// - `--device gpu` with an *explicit* `--max-prompt-tokens` or
-///   `--allow-truncate`: the caller opted in, so truncate with a `warn!`
-///   exactly as before.
-/// - `--device gpu` with the default cap and no opt-in: a truncated run would
+///   `--allow-truncate`: the caller opted in, so truncate with a `warn!`.
+/// - `--device gpu` on the default cap with no opt-in: a truncated run would
 ///   silently record a shorter measurement that looks like a full-length one,
-///   so this is a hard error instead of a WARN-only truncation.
+///   so this is a hard error naming the cap that bit and the flag that lifts
+///   it.
 pub(crate) fn resolve_prompt_truncation(
     prompt_len: usize,
-    max_prompt_tokens: usize,
+    max_prompt_tokens: Option<usize>,
+    ceiling: usize,
     device: Device,
-    cap_is_explicit: bool,
     allow_truncate: bool,
 ) -> anyhow::Result<usize> {
-    if prompt_len <= max_prompt_tokens {
+    let cap = max_prompt_tokens.unwrap_or(ceiling);
+    if prompt_len <= cap {
         return Ok(prompt_len);
     }
 
-    if device == Device::Cpu || cap_is_explicit || allow_truncate {
+    if device == Device::Cpu || max_prompt_tokens.is_some() || allow_truncate {
         warn!(
             original = prompt_len,
-            cap = max_prompt_tokens,
-            "baseline: prompt truncated to cap"
+            cap, "baseline: prompt truncated to cap"
         );
-        return Ok(max_prompt_tokens);
+        return Ok(cap);
     }
 
     Err(anyhow::anyhow!(
-        "prompt has {prompt_len} tokens, exceeding the default --max-prompt-tokens cap of \
-         {max_prompt_tokens} on --device gpu. Silently truncating would record a shorter run \
-         that looks like a full-length measurement. Pass --max-prompt-tokens {prompt_len} (or \
-         higher) to measure the full prompt, or --allow-truncate to opt into truncation."
+        "prompt has {prompt_len} tokens, exceeding the resolved context ceiling of {cap} on \
+         --device gpu. Silently truncating would record a shorter run that looks like a \
+         full-length measurement. Raise --max-ctx to {prompt_len} (or higher, up to the \
+         model's positional capacity) to measure the full prompt, or pass --allow-truncate \
+         to opt into truncation."
     ))
 }
 
@@ -330,21 +323,22 @@ fn tokenize_chat_fixture(
 /// Record a performance baseline for the given model snapshot.
 ///
 /// Steps:
-/// 1. Parse device, read prompt file, tokenize, then resolve against
-///    `max_prompt_tokens` (CLI-configurable; defaults to `MAX_PROMPT_TOKENS`)
-///    via `resolve_prompt_truncation` -- truncates on `--device cpu` or an
-///    explicit opt-in, errors loudly on `--device gpu` with the default cap.
-///    A chat-JSON fixture (`{"messages": [...], ...}`, e.g.
-///    `prompts/longctx_<N>k.json`) is rendered through the model's real
-///    `chat_template.jinja` first, so the token count reflects the message
-///    content rather than the fixture's JSON envelope + syntax.
+/// 1. Parse device, read prompt file, tokenize. A chat-JSON fixture
+///    (`{"messages": [...], ...}`, e.g. `prompts/longctx_<N>k.json`) is
+///    rendered through the model's real `chat_template.jinja` first, so the
+///    token count reflects the message content rather than the fixture's JSON
+///    envelope + syntax.
 /// 2. `arch::load_model` -- capture `load_ms`.
-/// 3. `arch.generate_greedy` -- per-token `step_fn` callback captures wall-clock
+/// 3. Resolve the context ceiling from the loaded checkpoint, then apply the
+///    prompt cap (`--max-prompt-tokens`, defaulting to that ceiling) via
+///    `resolve_prompt_truncation` -- truncates on `--device cpu` or an
+///    explicit opt-in, errors loudly on `--device gpu` with the default cap.
+/// 4. `arch.generate_greedy` -- per-token `step_fn` callback captures wall-clock
 /// so prefill (TTFT) and steady-state decode are timed SEPARATELY.
-/// 4. Compute decode-only TPS, measured TTFT, first-50-token preview, peak RSS,
+/// 5. Compute decode-only TPS, measured TTFT, first-50-token preview, peak RSS,
 ///    and the Metal-allocator peak bracketed across prefill+decode.
-/// 5. Emit EventRecorder records and 1 baseline.csv row.
-/// 6. Print one-line summary to stdout, plus the exact generated token-id
+/// 6. Emit EventRecorder records and 1 baseline.csv row.
+/// 7. Print one-line summary to stdout, plus the exact generated token-id
 ///    sequence when `emit_token_ids` is set.
 #[tracing::instrument(skip_all, fields(
     model_dir = %model_path.display(),
@@ -361,8 +355,7 @@ pub(crate) fn run_baseline(
     prompt_label: &str,
     kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
     max_ctx_override: Option<i32>,
-    max_prompt_tokens: usize,
-    cap_is_explicit: bool,
+    max_prompt_tokens: Option<usize>,
     allow_truncate: bool,
     yarn_override: Option<rmlx_models::qwen3::YarnOverride>,
     emit_token_ids: bool,
@@ -397,28 +390,6 @@ pub(crate) fn run_baseline(
     let (mut prompt_ids, template_used) =
         tokenize_prompt_text(model_path, &tokenizer, &prompt_text)?;
 
-    // Truncate to `max_prompt_tokens` when the cap allows it; on GPU with the
-    // default (non-explicit) cap this is a hard error instead -- see
-    // `resolve_prompt_truncation`.
-    let effective_len = resolve_prompt_truncation(
-        prompt_ids.len(),
-        max_prompt_tokens,
-        device,
-        cap_is_explicit,
-        allow_truncate,
-    )?;
-    prompt_ids.truncate(effective_len);
-    let prompt_token_count = prompt_ids.len();
-
-    info!(
-        model = %model_path.display(),
-        device = device_str,
-        prompt_tokens = prompt_token_count,
-        max_tokens,
-        template_used,
-        "baseline: starting"
-    );
-
     // -- Load model, capture load_ms -------------------------------------------
     let ts_load_start = Instant::now();
     let model = arch::load_model(
@@ -432,6 +403,33 @@ pub(crate) fn run_baseline(
     let load_ms = ts_load_start.elapsed().as_millis() as f64;
 
     info!(load_ms, "baseline: model loaded");
+
+    // Truncate to the prompt cap when it allows it; on GPU with the default
+    // (non-explicit) cap this is a hard error instead -- see
+    // `resolve_prompt_truncation`. The default cap is the run's resolved
+    // context ceiling, which is why this runs after the load.
+    let resolved_ctx =
+        rmlx_models::context::resolve_context(&model.context_limits(), max_ctx_override)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let effective_len = resolve_prompt_truncation(
+        prompt_ids.len(),
+        max_prompt_tokens,
+        resolved_ctx.ceiling.max(0) as usize,
+        device,
+        allow_truncate,
+    )?;
+    prompt_ids.truncate(effective_len);
+    let prompt_token_count = prompt_ids.len();
+
+    info!(
+        model = %model_path.display(),
+        device = device_str,
+        prompt_tokens = prompt_token_count,
+        max_ctx = resolved_ctx.ceiling,
+        max_tokens,
+        template_used,
+        "baseline: starting"
+    );
 
     // -- Generate, capture per-phase timing ------------------------------------
     // `generate_greedy` calls `step_fn` once per produced token. The FIRST call
