@@ -38,6 +38,10 @@ use tracing::{info, info_span, warn};
 ///   silently record a shorter measurement that looks like a full-length one,
 ///   so this is a hard error naming the cap that bit and the flag that lifts
 ///   it.
+///
+/// An explicit cap **above** `ceiling` is refused outright: the engine cannot
+/// honour it, so admitting it only moves the failure into prefill, where it
+/// surfaces as a `KvCeilingExceeded` naming a number the operator never typed.
 pub(crate) fn resolve_prompt_truncation(
     prompt_len: usize,
     max_prompt_tokens: Option<usize>,
@@ -45,6 +49,16 @@ pub(crate) fn resolve_prompt_truncation(
     device: Device,
     allow_truncate: bool,
 ) -> anyhow::Result<usize> {
+    if let Some(cap) = max_prompt_tokens {
+        if cap > ceiling {
+            return Err(anyhow::anyhow!(
+                "--max-prompt-tokens {cap} is above the resolved context ceiling of {ceiling}; \
+                 the engine cannot serve a prompt past the ceiling, so this cap can only be \
+                 honoured by raising --max-ctx to {cap} (up to the model's positional \
+                 capacity), or by lowering --max-prompt-tokens to {ceiling} or less."
+            ));
+        }
+    }
     let cap = max_prompt_tokens.unwrap_or(ceiling);
     if prompt_len <= cap {
         return Ok(prompt_len);
@@ -414,7 +428,7 @@ pub(crate) fn run_baseline(
     let effective_len = resolve_prompt_truncation(
         prompt_ids.len(),
         max_prompt_tokens,
-        resolved_ctx.ceiling.max(0) as usize,
+        resolved_ctx.ceiling_tokens(),
         device,
         allow_truncate,
     )?;
@@ -720,11 +734,10 @@ pub(crate) fn run_baseline(
         .and_then(|c| c.quantization.as_ref())
         .map(|q| format!("{} g{} b{}", q.mode_or_default(), q.group_size, q.bits))
         .unwrap_or_default();
-    let context_size: u32 = cfg
-        .as_ref()
-        .and_then(|c| c.text_config.as_ref())
-        .and_then(|tc| tc.max_position_embeddings)
-        .unwrap_or(0);
+    // The checkpoint's positional capacity, from the one context resolution —
+    // not a raw config field, which misses the arches that carry the limit at
+    // the top level of config.json and every RoPE-scaled window.
+    let context_size: u32 = resolved_ctx.positional_tokens().unwrap_or(0) as u32;
 
     // A phase this run did not measure records nothing — an event row reading
     // `0` tok/s is indistinguishable from a measured stall.
@@ -877,6 +890,7 @@ pub(crate) fn run_baseline(
             &weight_quant_str,
             prompt_token_count as i64,
             i64::from(max_tokens),
+            i64::from(resolved_ctx.ceiling),
             load_ms,
             ttft_ms,
             decode_tps,
@@ -947,8 +961,6 @@ pub(crate) struct BaselineRecordArgs<'a> {
     pub prompt_body: Option<serde_json::Value>,
     /// Final resolved `KvQuant` actually used by the run.
     pub kv_quant: rmlx_kv_quant::KvQuant,
-    /// Final resolved `ctx_max`.
-    pub ctx_max: i64,
     /// Caller-supplied `--git-sha` value, or `None`. Provenance only — the
     /// binary never derives this itself (see `RunIdentity`'s doc).
     pub git_sha: Option<&'a str>,
@@ -1012,6 +1024,7 @@ fn build_run_record(
     weight_quant: &str,
     prompt_tokens: i64,
     max_tokens: i64,
+    ctx_max: i64,
     load_ms: f64,
     ttft_ms: Option<f64>,
     decode_tps: Option<f64>,
@@ -1084,7 +1097,7 @@ fn build_run_record(
         "model": model,
         "weight_quant": weight_quant,
         "kv_quant": kv_quant_str,
-        "ctx_max": args.ctx_max,
+        "ctx_max": ctx_max,
         "prompt": {
             "name": prompt_name,
             "body": prompt_body,

@@ -176,7 +176,6 @@ fn build_record_git_sha_survives_stamp_json() {
         prompt_id: Some("longctx_4k"),
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
-        ctx_max: 4096,
         git_sha: Some("cafebabe"),
     };
 
@@ -189,6 +188,7 @@ fn build_record_git_sha_survives_stamp_json() {
         "bf16",
         16,
         8,
+        4096,
         0.0,
         Some(120.0),
         Some(40.0),
@@ -220,7 +220,6 @@ fn build_record_git_sha_absent_is_null() {
         prompt_id: Some("longctx_4k"),
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
-        ctx_max: 4096,
         git_sha: None,
     };
 
@@ -233,6 +232,7 @@ fn build_record_git_sha_absent_is_null() {
         "bf16",
         16,
         8,
+        4096,
         0.0,
         Some(120.0),
         Some(40.0),
@@ -261,7 +261,6 @@ fn build_record_git_sha_blank_string_is_null() {
         prompt_id: Some("longctx_4k"),
         prompt_body: Some(serde_json::json!([{"role": "user", "content": "hi"}])),
         kv_quant: rmlx_kv_quant::KvQuant::None,
-        ctx_max: 4096,
         git_sha: Some(""),
     };
 
@@ -274,6 +273,7 @@ fn build_record_git_sha_blank_string_is_null() {
         "bf16",
         16,
         8,
+        4096,
         0.0,
         Some(120.0),
         Some(40.0),
@@ -320,6 +320,30 @@ fn default_prompt_cap_follows_the_resolved_ceiling() {
     assert_eq!(len, 100_000);
     resolve_prompt_truncation(100_000, None, 65_536, Device::Gpu, false)
         .expect_err("a 65536 ceiling must refuse the same prompt");
+}
+
+/// An explicit `--max-prompt-tokens` above the resolved context ceiling is
+/// refused. Admitting it only moves the failure into prefill, where it
+/// surfaces as a `KvCeilingExceeded` naming a number the operator never typed.
+// gpu-test-gate: exempt
+#[test]
+fn explicit_cap_above_the_ceiling_is_refused() {
+    let err = resolve_prompt_truncation(1_000, Some(131_072), 65_536, Device::Gpu, false)
+        .expect_err("a cap above the ceiling cannot be honoured");
+    let msg = err.to_string();
+    assert!(msg.contains("131072"), "cap missing: {msg}");
+    assert!(msg.contains("65536"), "ceiling missing: {msg}");
+    assert!(msg.contains("--max-ctx"), "lift missing: {msg}");
+}
+
+/// An explicit cap exactly at the ceiling is fine — pins the `>` boundary
+/// against a `>=` mutation.
+// gpu-test-gate: exempt
+#[test]
+fn explicit_cap_at_the_ceiling_is_accepted() {
+    let len = resolve_prompt_truncation(1_000, Some(65_536), 65_536, Device::Gpu, false)
+        .expect("a cap equal to the ceiling is honourable");
+    assert_eq!(len, 1_000);
 }
 
 /// Equality boundary on the GPU-default (no opt-in) path: a prompt exactly

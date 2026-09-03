@@ -207,11 +207,12 @@ cannot appear unnoticed.
 `--max-ctx` above the capacity is **refused**, not clamped. RoPE extrapolated
 past the trained window without scaling produces incoherent output, so serving
 a shorter window instead hid both the truncation and its cause. The refusal
-fires when the model loads — `rmlx baseline` / `rmlx bench` exit non-zero,
-`rmlx serve` logs it at `warn!` from the eager preload (which stays
-best-effort) and returns it in the 503 body of every request for that model —
-and it names the request, the capacity, the trained window and the mechanism
-that would lift it:
+fires when the model loads, and it is fatal: `rmlx baseline` / `rmlx bench`
+exit non-zero, and `rmlx serve` aborts during the eager preload **before it
+binds the port** rather than coming up healthy and 503-ing every request.
+(Other preload failures stay best-effort — only a ceiling refusal, which no
+retry can fix, aborts startup.) The message names the request, the capacity,
+the trained window and the mechanism that would lift it:
 
 ```
 requested context 131072 tokens exceeds the model's positional capacity of
@@ -230,7 +231,11 @@ offering a flag that does nothing.
 
 The effective numbers are reported in two places: the `slots: model loaded`
 log line (`effective_max_ctx`, `positional_max`) and `GET /v1/models`, which
-carries `max_ctx` and `positional_max` for each resident model.
+carries `max_ctx` and `positional_max` for each resident model whose capacity
+is known. An architecture that does not expose `max_position_embeddings` has
+no capacity to enforce — the resolver accepts any `--max-ctx` — so neither
+field is published for it, rather than publishing a `0` that reads as the
+opposite.
 
 Reference points: `mlx-lm` applies no cap and extrapolates; `llama.cpp` warns
 (`possible training context overflow`) and proceeds; vLLM refuses a
@@ -576,6 +581,10 @@ exceeds the cap:
 - **`--device gpu`** with an **explicit** `--max-prompt-tokens` or with
   `--allow-truncate` set: truncates with a `tracing::warn!`, same as CPU —
   the caller has explicitly opted in.
+- An explicit `--max-prompt-tokens` **above** the ceiling is refused outright,
+  on either device: the engine cannot serve a prompt past the ceiling, so
+  admitting the cap would only move the failure into prefill and report it
+  against a number the operator never typed. Raise `--max-ctx` instead.
 
 ```bash
 # 128k prompt on GPU: raise the ceiling so the cap follows it (no truncation).
@@ -1365,7 +1374,7 @@ persistent shell configuration.
 | `RMLX_TTS_TOKENIZER_PATH` | `--tts-tokenizer-path` | — | Path to the Qwen3-TTS speech tokenizer snapshot directory. Flag wins. |
 | `RMLX_MM_CACHE_BYTES` | `--mm-cache-bytes` | `536870912` (512 MiB) | Byte budget for the multimodal encoder-output cache. `0` disables. Flag wins. |
 | `RMLX_SESSION_CACHE_MAX_SESSIONS` | `--session-cache-max-sessions` | `8` | Maximum number of prompt-cache sessions held resident. Flag wins. |
-| `RMLX_YARN_FACTOR` | `--yarn-factor` | — | Qwen3-family YARN RoPE extension: a float `> 1.0` synthesises a YARN config at model load (`beta_fast=32, beta_slow=1`, per the paper) **and raises the positional capacity `--max-ctx` is bounded by** to `factor × original`. It **overrides** a `rope_scaling` the config declares, so it also extends a checkpoint that already ships one. Architectures other than Qwen3 implement no RoPE scaling and log a warning that the flag was ignored. Flag wins over the env var. |
+| `RMLX_YARN_FACTOR` | `--yarn-factor` | — | Qwen3-family YARN RoPE extension: a float `> 1.0` synthesises a YARN config at model load **and raises the positional capacity `--max-ctx` is bounded by** to `factor × original`. Only the window changes: a checkpoint that declares its own `beta_fast` / `beta_slow` keeps them; the paper defaults (`beta_fast=32, beta_slow=1`) apply only when the checkpoint declares no `rope_scaling`. It **overrides** a `rope_scaling` the config declares, so it also extends a checkpoint that already ships one. Architectures other than Qwen3 implement no RoPE scaling and log a warning that the flag was ignored. Flag wins over the env var. |
 | `RMLX_YARN_ORIGINAL_MAX` | `--yarn-original-max` | (checkpoint's declared `original_max_position_embeddings`, else `max_position_embeddings`) | Optional companion to `RMLX_YARN_FACTOR`: the pre-extension context size the scaling interpolates from. Flag wins. |
 | `RMLX_PROMPTS_DIR` | `--prompts-dir` | `<repo>/prompts/` | Directory containing prompt JSON files used by `rmlx baseline` and bench scripts. Flag wins. |
 | `MLX_VLM_DRAFT_KIND` | `--draft-kind` | — | Drafter architecture for speculative decoding. Values: `mtp`, `dflash`, `eagle3`. Flag wins. |

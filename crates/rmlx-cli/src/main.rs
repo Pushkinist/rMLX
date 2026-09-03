@@ -934,22 +934,6 @@ enum Cmd {
         /// `min(capacity, 4096)`. Must be >= 256 when set.
         #[arg(long)]
         max_ctx: Option<u32>,
-        /// YARN RoPE scale factor. Extends the context window a Qwen3-family
-        /// checkpoint can address to `factor * original` and raises the
-        /// ceiling `--max-ctx` is bounded by. Overrides a `rope_scaling` the
-        /// config declares; must be > 1.0 to take effect. Output quality past
-        /// the checkpoint's trained window is the operator's risk, and every
-        /// run past it is logged.
-        /// Env: `RMLX_YARN_FACTOR`.
-        #[arg(long, env = "RMLX_YARN_FACTOR", value_name = "FLOAT")]
-        yarn_factor: Option<f32>,
-        /// Pre-extension context size `--yarn-factor` interpolates from.
-        /// When absent, the checkpoint's declared
-        /// `original_max_position_embeddings` is used, falling back to its
-        /// `max_position_embeddings`.
-        /// Env: `RMLX_YARN_ORIGINAL_MAX`.
-        #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
-        yarn_original_max: Option<u32>,
     },
     /// Transcribe an audio file to text / subtitles (speech-to-text).
     ///
@@ -2192,8 +2176,6 @@ fn main() -> Result<()> {
             kv_bits,
             kv_group_size,
             max_ctx,
-            yarn_factor: _yarn_factor,
-            yarn_original_max: _yarn_original_max,
         } => {
             // Load config + run the cache-type resolver before any model
             // load. Even though `chat` is a stub today, validating the flag
@@ -2473,18 +2455,6 @@ fn main() -> Result<()> {
                 prompt_label
             };
 
-            // Resolved final ctx_max for the record (mirrors the engine's
-            // derivation: explicit override → model max → 4096 fallback).
-            let resolved_ctx_max = max_ctx_override
-                .map(i64::from)
-                .or_else(|| {
-                    rmlx_loader::load_config(&model)
-                        .ok()
-                        .and_then(|c| c.text_config.and_then(|tc| tc.max_position_embeddings))
-                        .map(i64::from)
-                })
-                .unwrap_or(4096);
-
             let bench_label_ref = bench_label.as_deref();
             let prompt_id_ref = prompt_id_opt.as_deref();
             let git_sha_ref = git_sha.as_deref();
@@ -2494,7 +2464,6 @@ fn main() -> Result<()> {
                     prompt_id: prompt_id_ref,
                     prompt_body: prompt_body_opt,
                     kv_quant: kv_quant_resolved,
-                    ctx_max: resolved_ctx_max,
                     git_sha: git_sha_ref,
                 })
             } else {

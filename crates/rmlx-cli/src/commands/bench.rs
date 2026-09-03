@@ -1137,7 +1137,7 @@ pub(crate) fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
     // prompt is capped after the checkpoint's limits are known.
     let resolved_ctx = rmlx_models::context::resolve_context(&model.context_limits(), args.max_ctx)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let prompt_ids = prepare_prompt(&args, &tokenizer, resolved_ctx.ceiling.max(0) as usize)?;
+    let prompt_ids = prepare_prompt(&args, &tokenizer, resolved_ctx.ceiling_tokens())?;
 
     let samples = collect_samples(&model, &tokenizer, &prompt_ids, &args)?;
     let summary = summarize(&samples)?;
