@@ -98,6 +98,9 @@ arch stand-down cannot separate them: the drafter's `backbone_hidden_size` is
 checked against the verifier's width before the drafter is loaded, and a
 mismatched pair skips with that reason rather than panicking in the loader.
 
+Under Metal shader validation the pair produces **zero** hits, so it has no
+entry in `scripts/gpu_validation_census.txt` and needs none.
+
 The file also carries `speculative_greedy_reproduces_plain_greedy_at_long_context`
 — the same gate over `prompts/longctx_4k.json`, which **fails today**: it is the
 reproducer for issue #506 and turns `make gpu-test` red on a machine holding
