@@ -135,7 +135,12 @@ pub enum NotesVerdict {
 /// This is the only place the format is written. The engine composes the
 /// string here and logs it on its `done` line, and `scripts/spec_bench.sh`
 /// records what the engine said rather than spelling it a second time.
-pub fn decode_config(draft_kind: &str, block_size: u32, depth_policy: Option<&str>) -> String {
+///
+/// `block_size` is a `usize` so the value the engine holds reaches the term
+/// unchanged. A narrower parameter would put a conversion at every call site,
+/// and a conversion that truncates or saturates here files a run under a block
+/// nothing ran — in a table that cannot take it back out.
+pub fn decode_config(draft_kind: &str, block_size: usize, depth_policy: Option<&str>) -> String {
     match depth_policy {
         Some(policy) => {
             format!("{draft_kind}/block={block_size},{draft_kind}/depth={policy}")
@@ -266,7 +271,7 @@ pub fn decode_config_from_notes(notes: &str) -> NotesVerdict {
     let block = note_value(notes, "block_size=");
     match (kind, block) {
         (Some(kind), Some(block)) if kind != "none" => {
-            match block.parse::<u32>() {
+            match block.parse::<usize>() {
                 // The drafter name is lifted verbatim out of free-form notes,
                 // so it can be anything a bench script wrote — `Eagle3`, a
                 // typo, a word with a space in it. Composing that into a

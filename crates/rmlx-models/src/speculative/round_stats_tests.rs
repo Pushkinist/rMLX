@@ -3,14 +3,18 @@
 
 use super::{RoundStats, SpecLoop};
 
-const ALL_LOOPS: &[SpecLoop] = &[
-    SpecLoop::MtpAssistant,
-    SpecLoop::MtpSidecar,
-    SpecLoop::DFlash,
-    SpecLoop::Eagle3,
-    SpecLoop::TwoModelGreedy,
-    SpecLoop::TwoModelStochastic,
-];
+/// What each loop emits before its round loop starts, as the loops themselves
+/// measure it: the sidecar paths argmax a bonus token out of the prefill
+/// forward, the two-model paths emit nothing until a round has run.
+///
+/// This is the fixture's model of the loops, not the engine's — the engine
+/// measures it. It exists so the two accountings are both exercised here.
+fn seed_of(loop_kind: SpecLoop) -> usize {
+    match loop_kind {
+        SpecLoop::MtpAssistant | SpecLoop::MtpSidecar | SpecLoop::DFlash | SpecLoop::Eagle3 => 1,
+        SpecLoop::TwoModelGreedy | SpecLoop::TwoModelStochastic => 0,
+    }
+}
 
 /// A request as `loop_kind` would really have accounted it: 8 rounds at block
 /// 5, every round drafting 4 and the verifier accepting 12 of the 32, plus the
@@ -22,11 +26,13 @@ const ALL_LOOPS: &[SpecLoop] = &[
 fn sample(loop_kind: SpecLoop) -> RoundStats {
     let rounds = 8usize;
     let total_accept = 12usize;
+    let seed_emitted = seed_of(loop_kind);
     RoundStats {
         loop_kind,
         block_size: 5,
         rounds,
-        emitted: loop_kind.seed_tokens() + total_accept + rounds,
+        emitted: seed_emitted + total_accept + rounds,
+        seed_emitted,
         total_draft: 32,
         total_accept,
         prefill_ns: 500_000_000,
@@ -133,14 +139,14 @@ fn a_request_with_no_round_derives_zeros_not_nan() {
 /// that models only one accounting cannot see the difference.
 #[test]
 fn the_fixed_block_identity_holds_on_every_loop() {
-    for &loop_kind in ALL_LOOPS {
+    for &loop_kind in SpecLoop::ALL {
         let stats = sample(loop_kind);
         assert_eq!(
             stats.total_draft,
-            stats.rounds * (stats.block_size as usize - 1),
+            stats.rounds * (stats.block_size - 1),
             "{loop_kind:?}: the sample must be a run that never resized its block"
         );
-        let from_fixed_block = 1.0 + stats.accept_rate() * (f64::from(stats.block_size) - 1.0);
+        let from_fixed_block = 1.0 + stats.accept_rate() * (stats.block_size as f64 - 1.0);
         assert!(
             (stats.tokens_per_round() - from_fixed_block).abs() < 1e-9,
             "{loop_kind:?}: the identity gives {from_fixed_block}, the loop measured {}",
@@ -149,25 +155,59 @@ fn the_fixed_block_identity_holds_on_every_loop() {
     }
 }
 
-/// The two accountings, pinned as themselves: a sidecar loop emits one token
-/// its rounds did not produce, a two-model loop emits none.
+/// Two loops that ran the same rounds report the same figure whatever they
+/// emitted before them — which is the whole reason the seed is subtracted.
 #[test]
-fn each_loop_declares_what_it_emits_outside_its_rounds() {
-    for &loop_kind in ALL_LOOPS {
+fn what_a_loop_emitted_before_its_rounds_does_not_reach_the_figure() {
+    for &loop_kind in SpecLoop::ALL {
         let stats = sample(loop_kind);
-        assert_eq!(
-            stats.emitted - stats.round_emitted(),
-            loop_kind.seed_tokens(),
-            "{loop_kind:?}"
-        );
+        assert_eq!(stats.emitted - stats.round_emitted(), stats.seed_emitted);
         assert_eq!(stats.round_emitted(), 20, "{loop_kind:?}");
     }
-    assert_eq!(SpecLoop::MtpSidecar.seed_tokens(), 1);
-    assert_eq!(SpecLoop::MtpAssistant.seed_tokens(), 1);
-    assert_eq!(SpecLoop::DFlash.seed_tokens(), 1);
-    assert_eq!(SpecLoop::Eagle3.seed_tokens(), 1);
-    assert_eq!(SpecLoop::TwoModelGreedy.seed_tokens(), 0);
-    assert_eq!(SpecLoop::TwoModelStochastic.seed_tokens(), 0);
+}
+
+/// A request whose round loop never ran emitted exactly what it emitted before
+/// that loop. The two counts are taken at different points, so this catches a
+/// loop that stopped emitting its seed or grew a second one — the drift a
+/// per-loop constant would have hidden.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion is that the inconsistency is named; unwrapping the \
+              None case here is the failure the test exists to report"
+)]
+fn a_seedless_round_loop_that_emitted_something_is_named() {
+    let mut stats = sample(SpecLoop::MtpSidecar);
+    stats.rounds = 0;
+    stats.emitted = stats.seed_emitted;
+    assert!(stats.seed_violation().is_none(), "1 emitted, 1 seeded");
+
+    stats.emitted = 2;
+    let reason = stats.seed_violation().expect("must be named");
+    assert!(reason.contains("no round ran"), "{reason}");
+
+    let mut backwards = sample(SpecLoop::DFlash);
+    backwards.seed_emitted = backwards.emitted + 1;
+    let reason = backwards.seed_violation().expect("must be named");
+    assert!(reason.contains("exceeds emitted"), "{reason}");
+}
+
+/// `ALL` and `index` are two halves of one list and the compiler holds both: a
+/// seventh variant does not compile until it has an index, and does not pass
+/// here until it is in `ALL` at that index.
+#[test]
+fn every_variant_is_in_all_once() {
+    for (position, &loop_kind) in SpecLoop::ALL.iter().enumerate() {
+        assert_eq!(loop_kind.index(), position, "{loop_kind:?}");
+    }
+    let mut indices: Vec<usize> = SpecLoop::ALL.iter().map(|k| k.index()).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    assert_eq!(
+        indices.len(),
+        SpecLoop::ALL.len(),
+        "two variants share an index"
+    );
 }
 
 /// Counting the seed token would read `+1/rounds` high, and the two loop
@@ -216,7 +256,7 @@ fn a_phase_span_reaching_outside_the_round_loop_is_named() {
 #[test]
 fn every_loop_names_a_distinct_done_event() {
     let mut seen: Vec<&str> = Vec::new();
-    for &loop_kind in ALL_LOOPS {
+    for &loop_kind in SpecLoop::ALL {
         let event = loop_kind.done_event();
         assert!(!seen.contains(&event), "{event} is claimed by two loops");
         assert!(
@@ -233,7 +273,7 @@ fn every_loop_names_a_distinct_done_event() {
 fn every_loop_composes_a_well_formed_cell() {
     let mut adaptive: Vec<String> = Vec::new();
     let mut fixed: Vec<String> = Vec::new();
-    for &loop_kind in ALL_LOOPS {
+    for &loop_kind in SpecLoop::ALL {
         let config = sample(loop_kind).decode_config();
         assert!(
             rmlx_metrics::cell::decode_config_is_well_formed(&config),

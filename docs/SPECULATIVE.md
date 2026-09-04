@@ -867,7 +867,8 @@ a block policy or an acceptance walk can trade one for the other invisibly.
 
 | Gate | Loop | Oracle | Horizon |
 |---|---|---|---|
-| `crates/rmlx-models/tests/spec_greedy_equivalence.rs` | Gemma4 assistant | longest common subsequence with plain greedy ≥ 0.70 over the whole answer and ≥ 0.40 over every tail window, plus a whole-stream repetition-loop control and a length-agreement guard on both arms | 512 tokens |
+| `crates/rmlx-models/tests/spec_greedy_equivalence.rs` | Gemma4 assistant | longest common subsequence with plain greedy ≥ 0.70 over the whole answer and ≥ 0.40 over every tail window, plus a repetition-loop control read over the whole stream and each tail cut, and a length-agreement guard, on both arms | 512 tokens |
+| the same file, `…_at_long_context` | Gemma4 assistant, 4k prompt | the same oracle | 512 tokens — **red until #506** |
 | `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs` | MTP sidecar | shared prefix ≥ half | 48 tokens |
 | `crates/rmlx-models/tests/qwen3_5_eagle3_alignment.rs` | EAGLE-3 | shared prefix ≥ half | 48 tokens |
 | `crates/rmlx-models/tests/qwen3_5_two_model_alignment.rs` | two-model | shared prefix ≥ half | 48 tokens |
@@ -893,13 +894,16 @@ key left in the cache.
 below any floor that still refuses a broken rollback. 512 is the horizon where
 the regimes separate, not a length past which nothing goes wrong.
 
-**A real defect sits past that horizon.** Driven from `prompts/longctx_4k.json`
-instead of the gate's short prompt, the Gemma4-assistant speculative arm
-collapses into a period-8 repetition loop (`x86 is:66 is x86 is:66 is …`, cycle
-0.881 across 512 tokens) while plain greedy writes a clean summary and stops at
-200 — whole-stream LCS 0.11, first divergence at token 3. It reproduces
-identically on `main` (8ccc0593). Moving the gate onto the long prompt is the
-right thing to do once that is fixed.
+**A real defect sits past that horizon — issue #506.** Driven from
+`prompts/longctx_4k.json` instead of the gate's short prompt, the
+Gemma4-assistant speculative arm collapses into a period-8 repetition loop
+(`x86 is:66 is x86 is:66 is …`, cycle 0.881 across 512 tokens) while plain
+greedy writes a clean summary and stops at 200 — whole-stream LCS 0.11, first
+divergence at token 3. It reproduces identically on `main` (8ccc0593). The Qwen
+MTP sidecar's 0.520 above is the same issue's second case.
+`speculative_greedy_reproduces_plain_greedy_at_long_context` is that run as an
+`#[ignore]`d reproducer and **fails until #506 is fixed**; fixing it is what
+moves the gate itself onto the long prompt, which a paragraph would not.
 
 **A recurrent verifier is out of that gate's scope.** Its state has no sequence
 axis to truncate — it is snapshotted and replayed — and Qwen3.8-27B with its MTP

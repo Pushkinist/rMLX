@@ -947,9 +947,10 @@ pub fn eagle3_generate_greedy(
         // happened, so it still leaves exactly one record.
         super::RoundStats {
             loop_kind: super::SpecLoop::Eagle3,
-            block_size: block_total as u32,
+            block_size: block_total,
             rounds: 0,
             emitted: emitted.len(),
+            seed_emitted: emitted.len(),
             total_draft: 0,
             total_accept: 0,
             prefill_ns,
@@ -973,6 +974,7 @@ pub fn eagle3_generate_greedy(
         "eagle3_generate_greedy: starting (Qwen3.6-MoE verifier + EAGLE-3 drafter)"
     );
 
+    let seed_emitted = emitted.len();
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
@@ -1208,9 +1210,10 @@ pub fn eagle3_generate_greedy(
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();
     super::RoundStats {
         loop_kind: super::SpecLoop::Eagle3,
-        block_size: block_total as u32,
+        block_size: block_total,
         rounds,
         emitted: emitted.len(),
+        seed_emitted,
         total_draft,
         total_accept,
         prefill_ns,

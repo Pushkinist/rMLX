@@ -116,7 +116,7 @@ ROUNDS = 30
 DRAFT_MS = 300.0
 VERIFY_MS = 900.0
 ROUND_MS = 1800.0
-SEED_EMITTED = 1
+SEED_EMITTED = int(os.environ.get("STUB_SEED_EMITTED", "1"))
 DECODE_CONFIG = os.environ.get("STUB_DECODE_CONFIG", "mtp/block=5")
 # The engine composes both from one block, so the stub cannot make them
 # disagree by accident.
@@ -125,7 +125,6 @@ BLOCK_SIZE = int(
 )
 DERIVED_OVERRIDE = os.environ.get("STUB_DERIVED_OVERRIDE", "")
 DROP_FIELDS = [f for f in os.environ.get("STUB_DROP_FIELDS", "").split(",") if f]
-LEGACY_ACCEPT_NAME = os.environ.get("STUB_LEGACY_ACCEPT_NAME", "") == "1"
 
 
 def done_line():
@@ -161,8 +160,6 @@ def done_line():
     if DERIVED_OVERRIDE:
         name, _, value = DERIVED_OVERRIDE.partition("=")
         fields[name] = float(value)
-    if LEGACY_ACCEPT_NAME:
-        fields["total_accept_count"] = fields.pop("total_accept")
     for name in DROP_FIELDS:
         fields.pop(name, None)
     if raw:
@@ -833,14 +830,14 @@ run_case dropped_round_span_refused 1 \
 no_row mtp
 verdict
 
-# A log from before the round loops shared one record names the accepted count
-# `total_accept_count`. It is supported, and support means read — not read by
-# the summariser and refused by the cross-check for a formula it never broke.
-run_case legacy_accept_field_read 0 \
-	"a legacy accepted-count field name is read, not blamed for a formula drift" \
-	'STUB_LEGACY_ACCEPT_NAME=1'
-got="$(metric_value mtp accept_tokens_total)"
-[ "$got" = "294" ] || note_bad "accept_tokens_total=$got (want 294, three measured runs)"
+# The seed count and the emitted count are read at different points in the loop,
+# so a loop that stopped emitting its pre-round token disagrees with itself here
+# rather than shifting tokens_per_round by 1/rounds in an append-only table.
+run_case seed_contradicting_emitted_refused 1 \
+	"a done line whose seed count contradicts what it emitted is refused" \
+	'STUB_SEED_EMITTED=999' \
+	'GREP:more before its rounds than it emitted'
+no_row mtp
 verdict
 
 # The cell a row belongs to is the one the round loop named. A log that does not
@@ -883,7 +880,7 @@ verdict
 run_case hostile_draft_kind_refused 1 \
 	"a drafter kind that would escape the buffer directory is refused at parse" \
 	ARGS:--draft-kind ARGS:../../etc/mtp \
-	'GREP:is not one the engine ships'
+	'GREP:is not a bare lower-case name'
 no_row mtp
 [ -z "$(ls "$CASE_HOME"/metrics/buffer/pending/* 2>/dev/null)" ] ||
 	note_bad "a buffer file was written for a refused drafter kind"

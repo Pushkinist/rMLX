@@ -87,7 +87,18 @@ repetition-loop control, because two arms in the same loop agree perfectly.
 Unlike the three above it **resolves its pair by slug** from
 `RMLX_O_MODELS_ROOT`, so `make gpu-test` runs it on a machine holding the
 snapshots and `run_gpu_tests.sh` reports a machine without them as INCOMPLETE.
-The two variables override either half.
+The verifier goes through the golden harness's own resolver
+(`common::model_for`); `RMLX_DRAFT_TEST_MODEL` overrides the drafter. Both
+`-e2b-` and `-e4b-` snapshots declare the same architecture, so the harness's
+arch stand-down cannot separate them: the drafter's `backbone_hidden_size` is
+checked against the verifier's width before the drafter is loaded, and a
+mismatched pair skips with that reason rather than panicking in the loader.
+
+The file also carries `speculative_greedy_reproduces_plain_greedy_at_long_context`
+— the same gate over `prompts/longctx_4k.json`, which **fails today**: it is the
+reproducer for issue #506 and turns `make gpu-test` red on a machine holding
+both snapshots until that defect is fixed. `make ci` runs no GPU test and is
+unaffected.
 
 It **skips** unless the drafter is a Gemma4 assistant and the verifier carries
 no recurrent state: the floors are calibrated on the exact-rollback regime only,

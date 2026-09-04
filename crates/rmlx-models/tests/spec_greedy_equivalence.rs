@@ -44,20 +44,29 @@
 //! **The control.** A token stream that has collapsed into a repetition loop
 //! matches anything, so "the two agree" would pass on garbage. Every run checks
 //! that neither arm repeats at any period up to [`MAX_CYCLE_PERIOD`] across more
-//! than [`MAX_CYCLE_FRACTION`] of its tokens — a whole-stream measure, because a
-//! collapse that begins at token 20 and an `A B A B` cycle are both degeneracies
-//! that a leading-run measure scores at zero. Real prose from both arms reads
-//! about 0.02 on it.
+//! than [`MAX_CYCLE_FRACTION`] of its tokens — over the whole stream *and* over
+//! each of the same tail cuts the oracle uses, because three real degeneracies
+//! score under the ceiling on a whole-stream sweep at a short period:
+//!
+//! | shape | whole stream, period ≤ 8 | whole stream, period ≤ 64 | windowed |
+//! |---|---|---|---|
+//! | collapse from token 0 | 1.0000 | 1.0000 | 1.0000 |
+//! | collapse over the last two fifths | 0.3992 | 0.3992 | ~1.0 |
+//! | a twelve-token phrase over four fifths | 0.0000 | 0.7960 | 0.7960 |
+//!
+//! A leading-run measure scores every one of the last two at zero. Real prose
+//! from both arms is measured in the run line the gate prints.
 //!
 //! **Known gap: this gate runs at a short context and there is a defect past
-//! it.** Driven from the 4k document in `prompts/longctx_4k.json` instead of
-//! this prompt, the speculative arm collapses into a period-8 repetition loop
-//! (`x86 is:66 is x86 is:66 is ...`, cycle 0.881 across 512 tokens) while plain
-//! greedy writes a clean summary and stops at 200 — whole-stream LCS 0.11,
-//! first divergence at token 3. That reproduces identically on `main`
-//! (8ccc0593), so it is not this branch's, and it is why the horizon here is
-//! not the whole story. Moving this gate onto the long prompt is the right
-//! thing to do once that defect is fixed.
+//! it.** `speculative_greedy_reproduces_plain_greedy_at_long_context` is the
+//! same gate over the 4k document in `prompts/longctx_4k.json` and it **fails
+//! today**: the speculative arm collapses into a period-8 repetition loop
+//! (`x86 is:66 is x86 is:66 is …`) while plain greedy writes a clean summary and
+//! stops at 200 — whole-stream LCS 0.11, first divergence at token 3. It
+//! reproduces identically on `main` (8ccc0593), so it is not this branch's. It
+//! is filed, with the Qwen MTP sidecar's 0.520 as a second case, and it is a
+//! reproducer rather than a paragraph so that fixing it is what moves this gate
+//! onto the long prompt.
 //!
 //! Server-free. Both snapshots resolve by slug from `RMLX_O_MODELS_ROOT`, so
 //! `make gpu-test` runs this on a machine holding them and
@@ -122,14 +131,19 @@ const MAX_CTX: i32 = 8192;
 /// the cache.
 const MIN_LCS_RATIO: f64 = 0.70;
 
-/// The most of an arm that may repeat at a short period before the stream counts
-/// as degenerate. A loop repeats at its period almost everywhere; the measured
-/// readings for real prose from both arms are in the module docs.
+/// The most of an arm — or of any tail cut of it — that may repeat at a short
+/// period before the stream counts as degenerate. A loop repeats at its period
+/// almost everywhere inside itself; the measured readings for real prose from
+/// both arms are in the module docs.
 const MAX_CYCLE_FRACTION: f64 = 0.50;
 
-/// Longest cycle the control looks for. A loop longer than this is a stream
-/// that is still saying different things.
-const MAX_CYCLE_PERIOD: usize = 8;
+/// Longest cycle the control looks for.
+///
+/// A degeneracy in real output is usually a repeated phrase or sentence, not a
+/// repeated token: a 12-token phrase filling four fifths of a stream scores
+/// 0.0000 at any period under 12 and 0.7960 at 12. The defect this file
+/// documents repeats at period 8, one step under the old ceiling.
+const MAX_CYCLE_PERIOD: usize = 64;
 
 /// The stream is cut at each `1/TAIL_WINDOWS` boundary and the suffixes
 /// compared, so a divergence that begins late has a window it dominates.
@@ -198,6 +212,25 @@ fn strongest_cycle(tokens: &[u32]) -> (usize, f64) {
     worst
 }
 
+/// The strongest short cycle in `tokens` or in any tail cut of it: where it
+/// starts, its period, and the fraction of that window repeating at it.
+///
+/// Over the whole stream a collapse confined to the last two fifths reads
+/// 0.3992 — under the ceiling, because the healthy majority dilutes it. The
+/// same cuts `weakest_tail` uses give it a window it fills.
+fn strongest_windowed_cycle(tokens: &[u32]) -> (usize, usize, f64) {
+    let starts =
+        std::iter::once(0).chain((1..TAIL_WINDOWS).map(|n| tokens.len() * n / TAIL_WINDOWS));
+    let mut worst = (0usize, 1usize, 0.0f64);
+    for start in starts {
+        let (period, fraction) = strongest_cycle(&tokens[start..]);
+        if fraction > worst.2 {
+            worst = (start, period, fraction);
+        }
+    }
+    worst
+}
+
 /// The weakest agreement over the tail windows, and where it was found.
 ///
 /// The whole-stream ratio blends a run that diverged once at token 60 and
@@ -245,12 +278,12 @@ fn judge(spec: &[u32], plain: &[u32]) -> Option<String> {
     }
 
     for (name, arm) in [("plain", plain), ("speculative", spec)] {
-        let (period, fraction) = strongest_cycle(arm);
+        let (start, period, fraction) = strongest_windowed_cycle(arm);
         if fraction > MAX_CYCLE_FRACTION {
             return Some(format!(
                 "the {name} arm repeats at period {period} across {fraction:.4} of its \
-                 {shorter} tokens (ceiling {MAX_CYCLE_FRACTION}) — it has collapsed into a \
-                 repetition loop, so agreement between the arms would say nothing"
+                 tokens from {start} on (ceiling {MAX_CYCLE_FRACTION}) — it has collapsed \
+                 into a repetition loop, so agreement between the arms would say nothing"
             ));
         }
     }
@@ -331,6 +364,27 @@ fn every_shape_of_repetition_loop_is_refused() {
                 .chain((0..N_TOKENS - 40).map(|i| [7u32, 9, 11][i % 3]))
                 .collect(),
         ),
+        // Over the whole stream this reads 0.3992 at period 1 — under the
+        // ceiling, because the healthy three fifths dilute it. Its own tail
+        // window is where it is visible.
+        (
+            "a collapse confined to the last two fifths",
+            healthy[..N_TOKENS * 3 / 5]
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(7u32, N_TOKENS - N_TOKENS * 3 / 5))
+                .collect(),
+        ),
+        // A repeated sentence is the commonest real degeneracy and reads
+        // 0.0000 at every period under its own length.
+        (
+            "a twelve-token phrase over four fifths",
+            healthy[..N_TOKENS / 5]
+                .iter()
+                .copied()
+                .chain((0..N_TOKENS - N_TOKENS / 5).map(|i| 1000 + (i % 12) as u32))
+                .collect(),
+        ),
     ] {
         let failure = judge(&stream, &stream).unwrap_or_else(|| panic!("{shape} was not refused"));
         assert!(failure.contains("repetition loop"), "{shape}: {failure}");
@@ -348,14 +402,18 @@ fn a_degenerate_speculative_arm_is_caught() {
 }
 
 /// Real prose is not a repetition loop. Without this the control could be made
-/// to fire on everything and the suite above would still be green.
+/// to fire on everything and the suite above would still be green — and the
+/// widening to period 64 over four windows is exactly the change that could do
+/// it. The measured readings from both real arms are in the module docs.
 #[test]
 fn a_healthy_stream_clears_the_repetition_control() {
+    // 97 is coprime with every period the sweep looks at, so no window of this
+    // stream repeats at any of them.
     let healthy: Vec<u32> = (0..N_TOKENS as u32).map(|t| t % 97).collect();
-    let (period, fraction) = strongest_cycle(&healthy);
+    let (start, period, fraction) = strongest_windowed_cycle(&healthy);
     assert!(
         fraction <= MAX_CYCLE_FRACTION,
-        "a stream with no short cycle scored {fraction} at period {period}"
+        "a stream with no short cycle scored {fraction} at period {period} from {start}"
     );
     assert!(judge(&healthy, &healthy).is_none());
 }
@@ -454,15 +512,20 @@ fn the_gate_admits_the_shipped_regime_and_refuses_the_broken_one() {
 
 // ── The gate ─────────────────────────────────────────────────────────────────
 
-/// Snapshot slug of the verifier this gate is calibrated on.
-const VERIFIER_SLUG: &str = "mlx-community__gemma-4-e2b-it-mxfp8";
+/// The verifier this gate is calibrated on, resolved by the golden harness so
+/// an override naming another architecture stands down instead of running.
+const VERIFIER: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__gemma-4-e2b-it-mxfp8",
+    archs: &["Gemma4ForConditionalGeneration"],
+};
 /// Snapshot slug of its assistant drafter.
 const DRAFTER_SLUG: &str = "mlx-community__gemma-4-E2B-it-assistant-bf16";
 /// Draft-model override, the variable the sibling alignment suites take.
 const DRAFT_MODEL_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 
-/// Resolve one half of the pair: an operator's override if they named one,
-/// otherwise the slug under `RMLX_O_MODELS_ROOT`.
+/// Resolve the **drafter**, which the golden harness has no variable for: an
+/// operator's override if they named one, otherwise the slug under
+/// `RMLX_O_MODELS_ROOT`. The verifier goes through `common::model_for`.
 ///
 /// Resolving by slug is what puts this gate inside `make gpu-test` on a machine
 /// holding the snapshots: it joins the population `run_gpu_tests.sh` already
@@ -506,16 +569,38 @@ fn resolve(var: &str, slug: &str) -> common::Gate {
 /// or the other depending on the export tool — the same two fields the serve
 /// layer routes `--draft-kind mtp` on.
 fn is_gemma4_assistant(draft_path: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(draft_path.join("config.json")) else {
-        return false;
-    };
-    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    let model_type = cfg["model_type"].as_str().unwrap_or_default();
-    let arch_name = cfg["architectures"][0].as_str().unwrap_or_default();
-    model_type == "gemma4_assistant" || arch_name.contains("Gemma4Assistant")
+    draft_config(draft_path).is_some_and(|cfg| {
+        let model_type = cfg["model_type"].as_str().unwrap_or_default();
+        let arch_name = cfg["architectures"][0].as_str().unwrap_or_default();
+        model_type == "gemma4_assistant" || arch_name.contains("Gemma4Assistant")
+    })
 }
+
+fn draft_config(draft_path: &Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(draft_path.join("config.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// The verifier width this drafter was trained to project into.
+///
+/// Both `-e2b-` and `-e4b-` snapshots declare the same architecture, so the
+/// harness's arch stand-down cannot tell them apart — an operator with
+/// `RMLX_KV_TEST_MODEL` pointed at e4b for another suite would otherwise run an
+/// e4b verifier against the E2B drafter resolved by slug, against floors
+/// measured on e2b. This is the field that does tell them apart, and it is read
+/// before the drafter is loaded so a mismatched pair skips with a reason rather
+/// than panicking inside the loader.
+fn drafter_backbone_hidden(draft_path: &Path) -> Option<usize> {
+    draft_config(draft_path)?["backbone_hidden_size"]
+        .as_u64()
+        .and_then(|v| usize::try_from(v).ok())
+}
+
+/// The 4k document the long-context benches use, for the reproducer below.
+const LONG_CONTEXT_PROMPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../prompts/longctx_4k.json"
+));
 
 /// Chat-formatted prompt, with the leading `<bos>`.
 ///
@@ -523,14 +608,38 @@ fn is_gemma4_assistant(draft_path: &Path) -> bool {
 /// first token, and a gate that only ever runs on a degenerate stream is a gate
 /// that never runs.
 fn build_prompt(tk: &tokenizers::Tokenizer) -> Vec<u32> {
-    let text = "<start_of_turn>user\nExplain how a hash map resolves collisions, \
-                step by step.<end_of_turn>\n<start_of_turn>model\n";
+    wrap_turn(
+        tk,
+        "Explain how a hash map resolves collisions, step by step.",
+    )
+}
+
+/// The same, over the 4k document: a cache large enough to reach the boundaries
+/// where this repository's KV defects live.
+fn build_long_context_prompt(tk: &tokenizers::Tokenizer) -> Vec<u32> {
+    let doc: serde_json::Value =
+        serde_json::from_str(LONG_CONTEXT_PROMPT).expect("the long-context prompt is JSON");
+    let body = doc["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    wrap_turn(
+        tk,
+        &format!("{body}\n\nSummarise the document above section by section, in detail."),
+    )
+}
+
+fn wrap_turn(tk: &tokenizers::Tokenizer, question: &str) -> Vec<u32> {
+    let text = format!("<start_of_turn>user\n{question}<end_of_turn>\n<start_of_turn>model\n");
     let mut ids: Vec<u32> = Vec::new();
     if let Some(bos) = tk.token_to_id("<bos>") {
         ids.push(bos);
     }
     ids.extend(
-        tk.encode(text, true)
+        tk.encode(text.as_str(), true)
             .expect("encode")
             .get_ids()
             .iter()
@@ -618,17 +727,36 @@ fn plain_greedy(
 #[test]
 fn speculative_greedy_reproduces_plain_greedy() {
     const TEST: &str = "speculative_greedy_reproduces_plain_greedy";
+    run_gate(TEST, build_prompt);
+}
+
+/// The same gate over a 4k document, where it fails today.
+///
+/// The speculative arm collapses into a period-8 repetition loop while plain
+/// greedy writes a clean summary and stops — see the module docs for the
+/// readings and the issue. It reproduces on `main`, so it is not this branch's;
+/// it is here because a reproducer that fails until the defect is fixed is what
+/// makes moving the gate onto this prompt happen, and a paragraph is not.
+#[ignore]
+#[test]
+fn speculative_greedy_reproduces_plain_greedy_at_long_context() {
+    const TEST: &str = "speculative_greedy_reproduces_plain_greedy_at_long_context";
+    run_gate(TEST, build_long_context_prompt);
+}
+
+/// Both arms of one pair over `prompt`, judged.
+fn run_gate(test: &str, prompt_of: fn(&tokenizers::Tokenizer) -> Vec<u32>) {
     let (Some(model_path), Some(draft_path)) = (
-        common::apply(resolve(common::SINGLE_MODEL_VAR, VERIFIER_SLUG), TEST),
-        common::apply(resolve(DRAFT_MODEL_VAR, DRAFTER_SLUG), TEST),
+        common::model_for(&VERIFIER, test),
+        common::apply(resolve(DRAFT_MODEL_VAR, DRAFTER_SLUG), test),
     ) else {
         return;
     };
 
     if !is_gemma4_assistant(&draft_path) {
         eprintln!(
-            "[spec_equiv] {} is not a Gemma4 assistant drafter - skipping; the floor is \
-             calibrated on the exact-rollback regime only",
+            "SKIP {test}: {} is not a Gemma4 assistant drafter; the floors are calibrated \
+             on the exact-rollback regime only",
             draft_path.display()
         );
         return;
@@ -639,15 +767,25 @@ fn speculative_greedy_reproduces_plain_greedy() {
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     if verifier.needs_lin_caches() {
         eprintln!(
-            "[spec_equiv] {} carries recurrent state - skipping; see the module docs",
+            "SKIP {test}: {} carries recurrent state; see the module docs",
             model_path.display()
         );
         return;
     }
     let hidden = verifier.hidden_size();
+    if drafter_backbone_hidden(&draft_path) != Some(hidden) {
+        eprintln!(
+            "SKIP {test}: {} projects into a backbone of {:?} and {} is {hidden} wide; the \
+             floors are measured on one pair and this is another",
+            draft_path.display(),
+            drafter_backbone_hidden(&draft_path),
+            model_path.display(),
+        );
+        return;
+    }
     let tk =
         tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");
-    let prompt = build_prompt(&tk);
+    let prompt = prompt_of(&tk);
     let eos = eos_ids(&model_path);
     assert!(
         !eos.is_empty(),
@@ -682,11 +820,12 @@ fn speculative_greedy_reproduces_plain_greedy() {
     let plain_ids = plain_greedy(&verifier, &tk, &prompt, &eos, device);
 
     let (tail_start, tail_ratio) = weakest_tail(&spec_ids, &plain_ids);
-    let (spec_period, spec_cycle) = strongest_cycle(&spec_ids);
-    let (plain_period, plain_cycle) = strongest_cycle(&plain_ids);
+    let (spec_from, spec_period, spec_cycle) = strongest_windowed_cycle(&spec_ids);
+    let (plain_from, plain_period, plain_cycle) = strongest_windowed_cycle(&plain_ids);
     eprintln!(
-        "[spec_equiv] lcs={:.4} first_divergence={} tail={tail_ratio:.4}@{tail_start} \
-         cycle spec={spec_cycle:.4}/p{spec_period} plain={plain_cycle:.4}/p{plain_period} \
+        "[{test}] lcs={:.4} first_divergence={} tail={tail_ratio:.4}@{tail_start} \
+         cycle spec={spec_cycle:.4}/p{spec_period}@{spec_from} \
+         plain={plain_cycle:.4}/p{plain_period}@{plain_from} \
          spec={} plain={}\n  spec  = {:?}\n  plain = {:?}",
         lcs_ratio(&spec_ids, &plain_ids),
         common_prefix_len(&spec_ids, &plain_ids),

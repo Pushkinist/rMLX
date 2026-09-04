@@ -47,7 +47,15 @@ the append-only store cannot be taken back out.
 `emitted_total` is what the rounds produced. The sidecar loops emit a bonus
 token out of the prefill forward before the first round and report it as
 `seed_emitted`; it is subtracted, or a sidecar row would read one token per
-round above a two-model row that did the same work.
+round above a two-model row that did the same work. An event that ran no round
+and emitted something other than its seed is refused: those two counts are taken
+at different points in the loop, so disagreement means the loop's own accounting
+moved.
+
+There is no legacy-field support here. `seed_emitted` is required, and every
+binary that ever wrote a `done` line without it also predates the fields this
+module reads, so a log old enough to need a rename is refused for a reason that
+is true rather than accepted under a shim nothing exercises.
 
 Every counter a figure is derived from is **required**. A binary that stops
 reporting one, together with its derived twin, would otherwise aggregate to a
@@ -79,12 +87,6 @@ import sys
 
 DONE_MARKERS = ("generate_greedy", "generate_stochastic")
 
-# Field names that moved, oldest spelling first. Binaries from before the round
-# loops shared one record logged the cached two-model loops' accepted count as
-# `total_accept_count`; every loop logs `total_accept` now. Renaming on read is
-# what keeps one consumer supporting a legacy log while another refuses it and
-# blames a formula drift for a field-name change.
-FIELD_ALIASES = {"total_accept_count": "total_accept"}
 
 # Counters every derived figure is built from. A log missing one of these has no
 # aggregate, and saying so beats reporting a zero nobody measured.
@@ -124,20 +126,8 @@ def done_events(path):
                 continue
             message = fields.get("message", "")
             if any(m in message for m in DONE_MARKERS) and "done" in message:
-                events.append(normalise(fields))
+                events.append(fields)
     return events
-
-
-def normalise(fields):
-    """`fields` with every legacy field name replaced by its current one.
-
-    Done once, before any consumer sees the event, so an alias cannot be known
-    to one consumer and not another.
-    """
-    for old_name, new_name in FIELD_ALIASES.items():
-        if old_name in fields and new_name not in fields:
-            fields[new_name] = fields.pop(old_name)
-    return fields
 
 
 def decode_tps(fields):
@@ -191,6 +181,28 @@ def require_counters(events):
                 f"'{message}' carries no {', '.join(missing)}: a figure derived "
                 "from a counter the log does not have is a zero nobody measured"
             )
+
+
+def check_seed(fields):
+    """Refuse an event whose seed count contradicts what it emitted.
+
+    `emitted` is read at the end of the request and `seed_emitted` before the
+    first round, so a loop that stopped emitting its pre-round token, or grew a
+    second one, disagrees with itself here. `tokens_per_round` subtracts one
+    from the other and lands in an append-only table.
+    """
+    message = fields.get("message", "<no message>")
+    if fields["seed_emitted"] > fields["emitted"]:
+        raise SpecLogError(
+            f"'{message}' seeded {fields['seed_emitted']} of {fields['emitted']} "
+            "emitted tokens: more before its rounds than it emitted in total"
+        )
+    if fields["rounds"] == 0 and fields["emitted"] != fields["seed_emitted"]:
+        raise SpecLogError(
+            f"'{message}' ran no round and emitted {fields['emitted']} against a seed "
+            f"of {fields['seed_emitted']}: tokens_per_round would count what no "
+            "round produced"
+        )
 
 
 def one_value(events, field):
@@ -273,6 +285,7 @@ def summarize(events):
     """
     require_counters(events)
     for event in events:
+        check_seed(event)
         check_derived(event)
 
     rounds = sum(e["rounds"] for e in events)

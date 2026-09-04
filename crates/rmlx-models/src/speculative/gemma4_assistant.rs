@@ -798,9 +798,10 @@ pub fn mtp_assistant_generate_greedy(
             // still happened, so it still leaves exactly one record.
             super::RoundStats {
                 loop_kind: super::SpecLoop::MtpAssistant,
-                block_size: block_size as u32,
+                block_size,
                 rounds: 0,
                 emitted: emitted.len(),
+                seed_emitted: emitted.len(),
                 total_draft: 0,
                 total_accept: 0,
                 prefill_ns,
@@ -823,6 +824,7 @@ pub fn mtp_assistant_generate_greedy(
         "mtp_assistant_generate_greedy: starting (Gemma4-assistant MTP)"
     );
 
+    let seed_emitted = emitted.len();
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
@@ -948,9 +950,10 @@ pub fn mtp_assistant_generate_greedy(
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();
     super::RoundStats {
         loop_kind: super::SpecLoop::MtpAssistant,
-        block_size: block_size as u32,
+        block_size,
         rounds,
         emitted: emitted.len(),
+        seed_emitted,
         total_draft,
         total_accept,
         prefill_ns,

@@ -20,8 +20,11 @@
 //! two-model loops emit nothing outside their loop. Dividing `emitted` by
 //! `rounds` would therefore read `+1/rounds` high on four of six loops — about
 //! 3% at a 128-token bench — and make the one figure the record exists to
-//! compare incomparable between them. [`SpecLoop::seed_tokens`] is what each
-//! loop emits outside its rounds, and it is subtracted.
+//! compare incomparable between them. Each loop reads its own `emitted.len()`
+//! at the moment its round loop starts and reports it as
+//! [`RoundStats::seed_emitted`], which is subtracted. A per-loop constant would
+//! say the same thing today and would drift, silently, the day a loop stopped
+//! emitting one.
 //!
 //! **The derivation does not change what it measures.** Every figure below is
 //! arithmetic over counters the loops already keep; nothing here forces an
@@ -64,6 +67,40 @@ pub(crate) enum SpecLoop {
 }
 
 impl SpecLoop {
+    /// Every variant, once — the population the per-loop tests sweep.
+    ///
+    /// Paired with [`Self::index`], whose match is exhaustive: a seventh
+    /// variant does not compile until it has an index, and
+    /// `every_variant_is_in_all_once` does not pass until it is in this list at
+    /// that index. A hand-written list in a test file is forced by neither, and
+    /// a new loop would silently join none of the six per-loop tests.
+    ///
+    /// It lives beside the enum because that is where the exhaustiveness comes
+    /// from, and is compiled with the tests because that is its only caller —
+    /// `make ci` builds them, so the guarantee holds where it is checked.
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::MtpAssistant,
+        Self::MtpSidecar,
+        Self::DFlash,
+        Self::Eagle3,
+        Self::TwoModelGreedy,
+        Self::TwoModelStochastic,
+    ];
+
+    /// This variant's position in [`Self::ALL`].
+    #[cfg(test)]
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::MtpAssistant => 0,
+            Self::MtpSidecar => 1,
+            Self::DFlash => 2,
+            Self::Eagle3 => 3,
+            Self::TwoModelGreedy => 4,
+            Self::TwoModelStochastic => 5,
+        }
+    }
+
     /// The event this loop closes every request with. One per request, whatever
     /// stopped it — a reader counting records against requests served needs the
     /// EOS case to leave one too.
@@ -88,19 +125,6 @@ impl SpecLoop {
             Self::DFlash => DraftKind::DFlash.as_str(),
             Self::Eagle3 => DraftKind::Eagle3.as_str(),
             Self::TwoModelGreedy | Self::TwoModelStochastic => TWO_MODEL_KIND,
-        }
-    }
-
-    /// Tokens this loop emits outside its round loop.
-    ///
-    /// The sidecar loops take the first bonus token from the prefill forward's
-    /// logits and emit it before the first round, so one emitted token is a
-    /// product of the prefill and not of a verify round. The two-model loops
-    /// seed a carry token instead and emit nothing until a round has run.
-    pub(crate) const fn seed_tokens(self) -> usize {
-        match self {
-            Self::MtpAssistant | Self::MtpSidecar | Self::DFlash | Self::Eagle3 => 1,
-            Self::TwoModelGreedy | Self::TwoModelStochastic => 0,
         }
     }
 
@@ -132,15 +156,21 @@ pub(crate) struct RoundStats {
     /// Which loop produced the tokens.
     pub(crate) loop_kind: SpecLoop,
     /// The block size the request was configured with, verifier token included.
-    ///
-    /// `u32` because it reaches a `decode_config` term, which is cell identity
-    /// in an append-only store: a lossy conversion at that point would file a
-    /// run under a block nothing ran.
-    pub(crate) block_size: u32,
+    pub(crate) block_size: usize,
     /// Rounds the loop entered.
     pub(crate) rounds: usize,
     /// Tokens handed to the sink.
     pub(crate) emitted: usize,
+    /// How many of those the loop had already emitted when its round loop
+    /// started.
+    ///
+    /// A measurement, not a constant: the sidecar loops argmax a bonus token
+    /// out of the prefill forward and emit it before the first round, the
+    /// two-model loops emit nothing until a round has run, and each loop reads
+    /// its own `emitted.len()` at that point. A per-loop constant would say the
+    /// same thing today and drift the day a loop stops emitting one — silently,
+    /// into an append-only store.
+    pub(crate) seed_emitted: usize,
     /// Tokens the drafter proposed, over all rounds.
     pub(crate) total_draft: usize,
     /// Proposed tokens the verifier accepted, over all rounds.
@@ -185,7 +215,7 @@ impl RoundStats {
 
     /// Tokens the round loop itself emitted.
     pub(crate) fn round_emitted(&self) -> usize {
-        self.emitted.saturating_sub(self.loop_kind.seed_tokens())
+        self.emitted.saturating_sub(self.seed_emitted)
     }
 
     /// Drafting wall-clock per round.
@@ -209,6 +239,30 @@ impl RoundStats {
     pub(crate) fn loop_ms_per_round(&self) -> f64 {
         let overhead = ms(self.round_loop_ns) - ms(self.draft_ns) - ms(self.verifier_ns);
         ratio(overhead, self.rounds as f64)
+    }
+
+    /// Why the emitted counts do not add up, when they do not.
+    ///
+    /// A request whose round loop never ran emitted exactly what it emitted
+    /// before that loop, and nothing else. The two counts come from different
+    /// places — one is `emitted.len()` at the end, the other `emitted.len()`
+    /// before the first round — so this is a cross-check on the loop's own
+    /// accounting rather than a restatement of it.
+    pub(crate) fn seed_violation(&self) -> Option<String> {
+        if self.seed_emitted > self.emitted {
+            return Some(format!(
+                "seed_emitted {} exceeds emitted {}: the loop counted more tokens before \
+                 its rounds than it emitted in total",
+                self.seed_emitted, self.emitted
+            ));
+        }
+        (self.rounds == 0 && self.emitted != self.seed_emitted).then(|| {
+            format!(
+                "no round ran and emitted {} is not the {} the loop had before its round \
+                 loop: tokens_per_round would count what no round produced",
+                self.emitted, self.seed_emitted
+            )
+        })
     }
 
     /// Why the three spans do not partition the round loop, when they do not.
@@ -253,18 +307,20 @@ impl RoundStats {
     /// six callsites became one. `loop_kind` is a field so the loop is still
     /// selectable, by field rather than by module path.
     pub(crate) fn log_done(&self) {
-        if let Some(reason) = self.span_violation() {
+        for reason in [self.span_violation(), self.seed_violation()]
+            .into_iter()
+            .flatten()
+        {
             tracing::error!(
                 loop_kind = ?self.loop_kind,
-                "speculative round timing is inconsistent: {reason}"
+                "speculative round accounting is inconsistent: {reason}"
             );
-            debug_assert!(false, "{reason}");
         }
         tracing::info!(
             loop_kind = ?self.loop_kind,
             rounds = self.rounds,
             emitted = self.emitted,
-            seed_emitted = self.loop_kind.seed_tokens(),
+            seed_emitted = self.seed_emitted,
             total_draft = self.total_draft,
             total_accept = self.total_accept,
             accept_rate = self.accept_rate(),

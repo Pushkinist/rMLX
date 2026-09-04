@@ -572,6 +572,7 @@ impl SpeculativeDispatcher {
         let mut d_seed: Vec<u32> = vec![last_prompt];
 
         // --- Spec loop. ------------------------------------------------
+        let seed_emitted = emitted.len();
         let round_loop_t0 = Instant::now();
         while emitted.len() < n_tokens {
             rounds += 1;
@@ -682,9 +683,10 @@ impl SpeculativeDispatcher {
             if hit_eos {
                 RoundStats {
                     loop_kind: SpecLoop::TwoModelGreedy,
-                    block_size: (k + 1) as u32,
+                    block_size: k + 1,
                     rounds,
                     emitted: emitted.len(),
+                    seed_emitted,
                     total_draft: total_draft_tokens,
                     total_accept: total_accept_count,
                     prefill_ns,
@@ -799,9 +801,10 @@ impl SpeculativeDispatcher {
 
         RoundStats {
             loop_kind: SpecLoop::TwoModelGreedy,
-            block_size: (k + 1) as u32,
+            block_size: k + 1,
             rounds,
             emitted: emitted.len(),
+            seed_emitted,
             total_draft: total_draft_tokens,
             total_accept: total_accept_count,
             prefill_ns,
@@ -984,6 +987,7 @@ impl SpeculativeDispatcher {
         let mut v_carry: Vec<u32> = vec![last_prompt];
         let mut d_seed: Vec<u32> = vec![last_prompt];
 
+        let seed_emitted = emitted.len();
         let round_loop_t0 = Instant::now();
         while emitted.len() < n_tokens {
             rounds += 1;
@@ -1101,9 +1105,10 @@ impl SpeculativeDispatcher {
             if hit_eos {
                 RoundStats {
                     loop_kind: SpecLoop::TwoModelStochastic,
-                    block_size: (k + 1) as u32,
+                    block_size: k + 1,
                     rounds,
                     emitted: emitted.len(),
+                    seed_emitted,
                     total_draft: total_draft_tokens,
                     total_accept: total_accept_count,
                     prefill_ns,
@@ -1191,9 +1196,10 @@ impl SpeculativeDispatcher {
 
         RoundStats {
             loop_kind: SpecLoop::TwoModelStochastic,
-            block_size: (k + 1) as u32,
+            block_size: k + 1,
             rounds,
             emitted: emitted.len(),
+            seed_emitted,
             total_draft: total_draft_tokens,
             total_accept: total_accept_count,
             prefill_ns,

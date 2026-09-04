@@ -63,6 +63,28 @@ fn adaptive_depth_is_a_separate_well_formed_cell() {
     assert!(decode_config_is_well_formed(&confidence), "{confidence}");
 }
 
+/// The block reaches the term as the engine holds it. A narrower parameter
+/// would truncate or saturate here, and the row would name a block nothing ran
+/// in a table that cannot take it back out.
+#[test]
+fn a_block_beyond_a_narrower_type_is_not_truncated() {
+    let huge = u32::MAX as usize + 2;
+    assert_eq!(
+        decode_config("mtp", huge, None),
+        format!("mtp/block={huge}")
+    );
+    assert!(decode_config_is_well_formed(&decode_config(
+        "mtp", huge, None
+    )));
+
+    // The same value read back out of a row's notes, for the same reason.
+    let notes = format!("config=mtp draft_kind=mtp block_size={huge}");
+    assert_eq!(
+        decode_config_from_notes(&notes),
+        NotesVerdict::Speculative(format!("mtp/block={huge}")),
+    );
+}
+
 #[test]
 fn notes_naming_a_drafter_classify_as_that_arm() {
     for (notes, want) in [

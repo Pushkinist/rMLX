@@ -120,16 +120,17 @@ done
 
 # The drafter kind reaches a buffer *filename* and the record's `notes`, both
 # before the engine ever sees it, so a value with a `/` or a space in it writes
-# outside `pending/` or files an unparseable note. The engine's own list is the
-# authority; this is the same list, checked early enough to matter.
-case "${DRAFT_KIND}" in
-    mtp|dflash|eagle3) ;;
-    *)
-        echo "ERROR: --draft-kind '${DRAFT_KIND}' is not one the engine ships" \
-             "(mtp, dflash, eagle3)" >&2
-        exit 1
-        ;;
-esac
+# outside `pending/` or files an unparseable note. That is the property this
+# script needs and the only one it checks: a list of the kinds the engine ships
+# would be a third copy of an enum this script cannot keep current, and would
+# reject a new drafter with a sentence that is false about it. Which kinds exist
+# is the engine's to say, in its own message.
+if ! [[ "${DRAFT_KIND}" =~ ^[a-z0-9_]+$ ]]; then
+    echo "ERROR: --draft-kind '${DRAFT_KIND}' is not a bare lower-case name;" \
+         "it reaches a buffer filename and the record's notes before the engine" \
+         "sees it" >&2
+    exit 1
+fi
 
 if ! [[ "${DRAFT_BLOCK_SIZE}" =~ ^[0-9]+$ ]] || (( DRAFT_BLOCK_SIZE < 2 )); then
     echo "ERROR: --draft-block-size '${DRAFT_BLOCK_SIZE}' must be an integer >= 2:" \

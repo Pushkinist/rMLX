@@ -158,6 +158,94 @@ fn seed_speculative_at(
     rec.record_run(&run).unwrap();
 }
 
+/// One speculative run, every cell column addressable.
+#[derive(Clone)]
+struct SpecRun {
+    backend: String,
+    namespace: String,
+    model: String,
+    weight_quant: String,
+    kv_quant: String,
+    ctx_max: i64,
+    prompt: String,
+    decode_config: String,
+}
+
+impl SpecRun {
+    fn baseline() -> Self {
+        Self {
+            backend: "rmlx".into(),
+            namespace: "mlx-community".into(),
+            model: "Qwen3.8-27B-mxfp8".into(),
+            weight_quant: "mxfp8".into(),
+            kv_quant: "none".into(),
+            ctx_max: 16384,
+            prompt: "p".into(),
+            decode_config: "mtp/block=3".into(),
+        }
+    }
+}
+
+/// Two runs alike but for `column`. Every entry of `cell::CELL_COLUMNS` has an
+/// arm, so a new column fails to compile here rather than silently rendering
+/// one blended row.
+fn two_runs_differing_in(column: &str) -> (SpecRun, SpecRun) {
+    let a = SpecRun::baseline();
+    let mut b = a.clone();
+    match column {
+        "backend" => b.backend = "mlx_lm".into(),
+        "model_namespace" => b.namespace = "hf".into(),
+        "model" => b.model = "gemma-4-e2b-it-mxfp8".into(),
+        "weight_quant" => b.weight_quant = "4bit".into(),
+        "kv_quant" => b.kv_quant = "k8v8".into(),
+        "ctx_max" => b.ctx_max = 4096,
+        "prompt_id" => b.prompt = "q".into(),
+        "decode_config" => b.decode_config = "mtp/block=2".into(),
+        other => panic!("{other} is a cell column with no arm here; add one"),
+    }
+    (a, b)
+}
+
+fn record_spec(conn: &mut Connection, run: &SpecRun) {
+    let mut rec = Recorder::new(conn, "test@0.0.1");
+    let record = RunRecord {
+        schema_version: crate::ingest::RECORD_SCHEMA_VERSION,
+        backend: run.backend.clone(),
+        backend_version: Some("0.4.1".into()),
+        model_namespace: run.namespace.clone(),
+        model: run.model.clone(),
+        weight_quant: run.weight_quant.clone(),
+        kv_quant: run.kv_quant.clone(),
+        ctx_max: run.ctx_max,
+        prompt: PromptRef::ByBody {
+            name: run.prompt.clone(),
+            body: json!(run.prompt.clone()),
+            notes: None,
+            tokens_approx: Some(1),
+        },
+        ts_utc: "2026-09-04T10:00:00Z".into(),
+        git_sha: None,
+        build_profile: None,
+        hardware_tag: "m5_max_128gb".into(),
+        prompt_tokens: None,
+        max_tokens: None,
+        temperature: Some(0.0),
+        seed: None,
+        n_warmups: None,
+        n_measure: None,
+        output_first_64: None,
+        notes: None,
+        description: None,
+        decode_config: Some(run.decode_config.clone()),
+        metrics: vec![MetricEntry {
+            name: "tokens_per_round".into(),
+            value: Some(2.5),
+            stddev: None,
+        }],
+    };
+    rec.record_run(&record).unwrap();
+}
+
 fn tiny_scope() -> ScopeFile {
     ScopeFile::parse(
         r#"
@@ -800,6 +888,38 @@ fn two_contexts_are_two_rows_not_one_blended_row() {
         !short.contains("210.00"),
         "the 4k row took a millisecond figure from the 128k run: {short}"
     );
+}
+
+/// Every cell column separates rows, driven off `CELL_COLUMNS` itself.
+///
+/// `SpecRowKey`'s doc claims to carry all of them and nothing enforced it. That
+/// column list is the module that exists because `decode_config` reached the
+/// view and none of the consumers, and nothing failed; a ninth column would
+/// reproduce it in this exact tuple and re-blend the rows this table separates.
+/// Driven off the constant, a new column fails here until it has a fixture and
+/// a key element.
+#[test]
+fn every_cell_column_separates_two_speculative_rows() {
+    for col in crate::cell::CELL_COLUMNS {
+        let mut conn = test_conn();
+        let (a, b) = two_runs_differing_in(col.name);
+        record_spec(&mut conn, &a);
+        record_spec(&mut conn, &b);
+
+        let md = export_markdown(&conn, None).unwrap();
+        let Some(section) = md.split("## Speculative decoding").nth(1) else {
+            panic!("{}: no speculative section rendered", col.name);
+        };
+        let rows = section
+            .lines()
+            .filter(|l| l.starts_with("| `") && l.contains("block="))
+            .count();
+        assert_eq!(
+            rows, 2,
+            "{} does not separate two rows; they were blended into one:\n{section}",
+            col.name
+        );
+    }
 }
 
 /// The rendered set is the declared set. A speculative metric added to the
