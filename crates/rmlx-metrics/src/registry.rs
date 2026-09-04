@@ -141,6 +141,42 @@ const MB_CEILING: f64 = 1e9;
 
 // ── METRICS const ─────────────────────────────────────────────────────────────
 
+/// What a speculative metric is: a raw total over the request, or a figure
+/// derived from those totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "a speculative metric is a counter or something computed from counters; a third kind would be a different table"
+)]
+pub enum SpecRole {
+    /// Cumulative over the request. Recorded for audit; not a table column,
+    /// because a total says nothing without the rounds it is spread over.
+    Counter,
+    /// Computed from the counters. What the table shows.
+    Derived,
+}
+
+/// The metrics a speculative round loop reports, in the order they are derived.
+///
+/// One declaration of the set. `rmlx_metrics::export`'s speculative table
+/// renders exactly the [`SpecRole::Derived`] ones (plus the throughput they
+/// explain) and a test pins that, so a metric added here reaches the table
+/// rather than being invisible until somebody notices the column is missing.
+///
+/// `decode_tps_warm` is deliberately not here: every backend emits it and it is
+/// not a round-loop figure.
+pub const SPEC_METRICS: &[(&str, SpecRole)] = &[
+    ("accept_rate", SpecRole::Derived),
+    ("draft_tokens_total", SpecRole::Counter),
+    ("accept_tokens_total", SpecRole::Counter),
+    ("draft_rounds_total", SpecRole::Counter),
+    ("accepted_per_step", SpecRole::Derived),
+    ("tokens_per_round", SpecRole::Derived),
+    ("draft_ms_per_round", SpecRole::Derived),
+    ("verify_ms_per_round", SpecRole::Derived),
+    ("loop_ms_per_round", SpecRole::Derived),
+];
+
 /// Canonical metric name → (unit, direction, plausible bounds).
 /// Add new metrics here AND in §4.
 pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[

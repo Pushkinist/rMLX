@@ -106,6 +106,16 @@ fn seed_speculative(
     decode_config: Option<&str>,
     metrics: &[(&str, f64)],
 ) {
+    seed_speculative_at(conn, model, decode_config, 16384, metrics);
+}
+
+fn seed_speculative_at(
+    conn: &mut Connection,
+    model: &str,
+    decode_config: Option<&str>,
+    ctx_max: i64,
+    metrics: &[(&str, f64)],
+) {
     let mut rec = Recorder::new(conn, "test@0.0.1");
     let run = RunRecord {
         schema_version: crate::ingest::RECORD_SCHEMA_VERSION,
@@ -115,7 +125,7 @@ fn seed_speculative(
         model: model.into(),
         weight_quant: "mxfp8".into(),
         kv_quant: "none".into(),
-        ctx_max: 16384,
+        ctx_max,
         prompt: PromptRef::ByBody {
             name: "p".into(),
             body: json!("x"),
@@ -697,10 +707,136 @@ fn the_speculative_section_carries_the_round_loop_figures() {
         .split("## Speculative decoding")
         .nth(1)
         .expect("section present");
-    assert!(section.contains("Tokens/round"), "{section}");
-    assert!(section.contains("mtp/block=3"), "{section}");
-    for value in ["2.46", "1.46", "12.50", "44.00", "8.25", "0.728"] {
-        assert!(section.contains(value), "{value} missing from {section}");
+
+    // The whole row, not `contains` per value: every one of these numbers is
+    // present under any column order, so only the row as rendered can tell a
+    // reordered table from a correct one.
+    let row = section
+        .lines()
+        .find(|l| l.contains("mtp/block=3"))
+        .expect("the arm's row");
+    let cells: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+    assert_eq!(
+        &cells[..10],
+        &[
+            "`mlx-community__Qwen3.8-27B-mxfp8`",
+            "mtp/block=3",
+            "rmlx",
+            "bf16 KV",
+            "mxfp8",
+            "16384",
+            "1",
+            "25.50",
+            "0.728",
+            "2.46",
+        ],
+        "row rendered as {row}"
+    );
+    assert_eq!(&cells[10..13], &["1.46", "12.50", "44.00"], "{row}");
+    assert_eq!(cells[13], "8.25", "{row}");
+
+    // Header and body come from one array, so the heading order is the value
+    // order. Pinned here so a reorder is a diff in two places, not one.
+    let header = section
+        .lines()
+        .find(|l| l.contains("Tokens/round"))
+        .expect("the heading row");
+    let labels: Vec<&str> = header.trim_matches('|').split('|').map(str::trim).collect();
+    assert_eq!(
+        &labels[7..],
+        &[
+            "Decode TPS warm",
+            "Accept rate",
+            "Tokens/round",
+            "Accepted/step",
+            "Draft ms/round",
+            "Verify ms/round",
+            "Loop ms/round",
+            "Updated",
+        ],
+        "heading rendered as {header}"
+    );
+}
+
+/// One row is one cell. Two contexts are two cells, and merging them would take
+/// the higher-better token rate from one and the lower-better milliseconds from
+/// the other — under a heading saying the three millisecond columns partition
+/// one round.
+#[test]
+fn two_contexts_are_two_rows_not_one_blended_row() {
+    let mut conn = test_conn();
+    seed_speculative_at(
+        &mut conn,
+        "Qwen3.8-27B-mxfp8",
+        Some("mtp/block=3"),
+        4096,
+        &[("tokens_per_round", 2.46), ("verify_ms_per_round", 44.0)],
+    );
+    seed_speculative_at(
+        &mut conn,
+        "Qwen3.8-27B-mxfp8",
+        Some("mtp/block=3"),
+        131_072,
+        &[("tokens_per_round", 1.90), ("verify_ms_per_round", 210.0)],
+    );
+    let md = export_markdown(&conn, None).unwrap();
+    let section = md
+        .split("## Speculative decoding")
+        .nth(1)
+        .expect("section present");
+    let rows: Vec<&str> = section
+        .lines()
+        .filter(|l| l.contains("mtp/block=3"))
+        .collect();
+    assert_eq!(rows.len(), 2, "one row per context: {section}");
+
+    let short = rows
+        .iter()
+        .find(|l| l.contains("| 4096 "))
+        .expect("the 4k row");
+    assert!(short.contains("2.46"), "{short}");
+    assert!(short.contains("44.00"), "{short}");
+    assert!(
+        !short.contains("210.00"),
+        "the 4k row took a millisecond figure from the 128k run: {short}"
+    );
+}
+
+/// The rendered set is the declared set. A speculative metric added to the
+/// registry and not to the table would otherwise be recorded and never seen.
+#[test]
+fn the_table_renders_every_declared_speculative_metric() {
+    use crate::registry::{SpecRole, SPEC_METRICS};
+
+    let rendered: Vec<&str> = SPEC_METRIC_COLUMNS.iter().map(|c| c.db_name).collect();
+    for (name, role) in SPEC_METRICS {
+        match role {
+            SpecRole::Derived => assert!(
+                rendered.contains(name),
+                "{name} is a declared speculative figure and has no column"
+            ),
+            SpecRole::Counter => assert!(
+                !rendered.contains(name),
+                "{name} is a cumulative total and says nothing as a column"
+            ),
+        }
+    }
+    for col in SPEC_METRIC_COLUMNS {
+        assert!(
+            col.db_name == "decode_tps_warm"
+                || SPEC_METRICS.iter().any(|(name, _)| *name == col.db_name),
+            "{} has a column and is not a declared speculative metric",
+            col.db_name
+        );
+        assert!(!col.label.is_empty(), "{} has no heading", col.db_name);
+    }
+    // Every declared name is a real metric, or the registry's own gate would
+    // not see it.
+    for (name, _) in SPEC_METRICS {
+        assert!(
+            crate::registry::lookup(name).is_ok(),
+            "{name} is declared speculative and is not in METRICS"
+        );
     }
 }
 
