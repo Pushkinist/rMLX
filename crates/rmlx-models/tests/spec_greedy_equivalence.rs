@@ -32,6 +32,12 @@
 //! flips early, which is a property of the prompt and the arithmetic rather
 //! than of the round loop.
 //!
+//! **Each case declares its own horizon.** The short prompt answers past 512
+//! tokens and asks for [`MIN_ANSWER_TOKENS`]; the long-context one answers in
+//! about 200 and asks for [`MIN_LONG_CONTEXT_ANSWER_TOKENS`], because a floor
+//! its own prompt cannot meet would refuse a *fixed* engine and the reproducer
+//! could never flip to green.
+//!
 //! **Length is bounded from both sides.** Two configurations that differ can
 //! agree for the first few dozen tokens of an easy answer, so a short run is a
 //! gate that cannot fail. A long one is a different trap: greedy decoding
@@ -41,25 +47,53 @@
 //! refuses a broken rollback. [`N_TOKENS`] is the horizon where the two regimes
 //! are separable; it is not a length past which nothing goes wrong.
 //!
-//! **The control.** A token stream that has collapsed into a repetition loop
-//! matches anything, so "the two agree" would pass on garbage. Every run checks
-//! that neither arm repeats at any period up to [`MAX_CYCLE_PERIOD`] across more
-//! than [`MAX_CYCLE_FRACTION`] of its tokens — over the whole stream *and* over
-//! each of the same tail cuts the oracle uses, because three real degeneracies
-//! score under the ceiling on a whole-stream sweep at a short period:
+//! **The control, and what it does not claim.** A token stream that has
+//! collapsed into a repetition loop matches anything, so "the two agree" would
+//! pass on garbage. Every run checks that neither arm repeats at a short period
+//! across more than [`MAX_CYCLE_FRACTION`] of its tokens — over the whole stream
+//! and over each of the same tail cuts the oracle uses, at every period up to
+//! [`MAX_CYCLE_PERIOD`], from at least [`MIN_CYCLE_SAMPLES`] comparisons.
+//!
+//! Three real degeneracies score under any ceiling on a whole-stream sweep at a
+//! short period, which is why it is neither:
 //!
 //! | shape | whole stream, period ≤ 8 | whole stream, period ≤ 64 | windowed |
 //! |---|---|---|---|
 //! | collapse from token 0 | 1.0000 | 1.0000 | 1.0000 |
-//! | collapse over the last two fifths | 0.3992 | 0.3992 | ~1.0 |
-//! | a twelve-token phrase over four fifths | 0.0000 | 0.7960 | 0.7960 |
+//! | collapse over the last two fifths | 0.3992 | 0.3992 | 1.0000 |
+//! | a twelve-token phrase over four fifths | 0.0000 | 0.7960 | 1.0000 |
 //!
-//! A leading-run measure scores every one of the last two at zero. Real prose
-//! from both arms reads 0.0909 (period 62) and 0.0841 (period 21) under the
-//! same widened, windowed sweep — 5.5x under the ceiling, which is what says
-//! the widening does not fire on real output. The controls run before the
-//! length and subsequence checks: a collapse is a more specific verdict than a
-//! short run, and it can be what cut the run short.
+//! **The ceiling sits between two measured populations, and they do not quite
+//! meet.** Structured output is not a loop, and both of this gate's prompts ask
+//! for exactly the shapes that come closest to one:
+//!
+//! | healthy shape | windowed | | loop varying in | windowed |
+//! |---|---|---|---|---|
+//! | prose | 0.06 | | nothing | 1.0000 |
+//! | a stock phrase every 16 tokens | 0.27 | | 1 token in 50 | 0.95–0.99 |
+//! | a numbered list | 0.64 | | 1 token in 20 | 0.88–0.95 |
+//! | a markdown table | 0.68 | | 1 token in 10 | 0.80–0.89 |
+//! | a table in the last quarter | 0.69 | | 1 token in 5 | 0.63–0.75 |
+//!
+//! So the control claims one thing: **an arm locked into a near-exact cycle**.
+//! Above 0.85 nothing healthy was measured and every loop varying in at most a
+//! token in twenty was. Below it the two populations overlap — a healthy
+//! markdown table (0.69) and a loop varying in one token in five (0.63–0.75) are
+//! the same reading, and no threshold separates them. That band is a declared
+//! blind spot rather than an oversight: moving the ceiling down to catch the
+//! ragged loop would fail the table, and this repository has been bitten before
+//! by a verdict whose label drifted while its threshold stayed put.
+//!
+//! Measured on the pair itself: the passing gate's two arms read 0.0571 and
+//! 0.0841, and the failing reproducer's speculative arm reads 1.0000 at period
+//! 8 while its plain arm reads 0.0855 — so that failure is attributable to the
+//! collapse and not to a control misreading a short arm.
+//!
+//! The blind spot is also where the control is least needed. It exists for the
+//! case that defeats the subsequence oracle — two arms collapsing *identically*,
+//! which requires the collapse to be near-exact. A ragged loop produces two
+//! different ragged streams, their subsequence ratio falls, and
+//! [`MIN_LCS_RATIO`] is what refuses them.
 //!
 //! **Known gap: this gate runs at a short context and there is a defect past
 //! it.** `speculative_greedy_reproduces_plain_greedy_at_long_context` is the
@@ -110,10 +144,20 @@ use rmlx_models::speculative::gemma4_assistant::{
 /// that filler measures nothing about the round loop.
 const N_TOKENS: usize = 512;
 
-/// The shorter arm must be at least this long, or there is not enough answer to
-/// compare. A digest over 32 generated tokens has already given two
-/// configurations of this engine the same value where 200 separated them.
+/// The shorter arm must be at least this long on the short prompt, or there is
+/// not enough answer to compare. A digest over 32 generated tokens has already
+/// given two configurations of this engine the same value where 200 separated
+/// them.
 const MIN_ANSWER_TOKENS: usize = 256;
+
+/// The same floor for the long-context case, whose prompt answers shorter.
+///
+/// Plain greedy writes its summary of that document in about 200 tokens and
+/// stops. A floor of 256 there would fail a *fixed* engine — both arms would
+/// agree at ~200 tokens and the gate would still report "an arm stopped early",
+/// so the reproducer could never flip to green and would have to be rewritten
+/// after the fix, which is the outcome it exists to prevent.
+const MIN_LONG_CONTEXT_ANSWER_TOKENS: usize = 150;
 
 /// The shorter arm over the longer. `lcs_ratio` divides by the shorter stream,
 /// so an arm that stopped at a third of the other's length and matched its
@@ -136,19 +180,37 @@ const MAX_CTX: i32 = 8192;
 /// the cache.
 const MIN_LCS_RATIO: f64 = 0.70;
 
-/// The most of an arm — or of any tail cut of it — that may repeat at a short
-/// period before the stream counts as degenerate. A loop repeats at its period
-/// almost everywhere inside itself; the measured readings for real prose from
-/// both arms are in the module docs.
-const MAX_CYCLE_FRACTION: f64 = 0.50;
+/// How nearly exactly an arm — or any tail cut of it — may repeat at a short
+/// period before it counts as locked into a cycle.
+///
+/// Set in the gap between two measured populations, not moved until fixtures
+/// passed: every structured-but-healthy shape measured reads at most 0.6939 and
+/// every loop varying in at most one token in twenty reads at least 0.8750. See
+/// the module docs for both tables, and for the band between them that this
+/// control deliberately does not claim.
+const MAX_CYCLE_FRACTION: f64 = 0.85;
 
 /// Longest cycle the control looks for.
 ///
 /// A degeneracy in real output is usually a repeated phrase or sentence, not a
 /// repeated token: a 12-token phrase filling four fifths of a stream scores
 /// 0.0000 at any period under 12 and 0.7960 at 12. The defect this file
-/// documents repeats at period 8, one step under the old ceiling.
+/// documents repeats at period 8, one step under the ceiling this replaced.
+///
+/// Bounded again by a quarter of whatever window is being read: a period that
+/// long inside a short window leaves too few comparisons to mean anything.
 const MAX_CYCLE_PERIOD: usize = 64;
+
+/// Fewest comparisons a cycle reading may be computed from.
+///
+/// `strongest_cycle` divides by `len - period`. In the last quarter of a
+/// 256-token arm that is a 64-token window, and at period 63 the denominator is
+/// **one comparison** — a single coincidental token match read 1.0000 and the
+/// gate reported a repetition loop on healthy output. Measured over 200 healthy
+/// synthetic streams per length, that fired on 3% of 256-token arms, 8.5% at 120
+/// and 15% at 40; with this floor and the window bound above, 0 of 300 at every
+/// length.
+const MIN_CYCLE_SAMPLES: usize = 32;
 
 /// The stream is cut at each `1/TAIL_WINDOWS` boundary and the suffixes
 /// compared, so a divergence that begins late has a window it dominates.
@@ -197,19 +259,23 @@ fn lcs_ratio(a: &[u32], b: &[u32]) -> f64 {
 ///
 /// The control. A stream stuck in a loop matches itself at the loop's period,
 /// and two arms in the same loop agree perfectly — so the equivalence oracle
-/// says nothing exactly when this is high. It is a whole-stream measure and
-/// covers every period up to [`MAX_CYCLE_PERIOD`], because a collapse that
-/// starts at token 20 and a two-token `A B A B` cycle are both degeneracies a
-/// leading-run measure scores at zero.
+/// says nothing exactly when this is high. It covers every period up to
+/// [`MAX_CYCLE_PERIOD`], because a collapse that starts at token 20 and a
+/// two-token `A B A B` cycle are both degeneracies a leading-run measure scores
+/// at zero.
 fn strongest_cycle(tokens: &[u32]) -> (usize, f64) {
     let mut worst = (1usize, 0.0f64);
-    for period in 1..=MAX_CYCLE_PERIOD.min(tokens.len().saturating_sub(1)) {
+    for period in 1..=MAX_CYCLE_PERIOD.min(tokens.len() / 4) {
+        let samples = tokens.len() - period;
+        if samples < MIN_CYCLE_SAMPLES {
+            continue;
+        }
         let matches = tokens[period..]
             .iter()
             .zip(tokens)
             .filter(|(a, b)| a == b)
             .count();
-        let fraction = matches as f64 / (tokens.len() - period) as f64;
+        let fraction = matches as f64 / samples as f64;
         if fraction > worst.1 {
             worst = (period, fraction);
         }
@@ -259,7 +325,7 @@ fn weakest_tail(spec: &[u32], plain: &[u32]) -> (usize, f64) {
 
 /// Judge one pair of streams. Returns the failure text, or `None` when the
 /// oracle and both controls held.
-fn judge(spec: &[u32], plain: &[u32]) -> Option<String> {
+fn judge(spec: &[u32], plain: &[u32], min_answer: usize) -> Option<String> {
     let shorter = spec.len().min(plain.len());
     let longer = spec.len().max(plain.len());
 
@@ -276,9 +342,9 @@ fn judge(spec: &[u32], plain: &[u32]) -> Option<String> {
         }
     }
 
-    if shorter < MIN_ANSWER_TOKENS {
+    if shorter < min_answer {
         return Some(format!(
-            "an arm stopped early — spec={} plain={}, under {MIN_ANSWER_TOKENS}; a short \
+            "an arm stopped early — spec={} plain={}, under {min_answer}; a short \
              run is a comparison with no power, not a pass",
             spec.len(),
             plain.len()
@@ -329,14 +395,18 @@ fn a_single_flip_passes_and_a_divergent_stream_does_not() {
 
     let mut one_flip = plain.clone();
     one_flip[66] = 9999;
-    assert!(judge(&one_flip, &plain).is_none(), "one flip must pass");
+    assert!(
+        judge(&one_flip, &plain, MIN_ANSWER_TOKENS).is_none(),
+        "one flip must pass"
+    );
 
     let diverged: Vec<u32> = plain
         .iter()
         .enumerate()
         .map(|(i, t)| if i > 8 { 50_000 + i as u32 } else { *t })
         .collect();
-    let failure = judge(&diverged, &plain).expect("a divergent stream must fail");
+    let failure =
+        judge(&diverged, &plain, MIN_ANSWER_TOKENS).expect("a divergent stream must fail");
     assert!(failure.contains("did not reproduce"), "{failure}");
 }
 
@@ -394,7 +464,8 @@ fn every_shape_of_repetition_loop_is_refused() {
                 .collect(),
         ),
     ] {
-        let failure = judge(&stream, &stream).unwrap_or_else(|| panic!("{shape} was not refused"));
+        let failure = judge(&stream, &stream, MIN_ANSWER_TOKENS)
+            .unwrap_or_else(|| panic!("{shape} was not refused"));
         assert!(failure.contains("repetition loop"), "{shape}: {failure}");
     }
 }
@@ -405,25 +476,209 @@ fn every_shape_of_repetition_loop_is_refused() {
 fn a_degenerate_speculative_arm_is_caught() {
     let plain: Vec<u32> = (0..N_TOKENS as u32).collect();
     let looping = vec![7u32; N_TOKENS];
-    let failure = judge(&looping, &plain).expect("must refuse");
+    let failure = judge(&looping, &plain, MIN_ANSWER_TOKENS).expect("must refuse");
     assert!(failure.contains("speculative arm"), "{failure}");
 }
 
-/// Real prose is not a repetition loop. Without this the control could be made
-/// to fire on everything and the suite above would still be green — and the
-/// widening to period 64 over four windows is exactly the change that could do
-/// it. The measured readings from both real arms are in the module docs.
+/// A deterministic stand-in for token streams, seeded per case.
+///
+/// A plain `t % 97` stream was the previous control: 97 is prime and above the
+/// period ceiling, so it reads exactly 0.0000 at every period the sweep looks at
+/// and could not detect a control that fires on real output. These shapes can.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        // xorshift64*, so the fixtures are reproducible without a dependency.
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, n: u32) -> u32 {
+        (self.next() % u64::from(n)) as u32
+    }
+
+    /// Word ids drawn from a Zipf-ish distribution, as prose is.
+    fn prose(&mut self, len: usize) -> Vec<u32> {
+        (0..len)
+            .map(|_| {
+                let r = self.below(1000);
+                r % (1 + r / 8)
+            })
+            .collect()
+    }
+}
+
+/// Structured output is not a repetition loop, and it is what both of this
+/// gate's prompts ask for.
+///
+/// A markdown table repeats its delimiters every row and a numbered list its
+/// `N. **` prefix every item; on the same measure they read far above prose.
+/// The previous control could not see that — and the previous ceiling of 0.50
+/// sat underneath both of them, so the gate would have called a healthy table a
+/// collapse. The readings are in the module docs.
 #[test]
-fn a_healthy_stream_clears_the_repetition_control() {
-    // 97 is coprime with every period the sweep looks at, so no window of this
-    // stream repeats at any of them.
-    let healthy: Vec<u32> = (0..N_TOKENS as u32).map(|t| t % 97).collect();
-    let (start, period, fraction) = strongest_windowed_cycle(&healthy);
-    assert!(
-        fraction <= MAX_CYCLE_FRACTION,
-        "a stream with no short cycle scored {fraction} at period {period} from {start}"
+fn structured_but_healthy_output_clears_the_repetition_control() {
+    let mut rng = Rng(0x5EED_5EED);
+    let mut table = Vec::new();
+    while table.len() < N_TOKENS {
+        // `| ` name `| ` value `|` newline — two of six tokens vary.
+        table.extend_from_slice(&[900, 901, rng.below(50), 902, rng.below(50), 903]);
+    }
+    let mut numbered = Vec::new();
+    while numbered.len() < N_TOKENS {
+        numbered.extend_from_slice(&[910, 911, 912]);
+        numbered.extend((0..3).map(|_| rng.below(80)));
+        numbered.extend_from_slice(&[913, 914]);
+    }
+    let mut phrased = Vec::new();
+    while phrased.len() < N_TOKENS {
+        phrased.extend_from_slice(&[920, 921, 922, 923]);
+        phrased.extend((0..12).map(|_| rng.below(200)));
+    }
+    let prose = Rng(0xC0FF_EE00).prose(N_TOKENS);
+    let tail_table: Vec<u32> = Rng(0xBEEF)
+        .prose(N_TOKENS * 3 / 4)
+        .into_iter()
+        .chain(table.iter().copied())
+        .take(N_TOKENS)
+        .collect();
+
+    for (shape, stream) in [
+        ("healthy prose", prose),
+        ("a markdown table", table[..N_TOKENS].to_vec()),
+        ("a table confined to the last quarter", tail_table),
+        ("a numbered list", numbered[..N_TOKENS].to_vec()),
+        (
+            "a stock phrase every sixteen tokens",
+            phrased[..N_TOKENS].to_vec(),
+        ),
+    ] {
+        let (start, period, fraction) = strongest_windowed_cycle(&stream);
+        assert!(
+            fraction <= MAX_CYCLE_FRACTION,
+            "{shape} reads {fraction:.4} at period {period} from {start}, over the \
+             ceiling {MAX_CYCLE_FRACTION} — the control would call healthy output a \
+             collapse"
+        );
+        assert!(
+            judge(&stream, &stream, MIN_ANSWER_TOKENS).is_none(),
+            "{shape}"
+        );
+    }
+}
+
+/// The two bounds that make the reading mean something, each isolated.
+///
+/// `strongest_cycle` divides by `len - period`. Without a floor on that
+/// denominator and a bound on the period relative to the window, a reading can
+/// be one coincidental comparison out of one — which is what made the control
+/// fire on healthy output. These are exact fixtures, not draws: each is a
+/// stream whose only strong cycle is unreadable under the bounds, so it must
+/// read zero.
+#[test]
+#[allow(
+    clippy::float_cmp,
+    reason = "the assertion is that no reading was taken at all, which is exactly               zero; a band would accept a reading taken from too few samples"
+)]
+fn a_cycle_no_window_can_support_is_not_read() {
+    // One coincidence at distance 63 in a 64-token window: one comparison,
+    // read as 1.0000 before the bounds. Either bound alone refuses it.
+    let mut coincidence: Vec<u32> = (0..64).collect();
+    coincidence[63] = 0;
+    assert_eq!(
+        strongest_cycle(&coincidence).1,
+        0.0,
+        "a reading from a single comparison must not be taken"
     );
-    assert!(judge(&healthy, &healthy).is_none());
+
+    // An exact period of 60 in 200 tokens: 140 comparisons, so the sample floor
+    // admits it and only the window bound refuses it. A cycle a quarter of the
+    // window long is not a cycle the window can establish.
+    let long_period: Vec<u32> = (0..200u32).map(|i| i % 60).collect();
+    assert_eq!(
+        strongest_cycle(&long_period).1,
+        0.0,
+        "a period past a quarter of the window must not be read"
+    );
+
+    // An exact period of 10 in 40 tokens: inside the window bound, and only 30
+    // comparisons, so only the sample floor refuses it.
+    let short_window: Vec<u32> = (0..40u32).map(|i| i % 10).collect();
+    assert_eq!(
+        strongest_cycle(&short_window).1,
+        0.0,
+        "a reading from fewer than the sample floor must not be taken"
+    );
+
+    // The bounds are a floor on evidence, not a blanket: the same period over a
+    // window that can support it is still read.
+    let supported: Vec<u32> = (0..N_TOKENS as u32).map(|i| i % 10).collect();
+    assert!(
+        strongest_cycle(&supported).1 > MAX_CYCLE_FRACTION,
+        "an exact cycle a full window supports must still be caught"
+    );
+}
+
+/// The control is not flaky on healthy output at any length it can be handed.
+///
+/// It reads a window as short as a quarter of the arm, and the arm can be as
+/// short as a run that stopped early — the controls deliberately run before the
+/// length check. Without a bound on the period and a floor on the sample count,
+/// a single coincidental match in a 64-token window at period 63 read 1.0000.
+#[test]
+fn the_control_does_not_fire_on_healthy_output_at_any_length() {
+    for len in [40usize, 120, 200, 256, 300, 512] {
+        for seed in 0..64u64 {
+            let stream = Rng(0x1234_0000 + seed).prose(len);
+            let (start, period, fraction) = strongest_windowed_cycle(&stream);
+            assert!(
+                fraction <= MAX_CYCLE_FRACTION,
+                "healthy prose of {len} tokens (seed {seed}) read {fraction:.4} at \
+                 period {period} from {start}"
+            );
+        }
+    }
+}
+
+/// What the control claims, stated as the boundary it was measured at: a stream
+/// locked into a near-exact cycle is caught, and one that varies more than
+/// about a token in twenty is not. That second half is a blind spot, not an
+/// oversight — see the module docs for why no threshold closes it.
+#[test]
+fn the_control_catches_a_near_exact_cycle_and_declares_the_band_it_does_not() {
+    let cycle = |noise_in_100: u64, seed: u64| -> f64 {
+        let mut rng = Rng(0xA5A5_0000 + seed);
+        let head = Rng(seed + 1).prose(N_TOKENS / 4);
+        let tail: Vec<u32> = (0..N_TOKENS - N_TOKENS / 4)
+            .map(|i| {
+                if u64::from(rng.below(100)) < noise_in_100 {
+                    rng.below(300)
+                } else {
+                    1000 + (i % 8) as u32
+                }
+            })
+            .collect();
+        let stream: Vec<u32> = head.into_iter().chain(tail).collect();
+        strongest_windowed_cycle(&stream).2
+    };
+
+    for seed in 0..8 {
+        let exact = cycle(0, seed);
+        assert!(
+            exact > MAX_CYCLE_FRACTION,
+            "an exact cycle read {exact:.4}, at or under the ceiling"
+        );
+        let noisy = cycle(30, seed);
+        assert!(
+            noisy <= MAX_CYCLE_FRACTION,
+            "a cycle varying in three tokens of ten read {noisy:.4} — if this now \
+             trips, the band the module docs declare as not covered has moved and \
+             the claim has to move with it"
+        );
+    }
 }
 
 /// The subsequence ratio is taken over the shorter arm, so an arm that stopped
@@ -440,19 +695,48 @@ fn the_ratio_is_over_the_shorter_arm_and_the_length_guard_covers_it() {
         "a true prefix must score 1.0 over the shorter arm; it read {}",
         lcs_ratio(truncated, &plain)
     );
-    let failure = judge(truncated, &plain).expect("the length guard must refuse it");
+    let failure =
+        judge(truncated, &plain, MIN_ANSWER_TOKENS).expect("the length guard must refuse it");
     assert!(failure.contains("stopped well before"), "{failure}");
 
     // Just inside the guard the same shape scores 1.0 and passes, which is what
     // makes the guard — not the ratio — the thing doing the work above.
-    assert!(judge(&plain[..350], &plain).is_none());
+    assert!(judge(&plain[..350], &plain, MIN_ANSWER_TOKENS).is_none());
+}
+
+/// The long-context reproducer can flip to green.
+///
+/// Its prompt answers in about 200 tokens, and the short prompt's floor of 256
+/// would refuse a *fixed* engine: both arms would agree at ~200 and the gate
+/// would still say "an arm stopped early". A reproducer that cannot pass once
+/// the defect is fixed has to be rewritten after the fix, which is the outcome
+/// it exists to prevent.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion is that the short prompt's floor refuses this length; \
+              unwrapping the None case is the failure the test exists to report"
+)]
+fn a_fixed_engine_would_pass_the_long_context_reproducer() {
+    let answer = Rng(0x00F1_7EDD).prose(200);
+    assert!(
+        judge(&answer, &answer, MIN_LONG_CONTEXT_ANSWER_TOKENS).is_none(),
+        "two arms agreeing at 200 tokens must pass the long-context floor"
+    );
+    // One benign flip, as the shipped short-prompt pair shows at token 66.
+    let mut flipped = answer.clone();
+    flipped[66] = 60_000;
+    assert!(judge(&flipped, &answer, MIN_LONG_CONTEXT_ANSWER_TOKENS).is_none());
+    // And the short prompt's floor is what makes it unreachable.
+    let failure = judge(&answer, &answer, MIN_ANSWER_TOKENS).expect("256 refuses 200");
+    assert!(failure.contains("stopped early"), "{failure}");
 }
 
 /// A run that stopped short is refused rather than passed on its short prefix.
 #[test]
 fn a_truncated_run_is_refused_rather_than_judged() {
     let plain: Vec<u32> = (0..N_TOKENS as u32).collect();
-    let failure = judge(&plain[..16], &plain).expect("must refuse");
+    let failure = judge(&plain[..16], &plain, MIN_ANSWER_TOKENS).expect("must refuse");
     assert!(failure.contains("stopped early"), "{failure}");
 }
 
@@ -476,7 +760,7 @@ fn a_late_onset_divergence_passes_the_whole_stream_ratio_and_fails_the_tail() {
         "the whole-stream ratio {whole} already refuses this, so the tail windows \
          are not what is being tested"
     );
-    let failure = judge(&late, &plain).expect("the tail windows must refuse it");
+    let failure = judge(&late, &plain, MIN_ANSWER_TOKENS).expect("the tail windows must refuse it");
     assert!(failure.contains("begins late"), "{failure}");
 }
 
@@ -499,7 +783,10 @@ fn the_gate_admits_the_shipped_regime_and_refuses_the_broken_one() {
         "reconstructed shipped regime reads {}",
         lcs_ratio(&shipped, &plain)
     );
-    assert!(judge(&shipped, &plain).is_none(), "shipped must pass");
+    assert!(
+        judge(&shipped, &plain, MIN_ANSWER_TOKENS).is_none(),
+        "shipped must pass"
+    );
 
     // The broken rollback: diverged at token 5 and never recovered. Three
     // tokens in four replaced leaves roughly the measured 0.26.
@@ -514,7 +801,7 @@ fn the_gate_admits_the_shipped_regime_and_refuses_the_broken_one() {
             }
         })
         .collect();
-    let failure = judge(&broken, &plain).expect("broken must fail");
+    let failure = judge(&broken, &plain, MIN_ANSWER_TOKENS).expect("broken must fail");
     assert!(failure.contains("did not reproduce"), "{failure}");
 }
 
@@ -535,7 +822,7 @@ fn the_drafter_declares_the_backbone_it_projects_into() {
     )
     .expect("write config");
     assert!(is_gemma4_assistant(&dir));
-    assert_eq!(drafter_backbone_hidden(&dir), Some(1536));
+    assert_eq!(declared_backbone_hidden(&dir), Some(1536));
 
     // The e4b assistant is the same architecture and a different backbone.
     std::fs::write(
@@ -544,15 +831,23 @@ fn the_drafter_declares_the_backbone_it_projects_into() {
     )
     .expect("write config");
     assert!(is_gemma4_assistant(&dir), "still the same architecture");
-    assert_eq!(drafter_backbone_hidden(&dir), Some(2560));
+    assert_eq!(declared_backbone_hidden(&dir), Some(2560));
 
-    // A snapshot that does not say is not a pair this gate can judge.
+    // A snapshot that does not say is served by the engine at the verifier's
+    // width, so it must not read as a mismatch here.
     std::fs::write(
         dir.join("config.json"),
         r#"{"model_type":"gemma4_assistant","architectures":["Gemma4AssistantForCausalLM"]}"#,
     )
     .expect("write config");
-    assert_eq!(drafter_backbone_hidden(&dir), None);
+    let silent = declared_backbone_hidden(&dir);
+    assert_eq!(silent, None);
+    // The gate's own predicate, on the value the gate would have: absent is
+    // what the loader defaults to the verifier's width, not a mismatch.
+    assert!(
+        silent.is_none_or(|w| w == 1536),
+        "an absent key must not read as a mismatch"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -628,7 +923,8 @@ fn draft_config(draft_path: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&raw).ok()
 }
 
-/// The verifier width this drafter was trained to project into.
+/// The verifier width this drafter declares it projects into, if it declares
+/// one.
 ///
 /// Both `-e2b-` and `-e4b-` snapshots declare the same architecture, so the
 /// harness's arch stand-down cannot tell them apart — an operator with
@@ -637,7 +933,12 @@ fn draft_config(draft_path: &Path) -> Option<serde_json::Value> {
 /// measured on e2b. This is the field that does tell them apart, and it is read
 /// before the drafter is loaded so a mismatched pair skips with a reason rather
 /// than panicking inside the loader.
-fn drafter_backbone_hidden(draft_path: &Path) -> Option<usize> {
+///
+/// `None` means the snapshot does not say, which is **not** a mismatch:
+/// `Gemma4AssistantDrafter::load` takes the verifier's width when the key is
+/// absent, so a drafter the engine serves must not make this gate skip and
+/// blame the drafter for it.
+fn declared_backbone_hidden(draft_path: &Path) -> Option<usize> {
     draft_config(draft_path)?["backbone_hidden_size"]
         .as_u64()
         .and_then(|v| usize::try_from(v).ok())
@@ -774,7 +1075,7 @@ fn plain_greedy(
 #[test]
 fn speculative_greedy_reproduces_plain_greedy() {
     const TEST: &str = "speculative_greedy_reproduces_plain_greedy";
-    run_gate(TEST, build_prompt);
+    run_gate(TEST, build_prompt, MIN_ANSWER_TOKENS);
 }
 
 /// The same gate over a 4k document, where it fails today.
@@ -788,11 +1089,15 @@ fn speculative_greedy_reproduces_plain_greedy() {
 #[test]
 fn speculative_greedy_reproduces_plain_greedy_at_long_context() {
     const TEST: &str = "speculative_greedy_reproduces_plain_greedy_at_long_context";
-    run_gate(TEST, build_long_context_prompt);
+    run_gate(
+        TEST,
+        build_long_context_prompt,
+        MIN_LONG_CONTEXT_ANSWER_TOKENS,
+    );
 }
 
 /// Both arms of one pair over `prompt`, judged.
-fn run_gate(test: &str, prompt_of: fn(&tokenizers::Tokenizer) -> Vec<u32>) {
+fn run_gate(test: &str, prompt_of: fn(&tokenizers::Tokenizer) -> Vec<u32>, min_answer: usize) {
     let (Some(model_path), Some(draft_path)) = (
         common::model_for(&VERIFIER, test),
         common::apply(resolve(DRAFT_MODEL_VAR, DRAFTER_SLUG), test),
@@ -820,13 +1125,24 @@ fn run_gate(test: &str, prompt_of: fn(&tokenizers::Tokenizer) -> Vec<u32>) {
         return;
     }
     let hidden = verifier.hidden_size();
-    if drafter_backbone_hidden(&draft_path) != Some(hidden) {
+    let declared = declared_backbone_hidden(&draft_path);
+    if declared.is_some_and(|width| width != hidden) {
+        let retargeted = std::env::var(common::SINGLE_MODEL_VAR)
+            .is_ok_and(|v| !v.is_empty() && Path::new(&v) == model_path);
         eprintln!(
-            "SKIP {test}: {} projects into a backbone of {:?} and {} is {hidden} wide; the \
-             floors are measured on one pair and this is another",
+            "SKIP {test}: {} projects into a backbone {} wide and {} is {hidden}; the \
+             floors are measured on one pair and this is another{}",
             draft_path.display(),
-            drafter_backbone_hidden(&draft_path),
+            declared.unwrap_or(hidden),
             model_path.display(),
+            if retargeted {
+                format!(
+                    " — the verifier came from {}, which retargeted this gate",
+                    common::SINGLE_MODEL_VAR
+                )
+            } else {
+                String::new()
+            },
         );
         return;
     }
@@ -882,7 +1198,7 @@ fn run_gate(test: &str, prompt_of: fn(&tokenizers::Tokenizer) -> Vec<u32>) {
         tk.decode(&plain_ids, false).unwrap_or_default(),
     );
 
-    if let Some(failure) = judge(&spec_ids, &plain_ids) {
+    if let Some(failure) = judge(&spec_ids, &plain_ids, min_answer) {
         panic!("{failure}");
     }
 }

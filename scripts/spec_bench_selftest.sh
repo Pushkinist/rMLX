@@ -117,6 +117,7 @@ DRAFT_MS = 300.0
 VERIFY_MS = 900.0
 ROUND_MS = 1800.0
 SEED_EMITTED = int(os.environ.get("STUB_SEED_EMITTED", "1"))
+TOTAL_ACCEPT = int(os.environ.get("STUB_TOTAL_ACCEPT", "98"))
 DECODE_CONFIG = os.environ.get("STUB_DECODE_CONFIG", "mtp/block=5")
 # The engine composes both from one block, so the stub cannot make them
 # disagree by accident.
@@ -142,9 +143,9 @@ def done_line():
         "emitted": EMITTED,
         "seed_emitted": SEED_EMITTED,
         "total_draft": 150,
-        "total_accept": 98,
-        "accept_rate": 98 / 150,
-        "accepted_per_step": 98 / ROUNDS,
+        "total_accept": TOTAL_ACCEPT,
+        "accept_rate": TOTAL_ACCEPT / 150,
+        "accepted_per_step": TOTAL_ACCEPT / ROUNDS,
         "tokens_per_round": round_emitted / ROUNDS,
         "elapsed_ms": ELAPSED_MS,
         "prefill_ms": 100.0,
@@ -837,6 +838,16 @@ run_case seed_contradicting_emitted_refused 1 \
 	"a done line whose seed count contradicts what it emitted is refused" \
 	'STUB_SEED_EMITTED=999' \
 	'GREP:more before its rounds than it emitted'
+no_row mtp
+verdict
+
+# The drift that reaches a real request: a seed taken before the loop emitted it
+# credits the rounds with a token they could not have produced. 30 rounds
+# accepting 90 tokens can emit 120; 128 emitted against a seed of 1 is 127.
+run_case seed_over_the_round_budget_refused 1 \
+	"a seed taken too early credits the rounds with a token they could not emit" \
+	'STUB_TOTAL_ACCEPT=90' \
+	'GREP:seed count was taken before the loop had finished'
 no_row mtp
 verdict
 

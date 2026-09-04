@@ -192,6 +192,44 @@ fn a_seedless_round_loop_that_emitted_something_is_named() {
     assert!(reason.contains("exceeds emitted"), "{reason}");
 }
 
+/// The branch with power over a real request: a seed captured one line too
+/// early — before the pre-round emission — is silent in the two branches above
+/// and makes `round_emitted()` one too high on every request that ran a round.
+/// Each round emits at most what it accepted plus the verifier's own token, and
+/// that is the budget it breaks.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion is that the drift is named; unwrapping the None case \
+              here is the failure the test exists to report"
+)]
+fn a_seed_taken_before_the_pre_round_emission_breaks_the_round_budget() {
+    for &loop_kind in SpecLoop::ALL {
+        let sound = sample(loop_kind);
+        assert!(
+            sound.seed_violation().is_none(),
+            "{loop_kind:?}: the sample emits accept + 1 per round and must be sound"
+        );
+        assert_eq!(
+            sound.round_emitted(),
+            sound.total_accept + sound.rounds,
+            "{loop_kind:?}: the sample must sit at the budget, or exceeding it by one \
+             would not be detectable"
+        );
+
+        // The drift: the seed was taken before the loop emitted it. A loop that
+        // emits nothing outside its rounds has no earlier line to take it from,
+        // which is why the two-model paths are exempt rather than untested.
+        if sound.seed_emitted == 0 {
+            continue;
+        }
+        let mut drifted = sample(loop_kind);
+        drifted.seed_emitted -= 1;
+        let reason = drifted.seed_violation().expect("must be named");
+        assert!(reason.contains("exceeds the"), "{loop_kind:?}: {reason}");
+    }
+}
+
 /// `ALL` and `index` are two halves of one list and the compiler holds both: a
 /// seventh variant does not compile until it has an index, and does not pass
 /// here until it is in `ALL` at that index.

@@ -203,6 +203,18 @@ def check_seed(fields):
             f"of {fields['seed_emitted']}: tokens_per_round would count what no "
             "round produced"
         )
+    # The branch with power over a real request. A seed taken one line too early
+    # is silent in both checks above and makes the round count one too high on
+    # every request that ran a round; each round emits at most what it accepted
+    # plus the verifier's own token, and that is the budget it breaks.
+    round_emitted = fields["emitted"] - fields["seed_emitted"]
+    budget = fields["total_accept"] + fields["rounds"]
+    if fields["rounds"] > 0 and round_emitted > budget:
+        raise SpecLogError(
+            f"'{message}' credits {round_emitted} tokens to {fields['rounds']} rounds "
+            f"that could have produced {budget} (accepted plus one verifier token "
+            "each): the seed count was taken before the loop had finished emitting it"
+        )
 
 
 def one_value(events, field):

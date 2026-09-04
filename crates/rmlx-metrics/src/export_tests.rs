@@ -186,9 +186,11 @@ impl SpecRun {
     }
 }
 
-/// Two runs alike but for `column`. Every entry of `cell::CELL_COLUMNS` has an
-/// arm, so a new column fails to compile here rather than silently rendering
-/// one blended row.
+/// Two runs alike but for `column`. Every entry of `cell::CELL_COLUMNS` needs an
+/// arm; a new column reaches the fall-through and panics by name, so it is a
+/// loud test failure rather than a silently blended row. The match is on a
+/// `&str` and the compiler cannot check it — the sweep at the caller is what is
+/// driven off the constant.
 fn two_runs_differing_in(column: &str) -> (SpecRun, SpecRun) {
     let a = SpecRun::baseline();
     let mut b = a.clone();

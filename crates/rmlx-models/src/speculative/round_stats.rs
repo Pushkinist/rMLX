@@ -243,11 +243,19 @@ impl RoundStats {
 
     /// Why the emitted counts do not add up, when they do not.
     ///
-    /// A request whose round loop never ran emitted exactly what it emitted
-    /// before that loop, and nothing else. The two counts come from different
-    /// places — one is `emitted.len()` at the end, the other `emitted.len()`
-    /// before the first round — so this is a cross-check on the loop's own
-    /// accounting rather than a restatement of it.
+    /// The two counts come from different places — one is `emitted.len()` at the
+    /// end, the other `emitted.len()` before the first round — so this is a
+    /// cross-check on the loop's own accounting rather than a restatement of it.
+    ///
+    /// The third branch is the one with power over a real request. The first two
+    /// describe states no loop reaches while the seed is captured where it is
+    /// (`rounds` increments as the first statement of every loop body, so
+    /// `rounds == 0` implies `emitted` never moved); they are the shape of the
+    /// drift, not a detector for it. A seed captured one line *too early* —
+    /// before the pre-round `emit_step` — is the drift that matters, it is
+    /// silent in both, and it makes `round_emitted()` exactly one too high on
+    /// every request that ran a round. Each round emits at most the tokens it
+    /// accepted plus the verifier's own, and that is the budget it breaks.
     pub(crate) fn seed_violation(&self) -> Option<String> {
         if self.seed_emitted > self.emitted {
             return Some(format!(
@@ -256,11 +264,21 @@ impl RoundStats {
                 self.seed_emitted, self.emitted
             ));
         }
-        (self.rounds == 0 && self.emitted != self.seed_emitted).then(|| {
-            format!(
+        if self.rounds == 0 && self.emitted != self.seed_emitted {
+            return Some(format!(
                 "no round ran and emitted {} is not the {} the loop had before its round \
                  loop: tokens_per_round would count what no round produced",
                 self.emitted, self.seed_emitted
+            ));
+        }
+        let budget = self.total_accept.saturating_add(self.rounds);
+        (self.rounds > 0 && self.round_emitted() > budget).then(|| {
+            format!(
+                "round_emitted {} exceeds the {budget} tokens {} rounds could have \
+                 produced (accepted plus one verifier token each): the seed count was \
+                 taken before the loop had finished emitting it",
+                self.round_emitted(),
+                self.rounds
             )
         })
     }
@@ -273,6 +291,13 @@ impl RoundStats {
     /// refused by the ingest bounds — taking the whole run's record with it,
     /// naming no field. Reported here so the field is named while the run is
     /// still in front of somebody.
+    ///
+    /// Reported and nothing else. This carried a `debug_assert!(false)` for one
+    /// commit, which turned a report into a crate-wide abort under exactly the
+    /// profile `make test` and `make gpu-test` run at, and compiled to nothing
+    /// under `release-perf` where a real timing anomaly would be worth seeing.
+    /// The property it guarded is pinned by
+    /// `a_phase_span_reaching_outside_the_round_loop_is_named` instead.
     pub(crate) fn span_violation(&self) -> Option<String> {
         let inner = self.draft_ns.saturating_add(self.verifier_ns);
         (inner > self.round_loop_ns).then(|| {
