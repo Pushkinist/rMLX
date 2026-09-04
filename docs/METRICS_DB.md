@@ -207,9 +207,22 @@ a spelling of that and is refused.
 
 | Terms | Setting | Emitted by |
 |---|---|---|
-| `mtp/block=<n>` | speculative-decode arm and its block size | `rmlx_metrics::cell::decode_config` |
+| `<drafter>/block=<n>` | speculative-decode arm and the block it was configured with | `rmlx_metrics::cell::decode_config`, composed by the round loop and logged on its `done` line |
+| `<drafter>/depth=<policy>` | how the loop picks each round's block, when it does not simply take the configured one | same |
 | `prefill_chunk=<n>` | non-default prefill chunk size | prefill-chunk sweeps |
 | `kv_boundary/head=<h>,kv_boundary/tail=<t>` | `--kv-boundary-layers` off its default | `rmlx baseline --record`, `rmlx eval ppl`, `scripts/ingest/{codec_inertness,perf_ab}_ingest.py` |
+
+The `<drafter>/depth` term is absent when the loop drafts the configured block
+every round, which is what keeps every speculative row recorded before the term
+existed in the cell it has always been in. It is present when the loop resizes:
+DFlash halves and grows its block from the recent accept rate, so its arm is
+`dflash/block=16,dflash/depth=accept_rate` and is a different cell from a fixed
+arm at block 16 — which it must be, because the two do not emit the same number
+of tokens per round. The round loop composes both terms and puts the result on
+its `done` line, and `scripts/spec_bench.sh` records what it finds there; a
+bench script that spelled the string itself would file a run under a
+configuration the engine did not use, which is the defect that motivated
+moving it.
 
 The `kv_boundary/*` pair is always written together and always in that order
 (`head` sorts before `tail`), because a head count without a tail count does
@@ -529,6 +542,10 @@ Source of truth for `observations.metric`, `.unit`, `.direction`. Add to this ta
 | `accept_tokens_total`            | `count` | `higher_better` | Speculative decoding: cumulative verifier-accepted token count over the request. rmlx-only. |
 | `draft_rounds_total`             | `count` | `higher_better` | Speculative decoding: number of verifier rounds (one round = drafter proposes block, verifier accepts prefix). rmlx-only. |
 | `accepted_per_step`              | `ratio` | `higher_better` | Speculative decoding: `accept_tokens_total / draft_rounds_total` (mean accepted tokens per verifier step). rmlx-only. |
+| `tokens_per_round`               | `ratio` | `higher_better` | Speculative decoding: tokens emitted per verify round — accepted drafts plus the verifier's own token. `1 + accept_rate x (block - 1)` only while every round drafts the configured block, which an adaptive drafter does not, so it is recorded and not derived. rmlx-only. |
+| `draft_ms_per_round`             | `ms`    | `lower_better`  | Speculative decoding: wall clock inside the drafter call, per round. rmlx-only. |
+| `verify_ms_per_round`            | `ms`    | `lower_better`  | Speculative decoding: wall clock inside the verify forward, per round. rmlx-only. |
+| `loop_ms_per_round`              | `ms`    | `lower_better`  | Speculative decoding: the round loop's own overhead per round — rollback, snapshot and restore, acceptance walks, sampling. A residual: the three `*_ms_per_round` partition one round's wall clock. rmlx-only. |
 | `ssd_bytes_used`                 | `bytes` | `lower_better`  | SSD-tier: current on-disk KV-block cache footprint per namespace. Unbounded growth is a budget risk; LowerBetter keeps regression gate alert on runaway accumulation. rmlx-only. |
 | `ssd_evict_total`                | `count` | `lower_better`  | SSD-tier: lifetime LRU eviction count. More evictions = more cache thrash. rmlx-only. |
 | `ssd_spill_ms`                   | `ms`    | `lower_better`  | SSD-tier: raw per-spill duration observation (drain thread, off-hot-path). One SQLite row per event. Real p50/p99 aggregation via Prometheus histogram `rmlx_ssd_spill_us_bucket`. rmlx-only. |
@@ -564,7 +581,7 @@ floor is itself a measurement:
 | Durations (`ms`) | `0` included | 3.6e6 (1 h) | Millisecond resolution rounds a sub-ms span to zero. A single span past an hour is a hung run. |
 | Counters (`count`) | `0` included | 1e12 | Zero cache hits is a real observation. |
 | Gauges (`mb`, `bytes`) | `0` included, except `peak_rss_mb` | 1e9 MB / 1e13 B | A live process always has RSS; a run can genuinely allocate no Metal. |
-| Ratios (`ratio`) | `0` included | 1.0 (or 1e3 for `accepted_per_step`) | Rates of acceptance are honestly zero. |
+| Ratios (`ratio`) | `0` included | 1.0 (or 1e3 for `accepted_per_step` / `tokens_per_round`) | Rates of acceptance are honestly zero, and a per-round count is not a fraction. |
 
 Ceilings are deliberately loose — several × the best value ever recorded — so
 they reject fabrications, not fast machines. NaN and infinities are outside
@@ -768,6 +785,21 @@ because nothing enforces it.
   from that row's own fields into a column that was NULL for want of existing;
   no measurement is written, corrected or moved.
 
+- **`dflash/block=<n>` with no `depth` term** — DFlash has always resized its
+  block from the recent accept rate, so `<n>` was the ceiling and never the
+  block a round drafted. Those rows sit in the fixed-block cell and cannot be
+  reclassified: nothing recorded says what the loop actually did, and
+  `1 + accept_rate x (block - 1)` over them reads far above any block the run
+  used. Rows written since the round loop composed its own `decode_config`
+  carry `dflash/block=<n>,dflash/depth=accept_rate` and a measured
+  `tokens_per_round`.
+
+  ```sql
+  SELECT * FROM observations
+  WHERE decode_config LIKE 'dflash/block=%'
+    AND decode_config NOT LIKE '%/depth=%';
+  ```
+
 Anything anchoring on a recorded rate — a roofline, a champion table, a
 `rmlx metrics rank` — should read `bests`, or one of the `query::*` functions,
 all of which apply the bound already. A consumer that genuinely needs the raw
@@ -818,6 +850,10 @@ itself.
 | `accept_tokens_total`             | yes | no | no | no | no | no | no | no |
 | `draft_rounds_total`              | yes | no | no | no | no | no | no | no |
 | `accepted_per_step`               | yes | no | no | no | no | no | no | no |
+| `tokens_per_round`                | yes | no | no | no | no | no | no | no |
+| `draft_ms_per_round`              | yes | no | no | no | no | no | no | no |
+| `verify_ms_per_round`             | yes | no | no | no | no | no | no | no |
+| `loop_ms_per_round`               | yes | no | no | no | no | no | no | no |
 
 `no` = backend genuinely can't measure. `maybe` = backend exposes it but recording path not wired. rMLX TTFT/ITL/kv_cache_bytes are wired via the EventRecorder → `events` table; cold/warm TTFT is distinguished by a first-load flag. Metal peak alloc is also wired.
 

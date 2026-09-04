@@ -714,7 +714,15 @@ from the first emitted token to the last, prefill excluded — the same window
 `rmlx baseline` reports, so the speculative and no-drafter arms mean the same
 thing. Accept rate is read off the `<kind>_generate_greedy: done` serve-log
 line; no done-line means the round loop never ran. Every cell below is also a
-row in `runs.db` (metrics `accept_rate` and `decode_tps_warm`).
+row in `runs.db` (metrics `accept_rate` and `decode_tps_warm`; runs recorded
+since the round loop reported its own split also carry `tokens_per_round`,
+`accepted_per_step` and the three `*_ms_per_round` figures).
+
+**Tokens per round is not in the tables below.** Every row here predates the
+round loop reporting it, and it is not recoverable from `accept_rate` and the
+block for the DFlash rows — that drafter resizes its block. Re-running
+`scripts/spec_bench.sh` for a cell fills it in `runs.db`, and
+`rmlx metrics export --markdown` renders it in the speculative section.
 
 That same `done` line carries a `decode_tps` field, on the same
 first-token-to-last basis, for every one of the five round loops. It is an
@@ -722,8 +730,40 @@ first-token-to-last basis, for every one of the five round loops. It is an
 fewer than two tokens and there is no interval to measure, which is the honest
 answer where a `0.0` would be averaged as a real rate.
 
+**Every round loop closes a request with the same record.** One `done` line per
+request, whatever stopped it — the stop token arriving before the first round
+included, which used to leave no record at all and made a reader counting
+records against requests served refuse the whole run.
+`crates/rmlx-models/src/speculative/round_stats.rs` holds the counters, the
+derivation and the log site, so a row from one drafter can be read the same way
+as a row from another. The line carries the raw counters (`rounds`, `emitted`,
+`total_draft`, `total_accept`, `prefill_ms`, `round_ms`, `draft_ms`,
+`verifier_ms`, `block_size`), the figures derived from them
+(`accept_rate`, `accepted_per_step`, `tokens_per_round`, `draft_ms_per_round`,
+`verify_ms_per_round`, `loop_ms_per_round`) and the `decode_config` naming the
+cell the request's rows belong to.
+
+`tokens_per_round` is the figure a speculative result is read with: accepted
+drafts plus the verifier's own token. `1 + accept_rate × (block − 1)` recovers
+it only while every round drafts the configured block — DFlash's does not, and
+never has — so it is recorded rather than derived at read time.
+
+The three `*_ms_per_round` figures partition one round's wall clock:
+`round_ms` is the whole round loop, `draft_ms` and `verifier_ms` are disjoint
+sub-spans of it, and `loop_ms_per_round` is the residual — rollback, snapshot
+and restore, acceptance walks, sampling. `draft_ms` and `verifier_ms` are the
+wall-clock spans of their call sites and **not** the cost of the work those
+calls issue: this engine evaluates lazily, so work issued in one span can be
+paid for in another. They are reported as what they are. Inserting a blocking
+evaluation to make them attributable would price the phases by changing them,
+and that blocking evaluation is itself one of the costs the round loop is
+trying to shed.
+
 `scripts/lib/spec_round_log.py` is the only thing that reads that line, and
-`scripts/spec_bench.sh` takes its speculative `decode_tps_warm` from there. Its
+`scripts/spec_bench.sh` takes its speculative `decode_tps_warm` from there. It
+also checks every event's derived fields against that event's own counters
+before aggregating: the engine derives them per request and the reader derives
+them per run, and two expressions of one formula drift silently otherwise. Its
 no-drafter arm has no round-loop record, but the server times every generation's
 inter-token gaps and publishes the aggregate at `GET /metrics/cache`, where
 `1000 / step_mean_ms` is the same `(n - 1) / (t_last - t_first)` — that is the
@@ -810,6 +850,37 @@ No-drafter baseline 83.6 (code) / 83.2 (prose) / 79.1 (4k) decode TPS.
   the prompt, and never a doubling. The restricted-vocab hot path does not change
   the accepted token IDs; it only avoids materialising the full-vocab logit
   tensor for accepted positions.
+
+## Correctness gates
+
+Speculative decoding must produce the answer the verifier produces on its own.
+Nothing in the throughput number says whether it does, so a change to a drafter,
+a block policy or an acceptance walk can trade one for the other invisibly.
+
+| Gate | Loop | Oracle | Horizon |
+|---|---|---|---|
+| `crates/rmlx-models/tests/spec_greedy_equivalence.rs` | Gemma4 assistant | longest common subsequence with plain greedy ≥ 0.70, plus a repetition-loop control on both arms | 256 tokens |
+| `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs` | MTP sidecar | shared prefix ≥ half | 48 tokens |
+| `crates/rmlx-models/tests/qwen3_5_eagle3_alignment.rs` | EAGLE-3 | shared prefix ≥ half | 48 tokens |
+| `crates/rmlx-models/tests/qwen3_5_two_model_alignment.rs` | two-model | shared prefix ≥ half | 48 tokens |
+| `crates/rmlx-models/tests/dflash_drafter_alignment.rs` | DFlash | round-0 alignment + coherent output | 40 tokens |
+
+**It is not bit-identity, and measurement says so.** The verify pass scores a
+whole block in one forward where plain decode steps one token at a time, and
+that is a different reduction order. On the most favourable case there is — a
+full-attention verifier whose rollback is an exact KV truncation — the two arms
+share 66 of 256 tokens and then differ by one word, after which both continue
+the same explanation. A gate demanding identity fails on that; a gate on the
+shared prefix fails on it too, which is why the equivalence gate is
+length-scaled. Measured on `gemma-4-e2b-it-mxfp8` + `gemma-4-E2B-it-assistant-bf16`:
+0.914 as shipped, 0.258 with one rejected draft key left in the cache.
+
+**A recurrent verifier is out of that gate's scope.** Its state has no sequence
+axis to truncate — it is snapshotted and replayed — and Qwen3.8-27B with its MTP
+sidecar reads 0.520 on the same measure as shipped, which is not separable from
+a broken exact rollback. Whether that is the reduction order or the replay is
+open, and the shorter-horizon prefix gates above are what those loops have
+today.
 
 ## See also
 
