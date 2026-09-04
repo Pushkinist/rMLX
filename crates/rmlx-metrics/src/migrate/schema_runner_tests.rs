@@ -274,6 +274,116 @@ fn migrating_moves_an_adaptive_drafter_out_of_the_fixed_block_cell() {
     assert_eq!(values, vec![600_000_000.0, 493_133_824.0]);
 }
 
+/// The version and the work it stands for commit together, or neither does.
+///
+/// Migrations 006, 007 and 008 carry no schema change — their `.sql` is a no-op
+/// and the post-hook is the whole migration. If the version committed first, an
+/// interrupt would leave the DB at the new version with the work half done and
+/// `run_pending` would never re-enter that branch. This pins the SQLite property
+/// the design leans on: `PRAGMA user_version` is transactional, so rolling the
+/// transaction back takes the version with it.
+#[test]
+fn the_schema_version_rolls_back_with_the_work_it_stands_for() {
+    let mut conn = conn_at_version(7);
+    insert_with_decode_config(&conn, 1, 600_000_000.0, "dflash/block=16");
+
+    {
+        let tx = conn.transaction().unwrap();
+        crate::migrate::schema_runner::adaptive_depth_decode_config(&tx).unwrap();
+        tx.execute_batch("PRAGMA user_version = 8;").unwrap();
+        // The work is visible inside the transaction.
+        let inside: String = tx
+            .query_row(
+                "SELECT decode_config FROM observations WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inside, "dflash/block=16,dflash/depth=accept_rate");
+        tx.rollback().unwrap();
+    }
+
+    let version: u32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 7, "the version must roll back with the work");
+    let after: String = conn
+        .query_row(
+            "SELECT decode_config FROM observations WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after, "dflash/block=16",
+        "a rolled-back hook leaves the row alone, and the version says so"
+    );
+
+    // And the next open repairs it, because the branch is still pending.
+    crate::migrate::run_pending(&mut conn).unwrap();
+    let repaired: String = conn
+        .query_row(
+            "SELECT decode_config FROM observations WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(repaired, "dflash/block=16,dflash/depth=accept_rate");
+}
+
+/// A post-hook that fails takes its migration's version down with it.
+///
+/// The property above, observed through `run_pending` itself rather than
+/// through a transaction the test drives: with the version committed before the
+/// hook — the shape 006 and 007 shipped with — this DB would be left at 8 with
+/// the row unrewritten and the branch never re-entered.
+#[test]
+fn a_failing_post_hook_leaves_the_version_where_it_was() {
+    let mut conn = conn_at_version(7);
+    insert_with_decode_config(&conn, 1, 600_000_000.0, "dflash/block=16");
+    // Make migration 008's UPDATE fail, from inside SQLite.
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_reclassify BEFORE UPDATE OF decode_config ON observations
+         BEGIN SELECT RAISE(ABORT, 'refused for the test'); END;",
+    )
+    .unwrap();
+
+    assert!(
+        crate::migrate::run_pending(&mut conn).is_err(),
+        "the hook must surface its failure"
+    );
+
+    let version: u32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 7,
+        "migration 008 did not do its work, so the DB must not claim it did — at \
+         version 8 the branch is never re-entered and the row stays stale for good"
+    );
+    let untouched: String = conn
+        .query_row(
+            "SELECT decode_config FROM observations WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(untouched, "dflash/block=16");
+
+    // With the obstruction gone the next open completes it.
+    conn.execute_batch("DROP TRIGGER refuse_reclassify;")
+        .unwrap();
+    crate::migrate::run_pending(&mut conn).unwrap();
+    let repaired: String = conn
+        .query_row(
+            "SELECT decode_config FROM observations WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(repaired, "dflash/block=16,dflash/depth=accept_rate");
+}
+
 /// `bests` champions as `(id, decode_config)`, lowest `kv_cache_bytes` per cell.
 fn champions(conn: &Connection) -> Vec<(i64, Option<String>)> {
     let mut stmt = conn

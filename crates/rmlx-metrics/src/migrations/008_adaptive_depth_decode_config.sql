@@ -4,12 +4,16 @@
 -- term means the loop drafted the configured block every round. DFlash never
 -- did: its production call site has always passed `prefer_requested = false`,
 -- and the only caller passing `true` is a unit test. So `dflash/block=16`
--- describes a configuration that has never run, and the eight rows carrying it
--- sit in a cell that no future DFlash row can join — this branch records the
--- same runs as `dflash/block=16,dflash/depth=accept_rate`, and the two spellings
--- are two cells where neither ranks against the other and both look like
--- champions of whatever they contain. That is the defect migration 007 was
--- written for, in a different column position.
+-- describes a configuration that has never run.
+--
+-- What the rewrite buys is not a contest these rows were losing — they are a
+-- different model, quant and prompt set from anything recorded since, so they
+-- were never going to rank against those rows whatever the spelling. It is that
+-- the eight sat in a cell no future DFlash row can join: the engine composes the
+-- depth term now and ingest refuses the bare spelling, so that cell was closed
+-- and its rows would have ranked against nothing for good. After this they are
+-- in the cell that describes their loop, where a re-run of the same
+-- configuration can be compared with them.
 --
 -- **This writes no measurement.** It rewrites a column that says how the engine
 -- was configured, from a spelling that was never true of these rows to the one

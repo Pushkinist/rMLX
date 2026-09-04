@@ -146,24 +146,56 @@ pub fn inherent_depth_policy(draft_kind: &str) -> Option<&'static str> {
 ///
 /// `None` when nothing needs correcting — which includes a malformed value,
 /// since this answers "is it stale", not "is it legal".
+///
+/// The correction **adds a term**; it never rebuilds the value from one of them.
+/// A `decode_config` carries every non-default setting a run moved, and the
+/// column already holds three-term values, so recomposing from the drafter term
+/// would drop the rest — into an append-only classification column via migration
+/// 008, and back at an operator as the spelling to use via `RunRecord::validate`.
+/// Every other term is carried through untouched and the result is re-checked
+/// against the grammar before it is offered.
 pub fn decode_config_with_inherent_depth(value: &str) -> Option<String> {
     if !decode_config_is_well_formed(value) {
         return None;
     }
-    for term in value.split(',') {
-        let (key, block) = term.split_once('=')?;
+    let terms: Vec<&str> = value.split(',').collect();
+    let mut missing: Vec<String> = Vec::new();
+    for term in &terms {
+        // `continue`, not `?`: a value whose first drafter term is fixed-block
+        // must still be examined for a later adaptive one.
+        let Some((key, block)) = term.split_once('=') else {
+            continue;
+        };
         let Some(kind) = key.strip_suffix("/block") else {
             continue;
         };
-        let policy = inherent_depth_policy(kind)?;
-        let depth_key = format!("{kind}/depth=");
-        if value.split(',').any(|t| t.starts_with(&depth_key)) {
-            return None;
+        let Some(policy) = inherent_depth_policy(kind) else {
+            continue;
+        };
+        if block.parse::<usize>().is_err() {
+            continue;
         }
-        let block: usize = block.parse().ok()?;
-        return Some(decode_config(kind, block, Some(policy)));
+        let depth_key = format!("{kind}/depth");
+        if terms
+            .iter()
+            .any(|t| t.split_once('=').is_some_and(|(k, _)| k == depth_key))
+        {
+            continue;
+        }
+        missing.push(format!("{depth_key}={policy}"));
     }
-    None
+    if missing.is_empty() {
+        return None;
+    }
+
+    // Terms are ordered by key, so the additions are merged rather than
+    // appended.
+    let key_of = |term: &str| term.split_once('=').map_or(term, |(key, _)| key).to_owned();
+    let mut merged: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+    merged.extend(missing);
+    merged.sort_by_key(|term| key_of(term));
+    let corrected = merged.join(",");
+    decode_config_is_well_formed(&corrected).then_some(corrected)
 }
 
 /// The canonical `decode_config` for a speculative arm.

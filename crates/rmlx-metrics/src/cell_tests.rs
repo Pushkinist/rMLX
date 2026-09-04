@@ -301,6 +301,37 @@ fn an_adaptive_drafter_has_no_fixed_block_spelling() {
         decode_config_with_inherent_depth("dflash/block=16,dflash/depth=accept_rate"),
         None
     );
+    // Every other term is carried through. Rebuilding the value from the
+    // drafter term would drop them — into an append-only column via migration
+    // 008, and back at an operator as the spelling to use via validate. The
+    // column already holds three-term values.
+    assert_eq!(
+        decode_config_with_inherent_depth("dflash/block=16,kv_boundary/head=2,kv_boundary/tail=4")
+            .as_deref(),
+        Some("dflash/block=16,dflash/depth=accept_rate,kv_boundary/head=2,kv_boundary/tail=4")
+    );
+    // The addition is merged in key order, not appended.
+    assert_eq!(
+        decode_config_with_inherent_depth("dflash/block=16,prefill_chunk=1024").as_deref(),
+        Some("dflash/block=16,dflash/depth=accept_rate,prefill_chunk=1024")
+    );
+    // A value whose first drafter term is fixed-block is still examined for a
+    // later adaptive one, rather than the scan aborting on the first `/block`.
+    assert_eq!(
+        decode_config_with_inherent_depth("dflash/block=16,mtp/block=5").as_deref(),
+        Some("dflash/block=16,dflash/depth=accept_rate,mtp/block=5")
+    );
+    // And a correction is never offered unless it is itself legal.
+    for corrected in [
+        decode_config_with_inherent_depth("dflash/block=16"),
+        decode_config_with_inherent_depth("dflash/block=16,kv_boundary/head=2,kv_boundary/tail=4"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(decode_config_is_well_formed(&corrected), "{corrected}");
+    }
+
     // A fixed-block drafter's spelling is not touched, and neither is a
     // non-drafter configuration or a malformed one.
     for untouched in [

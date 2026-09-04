@@ -344,6 +344,40 @@ fn every_loop_composes_a_well_formed_cell() {
     }
 }
 
+/// Every loop's depth policy, written down once per variant.
+///
+/// `every_loop_composes_a_well_formed_cell` only asserts the adaptive set is
+/// non-empty, which one existing loop satisfies forever. This table has an entry
+/// per variant and is checked against `SpecLoop::ALL`, so a seventh loop fails
+/// here until someone records what its block policy is — and is checked against
+/// `ADAPTIVE_DRAFTERS`, so the engine's match and the shared list cannot
+/// disagree about it.
+#[test]
+fn every_loop_is_classified_against_the_shared_list() {
+    let expected: &[(SpecLoop, Option<&str>)] = &[
+        (SpecLoop::MtpAssistant, None),
+        (SpecLoop::MtpSidecar, None),
+        (SpecLoop::DFlash, Some("accept_rate")),
+        (SpecLoop::Eagle3, None),
+        (SpecLoop::TwoModelGreedy, None),
+        (SpecLoop::TwoModelStochastic, None),
+    ];
+    assert_eq!(
+        expected.len(),
+        SpecLoop::ALL.len(),
+        "a loop was added without recording whether its block is the configured one"
+    );
+    for &(loop_kind, want) in expected {
+        assert!(SpecLoop::ALL.contains(&loop_kind), "{loop_kind:?}");
+        assert_eq!(loop_kind.depth_policy(), want, "{loop_kind:?}");
+        assert_eq!(
+            loop_kind.depth_policy(),
+            rmlx_metrics::cell::inherent_depth_policy(loop_kind.draft_kind()),
+            "{loop_kind:?}: the loop's match and ADAPTIVE_DRAFTERS disagree"
+        );
+    }
+}
+
 /// Both MTP paths record as one drafter, and the two-model loops as one that is
 /// neither.
 #[test]

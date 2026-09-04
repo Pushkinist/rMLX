@@ -772,11 +772,25 @@ and restore, acceptance walks, sampling.
 
 That partition can be checked against the engine's independently measured
 decode rate: `tokens_per_round / (round_ms / rounds) * 1000` should be
-`decode_tps`. Measured per request on four loops it closes to within **0.5% on
-every one and 0.06% on three of four** — the residual is mechanical, not a
-defect. The decode window ends at the last emitted token while `round_ms` ends
-after the last round's post-emit tail; on the Qwen3.8-27B MTP sidecar that tail
-is 28.0 ms of a 6720 ms round loop (−0.42%), and at most 0.01 ms elsewhere.
+`decode_tps`. Measured per request, it closes to within **0.5% on every loop**, and how much
+tighter than that depends on the loop:
+
+| loop | delta | explained by |
+|---|---|---|
+| DFlash, Qwen3.8-27B | −0.0001% to −0.0003% | — |
+| MtpAssistant, gemma-4-e2b | ±0.0006% | — |
+| Eagle3, Qwen3.6-35B | −0.053% to −0.059% | **not established** |
+| MtpSidecar, Qwen3.8-27B | −0.416% to −0.425% | the last round's post-emit tail |
+
+The sidecar's outlier has a measured mechanism: the decode window ends at the
+last emitted token while `round_ms` ends after the rollback and GDN
+snapshot/restore that follow it — 28.0 ms of a 6720 ms round loop there. That
+mechanism does **not** account for Eagle3's 0.06%: the same tail is at most
+0.01 ms on the other loops, which is under 0.001% of their round loops, and on
+the assistant loop the residual implied by the identity is ±0.007 ms of a
+1071 ms loop — noise about zero rather than a tail. Eagle3's 0.06% is recorded
+as unexplained rather than attributed; it is two orders under the bound the
+identity is used for and nobody has taken it apart.
 
 `prefill_ms` is the same kind of figure and is looser still: on Eagle3 three
 identical requests read 77.7, 799.8 and 809.7 ms. That is what a call-site wall

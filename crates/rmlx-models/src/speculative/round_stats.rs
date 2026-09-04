@@ -126,13 +126,27 @@ impl SpecLoop {
     /// How this loop picks each round's block size, or `None` when it drafts
     /// the configured block every round.
     ///
-    /// Read from [`rmlx_metrics::cell::ADAPTIVE_DRAFTERS`] rather than declared
-    /// here: the same fact decides what a row's cell is, what a row recovered
-    /// from notes is classified as, and which historical rows migration 008
-    /// rewrites. A second copy in the engine is the drift `decode_config`
-    /// exists to prevent.
+    /// The *policy* is read from [`rmlx_metrics::cell::ADAPTIVE_DRAFTERS`]
+    /// rather than declared here: the same fact decides what a row's cell is,
+    /// what a row recovered from notes is classified as, and which historical
+    /// rows migration 008 rewrites, and a second copy of it in the engine is
+    /// the drift `decode_config` exists to prevent.
+    ///
+    /// The *match* is exhaustive on purpose. A bare lookup compiles for a
+    /// seventh loop that forgot to join that list, hands it `None`, and records
+    /// the exact spelling migration 008 exists to undo. Here a new variant does
+    /// not compile until someone says which arm it is in, and
+    /// `every_loop_is_classified_against_the_shared_list` pins each arm's answer
+    /// against the list so the two cannot disagree.
     pub(crate) fn depth_policy(self) -> Option<&'static str> {
-        rmlx_metrics::cell::inherent_depth_policy(self.draft_kind())
+        match self {
+            Self::DFlash => rmlx_metrics::cell::inherent_depth_policy(self.draft_kind()),
+            Self::MtpAssistant
+            | Self::MtpSidecar
+            | Self::Eagle3
+            | Self::TwoModelGreedy
+            | Self::TwoModelStochastic => None,
+        }
     }
 }
 
@@ -251,8 +265,17 @@ impl RoundStats {
     ///
     /// Three counts taken at three points in the loop: `seed_emitted` before the
     /// first round, `emitted_in_rounds` at the emit site inside it, `emitted` at
-    /// the end. They must add up, exactly, on every request — which is what
-    /// makes this a detector rather than a description.
+    /// the end. They must add up, exactly, on every request that reached the
+    /// round loop — which is what makes this a detector rather than a
+    /// description.
+    ///
+    /// One exemption, and it is structural: the four sidecar records written
+    /// when the stop token arrives *before* the first round set `emitted` and
+    /// `seed_emitted` from the same `emitted.len()` and `emitted_in_rounds` to a
+    /// literal zero, so the sum cannot disagree there — the "one mistake
+    /// perturbs two counts together" case. It costs nothing: `rounds == 0`
+    /// makes every per-round figure zero regardless, so no recorded number
+    /// depends on those three counts being independent.
     ///
     /// The drift it exists for is a seed captured one line *too early*, before
     /// the pre-round `emit_step`. That makes the sum disagree by one on every
