@@ -53,8 +53,8 @@ variables above:
 | Variable | Used by | Purpose |
 |----------|---------|---------|
 | `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override for the SSD-restart smoke test. |
-| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs`, `spec_greedy_equivalence.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path; the Qwen3.5-family alignment tests take a **verifier** here instead (see below). |
-| `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs`, `spec_greedy_equivalence.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
+| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path; the Qwen3.5-family alignment tests take a **verifier** here instead (see below). |
+| `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | Vision-language model snapshot for VL text-parity tests. |
 | `RMLX_PROMPT_CACHE_TEST_MODEL_A` / `_B` | `rmlx-models/tests/prompt_cache_cross_model.rs` | **Two** snapshots of the same architecture with the same KV shape but different weights — the prompt cache is one static per arch, and this pair is what shows whether its key separates two resident models. `mlx-community__gemma-4-e2b-it-mxfp8` + `mlx-community__gemma-4-E2B-it-qat-4bit` fit (both `Gemma4ForConditionalGeneration`, 35 layers x 1 KV head x head_dim 256). Same-shape matters: a shape mismatch would fail for the wrong reason. Different weights matter: identical outputs make the comparison vacuous, and the test refuses rather than passing. |
 
@@ -68,63 +68,9 @@ passes while never running. The pairs their thresholds are calibrated against:
 | `qwen3_5_mtp_drafter_alignment.rs` | `mlx-community__Qwen3.8-27B-mxfp8` | `mlx-community__Qwen3.8-27B-MTP-mxfp8` |
 | `qwen3_5_eagle3_alignment.rs` | `mlx-community__Qwen3.6-35B-A3B-8bit` | `Dogacel__specdrift-qwen3.6-35b-a3b-eagle3` |
 | `qwen3_5_two_model_alignment.rs` | `mlx-community__Qwen3.8-27B-mxfp8` | `sahilchachra__ornith-1.0-9b-mxfp8-mlx` (a full model, not a drafter head — both halves must be GDN hybrids sharing a vocabulary) |
-| `spec_greedy_equivalence.rs` | `mlx-community__gemma-4-e2b-it-mxfp8` | `mlx-community__gemma-4-E2B-it-assistant-bf16` |
 
 Point either at a different pair and re-measure both arms before reading a
 failure as a regression.
-
-`spec_greedy_equivalence.rs` asks a different question from the three above: not
-whether the round loop keeps the verifier's state consistent for a while, but
-whether the run produces the answer the verifier produces alone, over 256
-tokens. Its oracle is the longest common subsequence with plain greedy, because
-the two arms legitimately differ by a word — the verify pass scores a block in
-one forward where plain decode steps one token at a time. It is read over the
-whole answer (floor 0.70) and over each tail window (floor 0.40): one benign
-flip and a divergence that begins late both score near 0.8 overall, and only the
-second collapses a window. Both arms are also checked for a repetition
-loop — over the whole stream and over each tail cut, at every period up to 64
-that leaves 32 comparisons — because two arms that collapse into the *same* loop
-agree on garbage and the subsequence oracle cannot refuse that: it measures a
-subsequence over one periodic base, so a pair sharing a healthy prefix and then
-locked in the same period-8 loop reads 0.70 to 0.93 across the whole 12–40%
-ragged range.
-
-That control has no general threshold. Healthy output spans 0.03 for prose to
-0.88 for a markdown table with a yes/no column, and degenerate output 0.37 for a
-ragged loop to 1.00 for an exact one — overlapping populations. **Both prompts
-therefore ask for prose**, which is the regime where they separate: the real
-arms read 0.089 and 0.100 against a ceiling of 0.50, 1000 synthetic healthy
-streams at each of six lengths trip it none (max 0.1351), and the whole ragged
-range is refused with the subsequence floor taking over past it. Structured
-output trips the control — a false positive on an input the gate controls, not a
-class it admits.
-
-Unlike the three above it **resolves its pair by slug** from
-`RMLX_O_MODELS_ROOT`, so `make gpu-test` runs it on a machine holding the
-snapshots and `run_gpu_tests.sh` reports a machine without them as INCOMPLETE.
-The verifier goes through the golden harness's own resolver
-(`common::model_for`); `RMLX_DRAFT_TEST_MODEL` overrides the drafter. Both
-`-e2b-` and `-e4b-` snapshots declare the same architecture, so the harness's
-arch stand-down cannot separate them: the drafter's `backbone_hidden_size` is
-checked against the verifier's width before the drafter is loaded, and a
-mismatched pair skips with that reason rather than panicking in the loader.
-
-Under Metal shader validation the pair produces **zero** hits, so it has no
-entry in `scripts/gpu_validation_census.txt` and needs none.
-
-The file also carries `speculative_greedy_reproduces_plain_greedy_at_long_context`
-— the same gate over `prompts/longctx_4k.json`, which **fails today**: it is the
-reproducer for issue #506 and turns `make gpu-test` red on a machine holding
-both snapshots until that defect is fixed. `make ci` runs no GPU test and is
-unaffected.
-
-It **skips** unless the drafter is a Gemma4 assistant and the verifier carries
-no recurrent state: the floors are calibrated on the exact-rollback regime only,
-where the shipped code reads 0.9180 whole / 0.6875 weakest tail and a rollback
-leaving one rejected key reads 0.4062 / 0.2031. Qwen3.8-27B with its MTP sidecar
-reads 0.520 as shipped at 256 tokens, which no floor separates from a broken
-rollback, so it is left to the prefix gate above rather than admitted under a
-threshold that means nothing.
 
 `dflash_drafter_alignment.rs` is **not** one of those three and does not gate the
 same property. It asserts that the drafter's round-0 first-block proposal aligns
