@@ -25,7 +25,7 @@ Output (stdout), one `key=value` per line:
 
     events=<n>                  round-loop done events considered
     rounds_total=<n>
-    emitted_total=<n>
+    emitted_total=<n>           tokens the rounds produced, seed tokens excluded
     draft_tokens_total=<n>
     accept_tokens_total=<n>
     accept_rate=<f>             accept_tokens_total / draft_tokens_total
@@ -44,6 +44,16 @@ event is checked against this module's arithmetic before it is aggregated: two
 expressions of one formula drift silently otherwise, and the row that reaches
 the append-only store cannot be taken back out.
 
+`emitted_total` is what the rounds produced. The sidecar loops emit a bonus
+token out of the prefill forward before the first round and report it as
+`seed_emitted`; it is subtracted, or a sidecar row would read one token per
+round above a two-model row that did the same work.
+
+Every counter a figure is derived from is **required**. A binary that stops
+reporting one, together with its derived twin, would otherwise aggregate to a
+silent `0.000000` that the caller cannot tell from a measurement — and a
+measured zero wins a `bests` cell in an append-only table.
+
 `block_size` is the block the engine ran, which is not always the one asked
 for — a sidecar caps it at its own — and `decode_config` is the cell key the
 round loop composed
@@ -57,9 +67,10 @@ Aggregating the `decode_tps` lines is the caller's job: a bench script that
 already has a median/stddev helper must not grow a second one here.
 
 Exit codes: 0 — read; 2 — log unreadable; 3 — a `done` event's `decode_tps` is
-not the documented shape, or the events name more than one cell; 4 — no `done`
-event in the log; 5 — the log holds a different number of `done` events than
-the caller served requests.
+not the documented shape, an event is missing a counter a figure is derived
+from, an event's derived field contradicts its own counters, or the events name
+more than one cell; 4 — no `done` event in the log; 5 — the log holds a
+different number of `done` events than the caller served requests.
 """
 
 import argparse
@@ -67,6 +78,26 @@ import json
 import sys
 
 DONE_MARKERS = ("generate_greedy", "generate_stochastic")
+
+# Field names that moved, oldest spelling first. Binaries from before the round
+# loops shared one record logged the cached two-model loops' accepted count as
+# `total_accept_count`; every loop logs `total_accept` now. Renaming on read is
+# what keeps one consumer supporting a legacy log while another refuses it and
+# blames a formula drift for a field-name change.
+FIELD_ALIASES = {"total_accept_count": "total_accept"}
+
+# Counters every derived figure is built from. A log missing one of these has no
+# aggregate, and saying so beats reporting a zero nobody measured.
+REQUIRED_COUNTERS = (
+    "rounds",
+    "emitted",
+    "seed_emitted",
+    "total_draft",
+    "total_accept",
+    "draft_ms",
+    "verifier_ms",
+    "round_ms",
+)
 
 
 class SpecLogError(Exception):
@@ -93,8 +124,20 @@ def done_events(path):
                 continue
             message = fields.get("message", "")
             if any(m in message for m in DONE_MARKERS) and "done" in message:
-                events.append(fields)
+                events.append(normalise(fields))
     return events
+
+
+def normalise(fields):
+    """`fields` with every legacy field name replaced by its current one.
+
+    Done once, before any consumer sees the event, so an alias cannot be known
+    to one consumer and not another.
+    """
+    for old_name, new_name in FIELD_ALIASES.items():
+        if old_name in fields and new_name not in fields:
+            fields[new_name] = fields.pop(old_name)
+    return fields
 
 
 def decode_tps(fields):
@@ -131,6 +174,25 @@ def decode_tps(fields):
     )
 
 
+def require_counters(events):
+    """Refuse an event missing a counter a reported figure is derived from.
+
+    `check_derived` skips a derived field an event does not carry and the
+    summariser would default a missing counter to zero, so a binary that dropped
+    a counter *and* its derived twin would agree with itself all the way to a
+    `0.000000` in the metrics store. The caller cannot see that: this reader
+    always prints the key.
+    """
+    for event in events:
+        missing = [name for name in REQUIRED_COUNTERS if name not in event]
+        if missing:
+            message = event.get("message", "<no message>")
+            raise SpecLogError(
+                f"'{message}' carries no {', '.join(missing)}: a figure derived "
+                "from a counter the log does not have is a zero nobody measured"
+            )
+
+
 def one_value(events, field):
     """The value of `field` that every event agrees on.
 
@@ -161,7 +223,7 @@ def one_value(events, field):
 DERIVED_FIELDS = (
     ("accept_rate", ("total_accept",), ("total_draft",)),
     ("accepted_per_step", ("total_accept",), ("rounds",)),
-    ("tokens_per_round", ("emitted",), ("rounds",)),
+    ("tokens_per_round", ("emitted", "-seed_emitted"), ("rounds",)),
     ("draft_ms_per_round", ("draft_ms",), ("rounds",)),
     ("verify_ms_per_round", ("verifier_ms",), ("rounds",)),
     ("loop_ms_per_round", ("round_ms", "-draft_ms", "-verifier_ms"), ("rounds",)),
@@ -204,25 +266,25 @@ def check_derived(fields):
 def summarize(events):
     """The `key=value` lines for `events`.
 
-    Every ratio is the engine's formula over the summed counters. Zero rounds
-    gives zero rather than a division error: a request whose stop token arrived
-    before the first round has no per-round figure.
+    Every ratio is the engine's formula over the summed counters, and every
+    counter is required — `require_counters` has run. Zero rounds gives zero
+    rather than a division error: a request whose stop token arrived before the
+    first round has no per-round figure.
     """
-    rounds = sum(e.get("rounds", 0) for e in events)
-    emitted = sum(e.get("emitted", 0) for e in events)
-    draft = sum(e.get("total_draft", 0) for e in events)
-    # The Gemma4 assistant and MTP sidecar loops name it `total_accept`; the
-    # cached spec loops name it `total_accept_count`.
-    accept = sum(e.get("total_accept", e.get("total_accept_count", 0)) for e in events)
-    draft_ms = sum(e.get("draft_ms", 0.0) for e in events)
-    verify_ms = sum(e.get("verifier_ms", 0.0) for e in events)
-    round_ms = sum(e.get("round_ms", 0.0) for e in events)
+    require_counters(events)
+    for event in events:
+        check_derived(event)
+
+    rounds = sum(e["rounds"] for e in events)
+    emitted = sum(e["emitted"] - e["seed_emitted"] for e in events)
+    draft = sum(e["total_draft"] for e in events)
+    accept = sum(e["total_accept"] for e in events)
+    draft_ms = sum(e["draft_ms"] for e in events)
+    verify_ms = sum(e["verifier_ms"] for e in events)
+    round_ms = sum(e["round_ms"] for e in events)
 
     def per_round(total):
         return total / rounds if rounds > 0 else 0.0
-
-    for event in events:
-        check_derived(event)
 
     lines = [
         f"events={len(events)}",

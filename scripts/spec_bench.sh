@@ -118,6 +118,25 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# The drafter kind reaches a buffer *filename* and the record's `notes`, both
+# before the engine ever sees it, so a value with a `/` or a space in it writes
+# outside `pending/` or files an unparseable note. The engine's own list is the
+# authority; this is the same list, checked early enough to matter.
+case "${DRAFT_KIND}" in
+    mtp|dflash|eagle3) ;;
+    *)
+        echo "ERROR: --draft-kind '${DRAFT_KIND}' is not one the engine ships" \
+             "(mtp, dflash, eagle3)" >&2
+        exit 1
+        ;;
+esac
+
+if ! [[ "${DRAFT_BLOCK_SIZE}" =~ ^[0-9]+$ ]] || (( DRAFT_BLOCK_SIZE < 2 )); then
+    echo "ERROR: --draft-block-size '${DRAFT_BLOCK_SIZE}' must be an integer >= 2:" \
+         "a block of 1 leaves no room for a draft token" >&2
+    exit 1
+fi
+
 if [[ -n "${KV_QUANT}" ]]; then
     KV_QUANT_ARGS=(--kv-quant "${KV_QUANT}")
 fi

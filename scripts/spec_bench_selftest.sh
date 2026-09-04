@@ -110,9 +110,13 @@ itl_ring = []
 
 
 ROUNDS = 30
+# Pairwise distinct per-round figures (10 / 30 / 20 ms): with a round loop of
+# 1500 the draft and loop residual were both 10, and a swap of the two
+# derivations passed every assertion in this suite.
 DRAFT_MS = 300.0
 VERIFY_MS = 900.0
-ROUND_MS = 1500.0
+ROUND_MS = 1800.0
+SEED_EMITTED = 1
 DECODE_CONFIG = os.environ.get("STUB_DECODE_CONFIG", "mtp/block=5")
 # The engine composes both from one block, so the stub cannot make them
 # disagree by accident.
@@ -121,6 +125,7 @@ BLOCK_SIZE = int(
 )
 DERIVED_OVERRIDE = os.environ.get("STUB_DERIVED_OVERRIDE", "")
 DROP_FIELDS = [f for f in os.environ.get("STUB_DROP_FIELDS", "").split(",") if f]
+LEGACY_ACCEPT_NAME = os.environ.get("STUB_LEGACY_ACCEPT_NAME", "") == "1"
 
 
 def done_line():
@@ -131,15 +136,17 @@ def done_line():
     breaks one of them, which is how the reader's cross-check is staged.
     """
     raw = SEQ[min(served, len(SEQ) - 1)] if SEQ else ""
+    round_emitted = EMITTED - SEED_EMITTED
     fields = {
         "message": "mtp_generate_greedy: done",
         "rounds": ROUNDS,
         "emitted": EMITTED,
+        "seed_emitted": SEED_EMITTED,
         "total_draft": 150,
         "total_accept": 98,
         "accept_rate": 98 / 150,
         "accepted_per_step": 98 / ROUNDS,
-        "tokens_per_round": EMITTED / ROUNDS,
+        "tokens_per_round": round_emitted / ROUNDS,
         "elapsed_ms": ELAPSED_MS,
         "prefill_ms": 100.0,
         "round_ms": ROUND_MS,
@@ -154,6 +161,8 @@ def done_line():
     if DERIVED_OVERRIDE:
         name, _, value = DERIVED_OVERRIDE.partition("=")
         fields[name] = float(value)
+    if LEGACY_ACCEPT_NAME:
+        fields["total_accept_count"] = fields.pop("total_accept")
     for name in DROP_FIELDS:
         fields.pop(name, None)
     if raw:
@@ -768,16 +777,17 @@ for m in rec.get("metrics", []):
 }
 
 # The whole point of the change: a speculative row carries what the round loop
-# counted, not only its accept rate. 30 rounds emitting 128 tokens is 4.2667
-# tokens per round, and 1500 - 300 - 900 ms of loop over 30 rounds is 10 ms.
+# counted, not only its accept rate. 30 rounds emitting 128 tokens of which one
+# is the pre-round seed is 127/30 = 4.2333 tokens per round, and
+# 1800 - 300 - 900 ms of loop over 30 rounds is 20 ms.
 run_case round_loop_figures_recorded 0 \
 	"the speculative row carries the per-round split, not only the accept rate"
 for pair in \
-	"tokens_per_round 4.266667" \
+	"tokens_per_round 4.233333" \
 	"accepted_per_step 3.266667" \
 	"draft_ms_per_round 10.0" \
 	"verify_ms_per_round 30.0" \
-	"loop_ms_per_round 10.0"; do
+	"loop_ms_per_round 20.0"; do
 	set -- $pair
 	got="$(metric_value mtp "$1")"
 	close_to "$got" "$2" 0.001 || note_bad "mtp $1=$got (want $2)"
@@ -792,12 +802,45 @@ verdict
 
 # The engine derives the per-round figures too, and this reader derives them
 # again. A drift between the two would file a number no run produced, so an
-# event whose own counters contradict its derived field is refused.
-run_case derived_field_contradicting_counters_refused 1 \
-	"a done line whose derived field disagrees with its counters is refused" \
-	'STUB_DERIVED_OVERRIDE=tokens_per_round=9.0' \
-	'GREP:do not agree on the formula'
+# event whose own counters contradict its derived field is refused — for every
+# one of them, not for the one that happened to be tested. `loop_ms_per_round`
+# is the term list that can go wrong quietly: it is the only difference of
+# three counters.
+for derived in accept_rate accepted_per_step tokens_per_round \
+	draft_ms_per_round verify_ms_per_round loop_ms_per_round; do
+	run_case "derived_${derived}_contradiction_refused" 1 \
+		"a done line whose ${derived} disagrees with its counters is refused" \
+		"STUB_DERIVED_OVERRIDE=${derived}=9.0" \
+		'GREP:do not agree on the formula'
+	no_row mtp
+	verdict
+done
+
+# A counter a figure is derived from, dropped together with that figure, would
+# otherwise aggregate to a zero nobody measured — and the caller cannot see it,
+# because this reader always prints the key.
+run_case dropped_counter_refused 1 \
+	"a counter a figure is derived from is required, not defaulted to zero" \
+	'STUB_DROP_FIELDS=emitted,tokens_per_round' \
+	'GREP:carries no emitted'
 no_row mtp
+verdict
+
+run_case dropped_round_span_refused 1 \
+	"the round-loop span is required too, so its residual cannot read zero" \
+	'STUB_DROP_FIELDS=round_ms,loop_ms_per_round' \
+	'GREP:carries no round_ms'
+no_row mtp
+verdict
+
+# A log from before the round loops shared one record names the accepted count
+# `total_accept_count`. It is supported, and support means read — not read by
+# the summariser and refused by the cross-check for a formula it never broke.
+run_case legacy_accept_field_read 0 \
+	"a legacy accepted-count field name is read, not blamed for a formula drift" \
+	'STUB_LEGACY_ACCEPT_NAME=1'
+got="$(metric_value mtp accept_tokens_total)"
+[ "$got" = "294" ] || note_bad "accept_tokens_total=$got (want 294, three measured runs)"
 verdict
 
 # The cell a row belongs to is the one the round loop named. A log that does not
@@ -833,6 +876,23 @@ run_case adaptive_cell_passes_through 0 \
 	ARGS:--draft-kind ARGS:dflash
 [ "$(field_of_record dflash decode_config)" = "dflash/block=16,dflash/depth=accept_rate" ] ||
 	note_bad "decode_config=$(field_of_record dflash decode_config)"
+verdict
+
+# The kind becomes a component of the buffer filename and of `notes` before the
+# engine sees it, so a value the engine would reject must not get that far.
+run_case hostile_draft_kind_refused 1 \
+	"a drafter kind that would escape the buffer directory is refused at parse" \
+	ARGS:--draft-kind ARGS:../../etc/mtp \
+	'GREP:is not one the engine ships'
+no_row mtp
+[ -z "$(ls "$CASE_HOME"/metrics/buffer/pending/* 2>/dev/null)" ] ||
+	note_bad "a buffer file was written for a refused drafter kind"
+verdict
+
+run_case unusable_block_size_refused 1 \
+	"a block size with no room for a draft token is refused" \
+	ARGS:--draft-block-size ARGS:1 \
+	'GREP:must be an integer >= 2'
 verdict
 
 echo
