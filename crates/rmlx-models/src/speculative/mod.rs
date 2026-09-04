@@ -682,7 +682,7 @@ impl SpeculativeDispatcher {
             if hit_eos {
                 RoundStats {
                     loop_kind: SpecLoop::TwoModelGreedy,
-                    block_size: k + 1,
+                    block_size: (k + 1) as u32,
                     rounds,
                     emitted: emitted.len(),
                     total_draft: total_draft_tokens,
@@ -799,7 +799,7 @@ impl SpeculativeDispatcher {
 
         RoundStats {
             loop_kind: SpecLoop::TwoModelGreedy,
-            block_size: k + 1,
+            block_size: (k + 1) as u32,
             rounds,
             emitted: emitted.len(),
             total_draft: total_draft_tokens,
@@ -1101,7 +1101,7 @@ impl SpeculativeDispatcher {
             if hit_eos {
                 RoundStats {
                     loop_kind: SpecLoop::TwoModelStochastic,
-                    block_size: k + 1,
+                    block_size: (k + 1) as u32,
                     rounds,
                     emitted: emitted.len(),
                     total_draft: total_draft_tokens,
@@ -1191,7 +1191,7 @@ impl SpeculativeDispatcher {
 
         RoundStats {
             loop_kind: SpecLoop::TwoModelStochastic,
-            block_size: k + 1,
+            block_size: (k + 1) as u32,
             rounds,
             emitted: emitted.len(),
             total_draft: total_draft_tokens,

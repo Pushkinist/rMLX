@@ -10,9 +10,18 @@
 //! `1 + accept_rate * (block - 1)` only while the block is the configured one
 //! every round, and DFlash's already is not: it halves and grows its block from
 //! the recent accept rate, so its rows have never been derivable that way. That
-//! is also why the block policy is part of [`Self::decode_config`] rather than
-//! context — an adaptive arm at ceiling 16 and a fixed arm at block 16 are
+//! is also why the block policy is part of [`RoundStats::decode_config`] rather
+//! than context — an adaptive arm at ceiling 16 and a fixed arm at block 16 are
 //! different configurations.
+//!
+//! **A round's tokens are the ones a round produced.** The four sidecar loops
+//! argmax a bonus token out of the prefill forward and emit it before the round
+//! loop starts, so `emitted` carries one token no verify round produced; the
+//! two-model loops emit nothing outside their loop. Dividing `emitted` by
+//! `rounds` would therefore read `+1/rounds` high on four of six loops — about
+//! 3% at a 128-token bench — and make the one figure the record exists to
+//! compare incomparable between them. [`SpecLoop::seed_tokens`] is what each
+//! loop emits outside its rounds, and it is subtracted.
 //!
 //! **The derivation does not change what it measures.** Every figure below is
 //! arithmetic over counters the loops already keep; nothing here forces an
@@ -82,6 +91,19 @@ impl SpecLoop {
         }
     }
 
+    /// Tokens this loop emits outside its round loop.
+    ///
+    /// The sidecar loops take the first bonus token from the prefill forward's
+    /// logits and emit it before the first round, so one emitted token is a
+    /// product of the prefill and not of a verify round. The two-model loops
+    /// seed a carry token instead and emit nothing until a round has run.
+    pub(crate) const fn seed_tokens(self) -> usize {
+        match self {
+            Self::MtpAssistant | Self::MtpSidecar | Self::DFlash | Self::Eagle3 => 1,
+            Self::TwoModelGreedy | Self::TwoModelStochastic => 0,
+        }
+    }
+
     /// How this loop picks each round's block size, or `None` when it drafts
     /// the configured block every round.
     pub(crate) const fn depth_policy(self) -> Option<&'static str> {
@@ -105,12 +127,16 @@ fn ms(ns: u128) -> f64 {
 ///
 /// Built once, after the round loop, by the loop that ran it. The loops keep
 /// the counters as locals while they run and hand them over here.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct RoundStats {
     /// Which loop produced the tokens.
     pub(crate) loop_kind: SpecLoop,
     /// The block size the request was configured with, verifier token included.
-    pub(crate) block_size: usize,
+    ///
+    /// `u32` because it reaches a `decode_config` term, which is cell identity
+    /// in an append-only store: a lossy conversion at that point would file a
+    /// run under a block nothing ran.
+    pub(crate) block_size: u32,
     /// Rounds the loop entered.
     pub(crate) rounds: usize,
     /// Tokens handed to the sink.
@@ -145,11 +171,21 @@ impl RoundStats {
         ratio(self.total_accept as f64, self.rounds as f64)
     }
 
-    /// Tokens emitted per verify round — accepted proposals plus the verifier's
-    /// own token. The figure a speculative result is read with, and the one
-    /// that stops being derivable the moment the block stops being fixed.
+    /// Tokens the rounds produced — accepted proposals plus the verifier's own
+    /// token, per round.
+    ///
+    /// The figure a speculative result is read with, and the one that stops
+    /// being derivable the moment the block stops being fixed. The loop's seed
+    /// token is excluded: it comes out of the prefill forward, not out of a
+    /// round, and counting it makes the sidecar loops incomparable with the
+    /// two-model ones.
     pub(crate) fn tokens_per_round(&self) -> f64 {
-        ratio(self.emitted as f64, self.rounds as f64)
+        ratio(self.round_emitted() as f64, self.rounds as f64)
+    }
+
+    /// Tokens the round loop itself emitted.
+    pub(crate) fn round_emitted(&self) -> usize {
+        self.emitted.saturating_sub(self.loop_kind.seed_tokens())
     }
 
     /// Drafting wall-clock per round.
@@ -168,18 +204,39 @@ impl RoundStats {
     ///
     /// The three spans partition the round loop by construction — drafting and
     /// verifying are disjoint sub-spans of it — so this is a residual, not a
-    /// fourth measurement, and it cannot be negative unless a loop times a span
-    /// that starts outside its own round loop.
+    /// fourth measurement. [`Self::span_violation`] names the one way that can
+    /// stop being true.
     pub(crate) fn loop_ms_per_round(&self) -> f64 {
         let overhead = ms(self.round_loop_ns) - ms(self.draft_ns) - ms(self.verifier_ns);
         ratio(overhead, self.rounds as f64)
+    }
+
+    /// Why the three spans do not partition the round loop, when they do not.
+    ///
+    /// Drafting and verifying are sub-spans of the round loop, so their sum
+    /// cannot exceed it. A loop that starts one of those timers before
+    /// `round_loop_t0` makes the residual negative, and a negative duration is
+    /// refused by the ingest bounds — taking the whole run's record with it,
+    /// naming no field. Reported here so the field is named while the run is
+    /// still in front of somebody.
+    pub(crate) fn span_violation(&self) -> Option<String> {
+        let inner = self.draft_ns.saturating_add(self.verifier_ns);
+        (inner > self.round_loop_ns).then(|| {
+            format!(
+                "draft_ms {:.3} + verifier_ms {:.3} exceeds round_ms {:.3}: a timer starts \
+                 outside the round loop it is attributed to, and loop_ms_per_round is negative",
+                ms(self.draft_ns),
+                ms(self.verifier_ns),
+                ms(self.round_loop_ns)
+            )
+        })
     }
 
     /// The cell this request's rows belong to.
     pub(crate) fn decode_config(&self) -> String {
         rmlx_metrics::cell::decode_config(
             self.loop_kind.draft_kind(),
-            u32::try_from(self.block_size).unwrap_or(u32::MAX),
+            self.block_size,
             self.loop_kind.depth_policy(),
         )
     }
@@ -191,10 +248,23 @@ impl RoundStats {
     /// `scripts/spec_bench.sh` records what it finds here — including
     /// `decode_config`, so a new drafter or a new depth policy reaches the
     /// metrics store without a bench script learning about it.
+    ///
+    /// The event's target is this module for every loop, not the loop's own —
+    /// six callsites became one. `loop_kind` is a field so the loop is still
+    /// selectable, by field rather than by module path.
     pub(crate) fn log_done(&self) {
+        if let Some(reason) = self.span_violation() {
+            tracing::error!(
+                loop_kind = ?self.loop_kind,
+                "speculative round timing is inconsistent: {reason}"
+            );
+            debug_assert!(false, "{reason}");
+        }
         tracing::info!(
+            loop_kind = ?self.loop_kind,
             rounds = self.rounds,
             emitted = self.emitted,
+            seed_emitted = self.loop_kind.seed_tokens(),
             total_draft = self.total_draft,
             total_accept = self.total_accept,
             accept_rate = self.accept_rate(),

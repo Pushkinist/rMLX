@@ -798,7 +798,7 @@ pub fn mtp_assistant_generate_greedy(
             // still happened, so it still leaves exactly one record.
             super::RoundStats {
                 loop_kind: super::SpecLoop::MtpAssistant,
-                block_size,
+                block_size: block_size as u32,
                 rounds: 0,
                 emitted: emitted.len(),
                 total_draft: 0,
@@ -948,7 +948,7 @@ pub fn mtp_assistant_generate_greedy(
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();
     super::RoundStats {
         loop_kind: super::SpecLoop::MtpAssistant,
-        block_size,
+        block_size: block_size as u32,
         rounds,
         emitted: emitted.len(),
         total_draft,
