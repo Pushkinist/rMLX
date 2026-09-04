@@ -904,6 +904,7 @@ pub fn eagle3_generate_greedy(
         chunk_size = PREFILL_CHUNK_SIZE,
         "eagle3: verifier prefill (chunked)"
     );
+    let prefill_t0 = Instant::now();
     let (bonus_logits, all_hidden) = verifier.forward_verify_capture_chunked(
         prompt_ids,
         &aux_layer_ids,
@@ -936,9 +937,29 @@ pub fn eagle3_generate_greedy(
     );
 
     let (mut b, mut h_seed, mut d_seed_tok) = (bonus, h_seed_init, Some(seed_tok_init));
+    // Prefill for this loop is the verifier pass plus the drafter's own KV
+    // prefill that conditions on it.
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
     if eos_ids.contains(&b) {
+        // The stop token arrived before a round could run. The request still
+        // happened, so it still leaves exactly one record.
+        super::RoundStats {
+            loop_kind: super::SpecLoop::Eagle3,
+            block_size: block_total,
+            rounds: 0,
+            emitted: emitted.len(),
+            total_draft: 0,
+            total_accept: 0,
+            prefill_ns,
+            draft_ns: 0,
+            verifier_ns: 0,
+            round_loop_ns: 0,
+            elapsed_ns: t_total.elapsed().as_nanos(),
+            decode_tps: window.tps(),
+        }
+        .log_done();
         return Ok(emitted);
     }
 
@@ -952,6 +973,7 @@ pub fn eagle3_generate_greedy(
         "eagle3_generate_greedy: starting (Qwen3.6-MoE verifier + EAGLE-3 drafter)"
     );
 
+    let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
         let remaining = n_tokens - emitted.len();
@@ -1183,26 +1205,22 @@ pub fn eagle3_generate_greedy(
         );
     }
 
-    let elapsed_ms = (t_total.elapsed().as_nanos() as f64) / 1.0e6;
-    let accept_rate = if total_draft > 0 {
-        (total_accept as f64) / (total_draft as f64)
-    } else {
-        0.0
-    };
-
-    tracing::info!(
+    let round_loop_ns = round_loop_t0.elapsed().as_nanos();
+    super::RoundStats {
+        loop_kind: super::SpecLoop::Eagle3,
+        block_size: block_total,
         rounds,
-        emitted = emitted.len(),
+        emitted: emitted.len(),
         total_draft,
         total_accept,
-        accept_rate,
-        decode_tps = ?window.tps(),
-        elapsed_ms,
-        draft_ms = (draft_ns as f64) / 1.0e6,
-        verifier_ms = (verifier_ns as f64) / 1.0e6,
-        block_size = block_total,
-        "eagle3_generate_greedy: done"
-    );
+        prefill_ns,
+        draft_ns,
+        verifier_ns,
+        round_loop_ns,
+        elapsed_ns: t_total.elapsed().as_nanos(),
+        decode_tps: window.tps(),
+    }
+    .log_done();
 
     // Report the verifier's resident KV, so a caller that sampled the verifier
     // arch around this call can attribute the figure to it. This round loop

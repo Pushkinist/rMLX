@@ -118,13 +118,30 @@ pub enum NotesVerdict {
     Silent,
 }
 
-/// The canonical `decode_config` for a drafter and block size.
+/// The canonical `decode_config` for a speculative arm.
 ///
-/// One definition of the format. `scripts/spec_bench.sh` writes the same string
-/// when it records a speculative arm, and `decode_config_format_is_stable` pins
-/// the spelling so the two cannot drift apart unnoticed.
-pub fn decode_config(draft_kind: &str, block_size: u32) -> String {
-    format!("{draft_kind}/block={block_size}")
+/// `block_size` is the block the run was *configured* with. `depth_policy`
+/// names how the round loop picks each round's block when it does not simply
+/// take that one — `None` for a loop that drafts a fixed block every round.
+///
+/// The policy is part of cell identity because the block is not observable
+/// from the configured ceiling once a loop moves off it: DFlash already halves
+/// and grows its block from the recent accept rate, so an adaptive arm at
+/// ceiling 16 and a fixed arm at block 16 are different configurations that
+/// would otherwise rank against each other under one label. Absence of the
+/// term is the fixed block, which is what keeps every row recorded before the
+/// term existed in the cell it has always been in.
+///
+/// This is the only place the format is written. The engine composes the
+/// string here and logs it on its `done` line, and `scripts/spec_bench.sh`
+/// records what the engine said rather than spelling it a second time.
+pub fn decode_config(draft_kind: &str, block_size: u32, depth_policy: Option<&str>) -> String {
+    match depth_policy {
+        Some(policy) => {
+            format!("{draft_kind}/block={block_size},{draft_kind}/depth={policy}")
+        }
+        None => format!("{draft_kind}/block={block_size}"),
+    }
 }
 
 /// Whether `value` is a well-formed `decode_config` — see `docs/METRICS_DB.md`
@@ -243,7 +260,10 @@ pub fn decode_config_from_notes(notes: &str) -> NotesVerdict {
                 // back out. A row whose notes do not compose to a legal
                 // configuration does not say what it was.
                 Ok(block) => {
-                    let config = decode_config(kind, block);
+                    // Notes record the configured block and nothing about
+                    // how the loop chose each round's, so a backfilled row can
+                    // only claim the fixed spelling.
+                    let config = decode_config(kind, block, None);
                     if decode_config_is_well_formed(&config) {
                         NotesVerdict::Speculative(config)
                     } else {

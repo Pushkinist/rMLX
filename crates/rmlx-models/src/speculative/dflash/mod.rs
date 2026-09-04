@@ -718,6 +718,7 @@ pub fn dflash_generate_greedy(
 
     // -- Prefill verifier on prompt[..-1]; last token is the round-0 carry. --
     let prefill_slice = &prompt_ids[..prompt_ids.len() - 1];
+    let prefill_t0 = Instant::now();
     super::prefill_chunked(
         verifier,
         prefill_slice,
@@ -725,6 +726,7 @@ pub fn dflash_generate_greedy(
         Some(&mut v_lin),
         device,
     )?;
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     // -- Round-0: feed the last prompt token, capture its hidden + first bonus. --
     let last_prompt = *prompt_ids.last().unwrap();
@@ -751,6 +753,23 @@ pub fn dflash_generate_greedy(
     // Emit the first bonus.
     emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
     if eos_ids.contains(&b) {
+        // The stop token arrived before a round could run. The request still
+        // happened, so it still leaves exactly one record.
+        super::RoundStats {
+            loop_kind: super::SpecLoop::DFlash,
+            block_size: block_total,
+            rounds: 0,
+            emitted: emitted.len(),
+            total_draft: 0,
+            total_accept: 0,
+            prefill_ns,
+            draft_ns: 0,
+            verifier_ns: 0,
+            round_loop_ns: 0,
+            elapsed_ns: t_total.elapsed().as_nanos(),
+            decode_tps: window.tps(),
+        }
+        .log_done();
         return Ok(emitted);
     }
 
@@ -763,6 +782,7 @@ pub fn dflash_generate_greedy(
         "dflash_generate_greedy: starting (Qwen3.6-MoE verifier + DFlash drafter)"
     );
 
+    let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
         let remaining = n_tokens - emitted.len();
@@ -894,36 +914,22 @@ pub fn dflash_generate_greedy(
         );
     }
 
-    let elapsed_ms = (t_total.elapsed().as_nanos() as f64) / 1.0e6;
-    let accept_rate = if total_draft > 0 {
-        (total_accept as f64) / (total_draft as f64)
-    } else {
-        0.0
-    };
-
-    tracing::info!(
+    let round_loop_ns = round_loop_t0.elapsed().as_nanos();
+    super::RoundStats {
+        loop_kind: super::SpecLoop::DFlash,
+        block_size: block_total,
         rounds,
-        emitted = emitted.len(),
+        emitted: emitted.len(),
         total_draft,
         total_accept,
-        accept_rate,
-        decode_tps = ?window.tps(),
-        elapsed_ms,
-        draft_ms = (draft_ns as f64) / 1.0e6,
-        verifier_ms = (verifier_ns as f64) / 1.0e6,
-        block_size = block_total,
-        "dflash_generate_greedy: done"
-    );
-    tracing::debug!(
-        rounds,
-        emitted = emitted.len(),
-        total_draft,
-        total_accept,
-        accept_rate,
-        decode_tps = ?window.tps(),
-        elapsed_ms,
-        "[dflash] debug summary"
-    );
+        prefill_ns,
+        draft_ns,
+        verifier_ns,
+        round_loop_ns,
+        elapsed_ns: t_total.elapsed().as_nanos(),
+        decode_tps: window.tps(),
+    }
+    .log_done();
 
     // Report the verifier's resident KV, so a caller that sampled the verifier
     // arch around this call can attribute the figure to it. This round loop

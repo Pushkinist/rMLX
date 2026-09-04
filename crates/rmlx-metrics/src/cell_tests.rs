@@ -39,12 +39,27 @@ fn the_partition_list_is_the_cell_key_plus_metric() {
 
 // ── Deriving `decode_config` from notes ───────────────────────────────────────
 
-/// The one place the format is written, pinned against the string
-/// `scripts/spec_bench.sh` records for the same run.
+/// The one place the format is written, pinned against the string the engine
+/// logs and `scripts/spec_bench.sh` records for the same run.
 #[test]
 fn decode_config_format_is_stable() {
-    assert_eq!(decode_config("mtp", 5), "mtp/block=5");
-    assert_eq!(decode_config("dflash", 16), "dflash/block=16");
+    assert_eq!(decode_config("mtp", 5, None), "mtp/block=5");
+    assert_eq!(decode_config("dflash", 16, None), "dflash/block=16");
+}
+
+/// An adaptive arm is a different cell from the fixed arm at the same ceiling,
+/// and both are legal `decode_config` values in term order.
+#[test]
+fn adaptive_depth_is_a_separate_well_formed_cell() {
+    let adaptive = decode_config("dflash", 16, Some("accept_rate"));
+    assert_eq!(adaptive, "dflash/block=16,dflash/depth=accept_rate");
+    assert!(decode_config_is_well_formed(&adaptive), "{adaptive}");
+    assert_ne!(adaptive, decode_config("dflash", 16, None));
+    assert!(!decode_config_is_all_defaults(&adaptive), "{adaptive}");
+
+    let confidence = decode_config("mtp", 8, Some("confidence"));
+    assert_eq!(confidence, "mtp/block=8,mtp/depth=confidence");
+    assert!(decode_config_is_well_formed(&confidence), "{confidence}");
 }
 
 #[test]
@@ -120,10 +135,12 @@ fn the_shipped_decode_configurations_are_well_formed() {
         "eagle/block=5",
         "prefill_chunk=1024",
         "prefill_chunk=1024,spec/block=5",
+        "dflash/block=16,dflash/depth=accept_rate",
+        "two_model/block=5",
     ] {
         assert!(decode_config_is_well_formed(config), "{config}");
     }
-    assert!(decode_config_is_well_formed(&decode_config("mtp", 5)));
+    assert!(decode_config_is_well_formed(&decode_config("mtp", 5, None)));
 }
 
 /// The rejections that protect cell identity: a term order that would split
