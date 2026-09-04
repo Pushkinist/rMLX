@@ -360,6 +360,28 @@ fn a_healthy_stream_clears_the_repetition_control() {
     assert!(judge(&healthy, &healthy).is_none());
 }
 
+/// The subsequence ratio is taken over the shorter arm, so an arm that stopped
+/// early and matched the other's prefix scores 1.0 and says nothing about the
+/// tail it never wrote. The length guard is the only thing between that and a
+/// green gate, and this pins both halves: the denominator and the guard.
+#[test]
+fn the_ratio_is_over_the_shorter_arm_and_the_length_guard_covers_it() {
+    let plain: Vec<u32> = (0..N_TOKENS as u32).map(|t| t % 97).collect();
+
+    let truncated = &plain[..300];
+    assert!(
+        (lcs_ratio(truncated, &plain) - 1.0).abs() < 1e-9,
+        "a true prefix must score 1.0 over the shorter arm; it read {}",
+        lcs_ratio(truncated, &plain)
+    );
+    let failure = judge(truncated, &plain).expect("the length guard must refuse it");
+    assert!(failure.contains("stopped well before"), "{failure}");
+
+    // Just inside the guard the same shape scores 1.0 and passes, which is what
+    // makes the guard — not the ratio — the thing doing the work above.
+    assert!(judge(&plain[..350], &plain).is_none());
+}
+
 /// A run that stopped short is refused rather than passed on its short prefix.
 #[test]
 fn a_truncated_run_is_refused_rather_than_judged() {

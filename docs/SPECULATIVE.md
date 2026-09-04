@@ -743,10 +743,18 @@ as a row from another. The line carries the raw counters (`rounds`, `emitted`,
 `verify_ms_per_round`, `loop_ms_per_round`) and the `decode_config` naming the
 cell the request's rows belong to.
 
-`tokens_per_round` is the figure a speculative result is read with: accepted
-drafts plus the verifier's own token. `1 + accept_rate × (block − 1)` recovers
-it only while every round drafts the configured block — DFlash's does not, and
-never has — so it is recorded rather than derived at read time.
+`tokens_per_round` is the figure a speculative result is read with: the tokens
+the **rounds** produced, per round — accepted drafts plus the verifier's own
+token. `1 + accept_rate × (block − 1)` recovers it only while every round drafts
+the configured block — DFlash's does not, and never has — so it is recorded
+rather than derived at read time.
+
+The four sidecar loops argmax a bonus token out of the prefill forward and emit
+it before the first round; the two-model loops emit nothing outside their loop.
+That token is a product of the prefill, not of a verify round, so it is reported
+as `seed_emitted` and subtracted. Counting it would read `+1/rounds` high on
+four of six loops — about 3% at a 128-token bench — and the one figure the
+record exists to make comparable would not be.
 
 The three `*_ms_per_round` figures partition one round's wall clock:
 `round_ms` is the whole round loop, `draft_ms` and `verifier_ms` are disjoint
@@ -859,7 +867,7 @@ a block policy or an acceptance walk can trade one for the other invisibly.
 
 | Gate | Loop | Oracle | Horizon |
 |---|---|---|---|
-| `crates/rmlx-models/tests/spec_greedy_equivalence.rs` | Gemma4 assistant | longest common subsequence with plain greedy ≥ 0.70, plus a repetition-loop control on both arms | 256 tokens |
+| `crates/rmlx-models/tests/spec_greedy_equivalence.rs` | Gemma4 assistant | longest common subsequence with plain greedy ≥ 0.70 over the whole answer and ≥ 0.40 over every tail window, plus a whole-stream repetition-loop control and a length-agreement guard on both arms | 512 tokens |
 | `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs` | MTP sidecar | shared prefix ≥ half | 48 tokens |
 | `crates/rmlx-models/tests/qwen3_5_eagle3_alignment.rs` | EAGLE-3 | shared prefix ≥ half | 48 tokens |
 | `crates/rmlx-models/tests/qwen3_5_two_model_alignment.rs` | two-model | shared prefix ≥ half | 48 tokens |
@@ -869,11 +877,29 @@ a block policy or an acceptance walk can trade one for the other invisibly.
 whole block in one forward where plain decode steps one token at a time, and
 that is a different reduction order. On the most favourable case there is — a
 full-attention verifier whose rollback is an exact KV truncation — the two arms
-share 66 of 256 tokens and then differ by one word, after which both continue
+share 66 leading tokens and then differ by one word, after which both continue
 the same explanation. A gate demanding identity fails on that; a gate on the
 shared prefix fails on it too, which is why the equivalence gate is
-length-scaled. Measured on `gemma-4-e2b-it-mxfp8` + `gemma-4-E2B-it-assistant-bf16`:
-0.914 as shipped, 0.258 with one rejected draft key left in the cache.
+length-scaled and read twice — over the whole answer and over each tail window,
+because one benign flip and a divergence that begins late both land near 0.8
+overall and only the second collapses a window. Measured on
+`gemma-4-e2b-it-mxfp8` + `gemma-4-E2B-it-assistant-bf16` at 512 tokens: 0.8438
+whole / 0.6484 weakest tail as shipped, 0.3070 / 0.2093 with one rejected draft
+key left in the cache.
+
+**Longer is not better here.** Greedy decoding compounds, so the flip at token
+66 makes the two arms write different sections by token 800: the same pair reads
+0.914 at 256 tokens, 0.8438 at 512 and 0.6846 at its natural stop near 800 —
+below any floor that still refuses a broken rollback. 512 is the horizon where
+the regimes separate, not a length past which nothing goes wrong.
+
+**A real defect sits past that horizon.** Driven from `prompts/longctx_4k.json`
+instead of the gate's short prompt, the Gemma4-assistant speculative arm
+collapses into a period-8 repetition loop (`x86 is:66 is x86 is:66 is …`, cycle
+0.881 across 512 tokens) while plain greedy writes a clean summary and stops at
+200 — whole-stream LCS 0.11, first divergence at token 3. It reproduces
+identically on `main` (8ccc0593). Moving the gate onto the long prompt is the
+right thing to do once that is fixed.
 
 **A recurrent verifier is out of that gate's scope.** Its state has no sequence
 axis to truncate — it is snapshotted and replayed — and Qwen3.8-27B with its MTP

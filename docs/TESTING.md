@@ -75,16 +75,27 @@ failure as a regression.
 
 `spec_greedy_equivalence.rs` asks a different question from the three above: not
 whether the round loop keeps the verifier's state consistent for a while, but
-whether the run produces the answer the verifier produces alone, over 256
+whether the run produces the answer the verifier produces alone, over 512
 tokens. Its oracle is the longest common subsequence with plain greedy, because
 the two arms legitimately differ by a word — the verify pass scores a block in
-one forward where plain decode steps one token at a time. It **skips** unless
-the drafter is a Gemma4 assistant and the verifier carries no recurrent state:
-the floor (0.70) is calibrated on the exact-rollback regime only, where the
-shipped code reads 0.914 and a rollback leaving one rejected key reads 0.258.
-Qwen3.8-27B with its MTP sidecar reads 0.520 as shipped, which no floor
-separates from a broken rollback, so it is left to the prefix gate above rather
-than admitted under a threshold that means nothing.
+one forward where plain decode steps one token at a time. It is read over the
+whole answer (floor 0.70) and over each tail window (floor 0.40): one benign
+flip and a divergence that begins late both score near 0.8 overall, and only the
+second collapses a window. Both arms are also checked against a whole-stream
+repetition-loop control, because two arms in the same loop agree perfectly.
+
+Unlike the three above it **resolves its pair by slug** from
+`RMLX_O_MODELS_ROOT`, so `make gpu-test` runs it on a machine holding the
+snapshots and `run_gpu_tests.sh` reports a machine without them as INCOMPLETE.
+The two variables override either half.
+
+It **skips** unless the drafter is a Gemma4 assistant and the verifier carries
+no recurrent state: the floors are calibrated on the exact-rollback regime only,
+where the shipped code reads 0.8438 whole / 0.6484 weakest tail and a rollback
+leaving one rejected key reads 0.3070 / 0.2093. Qwen3.8-27B with its MTP sidecar
+reads 0.520 as shipped at 256 tokens, which no floor separates from a broken
+rollback, so it is left to the prefix gate above rather than admitted under a
+threshold that means nothing.
 
 `dflash_drafter_alignment.rs` is **not** one of those three and does not gate the
 same property. It asserts that the drafter's round-0 first-block proposal aligns
