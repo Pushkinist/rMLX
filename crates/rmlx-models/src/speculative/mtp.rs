@@ -157,10 +157,10 @@ impl MtpDrafter {
     /// grown — but that is a fill the caller's accounting did not predict, and
     /// silently skipping it lets a slot-vs-position gap open one step at a time
     /// and show up only as a quietly decaying accept rate. Say so.
-    pub fn truncate_to(&mut self, target: i32) {
+    pub fn truncate_to(&mut self, target: i32) -> Result<()> {
         for c in &mut self.caches {
             if c.offset() >= target {
-                c.truncate_to(target);
+                c.truncate_to(target)?;
             } else {
                 tracing::warn!(
                     target_positions = target,
@@ -170,6 +170,7 @@ impl MtpDrafter {
                 );
             }
         }
+        Ok(())
     }
 
     /// Project one `(token_embed, hidden)` pair through the `fc` + pre-fc norms.
@@ -889,7 +890,7 @@ pub fn mtp_generate_greedy(
         // above). Keeping only `accept` would drop the last accepted draft's KV
         // every round, silently degrading draft accept-rate.
         let d_target = draft_start + accept as i32 + 1;
-        drafter.truncate_to(d_target);
+        drafter.truncate_to(d_target)?;
 
         // Next-round conditioning: the verifier hidden at the newly accepted
         // bonus slot (= position `accept` of the captured penultimate hidden).

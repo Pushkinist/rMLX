@@ -127,6 +127,11 @@ mod v_mirror_alloc_tests;
 #[path = "rotor_qjl_store_gate_tests.rs"]
 mod rotor_qjl_store_gate_tests;
 
+// `truncate_to` reaches exactly the targets `can_truncate_to` promises.
+#[cfg(test)]
+#[path = "rollback_tests.rs"]
+mod rollback_tests;
+
 pub use core::KvCache;
 pub use fused_qk_dispatch::fused_qk_total_dispatch_count;
 pub use shared_kv::SharedKv;

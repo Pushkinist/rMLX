@@ -4002,7 +4002,12 @@ impl KvCache {
     /// For quantised paths (K8V4/K8V8/Planar) the decode_fp16 buffers
     /// are the warm-TTFT seed; the quantised storage's
     /// `shape[2]` is also lowered to `n` via `storage.truncate_to`.
-    pub fn truncate_to(&mut self, n: i32) {
+    ///
+    /// Fails when the cache cannot reach `n` without losing a position it
+    /// would still have to serve — an SWA ring left in rotated order past its
+    /// wrap. [`Self::can_truncate_to`] is the predicate, and a caller that has
+    /// another way to reach the state (re-prefill) should ask it first.
+    pub fn truncate_to(&mut self, n: i32) -> Result<()> {
         debug_assert!(
             n <= self.offset,
             "KvCache::truncate_to: n={n} > offset={}",
@@ -4024,19 +4029,18 @@ impl KvCache {
             );
             shadow.truncate_to(n);
         }
-        // Port mlx-lm `RotatingKVCache.trim` semantics (cache.py:542-549).
-        // mlx-lm's `trim_prompt_cache(cache, num)` decrements offset/idx
-        // losslessly when `is_trimmable` (offset < max_size); otherwise
-        // silently returns 0 (cache.py:109-111). Speculative decoding
-        // tolerates this — the Gemma 31b spec test in mlx-lm relies on it.
         if let Some(ref mut rot) = self.rotating {
             let delta = self.offset - n;
-            let _trimmed = rot.trim_lossless(delta);
-            // Mirror rot's offset back onto KvCache.offset. If `trimmed == 0`
-            // (post-rotation), `rot.offset` is unchanged and KvCache.offset
-            // must stay where it was — matches mlx-lm's no-op behaviour.
+            if !rot.roll_back(delta)? {
+                return Err(Error::Mlx(format!(
+                    "KvCache::truncate_to: layer {} is a sliding-window ring that has \
+                     wrapped and is not in temporal order, so rolling it back {delta} \
+                     positions from {} would drop keys it still has to serve",
+                    self.layer_idx, self.offset,
+                )));
+            }
             self.offset = rot.offset;
-            return;
+            return Ok(());
         }
         self.storage.truncate_to(n);
         self.offset = n;
@@ -4047,6 +4051,7 @@ impl KvCache {
         if self.flash_filled > n {
             self.flash_filled = n;
         }
+        Ok(())
     }
 
     /// Force evaluation of any pending MLX lazy operations in the KV buffers.

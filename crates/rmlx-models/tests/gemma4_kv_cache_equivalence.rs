@@ -413,13 +413,14 @@ fn gemma4_partial_prefix_reuse_cold_equal() {
         let first_shared = n_layers - model.cfg.num_kv_shared_layers;
         for c in &cloned[..first_shared] {
             assert!(
-                c.is_trimmable(),
-                "own-KV SWA cache not trimmable — test prompt exceeded sliding_window"
+                c.can_truncate_to(prefix_len as i32),
+                "own-KV SWA cache not rollable — test prompt exceeded sliding_window"
             );
         }
         for (i, c) in cloned.iter_mut().enumerate() {
             if c.offset() > 0 {
-                c.truncate_to(prefix_len as i32);
+                c.truncate_to(prefix_len as i32)
+                    .expect("every layer reported the prefix reachable above");
             }
             if i < first_shared {
                 assert_eq!(

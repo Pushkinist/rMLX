@@ -486,9 +486,9 @@ impl SpeculativeDispatcher {
         // whatever codec it is handed — the branch is `window > 0` alone
         // (`KvCache::with_quant_max_seq_window`), so an SWA layer here is bf16
         // at `sliding_window` tokens under every `kv_quant`, and only the
-        // full-attention layers quantize. Rollback below calls `truncate_to`
-        // on every layer without consulting `is_trimmable()`, which a rotating
-        // layer only satisfies until it wraps.
+        // full-attention layers quantize. A block-verify write leaves that ring
+        // holding its window plus the block, which is what lets the rollback
+        // below drop the rejected tail out of it losslessly.
         let mut verifier_caches: Vec<KvCache> = (0..self.verifier.num_hidden_layers())
             .map(|i| {
                 let window = self.verifier.layer_sliding_window(i);
@@ -1527,8 +1527,7 @@ fn rollback_round_caches(
     device: Device,
 ) -> Result<()> {
     let Some((lin, snapshot)) = lin.zip(snapshot).filter(|(l, _)| !l.is_empty()) else {
-        truncate_kv_to(kv, target_offset);
-        return Ok(());
+        return truncate_kv_to(kv, target_offset);
     };
 
     let kept = (target_offset - pre_round_offset).max(0) as usize;
@@ -1542,7 +1541,7 @@ fn rollback_round_caches(
         )));
     }
 
-    truncate_kv_to(kv, pre_round_offset);
+    truncate_kv_to(kv, pre_round_offset)?;
     for (c, snap) in lin.iter_mut().zip(snapshot) {
         c.restore_snapshot(snap);
     }
@@ -1559,12 +1558,18 @@ fn rollback_round_caches(
 ///
 /// A GDN layer's KvCache never advances past 0, so an unguarded truncate would
 /// set it to a positive offset over an empty store.
-fn truncate_kv_to(kv: &mut [KvCache], n: i32) {
+///
+/// A layer that cannot reach `n` stops the round rather than being left behind
+/// the rest of the stack: an SWA ring that silently kept the rejected drafts
+/// while the full-attention layers dropped them is how a speculative arm stops
+/// reproducing plain greedy at long context.
+fn truncate_kv_to(kv: &mut [KvCache], n: i32) -> Result<()> {
     for c in kv.iter_mut() {
         if c.offset() >= n {
-            c.truncate_to(n);
+            c.truncate_to(n)?;
         }
     }
+    Ok(())
 }
 
 /// Run `n` greedy decode steps through `model` with persistent `caches`.

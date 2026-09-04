@@ -46,7 +46,10 @@ fn can_truncate_when_no_swa_wrap() {
         KvCache::with_quant_max_seq_window(KvQuant::K8V4, 8192, Some(1024)), // SWA
     ];
     for c in &kv {
-        assert!(c.is_trimmable(), "fresh cache (offset 0) must be trimmable");
+        assert!(
+            c.can_truncate_to(0),
+            "fresh cache (offset 0) must be rollable"
+        );
     }
     let e = entry_with(kv, (0..512u32).collect());
     assert!(

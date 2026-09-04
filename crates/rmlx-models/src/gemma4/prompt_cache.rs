@@ -74,19 +74,21 @@ impl Gemma4Entry {
     /// lossless on EVERY layer cache (mlx-lm `can_trim_prompt_cache`:
     /// `all(c.is_trimmable())`, `cache.py:88-92`).
     ///
-    /// Gemma4 has SWA layers backed by a `RotatingKvCache`. Once that ring
-    /// buffer wraps (cached prompt longer than `sliding_window`) it is no
-    /// longer trimmable — `truncate_kv_to_block` would silently no-op on the
-    /// SWA layers while truncating the full-attention layers, desyncing the
-    /// caches and corrupting the re-prefilled tail (this was the original
-    /// broken gemma4 Prefix path: longctx 22 -> 0 tokens). When this returns
-    /// `false` the caller MUST fall back to a full re-prefill (Miss).
+    /// Gemma4 has SWA layers backed by a `RotatingKvCache`. A ring that has
+    /// wrapped can only be rolled back while it still holds the window the
+    /// shorter prefix attends over, and a cached prompt long enough to wrap it
+    /// never does over a whole block. `truncate_kv_to_block` would then fail on
+    /// the SWA layers after truncating the full-attention ones, desyncing the
+    /// caches (this was the original broken gemma4 Prefix path: longctx
+    /// 22 -> 0 tokens). When this returns `false` the caller MUST fall back to
+    /// a full re-prefill (Miss).
     pub(crate) fn can_truncate_to_block(&self, block_count: usize) -> bool {
         debug_assert!(
             block_count >= 1,
             "block_count must be >= 1 for a prefix hit"
         );
-        self.kv_caches.iter().all(KvCache::is_trimmable)
+        let target = (block_count * BLOCK_TOKENS) as i32;
+        self.kv_caches.iter().all(|c| c.can_truncate_to(target))
     }
 
     /// True iff this entry's full token sequence is a STRICT prefix of
@@ -124,8 +126,8 @@ impl Gemma4Entry {
     /// records them geometry-only, see `block_io::write_layer`). Reusing such a
     /// hydrated entry via a prefix arm would re-prefill only the tail on top of
     /// an empty SWA prefix, giving the SWA layers the wrong attention context
-    /// and corrupting the output. `KvCache::is_trimmable()` returns `true` for a
-    /// `None` layer, so it is the wrong predicate to detect this.
+    /// and corrupting the output. `KvCache::can_truncate_to()` returns `true`
+    /// for a `None` layer, so it is the wrong predicate to detect this.
     ///
     /// A layer is payload-less when its storage is `None` AND it carries no
     /// off-storage bf16 seed. This distinguishes a dropped SWA ring (no seed →
@@ -266,7 +268,7 @@ impl PromptCacheEntry for Gemma4Entry {
                 // (`offset() == 0`) are skipped by `truncate_kv_to`, so they are
                 // excluded from the check.
                 let mut cloned = self.deep_clone()?;
-                cloned.truncate_kv_to_block(effective_blocks);
+                cloned.truncate_kv_to_block(effective_blocks)?;
                 debug_assert!(
                     {
                         let expected = (effective_blocks * BLOCK_TOKENS) as i32;

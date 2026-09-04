@@ -23,7 +23,8 @@
 //! `PromptCacheEntry` exposes:
 //! - `prompt_token_ids() -> &[u32]` — key for prefix matching.
 //! - `deep_clone() -> Result<Self>` — cheap refcount clone of MLX arrays.
-//! - `truncate_kv_to(prefix_len: usize)` — trim KV caches to prefix length.
+//! - `truncate_kv_to(prefix_len: usize) -> Result<()>` — trim KV caches to
+//!   prefix length.
 //! - `kv_bytes() -> u64` — RAM estimate for eviction budget.
 //!
 //! ## Stats
@@ -340,21 +341,25 @@ pub(crate) trait PromptCacheEntry: Sized {
     ///
     /// Called on a cloned entry before re-prefilling the tail. The default
     /// body trims only the KV caches (`offset() > 0` guard skips never-filled
-    /// layers). The recurrent GDN [`lin_caches`] are deliberately NOT reachable
+    /// layers). It fails when a layer cannot reach `prefix_len` without losing
+    /// state it still has to serve — a wrapped SWA ring. Callers gate on
+    /// `KvCache::can_truncate_to` and degrade to a re-prefill, so the failure
+    /// path here is the gate having gone out of step with the caches. The recurrent GDN [`lin_caches`] are deliberately NOT reachable
     /// from this default — that "never truncate linear state" invariant is now
     /// structural: linear state is re-run on the tail, never sliced. Override
     /// only for a mock or a genuinely different per-arch policy.
     ///
     /// [`lin_caches`]: PromptCacheEntry::lin_caches
-    fn truncate_kv_to(&mut self, prefix_len: usize) {
+    fn truncate_kv_to(&mut self, prefix_len: usize) -> Result<()> {
         for kv in self.kv_caches_mut() {
             if kv.offset() > 0 {
-                kv.truncate_to(prefix_len as i32);
+                kv.truncate_to(prefix_len as i32)?;
             }
         }
         // lin caches deliberately untouched: recurrent GDN state is re-run on
         // the tail, never truncated. Structural now — the default body cannot
         // reach them.
+        Ok(())
     }
 
     /// Block-aligned truncation: trim KV caches to `block_count` full blocks.
@@ -365,8 +370,8 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// (every layer cache trimmable — no wrapped-SWA desync). Qwen3.5-MoE never
     /// calls it: its recurrent GDN `lin_caches` cannot be reconstructed from a
     /// block-truncated KV, so MoE is gated to full-token-equality (Exact) reuse.
-    fn truncate_kv_to_block(&mut self, block_count: usize) {
-        self.truncate_kv_to(block_count * BLOCK_TOKENS);
+    fn truncate_kv_to_block(&mut self, block_count: usize) -> Result<()> {
+        self.truncate_kv_to(block_count * BLOCK_TOKENS)
     }
 
     /// Approximate RAM held by this entry's KV/recurrent state, in bytes.
