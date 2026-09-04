@@ -897,9 +897,9 @@ the regimes separate, not a length past which nothing goes wrong.
 **A real defect sits past that horizon — issue #506.** Driven from
 `prompts/longctx_4k.json` instead of the gate's short prompt, the
 Gemma4-assistant speculative arm collapses into a period-8 repetition loop
-(`x86 is:66 is x86 is:66 is …`, cycle 0.881 across 512 tokens) while plain
-greedy writes a clean summary and stops at 200 — whole-stream LCS 0.11, first
-divergence at token 3. It reproduces identically on `main` (8ccc0593). The Qwen
+(`x86 is:66 is x86 is:66 is …`, filling its window from token 128 on) while
+plain greedy writes a clean summary and stops at 200 — whole-stream LCS 0.11,
+first divergence at token 3. It reproduces identically on `main` (8ccc0593). The Qwen
 MTP sidecar's 0.520 above is the same issue's second case.
 `speculative_greedy_reproduces_plain_greedy_at_long_context` is that run as an
 `#[ignore]`d reproducer and **fails until #506 is fixed**; fixing it is what

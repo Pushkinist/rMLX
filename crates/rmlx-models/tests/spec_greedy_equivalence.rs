@@ -55,14 +55,19 @@
 //! | a twelve-token phrase over four fifths | 0.0000 | 0.7960 | 0.7960 |
 //!
 //! A leading-run measure scores every one of the last two at zero. Real prose
-//! from both arms is measured in the run line the gate prints.
+//! from both arms reads 0.0909 (period 62) and 0.0841 (period 21) under the
+//! same widened, windowed sweep — 5.5x under the ceiling, which is what says
+//! the widening does not fire on real output. The controls run before the
+//! length and subsequence checks: a collapse is a more specific verdict than a
+//! short run, and it can be what cut the run short.
 //!
 //! **Known gap: this gate runs at a short context and there is a defect past
 //! it.** `speculative_greedy_reproduces_plain_greedy_at_long_context` is the
 //! same gate over the 4k document in `prompts/longctx_4k.json` and it **fails
 //! today**: the speculative arm collapses into a period-8 repetition loop
 //! (`x86 is:66 is x86 is:66 is …`) while plain greedy writes a clean summary and
-//! stops at 200 — whole-stream LCS 0.11, first divergence at token 3. It
+//! stops at 200 — whole-stream LCS 0.11, first divergence at token 3, and the
+//! collapsed window reading 1.0000 at period 8 from token 128. It
 //! reproduces identically on `main` (8ccc0593), so it is not this branch's. It
 //! is filed, with the Qwen MTP sidecar's 0.520 as a second case, and it is a
 //! reproducer rather than a paragraph so that fixing it is what moves this gate
@@ -257,6 +262,20 @@ fn weakest_tail(spec: &[u32], plain: &[u32]) -> (usize, f64) {
 fn judge(spec: &[u32], plain: &[u32]) -> Option<String> {
     let shorter = spec.len().min(plain.len());
     let longer = spec.len().max(plain.len());
+
+    // The controls first. A degenerate arm is a more specific verdict than a
+    // short one, and a collapse can be what cut the run short.
+    for (name, arm) in [("plain", plain), ("speculative", spec)] {
+        let (start, period, fraction) = strongest_windowed_cycle(arm);
+        if fraction > MAX_CYCLE_FRACTION {
+            return Some(format!(
+                "the {name} arm repeats at period {period} across {fraction:.4} of its \
+                 tokens from {start} on (ceiling {MAX_CYCLE_FRACTION}) — it has collapsed \
+                 into a repetition loop, so agreement between the arms would say nothing"
+            ));
+        }
+    }
+
     if shorter < MIN_ANSWER_TOKENS {
         return Some(format!(
             "an arm stopped early — spec={} plain={}, under {MIN_ANSWER_TOKENS}; a short \
@@ -275,17 +294,6 @@ fn judge(spec: &[u32], plain: &[u32]) -> Option<String> {
             spec.len(),
             plain.len()
         ));
-    }
-
-    for (name, arm) in [("plain", plain), ("speculative", spec)] {
-        let (start, period, fraction) = strongest_windowed_cycle(arm);
-        if fraction > MAX_CYCLE_FRACTION {
-            return Some(format!(
-                "the {name} arm repeats at period {period} across {fraction:.4} of its \
-                 tokens from {start} on (ceiling {MAX_CYCLE_FRACTION}) — it has collapsed \
-                 into a repetition loop, so agreement between the arms would say nothing"
-            ));
-        }
     }
 
     let ratio = lcs_ratio(spec, plain);
@@ -508,6 +516,45 @@ fn the_gate_admits_the_shipped_regime_and_refuses_the_broken_one() {
         .collect();
     let failure = judge(&broken, &plain).expect("broken must fail");
     assert!(failure.contains("did not reproduce"), "{failure}");
+}
+
+/// The field that separates two drafters the arch check cannot.
+///
+/// Both `-e2b-` and `-e4b-` assistants declare `Gemma4AssistantForCausalLM`, so
+/// the golden harness's stand-down passes either against either verifier. This
+/// is what the gate reads instead, and it has to read the number rather than
+/// merely find the file.
+#[test]
+fn the_drafter_declares_the_backbone_it_projects_into() {
+    let dir = std::env::temp_dir().join(format!("rmlx_spec_equiv_backbone_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"model_type":"gemma4_assistant","architectures":["Gemma4AssistantForCausalLM"],"backbone_hidden_size":1536}"#,
+    )
+    .expect("write config");
+    assert!(is_gemma4_assistant(&dir));
+    assert_eq!(drafter_backbone_hidden(&dir), Some(1536));
+
+    // The e4b assistant is the same architecture and a different backbone.
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"model_type":"gemma4_assistant","architectures":["Gemma4AssistantForCausalLM"],"backbone_hidden_size":2560}"#,
+    )
+    .expect("write config");
+    assert!(is_gemma4_assistant(&dir), "still the same architecture");
+    assert_eq!(drafter_backbone_hidden(&dir), Some(2560));
+
+    // A snapshot that does not say is not a pair this gate can judge.
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"model_type":"gemma4_assistant","architectures":["Gemma4AssistantForCausalLM"]}"#,
+    )
+    .expect("write config");
+    assert_eq!(drafter_backbone_hidden(&dir), None);
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ── The gate ─────────────────────────────────────────────────────────────────

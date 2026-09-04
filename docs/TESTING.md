@@ -81,8 +81,12 @@ the two arms legitimately differ by a word — the verify pass scores a block in
 one forward where plain decode steps one token at a time. It is read over the
 whole answer (floor 0.70) and over each tail window (floor 0.40): one benign
 flip and a divergence that begins late both score near 0.8 overall, and only the
-second collapses a window. Both arms are also checked against a whole-stream
-repetition-loop control, because two arms in the same loop agree perfectly.
+second collapses a window. Both arms are also checked for a repetition
+loop — over the whole stream and over each tail cut, at every period up to 64 —
+because two arms in the same loop agree perfectly, and a collapse confined to
+the last two fifths (0.3992) or a repeated twelve-token phrase (0.0000 at any
+shorter period) both score under the ceiling on a whole-stream short-period
+sweep. Real prose from both arms reads about 0.09.
 
 Unlike the three above it **resolves its pair by slug** from
 `RMLX_O_MODELS_ROOT`, so `make gpu-test` runs it on a machine holding the
