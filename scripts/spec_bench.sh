@@ -408,7 +408,6 @@ emit_and_ingest() {
         BENCH_TEMPERATURE="${TEMPERATURE}" \
         BENCH_SEED="${SEED}" \
         BENCH_DRAFT_KIND="${DRAFT_KIND}" \
-        BENCH_DRAFT_BLOCK_SIZE="${DRAFT_BLOCK_SIZE}" \
         BENCH_TAG="${BENCH_TAG}" \
         BENCH_PROMPT_CONTENT="${PROMPT_CONTENT}" \
         BENCH_PROMPT_NAME="${PROMPT_NAME}" \
