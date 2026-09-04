@@ -28,15 +28,15 @@ use crate::KvQuant;
 /// turbo3 kernel). Distinct from `"k8vturbo3"` (asymmetric K8V turbo3) and
 /// from [`TURBOSYM4_LAYOUT_TAG`] (4-bit symmetric) so the SSD reader can
 /// dispatch to the correct symmetric 3-bit hydrate path. Format
-/// `"<codec>_wht_<k_bits>_<v_bits>"`.
-pub const TURBOSYM3_LAYOUT_TAG: &str = "tsym3_wht_3_3";
+/// `"<codec>_lloyd_<k_bits>_<v_bits>"`.
+pub const TURBOSYM3_LAYOUT_TAG: &str = "tsym3_lloyd_3_3";
 
 /// Layout tag for symmetric TurboQuant 4-bit K + tq4 V.
 ///
 /// Single source of truth for the SSD geometry tag (used by `KvBlockWriter` /
 /// `KvBlockReader` and the layout-key tier). Format
-/// `"<codec>_wht_<k_bits>_<v_bits>"`.
-pub const TURBOSYM4_LAYOUT_TAG: &str = "tsym4_wht_4_4";
+/// `"<codec>_lloyd_<k_bits>_<v_bits>"`.
+pub const TURBOSYM4_LAYOUT_TAG: &str = "tsym4_lloyd_4_4";
 
 /// Layout tag for K-axis PlanarQuant 4-bit.
 ///
@@ -585,7 +585,7 @@ impl KvStorage {
                 v: None,
                 max_seq,
             },
-            // TurboSym3 — symmetric WHT-3 K+V. Never routes through
+            // TurboSym3 — symmetric 3-bit Lloyd-Max K+V. Never routes through
             // the paged path: PagedKStorage is q8-only and there is no paged
             // TurboQuant-K3 variant. Deviation documented in docs/KV_QUANT.md.
             KvQuant::TurboSym3 => Self::TurboSym3 {
@@ -593,7 +593,7 @@ impl KvStorage {
                 v: None,
                 max_seq,
             },
-            // TurboSym4 — symmetric WHT-4 K+V. Never routes through
+            // TurboSym4 — symmetric 4-bit Lloyd-Max K+V. Never routes through
             // the paged path: PagedKStorage is q8-only and adding a TurboQuant-K
             // paged variant is out of scope; deviation documented in
             // docs/KV_QUANT.md.

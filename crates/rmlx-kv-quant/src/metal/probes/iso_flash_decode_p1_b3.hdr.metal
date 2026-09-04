@@ -24,15 +24,61 @@ constant float ISO_CB[8] = {
     as_type<float>(0x4009B977u)
 };
 
+// Dense code plane — codes packed LSB-first across a row's groups, the row
+// padded to a whole u32. Mirrors crate::code_plane.
+#define CP_BITS 3u
+#define CP_MASK 0x7u
+#define CP_CODES_PER_GROUP 4u
+
+// u32 words one row of `n_groups` groups occupies.
+inline uint cp_row_words(uint n_groups) {
+    return (n_groups * CP_CODES_PER_GROUP * CP_BITS + 31u) / 32u;
+}
+
+// Read code `idx` of the row whose first word is `codes[row_base]`.
+//
+// Templated over the address space because MLX binds a small input buffer as
+// `constant` and a large one as `device`, and MSL will not convert between the
+// two: a single-address-space reader compiles for one dispatch shape and fails
+// the other at JIT time.
+template <typename P>
+inline uint cp_read_code(P codes, uint row_base, uint idx) {
+    uint bit  = idx * CP_BITS;
+    uint word = row_base + (bit >> 5u);
+    uint off  = bit & 31u;
+    uint v    = codes[word] >> off;
+    if (off + CP_BITS > 32u) {
+        v |= codes[word + 1u] << (32u - off);
+    }
+    return v & CP_MASK;
+}
+
+// OR code `idx` into the row whose first word is `codes[row_base]`. The plane
+// is zero-initialised at dispatch, so an OR is a write; a code that straddles
+// two words ORs into both.
+inline void cp_write_code(device uint* codes, uint row_base, uint idx, uint code) {
+    uint bit  = idx * CP_BITS;
+    uint word = row_base + (bit >> 5u);
+    uint off  = bit & 31u;
+    uint v    = code & CP_MASK;
+    atomic_fetch_or_explicit((device atomic_uint *)&codes[word], v << off,
+                             memory_order_relaxed);
+    if (off + CP_BITS > 32u) {
+        atomic_fetch_or_explicit((device atomic_uint *)&codes[word + 1u],
+                                 v >> (32u - off), memory_order_relaxed);
+    }
+}
+
 // Decode one head-dim lane of an iso-quantized token.
 //
 // `tok_idx` indexes the flat sequence-major token stream
 // (`(b * kv_seq + t) * kv_h + kv_h_idx`); `lane` is the head-dim slot
 // in [0, head_dim). Bit-exact with the CPU iso_decode_fast.
 //
-// Self-contained per lane: the group's four codes all live in one u32,
-// so the Hamilton product runs in registers with no threadgroup
-// staging and no barrier — callable from any kernel body.
+// Self-contained per lane: the group's four codes are four reads of
+// the row's code plane, so the Hamilton product runs in registers
+// with no threadgroup staging and no barrier — callable from any
+// kernel body.
 //
 // Shared surface: a quantized-V flash kernel calls this unchanged,
 // passing the V store's (codes, scales, norms) instead of K's.
@@ -47,14 +93,16 @@ inline float if_decode_k_lane(
     uint group_id_in_head = lane / 4u;
     uint lane_in_group    = lane - group_id_in_head * 4u;
 
-    uint  word    = codes[tok_idx * n_groups + group_id_in_head];
     float k_scale = scales[tok_idx * n_groups + group_id_in_head];
 
-    // Unpack the group's 4 IF_BITS-bit codes -> centroid x scale.
-    float rw = ISO_CB[(word >> (0u * IF_BITS)) & IF_MASK] * k_scale;
-    float rx = ISO_CB[(word >> (1u * IF_BITS)) & IF_MASK] * k_scale;
-    float ry = ISO_CB[(word >> (2u * IF_BITS)) & IF_MASK] * k_scale;
-    float rz = ISO_CB[(word >> (3u * IF_BITS)) & IF_MASK] * k_scale;
+    // Read the group's 4 codes out of the row's dense plane ->
+    // centroid x scale.
+    uint row_base  = tok_idx * cp_row_words(n_groups);
+    uint code_base = group_id_in_head * CP_CODES_PER_GROUP;
+    float rw = ISO_CB[cp_read_code(codes, row_base, code_base + 0u)] * k_scale;
+    float rx = ISO_CB[cp_read_code(codes, row_base, code_base + 1u)] * k_scale;
+    float ry = ISO_CB[cp_read_code(codes, row_base, code_base + 2u)] * k_scale;
+    float rz = ISO_CB[cp_read_code(codes, row_base, code_base + 3u)] * k_scale;
 
     // Inverse rotation: r' = qbar * r, Hamilton product in the
     // [w, x, y, z] convention. qbar = (ISO_QW, ISO_QCX, ISO_QCY,

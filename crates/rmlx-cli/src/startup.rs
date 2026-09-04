@@ -197,6 +197,7 @@ pub(crate) fn rotate_logs(dir: &std::path::Path, cap_mb: u64) {
     reason = "wildcard arm is the correct fallthrough for unsupported variants; exhaustive expansion would require updating on every new variant"
 )]
 pub(crate) fn print_cache_type_table() {
+    use rmlx_kv_quant::code_plane::row_words;
     use rmlx_kv_quant::storage::ring_bits_per_value;
     use rmlx_models::kv_cache::CacheType;
     // Header.
@@ -238,7 +239,7 @@ pub(crate) fn print_cache_type_table() {
             CacheType::IsoK4 => "IsoQuant K-rotation (4-bit)",
             CacheType::RotorK3 => "Clifford rotor K-side (3-bit)",
             CacheType::RotorK4 => "Clifford rotor K-side (4-bit)",
-            // Symmetric WHT-3 K+V.
+            // Symmetric 3-bit Lloyd-Max K+V.
             CacheType::TurboSym3 => "TurboQuant sym K+V (3-bit)",
         };
         let bits = match ct.bits() {
@@ -290,35 +291,43 @@ pub(crate) fn print_cache_type_table() {
             sides,
         );
     }
-    // The nominal width in a rotation codec's name is its codebook, not what
-    // the store spends. The iso and rotor tags decode from a shared GPU ring
-    // that costs one whole u32 code word plus one sideband scale per group
-    // whatever the codebook width, so a 3-bit and a 4-bit member of the same
-    // family occupy byte-identical space; planar spends an f32 per PAIR and is
-    // wider than either. The two ring figures are computed from the ring's own
-    // `ring_bits_per_value`, the single producer of a stored-rate figure, so
-    // narrowing the sideband moves this listing without anyone editing it.
-    // Said here because this listing is where the tags are chosen.
+    // The iso and rotor tags decode from a shared GPU ring: the row's dense
+    // code plane, one sideband scale per group, one norm per row. The figures
+    // are computed from the ring's own `ring_bits_per_value`, the single
+    // producer of a stored-rate figure, so a change to either plane moves this
+    // listing without anyone editing it. Said here because this listing is
+    // where the tags are chosen.
     let head_dim: u64 = 128;
-    let iso_rate = ring_bits_per_value(head_dim, head_dim / 4);
-    let rotor_rate = ring_bits_per_value(head_dim, head_dim.div_ceil(3));
+    let iso_groups = head_dim / 4;
+    let rotor_groups = head_dim.div_ceil(3);
+    let rate = |groups: u64, codes: usize, bits: u8| {
+        ring_bits_per_value(
+            head_dim,
+            groups,
+            row_words(groups as usize * codes, bits) as u64,
+        )
+    };
+    let iso3 = rate(iso_groups, 4, 3);
+    let iso4 = rate(iso_groups, 4, 4);
+    let rotor3 = rate(rotor_groups, 3, 3);
+    let rotor4 = rate(rotor_groups, 3, 4);
     println!();
-    println!("note: the bit width in an iso_*/rotor_*/planar* name is its codebook, not");
-    println!("      what it stores: each spends a whole u32 code word per group (planar,");
-    println!("      per PAIR), so the 3-bit and the 4-bit member of a family are");
-    println!("      byte-identical. Stored rate at head_dim {head_dim}, against bf16's 16.00:");
-    println!("        iso_k_3/4, iso_v_3/4 on the ring    {iso_rate:6.3}  (12 + 16/head_dim)");
-    println!("        rotor_k_3/4, rotor_v_3/4            {rotor_rate:6.3}  ((48*ceil(D/3)+16)/D)");
+    println!("note: the bit width in an iso_*/rotor_*/planar* name is its codebook.");
+    println!("      Stored rate at head_dim {head_dim}, against bf16's 16.00:");
+    println!("        iso_k_3, iso_v_3 on the ring        {iso3:6.3}");
+    println!("        iso_k_4, iso_v_4 on the ring        {iso4:6.3}");
+    println!("        rotor_k_3, rotor_v_3                {rotor3:6.3}");
+    println!("        rotor_k_4, rotor_v_4                {rotor4:6.3}");
     println!("        planar3, planar4, planar_k4         22.000  (at every head_dim)");
-    println!("      Only iso is under bf16, and only because its scale and norm planes");
-    println!("      are 16 bits: a sideband change cannot fix rotor's u32-per-3-values");
-    println!("      code cadence, and planar is the widest cell on this menu.");
+    println!("      Past the code plane the per-group scale is the dominant term —");
+    println!("      4.000 bits per value for iso, 5.375 for rotor — and planar, which");
+    println!("      spends an f32 per PAIR, is the widest cell on this menu.");
     println!("      The ring is what a served request holds for iso_k_*/rotor_k_* and");
     println!("      for both axes of iso3_sym/iso4_sym/rotor3_sym/rotor4_sym. An");
     println!("      iso_v_3/iso_v_4 chosen on its own (K stays q8) builds NO packed");
     println!("      store at all and decodes from the bf16 mirror — it stores nothing");
-    println!("      and saves nothing. The rotor and planar figures are also measured");
-    println!("      from real encoder output by the crate rate gate (kv_rate_tests).");
+    println!("      and saves nothing. Every figure here is also measured from real");
+    println!("      encoder output by the crate rate gate (kv_rate_tests).");
     println!("      For which pairings actually build a store see docs/KV_QUANT.md");
     println!("      \"Codec disposition\".");
 }

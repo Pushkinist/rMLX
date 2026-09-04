@@ -254,13 +254,13 @@ valid; do not discard one on the strength of this fix.
 **Neither tier competes with `none` on throughput; the memory half of this
 claim is superseded.** When these rows were recorded the whole iso/rotor family
 stored one `u32` code word plus one **`f32`** scale per group, so no member was
-ever smaller than bf16. The ring's scale and norm planes have since been
-narrowed to `KV_SIDEBAND_DTYPE`: **iso now stores 12.125 bits/value at
-head\_dim=128 and is under bf16's 16.0**, rotor 16.25 and is still above it (see
-`docs/KV_QUANT.md` "Memory truth"). Decode is still several times `none`'s for
-every member, which is the part that has not moved. Bench them for kernel work
-and quality study; iso is now a memory candidate, neither tier is a throughput
-one.
+ever smaller than bf16. The scale and norm planes have since been narrowed to
+`KV_SIDEBAND_DTYPE` and the codes packed densely across a row's groups:
+**iso3 stores 7.125 bits/value at head\_dim=128, iso4 8.125, rotor3 8.750 and
+rotor4 9.750**, all under bf16's 16.0 (see `docs/KV_QUANT.md` "Memory truth").
+Decode is still several times `none`'s for every member, which is the part that
+has not moved. Bench them for kernel work and quality study; both tiers are
+memory candidates, neither is a throughput one.
 
 **A denser store would not rescue them either.** Post-fix marginal cost puts the
 hand-written flash-decode shell at 4–14% of MLX `sdpa_vector`'s per-byte
@@ -319,9 +319,9 @@ ratio is pushed toward 1. Read the table above instead — the win is 15.7–17.
 on Bonsai-8B and 19.5–24.1% on e2b, not 2–4%.
 
 The throughput conclusion above is unchanged and is still the binding one; the
-memory conclusion is not — iso is under bf16, and the remaining gap between the
-whole-cache ratio and the 12.125 bits/value ring rate (0.758×) is the
-boundary-layer `K8V8` promotion, not the codec. On Bonsai-8B that gap is 7.9% of
+memory conclusion is not — both families are under bf16, and the remaining gap
+between the whole-cache ratio and the ring rate is the boundary-layer `K8V8`
+promotion, not the codec. On Bonsai-8B that gap is 7.9% of
 the cache at 32k; on e2b it is zero, because `num_kv_shared_layers = 20` leaves
 no promoted layer that owns a cache. See `docs/KV_QUANT.md` §Layer-adaptive
 overrides.
@@ -1244,7 +1244,7 @@ Equivalent diagnostic emitted for `iso4_sym`, `k_iso3`, `k_iso4`. The codec smok
 ## TurboSym3 (turbo-3 K + turbo-3 V) decode-TPS anchor (2026-05-31)
 
 **Binary**: `target/release/rmlx` (debug-assertions on — ship-quality builds use release-perf, these numbers are the ceiling, not the floor).
-**Codec**: TurboSym3 (3-bit K + 3-bit V, symmetric). Both K and V sides use the same Lloyd-Max 3-bit codebook path. **No rotation is applied on either axis** — the family's name and the `_wht_` substring in its layout tag imply one that the encoder does not have; see docs/KV_QUANT.md, "The turbo family's missing rotation".
+**Codec**: TurboSym3 (3-bit K + 3-bit V, symmetric). Both K and V sides use the same Lloyd-Max 3-bit codebook path. **No rotation is applied on either axis** — the family's name implies one the encoder does not have; see docs/KV_QUANT.md, "The turbo family's missing rotation".
 **Shape**: 2-token prompt ("Hello world") + `--max-tokens 100`. Single-MLX preflight between each run. Hardware: M5 Max.
 **Protocol**: 3 measured runs per model. Mean decode TPS reported. No warmup run (short prompt; all runs included).
 

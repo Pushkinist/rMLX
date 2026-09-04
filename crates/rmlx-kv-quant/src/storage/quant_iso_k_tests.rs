@@ -509,6 +509,7 @@ fn iso_k3_single_kv_head_head_dim_512_decodes_the_same_either_chunking() {
                 sh,
                 n_groups,
                 ISO_K3_GROUP_SIZE,
+                crate::storage::iso_row_words(head_dim, 3),
                 "test",
             )
             .expect("well-formed store")

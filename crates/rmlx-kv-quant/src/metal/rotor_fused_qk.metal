@@ -15,10 +15,10 @@ uint hq        = bh % n_q_heads;
 uint kv_h_idx  = hq / heads_per_kv;
 
 // Per-token layout:
-//   codes_per_tok  = n_groups (1 u32 word per group of 8 mv components)
-//   scales_per_tok = n_groups (1 f32 per group)
+//   codes  : the dense code plane, cp_row_words(n_groups) u32 per token
+//   scales : n_groups (1 f32 per group)
 uint kv_tok         = (b * kv_h + kv_h_idx) * kv_seq + s_kv;
-uint codes_tok_off  = kv_tok * n_groups;
+uint codes_row_base = kv_tok * cp_row_words(n_groups);
 uint scales_tok_off = kv_tok * n_groups;
 
 // tid handles one head_dim element. Which group and which grade-1 lane?
@@ -34,8 +34,8 @@ q_shared[tid] = query[bh * head_dim + tid];
 // (acceptable triplication: 3 lanes per group all decode the same 8-component
 // mv → very small kernel, no SMEM staging needed, see module docs).
 
-// Read packed code word + scale + rotor for this group.
-uint word     = codes[codes_tok_off + group_id_in_head];
+// Read the scale and rotor for this group; the codes come out of the plane
+// below.
 float k_scale = scales[scales_tok_off + group_id_in_head];
 
 uint rotor_base = group_id_in_head * 4u;
@@ -44,12 +44,14 @@ float rb12      = rotors[rotor_base + 1u];
 float rb13      = rotors[rotor_base + 2u];
 float rb23      = rotors[rotor_base + 3u];
 
-// Unpack 8 BITS-bit codes → centroid × scale → mv_q[0..8].
-float mv_q[8];
-for (uint e = 0u; e < 8u; ++e) {
-    uint shift = e * RF_BITS;
-    uint idx   = (word >> shift) & RF_MASK;
-    mv_q[e]    = ROTOR_CB[idx] * k_scale;
+// Read the group's three stored codes → centroid × scale → the grade-1 slots
+// of mv_q. The other five components are algebraically zero — the sandwich
+// preserves grade — so nothing was stored for them.
+float mv_q[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+for (uint e = 0u; e < CP_CODES_PER_GROUP; ++e) {
+    uint idx     = cp_read_code(codes, codes_row_base,
+                                group_id_in_head * CP_CODES_PER_GROUP + e);
+    mv_q[e + 1u] = ROTOR_CB[idx] * k_scale;
 }
 
 // Phase 3: inverse Cl(3,0) sandwich  restored = R̃ * mv_q * R.

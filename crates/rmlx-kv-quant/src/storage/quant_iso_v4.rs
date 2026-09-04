@@ -190,7 +190,8 @@ impl QuantIsoV4 {
     /// Forwards a [`synced_iso_v_blocks`] reconciliation error.
     pub fn try_deep_clone(&self) -> Result<Self> {
         let blocks =
-            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?.into_owned();
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, Device::Gpu)?
+                .into_owned();
         Ok(Self {
             // The clone starts CPU-only: `blocks` carries the full payload, so
             // the ring re-seeds from them on the clone's first GPU append.
@@ -257,13 +258,16 @@ impl QuantIsoV4 {
                 "QuantIsoV4::gpu_append: head_dim={head_dim} yields no quaternion groups"
             )));
         }
+        let code_words =
+            crate::storage::iso_code_words_i32(head_dim, ISO4_BITS, "QuantIsoV4::gpu_append")?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
-            self.gpu
-                .seed_from_cpu(&c, &s, &n, kv_h, n_groups, prev_seq, max_seq, device)?;
+            self.gpu.seed_from_cpu(
+                &c, &s, &n, kv_h, n_groups, code_words, prev_seq, max_seq, device,
+            )?;
         }
         self.gpu.append_encoded(
-            codes, scales, norms, kv_h, n_groups, prev_seq, new_seq, max_seq, device,
+            codes, scales, norms, kv_h, n_groups, code_words, prev_seq, new_seq, max_seq, device,
         )
     }
 
@@ -316,7 +320,7 @@ impl QuantIsoV4 {
             return Ok(());
         }
         if let std::borrow::Cow::Owned(full) =
-            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, device)?
         {
             self.blocks = full;
         }
@@ -344,7 +348,8 @@ impl QuantIsoV4 {
         let mut out: Vec<f32> = Vec::with_capacity(total_elems);
 
         // Reconcile the ring-only decode tail — see [`super::QuantIsoV3::dequant`].
-        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+        let blocks =
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, Device::Gpu)?;
 
         if blocks.is_empty() {
             // Loud on a lost decode tail — see [`super::QuantIsoV3::dequant`].

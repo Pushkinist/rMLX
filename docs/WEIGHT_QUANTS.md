@@ -314,8 +314,8 @@ TurboQuant decorrelates before quantizing — that is the point of the family, a
 it is what IsoQuant, PlanarQuant and RotorQuant all do. rMLX's turbo encoder
 applies no transform on either axis at any width: §5.2 and §5.3 below are the
 whole codec, and the source contains no Hadamard or Walsh-Hadamard code. The
-`_wht_` substring in the `tsym3` / `tsym4` SSD layout tags is a geometry
-identifier for the block reader, not a description of the encoder.
+`tsym3` / `tsym4` SSD layout tags name the Lloyd-Max codebook the encoder does
+apply — `tsym3_lloyd_3_3` / `tsym4_lloyd_4_4`.
 
 What the missing transform would be worth has been measured, by a controlled
 test-side ablation around the shipped encoder

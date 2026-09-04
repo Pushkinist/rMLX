@@ -27,9 +27,8 @@
 //!
 //! # Pack format
 //!
-//! 10 × 3-bit values per u32 (30 bits used, 2 wasted). For `ISO3_GS=4`:
-//! 1 u32 per group (4 × 3 = 12 bits ≤ 30). Element `e` within a group maps to
-//! `word = e / 10`, `shift = (e % 10) * 3`. Mirrors Planar3 convention.
+//! Codes go into the dense code plane (see [`crate::code_plane`]): 3 bits per
+//! code, packed across the row's groups, the row padded to a whole u32.
 //!
 //! # Codebook source
 //!
@@ -45,6 +44,7 @@ use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 use crate::isoquant::FIXED_QUAT;
+use crate::storage::{iso_row_words, ISO3_BITS};
 use crate::storage::{sideband_to_f32_vec, to_sideband_dtype, KV_SIDEBAND_DTYPE};
 use crate::turboquant::lloyd_gaussian_codebook;
 use rmlx_core::error::Result;
@@ -57,17 +57,6 @@ use rmlx_mlx::{Array, Device, Dtype};
 /// Matches [`crate::storage::quant_iso_v::ISO3_GROUP_SIZE`].
 const ISO3_GROUP_SIZE: usize = 4;
 
-/// 3-bit values per u32 word (30 bits used, 2 wasted). Planar3 convention.
-const VALS_PER_WORD: usize = 10;
-
-/// Words per group for `ISO3_GROUP_SIZE=4`: ceil(4/10) = 1.
-const WORDS_PER_GROUP: usize = ISO3_GROUP_SIZE.div_ceil(VALS_PER_WORD);
-
-/// Public re-export of [`WORDS_PER_GROUP`] for sibling modules that size
-/// per-step GPU buffers off the iso3 codes layout (e.g. the GPU-resident mirror
-/// in `storage::quant_iso_v::QuantIsoV3::append_gpu`).
-pub const ISO3_WORDS_PER_GROUP: usize = WORDS_PER_GROUP;
-
 // ── MSL header builder ────────────────────────────────────────────────────────
 
 /// Generate the MSL header string for the iso3 kernels.
@@ -75,7 +64,7 @@ pub const ISO3_WORDS_PER_GROUP: usize = WORDS_PER_GROUP;
 /// Embeds:
 /// - The fixed golden-ratio unit quaternion components (and conjugate).
 /// - The 3-bit Lloyd-Max N(0,1) codebook (8 entries) and 7 decision boundaries.
-/// - `ISO3_CB_MAX`, `ISO3_GS` (group size), `ISO3_WPG` (words per group) constants.
+/// - `ISO3_CB_MAX`, `ISO3_GS` (group size) and the dense code plane's reader.
 ///
 /// Constants are generated at runtime so that any change to `FIXED_QUAT` or
 /// `lloyd_gaussian_codebook(3)` is automatically reflected in the MSL kernels.
@@ -178,12 +167,12 @@ fn build_msl_header_iso3() -> String {
         s,
         "\nconstant float ISO3_CB_MAX = as_type<float>(0x{cb_max_bits:08X}u);\n\
          // Quaternion-block group size (4 elements per group).\n\
-         constant uint  ISO3_GS = {ISO3_GROUP_SIZE}u;\n\
-         // 3-bit values per u32 word (10 vals, 30 bits used).\n\
-         constant uint  ISO3_VPW = {VALS_PER_WORD}u;\n\
-         // u32 words per group = ceil(ISO3_GS / ISO3_VPW) = 1 for GS=4.\n\
-         constant uint  ISO3_WPG = {WORDS_PER_GROUP}u;\n"
+         constant uint  ISO3_GS = {ISO3_GROUP_SIZE}u;\n"
     );
+    s.push_str(&crate::code_plane::render_msl_code_plane(
+        ISO3_BITS,
+        ISO3_GROUP_SIZE,
+    ));
     s
 }
 
@@ -202,7 +191,7 @@ fn build_msl_header_iso3() -> String {
 // implementation; T11e may introduce a two-pass approach if GPU time dominates.
 //
 // Outputs:
-//   codes_out  : u32 [n_tokens * n_groups * ISO3_WPG] — 3-bit codes, 10/u32
+//   codes_out  : u32 [n_tokens * iso_row_words(head_dim, ISO3_BITS)] — the dense code plane
 //   scales_out : f32 [n_tokens * n_groups]             — per-group scale
 //   norms_out  : f32 [n_tokens * n_groups]             — per-group (all same per token)
 //
@@ -215,7 +204,7 @@ const QUANTIZE_SOURCE_ISO3: &str = include_str!("metal/isoquant_quantize_iso3.me
 // Reverses the quantize kernel.
 //
 // Inputs:
-//   codes_in  : u32 [n_tokens * n_groups * ISO3_WPG]
+//   codes_in  : u32 [n_tokens * iso_row_words(head_dim, ISO3_BITS)]
 //   scales_in : f32 [n_tokens * n_groups]
 //   norms_in  : f32 [n_tokens * n_groups]  (per-group slot, same value per token)
 
@@ -274,7 +263,7 @@ fn iso3_dequant_kernel() -> Result<&'static MetalKernel> {
 /// # Returns
 ///
 /// `(codes_packed, scales, quaternions, norms)` where:
-/// - `codes_packed`: `u32 [n_tokens * n_groups * WORDS_PER_GROUP]` — 3-bit
+/// - `codes_packed`: `u32 [n_tokens * iso_row_words(head_dim, ISO3_BITS)]` — 3-bit
 ///   indices, 10 per word (Planar3 pack convention).
 /// - `scales`: `f32 [n_tokens * n_groups]` — per-group scale.
 /// - `quaternions`: `f32 [n_tokens * n_groups * 4]` — per-group unit quaternion.
@@ -336,8 +325,11 @@ pub fn iso_quantize_v3_gpu(
     invoke.add_input(&v_f32)?;
     invoke.add_input(&n_groups_arr)?;
 
-    // codes_out: u32 [total_groups * WORDS_PER_GROUP].
-    invoke.add_output_shape(&[(total_groups * WORDS_PER_GROUP) as i32], Dtype::U32)?;
+    // codes_out: the dense code plane, one row per token.
+    invoke.add_output_shape(
+        &[(n_tokens * iso_row_words(head_dim, ISO3_BITS)) as i32],
+        Dtype::U32,
+    )?;
     // scales_out: [total_groups] at the ring's stored sideband dtype, so the
     // ring append is a straight `slice_update` with no conversion on the
     // per-decode-step path.
@@ -416,7 +408,7 @@ pub fn iso_dequantize_v3_gpu(
     let n_tokens = total_groups / n_groups;
     let total_elems = n_tokens * head_dim;
 
-    let expected_codes = total_groups * WORDS_PER_GROUP;
+    let expected_codes = n_tokens * iso_row_words(n_groups * ISO3_GROUP_SIZE, ISO3_BITS);
     let codes_len: usize = codes_packed.shape().iter().map(|&d| d as usize).product();
     if codes_len != expected_codes {
         return Err(rmlx_core::error::Error::Quant(format!(
@@ -528,7 +520,7 @@ pub fn iso3_gpu_outputs_to_cpu(
         quats.extend_from_slice(&FIXED_QUAT);
     }
 
-    let expected_codes = total_groups * WORDS_PER_GROUP;
+    let expected_codes = n_tokens * iso_row_words(n_groups * ISO3_GROUP_SIZE, ISO3_BITS);
     if codes.len() != expected_codes {
         return Err(rmlx_core::error::Error::Quant(format!(
             "iso3_gpu_outputs_to_cpu: codes len {} != expected {expected_codes}",

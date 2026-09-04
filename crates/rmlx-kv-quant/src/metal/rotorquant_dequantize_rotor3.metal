@@ -8,19 +8,11 @@ uint grp   = gid % n_grp;
 float scale = scales_in[gid];
 float norm  = norms_in[gid];
 
-// ── Unpack 8 codes from 1 u32 ────────────────────────────────────────────
-uint word = codes_in[gid * ROTOR3_WPG];
-float rots[8];
-for (uint e = 0u; e < ROTOR3_MV; e++) {
-    uint shift = e * 3u;
-    uint idx   = (word >> shift) & 0x7u;
-    rots[e]    = ROTOR3_CB[idx] * scale;
-}
-
-// ── Extract grade-1 components only (zero slots discarded) ───────────────
-float c1 = rots[1];
-float c2 = rots[2];
-float c3 = rots[3];
+// ── Read the three stored grade-1 codes out of the dense plane ───────────
+uint row_base = token * cp_row_words(n_grp);
+float c1      = ROTOR3_CB[cp_read_code(codes_in, row_base, grp *CP_CODES_PER_GROUP + 0u)] * scale;
+float c2      = ROTOR3_CB[cp_read_code(codes_in, row_base, grp *CP_CODES_PER_GROUP + 1u)] * scale;
+float c3      = ROTOR3_CB[cp_read_code(codes_in, row_base, grp *CP_CODES_PER_GROUP + 2u)] * scale;
 
 // ── Load rotor and apply inverse rotation M(R)^T = M(R̃) ─────────────────
 uint r_base = grp * 4u;

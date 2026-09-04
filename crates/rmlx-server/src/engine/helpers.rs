@@ -297,7 +297,7 @@ pub(crate) fn kv_quant_label(kv: Option<rmlx_kv_quant::KvQuant>) -> String {
             kq @ (rmlx_kv_quant::KvQuant::RotorK3Asym { .. }
             | rmlx_kv_quant::KvQuant::RotorK4Asym { .. }),
         ) => return format!("{kq}"),
-        // TurboSym3 — symmetric WHT-3 K+V.
+        // TurboSym3 — symmetric 3-bit Lloyd-Max K+V.
         Some(rmlx_kv_quant::KvQuant::TurboSym3) => "tsym3",
         None => "auto",
     }

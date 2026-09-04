@@ -283,12 +283,14 @@ fn rotor_gpu_encode_block_retaining(
     let (codes_arr, scales_arr, norms_arr, n_tokens_total, n_groups) =
         rotor_gpu_encode_arrays(new_kv, new_shape, rotors, bits)?;
 
+    let head_dim = new_shape.get(3).copied().unwrap_or(0).max(0) as usize;
     let (codes, scales, norms) = crate::rotorquant_msl::rotor_gpu_outputs_to_cpu(
         &codes_arr,
         &scales_arr,
         &norms_arr,
         n_tokens_total,
         n_groups,
+        crate::rotorquant::row_words_for(head_dim, bits),
     )?;
 
     // The encode kernel emits norms **per group** (`[n_tokens * n_groups]`,
@@ -598,11 +600,12 @@ fn materialize_rotor_v3_ring_tail(vs: &mut QuantRotorV3, device: Device) -> Resu
     if !vs.gpu.is_allocated() {
         return Ok(());
     }
-    let rebuilt =
-        match crate::storage::synced_rotor_v_blocks(&vs.blocks, &vs.shape, &vs.gpu, device)? {
-            std::borrow::Cow::Owned(full) => Some(full),
-            std::borrow::Cow::Borrowed(_) => None,
-        };
+    let rebuilt = match crate::storage::synced_rotor_v_blocks(
+        &vs.blocks, &vs.shape, &vs.gpu, vs.bits, device,
+    )? {
+        std::borrow::Cow::Owned(full) => Some(full),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
     if let Some(full) = rebuilt {
         vs.blocks = full;
     }
@@ -664,11 +667,12 @@ fn materialize_rotor_v4_ring_tail(vs: &mut QuantRotorV4, device: Device) -> Resu
     if !vs.gpu.is_allocated() {
         return Ok(());
     }
-    let rebuilt =
-        match crate::storage::synced_rotor_v_blocks(&vs.blocks, &vs.shape, &vs.gpu, device)? {
-            std::borrow::Cow::Owned(full) => Some(full),
-            std::borrow::Cow::Borrowed(_) => None,
-        };
+    let rebuilt = match crate::storage::synced_rotor_v_blocks(
+        &vs.blocks, &vs.shape, &vs.gpu, vs.bits, device,
+    )? {
+        std::borrow::Cow::Owned(full) => Some(full),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
     if let Some(full) = rebuilt {
         vs.blocks = full;
     }
@@ -978,11 +982,12 @@ fn materialize_rotor_k3_ring_tail(
     if !ks.gpu.is_allocated() {
         return Ok(());
     }
-    let rebuilt =
-        match crate::storage::synced_rotor_k_blocks(&ks.blocks, &ks.shape, &ks.gpu, device)? {
-            std::borrow::Cow::Owned(full) => Some(full),
-            std::borrow::Cow::Borrowed(_) => None,
-        };
+    let rebuilt = match crate::storage::synced_rotor_k_blocks(
+        &ks.blocks, &ks.shape, &ks.gpu, ks.bits, device,
+    )? {
+        std::borrow::Cow::Owned(full) => Some(full),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
     if let Some(full) = rebuilt {
         ks.blocks = full;
     }
@@ -997,11 +1002,12 @@ fn materialize_rotor_k4_ring_tail(
     if !ks.gpu.is_allocated() {
         return Ok(());
     }
-    let rebuilt =
-        match crate::storage::synced_rotor_k_blocks(&ks.blocks, &ks.shape, &ks.gpu, device)? {
-            std::borrow::Cow::Owned(full) => Some(full),
-            std::borrow::Cow::Borrowed(_) => None,
-        };
+    let rebuilt = match crate::storage::synced_rotor_k_blocks(
+        &ks.blocks, &ks.shape, &ks.gpu, ks.bits, device,
+    )? {
+        std::borrow::Cow::Owned(full) => Some(full),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
     if let Some(full) = rebuilt {
         ks.blocks = full;
     }
@@ -2050,11 +2056,11 @@ impl KvCache {
             )),
             // K8VTurbo3 decode update — same structure as K8V4 but bits=3 on V.
             KvStorage::K8VTurbo3 { .. } => self.update_k8vturbo3(new_k, new_v, device),
-            // TurboSym3 decode update — symmetric WHT-3 K + turbo3 V.
+            // TurboSym3 decode update — symmetric 3-bit Lloyd-Max K + turbo3 V.
             // K side uses the GPU turbo3 MSL kernel; V side forced CPU
             // (same K8VTurbo3 precedent: GPU V-side dispatch regressed −2% TPS gate).
             KvStorage::TurboSym3 { .. } => self.update_tsym3(new_k, new_v, device),
-            // TurboSym4 decode update — symmetric WHT-4 K + tq4 V.
+            // TurboSym4 decode update — symmetric 4-bit Lloyd-Max K + tq4 V.
             KvStorage::TurboSym4 { .. } => self.update_tsym4(new_k, new_v, device),
             // PlanarK decode update — K is PlanarQuant 4-bit, V bf16.
             KvStorage::PlanarK { .. } => self.update_planar_k(new_k, new_v, device),
@@ -3008,7 +3014,7 @@ impl KvCache {
                 *k = Some(qk);
                 *v = Some(qv);
             }
-            // TurboSym3 — symmetric WHT-3 K + turbo3 V.
+            // TurboSym3 — symmetric 3-bit Lloyd-Max K + turbo3 V.
             // K side uses the GPU turbo3 MSL kernel (Decision B); V side forced CPU
             // (K8VTurbo3 precedent: GPU V-side dispatch regressed −2% TPS gate).
             KvQuant::TurboSym3 => {
@@ -3057,7 +3063,7 @@ impl KvCache {
                 *k = Some(qk);
                 *v = Some(qv);
             }
-            // TurboSym4 — symmetric WHT-4 K + tq4 V. Both axes are
+            // TurboSym4 — symmetric 4-bit Lloyd-Max K + tq4 V. Both axes are
             // bulk-quantized via the same MSL kernel (axis-agnostic).
             KvQuant::TurboSym4 => {
                 tracing::debug!(
@@ -5087,7 +5093,7 @@ impl KvCache {
         Ok((k_full, v_full))
     }
 
-    /// TurboSym4 decode update — symmetric WHT-4 K + tq4 V.
+    /// TurboSym4 decode update — symmetric 4-bit Lloyd-Max K + tq4 V.
     ///
     /// Mirrors `update_k8v4` but the K side uses [`QuantKTurbo4`] (TurboQuant
     /// 4-bit) instead of `QuantK` (q8_0). Both K and V dispatch through the

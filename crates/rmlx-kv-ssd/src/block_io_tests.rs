@@ -152,7 +152,7 @@ fn build_storage(
                 max_seq: 4096,
             }
         }
-        // TurboSym3 — symmetric WHT-3 K + turbo3 V (CPU-only build).
+        // TurboSym3 — symmetric 3-bit Lloyd-Max K + turbo3 V (CPU-only build).
         KvQuant::TurboSym3 => {
             use rmlx_kv_quant::storage::QuantKTurbo3;
             let kblk = turbo_quantize_v(&k_data, 3, shape).unwrap();
@@ -168,7 +168,7 @@ fn build_storage(
                 max_seq: 4096,
             }
         }
-        // TurboSym4 — symmetric WHT-4 K + tq4 V (CPU-only build).
+        // TurboSym4 — symmetric 4-bit Lloyd-Max K + tq4 V (CPU-only build).
         KvQuant::TurboSym4 => {
             use rmlx_kv_quant::turboquant::turbo_quantize_v;
             let kblk = turbo_quantize_v(&k_data, 4, shape).unwrap();

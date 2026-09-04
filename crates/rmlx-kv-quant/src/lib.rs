@@ -67,6 +67,7 @@ mod turbo_rotation_fidelity_tests;
 
 pub(crate) mod bytes;
 pub mod clifford;
+pub mod code_plane;
 pub(crate) mod flash_decode_common;
 pub(crate) mod fused_qk_common;
 pub mod iso_flash_decode_msl;

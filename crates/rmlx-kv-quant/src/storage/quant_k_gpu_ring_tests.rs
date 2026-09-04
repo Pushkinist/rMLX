@@ -41,15 +41,20 @@ fn read_u32(a: &Array) -> Vec<u32> {
 /// not need a tolerance that would also swallow a mis-strided read.
 use crate::test_utils::read_sideband_plane as read_f32;
 
-/// n_groups 2, so one sequence position with kv_h=2 is 4 code words and 2
-/// norms. Small enough to assert element-by-element.
+/// n_groups 2 and 3 code words per row, so one sequence position with kv_h=2 is
+/// 6 code words, 4 scales and 2 norms. Small enough to assert
+/// element-by-element.
 ///
-/// The ring takes `n_groups` directly — how a codec derives it from `head_dim`
-/// (rotor `ceil(D/3)`, iso `D/4`) is the codec's rule, not the ring's, so no
-/// head_dim appears here.
+/// The two counts are deliberately **different**: the code plane is dense
+/// across a row's groups, so its stride is not the scale plane's, and a test
+/// where the two coincide cannot tell a swapped stride from a correct one.
+/// How a codec derives either from `head_dim` is the codec's rule, not the
+/// ring's, so no head_dim appears here.
 const N_GROUPS: i32 = 2;
+const CODE_WORDS: i32 = 3;
 const KV_H: i32 = 2;
-const CODES_PER_STEP: usize = 4; // kv_h * n_groups = 2 * 2
+const CODES_PER_STEP: usize = 6; // kv_h * code_words = 2 * 3
+const SCALES_PER_STEP: usize = 4; // kv_h * n_groups = 2 * 2
 const NORMS_PER_STEP: usize = 2; // kv_h
 
 #[test]
@@ -78,6 +83,7 @@ fn append_then_view_round_trips_payload() {
     let codes: Vec<u32> = (0..CODES_PER_STEP as u32).collect();
     let scales: Vec<f32> = vec![0.5, 1.5, 2.5, 3.5];
     let norms: Vec<f32> = vec![7.0, 8.0];
+    assert_eq!(scales.len(), SCALES_PER_STEP);
 
     ring.append_encoded(
         &u32_arr(&codes),
@@ -85,6 +91,7 @@ fn append_then_view_round_trips_payload() {
         &f32_arr(&norms),
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         0,
         1,
         64,
@@ -112,7 +119,7 @@ fn sequential_appends_land_at_increasing_offsets() {
     // a mis-strided write shows up as a wrong element, not just a wrong length.
     for step in 0..3_u32 {
         let codes: Vec<u32> = (0..CODES_PER_STEP as u32).map(|i| step * 100 + i).collect();
-        let scales: Vec<f32> = (0..CODES_PER_STEP)
+        let scales: Vec<f32> = (0..SCALES_PER_STEP)
             .map(|i| step as f32 + i as f32)
             .collect();
         let norms: Vec<f32> = (0..NORMS_PER_STEP)
@@ -124,6 +131,7 @@ fn sequential_appends_land_at_increasing_offsets() {
             &f32_arr(&norms),
             KV_H,
             N_GROUPS,
+            CODE_WORDS,
             step as i32,
             1,
             64,
@@ -138,9 +146,17 @@ fn sequential_appends_land_at_increasing_offsets() {
         .expect("ring is live");
     let got_codes = read_u32(&c);
     assert_eq!(got_codes.len(), 3 * CODES_PER_STEP);
-    assert_eq!(got_codes[0..4], [0, 1, 2, 3], "step 0 codes");
-    assert_eq!(got_codes[4..8], [100, 101, 102, 103], "step 1 codes");
-    assert_eq!(got_codes[8..12], [200, 201, 202, 203], "step 2 codes");
+    assert_eq!(got_codes[0..6], [0, 1, 2, 3, 4, 5], "step 0 codes");
+    assert_eq!(
+        got_codes[6..12],
+        [100, 101, 102, 103, 104, 105],
+        "step 1 codes"
+    );
+    assert_eq!(
+        got_codes[12..18],
+        [200, 201, 202, 203, 204, 205],
+        "step 2 codes"
+    );
     let got_norms = read_f32(&n);
     assert_eq!(got_norms, vec![0.0, 1.0, 10.0, 11.0, 20.0, 21.0]);
 }
@@ -157,7 +173,7 @@ fn seed_from_cpu_then_append_preserves_prefix() {
     // [0, prev_seq) as zeros.
     let filled = 2_i32;
     let cpu_codes: Vec<u32> = (0..(filled as usize * CODES_PER_STEP) as u32).collect();
-    let cpu_scales: Vec<f32> = (0..filled as usize * CODES_PER_STEP)
+    let cpu_scales: Vec<f32> = (0..filled as usize * SCALES_PER_STEP)
         .map(|i| i as f32 * 0.25)
         .collect();
     let cpu_norms: Vec<f32> = (0..filled as usize * NORMS_PER_STEP)
@@ -171,6 +187,7 @@ fn seed_from_cpu_then_append_preserves_prefix() {
         &cpu_norms,
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         filled,
         64,
         Device::Gpu,
@@ -178,13 +195,14 @@ fn seed_from_cpu_then_append_preserves_prefix() {
     .expect("seed_from_cpu");
     assert!(ring.is_allocated());
 
-    let next_codes: Vec<u32> = vec![900, 901, 902, 903];
+    let next_codes: Vec<u32> = vec![900, 901, 902, 903, 904, 905];
     ring.append_encoded(
         &u32_arr(&next_codes),
         &f32_arr(&[9.0, 9.1, 9.2, 9.3]),
         &f32_arr(&[99.0, 99.1]),
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         filled,
         1,
         64,
@@ -215,11 +233,12 @@ fn seed_is_a_no_op_once_allocated() {
     }
     let mut ring = QuantKGpuRing::default();
     ring.append_encoded(
-        &u32_arr(&[1, 2, 3, 4]),
+        &u32_arr(&[1, 2, 3, 4, 5, 6]),
         &f32_arr(&[1.0, 2.0, 3.0, 4.0]),
         &f32_arr(&[5.0, 6.0]),
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         0,
         1,
         64,
@@ -230,10 +249,11 @@ fn seed_is_a_no_op_once_allocated() {
     // A second seed must not clobber the live ring.
     ring.seed_from_cpu(
         &[0; CODES_PER_STEP],
-        &[0.0; CODES_PER_STEP],
+        &[0.0; SCALES_PER_STEP],
         &[0.0; NORMS_PER_STEP],
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         1,
         64,
         Device::Gpu,
@@ -246,7 +266,7 @@ fn seed_is_a_no_op_once_allocated() {
         .expect("ring is live");
     assert_eq!(
         read_u32(&c),
-        vec![1, 2, 3, 4],
+        vec![1, 2, 3, 4, 5, 6],
         "live ring must not be reset"
     );
 }
@@ -262,7 +282,7 @@ fn growth_across_a_page_boundary_preserves_prefix() {
     let mut ring = QuantKGpuRing::default();
     let first = KV_PAGE_SIZE;
     let cpu_codes: Vec<u32> = (0..(first as usize * CODES_PER_STEP) as u32).collect();
-    let cpu_scales: Vec<f32> = vec![1.0; first as usize * CODES_PER_STEP];
+    let cpu_scales: Vec<f32> = vec![1.0; first as usize * SCALES_PER_STEP];
     let cpu_norms: Vec<f32> = vec![2.0; first as usize * NORMS_PER_STEP];
     ring.seed_from_cpu(
         &cpu_codes,
@@ -270,6 +290,7 @@ fn growth_across_a_page_boundary_preserves_prefix() {
         &cpu_norms,
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         first,
         4096,
         Device::Gpu,
@@ -278,11 +299,12 @@ fn growth_across_a_page_boundary_preserves_prefix() {
     let cap_before = ring.capacity;
 
     ring.append_encoded(
-        &u32_arr(&[7, 7, 7, 7]),
+        &u32_arr(&[7, 7, 7, 7, 7, 7]),
         &f32_arr(&[1.0, 1.0, 1.0, 1.0]),
         &f32_arr(&[3.0, 3.0]),
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         first,
         1,
         4096,
@@ -305,7 +327,11 @@ fn growth_across_a_page_boundary_preserves_prefix() {
         cpu_codes[..],
         "prefix must survive the grow-realloc"
     );
-    assert_eq!(got[cpu_codes.len()..], [7, 7, 7, 7], "post-grow append");
+    assert_eq!(
+        got[cpu_codes.len()..],
+        [7, 7, 7, 7, 7, 7],
+        "post-grow append"
+    );
 }
 
 #[test]
@@ -316,11 +342,12 @@ fn clear_drops_the_ring() {
     }
     let mut ring = QuantKGpuRing::default();
     ring.append_encoded(
-        &u32_arr(&[1, 2, 3, 4]),
+        &u32_arr(&[1, 2, 3, 4, 5, 6]),
         &f32_arr(&[1.0, 2.0, 3.0, 4.0]),
         &f32_arr(&[5.0, 6.0]),
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         0,
         1,
         64,
@@ -364,6 +391,7 @@ fn append_on_unallocated_ring_with_existing_prefix_errors() {
         &f32_arr(&[5.0, 6.0]),
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         5, // prev_seq > 0 on an unallocated ring
         1,
         64,
@@ -389,6 +417,7 @@ fn append_beyond_max_seq_errors() {
         &f32_arr(&[5.0, 6.0]),
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         8,
         1,
         8, // max_seq — prev_seq + new_seq = 9 > 8
@@ -410,6 +439,7 @@ fn chunk_length_mismatch_errors() {
         &f32_arr(&[5.0, 6.0]),
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         0,
         1,
         64,
@@ -425,11 +455,12 @@ fn chunk_length_mismatch_errors() {
 fn seed_length_mismatch_errors() {
     let mut ring = QuantKGpuRing::default();
     let err = ring.seed_from_cpu(
-        &[1, 2, 3], // not filled_seq * kv_h * n_groups
+        &[1, 2, 3], // not filled_seq * kv_h * code_words
         &[1.0, 2.0, 3.0],
         &[1.0, 2.0],
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         1,
         64,
         Device::Cpu,
@@ -471,7 +502,7 @@ fn page_round_covers_needed_and_caps_at_max() {
 #[test]
 fn appending_past_the_fill_watermark_is_refused() {
     let codes: Vec<u32> = (0..CODES_PER_STEP as u32 * 2).collect();
-    let scales: Vec<f32> = vec![0.5; CODES_PER_STEP * 2];
+    let scales: Vec<f32> = vec![0.5; SCALES_PER_STEP * 2];
     let norms: Vec<f32> = vec![7.0; NORMS_PER_STEP * 2];
 
     let mut ring = QuantKGpuRing::default();
@@ -481,6 +512,7 @@ fn appending_past_the_fill_watermark_is_refused() {
         &f32_arr(&norms),
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         0,
         2,
         64,
@@ -491,7 +523,7 @@ fn appending_past_the_fill_watermark_is_refused() {
 
     // A stale caller: its blocks reached position 4 while the ring stopped at 2.
     let one_codes: Vec<u32> = (0..CODES_PER_STEP as u32).collect();
-    let one_scales: Vec<f32> = vec![1.5; CODES_PER_STEP];
+    let one_scales: Vec<f32> = vec![1.5; SCALES_PER_STEP];
     let one_norms: Vec<f32> = vec![9.0; NORMS_PER_STEP];
     let err = ring
         .append_encoded(
@@ -500,6 +532,7 @@ fn appending_past_the_fill_watermark_is_refused() {
             &f32_arr(&one_norms),
             KV_H,
             N_GROUPS,
+            CODE_WORDS,
             4,
             1,
             64,
@@ -534,6 +567,7 @@ fn appending_past_the_fill_watermark_is_refused() {
         &f32_arr(&one_norms),
         KV_H,
         N_GROUPS,
+        CODE_WORDS,
         2,
         1,
         64,
@@ -683,17 +717,19 @@ fn ring_bits_per_value_is_what_the_allocation_holds() {
     if skip_if_no_gpu_env() {
         return;
     }
-    // iso geometry at head_dim 128: one quaternion group per 4 slots.
+    // iso3 geometry at head_dim 128: one quaternion group per 4 slots, four
+    // 3-bit codes each, packed dense across the row.
     let head_dim: u64 = 128;
     let n_groups: u64 = head_dim / 4;
+    let code_words = crate::code_plane::row_words(head_dim as usize, 3) as u64;
     let seq: u64 = 8;
     let kv_h: u64 = 1;
     let values = seq * kv_h * head_dim;
 
-    let codes: Vec<u32> = (0..(seq * kv_h * n_groups) as usize)
+    let codes: Vec<u32> = (0..(seq * kv_h * code_words) as usize)
         .map(|i| i as u32)
         .collect();
-    let scales: Vec<f32> = vec![1.0; codes.len()];
+    let scales: Vec<f32> = vec![1.0; (seq * kv_h * n_groups) as usize];
     let norms: Vec<f32> = vec![1.0; (seq * kv_h) as usize];
 
     let mut ring = QuantKGpuRing::default();
@@ -703,6 +739,7 @@ fn ring_bits_per_value_is_what_the_allocation_holds() {
         &norms,
         kv_h as i32,
         n_groups as i32,
+        code_words as i32,
         seq as i32,
         seq as i32,
         Device::Gpu,
@@ -710,7 +747,7 @@ fn ring_bits_per_value_is_what_the_allocation_holds() {
     .expect("seed the ring");
 
     let measured = (ring.byte_size() * 8) as f64 / values as f64;
-    let stated = ring_bits_per_value(head_dim, n_groups);
+    let stated = ring_bits_per_value(head_dim, n_groups, code_words);
     assert!(
         (measured - stated).abs() < 1e-9,
         "the ring holds {measured} bits per value, ring_bits_per_value states {stated}"

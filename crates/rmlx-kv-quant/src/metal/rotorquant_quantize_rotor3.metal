@@ -45,32 +45,25 @@ float R3 =
     (-2.0f * s * b13 + 2.0f * b23 * b12) * v1 + (-2.0f * s * b23 - 2.0f * b13 * b12) * v2 + (s2 - b13_2 - b23_2 + b12_2) * v3;
 
 // ── 8-component MV: [0, R1, R2, R3, 0, 0, 0, 0] ──────────────────────────
-float rots[8];
-rots[0] = 0.0f;
-rots[1] = R1;
-rots[2] = R2;
-rots[3] = R3;
-rots[4] = 0.0f;
-rots[5] = 0.0f;
-rots[6] = 0.0f;
-rots[7] = 0.0f;
-
-// ── Per-group scale = max|R_i| / CB_MAX ──────────────────────────────────
 float abs_max   = max(max(abs(R1), abs(R2)), abs(R3));
 float scale     = float(bfloat((abs_max < 1e-12f) ? 1e-12f : (abs_max / ROTOR3_CB_MAX)));
 scales_out[gid] = bfloat(scale);
 
-// ── 3-bit quantize all 8 components and pack into 1 u32 via atomic OR ────
-uint code_word = gid * ROTOR3_WPG; // = gid (WPG = 1)
-for (uint e = 0u; e < ROTOR3_MV; e++) {
+// ── Quantize the three grade-1 components into the dense code plane ──────
+// The other five multivector components are algebraically zero — the rotor
+// sandwich preserves grade — so they are not stored.
+float rots[CP_CODES_PER_GROUP];
+rots[0] = R1;
+rots[1] = R2;
+rots[2] = R3;
+
+uint row_base = token * cp_row_words(n_grp);
+for (uint e = 0u; e < CP_CODES_PER_GROUP; e++) {
     float norm_val = (scale > 0.0f) ? (rots[e] / scale) : 0.0f;
     uint idx       = 0u;
     for (uint bi = 0u; bi < 7u; bi++) {
         if (norm_val > ROTOR3_BOUNDS[bi])
             idx++;
     }
-    uint shift = e * 3u;
-    atomic_fetch_or_explicit((device atomic_uint *)&codes_out[code_word],
-                             (idx & 0x7u) << shift,
-                             memory_order_relaxed);
+    cp_write_code(codes_out, row_base, grp * CP_CODES_PER_GROUP + e, idx);
 }

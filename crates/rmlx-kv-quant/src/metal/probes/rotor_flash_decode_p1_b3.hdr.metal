@@ -44,6 +44,51 @@ constant float RF_MUL_S[64] = {
     1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f
 };
 
+// Dense code plane — codes packed LSB-first across a row's groups, the row
+// padded to a whole u32. Mirrors crate::code_plane.
+#define CP_BITS 3u
+#define CP_MASK 0x7u
+#define CP_CODES_PER_GROUP 3u
+
+// u32 words one row of `n_groups` groups occupies.
+inline uint cp_row_words(uint n_groups) {
+    return (n_groups * CP_CODES_PER_GROUP * CP_BITS + 31u) / 32u;
+}
+
+// Read code `idx` of the row whose first word is `codes[row_base]`.
+//
+// Templated over the address space because MLX binds a small input buffer as
+// `constant` and a large one as `device`, and MSL will not convert between the
+// two: a single-address-space reader compiles for one dispatch shape and fails
+// the other at JIT time.
+template <typename P>
+inline uint cp_read_code(P codes, uint row_base, uint idx) {
+    uint bit  = idx * CP_BITS;
+    uint word = row_base + (bit >> 5u);
+    uint off  = bit & 31u;
+    uint v    = codes[word] >> off;
+    if (off + CP_BITS > 32u) {
+        v |= codes[word + 1u] << (32u - off);
+    }
+    return v & CP_MASK;
+}
+
+// OR code `idx` into the row whose first word is `codes[row_base]`. The plane
+// is zero-initialised at dispatch, so an OR is a write; a code that straddles
+// two words ORs into both.
+inline void cp_write_code(device uint* codes, uint row_base, uint idx, uint code) {
+    uint bit  = idx * CP_BITS;
+    uint word = row_base + (bit >> 5u);
+    uint off  = bit & 31u;
+    uint v    = code & CP_MASK;
+    atomic_fetch_or_explicit((device atomic_uint *)&codes[word], v << off,
+                             memory_order_relaxed);
+    if (off + CP_BITS > 32u) {
+        atomic_fetch_or_explicit((device atomic_uint *)&codes[word + 1u],
+                                 v >> (32u - off), memory_order_relaxed);
+    }
+}
+
 // Decode a whole Cl(3,0) block of a rotor-quantized token.
 //
 // `tok_idx` indexes the flat sequence-major token stream
@@ -62,7 +107,6 @@ inline void rf_decode_k_group(
     uint                n_groups,
     uint                group_id,
     thread float*       out) {
-    uint  word    = codes[tok_idx * n_groups + group_id];
     float k_scale = scales[tok_idx * n_groups + group_id];
 
     uint  rotor_base = group_id * 4u;
@@ -71,11 +115,16 @@ inline void rf_decode_k_group(
     float rb13       = rotors[rotor_base + 2u];
     float rb23       = rotors[rotor_base + 3u];
 
-    // Unpack 8 RF_BITS-bit codes -> centroid x scale -> mv_q[0..8].
-    float mv_q[8];
-    for (uint e = 0u; e < 8u; ++e) {
-        uint idx = (word >> (e * RF_BITS)) & RF_MASK;
-        mv_q[e]  = RF_CB[idx] * k_scale;
+    // Read the group's RF_GROUP_SIZE stored codes out of the dense
+    // plane -> centroid x scale -> grade-1 slots of mv_q. The other
+    // five components are algebraically zero: the sandwich preserves
+    // grade, so nothing was stored for them.
+    float mv_q[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    uint  row_base = tok_idx * cp_row_words(n_groups);
+    for (uint e = 0u; e < RF_GROUP_SIZE; ++e) {
+        uint idx = cp_read_code(codes, row_base,
+                                group_id * CP_CODES_PER_GROUP + e);
+        mv_q[e + 1u] = RF_CB[idx] * k_scale;
     }
 
     // Inverse sandwich: restored = R~ * mv_q * R.

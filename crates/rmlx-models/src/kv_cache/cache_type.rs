@@ -428,7 +428,7 @@ pub enum CacheType {
     /// `KvQuant::Rotor4Sym` or V=`bf16` for `KvQuant::RotorKOnly4`.
     /// Arch-guarded against Qwen MoE.
     RotorK4,
-    /// `tsym3` — symmetric WHT-3 K + turbo3 V.
+    /// `tsym3` — symmetric 3-bit Lloyd-Max K + turbo3 V.
     ///
     /// Both K and V use the TurboQuant 3-bit Lloyd-Max N(0,1) 8-centroid
     /// codebook. K is `QuantKTurbo3` (GPU: same MSL kernel as V-side turbo3).
@@ -663,7 +663,7 @@ pub fn parse(s: &str) -> Result<CacheType, ParseError> {
         // K-side rotor — dual spelling.
         "rotor_k_3" | "k_rotor3" => Ok(CacheType::RotorK3),
         "rotor_k_4" | "k_rotor4" => Ok(CacheType::RotorK4),
-        // symmetric WHT-3 (K+V both turbo3).
+        // symmetric 3-bit Lloyd-Max (K+V both turbo3).
         "tsym3" => Ok(CacheType::TurboSym3),
 
         // Aliases
@@ -1626,7 +1626,7 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
                 variant: format!("{kq}"),
             });
         }
-        // Contract A.y — TurboSym3 (symmetric WHT-3 K+V) is K-side
+        // Contract A.y — TurboSym3 (symmetric 3-bit Lloyd-Max K+V) is K-side
         // 3-bit on Qwen MoE — rejected with a dedicated error so the diagnostic
         // names the variant. Runs after rotor guard and before `k_below_8bit`.
         if matches!(kq, KvQuant::TurboSym3) {
@@ -1639,7 +1639,7 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
                 variant: format!("{kq}"),
             });
         }
-        // Symmetric WHT-4 K + tq4 V (`KvQuant::TurboSym4`) is
+        // Symmetric 4-bit Lloyd-Max K + tq4 V (`KvQuant::TurboSym4`) is
         // the PPL-218→8641 disaster path on Qwen MoE (CLAUDE.md hard rule 6).
         // Surface as `QwenMoeKBitsTooLow(4)` so the error class is uniform with
         // the existing Mixed K<8 rejection — same exit code, same hint text.

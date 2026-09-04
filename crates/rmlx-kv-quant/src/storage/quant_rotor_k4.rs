@@ -231,13 +231,25 @@ impl QuantRotorK4 {
                 "QuantRotorK4::gpu_append: n_groups for head_dim={head_dim} exceeds i32::MAX"
             ))
         })?;
+        // The dense code plane's row width is the codec's too — a plane no
+        // longer holds one word per group.
+        let code_words = i32::try_from(crate::rotorquant::row_words_for(
+            usize::try_from(head_dim.max(0)).unwrap_or(0),
+            ROTOR4_BITS,
+        ))
+        .map_err(|_| {
+            Error::Quant(format!(
+                "QuantRotorK4::gpu_append: code words for head_dim={head_dim} exceeds i32::MAX"
+            ))
+        })?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
-            self.gpu
-                .seed_from_cpu(&c, &s, &n, kv_h, n_groups, prev_seq, max_seq, device)?;
+            self.gpu.seed_from_cpu(
+                &c, &s, &n, kv_h, n_groups, code_words, prev_seq, max_seq, device,
+            )?;
         }
         self.gpu.append_encoded(
-            codes, scales, norms, kv_h, n_groups, prev_seq, new_seq, max_seq, device,
+            codes, scales, norms, kv_h, n_groups, code_words, prev_seq, new_seq, max_seq, device,
         )
     }
 
@@ -301,7 +313,8 @@ impl QuantRotorK4 {
         // [`QuantRotorK3::try_deep_clone`] for the full rationale (this is the
         // single reconcile point for the prompt-cache and SSD spill clones).
         let blocks =
-            synced_rotor_k_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?.into_owned();
+            synced_rotor_k_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, Device::Gpu)?
+                .into_owned();
         Ok(Self {
             rotors: self.rotors.clone(),
             // The clone starts CPU-only: `blocks` carries the full payload, so
@@ -371,7 +384,8 @@ impl QuantRotorK4 {
 
         // Reconcile CPU blocks with the GPU ring (ring-only decode tail rebuild;
         // loud on an unrecoverable gap). See [`QuantRotorK3::dequant`].
-        let blocks = synced_rotor_k_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+        let blocks =
+            synced_rotor_k_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, Device::Gpu)?;
 
         if blocks.is_empty() {
             out.resize(total_elems, 0.0);

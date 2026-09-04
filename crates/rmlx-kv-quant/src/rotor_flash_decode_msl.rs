@@ -252,9 +252,10 @@ fn render_mul_table() -> String {
 /// inlining into the pass-1 body) is what makes them callable from another
 /// kernel body.
 ///
-/// Mirrors [`crate::rotorquant::rotor3_decode`] step for step: unpack 8
-/// `RF_BITS`-bit codes from the group's single u32, centroid lookup × per-group
-/// scale, inverse sandwich `R̃ * mv_q * R`, grade-1 extraction, × per-token L2.
+/// Mirrors [`crate::rotorquant::rotor3_decode`] step for step: read the group's
+/// three stored codes out of the dense code plane, centroid lookup × per-group
+/// scale into the grade-1 slots, inverse sandwich `R̃ * mv_q * R`, grade-1
+/// extraction, × per-token L2.
 fn render_decode_fn() -> String {
     let mut s = String::new();
     let _ = write!(
@@ -277,7 +278,6 @@ fn render_decode_fn() -> String {
          \x20   uint                n_groups,\n\
          \x20   uint                group_id,\n\
          \x20   thread float*       out) {{\n\
-         \x20   uint  word    = codes[tok_idx * n_groups + group_id];\n\
          \x20   float k_scale = scales[tok_idx * n_groups + group_id];\n\
          \n\
          \x20   uint  rotor_base = group_id * 4u;\n\
@@ -286,11 +286,16 @@ fn render_decode_fn() -> String {
          \x20   float rb13       = rotors[rotor_base + 2u];\n\
          \x20   float rb23       = rotors[rotor_base + 3u];\n\
          \n\
-         \x20   // Unpack 8 RF_BITS-bit codes -> centroid x scale -> mv_q[0..8].\n\
-         \x20   float mv_q[8];\n\
-         \x20   for (uint e = 0u; e < 8u; ++e) {{\n\
-         \x20       uint idx = (word >> (e * RF_BITS)) & RF_MASK;\n\
-         \x20       mv_q[e]  = RF_CB[idx] * k_scale;\n\
+         \x20   // Read the group's RF_GROUP_SIZE stored codes out of the dense\n\
+         \x20   // plane -> centroid x scale -> grade-1 slots of mv_q. The other\n\
+         \x20   // five components are algebraically zero: the sandwich preserves\n\
+         \x20   // grade, so nothing was stored for them.\n\
+         \x20   float mv_q[8] = {{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}};\n\
+         \x20   uint  row_base = tok_idx * cp_row_words(n_groups);\n\
+         \x20   for (uint e = 0u; e < RF_GROUP_SIZE; ++e) {{\n\
+         \x20       uint idx = cp_read_code(codes, row_base,\n\
+         \x20                               group_id * CP_CODES_PER_GROUP + e);\n\
+         \x20       mv_q[e + 1u] = RF_CB[idx] * k_scale;\n\
          \x20   }}\n\
          \n\
          \x20   // Inverse sandwich: restored = R~ * mv_q * R.\n\
@@ -419,6 +424,10 @@ pub(crate) fn build_rotor_flash_header(bits: u8) -> Result<String> {
         cb_join = cb_hex.join(",\n")
     );
     s.push_str(&render_mul_table());
+    s.push_str(&crate::code_plane::render_msl_code_plane(
+        bits,
+        crate::rotorquant::ROTOR_CODES_PER_GROUP,
+    ));
     s.push_str(&render_decode_fn());
     let _ = write!(
         s,
@@ -434,7 +443,7 @@ pub(crate) fn build_rotor_flash_header(bits: u8) -> Result<String> {
 // P1 buffer layout (must match `add_input` order in `rotor_flash_decode_sdpa`):
 // K buffers are SEQUENCE-major (`[B, S, kv_h, ...]`); V stays head-major.
 // 0. query     : f32  [B * n_q_heads * head_dim]
-// 1. codes     : u32  [B * kv_seq * kv_h * n_groups]
+// 1. codes     : u32  [B * kv_seq * kv_h * code_words]
 // 2. scales    : f32  [B * kv_seq * kv_h * n_groups]
 // 3. norms     : f32  [B * kv_seq * kv_h]
 // 4. rotors    : f32  [n_groups * 4]
@@ -621,6 +630,9 @@ pub fn rotor_flash_decode_sdpa<const BITS: u8>(
     let n_tiles = (kv_seq + TILE_SIZE - 1) / TILE_SIZE;
     let n_groups = n_groups_for(head_dim as usize);
     let n_groups_i64 = n_groups as i64;
+    // The code plane is dense across the row's groups, so its stride is its own
+    // number; the scale plane stays one entry per group.
+    let code_words_i64 = crate::rotorquant::row_words_for(head_dim as usize, BITS) as i64;
 
     // ── Flatten Q to [n_bh * head_dim] f32 ────────────────────────────────
     let q_total: i64 = i64::from(n_bh) * i64::from(head_dim);
@@ -633,14 +645,16 @@ pub fn rotor_flash_decode_sdpa<const BITS: u8>(
 
     // ── Flatten K buffers ─────────────────────────────────────────────────
     let tok_count: i64 = i64::from(b) * i64::from(kv_h) * i64::from(kv_seq);
-    let codes_total: i64 = tok_count * n_groups_i64;
+    let codes_total: i64 = tok_count * code_words_i64;
+    let scales_total: i64 = tok_count * n_groups_i64;
     let rotors_total: i64 = n_groups_i64 * ROTOR_STRIDE;
 
     let codes_flat = k_codes.reshape(&[codes_total as i32], device)?;
     // Bound at the stored sideband dtype — see `iso_flash_decode_msl`. The
     // rotor table stays f32: it is a per-(layer, head) constant, not a
     // per-token plane, and its declaration is unchanged.
-    let scales_flat = to_sideband_dtype(&k_scales.reshape(&[codes_total as i32], device)?, device)?;
+    let scales_flat =
+        to_sideband_dtype(&k_scales.reshape(&[scales_total as i32], device)?, device)?;
     let norms_flat = to_sideband_dtype(&k_norms.reshape(&[tok_count as i32], device)?, device)?;
     let rotors_flat = k_rotors.reshape(&[rotors_total as i32], device)?;
 

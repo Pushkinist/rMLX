@@ -317,3 +317,106 @@ fn hdr_probe_snapshot_matches_builder() {
         "stale snapshot: refresh metal/probes/isoquant_iso3.hdr.metal"
     );
 }
+
+/// The GPU encoder writes the code plane the CPU encoder writes — same bytes,
+/// at both KV-head counts and at a `head_dim` that is not a power of two.
+///
+/// The two encoders reach the plane by different routes: the CPU packs a whole
+/// row through [`crate::code_plane::pack_row_into`], the kernel ORs one code at
+/// a time from one thread per group, and a code that straddles a word boundary
+/// is two atomics there and one shift-pair here. A disagreement between them is
+/// silent — a store seeded from CPU blocks and appended on GPU would hold two
+/// cadences in one buffer and decode plausible-looking K/V out of the join.
+///
+/// Codes are compared as codes, not as words: a word-level comparison would
+/// pass on a plane whose codes are correct but shifted, which is the failure
+/// this exists to catch.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test -p rmlx-kv-quant -- --ignored isoquant_msl --test-threads=1"]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture: a codec rejection on a valid shape is the failure being reported"
+)]
+fn the_gpu_encoder_writes_the_plane_the_cpu_encoder_writes() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    // 132 is a multiple of the quaternion block and not a power of two, so its
+    // 3-bit row is 396 bits — a whole word longer than the codes need, with
+    // codes straddling word boundaries at both widths.
+    for head_dim in [128_usize, 132] {
+        for kv_h in [1_usize, 8] {
+            for bits in [3_u8, 4] {
+                let n_tokens = 12 * kv_h;
+                let data = lcg_data(n_tokens * head_dim, 0x150E_2026 + u64::from(bits));
+                let arr = make_f32_array(&data, &[n_tokens as i32, head_dim as i32]);
+
+                let (cpu_codes, _, _, _) =
+                    iso_encode_fast(&data, head_dim, 4, bits).expect("iso_encode_fast");
+                let gpu_codes = if bits == 3 {
+                    let (c, _, _, _) =
+                        iso_quantize_v3_gpu(&arr, head_dim, Device::Gpu).expect("iso3 gpu encode");
+                    c
+                } else {
+                    let (c, _, _, _) =
+                        crate::isoquant_msl_v4::iso_quantize_v4_gpu(&arr, head_dim, Device::Gpu)
+                            .expect("iso4 gpu encode");
+                    c
+                };
+                gpu_codes.eval().expect("eval codes");
+                let gpu_words: Vec<u32> = gpu_codes
+                    .to_bytes()
+                    .expect("codes to_bytes")
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes(<[u8; 4]>::try_from(b).unwrap_or([0; 4])))
+                    .collect();
+
+                let row_words = crate::code_plane::row_words(head_dim, bits);
+                assert_eq!(
+                    gpu_words.len(),
+                    n_tokens * row_words,
+                    "iso{bits} head_dim={head_dim} kv_h={kv_h}: the kernel's plane is not \
+                     {row_words} words per row"
+                );
+                assert_eq!(
+                    cpu_codes.len(),
+                    gpu_words.len(),
+                    "iso{bits} head_dim={head_dim} kv_h={kv_h}: plane lengths differ"
+                );
+
+                let read = |w: &[u32], row: usize, i: usize| {
+                    crate::code_plane::read_code(
+                        w.get(row * row_words..(row + 1) * row_words)
+                            .expect("row inside the plane"),
+                        i,
+                        bits,
+                    )
+                };
+                let mut slips = 0_usize;
+                for row in 0..n_tokens {
+                    for i in 0..head_dim {
+                        let (c, g) = (read(&cpu_codes, row, i), read(&gpu_words, row, i));
+                        if c != g {
+                            slips += 1;
+                            assert!(
+                                i32::from(c).abs_diff(i32::from(g)) == 1,
+                                "iso{bits} head_dim={head_dim} kv_h={kv_h}: code {i} of row \
+                                 {row} is {c} on the CPU and {g} on the GPU — more than one \
+                                 codebook step apart, so this is a packing or rotation \
+                                 divergence, not a boundary tie"
+                            );
+                        }
+                    }
+                }
+                // The two assignment rules — nearest-centroid scan against
+                // midpoint comparisons — can only disagree at a boundary.
+                let total = n_tokens * head_dim;
+                assert!(
+                    slips * 100 < total * 5,
+                    "iso{bits} head_dim={head_dim} kv_h={kv_h}: {slips} of {total} codes \
+                     differ; a shifted plane reads as a large disagreement here"
+                );
+            }
+        }
+    }
+}

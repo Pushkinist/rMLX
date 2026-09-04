@@ -8,16 +8,14 @@ uint hd         = n_groups_u * ISO4_GS;
 float scale = scales_in[gid];
 float norm  = norms_in[gid];
 
-uint code_word = gid * ISO4_WPG;
-uint base_out  = token * hd + grp * ISO4_GS;
+uint row_base = token * cp_row_words(n_groups_u);
+uint base_out = token * hd + grp * ISO4_GS;
 
-// ── Unpack, dequantize, inverse-rotate, rescale ───────────────────────────
+// ── Read the group's codes out of the plane, dequantize, inverse-rotate ──
 float rots[4];
 for (uint e = 0u; e < ISO4_GS; e++) {
-    uint word  = code_word + e / ISO4_VPW;
-    uint shift = (e % ISO4_VPW) * 4u;
-    uint idx   = (codes_in[word] >> shift) & 0xFu;
-    rots[e]    = ISO4_CB[idx] * scale;
+    uint idx = cp_read_code(codes_in, row_base, grp * CP_CODES_PER_GROUP + e);
+    rots[e]  = ISO4_CB[idx] * scale;
 }
 
 float rw = rots[0];

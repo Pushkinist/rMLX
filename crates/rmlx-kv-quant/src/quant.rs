@@ -273,15 +273,12 @@ pub enum KvQuant {
     /// K = affine q8_0 (group_size=128), V = rotor4 (Cl(3,0)
     /// Clifford rotor sandwich + 4-bit Lloyd-Max codebook).
     ///
-    /// 4.25-bit V codec — same Clifford Cl(3,0) sandwich as rotor3 with the
-    /// 16-centroid Lloyd-Max N(0,1) codebook and dense 8-vals-per-u32 pack
-    /// (iso4 convention: 8 codes × 4 bits = 32 bits = 1 u32 per group).
-    /// ~10.7 bpe in codes at bits=4 (single-codebook simplification; grade-aware
-    /// split deferred per spec) — but a whole `u32` code word goes to each group
-    /// of 3, so **16.25 bits per value reach the store**, above bf16's 16.0,
-    /// even with the scale and norm planes narrowed to
-    /// [`crate::storage::KV_SIDEBAND_DTYPE`]. Not a memory win; see
-    /// `crate::rotorquant` § "Effective bpe".
+    /// 4-bit V codec — same Clifford Cl(3,0) sandwich as rotor3 with the
+    /// 16-centroid Lloyd-Max N(0,1) codebook. Three codes per group of 3 in the
+    /// dense code plane, so **9.75 bits per value reach the store** at
+    /// `head_dim = 128` with the scale and norm planes at
+    /// [`crate::storage::KV_SIDEBAND_DTYPE`]. The per-group scale is 5.375 of
+    /// those bits; see `crate::rotorquant` § "Effective bpe".
     ///
     /// **Implementation scope**: CPU codec only. SDPA falls through to the
     /// dequant-then-SDPA legacy fallback path. No MSL kernel (deferred). Single-
@@ -538,14 +535,15 @@ enum SideStore {
     /// understatement of 4.4× and 5.5× respectively, in the codec's favour.
     /// Latent.
     Planar,
-    /// IsoQuant on the GPU ring (`QuantKGpuRing`): one `u32` code word + one
-    /// scale per 4-element quaternion group, plus one norm per token, both
-    /// planes at [`crate::storage::KV_SIDEBAND_DTYPE`]. At bf16 that is
-    /// `12 + 16/head_dim` bits per value — **12.125 at `head_dim = 128`, under
-    /// bf16's 16.0**. It was 16.25 while the two planes were `f32`: a whole
-    /// `f32` scale per 4 values is 8 bits per value of sideband on its own, and
-    /// the mantissa beyond bf16's 8 bits is not read by anything — the decode
-    /// kernels reconstruct into a `float` accumulator from a magnitude.
+    /// IsoQuant on the GPU ring (`QuantKGpuRing`): the row's dense code plane —
+    /// four codes per quaternion group, `bits` each — plus one scale per group
+    /// and one norm per token, both planes at
+    /// [`crate::storage::KV_SIDEBAND_DTYPE`]. At `head_dim = 128` that is
+    /// **7.125 bits per value for iso3 and 8.125 for iso4**, against bf16's
+    /// 16.0. The per-group scale is 4.000 of those bits and is the dominant
+    /// term once the plane is dense; the mantissa beyond bf16's 8 bits is not
+    /// read by anything — the decode kernels reconstruct into a `float`
+    /// accumulator from a magnitude.
     ///
     /// The rotation is the compile-time `crate::isoquant::FIXED_QUAT` and is not
     /// stored. This is the resident form for every iso codec that materialises a
@@ -566,9 +564,9 @@ enum SideStore {
     ///   property of the model's geometry, not a startup window: it does not
     ///   end.
     IsoRing,
-    /// IsoQuant in CPU `IsoBlocks`: one `u32` code word, one `f32` scale and a
-    /// 4×`f32` quaternion per group, plus one `f32` norm per token — 48.25 bits
-    /// per value at `head_dim = 128`, 3.98× the ring. The sideband is `f32`
+    /// IsoQuant in CPU `IsoBlocks`: the ring's dense code plane, plus one `f32`
+    /// scale and a 4×`f32` quaternion per group and one `f32` norm per token —
+    /// 43.25 bits per value at `head_dim = 128` for iso3, 6.07× the ring. The sideband is `f32`
     /// here and not [`crate::storage::KV_SIDEBAND_DTYPE`]: these are `Vec<f32>`
     /// in host RAM, not a GPU plane, so the ring's stored width does not apply
     /// to them.
@@ -578,17 +576,15 @@ enum SideStore {
     /// what `Iso3` / `Iso4` name, and why they are latent: their decode
     /// early-returns to the bf16 mirror, so no store is built at all.
     IsoBlocks,
-    /// RotorQuant on the GPU ring: one `u32` code word + one scale per
-    /// 3-element group, plus one norm per token, both planes at
-    /// [`crate::storage::KV_SIDEBAND_DTYPE`] —
-    /// `(48 * ceil(head_dim/3) + 16) / head_dim` bits per value, **16.25 at
-    /// `head_dim = 128`**, down from 21.75 at an `f32` sideband. That is a 25%
-    /// cut and it still does not reach bf16's 16.0: rotor spends a whole `u32`
-    /// code word per 3 head-dim slots — 10.67 bits per value before any
-    /// sideband — and five of the eight codes in each word are structurally
-    /// zero (see `crate::clifford`). Narrowing the sideband cannot fix a code
-    /// cadence, so rotor remains a fidelity experiment rather than a
-    /// compression format.
+    /// RotorQuant on the GPU ring: the row's dense code plane holding three
+    /// codes per 3-element group — the grade-1 components, the only ones the
+    /// sandwich leaves non-zero (see `crate::clifford`) — plus one scale per
+    /// group and one norm per token, both at
+    /// [`crate::storage::KV_SIDEBAND_DTYPE`]. **8.75 bits per value at
+    /// `head_dim = 128` for rotor3 and 9.75 for rotor4**, against bf16's 16.0.
+    /// Past the plane the per-group scale is the dominant term at 5.375 bits
+    /// per value — rotor shares a scale across 3 values where iso shares one
+    /// across 4, which is why rotor stays the wider family at both widths.
     ///
     /// The CPU blocks carry the same payload with an `f32` sideband (they are
     /// `Vec<f32>` in host RAM), and are dropped once the ring is live, which is
@@ -622,6 +618,17 @@ const SIDEBAND_BYTES: u64 = crate::storage::KV_SIDEBAND_DTYPE.itemsize() as u64;
 /// of a store no live codec materialises yet is still reachable from a test:
 /// four of the seven layouts are latent (see [`SideStore`]), and a cadence only
 /// the estimator could call would be a gate that cannot fail.
+/// Bytes the dense code plane holds for `n_tokens` rows of `codes_per_row`
+/// codes at `bits`.
+///
+/// Reads [`crate::code_plane::row_words`] rather than restating its rounding:
+/// a row is padded to a whole `u32` and nothing else is, so a second copy of
+/// that rule here is a second producer of every rate figure in the tree.
+fn plane_bytes(codes_per_row: u64, bits: u32, n_tokens: u64) -> u64 {
+    let words = crate::code_plane::row_words(codes_per_row as usize, bits as u8) as u64;
+    words.saturating_mul(4).saturating_mul(n_tokens)
+}
+
 fn packed_side_bytes(store: SideStore, bits: u32, elems: u64, head_dim: u64, n_tokens: u64) -> u64 {
     let codes = elems.saturating_mul(u64::from(bits)) / 8;
     match store {
@@ -650,29 +657,41 @@ fn packed_side_bytes(store: SideStore, bits: u32, elems: u64, head_dim: u64, n_t
                 .saturating_add(rotations)
         }
         SideStore::IsoRing => {
-            // code u32 + scale at the ring's sideband dtype; the rotation is
+            // The row's dense code plane (four codes per quaternion group) plus
+            // one scale per group at the ring's sideband dtype; the rotation is
             // FIXED_QUAT. One norm per token, same dtype.
             let groups = elems / 4;
-            groups
-                .saturating_mul(4 + SIDEBAND_BYTES)
+            // One code per value: four per quaternion group, head_dim per row.
+            let plane = plane_bytes(head_dim, bits, n_tokens);
+            plane
+                .saturating_add(groups.saturating_mul(SIDEBAND_BYTES))
                 .saturating_add(n_tokens.saturating_mul(SIDEBAND_BYTES))
         }
         SideStore::IsoBlocks => {
-            // Host `Vec` form: code u32 + scale f32 + the 4x f32 quaternion the
-            // CPU blocks replicate per group, and one f32 norm per token. The
-            // sideband is f32 here and not the ring's dtype — these are
-            // `Vec<f32>` in host RAM, not a GPU plane.
+            // Host `Vec` form: the same dense code plane as the ring, plus an
+            // f32 scale and the 4x f32 quaternion the CPU blocks replicate per
+            // group, and one f32 norm per token. The sideband is f32 here and
+            // not the ring's dtype — these are `Vec<f32>` in host RAM, not a
+            // GPU plane.
             let groups = elems / 4;
-            groups
-                .saturating_mul(4 + 4 + 16)
+            plane_bytes(head_dim, bits, n_tokens)
+                .saturating_add(groups.saturating_mul(4 + 16))
                 .saturating_add(n_tokens.saturating_mul(4))
         }
         SideStore::Rotor => {
-            // group size 3: per-token head_dim.div_ceil(3), NOT elems/3.
-            // code u32 + scale at the ring's sideband dtype, one norm per token.
-            let groups = head_dim.div_ceil(3).saturating_mul(n_tokens);
-            groups
-                .saturating_mul(4 + SIDEBAND_BYTES)
+            // group size 3: per-token head_dim.div_ceil(3), NOT elems/3. Three
+            // codes per group — the grade-1 components, the only ones stored —
+            // in the row's dense code plane, plus one scale per group at the
+            // ring's sideband dtype and one norm per token.
+            let n_groups = head_dim.div_ceil(3);
+            let codes_per_row = n_groups.saturating_mul(3);
+            let plane = plane_bytes(codes_per_row, bits, n_tokens);
+            plane
+                .saturating_add(
+                    n_groups
+                        .saturating_mul(n_tokens)
+                        .saturating_mul(SIDEBAND_BYTES),
+                )
                 .saturating_add(n_tokens.saturating_mul(SIDEBAND_BYTES))
         }
     }
@@ -1287,14 +1306,13 @@ impl KvQuant {
     /// `RotorKOnly*`) report a quantized K and a 16-bit V.
     ///
     /// **Three families do not store at their codebook width.** The iso and
-    /// rotor stores spend one whole `u32` code word *and* one sideband scale
-    /// per group — 4 head-dim slots for iso, 3 for rotor — and the planar store
-    /// spends one `f32` scale per *pair*. A 3-bit and a 4-bit member of any of
-    /// the three therefore occupy byte-identical storage, at `head_dim = 128`:
-    /// 12.125 bits per value for iso on the ring, 16.25 for rotor and 22.00 for
-    /// planar, against bf16's 16.0 — so iso is under the baseline and the other
-    /// two are over it. The width below is what the codebook quantizes to, not
-    /// what reaches memory.
+    /// rotor stores spend one sideband scale per group — 4 head-dim slots for
+    /// iso, 3 for rotor — on top of the codes, and the planar store spends one
+    /// `f32` scale per *pair* and does not vary with the codebook at all. At
+    /// `head_dim = 128`: 7.125 bits per value for iso3 on the ring, 8.125 for
+    /// iso4, 8.750 for rotor3, 9.750 for rotor4 and 22.00 for planar at either
+    /// width, against bf16's 16.0. The width below is what the codebook
+    /// quantizes to, not what reaches memory.
     /// [`Self::estimated_resident_bytes_per_layer`] does not size those three
     /// families from this number at all — it sizes every side from
     /// [`SideStore`], the store's own group geometry.

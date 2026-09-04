@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The packed K/V ring stores its codes in a dense plane, and the iso and rotor
+  codecs get between 33% and 46% smaller.** The ring spent one whole `u32` code
+  word per group whatever the codec's bit width, so at `head_dim = 128` between
+  50% and 72% of every word was padding and a 3-bit codec occupied exactly as
+  much space as its 4-bit sibling. Codes are now packed densely across a row's
+  groups, LSB-first, with the row padded to a whole `u32` — one packer,
+  parameterised by width, shared by every codec with a code plane
+  (`crates/rmlx-kv-quant/src/code_plane.rs`, Rust and MSL). At `head_dim = 128`,
+  against bf16's 16.0 bits per value: `iso3` 12.125 → **7.125**, `iso4` 12.125 →
+  **8.125**, `rotor3` 16.250 → **8.750**, `rotor4` 16.250 → **9.750**. The rotor
+  encoders additionally store three codes per group instead of eight — the other
+  five components of the Cl(3,0) multivector are algebraically zero after a
+  grade-preserving sandwich, which `clifford_tests` pins in both directions —
+  and that is what takes the rotor family under the bf16 floor for the first
+  time. Their `Verdict::Exempt` rows in the crate rate gate are gone.
+
+- **The TurboQuant codecs stop claiming a transform they do not apply.** Every
+  site that described `tsym3` / `tsym4` as a Walsh-Hadamard codec now names the
+  Lloyd-Max codebook the encoder actually uses, including the two on-disk
+  geometry tags: `tsym3_wht_3_3` → `tsym3_lloyd_3_3`, `tsym4_wht_4_4` →
+  `tsym4_lloyd_4_4`. Hydrate dispatches on exact string equality, so the rename
+  is a stored-format change and rides the same schema bump as the plane.
+
+- **`SsdKvIndex::SCHEMA_VERSION` 7 → 8.** Both changes above are stored formats
+  that `layout_key` cannot tell apart — it folds codec names and shapes, and
+  neither moves when the bits inside a block are re-cadenced — so a v7 block
+  would hit and hydrate under the new unpacker. The bump routes those namespaces
+  through the startup wipe instead. One cold pass after upgrading.
+
 ### Fixed
 
 - **The bench scripts record the decode rate the engine measured, not one they

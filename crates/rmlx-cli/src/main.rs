@@ -176,14 +176,14 @@ Special value:
 Presets:
   fp16          -- bf16 both sides (unquantised; KvQuant::None)
   q8            -- symmetric 8-bit K+V (KvQuant::K8V8)
-  speed         -- TurboSym3 (symmetric WHT-3 K+V; rejected on Qwen MoE)
-  quality       -- TurboSym4 (WHT-4 symmetric K+V; rejected on Qwen MoE — see arch guard note*)
+  speed         -- TurboSym3 (symmetric 3-bit Lloyd-Max K+V; rejected on Qwen MoE)
+  quality       -- TurboSym4 (symmetric 4-bit Lloyd-Max K+V; rejected on Qwen MoE — see arch guard note*)
   planar        -- PlanarQuant V-side (KvQuant::Planar)
   planar3       -- PlanarQuant 3-bit V-side (KvQuant::Planar3)
   k_only_planar -- PlanarQuant K-side, V bf16 (KvQuant::PlanarK; rejected on Qwen MoE)
 
-*Arch guard: --kv-preset quality resolves to TurboSym4 (symmetric WHT-4 K+V), rejected on \
-Qwen MoE (PPL disaster path). --kv-preset speed resolves to TurboSym3 (symmetric WHT-3 K+V), \
+*Arch guard: --kv-preset quality resolves to TurboSym4 (symmetric 4-bit Lloyd-Max K+V), rejected on \
+Qwen MoE (PPL disaster path). --kv-preset speed resolves to TurboSym3 (symmetric 3-bit Lloyd-Max K+V), \
 also rejected on Qwen MoE (K-side 3-bit PPL disaster). \
 See docs/KV_QUANT.md sections \"Preset semantics\" and \"Codec disposition\".";
 

@@ -121,7 +121,13 @@ fn run_planar(data: &[f32], bits: u8) -> (Vec<f32>, f64) {
 /// `QuantKGpuRing::byte_size` reads each plane's own shape and dtype, so the
 /// rate column tracks the stored sideband width rather than a constant written
 /// here — which is the term that moved when the scale and norm planes narrowed.
-fn ring_bytes(codes: &[u32], scales: &[f32], norms: &[f32], n_groups: usize) -> u64 {
+fn ring_bytes(
+    codes: &[u32],
+    scales: &[f32],
+    norms: &[f32],
+    n_groups: usize,
+    code_words: usize,
+) -> u64 {
     let mut ring = crate::storage::QuantKGpuRing::default();
     ring.seed_from_cpu(
         codes,
@@ -129,6 +135,7 @@ fn ring_bytes(codes: &[u32], scales: &[f32], norms: &[f32], n_groups: usize) -> 
         norms,
         1,
         n_groups as i32,
+        code_words as i32,
         RD_ROWS as i32,
         RD_ROWS as i32,
         rmlx_mlx::Device::Cpu,
@@ -183,7 +190,13 @@ fn run_rotor(data: &[f32], bits: u8) -> (Vec<f32>, f64) {
     } else {
         rotor4_encode(data, &rotors, RD_HEAD_DIM).expect("rotor4_encode")
     };
-    let bytes = ring_bytes(&codes, &scales, &norms, n_groups);
+    let bytes = ring_bytes(
+        &codes,
+        &scales,
+        &norms,
+        n_groups,
+        crate::rotorquant::row_words_for(RD_HEAD_DIM, bits),
+    );
     let decoded = if bits == 3 {
         rotor3_decode(&codes, &scales, &norms, &rotors, RD_HEAD_DIM).expect("rotor3_decode")
     } else {
@@ -482,18 +495,17 @@ fn one_bit_short_codec_fails_the_rate_distortion_gate() {
 
 // ── Measured anomaly, pinned ─────────────────────────────────────────────────
 
-/// The 3-bit and 4-bit widths of iso, rotor and planar cost **byte-identical**
-/// storage, so in each family one width is strictly dominated.
+/// Planar's 3-bit and 4-bit widths cost **byte-identical** storage, so one of
+/// them is strictly dominated; iso's and rotor's do not, and there the extra
+/// bit is bought and paid for.
 ///
-/// All three pack codes into u32 words under the shared `32 / bits`
-/// vals-per-word convention, and at every shipped group size the word count
-/// comes out the same for `bits = 3` and `bits = 4`: iso and rotor put one
-/// group in one word either way, and planar's 32-value block takes
-/// `ceil(32/10) = ceil(32/8) = 4` words. The 3-bit variants therefore burn the
-/// spare bits rather than saving anything, and the comparison between the two
-/// widths is pure quality at fixed rate.
+/// Planar's 32-value block takes `ceil(32/10) = ceil(32/8) = 4` words under the
+/// `32 / bits` vals-per-word convention, so its 3-bit variant burns the spare
+/// bits rather than saving anything and the comparison between its two widths is
+/// pure quality at fixed rate. Iso and rotor pack their codes into the dense
+/// code plane, where a code costs `bits` and nothing else, so their 4-bit
+/// variants cost exactly one more bit per stored code.
 ///
-/// * `iso` and `rotor` — the 4-bit width wins, so the 3-bit width is dominated.
 /// * `planar` — the **3-bit** width wins, by ~3.9 dB, so `planar4` is
 ///   dominated. Per pair the larger element is pinned to the outermost
 ///   centroid, leaving the smaller one on the grid `centroid / max_centroid`,
@@ -501,51 +513,71 @@ fn one_bit_short_codec_fails_the_rate_distortion_gate() {
 ///   `(2.718 - 2.052)/2.718 = 0.245` at 4 bits — only 1.5x finer, while the
 ///   16-angle Givens search that has to land *both* elements on centroids gets
 ///   no larger. The extra bit does not pay for itself.
+/// * `iso` and `rotor` — the 4-bit width wins on quality and costs more, which
+///   is the ordinary rate-distortion trade and not an anomaly. The rate delta is
+///   pinned so a packing change that stopped charging for the extra bit shows up
+///   here.
 ///
 /// The test pins what is measured rather than the ordering everyone expects, so
 /// the day a family's packing or codebook is fixed this goes red and gets
 /// re-pointed at the new contract instead of quietly agreeing with whatever the
 /// code does.
 #[test]
-fn byte_identical_bit_widths_leave_one_width_dominated() {
+fn planar_widths_are_byte_identical_and_the_others_pay_for_their_bits() {
     let data = gaussian_fixture();
 
-    // (family, encoder, which width wins)
-    let families: [(&str, CodecRun, u8); 3] = [
-        ("iso", run_iso, 4),
-        ("rotor", run_rotor, 4),
-        ("planar", run_planar, 3),
+    // planar: same bytes at either width, so the 3-bit win is a pure
+    // quality-at-fixed-rate result.
+    let (three, three_rate) = run_planar(&data, 3);
+    let (four, four_rate) = run_planar(&data, 4);
+    let (three_db, four_db) = (sqnr_db(&data, &three), sqnr_db(&data, &four));
+    println!(
+        "planar: 3-bit {three_db:.2} dB @ {three_rate:.2} bits/value | \
+         4-bit {four_db:.2} dB @ {four_rate:.2} bits/value"
+    );
+    assert!(
+        (three_rate - four_rate).abs() < 1e-9,
+        "planar 3-bit and 4-bit are supposed to occupy byte-identical storage: \
+         {three_rate:.2} vs {four_rate:.2} bits per value. If a packing change made them \
+         differ, this comparison is no longer at fixed rate — re-point the test"
+    );
+    assert!(
+        three_db > four_db,
+        "planar4 {four_db:.2} dB now beats planar3 {three_db:.2} dB at the same rate. The \
+         documented dominance has flipped — update docs/KV_QUANT.md and this test rather \
+         than deleting it"
+    );
+
+    // iso and rotor: the dense code plane charges for the extra bit, one per
+    // stored code, and the 4-bit width buys quality with it.
+    // Bits per value the fourth codebook bit costs each family: one per stored
+    // code, and rotor stores `ceil(head_dim/3) * 3` codes per `head_dim` values
+    // because its last group is tail-padded.
+    let rotor_codes_per_value = (n_groups_for(RD_HEAD_DIM) * 3) as f64 / RD_HEAD_DIM as f64;
+    let families: [(&str, CodecRun, f64); 2] = [
+        ("iso", run_iso, 1.0),
+        ("rotor", run_rotor, rotor_codes_per_value),
     ];
-    for (family, run, winner) in families {
+    for (family, run, codes_per_value) in families {
         let (three, three_rate) = run(&data, 3);
         let (four, four_rate) = run(&data, 4);
-        let three_db = sqnr_db(&data, &three);
-        let four_db = sqnr_db(&data, &four);
-
+        let (three_db, four_db) = (sqnr_db(&data, &three), sqnr_db(&data, &four));
         println!(
             "{family}: 3-bit {three_db:.2} dB @ {three_rate:.2} bits/value | \
-             4-bit {four_db:.2} dB @ {four_rate:.2} bits/value | \
-             winner {winner}-bit by {:.2} dB",
-            (three_db - four_db).abs(),
+             4-bit {four_db:.2} dB @ {four_rate:.2} bits/value"
         );
-
+        // The plane rounds each row up to a whole u32, so the delta is the
+        // codes' own bit cost to within that rounding.
+        let delta = four_rate - three_rate;
         assert!(
-            (three_rate - four_rate).abs() < 1e-9,
-            "{family} 3-bit and 4-bit are supposed to occupy byte-identical storage: \
-             {three_rate:.2} vs {four_rate:.2} bits per value. If a packing change made them \
-             differ, this comparison is no longer at fixed rate — re-point the test"
+            (delta - codes_per_value).abs() < 0.05,
+            "{family}: the 4-bit width should cost about {codes_per_value:.3} bits per value \
+             more than the 3-bit one, measured {delta:.3} ({three_rate:.3} -> {four_rate:.3})"
         );
-
-        let (winner_db, loser_db, loser) = if winner == 3 {
-            (three_db, four_db, 4)
-        } else {
-            (four_db, three_db, 3)
-        };
         assert!(
-            winner_db > loser_db,
-            "{family}{loser} {loser_db:.2} dB now beats {family}{winner} {winner_db:.2} dB at \
-             the same rate. The documented dominance has flipped — update docs/KV_QUANT.md \
-             and this test rather than deleting it"
+            four_db > three_db,
+            "{family}4 {four_db:.2} dB must beat {family}3 {three_db:.2} dB — it is paying \
+             a bit per code for it"
         );
     }
 }

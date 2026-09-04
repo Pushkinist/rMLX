@@ -51,7 +51,10 @@ fn rotor_encode_for_test(
     } else {
         rotor4_encode(k_flat, &rotors, head_dim).expect("rotor4_encode")
     };
-    debug_assert_eq!(codes.len(), n_tokens * n_groups);
+    debug_assert_eq!(
+        codes.len(),
+        n_tokens * crate::rotorquant::row_words_for(head_dim, bits)
+    );
     debug_assert_eq!(scales.len(), n_tokens * n_groups);
     debug_assert_eq!(norms.len(), n_tokens);
 
