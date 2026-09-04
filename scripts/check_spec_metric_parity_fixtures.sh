@@ -60,6 +60,15 @@ judge() {
 	fi
 }
 
+# run_extra <name> <pattern> — a second assertion on a case already judged.
+run_extra() {
+	if ! grep -qE "$2" "${WORK}/$1.log"; then
+		printf 'FAIL  %-34s %s\n' "$1" "missing /$2/"
+		FAILED=$((FAILED + 1))
+		PASSED=$((PASSED - 1))
+	fi
+}
+
 echo "check_spec_metric_parity fixtures"
 echo
 
@@ -94,7 +103,8 @@ old = '    ("tokens_per_round", "tokens_per_round", float),\n'
 assert old in s, "fixture anchor missing"
 p.write_text(s.replace(old, '', 1))
 PY
-judge dropped_from_bench 1 "a name deleted from the bench is the parity branch, not the unreadable one" "tokens_per_round"
+judge dropped_from_bench 1 "a name deleted from the bench is the parity branch, and in the right direction" "never recorded by spec_bench.sh"
+run_extra dropped_from_bench "tokens_per_round"
 
 d="$(root indented_python)"
 python3 - "${d}/scripts/spec_bench.sh" <<'PY'
@@ -104,7 +114,7 @@ old = 'SPEC_METRICS = ('
 assert old in s, "fixture anchor missing"
 p.write_text(s.replace(old, '    SPEC_METRICS = (', 1))
 PY
-judge indented_python 2 "a reformat that moves the marker off column 0 fails closed" "no SPEC_METRICS entries found"
+judge indented_python 2 "a reformat that moves the marker off column 0 fails closed, naming the bench" "no SPEC_METRICS entries found in scripts/spec_bench.sh"
 
 d="$(root renamed_registry_const)"
 python3 - "${d}/crates/rmlx-metrics/src/registry.rs" <<'PY'
@@ -114,7 +124,7 @@ old = 'pub const SPEC_METRICS: &[(&str, SpecRole)] = &['
 assert old in s, "fixture anchor missing"
 p.write_text(s.replace(old, 'pub const SPECULATIVE_METRICS: &[(&str, SpecRole)] = &[', 1))
 PY
-judge renamed_registry_const 2 "a rename of the oracle fails closed rather than reporting agreement" "no SPEC_METRICS entries found"
+judge renamed_registry_const 2 "a rename of the oracle fails closed, naming the registry" "no SPEC_METRICS entries found in crates/rmlx-metrics/src/registry.rs"
 
 echo
 echo "passed=${PASSED} failed=${FAILED}"

@@ -207,6 +207,13 @@ def check_seed(fields):
     # is silent in both checks above and makes the round count one too high on
     # every request that ran a round; each round emits at most what it accepted
     # plus the verifier's own token, and that is the budget it breaks.
+    #
+    # It catches the drift on a request that ran every round to `accept + 1`,
+    # which is a request the token budget and the stop token both left alone. A
+    # request whose last round emitted fewer than that sits under the budget and
+    # absorbs the off-by-one silently. Exact detection would need each loop to
+    # count the tokens its rounds emitted at the emit site, which is a counter on
+    # the hot path; this is what is checkable from what the loops already report.
     round_emitted = fields["emitted"] - fields["seed_emitted"]
     budget = fields["total_accept"] + fields["rounds"]
     if fields["rounds"] > 0 and round_emitted > budget:

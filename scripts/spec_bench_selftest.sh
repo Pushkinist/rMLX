@@ -117,7 +117,11 @@ DRAFT_MS = 300.0
 VERIFY_MS = 900.0
 ROUND_MS = 1800.0
 SEED_EMITTED = int(os.environ.get("STUB_SEED_EMITTED", "1"))
-TOTAL_ACCEPT = int(os.environ.get("STUB_TOTAL_ACCEPT", "98"))
+# 97 accepted over 30 rounds is 127 tokens the rounds could produce, and the
+# canned line emits 128 of which 1 is the seed — so the stub describes a request
+# that ran every round to `accept + 1`, which is the request the budget check can
+# see a too-early seed on. A line one under the budget absorbs the off-by-one.
+TOTAL_ACCEPT = int(os.environ.get("STUB_TOTAL_ACCEPT", "97"))
 DECODE_CONFIG = os.environ.get("STUB_DECODE_CONFIG", "mtp/block=5")
 # The engine composes both from one block, so the stub cannot make them
 # disagree by accident.
@@ -782,7 +786,7 @@ run_case round_loop_figures_recorded 0 \
 	"the speculative row carries the per-round split, not only the accept rate"
 for pair in \
 	"tokens_per_round 4.233333" \
-	"accepted_per_step 3.266667" \
+	"accepted_per_step 3.233333" \
 	"draft_ms_per_round 10.0" \
 	"verify_ms_per_round 30.0" \
 	"loop_ms_per_round 20.0"; do
@@ -841,12 +845,13 @@ run_case seed_contradicting_emitted_refused 1 \
 no_row mtp
 verdict
 
-# The drift that reaches a real request: a seed taken before the loop emitted it
-# credits the rounds with a token they could not have produced. 30 rounds
-# accepting 90 tokens can emit 120; 128 emitted against a seed of 1 is 127.
-run_case seed_over_the_round_budget_refused 1 \
-	"a seed taken too early credits the rounds with a token they could not emit" \
-	'STUB_TOTAL_ACCEPT=90' \
+# The drift itself, against the stub's own healthy counters: the seed captured
+# before the pre-round emit_step, so it reports 0 where the loop emitted 1. The
+# budget check catches it only when the request ran every round to accept + 1 —
+# this one does, and `check_seed`'s doc says so.
+run_case seed_taken_before_the_pre_round_emission_refused 1 \
+	"the drift itself is refused, not a manufactured inequality" \
+	'STUB_SEED_EMITTED=0' \
 	'GREP:seed count was taken before the loop had finished'
 no_row mtp
 verdict

@@ -867,8 +867,8 @@ a block policy or an acceptance walk can trade one for the other invisibly.
 
 | Gate | Loop | Oracle | Horizon |
 |---|---|---|---|
-| `crates/rmlx-models/tests/spec_greedy_equivalence.rs` | Gemma4 assistant | longest common subsequence with plain greedy ≥ 0.70 over the whole answer and ≥ 0.40 over every tail window, plus a repetition-loop control read over the whole stream and each tail cut, and a length-agreement guard, on both arms | 512 tokens |
-| the same file, `…_at_long_context` | Gemma4 assistant, 4k prompt | the same oracle | 512 tokens — **red until #506** |
+| `crates/rmlx-models/tests/spec_greedy_equivalence.rs` | Gemma4 assistant | longest common subsequence with plain greedy ≥ 0.70 over the whole answer and ≥ 0.40 over every tail window, plus a repetition-loop control read over the whole stream and each tail cut, and a length-agreement guard, on both arms | 256 tokens |
+| the same file, `…_at_long_context` | Gemma4 assistant, 4k prompt | the same oracle | 256 tokens — **red until #506** |
 | `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs` | MTP sidecar | shared prefix ≥ half | 48 tokens |
 | `crates/rmlx-models/tests/qwen3_5_eagle3_alignment.rs` | EAGLE-3 | shared prefix ≥ half | 48 tokens |
 | `crates/rmlx-models/tests/qwen3_5_two_model_alignment.rs` | two-model | shared prefix ≥ half | 48 tokens |
@@ -878,28 +878,42 @@ a block policy or an acceptance walk can trade one for the other invisibly.
 whole block in one forward where plain decode steps one token at a time, and
 that is a different reduction order. On the most favourable case there is — a
 full-attention verifier whose rollback is an exact KV truncation — the two arms
-share 66 leading tokens and then differ by one word, after which both continue
-the same explanation. A gate demanding identity fails on that; a gate on the
-shared prefix fails on it too, which is why the equivalence gate is
-length-scaled and read twice — over the whole answer and over each tail window,
-because one benign flip and a divergence that begins late both land near 0.8
-overall and only the second collapses a window. Measured on
-`gemma-4-e2b-it-mxfp8` + `gemma-4-E2B-it-assistant-bf16` at 512 tokens: 0.8438
-whole / 0.6484 weakest tail as shipped, 0.3070 / 0.2093 with one rejected draft
-key left in the cache.
+share 91 leading tokens and then differ by a word, after which both continue the
+same explanation. A gate demanding identity fails on that; a gate on the shared
+prefix fails on it too, which is why the equivalence gate is length-scaled and
+read twice — over the whole answer and over each tail window, because one benign
+flip and a divergence that begins late both land near 0.8 overall and only the
+second collapses a window. Measured on `gemma-4-e2b-it-mxfp8` +
+`gemma-4-E2B-it-assistant-bf16` at 256 tokens: 0.9180 whole / 0.6875 weakest
+tail as shipped, 0.4062 / 0.2031 with one rejected draft key left in the cache.
 
-**Longer is not better here.** Greedy decoding compounds, so the flip at token
-66 makes the two arms write different sections by token 800: the same pair reads
-0.914 at 256 tokens, 0.8438 at 512 and 0.6846 at its natural stop near 800 —
-below any floor that still refuses a broken rollback. 512 is the horizon where
-the regimes separate, not a length past which nothing goes wrong.
+**Longer is not better here.** Greedy decoding compounds, so a benign flip makes
+the two arms write different paragraphs a few hundred tokens later: the same
+pair reads 0.9180 at 256 tokens, 0.8438 at 512 and 0.6846 at its natural stop
+near 800 — the last below any floor that still refuses a broken rollback. 256 is
+the horizon where the regimes separate, not a length past which nothing goes
+wrong.
+
+**Both prompts ask for prose, and that is load-bearing.** The gate also refuses
+a pair whose two arms have collapsed into the *same* loop, which the subsequence
+oracle cannot do by itself — it measures a subsequence over one periodic base,
+so two arms sharing a healthy prefix and then locked in the same period-8 loop
+read 0.70 to 0.93 across the whole 12–40% ragged range. The repetition control
+that refuses them has no general threshold: healthy output spans 0.03 for prose
+to 0.88 for a markdown table with a yes/no column, and degenerate output 0.37 to
+1.00, two overlapping populations. Prose is where they separate — the real arms
+read 0.089 and 0.100 against a ceiling of 0.50, and 1000 synthetic healthy
+streams at each of six lengths trip it none. Structured output trips the
+control, which is a false positive on an input the gate controls rather than a
+class it lets through.
 
 **A real defect sits past that horizon — issue #506.** Driven from
 `prompts/longctx_4k.json` instead of the gate's short prompt, the
-Gemma4-assistant speculative arm collapses into a period-8 repetition loop
-(`x86 is:66 is x86 is:66 is …`, filling its window from token 128 on) while
-plain greedy writes a clean summary and stops at 200 — whole-stream LCS 0.11,
-first divergence at token 3. It reproduces identically on `main` (8ccc0593). The Qwen
+Gemma4-assistant speculative arm runs to the token budget writing a different,
+degraded summary while plain greedy writes a clean one and stops at 218 —
+whole-stream LCS 0.2798, first divergence at token 6. Asked instead for a
+structured section-by-section summary, the same defect showed as an outright
+period-8 repetition loop (`x86 is:66 is x86 is:66 is …`) reading 1.0000. It reproduces identically on `main` (8ccc0593). The Qwen
 MTP sidecar's 0.520 above is the same issue's second case.
 `speculative_greedy_reproduces_plain_greedy_at_long_context` is that run as an
 `#[ignore]`d reproducer and **fails until #506 is fixed**; fixing it is what

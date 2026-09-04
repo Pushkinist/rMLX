@@ -10,10 +10,9 @@
 //! whole block in one forward where plain decode steps one token at a time, and
 //! that is a different reduction order. On the Gemma4-e2b assistant pair — a
 //! full-attention verifier whose rollback is an exact KV truncation, the most
-//! favourable case there is — the two arms share 66 leading tokens and then
-//! differ by one word ("Separate Chaining (Most Common Method)" against
-//! "(The Most Common Method)"), after which both continue the same explanation.
-//! A gate demanding identity would fail on that.
+//! favourable case there is — the two arms share 91 leading tokens and then
+//! differ by a word, after which both continue the same explanation. A gate
+//! demanding identity would fail on that.
 //!
 //! **The oracle is therefore length-scaled, not positional**, and it is read
 //! twice: over the whole answer, and over each tail window, because those
@@ -24,8 +23,8 @@
 //!
 //! | rollback | whole-stream LCS | weakest tail window | first divergence |
 //! |---|---|---|---|
-//! | as shipped | 0.8438 | 0.6484 at token 384 | 66 |
-//! | one rejected draft key left in the cache | 0.3070 | 0.2093 at token 256 | 5 |
+//! | as shipped | 0.9180 | 0.6875 at token 192 | 91 |
+//! | one rejected draft key left in the cache | 0.4062 | 0.2031 at token 192 | 8 |
 //!
 //! [`MIN_LCS_RATIO`] and [`MIN_TAIL_LCS_RATIO`] sit in those gaps. The shared
 //! prefix is reported and never asserted on: it collapses the moment a near-tie
@@ -41,21 +40,25 @@
 //! **Length is bounded from both sides.** Two configurations that differ can
 //! agree for the first few dozen tokens of an easy answer, so a short run is a
 //! gate that cannot fail. A long one is a different trap: greedy decoding
-//! compounds, so one benign flip at token 66 makes the two arms write different
-//! sections by token 800, and the same pair that reads 0.914 at 256 tokens
-//! reads 0.6846 at its natural stop near 800 — below any floor that still
-//! refuses a broken rollback. [`N_TOKENS`] is the horizon where the two regimes
-//! are separable; it is not a length past which nothing goes wrong.
+//! compounds, so one benign flip makes the two arms write different paragraphs a
+//! few hundred tokens later — the same pair reads 0.9180 at 256 tokens, 0.8438
+//! at 512 and 0.6846 at its natural stop near 800, the last below any floor that
+//! still refuses a broken rollback. [`N_TOKENS`] is the horizon where the two
+//! regimes are separable; it is not a length past which nothing goes wrong.
 //!
-//! **The control, and what it does not claim.** A token stream that has
-//! collapsed into a repetition loop matches anything, so "the two agree" would
-//! pass on garbage. Every run checks that neither arm repeats at a short period
-//! across more than [`MAX_CYCLE_FRACTION`] of its tokens — over the whole stream
-//! and over each of the same tail cuts the oracle uses, at every period up to
-//! [`MAX_CYCLE_PERIOD`], from at least [`MIN_CYCLE_SAMPLES`] comparisons.
+//! **The control.** Two arms that collapse into the *same* loop agree on
+//! garbage, and the subsequence oracle cannot refuse that by itself — it
+//! measures a subsequence over the same periodic base, so independent
+//! raggedness costs it far less than it costs a cycle reading. Two arms sharing
+//! a healthy prefix and then locked in the same period-8 loop read LCS 0.70 to
+//! 0.93 across the whole 12–40% ragged range. So every run also checks that
+//! neither arm repeats at a short period across more than
+//! [`MAX_CYCLE_FRACTION`] of its tokens — over the whole stream and over each of
+//! the same tail cuts the oracle uses, at every period up to
+//! [`MAX_CYCLE_PERIOD`] that leaves [`MIN_CYCLE_SAMPLES`] comparisons.
 //!
-//! Three real degeneracies score under any ceiling on a whole-stream sweep at a
-//! short period, which is why it is neither:
+//! Windowing and the period sweep are both load-bearing; three real degeneracies
+//! score under any ceiling without them:
 //!
 //! | shape | whole stream, period ≤ 8 | whole stream, period ≤ 64 | windowed |
 //! |---|---|---|---|
@@ -63,46 +66,38 @@
 //! | collapse over the last two fifths | 0.3992 | 0.3992 | 1.0000 |
 //! | a twelve-token phrase over four fifths | 0.0000 | 0.7960 | 1.0000 |
 //!
-//! **The ceiling sits between two measured populations, and they do not quite
-//! meet.** Structured output is not a loop, and both of this gate's prompts ask
-//! for exactly the shapes that come closest to one:
+//! **There is no general threshold, which is why the prompts are what they
+//! are.** Healthy output spans 0.03 for prose to 0.88 for a markdown table with
+//! a yes/no column; degenerate output spans 0.37 for a ragged loop to 1.00 for
+//! an exact one. Those populations overlap over most of their range and no
+//! ceiling separates them — an earlier revision of this file put one at 0.85 and
+//! thereby admitted every pair in the ragged range while refusing a healthy
+//! low-entropy table.
 //!
-//! | healthy shape | windowed | | loop varying in | windowed |
-//! |---|---|---|---|---|
-//! | prose | 0.06 | | nothing | 1.0000 |
-//! | a stock phrase every 16 tokens | 0.27 | | 1 token in 50 | 0.95–0.99 |
-//! | a numbered list | 0.64 | | 1 token in 20 | 0.88–0.95 |
-//! | a markdown table | 0.68 | | 1 token in 10 | 0.80–0.89 |
-//! | a table in the last quarter | 0.69 | | 1 token in 5 | 0.63–0.75 |
+//! Prose is the regime where they do separate, and this gate owns its prompts.
+//! [`PROSE_INSTRUCTION`] is what makes the ceiling meaningful: measured on the
+//! real pair the two arms read 0.0893 and 0.1000, and 1000 synthetic healthy
+//! streams at each of six lengths trip it 0 times with a peak of 0.1351
+//! (`the_false_positive_rate_on_healthy_output` prints that). At 0.50 the whole
+//! ragged range is refused, and at 50% raggedness [`MIN_LCS_RATIO`] takes over —
+//! no gap between them.
 //!
-//! So the control claims one thing: **an arm locked into a near-exact cycle**.
-//! Above 0.85 nothing healthy was measured and every loop varying in at most a
-//! token in twenty was. Below it the two populations overlap — a healthy
-//! markdown table (0.69) and a loop varying in one token in five (0.63–0.75) are
-//! the same reading, and no threshold separates them. That band is a declared
-//! blind spot rather than an oversight: moving the ceiling down to catch the
-//! ragged loop would fail the table, and this repository has been bitten before
-//! by a verdict whose label drifted while its threshold stayed put.
-//!
-//! Measured on the pair itself: the passing gate's two arms read 0.0571 and
-//! 0.0841, and the failing reproducer's speculative arm reads 1.0000 at period
-//! 8 while its plain arm reads 0.0855 — so that failure is attributable to the
-//! collapse and not to a control misreading a short arm.
-//!
-//! The blind spot is also where the control is least needed. It exists for the
-//! case that defeats the subsequence oracle — two arms collapsing *identically*,
-//! which requires the collapse to be near-exact. A ragged loop produces two
-//! different ragged streams, their subsequence ratio falls, and
-//! [`MIN_LCS_RATIO`] is what refuses them.
+//! The limit that remains is a false *positive*: structured output trips this
+//! control. That is an input the gate controls rather than a class it lets
+//! through, and it is recorded by
+//! `structured_output_trips_the_control_which_is_why_the_prompts_forbid_it`.
 //!
 //! **Known gap: this gate runs at a short context and there is a defect past
 //! it.** `speculative_greedy_reproduces_plain_greedy_at_long_context` is the
 //! same gate over the 4k document in `prompts/longctx_4k.json` and it **fails
 //! today**: the speculative arm collapses into a period-8 repetition loop
 //! (`x86 is:66 is x86 is:66 is …`) while plain greedy writes a clean summary and
-//! stops at 200 — whole-stream LCS 0.11, first divergence at token 3, and the
-//! collapsed window reading 1.0000 at period 8 from token 128. It
-//! reproduces identically on `main` (8ccc0593), so it is not this branch's. It
+//! stops at 218 while the speculative arm runs to the budget writing a
+//! different, degraded summary — whole-stream LCS 0.2798, first divergence at
+//! token 6. Asked for the structured summary an earlier revision of this file
+//! used, the same defect showed as an outright period-8 repetition loop reading
+//! 1.0000. It reproduces identically on `main` (8ccc0593), so it is not this
+//! branch's. It
 //! is filed, with the Qwen MTP sidecar's 0.520 as a second case, and it is a
 //! reproducer rather than a paragraph so that fixing it is what moves this gate
 //! onto the long prompt.
@@ -142,7 +137,7 @@ use rmlx_models::speculative::gemma4_assistant::{
 /// alignment suites compare. Running *past* the answer is the opposite problem:
 /// with no stop ids both arms emit end-of-turn forever, and a comparison over
 /// that filler measures nothing about the round loop.
-const N_TOKENS: usize = 512;
+const N_TOKENS: usize = 256;
 
 /// The shorter arm must be at least this long on the short prompt, or there is
 /// not enough answer to compare. A digest over 32 generated tokens has already
@@ -150,14 +145,44 @@ const N_TOKENS: usize = 512;
 /// them.
 const MIN_ANSWER_TOKENS: usize = 256;
 
+/// Which prompt an arm came from, and so how much answer the gate may demand.
+///
+/// A closed type rather than a `usize` parameter: `judge(a, b, 0)` disables the
+/// length guard entirely and nothing would refuse it. The two constants below
+/// stay the only producers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Horizon {
+    /// The short prose prompt, which answers past the budget.
+    ShortPrompt,
+    /// The 4k document, whose summary is shorter.
+    LongContext,
+}
+
+impl Horizon {
+    const fn min_answer(self) -> usize {
+        match self {
+            Self::ShortPrompt => MIN_ANSWER_TOKENS,
+            Self::LongContext => MIN_LONG_CONTEXT_ANSWER_TOKENS,
+        }
+    }
+}
+
 /// The same floor for the long-context case, whose prompt answers shorter.
 ///
-/// Plain greedy writes its summary of that document in about 200 tokens and
-/// stops. A floor of 256 there would fail a *fixed* engine — both arms would
-/// agree at ~200 tokens and the gate would still report "an arm stopped early",
-/// so the reproducer could never flip to green and would have to be rewritten
-/// after the fix, which is the outcome it exists to prevent.
-const MIN_LONG_CONTEXT_ANSWER_TOKENS: usize = 150;
+/// **Measured**, not chosen: plain greedy writes its summary of that document in
+/// 218 tokens and stops, so the floor is set just under the length a correct
+/// engine produces. A floor of 256 would fail a *fixed* engine — both arms would
+/// agree at ~218 tokens and the gate would still report "an arm stopped early",
+/// so the reproducer could never flip to green. A much lower one would admit
+/// arms whose last tail window is too short to read the period the collapse
+/// repeats at: at 200 tokens that window is 50 and periods to 18 are readable,
+/// which covers the documented period-8 loop; at 150 it is 38 and they are not.
+const MIN_LONG_CONTEXT_ANSWER_TOKENS: usize = 200;
+
+/// What plain greedy actually answers that prompt in, measured on the pair.
+/// The floor above is set under it; `a_fixed_engine_would_pass_the_long_context_reproducer`
+/// drives a stream of this length through `judge` so the relation is pinned.
+const MEASURED_LONG_CONTEXT_PLAIN_ARM: usize = 218;
 
 /// The shorter arm over the longer. `lcs_ratio` divides by the shorter stream,
 /// so an arm that stopped at a third of the other's length and matched its
@@ -180,15 +205,23 @@ const MAX_CTX: i32 = 8192;
 /// the cache.
 const MIN_LCS_RATIO: f64 = 0.70;
 
-/// How nearly exactly an arm — or any tail cut of it — may repeat at a short
-/// period before it counts as locked into a cycle.
+/// How much of an arm — or of any tail cut of it — may repeat at a short period
+/// before it counts as collapsed.
 ///
-/// Set in the gap between two measured populations, not moved until fixtures
-/// passed: every structured-but-healthy shape measured reads at most 0.6939 and
-/// every loop varying in at most one token in twenty reads at least 0.8750. See
-/// the module docs for both tables, and for the band between them that this
-/// control deliberately does not claim.
-const MAX_CYCLE_FRACTION: f64 = 0.85;
+/// Set against **the output this gate's own prompts produce**, which is prose:
+/// the real arms read 0.0893 and 0.1000, and 1800 synthetic healthy streams
+/// across six lengths peaked at 0.1212. Every pair of arms locked in the same
+/// period-8 loop up to 40% raggedness is refused above it, and at 50% the
+/// subsequence floor takes over — so the whole degenerate range is covered with
+/// no gap.
+///
+/// It is **not** a general degeneracy threshold and there is none: healthy
+/// markdown tables read 0.68 to 0.88 on this measure and ragged loops read 0.37
+/// to 0.85, two populations overlapping over most of their range. Structured
+/// output therefore trips this control, which is why [`PROSE_INSTRUCTION`]
+/// exists and why the value here is only meaningful for arms these prompts
+/// produced.
+const MAX_CYCLE_FRACTION: f64 = 0.50;
 
 /// Longest cycle the control looks for.
 ///
@@ -197,8 +230,8 @@ const MAX_CYCLE_FRACTION: f64 = 0.85;
 /// 0.0000 at any period under 12 and 0.7960 at 12. The defect this file
 /// documents repeats at period 8, one step under the ceiling this replaced.
 ///
-/// Bounded again by a quarter of whatever window is being read: a period that
-/// long inside a short window leaves too few comparisons to mean anything.
+/// Bounded again by what leaves [`MIN_CYCLE_SAMPLES`] comparisons in whatever
+/// window is being read, which is the only bound that turned out to be needed.
 const MAX_CYCLE_PERIOD: usize = 64;
 
 /// Fewest comparisons a cycle reading may be computed from.
@@ -206,10 +239,17 @@ const MAX_CYCLE_PERIOD: usize = 64;
 /// `strongest_cycle` divides by `len - period`. In the last quarter of a
 /// 256-token arm that is a 64-token window, and at period 63 the denominator is
 /// **one comparison** — a single coincidental token match read 1.0000 and the
-/// gate reported a repetition loop on healthy output. Measured over 200 healthy
-/// synthetic streams per length, that fired on 3% of 256-token arms, 8.5% at 120
-/// and 15% at 40; with this floor and the window bound above, 0 of 300 at every
-/// length.
+/// gate reported a repetition loop on healthy output. Every false positive
+/// observed came from a denominator of one or two, at any ceiling, so this floor
+/// is the whole fix; `the_false_positive_rate_on_healthy_output` prints the
+/// measured rate per length rather than recording a number nothing can
+/// regenerate.
+///
+/// A bound on the *period relative to the window* was tried alongside it and
+/// removed: it changed no false-positive rate and it blinded the sweep to real
+/// collapses — a period-40 loop over the last quarter of a 512-token arm read
+/// 0.4074 under it and 1.0000 without it, which is the shape the windowed sweep
+/// exists for.
 const MIN_CYCLE_SAMPLES: usize = 32;
 
 /// The stream is cut at each `1/TAIL_WINDOWS` boundary and the suffixes
@@ -265,11 +305,8 @@ fn lcs_ratio(a: &[u32], b: &[u32]) -> f64 {
 /// at zero.
 fn strongest_cycle(tokens: &[u32]) -> (usize, f64) {
     let mut worst = (1usize, 0.0f64);
-    for period in 1..=MAX_CYCLE_PERIOD.min(tokens.len() / 4) {
+    for period in 1..=MAX_CYCLE_PERIOD.min(tokens.len().saturating_sub(MIN_CYCLE_SAMPLES)) {
         let samples = tokens.len() - period;
-        if samples < MIN_CYCLE_SAMPLES {
-            continue;
-        }
         let matches = tokens[period..]
             .iter()
             .zip(tokens)
@@ -325,7 +362,7 @@ fn weakest_tail(spec: &[u32], plain: &[u32]) -> (usize, f64) {
 
 /// Judge one pair of streams. Returns the failure text, or `None` when the
 /// oracle and both controls held.
-fn judge(spec: &[u32], plain: &[u32], min_answer: usize) -> Option<String> {
+fn judge(spec: &[u32], plain: &[u32], horizon: Horizon) -> Option<String> {
     let shorter = spec.len().min(plain.len());
     let longer = spec.len().max(plain.len());
 
@@ -342,6 +379,7 @@ fn judge(spec: &[u32], plain: &[u32], min_answer: usize) -> Option<String> {
         }
     }
 
+    let min_answer = horizon.min_answer();
     if shorter < min_answer {
         return Some(format!(
             "an arm stopped early — spec={} plain={}, under {min_answer}; a short \
@@ -396,7 +434,7 @@ fn a_single_flip_passes_and_a_divergent_stream_does_not() {
     let mut one_flip = plain.clone();
     one_flip[66] = 9999;
     assert!(
-        judge(&one_flip, &plain, MIN_ANSWER_TOKENS).is_none(),
+        judge(&one_flip, &plain, Horizon::ShortPrompt).is_none(),
         "one flip must pass"
     );
 
@@ -406,7 +444,7 @@ fn a_single_flip_passes_and_a_divergent_stream_does_not() {
         .map(|(i, t)| if i > 8 { 50_000 + i as u32 } else { *t })
         .collect();
     let failure =
-        judge(&diverged, &plain, MIN_ANSWER_TOKENS).expect("a divergent stream must fail");
+        judge(&diverged, &plain, Horizon::ShortPrompt).expect("a divergent stream must fail");
     assert!(failure.contains("did not reproduce"), "{failure}");
 }
 
@@ -464,7 +502,7 @@ fn every_shape_of_repetition_loop_is_refused() {
                 .collect(),
         ),
     ] {
-        let failure = judge(&stream, &stream, MIN_ANSWER_TOKENS)
+        let failure = judge(&stream, &stream, Horizon::ShortPrompt)
             .unwrap_or_else(|| panic!("{shape} was not refused"));
         assert!(failure.contains("repetition loop"), "{shape}: {failure}");
     }
@@ -476,7 +514,7 @@ fn every_shape_of_repetition_loop_is_refused() {
 fn a_degenerate_speculative_arm_is_caught() {
     let plain: Vec<u32> = (0..N_TOKENS as u32).collect();
     let looping = vec![7u32; N_TOKENS];
-    let failure = judge(&looping, &plain, MIN_ANSWER_TOKENS).expect("must refuse");
+    let failure = judge(&looping, &plain, Horizon::ShortPrompt).expect("must refuse");
     assert!(failure.contains("speculative arm"), "{failure}");
 }
 
@@ -511,21 +549,28 @@ impl Rng {
     }
 }
 
-/// Structured output is not a repetition loop, and it is what both of this
-/// gate's prompts ask for.
+/// Structured output trips this control, and that is why the prompts forbid it.
 ///
 /// A markdown table repeats its delimiters every row and a numbered list its
-/// `N. **` prefix every item; on the same measure they read far above prose.
-/// The previous control could not see that — and the previous ceiling of 0.50
-/// sat underneath both of them, so the gate would have called a healthy table a
-/// collapse. The readings are in the module docs.
+/// `N. **` prefix every item. On this measure they read far above prose and
+/// above any ceiling that still refuses a ragged loop — so the control is not a
+/// general degeneracy classifier and this test records that rather than
+/// asserting it away. [`PROSE_INSTRUCTION`] is what keeps these shapes out of
+/// the arms the gate actually judges; if an answer ever comes back structured,
+/// the gate refuses it and the reason will say "repetition loop", which is this
+/// limit and not a defect in the engine.
 #[test]
-fn structured_but_healthy_output_clears_the_repetition_control() {
+fn structured_output_trips_the_control_which_is_why_the_prompts_forbid_it() {
     let mut rng = Rng(0x5EED_5EED);
     let mut table = Vec::new();
     while table.len() < N_TOKENS {
         // `| ` name `| ` value `|` newline — two of six tokens vary.
         table.extend_from_slice(&[900, 901, rng.below(50), 902, rng.below(50), 903]);
+    }
+    let mut boolean_table = Vec::new();
+    while boolean_table.len() < N_TOKENS {
+        // The same shape with a yes/no column: lower entropy, higher reading.
+        boolean_table.extend_from_slice(&[900, 901, rng.below(2), 902, rng.below(2), 903]);
     }
     let mut numbered = Vec::new();
     while numbered.len() < N_TOKENS {
@@ -533,104 +578,30 @@ fn structured_but_healthy_output_clears_the_repetition_control() {
         numbered.extend((0..3).map(|_| rng.below(80)));
         numbered.extend_from_slice(&[913, 914]);
     }
-    let mut phrased = Vec::new();
-    while phrased.len() < N_TOKENS {
-        phrased.extend_from_slice(&[920, 921, 922, 923]);
-        phrased.extend((0..12).map(|_| rng.below(200)));
-    }
-    let prose = Rng(0xC0FF_EE00).prose(N_TOKENS);
-    let tail_table: Vec<u32> = Rng(0xBEEF)
-        .prose(N_TOKENS * 3 / 4)
-        .into_iter()
-        .chain(table.iter().copied())
-        .take(N_TOKENS)
-        .collect();
-
     for (shape, stream) in [
-        ("healthy prose", prose),
         ("a markdown table", table[..N_TOKENS].to_vec()),
-        ("a table confined to the last quarter", tail_table),
-        ("a numbered list", numbered[..N_TOKENS].to_vec()),
         (
-            "a stock phrase every sixteen tokens",
-            phrased[..N_TOKENS].to_vec(),
+            "a table with a yes/no column",
+            boolean_table[..N_TOKENS].to_vec(),
         ),
+        ("a numbered list", numbered[..N_TOKENS].to_vec()),
     ] {
-        let (start, period, fraction) = strongest_windowed_cycle(&stream);
+        let (_, _, fraction) = strongest_windowed_cycle(&stream);
         assert!(
-            fraction <= MAX_CYCLE_FRACTION,
-            "{shape} reads {fraction:.4} at period {period} from {start}, over the \
-             ceiling {MAX_CYCLE_FRACTION} — the control would call healthy output a \
-             collapse"
-        );
-        assert!(
-            judge(&stream, &stream, MIN_ANSWER_TOKENS).is_none(),
-            "{shape}"
+            fraction > MAX_CYCLE_FRACTION,
+            "{shape} reads {fraction:.4}, at or under the ceiling — if structured \
+             output has stopped tripping this control the module docs are wrong \
+             about why the prompts are what they are"
         );
     }
 }
 
-/// The two bounds that make the reading mean something, each isolated.
-///
-/// `strongest_cycle` divides by `len - period`. Without a floor on that
-/// denominator and a bound on the period relative to the window, a reading can
-/// be one coincidental comparison out of one — which is what made the control
-/// fire on healthy output. These are exact fixtures, not draws: each is a
-/// stream whose only strong cycle is unreadable under the bounds, so it must
-/// read zero.
+/// Prose does not, at any length the gate can hand it, and that is the
+/// population the ceiling is set against.
 #[test]
-#[allow(
-    clippy::float_cmp,
-    reason = "the assertion is that no reading was taken at all, which is exactly               zero; a band would accept a reading taken from too few samples"
-)]
-fn a_cycle_no_window_can_support_is_not_read() {
-    // One coincidence at distance 63 in a 64-token window: one comparison,
-    // read as 1.0000 before the bounds. Either bound alone refuses it.
-    let mut coincidence: Vec<u32> = (0..64).collect();
-    coincidence[63] = 0;
-    assert_eq!(
-        strongest_cycle(&coincidence).1,
-        0.0,
-        "a reading from a single comparison must not be taken"
-    );
-
-    // An exact period of 60 in 200 tokens: 140 comparisons, so the sample floor
-    // admits it and only the window bound refuses it. A cycle a quarter of the
-    // window long is not a cycle the window can establish.
-    let long_period: Vec<u32> = (0..200u32).map(|i| i % 60).collect();
-    assert_eq!(
-        strongest_cycle(&long_period).1,
-        0.0,
-        "a period past a quarter of the window must not be read"
-    );
-
-    // An exact period of 10 in 40 tokens: inside the window bound, and only 30
-    // comparisons, so only the sample floor refuses it.
-    let short_window: Vec<u32> = (0..40u32).map(|i| i % 10).collect();
-    assert_eq!(
-        strongest_cycle(&short_window).1,
-        0.0,
-        "a reading from fewer than the sample floor must not be taken"
-    );
-
-    // The bounds are a floor on evidence, not a blanket: the same period over a
-    // window that can support it is still read.
-    let supported: Vec<u32> = (0..N_TOKENS as u32).map(|i| i % 10).collect();
-    assert!(
-        strongest_cycle(&supported).1 > MAX_CYCLE_FRACTION,
-        "an exact cycle a full window supports must still be caught"
-    );
-}
-
-/// The control is not flaky on healthy output at any length it can be handed.
-///
-/// It reads a window as short as a quarter of the arm, and the arm can be as
-/// short as a run that stopped early — the controls deliberately run before the
-/// length check. Without a bound on the period and a floor on the sample count,
-/// a single coincidental match in a 64-token window at period 63 read 1.0000.
-#[test]
-fn the_control_does_not_fire_on_healthy_output_at_any_length() {
-    for len in [40usize, 120, 200, 256, 300, 512] {
+fn prose_clears_the_control_at_every_length_the_gate_can_hand_it() {
+    let mut worst = 0.0f64;
+    for len in [40usize, 120, 200, 218, 256] {
         for seed in 0..64u64 {
             let stream = Rng(0x1234_0000 + seed).prose(len);
             let (start, period, fraction) = strongest_windowed_cycle(&stream);
@@ -639,69 +610,184 @@ fn the_control_does_not_fire_on_healthy_output_at_any_length() {
                 "healthy prose of {len} tokens (seed {seed}) read {fraction:.4} at \
                  period {period} from {start}"
             );
+            worst = worst.max(fraction);
         }
     }
+    assert!(
+        worst < MAX_CYCLE_FRACTION * 0.5,
+        "the margin over healthy prose has fallen to {worst:.4} against a ceiling \
+         of {MAX_CYCLE_FRACTION}; the real arms measure about 0.09"
+    );
 }
 
-/// What the control claims, stated as the boundary it was measured at: a stream
-/// locked into a near-exact cycle is caught, and one that varies more than
-/// about a token in twenty is not. That second half is a blind spot, not an
-/// oversight — see the module docs for why no threshold closes it.
+/// The one bound that makes a reading mean something.
+///
+/// `strongest_cycle` divides by `len - period`. Without a floor on that
+/// denominator a reading can be one coincidental comparison out of one, which
+/// is what made the control fire on healthy output. A bound on the period
+/// relative to the window was tried alongside it and removed: it changed no
+/// false-positive rate and blinded the sweep to real collapses.
 #[test]
-fn the_control_catches_a_near_exact_cycle_and_declares_the_band_it_does_not() {
-    let cycle = |noise_in_100: u64, seed: u64| -> f64 {
-        let mut rng = Rng(0xA5A5_0000 + seed);
-        let head = Rng(seed + 1).prose(N_TOKENS / 4);
-        let tail: Vec<u32> = (0..N_TOKENS - N_TOKENS / 4)
-            .map(|i| {
-                if u64::from(rng.below(100)) < noise_in_100 {
-                    rng.below(300)
-                } else {
-                    1000 + (i % 8) as u32
-                }
-            })
-            .collect();
-        let stream: Vec<u32> = head.into_iter().chain(tail).collect();
-        strongest_windowed_cycle(&stream).2
-    };
+#[allow(
+    clippy::float_cmp,
+    reason = "the assertion is that no reading was taken at all, which is \
+              exactly zero; a band would accept a reading from too few samples"
+)]
+fn a_cycle_too_short_a_window_to_evidence_is_not_read() {
+    // One coincidence at distance 63 in a 64-token window: one comparison.
+    let mut coincidence: Vec<u32> = (0..64).collect();
+    coincidence[63] = 0;
+    assert_eq!(
+        strongest_cycle(&coincidence).1,
+        0.0,
+        "a reading from a single comparison must not be taken"
+    );
 
-    for seed in 0..8 {
-        let exact = cycle(0, seed);
-        assert!(
-            exact > MAX_CYCLE_FRACTION,
-            "an exact cycle read {exact:.4}, at or under the ceiling"
-        );
-        let noisy = cycle(30, seed);
-        assert!(
-            noisy <= MAX_CYCLE_FRACTION,
-            "a cycle varying in three tokens of ten read {noisy:.4} — if this now \
-             trips, the band the module docs declare as not covered has moved and \
-             the claim has to move with it"
+    // An exact period of 10 in 40 tokens: 30 comparisons, under the floor.
+    let short_window: Vec<u32> = (0..40u32).map(|i| i % 10).collect();
+    assert_eq!(
+        strongest_cycle(&short_window).1,
+        0.0,
+        "a reading from fewer than the sample floor must not be taken"
+    );
+
+    // The floor is a floor on evidence, not a blanket. 140 comparisons all
+    // matching at period 60 is overwhelming, and the quarter-window bound used
+    // to score it 0.0000 — the case that showed the bound cost real detection.
+    let long_period: Vec<u32> = (0..200u32).map(|i| i % 60).collect();
+    assert!(
+        strongest_cycle(&long_period).1 > MAX_CYCLE_FRACTION,
+        "an exact period-60 cycle over 140 comparisons must be read, not bounded away"
+    );
+
+    let supported: Vec<u32> = (0..N_TOKENS as u32).map(|i| i % 10).collect();
+    assert!(
+        strongest_cycle(&supported).1 > MAX_CYCLE_FRACTION,
+        "an exact cycle a full window supports must still be caught"
+    );
+}
+
+/// The false-positive rate of the control on healthy output, per length.
+///
+/// Not a gate: it prints. Three rounds of review disagreed about this rate by a
+/// factor of three to five because the measuring code was never committed and
+/// the surviving tests could only observe the "after" state, so nothing in the
+/// tree could adjudicate. This is that code.
+///
+/// `#[ignore]` because it is a measurement over thousands of streams and says
+/// nothing about correctness; `prose_clears_the_control_at_every_length_the_gate_can_hand_it`
+/// is the assertion. Run it with `--ignored --nocapture`; it reaches no device.
+// gpu-test-gate: exempt
+#[ignore = "measurement, not an assertion: prints the false-positive rate per length"]
+#[test]
+fn the_false_positive_rate_on_healthy_output() {
+    const TRIALS: u64 = 1000;
+    println!(
+        "healthy-prose false positives, {TRIALS} streams per length, ceiling {MAX_CYCLE_FRACTION}"
+    );
+    for len in [40usize, 120, 200, 218, 256, 512] {
+        let mut trips = 0u32;
+        let mut worst = 0.0f64;
+        for seed in 0..TRIALS {
+            let f = strongest_windowed_cycle(&Rng(0x9E37_0000 + seed).prose(len)).2;
+            worst = worst.max(f);
+            if f > MAX_CYCLE_FRACTION {
+                trips += 1;
+            }
+        }
+        println!(
+            "  len={len:4}  trips={trips:4}/{TRIALS}  rate={:.3}%  max reading={worst:.4}",
+            f64::from(trips) * 100.0 / TRIALS as f64
         );
     }
 }
 
+/// **The pair regime.** Two arms that share a real prefix and then collapse into
+/// the same loop agree on garbage, and that is the one case the subsequence
+/// oracle cannot refuse by itself — it is a subsequence measure over the same
+/// periodic base, and independent raggedness costs it far less than it costs
+/// the cycle reading. Every fixture in this file before this one judged a
+/// single arm, or a pair whose heads were independently seeded, so this regime
+/// was never tested and a false claim about it went unnoticed for two rounds.
+#[test]
+fn two_arms_in_the_same_ragged_loop_are_not_a_pass() {
+    let head = Rng(0xFEED).prose(N_TOKENS / 2);
+    let arm = |seed: u64, noise: u64| -> Vec<u32> {
+        let mut rng = Rng(seed);
+        let mut out = head.clone();
+        for i in 0..N_TOKENS / 2 {
+            out.push(if u64::from(rng.below(100)) < noise {
+                rng.below(300)
+            } else {
+                1000 + (i % 8) as u32
+            });
+        }
+        out
+    };
+    for noise in [0u64, 12, 16, 25, 30, 40] {
+        let (a, b) = (arm(0x33, noise), arm(0x44, noise));
+        let verdict = judge(&a, &b, Horizon::ShortPrompt);
+        assert!(
+            verdict.is_some(),
+            "two arms {noise}% ragged in the same period-8 loop passed: lcs {:.4}, \
+             cycles {:.4} and {:.4} — they agree on garbage and the gate called it \
+             agreement",
+            lcs_ratio(&a, &b),
+            strongest_windowed_cycle(&a).2,
+            strongest_windowed_cycle(&b).2,
+        );
+    }
+}
+
+/// A collapse over the last quarter of a long arm is what the windowed sweep
+/// was added for, and a pair of them must not pass.
+#[test]
+fn two_arms_collapsing_over_their_last_quarter_are_not_a_pass() {
+    let head = Rng(0xC0DE).prose(N_TOKENS * 3 / 4);
+    let arm = |seed: u64| -> Vec<u32> {
+        let mut rng = Rng(seed);
+        let mut out = head.clone();
+        for i in 0..N_TOKENS - N_TOKENS * 3 / 4 {
+            out.push(if rng.below(100) < 5 {
+                rng.below(300)
+            } else {
+                1000 + (i % 16) as u32
+            });
+        }
+        out
+    };
+    let (a, b) = (arm(0x55), arm(0x66));
+    assert!(
+        judge(&a, &b, Horizon::ShortPrompt).is_some(),
+        "two arms collapsing into a period-16 loop over their last quarter passed: \
+         lcs {:.4}, cycles {:.4} and {:.4}",
+        lcs_ratio(&a, &b),
+        strongest_windowed_cycle(&a).2,
+        strongest_windowed_cycle(&b).2,
+    );
+}
 /// The subsequence ratio is taken over the shorter arm, so an arm that stopped
 /// early and matched the other's prefix scores 1.0 and says nothing about the
 /// tail it never wrote. The length guard is the only thing between that and a
 /// green gate, and this pins both halves: the denominator and the guard.
 #[test]
 fn the_ratio_is_over_the_shorter_arm_and_the_length_guard_covers_it() {
-    let plain: Vec<u32> = (0..N_TOKENS as u32).map(|t| t % 97).collect();
+    // Twice the budget, so the *ratio* is what fires rather than the floor.
+    let plain: Vec<u32> = Rng(0x1E17_0000).prose(N_TOKENS * 2);
 
-    let truncated = &plain[..300];
+    let truncated = &plain[..N_TOKENS + 4];
     assert!(
         (lcs_ratio(truncated, &plain) - 1.0).abs() < 1e-9,
         "a true prefix must score 1.0 over the shorter arm; it read {}",
         lcs_ratio(truncated, &plain)
     );
     let failure =
-        judge(truncated, &plain, MIN_ANSWER_TOKENS).expect("the length guard must refuse it");
+        judge(truncated, &plain, Horizon::ShortPrompt).expect("the length guard must refuse it");
     assert!(failure.contains("stopped well before"), "{failure}");
 
     // Just inside the guard the same shape scores 1.0 and passes, which is what
     // makes the guard — not the ratio — the thing doing the work above.
-    assert!(judge(&plain[..350], &plain, MIN_ANSWER_TOKENS).is_none());
+    assert!(judge(&plain[..N_TOKENS + 84], &plain, Horizon::ShortPrompt).is_none());
 }
 
 /// The long-context reproducer can flip to green.
@@ -718,17 +804,52 @@ fn the_ratio_is_over_the_shorter_arm_and_the_length_guard_covers_it() {
               unwrapping the None case is the failure the test exists to report"
 )]
 fn a_fixed_engine_would_pass_the_long_context_reproducer() {
+    // The floor is pinned in both directions, or its value is free: replacing
+    // it with 60 or 199 left the suite green.
+    let at_floor = Rng(0x00F1_7EDD).prose(MIN_LONG_CONTEXT_ANSWER_TOKENS);
+    assert!(
+        judge(&at_floor, &at_floor, Horizon::LongContext).is_none(),
+        "two arms exactly at the floor must pass"
+    );
+    let under = &at_floor[..MIN_LONG_CONTEXT_ANSWER_TOKENS - 1];
+    assert!(
+        judge(under, under, Horizon::LongContext).is_some(),
+        "two arms one token under the floor must be refused"
+    );
+    // And the floor is under the length a correct engine produces on that
+    // prompt, which is what lets the reproducer flip to green. Driven through
+    // `judge` rather than compared as constants, so it pins the gate.
+    let measured_plain_arm = Rng(0x2181_2181).prose(MEASURED_LONG_CONTEXT_PLAIN_ARM);
+    assert!(
+        judge(
+            &measured_plain_arm,
+            &measured_plain_arm,
+            Horizon::LongContext
+        )
+        .is_none(),
+        "a correct engine answers that prompt in {MEASURED_LONG_CONTEXT_PLAIN_ARM} \
+         tokens and must clear the floor"
+    );
+    // Far enough under to be reachable, close enough that the last tail window
+    // can still read the period the documented collapse repeats at.
+    let last_window = MIN_LONG_CONTEXT_ANSWER_TOKENS / TAIL_WINDOWS;
+    assert!(
+        last_window.saturating_sub(MIN_CYCLE_SAMPLES) >= 8,
+        "at this floor the last tail window is {last_window} tokens and cannot \
+         evidence a period-8 cycle, which is the collapse the reproducer records"
+    );
+
     let answer = Rng(0x00F1_7EDD).prose(200);
     assert!(
-        judge(&answer, &answer, MIN_LONG_CONTEXT_ANSWER_TOKENS).is_none(),
+        judge(&answer, &answer, Horizon::LongContext).is_none(),
         "two arms agreeing at 200 tokens must pass the long-context floor"
     );
     // One benign flip, as the shipped short-prompt pair shows at token 66.
     let mut flipped = answer.clone();
     flipped[66] = 60_000;
-    assert!(judge(&flipped, &answer, MIN_LONG_CONTEXT_ANSWER_TOKENS).is_none());
+    assert!(judge(&flipped, &answer, Horizon::LongContext).is_none());
     // And the short prompt's floor is what makes it unreachable.
-    let failure = judge(&answer, &answer, MIN_ANSWER_TOKENS).expect("256 refuses 200");
+    let failure = judge(&answer, &answer, Horizon::ShortPrompt).expect("256 refuses 200");
     assert!(failure.contains("stopped early"), "{failure}");
 }
 
@@ -736,7 +857,7 @@ fn a_fixed_engine_would_pass_the_long_context_reproducer() {
 #[test]
 fn a_truncated_run_is_refused_rather_than_judged() {
     let plain: Vec<u32> = (0..N_TOKENS as u32).collect();
-    let failure = judge(&plain[..16], &plain, MIN_ANSWER_TOKENS).expect("must refuse");
+    let failure = judge(&plain[..16], &plain, Horizon::ShortPrompt).expect("must refuse");
     assert!(failure.contains("stopped early"), "{failure}");
 }
 
@@ -760,7 +881,8 @@ fn a_late_onset_divergence_passes_the_whole_stream_ratio_and_fails_the_tail() {
         "the whole-stream ratio {whole} already refuses this, so the tail windows \
          are not what is being tested"
     );
-    let failure = judge(&late, &plain, MIN_ANSWER_TOKENS).expect("the tail windows must refuse it");
+    let failure =
+        judge(&late, &plain, Horizon::ShortPrompt).expect("the tail windows must refuse it");
     assert!(failure.contains("begins late"), "{failure}");
 }
 
@@ -784,7 +906,7 @@ fn the_gate_admits_the_shipped_regime_and_refuses_the_broken_one() {
         lcs_ratio(&shipped, &plain)
     );
     assert!(
-        judge(&shipped, &plain, MIN_ANSWER_TOKENS).is_none(),
+        judge(&shipped, &plain, Horizon::ShortPrompt).is_none(),
         "shipped must pass"
     );
 
@@ -801,7 +923,7 @@ fn the_gate_admits_the_shipped_regime_and_refuses_the_broken_one() {
             }
         })
         .collect();
-    let failure = judge(&broken, &plain, MIN_ANSWER_TOKENS).expect("broken must fail");
+    let failure = judge(&broken, &plain, Horizon::ShortPrompt).expect("broken must fail");
     assert!(failure.contains("did not reproduce"), "{failure}");
 }
 
@@ -944,6 +1066,22 @@ fn declared_backbone_hidden(draft_path: &Path) -> Option<usize> {
         .and_then(|v| usize::try_from(v).ok())
 }
 
+/// What both prompts ask for, and why they ask for it.
+///
+/// This gate owns its prompts, and that is the asymmetry that makes its
+/// repetition control possible at all. A general "is this arm degenerate"
+/// classifier cannot exist on this measure: healthy output spans 0.03 for prose
+/// to 0.88 for a markdown table with a yes/no column, and degenerate output
+/// spans 0.37 for a ragged loop to 1.00 for an exact one — two populations
+/// overlapping over most of their range, with no threshold between them.
+///
+/// Prose is the one regime where they separate. Asking for it is not a
+/// convenience: it is what lets [`MAX_CYCLE_FRACTION`] sit above every healthy
+/// reading measured here and below every collapse the gate has to catch.
+const PROSE_INSTRUCTION: &str = "Answer at length, in continuous prose, in at least \
+     six full paragraphs. Do not use lists, numbered steps, tables, headings, bullet \
+     points or code blocks.";
+
 /// The 4k document the long-context benches use, for the reproducer below.
 const LONG_CONTEXT_PROMPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -958,7 +1096,11 @@ const LONG_CONTEXT_PROMPT: &str = include_str!(concat!(
 fn build_prompt(tk: &tokenizers::Tokenizer) -> Vec<u32> {
     wrap_turn(
         tk,
-        "Explain how a hash map resolves collisions, step by step.",
+        &format!(
+            "Explain how a hash map handles two keys that hash to the same bucket, \
+             covering separate chaining and each of the open-addressing probing \
+             strategies. {PROSE_INSTRUCTION}"
+        ),
     )
 }
 
@@ -976,7 +1118,7 @@ fn build_long_context_prompt(tk: &tokenizers::Tokenizer) -> Vec<u32> {
         .join("\n\n");
     wrap_turn(
         tk,
-        &format!("{body}\n\nSummarise the document above section by section, in detail."),
+        &format!("{body}\n\nSummarise the document above. {PROSE_INSTRUCTION}"),
     )
 }
 
@@ -1075,7 +1217,7 @@ fn plain_greedy(
 #[test]
 fn speculative_greedy_reproduces_plain_greedy() {
     const TEST: &str = "speculative_greedy_reproduces_plain_greedy";
-    run_gate(TEST, build_prompt, MIN_ANSWER_TOKENS);
+    run_gate(TEST, build_prompt, Horizon::ShortPrompt);
 }
 
 /// The same gate over a 4k document, where it fails today.
@@ -1089,15 +1231,11 @@ fn speculative_greedy_reproduces_plain_greedy() {
 #[test]
 fn speculative_greedy_reproduces_plain_greedy_at_long_context() {
     const TEST: &str = "speculative_greedy_reproduces_plain_greedy_at_long_context";
-    run_gate(
-        TEST,
-        build_long_context_prompt,
-        MIN_LONG_CONTEXT_ANSWER_TOKENS,
-    );
+    run_gate(TEST, build_long_context_prompt, Horizon::LongContext);
 }
 
 /// Both arms of one pair over `prompt`, judged.
-fn run_gate(test: &str, prompt_of: fn(&tokenizers::Tokenizer) -> Vec<u32>, min_answer: usize) {
+fn run_gate(test: &str, prompt_of: fn(&tokenizers::Tokenizer) -> Vec<u32>, horizon: Horizon) {
     let (Some(model_path), Some(draft_path)) = (
         common::model_for(&VERIFIER, test),
         common::apply(resolve(DRAFT_MODEL_VAR, DRAFTER_SLUG), test),
@@ -1198,7 +1336,7 @@ fn run_gate(test: &str, prompt_of: fn(&tokenizers::Tokenizer) -> Vec<u32>, min_a
         tk.decode(&plain_ids, false).unwrap_or_default(),
     );
 
-    if let Some(failure) = judge(&spec_ids, &plain_ids, min_answer) {
+    if let Some(failure) = judge(&spec_ids, &plain_ids, horizon) {
         panic!("{failure}");
     }
 }

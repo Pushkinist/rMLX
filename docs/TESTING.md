@@ -75,7 +75,7 @@ failure as a regression.
 
 `spec_greedy_equivalence.rs` asks a different question from the three above: not
 whether the round loop keeps the verifier's state consistent for a while, but
-whether the run produces the answer the verifier produces alone, over 512
+whether the run produces the answer the verifier produces alone, over 256
 tokens. Its oracle is the longest common subsequence with plain greedy, because
 the two arms legitimately differ by a word — the verify pass scores a block in
 one forward where plain decode steps one token at a time. It is read over the
@@ -83,20 +83,21 @@ whole answer (floor 0.70) and over each tail window (floor 0.40): one benign
 flip and a divergence that begins late both score near 0.8 overall, and only the
 second collapses a window. Both arms are also checked for a repetition
 loop — over the whole stream and over each tail cut, at every period up to 64
-that a quarter of the window supports and from at least 32 comparisons —
-because two arms in the same loop agree perfectly, and a collapse confined to
-the last two fifths (0.3992) or a repeated twelve-token phrase (0.0000 at any
-shorter period) both score under the ceiling on a whole-stream short-period
-sweep.
+that leaves 32 comparisons — because two arms that collapse into the *same* loop
+agree on garbage and the subsequence oracle cannot refuse that: it measures a
+subsequence over one periodic base, so a pair sharing a healthy prefix and then
+locked in the same period-8 loop reads 0.70 to 0.93 across the whole 12–40%
+ragged range.
 
-That control claims one thing: an arm **locked into a near-exact cycle**. Its
-ceiling of 0.85 sits above every structured-but-healthy shape measured (a
-markdown table reads 0.69, a numbered list 0.64 — and both prompts ask for
-exactly those) and below every loop varying in at most a token in twenty (0.88
-and up). Between them the populations overlap and no threshold separates a
-healthy table from a ragged loop; that band is a declared blind spot, and the
-subsequence floor is what covers it, since a ragged loop produces two different
-ragged arms.
+That control has no general threshold. Healthy output spans 0.03 for prose to
+0.88 for a markdown table with a yes/no column, and degenerate output 0.37 for a
+ragged loop to 1.00 for an exact one — overlapping populations. **Both prompts
+therefore ask for prose**, which is the regime where they separate: the real
+arms read 0.089 and 0.100 against a ceiling of 0.50, 1000 synthetic healthy
+streams at each of six lengths trip it none (max 0.1351), and the whole ragged
+range is refused with the subsequence floor taking over past it. Structured
+output trips the control — a false positive on an input the gate controls, not a
+class it admits.
 
 Unlike the three above it **resolves its pair by slug** from
 `RMLX_O_MODELS_ROOT`, so `make gpu-test` runs it on a machine holding the
@@ -119,8 +120,8 @@ unaffected.
 
 It **skips** unless the drafter is a Gemma4 assistant and the verifier carries
 no recurrent state: the floors are calibrated on the exact-rollback regime only,
-where the shipped code reads 0.8438 whole / 0.6484 weakest tail and a rollback
-leaving one rejected key reads 0.3070 / 0.2093. Qwen3.8-27B with its MTP sidecar
+where the shipped code reads 0.9180 whole / 0.6875 weakest tail and a rollback
+leaving one rejected key reads 0.4062 / 0.2031. Qwen3.8-27B with its MTP sidecar
 reads 0.520 as shipped at 256 tokens, which no floor separates from a broken
 rollback, so it is left to the prefix gate above rather than admitted under a
 threshold that means nothing.

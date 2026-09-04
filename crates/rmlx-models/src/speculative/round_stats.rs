@@ -256,6 +256,14 @@ impl RoundStats {
     /// silent in both, and it makes `round_emitted()` exactly one too high on
     /// every request that ran a round. Each round emits at most the tokens it
     /// accepted plus the verifier's own, and that is the budget it breaks.
+    ///
+    /// It catches that on a request whose rounds all ran to `accept + 1` — one
+    /// the token budget and the stop token both left alone. A request whose last
+    /// round emitted fewer sits under the budget and absorbs the off-by-one
+    /// silently, so this detects the drift rather than every instance of it.
+    /// Exact detection would need each loop to count what its rounds emitted at
+    /// the emit site, a counter on the hot path; this is what is checkable from
+    /// what the loops already report.
     pub(crate) fn seed_violation(&self) -> Option<String> {
         if self.seed_emitted > self.emitted {
             return Some(format!(
