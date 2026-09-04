@@ -109,19 +109,53 @@ served = 0
 itl_ring = []
 
 
+ROUNDS = 30
+DRAFT_MS = 300.0
+VERIFY_MS = 900.0
+ROUND_MS = 1500.0
+DECODE_CONFIG = os.environ.get("STUB_DECODE_CONFIG", "mtp/block=5")
+# The engine composes both from one block, so the stub cannot make them
+# disagree by accident.
+BLOCK_SIZE = int(
+    next(t for t in DECODE_CONFIG.split(",") if t.split("=")[0].endswith("/block")).split("=")[1]
+)
+DERIVED_OVERRIDE = os.environ.get("STUB_DERIVED_OVERRIDE", "")
+DROP_FIELDS = [f for f in os.environ.get("STUB_DROP_FIELDS", "").split(",") if f]
+
+
 def done_line():
-    """One round-loop `done` record, as tracing's JSON layer renders it."""
+    """One round-loop `done` record, as tracing's JSON layer renders it.
+
+    Carries the raw counters and the per-round figures the engine derives from
+    them, consistent with each other. STUB_DERIVED_OVERRIDE (`name=value`)
+    breaks one of them, which is how the reader's cross-check is staged.
+    """
     raw = SEQ[min(served, len(SEQ) - 1)] if SEQ else ""
     fields = {
         "message": "mtp_generate_greedy: done",
-        "rounds": 30,
+        "rounds": ROUNDS,
         "emitted": EMITTED,
         "total_draft": 150,
         "total_accept": 98,
         "accept_rate": 98 / 150,
+        "accepted_per_step": 98 / ROUNDS,
+        "tokens_per_round": EMITTED / ROUNDS,
         "elapsed_ms": ELAPSED_MS,
-        "block_size": 5,
+        "prefill_ms": 100.0,
+        "round_ms": ROUND_MS,
+        "draft_ms": DRAFT_MS,
+        "verifier_ms": VERIFY_MS,
+        "draft_ms_per_round": DRAFT_MS / ROUNDS,
+        "verify_ms_per_round": VERIFY_MS / ROUNDS,
+        "loop_ms_per_round": (ROUND_MS - DRAFT_MS - VERIFY_MS) / ROUNDS,
+        "block_size": BLOCK_SIZE,
+        "decode_config": DECODE_CONFIG,
     }
+    if DERIVED_OVERRIDE:
+        name, _, value = DERIVED_OVERRIDE.partition("=")
+        fields[name] = float(value)
+    for name in DROP_FIELDS:
+        fields.pop(name, None)
     if raw:
         fields["decode_tps"] = json.loads(raw)
     return json.dumps(
@@ -715,6 +749,90 @@ run_case server_rate_unattributable_refused 1 \
 	'STUB_ITL_SUPPRESS=1' \
 	'GREP:the server attributed no decode rate'
 no_row normal
+verdict
+
+# ── The round-loop figures ────────────────────────────────────────────────────
+
+# metric_value <config> <metric name> — that metric's value, or "" when the row
+# carries no such metric.
+metric_value() {
+	local path
+	path="$(record_of "$1")"
+	[ -z "$path" ] && return 0
+	python3 -c 'import json, sys
+rec = json.load(open(sys.argv[1]))
+for m in rec.get("metrics", []):
+    if m.get("name") == sys.argv[2]:
+        print(m.get("value", ""))
+        break' "$path" "$2"
+}
+
+# The whole point of the change: a speculative row carries what the round loop
+# counted, not only its accept rate. 30 rounds emitting 128 tokens is 4.2667
+# tokens per round, and 1500 - 300 - 900 ms of loop over 30 rounds is 10 ms.
+run_case round_loop_figures_recorded 0 \
+	"the speculative row carries the per-round split, not only the accept rate"
+for pair in \
+	"tokens_per_round 4.266667" \
+	"accepted_per_step 3.266667" \
+	"draft_ms_per_round 10.0" \
+	"verify_ms_per_round 30.0" \
+	"loop_ms_per_round 10.0"; do
+	set -- $pair
+	got="$(metric_value mtp "$1")"
+	close_to "$got" "$2" 0.001 || note_bad "mtp $1=$got (want $2)"
+done
+# The no-drafter arm has no round loop, so it must carry no per-round figure —
+# a zero there would rank as a measured one.
+for name in tokens_per_round accepted_per_step loop_ms_per_round; do
+	[ -z "$(metric_value normal "$name")" ] ||
+		note_bad "normal carries $name=$(metric_value normal "$name")"
+done
+verdict
+
+# The engine derives the per-round figures too, and this reader derives them
+# again. A drift between the two would file a number no run produced, so an
+# event whose own counters contradict its derived field is refused.
+run_case derived_field_contradicting_counters_refused 1 \
+	"a done line whose derived field disagrees with its counters is refused" \
+	'STUB_DERIVED_OVERRIDE=tokens_per_round=9.0' \
+	'GREP:do not agree on the formula'
+no_row mtp
+verdict
+
+# The cell a row belongs to is the one the round loop named. A log that does not
+# name it leaves the script to guess from its own flags, which is how a row is
+# filed under a configuration the run did not use.
+run_case unnamed_cell_refused 1 \
+	"a log that does not name its cell is refused rather than guessed at" \
+	'STUB_DROP_FIELDS=decode_config' \
+	'GREP:carries no decode_config field'
+no_row mtp
+verdict
+
+# The script asked for block 9; the engine ran block 3 and said so. The row must
+# be the engine's cell, or a sidecar that caps the block silently files every
+# request under a block it never ran.
+run_case engines_cell_beats_the_flag 0 \
+	"the recorded cell is the one the engine named, not the one asked for" \
+	'STUB_DECODE_CONFIG=mtp/block=3' \
+	ARGS:--draft-block-size ARGS:9
+[ "$(field_of_record mtp decode_config)" = "mtp/block=3" ] ||
+	note_bad "decode_config=$(field_of_record mtp decode_config)"
+case "$(notes_of mtp)" in
+*"block_size=3"*) ;;
+*) note_bad "notes claim a block the engine did not run: $(notes_of mtp)" ;;
+esac
+verdict
+
+# A drafter that resizes its block names a cell of its own. Recording it as the
+# fixed arm at the same ceiling would rank two configurations as one.
+run_case adaptive_cell_passes_through 0 \
+	"an adaptive drafter's cell reaches the row intact" \
+	'STUB_DECODE_CONFIG=dflash/block=16,dflash/depth=accept_rate' \
+	ARGS:--draft-kind ARGS:dflash
+[ "$(field_of_record dflash decode_config)" = "dflash/block=16,dflash/depth=accept_rate" ] ||
+	note_bad "decode_config=$(field_of_record dflash decode_config)"
 verdict
 
 echo
