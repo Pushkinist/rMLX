@@ -18,13 +18,12 @@
 //! argmax a bonus token out of the prefill forward and emit it before the round
 //! loop starts, so `emitted` carries one token no verify round produced; the
 //! two-model loops emit nothing outside their loop. Dividing `emitted` by
-//! `rounds` would therefore read `+1/rounds` high on four of six loops — about
-//! 3% at a 128-token bench — and make the one figure the record exists to
-//! compare incomparable between them. Each loop reads its own `emitted.len()`
-//! at the moment its round loop starts and reports it as
-//! [`RoundStats::seed_emitted`], which is subtracted. A per-loop constant would
-//! say the same thing today and would drift, silently, the day a loop stopped
-//! emitting one.
+//! `rounds` would therefore read `+1/rounds` high on four of six loops —
+//! measured at +1.35% and +0.98% on two of them — and make the one figure the
+//! record exists to compare incomparable between them. Each loop counts what
+//! its rounds emit at the emit site and reports it as
+//! [`RoundStats::emitted_in_rounds`]; that count is the figure's numerator, and
+//! `seed_emitted` beside it makes the three counts add up or say why not.
 //!
 //! **The derivation does not change what it measures.** Every figure below is
 //! arithmetic over counters the loops already keep; nothing here forces an
@@ -161,6 +160,14 @@ pub(crate) struct RoundStats {
     pub(crate) rounds: usize,
     /// Tokens handed to the sink.
     pub(crate) emitted: usize,
+    /// How many tokens the round loop emitted, counted at its emit site.
+    ///
+    /// The ground truth for [`Self::tokens_per_round`], and — paired with
+    /// `emitted` and `seed_emitted`, which are read at two other points — an
+    /// exact cross-check on the loop's own accounting. One integer increment per
+    /// emitted token: no evaluation, no allocation, nothing that reaches a
+    /// device.
+    pub(crate) emitted_in_rounds: usize,
     /// How many of those the loop had already emitted when its round loop
     /// started.
     ///
@@ -213,9 +220,9 @@ impl RoundStats {
         ratio(self.round_emitted() as f64, self.rounds as f64)
     }
 
-    /// Tokens the round loop itself emitted.
-    pub(crate) fn round_emitted(&self) -> usize {
-        self.emitted.saturating_sub(self.seed_emitted)
+    /// Tokens the round loop itself emitted, as the loop counted them.
+    pub(crate) const fn round_emitted(&self) -> usize {
+        self.emitted_in_rounds
     }
 
     /// Drafting wall-clock per round.
@@ -247,46 +254,40 @@ impl RoundStats {
     /// end, the other `emitted.len()` before the first round — so this is a
     /// cross-check on the loop's own accounting rather than a restatement of it.
     ///
-    /// The third branch is the one with power over a real request. The first two
-    /// describe states no loop reaches while the seed is captured where it is
-    /// (`rounds` increments as the first statement of every loop body, so
-    /// `rounds == 0` implies `emitted` never moved); they are the shape of the
-    /// drift, not a detector for it. A seed captured one line *too early* —
-    /// before the pre-round `emit_step` — is the drift that matters, it is
-    /// silent in both, and it makes `round_emitted()` exactly one too high on
-    /// every request that ran a round. Each round emits at most the tokens it
-    /// accepted plus the verifier's own, and that is the budget it breaks.
+    /// Three counts taken at three points in the loop: `seed_emitted` before the
+    /// first round, `emitted_in_rounds` at the emit site inside it, `emitted` at
+    /// the end. They must add up, exactly, on every request — which is what
+    /// makes this a detector rather than a description.
     ///
-    /// It catches that on a request whose rounds all ran to `accept + 1` — one
-    /// the token budget and the stop token both left alone. A request whose last
-    /// round emitted fewer sits under the budget and absorbs the off-by-one
-    /// silently, so this detects the drift rather than every instance of it.
-    /// Exact detection would need each loop to count what its rounds emitted at
-    /// the emit site, a counter on the hot path; this is what is checkable from
-    /// what the loops already report.
+    /// The drift it exists for is a seed captured one line *too early*, before
+    /// the pre-round `emit_step`. That makes the sum disagree by one on every
+    /// request that emitted anything, whatever the model, prompt or token
+    /// budget. An earlier revision inferred the drift from an emission-budget
+    /// inequality instead, which only bites when a request's rounds exactly
+    /// saturate `total_accept + rounds`: measured on the four reachable loops at
+    /// a fixed `--max-tokens`, that held for one of them, and on the other three
+    /// a 0.5%-wrong `tokens_per_round` reached the store in silence.
     pub(crate) fn seed_violation(&self) -> Option<String> {
-        if self.seed_emitted > self.emitted {
+        let accounted = self.seed_emitted.saturating_add(self.emitted_in_rounds);
+        if accounted != self.emitted {
             return Some(format!(
-                "seed_emitted {} exceeds emitted {}: the loop counted more tokens before \
-                 its rounds than it emitted in total",
-                self.seed_emitted, self.emitted
+                "emitted {} but accounts for {accounted} — {} before the rounds and {} \
+                 inside them. The three counts are taken at three points in the loop and \
+                 a seed read before the pre-round emission is one of the ways they stop \
+                 adding up",
+                self.emitted, self.seed_emitted, self.emitted_in_rounds
             ));
         }
-        if self.rounds == 0 && self.emitted != self.seed_emitted {
-            return Some(format!(
-                "no round ran and emitted {} is not the {} the loop had before its round \
-                 loop: tokens_per_round would count what no round produced",
-                self.emitted, self.seed_emitted
-            ));
-        }
+        // A second, independent invariant on the same counters: a round emits
+        // the tokens it accepted plus the verifier's own and no more. It is not
+        // the seed detector — the equality above is — but it is free here and it
+        // is the one an acceptance-walk change would break.
         let budget = self.total_accept.saturating_add(self.rounds);
-        (self.rounds > 0 && self.round_emitted() > budget).then(|| {
+        (self.emitted_in_rounds > budget).then(|| {
             format!(
-                "round_emitted {} exceeds the {budget} tokens {} rounds could have \
-                 produced (accepted plus one verifier token each): the seed count was \
-                 taken before the loop had finished emitting it",
-                self.round_emitted(),
-                self.rounds
+                "{} tokens credited to {} rounds that could have produced {budget} \
+                 (accepted plus one verifier token each)",
+                self.emitted_in_rounds, self.rounds
             )
         })
     }
@@ -354,6 +355,7 @@ impl RoundStats {
             rounds = self.rounds,
             emitted = self.emitted,
             seed_emitted = self.seed_emitted,
+            emitted_in_rounds = self.emitted_in_rounds,
             total_draft = self.total_draft,
             total_accept = self.total_accept,
             accept_rate = self.accept_rate(),

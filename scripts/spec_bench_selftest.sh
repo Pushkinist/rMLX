@@ -117,11 +117,11 @@ DRAFT_MS = 300.0
 VERIFY_MS = 900.0
 ROUND_MS = 1800.0
 SEED_EMITTED = int(os.environ.get("STUB_SEED_EMITTED", "1"))
-# 97 accepted over 30 rounds is 127 tokens the rounds could produce, and the
-# canned line emits 128 of which 1 is the seed — so the stub describes a request
-# that ran every round to `accept + 1`, which is the request the budget check can
-# see a too-early seed on. A line one under the budget absorbs the off-by-one.
-TOTAL_ACCEPT = int(os.environ.get("STUB_TOTAL_ACCEPT", "97"))
+# 98 accepted over 30 rounds could produce 128; the rounds emitted 127. The stub
+# deliberately sits one token UNDER that budget, because the check this exercises
+# is the three counts adding up rather than the inequality it replaced — which
+# only bit at the budget, and on real requests bit on one of four loops.
+TOTAL_ACCEPT = int(os.environ.get("STUB_TOTAL_ACCEPT", "98"))
 DECODE_CONFIG = os.environ.get("STUB_DECODE_CONFIG", "mtp/block=5")
 # The engine composes both from one block, so the stub cannot make them
 # disagree by accident.
@@ -140,12 +140,17 @@ def done_line():
     breaks one of them, which is how the reader's cross-check is staged.
     """
     raw = SEQ[min(served, len(SEQ) - 1)] if SEQ else ""
-    round_emitted = EMITTED - SEED_EMITTED
+    # The engine counts this at its own emit site, independently of the seed —
+    # which is the whole point: a drifting seed must break the sum rather than
+    # be absorbed by it. So the default is the healthy round count, not
+    # `EMITTED - SEED_EMITTED`.
+    round_emitted = int(os.environ.get("STUB_EMITTED_IN_ROUNDS", EMITTED - 1))
     fields = {
         "message": "mtp_generate_greedy: done",
         "rounds": ROUNDS,
         "emitted": EMITTED,
         "seed_emitted": SEED_EMITTED,
+        "emitted_in_rounds": round_emitted,
         "total_draft": 150,
         "total_accept": TOTAL_ACCEPT,
         "accept_rate": TOTAL_ACCEPT / 150,
@@ -786,7 +791,7 @@ run_case round_loop_figures_recorded 0 \
 	"the speculative row carries the per-round split, not only the accept rate"
 for pair in \
 	"tokens_per_round 4.233333" \
-	"accepted_per_step 3.233333" \
+	"accepted_per_step 3.266667" \
 	"draft_ms_per_round 10.0" \
 	"verify_ms_per_round 30.0" \
 	"loop_ms_per_round 20.0"; do
@@ -838,21 +843,32 @@ verdict
 # The seed count and the emitted count are read at different points in the loop,
 # so a loop that stopped emitting its pre-round token disagrees with itself here
 # rather than shifting tokens_per_round by 1/rounds in an append-only table.
-run_case seed_contradicting_emitted_refused 1 \
-	"a done line whose seed count contradicts what it emitted is refused" \
-	'STUB_SEED_EMITTED=999' \
-	'GREP:more before its rounds than it emitted'
+# The drift itself, against the stub's own healthy counters: the seed captured
+# before the pre-round emit_step, so it reports 0 where the loop emitted 1. The
+# stub's line sits one token under the emission budget — where the inequality
+# this replaced was blind and where three of the four reachable loops live — so
+# only the three counts adding up can see it.
+run_case seed_taken_before_the_pre_round_emission_refused 1 \
+	"the drift is refused on a request that does not saturate the round budget" \
+	'STUB_SEED_EMITTED=0' \
+	'GREP:accounts for'
 no_row mtp
 verdict
 
-# The drift itself, against the stub's own healthy counters: the seed captured
-# before the pre-round emit_step, so it reports 0 where the loop emitted 1. The
-# budget check catches it only when the request ran every round to accept + 1 —
-# this one does, and `check_seed`'s doc says so.
-run_case seed_taken_before_the_pre_round_emission_refused 1 \
-	"the drift itself is refused, not a manufactured inequality" \
-	'STUB_SEED_EMITTED=0' \
-	'GREP:seed count was taken before the loop had finished'
+# The same inconsistency from the other side: a round loop that counted more
+# than it emitted.
+run_case round_count_contradicting_emitted_refused 1 \
+	"a round count that disagrees with the emitted total is refused" \
+	'STUB_EMITTED_IN_ROUNDS=120' \
+	'GREP:accounts for'
+no_row mtp
+verdict
+
+# And the emission budget, which is a different invariant on the same counters.
+run_case round_count_over_the_emission_budget_refused 1 \
+	"more tokens credited to the rounds than they could have produced is refused" \
+	'STUB_EMITTED_IN_ROUNDS=200' 'STUB_EMITTED=201' \
+	'GREP:could have produced'
 no_row mtp
 verdict
 

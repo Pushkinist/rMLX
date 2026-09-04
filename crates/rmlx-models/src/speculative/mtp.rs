@@ -772,6 +772,7 @@ pub fn mtp_generate_greedy(
             rounds: 0,
             emitted: emitted.len(),
             seed_emitted: emitted.len(),
+            emitted_in_rounds: 0,
             total_draft: 0,
             total_accept: 0,
             prefill_ns,
@@ -795,6 +796,7 @@ pub fn mtp_generate_greedy(
     );
 
     let seed_emitted = emitted.len();
+    let mut emitted_in_rounds = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
@@ -846,6 +848,7 @@ pub fn mtp_generate_greedy(
                 break;
             }
             emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
+            emitted_in_rounds += 1;
             if eos_ids.contains(&id) {
                 hit_eos = true;
                 break;
@@ -919,6 +922,7 @@ pub fn mtp_generate_greedy(
         rounds,
         emitted: emitted.len(),
         seed_emitted,
+        emitted_in_rounds,
         total_draft,
         total_accept,
         prefill_ns,

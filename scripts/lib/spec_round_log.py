@@ -44,13 +44,13 @@ event is checked against this module's arithmetic before it is aggregated: two
 expressions of one formula drift silently otherwise, and the row that reaches
 the append-only store cannot be taken back out.
 
-`emitted_total` is what the rounds produced. The sidecar loops emit a bonus
-token out of the prefill forward before the first round and report it as
-`seed_emitted`; it is subtracted, or a sidecar row would read one token per
-round above a two-model row that did the same work. An event that ran no round
-and emitted something other than its seed is refused: those two counts are taken
-at different points in the loop, so disagreement means the loop's own accounting
-moved.
+`emitted_total` is what the rounds produced, counted at the loops' own emit
+sites and reported as `emitted_in_rounds`. The sidecar loops emit a bonus token
+out of the prefill forward before the first round and report that separately as
+`seed_emitted`; it does not reach the figure, or a sidecar row would read one
+token per round above a two-model row that did the same work. The three counts
+are taken at three points in the loop and every event is refused unless they add
+up.
 
 There is no legacy-field support here. `seed_emitted` is required, and every
 binary that ever wrote a `done` line without it also predates the fields this
@@ -94,6 +94,7 @@ REQUIRED_COUNTERS = (
     "rounds",
     "emitted",
     "seed_emitted",
+    "emitted_in_rounds",
     "total_draft",
     "total_accept",
     "draft_ms",
@@ -184,43 +185,31 @@ def require_counters(events):
 
 
 def check_seed(fields):
-    """Refuse an event whose seed count contradicts what it emitted.
+    """Refuse an event whose three emission counts do not add up.
 
-    `emitted` is read at the end of the request and `seed_emitted` before the
-    first round, so a loop that stopped emitting its pre-round token, or grew a
-    second one, disagrees with itself here. `tokens_per_round` subtracts one
-    from the other and lands in an append-only table.
+    `seed_emitted` is read before the first round, `emitted_in_rounds` at the
+    emit site inside it and `emitted` at the end, so any drift between them
+    shows here — on every request, whatever the model, prompt or token budget.
+    `tokens_per_round` is built from the middle one and lands in an append-only
+    table.
     """
     message = fields.get("message", "<no message>")
-    if fields["seed_emitted"] > fields["emitted"]:
+    accounted = fields["seed_emitted"] + fields["emitted_in_rounds"]
+    if accounted != fields["emitted"]:
         raise SpecLogError(
-            f"'{message}' seeded {fields['seed_emitted']} of {fields['emitted']} "
-            "emitted tokens: more before its rounds than it emitted in total"
+            f"'{message}' emitted {fields['emitted']} but accounts for {accounted} — "
+            f"{fields['seed_emitted']} before its rounds and "
+            f"{fields['emitted_in_rounds']} inside them. A seed read before the "
+            "pre-round emission is one of the ways the three counts stop adding up"
         )
-    if fields["rounds"] == 0 and fields["emitted"] != fields["seed_emitted"]:
-        raise SpecLogError(
-            f"'{message}' ran no round and emitted {fields['emitted']} against a seed "
-            f"of {fields['seed_emitted']}: tokens_per_round would count what no "
-            "round produced"
-        )
-    # The branch with power over a real request. A seed taken one line too early
-    # is silent in both checks above and makes the round count one too high on
-    # every request that ran a round; each round emits at most what it accepted
-    # plus the verifier's own token, and that is the budget it breaks.
-    #
-    # It catches the drift on a request that ran every round to `accept + 1`,
-    # which is a request the token budget and the stop token both left alone. A
-    # request whose last round emitted fewer than that sits under the budget and
-    # absorbs the off-by-one silently. Exact detection would need each loop to
-    # count the tokens its rounds emitted at the emit site, which is a counter on
-    # the hot path; this is what is checkable from what the loops already report.
-    round_emitted = fields["emitted"] - fields["seed_emitted"]
+    # A second, independent invariant on the same counters: a round emits what it
+    # accepted plus the verifier's own token and no more.
     budget = fields["total_accept"] + fields["rounds"]
-    if fields["rounds"] > 0 and round_emitted > budget:
+    if fields["emitted_in_rounds"] > budget:
         raise SpecLogError(
-            f"'{message}' credits {round_emitted} tokens to {fields['rounds']} rounds "
-            f"that could have produced {budget} (accepted plus one verifier token "
-            "each): the seed count was taken before the loop had finished emitting it"
+            f"'{message}' credits {fields['emitted_in_rounds']} tokens to "
+            f"{fields['rounds']} rounds that could have produced {budget} (accepted "
+            "plus one verifier token each)"
         )
 
 
@@ -254,7 +243,7 @@ def one_value(events, field):
 DERIVED_FIELDS = (
     ("accept_rate", ("total_accept",), ("total_draft",)),
     ("accepted_per_step", ("total_accept",), ("rounds",)),
-    ("tokens_per_round", ("emitted", "-seed_emitted"), ("rounds",)),
+    ("tokens_per_round", ("emitted_in_rounds",), ("rounds",)),
     ("draft_ms_per_round", ("draft_ms",), ("rounds",)),
     ("verify_ms_per_round", ("verifier_ms",), ("rounds",)),
     ("loop_ms_per_round", ("round_ms", "-draft_ms", "-verifier_ms"), ("rounds",)),
@@ -308,7 +297,7 @@ def summarize(events):
         check_derived(event)
 
     rounds = sum(e["rounds"] for e in events)
-    emitted = sum(e["emitted"] - e["seed_emitted"] for e in events)
+    emitted = sum(e["emitted_in_rounds"] for e in events)
     draft = sum(e["total_draft"] for e in events)
     accept = sum(e["total_accept"] for e in events)
     draft_ms = sum(e["draft_ms"] for e in events)

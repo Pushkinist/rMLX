@@ -27,11 +27,17 @@ fn sample(loop_kind: SpecLoop) -> RoundStats {
     let rounds = 8usize;
     let total_accept = 12usize;
     let seed_emitted = seed_of(loop_kind);
+    // One token under the emission budget, deliberately: an earlier revision
+    // inferred the seed drift from that inequality, and its fixtures were built
+    // to sit exactly at the budget — the only place it could fire. On real
+    // requests it fired on one of the four reachable loops.
+    let emitted_in_rounds = total_accept + rounds - 1;
     RoundStats {
         loop_kind,
         block_size: 5,
         rounds,
-        emitted: seed_emitted + total_accept + rounds,
+        emitted: seed_emitted + emitted_in_rounds,
+        emitted_in_rounds,
         seed_emitted,
         total_draft: 32,
         total_accept,
@@ -52,14 +58,11 @@ fn sample(loop_kind: SpecLoop) -> RoundStats {
 )]
 fn derived_figures_are_the_documented_formulas() {
     let stats = sample(SpecLoop::MtpSidecar);
-    assert_eq!(
-        stats.emitted, 21,
-        "1 seed + 12 accepted + 8 verifier tokens"
-    );
+    assert_eq!(stats.emitted, 20, "1 seed + the 19 the rounds emitted");
     assert_eq!(stats.accept_rate(), 12.0 / 32.0);
     assert_eq!(stats.accepted_per_step(), 12.0 / 8.0);
     // The seed token is not a round's product and does not reach the figure.
-    assert_eq!(stats.tokens_per_round(), 20.0 / 8.0);
+    assert_eq!(stats.tokens_per_round(), 19.0 / 8.0);
     assert_eq!(stats.draft_ms_per_round(), 200.0 / 8.0);
     assert_eq!(stats.verify_ms_per_round(), 400.0 / 8.0);
     // 1200 ms in the loop, 200 drafting, 400 verifying: 600 ms of loop over 8
@@ -140,7 +143,12 @@ fn a_request_with_no_round_derives_zeros_not_nan() {
 #[test]
 fn the_fixed_block_identity_holds_on_every_loop() {
     for &loop_kind in SpecLoop::ALL {
-        let stats = sample(loop_kind);
+        // The identity describes a run whose every round emitted `accept + 1`;
+        // the sample is one token under that on purpose, so this case restores
+        // it rather than the sample being built to satisfy it.
+        let mut stats = sample(loop_kind);
+        stats.emitted_in_rounds = stats.total_accept + stats.rounds;
+        stats.emitted = stats.seed_emitted + stats.emitted_in_rounds;
         assert_eq!(
             stats.total_draft,
             stats.rounds * (stats.block_size - 1),
@@ -162,72 +170,71 @@ fn what_a_loop_emitted_before_its_rounds_does_not_reach_the_figure() {
     for &loop_kind in SpecLoop::ALL {
         let stats = sample(loop_kind);
         assert_eq!(stats.emitted - stats.round_emitted(), stats.seed_emitted);
-        assert_eq!(stats.round_emitted(), 20, "{loop_kind:?}");
+        assert_eq!(stats.round_emitted(), 19, "{loop_kind:?}");
     }
 }
 
-/// A request whose round loop never ran emitted exactly what it emitted before
-/// that loop. The two counts are taken at different points, so this catches a
-/// loop that stopped emitting its seed or grew a second one — the drift a
-/// per-loop constant would have hidden.
-#[test]
-#[allow(
-    clippy::expect_used,
-    reason = "the assertion is that the inconsistency is named; unwrapping the \
-              None case here is the failure the test exists to report"
-)]
-fn a_seedless_round_loop_that_emitted_something_is_named() {
-    let mut stats = sample(SpecLoop::MtpSidecar);
-    stats.rounds = 0;
-    stats.emitted = stats.seed_emitted;
-    assert!(stats.seed_violation().is_none(), "1 emitted, 1 seeded");
-
-    stats.emitted = 2;
-    let reason = stats.seed_violation().expect("must be named");
-    assert!(reason.contains("no round ran"), "{reason}");
-
-    let mut backwards = sample(SpecLoop::DFlash);
-    backwards.seed_emitted = backwards.emitted + 1;
-    let reason = backwards.seed_violation().expect("must be named");
-    assert!(reason.contains("exceeds emitted"), "{reason}");
-}
-
-/// The branch with power over a real request: a seed captured one line too
-/// early — before the pre-round emission — is silent in the two branches above
-/// and makes `round_emitted()` one too high on every request that ran a round.
-/// Each round emits at most what it accepted plus the verifier's own token, and
-/// that is the budget it breaks.
+/// The three counts must add up on every request, and this is the drift they
+/// exist to catch: a seed captured one line before the pre-round emission.
+///
+/// The point of counting at the emit site is that this fires **whatever the
+/// request looked like**. The predecessor inferred the drift from an
+/// emission-budget inequality, which only bites when a request's rounds exactly
+/// saturate `total_accept + rounds`; the sample here deliberately sits one token
+/// under that, where the old check was blind and three of the four reachable
+/// loops actually live.
 #[test]
 #[allow(
     clippy::expect_used,
     reason = "the assertion is that the drift is named; unwrapping the None case \
               here is the failure the test exists to report"
 )]
-fn a_seed_taken_before_the_pre_round_emission_breaks_the_round_budget() {
+fn a_seed_taken_before_the_pre_round_emission_is_named_on_any_request() {
     for &loop_kind in SpecLoop::ALL {
         let sound = sample(loop_kind);
         assert!(
             sound.seed_violation().is_none(),
-            "{loop_kind:?}: the sample emits accept + 1 per round and must be sound"
+            "{loop_kind:?} must be sound"
         );
-        assert_eq!(
-            sound.round_emitted(),
-            sound.total_accept + sound.rounds,
-            "{loop_kind:?}: the sample must sit at the budget, or exceeding it by one \
-             would not be detectable"
+        assert!(
+            sound.emitted_in_rounds < sound.total_accept + sound.rounds,
+            "{loop_kind:?}: the sample must sit under the emission budget, or this \
+             would not distinguish the equality from the inequality it replaced"
         );
 
-        // The drift: the seed was taken before the loop emitted it. A loop that
-        // emits nothing outside its rounds has no earlier line to take it from,
-        // which is why the two-model paths are exempt rather than untested.
+        // A loop that emits nothing outside its rounds has no earlier line to
+        // take the seed from, which is why the two-model paths are exempt rather
+        // than untested.
         if sound.seed_emitted == 0 {
             continue;
         }
         let mut drifted = sample(loop_kind);
         drifted.seed_emitted -= 1;
         let reason = drifted.seed_violation().expect("must be named");
-        assert!(reason.contains("exceeds the"), "{loop_kind:?}: {reason}");
+        assert!(reason.contains("accounts for"), "{loop_kind:?}: {reason}");
     }
+}
+
+/// Any disagreement between the three counts is named, not only the seed drift:
+/// a round loop that emitted more than it counted, or counted more than it
+/// emitted, is the same inconsistency from the other side.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion is that the inconsistency is named; unwrapping the \
+              None case here is the failure the test exists to report"
+)]
+fn any_disagreement_between_the_three_counts_is_named() {
+    let mut miscounted = sample(SpecLoop::DFlash);
+    miscounted.emitted_in_rounds += 1;
+    let reason = miscounted.seed_violation().expect("must be named");
+    assert!(reason.contains("accounts for"), "{reason}");
+
+    let mut over_budget = sample(SpecLoop::MtpSidecar);
+    over_budget.emitted_in_rounds = over_budget.total_accept + over_budget.rounds + 1;
+    over_budget.emitted = over_budget.seed_emitted + over_budget.emitted_in_rounds;
+    let reason = over_budget.seed_violation().expect("must be named");
+    assert!(reason.contains("could have produced"), "{reason}");
 }
 
 /// `ALL` and `index` are two halves of one list and the compiler holds both: a
