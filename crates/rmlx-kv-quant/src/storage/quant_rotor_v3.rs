@@ -35,7 +35,7 @@ pub const ROTOR3_V_GROUP_SIZE: usize = ROTOR3_GROUP_SIZE;
 /// append-call's worth of tokens.
 #[derive(Debug, Clone)]
 pub struct RotorBlocks {
-    /// Packed 3-bit codes; pack convention = 10 vals/u32 (planar3 / iso3).
+    /// The row's dense code plane: three 3-bit codes per Cl(3,0) group.
     /// Length per block = `n_tokens * n_groups * 1` u32 words.
     pub codes: Vec<u32>,
     /// Per-group scale: `n_tokens * n_groups` f32 entries (flat).

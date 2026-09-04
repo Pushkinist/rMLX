@@ -337,7 +337,8 @@ pub enum CacheType {
     /// `iso_v_4` (alias `iso4`) — IsoQuant 4-bit V; V-side only.
     ///
     /// 4.25-bit V codec: same quaternion SO(4) rotation as `Iso3` with the
-    /// 16-centroid Lloyd-Max codebook and dense 8-vals-per-u32 pack. Requires
+    /// 16-centroid Lloyd-Max codebook, at 4 bits per code in the dense code
+    /// plane. Requires
     /// `head_dim % 4 == 0`. Pairs with K-side `q8_g128` (coerced to
     /// `KvQuant::Iso4`). CPU-only (no MSL kernel — the iso3 MSL
     /// kernel is hard-coded for `bits=3`).
@@ -347,7 +348,7 @@ pub enum CacheType {
     ///
     /// 3-bit V codec built on Cl(3,0) multivectors (8 components per group of
     /// 3 grade-1 elements). Static per-layer rotor table; per-token codes +
-    /// scales + L2 norm. Pack format: 10 vals/u32 (planar3 / iso3 convention).
+    /// scales + L2 norm. Pack format: the dense code plane, 3 bits per code.
     /// Pairs with K-side `q8_g128` (coerced to `KvQuant::Rotor3`). CPU-only
     /// (no MSL kernel — same precedent as iso3 / iso4).
     Rotor3,
@@ -355,9 +356,10 @@ pub enum CacheType {
     /// V; V-side only.
     ///
     /// 4-bit V codec built on Cl(3,0) multivectors — same algebra as `Rotor3`
-    /// but with the 16-centroid Lloyd-Max codebook and dense 8-vals-per-u32
-    /// pack. ~10.7-bit effective storage per element counting per-group scale +
-    /// per-token norm; rotor table amortises across tokens. `head_dim` may be
+    /// but with the 16-centroid Lloyd-Max codebook, at 4 bits per code in the
+    /// dense code plane. 9.75 stored bits per element at `head_dim = 128`,
+    /// counting the per-group scale and per-token norm; the rotor table
+    /// amortises across tokens. `head_dim` may be
     /// any positive integer (the last group is tail-padded when
     /// `head_dim % 3 != 0`). Pairs with K-side `q8_g128` (coerced to
     /// `KvQuant::Rotor4`). CPU-only (no MSL kernel).

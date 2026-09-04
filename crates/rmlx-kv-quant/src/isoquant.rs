@@ -218,8 +218,8 @@ pub fn quat_conjugate(q: [f32; 4]) -> [f32; 4] {
 /// - `head_dim` — must be a positive multiple of 4.
 /// - `group_size` — elements per quantization group; must be a positive multiple of 4
 ///   and divide `head_dim` evenly. Typically 4 (one quaternion block per group).
-/// - `bits` — `3` for iso3 (10 vals/u32, Planar3 pack) or `4` for iso4
-///   (8 vals/u32, dense pack — iso4).
+/// - `bits` — `3` for iso3 or `4` for iso4; the code plane charges for the
+///   width either way.
 ///
 /// # Returns
 ///

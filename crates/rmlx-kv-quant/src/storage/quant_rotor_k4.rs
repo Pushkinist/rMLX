@@ -1,9 +1,9 @@
 // Rotor4 K-side storage (Cl(3,0) Clifford rotor sandwich,
 // 4-bit Lloyd-Max codebook, optional 1-bit QJL residual).
 //
-// Mirror of `quant_rotor_k3.rs` with `bits=4` and the dense 8-vals-per-u32
-// pack from `rotor4_k_encode` / `rotor4_k_decode`. Identical storage layout
-// modulo the codes bit-width — `RotorKBlocks` is shared from `quant_rotor_k3`.
+// Mirror of `quant_rotor_k3.rs` at `bits=4` — the same dense code plane from
+// `rotor4_k_encode` / `rotor4_k_decode`, one bit per code wider.
+// `RotorKBlocks` is shared from `quant_rotor_k3`.
 #![allow(
     unreachable_pub,
     clippy::exhaustive_structs,

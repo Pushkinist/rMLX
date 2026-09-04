@@ -15,7 +15,7 @@
 //!      golden-ratio unit quaternion [`FIXED_QUAT`].
 //!   4. Per-group scale = `max|r_i| / ISO3_CB_MAX`.
 //!   5. 3-bit quantize each `r_i` into the Lloyd-Max codebook.
-//!   6. Pack 3-bit codes via atomic OR (10 vals/u32, Planar3 pack convention).
+//!   6. Write the 3-bit codes into the row's dense code plane via atomic OR.
 //!
 //! Dequantize reverses: unpack → centroid × scale → conjugate Hamilton product
 //! → rescale by per-token norm.

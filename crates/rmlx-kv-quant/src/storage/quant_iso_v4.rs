@@ -1,7 +1,7 @@
 // IsoQuant 4-bit V storage struct.
 //
-// Mirrors `quant_iso_v.rs` (`QuantIsoV3`) one-for-one with `bits=4` baked in
-// and the dense 8-vals-per-u32 pack from the parameterized
+// Mirrors `quant_iso_v.rs` (`QuantIsoV3`) one-for-one with `bits=4` baked in —
+// the same dense code plane, one bit per code wider — from the parameterized
 // `iso_encode_fast`/`iso_decode_fast` codec.
 //
 // Step 1 decision (parameterize vs fork): the encode/decode functions in

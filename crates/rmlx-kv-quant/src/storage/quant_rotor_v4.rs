@@ -1,7 +1,7 @@
 // Rotor4 (Cl(3,0) Clifford rotor sandwich) 4-bit V storage.
 //
 // Mirrors `quant_rotor_v3.rs` (`QuantRotorV3`) one-for-one with `bits=4` and
-// the dense 8-vals-per-u32 pack from the parameterized `rotor4_encode` /
+// the same dense code plane one bit per code wider, from `rotor4_encode` /
 // `rotor4_decode` codec.
 //
 // Step decision (parameterize vs fork): the encode/decode functions in

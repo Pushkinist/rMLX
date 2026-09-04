@@ -1949,26 +1949,28 @@ the linear decomposition `p/(F-p) * (bytes(none) - bytes(codec))` over the
 
 | model | codec | whole-cache ÷ `none` | floor's share of that cache |
 |---|---|---:|---:|
-| Ternary-Bonsai-8B 4k (F=36, p=10) | `iso3_sym` / `iso4_sym` | 0.8426× | **+7.18%** |
-| Ternary-Bonsai-8B 32k | `iso3_sym` / `iso4_sym` | 0.8294× | **+7.91%** |
-| Ternary-Bonsai-8B 4k | `k_iso3` / `k_iso4` | 0.9213× | +3.29% |
-| Ternary-Bonsai-8B 4k | `rotor3_sym` | 1.0348× | **−1.29%** |
-| Ternary-Bonsai-8B 4k | `k_rotor3` | 1.0174× | −0.66% |
+| Ternary-Bonsai-8B 4k (F=36, p=10) | `iso3_sym` | 0.6097× | **+24.62%** |
+| Ternary-Bonsai-8B 32k | `iso3_sym` | 0.6019× | **+25.44%** |
+| Ternary-Bonsai-8B 4k | `iso4_sym` | 0.6563× | +20.15% |
+| Ternary-Bonsai-8B 4k | `k_iso3` | 0.8048× | +9.33% |
+| Ternary-Bonsai-8B 4k | `rotor3_sym` | 0.6854× | +17.65% |
+| Ternary-Bonsai-8B 4k | `k_rotor3` | 0.8427× | +7.18% |
 | Ternary-Bonsai-8B 4k | `mixed_k4g64_v4g64` (in-family) | 0.3557× | **+19.80%** |
 | Ternary-Bonsai-8B 32k | `mixed_k4g64_v4g64` (in-family) | 0.3513× | **+19.80%** |
 | gemma-4-e2b, any ctx | every codec | — | **0.00%** (p = 0) |
 
 Three things that table settles:
 
-* **The iso four pay, and it is what separates the store rate from the
-  whole-cache rate.** `iso3_sym`'s ring is 12.125 bits per value — 0.758× bf16 —
-  and its whole-cache ratio is 0.829× at 32k. The 7.9% gap is the ten promoted
-  layers at bf16. Undoing it would take the ratio to 0.764×, which is the ring
-  rate plus the accounting slack, and is what a `--kv-boundary-layers 0,0` run
-  measures directly.
-* **Rotor is byte-favourable, not merely neutral.** Its ring is 16.25 bits per
-  value, *above* bf16, so replacing a rotor layer with a bf16 one gives bytes
-  back. The floor is free on this family in the byte sense and always has been.
+* **The denser the store, the more the floor costs.** `iso3_sym`'s ring is
+  7.125 bits per value — 0.445× bf16 — and its whole-cache ratio is 0.602× at
+  32k. The whole of that gap is the ten promoted layers at bf16, and it is now
+  25% of the cache where it was 7.9% at the old store: promoting a layer costs
+  the difference between the codec and bf16, so it gets more expensive exactly
+  as the codec gets better. A `--kv-boundary-layers 0,0` run measures the
+  undone figure directly.
+* **The price is paid by every family now.** Rotor used to be *above* bf16, so
+  the floor gave bytes back on it; at 8.75 bits per value it pays like the rest
+  (+17.65% on `rotor3_sym`, +7.18% on `k_rotor3`).
 * **In-family costs 19.80% of `mixed_k4g64_v4g64`'s cache**, invariant in
   context. The comparison in-family wins is against the fallback, not against
   nothing: the same ten layers at `K8V8` would be 0.484× where in-family is
@@ -2806,8 +2808,8 @@ all four V buffers (codes_packed, scales, quaternions, norms)
 bit-identical post-hydrate.
 
 **Parameterize vs fork decision.**
-The encode/decode CPU functions are parameterized over `bits ∈ {3, 4}`
-(generic packer using `vals_per_word(bits) = 32 / bits`). The storage
+The encode/decode CPU functions are parameterized over `bits ∈ {3, 4}` (the
+shared dense code plane, `crate::code_plane`). The storage
 struct is forked (`QuantIsoV3` + `QuantIsoV4`) because the bit-width is
 fixed per storage variant and a generic rename would create large
 cross-crate churn for no benefit. `IsoBlocks` is shared (codes:
@@ -4305,10 +4307,9 @@ To find a retired codec: `git branch -a --list 'preserve/kv-*'`.
 
 **What this does to the dominated-vs-unused split.** The word belongs to
 Class 3, not here. On the axes anything is measured on, `none` is strictly
-smaller than every Class 3 codec except the four iso ones (4 cells, 1.004×–1.541×
-for the rest; the iso rows are 0.763×–0.915× and are the exception) and not
-slower, so most of Class 3 *is* dominated by the baseline; Class 2 merely ties
-it. The two classes
+smaller than `mixed` and `rot_k` (1.339×–1.541×) and not slower than anything,
+but the eight iso and rotor codecs are all smaller than it — 0.456×–0.866× —
+so what dominates them is decode speed, not bytes; Class 2 merely ties it. The two classes
 are still kept for different reasons — see each disposition — but the reason is
 not that one is beaten and the other is not.
 
@@ -4340,29 +4341,35 @@ and indistinguishable today.
 `k_iso3`, `k_iso4`, `rotor3_sym`, `rotor4_sym`, `k_rotor3`, `k_rotor4`.
 
 These are the only codecs whose quantization a served request touches. **The
-iso family is smaller than bf16 on every architecture; the rotor family is
-larger on every architecture; `mixed` / `rot_k` are smaller on one topology and
-larger on the other, because their bf16 mirror is retained exactly where a
-consumer layer reads it.**
+iso and rotor families are both smaller than bf16 on every architecture, iso by
+more at every width; `mixed` / `rot_k` are smaller on one topology and larger on
+the other, because their bf16 mirror is retained exactly where a consumer layer
+reads it.**
 
-Measured as `kv_cache_bytes` from `rmlx baseline`, both arms in one harness on
-one host, at `--max-tokens 32`. The "was" column is the same measurement taken
-with the ring's scale and norm planes at `f32`; the "now" column is the shipped
-`KV_SIDEBAND_DTYPE`. Residency is deterministic — every cell reproduced
-byte-for-byte across runs — so these are exact, not medians.
+Measured as `kv_cache_bytes` from `rmlx baseline`, one harness on one host
+(`scripts/bench/codec_inertness_probe.sh`, `--max-tokens 200`). Residency is
+deterministic — every cell reproduced byte-for-byte across runs and across two
+independently built binaries — so these are exact, not medians. Each width has
+its own row: the dense code plane charges for the codebook bit, so a family's
+3-bit and 4-bit members no longer occupy the same bytes.
 
 | codec | e2b 4k | e2b 32k | Bonsai 4k | Bonsai 32k |
 |---|---:|---:|---:|---:|
-| `k_iso3` / `k_iso4` — was | 1.021× | 1.004× | 1.009× | 1.008× |
-| `k_iso3` / `k_iso4` — **now** | **0.915×** | **0.881×** | **0.915×** | **0.914×** |
-| `iso3_sym` / `iso4_sym` — was | 1.043× | 1.009× | 1.019× | 1.015× |
-| `iso3_sym` / `iso4_sym` — **now** | **0.831×** | **0.763×** | **0.831×** | **0.828×** |
-| `k_rotor3` / `k_rotor4` — was | 1.163× | 1.168× | 1.135× | 1.132× |
-| `k_rotor3` / `k_rotor4` — now | 1.022× | 1.004× | 1.009× | 1.008× |
-| `rotor3_sym` / `rotor4_sym` — was | 1.326× | 1.337× | 1.270× | 1.265× |
-| `rotor3_sym` / `rotor4_sym` — now | 1.043× | 1.009× | 1.019× | 1.015× |
+| `iso3_sym` | **0.550×** | **0.456×** | **0.610×** | **0.602×** |
+| `iso4_sym` | **0.601×** | **0.516×** | **0.656×** | **0.647×** |
+| `k_iso3` | **0.775×** | **0.728×** | **0.805×** | **0.801×** |
+| `k_iso4` | **0.800×** | **0.758×** | **0.828×** | **0.824×** |
+| `rotor3_sym` | **0.622×** | **0.541×** | **0.685×** | **0.676×** |
+| `rotor4_sym` | **0.673×** | **0.602×** | **0.732×** | **0.721×** |
+| `k_rotor3` | **0.811×** | **0.771×** | **0.843×** | **0.838×** |
+| `k_rotor4` | **0.836×** | **0.801×** | **0.866×** | **0.861×** |
 | `mixed_k8g64_v4g64` | 1.339× | 1.396× | in `runs.db`† | in `runs.db`† |
 | `rot_k_v8g64` | 1.541× | 1.533× | in `runs.db`† | in `runs.db`† |
+
+A cell is above its store rate by the layer-adaptive boundary promotion, which
+takes ten of Bonsai's 36 layers out of the codec and charges bf16 for them; e2b
+has no promoted layer that owns a cache, which is why its column sits closest
+to the store figure (`iso3_sym` at 0.456× against a 0.445× store).
 
 † The two Bonsai cells for `mixed` / `rot_k` were first measured on a binary
 that built the bf16 K/V mirror on **every** architecture. `exit_prefill` now

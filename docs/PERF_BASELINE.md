@@ -295,28 +295,29 @@ across the runs of a cell.
 | gemma-4-e2b | `k_rotor4` | **100.73** | — | — | — | — |
 
 The KV-bytes column is the reason to stop optimizing this family for
-throughput: `k_iso3/4` measures **1.003–1.006×** `none` and `k_rotor3/4`
-**1.11–1.17×**. A codec that is not smaller than the bf16 it replaces has no
-bandwidth prize to collect, so parity is the ceiling, not a milestone on the
-way past it.
+throughput: `k_iso3/4` measured **1.003–1.006×** `none` and `k_rotor3/4`
+**1.11–1.17×** on the store these rows were recorded at. Both families are
+smaller than bf16 now (see the re-measured table below), so a bandwidth prize
+exists in principle — but the decode shell, not the store, is what sets these
+rows, and the shell has not moved.
 
-**The KV-bytes column is pre-sideband-narrowing.** Re-measured on the current
-tree at bench-scale prompts (`scripts/bench/codec_inertness_probe.sh`,
-`kv_cache_bytes` from `rmlx baseline`, `--max-tokens 200`):
+**The KV-bytes column predates both the sideband narrowing and the dense code
+plane.** Re-measured on the current tree at bench-scale prompts
+(`scripts/bench/codec_inertness_probe.sh`, `kv_cache_bytes` from
+`rmlx baseline`, `--max-tokens 200`):
 
 | model | ctx | `k_iso3` ÷ `none` | `iso3_sym` ÷ `none` | `k_rotor3` ÷ `none` |
 |---|---|---:|---:|---:|
-| Bonsai-8B | 3.8k | 0.921× | **0.843×** | 1.017× |
-| Bonsai-8B | 31.5k | 0.915× | **0.829×** | 1.009× |
-| gemma-4-e2b | 4.1k | 0.902× | **0.805×** | 1.005× |
-| gemma-4-e2b | 34.4k | 0.880× | **0.759×** | 1.002× |
+| Bonsai-8B | 4k | 0.805× | **0.610×** | 0.843× |
+| Bonsai-8B | 32k | 0.801× | **0.602×** | 0.838× |
+| gemma-4-e2b | 4k | 0.775× | **0.550×** | 0.811× |
+| gemma-4-e2b | 32k | 0.728× | **0.456×** | 0.771× |
 
 An earlier restatement of this paragraph quoted 0.980× / 0.962× (Bonsai-8B) and
 0.937× / 0.876× (e2b) from a **928-token** `rmlx serve` prompt. Those are that
 prompt's numbers, not the codecs': at 928 tokens the per-layer allocation floors
 and the ring's grow-step rounding are a large fraction of a small cache, so the
-ratio is pushed toward 1. Read the table above instead — the win is 15.7–17.1%
-on Bonsai-8B and 19.5–24.1% on e2b, not 2–4%.
+ratio is pushed toward 1. Read the table above instead.
 
 The throughput conclusion above is unchanged and is still the binding one; the
 memory conclusion is not — both families are under bf16, and the remaining gap

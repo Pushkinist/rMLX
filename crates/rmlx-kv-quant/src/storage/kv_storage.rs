@@ -319,7 +319,7 @@ pub enum KvStorage {
     /// V = IsoQuant 4-bit (quaternion SO(4) rotation + Lloyd-Max 4-bit codebook).
     ///
     /// Same machinery as [`IsoV3`](KvStorage::IsoV3) with `bits=4` and the
-    /// dense 8-vals-per-u32 pack. CPU-only — the existing MSL kernel is
+    /// dense code plane at 4 bits per code. CPU-only — the existing MSL kernel is
     /// hard-coded for `bits=3`; an iso4 MSL kernel is deferred.
     IsoV4 {
         k: Option<QuantK>,
@@ -338,7 +338,7 @@ pub enum KvStorage {
         max_seq: i32,
     },
     /// Symmetric IsoQuant 4-bit — both K and V use the same
-    /// quaternion SO(4) + 4-bit Lloyd-Max codebook (dense 8-vals-per-u32 pack).
+    /// quaternion SO(4) + 4-bit Lloyd-Max codebook, 4 bits per code in the plane.
     ///
     /// Layout tag: [`ISO_SYM_4_LAYOUT_TAG`]. CPU-only.
     IsoSym4 {
@@ -449,7 +449,7 @@ pub enum KvStorage {
     /// V = rotor4 (Cl(3,0) Clifford rotor sandwich + 4-bit Lloyd-Max codebook).
     ///
     /// 4.25-bit V codec — same Clifford sandwich as rotor3 with the
-    /// 16-centroid Lloyd-Max N(0,1) codebook and dense 8-vals-per-u32 pack
+    /// 16-centroid Lloyd-Max N(0,1) codebook, 4 bits per code in the plane
     /// (iso4 convention). Higher fidelity than rotor3 at the cost of one extra
     /// bit per value in the codes (~10.7 bpe at bits=4). Storage is unaffected:
     /// both widths spend one `u32` code word plus one

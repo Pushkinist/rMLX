@@ -39,9 +39,9 @@ pub const ISO3_GROUP_SIZE: usize = 4;
 /// path lands in T11d.
 #[derive(Debug, Clone)]
 pub struct IsoBlocks {
-    /// Packed `bits`-bit codes; layout determined by the owning `QuantIsoV*`
-    /// struct. Length per token = `n_groups * ceil(group_size / vals_per_word(bits))` u32s
-    /// where `vals_per_word(bits) = 32 / bits`.
+    /// The row's dense code plane (see [`crate::code_plane`]): `bits` per code,
+    /// four codes per quaternion group, packed across the row's groups.
+    /// Length per token = `iso_row_words(head_dim, bits)` u32s.
     pub codes: Vec<u32>,
     /// Per-group scale (one f32 per `(token, group)`).
     pub scales: Vec<f32>,
@@ -142,7 +142,7 @@ pub struct QuantIsoV3 {
     // `append_gpu` / `dequant_gpu` / `byte_size` / `try_deep_clone` /
     // `truncate_to` / `reset`.
     /// Pre-allocated u32 codes buffer on GPU. Length
-    /// `B * kv_h * max_seq * n_groups * WORDS_PER_GROUP`. Quaternion buffer is
+    /// `B * kv_h * max_seq * iso_row_words(head_dim, bits)`. Quaternion buffer is
     /// omitted on purpose — every group uses the same [`FIXED_QUAT`] constant
     /// (the `iso_dequantize_v3_gpu` kernel never reads it; see kernel source
     /// in `isoquant_msl.rs`). `None` until first GPU `append_gpu` call, or
