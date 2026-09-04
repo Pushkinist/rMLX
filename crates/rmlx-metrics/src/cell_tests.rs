@@ -1,6 +1,7 @@
 use super::{
     decode_config, decode_config_from_notes, decode_config_is_all_defaults,
-    decode_config_is_well_formed, predicate, NotesVerdict, CELL_COLUMNS,
+    decode_config_is_well_formed, decode_config_names_a_drafter, predicate, NotesVerdict,
+    CELL_COLUMNS,
 };
 
 #[test]
@@ -227,5 +228,30 @@ fn a_configuration_that_says_something_is_not_all_defaults() {
             !decode_config_is_all_defaults(&config),
             "{config:?} must not be read as the engine at its defaults"
         );
+    }
+}
+
+/// Not every `decode_config` is a drafter. A reader that keyed on "the column
+/// is not NULL" would pull a prefill-chunk sweep into the speculative table and
+/// report a blank round loop for it.
+#[test]
+fn only_a_block_term_names_a_drafter() {
+    for config in [
+        "mtp/block=5",
+        "dflash/block=16,dflash/depth=accept_rate",
+        "two_model/block=5",
+        "prefill_chunk=1024,spec/block=5",
+    ] {
+        assert!(decode_config_names_a_drafter(config), "{config}");
+    }
+    for config in [
+        "prefill_chunk=1024",
+        "kv_boundary/head=3,kv_boundary/tail=9",
+        "mtp/blocking=5",
+        "block=5",
+        "",
+        "mtp/block=",
+    ] {
+        assert!(!decode_config_names_a_drafter(config), "{config}");
     }
 }

@@ -99,6 +99,55 @@ fn seed_named(
     rec.record_run(&run).unwrap();
 }
 
+/// One drafter arm's round-loop metrics, recorded as a speculative cell.
+fn seed_speculative(
+    conn: &mut Connection,
+    model: &str,
+    decode_config: Option<&str>,
+    metrics: &[(&str, f64)],
+) {
+    let mut rec = Recorder::new(conn, "test@0.0.1");
+    let run = RunRecord {
+        schema_version: crate::ingest::RECORD_SCHEMA_VERSION,
+        backend: "rmlx".into(),
+        backend_version: Some("0.4.1".into()),
+        model_namespace: "mlx-community".into(),
+        model: model.into(),
+        weight_quant: "mxfp8".into(),
+        kv_quant: "none".into(),
+        ctx_max: 16384,
+        prompt: PromptRef::ByBody {
+            name: "p".into(),
+            body: json!("x"),
+            notes: None,
+            tokens_approx: Some(1),
+        },
+        ts_utc: "2026-09-04T10:00:00Z".into(),
+        git_sha: None,
+        build_profile: None,
+        hardware_tag: "m5_max_128gb".into(),
+        prompt_tokens: None,
+        max_tokens: None,
+        temperature: Some(0.0),
+        seed: None,
+        n_warmups: None,
+        n_measure: None,
+        output_first_64: None,
+        notes: None,
+        description: None,
+        decode_config: decode_config.map(ToOwned::to_owned),
+        metrics: metrics
+            .iter()
+            .map(|(name, value)| MetricEntry {
+                name: (*name).to_owned(),
+                value: Some(*value),
+                stddev: None,
+            })
+            .collect(),
+    };
+    rec.record_run(&run).unwrap();
+}
+
 fn tiny_scope() -> ScopeFile {
     ScopeFile::parse(
         r#"
@@ -618,4 +667,95 @@ fn the_csv_carries_the_decode_configuration() {
     let csv = export_csv(&conn).unwrap();
     let header = csv.lines().next().unwrap();
     assert!(header.contains("decode_config"), "{header}");
+}
+
+// ── Speculative section ───────────────────────────────────────────────────
+
+/// The round-loop figures reach the export, and the arm they belong to is
+/// named beside them.
+#[test]
+fn the_speculative_section_carries_the_round_loop_figures() {
+    let mut conn = test_conn();
+    seed_speculative(
+        &mut conn,
+        "Qwen3.8-27B-mxfp8",
+        Some("mtp/block=3"),
+        &[
+            ("decode_tps_warm", 25.5),
+            ("accept_rate", 0.728),
+            ("tokens_per_round", 2.46),
+            ("accepted_per_step", 1.46),
+            ("draft_ms_per_round", 12.5),
+            ("verify_ms_per_round", 44.0),
+            ("loop_ms_per_round", 8.25),
+        ],
+    );
+    let md = export_markdown(&conn, None).unwrap();
+
+    assert!(md.contains("## Speculative decoding"), "{md}");
+    let section = md
+        .split("## Speculative decoding")
+        .nth(1)
+        .expect("section present");
+    assert!(section.contains("Tokens/round"), "{section}");
+    assert!(section.contains("mtp/block=3"), "{section}");
+    for value in ["2.46", "1.46", "12.50", "44.00", "8.25", "0.728"] {
+        assert!(section.contains(value), "{value} missing from {section}");
+    }
+}
+
+/// An adaptive arm and a fixed arm at the same ceiling are two rows, not one:
+/// they are two cells, and merging them would publish one loop's figures under
+/// the other's label.
+#[test]
+fn an_adaptive_arm_is_a_row_of_its_own() {
+    let mut conn = test_conn();
+    seed_speculative(
+        &mut conn,
+        "Qwen3.6-35B-A3B-8bit",
+        Some("dflash/block=16"),
+        &[("tokens_per_round", 9.5)],
+    );
+    seed_speculative(
+        &mut conn,
+        "Qwen3.6-35B-A3B-8bit",
+        Some("dflash/block=16,dflash/depth=accept_rate"),
+        &[("tokens_per_round", 2.1)],
+    );
+    let md = export_markdown(&conn, None).unwrap();
+    let section = md
+        .split("## Speculative decoding")
+        .nth(1)
+        .expect("section present");
+    assert!(section.contains("9.50"), "{section}");
+    assert!(section.contains("2.10"), "{section}");
+}
+
+/// A non-drafter `decode_config` is not a speculative arm. Keying the section
+/// on "the column is not NULL" would file a prefill-chunk sweep here and report
+/// a blank round loop for it.
+#[test]
+fn a_prefill_chunk_sweep_does_not_reach_the_speculative_section() {
+    let mut conn = test_conn();
+    seed_speculative(
+        &mut conn,
+        "gemma-4-e2b-it-mxfp8",
+        Some("prefill_chunk=2048"),
+        &[("decode_tps_warm", 80.0)],
+    );
+    let md = export_markdown(&conn, None).unwrap();
+    assert!(
+        !md.contains("## Speculative decoding"),
+        "a prefill-chunk row opened a speculative section: {md}"
+    );
+}
+
+/// No drafter measured means no heading. An empty table under one reads as a
+/// verdict about drafters rather than about the database.
+#[test]
+fn a_database_with_no_drafter_renders_no_speculative_section() {
+    let mut conn = test_conn();
+    seed_one(&mut conn, 100.0, None);
+    let md = export_markdown(&conn, None).unwrap();
+    assert!(!md.contains("## Speculative decoding"), "{md}");
 }

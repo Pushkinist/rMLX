@@ -378,6 +378,17 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
     // survive verification per round. *_total counters monotonically grow per
     // request and are reset per run. `accepted_per_step` = total_accept /
     // n_rounds (mean draft tokens accepted per verifier step).
+    //
+    // `tokens_per_round` is the one that lets a speculative result be read
+    // independently of the kernels: accepted drafts plus the verifier's own
+    // token. It is `1 + accept_rate * (block - 1)` only while every round
+    // drafts the configured block, which an adaptive drafter does not, so it is
+    // recorded rather than derived at read time.
+    //
+    // The three `*_ms_per_round` figures partition one round's wall clock:
+    // drafting, verifying, and everything else the loop does (rollback,
+    // snapshot and restore, acceptance walks, sampling). The third is the
+    // round-loop overhead itself.
     (
         "accept_rate",
         "ratio",
@@ -407,6 +418,30 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
         "ratio",
         Direction::HigherBetter,
         Bounds::non_negative(1e3),
+    ),
+    (
+        "tokens_per_round",
+        "ratio",
+        Direction::HigherBetter,
+        Bounds::non_negative(1e3),
+    ),
+    (
+        "draft_ms_per_round",
+        "ms",
+        Direction::LowerBetter,
+        Bounds::non_negative(MS_CEILING),
+    ),
+    (
+        "verify_ms_per_round",
+        "ms",
+        Direction::LowerBetter,
+        Bounds::non_negative(MS_CEILING),
+    ),
+    (
+        "loop_ms_per_round",
+        "ms",
+        Direction::LowerBetter,
+        Bounds::non_negative(MS_CEILING),
     ),
     // SSD-tier observability (step2): byte/evict gauges + spill/hydrate timing.
     //
@@ -675,6 +710,10 @@ pub const COVERAGE_MATRIX: &[(&str, &str, Coverage)] = &[
     ("rmlx", "accept_tokens_total", Coverage::Yes),
     ("rmlx", "draft_rounds_total", Coverage::Yes),
     ("rmlx", "accepted_per_step", Coverage::Yes),
+    ("rmlx", "tokens_per_round", Coverage::Yes),
+    ("rmlx", "draft_ms_per_round", Coverage::Yes),
+    ("rmlx", "verify_ms_per_round", Coverage::Yes),
+    ("rmlx", "loop_ms_per_round", Coverage::Yes),
     // SSD-tier observability — rmlx-only (other backends have no MLX-native
     // SSD KV-cache tier; coverage reflects the rmlx kv_cache/spill+hydrate
     // instrumentation added in step2).

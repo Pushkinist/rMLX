@@ -190,6 +190,21 @@ pub fn decode_config_is_well_formed(value: &str) -> bool {
     previous_key.is_some()
 }
 
+/// Whether `value` names a speculative arm.
+///
+/// The drafter terms are the ones a round loop composes through
+/// [`decode_config`], so the shape is a `<drafter>/block=<n>` term. A
+/// prefill-chunk sweep and a KV-boundary setting are `decode_config` values too
+/// and are not drafters; a reader looking for speculative rows keys on this
+/// rather than on "the column is not NULL".
+pub fn decode_config_names_a_drafter(value: &str) -> bool {
+    decode_config_is_well_formed(value)
+        && value.split(',').any(|term| {
+            term.split_once('=')
+                .is_some_and(|(key, _)| key.ends_with("/block"))
+        })
+}
+
 /// Whether every term of `value` spells a setting's own shipped default.
 ///
 /// `NULL` is the engine at its defaults (`docs/METRICS_DB.md` §3.2), so a
