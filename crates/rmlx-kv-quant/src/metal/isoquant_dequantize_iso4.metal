@@ -12,11 +12,12 @@ uint row_base = token * cp_row_words(n_groups_u);
 uint base_out = token * hd + grp * ISO4_GS;
 
 // ── Read the group's codes out of the plane, dequantize, inverse-rotate ──
+cp_group_t g = cp_read_group(codes_in, row_base, grp);
 float rots[4];
-for (uint e = 0u; e < ISO4_GS; e++) {
-    uint idx = cp_read_code(codes_in, row_base, grp * CP_CODES_PER_GROUP + e);
-    rots[e]  = ISO4_CB[idx] * scale;
-}
+rots[0] = ISO4_CB[g.x] * scale;
+rots[1] = ISO4_CB[g.y] * scale;
+rots[2] = ISO4_CB[g.z] * scale;
+rots[3] = ISO4_CB[g.w] * scale;
 
 float rw = rots[0];
 float rx = rots[1];

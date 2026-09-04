@@ -276,6 +276,7 @@ fn render_decode_fn() -> String {
          \x20   device const float*  rotors,\n\
          \x20   uint                tok_idx,\n\
          \x20   uint                n_groups,\n\
+         \x20   uint                row_words,\n\
          \x20   uint                group_id,\n\
          \x20   thread float*       out) {{\n\
          \x20   float k_scale = scales[tok_idx * n_groups + group_id];\n\
@@ -291,12 +292,11 @@ fn render_decode_fn() -> String {
          \x20   // five components are algebraically zero: the sandwich preserves\n\
          \x20   // grade, so nothing was stored for them.\n\
          \x20   float mv_q[8] = {{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}};\n\
-         \x20   uint  row_base = tok_idx * cp_row_words(n_groups);\n\
-         \x20   for (uint e = 0u; e < RF_GROUP_SIZE; ++e) {{\n\
-         \x20       uint idx = cp_read_code(codes, row_base,\n\
-         \x20                               group_id * CP_CODES_PER_GROUP + e);\n\
-         \x20       mv_q[e + 1u] = RF_CB[idx] * k_scale;\n\
-         \x20   }}\n\
+         \x20   uint  row_base = tok_idx * row_words;\n\
+         \x20   cp_group_t g = cp_read_group(codes, row_base, group_id);\n\
+         \x20   mv_q[1] = RF_CB[g.x] * k_scale;\n\
+         \x20   mv_q[2] = RF_CB[g.y] * k_scale;\n\
+         \x20   mv_q[3] = RF_CB[g.z] * k_scale;\n\
          \n\
          \x20   // Inverse sandwich: restored = R~ * mv_q * R.\n\
          \x20   //\n\
@@ -355,13 +355,14 @@ fn render_decode_fn() -> String {
          \x20   device const float*  rotors,\n\
          \x20   uint                tok_idx,\n\
          \x20   uint                n_groups,\n\
+         \x20   uint                row_words,\n\
          \x20   uint                lane) {{\n\
          \x20   // Each group of RF_GROUP_SIZE head-dim slots is one Cl(3,0) block.\n\
          \x20   uint group_id_in_head = lane / RF_GROUP_SIZE;\n\
          \x20   uint lane_in_group    = lane - group_id_in_head * RF_GROUP_SIZE;\n\
          \x20   float g[RF_GROUP_SIZE];\n\
          \x20   rf_decode_k_group(codes, scales, norms, rotors, tok_idx, n_groups,\n\
-         \x20                     group_id_in_head, g);\n\
+         \x20                     row_words, group_id_in_head, g);\n\
          \x20   return g[lane_in_group];\n\
          }}\n",
     );

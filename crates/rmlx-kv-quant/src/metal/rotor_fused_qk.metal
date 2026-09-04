@@ -48,11 +48,10 @@ float rb23      = rotors[rotor_base + 3u];
 // of mv_q. The other five components are algebraically zero — the sandwich
 // preserves grade — so nothing was stored for them.
 float mv_q[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-for (uint e = 0u; e < CP_CODES_PER_GROUP; ++e) {
-    uint idx     = cp_read_code(codes, codes_row_base,
-                                group_id_in_head * CP_CODES_PER_GROUP + e);
-    mv_q[e + 1u] = ROTOR_CB[idx] * k_scale;
-}
+cp_group_t g  = cp_read_group(codes, codes_row_base, group_id_in_head);
+mv_q[1]       = ROTOR_CB[g.x] * k_scale;
+mv_q[2]       = ROTOR_CB[g.y] * k_scale;
+mv_q[3]       = ROTOR_CB[g.z] * k_scale;
 
 // Phase 3: inverse Cl(3,0) sandwich  restored = R̃ * mv_q * R.
 //

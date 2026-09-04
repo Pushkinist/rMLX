@@ -204,7 +204,9 @@ fn render_decode_fn() -> String {
          //\n\
          // `tok_idx` indexes the flat sequence-major token stream\n\
          // (`(b * kv_seq + t) * kv_h + kv_h_idx`); `lane` is the head-dim slot\n\
-         // in [0, head_dim). Bit-exact with the CPU iso_decode_fast.\n\
+         // in [0, head_dim). `row_words` is `cp_row_words(n_groups)`, hoisted\n\
+         // by the caller: it is loop-invariant and this runs per lane per KV\n\
+         // token. Bit-exact with the CPU iso_decode_fast.\n\
          //\n\
          // Self-contained per lane: the group's four codes are four reads of\n\
          // the row's code plane, so the Hamilton product runs in registers\n\
@@ -219,6 +221,7 @@ fn render_decode_fn() -> String {
          \x20   device const bfloat* norms,\n\
          \x20   uint                tok_idx,\n\
          \x20   uint                n_groups,\n\
+         \x20   uint                row_words,\n\
          \x20   uint                lane) {{\n\
          \x20   // Each group of 4 head-dim slots is one quaternion block.\n\
          \x20   uint group_id_in_head = lane / {gs}u;\n\
@@ -226,14 +229,14 @@ fn render_decode_fn() -> String {
          \n\
          \x20   float k_scale = scales[tok_idx * n_groups + group_id_in_head];\n\
          \n\
-         \x20   // Read the group's 4 codes out of the row's dense plane ->\n\
-         \x20   // centroid x scale.\n\
-         \x20   uint row_base  = tok_idx * cp_row_words(n_groups);\n\
-         \x20   uint code_base = group_id_in_head * CP_CODES_PER_GROUP;\n\
-         \x20   float rw = ISO_CB[cp_read_code(codes, row_base, code_base + 0u)] * k_scale;\n\
-         \x20   float rx = ISO_CB[cp_read_code(codes, row_base, code_base + 1u)] * k_scale;\n\
-         \x20   float ry = ISO_CB[cp_read_code(codes, row_base, code_base + 2u)] * k_scale;\n\
-         \x20   float rz = ISO_CB[cp_read_code(codes, row_base, code_base + 3u)] * k_scale;\n\
+         \x20   // Read the group's 4 codes out of the row's dense plane in one\n\
+         \x20   // load -> centroid x scale.\n\
+         \x20   uint row_base = tok_idx * row_words;\n\
+         \x20   cp_group_t g = cp_read_group(codes, row_base, group_id_in_head);\n\
+         \x20   float rw = ISO_CB[g.x] * k_scale;\n\
+         \x20   float rx = ISO_CB[g.y] * k_scale;\n\
+         \x20   float ry = ISO_CB[g.z] * k_scale;\n\
+         \x20   float rz = ISO_CB[g.w] * k_scale;\n\
          \n\
          \x20   // Inverse rotation: r' = qbar * r, Hamilton product in the\n\
          \x20   // [w, x, y, z] convention. qbar = (ISO_QW, ISO_QCX, ISO_QCY,\n\

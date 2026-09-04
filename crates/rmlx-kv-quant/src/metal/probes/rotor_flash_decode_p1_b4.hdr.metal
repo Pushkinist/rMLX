@@ -63,22 +63,49 @@ inline uint cp_row_words(uint n_groups) {
     return (n_groups * CP_CODES_PER_GROUP * CP_BITS + 31u) / 32u;
 }
 
-// Read code `idx` of the row whose first word is `codes[row_base]`.
+// One group's codes, returned by value: a vector lives in registers where a
+// `thread uint[]` out-parameter is addressable and can be spilled to thread
+// memory, which on the decode path costs more than the loads it saves.
+typedef uint3 cp_group_t;
+
+// Read all CP_CODES_PER_GROUP codes of group `group_id`.
 //
 // Templated over the address space because MLX binds a small input buffer as
 // `constant` and a large one as `device`, and MSL will not convert between the
 // two: a single-address-space reader compiles for one dispatch shape and fails
 // the other at JIT time.
+//
+// A whole group is CP_CODES_PER_GROUP * CP_BITS bits — at most 32, and never
+// spanning more than a word pair — so this is a word pair, where a code at a
+// time would be one load per code. That matters: every decode
+// lane needs its group's whole code set (the quaternion product and the rotor
+// sandwich both mix all of them), so a per-code reader multiplies the loads on
+// the hottest path in the kernel by the group size.
 template <typename P>
-inline uint cp_read_code(P codes, uint row_base, uint idx) {
-    uint bit  = idx * CP_BITS;
+inline cp_group_t cp_read_group(P codes, uint row_base, uint group_id) {
+    uint span = CP_CODES_PER_GROUP * CP_BITS;
+    uint bit  = group_id * span;
     uint word = row_base + (bit >> 5u);
     uint off  = bit & 31u;
-    uint v    = codes[word] >> off;
-    if (off + CP_BITS > 32u) {
-        v |= codes[word + 1u] << (32u - off);
-    }
-    return v & CP_MASK;
+    // A group's span never exceeds 32 bits, so its bits fit one word once
+    // shifted down — no 64-bit arithmetic, which Apple GPUs emulate.
+    //
+    // The straddle is a select, not a branch. Whether a group crosses a word
+    // boundary depends on its index, so within one simdgroup some lanes cross
+    // and some do not: a branch there is executed by every lane anyway, and
+    // costs the divergence on top. The second word is addressed with a select
+    // (`word` when there is nothing to fetch, so never out of bounds) and its
+    // contribution is masked to zero the same way.
+    bool crosses = off + span > 32u;
+    uint v       = codes[word] >> off;
+    uint hi      = codes[word + (crosses ? 1u : 0u)];
+    v |= crosses ? (hi << (32u - off)) : 0u;
+    cp_group_t out;
+    out.x = (v >> 0u * CP_BITS) & CP_MASK;
+    out.y = (v >> 1u * CP_BITS) & CP_MASK;
+    out.z = (v >> 2u * CP_BITS) & CP_MASK;
+
+    return out;
 }
 
 // OR code `idx` into the row whose first word is `codes[row_base]`. The plane
@@ -113,6 +140,7 @@ inline void rf_decode_k_group(
     device const float*  rotors,
     uint                tok_idx,
     uint                n_groups,
+    uint                row_words,
     uint                group_id,
     thread float*       out) {
     float k_scale = scales[tok_idx * n_groups + group_id];
@@ -128,12 +156,11 @@ inline void rf_decode_k_group(
     // five components are algebraically zero: the sandwich preserves
     // grade, so nothing was stored for them.
     float mv_q[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    uint  row_base = tok_idx * cp_row_words(n_groups);
-    for (uint e = 0u; e < RF_GROUP_SIZE; ++e) {
-        uint idx = cp_read_code(codes, row_base,
-                                group_id * CP_CODES_PER_GROUP + e);
-        mv_q[e + 1u] = RF_CB[idx] * k_scale;
-    }
+    uint  row_base = tok_idx * row_words;
+    cp_group_t g = cp_read_group(codes, row_base, group_id);
+    mv_q[1] = RF_CB[g.x] * k_scale;
+    mv_q[2] = RF_CB[g.y] * k_scale;
+    mv_q[3] = RF_CB[g.z] * k_scale;
 
     // Inverse sandwich: restored = R~ * mv_q * R.
     //
@@ -192,13 +219,14 @@ inline float rf_decode_k_lane(
     device const float*  rotors,
     uint                tok_idx,
     uint                n_groups,
+    uint                row_words,
     uint                lane) {
     // Each group of RF_GROUP_SIZE head-dim slots is one Cl(3,0) block.
     uint group_id_in_head = lane / RF_GROUP_SIZE;
     uint lane_in_group    = lane - group_id_in_head * RF_GROUP_SIZE;
     float g[RF_GROUP_SIZE];
     rf_decode_k_group(codes, scales, norms, rotors, tok_idx, n_groups,
-                      group_id_in_head, g);
+                      row_words, group_id_in_head, g);
     return g[lane_in_group];
 }
 

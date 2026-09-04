@@ -10,9 +10,10 @@ float norm  = norms_in[gid];
 
 // ── Read the three stored grade-1 codes out of the dense plane ───────────
 uint row_base = token * cp_row_words(n_grp);
-float c1      = ROTOR3_CB[cp_read_code(codes_in, row_base, grp *CP_CODES_PER_GROUP + 0u)] * scale;
-float c2      = ROTOR3_CB[cp_read_code(codes_in, row_base, grp *CP_CODES_PER_GROUP + 1u)] * scale;
-float c3      = ROTOR3_CB[cp_read_code(codes_in, row_base, grp *CP_CODES_PER_GROUP + 2u)] * scale;
+cp_group_t g  = cp_read_group(codes_in, row_base, grp);
+float c1      = ROTOR3_CB[g.x] * scale;
+float c2      = ROTOR3_CB[g.y] * scale;
+float c3      = ROTOR3_CB[g.z] * scale;
 
 // ── Load rotor and apply inverse rotation M(R)^T = M(R̃) ─────────────────
 uint r_base = grp * 4u;
