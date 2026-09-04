@@ -52,6 +52,10 @@ fn every_spec_metric_present() {
         "accept_tokens_total",
         "draft_rounds_total",
         "accepted_per_step",
+        "tokens_per_round",
+        "draft_ms_per_round",
+        "verify_ms_per_round",
+        "loop_ms_per_round",
         // SSD-tier observability (step2).
         "ssd_bytes_used",
         "ssd_evict_total",
@@ -77,7 +81,7 @@ fn every_spec_metric_present() {
         );
     }
     // METRICS row count — bump when adding new metric ops.
-    assert_eq!(METRICS.len(), 56, "METRICS should have exactly 56 rows");
+    assert_eq!(METRICS.len(), 60, "METRICS should have exactly 60 rows");
 }
 
 #[test]

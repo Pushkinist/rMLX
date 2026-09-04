@@ -12,8 +12,14 @@ use crate::{bests_view, error::Result, schema::MIGRATIONS, time_util::now_iso860
 ///
 /// Reads `PRAGMA user_version` to find the current schema version, then runs
 /// every migration whose target version exceeds it, in order. Each migration
-/// executes inside its own transaction. After migration 001 is applied, the
-/// `schema_meta` seed rows are inserted (idempotent via `INSERT OR IGNORE`).
+/// executes inside its own transaction — **including its post-hook**, which for
+/// 006, 007 and 008 is the entire substance of the migration since their `.sql`
+/// files carry no schema change. Committing the version first and running the
+/// hook after would let an interrupt leave the DB at the new version with only
+/// some rows rewritten, and `run_pending` never re-enters that branch: the rest
+/// stay stale for good, silently, because ingest refuses new rows in that state
+/// and nothing repopulates the cell. After migration 001 the `schema_meta` seed
+/// rows are inserted (idempotent via `INSERT OR IGNORE`).
 ///
 /// Finally, [`bests_view::ensure`] brings the `bests` view in line with the §4
 /// registry — see that module for why the view is generated rather than
@@ -30,23 +36,27 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
             continue;
         }
 
-        // Each migration runs in its own transaction.
+        // Each migration and its post-hook run in one transaction, so the
+        // version and the work it stands for commit together or not at all.
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
-        // Mirror schema_meta.schema_version in the SQLite header.
+        match target_version {
+            1 => seed_schema_meta(&tx)?,
+            6 => {
+                backfill_decode_config(&tx)?;
+            }
+            7 => {
+                null_default_decode_config(&tx)?;
+            }
+            8 => {
+                adaptive_depth_decode_config(&tx)?;
+            }
+            _ => {}
+        }
+        // Mirror schema_meta.schema_version in the SQLite header. Last inside
+        // the transaction: the version is what says the hook above ran.
         tx.execute_batch(&format!("PRAGMA user_version = {target_version};"))?;
         tx.commit()?;
-
-        // Post-migration hooks.
-        if target_version == 1 {
-            seed_schema_meta(conn)?;
-        }
-        if target_version == 6 {
-            backfill_decode_config(conn)?;
-        }
-        if target_version == 7 {
-            null_default_decode_config(conn)?;
-        }
 
         applied += 1;
     }
@@ -146,6 +156,46 @@ fn null_default_decode_config(conn: &Connection) -> Result<usize> {
             rows = n,
             %spelling,
             "migrate: decode_config spelled the engine defaults; moved to the default cell"
+        );
+        moved += n;
+    }
+    Ok(moved)
+}
+
+/// Migration 008 post-hook: a drafter that has always resized its block says so.
+///
+/// Writes no measurement: it rewrites how a row says the engine was configured,
+/// on rows whose spelling was never true of them — a bare `<kind>/block=<n>` for
+/// a drafter in [`crate::cell::ADAPTIVE_DRAFTERS`], which has no fixed-block arm
+/// to describe. The predicate is
+/// [`crate::cell::decode_config_with_inherent_depth`], reading that one list —
+/// not a SQL literal, which would be a second copy of it.
+///
+/// Returns how many rows were moved to the cell that describes their loop.
+pub(crate) fn adaptive_depth_decode_config(conn: &Connection) -> Result<usize> {
+    let spellings: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT decode_config FROM observations WHERE decode_config IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut moved = 0_usize;
+    for stale in spellings {
+        let Some(corrected) = crate::cell::decode_config_with_inherent_depth(&stale) else {
+            continue;
+        };
+        let n = conn.execute(
+            "UPDATE observations SET decode_config = ?1 WHERE decode_config = ?2",
+            rusqlite::params![corrected, stale],
+        )?;
+        tracing::info!(
+            rows = n,
+            %stale,
+            %corrected,
+            "migrate: decode_config described an adaptive drafter as fixed-block; \
+             moved to the cell that describes its loop"
         );
         moved += n;
     }

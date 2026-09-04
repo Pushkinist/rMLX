@@ -29,6 +29,7 @@ pub mod gemma4_assistant;
 pub mod mtp;
 
 pub(crate) mod draft_kind;
+pub(crate) mod round_stats;
 
 // kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
 // caches a round builds live for that round only: they are never pushed to the
@@ -47,6 +48,7 @@ use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 pub use draft_kind::DraftKind;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+pub(crate) use round_stats::{RoundStats, SpecLoop};
 
 /// Resolve the context bounds a speculative pair runs under.
 ///
@@ -570,6 +572,9 @@ impl SpeculativeDispatcher {
         let mut d_seed: Vec<u32> = vec![last_prompt];
 
         // --- Spec loop. ------------------------------------------------
+        let seed_emitted = emitted.len();
+        let mut emitted_in_rounds = 0usize;
+        let round_loop_t0 = Instant::now();
         while emitted.len() < n_tokens {
             rounds += 1;
             let remaining = n_tokens - emitted.len();
@@ -671,29 +676,30 @@ impl SpeculativeDispatcher {
                     break;
                 }
                 emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
+                emitted_in_rounds += 1;
                 if eos_ids.contains(&id) {
                     hit_eos = true;
                     break;
                 }
             }
             if hit_eos {
-                tracing::info!(
+                RoundStats {
+                    loop_kind: SpecLoop::TwoModelGreedy,
+                    block_size: k + 1,
                     rounds,
-                    emitted = emitted.len(),
-                    total_draft = total_draft_tokens,
-                    total_accept_count,
-                    accept_rate = if total_draft_tokens > 0 {
-                        (total_accept_count as f64) / (total_draft_tokens as f64)
-                    } else {
-                        0.0
-                    },
-                    elapsed_ms = (t_total.elapsed().as_nanos() as f64) / 1.0e6,
-                    prefill_ms = (prefill_ns as f64) / 1.0e6,
-                    draft_ms = (draft_ns as f64) / 1.0e6,
-                    verifier_ms = (verifier_ns as f64) / 1.0e6,
-                    k,
-                    "spec_generate_greedy_cached: EOS — stopping"
-                );
+                    emitted: emitted.len(),
+                    seed_emitted,
+                    emitted_in_rounds,
+                    total_draft: total_draft_tokens,
+                    total_accept: total_accept_count,
+                    prefill_ns,
+                    draft_ns,
+                    verifier_ns,
+                    round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+                    elapsed_ns: t_total.elapsed().as_nanos(),
+                    decode_tps: window.tps(),
+                }
+                .log_done();
                 return Ok(emitted);
             }
 
@@ -796,25 +802,23 @@ impl SpeculativeDispatcher {
             );
         }
 
-        let elapsed_ms = (t_total.elapsed().as_nanos() as f64) / 1.0e6;
-        tracing::info!(
+        RoundStats {
+            loop_kind: SpecLoop::TwoModelGreedy,
+            block_size: k + 1,
             rounds,
-            emitted = emitted.len(),
-            total_draft = total_draft_tokens,
-            total_accept_count,
-            accept_rate = if total_draft_tokens > 0 {
-                (total_accept_count as f64) / (total_draft_tokens as f64)
-            } else {
-                0.0
-            },
-            decode_tps = ?window.tps(),
-            elapsed_ms,
-            prefill_ms = (prefill_ns as f64) / 1.0e6,
-            draft_ms = (draft_ns as f64) / 1.0e6,
-            verifier_ms = (verifier_ns as f64) / 1.0e6,
-            k,
-            "spec_generate_greedy_cached: done"
-        );
+            emitted: emitted.len(),
+            seed_emitted,
+            emitted_in_rounds,
+            total_draft: total_draft_tokens,
+            total_accept: total_accept_count,
+            prefill_ns,
+            draft_ns,
+            verifier_ns,
+            round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+            elapsed_ns: t_total.elapsed().as_nanos(),
+            decode_tps: window.tps(),
+        }
+        .log_done();
 
         // Report the verifier's resident KV, so a caller that sampled the
         // verifier arch around this call can attribute the figure to it. This
@@ -987,6 +991,9 @@ impl SpeculativeDispatcher {
         let mut v_carry: Vec<u32> = vec![last_prompt];
         let mut d_seed: Vec<u32> = vec![last_prompt];
 
+        let seed_emitted = emitted.len();
+        let mut emitted_in_rounds = 0usize;
+        let round_loop_t0 = Instant::now();
         while emitted.len() < n_tokens {
             rounds += 1;
             let remaining = n_tokens - emitted.len();
@@ -1095,29 +1102,30 @@ impl SpeculativeDispatcher {
                     break;
                 }
                 emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
+                emitted_in_rounds += 1;
                 if eos_ids.contains(&id) {
                     hit_eos = true;
                     break;
                 }
             }
             if hit_eos {
-                tracing::info!(
+                RoundStats {
+                    loop_kind: SpecLoop::TwoModelStochastic,
+                    block_size: k + 1,
                     rounds,
-                    emitted = emitted.len(),
-                    total_draft = total_draft_tokens,
-                    total_accept_count,
-                    accept_rate = if total_draft_tokens > 0 {
-                        (total_accept_count as f64) / (total_draft_tokens as f64)
-                    } else {
-                        0.0
-                    },
-                    elapsed_ms = (t_total.elapsed().as_nanos() as f64) / 1.0e6,
-                    prefill_ms = (prefill_ns as f64) / 1.0e6,
-                    draft_ms = (draft_ns as f64) / 1.0e6,
-                    verifier_ms = (verifier_ns as f64) / 1.0e6,
-                    k,
-                    "spec_generate_stochastic_cached: EOS — stopping"
-                );
+                    emitted: emitted.len(),
+                    seed_emitted,
+                    emitted_in_rounds,
+                    total_draft: total_draft_tokens,
+                    total_accept: total_accept_count,
+                    prefill_ns,
+                    draft_ns,
+                    verifier_ns,
+                    round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+                    elapsed_ns: t_total.elapsed().as_nanos(),
+                    decode_tps: window.tps(),
+                }
+                .log_done();
                 return Ok(emitted);
             }
 
@@ -1193,25 +1201,23 @@ impl SpeculativeDispatcher {
             );
         }
 
-        let elapsed_ms = (t_total.elapsed().as_nanos() as f64) / 1.0e6;
-        tracing::info!(
+        RoundStats {
+            loop_kind: SpecLoop::TwoModelStochastic,
+            block_size: k + 1,
             rounds,
-            emitted = emitted.len(),
-            total_draft = total_draft_tokens,
-            total_accept_count,
-            accept_rate = if total_draft_tokens > 0 {
-                (total_accept_count as f64) / (total_draft_tokens as f64)
-            } else {
-                0.0
-            },
-            decode_tps = ?window.tps(),
-            elapsed_ms,
-            prefill_ms = (prefill_ns as f64) / 1.0e6,
-            draft_ms = (draft_ns as f64) / 1.0e6,
-            verifier_ms = (verifier_ns as f64) / 1.0e6,
-            k,
-            "spec_generate_stochastic_cached: done"
-        );
+            emitted: emitted.len(),
+            seed_emitted,
+            emitted_in_rounds,
+            total_draft: total_draft_tokens,
+            total_accept: total_accept_count,
+            prefill_ns,
+            draft_ns,
+            verifier_ns,
+            round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+            elapsed_ns: t_total.elapsed().as_nanos(),
+            decode_tps: window.tps(),
+        }
+        .log_done();
 
         // See the greedy path: the verifier's own resident KV, reported so the
         // caller can attribute it to this call.

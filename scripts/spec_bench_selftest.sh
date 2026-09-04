@@ -109,19 +109,69 @@ served = 0
 itl_ring = []
 
 
+ROUNDS = 30
+# Pairwise distinct per-round figures (10 / 30 / 20 ms): with a round loop of
+# 1500 the draft and loop residual were both 10, and a swap of the two
+# derivations passed every assertion in this suite.
+DRAFT_MS = 300.0
+VERIFY_MS = 900.0
+ROUND_MS = 1800.0
+SEED_EMITTED = int(os.environ.get("STUB_SEED_EMITTED", "1"))
+# 98 accepted over 30 rounds could produce 128; the rounds emitted 127. The stub
+# deliberately sits one token UNDER that budget, because the check this exercises
+# is the three counts adding up rather than the inequality it replaced — which
+# only bit at the budget, and on real requests bit on one of four loops.
+TOTAL_ACCEPT = int(os.environ.get("STUB_TOTAL_ACCEPT", "98"))
+DECODE_CONFIG = os.environ.get("STUB_DECODE_CONFIG", "mtp/block=5")
+# The engine composes both from one block, so the stub cannot make them
+# disagree by accident.
+BLOCK_SIZE = int(
+    next(t for t in DECODE_CONFIG.split(",") if t.split("=")[0].endswith("/block")).split("=")[1]
+)
+DERIVED_OVERRIDE = os.environ.get("STUB_DERIVED_OVERRIDE", "")
+DROP_FIELDS = [f for f in os.environ.get("STUB_DROP_FIELDS", "").split(",") if f]
+
+
 def done_line():
-    """One round-loop `done` record, as tracing's JSON layer renders it."""
+    """One round-loop `done` record, as tracing's JSON layer renders it.
+
+    Carries the raw counters and the per-round figures the engine derives from
+    them, consistent with each other. STUB_DERIVED_OVERRIDE (`name=value`)
+    breaks one of them, which is how the reader's cross-check is staged.
+    """
     raw = SEQ[min(served, len(SEQ) - 1)] if SEQ else ""
+    # The engine counts this at its own emit site, independently of the seed —
+    # which is the whole point: a drifting seed must break the sum rather than
+    # be absorbed by it. So the default is the healthy round count, not
+    # `EMITTED - SEED_EMITTED`.
+    round_emitted = int(os.environ.get("STUB_EMITTED_IN_ROUNDS", EMITTED - 1))
     fields = {
         "message": "mtp_generate_greedy: done",
-        "rounds": 30,
+        "rounds": ROUNDS,
         "emitted": EMITTED,
+        "seed_emitted": SEED_EMITTED,
+        "emitted_in_rounds": round_emitted,
         "total_draft": 150,
-        "total_accept": 98,
-        "accept_rate": 98 / 150,
+        "total_accept": TOTAL_ACCEPT,
+        "accept_rate": TOTAL_ACCEPT / 150,
+        "accepted_per_step": TOTAL_ACCEPT / ROUNDS,
+        "tokens_per_round": round_emitted / ROUNDS,
         "elapsed_ms": ELAPSED_MS,
-        "block_size": 5,
+        "prefill_ms": 100.0,
+        "round_ms": ROUND_MS,
+        "draft_ms": DRAFT_MS,
+        "verifier_ms": VERIFY_MS,
+        "draft_ms_per_round": DRAFT_MS / ROUNDS,
+        "verify_ms_per_round": VERIFY_MS / ROUNDS,
+        "loop_ms_per_round": (ROUND_MS - DRAFT_MS - VERIFY_MS) / ROUNDS,
+        "block_size": BLOCK_SIZE,
+        "decode_config": DECODE_CONFIG,
     }
+    if DERIVED_OVERRIDE:
+        name, _, value = DERIVED_OVERRIDE.partition("=")
+        fields[name] = float(value)
+    for name in DROP_FIELDS:
+        fields.pop(name, None)
     if raw:
         fields["decode_tps"] = json.loads(raw)
     return json.dumps(
@@ -715,6 +765,163 @@ run_case server_rate_unattributable_refused 1 \
 	'STUB_ITL_SUPPRESS=1' \
 	'GREP:the server attributed no decode rate'
 no_row normal
+verdict
+
+# ── The round-loop figures ────────────────────────────────────────────────────
+
+# metric_value <config> <metric name> — that metric's value, or "" when the row
+# carries no such metric.
+metric_value() {
+	local path
+	path="$(record_of "$1")"
+	[ -z "$path" ] && return 0
+	python3 -c 'import json, sys
+rec = json.load(open(sys.argv[1]))
+for m in rec.get("metrics", []):
+    if m.get("name") == sys.argv[2]:
+        print(m.get("value", ""))
+        break' "$path" "$2"
+}
+
+# The whole point of the change: a speculative row carries what the round loop
+# counted, not only its accept rate. 30 rounds emitting 128 tokens of which one
+# is the pre-round seed is 127/30 = 4.2333 tokens per round, and
+# 1800 - 300 - 900 ms of loop over 30 rounds is 20 ms.
+run_case round_loop_figures_recorded 0 \
+	"the speculative row carries the per-round split, not only the accept rate"
+for pair in \
+	"tokens_per_round 4.233333" \
+	"accepted_per_step 3.266667" \
+	"draft_ms_per_round 10.0" \
+	"verify_ms_per_round 30.0" \
+	"loop_ms_per_round 20.0"; do
+	set -- $pair
+	got="$(metric_value mtp "$1")"
+	close_to "$got" "$2" 0.001 || note_bad "mtp $1=$got (want $2)"
+done
+# The no-drafter arm has no round loop, so it must carry no per-round figure —
+# a zero there would rank as a measured one.
+for name in tokens_per_round accepted_per_step loop_ms_per_round; do
+	[ -z "$(metric_value normal "$name")" ] ||
+		note_bad "normal carries $name=$(metric_value normal "$name")"
+done
+verdict
+
+# The engine derives the per-round figures too, and this reader derives them
+# again. A drift between the two would file a number no run produced, so an
+# event whose own counters contradict its derived field is refused — for every
+# one of them, not for the one that happened to be tested. `loop_ms_per_round`
+# is the term list that can go wrong quietly: it is the only difference of
+# three counters.
+for derived in accept_rate accepted_per_step tokens_per_round \
+	draft_ms_per_round verify_ms_per_round loop_ms_per_round; do
+	run_case "derived_${derived}_contradiction_refused" 1 \
+		"a done line whose ${derived} disagrees with its counters is refused" \
+		"STUB_DERIVED_OVERRIDE=${derived}=9.0" \
+		'GREP:do not agree on the formula'
+	no_row mtp
+	verdict
+done
+
+# A counter a figure is derived from, dropped together with that figure, would
+# otherwise aggregate to a zero nobody measured — and the caller cannot see it,
+# because this reader always prints the key.
+run_case dropped_counter_refused 1 \
+	"a counter a figure is derived from is required, not defaulted to zero" \
+	'STUB_DROP_FIELDS=emitted,tokens_per_round' \
+	'GREP:carries no emitted'
+no_row mtp
+verdict
+
+run_case dropped_round_span_refused 1 \
+	"the round-loop span is required too, so its residual cannot read zero" \
+	'STUB_DROP_FIELDS=round_ms,loop_ms_per_round' \
+	'GREP:carries no round_ms'
+no_row mtp
+verdict
+
+# The seed count and the emitted count are read at different points in the loop,
+# so a loop that stopped emitting its pre-round token disagrees with itself here
+# rather than shifting tokens_per_round by 1/rounds in an append-only table.
+# The drift itself, against the stub's own healthy counters: the seed captured
+# before the pre-round emit_step, so it reports 0 where the loop emitted 1. The
+# stub's line sits one token under the emission budget — where the inequality
+# this replaced was blind and where three of the four reachable loops live — so
+# only the three counts adding up can see it.
+run_case seed_taken_before_the_pre_round_emission_refused 1 \
+	"the drift is refused on a request that does not saturate the round budget" \
+	'STUB_SEED_EMITTED=0' \
+	'GREP:accounts for'
+no_row mtp
+verdict
+
+# The same inconsistency from the other side: a round loop that counted more
+# than it emitted.
+run_case round_count_contradicting_emitted_refused 1 \
+	"a round count that disagrees with the emitted total is refused" \
+	'STUB_EMITTED_IN_ROUNDS=120' \
+	'GREP:accounts for'
+no_row mtp
+verdict
+
+# And the emission budget, which is a different invariant on the same counters.
+run_case round_count_over_the_emission_budget_refused 1 \
+	"more tokens credited to the rounds than they could have produced is refused" \
+	'STUB_EMITTED_IN_ROUNDS=200' 'STUB_EMITTED=201' \
+	'GREP:could have produced'
+no_row mtp
+verdict
+
+# The cell a row belongs to is the one the round loop named. A log that does not
+# name it leaves the script to guess from its own flags, which is how a row is
+# filed under a configuration the run did not use.
+run_case unnamed_cell_refused 1 \
+	"a log that does not name its cell is refused rather than guessed at" \
+	'STUB_DROP_FIELDS=decode_config' \
+	'GREP:carries no decode_config field'
+no_row mtp
+verdict
+
+# The script asked for block 9; the engine ran block 3 and said so. The row must
+# be the engine's cell, or a sidecar that caps the block silently files every
+# request under a block it never ran.
+run_case engines_cell_beats_the_flag 0 \
+	"the recorded cell is the one the engine named, not the one asked for" \
+	'STUB_DECODE_CONFIG=mtp/block=3' \
+	ARGS:--draft-block-size ARGS:9
+[ "$(field_of_record mtp decode_config)" = "mtp/block=3" ] ||
+	note_bad "decode_config=$(field_of_record mtp decode_config)"
+case "$(notes_of mtp)" in
+*"block_size=3"*) ;;
+*) note_bad "notes claim a block the engine did not run: $(notes_of mtp)" ;;
+esac
+verdict
+
+# A drafter that resizes its block names a cell of its own. Recording it as the
+# fixed arm at the same ceiling would rank two configurations as one.
+run_case adaptive_cell_passes_through 0 \
+	"an adaptive drafter's cell reaches the row intact" \
+	'STUB_DECODE_CONFIG=dflash/block=16,dflash/depth=accept_rate' \
+	ARGS:--draft-kind ARGS:dflash
+[ "$(field_of_record dflash decode_config)" = "dflash/block=16,dflash/depth=accept_rate" ] ||
+	note_bad "decode_config=$(field_of_record dflash decode_config)"
+verdict
+
+# The kind becomes a component of the buffer filename and of `notes` before the
+# engine sees it, so a value the engine would reject must not get that far.
+run_case hostile_draft_kind_refused 1 \
+	"a drafter kind that would escape the buffer directory is refused at parse" \
+	ARGS:--draft-kind ARGS:../../etc/mtp \
+	'GREP:is not a bare lower-case name'
+no_row mtp
+[ -z "$(ls "$CASE_HOME"/metrics/buffer/pending/* 2>/dev/null)" ] ||
+	note_bad "a buffer file was written for a refused drafter kind"
+verdict
+
+run_case unusable_block_size_refused 1 \
+	"a block size with no room for a draft token is refused" \
+	ARGS:--draft-block-size ARGS:1 \
+	'GREP:must be an integer >= 2'
 verdict
 
 echo

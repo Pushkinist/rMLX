@@ -3,6 +3,8 @@
 #
 # Usage:
 #   bash scripts/spec_bench.sh [--port N] [--dry-run]
+#       [--draft-kind mtp|dflash|eagle3] [--draft-block-size N]
+#       [--kv-quant Q] [--max-ctx N] [--tag T]
 #
 # Requires:
 #   - Built binary at target/release-perf/rmlx  (run: make build-perf)
@@ -75,6 +77,10 @@ MEASURED_RUNS=3
 MAX_TOKENS=128
 TEMPERATURE=0
 SEED=42
+# The drafter to bench. Every kind the engine ships goes through this one path;
+# set with --draft-kind / --draft-block-size. What the run is *recorded* as is
+# not read from here — the round loop names its own cell and this script records
+# what it said (see the `decode_config` the log carries).
 DRAFT_KIND="mtp"
 DRAFT_BLOCK_SIZE=5
 # Empty means "let the engine resolve one", which it always does and always
@@ -104,9 +110,33 @@ while [[ $# -gt 0 ]]; do
         --kv-quant) shift; KV_QUANT="${1:?--kv-quant requires a value}"; shift ;;
         --max-ctx=*) MAX_CTX="${1#--max-ctx=}"; shift ;;
         --max-ctx) shift; MAX_CTX="${1:?--max-ctx requires a value}"; shift ;;
+        --draft-kind=*) DRAFT_KIND="${1#--draft-kind=}"; shift ;;
+        --draft-kind) shift; DRAFT_KIND="${1:?--draft-kind requires a value}"; shift ;;
+        --draft-block-size=*) DRAFT_BLOCK_SIZE="${1#--draft-block-size=}"; shift ;;
+        --draft-block-size) shift; DRAFT_BLOCK_SIZE="${1:?--draft-block-size requires a value}"; shift ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
+
+# The drafter kind reaches a buffer *filename* and the record's `notes`, both
+# before the engine ever sees it, so a value with a `/` or a space in it writes
+# outside `pending/` or files an unparseable note. That is the property this
+# script needs and the only one it checks: a list of the kinds the engine ships
+# would be a third copy of an enum this script cannot keep current, and would
+# reject a new drafter with a sentence that is false about it. Which kinds exist
+# is the engine's to say, in its own message.
+if ! [[ "${DRAFT_KIND}" =~ ^[a-z0-9_]+$ ]]; then
+    echo "ERROR: --draft-kind '${DRAFT_KIND}' is not a bare lower-case name;" \
+         "it reaches a buffer filename and the record's notes before the engine" \
+         "sees it" >&2
+    exit 1
+fi
+
+if ! [[ "${DRAFT_BLOCK_SIZE}" =~ ^[0-9]+$ ]] || (( DRAFT_BLOCK_SIZE < 2 )); then
+    echo "ERROR: --draft-block-size '${DRAFT_BLOCK_SIZE}' must be an integer >= 2:" \
+         "a block of 1 leaves no room for a draft token" >&2
+    exit 1
+fi
 
 if [[ -n "${KV_QUANT}" ]]; then
     KV_QUANT_ARGS=(--kv-quant "${KV_QUANT}")
@@ -340,26 +370,27 @@ stddev() {
 }
 
 # Emit a §8.5 RunRecord JSON and ingest it.
-# Args: config_name decode_tps stddev accept_rate draft_tokens_total
-#        accept_tokens_total draft_rounds_total accepted_per_step output_preview
-#        kv_quant prompt_tokens
+# Args: config_name decode_tps stddev output_preview kv_quant prompt_tokens
+#       [spec_data]
 #
 # `kv_quant` and `prompt_tokens` are measured facts about the run, not settings
 # this script may assume: the codec is whatever the engine resolved and said so
 # in its log, and the prompt length is whatever the server counted. A record
 # missing either is refused rather than filed under a guess.
+#
+# `spec_data` is scripts/lib/spec_round_log.py's output for the speculative arm
+# and empty for the no-drafter one. Every speculative metric, the block the
+# engine ran and the cell the row belongs to come out of it: that reader is the
+# one place a round loop's numbers are turned into a row, so a new drafter or a
+# new block policy is recorded correctly without this script learning about it.
 emit_and_ingest() {
     local config="$1"
     local decode_tps="$2"
     local decode_tps_stddev="$3"
-    local accept_rate="$4"
-    local draft_tokens_total="$5"
-    local accept_tokens_total="$6"
-    local draft_rounds_total="$7"
-    local accepted_per_step="$8"
-    local preview="$9"
-    local kv_quant="${10}"
-    local prompt_tokens="${11}"
+    local preview="$4"
+    local kv_quant="$5"
+    local prompt_tokens="$6"
+    local spec_data="${7:-}"
 
     if [[ -z "${kv_quant}" ]]; then
         echo "ERROR: ${config}: the run did not report which KV codec it resolved" >&2
@@ -380,11 +411,7 @@ emit_and_ingest() {
         BENCH_CONFIG="${config}" \
         BENCH_DECODE_TPS="${decode_tps}" \
         BENCH_DECODE_TPS_STDDEV="${decode_tps_stddev}" \
-        BENCH_ACCEPT_RATE="${accept_rate}" \
-        BENCH_DRAFT_TOKENS_TOTAL="${draft_tokens_total}" \
-        BENCH_ACCEPT_TOKENS_TOTAL="${accept_tokens_total}" \
-        BENCH_DRAFT_ROUNDS_TOTAL="${draft_rounds_total}" \
-        BENCH_ACCEPTED_PER_STEP="${accepted_per_step}" \
+        BENCH_SPEC_DATA="${spec_data}" \
         BENCH_PREVIEW="${preview}" \
         BENCH_KV_QUANT="${kv_quant}" \
         BENCH_PROMPT_TOKENS="${prompt_tokens}" \
@@ -401,7 +428,6 @@ emit_and_ingest() {
         BENCH_TEMPERATURE="${TEMPERATURE}" \
         BENCH_SEED="${SEED}" \
         BENCH_DRAFT_KIND="${DRAFT_KIND}" \
-        BENCH_DRAFT_BLOCK_SIZE="${DRAFT_BLOCK_SIZE}" \
         BENCH_TAG="${BENCH_TAG}" \
         BENCH_PROMPT_CONTENT="${PROMPT_CONTENT}" \
         BENCH_PROMPT_NAME="${PROMPT_NAME}" \
@@ -411,11 +437,11 @@ import json, os
 config = os.environ["BENCH_CONFIG"]
 decode_tps = float(os.environ["BENCH_DECODE_TPS"])
 decode_tps_stddev = float(os.environ["BENCH_DECODE_TPS_STDDEV"])
-accept_rate = float(os.environ["BENCH_ACCEPT_RATE"])
-draft_tokens_total = int(os.environ["BENCH_DRAFT_TOKENS_TOTAL"])
-accept_tokens_total = int(os.environ["BENCH_ACCEPT_TOKENS_TOTAL"])
-draft_rounds_total = int(os.environ["BENCH_DRAFT_ROUNDS_TOTAL"])
-accepted_per_step = float(os.environ["BENCH_ACCEPTED_PER_STEP"])
+spec = dict(
+    line.split("=", 1)
+    for line in os.environ["BENCH_SPEC_DATA"].splitlines()
+    if "=" in line
+)
 preview = os.environ["BENCH_PREVIEW"]
 kv_quant = os.environ["BENCH_KV_QUANT"]
 prompt_tokens = int(os.environ["BENCH_PROMPT_TOKENS"])
@@ -432,7 +458,6 @@ measured_runs = int(os.environ["BENCH_MEASURED_RUNS"])
 temperature = float(os.environ["BENCH_TEMPERATURE"])
 seed = int(os.environ["BENCH_SEED"])
 draft_kind = os.environ["BENCH_DRAFT_KIND"]
-draft_block_size = int(os.environ["BENCH_DRAFT_BLOCK_SIZE"])
 bench_tag = os.environ.get("BENCH_TAG", "")
 tag_suffix = f" tag={bench_tag}" if bench_tag else ""
 
@@ -440,20 +465,43 @@ prompt_content = os.environ["BENCH_PROMPT_CONTENT"]
 prompt_name = os.environ["BENCH_PROMPT_NAME"]
 prompt_body = [{"role": "user", "content": prompt_content}]
 
+# One name per figure the round loop reported, in the order they are derived.
+# The reader's key is the metric name, so a figure it stops reporting stops
+# being recorded rather than being recorded as a zero.
+SPEC_METRICS = (
+    ("accept_rate", "accept_rate", float),
+    ("draft_tokens_total", "draft_tokens_total", int),
+    ("accept_tokens_total", "accept_tokens_total", int),
+    ("draft_rounds_total", "rounds_total", int),
+    ("accepted_per_step", "accepted_per_step", float),
+    ("tokens_per_round", "tokens_per_round", float),
+    ("draft_ms_per_round", "draft_ms_per_round", float),
+    ("verify_ms_per_round", "verify_ms_per_round", float),
+    ("loop_ms_per_round", "loop_ms_per_round", float),
+)
+
+metrics = [
+    {"name": "decode_tps_warm", "value": decode_tps, "stddev": decode_tps_stddev}
+]
 if config == "normal":
-    metrics = [
-        {"name": "decode_tps_warm", "value": decode_tps, "stddev": decode_tps_stddev},
-        {"name": "draft_tokens_total", "value": 0},
-    ]
+    # The no-drafter arm drafted nothing, which is a measured zero and not a
+    # missing value. It has no round loop, so it has no per-round figure at all.
+    metrics.append({"name": "draft_tokens_total", "value": 0})
+    decode_config = None
+    block_size = None
 else:
-    metrics = [
-        {"name": "decode_tps_warm", "value": decode_tps, "stddev": decode_tps_stddev},
-        {"name": "accept_rate", "value": accept_rate},
-        {"name": "draft_tokens_total", "value": draft_tokens_total},
-        {"name": "accept_tokens_total", "value": accept_tokens_total},
-        {"name": "draft_rounds_total", "value": draft_rounds_total},
-        {"name": "accepted_per_step", "value": accepted_per_step},
-    ]
+    missing = [key for _, key, _ in SPEC_METRICS if key not in spec]
+    if missing:
+        raise SystemExit(
+            "spec_bench: the round-loop reader reported no "
+            + ", ".join(missing)
+            + " — refusing to file a speculative row without them"
+        )
+    metrics.extend(
+        {"name": name, "value": cast(spec[key])} for name, key, cast in SPEC_METRICS
+    )
+    decode_config = spec["decode_config"]
+    block_size = spec["block_size"]
 
 obj = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
@@ -470,8 +518,10 @@ obj = {
         "body": prompt_body,
     },
     # The bests cell key partitions on this: a speculative arm is a different
-    # configuration, not a better measurement of the plain-decode one.
-    "decode_config": None if config == "normal" else f"{draft_kind}/block={draft_block_size}",
+    # configuration, not a better measurement of the plain-decode one. The
+    # round loop composed it and named it on its own `done` line; spelling it
+    # again here is how one configuration ends up in two cells.
+    "decode_config": decode_config,
     "ts_utc": ts_utc,
     "prompt_tokens": prompt_tokens,
     "max_tokens": max_tokens,
@@ -487,8 +537,10 @@ obj = {
     "notes": (
         f"config={config} draft_kind=none{tag_suffix} decode_window=engine_itl"
         if config == "normal"
+        # `block_size` is the block the engine ran, which a sidecar can cap
+        # below the one asked for.
         else f"config={config} draft_kind={draft_kind} "
-        f"block_size={draft_block_size}{tag_suffix} decode_window=engine_round_loop"
+        f"block_size={block_size}{tag_suffix} decode_window=engine_round_loop"
     ),
     "description": f"spec_bench {config} sha={git_sha}",
     "metrics": metrics,
@@ -635,11 +687,6 @@ NORMAL_BUF_PATH=$(emit_and_ingest \
     "normal" \
     "${NORMAL_MEDIAN_TPS}" \
     "${NORMAL_STDDEV_TPS}" \
-    "0.0" \
-    "0" \
-    "0" \
-    "0" \
-    "0.0" \
     "${NORMAL_PREVIEW}" \
     "${NORMAL_KV_QUANT}" \
     "${NORMAL_PROMPT_TOKENS}")
@@ -648,16 +695,16 @@ echo ""
 echo "==> Phase 1 complete. Median decode TPS: ${NORMAL_MEDIAN_TPS}"
 echo ""
 
-# ── Phase 2: MTP speculative decode ─────────────────────────────────────────
+# ── Phase 2: speculative decode ──────────────────────────────────────────────
 
-echo "==> Phase 2: MTP speculative decode (draft_kind=${DRAFT_KIND} block_size=${DRAFT_BLOCK_SIZE})"
+echo "==> Phase 2: speculative decode (draft_kind=${DRAFT_KIND} block_size=${DRAFT_BLOCK_SIZE})"
 echo ""
 
 preflight
 
 snapshot_logs
 
-echo "  [server] starting MTP server..." >&2
+echo "  [server] starting speculative server..." >&2
 RMLX_HOME="${RMLX_HOME}" \
 RMLX_LOG_CAP_MB=200 \
     "${BINARY}" serve \
@@ -676,19 +723,19 @@ echo "  [server] pid=${SERVER_PID}" >&2
 
 wait_for_server
 
-echo "  [mtp] warmup..." >&2
+echo "  [spec] warmup..." >&2
 for i in $(seq 1 ${WARMUP_RUNS}); do
     measured_request "${SCRATCH_DIR}/warmup_resp.txt" > /dev/null || true
-    echo "  [mtp] warmup ${i} done" >&2
+    echo "  [spec] warmup ${i} done" >&2
     sleep 5
 done
 
-echo "  [mtp] measured runs..." >&2
+echo "  [spec] measured runs..." >&2
 MTP_CLIENT_TPS_VALUES=()
 MTP_PREVIEW=""
 
 for i in $(seq 1 ${MEASURED_RUNS}); do
-    echo "  [mtp] measured run ${i}/${MEASURED_RUNS}..." >&2
+    echo "  [spec] measured run ${i}/${MEASURED_RUNS}..." >&2
 
     RUN_BLOCK="$(measured_request "${SCRATCH_DIR}/mtp_resp.txt")" || RUN_BLOCK=""
     N_TOKENS="$(field_of "${RUN_BLOCK}" tokens)"
@@ -697,17 +744,17 @@ for i in $(seq 1 ${MEASURED_RUNS}); do
     MTP_PROMPT_TOKENS="$(field_of "${RUN_BLOCK}" prompt_tokens)"
 
     if [[ -z "${CLIENT_TPS}" ]]; then
-        echo "ERROR: mtp run ${i} produced no measurable decode window" \
+        echo "ERROR: spec run ${i} produced no measurable decode window" \
              "(tokens=${N_TOKENS:-0}); response head:" >&2
         head -c 200 "${SCRATCH_DIR}/mtp_resp.txt" >&2 || true
         kill "${SERVER_PID}" 2>/dev/null || true
         exit 1
     fi
 
-    echo "  [mtp] run ${i}: tokens=${N_TOKENS} client_decode_tps=${CLIENT_TPS}" >&2
+    echo "  [spec] run ${i}: tokens=${N_TOKENS} client_decode_tps=${CLIENT_TPS}" >&2
 
     if [[ -z "${MTP_PROMPT_TOKENS}" ]]; then
-        echo "ERROR: mtp run ${i}: the response carried no usage.prompt_tokens," \
+        echo "ERROR: spec run ${i}: the response carried no usage.prompt_tokens," \
              "so the prompt length is not a measured fact" >&2
         kill "${SERVER_PID}" 2>/dev/null || true
         exit 1
@@ -718,7 +765,7 @@ for i in $(seq 1 ${MEASURED_RUNS}); do
     sleep 5
 done
 
-echo "  [server] killing MTP server pid=${SERVER_PID}" >&2
+echo "  [server] killing speculative server pid=${SERVER_PID}" >&2
 kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
 sleep 3
@@ -729,15 +776,15 @@ sleep 3
 sleep 2  # let log flush
 MTP_LOG="$(phase_log "${SERVER_PID}")" || MTP_LOG=""
 if [[ -z "${MTP_LOG}" ]]; then
-    echo "ERROR: no run log in ${LOG_DIR} is attributable to the MTP server" \
+    echo "ERROR: no run log in ${LOG_DIR} is attributable to the speculative server" \
          "(pid ${SERVER_PID})" >&2
     exit 1
 fi
 
-echo "  [mtp] parsing spec metrics from: ${MTP_LOG}" >&2
+echo "  [spec] parsing spec metrics from: ${MTP_LOG}" >&2
 
 MTP_KV_QUANT="$(log_kv_quant "${MTP_LOG}")" || MTP_KV_QUANT=""
-echo "  [mtp] resolved kv_quant=${MTP_KV_QUANT:-<unreported>}" >&2
+echo "  [spec] resolved kv_quant=${MTP_KV_QUANT:-<unreported>}" >&2
 
 # Round counts, draft/accept totals and the engine's own decode rate all come
 # off the round-loop `done` line, and scripts/lib/spec_round_log.py is the only
@@ -753,13 +800,16 @@ if ! MTP_SPEC_DATA=$(python3 "${REPO_ROOT}/scripts/lib/spec_round_log.py" \
     exit 1
 fi
 
-echo "  [mtp] spec metrics: $(echo "${MTP_SPEC_DATA}" | tr '\n' ' ')" >&2
+echo "  [spec] spec metrics: $(echo "${MTP_SPEC_DATA}" | tr '\n' ' ')" >&2
 
-MTP_ROUNDS_TOTAL="$(field_of "${MTP_SPEC_DATA}" rounds_total)"
+# Read back only for the comparison table below — the record itself takes the
+# whole block, so the two cannot describe different runs.
 MTP_DRAFT_TOTAL="$(field_of "${MTP_SPEC_DATA}" draft_tokens_total)"
-MTP_ACCEPT_TOTAL="$(field_of "${MTP_SPEC_DATA}" accept_tokens_total)"
 MTP_ACCEPT_RATE="$(field_of "${MTP_SPEC_DATA}" accept_rate)"
 MTP_ACCEPTED_PER_STEP="$(field_of "${MTP_SPEC_DATA}" accepted_per_step)"
+MTP_TOKENS_PER_ROUND="$(field_of "${MTP_SPEC_DATA}" tokens_per_round)"
+MTP_LOOP_MS_PER_ROUND="$(field_of "${MTP_SPEC_DATA}" loop_ms_per_round)"
+MTP_DECODE_CONFIG="$(field_of "${MTP_SPEC_DATA}" decode_config)"
 
 # The engine measures the speculative decode rate over the window from the first
 # emitted token to the last and reports it per request; the script's job is to
@@ -779,23 +829,19 @@ fi
 MTP_MEDIAN_TPS=$(median "${MTP_ENGINE_TPS_VALUES[@]}")
 MTP_STDDEV_TPS=$(stddev "${MTP_ENGINE_TPS_VALUES[@]}")
 MTP_CLIENT_MEDIAN_TPS=$(median "${MTP_CLIENT_TPS_VALUES[@]}")
-cross_check mtp "${MTP_MEDIAN_TPS}" "${MTP_CLIENT_MEDIAN_TPS}"
+cross_check "${DRAFT_KIND}" "${MTP_MEDIAN_TPS}" "${MTP_CLIENT_MEDIAN_TPS}"
 
-echo "  [mtp] median_tps=${MTP_MEDIAN_TPS} stddev=${MTP_STDDEV_TPS}" \
+echo "  [spec] median_tps=${MTP_MEDIAN_TPS} stddev=${MTP_STDDEV_TPS}" \
      "(client-observed median: ${MTP_CLIENT_MEDIAN_TPS})" >&2
 
 MTP_BUF_PATH=$(emit_and_ingest \
-    "mtp" \
+    "${DRAFT_KIND}" \
     "${MTP_MEDIAN_TPS}" \
     "${MTP_STDDEV_TPS}" \
-    "${MTP_ACCEPT_RATE}" \
-    "${MTP_DRAFT_TOTAL}" \
-    "${MTP_ACCEPT_TOTAL}" \
-    "${MTP_ROUNDS_TOTAL}" \
-    "${MTP_ACCEPTED_PER_STEP}" \
     "${MTP_PREVIEW}" \
     "${MTP_KV_QUANT}" \
-    "${MTP_PROMPT_TOKENS}")
+    "${MTP_PROMPT_TOKENS}" \
+    "${MTP_SPEC_DATA}")
 
 echo ""
 echo "==> Phase 2 complete. Median decode TPS: ${MTP_MEDIAN_TPS}"
@@ -833,34 +879,38 @@ MTP_SD_FMT=$(python3 -c "print(f'{float(\"${MTP_STDDEV_TPS}\"):.2f}')" 2>/dev/nu
 echo "============================================================"
 echo "  SPEC BENCH RESULTS — ${MODEL_NAME}"
 echo "============================================================"
-printf "%-10s  %-16s  %-13s  %-20s  %-22s  %s\n" \
-    "Config" "decode_tps_warm" "accept_rate" "accepted_per_step" "draft_tokens_total" "notes"
-printf "%-10s  %-16s  %-13s  %-20s  %-22s  %s\n" \
-    "------" "---------------" "-----------" "-----------------" "------------------" "-----"
-printf "%-10s  %-16.2f  %-13s  %-20s  %-22s  %s\n" \
+SPEC_TABLE_FMT="%-14s  %-16s  %-12s  %-13s  %-14s  %-14s  %s\n"
+# shellcheck disable=SC2059  # the format lives in a variable on purpose
+printf "${SPEC_TABLE_FMT}" \
+    "Config" "decode_tps_warm" "accept_rate" "tokens/round" "accepted/step" "loop ms/round" "notes"
+# shellcheck disable=SC2059
+printf "${SPEC_TABLE_FMT}" \
+    "------" "---------------" "-----------" "------------" "-------------" "-------------" "-----"
+# shellcheck disable=SC2059
+printf "${SPEC_TABLE_FMT}" \
     "normal" \
-    "${NORMAL_MEDIAN_TPS}" \
-    "N/A" \
-    "N/A" \
-    "0" \
+    "$(printf '%.2f' "${NORMAL_MEDIAN_TPS}")" \
+    "N/A" "N/A" "N/A" "N/A" \
     "baseline (±${NORMAL_SD_FMT})"
-printf "%-10s  %-16.2f  %-13.4f  %-20.4f  %-22s  %s\n" \
-    "mtp" \
-    "${MTP_MEDIAN_TPS}" \
-    "${MTP_ACCEPT_RATE}" \
-    "${MTP_ACCEPTED_PER_STEP}" \
-    "${MTP_DRAFT_TOTAL}" \
-    "${TPS_DELTA} vs normal (±${MTP_SD_FMT})"
+# shellcheck disable=SC2059
+printf "${SPEC_TABLE_FMT}" \
+    "${MTP_DECODE_CONFIG}" \
+    "$(printf '%.2f' "${MTP_MEDIAN_TPS}")" \
+    "$(printf '%.4f' "${MTP_ACCEPT_RATE}")" \
+    "$(printf '%.3f' "${MTP_TOKENS_PER_ROUND}")" \
+    "$(printf '%.3f' "${MTP_ACCEPTED_PER_STEP}")" \
+    "$(printf '%.2f' "${MTP_LOOP_MS_PER_ROUND}")" \
+    "${TPS_DELTA} vs normal (±${MTP_SD_FMT}), ${MTP_DRAFT_TOTAL} drafted"
 echo "============================================================"
 echo ""
 echo "Buffer files:"
 [[ -n "${NORMAL_BUF_PATH}" ]] && echo "  normal : ${NORMAL_BUF_PATH}" || echo "  normal : (dry-run or failed)"
-[[ -n "${MTP_BUF_PATH}" ]] && echo "  mtp    : ${MTP_BUF_PATH}" || echo "  mtp    : (dry-run or failed)"
+[[ -n "${MTP_BUF_PATH}" ]] && echo "  spec   : ${MTP_BUF_PATH}" || echo "  spec   : (dry-run or failed)"
 echo ""
 echo "Logs:"
 echo "  normal server : ${SCRATCH_DIR}/normal_stdout.txt"
-echo "  mtp server    : ${SCRATCH_DIR}/mtp_stdout.txt"
-[[ -n "${MTP_LOG}" ]] && echo "  mtp spec log  : ${MTP_LOG}"
+echo "  spec server   : ${SCRATCH_DIR}/mtp_stdout.txt"
+[[ -n "${MTP_LOG}" ]] && echo "  spec run log  : ${MTP_LOG}"
 echo ""
 echo "DB: ${DB_PATH}"
 echo "Done."

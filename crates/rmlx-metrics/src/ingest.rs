@@ -497,6 +497,20 @@ impl RunRecord {
                     ),
                 });
             }
+            // Same reasoning, other direction: a drafter that has always
+            // resized its block has no fixed-block arm, so the bare spelling
+            // names a configuration that never ran.
+            if let Some(corrected) = crate::cell::decode_config_with_inherent_depth(config) {
+                return Err(Error::InvalidIngestField {
+                    field: "decode_config".to_string(),
+                    message: format!(
+                        "'{config}' describes an adaptive drafter as though its block \
+                         were fixed; that configuration has never run. The engine \
+                         composes '{corrected}', and migration 008 rewrote the rows \
+                         that predate it (docs/METRICS_DB.md §3.2)"
+                    ),
+                });
+            }
         }
 
         // temperature range (strict)

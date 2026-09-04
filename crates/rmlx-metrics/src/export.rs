@@ -54,9 +54,16 @@ fn kv_quant_display(kv_quant: &str) -> &str {
 
 // ── Metric columns rendered in the per-model table (in column order). ────────
 
+/// One rendered metric column: the row it reads and the heading it sits under.
+///
+/// The heading is a field rather than a parallel array. Two index-coupled
+/// arrays render the header from one and the body from the other, so a reorder
+/// in either puts every value under the wrong heading and nothing says so.
 #[derive(Clone, Copy)]
 struct MetricCol {
     db_name: &'static str,
+    /// Column heading.
+    label: &'static str,
     /// Decimal places for formatting. 0 = integer.
     decimals: usize,
 }
@@ -64,32 +71,74 @@ struct MetricCol {
 const METRIC_COLUMNS: &[MetricCol] = &[
     MetricCol {
         db_name: "decode_tps_warm",
+        label: "Decode TPS warm",
         decimals: 2,
     },
     MetricCol {
         db_name: "prefill_tps",
+        label: "Prefill TPS",
         decimals: 0,
     },
     MetricCol {
         db_name: "ttft_cold_ms",
+        label: "TTFT cold (ms)",
         decimals: 0,
     },
     MetricCol {
         db_name: "ttft_warm_ms",
+        label: "TTFT warm (ms)",
         decimals: 0,
     },
     MetricCol {
         db_name: "peak_rss_mb",
+        label: "Peak RSS (MB)",
         decimals: 0,
     },
 ];
 
-const METRIC_HEADER_LABELS: &[&str] = &[
-    "Decode TPS warm",
-    "Prefill TPS",
-    "TTFT cold (ms)",
-    "TTFT warm (ms)",
-    "Peak RSS (MB)",
+// ── Speculative round-loop columns (in column order). ────────────────────────
+//
+// These belong to a section of their own rather than to the per-model table:
+// every one of them is `-` on a plain-decode row, and there are far more of
+// those. The metric set comes from `registry::SPEC_METRICS`, which is where a
+// new speculative metric is declared; a test pins that this renders all of it.
+
+const SPEC_METRIC_COLUMNS: &[MetricCol] = &[
+    MetricCol {
+        db_name: "decode_tps_warm",
+        label: "Decode TPS warm",
+        decimals: 2,
+    },
+    MetricCol {
+        db_name: "accept_rate",
+        label: "Accept rate",
+        decimals: 3,
+    },
+    MetricCol {
+        db_name: "tokens_per_round",
+        label: "Tokens/round",
+        decimals: 2,
+    },
+    MetricCol {
+        db_name: "accepted_per_step",
+        label: "Accepted/step",
+        decimals: 2,
+    },
+    MetricCol {
+        db_name: "draft_ms_per_round",
+        label: "Draft ms/round",
+        decimals: 2,
+    },
+    MetricCol {
+        db_name: "verify_ms_per_round",
+        label: "Verify ms/round",
+        decimals: 2,
+    },
+    MetricCol {
+        db_name: "loop_ms_per_round",
+        label: "Loop ms/round",
+        decimals: 2,
+    },
 ];
 
 // ── KV memory columns ────────────────────────────────────────────────────────
@@ -205,6 +254,8 @@ pub fn export_markdown(conn: &Connection, scope: Option<&ScopeFile>) -> Result<S
         out.push('\n');
     }
 
+    out.push_str(&render_speculative_table(&all));
+
     // ── Champion summary ─────────────────────────────────────────────────────
     out.push_str("---\n\n## Champion summary (auto-generated)\n\n");
     out.push_str("Per metric × model: which backend holds the record, with the rMLX gap.\n\n");
@@ -219,6 +270,95 @@ pub fn export_markdown(conn: &Connection, scope: Option<&ScopeFile>) -> Result<S
     out.push_str(&provenance_section(&exported_at, all.len(), total_cells));
 
     Ok(out)
+}
+
+/// One row of the speculative table: **the whole cell key**, in schema order.
+///
+/// Every column of `cell::CELL_COLUMNS` is here — namespace and model share the
+/// first element — because each metric in the row
+/// is resolved independently against `bests`. Drop one — `ctx_max`, say — and a
+/// row takes its higher-better token rate from a 4k run and its lower-better
+/// milliseconds from a 128k one, under a heading that says the three
+/// millisecond columns partition one round.
+type SpecRowKey = (String, String, String, String, String, i64, i64);
+
+/// Render the speculative section: one row per drafter arm, with the round-loop
+/// figures beside the throughput they explain.
+///
+/// Empty string when no row in the DB names a drafter — a heading over an empty
+/// table would read as "no drafter pays" rather than "nothing was measured".
+fn render_speculative_table(all: &[BestRow]) -> String {
+    let mut cells: BTreeMap<SpecRowKey, BTreeMap<String, &BestRow>> = BTreeMap::new();
+    for r in all {
+        let Some(config) = r.cell.decode_config.as_deref() else {
+            continue;
+        };
+        if !crate::cell::decode_config_names_a_drafter(config) {
+            continue;
+        }
+        cells
+            .entry((
+                format!("{}__{}", r.cell.model_namespace, r.cell.model),
+                config.to_owned(),
+                r.cell.backend.clone(),
+                r.cell.kv_quant.clone(),
+                r.cell.weight_quant.clone(),
+                r.cell.ctx_max,
+                r.cell.prompt_id,
+            ))
+            .or_default()
+            .entry(r.metric.clone())
+            .and_modify(|existing| {
+                if best_of(existing, r) {
+                    *existing = r;
+                }
+            })
+            .or_insert(r);
+    }
+    if cells.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("---\n\n## Speculative decoding (auto-generated)\n\n");
+    out.push_str(
+        "Tokens per verify round — accepted drafts plus the verifier's own token — is what a \
+         drafter is read with. It equals `1 + accept_rate x (block - 1)` only while every round \
+         drafts the configured block, which an adaptive drafter does not, so it is recorded \
+         rather than derived here. The three `ms/round` columns partition one round's wall \
+         clock; the last is the round loop's own overhead. One row is one cell, so the \
+         context and prompt every figure was measured at are columns of it.\n\n",
+    );
+    out.push_str("| Model | Decode | Backend | KV-quant | Weight | ctx_max | prompt ");
+    for col in SPEC_METRIC_COLUMNS {
+        // write!(String) is infallible — let _ discards the unit Ok.
+        let _ = write!(out, "| {} ", col.label);
+    }
+    out.push_str("| Updated |\n|---|---|---|---|---|---:|---:");
+    for _ in SPEC_METRIC_COLUMNS {
+        out.push_str("|---:");
+    }
+    out.push_str("|---|\n");
+
+    for ((model, config, backend, kv_quant, weight_quant, ctx_max, prompt_id), metric_map) in &cells
+    {
+        let mut row = format!(
+            "| `{model}` | {config} | {} | {} | {weight_quant} | {ctx_max} | {prompt_id} ",
+            backend_display(backend),
+            kv_quant_display(kv_quant)
+        );
+        for col in SPEC_METRIC_COLUMNS {
+            match metric_map.get(col.db_name) {
+                Some(r) => {
+                    let _ = write!(row, "| {} ", fmt_value(r.value, col.decimals));
+                }
+                None => row.push_str("| - "),
+            }
+        }
+        let _ = writeln!(row, "| {} |", updated_summary(metric_map));
+        out.push_str(&row);
+    }
+    out.push('\n');
+    out
 }
 
 /// Full bests dump as a compact JSON array (`Vec<BestRow>`).
@@ -371,13 +511,13 @@ fn render_model_table(
 
     let mut out = String::new();
     out.push_str("| Backend | KV-quant | Decode ");
-    for label in METRIC_HEADER_LABELS {
+    for col in METRIC_COLUMNS {
         // write!(String) is infallible — let _ discards the unit Ok.
-        let _ = write!(out, "| {label} ");
+        let _ = write!(out, "| {} ", col.label);
     }
     out.push_str("| KV GB | reduction vs bf16 | Updated |\n");
     out.push_str("|---|---|---");
-    for _ in METRIC_HEADER_LABELS {
+    for _ in METRIC_COLUMNS {
         out.push_str("|---:");
     }
     out.push_str("|---:|---:|---|\n");

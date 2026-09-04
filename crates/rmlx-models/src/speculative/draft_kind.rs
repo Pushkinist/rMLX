@@ -4,7 +4,8 @@ use std::str::FromStr;
 
 /// Speculative drafter architecture family.
 ///
-/// Determines which loader / acceptance algorithm /14/15 will use.
+/// Decides which drafter loader the serve layer builds and which round loop
+/// drives the request.
 /// Mirrors mlx-vlm `--draft-kind choices=[dflash,eagle3,mtp]`.
 ///
 /// `rmlx-models` carries the plain enum (no clap dep).
