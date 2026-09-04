@@ -47,6 +47,9 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
         if target_version == 7 {
             null_default_decode_config(conn)?;
         }
+        if target_version == 8 {
+            adaptive_depth_decode_config(conn)?;
+        }
 
         applied += 1;
     }
@@ -146,6 +149,46 @@ fn null_default_decode_config(conn: &Connection) -> Result<usize> {
             rows = n,
             %spelling,
             "migrate: decode_config spelled the engine defaults; moved to the default cell"
+        );
+        moved += n;
+    }
+    Ok(moved)
+}
+
+/// Migration 008 post-hook: a drafter that has always resized its block says so.
+///
+/// Writes no measurement: it rewrites how a row says the engine was configured,
+/// on rows whose spelling was never true of them — a bare `<kind>/block=<n>` for
+/// a drafter in [`crate::cell::ADAPTIVE_DRAFTERS`], which has no fixed-block arm
+/// to describe. The predicate is
+/// [`crate::cell::decode_config_with_inherent_depth`], reading that one list —
+/// not a SQL literal, which would be a second copy of it.
+///
+/// Returns how many rows were moved to the cell that describes their loop.
+fn adaptive_depth_decode_config(conn: &Connection) -> Result<usize> {
+    let spellings: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT decode_config FROM observations WHERE decode_config IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut moved = 0_usize;
+    for stale in spellings {
+        let Some(corrected) = crate::cell::decode_config_with_inherent_depth(&stale) else {
+            continue;
+        };
+        let n = conn.execute(
+            "UPDATE observations SET decode_config = ?1 WHERE decode_config = ?2",
+            rusqlite::params![corrected, stale],
+        )?;
+        tracing::info!(
+            rows = n,
+            %stale,
+            %corrected,
+            "migrate: decode_config described an adaptive drafter as fixed-block; \
+             moved to the cell that describes its loop"
         );
         moved += n;
     }

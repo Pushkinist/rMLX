@@ -118,6 +118,54 @@ pub enum NotesVerdict {
     Silent,
 }
 
+/// Drafters whose round loop chooses each round's block rather than taking the
+/// configured one, and the policy it chooses by.
+///
+/// One declaration. `rmlx_models::speculative`'s per-loop accessor reads it,
+/// [`decode_config_from_notes`] reads it when recovering a row from free-form
+/// notes, `RunRecord::validate` refuses a record that contradicts it, and
+/// migration 008 rewrites the rows that predate it. A second copy in the engine
+/// would be the drift this column exists to prevent.
+///
+/// DFlash is here because it has always been adaptive: its production call site
+/// passes `prefer_requested = false`, and the only caller passing `true` is a
+/// unit test. There has never been a fixed-block DFlash arm to describe.
+pub const ADAPTIVE_DRAFTERS: &[(&str, &str)] = &[("dflash", "accept_rate")];
+
+/// The depth policy `draft_kind`'s round loop always runs under, if it always
+/// runs under one.
+pub fn inherent_depth_policy(draft_kind: &str) -> Option<&'static str> {
+    ADAPTIVE_DRAFTERS
+        .iter()
+        .find(|(kind, _)| *kind == draft_kind)
+        .map(|(_, policy)| *policy)
+}
+
+/// The corrected spelling of `value`, when it describes an adaptive drafter as
+/// though its block were fixed.
+///
+/// `None` when nothing needs correcting — which includes a malformed value,
+/// since this answers "is it stale", not "is it legal".
+pub fn decode_config_with_inherent_depth(value: &str) -> Option<String> {
+    if !decode_config_is_well_formed(value) {
+        return None;
+    }
+    for term in value.split(',') {
+        let (key, block) = term.split_once('=')?;
+        let Some(kind) = key.strip_suffix("/block") else {
+            continue;
+        };
+        let policy = inherent_depth_policy(kind)?;
+        let depth_key = format!("{kind}/depth=");
+        if value.split(',').any(|t| t.starts_with(&depth_key)) {
+            return None;
+        }
+        let block: usize = block.parse().ok()?;
+        return Some(decode_config(kind, block, Some(policy)));
+    }
+    None
+}
+
 /// The canonical `decode_config` for a speculative arm.
 ///
 /// `block_size` is the block the run was *configured* with. `depth_policy`
@@ -125,16 +173,24 @@ pub enum NotesVerdict {
 /// take that one — `None` for a loop that drafts a fixed block every round.
 ///
 /// The policy is part of cell identity because the block is not observable
-/// from the configured ceiling once a loop moves off it: DFlash already halves
-/// and grows its block from the recent accept rate, so an adaptive arm at
-/// ceiling 16 and a fixed arm at block 16 are different configurations that
-/// would otherwise rank against each other under one label. Absence of the
-/// term is the fixed block, which is what keeps every row recorded before the
-/// term existed in the cell it has always been in.
+/// from the configured ceiling once a loop moves off it: DFlash halves and
+/// grows its block from the recent accept rate, so an adaptive arm at ceiling
+/// 16 and a fixed arm at block 16 are different configurations that would
+/// otherwise rank against each other under one label.
 ///
-/// This is the only place the format is written. The engine composes the
-/// string here and logs it on its `done` line, and `scripts/spec_bench.sh`
-/// records what the engine said rather than spelling it a second time.
+/// Absence of the term is the fixed block **for a drafter that has one**. For a
+/// drafter in [`ADAPTIVE_DRAFTERS`] there is no such arm, so a bare
+/// `dflash/block=16` describes a configuration that never ran: migration 008
+/// rewrites the rows carrying it and `RunRecord::validate` refuses a new one.
+/// Rows for every other drafter keep the cell they have always been in.
+///
+/// This is the only place the **drafter** terms are written: the engine composes
+/// the string here and logs it on its `done` line, and `scripts/spec_bench.sh`
+/// records what the engine said rather than spelling it a second time. It is not
+/// the only composer of the *column* — `rmlx_models::kv_cache`'s boundary terms,
+/// `scripts/ingest/{perf_ab,codec_inertness}_ingest.py` and
+/// `scripts/prefill_chunk_sweep.sh` each build their own, sharing the values
+/// through `check-kv-boundary-default-parity` but not the format.
 ///
 /// `block_size` is a `usize` so the value the engine holds reaches the term
 /// unchanged. A narrower parameter would put a conversion at every call site,
@@ -280,10 +336,12 @@ pub fn decode_config_from_notes(notes: &str) -> NotesVerdict {
                 // back out. A row whose notes do not compose to a legal
                 // configuration does not say what it was.
                 Ok(block) => {
-                    // Notes record the configured block and nothing about
-                    // how the loop chose each round's, so a backfilled row can
-                    // only claim the fixed spelling.
-                    let config = decode_config(kind, block, None);
+                    // Notes record the configured block and nothing about how
+                    // the loop chose each round's — but for a drafter that has
+                    // always been adaptive the policy is not a free variable,
+                    // and spelling the row as fixed would file it under a
+                    // configuration that never ran.
+                    let config = decode_config(kind, block, inherent_depth_policy(kind));
                     if decode_config_is_well_formed(&config) {
                         NotesVerdict::Speculative(config)
                     } else {

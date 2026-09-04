@@ -968,10 +968,13 @@ fn the_table_renders_every_declared_speculative_metric() {
 #[test]
 fn an_adaptive_arm_is_a_row_of_its_own() {
     let mut conn = test_conn();
+    // `dflash/block=16` is refused at ingest now — DFlash has no fixed-block
+    // arm — so the pair that must stay apart is a fixed drafter against an
+    // adaptive one at the same ceiling.
     seed_speculative(
         &mut conn,
         "Qwen3.6-35B-A3B-8bit",
-        Some("dflash/block=16"),
+        Some("mtp/block=16"),
         &[("tokens_per_round", 9.5)],
     );
     seed_speculative(

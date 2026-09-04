@@ -751,15 +751,36 @@ rather than derived at read time.
 
 The four sidecar loops argmax a bonus token out of the prefill forward and emit
 it before the first round; the two-model loops emit nothing outside their loop.
-That token is a product of the prefill, not of a verify round, so it is reported
-as `seed_emitted` and subtracted. Counting it would read `+1/rounds` high on
-four of six loops — about 3% at a 128-token bench — and the one figure the
-record exists to make comparable would not be.
+That token is a product of the prefill, not of a verify round, so it does not
+reach the figure — counting it reads high by `+1/rounds`, measured at +1.35% on
+the Gemma4 assistant and +0.98% on the MTP sidecar.
+
+Each loop counts what its rounds emit at its own emit site and reports that as
+`emitted_in_rounds`; `seed_emitted` is what it had emitted before the first
+round. With `emitted` those are three counts taken at three points, and the
+engine and the reader both refuse a request where they do not add up. That is
+what catches a seed captured on the wrong side of the pre-round emission — a
+drift worth 0.5% in `tokens_per_round`, into an append-only table. An earlier
+revision inferred it from an emission-budget inequality instead, which only
+bites when a request's rounds exactly saturate `total_accept + rounds`: measured
+on the four reachable loops at a fixed `--max-tokens`, that held for one.
 
 The three `*_ms_per_round` figures partition one round's wall clock:
 `round_ms` is the whole round loop, `draft_ms` and `verifier_ms` are disjoint
 sub-spans of it, and `loop_ms_per_round` is the residual — rollback, snapshot
-and restore, acceptance walks, sampling. `draft_ms` and `verifier_ms` are the
+and restore, acceptance walks, sampling.
+
+That partition can be checked against the engine's independently measured
+decode rate: `tokens_per_round / (round_ms / rounds) * 1000` should be
+`decode_tps`. Measured per request on four loops it closes to within **0.5% on
+every one and 0.06% on three of four** — the residual is mechanical, not a
+defect. The decode window ends at the last emitted token while `round_ms` ends
+after the last round's post-emit tail; on the Qwen3.8-27B MTP sidecar that tail
+is 28.0 ms of a 6720 ms round loop (−0.42%), and at most 0.01 ms elsewhere.
+
+`prefill_ms` is the same kind of figure and is looser still: on Eagle3 three
+identical requests read 77.7, 799.8 and 809.7 ms. That is what a call-site wall
+clock means under lazy evaluation. It is log-only and never reaches the DB. `draft_ms` and `verifier_ms` are the
 wall-clock spans of their call sites and **not** the cost of the work those
 calls issue: this engine evaluates lazily, so work issued in one span can be
 paid for in another. They are reported as what they are. Inserting a blocking

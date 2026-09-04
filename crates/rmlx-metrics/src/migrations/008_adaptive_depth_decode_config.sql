@@ -1,0 +1,33 @@
+-- Migration 008: a drafter that has always resized its block says so.
+--
+-- §3.2 makes `decode_config` cell identity, and absence of a `<kind>/depth=`
+-- term means the loop drafted the configured block every round. DFlash never
+-- did: its production call site has always passed `prefer_requested = false`,
+-- and the only caller passing `true` is a unit test. So `dflash/block=16`
+-- describes a configuration that has never run, and the eight rows carrying it
+-- sit in a cell that no future DFlash row can join — this branch records the
+-- same runs as `dflash/block=16,dflash/depth=accept_rate`, and the two spellings
+-- are two cells where neither ranks against the other and both look like
+-- champions of whatever they contain. That is the defect migration 007 was
+-- written for, in a different column position.
+--
+-- **This writes no measurement.** It rewrites a column that says how the engine
+-- was configured, from a spelling that was never true of these rows to the one
+-- that is, leaving every value, timestamp and identity untouched. The
+-- append-only rule is about measurements; 006 filled this column and 007
+-- rewrote it, on the same grounds.
+--
+-- The rule is `rmlx_metrics::cell::decode_config_with_inherent_depth`, run from
+-- `migrate::schema_runner::adaptive_depth_decode_config` — one predicate over
+-- `cell::ADAPTIVE_DRAFTERS`, shared with `RunRecord::validate`, which refuses a
+-- record carrying the stale spelling so no new row can arrive in this state. It
+-- is not expressed in SQL because the drafter list is the engine's own and a
+-- SQL literal would be a second copy of it.
+--
+-- What this does NOT touch: `eagle/block=5` beside `eagle3/block=5`. That split
+-- is a drafter *name* an old bench script wrote, not a policy term the loop
+-- always had, and nothing recorded says the two populations ran the same
+-- drafter. It is named in docs/METRICS_DB.md under the known-bad rows instead.
+--
+-- This file itself is a no-op statement; the work is the post-hook.
+SELECT 1;

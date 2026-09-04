@@ -205,6 +205,75 @@ fn migrating_moves_a_default_spelling_into_the_default_cell() {
     assert_eq!(remaining, 0, "no row still spells the defaults");
 }
 
+/// Migration 008: the rows that describe an adaptive drafter as fixed-block join
+/// the cell that describes their loop, and nothing else moves.
+///
+/// The eight `dflash/block=16` rows in the workspace DB name a configuration
+/// that has never run, and this branch records the same runs with the depth
+/// term — two cells for one configuration, neither ranking against the other.
+#[test]
+fn migrating_moves_an_adaptive_drafter_out_of_the_fixed_block_cell() {
+    let mut conn = conn_at_version(7);
+    // The historical spelling, and the one the engine composes today.
+    insert_with_decode_config(&conn, 1, 600_000_000.0, "dflash/block=16");
+    insert_with_decode_config(
+        &conn,
+        2,
+        493_133_824.0,
+        "dflash/block=16,dflash/depth=accept_rate",
+    );
+    // A fixed-block drafter at the same ceiling is a different configuration
+    // and keeps its own cell.
+    insert_with_decode_config(&conn, 3, 457_703_424.0, "mtp/block=16");
+
+    crate::bests_view::ensure(&conn).unwrap();
+    let before: Vec<(i64, Option<String>)> = champions(&conn);
+    assert_eq!(
+        before.len(),
+        3,
+        "three spellings, three cells, three champions: {before:?}"
+    );
+
+    crate::migrate::run_pending(&mut conn).unwrap();
+
+    let after: Vec<(i64, Option<String>)> = champions(&conn);
+    assert_eq!(
+        after,
+        vec![
+            (
+                2,
+                Some("dflash/block=16,dflash/depth=accept_rate".to_string())
+            ),
+            (3, Some("mtp/block=16".to_string())),
+        ],
+        "the historical DFlash rows joined the cell that describes their loop \
+         and ranked against it; the fixed-block drafter kept its own: {after:?}"
+    );
+
+    let stale: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE decode_config = 'dflash/block=16'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0, "no row still describes DFlash as fixed-block");
+
+    // No measurement moved: both DFlash rows are still there, with their values.
+    let values: Vec<f64> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT value FROM observations WHERE decode_config LIKE 'dflash%' ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(values, vec![600_000_000.0, 493_133_824.0]);
+}
+
 /// `bests` champions as `(id, decode_config)`, lowest `kv_cache_bytes` per cell.
 fn champions(conn: &Connection) -> Vec<(i64, Option<String>)> {
     let mut stmt = conn

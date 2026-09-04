@@ -213,12 +213,21 @@ a spelling of that and is refused.
 | `kv_boundary/head=<h>,kv_boundary/tail=<t>` | `--kv-boundary-layers` off its default | `rmlx baseline --record`, `rmlx eval ppl`, `scripts/ingest/{codec_inertness,perf_ab}_ingest.py` |
 
 The `<drafter>/depth` term is absent when the loop drafts the configured block
-every round, which is what keeps every speculative row recorded before the term
-existed in the cell it has always been in. It is present when the loop resizes:
-DFlash halves and grows its block from the recent accept rate, so its arm is
+every round. It is present when the loop resizes: DFlash halves and grows its
+block from the recent accept rate, so its arm is
 `dflash/block=16,dflash/depth=accept_rate` and is a different cell from a fixed
 arm at block 16 — which it must be, because the two do not emit the same number
-of tokens per round. The round loop composes both terms and puts the result on
+of tokens per round.
+
+**DFlash has no fixed-block arm at all**, and never had: its production call
+site has always passed `prefer_requested = false`, and the only caller passing
+`true` is a unit test. So the bare `dflash/block=<n>` names a configuration that
+has never run. `rmlx_metrics::cell::ADAPTIVE_DRAFTERS` is the one list of
+drafters in that position — the engine's per-loop accessor reads it,
+`decode_config_from_notes` reads it when recovering a row from notes,
+`RunRecord::validate` refuses a record that contradicts it, and **migration
+008** rewrote the eight rows (ids 122743–122750) that predated it. Rows for
+every other drafter keep the cell they have always been in. The round loop composes both terms and puts the result on
 its `done` line, and `scripts/spec_bench.sh` records what it finds there; a
 bench script that spelled the string itself would file a run under a
 configuration the engine did not use, which is the defect that motivated
@@ -244,6 +253,15 @@ term. Putting it here would have fenced both off from every `mlx_lm` row, which
 can never carry a term this engine invented. The test is the one stated above:
 a setting the engine moved off its default belongs here; a different
 measurement is a different metric.
+
+**One producer of the drafter terms, not of the column.**
+`rmlx_metrics::cell::decode_config` is the only site that composes a
+`<drafter>/block` or `<drafter>/depth` term, and `scripts/spec_bench.sh` records
+the string the engine logged rather than spelling it again. The column has other
+composers — `rmlx_models::kv_cache`'s boundary terms,
+`scripts/ingest/perf_ab_ingest.py`, `scripts/ingest/codec_inertness_ingest.py`
+and `scripts/prefill_chunk_sweep.sh` — whose *values* are held together by
+`check-kv-boundary-default-parity` but whose *format* is not.
 
 `rmlx_metrics::cell::decode_config_is_well_formed` is the one implementation,
 enforced at ingest (`RunRecord::validate`) so a private spelling is rejected
@@ -542,7 +560,7 @@ Source of truth for `observations.metric`, `.unit`, `.direction`. Add to this ta
 | `accept_tokens_total`            | `count` | `higher_better` | Speculative decoding: cumulative verifier-accepted token count over the request. rmlx-only. |
 | `draft_rounds_total`             | `count` | `higher_better` | Speculative decoding: number of verifier rounds (one round = drafter proposes block, verifier accepts prefix). rmlx-only. |
 | `accepted_per_step`              | `ratio` | `higher_better` | Speculative decoding: `accept_tokens_total / draft_rounds_total` (mean accepted tokens per verifier step). rmlx-only. |
-| `tokens_per_round`               | `ratio` | `higher_better` | Speculative decoding: tokens the **rounds** produced per round — accepted drafts plus the verifier's own token. The sidecar loops emit one bonus token out of the prefill forward before the first round and it is excluded, or their rows would read `+1/rounds` above a two-model row that did the same work. `1 + accept_rate x (block - 1)` only while every round drafts the configured block, which an adaptive drafter does not, so it is recorded and not derived. rmlx-only. |
+| `tokens_per_round`               | `ratio` | `higher_better` | Speculative decoding: tokens the **rounds** produced per round, counted at the loops' own emit sites. The sidecar loops emit one bonus token out of the prefill forward before the first round and it is excluded, or their rows would read `+1/rounds` above a two-model row that did the same work (measured +1.35% and +0.98%). `1 + accept_rate x (block - 1)` only while every round drafts the configured block, which an adaptive drafter does not, so it is recorded and not derived. rmlx-only. |
 | `draft_ms_per_round`             | `ms`    | `lower_better`  | Speculative decoding: wall clock inside the drafter call, per round. rmlx-only. |
 | `verify_ms_per_round`            | `ms`    | `lower_better`  | Speculative decoding: wall clock inside the verify forward, per round. rmlx-only. |
 | `loop_ms_per_round`              | `ms`    | `lower_better`  | Speculative decoding: the round loop's own overhead per round — rollback, snapshot and restore, acceptance walks, sampling. A residual: the three `*_ms_per_round` partition one round's wall clock. rmlx-only. |
@@ -785,19 +803,17 @@ because nothing enforces it.
   from that row's own fields into a column that was NULL for want of existing;
   no measurement is written, corrected or moved.
 
-- **`dflash/block=<n>` with no `depth` term** — DFlash has always resized its
-  block from the recent accept rate, so `<n>` was the ceiling and never the
-  block a round drafted. Those rows sit in the fixed-block cell and cannot be
-  reclassified: nothing recorded says what the loop actually did, and
-  `1 + accept_rate x (block - 1)` over them reads far above any block the run
-  used. Rows written since the round loop composed its own `decode_config`
-  carry `dflash/block=<n>,dflash/depth=accept_rate` and a measured
-  `tokens_per_round`.
+- **`eagle/block=5` beside `eagle3/block=5`** — two cells, one drafter, from a
+  bench script that wrote the drafter's name as `eagle` where the engine writes
+  `eagle3` (`DraftKind::as_str`). 16 rows carry the old name (ids 122751–122766)
+  and rank against nothing. Unlike the DFlash split that migration 008 closed,
+  this is a **name** and not a policy the loop always had: nothing recorded says
+  the two populations ran the same drafter on the same code, so reclassifying
+  them would be an assertion rather than a correction. Re-running the cell is
+  what fills it.
 
   ```sql
-  SELECT * FROM observations
-  WHERE decode_config LIKE 'dflash/block=%'
-    AND decode_config NOT LIKE '%/depth=%';
+  SELECT * FROM observations WHERE decode_config LIKE 'eagle/%';
   ```
 
 Anything anchoring on a recorded rate — a roofline, a champion table, a

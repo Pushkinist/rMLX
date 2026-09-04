@@ -44,10 +44,6 @@ use crate::speculative::DraftKind;
 /// not one of the sidecar [`DraftKind`]s.
 const TWO_MODEL_KIND: &str = "two_model";
 
-/// `decode_config` depth policy for a loop that resizes its block from the
-/// accept rate of the recent rounds.
-const DEPTH_POLICY_ACCEPT_RATE: &str = "accept_rate";
-
 /// Which round loop produced a request's tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpecLoop {
@@ -129,15 +125,14 @@ impl SpecLoop {
 
     /// How this loop picks each round's block size, or `None` when it drafts
     /// the configured block every round.
-    pub(crate) const fn depth_policy(self) -> Option<&'static str> {
-        match self {
-            Self::DFlash => Some(DEPTH_POLICY_ACCEPT_RATE),
-            Self::MtpAssistant
-            | Self::MtpSidecar
-            | Self::Eagle3
-            | Self::TwoModelGreedy
-            | Self::TwoModelStochastic => None,
-        }
+    ///
+    /// Read from [`rmlx_metrics::cell::ADAPTIVE_DRAFTERS`] rather than declared
+    /// here: the same fact decides what a row's cell is, what a row recovered
+    /// from notes is classified as, and which historical rows migration 008
+    /// rewrites. A second copy in the engine is the drift `decode_config`
+    /// exists to prevent.
+    pub(crate) fn depth_policy(self) -> Option<&'static str> {
+        rmlx_metrics::cell::inherent_depth_policy(self.draft_kind())
     }
 }
 
