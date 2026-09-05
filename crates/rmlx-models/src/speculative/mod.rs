@@ -49,7 +49,7 @@ use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-pub(crate) use round_stats::{ms, phases_charged, RoundStats, SpecLoop, PHASE_TARGET};
+pub(crate) use round_stats::{phases_charged, RoundPhases, RoundStats, SpecLoop};
 
 /// Resolve the context bounds a speculative pair runs under.
 ///

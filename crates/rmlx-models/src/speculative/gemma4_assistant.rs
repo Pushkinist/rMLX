@@ -965,28 +965,21 @@ pub fn mtp_assistant_generate_greedy(
         }
         let round_rollback_ns = t0.elapsed().as_nanos();
 
-        let round_ns = round_t0.elapsed().as_nanos();
-        tracing::debug!(
-            target: super::PHASE_TARGET,
-            round = rounds,
+        super::RoundPhases {
+            round_ns: round_t0.elapsed().as_nanos(),
+            draft_ns: round_draft_ns,
+            verify_ns: round_verify_ns,
+            walk_ns: round_walk_ns,
+            rollback_ns: round_rollback_ns,
+            // Full attention: the rollback is a K/V tail slice, never a replay.
+            replayed: false,
+            charged: charge_phases,
+        }
+        .log(
+            super::SpecLoop::MtpAssistant,
+            rounds,
             accept,
-            num_draft = draft_tokens.len(),
-            emitted_total = emitted.len(),
-            pre_round_offset,
-            v_target,
-            replayed = false,
-            charged = charge_phases,
-            round_ms = super::ms(round_ns),
-            draft_ms = super::ms(round_draft_ns),
-            verify_ms = super::ms(round_verify_ns),
-            walk_ms = super::ms(round_walk_ns),
-            rollback_ms = super::ms(round_rollback_ns),
-            other_ms = super::ms(round_ns)
-                - super::ms(round_draft_ns)
-                - super::ms(round_verify_ns)
-                - super::ms(round_walk_ns)
-                - super::ms(round_rollback_ns),
-            "mtp assistant round"
+            draft_tokens.len(),
         );
     }
 

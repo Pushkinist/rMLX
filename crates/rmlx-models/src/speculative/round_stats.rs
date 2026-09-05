@@ -186,6 +186,95 @@ pub(crate) fn ms(ns: u128) -> f64 {
     (ns as f64) / 1.0e6
 }
 
+/// One round's wall clock, split by the phase that spent it.
+///
+/// The four phases are disjoint sub-spans of the round, so the round's own
+/// clock less their sum is what no phase claimed: emission, tokenizer decode,
+/// slicing and host bookkeeping. Read `charged` before reading any of it —
+/// uncharged, a phase is timed but not forced, and lazy work drifts between
+/// them (see [`phases_charged`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoundPhases {
+    /// The round's own wall clock.
+    pub(crate) round_ns: u128,
+    /// Time inside the drafter call.
+    pub(crate) draft_ns: u128,
+    /// Time inside the verify forward and its argmax read-back.
+    pub(crate) verify_ns: u128,
+    /// Time inside the acceptance walk.
+    pub(crate) walk_ns: u128,
+    /// Time inside the rollback: cache truncation and, on a recurrent
+    /// verifier, the replay.
+    pub(crate) rollback_ns: u128,
+    /// Whether the round took the recurrent replay arm of
+    /// [`super::rollback_round_caches`].
+    pub(crate) replayed: bool,
+    /// Whether the phases were charged for the work they issued.
+    pub(crate) charged: bool,
+}
+
+impl RoundPhases {
+    /// Round time no phase claimed, and `None` when the phases claim more than
+    /// the round has.
+    ///
+    /// `u128` throughout: the phases are sub-spans, so an overrun is a timer
+    /// that escaped the round rather than a small number, and subtracting five
+    /// `f64` milliseconds would report it as a near-zero negative that reads
+    /// like rounding.
+    fn unclaimed_ns(&self) -> Option<u128> {
+        let claimed = self
+            .draft_ns
+            .saturating_add(self.verify_ns)
+            .saturating_add(self.walk_ns)
+            .saturating_add(self.rollback_ns);
+        self.round_ns.checked_sub(claimed)
+    }
+
+    /// Emit this round's split, and say so when it does not partition the
+    /// round.
+    ///
+    /// One emitter for every loop that keeps a split: a field added at one call
+    /// site and not the other would put two incomparable record shapes under
+    /// one target. The overrun is an `error!` for the same reason
+    /// [`RoundStats::span_violation`] is — a phase timer that starts outside
+    /// the round it is attributed to is a defect in the instrument, and the
+    /// only reader who would otherwise notice is one already reading raw
+    /// JSON-Lines and already looking for it.
+    pub(crate) fn log(&self, loop_kind: SpecLoop, round: usize, accept: usize, num_draft: usize) {
+        let Some(unclaimed_ns) = self.unclaimed_ns() else {
+            tracing::error!(
+                target: PHASE_TARGET,
+                ?loop_kind,
+                round,
+                round_ms = ms(self.round_ns),
+                draft_ms = ms(self.draft_ns),
+                verify_ms = ms(self.verify_ns),
+                walk_ms = ms(self.walk_ns),
+                rollback_ms = ms(self.rollback_ns),
+                "speculative round phases claim more time than the round has: a phase \
+                 timer starts outside the round it is attributed to"
+            );
+            return;
+        };
+        tracing::debug!(
+            target: PHASE_TARGET,
+            ?loop_kind,
+            round,
+            accept,
+            num_draft,
+            replayed = self.replayed,
+            charged = self.charged,
+            round_ms = ms(self.round_ns),
+            draft_ms = ms(self.draft_ns),
+            verify_ms = ms(self.verify_ns),
+            walk_ms = ms(self.walk_ns),
+            rollback_ms = ms(self.rollback_ns),
+            other_ms = ms(unclaimed_ns),
+            "speculative round"
+        );
+    }
+}
+
 /// One speculative request's counters, and the per-round figures they imply.
 ///
 /// Built once, after the round loop, by the loop that ran it. The loops keep

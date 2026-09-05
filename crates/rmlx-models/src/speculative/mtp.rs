@@ -869,30 +869,20 @@ pub fn mtp_generate_greedy(
         b = *new_tokens.last().unwrap_or(&b);
         draft_pos += n_committed as i32;
 
-        let round_ns = round_t0.elapsed().as_nanos();
-        tracing::debug!(
-            target: super::PHASE_TARGET,
-            round = rounds,
+        super::RoundPhases {
+            round_ns: round_t0.elapsed().as_nanos(),
+            draft_ns: round_draft_ns,
+            verify_ns: round_verify_ns,
+            walk_ns: round_walk_ns,
+            rollback_ns: round_rollback_ns,
+            replayed: v_target < v_offset_before,
+            charged: charge_phases,
+        }
+        .log(
+            super::SpecLoop::MtpSidecar,
+            rounds,
             accept,
-            num_draft = draft_tokens.len(),
-            n_committed,
-            emitted_total = emitted.len(),
-            v_offset_before,
-            v_target,
-            draft_pos,
-            replayed = v_target < v_offset_before,
-            charged = charge_phases,
-            round_ms = super::ms(round_ns),
-            draft_ms = super::ms(round_draft_ns),
-            verify_ms = super::ms(round_verify_ns),
-            walk_ms = super::ms(round_walk_ns),
-            rollback_ms = super::ms(round_rollback_ns),
-            other_ms = super::ms(round_ns)
-                - super::ms(round_draft_ns)
-                - super::ms(round_verify_ns)
-                - super::ms(round_walk_ns)
-                - super::ms(round_rollback_ns),
-            "mtp round"
+            draft_tokens.len(),
         );
     }
 

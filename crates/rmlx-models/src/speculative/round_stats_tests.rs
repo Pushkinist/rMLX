@@ -487,3 +487,52 @@ fn a_subscriber_that_declines_the_phase_target_leaves_the_phases_uncharged() {
          the phase target must not make the engine drain its pipeline per round"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The per-round phase split
+// ---------------------------------------------------------------------------
+
+fn phases(round_ns: u128, draft_ns: u128, verify_ns: u128) -> super::RoundPhases {
+    super::RoundPhases {
+        round_ns,
+        draft_ns,
+        verify_ns,
+        walk_ns: 1_000_000,
+        rollback_ns: 2_000_000,
+        replayed: true,
+        charged: true,
+    }
+}
+
+#[test]
+fn the_unclaimed_round_time_is_what_no_phase_spent() {
+    let p = phases(50_000_000, 4_000_000, 40_000_000);
+    assert_eq!(p.unclaimed_ns(), Some(3_000_000));
+}
+
+#[test]
+fn phases_that_claim_more_than_the_round_are_not_reported_as_a_small_residual() {
+    // Five f64 milliseconds subtracted from each other would make this read as
+    // a near-zero negative, which is indistinguishable from rounding. The
+    // phases are sub-spans of the round, so this is a timer that escaped it.
+    let p = phases(40_000_000, 4_000_000, 40_000_000);
+    assert_eq!(
+        p.unclaimed_ns(),
+        None,
+        "an overrun must be a distinct answer, not a residual near zero"
+    );
+}
+
+#[test]
+fn a_round_with_one_phase_and_nothing_else_claims_all_of_it() {
+    let p = super::RoundPhases {
+        round_ns: 10_000_000,
+        draft_ns: 10_000_000,
+        verify_ns: 0,
+        walk_ns: 0,
+        rollback_ns: 0,
+        replayed: false,
+        charged: false,
+    };
+    assert_eq!(p.unclaimed_ns(), Some(0));
+}

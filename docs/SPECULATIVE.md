@@ -222,17 +222,20 @@ numbers:
   second weight read a partial-accept round pays is billed to the *next* round's
   `verifier_ms`.
 
-Per-round attribution comes from the `mtp round` / `mtp assistant round` event,
-target `rmlx::spec::phase`, one per round at `debug`:
+Per-round attribution comes from the `speculative round` event, target
+`rmlx::spec::phase`, one per round at `debug`, emitted by one shared
+`RoundPhases::log` so the two loops cannot drift into two record shapes:
 
 ```
-round draft_ms verify_ms walk_ms rollback_ms other_ms round_ms
-accept num_draft replayed charged
+loop_kind round accept num_draft replayed charged
+round_ms draft_ms verify_ms walk_ms rollback_ms other_ms
 ```
 
-`other_ms` is a signed residual — the round's own wall clock less the four
-phases — so a timer that escapes its phase reads negative rather than reading
-zero. `replayed` says whether that round took the GDN replay arm of
+`other_ms` is what no phase claimed: emission, tokenizer decode, slicing and
+host bookkeeping. The four phases are disjoint sub-spans of the round, so
+claiming more than the round has means a timer started outside it — that is an
+`error!` naming the phases rather than an `other_ms` near zero that reads like
+rounding. `replayed` says whether that round took the GDN replay arm of
 `rollback_round_caches`.
 
 `charged` is the field that says how to read the rest. At `debug` the phases are
