@@ -433,6 +433,19 @@ impl AskRecorder {
 }
 
 impl tracing::Subscriber for AskRecorder {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        // Installing a dispatcher rebuilds interest for every callsite already
+        // registered in the process, and the default implementation answers
+        // that by calling `enabled` on each — which would bury the one question
+        // this fixture exists to see under every callsite the rest of the test
+        // binary has touched. `sometimes` keeps `enabled` consulted per event,
+        // which is the only route `tracing::enabled!` takes anyway.
+        tracing::subscriber::Interest::sometimes()
+    }
+
     fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
         self.asked
             .lock()
