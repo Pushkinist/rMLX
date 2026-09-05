@@ -175,11 +175,12 @@ const MAX_CTX: i32 = 8192;
 /// | assistant pair, SWA ring keeping its rejected block tail | 0.4219 to 0.9258 |
 /// | recurrent pair, acceptance walk without the final norm | 0.0000 to 0.5000 |
 ///
-/// The value is the geometric midpoint of the worst correct cell (0.0820) and
-/// the lowest broken cell the *set* has to catch — 1.46x above the first. It
-/// clears every correct cell and refuses ten of the twelve broken ones; the two
-/// it does not are covered by running every prompt rather than one, since each
-/// broken engine is refused on at least four of its six.
+/// The measurement leaves a band, and the value sits inside it: above the worst
+/// correct cell (0.0820, 1.46x) and under the lowest broken cell above it
+/// (0.1538, 1.28x). It clears every correct cell and refuses ten of the twelve
+/// broken ones; the two it does not read 0.0000 and 0.0977 and are covered by
+/// running every prompt rather than one, since each broken engine is refused on
+/// at least four of its six.
 const MAX_DIVERGENCE_CONFIDENCE: f64 = 0.12;
 
 /// The worst tail agreement a **correct** pair reached over the prompts the gate
@@ -1109,25 +1110,30 @@ fn a_late_onset_divergence_is_judged_where_it_begins() {
 ///
 /// Correct: the worst reading a shipped pair produced, a first divergence at the
 /// 8.2nd percentile of the reference arm's own margins. Broken: the lowest
-/// reading a broken engine produced that the gate still has to refuse, the 16.8th.
+/// reading a broken engine produced above the ceiling, the 15.4th — the cell the
+/// recorded ten-of-twelve recall stands or falls on.
 #[test]
 fn the_gate_admits_the_worst_correct_regime_and_refuses_the_lowest_broken_one() {
     let plain: Vec<u32> = (0..N_TOKENS as u32).map(|t| t % 97).collect();
     let mut spec = plain.clone();
     spec[64] = 60_000;
 
-    let margins_with_percentile = |pct: usize| -> Vec<f32> {
+    // The reading is the count of margins under the one at the divergence over
+    // the arm's length, so the count is what the regime is reconstructed from —
+    // a percentage of it lands on whichever reading integer division reaches,
+    // which is how a ceiling under the worst correct cell used to pass here.
+    let margins_reading = |below: usize| -> Vec<f32> {
         let mut m: Vec<f32> = (0..N_TOKENS)
-            .map(|i| if i < N_TOKENS * pct / 1000 { 0.01 } else { 5.0 })
+            .map(|i| if i < below { 0.01 } else { 5.0 })
             .collect();
         m[64] = 0.02;
         m
     };
 
-    let correct = margins_with_percentile(82);
+    let correct = margins_reading(21);
     let (_, worst_correct) = divergence_confidence(&spec, &plain, &correct).expect("a divergence");
     assert!(
-        (worst_correct - 0.082).abs() < 0.005,
+        (worst_correct - 0.0820).abs() < 0.0005,
         "the reconstructed correct regime reads {worst_correct:.4}, not the measured 0.0820"
     );
     assert!(
@@ -1135,11 +1141,13 @@ fn the_gate_admits_the_worst_correct_regime_and_refuses_the_lowest_broken_one() 
         "the worst correct regime must pass"
     );
 
-    let broken = margins_with_percentile(168);
+    // 0.1538 is 2/13 — the broken cell's reference arm was 13 tokens long, and a
+    // 256-position array gets within one of its own quantum of it.
+    let broken = margins_reading(39);
     let (_, lowest_broken) = divergence_confidence(&spec, &plain, &broken).expect("a divergence");
     assert!(
-        (lowest_broken - 0.168).abs() < 0.005,
-        "the reconstructed broken regime reads {lowest_broken:.4}, not the measured 0.1680"
+        (lowest_broken - 0.1538).abs() < 0.002,
+        "the reconstructed broken regime reads {lowest_broken:.4}, not the measured 0.1538"
     );
     let failure = judge(&spec, &plain, &broken)
         .refusal()

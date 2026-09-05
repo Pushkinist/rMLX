@@ -74,9 +74,10 @@ against two deliberately broken ones:
 | assistant pair, SWA ring keeping its rejected block tail | 0.4219 to 0.9258 |
 | recurrent pair, acceptance walk without the final norm | 0.0000 to 0.5000 |
 
-`MAX_DIVERGENCE_CONFIDENCE` is 0.12 — the geometric midpoint of the worst
-correct cell and the lowest broken cell the set has to catch, 1.46× above the
-first. It clears every correct cell and refuses ten of the twelve broken ones.
+`MAX_DIVERGENCE_CONFIDENCE` is 0.12, inside the band the measurement leaves:
+above the worst correct cell (0.0820, 1.46×) and under the lowest broken cell
+above it (0.1538, 1.28×). It clears every correct cell and refuses ten of the
+twelve broken ones.
 The two it does not are covered by running **every** prompt rather than one:
 each broken engine is refused on at least four of its six, so a gate pinned to
 one prompt would be a coin toss and this one is not.
