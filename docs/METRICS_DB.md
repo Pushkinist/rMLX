@@ -738,36 +738,55 @@ because nothing enforces it.
     AND prompt_id IN (SELECT id FROM prompts WHERE name LIKE 'wikitext-2_ctx2048%');
   ```
 
-- **Every `ppl_wikitext2` / `ppl_wikitext2_cached` row taken before the
-  sliding walk's warm-up was corrected** — the non-BOS scorer skipped
-  `ctx_window - stride` leading slots per window where the slot that scores
-  the first unseen corpus position is `ctx_window - stride - 1`, so exactly
-  one corpus position per window boundary was never scored. At the default
-  `--ctx-window 4096 --stride 2048` that is one position in 2048 (0.05% of
-  the denominator) and the resulting shift in `ppl` is far under any gate it
-  has been used for; at `stride == 1` it was total, every window after the
-  first scoring nothing. The Gemma4 scorer was always correct — it prepends
-  BOS, which shifts each target one slot, and it subtracted the one. Rows
-  before and after the correction are the same metric measured over denominators
-  differing by `(windows - 1)` positions; compare them, but do not read a
-  sub-0.1% delta between two eras as a model difference.
+- **35 `ppl_*` rows on `Ternary-Bonsai-8B-mlx-2bit`, scored with a warm-up one
+  slot too late** — the non-BOS scorer skipped `ctx_window - stride` leading
+  slots where the slot that scores the first unseen corpus position is
+  `ctx_window - stride - 1`, so exactly one corpus position per window boundary
+  was never scored. `ppl_scored_tokens` is the metric that moved most: it *is*
+  the denominator that changed, by `windows - 1`, and `ppl_mean_nll` and
+  `ppl_windows` come off the same runs — which is why the predicate below covers
+  the whole `ppl_` family and not just the headline metric.
+
+  **Three conditions, all necessary**, and the selector is narrow because a
+  predicate that flags good rows is one readers learn to ignore:
+
+  - **Not Gemma4.** That scorer prepends BOS, which shifts each target one slot,
+    and it already subtracted the one. It was always correct. 46 rows.
+  - **`stride < ctx_window`.** At `stride == ctx_window` the old expression gives
+    `ctx_window - stride = 0` and the new gives `0.saturating_sub(1) = 0`:
+    identical, and the scored sets are byte-identical. The whole `2026-09-03`
+    Bonsai batch is in that case. 16 rows.
+  - **A pre-fix binary.** `git_sha` is the discriminator, not the date. This
+    change was made on a branch, so a run from a pre-fix binary *after* the fix
+    landed files an affected row that no date predicate catches; the four shas
+    below are what the DB holds today, and a fifth would have to be added here
+    rather than inferred. No affected row has a NULL `git_sha`.
+
+  At the default `--ctx-window 4096 --stride 2048` the effect is one position in
+  2048 — 0.05% of the denominator — and the resulting shift in `ppl` is far under
+  any gate it has been used for. At `stride == 1` it was total: every window
+  after the first scored nothing.
 
   ```sql
   SELECT * FROM observations
-  WHERE metric LIKE 'ppl_wikitext2%'
-    AND ts_utc < '2026-09-05';
+  WHERE metric LIKE 'ppl_%'
+    AND model NOT LIKE 'gemma%'
+    AND notes NOT LIKE '%ctx_window=' || ctx_max || ' stride=' || ctx_max || '%'
+    AND git_sha IN ('2bcf206', '2bcf206-dirty', '6eeb4ae-dirty', 'a71d88b-dirty');
   ```
 
-- **`dflash/*` rows measured against a DFlash 2 checkpoint** — the drafter
-  loader implements the earlier DFlash architecture and reads none of the
-  candidate-selector or per-layer dynamic-convolution tensors a DFlash 2
-  snapshot ships. It builds the drafter it can build out of the rest and serves,
-  so the rows are honest measurements of *that* drafter and are not measurements
+- **`dflash/*` rows on `Qwen3.8-27B-4bit`, measured against a DFlash 2
+  checkpoint** — the drafter loader implements the earlier DFlash architecture
+  and reads none of the candidate-selector or per-layer dynamic-convolution
+  tensors a DFlash 2 snapshot ships. It used to build the drafter out of the
+  rest and serve, so the rows are honest measurements of *that* drafter and not
   of the published one. `decode_config` says `dflash/block=N` either way and
-  cannot tell them apart; the load now names the tensors it did not read, so a
-  run log can. On `Qwen3.8-27B-4bit` those are the `2026-09-04` block-16 rows and
-  the `2026-09-05` block-8 ones. Do not compare them against a row taken once the
-  full drafter is implemented.
+  cannot tell them apart, which is why the loader now refuses such a snapshot
+  outright: no further row of this kind can be written. The `2026-09-04`
+  block-16 rows and the `2026-09-05` block-8 ones are the ones already here. Do
+  not compare them against a row taken once the full drafter is implemented.
+  `z-lab/Qwen3.6-35B-A3B-DFlash` reads every tensor it ships and is unaffected
+  by the refusal.
 
   ```sql
   SELECT * FROM observations

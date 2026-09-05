@@ -63,15 +63,22 @@ transitive across loops — each one has its own rollback and its own acceptance
 walk, which is what the gate reads.
 
 That boundary is not hypothetical. Served at temperature 0 on the code prompt,
-`Qwen3.8-27B-4bit` drafted by `z-lab/Qwen3.8-27B-DFlash2` at block 8 diverges
+`Qwen3.8-27B-4bit` drafted by `z-lab/Qwen3.8-27B-DFlash2` at block 8 diverged
 from the same verifier's no-drafter answer at the fourth token — "We need to
-respond to user:" against "We need answer user's request:" — and stays diverged;
-the MTP sidecar on the same verifier, same prompt and same 160-token budget is
-byte-identical to it. A greedy speculative loop can only emit the verifier's own
-argmax, so a drafter proposing badly costs throughput and cannot change the
-answer. A changed answer is the loop, not the drafter, and this one is uncovered.
-That the drafter is also being loaded as an earlier architecture than the
-checkpoint (see `docs/SPECULATIVE.md` § Qwen3.8-27B-4bit) does not explain it.
+respond to user:" against "We need answer user's request:" — and stayed
+diverged; the MTP sidecar on the same verifier, same prompt and same 160-token
+budget is byte-identical to it. A greedy speculative loop can only emit the
+verifier's own argmax, so a drafter proposing badly costs throughput and cannot
+change the answer. A changed answer is the loop, not the drafter, and this one is
+uncovered. That the drafter was also being loaded as an earlier architecture than
+the checkpoint (see `docs/SPECULATIVE.md` § Qwen3.8-27B-4bit) does not explain
+it.
+
+That pair no longer loads: the DFlash loader refuses a snapshot it only half
+reads, for a metrics-attribution reason unrelated to this. Reproducing the
+divergence on it means lifting that refusal. `z-lab/Qwen3.6-35B-A3B-DFlash` reads
+every tensor it ships, loads, and drives the same round loop — it is the pair a
+DFlash case here would be built on.
 
 ## The oracle: where a correct pair diverges
 

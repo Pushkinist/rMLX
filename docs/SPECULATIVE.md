@@ -1032,22 +1032,27 @@ faster: `loop_ms_per_round` is 14.6 ms of a 44.4 ms round at block 2 and 25.1 ms
 of a 63.4 ms round at block 3, a third to two fifths of the round in a residual
 that produces no tokens.
 
-**DFlash on this verifier is not the DFlash 2 algorithm.** `z-lab/Qwen3.8-27B-DFlash2`
-loads, drafts and accepts — 0.530 accept, 2.59 tokens/round, 0.91× on code at
-block 8 — but 23 of its tensors are families this loader has no code for (a
-candidate selector and per-layer two-tap dynamic convolutions), and it names
-them at load. What that row measures is this engine's DFlash drafter built out of
-the subset of a DFlash 2 checkpoint it recognises. It is not a reading of the
-published drafter and must not be quoted as one.
+**DFlash 2 on this verifier is refused at load, and the numbers below predate
+the refusal.** 23 of `z-lab/Qwen3.8-27B-DFlash2`'s tensors are weight families
+this loader has no code for — a candidate selector and per-layer two-tap dynamic
+convolutions. It used to build the earlier DFlash architecture out of the
+remainder and serve: 0.530 accept, 2.59 tokens/round, 0.91× on code at block 8.
+Those figures are this engine's DFlash drafter wearing the checkpoint's name, and
+`decode_config` records `dflash/block=8` either way, so a row of them cannot be
+told from a row of the real drafter afterwards. The loader now refuses, naming
+the count and the tensors. `z-lab/Qwen3.6-35B-A3B-DFlash` reads every tensor it
+ships and is unaffected.
 
-**And that arm does not reproduce its verifier's answer.** At temperature 0 on
-the code prompt it diverges from the no-drafter arm at the fourth token and stays
-diverged, where the MTP sidecar on the same verifier and prompt is byte-identical
-over 160 tokens. Greedy acceptance emits only the verifier's argmax, so no
-drafter — however badly it proposes, and whatever tensors it was built without —
-can change the answer; a changed answer is the round loop. The DFlash loop is one
-of the three the answer-equivalence gate does not cover
-(`docs/SPEC_ANSWER_EQUIVALENCE.md` § What it runs).
+**That arm also did not reproduce its verifier's answer.** At temperature 0 on
+the code prompt it diverged from the no-drafter arm at the fourth token and
+stayed diverged, where the MTP sidecar on the same verifier and prompt is
+byte-identical over 160 tokens. Greedy acceptance emits only the verifier's
+argmax, so no drafter — however badly it proposes, and whatever tensors it was
+built without — can change the answer; a changed answer is the round loop, and
+the DFlash loop is one of the three the answer-equivalence gate does not cover
+(`docs/SPEC_ANSWER_EQUIVALENCE.md` § What it runs). Reproducing it on this pair
+now means lifting the refusal; the Qwen3.6 DFlash drafter still loads and drives
+the same loop.
 
 ### Qwen3.6-35B-A3B-8bit — three drafters (GDN hybrid, MoE)
 

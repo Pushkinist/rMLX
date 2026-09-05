@@ -266,19 +266,14 @@ impl Qwen3_5MoeText {
         let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
         let ids_arr = Array::from_i32_slice(&ids_i32, &[seq_i32])?;
 
-        let shared_mask: Option<Array> =
-            if crate::layers::pick_attn_mask_mode(0, seq_i32) == "array" {
-                Some(crate::layers::build_chunked_prefill_mask(
-                    0, seq_i32, device,
-                )?)
-            } else {
-                None
-            };
-
         let h = self.embed_tokens.forward(&ids_arr, device)?;
         let mut h = h.reshape(&[1, seq_i32, self.cfg.hidden_size as i32], device)?;
+        // No prebuilt mask. `pick_attn_mask_mode` answers "causal" for every
+        // `seq` once the offset is 0, so there is no array mask to share;
+        // `forward_arr` builds one because its offset is a runtime value, and
+        // here it is the literal 0.
         for layer in &self.layers {
-            h = layer.forward(&h, 0, None, None, shared_mask.as_ref(), device)?;
+            h = layer.forward(&h, 0, None, None, None, device)?;
         }
         let h = self.final_norm.forward(&h, device)?;
 

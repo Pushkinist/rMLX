@@ -175,18 +175,19 @@ fn gemma4_error_message_advertises_support() {
         arch: "LagunaForCausalLM".to_owned(),
     };
     let msg = err.to_string();
-    assert!(
-        msg.contains("Qwen3"),
-        "error message must mention Qwen3: {msg}"
-    );
-    assert!(
-        msg.contains("Gemma4"),
-        "error message must mention Gemma4: {msg}"
-    );
-    assert!(
-        msg.contains("Qwen3_5Moe"),
-        "error message must mention Qwen3_5Moe: {msg}"
-    );
+    // The supported list spells checkpoint architectures, not enum variants,
+    // so an operator can grep it for what their `config.json` declares.
+    for declared in [
+        "Qwen3ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    ] {
+        assert!(
+            msg.contains(declared),
+            "error message must name the checkpoint architecture {declared}: {msg}"
+        );
+    }
     assert!(
         msg.contains("LagunaForCausalLM"),
         "error message must include the unsupported arch name: {msg}"
@@ -201,7 +202,7 @@ fn gemma4_error_message_advertises_support() {
             usize,
             usize,
             Device,
-            Option<KvQuant>,
+            ScoredThrough,
         ) -> std::result::Result<PplReport, PplError>;
 }
 
@@ -245,8 +246,10 @@ fn gemma4_dispatch_reaches_compute_fn() {
     // Confirm the supported-arches list in the error message still includes
     // every arch that has a scorer (regression guard for the error text).
     assert!(
-        msg.contains("Qwen3") && msg.contains("Gemma4") && msg.contains("Qwen3_5Moe"),
-        "supported-arches list must mention Qwen3, Gemma4 and Qwen3_5Moe: {msg}"
+        msg.contains("Qwen3ForCausalLM")
+            && msg.contains("Gemma4ForConditionalGeneration")
+            && msg.contains("Qwen3_5MoeForConditionalGeneration"),
+        "supported-arches list must name every arch with a scorer: {msg}"
     );
 }
 
@@ -278,6 +281,7 @@ fn a_window_with_no_scored_position_dispatches_nothing() {
         Device::Cpu,
         &mut sum_nll,
         &mut count,
+        &mut Vec::new(),
         |_ids, _caches| unreachable!("no scored position, so no forward may run"),
     );
 
@@ -366,29 +370,135 @@ fn sliding_walk_scores_each_position_once() {
 /// silently not the GatedDeltaNet ones, so the command refuses. The message
 /// has to name the arch and the way out, or the caller reads it as "no scorer
 /// at all" and stops.
+/// The codec refusal is a decision, not a message: both directions are driven
+/// through the producer the scorer actually calls.
+///
+/// Mutations this fails on: inverting the `CACHED_SCORER_ARCHES` membership
+/// test (the Qwen3.5 cases stop refusing); dropping the `kv_quant.is_some()`
+/// condition (the no-codec cases start refusing); removing a Qwen3.5 class
+/// string from nothing and instead *adding* one to the allowlist (the refusal
+/// cases stop refusing). Deleting the call in `compute_ppl` does not compile:
+/// the scorer arms take `ScoredThrough`, which only this producer builds.
 #[test]
-fn qwen3_5_refuses_a_codec_and_names_the_cacheless_route() {
-    let err = PplError::CachedScorerUnsupported {
-        arch: "Qwen3_5ForConditionalGeneration".to_owned(),
-    };
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Qwen3_5ForConditionalGeneration"),
-        "refusal must name the arch: {msg}"
-    );
-    assert!(
-        msg.contains("cacheless"),
-        "refusal must name the route that works: {msg}"
-    );
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+fn a_codec_is_refused_on_the_arches_whose_scorer_keeps_no_cache() {
+    let codec = Some(KvQuant::K8V8);
 
-    // Compile-time existence gate, as for the Gemma4 scorer above.
-    let _ = compute_ppl_qwen3_5_moe
-        as fn(
-            &Qwen3_5MoeText,
-            &[u32],
-            usize,
-            usize,
-            Device,
-            Option<KvQuant>,
-        ) -> std::result::Result<PplReport, PplError>;
+    // Both spellings a Qwen3.5 checkpoint can resolve to, dense and MoE.
+    for arch in [
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    ] {
+        let err = cached_scorer_codec(arch, codec).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PplError::CachedScorerUnsupported { .. }),
+            "{arch} with a codec must be refused as CachedScorerUnsupported, got {msg}"
+        );
+        assert!(msg.contains(arch), "refusal must name the arch: {msg}");
+        assert!(
+            msg.contains("GatedDeltaNet"),
+            "refusal must name the layers that justify it, or it reads as \
+             'not implemented yet': {msg}"
+        );
+        assert!(
+            msg.contains("cacheless"),
+            "refusal must name the route that works: {msg}"
+        );
+
+        // Without a codec there is nothing to refuse.
+        let passed = cached_scorer_codec(arch, None).unwrap().codec();
+        assert!(passed.is_none(), "{arch} cacheless must pass through");
+    }
+
+    // The two arches that do have a cached scorer keep their codec.
+    for arch in CACHED_SCORER_ARCHES {
+        let passed = cached_scorer_codec(arch, codec).unwrap().codec();
+        assert_eq!(passed, codec, "{arch} must be handed its codec unchanged");
+    }
+}
+
+/// The scoring kernel scores the *next* token, and only from `warmup` on.
+///
+/// No model: a hand-built `[1, seq, vocab]` logit tensor on `Device::Cpu` with
+/// one row per position. Mutations this fails on: `win[t + 1]` -> `win[t]`,
+/// which scores each position against its own logits and pulls perplexity
+/// toward 1.0; `warmup..` -> `0..`, which counts the overlap twice.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "row slices are bounded by the vocab and seq this test constructs"
+)]
+fn the_scoring_kernel_scores_the_next_token_from_the_warmup_on() {
+    const VOCAB: usize = 4;
+    let win: [u32; 4] = [0, 1, 2, 3];
+    let seq = win.len();
+
+    // Asymmetric rows: no two vocabulary entries share a logit, so scoring the
+    // wrong target or the wrong row lands on a different NLL.
+    let mut flat: Vec<f32> = Vec::with_capacity(seq * VOCAB);
+    for t in 0..seq {
+        for v in 0..VOCAB {
+            flat.push((t * VOCAB + v) as f32 * 0.5 - 1.0);
+        }
+    }
+    let logits = Array::from_f32_slice(&flat, &[1, seq as i32, VOCAB as i32]).unwrap();
+
+    for warmup in 0..seq {
+        let mut host: Vec<f32> = Vec::new();
+        let mut sum_nll = 0.0_f64;
+        let mut count = 0_usize;
+        score_window_cacheless(
+            &logits,
+            &win,
+            warmup,
+            VOCAB,
+            &mut host,
+            &mut sum_nll,
+            &mut count,
+        )
+        .unwrap();
+
+        // Which positions contributed: exactly [warmup .. seq - 1).
+        let expected_count = (seq - 1).saturating_sub(warmup);
+        assert_eq!(
+            count, expected_count,
+            "warmup {warmup}: scored positions must be [warmup .. seq-1)"
+        );
+
+        // What each contributed: the NLL of win[t + 1] under row t.
+        let mut expected_nll = 0.0_f64;
+        for t in warmup..(seq - 1) {
+            let row = &flat[t * VOCAB..(t + 1) * VOCAB];
+            expected_nll += f64::from(neg_log_softmax_at(row, win[t + 1] as usize));
+        }
+        assert!(
+            (sum_nll - expected_nll).abs() < 1e-6,
+            "warmup {warmup}: sum_nll {sum_nll} != {expected_nll} — the scored \
+             target or the scored row is wrong"
+        );
+    }
+
+    // The shift is what separates this from scoring each position against its
+    // own logits, so state that the two differ on this fixture at all.
+    let mut self_scored = 0.0_f64;
+    for t in 0..(seq - 1) {
+        let row = &flat[t * VOCAB..(t + 1) * VOCAB];
+        self_scored += f64::from(neg_log_softmax_at(row, win[t] as usize));
+    }
+    let mut host: Vec<f32> = Vec::new();
+    let mut sum_nll = 0.0_f64;
+    let mut count = 0_usize;
+    score_window_cacheless(&logits, &win, 0, VOCAB, &mut host, &mut sum_nll, &mut count).unwrap();
+    assert!(
+        (sum_nll - self_scored).abs() > 1e-3,
+        "the fixture cannot tell win[t+1] from win[t] and so cannot gate the shift"
+    );
 }
