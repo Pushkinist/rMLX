@@ -15,7 +15,7 @@ use std::str::FromStr;
 /// adapter lives in `rmlx-cli::main` (see `DraftKindArg`).
 #[allow(
     clippy::exhaustive_enums,
-    reason = "closed dispatch enum — adding a kind requires a Drafter variant in SpeculativeGenerator, a spelling in as_str()/from_str(), and a rule in Declared::from_snapshot()"
+    reason = "closed dispatch enum — the compiler forces a new kind through as_str(), index() and every dispatch match; ALL then puts it in front of the tests that reach the string surfaces (from_str, the clap value) the compiler cannot"
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DraftKind {
@@ -31,6 +31,26 @@ pub enum DraftKind {
 }
 
 impl DraftKind {
+    /// Every kind, once — the population the string-surface tests sweep.
+    ///
+    /// Paired with [`Self::index`], whose match is exhaustive: a new kind does
+    /// not compile until it has an index, and `every_kind_is_in_all_once` does
+    /// not pass until it is in this list at that index. The parser's `other`
+    /// arm and the CLI value enum are separate string tables the compiler
+    /// cannot tie to this enum; sweeping them from here is what makes a kind
+    /// that is unreachable from the flag fail a test rather than go quiet.
+    pub const ALL: &'static [Self] = &[Self::Mtp, Self::DFlash, Self::Eagle3, Self::TwoModel];
+
+    /// This kind's position in [`Self::ALL`].
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Mtp => 0,
+            Self::DFlash => 1,
+            Self::Eagle3 => 2,
+            Self::TwoModel => 3,
+        }
+    }
+
     /// Canonical name used in log fields, `decode_config` and the CLI value.
     pub fn as_str(self) -> &'static str {
         match self {

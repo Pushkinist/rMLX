@@ -94,12 +94,7 @@ fn draft_block_size_below_the_floor_is_refused_at_parse_time() {
 /// engine spells it in its logs and metrics.
 #[test]
 fn every_draft_kind_is_a_flag_value() {
-    for kind in [
-        rmlx_models::DraftKind::Mtp,
-        rmlx_models::DraftKind::DFlash,
-        rmlx_models::DraftKind::Eagle3,
-        rmlx_models::DraftKind::TwoModel,
-    ] {
+    for &kind in rmlx_models::DraftKind::ALL {
         let r = Cli::try_parse_from([
             "rmlx",
             "serve",

@@ -99,7 +99,7 @@ fn mtp_reject_reason(arch: &str, model_type: &str) -> String {
 
 /// The round block when `--draft-block-size` is absent: the verifier's own
 /// token plus four drafted.
-pub const DEFAULT_DRAFT_BLOCK_SIZE: usize = 5;
+pub(crate) const DEFAULT_DRAFT_BLOCK_SIZE: usize = 5;
 
 /// The smallest round block with room for a draft token.
 pub const MIN_DRAFT_BLOCK_SIZE: usize = 2;
@@ -153,15 +153,31 @@ fn decide_draft_kind(
     arch: &str,
     model_type: &str,
 ) -> rmlx_core::Result<rmlx_models::DraftKind> {
+    use rmlx_models::{Declared, DraftKind};
     match (flag, declared) {
-        (Some(f), rmlx_models::Declared::Sidecar(d)) if f != d => Err(Error::SpeculativePairing {
+        (Some(f), Declared::Sidecar(d)) if f != d => Err(Error::SpeculativePairing {
             reason: format!(
                 "--draft-kind {f} contradicts the draft snapshot, which declares itself \
-                     a {d} drafter (architectures[0] {arch:?}, model_type {model_type:?}); \
-                     drop the flag or point --draft-model at a {f} snapshot"
+                 a {d} drafter (architectures[0] {arch:?}, model_type {model_type:?}); \
+                 drop the flag or point --draft-model at a {f} snapshot"
             ),
         }),
-        (Some(f), _) => Ok(f),
+        // A registered full model carries none of a sidecar head's tensors.
+        // The inference yields to the flag, but not into a loader that would
+        // materialise the whole verifier first and then die on a tensor name.
+        // `mtp` is not listed: its own family router refuses a full model
+        // before any weight is read.
+        (Some(f @ (DraftKind::Eagle3 | DraftKind::DFlash)), Declared::FullModel) => {
+            Err(Error::SpeculativePairing {
+                reason: format!(
+                    "--draft-kind {f} points at a registered full model (architectures[0] \
+                     {arch:?}, model_type {model_type:?}), which carries no {f} head; point \
+                     --draft-model at a {f} sidecar, or drop the flag to run it as a \
+                     two_model draft"
+                ),
+            })
+        }
+        (Some(f), Declared::Sidecar(_) | Declared::FullModel | Declared::Unknown) => Ok(f),
         (None, declared) => declared.kind().ok_or_else(|| Error::SpeculativePairing {
             reason: format!(
                 "the draft snapshot's config.json identifies no drafter (architectures[0] \
@@ -209,7 +225,7 @@ impl Drafter {
 
 /// Generator backed by a verifier and a drafter of one [`rmlx_models::DraftKind`].
 ///
-/// Each round the drafter proposes up to `k` tokens; the verifier scores them
+/// Each round the drafter proposes a block of tokens; the verifier scores them
 /// in one cached forward and emits the accepted prefix plus its own next
 /// token. Which drafter runs is decided at construction from the draft
 /// snapshot's own `config.json`, or by an explicit `--draft-kind`.
@@ -481,11 +497,6 @@ impl SpeculativeGenerator {
     /// The model id this generator serves (verifier basename).
     pub fn model_id(&self) -> &str {
         &self.model_id
-    }
-
-    /// Which drafter this generator runs.
-    pub fn draft_kind(&self) -> rmlx_models::DraftKind {
-        self.drafter.kind()
     }
 }
 

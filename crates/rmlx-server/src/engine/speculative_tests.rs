@@ -110,6 +110,37 @@ fn the_flag_outranks_the_registry_inference() {
     );
 }
 
+/// A sidecar flag over a registered full model is refused before a weight is
+/// read: the snapshot carries no such head, and the loader it would reach
+/// materialises the whole verifier first and then dies on a tensor name that
+/// names neither side. The refusal names both, and the two ways out.
+#[test]
+fn a_sidecar_flag_over_a_full_model_is_refused() {
+    let declared = Declared::from_snapshot("Gemma4ForConditionalGeneration", "gemma4");
+    for kind in [DraftKind::Eagle3, DraftKind::DFlash] {
+        let msg = decide_draft_kind(
+            Some(kind),
+            declared,
+            "Gemma4ForConditionalGeneration",
+            "gemma4",
+        )
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+        assert!(
+            msg.contains(&format!("--draft-kind {kind}")),
+            "names the flag: {msg}"
+        );
+        assert!(
+            msg.contains("Gemma4ForConditionalGeneration") && msg.contains("full model"),
+            "names the snapshot and what it is: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{kind} sidecar")) && msg.contains("two_model"),
+            "names both ways out: {msg}"
+        );
+    }
+}
+
 // ── round block ──────────────────────────────────────────────────────────────
 
 /// One flag value is one round block, whichever drafter runs: the sidecars

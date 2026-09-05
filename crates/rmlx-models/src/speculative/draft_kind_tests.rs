@@ -84,16 +84,26 @@ fn an_unknown_declaration_is_no_kind() {
     }
 }
 
+/// `ALL` holds every kind at its own index, so the sweeps below cover a kind
+/// the moment it compiles.
+#[test]
+fn every_kind_is_in_all_once() {
+    // The count is a match, so a new variant does not compile until it is
+    // counted here, and then `ALL` must grow to match.
+    let count = match DraftKind::Mtp {
+        DraftKind::Mtp | DraftKind::DFlash | DraftKind::Eagle3 | DraftKind::TwoModel => 4,
+    };
+    assert_eq!(DraftKind::ALL.len(), count, "a kind is missing from ALL");
+    for (i, kind) in DraftKind::ALL.iter().enumerate() {
+        assert_eq!(kind.index(), i, "{kind} is listed at the wrong position");
+    }
+}
+
 /// The CLI spelling and the log spelling are one string per kind, and the
 /// parser accepts exactly those.
 #[test]
 fn every_kind_round_trips_through_its_name() {
-    for kind in [
-        DraftKind::Mtp,
-        DraftKind::DFlash,
-        DraftKind::Eagle3,
-        DraftKind::TwoModel,
-    ] {
+    for &kind in DraftKind::ALL {
         assert_eq!(kind.as_str().parse::<DraftKind>(), Ok(kind));
         assert_eq!(kind.to_string(), kind.as_str());
     }
