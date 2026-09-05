@@ -1135,6 +1135,65 @@ No-drafter baseline 83.6 (code) / 83.2 (prose) / 79.1 (4k) decode TPS.
 | 6 | 4k | 0.289 | 0.79× |
 | 6 | prose | 0.238 | 0.88× |
 
+### Where a round's time actually goes
+
+Charged per-round split (`RUST_LOG=info,rmlx::spec::phase=trace`, see § "Where a
+round's time goes"), code prompt, 200 tokens, `release-perf`, M5 Max. Milliseconds
+per round. The plain step is that checkpoint's own `decode_profile
+forward_per_step_ms` from a no-drafter run of the same prompt.
+
+Qwen3.8-27B-4bit + MTP-4bit — GDN hybrid, plain step **30.77 ms** (32.5 t/s):
+
+| Phase | block 2 | block 3 |
+|---|---:|---:|
+| verify forward | 34.01 | 41.28 |
+| GDN replay, averaged over all rounds | 6.42 | 12.66 |
+| — on the rounds that take it | 30.87 (21 % of rounds) | 31.99 (40 %) |
+| drafting | 2.15 | 4.18 |
+| acceptance walk | 0.000 | 0.000 |
+| snapshot, emit, bookkeeping | 0.056 | 0.062 |
+| **round total** | **42.63** | **58.18** |
+| tokens per round | 1.793 | 2.314 |
+| implied step cost vs plain | 1.39× | 1.89× |
+
+Gemma4-e4b-it-mxfp8 + E4B assistant — full attention, plain step **11.9 ms**
+(84 t/s), no recurrent state and so no replay:
+
+| Phase | block 2 | block 6 |
+|---|---:|---:|
+| verify forward | 13.74 | 25.27 |
+| rollback (K/V tail slice) | 0.023 | 0.038 |
+| drafting | 1.08 | 4.21 |
+| acceptance walk | 0.000 | 0.000 |
+| emit, bookkeeping | 0.065 | 0.121 |
+| **round total** | **14.92** | **29.63** |
+
+Four things those say:
+
+- **The GDN replay is the sidecar loop's entire residual.** A partial-accept
+  round pays 31–32 ms for `rollback_round_caches`, a second full weight read of
+  the verifier; a full-accept round pays 0.027 ms. Everything else the residual
+  was ever suspected of — the 48-layer `LinearAttnCache` snapshot and restore,
+  the emission, the cache truncation — is 0.06 ms together.
+- **`kept` is never zero in these loops**, so the early return in
+  `rollback_round_caches` is unreachable from them and every partial round
+  replays. The retained prefix is `1 + accept`: the carry token is always kept.
+- **Verifying one more position costs about a quarter of a plain step**, on both
+  architectures: 7.27 ms against a 30.77 ms step on the 27B (0.236), 2.88 ms
+  against an 11.9 ms step on e4b (0.242). A weight-bandwidth roofline says a
+  block should be one weight read plus a few milliseconds of compute, so this is
+  five to six times what that predicts, and it is the same fraction on a GDN
+  hybrid at 4-bit and a full-attention model at mxfp8 — a property of verifying
+  `k` positions through a quantised stack, not of either architecture. It is
+  what makes a deeper block lose: block 3 on the 27B pays 7.27 ms more per round
+  in the verify forward than block 2, comparable with the 6.24 ms more it pays in
+  replay.
+- **A verify forward's full-vocab logits are not a cost.** `forward_verify_capture`
+  builds them for every block position, but the graph node is dropped
+  unevaluated, so nothing is materialised until a caller asks. The cost that
+  existed was the acceptance walk re-deriving the head one position at a time,
+  which is why it now reads the block's argmax back once instead.
+
 ### What these say
 
 - **MTP pays on both GDN hybrids and is the only drafter that does.** On the MoE
@@ -1147,6 +1206,11 @@ No-drafter baseline 83.6 (code) / 83.2 (prose) / 79.1 (4k) decode TPS.
   block 3 are the only two settings those pairs have, and 2 measured faster than
   3 on all three prompt classes for Qwen3.8-27B at both weight formats. The `block_size` field on the
   `mtp_generate_greedy: done` line reports the value actually used.
+- **The step cost the round loop pays is 1.39× a plain step at block 2 and 1.89×
+  at block 3** on Qwen3.8-27B-4bit, against 32.47 / 32.54 t/s no-drafter and
+  39.70 / 37.00 t/s with the sidecar. The split above says where the growth goes:
+  roughly half to the replay's rising partial-round fraction, roughly half to the
+  verify forward's per-position cost.
 - **DFlash and EAGLE-3 are net decode losses on this verifier at every prompt
   class measured**, DFlash by 3-22% and EAGLE-3 by 26-39%. Both run correctly and
   accept real tokens; neither clears its own round-loop overhead.
