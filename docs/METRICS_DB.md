@@ -738,29 +738,42 @@ because nothing enforces it.
     AND prompt_id IN (SELECT id FROM prompts WHERE name LIKE 'wikitext-2_ctx2048%');
   ```
 
-- **35 `ppl_*` rows on `Ternary-Bonsai-8B-mlx-2bit`, scored with a warm-up one
-  slot too late** — the non-BOS scorer skipped `ctx_window - stride` leading
-  slots where the slot that scores the first unseen corpus position is
+- **35 `ppl_*` rows (7 runs) on `Ternary-Bonsai-8B-mlx-2bit`, scored with a
+  warm-up one slot too late** — the non-BOS scorer skipped `ctx_window - stride`
+  leading slots where the slot that scores the first unseen corpus position is
   `ctx_window - stride - 1`, so exactly one corpus position per window boundary
   was never scored. `ppl_scored_tokens` is the metric that moved most: it *is*
   the denominator that changed, by `windows - 1`, and `ppl_mean_nll` and
   `ppl_windows` come off the same runs — which is why the predicate below covers
   the whole `ppl_` family and not just the headline metric.
 
+  The arithmetic, all in rows (a run files five `ppl_*` rows, so run counts are
+  a fifth of these and mixing the two units is what makes the subtraction look
+  wrong): **365 total − 230 Gemma4 − 80 at `stride == ctx_window` − 20 post-fix
+  = 35**.
+
   **Three conditions, all necessary**, and the selector is narrow because a
   predicate that flags good rows is one readers learn to ignore:
 
-  - **Not Gemma4.** That scorer prepends BOS, which shifts each target one slot,
-    and it already subtracted the one. It was always correct. 46 rows.
+  - **Not the Gemma4 scorer.** It prepends BOS, which shifts each target one
+    slot, and it already subtracted the one. It was always correct. 230 rows
+    (46 runs). The predicate names the affected model rather than excluding a
+    `gemma%` prefix: `medgemma-1.5-4b-it-8bit` is already in `observations` and
+    does not start with `gemma`, so a prefix test would flag its future `ppl_*`
+    rows as affected — the exact over-selection this entry exists to avoid.
   - **`stride < ctx_window`.** At `stride == ctx_window` the old expression gives
     `ctx_window - stride = 0` and the new gives `0.saturating_sub(1) = 0`:
     identical, and the scored sets are byte-identical. The whole `2026-09-03`
-    Bonsai batch is in that case. 16 rows.
+    Bonsai batch is in that case. 80 rows (16 runs). `COALESCE(notes, '')`
+    because a bare `LIKE` against a NULL `notes` evaluates to NULL and drops the
+    row from the affected set — a fail-open in the direction that matters, and
+    this predicate is the durable artifact.
   - **A pre-fix binary.** `git_sha` is the discriminator, not the date. This
     change was made on a branch, so a run from a pre-fix binary *after* the fix
     landed files an affected row that no date predicate catches; the four shas
     below are what the DB holds today, and a fifth would have to be added here
-    rather than inferred. No affected row has a NULL `git_sha`.
+    rather than inferred. 20 rows (4 runs) carry the post-fix sha. No affected
+    row has a NULL `git_sha`.
 
   At the default `--ctx-window 4096 --stride 2048` the effect is one position in
   2048 — 0.05% of the denominator — and the resulting shift in `ppl` is far under
@@ -770,8 +783,9 @@ because nothing enforces it.
   ```sql
   SELECT * FROM observations
   WHERE metric LIKE 'ppl_%'
-    AND model NOT LIKE 'gemma%'
-    AND notes NOT LIKE '%ctx_window=' || ctx_max || ' stride=' || ctx_max || '%'
+    AND model = 'Ternary-Bonsai-8B-mlx-2bit'
+    AND COALESCE(notes, '') NOT LIKE
+        '%ctx_window=' || ctx_max || ' stride=' || ctx_max || '%'
     AND git_sha IN ('2bcf206', '2bcf206-dirty', '6eeb4ae-dirty', 'a71d88b-dirty');
   ```
 

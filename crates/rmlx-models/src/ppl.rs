@@ -70,7 +70,9 @@ pub enum PplError {
     /// reports and a checkpoint's `config.json` carries, so an operator can
     /// grep the message for what their snapshot declares.
     #[error(
-        "ppl: architecture '{arch}' is not supported (supported:          Qwen3ForCausalLM, Gemma4ForConditionalGeneration,          Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)"
+        "ppl: architecture '{arch}' is not supported (supported: \
+Qwen3ForCausalLM, Gemma4ForConditionalGeneration, \
+Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration)"
     )]
     ArchUnsupported {
         /// The architecture name that is not yet supported.
@@ -83,7 +85,10 @@ pub enum PplError {
     /// reading the module docs at that moment and "no cached scorer" alone
     /// reads as "not implemented yet".
     #[error(
-        "ppl: architecture '{arch}' has no cached scorer: its GatedDeltaNet          layers hold a recurrent state no KV codec touches, so a number scored          through a codec there would describe only the full-attention layers.          Drop the KV-codec flags to score it cacheless"
+        "ppl: architecture '{arch}' has no cached scorer: its GatedDeltaNet \
+layers hold a recurrent state no KV codec touches, so a number scored through a \
+codec there would describe only the full-attention layers. Drop the KV-codec \
+flags to score it cacheless"
     )]
     CachedScorerUnsupported {
         /// The architecture name whose scorer keeps no cache.
@@ -296,7 +301,7 @@ fn accumulate_position_nll(
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
-    reason = "every index below is behind the `warmup + 1 < win.len()` guard at the top or the loop's own `t < last_scored` bound"
+    reason = "every index below is behind the `warmup + 1 < win.len()` guard at the top or the loop's own `t < last_scored` bound; `host[..vocab]` is bounded by read_logits_3d_into having just filled it to `1 * vocab`"
 )]
 fn score_window_through_cache(
     win: &[u32],
@@ -329,9 +334,14 @@ fn score_window_through_cache(
         arch,
         &mut forward,
     )?;
+    // `&host[..vocab]`, not `host`: the buffer is the caller's and outlives this
+    // window, so its length is whatever the widest window so far needed.
+    // `neg_log_softmax_at` sums `exp()` over every element it is handed, so
+    // passing the whole buffer would make the softmax denominator depend on a
+    // previous window's shape. The cacheless scorer slices for the same reason.
     read_logits_3d_into(&prefill_logits, 1, vocab, host)?;
     accumulate_position_nll(
-        host,
+        &host[..vocab],
         win[warmup + 1] as usize,
         vocab,
         warmup,
@@ -342,7 +352,14 @@ fn score_window_through_cache(
     for t in (warmup + 1)..last_scored {
         let logits = forward(&win[t..=t], caches)?;
         read_logits_3d_into(&logits, 1, vocab, host)?;
-        accumulate_position_nll(host, win[t + 1] as usize, vocab, t, sum_nll, count);
+        accumulate_position_nll(
+            &host[..vocab],
+            win[t + 1] as usize,
+            vocab,
+            t,
+            sum_nll,
+            count,
+        );
     }
     Ok(())
 }
@@ -909,7 +926,7 @@ pub(crate) fn neg_log_softmax_at(row: &[f32], idx: usize) -> f32 {
 )]
 #[allow(
     clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+    reason = "both unwraps are `try_into` on a statically sized chunk — `chunks_exact(4)` yields exactly 4 bytes and the bf16 slice is indexed as `o..o + 2`; neither can be the wrong width"
 )]
 #[allow(
     clippy::wildcard_enum_match_arm,

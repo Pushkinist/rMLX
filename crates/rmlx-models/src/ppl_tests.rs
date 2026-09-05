@@ -502,3 +502,229 @@ fn the_scoring_kernel_scores_the_next_token_from_the_warmup_on() {
         "the fixture cannot tell win[t+1] from win[t] and so cannot gate the shift"
     );
 }
+
+/// A scorer handed a buffer that a longer window already filled scores the
+/// short window and nothing else.
+///
+/// The hoist that made `host` the caller's turned a fresh allocation into
+/// shared mutable state in a numerical path, and `neg_log_softmax_at` sums
+/// `exp()` over every element it is given. A stale tail left behind by a wider
+/// window would therefore inflate the softmax denominator of every later,
+/// narrower one — a wrong perplexity with no error anywhere, which is the whole
+/// failure class this file exists to close.
+///
+/// Cross-shape on purpose: a same-shape reuse cannot see it. Mutation this
+/// fails on: deleting `out.clear()` from `read_logits_3d_into`. The `NAN` fill
+/// makes a surviving tail unmissable — `exp()` of it poisons `sum_nll` — and the
+/// `host.len()` assertion catches it even where the arithmetic would not.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "row slices are bounded by the vocab and seq this test constructs"
+)]
+fn a_buffer_a_longer_window_dirtied_does_not_reach_the_next_window() {
+    const VOCAB: usize = 4;
+    let long_win: [u32; 6] = [0, 1, 2, 3, 0, 1];
+    let short_win: [u32; 3] = [2, 3, 0];
+
+    let row_at = |t: usize| -> Vec<f32> {
+        (0..VOCAB)
+            .map(|v| (t * VOCAB + v) as f32 * 0.5 - 1.0)
+            .collect()
+    };
+    let flat_for = |seq: usize| -> Vec<f32> { (0..seq).flat_map(row_at).collect() };
+
+    let long_logits = Array::from_f32_slice(
+        &flat_for(long_win.len()),
+        &[1, long_win.len() as i32, VOCAB as i32],
+    )
+    .unwrap();
+    let short_flat = flat_for(short_win.len());
+    let short_logits =
+        Array::from_f32_slice(&short_flat, &[1, short_win.len() as i32, VOCAB as i32]).unwrap();
+
+    // The answer the short window has on its own, from a buffer nothing touched.
+    let mut clean: Vec<f32> = Vec::new();
+    let mut clean_nll = 0.0_f64;
+    let mut clean_count = 0_usize;
+    score_window_cacheless(
+        &short_logits,
+        &short_win,
+        0,
+        VOCAB,
+        &mut clean,
+        &mut clean_nll,
+        &mut clean_count,
+    )
+    .unwrap();
+
+    // The same window through a buffer the longer one filled, then dirtied
+    // past what the short window needs.
+    let mut reused: Vec<f32> = Vec::new();
+    let mut scratch_nll = 0.0_f64;
+    let mut scratch_count = 0_usize;
+    score_window_cacheless(
+        &long_logits,
+        &long_win,
+        0,
+        VOCAB,
+        &mut reused,
+        &mut scratch_nll,
+        &mut scratch_count,
+    )
+    .unwrap();
+    assert_eq!(
+        reused.len(),
+        long_win.len() * VOCAB,
+        "the wide window must have filled the buffer to its own width"
+    );
+    reused.fill(f32::NAN);
+
+    let mut dirty_nll = 0.0_f64;
+    let mut dirty_count = 0_usize;
+    score_window_cacheless(
+        &short_logits,
+        &short_win,
+        0,
+        VOCAB,
+        &mut reused,
+        &mut dirty_nll,
+        &mut dirty_count,
+    )
+    .unwrap();
+
+    assert_eq!(
+        reused.len(),
+        short_win.len() * VOCAB,
+        "the buffer must be resized down to this window, not left holding the wider one"
+    );
+    assert_eq!(
+        dirty_count, clean_count,
+        "reuse must not change which positions are scored"
+    );
+    assert!(
+        dirty_nll.is_finite(),
+        "a stale NAN tail reached the softmax: sum_nll is {dirty_nll}"
+    );
+    assert!(
+        (dirty_nll - clean_nll).abs() < 1e-9,
+        "reuse changed the answer: {dirty_nll} against {clean_nll} from a fresh buffer"
+    );
+}
+
+/// The messages an operator greps carry no run of whitespace.
+///
+/// Both are wrapped across source lines with `\` continuations, which strip the
+/// newline *and* the indentation that follows it. Dropping one continuation
+/// leaves ten spaces mid-sentence and a search for the phrase either side of the
+/// break finds nothing — which is the property the wrapped messages exist for.
+#[test]
+fn the_operator_facing_messages_are_one_line_of_single_spaces() {
+    let messages = [
+        PplError::ArchUnsupported {
+            arch: "LagunaForCausalLM".to_owned(),
+        }
+        .to_string(),
+        PplError::CachedScorerUnsupported {
+            arch: "Qwen3_5ForConditionalGeneration".to_owned(),
+        }
+        .to_string(),
+    ];
+    for msg in messages {
+        assert!(
+            !msg.contains("  "),
+            "a dropped line continuation left a run of spaces: {msg}"
+        );
+        assert!(
+            !msg.contains('\n'),
+            "the message must render on one line: {msg}"
+        );
+    }
+}
+
+/// The cached scorer scores one position per forward, from a buffer that is
+/// the caller's and starts dirty.
+///
+/// Driven by a stub forward and an empty cache stack, so it needs no model and
+/// no Metal: `chunked_prefill`'s cache sweeps are no-ops over an empty `Vec`
+/// and every array here is built on `Device::Cpu`. Until this existed the
+/// cached path's only test was the one that asserts it dispatches *nothing*.
+///
+/// Mutation this fails on: deleting `out.clear()` from `read_logits_3d_into`,
+/// which leaves the wide starting buffer's `NAN` tail under the softmax. The
+/// companion `&host[..vocab]` slice at the call site is not separately
+/// observable while `out.clear()` stands — the buffer is exactly `vocab` long
+/// there by construction, so the slice and the whole buffer are the same value.
+/// It is defence in depth against the two changing independently, and is
+/// recorded as such rather than as a gated invariant.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "row slices are bounded by the vocab and seq this test constructs"
+)]
+fn the_cached_scorer_scores_a_position_per_forward_from_the_callers_buffer() {
+    const VOCAB: usize = 4;
+    let win: [u32; 4] = [0, 1, 2, 3];
+
+    let row_at = |t: usize| -> Vec<f32> {
+        (0..VOCAB)
+            .map(|v| (t * VOCAB + v) as f32 * 0.5 - 1.0)
+            .collect()
+    };
+
+    // The stub answers the n-th forward with row n: the prefill call scores
+    // position `warmup`, and each later single-token call scores its own.
+    let mut call = 0_usize;
+    let mut caches: Vec<KvCache> = Vec::new();
+    // Starts wider than one row and full of NAN — the state a previous, wider
+    // window would leave behind.
+    let mut host: Vec<f32> = vec![f32::NAN; VOCAB * 8];
+    let mut sum_nll = 0.0_f64;
+    let mut count = 0_usize;
+
+    score_window_through_cache(
+        &win,
+        0,
+        VOCAB,
+        &mut caches,
+        "qwen3",
+        Device::Cpu,
+        &mut sum_nll,
+        &mut count,
+        &mut host,
+        |_ids, _cs| {
+            let row = row_at(call);
+            call += 1;
+            Array::from_f32_slice(&row, &[1, 1, VOCAB as i32])
+        },
+    )
+    .unwrap();
+
+    assert_eq!(call, win.len() - 1, "one forward per scored position");
+    assert_eq!(
+        count,
+        win.len() - 1,
+        "every position from the warm-up scores"
+    );
+
+    let mut expected = 0.0_f64;
+    for t in 0..(win.len() - 1) {
+        expected += f64::from(neg_log_softmax_at(&row_at(t), win[t + 1] as usize));
+    }
+    assert!(
+        sum_nll.is_finite(),
+        "the caller's dirty buffer reached the softmax: {sum_nll}"
+    );
+    assert!(
+        (sum_nll - expected).abs() < 1e-9,
+        "cached scorer summed {sum_nll}, expected {expected}"
+    );
+}

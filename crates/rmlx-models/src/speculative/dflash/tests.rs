@@ -213,7 +213,7 @@ fn a_snapshot_this_loader_only_half_reads_is_refused_and_a_whole_one_is_not() {
     let consumed: HashSet<String> = read_by_the_loader.iter().map(|s| (*s).to_owned()).collect();
 
     // Every tensor consumed — the shape of the DFlash 1 checkpoint.
-    let whole: Vec<String> = read_by_the_loader.iter().map(|s| (*s).to_owned()).collect();
+    let whole: HashSet<String> = read_by_the_loader.iter().map(|s| (*s).to_owned()).collect();
     assert!(
         unread_tensor_refusal(&whole, &consumed).is_ok(),
         "a snapshot the loader reads entirely must load"
@@ -221,8 +221,8 @@ fn a_snapshot_this_loader_only_half_reads_is_refused_and_a_whole_one_is_not() {
 
     // Extra weight families — the shape of the DFlash 2 checkpoint.
     let mut partial = whole;
-    partial.push("candidate_selector.successor_codebook".to_owned());
-    partial.push("layers.0.attention_conv.base_kernel".to_owned());
+    partial.insert("candidate_selector.successor_codebook".to_owned());
+    partial.insert("layers.0.attention_conv.base_kernel".to_owned());
     let err = unread_tensor_refusal(&partial, &consumed).unwrap_err();
     let msg = err.to_string();
     assert!(

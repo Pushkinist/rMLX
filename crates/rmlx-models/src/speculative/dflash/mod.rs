@@ -972,7 +972,7 @@ pub fn dflash_generate_greedy(
 /// `Result` rather than an `Option<Error>` so a call site that stops propagating
 /// it is an `unused_must_use` warning, which `-D warnings` turns into a build
 /// failure — the guard cannot be un-wired quietly.
-fn unread_tensor_refusal(present: &[String], consumed: &HashSet<String>) -> Result<()> {
+fn unread_tensor_refusal(present: &HashSet<String>, consumed: &HashSet<String>) -> Result<()> {
     let mut unread: Vec<&str> = present
         .iter()
         .map(String::as_str)
@@ -1159,7 +1159,9 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
         });
     }
 
-    let mut present: Vec<String> = Vec::new();
+    // A set, not a list: a name carried by two shard files would otherwise be
+    // counted and listed twice in the refusal.
+    let mut present: HashSet<String> = HashSet::new();
     for (_, handle) in shards.iter() {
         let st = handle
             .safetensors()
