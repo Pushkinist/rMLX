@@ -56,6 +56,23 @@ runs by default. Closing it needs either the census analysis extended to this
 kernel and model, or a stable count — neither of which this change is the place
 for.
 
+**Three of the five round loops are outside the gate entirely.** It covers the
+Gemma4 assistant loop and the Qwen3.5-family MTP sidecar loop. The DFlash,
+EAGLE-3 and two-model loops have no pair here, and the property is not
+transitive across loops — each one has its own rollback and its own acceptance
+walk, which is what the gate reads.
+
+That boundary is not hypothetical. Served at temperature 0 on the code prompt,
+`Qwen3.8-27B-4bit` drafted by `z-lab/Qwen3.8-27B-DFlash2` at block 8 diverges
+from the same verifier's no-drafter answer at the fourth token — "We need to
+respond to user:" against "We need answer user's request:" — and stays diverged;
+the MTP sidecar on the same verifier, same prompt and same 160-token budget is
+byte-identical to it. A greedy speculative loop can only emit the verifier's own
+argmax, so a drafter proposing badly costs throughput and cannot change the
+answer. A changed answer is the loop, not the drafter, and this one is uncovered.
+That the drafter is also being loaded as an earlier architecture than the
+checkpoint (see `docs/SPECULATIVE.md` § Qwen3.8-27B-4bit) does not explain it.
+
 ## The oracle: where a correct pair diverges
 
 A reduction-order difference is a relative perturbation of order `1e-3` on a

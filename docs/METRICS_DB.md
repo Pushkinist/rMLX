@@ -758,6 +758,23 @@ because nothing enforces it.
     AND ts_utc < '2026-09-05';
   ```
 
+- **`dflash/*` rows measured against a DFlash 2 checkpoint** — the drafter
+  loader implements the earlier DFlash architecture and reads none of the
+  candidate-selector or per-layer dynamic-convolution tensors a DFlash 2
+  snapshot ships. It builds the drafter it can build out of the rest and serves,
+  so the rows are honest measurements of *that* drafter and are not measurements
+  of the published one. `decode_config` says `dflash/block=N` either way and
+  cannot tell them apart; the load now names the tensors it did not read, so a
+  run log can. On `Qwen3.8-27B-4bit` those are the `2026-09-04` block-16 rows and
+  the `2026-09-05` block-8 ones. Do not compare them against a row taken once the
+  full drafter is implemented.
+
+  ```sql
+  SELECT * FROM observations
+  WHERE decode_config LIKE 'dflash/%'
+    AND model = 'Qwen3.8-27B-4bit';
+  ```
+
 - **Two synthetic rows from an ingest-refusal probe** — a review of the
   boundary-layer work exercised the ingest path's refusals by handing it
   near-real records, and two of them were accepted instead of refused. They
