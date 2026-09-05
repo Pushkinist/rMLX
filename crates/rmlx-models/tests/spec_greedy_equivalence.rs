@@ -36,7 +36,8 @@
 //!
 //! **There is deliberately no subsequence floor.** How much of one answer two
 //! correct arms share is decided by where their first near-tie lands and by
-//! nothing else: the assistant pair reads 0.9375 on the 4k document and 0.4766
+//! nothing else: on `lcs_ratio` — not the tail — the assistant pair reads 0.9375
+//! on the 4k document and 0.4766
 //! on a short prose prompt whose arms flip an **exact** tie (top-two margin
 //! 0.0000) at token 37, after which both write well-formed, correct, different
 //! prose. The two broken engines read 0.2188 to 0.4615 on the same measure —
@@ -183,14 +184,21 @@ const MAX_CTX: i32 = 8192;
 /// at least four of its six.
 const MAX_DIVERGENCE_CONFIDENCE: f64 = 0.12;
 
-/// The worst tail agreement a **correct** pair reached over the prompts the gate
-/// judged, on either pair. Not a threshold the gate applies — see below — but
-/// the reference `two_arms_in_the_same_ragged_loop_are_not_returned_as_agreement`
+/// The worst [`weakest_tail`] reading a **correct** pair reached over the prompts
+/// the gate judged, on either pair. Not a threshold the gate applies — see below
+/// — but the reference `two_arms_in_the_same_ragged_loop_are_not_returned_as_agreement`
 /// uses to decide whether a synthetic pair still looks like agreement at all.
+/// `the_worst_correct_tail_is_the_worst_of_the_tails_measured` holds it to that
+/// population.
+///
+/// The paragraph below is about a **different measure** and its figures are not
+/// comparable to the one above: [`lcs_ratio`] over the whole arm, where the same
+/// runs read higher.
 ///
 /// There is deliberately **no subsequence floor**. How much of one answer two
 /// correct arms share is decided by where their first near-tie lands and by
-/// nothing else: the assistant pair reads 0.9375 on the 4k document and 0.4766
+/// nothing else: on `lcs_ratio` the assistant pair reads 0.9375 on the 4k
+/// document and 0.4766
 /// on a short prose prompt whose arms flip an exact tie at token 37, and the two
 /// broken engines measured here read 0.2188 to 0.4615 — three per cent under
 /// that, with nothing bounding the correct minimum from below. `report` prints
@@ -889,8 +897,10 @@ fn two_arms_in_the_same_ragged_loop_are_not_returned_as_agreement() {
 /// it to the population it names fails in both directions.
 #[test]
 fn the_worst_correct_tail_is_the_worst_of_the_tails_measured() {
-    /// Every tail agreement a correct pair reached, over both pairs and the
-    /// prompts each of them judged.
+    /// Every [`weakest_tail`] reading a correct pair reached, over both pairs and
+    /// the prompts each of them judged. These are tails, not [`lcs_ratio`] over
+    /// the whole arm — the same runs read 0.4766 to 1.0000 on that measure, and
+    /// the two figures the "no subsequence floor" paragraphs quote come from it.
     const MEASURED: &[f64] = &[
         // Assistant pair, six prompts.
         0.3125, 0.3750, 0.3906, 0.2344, 1.0000, 0.9062,
@@ -1065,28 +1075,26 @@ fn the_length_floor_admits_every_answer_the_prompts_produce() {
         judge(&budget, &budget, &[]).refusal().is_none(),
         "a pair that answers in full must clear the floor"
     );
+    // Both sides of the floor, at compile time, and each is the tightest form
+    // its evidence supports. The band they leave is [160, 165] and the shipped
+    // floor sits on its lower limit.
     const {
         // The upper side, and it is not merely the budget. A correct pair can
-        // answer and stop well before the budget — run at 512 tokens these same
-        // prompts stop the reference arm at 330 — so a floor that only cleared
-        // `N_TOKENS` would still class a pair that answered and stopped as a
-        // prompt that produced nothing, driving `judged` to zero and failing
-        // `run_gate`'s own guard for the wrong reason. Two thirds is the
-        // fraction that measurement leaves.
-        assert!(MIN_ANSWER_TOKENS * 3 <= N_TOKENS * 2);
-        // And the lower side: below this the last tail window cannot evidence a
-        // cycle at all.
-        assert!(MIN_ANSWER_TOKENS > TAIL_WINDOWS * MIN_CYCLE_SAMPLES);
+        // answer and stop well before the budget: the assistant pair run at a
+        // 512-token budget over these prompts stops the reference arm on the 4k
+        // document at 330, a fraction of 330/512. A floor that only cleared
+        // `N_TOKENS` would class a pair that answered and stopped as a prompt
+        // that produced nothing, driving `judged` to zero and failing
+        // `run_gate`'s own guard for the wrong reason. The measured fraction is
+        // asserted rather than a rounder one above it.
+        assert!(MIN_ANSWER_TOKENS * 512 <= N_TOKENS * 330);
+        // The lower side: the last tail window is `MIN_ANSWER_TOKENS /
+        // TAIL_WINDOWS`, and it has to leave `MIN_CYCLE_SAMPLES` comparisons
+        // over and above the period-8 cycle the documented collapse repeats at.
+        // The looser `MIN_ANSWER_TOKENS > TAIL_WINDOWS * MIN_CYCLE_SAMPLES`
+        // admits 129 and rejects nothing this does not.
+        assert!(MIN_ANSWER_TOKENS / TAIL_WINDOWS >= MIN_CYCLE_SAMPLES + 8);
     }
-
-    // And the floor leaves the last tail window able to read the period the
-    // documented collapse repeats at.
-    let last_window = MIN_ANSWER_TOKENS / TAIL_WINDOWS;
-    assert!(
-        last_window.saturating_sub(MIN_CYCLE_SAMPLES) >= 8,
-        "at this floor the last tail window is {last_window} tokens and cannot \
-         evidence a period-8 cycle, which is the collapse this gate was built on"
-    );
 }
 
 /// A run that stopped short is refused rather than passed on its short prefix.

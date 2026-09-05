@@ -90,7 +90,9 @@ The obvious oracle — how much of one answer the two arms share — cannot be
 thresholded, and this is measured rather than asserted.
 
 How much two *correct* arms share is decided by where their first near-tie lands
-and by nothing else. On the assistant pair the same engine, model and prompt
+and by nothing else. The figures here are `lcs_ratio` over the whole arm, not the
+tail readings `WORST_CORRECT_TAIL_AGREEMENT` is set from — the same runs read
+lower on that. On the assistant pair the same engine, model and prompt
 family read 0.9375 on the 4k document and 0.4766 on a prompt whose arms flip an
 **exact** tie (top-two margin 0.0000) at token 37 — after which both write
 well-formed, correct, different prose. The broken engines read 0.2188 to 0.4615

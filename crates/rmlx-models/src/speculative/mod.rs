@@ -1581,8 +1581,14 @@ fn rollback_round_caches(
 /// rejected drafts while the full-attention layers dropped them is how a
 /// speculative arm stops reproducing plain greedy at long context, and a
 /// failure part-way through the loop produces exactly that state with no way
-/// back. `KvCache::can_truncate_to` is the same predicate `truncate_to` fails
-/// on, so the gate and the operation cannot disagree.
+/// back. `KvCache::can_truncate_to` decides reachability on exactly the ground
+/// `truncate_to` refuses on — a sliding-window ring's order past its wrap — so
+/// on that question the gate and the operation cannot disagree.
+///
+/// It does not model a fault in the write itself: a ring admitted with no
+/// recorded stream, or a buffer that is not 4-D. Both are structural invariants
+/// rather than states a caller can reach, and either would still return
+/// mid-stack.
 fn truncate_kv_to(kv: &mut [KvCache], n: i32) -> Result<()> {
     if let Some((idx, c)) = kv
         .iter()

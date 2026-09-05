@@ -482,7 +482,15 @@ fn a_stack_with_one_layer_that_cannot_roll_back_moves_no_layer() {
         "and the target it could not reach: {msg}"
     );
 
-    // And a target every layer can reach is not refused.
-    assert!(truncate_kv_to(&mut stack, 9).is_ok());
-    assert_eq!((stack[0].offset(), stack[1].offset()), (9, 9));
+    // And the gate does not stand in the way of a rollback the whole stack can
+    // make. A target both layers are already at would prove nothing — it is
+    // `roll_back(0)` on one and a no-op on the other, and a loop that skipped
+    // the truncation outright would still pass it. So this one moves.
+    let mut reachable = vec![filled_layer(None, device), filled_layer(None, device)];
+    assert!(truncate_kv_to(&mut reachable, 7).is_ok());
+    assert_eq!(
+        (reachable[0].offset(), reachable[1].offset()),
+        (7, 7),
+        "a target every layer can reach must move every layer"
+    );
 }
