@@ -733,9 +733,9 @@ fn write_layer(
                 seq,
             ))
         }
-        // TurboSym3 — symmetric WHT-3 K + turbo3 V.
+        // TurboSym3 — symmetric 3-bit Lloyd-Max K + turbo3 V.
         // K is `QuantKTurbo3` (3-bit codes, same GPU pack as V-side turbo3).
-        // Layout tag: TURBOSYM3_LAYOUT_TAG = "tsym3_wht_3_3".
+        // Layout tag: TURBOSYM3_LAYOUT_TAG = "tsym3_lloyd_3_3".
         KvStorage::TurboSym3 { k, v, max_seq } => {
             let seq = write_quant_k_turbo3(idx, k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
@@ -744,9 +744,9 @@ fn write_layer(
                 seq,
             ))
         }
-        // TurboSym4 — symmetric WHT-4 K + tq4 V.
+        // TurboSym4 — symmetric 4-bit Lloyd-Max K + tq4 V.
         // Both axes use TurboQuant 4-bit; K is `QuantKTurbo4` (not `QuantK`).
-        // Geometry tag is `TURBOSYM4_LAYOUT_TAG` = "tsym4_wht_4_4".
+        // Geometry tag is `TURBOSYM4_LAYOUT_TAG` = "tsym4_lloyd_4_4".
         KvStorage::TurboSym4 { k, v, max_seq } => {
             let seq = write_quant_k_turbo4(idx, k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
@@ -2213,10 +2213,10 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
                 max_seq,
             })
         }
-        // TurboSym3 — symmetric WHT-3 K + turbo3 V. Match against the canonical
+        // TurboSym3 — symmetric 3-bit Lloyd-Max K + turbo3 V. Match against the canonical
         // layout tag constant.
         tag if tag == TURBOSYM3_LAYOUT_TAG => read_tsym3(st, idx, geom),
-        // TurboSym4 — symmetric WHT-4 K + tq4 V. Match against the canonical
+        // TurboSym4 — symmetric 4-bit Lloyd-Max K + tq4 V. Match against the canonical
         // layout tag constant.
         tag if tag == TURBOSYM4_LAYOUT_TAG => read_tsym4(st, idx, geom),
         // PlanarK — K-only payload (codes/scales/rotations); V is bf16
@@ -2438,7 +2438,7 @@ fn parse_v_suffix(rest: &str) -> Option<(u8, u16)> {
     Some((bits, group))
 }
 
-/// Hydrate a `KvStorage::TurboSym3` from a `"tsym3_wht_3_3"`-tagged geometry.
+/// Hydrate a `KvStorage::TurboSym3` from a `"tsym3_lloyd_3_3"`-tagged geometry.
 /// Mirrors `read_tsym4` exactly but for 3-bit codes.
 fn read_tsym3(st: &SafeTensors<'_>, idx: usize, geom: &str) -> Result<KvStorage> {
     let max_seq = geom_i32(geom, "max_seq")?;
@@ -2478,7 +2478,7 @@ fn read_quant_k_turbo3(
     ))
 }
 
-/// Hydrate a `KvStorage::TurboSym4` from a `"tsym4_wht_4_4"`-tagged geometry.
+/// Hydrate a `KvStorage::TurboSym4` from a `"tsym4_lloyd_4_4"`-tagged geometry.
 /// Mirrors `read_quant_v` for the V side, and uses [`read_quant_k_turbo4`]
 /// for the K side (identical TurboQuant codes/scales layout, different Rust
 /// type).

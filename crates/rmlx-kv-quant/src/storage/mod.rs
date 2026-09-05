@@ -60,8 +60,8 @@ pub use kv_storage::{
     TURBOSYM3_LAYOUT_TAG, TURBOSYM4_LAYOUT_TAG,
 };
 pub use quant_iso_k::{
-    iso_n_groups_for, iso_n_groups_i32, QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE,
-    ISO_QUAT_BLOCK_SIZE,
+    iso_code_words_i32, iso_n_groups_for, iso_n_groups_i32, iso_row_words, QuantIsoK3, ISO_K3_BITS,
+    ISO_K3_GROUP_SIZE, ISO_QUAT_BLOCK_SIZE,
 };
 pub use quant_iso_k4::{QuantIsoK4, ISO_K4_BITS, ISO_K4_GROUP_SIZE};
 pub use quant_iso_v::{IsoBlocks, QuantIsoV3, ISO3_BITS, ISO3_GROUP_SIZE};

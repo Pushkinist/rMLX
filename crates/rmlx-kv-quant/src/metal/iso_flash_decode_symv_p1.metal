@@ -8,6 +8,10 @@ uint heads_per_kv = dims[4];
 uint n_tiles      = dims[5];
 uint has_mask     = dims[6];
 uint n_groups     = dims[7];
+// Words the dense code plane holds per row. Loop-invariant, and the
+// per-lane decode below runs once per KV token, so it is derived here
+// rather than inside the decode.
+uint row_words = cp_row_words(n_groups);
 
 uint tile_idx = threadgroup_position_in_grid.x;
 uint bh       = threadgroup_position_in_grid.y;
@@ -68,7 +72,8 @@ for (uint t = tile_start; t < tile_end; t++) {
     // with no threadgroup stage on either axis.
     uint kv_tok = (b * kv_seq + t) * kv_h + kv_h_idx;
 
-    float k_val = if_decode_k_lane(k_codes, k_scales, k_norms, kv_tok, n_groups, tid);
+    float k_val =
+        if_decode_k_lane(k_codes, k_scales, k_norms, kv_tok, n_groups, row_words, tid);
 
     // ── QK dot via simdgroup reduction ───────────────────────────────
     // simd_sum folds each simdgroup's 32 lanes with no threadgroup barrier and
@@ -111,9 +116,10 @@ for (uint t = tile_start; t < tile_end; t++) {
     // quaternion block as K, from the V store's own codes / scales / norms.
     // No bf16 V exists in device memory — that mirror is exactly what this
     // kernel deletes. Self-contained per lane, so no threadgroup stage.
-    float corr  = s_corr[0];
-    float es    = s_expsc[0];
-    float v_val = if_decode_k_lane(v_codes, v_scales, v_norms, kv_tok, n_groups, tid);
+    float corr = s_corr[0];
+    float es   = s_expsc[0];
+    float v_val =
+        if_decode_k_lane(v_codes, v_scales, v_norms, kv_tok, n_groups, row_words, tid);
 
     acc_v = acc_v * corr + es * v_val;
 }

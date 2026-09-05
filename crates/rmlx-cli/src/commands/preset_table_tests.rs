@@ -20,7 +20,7 @@ fn preset_q8_resolves_to_k8v8() {
 
 #[test]
 fn preset_speed_resolves_to_tsym3() {
-    // speed promoted from K8VTurbo3 to TurboSym3 (symmetric WHT-3 K+V,
+    // speed promoted from K8VTurbo3 to TurboSym3 (symmetric 3-bit Lloyd-Max K+V,
     // matching mtq's `speed` preset definition exactly).
     let spec = lookup_preset("speed").expect("speed must resolve");
     assert_eq!(spec.kv_quant, KvQuant::TurboSym3);
@@ -29,7 +29,7 @@ fn preset_speed_resolves_to_tsym3() {
 
 #[test]
 fn preset_quality_resolves_to_tsym4() {
-    // `quality` resolves to symmetric WHT-4 K + tq4 V, matching
+    // `quality` resolves to symmetric 4-bit Lloyd-Max K + tq4 V, matching
     // mtq's `quality` definition byte-for-byte.
     let spec = lookup_preset("quality").expect("quality must resolve");
     assert_eq!(spec.kv_quant, KvQuant::TurboSym4);

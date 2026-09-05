@@ -337,7 +337,8 @@ pub enum CacheType {
     /// `iso_v_4` (alias `iso4`) — IsoQuant 4-bit V; V-side only.
     ///
     /// 4.25-bit V codec: same quaternion SO(4) rotation as `Iso3` with the
-    /// 16-centroid Lloyd-Max codebook and dense 8-vals-per-u32 pack. Requires
+    /// 16-centroid Lloyd-Max codebook, at 4 bits per code in the dense code
+    /// plane. Requires
     /// `head_dim % 4 == 0`. Pairs with K-side `q8_g128` (coerced to
     /// `KvQuant::Iso4`). CPU-only (no MSL kernel — the iso3 MSL
     /// kernel is hard-coded for `bits=3`).
@@ -347,7 +348,7 @@ pub enum CacheType {
     ///
     /// 3-bit V codec built on Cl(3,0) multivectors (8 components per group of
     /// 3 grade-1 elements). Static per-layer rotor table; per-token codes +
-    /// scales + L2 norm. Pack format: 10 vals/u32 (planar3 / iso3 convention).
+    /// scales + L2 norm. Pack format: the dense code plane, 3 bits per code.
     /// Pairs with K-side `q8_g128` (coerced to `KvQuant::Rotor3`). CPU-only
     /// (no MSL kernel — same precedent as iso3 / iso4).
     Rotor3,
@@ -355,9 +356,10 @@ pub enum CacheType {
     /// V; V-side only.
     ///
     /// 4-bit V codec built on Cl(3,0) multivectors — same algebra as `Rotor3`
-    /// but with the 16-centroid Lloyd-Max codebook and dense 8-vals-per-u32
-    /// pack. ~10.7-bit effective storage per element counting per-group scale +
-    /// per-token norm; rotor table amortises across tokens. `head_dim` may be
+    /// but with the 16-centroid Lloyd-Max codebook, at 4 bits per code in the
+    /// dense code plane. 9.75 stored bits per element at `head_dim = 128`,
+    /// counting the per-group scale and per-token norm; the rotor table
+    /// amortises across tokens. `head_dim` may be
     /// any positive integer (the last group is tail-padded when
     /// `head_dim % 3 != 0`). Pairs with K-side `q8_g128` (coerced to
     /// `KvQuant::Rotor4`). CPU-only (no MSL kernel).
@@ -428,7 +430,7 @@ pub enum CacheType {
     /// `KvQuant::Rotor4Sym` or V=`bf16` for `KvQuant::RotorKOnly4`.
     /// Arch-guarded against Qwen MoE.
     RotorK4,
-    /// `tsym3` — symmetric WHT-3 K + turbo3 V.
+    /// `tsym3` — symmetric 3-bit Lloyd-Max K + turbo3 V.
     ///
     /// Both K and V use the TurboQuant 3-bit Lloyd-Max N(0,1) 8-centroid
     /// codebook. K is `QuantKTurbo3` (GPU: same MSL kernel as V-side turbo3).
@@ -663,7 +665,7 @@ pub fn parse(s: &str) -> Result<CacheType, ParseError> {
         // K-side rotor — dual spelling.
         "rotor_k_3" | "k_rotor3" => Ok(CacheType::RotorK3),
         "rotor_k_4" | "k_rotor4" => Ok(CacheType::RotorK4),
-        // symmetric WHT-3 (K+V both turbo3).
+        // symmetric 3-bit Lloyd-Max (K+V both turbo3).
         "tsym3" => Ok(CacheType::TurboSym3),
 
         // Aliases
@@ -1626,7 +1628,7 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
                 variant: format!("{kq}"),
             });
         }
-        // Contract A.y — TurboSym3 (symmetric WHT-3 K+V) is K-side
+        // Contract A.y — TurboSym3 (symmetric 3-bit Lloyd-Max K+V) is K-side
         // 3-bit on Qwen MoE — rejected with a dedicated error so the diagnostic
         // names the variant. Runs after rotor guard and before `k_below_8bit`.
         if matches!(kq, KvQuant::TurboSym3) {
@@ -1639,7 +1641,7 @@ pub fn validate_resolved(arch_class: &str, kq: &KvQuant) -> Result<(), ResolveEr
                 variant: format!("{kq}"),
             });
         }
-        // Symmetric WHT-4 K + tq4 V (`KvQuant::TurboSym4`) is
+        // Symmetric 4-bit Lloyd-Max K + tq4 V (`KvQuant::TurboSym4`) is
         // the PPL-218→8641 disaster path on Qwen MoE (CLAUDE.md hard rule 6).
         // Surface as `QwenMoeKBitsTooLow(4)` so the error class is uniform with
         // the existing Mixed K<8 rejection — same exit code, same hint text.

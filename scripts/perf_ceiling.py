@@ -104,9 +104,10 @@ BF16 = 2  # bytes per bf16 element
 
 # Bytes one scale -- or one norm -- occupies in a GPU-resident iso/rotor ring.
 # Mirror of `SIDEBAND_BYTES` (quant.rs), which reads `KV_SIDEBAND_DTYPE`
-# (storage/quant_k_gpu_ring.rs). It is bf16, not f32: a ring modelled at 4 bytes
-# prices iso at 16.25 bits per value against the stored 12.125 and rotor at
-# 21.75 against 16.25 -- 34% over on both, and on the wrong side of bf16 for iso.
+# (storage/quant_k_gpu_ring.rs). It is bf16, not f32: past the dense code plane
+# the sideband is the dominant term -- 4.125 of iso3's 7.125 stored bits per
+# value at head_dim 128 -- so modelling it at 4 bytes would price the family
+# half again over.
 _RING_SIDEBAND_BYTES = 2
 
 DTYPE_BYTES = {
@@ -184,6 +185,16 @@ Q8_GROUP_SIZE = 128
 TURBO_GROUP_SIZE = 32
 
 
+def _plane_bytes(codes_per_row: int, bits: int, n_tokens: int) -> int:
+    """Bytes the dense code plane holds for `n_tokens` rows.
+
+    Mirror of `code_plane::row_words` + `plane_bytes` (quant.rs): codes are
+    packed LSB-first across a row's groups and the row is padded to a whole u32.
+    """
+    words = -(-(codes_per_row * bits) // 32)
+    return words * 4 * n_tokens
+
+
 def _affine_side_bytes(bits: int, group: int, elems: int) -> int:
     """Packed affine bytes for one axis: codes plus the per-group scale+bias."""
     if group <= 0:
@@ -232,10 +243,10 @@ _ISO = {"Iso3", "Iso4", "Iso3Sym", "Iso4Sym", "IsoKOnly3", "IsoKOnly4"}
 # seeds the ring from the prefill CPU blocks and then drops them
 # (`drop_blocks_when_ring_live_iso_*`, kvcache/update.rs), so the ring is the
 # sole resident copy from the first fused decode step. `Iso3` / `Iso4` have no
-# ring path and would hold the CPU-block form, 3.98x larger (48.25 bits/value
-# against the ring's 12.125 at head_dim 128 -- the blocks carry f32 scales, a
-# replicated f32 quaternion per group and an f32 norm). Mirrors
-# `SideStore::IsoRing` vs `SideStore::IsoBlocks`.
+# ring path and would hold the CPU-block form, 6.07x larger (43.25 bits/value
+# against the ring's 7.125 at head_dim 128 -- the same code plane, but the
+# blocks carry f32 scales, a replicated f32 quaternion per group and an f32
+# norm). Mirrors `SideStore::IsoRing` vs `SideStore::IsoBlocks`.
 _ISO_RING = {"Iso3Sym", "Iso4Sym", "IsoKOnly3", "IsoKOnly4"}
 _ROTOR = {"Rotor3", "Rotor4", "Rotor3Sym", "Rotor4Sym", "RotorKOnly3",
           "RotorKOnly4", "RotorK3Asym", "RotorK4Asym"}
@@ -301,19 +312,23 @@ def _side_bytes(c: Codec, bits: int, elems: int, n_tokens: int, head_dim: int,
         groups = elems // TURBO_GROUP_SIZE
         stored = groups * 4 * 4 + (elems // 2) * 4 + groups * 2 * 4
     elif uses_family and c.kind in _ISO:
-        # Ring-backed: a 4B code word plus one sideband scale per quaternion
-        # group, and one sideband norm per token. Block-backed: the host `Vec`
-        # form, whose scale, norm and the 16B quaternion it replicates per group
-        # are all f32 and not the ring's dtype (`SideStore::IsoBlocks`).
+        # Ring-backed: the row's dense code plane -- one code per value, `bits`
+        # each -- plus one sideband scale per quaternion group and one sideband
+        # norm per token. Block-backed: the host `Vec` form, same plane, but its
+        # scale, norm and the 16B quaternion it replicates per group are all f32
+        # and not the ring's dtype (`SideStore::IsoBlocks`).
+        plane = _plane_bytes(head_dim, bits, n_tokens)
         if c.kind in _ISO_RING:
-            stored = ((elems // 4) * (4 + _RING_SIDEBAND_BYTES)
+            stored = (plane + (elems // 4) * _RING_SIDEBAND_BYTES
                       + n_tokens * _RING_SIDEBAND_BYTES)
         else:
-            stored = (elems // 4) * (4 + 4 + 16) + n_tokens * 4
+            stored = plane + (elems // 4) * (4 + 16) + n_tokens * 4
     elif uses_family and c.kind in _ROTOR:
-        # group size 3: per-token ceil(head_dim/3), NOT elems/3
-        groups = -(-head_dim // 3) * n_tokens
-        stored = (groups * (4 + _RING_SIDEBAND_BYTES)
+        # group size 3: per-token ceil(head_dim/3), NOT elems/3. Three codes per
+        # group -- the grade-1 components, the only ones stored.
+        n_groups = -(-head_dim // 3)
+        stored = (_plane_bytes(n_groups * 3, bits, n_tokens)
+                  + n_groups * n_tokens * _RING_SIDEBAND_BYTES
                   + n_tokens * _RING_SIDEBAND_BYTES)
     else:
         codes = elems * bits // 8

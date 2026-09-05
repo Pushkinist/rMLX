@@ -8,17 +8,12 @@ uint grp   = gid % n_grp;
 float scale = scales_in[gid];
 float norm  = norms_in[gid];
 
-uint word = codes_in[gid * ROTOR4_WPG];
-float rots[8];
-for (uint e = 0u; e < ROTOR4_MV; e++) {
-    uint shift = e * 4u;
-    uint idx   = (word >> shift) & 0xFu;
-    rots[e]    = ROTOR4_CB[idx] * scale;
-}
-
-float c1 = rots[1];
-float c2 = rots[2];
-float c3 = rots[3];
+// ── Read the three stored grade-1 codes out of the dense plane ───────────
+uint row_base = token * cp_row_words(n_grp);
+cp_group_t g  = cp_read_group(codes_in, row_base, grp);
+float c1      = ROTOR4_CB[g.x] * scale;
+float c2      = ROTOR4_CB[g.y] * scale;
+float c3      = ROTOR4_CB[g.z] * scale;
 
 uint r_base = grp * 4u;
 float s     = rotors_in[r_base + 0u];

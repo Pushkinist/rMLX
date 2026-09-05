@@ -485,7 +485,7 @@ fn resident_growth_over_decode(
 /// constant. What this loop grows by is the packed **K** view's own
 /// prefix-sized materialisation, and that term scales with the K codec's bit
 /// width and its sideband planes where the V term scales with `sizeof(bf16)` —
-/// so it differs per codec, measured at 886 per mille for iso3 against 1144 for
+/// so it differs per codec, measured at 574 per mille for iso3 against 676 for
 /// rotor3. `floor_band` is that measurement, per caller. Pinning it makes
 /// K-side drift a named failure here rather than silent margin eaten out of the
 /// bound above.
@@ -522,8 +522,8 @@ fn iso_decode_does_not_copy_the_v_mirror() {
     }
     let cache = KvCache::with_quant_max_seq(KvQuant::IsoKOnly3, MAX_SEQ);
     let probe = resident_growth_over_decode("iso3", cache, iso_flash_decode_dispatch_count);
-    // Measured 886 per mille of one V prefix copy.
-    assert_growth_holds_no_v_prefix("iso3", &probe, 750..=1000);
+    // Measured 574 per mille of one V prefix copy.
+    assert_growth_holds_no_v_prefix("iso3", &probe, 500..=660);
 }
 
 #[test]
@@ -556,9 +556,9 @@ fn rotor_decode_does_not_copy_the_v_mirror() {
         false,
     );
     let probe = resident_growth_over_decode("rotor3", cache, rotor_flash_decode_dispatch_count);
-    // Measured 1144 per mille — rotor3's packed view carries more per token
+    // Measured 676 per mille — rotor3's packed view carries more per token
     // than iso3's, which is why the band is per codec and not shared.
-    assert_growth_holds_no_v_prefix("rotor3", &probe, 1000..=1300);
+    assert_growth_holds_no_v_prefix("rotor3", &probe, 600..=760);
 }
 
 // ── The mirror's valid length is checked in every profile ─────────────────────
@@ -592,7 +592,11 @@ fn a_v_mirror_shorter_than_the_attended_prefix_is_rejected() {
     // undersized dummies would fail earlier and this would pass for the wrong
     // reason.
     let tok = B * kv_seq * shape.kv_h;
-    let codes = u32_array(&vec![0_u32; (tok * n_groups) as usize], &[tok * n_groups]);
+    let code_words = crate::storage::iso_row_words(HEAD_DIM as usize, 3) as i32;
+    let codes = u32_array(
+        &vec![0_u32; (tok * code_words) as usize],
+        &[tok * code_words],
+    );
     let scales = f32_array(&vec![0.0_f32; (tok * n_groups) as usize], &[tok * n_groups]);
     let norms = f32_array(&vec![0.0_f32; tok as usize], &[tok]);
     let q = decode_query(shape, 0xD1);

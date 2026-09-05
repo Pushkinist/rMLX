@@ -11,7 +11,7 @@
 //! Quantized K buffer with **TurboQuant 4-bit** layout: [`QuantKTurbo4`].
 //!
 //! This is the K-side counterpart to [`super::QuantV`] (V-side TurboQuant 4-bit).
-//! The two structs are independent — symmetric WHT-4 K + tq4 V form the new
+//! The two structs are independent — symmetric 4-bit Lloyd-Max K + tq4 V form the new
 //! [`super::KvStorage::TurboSym4`] storage variant.
 //!
 //! The CPU codec ([`crate::turboquant::turbo_quantize_v`] / `turbo_dequantize`)

@@ -262,7 +262,7 @@ fn render_mul_table() -> String {
     reason = "lloyd_gaussian_codebook(3|4) is always Ok; verified by \
               `turbo_codebook_3bit_has_8_entries_monotonic` test in turboquant_tests.rs"
 )]
-fn build_rotor_fused_qk_header(bits: u8) -> String {
+pub(crate) fn build_rotor_fused_qk_header(bits: u8) -> String {
     debug_assert!(
         bits == 3 || bits == 4,
         "rotor fused-QK: bits must be 3 or 4"
@@ -274,8 +274,9 @@ fn build_rotor_fused_qk_header(bits: u8) -> String {
         n_entries,
         "rotor fused-QK: codebook entry count must match 2^BITS"
     );
-    // Unpack width parameters consumed by the shared kernel body: each of the
-    // 8 codes occupies `RF_BITS` bits of the packed u32, masked by `RF_MASK`.
+    // Unpack width parameters consumed by the shared kernel body. The plane's
+    // own reader carries the same width; `RF_BITS` / `RF_MASK` stay for the
+    // body's arithmetic.
     let mask = n_entries as u32 - 1;
 
     let cb_hex: Vec<String> = cb
@@ -300,6 +301,10 @@ fn build_rotor_fused_qk_header(bits: u8) -> String {
         cb_join = cb_hex.join(",\n")
     );
     s.push_str(&render_mul_table());
+    s.push_str(&crate::code_plane::render_msl_code_plane(
+        bits,
+        crate::rotorquant::ROTOR_CODES_PER_GROUP,
+    ));
     s
 }
 
@@ -460,8 +465,11 @@ pub fn rotor_fused_qk_sdpa_generic<const BITS: u8>(
     };
 
     let tok_count: i64 = i64::from(b) * i64::from(kv_h) * i64::from(kv_seq);
-    let codes_total: i64 = tok_count * i64::from(n_groups_i32);
-    let scales_total: i64 = codes_total;
+    // The code plane is dense across the row's groups, so its stride is its own
+    // number; the scale plane stays one entry per group.
+    let codes_total: i64 =
+        tok_count * crate::rotorquant::row_words_for(head_dim_usize, BITS) as i64;
+    let scales_total: i64 = tok_count * i64::from(n_groups_i32);
     let norms_total: i64 = tok_count;
     let rotors_total: i64 = i64::from(n_groups_i32) * (ROTOR_STRIDE as i64);
     let codes_flat = k_codes.reshape(&[codes_total as i32], device)?;

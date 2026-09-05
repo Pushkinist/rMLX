@@ -28,9 +28,8 @@
 //!
 //! # Pack format
 //!
-//! 8 × 4-bit values per u32 (32 bits used). For `ISO4_GS=4`:
-//! `WORDS_PER_GROUP = ceil(4 / 8) = 1` u32 per group. Element `e` maps to
-//! `word = e / 8`, `shift = (e % 8) * 4`.
+//! The dense code plane (see [`crate::code_plane`]): 4 bits per code, packed
+//! across the row's groups, the row padded to a whole u32.
 //!
 //! # Single-process GPU claim
 //!
@@ -40,6 +39,7 @@ use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 use crate::isoquant::FIXED_QUAT;
+use crate::storage::{iso_row_words, ISO4_BITS};
 use crate::storage::{sideband_to_f32_vec, to_sideband_dtype, KV_SIDEBAND_DTYPE};
 use crate::turboquant::lloyd_gaussian_codebook;
 use rmlx_core::error::Result;
@@ -52,17 +52,6 @@ use rmlx_mlx::{Array, Device, Dtype};
 /// Matches [`crate::storage::quant_iso_v4::ISO4_GROUP_SIZE`].
 const ISO4_GROUP_SIZE: usize = 4;
 
-/// 4-bit values per u32 word (32 bits used, 0 wasted — dense pack).
-const VALS_PER_WORD: usize = 8;
-
-/// Words per group for `ISO4_GROUP_SIZE = 4`: ceil(4 / 8) = 1.
-const WORDS_PER_GROUP: usize = ISO4_GROUP_SIZE.div_ceil(VALS_PER_WORD);
-
-const _: () = assert!(
-    WORDS_PER_GROUP == 1,
-    "iso4 MSL kernel assumes 1 word per group; multi-word groups require pack-loop changes"
-);
-
 // ── MSL header builder ────────────────────────────────────────────────────────
 
 /// Generate the MSL header string for the iso4 kernels.
@@ -70,7 +59,7 @@ const _: () = assert!(
 /// Embeds:
 /// - The fixed golden-ratio unit quaternion components (and conjugate).
 /// - The 4-bit Lloyd-Max N(0,1) codebook (16 entries) and 15 decision boundaries.
-/// - `ISO4_CB_MAX`, `ISO4_GS`, `ISO4_VPW`, `ISO4_WPG` constants.
+/// - `ISO4_CB_MAX`, `ISO4_GS` and the dense code plane's reader.
 ///
 /// # Errors
 ///
@@ -167,12 +156,12 @@ fn build_msl_header_iso4() -> Result<String> {
         s,
         "\nconstant float ISO4_CB_MAX = as_type<float>(0x{cb_max_bits:08X}u);\n\
          // Quaternion-block group size (4 elements per group).\n\
-         constant uint  ISO4_GS = {ISO4_GROUP_SIZE}u;\n\
-         // 4-bit values per u32 word (8 vals, 32 bits used — dense pack).\n\
-         constant uint  ISO4_VPW = {VALS_PER_WORD}u;\n\
-         // u32 words per group = ceil(ISO4_GS / ISO4_VPW) = 1 for GS=4.\n\
-         constant uint  ISO4_WPG = {WORDS_PER_GROUP}u;\n"
+         constant uint  ISO4_GS = {ISO4_GROUP_SIZE}u;\n"
     );
+    s.push_str(&crate::code_plane::render_msl_code_plane(
+        ISO4_BITS,
+        ISO4_GROUP_SIZE,
+    ));
     Ok(s)
 }
 
@@ -197,7 +186,7 @@ static ISO4_DEQUANT_KERNEL: OnceLock<Result<MetalKernel>> = OnceLock::new();
 // call.
 static ISO4_KERNEL_HEADER: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 
-fn kernel_header_iso4() -> Result<&'static str> {
+pub(crate) fn kernel_header_iso4() -> Result<&'static str> {
     match ISO4_KERNEL_HEADER.get_or_init(|| build_msl_header_iso4().map_err(|e| e.to_string())) {
         Ok(s) => Ok(s.as_str()),
         Err(msg) => Err(rmlx_core::error::Error::Mlx(format!(
@@ -251,7 +240,7 @@ fn iso4_dequant_kernel() -> Result<&'static MetalKernel> {
 /// # Returns
 ///
 /// `(codes_packed, scales, quaternions, norms)` where:
-/// - `codes_packed`: `u32 [n_tokens * n_groups * WORDS_PER_GROUP]` — 4-bit
+/// - `codes_packed`: `u32 [n_tokens * iso_row_words(head_dim, ISO4_BITS)]` — 4-bit
 ///   indices, 8 per word (dense pack).
 /// - `scales`: `f32 [n_tokens * n_groups]` — per-group scale.
 /// - `quaternions`: `f32 [n_tokens * n_groups * 4]` — per-group unit quaternion.
@@ -320,7 +309,10 @@ pub fn iso_quantize_v4_gpu(
     invoke.add_input(&v_f32)?;
     invoke.add_input(&n_groups_arr)?;
 
-    invoke.add_output_shape(&[(total_groups * WORDS_PER_GROUP) as i32], Dtype::U32)?;
+    invoke.add_output_shape(
+        &[(n_tokens * iso_row_words(head_dim, ISO4_BITS)) as i32],
+        Dtype::U32,
+    )?;
     // scales_out / norms_out at the ring's stored sideband dtype — see
     // `iso_quantize_v3_gpu`.
     invoke.add_output_shape(&[total_groups as i32], KV_SIDEBAND_DTYPE)?;
@@ -395,7 +387,7 @@ pub fn iso_dequantize_v4_gpu(
     let n_tokens = total_groups / n_groups;
     let total_elems = n_tokens * head_dim;
 
-    let expected_codes = total_groups * WORDS_PER_GROUP;
+    let expected_codes = n_tokens * iso_row_words(n_groups * ISO4_GROUP_SIZE, ISO4_BITS);
     let codes_len: usize = codes_packed.shape().iter().map(|&d| d as usize).product();
     if codes_len != expected_codes {
         return Err(rmlx_core::error::Error::Quant(format!(
@@ -506,7 +498,7 @@ pub fn iso4_gpu_outputs_to_cpu(
         quats.extend_from_slice(&FIXED_QUAT);
     }
 
-    let expected_codes = total_groups * WORDS_PER_GROUP;
+    let expected_codes = n_tokens * iso_row_words(n_groups * ISO4_GROUP_SIZE, ISO4_BITS);
     if codes.len() != expected_codes {
         return Err(rmlx_core::error::Error::Quant(format!(
             "iso4_gpu_outputs_to_cpu: codes len {} != expected {expected_codes}",

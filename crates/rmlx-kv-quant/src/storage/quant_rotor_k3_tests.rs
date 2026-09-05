@@ -272,7 +272,11 @@ fn seed_ring_via_gpu_append(
 ) {
     use rmlx_mlx::{Array, Device, Dtype};
     let n_groups = n_groups_for(head_dim as usize) as i32;
-    let cps = (kv_h * n_groups * n_tokens) as usize;
+    // The code plane and the scale plane have their own per-token strides.
+    let code_words =
+        crate::rotorquant::row_words_for(head_dim as usize, crate::rotorquant::ROTOR3_BITS) as i32;
+    let cps = (kv_h * code_words * n_tokens) as usize;
+    let sps = (kv_h * n_groups * n_tokens) as usize;
     let nps = (kv_h * n_tokens) as usize;
     // Scales and norms start at 1, not 0. `rotor3_decode` multiplies the
     // reconstruction by both, so a zero in either makes the decoded token
@@ -280,14 +284,14 @@ fn seed_ring_via_gpu_append(
     // compares zeros to zeros and cannot tell a correct ring readback from a
     // zero-padded gap, which is the exact failure these tests exist to catch.
     let codes_b: Vec<u8> = (0..cps).flat_map(|i| (i as u32).to_le_bytes()).collect();
-    let scales_b: Vec<u8> = (0..cps)
+    let scales_b: Vec<u8> = (0..sps)
         .flat_map(|i| ((i + 1) as f32).to_le_bytes())
         .collect();
     let norms_b: Vec<u8> = (0..nps)
         .flat_map(|i| ((i + 1) as f32).to_le_bytes())
         .collect();
     let codes = Array::from_bytes(&codes_b, &[cps as i32], Dtype::U32).expect("codes");
-    let scales = Array::from_bytes(&scales_b, &[cps as i32], Dtype::F32).expect("scales");
+    let scales = Array::from_bytes(&scales_b, &[sps as i32], Dtype::F32).expect("scales");
     let norms = Array::from_bytes(&norms_b, &[nps as i32], Dtype::F32).expect("norms");
     ks.gpu_append(
         &codes,

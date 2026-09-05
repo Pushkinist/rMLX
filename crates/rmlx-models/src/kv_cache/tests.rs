@@ -2099,20 +2099,19 @@ mod tests {
         assert_eq!(saving, 0, "bf16 must never be net-negative against itself");
     }
 
-    /// On one and the same pure-global layer mix at large context, the two
-    /// seed-free K-only codecs land on opposite sides of the advisory: rotor
-    /// fires it and iso does not.
+    /// On a pure-global layer mix at large context, neither seed-free K-only
+    /// codec fires the advisory, and iso saves more than rotor.
     ///
-    /// That is the point of running them together. Both are "a K-only codec
-    /// with a per-group sideband on a mix with no windowed layers", so a
-    /// decision keyed on the layer mix — or on the codec being K-only — would
-    /// have to give them the same answer. The sign comes from each codec's own
-    /// group geometry: rotor spends one `u32` code word per 3 head-dim slots
-    /// (10.67 bits per value before any sideband), iso spends one per 4 (8),
-    /// and both carry the same two sideband planes at the stored sideband
-    /// dtype.
+    /// Both are "a K-only codec with a per-group sideband on a mix with no
+    /// windowed layers", so the ordering between them cannot come from the layer
+    /// mix or from being K-only. It comes from each codec's own group geometry:
+    /// both hold a dense code plane, but rotor shares one scale across 3 head-dim
+    /// slots where iso shares one across 4, which is 1.375 extra bits per value
+    /// of sideband. The advisory's firing side is exercised by
+    /// [`net_negative_warn_on_swa_mix_follows_shared_kv`], on a codec that keeps
+    /// its bf16 mirrors alongside the store.
     #[test]
-    fn net_negative_warn_splits_the_two_k_only_codecs_global_only() {
+    fn the_two_k_only_codecs_both_save_and_iso_saves_more_global_only() {
         // All-global mix (no windowed layers), large context.
         let layers: Vec<KvLayerShape> = (0..16)
             .map(|_| KvLayerShape {
@@ -2126,15 +2125,18 @@ mod tests {
         assert_eq!(n_global, 16);
         assert_eq!(n_win, 0);
         assert!(
-            rotor < 0,
-            "RotorKOnly4 stores 16.25 bits per value against bf16's 16 → net-negative even \
-             all-global; got {rotor}"
+            rotor > 0,
+            "RotorKOnly4 stores 9.75 bits per value against bf16's 16 → net-positive; got {rotor}"
         );
         let (iso, _, _) = kv_codec_net_saving_total(KvQuant::IsoKOnly4, &layers, 16_384, false);
         assert!(
             iso > 0,
-            "IsoKOnly4 stores 12.125 bits per value on the same mix → the advisory must stay \
-             silent; got {iso}"
+            "IsoKOnly4 stores 8.125 bits per value on the same mix → net-positive; got {iso}"
+        );
+        assert!(
+            iso > rotor,
+            "iso's coarser scale cadence must leave it ahead on the same mix: \
+             iso={iso} rotor={rotor}"
         );
     }
 

@@ -8,6 +8,10 @@ uint heads_per_kv = dims[4];
 uint n_tiles      = dims[5];
 uint has_mask     = dims[6];
 uint n_groups     = dims[7];
+// Words the dense code plane holds per row. Loop-invariant, and the
+// per-lane decode below runs once per KV token, so it is derived here
+// rather than inside the decode.
+uint row_words = cp_row_words(n_groups);
 // V's own sequence extent, which may exceed `kv_seq`: the caller hands over the
 // whole bf16 mirror allocation rather than a `..kv_seq` slice of it, so that no
 // partial-slice view has to be made row-contiguous before dispatch.
@@ -70,7 +74,8 @@ for (uint t = tile_start; t < tile_end; t++) {
     // block fits one u32), so it stays in registers with no threadgroup stage.
     uint kv_tok = (b * kv_seq + t) * kv_h + kv_h_idx;
 
-    float k_val = if_decode_k_lane(codes, scales, norms, kv_tok, n_groups, tid);
+    float k_val =
+        if_decode_k_lane(codes, scales, norms, kv_tok, n_groups, row_words, tid);
 
     // ── QK dot via simdgroup reduction ───────────────────────────────
     // simd_sum folds each simdgroup's 32 lanes with no threadgroup barrier and
