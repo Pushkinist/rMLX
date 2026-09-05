@@ -640,7 +640,7 @@ impl Eagle3Drafter {
         device: Device,
     ) -> Result<(Array, u32)> {
         // (1) Roll drafter KV cache back to pre-round state.
-        self.truncate_cache(pre_round_offset);
+        self.truncate_cache(pre_round_offset)?;
 
         // (2) Build token sequence: accepted draft prefix + correction.
         let n = accepted + 1;
@@ -768,10 +768,11 @@ impl Eagle3Drafter {
     }
 
     /// Truncate the drafter cache to `n` positions (partial-accept rollback).
-    pub fn truncate_cache(&mut self, n: i32) {
+    pub fn truncate_cache(&mut self, n: i32) -> Result<()> {
         if self.cache.offset() >= n {
-            self.cache.truncate_to(n);
+            self.cache.truncate_to(n)?;
         }
+        Ok(())
     }
 }
 
@@ -1070,7 +1071,8 @@ pub fn eagle3_generate_greedy(
                 &[1, 1, 1],
                 device,
             )?;
-            let corr_logits = verifier.logits_from_hidden(&h_corr, device)?;
+            // `v_final_hidden` is final-normed by `forward_verify_capture_hot`.
+            let corr_logits = verifier.logits_from_final_hidden(&h_corr, device)?;
             let corr_am = argmax(&corr_logits, -1, device)?;
             corr_am.eval()?;
             let corr_bytes = corr_am.to_bytes()?;

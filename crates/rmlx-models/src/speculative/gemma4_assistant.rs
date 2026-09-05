@@ -736,6 +736,19 @@ pub fn mtp_assistant_generate_greedy(
             "mtp_assistant_generate_greedy: block_size must be >= 2".into(),
         ));
     }
+    // Which round loop runs is decided by the drafter snapshot's `model_type`
+    // alone, so a `gemma4_assistant` drafter can be handed any verifier. This
+    // loop conditions the drafter on the verifier's own final-normed hidden and
+    // reads its K/V directly, neither of which means anything across
+    // architectures — so the pair is refused here, at the entry, rather than
+    // deeper in a shape mismatch.
+    if !matches!(verifier, Architecture::Gemma4(_)) {
+        return Err(Error::Model(format!(
+            "mtp_assistant_generate_greedy: the Gemma4 assistant round loop needs a Gemma4 \
+             verifier and this one is {}",
+            verifier.arch_class()
+        )));
+    }
     let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
 
     // Same constant the verifier resolves — a spec pair must not run two
@@ -856,6 +869,11 @@ pub fn mtp_assistant_generate_greedy(
         verify_input.extend_from_slice(&draft_tokens);
         let v_k = verify_input.len();
 
+        // Read before the forward: it is the position the rollback returns to,
+        // and reading it afterwards makes it a function of how far each layer
+        // happened to advance.
+        let pre_round_offset = caches.iter().map(KvCache::offset).max().unwrap_or(0);
+
         let t0 = Instant::now();
         let (v_hidden, new_sliding, new_full, _off) =
             verifier.forward_hidden_states_shared_kv(&verify_input, v_k, &mut caches, device)?;
@@ -903,15 +921,19 @@ pub fn mtp_assistant_generate_greedy(
         // -- Phase D: rollback + next-round setup. ---------------------------
         // The verifier consumed v_k positions; valid prefix = prev + accept + 1
         // (the correction v_tokens[accept] is a prediction, not yet processed).
-        let v_offset_before = caches[0].offset();
-        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
-        for c in &mut caches {
-            // KV-shared layers read another layer's K/V and never advance their
-            // own cache (offset stays 0); truncating them would assert n>offset.
-            // Only roll back caches that actually accumulated this round's keys.
-            if c.offset() >= v_target {
-                c.truncate_to(v_target);
-            }
+        let v_target = pre_round_offset + accept as i32 + 1;
+        let rejected = v_k as i32 - (accept as i32 + 1);
+        if rejected > 0 {
+            super::rollback_round_caches(
+                verifier,
+                &mut caches,
+                None,
+                None,
+                &verify_input,
+                pre_round_offset,
+                v_target,
+                device,
+            )?;
         }
 
         // Next hidden = verifier penultimate at the accepted position, then
@@ -927,16 +949,14 @@ pub fn mtp_assistant_generate_greedy(
         hidden = verifier.apply_final_norm(&hidden_slice, device)?;
         b = v_tokens[accept];
 
-        // Shared K/V for the next round: re-read from the just-advanced cache.
-        // On full accept the verify-call K/V is valid as-is; on partial accept
-        // we truncated, so the verify-call K/V tail is stale — re-derive cheaply
-        // by re-running a zero-length probe is overkill; instead the shared K/V
-        // is the verifier's last-layer accumulated K/V which the truncate_to
-        // already trimmed in the cache. The verify call returned the *pre-trim*
-        // K/V; slice it to v_target length to match.
-        let kv_keep = v_target; // absolute length of valid keys after trim
-        sliding_kv = slice_kv_len(&new_sliding, kv_keep, device)?;
-        full_kv = slice_kv_len(&new_full, kv_keep, device)?;
+        // Shared K/V for the next round. The verify call returned the
+        // *pre-rollback* K/V, so the rejected drafts are still on its tail;
+        // drop exactly those. Counting from the tail rather than slicing to an
+        // absolute length is what makes this right for both layer types: a
+        // full-attention layer's K/V is the whole sequence, a sliding layer's
+        // is a window that does not start at position 0.
+        sliding_kv = drop_kv_tail(&new_sliding, rejected, device)?;
+        full_kv = drop_kv_tail(&new_full, rejected, device)?;
         kv_offset = v_target;
 
         tracing::debug!(
@@ -944,7 +964,7 @@ pub fn mtp_assistant_generate_greedy(
             accept,
             num_draft = draft_tokens.len(),
             emitted_total = emitted.len(),
-            v_offset_before,
+            pre_round_offset,
             v_target,
             "mtp assistant round"
         );
@@ -980,16 +1000,17 @@ pub fn mtp_assistant_generate_greedy(
     Ok(emitted)
 }
 
-/// Slice a shared `(K, V)` pair to the first `keep` key positions (axis 2).
-/// `[1, n_kv, kv, hd] -> [1, n_kv, keep, hd]`. No-op when already <= keep.
+/// Drop the last `drop` key positions (axis 2) from a shared `(K, V)` pair.
+/// `[1, n_kv, kv, hd] -> [1, n_kv, kv - drop, hd]`. No-op when `drop <= 0`.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
-fn slice_kv_len(kv: &(Array, Array), keep: i32, device: Device) -> Result<(Array, Array)> {
+fn drop_kv_tail(kv: &(Array, Array), drop: i32, device: Device) -> Result<(Array, Array)> {
     let do_slice = |a: &Array| -> Result<Array> {
         let s = a.shape();
-        if s[2] <= keep {
+        let keep = s[2] - drop.max(0);
+        if keep >= s[2] {
             return a.try_clone();
         }
         a.slice(

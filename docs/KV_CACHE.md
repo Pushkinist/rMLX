@@ -294,6 +294,37 @@ never allocates its `KvStorage` (mlx-lm's reference keeps SWA bf16 too —
 `RotatingKVCache.to_quantized` raises). The bound therefore applies at every
 codec, not only at the default.
 
+### Rolling the SWA ring back
+
+`KvCache::truncate_to(n)` is the rollback a speculative round runs after a
+partial acceptance, and a rotating ring can serve it in exactly two states.
+
+- **Before the first wrap** (`offset < max_size`) every position ever written is
+  still at its own slot, so the rollback is a move of the write pointer. This is
+  mlx-lm's `is_trimmable` (`cache.py:542-543`).
+- **After a wrap, while the buffer is in temporal order** — the state
+  `update_concat` leaves it in, holding `max_size + s - 1` positions for a write
+  of `s`, precisely so every token in the block sees a full window. Those are the
+  newest positions in order, so dropping the last `n` is lossless exactly while
+  what is left still covers the window the rolled-back offset needs. A
+  block-verify write can therefore always be rolled back over its own rejected
+  tail, which is at most `s - 1` long.
+
+A ring left in **rotated** order by single-token writes past the wrap cannot: its
+newest slots hold the positions they overwrote. `truncate_to` returns an error
+there naming the layer and the distance, and `KvCache::can_truncate_to(n)` is the
+predicate it implements — one predicate, so a caller's gate and the operation
+cannot drift apart. The gemma4 partial-prefix path asks first and takes the
+re-prefill route; a speculative round loop has no second route and lets the
+failure surface.
+
+mlx-lm's `trim_prompt_cache` silently returns 0 for the refused case, which is
+safe for its caller because it re-prefills what it could not roll back. It is not
+safe for a round loop: the other layers do roll back, and the ring is left
+holding the rejected drafts at an offset the rest of the stack has left behind.
+That is what `docs/SPEC_ANSWER_EQUIVALENCE.md` records as the first of the two
+defects the answer-equivalence gate found.
+
 ### `resident_bytes` counts the live-inference KV (filled prefix, not ceiling)
 
 `KvCache::resident_bytes()` reports the bytes of the K/V that **actually serves

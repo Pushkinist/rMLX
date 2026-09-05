@@ -197,12 +197,14 @@ impl PromptCacheEntry for TestEntry {
         &[]
     }
 
-    fn truncate_kv_to(&mut self, prefix_len: usize) {
+    fn truncate_kv_to(&mut self, prefix_len: usize) -> Result<()> {
         self.truncated_to.set(Some(prefix_len));
+        Ok(())
     }
 
-    fn truncate_kv_to_block(&mut self, block_count: usize) {
+    fn truncate_kv_to_block(&mut self, block_count: usize) -> Result<()> {
         self.truncated_to.set(Some(block_count * BLOCK_TOKENS));
+        Ok(())
     }
 
     fn kv_bytes(&self) -> u64 {
@@ -416,6 +418,10 @@ impl PromptCacheEntry for RealEntry {
     clippy::unwrap_used,
     reason = "test-only: fixture caches are constructed just above; deep_clone/eval are infallible on this CPU K8V8 fixture"
 )]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: an unreachable rollback failure is the defect the test reports"
+)]
 fn default_truncate_and_kv_bytes_over_real_caches() {
     // 4 full blocks of tokens, caches each holding 4*BLOCK_TOKENS positions.
     let seq = (4 * BLOCK_TOKENS) as i32;
@@ -426,7 +432,8 @@ fn default_truncate_and_kv_bytes_over_real_caches() {
     assert!(before > 0, "filled real caches must report non-zero bytes");
 
     // Truncate to 1 block (256 positions) via the DEFAULT body.
-    e.truncate_kv_to(BLOCK_TOKENS);
+    e.truncate_kv_to(BLOCK_TOKENS)
+        .expect("a full-attention entry rolls back to any prefix");
     for kv in e.kv_caches() {
         assert_eq!(
             kv.offset(),
@@ -444,7 +451,9 @@ fn default_truncate_and_kv_bytes_over_real_caches() {
     // no panic, bytes are zero.
     let mut empty = RealEntry::new(make_ids(4 * BLOCK_TOKENS), 0, 2, 0);
     assert_eq!(empty.kv_bytes(), 0, "never-filled caches hold no bytes");
-    empty.truncate_kv_to(BLOCK_TOKENS); // must not panic (offset == 0 guard)
+    empty
+        .truncate_kv_to(BLOCK_TOKENS)
+        .expect("the offset == 0 guard skips a never-filled cache");
     for kv in empty.kv_caches() {
         assert_eq!(kv.offset(), 0, "guard skipped the never-filled cache");
     }
@@ -862,6 +871,10 @@ fn over_cap_refusal_preserves_existing_slots() {
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: an unreachable rollback failure is the defect the test reports"
+)]
 fn long_prompt_block_aligned_partial_hit() {
     let prompt_a: Vec<u32> = make_ids(16 * BLOCK_TOKENS); // 4096 tokens
     let mut cache: PromptCache<TestEntry> = PromptCache::new(4);
@@ -879,7 +892,9 @@ fn long_prompt_block_aligned_partial_hit() {
 
     // Block-aligned truncation lands at 3840 tokens.
     let mut cloned = cache.slots[slot_idx].entry.deep_clone().unwrap();
-    cloned.truncate_kv_to_block(block_count);
+    cloned
+        .truncate_kv_to_block(block_count)
+        .expect("a full-attention entry rolls back to a block boundary");
     assert_eq!(
         cloned.truncated_to.get(),
         Some(15 * BLOCK_TOKENS),
@@ -1372,7 +1387,9 @@ fn partial_hit_truncates_to_matched_block_boundary() {
     assert_eq!(blocks, 3, "exactly 3 leading blocks match");
 
     let mut cloned = cache.slots[idx].entry.deep_clone().unwrap();
-    cloned.truncate_kv_to_block(blocks);
+    cloned
+        .truncate_kv_to_block(blocks)
+        .expect("a full-attention entry rolls back to a block boundary");
     assert_eq!(
         cloned.truncated_to.get(),
         Some(3 * BLOCK_TOKENS),

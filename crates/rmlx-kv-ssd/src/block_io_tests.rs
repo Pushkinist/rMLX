@@ -4309,7 +4309,8 @@ fn iso_sym_truncate_keeps_ring_tail() {
 
     // Truncate into the ring-only tail and confirm dequant still rebuilds it.
     let keep = prefill + steps - 3;
-    c.truncate_to(keep);
+    c.truncate_to(keep)
+        .expect("a full-attention store rolls back to any prefix");
     let (_k2, v_after, seq_after, _, _) = iso_sym3_probe(&c);
     assert_eq!(seq_after, keep, "shape[2] lowered to the truncation point");
     assert_eq!(
@@ -4397,7 +4398,8 @@ fn rotor_sym_truncate_keeps_ring_tail() {
     // Truncate into the ring-only tail (below the last CPU block, inside the
     // ring-held region) and confirm dequant still rebuilds the kept prefix.
     let keep = prefill + steps - 3;
-    c.truncate_to(keep);
+    c.truncate_to(keep)
+        .expect("a full-attention store rolls back to any prefix");
     let (_k2, v_after, seq_after, _, _) = rotor_sym3_probe(&c);
     assert_eq!(seq_after, keep, "shape[2] lowered to the truncation point");
     assert_eq!(

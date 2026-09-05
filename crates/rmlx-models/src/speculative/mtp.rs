@@ -157,10 +157,10 @@ impl MtpDrafter {
     /// grown — but that is a fill the caller's accounting did not predict, and
     /// silently skipping it lets a slot-vs-position gap open one step at a time
     /// and show up only as a quietly decaying accept rate. Say so.
-    pub fn truncate_to(&mut self, target: i32) {
+    pub fn truncate_to(&mut self, target: i32) -> Result<()> {
         for c in &mut self.caches {
             if c.offset() >= target {
-                c.truncate_to(target);
+                c.truncate_to(target)?;
             } else {
                 tracing::warn!(
                     target_positions = target,
@@ -170,6 +170,7 @@ impl MtpDrafter {
                 );
             }
         }
+        Ok(())
     }
 
     /// Project one `(token_embed, hidden)` pair through the `fc` + pre-fc norms.
@@ -240,7 +241,9 @@ impl MtpDrafter {
             // Project + run the head decoder layer(s) -> next hidden [1,1,H].
             let h_next = self.forward_token(&tok_embed, &h_prev, offset)?;
             // Re-use the verifier LM head to pick the next draft token (greedy).
-            let logits = verifier.logits_from_hidden(&h_next, self.device)?;
+            // `forward_token` ends with the sidecar's own final norm, so the
+            // verifier's norm must not be applied a second time.
+            let logits = verifier.logits_from_final_hidden(&h_next, self.device)?;
             let next = argmax(&logits, -1, self.device)?;
             next.eval()?;
             let id = u32::from_le_bytes(next.to_bytes()?[..4].try_into().unwrap());
@@ -569,9 +572,12 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
 /// `_speculative_walk_deferred_greedy`).
 ///
 /// `target_hidden` is the verifier's penultimate hidden at positions
-/// `[carry, d0, d1, ...]` — shape `[1, n_draft+1, H]`. For each position the
-/// verifier logits are re-derived from the hidden (deferred — only until the
-/// first reject) and compared greedily against the draft. Returns
+/// `[carry, d0, d1, ...]` — shape `[1, n_draft+1, H]`, captured **before** the
+/// final norm, which is why the logits go through
+/// [`Architecture::logits_from_hidden`] and not its already-normed counterpart.
+/// For each position the verifier logits are re-derived from the hidden
+/// (deferred — only until the first reject) and compared greedily against the
+/// draft. Returns
 /// `(accepted, new_tokens)` where `new_tokens` are the verifier-confirmed token
 /// ids to emit (accepted prefix + one correction/bonus), capped at `budget`.
 #[allow(
@@ -889,7 +895,7 @@ pub fn mtp_generate_greedy(
         // above). Keeping only `accept` would drop the last accepted draft's KV
         // every round, silently degrading draft accept-rate.
         let d_target = draft_start + accept as i32 + 1;
-        drafter.truncate_to(d_target);
+        drafter.truncate_to(d_target)?;
 
         // Next-round conditioning: the verifier hidden at the newly accepted
         // bonus slot (= position `accept` of the captured penultimate hidden).

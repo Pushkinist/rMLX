@@ -52,6 +52,7 @@ pub(super) struct RotatingSnapshot {
     pub(super) max_size: i32,
     pub(super) keep: i32,
     pub(super) idx: i32,
+    pub(super) stream: Option<Device>,
 }
 
 /// Internal state for a rotating bf16 KV cache.
@@ -63,6 +64,32 @@ pub(super) struct RotatingState {
     pub(super) max_size: i32,
     pub(super) keep: i32,
     pub(super) idx: i32,
+    /// The stream the buffers above were last written on. A rollback slices
+    /// them and runs on the same one, which is why the ring records it instead
+    /// of every `truncate_to` caller carrying a device it otherwise never uses.
+    /// `None` until the first write, when there is nothing to slice.
+    pub(super) stream: Option<Device>,
+}
+
+/// The first `keep` positions of a `[B, kv_h, S, D]` ring buffer.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the ndim check above establishes four axes, so shape[0..4] are in bounds"
+)]
+fn slice_leading(v: &Array, keep: i32, device: Device) -> Result<Array> {
+    let shape = v.shape();
+    if shape.len() != 4 {
+        return Err(Error::Mlx(format!(
+            "RotatingKvCache::slice_leading expected 4-D tensor, got ndim={}",
+            shape.len()
+        )));
+    }
+    v.slice(
+        &[0, 0, 0, 0],
+        &[shape[0], shape[1], keep, shape[3]],
+        &[1i32; 4],
+        device,
+    )
 }
 
 impl RotatingState {
@@ -85,6 +112,7 @@ impl RotatingState {
             max_size: _,
             keep: _,
             idx: _,
+            stream: _,
         } = self;
         crate::bytes::opt_filled_seq_bytes(keys.as_ref(), filled)
             + crate::bytes::opt_filled_seq_bytes(values.as_ref(), filled)
@@ -98,6 +126,7 @@ impl RotatingState {
             max_size,
             keep: 0,
             idx: 0,
+            stream: None,
         }
     }
 
@@ -106,27 +135,99 @@ impl RotatingState {
         self.values = None;
         self.offset = 0;
         self.idx = 0;
+        self.stream = None;
     }
 
-    /// Lossless rollback by `n` positions, mirroring mlx-lm
-    /// `RotatingKVCache.is_trimmable` + `trim` (`cache.py:542-549`).
+    /// Whether [`Self::trim`] can roll this ring back by `n` positions without
+    /// losing a position the window would still need.
     ///
-    /// Returns the number of positions actually rolled back. mlx-lm's
-    /// `is_trimmable` is `self.offset < self.max_size` — the ring buffer is
-    /// rollable iff it has not yet wrapped. After a wrap, the original
-    /// pre-wrap K/V have been overwritten; mlx-lm's `trim_prompt_cache`
-    /// silently returns 0 in that case (`cache.py:109-111`). This port
-    /// matches that exact behaviour: returns 0 (no-op) when not trimmable.
-    pub(super) fn trim_lossless(&mut self, n: i32) -> i32 {
-        if self.offset >= self.max_size {
-            // Not trimmable — see mlx-lm `is_trimmable`. Caller treats this
-            // as `trim_prompt_cache returned 0`.
-            return 0;
+    /// Two regimes are rollable, and they are the two the ring can be left in:
+    ///
+    /// - **Before the first wrap** (`offset < max_size`), every position ever
+    ///   written is still in the buffer at its own slot, so any rollback is a
+    ///   move of the write pointer. This is mlx-lm's `is_trimmable`
+    ///   (`cache.py:542-543`).
+    /// - **After a wrap, while the buffer is in temporal order** — which is the
+    ///   state [`Self::update_concat`] leaves it in, holding `max_size + s - 1`
+    ///   positions for a write of `s`. Those are the newest positions in order,
+    ///   so dropping the last `n` of them is lossless exactly while what is left
+    ///   still covers the window the rolled-back offset needs. A block-verify
+    ///   write of `s` positions can therefore always be rolled back over its own
+    ///   rejected tail, which is at most `s - 1` long. Rolling the whole block
+    ///   back is one position too far and is refused — a caller that needs it
+    ///   (a recurrent round loop replaying from its pre-round offset) has no
+    ///   route through here.
+    ///
+    /// A ring left in rotated order by a single-token write
+    /// (`update_in_place` past the wrap) is **not** rollable: the newest slots
+    /// hold the positions they overwrote, and those are gone.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the ring's K/V are always [B, kv_h, S, D], so the sequence axis is shape[2]"
+    )]
+    pub(super) fn can_trim(&self, n: i32) -> bool {
+        if n <= 0 {
+            return true;
         }
-        let n = n.min(self.offset);
+        if n > self.offset {
+            return false;
+        }
+        if self.offset < self.max_size {
+            return true;
+        }
+        let (Some(keys), Some(_)) = (self.keys.as_ref(), self.stream) else {
+            return false;
+        };
+        let len = keys.shape()[2];
+        self.idx == len && len - n >= (self.offset - n).min(self.max_size)
+    }
+
+    /// Roll the ring back by `n` positions. Returns `false` and leaves the ring
+    /// untouched when that cannot be done losslessly — see [`Self::can_trim`].
+    ///
+    /// Not to be confused with [`Self::trim`], the mlx-lm `_trim` port that
+    /// drops the ring's *oldest* positions to make room for a write.
+    ///
+    /// mlx-lm's `trim_prompt_cache` silently returns 0 for the case this
+    /// refuses (`cache.py:109-111`). A silent no-op is safe for its caller,
+    /// which re-prefills what it could not roll back; it is not safe for a
+    /// speculative round loop, where the other layers do roll back and the ring
+    /// is left holding the rejected drafts at an offset the rest of the stack
+    /// has left behind.
+    pub(super) fn roll_back(&mut self, n: i32) -> Result<bool> {
+        if !self.can_trim(n) {
+            return Ok(false);
+        }
+        if n <= 0 {
+            return Ok(true);
+        }
+        if self.offset >= self.max_size {
+            // `can_trim` admits this branch only with a stream recorded, so a
+            // missing one is a broken invariant and says so — reporting it as a
+            // refusal would blame the ring's order for a bookkeeping fault.
+            let device = self.stream.ok_or_else(|| {
+                Error::Mlx(
+                    "RotatingKvCache::roll_back: a post-wrap rollback was admitted with no \
+                     recorded stream to slice the ring on"
+                        .to_owned(),
+                )
+            })?;
+            // Temporal order: the newest `n` positions are the last `n` slots.
+            let keep = self.idx - n;
+            self.keys = match &self.keys {
+                Some(k) => Some(slice_leading(k, keep, device)?),
+                None => None,
+            };
+            self.values = match &self.values {
+                Some(v) => Some(slice_leading(v, keep, device)?),
+                None => None,
+            };
+            self.idx = keep;
+        } else {
+            self.idx -= n;
+        }
         self.offset -= n;
-        self.idx -= n;
-        n
+        Ok(true)
     }
 
     /// Deep (refcount) clone of the ring.
@@ -171,6 +272,7 @@ impl RotatingState {
             max_size: self.max_size,
             keep: self.keep,
             idx: self.idx,
+            stream: self.stream,
         })
     }
 
@@ -194,6 +296,7 @@ impl RotatingState {
         self.max_size = snap.max_size;
         self.keep = snap.keep;
         self.idx = snap.idx;
+        self.stream = snap.stream;
         Ok(())
     }
 
@@ -208,6 +311,7 @@ impl RotatingState {
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
+        self.stream = Some(device);
         let s = new_k.shape()[2];
         if s == 1 {
             self.update_in_place(new_k, new_v, device)

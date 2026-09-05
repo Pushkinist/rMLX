@@ -616,7 +616,9 @@ fn ring_only_tail_truncate_then_decode(quant: KvQuant) {
 
     // Roll back to prefill + keep (partial-accept), then decode one more token.
     let m = prefill + keep;
-    cache.truncate_to(m);
+    cache
+        .truncate_to(m)
+        .expect("a full-attention store rolls back to any prefix");
     assert_eq!(
         cache.offset(),
         m,
