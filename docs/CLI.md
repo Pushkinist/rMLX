@@ -103,7 +103,7 @@ mutually exclusive.
 | `--prompt-cache-slots` | usize | 4 | Number of prompt-cache slots for multi-slot prefix matching. Set to `1` for legacy single-slot exact-match behaviour. **`0` disables the prompt cache**: no snapshot is ever stored, so every request runs a full prefill. It is a real state, not a one-slot cache — see `docs/PROMPT_CACHE.md` §Zero slots. A request carrying an `X-Session-Id` header widens this number by one slot per active session (session KV-reuse); `0` is not widened — a disabled cache stays disabled. |
 | `--draft-model` | path | — | The drafter snapshot for speculative decoding: a sidecar head (`mtp` / `dflash` / `eagle3`) or a smaller full model of the verifier's family (`two_model`). Which one it is is read from its `config.json` — see `docs/SPECULATIVE.md` § "Which drafter a snapshot is". Must be a **different snapshot** from `--model`: a draft that is the verifier is refused at load, because it doubles the resident weights for no speedup. A full draft model must carry the verifier's tokenizer, checked id by id before either model loads. |
 | `--draft-kind` | `mtp \| dflash \| eagle3 \| two_model` | (from the snapshot) | Names the drafter kind for a `--draft-model` whose `config.json` declares none. Requires `--draft-model`. Refused when it contradicts what the snapshot declares. Env: `MLX_VLM_DRAFT_KIND`. |
-| `--draft-block-size` | usize | 4 | Tokens proposed per speculative round, capped by the drafter's own `block_size` (3 for both shipped Qwen3.5-family MTP sidecars, which carry no such key). Env: `MLX_VLM_DRAFT_BLOCK_SIZE`. |
+| `--draft-block-size` | usize ≥ 2 | 5 | Speculative round block: tokens the verifier scores per round, its own token included, so the drafter proposes one fewer — the same number for every drafter kind and the one `decode_config` records. Refused below 2 at parse time. Capped by a sidecar's own `block_size` (3 for both shipped Qwen3.5-family MTP sidecars, which carry no such key). Env: `MLX_VLM_DRAFT_BLOCK_SIZE`. |
 | `--max-tokens-cap` | u32 | `1048576` | Per-request `max_tokens` ceiling. Requests exceeding this receive HTTP 400. Only lowers the structural 1 048 576-token ceiling. |
 | `--max-timeout-secs` | u64 | 600 | Server-startup wall-clock timeout cap per request in seconds. `0` disables. |
 | `--require-smoke-probe` | bool flag | off | Run 8-token smoke probe on every model load; reject `BrokenPunctLoop` / `BrokenNan` results with HTTP 503. In practice only `BrokenPunctLoop` fires: every path that can see a NaN logit row now aborts the request where it is detected, so no `ProbeStep` reaching the classifier carries a non-zero `nan_count`. A NaN surfaces as a failed request with an `error = %e` / `nan_count` event, not as a smoke verdict. |
@@ -1428,7 +1428,7 @@ persistent shell configuration.
 | `RMLX_YARN_ORIGINAL_MAX` | `--yarn-original-max` | (checkpoint's declared `original_max_position_embeddings`, else `max_position_embeddings`) | Optional companion to `RMLX_YARN_FACTOR`: the pre-extension context size the scaling interpolates from. Flag wins. |
 | `RMLX_PROMPTS_DIR` | `--prompts-dir` | `<repo>/prompts/` | Directory containing prompt JSON files used by `rmlx baseline` and bench scripts. Flag wins. |
 | `MLX_VLM_DRAFT_KIND` | `--draft-kind` | — | Drafter kind, for a `--draft-model` whose `config.json` declares none. Values: `mtp`, `dflash`, `eagle3`, `two_model`. Flag wins. |
-| `MLX_VLM_DRAFT_BLOCK_SIZE` | `--draft-block-size` | `4` | Draft block size (tokens per speculative round). Flag wins. |
+| `MLX_VLM_DRAFT_BLOCK_SIZE` | `--draft-block-size` | `5` | Speculative round block, verifier token included; ≥ 2. Flag wins. |
 
 ### Internal / advanced (not needed for normal use)
 
@@ -1522,14 +1522,14 @@ rmlx serve \
 rmlx serve \
   --model /path/to/gemma-4-e4b-it-mxfp8 \
   --draft-model /path/to/gemma-4-e2b-it-mxfp8 \
-  --draft-block-size 4
+  --draft-block-size 5
 
 # Serve from a registry with a sidecar drafter, naming the kind explicitly
 rmlx serve \
   --registry ./registry.json \
   --draft-model /path/to/draft-snapshot \
   --draft-kind eagle3 \
-  --draft-block-size 4
+  --draft-block-size 5
 ```
 
 ### Inspect a snapshot

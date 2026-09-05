@@ -47,7 +47,7 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
-pub use draft_kind::DraftKind;
+pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 pub(crate) use round_stats::{RoundStats, SpecLoop};
 
@@ -140,7 +140,21 @@ fn same_snapshot(a: &Path, b: &Path) -> bool {
 /// them. Every id both sides carry must still name the same piece; only the
 /// tail is allowed to differ, and only by this much. It is llama.cpp's
 /// `SPEC_VOCAB_MAX_SIZE_DIFFERENCE`, so the two engines admit the same pairs.
+///
+/// An id in that tail is one the verifier can emit and the draft's tokenizer
+/// never named; it is fed back to the draft as context and indexes an
+/// embedding row there. That row exists — untrained, not out of bounds — only
+/// because [`SpeculativeDispatcher::new`] pins the two `vocab_size` values
+/// equal. The tolerance depends on that check.
 const VOCAB_TAIL_TOLERANCE: usize = 128;
+
+/// The largest token id a tokenizer may carry and still be compared here.
+///
+/// The comparison walks every id up to the smaller side's last one, so a
+/// stray sentinel at an enormous id would turn model load into a spin over
+/// the whole span. No tokenizer this backend loads comes within an order of
+/// magnitude of this.
+const VOCAB_ID_CEILING: u32 = 1 << 22;
 
 /// The vocabulary a snapshot's `tokenizer.json` declares, added tokens included.
 fn snapshot_vocab(dir: &Path) -> Result<HashMap<String, u32>> {
@@ -148,6 +162,26 @@ fn snapshot_vocab(dir: &Path) -> Result<HashMap<String, u32>> {
     let tokenizer = tokenizers::Tokenizer::from_file(&path)
         .map_err(|e| Error::Model(format!("load tokenizer {}: {e}", path.display())))?;
     Ok(tokenizer.get_vocab(true))
+}
+
+/// `vocab` inverted to id order, refusing an id two pieces claim.
+///
+/// `get_vocab(true)` merges the added tokens into the model vocabulary by
+/// piece, and nothing there promises the result is injective. Letting the
+/// `collect` pick a winner would make the verdict depend on hash order.
+fn vocab_by_id<'a>(side: &str, vocab: &'a HashMap<String, u32>) -> Result<BTreeMap<u32, &'a str>> {
+    let mut by_id: BTreeMap<u32, &str> = BTreeMap::new();
+    for (piece, id) in vocab {
+        if let Some(other) = by_id.insert(*id, piece.as_str()) {
+            return Err(Error::SpeculativePairing {
+                reason: format!(
+                    "the {side} tokenizer names token id {id} twice, as {other:?} and \
+                     {piece:?} — a draft proposal of that id has no single meaning"
+                ),
+            });
+        }
+    }
+    Ok(by_id)
 }
 
 /// Whether the draft's tokenizer can stand in for the verifier's.
@@ -164,25 +198,29 @@ fn snapshot_vocab(dir: &Path) -> Result<HashMap<String, u32>> {
 /// stop decided by the verifier alone, and the draft only ever sees ids.
 ///
 /// # Errors
-/// [`Error::SpeculativePairing`], naming the first id whose piece differs, or
-/// the size of a tail the tolerance does not cover.
+/// [`Error::SpeculativePairing`], naming the first id whose piece differs, the
+/// size of a tail the tolerance does not cover, an id two pieces claim, or an
+/// id past [`VOCAB_ID_CEILING`].
 pub(crate) fn vocab_pairing_verdict(
     verifier: &HashMap<String, u32>,
     draft: &HashMap<String, u32>,
 ) -> Result<()> {
-    let by_id = |vocab: &HashMap<String, u32>| -> BTreeMap<u32, String> {
-        vocab
-            .iter()
-            .map(|(piece, id)| (*id, piece.clone()))
-            .collect()
-    };
-    let (v, d) = (by_id(verifier), by_id(draft));
+    let v = vocab_by_id("verifier", verifier)?;
+    let d = vocab_by_id("draft", draft)?;
     let (Some(v_last), Some(d_last)) = (v.keys().next_back(), d.keys().next_back()) else {
         return Err(Error::SpeculativePairing {
             reason: "a tokenizer.json on one side declares no vocabulary".to_owned(),
         });
     };
     let shared_end = (*v_last).min(*d_last);
+    if shared_end >= VOCAB_ID_CEILING {
+        return Err(Error::SpeculativePairing {
+            reason: format!(
+                "both tokenizers carry token id {shared_end}, past the {VOCAB_ID_CEILING} this \
+                 comparison walks — not a vocabulary this backend recognises"
+            ),
+        });
+    }
     for id in 0..=shared_end {
         let (vp, dp) = (v.get(&id), d.get(&id));
         if vp != dp {
@@ -197,7 +235,8 @@ pub(crate) fn vocab_pairing_verdict(
             });
         }
     }
-    let tail = v.range(shared_end + 1..).count() + d.range(shared_end + 1..).count();
+    let tail_start = shared_end.saturating_add(1);
+    let tail = v.range(tail_start..).count() + d.range(tail_start..).count();
     if tail > VOCAB_TAIL_TOLERANCE {
         return Err(Error::SpeculativePairing {
             reason: format!(

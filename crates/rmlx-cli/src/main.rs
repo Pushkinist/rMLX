@@ -85,6 +85,21 @@ impl From<DraftKindArg> for rmlx_models::DraftKind {
     }
 }
 
+/// `--draft-block-size` at parse time: the engine's floor, refused before a
+/// model loads rather than on the first request after two have.
+fn parse_draft_block_size(s: &str) -> Result<usize, String> {
+    let block: usize = s
+        .parse()
+        .map_err(|e| format!("not a whole number of tokens: {e}"))?;
+    if block < rmlx_server::MIN_DRAFT_BLOCK_SIZE {
+        return Err(format!(
+            "a block of {block} leaves no room for a draft token; it must be at least {}",
+            rmlx_server::MIN_DRAFT_BLOCK_SIZE
+        ));
+    }
+    Ok(block)
+}
+
 /// CLI value-enum wrapper for [`rmlx_models::prefix_index::PrefixIndexKind`].
 ///
 /// review MEDIUM-3: lets clap reject garbage values at parse-time
@@ -610,11 +625,11 @@ enum Cmd {
         /// Values: mtp, dflash, eagle3, two_model
         #[arg(long, value_enum, requires = "draft_model", env = "MLX_VLM_DRAFT_KIND")]
         draft_kind: Option<DraftKindArg>,
-        /// Number of tokens the draft model proposes per speculative round.
-        ///
-        /// Must be ≥ 1. Default 4 when `--draft-model` is set.
+        /// Speculative round block: tokens the verifier scores per round, its
+        /// own token included, so the drafter proposes one fewer. The same
+        /// number for every drafter kind. Must be ≥ 2. Default 5.
         /// Env: `MLX_VLM_DRAFT_BLOCK_SIZE` (fallback when flag is absent).
-        #[arg(long, value_name = "N", env = "MLX_VLM_DRAFT_BLOCK_SIZE")]
+        #[arg(long, value_name = "N", env = "MLX_VLM_DRAFT_BLOCK_SIZE", value_parser = parse_draft_block_size)]
         draft_block_size: Option<usize>,
         /// Per-request `max_tokens` ceiling. Requests with a higher value
         /// receive HTTP 400 `invalid_request_error` instead of being silently
@@ -2134,10 +2149,12 @@ fn main() -> Result<()> {
                 return Err(anyhow::anyhow!("--image-max-tokens must be > 0"));
             }
             // projects.toml loading + cap resolution wired in run_serve.
+            // `draft_kind_flag`, not `draft_kind`: the resolved kind is
+            // logged under that name by the generator once the snapshot is read.
             if let Some(dp) = draft_model.as_deref() {
                 info!(
                     draft_model = %dp.display(),
-                    draft_kind = ?draft_kind,
+                    draft_kind_flag = ?draft_kind,
                     draft_block_size = ?draft_block_size,
                     "speculative decoding — draft flags"
                 );

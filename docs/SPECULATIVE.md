@@ -533,8 +533,10 @@ pair resolved by slug.
 snapshot's own `config.json` like every other kind: a registered architecture
 there is a full model. `rmlx serve --model <verifier> --draft-model <draft>`
 is the whole invocation; `--draft-kind two_model` is accepted and says the same
-thing. `--draft-block-size` is `K`, the tokens the draft proposes per round
-(default 4).
+thing. `--draft-block-size` is the round block — the verifier's own token plus
+the drafted ones, default 5 — so the draft proposes one fewer; it means the
+same on every drafter kind, and `RoundStats.block_size` records that one
+number whichever loop ran.
 
 **What is checked at load, and why it is the tokenizer.** A mismatched pair
 does not fail — it serves. The draft proposes ids, the verifier scores them as
@@ -598,9 +600,14 @@ probability at each step; `draft_decode_n` today batches its argmaxes and
 syncs once per round, so that is one host readback per draft token, the same
 cost the stochastic loop already pays. Not implemented here.
 
-**Measured** (temperature 0, `--kv-quant none`, `--max-ctx 8192`, 128 tokens,
-one warmup and three measured requests, `scripts/spec_bench.sh`), see the
-reference tables below.
+**Measured** (temperature 0, `--kv-quant none`, `--max-ctx 8192`, block 5, 128
+tokens, one warmup and three measured requests, `scripts/spec_bench.sh`), rows
+in `runs.db` under `decode_config = two_model/block=5`: `gemma-4-e4b-it-mxfp8`
+drafted by `gemma-4-e2b-it-mxfp8` runs at 72.95 TPS against 83.12 with no
+drafter (accept rate 0.66, 3.56 tokens/round); `Qwen3.8-27B-mxfp8` drafted by
+`ornith-1.0-9b-mxfp8-mlx` at 10.71 against 18.89 (accept rate 0.36, 51.5 ms of
+rollback per round on the GDN pair). Neither pair pays at this block; both
+reproduce the no-drafter arm's text.
 
 ### Gemma4 Assistant Drafter
 
@@ -760,7 +767,7 @@ carry `draft_model` too (`docs/CLI.md` § Profiles), and runs the same way.
 |------|--------|---------|-------------|
 | `--draft-model <PATH>` | directory | (none) | The drafter snapshot: a sidecar head or a smaller full model. Which one it is is read from its `config.json`. |
 | `--draft-kind <KIND>` | `mtp`, `dflash`, `eagle3`, `two_model` | (from the snapshot) | Names the kind for a snapshot whose `config.json` declares none. Requires `--draft-model`. Refused when it contradicts what the snapshot declares. |
-| `--draft-block-size <N>` | integer ≥ 1 | 4 | Tokens the drafter proposes per round. Upper-bounded by a sidecar's own `block_size`; an MTP sidecar config without that key takes the loader default of 3, which is what both shipped Qwen3.5-family sidecars do. |
+| `--draft-block-size <N>` | integer ≥ 2 | 5 | Round block: tokens the verifier scores per round, its own token included, so the drafter proposes one fewer. One meaning for every kind, and the `block_size` every `done` line and `decode_config` records. Refused below 2 at parse time. Upper-bounded by a sidecar's own `block_size`; an MTP sidecar config without that key takes the loader default of 3, which is what both shipped Qwen3.5-family sidecars do. |
 
 Environment variable fallbacks: `MLX_VLM_DRAFT_KIND` and
 `MLX_VLM_DRAFT_BLOCK_SIZE` for `--draft-kind` and `--draft-block-size`
@@ -771,7 +778,7 @@ To disable speculative decoding omit `--draft-model`; there is no
 
 ### Which drafter a snapshot is
 
-`rmlx_models::DraftKind::from_declaration` reads the draft's `architectures[0]`
+`rmlx_models::Declared::from_snapshot` reads the draft's `architectures[0]`
 and `model_type` — both, because export tools set one or the other:
 
 | Declaration | Kind |
@@ -779,15 +786,18 @@ and `model_type` — both, because export tools set one or the other:
 | `architectures[0]` contains `Eagle3` (`LlamaForCausalLMEagle3`, over `model_type = llama`) | `eagle3` |
 | `architectures[0]` contains `DFlash` (`DFlashDraftModel`, `DFlash2DraftModel`, over `model_type = qwen3`) | `dflash` |
 | `model_type = gemma4_assistant` / `Gemma4Assistant*`, or `qwen3_5_mtp` on either field (the Qwen3.5-family sidecars ship no `architectures` at all) | `mtp` |
-| a registered architecture (`Gemma4ForConditionalGeneration`, `Qwen3_5ForConditionalGeneration`, …) | `two_model` |
-| anything else | none — `--draft-kind` is required, and is the only reason the flag exists |
+| a registered generative architecture (`Gemma4ForConditionalGeneration`, `Qwen3_5ForConditionalGeneration`, …) | `two_model` — an inference from the registry, not a marker the snapshot carries |
+| anything else, a registered encoder (`JinaEmbeddingsV4Model`) included | none — `--draft-kind` is required, and is the only reason the flag exists |
 
 The order matters: DFlash and EAGLE-3 declare a plain family `model_type`
 under their own architecture name, so the architecture is read first. A flag
-that names a kind the snapshot does not declare is refused at load with both
-sides named (`engine::speculative::decide_draft_kind`), because no loader can
-build a snapshot as a kind it is not and the tensor-name error it would die
-with later names neither.
+that contradicts a sidecar marker is refused at load with both sides named
+(`engine::speculative::decide_draft_kind`), because no loader can build a
+snapshot as a kind it is not and the tensor-name error it would die with later
+names neither. The registry inference is not a marker and yields to the flag:
+the registry is edited whenever a model is supported, and an entry added for
+some other reason must not turn a working `--draft-kind mtp` run into a
+refusal.
 
 Before this rule existed the kind came from `--draft-kind` alone, and
 `--draft-model` required it; the two-model loops, selected by the *absence* of
@@ -824,7 +834,7 @@ is the Gemma4 `mtp` drafter.
 rmlx serve \
   --model   /path/to/gemma-4-e4b-it-mxfp8 \
   --draft-model /path/to/gemma-4-e2b-it-mxfp8 \
-  --draft-block-size 4
+  --draft-block-size 5
 
 # Gemma4 assistant speculative (verifier + dedicated assistant drafter):
 # the draft is the *-assistant-bf16 snapshot, which declares itself `mtp`.

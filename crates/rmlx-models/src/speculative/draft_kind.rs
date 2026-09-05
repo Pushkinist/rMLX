@@ -3,8 +3,6 @@
 
 use std::str::FromStr;
 
-use rmlx_loader::ModelConfig;
-
 /// Speculative drafter kind.
 ///
 /// Decides which loader builds the drafter and which round loop drives the
@@ -17,7 +15,7 @@ use rmlx_loader::ModelConfig;
 /// adapter lives in `rmlx-cli::main` (see `DraftKindArg`).
 #[allow(
     clippy::exhaustive_enums,
-    reason = "closed dispatch enum — adding a kind requires a loader arm in SpeculativeGenerator, a spelling in as_str()/from_str(), and a declaration rule in from_declaration()"
+    reason = "closed dispatch enum — adding a kind requires a Drafter variant in SpeculativeGenerator, a spelling in as_str()/from_str(), and a rule in Declared::from_snapshot()"
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DraftKind {
@@ -42,45 +40,61 @@ impl DraftKind {
             DraftKind::TwoModel => "two_model",
         }
     }
+}
 
-    /// The kind a drafter snapshot declares in its `config.json`, or `None`
-    /// when the declaration identifies no drafter.
+/// What a draft snapshot's `config.json` says about it.
+///
+/// Read by [`Declared::from_snapshot`] from `architectures[0]` and
+/// `model_type` — both, because export tools set one or the other: the Gemma4
+/// assistant carries `Gemma4AssistantForCausalLM` / `gemma4_assistant`, a
+/// Qwen3.5-family MTP sidecar carries `model_type = qwen3_5_mtp` and no
+/// `architectures` at all, DFlash carries `DFlash*DraftModel` over a plain
+/// `qwen3` model type, and EAGLE-3 carries `*Eagle3` over `llama`. The
+/// architecture is read first for that reason.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed: the three answers a declaration can give, consumed by one match in the serve layer"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Declared {
+    /// A drafter-specific marker: this snapshot is this kind and nothing else.
+    Sidecar(DraftKind),
+    /// A registered generative architecture, which a full draft model is.
     ///
-    /// See [`Self::from_declaration`] for the rule.
-    pub fn from_config(cfg: &ModelConfig) -> Option<Self> {
-        let arch = cfg.architectures.first().map_or("", String::as_str);
-        let model_type = cfg
-            .extras
-            .get("model_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        Self::from_declaration(arch, model_type)
-    }
+    /// An inference from the registry, not a marker the snapshot carries, so
+    /// an explicit `--draft-kind` outranks it: the registry is edited whenever
+    /// a model is supported, for reasons that have nothing to do with drafting.
+    FullModel,
+    /// Nothing this crate can name. `--draft-kind` exists for this snapshot.
+    Unknown,
+}
 
-    /// The kind a snapshot's `architectures[0]` / `model_type` pair declares.
-    ///
-    /// Both fields are read because export tools set one or the other: the
-    /// Gemma4 assistant carries `Gemma4AssistantForCausalLM` / `gemma4_assistant`,
-    /// a Qwen3.5-family MTP sidecar carries `model_type = qwen3_5_mtp` and no
-    /// `architectures` at all, DFlash carries `DFlash*DraftModel` over a plain
-    /// `qwen3` model type, and EAGLE-3 carries `*Eagle3` over `llama`. A full
-    /// model declares a registered architecture. A declaration matching none
-    /// of those is `None`: the `--draft-kind` flag exists for that snapshot.
-    pub fn from_declaration(arch: &str, model_type: &str) -> Option<Self> {
+impl Declared {
+    /// The declaration behind an `architectures[0]` / `model_type` pair.
+    pub fn from_snapshot(arch: &str, model_type: &str) -> Self {
         if arch.contains("Eagle3") {
-            Some(DraftKind::Eagle3)
+            Declared::Sidecar(DraftKind::Eagle3)
         } else if arch.contains("DFlash") {
-            Some(DraftKind::DFlash)
+            Declared::Sidecar(DraftKind::DFlash)
         } else if model_type == "gemma4_assistant"
             || arch.contains("Gemma4Assistant")
             || model_type.contains("qwen3_5_mtp")
             || arch.contains("qwen3_5_mtp")
         {
-            Some(DraftKind::Mtp)
-        } else if crate::arch::registry::is_arch_supported(arch) {
-            Some(DraftKind::TwoModel)
+            Declared::Sidecar(DraftKind::Mtp)
+        } else if crate::arch::registry::is_generative_arch(arch) {
+            Declared::FullModel
         } else {
-            None
+            Declared::Unknown
+        }
+    }
+
+    /// The kind this declaration selects on its own, if it selects one.
+    pub fn kind(self) -> Option<DraftKind> {
+        match self {
+            Declared::Sidecar(kind) => Some(kind),
+            Declared::FullModel => Some(DraftKind::TwoModel),
+            Declared::Unknown => None,
         }
     }
 }

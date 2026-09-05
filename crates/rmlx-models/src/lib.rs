@@ -65,7 +65,7 @@ pub mod ssd_tier;
 // `rmlx_kv_quant::{q8_msl,turboquant_msl,planarquant_msl,turbo_flash_msl}`
 // if needed.
 
-pub use arch::{is_arch_supported, read_load_phases, LoadPhases};
+pub use arch::{is_arch_supported, is_generative_arch, read_load_phases, LoadPhases};
 pub use constraint::{ConstraintEngine, NoOpConstraint};
 pub use decode_loop::{ProbeStep, SmokeVerdict};
 // The flat `rmlx_models::{KvCache, KvQuant, LinearAttnCache,
@@ -82,4 +82,4 @@ pub use decode_loop::{ProbeStep, SmokeVerdict};
 pub use kv_bytes::{classify_kv_bytes, KvBytesSample, KvBytesVerdict};
 pub use prompt_cache::CacheStats;
 pub use sampler::{Pcg32, PenaltyConfig, SamplerConfig, TokenLogprobs};
-pub use speculative::{DraftKind, SpeculativeDispatcher};
+pub use speculative::{Declared, DraftKind, SpeculativeDispatcher};

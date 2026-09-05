@@ -75,7 +75,11 @@ drafted by `mlx-community__gemma-4-e2b-it-mxfp8`, both resolved by slug from
 `RMLX_O_MODELS_ROOT`, and pins that one seed reproduces one sequence while a
 second seed and `temperature 0` do not — the Leviathan loop is sampling, and it
 is the loop that ran. It is the only gate on that loop; every alignment suite
-runs greedy.
+runs greedy. It resolves by slug, so `make gpu-test` runs it wherever the
+snapshots are; under `scripts/run_gpu_tests.sh` with shader validation on it
+passes in about 80 s and produces **zero** validation hits, which is why it has
+no entry in `scripts/gpu_validation_census.txt` — the runner fails on an
+unpinned hit, so a clean pass is the evidence, not the absence of a pin.
 
 Point either at a different pair and re-measure both arms before reading a
 failure as a regression.

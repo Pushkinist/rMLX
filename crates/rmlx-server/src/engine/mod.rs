@@ -41,7 +41,7 @@ mod tests;
 
 pub use arch_generator::ArchGenerator;
 pub use generator::{Generator, NotReadyGenerator};
-pub use speculative::SpeculativeGenerator;
+pub use speculative::{SpeculativeGenerator, DEFAULT_DRAFT_BLOCK_SIZE, MIN_DRAFT_BLOCK_SIZE};
 pub use types::{
     admit_request, normalized_to_jinja_tool, Admission, GenerationRequest, GenerationToken,
     GpuAdmission, ModelLoadConfig, NormalizedResponseFormat, NormalizedTool, NormalizedToolChoice,

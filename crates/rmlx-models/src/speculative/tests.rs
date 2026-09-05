@@ -588,3 +588,98 @@ fn vocab_verdict_refuses_a_tail_past_the_tolerance() {
         "exactly the tolerance is admitted"
     );
 }
+
+/// An id two pieces claim has no single meaning, and letting one win by hash
+/// order would make the verdict irreproducible. Refused naming the id and both
+/// pieces, on either side.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_an_id_two_pieces_claim() {
+    let clean = vocab_of(&["<pad>", "<bos>", "a", "b"]);
+    let mut doubled = clean.clone();
+    doubled.insert("B".to_owned(), 3);
+    for (verifier, draft, side) in [(&clean, &doubled, "draft"), (&doubled, &clean, "verifier")] {
+        let msg = vocab_pairing_verdict(verifier, draft)
+            .expect_err("two pieces at id 3")
+            .to_string();
+        assert!(
+            msg.contains(side) && msg.contains("token id 3 twice"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("\"b\"") && msg.contains("\"B\""),
+            "names both pieces: {msg}"
+        );
+    }
+}
+
+/// A vocabulary reaching past the ceiling is refused by name rather than
+/// walked, so one sentinel at a huge id cannot turn model load into a spin.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_an_id_past_the_ceiling() {
+    let mut huge = vocab_of(&["<pad>", "<bos>", "a"]);
+    huge.insert("<sentinel>".to_owned(), VOCAB_ID_CEILING);
+    let msg = vocab_pairing_verdict(&huge, &huge)
+        .expect_err("a shared id at the ceiling")
+        .to_string();
+    assert!(
+        msg.contains(&format!("token id {VOCAB_ID_CEILING}")),
+        "names the id: {msg}"
+    );
+}
+
+/// `load_speculative` runs the verdict before it reads a config or a weight.
+///
+/// Two snapshot directories holding nothing but a `tokenizer.json` each: with
+/// the gate in place the refusal names the differing id; without it the call
+/// fails later, on the missing `config.json`, and says nothing about tokens.
+/// Every other test drives the verdict directly, so this is the one that fails
+/// when the call is deleted.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the tokenizers are literal and the tempdir is this process's own, so a failure to write either names a broken environment"
+)]
+fn load_speculative_refuses_a_foreign_tokenizer_before_reading_weights() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let write = |name: &str, pieces: &[&str]| -> std::path::PathBuf {
+        use tokenizers::models::wordlevel::WordLevel;
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).expect("snapshot dir");
+        let vocab = pieces
+            .iter()
+            .enumerate()
+            .map(|(id, piece)| ((*piece).to_owned(), id as u32))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".to_owned())
+            .build()
+            .expect("literal vocabulary builds a WordLevel model");
+        tokenizers::Tokenizer::new(model)
+            .save(dir.join("tokenizer.json"), false)
+            .expect("write tokenizer.json");
+        dir
+    };
+    let verifier = write("verifier", &["<unk>", "<bos>", "sea", "sky"]);
+    let draft = write("draft", &["<unk>", "<bos>", "sea", "SKY"]);
+
+    let msg = SpeculativeDispatcher::load_speculative(&verifier, &draft, Device::Cpu)
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(
+        msg.contains("token id 3"),
+        "the pair must be refused on the token, before any weight is read: {msg:?}"
+    );
+    assert!(
+        !msg.contains("config.json"),
+        "the refusal reached the config read — the vocabulary gate did not run: {msg:?}"
+    );
+}

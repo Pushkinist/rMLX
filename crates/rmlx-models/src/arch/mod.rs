@@ -25,7 +25,7 @@ pub(crate) mod registry;
 
 pub use loader::{load_model, run_smoke_probe, smoke_prompt_ids, LoadOpts, SMOKE_PROMPT};
 pub use phases::{read_load_phases, LoadPhases};
-pub use registry::{is_arch_supported, KNOWN_ARCHS};
+pub use registry::{is_arch_supported, is_generative_arch, KNOWN_ARCHS};
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};

@@ -55,6 +55,41 @@ fn draft_kind_requires_draft_model() {
     );
 }
 
+/// A block with no room for a draft token is refused at parse time, naming the
+/// floor — not after both models have loaded, on the first request.
+#[test]
+fn draft_block_size_below_the_floor_is_refused_at_parse_time() {
+    for bad in ["0", "1"] {
+        let r = Cli::try_parse_from([
+            "rmlx",
+            "serve",
+            "--model",
+            "/tmp/m",
+            "--draft-model",
+            "/tmp/d",
+            "--draft-block-size",
+            bad,
+        ]);
+        let msg = r.err().map_or_else(String::new, |e| e.to_string());
+        assert!(
+            msg.contains(&format!("at least {}", rmlx_server::MIN_DRAFT_BLOCK_SIZE)),
+            "--draft-block-size {bad} must be refused naming the floor, got: {msg}"
+        );
+    }
+    let floor = rmlx_server::MIN_DRAFT_BLOCK_SIZE.to_string();
+    let r = Cli::try_parse_from([
+        "rmlx",
+        "serve",
+        "--model",
+        "/tmp/m",
+        "--draft-model",
+        "/tmp/d",
+        "--draft-block-size",
+        &floor,
+    ]);
+    assert!(r.is_ok(), "the floor itself must parse, got: {:?}", r.err());
+}
+
 /// Every kind the engine ships is a value the flag accepts, spelled as the
 /// engine spells it in its logs and metrics.
 #[test]
