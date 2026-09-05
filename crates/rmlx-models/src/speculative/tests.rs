@@ -683,3 +683,47 @@ fn load_speculative_refuses_a_foreign_tokenizer_before_reading_weights() {
         "the refusal reached the config read — the vocabulary gate did not run: {msg:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Acceptance walk
+// ---------------------------------------------------------------------------
+
+#[test]
+fn accept_prefix_all_accepted_emits_the_bonus_token() {
+    let (acc, emit) = accept_prefix(&[10, 11, 12, 99], &[10, 11, 12], 8);
+    assert_eq!(acc, 3);
+    assert_eq!(emit, vec![10, 11, 12, 99]);
+}
+
+#[test]
+fn accept_prefix_stops_at_the_first_disagreement_and_emits_the_correction() {
+    let (acc, emit) = accept_prefix(&[10, 11, 55, 0], &[10, 11, 12], 8);
+    assert_eq!(acc, 2);
+    assert_eq!(emit, vec![10, 11, 55]);
+}
+
+#[test]
+fn accept_prefix_emits_only_the_correction_when_nothing_is_accepted() {
+    let (acc, emit) = accept_prefix(&[42, 0, 0], &[10, 11], 8);
+    assert_eq!(acc, 0);
+    assert_eq!(emit, vec![42]);
+}
+
+#[test]
+fn accept_prefix_budget_caps_the_emission_and_not_the_acceptance() {
+    // The round committed three drafts to the caches whatever the token budget
+    // was; a walk that reported two accepts here would leave the KV holding a
+    // position the loop believes it rolled back.
+    let (acc, emit) = accept_prefix(&[10, 11, 12, 99], &[10, 11, 12], 2);
+    assert_eq!(acc, 3);
+    assert_eq!(emit, vec![10, 11]);
+}
+
+#[test]
+fn accept_prefix_without_a_bonus_slot_ends_at_the_last_agreement() {
+    // The verifier's own token count is what bounds the walk: no bonus slot
+    // means no correction to emit, not an out-of-bounds read.
+    let (acc, emit) = accept_prefix(&[10, 11], &[10, 11], 8);
+    assert_eq!(acc, 2);
+    assert_eq!(emit, vec![10, 11]);
+}

@@ -3,7 +3,7 @@
 //! Port of mlx-vlm `mlx_vlm/speculative/drafters/qwen3_5_mtp/qwen3_5_mtp.py`
 //! (`Qwen3_5MTPDraftModel`) and the round-loop in
 //! `mlx_vlm/speculative/mtp.py` (`_mtp_verify_target`,
-//! `_speculative_walk_deferred_greedy`, `_mtp_rounds`).
+//! `_mtp_rounds`).
 //!
 //! # What an MTP drafter is
 //!
@@ -568,68 +568,6 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
 // Round-loop (greedy)
 // ---------------------------------------------------------------------------
 
-/// One greedy MTP acceptance walk over a draft block (port of
-/// `_speculative_walk_deferred_greedy`).
-///
-/// `target_hidden` is the verifier's penultimate hidden at positions
-/// `[carry, d0, d1, ...]` — shape `[1, n_draft+1, H]`, captured **before** the
-/// final norm, which is why the logits go through
-/// [`Architecture::logits_from_hidden`] and not its already-normed counterpart.
-/// For each position the verifier logits are re-derived from the hidden
-/// (deferred — only until the first reject) and compared greedily against the
-/// draft. Returns
-/// `(accepted, new_tokens)` where `new_tokens` are the verifier-confirmed token
-/// ids to emit (accepted prefix + one correction/bonus), capped at `budget`.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
-pub fn walk_deferred_greedy(
-    verifier: &Architecture,
-    target_hidden: &Array,
-    draft_tokens: &[u32],
-    budget: usize,
-    device: Device,
-) -> Result<(usize, Vec<u32>)> {
-    let n_draft = draft_tokens.len();
-    let mut accepted = 0usize;
-    let mut new_tokens: Vec<u32> = Vec::new();
-    let h = verifier.hidden_size() as i32;
-
-    // Iterate one position past `draft_tokens` (the bonus slot); `pos == n_draft`
-    // has no draft token to compare, only a verifier prediction to emit.
-    #[allow(clippy::needless_range_loop)]
-    for pos in 0..=n_draft {
-        let row = target_hidden.slice(
-            &[0, pos as i32, 0],
-            &[1, pos as i32 + 1, h],
-            &[1, 1, 1],
-            device,
-        )?;
-        let logits = verifier.logits_from_hidden(&row, device)?;
-        let am = argmax(&logits, -1, device)?;
-        am.eval()?;
-        let token = u32::from_le_bytes(am.to_bytes()?[..4].try_into().unwrap());
-
-        if pos < n_draft && token == draft_tokens[pos] {
-            accepted += 1;
-            if new_tokens.len() < budget {
-                new_tokens.push(token);
-            }
-            continue;
-        }
-        if new_tokens.len() < budget {
-            new_tokens.push(token);
-        }
-        break;
-    }
-    Ok((accepted, new_tokens))
-}
-
 use crate::decode_loop::ProbeStep;
 
 /// MTP speculative-decoding round-loop (greedy / temp=0).
@@ -638,8 +576,8 @@ use crate::decode_loop::ProbeStep;
 /// structurally: prefill the verifier, capture the penultimate hidden + first
 /// bonus, then per round draft `block_size - 1` tokens via [`MtpDrafter::draft_n`],
 /// verify all `block_size` positions in one cached forward (capturing both
-/// logits and the penultimate hidden), accept the greedy prefix via
-/// [`walk_deferred_greedy`], emit, and roll back the verifier KV (GDN-aware) and
+/// logits and the penultimate hidden), accept the greedy prefix the verifier's
+/// own argmax agrees with, emit, and roll back the verifier KV (GDN-aware) and
 /// the sidecar KV on partial acceptance.
 ///
 /// The verifier is the Qwen3.5/3.6-MoE hybrid (carries GDN linear-attention
@@ -832,7 +770,7 @@ pub fn mtp_generate_greedy(
         let v_k = v_input.len();
 
         let t0 = Instant::now();
-        let (_v_logits, v_hidden) = verifier.forward_verify_capture(
+        let (v_logits, v_hidden) = verifier.forward_verify_capture(
             &v_input,
             v_k,
             &capture_ids,
@@ -840,11 +778,26 @@ pub fn mtp_generate_greedy(
             Some(&mut v_lin),
             device,
         )?;
+        // The verify forward already projected all `v_k` positions through the
+        // LM head. Read that back once, here, rather than re-deriving the head
+        // one position at a time in the acceptance walk: the head is a separate
+        // quantised tensor and each re-derivation is another full read of it
+        // plus another pipeline drain. Reading it inside this span is also what
+        // makes `verifier_ms` the cost of the verify forward rather than the
+        // cost of building its graph — the assistant loop reads its verifier
+        // argmax back at the same point, and the two figures are only
+        // comparable because of it.
+        let v_argmax = argmax(&v_logits, -1, device)?;
+        v_argmax.eval()?;
+        let vb = v_argmax.to_bytes()?;
         verifier_ns += t0.elapsed().as_nanos();
 
-        // -- Phase C: deferred greedy acceptance walk over the penultimate hidden.
-        let (accept, new_tokens) =
-            walk_deferred_greedy(verifier, &v_hidden, &draft_tokens, remaining, device)?;
+        // -- Phase C: greedy acceptance walk over the verifier's own tokens.
+        let mut v_tokens: Vec<u32> = Vec::with_capacity(v_k);
+        for i in 0..v_k {
+            v_tokens.push(u32::from_le_bytes(vb[i * 4..i * 4 + 4].try_into().unwrap()));
+        }
+        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining);
         total_accept += accept;
 
         // -- Emit accepted prefix + 1 correction/bonus. --

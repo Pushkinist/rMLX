@@ -1606,6 +1606,45 @@ fn snapshot_lin(lin: Option<&[LinearAttnCache]>) -> Result<Option<Vec<LinearAttn
     }
 }
 
+/// The greedy acceptance walk over one verified block.
+///
+/// `verifier_tokens[i]` is the verifier's own greedy continuation after
+/// position `i` of the verify input, so the draft proposed for that position is
+/// accepted exactly when the two agree. The walk stops at the first
+/// disagreement.
+///
+/// Returns the number of accepted proposals and the tokens to emit: the agreed
+/// prefix followed by one token the verifier stands behind — its correction at
+/// the disagreement, or, when every proposal held, its bonus token past the last
+/// draft. `budget` caps the emission, not the acceptance: a round that runs out
+/// of token budget still committed the KV it committed, and reporting fewer
+/// accepts than the caches hold is how the two disagree.
+///
+/// `verifier_tokens` carries one position more than `draft_tokens` — the bonus
+/// slot. A shorter one simply ends the walk early, which is the same answer as
+/// disagreeing there.
+pub(crate) fn accept_prefix(
+    verifier_tokens: &[u32],
+    draft_tokens: &[u32],
+    budget: usize,
+) -> (usize, Vec<u32>) {
+    let mut accepted = 0usize;
+    let mut emit: Vec<u32> = Vec::with_capacity(verifier_tokens.len());
+    for (pos, &token) in verifier_tokens.iter().enumerate() {
+        let agreed = draft_tokens.get(pos) == Some(&token);
+        if agreed {
+            accepted += 1;
+        }
+        if emit.len() < budget {
+            emit.push(token);
+        }
+        if !agreed {
+            break;
+        }
+    }
+    (accepted, emit)
+}
+
 /// Roll one speculative round's caches back to `target_offset` after a partial
 /// acceptance — both the full-attention `kv` stack and, when the arch has one,
 /// the GDN recurrent state in `lin`.

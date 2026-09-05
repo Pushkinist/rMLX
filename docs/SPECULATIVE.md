@@ -60,9 +60,9 @@ answer-equivalence gate found. `truncate_to` now returns that refusal, and the
 gemma4-assistant loop reads its rollback target before the verify forward rather
 than off a cache afterwards.
 
-**Whose hidden the acceptance walk scores.** `walk_deferred_greedy` reads the
-verifier's **pre-final-norm** capture, so it goes through
-`Architecture::logits_from_hidden`, which applies the final norm.
+**Which hidden the LM head is fed.** A verify forward's capture is the
+verifier's **pre-final-norm** residual stream, so a caller that projects one goes
+through `Architecture::logits_from_hidden`, which applies the final norm.
 `logits_from_final_hidden` is the head-only counterpart, for callers that hold an
 already-normed hidden: the Qwen capture forwards, the EAGLE-3 full-vocab
 correction, and the two drafters whose own final norm ends their stack. One name
@@ -274,9 +274,9 @@ gates both the FFN-shape probe and the greedy-tracking property. The round-loop
 (`mtp_generate_greedy`) mirrors the DFlash loop structurally: verifier prefill →
 round-0 penultimate-hidden + first-bonus capture → per-round autoregressive
 `draft_n` (RoPE offset = sidecar `_next_position` = verifier prefix length +
-appended count) → one combined verify forward → `walk_deferred_greedy` accept →
-emit → GDN snapshot/restore verifier-KV rollback + sidecar-KV `truncate_to` on
-partial acceptance.
+appended count) → one combined verify forward → `accept_prefix` walk over the
+verifier's own argmax → emit → GDN snapshot/restore verifier-KV rollback +
+sidecar-KV `truncate_to` on partial acceptance.
 
 `draft_n` proposes `block_size - 1` tokens but only ever feeds back `block_size - 2`
 of them, so the last one used to get no KV slot. A full-accept round then commits
@@ -284,8 +284,8 @@ of them, so the last one used to get no KV slot. A full-accept round then commit
 `MtpDrafter::truncate_to` — which skips a layer already shorter than the target —
 absorbed the difference in silence. The gap grew one slot per full-accept round
 and the sidecar acquired a permanent context hole. It cannot corrupt an emitted
-token (every one of those is `walk_deferred_greedy`'s argmax over the verifier's
-own captured hidden, which never consults the drafter), so the only symptom was
+token (every one of those is the verifier's own argmax over its own verify
+forward, which never consults the drafter), so the only symptom was
 accept-rate decay. `draft_n` now runs one more `forward_token` at the end and
 discards the hidden, purely so the last drafted token gets its slot, and the skip
 in `truncate_to` warns instead of passing quietly.
@@ -351,11 +351,20 @@ snapshots are mlx-format, so the split stores weights verbatim — rMLX loads th
 verbatim and applies a plain `rms_norm` (matching the verifier's own RmsNorm),
 adding no centring shift.
 
-Acceptance walk (`walk_deferred_greedy`): for each position from 0 to
-`n_draft` (inclusive), the verifier's hidden at that position is projected
-through the LM head lazily (only until the first reject). On a match, the
-token is accepted. On a mismatch or at position `n_draft`, the verifier's
-prediction at that position is emitted as the correction/bonus. Budget-capped.
+Acceptance walk (`speculative::accept_prefix`, shared with the gemma4-assistant
+loop): the verify forward already projects all `block_size` positions through the
+LM head, so the loop reads that argmax back once and walks it on the host. For
+each position from 0 to `n_draft` (inclusive), the verifier's own token is
+compared with the draft; on a match the draft is accepted, and on a mismatch or
+at position `n_draft` the verifier's token is emitted as the correction/bonus.
+Budget-capped.
+
+The walk used to re-derive the head one position at a time and stop at the first
+reject. That saves head FLOPs and costs a full read of the head tensor — a
+separate quantised matrix, not tied — plus a pipeline drain, per position walked.
+On a bandwidth-bound verifier that is the wrong way round: one batched read of
+the head serves every position, and the block's logits were already in the verify
+forward's graph, dropped unevaluated.
 
 ### DFlash — Draft-Flash Attention (Qwen3.6-MoE target)
 

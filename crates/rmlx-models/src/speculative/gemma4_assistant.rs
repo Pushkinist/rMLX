@@ -889,21 +889,11 @@ pub fn mtp_assistant_generate_greedy(
         }
 
         // -- Phase C: greedy acceptance walk. --------------------------------
-        // v_tokens[i] = verifier prediction after verify_input[i].
-        // Compare v_tokens[i] vs draft_tokens[i] for i in 0..bs-1.
-        let mut accept = 0usize;
-        for i in 0..draft_tokens.len() {
-            if v_tokens[i] == draft_tokens[i] {
-                accept += 1;
-            } else {
-                break;
-            }
-        }
+        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining);
         total_accept += accept;
-        // Emit accepted prefix + 1 correction/bonus: v_tokens[0..=accept].
-        let to_emit = (accept + 1).min(v_tokens.len());
+        // -- Emit accepted prefix + 1 correction/bonus. --
         let mut hit_eos = false;
-        for &id in v_tokens.iter().take(to_emit) {
+        for &id in &new_tokens {
             if emitted.len() >= n_tokens {
                 break;
             }
