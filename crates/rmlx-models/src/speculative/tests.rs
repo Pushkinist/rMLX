@@ -727,3 +727,59 @@ fn accept_prefix_without_a_bonus_slot_ends_at_the_last_agreement() {
     assert_eq!(acc, 2);
     assert_eq!(emit, vec![10, 11]);
 }
+
+// ---------------------------------------------------------------------------
+// Reading the verifier's argmax back
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the fixture buffer is built two lines above with the byte count the call asks for, so an Err here is the assertion failing"
+)]
+fn argmax_tokens_reads_one_id_per_verified_position() {
+    let bytes: Vec<u8> = [7u32, 9, 11].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let got = argmax_tokens(&bytes, 3).expect("three positions, twelve bytes");
+    assert_eq!(got, vec![7, 9, 11]);
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the fixture buffer is built two lines above with the byte count the call asks for, so an Err here is the assertion failing"
+)]
+fn argmax_tokens_stops_at_the_block_and_ignores_a_longer_buffer() {
+    let bytes: Vec<u8> = [7u32, 9, 11].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let got = argmax_tokens(&bytes, 2).expect("two positions asked for");
+    assert_eq!(got, vec![7, 9]);
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the fixture buffer is built two lines above with the byte count the call asks for, so an Err here is the assertion failing"
+)]
+fn argmax_tokens_names_a_short_buffer_instead_of_panicking() {
+    // The read runs once per round. A slice-and-unwrap here aborts the request
+    // with a bounds panic and no mention of the device that came back short.
+    let bytes: Vec<u8> = [7u32, 9].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let err = argmax_tokens(&bytes, 3).expect_err("three positions, eight bytes");
+    let msg = err.to_string();
+    assert!(
+        msg.contains('8') && msg.contains("12") && msg.contains('3'),
+        "the refusal must name the bytes it got, the bytes it needed and the \
+         positions it was reading for, got: {msg}"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the fixture buffer is built two lines above with the byte count the call asks for, so an Err here is the assertion failing"
+)]
+fn argmax_tokens_of_an_empty_block_reads_nothing() {
+    assert_eq!(
+        argmax_tokens(&[], 0).expect("no positions"),
+        Vec::<u32>::new()
+    );
+}

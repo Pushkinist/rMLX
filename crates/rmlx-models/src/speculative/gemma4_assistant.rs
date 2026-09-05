@@ -890,10 +890,7 @@ pub fn mtp_assistant_generate_greedy(
         let round_verify_ns = t0.elapsed().as_nanos();
         verifier_ns += round_verify_ns;
         let t0 = Instant::now();
-        let mut v_tokens: Vec<u32> = Vec::with_capacity(v_k);
-        for i in 0..v_k {
-            v_tokens.push(u32::from_le_bytes(vb[i * 4..i * 4 + 4].try_into().unwrap()));
-        }
+        let v_tokens = super::argmax_tokens(&vb, v_k)?;
 
         // -- Phase C: greedy acceptance walk. --------------------------------
         let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining);

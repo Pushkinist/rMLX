@@ -766,19 +766,7 @@ impl SpeculativeDispatcher {
             let bytes = v_argmax.to_bytes()?;
             verifier_ns += t0.elapsed().as_nanos();
 
-            if bytes.len() < 4 * v_k {
-                return Err(Error::Model(format!(
-                    "spec_generate_greedy_cached: argmax bytes={} expected={}",
-                    bytes.len(),
-                    4 * v_k
-                )));
-            }
-            let mut v_tokens: Vec<u32> = Vec::with_capacity(v_k);
-            for i in 0..v_k {
-                let off = i * 4;
-                let id = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-                v_tokens.push(id);
-            }
+            let v_tokens = argmax_tokens(&bytes, v_k)?;
 
             // -- Phase C: greedy acceptance. ---------------------------
             // v_tokens[i] is the verifier's prediction after the i-th
@@ -1616,6 +1604,37 @@ fn snapshot_lin(lin: Option<&[LinearAttnCache]>) -> Result<Option<Vec<LinearAttn
             Ok(Some(snap))
         }
     }
+}
+
+/// Read a verify forward's `argmax` result back as `k` token ids.
+///
+/// The buffer is checked once, against the position count the caller verified,
+/// before any of it is read. A round loop does this every round, so an
+/// unguarded index here is a per-round panic on an invariant no type carries:
+/// the argmax comes back from the device, and "the device returned fewer bytes
+/// than the block has positions" is a state to name, not to abort on.
+///
+/// Extra trailing bytes are not an error — `k` is what the caller verified and
+/// what it walks.
+pub(crate) fn argmax_tokens(bytes: &[u8], k: usize) -> Result<Vec<u32>> {
+    let want = k * 4;
+    if bytes.len() < want {
+        return Err(Error::Model(format!(
+            "argmax_tokens: the verifier's argmax came back as {} bytes for {k} verified \
+             positions, which needs {want}",
+            bytes.len()
+        )));
+    }
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "chunks_exact(4) yields slices of exactly 4, so these four indices are \
+                  in bounds by the iterator's own contract"
+    )]
+    Ok(bytes
+        .chunks_exact(4)
+        .take(k)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 /// The greedy acceptance walk over one verified block.
