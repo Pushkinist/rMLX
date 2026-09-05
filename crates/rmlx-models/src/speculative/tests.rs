@@ -400,3 +400,89 @@ fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
         );
     }
 }
+
+/// Deterministic `[1, 1, s, 2]` f32 K/V pair for the rollback tests below.
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn rollback_kv(s: i32, base: f32) -> Array {
+    let mut data: Vec<f32> = Vec::with_capacity((s * 2) as usize);
+    for p in 0..s {
+        data.push(base + p as f32);
+        data.push(base + p as f32 + 0.5);
+    }
+    Array::from_f32_slice(&data, &[1, 1, s, 2]).unwrap()
+}
+
+/// A prompt then three decode steps, which leaves a windowed layer rotated and
+/// a plain one able to roll back to anywhere.
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn filled_layer(window: Option<i32>, device: Device) -> KvCache {
+    let mut cache = KvCache::with_quant_max_seq_window(KvQuant::None, 512, window);
+    cache
+        .update(&rollback_kv(6, 0.0), &rollback_kv(6, 100.0), device)
+        .unwrap();
+    for step in 0..3 {
+        let p = (6 + step) as f32;
+        cache
+            .update(&rollback_kv(1, p), &rollback_kv(1, 100.0 + p), device)
+            .unwrap();
+    }
+    cache
+}
+
+/// `truncate_kv_to` moves every layer or none.
+///
+/// A stack left half rolled back is the same desync the ring fix exists to
+/// stop, reached through the failure path instead of through a silent no-op:
+/// the layers that did move sit behind an offset the refusing one still holds,
+/// and no caller can put them back. So the refusal is decided before any layer
+/// is touched, and it names the layer that decided it.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the stack is built with two layers immediately above"
+)]
+#[allow(
+    clippy::panic,
+    reason = "the else-branch of a let-else that only a broken gate can reach"
+)]
+fn a_stack_with_one_layer_that_cannot_roll_back_moves_no_layer() {
+    let device = Device::Cpu;
+    // Layer 0 could reach the target on its own. Layer 1 is a window that
+    // decode writes left rotated, and cannot.
+    let mut stack = vec![filled_layer(None, device), filled_layer(Some(4), device)];
+    assert_eq!((stack[0].offset(), stack[1].offset()), (9, 9));
+    assert!(stack[0].can_truncate_to(8));
+    assert!(!stack[1].can_truncate_to(8));
+
+    let Err(err) = truncate_kv_to(&mut stack, 8) else {
+        panic!("a stack holding a layer that cannot reach 8 must not report success")
+    };
+    assert_eq!(
+        (stack[0].offset(), stack[1].offset()),
+        (9, 9),
+        "the layer that could roll back must not have"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("layer 1"),
+        "the refusal must name the layer: {msg}"
+    );
+    assert!(
+        msg.contains("cannot be rolled back to 8"),
+        "and the target it could not reach: {msg}"
+    );
+
+    // And a target every layer can reach is not refused.
+    assert!(truncate_kv_to(&mut stack, 9).is_ok());
+    assert_eq!((stack[0].offset(), stack[1].offset()), (9, 9));
+}
