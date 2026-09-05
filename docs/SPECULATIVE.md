@@ -424,6 +424,25 @@ On a bandwidth-bound verifier that is the wrong way round: one batched read of
 the head serves every position, and the block's logits were already in the verify
 forward's graph, dropped unevaluated.
 
+**The trade is conditional, not a pure gain.** The head cost is now constant in
+`k` where it was proportional to `accept + 1`. A round that accepts nothing used
+to project one position and now projects all `k` — the same single read of the
+head tensor, `k` times its FLOPs. So it is a large win on high-accept rounds
+against a small loss on low-accept ones, and the measured +1.96% on
+Qwen3.8-27B-4bit was taken at 1.79 to 2.31 tokens per round. It narrows as
+acceptance falls, and a pair that accepts poorly should be measured rather than
+assumed to gain.
+
+**One residual risk, recorded rather than fixed.** The substitution is
+mathematically exact — RMSNorm is per-row, so slicing commutes with it — but the
+head is now one GEMM at `M = k` where it was `k` GEMMs at `M = 1`, and a
+differently tiled reduction can flip an argmax on a near-tie. In a speculative
+loop that changes an emitted token. The evidence against it is one token digest
+across 26 generations on two checkpoints plus the answer-equivalence suite; its
+standing guard is that suite, which skips silently when the snapshots are absent
+while `make ci-perf` reports green. Anyone touching the head path should run it
+deliberately.
+
 ### DFlash — Draft-Flash Attention (Qwen3.6-MoE target)
 
 **Source**: `speculative/dflash.rs`

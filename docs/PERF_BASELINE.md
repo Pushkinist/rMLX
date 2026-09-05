@@ -27,6 +27,28 @@ forward, `events.mlx_nax` (`"present"` / `"absent"` / `"unknown"`, migration
 are self-describing; see `docs/METRICS_DB.md` §3.6. Historical `runs.db`
 rows are likewise not backfilled — that table is append-only.
 
+## Caveat: the sidecar loop's `verifier_ms` changed meaning (2026-09)
+
+The MTP sidecar loop used to close its verify span on an unevaluated forward
+and then re-derive the LM head one position at a time in the acceptance walk,
+so most of the verify forward's cost fell into the residual. It now reads the
+block's argmax back inside the verify span, which is where the gemma4-assistant
+loop always read its own.
+
+Both figures are ingested. **`verifier_ms` and `loop_ms_per_round` rows written
+before and after that change are not comparable**, on the sidecar loop only:
+measured on Qwen3.8-27B-4bit at block 3, `verify_ms_per_round` moved 32.2 →
+41.5 and `loop_ms_per_round` 20.1 → 10.2 for the same work. `decode_tps`,
+`accept_rate` and `tokens_per_round` are unaffected and stay comparable, and
+the gemma4-assistant loop's rows are unaffected in every column. The two loops'
+residuals became comparable with each other at the same commit; before it they
+were produced by different instruments.
+
+Rows also now carry `charged`. A `true` there means the request ran with its
+phases forced at each boundary — a slower, differently scheduled engine — so
+its `verifier_ms`, `loop_ms_per_round` and `decode_tps` describe that run and
+not a normal one. See `docs/SPECULATIVE.md` § "Where a round's time goes".
+
 ## Baseline KV-cache reuse
 
 **Verdict: CORRECT-reuse.** The `rmlx baseline` decode loop appends one new
