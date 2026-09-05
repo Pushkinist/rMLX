@@ -48,6 +48,30 @@ recurrent state in addition to the standard KV cache, rollback requires
 snapshot/restore rather than truncation, because the GDN state has no sequence
 axis.
 
+A round loop's rollback is not only about the store it can slice. A sliding-window
+layer's ring must give back the block tail it just wrote, and it can — see
+`docs/KV_CACHE.md` § "Rolling the SWA ring back" — but only in the state a block
+write leaves it in. It used to refuse silently, keeping the rejected drafts while
+every full-attention layer dropped theirs, which is one of the two defects the
+answer-equivalence gate found. `truncate_to` now returns that refusal, and the
+gemma4-assistant loop reads its rollback target before the verify forward rather
+than off a cache afterwards.
+
+**Whose hidden the acceptance walk scores.** `walk_deferred_greedy` reads the
+verifier's **pre-final-norm** capture, so it goes through
+`Architecture::logits_from_hidden`, which applies the final norm.
+`logits_from_final_hidden` is the head-only counterpart, for callers that hold an
+already-normed hidden: the Qwen capture forwards, the EAGLE-3 full-vocab
+correction, and the two drafters whose own final norm ends their stack. One name
+meant both contracts once, and the arch that did not norm quietly reweighted the
+vocabulary by the norm's weight vector for every caller handing it a raw capture.
+
+**Answer equivalence.** Neither of those defects changed an accept rate enough to
+notice, and neither was visible to the 48-token prefix checks the alignment
+suites run. `crates/rmlx-models/tests/spec_greedy_equivalence.rs` is the gate that
+found them, over 256 generated tokens; `docs/SPEC_ANSWER_EQUIVALENCE.md` is its
+reference.
+
 ```text
 # Initialisation
 prefill verifier + draft on prompt[..-1]
@@ -533,9 +557,8 @@ attends, or mlx-c rejects the broadcast (`mask (1,1,5,kv+1)` vs scores
 `min(window-1, producer_offset) + seq` (rotating), where `producer_offset` is
 the **cache-holding layer's own `KvCache::offset()`** — NOT the model-wide
 `cache_base_offset` (read from the first full-attention cache). Those two can
-desync by one position across a partial-accept verify-block rollback (the
-rotating sliding cache that drives `v_target` rolls back with no-op semantics
-once it wraps), so sizing the mask from `cache_base_offset` produced a mask one
+desync by one position across a partial-accept verify-block rollback, so sizing
+the mask from `cache_base_offset` produced a mask one
 key too long only at non-trivial prompt lengths (window no longer covers the
 whole KV). RoPE still uses the model-wide absolute `offset`; only the mask's
 key dim is bound to the producer's own K. A guard in the producer branch fails

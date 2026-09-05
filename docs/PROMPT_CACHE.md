@@ -325,9 +325,10 @@ pub(crate) enum ReusePolicy {
 want_blocks`) may be taken. The generate loop deep-clones the slot, calls
 `truncate_kv_to_block(best_blocks)`, and re-prefills the tail. There is an
 additional per-slot gate: `Gemma4Entry::can_truncate_to_block` checks whether
-every layer cache is trimmable (`KvCache::is_trimmable`). A SWA
-`RotatingKvCache` whose ring buffer has wrapped is not trimmable; in that
-case the partial path falls back to Miss.
+every layer cache can reach the block boundary
+(`KvCache::can_truncate_to(block_count * BLOCK_TOKENS)`). A SWA
+`RotatingKvCache` whose ring buffer has wrapped cannot give back a whole block;
+in that case the partial path falls back to Miss.
 
 **`ExactOnly`** (Qwen3, Qwen3.5-MoE): any block-level match that is not a
 full-token-equality Exact hit is routed to `CacheLookup::Miss` and triggers a
@@ -523,11 +524,13 @@ layers use `RotatingKvCache`, which is a ring buffer of the last
 `sliding_window` K/V tokens.
 
 **`can_truncate_to_block(block_count)`**: returns true iff every layer cache
-passes `KvCache::is_trimmable`. A SWA cache whose ring has wrapped (i.e.
-`offset >= sliding_window`) is not trimmable — block-aligned truncation
-would silently no-op on SWA layers while trimming full-attention layers,
-desyncing the caches. When `can_truncate_to_block` returns false, the partial
-prefix hit degrades to Miss and the request falls back to full re-prefill.
+passes `KvCache::can_truncate_to(block_count * BLOCK_TOKENS)`. A wrapped SWA
+ring can only be rolled back while it still holds the window the shorter prefix
+attends over, and a cached prompt long enough to wrap it never does over a whole
+block — `truncate_kv_to_block` would then fail on the SWA layers after trimming
+the full-attention ones, desyncing the caches. When `can_truncate_to_block`
+returns false, the partial prefix hit degrades to Miss and the request falls
+back to full re-prefill.
 
 **`is_strict_prefix_of(prompt_ids)`**: returns true iff this entry's full
 token sequence is a strict prefix of `prompt_ids` (i.e. the new prompt

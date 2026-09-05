@@ -50,6 +50,7 @@ areas before touching code:
 | [`docs/SSD_CANARY.md`](docs/SSD_CANARY.md) | SSD KV cross-restart smoke probe |
 | [`docs/PROMPT_CACHE.md`](docs/PROMPT_CACHE.md) | Prompt cache + automatic prefix caching (block hashing, ReusePolicy, prefix index) |
 | [`docs/SPECULATIVE.md`](docs/SPECULATIVE.md) | Speculative decoding (MTP, DFlash, Eagle3 drafters; round-loop; accept-rate gates) |
+| [`docs/SPEC_ANSWER_EQUIVALENCE.md`](docs/SPEC_ANSWER_EQUIVALENCE.md) | Answer equivalence for speculative decoding: the divergence-confidence oracle, why agreement cannot be thresholded |
 | [`docs/SAMPLING.md`](docs/SAMPLING.md) | Per-token sampling (temperature, top-k/p, penalties, thinking budget, constrained decoding) |
 | [`docs/FFI.md`](docs/FFI.md) | rmlx-mlx ↔ mlx-c FFI bridge; MSL kernel surface; unsafe policy |
 | [`docs/METRICS_DB.md`](docs/METRICS_DB.md) | Metrics DB: observations / events / bests; ingest, query, export, deltas |
