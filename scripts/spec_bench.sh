@@ -3,7 +3,7 @@
 #
 # Usage:
 #   bash scripts/spec_bench.sh [--port N] [--dry-run]
-#       [--draft-kind mtp|dflash|eagle3] [--draft-block-size N]
+#       [--draft-kind mtp|dflash|eagle3|two_model] [--draft-block-size N]
 #       [--kv-quant Q] [--max-ctx N] [--tag T]
 #
 # Requires:

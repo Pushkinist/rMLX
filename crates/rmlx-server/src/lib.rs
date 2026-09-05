@@ -66,7 +66,7 @@ pub use admission::{
 };
 pub use engine::{
     ArchGenerator, GenerationRequest, GenerationToken, Generator, ModelLoadConfig,
-    NotReadyGenerator, SpeculativeGenerator,
+    NotReadyGenerator, SpeculativeGenerator, MIN_DRAFT_BLOCK_SIZE,
 };
 pub use keep_alive::{
     parse_duration_spec, policy_from_request_field, DecodeLease, DecodeLeaseGuard, KeepAlivePolicy,

@@ -494,3 +494,192 @@ fn a_stack_with_one_layer_that_cannot_roll_back_moves_no_layer() {
         "a target every layer can reach must move every layer"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Vocabulary pairing
+// ---------------------------------------------------------------------------
+
+/// A literal vocabulary: `pieces[i]` is the piece at id `i`.
+fn vocab_of(pieces: &[&str]) -> HashMap<String, u32> {
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(id, piece)| ((*piece).to_owned(), id as u32))
+        .collect()
+}
+
+/// The pairs `load_speculative` admits: one vocabulary spelled twice, and one
+/// that differs only by a short tail of specials the other side never emits —
+/// the shape a base and an audio release of one family actually ship.
+#[test]
+fn vocab_verdict_admits_identical_and_short_tail_pairs() {
+    let base = vocab_of(&["<pad>", "<bos>", "a", "b", "c"]);
+    assert!(vocab_pairing_verdict(&base, &base).is_ok());
+
+    let mut with_tail = base.clone();
+    for i in 0..7_u32 {
+        with_tail.insert(format!("<|special_{i}|>"), 5 + i);
+    }
+    assert!(vocab_pairing_verdict(&base, &with_tail).is_ok());
+    assert!(
+        vocab_pairing_verdict(&with_tail, &base).is_ok(),
+        "the tolerance is symmetric — either side may carry the tail"
+    );
+}
+
+/// A pair that agrees on size and disagrees on meaning is the case a
+/// `vocab_size` comparison cannot see, and the one that serves garbage rather
+/// than failing. The refusal names the id and both pieces.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_a_piece_that_differs_and_names_it() {
+    let verifier = vocab_of(&["<pad>", "<bos>", "a", "b", "c"]);
+    let draft = vocab_of(&["<pad>", "<bos>", "a", "B", "c"]);
+    let msg = vocab_pairing_verdict(&verifier, &draft)
+        .expect_err("same size, different piece at id 3")
+        .to_string();
+    assert!(msg.contains("token id 3"), "names the id: {msg}");
+    assert!(
+        msg.contains("\"b\"") && msg.contains("\"B\""),
+        "names both pieces: {msg}"
+    );
+
+    // An id one side skips inside the shared range is a difference too, not a
+    // tail: the other side can propose it.
+    let mut holed = verifier.clone();
+    holed.remove("a");
+    let msg = vocab_pairing_verdict(&verifier, &holed)
+        .expect_err("a hole inside the shared range")
+        .to_string();
+    assert!(
+        msg.contains("token id 2") && msg.contains("absent"),
+        "{msg}"
+    );
+}
+
+/// A tail past the tolerance is a different vocabulary, however well the
+/// prefix agrees. The bound is the one llama.cpp admits, so the two engines
+/// accept the same pairs.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_a_tail_past_the_tolerance() {
+    let base = vocab_of(&["<pad>", "<bos>", "a"]);
+    let mut long_tail = base.clone();
+    for i in 0..=(VOCAB_TAIL_TOLERANCE as u32) {
+        long_tail.insert(format!("<|extra_{i}|>"), 3 + i);
+    }
+    let msg = vocab_pairing_verdict(&base, &long_tail)
+        .expect_err("a tail of tolerance + 1 ids")
+        .to_string();
+    assert!(
+        msg.contains(&format!("{} more ids", VOCAB_TAIL_TOLERANCE + 1)),
+        "names the tail size: {msg}"
+    );
+
+    long_tail.remove(&format!("<|extra_{VOCAB_TAIL_TOLERANCE}|>"));
+    assert!(
+        vocab_pairing_verdict(&base, &long_tail).is_ok(),
+        "exactly the tolerance is admitted"
+    );
+}
+
+/// An id two pieces claim has no single meaning, and letting one win by hash
+/// order would make the verdict irreproducible. Refused naming the id and both
+/// pieces, on either side.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_an_id_two_pieces_claim() {
+    let clean = vocab_of(&["<pad>", "<bos>", "a", "b"]);
+    let mut doubled = clean.clone();
+    doubled.insert("B".to_owned(), 3);
+    for (verifier, draft, side) in [(&clean, &doubled, "draft"), (&doubled, &clean, "verifier")] {
+        let msg = vocab_pairing_verdict(verifier, draft)
+            .expect_err("two pieces at id 3")
+            .to_string();
+        assert!(
+            msg.contains(side) && msg.contains("token id 3 twice"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("\"b\"") && msg.contains("\"B\""),
+            "names both pieces: {msg}"
+        );
+    }
+}
+
+/// A vocabulary reaching past the ceiling is refused by name rather than
+/// walked, so one sentinel at a huge id cannot turn model load into a spin.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_an_id_past_the_ceiling() {
+    let mut huge = vocab_of(&["<pad>", "<bos>", "a"]);
+    huge.insert("<sentinel>".to_owned(), VOCAB_ID_CEILING);
+    let msg = vocab_pairing_verdict(&huge, &huge)
+        .expect_err("a shared id at the ceiling")
+        .to_string();
+    assert!(
+        msg.contains(&format!("token id {VOCAB_ID_CEILING}")),
+        "names the id: {msg}"
+    );
+}
+
+/// `load_speculative` runs the verdict before it reads a config or a weight.
+///
+/// Two snapshot directories holding nothing but a `tokenizer.json` each: with
+/// the gate in place the refusal names the differing id; without it the call
+/// fails later, on the missing `config.json`, and says nothing about tokens.
+/// Every other test drives the verdict directly, so this is the one that fails
+/// when the call is deleted.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the tokenizers are literal and the tempdir is this process's own, so a failure to write either names a broken environment"
+)]
+fn load_speculative_refuses_a_foreign_tokenizer_before_reading_weights() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let write = |name: &str, pieces: &[&str]| -> std::path::PathBuf {
+        use tokenizers::models::wordlevel::WordLevel;
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).expect("snapshot dir");
+        let vocab = pieces
+            .iter()
+            .enumerate()
+            .map(|(id, piece)| ((*piece).to_owned(), id as u32))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".to_owned())
+            .build()
+            .expect("literal vocabulary builds a WordLevel model");
+        tokenizers::Tokenizer::new(model)
+            .save(dir.join("tokenizer.json"), false)
+            .expect("write tokenizer.json");
+        dir
+    };
+    let verifier = write("verifier", &["<unk>", "<bos>", "sea", "sky"]);
+    let draft = write("draft", &["<unk>", "<bos>", "sea", "SKY"]);
+
+    let msg = SpeculativeDispatcher::load_speculative(&verifier, &draft, Device::Cpu)
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(
+        msg.contains("token id 3"),
+        "the pair must be refused on the token, before any weight is read: {msg:?}"
+    );
+    assert!(
+        !msg.contains("config.json"),
+        "the refusal reached the config read — the vocabulary gate did not run: {msg:?}"
+    );
+}

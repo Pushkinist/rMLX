@@ -5129,16 +5129,14 @@ gemma4-assistant self-speculative path). Whether any of them can reach a
 - **Bonsai (`Qwen3ForCausalLM`, `kv_h = 8`)** — **reachable.** Its prompt-cache
   `ReusePolicy` is `ExactOnly`, so the partial-prefix trim never fires, but the
   speculative path does. Two reasons, both arch-generic:
-  1. `SpeculativeGenerator::from_snapshots_with_id` takes a fourth,
-     drafter-agnostic branch — `SpeculativeDispatcher::load_speculative` — when
-     `draft_kind` is `None`, and `rmlx-cli`'s serve gate keys on
-     `draft_path.is_some()` alone. `draft_model` has a `projects.toml` profile
-     key while `draft_kind` does not, so `draft_model = Some, draft_kind = None`
-     is reachable and never trips clap's `requires = "draft_kind"` (that only
-     binds CLI-supplied flags). That branch calls plain `load_model` on both
-     sides and `spec_generate_greedy_cached` builds caches from
-     `num_hidden_layers()` with **no arch check**, rolling back through
-     `KvCache::truncate_to`.
+  1. `SpeculativeGenerator::from_snapshots_with_id` takes the `two_model`
+     branch — `SpeculativeDispatcher::load_speculative` — for any
+     `--draft-model` whose `config.json` declares a registered architecture
+     (`docs/SPECULATIVE.md` § "Which drafter a snapshot is"), so a bare
+     `--draft-model <full model>` or a `profiles.toml` `draft_model` reaches
+     it. That branch calls plain `load_model` on both sides and
+     `spec_generate_greedy_cached` builds caches from `num_hidden_layers()`
+     with **no arch check**, rolling back through `KvCache::truncate_to`.
   2. No drafter gates the **verifier** arch at all. The
      `"Qwen3_5MoeForConditionalGeneration"` strings in `speculative/mtp.rs` and
      `speculative/dflash/mod.rs` are error-message text, not architecture

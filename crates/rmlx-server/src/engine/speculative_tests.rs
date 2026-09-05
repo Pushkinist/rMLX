@@ -1,11 +1,175 @@
-//! Unit tests for the `--draft-kind mtp` arch-family dispatch (issue #23).
+//! Unit tests for the load-time drafter routing.
 //!
-//! These cover the pure classifier `classify_mtp_draft` and the rejection
-//! message builder `mtp_reject_reason` — the load-time routing decision that
-//! keeps a plain Gemma4 draft from falling through to the Qwen3.5 MTP sidecar
-//! loader (which would leak a `text_config missing num_experts` error).
+//! `decide_draft_kind` picks the kind from the draft snapshot's declaration and
+//! the optional flag; `classify_mtp_draft` / `mtp_reject_reason` are the
+//! `mtp` family's second-level routing, which keeps a plain Gemma4 draft from
+//! falling through to the Qwen3.5 MTP sidecar loader (which would leak a
+//! `text_config missing num_experts` error).
 
-use super::{classify_mtp_draft, mtp_reject_reason, MtpDraftFamily};
+use super::{
+    classify_mtp_draft, decide_draft_kind, drafted_per_round, mtp_reject_reason, round_block,
+    MtpDraftFamily, DEFAULT_DRAFT_BLOCK_SIZE, MIN_DRAFT_BLOCK_SIZE,
+};
+use rmlx_models::{Declared, DraftKind};
+
+// ── decide_draft_kind ────────────────────────────────────────────────────────
+
+/// A declaration alone selects the kind: this is what makes a bare
+/// `--draft-model` run, for every kind, including the two-model one.
+#[test]
+fn a_declaration_alone_selects_the_kind() {
+    for kind in [DraftKind::Mtp, DraftKind::DFlash, DraftKind::Eagle3] {
+        let declared = Declared::Sidecar(kind);
+        assert_eq!(
+            decide_draft_kind(None, declared, "arch", "type").ok(),
+            Some(kind)
+        );
+        assert_eq!(
+            decide_draft_kind(Some(kind), declared, "arch", "type").ok(),
+            Some(kind),
+            "a flag that agrees with the declaration changes nothing"
+        );
+    }
+    assert_eq!(
+        decide_draft_kind(None, Declared::FullModel, "arch", "type").ok(),
+        Some(DraftKind::TwoModel)
+    );
+}
+
+/// The flag is for a snapshot that declares nothing.
+#[test]
+fn the_flag_names_an_undeclared_snapshot() {
+    assert_eq!(
+        decide_draft_kind(Some(DraftKind::Mtp), Declared::Unknown, "", "").ok(),
+        Some(DraftKind::Mtp)
+    );
+}
+
+/// Nothing named on either side is refused, and the refusal says what the
+/// snapshot declared and what would settle it.
+#[test]
+fn an_undeclared_snapshot_without_a_flag_is_refused() {
+    let msg = decide_draft_kind(None, Declared::Unknown, "FooForCausalLM", "foo")
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(
+        msg.contains("FooForCausalLM") && msg.contains("\"foo\""),
+        "{msg}"
+    );
+    assert!(msg.contains("--draft-kind"), "names the way out: {msg}");
+}
+
+/// A flag that contradicts a sidecar marker is refused rather than obeyed: no
+/// loader can build a snapshot as a kind it is not, and the error it would
+/// die with later names neither side. The refusal names both.
+#[test]
+fn a_flag_that_contradicts_the_declaration_is_refused() {
+    let msg = decide_draft_kind(
+        Some(DraftKind::TwoModel),
+        Declared::Sidecar(DraftKind::Mtp),
+        "Gemma4AssistantForCausalLM",
+        "gemma4_assistant",
+    )
+    .err()
+    .map_or_else(String::new, |e| e.to_string());
+    assert!(
+        msg.contains("--draft-kind two_model"),
+        "names the flag: {msg}"
+    );
+    assert!(
+        msg.contains("a mtp drafter"),
+        "names the declaration: {msg}"
+    );
+    assert!(
+        msg.contains("Gemma4AssistantForCausalLM"),
+        "names the snapshot's own words: {msg}"
+    );
+}
+
+/// The registry's full-model inference yields to an explicit flag. It is not a
+/// marker the snapshot carries, and the registry is edited whenever a model is
+/// supported, so a refusal there would let an unrelated registry edit turn a
+/// working `--draft-kind mtp` run into a hard refusal.
+#[test]
+fn the_flag_outranks_the_registry_inference() {
+    let declared = Declared::from_snapshot("Gemma4ForConditionalGeneration", "gemma4");
+    assert_eq!(
+        declared,
+        Declared::FullModel,
+        "precondition: a registered arch"
+    );
+    assert_eq!(
+        decide_draft_kind(
+            Some(DraftKind::Mtp),
+            declared,
+            "Gemma4ForConditionalGeneration",
+            "gemma4"
+        )
+        .ok(),
+        Some(DraftKind::Mtp)
+    );
+}
+
+/// A sidecar flag over a registered full model is refused before a weight is
+/// read: the snapshot carries no such head, and the loader it would reach
+/// materialises the whole verifier first and then dies on a tensor name that
+/// names neither side. The refusal names both, and the two ways out.
+#[test]
+fn a_sidecar_flag_over_a_full_model_is_refused() {
+    let declared = Declared::from_snapshot("Gemma4ForConditionalGeneration", "gemma4");
+    for kind in [DraftKind::Eagle3, DraftKind::DFlash] {
+        let msg = decide_draft_kind(
+            Some(kind),
+            declared,
+            "Gemma4ForConditionalGeneration",
+            "gemma4",
+        )
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+        assert!(
+            msg.contains(&format!("--draft-kind {kind}")),
+            "names the flag: {msg}"
+        );
+        assert!(
+            msg.contains("Gemma4ForConditionalGeneration") && msg.contains("full model"),
+            "names the snapshot and what it is: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{kind} sidecar")) && msg.contains("two_model"),
+            "names both ways out: {msg}"
+        );
+    }
+}
+
+// ── round block ──────────────────────────────────────────────────────────────
+
+/// One flag value is one round block, whichever drafter runs: the sidecars
+/// take it whole and the two-model loop drafts one fewer and records it back
+/// as `k + 1`. A block too small to hold a draft token is refused by name.
+#[test]
+fn one_flag_value_is_one_round_block() {
+    assert_eq!(round_block(None).ok(), Some(DEFAULT_DRAFT_BLOCK_SIZE));
+    for block in [MIN_DRAFT_BLOCK_SIZE, 5, 16] {
+        assert_eq!(round_block(Some(block)).ok(), Some(block));
+        assert_eq!(
+            drafted_per_round(block) + 1,
+            block,
+            "the two-model loop records k + 1, which must be the block the flag named"
+        );
+    }
+    for block in [0, MIN_DRAFT_BLOCK_SIZE - 1] {
+        let msg = round_block(Some(block))
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
+        assert!(
+            msg.contains(&format!("block size {block}"))
+                && msg.contains(&format!("at least {MIN_DRAFT_BLOCK_SIZE}")),
+            "{msg}"
+        );
+    }
+}
+
+// ── classify_mtp_draft ───────────────────────────────────────────────────────
 
 #[test]
 fn qwen35_mtp_sidecar_routes_to_mtp_drafter() {

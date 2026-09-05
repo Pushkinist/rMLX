@@ -24,6 +24,95 @@ fn default_env_filter_does_not_contain_debug() {
 
 // ── clap parse-time validation ───────────────────────────────────
 
+/// `--draft-model` stands alone: the drafter kind is read from the snapshot.
+/// A `requires = "draft_kind"` here is what made the two-model loop
+/// unreachable from the command line.
+#[test]
+fn draft_model_parses_without_draft_kind() {
+    let r = Cli::try_parse_from([
+        "rmlx",
+        "serve",
+        "--model",
+        "/tmp/m",
+        "--draft-model",
+        "/tmp/d",
+    ]);
+    assert!(
+        r.is_ok(),
+        "--draft-model alone must parse, got: {:?}",
+        r.err()
+    );
+}
+
+/// `--draft-kind` without a draft is meaningless and stays refused.
+#[test]
+fn draft_kind_requires_draft_model() {
+    let r = Cli::try_parse_from(["rmlx", "serve", "--model", "/tmp/m", "--draft-kind", "mtp"]);
+    let msg = r.err().map_or_else(String::new, |e| e.to_string());
+    assert!(
+        msg.contains("--draft-model"),
+        "--draft-kind without --draft-model must be refused naming the missing flag, got: {msg}"
+    );
+}
+
+/// A block with no room for a draft token is refused at parse time, naming the
+/// floor — not after both models have loaded, on the first request.
+#[test]
+fn draft_block_size_below_the_floor_is_refused_at_parse_time() {
+    for bad in ["0", "1"] {
+        let r = Cli::try_parse_from([
+            "rmlx",
+            "serve",
+            "--model",
+            "/tmp/m",
+            "--draft-model",
+            "/tmp/d",
+            "--draft-block-size",
+            bad,
+        ]);
+        let msg = r.err().map_or_else(String::new, |e| e.to_string());
+        assert!(
+            msg.contains(&format!("at least {}", rmlx_server::MIN_DRAFT_BLOCK_SIZE)),
+            "--draft-block-size {bad} must be refused naming the floor, got: {msg}"
+        );
+    }
+    let floor = rmlx_server::MIN_DRAFT_BLOCK_SIZE.to_string();
+    let r = Cli::try_parse_from([
+        "rmlx",
+        "serve",
+        "--model",
+        "/tmp/m",
+        "--draft-model",
+        "/tmp/d",
+        "--draft-block-size",
+        &floor,
+    ]);
+    assert!(r.is_ok(), "the floor itself must parse, got: {:?}", r.err());
+}
+
+/// Every kind the engine ships is a value the flag accepts, spelled as the
+/// engine spells it in its logs and metrics.
+#[test]
+fn every_draft_kind_is_a_flag_value() {
+    for &kind in rmlx_models::DraftKind::ALL {
+        let r = Cli::try_parse_from([
+            "rmlx",
+            "serve",
+            "--model",
+            "/tmp/m",
+            "--draft-model",
+            "/tmp/d",
+            "--draft-kind",
+            kind.as_str(),
+        ]);
+        assert!(
+            r.is_ok(),
+            "--draft-kind {kind} must parse, got: {:?}",
+            r.err()
+        );
+    }
+}
+
 use super::Cli;
 use clap::Parser;
 

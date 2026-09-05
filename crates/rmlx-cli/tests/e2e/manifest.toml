@@ -1229,6 +1229,27 @@ draft_kind = "mtp"
 assert = { kind = "spec_decode", expect = "Paris" }
 tags = ["run2e", "qwen36", "speculative"]
 
+# Two-model drafters: a smaller full model of the verifier's family. No
+# `draft_kind` — the engine reads it off the drafter's config.json, which is the
+# path a bare `--draft-model` takes.
+[[case]]
+id = "p2e_gemma4_two_model"
+feature = "speculative"
+subfeature = "Gemma4 e4b / e2b full draft model — round-loop fires + coherent"
+model = "GEMMA4_E4B"
+draft_model = "mlx-community__gemma-4-e2b-it-mxfp8"
+assert = { kind = "spec_decode", expect = "Paris" }
+tags = ["run2e", "gemma4", "speculative"]
+
+[[case]]
+id = "p2e_qwen38_two_model"
+feature = "speculative"
+subfeature = "Qwen3.8-27B / ornith-9b full draft model (GDN pair) — round-loop fires + coherent"
+model = "mlx-community__Qwen3.8-27B-mxfp8"
+draft_model = "sahilchachra__ornith-1.0-9b-mxfp8-mlx"
+assert = { kind = "spec_decode", expect = "Paris" }
+tags = ["run2e", "qwen38", "speculative"]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2f — modalities + agent surface (LIVE). Image input (vision tower) and
 # function/tool-calling, the two heavy-use agent paths. Real models, real

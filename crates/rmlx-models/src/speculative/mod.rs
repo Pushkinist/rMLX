@@ -37,6 +37,7 @@ pub(crate) mod round_stats;
 // description has to match them. Applying the boundary promotion here would
 // change the codec of a stack whose only reader is the round that built it.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Instant;
 
@@ -46,7 +47,7 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
-pub use draft_kind::DraftKind;
+pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 pub(crate) use round_stats::{RoundStats, SpecLoop};
 
@@ -132,10 +133,128 @@ fn same_snapshot(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// How many trailing ids one tokenizer may carry that the other does not.
+///
+/// Snapshots of one family ship the same vocabulary with a different tail of
+/// special tokens — an audio or TTS release appends a few, a base release omits
+/// them. Every id both sides carry must still name the same piece; only the
+/// tail is allowed to differ, and only by this much. It is llama.cpp's
+/// `SPEC_VOCAB_MAX_SIZE_DIFFERENCE`, so the two engines admit the same pairs.
+///
+/// An id in that tail is one the verifier can emit and the draft's tokenizer
+/// never named; it is fed back to the draft as context and indexes an
+/// embedding row there. That row exists — untrained, not out of bounds — only
+/// because [`SpeculativeDispatcher::new`] pins the two `vocab_size` values
+/// equal. The tolerance depends on that check.
+const VOCAB_TAIL_TOLERANCE: usize = 128;
+
+/// The largest token id a tokenizer may carry and still be compared here.
+///
+/// The comparison walks every id up to the smaller side's last one, so a
+/// stray sentinel at an enormous id would turn model load into a spin over
+/// the whole span. No tokenizer this backend loads comes within an order of
+/// magnitude of this.
+const VOCAB_ID_CEILING: u32 = 1 << 22;
+
+/// The vocabulary a snapshot's `tokenizer.json` declares, added tokens included.
+fn snapshot_vocab(dir: &Path) -> Result<HashMap<String, u32>> {
+    let path = dir.join("tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&path)
+        .map_err(|e| Error::Model(format!("load tokenizer {}: {e}", path.display())))?;
+    Ok(tokenizer.get_vocab(true))
+}
+
+/// `vocab` inverted to id order, refusing an id two pieces claim.
+///
+/// `get_vocab(true)` merges the added tokens into the model vocabulary by
+/// piece, and nothing there promises the result is injective. Letting the
+/// `collect` pick a winner would make the verdict depend on hash order.
+fn vocab_by_id<'a>(side: &str, vocab: &'a HashMap<String, u32>) -> Result<BTreeMap<u32, &'a str>> {
+    let mut by_id: BTreeMap<u32, &str> = BTreeMap::new();
+    for (piece, id) in vocab {
+        if let Some(other) = by_id.insert(*id, piece.as_str()) {
+            return Err(Error::SpeculativePairing {
+                reason: format!(
+                    "the {side} tokenizer names token id {id} twice, as {other:?} and \
+                     {piece:?} — a draft proposal of that id has no single meaning"
+                ),
+            });
+        }
+    }
+    Ok(by_id)
+}
+
+/// Whether the draft's tokenizer can stand in for the verifier's.
+///
+/// A draft proposes token *ids*, and the verifier scores them as indices into
+/// its own vocabulary. If the two tokenizers disagree on what an id means, the
+/// pair does not fail — it serves garbage, at a low accept rate, with no error.
+/// Comparing `vocab_size` cannot see that: Gemma 3 and Gemma 4 both declare
+/// 262144 and share no vocabulary. So this compares the pieces, id by id, over
+/// every id both sides carry, and tolerates a short tail of ids only one side
+/// has (see [`VOCAB_TAIL_TOLERANCE`]).
+///
+/// The stop ids are deliberately not compared: the prompt is tokenized and the
+/// stop decided by the verifier alone, and the draft only ever sees ids.
+///
+/// # Errors
+/// [`Error::SpeculativePairing`], naming the first id whose piece differs, the
+/// size of a tail the tolerance does not cover, an id two pieces claim, or an
+/// id past [`VOCAB_ID_CEILING`].
+pub(crate) fn vocab_pairing_verdict(
+    verifier: &HashMap<String, u32>,
+    draft: &HashMap<String, u32>,
+) -> Result<()> {
+    let v = vocab_by_id("verifier", verifier)?;
+    let d = vocab_by_id("draft", draft)?;
+    let (Some(v_last), Some(d_last)) = (v.keys().next_back(), d.keys().next_back()) else {
+        return Err(Error::SpeculativePairing {
+            reason: "a tokenizer.json on one side declares no vocabulary".to_owned(),
+        });
+    };
+    let shared_end = (*v_last).min(*d_last);
+    if shared_end >= VOCAB_ID_CEILING {
+        return Err(Error::SpeculativePairing {
+            reason: format!(
+                "both tokenizers carry token id {shared_end}, past the {VOCAB_ID_CEILING} this \
+                 comparison walks — not a vocabulary this backend recognises"
+            ),
+        });
+    }
+    for id in 0..=shared_end {
+        let (vp, dp) = (v.get(&id), d.get(&id));
+        if vp != dp {
+            return Err(Error::SpeculativePairing {
+                reason: format!(
+                    "draft tokenizer is not the verifier's: token id {id} is {} in the \
+                     verifier and {} in the draft — a draft can only propose ids the \
+                     verifier reads the same way",
+                    vp.map_or("absent".to_owned(), |p| format!("{p:?}")),
+                    dp.map_or("absent".to_owned(), |p| format!("{p:?}")),
+                ),
+            });
+        }
+    }
+    let tail_start = shared_end.saturating_add(1);
+    let tail = v.range(tail_start..).count() + d.range(tail_start..).count();
+    if tail > VOCAB_TAIL_TOLERANCE {
+        return Err(Error::SpeculativePairing {
+            reason: format!(
+                "draft tokenizer is not the verifier's: the two agree up to id {shared_end} \
+                 and then one side carries {tail} more ids, above the {VOCAB_TAIL_TOLERANCE} \
+                 a trailing run of special tokens is allowed to differ by"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Holds a verifier and, for the two-model path, a draft `Architecture`.
 ///
 /// When a draft is present:
 /// - `verifier.vocab_size() == draft.vocab_size()` (asserted in `new`).
+/// - The two tokenizers name the same piece at every id both carry (enforced
+///   in `load_speculative`, see [`vocab_pairing_verdict`]).
 /// - The two architectures come from distinct snapshot dirs (enforced in
 ///   `load_speculative`).
 /// - Both share the same `Device` at construction time.
@@ -157,13 +276,17 @@ pub struct SpeculativeDispatcher {
 impl SpeculativeDispatcher {
     /// Construct a dispatcher from two pre-loaded `Architecture` values.
     ///
-    /// Asserts vocab-size equality. Mismatched vocabularies make
-    /// speculation meaningless: a draft-proposed token id at index 5000
-    /// would refer to a different word in the verifier's vocabulary.
+    /// Asserts that the two logit rows are the same width. The greedy loop
+    /// only compares argmax ids, but the stochastic loop takes `p` and `q` as
+    /// whole distributions and the acceptance test indexes both by one id, so
+    /// a draft whose head is padded to a different width has no `q` to hand it.
+    /// Whether the ids *mean* the same thing is the tokenizer's business, and
+    /// `load_speculative` settles that before either model is loaded.
     pub fn new(verifier: Architecture, draft: Architecture, device: Device) -> Result<Self> {
         if verifier.vocab_size() != draft.vocab_size() {
             return Err(Error::Model(format!(
-                "speculative: vocab mismatch — verifier={} draft={}",
+                "speculative: logit width mismatch — verifier vocab_size={} draft vocab_size={}; \
+                 the stochastic acceptance test needs one distribution per id on both sides",
                 verifier.vocab_size(),
                 draft.vocab_size()
             )));
@@ -212,6 +335,10 @@ impl SpeculativeDispatcher {
     /// materialises the weights twice for no benefit — the draft would cost
     /// exactly as much to run as the verifier it is meant to outrun. A caller
     /// wanting one model wants [`Self::load_verifier_only`].
+    ///
+    /// Returns [`Error::SpeculativePairing`] when the draft's tokenizer is not
+    /// the verifier's — see [`vocab_pairing_verdict`]. Both checks run before
+    /// any weight is read.
     pub fn load_speculative(verifier_dir: &Path, draft_dir: &Path, device: Device) -> Result<Self> {
         if same_snapshot(verifier_dir, draft_dir) {
             return Err(Error::Model(format!(
@@ -221,6 +348,7 @@ impl SpeculativeDispatcher {
                 verifier_dir.display()
             )));
         }
+        vocab_pairing_verdict(&snapshot_vocab(verifier_dir)?, &snapshot_vocab(draft_dir)?)?;
         tracing::info!(
             verifier = %verifier_dir.display(),
             draft = %draft_dir.display(),

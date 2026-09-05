@@ -16,10 +16,13 @@ is negligible relative to the verifier.
 
 Key constraints enforced at construction time:
 
-- The verifier and drafter vocabularies must match (`vocab_size` assertion in
-  `SpeculativeDispatcher::new`). Draft token IDs only make sense as verifier
-  logit indices if the vocabularies align. For EAGLE-3, which uses a reduced
-  draft vocabulary, a `d2t` offset table maps draft IDs to target IDs.
+- The verifier and drafter vocabularies must match. Draft token ids only make
+  sense as verifier logit indices if the two tokenizers read them the same way,
+  so a full draft model is checked piece by piece against the verifier's
+  `tokenizer.json` before either model is loaded (§ "Two-model drafter"), and
+  the two logit rows must be the same width (`SpeculativeDispatcher::new`). For
+  EAGLE-3, which uses a reduced draft vocabulary, a `d2t` offset table maps
+  draft ids to target ids.
 - Both models load under the single Apple Silicon Metal context. Loading is
   sequential; both models share the same `Device` at construction.
 - The speculative path does not support `ConstraintEngine` (structured output /
@@ -504,6 +507,108 @@ before each verify forward, `restore` + kept-prefix replay on partial accept.
 
 Per-step trace is available via `RUST_LOG=rmlx_models::speculative::eagle3=trace`.
 
+### Two-model drafter — a separate full model
+
+**Source**: `speculative/mod.rs` (`SpeculativeDispatcher::spec_generate_greedy`)
+
+The classic form: a smaller full model of the verifier's family proposes, the
+verifier scores. Nothing hooks into the verifier's forward pass — the draft is
+loaded as its own `Architecture`, keeps its own KV (and, on a GDN hybrid, its
+own recurrent state), and is rolled back through the same
+`rollback_round_caches` as the verifier. Any registered architecture can be the
+draft, subject to the checks below; a pair of the same architecture is the
+normal case (`gemma-4-e4b` drafted by `gemma-4-e2b`, `Qwen3.8-27B` drafted by
+`ornith-1.0-9b`).
+
+It is the one drafter kind with two acceptance rules. At `temperature == 0`
+the loop is `spec_generate_greedy_cached`; above it, `spec_generate_stochastic_cached`
+— Leviathan acceptance over the same post-sampling distributions the ordinary
+sampler builds. The sidecar kinds are greedy only.
+`crates/rmlx-models/tests/two_model_stochastic.rs` is the gate that the
+stochastic loop runs at all: it pins that one seed reproduces one sequence, that
+a second seed and `temperature == 0` do not, on the `gemma-4-e4b` / `gemma-4-e2b`
+pair resolved by slug.
+
+**Selecting it.** The kind is `two_model`, and it is read off the draft
+snapshot's own `config.json` like every other kind: a registered architecture
+there is a full model. `rmlx serve --model <verifier> --draft-model <draft>`
+is the whole invocation; `--draft-kind two_model` is accepted and says the same
+thing. `--draft-block-size` is the round block — the verifier's own token plus
+the drafted ones, default 5 — so the draft proposes one fewer; it means the
+same on every drafter kind, and `RoundStats.block_size` records that one
+number whichever loop ran.
+
+**What is checked at load, and why it is the tokenizer.** A mismatched pair
+does not fail — it serves. The draft proposes ids, the verifier scores them as
+indices into its own vocabulary, and if the two tokenizers disagree on what an
+id means the verifier rejects nearly everything and the output is the
+verifier's own, at a fraction of its plain speed, with no error anywhere.
+`vocab_size` cannot see that: Gemma 3 and Gemma 4 both declare 262144 and share
+no vocabulary (6207 of the ids differ). So `SpeculativeDispatcher::load_speculative`
+compares the two `tokenizer.json` files id by id over every id both carry,
+before any weight is read, and refuses the pair naming the first id whose
+piece differs. A short tail of ids only one side carries is admitted, up to
+128 — snapshots of one family ship one vocabulary with a different tail of
+specials (the audio release of Qwen3.6 appends seven `<|audio_*|>` / `<tts_*>`
+tokens the text release does not have), and neither side can propose an id
+the other's logit row does not cover. The stop ids are not compared: the prompt
+is tokenized and the stop decided by the verifier alone, and the draft only
+ever sees ids. `vocab_size` equality is still asserted, for the stochastic
+loop: `p` and `q` are indexed by one id and must be the same width.
+
+**How the other engines do it.** Checked against their sources, September 2026.
+
+- *llama.cpp* (`common/speculative.cpp`): `--spec-draft-model` / `-md` alone
+  activates the draft-model path — `--spec-type` names only the n-gram methods.
+  `common_speculative_are_compatible` requires the same vocab type, the same BOS
+  and EOS (id and add-flag), a token count differing by at most
+  `SPEC_VOCAB_MAX_SIZE_DIFFERENCE = 128`, and identical token text for every id
+  from `SPEC_VOCAB_CHECK_START_TOKEN_ID = 5` up to the smaller count. Through
+  mid-2026 an incompatible pair was *translated* rather than refused —
+  detokenize the prompt with the target, retokenize with the draft, and back
+  again for the proposals, with `--spec-replace` string substitutions and a
+  warning that "tokens will be translated between the two"; current master
+  refuses the pair with `draft model vocab type must match target model to use
+  speculation`. rMLX's tail tolerance is the same 128 so the two engines admit
+  the same pairs; rMLX compares from id 0 and skips the BOS/EOS check for the
+  reason above.
+- *mlx-lm* (`generate.py`, `server.py`): `--draft-model`; compares
+  `draft_tokenizer.vocab_size` to the target's, raising in `generate` and only
+  warning in the server. `--num-draft-tokens` is the fixed chain length.
+- *vLLM* (`speculative_config`): `method` must be set to `draft_model` for a
+  full draft — inference from the draft's own metadata covers EAGLE and MTP
+  only. `num_speculative_tokens` is fixed. Vocabularies must match unless
+  `use_heterogeneous_vocab` enables its token-level-intersection mapping,
+  which does not combine with probabilistic draft sampling.
+
+**Early stop on draft confidence.** llama.cpp has the knob:
+`--spec-draft-p-min` (default 0.75) stops the current chain at the first token
+whose draft top-1 probability falls below it — "only collect very
+high-confidence draft tokens" — and `--spec-draft-n-min` (default 0) discards a
+chain that came out shorter than `n_min`, so the verifier is not asked to
+batch-score one or two tokens. Both are per-request in its server
+(`speculative.p_min`, `speculative.n_min`). `--spec-draft-p-split` is declared
+and unused. That is the idea of a chain whose depth follows the draft's own
+confidence, arrived at independently and shipped since the late-2024
+`common/speculative.cpp` refactor: the depth is decided token by token, inside
+the round, by the draft's probability at each step. rMLX has no such knob on
+any loop. The one depth policy it does run — DFlash's `dflash_next_block_size` —
+is a different signal: it sets the *next* round's block from the accept rate of
+the last eight rounds, per round and after the fact, not per token from the
+draft's confidence. A `p_min` for the two-model loop would need the draft's
+probability at each step; `draft_decode_n` today batches its argmaxes and
+syncs once per round, so that is one host readback per draft token, the same
+cost the stochastic loop already pays. Not implemented here.
+
+**Measured** (temperature 0, `--kv-quant none`, `--max-ctx 8192`, block 5, 128
+tokens, one warmup and three measured requests, `scripts/spec_bench.sh`), rows
+in `runs.db` under `decode_config = two_model/block=5`: `gemma-4-e4b-it-mxfp8`
+drafted by `gemma-4-e2b-it-mxfp8` runs at 72.95 TPS against 83.12 with no
+drafter (accept rate 0.66, 3.56 tokens/round); `Qwen3.8-27B-mxfp8` drafted by
+`ornith-1.0-9b-mxfp8-mlx` at 10.71 against 18.89 (accept rate 0.36, 51.5 ms of
+rollback per round on the GDN pair). Neither pair pays at this block; both
+reproduce the no-drafter arm's text.
+
 ### Gemma4 Assistant Drafter
 
 **Source**: `speculative/gemma4_assistant.rs`
@@ -588,24 +693,22 @@ layer are precomputed at load time.
 
 ## SpeculativeDispatcher
 
-`SpeculativeDispatcher` is the top-level container for the
-two-independent-model speculative path (Gemma4 31B + Gemma4 E2B). The
-drafter-conditioned paths (MTP, DFlash, EAGLE-3) each have their own
-round-loop function and are dispatched from the serve layer based on the
-`draft_kind` parameter.
+`SpeculativeDispatcher` is the top-level container for the two-model path.
+The sidecar kinds (MTP, DFlash, EAGLE-3) each have their own round-loop
+function and are dispatched from the serve layer on the resolved `DraftKind`.
 
 Two constructors, because the two shapes hold different numbers of models:
 
-- `load_speculative(verifier_dir, draft_dir, device)` — the two-model path.
-  `SpeculativeDispatcher::new` asserts
-  `verifier.vocab_size() == draft.vocab_size()`; mismatched vocabularies make
-  speculation meaningless. Naming the *same* directory on both sides is
-  refused: it materialises the weights twice, and a draft that is the verifier
-  costs exactly as much to run as the verifier it is meant to outrun.
-- `load_verifier_only(verifier_dir, device)` — the sidecar path taken by every
-  `draft_kind`. MTP / DFlash / EAGLE-3 drafters are small heads the serve layer
-  loads and drives itself, so `draft` is `None` and the verifier weights are
-  resident once. `spec_generate_*` refuses to run on such a dispatcher.
+- `load_speculative(verifier_dir, draft_dir, device)` — the `two_model` kind.
+  Refuses a draft whose tokenizer is not the verifier's (§ "Two-model
+  drafter") and, in `SpeculativeDispatcher::new`, a draft whose logit row is a
+  different width. Naming the *same* directory on both sides is refused: it
+  materialises the weights twice, and a draft that is the verifier costs
+  exactly as much to run as the verifier it is meant to outrun.
+- `load_verifier_only(verifier_dir, device)` — the sidecar path taken by the
+  other three kinds. MTP / DFlash / EAGLE-3 drafters are small heads the serve
+  layer loads and drives itself, so `draft` is `None` and the verifier weights
+  are resident once. `spec_generate_*` refuses to run on such a dispatcher.
 
 `spec_generate_greedy` is the public entry point:
 
@@ -656,63 +759,97 @@ partial-accept rollback section above for what that costs.
 
 ## CLI
 
-Speculative decoding is activated on the `rmlx serve` and `rmlx chat`
-subcommands by supplying `--draft-model` together with `--draft-kind`.
+Speculative decoding is activated on `rmlx serve` only, by supplying
+`--draft-model`. `rmlx chat` has no draft flags. A `profiles.toml` profile can
+carry `draft_model` too (`docs/CLI.md` § Profiles), and runs the same way.
 
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
-| `--draft-model <PATH>` | directory | (none) | Path to the drafter snapshot directory. Requires `--draft-kind`. |
-| `--draft-kind <KIND>` | `mtp`, `dflash`, `eagle3` | (none) | Drafter architecture family. Requires `--draft-model`. |
-| `--draft-block-size <N>` | integer ≥ 1 | 4 | Tokens the drafter proposes per round. Upper-bounded by the drafter's own `block_size`; an MTP sidecar config without that key takes the loader default of 3, which is what both shipped Qwen3.5-family sidecars do. |
+| `--draft-model <PATH>` | directory | (none) | The drafter snapshot: a sidecar head or a smaller full model. Which one it is is read from its `config.json`. |
+| `--draft-kind <KIND>` | `mtp`, `dflash`, `eagle3`, `two_model` | (from the snapshot) | Names the kind for a snapshot whose `config.json` declares none. Requires `--draft-model`. Refused when it contradicts what the snapshot declares. |
+| `--draft-block-size <N>` | integer ≥ 2 | 5 | Round block: tokens the verifier scores per round, its own token included, so the drafter proposes one fewer. One meaning for every kind, and the `block_size` every `done` line and `decode_config` records. Refused below 2 at parse time. Upper-bounded by a sidecar's own `block_size`; an MTP sidecar config without that key takes the loader default of 3, which is what both shipped Qwen3.5-family sidecars do. |
 
 Environment variable fallbacks: `MLX_VLM_DRAFT_KIND` and
 `MLX_VLM_DRAFT_BLOCK_SIZE` for `--draft-kind` and `--draft-block-size`
 respectively.
 
-`--draft-kind none` is not a valid value; to disable speculative decoding omit
-`--draft-model` and `--draft-kind` entirely.
+To disable speculative decoding omit `--draft-model`; there is no
+`--draft-kind none`.
 
-### `--draft-kind mtp` dispatch (arch-family routing)
+### Which drafter a snapshot is
 
-`--draft-kind mtp` fronts **two structurally different drafter loaders**, and
-the serve layer (`engine::speculative::classify_mtp_draft`) routes by the draft
-model's **detected architecture family** (`architectures[0]` and `model_type`),
-never a substring guess:
+`rmlx_models::Declared::from_snapshot` reads the draft's `architectures[0]`
+and `model_type` — both, because export tools set one or the other:
+
+| Declaration | Kind |
+|---|---|
+| `architectures[0]` contains `Eagle3` (`LlamaForCausalLMEagle3`, over `model_type = llama`) | `eagle3` |
+| `architectures[0]` contains `DFlash` (`DFlashDraftModel`, `DFlash2DraftModel`, over `model_type = qwen3`) | `dflash` |
+| `model_type = gemma4_assistant` / `Gemma4Assistant*`, or `qwen3_5_mtp` on either field (the Qwen3.5-family sidecars ship no `architectures` at all) | `mtp` |
+| a registered generative architecture (`Gemma4ForConditionalGeneration`, `Qwen3_5ForConditionalGeneration`, …) | `two_model` — an inference from the registry, not a marker the snapshot carries |
+| anything else, a registered encoder (`JinaEmbeddingsV4Model`) included | none — `--draft-kind` is required, and is the only reason the flag exists |
+
+The order matters: DFlash and EAGLE-3 declare a plain family `model_type`
+under their own architecture name, so the architecture is read first. A flag
+that contradicts a sidecar marker is refused at load with both sides named
+(`engine::speculative::decide_draft_kind`), because no loader can build a
+snapshot as a kind it is not and the tensor-name error it would die with later
+names neither. The registry inference is not a marker and yields to the flag:
+the registry is edited whenever a model is supported, and an entry added for
+some other reason must not turn a working `--draft-kind mtp` run into a
+refusal.
+
+Before this rule existed the kind came from `--draft-kind` alone, and
+`--draft-model` required it; the two-model loops, selected by the *absence* of
+a kind, could not be reached from the command line at all. Reading the kind
+off the snapshot is what makes a bare `--draft-model` run and leaves no branch
+to be orphaned by flag coupling again.
+
+### `mtp` dispatch (arch-family routing)
+
+`mtp` fronts **two structurally different drafter loaders**, and the serve
+layer (`engine::speculative::classify_mtp_draft`) routes by the draft model's
+**detected architecture family** (`architectures[0]` and `model_type`), never
+a substring guess:
 
 | Draft family (`model_type` / `architectures[0]`) | Drafter loaded | Notes |
 |---|---|---|
 | `qwen3_5_mtp`, MoE sidecar (`layers.0.mlp.switch_mlp.*` present) | `MtpDrafter` (Qwen3.5-family sidecar head) | The MTP head reuses the verifier's embedding, LM head, and one Qwen3.5 decoder layer with a sparse-MoE FFN. E.g. `Qwen3.6-35B-A3B-MTP-5bit`. |
 | `qwen3_5_mtp`, dense sidecar (no `switch_mlp`, no `num_experts`) | `MtpDrafter` (same loader) | Same head; the reused decoder layer takes a plain SwiGLU FFN. E.g. `Qwen3.8-27B-MTP-mxfp8`. |
 | `gemma4_assistant` / `Gemma4Assistant*` | `Gemma4AssistantDrafter` | The dedicated `*-it-assistant-bf16` snapshot — a small Gemma4 decoder stack that reads the verifier's own K/V cache. |
-| anything else (incl. plain `Gemma4ForConditionalGeneration`) | **rejected at load** | Typed `Error::SpeculativePairing`; for a plain Gemma4 draft the message points at the assistant snapshot. |
+| anything else | **rejected at load** | Typed `Error::SpeculativePairing`, naming the family; never a fall-through to the Qwen3.5 sidecar loader, whose failure would name a missing MoE config instead of the mismatch. |
 
 A **plain Gemma4 model** (`Gemma4ForConditionalGeneration`, e.g.
-`gemma-4-e2b-it-mxfp8`) is **not** a valid `--draft-kind mtp` draft: it has no
-MTP sidecar head and is not the assistant drafter. Passing one is rejected at
-load with an actionable error rather than falling through to the Qwen3.5
-sidecar loader (which previously leaked a confusing `text_config missing
-num_experts` error — issue #23). Use the `*-it-assistant-bf16` assistant
-snapshot for Gemma4 speculative decoding.
+`gemma-4-e2b-it-mxfp8`) is a `two_model` draft, not an `mtp` one: it has no
+MTP sidecar head and is not the assistant drafter. Given bare it drafts as a
+full model; given with `--draft-kind mtp` it is refused by the contradiction
+rule above before this table is consulted. The `*-it-assistant-bf16` snapshot
+is the Gemma4 `mtp` drafter.
 
 ### Example invocations
 
 ```text
+# Two full models: a Gemma4 verifier drafted by the smaller Gemma4. The kind
+# is read off the draft's config.json; `--draft-kind two_model` says the same.
+rmlx serve \
+  --model   /path/to/gemma-4-e4b-it-mxfp8 \
+  --draft-model /path/to/gemma-4-e2b-it-mxfp8 \
+  --draft-block-size 5
+
 # Gemma4 assistant speculative (verifier + dedicated assistant drafter):
-# the draft MUST be the *-assistant-bf16 snapshot, NOT a plain Gemma4 model.
+# the draft is the *-assistant-bf16 snapshot, which declares itself `mtp`.
 rmlx serve \
   --model   /path/to/gemma-4-e2b-it-mxfp8 \
   --draft-model /path/to/gemma-4-E2B-it-assistant-bf16 \
-  --draft-kind  mtp \
   --draft-block-size 6
 
 # Qwen3.6-MoE + DFlash drafter:
 rmlx serve \
   --model   /path/to/Qwen3.6-35B-A3B-8bit \
   --draft-model /path/to/Qwen3.6-35B-A3B-DFlash \
-  --draft-kind  dflash \
   --draft-block-size 16
 
-# Qwen3.6-MoE + EAGLE-3 drafter:
+# Qwen3.6-MoE + EAGLE-3 drafter, naming the kind explicitly (optional):
 rmlx serve \
   --model   /path/to/Qwen3.6-35B-A3B-8bit \
   --draft-model /path/to/Qwen3.6-35B-A3B-Eagle3 \
