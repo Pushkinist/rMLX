@@ -344,7 +344,9 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// layers). It fails when a layer cannot reach `prefix_len` without losing
     /// state it still has to serve — a wrapped SWA ring. Callers gate on
     /// `KvCache::can_truncate_to` and degrade to a re-prefill, so the failure
-    /// path here is the gate having gone out of step with the caches. The recurrent GDN [`lin_caches`] are deliberately NOT reachable
+    /// path here is the gate having gone out of step with the caches.
+    ///
+    /// The recurrent GDN [`lin_caches`] are deliberately NOT reachable
     /// from this default — that "never truncate linear state" invariant is now
     /// structural: linear state is re-run on the tail, never sliced. Override
     /// only for a mock or a genuinely different per-arch policy.

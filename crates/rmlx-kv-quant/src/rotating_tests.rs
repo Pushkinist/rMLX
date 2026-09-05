@@ -167,9 +167,13 @@ fn snapshot_restore_multitoken_tail_wrapped() {
 /// without dropping the rejected keys reads the same offset and the wrong keys.
 ///
 /// The last case is the boundary: a rollback of the *whole* block would leave
-/// the ring one position short of its window, and is refused. A round loop never
-/// asks for it — the bonus token is always kept — so the guarantee it needs is
-/// exactly "any tail up to `block - 1`".
+/// the ring one position short of its window, and is refused. The assistant
+/// round loop never asks for it — the bonus token is always kept — so the
+/// guarantee it needs is exactly "any tail up to `block - 1`". A **recurrent**
+/// round loop does ask for the whole block, because it replays from the
+/// pre-round offset its state snapshot was taken at, and would be refused here;
+/// no architecture wired today pairs recurrent state with a windowed KV layer,
+/// and `rollback_round_caches` is where the first one that does will say so.
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -212,6 +216,62 @@ fn a_wrapped_ring_rolls_a_rejected_block_tail_back_off() {
         assert_eq!(
             tail, want,
             "kept={kept}: the rolled-back ring must hold the window ending at its offset"
+        );
+
+        // And the ring is still writable, on both paths that write it. A
+        // post-wrap rollback leaves a sliced view behind; a decode step reaches
+        // that view through `slice_update`, which no-ops silently when its
+        // bounds are wrong, and the next block write reaches it through
+        // `temporal_order` / `trim`. Reading the buffer straight after the
+        // rollback exercises neither.
+        let before_decode = st.offset;
+        let (k1, _v1) = st
+            .update_and_fetch(
+                &kv(1, before_decode as f32),
+                &kv(1, 100.0 + before_decode as f32),
+                device,
+            )
+            .unwrap();
+        assert_eq!(
+            st.offset,
+            before_decode + 1,
+            "kept={kept}: offset after a decode step"
+        );
+        // Past the wrap a decode step writes in place, so the window is present
+        // but not in order — which positions the ring holds is the assertion.
+        let mut held: Vec<f32> = host(&k1).chunks_exact(2).map(|c| c[0]).collect();
+        held.sort_by(f32::total_cmp);
+        let live = max_size.min(st.offset);
+        let want_held: Vec<f32> = ((st.offset - live)..st.offset).map(|p| p as f32).collect();
+        assert_eq!(
+            held, want_held,
+            "kept={kept}: a decode step into a rolled-back ring must leave it holding \
+             the window ending at the new offset"
+        );
+
+        let before_block = st.offset;
+        let (k2, _v2) = st
+            .update_and_fetch(
+                &kv(2, before_block as f32),
+                &kv(2, 100.0 + before_block as f32),
+                device,
+            )
+            .unwrap();
+        assert_eq!(
+            st.offset,
+            before_block + 2,
+            "kept={kept}: offset after a block write"
+        );
+        let after = host(&k2);
+        let live = max_size.min(st.offset);
+        let want_after: Vec<f32> = ((st.offset - live)..st.offset)
+            .flat_map(|p| [p as f32, p as f32 + 0.5])
+            .collect();
+        assert_eq!(
+            &after[after.len() - (live as usize) * 2..],
+            want_after.as_slice(),
+            "kept={kept}: a block write into a rolled-back ring must continue the window \
+             it kept"
         );
     }
 
@@ -297,15 +357,26 @@ fn an_unwrapped_ring_rolls_back_to_any_prefix() {
     );
 }
 
-/// `can_trim` is the predicate `roll_back` implements, at every rollback depth a
-/// ring in either regime can be asked for. A predicate that drifted from the
-/// operation is worse than none: the callers gate on it.
+/// What `can_trim` promises is what `roll_back` leaves, at every rollback depth
+/// a ring in either regime can be asked for. The callers gate on the predicate,
+/// so a predicate that drifted from the operation is worse than none.
+///
+/// Asserting only that the two *agree* would be a tautology — `roll_back`'s
+/// first statement consults `can_trim`, so no mutation short of deleting that
+/// line could fail it. Each depth therefore asserts the ring's resulting state:
+/// a rollback that happened holds the window ending at its new offset, one that
+/// was refused left the ring byte-identical, and a rollback of nothing is a
+/// no-op whichever regime the ring is in.
 #[test]
 #[allow(
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-fn can_trim_and_roll_back_agree_at_every_depth() {
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the window slice is bounded by the buffer length it is taken from"
+)]
+fn what_can_trim_promises_is_what_roll_back_leaves() {
     let device = Device::Cpu;
     for rotated in [false, true] {
         for depth in 0..10i32 {
@@ -319,12 +390,37 @@ fn can_trim_and_roll_back_agree_at_every_depth() {
                 st.update_and_fetch(&kv(4, 6.0), &kv(4, 106.0), device)
                     .unwrap();
             }
+            let before = (st.offset, st.idx, host(st.keys.as_ref().unwrap()));
             let predicted = st.can_trim(depth);
             let done = st.roll_back(depth).unwrap();
             assert_eq!(
                 predicted, done,
                 "rotated={rotated} depth={depth}: can_trim promised {predicted} and \
                  roll_back did {done}"
+            );
+            let now = (st.offset, st.idx, host(st.keys.as_ref().unwrap()));
+            if !done || depth == 0 {
+                assert_eq!(
+                    now, before,
+                    "rotated={rotated} depth={depth}: a refused or empty rollback must \
+                     leave the ring exactly as it was"
+                );
+                continue;
+            }
+            assert_eq!(
+                st.offset,
+                before.0 - depth,
+                "rotated={rotated} depth={depth}: rolled-back offset"
+            );
+            let window = st.max_size.min(st.offset) as usize;
+            let want: Vec<f32> = (st.offset - window as i32..st.offset)
+                .flat_map(|p| [p as f32, p as f32 + 0.5])
+                .collect();
+            assert_eq!(
+                &now.2[now.2.len() - window * 2..],
+                want.as_slice(),
+                "rotated={rotated} depth={depth}: the ring must hold the window ending \
+                 at the offset it rolled back to"
             );
         }
     }

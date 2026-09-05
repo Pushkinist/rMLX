@@ -74,7 +74,7 @@ pub(super) struct RotatingState {
 /// The first `keep` positions of a `[B, kv_h, S, D]` ring buffer.
 #[allow(
     clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+    reason = "the ndim check above establishes four axes, so shape[0..4] are in bounds"
 )]
 fn slice_leading(v: &Array, keep: i32, device: Device) -> Result<Array> {
     let shape = v.shape();
@@ -153,14 +153,17 @@ impl RotatingState {
     ///   so dropping the last `n` of them is lossless exactly while what is left
     ///   still covers the window the rolled-back offset needs. A block-verify
     ///   write of `s` positions can therefore always be rolled back over its own
-    ///   rejected tail, which is at most `s - 1` long.
+    ///   rejected tail, which is at most `s - 1` long. Rolling the whole block
+    ///   back is one position too far and is refused — a caller that needs it
+    ///   (a recurrent round loop replaying from its pre-round offset) has no
+    ///   route through here.
     ///
     /// A ring left in rotated order by a single-token write
     /// (`update_in_place` past the wrap) is **not** rollable: the newest slots
     /// hold the positions they overwrote, and those are gone.
     #[allow(
         clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+        reason = "the ring's K/V are always [B, kv_h, S, D], so the sequence axis is shape[2]"
     )]
     pub(super) fn can_trim(&self, n: i32) -> bool {
         if n <= 0 {
@@ -199,9 +202,16 @@ impl RotatingState {
             return Ok(true);
         }
         if self.offset >= self.max_size {
-            let Some(device) = self.stream else {
-                return Ok(false);
-            };
+            // `can_trim` admits this branch only with a stream recorded, so a
+            // missing one is a broken invariant and says so — reporting it as a
+            // refusal would blame the ring's order for a bookkeeping fault.
+            let device = self.stream.ok_or_else(|| {
+                Error::Mlx(
+                    "RotatingKvCache::roll_back: a post-wrap rollback was admitted with no \
+                     recorded stream to slice the ring on"
+                        .to_owned(),
+                )
+            })?;
             // Temporal order: the newest `n` positions are the last `n` slots.
             let keep = self.idx - n;
             self.keys = match &self.keys {

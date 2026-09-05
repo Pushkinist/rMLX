@@ -1541,7 +1541,23 @@ fn rollback_round_caches(
         )));
     }
 
-    truncate_kv_to(kv, pre_round_offset)?;
+    // The whole verify block, not the rejected tail: the recurrent state has no
+    // sequence axis to truncate, so it is restored from the pre-round snapshot
+    // and the accepted prefix replayed into KV caches that must start where the
+    // snapshot does. A sliding-window ring cannot serve that past its wrap — it
+    // can give back a rejected tail but not the block that established its
+    // window — so this branch and a sliding layer are mutually exclusive. No
+    // architecture wired today pairs the two (`Architecture::layer_sliding_window`
+    // names only the Gemma families, and neither carries recurrent state); the
+    // first one that does lands here rather than anywhere subtler.
+    truncate_kv_to(kv, pre_round_offset).map_err(|e| {
+        Error::Model(format!(
+            "rollback_round_caches: a recurrent verifier rolls the whole verify block off \
+             and replays the accepted prefix, which a sliding-window layer cannot do past \
+             its wrap — this architecture pairs recurrent state with a windowed KV layer \
+             and the round loop has no rollback for that combination: {e}"
+        ))
+    })?;
     for (c, snap) in lin.iter_mut().zip(snapshot) {
         c.restore_snapshot(snap);
     }
@@ -1559,11 +1575,26 @@ fn rollback_round_caches(
 /// A GDN layer's KvCache never advances past 0, so an unguarded truncate would
 /// set it to a positive offset over an empty store.
 ///
-/// A layer that cannot reach `n` stops the round rather than being left behind
-/// the rest of the stack: an SWA ring that silently kept the rejected drafts
-/// while the full-attention layers dropped them is how a speculative arm stops
-/// reproducing plain greedy at long context.
+/// **All or nothing.** Every layer is asked whether it can reach `n` before any
+/// is moved, because a stack left half rolled back is the defect this function
+/// exists to prevent, not a milder version of it: an SWA ring that kept the
+/// rejected drafts while the full-attention layers dropped them is how a
+/// speculative arm stops reproducing plain greedy at long context, and a
+/// failure part-way through the loop produces exactly that state with no way
+/// back. `KvCache::can_truncate_to` is the same predicate `truncate_to` fails
+/// on, so the gate and the operation cannot disagree.
 fn truncate_kv_to(kv: &mut [KvCache], n: i32) -> Result<()> {
+    if let Some((idx, c)) = kv
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.offset() >= n && !c.can_truncate_to(n))
+    {
+        return Err(Error::Model(format!(
+            "truncate_kv_to: layer {idx} holds {} positions and cannot be rolled back to \
+             {n}, so no layer was, and the stack is still where the round left it",
+            c.offset(),
+        )));
+    }
     for c in kv.iter_mut() {
         if c.offset() >= n {
             c.truncate_to(n)?;
