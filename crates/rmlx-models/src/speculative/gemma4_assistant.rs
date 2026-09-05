@@ -893,7 +893,7 @@ pub fn mtp_assistant_generate_greedy(
         let v_tokens = super::argmax_tokens(&vb, v_k)?;
 
         // -- Phase C: greedy acceptance walk. --------------------------------
-        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining);
+        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
         // -- Emit accepted prefix + 1 correction/bonus. --

@@ -688,23 +688,32 @@ fn load_speculative_refuses_a_foreign_tokenizer_before_reading_weights() {
 // Acceptance walk
 // ---------------------------------------------------------------------------
 
+/// The walk, unwrapped, for the cases whose block is well formed.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: each caller passes a block one longer than its proposals, which is the shape the walk accepts"
+)]
+fn walk(verifier: &[u32], draft: &[u32], budget: usize) -> (usize, Vec<u32>) {
+    accept_prefix(verifier, draft, budget).expect("a block one longer than its proposals")
+}
+
 #[test]
 fn accept_prefix_all_accepted_emits_the_bonus_token() {
-    let (acc, emit) = accept_prefix(&[10, 11, 12, 99], &[10, 11, 12], 8);
+    let (acc, emit) = walk(&[10, 11, 12, 99], &[10, 11, 12], 8);
     assert_eq!(acc, 3);
     assert_eq!(emit, vec![10, 11, 12, 99]);
 }
 
 #[test]
 fn accept_prefix_stops_at_the_first_disagreement_and_emits_the_correction() {
-    let (acc, emit) = accept_prefix(&[10, 11, 55, 0], &[10, 11, 12], 8);
+    let (acc, emit) = walk(&[10, 11, 55, 0], &[10, 11, 12], 8);
     assert_eq!(acc, 2);
     assert_eq!(emit, vec![10, 11, 55]);
 }
 
 #[test]
 fn accept_prefix_emits_only_the_correction_when_nothing_is_accepted() {
-    let (acc, emit) = accept_prefix(&[42, 0, 0], &[10, 11], 8);
+    let (acc, emit) = walk(&[42, 0, 0], &[10, 11], 8);
     assert_eq!(acc, 0);
     assert_eq!(emit, vec![42]);
 }
@@ -714,18 +723,31 @@ fn accept_prefix_budget_caps_the_emission_and_not_the_acceptance() {
     // The round committed three drafts to the caches whatever the token budget
     // was; a walk that reported two accepts here would leave the KV holding a
     // position the loop believes it rolled back.
-    let (acc, emit) = accept_prefix(&[10, 11, 12, 99], &[10, 11, 12], 2);
+    let (acc, emit) = walk(&[10, 11, 12, 99], &[10, 11, 12], 2);
     assert_eq!(acc, 3);
     assert_eq!(emit, vec![10, 11]);
 }
 
 #[test]
-fn accept_prefix_without_a_bonus_slot_ends_at_the_last_agreement() {
-    // The verifier's own token count is what bounds the walk: no bonus slot
-    // means no correction to emit, not an out-of-bounds read.
-    let (acc, emit) = accept_prefix(&[10, 11], &[10, 11], 8);
-    assert_eq!(acc, 2);
-    assert_eq!(emit, vec![10, 11]);
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the call is deliberately malformed and an Ok here is the assertion failing"
+)]
+fn accept_prefix_refuses_a_block_that_is_not_its_proposals_plus_a_bonus() {
+    // The two arguments are same-typed slices and the order carries the whole
+    // meaning. Swapped, this compiles and — before the check — returned an
+    // accept count that then drove the KV rollback.
+    let verifier = [10u32, 11, 12, 99];
+    let draft = [10u32, 11, 12];
+    let err = accept_prefix(&draft, &verifier, 8).expect_err("arguments the wrong way round");
+    let msg = err.to_string();
+    assert!(
+        msg.contains('3') && msg.contains('4'),
+        "the refusal must name both counts so a swapped call site is identifiable, got: {msg}"
+    );
+    // A block missing its bonus slot is the same defect arriving from the other
+    // side: there is no correction to emit and nothing should guess one.
+    assert!(accept_prefix(&[10, 11], &[10, 11], 8).is_err());
 }
 
 // ---------------------------------------------------------------------------

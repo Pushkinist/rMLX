@@ -801,7 +801,7 @@ pub fn mtp_generate_greedy(
         // -- Phase C: greedy acceptance walk over the verifier's own tokens.
         let t0 = Instant::now();
         let v_tokens = super::argmax_tokens(&vb, v_k)?;
-        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining);
+        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
 

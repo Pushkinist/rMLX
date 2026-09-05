@@ -406,7 +406,8 @@ verbatim and applies a plain `rms_norm` (matching the verifier's own RmsNorm),
 adding no centring shift.
 
 Acceptance walk (`speculative::accept_prefix`, shared with the gemma4-assistant
-loop): the verify forward already projects all `block_size` positions through the
+and two-model-greedy loops; the stochastic two-model loop applies a different,
+Leviathan acceptance rule and does not use it): the verify forward already projects all `block_size` positions through the
 LM head, so the loop reads that argmax back once and walks it on the host. For
 each position from 0 to `n_draft` (inclusive), the verifier's own token is
 compared with the draft; on a match the draft is accepted, and on a mismatch or

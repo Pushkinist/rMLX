@@ -769,25 +769,12 @@ impl SpeculativeDispatcher {
             let v_tokens = argmax_tokens(&bytes, v_k)?;
 
             // -- Phase C: greedy acceptance. ---------------------------
-            // v_tokens[i] is the verifier's prediction after the i-th
-            // input token (positions 0..K). Compare v_tokens[0..num_draft]
-            // against draft_tokens[0..num_draft]. Longest matching prefix
-            // → emit accept tokens; emit v_tokens[accept] as correction
-            // (or bonus when accept == num_draft).
-            let mut accept = 0usize;
-            for i in 0..draft_tokens.len() {
-                if v_tokens[i] == draft_tokens[i] {
-                    accept += 1;
-                } else {
-                    break;
-                }
-            }
+            let (accept, new_tokens) = accept_prefix(&v_tokens, &draft_tokens, remaining)?;
             total_accept_count += accept;
 
-            // Emit accept + 1 tokens: v_tokens[0..=accept].
-            let to_emit = (accept + 1).min(v_tokens.len());
+            // Emit accepted prefix + 1 correction/bonus.
             let mut hit_eos = false;
-            for &id in v_tokens.iter().take(to_emit) {
+            for &id in &new_tokens {
                 if emitted.len() >= n_tokens {
                     break;
                 }
@@ -913,7 +900,7 @@ impl SpeculativeDispatcher {
                 round = rounds,
                 accept,
                 num_draft = draft_tokens.len(),
-                emitted_round = to_emit,
+                emitted_round = new_tokens.len(),
                 emitted_total = emitted.len(),
                 v_offset_before,
                 v_target,
@@ -1651,14 +1638,26 @@ pub(crate) fn argmax_tokens(bytes: &[u8], k: usize) -> Result<Vec<u32>> {
 /// of token budget still committed the KV it committed, and reporting fewer
 /// accepts than the caches hold is how the two disagree.
 ///
-/// `verifier_tokens` carries one position more than `draft_tokens` — the bonus
-/// slot. A shorter one simply ends the walk early, which is the same answer as
-/// disagreeing there.
+/// `verifier_tokens` carries exactly one position more than `draft_tokens` —
+/// the bonus slot — at every call site, and that is checked rather than
+/// assumed. The two arguments are same-typed slices whose order carries the
+/// whole meaning, so a swapped call compiles and still returns a plausible
+/// accept count; the count then drives a KV rollback. Reversed, the lengths are
+/// wrong by two, which is what this refuses.
 pub(crate) fn accept_prefix(
     verifier_tokens: &[u32],
     draft_tokens: &[u32],
     budget: usize,
-) -> (usize, Vec<u32>) {
+) -> Result<(usize, Vec<u32>)> {
+    if verifier_tokens.len() != draft_tokens.len() + 1 {
+        return Err(Error::Model(format!(
+            "accept_prefix: {} verifier tokens against {} proposals — a verified block \
+             is the proposals plus one bonus slot, and swapping the two arguments is \
+             how these arrive the wrong way round",
+            verifier_tokens.len(),
+            draft_tokens.len()
+        )));
+    }
     let mut accepted = 0usize;
     let mut emit: Vec<u32> = Vec::with_capacity(verifier_tokens.len());
     for (pos, &token) in verifier_tokens.iter().enumerate() {
@@ -1673,7 +1672,7 @@ pub(crate) fn accept_prefix(
             break;
         }
     }
-    (accepted, emit)
+    Ok((accepted, emit))
 }
 
 /// Roll one speculative round's caches back to `target_offset` after a partial
