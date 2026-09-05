@@ -736,6 +736,19 @@ pub fn mtp_assistant_generate_greedy(
             "mtp_assistant_generate_greedy: block_size must be >= 2".into(),
         ));
     }
+    // Which round loop runs is decided by the drafter snapshot's `model_type`
+    // alone, so a `gemma4_assistant` drafter can be handed any verifier. This
+    // loop conditions the drafter on the verifier's own final-normed hidden and
+    // reads its K/V directly, neither of which means anything across
+    // architectures — so the pair is refused here, at the entry, rather than
+    // deeper in a shape mismatch.
+    if !matches!(verifier, Architecture::Gemma4(_)) {
+        return Err(Error::Model(format!(
+            "mtp_assistant_generate_greedy: the Gemma4 assistant round loop needs a Gemma4 \
+             verifier and this one is {}",
+            verifier.arch_class()
+        )));
+    }
     let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
 
     // Same constant the verifier resolves — a spec pair must not run two
