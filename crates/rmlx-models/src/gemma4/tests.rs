@@ -504,10 +504,16 @@ fn forward_hidden_states_matches_reference_extraction() {
         .any(|c| f32::from_le_bytes(c.try_into().unwrap()).is_nan());
     assert!(!any_nan, "hidden contains NaN");
 
-    // Reference equivalence: logits_from_hidden(hidden) == forward_seq_last_k.
+    // Reference equivalence: norm then head over the captured hidden ==
+    // forward_seq_last_k. The two halves are composed here the way
+    // `Architecture::logits_from_hidden` composes them, so a norm dropped from
+    // either one fails this.
+    let normed = model
+        .apply_final_norm(&h, device)
+        .expect("apply_final_norm");
     let logits_via_hidden = model
-        .logits_from_hidden(&h, device)
-        .expect("logits_from_hidden");
+        .logits_from_final_hidden(&normed, device)
+        .expect("logits_from_final_hidden");
     logits_via_hidden.eval().expect("eval lvh");
     let logits_direct = model
         .forward_seq_last_k(ids, k, device)
@@ -537,7 +543,7 @@ fn forward_hidden_states_matches_reference_extraction() {
     eprintln!("[forward_hidden_states_test] max_abs_logit_diff={max_abs_diff}");
     assert!(
         max_abs_diff < 1e-3,
-        "logits_from_hidden must reproduce forward_seq_last_k; max diff {max_abs_diff}"
+        "the final norm and the head must reproduce forward_seq_last_k; max diff {max_abs_diff}"
     );
 }
 

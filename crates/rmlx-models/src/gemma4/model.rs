@@ -980,25 +980,18 @@ impl Gemma4Text {
         multiply(&e, &scale, device)
     }
 
-    /// Re-derive logits from a pre-final-norm hidden state.
+    /// Re-derive logits from a hidden state the caller has already
+    /// final-normed: tied LM head (`embed_tokens.as_linear`) → final-logit
+    /// softcap. `hidden`: `[1, n, hidden]`, returns `[1, n, vocab]`.
     ///
-    /// Inverse of the tail dropped by [`forward_hidden_states`]: applies
-    /// `final_norm` → tied LM head (`embed_tokens.as_linear`) → final-logit
-    /// softcap. Mirrors mlx-vlm `speculative_logits_from_hidden`, used by the
-    /// MTP deferred-greedy acceptance walk to score draft positions against the
-    /// verifier without re-running the trunk. `hidden`: `[1, n, hidden]`,
-    /// returns `[1, n, vocab]`.
-    pub fn logits_from_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
-        let h = self.final_norm.forward(hidden, device)?;
-        self.logits_from_final_hidden(&h, device)
-    }
-
-    /// The same, from a hidden state the caller has already final-normed.
-    ///
-    /// The two entry points exist because a speculative loop holds one or the
-    /// other depending on where in the verify pass it captured: naming which is
-    /// which is what keeps a missing — or doubled — `final_norm` from becoming a
-    /// silent reweighting of the vocabulary.
+    /// The norm is not applied here and must not be. With
+    /// [`Gemma4Text::apply_final_norm`] it composes into
+    /// [`Architecture::logits_from_hidden`], the mlx-vlm
+    /// `speculative_logits_from_hidden` the MTP deferred-greedy acceptance walk
+    /// uses to score draft positions against the verifier without re-running the
+    /// trunk. Naming which entry point holds which shape keeps a missing — or
+    /// doubled — `final_norm` from becoming a silent reweighting of the
+    /// vocabulary.
     pub fn logits_from_final_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
         let logits = self.embed_tokens.as_linear(hidden, device)?;
         apply_softcap(&logits, self.cfg.final_logit_softcapping, device)
