@@ -82,9 +82,13 @@ scale. It is documented in full in `docs/SPEC_ANSWER_EQUIVALENCE.md`, including
 why the obvious oracle (how much of one answer the arms share) cannot be
 thresholded at all.
 
-Unlike the three above it **resolves both halves of each pair by slug** from
-`RMLX_O_MODELS_ROOT`, so `make gpu-test` runs it on a machine holding the
+Unlike the three above, its **assistant pair resolves both halves by slug** from
+`RMLX_O_MODELS_ROOT`, so `make gpu-test` runs that pair on a machine holding the
 snapshots and `run_gpu_tests.sh` reports a machine without them as INCOMPLETE.
+The recurrent pair is the exception and is not gated: its drafter comes from
+`RMLX_DRAFT_TEST_MODEL` or the pair does not run, because its verifier's
+quantized matmul trips the shader-validation census (see the table below and
+`docs/SPEC_ANSWER_EQUIVALENCE.md`).
 The verifier goes through the golden harness's own resolver
 (`common::model_for`); `RMLX_DRAFT_TEST_MODEL` overrides the drafter. Both
 `-e2b-` and `-e4b-` assistant snapshots declare the same architecture, so the

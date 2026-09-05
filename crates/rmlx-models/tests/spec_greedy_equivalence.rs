@@ -880,6 +880,32 @@ fn two_arms_in_the_same_ragged_loop_are_not_returned_as_agreement() {
     }
 }
 
+/// [`WORST_CORRECT_TAIL_AGREEMENT`] is the worst of the tails actually measured,
+/// and this is where that is checked.
+///
+/// Its only other use is an upper bound, so **raising** it weakens the ragged
+/// sweep above toward vacuity with every test still green — the same
+/// one-directional asymmetry the divergence ceiling's pin used to have. Holding
+/// it to the population it names fails in both directions.
+#[test]
+fn the_worst_correct_tail_is_the_worst_of_the_tails_measured() {
+    /// Every tail agreement a correct pair reached, over both pairs and the
+    /// prompts each of them judged.
+    const MEASURED: &[f64] = &[
+        // Assistant pair, six prompts.
+        0.3125, 0.3750, 0.3906, 0.2344, 1.0000, 0.9062,
+        // Recurrent pair, the five prompts it judged — the 4k document is
+        // answered in 13 and 26 tokens and is reported unjudgeable.
+        0.3281, 1.0000, 1.0000, 0.6354, 1.0000,
+    ];
+    let worst = MEASURED.iter().copied().fold(f64::INFINITY, f64::min);
+    assert!(
+        (worst - WORST_CORRECT_TAIL_AGREEMENT).abs() < 1e-9,
+        "the constant reads {WORST_CORRECT_TAIL_AGREEMENT:.4} and the worst tail a \
+         correct pair reached is {worst:.4}"
+    );
+}
+
 /// Half a healthy prefix, then a period-8 loop `noise` percent of whose tokens
 /// are drawn at random instead.
 fn ragged_loop_arm(seed: u64, noise: u64) -> Vec<u32> {
@@ -1040,9 +1066,17 @@ fn the_length_floor_admits_every_answer_the_prompts_produce() {
         "a pair that answers in full must clear the floor"
     );
     const {
-        // A floor at or above the budget would pass only if neither arm ever
-        // emitted a stop id, which is a different assertion from this one.
-        assert!(MIN_ANSWER_TOKENS < N_TOKENS);
+        // The upper side, and it is not merely the budget. A correct pair can
+        // answer and stop well before the budget — run at 512 tokens these same
+        // prompts stop the reference arm at 330 — so a floor that only cleared
+        // `N_TOKENS` would still class a pair that answered and stopped as a
+        // prompt that produced nothing, driving `judged` to zero and failing
+        // `run_gate`'s own guard for the wrong reason. Two thirds is the
+        // fraction that measurement leaves.
+        assert!(MIN_ANSWER_TOKENS * 3 <= N_TOKENS * 2);
+        // And the lower side: below this the last tail window cannot evidence a
+        // cycle at all.
+        assert!(MIN_ANSWER_TOKENS > TAIL_WINDOWS * MIN_CYCLE_SAMPLES);
     }
 
     // And the floor leaves the last tail window able to read the period the

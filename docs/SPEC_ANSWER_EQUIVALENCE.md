@@ -15,8 +15,10 @@ against.
 
 ## What it runs
 
-Two pairs, both resolved by slug from `RMLX_O_MODELS_ROOT`, each over every
-prompt in the file:
+Two pairs, each over every prompt in the file. The assistant pair resolves both
+halves by slug from `RMLX_O_MODELS_ROOT` and so runs wherever the snapshots are;
+the recurrent pair's drafter is named by the operator and its verifier is the
+reason (below):
 
 | verifier | drafter | round loop | rollback |
 |---|---|---|---|
@@ -174,8 +176,14 @@ next defect.
   "healthy output ≤ 0.69" claim and the "no gap across the ragged range" claim
   were drawn from a handful of self-authored samples and both were false.
 
-One limitation is worth carrying forward: `Rng::prose` is an i.i.d. word model
-with zero autocorrelation, and real prose is not. The real arms are the
-population that matters and they are measured, but a generator with realistic
-autocorrelation, or a corpus of arms captured from runs, would make the
-synthetic false-positive argument mean more than it currently does.
+One limitation is worth carrying forward, and it is not only a weakness of the
+synthetic argument. `Rng::prose` is an i.i.d. word model with zero
+autocorrelation, and real prose is not — so synthetic prose reads **lower** on a
+self-similarity measure than the real thing. That generator is not merely
+illustrative: `prose_clears_the_control_at_every_length_the_gate_can_hand_it` is
+a hard gate on it, and `MAX_CYCLE_FRACTION`'s lower bound is derived from it. The
+1.48× headroom over 6000 synthetic streams therefore over-estimates the true
+headroom by an unmeasured factor. The real arms are measured too and read 0.0426
+to 0.1351, which is what the constant actually rests on; a generator with
+realistic autocorrelation, or a corpus of arms captured from runs, would close
+the gap.
