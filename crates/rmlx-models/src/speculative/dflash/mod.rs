@@ -1040,7 +1040,17 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
     let shards = ShardSet::open(draft_dir, &idx)
         .map_err(|e| Error::Model(format!("DFlashDrafter: open: {e}")))?;
 
+    // Which tensor names the loader actually consumed. A drafter checkpoint of
+    // a later DFlash generation carries families this loader has no code for
+    // (a candidate selector, per-layer dynamic convolutions); loading it then
+    // silently yields the earlier architecture built out of the subset it does
+    // recognise, running at an accept rate that is not the checkpoint's. The
+    // set is compared against the snapshot below so that downgrade is stated.
+    let consumed: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
     let load = |name: &str| -> Result<Array> {
+        consumed.borrow_mut().insert(name.to_owned());
         for (_, handle) in shards.iter() {
             let st = handle
                 .safetensors()
@@ -1109,6 +1119,29 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
                 activation: Activation::Silu,
             },
         });
+    }
+
+    let mut unread: Vec<String> = Vec::new();
+    for (_, handle) in shards.iter() {
+        let st = handle
+            .safetensors()
+            .map_err(|e| Error::Model(format!("DFlashDrafter: safetensors: {e}")))?;
+        for name in st.names() {
+            if !consumed.borrow().contains(name) {
+                unread.push(name.to_owned());
+            }
+        }
+    }
+    if !unread.is_empty() {
+        unread.sort();
+        tracing::warn!(
+            unread_count = unread.len(),
+            unread = ?unread,
+            "DFlashDrafter: the snapshot carries tensors this loader does not read; \
+             the drafter built from it is the architecture this loader implements, \
+             not the one the checkpoint was trained as, and its accept rate is that \
+             drafter's rather than the checkpoint's"
+        );
     }
 
     // YARN RoPE: the Qwen3.6 DFlash drafter is trained with rope_scaling
