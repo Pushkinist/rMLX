@@ -69,6 +69,14 @@ passes while never running. The pairs their thresholds are calibrated against:
 | `qwen3_5_eagle3_alignment.rs` | `mlx-community__Qwen3.6-35B-A3B-8bit` | `Dogacel__specdrift-qwen3.6-35b-a3b-eagle3` |
 | `qwen3_5_two_model_alignment.rs` | `mlx-community__Qwen3.8-27B-mxfp8` | `sahilchachra__ornith-1.0-9b-mxfp8-mlx` (a full model, not a drafter head — both halves must be GDN hybrids sharing a vocabulary) |
 
+`two_model_stochastic.rs` is the two-model loop's other acceptance rule: it runs
+`spec_generate_greedy` at `temperature 1.0` on `mlx-community__gemma-4-e4b-it-mxfp8`
+drafted by `mlx-community__gemma-4-e2b-it-mxfp8`, both resolved by slug from
+`RMLX_O_MODELS_ROOT`, and pins that one seed reproduces one sequence while a
+second seed and `temperature 0` do not — the Leviathan loop is sampling, and it
+is the loop that ran. It is the only gate on that loop; every alignment suite
+runs greedy.
+
 Point either at a different pair and re-measure both arms before reading a
 failure as a regression.
 

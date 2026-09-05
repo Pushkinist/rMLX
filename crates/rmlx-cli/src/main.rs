@@ -57,16 +57,21 @@ use commands::metrics::{dispatch as metrics_dispatch, MetricsCmd};
 /// Clap `ValueEnum` adapter for `rmlx_models::DraftKind`.
 ///
 /// `rmlx-models` carries no clap dep, so the `ValueEnum` impl lives here.
-/// Conversion to the model-crate type is via `From<DraftKindArg>`.
+/// Conversion to the model-crate type is via `From<DraftKindArg>`. Each value
+/// is spelled as `DraftKind::as_str` spells it, so the flag, the log fields
+/// and the metrics `decode_config` say one thing.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum DraftKindArg {
-    /// Multi-Token Prediction drafter.
+    /// Multi-Token Prediction sidecar (Qwen3.5-family head, Gemma4 assistant).
     Mtp,
     /// Draft-Flash attention-based draft head.
     #[value(name = "dflash")]
     DFlash,
     /// EAGLE-3 speculative drafter.
     Eagle3,
+    /// A separate full draft model of the verifier's family.
+    #[value(name = "two_model")]
+    TwoModel,
 }
 
 impl From<DraftKindArg> for rmlx_models::DraftKind {
@@ -75,6 +80,7 @@ impl From<DraftKindArg> for rmlx_models::DraftKind {
             DraftKindArg::Mtp => rmlx_models::DraftKind::Mtp,
             DraftKindArg::DFlash => rmlx_models::DraftKind::DFlash,
             DraftKindArg::Eagle3 => rmlx_models::DraftKind::Eagle3,
+            DraftKindArg::TwoModel => rmlx_models::DraftKind::TwoModel,
         }
     }
 }
@@ -591,17 +597,17 @@ enum Cmd {
         /// Default 4. Set to 1 for legacy single-slot exact-match behaviour.
         #[arg(long)]
         prompt_cache_slots: Option<usize>,
-        /// Path to a smaller "draft" model for speculative decoding.
-        /// Vocab size of draft must match the verifier (`--model`); enforced
-        /// at load time. Optional. Must be paired with `--draft-kind`.
-        #[arg(long, requires = "draft_kind")]
+        /// Drafter snapshot for speculative decoding: a sidecar head (MTP,
+        /// DFlash, EAGLE-3) or a smaller full model of the verifier's family.
+        /// Which one it is is read from its config.json. A full draft model
+        /// must carry the verifier's tokenizer; that is checked at load time.
+        #[arg(long)]
         draft_model: Option<PathBuf>,
-        /// Drafter architecture family.
+        /// Drafter kind, for a `--draft-model` whose config.json does not
+        /// declare one. Refused when it contradicts what the snapshot declares.
+        /// Requires `--draft-model`. Env: `MLX_VLM_DRAFT_KIND`.
         ///
-        /// Required when `--draft-model` is set; must not be used without it.
-        /// Env: `MLX_VLM_DRAFT_KIND` (fallback when flag is absent).
-        ///
-        /// Values: mtp, dflash, eagle3
+        /// Values: mtp, dflash, eagle3, two_model
         #[arg(long, value_enum, requires = "draft_model", env = "MLX_VLM_DRAFT_KIND")]
         draft_kind: Option<DraftKindArg>,
         /// Number of tokens the draft model proposes per speculative round.
@@ -2002,7 +2008,8 @@ fn main() -> Result<()> {
                 .or_else(|| p.and_then(|x| x.prompt_cache_slots))
                 .unwrap_or(DEFAULT_PROMPT_CACHE_SLOTS);
             let draft_model = draft_model.or_else(|| p.and_then(|x| x.draft_model.clone()));
-            // draft_kind / draft_block_size have no profile key yet.
+            // draft_kind / draft_block_size have no profile key; a profile's
+            // draft_model runs at the kind its snapshot declares.
             let draft_kind: Option<rmlx_models::DraftKind> = draft_kind.map(Into::into);
             let max_tokens_cap = max_tokens_cap
                 .or_else(|| p.and_then(|x| x.max_tokens_cap))
@@ -2127,13 +2134,12 @@ fn main() -> Result<()> {
                 return Err(anyhow::anyhow!("--image-max-tokens must be > 0"));
             }
             // projects.toml loading + cap resolution wired in run_serve.
-            // log draft flags at startup.
-            if let (Some(dp), Some(dk)) = (draft_model.as_deref(), draft_kind) {
+            if let Some(dp) = draft_model.as_deref() {
                 info!(
                     draft_model = %dp.display(),
-                    draft_kind = %dk,
+                    draft_kind = ?draft_kind,
                     draft_block_size = ?draft_block_size,
-                    "speculative decoding — draft_kind + draft_block_size"
+                    "speculative decoding — draft flags"
                 );
             }
             // Resolve --cache-type-* against the model config when a single

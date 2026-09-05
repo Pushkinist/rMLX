@@ -78,10 +78,11 @@ pub struct Case {
     #[serde(default)]
     pub ctv: Option<String>,
     /// Speculative-decoding drafter spec (path/slug/alias, resolved like
-    /// `model`). Pairs with `draft_kind`. Used by the `spec_decode` assert.
+    /// `model`). Used by the `spec_decode` assert.
     #[serde(default)]
     pub draft_model: Option<String>,
-    /// Drafter architecture family for `--draft-kind` (`mtp` | `dflash` | `eagle3`).
+    /// `--draft-kind` value, when the case wants to pass the flag; absent, the
+    /// engine reads the kind off the drafter's config.json.
     #[serde(default)]
     pub draft_kind: Option<String>,
     pub assert: Assert,
@@ -2729,7 +2730,9 @@ fn assert_spec_decode(
             format!("drafter `{spec}` unresolved — snapshot absent"),
         );
     };
-    let kind = case.draft_kind.as_deref().unwrap_or("mtp");
+    // The engine reads the kind off the drafter's config.json; a case names
+    // one only to exercise the flag.
+    let kind = case.draft_kind.as_deref();
     // The expected coherence token (default "Paris") may land in the thinking
     // block on a reasoning model, so a generous budget lets it close the block.
     let want = case.assert.expect.as_deref().unwrap_or("Paris");
@@ -2741,19 +2744,24 @@ fn assert_spec_decode(
     }
 
     claim_preflight();
-    let extra = vec![
+    let mut extra = vec![
         "--draft-model".to_owned(),
         draft.to_string_lossy().into_owned(),
-        "--draft-kind".to_owned(),
-        kind.to_owned(),
         "--max-ctx".to_owned(),
         "16384".to_owned(),
     ];
+    if let Some(kind) = kind {
+        extra.push("--draft-kind".to_owned());
+        extra.push(kind.to_owned());
+    }
     let guard = match spawn_serve_verbose_flags(model, port, &home, &extra) {
         Ok(g) => g,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&home);
-            return mk(Verdict::Fail, format!("spec serve ({kind}): {e}"));
+            return mk(
+                Verdict::Fail,
+                format!("spec serve ({}): {e}", kind.unwrap_or("kind from config")),
+            );
         }
     };
 
@@ -2789,6 +2797,7 @@ fn assert_spec_decode(
     let scraped = scrape_spec_accept(&home);
     let _ = std::fs::remove_dir_all(&home);
 
+    let kind = kind.unwrap_or("declared-kind");
     if !coherent || !mentions {
         return mk(
             Verdict::Fail,

@@ -95,23 +95,62 @@ fn mtp_reject_reason(arch: &str, model_type: &str) -> String {
     }
 }
 
+// ── Drafter kind ──────────────────────────────────────────────────────────────
+
+/// Tokens the drafter proposes per round when `--draft-block-size` is absent.
+const DEFAULT_DRAFT_TOKENS: usize = 4;
+
+/// The drafter kind a run is under.
+///
+/// `declared` is what the draft snapshot says it is ([`DraftKind::from_declaration`]);
+/// `flag` is `--draft-kind`. A declaration alone is enough, which is what lets a
+/// bare `--draft-model` run. The flag is for a snapshot that declares nothing —
+/// an MTP sidecar exported with an empty `config.json` — and is refused when it
+/// contradicts a declaration: no loader can build a snapshot as a kind it is
+/// not, and the tensor-name error it would die with later names neither side.
+///
+/// # Errors
+/// [`Error::SpeculativePairing`] when neither side names a kind, or both do and
+/// disagree.
+fn decide_draft_kind(
+    flag: Option<rmlx_models::DraftKind>,
+    declared: Option<rmlx_models::DraftKind>,
+    arch: &str,
+    model_type: &str,
+) -> rmlx_core::Result<rmlx_models::DraftKind> {
+    match (flag, declared) {
+        (Some(f), Some(d)) if f != d => Err(Error::SpeculativePairing {
+            reason: format!(
+                "--draft-kind {f} contradicts the draft snapshot, which declares itself \
+                 a {d} drafter (architectures[0] {arch:?}, model_type {model_type:?}); \
+                 drop the flag or point --draft-model at a {f} snapshot"
+            ),
+        }),
+        (Some(f), _) => Ok(f),
+        (None, Some(d)) => Ok(d),
+        (None, None) => Err(Error::SpeculativePairing {
+            reason: format!(
+                "the draft snapshot's config.json identifies no drafter (architectures[0] \
+                 {arch:?}, model_type {model_type:?}) — it is neither a sidecar head \
+                 (mtp / dflash / eagle3) nor a registered architecture; pass --draft-kind \
+                 to name it"
+            ),
+        }),
+    }
+}
+
 // ── SpeculativeGenerator ──────────────────────────────────────────────────────
 
-/// Generator backed by a (verifier, draft) pair under
-/// `rmlx_models::SpeculativeDispatcher`.
+/// Generator backed by a verifier and a drafter of one [`rmlx_models::DraftKind`].
 ///
-/// Algorithm: greedy speculative decoding. Draft proposes K
-/// tokens serially per round; verifier evaluates them in one
-/// prefill-style call and emits the longest matching prefix plus one
-/// bonus/correction token.
+/// Each round the drafter proposes up to `k` tokens; the verifier scores them
+/// in one cached forward and emits the accepted prefix plus its own next
+/// token. Which drafter runs is decided at construction from the draft
+/// snapshot's own `config.json`, or by an explicit `--draft-kind`.
 ///
-/// Phase 2 invariants:
-/// - K is fixed at construction time (default 4; tunable via
-///   `--draft-block-size`).
-/// - Verifier and draft both re-prefill on every round (no KV
-///   reconciliation — Phase 3).
-/// - Greedy only — no sampling. Temperature/seed in the request are
-///   ignored with a `tracing::warn!`.
+/// `k` is `--draft-block-size` (default 4). The two-model loops accept greedily
+/// at `temperature == 0` and by Leviathan stochastic acceptance above it; the
+/// sidecar loops are greedy only.
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal generator implementation — field set is coupled to the speculative-decoding lifecycle; adding a field requires updating from_snapshot and all constructors"
@@ -126,7 +165,7 @@ pub struct SpeculativeGenerator {
     max_ctx_override: Option<i32>,
     prompt_cache_slots: usize,
     eos_ids: Arc<Vec<u32>>,
-    /// Draft K (number of speculative tokens proposed per round).
+    /// Tokens the drafter proposes per round (`--draft-block-size`).
     k: usize,
     /// Effective max prompt-context length for the per-request guard — the
     /// ceiling `rmlx_models::context::resolve_context` produced at load from
@@ -137,12 +176,10 @@ pub struct SpeculativeGenerator {
     context_limits: rmlx_models::context::ContextLimits,
     /// A10: detokenization family from the verifier's `tokenizer.json`.
     tokenizer_kind: crate::detokenizer::TokenizerKind,
-    /// drafter architecture family (`--draft-kind`).
-    /// `None` = legacy path (plain SpeculativeDispatcher, no kind metadata).
-    /// /14/15 loaders branch on this to select the correct drafter.
-    pub draft_kind: Option<rmlx_models::DraftKind>,
-    /// draft block size (`--draft-block-size`).
-    /// `None` = use default (4).
+    /// Which drafter this generator runs. Never implicit: inferred from the
+    /// draft snapshot's declaration, or named by `--draft-kind`.
+    pub draft_kind: rmlx_models::DraftKind,
+    /// `--draft-block-size` as given; `None` takes the default.
     pub draft_block_size: Option<usize>,
     /// MTP sidecar drafter, `Some` only when `draft_kind == Mtp`.
     ///
@@ -198,27 +235,13 @@ impl std::fmt::Debug for SpeculativeGenerator {
 }
 
 impl SpeculativeGenerator {
-    /// Load a verifier + draft pair from disk and build the speculative
-    /// dispatcher.
+    /// Load a verifier + draft pair from disk and build the generator.
     ///
-    /// `verifier_dir` is the primary `--model` snapshot (its basename
-    /// becomes the OpenAI `model_id`). `draft_dir` is the smaller draft.
-    /// Vocab match is enforced inside `SpeculativeDispatcher::new`.
-    pub fn from_snapshots(
-        verifier_dir: &Path,
-        draft_dir: &Path,
-        cfg: &ModelLoadConfig,
-        gpu_gate: Arc<Mutex<()>>,
-    ) -> rmlx_core::Result<Self> {
-        Self::from_snapshots_with_id(verifier_dir, draft_dir, None, cfg, gpu_gate, None, None)
-    }
-
-    /// Like [`from_snapshots`] but accepts an explicit `model_id` override and
-    /// draft metadata (`draft_kind`, `draft_block_size`).
-    ///
-    /// When `model_id_override` is `None` the id is derived from `verifier_dir`
-    /// basename (existing behaviour). `draft_kind` / `draft_block_size` are
-    /// stored on the generator for /14/15 loaders that branch on kind.
+    /// `verifier_dir` is the primary `--model` snapshot; its basename becomes
+    /// the OpenAI `model_id` unless `model_id_override` names one. `draft_dir`
+    /// is the drafter: a full model or a sidecar head, decided by
+    /// [`decide_draft_kind`] from its `config.json` and the optional
+    /// `draft_kind` flag.
     pub fn from_snapshots_with_id(
         verifier_dir: &Path,
         draft_dir: &Path,
@@ -266,134 +289,127 @@ impl SpeculativeGenerator {
             "SpeculativeGenerator: parsed EOS token ids from verifier config"
         );
 
-        // branch on draft kind. For MTP / EAGLE-3 / DFlash the `--draft-model`
-        // folder is a sidecar HEAD, not a full model: the dispatcher holds the
-        // verifier alone (`load_verifier_only`) and the head is loaded beside
-        // it, driven by its own round loop. Only the final `else` arm — the
-        // `--draft-model` full-model case — has two models to load.
-        let (dispatcher, mtp_drafter, mtp_assistant, dflash_drafter, eagle3_drafter) = if matches!(
-            draft_kind,
-            Some(rmlx_models::DraftKind::Eagle3)
-        ) {
-            tracing::info!(
-                draft = %draft_dir.display(),
-                "SpeculativeGenerator: EAGLE-3 drafter — loading drafter"
-            );
-            let dispatcher =
-                rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
-            let hidden_size = dispatcher.verifier.hidden_size();
-            let vocab_size = dispatcher.verifier.vocab_size();
-            let drafter = rmlx_models::speculative::eagle3::Eagle3Drafter::load(
-                draft_dir,
-                hidden_size,
-                vocab_size,
-                &eos_ids,
-                device,
-            )?;
-            (
-                dispatcher,
-                None,
-                None,
-                None,
-                Some(Arc::new(Mutex::new(drafter))),
-            )
-        } else if matches!(draft_kind, Some(rmlx_models::DraftKind::DFlash)) {
-            tracing::info!(
-                draft = %draft_dir.display(),
-                "SpeculativeGenerator: DFlash drafter — loading drafter"
-            );
-            let dispatcher =
-                rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
-            let hidden_size = dispatcher.verifier.hidden_size();
-            let drafter = rmlx_models::speculative::dflash::DFlashDrafter::load(
-                draft_dir,
-                hidden_size,
-                device,
-            )?;
-            (
-                dispatcher,
-                None,
-                None,
-                Some(Arc::new(Mutex::new(drafter))),
-                None,
-            )
-        } else if matches!(draft_kind, Some(rmlx_models::DraftKind::Mtp)) {
-            tracing::info!(
-                draft = %draft_dir.display(),
-                "SpeculativeGenerator: MTP drafter — loading sidecar head"
-            );
-            let dispatcher =
-                rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
-            let hidden_size = dispatcher.verifier.hidden_size();
-            // Route by the draft model's detected architecture family — never
-            // by a substring leak. `--draft-kind mtp` covers two distinct
-            // drafter loaders, and a third (non-MTP) family must be rejected
-            // cleanly rather than falling through to the Qwen3.5 sidecar
-            // loader (which would leak a confusing `text_config missing
-            // num_experts` error for a draft that has no MoE config at all).
-            let draft_cfg = rmlx_loader::load_config(draft_dir)
-                .map_err(|e| Error::Other(format!("load_config (draft): {e}")))?;
-            let draft_arch = draft_cfg.architectures.first().map_or("", String::as_str);
-            let draft_model_type = draft_cfg
-                .extras
-                .get("model_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            match classify_mtp_draft(draft_arch, draft_model_type) {
-                MtpDraftFamily::Gemma4Assistant => {
-                    tracing::info!(
-                        draft = %draft_dir.display(),
-                        arch = draft_arch,
-                        model_type = draft_model_type,
-                        "SpeculativeGenerator: MTP dispatch — Gemma4 assistant drafter"
-                    );
-                    let drafter =
-                        rmlx_models::speculative::gemma4_assistant::Gemma4AssistantDrafter::load(
-                            draft_dir,
-                            hidden_size,
-                            device,
-                        )?;
-                    (dispatcher, None, Some(Arc::new(drafter)), None, None)
+        let draft_cfg = rmlx_loader::load_config(draft_dir)
+            .map_err(|e| Error::Other(format!("load_config (draft): {e}")))?;
+        let draft_arch = draft_cfg.architectures.first().map_or("", String::as_str);
+        let draft_model_type = draft_cfg
+            .extras
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let declared = rmlx_models::DraftKind::from_declaration(draft_arch, draft_model_type);
+        let draft_kind = decide_draft_kind(draft_kind, declared, draft_arch, draft_model_type)?;
+        tracing::info!(
+            draft = %draft_dir.display(),
+            arch = draft_arch,
+            model_type = draft_model_type,
+            ?declared,
+            %draft_kind,
+            "SpeculativeGenerator: drafter kind"
+        );
+
+        // For a sidecar head the `--draft-model` folder is not a full model:
+        // the dispatcher holds the verifier alone (`load_verifier_only`) and
+        // the head is loaded beside it, driven by its own round loop. Only the
+        // two-model kind has two models to load.
+        let (dispatcher, mtp_drafter, mtp_assistant, dflash_drafter, eagle3_drafter) =
+            match draft_kind {
+                rmlx_models::DraftKind::Eagle3 => {
+                    let dispatcher = rmlx_models::SpeculativeDispatcher::load_verifier_only(
+                        verifier_dir,
+                        device,
+                    )?;
+                    let hidden_size = dispatcher.verifier.hidden_size();
+                    let vocab_size = dispatcher.verifier.vocab_size();
+                    let drafter = rmlx_models::speculative::eagle3::Eagle3Drafter::load(
+                        draft_dir,
+                        hidden_size,
+                        vocab_size,
+                        &eos_ids,
+                        device,
+                    )?;
+                    (
+                        dispatcher,
+                        None,
+                        None,
+                        None,
+                        Some(Arc::new(Mutex::new(drafter))),
+                    )
                 }
-                MtpDraftFamily::Qwen35Mtp => {
-                    tracing::info!(
-                        draft = %draft_dir.display(),
-                        arch = draft_arch,
-                        model_type = draft_model_type,
-                        "SpeculativeGenerator: MTP dispatch — Qwen3.5 MTP sidecar"
-                    );
-                    let drafter = rmlx_models::speculative::mtp::MtpDrafter::load(
+                rmlx_models::DraftKind::DFlash => {
+                    let dispatcher = rmlx_models::SpeculativeDispatcher::load_verifier_only(
+                        verifier_dir,
+                        device,
+                    )?;
+                    let hidden_size = dispatcher.verifier.hidden_size();
+                    let drafter = rmlx_models::speculative::dflash::DFlashDrafter::load(
                         draft_dir,
                         hidden_size,
                         device,
                     )?;
                     (
                         dispatcher,
+                        None,
+                        None,
                         Some(Arc::new(Mutex::new(drafter))),
-                        None,
-                        None,
                         None,
                     )
                 }
-                MtpDraftFamily::Unsupported => {
-                    let reason = mtp_reject_reason(draft_arch, draft_model_type);
-                    tracing::error!(
-                        draft = %draft_dir.display(),
-                        arch = draft_arch,
-                        model_type = draft_model_type,
-                        "SpeculativeGenerator: MTP dispatch — rejecting unsupported draft family"
-                    );
-                    return Err(Error::SpeculativePairing { reason });
+                rmlx_models::DraftKind::Mtp => {
+                    let dispatcher = rmlx_models::SpeculativeDispatcher::load_verifier_only(
+                        verifier_dir,
+                        device,
+                    )?;
+                    let hidden_size = dispatcher.verifier.hidden_size();
+                    // `mtp` fronts two loaders, told apart by the draft's
+                    // family; a third family is refused here rather than
+                    // handed to the Qwen3.5 loader, whose failure would name
+                    // a missing MoE config instead of the real mismatch.
+                    match classify_mtp_draft(draft_arch, draft_model_type) {
+                        MtpDraftFamily::Gemma4Assistant => {
+                            let drafter =
+                                rmlx_models::speculative::gemma4_assistant::Gemma4AssistantDrafter::load(
+                                    draft_dir,
+                                    hidden_size,
+                                    device,
+                                )?;
+                            (dispatcher, None, Some(Arc::new(drafter)), None, None)
+                        }
+                        MtpDraftFamily::Qwen35Mtp => {
+                            let drafter = rmlx_models::speculative::mtp::MtpDrafter::load(
+                                draft_dir,
+                                hidden_size,
+                                device,
+                            )?;
+                            (
+                                dispatcher,
+                                Some(Arc::new(Mutex::new(drafter))),
+                                None,
+                                None,
+                                None,
+                            )
+                        }
+                        MtpDraftFamily::Unsupported => {
+                            let reason = mtp_reject_reason(draft_arch, draft_model_type);
+                            tracing::error!(
+                                draft = %draft_dir.display(),
+                                arch = draft_arch,
+                                model_type = draft_model_type,
+                                "SpeculativeGenerator: MTP dispatch — rejecting unsupported draft family"
+                            );
+                            return Err(Error::SpeculativePairing { reason });
+                        }
+                    }
                 }
-            }
-        } else {
-            let dispatcher = rmlx_models::SpeculativeDispatcher::load_speculative(
-                verifier_dir,
-                draft_dir,
-                device,
-            )?;
-            (dispatcher, None, None, None, None)
-        };
+                rmlx_models::DraftKind::TwoModel => {
+                    let dispatcher = rmlx_models::SpeculativeDispatcher::load_speculative(
+                        verifier_dir,
+                        draft_dir,
+                        device,
+                    )?;
+                    (dispatcher, None, None, None, None)
+                }
+            };
 
         let tk_path = verifier_dir.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tk_path)
@@ -408,11 +424,7 @@ impl SpeculativeGenerator {
             None => crate::detokenizer::TokenizerKind::Other,
         };
 
-        // Speculative lookahead K. Fixed at 4 (was the undocumented experimental
-        // RMLX_SPEC_K env, removed in the env-var cleanup; its only value was the
-        // default). The independent `--draft-block-size` flag still controls the
-        // round block size below (defaulting to k+1) — the two are decoupled.
-        let k: usize = 4;
+        let k = draft_block_size.unwrap_or(DEFAULT_DRAFT_TOKENS);
 
         // Speculative inherits the verifier's KV-cache sizing, so the
         // verifier's positional capacity is what the shared resolver bounds
@@ -461,16 +473,11 @@ impl SpeculativeGenerator {
             effective_max_ctx,
             context_limits,
             tokenizer_kind,
-            // drafter metadata for /14/15 loaders.
             draft_kind,
             draft_block_size,
-            // MTP sidecar drafter (Some only when draft_kind == Mtp).
             mtp_drafter,
-            // Gemma4-assistant shared-K/V drafter (the live MTP family).
             mtp_assistant,
-            // DFlash drafter (Some only when draft_kind == DFlash).
             dflash_drafter,
-            // EAGLE-3 drafter (Some only when draft_kind == Eagle3).
             eagle3_drafter,
         })
     }
@@ -540,31 +547,14 @@ impl Generator for SpeculativeGenerator {
             }));
         }
 
-        // the DFlash drafter round-loop is wired against the Qwen3.6-MoE
-        // verifier (multi-layer hidden capture + GDN snapshot/restore rollback +
-        // raw embed). Selected below in the blocking task via `dflash_drafter`.
-
-        // The MTP sidecar drafter round-loop is wired against the Qwen3.5/3.6-MoE
-        // verifier (forward_verify_capture penultimate-hidden + autoregressive
-        // draft_n over the reused Qwen3.5-MoE decoder layer + deferred greedy
-        // acceptance + GDN snapshot/restore rollback). Selected below in the
-        // blocking task via `mtp_drafter`.
-
         let (tx, rx) = tokio::sync::mpsc::channel::<rmlx_core::Result<GenerationToken>>(4);
 
         let dispatcher = Arc::clone(&self.dispatcher);
-        // clone the Gemma4-assistant drafter handle into the blocking
-        // task (Arc — `draft_n` borrows `&self`). `Some` selects the assistant
-        // MTP round-loop over the two-model spec path.
+        // The drafter handles move into the blocking task; exactly one is
+        // `Some`, set by the kind at construction, and selects the round loop.
         let mtp_assistant = self.mtp_assistant.clone();
-        // clone the DFlash drafter handle into the blocking task. `Some`
-        // selects the DFlash round-loop over the MTP / two-model spec path.
         let dflash_drafter = self.dflash_drafter.clone();
-        // clone the MTP sidecar drafter handle into the blocking task. `Some`
-        // selects the MTP round-loop over the two-model spec path.
         let mtp_drafter = self.mtp_drafter.clone();
-        // clone the EAGLE-3 drafter handle into the blocking task. `Some`
-        // selects the EAGLE-3 round-loop over the DFlash / MTP / two-model paths.
         let eagle3_drafter = self.eagle3_drafter.clone();
         let block_size = self.draft_block_size.unwrap_or(self.k + 1).max(2);
         let tokenizer = Arc::clone(&self.tokenizer);
@@ -668,15 +658,9 @@ impl Generator for SpeculativeGenerator {
                 "SpeculativeGenerator: stochastic acceptance active (Leviathan)"
             );
         }
-        // A3: think_splitter mirrors ArchGenerator. Speculative wraps a
-        // verifier `Architecture` so we can ask it directly. Today the
-        // verifier is Gemma4 in all production paths (Qwen3 speculative
-        // is unimplemented per L36 N48), so this is always `None`, but
-        // the wiring keeps the code symmetric for when L36 lands.
-        // thread budget + thinking-end id + the prompt-derived initial think
-        // channel through the same `new_for_request` constructor as the
-        // standard path, so the symmetry holds if a thinking verifier ever
-        // lands. also thread per-request delimiter overrides.
+        // Think-splitter mirrors ArchGenerator: budget, thinking-end id, the
+        // prompt-derived initial channel and per-request delimiters go through
+        // the same `new_for_request` constructor as the standard path.
         let thinking_budget = req.thinking_budget;
         let thinking_end_token_id = req.thinking_end_token_id;
         let splitter_open = req.prompt_think_open;
@@ -755,11 +739,9 @@ impl Generator for SpeculativeGenerator {
             let think_splitter_ref = &mut think_splitter;
             let tokenizer_ref = tokenizer.clone();
 
-            // same `Option<u32>` forced-token contract as the
-            // standard path. The production verifier is Gemma4 (non-thinking)
-            // so `think_splitter` is `None` here and this always returns
-            // `None`, but the wiring is symmetric for a future thinking
-            // verifier (L36).
+            // Same `Option<u32>` forced-token contract as the standard path.
+            // Every speculative loop discards it (see `emit_step`), so a
+            // thinking budget's force-close is inert here.
             let mut step_fn = |s: &rmlx_models::ProbeStep| -> Option<u32> {
                 // M30: record step arrival time for ITL computation.
                 timestamps_ref.push(Instant::now());

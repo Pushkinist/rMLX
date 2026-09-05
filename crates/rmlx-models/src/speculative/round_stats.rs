@@ -40,10 +40,6 @@
 
 use crate::speculative::DraftKind;
 
-/// `decode_config` drafter name for the classic two-model round loop, which is
-/// not one of the sidecar [`DraftKind`]s.
-const TWO_MODEL_KIND: &str = "two_model";
-
 /// Which round loop produced a request's tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpecLoop {
@@ -119,7 +115,7 @@ impl SpecLoop {
             Self::MtpAssistant | Self::MtpSidecar => DraftKind::Mtp.as_str(),
             Self::DFlash => DraftKind::DFlash.as_str(),
             Self::Eagle3 => DraftKind::Eagle3.as_str(),
-            Self::TwoModelGreedy | Self::TwoModelStochastic => TWO_MODEL_KIND,
+            Self::TwoModelGreedy | Self::TwoModelStochastic => DraftKind::TwoModel.as_str(),
         }
     }
 

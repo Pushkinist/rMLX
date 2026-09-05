@@ -494,3 +494,97 @@ fn a_stack_with_one_layer_that_cannot_roll_back_moves_no_layer() {
         "a target every layer can reach must move every layer"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Vocabulary pairing
+// ---------------------------------------------------------------------------
+
+/// A literal vocabulary: `pieces[i]` is the piece at id `i`.
+fn vocab_of(pieces: &[&str]) -> HashMap<String, u32> {
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(id, piece)| ((*piece).to_owned(), id as u32))
+        .collect()
+}
+
+/// The pairs `load_speculative` admits: one vocabulary spelled twice, and one
+/// that differs only by a short tail of specials the other side never emits —
+/// the shape a base and an audio release of one family actually ship.
+#[test]
+fn vocab_verdict_admits_identical_and_short_tail_pairs() {
+    let base = vocab_of(&["<pad>", "<bos>", "a", "b", "c"]);
+    assert!(vocab_pairing_verdict(&base, &base).is_ok());
+
+    let mut with_tail = base.clone();
+    for i in 0..7_u32 {
+        with_tail.insert(format!("<|special_{i}|>"), 5 + i);
+    }
+    assert!(vocab_pairing_verdict(&base, &with_tail).is_ok());
+    assert!(
+        vocab_pairing_verdict(&with_tail, &base).is_ok(),
+        "the tolerance is symmetric — either side may carry the tail"
+    );
+}
+
+/// A pair that agrees on size and disagrees on meaning is the case a
+/// `vocab_size` comparison cannot see, and the one that serves garbage rather
+/// than failing. The refusal names the id and both pieces.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_a_piece_that_differs_and_names_it() {
+    let verifier = vocab_of(&["<pad>", "<bos>", "a", "b", "c"]);
+    let draft = vocab_of(&["<pad>", "<bos>", "a", "B", "c"]);
+    let msg = vocab_pairing_verdict(&verifier, &draft)
+        .expect_err("same size, different piece at id 3")
+        .to_string();
+    assert!(msg.contains("token id 3"), "names the id: {msg}");
+    assert!(
+        msg.contains("\"b\"") && msg.contains("\"B\""),
+        "names both pieces: {msg}"
+    );
+
+    // An id one side skips inside the shared range is a difference too, not a
+    // tail: the other side can propose it.
+    let mut holed = verifier.clone();
+    holed.remove("a");
+    let msg = vocab_pairing_verdict(&verifier, &holed)
+        .expect_err("a hole inside the shared range")
+        .to_string();
+    assert!(
+        msg.contains("token id 2") && msg.contains("absent"),
+        "{msg}"
+    );
+}
+
+/// A tail past the tolerance is a different vocabulary, however well the
+/// prefix agrees. The bound is the one llama.cpp admits, so the two engines
+/// accept the same pairs.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_a_tail_past_the_tolerance() {
+    let base = vocab_of(&["<pad>", "<bos>", "a"]);
+    let mut long_tail = base.clone();
+    for i in 0..=(VOCAB_TAIL_TOLERANCE as u32) {
+        long_tail.insert(format!("<|extra_{i}|>"), 3 + i);
+    }
+    let msg = vocab_pairing_verdict(&base, &long_tail)
+        .expect_err("a tail of tolerance + 1 ids")
+        .to_string();
+    assert!(
+        msg.contains(&format!("{} more ids", VOCAB_TAIL_TOLERANCE + 1)),
+        "names the tail size: {msg}"
+    );
+
+    long_tail.remove(&format!("<|extra_{VOCAB_TAIL_TOLERANCE}|>"));
+    assert!(
+        vocab_pairing_verdict(&base, &long_tail).is_ok(),
+        "exactly the tolerance is admitted"
+    );
+}

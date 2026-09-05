@@ -101,8 +101,8 @@ mutually exclusive.
 | `--max-ctx` | u32 | (from model) | **Virtual ceiling** on context length, in tokens — NOT an eager allocation. The KV ring starts small (`KV_MAX_SEQ_DEFAULT = 4096`) and grows lazily up to this ceiling as the prompt fills; prompts over the ceiling are rejected. Short requests on a large-`--max-ctx` server thus decode at full speed (no long-context working-set tax — see `docs/KV_CACHE.md` §4.6). Bounded by the checkpoint's **positional capacity** (`max_position_embeddings`, extended by a declared `rope_scaling` or by `--yarn-factor`); a value above it is **refused**, never clamped — see §Context ceiling. Resolves to `min(capacity, 4096)` when unset. Must be ≥ 256 when set. |
 | `--idle-timeout-secs` | string | `15m` | Idle time before the model is unloaded. Accepts an integer count of seconds (`30`, `900`) OR a Go-style duration (`30s`, `15m`, `2h`, `24h`). Negative (`-1`) pins the model forever; `0` unloads after each response. Per-request override on **native** routes only (`POST /v1/models/{id}/load` body field `keep_alive`); OpenAI/Anthropic compat routes do not parse the field but still reset the timer on use. **Interaction with the single-MLX claim file:** the timer never bypasses the claim — when TTL fires it unloads the slot in-process; the cross-process claim file (`/tmp/rmlx.<port>.claim`) remains held for the lifetime of the `rmlx serve` process. |
 | `--prompt-cache-slots` | usize | 4 | Number of prompt-cache slots for multi-slot prefix matching. Set to `1` for legacy single-slot exact-match behaviour. **`0` disables the prompt cache**: no snapshot is ever stored, so every request runs a full prefill. It is a real state, not a one-slot cache — see `docs/PROMPT_CACHE.md` §Zero slots. A request carrying an `X-Session-Id` header widens this number by one slot per active session (session KV-reuse); `0` is not widened — a disabled cache stays disabled. |
-| `--draft-model` | path | — | Path to a draft model for speculative decoding. Requires `--draft-kind`. Must be a **different snapshot** from `--model`: a draft that is the verifier is refused at load, because it doubles the resident weights for no speedup. Sidecar drafters (`mtp` / `dflash` / `eagle3`) point here at the small head, not at a second full model. |
-| `--draft-kind` | `mtp \| dflash \| eagle3` | — | Drafter architecture. Requires `--draft-model`. Env: `MLX_VLM_DRAFT_KIND`. |
+| `--draft-model` | path | — | The drafter snapshot for speculative decoding: a sidecar head (`mtp` / `dflash` / `eagle3`) or a smaller full model of the verifier's family (`two_model`). Which one it is is read from its `config.json` — see `docs/SPECULATIVE.md` § "Which drafter a snapshot is". Must be a **different snapshot** from `--model`: a draft that is the verifier is refused at load, because it doubles the resident weights for no speedup. A full draft model must carry the verifier's tokenizer, checked id by id before either model loads. |
+| `--draft-kind` | `mtp \| dflash \| eagle3 \| two_model` | (from the snapshot) | Names the drafter kind for a `--draft-model` whose `config.json` declares none. Requires `--draft-model`. Refused when it contradicts what the snapshot declares. Env: `MLX_VLM_DRAFT_KIND`. |
 | `--draft-block-size` | usize | 4 | Tokens proposed per speculative round, capped by the drafter's own `block_size` (3 for both shipped Qwen3.5-family MTP sidecars, which carry no such key). Env: `MLX_VLM_DRAFT_BLOCK_SIZE`. |
 | `--max-tokens-cap` | u32 | `1048576` | Per-request `max_tokens` ceiling. Requests exceeding this receive HTTP 400. Only lowers the structural 1 048 576-token ceiling. |
 | `--max-timeout-secs` | u64 | 600 | Server-startup wall-clock timeout cap per request in seconds. `0` disables. |
@@ -1427,7 +1427,7 @@ persistent shell configuration.
 | `RMLX_YARN_FACTOR` | `--yarn-factor` | — | Qwen3-family YARN RoPE extension: a float `> 1.0` synthesises a YARN config at model load **and raises the positional capacity `--max-ctx` is bounded by** to `factor × original`. Only the window changes: a checkpoint that declares its own `beta_fast` / `beta_slow` keeps them; the paper defaults (`beta_fast=32, beta_slow=1`) apply only when the checkpoint declares no `rope_scaling`. It **overrides** a `rope_scaling` the config declares, so it also extends a checkpoint that already ships one. Architectures other than Qwen3 implement no RoPE scaling and log a warning that the flag was ignored. Flag wins over the env var. |
 | `RMLX_YARN_ORIGINAL_MAX` | `--yarn-original-max` | (checkpoint's declared `original_max_position_embeddings`, else `max_position_embeddings`) | Optional companion to `RMLX_YARN_FACTOR`: the pre-extension context size the scaling interpolates from. Flag wins. |
 | `RMLX_PROMPTS_DIR` | `--prompts-dir` | `<repo>/prompts/` | Directory containing prompt JSON files used by `rmlx baseline` and bench scripts. Flag wins. |
-| `MLX_VLM_DRAFT_KIND` | `--draft-kind` | — | Drafter architecture for speculative decoding. Values: `mtp`, `dflash`, `eagle3`. Flag wins. |
+| `MLX_VLM_DRAFT_KIND` | `--draft-kind` | — | Drafter kind, for a `--draft-model` whose `config.json` declares none. Values: `mtp`, `dflash`, `eagle3`, `two_model`. Flag wins. |
 | `MLX_VLM_DRAFT_BLOCK_SIZE` | `--draft-block-size` | `4` | Draft block size (tokens per speculative round). Flag wins. |
 
 ### Internal / advanced (not needed for normal use)
@@ -1517,7 +1517,14 @@ rmlx serve \
   --port 9000 \
   --max-loaded-models 3
 
-# Serve from a registry with speculative decoding
+# Serve with speculative decoding: a smaller full model of the same family
+# drafts for the verifier. The drafter kind is read off the draft's config.json.
+rmlx serve \
+  --model /path/to/gemma-4-e4b-it-mxfp8 \
+  --draft-model /path/to/gemma-4-e2b-it-mxfp8 \
+  --draft-block-size 4
+
+# Serve from a registry with a sidecar drafter, naming the kind explicitly
 rmlx serve \
   --registry ./registry.json \
   --draft-model /path/to/draft-snapshot \

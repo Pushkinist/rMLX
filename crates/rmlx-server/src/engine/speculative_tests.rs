@@ -1,11 +1,83 @@
-//! Unit tests for the `--draft-kind mtp` arch-family dispatch (issue #23).
+//! Unit tests for the load-time drafter routing.
 //!
-//! These cover the pure classifier `classify_mtp_draft` and the rejection
-//! message builder `mtp_reject_reason` — the load-time routing decision that
-//! keeps a plain Gemma4 draft from falling through to the Qwen3.5 MTP sidecar
-//! loader (which would leak a `text_config missing num_experts` error).
+//! `decide_draft_kind` picks the kind from the draft snapshot's declaration and
+//! the optional flag; `classify_mtp_draft` / `mtp_reject_reason` are the
+//! `mtp` family's second-level routing, which keeps a plain Gemma4 draft from
+//! falling through to the Qwen3.5 MTP sidecar loader (which would leak a
+//! `text_config missing num_experts` error).
 
-use super::{classify_mtp_draft, mtp_reject_reason, MtpDraftFamily};
+use super::{classify_mtp_draft, decide_draft_kind, mtp_reject_reason, MtpDraftFamily};
+use rmlx_models::DraftKind;
+
+// ── decide_draft_kind ────────────────────────────────────────────────────────
+
+/// A declaration alone selects the kind: this is what makes a bare
+/// `--draft-model` run, for every kind, including the two-model one.
+#[test]
+fn a_declaration_alone_selects_the_kind() {
+    for kind in [
+        DraftKind::Mtp,
+        DraftKind::DFlash,
+        DraftKind::Eagle3,
+        DraftKind::TwoModel,
+    ] {
+        assert_eq!(
+            decide_draft_kind(None, Some(kind), "arch", "type").ok(),
+            Some(kind)
+        );
+        assert_eq!(
+            decide_draft_kind(Some(kind), Some(kind), "arch", "type").ok(),
+            Some(kind),
+            "a flag that agrees with the declaration changes nothing"
+        );
+    }
+}
+
+/// The flag is for a snapshot that declares nothing.
+#[test]
+fn the_flag_names_an_undeclared_snapshot() {
+    assert_eq!(
+        decide_draft_kind(Some(DraftKind::Mtp), None, "", "").ok(),
+        Some(DraftKind::Mtp)
+    );
+}
+
+/// Nothing named on either side is refused, and the refusal says what the
+/// snapshot declared and what would settle it.
+#[test]
+fn an_undeclared_snapshot_without_a_flag_is_refused() {
+    let msg = decide_draft_kind(None, None, "FooForCausalLM", "foo")
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(
+        msg.contains("FooForCausalLM") && msg.contains("\"foo\""),
+        "{msg}"
+    );
+    assert!(msg.contains("--draft-kind"), "names the way out: {msg}");
+}
+
+/// A flag that contradicts the declaration is refused rather than obeyed: no
+/// loader can build a snapshot as a kind it is not, and the error it would
+/// die with later names neither side. The refusal names both.
+#[test]
+fn a_flag_that_contradicts_the_declaration_is_refused() {
+    let msg = decide_draft_kind(
+        Some(DraftKind::Mtp),
+        Some(DraftKind::TwoModel),
+        "Gemma4ForConditionalGeneration",
+        "gemma4",
+    )
+    .err()
+    .map_or_else(String::new, |e| e.to_string());
+    assert!(msg.contains("--draft-kind mtp"), "names the flag: {msg}");
+    assert!(msg.contains("two_model"), "names the declaration: {msg}");
+    assert!(
+        msg.contains("Gemma4ForConditionalGeneration"),
+        "names the snapshot's own words: {msg}"
+    );
+}
+
+// ── classify_mtp_draft ───────────────────────────────────────────────────────
 
 #[test]
 fn qwen35_mtp_sidecar_routes_to_mtp_drafter() {
