@@ -1071,7 +1071,8 @@ pub fn eagle3_generate_greedy(
                 &[1, 1, 1],
                 device,
             )?;
-            let corr_logits = verifier.logits_from_hidden(&h_corr, device)?;
+            // `v_final_hidden` is final-normed by `forward_verify_capture_hot`.
+            let corr_logits = verifier.logits_from_final_hidden(&h_corr, device)?;
             let corr_am = argmax(&corr_logits, -1, device)?;
             corr_am.eval()?;
             let corr_bytes = corr_am.to_bytes()?;

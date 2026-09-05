@@ -577,7 +577,7 @@ impl Qwen3_5MoeText {
         let h_normed = self.final_norm.forward(&h, device)?;
         let h_last = h_normed.slice(&[0, seq - k, 0], &[1, seq, hidden], &[1, 1, 1], device)?;
         let h_last = h_last.reshape(&[1, k, hidden], device)?;
-        let logits = self.logits_from_hidden(&h_last, device)?;
+        let logits = self.logits_from_final_hidden(&h_last, device)?;
 
         // Concat captures in requested order.
         let mut ordered: Vec<&Array> = Vec::with_capacity(capture_layer_ids.len());
@@ -796,7 +796,7 @@ impl Qwen3_5MoeText {
         let h_last_norm =
             h_normed.slice(&[0, seq_i - 1, 0], &[1, seq_i, hidden], &[1, 1, 1], device)?;
         let h_last_norm = h_last_norm.reshape(&[1, 1, hidden], device)?;
-        let last_logits = self.logits_from_hidden(&h_last_norm, device)?;
+        let last_logits = self.logits_from_final_hidden(&h_last_norm, device)?;
 
         // Re-order aux captures and slice to [1, seq, H] each.
         let mut ordered: Vec<Array> = Vec::with_capacity(capture_layer_ids.len());
@@ -951,6 +951,17 @@ impl Qwen3_5MoeText {
     /// `hidden`: `[1, n, hidden]` → `[1, n, vocab]`. Uses the tied
     /// `embed_tokens.as_linear` when `lm_head` is absent (mirrors `forward_arr`).
     pub fn logits_from_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
+        let h = self.final_norm.forward(hidden, device)?;
+        self.logits_from_final_hidden(&h, device)
+    }
+
+    /// The same, from a hidden state the caller has already final-normed.
+    ///
+    /// The two entry points exist because a speculative loop holds one or the
+    /// other depending on where in the verify pass it captured: naming which is
+    /// which is what keeps a missing — or doubled — `final_norm` from becoming a
+    /// silent reweighting of the vocabulary.
+    pub fn logits_from_final_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
         match &self.lm_head {
             Some(lm) => lm.forward(hidden, device),
             None => self.embed_tokens.as_linear(hidden, device),

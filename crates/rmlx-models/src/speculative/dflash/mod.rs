@@ -523,7 +523,8 @@ impl DFlashDrafter {
                 &[1, 1, 1],
                 device,
             )?;
-            let mut logits = verifier.logits_from_hidden(&row, device)?;
+            // `forward_block` ends with the drafter's own final norm.
+            let mut logits = verifier.logits_from_final_hidden(&row, device)?;
             if let Some(cap) = self.cfg.final_logit_softcapping {
                 let cap_arr = scalar_f32(cap).astype(logits.dtype(), device)?;
                 let scaled = divide(&logits, &cap_arr, device)?;

@@ -524,11 +524,17 @@ impl Architecture {
         }
     }
 
-    /// Re-derive logits from a pre-final-norm hidden state.
+    /// Re-derive logits from a **pre-final-norm** hidden state: `final_norm`
+    /// then the LM head.
     ///
     /// Inverse of the tail dropped by [`Architecture::forward_hidden_states`].
-    /// Routes to `Gemma4Text::logits_from_hidden`; other architectures return
-    /// `Error::Model`. `hidden`: `[1, n, hidden]` -> `[1, n, vocab]`.
+    /// Every architecture that implements it applies the norm — a caller
+    /// holding an already-normed hidden wants
+    /// [`Architecture::logits_from_final_hidden`] instead. The two contracts
+    /// used to share this one name, and the arch that did not norm quietly
+    /// reweighted the vocabulary by the norm's own weight vector for every
+    /// caller that handed it a raw capture.
+    /// `hidden`: `[1, n, hidden]` -> `[1, n, vocab]`.
     #[allow(
         clippy::unreachable,
         reason = "Architecture::Gemma4 and Qwen3_5Moe arms are handled by the outer match; \
@@ -554,7 +560,46 @@ impl Architecture {
                     Architecture::BitNet(_) => "BitNet",
                 };
                 Err(Error::Model(format!(
-                    "logits_from_hidden not yet wired for {arch} (Gemma4 only)"
+                    "logits_from_hidden not yet wired for {arch} (Gemma4 and \
+                     Qwen3.5-MoE only)"
+                )))
+            }
+        }
+    }
+
+    /// Logits from a hidden state the caller has **already final-normed**.
+    ///
+    /// The counterpart of [`Architecture::logits_from_hidden`]: LM head (and
+    /// the architecture's logit softcap) with no norm. A verify pass that
+    /// captured after the final norm — or a drafter with a final norm of its
+    /// own — holds this shape.
+    #[allow(
+        clippy::unreachable,
+        reason = "Architecture::Gemma4 and Qwen3_5Moe arms are handled by the outer match; \
+                  the inner arms are structurally unreachable -- required to exhaust the enum \
+                  for the arch-name string table"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
+    )]
+    pub fn logits_from_final_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
+        match self {
+            Architecture::Gemma4(m) => m.logits_from_final_hidden(hidden, device),
+            Architecture::Qwen3_5Moe(m) => m.logits_from_final_hidden(hidden, device),
+            other => {
+                let arch = match other {
+                    Architecture::Gemma4(_) | Architecture::Qwen3_5Moe(_) => unreachable!(),
+                    Architecture::Gemma3(_) => "Gemma3",
+                    Architecture::Qwen2(_) => "Qwen2",
+                    Architecture::Qwen3(_) => "Qwen3",
+                    Architecture::Laguna(_) => "Laguna",
+                    Architecture::Qwen3VlMoe(_) => "Qwen3VlMoe",
+                    Architecture::BitNet(_) => "BitNet",
+                };
+                Err(Error::Model(format!(
+                    "logits_from_final_hidden not yet wired for {arch} (Gemma4 and \
+                     Qwen3.5-MoE only)"
                 )))
             }
         }

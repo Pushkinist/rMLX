@@ -990,7 +990,17 @@ impl Gemma4Text {
     /// returns `[1, n, vocab]`.
     pub fn logits_from_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
         let h = self.final_norm.forward(hidden, device)?;
-        let logits = self.embed_tokens.as_linear(&h, device)?;
+        self.logits_from_final_hidden(&h, device)
+    }
+
+    /// The same, from a hidden state the caller has already final-normed.
+    ///
+    /// The two entry points exist because a speculative loop holds one or the
+    /// other depending on where in the verify pass it captured: naming which is
+    /// which is what keeps a missing — or doubled — `final_norm` from becoming a
+    /// silent reweighting of the vocabulary.
+    pub fn logits_from_final_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
+        let logits = self.embed_tokens.as_linear(hidden, device)?;
         apply_softcap(&logits, self.cfg.final_logit_softcapping, device)
     }
 
