@@ -570,7 +570,7 @@ Source of truth for `observations.metric`, `.unit`, `.direction`. Add to this ta
 | `ssd_hydrate_ms`                 | `ms`    | `lower_better`  | SSD-tier: raw per-hydrate duration observation (on request thread, RAM-miss cold path). One SQLite row per event. Real p50/p99 aggregation via Prometheus histogram `rmlx_ssd_hydrate_us_bucket`. rmlx-only. |
 | `ssd_spill_mb_per_s`             | `mb/s`  | `higher_better` | SSD-tier: spill throughput (bytes_written / dur_us). rmlx-only. |
 | `ssd_hydrate_mb_per_s`           | `mb/s`  | `higher_better` | SSD-tier: hydrate throughput (bytes_read / dur_us). rmlx-only. |
-| `ppl_wikitext2`                  | `ppl`   | `lower_better`  | Sliding-window perplexity over the wikitext-2 raw test split, computed by `rmlx eval ppl`. Architecture support: Qwen3 only (HTTP `echo` follow-up will widen coverage). rmlx-only. |
+| `ppl_wikitext2`                  | `ppl`   | `lower_better`  | Sliding-window perplexity over the wikitext-2 raw test split, computed by `rmlx eval ppl`. Architecture support: Qwen3, Gemma4, Qwen3.5. rmlx-only. |
 | `ppl_mean_nll`                   | `nat`   | `lower_better`  | Per-token mean negative log-likelihood from the same scorer (natural-log nats). Audit field paired with `ppl_*`. rmlx-only. |
 | `ppl_scored_tokens`              | `count` | `higher_better` | Number of corpus positions scored. Audit field. rmlx-only. |
 | `ppl_windows`                    | `count` | `higher_better` | Number of sliding-window forwards the scorer ran. Audit field. rmlx-only. |
@@ -736,6 +736,26 @@ because nothing enforces it.
   WHERE metric = 'ppl_wikitext2'
     AND ts_utc >= '2026-09-03'
     AND prompt_id IN (SELECT id FROM prompts WHERE name LIKE 'wikitext-2_ctx2048%');
+  ```
+
+- **Every `ppl_wikitext2` / `ppl_wikitext2_cached` row taken before the
+  sliding walk's warm-up was corrected** — the non-BOS scorer skipped
+  `ctx_window - stride` leading slots per window where the slot that scores
+  the first unseen corpus position is `ctx_window - stride - 1`, so exactly
+  one corpus position per window boundary was never scored. At the default
+  `--ctx-window 4096 --stride 2048` that is one position in 2048 (0.05% of
+  the denominator) and the resulting shift in `ppl` is far under any gate it
+  has been used for; at `stride == 1` it was total, every window after the
+  first scoring nothing. The Gemma4 scorer was always correct — it prepends
+  BOS, which shifts each target one slot, and it subtracted the one. Rows
+  before and after the correction are the same metric measured over denominators
+  differing by `(windows - 1)` positions; compare them, but do not read a
+  sub-0.1% delta between two eras as a model difference.
+
+  ```sql
+  SELECT * FROM observations
+  WHERE metric LIKE 'ppl_wikitext2%'
+    AND ts_utc < '2026-09-05';
   ```
 
 - **Two synthetic rows from an ingest-refusal probe** — a review of the

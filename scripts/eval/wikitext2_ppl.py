@@ -54,7 +54,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model",
         required=True,
-        help="Absolute path to an MLX model snapshot directory (Qwen3 family).",
+        help="Absolute path to an MLX model snapshot directory "
+        "(Qwen3, Gemma4 or Qwen3.5).",
     )
     p.add_argument(
         "--ctx-window",

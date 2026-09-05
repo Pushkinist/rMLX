@@ -1284,7 +1284,11 @@ One-shot idempotent ingestion of legacy JSONL/CSV/Markdown into the DB.
 ### `eval ppl`
 
 Computes perplexity over a text corpus using sliding-window NLL. Supported
-models: Qwen3 family (Bonsai is the smoke target).
+models: Qwen3, Gemma4 and Qwen3.5 (dense and MoE). Bonsai is the smoke
+target. The KV-codec flags below reach the cached scorer, which Qwen3.5 does
+not have — there its GatedDeltaNet layers carry a recurrent state no codec
+touches, so the command refuses rather than reporting a number that describes
+only the full-attention layers.
 
 Prints one JSON line to stdout:
 ```text

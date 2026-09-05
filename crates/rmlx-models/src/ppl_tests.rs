@@ -184,6 +184,10 @@ fn gemma4_error_message_advertises_support() {
         "error message must mention Gemma4: {msg}"
     );
     assert!(
+        msg.contains("Qwen3_5Moe"),
+        "error message must mention Qwen3_5Moe: {msg}"
+    );
+    assert!(
         msg.contains("LagunaForCausalLM"),
         "error message must include the unsupported arch name: {msg}"
     );
@@ -239,10 +243,10 @@ fn gemma4_dispatch_reaches_compute_fn() {
         "sentinel ArchUnsupported must carry the arch name: {msg}"
     );
     // Confirm the supported-arches list in the error message still includes
-    // both Qwen3 and Gemma4 (regression guard for the error text).
+    // every arch that has a scorer (regression guard for the error text).
     assert!(
-        msg.contains("Qwen3") && msg.contains("Gemma4"),
-        "supported-arches list must mention both Qwen3 and Gemma4: {msg}"
+        msg.contains("Qwen3") && msg.contains("Gemma4") && msg.contains("Qwen3_5Moe"),
+        "supported-arches list must mention Qwen3, Gemma4 and Qwen3_5Moe: {msg}"
     );
 }
 
@@ -286,4 +290,105 @@ fn a_window_with_no_scored_position_dispatches_nothing() {
         (sum_nll - 7.5).abs() < f64::EPSILON,
         "nothing was scored, so the accumulator cannot move"
     );
+}
+
+/// The shared sliding walk covers every scorable corpus position exactly once.
+///
+/// The two non-BOS scorers score positions `[warmup .. win.len() - 1)` of each
+/// window, so a corpus position `c` is scored by the window that owns the slot
+/// predicting it. Overlap is what `warmup` exists to remove: score a position
+/// twice and it is counted twice in a mean whose denominator is the scored
+/// count. No model and no GPU — the walk is index arithmetic and the closure
+/// stands in for the forward.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+fn sliding_walk_scores_each_position_once() {
+    // stride < ctx_window only: at `stride == ctx_window` the position after
+    // each window's last slot has no in-window predecessor and is genuinely
+    // unscorable, so full coverage is not the contract there.
+    let cases: &[(usize, usize, usize)] = &[
+        (10, 4, 1),
+        (20, 8, 4),
+        (100, 16, 8),
+        (25, 8, 5),
+        (17, 6, 4),
+        (3, 2, 1),
+    ];
+
+    for &(n_tokens, ctx_window, stride) in cases {
+        let tokens: Vec<u32> = (0..n_tokens as u32).collect();
+        let mut scored: Vec<usize> = Vec::new();
+        let mut start_of_window = 0_usize;
+
+        let report = sliding_window_ppl(
+            &tokens,
+            ctx_window,
+            stride,
+            |window, warmup, sum_nll, count| {
+                for t in warmup..(window.len() - 1) {
+                    // The corpus index whose NLL this slot contributes.
+                    scored.push(start_of_window + t + 1);
+                    *sum_nll += 1.0;
+                    *count += 1;
+                }
+                start_of_window += stride;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let unique: HashSet<usize> = scored.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            scored.len(),
+            "({n_tokens}, {ctx_window}, {stride}): a position was scored twice"
+        );
+        assert_eq!(
+            report.scored_tokens,
+            scored.len(),
+            "({n_tokens}, {ctx_window}, {stride}): report disagrees with the closure"
+        );
+        // Position 0 has no predecessor to predict it; every later one does.
+        let expected: HashSet<usize> = (1..n_tokens).collect();
+        assert_eq!(
+            unique, expected,
+            "({n_tokens}, {ctx_window}, {stride}): coverage is not the whole corpus tail"
+        );
+    }
+}
+
+/// Qwen3.5 has a cacheless scorer and no cached one, and says which.
+///
+/// A KV codec on that arch would describe the full-attention layers and
+/// silently not the GatedDeltaNet ones, so the command refuses. The message
+/// has to name the arch and the way out, or the caller reads it as "no scorer
+/// at all" and stops.
+#[test]
+fn qwen3_5_refuses_a_codec_and_names_the_cacheless_route() {
+    let err = PplError::CachedScorerUnsupported {
+        arch: "Qwen3_5ForConditionalGeneration".to_owned(),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Qwen3_5ForConditionalGeneration"),
+        "refusal must name the arch: {msg}"
+    );
+    assert!(
+        msg.contains("cacheless"),
+        "refusal must name the route that works: {msg}"
+    );
+
+    // Compile-time existence gate, as for the Gemma4 scorer above.
+    let _ = compute_ppl_qwen3_5_moe
+        as fn(
+            &Qwen3_5MoeText,
+            &[u32],
+            usize,
+            usize,
+            Device,
+            Option<KvQuant>,
+        ) -> std::result::Result<PplReport, PplError>;
 }

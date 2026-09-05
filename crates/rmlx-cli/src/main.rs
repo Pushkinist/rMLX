@@ -1551,7 +1551,7 @@ enum EvalCmd {
     /// Compute perplexity over a text corpus using sliding-window NLL.
     ///
     /// Loads `--model`, tokenizes `--text-file`, and runs the native PPL
-    /// scorer (Qwen3 family only — Bonsai is the smoke target).
+    /// scorer (Qwen3, Gemma4 and Qwen3.5 — Bonsai is the smoke target).
     /// Prints one JSON line to stdout: `{"ppl":..,"mean_nll":..,"scored_tokens":..,"windows":..}`.
     /// When `--corpus wikitext-2` (or any non-empty value) is supplied, also
     /// ingests one §8.5 universal `RunRecord` into `<RMLX_HOME>/metrics/runs.db`

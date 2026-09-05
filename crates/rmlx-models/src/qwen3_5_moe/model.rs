@@ -245,6 +245,49 @@ impl Qwen3_5MoeText {
         }
     }
 
+    /// Full-sequence forward returning logits at **every** position, shape
+    /// `[1, seq, vocab_size]`. The offline PPL scorer reads the per-position
+    /// log-likelihood of the actual corpus token off this tensor.
+    ///
+    /// Both cache kinds are absent, which on this hybrid means two different
+    /// things: the FullAttention layers recompute K/V inside the window, and
+    /// the GatedDeltaNet layers start from a zero conv tail and zero delta
+    /// state. Together that scores the window as a fresh document, which is
+    /// what a sliding-window scorer needs and what the same call on the two
+    /// non-hybrid architectures already gives.
+    pub fn forward_seq_logits_all(&self, ids: &[u32], device: Device) -> Result<Array> {
+        let seq = ids.len();
+        if seq == 0 {
+            return Err(rmlx_core::error::Error::Model(
+                "forward_seq_logits_all: empty prompt".to_owned(),
+            ));
+        }
+        let seq_i32 = seq as i32;
+        let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq_i32])?;
+
+        let shared_mask: Option<Array> =
+            if crate::layers::pick_attn_mask_mode(0, seq_i32) == "array" {
+                Some(crate::layers::build_chunked_prefill_mask(
+                    0, seq_i32, device,
+                )?)
+            } else {
+                None
+            };
+
+        let h = self.embed_tokens.forward(&ids_arr, device)?;
+        let mut h = h.reshape(&[1, seq_i32, self.cfg.hidden_size as i32], device)?;
+        for layer in &self.layers {
+            h = layer.forward(&h, 0, None, None, shared_mask.as_ref(), device)?;
+        }
+        let h = self.final_norm.forward(&h, device)?;
+
+        match &self.lm_head {
+            Some(lm) => lm.forward(&h, device),
+            None => self.embed_tokens.as_linear(&h, device),
+        }
+    }
+
     /// Cache-using forward returning logits at the **last `k` positions**
     /// (L36 Phase 4 — speculative verifier path).
     ///

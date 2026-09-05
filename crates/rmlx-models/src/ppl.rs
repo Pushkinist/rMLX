@@ -6,10 +6,16 @@
 //!
 //! # Scope
 //!
-//! Implemented for [`crate::Architecture::Qwen3`] (, Bonsai smoke target)
-//! and [`crate::Architecture::Gemma4`]. Other architectures return
-//! [`PplError::ArchUnsupported`]; adding parity paths for Qwen3.5MoE / Qwen3VL
-//! is a follow-up.
+//! Implemented for [`crate::Architecture::Qwen3`] (Bonsai smoke target),
+//! [`crate::Architecture::Gemma4`] and [`crate::Architecture::Qwen3_5Moe`]
+//! (dense and MoE alike). Other architectures return
+//! [`PplError::ArchUnsupported`].
+//!
+//! The cached scorer (`kv_quant = Some(codec)`) covers the first two only.
+//! Qwen3.5 returns [`PplError::CachedScorerUnsupported`]: its GatedDeltaNet
+//! layers carry a recurrent state that no KV codec touches, so a "scored
+//! through codec X" number there would describe the sixteen full-attention
+//! layers and silently not the other forty-eight.
 //!
 //! # Algorithm
 //!
@@ -44,6 +50,7 @@ use crate::decode_loop::chunked_prefill;
 use crate::gemma4::{Gemma4Text, LayerType};
 use crate::kv_cache::kv_layer_quants;
 use crate::qwen3::Qwen3Text;
+use crate::qwen3_5_moe::Qwen3_5MoeText;
 
 /// Errors that can short-circuit a PPL scoring run.
 #[non_exhaustive]
@@ -52,10 +59,16 @@ pub enum PplError {
     /// The model architecture does not yet have the `forward_seq_logits_all`
     /// path the scorer needs. See module docs.
     ///
-    /// implements Qwen3; adds Gemma4.
-    #[error("ppl: architecture '{arch}' is not supported (supported: Qwen3, Gemma4)")]
+    #[error("ppl: architecture '{arch}' is not supported (supported: Qwen3, Gemma4, Qwen3_5Moe)")]
     ArchUnsupported {
         /// The architecture name that is not yet supported.
+        arch: String,
+    },
+    /// The architecture has a cacheless scorer but no cached one, so a KV
+    /// codec cannot be scored through it. See the module docs.
+    #[error("ppl: architecture '{arch}' has no cached scorer; drop the KV-codec flags to score it cacheless")]
+    CachedScorerUnsupported {
+        /// The architecture name whose scorer keeps no cache.
         arch: String,
     },
     /// Window parameters are not usable (e.g. `stride > ctx_window`, or the
@@ -98,8 +111,8 @@ pub struct PplReport {
 /// already scored in the previous window).
 ///
 /// `tokens` must be the corpus tokenized end-to-end. Returns
-/// `Err(PplError::ArchUnsupported)` for any architecture other than Qwen3 or
-/// Gemma4.
+/// `Err(PplError::ArchUnsupported)` for any architecture other than Qwen3,
+/// Gemma4 or Qwen3.5.
 ///
 /// `kv_quant` selects between the two scorers:
 ///
@@ -142,6 +155,9 @@ pub fn compute_ppl(
         }
         Architecture::Gemma4(m) => {
             compute_ppl_gemma4(m, tokens, ctx_window, stride, device, kv_quant)
+        }
+        Architecture::Qwen3_5Moe(m) => {
+            compute_ppl_qwen3_5_moe(m, tokens, ctx_window, stride, device, kv_quant)
         }
         other => Err(PplError::ArchUnsupported {
             arch: other.arch_class().to_string(),
@@ -249,18 +265,24 @@ fn score_window_through_cache(
     Ok(())
 }
 
-#[instrument(skip(model, tokens), fields(n_tokens = tokens.len(), ctx_window, stride))]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-fn compute_ppl_qwen3(
-    model: &Qwen3Text,
+/// The sliding walk the two non-BOS scorers share.
+///
+/// Window bounds, the warm-up that keeps an overlapped position from being
+/// scored twice, and the running accumulators live here once; `score_window`
+/// supplies the architecture's forward and scores positions
+/// `[warmup .. win.len() - 1)`. The Gemma4 scorer does not use it: prepending
+/// BOS to every window shifts each corpus target one slot and gives that arch
+/// a different warm-up and a different stop condition.
+fn sliding_window_ppl(
     tokens: &[u32],
     ctx_window: usize,
     stride: usize,
-    device: Device,
-    kv_quant: Option<KvQuant>,
+    mut score_window: impl FnMut(
+        &[u32],
+        usize,
+        &mut f64,
+        &mut usize,
+    ) -> std::result::Result<(), PplError>,
 ) -> std::result::Result<PplReport, PplError> {
     if ctx_window < 2 {
         return Err(PplError::InvalidWindow {
@@ -278,7 +300,6 @@ fn compute_ppl_qwen3(
         });
     }
 
-    let vocab = model.cfg.vocab_size;
     let mut sum_nll: f64 = 0.0;
     let mut count: usize = 0;
     let mut windows: usize = 0;
@@ -287,53 +308,29 @@ fn compute_ppl_qwen3(
     let mut first = true;
     while start < tokens.len() {
         let end = (start + ctx_window).min(tokens.len());
-        let window = &tokens[start..end];
+        let window = tokens.get(start..end).unwrap_or_default();
         if window.len() < 2 {
             break;
         }
 
-        // warmup = number of leading positions whose NLL was already counted
-        // in the previous window. First window: 0. Subsequent windows: the
-        // overlap = ctx_window - stride.
+        // warmup = number of leading slots whose target was already scored by
+        // the previous window. First window: 0. Otherwise: slot `t` here
+        // scores corpus position `start + t + 1`, and the previous window
+        // stopped at `start - stride + ctx_window - 1`, so the first unscored
+        // slot is `ctx_window - stride - 1`. Skipping `ctx_window - stride`
+        // instead leaves exactly one corpus position unscored per window
+        // boundary, and at `stride == 1` leaves every window after the first
+        // scoring nothing at all.
         let warmup = if first {
             0
         } else {
-            ctx_window.saturating_sub(stride).min(window.len() - 1)
+            ctx_window
+                .saturating_sub(stride)
+                .saturating_sub(1)
+                .min(window.len() - 1)
         };
 
-        // Score positions [warmup .. window.len() - 1) -- predicting token at
-        // window[t+1] from logits[t].
-        match kv_quant {
-            None => {
-                let logits = model.forward_seq_logits_all(window, device)?;
-                let host = logits_3d_to_host_f32(&logits, window.len(), vocab)?;
-                for t in warmup..(window.len() - 1) {
-                    let row = &host[t * vocab..(t + 1) * vocab];
-                    accumulate_position_nll(
-                        row,
-                        window[t + 1] as usize,
-                        vocab,
-                        t,
-                        &mut sum_nll,
-                        &mut count,
-                    );
-                }
-            }
-            Some(q) => {
-                let mut caches = qwen3_ppl_caches(model, q, window.len());
-                score_window_through_cache(
-                    window,
-                    warmup,
-                    vocab,
-                    &mut caches,
-                    "qwen3",
-                    device,
-                    &mut sum_nll,
-                    &mut count,
-                    |ids, cs| model.forward_seq_with_cache(ids, Some(cs.as_mut_slice()), device),
-                )?;
-            }
-        }
+        score_window(window, warmup, &mut sum_nll, &mut count)?;
 
         windows += 1;
         debug!(
@@ -379,6 +376,103 @@ fn compute_ppl_qwen3(
         scored_tokens: count,
         windows,
     })
+}
+
+/// Score one window off a `[1, seq, vocab]` logit tensor computed in one
+/// cacheless forward: position `t` predicts `win[t + 1]`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the row slice is bounded by the loop's own `t < win.len() - 1` and the host buffer is sized `win.len() * vocab` by logits_3d_to_host_f32"
+)]
+fn score_window_cacheless(
+    logits: &Array,
+    win: &[u32],
+    warmup: usize,
+    vocab: usize,
+    sum_nll: &mut f64,
+    count: &mut usize,
+) -> Result<()> {
+    let host = logits_3d_to_host_f32(logits, win.len(), vocab)?;
+    for t in warmup..(win.len() - 1) {
+        let row = &host[t * vocab..(t + 1) * vocab];
+        accumulate_position_nll(row, win[t + 1] as usize, vocab, t, sum_nll, count);
+    }
+    Ok(())
+}
+
+#[instrument(skip(model, tokens), fields(n_tokens = tokens.len(), ctx_window, stride))]
+fn compute_ppl_qwen3(
+    model: &Qwen3Text,
+    tokens: &[u32],
+    ctx_window: usize,
+    stride: usize,
+    device: Device,
+    kv_quant: Option<KvQuant>,
+) -> std::result::Result<PplReport, PplError> {
+    let vocab = model.cfg.vocab_size;
+    sliding_window_ppl(
+        tokens,
+        ctx_window,
+        stride,
+        |window, warmup, sum_nll, count| {
+            match kv_quant {
+                None => {
+                    let logits = model.forward_seq_logits_all(window, device)?;
+                    score_window_cacheless(&logits, window, warmup, vocab, sum_nll, count)?;
+                }
+                Some(q) => {
+                    let mut caches = qwen3_ppl_caches(model, q, window.len());
+                    score_window_through_cache(
+                        window,
+                        warmup,
+                        vocab,
+                        &mut caches,
+                        "qwen3",
+                        device,
+                        sum_nll,
+                        count,
+                        |ids, cs| {
+                            model.forward_seq_with_cache(ids, Some(cs.as_mut_slice()), device)
+                        },
+                    )?;
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Sliding-window PPL scorer for the Qwen3.5 hybrid family, dense and MoE.
+///
+/// Cacheless only. The window is one `forward_seq_logits_all` call with no KV
+/// cache and no recurrent state carried in, so every layer kind sees the window
+/// as a fresh document — the same contract the other two cacheless scorers
+/// keep. A KV codec cannot be scored here; see [`PplError::CachedScorerUnsupported`].
+#[instrument(skip(model, tokens), fields(n_tokens = tokens.len(), ctx_window, stride))]
+fn compute_ppl_qwen3_5_moe(
+    model: &Qwen3_5MoeText,
+    tokens: &[u32],
+    ctx_window: usize,
+    stride: usize,
+    device: Device,
+    kv_quant: Option<KvQuant>,
+) -> std::result::Result<PplReport, PplError> {
+    if kv_quant.is_some() {
+        return Err(PplError::CachedScorerUnsupported {
+            arch: model.arch_class().to_owned(),
+        });
+    }
+    let vocab = model.cfg.vocab_size;
+    sliding_window_ppl(
+        tokens,
+        ctx_window,
+        stride,
+        |window, warmup, sum_nll, count| {
+            let logits = model.forward_seq_logits_all(window, device)?;
+            score_window_cacheless(&logits, window, warmup, vocab, sum_nll, count)?;
+            Ok(())
+        },
+    )
 }
 
 /// Sliding-window PPL scorer for the Gemma4 family.
@@ -489,18 +583,14 @@ fn compute_ppl_gemma4(
         match kv_quant {
             None => {
                 let logits = model.forward_seq_logits_all(&bos_window, device)?;
-                let host = logits_3d_to_host_f32(&logits, win_len, vocab)?;
-                for t in warmup..(win_len - 1) {
-                    let row = &host[t * vocab..(t + 1) * vocab];
-                    accumulate_position_nll(
-                        row,
-                        bos_window[t + 1] as usize,
-                        vocab,
-                        t,
-                        &mut sum_nll,
-                        &mut count,
-                    );
-                }
+                score_window_cacheless(
+                    &logits,
+                    &bos_window,
+                    warmup,
+                    vocab,
+                    &mut sum_nll,
+                    &mut count,
+                )?;
             }
             Some(q) => {
                 let mut caches = gemma4_ppl_caches(model, q, win_len);
