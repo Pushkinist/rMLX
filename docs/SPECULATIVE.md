@@ -203,6 +203,48 @@ zero-padded (`out.resize(total, 0.0)`) and the planar stores panicked on an
 out-of-range index. See `docs/KV_QUANT.md` § "Scope — every CPU-side store now
 cuts, and every one of them is loud".
 
+### Where a round's time goes
+
+The request-level `done` line reports `draft_ms`, `verifier_ms` and a residual
+`loop_ms_per_round`. Those are wall-clock spans around call sites, and this
+engine evaluates lazily, so a span is charged the work it *issued* only when
+something inside it blocks. Two consequences that have to be read with the
+numbers:
+
+- **A span with no blocking evaluation in it measures graph construction, not
+  work.** Both MTP loops now read the verifier's argmax back inside the verify
+  span, so `verifier_ms` is the verify forward in both. It was not always: the
+  sidecar loop used to close its span on the unevaluated forward and re-derive
+  the LM head position by position afterwards, which put most of the verify
+  forward into the residual and made the two loops' residuals incomparable.
+- **The rollback replay is still lazy by default.** Its output is discarded and
+  the state it writes is not read until the next round's verify forward, so the
+  second weight read a partial-accept round pays is billed to the *next* round's
+  `verifier_ms`.
+
+Per-round attribution comes from the `mtp round` / `mtp assistant round` event,
+target `rmlx::spec::phase`, one per round at `debug`:
+
+```
+round draft_ms verify_ms walk_ms rollback_ms other_ms round_ms
+accept num_draft replayed charged
+```
+
+`other_ms` is a signed residual — the round's own wall clock less the four
+phases — so a timer that escapes its phase reads negative rather than reading
+zero. `replayed` says whether that round took the GDN replay arm of
+`rollback_round_caches`.
+
+`charged` is the field that says how to read the rest. At `debug` the phases are
+timed but not forced, so the lazy tails above still move between them. At
+`trace` on the same target — `--log verbose`, or
+`RUST_LOG=info,rmlx::spec::phase=trace` for the split without per-token traces —
+each phase forces its own work before its span closes and the split becomes
+attributable. That run is also slower than the run it describes: the forced
+evaluations drain a pipeline the loop would otherwise keep full, and shedding
+exactly those drains is part of what the loop is being measured for. Compare a
+charged run's `round_ms` against an uncharged one's before trusting either.
+
 ## Per-drafter Deep Dive
 
 ### MTP — Multi-Token Prediction (Qwen3.5 sidecar)

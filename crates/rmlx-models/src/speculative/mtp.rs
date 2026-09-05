@@ -742,7 +742,9 @@ pub fn mtp_generate_greedy(
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
     let round_loop_t0 = Instant::now();
+    let charge_phases = super::phases_charged();
     while emitted.len() < n_tokens {
+        let round_t0 = Instant::now();
         rounds += 1;
         let remaining = n_tokens - emitted.len();
         let bs = block_total.min(remaining + 1).max(2);
@@ -755,7 +757,8 @@ pub fn mtp_generate_greedy(
         let draft_start = drafter.offset();
         let t0 = Instant::now();
         let draft_tokens = drafter.draft_n(verifier, b, &h_cond, bs, draft_pos)?;
-        draft_ns += t0.elapsed().as_nanos();
+        let round_draft_ns = t0.elapsed().as_nanos();
+        draft_ns += round_draft_ns;
         if draft_tokens.is_empty() {
             break;
         }
@@ -790,14 +793,17 @@ pub fn mtp_generate_greedy(
         let v_argmax = argmax(&v_logits, -1, device)?;
         v_argmax.eval()?;
         let vb = v_argmax.to_bytes()?;
-        verifier_ns += t0.elapsed().as_nanos();
+        let round_verify_ns = t0.elapsed().as_nanos();
+        verifier_ns += round_verify_ns;
 
         // -- Phase C: greedy acceptance walk over the verifier's own tokens.
+        let t0 = Instant::now();
         let mut v_tokens: Vec<u32> = Vec::with_capacity(v_k);
         for i in 0..v_k {
             v_tokens.push(u32::from_le_bytes(vb[i * 4..i * 4 + 4].try_into().unwrap()));
         }
         let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining);
+        let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
 
         // -- Emit accepted prefix + 1 correction/bonus. --
@@ -821,6 +827,7 @@ pub fn mtp_generate_greedy(
         // The verifier processed `v_k` positions (carry + bs-1 drafts). Committed
         // positions this round = accept (consumed drafts) + 1 carry. Drop the
         // unaccepted draft tail from the FA KV caches.
+        let t0 = Instant::now();
         let n_committed = new_tokens.len();
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
         let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
@@ -849,6 +856,7 @@ pub fn mtp_generate_greedy(
         // every round, silently degrading draft accept-rate.
         let d_target = draft_start + accept as i32 + 1;
         drafter.truncate_to(d_target)?;
+        let round_rollback_ns = t0.elapsed().as_nanos();
 
         // Next-round conditioning: the verifier hidden at the newly accepted
         // bonus slot (= position `accept` of the captured penultimate hidden).
@@ -861,7 +869,9 @@ pub fn mtp_generate_greedy(
         b = *new_tokens.last().unwrap_or(&b);
         draft_pos += n_committed as i32;
 
+        let round_ns = round_t0.elapsed().as_nanos();
         tracing::debug!(
+            target: super::PHASE_TARGET,
             round = rounds,
             accept,
             num_draft = draft_tokens.len(),
@@ -870,6 +880,18 @@ pub fn mtp_generate_greedy(
             v_offset_before,
             v_target,
             draft_pos,
+            replayed = v_target < v_offset_before,
+            charged = charge_phases,
+            round_ms = super::ms(round_ns),
+            draft_ms = super::ms(round_draft_ns),
+            verify_ms = super::ms(round_verify_ns),
+            walk_ms = super::ms(round_walk_ns),
+            rollback_ms = super::ms(round_rollback_ns),
+            other_ms = super::ms(round_ns)
+                - super::ms(round_draft_ns)
+                - super::ms(round_verify_ns)
+                - super::ms(round_walk_ns)
+                - super::ms(round_rollback_ns),
             "mtp round"
         );
     }

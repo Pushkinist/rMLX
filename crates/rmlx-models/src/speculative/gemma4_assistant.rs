@@ -841,7 +841,9 @@ pub fn mtp_assistant_generate_greedy(
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
     let round_loop_t0 = Instant::now();
+    let charge_phases = super::phases_charged();
     while emitted.len() < n_tokens {
+        let round_t0 = Instant::now();
         rounds += 1;
         let remaining = n_tokens - emitted.len();
         let bs = (remaining + 1).min(block_size).max(2);
@@ -857,7 +859,8 @@ pub fn mtp_assistant_generate_greedy(
             kv_offset,
             bs,
         )?;
-        draft_ns += t0.elapsed().as_nanos();
+        let round_draft_ns = t0.elapsed().as_nanos();
+        draft_ns += round_draft_ns;
         if draft_tokens.is_empty() {
             break;
         }
@@ -882,7 +885,9 @@ pub fn mtp_assistant_generate_greedy(
         let v_argmax = argmax(&v_logits, -1, device)?;
         v_argmax.eval()?;
         let vb = v_argmax.to_bytes()?;
-        verifier_ns += t0.elapsed().as_nanos();
+        let round_verify_ns = t0.elapsed().as_nanos();
+        verifier_ns += round_verify_ns;
+        let t0 = Instant::now();
         let mut v_tokens: Vec<u32> = Vec::with_capacity(v_k);
         for i in 0..v_k {
             v_tokens.push(u32::from_le_bytes(vb[i * 4..i * 4 + 4].try_into().unwrap()));
@@ -890,6 +895,7 @@ pub fn mtp_assistant_generate_greedy(
 
         // -- Phase C: greedy acceptance walk. --------------------------------
         let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining);
+        let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
         // -- Emit accepted prefix + 1 correction/bonus. --
         let mut hit_eos = false;
@@ -911,6 +917,7 @@ pub fn mtp_assistant_generate_greedy(
         // -- Phase D: rollback + next-round setup. ---------------------------
         // The verifier consumed v_k positions; valid prefix = prev + accept + 1
         // (the correction v_tokens[accept] is a prediction, not yet processed).
+        let t0 = Instant::now();
         let v_target = pre_round_offset + accept as i32 + 1;
         let rejected = v_k as i32 - (accept as i32 + 1);
         if rejected > 0 {
@@ -948,14 +955,37 @@ pub fn mtp_assistant_generate_greedy(
         sliding_kv = drop_kv_tail(&new_sliding, rejected, device)?;
         full_kv = drop_kv_tail(&new_full, rejected, device)?;
         kv_offset = v_target;
+        if charge_phases {
+            // The trimmed K/V is not read until the next round's drafter call,
+            // so nothing forces these slices here and the trim is billed to
+            // that round. See `phases_charged`.
+            for a in [&sliding_kv.0, &sliding_kv.1, &full_kv.0, &full_kv.1] {
+                a.eval()?;
+            }
+        }
+        let round_rollback_ns = t0.elapsed().as_nanos();
 
+        let round_ns = round_t0.elapsed().as_nanos();
         tracing::debug!(
+            target: super::PHASE_TARGET,
             round = rounds,
             accept,
             num_draft = draft_tokens.len(),
             emitted_total = emitted.len(),
             pre_round_offset,
             v_target,
+            replayed = false,
+            charged = charge_phases,
+            round_ms = super::ms(round_ns),
+            draft_ms = super::ms(round_draft_ns),
+            verify_ms = super::ms(round_verify_ns),
+            walk_ms = super::ms(round_walk_ns),
+            rollback_ms = super::ms(round_rollback_ns),
+            other_ms = super::ms(round_ns)
+                - super::ms(round_draft_ns)
+                - super::ms(round_verify_ns)
+                - super::ms(round_walk_ns)
+                - super::ms(round_rollback_ns),
             "mtp assistant round"
         );
     }

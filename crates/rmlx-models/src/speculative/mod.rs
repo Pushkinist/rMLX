@@ -49,7 +49,7 @@ use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-pub(crate) use round_stats::{RoundStats, SpecLoop};
+pub(crate) use round_stats::{ms, phases_charged, RoundStats, SpecLoop, PHASE_TARGET};
 
 /// Resolve the context bounds a speculative pair runs under.
 ///
@@ -1733,7 +1733,14 @@ fn rollback_round_caches(
         // already the answer and the caches are already at `target_offset`.
         return Ok(());
     }
-    let _ = arch.forward_seq_last_k_with_cache(&round_tokens[..kept], 1, kv, Some(lin), device)?;
+    let replayed =
+        arch.forward_seq_last_k_with_cache(&round_tokens[..kept], 1, kv, Some(lin), device)?;
+    if phases_charged() {
+        // Nothing reads this replay until the next round's verify forward, so
+        // with nothing forcing it here the whole second weight read is billed
+        // to that round's verify span. See `phases_charged`.
+        replayed.eval()?;
+    }
     Ok(())
 }
 

@@ -146,8 +146,32 @@ impl SpecLoop {
     }
 }
 
+/// The target the per-round phase split is logged under, and the switch that
+/// decides whether those phases are charged for the work they issue.
+pub(crate) const PHASE_TARGET: &str = "rmlx::spec::phase";
+
+/// Whether a round loop forces each phase's work before closing its span.
+///
+/// The phase spans wrap call sites and this engine evaluates lazily, so a
+/// call's work is paid wherever the next blocking evaluation falls — not
+/// necessarily in the phase that issued it. The rollback replay is the clear
+/// case: its output is discarded and the state it writes is not read until the
+/// next round's verify forward, so with nothing forcing it the whole replay is
+/// billed to that round's verify span.
+///
+/// At TRACE on [`PHASE_TARGET`] each phase forces its own work before its span
+/// closes and the split becomes attributable. It is then also a different,
+/// slower run — the forced evaluations drain a pipeline the loop would
+/// otherwise keep full, and shedding exactly those drains is part of what the
+/// loop is being measured for. The per-round event carries the answer as
+/// `charged`, so a reader never has to infer which run a split came from, and
+/// the request-level record is unaffected either way.
+pub(crate) fn phases_charged() -> bool {
+    tracing::enabled!(target: PHASE_TARGET, tracing::Level::TRACE)
+}
+
 /// Nanoseconds to milliseconds.
-fn ms(ns: u128) -> f64 {
+pub(crate) fn ms(ns: u128) -> f64 {
     (ns as f64) / 1.0e6
 }
 
