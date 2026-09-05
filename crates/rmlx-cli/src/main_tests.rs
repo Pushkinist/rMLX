@@ -22,6 +22,24 @@ fn default_env_filter_does_not_contain_debug() {
     );
 }
 
+/// The verbose preset must not raise the *global* default level.
+///
+/// A bare `trace` there puts every dependency's trace events in the log and
+/// satisfies engine-side `tracing::enabled!(target: ...)` checks that were
+/// written to be opt-in by target — the speculative round loops' phase-charging
+/// switch is one, and satisfying it changes how the engine schedules work. The
+/// preset's own doc comment has always said "trace on rmlx crates"; this pins
+/// the string to it.
+#[test]
+fn verbose_env_filter_leaves_the_global_default_at_info() {
+    let filter_str = LogLevel::Verbose.env_filter();
+    assert!(
+        filter_str.starts_with("info,"),
+        "verbose EnvFilter must leave the global default at info and raise only \
+         the rmlx crates, got: {filter_str:?}"
+    );
+}
+
 // ── clap parse-time validation ───────────────────────────────────
 
 /// `--draft-model` stands alone: the drafter kind is read from the snapshot.

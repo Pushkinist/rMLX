@@ -826,6 +826,7 @@ impl SpeculativeDispatcher {
                     round_loop_ns: round_loop_t0.elapsed().as_nanos(),
                     elapsed_ns: t_total.elapsed().as_nanos(),
                     decode_tps: window.tps(),
+                    charged: false,
                 }
                 .log_done();
                 return Ok(emitted);
@@ -864,6 +865,8 @@ impl SpeculativeDispatcher {
                     &v_input,
                     v_offset_before - v_k as i32,
                     v_target,
+                    // This loop times no phases, so it never charges one.
+                    false,
                     device,
                 )?;
             } else {
@@ -898,6 +901,8 @@ impl SpeculativeDispatcher {
                     &d_fed,
                     d_pre_round_offset,
                     d_target,
+                    // This loop times no phases, so it never charges one.
+                    false,
                     device,
                 )?;
             } else {
@@ -945,6 +950,7 @@ impl SpeculativeDispatcher {
             round_loop_ns: round_loop_t0.elapsed().as_nanos(),
             elapsed_ns: t_total.elapsed().as_nanos(),
             decode_tps: window.tps(),
+            charged: false,
         }
         .log_done();
 
@@ -1252,6 +1258,7 @@ impl SpeculativeDispatcher {
                     round_loop_ns: round_loop_t0.elapsed().as_nanos(),
                     elapsed_ns: t_total.elapsed().as_nanos(),
                     decode_tps: window.tps(),
+                    charged: false,
                 }
                 .log_done();
                 return Ok(emitted);
@@ -1277,6 +1284,8 @@ impl SpeculativeDispatcher {
                     &v_input,
                     v_offset_before - v_k as i32,
                     v_target,
+                    // This loop times no phases, so it never charges one.
+                    false,
                     device,
                 )?;
             } else {
@@ -1301,6 +1310,8 @@ impl SpeculativeDispatcher {
                     &d_fed,
                     d_pre_round_offset,
                     d_target,
+                    // This loop times no phases, so it never charges one.
+                    false,
                     device,
                 )?;
             } else {
@@ -1344,6 +1355,7 @@ impl SpeculativeDispatcher {
             round_loop_ns: round_loop_t0.elapsed().as_nanos(),
             elapsed_ns: t_total.elapsed().as_nanos(),
             decode_tps: window.tps(),
+            charged: false,
         }
         .log_done();
 
@@ -1678,6 +1690,11 @@ pub(crate) fn accept_prefix(
 /// Call this only when the round actually dropped positions
 /// (`target_offset < offset_before`); on a full accept there is nothing to roll
 /// back and the snapshot is simply dropped.
+///
+/// `charge` is the calling loop's per-request answer from
+/// [`phases_charged`], not a decision this function makes. Six loops share it
+/// and two of them time their phases; reading the switch here would change the
+/// schedule of the other four with nothing on their records saying so.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -1691,6 +1708,7 @@ fn rollback_round_caches(
     round_tokens: &[u32],
     pre_round_offset: i32,
     target_offset: i32,
+    charge: bool,
     device: Device,
 ) -> Result<()> {
     let Some((lin, snapshot)) = lin.zip(snapshot).filter(|(l, _)| !l.is_empty()) else {
@@ -1735,7 +1753,7 @@ fn rollback_round_caches(
     }
     let replayed =
         arch.forward_seq_last_k_with_cache(&round_tokens[..kept], 1, kv, Some(lin), device)?;
-    if phases_charged() {
+    if charge {
         // Nothing reads this replay until the next round's verify forward, so
         // with nothing forcing it here the whole second weight read is billed
         // to that round's verify span. See `phases_charged`.

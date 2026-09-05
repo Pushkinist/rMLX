@@ -245,6 +245,18 @@ evaluations drain a pipeline the loop would otherwise keep full, and shedding
 exactly those drains is part of what the loop is being measured for. Compare a
 charged run's `round_ms` against an uncharged one's before trusting either.
 
+**The decision is the loop's, made once per request, and it travels on the
+record.** `phases_charged()` is read at the loop head and passed down — to
+`rollback_round_caches` as an argument, and onto `RoundStats::charged`, which
+`mtp_generate_greedy: done` carries and `scripts/spec_bench.sh` ingests. Two
+things depend on that. `rollback_round_caches` is shared by six loops and only
+two of them time their phases; a switch it read on its own behalf would change
+how the other four schedule work, with nothing on their records saying so — they
+pass `false` and report `charged=false`. And a charged request's `verifier_ms`,
+`loop_ms_per_round` and `decode_tps` describe a differently scheduled engine, so
+without the field on the `done` line such a row would be indistinguishable from a
+normal one in an append-only store.
+
 ## Per-drafter Deep Dive
 
 ### MTP — Multi-Token Prediction (Qwen3.5 sidecar)

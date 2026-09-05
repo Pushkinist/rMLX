@@ -773,6 +773,7 @@ pub fn dflash_generate_greedy(
             round_loop_ns: 0,
             elapsed_ns: t_total.elapsed().as_nanos(),
             decode_tps: window.tps(),
+            charged: false,
         }
         .log_done();
         return Ok(emitted);
@@ -886,6 +887,8 @@ pub fn dflash_generate_greedy(
                 &v_input,
                 v_pre_round_offset,
                 v_target,
+                // This loop times no phases, so it never charges one.
+                false,
                 device,
             )?;
         } else {
@@ -938,6 +941,7 @@ pub fn dflash_generate_greedy(
         round_loop_ns,
         elapsed_ns: t_total.elapsed().as_nanos(),
         decode_tps: window.tps(),
+        charged: false,
     }
     .log_done();
 

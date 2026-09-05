@@ -46,6 +46,7 @@ fn sample(loop_kind: SpecLoop) -> RoundStats {
         verifier_ns: 400_000_000,
         round_loop_ns: 1_200_000_000,
         elapsed_ns: 1_800_000_000,
+        charged: false,
         decode_tps: Some(20.0),
     }
 }
@@ -393,5 +394,96 @@ fn loops_that_are_one_drafter_share_a_kind() {
     assert_ne!(
         SpecLoop::TwoModelGreedy.draft_kind(),
         SpecLoop::MtpSidecar.draft_kind()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The charge switch
+// ---------------------------------------------------------------------------
+
+/// A subscriber that answers `enabled` from a fixed verdict and keeps every
+/// question it was asked.
+///
+/// Not a filter. It exists to record *what* [`phases_charged`] asks about,
+/// which is the part a mutation moves: a switch retargeted at another string,
+/// or lowered from `TRACE` to `DEBUG` — which would charge every `--log debug`
+/// run — changes the recorded question rather than the recorded answer, and a
+/// test that only checked the answer would stay green through both.
+struct AskRecorder {
+    verdict: bool,
+    asked: std::sync::Mutex<Vec<(String, tracing::Level)>>,
+}
+
+impl AskRecorder {
+    fn new(verdict: bool) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            verdict,
+            asked: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn questions(&self) -> Vec<(String, tracing::Level)> {
+        // A poisoned lock still holds the questions; this fixture has no
+        // invariant a panicking writer could have broken.
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl tracing::Subscriber for AskRecorder {
+    fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((meta.target().to_owned(), *meta.level()));
+        self.verdict
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[test]
+fn the_charge_switch_asks_about_the_phase_target_at_trace() {
+    let rec = AskRecorder::new(true);
+    let charged =
+        tracing::subscriber::with_default(std::sync::Arc::clone(&rec), super::phases_charged);
+    assert!(
+        charged,
+        "a subscriber that enables everything must leave the phases charged"
+    );
+    let asked = rec.questions();
+    assert!(
+        !asked.is_empty(),
+        "the switch consulted no subscriber, so this test asserts nothing about it"
+    );
+    let want = (super::PHASE_TARGET.to_owned(), tracing::Level::TRACE);
+    // Every question, not their number: the macro is free to ask more than
+    // once, and pinning the count would pin its implementation rather than the
+    // switch's.
+    assert!(
+        asked.iter().all(|q| *q == want),
+        "the switch must ask about {} at TRACE and nothing else — at DEBUG it would \
+         charge every `--log debug` run, and on another target it would answer to a \
+         filter no documentation names. Asked: {asked:?}",
+        super::PHASE_TARGET
+    );
+}
+
+#[test]
+fn a_subscriber_that_declines_the_phase_target_leaves_the_phases_uncharged() {
+    let rec = AskRecorder::new(false);
+    let charged = tracing::subscriber::with_default(rec, super::phases_charged);
+    assert!(
+        !charged,
+        "the default schedule is the uncharged one: a filter that does not enable \
+         the phase target must not make the engine drain its pipeline per round"
     );
 }

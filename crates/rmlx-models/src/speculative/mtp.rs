@@ -661,6 +661,8 @@ pub fn mtp_generate_greedy(
     let mut total_draft = 0usize;
     let mut total_accept = 0usize;
     let mut rounds = 0usize;
+    // One read of process-global log state per request, at the loop head.
+    let charge_phases = super::phases_charged();
     let t_total = Instant::now();
     let mut window = DecodeWindow::new();
     let mut draft_ns: u128 = 0;
@@ -725,6 +727,7 @@ pub fn mtp_generate_greedy(
             round_loop_ns: 0,
             elapsed_ns: t_total.elapsed().as_nanos(),
             decode_tps: window.tps(),
+            charged: charge_phases,
         }
         .log_done();
         return Ok(emitted);
@@ -742,7 +745,6 @@ pub fn mtp_generate_greedy(
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
     let round_loop_t0 = Instant::now();
-    let charge_phases = super::phases_charged();
     while emitted.len() < n_tokens {
         let round_t0 = Instant::now();
         rounds += 1;
@@ -841,6 +843,7 @@ pub fn mtp_generate_greedy(
                 &v_input,
                 v_pre_round_offset,
                 v_target,
+                charge_phases,
                 device,
             )?;
         } else {
@@ -912,6 +915,7 @@ pub fn mtp_generate_greedy(
         round_loop_ns,
         elapsed_ns: t_total.elapsed().as_nanos(),
         decode_tps: window.tps(),
+        charged: charge_phases,
     }
     .log_done();
 
