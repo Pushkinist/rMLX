@@ -88,6 +88,9 @@
 //! | `gemma-4-e2b-it-mxfp8` | `gemma-4-E2B-it-assistant-bf16` | shared-K/V assistant | KV truncation, SWA ring included |
 //! | `Qwen3.8-27B-mxfp8` | `Qwen3.8-27B-MTP-mxfp8` | MTP sidecar | KV truncation + recurrent snapshot/replay |
 //!
+//! The first runs wherever the snapshots are; the second runs on request — see
+//! [`DrafterSource`] for the shader-validation reason.
+//!
 //! The second is the pair whose agreement no subsequence floor could separate
 //! from a broken rollback. The divergence oracle settled it: its acceptance walk
 //! was scoring an un-normed hidden through the LM head, and with that fixed
@@ -1208,8 +1211,27 @@ enum RoundLoop {
 /// One verifier + drafter the gate can run.
 struct Pair {
     verifier: common::GoldenModel,
-    drafter_slug: &'static str,
+    drafter: DrafterSource,
     round_loop: RoundLoop,
+}
+
+/// How a pair's drafter is found, and so whether `make gpu-test` selects the
+/// pair on a machine that merely holds the snapshots.
+enum DrafterSource {
+    /// Resolved by slug from `RMLX_O_MODELS_ROOT`, like the verifier — the pair
+    /// runs wherever the snapshots are.
+    Slug(&'static str),
+    /// Named by an operator or not run at all.
+    ///
+    /// Its verifier drives an MLX quantized matmul whose `load_safe` bound is
+    /// the one `scripts/gpu_validation_census.txt` records, so a run under Metal
+    /// shader validation reports over a thousand invalid loads from a kernel
+    /// this repo does not compile. The census pins one exact count per test, and
+    /// a count from a 256-token generation moves with every prompt — so pinning
+    /// this pair would make the census brittle rather than informative. Until
+    /// that is settled the pair runs on request and `make gpu-test` reports it
+    /// as skipped, with the variable that would run it named.
+    Named,
 }
 
 /// The pair the floors were measured on: a full-attention-plus-SWA verifier
@@ -1219,7 +1241,7 @@ const ASSISTANT_PAIR: Pair = Pair {
         slug: "mlx-community__gemma-4-e2b-it-mxfp8",
         archs: &["Gemma4ForConditionalGeneration"],
     },
-    drafter_slug: "mlx-community__gemma-4-E2B-it-assistant-bf16",
+    drafter: DrafterSource::Slug("mlx-community__gemma-4-E2B-it-assistant-bf16"),
     round_loop: RoundLoop::Gemma4Assistant,
 };
 
@@ -1234,7 +1256,7 @@ const MTP_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter_slug: "mlx-community__Qwen3.8-27B-MTP-mxfp8",
+    drafter: DrafterSource::Named,
     round_loop: RoundLoop::MtpSidecar,
 };
 
@@ -1628,12 +1650,21 @@ impl Loaded {
 
 /// Load a pair, or say why the gate stood down.
 fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
-    let (Some(model_path), Some(draft_path)) = (
-        common::model_for(&pair.verifier, test),
-        common::apply(resolve(DRAFT_MODEL_VAR, pair.drafter_slug), test),
-    ) else {
-        return None;
+    // The drafter first: a pair the operator has not named stands down before
+    // anything loads a verifier.
+    let named = std::env::var(DRAFT_MODEL_VAR)
+        .ok()
+        .filter(|v| !v.is_empty());
+    let draft_gate = match (&pair.drafter, named.is_some()) {
+        (DrafterSource::Slug(slug), _) => resolve(DRAFT_MODEL_VAR, slug),
+        (DrafterSource::Named, true) => resolve(DRAFT_MODEL_VAR, ""),
+        (DrafterSource::Named, false) => common::Gate::Skip(format!(
+            "{DRAFT_MODEL_VAR} is unset and this pair's drafter is not resolved by \
+             slug — see the DrafterSource::Named note for why"
+        )),
     };
+    let draft_path = common::apply(draft_gate, test)?;
+    let model_path = common::model_for(&pair.verifier, test)?;
 
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");

@@ -93,13 +93,19 @@ harness's arch stand-down cannot separate them: the drafter's
 is loaded, and a mismatched pair skips with that reason rather than panicking in
 the loader.
 
-| Pair | verifier | drafter |
-|---|---|---|
-| assistant | `mlx-community__gemma-4-e2b-it-mxfp8` | `mlx-community__gemma-4-E2B-it-assistant-bf16` |
-| recurrent | `mlx-community__Qwen3.8-27B-mxfp8` | `mlx-community__Qwen3.8-27B-MTP-mxfp8` |
+| Pair | verifier | drafter | selected by |
+|---|---|---|---|
+| assistant | `mlx-community__gemma-4-e2b-it-mxfp8` | `mlx-community__gemma-4-E2B-it-assistant-bf16` | slug |
+| recurrent | `mlx-community__Qwen3.8-27B-mxfp8` | `mlx-community__Qwen3.8-27B-MTP-mxfp8` | `RMLX_DRAFT_TEST_MODEL` only |
 
-Under Metal shader validation it produces **zero** hits, so it has no entry in
-`scripts/gpu_validation_census.txt` and needs none.
+The assistant pair produces **zero** Metal shader-validation hits and so has no
+entry in `scripts/gpu_validation_census.txt` and needs none. The recurrent pair's
+verifier drives MLX's mxfp8 quantized matmul and a narrowed run reports 1344
+invalid loads from it — the same `load_safe` bound the census already records for
+the affine instantiation, in a kernel this repo does not compile. The census pins
+one exact count per test and a count from a 256-token generation is not stable
+across a prompt change, so that pair is named rather than slug-resolved and
+`make gpu-test` reports it as skipped. See `docs/SPEC_ANSWER_EQUIVALENCE.md`.
 
 `dflash_drafter_alignment.rs` is **not** one of those three and does not gate the
 same property. It asserts that the drafter's round-0 first-block proposal aligns

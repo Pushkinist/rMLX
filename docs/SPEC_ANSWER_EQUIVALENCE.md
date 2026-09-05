@@ -26,12 +26,33 @@ prompt in the file:
 Six prompts, all asking for continuous prose. A tokenizer that declares `<think>`
 gets an empty reasoning block — its own template's `enable_thinking=false` — and
 turn markers are read off the tokenizer's added tokens rather than hard-coded, so
-a pair is never served outside its own template. Under Metal shader validation
-the pair produces **zero** hits, so it has no entry in
-`scripts/gpu_validation_census.txt` and needs none.
+a pair is never served outside its own template.
 
-Both gates carry `#[ignore]` and run under `make gpu-test`. Together they take
-about 4.5 minutes on an idle M5.
+**The two pairs are selected differently, and the reason is the census.** The
+assistant pair resolves both halves by slug, produces **zero** shader-validation
+hits (measured, narrowed run), and runs under `make gpu-test` on any machine
+holding the snapshots — about 3.5 minutes. The recurrent pair's verifier drives
+MLX's mxfp8 quantized matmul, whose `load_safe` bound is the same one
+`scripts/gpu_validation_census.txt` records for the affine instantiation: a
+narrowed run reports 1344 invalid **loads** (no stores) from
+`mxfp8_qmm_t_splitk_bfloat16_t_gs_32_b_8_alN_false`, a kernel this repo does not
+compile. The census pins one exact count per originating test, and a count taken
+from a 256-token generation moves with every prompt — pinning it would make the
+census brittle rather than informative. So that pair resolves its drafter from
+`RMLX_DRAFT_TEST_MODEL` only, `make gpu-test` reports it as skipped naming the
+variable, and running it is:
+
+```
+RMLX_KV_TEST_MODEL=<...>/mlx-community__Qwen3.8-27B-mxfp8 \
+RMLX_DRAFT_TEST_MODEL=<...>/mlx-community__Qwen3.8-27B-MTP-mxfp8 \
+cargo test -p rmlx-models --test spec_greedy_equivalence -- --ignored --nocapture \
+  the_recurrent_round_loop
+```
+
+That is a real gap: the case the second defect was found in is not in a gate that
+runs by default. Closing it needs either the census analysis extended to this
+kernel and model, or a stable count — neither of which this change is the place
+for.
 
 ## The oracle: where a correct pair diverges
 
