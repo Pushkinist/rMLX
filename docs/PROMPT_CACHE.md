@@ -524,13 +524,22 @@ layers use `RotatingKvCache`, which is a ring buffer of the last
 `sliding_window` K/V tokens.
 
 **`can_truncate_to_block(block_count)`**: returns true iff every layer cache
-passes `KvCache::can_truncate_to(block_count * BLOCK_TOKENS)`. A wrapped SWA
-ring can only be rolled back while it still holds the window the shorter prefix
-attends over, and a cached prompt long enough to wrap it never does over a whole
-block — `truncate_kv_to_block` would then fail on the SWA layers after trimming
-the full-attention ones, desyncing the caches. When `can_truncate_to_block`
-returns false, the partial prefix hit degrades to Miss and the request falls
-back to full re-prefill.
+that holds anything (`offset() > 0` — the KV-shared tail never does, and the
+truncation skips it too) passes
+`KvCache::can_truncate_to(block_count * BLOCK_TOKENS)`. A cached entry has taken
+decode steps, so its SWA ring is in rotated order; past the wrap that ring cannot
+give a position back and `truncate_kv_to_block` would fail on the SWA layers
+after trimming the full-attention ones, desyncing the caches. When
+`can_truncate_to_block` returns false, the partial prefix hit degrades to Miss
+and the request falls back to full re-prefill.
+
+The predicate is exact rather than conservative, which widens the path slightly:
+where the old `is_trimmable` refused every ring past its wrap, a ring still
+holding the window the shorter prefix attends over — a prefill-only entry, whose
+chunked prefill leaves it `window - 1 + chunk` long and in temporal order — is
+now allowed. That rollback is lossless by the rule in `docs/KV_CACHE.md`
+§ "Rolling the SWA ring back", and `gemma4_kv_cache_equivalence.rs` is what shows
+the reused prefix reproduces a full prefill.
 
 **`is_strict_prefix_of(prompt_ids)`**: returns true iff this entry's full
 token sequence is a strict prefix of `prompt_ids` (i.e. the new prompt

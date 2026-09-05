@@ -39,9 +39,10 @@
 //! nothing else: the assistant pair reads 0.9375 on the 4k document and 0.4766
 //! on a short prose prompt whose arms flip an **exact** tie (top-two margin
 //! 0.0000) at token 37, after which both write well-formed, correct, different
-//! prose. The two broken engines read 0.2188 to 0.4615 on the same measure. The
-//! populations overlap. [`report`] prints the figure on every run and the gate
-//! does not assert it.
+//! prose. The two broken engines read 0.2188 to 0.4615 on the same measure —
+//! three per cent under the worst correct cell, and the correct minimum is set
+//! by where an exact tie happens to land, which nothing bounds from below.
+//! [`report`] prints the figure on every run and the gate does not assert it.
 //!
 //! **The repetition control** is the second oracle, and it exists because the
 //! first has nothing to read when both arms are degenerate: two arms in the same
@@ -187,9 +188,9 @@ const MAX_DIVERGENCE_CONFIDENCE: f64 = 0.12;
 /// correct arms share is decided by where their first near-tie lands and by
 /// nothing else: the assistant pair reads 0.9375 on the 4k document and 0.4766
 /// on a short prose prompt whose arms flip an exact tie at token 37, and the two
-/// broken engines measured here read 0.2188 to 0.4615. The populations overlap,
-/// so no floor separates them. `report` prints the figure on every run and the
-/// gate does not assert it.
+/// broken engines measured here read 0.2188 to 0.4615 — three per cent under
+/// that, with nothing bounding the correct minimum from below. `report` prints
+/// the figure on every run and the gate does not assert it.
 const WORST_CORRECT_TAIL_AGREEMENT: f64 = 0.2344;
 
 /// How much of an arm — or of any tail cut of it — may repeat at a short period

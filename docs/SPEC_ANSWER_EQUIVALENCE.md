@@ -70,7 +70,9 @@ and by nothing else. On the assistant pair the same engine, model and prompt
 family read 0.9375 on the 4k document and 0.4766 on a prompt whose arms flip an
 **exact** tie (top-two margin 0.0000) at token 37 — after which both write
 well-formed, correct, different prose. The broken engines read 0.2188 to 0.4615
-on the same measure. The populations overlap, so no floor separates them.
+on the same measure — three per cent under the worst correct cell, and nothing
+bounds that correct minimum from below, because it is set by where an exact tie
+happens to land. No floor can be placed in a gap that narrow and that arbitrary.
 
 The figure is printed on every run, together with the weakest tail window, the
 first divergence, the margin there, and both arms' decoded text. It is evidence,

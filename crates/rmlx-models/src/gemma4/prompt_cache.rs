@@ -88,7 +88,13 @@ impl Gemma4Entry {
             "block_count must be >= 1 for a prefix hit"
         );
         let target = (block_count * BLOCK_TOKENS) as i32;
-        self.kv_caches.iter().all(|c| c.can_truncate_to(target))
+        // Same population `truncate_kv_to` acts on: a never-filled layer — the
+        // KV-shared tail, whose offset stays 0 — is skipped by the truncation
+        // and must not veto it either.
+        self.kv_caches
+            .iter()
+            .filter(|c| c.offset() > 0)
+            .all(|c| c.can_truncate_to(target))
     }
 
     /// True iff this entry's full token sequence is a STRICT prefix of

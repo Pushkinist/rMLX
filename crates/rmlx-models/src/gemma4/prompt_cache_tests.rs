@@ -70,6 +70,56 @@ fn flat_only_snapshot_always_trimmable() {
     assert!(e.can_truncate_to_block(1));
 }
 
+/// The gate on **filled** caches, in both directions.
+///
+/// The tests above only reach the `offset == 0` arm, where the truncation has
+/// nothing to do and the gate has nothing to refuse. This is the case the gate
+/// exists for, in the shape production reaches it: an entry is cached after
+/// decode, so its sliding-window ring has taken single-token writes. Past the
+/// wrap those leave it in rotated order and it cannot give a position back; short
+/// of the wrap every position is still at its own slot and it can.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture arrays are constructed just above and the CPU update path is infallible on them"
+)]
+fn a_wrapped_swa_ring_refuses_the_block_truncate_path_and_an_unwrapped_one_does_not() {
+    use rmlx_mlx::{Array, Device};
+
+    let device = Device::Cpu;
+    let kv = |n: i32| -> Array {
+        let data: Vec<f32> = (0..n * 2).map(|i| i as f32).collect();
+        Array::from_f32_slice(&data, &[1, 1, n, 2]).unwrap()
+    };
+    // Prefill `fill` positions, then decode two: the shape a cached entry has.
+    let stack = |window: i32, fill: i32| -> Vec<KvCache> {
+        let mut stack = vec![
+            KvCache::with_quant_max_seq_window(KvQuant::None, 8192, None),
+            KvCache::with_quant_max_seq_window(KvQuant::None, 8192, Some(window)),
+        ];
+        for c in &mut stack {
+            c.update(&kv(fill), &kv(fill), device).unwrap();
+            for _ in 0..2 {
+                c.update(&kv(1), &kv(1), device).unwrap();
+            }
+        }
+        stack
+    };
+
+    let unwrapped = entry_with(stack(512, 300), (0..302u32).collect());
+    assert!(
+        unwrapped.can_truncate_to_block(1),
+        "a ring short of its window must allow the block-truncate path"
+    );
+
+    let wrapped = entry_with(stack(128, 512), (0..514u32).collect());
+    assert!(
+        !wrapped.can_truncate_to_block(1),
+        "a ring a decode step left rotated past its wrap cannot give a block \
+         back, and the caller must re-prefill instead"
+    );
+}
+
 /// MISMATCH path: stored `Some(K8V8)`, runtime `K8V4` → evict + miss.
 #[test]
 #[allow(
