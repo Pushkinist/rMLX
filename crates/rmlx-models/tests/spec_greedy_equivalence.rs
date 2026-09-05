@@ -24,23 +24,24 @@
 //! same context up to that position, so this judges the **pair**, and it needs
 //! no per-prompt calibration: it is a rank, not a number of nats.
 //!
-//! Over the six prompts in [`PROMPTS`], measured by
-//! `the_agreement_a_correct_pair_reaches`:
+//! Over the six prompts in [`PROMPTS`], for each pair, run against the shipped
+//! engine and against two deliberately broken ones:
 //!
 //! | engine | first divergence | percentile of the reference arm's own margins |
 //! |---|---|---|
-//! | assistant pair, as shipped | 4 to 193 | 0.0000 to 0.0352 |
-//! | MTP pair, as shipped | 35 to 256 (three prompts bit-identical) | 0.0000 to 0.0234 |
-//! | assistant pair, SWA ring keeping its rejected block tail | 3 to 7 | 0.0000 to 0.9531 |
-//! | MTP pair, acceptance walk without the final norm | 4 to 28 | 0.1680 to 0.4453 |
+//! | assistant pair, as shipped | 16 to 256 (one prompt bit-identical) | 0.0000 to 0.0820 |
+//! | recurrent pair, as shipped | 65 to 256 (three prompts bit-identical) | 0.0000 to 0.0234 |
+//! | assistant pair, SWA ring keeping its rejected block tail | 6 to 9 | 0.4219 to 0.9258 |
+//! | recurrent pair, acceptance walk without the final norm | 1 to 24 | 0.0000 to 0.5000 |
 //!
 //! **There is deliberately no subsequence floor.** How much of one answer two
 //! correct arms share is decided by where their first near-tie lands and by
-//! nothing else: the assistant pair reads 0.9180 when it falls at token 91 and
-//! 0.3281 when it falls at token 4 — an exact tie, both answers well-formed
-//! prose — while the two broken engines above read 0.2070 to 0.6953. The
-//! populations overlap. `report` prints the figure on every run and the gate does
-//! not assert it.
+//! nothing else: the assistant pair reads 0.9375 on the 4k document and 0.4766
+//! on a short prose prompt whose arms flip an **exact** tie (top-two margin
+//! 0.0000) at token 37, after which both write well-formed, correct, different
+//! prose. The two broken engines read 0.2188 to 0.4615 on the same measure. The
+//! populations overlap. [`report`] prints the figure on every run and the gate
+//! does not assert it.
 //!
 //! **The repetition control** is the second oracle, and it exists because the
 //! first has nothing to read when both arms are degenerate: two arms in the same
@@ -68,15 +69,13 @@
 //! arm trips the control the input is outside the gate's domain and the gate
 //! says so, rather than accusing plain greedy of a repetition loop.
 //!
-//! # Recall, and what escapes
+//! # Recall
 //!
-//! Over the twelve (pair, prompt) cells the two broken engines above produce,
-//! the gate refuses eleven. The twelfth is the assistant pair's broken ring on
-//! the one prompt where a *correct* pair also flips an exact tie at token 4:
-//! there the divergence carries no information either way, and the subsequence
-//! ratio that would separate them — 0.2070 broken against 0.3281 correct — is
-//! inside the correct population's own spread. It is recorded rather than
-//! designed around.
+//! Over the twelve (pair, prompt) cells each broken engine above produces, the
+//! gate refuses six of six on the assistant pair and four of six on the
+//! recurrent one. The two it does not refuse read 0.0000 and 0.0977 — inside the
+//! ceiling — and are why the gate runs **every** prompt rather than one: recall
+//! is a property of the set. Both broken engines turn both gates red.
 //!
 //! # Pairs
 //!
@@ -1010,13 +1009,13 @@ fn the_ratio_is_over_the_shorter_arm_and_the_length_guard_covers_it() {
         .is_none());
 }
 
-/// The length floor is pinned in both directions, and it is under what a correct
-/// engine produces on the shortest prompt the gate runs.
+/// The length floor is pinned in both directions, and it is under every answer a
+/// correct pair produced.
 ///
-/// A floor a real answer cannot reach refuses a *fixed* engine and the
-/// reproducer could never flip to green; a floor nothing can fail is free.
+/// A floor a real answer cannot reach refuses a *fixed* engine and no reproducer
+/// could ever flip to green; a floor nothing can fail is free.
 #[test]
-fn the_length_floor_admits_the_shortest_answer_the_prompts_produce() {
+fn the_length_floor_admits_every_answer_the_prompts_produce() {
     let at_floor = Rng(0x00F1_7EDD).prose(MIN_ANSWER_TOKENS);
     assert!(
         judge(&at_floor, &at_floor, &[]).refusal().is_none(),
@@ -1028,15 +1027,18 @@ fn the_length_floor_admits_the_shortest_answer_the_prompts_produce() {
         "two arms one token under the floor must not be returned as agreement"
     );
 
-    // The shortest arm any prompt in the sweep produced. Driven through `judge`
-    // rather than compared as constants, so it pins the gate and not a pair of
-    // numbers.
-    let measured = Rng(0x2181_2181).prose(SHORTEST_MEASURED_ARM);
+    // Every arm the gate judged ran to the budget, so the floor is under all of
+    // them. Driven through `judge` rather than compared as constants.
+    let budget = Rng(0x2181_2181).prose(N_TOKENS);
     assert!(
-        judge(&measured, &measured, &[]).refusal().is_none(),
-        "a correct engine answers the shortest prompt in {SHORTEST_MEASURED_ARM} tokens \
-         and must clear the floor"
+        judge(&budget, &budget, &[]).refusal().is_none(),
+        "a pair that answers in full must clear the floor"
     );
+    const {
+        // A floor at or above the budget would pass only if neither arm ever
+        // emitted a stop id, which is a different assertion from this one.
+        assert!(MIN_ANSWER_TOKENS < N_TOKENS);
+    }
 
     // And the floor leaves the last tail window able to read the period the
     // documented collapse repeats at.
@@ -1047,10 +1049,6 @@ fn the_length_floor_admits_the_shortest_answer_the_prompts_produce() {
          evidence a period-8 cycle, which is the collapse this gate was built on"
     );
 }
-
-/// The shortest arm any prompt in [`PROMPTS`] produced on the calibrating pair,
-/// printed by `the_agreement_a_correct_pair_reaches`.
-const SHORTEST_MEASURED_ARM: usize = 216;
 
 /// A run that stopped short is refused rather than passed on its short prefix.
 #[test]
@@ -1105,38 +1103,35 @@ fn a_late_onset_divergence_is_judged_where_it_begins() {
 /// The two measured regimes put through `judge` itself, so the test fails when
 /// the oracle's composition changes and not only when a constant moves.
 ///
-/// Both come from the prompt sweep. Correct: the assistant pair's worst reading,
-/// a first divergence at the 3.5th percentile of the reference arm's own
-/// margins. Broken: the MTP sidecar before its acceptance walk was given the
-/// final norm, whose lowest reading over six prompts was the 16.8th percentile.
+/// Correct: the worst reading a shipped pair produced, a first divergence at the
+/// 8.2nd percentile of the reference arm's own margins. Broken: the lowest
+/// reading a broken engine produced that the gate still has to refuse, the 16.8th.
 #[test]
 fn the_gate_admits_the_worst_correct_regime_and_refuses_the_lowest_broken_one() {
     let plain: Vec<u32> = (0..N_TOKENS as u32).map(|t| t % 97).collect();
     let mut spec = plain.clone();
     spec[64] = 60_000;
 
-    // A margin distribution in which position 64 sits at the 3.5th percentile.
-    let correct: Vec<f32> = (0..N_TOKENS)
-        .map(|i| if i < N_TOKENS * 35 / 1000 { 0.01 } else { 5.0 })
-        .map(|m: f32| m)
-        .collect();
-    let mut correct = correct;
-    correct[64] = 0.02;
+    let margins_with_percentile = |pct: usize| -> Vec<f32> {
+        let mut m: Vec<f32> = (0..N_TOKENS)
+            .map(|i| if i < N_TOKENS * pct / 1000 { 0.01 } else { 5.0 })
+            .collect();
+        m[64] = 0.02;
+        m
+    };
+
+    let correct = margins_with_percentile(82);
     let (_, worst_correct) = divergence_confidence(&spec, &plain, &correct).expect("a divergence");
     assert!(
-        (worst_correct - 0.035).abs() < 0.005,
-        "the reconstructed correct regime reads {worst_correct:.4}, not the measured 0.0352"
+        (worst_correct - 0.082).abs() < 0.005,
+        "the reconstructed correct regime reads {worst_correct:.4}, not the measured 0.0820"
     );
     assert!(
         judge(&spec, &plain, &correct).refusal().is_none(),
-        "it must pass"
+        "the worst correct regime must pass"
     );
 
-    // The same divergence at the 16.8th percentile.
-    let mut broken: Vec<f32> = (0..N_TOKENS)
-        .map(|i| if i < N_TOKENS * 168 / 1000 { 0.01 } else { 5.0 })
-        .collect();
-    broken[64] = 0.02;
+    let broken = margins_with_percentile(168);
     let (_, lowest_broken) = divergence_confidence(&spec, &plain, &broken).expect("a divergence");
     assert!(
         (lowest_broken - 0.168).abs() < 0.005,
@@ -1144,7 +1139,7 @@ fn the_gate_admits_the_worst_correct_regime_and_refuses_the_lowest_broken_one() 
     );
     let failure = judge(&spec, &plain, &broken)
         .refusal()
-        .expect("broken must fail");
+        .expect("the lowest broken regime must be refused");
     assert!(failure.contains("nearly tied"), "{failure}");
 }
 
