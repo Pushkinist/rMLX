@@ -111,7 +111,7 @@ pub(crate) fn run_ppl(
         |e| match e {
             ppl::PplError::ArchUnsupported { arch } => anyhow::anyhow!(
                 "ppl: arch '{arch}' is not yet supported by the perplexity scorer \
-                 (Qwen3 only; see crates/rmlx-models/src/ppl.rs)"
+                 (Qwen3, Gemma4, Qwen3.5; see crates/rmlx-models/src/ppl.rs)"
             ),
             other => anyhow::anyhow!("ppl: {other}"),
         },

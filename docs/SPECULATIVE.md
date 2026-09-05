@@ -999,6 +999,61 @@ No-drafter baseline 18.98 (code) / 18.77 (prose) / 18.74 (4k) decode TPS.
 | 3 | prose | 0.559 | 0.98× |
 | 3 | 4k | 0.526 | 0.92× |
 
+### Qwen3.8-27B-4bit — MTP sidecar (GDN hybrid, dense)
+
+The published affine-4-bit verifier (`mlx-community/Qwen3.8-27B-4bit`, group 64)
+with its own 4-bit sidecar (`mlx-community/Qwen3.8-27B-MTP-4bit`, `block_size: 3`).
+Same backbone as the mxfp8 rows above at 15.5 GB of resident weights against
+27.7, so the verifier's own step is 1.70× faster here (31.4 against 18.4 decode
+TPS at a 3 892-token prompt, `--kv-quant none`, three runs each) and every fixed
+cost in the round loop is a correspondingly larger share of a round.
+
+No-drafter baseline 32.45 (code) / 32.53 (prose) / 32.03 (4k) decode TPS, each
+measured in the same `scripts/spec_bench.sh` run as the speculative arm beside it.
+
+| Block | Prompt | Accept rate | tokens/round | Decode vs no drafter |
+|---|---|---|---|---|
+| 2 | code | 0.730 | 1.72 | **1.19×** |
+| 2 | 4k | 0.712 | 1.71 | **1.19×** |
+| 2 | prose | 0.608 | 1.61 | 1.04× |
+| 3 | code | 0.576 | 2.15 | 1.11× |
+| 3 | 4k | 0.516 | 2.02 | 0.99× |
+| 3 | prose | 0.477 | 1.95 | 0.95× |
+
+**The drafter does care about the verifier's weight format.** The same sidecar
+architecture against the mxfp8 verifier accepts 0.877 on code at block 2 and
+returns 1.36×; here it accepts 0.730 and returns 1.19×. Acceptance is a
+comparison against the *verifier's* argmax, so re-quantizing the verifier moves
+the target the drafter is being scored against — and the sidecar was
+re-quantized with it, which this pairing cannot separate from that. The speedup
+falls further than the accept rate does, because a 1.70× faster verifier step
+does not make the rollback, the GDN snapshot/restore and the acceptance walk any
+faster: `loop_ms_per_round` is 14.6 ms of a 44.4 ms round at block 2 and 25.1 ms
+of a 63.4 ms round at block 3, a third to two fifths of the round in a residual
+that produces no tokens.
+
+**DFlash 2 on this verifier is refused at load, and the numbers below predate
+the refusal.** 23 of `z-lab/Qwen3.8-27B-DFlash2`'s tensors are weight families
+this loader has no code for — a candidate selector and per-layer two-tap dynamic
+convolutions. It used to build the earlier DFlash architecture out of the
+remainder and serve: 0.530 accept, 2.59 tokens/round, 0.91× on code at block 8.
+Those figures are this engine's DFlash drafter wearing the checkpoint's name, and
+`decode_config` records `dflash/block=8` either way, so a row of them cannot be
+told from a row of the real drafter afterwards. The loader now refuses, naming
+the count and the tensors. `z-lab/Qwen3.6-35B-A3B-DFlash` reads every tensor it
+ships and is unaffected.
+
+**That arm also did not reproduce its verifier's answer.** At temperature 0 on
+the code prompt it diverged from the no-drafter arm at the fourth token and
+stayed diverged, where the MTP sidecar on the same verifier and prompt is
+byte-identical over 160 tokens. Greedy acceptance emits only the verifier's
+argmax, so no drafter — however badly it proposes, and whatever tensors it was
+built without — can change the answer; a changed answer is the round loop, and
+the DFlash loop is one of the three the answer-equivalence gate does not cover
+(`docs/SPEC_ANSWER_EQUIVALENCE.md` § What it runs). Reproducing it on this pair
+now means lifting the refusal; the Qwen3.6 DFlash drafter still loads and drives
+the same loop.
+
 ### Qwen3.6-35B-A3B-8bit — three drafters (GDN hybrid, MoE)
 
 No-drafter baseline 102.7 (code) / 102.7 (prose) / 100.0 (paris) / 98.7 (4k)
@@ -1034,11 +1089,12 @@ No-drafter baseline 83.6 (code) / 83.2 (prose) / 79.1 (4k) decode TPS.
 - **MTP pays on both GDN hybrids and is the only drafter that does.** On the MoE
   it wins every prompt class at the shipped block size. On the dense 27B it wins
   every prompt class at block 2 and only the code class at block 3.
-- **`--draft-block-size` is capped by the sidecar's own `block_size`, and both
-  shipped Qwen3.5-family MTP sidecars omit that key** — so they take the loader
-  default of 3 and any request above 3 is silently the same run. Block 2 and
+- **`--draft-block-size` is capped by the sidecar's own `block_size`, and every
+  shipped Qwen3.5-family MTP sidecar declares that key as 3** — the Qwen3.6-35B
+  5-bit one and both Qwen3.8-27B ones, which is also the loader's default when
+  the key is absent. Any request above 3 is silently the same run. Block 2 and
   block 3 are the only two settings those pairs have, and 2 measured faster than
-  3 on all three prompt classes for Qwen3.8-27B. The `block_size` field on the
+  3 on all three prompt classes for Qwen3.8-27B at both weight formats. The `block_size` field on the
   `mtp_generate_greedy: done` line reports the value actually used.
 - **DFlash and EAGLE-3 are net decode losses on this verifier at every prompt
   class measured**, DFlash by 3-22% and EAGLE-3 by 26-39%. Both run correctly and

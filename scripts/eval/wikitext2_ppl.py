@@ -54,7 +54,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model",
         required=True,
-        help="Absolute path to an MLX model snapshot directory (Qwen3 family).",
+        help="Absolute path to an MLX model snapshot directory "
+        "(Qwen3, Gemma4 or Qwen3.5).",
     )
     p.add_argument(
         "--ctx-window",
@@ -99,6 +100,13 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Cache directory for the downloaded wikitext-2 archive. Default: "
         "`$RMLX_HOME/cache/wikitext-2/` or `$HOME/.rmlx/cache/wikitext-2/`.",
+    )
+    p.add_argument(
+        "--git-sha",
+        default="",
+        help="Commit SHA stamped on the emitted record's `git_sha` column. "
+        "Provenance the caller supplies -- the binary does not derive it, so "
+        "an omitted flag leaves the column NULL.",
     )
     p.add_argument(
         "--plausibility",
@@ -195,6 +203,8 @@ def run_ppl(args: argparse.Namespace, text_path: Path, rmlx: Path) -> dict:
         "--max-tokens",
         str(args.max_tokens),
     ]
+    if args.git_sha:
+        cmd += ["--git-sha", args.git_sha]
     print(f"wikitext-2: running: {' '.join(cmd)}", file=sys.stderr)
     proc = subprocess.run(
         cmd,

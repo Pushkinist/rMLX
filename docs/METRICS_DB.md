@@ -570,7 +570,7 @@ Source of truth for `observations.metric`, `.unit`, `.direction`. Add to this ta
 | `ssd_hydrate_ms`                 | `ms`    | `lower_better`  | SSD-tier: raw per-hydrate duration observation (on request thread, RAM-miss cold path). One SQLite row per event. Real p50/p99 aggregation via Prometheus histogram `rmlx_ssd_hydrate_us_bucket`. rmlx-only. |
 | `ssd_spill_mb_per_s`             | `mb/s`  | `higher_better` | SSD-tier: spill throughput (bytes_written / dur_us). rmlx-only. |
 | `ssd_hydrate_mb_per_s`           | `mb/s`  | `higher_better` | SSD-tier: hydrate throughput (bytes_read / dur_us). rmlx-only. |
-| `ppl_wikitext2`                  | `ppl`   | `lower_better`  | Sliding-window perplexity over the wikitext-2 raw test split, computed by `rmlx eval ppl`. Architecture support: Qwen3 only (HTTP `echo` follow-up will widen coverage). rmlx-only. |
+| `ppl_wikitext2`                  | `ppl`   | `lower_better`  | Sliding-window perplexity over the wikitext-2 raw test split, computed by `rmlx eval ppl`. Architecture support: Qwen3, Gemma4, Qwen3.5. rmlx-only. |
 | `ppl_mean_nll`                   | `nat`   | `lower_better`  | Per-token mean negative log-likelihood from the same scorer (natural-log nats). Audit field paired with `ppl_*`. rmlx-only. |
 | `ppl_scored_tokens`              | `count` | `higher_better` | Number of corpus positions scored. Audit field. rmlx-only. |
 | `ppl_windows`                    | `count` | `higher_better` | Number of sliding-window forwards the scorer ran. Audit field. rmlx-only. |
@@ -736,6 +736,76 @@ because nothing enforces it.
   WHERE metric = 'ppl_wikitext2'
     AND ts_utc >= '2026-09-03'
     AND prompt_id IN (SELECT id FROM prompts WHERE name LIKE 'wikitext-2_ctx2048%');
+  ```
+
+- **35 `ppl_*` rows (7 runs) on `Ternary-Bonsai-8B-mlx-2bit`, scored with a
+  warm-up one slot too late** — the non-BOS scorer skipped `ctx_window - stride`
+  leading slots where the slot that scores the first unseen corpus position is
+  `ctx_window - stride - 1`, so exactly one corpus position per window boundary
+  was never scored. `ppl_scored_tokens` is the metric that moved most: it *is*
+  the denominator that changed, by `windows - 1`, and `ppl_mean_nll` and
+  `ppl_windows` come off the same runs — which is why the predicate below covers
+  the whole `ppl_` family and not just the headline metric.
+
+  The arithmetic, all in rows (a run files five `ppl_*` rows, so run counts are
+  a fifth of these and mixing the two units is what makes the subtraction look
+  wrong): **365 total − 230 Gemma4 − 80 at `stride == ctx_window` − 20 post-fix
+  = 35**.
+
+  **Three conditions, all necessary**, and the selector is narrow because a
+  predicate that flags good rows is one readers learn to ignore:
+
+  - **Not the Gemma4 scorer.** It prepends BOS, which shifts each target one
+    slot, and it already subtracted the one. It was always correct. 230 rows
+    (46 runs). The predicate names the affected model rather than excluding a
+    `gemma%` prefix: `medgemma-1.5-4b-it-8bit` is already in `observations` and
+    does not start with `gemma`, so a prefix test would flag its future `ppl_*`
+    rows as affected — the exact over-selection this entry exists to avoid.
+  - **`stride < ctx_window`.** At `stride == ctx_window` the old expression gives
+    `ctx_window - stride = 0` and the new gives `0.saturating_sub(1) = 0`:
+    identical, and the scored sets are byte-identical. The whole `2026-09-03`
+    Bonsai batch is in that case. 80 rows (16 runs). `COALESCE(notes, '')`
+    because a bare `LIKE` against a NULL `notes` evaluates to NULL and drops the
+    row from the affected set — a fail-open in the direction that matters, and
+    this predicate is the durable artifact.
+  - **A pre-fix binary.** `git_sha` is the discriminator, not the date. This
+    change was made on a branch, so a run from a pre-fix binary *after* the fix
+    landed files an affected row that no date predicate catches; the four shas
+    below are what the DB holds today, and a fifth would have to be added here
+    rather than inferred. 20 rows (4 runs) carry the post-fix sha. No affected
+    row has a NULL `git_sha`.
+
+  At the default `--ctx-window 4096 --stride 2048` the effect is one position in
+  2048 — 0.05% of the denominator — and the resulting shift in `ppl` is far under
+  any gate it has been used for. At `stride == 1` it was total: every window
+  after the first scored nothing.
+
+  ```sql
+  SELECT * FROM observations
+  WHERE metric LIKE 'ppl_%'
+    AND model = 'Ternary-Bonsai-8B-mlx-2bit'
+    AND COALESCE(notes, '') NOT LIKE
+        '%ctx_window=' || ctx_max || ' stride=' || ctx_max || '%'
+    AND git_sha IN ('2bcf206', '2bcf206-dirty', '6eeb4ae-dirty', 'a71d88b-dirty');
+  ```
+
+- **`dflash/*` rows on `Qwen3.8-27B-4bit`, measured against a DFlash 2
+  checkpoint** — the drafter loader implements the earlier DFlash architecture
+  and reads none of the candidate-selector or per-layer dynamic-convolution
+  tensors a DFlash 2 snapshot ships. It used to build the drafter out of the
+  rest and serve, so the rows are honest measurements of *that* drafter and not
+  of the published one. `decode_config` says `dflash/block=N` either way and
+  cannot tell them apart, which is why the loader now refuses such a snapshot
+  outright: no further row of this kind can be written. The `2026-09-04`
+  block-16 rows and the `2026-09-05` block-8 ones are the ones already here. Do
+  not compare them against a row taken once the full drafter is implemented.
+  `z-lab/Qwen3.6-35B-A3B-DFlash` reads every tensor it ships and is unaffected
+  by the refusal.
+
+  ```sql
+  SELECT * FROM observations
+  WHERE decode_config LIKE 'dflash/%'
+    AND model = 'Qwen3.8-27B-4bit';
   ```
 
 - **Two synthetic rows from an ingest-refusal probe** — a review of the

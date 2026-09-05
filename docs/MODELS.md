@@ -290,7 +290,8 @@ at temp=0.
 One backbone, three checkpoint shapes — all route to `Architecture::Qwen3_5Moe`:
 
 - **Dense mxfp8 / affine** (`Qwen3_5ForConditionalGeneration`, e.g.
-  `ornith-1.0-9b-mxfp8`) — a plain SwiGLU MLP per layer.
+  `ornith-1.0-9b-mxfp8`, `Qwen3.8-27B-mxfp8`, `Qwen3.8-27B-4bit`) — a plain
+  SwiGLU MLP per layer.
 - **Sparse MoE mxfp8 / affine** (`Qwen3_5MoeForConditionalGeneration`, e.g.
   `ornith-1.0-35b-mxfp8`, `Qwen3.6-35B-A3B`) — `switch_mlp` + `shared_expert` + router.
 - **PARO INT4 dense** (`Qwen3_5ForConditionalGeneration` with a

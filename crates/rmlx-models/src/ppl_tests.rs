@@ -175,14 +175,19 @@ fn gemma4_error_message_advertises_support() {
         arch: "LagunaForCausalLM".to_owned(),
     };
     let msg = err.to_string();
-    assert!(
-        msg.contains("Qwen3"),
-        "error message must mention Qwen3: {msg}"
-    );
-    assert!(
-        msg.contains("Gemma4"),
-        "error message must mention Gemma4: {msg}"
-    );
+    // The supported list spells checkpoint architectures, not enum variants,
+    // so an operator can grep it for what their `config.json` declares.
+    for declared in [
+        "Qwen3ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    ] {
+        assert!(
+            msg.contains(declared),
+            "error message must name the checkpoint architecture {declared}: {msg}"
+        );
+    }
     assert!(
         msg.contains("LagunaForCausalLM"),
         "error message must include the unsupported arch name: {msg}"
@@ -197,7 +202,7 @@ fn gemma4_error_message_advertises_support() {
             usize,
             usize,
             Device,
-            Option<KvQuant>,
+            ScoredThrough,
         ) -> std::result::Result<PplReport, PplError>;
 }
 
@@ -239,10 +244,12 @@ fn gemma4_dispatch_reaches_compute_fn() {
         "sentinel ArchUnsupported must carry the arch name: {msg}"
     );
     // Confirm the supported-arches list in the error message still includes
-    // both Qwen3 and Gemma4 (regression guard for the error text).
+    // every arch that has a scorer (regression guard for the error text).
     assert!(
-        msg.contains("Qwen3") && msg.contains("Gemma4"),
-        "supported-arches list must mention both Qwen3 and Gemma4: {msg}"
+        msg.contains("Qwen3ForCausalLM")
+            && msg.contains("Gemma4ForConditionalGeneration")
+            && msg.contains("Qwen3_5MoeForConditionalGeneration"),
+        "supported-arches list must name every arch with a scorer: {msg}"
     );
 }
 
@@ -274,6 +281,7 @@ fn a_window_with_no_scored_position_dispatches_nothing() {
         Device::Cpu,
         &mut sum_nll,
         &mut count,
+        &mut Vec::new(),
         |_ids, _caches| unreachable!("no scored position, so no forward may run"),
     );
 
@@ -285,5 +293,438 @@ fn a_window_with_no_scored_position_dispatches_nothing() {
     assert!(
         (sum_nll - 7.5).abs() < f64::EPSILON,
         "nothing was scored, so the accumulator cannot move"
+    );
+}
+
+/// The shared sliding walk covers every scorable corpus position exactly once.
+///
+/// The two non-BOS scorers score positions `[warmup .. win.len() - 1)` of each
+/// window, so a corpus position `c` is scored by the window that owns the slot
+/// predicting it. Overlap is what `warmup` exists to remove: score a position
+/// twice and it is counted twice in a mean whose denominator is the scored
+/// count. No model and no GPU — the walk is index arithmetic and the closure
+/// stands in for the forward.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+fn sliding_walk_scores_each_position_once() {
+    // stride < ctx_window only: at `stride == ctx_window` the position after
+    // each window's last slot has no in-window predecessor and is genuinely
+    // unscorable, so full coverage is not the contract there.
+    let cases: &[(usize, usize, usize)] = &[
+        (10, 4, 1),
+        (20, 8, 4),
+        (100, 16, 8),
+        (25, 8, 5),
+        (17, 6, 4),
+        (3, 2, 1),
+    ];
+
+    for &(n_tokens, ctx_window, stride) in cases {
+        let tokens: Vec<u32> = (0..n_tokens as u32).collect();
+        let mut scored: Vec<usize> = Vec::new();
+        let mut start_of_window = 0_usize;
+
+        let report = sliding_window_ppl(
+            &tokens,
+            ctx_window,
+            stride,
+            |window, warmup, sum_nll, count| {
+                for t in warmup..(window.len() - 1) {
+                    // The corpus index whose NLL this slot contributes.
+                    scored.push(start_of_window + t + 1);
+                    *sum_nll += 1.0;
+                    *count += 1;
+                }
+                start_of_window += stride;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let unique: HashSet<usize> = scored.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            scored.len(),
+            "({n_tokens}, {ctx_window}, {stride}): a position was scored twice"
+        );
+        assert_eq!(
+            report.scored_tokens,
+            scored.len(),
+            "({n_tokens}, {ctx_window}, {stride}): report disagrees with the closure"
+        );
+        // Position 0 has no predecessor to predict it; every later one does.
+        let expected: HashSet<usize> = (1..n_tokens).collect();
+        assert_eq!(
+            unique, expected,
+            "({n_tokens}, {ctx_window}, {stride}): coverage is not the whole corpus tail"
+        );
+    }
+}
+
+/// Qwen3.5 has a cacheless scorer and no cached one, and says which.
+///
+/// A KV codec on that arch would describe the full-attention layers and
+/// silently not the GatedDeltaNet ones, so the command refuses. The message
+/// has to name the arch and the way out, or the caller reads it as "no scorer
+/// at all" and stops.
+/// The codec refusal is a decision, not a message: both directions are driven
+/// through the producer the scorer actually calls.
+///
+/// Mutations this fails on: inverting the `CACHED_SCORER_ARCHES` membership
+/// test (the Qwen3.5 cases stop refusing); dropping the `kv_quant.is_some()`
+/// condition (the no-codec cases start refusing); removing a Qwen3.5 class
+/// string from nothing and instead *adding* one to the allowlist (the refusal
+/// cases stop refusing). Deleting the call in `compute_ppl` does not compile:
+/// the scorer arms take `ScoredThrough`, which only this producer builds.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+fn a_codec_is_refused_on_the_arches_whose_scorer_keeps_no_cache() {
+    let codec = Some(KvQuant::K8V8);
+
+    // Both spellings a Qwen3.5 checkpoint can resolve to, dense and MoE.
+    for arch in [
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    ] {
+        let err = cached_scorer_codec(arch, codec).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PplError::CachedScorerUnsupported { .. }),
+            "{arch} with a codec must be refused as CachedScorerUnsupported, got {msg}"
+        );
+        assert!(msg.contains(arch), "refusal must name the arch: {msg}");
+        assert!(
+            msg.contains("GatedDeltaNet"),
+            "refusal must name the layers that justify it, or it reads as \
+             'not implemented yet': {msg}"
+        );
+        assert!(
+            msg.contains("cacheless"),
+            "refusal must name the route that works: {msg}"
+        );
+
+        // Without a codec there is nothing to refuse.
+        let passed = cached_scorer_codec(arch, None).unwrap().codec();
+        assert!(passed.is_none(), "{arch} cacheless must pass through");
+    }
+
+    // The two arches that do have a cached scorer keep their codec.
+    for arch in CACHED_SCORER_ARCHES {
+        let passed = cached_scorer_codec(arch, codec).unwrap().codec();
+        assert_eq!(passed, codec, "{arch} must be handed its codec unchanged");
+    }
+}
+
+/// The scoring kernel scores the *next* token, and only from `warmup` on.
+///
+/// No model: a hand-built `[1, seq, vocab]` logit tensor on `Device::Cpu` with
+/// one row per position. Mutations this fails on: `win[t + 1]` -> `win[t]`,
+/// which scores each position against its own logits and pulls perplexity
+/// toward 1.0; `warmup..` -> `0..`, which counts the overlap twice.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "row slices are bounded by the vocab and seq this test constructs"
+)]
+fn the_scoring_kernel_scores_the_next_token_from_the_warmup_on() {
+    const VOCAB: usize = 4;
+    let win: [u32; 4] = [0, 1, 2, 3];
+    let seq = win.len();
+
+    // Asymmetric rows: no two vocabulary entries share a logit, so scoring the
+    // wrong target or the wrong row lands on a different NLL.
+    let mut flat: Vec<f32> = Vec::with_capacity(seq * VOCAB);
+    for t in 0..seq {
+        for v in 0..VOCAB {
+            flat.push((t * VOCAB + v) as f32 * 0.5 - 1.0);
+        }
+    }
+    let logits = Array::from_f32_slice(&flat, &[1, seq as i32, VOCAB as i32]).unwrap();
+
+    for warmup in 0..seq {
+        let mut host: Vec<f32> = Vec::new();
+        let mut sum_nll = 0.0_f64;
+        let mut count = 0_usize;
+        score_window_cacheless(
+            &logits,
+            &win,
+            warmup,
+            VOCAB,
+            &mut host,
+            &mut sum_nll,
+            &mut count,
+        )
+        .unwrap();
+
+        // Which positions contributed: exactly [warmup .. seq - 1).
+        let expected_count = (seq - 1).saturating_sub(warmup);
+        assert_eq!(
+            count, expected_count,
+            "warmup {warmup}: scored positions must be [warmup .. seq-1)"
+        );
+
+        // What each contributed: the NLL of win[t + 1] under row t.
+        let mut expected_nll = 0.0_f64;
+        for t in warmup..(seq - 1) {
+            let row = &flat[t * VOCAB..(t + 1) * VOCAB];
+            expected_nll += f64::from(neg_log_softmax_at(row, win[t + 1] as usize));
+        }
+        assert!(
+            (sum_nll - expected_nll).abs() < 1e-6,
+            "warmup {warmup}: sum_nll {sum_nll} != {expected_nll} — the scored \
+             target or the scored row is wrong"
+        );
+    }
+
+    // The shift is what separates this from scoring each position against its
+    // own logits, so state that the two differ on this fixture at all.
+    let mut self_scored = 0.0_f64;
+    for t in 0..(seq - 1) {
+        let row = &flat[t * VOCAB..(t + 1) * VOCAB];
+        self_scored += f64::from(neg_log_softmax_at(row, win[t] as usize));
+    }
+    let mut host: Vec<f32> = Vec::new();
+    let mut sum_nll = 0.0_f64;
+    let mut count = 0_usize;
+    score_window_cacheless(&logits, &win, 0, VOCAB, &mut host, &mut sum_nll, &mut count).unwrap();
+    assert!(
+        (sum_nll - self_scored).abs() > 1e-3,
+        "the fixture cannot tell win[t+1] from win[t] and so cannot gate the shift"
+    );
+}
+
+/// A scorer handed a buffer that a longer window already filled scores the
+/// short window and nothing else.
+///
+/// The hoist that made `host` the caller's turned a fresh allocation into
+/// shared mutable state in a numerical path, and `neg_log_softmax_at` sums
+/// `exp()` over every element it is given. A stale tail left behind by a wider
+/// window would therefore inflate the softmax denominator of every later,
+/// narrower one — a wrong perplexity with no error anywhere, which is the whole
+/// failure class this file exists to close.
+///
+/// Cross-shape on purpose: a same-shape reuse cannot see it. Mutation this
+/// fails on: deleting `out.clear()` from `read_logits_3d_into`. The `NAN` fill
+/// makes a surviving tail unmissable — `exp()` of it poisons `sum_nll` — and the
+/// `host.len()` assertion catches it even where the arithmetic would not.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "row slices are bounded by the vocab and seq this test constructs"
+)]
+fn a_buffer_a_longer_window_dirtied_does_not_reach_the_next_window() {
+    const VOCAB: usize = 4;
+    let long_win: [u32; 6] = [0, 1, 2, 3, 0, 1];
+    let short_win: [u32; 3] = [2, 3, 0];
+
+    let row_at = |t: usize| -> Vec<f32> {
+        (0..VOCAB)
+            .map(|v| (t * VOCAB + v) as f32 * 0.5 - 1.0)
+            .collect()
+    };
+    let flat_for = |seq: usize| -> Vec<f32> { (0..seq).flat_map(row_at).collect() };
+
+    let long_logits = Array::from_f32_slice(
+        &flat_for(long_win.len()),
+        &[1, long_win.len() as i32, VOCAB as i32],
+    )
+    .unwrap();
+    let short_flat = flat_for(short_win.len());
+    let short_logits =
+        Array::from_f32_slice(&short_flat, &[1, short_win.len() as i32, VOCAB as i32]).unwrap();
+
+    // The answer the short window has on its own, from a buffer nothing touched.
+    let mut clean: Vec<f32> = Vec::new();
+    let mut clean_nll = 0.0_f64;
+    let mut clean_count = 0_usize;
+    score_window_cacheless(
+        &short_logits,
+        &short_win,
+        0,
+        VOCAB,
+        &mut clean,
+        &mut clean_nll,
+        &mut clean_count,
+    )
+    .unwrap();
+
+    // The same window through a buffer the longer one filled, then dirtied
+    // past what the short window needs.
+    let mut reused: Vec<f32> = Vec::new();
+    let mut scratch_nll = 0.0_f64;
+    let mut scratch_count = 0_usize;
+    score_window_cacheless(
+        &long_logits,
+        &long_win,
+        0,
+        VOCAB,
+        &mut reused,
+        &mut scratch_nll,
+        &mut scratch_count,
+    )
+    .unwrap();
+    assert_eq!(
+        reused.len(),
+        long_win.len() * VOCAB,
+        "the wide window must have filled the buffer to its own width"
+    );
+    reused.fill(f32::NAN);
+
+    let mut dirty_nll = 0.0_f64;
+    let mut dirty_count = 0_usize;
+    score_window_cacheless(
+        &short_logits,
+        &short_win,
+        0,
+        VOCAB,
+        &mut reused,
+        &mut dirty_nll,
+        &mut dirty_count,
+    )
+    .unwrap();
+
+    assert_eq!(
+        reused.len(),
+        short_win.len() * VOCAB,
+        "the buffer must be resized down to this window, not left holding the wider one"
+    );
+    assert_eq!(
+        dirty_count, clean_count,
+        "reuse must not change which positions are scored"
+    );
+    assert!(
+        dirty_nll.is_finite(),
+        "a stale NAN tail reached the softmax: sum_nll is {dirty_nll}"
+    );
+    assert!(
+        (dirty_nll - clean_nll).abs() < 1e-9,
+        "reuse changed the answer: {dirty_nll} against {clean_nll} from a fresh buffer"
+    );
+}
+
+/// The messages an operator greps carry no run of whitespace.
+///
+/// Both are wrapped across source lines with `\` continuations, which strip the
+/// newline *and* the indentation that follows it. Dropping one continuation
+/// leaves ten spaces mid-sentence and a search for the phrase either side of the
+/// break finds nothing — which is the property the wrapped messages exist for.
+#[test]
+fn the_operator_facing_messages_are_one_line_of_single_spaces() {
+    let messages = [
+        PplError::ArchUnsupported {
+            arch: "LagunaForCausalLM".to_owned(),
+        }
+        .to_string(),
+        PplError::CachedScorerUnsupported {
+            arch: "Qwen3_5ForConditionalGeneration".to_owned(),
+        }
+        .to_string(),
+    ];
+    for msg in messages {
+        assert!(
+            !msg.contains("  "),
+            "a dropped line continuation left a run of spaces: {msg}"
+        );
+        assert!(
+            !msg.contains('\n'),
+            "the message must render on one line: {msg}"
+        );
+    }
+}
+
+/// The cached scorer scores one position per forward, from a buffer that is
+/// the caller's and starts dirty.
+///
+/// Driven by a stub forward and an empty cache stack, so it needs no model and
+/// no Metal: `chunked_prefill`'s cache sweeps are no-ops over an empty `Vec`
+/// and every array here is built on `Device::Cpu`. Until this existed the
+/// cached path's only test was the one that asserts it dispatches *nothing*.
+///
+/// Mutation this fails on: deleting `out.clear()` from `read_logits_3d_into`,
+/// which leaves the wide starting buffer's `NAN` tail under the softmax. The
+/// companion `&host[..vocab]` slice at the call site is not separately
+/// observable while `out.clear()` stands — the buffer is exactly `vocab` long
+/// there by construction, so the slice and the whole buffer are the same value.
+/// It is defence in depth against the two changing independently, and is
+/// recorded as such rather than as a gated invariant.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "row slices are bounded by the vocab and seq this test constructs"
+)]
+fn the_cached_scorer_scores_a_position_per_forward_from_the_callers_buffer() {
+    const VOCAB: usize = 4;
+    let win: [u32; 4] = [0, 1, 2, 3];
+
+    let row_at = |t: usize| -> Vec<f32> {
+        (0..VOCAB)
+            .map(|v| (t * VOCAB + v) as f32 * 0.5 - 1.0)
+            .collect()
+    };
+
+    // The stub answers the n-th forward with row n: the prefill call scores
+    // position `warmup`, and each later single-token call scores its own.
+    let mut call = 0_usize;
+    let mut caches: Vec<KvCache> = Vec::new();
+    // Starts wider than one row and full of NAN — the state a previous, wider
+    // window would leave behind.
+    let mut host: Vec<f32> = vec![f32::NAN; VOCAB * 8];
+    let mut sum_nll = 0.0_f64;
+    let mut count = 0_usize;
+
+    score_window_through_cache(
+        &win,
+        0,
+        VOCAB,
+        &mut caches,
+        "qwen3",
+        Device::Cpu,
+        &mut sum_nll,
+        &mut count,
+        &mut host,
+        |_ids, _cs| {
+            let row = row_at(call);
+            call += 1;
+            Array::from_f32_slice(&row, &[1, 1, VOCAB as i32])
+        },
+    )
+    .unwrap();
+
+    assert_eq!(call, win.len() - 1, "one forward per scored position");
+    assert_eq!(
+        count,
+        win.len() - 1,
+        "every position from the warm-up scores"
+    );
+
+    let mut expected = 0.0_f64;
+    for t in 0..(win.len() - 1) {
+        expected += f64::from(neg_log_softmax_at(&row_at(t), win[t + 1] as usize));
+    }
+    assert!(
+        sum_nll.is_finite(),
+        "the caller's dirty buffer reached the softmax: {sum_nll}"
+    );
+    assert!(
+        (sum_nll - expected).abs() < 1e-9,
+        "cached scorer summed {sum_nll}, expected {expected}"
     );
 }
