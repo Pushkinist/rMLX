@@ -322,17 +322,27 @@ fn bf16_input(values: &[f32], shape: &[i32]) -> rmlx_mlx::Array {
         .expect("cast the input to bf16")
 }
 
-fn published_reference() -> rmlx_mlx::Array {
+fn published_reference(name: &str) -> rmlx_mlx::Array {
     let bytes = std::fs::read(FORWARD_REFERENCE).expect("the reference fixture is readable");
     let st = safetensors::SafeTensors::deserialize(&bytes).expect("the fixture parses");
-    let t = st.tensor("hidden").expect("the fixture carries `hidden`");
+    let t = st.tensor(name).expect("the fixture carries the tensor");
     rmlx_mlx::Array::from_safetensor_view(&rmlx_loader::TensorView {
-        name: "hidden",
+        name,
         dtype: t.dtype(),
         shape: t.shape().to_vec(),
         bytes: t.data(),
     })
     .expect("the reference loads")
+}
+
+fn reference_ids(name: &str) -> Vec<u32> {
+    let a = published_reference(name);
+    a.eval().expect("eval");
+    a.to_bytes()
+        .expect("read bytes")
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("four bytes")))
+        .collect()
 }
 
 fn max_abs_diff(a: &rmlx_mlx::Array, b: &rmlx_mlx::Array) -> f32 {
@@ -390,7 +400,7 @@ fn the_forward_reproduces_the_reference_on_the_published_weights() {
     let got = drafter
         .forward_hidden(&block, &ctx)
         .expect("the forward runs on the published weights");
-    let want = published_reference();
+    let want = published_reference("hidden");
     assert_eq!(
         got.shape(),
         want.shape(),
@@ -401,5 +411,134 @@ fn the_forward_reproduces_the_reference_on_the_published_weights() {
     assert!(
         diff <= FORWARD_TOL,
         "the forward differs from the reference by {diff} on the published weights"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the selector, against the reference on the published weights
+// ---------------------------------------------------------------------------
+
+/// The anchors the reference traced the published chains from.
+const SELECTOR_ANCHORS: [u32; 2] = [100, 50_000];
+
+/// Peaks per position in the stand-in head. `generate.py::selector_logits`
+/// uses the same five numbers.
+const SPIKE_COUNT: usize = 20;
+/// Distance between two adjacent peaks.
+const SPIKE_STEP: f32 = 0.093_75;
+/// The logit every token that is not a peak carries.
+const SPIKE_FLOOR: f32 = -8.0;
+/// Shift applied to the peak ids from one block position to the next.
+const SPIKE_POS_STRIDE: usize = 12_289;
+/// Distance between two adjacent peaks' token ids.
+const SPIKE_ID_STRIDE: usize = 18;
+
+/// The stand-in verifier logits the reference was run over, `[1, n, vocab]`.
+///
+/// The pair's real head is 4-bit and 27 B, and its output over a 248 320-token
+/// vocabulary is not a thing to commit, so both sides build this instead: a
+/// floor with [`SPIKE_COUNT`] peaks [`SPIKE_STEP`] apart. Every value is a
+/// dyadic rational exactly representable in bf16 and both sides compute it from
+/// integer arithmetic, so the comparison below never turns on a matmul kernel.
+///
+/// The spacing is what makes the case decidable. Peaks are 0.09375 apart, three
+/// bf16 places at the magnitudes they reach, so the sixteenth and seventeenth
+/// candidate cannot tie and the candidate set does not depend on how a
+/// partition orders equal logits — which, over a vocabulary this size in bf16,
+/// a real head's output routinely produces.
+fn stand_in_logits(positions: usize, vocab: usize) -> rmlx_mlx::Array {
+    let mut values = vec![SPIKE_FLOOR; positions * vocab];
+    for t in 0..positions {
+        for j in 0..SPIKE_COUNT {
+            let token = (t * SPIKE_POS_STRIDE + j * SPIKE_ID_STRIDE) % vocab;
+            values[t * vocab + token] = j as f32 * SPIKE_STEP;
+        }
+    }
+    bf16_input(&values, &[1, positions as i32, vocab as i32])
+}
+
+/// The selector reproduces the reference implementation's chain on the
+/// published weights, at the checkpoint's own widths.
+///
+/// The scale-model case beside the selector proves the algebra against the same
+/// reference with forty bf16 places of separation, which is where the numerical
+/// argument lives. What only the real weights can show is that the two
+/// 248 320-row codebooks are gathered along the axis the loader bound them on,
+/// that the rank-256 projection and the sixteen kept candidates hold at size,
+/// and that the chain is traced over the drafter's own hidden states rather
+/// than a fixture's.
+///
+/// The chain is compared exactly — these are token ids. The separation here is
+/// thinner than the scale case's, and is stated rather than engineered away:
+/// the winning score beats the runner-up by 0.078 at the tightest of the
+/// fourteen decisions, where the scores reach 6.6 and a bf16 place is 0.031 —
+/// two and a half places. That is what the top sixteen of this vocabulary look
+/// like at this width; the forward feeding it is bit-identical to the
+/// reference, so the observed difference is zero rather than two places.
+///
+/// Both anchors trace a chain that differs from the per-position argmax, and
+/// the two differ from each other, so a selector that returned the argmax or
+/// ignored the seed fails here.
+#[ignore]
+#[test]
+fn the_selector_reproduces_the_reference_on_the_published_weights() {
+    let dir = match snapshot(DRAFT_SLUG) {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP dflash2_loader: {why}");
+            return;
+        }
+    };
+    let drafter = DFlash2Drafter::load(&dir, VERIFIER_HIDDEN, Device::Gpu)
+        .expect("the published DFlash 2 checkpoint must load whole");
+
+    let hidden_width = VERIFIER_HIDDEN as i32;
+    let concat = drafter.cfg.target_layer_ids.len() as i32 * hidden_width;
+    let block = bf16_input(
+        &synthetic_input(FORWARD_BLOCK_LEN * VERIFIER_HIDDEN, 0),
+        &[1, FORWARD_BLOCK_LEN as i32, hidden_width],
+    );
+    let ctx = bf16_input(
+        &synthetic_input(FORWARD_CTX_LEN * concat as usize, 1_000_003),
+        &[1, FORWARD_CTX_LEN as i32, concat],
+    );
+
+    // Row 0 of the block is the seed the chain is anchored at; the drafted
+    // positions are the rest, which is the reference's own `logits_start = 1`.
+    let full = drafter
+        .forward_hidden(&block, &ctx)
+        .expect("the forward runs on the published weights");
+    let positions = FORWARD_BLOCK_LEN as i32 - 1;
+    let hidden = full
+        .slice(
+            &[0, 1, 0],
+            &[1, positions + 1, hidden_width],
+            &[1, 1, 1],
+            Device::Gpu,
+        )
+        .expect("drop the seed row");
+    let logits = stand_in_logits(positions as usize, drafter.cfg.vocab_size);
+
+    let top1 = reference_ids("selector_top1");
+    for (i, anchor) in SELECTOR_ANCHORS.iter().enumerate() {
+        let want = reference_ids(&format!("selector_chain_{i}"));
+        let got = drafter
+            .select_chain(&hidden, &logits, *anchor)
+            .expect("the selector runs on the published weights");
+        println!("dflash2 published selector: anchor {anchor} -> {got:?}");
+        assert_eq!(
+            got, want,
+            "the chain at anchor {anchor} must be the reference's"
+        );
+        assert_ne!(
+            got, top1,
+            "the reference's own chain at anchor {anchor} equals the per-position \
+             argmax, so this case cannot tell a working selector from a dead one"
+        );
+    }
+    assert_ne!(
+        reference_ids("selector_chain_0"),
+        reference_ids("selector_chain_1"),
+        "the two anchors must trace different chains"
     );
 }
