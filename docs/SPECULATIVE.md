@@ -1135,7 +1135,7 @@ faster: `loop_ms_per_round` is 14.6 ms of a 44.4 ms round at block 2 and 25.1 ms
 of a 63.4 ms round at block 3, a third to two fifths of the round in a residual
 that produces no tokens.
 
-**The numbers below are not DFlash 2's.**
+**One row already recorded against this checkpoint is not DFlash 2's.**
 `z-lab/Qwen3.8-27B-DFlash2` is its own drafter kind (`dflash2`) with its own
 loader: config, weights and shapes are read and validated, and 23 of its 81
 tensors — a candidate selector and per-layer two-tap dynamic convolutions — are
@@ -1147,9 +1147,81 @@ drafter wearing the checkpoint's name, and `decode_config` recorded
 real drafter afterwards. **They are not a DFlash 2 measurement and must not be
 quoted as one.**
 
-No DFlash 2 accept rate or speedup has been measured on this pair. The loop
-below is proven correct — it reproduces plain greedy — and unmeasured for
-throughput; a figure appears here when one is taken.
+#### DFlash 2 and the MTP sidecar on that verifier, measured
+
+Same harness, same three registered prompt classes, and a no-drafter arm
+measured in every invocation beside the speculative one it is divided by:
+`--kv-quant none`, `--max-ctx 8192`, temperature 0, seed 42, 128 max tokens, one
+warmup and three measured requests. Every speculative row carries
+`charged=false`, and every arm's engine-measured decode window agrees with the
+client's reading of the same window to under 0.1%.
+
+| Drafter | Block | Prompt | Accept rate | tokens/round | Decode vs no drafter |
+|---|---|---|---|---|---|
+| DFlash 2 | 5 | code | 0.981 | 4.88 | **1.93×** |
+| DFlash 2 | 5 | structured | 0.824 | 4.23 | **1.54×** |
+| DFlash 2 | 5 | prose | 0.515 | 3.02 | 0.94× |
+| DFlash 2 | 8 | code | 0.865 | 7.06 | **1.85×** |
+| DFlash 2 | 8 | structured | 0.682 | 5.52 | **1.38×** |
+| DFlash 2 | 8 | prose | 0.405 | 3.74 | 0.87× |
+| MTP-4bit | 3 | code | 0.576 | 2.15 | 1.14× |
+| MTP-4bit | 3 | structured | 0.676 | 2.35 | 1.32× |
+| MTP-4bit | 3 | prose | 0.477 | 1.95 | 0.97× |
+
+The MTP rows reproduce the block-3 rows of the table above — same accept rate to
+three places, same tokens per round — which is what makes them usable as the
+comparison arm rather than a second, differently taken reading.
+
+**The comparison is not at equal depth and cannot be.** `MtpDrafter::block_size`
+is the sidecar's own `config.json` value (3 here) and the MTP round loop clamps
+`block_total` to it, so `--draft-block-size 8` against that sidecar runs at 3 and
+records `mtp/block=3`. The published comparison's "same 7 drafts" arm has no
+counterpart on this checkpoint; each drafter is shown at the depth it can run.
+
+The code column was taken DFlash 2 → MTP → MTP → DFlash 2, and the two DFlash 2
+readings agree to 0.8% as do the two MTP ones, so the ranking is not this host's
+slot drift. It is not run-to-run variation either: at temperature 0 the token
+stream repeats exactly, so accept rate, round count and tokens per round come
+back identical to the digit and only the timing moves.
+
+**Block 8 is the trained block; block 5 is the faster one**, which is what
+z-lab's own MLX guidance says (`block_size <= 5` against a quantized target and
+draft). Acceptance is per chain, so a shorter chain has a larger accepted
+fraction — 0.981 against 0.865 on code — and leaves less to roll back:
+`loop_ms_per_round` is 3.0 ms at block 5 against 11.7 ms at block 8 on the same
+prompt. Block 8 still wins on tokens per round and still loses on throughput,
+because the round it buys them in is longer than the extra tokens pay for.
+
+Where the round goes, against the 31.1 ms per token of the no-drafter arm:
+
+| Block | draft ms | verify ms | loop ms | round ms | tokens/round |
+|---|---|---|---|---|---|
+| 3 (MTP) | 6.3 | 39.6 | 12.5 | 58.4 | 2.15 |
+| 5 (DFlash 2) | 19.5 | 56.2 | 3.0 | 78.7 | 4.88 |
+| 8 (DFlash 2) | 22.5 | 84.3 | 11.7 | 118.5 | 7.06 |
+
+Verify against block: two more positions cost 16.5 ms and three more cost
+27.3 ms, so a marginal verified position is 8.2–9.1 ms — **26–29% of a plain
+decode step** where the bandwidth roofline is nearer 4%. That is the ceiling
+every speculative arm on this machine meets, and this is a third drafter kind
+measuring it.
+
+Drafting costs 19.5–24.4 ms per round almost independently of block and of
+prompt, against the sidecar's 5.9–6.9 ms. Two costs the port does not pay down
+explain that floor: the forward re-projects the conditioning over as many rows as
+the drafter's window reaches back over (2047 here) every round rather than over
+the new rows only, and the drafter's 3.85 GB of bf16 weights are read every round.
+Removing the loop residual entirely — more than the remaining accepted-prefix
+replay work would do — takes the block-8 code round to 106.8 ms and 2.05×, and
+also bringing drafting to the sidecar's cost takes it to 90.6 ms and 2.42×. Both
+are computed from the rows above, not measured.
+
+**The loop-overhead work is not landed** — its first half is, the accepted-prefix
+replay fix is not. Every number in this section was taken in that state.
+
+Greedy losslessness holds through all of it: on the code prompt the plain arm,
+the block-5 arm and the block-8 arm return the same 429 characters under one
+sha256, and the structured prompt's two arms likewise.
 
 `rmlx_models::speculative::dflash2` binds every tensor at the shape the config
 predicts and refuses a snapshot carrying one it does not read, and
