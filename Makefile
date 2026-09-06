@@ -96,6 +96,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest \
         canary-ab-host-gate-fixtures llama-ab-selftest spec-bench-selftest \
+        spec-bench-published-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
         check-published-samples check-published-samples-fixtures \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
@@ -512,6 +513,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/perf_ab_ingest_selftest.sh
 	@bash scripts/bench_llama_ab_selftest.sh
 	@bash scripts/spec_bench_selftest.sh
+	@bash scripts/spec_bench_published_selftest.sh
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true
@@ -695,6 +697,9 @@ llama-ab-selftest: ## mutation-check the llama-server A/B harness against a stub
 
 spec-bench-selftest: ## mutation-check the spec-decode bench against a stub server (no GPU, no model, no DB write)
 	bash scripts/spec_bench_selftest.sh
+
+spec-bench-published-selftest: ## mutation-check the published-protocol bench against a stub server (no GPU, no model)
+	bash scripts/spec_bench_published_selftest.sh
 
 canary-gate:        ## gate TPS regressions via runs.db (SHA= required; e.g. make canary-gate SHA=3ba8aee)
 	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make canary-gate SHA=<last-green-sha>"; exit 125; }

@@ -69,6 +69,17 @@ def cmd_pass(args):
         engine = json.load(handle)
     rows_in = engine["requests"]
 
+    # A charged round loop forces an evaluation at every phase boundary,
+    # draining a pipeline it otherwise keeps full. Its rate describes a slower,
+    # differently scheduled engine, and it is reachable from an ambient RUST_LOG
+    # that the harness's own filter does not clear.
+    if engine.get("charged"):
+        raise InputError(
+            f"pass {args.pass_number}: the round loop reported charged=true — it "
+            "forced an evaluation at every phase boundary and its decode rate "
+            "describes a differently scheduled engine. Unset RUST_LOG and re-run"
+        )
+
     index = []
     with open(args.index, encoding="utf-8") as handle:
         for line in handle:

@@ -235,63 +235,16 @@ WORK="$(mktemp -d "${SCRATCH_DIR}/published.XXXXXX")"
 trap 'rm -rf "${WORK}"' EXIT
 
 # ── Payloads ─────────────────────────────────────────────────────────────────
-#
-# Rendered once, from the checked-in samples, with the `messages` array copied
-# verbatim. The workspace builds serde_json with preserve_order, so a
-# re-emitted `{content, role}` has a different content address than the
-# `{role, content}` that was checked in, and a later join on it splits without
-# saying so.
 
 CELL_INDEX="${WORK}/cells.tsv"
-python3 - "${SAMPLES_ROOT}" "${WORK}" "${MODEL_ID}" "${CELL_INDEX}" "${CELLS[@]}" <<'PY'
-import json, pathlib, sys
-
-root, work, model_id, index_path = (pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]),
-                                    sys.argv[3], pathlib.Path(sys.argv[4]))
-cells = [spec.split(":") for spec in sys.argv[5:]]
-
-manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-files = {d["key"]: d["file"] for d in manifest["datasets"]}
-
-named = {dataset for dataset, _ in cells}
-missing = [d for d in named if d not in files]
-if missing:
-    sys.exit(f"ERROR: {root} holds no dataset {', '.join(sorted(missing))}")
-unmeasured = [k for k in files if k not in named]
-if unmeasured:
-    sys.exit(
-        f"ERROR: {root} holds {', '.join(sorted(unmeasured))}, which no cell measures: a "
-        "checked-in dataset that no pass sends is a sample set nobody is reading"
-    )
-
-rows = []
-for dataset, max_tokens in cells:
-    doc = json.loads((root / files[dataset]).read_text(encoding="utf-8"))
-    cell = f"{dataset}@{max_tokens}"
-    out = work / "payloads" / cell
-    out.mkdir(parents=True, exist_ok=True)
-    if not doc["samples"]:
-        sys.exit(f"ERROR: {cell}: the dataset holds no sample")
-    for i, sample in enumerate(doc["samples"]):
-        body = {
-            "model": model_id,
-            "messages": sample["messages"],
-            "max_tokens": int(max_tokens),
-            # Pinned choice: thinking on, and its tokens count as output.
-            "enable_thinking": True,
-            "stream": True,
-            # The prompt length recorded with a request is the one the server
-            # counted, and it only says so when asked.
-            "stream_options": {"include_usage": True},
-        }
-        payload = out / f"{i:05d}.json"
-        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
-        rows.append((cell, dataset, max_tokens, sample["id"], sample["body_sha256"],
-                     str(payload)))
-
-index_path.write_text("".join("\t".join(r) + "\n" for r in rows), encoding="utf-8")
-print(f"{len(rows)} requests over {len(cells)} cells")
-PY
+CELL_ARGS=()
+for spec in "${CELLS[@]}"; do CELL_ARGS+=(--cell "${spec}"); done
+python3 "${REPO_ROOT}/scripts/lib/published_payloads.py" \
+    --samples-root "${SAMPLES_ROOT}" \
+    --out "${WORK}/payloads" \
+    --model-id "${MODEL_ID}" \
+    --index "${CELL_INDEX}" \
+    "${CELL_ARGS[@]}" || exit 1
 
 REQUESTS_PER_PASS="$(wc -l < "${CELL_INDEX}" | tr -d ' ')"
 
