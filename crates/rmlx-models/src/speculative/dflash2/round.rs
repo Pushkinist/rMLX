@@ -44,7 +44,7 @@
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{argmax, concatenate, Array, Device};
+use rmlx_mlx::{argmax, Array, Device};
 
 use super::DFlash2Drafter;
 use crate::arch::Architecture;
@@ -112,9 +112,6 @@ pub fn dflash2_generate_greedy(
 
     let target_layer_ids = drafter.cfg.target_layer_ids.clone();
     let condition_width = (drafter.cfg.hidden_size * target_layer_ids.len()) as i32;
-    // The drafter attends over `sliding_window` positions, one of which is the
-    // block position itself, so this many conditioning rows are reachable.
-    let keep_rows = drafter.cfg.sliding_window as i32 - 1;
     let block_total = requested_block_total.min(drafter.cfg.block_size).max(2);
 
     // Same constant the verifier resolves — a spec pair must not run two
@@ -164,7 +161,7 @@ pub fn dflash2_generate_greedy(
         device,
     )?;
     guard_verifier_prefill_logits(verifier, &bonus_logits, prompt_ids.len())?;
-    let mut h_ctx = keep_last_rows(&prompt_hidden, keep_rows, condition_width, device)?;
+    let mut h_ctx = drafter.trim_conditioning(&prompt_hidden)?;
     let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     let mut b = read_argmax(&bonus_logits, device)?;
@@ -298,8 +295,7 @@ pub fn dflash2_generate_greedy(
             &[1, 1, 1],
             device,
         )?;
-        let grown = concatenate(&[&h_ctx, &committed_hidden], 1, device)?;
-        h_ctx = keep_last_rows(&grown, keep_rows, condition_width, device)?;
+        h_ctx = drafter.extend_conditioning(&h_ctx, &committed_hidden)?;
         b = *new_tokens.last().unwrap_or(&b);
 
         tracing::debug!(
@@ -374,37 +370,6 @@ fn draft_block(
     drafter.select_chain(&drafted, &logits, seed)
 }
 
-/// The last `keep` rows of a `[1, rows, width]` conditioning buffer.
-///
-/// `width` is the width the caller's config predicts rather than the one the
-/// array reports: a buffer that is not that wide has been built from the wrong
-/// capture, and the drafter's `fc` would consume it as though it were.
-///
-/// Returns the array itself when it is already short enough.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "each axis is read only after the rank has been compared against 3"
-)]
-pub(super) fn keep_last_rows(
-    hidden: &Array,
-    keep: i32,
-    width: i32,
-    device: Device,
-) -> Result<Array> {
-    let shape = hidden.shape();
-    if shape.len() != 3 || shape[0] != 1 || shape[2] != width {
-        return Err(Error::Model(format!(
-            "dflash2_generate_greedy: the conditioning buffer has shape {shape:?}, not \
-             the [1, rows, {width}] the drafter's target_layer_ids predict"
-        )));
-    }
-    let rows = shape[1];
-    if rows <= keep {
-        return hidden.try_clone();
-    }
-    hidden.slice(&[0, rows - keep, 0], &[1, rows, width], &[1, 1, 1], device)
-}
-
 /// One token id off a `[.., 1, vocab]` logit row.
 #[allow(
     clippy::indexing_slicing,
@@ -423,7 +388,3 @@ fn read_argmax(logits: &Array, device: Device) -> Result<u32> {
     }
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
-
-#[cfg(test)]
-#[path = "round_tests.rs"]
-mod round_tests;

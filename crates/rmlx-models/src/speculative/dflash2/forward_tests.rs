@@ -427,6 +427,253 @@ fn the_window_drops_the_conditioning_rows_the_reference_drops() {
     );
 }
 
+/// The mask is the reference's predicate, cell for cell, at a shape whose
+/// positions bf16 cannot represent.
+///
+/// The reference decides one boolean per (query, key) pair
+/// (`model_mlx.py`, `DFlashAttention.__call__`):
+///
+/// ```text
+/// context = (key < ctx_len) & (ctx_len + t - key < sliding_window)
+/// block   = key >= ctx_len
+/// allowed = context | block
+/// ```
+///
+/// Written out in integers here rather than compared against a stored tensor,
+/// so it is the reference's rule being checked and not this port's output.
+///
+/// **The second shape, at bf16, is the point.** `ctx_len = 257` is the first
+/// integer bf16 rounds — it lands on 256 — and the window is one wider than the
+/// context, so the deepest block queries reach back past key 256 and the
+/// `block` term is what decides it. That makes the position threshold's dtype
+/// observable: casting it to the block's dtype, which is what the `f32-ok`
+/// marker beside it exists to stop, opens a key the window blocks. At every
+/// shape the reference fixtures use — contexts of 2, 3 and 6 — bf16 is exact
+/// and the same cast changes nothing, which is why no fixture could defend that
+/// marker.
+///
+/// The dtype is swept because the production call passes the block's, which is
+/// bf16, and a check run only at `f32` would make that cast a no-op.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test assertion: the mask is read at the shape window_mask was asked for, and a shorter buffer than that is the assertion failing"
+)]
+fn the_mask_is_the_references_predicate_including_past_bf16s_integers() {
+    // (sliding_window, ctx_len, block_len)
+    let shapes = [(4i32, 6i32, 4i32), (258, 257, 258)];
+    for ((window, ctx_len, block_len), dtype) in shapes
+        .into_iter()
+        .flat_map(|s| [(s, Dtype::Bf16), (s, Dtype::F32)])
+    {
+        let (drafter, _dir) = scale_drafter(Some(window as u64));
+        let mask = match drafter.window_mask(block_len, ctx_len, dtype) {
+            Ok(m) => m,
+            Err(e) => panic!("window_mask({window}, {ctx_len}, {block_len}, {dtype:?}): {e}"),
+        };
+        let keys = ctx_len + block_len;
+        assert_eq!(mask.shape(), vec![1, 1, block_len, keys]);
+        let got = to_f32(&mask);
+        assert_eq!(got.len(), (block_len * keys) as usize);
+
+        let mut disagreements = 0usize;
+        let mut first = String::new();
+        for t in 0..block_len {
+            for k in 0..keys {
+                let context = k < ctx_len && ctx_len + t - k < window;
+                let want_open = context || k >= ctx_len;
+                let is_open = got[(t * keys + k) as usize] == 0.0;
+                if is_open != want_open {
+                    disagreements += 1;
+                    if first.is_empty() {
+                        first = format!(
+                            "query {t}, key {k}: the reference {} it and the mask {} it",
+                            if want_open { "opens" } else { "blocks" },
+                            if is_open { "opens" } else { "blocks" },
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            disagreements,
+            0,
+            "at window {window}, context {ctx_len}, block {block_len}, {dtype:?} the \
+             mask disagrees with the reference on {disagreements} of {} pairs; {first}",
+            block_len * keys
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the conditioning window: which rows are carried, and how many
+// ---------------------------------------------------------------------------
+
+/// The row count the trim keeps is the largest one whose oldest row any block
+/// query can still read — derived from the mask's own predicate, not restated
+/// from the expression that computes it.
+///
+/// This is the number the round loop's buffer is bounded by, and the round loop
+/// cannot show it: the mask blocks whatever the trim leaves over, so keeping one
+/// row too many is invisible in an answer. It is a memory bound, and this is
+/// where it is checked.
+#[test]
+fn the_trim_keeps_every_row_a_block_query_can_reach_and_no_more() {
+    for window in [2i32, 4, 5, 17, 2048] {
+        let (drafter, _dir) = scale_drafter(Some(window as u64));
+        // The shallowest block query sits at key position `ctx_len`, and the
+        // window lets it read back to `ctx_len - window + 1`. The oldest kept
+        // row is index 0, so it is readable exactly while that is <= 0.
+        let readable = |ctx_len: i32| ctx_len - window < 0;
+        let largest = (1..=window).rev().find(|&rows| readable(rows)).unwrap_or(0);
+        assert_eq!(
+            drafter.conditioning_rows(),
+            largest,
+            "at window {window} the deepest reachable context is {largest} rows; \
+             keeping fewer discards a row the mask would have shown the drafter, \
+             keeping more carries one it will always hide"
+        );
+        assert!(
+            !readable(largest + 1),
+            "at window {window} the row past the bound must be unreadable, or this \
+             asserts nothing about where the bound is"
+        );
+    }
+}
+
+/// Rows of `[1, rows, width]` counting up from zero, one distinct value per row
+/// so a trim that kept the wrong end is a different answer.
+fn conditioning_rows_of(rows: i32, width: i32) -> Array {
+    let data: Vec<f32> = (0..rows)
+        .flat_map(|r| std::iter::repeat_n(r as f32, width as usize))
+        .collect();
+    f32_array(&data, &[1, rows, width])
+}
+
+/// The first element of every row, which is that row's own number.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test assertion: the array's shape is the one the fixture gave it"
+)]
+fn row_numbers(a: &Array) -> Vec<i32> {
+    let width = a.shape()[2] as usize;
+    to_f32(a).iter().step_by(width).map(|v| *v as i32).collect()
+}
+
+/// Past the window the **newest** rows survive, and a buffer inside it is
+/// carried whole.
+///
+/// Which end is kept is the whole property: the drafter attends over the rows
+/// nearest the block, so a trim that kept the oldest would condition every round
+/// on the start of the prompt and go on drafting without an error.
+#[test]
+fn the_trim_keeps_the_newest_rows_and_carries_a_short_buffer_whole() {
+    let (drafter, _dir) = scale_drafter(Some(5));
+    let keep = drafter.conditioning_rows();
+    assert_eq!(keep, 4);
+    let width = (drafter.cfg.target_layer_ids.len() * SCALE_HIDDEN) as i32;
+
+    let short = match drafter.trim_conditioning(&conditioning_rows_of(3, width)) {
+        Ok(a) => a,
+        Err(e) => panic!("trim_conditioning: {e}"),
+    };
+    assert_eq!(row_numbers(&short), vec![0, 1, 2], "inside the window");
+
+    // One row past the window: the narrowest shape the trim is observable at,
+    // and the one an off-by-one in the start index moves.
+    let over = match drafter.trim_conditioning(&conditioning_rows_of(5, width)) {
+        Ok(a) => a,
+        Err(e) => panic!("trim_conditioning: {e}"),
+    };
+    assert_eq!(over.shape(), vec![1, 4, width]);
+    assert_eq!(row_numbers(&over), vec![1, 2, 3, 4]);
+
+    let far = match drafter.trim_conditioning(&conditioning_rows_of(9, width)) {
+        Ok(a) => a,
+        Err(e) => panic!("trim_conditioning: {e}"),
+    };
+    assert_eq!(row_numbers(&far), vec![5, 6, 7, 8]);
+
+    // Idempotent, which is what makes the round loop's grow-then-trim bounded
+    // rather than merely bounded on its first pass.
+    let again = match drafter.trim_conditioning(&far) {
+        Ok(a) => a,
+        Err(e) => panic!("trim_conditioning: {e}"),
+    };
+    assert_eq!(row_numbers(&again), vec![5, 6, 7, 8]);
+}
+
+/// Extending the carried buffer bounds it in the same step, so a buffer already
+/// at the bound stays there however many rounds append to it.
+///
+/// The round loop's per-round growth goes through this and nothing else. Growing
+/// without bounding produces the same tokens and an unbounded allocation, which
+/// is why the two are one operation rather than two lines at a call site.
+#[test]
+fn extending_the_carried_buffer_leaves_it_at_the_bound() {
+    let (drafter, _dir) = scale_drafter(Some(5));
+    let keep = drafter.conditioning_rows();
+    let width = (drafter.cfg.target_layer_ids.len() * SCALE_HIDDEN) as i32;
+
+    let mut carried = conditioning_rows_of(2, width);
+    let mut next = 2;
+    for round in 0..6 {
+        let committed = f32_array(
+            &(0..3 * width)
+                .map(|i| (next + i / width) as f32)
+                .collect::<Vec<f32>>(),
+            &[1, 3, width],
+        );
+        next += 3;
+        carried = match drafter.extend_conditioning(&carried, &committed) {
+            Ok(a) => a,
+            Err(e) => panic!("extend_conditioning at round {round}: {e}"),
+        };
+        let rows = row_numbers(&carried);
+        assert!(
+            rows.len() as i32 <= keep,
+            "round {round} carries {} rows past a bound of {keep}",
+            rows.len()
+        );
+        assert_eq!(
+            rows.last().copied(),
+            Some(next - 1),
+            "round {round} must end on the newest committed row"
+        );
+    }
+    assert_eq!(row_numbers(&carried).len() as i32, keep, "saturated");
+}
+
+/// A conditioning buffer of another width or rank is refused rather than
+/// trimmed.
+///
+/// The width is `len(target_layer_ids) * hidden_size`, and a capture taken at a
+/// different set of target layers has the same rank and the same row count. The
+/// drafter's `fc` would consume it, project it, and draft from it.
+#[test]
+fn a_conditioning_buffer_the_projection_cannot_read_is_refused() {
+    let (drafter, _dir) = scale_drafter(None);
+    let width = (drafter.cfg.target_layer_ids.len() * SCALE_HIDDEN) as i32;
+
+    let err = match drafter.trim_conditioning(&conditioning_rows_of(4, width - SCALE_HIDDEN as i32))
+    {
+        Ok(a) => panic!("a narrower buffer must be refused, got {:?}", a.shape()),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("not the"), "names the mismatch: {err}");
+    assert!(
+        err.contains(&format!("{width}")),
+        "names the width it wanted: {err}"
+    );
+
+    let flat = f32_array(&[0.0, 1.0, 2.0], &[3]);
+    let err = match drafter.trim_conditioning(&flat) {
+        Ok(a) => panic!("a rank-1 buffer must be refused, got {:?}", a.shape()),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("[3]"), "names what it got: {err}");
+}
+
 /// A conditioning context shorter than the block is the reference's answer too:
 /// nothing in the mask or the position arithmetic assumes the context is the
 /// longer of the two.

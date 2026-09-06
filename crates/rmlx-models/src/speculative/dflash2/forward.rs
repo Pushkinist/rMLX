@@ -69,11 +69,9 @@ impl DFlash2Drafter {
             &[1, -1, self.cfg.target_layer_ids.len() as i32 * hidden],
         )?;
 
-        // The window keeps `sliding_window - 1` conditioning rows, so that every
-        // block query still reads a whole window once its own position is
-        // counted. `fc` and `hidden_norm` are row-wise, so dropping the rows
+        // `fc` and `hidden_norm` are row-wise, so dropping the unreachable rows
         // before them is the same result for less work.
-        let keep = self.cfg.sliding_window as i32 - 1;
+        let keep = self.conditioning_rows();
         let ctx_len = full_ctx.min(keep);
         let trimmed = if full_ctx > keep {
             target_hidden.slice(
@@ -336,6 +334,82 @@ impl DFlash2Drafter {
         let open = scalar_f32(0.0).astype(dtype, device)?;
         let blocked = scalar_f32(BLOCKED_BIAS).astype(dtype, device)?;
         where_cond(&allowed, &open, &blocked, device)
+    }
+
+    /// Conditioning rows a block query can reach: the window less the block
+    /// position itself.
+    ///
+    /// A block query at index `t` sits at key position `ctx_len + t`, and the
+    /// window lets it read back to `ctx_len + t - sliding_window + 1`. At
+    /// `t = 0` — the shallowest query, and so the one that reaches back least
+    /// far — the oldest readable key is `ctx_len - sliding_window + 1`, which is
+    /// index 0 exactly when `ctx_len` is `sliding_window - 1`. One row more and
+    /// the oldest is masked for every query in the block.
+    ///
+    /// `i32` because that is what an array axis is, and
+    /// [`check_config`](super::check_config) refuses a window that does not fit
+    /// in one — past that this subtraction wraps negative and
+    /// [`Self::trim_conditioning`] slices from beyond its own end.
+    pub(super) fn conditioning_rows(&self) -> i32 {
+        self.cfg.sliding_window as i32 - 1
+    }
+
+    /// Drop the conditioning rows no block query can read.
+    ///
+    /// Two callers, and they are not interchangeable. [`Self::forward_hidden`]
+    /// calls it to avoid projecting rows the mask will hide, which changes no
+    /// output; the round loop calls it on the buffer it carries between rounds,
+    /// where it is the **bound** on something that would otherwise grow by
+    /// `len(target_layer_ids) * hidden_size` per emitted token forever. Only the
+    /// first is visible in an answer, so a round loop passing its own row count
+    /// could drift to any value at all and no test would move. It passes none.
+    ///
+    /// `hidden` is `[1, rows, len(target_layer_ids) * hidden_size]`, oldest row
+    /// first. Returned unchanged when it is already short enough.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Model`] when the buffer is not the rank or the width this
+    /// drafter's `fc` reads — a capture taken at another set of target layers
+    /// has the same rank and the same row count, and would be projected as
+    /// though it were this one.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "each axis is read only after the rank has been compared against 3"
+    )]
+    pub(super) fn trim_conditioning(&self, hidden: &Array) -> Result<Array> {
+        let device = self.device;
+        let width = self.cfg.target_layer_ids.len() as i32 * self.cfg.hidden_size as i32;
+        let shape = hidden.shape();
+        if shape.len() != 3 || shape[0] != 1 || shape[2] != width {
+            return Err(Error::Model(format!(
+                "DFlash2Drafter: the conditioning buffer has shape {shape:?}, not the \
+                 [1, rows, {width}] this drafter's target_layer_ids predict"
+            )));
+        }
+        let keep = self.conditioning_rows();
+        let rows = shape[1];
+        if rows <= keep {
+            return hidden.try_clone();
+        }
+        hidden.slice(&[0, rows - keep, 0], &[1, rows, width], &[1, 1, 1], device)
+    }
+
+    /// Append a round's committed conditioning rows to the buffer carried from
+    /// the last one, bounded.
+    ///
+    /// Growing and bounding are one operation because the invariant is on the
+    /// result, not on either step: a caller that appended and did not trim would
+    /// produce the same tokens forever and grow without limit, and nothing in an
+    /// answer would say so. There is no way to reach the first half alone.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Model`] when either side is not the rank or the width this
+    /// drafter's `fc` reads.
+    pub(super) fn extend_conditioning(&self, carried: &Array, committed: &Array) -> Result<Array> {
+        let grown = concatenate(&[carried, committed], 1, self.device)?;
+        self.trim_conditioning(&grown)
     }
 
     /// Channel groups the dynamic kernel's correction is shared over.

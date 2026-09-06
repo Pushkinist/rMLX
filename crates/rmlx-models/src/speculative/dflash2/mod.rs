@@ -95,7 +95,8 @@ pub struct DFlash2Config {
     /// Attention window, in positions.
     pub sliding_window: usize,
     /// Whether the drafter's own attention is causal. DFlash 2 drafts the block
-    /// bidirectionally, so this is `false` on the published checkpoint.
+    /// bidirectionally, so this is `false` on the published checkpoint and
+    /// `true` is refused — see [`check_config`].
     pub is_causal: bool,
     /// Trained block size, including the seed token.
     pub block_size: usize,
@@ -463,6 +464,15 @@ fn check_config(
             cfg.hidden_size
         )));
     }
+    if cfg.is_causal {
+        return Err(Error::Model(
+            "DFlash2Drafter: config.json sets is_causal to true; this drafter denoises \
+             the block bidirectionally and has no causal branch, so a causal checkpoint \
+             would be denoised the wrong way round — fluent proposals at a quietly wrong \
+             accept rate, which nothing downstream can see"
+                .into(),
+        ));
+    }
     if cfg.conv_kernel_size != CONV_TAPS {
         return Err(Error::Model(format!(
             "DFlash2Drafter: dflash_config.conv_kernel_size is {}; this drafter's \
@@ -518,6 +528,18 @@ fn check_config(
             "DFlash2Drafter: sliding_window is {}; the window holds the block \
              position and the conditioning rows behind it, and below two it \
              reaches back past no row at all",
+            cfg.sliding_window
+        )));
+    }
+    // The window is a row count, and every consumer carries it as the `i32` an
+    // MLX axis length is. Above that it wraps negative, and a negative row
+    // count reaches the conditioning trim as a slice whose start is past its
+    // stop — which returns no rows and no error.
+    if i32::try_from(cfg.sliding_window).is_err() {
+        return Err(Error::Model(format!(
+            "DFlash2Drafter: sliding_window is {}, more positions than an array axis \
+             holds; the conditioning trim would take a slice starting past its own end \
+             and return an empty window rather than fail",
             cfg.sliding_window
         )));
     }

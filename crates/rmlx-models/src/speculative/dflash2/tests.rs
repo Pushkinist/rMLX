@@ -316,6 +316,14 @@ fn a_config_the_forward_could_not_honour_is_refused() {
         // forward's window arithmetic below zero.
         ("", "sliding_window", serde_json::json!(1), "sliding_window"),
         ("", "sliding_window", serde_json::json!(0), "sliding_window"),
+        // A window wider than an array axis wraps negative in the conditioning
+        // trim, which then slices from past its own end and returns nothing.
+        (
+            "",
+            "sliding_window",
+            serde_json::json!(u64::from(u32::MAX)),
+            "sliding_window",
+        ),
         // An empty target-layer list projects nothing.
         (
             "dflash_config",
@@ -354,6 +362,39 @@ fn a_config_the_forward_could_not_honour_is_refused() {
             "the refusal for {path}.{key} = {value} must name {want}: {err}"
         );
     }
+}
+
+/// A causal checkpoint is refused, and a bidirectional one is not.
+///
+/// The forward's mask is unconditionally bidirectional. The reference branches
+/// on this flag — it ands the block term with `key <= query` when it is set — so
+/// a causal checkpoint run through this drafter would be denoised the wrong way
+/// round and still produce fluent proposals, at an accept rate nothing
+/// downstream can attribute. Refusing it is the whole of this drafter's answer
+/// to that flag, which is why the flag has to be read for something.
+///
+/// Both directions are asserted. Refusing the true case alone is satisfied by a
+/// guard of the wrong polarity, which would refuse the published checkpoint.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: a refusal of the published checkpoint's own value is the assertion failing"
+)]
+fn a_causal_checkpoint_is_refused_and_a_bidirectional_one_is_not() {
+    let err = match parsed_with("", "is_causal", Some(serde_json::json!(true))) {
+        Ok(cfg) => panic!("a causal checkpoint must refuse, parsed to {cfg:?}"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("is_causal"), "names the key: {err}");
+    assert!(
+        err.contains("bidirectionally"),
+        "names the direction the forward actually denoises in, so a refusal for \
+         some other reason cannot satisfy this: {err}"
+    );
+
+    let cfg = parsed_with("", "is_causal", Some(serde_json::json!(false)))
+        .expect("the published checkpoint's own value is the one this drafter runs");
+    assert!(!cfg.is_causal);
 }
 
 /// A drafter of a different width than the verifier is refused: its `fc` reads
