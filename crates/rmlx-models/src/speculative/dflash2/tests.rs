@@ -1,9 +1,15 @@
-//! DFlash 2 config-parsing unit tests.
+//! DFlash 2 config-parsing and loader unit tests.
 //!
 //! The positive case is the published `z-lab/Qwen3.8-27B-DFlash2` config, kept
 //! here verbatim so the negative cases below are one edit away from a config
 //! that is known to work. `tests/dflash2_loader.rs` runs the same assertions
 //! against the file on disk, which is what keeps this copy honest.
+//!
+//! The loader half runs on a scale-model snapshot written to a temp dir — the
+//! same tensor names at a width small enough to write. It exists for the one
+//! property the real checkpoint cannot show: the real checkpoint carries no
+//! tensor the loader fails to read, so on it the unread-tensor refusal returns
+//! the same answer whether it is wired or deleted.
 
 use super::*;
 
@@ -335,5 +341,224 @@ fn a_width_the_verifier_does_not_share_is_refused() {
     assert!(
         err.contains("5120") && err.contains("2048"),
         "the refusal must name both widths: {err}"
+    );
+}
+
+// --- the loader, on a scale model of the snapshot ---
+
+/// A DFlash 2 config at a width small enough to write a whole snapshot for.
+/// Same keys, same relationships: `head_dim * num_attention_heads` is the
+/// hidden size, `conv_group_size` divides it, `layer_types` matches the stack.
+const SCALE_CONFIG_JSON: &str = r#"{
+  "architectures": ["DFlash2DraftModel"],
+  "is_causal": false,
+  "dflash_config": {
+    "block_size": 4,
+    "conv_group_size": 16,
+    "conv_kernel_size": 2,
+    "mask_token_id": 39,
+    "selector_rank": 8,
+    "selector_top_k": 4,
+    "target_layer_ids": [0, 1]
+  },
+  "head_dim": 16,
+  "hidden_size": 64,
+  "intermediate_size": 32,
+  "layer_types": ["sliding_attention"],
+  "model_type": "qwen3",
+  "num_attention_heads": 4,
+  "num_hidden_layers": 1,
+  "num_key_value_heads": 2,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": { "rope_theta": 10000000, "rope_type": "default" },
+  "sliding_window": 64,
+  "vocab_size": 40
+}"#;
+
+const SCALE_HIDDEN: usize = 64;
+
+/// Every tensor the scale-model snapshot ships, at the shape the config above
+/// predicts.
+fn scale_tensors() -> Vec<(String, Vec<usize>)> {
+    let mut t: Vec<(String, Vec<usize>)> = vec![
+        ("fc.weight".to_owned(), vec![64, 128]),
+        ("hidden_norm.weight".to_owned(), vec![64]),
+        ("norm.weight".to_owned(), vec![64]),
+        (
+            "candidate_selector.hidden_projection.weight".to_owned(),
+            vec![8, 64],
+        ),
+        (
+            "candidate_selector.predecessor_codebook".to_owned(),
+            vec![40, 8],
+        ),
+        (
+            "candidate_selector.successor_codebook".to_owned(),
+            vec![40, 8],
+        ),
+    ];
+    for (name, shape) in [
+        ("input_layernorm.weight", vec![64]),
+        ("post_attention_layernorm.weight", vec![64]),
+        ("self_attn.q_proj.weight", vec![64, 64]),
+        ("self_attn.k_proj.weight", vec![32, 64]),
+        ("self_attn.v_proj.weight", vec![32, 64]),
+        ("self_attn.o_proj.weight", vec![64, 64]),
+        ("self_attn.q_norm.weight", vec![16]),
+        ("self_attn.k_norm.weight", vec![16]),
+        ("mlp.gate_proj.weight", vec![32, 64]),
+        ("mlp.up_proj.weight", vec![32, 64]),
+        ("mlp.down_proj.weight", vec![64, 32]),
+        ("attention_conv.base_kernel", vec![2, 2, 64]),
+        ("attention_conv.kernel_projection.weight", vec![16, 64]),
+        ("mlp_conv.base_kernel", vec![2, 2, 64]),
+        ("mlp_conv.kernel_projection.weight", vec![16, 64]),
+    ] {
+        t.push((format!("layers.0.{name}"), shape));
+    }
+    t
+}
+
+/// Serialise a zero-filled bf16 safetensors file. Offsets are assigned in the
+/// order the header serialises in, which the format requires to be contiguous.
+fn safetensors_bytes(tensors: &[(String, Vec<usize>)]) -> Vec<u8> {
+    let mut sorted: Vec<&(String, Vec<usize>)> = tensors.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut header = serde_json::Map::new();
+    let mut offset = 0usize;
+    for (name, shape) in sorted {
+        let bytes = shape.iter().product::<usize>() * 2;
+        header.insert(
+            name.clone(),
+            serde_json::json!({
+                "dtype": "BF16",
+                "shape": shape,
+                "data_offsets": [offset, offset + bytes],
+            }),
+        );
+        offset += bytes;
+    }
+    let hdr = serde_json::Value::Object(header).to_string();
+
+    let mut out = Vec::with_capacity(8 + hdr.len() + offset);
+    out.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
+    out.extend_from_slice(hdr.as_bytes());
+    out.resize(out.len() + offset, 0);
+    out
+}
+
+/// Write a snapshot directory holding the given tensors.
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture: a temp dir that cannot be written is the harness failing, not the code under test"
+)]
+fn write_snapshot(tensors: &[(String, Vec<usize>)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("config.json"), SCALE_CONFIG_JSON).expect("config.json");
+    std::fs::write(
+        dir.path().join("model.safetensors"),
+        safetensors_bytes(tensors),
+    )
+    .expect("model.safetensors");
+    dir
+}
+
+/// The loader binds every tensor of a whole snapshot and reports the config it
+/// read. This is the control for the refusal below: without it, a loader that
+/// refused everything would pass that test.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertions: the fixture is a whole snapshot and an Err here is the assertion failing"
+)]
+fn a_whole_snapshot_loads_and_reports_what_it_read() {
+    let dir = write_snapshot(&scale_tensors());
+    let drafter = DFlash2Drafter::load(dir.path(), SCALE_HIDDEN, Device::Cpu)
+        .expect("a snapshot carrying every tensor must load");
+    assert_eq!(drafter.cfg.block_size, 4);
+    assert_eq!(drafter.cfg.selector_rank, 8);
+    assert_eq!(drafter.layers.len(), 1);
+    assert_eq!(
+        drafter.selector.predecessor_codebook.shape(),
+        vec![40, 8],
+        "the codebook binds under its bare name"
+    );
+    let layer = drafter.layers.first().expect("one layer");
+    assert_eq!(layer.attention_conv.base_kernel.shape(), vec![2, 2, 64]);
+    assert_eq!(layer.mlp_conv.base_kernel.shape(), vec![2, 2, 64]);
+}
+
+/// A snapshot carrying a tensor this loader does not read is refused, naming
+/// it.
+///
+/// The published checkpoint cannot show this: the loader reads all 81 of its
+/// tensors, so the refusal answers the same whether it is wired or deleted.
+/// A DFlash generation past this one is exactly the case it exists for.
+#[test]
+fn a_snapshot_with_a_tensor_this_loader_cannot_build_is_refused() {
+    let mut tensors = scale_tensors();
+    tensors.push((
+        "layers.0.self_attn.gate_proj.weight".to_owned(),
+        vec![32, 64],
+    ));
+    let dir = write_snapshot(&tensors);
+
+    let err = match DFlash2Drafter::load(dir.path(), SCALE_HIDDEN, Device::Cpu) {
+        Ok(_) => panic!("a snapshot carrying an unread tensor must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("DFlash2Drafter"),
+        "the refusal names the loader that issued it: {err}"
+    );
+    assert!(
+        err.contains("layers.0.self_attn.gate_proj.weight"),
+        "the refusal names the tensor it cannot build: {err}"
+    );
+}
+
+/// A tensor missing from the snapshot is refused by name rather than skipped.
+#[test]
+fn a_missing_tensor_is_refused_by_name() {
+    let tensors: Vec<(String, Vec<usize>)> = scale_tensors()
+        .into_iter()
+        .filter(|(n, _)| n != "candidate_selector.successor_codebook")
+        .collect();
+    let dir = write_snapshot(&tensors);
+
+    let err = match DFlash2Drafter::load(dir.path(), SCALE_HIDDEN, Device::Cpu) {
+        Ok(_) => panic!("a snapshot missing a tensor must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("candidate_selector.successor_codebook"),
+        "the refusal names the tensor it could not find: {err}"
+    );
+}
+
+/// A tensor present under the right name at the wrong shape is refused, naming
+/// both shapes.
+#[test]
+fn a_tensor_at_the_wrong_shape_is_refused_naming_both() {
+    let tensors: Vec<(String, Vec<usize>)> = scale_tensors()
+        .into_iter()
+        .map(|(n, s)| {
+            if n == "layers.0.attention_conv.kernel_projection.weight" {
+                (n, vec![8, 64])
+            } else {
+                (n, s)
+            }
+        })
+        .collect();
+    let dir = write_snapshot(&tensors);
+
+    let err = match DFlash2Drafter::load(dir.path(), SCALE_HIDDEN, Device::Cpu) {
+        Ok(_) => panic!("a tensor at the wrong shape must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("[8, 64]") && err.contains("[16, 64]"),
+        "the refusal names the shape it found and the shape it predicted: {err}"
     );
 }
