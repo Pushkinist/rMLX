@@ -858,3 +858,129 @@ fn a_snapshot_a_loader_only_half_reads_is_refused_and_a_whole_one_is_not() {
         "a consumed tensor must not be reported unread: {msg}"
     );
 }
+
+// ── VerifierDraw ─────────────────────────────────────────────────────────────
+
+/// Build a `[1, k, vocab]` logits array from row-major f32 values.
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn logits_block(rows: &[[f32; 4]]) -> Array {
+    let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+    let bytes: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
+    Array::from_bytes(&bytes, &[1, rows.len() as i32, 4], Dtype::F32)
+        .expect("a well-formed logits block")
+}
+
+fn greedy_cfg() -> crate::sampler::SamplerConfig {
+    crate::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(7),
+        top_logprobs_k: 0,
+    }
+}
+
+fn sampled_cfg() -> crate::sampler::SamplerConfig {
+    crate::sampler::SamplerConfig {
+        temperature: 0.7,
+        top_p: 0.95,
+        top_k: 20,
+        min_p: 0.0,
+        seed: Some(7),
+        top_logprobs_k: 0,
+    }
+}
+
+/// At temperature 0 the draw is each row's own argmax, and nothing else reaches
+/// it.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn a_greedy_draw_is_the_argmax_of_every_row() {
+    let block = logits_block(&[
+        [0.1, 9.0, 0.2, 0.3],
+        [4.0, 0.0, 0.5, 8.5],
+        [7.0, 1.0, 2.0, 3.0],
+    ]);
+    let mut draw = VerifierDraw::new(&greedy_cfg());
+    assert!(!draw.sampling(), "temperature 0 must not sample");
+    let got = draw
+        .block_tokens(&block, 3, Device::Cpu)
+        .expect("three rows");
+    assert_eq!(
+        got,
+        vec![1, 3, 0],
+        "each position takes its own row's argmax"
+    );
+}
+
+/// The seed a loop emits after prefill is the draw the round loop would take,
+/// at a block of one.
+///
+/// The two seams are separate calls on separate shapes — a `[1, 1, vocab]`
+/// prefill row against a `[1, k, vocab]` verified block — so a loop that sampled
+/// its block and argmaxed its seed would look right at every position but the
+/// first, and one position in a stream is below what a distributional gate can
+/// resolve. This is what covers it instead.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn the_seed_draw_is_the_block_draw_at_one_position() {
+    for cfg in [greedy_cfg(), sampled_cfg()] {
+        let row = logits_block(&[[2.0, 2.1, 1.9, 0.4]]);
+        let seed = VerifierDraw::new(&cfg)
+            .seed_token(&row, Device::Cpu)
+            .expect("one seed token");
+        let block = VerifierDraw::new(&cfg)
+            .block_tokens(&row, 1, Device::Cpu)
+            .expect("one block token");
+        assert_eq!(
+            vec![seed],
+            block,
+            "the prefill seam and the round seam must draw the same token from the same \
+             row at temperature {}",
+            cfg.temperature
+        );
+    }
+}
+
+/// A sampled draw reaches past the argmax, and reproduces itself from its seed.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn a_sampled_draw_is_neither_the_argmax_nor_irreproducible() {
+    // Four near-equal logits: id 1 is the argmax at every position, so a block
+    // that comes back all ones is an argmax wearing a temperature.
+    let rows = [[2.00_f32, 2.05, 2.02, 1.98]; 64];
+    let block = logits_block(&rows);
+    let cfg = sampled_cfg();
+    let first = VerifierDraw::new(&cfg)
+        .block_tokens(&block, 64, Device::Cpu)
+        .expect("sixty-four rows");
+    let again = VerifierDraw::new(&cfg)
+        .block_tokens(&block, 64, Device::Cpu)
+        .expect("sixty-four rows");
+    assert_eq!(first, again, "one seed must give one stream");
+    assert!(
+        first.iter().any(|&t| t != 1),
+        "every position took the argmax, so this is not sampling: {first:?}"
+    );
+    assert!(
+        first
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            >= 3,
+        "four near-equal logits must reach more than two ids over sixty-four draws: {first:?}"
+    );
+}

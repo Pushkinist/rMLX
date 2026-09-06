@@ -99,6 +99,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         spec-bench-published-selftest published-ingest-selftest \
         published-table check-published-table published-table-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
+        check-spec-sampling check-spec-sampling-fixtures \
         check-published-samples check-published-samples-fixtures \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
         profile-mst \
@@ -429,6 +430,14 @@ check-spec-metric-parity: ## CI gate: fail if the speculative metrics the engine
 check-spec-metric-parity-fixtures: ## CI gate: recall test for the above — one synthetic scan root per case, asserting the reason as well as the exit code
 	@bash scripts/check_spec_metric_parity_fixtures.sh
 
+.PHONY: check-spec-sampling
+check-spec-sampling: ## CI gate: fail if a speculative round loop is not handed the request's sampler, or a drafter arm does not pass it
+	@bash scripts/check_spec_sampling.sh
+
+.PHONY: check-spec-sampling-fixtures
+check-spec-sampling-fixtures: ## CI gate: recall test for the above — 10 synthetic scan roots, each asserting the reason as well as exit 1 vs exit 2
+	@bash scripts/check_spec_sampling_fixtures.sh
+
 .PHONY: check-published-samples
 check-published-samples: ## CI gate: fail if the checked-in published sample sets do not re-derive from their recorded seeds, digests and templates
 	@python3 scripts/published_samples.py verify
@@ -533,6 +542,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kv_boundary_default_parity.sh
 	@bash scripts/check_spec_metric_parity.sh
 	@bash scripts/check_spec_metric_parity_fixtures.sh
+	@bash scripts/check_spec_sampling.sh
+	@bash scripts/check_spec_sampling_fixtures.sh
 	@python3 scripts/published_samples.py verify
 	@bash scripts/check_published_samples_fixtures.sh
 	@bash scripts/check_doc_source_citations.sh
