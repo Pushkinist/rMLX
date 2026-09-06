@@ -273,3 +273,133 @@ fn a_mismatched_verifier_width_is_refused_on_the_real_config() {
         "the refusal must name both widths: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the forward, against the reference on the published weights
+// ---------------------------------------------------------------------------
+
+/// Block positions the reference was run over — the checkpoint's own block size.
+const FORWARD_BLOCK_LEN: usize = 8;
+/// Conditioning rows the reference was run over.
+const FORWARD_CTX_LEN: usize = 3;
+
+/// The hidden states the z-lab MLX reference produces from the published
+/// weights over the inputs [`synthetic_input`] generates.
+const FORWARD_REFERENCE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/dflash2_published_reference.safetensors"
+);
+
+/// Largest absolute difference from the reference this forward is allowed on
+/// the published weights.
+///
+/// Both sides run the same MLX ops on the same device here, and the measured
+/// difference is zero — the two are bit-identical. The bound is one bf16 place
+/// at the magnitude these hidden states reach (27, where a place is 0.125), so
+/// a rounding difference from a future kernel choice passes and an algebraic
+/// one does not.
+const FORWARD_TOL: f32 = 0.125;
+
+/// The inputs the reference was run over: `count` values from an integer
+/// recurrence, so nothing but the reference's answer has to be committed.
+///
+/// The generator beside the fixture repeats this formula exactly; every
+/// intermediate is an integer below 2^61 and a dyadic rational, so both sides
+/// round to f32 once and identically.
+fn synthetic_input(count: usize, seed: u64) -> Vec<f32> {
+    (0..count as u64)
+        .map(|i| {
+            let u = ((seed + i) * 1_103_515_245 + 12_345) % 2_147_483_648;
+            (u as f64 / 2_147_483_648.0 - 0.5) as f32
+        })
+        .collect()
+}
+
+fn bf16_input(values: &[f32], shape: &[i32]) -> rmlx_mlx::Array {
+    rmlx_mlx::Array::from_f32_slice(values, shape)
+        .expect("build the input")
+        .astype(rmlx_mlx::Dtype::Bf16, Device::Gpu)
+        .expect("cast the input to bf16")
+}
+
+fn published_reference() -> rmlx_mlx::Array {
+    let bytes = std::fs::read(FORWARD_REFERENCE).expect("the reference fixture is readable");
+    let st = safetensors::SafeTensors::deserialize(&bytes).expect("the fixture parses");
+    let t = st.tensor("hidden").expect("the fixture carries `hidden`");
+    rmlx_mlx::Array::from_safetensor_view(&rmlx_loader::TensorView {
+        name: "hidden",
+        dtype: t.dtype(),
+        shape: t.shape().to_vec(),
+        bytes: t.data(),
+    })
+    .expect("the reference loads")
+}
+
+fn max_abs_diff(a: &rmlx_mlx::Array, b: &rmlx_mlx::Array) -> f32 {
+    let f32s = |x: &rmlx_mlx::Array| -> Vec<f32> {
+        let c = x
+            .astype(rmlx_mlx::Dtype::F32, Device::Gpu)
+            .expect("cast for comparison");
+        c.eval().expect("eval");
+        c.to_bytes()
+            .expect("read bytes")
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("four bytes")))
+            .collect()
+    };
+    let (x, y) = (f32s(a), f32s(b));
+    assert_eq!(x.len(), y.len(), "compared arrays must be the same length");
+    x.iter()
+        .zip(&y)
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0f32, f32::max)
+}
+
+/// The forward reproduces the reference implementation on the published
+/// weights, at the checkpoint's own widths.
+///
+/// The scale-model tests beside the forward prove the algebra against the same
+/// reference, but at a width nothing on this checkpoint shares. What only the
+/// real weights can show is that the loader binds them in the order the forward
+/// reads them, and that the shapes it derives from the config — the grouped
+/// query heads, the 320 kernel groups, the 2048-position window — hold at size.
+#[ignore]
+#[test]
+fn the_forward_reproduces_the_reference_on_the_published_weights() {
+    let dir = match snapshot(DRAFT_SLUG) {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP dflash2_loader: {why}");
+            return;
+        }
+    };
+    let drafter = DFlash2Drafter::load(&dir, VERIFIER_HIDDEN, Device::Gpu)
+        .expect("the published DFlash 2 checkpoint must load whole");
+
+    let hidden = VERIFIER_HIDDEN as i32;
+    let concat = drafter.cfg.target_layer_ids.len() as i32 * hidden;
+    let block = bf16_input(
+        &synthetic_input(FORWARD_BLOCK_LEN * VERIFIER_HIDDEN, 0),
+        &[1, FORWARD_BLOCK_LEN as i32, hidden],
+    );
+    let ctx = bf16_input(
+        &synthetic_input(FORWARD_CTX_LEN * concat as usize, 1_000_003),
+        &[1, FORWARD_CTX_LEN as i32, concat],
+    );
+
+    let got = drafter
+        .forward_hidden(&block, &ctx)
+        .expect("the forward runs on the published weights");
+    let want = published_reference();
+    assert_eq!(
+        got.shape(),
+        want.shape(),
+        "the forward returns one hidden row per block position"
+    );
+    let diff = max_abs_diff(&got, &want);
+    println!("dflash2 published-weight forward: max abs diff {diff}");
+    assert!(
+        diff <= FORWARD_TOL,
+        "the forward differs from the reference by {diff} on the published weights"
+    );
+}
