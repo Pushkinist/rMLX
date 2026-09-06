@@ -501,6 +501,21 @@ fn check_config(
             cfg.num_attention_heads, cfg.num_key_value_heads
         )));
     }
+    // The masked positions are embedded through the *verifier's* table, and a
+    // gather past its end reads a clamped row rather than failing. Every drafted
+    // position but the seed carries this id, so out of range it is the whole
+    // block that is denoised from the wrong embedding — coherent proposals at a
+    // quietly wrong accept rate. `select_chain` already refuses an anchor
+    // outside the vocabulary for the same reason; this is the same check on the
+    // id the config supplies rather than the one a round does.
+    if cfg.mask_token_id as usize >= cfg.vocab_size {
+        return Err(Error::Model(format!(
+            "DFlash2Drafter: dflash_config.mask_token_id is {}, outside this drafter's \
+             vocabulary of {}; every masked block position would be embedded from a \
+             clamped row of the verifier's table",
+            cfg.mask_token_id, cfg.vocab_size
+        )));
+    }
     if cfg.selector_top_k < 2 {
         return Err(Error::Model(format!(
             "DFlash2Drafter: dflash_config.selector_top_k is {}; the path selector \
@@ -520,6 +535,20 @@ fn check_config(
         return Err(Error::Model(format!(
             "DFlash2Drafter: dflash_config.block_size is {}; a block of one is the \
              seed token alone and drafts nothing",
+            cfg.block_size
+        )));
+    }
+    // The block is a sequence axis: the round loop clamps the requested block to
+    // it, then sizes the block's token buffer and the verify input from the
+    // result, and the drafter's attention mask is `block x (block + window)` —
+    // quadratic in it. Unbounded, a checkpoint's own number reaches those
+    // allocations directly.
+    if i32::try_from(cfg.block_size).is_err() {
+        return Err(Error::Model(format!(
+            "DFlash2Drafter: dflash_config.block_size is {}, more positions than an \
+             array axis holds; every block position is a token the verifier scores in \
+             one forward and a row of the drafter's mask, and the loop would size both \
+             from this before anything could refuse it",
             cfg.block_size
         )));
     }

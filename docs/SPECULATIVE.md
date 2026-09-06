@@ -1412,9 +1412,25 @@ accept rate nothing downstream can attribute. `true` is refused rather than
 implemented: nothing ships it, and a numeric branch no checkpoint exercises is a
 second answer with no evidence behind it.
 
-A window wider than an array axis is refused for the same shape of reason: past
-that the window arithmetic wraps negative and the conditioning trim slices from
-beyond its own end, which returns no rows and no error.
+**Every size the config supplies is bounded on both sides**, and the ones that
+are not obviously sizes are the ones this had to be worked through for. A window
+or a block wider than an array axis is refused: past that the window arithmetic
+wraps negative and the conditioning trim slices from beyond its own end, which
+returns no rows and no error, and the block sizes the round's token buffer, the
+verify input and a mask that is quadratic in it. A `mask_token_id` outside the
+vocabulary is refused too — every drafted position but the seed carries it, and a
+gather past the end of the verifier's embedding reads a clamped row rather than
+failing, which is the same silent-wrong shape as `is_causal` one field over.
+`selector_top_k` was already bounded against `vocab_size` on both sides.
+
+The block's ceiling is deliberately the **axis width and not a relation to
+`sliding_window`**, even though the window's own refusal says the window "holds
+the block". A block longer than the window is degenerate but not wrong: the mask
+opens every block key regardless of the window, so a block position past it
+attends to the block alone, and the reference does the same thing — its `block`
+term carries no window either. Refusing that relationship would refuse a
+configuration this port runs correctly and the reference accepts, which is not
+what these refusals are for.
 
 The two generations also read their config from different places, which is why
 they do not share a loader: DFlash 1 carries `block_size` and `rope_theta` at

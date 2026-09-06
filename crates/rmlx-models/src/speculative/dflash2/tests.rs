@@ -312,6 +312,22 @@ fn a_config_the_forward_could_not_honour_is_refused() {
             serde_json::json!(1),
             "block_size",
         ),
+        // A block wider than an array axis sizes the round's token buffer, the
+        // verify input and the drafter's mask before anything can refuse it.
+        (
+            "dflash_config",
+            "block_size",
+            serde_json::json!(u64::from(u32::MAX)),
+            "block_size",
+        ),
+        // A mask token outside the vocabulary is embedded from a clamped row of
+        // the verifier's table, and every drafted position but the seed is it.
+        (
+            "dflash_config",
+            "mask_token_id",
+            serde_json::json!(248_320),
+            "mask_token_id",
+        ),
         // A window that reaches back past no conditioning row at all leaves the
         // forward's window arithmetic below zero.
         ("", "sliding_window", serde_json::json!(1), "sliding_window"),
@@ -360,6 +376,44 @@ fn a_config_the_forward_could_not_honour_is_refused() {
         assert!(
             err.contains(want),
             "the refusal for {path}.{key} = {value} must name {want}: {err}"
+        );
+    }
+}
+
+/// Each size bound accepts the last value it is meant to and refuses the first
+/// it is not.
+///
+/// Every refusal above asserts only that a bad value is rejected, which a guard
+/// that rejects *everything* also satisfies — and a size ceiling is exactly the
+/// shape that goes one-sided, because the value that proves it is the one nobody
+/// writes in a config by hand. So each bound is walked from both sides at its own
+/// boundary.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: a refusal of a value the drafter can run is the assertion failing"
+)]
+fn each_size_bound_accepts_its_boundary_and_refuses_one_past_it() {
+    let axis = u64::try_from(i32::MAX).expect("i32::MAX is a u64");
+    let cases: &[(&str, &str, u64, u64)] = &[
+        // (path, key, largest accepted, first refused)
+        ("dflash_config", "block_size", axis, axis + 1),
+        ("", "sliding_window", axis, axis + 1),
+        // A token id is an index, so the last one the vocabulary holds is the
+        // last one accepted.
+        ("dflash_config", "mask_token_id", 248_319, 248_320),
+        ("dflash_config", "selector_top_k", 248_320, 248_321),
+    ];
+    for &(path, key, accepted, refused) in cases {
+        parsed_with(path, key, Some(serde_json::json!(accepted)))
+            .unwrap_or_else(|e| panic!("{path}.{key} = {accepted} must still parse: {e}"));
+        let err = match parsed_with(path, key, Some(serde_json::json!(refused))) {
+            Ok(cfg) => panic!("{path}.{key} = {refused} must refuse, parsed to {cfg:?}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains(key),
+            "the refusal for {path}.{key} = {refused} must name the key: {err}"
         );
     }
 }
