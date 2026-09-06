@@ -241,8 +241,19 @@ def cmd_report(args):
         args.range_pct,
     )
 
+    meta = {}
+    if args.meta:
+        with open(args.meta, encoding="utf-8") as handle:
+            meta = json.load(handle)
+        if meta.get("arm") not in (None, passes[0]["arm"]):
+            raise InputError(
+                f"the run metadata says arm={meta['arm']!r} where the passes ran "
+                f"{passes[0]['arm']!r}"
+            )
+
     result = {
         "schema_version": SCHEMA_VERSION,
+        **meta,
         "arm": passes[0]["arm"],
         "range_refusal_pct": args.range_pct,
         "cells": cells,
@@ -334,6 +345,11 @@ def main():
     r.add_argument("passes", nargs="+", help="the pass JSON files")
     r.add_argument("--range-pct", type=float, default=5.0)
     r.add_argument("--json", default=None, help="write the full result here")
+    r.add_argument(
+        "--meta",
+        default=None,
+        help="a JSON object describing the run, merged into the result",
+    )
     r.set_defaults(func=cmd_report)
 
     args = ap.parse_args()
