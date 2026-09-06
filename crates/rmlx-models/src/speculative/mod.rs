@@ -24,6 +24,7 @@
     clippy::used_underscore_items
 )]
 pub mod dflash;
+pub mod dflash2;
 pub mod eagle3;
 pub mod gemma4_assistant;
 pub mod mtp;
