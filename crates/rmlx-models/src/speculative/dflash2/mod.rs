@@ -406,6 +406,18 @@ fn check_config(
             cfg.conv_group_size, cfg.hidden_size
         )));
     }
+    if cfg.num_key_value_heads == 0
+        || !cfg
+            .num_attention_heads
+            .is_multiple_of(cfg.num_key_value_heads)
+    {
+        return Err(Error::Model(format!(
+            "DFlash2Drafter: num_attention_heads {} is not a multiple of \
+             num_key_value_heads {}; grouped-query attention repeats each KV head \
+             a whole number of times and the projections' shapes do not show it",
+            cfg.num_attention_heads, cfg.num_key_value_heads
+        )));
+    }
     if cfg.selector_top_k < 2 {
         return Err(Error::Model(format!(
             "DFlash2Drafter: dflash_config.selector_top_k is {}; the path selector \

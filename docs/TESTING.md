@@ -84,6 +84,16 @@ unpinned hit, so a clean pass is the evidence, not the absence of a pin.
 Point either at a different pair and re-measure both arms before reading a
 failure as a regression.
 
+`dflash2_loader.rs` takes no model variable at all: it resolves
+`z-lab__Qwen3.8-27B-DFlash2` by slug from `RMLX_O_MODELS_ROOT`, like
+`two_model_stochastic.rs`, so `make gpu-test` runs it wherever the snapshot is.
+It resolves the slug itself rather than through `tests/common`'s
+`slug_snapshot`, which requires a `tokenizer.json` a drafter sidecar does not
+ship and never will — routed through it, all three of its tests announced a
+skip on a machine holding the checkpoint. It loads weights and asserts names
+and shapes; it runs no forward and produces no shader-validation hit, so it has
+no entry in `scripts/gpu_validation_census.txt`.
+
 `spec_greedy_equivalence.rs` asks a different question from those three: not
 whether the round loop keeps the verifier's state consistent for a while, but
 whether the run produces the answer the verifier produces alone, over 256 tokens

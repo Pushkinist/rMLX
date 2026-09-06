@@ -283,6 +283,20 @@ fn a_config_the_forward_could_not_honour_is_refused() {
             serde_json::json!(1),
             "selector_top_k",
         ),
+        // A KV head count that does not divide the query heads cannot be
+        // repeated a whole number of times, and no tensor shape shows it.
+        (
+            "",
+            "num_key_value_heads",
+            serde_json::json!(7),
+            "num_key_value_heads",
+        ),
+        (
+            "",
+            "num_key_value_heads",
+            serde_json::json!(0),
+            "num_key_value_heads",
+        ),
         // A block of one is the seed alone.
         (
             "dflash_config",
