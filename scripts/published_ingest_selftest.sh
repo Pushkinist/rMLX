@@ -443,6 +443,15 @@ result["binary"]["path"] = str(copy)
 result["binary"]["sha256"] = hashlib.sha256(blob).hexdigest()'
 verdict
 
+# A result written by something other than this harness is refused with the
+# field it is missing, not with a traceback: an operator reading a stack trace
+# cannot tell a malformed input from a broken ingester.
+ingest_case result_missing_a_field_is_refused 2 \
+    "a result this harness did not write is refused by name, not by traceback" \
+    "is missing something every record needs" \
+    'MUTATE:del result["protocol"]["seed_policy"]'
+verdict
+
 ingest_case result_without_a_binary_is_refused 2 \
     "a result that never said which binary it measured files no row" \
     "carries no binary identity" \

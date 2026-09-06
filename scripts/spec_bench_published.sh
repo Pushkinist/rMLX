@@ -324,6 +324,9 @@ cleanup() {
     if [[ -n "${SERVER_PID:-}" ]]; then
         kill "${SERVER_PID}" 2>/dev/null || true
     fi
+    if [[ -n "${MEMORY_PID:-}" ]]; then
+        kill "${MEMORY_PID}" 2>/dev/null || true
+    fi
     rm -rf "${WORK}"
 }
 trap cleanup EXIT INT TERM
@@ -751,6 +754,10 @@ print(json.dumps(json.load(open(sys.argv[1]))["sampling"], sort_keys=True))' \
     SAMPLING_SEEN="${PASS_SAMPLING}"
 
     echo "  [pass ${pass}] host window: ${WINDOW}"
+    if ! $SYNTHETIC_ARMS; then
+        echo "  [pass ${pass}] thermal: $(printf '%s; ' \
+            "${THERMAL_READINGS[@]: -3}")"
+    fi
     echo ""
 done
 

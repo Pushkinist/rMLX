@@ -117,7 +117,8 @@ def check_binary(result: dict[str, Any]) -> str:
             f"the binary the run measured is gone from {path}, so its recorded "
             f"identity (sha256:{binary['sha256'][:16]}) cannot be confirmed"
         )
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    blob = path.read_bytes()
+    actual = hashlib.sha256(blob).hexdigest()
     if actual != binary["sha256"]:
         raise Refused(
             f"the binary at {path} now hashes sha256:{actual[:16]} where the run "
@@ -125,7 +126,6 @@ def check_binary(result: dict[str, Any]) -> str:
             "measurement, so its version and build profile no longer describe "
             "these numbers."
         )
-    blob = path.read_bytes()
     absent = [
         m
         for m, count in binary["markers"].items()
@@ -456,6 +456,13 @@ def main() -> int:
         fixed = fixed_record(result, args, notes)
     except Refused as exc:
         print(f"refusing: {exc}", file=sys.stderr)
+        return 2
+    except (KeyError, OSError, ValueError) as exc:
+        print(
+            f"refusing: {args.result} is missing something every record needs "
+            f"({exc!r}); it was not written by this harness",
+            file=sys.stderr,
+        )
         return 2
     if fixed:
         records.append(fixed)
