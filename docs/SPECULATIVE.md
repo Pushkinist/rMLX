@@ -1147,15 +1147,33 @@ drafter wearing the checkpoint's name, and `decode_config` recorded
 real drafter afterwards. **They are not a DFlash 2 measurement and must not be
 quoted as one.**
 
-What runs today is the load: `rmlx_models::speculative::dflash2` binds every
-tensor at the shape the config predicts and refuses a snapshot carrying one it
-does not read. The drafter's forward — the convolution and the selector — and
-the round loop that would drive them are not implemented, so the serve layer
-refuses a `dflash2` snapshot before the verifier is loaded
-(`engine::speculative::dflash2_reject_reason`). `--draft-kind dflash` over that
-snapshot is refused separately as a flag contradicting the declaration.
-`z-lab/Qwen3.6-35B-A3B-DFlash` is `dflash`, reads every tensor it ships, and is
-unaffected.
+What runs today is the load and the decoder stack.
+`rmlx_models::speculative::dflash2` binds every tensor at the shape the config
+predicts and refuses a snapshot carrying one it does not read, and
+`DFlash2Drafter::forward_hidden` runs the block through the stack — the
+conditioning projection, the two-tap dynamic convolution around each of the two
+sublayers, grouped-query attention over the conditioning window and the whole
+block, RoPE and the MLP — and returns the block's final hidden states. That
+forward is checked against the z-lab MLX reference
+(`dflash/model_mlx.py`) on both a synthetic scale model
+(`crates/rmlx-models/tests/fixtures/dflash2_scale`, to within one bf16 place)
+and the published weights (`tests/dflash2_loader.rs`, bit-identical).
+
+The candidate selector and the round loop that would drive them are not
+implemented, so the serve layer still refuses a `dflash2` snapshot before the
+verifier is loaded (`engine::speculative::dflash2_reject_reason`).
+`--draft-kind dflash` over that snapshot is refused separately as a flag
+contradicting the declaration. `z-lab/Qwen3.6-35B-A3B-DFlash` is `dflash`, reads
+every tensor it ships, and is unaffected.
+
+The forward RoPEs its conditioning rows from position zero rather than from an
+absolute offset. It recomputes the conditioning K/V on every call instead of
+caching them across rounds, so all of one call's positions are rotated together
+and only the query-key difference reaches the attention scores; a uniform shift
+of every position is then not observable, which the reference's own answer
+confirms — it moves by one bf16 place between two offsets that are
+mathematically the same. A round loop that starts caching conditioning K/V
+across calls loses that invariance and has to carry the absolute offset back in.
 
 The two generations also read their config from different places, which is why
 they do not share a loader: DFlash 1 carries `block_size` and `rope_theta` at
