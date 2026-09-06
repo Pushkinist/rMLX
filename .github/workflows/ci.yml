@@ -95,10 +95,11 @@ jobs:
       # passing forever. Fixture trees pin its recall, per rule.
       - name: the eval-lock gate still catches what it is for
         run: make check-eval-lock-fixtures
-      # The published sample sets are the only evidence that a headline number
-      # was measured on the samples it claims. Nothing else re-derives them: the
-      # draw is recorded, not recomputed, and a regenerated file carries its own
-      # digest. Pure python3 over checked-in JSON — no toolchain, no network.
+      # A headline number's provenance is these files, and a manifest sitting
+      # beside them proves nothing on its own: the draw is recorded rather than
+      # recomputed, and an edited file can be re-blessed in the same commit. The
+      # gate holds them to digests pinned in its own source instead. Pure python3
+      # over checked-in JSON — no toolchain, no network.
       - name: the published sample sets re-derive from their recorded seeds
         run: make check-published-samples
       # ...and a verifier whose whole job is to refuse is the shape that quietly
