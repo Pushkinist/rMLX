@@ -36,13 +36,22 @@ Output (stdout), one `key=value` per line:
     content_chunks=<n>  chunks that carried text — the window's token count
     prompt_tokens=<n>   from the usage chunk; omitted when it carried none
     decode_tps=<f>      omitted when the response has no measurable window
+    answer_sha256=<hex> sha256 of the whole completion, reasoning included
     preview=<text>      first 64 characters of the completion, newlines folded
+
+`answer_sha256` is what a caller comparing two responses reads. `preview` is 64
+characters, and two answers that agree for a sentence and then diverge share it,
+so comparing previews would call them one answer. The digest covers
+`reasoning_content` as well as `content`, for the same reason the window counts
+both: they are tokens the model generated, and a run that thought differently
+answered differently.
 
 Exit codes: 0 — read; 2 — `--raw` could not be written; 3 — more content chunks
 arrived than the completion had tokens.
 """
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -118,6 +127,7 @@ def report(arrivals, text, usage_tokens, prompt_tokens):
         window = arrivals[-1] - arrivals[0]
         if window > 0:
             lines.append(f"decode_tps={(len(arrivals) - 1) / window:.6f}")
+    lines.append(f"answer_sha256={hashlib.sha256(text.encode('utf-8')).hexdigest()}")
     preview = text[:PREVIEW_CHARS].replace("\n", " ").replace("\r", " ")
     lines.append(f"preview={preview}")
     return lines

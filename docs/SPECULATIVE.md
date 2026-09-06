@@ -1130,6 +1130,24 @@ finds a bare number in `decode_tps` rather than `Some(x)` / `None` is looking at
 a log from before the field was corrected and is looking at exactly that lower
 number; it must refuse it rather than read it.
 
+**The two arms must also have answered the same thing.** A greedy speculative
+loop emits the verifier's own argmax at every position, so with no sampler
+running the speculative arm and the no-drafter arm beside it are two ways of
+computing one answer — and a throughput taken from an arm that answered
+something else is not a faster answer to the same question. The bench digests
+each measured run's whole completion through `scripts/lib/sse_decode_window.py`
+and holds every speculative run to the plain arm's answer, stopping before any
+median is taken; a plain arm that did not repeat itself is refused for the same
+reason, since it is the reference. Whether a sampler ran is read back from the
+engine's own per-request event through `scripts/lib/server_sampling.py` rather
+than assumed from the temperature the request asked for — the checkpoint's own
+generation config reaches the resolved sampling and the request cannot see it.
+Under a sampler the arms are two draws, the comparison does not apply, and both
+rows record `answer_check=sampled` instead of passing quietly. The correctness
+gate this leans on is `docs/SPEC_ANSWER_EQUIVALENCE.md`, which judges a
+divergence rather than only detecting one; the bench needs no such judgement,
+because a bench row is optional and a refused one costs nothing.
+
 Three prompt classes: `prose` and `code` are `prompts/spec_bench/{prose,code}.json`,
 `4k` is `prompts/longctx_4k.json`, `paris` is the bare "What is the capital of
 France?" probe.

@@ -87,12 +87,16 @@ failure as a regression.
 `dflash2_loader.rs` takes no model variable at all: it resolves
 `z-lab__Qwen3.8-27B-DFlash2` by slug from `RMLX_O_MODELS_ROOT`, like
 `two_model_stochastic.rs`, so `make gpu-test` runs it wherever the snapshot is.
-It resolves the slug itself rather than through `tests/common`'s
-`slug_snapshot`, which requires a `tokenizer.json` a drafter sidecar does not
-ship and never will — routed through it, all three of its tests announced a
-skip on a machine holding the checkpoint. It loads weights and asserts names
-and shapes; it runs no forward and produces no shader-validation hit, so it has
-no entry in `scripts/gpu_validation_census.txt`.
+It goes through `tests/common`'s `slug_snapshot` at `Role::Sidecar` — the role
+that asks only for the files a drafter checkpoint carries, since it is decoded
+with the verifier's tokenizer and ships none of its own. Each of its tests
+passes its own function name, so a stand-down announces
+`SKIP <that test>: <why>` and `run_gpu_tests.sh` can attribute it; a notice
+naming the file instead is counted as unattributable and listed nowhere. It
+loads the weights, asserts the names and shapes, and runs the forward and the
+selector against the committed reference. It has no entry in
+`scripts/gpu_validation_census.txt` — the runner fails on an unpinned hit, so a
+clean pass is the evidence, not the absence of a pin.
 
 `spec_sampled_distribution.rs` is the sidecar half of the same question, above
 temperature 0, and it is a distributional one: not what the arm emitted but what

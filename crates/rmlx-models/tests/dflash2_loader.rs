@@ -8,9 +8,9 @@
 //! pinned by name — including the two vocabulary codebooks, which carry no
 //! `.weight` suffix and are found by nothing that looks for one.
 //!
-//! The snapshot resolves by slug from `RMLX_O_MODELS_ROOT`, so `make gpu-test`
-//! runs this wherever the snapshots are and skips with a reason where they are
-//! not.
+//! The snapshot resolves by slug from `RMLX_O_MODELS_ROOT` through the shared
+//! harness, so `make gpu-test` runs this wherever the snapshots are and skips
+//! with a reason where they are not.
 //!
 //! Run: `cargo test -p rmlx-models --test dflash2_loader -- --ignored --nocapture`
 
@@ -42,43 +42,33 @@ const VERIFIER_HIDDEN: usize = 5120;
 /// Every tensor the checkpoint ships, and nothing else.
 const TENSOR_COUNT: usize = 81;
 
-/// The drafter snapshot by slug, or the reason this test stands down.
+/// The drafter snapshot by slug, or `None` once this test has announced why it
+/// stands down.
 ///
-/// The golden harness's `slug_snapshot` cannot be used here: it requires a
-/// `tokenizer.json`, which a drafter sidecar does not ship and never will — it
-/// runs against the verifier's. Routing through it made all three tests below
-/// announce a skip on a machine that holds the checkpoint, which is a green run
-/// that asserted nothing.
+/// A drafter sidecar ships no `tokenizer.json` — it is decoded with the
+/// verifier's — so the probe asks for a [`common::Role::Sidecar`], the shape
+/// that requires only the files such a checkpoint carries. The three outcomes
+/// are the harness's: a root that is set but is not a directory is one keystroke
+/// that disarms the test, so it fails; a root that simply does not hold this
+/// slug skips, because nobody holds every snapshot; an unset root skips with the
+/// variable named.
 ///
-/// The three outcomes match the harness's, and for its reasons: a root that is
-/// set but is not a directory is one keystroke that disarms the test, so it
-/// fails; a root that simply does not hold this slug skips, because nobody
-/// holds every snapshot; an unset root skips with the variable named.
-fn snapshot(slug: &str) -> Result<PathBuf, String> {
-    let Some(root) = std::env::var(common::MODELS_ROOT_VAR)
-        .ok()
-        .filter(|r| !r.is_empty())
-    else {
-        return Err(format!(
-            "no snapshot configured — set {} (holding {slug})",
-            common::MODELS_ROOT_VAR
-        ));
+/// `test` is the caller's own function name, so the notice `run_gpu_tests.sh`
+/// harvests names something a test filter can select. A notice naming this file
+/// instead is counted as unattributable and listed nowhere.
+fn snapshot(test: &str) -> Option<PathBuf> {
+    let root = std::env::var(common::MODELS_ROOT_VAR).ok();
+    let gate = match common::slug_snapshot(root.as_deref(), DRAFT_SLUG, common::Role::Sidecar) {
+        common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
+        // The harness offers its own override variable in that message. This
+        // suite reads none, so leaving the name in would send an operator after
+        // a setting that cannot make this test run.
+        common::Snapshot::Absent(why) => {
+            common::Gate::Skip(why.replace(&format!(" or {}", common::SINGLE_MODEL_VAR), ""))
+        }
+        common::Snapshot::Misconfigured(why) => common::Gate::Fail(why),
     };
-    let root_path = PathBuf::from(&root);
-    assert!(
-        root_path.is_dir(),
-        "{}={root} is not an existing directory",
-        common::MODELS_ROOT_VAR
-    );
-    let path = root_path.join(slug);
-    if path.join("config.json").is_file() && path.join("model.safetensors").is_file() {
-        return Ok(path);
-    }
-    Err(format!(
-        "{}={root} does not hold a {slug} with a config.json and a model.safetensors; \
-         put the snapshot, or a symlink to it, there",
-        common::MODELS_ROOT_VAR
-    ))
+    common::apply(gate, test)
 }
 
 fn linear_shape(l: &Linear) -> Vec<i32> {
@@ -136,12 +126,8 @@ fn assert_layer_shapes(i: usize, layer: &rmlx_models::speculative::dflash2::DFla
 #[ignore]
 #[test]
 fn the_published_checkpoint_loads_whole() {
-    let dir = match snapshot(DRAFT_SLUG) {
-        Ok(p) => p,
-        Err(why) => {
-            println!("SKIP dflash2_loader: {why}");
-            return;
-        }
+    let Some(dir) = snapshot("the_published_checkpoint_loads_whole") else {
+        return;
     };
 
     // Count the tensors on disk independently of the loader, so a loader that
@@ -228,12 +214,8 @@ fn the_published_checkpoint_loads_whole() {
 #[ignore]
 #[test]
 fn the_dflash_1_loader_still_refuses_this_checkpoint() {
-    let dir = match snapshot(DRAFT_SLUG) {
-        Ok(p) => p,
-        Err(why) => {
-            println!("SKIP dflash2_loader: {why}");
-            return;
-        }
+    let Some(dir) = snapshot("the_dflash_1_loader_still_refuses_this_checkpoint") else {
+        return;
     };
 
     let err =
@@ -257,12 +239,8 @@ fn the_dflash_1_loader_still_refuses_this_checkpoint() {
 #[ignore]
 #[test]
 fn a_mismatched_verifier_width_is_refused_on_the_real_config() {
-    let dir = match snapshot(DRAFT_SLUG) {
-        Ok(p) => p,
-        Err(why) => {
-            println!("SKIP dflash2_loader: {why}");
-            return;
-        }
+    let Some(dir) = snapshot("a_mismatched_verifier_width_is_refused_on_the_real_config") else {
+        return;
     };
 
     let err = DFlash2Drafter::load(&dir, 2048, Device::Gpu)
@@ -376,12 +354,9 @@ fn max_abs_diff(a: &rmlx_mlx::Array, b: &rmlx_mlx::Array) -> f32 {
 #[ignore]
 #[test]
 fn the_forward_reproduces_the_reference_on_the_published_weights() {
-    let dir = match snapshot(DRAFT_SLUG) {
-        Ok(p) => p,
-        Err(why) => {
-            println!("SKIP dflash2_loader: {why}");
-            return;
-        }
+    let Some(dir) = snapshot("the_forward_reproduces_the_reference_on_the_published_weights")
+    else {
+        return;
     };
     let drafter = DFlash2Drafter::load(&dir, VERIFIER_HIDDEN, Device::Gpu)
         .expect("the published DFlash 2 checkpoint must load whole");
@@ -482,12 +457,9 @@ fn stand_in_logits(positions: usize, vocab: usize) -> rmlx_mlx::Array {
 #[ignore]
 #[test]
 fn the_selector_reproduces_the_reference_on_the_published_weights() {
-    let dir = match snapshot(DRAFT_SLUG) {
-        Ok(p) => p,
-        Err(why) => {
-            println!("SKIP dflash2_loader: {why}");
-            return;
-        }
+    let Some(dir) = snapshot("the_selector_reproduces_the_reference_on_the_published_weights")
+    else {
+        return;
     };
     let drafter = DFlash2Drafter::load(&dir, VERIFIER_HIDDEN, Device::Gpu)
         .expect("the published DFlash 2 checkpoint must load whole");

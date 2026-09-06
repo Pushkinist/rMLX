@@ -26,6 +26,17 @@
 #   window timed client-side, and a disagreement past CROSS_CHECK_BAND_PCT is a
 #   refusal, not a choice between them.
 #
+# The two arms must have answered the same thing:
+#   A greedy speculative loop emits the verifier's own argmax at every position,
+#   so with no sampler running the speculative arm and the no-drafter arm are two
+#   ways of computing one answer. Every measured run's whole completion is
+#   digested and held to that, and a difference stops the run before any median
+#   is taken — an arm that answered a different question has no throughput to
+#   report for this one, and `observations` is append-only. Whether a sampler ran
+#   is read back from the engine's own per-request event rather than assumed from
+#   the temperature the request asked for; under one the arms are two draws, the
+#   comparison does not apply, and both rows say so in `answer_check`.
+#
 # Hard constraints honoured:
 #   - Preflight (pkill + claim-file delete) before each server start
 #   - Single server process at a time; killed explicitly between phases
@@ -238,10 +249,10 @@ echo ""
 # Fire one measured chat-completions request and report what the client saw.
 #
 # Prints the `key=value` block of scripts/lib/sse_decode_window.py: `tokens`,
-# `preview`, and `decode_tps` over the first-content-token to last-content-token
-# window. A rate over the whole request instead would count the prefill and the
-# curl spawn and read low, and would not be comparable with the rate the engine
-# logs for the speculative arm.
+# `preview`, `answer_sha256` and `decode_tps` over the first-content-token to
+# last-content-token window. A rate over the whole request instead would count
+# the prefill and the curl spawn and read low, and would not be comparable with
+# the rate the engine logs for the speculative arm.
 measured_request() {
     local raw_file="$1"
     curl -s \
@@ -284,6 +295,28 @@ print(f"  [{arm}] cross-check ok: engine {engine:.3f} vs client {client:.3f} ({o
 ' "${arm}" "${engine}" "${client}" "${CROSS_CHECK_BAND_PCT}" >&2
 }
 
+# Whether the engine resolved a sampler for this phase's requests, read back
+# from its own per-request event. `true` or `false`; empty when the reader
+# refused, which it does for a phase whose requests did not all share one
+# sampling setup — and it says why on stderr.
+log_sampled() {
+    field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_sampling.py" \
+        "$1" --expect-requests "$2")" sampled
+}
+
+# The digest every measured run of one arm produced, or `varied` when they were
+# not all the same.
+one_answer() {
+    local first="$1" digest
+    for digest in "$@"; do
+        if [[ "${digest}" != "${first}" ]]; then
+            echo "varied"
+            return 0
+        fi
+    done
+    echo "${first}"
+}
+
 # Compute median of space-separated values. LC_ALL=C so `sort -n` and awk read
 # the decimal point the same way this script writes it.
 median() {
@@ -312,12 +345,16 @@ stddev() {
 
 # Emit a §8.5 RunRecord JSON and ingest it.
 # Args: config_name decode_tps stddev output_preview kv_quant prompt_tokens
-#       [spec_data]
+#       answer answer_check [spec_data]
 #
 # `kv_quant` and `prompt_tokens` are measured facts about the run, not settings
 # this script may assume: the codec is whatever the engine resolved and said so
 # in its log, and the prompt length is whatever the server counted. A record
 # missing either is refused rather than filed under a guess.
+#
+# `answer` is the digest of what the arm generated and `answer_check` is what
+# comparing the two arms established, both in `notes`. A row that was never
+# compared says so there rather than looking like one that was.
 #
 # `spec_data` is scripts/lib/spec_round_log.py's output for the speculative arm
 # and empty for the no-drafter one. Every speculative metric, the block the
@@ -331,7 +368,9 @@ emit_and_ingest() {
     local preview="$4"
     local kv_quant="$5"
     local prompt_tokens="$6"
-    local spec_data="${7:-}"
+    local answer="$7"
+    local answer_check="$8"
+    local spec_data="${9:-}"
 
     if [[ -z "${kv_quant}" ]]; then
         echo "ERROR: ${config}: the run did not report which KV codec it resolved" >&2
@@ -356,6 +395,8 @@ emit_and_ingest() {
         BENCH_PREVIEW="${preview}" \
         BENCH_KV_QUANT="${kv_quant}" \
         BENCH_PROMPT_TOKENS="${prompt_tokens}" \
+        BENCH_ANSWER="${answer}" \
+        BENCH_ANSWER_CHECK="${answer_check}" \
         BENCH_MODEL_NAMESPACE="${MODEL_NAMESPACE}" \
         BENCH_MODEL="${MODEL_NAME}" \
         BENCH_WEIGHT_QUANT="${WEIGHT_QUANT}" \
@@ -386,6 +427,8 @@ spec = dict(
 preview = os.environ["BENCH_PREVIEW"]
 kv_quant = os.environ["BENCH_KV_QUANT"]
 prompt_tokens = int(os.environ["BENCH_PROMPT_TOKENS"])
+answer = os.environ["BENCH_ANSWER"]
+answer_check = os.environ["BENCH_ANSWER_CHECK"]
 model_namespace = os.environ["BENCH_MODEL_NAMESPACE"]
 model_name = os.environ["BENCH_MODEL"]
 weight_quant = os.environ["BENCH_WEIGHT_QUANT"]
@@ -491,13 +534,15 @@ obj = {
     # tellable apart from rows that carry the measured window
     # (docs/METRICS_DB.md, "Known-bad rows already in the DB").
     "notes": (
-        f"config={config} draft_kind=none{tag_suffix} decode_window=engine_itl"
+        f"config={config} draft_kind=none{tag_suffix} decode_window=engine_itl "
+        f"answer_check={answer_check} answer={answer}"
         if config == "normal"
         # `block_size` is the block the engine ran, which a sidecar can cap
         # below the one asked for.
         else f"config={config} draft_kind={draft_kind} "
         f"block_size={block_size} charged={charged}{tag_suffix} "
-        f"decode_window=engine_round_loop"
+        f"decode_window=engine_round_loop "
+        f"answer_check={answer_check} answer={answer}"
     ),
     "description": f"spec_bench {config} sha={git_sha}",
     "metrics": metrics,
@@ -565,6 +610,7 @@ done
 echo "  [normal] measured runs..." >&2
 NORMAL_ENGINE_TPS_VALUES=()
 NORMAL_CLIENT_TPS_VALUES=()
+NORMAL_ANSWER_DIGESTS=()
 NORMAL_PREVIEW=""
 
 for i in $(seq 1 ${MEASURED_RUNS}); do
@@ -608,6 +654,7 @@ for i in $(seq 1 ${MEASURED_RUNS}); do
 
     NORMAL_ENGINE_TPS_VALUES+=("${ENGINE_TPS}")
     NORMAL_CLIENT_TPS_VALUES+=("${CLIENT_TPS}")
+    NORMAL_ANSWER_DIGESTS+=("$(field_of "${RUN_BLOCK}" answer_sha256)")
     [[ -n "${PREVIEW}" ]] && NORMAL_PREVIEW="${PREVIEW}"
     sleep 5
 done
@@ -632,6 +679,34 @@ if [[ ${#NORMAL_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
     exit 1
 fi
 
+NORMAL_SAMPLED="$(log_sampled "${NORMAL_LOG}" $((WARMUP_RUNS + MEASURED_RUNS)))" \
+    || NORMAL_SAMPLED=""
+if [[ -z "${NORMAL_SAMPLED}" ]]; then
+    echo "ERROR: normal: ${NORMAL_LOG} does not say whether the engine ran a" \
+         "sampler for these requests, so whether the two arms are two ways of" \
+         "computing one answer is not knowable" >&2
+    exit 1
+fi
+
+# What the plain arm answered is the reference the speculative arm is held to.
+# Greedy decode of one prompt is one answer, so an arm that answered three
+# different things has no reference to offer and the run stops here — before a
+# median is taken over runs that were not answering the same question. Under a
+# sampler they may differ with nothing wrong, and then there is no comparison to
+# make; the row says so rather than looking like one that was compared.
+NORMAL_ANSWER="$(one_answer "${NORMAL_ANSWER_DIGESTS[@]}")"
+if [[ "${NORMAL_SAMPLED}" == "true" ]]; then
+    NORMAL_ANSWER_CHECK="sampled"
+elif [[ "${NORMAL_ANSWER}" == "varied" ]]; then
+    echo "ERROR: normal: the ${MEASURED_RUNS} measured runs of the no-drafter arm" \
+         "answered differently from each other (${NORMAL_ANSWER_DIGESTS[*]}) on a" \
+         "run the engine says it resolved no sampler for" >&2
+    exit 1
+else
+    NORMAL_ANSWER_CHECK="plain_repeatable"
+fi
+echo "  [normal] answer_check=${NORMAL_ANSWER_CHECK} answer=${NORMAL_ANSWER}" >&2
+
 NORMAL_MEDIAN_TPS=$(median "${NORMAL_ENGINE_TPS_VALUES[@]}")
 NORMAL_STDDEV_TPS=$(stddev "${NORMAL_ENGINE_TPS_VALUES[@]}")
 cross_check normal "${NORMAL_MEDIAN_TPS}" \
@@ -646,7 +721,9 @@ NORMAL_BUF_PATH=$(emit_and_ingest \
     "${NORMAL_STDDEV_TPS}" \
     "${NORMAL_PREVIEW}" \
     "${NORMAL_KV_QUANT}" \
-    "${NORMAL_PROMPT_TOKENS}")
+    "${NORMAL_PROMPT_TOKENS}" \
+    "${NORMAL_ANSWER}" \
+    "${NORMAL_ANSWER_CHECK}")
 
 echo ""
 echo "==> Phase 1 complete. Median decode TPS: ${NORMAL_MEDIAN_TPS}"
@@ -689,6 +766,7 @@ done
 
 echo "  [spec] measured runs..." >&2
 MTP_CLIENT_TPS_VALUES=()
+MTP_ANSWER_DIGESTS=()
 MTP_PREVIEW=""
 
 for i in $(seq 1 ${MEASURED_RUNS}); do
@@ -718,6 +796,7 @@ for i in $(seq 1 ${MEASURED_RUNS}); do
     fi
 
     MTP_CLIENT_TPS_VALUES+=("${CLIENT_TPS}")
+    MTP_ANSWER_DIGESTS+=("$(field_of "${RUN_BLOCK}" answer_sha256)")
     [[ -n "${PREVIEW}" ]] && MTP_PREVIEW="${PREVIEW}"
     sleep 5
 done
@@ -783,6 +862,43 @@ if [[ ${#MTP_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
     exit 1
 fi
 
+MTP_SAMPLED="$(log_sampled "${MTP_LOG}" $((WARMUP_RUNS + MEASURED_RUNS)))" \
+    || MTP_SAMPLED=""
+if [[ -z "${MTP_SAMPLED}" ]]; then
+    echo "ERROR: ${DRAFT_KIND}: ${MTP_LOG} does not say whether the engine ran a" \
+         "sampler for these requests, so whether the two arms are two ways of" \
+         "computing one answer is not knowable" >&2
+    exit 1
+fi
+
+# A greedy speculative loop emits the verifier's own argmax at every position, so
+# with no sampler on either arm the two arms are two ways of computing one answer
+# and a difference between them is a defect in the loop. Every measured run is
+# held to that, and the run stops before the median: a rate measured while
+# answering something else is not a faster answer to the same question, and
+# `observations` is append-only, so a row filed here cannot be taken back out.
+MTP_ANSWER="$(one_answer "${MTP_ANSWER_DIGESTS[@]}")"
+if [[ "${MTP_SAMPLED}" == "true" || "${NORMAL_SAMPLED}" == "true" ]]; then
+    MTP_ANSWER_CHECK="sampled"
+    echo "  [spec] answers not compared: the engine resolved a sampler (normal" \
+         "sampled=${NORMAL_SAMPLED}, ${DRAFT_KIND} sampled=${MTP_SAMPLED}), so the" \
+         "two arms are two draws and need not agree" >&2
+else
+    for i in $(seq 1 ${MEASURED_RUNS}); do
+        RUN_ANSWER="${MTP_ANSWER_DIGESTS[$((i - 1))]}"
+        if [[ "${RUN_ANSWER}" != "${NORMAL_ANSWER}" ]]; then
+            echo "ERROR: ${DRAFT_KIND}: measured run ${i} answered differently from" \
+                 "the no-drafter arm (${RUN_ANSWER} against ${NORMAL_ANSWER}) with" \
+                 "no sampler on either arm; a greedy speculative loop emits the" \
+                 "verifier's own argmax, so this arm answered a different question" \
+                 "and its throughput is not a rate for this one" >&2
+            exit 1
+        fi
+    done
+    MTP_ANSWER_CHECK="matches_plain"
+fi
+echo "  [spec] answer_check=${MTP_ANSWER_CHECK} answer=${MTP_ANSWER}" >&2
+
 MTP_MEDIAN_TPS=$(median "${MTP_ENGINE_TPS_VALUES[@]}")
 MTP_STDDEV_TPS=$(stddev "${MTP_ENGINE_TPS_VALUES[@]}")
 MTP_CLIENT_MEDIAN_TPS=$(median "${MTP_CLIENT_TPS_VALUES[@]}")
@@ -798,6 +914,8 @@ MTP_BUF_PATH=$(emit_and_ingest \
     "${MTP_PREVIEW}" \
     "${MTP_KV_QUANT}" \
     "${MTP_PROMPT_TOKENS}" \
+    "${MTP_ANSWER}" \
+    "${MTP_ANSWER_CHECK}" \
     "${MTP_SPEC_DATA}")
 
 echo ""
@@ -835,6 +953,7 @@ MTP_SD_FMT=$(python3 -c "print(f'{float(\"${MTP_STDDEV_TPS}\"):.2f}')" 2>/dev/nu
 
 echo "============================================================"
 echo "  SPEC BENCH RESULTS — ${MODEL_NAME}"
+echo "  answer check: ${MTP_ANSWER_CHECK}"
 echo "============================================================"
 SPEC_TABLE_FMT="%-14s  %-16s  %-12s  %-13s  %-14s  %-14s  %s\n"
 # shellcheck disable=SC2059  # the format lives in a variable on purpose

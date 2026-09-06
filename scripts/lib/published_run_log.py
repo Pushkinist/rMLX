@@ -53,13 +53,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import server_sampling  # noqa: E402
 import spec_round_log  # noqa: E402
 
 TTFT_MARKER = "generate_streaming: TTFT"
 # Anchored, not a substring test: the speculative path writes
 # "spec generate: ITL stats (M30)", which contains this one.
 ITL_MESSAGE = "generate: ITL stats (M30)"
-SAMPLER_MARKER = "generate: host categorical sampler active"
+SAMPLER_MARKER = server_sampling.MARKER
 # The fields the engine says it resolved for a request. `seed` is on the list
 # because the request sends none and the engine substitutes a fixed default, so
 # three passes replay one RNG stream rather than sampling independently — a
