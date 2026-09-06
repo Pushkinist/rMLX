@@ -1955,6 +1955,49 @@ fn draft_decode_n_stochastic(
     Ok((tokens, q_dists))
 }
 
+/// Refuse a draft snapshot carrying tensors its loader never reads.
+///
+/// A drafter checkpoint of a generation newer than the loader ships weight
+/// families that loader has no code for. Building the drafter out of the
+/// remainder yields **the loader's** architecture wearing the checkpoint's
+/// name, and the accept rate measured from it is filed under that name:
+/// `decode_config` records `<kind>/block=N` either way and cannot tell the two
+/// apart, so the row outlives any warning and cannot be re-attributed
+/// afterwards. Refusing is what keeps that row from being written; it costs a
+/// supported checkpoint nothing, which reads every tensor it ships.
+///
+/// `drafter` names the loader in the message, so a snapshot handed to the wrong
+/// generation's loader says which one refused it.
+///
+/// `Ok(())` means every tensor in the snapshot was consumed. It returns a
+/// `Result` rather than an `Option<Error>` so a call site that stops propagating
+/// it is an `unused_must_use` warning, which `-D warnings` turns into a build
+/// failure — the guard cannot be un-wired quietly.
+pub(crate) fn unread_tensor_refusal(
+    drafter: &str,
+    present: &std::collections::HashSet<String>,
+    consumed: &std::collections::HashSet<String>,
+) -> Result<()> {
+    let mut unread: Vec<&str> = present
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !consumed.contains(*name))
+        .collect();
+    if unread.is_empty() {
+        return Ok(());
+    }
+    unread.sort_unstable();
+    Err(Error::Model(format!(
+        "{drafter}: the snapshot carries {} tensors this loader does not read \
+         ({}); the drafter built from the rest would be this loader's architecture \
+         and not the checkpoint's, and any accept rate measured from it would be \
+         recorded under the checkpoint's name with nothing in the row to say so. \
+         Refusing rather than serving a drafter that is not the one named.",
+        unread.len(),
+        unread.join(", ")
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 
