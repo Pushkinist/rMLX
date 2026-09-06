@@ -17,13 +17,15 @@
 //!
 //! # Status — document-the-truth (CLAUDE.md hard rule 7)
 //!
-//! **This module loads the checkpoint; it does not yet run it.** Config
-//! parsing, weight binding and shape validation against
-//! `z-lab/Qwen3.8-27B-DFlash2` are wired and covered. The drafter forward —
-//! the convolution, the selector and the round loop that would drive them — is
-//! not implemented, and the serve layer refuses a DFlash 2 draft snapshot
-//! before any weight is read rather than running one of the other loops under
-//! this checkpoint's name.
+//! **This module loads the checkpoint and runs its decoder stack; it does not
+//! yet draft.** Config parsing, weight binding and shape validation against
+//! `z-lab/Qwen3.8-27B-DFlash2` are wired and covered, and
+//! [`DFlash2Drafter::forward_hidden`] returns a block's final hidden states,
+//! checked against the z-lab MLX reference. The candidate selector that turns
+//! those hidden states into a chain, and the round loop that would drive it,
+//! are not implemented — so the serve layer still refuses a DFlash 2 draft
+//! snapshot before any weight is read rather than running one of the other
+//! loops under this checkpoint's name.
 //!
 //! # Why its own module and its own [`crate::DraftKind`]
 //!
@@ -42,6 +44,8 @@ use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
+
+mod forward;
 
 /// The number of convolution sides a `base_kernel` carries: one kernel applied
 /// to the sublayer's normed input, one to the sublayer's output.
@@ -430,6 +434,14 @@ fn check_config(
             "DFlash2Drafter: dflash_config.block_size is {}; a block of one is the \
              seed token alone and drafts nothing",
             cfg.block_size
+        )));
+    }
+    if cfg.sliding_window < 2 {
+        return Err(Error::Model(format!(
+            "DFlash2Drafter: sliding_window is {}; the window holds the block \
+             position and the conditioning rows behind it, and below two it \
+             reaches back past no row at all",
+            cfg.sliding_window
         )));
     }
 

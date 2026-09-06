@@ -304,6 +304,10 @@ fn a_config_the_forward_could_not_honour_is_refused() {
             serde_json::json!(1),
             "block_size",
         ),
+        // A window that reaches back past no conditioning row at all leaves the
+        // forward's window arithmetic below zero.
+        ("", "sliding_window", serde_json::json!(1), "sliding_window"),
+        ("", "sliding_window", serde_json::json!(0), "sliding_window"),
         // An empty target-layer list projects nothing.
         (
             "dflash_config",
