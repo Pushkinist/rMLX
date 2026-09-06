@@ -16,7 +16,7 @@
 //! between the GDN layers feed them. Replaying through a fresh scratch KV stack
 //! makes those FA layers attend a `v_kept`-token prefix at positions
 //! `0..v_kept`, so every downstream GDN layer advances on a wrong hidden.
-//! `eagle3_generate_greedy` is GDN-only by construction (it refuses a verifier
+//! `eagle3_generate` is GDN-only by construction (it refuses a verifier
 //! without `needs_lin_caches`), so on this path the defect is always live on a
 //! partial accept.
 //!
@@ -48,7 +48,7 @@ use std::path::PathBuf;
 
 use rmlx_mlx::Device;
 use rmlx_models::arch;
-use rmlx_models::speculative::eagle3::{eagle3_generate_greedy, Eagle3Drafter};
+use rmlx_models::speculative::eagle3::{eagle3_generate, Eagle3Drafter};
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key)
@@ -137,13 +137,22 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
     // codec rather than the rollback.
     let kv_quant = Some(rmlx_kv_quant::KvQuant::None);
 
+    let sampler_cfg = rmlx_models::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 0,
+    };
+
     let mut spec_ids: Vec<u32> = Vec::new();
     {
         let mut step_fn = |s: &rmlx_models::ProbeStep| {
             spec_ids.push(s.token_id);
             None
         };
-        eagle3_generate_greedy(
+        eagle3_generate(
             &verifier,
             &mut drafter,
             &tk,
@@ -154,20 +163,13 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
             None,
             &eos,
             &mut step_fn,
+            &sampler_cfg,
             device,
         )
         .expect("eagle3 generate");
     }
 
     let mut plain_ids: Vec<u32> = Vec::new();
-    let sampler_cfg = rmlx_models::sampler::SamplerConfig {
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 0,
-        min_p: 0.0,
-        seed: Some(0),
-        top_logprobs_k: 0,
-    };
     let mut rng = rmlx_models::sampler::Pcg32::new(sampler_cfg.seed_or_default());
     let penalty_cfg = rmlx_models::sampler::PenaltyConfig::default();
     let mut history: Vec<u32> = Vec::new();

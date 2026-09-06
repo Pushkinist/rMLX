@@ -250,7 +250,7 @@ Per request it appends to the run log the events the harness reads back:
   generate: host categorical sampler active (A7.2)
                                          unless STUB_SAMPLED=0, capped by
                                          STUB_SAMPLER_LINES
-  <kind>_generate_greedy: done           when the serve argv carried a drafter,
+  <kind>_generate: done                  when the serve argv carried a drafter,
                                          or STUB_FORCE_DONE is set
 
 `mean_ms` on the ITL event and `decode_tps` on the done line both report the
@@ -340,7 +340,7 @@ def done_line(rate):
     total_accept = 98
     draft_ms, verify_ms, round_ms = 300.0, 900.0, 1800.0
     fields = {
-        "message": "mtp_generate_greedy: done",
+        "message": "mtp_generate: done",
         "rounds": rounds,
         "emitted": emitted,
         "seed_emitted": seed_emitted,
@@ -514,7 +514,7 @@ set -eu
 # case below removes one to show the check is not decorative.
 # markers: generate_streaming: TTFT | generate: ITL stats (M30)
 # markers: generate: host categorical sampler active | cache-type resolved
-# markers: generate_greedy: done
+# markers: mtp_generate: done
 case "\$1" in
 metrics)
 	case "\$2" in

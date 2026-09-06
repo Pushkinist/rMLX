@@ -54,7 +54,7 @@ use std::path::PathBuf;
 
 use rmlx_mlx::Device;
 use rmlx_models::arch;
-use rmlx_models::speculative::mtp::{mtp_generate_greedy, MtpDrafter};
+use rmlx_models::speculative::mtp::{mtp_generate, MtpDrafter};
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key)
@@ -175,13 +175,22 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
          past the answer into maximum-entropy filler and the comparison is noise"
     );
 
+    let sampler_cfg = rmlx_models::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 0,
+    };
+
     let mut spec_ids: Vec<u32> = Vec::new();
     {
         let mut step_fn = |s: &rmlx_models::ProbeStep| {
             spec_ids.push(s.token_id);
             None
         };
-        mtp_generate_greedy(
+        mtp_generate(
             &verifier,
             &mut drafter,
             &tk,
@@ -192,20 +201,13 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
             None,
             &eos,
             &mut step_fn,
+            &sampler_cfg,
             device,
         )
         .expect("mtp generate");
     }
 
     let mut plain_ids: Vec<u32> = Vec::new();
-    let sampler_cfg = rmlx_models::sampler::SamplerConfig {
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 0,
-        min_p: 0.0,
-        seed: Some(0),
-        top_logprobs_k: 0,
-    };
     let mut rng = rmlx_models::sampler::Pcg32::new(sampler_cfg.seed_or_default());
     let penalty_cfg = rmlx_models::sampler::PenaltyConfig::default();
     let mut history: Vec<u32> = Vec::new();

@@ -44,7 +44,7 @@ cat >"${BINARY}" <<'BINEOF'
 # generate: ITL stats (M30)
 # generate: host categorical sampler active
 # cache-type resolved
-# generate_greedy: done
+# mtp_generate: done
 exit 0
 BINEOF
 chmod +x "${BINARY}"

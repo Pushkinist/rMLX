@@ -105,11 +105,11 @@ impl SpecLoop {
     /// EOS case to leave one too.
     pub(crate) const fn done_event(self) -> &'static str {
         match self {
-            Self::MtpAssistant => "mtp_assistant_generate_greedy: done",
-            Self::MtpSidecar => "mtp_generate_greedy: done",
-            Self::DFlash => "dflash_generate_greedy: done",
-            Self::DFlash2 => "dflash2_generate_greedy: done",
-            Self::Eagle3 => "eagle3_generate_greedy: done",
+            Self::MtpAssistant => "mtp_assistant_generate: done",
+            Self::MtpSidecar => "mtp_generate: done",
+            Self::DFlash => "dflash_generate: done",
+            Self::DFlash2 => "dflash2_generate: done",
+            Self::Eagle3 => "eagle3_generate: done",
             Self::TwoModelGreedy => "spec_generate_greedy_cached: done",
             Self::TwoModelStochastic => "spec_generate_stochastic_cached: done",
         }

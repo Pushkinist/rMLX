@@ -1202,7 +1202,7 @@ tags = ["run2d", "gemma4", "swa"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2e — speculative decoding (LIVE). Real drafter + verifier; the round-loop
-# must FIRE (accept_rate > 0 in the `<kind>_generate_greedy: done` jsonl summary)
+# must FIRE (accept_rate > 0 in the `<kind>_generate: done` jsonl summary)
 # AND the output must stay coherent. Verifier = Qwen3.6-35B-A3B-8bit (alias
 # QWEN36). Drafters carry their snapshot slug directly in `draft_model` (resolved
 # under RMLX_O_MODELS_ROOT). SKIP (clear reason) when a drafter snapshot absent.

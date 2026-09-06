@@ -570,15 +570,20 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
 
 use crate::decode_loop::ProbeStep;
 
-/// MTP speculative-decoding round-loop (greedy / temp=0).
+/// MTP speculative-decoding round-loop.
 ///
-/// Port of `_mtp_rounds` (mlx-vlm). Mirrors [`super::dflash::dflash_generate_greedy`]
+/// Port of `_mtp_rounds` (mlx-vlm). Mirrors [`super::dflash::dflash_generate`]
 /// structurally: prefill the verifier, capture the penultimate hidden + first
 /// bonus, then per round draft `block_size - 1` tokens via [`MtpDrafter::draft_n`],
 /// verify all `block_size` positions in one cached forward (capturing both
-/// logits and the penultimate hidden), accept the greedy prefix the verifier's
-/// own argmax agrees with, emit, and roll back the verifier KV (GDN-aware) and
+/// logits and the penultimate hidden), accept the prefix the verifier's own
+/// token agrees with, emit, and roll back the verifier KV (GDN-aware) and
 /// the sidecar KV on partial acceptance.
+///
+/// `sampler_cfg` decides what "the verifier's own token" means at each position
+/// — its argmax at temperature 0, a draw from its post-sampling distribution
+/// above it. The drafter is unaffected either way: it proposes its argmax, and
+/// [`super::VerifierDraw`] explains why the walk is still exact.
 ///
 /// The verifier is the Qwen3.5/3.6-MoE hybrid (carries GDN linear-attention
 /// state); rollback uses the [`super::dflash::DFlashRoundState`] snapshot/restore.
@@ -592,7 +597,7 @@ use crate::decode_loop::ProbeStep;
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
 #[allow(clippy::too_many_lines)]
-pub fn mtp_generate_greedy(
+pub fn mtp_generate(
     verifier: &Architecture,
     drafter: &mut MtpDrafter,
     tokenizer: &tokenizers::Tokenizer,
@@ -603,6 +608,7 @@ pub fn mtp_generate_greedy(
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
 ) -> Result<Vec<ProbeStep>> {
     use super::dflash::DFlashRoundState;
@@ -611,12 +617,12 @@ pub fn mtp_generate_greedy(
 
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
-            "mtp_generate_greedy: prompt must have >=2 tokens".into(),
+            "mtp_generate: prompt must have >=2 tokens".into(),
         ));
     }
     if !verifier.needs_lin_caches() {
         return Err(Error::Model(
-            "mtp_generate_greedy: MTP verifier must be the Qwen3.5/3.6-MoE hybrid \
+            "mtp_generate: MTP verifier must be the Qwen3.5/3.6-MoE hybrid \
              (needs GDN lin_caches)"
                 .into(),
         ));
@@ -657,6 +663,8 @@ pub fn mtp_generate_greedy(
         .collect();
 
     drafter.reset();
+
+    let mut draw = super::VerifierDraw::new(sampler_cfg);
 
     let mut total_draft = 0usize;
     let mut total_accept = 0usize;
@@ -703,11 +711,7 @@ pub fn mtp_generate_greedy(
                     // Conditioning hidden for the first draft round = the carry position hidden.
     super::guard_verifier_prefill_logits(verifier, &r0_logits, prompt_ids.len())?;
     let mut h_cond = r0_hidden;
-    let mut b = {
-        let am = argmax(&r0_logits, -1, device)?;
-        am.eval()?;
-        u32::from_le_bytes(am.to_bytes()?[..4].try_into().unwrap())
-    };
+    let mut b = draw.seed_token(&r0_logits, device)?;
     emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
     if eos_ids.contains(&b) {
         // The stop token arrived before a round could run. The request still
@@ -739,7 +743,8 @@ pub fn mtp_generate_greedy(
         n_tokens,
         ?kv_quant,
         capture_layer = last_layer,
-        "mtp_generate_greedy: starting (Qwen3.6-MoE verifier + MTP sidecar)"
+        temperature = sampler_cfg.temperature,
+        "mtp_generate: starting (Qwen3.6-MoE verifier + MTP sidecar)"
     );
 
     let seed_emitted = emitted.len();
@@ -790,17 +795,16 @@ pub fn mtp_generate_greedy(
         // plus another pipeline drain. Reading it inside this span is also what
         // makes `verifier_ms` the cost of the verify forward rather than the
         // cost of building its graph — the assistant loop reads its verifier
-        // argmax back at the same point, and the two figures are only
-        // comparable because of it.
-        let v_argmax = argmax(&v_logits, -1, device)?;
-        v_argmax.eval()?;
-        let vb = v_argmax.to_bytes()?;
+        // token back at the same point, and the two figures are only
+        // comparable because of it. Sampled requests draw here too, so the
+        // per-position host softmax lands in the same span rather than
+        // silently inflating the walk.
+        let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
         let round_verify_ns = t0.elapsed().as_nanos();
         verifier_ns += round_verify_ns;
 
-        // -- Phase C: greedy acceptance walk over the verifier's own tokens.
+        // -- Phase C: acceptance walk over the verifier's own tokens.
         let t0 = Instant::now();
-        let v_tokens = super::argmax_tokens(&vb, v_k)?;
         let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;

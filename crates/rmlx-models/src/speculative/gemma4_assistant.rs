@@ -697,13 +697,15 @@ use std::time::Instant;
 ///
 /// Mirrors mlx-vlm `_mtp_rounds` (greedy / temp=0):
 /// 1. prefill verifier on `prompt[..-1]`, advancing its persistent KV cache;
-/// 2. round 0 seed `b` = argmax of the verifier logit after the last prompt
+/// 2. round 0 seed `b` = the verifier's own token after the last prompt
 /// 3. each round: drafter proposes `block-1` tokens conditioned on the verifier
-///    hidden states; verifier accepts greedily.
+///    hidden states; the verifier accepts the prefix it agrees with.
 ///
 /// `step_fn` is invoked once per emitted (verifier-confirmed) token. Returns the
 /// emitted `ProbeStep`s. `block_size` is the MTP block (draft proposes
-/// `block_size - 1` tokens/round).
+/// `block_size - 1` tokens/round). `sampler_cfg` decides what "the verifier's
+/// own token" means — its argmax at temperature 0, a draw from its
+/// post-sampling distribution above it; see [`super::VerifierDraw`].
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -713,7 +715,7 @@ use std::time::Instant;
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-pub fn mtp_assistant_generate_greedy(
+pub fn mtp_assistant_generate(
     verifier: &Architecture,
     drafter: &Gemma4AssistantDrafter,
     tokenizer: &tokenizers::Tokenizer,
@@ -724,16 +726,17 @@ pub fn mtp_assistant_generate_greedy(
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
 ) -> Result<Vec<ProbeStep>> {
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
-            "mtp_assistant_generate_greedy: prompt must have >=2 tokens".into(),
+            "mtp_assistant_generate: prompt must have >=2 tokens".into(),
         ));
     }
     if block_size < 2 {
         return Err(Error::Model(
-            "mtp_assistant_generate_greedy: block_size must be >= 2".into(),
+            "mtp_assistant_generate: block_size must be >= 2".into(),
         ));
     }
     // Which round loop runs is decided by the drafter snapshot's `model_type`
@@ -744,7 +747,7 @@ pub fn mtp_assistant_generate_greedy(
     // deeper in a shape mismatch.
     if !matches!(verifier, Architecture::Gemma4(_)) {
         return Err(Error::Model(format!(
-            "mtp_assistant_generate_greedy: the Gemma4 assistant round loop needs a Gemma4 \
+            "mtp_assistant_generate: the Gemma4 assistant round loop needs a Gemma4 \
              verifier and this one is {}",
             verifier.arch_class()
         )));
@@ -772,6 +775,8 @@ pub fn mtp_assistant_generate_greedy(
         })
         .collect();
 
+    let mut draw = super::VerifierDraw::new(sampler_cfg);
+
     // Diagnostics.
     let mut total_draft: usize = 0;
     let mut total_accept: usize = 0;
@@ -797,9 +802,7 @@ pub fn mtp_assistant_generate_greedy(
     let mut b = {
         let logits = verifier.logits_from_hidden(&hidden_raw, device)?;
         super::guard_verifier_prefill_logits(verifier, &logits, prompt_ids.len())?;
-        let am = argmax(&logits, -1, device)?;
-        am.eval()?;
-        u32::from_le_bytes(am.to_bytes()?[..4].try_into().unwrap())
+        draw.seed_token(&logits, device)?
     };
     // MTP drafter conditions on the *normed* trunk hidden
     // (speculative_draft_hidden = model.norm(h)), not the raw pre-norm hidden.
@@ -838,7 +841,8 @@ pub fn mtp_assistant_generate_greedy(
         prompt_len = prompt_ids.len(),
         n_tokens,
         ?kv_quant,
-        "mtp_assistant_generate_greedy: starting (Gemma4-assistant MTP)"
+        temperature = sampler_cfg.temperature,
+        "mtp_assistant_generate: starting (Gemma4-assistant MTP)"
     );
 
     let seed_emitted = emitted.len();
@@ -882,17 +886,14 @@ pub fn mtp_assistant_generate_greedy(
         let t0 = Instant::now();
         let (v_hidden, new_sliding, new_full, _off) =
             verifier.forward_hidden_states_shared_kv(&verify_input, v_k, &mut caches, device)?;
-        // Greedy verifier tokens from the K+1 hidden positions.
+        // The verifier's own token at each of the K+1 hidden positions.
         let v_logits = verifier.logits_from_hidden(&v_hidden, device)?;
-        let v_argmax = argmax(&v_logits, -1, device)?;
-        v_argmax.eval()?;
-        let vb = v_argmax.to_bytes()?;
+        let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
         let round_verify_ns = t0.elapsed().as_nanos();
         verifier_ns += round_verify_ns;
         let t0 = Instant::now();
-        let v_tokens = super::argmax_tokens(&vb, v_k)?;
 
-        // -- Phase C: greedy acceptance walk. --------------------------------
+        // -- Phase C: acceptance walk. ---------------------------------------
         let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;

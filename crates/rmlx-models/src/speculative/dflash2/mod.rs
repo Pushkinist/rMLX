@@ -17,17 +17,22 @@
 //!
 //! # Status — document-the-truth (CLAUDE.md hard rule 7)
 //!
-//! **Greedy end to end.** Config parsing, weight binding and shape validation
+//! **Wired end to end.** Config parsing, weight binding and shape validation
 //! against `z-lab/Qwen3.8-27B-DFlash2` are wired and covered;
 //! [`DFlash2Drafter::forward_hidden`] returns a block's final hidden states and
 //! [`DFlash2Drafter::select_chain`] turns those states and the verifier's
 //! logits over them into one ordered draft chain, both checked against the
-//! z-lab MLX reference; and [`dflash2_generate_greedy`] drives them round after
-//! round against the verifier. **Only greedy** — the reference's sampled arm
-//! accepts by rejection sampling restricted to the selector's own candidate
-//! set, which is neither what `select_chain` returns nor the acceptance rule
-//! this crate's two-model loop implements. Like every other sidecar loop here,
-//! a request above temperature 0 is served greedily.
+//! z-lab MLX reference; and [`dflash2_generate`] drives them round after round
+//! against the verifier.
+//!
+//! **The drafter is greedy and the acceptance is not.** `select_chain` returns
+//! ids and no candidate distribution, and the reference's sampled arm accepts by
+//! rejection sampling restricted to that candidate set. Neither is needed: a
+//! greedy proposal is a point mass, and the acceptance rule with a point-mass
+//! proposal is exact without a drafter distribution, so a request above
+//! temperature 0 draws the verifier's own token per verified position and
+//! accepts the prefix the chain agrees with. See
+//! [`crate::speculative::VerifierDraw`].
 //!
 //! # Why its own module and its own [`crate::DraftKind`]
 //!
@@ -51,7 +56,7 @@ mod forward;
 mod round;
 mod selector;
 
-pub use round::dflash2_generate_greedy;
+pub use round::dflash2_generate;
 
 /// The number of convolution sides a `base_kernel` carries: one kernel applied
 /// to the sublayer's normed input, one to the sublayer's output.

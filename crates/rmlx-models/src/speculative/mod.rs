@@ -1598,6 +1598,111 @@ fn snapshot_lin(lin: Option<&[LinearAttnCache]>) -> Result<Option<Vec<LinearAttn
     }
 }
 
+/// How a round loop reads the verifier's own token out of a block of logits.
+///
+/// At temperature 0 that is the device argmax. Above it, it is a draw from the
+/// verifier's post-sampling distribution at each position, taken through the
+/// same host pipeline (`sampling_distribution`) the ordinary decode path uses,
+/// so a speculative arm and a plain arm sample from the same distribution.
+///
+/// Feeding those draws to the acceptance walk unchanged is a distributionally
+/// exact sampled speculative step, and needs nothing from the drafter. The walk
+/// emits the verifier's own token at every position it reaches, and it only
+/// reaches position `i` when the proposals so far all agreed — so the emitted
+/// prefix is the prefix the verifier scored, and each emitted token is a draw
+/// from the verifier's distribution at exactly that prefix. The proposal decides
+/// how far the walk gets; it never decides what comes out. This is the
+/// acceptance rule with a point-mass proposal, which
+/// `a_point_mass_proposal_emits_the_target_and_matches_sample_and_match` pins
+/// against the residual form.
+///
+/// Holds its own RNG, one per request, so the draw stream is contiguous across
+/// rounds and a seeded request reproduces byte for byte.
+pub(crate) struct VerifierDraw {
+    cfg: crate::sampler::SamplerConfig,
+    penalties: crate::sampler::PenaltyConfig,
+    rng: crate::sampler::Pcg32,
+}
+
+impl VerifierDraw {
+    pub(crate) fn new(cfg: &crate::sampler::SamplerConfig) -> Self {
+        Self {
+            cfg: *cfg,
+            // The speculative path refuses penalties and constrained decoding at
+            // the request boundary, so the distribution builder runs with a
+            // no-op configuration and an empty history window. A round would
+            // need the penalty window rebuilt per drafted position, which no
+            // loop carries.
+            penalties: crate::sampler::PenaltyConfig::default(),
+            rng: crate::sampler::Pcg32::new(cfg.seed_or_default()),
+        }
+    }
+
+    /// Whether this request samples. `false` keeps every loop on the argmax
+    /// path it had.
+    pub(crate) fn sampling(&self) -> bool {
+        self.cfg.sampling_active()
+    }
+
+    /// One token from a single-position logits array (`[1, 1, vocab]` or
+    /// `[1, vocab]`) — the seed a loop emits straight after prefill.
+    pub(crate) fn seed_token(&mut self, logits: &Array, device: Device) -> Result<u32> {
+        if !self.sampling() {
+            let am = argmax(logits, -1, device)?;
+            am.eval()?;
+            let bytes = am.to_bytes()?;
+            return argmax_tokens(&bytes, 1)?.first().copied().ok_or_else(|| {
+                Error::Model("seed_token: the verifier's argmax carried no id".into())
+            });
+        }
+        let vocab = vocab_axis(logits)?;
+        Ok(self.draw_row(&logits.reshape(&[1, vocab], device)?)? as u32)
+    }
+
+    /// The verifier's token at each of the `v_k` positions of one verified
+    /// block, from its `[1, v_k, vocab]` logits.
+    pub(crate) fn block_tokens(
+        &mut self,
+        logits: &Array,
+        v_k: usize,
+        device: Device,
+    ) -> Result<Vec<u32>> {
+        if !self.sampling() {
+            let am = argmax(logits, -1, device)?;
+            am.eval()?;
+            let bytes = am.to_bytes()?;
+            return argmax_tokens(&bytes, v_k);
+        }
+        let vocab = vocab_axis(logits)?;
+        let mut tokens = Vec::with_capacity(v_k);
+        for i in 0..v_k {
+            let i = i as i32;
+            let row = logits
+                .slice(&[0, i, 0], &[1, i + 1, vocab], &[1, 1, 1], device)?
+                .reshape(&[1, vocab], device)?;
+            tokens.push(self.draw_row(&row)? as u32);
+        }
+        Ok(tokens)
+    }
+
+    fn draw_row(&mut self, row: &Array) -> Result<usize> {
+        let probs =
+            crate::sampler::sampling_distribution(row, &self.cfg, None, &self.penalties, &[])?;
+        Ok(crate::sampler::sample_index(&probs, &mut self.rng))
+    }
+}
+
+/// The vocabulary extent of a logits array — its last axis.
+fn vocab_axis(logits: &Array) -> Result<i32> {
+    match logits.shape().last() {
+        Some(&v) if v > 0 => Ok(v),
+        _ => Err(Error::Model(format!(
+            "the verifier's logits came back shaped {:?}, which has no vocabulary axis",
+            logits.shape()
+        ))),
+    }
+}
+
 /// Read a verify forward's `argmax` result back as `k` token ids.
 ///
 /// The buffer is checked once, against the position count the caller verified,

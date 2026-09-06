@@ -79,7 +79,7 @@ fn eagle3_module_compiles() {
     let _walk = eagle3_walk;
     let _d2t = draft_to_target;
     let _ffp = find_full_pos;
-    let _gen = eagle3_generate_greedy;
+    let _gen = eagle3_generate;
     let _ = (_load, _bs, _walk, _d2t, _ffp, _gen);
 }
 

@@ -129,11 +129,9 @@ mod common;
 
 use rmlx_mlx::Device;
 use rmlx_models::arch;
-use rmlx_models::speculative::dflash2::{dflash2_generate_greedy, DFlash2Drafter};
-use rmlx_models::speculative::gemma4_assistant::{
-    mtp_assistant_generate_greedy, Gemma4AssistantDrafter,
-};
-use rmlx_models::speculative::mtp::{mtp_generate_greedy, MtpDrafter};
+use rmlx_models::speculative::dflash2::{dflash2_generate, DFlash2Drafter};
+use rmlx_models::speculative::gemma4_assistant::{mtp_assistant_generate, Gemma4AssistantDrafter};
+use rmlx_models::speculative::mtp::{mtp_generate, MtpDrafter};
 use rmlx_models::{Declared, DraftKind};
 
 /// Token budget per arm. A ceiling, not a target: both arms stop on the
@@ -1702,6 +1700,18 @@ fn plain_greedy(
     (ids, margins)
 }
 
+/// The greedy sampler configuration both arms run under. Answer equivalence is
+/// a temperature-0 claim: at any other temperature the two arms draw from
+/// different random streams and the ids are free to differ.
+const GREEDY: rmlx_models::sampler::SamplerConfig = rmlx_models::sampler::SamplerConfig {
+    temperature: 0.0,
+    top_p: 1.0,
+    top_k: 0,
+    min_p: 0.0,
+    seed: Some(0),
+    top_logprobs_k: 0,
+};
+
 /// A loaded pair, ready to answer prompts.
 struct Loaded {
     verifier: arch::Architecture,
@@ -1728,7 +1738,7 @@ impl Loaded {
                 None
             };
             match &mut self.drafter {
-                Drafter::Assistant(drafter) => mtp_assistant_generate_greedy(
+                Drafter::Assistant(drafter) => mtp_assistant_generate(
                     &self.verifier,
                     drafter,
                     &self.tokenizer,
@@ -1739,12 +1749,13 @@ impl Loaded {
                     Some(MAX_CTX),
                     &self.eos,
                     &mut step,
+                    &GREEDY,
                     device,
                 )
                 .expect("assistant speculative generate"),
                 Drafter::Mtp(drafter) => {
                     let block = drafter.block_size();
-                    mtp_generate_greedy(
+                    mtp_generate(
                         &self.verifier,
                         drafter,
                         &self.tokenizer,
@@ -1755,6 +1766,7 @@ impl Loaded {
                         Some(MAX_CTX),
                         &self.eos,
                         &mut step,
+                        &GREEDY,
                         device,
                     )
                     .expect("mtp speculative generate")
@@ -1764,7 +1776,7 @@ impl Loaded {
                 // width its selector chain is defined over.
                 Drafter::DFlash2(drafter) => {
                     let block = drafter.cfg.block_size;
-                    dflash2_generate_greedy(
+                    dflash2_generate(
                         &self.verifier,
                         drafter,
                         &self.tokenizer,
@@ -1775,6 +1787,7 @@ impl Loaded {
                         Some(MAX_CTX),
                         &self.eos,
                         &mut step,
+                        &GREEDY,
                         device,
                     )
                     .expect("dflash2 speculative generate")

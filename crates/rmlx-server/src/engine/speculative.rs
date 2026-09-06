@@ -225,6 +225,28 @@ impl Drafter {
     }
 }
 
+/// The sampling fields a speculative request sets that no speculative arm
+/// applies, named so the run log can be read back against what was asked for.
+///
+/// Empty for a request that set none of them, which is the common case and the
+/// one that must stay silent.
+fn dropped_sampling_fields(sampling: &crate::engine::types::SamplingParams) -> Vec<&'static str> {
+    let mut named = Vec::new();
+    if (sampling.repetition_penalty - 1.0).abs() > f32::EPSILON {
+        named.push("repetition_penalty");
+    }
+    if sampling.frequency_penalty != 0.0 {
+        named.push("frequency_penalty");
+    }
+    if sampling.presence_penalty != 0.0 {
+        named.push("presence_penalty");
+    }
+    if !sampling.logit_bias.is_empty() {
+        named.push("logit_bias");
+    }
+    named
+}
+
 // ── SpeculativeGenerator ──────────────────────────────────────────────────────
 
 /// Generator backed by a verifier and a drafter of one [`rmlx_models::DraftKind`].
@@ -235,9 +257,10 @@ impl Drafter {
 /// snapshot's own `config.json`, or by an explicit `--draft-kind`.
 ///
 /// `--draft-block-size` is the round block, the verifier's token included
-/// (default 5), so every loop drafts one fewer. The two-model loops accept
-/// greedily at `temperature == 0` and by Leviathan stochastic acceptance above
-/// it; the sidecar loops are greedy only.
+/// (default 5), so every loop drafts one fewer. Every loop accepts by argmax
+/// agreement at `temperature == 0`; above it the two-model loop runs
+/// rejection sampling against the drafter's distribution and the sidecar loops
+/// draw the verifier's token per position and accept the prefix that agrees.
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal generator implementation — field set is coupled to the speculative-decoding lifecycle; adding a field requires updating from_snapshot and all constructors"
@@ -654,11 +677,12 @@ impl Generator for SpeculativeGenerator {
             }));
         }
         let _ = req.constraint;
-        // speculative decoding now supports temperature > 0 via Leviathan
-        // stochastic acceptance (was A7.2-rejected). `temperature == 0` keeps the
-        // byte-identical greedy cached path. Mirror the resolved sampling knobs
-        // into the rmlx-models `SamplerConfig` exactly as the standard path does;
-        // the dispatcher branches greedy vs stochastic on `sampling_active()`.
+        // Every speculative arm honours `temperature > 0`. The two-model arm runs
+        // full rejection sampling against the drafter's own distribution; the
+        // sidecar arms, whose drafters propose an argmax, draw the verifier's
+        // token at each verified position and accept the prefix that agrees —
+        // the same law with a point-mass proposal. `temperature == 0` keeps every
+        // arm on the argmax path it had, byte for byte.
         let spec_sampler_cfg = rmlx_models::SamplerConfig {
             temperature: req.sampling.temperature,
             top_p: req.sampling.top_p,
@@ -669,17 +693,31 @@ impl Generator for SpeculativeGenerator {
             // emits ProbeStep without logprobs); keep disabled.
             top_logprobs_k: 0,
         };
-        if spec_sampler_cfg.sampling_active() {
-            tracing::debug!(
+        // Penalties and logit bias reach no speculative arm. A round scores its
+        // whole block in one forward, so an exact per-position distribution would
+        // need the penalty window rebuilt over the drafted prefix at each
+        // position, and no loop carries that window. Dropping them silently is
+        // what made a nominally penalised speculative request indistinguishable
+        // from an unpenalised one, so name them instead.
+        let dropped = dropped_sampling_fields(&req.sampling);
+        if !dropped.is_empty() {
+            tracing::warn!(
                 model_id = %req.model_id,
-                temperature = spec_sampler_cfg.temperature,
-                top_p = spec_sampler_cfg.top_p,
-                top_k = spec_sampler_cfg.top_k,
-                min_p = spec_sampler_cfg.min_p,
-                seed = spec_sampler_cfg.seed_or_default(),
-                "SpeculativeGenerator: stochastic acceptance active (Leviathan)"
+                fields = %dropped.join(", "),
+                "SpeculativeGenerator: not honoured on the speculative path — the request \
+                 ran without them. Retry without a draft model to have them applied."
             );
         }
+        tracing::debug!(
+            model_id = %req.model_id,
+            temperature = spec_sampler_cfg.temperature,
+            top_p = spec_sampler_cfg.top_p,
+            top_k = spec_sampler_cfg.top_k,
+            min_p = spec_sampler_cfg.min_p,
+            seed = spec_sampler_cfg.seed_or_default(),
+            sampled = spec_sampler_cfg.sampling_active(),
+            "SpeculativeGenerator: sampling configuration"
+        );
         // Think-splitter mirrors ArchGenerator: budget, thinking-end id, the
         // prompt-derived initial channel and per-request delimiters go through
         // the same `new_for_request` constructor as the standard path.
@@ -841,7 +879,7 @@ impl Generator for SpeculativeGenerator {
             let result = match &drafter {
                 Drafter::Eagle3(drafter_arc) => {
                     let mut drafter = drafter_arc.lock();
-                    rmlx_models::speculative::eagle3::eagle3_generate_greedy(
+                    rmlx_models::speculative::eagle3::eagle3_generate(
                         &dispatcher.verifier,
                         &mut drafter,
                         &tokenizer,
@@ -852,12 +890,13 @@ impl Generator for SpeculativeGenerator {
                         max_ctx_override,
                         &eos_ids,
                         &mut step_fn,
+                        &spec_sampler_cfg,
                         dispatcher.device(),
                     )
                 }
                 Drafter::DFlash(drafter_arc) => {
                     let mut drafter = drafter_arc.lock();
-                    rmlx_models::speculative::dflash::dflash_generate_greedy(
+                    rmlx_models::speculative::dflash::dflash_generate(
                         &dispatcher.verifier,
                         &mut drafter,
                         &tokenizer,
@@ -868,26 +907,26 @@ impl Generator for SpeculativeGenerator {
                         max_ctx_override,
                         &eos_ids,
                         &mut step_fn,
+                        &spec_sampler_cfg,
                         dispatcher.device(),
                     )
                 }
-                Drafter::DFlash2(drafter) => {
-                    rmlx_models::speculative::dflash2::dflash2_generate_greedy(
-                        &dispatcher.verifier,
-                        drafter,
-                        &tokenizer,
-                        &prompt_tokens,
-                        n_tokens,
-                        block_size,
-                        kv_quant_override,
-                        max_ctx_override,
-                        &eos_ids,
-                        &mut step_fn,
-                        dispatcher.device(),
-                    )
-                }
+                Drafter::DFlash2(drafter) => rmlx_models::speculative::dflash2::dflash2_generate(
+                    &dispatcher.verifier,
+                    drafter,
+                    &tokenizer,
+                    &prompt_tokens,
+                    n_tokens,
+                    block_size,
+                    kv_quant_override,
+                    max_ctx_override,
+                    &eos_ids,
+                    &mut step_fn,
+                    &spec_sampler_cfg,
+                    dispatcher.device(),
+                ),
                 Drafter::MtpAssistant(assistant) => {
-                    rmlx_models::speculative::gemma4_assistant::mtp_assistant_generate_greedy(
+                    rmlx_models::speculative::gemma4_assistant::mtp_assistant_generate(
                         &dispatcher.verifier,
                         assistant,
                         &tokenizer,
@@ -898,12 +937,13 @@ impl Generator for SpeculativeGenerator {
                         max_ctx_override,
                         &eos_ids,
                         &mut step_fn,
+                        &spec_sampler_cfg,
                         dispatcher.device(),
                     )
                 }
                 Drafter::MtpSidecar(drafter_arc) => {
                     let mut drafter = drafter_arc.lock();
-                    rmlx_models::speculative::mtp::mtp_generate_greedy(
+                    rmlx_models::speculative::mtp::mtp_generate(
                         &dispatcher.verifier,
                         &mut drafter,
                         &tokenizer,
@@ -914,6 +954,7 @@ impl Generator for SpeculativeGenerator {
                         max_ctx_override,
                         &eos_ids,
                         &mut step_fn,
+                        &spec_sampler_cfg,
                         dispatcher.device(),
                     )
                 }
