@@ -14,15 +14,18 @@ produces.
   * `model.safetensors` + `config.json` — a synthetic drafter at the same tensor
     names and relationships as the published checkpoint, small enough to commit.
   * `reference.safetensors` — the inputs and the hidden states the reference
-    produces from them, one per case.
+    produces from them, one per case, plus the chains its candidate selector
+    traces over the `wide` case.
 
 `published` writes `../dflash2_published_reference.safetensors`: the hidden
-states the reference produces from the real `z-lab/Qwen3.8-27B-DFlash2` weights.
-Its inputs are not committed — both sides generate them from the integer
-recurrence in `synthetic`, which `tests/dflash2_loader.rs` repeats.
+states and selector chains the reference produces from the real
+`z-lab/Qwen3.8-27B-DFlash2` weights. Its inputs are not committed — both sides
+generate them from the integer recurrence in `synthetic` and from
+`selector_logits`, which `tests/dflash2_loader.rs` repeats.
 
-The consumers are `speculative/dflash2/forward_tests.rs` (scale) and
-`tests/dflash2_loader.rs` (published).
+The consumers are `speculative/dflash2/forward_tests.rs` and
+`speculative/dflash2/selector_tests.rs` (scale) and `tests/dflash2_loader.rs`
+(published).
 """
 
 import json
@@ -76,6 +79,70 @@ BLOCK = 4
 THETA = 1.0e7
 EPS = 1e-6
 TARGETS = [0, 1]
+SELECTOR_WEIGHT_SCALE = 0.25
+
+# --- the stand-in verifier head --------------------------------------------
+
+# The selector's unary term is the verifier's LM head over the drafter's hidden
+# states. Neither model here has one: the scale drafter has no verifier at all,
+# and the published pair's is a 27 B 4-bit head whose output nothing could
+# commit. The cases below stand one in -- a floor with `spikes` peaks a fixed
+# distance apart -- and both sides build it with the same exact arithmetic, so
+# the comparison never depends on a matmul kernel.
+#
+# The spacing is what makes the case decidable, and it is chosen per model
+# rather than shared: the peaks are `step` apart, which is dozens of bf16 places
+# at these magnitudes, so the k-th and (k+1)-th candidate cannot tie and the
+# candidate set does not depend on how a partition orders equals. The spread
+# across the kept candidates -- `(spikes - 1) * step` -- is set comparable to
+# the model's own pairwise term, so neither term decides every position. Both
+# models were measured: a spread far above the pairwise term makes the chain the
+# per-position argmax, and one far below makes it the pairwise argmax, and
+# either way one of the two terms could be dropped without the case noticing.
+SELECTOR_FLOOR = -8.0
+SELECTOR_POS_STRIDE = 12289
+SELECTOR_ID_STRIDE = 18
+SCALE_SELECTOR_STEP = 0.3125
+PUBLISHED_SELECTOR_STEP = 0.09375
+SCALE_ANCHORS = (3, 27)
+PUBLISHED_ANCHORS = (100, 50000)
+
+
+def selector_logits(positions, vocab, spikes, step):
+    """Stand-in verifier logits, `[1, positions, vocab]` bf16.
+
+    `tests/dflash2_loader.rs::stand_in_logits` repeats this, value for value.
+    """
+    lg = np.full((1, positions, vocab), SELECTOR_FLOOR, dtype=np.float32)
+    for t in range(positions):
+        for j in range(spikes):
+            token = (t * SELECTOR_POS_STRIDE + j * SELECTOR_ID_STRIDE) % vocab
+            lg[0, t, token] = j * step
+    return mx.array(lg).astype(mx.bfloat16)
+
+
+def selector_case(model, hidden_block, spikes, step, anchors, vocab):
+    """The reference's chain over `hidden_block`'s drafted positions.
+
+    `hidden_block` is the whole block; the drafted positions are the rest of it
+    after the seed, which is the reference's own `logits_start = 1`.
+    """
+    hidden = hidden_block[:, 1:]
+    logits = selector_logits(hidden.shape[1], vocab, spikes, step)
+    out = {
+        "selector_logits": logits,
+        "selector_top1": mx.argmax(logits, axis=-1).astype(mx.uint32)[0],
+    }
+    for i, anchor in enumerate(anchors):
+        path, _, _ = model.candidate_selector.select(
+            hidden, logits, mx.array([anchor]), 0.0
+        )
+        mx.eval(path)
+        out[f"selector_chain_{i}"] = path.astype(mx.uint32)[0]
+        print(f"  selector anchor {anchor} -> {path.tolist()[0]}")
+    print(f"  selector top-1      -> {out['selector_top1'].tolist()}")
+    return out
+
 
 CONFIG = {
     "architectures": ["DFlash2DraftModel"],
@@ -144,9 +211,15 @@ def scale_weights(rng):
     w["fc.weight"] = normal((H, len(TARGETS) * H))
     w["hidden_norm.weight"] = norm_w((H,))
     w["norm.weight"] = norm_w((H,))
-    w["candidate_selector.hidden_projection.weight"] = normal((RANK, H))
-    w["candidate_selector.predecessor_codebook"] = normal((VOCAB, RANK))
-    w["candidate_selector.successor_codebook"] = normal((VOCAB, RANK))
+    # The selector's three tensors are drawn wider than the rest. Their product
+    # is a rank-RANK triple product, so at the trunk's 0.05 the pairwise term
+    # lands around 0.009 -- below one bf16 place at any logit scale that leaves
+    # the candidate set unambiguous, which would make a bf16 reference case for
+    # the selector unable to separate anything. The draw consumes the same
+    # stream either way, so every other tensor here is unchanged by this scale.
+    w["candidate_selector.hidden_projection.weight"] = normal((RANK, H), SELECTOR_WEIGHT_SCALE)
+    w["candidate_selector.predecessor_codebook"] = normal((VOCAB, RANK), SELECTOR_WEIGHT_SCALE)
+    w["candidate_selector.successor_codebook"] = normal((VOCAB, RANK), SELECTOR_WEIGHT_SCALE)
     groups = H // GROUP
     for i in range(LAYERS):
         p = f"layers.{i}"
@@ -228,6 +301,23 @@ def build_scale(model_mlx):
         mx.eval(hidden)
         out[f"hidden_{name}"] = hidden
         print(f"{name}: window {window}, ctx {ctx.shape[1]}, offset {offset} -> {hidden.shape}")
+
+    selector_model = model_mlx.DFlash2DraftModel(scale_config(model_mlx, 64))
+    selector_model.eval()
+    selector_model.load_weights(list(loadable.items()))
+    mx.eval(selector_model.parameters())
+    print("selector, over the `wide` case's hidden states:")
+    out.update(
+        selector_case(
+            selector_model,
+            out["hidden_wide"],
+            TOPK + 2,
+            SCALE_SELECTOR_STEP,
+            SCALE_ANCHORS,
+            VOCAB,
+        )
+    )
+
     mx.save_safetensors(str(HERE / "reference.safetensors"), out)
     print("wrote", HERE / "reference.safetensors")
 
@@ -300,8 +390,23 @@ def build_published(model_mlx):
     mx.eval(hidden)
     f = hidden.astype(mx.float32)
     print("hidden", hidden.shape, "absmax", float(mx.max(mx.abs(f))))
+    saved = {"hidden": hidden}
+    print("selector, over that block's drafted positions:")
+    saved.update(
+        selector_case(
+            model,
+            hidden,
+            config.selector_top_k + 4,
+            PUBLISHED_SELECTOR_STEP,
+            PUBLISHED_ANCHORS,
+            config.vocab_size,
+        )
+    )
+    # The stand-in logits are rebuilt on the Rust side from the same arithmetic;
+    # a vocabulary-wide array is not a thing to commit.
+    del saved["selector_logits"]
     out = HERE.parent / "dflash2_published_reference.safetensors"
-    mx.save_safetensors(str(out), {"hidden": hidden})
+    mx.save_safetensors(str(out), saved)
     print("wrote", out)
 
 
