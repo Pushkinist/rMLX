@@ -73,7 +73,9 @@ vocabulary by the norm's weight vector for every caller handing it a raw capture
 notice, and neither was visible to the 48-token prefix checks the alignment
 suites run. `crates/rmlx-models/tests/spec_greedy_equivalence.rs` is the gate that
 found them, over 256 generated tokens; `docs/SPEC_ANSWER_EQUIVALENCE.md` is its
-reference.
+reference. It carries a pair for six of the seven round loops below; the seventh
+is the two-model stochastic one, which runs only above temperature 0 and so has
+no arm this gate can compare.
 
 ```text
 # Initialisation
@@ -703,8 +705,15 @@ in `runs.db` under `decode_config = two_model/block=5`: `gemma-4-e4b-it-mxfp8`
 drafted by `gemma-4-e2b-it-mxfp8` runs at 72.95 TPS against 83.12 with no
 drafter (accept rate 0.66, 3.56 tokens/round); `Qwen3.8-27B-mxfp8` drafted by
 `ornith-1.0-9b-mxfp8-mlx` at 10.71 against 18.89 (accept rate 0.36, 51.5 ms of
-rollback per round on the GDN pair). Neither pair pays at this block; both
-reproduce the no-drafter arm's text.
+rollback per round on the GDN pair). Neither pair pays at this block.
+
+Both were byte-identical to the no-drafter arm at 128 tokens, which is a weaker
+statement than it reads as: no correct speculative arm on this engine is
+byte-identical to plain greedy in general, so byte-equality is evidence and not a
+test. The GDN pair is now in the answer-equivalence gate
+(`the_two_model_round_loop_reproduces_plain_greedy`), which judges it over 256
+tokens and six prompts by where the arms first differ; it agrees on the five it
+judges, three of them bit-identical. See `docs/SPEC_ANSWER_EQUIVALENCE.md`.
 
 ### Gemma4 Assistant Drafter
 

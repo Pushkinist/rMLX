@@ -107,11 +107,11 @@ thresholded at all.
 Unlike the three above, its **assistant pair resolves both halves by slug** from
 `RMLX_O_MODELS_ROOT`, so `make gpu-test` runs that pair on a machine holding the
 snapshots and `run_gpu_tests.sh` reports a machine without them as INCOMPLETE.
-The recurrent and block pairs are the exceptions and are not gated: their
+The other five pairs are the exceptions and are not gated: their
 drafter comes from `RMLX_DRAFT_TEST_MODEL` or the pair does not run, because
 their verifiers' quantized matmuls trip the shader-validation census (see the
 table below and `docs/SPEC_ANSWER_EQUIVALENCE.md`). That one variable names one
-drafter, so the pair whose loop does not drive the kind that snapshot declares
+drafter, so a pair whose loop does not drive the kind that snapshot declares
 stands down naming both. Its drafter resolution does not go through
 `slug_snapshot` either, for the tokenizer reason above.
 The verifier goes through the golden harness's own resolver
@@ -120,29 +120,36 @@ The verifier goes through the golden harness's own resolver
 harness's arch stand-down cannot separate them: the drafter's
 `backbone_hidden_size` is checked against the verifier's width before the drafter
 is loaded, and a mismatched pair skips with that reason rather than panicking in
-the loader.
+the loader. The two-model pair has the same problem in a different form —
+`two_model` is inferred from the architecture registry, which every full model
+satisfies — and the declared vocabulary is what separates those.
 
 | Pair | verifier | drafter | selected by |
 |---|---|---|---|
 | assistant | `mlx-community__gemma-4-e2b-it-mxfp8` | `mlx-community__gemma-4-E2B-it-assistant-bf16` | slug |
 | recurrent | `mlx-community__Qwen3.8-27B-mxfp8` | `mlx-community__Qwen3.8-27B-MTP-mxfp8` | `RMLX_DRAFT_TEST_MODEL` only |
+| block | `mlx-community__Qwen3.8-27B-4bit` | `z-lab__Qwen3.8-27B-DFlash2` | `RMLX_DRAFT_TEST_MODEL` only |
+| adaptive | `mlx-community__Qwen3.6-35B-A3B-8bit` | `z-lab__Qwen3.6-35B-A3B-DFlash` | `RMLX_DRAFT_TEST_MODEL` only |
+| restricted-vocabulary | `mlx-community__Qwen3.6-35B-A3B-8bit` | `Dogacel__specdrift-qwen3.6-35b-a3b-eagle3` | `RMLX_DRAFT_TEST_MODEL` only |
+| two-model | `mlx-community__Qwen3.8-27B-mxfp8` | `sahilchachra__ornith-1.0-9b-mxfp8-mlx` | `RMLX_DRAFT_TEST_MODEL` only |
 
 The assistant pair produces **zero** Metal shader-validation hits and so has no
-entry in `scripts/gpu_validation_census.txt` and needs none. The recurrent pair's
-verifier drives MLX's mxfp8 quantized matmul and a narrowed run reports 1344
-invalid loads from it — the same `load_safe` bound the census already records for
-the affine instantiation, in a kernel this repo does not compile. The census pins
-one exact count per test and a count from a 256-token generation is not stable
-across a prompt change, so that pair is named rather than slug-resolved and
-`make gpu-test` reports it as skipped. See `docs/SPEC_ANSWER_EQUIVALENCE.md`.
+entry in `scripts/gpu_validation_census.txt` and needs none. The other pairs'
+verifiers drive MLX's mxfp8 or affine quantized matmul and a narrowed run reports
+1344 invalid loads from it — the same `load_safe` bound the census already records
+for the affine instantiation, in a kernel this repo does not compile. The census
+pins one exact count per test and a count from a 256-token generation is not
+stable across a prompt change, so those pairs are named rather than slug-resolved
+and `make gpu-test` reports them as skipped. See
+`docs/SPEC_ANSWER_EQUIVALENCE.md`.
 
 `dflash_drafter_alignment.rs` is **not** one of those three and does not gate the
 same property. It asserts that the drafter's round-0 first-block proposal aligns
 with the verifier's greedy continuation (`accept > 0`) and that the live loop
 emits coherent prose — a round-0 check, taken before any partial-accept rollback
 has happened. It cannot see a rollback that corrupts the verifier state part-way
-through a run, which is what the three suites above exist to catch. DFlash on a
-GDN hybrid therefore has no greedy-tracking gate.
+through a run. What does, for DFlash 1 on a GDN hybrid, is
+`the_adaptive_round_loop_reproduces_plain_greedy` in `spec_greedy_equivalence.rs`.
 
 The Whisper audio integration tests (`crates/rmlx-audio/tests/transcribe.rs`)
 deliberately use **no** dedicated env var — they resolve the
