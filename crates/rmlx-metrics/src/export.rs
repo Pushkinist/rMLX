@@ -346,15 +346,17 @@ fn render_speculative_table(all: &[BestRow]) -> String {
             backend_display(backend),
             kv_quant_display(kv_quant)
         );
+        let mut rendered: Vec<(&str, &BestRow)> = Vec::new();
         for col in SPEC_METRIC_COLUMNS {
             match metric_map.get(col.db_name) {
                 Some(r) => {
                     let _ = write!(row, "| {} ", fmt_value(r.value, col.decimals));
+                    rendered.push((col.db_name, r));
                 }
                 None => row.push_str("| - "),
             }
         }
-        let _ = writeln!(row, "| {} |", updated_summary(metric_map));
+        let _ = writeln!(row, "| {} |", updated_summary(&rendered));
         out.push_str(&row);
     }
     out.push('\n');
@@ -571,10 +573,12 @@ fn render_model_table(
             .reduce(f64::min);
 
         let mut row = format!("| {backend_label} | {kv_label} | {decode_label} ");
+        let mut rendered: Vec<(&str, &BestRow)> = Vec::new();
         for col in METRIC_COLUMNS {
             match metric_map.get(col.db_name) {
                 Some(r) => {
                     let _ = write!(row, "| {} ", fmt_value(r.value, col.decimals));
+                    rendered.push((col.db_name, r));
                     *total_cells += 1;
                 }
                 None => row.push_str("| - "),
@@ -582,7 +586,7 @@ fn render_model_table(
         }
         let _ = write!(row, "| {} ", fmt_kv_gb(kv_bytes_quant));
         let _ = write!(row, "| {} ", fmt_reduction(kv_bytes_quant, kv_bytes_bf16));
-        let _ = writeln!(row, "| {} |", updated_summary(metric_map));
+        let _ = writeln!(row, "| {} |", updated_summary(&rendered));
         out.push_str(&row);
     }
 
@@ -617,23 +621,47 @@ fn best_of(existing: &BestRow, candidate: &BestRow) -> bool {
     }
 }
 
-/// Pick the most recent ts_utc + run_id + (truncated) notes among the cell's metrics.
-fn updated_summary(metric_map: &BTreeMap<String, &BestRow>) -> String {
-    let mut newest: Option<&BestRow> = None;
-    for r in metric_map.values() {
-        match newest {
-            None => newest = Some(r),
-            Some(n) if r.ts_utc > n.ts_utc => newest = Some(r),
-            _ => {}
+/// Provenance for the metric columns of one row: the runs that produced the
+/// values printed beside it.
+///
+/// Every metric column is resolved against `bests` on its own, so two columns
+/// of one row can come from two runs. When they do there is no single run to
+/// name, and the cell says so and names each run beside the columns it backs —
+/// picking one of them would put a run id and its notes next to a number that
+/// run does not contain, which reads as provenance and is not.
+///
+/// Scope is the metric columns, and the caller passes exactly the ones it
+/// printed. `KV GB` and `reduction vs bf16` are minima over every matching
+/// cell and back to no single observation, so they are not represented here.
+///
+/// `rendered` is in column order; runs appear in the order their first column
+/// does.
+fn updated_summary(rendered: &[(&str, &BestRow)]) -> String {
+    let mut runs: Vec<(&BestRow, Vec<&str>)> = Vec::new();
+    for (metric, row) in rendered {
+        match runs.iter_mut().find(|(seen, _)| seen.run_id == row.run_id) {
+            Some((_, metrics)) => metrics.push(metric),
+            None => runs.push((row, vec![metric])),
         }
     }
-    let Some(r) = newest else {
-        return "-".into();
+
+    let [(row, _)] = runs.as_slice() else {
+        if runs.is_empty() {
+            return "-".into();
+        }
+        let mut out = String::from("no single run —");
+        for (i, (row, metrics)) in runs.iter().enumerate() {
+            let sep = if i == 0 { " " } else { ", " };
+            // write!(String) is infallible — let _ discards the unit Ok.
+            let _ = write!(out, "{sep}`{}` ({})", row.run_id, metrics.join(", "));
+        }
+        return out;
     };
-    let date = r.ts_utc.split('T').next().unwrap_or(&r.ts_utc);
-    let run = &r.run_id;
+
+    let date = row.ts_utc.split('T').next().unwrap_or(&row.ts_utc);
+    let run = &row.run_id;
     let mut note_part = String::new();
-    if let Some(n) = r.notes.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(n) = row.notes.as_deref().filter(|s| !s.is_empty()) {
         // `legacy_run_key=...` is migration bookkeeping; skip those notes.
         if !n.starts_with("legacy_run_key=") {
             let snippet: String = n.chars().take(80).collect();

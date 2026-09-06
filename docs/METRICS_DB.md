@@ -1733,9 +1733,33 @@ This:
 1. Queries `bests` for the canonical 5-model × N-KV grid.
 2. Renders cells per the existing layout in `BENCHMARK_CHAMPIONS.md`.
 3. Marks unsupported cells `N/A`, broken-output cells `x` (manual flag in `description`).
-4. Footer lines list the run_id + git_sha behind each champion cell.
+4. Names, in each row's `Updated` column, the run behind that row's metric columns.
 
 The hand-edit rule remains: if you didn't run a bench, don't touch the file. Now: if you didn't UPSERT a strictly-better row, the file won't change.
+
+### 9.1 What the `Updated` column means
+
+Every metric column of a row is a separate `bests` lookup — one partition per
+cell **and metric** (§3.3) — so a row's decode record and its memory record can
+come from two runs, and often do once a cell has been measured more than once.
+The column therefore reports provenance for the metric columns and nothing
+else:
+
+- **One run behind all of them** — its date, its `run_id` and its notes.
+- **More than one** — `no single run —` followed by each `run_id` and the
+  columns it backs. There is no single run to name and the column says so;
+  naming the newest, or any other one of them, would put a run id and its notes
+  beside numbers that run does not contain, which reads as provenance and is
+  not.
+- **No metric column printed at all** — `-`.
+
+`git_sha` is not in this column. It reaches `--csv`, `--json` and `--jsonl`,
+which emit one record per champion row and so carry it per value; from a
+markdown row, `run_id` is the key to look it up in `observations`.
+
+`KV GB` and `reduction vs bf16` are outside the column's scope. Both are minima
+over every cell matching the model, across backends and prompts, and back to no
+single observation.
 
 ---
 

@@ -1020,3 +1020,278 @@ fn a_database_with_no_drafter_renders_no_speculative_section() {
     let md = export_markdown(&conn, None).unwrap();
     assert!(!md.contains("## Speculative decoding"), "{md}");
 }
+
+// ── Row provenance ───────────────────────────────────────────────────────────
+
+/// One run in a fixed cell, with its own timestamp, notes and metric set.
+/// Returns the minted run id, so a test can name the run it expects a row to
+/// point at rather than matching a substring of the table.
+fn seed_run(
+    conn: &mut Connection,
+    ts_utc: &str,
+    notes: &str,
+    decode_config: Option<&str>,
+    metrics: &[(&str, f64)],
+) -> String {
+    let mut rec = Recorder::new(conn, "test@0.0.1");
+    let run = RunRecord {
+        schema_version: crate::ingest::RECORD_SCHEMA_VERSION,
+        backend: "rmlx".into(),
+        backend_version: Some("0.4.1".into()),
+        model_namespace: "mlx-community".into(),
+        model: "Qwen3.8-27B-mxfp8".into(),
+        weight_quant: "mxfp8".into(),
+        kv_quant: "none".into(),
+        ctx_max: 16384,
+        prompt: PromptRef::ByBody {
+            name: "p".into(),
+            body: json!("x"),
+            notes: None,
+            tokens_approx: Some(1),
+        },
+        ts_utc: ts_utc.into(),
+        git_sha: None,
+        build_profile: None,
+        hardware_tag: "m5_max_128gb".into(),
+        prompt_tokens: None,
+        max_tokens: None,
+        temperature: Some(0.0),
+        seed: None,
+        n_warmups: None,
+        n_measure: None,
+        output_first_64: None,
+        notes: Some(notes.into()),
+        description: None,
+        decode_config: decode_config.map(ToOwned::to_owned),
+        metrics: metrics
+            .iter()
+            .map(|(name, value)| MetricEntry {
+                name: (*name).to_owned(),
+                value: Some(*value),
+                stddev: None,
+            })
+            .collect(),
+    };
+    rec.record_run(&run).unwrap().run_id
+}
+
+/// What "the newest metric in the cell" answers for `decode_config` — the rule
+/// the `Updated` column used to follow.
+///
+/// The provenance fixtures assert this is *not* the run they expect to read.
+/// A fixture where the two rules agree cannot tell them apart, and would pass
+/// against the behaviour it exists to reject.
+fn newest_run_in_cell(conn: &Connection, decode_config: Option<&str>) -> String {
+    let mut newest: Option<BestRow> = None;
+    for r in all_bests(conn).unwrap() {
+        if r.cell.decode_config.as_deref() != decode_config {
+            continue;
+        }
+        match &newest {
+            Some(n) if n.ts_utc >= r.ts_utc => {}
+            _ => newest = Some(r),
+        }
+    }
+    newest.expect("the cell holds at least one champion").run_id
+}
+
+/// The `Records` half of the table — everything before the speculative section.
+fn records_section(md: &str) -> &str {
+    md.split("## Speculative decoding")
+        .next()
+        .expect("split yields at least one part")
+}
+
+fn row_containing<'a>(section: &'a str, needle: &str) -> &'a str {
+    section
+        .lines()
+        .find(|l| l.starts_with("| rmlx ") && l.contains(needle))
+        .unwrap_or_else(|| panic!("no row matching {needle} in:\n{section}"))
+}
+
+/// A row names the run behind its own values, and a later run in the same cell
+/// backing none of them does not displace it.
+///
+/// The later run here records `accept_rate`, which this table has no column
+/// for: its id and its notes reached the `Updated` cell of a row it contributed
+/// no printed number to.
+#[test]
+fn a_row_names_the_run_behind_its_values_not_the_newest_in_the_cell() {
+    let mut conn = test_conn();
+    let arm = Some("mtp/block=3");
+    let measured = seed_run(
+        &mut conn,
+        "2026-09-01T10:00:00Z",
+        "code prompt, 200 tokens",
+        arm,
+        &[("decode_tps_warm", 38.73), ("peak_rss_mb", 9000.0)],
+    );
+    let later = seed_run(
+        &mut conn,
+        "2026-09-04T10:00:00Z",
+        "accept-rate sweep",
+        arm,
+        &[("accept_rate", 0.91)],
+    );
+
+    // The fixture separates the two rules: the newest run in the cell is not
+    // the run behind the row's values.
+    assert_ne!(measured, later);
+    assert_eq!(newest_run_in_cell(&conn, arm), later);
+
+    let md = export_markdown(&conn, None).unwrap();
+    let row = row_containing(records_section(&md), "mtp/block=3");
+
+    assert!(row.contains("38.73"), "{row}");
+    assert!(
+        row.contains(&format!("`{measured}`")),
+        "the row does not name the run that produced its values: {row}"
+    );
+    assert!(
+        !row.contains(&later),
+        "the row carries the newest run in the cell instead: {row}"
+    );
+    assert!(row.contains("code prompt, 200 tokens"), "{row}");
+    assert!(
+        !row.contains("accept-rate sweep"),
+        "the row borrowed a note from a run none of its numbers came from: {row}"
+    );
+}
+
+/// Two runs, one row: the decode record is one run's and the memory record the
+/// other's, so no single run produced the row. The column says so and names
+/// both beside the columns they back, rather than taking whichever landed later
+/// and putting its notes next to a number it does not contain.
+#[test]
+fn a_row_built_from_two_runs_says_it_has_no_single_run() {
+    let mut conn = test_conn();
+    let fast = seed_run(
+        &mut conn,
+        "2026-09-01T10:00:00Z",
+        "code prompt, 200 tokens",
+        None,
+        &[("decode_tps_warm", 38.73), ("peak_rss_mb", 9000.0)],
+    );
+    let lean = seed_run(
+        &mut conn,
+        "2026-09-04T10:00:00Z",
+        "prose prompt, 200 tokens",
+        None,
+        &[("decode_tps_warm", 33.67), ("peak_rss_mb", 8000.0)],
+    );
+
+    // Distinguishing: the newest run backs one printed column and not the other.
+    assert_eq!(newest_run_in_cell(&conn, None), lean);
+
+    let md = export_markdown(&conn, None).unwrap();
+    let row = row_containing(records_section(&md), "| plain ");
+
+    assert!(row.contains("38.73"), "{row}");
+    assert!(row.contains("8000"), "{row}");
+    assert!(
+        row.contains("no single run"),
+        "a row blended from two runs claims one: {row}"
+    );
+    assert!(
+        row.contains(&format!("`{fast}` (decode_tps_warm)")),
+        "{row}"
+    );
+    assert!(row.contains(&format!("`{lean}` (peak_rss_mb)")), "{row}");
+    assert!(
+        !row.contains("prompt, 200 tokens"),
+        "a note belongs to one run and this row has two: {row}"
+    );
+}
+
+/// The speculative table resolves its columns the same way and needs the same
+/// rule — a fix applied to one renderer and not the other fails here.
+#[test]
+fn the_speculative_row_names_the_runs_behind_its_round_figures() {
+    let mut conn = test_conn();
+    let arm = Some("mtp/block=3");
+    let fast = seed_run(
+        &mut conn,
+        "2026-09-01T10:00:00Z",
+        "code prompt, 200 tokens",
+        arm,
+        &[("decode_tps_warm", 38.73)],
+    );
+    let accepting = seed_run(
+        &mut conn,
+        "2026-09-04T10:00:00Z",
+        "prose prompt, 200 tokens",
+        arm,
+        &[("decode_tps_warm", 33.67), ("accept_rate", 0.91)],
+    );
+
+    assert_eq!(newest_run_in_cell(&conn, arm), accepting);
+
+    let md = export_markdown(&conn, None).unwrap();
+    let section = md
+        .split("## Speculative decoding")
+        .nth(1)
+        .expect("section present");
+    let row = section
+        .lines()
+        .find(|l| l.contains("mtp/block=3"))
+        .expect("the arm's row");
+
+    assert!(row.contains("38.73"), "{row}");
+    assert!(row.contains("0.910"), "{row}");
+    assert!(row.contains("no single run"), "{row}");
+    assert!(
+        row.contains(&format!("`{fast}` (decode_tps_warm)")),
+        "{row}"
+    );
+    assert!(
+        row.contains(&format!("`{accepting}` (accept_rate)")),
+        "{row}"
+    );
+}
+
+/// The ordinary case is unchanged: one run behind every printed value keeps the
+/// date, the run id and that run's notes.
+#[test]
+fn a_row_from_one_run_still_shows_its_date_and_notes() {
+    let mut conn = test_conn();
+    let only = seed_run(
+        &mut conn,
+        "2026-09-01T10:00:00Z",
+        "code prompt, 200 tokens",
+        None,
+        &[("decode_tps_warm", 38.73), ("peak_rss_mb", 9000.0)],
+    );
+
+    let md = export_markdown(&conn, None).unwrap();
+    let row = row_containing(records_section(&md), "| plain ");
+
+    assert!(
+        row.contains(&format!("2026-09-01 `{only}` — code prompt, 200 tokens")),
+        "{row}"
+    );
+    assert!(!row.contains("no single run"), "{row}");
+}
+
+/// A row printing no metric column of its own has no provenance to show, and
+/// says nothing rather than reaching for a run in the cell that backs a column
+/// the row does not print.
+#[test]
+fn a_row_with_no_printed_metric_shows_no_run() {
+    let mut conn = test_conn();
+    let sweep = seed_run(
+        &mut conn,
+        "2026-09-01T10:00:00Z",
+        "accept-rate sweep",
+        Some("mtp/block=3"),
+        &[("accept_rate", 0.91)],
+    );
+
+    let md = export_markdown(&conn, None).unwrap();
+    let row = row_containing(records_section(&md), "mtp/block=3");
+
+    assert!(
+        !row.contains(&sweep),
+        "a row printing none of the run's metrics still names it: {row}"
+    );
+    assert!(row.trim_end().ends_with("| - |"), "{row}");
+}
