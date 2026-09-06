@@ -364,7 +364,11 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
 
     WARMUP_PAYLOAD="$(head -1 "${CELL_INDEX}" | cut -f6)"
     for (( w = 0; w < WARMUPS_PER_PASS; w++ )); do
-        send "${WARMUP_PAYLOAD}" "${WORK}/warmup.kv" || true
+        if ! send "${WARMUP_PAYLOAD}" "${WORK}/warmup.kv"; then
+            echo "ERROR: pass ${pass}: the warmup request failed" >&2
+            kill "${SERVER_PID}" 2>/dev/null || true
+            exit 1
+        fi
         echo "  [warmup] done" >&2
     done
 
@@ -376,8 +380,8 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
     while IFS=$'\t' read -r cell dataset max_tokens sample_id body_sha payload; do
         kv="${PASS_DIR}/$(printf '%05d' "${n}").kv"
         if ! send "${payload}" "${kv}"; then
-            echo "ERROR: pass ${pass} ${cell}/${sample_id}: the response carried no" \
-                 "measurable decode window" >&2
+            echo "ERROR: pass ${pass} ${cell}/${sample_id}: the request failed or its" \
+                 "response could not be read" >&2
             kill "${SERVER_PID}" 2>/dev/null || true
             exit 1
         fi
@@ -394,11 +398,13 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
     snapshot_ok "${WORK}/pass${pass}_b" || true
     WINDOW="$(host_window "${WORK}/pass${pass}_a" "${WORK}/pass${pass}_b" "${PASS_SECONDS}")"
     HOST_WINDOWS+=("${WINDOW}")
-    [[ "${WINDOW%% *}" == "busy" ]] && note_taint "pass ${pass}: ${WINDOW}"
+    if [[ "${WINDOW%% *}" == "busy" ]]; then
+        note_taint "pass ${pass}: ${WINDOW}"
+    fi
 
     kill "${SERVER_PID}" 2>/dev/null || true
     wait "${SERVER_PID}" 2>/dev/null || true
-    sleep 3
+    sleep 3  # let the run log flush before it is read
 
     PASS_LOG="$(phase_log "${SERVER_PID}")" || PASS_LOG=""
     if [[ -z "${PASS_LOG}" ]]; then
@@ -452,9 +458,11 @@ HOST_WINDOWS="$(printf '%s\n' "${HOST_WINDOWS[@]}")" \
 python3 - > "${META}" <<'PY'
 import json, os
 
+synthetic = os.environ["SYNTHETIC_ARMS"] == "true"
+
 print(json.dumps({
     **json.loads(os.environ["RMLX_IDENTITY_JSON"]),
-    "synthetic_arms": os.environ["SYNTHETIC_ARMS"] == "true",
+    "synthetic_arms": synthetic,
     "arm": os.environ["ARM"],
     "model_namespace": os.environ["MODEL_NAMESPACE"],
     "model": os.environ["MODEL_NAME"],
@@ -469,9 +477,9 @@ print(json.dumps({
         "seed": None,
         "thinking": "on, counted as output",
     },
+    # A run that consulted nothing files no reading taken off this machine.
     "host": {
-        "pass_windows": os.environ["HOST_WINDOWS"].split("\n") if not
-        os.environ["SYNTHETIC_ARMS"] == "true" else [],
+        "pass_windows": [] if synthetic else os.environ["HOST_WINDOWS"].split("\n"),
         "taint": os.environ["TAINT"],
     },
 }))

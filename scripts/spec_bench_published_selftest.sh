@@ -123,7 +123,10 @@ printf '%s\n' '{"temperature": 0.6}' >"${HALF_DEFAULTS}/generation_config.json"
 SHIMS="${WORK}/shims"
 mkdir -p "${SHIMS}"
 printf '#!/bin/sh\nexit 0\n' >"${SHIMS}/pkill"
-printf '#!/bin/sh\nexit 0\n' >"${SHIMS}/sleep"
+# Not a no-op: the harness starts a fresh server on the same port every pass and
+# its own 3 s settle is what keeps the next bind off the previous listener. 50 ms
+# keeps that ordering while costing the suite seconds rather than minutes.
+printf '#!/bin/sh\nexec /bin/sleep 0.05\n' >"${SHIMS}/sleep"
 cat >"${SHIMS}/rm" <<'RMEOF'
 #!/bin/sh
 for a in "$@"; do
