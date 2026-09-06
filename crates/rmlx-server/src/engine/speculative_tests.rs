@@ -7,8 +7,8 @@
 //! `text_config missing num_experts` error).
 
 use super::{
-    classify_mtp_draft, decide_draft_kind, drafted_per_round, mtp_reject_reason, round_block,
-    MtpDraftFamily, DEFAULT_DRAFT_BLOCK_SIZE, MIN_DRAFT_BLOCK_SIZE,
+    classify_mtp_draft, decide_draft_kind, dflash2_reject_reason, drafted_per_round,
+    mtp_reject_reason, round_block, MtpDraftFamily, DEFAULT_DRAFT_BLOCK_SIZE, MIN_DRAFT_BLOCK_SIZE,
 };
 use rmlx_models::{Declared, DraftKind};
 
@@ -18,7 +18,12 @@ use rmlx_models::{Declared, DraftKind};
 /// `--draft-model` run, for every kind, including the two-model one.
 #[test]
 fn a_declaration_alone_selects_the_kind() {
-    for kind in [DraftKind::Mtp, DraftKind::DFlash, DraftKind::Eagle3] {
+    for kind in [
+        DraftKind::Mtp,
+        DraftKind::DFlash,
+        DraftKind::DFlash2,
+        DraftKind::Eagle3,
+    ] {
         let declared = Declared::Sidecar(kind);
         assert_eq!(
             decide_draft_kind(None, declared, "arch", "type").ok(),
@@ -117,7 +122,7 @@ fn the_flag_outranks_the_registry_inference() {
 #[test]
 fn a_sidecar_flag_over_a_full_model_is_refused() {
     let declared = Declared::from_snapshot("Gemma4ForConditionalGeneration", "gemma4");
-    for kind in [DraftKind::Eagle3, DraftKind::DFlash] {
+    for kind in [DraftKind::Eagle3, DraftKind::DFlash, DraftKind::DFlash2] {
         let msg = decide_draft_kind(
             Some(kind),
             declared,
@@ -275,5 +280,61 @@ fn non_gemma_reject_reason_is_generic_and_clean() {
     assert!(
         !reason.contains("num_experts"),
         "reason must not leak the Qwen3.5 loader error: {reason}"
+    );
+}
+
+// ── DFlash generations ───────────────────────────────────────────────────────
+
+/// The two DFlash checkpoints route to their own loaders, and neither flag
+/// takes the other's snapshot.
+///
+/// `DFlash2DraftModel` contains `DFlash`, so a declaration rule that read the
+/// older marker first would send every DFlash 2 snapshot to the DFlash 1
+/// loader — which builds a different architecture out of the 58 tensors it
+/// recognises and records the accept rate under this checkpoint's name.
+#[test]
+fn the_two_dflash_generations_do_not_take_each_other() {
+    let one = Declared::from_snapshot("DFlashDraftModel", "qwen3");
+    let two = Declared::from_snapshot("DFlash2DraftModel", "qwen3");
+    assert_eq!(one, Declared::Sidecar(DraftKind::DFlash));
+    assert_eq!(two, Declared::Sidecar(DraftKind::DFlash2));
+
+    for (declared, arch, flag) in [
+        (two, "DFlash2DraftModel", DraftKind::DFlash),
+        (one, "DFlashDraftModel", DraftKind::DFlash2),
+    ] {
+        let msg = decide_draft_kind(Some(flag), declared, arch, "qwen3")
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
+        assert!(
+            msg.contains(&format!("--draft-kind {flag}")),
+            "names the flag: {msg}"
+        );
+        assert!(msg.contains(arch), "names the snapshot's own words: {msg}");
+    }
+}
+
+/// The DFlash 2 refusal states the gap and closes the route a reader would try
+/// next. Naming the checkpoint is not enough: `--draft-kind dflash` would load
+/// it, and the row it wrote could not afterwards be told from the real
+/// drafter's.
+#[test]
+fn the_dflash2_reject_reason_closes_the_dflash_1_route() {
+    let reason = dflash2_reject_reason("DFlash2DraftModel");
+    assert!(
+        reason.contains("DFlash2DraftModel"),
+        "names the snapshot: {reason}"
+    );
+    assert!(
+        reason.contains("not implemented"),
+        "states the gap rather than implying a bad checkpoint: {reason}"
+    );
+    assert!(
+        reason.contains("--draft-kind dflash"),
+        "closes the route a reader tries next: {reason}"
+    );
+    assert!(
+        reason.contains("--draft-model"),
+        "names the way out: {reason}"
     );
 }

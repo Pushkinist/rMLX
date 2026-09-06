@@ -56,11 +56,12 @@ runs by default. Closing it needs either the census analysis extended to this
 kernel and model, or a stable count — neither of which this change is the place
 for.
 
-**Three of the five round loops are outside the gate entirely.** It covers the
-Gemma4 assistant loop and the Qwen3.5-family MTP sidecar loop. The DFlash,
-EAGLE-3 and two-model loops have no pair here, and the property is not
+**Three of the round loops that exist are outside the gate entirely.** It
+covers the Gemma4 assistant loop and the Qwen3.5-family MTP sidecar loop. The
+DFlash, EAGLE-3 and two-model loops have no pair here, and the property is not
 transitive across loops — each one has its own rollback and its own acceptance
-walk, which is what the gate reads.
+walk, which is what the gate reads. (DFlash 2 is a fifth drafter kind with no
+round loop yet, so it has nothing to cover.)
 
 That boundary is not hypothetical. Served at temperature 0 on the code prompt,
 `Qwen3.8-27B-4bit` drafted by `z-lab/Qwen3.8-27B-DFlash2` at block 8 diverged
@@ -74,11 +75,11 @@ uncovered. That the drafter was also being loaded as an earlier architecture tha
 the checkpoint (see `docs/SPECULATIVE.md` § Qwen3.8-27B-4bit) does not explain
 it.
 
-That pair no longer loads: the DFlash loader refuses a snapshot it only half
-reads, for a metrics-attribution reason unrelated to this. Reproducing the
-divergence on it means lifting that refusal. `z-lab/Qwen3.6-35B-A3B-DFlash` reads
-every tensor it ships, loads, and drives the same round loop — it is the pair a
-DFlash case here would be built on.
+That pair no longer runs, for a reason unrelated to this: the checkpoint
+declares itself a DFlash 2 drafter and is routed to its own loader, whose
+forward is not implemented. `z-lab/Qwen3.6-35B-A3B-DFlash` reads every tensor it
+ships, loads, and drives the same round loop — it is the pair a DFlash case here
+would be built on.
 
 ## The oracle: where a correct pair diverges
 

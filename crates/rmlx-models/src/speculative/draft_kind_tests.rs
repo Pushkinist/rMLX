@@ -17,7 +17,11 @@ fn shipped_declarations_resolve_to_their_loader() {
         // Qwen3.5-family MTP sidecar: model_type only, no architectures array.
         ("", "qwen3_5_mtp", Declared::Sidecar(DraftKind::Mtp)),
         // DFlash and DFlash2 declare a plain `qwen3` model type under the head's
-        // own architecture name, so the architecture must be read first.
+        // own architecture name, so the architecture must be read first. The two
+        // are separate kinds and neither loader can build the other's
+        // checkpoint: `DFlash2DraftModel` also contains `DFlash`, so a rule that
+        // read the older marker first would send every DFlash 2 snapshot to the
+        // DFlash 1 loader.
         (
             "DFlashDraftModel",
             "qwen3",
@@ -26,7 +30,7 @@ fn shipped_declarations_resolve_to_their_loader() {
         (
             "DFlash2DraftModel",
             "qwen3",
-            Declared::Sidecar(DraftKind::DFlash),
+            Declared::Sidecar(DraftKind::DFlash2),
         ),
         // EAGLE-3 declares `llama` as its model type for the same reason.
         (
@@ -91,7 +95,11 @@ fn every_kind_is_in_all_once() {
     // The count is a match, so a new variant does not compile until it is
     // counted here, and then `ALL` must grow to match.
     let count = match DraftKind::Mtp {
-        DraftKind::Mtp | DraftKind::DFlash | DraftKind::Eagle3 | DraftKind::TwoModel => 4,
+        DraftKind::Mtp
+        | DraftKind::DFlash
+        | DraftKind::DFlash2
+        | DraftKind::Eagle3
+        | DraftKind::TwoModel => 5,
     };
     assert_eq!(DraftKind::ALL.len(), count, "a kind is missing from ALL");
     for (i, kind) in DraftKind::ALL.iter().enumerate() {

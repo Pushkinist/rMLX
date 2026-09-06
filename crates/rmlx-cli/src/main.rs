@@ -67,6 +67,9 @@ enum DraftKindArg {
     /// Draft-Flash attention-based draft head.
     #[value(name = "dflash")]
     DFlash,
+    /// Draft-Flash 2: dynamic convolutions plus a candidate-path selector.
+    #[value(name = "dflash2")]
+    DFlash2,
     /// EAGLE-3 speculative drafter.
     Eagle3,
     /// A separate full draft model of the verifier's family.
@@ -79,6 +82,7 @@ impl From<DraftKindArg> for rmlx_models::DraftKind {
         match a {
             DraftKindArg::Mtp => rmlx_models::DraftKind::Mtp,
             DraftKindArg::DFlash => rmlx_models::DraftKind::DFlash,
+            DraftKindArg::DFlash2 => rmlx_models::DraftKind::DFlash2,
             DraftKindArg::Eagle3 => rmlx_models::DraftKind::Eagle3,
             DraftKindArg::TwoModel => rmlx_models::DraftKind::TwoModel,
         }
@@ -622,7 +626,7 @@ enum Cmd {
         /// declare one. Refused when it contradicts what the snapshot declares.
         /// Requires `--draft-model`. Env: `MLX_VLM_DRAFT_KIND`.
         ///
-        /// Values: mtp, dflash, eagle3, two_model
+        /// Values: mtp, dflash, dflash2, eagle3, two_model
         #[arg(long, value_enum, requires = "draft_model", env = "MLX_VLM_DRAFT_KIND")]
         draft_kind: Option<DraftKindArg>,
         /// Speculative round block: tokens the verifier scores per round, its

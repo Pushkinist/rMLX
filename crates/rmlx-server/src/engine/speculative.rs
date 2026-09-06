@@ -95,6 +95,27 @@ fn mtp_reject_reason(arch: &str, model_type: &str) -> String {
     }
 }
 
+/// Build the rejection message for a DFlash 2 draft snapshot.
+///
+/// The loader reads and validates that checkpoint, but the drafter's forward —
+/// a dynamic convolution around each sublayer and a candidate-path selector
+/// over the block — is not implemented, so no round loop can run it. The
+/// message has to close the obvious next move as well as state the gap:
+/// `--draft-kind dflash` builds a different architecture out of the tensors it
+/// recognises, and a run records only the kind and the block, so the accept
+/// rate would be filed under this checkpoint's name with nothing in the row to
+/// say which drafter produced it.
+fn dflash2_reject_reason(arch: &str) -> String {
+    format!(
+        "draft model architecture '{arch}' is a DFlash 2 drafter; rMLX loads and validates \
+         that checkpoint but its drafter forward is not implemented, so no round loop can \
+         run it. Serving it with --draft-kind dflash is refused separately: that loader \
+         builds the earlier DFlash architecture out of the tensors it recognises, and the \
+         accept rate would be recorded under this checkpoint's name. Point --draft-model at \
+         a supported drafter"
+    )
+}
+
 // ── Drafter kind and round block ──────────────────────────────────────────────
 
 /// The round block when `--draft-block-size` is absent: the verifier's own
@@ -167,16 +188,17 @@ fn decide_draft_kind(
         // materialise the whole verifier first and then die on a tensor name.
         // `mtp` is not listed: its own family router refuses a full model
         // before any weight is read.
-        (Some(f @ (DraftKind::Eagle3 | DraftKind::DFlash)), Declared::FullModel) => {
-            Err(Error::SpeculativePairing {
-                reason: format!(
-                    "--draft-kind {f} points at a registered full model (architectures[0] \
+        (
+            Some(f @ (DraftKind::Eagle3 | DraftKind::DFlash | DraftKind::DFlash2)),
+            Declared::FullModel,
+        ) => Err(Error::SpeculativePairing {
+            reason: format!(
+                "--draft-kind {f} points at a registered full model (architectures[0] \
                      {arch:?}, model_type {model_type:?}), which carries no {f} head; point \
                      --draft-model at a {f} sidecar, or drop the flag to run it as a \
                      two_model draft"
-                ),
-            })
-        }
+            ),
+        }),
         (Some(f), Declared::Sidecar(_) | Declared::FullModel | Declared::Unknown) => Ok(f),
         (None, declared) => declared.kind().ok_or_else(|| Error::SpeculativePairing {
             reason: format!(
@@ -379,6 +401,18 @@ impl SpeculativeGenerator {
                     device,
                 )?;
                 (dispatcher, Drafter::DFlash(Arc::new(Mutex::new(drafter))))
+            }
+            // Refused before the verifier is loaded: the alternative is a run
+            // that reads the verifier and the drafter and only then finds it
+            // has no loop to draft with.
+            rmlx_models::DraftKind::DFlash2 => {
+                let reason = dflash2_reject_reason(draft_arch);
+                tracing::error!(
+                    draft = %draft_dir.display(),
+                    arch = draft_arch,
+                    "SpeculativeGenerator: DFlash 2 dispatch — the drafter forward is not implemented"
+                );
+                return Err(Error::SpeculativePairing { reason });
             }
             rmlx_models::DraftKind::Mtp => {
                 let dispatcher =

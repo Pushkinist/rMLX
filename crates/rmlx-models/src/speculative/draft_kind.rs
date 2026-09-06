@@ -6,10 +6,15 @@ use std::str::FromStr;
 /// Speculative drafter kind.
 ///
 /// Decides which loader builds the drafter and which round loop drives the
-/// request. Three kinds are sidecar heads that hook into the verifier's forward
+/// request. Four kinds are sidecar heads that hook into the verifier's forward
 /// pass; [`DraftKind::TwoModel`] is the classic form — a separate, smaller full
 /// model of the same family, loaded as its own `Architecture` and run against
 /// the verifier by `SpeculativeDispatcher::spec_generate_greedy`.
+///
+/// The two DFlash generations are separate kinds because their checkpoints
+/// differ by weight families one loader cannot build, and a run records only
+/// the kind and the block size: served as each other they would be filed under
+/// the same name with nothing in the row to tell them apart.
 ///
 /// `rmlx-models` carries the plain enum (no clap dep). The `clap::ValueEnum`
 /// adapter lives in `rmlx-cli::main` (see `DraftKindArg`).
@@ -23,6 +28,9 @@ pub enum DraftKind {
     Mtp,
     /// Draft-Flash block drafter (attention-based draft head).
     DFlash,
+    /// Draft-Flash 2: the same block drafter with a dynamic convolution around
+    /// each sublayer and a candidate-path selector over the block.
+    DFlash2,
     /// EAGLE-3 speculative drafter.
     Eagle3,
     /// A full draft model: any registered architecture sharing the verifier's
@@ -39,15 +47,22 @@ impl DraftKind {
     /// arm and the CLI value enum are separate string tables the compiler
     /// cannot tie to this enum; sweeping them from here is what makes a kind
     /// that is unreachable from the flag fail a test rather than go quiet.
-    pub const ALL: &'static [Self] = &[Self::Mtp, Self::DFlash, Self::Eagle3, Self::TwoModel];
+    pub const ALL: &'static [Self] = &[
+        Self::Mtp,
+        Self::DFlash,
+        Self::DFlash2,
+        Self::Eagle3,
+        Self::TwoModel,
+    ];
 
     /// This kind's position in [`Self::ALL`].
     pub const fn index(self) -> usize {
         match self {
             Self::Mtp => 0,
             Self::DFlash => 1,
-            Self::Eagle3 => 2,
-            Self::TwoModel => 3,
+            Self::DFlash2 => 2,
+            Self::Eagle3 => 3,
+            Self::TwoModel => 4,
         }
     }
 
@@ -56,6 +71,7 @@ impl DraftKind {
         match self {
             DraftKind::Mtp => "mtp",
             DraftKind::DFlash => "dflash",
+            DraftKind::DFlash2 => "dflash2",
             DraftKind::Eagle3 => "eagle3",
             DraftKind::TwoModel => "two_model",
         }
@@ -71,6 +87,10 @@ impl DraftKind {
 /// `architectures` at all, DFlash carries `DFlash*DraftModel` over a plain
 /// `qwen3` model type, and EAGLE-3 carries `*Eagle3` over `llama`. The
 /// architecture is read first for that reason.
+///
+/// `DFlash2DraftModel` contains `DFlash`, so the generations are read newest
+/// first: reading the older marker first would make every DFlash 2 snapshot a
+/// DFlash 1 one.
 #[allow(
     clippy::exhaustive_enums,
     reason = "closed: the three answers a declaration can give, consumed by one match in the serve layer"
@@ -94,6 +114,8 @@ impl Declared {
     pub fn from_snapshot(arch: &str, model_type: &str) -> Self {
         if arch.contains("Eagle3") {
             Declared::Sidecar(DraftKind::Eagle3)
+        } else if arch.contains("DFlash2") {
+            Declared::Sidecar(DraftKind::DFlash2)
         } else if arch.contains("DFlash") {
             Declared::Sidecar(DraftKind::DFlash)
         } else if model_type == "gemma4_assistant"
@@ -132,10 +154,11 @@ impl FromStr for DraftKind {
         match s.to_ascii_lowercase().as_str() {
             "mtp" => Ok(DraftKind::Mtp),
             "dflash" => Ok(DraftKind::DFlash),
+            "dflash2" => Ok(DraftKind::DFlash2),
             "eagle3" => Ok(DraftKind::Eagle3),
             "two_model" => Ok(DraftKind::TwoModel),
             other => Err(format!(
-                "unknown draft-kind '{other}'; valid values: mtp, dflash, eagle3, two_model"
+                "unknown draft-kind '{other}'; valid values: mtp, dflash, dflash2, eagle3, two_model"
             )),
         }
     }
