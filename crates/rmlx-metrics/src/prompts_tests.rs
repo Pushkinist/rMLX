@@ -253,3 +253,50 @@ fn sync_dir_real_rmlx_prompts() {
     assert!(count >= 1, "DB must have at least one row; got {count}");
     println!("real-files smoke: {inserted} inserted / {total} files / {count} DB rows");
 }
+
+/// Every sample under `prompts/published/` carries a `body_sha256` written by
+/// `scripts/published_samples.py`. That id is only worth anything if it is the
+/// id this recorder would give the same body — two implementations of one
+/// content address, in two languages, with nothing else holding them together.
+/// The published-samples gate cannot check this side; this is where it is
+/// checked.
+#[test]
+fn published_sample_body_digests_match_this_recorder() {
+    let manifest_dir =
+        std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map_or_else(|| manifest_dir.clone(), Path::to_path_buf);
+    let dir = repo_root.join("prompts").join("published");
+    if !dir.exists() {
+        eprintln!("skip: prompts/published/ not found");
+        return;
+    }
+
+    let manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+    let datasets = manifest["datasets"].as_array().unwrap();
+    assert!(!datasets.is_empty(), "manifest declares no datasets");
+
+    let mut checked = 0usize;
+    let mut declared = 0usize;
+    for entry in datasets {
+        declared += usize::try_from(entry["count"].as_u64().unwrap()).unwrap();
+        let file = entry["file"].as_str().unwrap();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(file)).unwrap()).unwrap();
+        for sample in doc["samples"].as_array().unwrap() {
+            let want = sample["body_sha256"].as_str().unwrap();
+            let got = prompt_body_sha256(&sample["messages"]);
+            assert_eq!(got, want, "{file}: sample {} body digest", sample["id"]);
+            checked += 1;
+        }
+    }
+
+    // A run that reads fewer samples than the manifest declares proves less,
+    // whatever else agreed.
+    assert_eq!(checked, declared, "every declared sample must be checked");
+    assert!(checked > 0, "a run that checks nothing proves nothing");
+    println!("published body-digest parity: {checked} samples");
+}
