@@ -128,6 +128,9 @@ DECODE_CONFIG = os.environ.get("STUB_DECODE_CONFIG", "mtp/block=5")
 BLOCK_SIZE = int(
     next(t for t in DECODE_CONFIG.split(",") if t.split("=")[0].endswith("/block")).split("=")[1]
 )
+# Whether the engine charged its phases. A JSON boolean on the real done line,
+# so the stub emits one too — the reader refuses a string, which is the point.
+CHARGED = json.loads(os.environ.get("STUB_CHARGED", "false"))
 DERIVED_OVERRIDE = os.environ.get("STUB_DERIVED_OVERRIDE", "")
 DROP_FIELDS = [f for f in os.environ.get("STUB_DROP_FIELDS", "").split(",") if f]
 
@@ -166,6 +169,7 @@ def done_line():
         "loop_ms_per_round": (ROUND_MS - DRAFT_MS - VERIFY_MS) / ROUNDS,
         "block_size": BLOCK_SIZE,
         "decode_config": DECODE_CONFIG,
+        "charged": CHARGED,
     }
     if DERIVED_OVERRIDE:
         name, _, value = DERIVED_OVERRIDE.partition("=")
@@ -895,6 +899,38 @@ case "$(notes_of mtp)" in
 *"block_size=3"*) ;;
 *) note_bad "notes claim a block the engine did not run: $(notes_of mtp)" ;;
 esac
+verdict
+
+# `charged` says the round loop drained its pipeline at every phase boundary, so
+# its decode rate measures a different engine. `--log info` does not prevent it:
+# RUST_LOG takes precedence over the preset and this script does not clear it.
+run_case charged_schedule_is_recorded 0 \
+	"a normal run says on its row that it was not charged"
+case "$(notes_of mtp)" in
+*"charged=false"*) ;;
+*) note_bad "notes do not say which schedule produced the row: $(notes_of mtp)" ;;
+esac
+verdict
+
+run_case charged_row_is_refused 1 \
+	"a charged run is refused rather than filed" \
+	'STUB_CHARGED=true' \
+	'GREP:charged=true'
+no_row mtp
+verdict
+
+run_case charged_must_be_a_boolean 1 \
+	"a charged value that is neither true nor false is refused, not coerced" \
+	'STUB_CHARGED="\"false\""' \
+	'GREP:not a boolean'
+no_row mtp
+verdict
+
+run_case missing_charged_refused 1 \
+	"a log that does not say which schedule produced it files no row" \
+	'STUB_DROP_FIELDS=charged' \
+	'GREP:carries no charged field'
+no_row mtp
 verdict
 
 # A drafter that resizes its block names a cell of its own. Recording it as the

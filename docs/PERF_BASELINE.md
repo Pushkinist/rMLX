@@ -44,10 +44,16 @@ the gemma4-assistant loop's rows are unaffected in every column. The two loops'
 residuals became comparable with each other at the same commit; before it they
 were produced by different instruments.
 
-Rows also now carry `charged`. A `true` there means the request ran with its
-phases forced at each boundary — a slower, differently scheduled engine — so
-its `verifier_ms`, `loop_ms_per_round` and `decode_tps` describe that run and
-not a normal one. See `docs/SPECULATIVE.md` § "Where a round's time goes".
+Every speculative `done` line also now carries `charged`. A `true` there means
+the request ran with its phases forced at each boundary — a slower, differently
+scheduled engine — so its `verifier_ms`, `loop_ms_per_round` and `decode_tps`
+describe that run and not a normal one. `scripts/spec_bench.sh` reads the flag
+back, records it in the row's `notes`, and refuses to file the row when it is
+`true`: `observations` is append-only and `bests` is a view over it, so no such
+row should ever be in the store to begin with. It is reachable from an ambient
+`RUST_LOG` — that takes precedence over the `--log info` the bench script
+passes — so unset `RUST_LOG` before benching. See `docs/SPECULATIVE.md` §
+"Where a round's time goes".
 
 ## Baseline KV-cache reuse
 

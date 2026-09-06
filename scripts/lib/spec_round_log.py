@@ -36,6 +36,7 @@ Output (stdout), one `key=value` per line:
     loop_ms_per_round=<f>       (round_ms - draft_ms - verifier_ms) / rounds_total
     block_size=<n>              the block the engine actually ran
     decode_config=<s>           the cell every event agreed it belongs to
+    charged=<true|false>        whether the phases were charged for their work
     decode_tps=<f>              one line per event with a measurable rate
 
 The ratios are the engine's own formulas applied to the summed counters. The
@@ -61,6 +62,14 @@ Every counter a figure is derived from is **required**. A binary that stops
 reporting one, together with its derived twin, would otherwise aggregate to a
 silent `0.000000` that the caller cannot tell from a measurement — and a
 measured zero wins a `bests` cell in an append-only table.
+
+`charged` says whether the round loop forced an evaluation at every phase
+boundary. That drains a pipeline the loop otherwise keeps full, so a charged
+request's `verifier_ms`, `loop_ms_per_round` and `decode_tps` describe a slower,
+differently scheduled engine — and it is reachable from an ambient `RUST_LOG`
+that the caller's own `--log` flag does not override. It is read back here for
+the same reason the counters are: a row that does not carry it is
+indistinguishable from a normal one in an append-only store.
 
 `block_size` is the block the engine ran, which is not always the one asked
 for — a sidecar caps it at its own — and `decode_config` is the cell key the
@@ -237,6 +246,24 @@ def one_value(events, field):
     return values.pop()
 
 
+def charged_flag(events):
+    """Whether these events ran with their phases charged.
+
+    Refused rather than coerced when it is not a boolean. `bool("false")` is
+    True, so a value that arrived as a string would read as charged on a normal
+    run and as normal on a charged one — and the row it decides is permanent.
+    """
+    value = one_value(events, "charged")
+    if not isinstance(value, bool):
+        raise SpecLogError(
+            f"a round-loop 'done' event reports charged={value!r}, which is not a "
+            "boolean: the field says whether the engine drained its pipeline at "
+            "every phase boundary, and a value that is neither true nor false "
+            "cannot be read as either"
+        )
+    return value
+
+
 # The engine's own name for each derived field, and the raw counters it comes
 # from. `rounds` is the denominator for all of them; `loop_ms_per_round` is a
 # residual, so its numerator is a difference.
@@ -321,6 +348,7 @@ def summarize(events):
         f"loop_ms_per_round={per_round(round_ms - draft_ms - verify_ms):.6f}",
         f"block_size={one_value(events, 'block_size')}",
         f"decode_config={one_value(events, 'decode_config')}",
+        f"charged={'true' if charged_flag(events) else 'false'}",
     ]
     for event in events:
         rate = decode_tps(event)

@@ -502,6 +502,21 @@ else:
     )
     decode_config = spec["decode_config"]
     block_size = spec["block_size"]
+    # A charged run forces an evaluation at every phase boundary, draining a
+    # pipeline the round loop otherwise keeps full. Its decode_tps measures that
+    # engine and not this one. `observations` is append-only and `bests` is a
+    # view over it, so a charged row cannot be taken back out and would compete
+    # in its cell on a reading nobody wanted — and `--log info` below does not
+    # prevent it, because RUST_LOG takes precedence over the preset.
+    charged = spec["charged"]
+    if charged != "false":
+        raise SystemExit(
+            "spec_bench: the round loop reported charged=" + charged + " — this run "
+            "forced an evaluation at every phase boundary and its decode rate "
+            "describes a slower, differently scheduled engine. Unset RUST_LOG "
+            "(it overrides the --log info this script passes) and re-run; refusing "
+            "to file a row that an append-only store cannot take back out."
+        )
 
 obj = {
     **json.loads(os.environ['RMLX_IDENTITY_JSON']),
@@ -540,7 +555,8 @@ obj = {
         # `block_size` is the block the engine ran, which a sidecar can cap
         # below the one asked for.
         else f"config={config} draft_kind={draft_kind} "
-        f"block_size={block_size}{tag_suffix} decode_window=engine_round_loop"
+        f"block_size={block_size} charged={charged}{tag_suffix} "
+        f"decode_window=engine_round_loop"
     ),
     "description": f"spec_bench {config} sha={git_sha}",
     "metrics": metrics,

@@ -251,14 +251,24 @@ charged run's `round_ms` against an uncharged one's before trusting either.
 **The decision is the loop's, made once per request, and it travels on the
 record.** `phases_charged()` is read at the loop head and passed down — to
 `rollback_round_caches` as an argument, and onto `RoundStats::charged`, which
-`mtp_generate_greedy: done` carries and `scripts/spec_bench.sh` ingests. Two
-things depend on that. `rollback_round_caches` is shared by six loops and only
-two of them time their phases; a switch it read on its own behalf would change
-how the other four schedule work, with nothing on their records saying so — they
-pass `false` and report `charged=false`. And a charged request's `verifier_ms`,
-`loop_ms_per_round` and `decode_tps` describe a differently scheduled engine, so
-without the field on the `done` line such a row would be indistinguishable from a
-normal one in an append-only store.
+every loop's `done` line carries. Two things depend on that.
+`rollback_round_caches` is shared by six loops and only two of them time their
+phases; a switch it read on its own behalf would change how the other four
+schedule work, with nothing on their records saying so — they pass `false` and
+report `charged=false`.
+
+And a charged request's `verifier_ms`, `loop_ms_per_round` and `decode_tps`
+describe a differently scheduled engine. `scripts/lib/spec_round_log.py` reads
+the flag back off the `done` line, refusing a value that is not a boolean rather
+than coercing one — `bool("false")` is `True`, and the row it would decide is
+permanent. `scripts/spec_bench.sh` puts it in the row's `notes` and **refuses to
+file a charged row at all**: `observations` is append-only and `bests` is a view
+over it, so such a row could not be taken back out and would compete in its cell
+on a reading nobody wanted. Passing `--log info`, which that script does, is not
+enough on its own — `RUST_LOG` takes precedence over the `--log` preset
+(`crates/rmlx-cli/src/startup.rs`), so an ambient
+`RUST_LOG=info,rmlx::spec::phase=trace` reaches a bench run that never asked for
+it. Unset it before benching.
 
 ## Per-drafter Deep Dive
 
@@ -410,8 +420,9 @@ adding no centring shift.
 
 Acceptance walk (`speculative::accept_prefix`, shared with the gemma4-assistant
 and two-model-greedy loops; the stochastic two-model loop applies a different,
-Leviathan acceptance rule and does not use it): the verify forward already projects all `block_size` positions through the
-LM head, so the loop reads that argmax back once and walks it on the host. For
+Leviathan acceptance rule and does not use it): the verify forward already
+projects all `block_size` positions through the LM head, so the loop reads that
+argmax back once and walks it on the host. For
 each position from 0 to `n_draft` (inclusive), the verifier's own token is
 compared with the draft; on a match the draft is accepted, and on a mismatch or
 at position `n_draft` the verifier's token is emitted as the correction/bonus.
