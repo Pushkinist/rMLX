@@ -129,12 +129,14 @@ mod common;
 
 use rmlx_mlx::Device;
 use rmlx_models::arch;
+use rmlx_models::speculative::dflash::{dflash_generate_greedy, DFlashDrafter};
 use rmlx_models::speculative::dflash2::{dflash2_generate_greedy, DFlash2Drafter};
+use rmlx_models::speculative::eagle3::{eagle3_generate_greedy, Eagle3Drafter};
 use rmlx_models::speculative::gemma4_assistant::{
     mtp_assistant_generate_greedy, Gemma4AssistantDrafter,
 };
 use rmlx_models::speculative::mtp::{mtp_generate_greedy, MtpDrafter};
-use rmlx_models::{Declared, DraftKind};
+use rmlx_models::{Declared, DraftKind, SpeculativeDispatcher};
 
 /// Token budget per arm. A ceiling, not a target: both arms stop on the
 /// verifier's own stop ids, and every prompt in the sweep answers under it.
@@ -450,7 +452,32 @@ fn judge(spec: &[u32], plain: &[u32], margins: &[f32]) -> Verdict {
             plain.len()
         ));
     }
-    if shorter < MIN_ANSWER_TOKENS {
+    if plain.len() < MIN_ANSWER_TOKENS {
+        // The reference arm is the control, and it answered this prompt in
+        // fewer tokens than the gate can read. One shape is still about the
+        // round loop: the speculative arm gave the whole reference answer back
+        // and then carried on, which says it did not stop where the verifier
+        // stopped. An arm that parted from the reference *inside* that answer
+        // and then wrote a longer one is a different answer, not a longer
+        // version of this one, and there is no answer here to judge it against.
+        if spec.starts_with(plain) {
+            return Verdict::Refused(format!(
+                "the reference arm ended at {} tokens and the speculative arm reproduced \
+                 it and ran on to {} — the round loop did not stop where the verifier \
+                 stopped",
+                plain.len(),
+                spec.len()
+            ));
+        }
+        return Verdict::Unjudgeable(format!(
+            "the reference arm answered in {} tokens, under {MIN_ANSWER_TOKENS}, and the \
+             arms parted inside that answer — plain greedy is the control, so what this \
+             says is that the prompt produced no answer to compare on this model, \
+             whatever the speculative arm went on to write",
+            plain.len()
+        ));
+    }
+    if spec.len() < MIN_ANSWER_TOKENS {
         return Verdict::Refused(format!(
             "one arm stopped early — spec={} plain={}, under {MIN_ANSWER_TOKENS} while \
              the other ran on; a short run is a comparison with no power, not a pass",
@@ -1120,6 +1147,52 @@ fn a_truncated_run_is_refused_rather_than_judged() {
     assert!(failure.contains("stopped early"), "{failure}");
 }
 
+/// Which arm is short decides what the gate is entitled to say, and all three
+/// shapes are pinned.
+///
+/// A *speculative* arm under the floor while the reference ran on is the round
+/// loop cutting its own run, and is refused. A *reference* arm under the floor
+/// is the prompt — plain greedy is the control, and the same asymmetry the
+/// repetition control already applies is what the divergence oracle needs here.
+/// The one shape that is still about the loop is a speculative arm that
+/// reproduced the whole reference answer and then carried on: that is a loop
+/// that did not stop where the verifier stopped, and it is separable from a loop
+/// that parted inside the answer and wrote a different, longer one.
+///
+/// This is the case the restricted-vocabulary pair brought: on its verifier the
+/// 4k document is answered in 52 tokens, and two other round loops reproduce
+/// that answer exactly while EAGLE-3 flips the single lowest-margin token in it
+/// and writes on.
+#[test]
+fn a_short_reference_arm_is_the_prompt_unless_the_other_arm_only_ran_past_it() {
+    let plain: Vec<u32> = Rng(0x5AFE_5AFE).prose(MIN_ANSWER_TOKENS - 1);
+
+    let mut ran_on = plain.clone();
+    ran_on.extend(Rng(0x0BAD_0BAD).prose(N_TOKENS));
+    let failure = judge(&ran_on, &plain, &[])
+        .refusal()
+        .expect("an arm that reproduced the whole reference answer and kept going must be refused");
+    assert!(
+        failure.contains("did not stop where the verifier stopped"),
+        "{failure}"
+    );
+
+    let mut parted = plain[..4].to_vec();
+    parted.extend(Rng(0x0F1F_0F1F).prose(N_TOKENS));
+    match judge(&parted, &plain, &[]) {
+        Verdict::Unjudgeable(why) => assert!(why.contains("parted inside that answer"), "{why}"),
+        other @ (Verdict::Agreed | Verdict::Refused(_)) => {
+            panic!("a reference arm under the floor is the prompt, not the loop: {other:?}")
+        }
+    }
+
+    let long_plain: Vec<u32> = Rng(0x1C1C_1C1C).prose(N_TOKENS);
+    let failure = judge(&long_plain[..16], &long_plain, &[])
+        .refusal()
+        .expect("a speculative arm under the floor while the reference ran on must be refused");
+    assert!(failure.contains("stopped early"), "{failure}");
+}
+
 /// A divergence that begins in the last quarter and never comes back.
 ///
 /// This is the shape of a regression that fires past a cache-size threshold, and
@@ -1269,10 +1342,22 @@ enum RoundLoop {
     /// rollback restores it from a pre-round snapshot and replays the accepted
     /// prefix.
     MtpSidecar,
+    /// DFlash 1 block drafter: the same recurrent rollback, and the only loop
+    /// here whose block size changes between rounds — it is set from the accept
+    /// rate of the recent ones, so a run walks a range of verify widths rather
+    /// than repeating one.
+    DFlash1,
     /// DFlash 2 block drafter: the same recurrent rollback, and a drafter that
     /// denoises a whole block at once from the verifier's multi-layer hidden
     /// states rather than stepping through it.
     DFlash2,
+    /// EAGLE-3: the same recurrent rollback, and an acceptance walk that scores
+    /// intermediate positions over the drafter's reduced vocabulary rather than
+    /// the verifier's whole one. See [`EAGLE3_PAIR`] for what that costs.
+    Eagle3,
+    /// Two full models, greedy acceptance: no sidecar head, a second complete
+    /// model with its own KV cache rolled back alongside the verifier's.
+    TwoModelGreedy,
 }
 
 impl RoundLoop {
@@ -1286,7 +1371,10 @@ impl RoundLoop {
         match self {
             RoundLoop::Gemma4Assistant => None,
             RoundLoop::MtpSidecar => Some(DraftKind::Mtp),
+            RoundLoop::DFlash1 => Some(DraftKind::DFlash),
             RoundLoop::DFlash2 => Some(DraftKind::DFlash2),
+            RoundLoop::Eagle3 => Some(DraftKind::Eagle3),
+            RoundLoop::TwoModelGreedy => Some(DraftKind::TwoModel),
         }
     }
 }
@@ -1361,6 +1449,75 @@ const DFLASH2_PAIR: Pair = Pair {
     },
     drafter: DrafterSource::Named,
     round_loop: RoundLoop::DFlash2,
+};
+
+/// The adaptive pair. Its drafter carries no dynamic convolution and no
+/// selector, and its loop sets each round's block from the accept rate of the
+/// recent ones — so it is the only pair here whose verify width changes between
+/// rounds, and the only one that reaches a block wider than 8.
+///
+/// Named for the same reason [`MTP_PAIR`] is: an 8-bit verifier drives the same
+/// MLX quantized matmul the census records for the affine instantiation.
+const DFLASH1_PAIR: Pair = Pair {
+    verifier: common::GoldenModel {
+        slug: "mlx-community__Qwen3.6-35B-A3B-8bit",
+        archs: &[
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ],
+    },
+    drafter: DrafterSource::Named,
+    round_loop: RoundLoop::DFlash1,
+};
+
+/// The restricted-vocabulary pair, and the one place this gate reads a
+/// **declared inexactness** rather than a defect.
+///
+/// EAGLE-3's verify pass scores the whole block against the drafter's reduced
+/// vocabulary — 32000 target ids plus the verifier's stop ids — and computes the
+/// verifier's full-vocabulary argmax at one position only: the first the draft
+/// missed, or the bonus when it missed none. An accepted position is therefore
+/// emitted as the draft's token whenever the draft agrees with the *restricted*
+/// argmax, and at a position whose true argmax lies outside that set those two
+/// are not the same token. The upstream implementation does this too, so it is a
+/// design boundary rather than a port defect — but it is still an answer change
+/// at temperature 0, which is what this gate reads.
+///
+/// [`Loaded::outside_draft_vocab`] measures the exposure on every run: how many
+/// of the reference arm's own tokens the drafter's vocabulary cannot name. Each
+/// one is a position where the boundary could fire; none of them is a position
+/// where it must.
+const EAGLE3_PAIR: Pair = Pair {
+    verifier: common::GoldenModel {
+        slug: "mlx-community__Qwen3.6-35B-A3B-8bit",
+        archs: &[
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ],
+    },
+    drafter: DrafterSource::Named,
+    round_loop: RoundLoop::Eagle3,
+};
+
+/// The two-model pair: no sidecar head at all, a second complete model of the
+/// same family whose own KV cache is rolled back beside the verifier's every
+/// partial round. Both halves are GDN hybrids, so a round rolls back two kinds
+/// of state on each of two models.
+///
+/// Named, and its drafter is the one kind [`RoundLoop::declares`] cannot pin to
+/// a snapshot: `two_model` is an inference from the architecture registry, which
+/// every full model satisfies. [`declared_vocab_size`] is the discriminator that
+/// stands a mismatched pair down before either model is read.
+const TWO_MODEL_PAIR: Pair = Pair {
+    verifier: common::GoldenModel {
+        slug: "mlx-community__Qwen3.8-27B-mxfp8",
+        archs: &[
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ],
+    },
+    drafter: DrafterSource::Named,
+    round_loop: RoundLoop::TwoModelGreedy,
 };
 
 /// Draft-model override, the variable the sibling alignment suites take.
@@ -1457,6 +1614,21 @@ fn draft_config(draft_path: &Path) -> Option<serde_json::Value> {
 fn declared_backbone_hidden(draft_path: &Path) -> Option<usize> {
     draft_config(draft_path)?["backbone_hidden_size"]
         .as_u64()
+        .and_then(|v| usize::try_from(v).ok())
+}
+
+/// The vocabulary a snapshot declares, from its own config or its text tower's.
+///
+/// The two-model pair needs this because its loop's kind is an inference from
+/// the architecture registry rather than a marker: every full model declares
+/// itself a `two_model` drafter, so the kind check cannot tell one family's from
+/// another's. A draft whose vocabulary is not the verifier's is refused inside
+/// `load_speculative`, which would fail the run rather than stand it down.
+fn declared_vocab_size(path: &Path) -> Option<usize> {
+    let cfg = draft_config(path)?;
+    cfg["vocab_size"]
+        .as_u64()
+        .or_else(|| cfg["text_config"]["vocab_size"].as_u64())
         .and_then(|v| usize::try_from(v).ok())
 }
 
@@ -1637,6 +1809,22 @@ fn eos_ids(model_path: &Path) -> Vec<u32> {
     }
 }
 
+/// Temperature 0, and the top-two logprobs the divergence oracle reads.
+///
+/// Both arms take it: the two-model loop routes on `sampling_active()`, so the
+/// same config that makes the reference arm greedy is what keeps its speculative
+/// arm off the Leviathan acceptance rule.
+fn greedy_sampler() -> rmlx_models::sampler::SamplerConfig {
+    rmlx_models::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 2,
+    }
+}
+
 /// Plain greedy decoding on the verifier alone, at temperature 0: the token ids
 /// and, per position, the verifier's own top-two logprob gap.
 ///
@@ -1650,14 +1838,7 @@ fn plain_greedy(
     eos: &[u32],
     device: Device,
 ) -> (Vec<u32>, Vec<f32>) {
-    let sampler_cfg = rmlx_models::sampler::SamplerConfig {
-        temperature: 0.0,
-        top_p: 1.0,
-        top_k: 0,
-        min_p: 0.0,
-        seed: Some(0),
-        top_logprobs_k: 2,
-    };
+    let sampler_cfg = greedy_sampler();
     let mut rng = rmlx_models::sampler::Pcg32::new(sampler_cfg.seed_or_default());
     let penalty_cfg = rmlx_models::sampler::PenaltyConfig::default();
     let mut history: Vec<u32> = Vec::new();
@@ -1704,16 +1885,41 @@ fn plain_greedy(
 
 /// A loaded pair, ready to answer prompts.
 struct Loaded {
-    verifier: arch::Architecture,
-    drafter: Drafter,
+    engine: Engine,
     tokenizer: tokenizers::Tokenizer,
     eos: Vec<u32>,
+}
+
+/// The verifier, and whatever drives the speculative arm against it.
+///
+/// A sidecar head reads the verifier and is held beside it. The two-model
+/// dispatcher owns both models, so that pair holds the dispatcher and lends the
+/// verifier back for the reference arm.
+enum Engine {
+    Sidecar {
+        verifier: Box<arch::Architecture>,
+        drafter: Drafter,
+    },
+    TwoModel(Box<SpeculativeDispatcher>),
+}
+
+impl Engine {
+    /// The model the reference arm decodes with, whichever half of the pair
+    /// holds it.
+    fn verifier(&self) -> &arch::Architecture {
+        match self {
+            Engine::Sidecar { verifier, .. } => verifier,
+            Engine::TwoModel(dispatcher) => &dispatcher.verifier,
+        }
+    }
 }
 
 enum Drafter {
     Assistant(Box<Gemma4AssistantDrafter>),
     Mtp(Box<MtpDrafter>),
+    DFlash1(Box<DFlashDrafter>),
     DFlash2(Box<DFlash2Drafter>),
+    Eagle3(Box<Eagle3Drafter>),
 }
 
 impl Loaded {
@@ -1727,63 +1933,144 @@ impl Loaded {
                 spec_ids.push(s.token_id);
                 None
             };
-            match &mut self.drafter {
-                Drafter::Assistant(drafter) => mtp_assistant_generate_greedy(
-                    &self.verifier,
-                    drafter,
-                    &self.tokenizer,
-                    &ids,
-                    N_TOKENS,
-                    BLOCK_SIZE,
-                    Some(rmlx_kv_quant::KvQuant::None),
-                    Some(MAX_CTX),
-                    &self.eos,
-                    &mut step,
-                    device,
-                )
-                .expect("assistant speculative generate"),
-                Drafter::Mtp(drafter) => {
-                    let block = drafter.block_size();
-                    mtp_generate_greedy(
-                        &self.verifier,
+            match &mut self.engine {
+                Engine::Sidecar { verifier, drafter } => match drafter {
+                    Drafter::Assistant(drafter) => mtp_assistant_generate_greedy(
+                        verifier,
                         drafter,
                         &self.tokenizer,
                         &ids,
                         N_TOKENS,
-                        block,
+                        BLOCK_SIZE,
                         Some(rmlx_kv_quant::KvQuant::None),
                         Some(MAX_CTX),
                         &self.eos,
                         &mut step,
                         device,
                     )
-                    .expect("mtp speculative generate")
-                }
-                // The block the drafter was trained at, not the harness's: the
-                // whole point of a block drafter is the block, and this is the
-                // width its selector chain is defined over.
-                Drafter::DFlash2(drafter) => {
-                    let block = drafter.cfg.block_size;
-                    dflash2_generate_greedy(
-                        &self.verifier,
-                        drafter,
+                    .expect("assistant speculative generate"),
+                    Drafter::Mtp(drafter) => {
+                        let block = drafter.block_size();
+                        mtp_generate_greedy(
+                            verifier,
+                            drafter,
+                            &self.tokenizer,
+                            &ids,
+                            N_TOKENS,
+                            block,
+                            Some(rmlx_kv_quant::KvQuant::None),
+                            Some(MAX_CTX),
+                            &self.eos,
+                            &mut step,
+                            device,
+                        )
+                        .expect("mtp speculative generate")
+                    }
+                    // The drafter's own ceiling, which its loop then halves and
+                    // grows from the recent accept rate: asking for a narrower
+                    // one would take the varying schedule out of the run, and
+                    // the schedule is what this pair covers that no other does.
+                    Drafter::DFlash1(drafter) => {
+                        let block = drafter.block_size();
+                        dflash_generate_greedy(
+                            verifier,
+                            drafter,
+                            &self.tokenizer,
+                            &ids,
+                            N_TOKENS,
+                            block,
+                            Some(rmlx_kv_quant::KvQuant::None),
+                            Some(MAX_CTX),
+                            &self.eos,
+                            &mut step,
+                            device,
+                        )
+                        .expect("dflash speculative generate")
+                    }
+                    // The block the drafter was trained at, not the harness's: the
+                    // whole point of a block drafter is the block, and this is the
+                    // width its selector chain is defined over.
+                    Drafter::DFlash2(drafter) => {
+                        let block = drafter.cfg.block_size;
+                        dflash2_generate_greedy(
+                            verifier,
+                            drafter,
+                            &self.tokenizer,
+                            &ids,
+                            N_TOKENS,
+                            block,
+                            Some(rmlx_kv_quant::KvQuant::None),
+                            Some(MAX_CTX),
+                            &self.eos,
+                            &mut step,
+                            device,
+                        )
+                        .expect("dflash2 speculative generate")
+                    }
+                    Drafter::Eagle3(drafter) => {
+                        let block = drafter.block_size();
+                        eagle3_generate_greedy(
+                            verifier,
+                            drafter,
+                            &self.tokenizer,
+                            &ids,
+                            N_TOKENS,
+                            block,
+                            Some(rmlx_kv_quant::KvQuant::None),
+                            Some(MAX_CTX),
+                            &self.eos,
+                            &mut step,
+                            device,
+                        )
+                        .expect("eagle3 speculative generate")
+                    }
+                },
+                Engine::TwoModel(dispatcher) => dispatcher
+                    .spec_generate_greedy(
                         &self.tokenizer,
                         &ids,
                         N_TOKENS,
-                        block,
+                        BLOCK_SIZE,
                         Some(rmlx_kv_quant::KvQuant::None),
                         Some(MAX_CTX),
+                        0,
                         &self.eos,
                         &mut step,
-                        device,
+                        None,
+                        &greedy_sampler(),
                     )
-                    .expect("dflash2 speculative generate")
-                }
+                    .expect("two-model speculative generate"),
             };
         }
-        let (plain_ids, margins) =
-            plain_greedy(&self.verifier, &self.tokenizer, &ids, &self.eos, device);
+        let (plain_ids, margins) = plain_greedy(
+            self.engine.verifier(),
+            &self.tokenizer,
+            &ids,
+            &self.eos,
+            device,
+        );
         (spec_ids, plain_ids, margins)
+    }
+
+    /// The target-vocabulary ids this pair's drafter can name, or `None` when it
+    /// can name every one the verifier can.
+    ///
+    /// Only EAGLE-3 answers. Its verify pass takes the argmax over the drafter's
+    /// reduced vocabulary at every position except the correction, and a
+    /// restricted argmax equals the true one **exactly** when the true one is in
+    /// the set. So a position whose reference token is in here cannot have been
+    /// changed by the restriction, and a position whose reference token is not
+    /// can have been.
+    fn draft_vocab(&self) -> Option<std::collections::HashSet<u32>> {
+        let Engine::Sidecar {
+            drafter: Drafter::Eagle3(drafter),
+            ..
+        } = &self.engine
+        else {
+            return None;
+        };
+        let hot: std::collections::HashSet<u32> = drafter.hot_ids_host().iter().copied().collect();
+        (!hot.is_empty()).then_some(hot)
     }
 }
 
@@ -1815,20 +2102,86 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
         }
     }
     let model_path = common::model_for(&pair.verifier, test)?;
+    // The two-model loop's kind is an inference from the architecture registry,
+    // so a full model of any family declares itself this pair's drafter. The
+    // vocabulary is what separates them, and reading it here stands a mismatched
+    // pair down instead of failing inside the dispatcher's own check.
+    if pair.round_loop == RoundLoop::TwoModelGreedy {
+        let (draft_vocab, verifier_vocab) = (
+            declared_vocab_size(&draft_path),
+            declared_vocab_size(&model_path),
+        );
+        if draft_vocab.is_some() && draft_vocab != verifier_vocab {
+            eprintln!(
+                "SKIP {test}: {} declares a {:?}-token vocabulary and {} declares {:?}, \
+                 so the two are not a two-model pair",
+                draft_path.display(),
+                draft_vocab.unwrap_or(0),
+                model_path.display(),
+                verifier_vocab.unwrap_or(0),
+            );
+            return None;
+        }
+    }
+
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");
+    let eos = eos_ids(&model_path);
+    assert!(
+        !eos.is_empty(),
+        "the verifier config must name its stop ids — without them both arms run past \
+         the answer into end-of-turn filler and the comparison is over that"
+    );
 
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
+    let engine = engine_for(
+        pair.round_loop,
+        test,
+        verifier,
+        &draft_path,
+        &model_path,
+        &eos,
+        device,
+    )?;
+
+    Some(Loaded {
+        engine,
+        tokenizer,
+        eos,
+    })
+}
+
+/// Build the pair's speculative half around an already-loaded verifier, or say
+/// why the gate stood down.
+///
+/// The drafter is what a pair is, and everything a loader can refuse about it is
+/// checked here: whether the verifier is the kind this loop drives, and whether
+/// the drafter's own declarations agree with the verifier it was resolved
+/// against.
+#[allow(clippy::too_many_arguments)]
+fn engine_for(
+    round_loop: RoundLoop,
+    test: &str,
+    verifier: arch::Architecture,
+    draft_path: &Path,
+    model_path: &Path,
+    eos: &[u32],
+    device: Device,
+) -> Option<Engine> {
     let hidden = verifier.hidden_size();
-    let drafter = match pair.round_loop {
+    let vocab = verifier.vocab_size();
+    let verifier = Box::new(verifier);
+    let engine = match round_loop {
         RoundLoop::Gemma4Assistant => {
-            if !is_gemma4_assistant(&draft_path) {
+            if !is_gemma4_assistant(draft_path) {
                 eprintln!(
                     "SKIP {test}: {} is not a Gemma4 assistant drafter",
                     draft_path.display()
                 );
                 return None;
             }
-            let declared = declared_backbone_hidden(&draft_path);
+            let declared = declared_backbone_hidden(draft_path);
             if declared.is_some_and(|width| width != hidden) {
                 eprintln!(
                     "SKIP {test}: {} projects into a backbone {} wide and {} is {hidden}",
@@ -1838,10 +2191,13 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
                 );
                 return None;
             }
-            Drafter::Assistant(Box::new(
-                Gemma4AssistantDrafter::load(&draft_path, hidden, device)
-                    .expect("load assistant drafter"),
-            ))
+            Engine::Sidecar {
+                verifier,
+                drafter: Drafter::Assistant(Box::new(
+                    Gemma4AssistantDrafter::load(draft_path, hidden, device)
+                        .expect("load assistant drafter"),
+                )),
+            }
         }
         RoundLoop::MtpSidecar => {
             if !verifier.needs_lin_caches() {
@@ -1852,9 +2208,28 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
                 );
                 return None;
             }
-            Drafter::Mtp(Box::new(
-                MtpDrafter::load(&draft_path, hidden, device).expect("load MTP sidecar"),
-            ))
+            Engine::Sidecar {
+                verifier,
+                drafter: Drafter::Mtp(Box::new(
+                    MtpDrafter::load(draft_path, hidden, device).expect("load MTP sidecar"),
+                )),
+            }
+        }
+        RoundLoop::DFlash1 => {
+            if !verifier.needs_lin_caches() {
+                eprintln!(
+                    "SKIP {test}: {} carries no recurrent state, so it is not the \
+                     verifier this loop drives",
+                    model_path.display()
+                );
+                return None;
+            }
+            Engine::Sidecar {
+                verifier,
+                drafter: Drafter::DFlash1(Box::new(
+                    DFlashDrafter::load(draft_path, hidden, device).expect("load DFlash 1 drafter"),
+                )),
+            }
         }
         RoundLoop::DFlash2 => {
             if !verifier.needs_lin_caches() {
@@ -1865,26 +2240,42 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
                 );
                 return None;
             }
-            Drafter::DFlash2(Box::new(
-                DFlash2Drafter::load(&draft_path, hidden, device).expect("load DFlash 2 drafter"),
+            Engine::Sidecar {
+                verifier,
+                drafter: Drafter::DFlash2(Box::new(
+                    DFlash2Drafter::load(draft_path, hidden, device)
+                        .expect("load DFlash 2 drafter"),
+                )),
+            }
+        }
+        RoundLoop::Eagle3 => {
+            if !verifier.needs_lin_caches() {
+                eprintln!(
+                    "SKIP {test}: {} carries no recurrent state, so it is not the \
+                     verifier this loop drives",
+                    model_path.display()
+                );
+                return None;
+            }
+            // The verifier's stop ids join the drafter's reduced vocabulary, so
+            // the restricted argmax can still end a turn. They are the same ids
+            // both arms stop on.
+            let drafter = Eagle3Drafter::load(draft_path, hidden, vocab, eos, device)
+                .expect("load EAGLE-3 drafter");
+            Engine::Sidecar {
+                verifier,
+                drafter: Drafter::Eagle3(Box::new(drafter)),
+            }
+        }
+        RoundLoop::TwoModelGreedy => {
+            let draft = arch::load_model(draft_path, device, &arch::LoadOpts::default())
+                .expect("load draft model");
+            Engine::TwoModel(Box::new(
+                SpeculativeDispatcher::new(*verifier, draft, device).expect("two-model dispatcher"),
             ))
         }
     };
-
-    let tokenizer =
-        tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");
-    let eos = eos_ids(&model_path);
-    assert!(
-        !eos.is_empty(),
-        "the verifier config must name its stop ids — without them both arms run past \
-         the answer into end-of-turn filler and the comparison is over that"
-    );
-    Some(Loaded {
-        verifier,
-        drafter,
-        tokenizer,
-        eos,
-    })
+    Some(engine)
 }
 
 /// Report one pair of arms, whatever the verdict.
@@ -1896,6 +2287,7 @@ fn report(
     spec: &[u32],
     plain: &[u32],
     margins: &[f32],
+    draft_vocab: Option<&std::collections::HashSet<u32>>,
     verdict: &Verdict,
 ) {
     let (tail_start, tail_ratio) = weakest_tail(spec, plain);
@@ -1903,9 +2295,20 @@ fn report(
     let (plain_from, plain_period, plain_cycle) = strongest_windowed_cycle(plain);
     let (div, confidence) = divergence_confidence(spec, plain, margins)
         .unwrap_or((common_prefix_len(spec, plain), 0.0));
+    // For a pair whose drafter names a reduced vocabulary: how much of the
+    // reference answer that vocabulary cannot say, and whether the token it
+    // could not say is the one the arms parted on.
+    let outside = match draft_vocab {
+        Some(vocab) => format!(
+            " unnameable={} divergence_unnameable={}",
+            plain.iter().filter(|id| !vocab.contains(id)).count(),
+            plain.get(div).is_some_and(|id| !vocab.contains(id)),
+        ),
+        None => String::new(),
+    };
     eprintln!(
         "[{test}/{}] lcs={:.4} tail={tail_ratio:.4}@{tail_start} divergence={div} \
-         margin={:.4} confidence={confidence:.4} \
+         margin={:.4} confidence={confidence:.4}{outside} \
          cycle spec={spec_cycle:.4}/p{spec_period}@{spec_from} \
          plain={plain_cycle:.4}/p{plain_period}@{plain_from} spec={} plain={}\n  \
          verdict = {verdict:?}\n  spec  = {:?}\n  plain = {:?}",
@@ -1969,6 +2372,54 @@ fn the_block_round_loop_reproduces_plain_greedy() {
     );
 }
 
+/// The adaptive pair, and the only one whose verify width is not fixed.
+///
+/// Its loop halves and grows the block from the accept rate of the recent
+/// rounds, so a run truncates an 8-wide append and follows it with a 4- or
+/// 6-wide one — a sequence of shapes no other pair here produces, over the same
+/// rollback the recurrent and block pairs use. Every individual width is
+/// exercised elsewhere; the schedule is not.
+#[ignore]
+#[test]
+fn the_adaptive_round_loop_reproduces_plain_greedy() {
+    run_gate(
+        "the_adaptive_round_loop_reproduces_plain_greedy",
+        &DFLASH1_PAIR,
+    );
+}
+
+/// The restricted-vocabulary pair.
+///
+/// It is judged by the same oracle as every other pair, and it carries one
+/// inexactness they do not: an accepted position is emitted as the draft's
+/// token, and the verifier's full-vocabulary argmax is computed at the
+/// correction position only. Where those two differ the arms differ, by design
+/// and in agreement with the upstream implementation. The run prints how many
+/// of the reference arm's tokens the drafter's vocabulary cannot name, which is
+/// the count of positions where that can happen at all.
+#[ignore]
+#[test]
+fn the_restricted_vocab_round_loop_reproduces_plain_greedy() {
+    run_gate(
+        "the_restricted_vocab_round_loop_reproduces_plain_greedy",
+        &EAGLE3_PAIR,
+    );
+}
+
+/// The two-model pair: two complete models, and the loop with no sidecar head.
+///
+/// Both halves are GDN hybrids, so a partial round rolls back a KV cache and a
+/// recurrent state on the verifier and the draft alike — four restores where
+/// the sidecar pairs do two.
+#[ignore]
+#[test]
+fn the_two_model_round_loop_reproduces_plain_greedy() {
+    run_gate(
+        "the_two_model_round_loop_reproduces_plain_greedy",
+        &TWO_MODEL_PAIR,
+    );
+}
+
 /// Every prompt in [`PROMPTS`], judged, and the whole table printed whatever the
 /// verdicts are.
 ///
@@ -1982,6 +2433,7 @@ fn run_gate(test: &str, pair: &Pair) {
     let Some(mut loaded) = load(pair, test, device) else {
         return;
     };
+    let draft_vocab = loaded.draft_vocab();
     let mut refusals: Vec<String> = Vec::new();
     let mut judged = 0usize;
     for prompt in PROMPTS {
@@ -1994,6 +2446,7 @@ fn run_gate(test: &str, pair: &Pair) {
             &spec,
             &plain,
             &margins,
+            draft_vocab.as_ref(),
             &verdict,
         );
         match verdict {
