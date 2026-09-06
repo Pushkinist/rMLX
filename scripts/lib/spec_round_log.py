@@ -94,7 +94,13 @@ import argparse
 import json
 import sys
 
-DONE_MARKERS = ("generate_greedy", "generate_stochastic")
+# Every round loop's done event is named for the function that emitted it, and
+# every one of those is `<something>_generate...` — `SpecLoop::done_event` in
+# crates/rmlx-models/src/speculative/round_stats.rs is the whole list. Matching
+# the shared stem rather than a spelling is what keeps this reader working when
+# a loop is renamed: it was `generate_greedy` until the sidecar loops stopped
+# being greedy, at which point the loops were still there and the marker was not.
+DONE_MARKERS = ("_generate",)
 
 
 # Counters every derived figure is built from. A log missing one of these has no
