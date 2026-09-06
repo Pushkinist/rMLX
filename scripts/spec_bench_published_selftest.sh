@@ -17,11 +17,22 @@
 # exit code, and every refusal asserts the reason as well: a guard that refuses
 # for the wrong reason stops refusing when that reason moves.
 #
-# The host is supplied by a `ps` shim, so no case reads this machine and the
-# file is deterministic under any load. `--synthetic-arms` is the boundary
-# between a run that measures and a run that exercises this logic, and it is
-# pinned in both directions: the host gates still fire without it, and with it a
-# hostile host and a quiet host reach the same verdict.
+# The host is supplied by a `ps` shim, so no case reads this machine's process
+# table and no verdict here depends on what else it is doing.
+# `--synthetic-arms` is the boundary between a run that measures and a run that
+# exercises this logic, and it is pinned in both directions: the host gates
+# still fire without it, and with it a hostile host and a quiet host reach the
+# same verdict.
+#
+# ONE THING HERE IS STILL WALL-CLOCK SENSITIVE, and it is bounded rather than
+# claimed away. The harness cross-checks the engine's decode rate against the
+# same window timed at the client, and the client is `curl | python3`, so a cold
+# interpreter start can slide the first content chunk's stamp forward and shrink
+# the window. The stub therefore holds its first content chunk behind a prefill
+# pause an order of magnitude longer than an interpreter start; the pause is
+# outside the measured window by construction, so it costs wall time and biases
+# nothing. Under two concurrent suites the observed slip was ~30 ms against a
+# 150 ms pause.
 #
 # No GPU, no model, no DB.
 #
@@ -55,45 +66,57 @@ ln -s "${REPO_ROOT}/prompts" "${FAKE_ROOT}/prompts"
 
 # ── Sample sets ───────────────────────────────────────────────────────────────
 #
-# A shrunken copy of the checked-in sets: the first few samples of each dataset,
-# with the manifest re-derived around them so `published_samples.py verify`
-# still passes. Different sizes on purpose — 2, 3 and 4 — so the macro average
-# and a pooled mean over the same rows are different numbers.
+# A shrunken copy of the checked-in sets: the first few samples of each dataset.
+# It is NOT held to `published_samples.py`, and nothing here asks it to be — that
+# gate anchors the published sets against constants in its own source, so a
+# shrunken copy cannot satisfy it and should not. The harness reaches this root
+# only through `--samples-root`, which is the unverified operator override, and
+# a case below pins that the default path does verify.
+#
+# Different sizes on purpose — 1, 2 and 3 — so the macro average, a mean over
+# the cells, a mean over the datasets-including-the-second-budget, and a pooled
+# mean over the rows are four different numbers.
 SAMPLES="${WORK}/samples"
 mkdir -p "${SAMPLES}"
-python3 - "${PUBLISHED}" "${SAMPLES}" <<'PY' || exit 2
-import hashlib, json, pathlib, sys
+shrink() { # shrink <src-root> <dst-root>
+	python3 - "$1" "$2" <<'PY' || exit 2
+import json, pathlib, sys
 
-sys.path.insert(0, str(pathlib.Path(sys.argv[0]).resolve().parent))
 src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-KEEP = {"mt_bench": 2, "math_500": 3, "humaneval": 4}
+KEEP = {"mt_bench": 1, "math_500": 2, "humaneval": 3}
 
 man = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
+kept = []
 for entry in man["datasets"]:
     keep = KEEP[entry["key"]]
     doc = json.loads((src / entry["file"]).read_text(encoding="utf-8"))
-    entry["selected_ids"] = entry["selected_ids"][:keep]
-    entry["count"] = keep
-    if entry["sampling"]["mode"] == "all":
-        # The whole pool is the selection, so the pool has to shrink with it.
-        entry["pool_ids"] = entry["pool_ids"][:keep]
-        entry["pool_size"] = keep
-    chosen = set(entry["selected_ids"])
-    doc["samples"] = [s for s in doc["samples"] if s["source_id"] in chosen]
+    doc["samples"] = doc["samples"][:keep]
     assert len(doc["samples"]) == keep, entry["key"]
-    blob = (json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    (dst / entry["file"]).write_bytes(blob)
-    entry["file_bytes"] = len(blob)
-    entry["file_sha256"] = hashlib.sha256(blob).hexdigest()
+    (dst / entry["file"]).write_text(
+        json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    kept.append({"key": entry["key"], "file": entry["file"], "count": keep})
 (dst / "manifest.json").write_text(
-    json.dumps(man, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    json.dumps({"datasets": kept}, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
 )
 PY
-python3 "${REPO_ROOT}/scripts/published_samples.py" verify --root "${SAMPLES}" \
-    >/dev/null || { echo "ERROR: the shrunken sample sets do not verify" >&2; exit 2; }
+}
+shrink "${PUBLISHED}" "${SAMPLES}"
 
-# 2 + 3 + 4 + 3 (MATH-500 again at 4096) requests per pass.
-REQUESTS_PER_PASS=12
+# 1 + 2 + 3 + 2 (MATH-500 again at 4096) requests per pass.
+REQUESTS_PER_PASS=8
+# One TTFT, one ITL and one sampler event per request, warmup included.
+EVENTS_PER_PASS=9
+
+# A second fake root whose `prompts/published` IS the shrunken copy. A run that
+# passes no --samples-root reaches it as the published root, and the gate that
+# anchors the published sets refuses it — which is how the default path is shown
+# to verify without benching all 336 samples.
+CANON_ROOT="${WORK}/repo_canonical"
+mkdir -p "${CANON_ROOT}/target/release-perf" "${CANON_ROOT}/prompts"
+ln -s "${REPO_ROOT}/scripts" "${CANON_ROOT}/scripts"
+ln -s "${SAMPLES}" "${CANON_ROOT}/prompts/published"
 
 # ── Snapshots ─────────────────────────────────────────────────────────────────
 
@@ -113,7 +136,17 @@ cp "${VERIFIER}/config.json" "${NO_DEFAULTS}/config.json"
 HALF_DEFAULTS="${WORK}/models/half-ns__half-model"
 mkdir -p "${HALF_DEFAULTS}"
 cp "${VERIFIER}/config.json" "${HALF_DEFAULTS}/config.json"
-printf '%s\n' '{"temperature": 0.6}' >"${HALF_DEFAULTS}/generation_config.json"
+printf '%s\n' '{"temperature": 0.6, "top_p": 0.95}' \
+	>"${HALF_DEFAULTS}/generation_config.json"
+
+# A checkpoint whose own default is greedy. It resolves no sampler, so the
+# engine writes no sampler event and the harness must expect none — the other
+# arm of a branch whose first arm every sampled case exercises.
+GREEDY="${WORK}/models/greedy-ns__greedy-model"
+mkdir -p "${GREEDY}"
+cp "${VERIFIER}/config.json" "${GREEDY}/config.json"
+printf '%s\n' '{"temperature": 0.0, "top_p": 1.0, "top_k": 0}' \
+	>"${GREEDY}/generation_config.json"
 
 # ── Shims ─────────────────────────────────────────────────────────────────────
 #
@@ -138,7 +171,7 @@ chmod +x "${SHIMS}/pkill" "${SHIMS}/sleep" "${SHIMS}/rm"
 
 # Two synthetic machines, on the shape `cpu_snapshot` reads. It refuses a
 # process table under 20 rows, so both emit 40 idle ones.
-mkdir -p "${WORK}/quiet" "${WORK}/hostile"
+mkdir -p "${WORK}/quiet" "${WORK}/hostile" "${WORK}/flaky"
 {
     echo '#!/usr/bin/env bash'
     echo 'for i in $(seq 1 40); do printf "%6d %12s %s\n" $((5000 + i)) "0:00.10" "/usr/sbin/idle$i"; done'
@@ -150,7 +183,17 @@ mkdir -p "${WORK}/quiet" "${WORK}/hostile"
     echo 'printf "%6d %12s %s\n" 4242 "0:$((n * 100)).00" /usr/local/bin/hog'
     echo 'for i in $(seq 1 40); do printf "%6d %12s %s\n" $((5000 + i)) "0:00.10" "/usr/sbin/idle$i"; done'
 } >"${WORK}/hostile/ps"
-chmod +x "${WORK}/quiet/ps" "${WORK}/hostile/ps"
+# A machine that answers the entry gate and then stops answering: a full table
+# for the first two calls, a truncated one after. `cpu_snapshot` refuses a table
+# under 20 rows, which is `unmeasured` — not knowing, which is not `quiet`.
+{
+    echo '#!/usr/bin/env bash'
+    echo "n=\$(cat '${WORK}/flaky.cnt' 2>/dev/null || echo 0)"
+    echo "echo \$((n + 1)) >'${WORK}/flaky.cnt'"
+    echo 'if [ "$n" -lt 2 ]; then rows=40; else rows=3; fi'
+    echo 'for i in $(seq 1 $rows); do printf "%6d %12s %s\n" $((5000 + i)) "0:00.10" "/usr/sbin/idle$i"; done'
+} >"${WORK}/flaky/ps"
+chmod +x "${WORK}/quiet/ps" "${WORK}/hostile/ps" "${WORK}/flaky/ps"
 
 # ── Stub server ───────────────────────────────────────────────────────────────
 
@@ -159,18 +202,28 @@ cat >"${SERVER_PY}" <<'PYEOF'
 """Canned OpenAI-compatible server for the published-harness selftest.
 
 Streams STUB_TOKENS content chunks a nominal gap apart, after a prefill pause,
-then a usage block. The gap for request `i` of pass `p` is
-`GAP_MS_SEQ[i] * PASS_SCALE[p - 1]`, both comma-separated with the last entry
-repeating, and the chunks go out on a fixed schedule so the per-chunk framing
-cost falls inside the gap rather than being added to it — the wire really does
-carry 1000/gap tok/s, which is what the client cross-check compares against.
+then a usage block. STUB_GAP_MS is a gap matrix: `;` separates passes, `,`
+separates requests within a pass, and the last entry of each list repeats. The
+chunks go out on a fixed schedule so the per-chunk framing cost falls inside the
+gap rather than being added to it — the wire really does carry 1000/gap tok/s,
+which is what the client cross-check compares against.
+
+STUB_PREFILL_S is long on purpose. The client is `curl | python3`, and the
+window is timed from the moment PYTHON stamps the first content chunk; a cold
+interpreter start would slide that forward and shrink the window. The pause is
+outside the window by construction, so holding the first content chunk behind
+one an order of magnitude longer than an interpreter start costs wall time and
+biases nothing.
 
 Per request it appends to the run log the events the harness reads back:
 
-  generate_streaming: TTFT (L6)   always, unless capped by STUB_TTFT_LINES
-  generate: ITL stats (M30)       always, unless capped by STUB_ITL_LINES
-  <kind>_generate_greedy: done    when the serve argv carried a drafter, or
-                                  STUB_FORCE_DONE is set
+  generate_streaming: TTFT (L6)          unless capped by STUB_TTFT_LINES
+  generate: ITL stats (M30)              unless capped by STUB_ITL_LINES
+  generate: host categorical sampler active (A7.2)
+                                         unless STUB_SAMPLED=0, capped by
+                                         STUB_SAMPLER_LINES
+  <kind>_generate_greedy: done           when the serve argv carried a drafter,
+                                         or STUB_FORCE_DONE is set
 
 `mean_ms` on the ITL event and `decode_tps` on the done line both report the
 nominal gap, so the engine figure is exact and the client's reading of the same
@@ -185,22 +238,29 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-def seq(name, default):
-    raw = os.environ.get(name, "") or default
-    return [float(v) for v in raw.split(",") if v != ""]
+def gap_matrix(raw):
+    return [
+        [float(v) for v in row.split(",") if v != ""]
+        for row in raw.split(";")
+        if row != ""
+    ]
 
 
 TOKENS = int(os.environ.get("STUB_TOKENS", "6"))
-GAP_MS_SEQ = seq("STUB_GAP_MS_SEQ", "40")
-PASS_SCALE = seq("STUB_PASS_SCALE", "1")
+GAP_MS = gap_matrix(os.environ.get("STUB_GAP_MS", "") or "40")
 PASS = int(os.environ.get("STUB_PASS", "1"))
-PREFILL_S = float(os.environ.get("STUB_PREFILL_S", "0.02"))
+PREFILL_S = float(os.environ.get("STUB_PREFILL_S", "0.15"))
 PROMPT_TOKENS = int(os.environ.get("STUB_PROMPT_TOKENS", "1234"))
 USAGE_TOKENS = int(os.environ.get("STUB_USAGE_TOKENS", "-1"))
 TTFT_MS = float(os.environ.get("STUB_TTFT_MS", "42"))
 TTFT_LINES = int(os.environ.get("STUB_TTFT_LINES", "-1"))
 ITL_LINES = int(os.environ.get("STUB_ITL_LINES", "-1"))
 ITL_MEAN_MS = os.environ.get("STUB_ITL_MEAN_MS", "")
+SAMPLED = os.environ.get("STUB_SAMPLED", "1") == "1"
+SAMPLER_LINES = int(os.environ.get("STUB_SAMPLER_LINES", "-1"))
+SAMPLER_TOP_K = int(os.environ.get("STUB_SAMPLER_TOP_K", "20"))
+SAMPLER_TOP_K_PASS2 = os.environ.get("STUB_SAMPLER_TOP_K_PASS2", "")
+OMIT_COMPLETION_TOKENS = os.environ.get("STUB_OMIT_COMPLETION_TOKENS", "") == "1"
 LOG_PATH = os.environ.get("STUB_LOG", "")
 SPECULATIVE = os.environ.get("STUB_SPECULATIVE", "") == "1"
 FORCE_DONE = os.environ.get("STUB_FORCE_DONE", "") == "1"
@@ -217,7 +277,7 @@ def pick(values, index):
 
 
 def gap_ms():
-    return pick(GAP_MS_SEQ, served) * pick(PASS_SCALE, PASS - 1)
+    return pick(pick(GAP_MS, PASS - 1), served)
 
 
 def event(fields):
@@ -310,11 +370,20 @@ class Handler(BaseHTTPRequestHandler):
             if remaining > 0:
                 time.sleep(remaining)
             chunk({"choices": [{"delta": {"content": f"t{i} "}, "index": 0}]})
-        usage = {"completion_tokens": USAGE_TOKENS if USAGE_TOKENS >= 0 else TOKENS}
+        usage = {}
+        if not OMIT_COMPLETION_TOKENS:
+            usage["completion_tokens"] = USAGE_TOKENS if USAGE_TOKENS >= 0 else TOKENS
         if PROMPT_TOKENS >= 0:
             usage["prompt_tokens"] = PROMPT_TOKENS
         chunk({"choices": [], "usage": usage})
 
+        if SAMPLED and (SAMPLER_LINES < 0 or served < SAMPLER_LINES):
+            top_k = SAMPLER_TOP_K
+            if SAMPLER_TOP_K_PASS2 and PASS >= 2:
+                top_k = int(SAMPLER_TOP_K_PASS2)
+            log(event({"message": "generate: host categorical sampler active (A7.2)",
+                       "model_id": "stub", "temperature": 0.6, "top_p": 0.95,
+                       "top_k": top_k, "min_p": 0.0, "seed": 42919}))
         if TTFT_LINES < 0 or served < TTFT_LINES:
             log(event({"message": "generate_streaming: TTFT (L6)",
                        "model_id": "stub", "ttft_ms": TTFT_MS}))
@@ -384,6 +453,7 @@ serve)
 esac
 STUBEOF
 chmod +x "${STUB}"
+ln -s "${STUB}" "${CANON_ROOT}/target/release-perf/rmlx"
 
 # A port this host is not already using. Probed rather than assumed: a foreign
 # listener would answer the readiness poll and the suite would measure it.
@@ -406,10 +476,17 @@ sys.exit("no free port in 18000-19999")
 # ── Case driver ───────────────────────────────────────────────────────────────
 
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
-#          [HOST:quiet|hostile] [GREP:pat ...] [NOGREP:pat ...]
+#          [HOST:quiet|hostile|flaky] [VERIFIER:dir] [MEASURED:1] [CANONICAL:1]
+#          [GREP:pat ...] [NOGREP:pat ...]
 #
-# Defaults: a quiet host, --synthetic-arms, the shrunken sample sets and the
-# healthy verifier snapshot, streaming six tokens 40 ms apart — 25 tok/s on
+# Defaults: a quiet host, --synthetic-arms, the healthy verifier snapshot, and
+# the shrunken sample sets reached through --samples-root — the unverified
+# operator override, which is the only way a root that is not the published one
+# can be measured at all. CANONICAL:1 drops the flag and runs out of a repo root
+# whose prompts/published IS the shrunken copy, which is how the default path is
+# shown to verify.
+#
+# The stub streams six tokens 40 ms apart behind a 150 ms prefill — 25 tok/s on
 # the wire and 25 reported by the engine.
 run_case() {
     CASE_NAME="$1"
@@ -421,7 +498,7 @@ run_case() {
     mkdir -p "${CASE_HOME}/logs"
 
     local env_pairs=() greps=() nogreps=() extra_args=() host="quiet" a
-    local synthetic=true verifier="${VERIFIER}"
+    local synthetic=true verifier="${VERIFIER}" canonical=false
     for a in "$@"; do
         case "$a" in
         GREP:*) greps+=("${a#GREP:}") ;;
@@ -429,11 +506,18 @@ run_case() {
         ARGS:*) extra_args+=("${a#ARGS:}") ;;
         HOST:*) host="${a#HOST:}" ;;
         MEASURED:*) synthetic=false ;;
+        CANONICAL:*) canonical=true ;;
         VERIFIER:*) verifier="${a#VERIFIER:}" ;;
         *) env_pairs+=("$a") ;;
         esac
     done
     $synthetic && extra_args+=(--synthetic-arms)
+    local root="${FAKE_ROOT}"
+    if $canonical; then
+        root="${CANON_ROOT}"
+    else
+        extra_args+=(--samples-root "${SAMPLES}")
+    fi
 
     CASE_OUT="${WORK}/${CASE_NAME}.log"
     local got=0
@@ -444,8 +528,8 @@ run_case() {
         STUB_BOUND_FLAG="${CASE_HOME}/stub_bound" \
         STUB_BODIES="${CASE_HOME}/bodies.jsonl" \
         ${env_pairs[@]+"${env_pairs[@]}"} \
-        bash "${FAKE_ROOT}/scripts/spec_bench_published.sh" \
-        "${verifier}" --port "${PORT}" --samples-root "${SAMPLES}" \
+        bash "${root}/scripts/spec_bench_published.sh" \
+        "${verifier}" --port "${PORT}" \
         ${extra_args[@]+"${extra_args[@]}"} >"${CASE_OUT}" 2>&1
     got=$?
     pkill -f "${SERVER_PY}" 2>/dev/null || true
@@ -529,47 +613,61 @@ for cell in mt_bench@1024 math_500@1024 humaneval@1024 math_500@4096; do
     got="$(jq_of "r['cells']['${cell}']['mean']")"
     close_to "${got}" 25.0 0.0001 || note_bad "${cell} mean=${got} (want 25.0)"
 done
-[ "$(jq_of "r['cells']['mt_bench@1024']['samples']")" = "2" ] ||
+[ "$(jq_of "r['cells']['mt_bench@1024']['samples']")" = "1" ] ||
     note_bad "mt_bench@1024 counted $(jq_of "r['cells']['mt_bench@1024']['samples']") samples"
-[ "$(jq_of "r['cells']['humaneval@1024']['samples']")" = "4" ] ||
+[ "$(jq_of "r['cells']['humaneval@1024']['samples']")" = "3" ] ||
     note_bad "humaneval@1024 counted $(jq_of "r['cells']['humaneval@1024']['samples']") samples"
 verdict
+
 # Three passes are what the protocol asks for and what the result has to hold.
 run_case three_passes_of_every_sample 0 \
     "the result holds three passes of every sample and nothing else"
-[ "$(jq_of "len(r['samples'])")" = "36" ] ||
-    note_bad "the result holds $(jq_of "len(r['samples'])") rows (want 3 x 12)"
+[ "$(jq_of "len(r['samples'])")" = "24" ] ||
+    note_bad "the result holds $(jq_of "len(r['samples'])") rows (want 3 x 8)"
 [ "$(jq_of "sorted({s['pass'] for s in r['samples']})")" = "[1, 2, 3]" ] ||
     note_bad "passes=$(jq_of "sorted({s['pass'] for s in r['samples']})")"
 verdict
 
-# The macro average is the mean of the dataset means. Pooling the rows instead
-# weights MT-Bench's two samples below HumanEval's four, and here the two
-# answers are 32.5 and 35.
-run_case macro_is_the_mean_of_the_dataset_means 0 \
-    "the macro average does not weight a dataset by its size" \
-    'STUB_GAP_MS_SEQ=40,100,100,25,25,25,25,25,25,25,25,25,25'
-close_to "$(jq_of "r['cells']['mt_bench@1024']['mean']")" 10.0 0.001 ||
-    note_bad "mt_bench mean=$(jq_of "r['cells']['mt_bench@1024']['mean']") (want 10)"
-close_to "$(jq_of "r['cells']['humaneval@1024']['mean']")" 40.0 0.001 ||
-    note_bad "humaneval mean=$(jq_of "r['cells']['humaneval@1024']['mean']") (want 40)"
+# ── What the macro average is over ────────────────────────────────────────────
+#
+# Four wrong answers and one right one, all reachable from the same fixture, so
+# this case cannot be satisfied by the weighting it is meant to catch:
+#
+#   cell means         mt_bench 5, math_500@1024 10, humaneval 20, math_500@4096 40
+#   over four CELLS                    (5+10+20+40)/4      = 18.75
+#   over three datasets, cells averaged (5 + (10+40)/2 + 20)/3 = 16.667
+#   pooled over the 8 rows        (1*5+2*10+3*20+2*40)/8   = 20.625
+#   OVER THREE DATASETS AT 1024        (5+10+20)/3         = 11.667  <- correct
+#
+# Request order is warmup, mt_bench, math_500@1024 x2, humaneval x3,
+# math_500@4096 x2; gaps 200/100/50/25 ms give 5/10/20/40 tok/s.
+run_case macro_is_over_the_datasets_at_the_headline_budget 0 \
+    "the macro is one cell per dataset at 1024, not one per cell" \
+    'STUB_GAP_MS=40,200,100,100,50,50,50,25,25' \
+    'GREP:MACRO covers .* at 1024 output tokens'
+close_to "$(jq_of "r['cells']['mt_bench@1024']['mean']")" 5.0 0.01 ||
+    note_bad "mt_bench mean=$(jq_of "r['cells']['mt_bench@1024']['mean']") (want 5)"
+close_to "$(jq_of "r['cells']['math_500@4096']['mean']")" 40.0 0.01 ||
+    note_bad "math_500@4096 mean=$(jq_of "r['cells']['math_500@4096']['mean']") (want 40)"
 got="$(jq_of "r['macro']['mean']")"
-close_to "${got}" 32.5 0.001 ||
-    note_bad "macro=${got} (want 32.5; a pooled mean would be 35.0)"
+close_to "${got}" 11.6667 0.01 ||
+    note_bad "macro=${got} (want 11.667; four cells give 18.75, datasets-with-both-budgets 16.667, pooled 20.625)"
+[ "$(jq_of "sorted(r['macro']['cells'])")" = "['humaneval@1024', 'math_500@1024', 'mt_bench@1024']" ] ||
+    note_bad "macro covers $(jq_of "sorted(r['macro']['cells'])")"
 verdict
 
 # ── The run-to-run range refusal ──────────────────────────────────────────────
 #
-# Both sides of the band, on the same fixture: the scales put the three pass
+# Both sides of the band on one fixture: the per-pass gaps put the three pass
 # rates at 24.3875 / 25 / 25.6125 (range 4.9% of the mean) and at
-# 24.36 / 25 / 25.64 (5.12%). A gate proven to fire but never proven to hold
-# its tongue is a gate that could be firing on everything.
-UNDER_BAND="$(python3 -c 'print(",".join(f"{25/r:.9f}" for r in (24.3875, 25, 25.6125)))')"
-OVER_BAND="$(python3 -c 'print(",".join(f"{25/r:.9f}" for r in (24.36, 25, 25.64)))')"
+# 24.36 / 25 / 25.64 (5.12%). A gate proven to fire but never proven to hold its
+# tongue is a gate that could be firing on everything.
+UNDER_BAND="$(python3 -c 'print(";".join(f"{1000/r:.9f}" for r in (24.3875, 25, 25.6125)))')"
+OVER_BAND="$(python3 -c 'print(";".join(f"{1000/r:.9f}" for r in (24.36, 25, 25.64)))')"
 
 run_case range_just_under_the_band_is_a_clean_mean 0 \
     "a spread just inside the band is published as a mean" \
-    "STUB_PASS_SCALE=${UNDER_BAND}" \
+    "STUB_GAP_MS=${UNDER_BAND}" \
     'NOGREP:RANGE REFUSAL' \
     'NOGREP:UNSTABLE'
 close_to "$(jq_of "r['cells']['mt_bench@1024']['range_pct']")" 4.9 0.02 ||
@@ -582,7 +680,7 @@ verdict
 
 run_case range_over_the_band_is_refused 3 \
     "a spread past the band is not printed as a mean" \
-    "STUB_PASS_SCALE=${OVER_BAND}" \
+    "STUB_GAP_MS=${OVER_BAND}" \
     'GREP:RANGE REFUSAL' \
     'GREP:UNSTABLE' \
     'GREP:mt_bench@1024'
@@ -594,6 +692,47 @@ close_to "$(jq_of "r['cells']['mt_bench@1024']['range_pct']")" 5.12 0.02 ||
 # from the record a later pass reads.
 close_to "$(jq_of "r['cells']['mt_bench@1024']['mean']")" 25.0 0.001 ||
     note_bad "mean=$(jq_of "r['cells']['mt_bench@1024']['mean']")"
+verdict
+
+# ONE cell destabilised, and only one. mt_bench is the single-sample dataset, so
+# request index 1 is all of it: 23.5 / 25 / 26.5 tok/s across the passes is a
+# 12% range there and leaves every other cell flat.
+#
+# This is also the empirical half of why the macro has no refusal of its own.
+# The macro's OWN range here is 4% — inside the band — while the dataset it is
+# built from is refused at 12%. A macro range test would have passed this run
+# and published the headline. Withholding it because a dataset was refused is
+# what makes the MACRO row say UNSTABLE.
+ONE_CELL="$(python3 -c 'g = lambda r: f"{1000/r:.9f}"
+print(";".join(["40," + g(23.5) + ",40,40,40,40,40,40,40",
+                "40",
+                "40," + g(26.5) + ",40,40,40,40,40,40,40"]))')"
+
+run_case one_unstable_dataset_withholds_only_it_and_the_macro 3 \
+    "one refused dataset does not refuse the others, and does withhold the macro" \
+    "STUB_GAP_MS=${ONE_CELL}" \
+    'GREP:RANGE REFUSAL: mt_bench@1024 —' \
+    'GREP:MACRO is withheld too'
+[ "$(jq_of "r['cells']['mt_bench@1024']['stable']")" = "False" ] ||
+    note_bad "the destabilised cell is marked stable"
+for cell in math_500@1024 humaneval@1024 math_500@4096; do
+    [ "$(jq_of "r['cells']['${cell}']['stable']")" = "True" ] ||
+        note_bad "${cell} was refused along with mt_bench"
+    close_to "$(jq_of "r['cells']['${cell}']['mean']")" 25.0 0.001 ||
+        note_bad "${cell} mean=$(jq_of "r['cells']['${cell}']['mean']")"
+done
+[ "$(jq_of "r['macro']['stable']")" = "False" ] ||
+    note_bad "the macro was published while a dataset it covers was refused"
+got="$(jq_of "r['macro']['range_pct']")"
+close_to "${got}" 4.0 0.05 ||
+    note_bad "macro range=${got} (want ~4.0 — inside the band, which is the point)"
+# The pass-mean range cannot see a sample that moves and moves back, so the
+# widest single-sample spread is reported beside it — and is not a refusal.
+got="$(jq_of "r['cells']['mt_bench@1024']['sample_range_pct_max']")"
+close_to "${got}" 12.0 0.05 ||
+    note_bad "sample_range_pct_max=${got} (want ~12)"
+[ "$(jq_of "r['cells']['math_500@1024']['sample_range_pct_max']")" = "0.0" ] ||
+    note_bad "a flat cell reported a spread"
 verdict
 
 # ── What is sent ──────────────────────────────────────────────────────────────
@@ -616,6 +755,10 @@ def address(messages):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+# The warmup carries its own token budget, so the two are told apart by it.
+warmups = [b for b in bodies if b["max_tokens"] == 64]
+measured = [b for b in bodies if b["max_tokens"] != 64]
+
 print(eval(sys.argv[3]))
 PY
 }
@@ -624,27 +767,82 @@ PY
 # sampling field at all means. A temperature spelled here would be a second
 # copy of a fact the snapshot owns, and the one that got published.
 run_case sampling_fields_are_not_sent 0 \
-    "no request carries a sampling parameter of this script's" \
-    'GREP:sampling   : model defaults'
+    "no request carries a sampling parameter of this script's"
 for field in temperature top_p top_k seed repetition_penalty; do
     [ "$(bodies_check "any('${field}' in b for b in bodies)")" = "False" ] ||
         note_bad "a request carried ${field}"
 done
 [ "$(bodies_check "all(b['enable_thinking'] is True for b in bodies)")" = "True" ] ||
     note_bad "a request did not ask for thinking"
-[ "$(bodies_check "sorted({b['max_tokens'] for b in bodies})")" = "[1024, 4096]" ] ||
+# The warmup is a 64-token request on a prompt outside the sample sets, so the
+# budgets sent are its own plus the two the protocol pins.
+[ "$(bodies_check "sorted({b['max_tokens'] for b in bodies})")" = "[64, 1024, 4096]" ] ||
     note_bad "max_tokens sent: $(bodies_check "sorted({b['max_tokens'] for b in bodies})")"
+verdict
+
+# What the run sampled under is the engine's to say. Re-reading the checkpoint
+# file would print what should have happened, which is a different claim.
+run_case sampling_is_read_back_from_the_engine 0 \
+    "the published sampling is the one the engine says it resolved" \
+    'STUB_SAMPLER_TOP_K=20' \
+    'GREP:sampling: .*"top_k": 20'
+[ "$(jq_of "r['protocol']['sampling_resolved']['top_k']")" = "20" ] ||
+    note_bad "top_k=$(jq_of "r['protocol']['sampling_resolved']['top_k']")"
+[ "$(jq_of "r['protocol']['sampling_resolved']['temperature']")" = "0.6" ] ||
+    note_bad "temperature=$(jq_of "r['protocol']['sampling_resolved']['temperature']")"
+# The request sends no seed, so the engine substitutes one and three passes
+# replay a single RNG stream. That belongs in the record, not in a footnote.
+[ "$(jq_of "r['protocol']['sampling_resolved']['seed']")" = "42919" ] ||
+    note_bad "seed=$(jq_of "r['protocol']['sampling_resolved']['seed']")"
+verdict
+
+run_case sampler_drift_between_passes_refused 1 \
+    "passes that sampled under different settings are not averaged" \
+    'STUB_SAMPLER_TOP_K=20' 'STUB_SAMPLER_TOP_K_PASS2=40' \
+    'GREP:not repetitions of one measurement'
+no_result
+verdict
+
+run_case unreported_sampling_refused 1 \
+    "a run whose sampling cannot be read back files nothing" \
+    'STUB_SAMPLER_LINES=0' \
+    'GREP:holds no sampler event'
+no_result
+verdict
+
+# The other arm of that branch: a greedy checkpoint resolves no sampler, the
+# engine writes no such event, and the harness must expect none rather than
+# refuse a run for lacking one.
+run_case greedy_checkpoint_resolves_no_sampler 0 \
+    "a checkpoint whose own default is greedy is measured, not refused" \
+    "VERIFIER:${GREEDY}" 'STUB_SAMPLED=0'
+[ "$(jq_of "r['protocol']['sampling_resolved']")" = "None" ] ||
+    note_bad "sampling_resolved=$(jq_of "r['protocol']['sampling_resolved']")"
+verdict
+
+run_case sampler_event_on_a_greedy_run_refused 1 \
+    "a greedy run whose engine resolved a sampler anyway is refused" \
+    "VERIFIER:${GREEDY}" 'STUB_SAMPLED=1' \
+    'GREP:resolved a sampler this run was not supposed to have'
+no_result
 verdict
 
 # The workspace builds serde_json with preserve_order, so a message re-emitted
 # as {content, role} has a different content address than the {role, content}
 # that was checked in — and a later join on it splits with nothing saying so.
 run_case messages_keep_their_content_address 0 \
-    "every request's messages still hash to the checked-in address"
-[ "$(bodies_check "all(address(b['messages']) in digests for b in bodies)")" = "True" ] ||
-    note_bad "a request's messages no longer hash to any checked-in body_sha256"
+    "every measured request's messages still hash to the checked-in address"
+# `measured` excludes the warmup, whose 64-token budget is its own. That the
+# warmup's prompt is in no sample set is the point of it: an untimed request on
+# a measured sample would leave that one sample facing a warm prompt cache.
+[ "$(bodies_check "all(address(b['messages']) in digests for b in measured)")" = "True" ] ||
+    note_bad "a measured request's messages no longer hash to any checked-in body_sha256"
 [ "$(bodies_check "all(list(m) == ['role', 'content'] for b in bodies for m in b['messages'])")" = "True" ] ||
     note_bad "a message was re-emitted with its keys in another order"
+[ "$(bodies_check "any(address(b['messages']) in digests for b in warmups)")" = "False" ] ||
+    note_bad "the warmup re-used a measured sample's prompt"
+[ "$(bodies_check "len(warmups)")" = "3" ] ||
+    note_bad "$(bodies_check "len(warmups)") warmups for three passes"
 verdict
 
 # Thinking tokens are generated tokens and the server counts them; the harness
@@ -665,6 +863,20 @@ run_case missing_prompt_tokens_refused 1 \
 no_result
 verdict
 
+# The client-side reader falls back to a count of content chunks when the usage
+# chunk carried no completion count, and content chunks miss every token whose
+# visible piece is empty. Publishing that under an engine field's name reads low
+# with nothing saying so, so the row is refused instead. The only server in play
+# builds one Usage struct carrying both counts, so this input is not reachable
+# from it today — which is exactly why it is staged here rather than left to the
+# prompt_tokens requirement to catch by accident.
+run_case usage_without_completion_tokens_refused 1 \
+    "a count of content chunks is not filed as the engine's completion count" \
+    'STUB_OMIT_COMPLETION_TOKENS=1' \
+    'GREP:carries no completion_tokens'
+no_result
+verdict
+
 # TTFT is the engine's, off its own event, per request.
 run_case ttft_is_the_engines_reading 0 \
     "each row carries the TTFT the engine reported" \
@@ -678,8 +890,8 @@ verdict
 # being measured, and the events that survive belong to other samples.
 run_case truncated_ttft_log_refused 1 \
     "a log missing a request's TTFT event is refused" \
-    'STUB_TTFT_LINES=5' \
-    'GREP:TTFT events, expected 13'
+    'STUB_TTFT_LINES=4' \
+    "GREP:TTFT events, expected ${EVENTS_PER_PASS}"
 no_result
 verdict
 
@@ -692,8 +904,8 @@ verdict
 
 run_case truncated_itl_log_refused 1 \
     "a plain log missing a request's ITL event is refused" \
-    'STUB_ITL_LINES=7' \
-    'GREP:ITL stats events, expected 13'
+    'STUB_ITL_LINES=5' \
+    "GREP:ITL stats events, expected ${EVENTS_PER_PASS}"
 no_result
 verdict
 
@@ -805,25 +1017,6 @@ verdict
 
 # ── The inputs ────────────────────────────────────────────────────────────────
 
-TAMPERED="${WORK}/tampered"
-cp -R "${SAMPLES}" "${TAMPERED}"
-python3 - "${TAMPERED}" <<'PY' || exit 2
-import json, pathlib, sys
-
-root = pathlib.Path(sys.argv[1])
-path = root / "mt_bench.json"
-doc = json.loads(path.read_text(encoding="utf-8"))
-doc["samples"][0]["messages"][0]["content"] += " (edited)"
-path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-PY
-
-run_case tampered_sample_set_refused 1 \
-    "a sample file that no longer re-derives is not measured against" \
-    "ARGS:--samples-root" "ARGS:${TAMPERED}" \
-    'GREP:do not re-derive from'
-no_result
-verdict
-
 # The cell table and the sample sets can drift apart two ways, and neither is
 # reachable by editing a manifest: `published_samples.py verify` pins the
 # manifest's dataset keys to its own source list first. The drift is a cell
@@ -864,21 +1057,24 @@ verdict
 
 payload_case every_dataset_covered_is_accepted 0 \
     "a cell table that covers the root renders every request" \
-    "12 requests over 4 cells" \
+    "8 requests over 4 cells" \
     mt_bench:1024 math_500:1024 humaneval:1024 math_500:4096
 verdict
 
 run_case snapshot_without_sampling_defaults_refused 1 \
     "a checkpoint that states no sampling defaults is not measured" \
     "VERIFIER:${NO_DEFAULTS}" \
-    'GREP:hard-coded temperature 1.0'
+    'GREP:generation_config.json does not exist' \
+    'GREP:top-k disabled'
 no_result
 verdict
 
-run_case snapshot_with_half_the_defaults_refused 1 \
-    "a checkpoint that states only some of them is refused too" \
+# Each of the three has a fallback that is not this checkpoint's, and top_k's is
+# the quiet one: absent means top-k disabled, while the protocol names top-k 20.
+run_case snapshot_without_top_k_refused 1 \
+    "a checkpoint stating temperature and top_p but no top_k is refused" \
     "VERIFIER:${HALF_DEFAULTS}" \
-    'GREP:states no top_p'
+    'GREP:states no top_k'
 no_result
 verdict
 
@@ -926,6 +1122,19 @@ run_case hostile_host_measured_with_the_waiver_is_tainted 0 \
     note_bad "the result does not record the taint: $(jq_of "r['host']['taint']")"
 verdict
 
+# `unmeasured` is a snapshot nobody could take. Folding it into "nothing was
+# running" is the exact failure the entry gate is careful to avoid, and the
+# per-pass window has to be equally careful. This host answers the entry gate
+# and then stops answering.
+run_case unmeasured_pass_window_taints 0 \
+    "a pass window nobody could sample taints the run" \
+    MEASURED:1 HOST:flaky \
+    'GREP:TAINTED' \
+    'GREP:unmeasured'
+[ "$(jq_of "'unmeasured' in r['host']['taint']")" = "True" ] ||
+    note_bad "the result does not record it: $(jq_of "r['host']['taint']")"
+verdict
+
 run_case quiet_host_measured 0 \
     "a quiet host measures without a taint" \
     MEASURED:1 HOST:quiet \
@@ -958,12 +1167,68 @@ SYNTHETIC_QUIET_MEAN="$(jq_of "r['macro']['mean']")"
 verdict
 
 # The flag waives host state and nothing else. A mode that skipped every guard
-# would make this whole suite green.
+# would make this whole suite green. The guard used here is deliberately not the
+# one any other case breaks: sharing one would mean a single mutation kills both
+# and this case proves nothing the other did not.
 run_case synthetic_arms_waives_no_arm_reading_guard 1 \
     "the flag does not waive a guard that reads the run" \
-    HOST:hostile 'STUB_TTFT_LINES=5' \
-    'GREP:TTFT events, expected 13'
+    HOST:hostile 'STUB_KV_QUANT_SUPPRESS=1' \
+    'GREP:never said which KV codec'
 no_result
+verdict
+
+# ── An aborted run ────────────────────────────────────────────────────────────
+#
+# Three servers run per invocation, and a SIGTERM to the harness — a CI timeout,
+# an operator, a parent tearing down — must not leave one alive holding the
+# Metal claim. The next run's preflight would not find it: `pkill -f "rmlx
+# serve"` does not match a snapshotted binary.
+sigterm_case() {
+    CASE_NAME="sigterm_leaves_no_server_running"
+    CASE_WHAT="a killed run takes its server with it"
+    CASE_HOME="${WORK}/home_${CASE_NAME}"
+    CASE_OUT="${WORK}/${CASE_NAME}.log"
+    CASE_BAD=""
+    mkdir -p "${CASE_HOME}/logs"
+
+    env -i \
+        PATH="${WORK}/quiet:${SHIMS}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        HOME="${WORK}" \
+        RMLX_HOME="${CASE_HOME}" \
+        STUB_BOUND_FLAG="${CASE_HOME}/stub_bound" \
+        STUB_PREFILL_S=5 \
+        bash "${FAKE_ROOT}/scripts/spec_bench_published.sh" \
+        "${VERIFIER}" --port "${PORT}" --samples-root "${SAMPLES}" \
+        --synthetic-arms >"${CASE_OUT}" 2>&1 &
+    local harness=$!
+
+    local waited=0
+    while [ ! -s "${CASE_HOME}/stub_bound" ] && [ "${waited}" -lt 200 ]; do
+        /bin/sleep 0.1
+        waited=$((waited + 1))
+    done
+    if [ ! -s "${CASE_HOME}/stub_bound" ]; then
+        note_bad "the stub never bound; nothing was killed"
+        kill "${harness}" 2>/dev/null
+        return
+    fi
+    local server
+    server="$(head -1 "${CASE_HOME}/stub_bound")"
+
+    kill -TERM "${harness}" 2>/dev/null
+    wait "${harness}" 2>/dev/null
+
+    waited=0
+    while kill -0 "${server}" 2>/dev/null && [ "${waited}" -lt 50 ]; do
+        /bin/sleep 0.1
+        waited=$((waited + 1))
+    done
+    if kill -0 "${server}" 2>/dev/null; then
+        note_bad "server ${server} outlived the harness"
+        kill -9 "${server}" 2>/dev/null
+    fi
+}
+sigterm_case
 verdict
 
 # ── The aggregate's own inputs ────────────────────────────────────────────────
@@ -999,7 +1264,7 @@ for obj in passes:
     (out / f"pass{obj['pass']}.json").write_text(json.dumps(obj))
 PY
     python3 "${AGGREGATE}" report "${dir}"/pass*.json --range-pct 5 \
-        >"${CASE_OUT}" 2>&1
+        --macro-max-tokens 1024 >"${CASE_OUT}" 2>&1
     local got=$?
     CASE_BAD=""
     [ "${got}" -ne "${want}" ] && CASE_BAD="exit=${got} (want ${want})"
@@ -1016,6 +1281,26 @@ agg_case cell_dropped_from_a_pass 1 \
     "passes that measured different cells are not averaged" \
     "a mean over two sample sets" \
     'passes[2]["samples"] = [dict(r, cell="b@1024") for r in passes[2]["samples"]]'
+verdict
+
+# 24.375 / 25 / 25.625 have a range of exactly 5.000% of their mean, and all
+# three are exact in binary so the comparison is not decided by rounding. The
+# band is `<=`, so this publishes. No fixture driven through the wire can land
+# on the boundary; this one can.
+agg_case range_exactly_at_the_band_publishes 0 \
+    "the band is inclusive, and the boundary is where that is decided" \
+    "MACRO" \
+    'for n, tps in ((0, 24.375), (1, 25.0), (2, 25.625)):
+    for row in passes[n]["samples"]:
+        row["decode_tps"] = tps
+        row["client_decode_tps"] = tps'
+verdict
+
+agg_case macro_needs_one_cell_per_dataset 1 \
+    "a dataset with two cells at the macro budget is refused, not counted twice" \
+    "cells at the macro budget" \
+    'passes[:] = [dict(p, samples=p["samples"] + [dict(r, cell="a@1024#2",
+        sample_id=r["sample_id"] + "b") for r in p["samples"]]) for p in passes]'
 verdict
 
 agg_case two_passes_is_not_three 1 \

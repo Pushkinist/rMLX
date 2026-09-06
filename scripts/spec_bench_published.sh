@@ -11,7 +11,7 @@
 #     --kv-quant Q             KV codec to ask the engine for
 #     --max-ctx N              context the server is started with
 #     --port N
-#     --samples-root DIR       default prompts/published
+#     --samples-root DIR       measure an unpinned copy instead; not recordable
 #     --allow-busy-host        measure anyway, and taint the result
 #     --synthetic-arms         the server is a stub, so this run measures nothing
 #
@@ -33,11 +33,19 @@
 #
 # WHAT THE PROTOCOL DOES NOT STATE, AND WE THEREFORE CHOOSE AND PRINT
 #
-#   sampling      the model's own defaults, from its generation_config.json.
-#                 The request carries no temperature, top_p, top_k or seed, so
-#                 there is one copy of them and it is the checkpoint's. A
-#                 snapshot that states none is refused rather than measured
-#                 under the engine's hard-coded 1.0.
+#   sampling      the model's own defaults. The request carries no temperature,
+#                 top_p, top_k or seed, so there is one copy of them and it is
+#                 the checkpoint's. A snapshot stating none of the three the
+#                 protocol names is refused before anything is served, because
+#                 the engine's fallbacks — temperature 1.0, top_p 1.0, top_k 0
+#                 (disabled) — would then be published as that checkpoint's
+#                 defaults. `repetition_penalty` is not required: the protocol
+#                 does not name it and its fallback is 1.0, the neutral element.
+#                 What is PRINTED and recorded is not that file but the sampling
+#                 the engine says it resolved, read back per request from its
+#                 own log. The seed is part of it: the request sends none and
+#                 the engine substitutes a fixed default, so the three passes
+#                 replay one RNG stream rather than sampling independently.
 #   thinking      on, and its tokens count as output — they are generated
 #                 tokens and the server counts them in `completion_tokens`.
 #   max output    1024 tokens, and MATH-500 a second time at 4096: a reasoning
@@ -45,6 +53,19 @@
 #   warmup        one untimed request per pass.
 #   passes        three, as the protocol says. Not a flag: a mean of any other
 #                 count is a different figure.
+#   macro         the mean of the three datasets at the 1024-token budget. The
+#                 MATH-500 4096 cell is a column beside that headline, not a
+#                 fourth dataset — averaging it in would give MATH-500 twice the
+#                 weight of the others.
+#
+# THE SAMPLE SETS
+#
+# The published number comes from `prompts/published/`, and that root is held to
+# `published_samples.py verify` before anything is served — no flag turns that
+# off. `--samples-root` measures some other copy: it is an operator override for
+# working on the harness, it is NOT verified, and the result it writes carries
+# `unverified_samples: true` so nothing downstream can promote it as a published
+# measurement.
 #
 # MEASUREMENT VS LOGIC
 #
@@ -82,6 +103,9 @@ CROSS_CHECK_BAND_PCT=10
 BUSY_PCT=25
 # `<dataset>:<max output tokens>`, one measured cell each.
 CELLS=(mt_bench:1024 math_500:1024 humaneval:1024 math_500:4096)
+# The budget the macro average is taken at — one cell per dataset. Every other
+# cell is a column beside the headline.
+MACRO_MAX_TOKENS=1024
 
 # ── Flags ────────────────────────────────────────────────────────────────────
 
@@ -92,7 +116,8 @@ DRAFT_BLOCK_SIZE=""
 KV_QUANT=""
 MAX_CTX=8192
 PORT=8090
-SAMPLES_ROOT="${REPO_ROOT}/prompts/published"
+PUBLISHED_ROOT="${REPO_ROOT}/prompts/published"
+SAMPLES_ROOT=""
 ALLOW_BUSY_HOST=false
 SYNTHETIC_ARMS=false
 
@@ -169,12 +194,30 @@ if [[ -n "${DRAFTER_MODEL}" && ! -d "${DRAFTER_MODEL}" ]]; then
 fi
 
 # The sample sets are the measurement's inputs. A number traced back to a file
-# that no longer re-derives from its manifest is traced back to nothing.
-if ! python3 "${REPO_ROOT}/scripts/published_samples.py" verify --root "${SAMPLES_ROOT}"; then
-    echo "ERROR: the sample sets under ${SAMPLES_ROOT} do not re-derive from" \
-         "their manifest; refusing to measure against them" >&2
-    exit 1
+# that no longer re-derives from what the gate pins is traced back to nothing,
+# so the published root is verified and no flag turns that off. `--samples-root`
+# is a different path entirely: an unverified operator copy, marked as such in
+# the result so nothing downstream promotes it.
+UNVERIFIED_SAMPLES=false
+if [[ -z "${SAMPLES_ROOT}" ]]; then
+    SAMPLES_ROOT="${PUBLISHED_ROOT}"
+    if ! python3 "${REPO_ROOT}/scripts/published_samples.py" verify; then
+        echo "ERROR: the published sample sets do not re-derive from what" \
+             "published_samples.py pins; refusing to measure against them" >&2
+        exit 1
+    fi
+else
+    UNVERIFIED_SAMPLES=true
+    cat >&2 <<'OVERRIDE'
+UNVERIFIED SAMPLES: --samples-root names a copy that is not the published one,
+  so it is not held to published_samples.py and this run is not a published
+  measurement. The result carries `unverified_samples: true`.
+OVERRIDE
 fi
+SAMPLES_ROOT="$(cd "${SAMPLES_ROOT}" 2>/dev/null && pwd)" || {
+    echo "ERROR: sample root not found" >&2
+    exit 1
+}
 
 SNAPSHOT_ID="$(python3 "${REPO_ROOT}/scripts/lib/snapshot_identity.py" "${VERIFIER_MODEL}")" || {
     echo "ERROR: cannot read the identity of ${VERIFIER_MODEL}" >&2
@@ -196,43 +239,27 @@ MODEL_NAME="$(field_of "${SNAPSHOT_ID}" model)"
 WEIGHT_QUANT="$(field_of "${SNAPSHOT_ID}" weight_quant)"
 MODEL_ID="$(basename "${VERIFIER_MODEL%/}")"
 
-# The request carries no sampling fields so the checkpoint's own defaults
-# apply. A snapshot that states none does not make them unknown — the engine
-# falls back to a hard-coded 1.0 / 1.0, which is nobody's default and would be
-# published as the model's.
-SAMPLING_DEFAULTS="$(
-    python3 - "${VERIFIER_MODEL}" <<'PY'
-import json, pathlib, sys
-
-path = pathlib.Path(sys.argv[1]) / "generation_config.json"
-if not path.is_file():
-    sys.exit(
-        f"ERROR: {path} does not exist: the request sends no sampling fields, so the "
-        "engine would fall back to its hard-coded temperature 1.0 / top_p 1.0 "
-        "and that would be published as this model's defaults"
-    )
-try:
-    cfg = json.loads(path.read_text(encoding="utf-8"))
-except ValueError as exc:
-    sys.exit(f"ERROR: {path} is not readable JSON: {exc}")
-missing = [k for k in ("temperature", "top_p") if cfg.get(k) is None]
-if missing:
-    sys.exit(
-        f"ERROR: {path} states no {', '.join(missing)}: the engine would fall back to "
-        "its hard-coded default and it would be published as this model's"
-    )
-print(
-    " ".join(
-        f"{k}={cfg[k]}" for k in ("temperature", "top_p", "top_k", "repetition_penalty")
-        if cfg.get(k) is not None
-    )
-)
-PY
-)" || exit 1
+# A pre-flight refusal, not the published figure: the checkpoint has to state
+# the sampling this run will be measured under, or the engine substitutes a
+# fallback nobody chose. What it actually resolved to is read back later.
+SNAPSHOT_SAMPLING="$(python3 "${REPO_ROOT}/scripts/lib/snapshot_sampling.py" \
+    "${VERIFIER_MODEL}")" || exit 1
+SAMPLED="$(field_of "${SNAPSHOT_SAMPLING}" sampled)"
 
 mkdir -p "${LOG_DIR}" "${SCRATCH_DIR}" "${RESULT_DIR}"
 WORK="$(mktemp -d "${SCRATCH_DIR}/published.XXXXXX")"
-trap 'rm -rf "${WORK}"' EXIT
+
+# Three servers run per invocation. A SIGTERM to this script — a CI timeout, an
+# operator, a parent tearing down — would otherwise leave one alive holding
+# /tmp/rmlx.*.claim, and the next run's preflight `pkill -f "rmlx serve"` does
+# not match a snapshotted binary.
+cleanup() {
+    if [[ -n "${SERVER_PID:-}" ]]; then
+        kill "${SERVER_PID}" 2>/dev/null || true
+    fi
+    rm -rf "${WORK}"
+}
+trap cleanup EXIT INT TERM
 
 # ── Payloads ─────────────────────────────────────────────────────────────────
 
@@ -247,6 +274,18 @@ python3 "${REPO_ROOT}/scripts/lib/published_payloads.py" \
     "${CELL_ARGS[@]}" || exit 1
 
 REQUESTS_PER_PASS="$(wc -l < "${CELL_INDEX}" | tr -d ' ')"
+# Written beside the cells and outside the index: the warmup is a request, not a
+# measurement.
+WARMUP_PAYLOAD="${WORK}/payloads/warmup.json"
+
+# One sampler-resolution event per request the engine actually sampled. A greedy
+# checkpoint resolves no sampler and writes none, so the reader is told to
+# expect none rather than deciding for itself.
+if [[ "${SAMPLED}" == "true" ]]; then
+    SAMPLER_EVENTS=$((REQUESTS_PER_PASS + WARMUPS_PER_PASS))
+else
+    SAMPLER_EVENTS=0
+fi
 
 # ── Host ─────────────────────────────────────────────────────────────────────
 
@@ -282,14 +321,20 @@ host_window() {
     esac
 }
 
+SAMPLES_LABEL="${SAMPLES_ROOT}"
+if $UNVERIFIED_SAMPLES; then
+    SAMPLES_LABEL="${SAMPLES_LABEL} (UNVERIFIED, not recordable)"
+fi
+
 echo "==> spec_bench_published.sh"
 echo "    verifier   : ${MODEL_NAMESPACE}/${MODEL_NAME} (${WEIGHT_QUANT})"
 echo "    arm        : ${ARM}${DRAFTER_MODEL:+ (${DRAFT_KIND:-engine default} block ${DRAFT_BLOCK_SIZE:-engine default})}"
-echo "    samples    : ${SAMPLES_ROOT} — ${REQUESTS_PER_PASS} requests per pass"
-echo "    sampling   : model defaults — ${SAMPLING_DEFAULTS}"
+echo "    samples    : ${SAMPLES_LABEL} — ${REQUESTS_PER_PASS} requests per pass"
 echo "    thinking   : on, counted as output"
 echo "    passes     : ${PASSES}, ${WARMUPS_PER_PASS} untimed warmup each"
 echo "    range band : ${RANGE_REFUSAL_PCT}% of the mean"
+echo "    sampling   : the checkpoint's own; what it resolved to is read back"
+echo "                 from the engine and printed with the results"
 echo ""
 
 if $SYNTHETIC_ARMS; then
@@ -362,7 +407,6 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
     snapshot_ok "${WORK}/pass${pass}_a" || true
     PASS_STARTED="$(date +%s)"
 
-    WARMUP_PAYLOAD="$(head -1 "${CELL_INDEX}" | cut -f6)"
     for (( w = 0; w < WARMUPS_PER_PASS; w++ )); do
         if ! send "${WARMUP_PAYLOAD}" "${WORK}/warmup.kv"; then
             echo "ERROR: pass ${pass}: the warmup request failed" >&2
@@ -398,7 +442,11 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
     snapshot_ok "${WORK}/pass${pass}_b" || true
     WINDOW="$(host_window "${WORK}/pass${pass}_a" "${WORK}/pass${pass}_b" "${PASS_SECONDS}")"
     HOST_WINDOWS+=("${WINDOW}")
-    if [[ "${WINDOW%% *}" == "busy" ]]; then
+    # Three outcomes, not two. `quiet` is nothing was running; `unmeasured` is a
+    # snapshot nobody could take, and folding that into `quiet` is how an
+    # interference gate stops gating; `not-sampled` is nobody looked, which a
+    # run that declared it would consult nothing cannot be faulted for.
+    if [[ "${WINDOW%% *}" != "quiet" && "${WINDOW%% *}" != "not-sampled" ]]; then
         note_taint "pass ${pass}: ${WINDOW}"
     fi
 
@@ -428,7 +476,9 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
     if ! python3 "${REPO_ROOT}/scripts/lib/published_run_log.py" "${PASS_LOG}" \
             --arm "${ARM}" \
             --expect-total "$((REQUESTS_PER_PASS + WARMUPS_PER_PASS))" \
-            --last "${REQUESTS_PER_PASS}" > "${PASS_DIR}/engine.json"; then
+            --last "${REQUESTS_PER_PASS}" \
+            --expect-sampler-events "${SAMPLER_EVENTS}" \
+            > "${PASS_DIR}/engine.json"; then
         echo "ERROR: pass ${pass}: no usable per-request record in ${PASS_LOG}" >&2
         exit 1
     fi
@@ -441,6 +491,20 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
         exit 1
     fi
     PASS_FILES+=("${PASS_DIR}/pass.json")
+
+    # What the run actually sampled under, off the engine's own event. The
+    # checkpoint's file said what should happen; this says what did.
+    PASS_SAMPLING="$(python3 -c 'import json, sys
+print(json.dumps(json.load(open(sys.argv[1]))["sampling"], sort_keys=True))' \
+        "${PASS_DIR}/engine.json")"
+    if [[ -n "${SAMPLING_SEEN:-}" && "${SAMPLING_SEEN}" != "${PASS_SAMPLING}" ]]; then
+        echo "ERROR: pass ${pass} sampled under ${PASS_SAMPLING} where an earlier" \
+             "pass sampled under ${SAMPLING_SEEN}; the passes are not repetitions" \
+             "of one measurement" >&2
+        exit 1
+    fi
+    SAMPLING_SEEN="${PASS_SAMPLING}"
+
     echo "  [pass ${pass}] host window: ${WINDOW}"
     echo ""
 done
@@ -451,8 +515,10 @@ META="${WORK}/meta.json"
 SYNTHETIC_ARMS="${SYNTHETIC_ARMS}" ARM="${ARM}" \
 MODEL_NAMESPACE="${MODEL_NAMESPACE}" MODEL_NAME="${MODEL_NAME}" \
 WEIGHT_QUANT="${WEIGHT_QUANT}" KV_QUANT_SEEN="${KV_QUANT_SEEN}" \
-MAX_CTX="${MAX_CTX}" SAMPLING_DEFAULTS="${SAMPLING_DEFAULTS}" \
+MAX_CTX="${MAX_CTX}" SAMPLING_SEEN="${SAMPLING_SEEN}" \
 WARMUPS_PER_PASS="${WARMUPS_PER_PASS}" PASSES="${PASSES}" \
+MACRO_MAX_TOKENS="${MACRO_MAX_TOKENS}" \
+UNVERIFIED_SAMPLES="${UNVERIFIED_SAMPLES}" \
 SAMPLES_ROOT="${SAMPLES_ROOT}" TAINT="${TAINT}" \
 HOST_WINDOWS="$(printf '%s\n' "${HOST_WINDOWS[@]}")" \
 python3 - > "${META}" <<'PY'
@@ -470,11 +536,15 @@ print(json.dumps({
     "kv_quant": os.environ["KV_QUANT_SEEN"],
     "ctx_max": int(os.environ["MAX_CTX"]),
     "samples_root": os.environ["SAMPLES_ROOT"],
+    # Not a published measurement: the samples it ran on are not the pinned ones.
+    "unverified_samples": os.environ["UNVERIFIED_SAMPLES"] == "true",
     "protocol": {
         "passes": int(os.environ["PASSES"]),
         "warmups_per_pass": int(os.environ["WARMUPS_PER_PASS"]),
-        "sampling": "model defaults — " + os.environ["SAMPLING_DEFAULTS"],
-        "seed": None,
+        "macro_max_tokens": int(os.environ["MACRO_MAX_TOKENS"]),
+        # Read back from the engine, not re-derived from the checkpoint file.
+        # null means the checkpoint is greedy and resolved no sampler.
+        "sampling_resolved": json.loads(os.environ["SAMPLING_SEEN"]),
         "thinking": "on, counted as output",
     },
     # A run that consulted nothing files no reading taken off this machine.
@@ -490,13 +560,18 @@ set +e
 python3 "${REPO_ROOT}/scripts/lib/published_aggregate.py" report \
     "${PASS_FILES[@]}" \
     --range-pct "${RANGE_REFUSAL_PCT}" \
+    --macro-max-tokens "${MACRO_MAX_TOKENS}" \
     --meta "${META}" \
     --json "${RESULT}"
 REPORT_STATUS=$?
 set -e
 
 echo ""
+echo "sampling: ${SAMPLING_SEEN}  (read back from the engine)"
 echo "result: ${RESULT}"
+if $UNVERIFIED_SAMPLES; then
+    echo "UNVERIFIED SAMPLES: not a published measurement, not recordable."
+fi
 if [[ -n "${TAINT}" ]]; then
     echo "TAINTED: ${TAINT}"
 fi

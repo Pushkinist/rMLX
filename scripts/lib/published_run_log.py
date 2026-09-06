@@ -26,8 +26,14 @@ over "the samples that worked" is not a mean over the sample set.
 
 Output (stdout): one JSON object.
 
-    {"arm": "...", "requests": [{...}, ...],
+    {"arm": "...", "requests": [{...}, ...], "sampling": {...} | null,
      "decode_config": "...", "block_size": n, "charged": false}
+
+`sampling` is the temperature / top_p / top_k / min_p / seed the engine says it
+resolved, read back rather than re-derived from the checkpoint's file — the
+request sends no sampling field, so what actually ran is only knowable from the
+engine. It is null for a greedy checkpoint, which resolves no sampler and
+writes no such event.
 
 `decode_config`, `block_size` and `charged` are present on the speculative arm
 only. Each request carries `ttft_ms` and `decode_tps`, plus `step_count` on the
@@ -50,7 +56,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import spec_round_log  # noqa: E402
 
 TTFT_MARKER = "generate_streaming: TTFT"
-ITL_MARKER = "generate: ITL stats"
+# Anchored, not a substring test: the speculative path writes
+# "spec generate: ITL stats (M30)", which contains this one.
+ITL_MESSAGE = "generate: ITL stats (M30)"
+SAMPLER_MARKER = "generate: host categorical sampler active"
+# The fields the engine says it resolved for a request. `seed` is on the list
+# because the request sends none and the engine substitutes a fixed default, so
+# three passes replay one RNG stream rather than sampling independently — a
+# fact a published number has to carry.
+SAMPLER_FIELDS = ("temperature", "top_p", "top_k", "min_p", "seed")
 
 # The round loop's own figures, copied onto each request as it reported them.
 # `spec_round_log.check_derived` has already refused any that contradict the
@@ -80,8 +94,11 @@ class CountError(Exception):
     """The log holds a different number of events than requests were served."""
 
 
-def events_matching(path, marker):
+def events_matching(path, marker, exact=False):
     """The `fields` of every event whose message holds `marker`, in file order.
+
+    `exact` compares the whole message, for a marker that is a substring of
+    another event's.
 
     A log can be truncated mid-write by a killed server, so a line that is not
     JSON is skipped rather than losing the rest of the file.
@@ -96,9 +113,49 @@ def events_matching(path, marker):
             except ValueError:
                 continue
             fields = record.get("fields")
-            if isinstance(fields, dict) and marker in fields.get("message", ""):
+            if not isinstance(fields, dict):
+                continue
+            message = fields.get("message", "")
+            if message == marker if exact else marker in message:
                 found.append(fields)
     return found
+
+
+def sampler_config(path, expect_total, last):
+    """The sampling the engine says it resolved, if it resolved any.
+
+    The event is written per request and only when the sampler is active
+    (`temperature > 0`), so a greedy checkpoint produces none — which is why the
+    caller states how many it expects rather than this deciding. Every event
+    must agree: three passes of one protocol are one sampling setup, and a
+    request that got another is not a repetition of the others.
+    """
+    events = events_matching(path, SAMPLER_MARKER)
+    if expect_total == 0:
+        if events:
+            raise LogError(
+                f"the log holds {len(events)} sampler events on a run whose "
+                "checkpoint states no sampling temperature: the engine resolved a "
+                "sampler this run was not supposed to have"
+            )
+        return None
+    events = take(events, "sampler", expect_total, last)
+    resolved = {}
+    for name in SAMPLER_FIELDS:
+        values = {e.get(name) for e in events}
+        if None in values:
+            raise LogError(
+                f"a sampler event carries no {name}: the sampling this run used "
+                "cannot be read back, only guessed at from the checkpoint's file"
+            )
+        if len(values) > 1:
+            raise LogError(
+                f"the sampler events report {len(values)} values for {name} "
+                f"({', '.join(sorted(str(v) for v in values))}); the requests of "
+                "one pass did not share one sampling setup"
+            )
+        resolved[name] = values.pop()
+    return resolved
 
 
 def take(events, kind, expect_total, last):
@@ -142,7 +199,7 @@ def itl_rate(fields):
     return 1000.0 / mean_ms, step_count
 
 
-def plain_requests(path, expect_total, last):
+def plain_requests(path, expect_total, last, sampler_events):
     """One row per request, for a server that was given no drafter."""
     intruders = spec_round_log.done_events(path)
     if intruders:
@@ -152,7 +209,7 @@ def plain_requests(path, expect_total, last):
             "server, or the drafter reached it another way"
         )
     ttfts = take(events_matching(path, TTFT_MARKER), "TTFT", expect_total, last)
-    itls = take(events_matching(path, ITL_MARKER), "ITL stats", expect_total, last)
+    itls = take(events_matching(path, ITL_MESSAGE, exact=True), "ITL stats", expect_total, last)
     rows = []
     for ttft, itl in zip(ttfts, itls):
         rate, step_count = itl_rate(itl)
@@ -163,10 +220,14 @@ def plain_requests(path, expect_total, last):
                 "step_count": step_count,
             }
         )
-    return {"arm": "plain", "requests": rows}
+    return {
+        "arm": "plain",
+        "requests": rows,
+        "sampling": sampler_config(path, sampler_events, last),
+    }
 
 
-def speculative_requests(path, expect_total, last):
+def speculative_requests(path, expect_total, last, sampler_events):
     """One row per request, for a server that was given a drafter."""
     ttfts = take(events_matching(path, TTFT_MARKER), "TTFT", expect_total, last)
     events = spec_round_log.done_events(path)
@@ -198,6 +259,7 @@ def speculative_requests(path, expect_total, last):
     return {
         "arm": "speculative",
         "requests": rows,
+        "sampling": sampler_config(path, sampler_events, last),
         "decode_config": spec_round_log.one_value(events, "decode_config"),
         "block_size": spec_round_log.one_value(events, "block_size"),
         "charged": spec_round_log.charged_flag(events),
@@ -225,11 +287,23 @@ def main():
         default=0,
         help="keep only the last N rows (0 = all), dropping the warmups",
     )
+    parser.add_argument(
+        "--expect-sampler-events",
+        type=int,
+        required=True,
+        help=(
+            "sampler-resolution events the log must hold — the request count "
+            "when the checkpoint states a temperature above zero, 0 when it is "
+            "greedy and the engine writes none"
+        ),
+    )
     args = parser.parse_args()
 
     read = plain_requests if args.arm == "plain" else speculative_requests
     try:
-        result = read(args.log, args.expect_total, args.last)
+        result = read(
+            args.log, args.expect_total, args.last, args.expect_sampler_events
+        )
     except OSError as exc:
         print(f"published_run_log: cannot read {args.log}: {exc}", file=sys.stderr)
         return 2

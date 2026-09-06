@@ -28,7 +28,11 @@ reading of the same window; see `scripts/spec_bench.sh`.
 
 Output (stdout), one `key=value` per line:
 
-    tokens=<n>          completion tokens, from the usage chunk when present
+    tokens=<n>          completion tokens from the usage chunk, or — when it
+                        carried none — the count of content chunks. A caller
+                        that must not publish a client derivation under an
+                        engine field's name reads `completion_tokens` instead.
+    completion_tokens=<n>  from the usage chunk; omitted when it carried none
     content_chunks=<n>  chunks that carried text — the window's token count
     prompt_tokens=<n>   from the usage chunk; omitted when it carried none
     decode_tps=<f>      omitted when the response has no measurable window
@@ -106,6 +110,8 @@ def report(arrivals, text, usage_tokens, prompt_tokens):
         )
     tokens = usage_tokens if usage_tokens is not None else len(arrivals)
     lines = [f"tokens={tokens}", f"content_chunks={len(arrivals)}"]
+    if usage_tokens is not None:
+        lines.append(f"completion_tokens={usage_tokens}")
     if prompt_tokens is not None:
         lines.append(f"prompt_tokens={prompt_tokens}")
     if len(arrivals) >= 2:

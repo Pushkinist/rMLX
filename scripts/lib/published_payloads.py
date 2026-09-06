@@ -22,6 +22,12 @@ is the checkpoint's own, and the way to send the checkpoint's own is to send
 none. Thinking is asked for explicitly — it is a pinned choice of the protocol,
 not a template default this is willing to inherit.
 
+`warmup.json` is written beside the cells and left out of the index. Its prompt
+is not in any sample set: an untimed warmup on the first measured sample would
+leave that one sample facing a warm prompt cache while every other is cold, and
+the protocol defines input speed over a cold one. A warmup is there to make the
+weights resident and the kernels compiled, which any prompt does.
+
 Exit codes: 0 — written; 1 — the cell table and the root do not describe one
 measurement, or a dataset is empty; 2 — the root could not be read.
 """
@@ -55,10 +61,41 @@ def check_coverage(files, cells):
         )
 
 
+WARMUP_PROMPT = "Say hello."
+WARMUP_MAX_TOKENS = 64
+
+
+def payload(model_id, messages, max_tokens):
+    return {
+        "model": model_id,
+        "messages": messages,
+        "max_tokens": int(max_tokens),
+        "enable_thinking": True,
+        "stream": True,
+        # The prompt length recorded with a request is the one the server
+        # counted, and it only says so when asked.
+        "stream_options": {"include_usage": True},
+    }
+
+
+def write_json(path, body):
+    path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+
+
 def render(root, out, model_id, cells):
     """(cell, dataset, max_tokens, sample_id, body_sha256, payload_path) rows."""
     files = load_root(root)
     check_coverage(files, cells)
+
+    out.mkdir(parents=True, exist_ok=True)
+    write_json(
+        out / "warmup.json",
+        payload(
+            model_id,
+            [{"role": "user", "content": WARMUP_PROMPT}],
+            WARMUP_MAX_TOKENS,
+        ),
+    )
 
     rows = []
     for dataset, max_tokens in cells:
@@ -69,21 +106,11 @@ def render(root, out, model_id, cells):
         cell_dir = out / cell
         cell_dir.mkdir(parents=True, exist_ok=True)
         for i, sample in enumerate(doc["samples"]):
-            body = {
-                "model": model_id,
-                "messages": sample["messages"],
-                "max_tokens": int(max_tokens),
-                "enable_thinking": True,
-                "stream": True,
-                # The prompt length recorded with a request is the one the
-                # server counted, and it only says so when asked.
-                "stream_options": {"include_usage": True},
-            }
-            payload = cell_dir / f"{i:05d}.json"
-            payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+            path = cell_dir / f"{i:05d}.json"
+            write_json(path, payload(model_id, sample["messages"], max_tokens))
             rows.append(
                 (cell, dataset, str(max_tokens), sample["id"],
-                 sample["body_sha256"], str(payload))
+                 sample["body_sha256"], str(path))
             )
     return rows
 
