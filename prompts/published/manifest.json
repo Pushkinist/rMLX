@@ -18,7 +18,13 @@
         "url": "https://raw.githubusercontent.com/lm-sys/FastChat/b494d0c6b4e7935f1764f8439e75da3e66beccc7/fastchat/llm_judge/data/mt_bench/question.jsonl",
         "encoding": "jsonl",
         "cache_file": "mt_bench.question.jsonl",
-        "sha256": "119565adbab82227089cefdb44c8d7e2cf04dc0a0ec233634c82e7d4e2a944f7"
+        "sha256": "119565adbab82227089cefdb44c8d7e2cf04dc0a0ec233634c82e7d4e2a944f7",
+        "license": {
+          "spdx": "Apache-2.0",
+          "holder": "LM-SYS / FastChat contributors",
+          "url": "https://github.com/lm-sys/FastChat/blob/main/LICENSE",
+          "redistribution": "permitted with attribution and licence text"
+        }
       },
       "pool_id_field": "question_id",
       "pool_size": 80,
@@ -206,7 +212,13 @@
         "url": "https://huggingface.co/datasets/HuggingFaceH4/MATH-500/resolve/6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be/test.jsonl",
         "encoding": "jsonl",
         "cache_file": "math_500.test.jsonl",
-        "sha256": "35dc41080a3680858b27fa7e0533d2d547825316fc5dafe5d316f4ccc5a06132"
+        "sha256": "35dc41080a3680858b27fa7e0533d2d547825316fc5dafe5d316f4ccc5a06132",
+        "license": {
+          "spdx": "MIT",
+          "holder": "OpenAI (prm800k split) over Hendrycks et al. MATH",
+          "url": "https://github.com/openai/prm800k/blob/main/LICENSE",
+          "redistribution": "permitted with attribution and licence text. The Hugging Face card for HuggingFaceH4/MATH-500 declares no licence of its own; it republishes the prm800k test split (MIT), which subsets hendrycks/math (MIT). Both upstream licences permit redistribution."
+        }
       },
       "pool_id_field": "unique_id",
       "pool_size": 500,
@@ -863,7 +875,13 @@
         "url": "https://raw.githubusercontent.com/openai/human-eval/463c980b59e818ace59f6f9803cd92c749ceae61/data/HumanEval.jsonl.gz",
         "encoding": "jsonl.gz",
         "cache_file": "humaneval.HumanEval.jsonl.gz",
-        "sha256": "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef"
+        "sha256": "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef",
+        "license": {
+          "spdx": "MIT",
+          "holder": "OpenAI",
+          "url": "https://github.com/openai/human-eval/blob/master/LICENSE",
+          "redistribution": "permitted with attribution and licence text"
+        }
       },
       "pool_id_field": "task_id",
       "pool_size": 164,
