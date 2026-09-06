@@ -35,6 +35,12 @@
 //! this one is greedy, and the serve layer routes a sidecar request to it
 //! whatever the request's temperature.
 
+// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
+// caches a round builds live for that round only: they are never pushed to the
+// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
+// description has to match them. Applying the boundary promotion here would
+// change the codec of a stack whose only reader is the round that built it.
+
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};

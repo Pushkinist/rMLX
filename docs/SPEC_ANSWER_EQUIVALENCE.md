@@ -15,15 +15,20 @@ against.
 
 ## What it runs
 
-Two pairs, each over every prompt in the file. The assistant pair resolves both
+Three pairs, each over every prompt in the file. The assistant pair resolves both
 halves by slug from `RMLX_O_MODELS_ROOT` and so runs wherever the snapshots are;
-the recurrent pair's drafter is named by the operator and its verifier is the
+the other two have their drafter named by the operator and their verifier is the
 reason (below):
 
 | verifier | drafter | round loop | rollback |
 |---|---|---|---|
 | `gemma-4-e2b-it-mxfp8` | `gemma-4-E2B-it-assistant-bf16` | shared-K/V assistant | KV truncation, SWA ring included |
 | `Qwen3.8-27B-mxfp8` | `Qwen3.8-27B-MTP-mxfp8` | MTP sidecar | KV truncation + recurrent snapshot/replay |
+| `Qwen3.8-27B-4bit` | `Qwen3.8-27B-DFlash2` | DFlash 2 block drafter | KV truncation + recurrent snapshot/replay |
+
+`RMLX_DRAFT_TEST_MODEL` names one drafter, so a pair whose loop does not drive
+the kind that snapshot declares stands down naming both rather than handing
+another drafter's tensors to a loader.
 
 Six prompts, all asking for continuous prose. A tokenizer that declares `<think>`
 gets an empty reasoning block — its own template's `enable_thinking=false` — and
@@ -57,11 +62,10 @@ kernel and model, or a stable count — neither of which this change is the plac
 for.
 
 **Three of the round loops that exist are outside the gate entirely.** It
-covers the Gemma4 assistant loop and the Qwen3.5-family MTP sidecar loop. The
-DFlash, EAGLE-3 and two-model loops have no pair here, and the property is not
-transitive across loops — each one has its own rollback and its own acceptance
-walk, which is what the gate reads. (DFlash 2 is a fifth drafter kind with no
-round loop yet, so it has nothing to cover.)
+covers the Gemma4 assistant loop, the Qwen3.5-family MTP sidecar loop and the
+DFlash 2 block loop. The DFlash 1, EAGLE-3 and two-model loops have no pair
+here, and the property is not transitive across loops — each one has its own
+rollback and its own acceptance walk, which is what the gate reads.
 
 That boundary is not hypothetical. Served at temperature 0 on the code prompt,
 `Qwen3.8-27B-4bit` drafted by `z-lab/Qwen3.8-27B-DFlash2` at block 8 diverged
@@ -70,16 +74,15 @@ respond to user:" against "We need answer user's request:" — and stayed
 diverged; the MTP sidecar on the same verifier, same prompt and same 160-token
 budget is byte-identical to it. A greedy speculative loop can only emit the
 verifier's own argmax, so a drafter proposing badly costs throughput and cannot
-change the answer. A changed answer is the loop, not the drafter, and this one is
-uncovered. That the drafter was also being loaded as an earlier architecture than
-the checkpoint (see `docs/SPECULATIVE.md` § Qwen3.8-27B-4bit) does not explain
-it.
+change the answer. A changed answer is the loop, not the drafter.
 
-That pair no longer runs, for a reason unrelated to this: the checkpoint
-declares itself a DFlash 2 drafter and is routed to its own loader, whose
-forward is not implemented. `z-lab/Qwen3.6-35B-A3B-DFlash` reads every tensor it
-ships, loads, and drives the same round loop — it is the pair a DFlash case here
-would be built on.
+**That arm was the DFlash 1 loop wearing the checkpoint's name**, and it no
+longer exists: the checkpoint declares itself a DFlash 2 drafter and routes to
+its own loader and its own round loop, which is now a pair in this gate and
+agrees with plain greedy on six of six prompts. What the observation is still
+evidence about is DFlash 1, which drives `z-lab/Qwen3.6-35B-A3B-DFlash` on its
+own verifier and remains uncovered — that is the pair a DFlash 1 case here would
+be built on.
 
 ## The oracle: where a correct pair diverges
 
@@ -91,23 +94,31 @@ that sits in the same arm's own margin distribution. Both arms saw the same
 context up to that position, so this judges the pair rather than an arm, and it
 needs no per-prompt calibration: it is a rank, not a number of nats.
 
-Measured over two pairs and six prompts each, against the shipped engine and
-against two deliberately broken ones:
+Measured over three pairs and six prompts each, against the shipped engine and
+against a deliberately broken one per pair — two on the block pair:
 
 | engine | percentile of the reference arm's own margins |
 |---|---|
 | assistant pair, as shipped | 0.0000 to 0.0820 |
 | recurrent pair, as shipped | 0.0000 to 0.0234 |
+| block pair, as shipped | 0.0000 to 0.0273 |
 | assistant pair, SWA ring keeping its rejected block tail | 0.4219 to 0.9258 |
 | recurrent pair, acceptance walk without the final norm | 0.0000 to 0.5000 |
+| block pair, rejected tail never rolled off | 0.0117 to 0.9297 |
+| block pair, one rejected draft kept every partial round | 0.1758 to 0.6406 |
 
 `MAX_DIVERGENCE_CONFIDENCE` is 0.12, inside the band the measurement leaves:
 above the worst correct cell (0.0820, 1.46×) and under the lowest broken cell
 above it (0.1538, 1.28×). It clears every correct cell and refuses ten of the
-twelve broken ones.
+first twelve broken ones.
 The two it does not are covered by running **every** prompt rather than one:
 each broken engine is refused on at least four of its six, so a gate pinned to
 one prompt would be a coin toss and this one is not.
+
+The block pair's two broken engines are refused on six of six each. One of their
+twelve cells reads 0.0117, inside the ceiling, and is refused by the repetition
+control instead — which reads 1.0000 on it. The two oracles cover each other and
+neither alone gives that recall.
 
 ## Why there is no subsequence floor
 

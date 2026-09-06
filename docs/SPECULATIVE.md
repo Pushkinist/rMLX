@@ -1135,7 +1135,7 @@ faster: `loop_ms_per_round` is 14.6 ms of a 44.4 ms round at block 2 and 25.1 ms
 of a 63.4 ms round at block 3, a third to two fifths of the round in a residual
 that produces no tokens.
 
-**DFlash 2 on this verifier does not run, and the numbers below are not its.**
+**The numbers below are not DFlash 2's.**
 `z-lab/Qwen3.8-27B-DFlash2` is its own drafter kind (`dflash2`) with its own
 loader: config, weights and shapes are read and validated, and 23 of its 81
 tensors — a candidate selector and per-layer two-tap dynamic convolutions — are
@@ -1147,7 +1147,10 @@ drafter wearing the checkpoint's name, and `decode_config` recorded
 real drafter afterwards. **They are not a DFlash 2 measurement and must not be
 quoted as one.**
 
-What runs today is the load, the decoder stack and the candidate selector.
+No DFlash 2 accept rate or speedup has been measured on this pair. The loop
+below is proven correct — it reproduces plain greedy — and unmeasured for
+throughput; a figure appears here when one is taken.
+
 `rmlx_models::speculative::dflash2` binds every tensor at the shape the config
 predicts and refuses a snapshot carrying one it does not read, and
 `DFlash2Drafter::forward_hidden` runs the block through the stack — the
@@ -1187,12 +1190,26 @@ the logits and from the chain the pairwise term alone would trace, and the two
 anchors trace different chains, so a selector that returned the argmax, dropped
 the logits or ignored the seed fails rather than passing quietly.
 
-The round loop that would drive them is not implemented, so the serve layer
-still refuses a `dflash2` snapshot before the verifier is loaded
-(`engine::speculative::dflash2_reject_reason`).
-`--draft-kind dflash` over that snapshot is refused separately as a flag
-contradicting the declaration. `z-lab/Qwen3.6-35B-A3B-DFlash` is `dflash`, reads
-every tensor it ships, and is unaffected.
+`dflash2_generate_greedy` drives them. It prefills the whole prompt through
+`forward_verify_capture_chunked`, keeping as many conditioning rows as the
+drafter's window reaches back over (2047 here) — the depth the reference
+conditions on, not the last prompt token alone — then per round drafts a block,
+scores the carry token and every proposal in one verify forward, accepts the
+agreed prefix through the shared `accept_prefix`, and rolls the caches back over
+the rest through the shared `rollback_round_caches`. The block is the one the
+drafter was trained at every round; only the token budget shortens it, so this
+loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
+
+It is **greedy**, like every other sidecar loop here. The reference's sampled arm
+accepts by rejection sampling restricted to the selector's own candidate set —
+a different acceptance rule from the full-vocabulary one the two-model loop
+implements — and `select_chain` traces a greedy chain and returns no candidate
+distribution to sample against. A request above temperature 0 is served greedily,
+which is what the serve layer already does for every sidecar.
+
+`--draft-kind dflash` over that snapshot is refused as a flag contradicting the
+declaration. `z-lab/Qwen3.6-35B-A3B-DFlash` is `dflash`, reads every tensor it
+ships, and is unaffected.
 
 The forward RoPEs its conditioning rows from position zero rather than from an
 absolute offset. It recomputes the conditioning K/V on every call instead of
@@ -1200,8 +1217,23 @@ caching them across rounds, so all of one call's positions are rotated together
 and only the query-key difference reaches the attention scores; a uniform shift
 of every position is then not observable, which the reference's own answer
 confirms — it moves by one bf16 place between two offsets that are
-mathematically the same. A round loop that starts caching conditioning K/V
-across calls loses that invariance and has to carry the absolute offset back in.
+mathematically the same. **The round loop keeps that choice**: it carries the
+committed hidden states forward and lets the forward re-derive the conditioning
+K/V, where the reference carries a per-layer rotating K/V cache and feeds it only
+each round's new rows. The two are the same answer — the cached rows are a
+deterministic function of those hidden states — and adopting the cache would make
+cached rows carry their own absolute RoPE, losing the invariance and the proof
+that rests on it. The buffer is bounded by the drafter's window rather than
+accumulated: unbounded it would grow by 50 KiB per emitted token.
+
+Three scalars the reference applies to the drafter's logit path —
+`input_embedding_scale`, `output_multiplier`, `final_logit_softcapping` — are
+absent from this checkpoint, and the port applies none of them. A checkpoint that
+moved one off the reference's default would otherwise be drafted through a
+differently scaled head at no error, so the loader refuses one that does and
+accepts one that spells its defaults out. Unlike every other refusal in that
+loader this one fires on a key that is *present*: an unread key is the failure a
+missing key cannot produce.
 
 The two generations also read their config from different places, which is why
 they do not share a loader: DFlash 1 carries `block_size` and `rope_theta` at
@@ -1217,12 +1249,14 @@ stayed diverged, where the MTP sidecar on the same verifier and prompt is
 byte-identical over 160 tokens. Greedy acceptance emits only the verifier's
 argmax, so no drafter — however badly it proposes, and whatever tensors it was
 built without — can change the answer; a changed answer is the round loop, and
-the DFlash loop is one of the three the answer-equivalence gate does not cover
+the DFlash 1 loop is one of the three the answer-equivalence gate does not cover
 (`docs/SPEC_ANSWER_EQUIVALENCE.md` § What it runs). That arm cannot be
 reproduced on this pair at all now — the checkpoint declares itself `dflash2`
 and no longer reaches the DFlash 1 loader — so the loop is reproduced where it
 still runs: `z-lab/Qwen3.6-35B-A3B-DFlash` on its own verifier drives the same
-`dflash_generate_greedy`.
+`dflash_generate_greedy`. **The observation is about DFlash 1, not this
+checkpoint**: the DFlash 2 loop on the same verifier is a pair in that gate and
+agrees with plain greedy on six of six prompts.
 
 ### Qwen3.6-35B-A3B-8bit — three drafters (GDN hybrid, MoE)
 

@@ -326,6 +326,10 @@ impl DFlash2Drafter {
         )?
         .reshape(&[1, 1, block_len, 1], device)?;
         let in_window = greater_equal(&key_pos, &oldest, device)?;
+        // f32-ok: the operand is a position index from `arange`, which is f32,
+        // and the comparison's result is a boolean mask. Nothing here carries
+        // the block's dtype, so casting to it would be a cast to the wrong
+        // side.
         let in_block = greater_equal(&key_pos, &scalar_f32(ctx_len as f32), device)?;
         let allowed = maximum(&in_window, &in_block, device)?;
 

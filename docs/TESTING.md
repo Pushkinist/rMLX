@@ -107,10 +107,13 @@ thresholded at all.
 Unlike the three above, its **assistant pair resolves both halves by slug** from
 `RMLX_O_MODELS_ROOT`, so `make gpu-test` runs that pair on a machine holding the
 snapshots and `run_gpu_tests.sh` reports a machine without them as INCOMPLETE.
-The recurrent pair is the exception and is not gated: its drafter comes from
-`RMLX_DRAFT_TEST_MODEL` or the pair does not run, because its verifier's
-quantized matmul trips the shader-validation census (see the table below and
-`docs/SPEC_ANSWER_EQUIVALENCE.md`).
+The recurrent and block pairs are the exceptions and are not gated: their
+drafter comes from `RMLX_DRAFT_TEST_MODEL` or the pair does not run, because
+their verifiers' quantized matmuls trip the shader-validation census (see the
+table below and `docs/SPEC_ANSWER_EQUIVALENCE.md`). That one variable names one
+drafter, so the pair whose loop does not drive the kind that snapshot declares
+stands down naming both. Its drafter resolution does not go through
+`slug_snapshot` either, for the tokenizer reason above.
 The verifier goes through the golden harness's own resolver
 (`common::model_for`); `RMLX_DRAFT_TEST_MODEL` overrides the drafter. Both
 `-e2b-` and `-e4b-` assistant snapshots declare the same architecture, so the
