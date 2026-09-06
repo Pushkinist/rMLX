@@ -303,7 +303,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make build` | `cargo build --workspace --release`. |
 | `make check` | `cargo check --workspace --all-targets` (fast). |
 | `make test` | `cargo test --workspace` — **skips every `#[ignore]` GPU test**. |
-| `make gpu-test` | Run the GPU/Metal `#[ignore]` tests, `--test-threads=1` (`CRATE=` / `FILTER=` narrow). Needs exclusive machine access. Under Metal shader validation (`--nocapture`, so the tests' own skip notices reach the scan): the hits it observes are diffed against `scripts/gpu_validation_census.txt`, which pins one count per originating test; the expectation is the sum over the tests that ran, an exact match passes and prints what it accepted, any deviation fails naming the delta. Part of `make ci-perf`, not `make ci`. |
+| `make gpu-test` | Run the GPU/Metal `#[ignore]` tests, `--test-threads=1` (`CRATE=` / `FILTER=` narrow). Needs exclusive machine access. Under Metal shader validation (`--nocapture`, so the tests' own skip notices reach the scan): the hits it observes are diffed against `scripts/gpu_validation_census.txt`, which pins one count per originating test; the expectation is the sum over the tests that ran, an exact match passes and prints what it accepted, any deviation fails naming the delta. A cell that stood down for want of a snapshot is listed with the reason its `SKIP <test>: <why>` notice gave and counted on the final line as INCOMPLETE — a test that could not run is not a test that passed, and libtest reports both as `ok`. Part of `make ci-perf`, not `make ci`. |
 | `make fmt` / `make fmt-check` | Write / check `cargo fmt`. |
 | `make lint` | `cargo clippy -D warnings`. |
 | `make audit` | `cargo audit` with RustSec ignores from `deny.toml`. |
@@ -311,7 +311,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make precommit` | `pre-commit run --all-files`. |
 | `make hooks` | Install the git `pre-commit` hook. |
 | `make ci` | `fmt-check + lint + test + deny + audit` — pre-merge gate. |
-| `make ci-perf` | `test-perf` under `release-perf` + the serialized GPU/Metal suite. Requires an idle GPU; without the snapshots the pinned entries' tests skip and are reported as not enforced in full rather than failing. Run before merging perf-sensitive or codec-layer changes (~21 min). |
+| `make ci-perf` | `test-perf` under `release-perf` + the serialized GPU/Metal suite. Requires an idle GPU; without the snapshots the pinned entries' tests skip and are reported as not enforced in full rather than failing, and the run ends in `ci-perf INCOMPLETE` naming what stood down instead of `ci-perf ok`. Run before merging perf-sensitive or codec-layer changes (~21 min). |
 | `make check-kv-layer-quants` | CI gate (in `make ci`): the per-layer KV codec vector has one producer (`kv_layer_quants`) — no second `kv_quant_for_layer` loop, and every per-layer cache stack either uses it or declares itself uniform. |
 | `make check-kv-codec-disposition` | CI gate (in `make ci`): the `--kv-quant` / `--kv-bits` help and the `docs/KV_QUANT.md` INERT banners agree with each codec's runtime disposition, derived from `ALL_KV_QUANTS` + `decode_reads_packed_store` / `feeds_bf16_{k,v}_at_decode`. |
 | `make check-kv-codec-disposition-fixtures` | CI gate (in `make ci`): recall test for the above, 18 synthetic scan roots (one edit each), each asserting which rule fired and exit 2 vs exit 1. |

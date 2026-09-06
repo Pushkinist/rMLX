@@ -311,13 +311,24 @@ The run / skip / fail rule:
 | `RMLX_O_MODELS_ROOT` is set but is not an existing directory | **fail** — one keystroke disarms all five gates |
 | the slug under the models root is a snapshot of the wrong arch | **fail** |
 
-"Runnable" means the directory holds every file the harness opens **by name**:
+"Runnable" means the directory holds every file the caller opens **by name**,
+and which files those are depends on what the caller will do with it. The probe
+takes that as a `Role`:
 
-| file | opened by |
-|---|---|
-| `config.json` | `model_arch`, `arch::load_model` |
-| `tokenizer.json` | `run_golden_test`'s `Tokenizer::from_file` |
-| `model.safetensors.index.json` **or** `model.safetensors` | `rmlx_loader::load_shard_index`, which tries them in that order and errors if neither exists |
+| file | opened by | `Standalone` | `Sidecar` |
+|---|---|---|---|
+| `config.json` | `model_arch`, `arch::load_model`, every `<Kind>Drafter::load` | required | required |
+| `tokenizer.json` | `run_golden_test`'s `Tokenizer::from_file` | required | — |
+| `model.safetensors.index.json` **or** `model.safetensors` | `rmlx_loader::load_shard_index`, which tries them in that order and errors if neither exists | required | required |
+
+`Sidecar` is the drafter case, and it exists because a drafter has no tokenizer:
+it proposes ids for a verifier and is decoded with the verifier's, and
+mlx-community ships those snapshots without one. Requiring a `tokenizer.json` of
+a drafter turned a checkpoint sitting on disk into an absence — which is a skip,
+and a skip in `spec_greedy_equivalence.rs` reads exactly like the equivalence
+holding. `two_model_stochastic.rs` resolves both of its models as `Standalone`,
+because there both sides are full models and the pair is loaded through
+`load_speculative`, which reads a tokenizer from each.
 
 The weight entrypoints are not padding. A download writes the small JSON files
 first and the multi-GB shards last, so `config.json` + `tokenizer.json` + no
@@ -341,10 +352,11 @@ Metal context, and `make ci` passes no `--ignored`. `make gpu-test` /
 classifies them as GPU tests through the cross-file `common::run_golden_test`
 helper, and `scripts/run_gpu_tests.sh` runs everything that classifier names.
 
-**Residual, stated rather than papered over:** libtest discards a passing test's
-output, so a golden that *skipped* prints its reason into a stream nothing shows.
-The gate cannot report "0 goldens checked" from inside a normal run. Add
-`--nocapture` when you need to see which ones stood down:
+libtest discards a passing test's output, so a golden that *skipped* prints its
+reason into a stream a bare `cargo test` does not show. `make gpu-test` and
+`make ci-perf` pass `--nocapture` and report every stand-down by name — see *A
+cell that stood down is reported* below. Running the golden by hand, add the
+flag yourself when you need to see which ones stood down:
 
 ```bash
 cargo test -p rmlx-models --test bonsai_golden_tokens -- --ignored --nocapture
@@ -826,6 +838,49 @@ It is fail-closed in three ways:
 * **Exclusive GPU.** It refuses to start while another MLX process holds the
   Metal context (CLAUDE.md hard rule 8).
 
+#### A cell that stood down is reported, and it is not a pass
+
+A model-gated cell whose snapshot is not on disk returns before asserting
+anything, and libtest prints `ok` for it exactly as for a cell that ran. That
+is the difference this runner reports rather than folds away:
+
+```
+stood down — these selected GPU tests announced they did not run:
+  rmlx-models the_recurrent_round_loop_reproduces_plain_greedy: RMLX_DRAFT_TEST_MODEL is unset …
+
+OK: 1 GPU tests passed across 1 workspace member(s) … — INCOMPLETE: 1 selected
+GPU test(s) stood down and 0 further notice(s) named no test; they asserted
+nothing (listed above)
+```
+
+The notice is the cell's own: **`SKIP <test>: <why>`**, printed to stderr and
+visible because the runner passes `--nocapture`. The name is what makes it
+attributable, and the reason is where the variable or the snapshot that would
+arm the cell is named — so both are printed. The same notice is what lets the
+census pin below drop that cell's hit count instead of waiving the entry, which
+is why an entry's test must print one.
+
+**A stand-down is not a failure and has no exit code.** A developer without the
+weights must not be blocked by this suite, and turning an absent snapshot red
+would do exactly that. What it must not do is look identical to a run that
+checked the cell, which is how a green `ci-perf` came to be quoted over
+speculative answer-equivalence gates that had never been asked. `make ci-perf`
+reads the runner's final line and prints `ci-perf INCOMPLETE` rather than
+`ci-perf ok` when it carries that marker.
+
+Both directions are pinned in `scripts/run_gpu_tests_selftest.sh`
+(`make gpu-runner-selftest`): a stand-down is listed with its reason, the final
+line of a run that stood a test down differs from the same run without it, the
+report survives `--no-shader-validation`, and a notice that named no test is
+counted without being attributed to whichever test was nearby.
+
+**Residual, stated rather than papered over.** A notice that names no test —
+`SKIP: <why>`, the older spelling still in much of the tree — cannot be
+attributed, so it is counted and not listed. The count is on the final line for
+the same reason the named ones are: a report that silently dropped them would
+claim a completeness it does not have. Converting the remaining sites is a
+mechanical change nobody has finished; write new ones in the named form.
+
 **No test in this suite is known-red on `main`, and this runner tracks no
 known-red list of tests.** (Shader-validation hits are the one thing it does
 track a baseline for, and that baseline is exact — see the census pin below. It
@@ -884,14 +939,16 @@ means.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 
-`make ci-perf` is three lines, and it is the only shared gate that executes the
-GPU tests:
+`make ci-perf` is the only shared gate that executes the GPU tests. In order: a
+preflight on the environment, the `release-perf` workspace suite, the GPU suite,
+and a final line that reports the GPU suite's verdict rather than asserting one
+— `ci-perf ok` only when that run did not mark itself INCOMPLETE:
 
 ```make
 ci-perf:
 	@bash scripts/run_gpu_tests.sh --preflight
 	$(MAKE) test-perf
-	@bash scripts/run_gpu_tests.sh
+	@… bash scripts/run_gpu_tests.sh …   # then: ok, or INCOMPLETE if it stood cells down
 ```
 
 It is deliberately **not** in `make ci`. Two costs rule that out: the suite needs
