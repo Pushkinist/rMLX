@@ -80,6 +80,14 @@ sees `[DONE]` sees the line too. `decode_tps` comes from the next entry of
 STUB_DECODE_TPS_SEQ, a comma-separated list of raw JSON values with the last one
 repeating, empty for a line carrying no such field. STUB_DONE_LINES caps how
 many requests get a line at all.
+
+What it answers is canned too. STUB_SPEC_DIVERGE_FROM makes the speculative
+server change the completion from that token on, standing in for a round loop
+that changed the answer; STUB_VARY_PER_REQUEST makes every request of both
+servers answer differently. STUB_SAMPLER appends the engine's per-request
+`host categorical sampler active` event, and STUB_SAMPLER_AFTER stops appending
+it partway through, which is the run whose requests did not share one sampling
+setup.
 """
 
 import json
@@ -104,6 +112,10 @@ ITL_SUPPRESS_AFTER = int(os.environ.get("STUB_ITL_SUPPRESS_AFTER", "-1"))
 USAGE_TOKENS = int(os.environ.get("STUB_USAGE_TOKENS", "-1"))
 PROMPT_TOKENS = int(os.environ.get("STUB_PROMPT_TOKENS", "-1"))
 BOUND_FLAG = os.environ.get("STUB_BOUND_FLAG", "")
+DIVERGE_FROM = int(os.environ.get("STUB_SPEC_DIVERGE_FROM", "-1"))
+VARY_PER_REQUEST = os.environ.get("STUB_VARY_PER_REQUEST", "") == "1"
+SAMPLER = os.environ.get("STUB_SAMPLER", "") == "1"
+SAMPLER_AFTER = int(os.environ.get("STUB_SAMPLER_AFTER", "-1"))
 
 served = 0
 itl_ring = []
@@ -183,6 +195,35 @@ def done_line():
     )
 
 
+def token_text(index):
+    """The index-th content piece this request streams.
+
+    Every piece is the same length whatever it says, so a diverging arm changes
+    the answer without changing the token count or the window it was timed over.
+    """
+    stem = "x" if SPECULATIVE and 0 <= DIVERGE_FROM <= index else "t"
+    request = f"r{served}-" if VARY_PER_REQUEST else ""
+    return f"{request}{stem}{index} "
+
+
+def sampler_line():
+    """The engine's per-request sampler-resolution event."""
+    return json.dumps(
+        {
+            "timestamp": "2026-09-03T00:00:00Z",
+            "level": "INFO",
+            "fields": {
+                "message": "generate: host categorical sampler active",
+                "temperature": 0.7,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0.0,
+                "seed": 42,
+            },
+        }
+    )
+
+
 def push_itl(sends):
     """Append this request's ITL aggregate, as the engine's ring holds it."""
     if ITL_SUPPRESS or len(sends) < 2:
@@ -244,7 +285,7 @@ class Handler(BaseHTTPRequestHandler):
             remaining = due - time.monotonic()
             if remaining > 0:
                 time.sleep(remaining)
-            chunk({"choices": [{"delta": {"content": f"t{i} "}, "index": 0}]})
+            chunk({"choices": [{"delta": {"content": token_text(i)}, "index": 0}]})
             sends.append(time.monotonic())
         reported = USAGE_TOKENS if USAGE_TOKENS >= 0 else TOKENS
         usage = {"completion_tokens": reported}
@@ -253,6 +294,9 @@ class Handler(BaseHTTPRequestHandler):
         chunk({"choices": [], "usage": usage})
 
         push_itl(sends)
+        if SAMPLER and LOG_PATH and (SAMPLER_AFTER < 0 or served < SAMPLER_AFTER):
+            with open(LOG_PATH, "a", encoding="utf-8") as handle:
+                handle.write(sampler_line() + "\n")
         if SPECULATIVE and LOG_PATH and (DONE_LINES < 0 or served < DONE_LINES):
             with open(LOG_PATH, "a", encoding="utf-8") as handle:
                 handle.write(done_line() + "\n")
@@ -958,6 +1002,87 @@ run_case unusable_block_size_refused 1 \
 	"a block size with no room for a draft token is refused" \
 	ARGS:--draft-block-size ARGS:1 \
 	'GREP:must be an integer >= 2'
+verdict
+
+# ── The two arms' answers ─────────────────────────────────────────────────────
+
+# answer_of <config> — the `answer=` field of that row's notes.
+answer_of() {
+	notes_of "$1" | tr ' ' '\n' | sed -n 's/^answer=//p'
+}
+
+# answer_check_of <config> — the `answer_check=` field of that row's notes.
+answer_check_of() {
+	notes_of "$1" | tr ' ' '\n' | sed -n 's/^answer_check=//p'
+}
+
+# The guard's other side, and the one a one-sided guard fails: two arms that
+# answered the same thing are measured and recorded, and both rows say the
+# comparison was made rather than leaving a reader to assume it.
+run_case agreeing_arms_are_recorded 0 \
+	"two arms that answered alike are recorded, and the rows say so"
+[ "$(answer_check_of normal)" = "plain_repeatable" ] ||
+	note_bad "normal answer_check=$(answer_check_of normal)"
+[ "$(answer_check_of mtp)" = "matches_plain" ] ||
+	note_bad "mtp answer_check=$(answer_check_of mtp)"
+[ -n "$(answer_of mtp)" ] && [ "$(answer_of mtp)" = "$(answer_of normal)" ] ||
+	note_bad "rows carry answers $(answer_of normal) and $(answer_of mtp)"
+verdict
+
+# The defect this exists for: a drafter that changed the answer at temperature 0
+# has had a throughput row filed for it. The arms stream the same token count at
+# the same rate, so nothing but the text separates them.
+run_case divergent_answer_refused 1 \
+	"a speculative arm that answered differently files no row" \
+	'STUB_SPEC_DIVERGE_FROM=3' \
+	'GREP:answered differently from the no-drafter arm' \
+	'GREP:emits the verifier.s own argmax'
+no_row mtp
+verdict
+
+# The preview a row already carried is 64 characters, and these arms agree for
+# the first 18 tokens. Comparing previews would call this one answer.
+run_case divergence_past_the_preview_refused 1 \
+	"a divergence past the preview's 64 characters is still refused" \
+	'STUB_TOKENS=40' 'STUB_SPEC_DIVERGE_FROM=30' \
+	'GREP:answered differently from the no-drafter arm'
+no_row mtp
+verdict
+
+# Under a sampler two arms are two draws, so a difference between them is not a
+# finding. The row is filed and states that it was not compared — a silent skip
+# would read exactly like a row that agreed.
+run_case sampled_run_is_not_compared 0 \
+	"a sampled run records that its arms were not compared" \
+	'STUB_SAMPLER=1' 'STUB_SPEC_DIVERGE_FROM=3' \
+	'GREP:two arms are two draws and need not agree'
+[ "$(answer_check_of mtp)" = "sampled" ] ||
+	note_bad "mtp answer_check=$(answer_check_of mtp)"
+[ "$(answer_check_of normal)" = "sampled" ] ||
+	note_bad "normal answer_check=$(answer_check_of normal)"
+verdict
+
+# The plain arm is the reference. One that answered three different things
+# without a sampler to explain it has none to offer, and the run stops before
+# either row.
+run_case unrepeatable_plain_arm_refused 1 \
+	"a no-drafter arm that did not repeat itself is not a reference" \
+	'STUB_VARY_PER_REQUEST=1' \
+	'GREP:answered differently from each other'
+no_row normal
+no_row mtp
+verdict
+
+# Sampler events covering two of four requests: some ran sampled and some did
+# not, so the run has no one disposition and neither answer_check would be true
+# of it.
+run_case partial_sampler_events_refused 1 \
+	"a run whose requests did not share one sampling setup is refused" \
+	'STUB_SAMPLER=1' 'STUB_SAMPLER_AFTER=2' \
+	'GREP:covered some of them and not the others' \
+	'GREP:does not say whether the engine ran a sampler'
+no_row normal
+no_row mtp
 verdict
 
 echo
