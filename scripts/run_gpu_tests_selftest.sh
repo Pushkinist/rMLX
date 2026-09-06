@@ -858,6 +858,26 @@ expect_out "INCOMPLETE: 0 selected GPU test(s) stood down"
 expect_no_out "rmlx-models spec_alpha:"
 
 # ---------------------------------------------------------------------------
+# A notice whose name is not a test is not an attribution either. A suite that
+# announces itself by file or helper name passes the pattern and names nothing
+# a libtest filter reaches, so listing it would put a name in the report that
+# the reader cannot run. It is counted with the nameless ones.
+new_case named_notice_that_is_not_a_test_is_not_attributed || exit 1
+classify "${CASE_ROOT}" rmlx-models spec_alpha
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test loader::published ... SKIP dflash2_loader: the published checkpoint is not on this machine
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "1 further stand-down notice(s)"
+expect_out "INCOMPLETE: 0 selected GPU test(s) stood down"
+expect_no_out "rmlx-models dflash2_loader:"
+
+# ---------------------------------------------------------------------------
 # The harness's own positive control: with nothing wrong, the same stubs produce
 # a green run. Without this, every case above could be passing because the stub
 # crates never ran at all.

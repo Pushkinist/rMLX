@@ -549,6 +549,16 @@ for crate in "${crates[@]}"; do
         [ -z "${notice}" ] && continue
         skip_test="${notice%%:*}"
         skip_test="${skip_test#SKIP }"
+        # The shape is not the attribution: a notice naming a suite, a file or a
+        # helper passes the pattern and names nothing this runner can select, so
+        # listing it would put a name in the report that no filter reaches.
+        # Checked against the whole classification rather than the selection,
+        # since an over-matching filter can run a classified test the selection
+        # did not ask for.
+        case $'\n'"${listing}"$'\n' in
+            *$'\n'"${crate}"$'\t'"${skip_test}"$'\n'*) ;;
+            *) n_unattributed=$((n_unattributed + 1)); continue ;;
+        esac
         stood_down="${stood_down}  ${crate} ${skip_test}: ${notice#*: }"$'\n'
         validation_skips="${validation_skips}${crate}"$'\t'"${skip_test}"$'\n'
         n_stood_down=$((n_stood_down + 1))
@@ -617,8 +627,9 @@ if [ "${n_stood_down}" -gt 0 ] || [ "${n_unattributed}" -gt 0 ]; then
     echo "stood down — these selected GPU tests announced they did not run:"
     printf '%s' "${stood_down}"
     if [ "${n_unattributed}" -gt 0 ]; then
-        echo "  ${n_unattributed} further stand-down notice(s) named no test and could not be"
-        echo "  attributed. A cell that stands down must print 'SKIP <test>: <why>', or its"
+        echo "  ${n_unattributed} further stand-down notice(s) named no test, or named something"
+        echo "  that is not a classified GPU test in that crate, and could not be attributed."
+        echo "  A cell that stands down must print 'SKIP <its own test fn>: <why>', or its"
         echo "  absence is invisible here and to the census pin. See docs/TESTING.md."
     fi
     echo

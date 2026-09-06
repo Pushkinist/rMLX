@@ -874,12 +874,17 @@ line of a run that stood a test down differs from the same run without it, the
 report survives `--no-shader-validation`, and a notice that named no test is
 counted without being attributed to whichever test was nearby.
 
-**Residual, stated rather than papered over.** A notice that names no test —
-`SKIP: <why>`, the older spelling still in much of the tree — cannot be
-attributed, so it is counted and not listed. The count is on the final line for
-the same reason the named ones are: a report that silently dropped them would
-claim a completeness it does not have. Converting the remaining sites is a
-mechanical change nobody has finished; write new ones in the named form.
+**The shape is not the attribution.** A notice is attributed only when the name
+it carries is a classified GPU test in that crate. `SKIP: <why>` — the older
+spelling still in much of the tree — names nothing; `SKIP <suite or file>:
+<why>` names something no libtest filter reaches, which in a report is worse
+than saying nothing, because the reader tries to run it. Both are counted with
+the reason they could not be attributed and left off the list. The count rides
+on the final line for the same reason the named ones do: a report that silently
+dropped them would claim a completeness it does not have.
+
+Write new ones as `SKIP <its own test fn>: <why>`. Converting the sites that
+predate this is mechanical and unfinished.
 
 **No test in this suite is known-red on `main`, and this runner tracks no
 known-red list of tests.** (Shader-validation hits are the one thing it does
