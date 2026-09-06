@@ -361,6 +361,13 @@ def fixed_block(paths, range_pct):
         "corpus": first["corpus"],
         "corpus_sha256": first["corpus_sha256"],
         "memory_poll_ms": first["memory_poll_ms"],
+        # How the body was cut, and the body itself. It is not checked in — it
+        # belongs to this checkpoint's tokenizer — so a row recorded against it
+        # has nowhere else to find it.
+        "words": first["words"],
+        "filler_word": first["filler_word"],
+        "filler_reps": first["filler_reps"],
+        "messages": first["messages"],
     }
     for name in FIXED_RATES:
         block[name] = summarise([r[name] for r in runs], range_pct)

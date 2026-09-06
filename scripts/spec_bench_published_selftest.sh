@@ -109,8 +109,9 @@ shrink "${PUBLISHED}" "${SAMPLES}"
 
 # 1 + 2 + 3 + 2 (MATH-500 again at 4096) requests per pass.
 REQUESTS_PER_PASS=8
-# One TTFT, one ITL and one sampler event per request, warmup included.
-EVENTS_PER_PASS=9
+# One TTFT, one ITL and one sampler event per request: the untimed warmup, the
+# fixed-length prompt, and the eight cell requests.
+EVENTS_PER_PASS=10
 
 # A second fake root whose `prompts/published` IS the shrunken copy. A run that
 # passes no --samples-root reaches it as the published root, and the gate that
@@ -170,7 +171,31 @@ for a in "$@"; do
 done
 exec /bin/rm "$@"
 RMEOF
-chmod +x "${SHIMS}/pkill" "${SHIMS}/sleep" "${SHIMS}/rm"
+# The thermal reading is a machine reading, so it is shimmed for the same reason
+# the process table is: no verdict here may depend on what this Mac's thermal
+# history happens to hold. The default says what an unthrottled Mac says — no
+# level has ever been posted — which is the state that must NOT taint.
+cat >"${SHIMS}/pmset" <<'PMSETEOF'
+#!/bin/sh
+echo "Note: No thermal warning level has been recorded"
+PMSETEOF
+chmod +x "${SHIMS}/pkill" "${SHIMS}/sleep" "${SHIMS}/rm" "${SHIMS}/pmset"
+
+# A Mac that posted a level and is at full speed, one that is being held back,
+# and one where the tool is not there to ask.
+for spec in nominal:100 throttled:62; do
+	dir="${WORK}/therm_${spec%%:*}"
+	mkdir -p "${dir}"
+	{
+		echo '#!/bin/sh'
+		echo 'echo "Note: Thermal pressure recorded"'
+		echo "echo 'CPU_Speed_Limit \t= ${spec#*:}'"
+	} >"${dir}/pmset"
+	chmod +x "${dir}/pmset"
+done
+mkdir -p "${WORK}/therm_unreadable"
+printf '#!/bin/sh\nexit 1\n' >"${WORK}/therm_unreadable/pmset"
+chmod +x "${WORK}/therm_unreadable/pmset"
 
 # Two synthetic machines, on the shape `cpu_snapshot` reads. It refuses a
 # process table under 20 rows, so both emit 40 idle ones.
@@ -255,16 +280,32 @@ PASS = int(os.environ.get("STUB_PASS", "1"))
 PREFILL_S = float(os.environ.get("STUB_PREFILL_S", "0.15"))
 PROMPT_TOKENS = int(os.environ.get("STUB_PROMPT_TOKENS", "1234"))
 USAGE_TOKENS = int(os.environ.get("STUB_USAGE_TOKENS", "-1"))
+# A pass that generates a different length than the others. Every request
+# sends no seed, so three passes are meant to be one generation replayed;
+# this is how a run where that did not hold is staged.
+USAGE_TOKENS_PASS2 = os.environ.get("STUB_USAGE_TOKENS_PASS2", "")
 TTFT_MS = float(os.environ.get("STUB_TTFT_MS", "42"))
 TTFT_LINES = int(os.environ.get("STUB_TTFT_LINES", "-1"))
 ITL_LINES = int(os.environ.get("STUB_ITL_LINES", "-1"))
 ITL_MEAN_MS = os.environ.get("STUB_ITL_MEAN_MS", "")
+# Which served request the ITL override starts at. The fixed-length prompt is
+# request 1 of every pass, so this is how a disagreement can be staged on the
+# cells without the fixed prompt tripping the same guard first.
+ITL_MEAN_FROM = int(os.environ.get("STUB_ITL_MEAN_FROM", "0"))
 SAMPLED = os.environ.get("STUB_SAMPLED", "1") == "1"
 SAMPLER_LINES = int(os.environ.get("STUB_SAMPLER_LINES", "-1"))
 SAMPLER_TOP_K = int(os.environ.get("STUB_SAMPLER_TOP_K", "20"))
 SAMPLER_TOP_K_PASS2 = os.environ.get("STUB_SAMPLER_TOP_K_PASS2", "")
 SAMPLER_TOP_K_AFTER = os.environ.get("STUB_SAMPLER_TOP_K_AFTER", "")
 OMIT_COMPLETION_TOKENS = os.environ.get("STUB_OMIT_COMPLETION_TOKENS", "") == "1"
+# A prompt length that is a function of the body, which is what the fixed-prompt
+# fit searches over. Four characters per token, so one " the" costs exactly one
+# and the fit can land on any target the corpus reaches.
+TOKEN_BASE = os.environ.get("STUB_TOKEN_BASE", "")
+PHYS_BYTES = int(os.environ.get("STUB_PHYS_BYTES", "31000000000"))
+RSS_BYTES = int(os.environ.get("STUB_RSS_BYTES", "29000000000"))
+MEM_SUPPRESS = os.environ.get("STUB_MEM_SUPPRESS", "") == "1"
+MEM_ZERO = os.environ.get("STUB_MEM_ZERO", "") == "1"
 LOG_PATH = os.environ.get("STUB_LOG", "")
 SPECULATIVE = os.environ.get("STUB_SPECULATIVE", "") == "1"
 FORCE_DONE = os.environ.get("STUB_FORCE_DONE", "") == "1"
@@ -327,6 +368,19 @@ def done_line(rate):
     return event(fields)
 
 
+def prompt_tokens_of(request):
+    """What this server says the request's prompt counted.
+
+    With STUB_TOKEN_BASE it is a function of the body — which is what makes the
+    fit a search rather than a fixed answer. Without it, the fixed figure the
+    other cases were written against.
+    """
+    if TOKEN_BASE:
+        content = "".join(m.get("content", "") for m in request.get("messages", []))
+        return int(TOKEN_BASE) + len(content) // 4
+    return PROMPT_TOKENS
+
+
 def log(line):
     if not LOG_PATH:
         return
@@ -346,7 +400,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _text(self, body):
+        raw = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def do_GET(self):
+        if self.path == "/metrics":
+            if MEM_SUPPRESS:
+                self._text("rmlx_uptime_seconds 1\n")
+                return
+            phys, rss = (0, 0) if MEM_ZERO else (PHYS_BYTES, RSS_BYTES)
+            self._text(
+                f"rmlx_process_rss_bytes {rss}\n"
+                f"rmlx_process_phys_footprint_bytes {phys}\n"
+            )
+            return
         self._json({"object": "list", "data": []})
 
     def do_POST(self):
@@ -355,6 +427,18 @@ class Handler(BaseHTTPRequestHandler):
         if BODIES:
             with open(BODIES, "ab") as handle:
                 handle.write(body + b"\n")
+        request = json.loads(body or b"{}")
+
+        # A fixed-prompt fit probe: it asks the server for a token count and
+        # nothing else, so it streams nothing and leaves no event behind. A
+        # probe that logged would be counted as a served request by the reader.
+        if not request.get("stream"):
+            self._json({
+                "choices": [{"message": {"role": "assistant", "content": "."}}],
+                "usage": {"prompt_tokens": prompt_tokens_of(request),
+                          "completion_tokens": 1},
+            })
+            return
 
         this_gap_ms = gap_ms()
         self.send_response(200)
@@ -376,9 +460,12 @@ class Handler(BaseHTTPRequestHandler):
             chunk({"choices": [{"delta": {"content": f"t{i} "}, "index": 0}]})
         usage = {}
         if not OMIT_COMPLETION_TOKENS:
-            usage["completion_tokens"] = USAGE_TOKENS if USAGE_TOKENS >= 0 else TOKENS
+            count = USAGE_TOKENS if USAGE_TOKENS >= 0 else TOKENS
+            if USAGE_TOKENS_PASS2 and PASS >= 2:
+                count = int(USAGE_TOKENS_PASS2)
+            usage["completion_tokens"] = count
         if PROMPT_TOKENS >= 0:
-            usage["prompt_tokens"] = PROMPT_TOKENS
+            usage["prompt_tokens"] = prompt_tokens_of(request)
         chunk({"choices": [], "usage": usage})
 
         if SAMPLED and (SAMPLER_LINES < 0 or served < SAMPLER_LINES):
@@ -394,7 +481,9 @@ class Handler(BaseHTTPRequestHandler):
             log(event({"message": "generate_streaming: TTFT (L6)",
                        "model_id": "stub", "ttft_ms": TTFT_MS}))
         if ITL_LINES < 0 or served < ITL_LINES:
-            mean = float(ITL_MEAN_MS) if ITL_MEAN_MS else this_gap_ms
+            mean = this_gap_ms
+            if ITL_MEAN_MS and served >= ITL_MEAN_FROM:
+                mean = float(ITL_MEAN_MS)
             log(event({"message": "generate: ITL stats (M30)", "model_id": "stub",
                        "step_count": TOKENS, "p50_ms": mean, "p95_ms": mean,
                        "p99_ms": mean, "mean_ms": mean, "itl_spikes": 0}))
@@ -419,6 +508,13 @@ STUB="${FAKE_ROOT}/target/release-perf/rmlx"
 cat >"${STUB}" <<STUBEOF
 #!/usr/bin/env bash
 set -eu
+# The log-message literals \`lib/binary_identity.py\` requires a binary to
+# contain before a run is started against it. A real rmlx carries them because
+# it writes them; this stub carries them because it fakes writing them, and a
+# case below removes one to show the check is not decorative.
+# markers: generate_streaming: TTFT | generate: ITL stats (M30)
+# markers: generate: host categorical sampler active | cache-type resolved
+# markers: generate_greedy: done
 case "\$1" in
 metrics)
 	case "\$2" in
@@ -439,8 +535,13 @@ serve)
 	done
 	# Which pass this is. The harness starts one server per pass and the stub
 	# has to vary its rate across them, so the count lives beside the logs.
-	pass=\$(( \$(cat "\$RMLX_HOME/pass.cnt" 2>/dev/null || echo 0) + 1 ))
-	echo "\$pass" >"\$RMLX_HOME/pass.cnt"
+	# On the plain arm the FIRST server is the preparation one the fixed-length
+	# prompt is fitted against — it measures nothing, so it is pass 0 and the
+	# per-pass fixtures still line up with the passes they were written for.
+	started=\$(( \$(cat "\$RMLX_HOME/pass.cnt" 2>/dev/null || echo 0) + 1 ))
+	echo "\$started" >"\$RMLX_HOME/pass.cnt"
+	pass=\$started
+	[ "\$speculative" = 0 ] && pass=\$((started - 1))
 	log="\$RMLX_HOME/logs/\$(date +%s)-\$\$-p\$pass.jsonl"
 	: >"\$log"
 	if [ -z "\${STUB_PID_SUPPRESS:-}" ]; then
@@ -460,6 +561,17 @@ esac
 STUBEOF
 chmod +x "${STUB}"
 ln -s "${STUB}" "${CANON_ROOT}/target/release-perf/rmlx"
+
+# A third root whose binary is the same stub with one marker literal removed. A
+# binary that cannot write the event a reading is read off cannot produce that
+# reading, and the run must stop before it starts rather than after three passes
+# produced nothing.
+MARKERLESS_ROOT="${WORK}/repo_markerless"
+mkdir -p "${MARKERLESS_ROOT}/target/release-perf"
+ln -s "${REPO_ROOT}/scripts" "${MARKERLESS_ROOT}/scripts"
+ln -s "${REPO_ROOT}/prompts" "${MARKERLESS_ROOT}/prompts"
+grep -v 'generate: ITL stats (M30)' "${STUB}" >"${MARKERLESS_ROOT}/target/release-perf/rmlx"
+chmod +x "${MARKERLESS_ROOT}/target/release-perf/rmlx"
 
 # A port this host is not already using. Probed rather than assumed: a foreign
 # listener would answer the readiness poll and the suite would measure it.
@@ -482,7 +594,8 @@ sys.exit("no free port in 18000-19999")
 # ── Case driver ───────────────────────────────────────────────────────────────
 
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
-#          [HOST:quiet|hostile|flaky] [VERIFIER:dir] [MEASURED:1] [CANONICAL:1]
+#          [HOST:quiet|hostile|flaky] [THERM:nominal|throttled|unreadable]
+#          [VERIFIER:dir] [MEASURED:1] [CANONICAL:1] [MARKERLESS:1]
 #          [GREP:pat ...] [NOGREP:pat ...]
 #
 # Defaults: a quiet host, --synthetic-arms, the healthy verifier snapshot, and
@@ -493,7 +606,9 @@ sys.exit("no free port in 18000-19999")
 # shown to verify.
 #
 # The stub streams six tokens 40 ms apart behind a 150 ms prefill — 25 tok/s on
-# the wire and 25 reported by the engine.
+# the wire and 25 reported by the engine. Its prompt count is four characters
+# per token above a base of 100, so the fixed-length prompt's fit is a real
+# search over the corpus rather than a fixed answer handed back.
 run_case() {
     CASE_NAME="$1"
     local want="$2"
@@ -505,6 +620,7 @@ run_case() {
 
     local env_pairs=() greps=() nogreps=() extra_args=() host="quiet" a
     local synthetic=true verifier="${VERIFIER}" canonical=false
+    local therm="${SHIMS}" markerless=false
     for a in "$@"; do
         case "$a" in
         GREP:*) greps+=("${a#GREP:}") ;;
@@ -513,6 +629,8 @@ run_case() {
         HOST:*) host="${a#HOST:}" ;;
         MEASURED:*) synthetic=false ;;
         CANONICAL:*) canonical=true ;;
+        MARKERLESS:*) markerless=true ;;
+        THERM:*) therm="${WORK}/therm_${a#THERM:}" ;;
         VERIFIER:*) verifier="${a#VERIFIER:}" ;;
         *) env_pairs+=("$a") ;;
         esac
@@ -522,17 +640,19 @@ run_case() {
     if $canonical; then
         root="${CANON_ROOT}"
     else
+        $markerless && root="${MARKERLESS_ROOT}"
         extra_args+=(--samples-root "${SAMPLES}")
     fi
 
     CASE_OUT="${WORK}/${CASE_NAME}.log"
     local got=0
     env -i \
-        PATH="${WORK}/${host}:${SHIMS}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        PATH="${WORK}/${host}:${therm}:${SHIMS}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
         HOME="${WORK}" \
         RMLX_HOME="${CASE_HOME}" \
         STUB_BOUND_FLAG="${CASE_HOME}/stub_bound" \
         STUB_BODIES="${CASE_HOME}/bodies.jsonl" \
+        STUB_TOKEN_BASE=100 \
         ${env_pairs[@]+"${env_pairs[@]}"} \
         bash "${root}/scripts/spec_bench_published.sh" \
         "${verifier}" --port "${PORT}" \
@@ -649,7 +769,7 @@ verdict
 # math_500@4096 x2; gaps 200/100/50/25 ms give 5/10/20/40 tok/s.
 run_case macro_is_over_the_datasets_at_the_headline_budget 0 \
     "the macro is one cell per dataset at 1024, not one per cell" \
-    'STUB_GAP_MS=40,200,100,100,50,50,50,25,25' \
+    'STUB_GAP_MS=40,40,200,100,100,50,50,50,25,25' \
     'GREP:MACRO covers .* at 1024 output tokens'
 close_to "$(jq_of "r['cells']['mt_bench@1024']['mean']")" 5.0 0.01 ||
     note_bad "mt_bench mean=$(jq_of "r['cells']['mt_bench@1024']['mean']") (want 5)"
@@ -701,8 +821,9 @@ close_to "$(jq_of "r['cells']['mt_bench@1024']['mean']")" 25.0 0.001 ||
 verdict
 
 # ONE cell destabilised, and only one. mt_bench is the single-sample dataset, so
-# request index 1 is all of it: 23.5 / 25 / 26.5 tok/s across the passes is a
-# 12% range there and leaves every other cell flat.
+# request index 2 is all of it — index 0 is the warmup and index 1 the
+# fixed-length prompt — and 23.5 / 25 / 26.5 tok/s across the passes is a 12%
+# range there that leaves every other cell flat.
 #
 # This is also the empirical half of why the macro has no refusal of its own.
 # The macro's OWN range here is 4% — inside the band — while the dataset it is
@@ -710,9 +831,9 @@ verdict
 # and published the headline. Withholding it because a dataset was refused is
 # what makes the MACRO row say UNSTABLE.
 ONE_CELL="$(python3 -c 'g = lambda r: f"{1000/r:.9f}"
-print(";".join(["40," + g(23.5) + ",40,40,40,40,40,40,40",
+print(";".join(["40,40," + g(23.5) + ",40,40,40,40,40,40,40",
                 "40",
-                "40," + g(26.5) + ",40,40,40,40,40,40,40"]))')"
+                "40,40," + g(26.5) + ",40,40,40,40,40,40,40"]))')"
 
 run_case one_unstable_dataset_withholds_only_it_and_the_macro 3 \
     "one refused dataset does not refuse the others, and does withhold the macro" \
@@ -745,8 +866,12 @@ verdict
 
 # bodies_check <python-expression over `bodies` and `digests`>
 bodies_check() {
-    python3 - "${CASE_HOME}/bodies.jsonl" "${SAMPLES}" "$1" <<'PY'
+    python3 - "${CASE_HOME}/bodies.jsonl" "${SAMPLES}" "$1" "${REPO_ROOT}" <<'PY'
 import hashlib, json, pathlib, sys
+
+sys.path.insert(0, str(pathlib.Path(sys.argv[4]) / "scripts" / "lib"))
+sys.path.insert(0, str(pathlib.Path(sys.argv[4]) / "scripts"))
+from published_fixed_prompt import INSTRUCTION
 
 bodies = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
 root = pathlib.Path(sys.argv[2])
@@ -761,9 +886,19 @@ def address(messages):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-# The warmup carries its own token budget, so the two are told apart by it.
-warmups = [b for b in bodies if b["max_tokens"] == 64]
-measured = [b for b in bodies if b["max_tokens"] != 64]
+# Four kinds of request reach the server and only one of them is a measured
+# sample. A fit probe streams nothing; the warmup carries its own budget; the
+# fixed-length prompt carries the instruction that module pins, imported rather
+# than spelled again here.
+probes = [b for b in bodies if not b.get("stream")]
+streamed = [b for b in bodies if b.get("stream")]
+warmups = [b for b in streamed if b["max_tokens"] == 64]
+fixed = [
+    b
+    for b in streamed
+    if b["max_tokens"] != 64 and b["messages"][0]["content"].startswith(INSTRUCTION)
+]
+measured = [b for b in streamed if b not in warmups and b not in fixed]
 
 print(eval(sys.argv[3]))
 PY
@@ -780,10 +915,13 @@ for field in temperature top_p top_k seed repetition_penalty; do
 done
 [ "$(bodies_check "all(b['enable_thinking'] is True for b in bodies)")" = "True" ] ||
     note_bad "a request did not ask for thinking"
-# The warmup is a 64-token request on a prompt outside the sample sets, so the
-# budgets sent are its own plus the two the protocol pins.
-[ "$(bodies_check "sorted({b['max_tokens'] for b in bodies})")" = "[64, 1024, 4096]" ] ||
+# The warmup is a 64-token request on a prompt outside the sample sets and a
+# fixed-prompt fit probe asks for one token, so the budgets sent are those two
+# plus the two the protocol pins.
+[ "$(bodies_check "sorted({b['max_tokens'] for b in bodies})")" = "[1, 64, 1024, 4096]" ] ||
     note_bad "max_tokens sent: $(bodies_check "sorted({b['max_tokens'] for b in bodies})")"
+[ "$(bodies_check "all(b['max_tokens'] == 1 for b in probes)")" = "True" ] ||
+    note_bad "a fit probe asked for more than the one token it needs to be counted"
 verdict
 
 # What the run sampled under is the engine's to say. Re-reading the checkpoint
@@ -848,8 +986,9 @@ verdict
 # that was checked in — and a later join on it splits with nothing saying so.
 run_case messages_keep_their_content_address 0 \
     "every measured request's messages still hash to the checked-in address"
-# `measured` excludes the warmup, whose 64-token budget is its own. That the
-# warmup's prompt is in no sample set is the point of it: an untimed request on
+# `measured` excludes the warmup, the fixed-length prompt and the fit probes:
+# none of the three is a sample, and each is meant to be in no sample set. That
+# the warmup's prompt is outside them is the point of it — an untimed request on
 # a measured sample would leave that one sample facing a warm prompt cache.
 [ "$(bodies_check "all(address(b['messages']) in digests for b in measured)")" = "True" ] ||
     note_bad "a measured request's messages no longer hash to any checked-in body_sha256"
@@ -859,6 +998,11 @@ run_case messages_keep_their_content_address 0 \
     note_bad "the warmup re-used a measured sample's prompt"
 [ "$(bodies_check "len(warmups)")" = "3" ] ||
     note_bad "$(bodies_check "len(warmups)") warmups for three passes"
+# The fixed-length prompt is sent once per pass and is in no sample set either.
+[ "$(bodies_check "len(fixed)")" = "3" ] ||
+    note_bad "$(bodies_check "len(fixed)") fixed-prompt requests for three passes"
+[ "$(bodies_check "any(address(b['messages']) in digests for b in fixed)")" = "False" ] ||
+    note_bad "the fixed prompt re-used a measured sample's prompt"
 verdict
 
 # Thinking tokens are generated tokens and the server counts them; the harness
@@ -868,8 +1012,22 @@ run_case completion_tokens_are_the_servers_count 0 \
     'STUB_USAGE_TOKENS=97'
 [ "$(jq_of "sorted({s['completion_tokens'] for s in r['samples']})")" = "[97]" ] ||
     note_bad "completion_tokens=$(jq_of "sorted({s['completion_tokens'] for s in r['samples']})")"
-[ "$(jq_of "sorted({s['prompt_tokens'] for s in r['samples']})")" = "[1234]" ] ||
-    note_bad "prompt_tokens=$(jq_of "sorted({s['prompt_tokens'] for s in r['samples']})")"
+# ...and prompt_tokens is the server's own count of that sample's body, which
+# the stub derives from the body, so a harness substituting a constant is seen.
+WANT_PROMPT_TOKENS="$(python3 - "${SAMPLES}" <<'TOKENS'
+import json, pathlib, sys
+
+root = pathlib.Path(sys.argv[1])
+counts = set()
+for entry in json.loads((root / "manifest.json").read_text())["datasets"]:
+    for sample in json.loads((root / entry["file"]).read_text())["samples"]:
+        content = "".join(m["content"] for m in sample["messages"])
+        counts.add(100 + len(content) // 4)
+print(sorted(counts))
+TOKENS
+)"
+[ "$(jq_of "sorted({s['prompt_tokens'] for s in r['samples']})")" = "${WANT_PROMPT_TOKENS}" ] ||
+    note_bad "prompt_tokens=$(jq_of "sorted({s['prompt_tokens'] for s in r['samples']})") (want ${WANT_PROMPT_TOKENS})"
 verdict
 
 run_case missing_prompt_tokens_refused 1 \
@@ -969,7 +1127,7 @@ verdict
 # reports half the gap it sent, so the engine claims twice the rate.
 run_case cross_check_refuses_disagreement 1 \
     "an engine and a client reading that disagree stop the run" \
-    'STUB_ITL_MEAN_MS=20' \
+    'STUB_ITL_MEAN_MS=20' 'STUB_ITL_MEAN_FROM=2' \
     'GREP:past the 10% band' \
     'GREP:mt_bench@1024/mt_bench'
 no_result
@@ -1212,6 +1370,198 @@ run_case synthetic_arms_waives_no_arm_reading_guard 1 \
     HOST:hostile 'STUB_KV_QUANT_SUPPRESS=1' \
     'GREP:never said which KV codec'
 no_result
+verdict
+
+# ── The binary that produced the numbers ──────────────────────────────────────
+#
+# A digest says whether the file changed. It does not say whether this is the
+# build the numbers are being attributed to — a stash-build-unstash cycle once
+# left the previous binary in `target/` and an A/B compared it against itself,
+# and both arms' digests agreed because both were one file. What separates them
+# is whether the binary contains the thing the run depends on, which here is the
+# log-message literal each reading is read off.
+
+run_case binary_identity_is_recorded 0 \
+    "the result names the binary it measured, and what it can write" \
+    'GREP:binary     : sha256:'
+WANT_SHA="$(shasum -a 256 "${STUB}" | awk '{print $1}')"
+[ "$(jq_of "r['binary']['sha256']")" = "${WANT_SHA}" ] ||
+    note_bad "binary sha256=$(jq_of "r['binary']['sha256']") (want ${WANT_SHA})"
+[ "$(jq_of "r['binary']['arm']")" = "plain" ] ||
+    note_bad "binary arm=$(jq_of "r['binary']['arm']")"
+[ "$(jq_of "all(v > 0 for v in r['binary']['markers'].values())")" = "True" ] ||
+    note_bad "a marker was recorded absent: $(jq_of "r['binary']['markers']")"
+verdict
+
+run_case binary_missing_a_marker_refused 1 \
+    "a binary that cannot write a reading's event is refused before it serves" \
+    MARKERLESS:1 \
+    'GREP:contains none of .generate: ITL stats' \
+    'GREP:cannot write the event this run reads its decode_rate from' \
+    'NOGREP:\[server\] pid='
+no_result
+verdict
+
+# ── Thermal state ─────────────────────────────────────────────────────────────
+#
+# Recorded beside the numbers and joined to the same taint field the
+# interference gate writes to, not left as a footnote. All three cases drive a
+# `pmset` shim: a verdict here must not depend on what this Mac's own thermal
+# history holds. The state that must NOT taint is the default one every other
+# measured case above already runs under — an unthrottled Mac has posted no
+# level at all, and tainting on that would make the field meaningless.
+
+run_case thermal_throttle_taints 0 \
+    "a machine held below full speed taints the numbers taken on it" \
+    MEASURED:1 THERM:throttled \
+    'GREP:TAINTED' \
+    'GREP:throttled=62'
+[ "$(jq_of "'throttled=62' in r['host']['taint']")" = "True" ] ||
+    note_bad "the result does not record it: $(jq_of "r['host']['taint']")"
+[ "$(jq_of "len(r['host']['thermal'])")" = "9" ] ||
+    note_bad "$(jq_of "len(r['host']['thermal'])") thermal readings (want 3 per pass)"
+[ "$(jq_of "r['host']['thermal_source']")" = "pmset -g therm" ] ||
+    note_bad "thermal_source=$(jq_of "r['host']['thermal_source']")"
+verdict
+
+run_case thermal_unreadable_taints 0 \
+    "nobody having looked is not the same as having looked and seen nothing" \
+    MEASURED:1 THERM:unreadable \
+    'GREP:TAINTED' \
+    'GREP:unreadable'
+[ "$(jq_of "'unreadable' in r['host']['taint']")" = "True" ] ||
+    note_bad "the result does not record it: $(jq_of "r['host']['taint']")"
+verdict
+
+run_case thermal_at_full_speed_does_not_taint 0 \
+    "a posted level at full speed is recorded and taints nothing" \
+    MEASURED:1 THERM:nominal \
+    'NOGREP:TAINTED'
+[ "$(jq_of "sorted({t.split()[-1] for t in r['host']['thermal']})")" = "['nominal']" ] ||
+    note_bad "thermal=$(jq_of "r['host']['thermal']")"
+verdict
+
+# A run that declared it would consult nothing files no thermal reading either,
+# for the same reason it files no host window: there is nothing on this machine
+# it is entitled to describe.
+run_case synthetic_arms_consults_no_thermometer 0 \
+    "the flag takes the thermometer out of the run with the rest of the machine" \
+    THERM:throttled \
+    'NOGREP:TAINTED'
+[ "$(jq_of "r['host']['thermal']")" = "[]" ] ||
+    note_bad "a run that consulted nothing filed a reading: $(jq_of "r['host']['thermal']")"
+verdict
+
+# ── The fixed-length prompt ───────────────────────────────────────────────────
+#
+# The stub charges one token per four characters above a base of 100, so the fit
+# is a real search over the corpus and lands on the target exactly or not at all.
+
+run_case fixed_prompt_is_fitted_to_the_target 0 \
+    "the fixed prompt is cut to the token count the protocol names, not near it" \
+    'GREP:fitted 1355 tokens' \
+    'GREP:FIXED PROMPT — 1355 tokens'
+[ "$(jq_of "r['fixed_prompt']['prompt_tokens']")" = "1355" ] ||
+    note_bad "prompt_tokens=$(jq_of "r['fixed_prompt']['prompt_tokens']")"
+[ "$(jq_of "r['fixed_prompt']['target_tokens']")" = "1355" ] ||
+    note_bad "target_tokens=$(jq_of "r['fixed_prompt']['target_tokens']")"
+[ "$(jq_of "r['fixed_prompt']['corpus']")" = "longctx_4k.json" ] ||
+    note_bad "corpus=$(jq_of "r['fixed_prompt']['corpus']")"
+# The body travels with the run and hashes to the address recorded for it: the
+# fitted body belongs to this tokenizer and is checked in nowhere.
+[ "$(jq_of "__import__('hashlib').sha256(__import__('json').dumps(r['fixed_prompt']['messages'], ensure_ascii=False, separators=(',', ':')).encode()).hexdigest() == r['fixed_prompt']['body_sha256']")" = "True" ] ||
+    note_bad "the recorded body does not hash to the recorded address"
+[ "$(jq_of "r['fixed_prompt']['memory_poll_ms']")" = "250" ] ||
+    note_bad "memory_poll_ms=$(jq_of "r['fixed_prompt']['memory_poll_ms']")"
+verdict
+
+run_case fixed_prompt_rates_are_the_engine_reading 0 \
+    "output speed is the engine's decode window and input speed is tokens over TTFT"
+close_to "$(jq_of "r['fixed_prompt']['decode_tps']['mean']")" 25.0 0.0001 ||
+    note_bad "decode_tps=$(jq_of "r['fixed_prompt']['decode_tps']['mean']")"
+# 1355 prompt tokens over the 42 ms TTFT the engine reported.
+close_to "$(jq_of "r['fixed_prompt']['prefill_tps']['mean']")" 32261.9 0.0001 ||
+    note_bad "prefill_tps=$(jq_of "r['fixed_prompt']['prefill_tps']['mean']")"
+[ "$(jq_of "r['fixed_prompt']['phys_footprint_bytes']['max']")" = "31000000000" ] ||
+    note_bad "phys peak=$(jq_of "r['fixed_prompt']['phys_footprint_bytes']['max']")"
+[ "$(jq_of "r['fixed_prompt']['rss_bytes']['max']")" = "29000000000" ] ||
+    note_bad "rss peak=$(jq_of "r['fixed_prompt']['rss_bytes']['max']")"
+verdict
+
+# The protocol's fixed-prompt figure is the AUTOREGRESSIVE one. A rate a drafter
+# produced is not that, and publishing it under that name is the comparison this
+# whole harness exists to make honest.
+run_case fixed_prompt_not_measured_on_a_speculative_arm 0 \
+    "a drafter's rate is not filed as the autoregressive one" \
+    ARGS:--draft-model "ARGS:${WORK}/drafter" \
+    'GREP:not measured on a speculative arm'
+[ "$(jq_of "'fixed_prompt' in r")" = "False" ] ||
+    note_bad "a speculative run filed a fixed-prompt block"
+verdict
+
+run_case unreachable_fixed_target_refused 1 \
+    "a target the corpus cannot reach on this tokenizer is refused, not rounded to" \
+    'STUB_TOKEN_BASE=2000' \
+    'GREP:a one-word prefix already counts more than 1355'
+no_result
+verdict
+
+run_case memory_gauge_absent_refused 1 \
+    "a resident peak over no sample is not a small peak" \
+    'STUB_MEM_SUPPRESS=1' \
+    'GREP:published no process-memory gauge'
+no_result
+verdict
+
+run_case memory_gauge_zero_refused 1 \
+    "a gauge that is published but carries nothing is refused" \
+    'STUB_MEM_ZERO=1' \
+    'GREP:is not a resident figure'
+no_result
+verdict
+
+# The fixed prompt is request 1 of every pass, so its rate can be moved without
+# touching a cell. Both directions on one fixture: the cells stay inside the
+# band and are published while the fixed prompt's own spread is refused.
+FIXED_UNSTABLE="$(python3 -c 'g = lambda r: f"{1000/r:.9f}"
+print(";".join(["40," + g(23.5) + ",40",
+                "40",
+                "40," + g(26.5) + ",40"]))')"
+run_case fixed_prompt_range_over_the_band_refused 3 \
+    "the fixed prompt's own spread is refused without refusing the cells" \
+    "STUB_GAP_MS=${FIXED_UNSTABLE}" \
+    'GREP:RANGE REFUSAL: fixed_prompt/decode_tps'
+[ "$(jq_of "r['fixed_prompt']['decode_tps']['stable']")" = "False" ] ||
+    note_bad "the fixed prompt is marked stable at a 12% spread"
+[ "$(jq_of "all(c['stable'] for c in r['cells'].values())")" = "True" ] ||
+    note_bad "a cell was refused along with the fixed prompt"
+verdict
+
+# ── What the run-to-run range is a range of ───────────────────────────────────
+#
+# The request sends no seed, so the engine seeds one RNG per request from its
+# fixed default and the three passes are one generation replayed. That is what
+# makes the range a reading of machine variance — and it is a claim about the
+# run, so it is measured rather than asserted.
+
+run_case passes_are_replicas_when_the_lengths_agree 0 \
+    "three passes that generated the same length are reported as replicas" \
+    'GREP:so the range is machine variance and not sampling variance'
+[ "$(jq_of "sum(c['divergent_samples'] for c in r['cells'].values())")" = "0" ] ||
+    note_bad "divergent=$(jq_of "sum(c['divergent_samples'] for c in r['cells'].values())")"
+[ "$(jq_of "r['protocol']['seed_policy']")" = "engine default, identical in all three passes" ] ||
+    note_bad "seed_policy=$(jq_of "r['protocol']['seed_policy']")"
+verdict
+
+run_case divergent_lengths_are_reported_not_hidden 0 \
+    "a pass that generated a different length is counted and said out loud" \
+    'STUB_USAGE_TOKENS=97' 'STUB_USAGE_TOKENS_PASS2=131' \
+    'GREP:samples generated a different length across'
+[ "$(jq_of "sum(c['divergent_samples'] for c in r['cells'].values())")" = "8" ] ||
+    note_bad "divergent=$(jq_of "sum(c['divergent_samples'] for c in r['cells'].values())") (want all 8)"
+# Reported, never refused: the run is readable and its cells are clean.
+[ "$(jq_of "all(c['stable'] for c in r['cells'].values())")" = "True" ] ||
+    note_bad "a cell was refused for a length that moved"
 verdict
 
 # ── An aborted run ────────────────────────────────────────────────────────────

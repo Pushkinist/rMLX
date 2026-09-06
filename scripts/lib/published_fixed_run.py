@@ -130,6 +130,13 @@ def assemble(args):
         "body_sha256": fit["body_sha256"],
         "corpus": fit["corpus"],
         "corpus_sha256": fit["corpus_sha256"],
+        # The body travels with the run. A resident figure recorded against a
+        # prompt nobody can reproduce is a figure attributed to nothing, and the
+        # fitted body is not checked in — it belongs to this tokenizer.
+        "messages": fit["messages"],
+        "words": fit["words"],
+        "filler_word": fit["filler_word"],
+        "filler_reps": fit["filler_reps"],
         "completion_tokens": number(client, "completion_tokens", int),
         "ttft_ms": ttft_ms,
         "decode_tps": engine_tps,

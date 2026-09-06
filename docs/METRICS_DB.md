@@ -231,7 +231,9 @@ every other drafter keep the cell they have always been in. The round loop compo
 its `done` line, and `scripts/spec_bench.sh` records what it finds there; a
 bench script that spelled the string itself would file a run under a
 configuration the engine did not use, which is the defect that motivated
-moving it.
+moving it. `scripts/ingest/published_ingest.py` is in the same position: it
+carries through the string its result file recorded off that `done` line and
+composes none of its own.
 
 The `kv_boundary/*` pair is always written together and always in that order
 (`head` sorts before `tail`), because a head count without a tail count does

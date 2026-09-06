@@ -312,6 +312,9 @@ SAMPLED="$(field_of "${SNAPSHOT_SAMPLING}" sampled)"
 
 mkdir -p "${LOG_DIR}" "${SCRATCH_DIR}" "${RESULT_DIR}"
 WORK="$(mktemp -d "${SCRATCH_DIR}/published.XXXXXX")"
+# When the run started, in the shape §8.5 wants. Stamped once: the result file's
+# name and every row recorded from it name the same moment.
+TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # Three servers run per invocation. A SIGTERM to this script — a CI timeout, an
 # operator, a parent tearing down — would otherwise leave one alive holding
@@ -762,7 +765,7 @@ WARMUPS_PER_PASS="${WARMUPS_PER_PASS}" PASSES="${PASSES}" \
 MACRO_MAX_TOKENS="${MACRO_MAX_TOKENS}" \
 UNVERIFIED_SAMPLES="${UNVERIFIED_SAMPLES}" \
 SAMPLES_ROOT="${SAMPLES_ROOT}" TAINT="${TAINT}" \
-BINARY_IDENTITY="${BINARY_IDENTITY}" \
+BINARY_IDENTITY="${BINARY_IDENTITY}" TS_UTC="${TS_UTC}" \
 HOST_WINDOWS="$(printf '%s\n' "${HOST_WINDOWS[@]}")" \
 THERMAL_READINGS="$(printf '%s\n' ${THERMAL_READINGS[@]+"${THERMAL_READINGS[@]}"})" \
 python3 - > "${META}" <<'PY'
@@ -780,6 +783,7 @@ print(json.dumps({
     "weight_quant": os.environ["WEIGHT_QUANT"],
     "kv_quant": os.environ["KV_QUANT_SEEN"],
     "ctx_max": int(os.environ["MAX_CTX"]),
+    "ts_utc": os.environ["TS_UTC"],
     "samples_root": os.environ["SAMPLES_ROOT"],
     # Not a published measurement: the samples it ran on are not the pinned ones.
     "unverified_samples": os.environ["UNVERIFIED_SAMPLES"] == "true",
@@ -819,7 +823,7 @@ print(json.dumps({
 }))
 PY
 
-RESULT="${RESULT_DIR}/$(date -u +%Y%m%dT%H%M%SZ)-${MODEL_NAME}-${ARM}.json"
+RESULT="${RESULT_DIR}/${TS_UTC//[-:]/}-${MODEL_NAME}-${ARM}.json"
 set +e
 python3 "${REPO_ROOT}/scripts/lib/published_aggregate.py" report \
     "${PASS_FILES[@]}" \
