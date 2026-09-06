@@ -69,7 +69,10 @@ fn dflash_round0_first_token_aligns() {
         env_path("RMLX_KV_TEST_MODEL"),
         env_path("RMLX_DRAFT_TEST_MODEL"),
     ) else {
-        eprintln!("[dflash_align] verifier/draft model unset/absent - skipping");
+        eprintln!(
+            "SKIP dflash_round0_first_token_aligns: RMLX_KV_TEST_MODEL and \
+             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
+        );
         return;
     };
     let device = Device::Gpu;
@@ -190,7 +193,10 @@ fn dflash_live_loop_emits_coherent() {
         env_path("RMLX_KV_TEST_MODEL"),
         env_path("RMLX_DRAFT_TEST_MODEL"),
     ) else {
-        eprintln!("[dflash_align] verifier/draft model unset/absent - skipping");
+        eprintln!(
+            "SKIP dflash_live_loop_emits_coherent: RMLX_KV_TEST_MODEL and \
+             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
+        );
         return;
     };
     let device = Device::Gpu;

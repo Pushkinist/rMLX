@@ -105,20 +105,26 @@ fn two_model_greedy_tracks_plain_greedy_for_a_long_prefix() {
         env_path("RMLX_KV_TEST_MODEL"),
         env_path("RMLX_DRAFT_TEST_MODEL"),
     ) else {
-        eprintln!("[qwen35_two_model_align] verifier/draft unset or absent - skipping");
+        eprintln!(
+            "SKIP two_model_greedy_tracks_plain_greedy_for_a_long_prefix: \
+             RMLX_KV_TEST_MODEL and RMLX_DRAFT_TEST_MODEL must both name an existing \
+             snapshot directory"
+        );
         return;
     };
     if !is_gdn_hybrid(&model_path) || !is_gdn_hybrid(&draft_path) {
         eprintln!(
-            "[qwen35_two_model_align] pair is not a GDN hybrid on both sides - skipping \
-             (a full-attention pair exercises no GDN rollback)"
+            "SKIP two_model_greedy_tracks_plain_greedy_for_a_long_prefix: the pair is not \
+             a GDN hybrid on both sides, and a full-attention pair exercises no GDN \
+             rollback"
         );
         return;
     }
     if model_path.canonicalize().ok() == draft_path.canonicalize().ok() {
         eprintln!(
-            "[qwen35_two_model_align] verifier and draft name one snapshot - skipping \
-             (load_speculative refuses that pair; point the two vars at different models)"
+            "SKIP two_model_greedy_tracks_plain_greedy_for_a_long_prefix: the verifier and \
+             the draft name one snapshot, which load_speculative refuses; point the two \
+             variables at different models"
         );
         return;
     }

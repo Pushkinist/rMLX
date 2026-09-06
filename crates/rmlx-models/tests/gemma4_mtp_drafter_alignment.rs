@@ -63,7 +63,10 @@ fn l2(bytes: &[u8]) -> f32 {
 #[test]
 fn embed_token_raw_applies_sqrt_hidden_scale() {
     let Some(model_path) = env_path("RMLX_KV_TEST_MODEL") else {
-        eprintln!("[mtp_align] RMLX_KV_TEST_MODEL unset/absent - skipping");
+        eprintln!(
+            "SKIP embed_token_raw_applies_sqrt_hidden_scale: RMLX_KV_TEST_MODEL does not \
+             name an existing snapshot directory"
+        );
         return;
     };
     let device = Device::Gpu;
@@ -97,7 +100,10 @@ fn mtp_assistant_accept_rate_is_high() {
         env_path("RMLX_KV_TEST_MODEL"),
         env_path("RMLX_DRAFT_TEST_MODEL"),
     ) else {
-        eprintln!("[mtp_align] verifier/draft model unset/absent - skipping");
+        eprintln!(
+            "SKIP mtp_assistant_accept_rate_is_high: RMLX_KV_TEST_MODEL and \
+             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
+        );
         return;
     };
     let device = Device::Gpu;
