@@ -201,7 +201,14 @@ fi
 UNVERIFIED_SAMPLES=false
 if [[ -z "${SAMPLES_ROOT}" ]]; then
     SAMPLES_ROOT="${PUBLISHED_ROOT}"
-    if ! python3 "${REPO_ROOT}/scripts/published_samples.py" verify; then
+    # `--root` names the tree about to be measured. Without it the gate resolves
+    # its own checkout from its own path, which is the same tree in a normal
+    # run and a different one whenever this script is driven from elsewhere —
+    # and verifying one root while measuring another proves nothing about the
+    # number. The anchor it checks against lives in the gate's source either
+    # way, so naming the root weakens nothing.
+    if ! python3 "${REPO_ROOT}/scripts/published_samples.py" verify \
+            --root "${PUBLISHED_ROOT}"; then
         echo "ERROR: the published sample sets do not re-derive from what" \
              "published_samples.py pins; refusing to measure against them" >&2
         exit 1

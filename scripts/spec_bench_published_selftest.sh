@@ -80,25 +80,28 @@ SAMPLES="${WORK}/samples"
 mkdir -p "${SAMPLES}"
 shrink() { # shrink <src-root> <dst-root>
 	python3 - "$1" "$2" <<'PY' || exit 2
-import json, pathlib, sys
+import hashlib, json, pathlib, sys
 
 src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 KEEP = {"mt_bench": 1, "math_500": 2, "humaneval": 3}
 
+# The manifest keeps its shape, so a run that reaches this root as the
+# published one is refused for what differs — the sample counts and the file
+# digests — and not for a manifest that was never built.
 man = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
-kept = []
 for entry in man["datasets"]:
     keep = KEEP[entry["key"]]
     doc = json.loads((src / entry["file"]).read_text(encoding="utf-8"))
     doc["samples"] = doc["samples"][:keep]
     assert len(doc["samples"]) == keep, entry["key"]
-    (dst / entry["file"]).write_text(
-        json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    kept.append({"key": entry["key"], "file": entry["file"], "count": keep})
+    blob = (json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    (dst / entry["file"]).write_bytes(blob)
+    entry["count"] = keep
+    entry["selected_ids"] = entry["selected_ids"][:keep]
+    entry["file_bytes"] = len(blob)
+    entry["file_sha256"] = hashlib.sha256(blob).hexdigest()
 (dst / "manifest.json").write_text(
-    json.dumps({"datasets": kept}, ensure_ascii=False, indent=2) + "\n",
-    encoding="utf-8",
+    json.dumps(man, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
 )
 PY
 }
@@ -260,6 +263,7 @@ SAMPLED = os.environ.get("STUB_SAMPLED", "1") == "1"
 SAMPLER_LINES = int(os.environ.get("STUB_SAMPLER_LINES", "-1"))
 SAMPLER_TOP_K = int(os.environ.get("STUB_SAMPLER_TOP_K", "20"))
 SAMPLER_TOP_K_PASS2 = os.environ.get("STUB_SAMPLER_TOP_K_PASS2", "")
+SAMPLER_TOP_K_AFTER = os.environ.get("STUB_SAMPLER_TOP_K_AFTER", "")
 OMIT_COMPLETION_TOKENS = os.environ.get("STUB_OMIT_COMPLETION_TOKENS", "") == "1"
 LOG_PATH = os.environ.get("STUB_LOG", "")
 SPECULATIVE = os.environ.get("STUB_SPECULATIVE", "") == "1"
@@ -381,6 +385,8 @@ class Handler(BaseHTTPRequestHandler):
             top_k = SAMPLER_TOP_K
             if SAMPLER_TOP_K_PASS2 and PASS >= 2:
                 top_k = int(SAMPLER_TOP_K_PASS2)
+            if SAMPLER_TOP_K_AFTER and served >= 2:
+                top_k = int(SAMPLER_TOP_K_AFTER)
             log(event({"message": "generate: host categorical sampler active (A7.2)",
                        "model_id": "stub", "temperature": 0.6, "top_p": 0.95,
                        "top_k": top_k, "min_p": 0.0, "seed": 42919}))
@@ -796,6 +802,16 @@ run_case sampling_is_read_back_from_the_engine 0 \
     note_bad "seed=$(jq_of "r['protocol']['sampling_resolved']['seed']")"
 verdict
 
+# Two guards, two cases: one pass whose requests did not share a setting, and
+# three passes that did not share one with each other.
+run_case sampler_drift_within_a_pass_refused 1 \
+    "requests of one pass that sampled under different settings are refused" \
+    'STUB_SAMPLER_TOP_K=20' 'STUB_SAMPLER_TOP_K_AFTER=40' \
+    'GREP:did not share one sampling setup' \
+    'GREP:2 values for top_k'
+no_result
+verdict
+
 run_case sampler_drift_between_passes_refused 1 \
     "passes that sampled under different settings are not averaged" \
     'STUB_SAMPLER_TOP_K=20' 'STUB_SAMPLER_TOP_K_PASS2=40' \
@@ -1016,6 +1032,27 @@ no_result
 verdict
 
 # ── The inputs ────────────────────────────────────────────────────────────────
+
+# The published root is held to `published_samples.py` and no flag turns that
+# off. This runs out of a repo whose prompts/published IS the shrunken copy and
+# passes no --samples-root, so the harness reaches it as the published root and
+# the anchor refuses it. Every other case here measures that same copy through
+# --samples-root, which is the whole difference between the two paths.
+run_case canonical_root_is_verified 1 \
+    "the published root is verified, and nothing measured against it can skip that" \
+    CANONICAL:1 \
+    'GREP:manifest count is 1 and disagrees with published_samples.py' \
+    'GREP:do not re-derive from what'
+no_result
+verdict
+
+run_case override_root_is_marked_unverified 0 \
+    "an overridden sample root is measured but is not a published measurement" \
+    'GREP:UNVERIFIED SAMPLES' \
+    'GREP:not a published measurement'
+[ "$(jq_of "r['unverified_samples']")" = "True" ] ||
+    note_bad "the result does not declare itself unverified"
+verdict
 
 # The cell table and the sample sets can drift apart two ways, and neither is
 # reachable by editing a manifest: `published_samples.py verify` pins the

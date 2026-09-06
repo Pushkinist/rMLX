@@ -51,10 +51,15 @@ field_of() {
     echo "${block}" | sed -n "s/^${key}=//p" | tail -1
 }
 
+# Where this process keeps its before/after log listings. Per-pid: two harnesses
+# sharing an RMLX_HOME would otherwise overwrite each other's listing and
+# attribute each other's run logs.
+log_listing() { echo "${SCRATCH_DIR}/logs_$1.$$"; }
+
 # Which run logs exist right now. Called before a phase starts its server.
 snapshot_logs() {
     { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
-        > "${SCRATCH_DIR}/logs_before"
+        > "$(log_listing before)"
 }
 
 # The run log a given pid wrote, among those that appeared since snapshot_logs.
@@ -66,11 +71,13 @@ snapshot_logs() {
 # all — reading metrics out of somebody else's log leaves no trace in the
 # output.
 phase_log() {
-    local pid="$1"
-    { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort \
-        > "${SCRATCH_DIR}/logs_after"
-    comm -13 "${SCRATCH_DIR}/logs_before" "${SCRATCH_DIR}/logs_after" \
+    local pid="$1" before after
+    before="$(log_listing before)"
+    after="$(log_listing after)"
+    { ls -1 "${LOG_DIR}"/*.jsonl 2>/dev/null || true; } | sort > "${after}"
+    comm -13 "${before}" "${after}" \
         | python3 "${REPO_ROOT}/scripts/lib/run_log_for_pid.py" --pid "${pid}"
+    rm -f "${after}"
 }
 
 # The KV codec that log says the run resolved. Empty when it does not say.
