@@ -64,6 +64,47 @@ use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 /// logit tensor in one Metal command buffer.
 const PREFILL_CHUNK_SIZE: usize = 1024;
 
+/// Largest block this loop can verify, and so the largest a checkpoint may
+/// declare.
+///
+/// **The block is scored in one un-chunked forward.** A round calls
+/// `Architecture::forward_verify_capture` once over the carry token and every
+/// proposal, and that forward materialises `block_size * vocab_size` logits in a
+/// single Metal command buffer — the round loop needs all of them, because it
+/// argmaxes every position to walk the acceptance. There is no chunked variant
+/// it could fall back on: `forward_verify_capture_chunked` exists precisely
+/// because that stops working, and it buys its headroom by materialising the
+/// *last* position's logits only, which a verify pass cannot do.
+///
+/// The number is the one that path already records as measured: a `[1, n, vocab]`
+/// logit tensor in one command buffer times the GPU out above roughly a thousand
+/// positions on this verifier's family, and a 4096-position single shot exceeds
+/// the Metal watchdog on logits alone. So a checkpoint declaring a block above
+/// this is describing a round that cannot be run rather than one that would be
+/// slow — and the block is what sizes the round's token buffer, the verify
+/// input, the selector's chain and a mask quadratic in it.
+///
+/// Real DFlash 2 blocks are single digits; the published checkpoint declares 8
+/// and its own guidance recommends 5 against a quantized pair. This is a
+/// structural ceiling with two orders of magnitude of headroom over anything
+/// that drafts, not a tuning knob.
+pub(super) const MAX_BLOCK_SIZE: usize = 1024;
+
+/// The block a request runs at: what it asked for, what the checkpoint was
+/// trained at, and what one verify forward can score — whichever is smallest,
+/// and never below the two positions a seed and one draft need.
+///
+/// **The [`MAX_BLOCK_SIZE`] clamp is not the loader's guarantee restated.**
+/// [`DFlash2Drafter`] is a public struct with public fields, so a drafter
+/// reaching this loop need not have come through `DFlash2Drafter::load` and its
+/// config need not have been through `check_config` — the tests build one
+/// directly. The block sizes this round's token buffer, its verify input and its
+/// selector chain, so the loop bounds it on its own behalf rather than on a
+/// promise its argument did not have to make.
+pub(super) fn round_block_total(requested: usize, declared: usize) -> usize {
+    requested.min(declared).clamp(2, MAX_BLOCK_SIZE)
+}
+
 /// Drive a DFlash 2 drafter against its verifier, greedily.
 ///
 /// `requested_block_total` is the round block including the verifier's own
@@ -122,7 +163,7 @@ pub fn dflash2_generate_greedy(
 
     let target_layer_ids = drafter.cfg.target_layer_ids.clone();
     let condition_width = (drafter.cfg.hidden_size * target_layer_ids.len()) as i32;
-    let block_total = requested_block_total.min(drafter.cfg.block_size).max(2);
+    let block_total = round_block_total(requested_block_total, drafter.cfg.block_size);
 
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.
@@ -437,3 +478,7 @@ fn read_argmax(logits: &Array, device: Device) -> Result<u32> {
     }
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
+
+#[cfg(test)]
+#[path = "round_tests.rs"]
+mod round_tests;

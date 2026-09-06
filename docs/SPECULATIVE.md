@@ -1413,24 +1413,44 @@ implemented: nothing ships it, and a numeric branch no checkpoint exercises is a
 second answer with no evidence behind it.
 
 **Every size the config supplies is bounded on both sides**, and the ones that
-are not obviously sizes are the ones this had to be worked through for. A window
-or a block wider than an array axis is refused: past that the window arithmetic
-wraps negative and the conditioning trim slices from beyond its own end, which
-returns no rows and no error, and the block sizes the round's token buffer, the
-verify input and a mask that is quadratic in it. A `mask_token_id` outside the
-vocabulary is refused too — every drafted position but the seed carries it, and a
-gather past the end of the verifier's embedding reads a clamped row rather than
-failing, which is the same silent-wrong shape as `is_causal` one field over.
+are not obviously sizes are the ones this had to be worked through for. A
+`mask_token_id` outside the vocabulary is refused — every drafted position but
+the seed carries it, and a gather past the end of the verifier's embedding reads
+a clamped row rather than failing, which is the same silent-wrong shape as
+`is_causal` one field over. A `sliding_window` wider than an array axis is
+refused: past that the window arithmetic wraps negative and the conditioning trim
+slices from beyond its own end, returning no rows and no error.
 `selector_top_k` was already bounded against `vocab_size` on both sides.
 
-The block's ceiling is deliberately the **axis width and not a relation to
-`sliding_window`**, even though the window's own refusal says the window "holds
-the block". A block longer than the window is degenerate but not wrong: the mask
-opens every block key regardless of the window, so a block position past it
-attends to the block alone, and the reference does the same thing — its `block`
-term carries no window either. Refusing that relationship would refuse a
-configuration this port runs correctly and the reference accepts, which is not
-what these refusals are for.
+**`block_size` is capped at what one verify forward can score**, which is a
+tighter bound than the axis width and a truer one. A round calls
+`forward_verify_capture` once over the carry token and every proposal, and that
+pass is not chunked — it materialises one full-vocabulary logit row per position
+in a single Metal command buffer, and the loop needs all of them because it
+argmaxes every position to walk the acceptance. `forward_verify_capture_chunked`
+exists because that stops working, and it buys its headroom by materialising the
+*last* position's logits only, which a verify pass cannot do. The number is the
+one that path already records as measured: a `[1, n, vocab]` logit tensor times
+the GPU out above roughly a thousand positions, and a 4096-position single shot
+exceeds the Metal watchdog on logits alone. So a checkpoint above the cap
+describes a round that cannot run rather than one that would be slow. Published
+blocks are single digits — this checkpoint declares 8 — so the ceiling has two
+orders of magnitude of headroom over anything that drafts.
+
+The cap is applied twice on purpose. The loader refuses a checkpoint that
+declares more, naming the field; the round loop clamps again, because
+`DFlash2Drafter` is a public struct with public fields and a drafter reaching
+that loop need not have come through the loader — the tests build one directly,
+and the block is what sizes the round's token buffer, its verify input and its
+selector chain.
+
+It is deliberately **not** a relation to `sliding_window`, even though the
+window's own refusal says the window "holds the block". A block longer than the
+window is degenerate but not wrong: the mask opens every block key regardless of
+the window, so a block position past it attends to the block alone, and the
+reference does the same — its `block` term carries no window either. Refusing
+that relationship would refuse a configuration this port runs correctly and the
+reference accepts, which is not what these refusals are for.
 
 The two generations also read their config from different places, which is why
 they do not share a loader: DFlash 1 carries `block_size` and `rope_theta` at

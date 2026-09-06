@@ -312,8 +312,9 @@ fn a_config_the_forward_could_not_honour_is_refused() {
             serde_json::json!(1),
             "block_size",
         ),
-        // A block wider than an array axis sizes the round's token buffer, the
-        // verify input and the drafter's mask before anything can refuse it.
+        // A block bigger than one verify forward can score sizes the round's
+        // token buffer, the verify input and the drafter's mask before anything
+        // can refuse it, and the pass it describes would time the GPU out.
         (
             "dflash_config",
             "block_size",
@@ -395,9 +396,10 @@ fn a_config_the_forward_could_not_honour_is_refused() {
 )]
 fn each_size_bound_accepts_its_boundary_and_refuses_one_past_it() {
     let axis = u64::try_from(i32::MAX).expect("i32::MAX is a u64");
+    let block = round::MAX_BLOCK_SIZE as u64;
     let cases: &[(&str, &str, u64, u64)] = &[
         // (path, key, largest accepted, first refused)
-        ("dflash_config", "block_size", axis, axis + 1),
+        ("dflash_config", "block_size", block, block + 1),
         ("", "sliding_window", axis, axis + 1),
         // A token id is an index, so the last one the vocabulary holds is the
         // last one accepted.
