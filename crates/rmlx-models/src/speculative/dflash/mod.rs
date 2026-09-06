@@ -832,10 +832,7 @@ pub fn dflash_generate_greedy(
         v_argmax.eval()?;
         let vb = v_argmax.to_bytes()?;
         verifier_ns += t0.elapsed().as_nanos();
-        let mut v_tokens: Vec<u32> = Vec::with_capacity(v_k);
-        for i in 0..v_k {
-            v_tokens.push(u32::from_le_bytes(vb[i * 4..i * 4 + 4].try_into().unwrap()));
-        }
+        let v_tokens = super::argmax_tokens(&vb, v_k)?;
 
         // -- Phase C: greedy acceptance walk. --------------------------------
         let (accept, new_tokens) = walk_block_greedy(&draft_tokens, &v_tokens, remaining);

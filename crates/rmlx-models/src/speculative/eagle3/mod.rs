@@ -1048,11 +1048,13 @@ pub fn eagle3_generate_greedy(
             let hot_am = argmax(&hot_logits, -1, device)?;
             hot_am.eval()?;
             let hot_bytes = hot_am.to_bytes()?;
-            let mut tokens: Vec<u32> = (0..v_k)
-                .map(|i| {
-                    let draft_idx =
-                        u32::from_le_bytes(hot_bytes[i * 4..i * 4 + 4].try_into().unwrap())
-                            as usize;
+            // Restricted vocabulary: the argmax is an index into `hot_ids`, not
+            // a token id, but the read-back is the same device buffer and the
+            // same guard applies to it.
+            let mut tokens: Vec<u32> = super::argmax_tokens(&hot_bytes, v_k)?
+                .into_iter()
+                .map(|draft_idx| {
+                    let draft_idx = draft_idx as usize;
                     hot_ids_host
                         .get(draft_idx)
                         .copied()
@@ -1094,11 +1096,7 @@ pub fn eagle3_generate_greedy(
             v_argmax.eval()?;
             let vb = v_argmax.to_bytes()?;
             verifier_ns += t0.elapsed().as_nanos();
-            let mut toks = Vec::with_capacity(v_k);
-            for i in 0..v_k {
-                toks.push(u32::from_le_bytes(vb[i * 4..i * 4 + 4].try_into().unwrap()));
-            }
-            (toks, v_hidden)
+            (super::argmax_tokens(&vb, v_k)?, v_hidden)
         };
 
         // -- Phase C: greedy acceptance walk. --
