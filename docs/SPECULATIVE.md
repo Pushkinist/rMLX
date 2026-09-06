@@ -1147,7 +1147,7 @@ drafter wearing the checkpoint's name, and `decode_config` recorded
 real drafter afterwards. **They are not a DFlash 2 measurement and must not be
 quoted as one.**
 
-What runs today is the load and the decoder stack.
+What runs today is the load, the decoder stack and the candidate selector.
 `rmlx_models::speculative::dflash2` binds every tensor at the shape the config
 predicts and refuses a snapshot carrying one it does not read, and
 `DFlash2Drafter::forward_hidden` runs the block through the stack — the
@@ -1159,9 +1159,37 @@ forward is checked against the z-lab MLX reference
 (`crates/rmlx-models/tests/fixtures/dflash2_scale`, to within one bf16 place)
 and the published weights (`tests/dflash2_loader.rs`, bit-identical).
 
-The candidate selector and the round loop that would drive them are not
-implemented, so the serve layer still refuses a `dflash2` snapshot before the
-verifier is loaded (`engine::speculative::dflash2_reject_reason`).
+`DFlash2Drafter::select_chain` then turns those hidden states into one ordered
+draft chain: the `selector_top_k` highest-scoring tokens are kept at each block
+position, adjacent pairs are scored
+`S_t(a, b) = U_t(b) + <A(a) ⊙ H(h_t), B(b)>` against the two rank-256
+vocabulary codebooks, and the chain is traced left to right from the seed
+token. `U_t` is the **verifier's** LM head over the drafter's hidden states —
+4-bit on this pair — which the round loop passes in; the drafter has no head of
+its own. `H(h_t)` is the context gate: it enters the pairwise term as a Hadamard
+factor on the predecessor embedding, so the same token pair scores differently
+depending on what the block is about at that position.
+
+The chain is sequential but not synchronous. Position `t` needs the token chosen
+at `t - 1`, and that dependency is carried in a device array rather than a host
+integer: every gather, product and argmax is a lazy MLX op and the whole chain is
+read back once, after the last position. The reference does the same. This is
+where the DFlash 1 drafter differs — `greedy_block_tokens` evaluates and reads
+back the argmax at every block position, which is `block_size - 1` device
+synchronisations per round.
+
+The selector is checked against the same reference on the same two models
+(`selector_tests.rs` on the scale snapshot, `tests/dflash2_loader.rs` on the
+published weights), chain for chain, and separately against the score formula
+walked by hand in plain arithmetic. Each fixture's power is asserted rather than
+assumed: both cases trace a chain that differs from the per-position argmax of
+the logits and from the chain the pairwise term alone would trace, and the two
+anchors trace different chains, so a selector that returned the argmax, dropped
+the logits or ignored the seed fails rather than passing quietly.
+
+The round loop that would drive them is not implemented, so the serve layer
+still refuses a `dflash2` snapshot before the verifier is loaded
+(`engine::speculative::dflash2_reject_reason`).
 `--draft-kind dflash` over that snapshot is refused separately as a flag
 contradicting the declaration. `z-lab/Qwen3.6-35B-A3B-DFlash` is `dflash`, reads
 every tensor it ships, and is unaffected.
