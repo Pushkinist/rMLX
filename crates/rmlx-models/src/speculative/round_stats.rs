@@ -18,7 +18,7 @@
 //! argmax a bonus token out of the prefill forward and emit it before the round
 //! loop starts, so `emitted` carries one token no verify round produced; the
 //! two-model loops emit nothing outside their loop. Dividing `emitted` by
-//! `rounds` would therefore read `+1/rounds` high on four of six loops —
+//! `rounds` would therefore read `+1/rounds` high on five of seven loops —
 //! measured at +1.35% and +0.98% on two of them — and make the one figure the
 //! record exists to compare incomparable between them. Each loop counts what
 //! its rounds emit at the emit site and reports it as
@@ -52,6 +52,9 @@ pub(crate) enum SpecLoop {
     MtpSidecar,
     /// Draft-Flash block drafter.
     DFlash,
+    /// Draft-Flash 2 block drafter: dynamic convolutions and a candidate-path
+    /// selector over the block.
+    DFlash2,
     /// EAGLE-3 drafter.
     Eagle3,
     /// Two full models, greedy acceptance.
@@ -63,11 +66,11 @@ pub(crate) enum SpecLoop {
 impl SpecLoop {
     /// Every variant, once — the population the per-loop tests sweep.
     ///
-    /// Paired with [`Self::index`], whose match is exhaustive: a seventh
+    /// Paired with [`Self::index`], whose match is exhaustive: an eighth
     /// variant does not compile until it has an index, and
     /// `every_variant_is_in_all_once` does not pass until it is in this list at
     /// that index. A hand-written list in a test file is forced by neither, and
-    /// a new loop would silently join none of the six per-loop tests.
+    /// a new loop would silently join none of the per-loop tests.
     ///
     /// It lives beside the enum because that is where the exhaustiveness comes
     /// from, and is compiled with the tests because that is its only caller —
@@ -77,6 +80,7 @@ impl SpecLoop {
         Self::MtpAssistant,
         Self::MtpSidecar,
         Self::DFlash,
+        Self::DFlash2,
         Self::Eagle3,
         Self::TwoModelGreedy,
         Self::TwoModelStochastic,
@@ -89,9 +93,10 @@ impl SpecLoop {
             Self::MtpAssistant => 0,
             Self::MtpSidecar => 1,
             Self::DFlash => 2,
-            Self::Eagle3 => 3,
-            Self::TwoModelGreedy => 4,
-            Self::TwoModelStochastic => 5,
+            Self::DFlash2 => 3,
+            Self::Eagle3 => 4,
+            Self::TwoModelGreedy => 5,
+            Self::TwoModelStochastic => 6,
         }
     }
 
@@ -103,6 +108,7 @@ impl SpecLoop {
             Self::MtpAssistant => "mtp_assistant_generate_greedy: done",
             Self::MtpSidecar => "mtp_generate_greedy: done",
             Self::DFlash => "dflash_generate_greedy: done",
+            Self::DFlash2 => "dflash2_generate_greedy: done",
             Self::Eagle3 => "eagle3_generate_greedy: done",
             Self::TwoModelGreedy => "spec_generate_greedy_cached: done",
             Self::TwoModelStochastic => "spec_generate_stochastic_cached: done",
@@ -117,6 +123,7 @@ impl SpecLoop {
             // architecture family.
             Self::MtpAssistant | Self::MtpSidecar => DraftKind::Mtp.as_str(),
             Self::DFlash => DraftKind::DFlash.as_str(),
+            Self::DFlash2 => DraftKind::DFlash2.as_str(),
             Self::Eagle3 => DraftKind::Eagle3.as_str(),
             Self::TwoModelGreedy | Self::TwoModelStochastic => DraftKind::TwoModel.as_str(),
         }
@@ -132,7 +139,7 @@ impl SpecLoop {
     /// the drift `decode_config` exists to prevent.
     ///
     /// The *match* is exhaustive on purpose. A bare lookup compiles for a
-    /// seventh loop that forgot to join that list, hands it `None`, and records
+    /// eighth loop that forgot to join that list, hands it `None`, and records
     /// the exact spelling migration 008 exists to undo. Here a new variant does
     /// not compile until someone says which arm it is in, and
     /// `every_loop_is_classified_against_the_shared_list` pins each arm's answer
@@ -140,8 +147,11 @@ impl SpecLoop {
     pub(crate) fn depth_policy(self) -> Option<&'static str> {
         match self {
             Self::DFlash => rmlx_metrics::cell::inherent_depth_policy(self.draft_kind()),
+            // DFlash 2 drafts the block its selector was trained at, every
+            // round; only the token budget shortens it.
             Self::MtpAssistant
             | Self::MtpSidecar
+            | Self::DFlash2
             | Self::Eagle3
             | Self::TwoModelGreedy
             | Self::TwoModelStochastic => None,

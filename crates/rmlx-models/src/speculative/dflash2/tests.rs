@@ -370,6 +370,75 @@ fn a_width_the_verifier_does_not_share_is_refused() {
     );
 }
 
+/// The three scalars the reference applies to the drafter's logit path are
+/// refused when a checkpoint moves one of them off the reference's default.
+///
+/// Every other refusal in this file fires on a key that is **absent**. These
+/// three are the opposite failure: the published checkpoint declares none of
+/// them, so a loader that ignores them is indistinguishable from one that
+/// applies them, and a later checkpoint that sets one would be drafted through a
+/// differently scaled head with nothing in the run to say so.
+#[test]
+fn a_logit_path_scalar_off_its_reference_default_is_refused() {
+    let cases: &[(&str, &str, serde_json::Value)] = &[
+        (
+            "dflash_config",
+            "input_embedding_scale",
+            serde_json::json!(11.3137),
+        ),
+        ("dflash_config", "output_multiplier", serde_json::json!(2.5)),
+        (
+            "dflash_config",
+            "final_logit_softcapping",
+            serde_json::json!(30.0),
+        ),
+        // The reference falls back to the top level for the cap alone, so a
+        // guard reading only `dflash_config` would miss this one.
+        ("", "final_logit_softcapping", serde_json::json!(30.0)),
+    ];
+    for (path, key, value) in cases {
+        let err = match parsed_with(path, key, Some(value.clone())) {
+            Ok(cfg) => panic!("{path}.{key} = {value} must refuse, parsed to {cfg:?}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains(key),
+            "the refusal for {path}.{key} = {value} must name the key: {err}"
+        );
+    }
+}
+
+/// A scalar declared **at** the reference's default is not a refusal: the
+/// drafter's path is that default, so the two agree.
+///
+/// Without this the guard could be "refuse whenever the key is present", which
+/// would turn a checkpoint that merely spells out its defaults into a load
+/// failure.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: a refusal of a config that agrees with the port is the assertion failing"
+)]
+fn a_logit_path_scalar_at_its_reference_default_is_accepted() {
+    for (path, key, value) in [
+        (
+            "dflash_config",
+            "input_embedding_scale",
+            serde_json::json!(1.0),
+        ),
+        ("dflash_config", "output_multiplier", serde_json::json!(1.0)),
+        (
+            "dflash_config",
+            "final_logit_softcapping",
+            serde_json::Value::Null,
+        ),
+        ("", "final_logit_softcapping", serde_json::Value::Null),
+    ] {
+        parsed_with(path, key, Some(value.clone()))
+            .unwrap_or_else(|e| panic!("{path}.{key} = {value} is the port's own path: {e}"));
+    }
+}
+
 // --- the loader, on a scale model of the snapshot ---
 
 /// A DFlash 2 config at a width small enough to write a whole snapshot for.

@@ -7,8 +7,8 @@
 //! `text_config missing num_experts` error).
 
 use super::{
-    classify_mtp_draft, decide_draft_kind, dflash2_reject_reason, drafted_per_round,
-    mtp_reject_reason, round_block, MtpDraftFamily, DEFAULT_DRAFT_BLOCK_SIZE, MIN_DRAFT_BLOCK_SIZE,
+    classify_mtp_draft, decide_draft_kind, drafted_per_round, mtp_reject_reason, round_block,
+    MtpDraftFamily, DEFAULT_DRAFT_BLOCK_SIZE, MIN_DRAFT_BLOCK_SIZE,
 };
 use rmlx_models::{Declared, DraftKind};
 
@@ -312,29 +312,4 @@ fn the_two_dflash_generations_do_not_take_each_other() {
         );
         assert!(msg.contains(arch), "names the snapshot's own words: {msg}");
     }
-}
-
-/// The DFlash 2 refusal states the gap and closes the route a reader would try
-/// next. Naming the checkpoint is not enough: `--draft-kind dflash` would load
-/// it, and the row it wrote could not afterwards be told from the real
-/// drafter's.
-#[test]
-fn the_dflash2_reject_reason_closes_the_dflash_1_route() {
-    let reason = dflash2_reject_reason("DFlash2DraftModel");
-    assert!(
-        reason.contains("DFlash2DraftModel"),
-        "names the snapshot: {reason}"
-    );
-    assert!(
-        reason.contains("not implemented"),
-        "states the gap rather than implying a bad checkpoint: {reason}"
-    );
-    assert!(
-        reason.contains("--draft-kind dflash"),
-        "closes the route a reader tries next: {reason}"
-    );
-    assert!(
-        reason.contains("--draft-model"),
-        "names the way out: {reason}"
-    );
 }

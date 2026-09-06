@@ -11,7 +11,11 @@ use super::{RoundStats, SpecLoop};
 /// measures it. It exists so the two accountings are both exercised here.
 fn seed_of(loop_kind: SpecLoop) -> usize {
     match loop_kind {
-        SpecLoop::MtpAssistant | SpecLoop::MtpSidecar | SpecLoop::DFlash | SpecLoop::Eagle3 => 1,
+        SpecLoop::MtpAssistant
+        | SpecLoop::MtpSidecar
+        | SpecLoop::DFlash
+        | SpecLoop::DFlash2
+        | SpecLoop::Eagle3 => 1,
         SpecLoop::TwoModelGreedy | SpecLoop::TwoModelStochastic => 0,
     }
 }
@@ -239,7 +243,7 @@ fn any_disagreement_between_the_three_counts_is_named() {
 }
 
 /// `ALL` and `index` are two halves of one list and the compiler holds both: a
-/// seventh variant does not compile until it has an index, and does not pass
+/// eighth variant does not compile until it has an index, and does not pass
 /// here until it is in `ALL` at that index.
 #[test]
 fn every_variant_is_in_all_once() {
@@ -349,7 +353,7 @@ fn every_loop_composes_a_well_formed_cell() {
 ///
 /// `every_loop_composes_a_well_formed_cell` only asserts the adaptive set is
 /// non-empty, which one existing loop satisfies forever. This table has an entry
-/// per variant and is checked against `SpecLoop::ALL`, so a seventh loop fails
+/// per variant and is checked against `SpecLoop::ALL`, so an eighth loop fails
 /// here until someone records what its block policy is — and is checked against
 /// `ADAPTIVE_DRAFTERS`, so the engine's match and the shared list cannot
 /// disagree about it.
@@ -359,6 +363,7 @@ fn every_loop_is_classified_against_the_shared_list() {
         (SpecLoop::MtpAssistant, None),
         (SpecLoop::MtpSidecar, None),
         (SpecLoop::DFlash, Some("accept_rate")),
+        (SpecLoop::DFlash2, None),
         (SpecLoop::Eagle3, None),
         (SpecLoop::TwoModelGreedy, None),
         (SpecLoop::TwoModelStochastic, None),

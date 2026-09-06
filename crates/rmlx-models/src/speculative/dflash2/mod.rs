@@ -17,16 +17,17 @@
 //!
 //! # Status — document-the-truth (CLAUDE.md hard rule 7)
 //!
-//! **This module drafts one block; nothing drives it round after round yet.**
-//! Config parsing, weight binding and shape validation against
-//! `z-lab/Qwen3.8-27B-DFlash2` are wired and covered,
-//! [`DFlash2Drafter::forward_hidden`] returns a block's final hidden states, and
+//! **Greedy end to end.** Config parsing, weight binding and shape validation
+//! against `z-lab/Qwen3.8-27B-DFlash2` are wired and covered;
+//! [`DFlash2Drafter::forward_hidden`] returns a block's final hidden states and
 //! [`DFlash2Drafter::select_chain`] turns those states and the verifier's
-//! logits over them into one ordered draft chain — both checked against the
-//! z-lab MLX reference. The round loop that would call them, verify the chain
-//! and roll the caches back is not implemented, so the serve layer still
-//! refuses a DFlash 2 draft snapshot before any weight is read rather than
-//! running one of the other loops under this checkpoint's name.
+//! logits over them into one ordered draft chain, both checked against the
+//! z-lab MLX reference; and [`dflash2_generate_greedy`] drives them round after
+//! round against the verifier. **Only greedy** — the reference's sampled arm
+//! accepts by rejection sampling restricted to the selector's own candidate
+//! set, which is neither what `select_chain` returns nor the acceptance rule
+//! this crate's two-model loop implements. Like every other sidecar loop here,
+//! a request above temperature 0 is served greedily.
 //!
 //! # Why its own module and its own [`crate::DraftKind`]
 //!
@@ -47,7 +48,10 @@ use rmlx_mlx::{Array, Device};
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 
 mod forward;
+mod round;
 mod selector;
+
+pub use round::dflash2_generate_greedy;
 
 /// The number of convolution sides a `base_kernel` carries: one kernel applied
 /// to the sublayer's normed input, one to the sublayer's output.
@@ -376,7 +380,70 @@ fn parse_config(
     };
 
     check_config(&cfg, cfg_raw, verifier_hidden)?;
+    check_scalars_at_reference_defaults(cfg_raw)?;
     Ok(cfg)
+}
+
+/// Refuse a checkpoint that moves one of the three scalars this drafter's
+/// numeric path leaves at the reference's default.
+///
+/// The reference scales the block's input embeddings by
+/// `input_embedding_scale`, its logits by `output_multiplier`, and softcaps them
+/// at `final_logit_softcapping`. This port applies none of the three, because
+/// the published checkpoint declares none of them and the reference's defaults —
+/// 1.0, 1.0 and off — make all three the identity. A checkpoint that moves one
+/// would be drafted through a differently scaled head, at no error and with
+/// nothing in the run to say so, which is the one failure a missing key cannot
+/// produce and an unread one can.
+///
+/// The keys are read where the reference reads them: all three from
+/// `dflash_config`, and `final_logit_softcapping` from the top level as well.
+fn check_scalars_at_reference_defaults(cfg_raw: &rmlx_loader::ModelConfig) -> Result<()> {
+    let dflash = cfg_raw.extras.get("dflash_config");
+    let scalar = |key: &str| -> Option<f64> {
+        dflash
+            .and_then(|d| d.get(key))
+            .and_then(serde_json::Value::as_f64)
+    };
+    let refuse = |key: &str, value: f64, effect: &str| -> Error {
+        Error::Model(format!(
+            "DFlash2Drafter: config.json sets {key} to {value}; this drafter {effect} and \
+             would draft through a differently scaled head without failing"
+        ))
+    };
+
+    for (key, effect) in [
+        (
+            "input_embedding_scale",
+            "embeds its block through the verifier's embedding unscaled",
+        ),
+        ("output_multiplier", "does not scale its logits"),
+    ] {
+        if let Some(value) = scalar(key) {
+            if (value - 1.0).abs() > f64::EPSILON {
+                return Err(refuse(key, value, effect));
+            }
+        }
+    }
+
+    // The reference softcaps only for a positive cap, so a null or a
+    // non-positive one is the identity here too.
+    let softcap = scalar("final_logit_softcapping").or_else(|| {
+        cfg_raw
+            .extras
+            .get("final_logit_softcapping")
+            .and_then(serde_json::Value::as_f64)
+    });
+    if let Some(cap) = softcap {
+        if cap > 0.0 {
+            return Err(refuse(
+                "final_logit_softcapping",
+                cap,
+                "does not softcap its logits",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a config the loader can parse but the drafter cannot run.

@@ -95,27 +95,6 @@ fn mtp_reject_reason(arch: &str, model_type: &str) -> String {
     }
 }
 
-/// Build the rejection message for a DFlash 2 draft snapshot.
-///
-/// The loader reads and validates that checkpoint, but the drafter's forward —
-/// a dynamic convolution around each sublayer and a candidate-path selector
-/// over the block — is not implemented, so no round loop can run it. The
-/// message has to close the obvious next move as well as state the gap:
-/// `--draft-kind dflash` builds a different architecture out of the tensors it
-/// recognises, and a run records only the kind and the block, so the accept
-/// rate would be filed under this checkpoint's name with nothing in the row to
-/// say which drafter produced it.
-fn dflash2_reject_reason(arch: &str) -> String {
-    format!(
-        "draft model architecture '{arch}' is a DFlash 2 drafter; rMLX loads and validates \
-         that checkpoint but its drafter forward is not implemented, so no round loop can \
-         run it. Serving it with --draft-kind dflash is refused separately: that loader \
-         builds the earlier DFlash architecture out of the tensors it recognises, and the \
-         accept rate would be recorded under this checkpoint's name. Point --draft-model at \
-         a supported drafter"
-    )
-}
-
 // ── Drafter kind and round block ──────────────────────────────────────────────
 
 /// The round block when `--draft-block-size` is absent: the verifier's own
@@ -224,6 +203,8 @@ enum Drafter {
     Eagle3(Arc<Mutex<rmlx_models::speculative::eagle3::Eagle3Drafter>>),
     /// DFlash drafter beside a verifier-only dispatcher.
     DFlash(Arc<Mutex<rmlx_models::speculative::dflash::DFlashDrafter>>),
+    /// DFlash 2 drafter; its round loop borrows `&self`, so no `Mutex`.
+    DFlash2(Arc<rmlx_models::speculative::dflash2::DFlash2Drafter>),
     /// Gemma4 assistant, the shared-K/V `mtp` family; `draft_n` borrows `&self`.
     MtpAssistant(Arc<rmlx_models::speculative::gemma4_assistant::Gemma4AssistantDrafter>),
     /// Qwen3.5-family MTP sidecar head.
@@ -237,6 +218,7 @@ impl Drafter {
         match self {
             Drafter::Eagle3(_) => rmlx_models::DraftKind::Eagle3,
             Drafter::DFlash(_) => rmlx_models::DraftKind::DFlash,
+            Drafter::DFlash2(_) => rmlx_models::DraftKind::DFlash2,
             Drafter::MtpAssistant(_) | Drafter::MtpSidecar(_) => rmlx_models::DraftKind::Mtp,
             Drafter::TwoModel => rmlx_models::DraftKind::TwoModel,
         }
@@ -402,17 +384,16 @@ impl SpeculativeGenerator {
                 )?;
                 (dispatcher, Drafter::DFlash(Arc::new(Mutex::new(drafter))))
             }
-            // Refused before the verifier is loaded: the alternative is a run
-            // that reads the verifier and the drafter and only then finds it
-            // has no loop to draft with.
             rmlx_models::DraftKind::DFlash2 => {
-                let reason = dflash2_reject_reason(draft_arch);
-                tracing::error!(
-                    draft = %draft_dir.display(),
-                    arch = draft_arch,
-                    "SpeculativeGenerator: DFlash 2 dispatch — the drafter forward is not implemented"
-                );
-                return Err(Error::SpeculativePairing { reason });
+                let dispatcher =
+                    rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
+                let hidden_size = dispatcher.verifier.hidden_size();
+                let drafter = rmlx_models::speculative::dflash2::DFlash2Drafter::load(
+                    draft_dir,
+                    hidden_size,
+                    device,
+                )?;
+                (dispatcher, Drafter::DFlash2(Arc::new(drafter)))
             }
             rmlx_models::DraftKind::Mtp => {
                 let dispatcher =
@@ -879,6 +860,21 @@ impl Generator for SpeculativeGenerator {
                     rmlx_models::speculative::dflash::dflash_generate_greedy(
                         &dispatcher.verifier,
                         &mut drafter,
+                        &tokenizer,
+                        &prompt_tokens,
+                        n_tokens,
+                        block_size,
+                        kv_quant_override,
+                        max_ctx_override,
+                        &eos_ids,
+                        &mut step_fn,
+                        dispatcher.device(),
+                    )
+                }
+                Drafter::DFlash2(drafter) => {
+                    rmlx_models::speculative::dflash2::dflash2_generate_greedy(
+                        &dispatcher.verifier,
+                        drafter,
                         &tokenizer,
                         &prompt_tokens,
                         n_tokens,
