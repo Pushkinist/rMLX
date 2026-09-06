@@ -81,29 +81,39 @@
 //!
 //! # Recall
 //!
-//! Over the twelve (pair, prompt) cells each broken engine above produces, the
-//! gate refuses six of six on the assistant pair and four of six on the
-//! recurrent one. The two it does not refuse read 0.0000 and 0.0977 — inside the
-//! ceiling — and are why the gate runs **every** prompt rather than one: recall
-//! is a property of the set. Both broken engines turn both gates red. The block
-//! pair's own two broken engines are refused on six of six prompts each.
+//! Over the (pair, prompt) cells each broken engine above produces, the gate
+//! refuses six of six on the assistant pair and four of six on the recurrent
+//! one. The two it does not refuse read 0.0000 and 0.0977 — inside the ceiling —
+//! and are why the gate runs **every** prompt rather than one: recall is a
+//! property of the set. Both broken engines turn both gates red. The block pair's
+//! own two broken engines are refused on six of six prompts each; the adaptive
+//! and restricted-vocabulary pairs refuse a rollback off by one on all five
+//! prompts they judge, and the two-model pair on all six.
 //!
 //! # Pairs
 //!
-//! Three, whose verifiers resolve by slug from `RMLX_O_MODELS_ROOT`:
+//! Six, whose verifiers resolve by slug from `RMLX_O_MODELS_ROOT`:
 //!
 //! | verifier | drafter | round loop | rollback |
 //! |---|---|---|---|
 //! | `gemma-4-e2b-it-mxfp8` | `gemma-4-E2B-it-assistant-bf16` | shared-K/V assistant | KV truncation, SWA ring included |
 //! | `Qwen3.8-27B-mxfp8` | `Qwen3.8-27B-MTP-mxfp8` | MTP sidecar | KV truncation + recurrent snapshot/replay |
 //! | `Qwen3.8-27B-4bit` | `Qwen3.8-27B-DFlash2` | DFlash 2 block drafter | KV truncation + recurrent snapshot/replay |
+//! | `Qwen3.6-35B-A3B-8bit` | `Qwen3.6-35B-A3B-DFlash` | DFlash 1, adaptive block | KV truncation + recurrent snapshot/replay |
+//! | `Qwen3.6-35B-A3B-8bit` | `specdrift-qwen3.6-35b-a3b-eagle3` | EAGLE-3 | KV truncation + recurrent snapshot/replay |
+//! | `Qwen3.8-27B-mxfp8` | `ornith-1.0-9b-mxfp8-mlx` | two full models, greedy | both models' KV + recurrent state |
 //!
-//! The first runs wherever the snapshots are; the other two run on request —
-//! see [`DrafterSource`] for the shader-validation reason. `RMLX_DRAFT_TEST_MODEL`
-//! names one drafter, so the pair it does not belong to stands down on the kind
+//! The first runs wherever the snapshots are; the others run on request — see
+//! [`DrafterSource`] for the shader-validation reason. `RMLX_DRAFT_TEST_MODEL`
+//! names one drafter, so a pair it does not belong to stands down on the kind
 //! its snapshot declares rather than loading it as something else.
 //!
-//! The second is the pair whose agreement no subsequence floor could separate
+//! The seventh round loop the engine ships is the two-model **stochastic** one,
+//! and it can have no pair here: it runs only above temperature 0, where neither
+//! arm is a function of the model alone. `two_model_stochastic.rs` gates it on a
+//! different property.
+//!
+//! The MTP pair is the one whose agreement no subsequence floor could separate
 //! from a broken rollback. The divergence oracle settled it: its acceptance walk
 //! was scoring an un-normed hidden through the LM head, and with that fixed
 //! three of six prompts come back bit-identical.
