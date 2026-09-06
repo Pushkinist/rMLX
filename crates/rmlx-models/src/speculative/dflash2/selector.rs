@@ -71,12 +71,18 @@ impl DFlash2Drafter {
         let k = self.cfg.selector_top_k as i32;
         let positions = self.check_inputs(hidden, logits, anchor_id)?;
 
-        // The candidate set, and the reference's own tie-break: `argpartition`
-        // leaves the top `k` in the trailing `k` slots in an unspecified order.
-        // Two tokens whose logits are equal — which a bf16 head over a vocabulary
-        // this size produces at nearly every block position — are separated by
-        // that order and by nothing else, so the choice of primitive is part of
-        // the answer, not an implementation detail.
+        // The candidate set, and with it the reference's own tie-break.
+        // `argpartition` leaves the top `k` in the trailing `k` slots in an
+        // order MLX does not specify, and a bf16 head over a vocabulary this
+        // size ties at the k-th place at nearly every block position — so which
+        // tokens are considered there is decided by that unspecified rule.
+        // Measured on the pinned MLX: the tie goes to the higher token id, and
+        // `argsort` keeps the same set (differing only in the order within the
+        // slice), so this is a coupling to MLX's tie-break rather than to the
+        // choice between those two primitives. It reaches the accept rate and
+        // nothing else, because greedy acceptance emits the verifier's own
+        // argmax whatever was proposed. See
+        // `a_tie_at_the_candidate_boundary_breaks_toward_the_higher_token_id`.
         let partitioned = argpartition(logits, -k, -1, device)?;
         let candidates = partitioned.slice(
             &[0, 0, vocab - k],

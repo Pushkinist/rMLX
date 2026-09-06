@@ -610,3 +610,85 @@ fn the_reference_case_runs_in_the_dtype_the_verifier_head_returns() {
     assert_eq!(fixture_tensor("selector_logits").dtype(), Dtype::Bf16);
     assert_eq!(fixture_tensor("hidden_wide").dtype(), Dtype::Bf16);
 }
+
+// ---------------------------------------------------------------------------
+// the tied boundary — the regime the reference fixtures deliberately exclude
+// ---------------------------------------------------------------------------
+
+/// At an exact tie the partition keeps the **highest-numbered** of the tied
+/// tokens, at every vocabulary size this selector runs at.
+///
+/// Both reference fixtures space their peaks so the boundary cannot tie, and
+/// say so; measured on the published 4-bit head, the 16th and 17th logits are
+/// exactly equal at every block position. So the exact-chain evidence covers a
+/// regime production is not in, and what decides the candidate set there is how
+/// `argpartition` orders equals — which MLX does not specify.
+///
+/// **This is the coupling, and it is the reason to pin it.** Which sixteen
+/// tokens the selector considers is an input to the accept rate and to nothing
+/// else: greedy acceptance emits the verifier's own argmax, so a set that moved
+/// would change how often a draft is accepted and change no answer. There is no
+/// correctness signal to notice it by. An MLX version whose partition broke ties
+/// the other way would move every published DFlash 2 acceptance figure in
+/// silence; here it fails, saying which way the tie now goes.
+///
+/// Measured, not assumed: `argsort` and `argpartition` keep the **same** set at
+/// a tie at 6, 1024 and 248 320 tokens — they differ only in the order within
+/// the kept slice — so this does not pin the choice between those two
+/// primitives, and swapping one for the other is invisible here and everywhere
+/// else. What it pins is the tie-break itself.
+///
+/// **CPU only.** The partition this asserts on is MLX's CPU kernel; production
+/// drafts on Metal, whose kernel is a different implementation of the same
+/// unspecified contract. A tie-break change arriving through an MLX bump would
+/// have to skip this to reach production unseen.
+#[test]
+fn a_tie_at_the_candidate_boundary_breaks_toward_the_higher_token_id() {
+    // The published pair's vocabulary and top-k last: the small sizes make the
+    // rule readable, and the large one is the shape it actually runs at.
+    for (vocab, k, tied) in [(6usize, 3usize, 4usize), (1024, 16, 20), (248_320, 16, 20)] {
+        // Spread across the vocabulary, so "highest-numbered" is a claim about
+        // the tie-break and not about the ids happening to be adjacent.
+        let ids: Vec<usize> = (0..tied).map(|i| (i * 7919 + 11) % vocab).collect();
+        let mut ranked = ids.clone();
+        ranked.sort_unstable();
+        let highest: Vec<usize> = ranked[tied - k..].to_vec();
+        let lowest: Vec<usize> = ranked[..k].to_vec();
+        assert_ne!(
+            highest, lowest,
+            "vocab {vocab}: the two answers must differ, or this asserts nothing"
+        );
+
+        let mut values = vec![-8.0f32; vocab];
+        for &id in &ids {
+            values[id] = 1.0;
+        }
+        let logits = f32_array(&values, &[1, 1, vocab as i32]);
+
+        let partitioned =
+            argpartition(&logits, -(k as i32), -1, Device::Cpu).expect("the partition runs");
+        let kept = partitioned
+            .slice(
+                &[0, 0, vocab as i32 - k as i32],
+                &[1, 1, vocab as i32],
+                &[1, 1, 1],
+                Device::Cpu,
+            )
+            .expect("the trailing k slices");
+        kept.eval().expect("evaluates");
+        let mut got: Vec<usize> = kept
+            .to_bytes()
+            .expect("reads back")
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+            .collect();
+        got.sort_unstable();
+
+        assert_eq!(
+            got, highest,
+            "vocab {vocab}: {tied} tokens tie for the top {k} places and the \
+             partition kept {got:?}; every acceptance figure recorded for this \
+             drafter was taken with the highest-numbered {k} kept instead"
+        );
+    }
+}

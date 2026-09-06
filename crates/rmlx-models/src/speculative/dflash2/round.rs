@@ -51,8 +51,9 @@ use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::dflash::DFlashRoundState;
 use crate::speculative::{
-    accept_prefix, argmax_tokens, emit_step, guard_verifier_prefill_logits, rollback_round_caches,
-    verifier_context, verifier_kv_bytes, DecodeWindow, RoundStats, SpecLoop,
+    accept_prefix, argmax_tokens, emit_step, guard_verifier_prefill_logits, phases_charged,
+    rollback_round_caches, verifier_context, verifier_kv_bytes, DecodeWindow, RoundPhases,
+    RoundStats, SpecLoop,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -81,7 +82,7 @@ const PREFILL_CHUNK_SIZE: usize = 1024;
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
-    reason = "the one index is axis 1 of the conditioning buffer, whose rank keep_last_rows checks before returning it"
+    reason = "the one index is axis 1 of the conditioning buffer, whose rank trim_conditioning checks before returning it"
 )]
 pub fn dflash2_generate_greedy(
     verifier: &Architecture,
@@ -101,11 +102,20 @@ pub fn dflash2_generate_greedy(
             "dflash2_generate_greedy: prompt must have >=2 tokens".into(),
         ));
     }
+    // The recurrent state is a proxy, and an exact one today: the three seams
+    // this loop needs — the multi-layer hidden capture, the raw embedding and
+    // the LM head over a final-normed hidden — are wired for the Qwen3.5 family
+    // and nothing else, and that is the family that carries recurrent state.
+    // Each of those seams refuses an architecture it is not wired for, so an
+    // arch that gained the state without the seams would still fail rather than
+    // draft — at the first block, after a whole prompt has been prefilled, which
+    // is the only thing this check buys over letting them refuse.
     if !verifier.needs_lin_caches() {
         return Err(Error::Model(
-            "dflash2_generate_greedy: the DFlash 2 verifier must be the Qwen3.5/3.6 \
-             hybrid — the drafter reads its multi-layer hidden capture, its raw \
-             embedding and its LM head, and no other architecture exposes them"
+            "dflash2_generate_greedy: this verifier carries no recurrent state, so it \
+             is not the Qwen3.5/3.6 hybrid the drafter's seams are wired for — its \
+             multi-layer hidden capture, its raw embedding and its LM head over a \
+             final-normed hidden"
                 .into(),
         ));
     }
@@ -141,6 +151,8 @@ pub fn dflash2_generate_greedy(
     let mut total_draft = 0usize;
     let mut total_accept = 0usize;
     let mut rounds = 0usize;
+    // One read of process-global log state per request, at the loop head.
+    let charge_phases = phases_charged();
     let t_total = Instant::now();
     let mut window = DecodeWindow::new();
     let mut draft_ns: u128 = 0;
@@ -162,6 +174,15 @@ pub fn dflash2_generate_greedy(
     )?;
     guard_verifier_prefill_logits(verifier, &bonus_logits, prompt_ids.len())?;
     let mut h_ctx = drafter.trim_conditioning(&prompt_hidden)?;
+    if charge_phases {
+        // The guard above forced the logits, and so the whole prompt forward,
+        // but not the capture: it hangs off a different output of that forward.
+        // Joining the chunks and trimming to the window is a copy of one row per
+        // prompt token at `len(target_layer_ids) * hidden_size` — and with
+        // nothing forcing it here the first round's drafter call pays for all of
+        // it. See `phases_charged`.
+        h_ctx.eval()?;
+    }
     let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     let mut b = read_argmax(&bonus_logits, device)?;
@@ -184,7 +205,7 @@ pub fn dflash2_generate_greedy(
             round_loop_ns: 0,
             elapsed_ns: t_total.elapsed().as_nanos(),
             decode_tps: window.tps(),
-            charged: false,
+            charged: charge_phases,
         }
         .log_done();
         return Ok(emitted);
@@ -205,6 +226,7 @@ pub fn dflash2_generate_greedy(
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
+        let round_t0 = Instant::now();
         let remaining = n_tokens - emitted.len();
         // The block never resizes: the drafter denoises the block it was
         // trained at, and only the token budget shortens it.
@@ -215,7 +237,8 @@ pub fn dflash2_generate_greedy(
 
         let t0 = Instant::now();
         let draft_tokens = draft_block(verifier, drafter, b, &h_ctx, bs, device)?;
-        draft_ns += t0.elapsed().as_nanos();
+        let round_draft_ns = t0.elapsed().as_nanos();
+        draft_ns += round_draft_ns;
         if draft_tokens.is_empty() {
             break;
         }
@@ -241,10 +264,23 @@ pub fn dflash2_generate_greedy(
         let v_argmax = argmax(&v_logits, -1, device)?;
         v_argmax.eval()?;
         let vb = v_argmax.to_bytes()?;
-        verifier_ns += t0.elapsed().as_nanos();
-        let v_tokens = argmax_tokens(&vb, v_k)?;
+        if charge_phases {
+            // The argmax forced the logits and the trunk under them, but the
+            // capture is a different output of the same forward and stays lazy.
+            // The next round's drafter reads it, so with nothing forcing it here
+            // the verifier's own capture is billed to the drafter — and this
+            // drafter's capture is `len(target_layer_ids)` times as wide as the
+            // sidecar loops', which is the comparison that would mislead. See
+            // `phases_charged`.
+            v_hidden.eval()?;
+        }
+        let round_verify_ns = t0.elapsed().as_nanos();
+        verifier_ns += round_verify_ns;
 
+        let t0 = Instant::now();
+        let v_tokens = argmax_tokens(&vb, v_k)?;
         let (accept, new_tokens) = accept_prefix(&v_tokens, &draft_tokens, remaining)?;
+        let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
 
         let mut hit_eos = false;
@@ -266,9 +302,11 @@ pub fn dflash2_generate_greedy(
         // The verifier consumed `v_k` positions and keeps the carry token plus
         // the accepted proposals. Read the offset from the deepest cache: a
         // recurrent layer's KvCache never advances, so layer 0 would report 0.
+        let t0 = Instant::now();
         let v_offset_before = v_caches.iter().map(KvCache::offset).max().unwrap_or(0);
         let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
-        if v_target < v_offset_before {
+        let replayed = v_target < v_offset_before;
+        if replayed {
             let v_pre_round_offset = v_offset_before - v_k as i32;
             rollback_round_caches(
                 verifier,
@@ -278,13 +316,13 @@ pub fn dflash2_generate_greedy(
                 &v_input,
                 v_pre_round_offset,
                 v_target,
-                // This loop times no phases, so it never charges one.
-                false,
+                charge_phases,
                 device,
             )?;
         } else {
             drop(round_snap);
         }
+        let round_rollback_ns = t0.elapsed().as_nanos();
 
         // The conditioning rows are exactly the positions the caches kept: the
         // carry token and the accepted proposals.
@@ -309,6 +347,17 @@ pub fn dflash2_generate_greedy(
             v_target,
             "dflash2 round"
         );
+
+        RoundPhases {
+            round_ns: round_t0.elapsed().as_nanos(),
+            draft_ns: round_draft_ns,
+            verify_ns: round_verify_ns,
+            walk_ns: round_walk_ns,
+            rollback_ns: round_rollback_ns,
+            replayed,
+            charged: charge_phases,
+        }
+        .log(SpecLoop::DFlash2, rounds, accept, draft_tokens.len());
     }
 
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();
@@ -327,7 +376,7 @@ pub fn dflash2_generate_greedy(
         round_loop_ns,
         elapsed_ns: t_total.elapsed().as_nanos(),
         decode_tps: window.tps(),
-        charged: false,
+        charged: charge_phases,
     }
     .log_done();
 

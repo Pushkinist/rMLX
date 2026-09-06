@@ -1172,6 +1172,21 @@ The MTP rows reproduce the block-3 rows of the table above — same accept rate 
 three places, same tokens per round — which is what makes them usable as the
 comparison arm rather than a second, differently taken reading.
 
+**Every accept rate here is conditional on MLX's tie-break, and nothing else
+would show it moving.** The selector keeps `selector_top_k` candidates per block
+position with `argpartition`, and over a 248 320-token vocabulary a bf16 head
+ties at the k-th place at nearly every position — so which sixteen tokens are
+considered is decided by an order MLX does not specify. Measured on the pinned
+build the tie goes to the higher token id (`argsort` keeps the same set,
+differing only in the order within the slice, so this is not a choice between
+those two primitives). That set is an input to the accept rate and to nothing
+else: greedy acceptance emits the verifier's own argmax whatever was proposed, so
+a build whose partition broke ties the other way would move every figure in this
+table and change no answer.
+`a_tie_at_the_candidate_boundary_breaks_toward_the_higher_token_id` pins it, on
+the CPU kernel — production drafts on Metal, whose partition is a different
+implementation of the same unspecified contract.
+
 **The comparison is not at equal depth and cannot be.** `MtpDrafter::block_size`
 is the sidecar's own `config.json` value (3 here) and the MTP round loop clamps
 `block_total` to it, so `--draft-block-size 8` against that sidecar runs at 3 and
@@ -1205,6 +1220,20 @@ Verify against block: two more positions cost 16.5 ms and three more cost
 decode step** where the bandwidth roofline is nearer 4%. That is the ceiling
 every speculative arm on this machine meets, and this is a third drafter kind
 measuring it.
+
+**Those `draft ms` figures are upper bounds, and the sidecar's are less so.**
+Every row carries `charged=false`, which means each phase is timed but not
+forced, and this engine evaluates lazily. The verify forward produces two
+outputs: the logits, which the argmax reads back inside the verify span, and the
+conditioning capture, which hangs off the same forward and stays unevaluated
+until the next round's drafter call touches it — inside `draft ms`. Both sidecar
+loops have the same shape, but this drafter's capture is
+`len(target_layer_ids) = 5` times as wide as the MTP sidecar's single hidden, so
+the two columns are skewed by different amounts and the ratio between them
+overstates the gap. `RUST_LOG=rmlx::spec::phase=trace` forces each phase's work
+before its span closes and re-attributes the capture; those rows carry
+`charged=true` and describe a differently scheduled engine, which is why they are
+not these. Before optimising against this split, take it charged.
 
 Drafting costs 19.5–24.4 ms per round almost independently of block and of
 prompt, against the sidecar's 5.9–6.9 ms. Two costs the port does not pay down
@@ -1272,6 +1301,17 @@ the rest through the shared `rollback_round_caches`. The block is the one the
 drafter was trained at every round; only the token budget shortens it, so this
 loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
 
+**The prompt's capture is materialised whole and then mostly thrown away.**
+`forward_verify_capture_chunked` evaluates each chunk and concatenates every one
+of them before returning, so a prompt of `n` tokens allocates `n` rows at
+`len(target_layer_ids) * hidden_size` — 51.2 KiB each on the published pair, or
+about 1.6 GiB at a 32k prompt — and the trim then keeps the last 2047 of them.
+It is a transient peak at the prompt boundary, not a steady-state cost: the
+buffer the rounds carry is bounded by the drafter's window from the first trim
+onward. Bounding the peak means giving that seam a tail limit, and EAGLE-3 shares
+it and needs every row, so it is a two-caller parameter and not one this port
+added. It is not fixed and no figure in this document depends on it.
+
 It is **greedy**, like every other sidecar loop here. The reference's sampled arm
 accepts by rejection sampling restricted to the selector's own candidate set —
 a different acceptance rule from the full-vocabulary one the two-model loop
@@ -1303,9 +1343,23 @@ Three scalars the reference applies to the drafter's logit path —
 absent from this checkpoint, and the port applies none of them. A checkpoint that
 moved one off the reference's default would otherwise be drafted through a
 differently scaled head at no error, so the loader refuses one that does and
-accepts one that spells its defaults out. Unlike every other refusal in that
-loader this one fires on a key that is *present*: an unread key is the failure a
-missing key cannot produce.
+accepts one that spells its defaults out. Unlike most refusals in that loader
+this one fires on a key that is *present*: an unread key is the failure a missing
+key cannot produce.
+
+**`is_causal` is the second such refusal**, and it is the one that class was
+found by. The mask this forward builds is unconditionally bidirectional; the
+reference branches on that flag and ands its block term with `key <= query` when
+it is set. The published checkpoint declares `false`, so a loader that parsed the
+key and consumed it nowhere was correct for the only checkpoint that exists and
+would have denoised a causal one the wrong way round — fluent proposals at an
+accept rate nothing downstream can attribute. `true` is refused rather than
+implemented: nothing ships it, and a numeric branch no checkpoint exercises is a
+second answer with no evidence behind it.
+
+A window wider than an array axis is refused for the same shape of reason: past
+that the window arithmetic wraps negative and the conditioning trim slices from
+beyond its own end, which returns no rows and no error.
 
 The two generations also read their config from different places, which is why
 they do not share a loader: DFlash 1 carries `block_size` and `rope_theta` at
