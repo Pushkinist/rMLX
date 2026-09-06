@@ -25,7 +25,11 @@ pub(crate) enum LogLevel {
     Info,
     /// debug on rmlx crates. Per-token trace! stays off.
     Debug,
-    /// trace on rmlx crates — per-token, per-FFI, per-layer events.
+    /// trace on rmlx crates — per-token, per-FFI, per-layer events, and the
+    /// speculative round loops' charged phase split. Everything else stays at
+    /// info: a bare `trace` here sets the *global* default, which puts every
+    /// dependency's trace events in the log and satisfies engine-side
+    /// `tracing::enabled!` checks that were meant to be opt-in by target.
     /// Use to debug single tokens / individual model / cache decisions.
     Verbose,
 }
@@ -35,7 +39,7 @@ impl LogLevel {
         match self {
             LogLevel::Info => "info,rmlx=info",
             LogLevel::Debug => "debug,rmlx=debug",
-            LogLevel::Verbose => "trace,rmlx=trace",
+            LogLevel::Verbose => "info,rmlx=trace",
         }
     }
 }

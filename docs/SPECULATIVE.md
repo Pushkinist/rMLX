@@ -60,9 +60,9 @@ answer-equivalence gate found. `truncate_to` now returns that refusal, and the
 gemma4-assistant loop reads its rollback target before the verify forward rather
 than off a cache afterwards.
 
-**Whose hidden the acceptance walk scores.** `walk_deferred_greedy` reads the
-verifier's **pre-final-norm** capture, so it goes through
-`Architecture::logits_from_hidden`, which applies the final norm.
+**Which hidden the LM head is fed.** A verify forward's capture is the
+verifier's **pre-final-norm** residual stream, so a caller that projects one goes
+through `Architecture::logits_from_hidden`, which applies the final norm.
 `logits_from_final_hidden` is the head-only counterpart, for callers that hold an
 already-normed hidden: the Qwen capture forwards, the EAGLE-3 full-vocab
 correction, and the two drafters whose own final norm ends their stack. One name
@@ -203,6 +203,73 @@ zero-padded (`out.resize(total, 0.0)`) and the planar stores panicked on an
 out-of-range index. See `docs/KV_QUANT.md` § "Scope — every CPU-side store now
 cuts, and every one of them is loud".
 
+### Where a round's time goes
+
+The request-level `done` line reports `draft_ms`, `verifier_ms` and a residual
+`loop_ms_per_round`. Those are wall-clock spans around call sites, and this
+engine evaluates lazily, so a span is charged the work it *issued* only when
+something inside it blocks. Two consequences that have to be read with the
+numbers:
+
+- **A span with no blocking evaluation in it measures graph construction, not
+  work.** Both MTP loops now read the verifier's argmax back inside the verify
+  span, so `verifier_ms` is the verify forward in both. It was not always: the
+  sidecar loop used to close its span on the unevaluated forward and re-derive
+  the LM head position by position afterwards, which put most of the verify
+  forward into the residual and made the two loops' residuals incomparable.
+- **The rollback replay is still lazy by default.** Its output is discarded and
+  the state it writes is not read until the next round's verify forward, so the
+  second weight read a partial-accept round pays is billed to the *next* round's
+  `verifier_ms`.
+
+Per-round attribution comes from the `speculative round` event, target
+`rmlx::spec::phase`, one per round at `debug`, emitted by one shared
+`RoundPhases::log` so the two loops cannot drift into two record shapes:
+
+```
+loop_kind round accept num_draft replayed charged
+round_ms draft_ms verify_ms walk_ms rollback_ms other_ms
+```
+
+`other_ms` is what no phase claimed: emission, tokenizer decode, slicing and
+host bookkeeping. The four phases are disjoint sub-spans of the round, so
+claiming more than the round has means a timer started outside it — that is an
+`error!` naming the phases rather than an `other_ms` near zero that reads like
+rounding. `replayed` says whether that round took the GDN replay arm of
+`rollback_round_caches`.
+
+`charged` is the field that says how to read the rest. At `debug` the phases are
+timed but not forced, so the lazy tails above still move between them. At
+`trace` on the same target — `--log verbose`, or
+`RUST_LOG=info,rmlx::spec::phase=trace` for the split without per-token traces —
+each phase forces its own work before its span closes and the split becomes
+attributable. That run is also slower than the run it describes: the forced
+evaluations drain a pipeline the loop would otherwise keep full, and shedding
+exactly those drains is part of what the loop is being measured for. Compare a
+charged run's `round_ms` against an uncharged one's before trusting either.
+
+**The decision is the loop's, made once per request, and it travels on the
+record.** `phases_charged()` is read at the loop head and passed down — to
+`rollback_round_caches` as an argument, and onto `RoundStats::charged`, which
+every loop's `done` line carries. Two things depend on that.
+`rollback_round_caches` is shared by six loops and only two of them time their
+phases; a switch it read on its own behalf would change how the other four
+schedule work, with nothing on their records saying so — they pass `false` and
+report `charged=false`.
+
+And a charged request's `verifier_ms`, `loop_ms_per_round` and `decode_tps`
+describe a differently scheduled engine. `scripts/lib/spec_round_log.py` reads
+the flag back off the `done` line, refusing a value that is not a boolean rather
+than coercing one — `bool("false")` is `True`, and the row it would decide is
+permanent. `scripts/spec_bench.sh` puts it in the row's `notes` and **refuses to
+file a charged row at all**: `observations` is append-only and `bests` is a view
+over it, so such a row could not be taken back out and would compete in its cell
+on a reading nobody wanted. Passing `--log info`, which that script does, is not
+enough on its own — `RUST_LOG` takes precedence over the `--log` preset
+(`crates/rmlx-cli/src/startup.rs`), so an ambient
+`RUST_LOG=info,rmlx::spec::phase=trace` reaches a bench run that never asked for
+it. Unset it before benching.
+
 ## Per-drafter Deep Dive
 
 ### MTP — Multi-Token Prediction (Qwen3.5 sidecar)
@@ -274,9 +341,9 @@ gates both the FFN-shape probe and the greedy-tracking property. The round-loop
 (`mtp_generate_greedy`) mirrors the DFlash loop structurally: verifier prefill →
 round-0 penultimate-hidden + first-bonus capture → per-round autoregressive
 `draft_n` (RoPE offset = sidecar `_next_position` = verifier prefix length +
-appended count) → one combined verify forward → `walk_deferred_greedy` accept →
-emit → GDN snapshot/restore verifier-KV rollback + sidecar-KV `truncate_to` on
-partial acceptance.
+appended count) → one combined verify forward → `accept_prefix` walk over the
+verifier's own argmax → emit → GDN snapshot/restore verifier-KV rollback +
+sidecar-KV `truncate_to` on partial acceptance.
 
 `draft_n` proposes `block_size - 1` tokens but only ever feeds back `block_size - 2`
 of them, so the last one used to get no KV slot. A full-accept round then commits
@@ -284,8 +351,8 @@ of them, so the last one used to get no KV slot. A full-accept round then commit
 `MtpDrafter::truncate_to` — which skips a layer already shorter than the target —
 absorbed the difference in silence. The gap grew one slot per full-accept round
 and the sidecar acquired a permanent context hole. It cannot corrupt an emitted
-token (every one of those is `walk_deferred_greedy`'s argmax over the verifier's
-own captured hidden, which never consults the drafter), so the only symptom was
+token (every one of those is the verifier's own argmax over its own verify
+forward, which never consults the drafter), so the only symptom was
 accept-rate decay. `draft_n` now runs one more `forward_token` at the end and
 discards the hidden, purely so the last drafted token gets its slot, and the skip
 in `truncate_to` warns instead of passing quietly.
@@ -351,11 +418,41 @@ snapshots are mlx-format, so the split stores weights verbatim — rMLX loads th
 verbatim and applies a plain `rms_norm` (matching the verifier's own RmsNorm),
 adding no centring shift.
 
-Acceptance walk (`walk_deferred_greedy`): for each position from 0 to
-`n_draft` (inclusive), the verifier's hidden at that position is projected
-through the LM head lazily (only until the first reject). On a match, the
-token is accepted. On a mismatch or at position `n_draft`, the verifier's
-prediction at that position is emitted as the correction/bonus. Budget-capped.
+Acceptance walk (`speculative::accept_prefix`, shared with the gemma4-assistant
+and two-model-greedy loops; the stochastic two-model loop applies a different,
+Leviathan acceptance rule and does not use it): the verify forward already
+projects all `block_size` positions through the LM head, so the loop reads that
+argmax back once and walks it on the host. For
+each position from 0 to `n_draft` (inclusive), the verifier's own token is
+compared with the draft; on a match the draft is accepted, and on a mismatch or
+at position `n_draft` the verifier's token is emitted as the correction/bonus.
+Budget-capped.
+
+The walk used to re-derive the head one position at a time and stop at the first
+reject. That saves head FLOPs and costs a full read of the head tensor — a
+separate quantised matrix, not tied — plus a pipeline drain, per position walked.
+On a bandwidth-bound verifier that is the wrong way round: one batched read of
+the head serves every position, and the block's logits were already in the verify
+forward's graph, dropped unevaluated.
+
+**The trade is conditional, not a pure gain.** The head cost is now constant in
+`k` where it was proportional to `accept + 1`. A round that accepts nothing used
+to project one position and now projects all `k` — the same single read of the
+head tensor, `k` times its FLOPs. So it is a large win on high-accept rounds
+against a small loss on low-accept ones, and the measured +1.96% on
+Qwen3.8-27B-4bit was taken at 1.79 to 2.31 tokens per round. It narrows as
+acceptance falls, and a pair that accepts poorly should be measured rather than
+assumed to gain.
+
+**One residual risk, recorded rather than fixed.** The substitution is
+mathematically exact — RMSNorm is per-row, so slicing commutes with it — but the
+head is now one GEMM at `M = k` where it was `k` GEMMs at `M = 1`, and a
+differently tiled reduction can flip an argmax on a near-tie. In a speculative
+loop that changes an emitted token. The evidence against it is one token digest
+across 26 generations on two checkpoints plus the answer-equivalence suite; its
+standing guard is that suite, which skips silently when the snapshots are absent
+while `make ci-perf` reports green. Anyone touching the head path should run it
+deliberately.
 
 ### DFlash — Draft-Flash Attention (Qwen3.6-MoE target)
 
@@ -958,9 +1055,11 @@ clock means under lazy evaluation. It is log-only and never reaches the DB. `dra
 wall-clock spans of their call sites and **not** the cost of the work those
 calls issue: this engine evaluates lazily, so work issued in one span can be
 paid for in another. They are reported as what they are. Inserting a blocking
-evaluation to make them attributable would price the phases by changing them,
-and that blocking evaluation is itself one of the costs the round loop is
-trying to shed.
+evaluation to make them attributable prices the phases by changing them, and
+that blocking evaluation is itself one of the costs the round loop is trying to
+shed — which is why charging them is opt-in, why a charged request says so on
+its `done` line, and why the bench refuses to file one. See § "Where a round's
+time goes".
 
 `scripts/lib/spec_round_log.py` is the only thing that reads that line, and
 `scripts/spec_bench.sh` takes its speculative `decode_tps_warm` from there. It
@@ -1084,6 +1183,65 @@ No-drafter baseline 83.6 (code) / 83.2 (prose) / 79.1 (4k) decode TPS.
 | 6 | 4k | 0.289 | 0.79× |
 | 6 | prose | 0.238 | 0.88× |
 
+### Where a round's time actually goes
+
+Charged per-round split (`RUST_LOG=info,rmlx::spec::phase=trace`, see § "Where a
+round's time goes"), code prompt, 200 tokens, `release-perf`, M5 Max. Milliseconds
+per round. The plain step is that checkpoint's own `decode_profile
+forward_per_step_ms` from a no-drafter run of the same prompt.
+
+Qwen3.8-27B-4bit + MTP-4bit — GDN hybrid, plain step **30.77 ms** (32.5 t/s):
+
+| Phase | block 2 | block 3 |
+|---|---:|---:|
+| verify forward | 34.01 | 41.28 |
+| GDN replay, averaged over all rounds | 6.42 | 12.66 |
+| — on the rounds that take it | 30.87 (21 % of rounds) | 31.99 (40 %) |
+| drafting | 2.15 | 4.18 |
+| acceptance walk | 0.000 | 0.000 |
+| snapshot, emit, bookkeeping | 0.056 | 0.062 |
+| **round total** | **42.63** | **58.18** |
+| tokens per round | 1.793 | 2.314 |
+| implied step cost vs plain | 1.39× | 1.89× |
+
+Gemma4-e4b-it-mxfp8 + E4B assistant — full attention, plain step **11.9 ms**
+(84 t/s), no recurrent state and so no replay:
+
+| Phase | block 2 | block 6 |
+|---|---:|---:|
+| verify forward | 13.74 | 25.27 |
+| rollback (K/V tail slice) | 0.023 | 0.038 |
+| drafting | 1.08 | 4.21 |
+| acceptance walk | 0.000 | 0.000 |
+| emit, bookkeeping | 0.065 | 0.121 |
+| **round total** | **14.92** | **29.63** |
+
+Four things those say:
+
+- **The GDN replay is the sidecar loop's entire residual.** A partial-accept
+  round pays 31–32 ms for `rollback_round_caches`, a second full weight read of
+  the verifier; a full-accept round pays 0.027 ms. Everything else the residual
+  was ever suspected of — the 48-layer `LinearAttnCache` snapshot and restore,
+  the emission, the cache truncation — is 0.06 ms together.
+- **`kept` is never zero in these loops**, so the early return in
+  `rollback_round_caches` is unreachable from them and every partial round
+  replays. The retained prefix is `1 + accept`: the carry token is always kept.
+- **Verifying one more position costs about a quarter of a plain step**, on both
+  architectures: 7.27 ms against a 30.77 ms step on the 27B (0.236), 2.88 ms
+  against an 11.9 ms step on e4b (0.242). A weight-bandwidth roofline says a
+  block should be one weight read plus a few milliseconds of compute, so this is
+  five to six times what that predicts, and it is the same fraction on a GDN
+  hybrid at 4-bit and a full-attention model at mxfp8 — a property of verifying
+  `k` positions through a quantised stack, not of either architecture. It is
+  what makes a deeper block lose: block 3 on the 27B pays 7.27 ms more per round
+  in the verify forward than block 2, comparable with the 6.24 ms more it pays in
+  replay.
+- **A verify forward's full-vocab logits are not a cost.** `forward_verify_capture`
+  builds them for every block position, but the graph node is dropped
+  unevaluated, so nothing is materialised until a caller asks. The cost that
+  existed was the acceptance walk re-deriving the head one position at a time,
+  which is why it now reads the block's argmax back once instead.
+
 ### What these say
 
 - **MTP pays on both GDN hybrids and is the only drafter that does.** On the MoE
@@ -1096,6 +1254,11 @@ No-drafter baseline 83.6 (code) / 83.2 (prose) / 79.1 (4k) decode TPS.
   block 3 are the only two settings those pairs have, and 2 measured faster than
   3 on all three prompt classes for Qwen3.8-27B at both weight formats. The `block_size` field on the
   `mtp_generate_greedy: done` line reports the value actually used.
+- **The step cost the round loop pays is 1.39× a plain step at block 2 and 1.89×
+  at block 3** on Qwen3.8-27B-4bit, against 32.47 / 32.54 t/s no-drafter and
+  39.70 / 37.00 t/s with the sidecar. The split above says where the growth goes:
+  roughly half to the replay's rising partial-round fraction, roughly half to the
+  verify forward's per-position cost.
 - **DFlash and EAGLE-3 are net decode losses on this verifier at every prompt
   class measured**, DFlash by 3-22% and EAGLE-3 by 26-39%. Both run correctly and
   accept real tokens; neither clears its own round-loop overhead.

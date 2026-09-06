@@ -49,7 +49,7 @@ use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-pub(crate) use round_stats::{RoundStats, SpecLoop};
+pub(crate) use round_stats::{phases_charged, RoundPhases, RoundStats, SpecLoop};
 
 /// Resolve the context bounds a speculative pair runs under.
 ///
@@ -766,40 +766,15 @@ impl SpeculativeDispatcher {
             let bytes = v_argmax.to_bytes()?;
             verifier_ns += t0.elapsed().as_nanos();
 
-            if bytes.len() < 4 * v_k {
-                return Err(Error::Model(format!(
-                    "spec_generate_greedy_cached: argmax bytes={} expected={}",
-                    bytes.len(),
-                    4 * v_k
-                )));
-            }
-            let mut v_tokens: Vec<u32> = Vec::with_capacity(v_k);
-            for i in 0..v_k {
-                let off = i * 4;
-                let id = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-                v_tokens.push(id);
-            }
+            let v_tokens = argmax_tokens(&bytes, v_k)?;
 
             // -- Phase C: greedy acceptance. ---------------------------
-            // v_tokens[i] is the verifier's prediction after the i-th
-            // input token (positions 0..K). Compare v_tokens[0..num_draft]
-            // against draft_tokens[0..num_draft]. Longest matching prefix
-            // → emit accept tokens; emit v_tokens[accept] as correction
-            // (or bonus when accept == num_draft).
-            let mut accept = 0usize;
-            for i in 0..draft_tokens.len() {
-                if v_tokens[i] == draft_tokens[i] {
-                    accept += 1;
-                } else {
-                    break;
-                }
-            }
+            let (accept, new_tokens) = accept_prefix(&v_tokens, &draft_tokens, remaining)?;
             total_accept_count += accept;
 
-            // Emit accept + 1 tokens: v_tokens[0..=accept].
-            let to_emit = (accept + 1).min(v_tokens.len());
+            // Emit accepted prefix + 1 correction/bonus.
             let mut hit_eos = false;
-            for &id in v_tokens.iter().take(to_emit) {
+            for &id in &new_tokens {
                 if emitted.len() >= n_tokens {
                     break;
                 }
@@ -826,6 +801,7 @@ impl SpeculativeDispatcher {
                     round_loop_ns: round_loop_t0.elapsed().as_nanos(),
                     elapsed_ns: t_total.elapsed().as_nanos(),
                     decode_tps: window.tps(),
+                    charged: false,
                 }
                 .log_done();
                 return Ok(emitted);
@@ -864,6 +840,8 @@ impl SpeculativeDispatcher {
                     &v_input,
                     v_offset_before - v_k as i32,
                     v_target,
+                    // This loop times no phases, so it never charges one.
+                    false,
                     device,
                 )?;
             } else {
@@ -898,6 +876,8 @@ impl SpeculativeDispatcher {
                     &d_fed,
                     d_pre_round_offset,
                     d_target,
+                    // This loop times no phases, so it never charges one.
+                    false,
                     device,
                 )?;
             } else {
@@ -920,7 +900,11 @@ impl SpeculativeDispatcher {
                 round = rounds,
                 accept,
                 num_draft = draft_tokens.len(),
-                emitted_round = to_emit,
+                // What the round emitted, which is `accept + 1` unless the
+                // request's token budget ran out mid-block. It used to be
+                // `accept + 1` unconditionally, so the two differ in the last
+                // round of a request that stops mid-block.
+                emitted_round = new_tokens.len(),
                 emitted_total = emitted.len(),
                 v_offset_before,
                 v_target,
@@ -945,6 +929,7 @@ impl SpeculativeDispatcher {
             round_loop_ns: round_loop_t0.elapsed().as_nanos(),
             elapsed_ns: t_total.elapsed().as_nanos(),
             decode_tps: window.tps(),
+            charged: false,
         }
         .log_done();
 
@@ -1252,6 +1237,7 @@ impl SpeculativeDispatcher {
                     round_loop_ns: round_loop_t0.elapsed().as_nanos(),
                     elapsed_ns: t_total.elapsed().as_nanos(),
                     decode_tps: window.tps(),
+                    charged: false,
                 }
                 .log_done();
                 return Ok(emitted);
@@ -1277,6 +1263,8 @@ impl SpeculativeDispatcher {
                     &v_input,
                     v_offset_before - v_k as i32,
                     v_target,
+                    // This loop times no phases, so it never charges one.
+                    false,
                     device,
                 )?;
             } else {
@@ -1301,6 +1289,8 @@ impl SpeculativeDispatcher {
                     &d_fed,
                     d_pre_round_offset,
                     d_target,
+                    // This loop times no phases, so it never charges one.
+                    false,
                     device,
                 )?;
             } else {
@@ -1344,6 +1334,7 @@ impl SpeculativeDispatcher {
             round_loop_ns: round_loop_t0.elapsed().as_nanos(),
             elapsed_ns: t_total.elapsed().as_nanos(),
             decode_tps: window.tps(),
+            charged: false,
         }
         .log_done();
 
@@ -1606,6 +1597,88 @@ fn snapshot_lin(lin: Option<&[LinearAttnCache]>) -> Result<Option<Vec<LinearAttn
     }
 }
 
+/// Read a verify forward's `argmax` result back as `k` token ids.
+///
+/// The buffer is checked once, against the position count the caller verified,
+/// before any of it is read. A round loop does this every round, so an
+/// unguarded index here is a per-round panic on an invariant no type carries:
+/// the argmax comes back from the device, and "the device returned fewer bytes
+/// than the block has positions" is a state to name, not to abort on.
+///
+/// Extra trailing bytes are not an error — `k` is what the caller verified and
+/// what it walks.
+pub(crate) fn argmax_tokens(bytes: &[u8], k: usize) -> Result<Vec<u32>> {
+    let want = k * 4;
+    if bytes.len() < want {
+        return Err(Error::Model(format!(
+            "argmax_tokens: the verifier's argmax came back as {} bytes for {k} verified \
+             positions, which needs {want}",
+            bytes.len()
+        )));
+    }
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "chunks_exact(4) yields slices of exactly 4, so these four indices are \
+                  in bounds by the iterator's own contract"
+    )]
+    Ok(bytes
+        .chunks_exact(4)
+        .take(k)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// The greedy acceptance walk over one verified block.
+///
+/// `verifier_tokens[i]` is the verifier's own greedy continuation after
+/// position `i` of the verify input, so the draft proposed for that position is
+/// accepted exactly when the two agree. The walk stops at the first
+/// disagreement.
+///
+/// Returns the number of accepted proposals and the tokens to emit: the agreed
+/// prefix followed by one token the verifier stands behind — its correction at
+/// the disagreement, or, when every proposal held, its bonus token past the last
+/// draft. `budget` caps the emission, not the acceptance: a round that runs out
+/// of token budget still committed the KV it committed, and reporting fewer
+/// accepts than the caches hold is how the two disagree.
+///
+/// `verifier_tokens` carries exactly one position more than `draft_tokens` —
+/// the bonus slot — at every call site, and that is checked rather than
+/// assumed. The two arguments are same-typed slices whose order carries the
+/// whole meaning, so a swapped call compiles and still returns a plausible
+/// accept count; the count then drives a KV rollback. Reversed, the lengths are
+/// wrong by two, which is what this refuses.
+pub(crate) fn accept_prefix(
+    verifier_tokens: &[u32],
+    draft_tokens: &[u32],
+    budget: usize,
+) -> Result<(usize, Vec<u32>)> {
+    if verifier_tokens.len() != draft_tokens.len() + 1 {
+        return Err(Error::Model(format!(
+            "accept_prefix: {} verifier tokens against {} proposals — a verified block \
+             is the proposals plus one bonus slot, and swapping the two arguments is \
+             how these arrive the wrong way round",
+            verifier_tokens.len(),
+            draft_tokens.len()
+        )));
+    }
+    let mut accepted = 0usize;
+    let mut emit: Vec<u32> = Vec::with_capacity(verifier_tokens.len());
+    for (pos, &token) in verifier_tokens.iter().enumerate() {
+        let agreed = draft_tokens.get(pos) == Some(&token);
+        if agreed {
+            accepted += 1;
+        }
+        if emit.len() < budget {
+            emit.push(token);
+        }
+        if !agreed {
+            break;
+        }
+    }
+    Ok((accepted, emit))
+}
+
 /// Roll one speculative round's caches back to `target_offset` after a partial
 /// acceptance — both the full-attention `kv` stack and, when the arch has one,
 /// the GDN recurrent state in `lin`.
@@ -1639,6 +1712,11 @@ fn snapshot_lin(lin: Option<&[LinearAttnCache]>) -> Result<Option<Vec<LinearAttn
 /// Call this only when the round actually dropped positions
 /// (`target_offset < offset_before`); on a full accept there is nothing to roll
 /// back and the snapshot is simply dropped.
+///
+/// `charge` is the calling loop's per-request answer from
+/// [`phases_charged`], not a decision this function makes. Six loops share it
+/// and two of them time their phases; reading the switch here would change the
+/// schedule of the other four with nothing on their records saying so.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -1652,6 +1730,7 @@ fn rollback_round_caches(
     round_tokens: &[u32],
     pre_round_offset: i32,
     target_offset: i32,
+    charge: bool,
     device: Device,
 ) -> Result<()> {
     let Some((lin, snapshot)) = lin.zip(snapshot).filter(|(l, _)| !l.is_empty()) else {
@@ -1694,7 +1773,14 @@ fn rollback_round_caches(
         // already the answer and the caches are already at `target_offset`.
         return Ok(());
     }
-    let _ = arch.forward_seq_last_k_with_cache(&round_tokens[..kept], 1, kv, Some(lin), device)?;
+    let replayed =
+        arch.forward_seq_last_k_with_cache(&round_tokens[..kept], 1, kv, Some(lin), device)?;
+    if charge {
+        // Nothing reads this replay until the next round's verify forward, so
+        // with nothing forcing it here the whole second weight read is billed
+        // to that round's verify span. See `phases_charged`.
+        replayed.eval()?;
+    }
     Ok(())
 }
 

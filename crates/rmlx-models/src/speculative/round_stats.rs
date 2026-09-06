@@ -25,18 +25,21 @@
 //! [`RoundStats::emitted_in_rounds`]; that count is the figure's numerator, and
 //! `seed_emitted` beside it makes the three counts add up or say why not.
 //!
-//! **The derivation does not change what it measures.** Every figure below is
-//! arithmetic over counters the loops already keep; nothing here forces an
-//! evaluation, allocates inside a round, or adds a clock read to one. The two
-//! spans that are new — prefill and the round loop as a whole — are one
-//! `Instant::now()` each per *request*.
+//! **The derivation does not change what it measures.** Every figure here is
+//! arithmetic over counters the loops already keep; deriving them allocates
+//! nothing inside a round and adds no clock read to one. The two spans that are
+//! new — prefill and the round loop as a whole — are one `Instant::now()` each
+//! per *request*.
 //!
-//! `draft_ms` and `verifier_ms` are the wall-clock spans of the two call sites,
+//! `draft_ms` and `verifier_ms` are the wall-clock spans of their call sites,
 //! not the cost of the work those calls issue: this engine evaluates lazily, so
-//! work issued inside one span can be paid for in another. They are reported as
-//! what they are. Inserting a blocking evaluation to make them attributable
-//! would price the phases by changing them, and that blocking evaluation is
-//! itself one of the costs the round loop is trying to shed.
+//! work issued inside one span can be paid for in another. Inserting a blocking
+//! evaluation to make them attributable prices the phases by changing them, and
+//! that blocking evaluation is itself one of the costs the round loop is trying
+//! to shed — so it is a per-request decision the loop makes and the record
+//! reports, not something this module does behind a reader's back. See
+//! [`phases_charged`], and `charged` on the record and on every per-round
+//! event.
 
 use crate::speculative::DraftKind;
 
@@ -146,9 +149,134 @@ impl SpecLoop {
     }
 }
 
+/// The target the per-round phase split is logged under, and the switch that
+/// decides whether those phases are charged for the work they issue.
+pub(crate) const PHASE_TARGET: &str = "rmlx::spec::phase";
+
+/// Whether this request's round loop should force each phase's work before
+/// closing its span.
+///
+/// The phase spans wrap call sites and this engine evaluates lazily, so a
+/// call's work is paid wherever the next blocking evaluation falls — not
+/// necessarily in the phase that issued it. The rollback replay is the clear
+/// case: its output is discarded and the state it writes is not read until the
+/// next round's verify forward, so with nothing forcing it the whole replay is
+/// billed to that round's verify span.
+///
+/// At TRACE on [`PHASE_TARGET`] each phase forces its own work before its span
+/// closes and the split becomes attributable. It is then also a different,
+/// slower run — the forced evaluations drain a pipeline the loop would
+/// otherwise keep full, and shedding exactly those drains is part of what the
+/// loop is being measured for.
+///
+/// **Call it once, at the loop head, and pass the answer down.** It reads
+/// process-global log state, and a helper several loops share that consults it
+/// on its own behalf changes the schedule of every one of them — including the
+/// loops that emit no phase event, which would then run differently with
+/// nothing saying so. The answer travels as a `bool`: to
+/// [`super::rollback_round_caches`] as an argument, and onto
+/// [`RoundStats::charged`], which is the field that keeps an ingested row
+/// honest about which schedule produced its `verifier_ms`.
+pub(crate) fn phases_charged() -> bool {
+    tracing::enabled!(target: PHASE_TARGET, tracing::Level::TRACE)
+}
+
 /// Nanoseconds to milliseconds.
-fn ms(ns: u128) -> f64 {
+pub(crate) fn ms(ns: u128) -> f64 {
     (ns as f64) / 1.0e6
+}
+
+/// One round's wall clock, split by the phase that spent it.
+///
+/// The four phases are disjoint sub-spans of the round, so the round's own
+/// clock less their sum is what no phase claimed: emission, tokenizer decode,
+/// slicing and host bookkeeping. Read `charged` before reading any of it —
+/// uncharged, a phase is timed but not forced, and lazy work drifts between
+/// them (see [`phases_charged`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoundPhases {
+    /// The round's own wall clock.
+    pub(crate) round_ns: u128,
+    /// Time inside the drafter call.
+    pub(crate) draft_ns: u128,
+    /// Time inside the verify forward and its argmax read-back.
+    pub(crate) verify_ns: u128,
+    /// Time inside the acceptance walk.
+    pub(crate) walk_ns: u128,
+    /// Time inside the rollback: cache truncation and, on a recurrent
+    /// verifier, the replay.
+    pub(crate) rollback_ns: u128,
+    /// Whether the round took the recurrent replay arm of
+    /// [`super::rollback_round_caches`].
+    pub(crate) replayed: bool,
+    /// Whether the phases were charged for the work they issued.
+    pub(crate) charged: bool,
+}
+
+impl RoundPhases {
+    /// Round time no phase claimed, and `None` when the phases claim more than
+    /// the round has.
+    ///
+    /// `u128` throughout: the phases are sub-spans, so an overrun is a timer
+    /// that escaped the round rather than a small number, and subtracting five
+    /// `f64` milliseconds would report it as a near-zero negative that reads
+    /// like rounding.
+    fn unclaimed_ns(&self) -> Option<u128> {
+        let claimed = self
+            .draft_ns
+            .saturating_add(self.verify_ns)
+            .saturating_add(self.walk_ns)
+            .saturating_add(self.rollback_ns);
+        self.round_ns.checked_sub(claimed)
+    }
+
+    /// Emit this round's split, and say so when it does not partition the
+    /// round.
+    ///
+    /// One emitter for every loop that keeps a split: a field added at one call
+    /// site and not the other would put two incomparable record shapes under
+    /// one target. The overrun is an `error!` for the same reason
+    /// [`RoundStats::span_violation`] is — a phase timer that starts outside
+    /// the round it is attributed to is a defect in the instrument, and the
+    /// only reader who would otherwise notice is one already reading raw
+    /// JSON-Lines and already looking for it.
+    pub(crate) fn log(&self, loop_kind: SpecLoop, round: usize, accept: usize, num_draft: usize) {
+        let Some(unclaimed_ns) = self.unclaimed_ns() else {
+            tracing::error!(
+                target: PHASE_TARGET,
+                ?loop_kind,
+                round,
+                accept,
+                num_draft,
+                replayed = self.replayed,
+                charged = self.charged,
+                round_ms = ms(self.round_ns),
+                draft_ms = ms(self.draft_ns),
+                verify_ms = ms(self.verify_ns),
+                walk_ms = ms(self.walk_ns),
+                rollback_ms = ms(self.rollback_ns),
+                "speculative round phases claim more time than the round has: a phase \
+                 timer starts outside the round it is attributed to"
+            );
+            return;
+        };
+        tracing::debug!(
+            target: PHASE_TARGET,
+            ?loop_kind,
+            round,
+            accept,
+            num_draft,
+            replayed = self.replayed,
+            charged = self.charged,
+            round_ms = ms(self.round_ns),
+            draft_ms = ms(self.draft_ns),
+            verify_ms = ms(self.verify_ns),
+            walk_ms = ms(self.walk_ns),
+            rollback_ms = ms(self.rollback_ns),
+            other_ms = ms(unclaimed_ns),
+            "speculative round"
+        );
+    }
 }
 
 /// One speculative request's counters, and the per-round figures they imply.
@@ -200,6 +328,16 @@ pub(crate) struct RoundStats {
     /// The decode rate over the first-token-to-last window, or `None` when the
     /// request emitted too few tokens to have an interval.
     pub(crate) decode_tps: Option<f64>,
+    /// Whether this request ran with its phases charged (see
+    /// [`phases_charged`]).
+    ///
+    /// It is on the record because the record is what gets ingested. A charged
+    /// request drains the pipeline at every phase boundary, so its
+    /// `verifier_ms`, `loop_ms_per_round` and `decode_tps` describe a
+    /// differently scheduled engine; without this field that row is
+    /// indistinguishable from a normal one in an append-only store. The four
+    /// loops that carry no phase instrument never charge and report `false`.
+    pub(crate) charged: bool,
 }
 
 impl RoundStats {
@@ -385,6 +523,7 @@ impl RoundStats {
             verify_ms_per_round = self.verify_ms_per_round(),
             loop_ms_per_round = self.loop_ms_per_round(),
             block_size = self.block_size,
+            charged = self.charged,
             decode_config = %self.decode_config(),
             "{}",
             self.loop_kind.done_event()
