@@ -1055,9 +1055,11 @@ clock means under lazy evaluation. It is log-only and never reaches the DB. `dra
 wall-clock spans of their call sites and **not** the cost of the work those
 calls issue: this engine evaluates lazily, so work issued in one span can be
 paid for in another. They are reported as what they are. Inserting a blocking
-evaluation to make them attributable would price the phases by changing them,
-and that blocking evaluation is itself one of the costs the round loop is
-trying to shed.
+evaluation to make them attributable prices the phases by changing them, and
+that blocking evaluation is itself one of the costs the round loop is trying to
+shed — which is why charging them is opt-in, why a charged request says so on
+its `done` line, and why the bench refuses to file one. See § "Where a round's
+time goes".
 
 `scripts/lib/spec_round_log.py` is the only thing that reads that line, and
 `scripts/spec_bench.sh` takes its speculative `decode_tps_warm` from there. It
