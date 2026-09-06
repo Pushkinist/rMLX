@@ -97,6 +97,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest \
         canary-ab-host-gate-fixtures llama-ab-selftest spec-bench-selftest \
         spec-bench-published-selftest published-ingest-selftest \
+        published-table check-published-table published-table-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
         check-published-samples check-published-samples-fixtures \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
@@ -436,6 +437,43 @@ check-published-samples: ## CI gate: fail if the checked-in published sample set
 check-published-samples-fixtures: ## CI gate: recall test for the above — one synthetic sample-set root per case, asserting the reason as well as the exit code
 	@bash scripts/check_published_samples_fixtures.sh
 
+# The committed published-protocol table is generated, never hand-written. It
+# is rendered from the checked-in fixture until a real three-pass run's result
+# files are checked in beside it; regenerating it from real results and leaving
+# the fixture as the gate's input turns `check-published-table` red, which is
+# the intended way to find out that the inputs to a published number were not
+# recorded.
+PUBLISHED_TABLE_FIXTURES := scripts/fixtures/published_table
+PUBLISHED_TABLE_RESULTS ?= $(PUBLISHED_TABLE_FIXTURES)/result_plain.json \
+                           $(PUBLISHED_TABLE_FIXTURES)/result_mtp.json \
+                           $(PUBLISHED_TABLE_FIXTURES)/result_dflash.json
+PUBLISHED_TABLE_MODEL ?= $(PUBLISHED_TABLE_FIXTURES)/fixture__published-table-16L
+
+.PHONY: published-table
+published-table: ## regenerate docs/PUBLISHED_PROTOCOL.md (PUBLISHED_TABLE_RESULTS= / PUBLISHED_TABLE_MODEL= to render a real run)
+	@python3 scripts/lib/published_table.py $(PUBLISHED_TABLE_RESULTS) \
+		--model $(PUBLISHED_TABLE_MODEL) --out docs/PUBLISHED_PROTOCOL.md
+	@echo "wrote docs/PUBLISHED_PROTOCOL.md"
+
+.PHONY: check-published-table
+check-published-table: ## CI gate: the committed published-protocol table is what the emitter renders from its checked-in inputs
+	@rendered=$$(mktemp) && trap 'rm -f "$$rendered"' EXIT && \
+	python3 scripts/lib/published_table.py \
+		$(PUBLISHED_TABLE_FIXTURES)/result_plain.json \
+		$(PUBLISHED_TABLE_FIXTURES)/result_mtp.json \
+		$(PUBLISHED_TABLE_FIXTURES)/result_dflash.json \
+		--model $(PUBLISHED_TABLE_FIXTURES)/fixture__published-table-16L \
+		--out "$$rendered" && \
+	diff -u docs/PUBLISHED_PROTOCOL.md "$$rendered" || { \
+		echo "ERROR: docs/PUBLISHED_PROTOCOL.md is not what the emitter renders."; \
+		echo "  It is generated, never hand-written: run \`make published-table\`,"; \
+		echo "  or check in the result files the committed table was rendered from."; \
+		exit 1; }
+
+.PHONY: published-table-selftest
+published-table-selftest: ## CI gate: mutation check for the published-protocol table emitter (no GPU, no model)
+	@bash scripts/published_table_selftest.sh
+
 check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited in docs/ does not exist
 	@bash scripts/check_doc_source_citations.sh
 
@@ -515,6 +553,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/spec_bench_selftest.sh
 	@bash scripts/spec_bench_published_selftest.sh
 	@bash scripts/published_ingest_selftest.sh
+	@bash scripts/published_table_selftest.sh
+	@$(MAKE) --no-print-directory check-published-table
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true

@@ -89,6 +89,10 @@ from pathlib import Path
 # ── Host constants ───────────────────────────────────────────────────────────
 
 HOST_BW_BYTES_PER_S = 614e9  # docs/PERF_BASELINE.md:101
+# The host that constant was measured on, in the §5.1 spelling a bench result
+# records. It travels with the number so a caller can check the two agree
+# before dividing a measurement by a ceiling belonging to another machine.
+HOST_BW_HARDWARE_TAG = "m5_max_128gb"
 
 # Anchor-selection policy for the prefill projection (see module docstring).
 PREFILL_ACHIEVED_FLOPS: float | None = None
@@ -671,9 +675,10 @@ def _bits_for(name: str, cfg: dict) -> int:
 
 
 def weight_census(snapshot: Path, cfg: dict, spec_layers: list[KvLayer],
-                  arch: str) -> tuple[int, int, list[str]]:
-    """Bytes of weights streamed per decode step, plus the active parameter
-    count used by the prefill FLOP model.
+                  arch: str) -> tuple[int, int, int, list[str]]:
+    """Bytes of weights streamed per decode step, the active parameter count
+    used by the prefill FLOP model, and the bytes text decode must hold
+    resident.
 
     Classification rules, in order:
       * multimodal towers          -> excluded (text decode never reads them)
@@ -686,6 +691,12 @@ def weight_census(snapshot: Path, cfg: dict, spec_layers: list[KvLayer],
       * gemma4 k_proj/v_proj on a
         KV-shared tail layer       -> excluded (loader.rs:157 never loads them)
       * everything else            -> streamed in full
+
+    The resident figure is a DIFFERENT question and takes only the first and
+    the fourth rule: a tensor that is never read is not held, but a tensor read
+    one row at a time is, and so is an expert this step did not select. It is
+    the weight half of a resident-memory floor -- for text decode, so a
+    checkpoint carrying towers has a floor below its own file size.
     """
     tc = _text_cfg(cfg)
     tied = bool(cfg.get("tie_word_embeddings", tc.get("tie_word_embeddings", False)))
@@ -695,12 +706,16 @@ def weight_census(snapshot: Path, cfg: dict, spec_layers: list[KvLayer],
 
     total_bytes = 0
     total_params = 0
+    resident_bytes = 0
     notes: list[str] = []
     n_expert_tensors = 0
+    tower_bytes = 0
     for name, dtype, shape, nbytes in read_headers(snapshot):
         short = name.split(".", 1)[1] if name.startswith("language_model.") else name
         if any(short.startswith(p) or name.startswith(p) for p in _SKIP_PREFIXES):
+            tower_bytes += nbytes
             continue
+        resident_bytes += nbytes
         stem = name.rsplit(".", 1)[0]
         leaf = stem.rsplit(".", 1)[-1]
 
@@ -711,6 +726,7 @@ def weight_census(snapshot: Path, cfg: dict, spec_layers: list[KvLayer],
         if is_gemma4 and leaf in ("k_proj", "v_proj"):
             m = _LAYER_RE.search(name)
             if m and not owns_kv.get(int(m.group(1)), True):
+                resident_bytes -= nbytes  # never loaded, so never held either
                 continue  # shared-KV tail layer: projection is never loaded
 
         frac = 1.0
@@ -743,7 +759,12 @@ def weight_census(snapshot: Path, cfg: dict, spec_layers: list[KvLayer],
     if tied:
         notes.append("tie_word_embeddings=true: embed_tokens counted once as "
                      "the streamed output projection")
-    return total_bytes, total_params, notes
+    if tower_bytes:
+        notes.append(
+            f"resident weights exclude {tower_bytes / 1e9:.3f} GB of multimodal "
+            "tower: the floor is a text-decode floor"
+        )
+    return total_bytes, total_params, resident_bytes, notes
 
 
 # ── KV totals per context ────────────────────────────────────────────────────
@@ -881,7 +902,7 @@ def prefill_anchor(db: Path, model_basename: str) -> dict | None:
 def analyse(snapshot: Path, codec_name: str, ctxs: list[int], args) -> dict:
     cfg = json.loads((snapshot / "config.json").read_text())
     arch, layers, geo_notes = build_layers(cfg)
-    wbytes, wparams, w_notes = weight_census(snapshot, cfg, layers, arch)
+    wbytes, wparams, resident_wbytes, w_notes = weight_census(snapshot, cfg, layers, arch)
     tc = _text_cfg(cfg)
     spec = ModelSpec(
         name=snapshot.name,
@@ -928,6 +949,12 @@ def analyse(snapshot: Path, codec_name: str, ctxs: list[int], args) -> dict:
             "ceiling_tps": ceiling,
             "ms_per_token_floor": 1000.0 / ceiling,
             "kv_total_mb": kv_res / 1e6,
+            "kv_resident_bytes": kv_res,
+            # The weight half of a resident floor: what text decode must hold,
+            # every expert and the embedding table included. NOT
+            # `weight_bytes_step`, which is what one step streams.
+            "resident_weight_bytes": resident_wbytes,
+            "resident_floor_bytes": resident_wbytes + kv_res,
             "prefill_ceiling_tps": pf_tps,
             "ttft_floor_ms": ttft,
             "kv_frac": kv_read / bytes_step,
@@ -953,6 +980,8 @@ def print_table(res: dict) -> None:
           "(docs/PERF_BASELINE.md:101)")
     print(f"weights    : {r0['weight_bytes_step'] / 1e9:.3f} GB/step, "
           f"{res['active_params_step'] / 1e9:.2f}e9 active params")
+    print(f"resident   : {r0['resident_weight_bytes'] / 1e9:.3f} GB of weights "
+          "text decode must hold, before KV")
     print(f"kv layers  : {r0['n_global_layers']} global, "
           f"{r0['n_windowed_layers']} windowed")
     a = res["prefill_anchor"]
