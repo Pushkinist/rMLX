@@ -228,10 +228,33 @@ pub fn regen_verdict(
     }
 }
 
-/// Files every snapshot must carry. Both are opened BY NAME: `config.json` by
-/// [`model_arch`] and `arch::load_model`, `tokenizer.json` by
+/// What the caller will open in the snapshot it is asking for.
+///
+/// A drafter sidecar has no tokenizer of its own — it proposes ids for a
+/// verifier and is decoded with the verifier's — and mlx-community ships those
+/// snapshots without one. Requiring a `tokenizer.json` of every snapshot turns
+/// such a checkpoint into an absence on the machine that holds it, and an
+/// absence is a skip: the suite reports green having asserted nothing. So the
+/// caller says which shape it needs, and the probe requires exactly the files
+/// that shape is opened for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// A model the caller tokenizes with: config, its own tokenizer, weights.
+    Standalone,
+    /// A drafter sidecar: config and weights. It shares the verifier's
+    /// tokenizer and ships none.
+    Sidecar,
+}
+
+/// Files a snapshot in this role must carry. Each is opened BY NAME:
+/// `config.json` by [`model_arch`] and `arch::load_model`, `tokenizer.json` by
 /// [`run_golden_test`]'s `Tokenizer::from_file`.
-const REQUIRED_FILES: [&str; 2] = ["config.json", "tokenizer.json"];
+fn required_files(role: Role) -> &'static [&'static str] {
+    match role {
+        Role::Standalone => &["config.json", "tokenizer.json"],
+        Role::Sidecar => &["config.json"],
+    }
+}
 
 /// Weight entrypoints. `rmlx_loader::load_shard_index` tries these two in this
 /// order and errors if neither exists.
@@ -265,19 +288,19 @@ fn has_any_shard(dir: &Path) -> bool {
     })
 }
 
-/// A directory is a snapshot when every file the harness opens by name is
-/// there: both JSONs, an entrypoint `load_shard_index` accepts, and at least
-/// one actual shard behind it.
-fn is_snapshot_dir(dir: &Path) -> bool {
-    REQUIRED_FILES.iter().all(|f| dir.join(f).is_file())
+/// A directory is a snapshot when every file the caller opens by name is
+/// there: the JSONs its role needs, an entrypoint `load_shard_index` accepts,
+/// and at least one actual shard behind it.
+fn is_snapshot_dir(dir: &Path, role: Role) -> bool {
+    required_files(role).iter().all(|f| dir.join(f).is_file())
         && WEIGHT_ENTRYPOINTS.iter().any(|f| dir.join(f).exists())
         && has_any_shard(dir)
 }
 
 /// Name what is missing, so a diagnosis says what to look at rather than just
 /// "not a snapshot".
-fn missing_file(dir: &Path) -> String {
-    if let Some(f) = REQUIRED_FILES.iter().find(|f| !dir.join(f).is_file()) {
+fn missing_file(dir: &Path, role: Role) -> String {
+    if let Some(f) = required_files(role).iter().find(|f| !dir.join(f).is_file()) {
         return (*f).to_owned();
     }
     if !WEIGHT_ENTRYPOINTS.iter().any(|f| dir.join(f).exists()) {
@@ -297,16 +320,16 @@ fn missing_file(dir: &Path) -> String {
 /// A value that does not name a runnable snapshot is [`Snapshot::Misconfigured`]:
 /// the operator named this path, so a typo or a moved snapshot must break the
 /// run rather than skip it.
-pub fn override_snapshot(single_model: Option<&str>) -> Option<Snapshot> {
+pub fn override_snapshot(single_model: Option<&str>, role: Role) -> Option<Snapshot> {
     let p = single_model.filter(|p| !p.is_empty())?;
     let path = PathBuf::from(p);
-    if is_snapshot_dir(&path) {
+    if is_snapshot_dir(&path, role) {
         let arch = model_arch(&path);
         return Some(Snapshot::Found { path, arch });
     }
     Some(Snapshot::Misconfigured(format!(
         "{SINGLE_MODEL_VAR}={p} is not a runnable snapshot directory (no {} in it)",
-        missing_file(&path)
+        missing_file(&path, role)
     )))
 }
 
@@ -317,7 +340,7 @@ pub fn override_snapshot(single_model: Option<&str>) -> Option<Snapshot> {
 /// once, which is the widest blast radius in this harness and the last thing
 /// that should report success by skipping. An existing root that simply does
 /// not hold this slug is [`Snapshot::Absent`]: nobody holds every snapshot.
-pub fn slug_snapshot(models_root: Option<&str>, slug: &str) -> Snapshot {
+pub fn slug_snapshot(models_root: Option<&str>, slug: &str, role: Role) -> Snapshot {
     let Some(root) = models_root.filter(|r| !r.is_empty()) else {
         return Snapshot::Absent(format!(
             "no snapshot configured — set {MODELS_ROOT_VAR} (holding {slug}) or {SINGLE_MODEL_VAR}"
@@ -330,14 +353,14 @@ pub fn slug_snapshot(models_root: Option<&str>, slug: &str) -> Snapshot {
         ));
     }
     let path = root_path.join(slug);
-    if is_snapshot_dir(&path) {
+    if is_snapshot_dir(&path, role) {
         let arch = model_arch(&path);
         return Snapshot::Found { path, arch };
     }
     Snapshot::Absent(format!(
         "{MODELS_ROOT_VAR}={root} does not hold a runnable {slug} (no {} in it); put the \
          snapshot, or a symlink to it, there",
-        missing_file(&path)
+        missing_file(&path, role)
     ))
 }
 
@@ -493,8 +516,8 @@ pub fn skip_if_arch_mismatch(model_dir: &Path, test_name: &str, expected: &[&str
 pub fn model_for(model: &GoldenModel, test_name: &str) -> Option<PathBuf> {
     let single = std::env::var(SINGLE_MODEL_VAR).ok();
     let root = std::env::var(MODELS_ROOT_VAR).ok();
-    let over = override_snapshot(single.as_deref());
-    let slug = slug_snapshot(root.as_deref(), model.slug);
+    let over = override_snapshot(single.as_deref(), Role::Standalone);
+    let slug = slug_snapshot(root.as_deref(), model.slug, Role::Standalone);
     apply(choose(over, slug, model, regen_requested()), test_name)
 }
 
