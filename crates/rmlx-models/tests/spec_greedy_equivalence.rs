@@ -123,7 +123,7 @@
     clippy::ignore_without_reason
 )]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
 
@@ -1377,67 +1377,38 @@ const DRAFT_MODEL_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 ///
 /// A path the operator named that is not a snapshot fails; a models root that
 /// simply does not hold the slug skips. That split is the harness's
-/// (`tests/common/mod.rs`), and the outcomes here match it.
+/// (`tests/common/mod.rs`), not a second copy of its rules.
 ///
-/// It cannot go **through** the harness, though: `common::slug_snapshot`
-/// requires a `tokenizer.json`, and a drafter sidecar does not ship one — it
-/// runs against the verifier's, which is the tokenizer both arms are compared
-/// under. Routing a drafter through it made a pair stand down on a machine
-/// holding both halves of it, which is a green run that asserted nothing.
+/// Both probes ask for a [`common::Role::Sidecar`]: a drafter is decoded with
+/// the verifier's tokenizer and ships none of its own, so requiring one would
+/// turn a checkpoint sitting on this machine's disk into a skip — and a skip in
+/// this gate reads exactly like the equivalence holding. The harness names its
+/// own override variable in the messages it builds; this half of the pair is
+/// overridden by a different one, so that name is substituted.
 fn resolve(var: &str, slug: &str) -> common::Gate {
     let Some(named) = std::env::var(var).ok().filter(|v| !v.is_empty()) else {
-        let Some(root) = std::env::var(common::MODELS_ROOT_VAR)
-            .ok()
-            .filter(|r| !r.is_empty())
-        else {
-            return common::Gate::Skip(format!(
-                "no drafter configured — set {} (holding {slug}) or {var}",
-                common::MODELS_ROOT_VAR
-            ));
-        };
-        if !Path::new(&root).is_dir() {
-            return common::Gate::Fail(format!(
-                "{}={root} is not an existing directory",
-                common::MODELS_ROOT_VAR
-            ));
-        }
-        let path = Path::new(&root).join(slug);
-        return match drafter_snapshot(&path) {
-            Ok(()) => common::Gate::Run { path, note: None },
-            Err(why) => common::Gate::Skip(format!(
-                "{}={root} does not hold a runnable {slug}: {why}; put the snapshot, or \
-                 a symlink to it, there",
-                common::MODELS_ROOT_VAR
-            )),
+        let root = std::env::var(common::MODELS_ROOT_VAR).ok();
+        return match common::slug_snapshot(root.as_deref(), slug, common::Role::Sidecar) {
+            common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
+            common::Snapshot::Absent(why) => {
+                common::Gate::Skip(why.replace(common::SINGLE_MODEL_VAR, var))
+            }
+            common::Snapshot::Misconfigured(why) => common::Gate::Fail(why),
         };
     };
-    let path = PathBuf::from(&named);
     // The operator named this path, so a typo or a moved snapshot breaks the
-    // run rather than skipping it.
-    match drafter_snapshot(&path) {
-        Ok(()) => common::Gate::Run { path, note: None },
-        Err(why) => common::Gate::Fail(format!("{var}={named}: {why}")),
+    // run rather than skipping it. `override_snapshot` reports only an unset or
+    // empty value as `None`, and this branch holds a non-empty one.
+    let probed =
+        common::override_snapshot(Some(&named), common::Role::Sidecar).unwrap_or_else(|| {
+            common::Snapshot::Misconfigured(format!("{var} is set to an empty value"))
+        });
+    match probed {
+        common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
+        common::Snapshot::Absent(why) | common::Snapshot::Misconfigured(why) => {
+            common::Gate::Fail(why.replace(common::SINGLE_MODEL_VAR, var))
+        }
     }
-}
-
-/// Whether `path` is a drafter this gate can load, or what it is missing.
-///
-/// A drafter needs a `config.json` and weights behind an entrypoint
-/// `rmlx_loader::load_shard_index` accepts. It does **not** need a tokenizer:
-/// every drafter here embeds and scores through the verifier's own.
-fn drafter_snapshot(path: &Path) -> Result<(), String> {
-    if !path.join("config.json").is_file() {
-        return Err(format!("no config.json in {}", path.display()));
-    }
-    let entrypoints = ["model.safetensors.index.json", "model.safetensors"];
-    if !entrypoints.iter().any(|f| path.join(f).exists()) {
-        return Err(format!(
-            "no {} in {}",
-            entrypoints.join(" or "),
-            path.display()
-        ));
-    }
-    Ok(())
 }
 
 /// Whether `draft_path` is the dedicated Gemma4 assistant drafter snapshot.

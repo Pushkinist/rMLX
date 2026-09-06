@@ -63,7 +63,7 @@ const K: usize = 4;
 /// root is a failure — see `tests/common/mod.rs`.
 fn snapshot(slug: &str) -> Result<PathBuf, String> {
     let root = std::env::var(common::MODELS_ROOT_VAR).ok();
-    match common::slug_snapshot(root.as_deref(), slug) {
+    match common::slug_snapshot(root.as_deref(), slug, common::Role::Standalone) {
         common::Snapshot::Found { path, .. } => Ok(path),
         common::Snapshot::Absent(why) => Err(why),
         common::Snapshot::Misconfigured(why) => panic!("{why}"),

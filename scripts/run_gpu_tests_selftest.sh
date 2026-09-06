@@ -760,6 +760,124 @@ expect_no_out "has no classified GPU test"
 expect_no_out "not found"
 
 # ---------------------------------------------------------------------------
+# A cell that stood down is reported as itself. libtest prints `ok` for a test
+# that returned before asserting anything, so without this the operator cannot
+# tell a suite that held from one that was never asked — the shape that let a
+# green `ci-perf` be quoted over speculative answer-equivalence gates that had
+# not run.
+#
+# The reason is asserted, not just the name: it is where the variable that would
+# arm the cell is named, and a report that drops it sends the reader hunting.
+new_case stand_down_is_named_with_its_reason || exit 1
+classify "${CASE_ROOT}" rmlx-models spec_alpha spec_beta
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test spec::alpha ... SKIP spec_alpha: RMLX_DRAFT_TEST_MODEL is unset and this pair's drafter is not resolved by slug
+ok
+test spec::beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "stood down"
+expect_out "rmlx-models spec_alpha: RMLX_DRAFT_TEST_MODEL is unset"
+expect_out "INCOMPLETE: 1 selected GPU test(s) stood down"
+expect_no_out "spec_beta:"
+
+# ---------------------------------------------------------------------------
+# The pair that makes the report falsifiable: the same crate, the same two
+# tests, run once with a stand-down and once without. The final line an operator
+# quotes must differ between them — if it does not, the notice above is
+# decoration.
+new_case stand_down_changes_the_final_line || exit 1
+classify "${CASE_ROOT}" rmlx-models spec_alpha spec_beta
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test spec::alpha ... SKIP spec_alpha: RMLX_O_MODELS_ROOT does not hold a runnable snapshot
+ok
+test spec::beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+stood_down_line="$(printf '%s\n' "${OUT}" | grep '^OK:')"
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test spec::alpha ... ok
+test spec::beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+ran_line="$(printf '%s\n' "${OUT}" | grep '^OK:')"
+[ "${stood_down_line}" = "${ran_line}" ] &&
+    fail "a run that stood a test down ends in the same line as one that ran it: ${ran_line}"
+case "${ran_line}" in
+    *INCOMPLETE*) fail "a run with nothing stood down must not be marked INCOMPLETE: ${ran_line}" ;;
+esac
+expect_no_out "stood down"
+
+# ---------------------------------------------------------------------------
+# A stand-down is not a property of the Metal validation layer, and harvesting
+# it only when that layer is on would leave `--no-shader-validation` reporting
+# an unqualified pass over cells that never ran.
+new_case stand_down_survives_uninstrumented || exit 1
+classify "${CASE_ROOT}" rmlx-models spec_alpha
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+running 1 test
+test spec::alpha ... SKIP spec_alpha: RMLX_DRAFT_TEST_MODEL is unset
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}" --no-shader-validation
+expect_status 0
+expect_out "rmlx-models spec_alpha: RMLX_DRAFT_TEST_MODEL is unset"
+expect_out "INCOMPLETE: 1 selected GPU test(s) stood down"
+
+# ---------------------------------------------------------------------------
+# A notice that names no test cannot be attributed. It is counted rather than
+# dropped — a report that omits it claims to have seen every stand-down when it
+# has not — and it must not be attributed to whichever test happened to be
+# nearby, which would be worse than saying nothing.
+new_case unattributed_stand_down_is_counted || exit 1
+classify "${CASE_ROOT}" rmlx-models spec_alpha
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test spec::alpha ... SKIP: RMLX_TEST_MODEL_QWEN36 not set
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "1 further stand-down notice(s) named no test"
+expect_out "INCOMPLETE: 0 selected GPU test(s) stood down"
+expect_no_out "rmlx-models spec_alpha:"
+
+# ---------------------------------------------------------------------------
+# A notice whose name is not a test is not an attribution either. A suite that
+# announces itself by file or helper name passes the pattern and names nothing
+# a libtest filter reaches, so listing it would put a name in the report that
+# the reader cannot run. It is counted with the nameless ones.
+new_case named_notice_that_is_not_a_test_is_not_attributed || exit 1
+classify "${CASE_ROOT}" rmlx-models spec_alpha
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test loader::published ... SKIP dflash2_loader: the published checkpoint is not on this machine
+ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "1 further stand-down notice(s)"
+expect_out "INCOMPLETE: 0 selected GPU test(s) stood down"
+expect_no_out "rmlx-models dflash2_loader:"
+
+# ---------------------------------------------------------------------------
 # The harness's own positive control: with nothing wrong, the same stubs produce
 # a green run. Without this, every case above could be passing because the stub
 # crates never ran at all.

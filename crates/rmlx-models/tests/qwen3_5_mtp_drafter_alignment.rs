@@ -104,7 +104,10 @@ fn mtp_sidecar_loads_whatever_ffn_it_carries() {
         env_path("RMLX_KV_TEST_MODEL"),
         env_path("RMLX_DRAFT_TEST_MODEL"),
     ) else {
-        eprintln!("[qwen35_mtp_align] verifier/sidecar unset or absent - skipping");
+        eprintln!(
+            "SKIP mtp_sidecar_loads_whatever_ffn_it_carries: RMLX_KV_TEST_MODEL and \
+             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
+        );
         return;
     };
     let device = Device::Gpu;
@@ -144,7 +147,10 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
         env_path("RMLX_KV_TEST_MODEL"),
         env_path("RMLX_DRAFT_TEST_MODEL"),
     ) else {
-        eprintln!("[qwen35_mtp_align] verifier/sidecar unset or absent - skipping");
+        eprintln!(
+            "SKIP mtp_greedy_tracks_plain_greedy_for_a_long_prefix: RMLX_KV_TEST_MODEL and \
+             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
+        );
         return;
     };
     let device = Device::Gpu;

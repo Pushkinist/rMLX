@@ -53,7 +53,12 @@
 #
 #   Model-gated cells that skip because no snapshot is present still count as
 #   executed; that is the suite's own documented contract and is not a
-#   process-wide off switch.
+#   process-wide off switch. They are REPORTED, though: every `SKIP <test>:
+#   <why>` notice is harvested, listed with its reason and counted on the final
+#   line as INCOMPLETE. A test that could not run is not a test that passed, and
+#   libtest prints `ok` for both — the answer-equivalence gates for speculative
+#   decoding are in that population, so a run that skipped them looked exactly
+#   like one where the equivalence held.
 #
 # SHADER VALIDATION (--shader-validation, on by default)
 #   An out-of-bounds device store from a Metal kernel is silently dropped: the
@@ -121,7 +126,9 @@
 #
 # Exit 0 = every selected GPU test passed and every shader-validation hit was
 # one the census pin accounts for. Exit 1 = a failing test, a hit the pin does
-# not account for, or a run that executed nothing.
+# not account for, or a run that executed nothing. A stand-down is not an exit
+# code — a developer without the weights must not be blocked — but it is on the
+# final line, marked INCOMPLETE.
 
 # No `-e`: cargo's exit code is captured explicitly via PIPESTATUS, and one
 # failing crate must not abort the remaining crates. The `[ ... ] && echo` guard
@@ -212,6 +219,18 @@ VALIDATION_BANNER='Metal GPU Validation Enabled'
 # to start a line. Requiring one of the two markers within a bounded distance
 # is what keeps a test's own "invalid" wording from forging a hit.
 VALIDATION_DIAGNOSTIC='Invalid .{0,120}(at offset [0-9]+|executing kernel function:)'
+
+# A cell that returns before asserting anything announces `SKIP <test>: <why>`.
+# The name is what makes the notice attributable — to the census expectation
+# below, and to the stand-down report the operator reads — so the two scans
+# share one definition of it: a run where they disagreed would list a notice as
+# attributed and count it as unattributed at the same time. Neither is anchored
+# at line start, because under --nocapture the notice lands after libtest's
+# `test some::name ... ` prefix.
+NAMED_SKIP='SKIP [A-Za-z_][A-Za-z0-9_]*:'
+# Any stand-down announcement, named or not. The surrounding character classes
+# keep `RMLX_SKIP_GPU` and words merely containing the letters from counting.
+ANY_SKIP='(^|[^A-Za-z0-9_])SKIP([^A-Za-z0-9_]|$)'
 
 # One `<kind><TAB><kernel>` record per diagnostic, read from stdin one
 # diagnostic per line.
@@ -369,6 +388,9 @@ validation_hits=""
 validation_kinds=""
 validation_records=""
 validation_skips=""
+stood_down=""
+n_stood_down=0
+n_unattributed=0
 
 if [ "${SHADER_VALIDATION}" = "1" ]; then
     echo "shader validation: ON (invalid Metal memory access fails this run)"
@@ -511,15 +533,45 @@ for crate in "${crates[@]}"; do
                                                       | awk -F'\t' -v c="${crate}" \
                                                             'NF == 2 { print c "\t" $0 }')"$'\n'
         fi
-        # A model-gated cell announces its own skip. Harvesting it is what lets
-        # the census expectation drop that cell's count instead of waiving the
-        # whole entry on a guess about which snapshots are installed. The notice
-        # routinely shares a line with libtest's `test <name> ... ` prefix under
-        # --nocapture, so this is not line-anchored.
-        validation_skips="${validation_skips}$(grep -Eo 'SKIP [A-Za-z_][A-Za-z0-9_]*:' "${log}" \
-            | awk -v c="${crate}" '{ sub(/^SKIP /, ""); sub(/:$/, ""); print c "\t" $0 }' \
-            | sort -u)"$'\n'
     fi
+
+    # A model-gated cell announces its own stand-down as `SKIP <test>: <why>`.
+    # It is harvested on every run, instrumented or not: a test that did not run
+    # is the same non-event either way, and the census expectation below drops
+    # that cell's count from it rather than waiving the whole entry on a guess
+    # about which snapshots are installed. The notice routinely shares a line
+    # with libtest's `test <name> ... ` prefix under --nocapture, so this is not
+    # line-anchored; a validation diagnostic can land appended to it, so the
+    # reason is cut there rather than carrying a second event's text.
+    crate_skips="$(grep -Eo "${NAMED_SKIP}.*" "${log}" \
+        | sed -E 's/Invalid (device|threadgroup).*$//; s/[[:space:]]+$//' | sort -u)"
+    while IFS= read -r notice; do
+        [ -z "${notice}" ] && continue
+        skip_test="${notice%%:*}"
+        skip_test="${skip_test#SKIP }"
+        # The shape is not the attribution: a notice naming a suite, a file or a
+        # helper passes the pattern and names nothing this runner can select, so
+        # listing it would put a name in the report that no filter reaches.
+        # Checked against the whole classification rather than the selection,
+        # since an over-matching filter can run a classified test the selection
+        # did not ask for.
+        case $'\n'"${listing}"$'\n' in
+            *$'\n'"${crate}"$'\t'"${skip_test}"$'\n'*) ;;
+            *) n_unattributed=$((n_unattributed + 1)); continue ;;
+        esac
+        stood_down="${stood_down}  ${crate} ${skip_test}: ${notice#*: }"$'\n'
+        validation_skips="${validation_skips}${crate}"$'\t'"${skip_test}"$'\n'
+        n_stood_down=$((n_stood_down + 1))
+    done <<< "${crate_skips}"
+
+    # A notice that names no test cannot be attributed, so it can be counted but
+    # not listed — and a report that silently drops it claims a completeness it
+    # does not have. Counted per occurrence rather than deduplicated: the point
+    # is how much of this run went unaccounted for.
+    all_notices="$(grep -Eo "${ANY_SKIP}" "${log}" | grep -c '')"
+    named_notices="$(grep -Eo "${NAMED_SKIP}" "${log}" | grep -c '')"
+    n_unattributed=$((n_unattributed + all_notices - named_notices))
+
     rm -f "${log}"
     crate_passed=${counts% *}
     crate_failed=${counts#* }
@@ -563,6 +615,25 @@ echo
 # the same run. Each crate's log is deleted inside the loop, so what is not
 # printed here is gone.
 red=0
+
+# A test that could not run is not a test that passed, and libtest reports both
+# as `ok`. So every stand-down this run observed is printed here, with the
+# reason its own gate gave — which is where the variable or the snapshot that
+# would arm it is named. It is not a failure: a developer without the weights
+# must not be blocked by this suite. It is the distinction between a suite that
+# held and one that was never asked, and it also reaches the final line, because
+# a summary read as green has to say what it did not check.
+if [ "${n_stood_down}" -gt 0 ] || [ "${n_unattributed}" -gt 0 ]; then
+    echo "stood down — these selected GPU tests announced they did not run:"
+    printf '%s' "${stood_down}"
+    if [ "${n_unattributed}" -gt 0 ]; then
+        echo "  ${n_unattributed} further stand-down notice(s) named no test, or named something"
+        echo "  that is not a classified GPU test in that crate, and could not be attributed."
+        echo "  A cell that stands down must print 'SKIP <its own test fn>: <why>', or its"
+        echo "  absence is invisible here and to the census pin. See docs/TESTING.md."
+    fi
+    echo
+fi
 
 # An invalid access is a failure even though every test reported `ok` and cargo
 # exited 0 — that is the whole point: the access never reaches the buffer, and
@@ -758,13 +829,17 @@ if [ "${red}" = "1" ]; then
     exit 1
 fi
 
-# The note rides on the OK line, not only on stderr: a summary an operator reads
+# The notes ride on the OK line, not only on stderr: a summary an operator reads
 # as "green" has to say what it did not check, or the next reader repeats the
-# mistake of quoting the exit code.
+# mistake of quoting the exit code. The word INCOMPLETE is the marker
+# `make ci-perf` reads to decide whether its own last line may say `ok`, so it
+# stays on this line whichever clause put it there.
+incomplete=""
 if [ -n "${snapshot_root_note}" ]; then
     incomplete=" — INCOMPLETE: ${snapshot_root_note}"
-else
-    incomplete=""
+fi
+if [ "${n_stood_down}" -gt 0 ] || [ "${n_unattributed}" -gt 0 ]; then
+    incomplete="${incomplete} — INCOMPLETE: ${n_stood_down} selected GPU test(s) stood down and $((n_unattributed)) further notice(s) named no test; they asserted nothing (listed above)"
 fi
 if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${census_notes}" ]; then
     echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader-validation census NOT enforced in full (see above).${incomplete}"

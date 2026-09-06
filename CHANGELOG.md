@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A suite that could not run no longer reports what a suite that passed
+  reports.** Two halves of one defect. The shared snapshot probe in the model
+  test harness required a `tokenizer.json` of every directory it was asked
+  about, and a drafter sidecar is decoded with the verifier's tokenizer and
+  ships none — so it read as absent on the machine holding it, and an absence
+  stands a gate down while libtest prints `ok`. The probe now takes the role the
+  caller is asking for: a sidecar needs its config and its weights, a model the
+  harness tokenizes with needs a tokenizer too. And `scripts/run_gpu_tests.sh`
+  now harvests every `SKIP <test>: <why>` notice on every run, lists each with
+  the reason its own gate gave, counts the notices that named no test, and marks
+  the run INCOMPLETE — which `make ci-perf` reports instead of printing
+  `ci-perf ok` over it. A stand-down is still not a failure; a developer without
+  the weights must not be blocked. The six speculative alignment suites, which
+  announced their stand-downs in a form nothing read, now use the form the
+  runner counts.
+
 - **The bench scripts record the decode rate the engine measured, not one they
   derive themselves.** `scripts/spec_bench.sh` read the speculative round loop's
   `done` line and divided `emitted` by `elapsed_ms`. That elapsed covers the

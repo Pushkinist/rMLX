@@ -100,12 +100,16 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
         env_path("RMLX_KV_TEST_MODEL"),
         env_path("RMLX_DRAFT_TEST_MODEL"),
     ) else {
-        eprintln!("[qwen35_eagle3_align] verifier/drafter unset or absent - skipping");
+        eprintln!(
+            "SKIP eagle3_greedy_tracks_plain_greedy_for_a_long_prefix: RMLX_KV_TEST_MODEL \
+             and RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
+        );
         return;
     };
     if !is_eagle3_drafter(&draft_path) {
         eprintln!(
-            "[qwen35_eagle3_align] RMLX_DRAFT_TEST_MODEL is not an EAGLE-3 drafter - skipping"
+            "SKIP eagle3_greedy_tracks_plain_greedy_for_a_long_prefix: \
+             RMLX_DRAFT_TEST_MODEL is not an EAGLE-3 drafter"
         );
         return;
     }

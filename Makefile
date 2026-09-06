@@ -245,6 +245,12 @@ test-perf:       ## cargo test --profile release-perf (release-perf profile, pan
 #     visits five crates and holds the GPU while it does. Fail on the broad,
 #     shareable step before spending exclusive-GPU minutes.
 #
+# The last line reads the runner's own verdict rather than asserting one. A
+# suite whose snapshot is not on disk stands down, which is not a failure and
+# has no exit code — so a `ci-perf ok` printed after it claimed a gate had held
+# when it had never been asked. The runner marks such a run INCOMPLETE on its
+# final line and lists what stood down; this target says so instead of `ok`.
+#
 # The runner is invoked directly rather than through `$(MAKE) gpu-test`. Make
 # propagates command-line variables to sub-makes, so `make ci-perf CRATE=…` or
 # `VALIDATE=0` would silently reach the runner and narrow or disarm the gate:
@@ -268,8 +274,14 @@ test-perf:       ## cargo test --profile release-perf (release-perf profile, pan
 ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (separate from make ci; run before merging perf-sensitive or codec-layer changes)
 	@bash scripts/run_gpu_tests.sh --preflight
 	$(MAKE) test-perf
-	@bash scripts/run_gpu_tests.sh
-	@echo "ci-perf ok"
+	@log="$$(mktemp)"; rc="$$(mktemp)"; \
+	{ bash scripts/run_gpu_tests.sh; echo $$? >"$$rc"; } | tee "$$log"; \
+	code="$$(cat "$$rc")"; rm -f "$$rc"; \
+	if [ "$$code" -ne 0 ]; then rm -f "$$log"; exit "$$code"; fi; \
+	if grep -q INCOMPLETE "$$log"; then \
+	  echo "ci-perf INCOMPLETE — the GPU suite did not run every gate it names (see above)"; \
+	else echo "ci-perf ok"; fi; \
+	rm -f "$$log"
 
 # gpu-test: the execution step for the tests `check-gpu-tests-ignored` mandates.
 # Every test reaching Device::Gpu must carry #[ignore] (a shared Metal context
