@@ -900,6 +900,10 @@ impl SpeculativeDispatcher {
                 round = rounds,
                 accept,
                 num_draft = draft_tokens.len(),
+                // What the round emitted, which is `accept + 1` unless the
+                // request's token budget ran out mid-block. It used to be
+                // `accept + 1` unconditionally, so the two differ in the last
+                // round of a request that stops mid-block.
                 emitted_round = new_tokens.len(),
                 emitted_total = emitted.len(),
                 v_offset_before,
