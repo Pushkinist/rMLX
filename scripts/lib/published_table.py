@@ -477,6 +477,44 @@ def fixed_table(result: dict, bound: dict) -> list[str]:
     return out
 
 
+# The columns the protocol omits and this harness set out to publish beside it,
+# each keyed on the result field it would arrive in. A section listing what is
+# missing is only honest while it is derived from the results rather than
+# asserted, so a run that carries one of these drops its line here — and then
+# has to grow a section of its own.
+EXTRA_COLUMNS = {
+    "greedy_match": "greedy token-match rate against plain decode on the same "
+                    "checkpoint, per dataset — the lossless proof",
+    "longctx": "TTFT and decode rate at 32k and 128k input, plain, from "
+               "`prompts/longctx_*.json`",
+    "wikitext_ppl": "Wikitext-2 perplexity of the served checkpoint against its "
+                    "bf16/mxfp8 sibling",
+    "humaneval_pass1": "pass@1 on the HumanEval subset, from these same "
+                       "completions",
+}
+
+
+def missing_columns_block(results: list[dict]) -> list[str]:
+    """What a reader should not go looking for in the table above."""
+    missing = [text for key, text in EXTRA_COLUMNS.items()
+               if not any(r.get(key) for r in results)]
+    if not missing:
+        return []
+    return [
+        "## Not in this table",
+        "",
+        "The protocol above omits these and they are what would make the",
+        "comparison more than a rate comparison. This harness does not measure",
+        "them yet, so they are named here rather than left for a reader to notice",
+        "their absence:",
+        "",
+    ] + [f"- {text}" for text in missing] + [
+        "",
+        "Thermal state and binary identity, the other two, are under Provenance.",
+        "",
+    ]
+
+
 def provenance_block(results: list[dict], snapshot: Path) -> list[str]:
     first = results[0]
     binary = first.get("binary") or {}
@@ -537,6 +575,7 @@ def render(results: list[dict], snapshot: Path, bounds: dict, meta: dict,
     for result in results:
         if result.get("fixed_prompt"):
             lines += fixed_table(result, bounds[(arm_label(result), "#fixed")])
+    lines += missing_columns_block(results)
     lines += provenance_block(results, snapshot)
     return "\n".join(lines).rstrip() + "\n"
 

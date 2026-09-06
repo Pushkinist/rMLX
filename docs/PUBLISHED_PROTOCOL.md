@@ -149,6 +149,20 @@ all rather than guessing when it has none: a single achieved-GEMM
 constant is not defensible on this host, where the recorded rows span a
 7× range across models.
 
+## Not in this table
+
+The protocol above omits these and they are what would make the
+comparison more than a rate comparison. This harness does not measure
+them yet, so they are named here rather than left for a reader to notice
+their absence:
+
+- greedy token-match rate against plain decode on the same checkpoint, per dataset — the lossless proof
+- TTFT and decode rate at 32k and 128k input, plain, from `prompts/longctx_*.json`
+- Wikitext-2 perplexity of the served checkpoint against its bf16/mxfp8 sibling
+- pass@1 on the HumanEval subset, from these same completions
+
+Thermal state and binary identity, the other two, are under Provenance.
+
 ## Provenance
 
 | field | value |

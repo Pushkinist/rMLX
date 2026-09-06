@@ -106,6 +106,15 @@ jobs:
       # stops refusing. Synthetic sample-set roots pin which reason it must give.
       - name: the published-samples gate still catches what it is for
         run: make check-published-samples-fixtures
+      # The committed published-protocol table is generated, so a hand edit to a
+      # number in it is a number no instrument produced. Pure python3 over
+      # checked-in JSON — no toolchain, no GPU, no model.
+      - name: the published-protocol table is what the emitter renders
+        run: make check-published-table
+      # ...and the emitter puts a bound beside every number, which renders just
+      # as plausibly when the bound is wrong. These re-derive it.
+      - name: the published-protocol table's bounds are the derived ones
+        run: make published-table-selftest
 
   msl:
     name: msl kernels (compile + format)

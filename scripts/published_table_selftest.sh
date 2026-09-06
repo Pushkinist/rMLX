@@ -479,6 +479,24 @@ if [ "$(grep -c 'The fixed-length prompt' "${CASE_OUT}")" -ne 1 ]; then
 fi
 verdict
 
+table_case what_is_not_measured_is_named 0 \
+    "the columns the harness does not measure yet are listed, not left to be noticed" \
+    'greedy token-match rate'
+grep -q 'TTFT and decode rate at 32k and 128k' "${CASE_OUT}" || \
+    note_bad "the long-context row is not named as missing"
+grep -q 'Wikitext-2 perplexity' "${CASE_OUT}" || \
+    note_bad "the perplexity column is not named as missing"
+grep -q 'pass@1 on the HumanEval subset' "${CASE_OUT}" || \
+    note_bad "pass@1 is not named as missing"
+verdict
+
+table_case a_measured_column_stops_being_listed_as_missing 0 \
+    "...and the list is derived from the results, so it cannot go stale silently" \
+    'TTFT and decode rate at 32k' \
+    ABSENT:'greedy token-match rate' \
+    PLAIN:'result["greedy_match"] = {"mt_bench:1024": 1.0}'
+verdict
+
 table_case an_absent_prefill_anchor_is_absent_not_guessed 0 \
     "without a runs.db anchor the input-speed bound is empty and says why" \
     'input-speed bound is empty on purpose'
