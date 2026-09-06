@@ -54,7 +54,7 @@ variables above:
 |----------|---------|---------|
 | `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override for the SSD-restart smoke test. |
 | `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs`, `spec_greedy_equivalence.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path; the Qwen3.5-family alignment tests take a **verifier** here instead (see below). |
-| `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs`, `spec_greedy_equivalence.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
+| `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs`, `spec_greedy_equivalence.rs`, `spec_sampled_distribution.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | Vision-language model snapshot for VL text-parity tests. |
 | `RMLX_PROMPT_CACHE_TEST_MODEL_A` / `_B` | `rmlx-models/tests/prompt_cache_cross_model.rs` | **Two** snapshots of the same architecture with the same KV shape but different weights — the prompt cache is one static per arch, and this pair is what shows whether its key separates two resident models. `mlx-community__gemma-4-e2b-it-mxfp8` + `mlx-community__gemma-4-E2B-it-qat-4bit` fit (both `Gemma4ForConditionalGeneration`, 35 layers x 1 KV head x head_dim 256). Same-shape matters: a shape mismatch would fail for the wrong reason. Different weights matter: identical outputs make the comparison vacuous, and the test refuses rather than passing. |
 
@@ -93,6 +93,30 @@ ship and never will — routed through it, all three of its tests announced a
 skip on a machine holding the checkpoint. It loads weights and asserts names
 and shapes; it runs no forward and produces no shader-validation hit, so it has
 no entry in `scripts/gpu_validation_census.txt`.
+
+`spec_sampled_distribution.rs` is the sidecar half of the same question, above
+temperature 0, and it is a distributional one: not what the arm emitted but what
+it drew from. Every emitted token carries a surprise under the distribution the
+plain path would have drawn from at the same prefix, and if the arm draws from
+that distribution the stream's total surprise has a mean and a variance those
+distributions fix exactly — so the verdict is a `z` with no threshold measured
+on a healthy engine first. It runs
+`mlx-community__gemma-4-e2b-it-mxfp8` drafted by
+`mlx-community__gemma-4-E2B-it-assistant-bf16`, both resolved by slug, over five
+prose questions, and it runs a second arm at temperature 0 as a positive control
+that the run is red unless it *refuses*: a verifier that is nearly certain at
+every position passes under every acceptance rule, so a prompt set with no
+evidence in it must report that rather than a pass. Measured, +0.58 for the
+sampled arm and -8.70 for the control. It produces zero shader-validation hits
+and so has no census entry.
+
+Its `RMLX_DRAFT_TEST_MODEL` override names the drafter; a named path that is not
+a snapshot fails, and a models root that does not hold the slug skips. The four
+CPU cases in the same file need no snapshot at all and pin the statistic's power
+against a greedy stream, a stream drawn at the wrong temperature and one drawn
+without the request's filters — the last of which the surprise test does not
+refuse on its own, which is why the file carries a second oracle over the tokens
+that carry no target mass.
 
 `spec_greedy_equivalence.rs` asks a different question from those three: not
 whether the round loop keeps the verifier's state consistent for a while, but

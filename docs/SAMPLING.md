@@ -1055,12 +1055,43 @@ Absent-seed requests at `temperature > 0` are therefore deterministic per
 model and prompt. Callers that need distinct random sequences across retries
 must provide explicit differing seeds.
 
-**Speculative decoding.** Temperature > 0 is rejected for speculative
-decoding at the server layer (HTTP 400). Speculative candidates must be
-greedy; the verifier uses stochastic acceptance only when both draft and
-verifier distributions are sampled identically via `sampling_distribution()`,
-which replicates the full pipeline (mask → penalties → softmax → filters →
-renormalise) so acceptance is unbiased (Leviathan 2023, §2.3).
+**Speculative decoding.** Every speculative arm honours `temperature > 0`,
+and the emitted distribution is the verifier's own — not an approximation of
+it. `temperature == 0` keeps every arm on the argmax path, byte for byte.
+
+Which rule runs depends on what the drafter can supply:
+
+- **Two-model.** The drafter samples, so the round scores each proposal
+  against the drafter's own distribution: accept with probability
+  `min(1, p(x)/q(x))`, and on the first rejection draw the correction from
+  the residual `normalize((p − q)+)` (Leviathan 2023, §2.3). Both `p` and `q`
+  come from `sampling_distribution()`, which replicates the full pipeline
+  (mask → penalties → softmax → filters → renormalise), so the two are
+  matched.
+- **Sidecar drafters** (MTP sidecar, Gemma4 MTP assistant, DFlash, DFlash 2,
+  EAGLE-3). These propose an argmax, which is a point mass, and the same rule
+  with a point-mass proposal reduces to something that needs no drafter
+  distribution at all: draw the verifier's own token from
+  `sampling_distribution()` at each verified position, accept the prefix the
+  proposals agree with, and emit the verifier's draw either way. The
+  acceptance walk only reaches a position when everything before it agreed,
+  so the prefix it scored is the prefix it emitted, and every emitted token
+  is a draw from the verifier's distribution at exactly that prefix.
+
+Two consequences worth knowing:
+
+- **A sampled request costs more than a greedy one on a sidecar arm.** The
+  argmax is one device reduction over the whole verified block; a draw is a
+  host round trip and a full-vocabulary softmax with the filters per
+  position, and the block's rejected tail pays for it too. EAGLE-3 gives up
+  more than the others: its restricted read-back projects only the drafter's
+  own vocabulary, which cannot be normalised into a distribution, so sampled
+  requests take the full-vocabulary branch and lose that reduction.
+- **Penalties and `logit_bias` reach no speculative arm.** An exact
+  per-position distribution inside a round would need the penalty window
+  rebuilt over each drafted prefix, and no round loop carries that window. A
+  request that sets one gets a `warn` naming the fields it did not get; drop
+  the draft model to have them applied.
 
 ---
 
@@ -1088,5 +1119,6 @@ renormalise) so acceptance is unbiased (Leviathan 2023, §2.3).
   manages cache growth and prefix reuse.
 - `docs/TESTING.md` — golden-token tests that pin sampling output for
   thinking-budget injection and exact-hit cache paths.
-- `docs/SPECULATIVE.md` — speculative decoding; how the draft and verifier
-  share `sampling_distribution` for stochastic acceptance.
+- `docs/SPECULATIVE.md` — speculative decoding; which acceptance rule each
+  drafter family runs above `temperature == 0`, and what proves it draws from
+  the verifier's distribution.

@@ -29,15 +29,56 @@ Key constraints enforced at construction time:
   `response_format`). Requests mixing speculative decoding with structured
   output receive `HTTP 400`. The single-arch path handles that case correctly.
 
-Two acceptance rules are available:
+Every arm honours the request's temperature. What differs is which form of the
+acceptance rule it runs, and that follows from what the drafter can supply.
 
-- **Greedy** (`temperature == 0`): longest prefix of draft tokens that match
-  the verifier's argmax at each position. Deterministic.
-- **Stochastic** (`temperature > 0`): Leviathan acceptance — each draft token
-  is accepted with probability `min(1, p(x)/q(x))` vs a uniform draw; on first
-  rejection a correction is sampled from `normalize((p - q)+)`. The `p` and `q`
-  distributions are built with the same post-temperature / top-p / top-k /
-  min-p pipeline, ensuring the output is the verifier's distribution exactly.
+- **Greedy** (`temperature == 0`, every arm): longest prefix of draft tokens
+  that match the verifier's argmax at each position. Deterministic.
+- **Two-model, sampled** (`temperature > 0`): the drafter samples, so each
+  proposal is scored against the drafter's own distribution — accepted with
+  probability `min(1, p(x)/q(x))` against a uniform draw, and on the first
+  rejection a correction is drawn from `normalize((p - q)+)` (Leviathan et al.,
+  §2.3). `p` and `q` are built through the same post-temperature / top-p /
+  top-k / min-p pipeline, so the output distribution is the verifier's exactly.
+- **Sidecar, sampled** (`temperature > 0`): the drafter proposes an argmax,
+  which is a point mass, and the rule above with a point-mass proposal needs no
+  drafter distribution at all. Nothing in the theorem asks the proposal to
+  spread its mass: with `q = δ_x` the acceptance probability is `p(x)` and the
+  residual is `p` with `x` removed, which is what a verifier that draws its own
+  token and accepts on agreement does by construction. So each sidecar loop
+  draws from the verifier's post-sampling distribution at every verified
+  position and hands those draws to the acceptance walk unchanged. The walk
+  only reaches position `i` when every proposal before it agreed, so the prefix
+  it scored is the prefix it emitted, and each emitted token is a draw from the
+  verifier's distribution at exactly that prefix.
+
+The point-mass reduction is pinned by
+`a_point_mass_proposal_emits_the_target_and_matches_sample_and_match` in
+`crates/rmlx-models/src/sampler_tests.rs`: 200k trials, both forms, agreeing on
+the emitted distribution and on the acceptance rate.
+
+`VerifierDraw` in `crates/rmlx-models/src/speculative/mod.rs` owns both seams a
+sidecar loop reads the verifier through — the seed token after prefill and the
+block each round — so a loop takes the argmax or the draw at one place rather
+than two.
+
+**What a sampled sidecar request gives up.** The argmax is a single device
+reduction over the whole verified block; a draw is a host round trip and a
+full-vocabulary softmax with the request's filters at every position, and the
+block's rejected tail pays for it too. EAGLE-3 gives up more: its
+restricted-vocabulary read-back projects only the drafter's 32000 ids, and a
+distribution needs the whole row's normalising constant — softmaxing the subset
+spreads the missing mass over the ids that survived, and top-p and top-k then
+cut a different set. An argmax is indifferent to all of that, which is why that
+reduction is sound at temperature 0 and only there; sampled EAGLE-3 requests
+take the full-vocabulary branch. **None of this has been measured.** No
+throughput figure in this document was taken above temperature 0.
+
+**Penalties and `logit_bias` reach no arm**, including the two-model one, where
+they have never been applied. A correct per-position distribution inside a round
+needs the penalty window rebuilt over each drafted prefix, and no round loop
+carries that window. A request that sets one now gets a `warn` naming the fields
+it did not get, rather than having them dropped in silence.
 
 ## Round-loop
 
@@ -617,14 +658,18 @@ draft, subject to the checks below; a pair of the same architecture is the
 normal case (`gemma-4-e4b` drafted by `gemma-4-e2b`, `Qwen3.8-27B` drafted by
 `ornith-1.0-9b`).
 
-It is the one drafter kind with two acceptance rules. At `temperature == 0`
-the loop is `spec_generate_greedy_cached`; above it, `spec_generate_stochastic_cached`
-— Leviathan acceptance over the same post-sampling distributions the ordinary
-sampler builds. The sidecar kinds are greedy only.
+It is the one drafter kind whose sampled arm scores against a drafter
+distribution, because it is the one whose drafter samples. At `temperature == 0`
+the loop is `spec_generate_greedy_cached`; above it,
+`spec_generate_stochastic_cached` — full rejection sampling over the same
+post-sampling distributions the ordinary sampler builds. The sidecar kinds run
+the point-mass form of the same rule (see [Acceptance rules](#speculative-decoding)).
 `crates/rmlx-models/tests/two_model_stochastic.rs` is the gate that the
 stochastic loop runs at all: it pins that one seed reproduces one sequence, that
 a second seed and `temperature == 0` do not, on the `gemma-4-e4b` / `gemma-4-e2b`
-pair resolved by slug.
+pair resolved by slug. It says nothing about *what* the loop samples from;
+`crates/rmlx-models/tests/spec_sampled_distribution.rs` is what reads that, on a
+sidecar pair.
 
 **Selecting it.** The kind is `two_model`, and it is read off the draft
 snapshot's own `config.json` like every other kind: a registered architecture
@@ -1367,12 +1412,14 @@ onward. Bounding the peak means giving that seam a tail limit, and EAGLE-3 share
 it and needs every row, so it is a two-caller parameter and not one this port
 added. It is not fixed and no figure in this document depends on it.
 
-It is **greedy**, like every other sidecar loop here. The reference's sampled arm
-accepts by rejection sampling restricted to the selector's own candidate set —
-a different acceptance rule from the full-vocabulary one the two-model loop
-implements — and `select_chain` traces a greedy chain and returns no candidate
-distribution to sample against. A request above temperature 0 is served greedily,
-which is what the serve layer already does for every sidecar.
+**Its drafter is greedy, and its acceptance is not.** `select_chain` traces a
+greedy chain and returns ids, no candidate distribution — and the reference's
+sampled arm accepts by rejection sampling restricted to that candidate set. This
+port needs neither: a greedy proposal is a point mass, and the acceptance rule
+with a point-mass proposal is exact without one, so a request above temperature 0
+draws the verifier's own token at each verified position and accepts the prefix
+the chain agrees with. What the reference's restricted rule buys over that is
+acceptance rate, not correctness, and it is not implemented here.
 
 `--draft-kind dflash` over that snapshot is refused as a flag contradicting the
 declaration. `z-lab/Qwen3.6-35B-A3B-DFlash` is `dflash`, reads every tensor it
