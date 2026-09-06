@@ -167,16 +167,17 @@ fn decide_draft_kind(
         // materialise the whole verifier first and then die on a tensor name.
         // `mtp` is not listed: its own family router refuses a full model
         // before any weight is read.
-        (Some(f @ (DraftKind::Eagle3 | DraftKind::DFlash)), Declared::FullModel) => {
-            Err(Error::SpeculativePairing {
-                reason: format!(
-                    "--draft-kind {f} points at a registered full model (architectures[0] \
+        (
+            Some(f @ (DraftKind::Eagle3 | DraftKind::DFlash | DraftKind::DFlash2)),
+            Declared::FullModel,
+        ) => Err(Error::SpeculativePairing {
+            reason: format!(
+                "--draft-kind {f} points at a registered full model (architectures[0] \
                      {arch:?}, model_type {model_type:?}), which carries no {f} head; point \
                      --draft-model at a {f} sidecar, or drop the flag to run it as a \
                      two_model draft"
-                ),
-            })
-        }
+            ),
+        }),
         (Some(f), Declared::Sidecar(_) | Declared::FullModel | Declared::Unknown) => Ok(f),
         (None, declared) => declared.kind().ok_or_else(|| Error::SpeculativePairing {
             reason: format!(
@@ -202,6 +203,8 @@ enum Drafter {
     Eagle3(Arc<Mutex<rmlx_models::speculative::eagle3::Eagle3Drafter>>),
     /// DFlash drafter beside a verifier-only dispatcher.
     DFlash(Arc<Mutex<rmlx_models::speculative::dflash::DFlashDrafter>>),
+    /// DFlash 2 drafter; its round loop borrows `&self`, so no `Mutex`.
+    DFlash2(Arc<rmlx_models::speculative::dflash2::DFlash2Drafter>),
     /// Gemma4 assistant, the shared-K/V `mtp` family; `draft_n` borrows `&self`.
     MtpAssistant(Arc<rmlx_models::speculative::gemma4_assistant::Gemma4AssistantDrafter>),
     /// Qwen3.5-family MTP sidecar head.
@@ -215,6 +218,7 @@ impl Drafter {
         match self {
             Drafter::Eagle3(_) => rmlx_models::DraftKind::Eagle3,
             Drafter::DFlash(_) => rmlx_models::DraftKind::DFlash,
+            Drafter::DFlash2(_) => rmlx_models::DraftKind::DFlash2,
             Drafter::MtpAssistant(_) | Drafter::MtpSidecar(_) => rmlx_models::DraftKind::Mtp,
             Drafter::TwoModel => rmlx_models::DraftKind::TwoModel,
         }
@@ -379,6 +383,17 @@ impl SpeculativeGenerator {
                     device,
                 )?;
                 (dispatcher, Drafter::DFlash(Arc::new(Mutex::new(drafter))))
+            }
+            rmlx_models::DraftKind::DFlash2 => {
+                let dispatcher =
+                    rmlx_models::SpeculativeDispatcher::load_verifier_only(verifier_dir, device)?;
+                let hidden_size = dispatcher.verifier.hidden_size();
+                let drafter = rmlx_models::speculative::dflash2::DFlash2Drafter::load(
+                    draft_dir,
+                    hidden_size,
+                    device,
+                )?;
+                (dispatcher, Drafter::DFlash2(Arc::new(drafter)))
             }
             rmlx_models::DraftKind::Mtp => {
                 let dispatcher =
@@ -845,6 +860,21 @@ impl Generator for SpeculativeGenerator {
                     rmlx_models::speculative::dflash::dflash_generate_greedy(
                         &dispatcher.verifier,
                         &mut drafter,
+                        &tokenizer,
+                        &prompt_tokens,
+                        n_tokens,
+                        block_size,
+                        kv_quant_override,
+                        max_ctx_override,
+                        &eos_ids,
+                        &mut step_fn,
+                        dispatcher.device(),
+                    )
+                }
+                Drafter::DFlash2(drafter) => {
+                    rmlx_models::speculative::dflash2::dflash2_generate_greedy(
+                        &dispatcher.verifier,
+                        drafter,
                         &tokenizer,
                         &prompt_tokens,
                         n_tokens,

@@ -957,43 +957,6 @@ pub fn dflash_generate_greedy(
 // Loader
 // ---------------------------------------------------------------------------
 
-/// Refuse a snapshot carrying tensors this loader never reads.
-///
-/// A DFlash checkpoint of a later generation ships weight families this loader
-/// has no code for — a candidate selector, per-layer dynamic convolutions.
-/// Building the drafter out of the remainder yields **this loader's**
-/// architecture wearing the checkpoint's name, and the accept rate measured
-/// from it is filed under that name: `decode_config` records `dflash/block=N`
-/// either way and cannot tell the two apart, so the row outlives any warning
-/// and cannot be re-attributed afterwards. Refusing is what keeps that row from
-/// being written; it costs the supported checkpoint nothing, which reads every
-/// tensor it ships.
-///
-/// `Ok(())` means every tensor in the snapshot was consumed. It returns a
-/// `Result` rather than an `Option<Error>` so a call site that stops propagating
-/// it is an `unused_must_use` warning, which `-D warnings` turns into a build
-/// failure — the guard cannot be un-wired quietly.
-fn unread_tensor_refusal(present: &HashSet<String>, consumed: &HashSet<String>) -> Result<()> {
-    let mut unread: Vec<&str> = present
-        .iter()
-        .map(String::as_str)
-        .filter(|name| !consumed.contains(*name))
-        .collect();
-    if unread.is_empty() {
-        return Ok(());
-    }
-    unread.sort_unstable();
-    Err(Error::Model(format!(
-        "DFlashDrafter: the snapshot carries {} tensors this loader does not read \
-         ({}); the drafter built from the rest would be this loader's architecture \
-         and not the checkpoint's, and any accept rate measured from it would be \
-         recorded under the checkpoint's name with nothing in the row to say so. \
-         Refusing rather than serving a drafter that is not the one named.",
-        unread.len(),
-        unread.join(", ")
-    )))
-}
-
 /// Load the DFlash drafter tensors + config from `draft_dir`.
 #[allow(
     clippy::indexing_slicing,
@@ -1081,11 +1044,11 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
         .map_err(|e| Error::Model(format!("DFlashDrafter: open: {e}")))?;
 
     // Which tensor names the loader actually consumed. A drafter checkpoint of
-    // a later DFlash generation carries families this loader has no code for
-    // (a candidate selector, per-layer dynamic convolutions); loading it then
-    // silently yields the earlier architecture built out of the subset it does
-    // recognise, running at an accept rate that is not the checkpoint's. The
-    // set is compared against the snapshot below so that downgrade is stated.
+    // a DFlash generation newer than this loader carries weight families it has
+    // no code for; loading it then silently yields this architecture built out
+    // of the subset it does recognise, running at an accept rate that is not the
+    // checkpoint's. The set is compared against the snapshot below so that
+    // downgrade is stated.
     let consumed: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 
     let load = |name: &str| -> Result<Array> {
@@ -1169,7 +1132,7 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
             .map_err(|e| Error::Model(format!("DFlashDrafter: safetensors: {e}")))?;
         present.extend(st.names().into_iter().map(ToOwned::to_owned));
     }
-    unread_tensor_refusal(&present, &consumed.borrow())?;
+    super::unread_tensor_refusal("DFlashDrafter", &present, &consumed.borrow())?;
 
     // YARN RoPE: the Qwen3.6 DFlash drafter is trained with rope_scaling
     // {rope_type: yarn}. Precompute its inverse-freq table + mscale so the

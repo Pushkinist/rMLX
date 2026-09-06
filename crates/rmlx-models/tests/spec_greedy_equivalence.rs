@@ -31,8 +31,16 @@
 //! |---|---|---|
 //! | assistant pair, as shipped | 16 to 256 (one prompt bit-identical) | 0.0000 to 0.0820 |
 //! | recurrent pair, as shipped | 65 to 256 (three prompts bit-identical) | 0.0000 to 0.0234 |
+//! | block pair, as shipped | 9 to 89 (none bit-identical) | 0.0000 to 0.0273 |
 //! | assistant pair, SWA ring keeping its rejected block tail | 6 to 9 | 0.4219 to 0.9258 |
 //! | recurrent pair, acceptance walk without the final norm | 1 to 24 | 0.0000 to 0.5000 |
+//! | block pair, rejected tail never rolled off | 4 to 7 | 0.0117 to 0.9297 |
+//! | block pair, one rejected draft kept every partial round | 4 to 10 | 0.1758 to 0.6406 |
+//!
+//! The block pair's own two broken engines are refused on six of six prompts
+//! each. One of their twelve cells reads 0.0117 — inside the confidence ceiling
+//! — and is refused by the repetition control instead, which reads 1.0000 on it:
+//! the two oracles cover each other, and neither alone gives that recall.
 //!
 //! **There is deliberately no subsequence floor.** How much of one answer two
 //! correct arms share is decided by where their first near-tie lands and by
@@ -77,20 +85,23 @@
 //! gate refuses six of six on the assistant pair and four of six on the
 //! recurrent one. The two it does not refuse read 0.0000 and 0.0977 — inside the
 //! ceiling — and are why the gate runs **every** prompt rather than one: recall
-//! is a property of the set. Both broken engines turn both gates red.
+//! is a property of the set. Both broken engines turn both gates red. The block
+//! pair's own two broken engines are refused on six of six prompts each.
 //!
 //! # Pairs
 //!
-//! Two, resolved by slug from `RMLX_O_MODELS_ROOT` so `make gpu-test` runs them
-//! on a machine holding the snapshots:
+//! Three, whose verifiers resolve by slug from `RMLX_O_MODELS_ROOT`:
 //!
 //! | verifier | drafter | round loop | rollback |
 //! |---|---|---|---|
 //! | `gemma-4-e2b-it-mxfp8` | `gemma-4-E2B-it-assistant-bf16` | shared-K/V assistant | KV truncation, SWA ring included |
 //! | `Qwen3.8-27B-mxfp8` | `Qwen3.8-27B-MTP-mxfp8` | MTP sidecar | KV truncation + recurrent snapshot/replay |
+//! | `Qwen3.8-27B-4bit` | `Qwen3.8-27B-DFlash2` | DFlash 2 block drafter | KV truncation + recurrent snapshot/replay |
 //!
-//! The first runs wherever the snapshots are; the second runs on request — see
-//! [`DrafterSource`] for the shader-validation reason.
+//! The first runs wherever the snapshots are; the other two run on request —
+//! see [`DrafterSource`] for the shader-validation reason. `RMLX_DRAFT_TEST_MODEL`
+//! names one drafter, so the pair it does not belong to stands down on the kind
+//! its snapshot declares rather than loading it as something else.
 //!
 //! The second is the pair whose agreement no subsequence floor could separate
 //! from a broken rollback. The divergence oracle settled it: its acceptance walk
@@ -118,10 +129,12 @@ mod common;
 
 use rmlx_mlx::Device;
 use rmlx_models::arch;
+use rmlx_models::speculative::dflash2::{dflash2_generate_greedy, DFlash2Drafter};
 use rmlx_models::speculative::gemma4_assistant::{
     mtp_assistant_generate_greedy, Gemma4AssistantDrafter,
 };
 use rmlx_models::speculative::mtp::{mtp_generate_greedy, MtpDrafter};
+use rmlx_models::{Declared, DraftKind};
 
 /// Token budget per arm. A ceiling, not a target: both arms stop on the
 /// verifier's own stop ids, and every prompt in the sweep answers under it.
@@ -1256,6 +1269,26 @@ enum RoundLoop {
     /// rollback restores it from a pre-round snapshot and replays the accepted
     /// prefix.
     MtpSidecar,
+    /// DFlash 2 block drafter: the same recurrent rollback, and a drafter that
+    /// denoises a whole block at once from the verifier's multi-layer hidden
+    /// states rather than stepping through it.
+    DFlash2,
+}
+
+impl RoundLoop {
+    /// The drafter kind a pair's snapshot must declare itself.
+    ///
+    /// One environment variable names the drafter for every pair that is not
+    /// resolved by slug, so a run set up for one of them reaches the others.
+    /// A snapshot of the wrong kind stands the pair down here rather than
+    /// panicking inside a loader that was handed another drafter's tensors.
+    fn declares(self) -> Option<DraftKind> {
+        match self {
+            RoundLoop::Gemma4Assistant => None,
+            RoundLoop::MtpSidecar => Some(DraftKind::Mtp),
+            RoundLoop::DFlash2 => Some(DraftKind::DFlash2),
+        }
+    }
 }
 
 /// One verifier + drafter the gate can run.
@@ -1278,9 +1311,9 @@ enum DrafterSource {
     /// shader validation reports over a thousand invalid loads from a kernel
     /// this repo does not compile. The census pins one exact count per test, and
     /// a count from a 256-token generation moves with every prompt — so pinning
-    /// this pair would make the census brittle rather than informative. Until
-    /// that is settled the pair runs on request and `make gpu-test` reports it
-    /// as skipped, with the variable that would run it named.
+    /// such a pair would make the census brittle rather than informative. Until
+    /// that is settled these pairs run on request and `make gpu-test` reports
+    /// them as skipped, with the variable that would run them named.
     Named,
 }
 
@@ -1310,6 +1343,26 @@ const MTP_PAIR: Pair = Pair {
     round_loop: RoundLoop::MtpSidecar,
 };
 
+/// The block pair. Its drafter denoises a whole block in one pass and its
+/// selector chains the block's independent argmaxes into one sentence, so an
+/// error in either reaches the verifier as a rejected proposal rather than as a
+/// failure — which the acceptance walk absorbs, and this gate does not.
+///
+/// Named for the same reason [`MTP_PAIR`] is, and more so: its verifier is
+/// 4-bit, so it drives the same MLX quantized matmul at a group size the
+/// census does not pin.
+const DFLASH2_PAIR: Pair = Pair {
+    verifier: common::GoldenModel {
+        slug: "mlx-community__Qwen3.8-27B-4bit",
+        archs: &[
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ],
+    },
+    drafter: DrafterSource::Named,
+    round_loop: RoundLoop::DFlash2,
+};
+
 /// Draft-model override, the variable the sibling alignment suites take.
 const DRAFT_MODEL_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 
@@ -1324,33 +1377,67 @@ const DRAFT_MODEL_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 ///
 /// A path the operator named that is not a snapshot fails; a models root that
 /// simply does not hold the slug skips. That split is the harness's
-/// (`tests/common/mod.rs`), not a second copy of its rules.
+/// (`tests/common/mod.rs`), and the outcomes here match it.
+///
+/// It cannot go **through** the harness, though: `common::slug_snapshot`
+/// requires a `tokenizer.json`, and a drafter sidecar does not ship one — it
+/// runs against the verifier's, which is the tokenizer both arms are compared
+/// under. Routing a drafter through it made a pair stand down on a machine
+/// holding both halves of it, which is a green run that asserted nothing.
 fn resolve(var: &str, slug: &str) -> common::Gate {
-    let root = std::env::var(common::MODELS_ROOT_VAR).ok();
     let Some(named) = std::env::var(var).ok().filter(|v| !v.is_empty()) else {
-        return match common::slug_snapshot(root.as_deref(), slug) {
-            common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
-            // The harness names its own override variable in that message; this
-            // half of the pair is overridden by a different one.
-            common::Snapshot::Absent(why) => {
-                common::Gate::Skip(why.replace(common::SINGLE_MODEL_VAR, var))
-            }
-            common::Snapshot::Misconfigured(why) => common::Gate::Fail(why),
+        let Some(root) = std::env::var(common::MODELS_ROOT_VAR)
+            .ok()
+            .filter(|r| !r.is_empty())
+        else {
+            return common::Gate::Skip(format!(
+                "no drafter configured — set {} (holding {slug}) or {var}",
+                common::MODELS_ROOT_VAR
+            ));
+        };
+        if !Path::new(&root).is_dir() {
+            return common::Gate::Fail(format!(
+                "{}={root} is not an existing directory",
+                common::MODELS_ROOT_VAR
+            ));
+        }
+        let path = Path::new(&root).join(slug);
+        return match drafter_snapshot(&path) {
+            Ok(()) => common::Gate::Run { path, note: None },
+            Err(why) => common::Gate::Skip(format!(
+                "{}={root} does not hold a runnable {slug}: {why}; put the snapshot, or \
+                 a symlink to it, there",
+                common::MODELS_ROOT_VAR
+            )),
         };
     };
-    let named_path = PathBuf::from(&named);
-    let (parent, leaf) = match (named_path.parent(), named_path.file_name()) {
-        (Some(parent), Some(leaf)) => (parent.to_owned(), leaf.to_string_lossy().into_owned()),
-        _ => return common::Gate::Fail(format!("{var}={named} is not a directory path")),
-    };
-    match common::slug_snapshot(parent.to_str(), &leaf) {
-        common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
-        // The operator named this path, so a typo or a moved snapshot breaks
-        // the run rather than skipping it.
-        common::Snapshot::Absent(why) | common::Snapshot::Misconfigured(why) => {
-            common::Gate::Fail(format!("{var}={named}: {why}"))
-        }
+    let path = PathBuf::from(&named);
+    // The operator named this path, so a typo or a moved snapshot breaks the
+    // run rather than skipping it.
+    match drafter_snapshot(&path) {
+        Ok(()) => common::Gate::Run { path, note: None },
+        Err(why) => common::Gate::Fail(format!("{var}={named}: {why}")),
     }
+}
+
+/// Whether `path` is a drafter this gate can load, or what it is missing.
+///
+/// A drafter needs a `config.json` and weights behind an entrypoint
+/// `rmlx_loader::load_shard_index` accepts. It does **not** need a tokenizer:
+/// every drafter here embeds and scores through the verifier's own.
+fn drafter_snapshot(path: &Path) -> Result<(), String> {
+    if !path.join("config.json").is_file() {
+        return Err(format!("no config.json in {}", path.display()));
+    }
+    let entrypoints = ["model.safetensors.index.json", "model.safetensors"];
+    if !entrypoints.iter().any(|f| path.join(f).exists()) {
+        return Err(format!(
+            "no {} in {}",
+            entrypoints.join(" or "),
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `draft_path` is the dedicated Gemma4 assistant drafter snapshot.
@@ -1364,6 +1451,16 @@ fn is_gemma4_assistant(draft_path: &Path) -> bool {
         let arch_name = cfg["architectures"][0].as_str().unwrap_or_default();
         model_type == "gemma4_assistant" || arch_name.contains("Gemma4Assistant")
     })
+}
+
+/// The drafter kind a snapshot declares itself, by the serve layer's own rule.
+fn declared_kind(draft_path: &Path) -> Option<DraftKind> {
+    let cfg = draft_config(draft_path)?;
+    Declared::from_snapshot(
+        cfg["architectures"][0].as_str().unwrap_or_default(),
+        cfg["model_type"].as_str().unwrap_or_default(),
+    )
+    .kind()
 }
 
 fn draft_config(draft_path: &Path) -> Option<serde_json::Value> {
@@ -1645,6 +1742,7 @@ struct Loaded {
 enum Drafter {
     Assistant(Box<Gemma4AssistantDrafter>),
     Mtp(Box<MtpDrafter>),
+    DFlash2(Box<DFlash2Drafter>),
 }
 
 impl Loaded {
@@ -1690,6 +1788,26 @@ impl Loaded {
                     )
                     .expect("mtp speculative generate")
                 }
+                // The block the drafter was trained at, not the harness's: the
+                // whole point of a block drafter is the block, and this is the
+                // width its selector chain is defined over.
+                Drafter::DFlash2(drafter) => {
+                    let block = drafter.cfg.block_size;
+                    dflash2_generate_greedy(
+                        &self.verifier,
+                        drafter,
+                        &self.tokenizer,
+                        &ids,
+                        N_TOKENS,
+                        block,
+                        Some(rmlx_kv_quant::KvQuant::None),
+                        Some(MAX_CTX),
+                        &self.eos,
+                        &mut step,
+                        device,
+                    )
+                    .expect("dflash2 speculative generate")
+                }
             };
         }
         let (plain_ids, margins) =
@@ -1714,6 +1832,17 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
         )),
     };
     let draft_path = common::apply(draft_gate, test)?;
+    if let Some(want) = pair.round_loop.declares() {
+        let declared = declared_kind(&draft_path);
+        if declared != Some(want) {
+            eprintln!(
+                "SKIP {test}: {} declares {declared:?}, and this pair's loop drives a \
+                 {want} drafter",
+                draft_path.display()
+            );
+            return None;
+        }
+    }
     let model_path = common::model_for(&pair.verifier, test)?;
 
     let verifier =
@@ -1754,6 +1883,19 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
             }
             Drafter::Mtp(Box::new(
                 MtpDrafter::load(&draft_path, hidden, device).expect("load MTP sidecar"),
+            ))
+        }
+        RoundLoop::DFlash2 => {
+            if !verifier.needs_lin_caches() {
+                eprintln!(
+                    "SKIP {test}: {} carries no recurrent state, so it is not the \
+                     verifier this loop drives",
+                    model_path.display()
+                );
+                return None;
+            }
+            Drafter::DFlash2(Box::new(
+                DFlash2Drafter::load(&draft_path, hidden, device).expect("load DFlash 2 drafter"),
             ))
         }
     };
@@ -1839,6 +1981,20 @@ fn the_recurrent_round_loop_reproduces_plain_greedy() {
     run_gate(
         "the_recurrent_round_loop_reproduces_plain_greedy",
         &MTP_PAIR,
+    );
+}
+
+/// The block pair. Its drafter proposes a whole block at once and its selector
+/// re-picks every position of that block against the one before it, so a defect
+/// in either arrives as a rejected proposal — which the acceptance walk absorbs
+/// silently and this gate does not. The rollback is the recurrent one, driven
+/// at a wider block than any other pair here reaches.
+#[ignore]
+#[test]
+fn the_block_round_loop_reproduces_plain_greedy() {
+    run_gate(
+        "the_block_round_loop_reproduces_plain_greedy",
+        &DFLASH2_PAIR,
     );
 }
 

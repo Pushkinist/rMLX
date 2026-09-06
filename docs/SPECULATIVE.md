@@ -863,7 +863,7 @@ carry `draft_model` too (`docs/CLI.md` § Profiles), and runs the same way.
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
 | `--draft-model <PATH>` | directory | (none) | The drafter snapshot: a sidecar head or a smaller full model. Which one it is is read from its `config.json`. |
-| `--draft-kind <KIND>` | `mtp`, `dflash`, `eagle3`, `two_model` | (from the snapshot) | Names the kind for a snapshot whose `config.json` declares none. Requires `--draft-model`. Refused when it contradicts what the snapshot declares. |
+| `--draft-kind <KIND>` | `mtp`, `dflash`, `dflash2`, `eagle3`, `two_model` | (from the snapshot) | Names the kind for a snapshot whose `config.json` declares none. Requires `--draft-model`. Refused when it contradicts what the snapshot declares. |
 | `--draft-block-size <N>` | integer ≥ 2 | 5 | Round block: tokens the verifier scores per round, its own token included, so the drafter proposes one fewer. One meaning for every kind, and the `block_size` every `done` line and `decode_config` records. Refused below 2 at parse time. Upper-bounded by a sidecar's own `block_size`; an MTP sidecar config without that key takes the loader default of 3, which is what both shipped Qwen3.5-family sidecars do. |
 
 Environment variable fallbacks: `MLX_VLM_DRAFT_KIND` and
@@ -881,13 +881,17 @@ and `model_type` — both, because export tools set one or the other:
 | Declaration | Kind |
 |---|---|
 | `architectures[0]` contains `Eagle3` (`LlamaForCausalLMEagle3`, over `model_type = llama`) | `eagle3` |
-| `architectures[0]` contains `DFlash` (`DFlashDraftModel`, `DFlash2DraftModel`, over `model_type = qwen3`) | `dflash` |
+| `architectures[0]` contains `DFlash2` (`DFlash2DraftModel`, over `model_type = qwen3`) | `dflash2` |
+| `architectures[0]` contains `DFlash` (`DFlashDraftModel`, over `model_type = qwen3`) | `dflash` |
 | `model_type = gemma4_assistant` / `Gemma4Assistant*`, or `qwen3_5_mtp` on either field (the Qwen3.5-family sidecars ship no `architectures` at all) | `mtp` |
 | a registered generative architecture (`Gemma4ForConditionalGeneration`, `Qwen3_5ForConditionalGeneration`, …) | `two_model` — an inference from the registry, not a marker the snapshot carries |
 | anything else, a registered encoder (`JinaEmbeddingsV4Model`) included | none — `--draft-kind` is required, and is the only reason the flag exists |
 
-The order matters: DFlash and EAGLE-3 declare a plain family `model_type`
-under their own architecture name, so the architecture is read first. A flag
+The order matters twice over. DFlash and EAGLE-3 declare a plain family
+`model_type` under their own architecture name, so the architecture is read
+first; and `DFlash2DraftModel` contains `DFlash`, so the generations are read
+newest first — the older marker read first would make every DFlash 2 snapshot
+a DFlash 1 one, and neither loader can build the other's checkpoint. A flag
 that contradicts a sidecar marker is refused at load with both sides named
 (`engine::speculative::decide_draft_kind`), because no loader can build a
 snapshot as a kind it is not and the tensor-name error it would die with later
@@ -1131,16 +1135,330 @@ faster: `loop_ms_per_round` is 14.6 ms of a 44.4 ms round at block 2 and 25.1 ms
 of a 63.4 ms round at block 3, a third to two fifths of the round in a residual
 that produces no tokens.
 
-**DFlash 2 on this verifier is refused at load, and the numbers below predate
-the refusal.** 23 of `z-lab/Qwen3.8-27B-DFlash2`'s tensors are weight families
-this loader has no code for — a candidate selector and per-layer two-tap dynamic
-convolutions. It used to build the earlier DFlash architecture out of the
-remainder and serve: 0.530 accept, 2.59 tokens/round, 0.91× on code at block 8.
-Those figures are this engine's DFlash drafter wearing the checkpoint's name, and
-`decode_config` records `dflash/block=8` either way, so a row of them cannot be
-told from a row of the real drafter afterwards. The loader now refuses, naming
-the count and the tensors. `z-lab/Qwen3.6-35B-A3B-DFlash` reads every tensor it
-ships and is unaffected.
+**One row already recorded against this checkpoint is not DFlash 2's.**
+`z-lab/Qwen3.8-27B-DFlash2` is its own drafter kind (`dflash2`) with its own
+loader: config, weights and shapes are read and validated, and 23 of its 81
+tensors — a candidate selector and per-layer two-tap dynamic convolutions — are
+weight families the DFlash 1 loader has no code for. That loader used to build
+the earlier architecture out of the remaining 58 and serve: 0.530 accept, 2.59
+tokens/round, 0.91× on code at block 8. Those figures are this engine's DFlash 1
+drafter wearing the checkpoint's name, and `decode_config` recorded
+`dflash/block=8` either way, so a row of them cannot be told from a row of the
+real drafter afterwards. **They are not a DFlash 2 measurement and must not be
+quoted as one.**
+
+#### DFlash 2 and the MTP sidecar on that verifier, measured
+
+Same harness, same three registered prompt classes, and a no-drafter arm
+measured in every invocation beside the speculative one it is divided by:
+`--kv-quant none`, `--max-ctx 8192`, temperature 0, seed 42, 128 max tokens, one
+warmup and three measured requests. Every speculative row carries
+`charged=false`.
+
+**TAINTED: the host was not idle.** CPU-only work belonging to another job ran
+concurrently for the whole forty-minute block, and the one-minute load average
+went from 2.67 at the start to 7.66 at the end. There was no GPU contention —
+the single-MLX claim was held throughout and never bypassed — so the taint is
+CPU scheduling around the GPU work, not two processes on the device.
+
+Four things say the ratios survive it, and they are worth more than the
+disclosure alone:
+
+* the no-drafter arm, which every ratio in the table is divided by, read
+  **32.10 to 32.47 t/s across all twelve invocations** — a 1.15% spread over the
+  whole block, so the denominator did not drift as the load climbed;
+* the ABBA repeats on the code column agree to under 1% (below);
+* the engine's own decode window and the client's reading of the same window
+  came back at **0.0%** apart on every arm;
+* thermal state showed no thermal or performance warning at any sample.
+
+That last one is the weakest leg and should be read as such: it was sampled with
+`pmset -g therm`, not `powermetrics`, which needs an interactive sudo that was
+not available. `pmset` reports the scheduler's advertised limits rather than the
+package's actual residency, so it can miss a throttle that `powermetrics` would
+show. A quiet reading from it is weaker evidence than a quiet reading from the
+instrument this project normally uses.
+
+**These figures are good enough to steer optimisation work by and are not clean
+enough to publish.** What they establish — which block is faster, where the round
+goes, which drafter wins on code — rests on ratios against a denominator measured
+in the same invocation, and on the code column also on an ABBA repeat, and that
+is what an optimisation round needs. An absolute throughput number quoted outside
+this document has neither protection, and the two columns that are single pairs
+have only the first. They will be re-taken on a genuinely idle host once the
+optimisation rounds are done, and this paragraph comes out then.
+
+| Drafter | Block | Prompt | Accept rate | tokens/round | Decode vs no drafter |
+|---|---|---|---|---|---|
+| DFlash 2 | 5 | code | 0.981 | 4.88 | **1.93×** |
+| DFlash 2 | 5 | structured | 0.824 | 4.23 | **1.54×** |
+| DFlash 2 | 5 | prose | 0.515 | 3.02 | 0.94× |
+| DFlash 2 | 8 | code | 0.865 | 7.06 | **1.85×** |
+| DFlash 2 | 8 | structured | 0.682 | 5.52 | **1.38×** |
+| DFlash 2 | 8 | prose | 0.405 | 3.74 | 0.87× |
+| MTP-4bit | 3 | code | 0.576 | 2.15 | 1.14× |
+| MTP-4bit | 3 | structured | 0.676 | 2.35 | 1.32× |
+| MTP-4bit | 3 | prose | 0.477 | 1.95 | 0.97× |
+
+The MTP rows reproduce the block-3 rows of the table above — same accept rate to
+three places, same tokens per round — which is what makes them usable as the
+comparison arm rather than a second, differently taken reading.
+
+**Every accept rate here is conditional on MLX's tie-break, and nothing else
+would show it moving.** The selector keeps `selector_top_k` candidates per block
+position with `argpartition`, and over a 248 320-token vocabulary a bf16 head
+ties at the k-th place at nearly every position — so which sixteen tokens are
+considered is decided by an order MLX does not specify. Measured on the pinned
+build the tie goes to the higher token id (`argsort` keeps the same set,
+differing only in the order within the slice, so this is not a choice between
+those two primitives). That set is an input to the accept rate and to nothing
+else: greedy acceptance emits the verifier's own argmax whatever was proposed, so
+a build whose partition broke ties the other way would move every figure in this
+table and change no answer.
+`a_tie_at_the_candidate_boundary_breaks_toward_the_higher_token_id` pins it, on
+the CPU kernel — production drafts on Metal, whose partition is a different
+implementation of the same unspecified contract.
+
+**The comparison is not at equal depth and cannot be.** `MtpDrafter::block_size`
+is the sidecar's own `config.json` value (3 here) and the MTP round loop clamps
+`block_total` to it, so `--draft-block-size 8` against that sidecar runs at 3 and
+records `mtp/block=3`. The published comparison's "same 7 drafts" arm has no
+counterpart on this checkpoint; each drafter is shown at the depth it can run.
+
+**Nor is it the same measurement as the published one, even where the drafter is
+the same.** The third-party acceptance figures this checkpoint is known by were
+taken under the reference's sampled arm — rejection sampling restricted to the
+selector's own candidate set — and this port implements greedy acceptance only
+(below). Acceptance under a candidate-restricted rejection rule and acceptance
+under an exact-match greedy walk are different quantities: the first accepts a
+draft the target merely finds probable enough, the second only one the target
+would itself have chosen. Reading a row here against a published number compares
+two acceptance rules, not two engines, and the same drafter can rank differently
+under each.
+
+**The code column is ABBA-paired; the structured one is not.** The code column
+was taken DFlash 2 → MTP → MTP → DFlash 2, and the two DFlash 2 readings agree
+to 0.8% as do the two MTP ones, so its ranking is not this host's slot drift —
+which on a host under load (above) is the thing that most needed ruling out. The
+structured class was taken as a **single pair**, one invocation each, so its
+1.54×-against-1.32× margin has no such control behind it and is the weakest leg
+of the drafter comparison. It is reported because it is what was measured, not
+because it carries the code column's weight.
+
+None of it is run-to-run variation in the *acceptance* figures: at temperature 0
+the token stream repeats exactly, so accept rate, round count and tokens per
+round come back identical to the digit and only the timing moves. That is also
+where the host taint does and does not reach. `Accept rate` and `tokens/round`
+are counts off a deterministic token stream and are untainted. Every millisecond
+below, and the decode ratios built from them, are wall clock taken under load —
+divided by a denominator from the same invocation, which is what makes the
+comparisons usable, and not by anything that makes an absolute figure clean.
+
+**Block 8 is the trained block; block 5 is the faster one**, which is what
+z-lab's own MLX guidance says (`block_size <= 5` against a quantized target and
+draft). Acceptance is per chain, so a shorter chain has a larger accepted
+fraction — 0.981 against 0.865 on code — and leaves less to roll back:
+`loop_ms_per_round` is 3.0 ms at block 5 against 11.7 ms at block 8 on the same
+prompt. Block 8 still wins on tokens per round and still loses on throughput,
+because the round it buys them in is longer than the extra tokens pay for.
+
+Where the round goes, against the 31.1 ms per token of the no-drafter arm:
+
+| Block | draft ms | verify ms | loop ms | round ms | tokens/round |
+|---|---|---|---|---|---|
+| 3 (MTP) | 6.3 | 39.6 | 12.5 | 58.4 | 2.15 |
+| 5 (DFlash 2) | 19.5 | 56.2 | 3.0 | 78.7 | 4.88 |
+| 8 (DFlash 2) | 22.5 | 84.3 | 11.7 | 118.5 | 7.06 |
+
+Verify against block: two more positions cost 16.5 ms and three more cost
+27.3 ms, so a marginal verified position is 8.2–9.1 ms — **26–29% of a plain
+decode step** where the bandwidth roofline is nearer 4%. That is the ceiling
+every speculative arm on this machine meets, and this is a third drafter kind
+measuring it.
+
+**Those `draft ms` figures are upper bounds, and the sidecar's are less so.**
+Every row carries `charged=false`, which means each phase is timed but not
+forced, and this engine evaluates lazily. The verify forward produces two
+outputs: the logits, which the argmax reads back inside the verify span, and the
+conditioning capture, which hangs off the same forward and stays unevaluated
+until the next round's drafter call touches it — inside `draft ms`. Both sidecar
+loops have the same shape, but this drafter's capture is
+`len(target_layer_ids) = 5` times as wide as the MTP sidecar's single hidden, so
+the two columns are skewed by different amounts and the ratio between them
+overstates the gap. `RUST_LOG=rmlx::spec::phase=trace` forces each phase's work
+before its span closes and re-attributes the capture; those rows carry
+`charged=true` and describe a differently scheduled engine, which is why they are
+not these. Before optimising against this split, take it charged.
+
+Drafting costs 19.5–24.4 ms per round almost independently of block and of
+prompt, against the sidecar's 5.9–6.9 ms. Two costs the port does not pay down
+explain that floor: the forward re-projects the conditioning over as many rows as
+the drafter's window reaches back over (2047 here) every round rather than over
+the new rows only, and the drafter's 3.85 GB of bf16 weights are read every round.
+Removing the loop residual entirely — more than the remaining accepted-prefix
+replay work would do — takes the block-8 code round to 106.8 ms and 2.05×, and
+also bringing drafting to the sidecar's cost takes it to 90.6 ms and 2.42×. Both
+are computed from the rows above, not measured.
+
+**The loop-overhead work is not landed** — its first half is, the accepted-prefix
+replay fix is not. Every number in this section was taken in that state.
+
+Greedy losslessness holds through all of it: on the code prompt the plain arm,
+the block-5 arm and the block-8 arm return the same 429 characters under one
+sha256, and the structured prompt's two arms likewise.
+
+`rmlx_models::speculative::dflash2` binds every tensor at the shape the config
+predicts and refuses a snapshot carrying one it does not read, and
+`DFlash2Drafter::forward_hidden` runs the block through the stack — the
+conditioning projection, the two-tap dynamic convolution around each of the two
+sublayers, grouped-query attention over the conditioning window and the whole
+block, RoPE and the MLP — and returns the block's final hidden states. That
+forward is checked against the z-lab MLX reference
+(`dflash/model_mlx.py`) on both a synthetic scale model
+(`crates/rmlx-models/tests/fixtures/dflash2_scale`, to within one bf16 place)
+and the published weights (`tests/dflash2_loader.rs`, bit-identical).
+
+`DFlash2Drafter::select_chain` then turns those hidden states into one ordered
+draft chain: the `selector_top_k` highest-scoring tokens are kept at each block
+position, adjacent pairs are scored
+`S_t(a, b) = U_t(b) + <A(a) ⊙ H(h_t), B(b)>` against the two rank-256
+vocabulary codebooks, and the chain is traced left to right from the seed
+token. `U_t` is the **verifier's** LM head over the drafter's hidden states —
+4-bit on this pair — which the round loop passes in; the drafter has no head of
+its own. `H(h_t)` is the context gate: it enters the pairwise term as a Hadamard
+factor on the predecessor embedding, so the same token pair scores differently
+depending on what the block is about at that position.
+
+The chain is sequential but not synchronous. Position `t` needs the token chosen
+at `t - 1`, and that dependency is carried in a device array rather than a host
+integer: every gather, product and argmax is a lazy MLX op and the whole chain is
+read back once, after the last position. The reference does the same. This is
+where the DFlash 1 drafter differs — `greedy_block_tokens` evaluates and reads
+back the argmax at every block position, which is `block_size - 1` device
+synchronisations per round.
+
+The selector is checked against the same reference on the same two models
+(`selector_tests.rs` on the scale snapshot, `tests/dflash2_loader.rs` on the
+published weights), chain for chain, and separately against the score formula
+walked by hand in plain arithmetic. Each fixture's power is asserted rather than
+assumed: both cases trace a chain that differs from the per-position argmax of
+the logits and from the chain the pairwise term alone would trace, and the two
+anchors trace different chains, so a selector that returned the argmax, dropped
+the logits or ignored the seed fails rather than passing quietly.
+
+`dflash2_generate_greedy` drives them. It prefills the whole prompt through
+`forward_verify_capture_chunked`, keeping as many conditioning rows as the
+drafter's window reaches back over (2047 here) — the depth the reference
+conditions on, not the last prompt token alone — then per round drafts a block,
+scores the carry token and every proposal in one verify forward, accepts the
+agreed prefix through the shared `accept_prefix`, and rolls the caches back over
+the rest through the shared `rollback_round_caches`. The block is the one the
+drafter was trained at every round; only the token budget shortens it, so this
+loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
+
+**The prompt's capture is materialised whole and then mostly thrown away.**
+`forward_verify_capture_chunked` evaluates each chunk and concatenates every one
+of them before returning, so a prompt of `n` tokens allocates `n` rows at
+`len(target_layer_ids) * hidden_size` — 51.2 KiB each on the published pair, or
+about 1.6 GiB at a 32k prompt — and the trim then keeps the last 2047 of them.
+It is a transient peak at the prompt boundary, not a steady-state cost: the
+buffer the rounds carry is bounded by the drafter's window from the first trim
+onward. Bounding the peak means giving that seam a tail limit, and EAGLE-3 shares
+it and needs every row, so it is a two-caller parameter and not one this port
+added. It is not fixed and no figure in this document depends on it.
+
+It is **greedy**, like every other sidecar loop here. The reference's sampled arm
+accepts by rejection sampling restricted to the selector's own candidate set —
+a different acceptance rule from the full-vocabulary one the two-model loop
+implements — and `select_chain` traces a greedy chain and returns no candidate
+distribution to sample against. A request above temperature 0 is served greedily,
+which is what the serve layer already does for every sidecar.
+
+`--draft-kind dflash` over that snapshot is refused as a flag contradicting the
+declaration. `z-lab/Qwen3.6-35B-A3B-DFlash` is `dflash`, reads every tensor it
+ships, and is unaffected.
+
+The forward RoPEs its conditioning rows from position zero rather than from an
+absolute offset. It recomputes the conditioning K/V on every call instead of
+caching them across rounds, so all of one call's positions are rotated together
+and only the query-key difference reaches the attention scores; a uniform shift
+of every position is then not observable, which the reference's own answer
+confirms — it moves by one bf16 place between two offsets that are
+mathematically the same. **The round loop keeps that choice**: it carries the
+committed hidden states forward and lets the forward re-derive the conditioning
+K/V, where the reference carries a per-layer rotating K/V cache and feeds it only
+each round's new rows. The two are the same answer — the cached rows are a
+deterministic function of those hidden states — and adopting the cache would make
+cached rows carry their own absolute RoPE, losing the invariance and the proof
+that rests on it. The buffer is bounded by the drafter's window rather than
+accumulated: unbounded it would grow by 50 KiB per emitted token.
+
+Three scalars the reference applies to the drafter's logit path —
+`input_embedding_scale`, `output_multiplier`, `final_logit_softcapping` — are
+absent from this checkpoint, and the port applies none of them. A checkpoint that
+moved one off the reference's default would otherwise be drafted through a
+differently scaled head at no error, so the loader refuses one that does and
+accepts one that spells its defaults out. Unlike most refusals in that loader
+this one fires on a key that is *present*: an unread key is the failure a missing
+key cannot produce.
+
+**`is_causal` is the second such refusal**, and it is the one that class was
+found by. The mask this forward builds is unconditionally bidirectional; the
+reference branches on that flag and ands its block term with `key <= query` when
+it is set. The published checkpoint declares `false`, so a loader that parsed the
+key and consumed it nowhere was correct for the only checkpoint that exists and
+would have denoised a causal one the wrong way round — fluent proposals at an
+accept rate nothing downstream can attribute. `true` is refused rather than
+implemented: nothing ships it, and a numeric branch no checkpoint exercises is a
+second answer with no evidence behind it.
+
+**Every size the config supplies is bounded on both sides**, and the ones that
+are not obviously sizes are the ones this had to be worked through for. A
+`mask_token_id` outside the vocabulary is refused — every drafted position but
+the seed carries it, and a gather past the end of the verifier's embedding reads
+a clamped row rather than failing, which is the same silent-wrong shape as
+`is_causal` one field over. A `sliding_window` wider than an array axis is
+refused: past that the window arithmetic wraps negative and the conditioning trim
+slices from beyond its own end, returning no rows and no error.
+`selector_top_k` was already bounded against `vocab_size` on both sides.
+
+**`block_size` is capped at what one verify forward can score**, which is a
+tighter bound than the axis width and a truer one. A round calls
+`forward_verify_capture` once over the carry token and every proposal, and that
+pass is not chunked — it materialises one full-vocabulary logit row per position
+in a single Metal command buffer, and the loop needs all of them because it
+argmaxes every position to walk the acceptance. `forward_verify_capture_chunked`
+exists because that stops working, and it buys its headroom by materialising the
+*last* position's logits only, which a verify pass cannot do. The number is the
+one that path already records as measured: a `[1, n, vocab]` logit tensor times
+the GPU out above roughly a thousand positions, and a 4096-position single shot
+exceeds the Metal watchdog on logits alone. So a checkpoint above the cap
+describes a round that cannot run rather than one that would be slow. Published
+blocks are single digits — this checkpoint declares 8 — so the ceiling has two
+orders of magnitude of headroom over anything that drafts.
+
+The cap is applied twice on purpose. The loader refuses a checkpoint that
+declares more, naming the field; the round loop clamps again, because
+`DFlash2Drafter` is a public struct with public fields and a drafter reaching
+that loop need not have come through the loader — the tests build one directly,
+and the block is what sizes the round's token buffer, its verify input and its
+selector chain.
+
+It is deliberately **not** a relation to `sliding_window`, even though the
+window's own refusal says the window "holds the block". A block longer than the
+window is degenerate but not wrong: the mask opens every block key regardless of
+the window, so a block position past it attends to the block alone, and the
+reference does the same — its `block` term carries no window either. Refusing
+that relationship would refuse a configuration this port runs correctly and the
+reference accepts, which is not what these refusals are for.
+
+The two generations also read their config from different places, which is why
+they do not share a loader: DFlash 1 carries `block_size` and `rope_theta` at
+the top level of `config.json`, DFlash 2 carries `block_size` under
+`dflash_config` (8) and its RoPE base under `rope_parameters` (1e7) and neither
+at the top level. The DFlash 2 loader defaults nothing — a key it needs and
+cannot find is a refusal naming the key, because a default is indistinguishable
+from the checkpoint's own value once a run is recorded.
 
 **That arm also did not reproduce its verifier's answer.** At temperature 0 on
 the code prompt it diverged from the no-drafter arm at the fourth token and
@@ -1148,10 +1466,14 @@ stayed diverged, where the MTP sidecar on the same verifier and prompt is
 byte-identical over 160 tokens. Greedy acceptance emits only the verifier's
 argmax, so no drafter — however badly it proposes, and whatever tensors it was
 built without — can change the answer; a changed answer is the round loop, and
-the DFlash loop is one of the three the answer-equivalence gate does not cover
-(`docs/SPEC_ANSWER_EQUIVALENCE.md` § What it runs). Reproducing it on this pair
-now means lifting the refusal; the Qwen3.6 DFlash drafter still loads and drives
-the same loop.
+the DFlash 1 loop is one of the three the answer-equivalence gate does not cover
+(`docs/SPEC_ANSWER_EQUIVALENCE.md` § What it runs). That arm cannot be
+reproduced on this pair at all now — the checkpoint declares itself `dflash2`
+and no longer reaches the DFlash 1 loader — so the loop is reproduced where it
+still runs: `z-lab/Qwen3.6-35B-A3B-DFlash` on its own verifier drives the same
+`dflash_generate_greedy`. **The observation is about DFlash 1, not this
+checkpoint**: the DFlash 2 loop on the same verifier is a pair in that gate and
+agrees with plain greedy on six of six prompts.
 
 ### Qwen3.6-35B-A3B-8bit — three drafters (GDN hybrid, MoE)
 

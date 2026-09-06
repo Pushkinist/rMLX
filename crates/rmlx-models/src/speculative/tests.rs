@@ -805,3 +805,56 @@ fn argmax_tokens_of_an_empty_block_reads_nothing() {
         Vec::<u32>::new()
     );
 }
+
+// --- unread_tensor_refusal ---
+
+/// A snapshot every tensor of which was read loads; one carrying tensors the
+/// loader has no code for is refused, naming them and naming the loader that
+/// refused.
+///
+/// Both directions, because the quiet direction is what keeps the check from
+/// decaying into noise a reader learns to skip. Mutation this fails on:
+/// `!consumed.contains(name)` -> `consumed.contains(name)`, which refuses the
+/// supported checkpoint and admits the unsupported one.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+fn a_snapshot_a_loader_only_half_reads_is_refused_and_a_whole_one_is_not() {
+    use std::collections::HashSet;
+
+    let read_by_the_loader = ["fc.weight", "hidden_norm.weight", "norm.weight"];
+    let consumed: HashSet<String> = read_by_the_loader.iter().map(|s| (*s).to_owned()).collect();
+
+    let whole: HashSet<String> = read_by_the_loader.iter().map(|s| (*s).to_owned()).collect();
+    assert!(
+        unread_tensor_refusal("DFlashDrafter", &whole, &consumed).is_ok(),
+        "a snapshot the loader reads entirely must load"
+    );
+
+    // A checkpoint generation newer than the loader: weight families it has no
+    // code for.
+    let mut partial = whole;
+    partial.insert("candidate_selector.successor_codebook".to_owned());
+    partial.insert("layers.0.attention_conv.base_kernel".to_owned());
+    let err = unread_tensor_refusal("DFlashDrafter", &partial, &consumed).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("DFlashDrafter"),
+        "the refusal must name the loader that issued it: {msg}"
+    );
+    assert!(
+        msg.contains('2'),
+        "refusal must count the unread tensors: {msg}"
+    );
+    assert!(
+        msg.contains("candidate_selector.successor_codebook")
+            && msg.contains("layers.0.attention_conv.base_kernel"),
+        "refusal must name the unread tensors: {msg}"
+    );
+    assert!(
+        !msg.contains("fc.weight"),
+        "a consumed tensor must not be reported unread: {msg}"
+    );
+}

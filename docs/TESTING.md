@@ -84,6 +84,16 @@ unpinned hit, so a clean pass is the evidence, not the absence of a pin.
 Point either at a different pair and re-measure both arms before reading a
 failure as a regression.
 
+`dflash2_loader.rs` takes no model variable at all: it resolves
+`z-lab__Qwen3.8-27B-DFlash2` by slug from `RMLX_O_MODELS_ROOT`, like
+`two_model_stochastic.rs`, so `make gpu-test` runs it wherever the snapshot is.
+It resolves the slug itself rather than through `tests/common`'s
+`slug_snapshot`, which requires a `tokenizer.json` a drafter sidecar does not
+ship and never will — routed through it, all three of its tests announced a
+skip on a machine holding the checkpoint. It loads weights and asserts names
+and shapes; it runs no forward and produces no shader-validation hit, so it has
+no entry in `scripts/gpu_validation_census.txt`.
+
 `spec_greedy_equivalence.rs` asks a different question from those three: not
 whether the round loop keeps the verifier's state consistent for a while, but
 whether the run produces the answer the verifier produces alone, over 256 tokens
@@ -97,10 +107,13 @@ thresholded at all.
 Unlike the three above, its **assistant pair resolves both halves by slug** from
 `RMLX_O_MODELS_ROOT`, so `make gpu-test` runs that pair on a machine holding the
 snapshots and `run_gpu_tests.sh` reports a machine without them as INCOMPLETE.
-The recurrent pair is the exception and is not gated: its drafter comes from
-`RMLX_DRAFT_TEST_MODEL` or the pair does not run, because its verifier's
-quantized matmul trips the shader-validation census (see the table below and
-`docs/SPEC_ANSWER_EQUIVALENCE.md`).
+The recurrent and block pairs are the exceptions and are not gated: their
+drafter comes from `RMLX_DRAFT_TEST_MODEL` or the pair does not run, because
+their verifiers' quantized matmuls trip the shader-validation census (see the
+table below and `docs/SPEC_ANSWER_EQUIVALENCE.md`). That one variable names one
+drafter, so the pair whose loop does not drive the kind that snapshot declares
+stands down naming both. Its drafter resolution does not go through
+`slug_snapshot` either, for the tokenizer reason above.
 The verifier goes through the golden harness's own resolver
 (`common::model_for`); `RMLX_DRAFT_TEST_MODEL` overrides the drafter. Both
 `-e2b-` and `-e4b-` assistant snapshots declare the same architecture, so the
