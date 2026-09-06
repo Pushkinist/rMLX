@@ -37,6 +37,8 @@ Conventions:
 | `check_no_kernel_input_eval.sh` | No blocking `Array::eval()` on a kernel input inside a dispatcher. |
 | `check_no_kernel_input_eval_fixtures.sh` | Recall test for the above. |
 | `check_no_scalar_f32_leak.sh` | No unguarded `scalar_f32(` in the metal-owning crates — the f32 decode-graph promotion class. |
+| `published_samples.py` | `verify`: the checked-in published-protocol sample sets (`prompts/published/`) re-derive from what the manifest records — every file's digest and byte length, the draw from its seed over the recorded pool, every sample's user message from its template and its verbatim upstream record, and every body digest from its messages. `--sources <dir>` adds the pinned upstream revision. `build` is the one producer of those files; both halves share the selector, the renderer and the digest, so a number's provenance cannot drift from the data it was measured on. |
+| `check_published_samples_fixtures.sh` | Recall test for the above — 18 synthetic sample-set roots, one edit each: a flipped byte, a truncated file, a wrong seed, an undrawn sample, a duplicated and a dropped one, a stale body digest, an edited prompt with every digest re-blessed, an upstream file off its pinned revision, a reordered pool, a missing source, and each way the manifest itself can be empty, short, unreadable, absent or of a schema this script does not read. Each asserts the reason as well as exit 1 vs exit 2. |
 | `metal_dirs.sh` | The list of directories holding gated `.metal` kernels. Sourced by the metal gates. |
 | `file_size_report.sh` | Advisory (non-failing) LOC report for source files >1000 lines. |
 | `target_size_report.sh` | Advisory (non-failing) `target/` size report. |

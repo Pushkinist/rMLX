@@ -97,6 +97,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest \
         canary-ab-host-gate-fixtures llama-ab-selftest spec-bench-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
+        check-published-samples check-published-samples-fixtures \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
@@ -426,6 +427,14 @@ check-spec-metric-parity: ## CI gate: fail if the speculative metrics the engine
 check-spec-metric-parity-fixtures: ## CI gate: recall test for the above — one synthetic scan root per case, asserting the reason as well as the exit code
 	@bash scripts/check_spec_metric_parity_fixtures.sh
 
+.PHONY: check-published-samples
+check-published-samples: ## CI gate: fail if the checked-in published sample sets do not re-derive from their recorded seeds, digests and templates
+	@python3 scripts/published_samples.py verify
+
+.PHONY: check-published-samples-fixtures
+check-published-samples-fixtures: ## CI gate: recall test for the above — one synthetic sample-set root per case, asserting the reason as well as the exit code
+	@bash scripts/check_published_samples_fixtures.sh
+
 check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited in docs/ does not exist
 	@bash scripts/check_doc_source_citations.sh
 
@@ -485,6 +494,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kv_boundary_default_parity.sh
 	@bash scripts/check_spec_metric_parity.sh
 	@bash scripts/check_spec_metric_parity_fixtures.sh
+	@python3 scripts/published_samples.py verify
+	@bash scripts/check_published_samples_fixtures.sh
 	@bash scripts/check_doc_source_citations.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_eval_lock.sh
