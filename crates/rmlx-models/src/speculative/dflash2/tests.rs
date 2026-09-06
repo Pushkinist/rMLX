@@ -283,6 +283,14 @@ fn a_config_the_forward_could_not_honour_is_refused() {
             serde_json::json!(1),
             "selector_top_k",
         ),
+        // More candidates than the vocabulary holds: the partition the selector
+        // takes them with has no such rank to keep.
+        (
+            "dflash_config",
+            "selector_top_k",
+            serde_json::json!(248_321),
+            "selector_top_k",
+        ),
         // A KV head count that does not divide the query heads cannot be
         // repeated a whole number of times, and no tensor shape shows it.
         (

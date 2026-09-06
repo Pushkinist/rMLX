@@ -17,15 +17,16 @@
 //!
 //! # Status — document-the-truth (CLAUDE.md hard rule 7)
 //!
-//! **This module loads the checkpoint and runs its decoder stack; it does not
-//! yet draft.** Config parsing, weight binding and shape validation against
-//! `z-lab/Qwen3.8-27B-DFlash2` are wired and covered, and
-//! [`DFlash2Drafter::forward_hidden`] returns a block's final hidden states,
-//! checked against the z-lab MLX reference. The candidate selector that turns
-//! those hidden states into a chain, and the round loop that would drive it,
-//! are not implemented — so the serve layer still refuses a DFlash 2 draft
-//! snapshot before any weight is read rather than running one of the other
-//! loops under this checkpoint's name.
+//! **This module drafts one block; nothing drives it round after round yet.**
+//! Config parsing, weight binding and shape validation against
+//! `z-lab/Qwen3.8-27B-DFlash2` are wired and covered,
+//! [`DFlash2Drafter::forward_hidden`] returns a block's final hidden states, and
+//! [`DFlash2Drafter::select_chain`] turns those states and the verifier's
+//! logits over them into one ordered draft chain — both checked against the
+//! z-lab MLX reference. The round loop that would call them, verify the chain
+//! and roll the caches back is not implemented, so the serve layer still
+//! refuses a DFlash 2 draft snapshot before any weight is read rather than
+//! running one of the other loops under this checkpoint's name.
 //!
 //! # Why its own module and its own [`crate::DraftKind`]
 //!
@@ -46,6 +47,7 @@ use rmlx_mlx::{Array, Device};
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 
 mod forward;
+mod selector;
 
 /// The number of convolution sides a `base_kernel` carries: one kernel applied
 /// to the sublayer's normed input, one to the sublayer's output.
@@ -427,6 +429,14 @@ fn check_config(
             "DFlash2Drafter: dflash_config.selector_top_k is {}; the path selector \
              chooses between candidates and has nothing to choose from below two",
             cfg.selector_top_k
+        )));
+    }
+    if cfg.selector_top_k > cfg.vocab_size {
+        return Err(Error::Model(format!(
+            "DFlash2Drafter: dflash_config.selector_top_k is {}, more candidates \
+             than the vocabulary of {} holds; the selector's partition has no \
+             {}th-largest logit to keep",
+            cfg.selector_top_k, cfg.vocab_size, cfg.selector_top_k
         )));
     }
     if cfg.block_size < 2 {
