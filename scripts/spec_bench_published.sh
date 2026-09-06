@@ -57,6 +57,45 @@
 #                 MATH-500 4096 cell is a column beside that headline, not a
 #                 fourth dataset — averaging it in would give MATH-500 twice the
 #                 weight of the others.
+#   seed          left at the engine's default in every pass. The three passes
+#                 therefore replay one RNG stream, and the run-to-run range is a
+#                 reading of machine variance with the sampling held still —
+#                 which is the tighter estimator and the one that makes the
+#                 range band a statement about measurement stability. Varying it
+#                 per pass would fold sampling variance into a figure the
+#                 protocol presents as a stability check, and three passes
+#                 cannot separate the two. The claim is checked, not asserted:
+#                 `divergent_samples` counts the samples that did not generate
+#                 the same length in all three passes.
+#   fixed prompt  the protocol's second figure — autoregressive output speed,
+#                 input speed and resident memory on one prompt of a stated
+#                 length. Its token count belongs to the tokenizer as much as to
+#                 the bytes, so the body is FITTED against this checkpoint from
+#                 a checked-in corpus and a stated cut rule, on a preparation
+#                 server that measures nothing, and a target the corpus cannot
+#                 reach exactly is refused rather than rounded to. It is sent
+#                 once per pass, before the cells, so its prefill is cold. It is
+#                 not measured on a speculative arm at all: a rate a drafter
+#                 produced is not the autoregressive one.
+#   input speed   prompt tokens over TTFT, on that cold prompt cache.
+#   memory        the peak of `rmlx_process_phys_footprint_bytes` (the counter
+#                 docs/PROFILING.md §9 names) sampled at a fixed interval while
+#                 the fixed-prompt request is in flight, reported with the
+#                 interval — it is a gauge, so a sampled peak is a lower bound.
+#
+# WHAT IS RECORDED ALONGSIDE THE NUMBERS
+#
+#   binary        the file's sha256 AND the log-message literals the readings
+#                 are read off, checked before the first server starts. A digest
+#                 alone does not separate a build from the stale one a
+#                 stash-build-unstash cycle left in `target/` — both hash the
+#                 same because both are the same file.
+#   thermal       three readings per pass, from `pmset -g therm`. A throttled or
+#                 unreadable state taints the run, in the same taint field the
+#                 host-interference gate writes to. `powermetrics` is the
+#                 instantaneous counter and needs sudo, so it is not reachable
+#                 from a non-interactive run; what is used is stated in the
+#                 result rather than implied.
 #
 # THE SAMPLE SETS
 #
@@ -106,6 +145,15 @@ CELLS=(mt_bench:1024 math_500:1024 humaneval:1024 math_500:4096)
 # The budget the macro average is taken at — one cell per dataset. Every other
 # cell is a column beside the headline.
 MACRO_MAX_TOKENS=1024
+# The fixed-length prompt the protocol reports autoregressive output speed,
+# input speed and resident memory on. The count is a property of the tokenizer
+# as well as the bytes, so the body is fitted against the server rather than
+# checked in — see lib/published_fixed_prompt.py.
+FIXED_PROMPT_TOKENS=1355
+FIXED_PROMPT_CORPUS="${REPO_ROOT}/prompts/longctx_4k.json"
+# Resident memory is a gauge, so a peak can only be sampled. This interval is
+# recorded with the figure: what comes out is a lower bound on the true peak.
+MEMORY_POLL_MS=250
 
 # ── Flags ────────────────────────────────────────────────────────────────────
 
@@ -184,6 +232,15 @@ if [[ ! -x "${BINARY}" ]]; then
     echo "ERROR: binary not found at ${BINARY}. Run: make build-perf" >&2
     exit 1
 fi
+
+# Which binary this is, and whether it can write the events the readings come
+# off. A digest alone would not have caught the stash-build-unstash cycle that
+# once had an A/B compare a build against itself: both files hashed the same
+# because both were the same file.
+BINARY_IDENTITY="$(python3 "${REPO_ROOT}/scripts/lib/binary_identity.py" \
+    "${BINARY}" --arm "${ARM}")" || exit 1
+BINARY_SHA256="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["sha256"])' \
+    "${BINARY_IDENTITY}")"
 if [[ ! -d "${VERIFIER_MODEL}" ]]; then
     echo "ERROR: verifier snapshot not found: ${VERIFIER_MODEL}" >&2
     exit 1
@@ -285,11 +342,17 @@ REQUESTS_PER_PASS="$(wc -l < "${CELL_INDEX}" | tr -d ' ')"
 # measurement.
 WARMUP_PAYLOAD="${WORK}/payloads/warmup.json"
 
+# The fixed-length-prompt request is one more request in every pass, and it is
+# only sent on the plain arm — see the fitting block below for why.
+FIXED_REQUESTS=0
+[[ "${ARM}" == "plain" ]] && FIXED_REQUESTS=1
+REQUESTS_TOTAL=$((REQUESTS_PER_PASS + WARMUPS_PER_PASS + FIXED_REQUESTS))
+
 # One sampler-resolution event per request the engine actually sampled. A greedy
 # checkpoint resolves no sampler and writes none, so the reader is told to
 # expect none rather than deciding for itself.
 if [[ "${SAMPLED}" == "true" ]]; then
-    SAMPLER_EVENTS=$((REQUESTS_PER_PASS + WARMUPS_PER_PASS))
+    SAMPLER_EVENTS=${REQUESTS_TOTAL}
 else
     SAMPLER_EVENTS=0
 fi
@@ -328,6 +391,49 @@ host_window() {
     esac
 }
 
+# One thermal reading, as a bare state word.
+#
+# `sudo powermetrics` is the instantaneous counter and it needs a password, so
+# it cannot be sampled from a non-interactive run; `pmset -g therm` is what is
+# left and it is a different thing — the last thermal-pressure level the system
+# posted, which is a notification history and not a reading of this instant.
+# That distinction is the reason for four states rather than two:
+#
+#   nominal      a level was posted and the CPU is not being held back
+#   throttled=N  a level was posted and the CPU is capped at N%
+#   unrecorded   no level has been posted since boot. Nothing has throttled,
+#                which is not the same as having looked and seen nothing, so it
+#                is named separately and printed — it just does not taint, or
+#                every run on a healthy Mac would carry a taint and the field
+#                would stop meaning anything.
+#   unreadable   the tool is absent or failed. Nobody looked.
+thermal_sample() {
+    local raw limit
+    raw="$(pmset -g therm 2>/dev/null)" || { echo "unreadable"; return; }
+    limit="$(printf '%s\n' "${raw}" | awk -F'= *' '/CPU_Speed_Limit/ { print $2; exit }')"
+    if [[ -z "${limit}" ]]; then
+        echo "unrecorded"
+    elif (( limit < 100 )); then
+        echo "throttled=${limit}"
+    else
+        echo "nominal"
+    fi
+}
+
+THERMAL_READINGS=()
+
+# note_thermal <where> — sample, record, and taint on a state that says the
+# numbers taken around it were taken on a machine that was not at full speed,
+# or on nobody having looked.
+note_thermal() {
+    local state
+    state="$(thermal_sample)"
+    THERMAL_READINGS+=("$1 ${state}")
+    case "${state}" in
+    throttled=* | unreadable) note_taint "thermal $1: ${state}" ;;
+    esac
+}
+
 SAMPLES_LABEL="${SAMPLES_ROOT}"
 if $UNVERIFIED_SAMPLES; then
     SAMPLES_LABEL="${SAMPLES_LABEL} (UNVERIFIED, not recordable)"
@@ -342,6 +448,11 @@ echo "    passes     : ${PASSES}, ${WARMUPS_PER_PASS} untimed warmup each"
 echo "    range band : ${RANGE_REFUSAL_PCT}% of the mean"
 echo "    sampling   : the checkpoint's own; what it resolved to is read back"
 echo "                 from the engine and printed with the results"
+echo "    seed       : the request sends none, so all three passes replay one"
+echo "                 RNG stream and the range is machine variance"
+echo "    binary     : sha256:${BINARY_SHA256}"
+echo "    thermal    : pmset -g therm (powermetrics needs sudo, so it is not"
+echo "                 reachable from a non-interactive run)"
 echo ""
 
 if $SYNTHETIC_ARMS; then
@@ -376,21 +487,39 @@ send() {
         | python3 "${REPO_ROOT}/scripts/lib/sse_decode_window.py" > "$2"
 }
 
+# ── Resident memory ──────────────────────────────────────────────────────────
+#
+# `phys_footprint` is the counter the OOM killer and Activity Monitor use
+# (docs/PROFILING.md §9), and the server publishes it as a gauge. A gauge has no
+# peak, so the peak is sampled: what comes out is the largest value seen at the
+# poll interval, which is a lower bound on the true peak and is recorded with
+# the interval so it reads as one.
+poll_memory() {
+    local out="$1"
+    : > "${out}"
+    while :; do
+        curl -s --max-time 5 "http://127.0.0.1:${PORT}/metrics" \
+            | awk '/^rmlx_process_phys_footprint_bytes /{ print "phys", $2 }
+                   /^rmlx_process_rss_bytes /{ print "rss", $2 }' >> "${out}"
+        sleep "$(awk -v ms="${MEMORY_POLL_MS}" 'BEGIN { print ms / 1000 }')"
+    done
+}
+
 # ── Passes ───────────────────────────────────────────────────────────────────
 
 PASS_FILES=()
-HOST_WINDOWS=()
-
-for (( pass = 1; pass <= PASSES; pass++ )); do
-    echo "==> pass ${pass}/${PASSES}"
-    $SYNTHETIC_ARMS || preflight
-    snapshot_logs
-
-    SERVER_ARGS=(serve --model "${VERIFIER_MODEL}" --max-ctx "${MAX_CTX}" --port "${PORT}")
-    [[ -n "${KV_QUANT}" ]] && SERVER_ARGS+=(--kv-quant "${KV_QUANT}")
-    [[ -n "${DRAFTER_MODEL}" ]] && SERVER_ARGS+=(--draft-model "${DRAFTER_MODEL}")
-    [[ -n "${DRAFT_KIND}" ]] && SERVER_ARGS+=(--draft-kind "${DRAFT_KIND}")
-    [[ -n "${DRAFT_BLOCK_SIZE}" ]] && SERVER_ARGS+=(--draft-block-size "${DRAFT_BLOCK_SIZE}")
+# start_server <tag> — one verifier server, ready to serve, as SERVER_PID.
+#
+# Two callers: the preparation server the fixed prompt is fitted against, and
+# each pass. They must be the same server or the fit describes a different
+# engine than the one measured on it.
+start_server() {
+    local tag="$1"
+    local args=(serve --model "${VERIFIER_MODEL}" --max-ctx "${MAX_CTX}" --port "${PORT}")
+    [[ -n "${KV_QUANT}" ]] && args+=(--kv-quant "${KV_QUANT}")
+    [[ -n "${DRAFTER_MODEL}" ]] && args+=(--draft-model "${DRAFTER_MODEL}")
+    [[ -n "${DRAFT_KIND}" ]] && args+=(--draft-kind "${DRAFT_KIND}")
+    [[ -n "${DRAFT_BLOCK_SIZE}" ]] && args+=(--draft-block-size "${DRAFT_BLOCK_SIZE}")
 
     # The plain arm's per-request decode rate is the ITL aggregate the engine
     # writes at the end of each request, and that event is a debug one. The
@@ -400,18 +529,72 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
     RMLX_HOME="${RMLX_HOME}" \
     RMLX_LOG_CAP_MB=400 \
     RUST_LOG="info,rmlx_server::engine::arch_generator=debug" \
-        "${BINARY}" "${SERVER_ARGS[@]}" \
-        > "${WORK}/server_${pass}.txt" 2>&1 &
+        "${BINARY}" "${args[@]}" \
+        > "${WORK}/server_${tag}.txt" 2>&1 &
     SERVER_PID=$!
     echo "  [server] pid=${SERVER_PID}" >&2
 
     if ! wait_for_server; then
         kill "${SERVER_PID}" 2>/dev/null || true
-        tail -20 "${WORK}/server_${pass}.txt" >&2 || true
+        tail -20 "${WORK}/server_${tag}.txt" >&2 || true
+        return 1
+    fi
+}
+
+# ── The fixed-length prompt ──────────────────────────────────────────────────
+#
+# The protocol's second figure is autoregressive output speed, input speed and
+# resident memory on one prompt of a stated length, so this block does not run
+# on a speculative arm at all: a rate produced by a drafter is not the
+# autoregressive one, and publishing it under that name is the comparison the
+# whole harness exists to make honest.
+#
+# The body is FITTED, on a server of its own, before the passes. The fit probes
+# prefixes of the prompt it is converging on, so every one of them would leave
+# that prefix in the prompt cache — and the protocol's input speed is over a
+# cold one. A preparation server measures nothing and is thrown away.
+FIXED_PAYLOAD=""
+FIXED_RECORD=""
+if [[ "${ARM}" == "plain" ]]; then
+    echo "==> fitting the ${FIXED_PROMPT_TOKENS}-token prompt (preparation server)"
+    $SYNTHETIC_ARMS || preflight
+    if ! start_server fit; then exit 1; fi
+    FIXED_RECORD="${WORK}/fixed_fit.json"
+    FIXED_PAYLOAD="${WORK}/fixed_payload.json"
+    if ! python3 "${REPO_ROOT}/scripts/lib/published_fixed_prompt.py" \
+            --corpus "${FIXED_PROMPT_CORPUS}" \
+            --target "${FIXED_PROMPT_TOKENS}" \
+            --port "${PORT}" \
+            --model-id "${MODEL_ID}" \
+            --max-tokens "${MACRO_MAX_TOKENS}" \
+            --out "${FIXED_RECORD}" \
+            --payload "${FIXED_PAYLOAD}"; then
+        kill "${SERVER_PID}" 2>/dev/null || true
         exit 1
     fi
+    kill "${SERVER_PID}" 2>/dev/null || true
+    wait "${SERVER_PID}" 2>/dev/null || true
+    SERVER_PID=""
+    sleep 3
+    echo ""
+else
+    echo "==> the fixed-prompt block is not measured on a speculative arm:" \
+         "its figure is the autoregressive one"
+    echo ""
+fi
+
+HOST_WINDOWS=()
+FIXED_FILES=()
+
+for (( pass = 1; pass <= PASSES; pass++ )); do
+    echo "==> pass ${pass}/${PASSES}"
+    $SYNTHETIC_ARMS || preflight
+    snapshot_logs
+
+    if ! start_server "${pass}"; then exit 1; fi
 
     snapshot_ok "${WORK}/pass${pass}_a" || true
+    $SYNTHETIC_ARMS || note_thermal "pass ${pass} start"
     PASS_STARTED="$(date +%s)"
 
     for (( w = 0; w < WARMUPS_PER_PASS; w++ )); do
@@ -425,6 +608,25 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
 
     PASS_DIR="${WORK}/pass${pass}"
     mkdir -p "${PASS_DIR}"
+
+    # The fixed-length prompt, once per pass and before the cells, so its
+    # prefix is not in the prompt cache — the protocol's input speed is over a
+    # cold one, and the warmup's prompt is in no sample set and shares no prefix
+    # with this.
+    if [[ -n "${FIXED_PAYLOAD}" ]]; then
+        poll_memory "${PASS_DIR}/memory.txt" &
+        MEMORY_PID=$!
+        if ! send "${FIXED_PAYLOAD}" "${PASS_DIR}/fixed.kv"; then
+            kill "${MEMORY_PID}" 2>/dev/null || true
+            echo "ERROR: pass ${pass}: the fixed-prompt request failed" >&2
+            kill "${SERVER_PID}" 2>/dev/null || true
+            exit 1
+        fi
+        kill "${MEMORY_PID}" 2>/dev/null || true
+        wait "${MEMORY_PID}" 2>/dev/null || true
+        echo "  [fixed] done" >&2
+    fi
+
     PASS_INDEX="${PASS_DIR}/index.tsv"
     : > "${PASS_INDEX}"
     n=0
@@ -440,11 +642,15 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
             "${cell}" "${dataset}" "${max_tokens}" "${sample_id}" "${body_sha}" "${kv}" \
             >> "${PASS_INDEX}"
         n=$((n + 1))
+        if (( n == REQUESTS_PER_PASS / 2 )); then
+            $SYNTHETIC_ARMS || note_thermal "pass ${pass} mid"
+        fi
         if (( n % 25 == 0 )); then
             echo "  [pass ${pass}] ${n}/${REQUESTS_PER_PASS}" >&2
         fi
     done < "${CELL_INDEX}"
 
+    $SYNTHETIC_ARMS || note_thermal "pass ${pass} end"
     PASS_SECONDS=$(( $(date +%s) - PASS_STARTED ))
     snapshot_ok "${WORK}/pass${pass}_b" || true
     WINDOW="$(host_window "${WORK}/pass${pass}_a" "${WORK}/pass${pass}_b" "${PASS_SECONDS}")"
@@ -482,12 +688,41 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
 
     if ! python3 "${REPO_ROOT}/scripts/lib/published_run_log.py" "${PASS_LOG}" \
             --arm "${ARM}" \
-            --expect-total "$((REQUESTS_PER_PASS + WARMUPS_PER_PASS))" \
+            --expect-total "${REQUESTS_TOTAL}" \
             --last "${REQUESTS_PER_PASS}" \
             --expect-sampler-events "${SAMPLER_EVENTS}" \
             > "${PASS_DIR}/engine.json"; then
         echo "ERROR: pass ${pass}: no usable per-request record in ${PASS_LOG}" >&2
         exit 1
+    fi
+
+    # The fixed-prompt request is the one between the warmups and the cells, so
+    # it is the first row of a read that keeps one more than the cells. The same
+    # reader, over the same log, with the same checks — a second, looser parse
+    # of one log is how two numbers taken from it stop agreeing.
+    if [[ -n "${FIXED_PAYLOAD}" ]]; then
+        if ! python3 "${REPO_ROOT}/scripts/lib/published_run_log.py" "${PASS_LOG}" \
+                --arm "${ARM}" \
+                --expect-total "${REQUESTS_TOTAL}" \
+                --last "$((REQUESTS_PER_PASS + FIXED_REQUESTS))" \
+                --expect-sampler-events "${SAMPLER_EVENTS}" \
+                > "${PASS_DIR}/engine_with_fixed.json"; then
+            echo "ERROR: pass ${pass}: the fixed-prompt request has no record in" \
+                 "${PASS_LOG}" >&2
+            exit 1
+        fi
+        if ! python3 "${REPO_ROOT}/scripts/lib/published_fixed_run.py" \
+                --engine "${PASS_DIR}/engine_with_fixed.json" \
+                --client "${PASS_DIR}/fixed.kv" \
+                --memory "${PASS_DIR}/memory.txt" \
+                --fit "${FIXED_RECORD}" \
+                --pass-number "${pass}" \
+                --memory-poll-ms "${MEMORY_POLL_MS}" \
+                --cross-check-pct "${CROSS_CHECK_BAND_PCT}" \
+                > "${PASS_DIR}/fixed.json"; then
+            exit 1
+        fi
+        FIXED_FILES+=("${PASS_DIR}/fixed.json")
     fi
 
     if ! python3 "${REPO_ROOT}/scripts/lib/published_aggregate.py" pass \
@@ -527,11 +762,14 @@ WARMUPS_PER_PASS="${WARMUPS_PER_PASS}" PASSES="${PASSES}" \
 MACRO_MAX_TOKENS="${MACRO_MAX_TOKENS}" \
 UNVERIFIED_SAMPLES="${UNVERIFIED_SAMPLES}" \
 SAMPLES_ROOT="${SAMPLES_ROOT}" TAINT="${TAINT}" \
+BINARY_IDENTITY="${BINARY_IDENTITY}" \
 HOST_WINDOWS="$(printf '%s\n' "${HOST_WINDOWS[@]}")" \
+THERMAL_READINGS="$(printf '%s\n' ${THERMAL_READINGS[@]+"${THERMAL_READINGS[@]}"})" \
 python3 - > "${META}" <<'PY'
 import json, os
 
 synthetic = os.environ["SYNTHETIC_ARMS"] == "true"
+thermal = [r for r in os.environ["THERMAL_READINGS"].split("\n") if r]
 
 print(json.dumps({
     **json.loads(os.environ["RMLX_IDENTITY_JSON"]),
@@ -553,10 +791,29 @@ print(json.dumps({
         # null means the checkpoint is greedy and resolved no sampler.
         "sampling_resolved": json.loads(os.environ["SAMPLING_SEEN"]),
         "thinking": "on, counted as output",
+        # Stated because the protocol does not, and because it is what the
+        # run-to-run range means: the request sends no seed, the engine
+        # substitutes its fixed default and seeds one RNG per request from it,
+        # so the three passes replay one stream rather than sampling
+        # independently. Holding the sampling still is the tighter estimator —
+        # varying it would fold sampling variance into a figure presented as a
+        # stability check. `divergent_samples` per cell is the measured check on
+        # that claim.
+        "seed_policy": "engine default, identical in all three passes",
     },
+    # Which binary produced the numbers, and that it can write the events they
+    # were read off. Re-checked at ingest: a rebuild between the run and the
+    # record would leave the identity describing a different binary.
+    "binary": json.loads(os.environ["BINARY_IDENTITY"]),
     # A run that consulted nothing files no reading taken off this machine.
     "host": {
         "pass_windows": [] if synthetic else os.environ["HOST_WINDOWS"].split("\n"),
+        # Three points per pass — entry, midway and exit. `pmset -g therm` is
+        # the last level the system posted, not a reading of the instant;
+        # `powermetrics` is the instantaneous one and needs sudo, which a
+        # non-interactive run does not have.
+        "thermal": thermal,
+        "thermal_source": "pmset -g therm",
         "taint": os.environ["TAINT"],
     },
 }))
@@ -569,6 +826,7 @@ python3 "${REPO_ROOT}/scripts/lib/published_aggregate.py" report \
     --range-pct "${RANGE_REFUSAL_PCT}" \
     --macro-max-tokens "${MACRO_MAX_TOKENS}" \
     --meta "${META}" \
+    ${FIXED_FILES[0]+--fixed "${FIXED_FILES[@]}"} \
     --json "${RESULT}"
 REPORT_STATUS=$?
 set -e

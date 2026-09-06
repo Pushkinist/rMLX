@@ -8,6 +8,10 @@ Two subcommands, one row schema:
           window are present here, so this is where they are required to agree.
   report  read three pass files and emit the per-dataset and macro-average
           means with their run-to-run range, plus the table a human reads.
+          `--fixed` adds the fixed-length-prompt block: three runs of one
+          prompt, whose rates are refused on the same band and whose resident
+          figures are peaks — reported as the maximum over the three runs,
+          because a mean of three peaks is not a peak of anything.
 
 THE MACRO AVERAGE IS OVER DATASETS, AT ONE OUTPUT-TOKEN BUDGET.
 
@@ -27,6 +31,17 @@ percentage. A dataset mean whose range exceeds `--range-pct` is not a clean
 mean: the three passes measured three different things and averaging them
 publishes a number none of them produced. Such a cell is reported as unstable,
 its mean is withheld from the mean column, and `report` exits 3.
+
+WHAT THE RANGE IS A RANGE OF.
+
+The request sends no seed, so the engine substitutes its fixed default and
+seeds one RNG per request from it. Three passes of one sample are therefore the
+same generation replayed, and the run-to-run range is a reading of machine
+variance with the sampling held still — which is the tighter estimator, and the
+one that makes a 5% band a statement about measurement stability. That claim is
+checked rather than asserted: `divergent_samples` counts the samples that did
+not generate the same length in all three passes, and is reported, never
+refused.
 
 That bound is over PASS MEANS, each already a mean over 80-128 samples, so
 per-sample noise has divided by sqrt(n) before it is seen. A run where one
@@ -233,6 +248,25 @@ def mean_of(rows, key):
     return statistics.fmean(present) if present else None
 
 
+def divergent_samples(per_pass):
+    """How many samples in this cell did not generate the same length twice.
+
+    The request sends no seed, so the engine substitutes its fixed default and
+    seeds one RNG per request from it. Three passes of one sample are therefore
+    meant to be the same generation replayed, which is what makes the
+    run-to-run range a reading of machine variance rather than of sampling.
+    This counts the samples where that did not hold — a float tie flipped, and
+    the passes generated different text of different length. It is a measured
+    check on the claim, reported and never refused: the claim is about what the
+    range means, and a reader has to be told when it means something else.
+    """
+    by_sample = {}
+    for rows in per_pass:
+        for row in rows:
+            by_sample.setdefault(row["sample_id"], set()).add(row["completion_tokens"])
+    return sum(1 for lengths in by_sample.values() if len(lengths) > 1)
+
+
 def widest_sample_range(per_pass):
     """The widest across-pass range of any one sample in this cell, as a percent.
 
@@ -276,6 +310,71 @@ def macro_cell_per_dataset(cells, macro_max_tokens):
     return [found[0] for found in (by_dataset[d] for d in sorted(by_dataset))]
 
 
+# The fixed-prompt block's rate figures — the two the protocol publishes as
+# scores, and so the two the range band refuses. `ttft_ms` is what `prefill_tps`
+# is derived from, so refusing the rate already covers it.
+FIXED_RATES = ("decode_tps", "prefill_tps")
+# Peaks, not scores. A peak over three runs is their maximum; a mean of three
+# peaks is not a peak of anything, and a range band over a resident figure would
+# refuse an allocator's ordinary behaviour.
+FIXED_PEAKS = ("phys_footprint_bytes", "rss_bytes")
+FIXED_REPORTED = ("ttft_ms", "completion_tokens")
+
+
+def fixed_block(paths, range_pct):
+    """The fixed-length-prompt block: three runs of one prompt, summarised.
+
+    The three runs must have measured one prompt, so the body's content address
+    and the token count the server gave it have to agree across them, and that
+    count has to be the target the protocol names. A block assembled out of
+    three different prompts would still produce a mean.
+    """
+    runs = []
+    for path in paths:
+        with open(path, encoding="utf-8") as handle:
+            runs.append(json.load(handle))
+    if len(runs) != 3:
+        raise InputError(
+            f"the fixed-prompt block was given {len(runs)} runs; the protocol "
+            "reports the mean of three consecutive runs"
+        )
+    for field in ("body_sha256", "prompt_tokens", "target_tokens", "max_tokens"):
+        seen = {r[field] for r in runs}
+        if len(seen) != 1:
+            raise InputError(
+                f"the fixed-prompt runs disagree on {field} ({sorted(seen)}); "
+                "they did not measure one prompt"
+            )
+    first = runs[0]
+    if first["prompt_tokens"] != first["target_tokens"]:
+        raise InputError(
+            f"the fixed prompt tokenized to {first['prompt_tokens']} tokens where "
+            f"the protocol names {first['target_tokens']}; a figure published "
+            "under the target's name would be a figure measured on another prompt"
+        )
+
+    block = {
+        "prompt_tokens": first["prompt_tokens"],
+        "target_tokens": first["target_tokens"],
+        "max_tokens": first["max_tokens"],
+        "body_sha256": first["body_sha256"],
+        "corpus": first["corpus"],
+        "corpus_sha256": first["corpus_sha256"],
+        "memory_poll_ms": first["memory_poll_ms"],
+    }
+    for name in FIXED_RATES:
+        block[name] = summarise([r[name] for r in runs], range_pct)
+    for name in FIXED_REPORTED:
+        entry = summarise([r[name] for r in runs], range_pct)
+        # Reported with its spread, never refused: it is not a published score.
+        entry.pop("stable")
+        block[name] = entry
+    for name in FIXED_PEAKS:
+        values = [r[name] for r in runs]
+        block[name] = {"run_values": values, "max": max(values), "min": min(values)}
+    return block
+
+
 def cmd_report(args):
     passes = []
     for path in args.passes:
@@ -312,6 +411,7 @@ def cmd_report(args):
         entry["prompt_tokens_mean"] = mean_of(flat, "prompt_tokens")
         entry["completion_tokens_mean"] = mean_of(flat, "completion_tokens")
         entry["sample_range_pct_max"] = widest_sample_range(per_pass)
+        entry["divergent_samples"] = divergent_samples(per_pass)
         for figure in ROUND_FIGURES:
             value = mean_of(flat, figure)
             if value is not None:
@@ -361,13 +461,19 @@ def cmd_report(args):
         if name in passes[0]:
             result[name] = passes[0][name]
 
+    stable = all(c["stable"] for c in cells.values())
+    if args.fixed:
+        block = fixed_block(args.fixed, args.range_pct)
+        result["fixed_prompt"] = block
+        stable = stable and all(block[name]["stable"] for name in FIXED_RATES)
+
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump(result, handle, indent=1)
             handle.write("\n")
 
     print_table(result, args.range_pct)
-    return 0 if all(c["stable"] for c in cells.values()) else 3
+    return 0 if stable else 3
 
 
 def mean_column(entry):
@@ -426,7 +532,44 @@ def print_table(result, range_pct):
         "across-pass range of any one sample, reported and never refused."
     )
 
+    diverged = sum(c["divergent_samples"] for c in result["cells"].values())
+    total = sum(c["samples"] for c in result["cells"].values())
+    if diverged:
+        print(
+            f"  {diverged} of {total} samples generated a different length across "
+            "the passes, so for those the range carries sampling variance too."
+        )
+    else:
+        print(
+            f"  all {total} samples generated the same length in all three passes, "
+            "so the range is machine variance and not sampling variance."
+        )
+
+    block = result.get("fixed_prompt")
+    if block:
+        print()
+        print(
+            f"  FIXED PROMPT — {block['prompt_tokens']} tokens, plain decode, "
+            f"{block['max_tokens']} output budget, three runs"
+        )
+        for name, unit in (("decode_tps", "tok/s out"), ("prefill_tps", "tok/s in")):
+            entry = block[name]
+            print(
+                f"    {unit:<10} {mean_column(entry):>10}   range "
+                f"{entry['range_pct']:.2f}%   runs "
+                + " ".join(f"{v:.2f}" for v in entry["pass_means"])
+            )
+        for name in FIXED_PEAKS:
+            peak = block[name]
+            print(
+                f"    {name:<10} {peak['max'] / 1e6:>10.1f} MB peak over the three "
+                "runs, sampled every " + f"{block['memory_poll_ms']} ms"
+            )
+
     refused = [n for n, c in result["cells"].items() if not c["stable"]]
+    refused += [
+        f"fixed_prompt/{n}" for n in FIXED_RATES if block and not block[n]["stable"]
+    ]
     if refused:
         print()
         print(
@@ -465,6 +608,13 @@ def main():
         help="the output-token budget the macro average is taken at",
     )
     r.add_argument("--json", default=None, help="write the full result here")
+    r.add_argument(
+        "--fixed",
+        nargs="+",
+        default=None,
+        metavar="RUN.json",
+        help="the three fixed-length-prompt runs, one per pass",
+    )
     r.add_argument(
         "--meta",
         default=None,
