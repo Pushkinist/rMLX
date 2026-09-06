@@ -183,10 +183,12 @@ def bound_for(rows: dict[int, dict], where: str, ctxs: tuple[int, int, int],
 # ── rendering helpers ─────────────────────────────────────────────────────────
 
 
-def pct(measured: float | None, bound: float | None) -> str:
-    if measured is None or not bound:
+def ratio_pct(part: float | None, whole: float | None) -> str:
+    """`part` as a percent of `whole`. Used both ways round: a rate against the
+    ceiling it cannot pass, and a floor against the resident peak it sits under."""
+    if part is None or not whole:
         return "—"
-    return f"{measured / bound * 100:.1f}%"
+    return f"{part / whole * 100:.1f}%"
 
 
 def gb(value: float | None) -> str:
@@ -354,7 +356,7 @@ def decode_table(results: list[dict], bounds: dict, plain: dict | None) -> list[
                 f"| `{name}` | `{arm_label(result)}` | {entry['samples']} "
                 f"| {entry['max_tokens']} | {rate_cell(entry)} "
                 f"| {entry['range_pct']:.2f} | {bound['ceiling_tps']:.2f} "
-                f"| {pct(value, bound['ceiling_tps'])} | {speedup} "
+                f"| {ratio_pct(value, bound['ceiling_tps'])} | {speedup} "
                 f"| {bound['ctx']} | {entry['sample_range_pct_max']:.1f} "
                 f"| {entry['divergent_samples']} of {entry['samples']} |"
             )
@@ -371,7 +373,7 @@ def decode_table(results: list[dict], bounds: dict, plain: dict | None) -> list[
             f"| **MACRO** | `{arm_label(result)}` | {len(names)} cells "
             f"| {macro['max_tokens']} | {rate_cell(macro)} "
             f"| {macro['range_pct']:.2f} | {macro_bound:.2f} "
-            f"| {pct(value, macro_bound)} | {speedup} | — | — | — |"
+            f"| {ratio_pct(value, macro_bound)} | {speedup} | — | — | — |"
         )
     out += [
         "",
@@ -444,16 +446,16 @@ def fixed_table(result: dict, bound: dict) -> list[str]:
         "|---|---:|---:|---:|",
         f"| output speed (tok/s) | {rate_cell(block['decode_tps'])} "
         f"| {bound['ceiling_tps']:.2f} "
-        f"| {pct(measured_rate(block['decode_tps']), bound['ceiling_tps'])} |",
+        f"| {ratio_pct(measured_rate(block['decode_tps']), bound['ceiling_tps'])} |",
         f"| input speed (tok/s) | {rate_cell(block['prefill_tps'])} "
         f"| {'—' if not prefill_bound else f'{prefill_bound:.0f}'} "
-        f"| {pct(measured_rate(block['prefill_tps']), prefill_bound)} |",
+        f"| {ratio_pct(measured_rate(block['prefill_tps']), prefill_bound)} |",
         f"| peak `phys_footprint` (GB) | {gb(footprint)} "
         f"| {gb(bound['resident_floor_bytes'])} "
-        f"| {pct(bound['resident_floor_bytes'], footprint)} |",
+        f"| {ratio_pct(bound['resident_floor_bytes'], footprint)} |",
         f"| peak RSS (GB) | {gb(block['rss_bytes']['max'])} "
         f"| {gb(bound['resident_floor_bytes'])} "
-        f"| {pct(bound['resident_floor_bytes'], block['rss_bytes']['max'])} |",
+        f"| {ratio_pct(bound['resident_floor_bytes'], block['rss_bytes']['max'])} |",
         "",
         "The two resident rows read the other way round — their bound is a",
         "**floor**, so the last column is how much of what the process held is",
