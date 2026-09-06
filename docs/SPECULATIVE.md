@@ -338,7 +338,7 @@ Status: **fully wired + live-validated** against two pairs — the MoE sidecar
 and the dense sidecar `mlx-community/Qwen3.8-27B-MTP-mxfp8` +
 `mlx-community/Qwen3.8-27B-mxfp8`. `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs`
 gates both the FFN-shape probe and the greedy-tracking property. The round-loop
-(`mtp_generate_greedy`) mirrors the DFlash loop structurally: verifier prefill →
+(`mtp_generate`) mirrors the DFlash loop structurally: verifier prefill →
 round-0 penultimate-hidden + first-bonus capture → per-round autoregressive
 `draft_n` (RoPE offset = sidecar `_next_position` = verifier prefix length +
 appended count) → one combined verify forward → `accept_prefix` walk over the
@@ -381,7 +381,7 @@ this — `speculative::rollback_round_caches`. It owns the whole rollback: the
 full-attention `truncate_to` loop, the GDN snapshot restore, and the replay.
 A full-attention arch (`lin` absent or empty) takes its short arm and truncates
 straight to the target; a GDN hybrid takes the replay arm. Its seven callers are
-`mtp_generate_greedy`, `dflash_generate_greedy`, `eagle3_generate_greedy`, and
+`mtp_generate`, `dflash_generate`, `eagle3_generate`, and
 the classic two-model loop's four (verifier + drafter, greedy + stochastic).
 There is deliberately no second copy: the defect below lived in four independent
 implementations at once, and a rollback inlined per loop is how it got there.
@@ -743,7 +743,7 @@ Per draft step:
    `vocab_per_centroid` candidate token embeddings for each, compute logits by
    inner product, and argmax.
 
-The round-loop (`mtp_assistant_generate_greedy`) seeds the drafter using the
+The round-loop (`mtp_assistant_generate`) seeds the drafter using the
 verifier's **normed trunk hidden** (`apply_final_norm(hidden_raw)`) at the
 accepted position, obtained via `forward_hidden_states_shared_kv`. On partial
 accept, the verifier KV caches are truncated to the valid prefix length;
@@ -1346,7 +1346,7 @@ the logits and from the chain the pairwise term alone would trace, and the two
 anchors trace different chains, so a selector that returned the argmax, dropped
 the logits or ignored the seed fails rather than passing quietly.
 
-`dflash2_generate_greedy` drives them. It prefills the whole prompt through
+`dflash2_generate` drives them. It prefills the whole prompt through
 `forward_verify_capture_chunked`, keeping as many conditioning rows as the
 drafter's window reaches back over (2047 here) — the depth the reference
 conditions on, not the last prompt token alone — then per round drafts a block,
@@ -1471,7 +1471,7 @@ the DFlash 1 loop is one of the three the answer-equivalence gate does not cover
 reproduced on this pair at all now — the checkpoint declares itself `dflash2`
 and no longer reaches the DFlash 1 loader — so the loop is reproduced where it
 still runs: `z-lab/Qwen3.6-35B-A3B-DFlash` on its own verifier drives the same
-`dflash_generate_greedy`. **The observation is about DFlash 1, not this
+`dflash_generate`. **The observation is about DFlash 1, not this
 checkpoint**: the DFlash 2 loop on the same verifier is a pair in that gate and
 agrees with plain greedy on six of six prompts.
 
@@ -1575,7 +1575,7 @@ Four things those say:
   the key is absent. Any request above 3 is silently the same run. Block 2 and
   block 3 are the only two settings those pairs have, and 2 measured faster than
   3 on all three prompt classes for Qwen3.8-27B at both weight formats. The `block_size` field on the
-  `mtp_generate_greedy: done` line reports the value actually used.
+  `mtp_generate: done` line reports the value actually used.
 - **The step cost the round loop pays is 1.39× a plain step at block 2 and 1.89×
   at block 3** on Qwen3.8-27B-4bit, against 32.47 / 32.54 t/s no-drafter and
   39.70 / 37.00 t/s with the sidecar. The split above says where the growth goes:
@@ -1585,8 +1585,8 @@ Four things those say:
   class measured**, DFlash by 3-22% and EAGLE-3 by 26-39%. Both run correctly and
   accept real tokens; neither clears its own round-loop overhead.
 - **Two distinct MTP paths**: the Gemma4 assistant shared-K/V path
-  (`mtp_assistant_generate_greedy`) and the Qwen3.5-family sidecar path
-  (`mtp_generate_greedy` / `MtpDrafter`). The Gemma4 arm is full-attention and
+  (`mtp_assistant_generate`) and the Qwen3.5-family sidecar path
+  (`mtp_generate` / `MtpDrafter`). The Gemma4 arm is full-attention and
   never touches the GDN rollback.
 - **The `fcs` per-aux norms help EAGLE-3, but modestly.** With `fcs` active
   (Dogacel speculators-format checkpoint) the rate is 0.263-0.362 against

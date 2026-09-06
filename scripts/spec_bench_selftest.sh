@@ -149,7 +149,7 @@ def done_line():
     # `EMITTED - SEED_EMITTED`.
     round_emitted = int(os.environ.get("STUB_EMITTED_IN_ROUNDS", EMITTED - 1))
     fields = {
-        "message": "mtp_generate_greedy: done",
+        "message": "mtp_generate: done",
         "rounds": ROUNDS,
         "emitted": EMITTED,
         "seed_emitted": SEED_EMITTED,

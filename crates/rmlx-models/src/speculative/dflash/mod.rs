@@ -33,7 +33,7 @@
 //! the drafter forward [`DFlashDrafter::draft_block`], the block-size schedule
 //! [`dflash_next_block_size`], the acceptance walk [`walk_block_greedy`], the
 //! [`DFlashRoundState`] GDN rollback, and the full round-loop
-//! [`dflash_generate_greedy`]. The three verifier-side seams are wired on
+//! [`dflash_generate`]. The three verifier-side seams are wired on
 //! [`crate::arch::Architecture`] for the Qwen3.6-MoE verifier:
 //!
 //! 1. **Multi-layer hidden capture** — [`Architecture::forward_verify_capture`]
@@ -649,7 +649,7 @@ use crate::decode_loop::ProbeStep;
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-pub fn dflash_generate_greedy(
+pub fn dflash_generate(
     verifier: &Architecture,
     drafter: &mut DFlashDrafter,
     tokenizer: &tokenizers::Tokenizer,
@@ -660,18 +660,19 @@ pub fn dflash_generate_greedy(
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
 ) -> Result<Vec<ProbeStep>> {
     use std::time::Instant;
 
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
-            "dflash_generate_greedy: prompt must have >=2 tokens".into(),
+            "dflash_generate: prompt must have >=2 tokens".into(),
         ));
     }
     if !verifier.needs_lin_caches() {
         return Err(Error::Model(
-            "dflash_generate_greedy: DFlash verifier must be the Qwen3.5/3.6-MoE \
+            "dflash_generate: DFlash verifier must be the Qwen3.5/3.6-MoE \
              hybrid (needs GDN lin_caches)"
                 .into(),
         ));
@@ -706,6 +707,8 @@ pub fn dflash_generate_greedy(
         .collect();
 
     drafter.reset();
+
+    let mut draw = super::VerifierDraw::new(sampler_cfg);
 
     // Diagnostics.
     let mut total_draft = 0usize;
@@ -748,11 +751,7 @@ pub fn dflash_generate_greedy(
     // context K/V derived deterministically from these same hiddens.
     super::guard_verifier_prefill_logits(verifier, &r0_logits, prompt_ids.len())?;
     let mut h_ctx_raw = r0_hidden;
-    let mut b = {
-        let am = argmax(&r0_logits, -1, device)?;
-        am.eval()?;
-        u32::from_le_bytes(am.to_bytes()?[..4].try_into().unwrap())
-    };
+    let mut b = draw.seed_token(&r0_logits, device)?;
     // Emit the first bonus.
     emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
     if eos_ids.contains(&b) {
@@ -785,7 +784,8 @@ pub fn dflash_generate_greedy(
         n_tokens,
         ?kv_quant,
         ?target_layer_ids,
-        "dflash_generate_greedy: starting (Qwen3.6-MoE verifier + DFlash drafter)"
+        temperature = sampler_cfg.temperature,
+        "dflash_generate: starting (Qwen3.6-MoE verifier + DFlash drafter)"
     );
 
     let seed_emitted = emitted.len();
@@ -828,13 +828,10 @@ pub fn dflash_generate_greedy(
             Some(&mut v_lin),
             device,
         )?;
-        let v_argmax = argmax(&v_logits, -1, device)?;
-        v_argmax.eval()?;
-        let vb = v_argmax.to_bytes()?;
+        let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
         verifier_ns += t0.elapsed().as_nanos();
-        let v_tokens = super::argmax_tokens(&vb, v_k)?;
 
-        // -- Phase C: greedy acceptance walk. --------------------------------
+        // -- Phase C: acceptance walk. ---------------------------------------
         let (accept, new_tokens) = walk_block_greedy(&draft_tokens, &v_tokens, remaining);
         total_accept += accept;
         recent.push((accept, draft_tokens.len()));

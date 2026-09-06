@@ -1,12 +1,11 @@
 //! The DFlash 2 round loop: draft a block, verify it, keep the agreed prefix.
 //!
-//! Ported from the z-lab MLX reference `_stream_generate` at
-//! `temperature == 0`. Verifier-side it is the shape every sidecar loop in this
-//! module family has — prefill, a bonus token out of the prefill forward, then
-//! rounds of draft / verify / accept / roll back — so it shares
-//! [`crate::speculative::accept_prefix`], `rollback_round_caches` and
-//! [`crate::speculative::argmax_tokens`] with them rather than restating any of
-//! it.
+//! Ported from the z-lab MLX reference `_stream_generate`. Verifier-side it is
+//! the shape every sidecar loop in this module family has — prefill, a bonus
+//! token out of the prefill forward, then rounds of draft / verify / accept /
+//! roll back — so it shares [`crate::speculative::accept_prefix`],
+//! `rollback_round_caches` and [`crate::speculative::VerifierDraw`] with them
+//! rather than restating any of it.
 //!
 //! # Conditioning: recomputed, not cached
 //!
@@ -44,16 +43,16 @@
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{argmax, Array, Device};
+use rmlx_mlx::{Array, Device};
 
 use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::dflash::DFlashRoundState;
 use crate::speculative::{
-    accept_prefix, argmax_tokens, emit_step, guard_verifier_prefill_logits, phases_charged,
-    rollback_round_caches, verifier_context, verifier_kv_bytes, DecodeWindow, RoundPhases,
-    RoundStats, SpecLoop,
+    accept_prefix, emit_step, guard_verifier_prefill_logits, phases_charged, rollback_round_caches,
+    verifier_context, verifier_kv_bytes, DecodeWindow, RoundPhases, RoundStats, SpecLoop,
+    VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -105,11 +104,17 @@ pub(super) fn round_block_total(requested: usize, declared: usize) -> usize {
     requested.min(declared).clamp(2, MAX_BLOCK_SIZE)
 }
 
-/// Drive a DFlash 2 drafter against its verifier, greedily.
+/// Drive a DFlash 2 drafter against its verifier.
 ///
 /// `requested_block_total` is the round block including the verifier's own
 /// token; it is clamped to the block the drafter was trained at, which is the
 /// widest one its selector chain is defined over.
+///
+/// `sampler_cfg` decides what "the verifier's own token" means at each position
+/// — its argmax at temperature 0, a draw from its post-sampling distribution
+/// above it. The drafter's selector chain is unaffected: it proposes ids either
+/// way, and [`crate::speculative::VerifierDraw`] explains why the walk is still
+/// exact.
 ///
 /// `step_fn` is called once per emitted token. Its `Option<u32>` return — the
 /// forced-token contract the plain decode loop uses — is discarded here, as it
@@ -125,7 +130,7 @@ pub(super) fn round_block_total(requested: usize, declared: usize) -> usize {
     clippy::indexing_slicing,
     reason = "the one index is axis 1 of the conditioning buffer, whose rank trim_conditioning checks before returning it"
 )]
-pub fn dflash2_generate_greedy(
+pub fn dflash2_generate(
     verifier: &Architecture,
     drafter: &DFlash2Drafter,
     tokenizer: &tokenizers::Tokenizer,
@@ -136,11 +141,12 @@ pub fn dflash2_generate_greedy(
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
 ) -> Result<Vec<ProbeStep>> {
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
-            "dflash2_generate_greedy: prompt must have >=2 tokens".into(),
+            "dflash2_generate: prompt must have >=2 tokens".into(),
         ));
     }
     // The recurrent state is a proxy, and an exact one today: the three seams
@@ -153,7 +159,7 @@ pub fn dflash2_generate_greedy(
     // is the only thing this check buys over letting them refuse.
     if !verifier.needs_lin_caches() {
         return Err(Error::Model(
-            "dflash2_generate_greedy: this verifier carries no recurrent state, so it \
+            "dflash2_generate: this verifier carries no recurrent state, so it \
              is not the Qwen3.5/3.6 hybrid the drafter's seams are wired for — its \
              multi-layer hidden capture, its raw embedding and its LM head over a \
              final-normed hidden"
@@ -188,6 +194,8 @@ pub fn dflash2_generate_greedy(
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
         .collect();
+
+    let mut draw = VerifierDraw::new(sampler_cfg);
 
     let mut total_draft = 0usize;
     let mut total_accept = 0usize;
@@ -226,7 +234,7 @@ pub fn dflash2_generate_greedy(
     }
     let prefill_ns = prefill_t0.elapsed().as_nanos();
 
-    let mut b = read_argmax(&bonus_logits, device)?;
+    let mut b = draw.seed_token(&bonus_logits, device)?;
     emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
     if eos_ids.contains(&b) {
         // The stop token arrived before a round could run. The request still
@@ -259,7 +267,8 @@ pub fn dflash2_generate_greedy(
         ?kv_quant,
         ?target_layer_ids,
         condition_rows = h_ctx.shape()[1],
-        "dflash2_generate_greedy: starting"
+        temperature = sampler_cfg.temperature,
+        "dflash2_generate: starting"
     );
 
     let seed_emitted = emitted.len();
@@ -302,11 +311,10 @@ pub fn dflash2_generate_greedy(
             Some(&mut v_lin),
             device,
         )?;
-        let v_argmax = argmax(&v_logits, -1, device)?;
-        v_argmax.eval()?;
-        let vb = v_argmax.to_bytes()?;
+        let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
         if charge_phases {
-            // The argmax forced the logits and the trunk under them, but the
+            // Reading the verifier's tokens forced the logits and the trunk
+            // under them, but the
             // capture is a different output of the same forward and stays lazy.
             // The next round's drafter reads it, so with nothing forcing it here
             // the verifier's own capture is billed to the drafter — and this
@@ -319,7 +327,6 @@ pub fn dflash2_generate_greedy(
         verifier_ns += round_verify_ns;
 
         let t0 = Instant::now();
-        let v_tokens = argmax_tokens(&vb, v_k)?;
         let (accept, new_tokens) = accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
@@ -458,25 +465,6 @@ fn draft_block(
     let drafted = hidden.slice(&[0, 1, 0], &[1, bs as i32, hidden_size], &[1, 1, 1], device)?;
     let logits = verifier.logits_from_final_hidden(&drafted, device)?;
     drafter.select_chain(&drafted, &logits, seed)
-}
-
-/// One token id off a `[.., 1, vocab]` logit row.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "the four bytes are indexed only after the buffer's length has been checked against them"
-)]
-fn read_argmax(logits: &Array, device: Device) -> Result<u32> {
-    let am = argmax(logits, -1, device)?;
-    am.eval()?;
-    let bytes = am.to_bytes()?;
-    if bytes.len() < 4 {
-        return Err(Error::Model(format!(
-            "dflash2_generate_greedy: the verifier's argmax came back as {} bytes, which \
-             is not one token id",
-            bytes.len()
-        )));
-    }
-    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 #[cfg(test)]

@@ -172,7 +172,7 @@ drafter). Two cell formats:
   limit and is marked `*`. Markers: `—(skip)` (codec not run at that size),
   `—(cap)` (K-only codec too slow past 8k), `—(TIMEOUT)`, `LOADFAIL`.
 - **MTP** cell = `specDecodeTPS · acceptRate · prefill(s)`, read from the serve-log
-  `mtp_assistant_generate_greedy: done` lines (KV reused from baseline).
+  `mtp_assistant_generate: done` lines (KV reused from baseline).
 
 **Cross-cutting (verified):** KV codec is a **decode no-op** on every model (all
 mainstream ≈ `none`) and **memory-inflating** (1.2–4×) — `none` is the smallest KV
@@ -446,7 +446,7 @@ Pre-fix, every speculative cell failed. Three distinct failures (verifier @4k, k
 |---|---|
 | 31b + `e2b-mxfp8`, `--draft-kind mtp` | **HTTP 500** — misroutes to the Qwen3.5 MTP path (checks `model_type=="gemma4_assistant"`; plain `gemma4` falls through) → `text_config missing num_experts`. |
 | e4b / 31b + `assistant-bf16`, mtp | **HTTP 500** — `backbone_hidden_size 1536 != verifier hidden 2560 / 5376`. The on-disk assistant was built for the **e2b** verifier only. |
-| **e2b** + `assistant-bf16`, mtp (correct pair) | **Loads**, enters `mtp_assistant_generate_greedy`, then **Metal crash**: `scaled_dot_product_attention: Invalid mask_mode additive` → TTFT ~220 ms, **0 decode tokens**. |
+| **e2b** + `assistant-bf16`, mtp (correct pair) | **Loads**, enters `mtp_assistant_generate`, then **Metal crash**: `scaled_dot_product_attention: Invalid mask_mode additive` → TTFT ~220 ms, **0 decode tokens**. |
 
 **Two bugs to file:**
 1. **Spec dispatch** doesn't recognize a plain-`gemma4` draft for the two-model

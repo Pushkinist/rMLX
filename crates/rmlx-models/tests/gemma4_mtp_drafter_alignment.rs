@@ -34,9 +34,7 @@ use std::path::PathBuf;
 
 use rmlx_mlx::Device;
 use rmlx_models::arch;
-use rmlx_models::speculative::gemma4_assistant::{
-    mtp_assistant_generate_greedy, Gemma4AssistantDrafter,
-};
+use rmlx_models::speculative::gemma4_assistant::{mtp_assistant_generate, Gemma4AssistantDrafter};
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key)
@@ -130,7 +128,15 @@ fn mtp_assistant_accept_rate_is_high() {
         None
     };
     let eos: Vec<u32> = Vec::new();
-    let steps = mtp_assistant_generate_greedy(
+    let sampler_cfg = rmlx_models::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 0,
+    };
+    let steps = mtp_assistant_generate(
         &verifier,
         &drafter,
         &tk,
@@ -141,6 +147,7 @@ fn mtp_assistant_accept_rate_is_high() {
         None,
         &eos,
         &mut step_fn,
+        &sampler_cfg,
         device,
     )
     .expect("mtp generate");

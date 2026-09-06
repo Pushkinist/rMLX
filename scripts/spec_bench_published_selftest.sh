@@ -340,7 +340,7 @@ def done_line(rate):
     total_accept = 98
     draft_ms, verify_ms, round_ms = 300.0, 900.0, 1800.0
     fields = {
-        "message": "mtp_generate_greedy: done",
+        "message": "mtp_generate: done",
         "rounds": rounds,
         "emitted": emitted,
         "seed_emitted": seed_emitted,

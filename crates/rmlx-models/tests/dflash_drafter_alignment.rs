@@ -43,7 +43,7 @@ use rmlx_kv_quant::{KvCache, LinearAttnCache};
 use rmlx_mlx::{argmax, Device};
 use rmlx_models::arch;
 use rmlx_models::kv_cache::DEFAULT_KV_QUANT;
-use rmlx_models::speculative::dflash::{dflash_generate_greedy, DFlashDrafter};
+use rmlx_models::speculative::dflash::{dflash_generate, DFlashDrafter};
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key)
@@ -217,7 +217,7 @@ fn dflash_live_loop_emits_coherent() {
         .chain(std::iter::once(248046u32))
         .collect();
 
-    let steps = dflash_generate_greedy(
+    let steps = dflash_generate(
         &verifier,
         &mut drafter,
         &tk,
@@ -228,6 +228,14 @@ fn dflash_live_loop_emits_coherent() {
         None,
         &eos,
         &mut step_fn,
+        &rmlx_models::sampler::SamplerConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            seed: Some(0),
+            top_logprobs_k: 0,
+        },
         device,
     )
     .expect("dflash generate");

@@ -22,7 +22,7 @@
 //! [`DFlash2Drafter::forward_hidden`] returns a block's final hidden states and
 //! [`DFlash2Drafter::select_chain`] turns those states and the verifier's
 //! logits over them into one ordered draft chain, both checked against the
-//! z-lab MLX reference; and [`dflash2_generate_greedy`] drives them round after
+//! z-lab MLX reference; and [`dflash2_generate`] drives them round after
 //! round against the verifier. **Only greedy** — the reference's sampled arm
 //! accepts by rejection sampling restricted to the selector's own candidate
 //! set, which is neither what `select_chain` returns nor the acceptance rule
@@ -51,7 +51,7 @@ mod forward;
 mod round;
 mod selector;
 
-pub use round::dflash2_generate_greedy;
+pub use round::dflash2_generate;
 
 /// The number of convolution sides a `base_kernel` carries: one kernel applied
 /// to the sublayer's normed input, one to the sublayer's output.

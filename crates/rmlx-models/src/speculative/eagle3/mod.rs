@@ -805,7 +805,7 @@ impl Eagle3Drafter {
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-pub fn eagle3_generate_greedy(
+pub fn eagle3_generate(
     verifier: &Architecture,
     drafter: &mut Eagle3Drafter,
     tokenizer: &tokenizers::Tokenizer,
@@ -816,18 +816,19 @@ pub fn eagle3_generate_greedy(
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
 ) -> Result<Vec<ProbeStep>> {
     use std::time::Instant;
 
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
-            "eagle3_generate_greedy: prompt must have >=2 tokens".into(),
+            "eagle3_generate: prompt must have >=2 tokens".into(),
         ));
     }
     if !verifier.needs_lin_caches() {
         return Err(Error::Model(
-            "eagle3_generate_greedy: EAGLE-3 verifier must be the Qwen3.5/3.6-MoE \
+            "eagle3_generate: EAGLE-3 verifier must be the Qwen3.5/3.6-MoE \
              hybrid (needs GDN lin_caches + multi-layer hidden capture)"
                 .into(),
         ));
@@ -867,6 +868,8 @@ pub fn eagle3_generate_greedy(
     // prompt + emitted tokens exceeded it (zero-length slice_update range in
     // update_decode_fp16, broadcast-shape panic).
     drafter.reset(max_seq);
+
+    let mut draw = super::VerifierDraw::new(sampler_cfg);
 
     let mut total_draft = 0usize;
     let mut total_accept = 0usize;
@@ -916,9 +919,7 @@ pub fn eagle3_generate_greedy(
     )?;
     // `bonus_logits` is [1,1,vocab] — the last prompt position only.
     super::guard_verifier_prefill_logits(verifier, &bonus_logits, prompt_ids.len())?;
-    let am = argmax(&bonus_logits, -1, device)?;
-    am.eval()?;
-    let bonus = u32::from_le_bytes(am.to_bytes()?[..4].try_into().unwrap());
+    let bonus = draw.seed_token(&bonus_logits, device)?;
 
     // Drafter prefill: shifted tokens = prompt[1..] + [bonus].
     // Conditioned on verifier hidden at positions 0..n-1 (all_hidden).
@@ -974,7 +975,11 @@ pub fn eagle3_generate_greedy(
         ?kv_quant,
         ?aux_layer_ids,
         draft_vocab_size = drafter.cfg.draft_vocab_size,
-        "eagle3_generate_greedy: starting (Qwen3.6-MoE verifier + EAGLE-3 drafter)"
+        temperature = sampler_cfg.temperature,
+        // A sampled request cannot take the restricted-vocabulary read-back, so
+        // report whether this one did rather than whether the drafter offers it.
+        hot_path = drafter.hot_path_active() && !draw.sampling(),
+        "eagle3_generate: starting (Qwen3.6-MoE verifier + EAGLE-3 drafter)"
     );
 
     let seed_emitted = emitted.len();
@@ -1026,8 +1031,17 @@ pub fn eagle3_generate_greedy(
         // 6. Replace tokens[full_pos] with the full-vocab correction token.
         //
         // This reduces logit materialisation by ~7.8× for accepted positions.
+        //
+        // A sampled request cannot use it. The restricted row is a logit vector
+        // over the drafter's 32000-id vocabulary, and a distribution needs the
+        // normalising constant of the whole row: softmaxing the subset spreads
+        // the missing mass over the ids that survived, and top-p and top-k then
+        // cut a different set than they would have. An argmax is indifferent to
+        // all of that, which is why the reduction is sound at temperature 0 and
+        // only there. Sampled requests pay the full-vocabulary projection at
+        // every verified position.
         let t0 = Instant::now();
-        let (v_tokens, v_hidden) = if drafter.hot_path_active() {
+        let (v_tokens, v_hidden) = if drafter.hot_path_active() && !draw.sampling() {
             let (v_hidden, v_final_hidden) = verifier.forward_verify_capture_hot(
                 &v_input,
                 v_k,
@@ -1092,11 +1106,9 @@ pub fn eagle3_generate_greedy(
                 Some(&mut v_lin),
                 device,
             )?;
-            let v_argmax = argmax(&v_logits, -1, device)?;
-            v_argmax.eval()?;
-            let vb = v_argmax.to_bytes()?;
+            let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
             verifier_ns += t0.elapsed().as_nanos();
-            (super::argmax_tokens(&vb, v_k)?, v_hidden)
+            (v_tokens, v_hidden)
         };
 
         // -- Phase C: greedy acceptance walk. --
