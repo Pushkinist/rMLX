@@ -1153,8 +1153,40 @@ Same harness, same three registered prompt classes, and a no-drafter arm
 measured in every invocation beside the speculative one it is divided by:
 `--kv-quant none`, `--max-ctx 8192`, temperature 0, seed 42, 128 max tokens, one
 warmup and three measured requests. Every speculative row carries
-`charged=false`, and every arm's engine-measured decode window agrees with the
-client's reading of the same window to under 0.1%.
+`charged=false`.
+
+**TAINTED: the host was not idle.** CPU-only work belonging to another job ran
+concurrently for the whole forty-minute block, and the one-minute load average
+went from 2.67 at the start to 7.66 at the end. There was no GPU contention —
+the single-MLX claim was held throughout and never bypassed — so the taint is
+CPU scheduling around the GPU work, not two processes on the device.
+
+Four things say the ratios survive it, and they are worth more than the
+disclosure alone:
+
+* the no-drafter arm, which every ratio in the table is divided by, read
+  **32.10 to 32.47 t/s across all twelve invocations** — a 1.15% spread over the
+  whole block, so the denominator did not drift as the load climbed;
+* the ABBA repeats on the code column agree to under 1% (below);
+* the engine's own decode window and the client's reading of the same window
+  came back at **0.0%** apart on every arm;
+* thermal state showed no thermal or performance warning at any sample.
+
+That last one is the weakest leg and should be read as such: it was sampled with
+`pmset -g therm`, not `powermetrics`, which needs an interactive sudo that was
+not available. `pmset` reports the scheduler's advertised limits rather than the
+package's actual residency, so it can miss a throttle that `powermetrics` would
+show. A quiet reading from it is weaker evidence than a quiet reading from the
+instrument this project normally uses.
+
+**These figures are good enough to steer optimisation work by and are not clean
+enough to publish.** What they establish — which block is faster, where the round
+goes, which drafter wins on code — rests on ratios against a denominator measured
+in the same invocation, and on the code column also on an ABBA repeat, and that
+is what an optimisation round needs. An absolute throughput number quoted outside
+this document has neither protection, and the two columns that are single pairs
+have only the first. They will be re-taken on a genuinely idle host once the
+optimisation rounds are done, and this paragraph comes out then.
 
 | Drafter | Block | Prompt | Accept rate | tokens/round | Decode vs no drafter |
 |---|---|---|---|---|---|
@@ -1193,11 +1225,34 @@ is the sidecar's own `config.json` value (3 here) and the MTP round loop clamps
 records `mtp/block=3`. The published comparison's "same 7 drafts" arm has no
 counterpart on this checkpoint; each drafter is shown at the depth it can run.
 
-The code column was taken DFlash 2 → MTP → MTP → DFlash 2, and the two DFlash 2
-readings agree to 0.8% as do the two MTP ones, so the ranking is not this host's
-slot drift. It is not run-to-run variation either: at temperature 0 the token
-stream repeats exactly, so accept rate, round count and tokens per round come
-back identical to the digit and only the timing moves.
+**Nor is it the same measurement as the published one, even where the drafter is
+the same.** The third-party acceptance figures this checkpoint is known by were
+taken under the reference's sampled arm — rejection sampling restricted to the
+selector's own candidate set — and this port implements greedy acceptance only
+(below). Acceptance under a candidate-restricted rejection rule and acceptance
+under an exact-match greedy walk are different quantities: the first accepts a
+draft the target merely finds probable enough, the second only one the target
+would itself have chosen. Reading a row here against a published number compares
+two acceptance rules, not two engines, and the same drafter can rank differently
+under each.
+
+**The code column is ABBA-paired; the structured one is not.** The code column
+was taken DFlash 2 → MTP → MTP → DFlash 2, and the two DFlash 2 readings agree
+to 0.8% as do the two MTP ones, so its ranking is not this host's slot drift —
+which on a host under load (above) is the thing that most needed ruling out. The
+structured class was taken as a **single pair**, one invocation each, so its
+1.54×-against-1.32× margin has no such control behind it and is the weakest leg
+of the drafter comparison. It is reported because it is what was measured, not
+because it carries the code column's weight.
+
+None of it is run-to-run variation in the *acceptance* figures: at temperature 0
+the token stream repeats exactly, so accept rate, round count and tokens per
+round come back identical to the digit and only the timing moves. That is also
+where the host taint does and does not reach. `Accept rate` and `tokens/round`
+are counts off a deterministic token stream and are untainted. Every millisecond
+below, and the decode ratios built from them, are wall clock taken under load —
+divided by a denominator from the same invocation, which is what makes the
+comparisons usable, and not by anything that makes an absolute figure clean.
 
 **Block 8 is the trained block; block 5 is the faster one**, which is what
 z-lab's own MLX guidance says (`block_size <= 5` against a quantized target and
