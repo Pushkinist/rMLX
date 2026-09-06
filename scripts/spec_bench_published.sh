@@ -845,6 +845,8 @@ set -e
 echo ""
 echo "sampling: ${SAMPLING_SEEN}  (read back from the engine)"
 echo "result: ${RESULT}"
+echo "  record it:  python3 scripts/ingest/published_ingest.py --record ${RESULT} --git-sha <sha>"
+echo "  render it:  python3 scripts/lib/published_table.py <result per mode> --model ${VERIFIER_MODEL}"
 if $UNVERIFIED_SAMPLES; then
     echo "UNVERIFIED SAMPLES: not a published measurement, not recordable."
 fi
