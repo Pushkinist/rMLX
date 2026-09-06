@@ -250,6 +250,12 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
         Bounds::positive(MB_CEILING),
     ),
     (
+        "peak_phys_footprint_mb",
+        "mb",
+        Direction::LowerBetter,
+        Bounds::positive(MB_CEILING),
+    ),
+    (
         "metal_peak_alloc_mb",
         "mb",
         Direction::LowerBetter,

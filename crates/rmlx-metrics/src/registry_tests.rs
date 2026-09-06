@@ -73,6 +73,8 @@ fn every_spec_metric_present() {
         // one per `rmlx eval ppl` scorer: the cacheless full-window forward and
         // the cache-bearing teacher-forced one do not measure the same thing.
         "ppl_wikitext2_cached",
+        // resident memory has two counters and they are not the same number
+        "peak_phys_footprint_mb",
     ];
     for name in spec_names {
         assert!(
@@ -81,7 +83,7 @@ fn every_spec_metric_present() {
         );
     }
     // METRICS row count — bump when adding new metric ops.
-    assert_eq!(METRICS.len(), 60, "METRICS should have exactly 60 rows");
+    assert_eq!(METRICS.len(), 61, "METRICS should have exactly 61 rows");
 }
 
 #[test]
