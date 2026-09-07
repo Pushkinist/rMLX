@@ -230,7 +230,8 @@ const MAX_CTX: i32 = 8192;
 /// | assistant pair, as shipped | 0.0000 to 0.0820 |
 /// | recurrent pair, as shipped | 0.0000 to 0.0234 |
 /// | block pair, as shipped | 0.0000 to 0.0273 |
-/// | adaptive pair, as shipped | 0.0000 to 0.0234 |
+/// | adaptive pair, as shipped, at the block it is served | 0.0000 to 0.0234 |
+/// | adaptive pair, as shipped, over its whole schedule | 0.0000 to 0.0703 |
 /// | restricted-vocabulary pair, as shipped | 0.0000 to 0.0703 |
 /// | two-model pair, as shipped | 0.0000 to 0.0234 |
 /// | assistant pair, SWA ring keeping its rejected block tail | 0.4219 to 0.9258 |
@@ -248,6 +249,16 @@ const MAX_CTX: i32 = 8192;
 /// is refused on at least four of the prompts the gate judged for it — which is
 /// what running every prompt rather than one buys, since no broken engine is
 /// refused on all of them by this oracle alone.
+///
+/// **The adaptive pair's two rows are the same engine at two blocks**, and the
+/// wider one reads three times the narrower. Both clear the ceiling and both are
+/// refused on none of the prompts the gate judges, against at least four for
+/// every broken engine here — but 0.0703 is also where the broken adaptive row
+/// starts, so the two populations touch on that pair at that block, and the
+/// margin the ceiling has over a correct reading there is 1.71x rather than the
+/// 1.46x the paragraph above quotes. The narrower row was measured before this
+/// pair was split in two and its block is not recorded; the served block
+/// reproduces it exactly.
 ///
 /// The exception is the last row, and it is a property of the defect rather than
 /// of the ceiling: leaving the correction on the restricted argmax only changes
@@ -1802,10 +1813,12 @@ const MTP_4BIT_DEEP_PAIR: Pair = Pair {
 /// curve still returns proposals at.
 const DEEP_BLOCK: usize = 8;
 
-/// The block pair. Its drafter denoises a whole block in one pass and its
-/// selector chains the block's independent argmaxes into one sentence, so an
-/// error in either reaches the verifier as a rejected proposal rather than as a
-/// failure — which the acceptance walk absorbs, and this gate does not.
+/// The block pair at the block a request that names none is served. Its drafter
+/// denoises a whole block in one pass and its selector chains the block's
+/// independent argmaxes into one sentence, so an error in either reaches the
+/// verifier as a rejected proposal rather than as a failure — which the
+/// acceptance walk absorbs, and this gate does not. The declared width is
+/// [`DFLASH2_DEEP_PAIR`]'s.
 ///
 /// Named for the same reason [`MTP_PAIR`] is, and more so: its verifier is
 /// 4-bit, so it drives the same MLX quantized matmul at a group size the
@@ -1823,10 +1836,26 @@ const DFLASH2_PAIR: Pair = Pair {
     block: None,
 };
 
-/// The adaptive pair. Its drafter carries no dynamic convolution and no
-/// selector, and its loop sets each round's block from the accept rate of the
-/// recent ones — so it is the only pair here whose verify width changes between
-/// rounds, and the only one that reaches a block wider than 8.
+/// The block pair at the width its checkpoint declares.
+///
+/// [`DFLASH2_PAIR`] runs the block a request that names none is served, which
+/// is the serve default and narrower than the declaration — so the selector
+/// chain is driven over four positions where it is defined over eight. The
+/// chain is the thing this drafter is, and a chain re-picking three positions
+/// against the one before it is not the chain re-picking seven.
+const DFLASH2_DEEP_PAIR: Pair = Pair {
+    verifier: DFLASH2_PAIR.verifier,
+    drafter: DrafterSource::Named(Some("z-lab__Qwen3.8-27B-DFlash2")),
+    round_loop: RoundLoop::DFlash2,
+    block: Some(8),
+};
+
+/// The adaptive pair at the block a request that names none is served. Its
+/// drafter carries no dynamic convolution and no selector, and its loop sets
+/// each round's block from the accept rate of the recent ones, so its verify
+/// width changes between rounds here as at any block. The schedule's full
+/// range is [`DFLASH1_DEEP_PAIR`]'s: at the served 5 this one oscillates over
+/// {4, 5}.
 ///
 /// Named for the same reason [`MTP_PAIR`] is: an 8-bit verifier drives the same
 /// MLX quantized matmul the census records for the affine instantiation.
@@ -1841,6 +1870,22 @@ const DFLASH1_PAIR: Pair = Pair {
     drafter: DrafterSource::Named(Some("z-lab__Qwen3.6-35B-A3B-DFlash")),
     round_loop: RoundLoop::DFlash1,
     block: None,
+};
+
+/// The adaptive pair over the range its schedule actually covers.
+///
+/// [`DFLASH1_PAIR`] runs the served block, and at 5 the schedule oscillates
+/// over {4, 5}: `dflash_next_block_size` floors at `min(block, 4)` and grows to
+/// the ceiling it was given. The checkpoint declares 16, and the sequence of
+/// widths a run then produces — an 8-wide append truncated and followed by a
+/// 4- or 6-wide one — is the thing no other pair here reaches. Both are gated
+/// because both are real: one is what an operator is served, the other is what
+/// the schedule is.
+const DFLASH1_DEEP_PAIR: Pair = Pair {
+    verifier: DFLASH1_PAIR.verifier,
+    drafter: DrafterSource::Named(Some("z-lab__Qwen3.6-35B-A3B-DFlash")),
+    round_loop: RoundLoop::DFlash1,
+    block: Some(16),
 };
 
 /// The restricted-vocabulary pair, and the one place this gate reads a
@@ -2879,11 +2924,11 @@ fn the_recurrent_round_loop_reproduces_plain_greedy_past_the_declared_block() {
     );
 }
 
-/// The block pair. Its drafter proposes a whole block at once and its selector
-/// re-picks every position of that block against the one before it, so a defect
-/// in either arrives as a rejected proposal — which the acceptance walk absorbs
-/// silently and this gate does not. The rollback is the recurrent one, driven
-/// at a wider block than any other pair here reaches.
+/// The block pair at the block it is served. Its drafter proposes a whole block
+/// at once and its selector re-picks every position of that block against the
+/// one before it, so a defect in either arrives as a rejected proposal — which
+/// the acceptance walk absorbs silently and this gate does not. The rollback is
+/// the recurrent one.
 #[ignore]
 #[test]
 fn the_block_round_loop_reproduces_plain_greedy() {
@@ -2893,19 +2938,48 @@ fn the_block_round_loop_reproduces_plain_greedy() {
     );
 }
 
-/// The adaptive pair, and the only one whose verify width is not fixed.
+/// The same loop at the width its checkpoint declares, which is the width its
+/// selector chain is defined over.
+///
+/// At the served block the chain re-picks three positions; here it re-picks
+/// seven, over a rollback whose rejected tail is correspondingly longer.
+#[ignore]
+#[test]
+fn the_block_round_loop_reproduces_plain_greedy_at_the_declared_block() {
+    run_gate(
+        "the_block_round_loop_reproduces_plain_greedy_at_the_declared_block",
+        &DFLASH2_DEEP_PAIR,
+    );
+}
+
+/// The adaptive pair at the block it is served, and the only loop here whose
+/// verify width is not fixed.
 ///
 /// Its loop halves and grows the block from the accept rate of the recent
-/// rounds, so a run truncates an 8-wide append and follows it with a 4- or
-/// 6-wide one — a sequence of shapes no other pair here produces, over the same
-/// rollback the recurrent and block pairs use. Every individual width is
-/// exercised elsewhere; the schedule is not.
+/// rounds, so the width varies within a run over the same rollback the
+/// recurrent and block pairs use. At the served block that variation is over
+/// {4, 5}; the range the schedule is defined over is the next cell's.
 #[ignore]
 #[test]
 fn the_adaptive_round_loop_reproduces_plain_greedy() {
     run_gate(
         "the_adaptive_round_loop_reproduces_plain_greedy",
         &DFLASH1_PAIR,
+    );
+}
+
+/// The same loop over the range its schedule actually covers.
+///
+/// A run truncates an 8-wide append and follows it with a 4- or 6-wide one — a
+/// sequence of shapes no other pair here produces, and one the served block
+/// cannot reach. Every individual width is exercised elsewhere; the schedule is
+/// not.
+#[ignore]
+#[test]
+fn the_adaptive_round_loop_reproduces_plain_greedy_over_its_whole_schedule() {
+    run_gate(
+        "the_adaptive_round_loop_reproduces_plain_greedy_over_its_whole_schedule",
+        &DFLASH1_DEEP_PAIR,
     );
 }
 
