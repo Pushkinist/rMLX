@@ -97,8 +97,9 @@ fn mtp_reject_reason(arch: &str, model_type: &str) -> String {
 
 // ── Drafter kind and round block ──────────────────────────────────────────────
 
-/// The round block when `--draft-block-size` is absent: the verifier's own
-/// token plus four drafted.
+/// The round block when `--draft-block-size` is absent and the drafter's
+/// checkpoint declares no depth of its own: the verifier's own token plus four
+/// drafted.
 pub(crate) const DEFAULT_DRAFT_BLOCK_SIZE: usize = 5;
 
 /// The smallest round block with room for a draft token.
@@ -113,12 +114,22 @@ pub const MIN_DRAFT_BLOCK_SIZE: usize = 2;
 /// — the field `decode_config` files a row under — is this value, so one flag
 /// value is one cell whichever drafter runs.
 ///
+/// `declared` is the depth the drafter's own checkpoint names, and it is what a
+/// request that named no block runs at. A checkpoint's depth is the one it was
+/// trained at, so it is a better default than a constant chosen for no drafter
+/// in particular; a drafter whose checkpoint declares nothing takes
+/// [`DEFAULT_DRAFT_BLOCK_SIZE`]. A request that names a block is honoured either
+/// way — the declared depth is a default, not a ceiling, and each round loop
+/// applies whatever ceiling its own draft shape imposes.
+///
 /// # Errors
 /// `Error::Other` for a block below [`MIN_DRAFT_BLOCK_SIZE`]. The CLI refuses
 /// that at parse time; this covers a caller that is not the CLI.
-fn round_block(flag: Option<usize>) -> rmlx_core::Result<usize> {
+fn round_block(flag: Option<usize>, declared: Option<usize>) -> rmlx_core::Result<usize> {
     match flag {
-        None => Ok(DEFAULT_DRAFT_BLOCK_SIZE),
+        None => Ok(declared
+            .unwrap_or(DEFAULT_DRAFT_BLOCK_SIZE)
+            .max(MIN_DRAFT_BLOCK_SIZE)),
         Some(block) if block >= MIN_DRAFT_BLOCK_SIZE => Ok(block),
         Some(block) => Err(Error::Other(format!(
             "draft block size {block} leaves no room for a draft token; it must be at \
@@ -214,6 +225,22 @@ enum Drafter {
 }
 
 impl Drafter {
+    /// The block depth this drafter's own checkpoint declares, when it declares
+    /// one.
+    ///
+    /// `None` is a drafter whose checkpoint says nothing about depth — the
+    /// Gemma4 assistant, whose config carries no block key, and the two-model
+    /// arm, whose draft is a full model with no drafting depth to declare.
+    fn declared_block_size(&self) -> Option<usize> {
+        match self {
+            Drafter::Eagle3(d) => Some(d.lock().block_size()),
+            Drafter::DFlash(d) => Some(d.lock().block_size()),
+            Drafter::DFlash2(d) => Some(d.cfg.block_size),
+            Drafter::MtpSidecar(d) => Some(d.lock().block_size()),
+            Drafter::MtpAssistant(_) | Drafter::TwoModel => None,
+        }
+    }
+
     fn kind(&self) -> rmlx_models::DraftKind {
         match self {
             Drafter::Eagle3(_) => rmlx_models::DraftKind::Eagle3,
@@ -256,8 +283,9 @@ fn dropped_sampling_fields(sampling: &crate::engine::types::SamplingParams) -> V
 /// token. Which drafter runs is decided at construction from the draft
 /// snapshot's own `config.json`, or by an explicit `--draft-kind`.
 ///
-/// `--draft-block-size` is the round block, the verifier's token included
-/// (default 5), so every loop drafts one fewer. Every loop accepts by argmax
+/// `--draft-block-size` is the round block, the verifier's token included, so
+/// every loop drafts one fewer; absent, it is the depth the drafter's own
+/// checkpoint declares. Every loop accepts by argmax
 /// agreement at `temperature == 0`; above it the two-model loop runs
 /// rejection sampling against the drafter's distribution and the sidecar loops
 /// draw the verifier's token per position and accept the prefix that agrees.
@@ -367,7 +395,6 @@ impl SpeculativeGenerator {
             .unwrap_or("");
         let declared = rmlx_models::Declared::from_snapshot(draft_arch, draft_model_type);
         let draft_kind = decide_draft_kind(draft_kind, declared, draft_arch, draft_model_type)?;
-        let block_size = round_block(draft_block_size)?;
         tracing::info!(
             draft = %draft_dir.display(),
             arch = draft_arch,
@@ -502,9 +529,13 @@ impl SpeculativeGenerator {
             dispatcher.verifier.validate_kv_quant(kq)?;
         }
 
+        let declared_block = drafter.declared_block_size();
+        let block_size = round_block(draft_block_size, declared_block)?;
+
         tracing::info!(
             model_id = %model_id,
             block_size,
+            ?declared_block,
             ?kv_quant_resolved,
             ?max_ctx_override,
             effective_max_ctx,

@@ -153,23 +153,51 @@ fn a_sidecar_flag_over_a_full_model_is_refused() {
 /// as `k + 1`. A block too small to hold a draft token is refused by name.
 #[test]
 fn one_flag_value_is_one_round_block() {
-    assert_eq!(round_block(None).ok(), Some(DEFAULT_DRAFT_BLOCK_SIZE));
-    for block in [MIN_DRAFT_BLOCK_SIZE, 5, 16] {
-        assert_eq!(round_block(Some(block)).ok(), Some(block));
-        assert_eq!(
-            drafted_per_round(block) + 1,
-            block,
-            "the two-model loop records k + 1, which must be the block the flag named"
-        );
+    for declared in [None, Some(3), Some(8)] {
+        for block in [MIN_DRAFT_BLOCK_SIZE, 5, 16] {
+            assert_eq!(round_block(Some(block), declared).ok(), Some(block));
+            assert_eq!(
+                drafted_per_round(block) + 1,
+                block,
+                "the two-model loop records k + 1, which must be the block the flag named"
+            );
+        }
+        for block in [0, MIN_DRAFT_BLOCK_SIZE - 1] {
+            let msg = round_block(Some(block), declared)
+                .err()
+                .map_or_else(String::new, |e| e.to_string());
+            assert!(
+                msg.contains(&format!("block size {block}"))
+                    && msg.contains(&format!("at least {MIN_DRAFT_BLOCK_SIZE}")),
+                "{msg}"
+            );
+        }
     }
-    for block in [0, MIN_DRAFT_BLOCK_SIZE - 1] {
-        let msg = round_block(Some(block))
-            .err()
-            .map_or_else(String::new, |e| e.to_string());
-        assert!(
-            msg.contains(&format!("block size {block}"))
-                && msg.contains(&format!("at least {MIN_DRAFT_BLOCK_SIZE}")),
-            "{msg}"
+}
+
+/// A request that names no block runs at the depth the drafter's own checkpoint
+/// declares.
+///
+/// The constant is what a drafter that declares nothing takes, not what every
+/// drafter takes: every shipped Qwen3.5-family MTP sidecar declares 3 and the
+/// published DFlash 2 checkpoint declares 8, so a constant default runs both at
+/// a depth neither was trained at.
+#[test]
+fn no_flag_runs_at_the_depth_the_checkpoint_declares() {
+    for declared in [MIN_DRAFT_BLOCK_SIZE, 3, 8, 16] {
+        assert_eq!(round_block(None, Some(declared)).ok(), Some(declared));
+    }
+    assert_eq!(round_block(None, None).ok(), Some(DEFAULT_DRAFT_BLOCK_SIZE));
+}
+
+/// A checkpoint declaring a depth with no room for a draft token does not
+/// silently produce a round that drafts nothing.
+#[test]
+fn a_declared_depth_below_the_minimum_is_floored() {
+    for declared in [0, MIN_DRAFT_BLOCK_SIZE - 1] {
+        assert_eq!(
+            round_block(None, Some(declared)).ok(),
+            Some(MIN_DRAFT_BLOCK_SIZE)
         );
     }
 }

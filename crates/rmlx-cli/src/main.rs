@@ -631,7 +631,9 @@ enum Cmd {
         draft_kind: Option<DraftKindArg>,
         /// Speculative round block: tokens the verifier scores per round, its
         /// own token included, so the drafter proposes one fewer. The same
-        /// number for every drafter kind. Must be ≥ 2. Default 5.
+        /// number for every drafter kind. Must be ≥ 2. Absent, the round runs
+        /// at the depth the drafter's own checkpoint declares, and at 5 only
+        /// for a drafter that declares none.
         /// Env: `MLX_VLM_DRAFT_BLOCK_SIZE` (fallback when flag is absent).
         #[arg(long, value_name = "N", env = "MLX_VLM_DRAFT_BLOCK_SIZE", value_parser = parse_draft_block_size)]
         draft_block_size: Option<usize>,
