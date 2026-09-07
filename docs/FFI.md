@@ -1365,6 +1365,18 @@ supplies the function signature and buffer declarations at dispatch. The
 
 An `#include` belongs in the header, never the body: MLX splices the body into
 the generated kernel *function*, so an include there lands at function scope.
+The same applies to any `inline` helper a body calls — a function definition at
+function scope does not compile — which is why the packed codecs' shared code
+plane reader (`crate::code_plane::render_msl_code_plane`) is emitted into each
+codec's generated header rather than into a body.
+
+**Address space is part of a helper's signature.** MLX binds a small input
+buffer as `constant` and a large one as `device`, and MSL will not convert
+between the two, so a helper that names one address space compiles for one
+dispatch shape and fails the other at JIT time — after the gate, on the first
+real dispatch. `cp_read_code` is templated over the pointer type for exactly
+that reason; the compile gate cannot see it, because it probes one buffer
+declaration per body.
 
 **Parameterised bodies.** Two mechanisms, and the choice is not stylistic:
 

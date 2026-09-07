@@ -121,7 +121,7 @@ Effective per-namespace ceiling when both budgets are set:
 
 ---
 
-## SsdKvIndex — Schema v3
+## SsdKvIndex — Schema v8
 
 Each namespace has one SQLite database at
 `<RMLX_HOME>/cache/kv/<namespace>/index.db`. The database runs in WAL mode
@@ -140,7 +140,7 @@ kv_blocks (
 )
 
 schema_version (
-    version     INTEGER PRIMARY KEY NOT NULL   -- 3
+    version     INTEGER PRIMARY KEY NOT NULL   -- 8
 )
 ```
 
@@ -793,6 +793,27 @@ out is `SsdKvIndex::SCHEMA_VERSION`, bumped to 4 for exactly this transition:
 every pre-change namespace is reclaimed by the `wipe_stale_schema_namespaces`
 pass at model load. Pinned by
 `ssd_tier_tests::wipe_removes_the_pre_none_bf16_block_format_namespace`.
+
+#### v8 — the packed rings' code layout, and two renamed geometry tags
+
+The iso and rotor codecs' code plane used to spend one whole `u32` per group
+whatever the codec's width. It is packed densely across a row's groups now, and
+the rotor encoders store three codes per group instead of eight — the five the
+Clifford sandwich leaves algebraically zero are not written. A block spilled by
+an older binary therefore carries a plane the new unpacker reads at the wrong
+stride, which decodes to plausible K/V rather than to an error.
+
+`layout_key` cannot carry that. `compute_layout_key` folds arch, layer count,
+`n_kv_heads`, `head_dim` and the per-layer codec `Display` vector — codec
+*names* and shapes, none of which move when the bits inside a block are
+re-cadenced — so a v7 block still **hits**. `SCHEMA_VERSION` is what routes it
+through the wipe instead.
+
+The same bump covers the `tsym3` / `tsym4` geometry tags, which named a
+Walsh-Hadamard the TurboQuant codecs do not apply and now name the Lloyd-Max
+codebook they do (`tsym3_lloyd_3_3` / `tsym4_lloyd_4_4`). Hydrate dispatches on
+exact string equality, so a tag rename is a stored-format change on the same
+schedule as a layout one.
 
 #### SWA layers are not spilled — hydrated entries degrade to re-prefill
 

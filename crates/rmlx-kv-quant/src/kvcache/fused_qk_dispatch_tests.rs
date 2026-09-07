@@ -233,7 +233,9 @@ fn fused_qk_layout_rotor_k_asym_3() {
     )
     .expect("layout result")
     .expect("rotor_k_asym_3 has fused-QK entry");
-    assert_eq!(l.codes_per_token, 43);
+    // 43 groups of three 3-bit codes: 387 bits, 13 words per row.
+    assert_eq!(l.codes_per_token, 13);
+    assert_eq!(l.scales_per_token, 43);
     assert!(l.has_norm);
     assert!(l.has_rotor_table);
 }
@@ -249,7 +251,9 @@ fn fused_qk_layout_rotor_k_asym_4() {
     )
     .expect("layout result")
     .expect("rotor_k_asym_4 has fused-QK entry");
-    assert_eq!(l.codes_per_token, 43);
+    // Same 129 codes at 4 bits: 516 bits, 17 words per row.
+    assert_eq!(l.codes_per_token, 17);
+    assert_eq!(l.scales_per_token, 43);
     assert!(l.has_norm);
     assert!(l.has_rotor_table);
 }

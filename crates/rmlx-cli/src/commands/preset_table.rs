@@ -76,8 +76,8 @@ pub(crate) enum PresetError {
 /// |---|---|---|
 /// | `fp16` | `KvQuant::None` | bf16 both sides (alias: "fp16", "bf16", "none" via `--kv-quant`) |
 /// | `q8` | `KvQuant::K8V8` | symmetric 8-bit K+V |
-/// | `speed` | `KvQuant::TurboSym3` | Symmetric WHT-3 K+V; matches mtq `speed` exactly; rejected on Qwen MoE (K-side 3-bit PPL-disaster) |
-/// | `quality` | `KvQuant::TurboSym4` | symmetric WHT-4 K + tq4 V; rejected on Qwen MoE |
+/// | `speed` | `KvQuant::TurboSym3` | Symmetric 3-bit Lloyd-Max K+V; matches mtq `speed` exactly; rejected on Qwen MoE (K-side 3-bit PPL-disaster) |
+/// | `quality` | `KvQuant::TurboSym4` | symmetric 4-bit Lloyd-Max K + tq4 V; rejected on Qwen MoE |
 /// | `planar` | `KvQuant::Planar` | PlanarQuant V-side |
 /// | `planar3` | `KvQuant::Planar3` | PlanarQuant 3-bit V-side |
 /// | `k_only_planar` | `KvQuant::PlanarK` | PlanarQuant K-side; V=bf16; rejected on Qwen MoE |
@@ -120,7 +120,7 @@ static PRESETS: &[(&str, PresetSpec)] = &[
         },
     ),
     (
-        // `quality` resolves to `KvQuant::TurboSym4` (symmetric WHT-4 K + tq4 V),
+        // `quality` resolves to `KvQuant::TurboSym4` (symmetric 4-bit Lloyd-Max K + tq4 V),
         // matching mtq's `quality` definition byte-for-byte on Apple Silicon.
         // Arch guard: rejected at resolve-time on Qwen MoE (PPL-218→8641 disaster).
         "quality",
@@ -131,9 +131,9 @@ static PRESETS: &[(&str, PresetSpec)] = &[
         },
     ),
     (
-        // `speed` resolves to TurboSym3 (symmetric WHT-3 K+V), matching mtq's
+        // `speed` resolves to TurboSym3 (symmetric 3-bit Lloyd-Max K+V), matching mtq's
         // `speed` preset definition. Symmetric turbo3 saves ~4-bit of K storage
-        // vs K8VTurbo3; K-side WHT-3 matches the V-side codebook exactly.
+        // vs K8VTurbo3; the K-side 3-bit codebook matches the V-side codebook exactly.
         // Cosine gate ≥ 0.9807 (K-side empirical floor).
         // Arch guard (Contract A.y): rejected on Qwen MoE (K-side 3-bit is the
         // PPL-disaster zone).

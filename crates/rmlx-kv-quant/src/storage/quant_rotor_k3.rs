@@ -370,13 +370,25 @@ impl QuantRotorK3 {
                 "QuantRotorK3::gpu_append: n_groups for head_dim={head_dim} exceeds i32::MAX"
             ))
         })?;
+        // The dense code plane's row width is the codec's too — a plane no
+        // longer holds one word per group.
+        let code_words = i32::try_from(crate::rotorquant::row_words_for(
+            usize::try_from(head_dim.max(0)).unwrap_or(0),
+            ROTOR3_BITS,
+        ))
+        .map_err(|_| {
+            Error::Quant(format!(
+                "QuantRotorK3::gpu_append: code words for head_dim={head_dim} exceeds i32::MAX"
+            ))
+        })?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
-            self.gpu
-                .seed_from_cpu(&c, &s, &n, kv_h, n_groups, prev_seq, max_seq, device)?;
+            self.gpu.seed_from_cpu(
+                &c, &s, &n, kv_h, n_groups, code_words, prev_seq, max_seq, device,
+            )?;
         }
         self.gpu.append_encoded(
-            codes, scales, norms, kv_h, n_groups, prev_seq, new_seq, max_seq, device,
+            codes, scales, norms, kv_h, n_groups, code_words, prev_seq, new_seq, max_seq, device,
         )
     }
 
@@ -456,7 +468,8 @@ impl QuantRotorK3 {
         // reconciles its blocks with the ring. A short-blocks clone with no
         // ring would silently truncate the store — refused loudly instead.
         let blocks =
-            synced_rotor_k_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?.into_owned();
+            synced_rotor_k_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, Device::Gpu)?
+                .into_owned();
         Ok(Self {
             rotors: self.rotors.clone(),
             // The clone starts CPU-only: `blocks` carries the full payload, so
@@ -532,7 +545,8 @@ impl QuantRotorK3 {
         // the decode tail lives only in the ring (`blocks` trail `shape[2]`),
         // and this rebuilds it on demand rather than decoding a short prefix and
         // zero-padding the gap. Loud on any unrecoverable disagreement.
-        let blocks = synced_rotor_k_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?;
+        let blocks =
+            synced_rotor_k_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, Device::Gpu)?;
 
         if blocks.is_empty() {
             out.resize(total_elems, 0.0);
@@ -605,8 +619,8 @@ impl QuantRotorK3 {
 /// blocks fall short of `shape[2]` and the ring cannot make up the difference is
 /// an `Error` — the caller must not fabricate a zeroed gap.
 ///
-/// Shared by `QuantRotorK3` and `QuantRotorK4` (the block payload and ring
-/// layout are identical modulo codes bit-width).
+/// Shared by `QuantRotorK3` and `QuantRotorK4`; `bits` is the store's own code
+/// width, which is what sizes the dense code plane a row holds.
 ///
 /// # Errors
 ///
@@ -617,6 +631,7 @@ pub(crate) fn synced_rotor_k_blocks<'a>(
     blocks: &'a [RotorKBlocks],
     shape: &[i32],
     gpu: &QuantKGpuRing,
+    bits: u8,
     device: Device,
 ) -> Result<Cow<'a, [RotorKBlocks]>> {
     if shape.len() != 4 {
@@ -656,11 +671,13 @@ pub(crate) fn synced_rotor_k_blocks<'a>(
         )));
     };
     let n_groups = n_groups_for(head_dim);
-    let want_codes = full_tokens * n_groups;
-    if codes.len() != want_codes || scales.len() != want_codes || norms.len() != full_tokens {
+    let want_scales = full_tokens * n_groups;
+    let want_codes = full_tokens * crate::rotorquant::row_words_for(head_dim, bits);
+    if codes.len() != want_codes || scales.len() != want_scales || norms.len() != full_tokens {
         return Err(Error::Quant(format!(
             "rotor K store: ring readback size mismatch (codes {} scales {} norms {}, \
-             want codes/scales {want_codes} norms {full_tokens}) — cannot rebuild blocks",
+             want codes {want_codes} scales {want_scales} norms {full_tokens}) — cannot \
+             rebuild blocks",
             codes.len(),
             scales.len(),
             norms.len(),

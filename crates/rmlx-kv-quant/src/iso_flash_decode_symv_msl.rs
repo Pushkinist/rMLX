@@ -378,6 +378,9 @@ pub fn iso_flash_decode_symv_sdpa<const BITS: u8>(
     let n_tiles = (kv_seq + TILE_SIZE - 1) / TILE_SIZE;
     let n_groups = iso_n_groups_for(head_dim as usize);
     let n_groups_i64 = n_groups as i64;
+    // The code plane is dense across the row's groups, so its stride is its own
+    // number; the scale plane stays one entry per group.
+    let code_words_i64 = crate::code_plane::row_words(head_dim as usize, BITS) as i64;
 
     // ── Flatten Q to [n_bh * head_dim] f32 ────────────────────────────────
     let q_total: i64 = i64::from(n_bh) * i64::from(head_dim);
@@ -390,14 +393,18 @@ pub fn iso_flash_decode_symv_sdpa<const BITS: u8>(
 
     // ── Flatten both packed axes ──────────────────────────────────────────
     let tok_count: i64 = i64::from(b) * i64::from(kv_h) * i64::from(kv_seq);
-    let codes_total: i64 = tok_count * n_groups_i64;
+    let codes_total: i64 = tok_count * code_words_i64;
+    let scales_total: i64 = tok_count * n_groups_i64;
 
     // Scales and norms are bound at the stored sideband dtype, which is what
     // the header's decode helper declares — see `iso_flash_decode_msl`.
     let flatten_axis = |axis: IsoPackedAxis<'_>| -> Result<(Array, Array, Array)> {
         Ok((
             axis.codes.reshape(&[codes_total as i32], device)?,
-            to_sideband_dtype(&axis.scales.reshape(&[codes_total as i32], device)?, device)?,
+            to_sideband_dtype(
+                &axis.scales.reshape(&[scales_total as i32], device)?,
+                device,
+            )?,
             to_sideband_dtype(&axis.norms.reshape(&[tok_count as i32], device)?, device)?,
         ))
     };

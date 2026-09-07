@@ -28,15 +28,15 @@ use crate::KvQuant;
 /// turbo3 kernel). Distinct from `"k8vturbo3"` (asymmetric K8V turbo3) and
 /// from [`TURBOSYM4_LAYOUT_TAG`] (4-bit symmetric) so the SSD reader can
 /// dispatch to the correct symmetric 3-bit hydrate path. Format
-/// `"<codec>_wht_<k_bits>_<v_bits>"`.
-pub const TURBOSYM3_LAYOUT_TAG: &str = "tsym3_wht_3_3";
+/// `"<codec>_lloyd_<k_bits>_<v_bits>"`.
+pub const TURBOSYM3_LAYOUT_TAG: &str = "tsym3_lloyd_3_3";
 
 /// Layout tag for symmetric TurboQuant 4-bit K + tq4 V.
 ///
 /// Single source of truth for the SSD geometry tag (used by `KvBlockWriter` /
 /// `KvBlockReader` and the layout-key tier). Format
-/// `"<codec>_wht_<k_bits>_<v_bits>"`.
-pub const TURBOSYM4_LAYOUT_TAG: &str = "tsym4_wht_4_4";
+/// `"<codec>_lloyd_<k_bits>_<v_bits>"`.
+pub const TURBOSYM4_LAYOUT_TAG: &str = "tsym4_lloyd_4_4";
 
 /// Layout tag for K-axis PlanarQuant 4-bit.
 ///
@@ -319,7 +319,7 @@ pub enum KvStorage {
     /// V = IsoQuant 4-bit (quaternion SO(4) rotation + Lloyd-Max 4-bit codebook).
     ///
     /// Same machinery as [`IsoV3`](KvStorage::IsoV3) with `bits=4` and the
-    /// dense 8-vals-per-u32 pack. CPU-only — the existing MSL kernel is
+    /// dense code plane at 4 bits per code. CPU-only — the existing MSL kernel is
     /// hard-coded for `bits=3`; an iso4 MSL kernel is deferred.
     IsoV4 {
         k: Option<QuantK>,
@@ -338,7 +338,7 @@ pub enum KvStorage {
         max_seq: i32,
     },
     /// Symmetric IsoQuant 4-bit — both K and V use the same
-    /// quaternion SO(4) + 4-bit Lloyd-Max codebook (dense 8-vals-per-u32 pack).
+    /// quaternion SO(4) + 4-bit Lloyd-Max codebook, 4 bits per code in the plane.
     ///
     /// Layout tag: [`ISO_SYM_4_LAYOUT_TAG`]. CPU-only.
     IsoSym4 {
@@ -449,7 +449,7 @@ pub enum KvStorage {
     /// V = rotor4 (Cl(3,0) Clifford rotor sandwich + 4-bit Lloyd-Max codebook).
     ///
     /// 4.25-bit V codec — same Clifford sandwich as rotor3 with the
-    /// 16-centroid Lloyd-Max N(0,1) codebook and dense 8-vals-per-u32 pack
+    /// 16-centroid Lloyd-Max N(0,1) codebook, 4 bits per code in the plane
     /// (iso4 convention). Higher fidelity than rotor3 at the cost of one extra
     /// bit per value in the codes (~10.7 bpe at bits=4). Storage is unaffected:
     /// both widths spend one `u32` code word plus one
@@ -585,7 +585,7 @@ impl KvStorage {
                 v: None,
                 max_seq,
             },
-            // TurboSym3 — symmetric WHT-3 K+V. Never routes through
+            // TurboSym3 — symmetric 3-bit Lloyd-Max K+V. Never routes through
             // the paged path: PagedKStorage is q8-only and there is no paged
             // TurboQuant-K3 variant. Deviation documented in docs/KV_QUANT.md.
             KvQuant::TurboSym3 => Self::TurboSym3 {
@@ -593,7 +593,7 @@ impl KvStorage {
                 v: None,
                 max_seq,
             },
-            // TurboSym4 — symmetric WHT-4 K+V. Never routes through
+            // TurboSym4 — symmetric 4-bit Lloyd-Max K+V. Never routes through
             // the paged path: PagedKStorage is q8-only and adding a TurboQuant-K
             // paged variant is out of scope; deviation documented in
             // docs/KV_QUANT.md.

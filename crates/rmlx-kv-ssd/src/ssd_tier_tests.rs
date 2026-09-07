@@ -259,6 +259,47 @@ fn wipe_removes_superseded_schema_namespace() {
     );
 }
 
+/// The v7 → v8 transition specifically: a namespace written while the packed
+/// K/V ring spent one `u32` code word per group must be reclaimed.
+///
+/// Its blocks carry a code plane the current unpacker reads at the wrong
+/// stride, and every term of the `(hash, layout_key)` key is unmoved — the key
+/// folds arch, layer count, kv_heads, head_dim and the codec `Display` vector,
+/// none of which changes when the bits inside a block are re-cadenced. So the
+/// block hits, hydrates, and decodes plausible-looking K/V. The same bump
+/// covers the renamed `tsym3` / `tsym4` geometry tags, which hydrate dispatches
+/// on by exact string equality.
+///
+/// Seeded at 7 rather than at "anything older", because
+/// `wipe_removes_superseded_schema_namespace` seeds v2 and would keep passing
+/// at any later version — it cannot fail for this transition.
+///
+/// Mutation check: put `SCHEMA_VERSION` back to 7 and the seeded namespace is
+/// `found == SCHEMA_VERSION`, so the pass skips it and the directory survives.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "fixture setup under a temp dir this test owns; a failure is a broken fixture, not a condition under test"
+)]
+fn wipe_removes_the_word_per_group_code_plane_namespace() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let kv_root = tmp.path().to_path_buf();
+    let pre_change = seed_namespace_at_version(&kv_root, "wipe-v7", 7);
+    let current = seed_current_schema_namespace(&kv_root, "keep-current");
+
+    wipe_stale_schema_namespaces(&kv_root);
+
+    assert!(
+        !pre_change.exists(),
+        "a namespace at the word-per-group code plane must be removed, not served: its \
+         blocks hit under an unchanged key and hydrate under a different code cadence"
+    );
+    assert!(
+        current.exists(),
+        "current-schema namespace must survive the same pass"
+    );
+}
+
 /// The v3 → v4 transition specifically: a namespace written before the
 /// bf16-mirror codecs moved their block payload must be reclaimed.
 ///

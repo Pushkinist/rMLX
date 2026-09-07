@@ -82,6 +82,42 @@ pub fn iso_n_groups_i32(head_dim: i32, what: &str) -> Result<i32> {
     })
 }
 
+/// Words the dense code plane holds per iso row of `head_dim` values at `bits`.
+///
+/// One code per value — four per quaternion group — so the row is `head_dim`
+/// codes wide at either width.
+#[must_use]
+pub fn iso_row_words(head_dim: usize, bits: u8) -> usize {
+    crate::code_plane::row_words(head_dim, bits)
+}
+
+/// [`iso_row_words`] as `i32`, with the same group-size invariant as
+/// [`iso_n_groups_i32`].
+///
+/// The ring is told this integer alongside the group count: a dense plane no
+/// longer holds one word per group, so the two strides are separate numbers and
+/// both are the codec's to state.
+///
+/// # Errors
+///
+/// Returns [`Error::Quant`] when `head_dim` is not a positive multiple of
+/// [`ISO_QUAT_BLOCK_SIZE`].
+pub fn iso_code_words_i32(head_dim: i32, bits: u8, what: &str) -> Result<i32> {
+    let hd = usize::try_from(head_dim)
+        .map_err(|_| Error::Quant(format!("{what}: head_dim={head_dim} must be positive")))?;
+    if hd == 0 || !hd.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
+        return Err(Error::Quant(format!(
+            "{what}: head_dim={head_dim} must be a positive multiple of the quaternion \
+             block size {ISO_QUAT_BLOCK_SIZE}"
+        )));
+    }
+    i32::try_from(iso_row_words(hd, bits)).map_err(|_| {
+        Error::Quant(format!(
+            "{what}: code words for head_dim={head_dim} exceeds i32::MAX"
+        ))
+    })
+}
+
 /// Accumulated IsoQuant K cache (3-bit, quaternion SO(4) fast mode).
 ///
 /// Carries both forms of the payload:
@@ -262,7 +298,8 @@ impl QuantIsoK3 {
     /// Forwards a [`synced_iso_v_blocks`] reconciliation error.
     pub fn try_deep_clone(&self) -> Result<Self> {
         let blocks =
-            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?.into_owned();
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, Device::Gpu)?
+                .into_owned();
         Ok(Self {
             // The clone starts CPU-only: `blocks` carries the full payload, so
             // the ring re-seeds from them on the clone's first GPU append.
@@ -336,13 +373,15 @@ impl QuantIsoK3 {
         device: Device,
     ) -> Result<()> {
         let n_groups = iso_n_groups_i32(head_dim, "QuantIsoK3::gpu_append")?;
+        let code_words = iso_code_words_i32(head_dim, ISO_K3_BITS, "QuantIsoK3::gpu_append")?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
-            self.gpu
-                .seed_from_cpu(&c, &s, &n, kv_h, n_groups, prev_seq, max_seq, device)?;
+            self.gpu.seed_from_cpu(
+                &c, &s, &n, kv_h, n_groups, code_words, prev_seq, max_seq, device,
+            )?;
         }
         self.gpu.append_encoded(
-            codes, scales, norms, kv_h, n_groups, prev_seq, new_seq, max_seq, device,
+            codes, scales, norms, kv_h, n_groups, code_words, prev_seq, new_seq, max_seq, device,
         )
     }
 
@@ -399,7 +438,7 @@ impl QuantIsoK3 {
             return Ok(());
         }
         if let std::borrow::Cow::Owned(full) =
-            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, device)?
         {
             self.blocks = full;
         }
@@ -448,7 +487,7 @@ impl QuantIsoK3 {
         // (`blocks` trail `shape[2]`), and this rebuilds it on demand rather than
         // decoding a short prefix and zero-padding the gap. Loud on any
         // unrecoverable disagreement.
-        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, device)?;
 
         if blocks.is_empty() {
             // Loud on a lost decode tail — see [`super::QuantIsoV3::dequant`].
@@ -536,7 +575,7 @@ impl QuantIsoK3 {
         // Reconcile the CPU blocks with the GPU ring first — see
         // [`super::QuantIsoV3::dequant_gpu`] for why both element counts must
         // come from the same source.
-        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, device)?;
 
         // Head-major kernel inputs — see [`super::QuantIsoV3::dequant_gpu`] for
         // why the row order is fixed on the way in rather than reshaped on the
@@ -546,6 +585,7 @@ impl QuantIsoK3 {
             &self.shape,
             n_groups,
             ISO_K3_GROUP_SIZE,
+            iso_row_words(head_dim, self.bits),
             "QuantIsoK3::dequant_gpu",
         )?;
 
@@ -554,7 +594,8 @@ impl QuantIsoK3 {
         }
 
         let n = inputs.total_groups as i32;
-        let codes_arr = Array::from_bytes(&inputs.codes, &[n], Dtype::U32)?;
+        let n_words = (inputs.codes.len() / 4) as i32;
+        let codes_arr = Array::from_bytes(&inputs.codes, &[n_words], Dtype::U32)?;
         let scales_arr = Array::from_bytes(&inputs.scales, &[n], Dtype::F32)?;
         let norms_arr = Array::from_bytes(&inputs.norms, &[n], Dtype::F32)?;
 

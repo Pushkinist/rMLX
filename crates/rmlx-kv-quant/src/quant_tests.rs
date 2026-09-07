@@ -327,19 +327,19 @@ fn mirror_only_codec_is_exactly_break_even_with_bf16() {
     }
 }
 
-/// The two seed-free K-only families split on the bf16 floor, and the split is
-/// the sideband width — not the code width, which is 4 bits in both cases.
+/// Both seed-free K-only families are under the bf16 floor, and by different
+/// margins — the split is the scale cadence, not the code width, which is 4
+/// bits in both cases.
 ///
-/// `IsoKOnly4` packs 4 head-dim slots into one `u32` and spends one scale on
-/// them, plus one norm per token: 8 bits of codes per value and, at the ring's
-/// stored sideband dtype, 4.125 of sideband — under bf16's 16. `RotorKOnly4`
-/// packs 3 slots into the same `u32`, so its codes alone are 10.67 bits per
-/// value and its scale cadence is a third denser; the same narrowing leaves it
-/// above the floor. Both are asserted here so neither result reads as a
-/// property of "K-only codecs" — it is a property of each one's group geometry.
+/// `IsoKOnly4` shares one scale across 4 head-dim slots and `RotorKOnly4`
+/// across 3, so at `head_dim = 128` iso spends 4.000 bits per value on the
+/// sideband against rotor's 5.375, on top of code planes of 4.000 and 4.250.
+/// Both are asserted here so neither result reads as a property of "K-only
+/// codecs" — it is a property of each one's group geometry, and rotor being the
+/// wider of the two is what that geometry buys.
 ///
 /// This is the operator truth the resolve-time net-benefit `warn!` relies on: a
-/// naive bits-only model reads both as a 4× saving.
+/// naive bits-only model reads both as a 4x saving, which neither is.
 #[test]
 fn k_only_iso_and_rotor_codecs_split_on_the_bf16_floor() {
     let (seq, head_dim, kv_heads) = (16_384_u64, 128_u64, 8_u64);
@@ -347,14 +347,18 @@ fn k_only_iso_and_rotor_codecs_split_on_the_bf16_floor() {
         KvQuant::IsoKOnly4.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
     assert!(
         iso > 0,
-        "IsoKOnly4's ring is 12.125 bits per value against bf16's 16 → net-positive; got {iso}"
+        "IsoKOnly4's ring is 8.125 bits per value against bf16's 16 → net-positive; got {iso}"
     );
     let rotor =
         KvQuant::RotorKOnly4.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
     assert!(
-        rotor < 0,
-        "RotorKOnly4's ring is 16.25 bits per value, still above bf16's 16 → net-negative; \
-         got {rotor}"
+        rotor > 0,
+        "RotorKOnly4's ring is 9.75 bits per value against bf16's 16 → net-positive; got {rotor}"
+    );
+    assert!(
+        iso > rotor,
+        "iso shares a scale across 4 values where rotor shares one across 3, so iso must save \
+         more at the same code width: iso={iso} rotor={rotor}"
     );
 }
 
@@ -402,11 +406,10 @@ fn store_plus_mirror_codec_slope_follows_shared_kv() {
     );
 }
 
-/// Both K-only families' net figure scales linearly with context, in opposite
-/// directions, because every term in the store is per-token: iso saves more the
-/// longer the context, rotor costs more. Neither crosses over — there is no
-/// fixed overhead to amortize away, so the sign is set by the geometry alone
-/// and holds at every context.
+/// Both K-only families' net figure scales linearly with context, because every
+/// term in the store is per-token: each saves more the longer the context, and
+/// iso saves more than rotor at every one. There is no fixed overhead to
+/// amortize away, so the ordering is set by the geometry alone.
 #[test]
 fn k_only_codec_net_figures_scale_with_context() {
     let iso_small = KvQuant::IsoKOnly4.estimated_net_saving_per_layer(64, 128, 8, false, false);
@@ -420,9 +423,14 @@ fn k_only_codec_net_figures_scale_with_context() {
     let rot_large =
         KvQuant::RotorKOnly4.estimated_net_saving_per_layer(16_384, 128, 8, false, false);
     assert!(
-        rot_small < 0 && rot_large < rot_small,
-        "rotor K-only's overrun is per-token, so it grows with context: \
+        rot_small > 0 && rot_large > rot_small,
+        "rotor K-only saves at every context and saves more with it: \
          small={rot_small} large={rot_large}"
+    );
+    assert!(
+        iso_large > rot_large,
+        "iso's coarser scale cadence keeps it ahead at every context: \
+         iso={iso_large} rotor={rot_large}"
     );
 }
 
@@ -449,7 +457,7 @@ fn none_codec_zero_saving_vs_itself() {
 /// (`drop_blocks_when_ring_live_iso_*`). The quaternion the CPU blocks carry is
 /// the constant `FIXED_QUAT` replicated per group and never reaches the ring.
 /// So the ring is what a served request holds, and the block form — asserted
-/// below at its measured 3.98x — is what the same store holds only between
+/// below at its measured 6.07x — is what the same store holds only between
 /// `exit_prefill` and the first fused decode step.
 #[test]
 fn estimator_matches_actual_iso_rotor_encode_bytes() {
@@ -472,6 +480,7 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
         &norms,
         kv_heads,
         head_dim / crate::storage::ISO3_GROUP_SIZE,
+        crate::code_plane::row_words(head_dim, 3),
         seq,
     );
     let iso_blocks_actual = crate::storage::IsoBlocks {
@@ -489,8 +498,8 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
     // choice a reader can check rather than a claim.
     let block_ratio = iso_blocks_actual as f64 / iso_ring_actual as f64;
     assert!(
-        (block_ratio - 3.979).abs() < 0.01,
-        "iso CPU blocks must be 3.98x the ring at head_dim=128, got {block_ratio}"
+        (block_ratio - 6.070).abs() < 0.01,
+        "iso CPU blocks must be 6.07x the ring at head_dim=128, got {block_ratio}"
     );
 
     // Iso3Sym quantizes BOTH sides with the iso codec and — like Rotor3Sym —
@@ -521,7 +530,15 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
     let rotors = vec![0.5f32; n_groups * 4];
     let (r_codes, r_scales, r_norms) =
         crate::rotorquant::rotor3_encode(&v, &rotors, head_dim).unwrap();
-    let rotor_side_actual = ring_side_bytes(&r_codes, &r_scales, &r_norms, kv_heads, n_groups, seq);
+    let rotor_side_actual = ring_side_bytes(
+        &r_codes,
+        &r_scales,
+        &r_norms,
+        kv_heads,
+        n_groups,
+        crate::rotorquant::row_words_for(head_dim, 3),
+        seq,
+    );
     let est_r = KvQuant::Rotor3Sym.estimated_resident_bytes_per_layer(
         seq,
         head_dim as u64,
@@ -569,11 +586,11 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
         "iso3 must report a net saving at head_dim=128, got {saving}"
     );
 
-    // Rotor does NOT clear the floor at the same geometry, and that is the
-    // point of measuring the two families side by side: the same narrowing
-    // takes rotor from 21.75 to 16.25 bits per value, a 25% cut that still
-    // leaves it above bf16, because rotor spends a whole u32 code word per 3
-    // head-dim slots — 10.67 bits per value before any sideband.
+    // Rotor clears the floor too, by less: it is the same dense code plane over
+    // a group of 3 rather than 4, so it stores a third more scales for the same
+    // values — 8.75 bits per value against iso3's 7.125. Measured side by side
+    // so the ordering is a property of the two geometries and not of one
+    // figure.
     let saving_r = KvQuant::Rotor3Sym.estimated_net_saving_per_layer(
         seq,
         head_dim as u64,
@@ -582,8 +599,13 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
         false,
     );
     assert!(
-        saving_r < 0,
-        "rotor3 must still report net-negative at head_dim=128, got {saving_r}"
+        saving_r > 0,
+        "rotor3 must report a net saving at head_dim=128, got {saving_r}"
+    );
+    assert!(
+        saving > saving_r,
+        "iso3 shares one scale across 4 values where rotor3 shares one across 3, so iso must \
+         save more: iso={saving} rotor={saving_r}"
     );
 
     // The V-only variant is a different codec, not a cheaper one. `Iso3`
@@ -606,26 +628,23 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
     );
 }
 
-/// The eight iso / rotor codecs that quantize K split by family on the bf16
-/// floor, at every context, `head_dim` and KV-head count — and the split does
-/// not depend on any of those.
+/// All eight iso / rotor codecs that quantize K are under the bf16 floor, at
+/// every context, `head_dim` and KV-head count — and iso is under it by more
+/// than rotor at every one of them.
 ///
-/// Both families spend one whole `u32` code word per group, plus one scale per
-/// group and one norm per token, the two sideband planes at the ring's stored
-/// dtype. The group is 4 head-dim slots for iso and 3 for rotor, so the codes
-/// alone are 8 bits per value for iso and 10.67 for rotor. With a `bf16`
-/// sideband that puts iso at `12 + 16/head_dim` and rotor at
-/// `(48 * ceil(head_dim/3) + 16) / head_dim` — under and over bf16's 16
-/// respectively, with no `head_dim` in between: iso's sideband term shrinks
-/// with `head_dim` and rotor's code term never does. The nominal 3-bit / 4-bit
-/// codebook width never reaches the store, which is why the 3-bit and 4-bit
-/// member of each family occupy byte-identical storage.
+/// Both families hold the row's dense code plane plus one scale per group and
+/// one norm per token, the two sideband planes at the ring's stored dtype. The
+/// group is 4 head-dim slots for iso and 3 for rotor, and rotor stores three
+/// codes per group against iso's four, so at `bits = 4` the codes are 4.000
+/// bits per value for iso and 4.250 for rotor while the scales are 4.000 and
+/// 5.375. Rotor's coarser scale cadence is what keeps it the wider family, and
+/// no `head_dim` reverses that: both terms are ratios fixed by the group size.
 ///
-/// Pinned as a sweep in both directions: a change that pushes iso back over the
-/// floor, or that appears to pull rotor under it without changing rotor's code
-/// cadence, has to come back through here.
+/// Pinned as a sweep in both directions: a change that pushes either family
+/// back over the floor, or that reverses the ordering between them, has to come
+/// back through here.
 #[test]
-fn iso_k_codecs_win_and_rotor_k_codecs_do_not_at_every_geometry() {
+fn iso_and_rotor_k_codecs_are_under_the_floor_at_every_geometry() {
     let iso = [
         KvQuant::IsoKOnly3,
         KvQuant::IsoKOnly4,
@@ -641,27 +660,27 @@ fn iso_k_codecs_win_and_rotor_k_codecs_do_not_at_every_geometry() {
     for head_dim in [64_u64, 128, 256, 512] {
         for kv_heads in [1_u64, 8] {
             for seq in [256_u64, 4096, 65_536] {
-                for q in iso {
+                for q in iso.iter().chain(rotor.iter()) {
                     let saving =
                         q.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
                     assert!(
                         saving > 0,
                         "{q} at seq={seq} head_dim={head_dim} kv_heads={kv_heads} reports \
-                         {saving} B — the iso ring is 12 bits of codes plus a per-token \
-                         sideband that shrinks with head_dim, so it is under bf16 at every \
-                         geometry"
+                         {saving} B — a dense code plane plus a per-group scale is under bf16 \
+                         at every geometry for both families"
                     );
                 }
-                for q in rotor {
-                    let saving =
-                        q.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
+                // Same width, same context: iso must save more, because it
+                // spends one scale per 4 values where rotor spends one per 3.
+                for (i, r) in iso.iter().zip(rotor.iter()) {
+                    let iso_saving =
+                        i.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
+                    let rotor_saving =
+                        r.estimated_net_saving_per_layer(seq, head_dim, kv_heads, false, false);
                     assert!(
-                        saving < 0,
-                        "{q} at seq={seq} head_dim={head_dim} kv_heads={kv_heads} reports a \
-                         {saving} B saving vs bf16 — rotor spends a u32 per 3 head-dim slots, \
-                         so it cannot be smaller than bf16 whatever its sideband costs, and a \
-                         non-negative number here means the layout model has drifted from the \
-                         store"
+                        iso_saving > rotor_saving,
+                        "{i} must save more than {r} at seq={seq} head_dim={head_dim} \
+                         kv_heads={kv_heads}: {iso_saving} vs {rotor_saving}"
                     );
                 }
             }
@@ -1461,6 +1480,7 @@ fn ring_side_bytes(
     norms: &[f32],
     kv_heads: u64,
     n_groups: usize,
+    code_words: usize,
     seq: u64,
 ) -> u64 {
     let mut ring = crate::storage::QuantKGpuRing::default();
@@ -1470,6 +1490,7 @@ fn ring_side_bytes(
         norms,
         kv_heads as i32,
         n_groups as i32,
+        code_words as i32,
         seq as i32,
         seq as i32,
         Device::Cpu,
@@ -1527,6 +1548,7 @@ fn measured_side_bytes(layout: StoreLayout, data: &[f32], geom: Cadence) -> u64 
                     &norms,
                     geom.kv_heads,
                     head_dim / crate::storage::ISO3_GROUP_SIZE,
+                    crate::code_plane::row_words(head_dim, bits),
                     geom.seq,
                 )
             }
@@ -1539,7 +1561,15 @@ fn measured_side_bytes(layout: StoreLayout, data: &[f32], geom: Cadence) -> u64 
             } else {
                 crate::rotorquant::rotor4_encode(data, &rotors, head_dim).unwrap()
             };
-            ring_side_bytes(&codes, &scales, &norms, geom.kv_heads, n_groups, geom.seq)
+            ring_side_bytes(
+                &codes,
+                &scales,
+                &norms,
+                geom.kv_heads,
+                n_groups,
+                crate::rotorquant::row_words_for(head_dim, bits),
+                geom.seq,
+            )
         }
         StoreLayout::Affine { bits, group } => affine_tuple(data, geom, bits, group).byte_size(),
     }
@@ -1836,13 +1866,27 @@ fn iso_and_rotor_side_bytes_track_the_stored_sideband_dtype() {
         // n_groups per row is the codec's rule, not the ring's: one quaternion
         // block per 4 head-dim slots for iso, one multivector group per 3 for
         // rotor (tail-padded).
-        for &(store, n_groups, name) in &[
-            (super::SideStore::IsoRing, geom.head_dim / 4, "iso"),
-            (super::SideStore::Rotor, geom.head_dim.div_ceil(3), "rotor"),
+        for &(store, n_groups, codes_per_row, name) in &[
+            (
+                super::SideStore::IsoRing,
+                geom.head_dim / 4,
+                geom.head_dim,
+                "iso",
+            ),
+            (
+                super::SideStore::Rotor,
+                geom.head_dim.div_ceil(3),
+                geom.head_dim.div_ceil(3) * 3,
+                "rotor",
+            ),
         ] {
             let modelled = super::packed_side_bytes(store, 3, elems, geom.head_dim, n_tokens);
             let modelled_bits = (modelled * 8) as f64 / elems as f64;
-            let ring_bits = crate::storage::ring_bits_per_value(geom.head_dim, n_groups);
+            let ring_bits = crate::storage::ring_bits_per_value(
+                geom.head_dim,
+                n_groups,
+                crate::code_plane::row_words(codes_per_row as usize, 3) as u64,
+            );
             assert!(
                 (modelled_bits - ring_bits).abs() < 1e-9,
                 "{name} at head_dim={}: the byte model spends {modelled_bits} bits per value, \
@@ -1851,6 +1895,86 @@ fn iso_and_rotor_side_bytes_track_the_stored_sideband_dtype() {
             );
         }
     }
+}
+
+/// The packed codecs' code plane spends the bits its codes need, and at most
+/// one padding word per row.
+///
+/// Measured off the encoders' own output, not off a declared rate: the codes
+/// vector's length is the plane, and the bits the codec has to store is
+/// `codes per row x bits`. A plane that rounds up per *group* rather than per
+/// row passes every rate assertion in this file — the model and the store agree
+/// on a figure they both compute the same wasteful way — and fails here, which
+/// is the point. `iso3` at `head_dim = 128` is the worst cell: 4 codes of 3
+/// bits in a 32-bit word is 62.5% padding.
+#[test]
+fn the_code_plane_spends_no_more_than_a_padding_word_per_row() {
+    for &geom in CADENCE_GEOMETRIES {
+        let data = geom.data();
+        let head_dim = geom.head_dim as usize;
+        let rows = geom.rows() as usize;
+
+        for bits in [3_u8, 4] {
+            // iso: one quaternion block per 4 head-dim slots, 4 codes each.
+            let (codes, _, _, _) =
+                crate::isoquant::iso_encode_fast(&data, head_dim, 4, bits).unwrap();
+            assert_plane_is_dense(&codes, rows, head_dim, bits, &format!("iso{bits}"), geom);
+
+            // rotor: one Cl(3,0) group per 3 head-dim slots. Only the three
+            // grade-1 components carry information — the other five are
+            // algebraically zero and are not stored.
+            let n_groups = crate::rotorquant::n_groups_for(head_dim);
+            let rotors = crate::clifford::make_rotor_table(0, 0, n_groups);
+            let (codes, _, _) = if bits == 3 {
+                crate::rotorquant::rotor3_encode(&data, &rotors, head_dim).unwrap()
+            } else {
+                crate::rotorquant::rotor4_encode(&data, &rotors, head_dim).unwrap()
+            };
+            assert_plane_is_dense(
+                &codes,
+                rows,
+                n_groups * crate::rotorquant::ROTOR_CODES_PER_GROUP,
+                bits,
+                &format!("rotor{bits}"),
+                geom,
+            );
+        }
+    }
+}
+
+/// `codes` holds `rows` rows of `codes_per_row` codes at `bits`, with less than
+/// a whole word of padding per row.
+fn assert_plane_is_dense(
+    codes: &[u32],
+    rows: usize,
+    codes_per_row: usize,
+    bits: u8,
+    what: &str,
+    geom: Cadence,
+) {
+    let words_per_row = codes.len() / rows;
+    assert_eq!(
+        codes.len() % rows,
+        0,
+        "{what} at head_dim={}: {} code words do not divide into {rows} rows",
+        geom.head_dim,
+        codes.len()
+    );
+    let needed = codes_per_row * bits as usize;
+    let held = words_per_row * 32;
+    assert!(
+        held >= needed,
+        "{what} at head_dim={}: the plane holds {held} bits per row for {needed} bits of codes",
+        geom.head_dim
+    );
+    assert!(
+        held - needed < 32,
+        "{what} at head_dim={}: the plane holds {held} bits per row where the codes need \
+         {needed} — {} bits of padding, more than the one partial word a row-aligned dense \
+         plane costs",
+        geom.head_dim,
+        held - needed
+    );
 }
 
 /// Three of the seven [`SideStore`] variants are reachable from the estimator;

@@ -116,9 +116,9 @@
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
+use crate::code_plane::render_msl_code_plane;
 use crate::rotorquant::{
-    ROTOR3_BITS, ROTOR3_GROUP_SIZE, ROTOR3_MV_COMPONENTS, ROTOR3_VALS_PER_WORD,
-    ROTOR3_WORDS_PER_GROUP, ROTOR4_BITS, ROTOR4_VALS_PER_WORD, ROTOR4_WORDS_PER_GROUP,
+    ROTOR3_BITS, ROTOR3_GROUP_SIZE, ROTOR3_MV_COMPONENTS, ROTOR4_BITS, ROTOR_CODES_PER_GROUP,
 };
 use crate::storage::{sideband_to_f32_vec, to_sideband_dtype, KV_SIDEBAND_DTYPE};
 use crate::turboquant::lloyd_gaussian_codebook;
@@ -137,12 +137,8 @@ const _: () = assert!(
     "rotor MSL kernel assumes 3 grade-1 components per group"
 );
 const _: () = assert!(
-    ROTOR3_WORDS_PER_GROUP == 1,
-    "rotor3 MSL pack: 8 codes × 3 bits = 24 bits ≤ 30 → 1 u32 per group"
-);
-const _: () = assert!(
-    ROTOR4_WORDS_PER_GROUP == 1,
-    "rotor4 MSL pack: 8 codes × 4 bits = 32 bits → 1 u32 per group (dense)"
+    ROTOR_CODES_PER_GROUP == ROTOR3_GROUP_SIZE,
+    "the rotor kernels store one code per grade-1 component and no more"
 );
 
 // ── MSL header builder ────────────────────────────────────────────────────────
@@ -171,11 +167,6 @@ fn build_msl_header(bits: u8) -> Result<String> {
     };
     let n_centroids: usize = 1usize << bits;
     let n_bounds: usize = n_centroids - 1;
-    let vals_per_word: usize = if bits == ROTOR3_BITS {
-        ROTOR3_VALS_PER_WORD
-    } else {
-        ROTOR4_VALS_PER_WORD
-    };
 
     let cb = lloyd_gaussian_codebook(bits).map_err(|e| {
         rmlx_core::error::Error::Mlx(format!(
@@ -254,12 +245,9 @@ fn build_msl_header(bits: u8) -> Result<String> {
          // Multivector component count (Cl(3,0) basis size).\n\
          constant uint  {prefix}_MV = {mv_components}u;\n\
          // Grade-1 group size (3 grade-1 components per group; one rotor).\n\
-         constant uint  {prefix}_GS = {group_size}u;\n\
-         // {bits}-bit values per u32 word.\n\
-         constant uint  {prefix}_VPW = {vals_per_word}u;\n\
-         // u32 words per group = 1 for both rotor3 (24/30 bits) and rotor4 (32/32 dense).\n\
-         constant uint  {prefix}_WPG = 1u;\n"
+         constant uint  {prefix}_GS = {group_size}u;\n"
     );
+    s.push_str(&render_msl_code_plane(bits, ROTOR_CODES_PER_GROUP));
     Ok(s)
 }
 
@@ -274,7 +262,7 @@ fn build_msl_header(bits: u8) -> Result<String> {
 //   head_dim  : u32 [1]                      — scalar uniform
 //
 // Outputs:
-//   codes_out  : u32 [n_tokens * n_groups]   — packed codes, 1 u32 per group
+//   codes_out  : u32 [n_tokens * row_words]  — the dense code plane
 //   scales_out : f32 [n_tokens * n_groups]   — per-group scale
 //   norms_out  : f32 [n_tokens * n_groups]   — per-group L2 norm slot (same per token)
 //
@@ -304,7 +292,7 @@ static ROTOR4_QUANT_KERNEL: OnceLock<Result<MetalKernel>> = OnceLock::new();
 static ROTOR4_DEQUANT_KERNEL: OnceLock<Result<MetalKernel>> = OnceLock::new();
 static ROTOR4_KERNEL_HEADER: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 
-fn kernel_header_rotor3() -> Result<&'static str> {
+pub(crate) fn kernel_header_rotor3() -> Result<&'static str> {
     match ROTOR3_KERNEL_HEADER
         .get_or_init(|| build_msl_header(ROTOR3_BITS).map_err(|e| e.to_string()))
     {
@@ -315,7 +303,7 @@ fn kernel_header_rotor3() -> Result<&'static str> {
     }
 }
 
-fn kernel_header_rotor4() -> Result<&'static str> {
+pub(crate) fn kernel_header_rotor4() -> Result<&'static str> {
     match ROTOR4_KERNEL_HEADER
         .get_or_init(|| build_msl_header(ROTOR4_BITS).map_err(|e| e.to_string()))
     {
@@ -446,7 +434,7 @@ fn validate_rotors_len(rotors: &Array, n_groups: usize) -> Result<()> {
 /// # Returns
 ///
 /// `(codes, scales, norms)`:
-/// * `codes`: `u32 [n_tokens * n_groups]` (1 word per group, 3 bits × 8 codes).
+/// * `codes`: the dense code plane, `row_words_for(head_dim, bits)` u32 per token.
 /// * `scales`: `f32 [n_tokens * n_groups]` per-group scale.
 /// * `norms`: `f32 [n_tokens * n_groups]` per-group L2 norm slot (caller may
 ///   deduplicate to per-token via [`rotor_gpu_outputs_to_cpu`]).
@@ -634,8 +622,11 @@ fn rotor_quantize_gpu_impl(
     invoke.add_input(&n_groups_arr)?;
     invoke.add_input(&head_dim_arr)?;
 
-    // codes_out: 1 u32 per group.
-    invoke.add_output_shape(&[total_groups as i32], Dtype::U32)?;
+    // codes_out: the dense code plane, one row per token.
+    invoke.add_output_shape(
+        &[(n_tokens * crate::rotorquant::row_words_for(head_dim, bits)) as i32],
+        Dtype::U32,
+    )?;
     // scales_out / norms_out at the ring's stored sideband dtype, so the ring
     // append is a straight `slice_update` with no conversion on the
     // per-decode-step path.
@@ -687,10 +678,12 @@ fn rotor_dequantize_gpu_impl(
     let total_elems = n_tokens * head_dim;
     validate_rotors_len(rotors, n_groups)?;
 
+    let want_codes = n_tokens * crate::rotorquant::row_words_for(head_dim, bits);
     let codes_len: usize = codes_packed.shape().iter().map(|&d| d as usize).product();
-    if codes_len != total_groups {
+    if codes_len != want_codes {
         return Err(rmlx_core::error::Error::Quant(format!(
-            "rotor_dequantize_gpu: codes length {codes_len} != total_groups {total_groups}"
+            "rotor_dequantize_gpu: codes length {codes_len} != the {want_codes} words \
+             {n_tokens} rows of the dense code plane hold"
         )));
     }
     let scales_len: usize = scales.shape().iter().map(|&d| d as usize).product();
@@ -700,7 +693,7 @@ fn rotor_dequantize_gpu_impl(
         )));
     }
 
-    let codes_flat = codes_packed.reshape(&[total_groups as i32], device)?;
+    let codes_flat = codes_packed.reshape(&[want_codes as i32], device)?;
     // The kernel declares both planes at the stored sideband dtype; MLX binds
     // by the array's own dtype, so a caller-supplied `f32` plane would be
     // reinterpreted rather than rejected.
@@ -788,8 +781,10 @@ pub fn rotor_gpu_outputs_to_cpu(
     norms_gpu: &Array,
     n_tokens: usize,
     n_groups: usize,
+    code_words: usize,
 ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
     let total_groups = n_tokens.saturating_mul(n_groups);
+    let want_codes = n_tokens.saturating_mul(code_words);
     if total_groups == 0 {
         return Err(rmlx_core::error::Error::Quant(
             "rotor_gpu_outputs_to_cpu: n_tokens * n_groups must be > 0".to_owned(),
@@ -816,9 +811,9 @@ pub fn rotor_gpu_outputs_to_cpu(
     // once per quantize call, off the per-decode-step path.
     let norms_per_group: Vec<f32> = sideband_to_f32_vec(norms_gpu, "norms_per_group")?;
 
-    if codes.len() != total_groups {
+    if codes.len() != want_codes {
         return Err(rmlx_core::error::Error::Quant(format!(
-            "rotor_gpu_outputs_to_cpu: codes len {} != expected {total_groups}",
+            "rotor_gpu_outputs_to_cpu: codes len {} != expected {want_codes}",
             codes.len()
         )));
     }

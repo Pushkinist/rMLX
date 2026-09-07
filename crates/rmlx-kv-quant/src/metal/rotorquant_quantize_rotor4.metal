@@ -40,30 +40,25 @@ float R2 =
 float R3 =
     (-2.0f * s * b13 + 2.0f * b23 * b12) * v1 + (-2.0f * s * b23 - 2.0f * b13 * b12) * v2 + (s2 - b13_2 - b23_2 + b12_2) * v3;
 
-float rots[8];
-rots[0] = 0.0f;
-rots[1] = R1;
-rots[2] = R2;
-rots[3] = R3;
-rots[4] = 0.0f;
-rots[5] = 0.0f;
-rots[6] = 0.0f;
-rots[7] = 0.0f;
-
 float abs_max   = max(max(abs(R1), abs(R2)), abs(R3));
 float scale     = float(bfloat((abs_max < 1e-12f) ? 1e-12f : (abs_max / ROTOR4_CB_MAX)));
 scales_out[gid] = bfloat(scale);
 
-uint code_word = gid * ROTOR4_WPG;
-for (uint e = 0u; e < ROTOR4_MV; e++) {
+// ── Quantize the three grade-1 components into the dense code plane ──────
+// The other five multivector components are algebraically zero — the rotor
+// sandwich preserves grade — so they are not stored.
+float rots[CP_CODES_PER_GROUP];
+rots[0] = R1;
+rots[1] = R2;
+rots[2] = R3;
+
+uint row_base = token * cp_row_words(n_grp);
+for (uint e = 0u; e < CP_CODES_PER_GROUP; e++) {
     float norm_val = (scale > 0.0f) ? (rots[e] / scale) : 0.0f;
     uint idx       = 0u;
     for (uint bi = 0u; bi < 15u; bi++) {
         if (norm_val > ROTOR4_BOUNDS[bi])
             idx++;
     }
-    uint shift = e * 4u;
-    atomic_fetch_or_explicit((device atomic_uint *)&codes_out[code_word],
-                             (idx & 0xFu) << shift,
-                             memory_order_relaxed);
+    cp_write_code(codes_out, row_base, grp * CP_CODES_PER_GROUP + e, idx);
 }
