@@ -1841,13 +1841,19 @@ fn rollback_round_caches(
 /// Rebuild every recurrent layer's state at `kept` positions into this round
 /// from the tape its forwards recorded.
 ///
-/// `round_len` is how many positions the round fed. Each layer's tape must hold
-/// exactly that many, and this refuses the round rather than refolding when one
-/// does not: a tape that is short recorded fewer forwards than the round took —
-/// armed late, or a forward that ran with recording off — and refolding it
-/// would leave the recurrent state describing a different prefix from the K/V
-/// stack beside it, which no later call can detect and which shows up only as
-/// wrong tokens.
+/// `round_len` is how many positions the round fed. Each recurrent layer's tape
+/// must hold exactly that many, and this refuses the round rather than refolding
+/// when one does not: a tape that is short recorded fewer forwards than the
+/// round took — armed late, or a forward that ran with recording off — and
+/// refolding it would leave the recurrent state describing a different prefix
+/// from the K/V stack beside it, which no later call can detect and which shows
+/// up only as wrong tokens.
+///
+/// `lin` carries one slot per decoder layer, and on a hybrid most of them belong
+/// to full-attention layers that never touch a recurrence. Those record nothing
+/// and hold no state, and are skipped. Holding no state is what separates them
+/// from a recurrent layer whose forward failed to record: that one has a state
+/// this round advanced, and an empty tape for it is the defect above.
 fn refold_lin_tapes(
     lin: &mut [LinearAttnCache],
     round_len: usize,
@@ -1865,6 +1871,9 @@ fn refold_lin_tapes(
             )));
         };
         let taped = tape.positions();
+        if taped == 0 && cache.conv_state.is_none() && cache.delta_state.is_none() {
+            continue;
+        }
         if taped != round_len {
             return Err(Error::Model(format!(
                 "refold_lin_tapes: recurrent layer {idx} taped {taped} positions over \
