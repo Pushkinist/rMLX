@@ -7,8 +7,8 @@
 //! `text_config missing num_experts` error).
 
 use super::{
-    classify_mtp_draft, decide_draft_kind, drafted_per_round, mtp_reject_reason, round_block,
-    MtpDraftFamily, MIN_DRAFT_BLOCK_SIZE,
+    classify_mtp_draft, decide_draft_kind, mtp_reject_reason, round_block, MtpDraftFamily,
+    MIN_DRAFT_BLOCK_SIZE,
 };
 use rmlx_models::{Declared, DraftKind};
 
@@ -157,7 +157,7 @@ fn one_flag_value_is_one_round_block() {
         for block in [MIN_DRAFT_BLOCK_SIZE, 5, 16] {
             assert_eq!(round_block(Some(block), declared).ok(), Some(block));
             assert_eq!(
-                drafted_per_round(block) + 1,
+                rmlx_models::speculative::drafts_per_round(block) + 1,
                 block,
                 "the two-model loop records k + 1, which must be the block the flag named"
             );

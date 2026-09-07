@@ -201,7 +201,7 @@ const MIN_LENGTH_RATIO: f64 = 0.60;
 /// served that instead, which is what [`Pair::block`] carries for the pairs
 /// whose loops read a declaration.
 const BLOCK_SIZE: usize = rmlx_models::speculative::DEFAULT_BLOCK_SIZE;
-use rmlx_models::speculative::default_block_for;
+use rmlx_models::speculative::{default_block_for, drafts_per_round};
 
 /// Context both arms run under. Above the 4k prompt plus the budget, and the
 /// same on both sides — a different cap on either would make this a measurement
@@ -2058,6 +2058,10 @@ fn declared_backbone_hidden(draft_path: &Path) -> Option<usize> {
 ///
 /// `None` on either side is no opinion: the DFlash 2 and EAGLE-3 drafters
 /// declare no `quantization` block at all.
+///
+/// It speaks for the sidecar loops only. A two-model draft is a whole model that
+/// shares the verifier's tokenizer and nothing else, so its weight format is
+/// unrelated to the verifier's and a pair of different ones is a pair.
 fn declared_quant_mode(path: &Path) -> Option<String> {
     let cfg = draft_config(path)?;
     for at in [&cfg["quantization"], &cfg["text_config"]["quantization"]] {
@@ -2526,13 +2530,18 @@ impl Loaded {
                         .1
                     }
                 },
+                // This loop takes a draft count where every other takes a
+                // block. The two are one apart, so passing a block here runs a
+                // round one position wider than the pair names and than the
+                // serve layer runs — which reads as a plausible block on both
+                // sides of the comparison.
                 Engine::TwoModel(dispatcher) => {
                     dispatcher
                         .spec_generate_greedy(
                             &self.tokenizer,
                             &ids,
                             N_TOKENS,
-                            self.block.unwrap_or(BLOCK_SIZE),
+                            drafts_per_round(self.block.unwrap_or(BLOCK_SIZE)),
                             Some(rmlx_kv_quant::KvQuant::None),
                             Some(MAX_CTX),
                             0,
@@ -2636,22 +2645,26 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
         }
     }
     let model_path = common::model_for(&pair.verifier, test)?;
-    // A drafter quantized differently from its verifier is not this pair, and
-    // nothing downstream says so — see `declared_quant_mode`.
-    match (
-        declared_quant_mode(&draft_path),
-        declared_quant_mode(&model_path),
-    ) {
-        (Some(d), Some(v)) if d != v => {
-            eprintln!(
-                "SKIP {test}: {} is quantized {d} and {} is quantized {v}, so the two \
-                 are not this pair",
-                draft_path.display(),
-                model_path.display(),
-            );
-            return None;
+    // A sidecar quantized differently from its verifier is not this pair, and
+    // nothing downstream says so — see `declared_quant_mode`. The two-model arm
+    // is exempt because its draft is an independent model: it shares the
+    // verifier's tokenizer and nothing else, so the two weight formats are
+    // unrelated and a pair of different ones is a pair.
+    if pair.round_loop != RoundLoop::TwoModelGreedy {
+        if let (Some(d), Some(v)) = (
+            declared_quant_mode(&draft_path),
+            declared_quant_mode(&model_path),
+        ) {
+            if d != v {
+                eprintln!(
+                    "SKIP {test}: {} is quantized {d} and {} is quantized {v}, so the \
+                     two are not this pair",
+                    draft_path.display(),
+                    model_path.display(),
+                );
+                return None;
+            }
         }
-        _ => {}
     }
     // The two-model loop's kind is an inference from the architecture registry,
     // so a full model of any family declares itself this pair's drafter. The

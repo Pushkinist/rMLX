@@ -104,8 +104,9 @@ pub const MIN_DRAFT_BLOCK_SIZE: usize = 2;
 /// token included.
 ///
 /// One meaning for every drafter. The sidecar loops take this number as their
-/// block and draft one fewer; the two-model loop takes [`drafted_per_round`] of
-/// it and counts the block back as `k + 1`.
+/// block and draft one fewer; the two-model loop takes
+/// [`rmlx_models::speculative::drafts_per_round`] of it and counts the block back
+/// as `k + 1`.
 ///
 /// **It is what the round loop is asked for, not what it runs.** Each loop
 /// resolves the block again against its own drafter and then narrows it per
@@ -139,11 +140,6 @@ fn round_block(flag: Option<usize>, declared: Option<usize>) -> rmlx_core::Resul
              least {MIN_DRAFT_BLOCK_SIZE}"
         ))),
     }
-}
-
-/// How many tokens the two-model loop drafts per round of `block` tokens.
-const fn drafted_per_round(block: usize) -> usize {
-    block - 1
 }
 
 /// The drafter kind a run is under.
@@ -1002,7 +998,7 @@ impl Generator for SpeculativeGenerator {
                     &tokenizer,
                     &prompt_tokens,
                     n_tokens,
-                    drafted_per_round(block_size),
+                    rmlx_models::speculative::drafts_per_round(block_size),
                     kv_quant_override,
                     max_ctx_override,
                     prompt_cache_slots,

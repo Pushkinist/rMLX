@@ -1819,6 +1819,19 @@ pub(crate) fn argmax_tokens(bytes: &[u8], k: usize) -> Result<Vec<u32>> {
         .collect())
 }
 
+/// How many tokens a round of `block` tokens drafts: the block less the
+/// verifier's own token.
+///
+/// The two-model loop is the only one that takes a draft count where the others
+/// take a block, so it is the only place the two units meet — and they are the
+/// same number one apart, which is exactly the shape a unit error hides in. One
+/// producer, so the serve layer and the equivalence harness cannot drift into
+/// asking that loop for different widths under the same name.
+#[must_use]
+pub const fn drafts_per_round(block: usize) -> usize {
+    block.saturating_sub(1)
+}
+
 /// How many tokens a two-model round drafts, bounded by what one verify forward
 /// can score.
 ///
