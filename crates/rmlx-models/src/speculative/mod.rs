@@ -157,6 +157,32 @@ const VOCAB_TAIL_TOLERANCE: usize = 128;
 /// magnitude of this.
 const VOCAB_ID_CEILING: u32 = 1 << 22;
 
+/// Largest block any round loop here can verify, and so the largest a
+/// checkpoint may declare or a request ask for.
+///
+/// **The block is scored in one un-chunked forward.** A round calls
+/// `Architecture::forward_verify_capture` once over the carry token and every
+/// proposal, and that forward materialises `block_size * vocab_size` logits in a
+/// single Metal command buffer — the round loop needs all of them, because it
+/// argmaxes every position to walk the acceptance. There is no chunked variant
+/// it could fall back on: `forward_verify_capture_chunked` exists precisely
+/// because that stops working, and it buys its headroom by materialising the
+/// *last* position's logits only, which a verify pass cannot do.
+///
+/// The number is the one that path already records as measured: a `[1, n, vocab]`
+/// logit tensor in one command buffer times the GPU out above roughly a thousand
+/// positions on this verifier's family, and a 4096-position single shot exceeds
+/// the Metal watchdog on logits alone. So a block above this describes a round
+/// that cannot be run rather than one that would be slow — and the block is what
+/// sizes the round's token buffer, its verify input, and on the loops that have
+/// one, the selector chain and a mask quadratic in it.
+///
+/// Real blocks are single digits; the published DFlash 2 checkpoint declares 8
+/// and its own guidance recommends 5 against a quantized pair. This is a
+/// structural ceiling with two orders of magnitude of headroom over anything
+/// that drafts, not a tuning knob.
+pub(crate) const MAX_BLOCK_SIZE: usize = 1024;
+
 /// The vocabulary a snapshot's `tokenizer.json` declares, added tokens included.
 fn snapshot_vocab(dir: &Path) -> Result<HashMap<String, u32>> {
     let path = dir.join("tokenizer.json");

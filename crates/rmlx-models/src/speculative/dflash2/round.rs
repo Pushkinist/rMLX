@@ -51,7 +51,7 @@ use crate::decode_loop::ProbeStep;
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, disarm_lin_tapes, emit_step, guard_verifier_prefill_logits,
     phases_charged, rollback_round_caches, verifier_context, verifier_kv_bytes, DecodeWindow,
-    RoundPhases, RoundStats, SpecLoop, VerifierDraw,
+    RoundPhases, RoundStats, SpecLoop, VerifierDraw, MAX_BLOCK_SIZE,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -61,32 +61,6 @@ use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 /// prefill of a long prompt would put the whole capture and a full-vocabulary
 /// logit tensor in one Metal command buffer.
 const PREFILL_CHUNK_SIZE: usize = 1024;
-
-/// Largest block this loop can verify, and so the largest a checkpoint may
-/// declare.
-///
-/// **The block is scored in one un-chunked forward.** A round calls
-/// `Architecture::forward_verify_capture` once over the carry token and every
-/// proposal, and that forward materialises `block_size * vocab_size` logits in a
-/// single Metal command buffer — the round loop needs all of them, because it
-/// argmaxes every position to walk the acceptance. There is no chunked variant
-/// it could fall back on: `forward_verify_capture_chunked` exists precisely
-/// because that stops working, and it buys its headroom by materialising the
-/// *last* position's logits only, which a verify pass cannot do.
-///
-/// The number is the one that path already records as measured: a `[1, n, vocab]`
-/// logit tensor in one command buffer times the GPU out above roughly a thousand
-/// positions on this verifier's family, and a 4096-position single shot exceeds
-/// the Metal watchdog on logits alone. So a checkpoint declaring a block above
-/// this is describing a round that cannot be run rather than one that would be
-/// slow — and the block is what sizes the round's token buffer, the verify
-/// input, the selector's chain and a mask quadratic in it.
-///
-/// Real DFlash 2 blocks are single digits; the published checkpoint declares 8
-/// and its own guidance recommends 5 against a quantized pair. This is a
-/// structural ceiling with two orders of magnitude of headroom over anything
-/// that drafts, not a tuning knob.
-pub(super) const MAX_BLOCK_SIZE: usize = 1024;
 
 /// The block a request runs at: what it asked for, what the checkpoint was
 /// trained at, and what one verify forward can score — whichever is smallest,

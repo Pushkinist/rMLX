@@ -396,7 +396,7 @@ fn a_config_the_forward_could_not_honour_is_refused() {
 )]
 fn each_size_bound_accepts_its_boundary_and_refuses_one_past_it() {
     let axis = u64::try_from(i32::MAX).expect("i32::MAX is a u64");
-    let block = round::MAX_BLOCK_SIZE as u64;
+    let block = crate::speculative::MAX_BLOCK_SIZE as u64;
     let cases: &[(&str, &str, u64, u64)] = &[
         // (path, key, largest accepted, first refused)
         ("dflash_config", "block_size", block, block + 1),

@@ -54,7 +54,7 @@ use std::path::Path;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, concatenate, Array, Device};
 
-use super::{emit_step, DecodeWindow};
+use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
@@ -100,8 +100,8 @@ pub struct MtpDrafter {
     weights: MtpHeadWeights,
     /// Per-MTP-layer KV cache (the head's own small cache).
     caches: Vec<KvCache>,
-    /// Drafter block size (`block_size` in the sidecar config) — the number of
-    /// tokens proposed per round (incl. the seed carry).
+    /// The block the sidecar's config declares (`block_size`) — the depth the
+    /// head was trained at, not a ceiling on the depth it can be run at.
     block_size: usize,
     device: Device,
 }
@@ -141,7 +141,10 @@ impl MtpDrafter {
         }
     }
 
-    /// Configured block size (tokens proposed per round, including the carry).
+    /// The block this sidecar's config declares, including the seed carry.
+    ///
+    /// The trained depth, which a round is free to exceed — see
+    /// [`round_block_total`].
     pub fn block_size(&self) -> usize {
         self.block_size
     }
@@ -570,6 +573,20 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
 
 use crate::decode_loop::ProbeStep;
 
+/// The block a request runs at: what it asked for, bounded by what one verify
+/// forward can score, and never below the two positions a seed and one draft
+/// need.
+///
+/// **The sidecar's declared `block_size` is not a ceiling here.** The head
+/// chains on its own output hidden — [`MtpDrafter::draft_n`] feeds each step's
+/// `h_next` back as the next step's `h_prev` — so proposing past the depth the
+/// checkpoint names is structurally admissible; what decays with depth is the
+/// acceptance rate, and that is the request's trade to make. The declared value
+/// describes what the head was trained at.
+fn round_block_total(requested: usize) -> usize {
+    requested.clamp(2, MAX_BLOCK_SIZE)
+}
+
 /// MTP speculative-decoding round-loop.
 ///
 /// Port of `_mtp_rounds` (mlx-vlm). Mirrors [`super::dflash::dflash_generate`]
@@ -634,8 +651,7 @@ pub fn mtp_generate(
     let capture_ids = [last_layer];
     let hidden = verifier.hidden_size() as i32;
 
-    // block_total: drafter config is the ceiling (sidecar `block_size`).
-    let block_total = requested_block_total.min(drafter.block_size()).max(2);
+    let block_total = round_block_total(requested_block_total);
 
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.
