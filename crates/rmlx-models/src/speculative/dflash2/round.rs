@@ -173,9 +173,18 @@ pub fn dflash2_generate(
 
     let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
 
-    // Prefill the whole prompt, capturing every position's conditioning hidden.
-    // The reference conditions its first round on as much of the prompt as the
-    // drafter's window reaches back over, not on the last token alone.
+    // Prefill the whole prompt, keeping the conditioning hidden of as many of
+    // its positions as the drafter's window reaches back over — the depth the
+    // reference conditions its first round on, not the last token alone. The
+    // rows before that can never be read, so the capture releases them as the
+    // prefill walks the prompt rather than holding one row per prompt token at
+    // `len(target_layer_ids) * hidden_size` to the end of it.
+    let keep_rows = usize::try_from(drafter.conditioning_rows()).map_err(|_| {
+        Error::Model(format!(
+            "dflash2_generate: the drafter's window reaches back              {} rows, which is not a row count",
+            drafter.conditioning_rows()
+        ))
+    })?;
     let prefill_t0 = Instant::now();
     let (bonus_logits, prompt_hidden) = verifier.forward_verify_capture_chunked(
         prompt_ids,
@@ -183,6 +192,7 @@ pub fn dflash2_generate(
         &mut v_caches,
         Some(&mut v_lin),
         PREFILL_CHUNK_SIZE,
+        Some(keep_rows),
         device,
     )?;
     guard_verifier_prefill_logits(verifier, &bonus_logits, prompt_ids.len())?;
@@ -190,10 +200,10 @@ pub fn dflash2_generate(
     if charge_phases {
         // The guard above forced the logits, and so the whole prompt forward,
         // but not the capture: it hangs off a different output of that forward.
-        // Joining the chunks and trimming to the window is a copy of one row per
-        // prompt token at `len(target_layer_ids) * hidden_size` — and with
-        // nothing forcing it here the first round's drafter call pays for all of
-        // it. See `phases_charged`.
+        // Joining the kept chunks and trimming to the window is a copy of one
+        // row per kept position at `len(target_layer_ids) * hidden_size` — and
+        // with nothing forcing it here the first round's drafter call pays for
+        // all of it. See `phases_charged`.
         h_ctx.eval()?;
     }
     let prefill_ns = prefill_t0.elapsed().as_nanos();

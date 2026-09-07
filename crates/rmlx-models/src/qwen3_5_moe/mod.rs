@@ -12,6 +12,7 @@
 //! [`crate::load_util`].
 
 pub(super) mod attention;
+pub(super) mod capture_tail;
 pub(super) mod config;
 pub(super) mod decoder_layer;
 pub(super) mod gated_delta_net;

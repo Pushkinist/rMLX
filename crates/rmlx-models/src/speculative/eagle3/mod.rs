@@ -960,6 +960,9 @@ pub fn eagle3_generate(
         &mut v_caches,
         Some(&mut v_lin),
         PREFILL_CHUNK_SIZE,
+        // This drafter's own KV prefill conditions on every prompt position, so
+        // no capture row can be released early.
+        None,
         device,
     )?;
     // `bonus_logits` is [1,1,vocab] — the last prompt position only.

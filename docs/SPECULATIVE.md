@@ -741,7 +741,9 @@ the prefill seed — because that is not recoverable from the tokens afterwards.
 **Verifier prefill chunking.** For prompts longer than 1024 tokens, the
 verifier prefill uses `forward_verify_capture_chunked`: non-final chunks run
 `forward_hidden_states_multi` (no logit materialisation); only the final chunk
-runs `forward_verify_capture` to obtain the last-position logits. The drafter
+runs `forward_verify_capture` to obtain the last-position logits. This loop
+passes no trailing-row limit to that seam and cannot: the drafter prefill below
+conditions on every prompt position, so no captured row is spare. The drafter
 prefill uses 512-token windows (`DRAFTER_PREFILL_CHUNK`), driven by the Metal
 watchdog limit on the drafter's single-layer quadratic attention kernel.
 
@@ -1554,16 +1556,19 @@ the rest through the shared `rollback_round_caches`. The block is the one the
 drafter was trained at every round; only the token budget shortens it, so this
 loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
 
-**The prompt's capture is materialised whole and then mostly thrown away.**
-`forward_verify_capture_chunked` evaluates each chunk and concatenates every one
-of them before returning, so a prompt of `n` tokens allocates `n` rows at
-`len(target_layer_ids) * hidden_size` — 51.2 KiB each on the published pair, or
-about 1.6 GiB at a 32k prompt — and the trim then keeps the last 2047 of them.
-It is a transient peak at the prompt boundary, not a steady-state cost: the
-buffer the rounds carry is bounded by the drafter's window from the first trim
-onward. Bounding the peak means giving that seam a tail limit, and EAGLE-3 shares
-it and needs every row, so it is a two-caller parameter and not one this port
-added. It is not fixed and no figure in this document depends on it.
+**The prompt's capture is bounded by the same window.**
+`forward_verify_capture_chunked` takes the trailing row count its caller will
+read, and this loop passes the drafter's own `conditioning_rows`. Chunks that
+have fallen out of that tail are released as the prefill walks the prompt, so
+what is held is the window plus the chunk being filled — 3071 rows at
+`len(target_layer_ids) * hidden_size`, or about 150 MiB on the published pair,
+at any prompt length. Joining every chunk first and trimming afterwards, which
+is what this did, allocated one row per prompt token instead: about 1.6 GiB at a
+32k prompt, of which the trim kept 2047 rows. The rows the round loop receives
+are the same ones either way, and no figure in this document changed with it.
+EAGLE-3 shares the seam and conditions its own KV prefill on every prompt
+position, so it passes no limit — which is why the bound is the capture's
+parameter rather than a rule inside it.
 
 **Its drafter is greedy, and its acceptance is not.** `select_chain` traces a
 greedy chain and returns ids, no candidate distribution — and the reference's

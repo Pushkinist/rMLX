@@ -431,10 +431,15 @@ impl Architecture {
     ///
     /// Processes `ids` in windows of at most `chunk_size` tokens, accumulating
     /// KV/GDN caches normally across chunks. Returns
-    /// `(logits[1,1,vocab], concat_hidden[1,n,n_aux*hidden])` where logits
-    /// covers only the single last prompt position (sufficient for the first
-    /// bonus token) and `concat_hidden` covers all `n` positions (needed for
-    /// the drafter KV prefill).
+    /// `(logits[1,1,vocab], hidden[1,kept,n_aux*hidden])` where logits covers
+    /// only the single last prompt position (sufficient for the first bonus
+    /// token).
+    ///
+    /// `keep_last` is how many trailing capture rows the caller will read:
+    /// `None` for all `n` of them, which is what a drafter conditioning its own
+    /// KV prefill on every prompt position needs, and `Some(k)` for one that
+    /// attends over a sliding window, whose earlier chunks are then released
+    /// during the prefill instead of joined and thrown away.
     ///
     /// Avoids materialising a `[1, n, vocab]` logit tensor in a single Metal
     /// command buffer, eliminating GPU timeouts for n > ~1k on Qwen3.6-MoE.
@@ -451,6 +456,7 @@ impl Architecture {
         kv_caches: &mut [rmlx_kv_quant::KvCache],
         lin_caches: Option<&mut [rmlx_kv_quant::LinearAttnCache]>,
         chunk_size: usize,
+        keep_last: Option<usize>,
         device: Device,
     ) -> Result<(Array, Array)> {
         match self {
@@ -460,6 +466,7 @@ impl Architecture {
                 kv_caches,
                 lin_caches,
                 chunk_size,
+                keep_last,
                 device,
             ),
             _ => Err(Error::Model(
