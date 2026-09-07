@@ -197,6 +197,24 @@ pub const MAX_BLOCK_SIZE: usize = 1024;
 /// number that stands until one answers it.
 pub const DEFAULT_BLOCK_SIZE: usize = 5;
 
+/// The block a request that named none runs at, given whatever depth the
+/// drafter's checkpoint declares.
+///
+/// [`DEFAULT_BLOCK_SIZE`] capped by the declaration: a checkpoint is not asked
+/// for more depth than it was trained at unless someone asks, and a deeper
+/// declaration does not move what an operator is served, because that is a
+/// throughput choice and belongs to a sweep. A drafter that declares nothing
+/// takes the constant.
+///
+/// One producer. The serve layer resolves the served block with this, and the
+/// two test harnesses that drive a loop the way a no-flag request would resolve
+/// it the same way — so a pair or an alignment cell covers the configuration an
+/// operator gets rather than one that agreed with it when it was written.
+#[must_use]
+pub fn default_block_for(declared: Option<usize>) -> usize {
+    declared.map_or(DEFAULT_BLOCK_SIZE, |d| DEFAULT_BLOCK_SIZE.min(d))
+}
+
 /// The block a round runs at when the drafter's declared depth is a real
 /// constraint: what the request asked for, what the checkpoint was trained at,
 /// and what one verify forward can score — whichever is smallest, and never

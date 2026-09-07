@@ -158,8 +158,7 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     let hidden = verifier.hidden_size();
     let mut drafter = MtpDrafter::load(&draft_path, hidden, device).expect("load sidecar");
-    const DEFAULT: usize = rmlx_models::speculative::DEFAULT_BLOCK_SIZE;
-    let block_size = drafter.block_size().map_or(DEFAULT, |d| DEFAULT.min(d));
+    let block_size = rmlx_models::speculative::default_block_for(drafter.block_size());
 
     let tk =
         tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");

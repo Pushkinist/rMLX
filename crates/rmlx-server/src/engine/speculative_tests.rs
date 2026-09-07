@@ -8,7 +8,7 @@
 
 use super::{
     classify_mtp_draft, decide_draft_kind, drafted_per_round, mtp_reject_reason, round_block,
-    MtpDraftFamily, DEFAULT_DRAFT_BLOCK_SIZE, MIN_DRAFT_BLOCK_SIZE,
+    MtpDraftFamily, MIN_DRAFT_BLOCK_SIZE,
 };
 use rmlx_models::{Declared, DraftKind};
 
@@ -186,6 +186,7 @@ fn one_flag_value_is_one_round_block() {
 /// served at 5 as before.
 #[test]
 fn no_flag_runs_at_the_default_capped_by_the_declared_depth() {
+    const DEFAULT_DRAFT_BLOCK_SIZE: usize = rmlx_models::speculative::DEFAULT_BLOCK_SIZE;
     for declared in [MIN_DRAFT_BLOCK_SIZE, 3, 4] {
         assert_eq!(round_block(None, Some(declared)).ok(), Some(declared));
     }

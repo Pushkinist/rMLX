@@ -97,10 +97,6 @@ fn mtp_reject_reason(arch: &str, model_type: &str) -> String {
 
 // ── Drafter kind and round block ──────────────────────────────────────────────
 
-/// The round block when `--draft-block-size` is absent, capped by whatever depth
-/// the drafter's checkpoint declares.
-pub(crate) const DEFAULT_DRAFT_BLOCK_SIZE: usize = rmlx_models::speculative::DEFAULT_BLOCK_SIZE;
-
 /// The smallest round block with room for a draft token.
 pub const MIN_DRAFT_BLOCK_SIZE: usize = 2;
 
@@ -113,13 +109,10 @@ pub const MIN_DRAFT_BLOCK_SIZE: usize = 2;
 /// — the field `decode_config` files a row under — is this value, so one flag
 /// value is one cell whichever drafter runs.
 ///
-/// `declared` is the depth the drafter's own checkpoint names. A request that
-/// names no block runs at [`DEFAULT_DRAFT_BLOCK_SIZE`] **capped by it** — a
-/// checkpoint is not asked for more depth than it was trained at unless someone
-/// asks — and a drafter whose checkpoint declares nothing runs at the constant.
-/// Which default each drafter deserves is a throughput question, answered by
-/// measuring; this is the depth that was already being served, held still while
-/// an explicit request stops being clamped to the declaration.
+/// `declared` is the depth the drafter's own checkpoint names, and
+/// [`rmlx_models::speculative::default_block_for`] is what a request that names
+/// no block runs at given it. That rule has one producer and the harnesses that
+/// drive a loop the way a no-flag request would read it from there.
 ///
 /// A request that names a block is honoured up to what one verify forward can
 /// score. The declared depth is a default, not a ceiling: the sidecar heads
@@ -131,11 +124,7 @@ pub const MIN_DRAFT_BLOCK_SIZE: usize = 2;
 /// is not the CLI.
 fn round_block(flag: Option<usize>, declared: Option<usize>) -> rmlx_core::Result<usize> {
     match flag {
-        None => Ok(declared
-            .map_or(DEFAULT_DRAFT_BLOCK_SIZE, |d| {
-                DEFAULT_DRAFT_BLOCK_SIZE.min(d)
-            })
-            .max(MIN_DRAFT_BLOCK_SIZE)),
+        None => Ok(rmlx_models::speculative::default_block_for(declared).max(MIN_DRAFT_BLOCK_SIZE)),
         Some(block) if block >= MIN_DRAFT_BLOCK_SIZE => {
             Ok(block.min(rmlx_models::speculative::MAX_BLOCK_SIZE))
         }

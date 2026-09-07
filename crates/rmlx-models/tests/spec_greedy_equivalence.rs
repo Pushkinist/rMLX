@@ -201,17 +201,7 @@ const MIN_LENGTH_RATIO: f64 = 0.60;
 /// served that instead, which is what [`Pair::block`] carries for the pairs
 /// whose loops read a declaration.
 const BLOCK_SIZE: usize = rmlx_models::speculative::DEFAULT_BLOCK_SIZE;
-
-/// The block the serve layer resolves for a request that names none: the
-/// default, narrowed by whatever depth the drafter declares.
-///
-/// Restated here rather than called, because the resolver lives in the serve
-/// crate and this crate does not depend on it. `crates/rmlx-server`'s
-/// `no_flag_runs_at_the_default_capped_by_the_declared_depth` is the cell that
-/// pins the rule; this is the same arithmetic over the same constant.
-fn served(declared: Option<usize>) -> usize {
-    declared.map_or(BLOCK_SIZE, |d| BLOCK_SIZE.min(d))
-}
+use rmlx_models::speculative::default_block_for;
 
 /// Context both arms run under. Above the 4k prompt plus the budget, and the
 /// same on both sides — a different cap on either would make this a measurement
@@ -2429,7 +2419,9 @@ impl Loaded {
                         .1
                     }
                     Drafter::Mtp(drafter) => {
-                        let block = self.block.unwrap_or_else(|| served(drafter.block_size()));
+                        let block = self
+                            .block
+                            .unwrap_or_else(|| default_block_for(drafter.block_size()));
                         mtp_generate(
                             verifier,
                             drafter,
@@ -2454,7 +2446,7 @@ impl Loaded {
                     Drafter::DFlash1(drafter) => {
                         let block = self
                             .block
-                            .unwrap_or_else(|| served(Some(drafter.block_size())));
+                            .unwrap_or_else(|| default_block_for(Some(drafter.block_size())));
                         dflash_generate(
                             verifier,
                             drafter,
@@ -2479,7 +2471,7 @@ impl Loaded {
                     Drafter::DFlash2(drafter) => {
                         let block = self
                             .block
-                            .unwrap_or_else(|| served(Some(drafter.cfg.block_size)));
+                            .unwrap_or_else(|| default_block_for(Some(drafter.cfg.block_size)));
                         dflash2_generate(
                             verifier,
                             drafter,
@@ -2500,7 +2492,7 @@ impl Loaded {
                     Drafter::Eagle3(drafter) => {
                         let block = self
                             .block
-                            .unwrap_or_else(|| served(Some(drafter.block_size())));
+                            .unwrap_or_else(|| default_block_for(Some(drafter.block_size())));
                         eagle3_generate(
                             verifier,
                             drafter,
