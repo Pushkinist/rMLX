@@ -879,6 +879,9 @@ impl Generator for SpeculativeGenerator {
             let result = match &drafter {
                 Drafter::Eagle3(drafter_arc) => {
                     let mut drafter = drafter_arc.lock();
+                    // Which vocabulary decided each token. The answer-equivalence
+                    // gate reads it; a served response does not.
+                    let mut decided_by = Vec::new();
                     rmlx_models::speculative::eagle3::eagle3_generate(
                         &dispatcher.verifier,
                         &mut drafter,
@@ -890,6 +893,7 @@ impl Generator for SpeculativeGenerator {
                         max_ctx_override,
                         &eos_ids,
                         &mut step_fn,
+                        &mut decided_by,
                         &spec_sampler_cfg,
                         dispatcher.device(),
                     )

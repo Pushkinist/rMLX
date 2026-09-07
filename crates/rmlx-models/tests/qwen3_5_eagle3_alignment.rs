@@ -152,6 +152,7 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
             spec_ids.push(s.token_id);
             None
         };
+        let mut decided_by = Vec::new();
         eagle3_generate(
             &verifier,
             &mut drafter,
@@ -163,6 +164,7 @@ fn eagle3_greedy_tracks_plain_greedy_for_a_long_prefix() {
             None,
             &eos,
             &mut step_fn,
+            &mut decided_by,
             &sampler_cfg,
             device,
         )

@@ -780,7 +780,37 @@ impl Eagle3Drafter {
 // Round-loop
 // ---------------------------------------------------------------------------
 
+/// Which vocabulary decided one emitted token.
+///
+/// The verify pass takes its argmax over the drafter's reduced target ids at
+/// every position it may accept, and over the verifier's whole vocabulary at
+/// the round's correction and at the prefill seed. The two argmaxes are the
+/// same token exactly when the verifier's own choice is one the drafter can
+/// name, so this is the only thing that says whether the restriction could have
+/// changed a token — and the token stream cannot express it.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed two-valued distinction: a verify position is scored over the drafter's ids or over the verifier's, and there is no third vocabulary"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecidedBy {
+    /// The drafter's reduced vocabulary — an accepted draft token. It differs
+    /// from the verifier's own argmax exactly when that argmax is a token the
+    /// drafter cannot name.
+    RestrictedVocab,
+    /// The verifier's whole vocabulary — a round's correction, the prefill
+    /// seed, or any position of a request that does not take the restricted
+    /// read-back at all. The restriction cannot have changed this token.
+    FullVocab,
+}
+
 /// EAGLE-3 speculative-decoding round-loop (greedy / temp=0).
+///
+/// `decided_by` is filled with one [`DecidedBy`] per emitted token, in
+/// emission order, and is cleared first. A caller that only wants the tokens
+/// passes a scratch vector; the answer-equivalence gate reads it, because
+/// whether the restriction could have changed a token is a property of the
+/// round the token came out of and not of the token.
 ///
 /// Port of `_eagle3_rounds` (mlx-vlm), now with correctness fixes:
 ///
@@ -816,10 +846,13 @@ pub fn eagle3_generate(
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    decided_by: &mut Vec<DecidedBy>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
 ) -> Result<Vec<ProbeStep>> {
     use std::time::Instant;
+
+    decided_by.clear();
 
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
@@ -870,6 +903,10 @@ pub fn eagle3_generate(
     drafter.reset(max_seq);
 
     let mut draw = super::VerifierDraw::new(sampler_cfg);
+    // Whether this request takes the restricted-vocabulary read-back at all. A
+    // sampled one cannot, so every position it emits is decided over the whole
+    // vocabulary.
+    let hot_path = drafter.hot_path_active() && !draw.sampling();
 
     let mut total_draft = 0usize;
     let mut total_accept = 0usize;
@@ -944,6 +981,7 @@ pub fn eagle3_generate(
     let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
+    decided_by.push(DecidedBy::FullVocab);
     if eos_ids.contains(&b) {
         // The stop token arrived before a round could run. The request still
         // happened, so it still leaves exactly one record.
@@ -978,7 +1016,7 @@ pub fn eagle3_generate(
         temperature = sampler_cfg.temperature,
         // A sampled request cannot take the restricted-vocabulary read-back, so
         // report whether this one did rather than whether the drafter offers it.
-        hot_path = drafter.hot_path_active() && !draw.sampling(),
+        hot_path,
         "eagle3_generate: starting (Qwen3.6-MoE verifier + EAGLE-3 drafter)"
     );
 
@@ -1041,7 +1079,7 @@ pub fn eagle3_generate(
         // only there. Sampled requests pay the full-vocabulary projection at
         // every verified position.
         let t0 = Instant::now();
-        let (v_tokens, v_hidden) = if drafter.hot_path_active() && !draw.sampling() {
+        let (v_tokens, v_hidden) = if hot_path {
             let (v_hidden, v_final_hidden) = verifier.forward_verify_capture_hot(
                 &v_input,
                 v_k,
@@ -1144,11 +1182,19 @@ pub fn eagle3_generate(
 
         // -- Emit accepted prefix + 1 correction/bonus. --
         let mut hit_eos = false;
-        for &id in &new_tokens {
+        for (i, &id) in new_tokens.iter().enumerate() {
             if emitted.len() >= n_tokens {
                 break;
             }
             emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
+            // `new_tokens[..accept]` are the draft's own tokens, which the
+            // restricted argmax confirmed; `new_tokens[accept]` is the
+            // correction, taken over the whole vocabulary.
+            decided_by.push(if hot_path && i < accept {
+                DecidedBy::RestrictedVocab
+            } else {
+                DecidedBy::FullVocab
+            });
             emitted_in_rounds += 1;
             if eos_ids.contains(&id) {
                 hit_eos = true;

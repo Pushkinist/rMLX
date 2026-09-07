@@ -192,7 +192,8 @@ runs the same way: the confidence ceiling fires on 4, 3, 1 and 4 of the judged
 cells and the control takes the rest.
 
 The last row is the exception and it is a property of the defect, not of the
-ceiling — see the boundary below.
+ceiling — see the boundary below. That row is also the one the boundary rule
+below had to be built not to forgive.
 
 ## A declared boundary: EAGLE-3's restricted vocabulary
 
@@ -207,8 +208,9 @@ argmax equals the true one exactly when the true one is in the set, so the whole
 inexactness lives on the positions where it is not.
 
 That mirrors the upstream implementation, so it is a design boundary rather than
-a port defect. It is still an answer change at temperature 0, which is what this
-gate reads, so the gate measures the exposure rather than assuming it away.
+a port defect. It is an answer change at temperature 0 that no correct
+implementation of this loop could avoid, so the gate reads it as a boundary and
+not as a defect — and the whole of the difficulty is telling one from the other.
 
 `docs/SPECULATIVE.md` says the restricted read-back is sound at temperature 0 and
 only there, and that is a claim about *sampling*: a distribution needs the whole
@@ -217,25 +219,68 @@ all. This section is about what remains at temperature 0 — the reduced argmax 
 the true argmax on the ids the drafter can name, and only on those. Both are
 true and neither implies the other.
 
-Every
-run of that pair prints two figures per prompt: `unnameable`, how many of the
-reference arm's own tokens the drafter's vocabulary cannot say, and
-`divergence_unnameable`, whether the token the arms parted on is one of them.
+### The rule, and why the token alone will not carry it
 
-Measured over the six prompts: `unnameable` reads 1, 2, 2, 3, 4 and 5 tokens —
-under 2% of a 256-token answer — and `divergence_unnameable` is **false on all
-six**. The boundary exists and did not fire at any first divergence here; every
-one of them is at a token the drafter can name, so the restriction cannot explain
-it and the confidence oracle judges it as it judges any other pair.
+Every run of that pair prints three figures per prompt: `unnameable`, how many of
+the reference arm's own tokens the drafter's vocabulary cannot say;
+`divergence_unnameable`, whether the token the arms parted on is one of them; and
+`divergence_decided_by`, which vocabulary the round loop used at that position.
 
-The gate has power over the boundary when it does bite. Left with the correction
-position on the restricted argmax as well — which widens the same inexactness
-from "sometimes at an accepted position" to "always at the correction" — the pair
-is refused on one prompt of six, at confidence 0.8828, with
-`divergence_unnameable` true on exactly that cell. One of six is what the
-exposure predicts, and it is why that pair carries a second broken engine: with
-its rollback target off by one it is refused on five of the five prompts it
-judges.
+**The verdict needs all three, and the third is why.** Widening the same
+inexactness to the correction — leaving it on the restricted argmax as well —
+changes an answer at exactly the kind of token the boundary does: same reference
+token, same speculative token, same near-certain margin. Nothing in the two token
+streams tells the two apart. What separates them is which position the loop was
+at: the restriction reaches an accepted position by design and cannot reach the
+correction, which is scored over the whole vocabulary. So `eagle3_generate` fills
+a `DecidedBy` per emitted token, and the rule is:
+
+- first divergence at a position the loop emitted from the drafter's own argmax,
+  whose reference token that vocabulary cannot name — **the boundary**. Reported
+  as unjudgeable, not refused: no correct loop of this kind could have said
+  anything else there, and a prompt where that happened says nothing about the
+  round loop either way.
+- first divergence anywhere else — **judged as any other pair's**, which is the
+  confidence oracle above.
+
+A run whose every prompt landed on the boundary would assert nothing, and
+`run_gate`'s existing floor catches that: it fails on a pair it could judge on no
+prompt at all.
+
+### What the rule was measured against
+
+Four engines, six prompts each, on `Qwen3.6-35B-A3B-8bit` drafted by
+`specdrift-qwen3.6-35b-a3b-eagle3`, five prompts judged and the 4k document
+unjudgeable for length in every one of them:
+
+| engine | verdict | where |
+|---|---|---|
+| as shipped | 5 of 5 agree | `divergence_unnameable` false on all six; confidences 0.0000 to 0.0703 |
+| correction left on the restricted argmax | **refused, 1 of 5 judged** | confidence 0.8828, `divergence_unnameable` **true**, at a **correction** |
+| rollback target one position short | **refused, 5 of 5 judged** | `divergence_unnameable` false on all six; the repetition control takes all five |
+| the recurrent tape (a branch under review) | 5 of 5 agree | one at confidence 0.2617, `divergence_unnameable` **true**, at an **accepted** position |
+
+`unnameable` reads 1, 2, 2, 3, 4 and 5 tokens on the shipped arms — under 2% of a
+256-token answer, and one to five chances per answer for the boundary to fire.
+
+The first two rows are the whole argument. **The widening is refused, and it is
+refused because of where it happened and not what it changed** — its cell has
+`divergence_unnameable` true, so a rule keyed on that field alone would have
+waived precisely the defect the pair exists to catch. Reading the position as
+well keeps it. The third row is the pair's other broken engine and the waiver has
+no purchase on it at all: none of its divergences is at an unnameable token, and
+the refusals come from the repetition control, which the rule does not touch.
+
+The fourth row is the case that forced the rule. That branch rebuilds a partly
+accepted round's recurrent state from a tape rather than replaying it; it does
+not touch the vocabulary restriction. Rebuilding is a different reduction order,
+which moved where the arms part, and it moved onto one of the five tokens the
+drafter cannot name. Without the rule that run is refused as a defect at
+confidence 0.2617; with it the prompt is reported and the other four still carry
+the gate. Both readings were taken.
+
+`scripts/spec_broken_engine.sh` applies each broken engine by name, so those rows
+can be taken again rather than believed.
 
 ## Which arm is short
 
