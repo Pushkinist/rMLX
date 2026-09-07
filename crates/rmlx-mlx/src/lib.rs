@@ -954,6 +954,29 @@ impl Array {
         unsafe { check_status(status, "Array::eval") }
     }
 
+    /// Whether this array's data is materialised, so reading it would not
+    /// first run a graph.
+    ///
+    /// False while the array is still an unevaluated node — the work it stands
+    /// for has been described and not yet paid for, and whoever blocks on it
+    /// next is who pays. That is the question a wall-clock span around a call
+    /// site cannot answer about itself, and the reason this is exposed at all.
+    ///
+    /// It does not block and does not schedule: an array left mid-flight by
+    /// [`Self::async_eval`] reads false until its event fires.
+    pub fn is_available(&self) -> Result<bool> {
+        install_error_handler();
+        let mut available = false;
+        // SAFETY: inner is a valid mlx_array; the out-pointer is a stack
+        // `bool` we own. This reads the array's status and evaluates nothing,
+        // so it is outside the evaluation lock's remit.
+        let status = unsafe { sys::_mlx_array_is_available(&raw mut available, self.inner) };
+        // SAFETY: called immediately after the C function on the same thread,
+        // whose thread-local error slot it reads.
+        unsafe { check_status(status, "Array::is_available") }?;
+        Ok(available)
+    }
+
     /// Asynchronously schedule this array's compute graph on the GPU stream
     /// without blocking the calling thread. The actual evaluation happens
     /// in the background; subsequent `to_bytes`/`eval` will wait if needed.
