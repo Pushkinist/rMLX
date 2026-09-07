@@ -1954,28 +1954,42 @@ const DRAFT_MODEL_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 /// own override variable in the messages it builds; this half of the pair is
 /// overridden by a different one, so that name is substituted.
 fn resolve(var: &str, slug: &str) -> common::Gate {
-    let Some(named) = std::env::var(var).ok().filter(|v| !v.is_empty()) else {
-        let root = std::env::var(common::MODELS_ROOT_VAR).ok();
-        return match common::slug_snapshot(root.as_deref(), slug, common::Role::Sidecar) {
-            common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
-            common::Snapshot::Absent(why) => {
-                common::Gate::Skip(why.replace(common::SINGLE_MODEL_VAR, var))
-            }
-            common::Snapshot::Misconfigured(why) => common::Gate::Fail(why),
-        };
-    };
-    // The operator named this path, so a typo or a moved snapshot breaks the
-    // run rather than skipping it. `override_snapshot` reports only an unset or
-    // empty value as `None`, and this branch holds a non-empty one.
+    named_path(var).unwrap_or_else(|| by_slug(var, slug))
+}
+
+/// What the path in `var` resolves to, or `None` when the variable holds none.
+///
+/// An operator who named a path meant it, so a typo or a moved snapshot breaks
+/// the run rather than skipping it. `override_snapshot` reports only an unset or
+/// empty value as `None`, so the inner `unwrap_or_else` covers a case the outer
+/// `?` has already excluded.
+fn named_path(var: &str) -> Option<common::Gate> {
+    let named = std::env::var(var).ok().filter(|v| !v.is_empty())?;
     let probed =
         common::override_snapshot(Some(&named), common::Role::Sidecar).unwrap_or_else(|| {
             common::Snapshot::Misconfigured(format!("{var} is set to an empty value"))
         });
-    match probed {
+    Some(match probed {
         common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
         common::Snapshot::Absent(why) | common::Snapshot::Misconfigured(why) => {
             common::Gate::Fail(why.replace(common::SINGLE_MODEL_VAR, var))
         }
+    })
+}
+
+/// What a slug resolves to under `RMLX_O_MODELS_ROOT`, reading no variable.
+///
+/// `blame` names the variable a message should point at — the one that would
+/// have overridden this — because the harness's own messages name its single
+/// override and this half of a pair is overridden by a different one.
+fn by_slug(blame: &str, slug: &str) -> common::Gate {
+    let root = std::env::var(common::MODELS_ROOT_VAR).ok();
+    match common::slug_snapshot(root.as_deref(), slug, common::Role::Sidecar) {
+        common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
+        common::Snapshot::Absent(why) => {
+            common::Gate::Skip(why.replace(common::SINGLE_MODEL_VAR, blame))
+        }
+        common::Snapshot::Misconfigured(why) => common::Gate::Fail(why),
     }
 }
 
@@ -2578,16 +2592,32 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
     let named = std::env::var(DRAFT_MODEL_VAR)
         .ok()
         .filter(|v| !v.is_empty());
+    // Both arms below that reach this are guarded on the variable being set, so
+    // it always resolves to something; the fallback names the guard it fell
+    // through rather than restating the message a `false` arm already gives.
+    let named_gate = || {
+        named_path(DRAFT_MODEL_VAR).unwrap_or_else(|| {
+            common::Gate::Fail(format!(
+                "{DRAFT_MODEL_VAR} was set when this pair was selected and is not now"
+            ))
+        })
+    };
     let draft_gate = match (&pair.drafter, named.is_some()) {
         (DrafterSource::Slug(slug), _) => resolve(DRAFT_MODEL_VAR, slug),
         // The variable asked for this pair; the pair says which sidecar it
         // needs. Its own slug first, so a run with several of these selected
         // does not hand all of them whichever one path the variable holds.
-        (DrafterSource::Named(Some(slug)), true) => match resolve("", slug) {
+        // Only a models root that simply does not carry the slug falls back to
+        // the path the variable holds. A root that is misconfigured is the
+        // operator's mistake, and swallowing it would reinstate the one
+        // cross-pairing the slug is here to prevent — with the drafter that
+        // happens to be in the variable, silently.
+        (DrafterSource::Named(Some(slug)), true) => match by_slug(DRAFT_MODEL_VAR, slug) {
             found @ common::Gate::Run { .. } => found,
-            common::Gate::Skip(_) | common::Gate::Fail(_) => resolve(DRAFT_MODEL_VAR, ""),
+            failed @ common::Gate::Fail(_) => failed,
+            common::Gate::Skip(_) => named_gate(),
         },
-        (DrafterSource::Named(None), true) => resolve(DRAFT_MODEL_VAR, ""),
+        (DrafterSource::Named(None), true) => named_gate(),
         (DrafterSource::Named(_), false) => common::Gate::Skip(format!(
             "{DRAFT_MODEL_VAR} is unset and this pair's drafter is not resolved by \
              slug — see the DrafterSource::Named note for why"
