@@ -75,7 +75,7 @@ use rmlx_mlx::{
     Array, Device, Dtype,
 };
 
-use super::{emit_step, DecodeWindow};
+use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
@@ -693,6 +693,25 @@ use crate::decode_loop::ProbeStep;
 use rmlx_kv_quant::{KvCache, KvQuant};
 use std::time::Instant;
 
+/// The block a request runs at: what it asked for, bounded by what one verify
+/// forward can score.
+///
+/// This loop refuses a block below two rather than raising it: the drafter and
+/// the verifier share K/V here, so a caller asking for a round that drafts
+/// nothing has asked for something this pairing cannot express, and silently
+/// running a different round would hide it.
+///
+/// # Errors
+/// [`Error::Model`] for a block with no room for a draft token.
+fn round_block_total(requested: usize) -> Result<usize> {
+    if requested < 2 {
+        return Err(Error::Model(
+            "mtp_assistant_generate: block_size must be >= 2".into(),
+        ));
+    }
+    Ok(requested.min(MAX_BLOCK_SIZE))
+}
+
 /// Greedy Gemma4-assistant MTP speculative generation.
 ///
 /// Mirrors mlx-vlm `_mtp_rounds` (greedy / temp=0):
@@ -734,11 +753,7 @@ pub fn mtp_assistant_generate(
             "mtp_assistant_generate: prompt must have >=2 tokens".into(),
         ));
     }
-    if block_size < 2 {
-        return Err(Error::Model(
-            "mtp_assistant_generate: block_size must be >= 2".into(),
-        ));
-    }
+    let block_size = round_block_total(block_size)?;
     // Which round loop runs is decided by the drafter snapshot's `model_type`
     // alone, so a `gemma4_assistant` drafter can be handed any verifier. This
     // loop conditions the drafter on the verifier's own final-normed hidden and
