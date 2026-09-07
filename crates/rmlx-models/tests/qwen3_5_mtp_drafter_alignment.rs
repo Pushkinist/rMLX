@@ -191,7 +191,7 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
             spec_ids.push(s.token_id);
             None
         };
-        mtp_generate(
+        let (_steps, ran) = mtp_generate(
             &verifier,
             &mut drafter,
             &tk,
@@ -206,6 +206,7 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
             device,
         )
         .expect("mtp generate");
+        assert_eq!(ran, block_size, "the loop must run the block it was handed");
     }
 
     let mut plain_ids: Vec<u32> = Vec::new();
@@ -277,5 +278,80 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
         "MTP tracked plain greedy for only {common} of {shorter} tokens (floor {floor}) — \
          a prefix this short means the verifier state the round loop leaves behind does \
          not match a sequential decode, not that a near-tie flipped"
+    );
+}
+
+/// The round loop runs the block it was handed, past the sidecar's declaration.
+///
+/// The block a round ran is not otherwise observable from outside the loop, and
+/// the value the shipped sidecars declare is small enough that a clamp back to
+/// it would still produce fluent output at a plausible accept rate. This drives
+/// a block above every shipped declaration and reads the loop's own answer for
+/// what it ran.
+#[ignore]
+#[test]
+fn the_round_loop_runs_a_block_deeper_than_the_sidecar_declares() {
+    let (Some(model_path), Some(draft_path)) = (
+        env_path("RMLX_KV_TEST_MODEL"),
+        env_path("RMLX_DRAFT_TEST_MODEL"),
+    ) else {
+        eprintln!(
+            "SKIP the_round_loop_runs_a_block_deeper_than_the_sidecar_declares: \
+             RMLX_KV_TEST_MODEL and RMLX_DRAFT_TEST_MODEL must both name an existing \
+             snapshot directory"
+        );
+        return;
+    };
+    let device = Device::Gpu;
+    let verifier =
+        arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
+    let mut drafter =
+        MtpDrafter::load(&draft_path, verifier.hidden_size(), device).expect("load sidecar");
+    let declared = drafter.block_size();
+    let requested = declared.map_or(8, |d| d + 5);
+
+    let tk =
+        tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");
+    let prompt_ids: Vec<u32> = tk.encode(PROMPT, false).expect("encode").get_ids().to_vec();
+    let eos = eos_ids(&model_path);
+    let sampler_cfg = rmlx_models::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 0,
+    };
+
+    let mut emitted = 0usize;
+    let mut step_fn = |_: &rmlx_models::ProbeStep| {
+        emitted += 1;
+        None
+    };
+    let (_steps, ran) = mtp_generate(
+        &verifier,
+        &mut drafter,
+        &tk,
+        &prompt_ids,
+        16,
+        requested,
+        Some(rmlx_kv_quant::KvQuant::None),
+        None,
+        &eos,
+        &mut step_fn,
+        &sampler_cfg,
+        device,
+    )
+    .expect("mtp generate");
+
+    assert_eq!(
+        ran, requested,
+        "asked for {requested} against a sidecar declaring {declared:?}, and the rounds \
+         ran {ran}"
+    );
+    assert!(
+        declared.is_none_or(|d| requested > d),
+        "this cell only says anything if the request is past the declaration: \
+         declared={declared:?} requested={requested}"
     );
 }

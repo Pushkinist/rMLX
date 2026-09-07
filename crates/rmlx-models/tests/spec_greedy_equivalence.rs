@@ -2342,6 +2342,7 @@ impl Loaded {
                             device,
                         )
                         .expect("mtp speculative generate")
+                        .0
                     }
                     // The loop halves and grows this from the recent accept
                     // rate, so the width varies within a run whatever it starts

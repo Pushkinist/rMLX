@@ -583,14 +583,25 @@ use crate::decode_loop::ProbeStep;
 /// forward can score, and never below the two positions a seed and one draft
 /// need.
 ///
-/// **The sidecar's declared `block_size` is not a ceiling here.** The head
-/// chains on its own output hidden — [`MtpDrafter::draft_n`] feeds each step's
-/// `h_next` back as the next step's `h_prev` — so proposing past the depth the
-/// checkpoint names is structurally admissible; what decays with depth is the
-/// acceptance rate, and that is the request's trade to make. The declared value
-/// describes what the head was trained at.
-fn round_block_total(requested: usize) -> usize {
-    requested.clamp(2, MAX_BLOCK_SIZE)
+/// **`declared` is not a ceiling here**, which is the whole reason it is an
+/// argument. The head chains on its own output hidden — [`MtpDrafter::draft_n`]
+/// feeds each step's `h_next` back as the next step's `h_prev` — so proposing
+/// past the depth the checkpoint names is structurally admissible; what decays
+/// with depth is the acceptance rate, and that is the request's trade to make.
+/// Taking it and not clamping to it is what makes this function, rather than its
+/// caller, the one place that decision lives.
+fn mtp_round_block_total(requested: usize, declared: Option<usize>) -> usize {
+    let block = requested.clamp(2, MAX_BLOCK_SIZE);
+    if declared.is_some_and(|d| block > d) {
+        tracing::debug!(
+            block,
+            declared,
+            "mtp_generate: running a block deeper than the sidecar declares; the head \
+             chains on its own hidden past its trained depth and acceptance falls with \
+             it"
+        );
+    }
+    block
 }
 
 /// MTP speculative-decoding round-loop.
@@ -610,6 +621,12 @@ fn round_block_total(requested: usize) -> usize {
 ///
 /// The verifier is the Qwen3.5/3.6-MoE hybrid (carries GDN linear-attention
 /// state); rollback refolds that state from the round tape.
+///
+/// Returns the emitted steps and **the block the rounds actually ran**. This is
+/// the one loop whose block is not the drafter's declaration narrowed by the
+/// request, so it is the one a caller cannot work out for itself — and a caller
+/// that cannot check it cannot notice the block silently reverting to the
+/// declaration.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -633,7 +650,7 @@ pub fn mtp_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     use rmlx_kv_quant::LinearAttnCache;
     use std::time::Instant;
 
@@ -657,7 +674,7 @@ pub fn mtp_generate(
     let capture_ids = [last_layer];
     let hidden = verifier.hidden_size() as i32;
 
-    let block_total = round_block_total(requested_block_total);
+    let block_total = mtp_round_block_total(requested_block_total, drafter.block_size());
 
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.
@@ -755,7 +772,7 @@ pub fn mtp_generate(
             charged: charge_phases,
         }
         .log_done();
-        return Ok(emitted);
+        return Ok((emitted, block_total));
     }
 
     tracing::info!(
@@ -947,7 +964,7 @@ pub fn mtp_generate(
         crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
         crate::decode_loop::PostDecode::seal(),
     );
-    Ok(emitted)
+    Ok((emitted, block_total))
 }
 
 // ---------------------------------------------------------------------------

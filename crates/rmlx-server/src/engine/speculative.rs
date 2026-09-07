@@ -1000,6 +1000,7 @@ impl Generator for SpeculativeGenerator {
                         &spec_sampler_cfg,
                         dispatcher.device(),
                     )
+                    .map(|(emitted, _block)| emitted)
                 }
                 // Greedy at temperature 0, Leviathan stochastic above it; the
                 // constraint is refused above, so `None` here.
