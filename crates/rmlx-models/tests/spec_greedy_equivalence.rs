@@ -193,14 +193,6 @@ const MIN_ANSWER_TOKENS: usize = 160;
 /// prefix would otherwise score 1.0.
 const MIN_LENGTH_RATIO: f64 = 0.60;
 
-/// The round block a pair that names none is driven at.
-///
-/// `rmlx_models::speculative::DEFAULT_BLOCK_SIZE` rather than a number of this
-/// harness's own: a pair judged at a width no request produces is judging a
-/// configuration nobody is served. A drafter that declares a shallower depth is
-/// served that instead, which is what [`Pair::block`] carries for the pairs
-/// whose loops read a declaration.
-const BLOCK_SIZE: usize = rmlx_models::speculative::DEFAULT_BLOCK_SIZE;
 use rmlx_models::speculative::{default_block_for, drafts_per_round};
 
 /// Context both arms run under. Above the 4k prompt plus the budget, and the
@@ -1693,14 +1685,15 @@ struct Pair {
     /// The round block to drive this pair at, or `None` for the block the engine
     /// serves a request that names none.
     ///
-    /// `None` is [`BLOCK_SIZE`] narrowed by whatever depth the drafter declares,
-    /// which is the serve layer's own rule — so a pair left at `None` covers the
-    /// configuration an operator gets. It is not the only one the engine will
-    /// run: a request names any block up to what one verify forward can score,
-    /// and a wider block puts the same round loop through a verify forward of a
-    /// different width, an acceptance walk over more positions and a rollback
-    /// over a longer rejected tail. Naming it here is what lets a pair be judged
-    /// at one of those.
+    /// `None` is `rmlx_models::speculative::default_block_for` of whatever depth
+    /// the drafter declares, which is the serve layer's own rule — so a pair
+    /// left at `None` covers the configuration an operator gets, and [`run_gate`]
+    /// holds it to that rather than to nothing. It is not the only one the
+    /// engine will run: a request names any block up to what one verify forward
+    /// can score, and a wider block puts the same round loop through a verify
+    /// forward of a different width, an acceptance walk over more positions and
+    /// a rollback over a longer rejected tail. Naming it here is what lets a
+    /// pair be judged at one of those.
     block: Option<usize>,
 }
 
@@ -2384,6 +2377,39 @@ enum Drafter {
 }
 
 impl Loaded {
+    /// The block depth this pair's drafter declares, when it declares one.
+    ///
+    /// The serve layer resolves a request that names no block from this, so it
+    /// is what a `None` pair has to be held to. It is read off the loaded
+    /// drafter rather than taken from the pair, which is what keeps the check
+    /// from being the harness reading back its own choice.
+    fn declared_block(&self) -> Option<usize> {
+        match &self.engine {
+            Engine::Sidecar { drafter, .. } => match drafter {
+                // Neither declares a depth: the assistant's config carries no
+                // block key, and a two-model draft is a full model with no
+                // drafting depth to declare.
+                Drafter::Assistant(_) => None,
+                Drafter::Mtp(drafter) => drafter.block_size(),
+                Drafter::DFlash1(drafter) => Some(drafter.block_size()),
+                Drafter::DFlash2(drafter) => Some(drafter.cfg.block_size),
+                Drafter::Eagle3(drafter) => Some(drafter.block_size()),
+            },
+            Engine::TwoModel(_) => None,
+        }
+    }
+
+    /// The block this pair's arms run at: what the pair names, or what the serve
+    /// layer resolves for a request that names none.
+    ///
+    /// One producer, so every arm asks for the same width and [`run_gate`] can
+    /// hold the answer to it. The two-model loop converts to a draft count at
+    /// its own call, which is the only place the two units meet.
+    fn round_block(&self) -> usize {
+        self.block
+            .unwrap_or_else(|| default_block_for(self.declared_block()))
+    }
+
     /// Both arms over one prompt: the block the speculative arm ran at, the
     /// speculative ids, the reference ids, the reference's per-position margins,
     /// and which vocabulary decided each speculative token.
@@ -2408,6 +2434,7 @@ impl Loaded {
         device: Device,
     ) -> (usize, Vec<u32>, Vec<u32>, Vec<f32>, Vec<DecidedBy>) {
         let ids = prompt.ids(&self.tokenizer);
+        let block = self.round_block();
         let mut spec_ids: Vec<u32> = Vec::new();
         let mut decided_by: Vec<DecidedBy> = Vec::new();
         let ran;
@@ -2425,7 +2452,7 @@ impl Loaded {
                             &self.tokenizer,
                             &ids,
                             N_TOKENS,
-                            self.block.unwrap_or(BLOCK_SIZE),
+                            block,
                             Some(rmlx_kv_quant::KvQuant::None),
                             Some(MAX_CTX),
                             &self.eos,
@@ -2462,9 +2489,6 @@ impl Loaded {
                     // at — the schedule is what this pair covers that no other
                     // does, and it runs at whatever block the pair names.
                     Drafter::DFlash1(drafter) => {
-                        let block = self
-                            .block
-                            .unwrap_or_else(|| default_block_for(Some(drafter.block_size())));
                         dflash_generate(
                             verifier,
                             drafter,
@@ -2487,9 +2511,6 @@ impl Loaded {
                     // checkpoint declares — so a pair naming none is served the
                     // narrower of that and the default, as anything else is.
                     Drafter::DFlash2(drafter) => {
-                        let block = self
-                            .block
-                            .unwrap_or_else(|| default_block_for(Some(drafter.cfg.block_size)));
                         dflash2_generate(
                             verifier,
                             drafter,
@@ -2508,9 +2529,6 @@ impl Loaded {
                         .1
                     }
                     Drafter::Eagle3(drafter) => {
-                        let block = self
-                            .block
-                            .unwrap_or_else(|| default_block_for(Some(drafter.block_size())));
                         eagle3_generate(
                             verifier,
                             drafter,
@@ -2541,7 +2559,7 @@ impl Loaded {
                             &self.tokenizer,
                             &ids,
                             N_TOKENS,
-                            drafts_per_round(self.block.unwrap_or(BLOCK_SIZE)),
+                            drafts_per_round(block),
                             Some(rmlx_kv_quant::KvQuant::None),
                             Some(MAX_CTX),
                             0,
@@ -3068,17 +3086,21 @@ fn run_gate(test: &str, pair: &Pair) {
     let mut judged = 0usize;
     for prompt in PROMPTS {
         let (block, spec, plain, margins, decided_by) = loaded.arms(prompt, device);
-        // A pair that named a block is judged at that block or not at all. The
-        // readings below are all attributed to one in the report line, and an
-        // arm that fell back to the drafter's declaration would fill that line
-        // with a plausible set under the wrong label.
-        if let Some(want) = pair.block {
-            assert_eq!(
-                block, want,
-                "{test}/{}: this pair names block {want} and the loop ran {block}",
-                prompt.name
-            );
-        }
+        // Every pair is judged at a block or not at all — the one it names, or
+        // the one the serve layer resolves for a request that names none. The
+        // readings below are all attributed to a block in the report line, and
+        // an arm running any other width would fill that line with a plausible
+        // set under the wrong label. `want` is built from the pair and from the
+        // depth the *drafter* declares, so it is not the harness reading back
+        // its own choice.
+        let want = pair
+            .block
+            .unwrap_or_else(|| default_block_for(loaded.declared_block()));
+        assert_eq!(
+            block, want,
+            "{test}/{}: this pair runs block {want} and the loop ran {block}",
+            prompt.name
+        );
         let restriction = draft_vocab.as_ref().map(|vocab| Restriction {
             vocab,
             decided_by: &decided_by,
