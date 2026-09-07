@@ -97,9 +97,9 @@ fn mtp_reject_reason(arch: &str, model_type: &str) -> String {
 
 // ── Drafter kind and round block ──────────────────────────────────────────────
 
-/// The round block when `--draft-block-size` is absent: the verifier's own token
-/// plus four drafted, capped by whatever depth the drafter's checkpoint declares.
-pub(crate) const DEFAULT_DRAFT_BLOCK_SIZE: usize = 5;
+/// The round block when `--draft-block-size` is absent, capped by whatever depth
+/// the drafter's checkpoint declares.
+pub(crate) const DEFAULT_DRAFT_BLOCK_SIZE: usize = rmlx_models::speculative::DEFAULT_BLOCK_SIZE;
 
 /// The smallest round block with room for a draft token.
 pub const MIN_DRAFT_BLOCK_SIZE: usize = 2;
@@ -244,7 +244,7 @@ impl Drafter {
             Drafter::Eagle3(d) => Some(d.lock().block_size()),
             Drafter::DFlash(d) => Some(d.lock().block_size()),
             Drafter::DFlash2(d) => Some(d.cfg.block_size),
-            Drafter::MtpSidecar(d) => Some(d.lock().block_size()),
+            Drafter::MtpSidecar(d) => d.lock().block_size(),
             Drafter::MtpAssistant(_) | Drafter::TwoModel => None,
         }
     }

@@ -183,6 +183,20 @@ const VOCAB_ID_CEILING: u32 = 1 << 22;
 /// that drafts, not a tuning knob.
 pub const MAX_BLOCK_SIZE: usize = 1024;
 
+/// The round block a request that named none runs at, before a drafter's own
+/// declaration narrows it: the verifier's own token plus four drafted.
+///
+/// One producer for the whole workspace. The serve layer resolves the served
+/// block from this and the drafter's declared depth, and the equivalence gate
+/// drives a pair that names no block at the same number, so the width that gate
+/// judges is a width an operator is actually served. A second copy of the value
+/// anywhere makes those two silently different runs.
+///
+/// It is not derived from any checkpoint. Which block each drafter should
+/// default to is a throughput question and belongs to a sweep; this is the
+/// number that stands until one answers it.
+pub const DEFAULT_BLOCK_SIZE: usize = 5;
+
 /// The vocabulary a snapshot's `tokenizer.json` declares, added tokens included.
 fn snapshot_vocab(dir: &Path) -> Result<HashMap<String, u32>> {
     let path = dir.join("tokenizer.json");

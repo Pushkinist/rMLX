@@ -119,8 +119,8 @@ fn mtp_sidecar_loads_whatever_ffn_it_carries() {
         .expect("MTP sidecar must load regardless of whether its layers.0 FFN is dense or MoE");
 
     assert!(
-        drafter.block_size() >= 2,
-        "block_size {} must leave room for at least one draft token",
+        drafter.block_size().is_none_or(|b| b >= 2),
+        "a declared block_size {:?} must leave room for at least one draft token",
         drafter.block_size()
     );
     assert_eq!(
@@ -129,7 +129,7 @@ fn mtp_sidecar_loads_whatever_ffn_it_carries() {
         "sidecar fc must project to the verifier width"
     );
     eprintln!(
-        "[qwen35_mtp_align] sidecar loaded: hidden={hidden} block_size={}",
+        "[qwen35_mtp_align] sidecar loaded: hidden={hidden} block_size={:?}",
         drafter.block_size()
     );
 }
@@ -158,7 +158,8 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     let hidden = verifier.hidden_size();
     let mut drafter = MtpDrafter::load(&draft_path, hidden, device).expect("load sidecar");
-    let block_size = drafter.block_size();
+    const DEFAULT: usize = rmlx_models::speculative::DEFAULT_BLOCK_SIZE;
+    let block_size = drafter.block_size().map_or(DEFAULT, |d| DEFAULT.min(d));
 
     let tk =
         tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");

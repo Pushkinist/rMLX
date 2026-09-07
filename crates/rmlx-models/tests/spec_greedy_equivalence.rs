@@ -193,9 +193,25 @@ const MIN_ANSWER_TOKENS: usize = 160;
 /// prefix would otherwise score 1.0.
 const MIN_LENGTH_RATIO: f64 = 0.60;
 
-/// Draft block for the assistant pair. Small enough that a rollback runs every
-/// few tokens, which is the code path the oracles protect.
-const BLOCK_SIZE: usize = 4;
+/// The round block a pair that names none is driven at.
+///
+/// `rmlx_models::speculative::DEFAULT_BLOCK_SIZE` rather than a number of this
+/// harness's own: a pair judged at a width no request produces is judging a
+/// configuration nobody is served. A drafter that declares a shallower depth is
+/// served that instead, which is what [`Pair::block`] carries for the pairs
+/// whose loops read a declaration.
+const BLOCK_SIZE: usize = rmlx_models::speculative::DEFAULT_BLOCK_SIZE;
+
+/// The block the serve layer resolves for a request that names none: the
+/// default, narrowed by whatever depth the drafter declares.
+///
+/// Restated here rather than called, because the resolver lives in the serve
+/// crate and this crate does not depend on it. `crates/rmlx-server`'s
+/// `no_flag_runs_at_the_default_capped_by_the_declared_depth` is the cell that
+/// pins the rule; this is the same arithmetic over the same constant.
+fn served(declared: Option<usize>) -> usize {
+    declared.map_or(BLOCK_SIZE, |d| BLOCK_SIZE.min(d))
+}
 
 /// Context both arms run under. Above the 4k prompt plus the budget, and the
 /// same on both sides — a different cap on either would make this a measurement
@@ -1673,17 +1689,17 @@ struct Pair {
     verifier: common::GoldenModel,
     drafter: DrafterSource,
     round_loop: RoundLoop,
-    /// The round block to drive this pair at, or `None` for the depth the
-    /// drafter's own checkpoint declares.
+    /// The round block to drive this pair at, or `None` for the block the engine
+    /// serves a request that names none.
     ///
-    /// A depth a checkpoint declares is the one it was trained at, and it is
-    /// what the engine runs when a request names no block — so it is the depth
-    /// a pair covers by default. It is not the only depth the engine will run:
-    /// a request names any block up to what one verify forward can score, and a
-    /// block wider than the declared one puts the same round loop through a
-    /// verify forward of a different width, an acceptance walk over more
-    /// positions and a rollback over a longer rejected tail. Naming it here is
-    /// what lets a pair be judged at a width an operator can actually ask for.
+    /// `None` is [`BLOCK_SIZE`] narrowed by whatever depth the drafter declares,
+    /// which is the serve layer's own rule — so a pair left at `None` covers the
+    /// configuration an operator gets. It is not the only one the engine will
+    /// run: a request names any block up to what one verify forward can score,
+    /// and a wider block puts the same round loop through a verify forward of a
+    /// different width, an acceptance walk over more positions and a rollback
+    /// over a longer rejected tail. Naming it here is what lets a pair be judged
+    /// at one of those.
     block: Option<usize>,
 }
 
@@ -2310,7 +2326,7 @@ impl Loaded {
                     )
                     .expect("assistant speculative generate"),
                     Drafter::Mtp(drafter) => {
-                        let block = self.block.unwrap_or_else(|| drafter.block_size());
+                        let block = self.block.unwrap_or_else(|| served(drafter.block_size()));
                         mtp_generate(
                             verifier,
                             drafter,
@@ -2327,13 +2343,14 @@ impl Loaded {
                         )
                         .expect("mtp speculative generate")
                     }
-                    // Absent a block on the pair, the drafter's own ceiling —
-                    // which this loop then halves and grows from the recent
-                    // accept rate. Asking for a narrower one would take the
-                    // varying schedule out of the run, and the schedule is what
-                    // this pair covers that no other does.
+                    // The loop halves and grows this from the recent accept
+                    // rate, so the width varies within a run whatever it starts
+                    // at — the schedule is what this pair covers that no other
+                    // does, and it runs at whatever block the pair names.
                     Drafter::DFlash1(drafter) => {
-                        let block = self.block.unwrap_or_else(|| drafter.block_size());
+                        let block = self
+                            .block
+                            .unwrap_or_else(|| served(Some(drafter.block_size())));
                         dflash_generate(
                             verifier,
                             drafter,
@@ -2350,12 +2367,14 @@ impl Loaded {
                         )
                         .expect("dflash speculative generate")
                     }
-                    // Absent a block on the pair, the one the drafter was
-                    // trained at rather than the harness's default: the whole
-                    // point of a block drafter is the block, and that is the
-                    // width its selector chain is defined over.
+                    // The whole point of a block drafter is the block, and the
+                    // width its selector chain is defined over is the one its
+                    // checkpoint declares — so a pair naming none is served the
+                    // narrower of that and the default, as anything else is.
                     Drafter::DFlash2(drafter) => {
-                        let block = self.block.unwrap_or(drafter.cfg.block_size);
+                        let block = self
+                            .block
+                            .unwrap_or_else(|| served(Some(drafter.cfg.block_size)));
                         dflash2_generate(
                             verifier,
                             drafter,
@@ -2373,7 +2392,9 @@ impl Loaded {
                         .expect("dflash2 speculative generate")
                     }
                     Drafter::Eagle3(drafter) => {
-                        let block = self.block.unwrap_or_else(|| drafter.block_size());
+                        let block = self
+                            .block
+                            .unwrap_or_else(|| served(Some(drafter.block_size())));
                         eagle3_generate(
                             verifier,
                             drafter,

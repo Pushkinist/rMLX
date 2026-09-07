@@ -102,7 +102,8 @@ pub struct MtpDrafter {
     caches: Vec<KvCache>,
     /// The block the sidecar's config declares (`block_size`) — the depth the
     /// head was trained at, not a ceiling on the depth it can be run at.
-    block_size: usize,
+    /// `None` when the config names none.
+    block_size: Option<usize>,
     device: Device,
 }
 
@@ -123,7 +124,7 @@ impl MtpDrafter {
             draft = %draft_dir.display(),
             hidden_size,
             num_mtp_layers = weights.layers.len(),
-            block_size,
+            ?block_size,
             "MtpDrafter: loaded sidecar head"
         );
         Ok(Self {
@@ -141,11 +142,12 @@ impl MtpDrafter {
         }
     }
 
-    /// The block this sidecar's config declares, including the seed carry.
+    /// The block this sidecar's config declares, including the seed carry, or
+    /// `None` when it declares none.
     ///
     /// The trained depth, which a round is free to exceed — see
-    /// [`round_block_total`].
-    pub fn block_size(&self) -> usize {
+    /// [`mtp_round_block_total`].
+    pub fn block_size(&self) -> Option<usize> {
         self.block_size
     }
 
@@ -298,7 +300,8 @@ impl MtpDrafter {
 /// Reads `model.safetensors` (qwen3.5 split layout) and constructs the `fc`
 /// linear + three RMSNorms + the reused Qwen3.5-MoE decoder layer(s). Validates
 /// `fc` shape `[hidden, 2*hidden]` against the verifier `hidden_size`. Returns
-/// `(weights, block_size)`.
+/// `(weights, block_size)`, the second `None` when the config names no
+/// `block_size`.
 ///
 /// Norm-weight contract: the qwen3.5 sidecar split (`qwen3_5_mtp.py::sanitize`)
 /// adds 1.0 to every 1-D norm weight ONLY when the source is NOT already an
@@ -310,7 +313,7 @@ impl MtpDrafter {
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
-fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights, usize)> {
+fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights, Option<usize>)> {
     use rmlx_loader::{load_config, load_shard_index, ShardSet};
 
     let cfg = load_config(draft_dir).map_err(|e| {
@@ -413,12 +416,15 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
     let partial_rotary_factor = rope_f64("partial_rotary_factor", 0.25);
     let rope_dims = ((head_dim as f64) * partial_rotary_factor).round() as usize;
 
-    // block_size (tokens proposed per round, incl. carry).
+    // block_size (tokens proposed per round, incl. carry). Absent is its own
+    // answer: a caller deciding a default has to be able to tell a checkpoint
+    // that declares a depth from one that says nothing, and a fallback here
+    // would hand it 3 either way.
     let block_size = cfg
         .extras
         .get("block_size")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(3) as usize;
+        .and_then(|v| usize::try_from(v).ok());
 
     // Sidecar global quant (group_size / bits / mode).
     let (q_gs, q_bits, q_mode) = match &cfg.quantization {
