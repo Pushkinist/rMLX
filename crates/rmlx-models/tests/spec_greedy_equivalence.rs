@@ -141,7 +141,7 @@ use rmlx_mlx::Device;
 use rmlx_models::arch;
 use rmlx_models::speculative::dflash::{dflash_generate, DFlashDrafter};
 use rmlx_models::speculative::dflash2::{dflash2_generate, DFlash2Drafter};
-use rmlx_models::speculative::eagle3::{eagle3_generate, Eagle3Drafter};
+use rmlx_models::speculative::eagle3::{eagle3_generate, DecidedBy, Eagle3Drafter};
 use rmlx_models::speculative::gemma4_assistant::{mtp_assistant_generate, Gemma4AssistantDrafter};
 use rmlx_models::speculative::mtp::{mtp_generate, MtpDrafter};
 use rmlx_models::{Declared, DraftKind, SpeculativeDispatcher};
@@ -426,15 +426,50 @@ fn weakest_tail(spec: &[u32], plain: &[u32]) -> (usize, f64) {
     worst
 }
 
+/// What a pair's loop could and could not have said at each of its positions.
+///
+/// Only the restricted-vocabulary pair builds one. Its verify pass emits the
+/// drafter's own argmax at a position it accepted, and that argmax is the
+/// verifier's exactly when the verifier's is a token the drafter can name — so
+/// a divergence at an accepted position whose reference token is unnameable is
+/// the declared boundary and could be nothing else. The round's correction is
+/// taken over the whole vocabulary, so a divergence there is a divergence like
+/// any other pair's and is judged like one.
+///
+/// **That distinction is the whole of the rule, and dropping it forgives the
+/// defect the pair exists to catch.** Widening the restriction to the
+/// correction as well changes an answer at exactly the same kind of token, so
+/// the two are indistinguishable in the token streams; what separates them is
+/// which position the loop was at, which only the loop knows.
+struct Restriction<'a> {
+    /// Target ids the drafter can name.
+    vocab: &'a std::collections::HashSet<u32>,
+    /// Which vocabulary decided each token of the speculative arm.
+    decided_by: &'a [DecidedBy],
+}
+
+impl Restriction<'_> {
+    /// Whether the declared boundary is what parted the arms at `at`.
+    fn explains(&self, at: usize, plain: &[u32]) -> bool {
+        self.decided_by.get(at) == Some(&DecidedBy::RestrictedVocab)
+            && plain.get(at).is_some_and(|id| !self.vocab.contains(id))
+    }
+
+    /// How many of the reference arm's own tokens the drafter cannot name.
+    fn unnameable(&self, plain: &[u32]) -> usize {
+        plain.iter().filter(|id| !self.vocab.contains(id)).count()
+    }
+}
+
 /// What one pair of arms says about the round loop.
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
     /// The round loop reproduced what the verifier decodes alone.
     Agreed,
     /// The pair says nothing either way, and the reason is a property of the
-    /// prompt or the model rather than of the round loop. Reported, not failed:
-    /// a gate that turns red on an input it cannot read teaches its operator to
-    /// ignore it.
+    /// prompt, the model or the pair's own declared vocabulary rather than of
+    /// the round loop. Reported, not failed: a gate that turns red on an input
+    /// it cannot read teaches its operator to ignore it.
     Unjudgeable(String),
     /// The round loop did not reproduce plain greedy.
     Refused(String),
@@ -445,7 +480,15 @@ enum Verdict {
 /// `margins` is the reference arm's per-position top-two logprob gap, or empty
 /// when the caller has none — the synthetic fixtures below run that way, and the
 /// divergence oracle stands down rather than inventing a distribution.
-fn judge(spec: &[u32], plain: &[u32], margins: &[f32]) -> Verdict {
+///
+/// `restriction` is `None` for every pair whose loop scores each position over
+/// the verifier's whole vocabulary, which is all of them but one.
+fn judge(
+    spec: &[u32],
+    plain: &[u32],
+    margins: &[f32],
+    restriction: Option<&Restriction<'_>>,
+) -> Verdict {
     let shorter = spec.len().min(plain.len());
     let longer = spec.len().max(plain.len());
 
@@ -525,6 +568,16 @@ fn judge(spec: &[u32], plain: &[u32], margins: &[f32]) -> Verdict {
 
     if let Some((at, confidence)) = divergence_confidence(spec, plain, margins) {
         if confidence > MAX_DIVERGENCE_CONFIDENCE {
+            if restriction.is_some_and(|r| r.explains(at, plain)) {
+                return Verdict::Unjudgeable(format!(
+                    "the arms first differ at token {at}, which the round loop emitted from \
+                     the drafter's own argmax and where the verifier's answer is a token \
+                     the drafter's vocabulary cannot name — the declared restricted-\
+                     vocabulary boundary parted them and no correct loop of this kind could \
+                     have said anything else there, so this prompt says nothing about the \
+                     round loop"
+                ));
+            }
             return Verdict::Refused(format!(
                 "the arms first differ at token {at}, where the verifier was surer than \
                  {confidence:.4} of its own decisions on this answer (ceiling \
@@ -595,7 +648,7 @@ fn a_single_flip_passes_and_a_confident_flip_does_not() {
     let mut tied = vec![5.0f32; N_TOKENS];
     tied[66] = 0.01;
     assert!(
-        judge(&one_flip, &plain, &tied).refusal().is_none(),
+        judge(&one_flip, &plain, &tied, None).refusal().is_none(),
         "a flip at the arm's own least-confident decision must pass"
     );
 
@@ -604,7 +657,7 @@ fn a_single_flip_passes_and_a_confident_flip_does_not() {
         *m = 0.001;
     }
     confident[66] = 5.0;
-    let failure = judge(&one_flip, &plain, &confident)
+    let failure = judge(&one_flip, &plain, &confident, None)
         .refusal()
         .expect("must refuse");
     assert!(failure.contains("nearly tied"), "{failure}");
@@ -634,6 +687,157 @@ fn the_divergence_oracle_reads_the_first_differing_position_or_nothing() {
     // the length guard owns that pair.
     let extended: Vec<u32> = plain.iter().copied().chain([1_u32]).collect();
     assert_eq!(divergence_confidence(&extended, &plain, &tied), None);
+}
+
+/// One pair of arms parting at token 66, at a decision the verifier was sure
+/// about, with everything the restricted-vocabulary rule reads left to the
+/// caller: the reference token there, and which vocabulary decided the
+/// speculative one.
+///
+/// Every case below is this pair with one of those two moved, so the verdict is
+/// the only thing that can differ between them.
+fn restricted_case(
+    reference_token_nameable: bool,
+    decided: DecidedBy,
+) -> (
+    Vec<u32>,
+    Vec<u32>,
+    Vec<f32>,
+    std::collections::HashSet<u32>,
+    Vec<DecidedBy>,
+) {
+    let plain: Vec<u32> = (0..N_TOKENS as u32).collect();
+    let mut spec = plain.clone();
+    spec[66] = 9999;
+
+    // Sure enough at token 66 that the confidence oracle refuses it: every other
+    // decision in the arm was a closer call than this one.
+    let mut margins = vec![0.01f32; N_TOKENS];
+    for m in margins.iter_mut().take(N_TOKENS / 3) {
+        *m = 0.001;
+    }
+    margins[66] = 5.0;
+
+    // The drafter names every id in play except, when the case asks for it, the
+    // reference arm's own token at the divergence. Two other reference tokens
+    // are unnameable throughout, so a rule that read the answer rather than the
+    // divergence would not tell the cases apart.
+    let mut vocab: std::collections::HashSet<u32> = plain.iter().copied().collect();
+    vocab.insert(9999);
+    vocab.remove(&12);
+    vocab.remove(&200);
+    if !reference_token_nameable {
+        vocab.remove(&66);
+    }
+
+    let mut decided_by = vec![DecidedBy::FullVocab; N_TOKENS];
+    decided_by[66] = decided;
+
+    (spec, plain, margins, vocab, decided_by)
+}
+
+/// The declared boundary: the loop emitted the drafter's own argmax at the
+/// position the arms parted on, and the verifier's answer there is a token that
+/// vocabulary cannot say. No correct loop of this kind could have said anything
+/// else, so the prompt is reported rather than refused.
+#[test]
+fn a_divergence_the_restricted_vocabulary_forced_is_not_a_refusal() {
+    let (spec, plain, margins, vocab, decided_by) =
+        restricted_case(false, DecidedBy::RestrictedVocab);
+    let verdict = judge(
+        &spec,
+        &plain,
+        &margins,
+        Some(&Restriction {
+            vocab: &vocab,
+            decided_by: &decided_by,
+        }),
+    );
+    assert!(verdict.refusal().is_none(), "{verdict:?}");
+    let Verdict::Unjudgeable(why) = &verdict else {
+        panic!("the boundary is not a statement about the round loop: {verdict:?}");
+    };
+    assert!(why.contains("cannot name"), "{why}");
+    assert!(why.contains("says nothing about the round loop"), "{why}");
+}
+
+/// **The mutation this rule has to survive.** Widening the same inexactness to
+/// the round's correction changes an answer at exactly the kind of token the
+/// boundary does — same reference token, same speculative token, same
+/// confidence — and the only thing that separates the two is the position the
+/// loop was at. A rule keyed on the token alone forgives it; this one refuses
+/// it, for the reason it refuses any other pair.
+#[test]
+fn the_same_divergence_at_the_correction_is_refused() {
+    let (spec, plain, margins, vocab, decided_by) = restricted_case(false, DecidedBy::FullVocab);
+    let failure = judge(
+        &spec,
+        &plain,
+        &margins,
+        Some(&Restriction {
+            vocab: &vocab,
+            decided_by: &decided_by,
+        }),
+    )
+    .refusal()
+    .expect("the correction reads the whole vocabulary, so the restriction cannot excuse it");
+    assert!(failure.contains("nearly tied"), "{failure}");
+}
+
+/// A divergence at a token the drafter could have named is judged the old way,
+/// wherever the loop was: the restricted argmax and the true one are the same
+/// token on the ids the drafter can name, so the restriction explains nothing
+/// there.
+#[test]
+fn a_divergence_the_drafter_could_have_named_is_judged_as_before() {
+    for decided in [DecidedBy::RestrictedVocab, DecidedBy::FullVocab] {
+        let (spec, plain, margins, vocab, decided_by) = restricted_case(true, decided);
+        let failure = judge(
+            &spec,
+            &plain,
+            &margins,
+            Some(&Restriction {
+                vocab: &vocab,
+                decided_by: &decided_by,
+            }),
+        )
+        .refusal()
+        .unwrap_or_else(|| panic!("a nameable divergence must still refuse, at {decided:?}"));
+        assert!(failure.contains("nearly tied"), "{failure}");
+
+        // And a pair that declares no reduced vocabulary reads the same pair the
+        // same way, which is what "judged as before" means.
+        let plain_rule = judge(&spec, &plain, &margins, None)
+            .refusal()
+            .expect("no restriction, no waiver");
+        assert_eq!(plain_rule, failure);
+    }
+}
+
+/// The waiver is scoped to the divergence oracle and reaches neither of the
+/// other two verdicts. A speculative arm that collapsed, or one that stopped
+/// early, is refused whatever the restriction would have said about where the
+/// arms part.
+#[test]
+fn the_boundary_excuses_no_other_refusal() {
+    let (_, plain, margins, vocab, decided_by) = restricted_case(false, DecidedBy::RestrictedVocab);
+    let restriction = Restriction {
+        vocab: &vocab,
+        decided_by: &decided_by,
+    };
+
+    let mut collapsed: Vec<u32> = plain[..66].to_vec();
+    collapsed.extend(std::iter::repeat_n([7_u32, 8].into_iter(), N_TOKENS).flatten());
+    collapsed.truncate(N_TOKENS);
+    let failure = judge(&collapsed, &plain, &margins, Some(&restriction))
+        .refusal()
+        .expect("a collapsed speculative arm is refused whatever parted the arms");
+    assert!(failure.contains("repetition loop"), "{failure}");
+
+    let failure = judge(&plain[..16], &plain, &margins, Some(&restriction))
+        .refusal()
+        .expect("a short speculative arm is refused whatever parted the arms");
+    assert!(failure.contains("stopped early"), "{failure}");
 }
 
 /// The oracle's own denominator: the confidence is a rank over the reference
@@ -710,7 +914,7 @@ fn every_shape_of_repetition_loop_is_refused() {
                 .collect(),
         ),
     ] {
-        let failure = judge(&stream, &healthy, &[])
+        let failure = judge(&stream, &healthy, &[], None)
             .refusal()
             .unwrap_or_else(|| panic!("{shape} was not refused"));
         assert!(failure.contains("repeats at period"), "{shape}: {failure}");
@@ -729,7 +933,7 @@ fn a_collapsed_reference_arm_is_reported_as_an_input_the_gate_cannot_judge() {
     let healthy: Vec<u32> = (0..N_TOKENS as u32).collect();
     let looping = vec![7u32; N_TOKENS];
 
-    let spec_side = judge(&looping, &healthy, &[]);
+    let spec_side = judge(&looping, &healthy, &[], None);
     let why = spec_side
         .refusal()
         .expect("a degenerate spec arm must be refused");
@@ -739,7 +943,7 @@ fn a_collapsed_reference_arm_is_reported_as_an_input_the_gate_cannot_judge() {
         "{why}"
     );
 
-    let plain_side = judge(&healthy, &looping, &[]);
+    let plain_side = judge(&healthy, &looping, &[], None);
     assert!(
         matches!(plain_side, Verdict::Unjudgeable(ref why) if why.contains("reference arm")),
         "a collapsed reference arm is an input the gate cannot read, not a \
@@ -753,12 +957,12 @@ fn a_collapsed_reference_arm_is_reported_as_an_input_the_gate_cannot_judge() {
 fn a_prompt_that_produced_no_answer_is_reported_rather_than_failed() {
     let short: Vec<u32> = Rng(0x5170_0000).prose(MIN_ANSWER_TOKENS - 1);
     assert!(
-        matches!(judge(&short, &short, &[]), Verdict::Unjudgeable(ref why) if why.contains("both arms")),
+        matches!(judge(&short, &short, &[], None), Verdict::Unjudgeable(ref why) if why.contains("both arms")),
         "two arms that both stopped short say nothing about the round loop"
     );
 
     let long: Vec<u32> = Rng(0x5170_0000).prose(N_TOKENS);
-    let why = judge(&short, &long, &[])
+    let why = judge(&short, &long, &[], None)
         .refusal()
         .expect("one short arm against one long one must be refused");
     assert!(why.contains("one arm stopped early"), "{why}");
@@ -952,7 +1156,7 @@ fn two_arms_in_the_same_ragged_loop_are_refused_until_they_are_no_longer_one_loo
     for noise in (0..=100).step_by(2) {
         for (sa, sb) in [(0x33u64, 0x44u64), (0x91, 0xA7), (0xB3, 0xC1), (0xD5, 0xE9)] {
             let (a, b) = (ragged_loop_arm(sa, noise), ragged_loop_arm(sb, noise));
-            if judge(&a, &b, &[]) != Verdict::Agreed {
+            if judge(&a, &b, &[], None) != Verdict::Agreed {
                 continue;
             }
             first_admitted = first_admitted.or(Some(noise));
@@ -1044,13 +1248,15 @@ fn a_speculative_arm_collapsing_over_its_last_quarter_is_refused_by_the_control(
     let healthy = Rng(0xC0DE).prose(N_TOKENS);
     for period in [8usize, 16, 24] {
         let spec = quarter_collapse(0x55, period);
-        let failure = judge(&spec, &healthy, &[]).refusal().unwrap_or_else(|| {
-            panic!(
-                "period {period}: an arm collapsing over its last quarter passed: \
+        let failure = judge(&spec, &healthy, &[], None)
+            .refusal()
+            .unwrap_or_else(|| {
+                panic!(
+                    "period {period}: an arm collapsing over its last quarter passed: \
                      cycle {:.4}",
-                strongest_windowed_cycle(&spec).2,
-            )
-        });
+                    strongest_windowed_cycle(&spec).2,
+                )
+            });
         assert!(
             failure.contains("repeats at period"),
             "period {period}: the control must be what refuses this — {failure}"
@@ -1142,14 +1348,14 @@ fn the_ratio_is_over_the_shorter_arm_and_the_length_guard_covers_it() {
         "a true prefix must score 1.0 over the shorter arm; it read {}",
         lcs_ratio(truncated, &plain)
     );
-    let failure = judge(truncated, &plain, &[])
+    let failure = judge(truncated, &plain, &[], None)
         .refusal()
         .expect("the length guard must refuse it");
     assert!(failure.contains("stopped well before"), "{failure}");
 
     // Just inside the guard the same shape scores 1.0 and passes, which is what
     // makes the guard — not the ratio — the thing doing the work above.
-    assert!(judge(&plain[..N_TOKENS * 3 / 2], &plain, &[])
+    assert!(judge(&plain[..N_TOKENS * 3 / 2], &plain, &[], None)
         .refusal()
         .is_none());
 }
@@ -1163,12 +1369,12 @@ fn the_ratio_is_over_the_shorter_arm_and_the_length_guard_covers_it() {
 fn the_length_floor_admits_every_answer_the_prompts_produce() {
     let at_floor = Rng(0x00F1_7EDD).prose(MIN_ANSWER_TOKENS);
     assert!(
-        judge(&at_floor, &at_floor, &[]).refusal().is_none(),
+        judge(&at_floor, &at_floor, &[], None).refusal().is_none(),
         "two arms exactly at the floor must pass"
     );
     let under = &at_floor[..MIN_ANSWER_TOKENS - 1];
     assert!(
-        judge(under, under, &[]) != Verdict::Agreed,
+        judge(under, under, &[], None) != Verdict::Agreed,
         "two arms one token under the floor must not be returned as agreement"
     );
 
@@ -1176,7 +1382,7 @@ fn the_length_floor_admits_every_answer_the_prompts_produce() {
     // them. Driven through `judge` rather than compared as constants.
     let budget = Rng(0x2181_2181).prose(N_TOKENS);
     assert!(
-        judge(&budget, &budget, &[]).refusal().is_none(),
+        judge(&budget, &budget, &[], None).refusal().is_none(),
         "a pair that answers in full must clear the floor"
     );
     // Both sides of the floor, at compile time, and each is the tightest form
@@ -1205,7 +1411,7 @@ fn the_length_floor_admits_every_answer_the_prompts_produce() {
 #[test]
 fn a_truncated_run_is_refused_rather_than_judged() {
     let plain: Vec<u32> = (0..N_TOKENS as u32).collect();
-    let failure = judge(&plain[..16], &plain, &[])
+    let failure = judge(&plain[..16], &plain, &[], None)
         .refusal()
         .expect("must refuse");
     assert!(failure.contains("stopped early"), "{failure}");
@@ -1233,7 +1439,7 @@ fn a_short_reference_arm_is_the_prompt_unless_the_other_arm_only_ran_past_it() {
 
     let mut ran_on = plain.clone();
     ran_on.extend(Rng(0x0BAD_0BAD).prose(N_TOKENS));
-    let failure = judge(&ran_on, &plain, &[])
+    let failure = judge(&ran_on, &plain, &[], None)
         .refusal()
         .expect("an arm that reproduced the whole reference answer and kept going must be refused");
     assert!(
@@ -1243,7 +1449,7 @@ fn a_short_reference_arm_is_the_prompt_unless_the_other_arm_only_ran_past_it() {
 
     let mut parted = plain[..4].to_vec();
     parted.extend(Rng(0x0F1F_0F1F).prose(N_TOKENS));
-    match judge(&parted, &plain, &[]) {
+    match judge(&parted, &plain, &[], None) {
         Verdict::Unjudgeable(why) => assert!(why.contains("parted inside that answer"), "{why}"),
         other @ (Verdict::Agreed | Verdict::Refused(_)) => {
             panic!("a reference arm under the floor is the prompt, not the loop: {other:?}")
@@ -1251,7 +1457,7 @@ fn a_short_reference_arm_is_the_prompt_unless_the_other_arm_only_ran_past_it() {
     }
 
     let long_plain: Vec<u32> = Rng(0x1C1C_1C1C).prose(N_TOKENS);
-    let failure = judge(&long_plain[..16], &long_plain, &[])
+    let failure = judge(&long_plain[..16], &long_plain, &[], None)
         .refusal()
         .expect("a speculative arm under the floor while the reference ran on must be refused");
     assert!(failure.contains("stopped early"), "{failure}");
@@ -1282,7 +1488,7 @@ fn a_late_onset_divergence_is_judged_where_it_begins() {
 
     let mut confident = vec![0.01f32; N_TOKENS];
     confident[onset] = 5.0;
-    let failure = judge(&late, &plain, &confident)
+    let failure = judge(&late, &plain, &confident, None)
         .refusal()
         .expect("must refuse");
     assert!(
@@ -1294,7 +1500,7 @@ fn a_late_onset_divergence_is_judged_where_it_begins() {
     // the benign case, and passes at exactly the same subsequence ratio.
     let mut tied = vec![5.0f32; N_TOKENS];
     tied[onset] = 0.01;
-    assert!(judge(&late, &plain, &tied).refusal().is_none());
+    assert!(judge(&late, &plain, &tied, None).refusal().is_none());
 }
 
 /// The two measured regimes put through `judge` itself, so the test fails when
@@ -1329,7 +1535,7 @@ fn the_gate_admits_the_worst_correct_regime_and_refuses_the_lowest_broken_one() 
         "the reconstructed correct regime reads {worst_correct:.4}, not the measured 0.0820"
     );
     assert!(
-        judge(&spec, &plain, &correct).refusal().is_none(),
+        judge(&spec, &plain, &correct, None).refusal().is_none(),
         "the worst correct regime must pass"
     );
 
@@ -1341,7 +1547,7 @@ fn the_gate_admits_the_worst_correct_regime_and_refuses_the_lowest_broken_one() 
         (lowest_broken - 0.1445).abs() < 0.002,
         "the reconstructed broken regime reads {lowest_broken:.4}, not the measured 0.1445"
     );
-    let failure = judge(&spec, &plain, &broken)
+    let failure = judge(&spec, &plain, &broken, None)
         .refusal()
         .expect("the lowest broken regime must be refused");
     assert!(failure.contains("nearly tied"), "{failure}");
@@ -1988,11 +2194,20 @@ enum Drafter {
 }
 
 impl Loaded {
-    /// Both arms over one prompt: the speculative ids, the reference ids, and
-    /// the reference's per-position margins.
-    fn arms(&mut self, prompt: &Prompt, device: Device) -> (Vec<u32>, Vec<u32>, Vec<f32>) {
+    /// Both arms over one prompt: the speculative ids, the reference ids, the
+    /// reference's per-position margins, and which vocabulary decided each
+    /// speculative token.
+    ///
+    /// The last is empty for every loop that scores each position over the
+    /// verifier's whole vocabulary, which is all of them but the restricted one.
+    fn arms(
+        &mut self,
+        prompt: &Prompt,
+        device: Device,
+    ) -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<DecidedBy>) {
         let ids = prompt.ids(&self.tokenizer);
         let mut spec_ids: Vec<u32> = Vec::new();
+        let mut decided_by: Vec<DecidedBy> = Vec::new();
         {
             let mut step = |s: &rmlx_models::ProbeStep| {
                 spec_ids.push(s.token_id);
@@ -2089,6 +2304,7 @@ impl Loaded {
                             Some(MAX_CTX),
                             &self.eos,
                             &mut step,
+                            &mut decided_by,
                             &GREEDY,
                             device,
                         )
@@ -2119,7 +2335,14 @@ impl Loaded {
             &self.eos,
             device,
         );
-        (spec_ids, plain_ids, margins)
+        assert!(
+            decided_by.is_empty() || decided_by.len() == spec_ids.len(),
+            "the loop reported which vocabulary decided {} tokens and emitted {} — the \
+             verdict indexes one by the other",
+            decided_by.len(),
+            spec_ids.len()
+        );
+        (spec_ids, plain_ids, margins, decided_by)
     }
 
     /// The target-vocabulary ids this pair's drafter can name, or `None` when it
@@ -2357,7 +2580,7 @@ fn report(
     spec: &[u32],
     plain: &[u32],
     margins: &[f32],
-    draft_vocab: Option<&std::collections::HashSet<u32>>,
+    restriction: Option<&Restriction<'_>>,
     verdict: &Verdict,
 ) {
     let (tail_start, tail_ratio) = weakest_tail(spec, plain);
@@ -2366,13 +2589,16 @@ fn report(
     let (div, confidence) = divergence_confidence(spec, plain, margins)
         .unwrap_or((common_prefix_len(spec, plain), 0.0));
     // For a pair whose drafter names a reduced vocabulary: how much of the
-    // reference answer that vocabulary cannot say, and whether the token it
-    // could not say is the one the arms parted on.
-    let outside = match draft_vocab {
-        Some(vocab) => format!(
-            " unnameable={} divergence_unnameable={}",
-            plain.iter().filter(|id| !vocab.contains(id)).count(),
-            plain.get(div).is_some_and(|id| !vocab.contains(id)),
+    // reference answer that vocabulary cannot say, whether the token it could
+    // not say is the one the arms parted on, and which vocabulary decided the
+    // speculative arm's token there — the two together are what the verdict
+    // reads.
+    let outside = match restriction {
+        Some(r) => format!(
+            " unnameable={} divergence_unnameable={} divergence_decided_by={:?}",
+            r.unnameable(plain),
+            plain.get(div).is_some_and(|id| !r.vocab.contains(id)),
+            r.decided_by.get(div),
         ),
         None => String::new(),
     };
@@ -2507,8 +2733,12 @@ fn run_gate(test: &str, pair: &Pair) {
     let mut refusals: Vec<String> = Vec::new();
     let mut judged = 0usize;
     for prompt in PROMPTS {
-        let (spec, plain, margins) = loaded.arms(prompt, device);
-        let verdict = judge(&spec, &plain, &margins);
+        let (spec, plain, margins, decided_by) = loaded.arms(prompt, device);
+        let restriction = draft_vocab.as_ref().map(|vocab| Restriction {
+            vocab,
+            decided_by: &decided_by,
+        });
+        let verdict = judge(&spec, &plain, &margins, restriction.as_ref());
         report(
             test,
             prompt,
@@ -2516,7 +2746,7 @@ fn run_gate(test: &str, pair: &Pair) {
             &spec,
             &plain,
             &margins,
-            draft_vocab.as_ref(),
+            restriction.as_ref(),
             &verdict,
         );
         match verdict {
