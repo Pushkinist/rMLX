@@ -167,13 +167,11 @@ fn snapshot_restore_multitoken_tail_wrapped() {
 /// without dropping the rejected keys reads the same offset and the wrong keys.
 ///
 /// The last case is the boundary: a rollback of the *whole* block would leave
-/// the ring one position short of its window, and is refused. The assistant
-/// round loop never asks for it — the bonus token is always kept — so the
-/// guarantee it needs is exactly "any tail up to `block - 1`". A **recurrent**
-/// round loop does ask for the whole block, because it replays from the
-/// pre-round offset its state snapshot was taken at, and would be refused here;
-/// no architecture wired today pairs recurrent state with a windowed KV layer,
-/// and `rollback_round_caches` is where the first one that does will say so.
+/// the ring one position short of its window, and is refused. No round loop asks
+/// for it — the bonus token is always kept — so the guarantee they need is
+/// exactly "any tail up to `block - 1`". That covers the recurrent loops too:
+/// they rebuild their recurrent state from the round tape and truncate K/V to
+/// the same target a full-attention loop does.
 #[test]
 #[allow(
     clippy::unwrap_used,

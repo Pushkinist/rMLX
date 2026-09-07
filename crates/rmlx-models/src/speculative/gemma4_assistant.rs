@@ -922,9 +922,7 @@ pub fn mtp_assistant_generate(
         let rejected = v_k as i32 - (accept as i32 + 1);
         if rejected > 0 {
             super::rollback_round_caches(
-                verifier,
                 &mut caches,
-                None,
                 None,
                 &verify_input,
                 pre_round_offset,
@@ -981,8 +979,8 @@ pub fn mtp_assistant_generate(
             verify_ns: round_verify_ns,
             walk_ns: round_walk_ns,
             rollback_ns: round_rollback_ns,
-            // Full attention: the rollback is a K/V tail slice, never a replay.
-            replayed: false,
+            // Full attention: the rollback is a K/V tail slice, never a refold.
+            refolded: false,
             charged: charge_phases,
         }
         .log(

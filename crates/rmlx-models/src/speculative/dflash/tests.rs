@@ -99,97 +99,11 @@ fn walk_respects_budget() {
     assert_eq!(emit, vec![10, 11]);
 }
 
-// --- DFlashRoundState rollback round-trip (GDN snapshot/restore) ---
-
-use rmlx_mlx::{Array, Dtype};
-
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-fn arr(vals: &[f32]) -> Array {
-    let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-    Array::from_bytes(&bytes, &[vals.len() as i32], Dtype::F32).expect("from_bytes")
-}
-
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
-fn read(a: &Array) -> Vec<f32> {
-    Array::eval(a).expect("materialise");
-    a.to_bytes()
-        .expect("to_bytes")
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-        .collect()
-}
-
-/// Snapshot a GDN cache before a round, mutate it (simulate a draft round
-/// advancing the recurrence), then restore on partial rejection — the
-/// cache must come back to the pre-round state exactly.
-#[test]
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
-fn round_state_rollback_round_trip() {
-    let mut caches = vec![LinearAttnCache {
-        conv_state: Some(arr(&[1.0, 2.0, 3.0])),
-        delta_state: Some(arr(&[4.0, 5.0])),
-    }];
-    let round = DFlashRoundState::snapshot(&caches).expect("snapshot");
-    assert_eq!(round.len(), 1);
-    assert!(!round.is_empty());
-
-    // Simulate the draft round advancing the recurrent state.
-    caches[0].conv_state = Some(arr(&[9.0, 9.0, 9.0]));
-    caches[0].delta_state = Some(arr(&[8.0, 8.0]));
-
-    // Partial rejection -> restore.
-    for (c, snap) in caches.iter_mut().zip(round.into_snapshots()) {
-        c.restore_snapshot(snap);
-    }
-    assert_eq!(
-        read(caches[0].conv_state.as_ref().unwrap()),
-        vec![1.0, 2.0, 3.0]
-    );
-    assert_eq!(
-        read(caches[0].delta_state.as_ref().unwrap()),
-        vec![4.0, 5.0]
-    );
-}
-
-#[test]
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-fn round_state_empty_for_non_gdn() {
-    let caches: Vec<LinearAttnCache> = vec![];
-    let round = DFlashRoundState::snapshot(&caches).expect("snapshot");
-    assert!(round.is_empty());
-    assert_eq!(round.len(), 0);
-}
-
 /// Compile-check: the public DFlash surface exists with expected sigs.
 #[test]
 fn dflash_module_compiles() {
     let _load = DFlashDrafter::load;
     let _bs = dflash_next_block_size;
     let _walk = walk_block_greedy;
-    let _snap = DFlashRoundState::snapshot;
-    let _ = (_load, _bs, _walk, _snap);
+    let _ = (_load, _bs, _walk);
 }
