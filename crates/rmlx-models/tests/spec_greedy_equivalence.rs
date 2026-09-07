@@ -1673,6 +1673,18 @@ struct Pair {
     verifier: common::GoldenModel,
     drafter: DrafterSource,
     round_loop: RoundLoop,
+    /// The round block to drive this pair at, or `None` for the depth the
+    /// drafter's own checkpoint declares.
+    ///
+    /// A depth a checkpoint declares is the one it was trained at, and it is
+    /// what the engine runs when a request names no block — so it is the depth
+    /// a pair covers by default. It is not the only depth the engine will run:
+    /// a request names any block up to what one verify forward can score, and a
+    /// block wider than the declared one puts the same round loop through a
+    /// verify forward of a different width, an acceptance walk over more
+    /// positions and a rollback over a longer rejected tail. Naming it here is
+    /// what lets a pair be judged at a width an operator can actually ask for.
+    block: Option<usize>,
 }
 
 /// How a pair's drafter is found, and so whether `make gpu-test` selects the
@@ -1703,6 +1715,7 @@ const ASSISTANT_PAIR: Pair = Pair {
     },
     drafter: DrafterSource::Slug("mlx-community__gemma-4-E2B-it-assistant-bf16"),
     round_loop: RoundLoop::Gemma4Assistant,
+    block: None,
 };
 
 /// The recurrent pair. Its agreement is far below the assistant pair's and no
@@ -1718,7 +1731,47 @@ const MTP_PAIR: Pair = Pair {
     },
     drafter: DrafterSource::Named,
     round_loop: RoundLoop::MtpSidecar,
+    block: None,
 };
+
+/// The recurrent pair on the 4-bit verifier, at the depth its sidecar declares.
+///
+/// The same round loop as [`MTP_PAIR`] against a verifier of half the weight
+/// width. It is the arm the deep-block pair below is compared against: two
+/// blocks of the same loop on the same pair, so a difference between them is
+/// the block and not the checkpoint.
+const MTP_4BIT_PAIR: Pair = Pair {
+    verifier: common::GoldenModel {
+        slug: "mlx-community__Qwen3.8-27B-4bit",
+        archs: &[
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ],
+    },
+    drafter: DrafterSource::Named,
+    round_loop: RoundLoop::MtpSidecar,
+    block: None,
+};
+
+/// The same pair driven past the depth its sidecar declares.
+///
+/// The sidecar head chains on its own output hidden, so it proposes to any
+/// depth asked for and a request may name one; nothing about that changes what
+/// the answer must be. What does change is every width downstream of it — the
+/// verify forward scores eight positions instead of three, the acceptance walk
+/// runs over eight, and a partial round rolls back a longer rejected tail. Each
+/// is a width no other pair here drives this loop at, and each is a place an
+/// answer could move without the loop reporting anything.
+const MTP_4BIT_DEEP_PAIR: Pair = Pair {
+    verifier: MTP_4BIT_PAIR.verifier,
+    drafter: DrafterSource::Named,
+    round_loop: RoundLoop::MtpSidecar,
+    block: Some(DEEP_BLOCK),
+};
+
+/// The block [`MTP_4BIT_DEEP_PAIR`] drives, chosen as the widest the accept
+/// curve still returns proposals at.
+const DEEP_BLOCK: usize = 8;
 
 /// The block pair. Its drafter denoises a whole block in one pass and its
 /// selector chains the block's independent argmaxes into one sentence, so an
@@ -1738,6 +1791,7 @@ const DFLASH2_PAIR: Pair = Pair {
     },
     drafter: DrafterSource::Named,
     round_loop: RoundLoop::DFlash2,
+    block: None,
 };
 
 /// The adaptive pair. Its drafter carries no dynamic convolution and no
@@ -1757,6 +1811,7 @@ const DFLASH1_PAIR: Pair = Pair {
     },
     drafter: DrafterSource::Named,
     round_loop: RoundLoop::DFlash1,
+    block: None,
 };
 
 /// The restricted-vocabulary pair, and the one place this gate reads a
@@ -1787,6 +1842,7 @@ const EAGLE3_PAIR: Pair = Pair {
     },
     drafter: DrafterSource::Named,
     round_loop: RoundLoop::Eagle3,
+    block: None,
 };
 
 /// The two-model pair: no sidecar head at all, a second complete model of the
@@ -1808,6 +1864,7 @@ const TWO_MODEL_PAIR: Pair = Pair {
     },
     drafter: DrafterSource::Named,
     round_loop: RoundLoop::TwoModelGreedy,
+    block: None,
 };
 
 /// Draft-model override, the variable the sibling alignment suites take.
@@ -2179,6 +2236,8 @@ struct Loaded {
     engine: Engine,
     tokenizer: tokenizers::Tokenizer,
     eos: Vec<u32>,
+    /// The pair's [`Pair::block`], carried through to the round-loop call.
+    block: Option<usize>,
 }
 
 /// The verifier, and whatever drives the speculative arm against it.
@@ -2241,7 +2300,7 @@ impl Loaded {
                         &self.tokenizer,
                         &ids,
                         N_TOKENS,
-                        BLOCK_SIZE,
+                        self.block.unwrap_or(BLOCK_SIZE),
                         Some(rmlx_kv_quant::KvQuant::None),
                         Some(MAX_CTX),
                         &self.eos,
@@ -2251,7 +2310,7 @@ impl Loaded {
                     )
                     .expect("assistant speculative generate"),
                     Drafter::Mtp(drafter) => {
-                        let block = drafter.block_size();
+                        let block = self.block.unwrap_or_else(|| drafter.block_size());
                         mtp_generate(
                             verifier,
                             drafter,
@@ -2268,12 +2327,13 @@ impl Loaded {
                         )
                         .expect("mtp speculative generate")
                     }
-                    // The drafter's own ceiling, which its loop then halves and
-                    // grows from the recent accept rate: asking for a narrower
-                    // one would take the varying schedule out of the run, and
-                    // the schedule is what this pair covers that no other does.
+                    // Absent a block on the pair, the drafter's own ceiling —
+                    // which this loop then halves and grows from the recent
+                    // accept rate. Asking for a narrower one would take the
+                    // varying schedule out of the run, and the schedule is what
+                    // this pair covers that no other does.
                     Drafter::DFlash1(drafter) => {
-                        let block = drafter.block_size();
+                        let block = self.block.unwrap_or_else(|| drafter.block_size());
                         dflash_generate(
                             verifier,
                             drafter,
@@ -2290,11 +2350,12 @@ impl Loaded {
                         )
                         .expect("dflash speculative generate")
                     }
-                    // The block the drafter was trained at, not the harness's: the
-                    // whole point of a block drafter is the block, and this is the
+                    // Absent a block on the pair, the one the drafter was
+                    // trained at rather than the harness's default: the whole
+                    // point of a block drafter is the block, and that is the
                     // width its selector chain is defined over.
                     Drafter::DFlash2(drafter) => {
-                        let block = drafter.cfg.block_size;
+                        let block = self.block.unwrap_or(drafter.cfg.block_size);
                         dflash2_generate(
                             verifier,
                             drafter,
@@ -2312,7 +2373,7 @@ impl Loaded {
                         .expect("dflash2 speculative generate")
                     }
                     Drafter::Eagle3(drafter) => {
-                        let block = drafter.block_size();
+                        let block = self.block.unwrap_or_else(|| drafter.block_size());
                         eagle3_generate(
                             verifier,
                             drafter,
@@ -2336,7 +2397,7 @@ impl Loaded {
                         &self.tokenizer,
                         &ids,
                         N_TOKENS,
-                        BLOCK_SIZE,
+                        self.block.unwrap_or(BLOCK_SIZE),
                         Some(rmlx_kv_quant::KvQuant::None),
                         Some(MAX_CTX),
                         0,
@@ -2462,6 +2523,7 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
         engine,
         tokenizer,
         eos,
+        block: pair.block,
     })
 }
 
@@ -2671,6 +2733,32 @@ fn the_recurrent_round_loop_reproduces_plain_greedy() {
     run_gate(
         "the_recurrent_round_loop_reproduces_plain_greedy",
         &MTP_PAIR,
+    );
+}
+
+/// The recurrent pair on the 4-bit verifier at its sidecar's declared depth,
+/// which is the control for the deep-block run below.
+#[ignore]
+#[test]
+fn the_recurrent_round_loop_reproduces_plain_greedy_at_the_declared_block() {
+    run_gate(
+        "the_recurrent_round_loop_reproduces_plain_greedy_at_the_declared_block",
+        &MTP_4BIT_PAIR,
+    );
+}
+
+/// The same pair and the same loop, driven past the depth its sidecar declares.
+///
+/// A request may name that block, so the answer it returns is one this engine
+/// serves, and it is judged by the same oracle as every other cell here: an
+/// arm that parts from plain greedy is refused unless the verifier's own top-two
+/// gap at the position they parted says the two were a near-tie.
+#[ignore]
+#[test]
+fn the_recurrent_round_loop_reproduces_plain_greedy_past_the_declared_block() {
+    run_gate(
+        "the_recurrent_round_loop_reproduces_plain_greedy_past_the_declared_block",
+        &MTP_4BIT_DEEP_PAIR,
     );
 }
 

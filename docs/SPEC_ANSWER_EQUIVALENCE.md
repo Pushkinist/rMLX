@@ -98,7 +98,7 @@ different property, and the only one available.
 | round loop | pair | how it is gated |
 |---|---|---|
 | Gemma4 shared-K/V assistant | `the_assistant_round_loop_reproduces_plain_greedy` | slug-resolved, runs under `make gpu-test` |
-| Qwen3.5-family MTP sidecar | `the_recurrent_round_loop_reproduces_plain_greedy` | `RMLX_DRAFT_TEST_MODEL` |
+| Qwen3.5-family MTP sidecar | `the_recurrent_round_loop_reproduces_plain_greedy`, and on the 4-bit verifier `..._at_the_declared_block` / `..._past_the_declared_block` | `RMLX_DRAFT_TEST_MODEL` |
 | DFlash 2 block | `the_block_round_loop_reproduces_plain_greedy` | `RMLX_DRAFT_TEST_MODEL` |
 | DFlash 1 block | `the_adaptive_round_loop_reproduces_plain_greedy` | `RMLX_DRAFT_TEST_MODEL` |
 | EAGLE-3 | `the_restricted_vocab_round_loop_reproduces_plain_greedy` | `RMLX_DRAFT_TEST_MODEL` |
@@ -108,6 +108,20 @@ different property, and the only one available.
 The property is not transitive across loops — each has its own rollback and its
 own acceptance walk, which is what the gate reads — so each of the six is its own
 pair rather than an inference from a neighbour.
+
+**Nor is it transitive across block widths.** A pair's `block` decides how many
+positions the verify forward scores in one pass, how many the acceptance walk
+reads back, and how long a rejected tail the rollback drops, so two blocks of one
+loop are two different runs of all three. The MTP sidecar is the loop where that
+matters most — its head chains on its own output hidden, so a request may name a
+block far past the depth the checkpoint declares — and it is the one carrying two
+pairs on the same verifier for it. Measured on `Qwen3.8-27B-4bit` with its 4-bit
+sidecar: at the declared block, one prompt of six is bit-identical and the other
+five part at a position whose confidence reads 0.0000-0.0312; at block 8 the same
+one is bit-identical and the other five read 0.0000-0.0156, three of them at an
+exact tie. Every reading is inside the ceiling, and the deeper block's are not
+the larger ones — which is the point of judging a divergence rather than
+detecting one.
 
 ## The divergence this gate was named for, settled
 

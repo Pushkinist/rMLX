@@ -1419,7 +1419,10 @@ here), so `--draft-block-size 8` against that sidecar ran at 3 and recorded
 `mtp/block=3`. That clamp is gone — the head chains on its own output hidden, so
 the declared value is the depth it was trained at and not one it can only propose
 to — and a deeper MTP block is now selectable. The rows above have not been
-re-taken at one; each drafter is shown at the depth its row was run at.
+re-taken at one; each drafter is shown at the depth its row was run at. The
+answer at a deeper block is gated: `spec_greedy_equivalence.rs` drives this pair
+at the declared block and at block 8, and both agree with plain greedy on all six
+prompts under the divergence-confidence oracle.
 
 **Nor is it the same measurement as the published one, even where the drafter is
 the same.** The third-party acceptance figures this checkpoint is known by were
