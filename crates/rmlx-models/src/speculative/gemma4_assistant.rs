@@ -725,6 +725,12 @@ fn block_from_request(requested: usize) -> Result<usize> {
 /// `block_size - 1` tokens/round). `sampler_cfg` decides what "the verifier's
 /// own token" means — its argmax at temperature 0, a draw from its
 /// post-sampling distribution above it; see [`super::VerifierDraw`].
+///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -747,7 +753,7 @@ pub fn mtp_assistant_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
             "mtp_assistant_generate: prompt must have >=2 tokens".into(),
@@ -847,7 +853,7 @@ pub fn mtp_assistant_generate(
                 charged: charge_phases,
             }
             .log_done();
-            return Ok(emitted);
+            return Ok((emitted, block_size));
         }
     }
 
@@ -862,12 +868,14 @@ pub fn mtp_assistant_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         let round_t0 = Instant::now();
         rounds += 1;
         let remaining = n_tokens - emitted.len();
         let bs = (remaining + 1).min(block_size).max(2);
+        widest_bs = widest_bs.max(bs);
 
         // -- Phase A: drafter proposes bs-1 tokens (conditioned on hidden). --
         let t0 = Instant::now();
@@ -1045,7 +1053,7 @@ pub fn mtp_assistant_generate(
         crate::speculative::verifier_kv_bytes(&caches, None),
         crate::decode_loop::PostDecode::seal(),
     );
-    Ok(emitted)
+    Ok((emitted, widest_bs))
 }
 
 /// Drop the last `drop` key positions (axis 2) from a shared `(K, V)` pair.

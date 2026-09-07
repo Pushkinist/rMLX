@@ -622,11 +622,11 @@ fn block_from_request(requested: usize, declared: Option<usize>) -> usize {
 /// The verifier is the Qwen3.5/3.6-MoE hybrid (carries GDN linear-attention
 /// state); rollback refolds that state from the round tape.
 ///
-/// Returns the emitted steps and **the block the rounds actually ran**. This is
-/// the one loop whose block is not the drafter's declaration narrowed by the
-/// request, so it is the one a caller cannot work out for itself — and a caller
-/// that cannot check it cannot notice the block silently reverting to the
-/// declaration.
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -787,12 +787,14 @@ pub fn mtp_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         let round_t0 = Instant::now();
         rounds += 1;
         let remaining = n_tokens - emitted.len();
         let bs = block_total.min(remaining + 1).max(2);
+        widest_bs = widest_bs.max(bs);
 
         // -- Phase A: drafter proposes bs-1 tokens (autoregressive). The sidecar
         //    KV starts this round at `draft_pos` (verifier prefix length). --
@@ -965,7 +967,7 @@ pub fn mtp_generate(
         crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
         crate::decode_loop::PostDecode::seal(),
     );
-    Ok((emitted, block_total))
+    Ok((emitted, widest_bs))
 }
 
 // ---------------------------------------------------------------------------

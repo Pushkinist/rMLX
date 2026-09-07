@@ -821,6 +821,12 @@ pub enum DecidedBy {
 ///
 /// Reuses the three verifier-side seams: multi-layer hidden capture,
 /// GDN snapshot/restore rollback, and raw embed accessor.
+///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::expect_used,
@@ -848,7 +854,7 @@ pub fn eagle3_generate(
     decided_by: &mut Vec<DecidedBy>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     use std::time::Instant;
 
     decided_by.clear();
@@ -1005,7 +1011,7 @@ pub fn eagle3_generate(
             charged: false,
         }
         .log_done();
-        return Ok(emitted);
+        return Ok((emitted, block_total));
     }
 
     tracing::info!(
@@ -1024,11 +1030,13 @@ pub fn eagle3_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
         let remaining = n_tokens - emitted.len();
         let bs = eagle3_next_block_size(block_total, remaining + 1);
+        widest_bs = widest_bs.max(bs);
         if bs <= 1 {
             break;
         }
@@ -1299,7 +1307,7 @@ pub fn eagle3_generate(
         crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
         crate::decode_loop::PostDecode::seal(),
     );
-    Ok(emitted)
+    Ok((emitted, widest_bs))
 }
 
 // ---------------------------------------------------------------------------

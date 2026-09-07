@@ -78,6 +78,12 @@ const PREFILL_CHUNK_SIZE: usize = 1024;
 /// forced-token contract the plain decode loop uses — is discarded here, as it
 /// is on every speculative loop: a round's tokens are already the verifier's.
 ///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
+///
 /// # Errors
 ///
 /// [`Error::Model`] when the prompt is too short to seed a round, when the
@@ -101,7 +107,7 @@ pub fn dflash2_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
             "dflash2_generate: prompt must have >=2 tokens".into(),
@@ -215,7 +221,7 @@ pub fn dflash2_generate(
             charged: charge_phases,
         }
         .log_done();
-        return Ok(emitted);
+        return Ok((emitted, block_total));
     }
 
     tracing::info!(
@@ -231,6 +237,7 @@ pub fn dflash2_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
@@ -239,6 +246,7 @@ pub fn dflash2_generate(
         // The block never resizes: the drafter denoises the block it was
         // trained at, and only the token budget shortens it.
         let bs = block_total.min(remaining + 1);
+        widest_bs = widest_bs.max(bs);
 
         let t0 = Instant::now();
         let draft_tokens = draft_block(verifier, drafter, b, &h_ctx, bs, device)?;
@@ -408,7 +416,7 @@ pub fn dflash2_generate(
         verifier_kv_bytes(&v_caches, Some(&v_lin)),
         crate::decode_loop::PostDecode::seal(),
     );
-    Ok(emitted)
+    Ok((emitted, widest_bs))
 }
 
 /// One block of `bs - 1` proposals: mask the block behind the carry token,

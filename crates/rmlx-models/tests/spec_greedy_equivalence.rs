@@ -2343,6 +2343,12 @@ impl Loaded {
     /// its confidence — is attributed to a block in the report line, and a pair
     /// whose block quietly fell back to the drafter's declaration would produce
     /// a full set of plausible readings under the wrong label.
+    ///
+    /// It is **each driver's own answer for the widest block its rounds ran**,
+    /// not the number this function was about to pass. Reading back the argument
+    /// would check that this function can hold a value, which is not the
+    /// question: the resolvers narrow to a checkpoint, and every loop narrows
+    /// again per round.
     fn arms(
         &mut self,
         prompt: &Prompt,
@@ -2360,14 +2366,13 @@ impl Loaded {
             ran = match &mut self.engine {
                 Engine::Sidecar { verifier, drafter } => match drafter {
                     Drafter::Assistant(drafter) => {
-                        let block = self.block.unwrap_or(BLOCK_SIZE);
                         mtp_assistant_generate(
                             verifier,
                             drafter,
                             &self.tokenizer,
                             &ids,
                             N_TOKENS,
-                            block,
+                            self.block.unwrap_or(BLOCK_SIZE),
                             Some(rmlx_kv_quant::KvQuant::None),
                             Some(MAX_CTX),
                             &self.eos,
@@ -2375,8 +2380,8 @@ impl Loaded {
                             &GREEDY,
                             device,
                         )
-                        .expect("assistant speculative generate");
-                        block
+                        .expect("assistant speculative generate")
+                        .1
                     }
                     Drafter::Mtp(drafter) => {
                         let block = self.block.unwrap_or_else(|| served(drafter.block_size()));
@@ -2419,8 +2424,8 @@ impl Loaded {
                             &GREEDY,
                             device,
                         )
-                        .expect("dflash speculative generate");
-                        block
+                        .expect("dflash speculative generate")
+                        .1
                     }
                     // The whole point of a block drafter is the block, and the
                     // width its selector chain is defined over is the one its
@@ -2444,8 +2449,8 @@ impl Loaded {
                             &GREEDY,
                             device,
                         )
-                        .expect("dflash2 speculative generate");
-                        block
+                        .expect("dflash2 speculative generate")
+                        .1
                     }
                     Drafter::Eagle3(drafter) => {
                         let block = self
@@ -2466,18 +2471,17 @@ impl Loaded {
                             &GREEDY,
                             device,
                         )
-                        .expect("eagle3 speculative generate");
-                        block
+                        .expect("eagle3 speculative generate")
+                        .1
                     }
                 },
                 Engine::TwoModel(dispatcher) => {
-                    let block = self.block.unwrap_or(BLOCK_SIZE);
                     dispatcher
                         .spec_generate_greedy(
                             &self.tokenizer,
                             &ids,
                             N_TOKENS,
-                            block,
+                            self.block.unwrap_or(BLOCK_SIZE),
                             Some(rmlx_kv_quant::KvQuant::None),
                             Some(MAX_CTX),
                             0,
@@ -2486,8 +2490,8 @@ impl Loaded {
                             None,
                             &GREEDY,
                         )
-                        .expect("two-model speculative generate");
-                    block
+                        .expect("two-model speculative generate")
+                        .1
                 }
             };
         }

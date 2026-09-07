@@ -1000,7 +1000,6 @@ impl Generator for SpeculativeGenerator {
                         &spec_sampler_cfg,
                         dispatcher.device(),
                     )
-                    .map(|(emitted, _block)| emitted)
                 }
                 // Greedy at temperature 0, Leviathan stochastic above it; the
                 // constraint is refused above, so `None` here.
@@ -1017,7 +1016,10 @@ impl Generator for SpeculativeGenerator {
                     None,
                     &spec_sampler_cfg,
                 ),
-            };
+            }
+            // Every driver reports the block its rounds ran; the served path
+            // reads it off the round loop's own `done` line instead.
+            .map(|(emitted, _block)| emitted);
 
             if cancelled {
                 return;

@@ -590,6 +590,12 @@ use crate::decode_loop::ProbeStep;
 /// `step_fn` is invoked once per emitted (verifier-confirmed) token; return
 /// `Some(id)` to force the next token (unused here — kept symmetric with the
 /// MTP path). Returns the emitted token ids.
+///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -612,7 +618,7 @@ pub fn dflash_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     use std::time::Instant;
 
     if prompt_ids.len() < 2 {
@@ -728,7 +734,7 @@ pub fn dflash_generate(
             charged: false,
         }
         .log_done();
-        return Ok(emitted);
+        return Ok((emitted, block_total));
     }
 
     tracing::info!(
@@ -743,11 +749,13 @@ pub fn dflash_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
         let remaining = n_tokens - emitted.len();
         let bs = dflash_next_block_size(&recent, block_total, remaining + 1, false);
+        widest_bs = widest_bs.max(bs);
         if bs <= 1 {
             break;
         }
@@ -898,7 +906,7 @@ pub fn dflash_generate(
         crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
         crate::decode_loop::PostDecode::seal(),
     );
-    Ok(emitted)
+    Ok((emitted, widest_bs))
 }
 
 // ---------------------------------------------------------------------------

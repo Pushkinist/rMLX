@@ -504,7 +504,12 @@ impl SpeculativeDispatcher {
     ///
     /// `step_fn` is called once per emitted token (verifier-confirmed) so
     /// the SSE consumer can stream output.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Returns the emitted steps and **the widest block any round of this run
+    /// actually ran**, the verifier's own token included. Not the `k + 1` that
+    /// was asked for: this loop narrows its draft count per round against the
+    /// remaining token budget, and a caller checking what it asked for against
+    /// its own argument would be checking nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn spec_generate_greedy(
         &self,
@@ -536,13 +541,13 @@ impl SpeculativeDispatcher {
         // residual `normalize((p−q)+)`. This preserves the verifier's output
         // distribution exactly (Leviathan 2023 Thm 1).
         sampler_cfg: &crate::sampler::SamplerConfig,
-    ) -> Result<Vec<ProbeStep>> {
+    ) -> Result<(Vec<ProbeStep>, usize)> {
         if k == 0 {
             return Err(Error::Model("spec_generate_greedy: k must be >= 1".into()));
         }
         let k = two_model_drafts_per_round(k);
         if n_tokens == 0 {
-            return Ok(vec![]);
+            return Ok((vec![], k + 1));
         }
         if prompt_ids.is_empty() {
             return Err(Error::Model(
@@ -589,6 +594,9 @@ impl SpeculativeDispatcher {
                 step_fn,
             )
         }
+        // The inner loops count drafts; every other loop here counts the block
+        // that holds them, so this reports the block the widest round ran.
+        .map(|(emitted, widest_draft)| (emitted, widest_draft + 1))
     }
 
     /// Greedy spec generation with persistent verifier + draft KV
@@ -633,7 +641,7 @@ impl SpeculativeDispatcher {
         max_ctx_override: Option<i32>,
         eos_ids: &[u32],
         step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
-    ) -> Result<Vec<ProbeStep>> {
+    ) -> Result<(Vec<ProbeStep>, usize)> {
         let draft = self.draft_model()?;
         let device = self.device;
         let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
@@ -764,6 +772,7 @@ impl SpeculativeDispatcher {
         // --- Spec loop. ------------------------------------------------
         let seed_emitted = emitted.len();
         let mut emitted_in_rounds = 0usize;
+        let mut widest_draft = 0usize;
         let round_loop_t0 = Instant::now();
         while emitted.len() < n_tokens {
             rounds += 1;
@@ -771,6 +780,7 @@ impl SpeculativeDispatcher {
             // Mirror mlx-lm: num_draft = min(remaining, K). Always ≥ 1
             // since loop guard ensures `remaining ≥ 1`.
             let num_draft = remaining.min(k).max(1);
+            widest_draft = widest_draft.max(num_draft);
 
             // -- GDN rollback prep. ------------------------------------
             // The GatedDeltaNet recurrent state has NO sequence axis, so
@@ -863,7 +873,7 @@ impl SpeculativeDispatcher {
                     charged: false,
                 }
                 .log_done();
-                return Ok(emitted);
+                return Ok((emitted, widest_draft));
             }
 
             // -- Phase D: setup next round. ----------------------------
@@ -997,7 +1007,7 @@ impl SpeculativeDispatcher {
             crate::decode_loop::PostDecode::seal(),
         );
 
-        Ok(emitted)
+        Ok((emitted, widest_draft))
     }
 
     /// Stochastic speculative decoding for `temperature > 0`.
@@ -1044,7 +1054,7 @@ impl SpeculativeDispatcher {
         eos_ids: &[u32],
         step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
         sampler_cfg: &crate::sampler::SamplerConfig,
-    ) -> Result<Vec<ProbeStep>> {
+    ) -> Result<(Vec<ProbeStep>, usize)> {
         use crate::sampler::{
             sample_index, sampling_distribution, stochastic_accept, AcceptDecision, Pcg32,
         };
@@ -1161,11 +1171,13 @@ impl SpeculativeDispatcher {
 
         let seed_emitted = emitted.len();
         let mut emitted_in_rounds = 0usize;
+        let mut widest_draft = 0usize;
         let round_loop_t0 = Instant::now();
         while emitted.len() < n_tokens {
             rounds += 1;
             let remaining = n_tokens - emitted.len();
             let num_draft = remaining.min(k).max(1);
+            widest_draft = widest_draft.max(num_draft);
 
             arm_lin_tapes(verifier_lin.as_deref_mut());
             arm_lin_tapes(draft_lin.as_deref_mut());
@@ -1295,7 +1307,7 @@ impl SpeculativeDispatcher {
                     charged: false,
                 }
                 .log_done();
-                return Ok(emitted);
+                return Ok((emitted, widest_draft));
             }
 
             // -- Phase D: cache rollback (identical to the greedy path). -----
@@ -1396,7 +1408,7 @@ impl SpeculativeDispatcher {
             crate::decode_loop::PostDecode::seal(),
         );
 
-        Ok(emitted)
+        Ok((emitted, widest_draft))
     }
 }
 

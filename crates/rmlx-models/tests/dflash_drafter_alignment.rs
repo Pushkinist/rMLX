@@ -223,7 +223,7 @@ fn dflash_live_loop_emits_coherent() {
         .chain(std::iter::once(248046u32))
         .collect();
 
-    let steps = dflash_generate(
+    let (steps, _block) = dflash_generate(
         &verifier,
         &mut drafter,
         &tk,
