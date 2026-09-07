@@ -753,12 +753,17 @@ drafter (accept rate 0.66, 3.56 tokens/round); `Qwen3.8-27B-mxfp8` drafted by
 rollback per round on the GDN pair). Neither pair pays at this block.
 
 Both were byte-identical to the no-drafter arm at 128 tokens, which is a weaker
-statement than it reads as: no correct speculative arm on this engine is
-byte-identical to plain greedy in general, so byte-equality is evidence and not a
-test. The GDN pair is now in the answer-equivalence gate
-(`the_two_model_round_loop_reproduces_plain_greedy`), which judges it over 256
-tokens and six prompts by where the arms first differ; it agrees on the five it
-judges, three of them bit-identical. See `docs/SPEC_ANSWER_EQUIVALENCE.md`.
+statement about the loop than it reads as: no correct speculative arm on this
+engine is byte-identical to plain greedy in general, so a run that is says the
+two arms happened not to meet a near-tie, not that the loop is right. The bench
+refuses a differing answer anyway, and that is a different job — it is deciding
+whether to *file a row*, and a row taken from an arm that answered something
+else is not a faster answer to the same question. Deciding whether a difference
+is a legitimate near-tie or a defect is the equivalence gate's job, and the GDN
+pair is now in it (`the_two_model_round_loop_reproduces_plain_greedy`): 256
+tokens over six prompts, judged by where the arms first differ and how sure the
+verifier was there; it agrees on the five it judges, three of them bit-identical.
+See `docs/SPEC_ANSWER_EQUIVALENCE.md`.
 
 ### Gemma4 Assistant Drafter
 
@@ -1534,20 +1539,27 @@ at the top level. The DFlash 2 loader defaults nothing — a key it needs and
 cannot find is a refusal naming the key, because a default is indistinguishable
 from the checkpoint's own value once a run is recorded.
 
-**That arm also did not reproduce its verifier's answer.** At temperature 0 on
-the code prompt it diverged from the no-drafter arm at the fourth token and
-stayed diverged, where the MTP sidecar on the same verifier and prompt is
-byte-identical over 160 tokens. Greedy acceptance emits only the verifier's
-argmax, so no drafter — however badly it proposes, and whatever tensors it was
-built without — can change the answer; a changed answer is the round loop, and
-the DFlash 1 loop is one of the three the answer-equivalence gate does not cover
-(`docs/SPEC_ANSWER_EQUIVALENCE.md` § What it runs). That arm cannot be
-reproduced on this pair at all now — the checkpoint declares itself `dflash2`
-and no longer reaches the DFlash 1 loader — so the loop is reproduced where it
-still runs: `z-lab/Qwen3.6-35B-A3B-DFlash` on its own verifier drives the same
-`dflash_generate`. **The observation is about DFlash 1, not this
-checkpoint**: the DFlash 2 loop on the same verifier is a pair in that gate and
-agrees with plain greedy on six of six prompts.
+**That arm also read as not reproducing its verifier's answer, and it did.** At
+temperature 0 on the code prompt it diverged from the no-drafter arm near the
+start and stayed diverged, where the MTP sidecar on the same verifier and prompt
+is byte-identical over 160 tokens. Read as byte-equality that says the round
+loop changed the answer. Measured against the oracle that judges a divergence
+rather than only detecting one, it does not: the verifier's top-two gap at the
+position the arms parted is the **smallest** of all 160 in that answer, rank
+0.0000 against a ceiling of 0.12. It is a near-tie flip, and
+`docs/SPEC_ANSWER_EQUIVALENCE.md` § The divergence this gate was named for
+carries the measurement. That is also the distinction between the two checks:
+`scripts/spec_bench.sh` refuses a row whose arms answered differently at all,
+because a bench row is optional and a refused one costs nothing; the
+equivalence gate is what decides whether a difference is a near-tie or a defect.
+
+That arm cannot be reproduced on this pair at all now — the checkpoint declares
+itself `dflash2` and no longer reaches the DFlash 1 loader, which would refuse it
+for the unread tensors anyway. **The observation was about DFlash 1, not this
+checkpoint**, and both loops are now pairs in that gate: DFlash 2 on this
+verifier agrees with plain greedy on six of six prompts, and DFlash 1 on
+`z-lab/Qwen3.6-35B-A3B-DFlash` and its own verifier agrees on the five it judges
+and reproduces the sixth exactly.
 
 ### Qwen3.6-35B-A3B-8bit — three drafters (GDN hybrid, MoE)
 

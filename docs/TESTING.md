@@ -122,7 +122,8 @@ without the request's filters — the last of which the surprise test does not
 refuse on its own, which is why the file carries a second oracle over the tokens
 that carry no target mass.
 
-`spec_greedy_equivalence.rs` asks a different question from those three: not
+`spec_greedy_equivalence.rs` asks a different question from the three alignment
+suites: not
 whether the round loop keeps the verifier's state consistent for a while, but
 whether the run produces the answer the verifier produces alone, over 256 tokens
 and every prompt the file carries. Its oracle is where the two arms first differ
@@ -132,7 +133,7 @@ scale. It is documented in full in `docs/SPEC_ANSWER_EQUIVALENCE.md`, including
 why the obvious oracle (how much of one answer the arms share) cannot be
 thresholded at all.
 
-Unlike the three above, its **assistant pair resolves both halves by slug** from
+Unlike those suites, its **assistant pair resolves both halves by slug** from
 `RMLX_O_MODELS_ROOT`, so `make gpu-test` runs that pair on a machine holding the
 snapshots and `run_gpu_tests.sh` reports a machine without them as INCOMPLETE.
 The other five pairs are the exceptions and are not gated: their
@@ -140,8 +141,10 @@ drafter comes from `RMLX_DRAFT_TEST_MODEL` or the pair does not run, because
 their verifiers' quantized matmuls trip the shader-validation census (see the
 table below and `docs/SPEC_ANSWER_EQUIVALENCE.md`). That one variable names one
 drafter, so a pair whose loop does not drive the kind that snapshot declares
-stands down naming both. Its drafter resolution does not go through
-`slug_snapshot` either, for the tokenizer reason above.
+stands down naming both. Its drafter goes through the same
+`slug_snapshot` at `Role::Sidecar` that `dflash2_loader.rs` does — one copy of
+the rules, and the role a drafter checkpoint can satisfy — and every stand-down
+names the test function it happened in, so `run_gpu_tests.sh` can attribute it.
 The verifier goes through the golden harness's own resolver
 (`common::model_for`); `RMLX_DRAFT_TEST_MODEL` overrides the drafter. Both
 `-e2b-` and `-e4b-` assistant snapshots declare the same architecture, so the
@@ -171,7 +174,8 @@ stable across a prompt change, so those pairs are named rather than slug-resolve
 and `make gpu-test` reports them as skipped. See
 `docs/SPEC_ANSWER_EQUIVALENCE.md`.
 
-`dflash_drafter_alignment.rs` is **not** one of those three and does not gate the
+`dflash_drafter_alignment.rs` is **not** one of the alignment suites above and
+does not gate the
 same property. It asserts that the drafter's round-0 first-block proposal aligns
 with the verifier's greedy continuation (`accept > 0`) and that the live loop
 emits coherent prose — a round-0 check, taken before any partial-accept rollback

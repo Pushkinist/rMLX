@@ -13,6 +13,16 @@ as they have existed, and both are fixed. What follows is the oracle it settled
 on, why the obvious oracle does not work, and the numbers every constant is set
 against.
 
+**This is not the bench's arm-equality refusal, and the two should not be read
+as one check.** `scripts/spec_bench.sh` digests each measured run's completion
+and refuses to file a speculative row whose answer differs from the plain arm's
+at all. That is a decision about whether a *throughput row* is worth recording,
+and it is right to be absolute: a bench row is optional and a refused one costs
+nothing. This gate answers the question the bench cannot — whether a difference
+is a near-tie the arithmetic permits or a defect in the round loop — and it
+exists because byte-equality cannot answer it. No correct speculative arm here is
+byte-identical to plain greedy in general.
+
 ## What it runs
 
 Six pairs, each over every prompt in the file. The assistant pair resolves both
@@ -133,6 +143,12 @@ own block of 16, with the adaptive schedule running, it agrees with plain greedy
 on the five prompts it judges and reproduces the sixth exactly. Its first
 divergences read 0.0000 to 0.0234.
 
+None of that makes the observation a false alarm about the *bench*. A row taken
+from an arm whose answer differs is not a faster answer to the same question
+however benign the difference, and `scripts/spec_bench.sh` now refuses one. What
+this section settles is the other question — whether the difference was the round
+loop — and the answer is that it was not.
+
 ## The oracle: where a correct pair diverges
 
 A reduction-order difference is a relative perturbation of order `1e-3` on a
@@ -192,7 +208,16 @@ inexactness lives on the positions where it is not.
 
 That mirrors the upstream implementation, so it is a design boundary rather than
 a port defect. It is still an answer change at temperature 0, which is what this
-gate reads, so the gate measures the exposure rather than assuming it away. Every
+gate reads, so the gate measures the exposure rather than assuming it away.
+
+`docs/SPECULATIVE.md` says the restricted read-back is sound at temperature 0 and
+only there, and that is a claim about *sampling*: a distribution needs the whole
+row's normalising constant, so a sampled request cannot take the reduction at
+all. This section is about what remains at temperature 0 — the reduced argmax is
+the true argmax on the ids the drafter can name, and only on those. Both are
+true and neither implies the other.
+
+Every
 run of that pair prints two figures per prompt: `unnameable`, how many of the
 reference arm's own tokens the drafter's vocabulary cannot say, and
 `divergence_unnameable`, whether the token the arms parted on is one of them.
