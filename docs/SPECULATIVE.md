@@ -1559,16 +1559,17 @@ loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
 **The prompt's capture is bounded by the same window.**
 `forward_verify_capture_chunked` takes the trailing row count its caller will
 read, and this loop passes the drafter's own `conditioning_rows`. Chunks that
-have fallen out of that tail are released as the prefill walks the prompt, so
-what is held is the window plus the chunk being filled — 3071 rows at
-`len(target_layer_ids) * hidden_size`, or about 150 MiB on the published pair,
-at any prompt length. Joining every chunk first and trimming afterwards, which
-is what this did, allocated one row per prompt token instead: about 1.6 GiB at a
-32k prompt, of which the trim kept 2047 rows. The rows the round loop receives
-are the same ones either way, and no figure in this document changed with it.
-EAGLE-3 shares the seam and conditions its own KV prefill on every prompt
-position, so it passes no limit — which is why the bound is the capture's
-parameter rather than a rule inside it.
+have fallen out of that tail are released as the prefill walks the prompt and
+the oldest one still held is cut to the part the tail reaches before anything is
+joined, so what is held is `sliding_window - 1 + PREFILL_CHUNK_SIZE` rows of
+`len(target_layer_ids) * hidden_size` at any prompt length. Joining every chunk
+first and trimming afterwards, which is what this did, held one such row per
+prompt token instead, and the trim then kept `sliding_window - 1` of them. Each
+row is 50 KiB on the published pair. The rows the round loop receives are the
+same ones either way, and no figure in this document changed with it. EAGLE-3
+shares the seam and conditions its own KV prefill on every prompt position, so
+it passes no limit — which is why the bound is the capture's parameter rather
+than a rule inside it.
 
 **Its drafter is greedy, and its acceptance is not.** `select_chain` traces a
 greedy chain and returns ids, no candidate distribution — and the reference's

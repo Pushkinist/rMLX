@@ -22,8 +22,10 @@ use std::path::{Path, PathBuf};
 
 use rmlx_mlx::Dtype;
 
+use super::super::round::PREFILL_CHUNK_SIZE;
 use super::*;
 use crate::layers::Linear;
+use crate::qwen3_5_moe::capture_tail::CaptureTail;
 
 /// Where the reference snapshot and its expected outputs live.
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dflash2_scale");
@@ -550,6 +552,15 @@ fn conditioning_rows_of(rows: i32, width: i32) -> Array {
     f32_array(&data, &[1, rows, width])
 }
 
+/// `conditioning_rows_of` shifted to start at an absolute prompt position, so a
+/// capture assembled from several chunks numbers its rows continuously.
+fn conditioning_rows_at(first: i32, rows: i32, width: i32) -> Array {
+    let data: Vec<f32> = (first..first + rows)
+        .flat_map(|r| std::iter::repeat_n(r as f32, width as usize))
+        .collect();
+    f32_array(&data, &[1, rows, width])
+}
+
 /// The first element of every row, which is that row's own number.
 #[allow(
     clippy::indexing_slicing,
@@ -601,6 +612,68 @@ fn the_trim_keeps_the_newest_rows_and_carries_a_short_buffer_whole() {
         Err(e) => panic!("trim_conditioning: {e}"),
     };
     assert_eq!(row_numbers(&again), vec![5, 6, 7, 8]);
+}
+
+/// The prefill capture, bounded by this drafter's own window, hands back exactly
+/// what the whole capture trimmed would have.
+///
+/// The round loop passes a row count to the capture and then trims what comes
+/// back, and the trim accepts a buffer shorter than the window without a word: a
+/// drafter conditioned on half its window still proposes, greedy verification
+/// still emits the verifier's own tokens, and the answer does not move. So the
+/// two paths are compared here on their bytes, at prompts either side of the
+/// window and at the chunk size the round loop passes.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: a capture that cannot be accumulated or joined is the assertion failing"
+)]
+fn the_bounded_prefill_capture_equals_the_whole_capture_trimmed() {
+    for window in [5u64, 2048] {
+        let (drafter, _dir) = scale_drafter(Some(window));
+        let keep = drafter.conditioning_rows();
+        let width = (drafter.cfg.target_layer_ids.len() * SCALE_HIDDEN) as i32;
+
+        for n in [
+            keep - 1,
+            keep,
+            keep + 1,
+            keep + PREFILL_CHUNK_SIZE as i32 + 7,
+        ] {
+            let case = format!("window {window}, prompt {n} rows");
+            let mut bounded = CaptureTail::new(Some(keep as usize));
+            let mut whole = CaptureTail::new(None);
+            let mut pos = 0;
+            while pos < n {
+                let rows = PREFILL_CHUNK_SIZE.min((n - pos) as usize) as i32;
+                let chunk = conditioning_rows_at(pos, rows, width);
+                bounded
+                    .push(chunk.try_clone().expect("clone chunk"))
+                    .expect("push to the bounded capture");
+                whole.push(chunk).expect("push to the whole capture");
+                pos += rows;
+            }
+
+            let kept = bounded
+                .finish(Device::Cpu)
+                .expect("join the bounded capture");
+            let trimmed = drafter
+                .trim_conditioning(&whole.finish(Device::Cpu).expect("join the whole capture"))
+                .expect("trim the whole capture");
+
+            assert_eq!(kept.shape(), trimmed.shape(), "{case}: shapes differ");
+            assert_eq!(
+                to_f32(&kept),
+                to_f32(&trimmed),
+                "{case}: the bounded capture is not the rows the trim would have kept"
+            );
+            assert_eq!(
+                row_numbers(&kept),
+                row_numbers(&trimmed),
+                "{case}: the bounded capture kept the wrong end"
+            );
+        }
+    }
 }
 
 /// Extending the carried buffer bounds it in the same step, so a buffer already

@@ -930,15 +930,6 @@ impl Qwen3_5MoeText {
             let chunk_n = chunk.len();
             let is_last = end == n;
 
-            tracing::debug!(
-                pos,
-                end,
-                chunk_n,
-                is_last,
-                held_rows = captured.retained_rows(),
-                "verify capture prefill chunk"
-            );
-
             let (last_logits_opt, hidden_chunk) = if is_last {
                 // Final chunk: one pass — all aux hidden + last-position logits only.
                 let (lg, hid) = self.forward_chunk_capture_last_logit(
@@ -966,6 +957,16 @@ impl Qwen3_5MoeText {
             // can reclaim intermediate buffers.
             hidden_chunk.eval()?;
             captured.push(hidden_chunk)?;
+
+            tracing::debug!(
+                pos,
+                end,
+                chunk_n,
+                is_last,
+                keep_last = ?keep_last,
+                held_rows_after_chunk = captured.retained_rows(),
+                "verify capture prefill chunk"
+            );
 
             if let Some(last_logits) = last_logits_opt {
                 return Ok((last_logits, captured.finish(device)?));

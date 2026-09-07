@@ -60,7 +60,7 @@ use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 /// The capture returns one hidden row per prompt position, so a single-shot
 /// prefill of a long prompt would put the whole capture and a full-vocabulary
 /// logit tensor in one Metal command buffer.
-const PREFILL_CHUNK_SIZE: usize = 1024;
+pub(super) const PREFILL_CHUNK_SIZE: usize = 1024;
 
 /// Drive a DFlash 2 drafter against its verifier.
 ///
@@ -179,10 +179,13 @@ pub fn dflash2_generate(
     // rows before that can never be read, so the capture releases them as the
     // prefill walks the prompt rather than holding one row per prompt token at
     // `len(target_layer_ids) * hidden_size` to the end of it.
-    let keep_rows = usize::try_from(drafter.conditioning_rows()).map_err(|_| {
+    let keep_rows = drafter.conditioning_rows();
+    // Defence in depth: `check_config` refuses a window under 2 or wider than an
+    // array axis, so this conversion cannot fail on a drafter that loaded.
+    let keep = usize::try_from(keep_rows).map_err(|_| {
         Error::Model(format!(
-            "dflash2_generate: the drafter's window reaches back              {} rows, which is not a row count",
-            drafter.conditioning_rows()
+            "dflash2_generate: this drafter reaches back over {keep_rows} rows, \
+             which is not a row count"
         ))
     })?;
     let prefill_t0 = Instant::now();
@@ -192,11 +195,25 @@ pub fn dflash2_generate(
         &mut v_caches,
         Some(&mut v_lin),
         PREFILL_CHUNK_SIZE,
-        Some(keep_rows),
+        Some(keep),
         device,
     )?;
     guard_verifier_prefill_logits(verifier, &bonus_logits, prompt_ids.len())?;
     let mut h_ctx = drafter.trim_conditioning(&prompt_hidden)?;
+    // What the capture was asked to keep is a number at a call site, and the
+    // trim above accepts a shorter buffer without a word. A drafter conditioned
+    // on less than its window still proposes, and greedy verification then emits
+    // the verifier's own tokens whatever the proposals were — so the answer is
+    // unchanged and only the accept rate falls. Nothing else here would say so.
+    let want_rows = keep_rows.min(i32::try_from(prompt_ids.len()).unwrap_or(i32::MAX));
+    if h_ctx.shape()[1] != want_rows {
+        return Err(Error::Model(format!(
+            "dflash2_generate: the prompt's capture kept {} conditioning rows where this \
+             drafter reaches back over {want_rows} of a {}-token prompt",
+            h_ctx.shape()[1],
+            prompt_ids.len()
+        )));
+    }
     if charge_phases {
         // The guard above forced the logits, and so the whole prompt forward,
         // but not the capture: it hangs off a different output of that forward.
