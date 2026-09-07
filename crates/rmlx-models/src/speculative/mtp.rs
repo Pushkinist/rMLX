@@ -145,8 +145,8 @@ impl MtpDrafter {
     /// The block this sidecar's config declares, including the seed carry, or
     /// `None` when it declares none.
     ///
-    /// The trained depth, which a round is free to exceed — see
-    /// [`mtp_round_block_total`].
+    /// The trained depth, which a round is free to exceed: `block_from_request`
+    /// in this module takes it and does not narrow to it.
     pub fn block_size(&self) -> Option<usize> {
         self.block_size
     }
@@ -590,7 +590,7 @@ use crate::decode_loop::ProbeStep;
 /// with depth is the acceptance rate, and that is the request's trade to make.
 /// Taking it and not clamping to it is what makes this function, rather than its
 /// caller, the one place that decision lives.
-fn mtp_round_block_total(requested: usize, declared: Option<usize>) -> usize {
+fn block_from_request(requested: usize, declared: Option<usize>) -> usize {
     let block = requested.clamp(2, MAX_BLOCK_SIZE);
     if declared.is_some_and(|d| block > d) {
         tracing::debug!(
@@ -674,7 +674,7 @@ pub fn mtp_generate(
     let capture_ids = [last_layer];
     let hidden = verifier.hidden_size() as i32;
 
-    let block_total = mtp_round_block_total(requested_block_total, drafter.block_size());
+    let block_total = block_from_request(requested_block_total, drafter.block_size());
 
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.
@@ -793,9 +793,6 @@ pub fn mtp_generate(
         rounds += 1;
         let remaining = n_tokens - emitted.len();
         let bs = block_total.min(remaining + 1).max(2);
-        if bs <= 1 {
-            break;
-        }
 
         // -- Phase A: drafter proposes bs-1 tokens (autoregressive). The sidecar
         //    KV starts this round at `draft_pos` (verifier prefix length). --
@@ -805,7 +802,11 @@ pub fn mtp_generate(
         let round_draft_ns = t0.elapsed().as_nanos();
         draft_ns += round_draft_ns;
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "mtp_generate: the sidecar proposed nothing at block {bs}; draft_n \
+                 returns block - 1 ids for any block of two or more, so an empty chain \
+                 is a broken drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 

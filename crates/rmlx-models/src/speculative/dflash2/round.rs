@@ -49,9 +49,9 @@ use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::{
-    accept_prefix, arm_lin_tapes, disarm_lin_tapes, emit_step, guard_verifier_prefill_logits,
-    phases_charged, rollback_round_caches, verifier_context, verifier_kv_bytes, DecodeWindow,
-    RoundPhases, RoundStats, SpecLoop, VerifierDraw, MAX_BLOCK_SIZE,
+    accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, disarm_lin_tapes, emit_step,
+    guard_verifier_prefill_logits, phases_charged, rollback_round_caches, verifier_context,
+    verifier_kv_bytes, DecodeWindow, RoundPhases, RoundStats, SpecLoop, VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -61,21 +61,6 @@ use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 /// prefill of a long prompt would put the whole capture and a full-vocabulary
 /// logit tensor in one Metal command buffer.
 const PREFILL_CHUNK_SIZE: usize = 1024;
-
-/// The block a request runs at: what it asked for, what the checkpoint was
-/// trained at, and what one verify forward can score — whichever is smallest,
-/// and never below the two positions a seed and one draft need.
-///
-/// **The [`MAX_BLOCK_SIZE`] clamp is not the loader's guarantee restated.**
-/// [`DFlash2Drafter`] is a public struct with public fields, so a drafter
-/// reaching this loop need not have come through `DFlash2Drafter::load` and its
-/// config need not have been through `check_config` — the tests build one
-/// directly. The block sizes this round's token buffer, its verify input and its
-/// selector chain, so the loop bounds it on its own behalf rather than on a
-/// promise its argument did not have to make.
-pub(super) fn round_block_total(requested: usize, declared: usize) -> usize {
-    requested.min(declared).clamp(2, MAX_BLOCK_SIZE)
-}
 
 /// Drive a DFlash 2 drafter against its verifier.
 ///
@@ -142,7 +127,7 @@ pub fn dflash2_generate(
 
     let target_layer_ids = drafter.cfg.target_layer_ids.clone();
     let condition_width = (drafter.cfg.hidden_size * target_layer_ids.len()) as i32;
-    let block_total = round_block_total(requested_block_total, drafter.cfg.block_size);
+    let block_total = block_capped_by_checkpoint(requested_block_total, drafter.cfg.block_size);
 
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.
@@ -254,16 +239,17 @@ pub fn dflash2_generate(
         // The block never resizes: the drafter denoises the block it was
         // trained at, and only the token budget shortens it.
         let bs = block_total.min(remaining + 1);
-        if bs <= 1 {
-            break;
-        }
 
         let t0 = Instant::now();
         let draft_tokens = draft_block(verifier, drafter, b, &h_ctx, bs, device)?;
         let round_draft_ns = t0.elapsed().as_nanos();
         draft_ns += round_draft_ns;
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "dflash2_generate: the drafter denoised nothing at block {bs}; a block \
+                 of two or more yields block - 1 proposals, so an empty block is a \
+                 broken drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 
@@ -452,7 +438,3 @@ fn draft_block(
     let logits = verifier.logits_from_final_hidden(&drafted, device)?;
     drafter.select_chain(&drafted, &logits, seed)
 }
-
-#[cfg(test)]
-#[path = "round_tests.rs"]
-mod round_tests;

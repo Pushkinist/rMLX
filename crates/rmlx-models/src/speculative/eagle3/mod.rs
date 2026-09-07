@@ -803,21 +803,6 @@ pub enum DecidedBy {
     FullVocab,
 }
 
-/// The block a request runs at: what it asked for, what the checkpoint's
-/// reduced-vocabulary head was trained at, and what one verify forward can
-/// score — whichever is smallest, never below the two positions a seed and one
-/// draft need.
-///
-/// The checkpoint's own value is the narrower bound on every drafter that
-/// exists, so the ceiling is not usually what decides. It is here because a
-/// drafter reaching this loop need not have come through the loader, and the
-/// block sizes the round's verify input.
-fn eagle3_round_block_total(requested: usize, declared: usize) -> usize {
-    requested
-        .min(declared)
-        .clamp(2, crate::speculative::MAX_BLOCK_SIZE)
-}
-
 /// EAGLE-3 speculative-decoding round-loop (greedy / temp=0).
 ///
 /// `decided_by` is filled with one [`DecidedBy`] per emitted token, in
@@ -882,7 +867,10 @@ pub fn eagle3_generate(
     }
 
     let aux_layer_ids = drafter.cfg.aux_layer_ids.clone();
-    let block_total = eagle3_round_block_total(requested_block_total, drafter.cfg.block_size);
+    let block_total = crate::speculative::block_capped_by_checkpoint(
+        requested_block_total,
+        drafter.cfg.block_size,
+    );
 
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.

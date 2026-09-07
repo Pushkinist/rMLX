@@ -21,7 +21,7 @@ fn a_request_deeper_than_the_declared_block_runs_at_the_request() {
     for declared in [None, Some(2), Some(3), Some(8)] {
         for requested in [4, 6, 8, 16] {
             assert_eq!(
-                mtp_round_block_total(requested, declared),
+                block_from_request(requested, declared),
                 requested,
                 "declared={declared:?} requested={requested}"
             );
@@ -33,15 +33,12 @@ fn a_request_deeper_than_the_declared_block_runs_at_the_request() {
 #[test]
 fn a_request_past_the_verify_ceiling_runs_at_the_ceiling() {
     for declared in [None, Some(3), Some(MAX_BLOCK_SIZE)] {
+        assert_eq!(block_from_request(MAX_BLOCK_SIZE, declared), MAX_BLOCK_SIZE);
         assert_eq!(
-            mtp_round_block_total(MAX_BLOCK_SIZE, declared),
+            block_from_request(MAX_BLOCK_SIZE + 1, declared),
             MAX_BLOCK_SIZE
         );
-        assert_eq!(
-            mtp_round_block_total(MAX_BLOCK_SIZE + 1, declared),
-            MAX_BLOCK_SIZE
-        );
-        assert_eq!(mtp_round_block_total(usize::MAX, declared), MAX_BLOCK_SIZE);
+        assert_eq!(block_from_request(usize::MAX, declared), MAX_BLOCK_SIZE);
     }
 }
 
@@ -49,8 +46,8 @@ fn a_request_past_the_verify_ceiling_runs_at_the_ceiling() {
 #[test]
 fn a_request_below_two_runs_at_two() {
     for declared in [None, Some(3), Some(8)] {
-        assert_eq!(mtp_round_block_total(0, declared), 2);
-        assert_eq!(mtp_round_block_total(1, declared), 2);
-        assert_eq!(mtp_round_block_total(2, declared), 2);
+        assert_eq!(block_from_request(0, declared), 2);
+        assert_eq!(block_from_request(1, declared), 2);
+        assert_eq!(block_from_request(2, declared), 2);
     }
 }

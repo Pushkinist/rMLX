@@ -703,7 +703,7 @@ use std::time::Instant;
 ///
 /// # Errors
 /// [`Error::Model`] for a block with no room for a draft token.
-fn round_block_total(requested: usize) -> Result<usize> {
+fn block_from_request(requested: usize) -> Result<usize> {
     if requested < 2 {
         return Err(Error::Model(
             "mtp_assistant_generate: block_size must be >= 2".into(),
@@ -753,7 +753,7 @@ pub fn mtp_assistant_generate(
             "mtp_assistant_generate: prompt must have >=2 tokens".into(),
         ));
     }
-    let block_size = round_block_total(block_size)?;
+    let block_size = block_from_request(block_size)?;
     // Which round loop runs is decided by the drafter snapshot's `model_type`
     // alone, so a `gemma4_assistant` drafter can be handed any verifier. This
     // loop conditions the drafter on the verifier's own final-normed hidden and
@@ -883,7 +883,11 @@ pub fn mtp_assistant_generate(
         let round_draft_ns = t0.elapsed().as_nanos();
         draft_ns += round_draft_ns;
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "mtp_assistant_generate: the drafter proposed nothing at block {bs}; \
+                 draft_n returns block - 1 ids for any block of two or more, so an \
+                 empty chain is a broken drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 

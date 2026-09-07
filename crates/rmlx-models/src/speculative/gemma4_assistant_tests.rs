@@ -217,12 +217,12 @@ fn plain_argmax_respects_hidden_direction() {
 #[test]
 fn the_round_block_is_bounded_above_and_refused_below_two() {
     for requested in [2, 6, 64, MAX_BLOCK_SIZE] {
-        assert_eq!(round_block_total(requested).ok(), Some(requested));
+        assert_eq!(block_from_request(requested).ok(), Some(requested));
     }
     for requested in [MAX_BLOCK_SIZE + 1, usize::MAX] {
-        assert_eq!(round_block_total(requested).ok(), Some(MAX_BLOCK_SIZE));
+        assert_eq!(block_from_request(requested).ok(), Some(MAX_BLOCK_SIZE));
     }
     for requested in [0, 1] {
-        assert!(round_block_total(requested).is_err(), "{requested}");
+        assert!(block_from_request(requested).is_err(), "{requested}");
     }
 }

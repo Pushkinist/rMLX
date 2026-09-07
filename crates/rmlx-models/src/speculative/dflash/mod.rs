@@ -577,19 +577,6 @@ pub fn walk_block_greedy(
 
 use crate::decode_loop::ProbeStep;
 
-/// The block a request starts a run at: what it asked for, what the checkpoint
-/// was trained at, and what one verify forward can score — whichever is
-/// smallest, never below the two positions a seed and one draft need.
-///
-/// This is the ceiling the round schedule grows back toward, not the block every
-/// round runs: `dflash_next_block_size` halves and grows it from the recent
-/// accept rate within a run.
-fn dflash_round_block_total(requested: usize, declared: usize) -> usize {
-    requested
-        .min(declared)
-        .clamp(2, crate::speculative::MAX_BLOCK_SIZE)
-}
-
 /// DFlash speculative-decoding round-loop (greedy / temp=0).
 ///
 /// Port of `_dflash_rounds` (mlx-vlm). Wires the three verifier-side
@@ -643,7 +630,10 @@ pub fn dflash_generate(
 
     let target_layer_ids = drafter.cfg.target_layer_ids.clone();
     let hidden = drafter.cfg.hidden_size as i32;
-    let block_total = dflash_round_block_total(requested_block_total, drafter.cfg.block_size);
+    let block_total = crate::speculative::block_capped_by_checkpoint(
+        requested_block_total,
+        drafter.cfg.block_size,
+    );
 
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.

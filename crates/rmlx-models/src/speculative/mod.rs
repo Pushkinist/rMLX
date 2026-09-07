@@ -197,6 +197,26 @@ pub const MAX_BLOCK_SIZE: usize = 1024;
 /// number that stands until one answers it.
 pub const DEFAULT_BLOCK_SIZE: usize = 5;
 
+/// The block a round runs at when the drafter's declared depth is a real
+/// constraint: what the request asked for, what the checkpoint was trained at,
+/// and what one verify forward can score — whichever is smallest, and never
+/// below the two positions a seed and one draft need.
+///
+/// Three loops narrow this way and share this. DFlash 1 and DFlash 2 denoise a
+/// block whose width *is* the drafter's input shape, and EAGLE-3's head is
+/// defined over its own block; none of the three can propose past what its
+/// checkpoint names. The MTP sidecar can, which is why it does not call this.
+///
+/// **The [`MAX_BLOCK_SIZE`] clamp is not the loaders' guarantee restated.** The
+/// drafter structs are public with public fields, so one reaching a round loop
+/// need not have come through a loader and its config need not have been
+/// checked — the tests build them directly. The block sizes the round's token
+/// buffer and its verify input, so each loop bounds it on its own behalf rather
+/// than on a promise its argument did not have to make.
+pub(crate) fn block_capped_by_checkpoint(requested: usize, declared: usize) -> usize {
+    requested.min(declared).clamp(2, MAX_BLOCK_SIZE)
+}
+
 /// The vocabulary a snapshot's `tokenizer.json` declares, added tokens included.
 fn snapshot_vocab(dir: &Path) -> Result<HashMap<String, u32>> {
     let path = dir.join("tokenizer.json");
