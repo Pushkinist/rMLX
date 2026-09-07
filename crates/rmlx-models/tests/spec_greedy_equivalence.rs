@@ -90,6 +90,22 @@
 //! and restricted-vocabulary pairs refuse a rollback off by one on all five
 //! prompts they judge, and the two-model pair on all six.
 //!
+//! # A declared boundary, and the only waiver
+//!
+//! EAGLE-3's verify pass scores every position it may accept over the drafter's
+//! reduced vocabulary, so where the verifier's own answer is a token that
+//! vocabulary cannot name the arm emits the drafter's argmax instead. That is
+//! upstream's design and no correct loop of this kind avoids it, so a divergence
+//! there is reported rather than refused.
+//!
+//! **Only there.** Widening the same inexactness to the round's correction
+//! changes an answer at exactly that kind of token — indistinguishable in the
+//! two token streams — and is refused. Which position the loop was at is the
+//! only thing that separates them, so the loop reports it per emitted token
+//! rather than the gate inferring it from the answer. [`Restriction`] carries
+//! the rule; `docs/SPEC_ANSWER_EQUIVALENCE.md` carries the measurements and
+//! `scripts/spec_broken_engine.sh` takes them again.
+//!
 //! # Pairs
 //!
 //! Six, whose verifiers resolve by slug from `RMLX_O_MODELS_ROOT`:
@@ -220,8 +236,11 @@ const MAX_CTX: i32 = 8192;
 /// The exception is the last row, and it is a property of the defect rather than
 /// of the ceiling: leaving the correction on the restricted argmax only changes
 /// an answer where that vocabulary falls short of the verifier's, which the
-/// runs measure at one to five tokens per answer. It is refused on one prompt of
-/// six, at 0.8828, at a position the drafter's vocabulary cannot name.
+/// runs measure at one to five tokens per answer. It is refused on one of the
+/// five prompts the gate judges, at 0.8828, at a token the drafter's vocabulary
+/// cannot name — and at the round's **correction**, which is the only thing that
+/// keeps it refused now the boundary at an accepted position is not. See
+/// [`Restriction`].
 const MAX_DIVERGENCE_CONFIDENCE: f64 = 0.12;
 
 /// The worst [`weakest_tail`] reading a **correct** pair reached over the prompts
@@ -1753,10 +1772,11 @@ const DFLASH1_PAIR: Pair = Pair {
 /// design boundary rather than a port defect — but it is still an answer change
 /// at temperature 0, which is what this gate reads.
 ///
-/// [`Loaded::outside_draft_vocab`] measures the exposure on every run: how many
-/// of the reference arm's own tokens the drafter's vocabulary cannot name. Each
-/// one is a position where the boundary could fire; none of them is a position
-/// where it must.
+/// [`Loaded::draft_vocab`] measures the exposure on every run: how many of the
+/// reference arm's own tokens the drafter's vocabulary cannot name — one to five
+/// per answer. Each is a position where the boundary could fire; none is a
+/// position where it must, because it fires only where the drafter also proposed
+/// the restricted argmax. [`Restriction`] is what the verdict does with that.
 const EAGLE3_PAIR: Pair = Pair {
     verifier: common::GoldenModel {
         slug: "mlx-community__Qwen3.6-35B-A3B-8bit",
@@ -2690,9 +2710,9 @@ fn the_adaptive_round_loop_reproduces_plain_greedy() {
 /// inexactness they do not: an accepted position is emitted as the draft's
 /// token, and the verifier's full-vocabulary argmax is computed at the
 /// correction position only. Where those two differ the arms differ, by design
-/// and in agreement with the upstream implementation. The run prints how many
-/// of the reference arm's tokens the drafter's vocabulary cannot name, which is
-/// the count of positions where that can happen at all.
+/// and in agreement with the upstream implementation, so a divergence there is
+/// reported rather than refused — but only there, and [`Restriction`] says why
+/// the position and not the token is what decides it.
 #[ignore]
 #[test]
 fn the_restricted_vocab_round_loop_reproduces_plain_greedy() {

@@ -710,7 +710,12 @@ list so EOS can be selected at intermediate positions.
    replace the token at that position with the full-vocab correction.
 
 This avoids materialising a `[1, K, 248320]` logit tensor for the accepted
-positions.
+positions. It also means an accepted position carries the drafter's argmax and
+not the verifier's, and the two are the same token only when the verifier's is
+one the drafter can name. `eagle3_generate` therefore fills a `DecidedBy` per
+emitted token — restricted at an accepted position, full at the correction and
+the prefill seed — because that is not recoverable from the tokens afterwards.
+`docs/SPEC_ANSWER_EQUIVALENCE.md` is where it is read and what it costs.
 
 **Verifier prefill chunking.** For prompts longer than 1024 tokens, the
 verifier prefill uses `forward_verify_capture_chunked`: non-final chunks run
