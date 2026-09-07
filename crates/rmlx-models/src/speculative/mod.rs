@@ -181,7 +181,7 @@ const VOCAB_ID_CEILING: u32 = 1 << 22;
 /// and its own guidance recommends 5 against a quantized pair. This is a
 /// structural ceiling with two orders of magnitude of headroom over anything
 /// that drafts, not a tuning knob.
-pub(crate) const MAX_BLOCK_SIZE: usize = 1024;
+pub const MAX_BLOCK_SIZE: usize = 1024;
 
 /// The vocabulary a snapshot's `tokenizer.json` declares, added tokens included.
 fn snapshot_vocab(dir: &Path) -> Result<HashMap<String, u32>> {

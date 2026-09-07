@@ -97,9 +97,8 @@ fn mtp_reject_reason(arch: &str, model_type: &str) -> String {
 
 // ── Drafter kind and round block ──────────────────────────────────────────────
 
-/// The round block when `--draft-block-size` is absent and the drafter's
-/// checkpoint declares no depth of its own: the verifier's own token plus four
-/// drafted.
+/// The round block when `--draft-block-size` is absent: the verifier's own token
+/// plus four drafted, capped by whatever depth the drafter's checkpoint declares.
 pub(crate) const DEFAULT_DRAFT_BLOCK_SIZE: usize = 5;
 
 /// The smallest round block with room for a draft token.
@@ -114,23 +113,32 @@ pub const MIN_DRAFT_BLOCK_SIZE: usize = 2;
 /// — the field `decode_config` files a row under — is this value, so one flag
 /// value is one cell whichever drafter runs.
 ///
-/// `declared` is the depth the drafter's own checkpoint names, and it is what a
-/// request that named no block runs at. A checkpoint's depth is the one it was
-/// trained at, so it is a better default than a constant chosen for no drafter
-/// in particular; a drafter whose checkpoint declares nothing takes
-/// [`DEFAULT_DRAFT_BLOCK_SIZE`]. A request that names a block is honoured either
-/// way — the declared depth is a default, not a ceiling, and each round loop
-/// applies whatever ceiling its own draft shape imposes.
+/// `declared` is the depth the drafter's own checkpoint names. A request that
+/// names no block runs at [`DEFAULT_DRAFT_BLOCK_SIZE`] **capped by it** — a
+/// checkpoint is not asked for more depth than it was trained at unless someone
+/// asks — and a drafter whose checkpoint declares nothing runs at the constant.
+/// Which default each drafter deserves is a throughput question, answered by
+/// measuring; this is the depth that was already being served, held still while
+/// an explicit request stops being clamped to the declaration.
+///
+/// A request that names a block is honoured up to what one verify forward can
+/// score. The declared depth is a default, not a ceiling: the sidecar heads
+/// chain on their own output and propose past it.
 ///
 /// # Errors
 /// `Error::Other` for a block below [`MIN_DRAFT_BLOCK_SIZE`]. The CLI refuses
-/// that at parse time; this covers a caller that is not the CLI.
+/// that, and a block above the ceiling, at parse time; this covers a caller that
+/// is not the CLI.
 fn round_block(flag: Option<usize>, declared: Option<usize>) -> rmlx_core::Result<usize> {
     match flag {
         None => Ok(declared
-            .unwrap_or(DEFAULT_DRAFT_BLOCK_SIZE)
+            .map_or(DEFAULT_DRAFT_BLOCK_SIZE, |d| {
+                DEFAULT_DRAFT_BLOCK_SIZE.min(d)
+            })
             .max(MIN_DRAFT_BLOCK_SIZE)),
-        Some(block) if block >= MIN_DRAFT_BLOCK_SIZE => Ok(block),
+        Some(block) if block >= MIN_DRAFT_BLOCK_SIZE => {
+            Ok(block.min(rmlx_models::speculative::MAX_BLOCK_SIZE))
+        }
         Some(block) => Err(Error::Other(format!(
             "draft block size {block} leaves no room for a draft token; it must be at \
              least {MIN_DRAFT_BLOCK_SIZE}"
@@ -284,8 +292,8 @@ fn dropped_sampling_fields(sampling: &crate::engine::types::SamplingParams) -> V
 /// snapshot's own `config.json`, or by an explicit `--draft-kind`.
 ///
 /// `--draft-block-size` is the round block, the verifier's token included, so
-/// every loop drafts one fewer; absent, it is the depth the drafter's own
-/// checkpoint declares. Every loop accepts by argmax
+/// every loop drafts one fewer; absent, it is the default capped by the depth
+/// the drafter's checkpoint declares. Every loop accepts by argmax
 /// agreement at `temperature == 0`; above it the two-model loop runs
 /// rejection sampling against the drafter's distribution and the sidecar loops
 /// draw the verifier's token per position and accept the prefix that agrees.

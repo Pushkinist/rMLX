@@ -175,17 +175,26 @@ fn one_flag_value_is_one_round_block() {
     }
 }
 
-/// A request that names no block runs at the depth the drafter's own checkpoint
-/// declares.
+/// A request that names no block runs at the default, capped by the depth the
+/// drafter's checkpoint declares.
 ///
-/// The constant is what a drafter that declares nothing takes, not what every
-/// drafter takes: every shipped Qwen3.5-family MTP sidecar declares 3 and the
-/// published DFlash 2 checkpoint declares 8, so a constant default runs both at
-/// a depth neither was trained at.
+/// A shallower declaration wins because a checkpoint is not asked for more depth
+/// than it was trained at unless someone asks — every shipped Qwen3.5-family MTP
+/// sidecar declares 3. A deeper one does not, because moving a served default
+/// upward is a throughput change and this is not where that is decided: the
+/// published DFlash 2 checkpoint declares 8 and DFlash 1's 16, and both are
+/// served at 5 as before.
 #[test]
-fn no_flag_runs_at_the_depth_the_checkpoint_declares() {
-    for declared in [MIN_DRAFT_BLOCK_SIZE, 3, 8, 16] {
+fn no_flag_runs_at_the_default_capped_by_the_declared_depth() {
+    for declared in [MIN_DRAFT_BLOCK_SIZE, 3, 4] {
         assert_eq!(round_block(None, Some(declared)).ok(), Some(declared));
+    }
+    for declared in [DEFAULT_DRAFT_BLOCK_SIZE, 8, 16, 1024] {
+        assert_eq!(
+            round_block(None, Some(declared)).ok(),
+            Some(DEFAULT_DRAFT_BLOCK_SIZE),
+            "a checkpoint declaring {declared} does not move the served default"
+        );
     }
     assert_eq!(round_block(None, None).ok(), Some(DEFAULT_DRAFT_BLOCK_SIZE));
 }
@@ -199,6 +208,19 @@ fn a_declared_depth_below_the_minimum_is_floored() {
             round_block(None, Some(declared)).ok(),
             Some(MIN_DRAFT_BLOCK_SIZE)
         );
+    }
+}
+
+/// An explicit request is honoured past the declaration and bounded by what one
+/// verify forward can score.
+#[test]
+fn an_explicit_block_outranks_the_declaration_and_stops_at_the_ceiling() {
+    const CEILING: usize = rmlx_models::speculative::MAX_BLOCK_SIZE;
+    for declared in [None, Some(3), Some(8)] {
+        assert_eq!(round_block(Some(64), declared).ok(), Some(64));
+        assert_eq!(round_block(Some(CEILING), declared).ok(), Some(CEILING));
+        assert_eq!(round_block(Some(CEILING + 1), declared).ok(), Some(CEILING));
+        assert_eq!(round_block(Some(usize::MAX), declared).ok(), Some(CEILING));
     }
 }
 
