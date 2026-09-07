@@ -100,23 +100,29 @@ fn mtp_reject_reason(arch: &str, model_type: &str) -> String {
 /// The smallest round block with room for a draft token.
 pub const MIN_DRAFT_BLOCK_SIZE: usize = 2;
 
-/// The round block a run is under: tokens the verifier scores per round, its
-/// own token included.
+/// The round block a run asks for: tokens the verifier scores per round, its own
+/// token included.
 ///
 /// One meaning for every drafter. The sidecar loops take this number as their
-/// block and draft one fewer; the two-model loop takes [`drafted_per_round`]
-/// of it and records the block back as `k + 1`. Either way `RoundStats.block_size`
-/// — the field `decode_config` files a row under — is this value, so one flag
-/// value is one cell whichever drafter runs.
+/// block and draft one fewer; the two-model loop takes [`drafted_per_round`] of
+/// it and counts the block back as `k + 1`.
+///
+/// **It is what the round loop is asked for, not what it runs.** Each loop
+/// resolves the block again against its own drafter and then narrows it per
+/// round against the remaining token budget, and `RoundStats.block_size` — the
+/// field `decode_config` files a row under — is the loop's resolved block. What
+/// bounds an explicit request above depends on the drafter: a DFlash
+/// checkpoint's own `block_size` caps it, because that block is the shape of the
+/// drafter's denoising input, and an EAGLE-3 checkpoint's caps it because its
+/// head is defined over that block; the Qwen3.5-family MTP sidecars do not,
+/// because the head chains on its own output hidden and can propose past the
+/// depth it was trained at. Every loop is bounded above by what one un-chunked
+/// verify forward can score.
 ///
 /// `declared` is the depth the drafter's own checkpoint names, and
 /// [`rmlx_models::speculative::default_block_for`] is what a request that names
 /// no block runs at given it. That rule has one producer and the harnesses that
 /// drive a loop the way a no-flag request would read it from there.
-///
-/// A request that names a block is honoured up to what one verify forward can
-/// score. The declared depth is a default, not a ceiling: the sidecar heads
-/// chain on their own output and propose past it.
 ///
 /// # Errors
 /// `Error::Other` for a block below [`MIN_DRAFT_BLOCK_SIZE`]. The CLI refuses
