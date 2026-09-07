@@ -756,9 +756,6 @@ pub fn dflash_generate(
         let remaining = n_tokens - emitted.len();
         let bs = dflash_next_block_size(&recent, block_total, remaining + 1, false);
         widest_bs = widest_bs.max(bs);
-        if bs <= 1 {
-            break;
-        }
 
         // -- Project the committed verifier hidden into the conditioning ctx. --
         let h_ctx = drafter.project_condition(&h_ctx_raw)?;
@@ -768,7 +765,11 @@ pub fn dflash_generate(
         let draft_tokens = drafter.draft_block(verifier, b, &h_ctx, bs)?;
         draft_ns += t0.elapsed().as_nanos();
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "dflash_generate: the drafter denoised nothing at block {bs}; a block \
+                 of two or more yields block - 1 proposals, so an empty block is a \
+                 broken drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 

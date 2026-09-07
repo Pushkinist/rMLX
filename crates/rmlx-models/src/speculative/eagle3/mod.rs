@@ -1037,9 +1037,6 @@ pub fn eagle3_generate(
         let remaining = n_tokens - emitted.len();
         let bs = eagle3_next_block_size(block_total, remaining + 1);
         widest_bs = widest_bs.max(bs);
-        if bs <= 1 {
-            break;
-        }
 
         // Track drafter cache offset before draft_block so accept_and_reseed
         // knows where to roll back to.
@@ -1053,7 +1050,11 @@ pub fn eagle3_generate(
         let draft_tokens = drafter.draft_block(verifier, b, &h_seed, d_seed_tok, bs)?;
         draft_ns += t0.elapsed().as_nanos();
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "eagle3_generate: the drafter proposed nothing at block {bs}; a block \
+                 of two or more yields block - 1 ids, so an empty chain is a broken \
+                 drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 
