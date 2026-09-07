@@ -1350,23 +1350,35 @@ fn an_accumulating_tape_refolds_across_its_segment_join() {
 
 // -- Round tape against the replay it replaced, on a real model --------------
 
-/// The hybrid the tape is checked on: a GDN stack whose recurrent layers are
-/// interleaved with full-attention ones, which is the shape that made the
-/// replay run the whole layer stack in the first place.
-const TAPE_REPLAY_SLUG: &str = "mlx-community__Qwen3.8-27B-4bit";
+/// The hybrids the tape is checked on: GDN stacks whose recurrent layers are
+/// interleaved with full-attention ones, which is the shape that made the replay
+/// run the whole layer stack in the first place. One dense, one mixture — the
+/// projections a shorter forward recomputes go through different kernels on the
+/// two, and this equality is a claim about those.
+const TAPE_REPLAY_SLUGS: &[&str] = &[
+    "mlx-community__Qwen3.8-27B-4bit",
+    "mlx-community__Qwen3.6-35B-A3B-8bit",
+];
 
-/// The snapshot, or a named stand-down the GPU runner counts.
-fn tape_replay_model(test: &str) -> Option<std::path::PathBuf> {
+/// The snapshots present on this machine, or a named stand-down the GPU runner
+/// counts for each that is not.
+fn tape_replay_models(test: &str) -> Vec<std::path::PathBuf> {
     let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT") else {
         eprintln!("SKIP {test}: RMLX_O_MODELS_ROOT is not set");
-        return None;
+        return Vec::new();
     };
-    let path = std::path::PathBuf::from(root).join(TAPE_REPLAY_SLUG);
-    if !path.join("config.json").exists() {
-        eprintln!("SKIP {test}: {TAPE_REPLAY_SLUG} is not under RMLX_O_MODELS_ROOT");
-        return None;
-    }
-    Some(path)
+    let root = std::path::PathBuf::from(root);
+    TAPE_REPLAY_SLUGS
+        .iter()
+        .filter_map(|slug| {
+            let path = root.join(slug);
+            if path.join("config.json").exists() {
+                return Some(path);
+            }
+            eprintln!("SKIP {test}: {slug} is not under RMLX_O_MODELS_ROOT");
+            None
+        })
+        .collect()
 }
 
 /// A fresh unquantized cache stack, so nothing between the two arms differs but
@@ -1413,21 +1425,30 @@ fn tape_replay_state(lin: &[LinearAttnCache], device: Device) -> Vec<f32> {
     out
 }
 
-/// Largest elementwise difference over the larger magnitude, which is the
-/// comparison a bf16 activation path admits.
+/// `||a - b|| / ||a||`, the relative size of the difference between two
+/// states.
+///
+/// A norm and not a worst element: these buffers hold millions of values, most
+/// of them near zero, and an elementwise ratio saturates on any pair of tiny
+/// opposite-signed ones whatever the states as a whole are doing.
 fn tape_replay_rel_err(a: &[f32], b: &[f32]) -> f64 {
     assert_eq!(
         a.len(),
         b.len(),
         "two states of the same stack differ in size"
     );
-    a.iter()
+    let diff: f64 = a
+        .iter()
         .zip(b)
-        .map(|(x, y)| {
-            let scale = x.abs().max(y.abs()).max(1e-6);
-            f64::from((x - y).abs() / scale)
-        })
-        .fold(0.0_f64, f64::max)
+        .map(|(x, y)| f64::from(x - y).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let scale: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    if scale > 0.0 {
+        diff / scale
+    } else {
+        diff
+    }
 }
 
 /// Twenty-odd deterministic ids well inside any vocabulary. The values do not
@@ -1478,14 +1499,19 @@ fn tape_replay_run(
 /// as a second stack prefilled identically and advanced over the accepted prefix
 /// alone, which is the same computation.
 ///
-/// **Bit-equality, and it is structural.** The projections the recurrence
-/// consumes reduce over the hidden dimension and not over the sequence, and the
-/// recurrence kernel walks positions in order, so what a forward computed at a
-/// position does not depend on how many positions followed it. Measured that
-/// way on this model at every accepted length and both shapes. The control
-/// beside it is what says the comparison has power: the same refold against the
-/// replay one token short of the accepted length, which a refold that folded the
-/// wrong number of positions would match instead.
+/// **How close they can be is the model's own answer, and the run measures it.**
+/// The replay computes the prefix in a forward of its own length; the tape
+/// returns what the round's forward computed at those positions. On the dense
+/// hybrid the two are bit-identical, and the run says so. On the mixture the
+/// model does not reproduce itself that way — one forward over the round and the
+/// same tokens stepped one at a time part company by a couple of percent, which
+/// is a property of that stack and not of this change — so the bound the refold
+/// is held to is that same disagreement, measured beside it in the same process.
+///
+/// The control is what gives the comparison power: the same refold against the
+/// replay one token short of the accepted length, which is where a refold that
+/// folded the wrong number of positions would sit. It reads about 0.5 against a
+/// refold-to-replay agreement of at most a few percent.
 #[test]
 #[ignore = "requires Metal GPU context and a 27B snapshot"]
 #[allow(
@@ -1498,64 +1524,77 @@ fn tape_replay_run(
 )]
 fn a_round_tape_refolds_to_what_the_replay_produced() {
     const NAME: &str = "a_round_tape_refolds_to_what_the_replay_produced";
-    let Some(path) = tape_replay_model(NAME) else {
-        return;
-    };
     let device = Device::Gpu;
-    let arch = load_model(&path, device, &LoadOpts::default()).expect("load verifier");
-    assert!(
-        arch.needs_lin_caches(),
-        "{TAPE_REPLAY_SLUG} must carry recurrent state or this test proves nothing"
-    );
-
     let round = TAPE_REPLAY_ROUND;
     let per_token: Vec<&[u32]> = round.iter().map(std::slice::from_ref).collect();
 
-    for (shape, chunks) in [
-        ("one verify forward", vec![round]),
-        ("a forward per token", per_token),
-    ] {
-        for kept in 1..round.len() {
-            let (_kv, mut taped) =
-                tape_replay_run(&arch, TAPE_REPLAY_PROMPT, &chunks, true, device);
-            refold_lin_tapes(&mut taped, round.len(), kept, false, device).expect("refold");
-            let refolded = tape_replay_state(&taped, device);
+    for path in tape_replay_models(NAME) {
+        let model = path.file_name().unwrap_or_default().to_string_lossy();
+        let arch = load_model(&path, device, &LoadOpts::default()).expect("load verifier");
+        assert!(
+            arch.needs_lin_caches(),
+            "{model} must carry recurrent state or this test proves nothing"
+        );
 
-            let (_kv, replayed) = tape_replay_run(
-                &arch,
-                TAPE_REPLAY_PROMPT,
-                &[round.get(..kept).expect("kept prefix")],
-                false,
-                device,
-            );
-            let agreement = tape_replay_rel_err(&refolded, &tape_replay_state(&replayed, device));
+        // What this model's own two regimes make of the same tokens: the round
+        // in one forward against the round stepped. It is the bound the refold
+        // is held to, because no rebuild of a prefix can be closer to a forward
+        // over that prefix than the model is to itself.
+        let (_kv, batched) = tape_replay_run(&arch, TAPE_REPLAY_PROMPT, &[round], false, device);
+        let (_kv, stepped) = tape_replay_run(&arch, TAPE_REPLAY_PROMPT, &per_token, false, device);
+        let regime = tape_replay_rel_err(
+            &tape_replay_state(&batched, device),
+            &tape_replay_state(&stepped, device),
+        );
+        eprintln!("[{NAME}/{model}] one forward against stepped: {regime:.6}");
 
-            let (_kv, off_by_one) = tape_replay_run(
-                &arch,
-                TAPE_REPLAY_PROMPT,
-                &[round.get(..kept - 1).expect("shorter prefix")],
-                false,
-                device,
-            );
-            let control = tape_replay_rel_err(&refolded, &tape_replay_state(&off_by_one, device));
+        for (shape, chunks) in [
+            ("one verify forward", vec![round]),
+            ("a forward per token", per_token.clone()),
+        ] {
+            for kept in 1..round.len() {
+                let (_kv, mut taped) =
+                    tape_replay_run(&arch, TAPE_REPLAY_PROMPT, &chunks, true, device);
+                refold_lin_tapes(&mut taped, round.len(), kept, false, device).expect("refold");
+                let refolded = tape_replay_state(&taped, device);
 
-            eprintln!(
-                "[{NAME}/{shape}] kept={kept} agreement={agreement:.6} \
-                 one-token-short={control:.6}"
-            );
-            assert!(
-                agreement <= 0.0,
-                "{shape} at kept={kept}: the refold and the replay of the same \
-                 {kept} tokens differ by {agreement}, and this comparison is exact \
-                 by construction"
-            );
-            assert!(
-                control > 0.0,
-                "{shape} at kept={kept}: the refold matches the replay of {} tokens \
-                 as well as the replay of {kept}, so this cell would pass whatever \
-                 the refold folded",
-                kept - 1
-            );
+                let (_kv, replayed) = tape_replay_run(
+                    &arch,
+                    TAPE_REPLAY_PROMPT,
+                    &[round.get(..kept).expect("kept prefix")],
+                    false,
+                    device,
+                );
+                let agreement =
+                    tape_replay_rel_err(&refolded, &tape_replay_state(&replayed, device));
+                let (_kv, off_by_one) = tape_replay_run(
+                    &arch,
+                    TAPE_REPLAY_PROMPT,
+                    &[round.get(..kept - 1).expect("shorter prefix")],
+                    false,
+                    device,
+                );
+                let control =
+                    tape_replay_rel_err(&refolded, &tape_replay_state(&off_by_one, device));
+
+                eprintln!(
+                    "[{NAME}/{shape}] kept={kept} agreement={agreement:.6} \
+                     one-token-short={control:.6}"
+                );
+                assert!(
+                    agreement <= regime,
+                    "{model}, {shape} at kept={kept}: the refold and the replay of the \
+                     same {kept} tokens differ by {agreement}, and this model \
+                     reproduces itself to {regime}"
+                );
+                assert!(
+                    agreement * 10.0 < control,
+                    "{model}, {shape} at kept={kept}: the refold is no nearer the replay \
+                     of {kept} tokens ({agreement}) than the replay of {} ({control}), \
+                     so this cell would pass whatever the refold folded",
+                    kept - 1
+                );
+            }
         }
     }
 }
