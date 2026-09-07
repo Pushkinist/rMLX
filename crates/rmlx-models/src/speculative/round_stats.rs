@@ -40,6 +40,18 @@
 //! reports, not something this module does behind a reader's back. See
 //! [`phases_charged`], and `charged` on the record and on every per-round
 //! event.
+//!
+//! **A charged round is checked, not trusted.** Charging is a list of
+//! evaluations a loop makes by hand, one per thing it produces, and the failure
+//! mode is an omission: a phase forces four of the five arrays it built and the
+//! fifth is paid for by the next round's drafter, at no cost to any assertion.
+//! [`RoundPhases::log`] therefore takes the arrays the round hands on and, on a
+//! charged round, names any that are still unevaluated — see [`unforced`].
+//! Whether a loop declared everything it carries is not something the check can
+//! know; what it removes is the case where the declaration was right and the
+//! forcing was missing.
+
+use rmlx_mlx::Array;
 
 use crate::speculative::DraftKind;
 
@@ -196,6 +208,32 @@ pub(crate) fn ms(ns: u128) -> f64 {
     (ns as f64) / 1.0e6
 }
 
+/// Which of the arrays a round hands to its successor are still unevaluated,
+/// by the name the round called them.
+///
+/// A charged round's phases each force their own work, but only the work they
+/// can see. An array built after a phase's timer closed — a conditioning
+/// context extended with this round's capture, a trimmed K/V — is nobody's
+/// work until something blocks on it, and the first thing that does is the next
+/// round's drafter. So the drafter's span pays, and the split reads as a
+/// drafter that costs more than it does.
+///
+/// This is the one question that settles it: not how long a span took, but
+/// whether the data it was supposed to leave behind is there.
+fn unforced(carry: &[(&str, &Array)]) -> Vec<String> {
+    carry
+        .iter()
+        .filter_map(|(name, array)| match array.is_available() {
+            Ok(true) => None,
+            Ok(false) => Some((*name).to_owned()),
+            // Not the same finding, and folding the two would report a broken
+            // read as a clean round. An unreadable status is not evidence the
+            // array was forced.
+            Err(e) => Some(format!("{name} (status unreadable: {e})")),
+        })
+        .collect()
+}
+
 /// One round's wall clock, split by the phase that spent it.
 ///
 /// The four phases are disjoint sub-spans of the round, so the round's own
@@ -250,7 +288,36 @@ impl RoundPhases {
     /// the round it is attributed to is a defect in the instrument, and the
     /// only reader who would otherwise notice is one already reading raw
     /// JSON-Lines and already looking for it.
-    pub(crate) fn log(&self, loop_kind: SpecLoop, round: usize, accept: usize, num_draft: usize) {
+    ///
+    /// `carry` is every array this round leaves for the next one's drafter to
+    /// read, each under the name the loop calls it. On a charged round they
+    /// must all be forced by now, and [`unforced`] says which are not — see
+    /// [`phases_charged`]. It is an argument rather than something this module
+    /// works out because only the loop knows what it carries; a loop that
+    /// genuinely carries no array passes an empty slice and says so where a
+    /// reader can see it.
+    pub(crate) fn log(
+        &self,
+        loop_kind: SpecLoop,
+        round: usize,
+        accept: usize,
+        num_draft: usize,
+        carry: &[(&str, &Array)],
+    ) {
+        if self.charged {
+            let unforced = unforced(carry);
+            if !unforced.is_empty() {
+                tracing::error!(
+                    target: PHASE_TARGET,
+                    ?loop_kind,
+                    round,
+                    unforced = %unforced.join(", "),
+                    "a charged round left work for the next round's drafter to pay for: \
+                     these arrays are still unevaluated, so the drafter's span is charged \
+                     the phase that built them"
+                );
+            }
+        }
         let Some(unclaimed_ns) = self.unclaimed_ns() else {
             tracing::error!(
                 target: PHASE_TARGET,

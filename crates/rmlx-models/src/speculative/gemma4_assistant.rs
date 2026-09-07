@@ -957,10 +957,19 @@ pub fn mtp_assistant_generate(
         full_kv = drop_kv_tail(&new_full, rejected, device)?;
         kv_offset = v_target;
         if charge_phases {
-            // The trimmed K/V is not read until the next round's drafter call,
-            // so nothing forces these slices here and the trim is billed to
-            // that round. See `phases_charged`.
-            for a in [&sliding_kv.0, &sliding_kv.1, &full_kv.0, &full_kv.1] {
+            // None of this is read until the next round's drafter call, so
+            // nothing forces it here and the whole next-round setup is billed
+            // to that round. The conditioning is in the list with the trimmed
+            // K/V: the verify span's argmax forced the hidden it is sliced
+            // from, but not the slice, the reshape or the norm over it. See
+            // `phases_charged`.
+            for a in [
+                &hidden,
+                &sliding_kv.0,
+                &sliding_kv.1,
+                &full_kv.0,
+                &full_kv.1,
+            ] {
                 a.eval()?;
             }
         }
@@ -981,6 +990,13 @@ pub fn mtp_assistant_generate(
             rounds,
             accept,
             draft_tokens.len(),
+            &[
+                ("hidden", &hidden),
+                ("sliding_k", &sliding_kv.0),
+                ("sliding_v", &sliding_kv.1),
+                ("full_k", &full_kv.0),
+                ("full_v", &full_kv.1),
+            ],
         );
     }
 

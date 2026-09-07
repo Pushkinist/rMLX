@@ -870,6 +870,15 @@ pub fn mtp_generate(
             &[1, 1, 1],
             device,
         )?;
+        if charge_phases {
+            // Reading the verifier's tokens forced the logits and the trunk
+            // under them, but the capture hangs off a different output of that
+            // forward and this slice off the capture. The next round's drafter
+            // is the first thing to read either, so with nothing forcing them
+            // here the verifier's capture is billed to the drafter. See
+            // `phases_charged`.
+            h_cond.eval()?;
+        }
         b = *new_tokens.last().unwrap_or(&b);
         draft_pos += n_committed as i32;
 
@@ -887,6 +896,7 @@ pub fn mtp_generate(
             rounds,
             accept,
             draft_tokens.len(),
+            &[("h_cond", &h_cond)],
         );
     }
 
