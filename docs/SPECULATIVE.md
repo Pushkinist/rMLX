@@ -309,8 +309,8 @@ timing assertion can see that, because the number it produces is a plausible
 one. `RoundPhases::log` therefore takes the arrays the round hands to its
 successor, under the names the loop calls them, and on a charged round reports
 any that are still unevaluated — `Array::is_available`, which asks MLX for the
-array's status rather than inferring it from a clock. Two omissions were found
-that way and are described below. The check cannot tell whether a loop declared
+array's status rather than inferring it from a clock. The three omissions it
+now covers are described below. The check cannot tell whether a loop declared
 everything it carries; what it removes is the case where the declaration was
 right and the forcing was missing. **The standing check is a charged run with no
 `still unevaluated` line in it** — grep the run log for that phrase after any
@@ -377,8 +377,8 @@ host being quiet. The assistant loop is full attention and replayed on none of
 its 114 rounds, which is why its gap is the smallest of the three and is the
 K/V trim rather than a replay.
 
-**Three omissions in the charge, each now inside that check.** The MTP sidecar charged its
-rollback and never its capture: before that was fixed, a charged run's
+**Three omissions in the charge, each now inside that check.** The MTP sidecar
+charged its rollback and never its capture: before that was fixed, a charged run's
 `verify_ms` was indistinguishable from an uncharged one's (39.97 against 40.48,
 the wrong way round), and the conditioning slice the next round's drafter reads
 was unevaluated on every charged round. It now rises by 1.51 ms when the
