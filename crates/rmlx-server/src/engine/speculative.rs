@@ -97,39 +97,49 @@ fn mtp_reject_reason(arch: &str, model_type: &str) -> String {
 
 // ── Drafter kind and round block ──────────────────────────────────────────────
 
-/// The round block when `--draft-block-size` is absent: the verifier's own
-/// token plus four drafted.
-pub(crate) const DEFAULT_DRAFT_BLOCK_SIZE: usize = 5;
-
 /// The smallest round block with room for a draft token.
 pub const MIN_DRAFT_BLOCK_SIZE: usize = 2;
 
-/// The round block a run is under: tokens the verifier scores per round, its
-/// own token included.
+/// The round block a run asks for: tokens the verifier scores per round, its own
+/// token included.
 ///
 /// One meaning for every drafter. The sidecar loops take this number as their
-/// block and draft one fewer; the two-model loop takes [`drafted_per_round`]
-/// of it and records the block back as `k + 1`. Either way `RoundStats.block_size`
-/// — the field `decode_config` files a row under — is this value, so one flag
-/// value is one cell whichever drafter runs.
+/// block and draft one fewer; the two-model loop takes
+/// [`rmlx_models::speculative::drafts_per_round`] of it and counts the block back
+/// as `k + 1`.
+///
+/// **It is what the round loop is asked for, not what it runs.** Each loop
+/// resolves the block again against its own drafter and then narrows it per
+/// round against the remaining token budget, and `RoundStats.block_size` — the
+/// field `decode_config` files a row under — is the loop's resolved block. What
+/// bounds an explicit request above depends on the drafter: a DFlash
+/// checkpoint's own `block_size` caps it, because that block is the shape of the
+/// drafter's denoising input, and an EAGLE-3 checkpoint's caps it because its
+/// head is defined over that block; the Qwen3.5-family MTP sidecars do not,
+/// because the head chains on its own output hidden and can propose past the
+/// depth it was trained at. Every loop is bounded above by what one un-chunked
+/// verify forward can score.
+///
+/// `declared` is the depth the drafter's own checkpoint names, and
+/// [`rmlx_models::speculative::default_block_for`] is what a request that names
+/// no block runs at given it. That rule has one producer and the harnesses that
+/// drive a loop the way a no-flag request would read it from there.
 ///
 /// # Errors
 /// `Error::Other` for a block below [`MIN_DRAFT_BLOCK_SIZE`]. The CLI refuses
-/// that at parse time; this covers a caller that is not the CLI.
-fn round_block(flag: Option<usize>) -> rmlx_core::Result<usize> {
+/// that, and a block above the ceiling, at parse time; this covers a caller that
+/// is not the CLI.
+fn round_block(flag: Option<usize>, declared: Option<usize>) -> rmlx_core::Result<usize> {
     match flag {
-        None => Ok(DEFAULT_DRAFT_BLOCK_SIZE),
-        Some(block) if block >= MIN_DRAFT_BLOCK_SIZE => Ok(block),
+        None => Ok(rmlx_models::speculative::default_block_for(declared).max(MIN_DRAFT_BLOCK_SIZE)),
+        Some(block) if block >= MIN_DRAFT_BLOCK_SIZE => {
+            Ok(block.min(rmlx_models::speculative::MAX_BLOCK_SIZE))
+        }
         Some(block) => Err(Error::Other(format!(
             "draft block size {block} leaves no room for a draft token; it must be at \
              least {MIN_DRAFT_BLOCK_SIZE}"
         ))),
     }
-}
-
-/// How many tokens the two-model loop drafts per round of `block` tokens.
-const fn drafted_per_round(block: usize) -> usize {
-    block - 1
 }
 
 /// The drafter kind a run is under.
@@ -214,6 +224,22 @@ enum Drafter {
 }
 
 impl Drafter {
+    /// The block depth this drafter's own checkpoint declares, when it declares
+    /// one.
+    ///
+    /// `None` is a drafter whose checkpoint says nothing about depth — the
+    /// Gemma4 assistant, whose config carries no block key, and the two-model
+    /// arm, whose draft is a full model with no drafting depth to declare.
+    fn declared_block_size(&self) -> Option<usize> {
+        match self {
+            Drafter::Eagle3(d) => Some(d.lock().block_size()),
+            Drafter::DFlash(d) => Some(d.lock().block_size()),
+            Drafter::DFlash2(d) => Some(d.cfg.block_size),
+            Drafter::MtpSidecar(d) => d.lock().block_size(),
+            Drafter::MtpAssistant(_) | Drafter::TwoModel => None,
+        }
+    }
+
     fn kind(&self) -> rmlx_models::DraftKind {
         match self {
             Drafter::Eagle3(_) => rmlx_models::DraftKind::Eagle3,
@@ -256,8 +282,9 @@ fn dropped_sampling_fields(sampling: &crate::engine::types::SamplingParams) -> V
 /// token. Which drafter runs is decided at construction from the draft
 /// snapshot's own `config.json`, or by an explicit `--draft-kind`.
 ///
-/// `--draft-block-size` is the round block, the verifier's token included
-/// (default 5), so every loop drafts one fewer. Every loop accepts by argmax
+/// `--draft-block-size` is the round block, the verifier's token included, so
+/// every loop drafts one fewer; absent, it is the default capped by the depth
+/// the drafter's checkpoint declares. Every loop accepts by argmax
 /// agreement at `temperature == 0`; above it the two-model loop runs
 /// rejection sampling against the drafter's distribution and the sidecar loops
 /// draw the verifier's token per position and accept the prefix that agrees.
@@ -367,7 +394,6 @@ impl SpeculativeGenerator {
             .unwrap_or("");
         let declared = rmlx_models::Declared::from_snapshot(draft_arch, draft_model_type);
         let draft_kind = decide_draft_kind(draft_kind, declared, draft_arch, draft_model_type)?;
-        let block_size = round_block(draft_block_size)?;
         tracing::info!(
             draft = %draft_dir.display(),
             arch = draft_arch,
@@ -502,9 +528,13 @@ impl SpeculativeGenerator {
             dispatcher.verifier.validate_kv_quant(kq)?;
         }
 
+        let declared_block = drafter.declared_block_size();
+        let block_size = round_block(draft_block_size, declared_block)?;
+
         tracing::info!(
             model_id = %model_id,
             block_size,
+            ?declared_block,
             ?kv_quant_resolved,
             ?max_ctx_override,
             effective_max_ctx,
@@ -968,7 +998,7 @@ impl Generator for SpeculativeGenerator {
                     &tokenizer,
                     &prompt_tokens,
                     n_tokens,
-                    drafted_per_round(block_size),
+                    rmlx_models::speculative::drafts_per_round(block_size),
                     kv_quant_override,
                     max_ctx_override,
                     prompt_cache_slots,
@@ -977,7 +1007,10 @@ impl Generator for SpeculativeGenerator {
                     None,
                     &spec_sampler_cfg,
                 ),
-            };
+            }
+            // Every driver reports the block its rounds ran; the served path
+            // reads it off the round loop's own `done` line instead.
+            .map(|(emitted, _block)| emitted);
 
             if cancelled {
                 return;

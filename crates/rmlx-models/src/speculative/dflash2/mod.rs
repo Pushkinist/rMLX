@@ -543,7 +543,7 @@ fn check_config(
             cfg.block_size
         )));
     }
-    if cfg.block_size > round::MAX_BLOCK_SIZE {
+    if cfg.block_size > crate::speculative::MAX_BLOCK_SIZE {
         return Err(Error::Model(format!(
             "DFlash2Drafter: dflash_config.block_size is {}, more positions than one \
              verify forward can score; the round scores the whole block in a single \
@@ -551,7 +551,7 @@ fn check_config(
              position, and above about a thousand of them that pass times the GPU out \
              rather than running slowly (max {})",
             cfg.block_size,
-            round::MAX_BLOCK_SIZE
+            crate::speculative::MAX_BLOCK_SIZE
         )));
     }
     if cfg.sliding_window < 2 {

@@ -482,6 +482,13 @@ appended count) → one combined verify forward → `accept_prefix` walk over th
 verifier's own argmax → emit → recurrent refold + verifier-KV truncation +
 sidecar-KV `truncate_to` on partial acceptance.
 
+Each `draft_n` step past the first conditions on the sidecar's own output
+hidden rather than the verifier's, so the chain runs to whatever depth the
+request asks for: the sidecar's declared `block_size` is the depth it was
+trained at, and the only bound the loop applies is what one un-chunked verify
+forward can score. Acceptance decays with depth — that is the trade, and it is
+the request's to make.
+
 `draft_n` proposes `block_size - 1` tokens but only ever feeds back `block_size - 2`
 of them, so the last one used to get no KV slot. A full-accept round then commits
 `block_size` verifier positions against `block_size - 1` sidecar slots, and
@@ -788,7 +795,7 @@ snapshot's own `config.json` like every other kind: a registered architecture
 there is a full model. `rmlx serve --model <verifier> --draft-model <draft>`
 is the whole invocation; `--draft-kind two_model` is accepted and says the same
 thing. `--draft-block-size` is the round block — the verifier's own token plus
-the drafted ones, default 5 — so the draft proposes one fewer; it means the
+the drafted ones — so the draft proposes one fewer; it means the
 same on every drafter kind, and `RoundStats.block_size` records that one
 number whichever loop ran.
 
@@ -836,11 +843,12 @@ loop: `p` and `q` are indexed by one id and must be the same width.
   which does not combine with probabilistic draft sampling.
 
 **Early stop on draft confidence.** llama.cpp has the knob:
-`--spec-draft-p-min` (default 0.75) stops the current chain at the first token
-whose draft top-1 probability falls below it — "only collect very
-high-confidence draft tokens" — and `--spec-draft-n-min` (default 0) discards a
-chain that came out shorter than `n_min`, so the verifier is not asked to
-batch-score one or two tokens. Both are per-request in its server
+`--spec-draft-p-min` stops the current chain at the first token whose draft
+top-1 probability falls below it, and `--spec-draft-n-min` (default 0) discards
+a chain that came out shorter than `n_min`, so the verifier is not asked to
+batch-score one or two tokens. `p_min` defaults to `0.0`, which is that knob's
+own documented way of disabling the early stop, so it ships off. Both are
+per-request in its server
 (`speculative.p_min`, `speculative.n_min`). `--spec-draft-p-split` is declared
 and unused. That is the idea of a chain whose depth follows the draft's own
 confidence, arrived at independently and shipped since the late-2024
@@ -1032,7 +1040,7 @@ carry `draft_model` too (`docs/CLI.md` § Profiles), and runs the same way.
 |------|--------|---------|-------------|
 | `--draft-model <PATH>` | directory | (none) | The drafter snapshot: a sidecar head or a smaller full model. Which one it is is read from its `config.json`. |
 | `--draft-kind <KIND>` | `mtp`, `dflash`, `dflash2`, `eagle3`, `two_model` | (from the snapshot) | Names the kind for a snapshot whose `config.json` declares none. Requires `--draft-model`. Refused when it contradicts what the snapshot declares. |
-| `--draft-block-size <N>` | integer ≥ 2 | 5 | Round block: tokens the verifier scores per round, its own token included, so the drafter proposes one fewer. One meaning for every kind, and the `block_size` every `done` line and `decode_config` records. Refused below 2 at parse time. Upper-bounded by a sidecar's own `block_size`; an MTP sidecar config without that key takes the loader default of 3, which is what both shipped Qwen3.5-family sidecars do. |
+| `--draft-block-size <N>` | integer ≥ 2 | 5, capped by the declared depth | Round block: tokens the verifier scores per round, its own token included, so the drafter proposes one fewer. One meaning for every kind, and the `block_size` every `done` line and `decode_config` records. **Absent, the round runs at 5 capped by the depth the drafter's own checkpoint declares**, and at a flat 5 for a drafter that declares none. Refused below 2 or above 1024 at parse time. What further bounds an explicit request depends on the drafter: a DFlash checkpoint's own `block_size` caps it, because that block is the shape of the drafter's denoising input; the Qwen3.5-family MTP sidecars do not, because the head chains on its own output hidden and can propose past the depth it was trained at. Every loop is bounded above by what one un-chunked verify forward can score. |
 
 Environment variable fallbacks: `MLX_VLM_DRAFT_KIND` and
 `MLX_VLM_DRAFT_BLOCK_SIZE` for `--draft-kind` and `--draft-block-size`
@@ -1405,11 +1413,16 @@ table and change no answer.
 the CPU kernel — production drafts on Metal, whose partition is a different
 implementation of the same unspecified contract.
 
-**The comparison is not at equal depth and cannot be.** `MtpDrafter::block_size`
-is the sidecar's own `config.json` value (3 here) and the MTP round loop clamps
-`block_total` to it, so `--draft-block-size 8` against that sidecar runs at 3 and
-records `mtp/block=3`. The published comparison's "same 7 drafts" arm has no
-counterpart on this checkpoint; each drafter is shown at the depth it can run.
+**The comparison is not at equal depth.** These MTP rows were taken while the
+round loop clamped `block_total` to the sidecar's own `config.json` value (3
+here), so `--draft-block-size 8` against that sidecar ran at 3 and recorded
+`mtp/block=3`. That clamp is gone — the head chains on its own output hidden, so
+the declared value is the depth it was trained at and not one it can only propose
+to — and a deeper MTP block is now selectable. The rows above have not been
+re-taken at one; each drafter is shown at the depth its row was run at. The
+answer at a deeper block is gated: `spec_greedy_equivalence.rs` drives this pair
+at the declared block and at block 8, and both agree with plain greedy on all six
+prompts under the divergence-confidence oracle.
 
 **Nor is it the same measurement as the published one, even where the drafter is
 the same.** The third-party acceptance figures this checkpoint is known by were
@@ -1766,12 +1779,13 @@ Four things those say:
 - **MTP pays on both GDN hybrids and is the only drafter that does.** On the MoE
   it wins every prompt class at the shipped block size. On the dense 27B it wins
   every prompt class at block 2 and only the code class at block 3.
-- **`--draft-block-size` is capped by the sidecar's own `block_size`, and every
-  shipped Qwen3.5-family MTP sidecar declares that key as 3** — the Qwen3.6-35B
-  5-bit one and both Qwen3.8-27B ones, which is also the loader's default when
-  the key is absent. Any request above 3 is silently the same run. Block 2 and
-  block 3 are the only two settings those pairs have, and 2 measured faster than
-  3 on all three prompt classes for Qwen3.8-27B at both weight formats. The `block_size` field on the
+- **Every shipped Qwen3.5-family MTP sidecar declares `block_size: 3`** — the
+  Qwen3.6-35B 5-bit one and both Qwen3.8-27B ones — and that is the depth the
+  head was trained at, not a bound on what it can propose. The rows here were
+  taken while the round loop clamped the request to it, so block 2 and block 3
+  were the only two settings those pairs had, and 2 measured faster than 3 on all
+  three prompt classes for Qwen3.8-27B at both weight formats. The clamp is gone;
+  deeper blocks are selectable and unmeasured. The `block_size` field on the
   `mtp_generate: done` line reports the value actually used.
 - **The step cost the round loop paid was 1.39× a plain step at block 2 and
   1.89× at block 3** on Qwen3.8-27B-4bit, against 32.47 / 32.54 t/s no-drafter

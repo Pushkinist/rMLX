@@ -157,6 +157,84 @@ const VOCAB_TAIL_TOLERANCE: usize = 128;
 /// magnitude of this.
 const VOCAB_ID_CEILING: u32 = 1 << 22;
 
+/// Largest block any round loop here can verify, and so the largest a
+/// checkpoint may declare or a request ask for.
+///
+/// **The block is scored in one un-chunked forward.** A round calls
+/// `Architecture::forward_verify_capture` once over the carry token and every
+/// proposal, and that forward materialises `block_size * vocab_size` logits in a
+/// single Metal command buffer — the round loop needs all of them, because it
+/// argmaxes every position to walk the acceptance. There is no chunked variant
+/// it could fall back on: `forward_verify_capture_chunked` exists precisely
+/// because that stops working, and it buys its headroom by materialising the
+/// *last* position's logits only, which a verify pass cannot do.
+///
+/// The number is the one that path already records as measured: a `[1, n, vocab]`
+/// logit tensor in one command buffer times the GPU out above roughly a thousand
+/// positions on this verifier's family, and a 4096-position single shot exceeds
+/// the Metal watchdog on logits alone. So a block above this describes a round
+/// that cannot be run rather than one that would be slow — and the block is what
+/// sizes the round's token buffer, its verify input, and on the loops that have
+/// one, the selector chain and a mask quadratic in it.
+///
+/// Real blocks are single digits; the published DFlash 2 checkpoint declares 8
+/// and its own guidance recommends 5 against a quantized pair. This is a
+/// structural ceiling with two orders of magnitude of headroom over anything
+/// that drafts, not a tuning knob.
+pub const MAX_BLOCK_SIZE: usize = 1024;
+
+/// The round block a request that named none runs at, before a drafter's own
+/// declaration narrows it: the verifier's own token plus four drafted.
+///
+/// One producer for the whole workspace. The serve layer resolves the served
+/// block from this and the drafter's declared depth, and the equivalence gate
+/// drives a pair that names no block at the same number, so the width that gate
+/// judges is a width an operator is actually served. A second copy of the value
+/// anywhere makes those two silently different runs.
+///
+/// It is not derived from any checkpoint. Which block each drafter should
+/// default to is a throughput question and belongs to a sweep; this is the
+/// number that stands until one answers it.
+pub const DEFAULT_BLOCK_SIZE: usize = 5;
+
+/// The block a request that named none runs at, given whatever depth the
+/// drafter's checkpoint declares.
+///
+/// [`DEFAULT_BLOCK_SIZE`] capped by the declaration: a checkpoint is not asked
+/// for more depth than it was trained at unless someone asks, and a deeper
+/// declaration does not move what an operator is served, because that is a
+/// throughput choice and belongs to a sweep. A drafter that declares nothing
+/// takes the constant.
+///
+/// One producer. The serve layer resolves the served block with this, and the
+/// two test harnesses that drive a loop the way a no-flag request would resolve
+/// it the same way — so a pair or an alignment cell covers the configuration an
+/// operator gets rather than one that agreed with it when it was written.
+#[must_use]
+pub fn default_block_for(declared: Option<usize>) -> usize {
+    declared.map_or(DEFAULT_BLOCK_SIZE, |d| DEFAULT_BLOCK_SIZE.min(d))
+}
+
+/// The block a round runs at when the drafter's declared depth is a real
+/// constraint: what the request asked for, what the checkpoint was trained at,
+/// and what one verify forward can score — whichever is smallest, and never
+/// below the two positions a seed and one draft need.
+///
+/// Three loops narrow this way and share this. DFlash 1 and DFlash 2 denoise a
+/// block whose width *is* the drafter's input shape, and EAGLE-3's head is
+/// defined over its own block; none of the three can propose past what its
+/// checkpoint names. The MTP sidecar can, which is why it does not call this.
+///
+/// **The [`MAX_BLOCK_SIZE`] clamp is not the loaders' guarantee restated.** The
+/// drafter structs are public with public fields, so one reaching a round loop
+/// need not have come through a loader and its config need not have been
+/// checked — the tests build them directly. The block sizes the round's token
+/// buffer and its verify input, so each loop bounds it on its own behalf rather
+/// than on a promise its argument did not have to make.
+pub(crate) fn block_capped_by_checkpoint(requested: usize, declared: usize) -> usize {
+    requested.min(declared).clamp(2, MAX_BLOCK_SIZE)
+}
+
 /// The vocabulary a snapshot's `tokenizer.json` declares, added tokens included.
 fn snapshot_vocab(dir: &Path) -> Result<HashMap<String, u32>> {
     let path = dir.join("tokenizer.json");
@@ -444,7 +522,12 @@ impl SpeculativeDispatcher {
     ///
     /// `step_fn` is called once per emitted token (verifier-confirmed) so
     /// the SSE consumer can stream output.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Returns the emitted steps and **the widest block any round of this run
+    /// actually ran**, the verifier's own token included. Not the `k + 1` that
+    /// was asked for: this loop narrows its draft count per round against the
+    /// remaining token budget, and a caller checking what it asked for against
+    /// its own argument would be checking nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn spec_generate_greedy(
         &self,
@@ -476,12 +559,13 @@ impl SpeculativeDispatcher {
         // residual `normalize((p−q)+)`. This preserves the verifier's output
         // distribution exactly (Leviathan 2023 Thm 1).
         sampler_cfg: &crate::sampler::SamplerConfig,
-    ) -> Result<Vec<ProbeStep>> {
+    ) -> Result<(Vec<ProbeStep>, usize)> {
         if k == 0 {
             return Err(Error::Model("spec_generate_greedy: k must be >= 1".into()));
         }
+        let k = two_model_drafts_per_round(k);
         if n_tokens == 0 {
-            return Ok(vec![]);
+            return Ok((vec![], k + 1));
         }
         if prompt_ids.is_empty() {
             return Err(Error::Model(
@@ -528,6 +612,9 @@ impl SpeculativeDispatcher {
                 step_fn,
             )
         }
+        // The inner loops count drafts; every other loop here counts the block
+        // that holds them, so this reports the block the widest round ran.
+        .map(|(emitted, widest_draft)| (emitted, widest_draft + 1))
     }
 
     /// Greedy spec generation with persistent verifier + draft KV
@@ -572,7 +659,7 @@ impl SpeculativeDispatcher {
         max_ctx_override: Option<i32>,
         eos_ids: &[u32],
         step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
-    ) -> Result<Vec<ProbeStep>> {
+    ) -> Result<(Vec<ProbeStep>, usize)> {
         let draft = self.draft_model()?;
         let device = self.device;
         let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
@@ -703,6 +790,7 @@ impl SpeculativeDispatcher {
         // --- Spec loop. ------------------------------------------------
         let seed_emitted = emitted.len();
         let mut emitted_in_rounds = 0usize;
+        let mut widest_draft = 0usize;
         let round_loop_t0 = Instant::now();
         while emitted.len() < n_tokens {
             rounds += 1;
@@ -710,6 +798,7 @@ impl SpeculativeDispatcher {
             // Mirror mlx-lm: num_draft = min(remaining, K). Always ≥ 1
             // since loop guard ensures `remaining ≥ 1`.
             let num_draft = remaining.min(k).max(1);
+            widest_draft = widest_draft.max(num_draft);
 
             // -- GDN rollback prep. ------------------------------------
             // The GatedDeltaNet recurrent state has NO sequence axis, so
@@ -802,7 +891,7 @@ impl SpeculativeDispatcher {
                     charged: false,
                 }
                 .log_done();
-                return Ok(emitted);
+                return Ok((emitted, widest_draft));
             }
 
             // -- Phase D: setup next round. ----------------------------
@@ -936,7 +1025,7 @@ impl SpeculativeDispatcher {
             crate::decode_loop::PostDecode::seal(),
         );
 
-        Ok(emitted)
+        Ok((emitted, widest_draft))
     }
 
     /// Stochastic speculative decoding for `temperature > 0`.
@@ -983,7 +1072,7 @@ impl SpeculativeDispatcher {
         eos_ids: &[u32],
         step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
         sampler_cfg: &crate::sampler::SamplerConfig,
-    ) -> Result<Vec<ProbeStep>> {
+    ) -> Result<(Vec<ProbeStep>, usize)> {
         use crate::sampler::{
             sample_index, sampling_distribution, stochastic_accept, AcceptDecision, Pcg32,
         };
@@ -1100,11 +1189,13 @@ impl SpeculativeDispatcher {
 
         let seed_emitted = emitted.len();
         let mut emitted_in_rounds = 0usize;
+        let mut widest_draft = 0usize;
         let round_loop_t0 = Instant::now();
         while emitted.len() < n_tokens {
             rounds += 1;
             let remaining = n_tokens - emitted.len();
             let num_draft = remaining.min(k).max(1);
+            widest_draft = widest_draft.max(num_draft);
 
             arm_lin_tapes(verifier_lin.as_deref_mut());
             arm_lin_tapes(draft_lin.as_deref_mut());
@@ -1234,7 +1325,7 @@ impl SpeculativeDispatcher {
                     charged: false,
                 }
                 .log_done();
-                return Ok(emitted);
+                return Ok((emitted, widest_draft));
             }
 
             // -- Phase D: cache rollback (identical to the greedy path). -----
@@ -1335,7 +1426,7 @@ impl SpeculativeDispatcher {
             crate::decode_loop::PostDecode::seal(),
         );
 
-        Ok(emitted)
+        Ok((emitted, widest_draft))
     }
 }
 
@@ -1726,6 +1817,31 @@ pub(crate) fn argmax_tokens(bytes: &[u8], k: usize) -> Result<Vec<u32>> {
         .take(k)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
+}
+
+/// How many tokens a round of `block` tokens drafts: the block less the
+/// verifier's own token.
+///
+/// The two-model loop is the only one that takes a draft count where the others
+/// take a block, so it is the only place the two units meet — and they are the
+/// same number one apart, which is exactly the shape a unit error hides in. One
+/// producer, so the serve layer and the equivalence harness cannot drift into
+/// asking that loop for different widths under the same name.
+#[must_use]
+pub const fn drafts_per_round(block: usize) -> usize {
+    block.saturating_sub(1)
+}
+
+/// How many tokens a two-model round drafts, bounded by what one verify forward
+/// can score.
+///
+/// This loop takes a draft count where the sidecar loops take a block; the round
+/// verifies the carry token and every draft in one un-chunked pass, so the two
+/// are the same quantity offset by one and take the same ceiling. Clamped rather
+/// than refused, because the serve layer refuses an over-wide request at parse
+/// time and this is the loop's own guard against a caller that is not it.
+pub(crate) fn two_model_drafts_per_round(k: usize) -> usize {
+    k.min(MAX_BLOCK_SIZE - 1)
 }
 
 /// The greedy acceptance walk over one verified block.

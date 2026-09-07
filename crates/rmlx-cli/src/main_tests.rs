@@ -287,3 +287,49 @@ fn kv_quant_none_matches_predicate() {
         "KvQuant::Planar must NOT match the paged-kv rejection predicate"
     );
 }
+
+/// A block wider than one verify forward can score is refused at parse time,
+/// naming the ceiling — not clamped.
+///
+/// An operator who asked for 4096 and was quietly served 1024 would read the
+/// round's figures as belonging to the block they named. The round loops clamp
+/// as well, and that clamp is their guard against a caller that is not this one.
+#[test]
+fn draft_block_size_above_the_ceiling_is_refused_at_parse_time() {
+    const CEILING: usize = rmlx_models::speculative::MAX_BLOCK_SIZE;
+    for bad in [CEILING + 1, 4096] {
+        let bad = bad.to_string();
+        let r = Cli::try_parse_from([
+            "rmlx",
+            "serve",
+            "--model",
+            "/tmp/m",
+            "--draft-model",
+            "/tmp/d",
+            "--draft-block-size",
+            &bad,
+        ]);
+        let msg = r.err().map_or_else(String::new, |e| e.to_string());
+        assert!(
+            msg.contains("more positions than one verify forward can score")
+                && msg.contains(&format!("max {CEILING}")),
+            "--draft-block-size {bad} must be refused naming the ceiling, got: {msg}"
+        );
+    }
+    let ceiling = CEILING.to_string();
+    let r = Cli::try_parse_from([
+        "rmlx",
+        "serve",
+        "--model",
+        "/tmp/m",
+        "--draft-model",
+        "/tmp/d",
+        "--draft-block-size",
+        &ceiling,
+    ]);
+    assert!(
+        r.is_ok(),
+        "the ceiling itself must parse, got: {:?}",
+        r.err()
+    );
+}

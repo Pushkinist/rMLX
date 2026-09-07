@@ -7,8 +7,8 @@
 //! `text_config missing num_experts` error).
 
 use super::{
-    classify_mtp_draft, decide_draft_kind, drafted_per_round, mtp_reject_reason, round_block,
-    MtpDraftFamily, DEFAULT_DRAFT_BLOCK_SIZE, MIN_DRAFT_BLOCK_SIZE,
+    classify_mtp_draft, decide_draft_kind, mtp_reject_reason, round_block, MtpDraftFamily,
+    MIN_DRAFT_BLOCK_SIZE,
 };
 use rmlx_models::{Declared, DraftKind};
 
@@ -153,24 +153,75 @@ fn a_sidecar_flag_over_a_full_model_is_refused() {
 /// as `k + 1`. A block too small to hold a draft token is refused by name.
 #[test]
 fn one_flag_value_is_one_round_block() {
-    assert_eq!(round_block(None).ok(), Some(DEFAULT_DRAFT_BLOCK_SIZE));
-    for block in [MIN_DRAFT_BLOCK_SIZE, 5, 16] {
-        assert_eq!(round_block(Some(block)).ok(), Some(block));
+    for declared in [None, Some(3), Some(8)] {
+        for block in [MIN_DRAFT_BLOCK_SIZE, 5, 16] {
+            assert_eq!(round_block(Some(block), declared).ok(), Some(block));
+            assert_eq!(
+                rmlx_models::speculative::drafts_per_round(block) + 1,
+                block,
+                "the two-model loop records k + 1, which must be the block the flag named"
+            );
+        }
+        for block in [0, MIN_DRAFT_BLOCK_SIZE - 1] {
+            let msg = round_block(Some(block), declared)
+                .err()
+                .map_or_else(String::new, |e| e.to_string());
+            assert!(
+                msg.contains(&format!("block size {block}"))
+                    && msg.contains(&format!("at least {MIN_DRAFT_BLOCK_SIZE}")),
+                "{msg}"
+            );
+        }
+    }
+}
+
+/// A request that names no block runs at the default, capped by the depth the
+/// drafter's checkpoint declares.
+///
+/// A shallower declaration wins because a checkpoint is not asked for more depth
+/// than it was trained at unless someone asks — every shipped Qwen3.5-family MTP
+/// sidecar declares 3. A deeper one does not, because moving a served default
+/// upward is a throughput change and this is not where that is decided: the
+/// published DFlash 2 checkpoint declares 8 and DFlash 1's 16, and both are
+/// served at 5 as before.
+#[test]
+fn no_flag_runs_at_the_default_capped_by_the_declared_depth() {
+    const DEFAULT_DRAFT_BLOCK_SIZE: usize = rmlx_models::speculative::DEFAULT_BLOCK_SIZE;
+    for declared in [MIN_DRAFT_BLOCK_SIZE, 3, 4] {
+        assert_eq!(round_block(None, Some(declared)).ok(), Some(declared));
+    }
+    for declared in [DEFAULT_DRAFT_BLOCK_SIZE, 8, 16, 1024] {
         assert_eq!(
-            drafted_per_round(block) + 1,
-            block,
-            "the two-model loop records k + 1, which must be the block the flag named"
+            round_block(None, Some(declared)).ok(),
+            Some(DEFAULT_DRAFT_BLOCK_SIZE),
+            "a checkpoint declaring {declared} does not move the served default"
         );
     }
-    for block in [0, MIN_DRAFT_BLOCK_SIZE - 1] {
-        let msg = round_block(Some(block))
-            .err()
-            .map_or_else(String::new, |e| e.to_string());
-        assert!(
-            msg.contains(&format!("block size {block}"))
-                && msg.contains(&format!("at least {MIN_DRAFT_BLOCK_SIZE}")),
-            "{msg}"
+    assert_eq!(round_block(None, None).ok(), Some(DEFAULT_DRAFT_BLOCK_SIZE));
+}
+
+/// A checkpoint declaring a depth with no room for a draft token does not
+/// silently produce a round that drafts nothing.
+#[test]
+fn a_declared_depth_below_the_minimum_is_floored() {
+    for declared in [0, MIN_DRAFT_BLOCK_SIZE - 1] {
+        assert_eq!(
+            round_block(None, Some(declared)).ok(),
+            Some(MIN_DRAFT_BLOCK_SIZE)
         );
+    }
+}
+
+/// An explicit request is honoured past the declaration and bounded by what one
+/// verify forward can score.
+#[test]
+fn an_explicit_block_outranks_the_declaration_and_stops_at_the_ceiling() {
+    const CEILING: usize = rmlx_models::speculative::MAX_BLOCK_SIZE;
+    for declared in [None, Some(3), Some(8)] {
+        assert_eq!(round_block(Some(64), declared).ok(), Some(64));
+        assert_eq!(round_block(Some(CEILING), declared).ok(), Some(CEILING));
+        assert_eq!(round_block(Some(CEILING + 1), declared).ok(), Some(CEILING));
+        assert_eq!(round_block(Some(usize::MAX), declared).ok(), Some(CEILING));
     }
 }
 

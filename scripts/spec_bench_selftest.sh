@@ -331,6 +331,9 @@ metrics)
 	esac
 	;;
 serve)
+	if [ -n "\${STUB_ARGV:-}" ]; then
+		printf '%s\n' "\$@" >"\$STUB_ARGV"
+	fi
 	port=8090
 	speculative=0
 	while [ \$# -gt 0 ]; do
@@ -434,6 +437,7 @@ run_case() {
 		STUB_DECODE_TPS_SEQ='"Some(20.0)"' \
 		STUB_PROMPT_TOKENS=1234 \
 		STUB_BOUND_FLAG="$CASE_HOME/stub_bound" \
+		STUB_ARGV="$CASE_HOME/serve_argv" \
 		${env_pairs[@]+"${env_pairs[@]}"} \
 		bash "$FAKE_ROOT/scripts/spec_bench.sh" --port "$PORT" \
 		${extra_args[@]+"${extra_args[@]}"} >"$CASE_OUT" 2>&1
@@ -764,6 +768,34 @@ run_case decode_config_names_the_arm 0 \
 	note_bad "mtp decode_config=$(field_of_record mtp decode_config)"
 [ "$(field_of_record normal decode_config)" = "null" ] ||
 	note_bad "normal decode_config=$(field_of_record normal decode_config)"
+verdict
+
+# The block a run is measured at is the engine's unless the caller named one, and
+# the only place that is visible is the argv the server was launched with. The
+# recorded `decode_config` cannot see it: it comes from the stub's own
+# STUB_DECODE_CONFIG, so a script that hard-coded a block and always passed it
+# would file rows reading `mtp/block=5` either way.
+run_case draft_block_left_to_the_engine 0 \
+	"the block flag is absent when the caller named none"
+if [ -s "$CASE_HOME/serve_argv" ]; then
+	grep -qx -- '--draft-block-size' "$CASE_HOME/serve_argv" &&
+		note_bad "the serve argv carried --draft-block-size with no caller asking"
+else
+	note_bad "the stub recorded no serve argv"
+fi
+verdict
+
+run_case draft_block_passed_when_asked 0 \
+	"the block flag is passed with the value the caller named" \
+	'ARGS:--draft-block-size=7'
+if [ -s "$CASE_HOME/serve_argv" ]; then
+	grep -qx -- '--draft-block-size' "$CASE_HOME/serve_argv" ||
+		note_bad "the serve argv dropped --draft-block-size the caller asked for"
+	grep -qx -- '7' "$CASE_HOME/serve_argv" ||
+		note_bad "the serve argv did not carry the block the caller named"
+else
+	note_bad "the stub recorded no serve argv"
+fi
 verdict
 
 # A round-loop record that reports no rate still counts as an event, so the

@@ -75,7 +75,7 @@ use rmlx_mlx::{
     Array, Device, Dtype,
 };
 
-use super::{emit_step, DecodeWindow};
+use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
@@ -693,6 +693,25 @@ use crate::decode_loop::ProbeStep;
 use rmlx_kv_quant::{KvCache, KvQuant};
 use std::time::Instant;
 
+/// The block a request runs at: what it asked for, bounded by what one verify
+/// forward can score.
+///
+/// This loop refuses a block below two rather than raising it: the drafter and
+/// the verifier share K/V here, so a caller asking for a round that drafts
+/// nothing has asked for something this pairing cannot express, and silently
+/// running a different round would hide it.
+///
+/// # Errors
+/// [`Error::Model`] for a block with no room for a draft token.
+fn block_from_request(requested: usize) -> Result<usize> {
+    if requested < 2 {
+        return Err(Error::Model(
+            "mtp_assistant_generate: block_size must be >= 2".into(),
+        ));
+    }
+    Ok(requested.min(MAX_BLOCK_SIZE))
+}
+
 /// Greedy Gemma4-assistant MTP speculative generation.
 ///
 /// Mirrors mlx-vlm `_mtp_rounds` (greedy / temp=0):
@@ -706,6 +725,12 @@ use std::time::Instant;
 /// `block_size - 1` tokens/round). `sampler_cfg` decides what "the verifier's
 /// own token" means — its argmax at temperature 0, a draw from its
 /// post-sampling distribution above it; see [`super::VerifierDraw`].
+///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -728,17 +753,13 @@ pub fn mtp_assistant_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
             "mtp_assistant_generate: prompt must have >=2 tokens".into(),
         ));
     }
-    if block_size < 2 {
-        return Err(Error::Model(
-            "mtp_assistant_generate: block_size must be >= 2".into(),
-        ));
-    }
+    let block_size = block_from_request(block_size)?;
     // Which round loop runs is decided by the drafter snapshot's `model_type`
     // alone, so a `gemma4_assistant` drafter can be handed any verifier. This
     // loop conditions the drafter on the verifier's own final-normed hidden and
@@ -832,7 +853,7 @@ pub fn mtp_assistant_generate(
                 charged: charge_phases,
             }
             .log_done();
-            return Ok(emitted);
+            return Ok((emitted, block_size));
         }
     }
 
@@ -847,12 +868,14 @@ pub fn mtp_assistant_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         let round_t0 = Instant::now();
         rounds += 1;
         let remaining = n_tokens - emitted.len();
         let bs = (remaining + 1).min(block_size).max(2);
+        widest_bs = widest_bs.max(bs);
 
         // -- Phase A: drafter proposes bs-1 tokens (conditioned on hidden). --
         let t0 = Instant::now();
@@ -868,7 +891,11 @@ pub fn mtp_assistant_generate(
         let round_draft_ns = t0.elapsed().as_nanos();
         draft_ns += round_draft_ns;
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "mtp_assistant_generate: the drafter proposed nothing at block {bs}; \
+                 draft_n returns block - 1 ids for any block of two or more, so an \
+                 empty chain is a broken drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 
@@ -1026,7 +1053,7 @@ pub fn mtp_assistant_generate(
         crate::speculative::verifier_kv_bytes(&caches, None),
         crate::decode_loop::PostDecode::seal(),
     );
-    Ok(emitted)
+    Ok((emitted, widest_bs))
 }
 
 /// Drop the last `drop` key positions (axis 2) from a shared `(K, V)` pair.

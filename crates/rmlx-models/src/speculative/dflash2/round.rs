@@ -49,9 +49,9 @@ use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::{
-    accept_prefix, arm_lin_tapes, disarm_lin_tapes, emit_step, guard_verifier_prefill_logits,
-    phases_charged, rollback_round_caches, verifier_context, verifier_kv_bytes, DecodeWindow,
-    RoundPhases, RoundStats, SpecLoop, VerifierDraw,
+    accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, disarm_lin_tapes, emit_step,
+    guard_verifier_prefill_logits, phases_charged, rollback_round_caches, verifier_context,
+    verifier_kv_bytes, DecodeWindow, RoundPhases, RoundStats, SpecLoop, VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -61,47 +61,6 @@ use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 /// prefill of a long prompt would put the whole capture and a full-vocabulary
 /// logit tensor in one Metal command buffer.
 const PREFILL_CHUNK_SIZE: usize = 1024;
-
-/// Largest block this loop can verify, and so the largest a checkpoint may
-/// declare.
-///
-/// **The block is scored in one un-chunked forward.** A round calls
-/// `Architecture::forward_verify_capture` once over the carry token and every
-/// proposal, and that forward materialises `block_size * vocab_size` logits in a
-/// single Metal command buffer — the round loop needs all of them, because it
-/// argmaxes every position to walk the acceptance. There is no chunked variant
-/// it could fall back on: `forward_verify_capture_chunked` exists precisely
-/// because that stops working, and it buys its headroom by materialising the
-/// *last* position's logits only, which a verify pass cannot do.
-///
-/// The number is the one that path already records as measured: a `[1, n, vocab]`
-/// logit tensor in one command buffer times the GPU out above roughly a thousand
-/// positions on this verifier's family, and a 4096-position single shot exceeds
-/// the Metal watchdog on logits alone. So a checkpoint declaring a block above
-/// this is describing a round that cannot be run rather than one that would be
-/// slow — and the block is what sizes the round's token buffer, the verify
-/// input, the selector's chain and a mask quadratic in it.
-///
-/// Real DFlash 2 blocks are single digits; the published checkpoint declares 8
-/// and its own guidance recommends 5 against a quantized pair. This is a
-/// structural ceiling with two orders of magnitude of headroom over anything
-/// that drafts, not a tuning knob.
-pub(super) const MAX_BLOCK_SIZE: usize = 1024;
-
-/// The block a request runs at: what it asked for, what the checkpoint was
-/// trained at, and what one verify forward can score — whichever is smallest,
-/// and never below the two positions a seed and one draft need.
-///
-/// **The [`MAX_BLOCK_SIZE`] clamp is not the loader's guarantee restated.**
-/// [`DFlash2Drafter`] is a public struct with public fields, so a drafter
-/// reaching this loop need not have come through `DFlash2Drafter::load` and its
-/// config need not have been through `check_config` — the tests build one
-/// directly. The block sizes this round's token buffer, its verify input and its
-/// selector chain, so the loop bounds it on its own behalf rather than on a
-/// promise its argument did not have to make.
-pub(super) fn round_block_total(requested: usize, declared: usize) -> usize {
-    requested.min(declared).clamp(2, MAX_BLOCK_SIZE)
-}
 
 /// Drive a DFlash 2 drafter against its verifier.
 ///
@@ -118,6 +77,12 @@ pub(super) fn round_block_total(requested: usize, declared: usize) -> usize {
 /// `step_fn` is called once per emitted token. Its `Option<u32>` return — the
 /// forced-token contract the plain decode loop uses — is discarded here, as it
 /// is on every speculative loop: a round's tokens are already the verifier's.
+///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
 ///
 /// # Errors
 ///
@@ -142,7 +107,7 @@ pub fn dflash2_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
             "dflash2_generate: prompt must have >=2 tokens".into(),
@@ -168,7 +133,7 @@ pub fn dflash2_generate(
 
     let target_layer_ids = drafter.cfg.target_layer_ids.clone();
     let condition_width = (drafter.cfg.hidden_size * target_layer_ids.len()) as i32;
-    let block_total = round_block_total(requested_block_total, drafter.cfg.block_size);
+    let block_total = block_capped_by_checkpoint(requested_block_total, drafter.cfg.block_size);
 
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.
@@ -256,7 +221,7 @@ pub fn dflash2_generate(
             charged: charge_phases,
         }
         .log_done();
-        return Ok(emitted);
+        return Ok((emitted, block_total));
     }
 
     tracing::info!(
@@ -272,6 +237,7 @@ pub fn dflash2_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
@@ -280,16 +246,18 @@ pub fn dflash2_generate(
         // The block never resizes: the drafter denoises the block it was
         // trained at, and only the token budget shortens it.
         let bs = block_total.min(remaining + 1);
-        if bs <= 1 {
-            break;
-        }
+        widest_bs = widest_bs.max(bs);
 
         let t0 = Instant::now();
         let draft_tokens = draft_block(verifier, drafter, b, &h_ctx, bs, device)?;
         let round_draft_ns = t0.elapsed().as_nanos();
         draft_ns += round_draft_ns;
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "dflash2_generate: the drafter denoised nothing at block {bs}; a block \
+                 of two or more yields block - 1 proposals, so an empty block is a \
+                 broken drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 
@@ -448,7 +416,7 @@ pub fn dflash2_generate(
         verifier_kv_bytes(&v_caches, Some(&v_lin)),
         crate::decode_loop::PostDecode::seal(),
     );
-    Ok(emitted)
+    Ok((emitted, widest_bs))
 }
 
 /// One block of `bs - 1` proposals: mask the block behind the carry token,
@@ -478,7 +446,3 @@ fn draft_block(
     let logits = verifier.logits_from_final_hidden(&drafted, device)?;
     drafter.select_chain(&drafted, &logits, seed)
 }
-
-#[cfg(test)]
-#[path = "round_tests.rs"]
-mod round_tests;

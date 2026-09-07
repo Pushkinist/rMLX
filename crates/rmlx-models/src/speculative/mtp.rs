@@ -54,7 +54,7 @@ use std::path::Path;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, concatenate, Array, Device};
 
-use super::{emit_step, DecodeWindow};
+use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
@@ -100,9 +100,10 @@ pub struct MtpDrafter {
     weights: MtpHeadWeights,
     /// Per-MTP-layer KV cache (the head's own small cache).
     caches: Vec<KvCache>,
-    /// Drafter block size (`block_size` in the sidecar config) — the number of
-    /// tokens proposed per round (incl. the seed carry).
-    block_size: usize,
+    /// The block the sidecar's config declares (`block_size`) — the depth the
+    /// head was trained at, not a ceiling on the depth it can be run at.
+    /// `None` when the config names none.
+    block_size: Option<usize>,
     device: Device,
 }
 
@@ -123,7 +124,7 @@ impl MtpDrafter {
             draft = %draft_dir.display(),
             hidden_size,
             num_mtp_layers = weights.layers.len(),
-            block_size,
+            ?block_size,
             "MtpDrafter: loaded sidecar head"
         );
         Ok(Self {
@@ -141,8 +142,12 @@ impl MtpDrafter {
         }
     }
 
-    /// Configured block size (tokens proposed per round, including the carry).
-    pub fn block_size(&self) -> usize {
+    /// The block this sidecar's config declares, including the seed carry, or
+    /// `None` when it declares none.
+    ///
+    /// The trained depth, which a round is free to exceed: `block_from_request`
+    /// in this module takes it and does not narrow to it.
+    pub fn block_size(&self) -> Option<usize> {
         self.block_size
     }
 
@@ -295,7 +300,8 @@ impl MtpDrafter {
 /// Reads `model.safetensors` (qwen3.5 split layout) and constructs the `fc`
 /// linear + three RMSNorms + the reused Qwen3.5-MoE decoder layer(s). Validates
 /// `fc` shape `[hidden, 2*hidden]` against the verifier `hidden_size`. Returns
-/// `(weights, block_size)`.
+/// `(weights, block_size)`, the second `None` when the config names no
+/// `block_size`.
 ///
 /// Norm-weight contract: the qwen3.5 sidecar split (`qwen3_5_mtp.py::sanitize`)
 /// adds 1.0 to every 1-D norm weight ONLY when the source is NOT already an
@@ -307,7 +313,7 @@ impl MtpDrafter {
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
-fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights, usize)> {
+fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights, Option<usize>)> {
     use rmlx_loader::{load_config, load_shard_index, ShardSet};
 
     let cfg = load_config(draft_dir).map_err(|e| {
@@ -410,12 +416,15 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
     let partial_rotary_factor = rope_f64("partial_rotary_factor", 0.25);
     let rope_dims = ((head_dim as f64) * partial_rotary_factor).round() as usize;
 
-    // block_size (tokens proposed per round, incl. carry).
+    // block_size (tokens proposed per round, incl. carry). Absent is its own
+    // answer: a caller deciding a default has to be able to tell a checkpoint
+    // that declares a depth from one that says nothing, and a fallback here
+    // would hand it 3 either way.
     let block_size = cfg
         .extras
         .get("block_size")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(3) as usize;
+        .and_then(|v| usize::try_from(v).ok());
 
     // Sidecar global quant (group_size / bits / mode).
     let (q_gs, q_bits, q_mode) = match &cfg.quantization {
@@ -570,6 +579,31 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
 
 use crate::decode_loop::ProbeStep;
 
+/// The block a request runs at: what it asked for, bounded by what one verify
+/// forward can score, and never below the two positions a seed and one draft
+/// need.
+///
+/// **`declared` is not a ceiling here**, which is the whole reason it is an
+/// argument. The head chains on its own output hidden — [`MtpDrafter::draft_n`]
+/// feeds each step's `h_next` back as the next step's `h_prev` — so proposing
+/// past the depth the checkpoint names is structurally admissible; what decays
+/// with depth is the acceptance rate, and that is the request's trade to make.
+/// Taking it and not clamping to it is what makes this function, rather than its
+/// caller, the one place that decision lives.
+fn block_from_request(requested: usize, declared: Option<usize>) -> usize {
+    let block = requested.clamp(2, MAX_BLOCK_SIZE);
+    if declared.is_some_and(|d| block > d) {
+        tracing::debug!(
+            block,
+            declared,
+            "mtp_generate: running a block deeper than the sidecar declares; the head \
+             chains on its own hidden past its trained depth and acceptance falls with \
+             it"
+        );
+    }
+    block
+}
+
 /// MTP speculative-decoding round-loop.
 ///
 /// Port of `_mtp_rounds` (mlx-vlm). Mirrors [`super::dflash::dflash_generate`]
@@ -587,6 +621,12 @@ use crate::decode_loop::ProbeStep;
 ///
 /// The verifier is the Qwen3.5/3.6-MoE hybrid (carries GDN linear-attention
 /// state); rollback refolds that state from the round tape.
+///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -610,7 +650,7 @@ pub fn mtp_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     use rmlx_kv_quant::LinearAttnCache;
     use std::time::Instant;
 
@@ -634,8 +674,7 @@ pub fn mtp_generate(
     let capture_ids = [last_layer];
     let hidden = verifier.hidden_size() as i32;
 
-    // block_total: drafter config is the ceiling (sidecar `block_size`).
-    let block_total = requested_block_total.min(drafter.block_size()).max(2);
+    let block_total = block_from_request(requested_block_total, drafter.block_size());
 
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.
@@ -733,7 +772,7 @@ pub fn mtp_generate(
             charged: charge_phases,
         }
         .log_done();
-        return Ok(emitted);
+        return Ok((emitted, block_total));
     }
 
     tracing::info!(
@@ -748,15 +787,14 @@ pub fn mtp_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         let round_t0 = Instant::now();
         rounds += 1;
         let remaining = n_tokens - emitted.len();
         let bs = block_total.min(remaining + 1).max(2);
-        if bs <= 1 {
-            break;
-        }
+        widest_bs = widest_bs.max(bs);
 
         // -- Phase A: drafter proposes bs-1 tokens (autoregressive). The sidecar
         //    KV starts this round at `draft_pos` (verifier prefix length). --
@@ -766,7 +804,11 @@ pub fn mtp_generate(
         let round_draft_ns = t0.elapsed().as_nanos();
         draft_ns += round_draft_ns;
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "mtp_generate: the sidecar proposed nothing at block {bs}; draft_n \
+                 returns block - 1 ids for any block of two or more, so an empty chain \
+                 is a broken drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 
@@ -925,7 +967,7 @@ pub fn mtp_generate(
         crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
         crate::decode_loop::PostDecode::seal(),
     );
-    Ok(emitted)
+    Ok((emitted, widest_bs))
 }
 
 // ---------------------------------------------------------------------------

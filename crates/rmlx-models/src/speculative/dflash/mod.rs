@@ -590,6 +590,12 @@ use crate::decode_loop::ProbeStep;
 /// `step_fn` is invoked once per emitted (verifier-confirmed) token; return
 /// `Some(id)` to force the next token (unused here — kept symmetric with the
 /// MTP path). Returns the emitted token ids.
+///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -612,7 +618,7 @@ pub fn dflash_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     use std::time::Instant;
 
     if prompt_ids.len() < 2 {
@@ -630,7 +636,10 @@ pub fn dflash_generate(
 
     let target_layer_ids = drafter.cfg.target_layer_ids.clone();
     let hidden = drafter.cfg.hidden_size as i32;
-    let block_total = requested_block_total.min(drafter.cfg.block_size).max(2);
+    let block_total = crate::speculative::block_capped_by_checkpoint(
+        requested_block_total,
+        drafter.cfg.block_size,
+    );
 
     // Same constant the verifier resolves — a spec pair must not run two
     // different caches.
@@ -725,7 +734,7 @@ pub fn dflash_generate(
             charged: false,
         }
         .log_done();
-        return Ok(emitted);
+        return Ok((emitted, block_total));
     }
 
     tracing::info!(
@@ -740,14 +749,13 @@ pub fn dflash_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
         let remaining = n_tokens - emitted.len();
         let bs = dflash_next_block_size(&recent, block_total, remaining + 1, false);
-        if bs <= 1 {
-            break;
-        }
+        widest_bs = widest_bs.max(bs);
 
         // -- Project the committed verifier hidden into the conditioning ctx. --
         let h_ctx = drafter.project_condition(&h_ctx_raw)?;
@@ -757,7 +765,11 @@ pub fn dflash_generate(
         let draft_tokens = drafter.draft_block(verifier, b, &h_ctx, bs)?;
         draft_ns += t0.elapsed().as_nanos();
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "dflash_generate: the drafter denoised nothing at block {bs}; a block \
+                 of two or more yields block - 1 proposals, so an empty block is a \
+                 broken drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 
@@ -895,7 +907,7 @@ pub fn dflash_generate(
         crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
         crate::decode_loop::PostDecode::seal(),
     );
-    Ok(emitted)
+    Ok((emitted, widest_bs))
 }
 
 // ---------------------------------------------------------------------------

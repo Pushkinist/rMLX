@@ -193,9 +193,7 @@ const MIN_ANSWER_TOKENS: usize = 160;
 /// prefix would otherwise score 1.0.
 const MIN_LENGTH_RATIO: f64 = 0.60;
 
-/// Draft block for the assistant pair. Small enough that a rollback runs every
-/// few tokens, which is the code path the oracles protect.
-const BLOCK_SIZE: usize = 4;
+use rmlx_models::speculative::{default_block_for, drafts_per_round};
 
 /// Context both arms run under. Above the 4k prompt plus the budget, and the
 /// same on both sides — a different cap on either would make this a measurement
@@ -214,7 +212,8 @@ const MAX_CTX: i32 = 8192;
 /// | assistant pair, as shipped | 0.0000 to 0.0820 |
 /// | recurrent pair, as shipped | 0.0000 to 0.0234 |
 /// | block pair, as shipped | 0.0000 to 0.0273 |
-/// | adaptive pair, as shipped | 0.0000 to 0.0234 |
+/// | adaptive pair, as shipped, at the block it is served | 0.0000 to 0.0234 |
+/// | adaptive pair, as shipped, over its whole schedule | 0.0000 to 0.0703 |
 /// | restricted-vocabulary pair, as shipped | 0.0000 to 0.0703 |
 /// | two-model pair, as shipped | 0.0000 to 0.0234 |
 /// | assistant pair, SWA ring keeping its rejected block tail | 0.4219 to 0.9258 |
@@ -232,6 +231,16 @@ const MAX_CTX: i32 = 8192;
 /// is refused on at least four of the prompts the gate judged for it — which is
 /// what running every prompt rather than one buys, since no broken engine is
 /// refused on all of them by this oracle alone.
+///
+/// **The adaptive pair's two rows are the same engine at two blocks**, and the
+/// wider one reads three times the narrower. Both clear the ceiling and both are
+/// refused on none of the prompts the gate judges, against at least four for
+/// every broken engine here — but 0.0703 is also where the broken adaptive row
+/// starts, so the two populations touch on that pair at that block, and the
+/// margin the ceiling has over a correct reading there is 1.71x rather than the
+/// 1.46x the paragraph above quotes. The narrower row was measured before this
+/// pair was split in two and its block is not recorded; the served block
+/// reproduces it exactly.
 ///
 /// The exception is the last row, and it is a property of the defect rather than
 /// of the ceiling: leaving the correction on the restricted argmax only changes
@@ -1673,6 +1682,19 @@ struct Pair {
     verifier: common::GoldenModel,
     drafter: DrafterSource,
     round_loop: RoundLoop,
+    /// The round block to drive this pair at, or `None` for the block the engine
+    /// serves a request that names none.
+    ///
+    /// `None` is `rmlx_models::speculative::default_block_for` of whatever depth
+    /// the drafter declares, which is the serve layer's own rule — so a pair
+    /// left at `None` covers the configuration an operator gets, and [`run_gate`]
+    /// holds it to that rather than to nothing. It is not the only one the
+    /// engine will run: a request names any block up to what one verify forward
+    /// can score, and a wider block puts the same round loop through a verify
+    /// forward of a different width, an acceptance walk over more positions and
+    /// a rollback over a longer rejected tail. Naming it here is what lets a
+    /// pair be judged at one of those.
+    block: Option<usize>,
 }
 
 /// How a pair's drafter is found, and so whether `make gpu-test` selects the
@@ -1681,7 +1703,20 @@ enum DrafterSource {
     /// Resolved by slug from `RMLX_O_MODELS_ROOT`, like the verifier — the pair
     /// runs wherever the snapshots are.
     Slug(&'static str),
-    /// Named by an operator or not run at all.
+    /// Run only when an operator asks, and then resolved by the slug named here.
+    ///
+    /// `RMLX_DRAFT_TEST_MODEL` is what asks. It is one variable and these are
+    /// several pairs, so it cannot also be what each of them resolves to: three
+    /// MTP pairs across two verifiers would all take whichever sidecar it held,
+    /// and a 4-bit sidecar loads against an mxfp8 verifier of the same width
+    /// without complaint. So the variable selects, the slug resolves, and the
+    /// path the variable holds is the fallback for a machine whose models root
+    /// does not carry the slug — checked against the verifier by
+    /// [`declared_quant_mode`] either way.
+    ///
+    /// `None` is a pair with no snapshot to name: the two-model arm's draft is a
+    /// full model of the verifier's family, and no sibling of these verifiers is
+    /// on this machine's models root, so the variable is its only handle.
     ///
     /// Its verifier drives an MLX quantized matmul whose `load_safe` bound is
     /// the one `scripts/gpu_validation_census.txt` records, so a run under Metal
@@ -1691,7 +1726,7 @@ enum DrafterSource {
     /// such a pair would make the census brittle rather than informative. Until
     /// that is settled these pairs run on request and `make gpu-test` reports
     /// them as skipped, with the variable that would run them named.
-    Named,
+    Named(Option<&'static str>),
 }
 
 /// The pair the floors were measured on: a full-attention-plus-SWA verifier
@@ -1703,6 +1738,7 @@ const ASSISTANT_PAIR: Pair = Pair {
     },
     drafter: DrafterSource::Slug("mlx-community__gemma-4-E2B-it-assistant-bf16"),
     round_loop: RoundLoop::Gemma4Assistant,
+    block: None,
 };
 
 /// The recurrent pair. Its agreement is far below the assistant pair's and no
@@ -1716,14 +1752,56 @@ const MTP_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(Some("mlx-community__Qwen3.8-27B-MTP-mxfp8")),
     round_loop: RoundLoop::MtpSidecar,
+    block: None,
 };
 
-/// The block pair. Its drafter denoises a whole block in one pass and its
-/// selector chains the block's independent argmaxes into one sentence, so an
-/// error in either reaches the verifier as a rejected proposal rather than as a
-/// failure — which the acceptance walk absorbs, and this gate does not.
+/// The recurrent pair on the 4-bit verifier, at the depth its sidecar declares.
+///
+/// The same round loop as [`MTP_PAIR`] against a verifier of half the weight
+/// width. It is the arm the deep-block pair below is compared against: two
+/// blocks of the same loop on the same pair, so a difference between them is
+/// the block and not the checkpoint.
+const MTP_4BIT_PAIR: Pair = Pair {
+    verifier: common::GoldenModel {
+        slug: "mlx-community__Qwen3.8-27B-4bit",
+        archs: &[
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ],
+    },
+    drafter: DrafterSource::Named(Some("mlx-community__Qwen3.8-27B-MTP-4bit")),
+    round_loop: RoundLoop::MtpSidecar,
+    block: None,
+};
+
+/// The same pair driven past the depth its sidecar declares.
+///
+/// The sidecar head chains on its own output hidden, so it proposes to any
+/// depth asked for and a request may name one; nothing about that changes what
+/// the answer must be. What does change is every width downstream of it — the
+/// verify forward scores eight positions instead of three, the acceptance walk
+/// runs over eight, and a partial round rolls back a longer rejected tail. Each
+/// is a width no other pair here drives this loop at, and each is a place an
+/// answer could move without the loop reporting anything.
+const MTP_4BIT_DEEP_PAIR: Pair = Pair {
+    verifier: MTP_4BIT_PAIR.verifier,
+    drafter: DrafterSource::Named(Some("mlx-community__Qwen3.8-27B-MTP-4bit")),
+    round_loop: RoundLoop::MtpSidecar,
+    block: Some(DEEP_BLOCK),
+};
+
+/// The block [`MTP_4BIT_DEEP_PAIR`] drives, chosen as the widest the accept
+/// curve still returns proposals at.
+const DEEP_BLOCK: usize = 8;
+
+/// The block pair at the block a request that names none is served. Its drafter
+/// denoises a whole block in one pass and its selector chains the block's
+/// independent argmaxes into one sentence, so an error in either reaches the
+/// verifier as a rejected proposal rather than as a failure — which the
+/// acceptance walk absorbs, and this gate does not. The declared width is
+/// [`DFLASH2_DEEP_PAIR`]'s.
 ///
 /// Named for the same reason [`MTP_PAIR`] is, and more so: its verifier is
 /// 4-bit, so it drives the same MLX quantized matmul at a group size the
@@ -1736,14 +1814,31 @@ const DFLASH2_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(Some("z-lab__Qwen3.8-27B-DFlash2")),
     round_loop: RoundLoop::DFlash2,
+    block: None,
 };
 
-/// The adaptive pair. Its drafter carries no dynamic convolution and no
-/// selector, and its loop sets each round's block from the accept rate of the
-/// recent ones — so it is the only pair here whose verify width changes between
-/// rounds, and the only one that reaches a block wider than 8.
+/// The block pair at the width its checkpoint declares.
+///
+/// [`DFLASH2_PAIR`] runs the block a request that names none is served, which
+/// is the serve default and narrower than the declaration — so the selector
+/// chain is driven over four positions where it is defined over eight. The
+/// chain is the thing this drafter is, and a chain re-picking three positions
+/// against the one before it is not the chain re-picking seven.
+const DFLASH2_DEEP_PAIR: Pair = Pair {
+    verifier: DFLASH2_PAIR.verifier,
+    drafter: DrafterSource::Named(Some("z-lab__Qwen3.8-27B-DFlash2")),
+    round_loop: RoundLoop::DFlash2,
+    block: Some(8),
+};
+
+/// The adaptive pair at the block a request that names none is served. Its
+/// drafter carries no dynamic convolution and no selector, and its loop sets
+/// each round's block from the accept rate of the recent ones, so its verify
+/// width changes between rounds here as at any block. The schedule's full
+/// range is [`DFLASH1_DEEP_PAIR`]'s: at the served 5 this one oscillates over
+/// {4, 5}.
 ///
 /// Named for the same reason [`MTP_PAIR`] is: an 8-bit verifier drives the same
 /// MLX quantized matmul the census records for the affine instantiation.
@@ -1755,8 +1850,25 @@ const DFLASH1_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(Some("z-lab__Qwen3.6-35B-A3B-DFlash")),
     round_loop: RoundLoop::DFlash1,
+    block: None,
+};
+
+/// The adaptive pair over the range its schedule actually covers.
+///
+/// [`DFLASH1_PAIR`] runs the served block, and at 5 the schedule oscillates
+/// over {4, 5}: `dflash_next_block_size` floors at `min(block, 4)` and grows to
+/// the ceiling it was given. The checkpoint declares 16, and the sequence of
+/// widths a run then produces — an 8-wide append truncated and followed by a
+/// 4- or 6-wide one — is the thing no other pair here reaches. Both are gated
+/// because both are real: one is what an operator is served, the other is what
+/// the schedule is.
+const DFLASH1_DEEP_PAIR: Pair = Pair {
+    verifier: DFLASH1_PAIR.verifier,
+    drafter: DrafterSource::Named(Some("z-lab__Qwen3.6-35B-A3B-DFlash")),
+    round_loop: RoundLoop::DFlash1,
+    block: Some(16),
 };
 
 /// The restricted-vocabulary pair, and the one place this gate reads a
@@ -1785,8 +1897,9 @@ const EAGLE3_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(Some("Dogacel__specdrift-qwen3.6-35b-a3b-eagle3")),
     round_loop: RoundLoop::Eagle3,
+    block: None,
 };
 
 /// The two-model pair: no sidecar head at all, a second complete model of the
@@ -1806,8 +1919,9 @@ const TWO_MODEL_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(None),
     round_loop: RoundLoop::TwoModelGreedy,
+    block: None,
 };
 
 /// Draft-model override, the variable the sibling alignment suites take.
@@ -1833,28 +1947,42 @@ const DRAFT_MODEL_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 /// own override variable in the messages it builds; this half of the pair is
 /// overridden by a different one, so that name is substituted.
 fn resolve(var: &str, slug: &str) -> common::Gate {
-    let Some(named) = std::env::var(var).ok().filter(|v| !v.is_empty()) else {
-        let root = std::env::var(common::MODELS_ROOT_VAR).ok();
-        return match common::slug_snapshot(root.as_deref(), slug, common::Role::Sidecar) {
-            common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
-            common::Snapshot::Absent(why) => {
-                common::Gate::Skip(why.replace(common::SINGLE_MODEL_VAR, var))
-            }
-            common::Snapshot::Misconfigured(why) => common::Gate::Fail(why),
-        };
-    };
-    // The operator named this path, so a typo or a moved snapshot breaks the
-    // run rather than skipping it. `override_snapshot` reports only an unset or
-    // empty value as `None`, and this branch holds a non-empty one.
+    named_path(var).unwrap_or_else(|| by_slug(var, slug))
+}
+
+/// What the path in `var` resolves to, or `None` when the variable holds none.
+///
+/// An operator who named a path meant it, so a typo or a moved snapshot breaks
+/// the run rather than skipping it. `override_snapshot` reports only an unset or
+/// empty value as `None`, so the inner `unwrap_or_else` covers a case the outer
+/// `?` has already excluded.
+fn named_path(var: &str) -> Option<common::Gate> {
+    let named = std::env::var(var).ok().filter(|v| !v.is_empty())?;
     let probed =
         common::override_snapshot(Some(&named), common::Role::Sidecar).unwrap_or_else(|| {
             common::Snapshot::Misconfigured(format!("{var} is set to an empty value"))
         });
-    match probed {
+    Some(match probed {
         common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
         common::Snapshot::Absent(why) | common::Snapshot::Misconfigured(why) => {
             common::Gate::Fail(why.replace(common::SINGLE_MODEL_VAR, var))
         }
+    })
+}
+
+/// What a slug resolves to under `RMLX_O_MODELS_ROOT`, reading no variable.
+///
+/// `blame` names the variable a message should point at — the one that would
+/// have overridden this — because the harness's own messages name its single
+/// override and this half of a pair is overridden by a different one.
+fn by_slug(blame: &str, slug: &str) -> common::Gate {
+    let root = std::env::var(common::MODELS_ROOT_VAR).ok();
+    match common::slug_snapshot(root.as_deref(), slug, common::Role::Sidecar) {
+        common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
+        common::Snapshot::Absent(why) => {
+            common::Gate::Skip(why.replace(common::SINGLE_MODEL_VAR, blame))
+        }
+        common::Snapshot::Misconfigured(why) => common::Gate::Fail(why),
     }
 }
 
@@ -1905,6 +2033,36 @@ fn declared_backbone_hidden(draft_path: &Path) -> Option<usize> {
     draft_config(draft_path)?["backbone_hidden_size"]
         .as_u64()
         .and_then(|v| usize::try_from(v).ok())
+}
+
+/// The weight-quantization mode a snapshot declares, if it declares one.
+///
+/// A sidecar is decoded through the verifier's own LM head and conditioned on
+/// its hidden states, so a pair whose halves were quantized differently is a
+/// pair in name only — and nothing downstream refuses it: both 27B sidecars
+/// carry the same width and the same tensor names, so a 4-bit one loads against
+/// an mxfp8 verifier and drafts fluently at a rate no reading here could be
+/// attributed to either checkpoint.
+///
+/// **Mode and not bits.** The shipped Qwen3.6 pair is an 8-bit verifier with a
+/// 5-bit sidecar, both affine, and it is the pair the MoE rows were measured on
+/// — so a width comparison would stand down a pairing that is real. The mode is
+/// what the two 27B pairs differ on and what nothing else separates them by.
+///
+/// `None` on either side is no opinion: the DFlash 2 and EAGLE-3 drafters
+/// declare no `quantization` block at all.
+///
+/// It speaks for the sidecar loops only. A two-model draft is a whole model that
+/// shares the verifier's tokenizer and nothing else, so its weight format is
+/// unrelated to the verifier's and a pair of different ones is a pair.
+fn declared_quant_mode(path: &Path) -> Option<String> {
+    let cfg = draft_config(path)?;
+    for at in [&cfg["quantization"], &cfg["text_config"]["quantization"]] {
+        if let Some(mode) = at["mode"].as_str() {
+            return Some(mode.to_owned());
+        }
+    }
+    None
 }
 
 /// The vocabulary a snapshot declares, from its own config or its text tower's.
@@ -2179,6 +2337,11 @@ struct Loaded {
     engine: Engine,
     tokenizer: tokenizers::Tokenizer,
     eos: Vec<u32>,
+    /// The pair's [`Pair::block`], carried through to the round-loop call.
+    block: Option<usize>,
+    /// The drafter snapshot these arms actually ran, so a reading names the
+    /// checkpoint it came from rather than the pair it was filed under.
+    drafter: std::path::PathBuf,
 }
 
 /// The verifier, and whatever drives the speculative arm against it.
@@ -2214,44 +2377,96 @@ enum Drafter {
 }
 
 impl Loaded {
-    /// Both arms over one prompt: the speculative ids, the reference ids, the
-    /// reference's per-position margins, and which vocabulary decided each
-    /// speculative token.
+    /// The block depth this pair's drafter declares, when it declares one.
+    ///
+    /// The serve layer resolves a request that names no block from this, so it
+    /// is what a `None` pair has to be held to. It is read off the loaded
+    /// drafter rather than taken from the pair, which is what keeps the check
+    /// from being the harness reading back its own choice.
+    fn declared_block(&self) -> Option<usize> {
+        match &self.engine {
+            Engine::Sidecar { drafter, .. } => match drafter {
+                // Neither declares a depth: the assistant's config carries no
+                // block key, and a two-model draft is a full model with no
+                // drafting depth to declare.
+                Drafter::Assistant(_) => None,
+                Drafter::Mtp(drafter) => drafter.block_size(),
+                Drafter::DFlash1(drafter) => Some(drafter.block_size()),
+                Drafter::DFlash2(drafter) => Some(drafter.cfg.block_size),
+                Drafter::Eagle3(drafter) => Some(drafter.block_size()),
+            },
+            Engine::TwoModel(_) => None,
+        }
+    }
+
+    /// The block this pair's arms run at: what the pair names, or what the serve
+    /// layer resolves for a request that names none.
+    ///
+    /// One producer, so every arm asks for the same width and [`run_gate`] can
+    /// hold the answer to it. The two-model loop converts to a draft count at
+    /// its own call, which is the only place the two units meet.
+    fn round_block(&self) -> usize {
+        self.block
+            .unwrap_or_else(|| default_block_for(self.declared_block()))
+    }
+
+    /// Both arms over one prompt: the block the speculative arm ran at, the
+    /// speculative ids, the reference ids, the reference's per-position margins,
+    /// and which vocabulary decided each speculative token.
     ///
     /// The last is empty for every loop that scores each position over the
     /// verifier's whole vocabulary, which is all of them but the restricted one.
+    ///
+    /// The block is returned because a pair that names one has to be checked
+    /// against it. Every reading below — the divergence position, its margin,
+    /// its confidence — is attributed to a block in the report line, and a pair
+    /// whose block quietly fell back to the drafter's declaration would produce
+    /// a full set of plausible readings under the wrong label.
+    ///
+    /// It is **each driver's own answer for the widest block its rounds ran**,
+    /// not the number this function was about to pass. Reading back the argument
+    /// would check that this function can hold a value, which is not the
+    /// question: the resolvers narrow to a checkpoint, and every loop narrows
+    /// again per round.
     fn arms(
         &mut self,
         prompt: &Prompt,
         device: Device,
-    ) -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<DecidedBy>) {
+    ) -> (usize, Vec<u32>, Vec<u32>, Vec<f32>, Vec<DecidedBy>) {
         let ids = prompt.ids(&self.tokenizer);
+        let block = self.round_block();
         let mut spec_ids: Vec<u32> = Vec::new();
         let mut decided_by: Vec<DecidedBy> = Vec::new();
+        let ran;
         {
             let mut step = |s: &rmlx_models::ProbeStep| {
                 spec_ids.push(s.token_id);
                 None
             };
-            match &mut self.engine {
+            ran = match &mut self.engine {
                 Engine::Sidecar { verifier, drafter } => match drafter {
-                    Drafter::Assistant(drafter) => mtp_assistant_generate(
-                        verifier,
-                        drafter,
-                        &self.tokenizer,
-                        &ids,
-                        N_TOKENS,
-                        BLOCK_SIZE,
-                        Some(rmlx_kv_quant::KvQuant::None),
-                        Some(MAX_CTX),
-                        &self.eos,
-                        &mut step,
-                        &GREEDY,
-                        device,
-                    )
-                    .expect("assistant speculative generate"),
+                    Drafter::Assistant(drafter) => {
+                        mtp_assistant_generate(
+                            verifier,
+                            drafter,
+                            &self.tokenizer,
+                            &ids,
+                            N_TOKENS,
+                            block,
+                            Some(rmlx_kv_quant::KvQuant::None),
+                            Some(MAX_CTX),
+                            &self.eos,
+                            &mut step,
+                            &GREEDY,
+                            device,
+                        )
+                        .expect("assistant speculative generate")
+                        .1
+                    }
                     Drafter::Mtp(drafter) => {
-                        let block = drafter.block_size();
+                        let block = self
+                            .block
+                            .unwrap_or_else(|| default_block_for(drafter.block_size()));
                         mtp_generate(
                             verifier,
                             drafter,
@@ -2267,13 +2482,13 @@ impl Loaded {
                             device,
                         )
                         .expect("mtp speculative generate")
+                        .1
                     }
-                    // The drafter's own ceiling, which its loop then halves and
-                    // grows from the recent accept rate: asking for a narrower
-                    // one would take the varying schedule out of the run, and
-                    // the schedule is what this pair covers that no other does.
+                    // The loop halves and grows this from the recent accept
+                    // rate, so the width varies within a run whatever it starts
+                    // at — the schedule is what this pair covers that no other
+                    // does, and it runs at whatever block the pair names.
                     Drafter::DFlash1(drafter) => {
-                        let block = drafter.block_size();
                         dflash_generate(
                             verifier,
                             drafter,
@@ -2289,12 +2504,13 @@ impl Loaded {
                             device,
                         )
                         .expect("dflash speculative generate")
+                        .1
                     }
-                    // The block the drafter was trained at, not the harness's: the
-                    // whole point of a block drafter is the block, and this is the
-                    // width its selector chain is defined over.
+                    // The whole point of a block drafter is the block, and the
+                    // width its selector chain is defined over is the one its
+                    // checkpoint declares — so a pair naming none is served the
+                    // narrower of that and the default, as anything else is.
                     Drafter::DFlash2(drafter) => {
-                        let block = drafter.cfg.block_size;
                         dflash2_generate(
                             verifier,
                             drafter,
@@ -2310,9 +2526,9 @@ impl Loaded {
                             device,
                         )
                         .expect("dflash2 speculative generate")
+                        .1
                     }
                     Drafter::Eagle3(drafter) => {
-                        let block = drafter.block_size();
                         eagle3_generate(
                             verifier,
                             drafter,
@@ -2329,23 +2545,32 @@ impl Loaded {
                             device,
                         )
                         .expect("eagle3 speculative generate")
+                        .1
                     }
                 },
-                Engine::TwoModel(dispatcher) => dispatcher
-                    .spec_generate_greedy(
-                        &self.tokenizer,
-                        &ids,
-                        N_TOKENS,
-                        BLOCK_SIZE,
-                        Some(rmlx_kv_quant::KvQuant::None),
-                        Some(MAX_CTX),
-                        0,
-                        &self.eos,
-                        &mut step,
-                        None,
-                        &GREEDY,
-                    )
-                    .expect("two-model speculative generate"),
+                // This loop takes a draft count where every other takes a
+                // block. The two are one apart, so passing a block here runs a
+                // round one position wider than the pair names and than the
+                // serve layer runs — which reads as a plausible block on both
+                // sides of the comparison.
+                Engine::TwoModel(dispatcher) => {
+                    dispatcher
+                        .spec_generate_greedy(
+                            &self.tokenizer,
+                            &ids,
+                            N_TOKENS,
+                            drafts_per_round(block),
+                            Some(rmlx_kv_quant::KvQuant::None),
+                            Some(MAX_CTX),
+                            0,
+                            &self.eos,
+                            &mut step,
+                            None,
+                            &GREEDY,
+                        )
+                        .expect("two-model speculative generate")
+                        .1
+                }
             };
         }
         let (plain_ids, margins) = plain_greedy(
@@ -2362,7 +2587,7 @@ impl Loaded {
             decided_by.len(),
             spec_ids.len()
         );
-        (spec_ids, plain_ids, margins, decided_by)
+        (ran, spec_ids, plain_ids, margins, decided_by)
     }
 
     /// The target-vocabulary ids this pair's drafter can name, or `None` when it
@@ -2394,10 +2619,33 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
     let named = std::env::var(DRAFT_MODEL_VAR)
         .ok()
         .filter(|v| !v.is_empty());
+    // Both arms below that reach this are guarded on the variable being set, so
+    // it always resolves to something; the fallback names the guard it fell
+    // through rather than restating the message a `false` arm already gives.
+    let named_gate = || {
+        named_path(DRAFT_MODEL_VAR).unwrap_or_else(|| {
+            common::Gate::Fail(format!(
+                "{DRAFT_MODEL_VAR} was set when this pair was selected and is not now"
+            ))
+        })
+    };
     let draft_gate = match (&pair.drafter, named.is_some()) {
         (DrafterSource::Slug(slug), _) => resolve(DRAFT_MODEL_VAR, slug),
-        (DrafterSource::Named, true) => resolve(DRAFT_MODEL_VAR, ""),
-        (DrafterSource::Named, false) => common::Gate::Skip(format!(
+        // The variable asked for this pair; the pair says which sidecar it
+        // needs. Its own slug first, so a run with several of these selected
+        // does not hand all of them whichever one path the variable holds.
+        // Only a models root that simply does not carry the slug falls back to
+        // the path the variable holds. A root that is misconfigured is the
+        // operator's mistake, and swallowing it would reinstate the one
+        // cross-pairing the slug is here to prevent — with the drafter that
+        // happens to be in the variable, silently.
+        (DrafterSource::Named(Some(slug)), true) => match by_slug(DRAFT_MODEL_VAR, slug) {
+            found @ common::Gate::Run { .. } => found,
+            failed @ common::Gate::Fail(_) => failed,
+            common::Gate::Skip(_) => named_gate(),
+        },
+        (DrafterSource::Named(None), true) => named_gate(),
+        (DrafterSource::Named(_), false) => common::Gate::Skip(format!(
             "{DRAFT_MODEL_VAR} is unset and this pair's drafter is not resolved by \
              slug — see the DrafterSource::Named note for why"
         )),
@@ -2415,6 +2663,27 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
         }
     }
     let model_path = common::model_for(&pair.verifier, test)?;
+    // A sidecar quantized differently from its verifier is not this pair, and
+    // nothing downstream says so — see `declared_quant_mode`. The two-model arm
+    // is exempt because its draft is an independent model: it shares the
+    // verifier's tokenizer and nothing else, so the two weight formats are
+    // unrelated and a pair of different ones is a pair.
+    if pair.round_loop != RoundLoop::TwoModelGreedy {
+        if let (Some(d), Some(v)) = (
+            declared_quant_mode(&draft_path),
+            declared_quant_mode(&model_path),
+        ) {
+            if d != v {
+                eprintln!(
+                    "SKIP {test}: {} is quantized {d} and {} is quantized {v}, so the \
+                     two are not this pair",
+                    draft_path.display(),
+                    model_path.display(),
+                );
+                return None;
+            }
+        }
+    }
     // The two-model loop's kind is an inference from the architecture registry,
     // so a full model of any family declares itself this pair's drafter. The
     // vocabulary is what separates them, and reading it here stands a mismatched
@@ -2462,6 +2731,8 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
         engine,
         tokenizer,
         eos,
+        block: pair.block,
+        drafter: draft_path,
     })
 }
 
@@ -2596,6 +2867,8 @@ fn engine_for(
 fn report(
     test: &str,
     prompt: &Prompt,
+    block: usize,
+    drafter: &Path,
     tk: &tokenizers::Tokenizer,
     spec: &[u32],
     plain: &[u32],
@@ -2623,12 +2896,16 @@ fn report(
         None => String::new(),
     };
     eprintln!(
-        "[{test}/{}] lcs={:.4} tail={tail_ratio:.4}@{tail_start} divergence={div} \
+        "[{test}/{}] block={block} drafter={} lcs={:.4} tail={tail_ratio:.4}@{tail_start} divergence={div} \
          margin={:.4} confidence={confidence:.4}{outside} \
          cycle spec={spec_cycle:.4}/p{spec_period}@{spec_from} \
          plain={plain_cycle:.4}/p{plain_period}@{plain_from} spec={} plain={}\n  \
          verdict = {verdict:?}\n  spec  = {:?}\n  plain = {:?}",
         prompt.name,
+        drafter
+            .file_name()
+            .unwrap_or(drafter.as_os_str())
+            .to_string_lossy(),
         lcs_ratio(spec, plain),
         margins.get(div).copied().unwrap_or(f32::NAN),
         spec.len(),
@@ -2674,11 +2951,37 @@ fn the_recurrent_round_loop_reproduces_plain_greedy() {
     );
 }
 
-/// The block pair. Its drafter proposes a whole block at once and its selector
-/// re-picks every position of that block against the one before it, so a defect
-/// in either arrives as a rejected proposal — which the acceptance walk absorbs
-/// silently and this gate does not. The rollback is the recurrent one, driven
-/// at a wider block than any other pair here reaches.
+/// The recurrent pair on the 4-bit verifier at its sidecar's declared depth,
+/// which is the control for the deep-block run below.
+#[ignore]
+#[test]
+fn the_recurrent_round_loop_reproduces_plain_greedy_at_the_declared_block() {
+    run_gate(
+        "the_recurrent_round_loop_reproduces_plain_greedy_at_the_declared_block",
+        &MTP_4BIT_PAIR,
+    );
+}
+
+/// The same pair and the same loop, driven past the depth its sidecar declares.
+///
+/// A request may name that block, so the answer it returns is one this engine
+/// serves, and it is judged by the same oracle as every other cell here: an
+/// arm that parts from plain greedy is refused unless the verifier's own top-two
+/// gap at the position they parted says the two were a near-tie.
+#[ignore]
+#[test]
+fn the_recurrent_round_loop_reproduces_plain_greedy_past_the_declared_block() {
+    run_gate(
+        "the_recurrent_round_loop_reproduces_plain_greedy_past_the_declared_block",
+        &MTP_4BIT_DEEP_PAIR,
+    );
+}
+
+/// The block pair at the block it is served. Its drafter proposes a whole block
+/// at once and its selector re-picks every position of that block against the
+/// one before it, so a defect in either arrives as a rejected proposal — which
+/// the acceptance walk absorbs silently and this gate does not. The rollback is
+/// the recurrent one.
 #[ignore]
 #[test]
 fn the_block_round_loop_reproduces_plain_greedy() {
@@ -2688,19 +2991,48 @@ fn the_block_round_loop_reproduces_plain_greedy() {
     );
 }
 
-/// The adaptive pair, and the only one whose verify width is not fixed.
+/// The same loop at the width its checkpoint declares, which is the width its
+/// selector chain is defined over.
+///
+/// At the served block the chain re-picks three positions; here it re-picks
+/// seven, over a rollback whose rejected tail is correspondingly longer.
+#[ignore]
+#[test]
+fn the_block_round_loop_reproduces_plain_greedy_at_the_declared_block() {
+    run_gate(
+        "the_block_round_loop_reproduces_plain_greedy_at_the_declared_block",
+        &DFLASH2_DEEP_PAIR,
+    );
+}
+
+/// The adaptive pair at the block it is served, and the only loop here whose
+/// verify width is not fixed.
 ///
 /// Its loop halves and grows the block from the accept rate of the recent
-/// rounds, so a run truncates an 8-wide append and follows it with a 4- or
-/// 6-wide one — a sequence of shapes no other pair here produces, over the same
-/// rollback the recurrent and block pairs use. Every individual width is
-/// exercised elsewhere; the schedule is not.
+/// rounds, so the width varies within a run over the same rollback the
+/// recurrent and block pairs use. At the served block that variation is over
+/// {4, 5}; the range the schedule is defined over is the next cell's.
 #[ignore]
 #[test]
 fn the_adaptive_round_loop_reproduces_plain_greedy() {
     run_gate(
         "the_adaptive_round_loop_reproduces_plain_greedy",
         &DFLASH1_PAIR,
+    );
+}
+
+/// The same loop over the range its schedule actually covers.
+///
+/// A run truncates an 8-wide append and follows it with a 4- or 6-wide one — a
+/// sequence of shapes no other pair here produces, and one the served block
+/// cannot reach. Every individual width is exercised elsewhere; the schedule is
+/// not.
+#[ignore]
+#[test]
+fn the_adaptive_round_loop_reproduces_plain_greedy_over_its_whole_schedule() {
+    run_gate(
+        "the_adaptive_round_loop_reproduces_plain_greedy_over_its_whole_schedule",
+        &DFLASH1_DEEP_PAIR,
     );
 }
 
@@ -2753,7 +3085,22 @@ fn run_gate(test: &str, pair: &Pair) {
     let mut refusals: Vec<String> = Vec::new();
     let mut judged = 0usize;
     for prompt in PROMPTS {
-        let (spec, plain, margins, decided_by) = loaded.arms(prompt, device);
+        let (block, spec, plain, margins, decided_by) = loaded.arms(prompt, device);
+        // Every pair is judged at a block or not at all — the one it names, or
+        // the one the serve layer resolves for a request that names none. The
+        // readings below are all attributed to a block in the report line, and
+        // an arm running any other width would fill that line with a plausible
+        // set under the wrong label. `want` is built from the pair and from the
+        // depth the *drafter* declares, so it is not the harness reading back
+        // its own choice.
+        let want = pair
+            .block
+            .unwrap_or_else(|| default_block_for(loaded.declared_block()));
+        assert_eq!(
+            block, want,
+            "{test}/{}: this pair runs block {want} and the loop ran {block}",
+            prompt.name
+        );
         let restriction = draft_vocab.as_ref().map(|vocab| Restriction {
             vocab,
             decided_by: &decided_by,
@@ -2762,6 +3109,8 @@ fn run_gate(test: &str, pair: &Pair) {
         report(
             test,
             prompt,
+            block,
+            &loaded.drafter,
             &loaded.tokenizer,
             &spec,
             &plain,

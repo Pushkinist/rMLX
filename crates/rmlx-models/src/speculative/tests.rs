@@ -1598,3 +1598,83 @@ fn a_round_tape_refolds_to_what_the_replay_produced() {
         }
     }
 }
+
+/// A two-model round drafts no more than one verify forward can score beside
+/// the carry token.
+#[test]
+fn the_two_model_draft_count_stops_at_the_verify_ceiling() {
+    assert_eq!(two_model_drafts_per_round(4), 4);
+    assert_eq!(
+        two_model_drafts_per_round(MAX_BLOCK_SIZE - 1),
+        MAX_BLOCK_SIZE - 1
+    );
+    assert_eq!(
+        two_model_drafts_per_round(MAX_BLOCK_SIZE),
+        MAX_BLOCK_SIZE - 1
+    );
+    assert_eq!(two_model_drafts_per_round(usize::MAX), MAX_BLOCK_SIZE - 1);
+}
+
+// ── block_capped_by_checkpoint ───────────────────────────────────────────────
+
+/// The request wins when it asks for less than the checkpoint was trained at.
+#[test]
+fn a_request_narrower_than_the_checkpoint_runs_at_the_request() {
+    assert_eq!(block_capped_by_checkpoint(5, 8), 5);
+}
+
+/// The checkpoint wins when the request asks for more than it was trained at:
+/// the selector's chain is defined over the trained block and no wider.
+#[test]
+fn a_request_wider_than_the_checkpoint_runs_at_the_checkpoint() {
+    assert_eq!(block_capped_by_checkpoint(8, 5), 5);
+}
+
+/// Two positions is the floor at both ends — a block of one is the seed alone
+/// and drafts nothing, so a request or a checkpoint below it still runs a round
+/// that proposes something.
+#[test]
+fn neither_side_can_take_the_block_below_a_seed_and_one_draft() {
+    assert_eq!(block_capped_by_checkpoint(0, 8), 2);
+    assert_eq!(block_capped_by_checkpoint(8, 1), 2);
+    assert_eq!(block_capped_by_checkpoint(0, 0), 2);
+}
+
+/// A checkpoint whose config never went through `check_config` is still bounded.
+///
+/// This is the case the clamp exists for, and the only one that separates it
+/// from the loader's refusal: `DFlash2Drafter` is publicly
+/// constructible with public fields, so `declared` here is whatever the caller
+/// put in the struct. Without the clamp this returns that number, and the round
+/// sizes its token buffer, its verify input and its selector chain from it.
+#[test]
+fn a_config_the_loader_never_saw_is_still_bounded_by_one_verify_forward() {
+    assert_eq!(
+        block_capped_by_checkpoint(usize::MAX, usize::MAX),
+        MAX_BLOCK_SIZE
+    );
+    assert_eq!(
+        block_capped_by_checkpoint(usize::MAX, 4_294_967_295),
+        MAX_BLOCK_SIZE
+    );
+    // And the request alone cannot lift it past the checkpoint either.
+    assert_eq!(block_capped_by_checkpoint(usize::MAX, 8), 8);
+}
+
+/// The ceiling admits its own value and refuses the next one, so it cannot be
+/// off by one in either direction.
+#[test]
+fn the_ceiling_admits_itself_and_nothing_above() {
+    assert_eq!(
+        block_capped_by_checkpoint(MAX_BLOCK_SIZE, MAX_BLOCK_SIZE),
+        MAX_BLOCK_SIZE
+    );
+    assert_eq!(
+        block_capped_by_checkpoint(MAX_BLOCK_SIZE + 1, MAX_BLOCK_SIZE + 1),
+        MAX_BLOCK_SIZE
+    );
+    assert_eq!(
+        block_capped_by_checkpoint(MAX_BLOCK_SIZE - 1, MAX_BLOCK_SIZE),
+        MAX_BLOCK_SIZE - 1
+    );
+}
