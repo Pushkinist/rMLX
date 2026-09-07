@@ -1344,9 +1344,12 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     ///    clones (+ truncates) for reuse. Hook `None` or an incomplete hydrate
     ///    degrades to `Miss`.
     ///
-    /// Every degrade branch emits exactly one `debug!{branch, reason}` so the
-    /// decision is reconstructable from a single run's log — the cached arches
-    /// previously had silent degrade arms.
+    /// Every arm that resolves to `Miss` emits exactly one
+    /// `debug!{branch, reason}`, including the two that carry no degrade — the
+    /// plain no-slot-match (`no_match`) and the not-yet-built cache
+    /// (`no_cache`). A silent `Miss` is worse than an unlogged one: a reader
+    /// counting branch events cannot tell it from an event that was emitted and
+    /// lost, so the two failures look identical in a captured stream.
     ///
     /// `n_layers` is the asking model's decoder-layer count — it sizes the
     /// per-layer mixture folded into the seed, so it must be the same count the
@@ -1395,8 +1398,17 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         // the value instead of re-reading a global.
         let dispatch_policy = rmlx_core::dispatch_policy();
 
-        self.with_inner_mut(|guard| match guard.as_mut() {
-            Some(cache) => Self::decide_locked(
+        self.with_inner_mut(|guard| {
+            let Some(cache) = guard.as_mut() else {
+                tracing::debug!(
+                    arch,
+                    branch = "no_cache",
+                    reason = "no cache built for this arch yet — prefill",
+                    prompt_len = prompt_ids.len(),
+                );
+                return Consumed::Miss;
+            };
+            Self::decide_locked(
                 arch,
                 policy,
                 cache,
@@ -1404,8 +1416,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
                 kv_quant,
                 seed,
                 dispatch_policy,
-            ),
-            None => Consumed::Miss,
+            )
         })
     }
 
@@ -1446,33 +1457,35 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
 
         // (4) Quant-mismatch guard. The snapshot is only safe to
         // reuse when the stored KvQuant equals the runtime quant.
-        let (slot_idx, block_count) = match raw_match {
-            Some((slot_idx, block_count)) => {
-                let stored = cache.slots[slot_idx].entry.kv_quant();
-                if stored == Some(kv_quant) {
-                    (slot_idx, block_count)
-                } else {
-                    tracing::debug!(
-                        arch,
-                        branch = "quant_mismatch",
-                        reason = "stored KV quant differs from runtime — evict + re-prefill",
-                        stored = ?stored,
-                        runtime = ?kv_quant,
-                        prompt_len = prompt_ids.len(),
-                    );
-                    tracing::warn!(
-                        stored = ?stored,
-                        runtime = ?kv_quant,
-                        prompt_len = prompt_ids.len(),
-                        "prompt cache KV quant mismatch — evicting entry, \
-                         degrading to re-prefill"
-                    );
-                    cache.evict_slot(slot_idx);
-                    return Consumed::Miss;
-                }
-            }
-            None => return Consumed::Miss,
+        let Some((slot_idx, block_count)) = raw_match else {
+            tracing::debug!(
+                arch,
+                branch = "no_match",
+                reason = "no stored slot shares a block-aligned prefix with this prompt — prefill",
+                prompt_len = prompt_ids.len(),
+            );
+            return Consumed::Miss;
         };
+        let stored = cache.slots[slot_idx].entry.kv_quant();
+        if stored != Some(kv_quant) {
+            tracing::debug!(
+                arch,
+                branch = "quant_mismatch",
+                reason = "stored KV quant differs from runtime — evict + re-prefill",
+                stored = ?stored,
+                runtime = ?kv_quant,
+                prompt_len = prompt_ids.len(),
+            );
+            tracing::warn!(
+                stored = ?stored,
+                runtime = ?kv_quant,
+                prompt_len = prompt_ids.len(),
+                "prompt cache KV quant mismatch — evicting entry, \
+                 degrading to re-prefill"
+            );
+            cache.evict_slot(slot_idx);
+            return Consumed::Miss;
+        }
 
         let entry = &cache.slots[slot_idx].entry;
         let is_ssd_hydrated = entry.is_ssd_hydrated();

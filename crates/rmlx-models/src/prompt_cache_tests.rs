@@ -2545,6 +2545,41 @@ fn consume_degrade_branches_each_emit_one_debug() {
     );
 }
 
+/// The two `Miss` arms that carry no degrade name themselves too.
+///
+/// They used to return silently, and a silent arm is what makes a captured
+/// branch stream ambiguous: a run where one scenario took an unlogged path is
+/// indistinguishable from a run where its event was emitted and lost, because
+/// both come back one branch short. Naming them turns the first case into a
+/// list that says which path ran.
+#[test]
+fn consume_miss_arms_that_are_not_degrades_still_name_their_branch() {
+    let prompt = make_ids(2 * BLOCK_TOKENS);
+
+    let branches = capture_branches(|| {
+        // Cache built, nothing stored: no slot shares a prefix.
+        {
+            let arch: ArchPromptCache<TestEntry> =
+                ArchPromptCache::new("test", ReusePolicy::ExactOnly, false);
+            arch.with_inner_mut(|g| *g = Some(PromptCache::new(4)));
+            let _ = arch.consume(&prompt, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
+        }
+        // No cache built for this arch at all.
+        {
+            let arch: ArchPromptCache<TestEntry> =
+                ArchPromptCache::new("test", ReusePolicy::ExactOnly, false);
+            let _ = arch.consume(&prompt, TEST_QUANT, TEST_LAYERS, false, TEST_SIG);
+        }
+    });
+
+    assert_eq!(
+        branches,
+        vec!["no_match".to_owned(), "no_cache".to_owned()],
+        "a consume that resolves to Miss without degrading must still say which \
+         arm it took"
+    );
+}
+
 // ── ensure() + the zero-slot cache ──────────────────────────────────────────
 //
 // `ensure` runs once per generation on every arch, so its "already the right
