@@ -2289,42 +2289,53 @@ enum Drafter {
 }
 
 impl Loaded {
-    /// Both arms over one prompt: the speculative ids, the reference ids, the
-    /// reference's per-position margins, and which vocabulary decided each
-    /// speculative token.
+    /// Both arms over one prompt: the block the speculative arm ran at, the
+    /// speculative ids, the reference ids, the reference's per-position margins,
+    /// and which vocabulary decided each speculative token.
     ///
     /// The last is empty for every loop that scores each position over the
     /// verifier's whole vocabulary, which is all of them but the restricted one.
+    ///
+    /// The block is returned because a pair that names one has to be checked
+    /// against it. Every reading below — the divergence position, its margin,
+    /// its confidence — is attributed to a block in the report line, and a pair
+    /// whose block quietly fell back to the drafter's declaration would produce
+    /// a full set of plausible readings under the wrong label.
     fn arms(
         &mut self,
         prompt: &Prompt,
         device: Device,
-    ) -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<DecidedBy>) {
+    ) -> (usize, Vec<u32>, Vec<u32>, Vec<f32>, Vec<DecidedBy>) {
         let ids = prompt.ids(&self.tokenizer);
         let mut spec_ids: Vec<u32> = Vec::new();
         let mut decided_by: Vec<DecidedBy> = Vec::new();
+        let ran;
         {
             let mut step = |s: &rmlx_models::ProbeStep| {
                 spec_ids.push(s.token_id);
                 None
             };
-            match &mut self.engine {
+            ran = match &mut self.engine {
                 Engine::Sidecar { verifier, drafter } => match drafter {
-                    Drafter::Assistant(drafter) => mtp_assistant_generate(
-                        verifier,
-                        drafter,
-                        &self.tokenizer,
-                        &ids,
-                        N_TOKENS,
-                        self.block.unwrap_or(BLOCK_SIZE),
-                        Some(rmlx_kv_quant::KvQuant::None),
-                        Some(MAX_CTX),
-                        &self.eos,
-                        &mut step,
-                        &GREEDY,
-                        device,
-                    )
-                    .expect("assistant speculative generate"),
+                    Drafter::Assistant(drafter) => {
+                        let block = self.block.unwrap_or(BLOCK_SIZE);
+                        mtp_assistant_generate(
+                            verifier,
+                            drafter,
+                            &self.tokenizer,
+                            &ids,
+                            N_TOKENS,
+                            block,
+                            Some(rmlx_kv_quant::KvQuant::None),
+                            Some(MAX_CTX),
+                            &self.eos,
+                            &mut step,
+                            &GREEDY,
+                            device,
+                        )
+                        .expect("assistant speculative generate");
+                        block
+                    }
                     Drafter::Mtp(drafter) => {
                         let block = self.block.unwrap_or_else(|| served(drafter.block_size()));
                         mtp_generate(
@@ -2342,7 +2353,7 @@ impl Loaded {
                             device,
                         )
                         .expect("mtp speculative generate")
-                        .0
+                        .1
                     }
                     // The loop halves and grows this from the recent accept
                     // rate, so the width varies within a run whatever it starts
@@ -2366,7 +2377,8 @@ impl Loaded {
                             &GREEDY,
                             device,
                         )
-                        .expect("dflash speculative generate")
+                        .expect("dflash speculative generate");
+                        block
                     }
                     // The whole point of a block drafter is the block, and the
                     // width its selector chain is defined over is the one its
@@ -2390,7 +2402,8 @@ impl Loaded {
                             &GREEDY,
                             device,
                         )
-                        .expect("dflash2 speculative generate")
+                        .expect("dflash2 speculative generate");
+                        block
                     }
                     Drafter::Eagle3(drafter) => {
                         let block = self
@@ -2411,24 +2424,29 @@ impl Loaded {
                             &GREEDY,
                             device,
                         )
-                        .expect("eagle3 speculative generate")
+                        .expect("eagle3 speculative generate");
+                        block
                     }
                 },
-                Engine::TwoModel(dispatcher) => dispatcher
-                    .spec_generate_greedy(
-                        &self.tokenizer,
-                        &ids,
-                        N_TOKENS,
-                        self.block.unwrap_or(BLOCK_SIZE),
-                        Some(rmlx_kv_quant::KvQuant::None),
-                        Some(MAX_CTX),
-                        0,
-                        &self.eos,
-                        &mut step,
-                        None,
-                        &GREEDY,
-                    )
-                    .expect("two-model speculative generate"),
+                Engine::TwoModel(dispatcher) => {
+                    let block = self.block.unwrap_or(BLOCK_SIZE);
+                    dispatcher
+                        .spec_generate_greedy(
+                            &self.tokenizer,
+                            &ids,
+                            N_TOKENS,
+                            block,
+                            Some(rmlx_kv_quant::KvQuant::None),
+                            Some(MAX_CTX),
+                            0,
+                            &self.eos,
+                            &mut step,
+                            None,
+                            &GREEDY,
+                        )
+                        .expect("two-model speculative generate");
+                    block
+                }
             };
         }
         let (plain_ids, margins) = plain_greedy(
@@ -2445,7 +2463,7 @@ impl Loaded {
             decided_by.len(),
             spec_ids.len()
         );
-        (spec_ids, plain_ids, margins, decided_by)
+        (ran, spec_ids, plain_ids, margins, decided_by)
     }
 
     /// The target-vocabulary ids this pair's drafter can name, or `None` when it
@@ -2680,6 +2698,7 @@ fn engine_for(
 fn report(
     test: &str,
     prompt: &Prompt,
+    block: usize,
     tk: &tokenizers::Tokenizer,
     spec: &[u32],
     plain: &[u32],
@@ -2707,7 +2726,7 @@ fn report(
         None => String::new(),
     };
     eprintln!(
-        "[{test}/{}] lcs={:.4} tail={tail_ratio:.4}@{tail_start} divergence={div} \
+        "[{test}/{}] block={block} lcs={:.4} tail={tail_ratio:.4}@{tail_start} divergence={div} \
          margin={:.4} confidence={confidence:.4}{outside} \
          cycle spec={spec_cycle:.4}/p{spec_period}@{spec_from} \
          plain={plain_cycle:.4}/p{plain_period}@{plain_from} spec={} plain={}\n  \
@@ -2863,7 +2882,18 @@ fn run_gate(test: &str, pair: &Pair) {
     let mut refusals: Vec<String> = Vec::new();
     let mut judged = 0usize;
     for prompt in PROMPTS {
-        let (spec, plain, margins, decided_by) = loaded.arms(prompt, device);
+        let (block, spec, plain, margins, decided_by) = loaded.arms(prompt, device);
+        // A pair that named a block is judged at that block or not at all. The
+        // readings below are all attributed to one in the report line, and an
+        // arm that fell back to the drafter's declaration would fill that line
+        // with a plausible set under the wrong label.
+        if let Some(want) = pair.block {
+            assert_eq!(
+                block, want,
+                "{test}/{}: this pair names block {want} and the loop ran {block}",
+                prompt.name
+            );
+        }
         let restriction = draft_vocab.as_ref().map(|vocab| Restriction {
             vocab,
             decided_by: &decided_by,
@@ -2872,6 +2902,7 @@ fn run_gate(test: &str, pair: &Pair) {
         report(
             test,
             prompt,
+            block,
             &loaded.tokenizer,
             &spec,
             &plain,
