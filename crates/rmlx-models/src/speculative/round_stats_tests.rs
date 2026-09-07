@@ -554,3 +554,187 @@ fn a_round_with_one_phase_and_nothing_else_claims_all_of_it() {
     };
     assert_eq!(p.unclaimed_ns(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// What a charged round left behind
+// ---------------------------------------------------------------------------
+
+/// An array holding host data, and the unevaluated result of an op over it.
+///
+/// Everything here runs on the CPU device and forces nothing it does not mean
+/// to: the point of the fixture is an array that is deliberately still a graph
+/// node.
+#[allow(
+    clippy::expect_used,
+    reason = "an array the fixture could not build leaves the test asserting nothing, \
+              so failing here is the right report"
+)]
+fn forced_and_lazy() -> (rmlx_mlx::Array, rmlx_mlx::Array) {
+    let bytes = 1.0f32.to_le_bytes();
+    let seed = rmlx_mlx::Array::from_bytes(&bytes, &[1], rmlx_mlx::Dtype::F32)
+        .expect("Array::from_bytes failed");
+    let lazy = rmlx_mlx::add(&seed, &seed, rmlx_mlx::Device::Cpu).expect("add failed");
+    (seed, lazy)
+}
+
+/// A subscriber that keeps every event's target, level and rendered fields.
+struct EventLog {
+    events: std::sync::Mutex<Vec<(String, tracing::Level, String)>>,
+}
+
+impl EventLog {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            events: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<(String, tracing::Level, String)> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+struct Render(String);
+
+impl tracing::field::Visit for Render {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, " {}={value}", field.name());
+    }
+}
+
+impl tracing::Subscriber for EventLog {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut render = Render(String::new());
+        event.record(&mut render);
+        let meta = event.metadata();
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((meta.target().to_owned(), *meta.level(), render.0));
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Every error the phase target carried during `f`.
+fn phase_errors(f: impl FnOnce()) -> Vec<String> {
+    let log = EventLog::new();
+    tracing::subscriber::with_default(std::sync::Arc::clone(&log), f);
+    log.seen()
+        .into_iter()
+        .filter(|(target, level, _)| {
+            target == super::PHASE_TARGET && *level == tracing::Level::ERROR
+        })
+        .map(|(_, _, fields)| fields)
+        .collect()
+}
+
+fn charged_round(charged: bool) -> super::RoundPhases {
+    super::RoundPhases {
+        round_ns: 10_000_000,
+        draft_ns: 4_000_000,
+        verify_ns: 4_000_000,
+        walk_ns: 1_000_000,
+        rollback_ns: 1_000_000,
+        replayed: false,
+        charged,
+    }
+}
+
+/// The predicate the whole guard rests on: it separates an array whose data is
+/// there from one whose is not, and names only the second.
+///
+/// A predicate that answered one way for everything would leave the guard
+/// either silent on every real defect or shouting on every clean round, and
+/// both end the same way — with it switched off.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "a forcing step that failed makes the second arm meaningless, so it \
+              must stop the test rather than be reported as a clean round"
+)]
+fn only_the_array_nobody_forced_is_named() {
+    let (forced, lazy) = forced_and_lazy();
+    assert_eq!(
+        super::unforced(&[("forced", &forced), ("lazy", &lazy)]),
+        vec!["lazy".to_owned()],
+        "the host-data array holds its data and the unevaluated sum does not"
+    );
+
+    lazy.eval().expect("eval failed");
+    assert!(
+        super::unforced(&[("forced", &forced), ("lazy", &lazy)]).is_empty(),
+        "once forced, neither array has work left for the next phase to pay for"
+    );
+}
+
+/// A charged round that leaves its conditioning unevaluated says so, and says
+/// which array and whose span will be charged for it.
+#[test]
+fn a_charged_round_that_left_its_carry_lazy_names_it() {
+    let (_, lazy) = forced_and_lazy();
+    let errors = phase_errors(|| {
+        charged_round(true).log(SpecLoop::DFlash2, 7, 3, 4, &[("h_ctx", &lazy)]);
+    });
+    let [reason] = errors.as_slice() else {
+        panic!("exactly one report per round, got: {errors:?}");
+    };
+    assert!(
+        reason.contains("h_ctx"),
+        "the report must name the array a reader has to go and find: {reason}"
+    );
+    assert!(
+        reason.contains("drafter"),
+        "and whose span is charged for it, which is the finding: {reason}"
+    );
+}
+
+/// The same round with its carry forced reports nothing.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "if the forcing step failed the round did leave lazy work behind, and \
+              a silent pass here would read as the guard clearing it"
+)]
+fn a_charged_round_that_forced_its_carry_is_silent() {
+    let (_, lazy) = forced_and_lazy();
+    lazy.eval().expect("eval failed");
+    let errors = phase_errors(|| {
+        charged_round(true).log(SpecLoop::DFlash2, 7, 3, 4, &[("h_ctx", &lazy)]);
+    });
+    assert!(
+        errors.is_empty(),
+        "a round that forced everything it carries has nothing to report: {errors:?}"
+    );
+}
+
+/// Uncharged, every phase leaves lazy work behind by design — that is what
+/// `charged=false` on the record means. Reporting it per round would put an
+/// error on every round of every ordinary run and train readers to skip it.
+#[test]
+fn an_uncharged_round_is_not_asked_where_its_work_went() {
+    let (_, lazy) = forced_and_lazy();
+    let errors = phase_errors(|| {
+        charged_round(false).log(SpecLoop::DFlash2, 7, 3, 4, &[("h_ctx", &lazy)]);
+    });
+    assert!(
+        errors.is_empty(),
+        "the guard is a charged-run instrument, not a running commentary: {errors:?}"
+    );
+}

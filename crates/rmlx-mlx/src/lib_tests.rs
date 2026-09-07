@@ -1052,3 +1052,35 @@ fn failed_reset_reports_nothing_rather_than_a_plausible_number() {
     assert!(ok.measurable());
     assert_eq!(ok.headroom_bytes(), 5_000_000_000);
 }
+
+// ── is_available ─────────────────────────────────────────────────────────
+
+/// Host data is materialised on arrival; the output of an op over it is not,
+/// until something forces it.
+///
+/// Both arms matter. A predicate stuck at `true` would let a span close over
+/// work it never paid for and report nothing; one stuck at `false` would call
+/// every carried array a defect and be switched off.
+#[test]
+fn an_unevaluated_result_is_not_available_and_a_forced_one_is() {
+    let input: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let a = Array::from_bytes(f32_as_bytes(&input), &[2i32, 2], Dtype::F32)
+        .expect("Array::from_bytes failed");
+    assert!(
+        a.is_available().expect("is_available failed on host data"),
+        "an array built from host bytes holds its data already"
+    );
+
+    let sum = add(&a, &a, Device::Cpu).expect("add failed");
+    assert!(
+        !sum.is_available()
+            .expect("is_available failed on a lazy result"),
+        "the result of an op nobody has forced is still a graph node"
+    );
+
+    sum.eval().expect("eval failed");
+    assert!(
+        sum.is_available().expect("is_available failed after eval"),
+        "eval blocks until the data is there, so the answer after it is true"
+    );
+}

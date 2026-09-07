@@ -260,14 +260,15 @@ numbers:
   sidecar loop used to close its span on the unevaluated forward and re-derive
   the LM head position by position afterwards, which put most of the verify
   forward into the residual and made the two loops' residuals incomparable.
-- **The rollback replay is still lazy by default.** Its output is discarded and
-  the state it writes is not read until the next round's verify forward, so the
-  second weight read a partial-accept round pays is billed to the *next* round's
-  `verifier_ms`.
+- **Uncharged, the drafter's span pays for the round before it.** The rollback
+  replay's output is discarded, the trimmed K/V and the extended conditioning
+  are not read until the next round drafts, and the drafter is the first thing
+  to block on any of them — so a partial-accept round's second weight read lands
+  in the *next* round's `draft_ms`. Measured on the three loops below.
 
 Per-round attribution comes from the `speculative round` event, target
 `rmlx::spec::phase`, one per round at `debug`, emitted by one shared
-`RoundPhases::log` so the two loops cannot drift into two record shapes:
+`RoundPhases::log` so the three loops cannot drift into three record shapes:
 
 ```
 loop_kind round accept num_draft replayed charged
@@ -295,10 +296,39 @@ charged run's `round_ms` against an uncharged one's before trusting either.
 record.** `phases_charged()` is read at the loop head and passed down — to
 `rollback_round_caches` as an argument, and onto `RoundStats::charged`, which
 every loop's `done` line carries. Two things depend on that.
-`rollback_round_caches` is shared by six loops and only two of them time their
-phases; a switch it read on its own behalf would change how the other four
+`rollback_round_caches` is shared by seven loops and only three of them time
+their phases; a switch it read on its own behalf would change how the other four
 schedule work, with nothing on their records saying so — they pass `false` and
 report `charged=false`.
+
+**Charging is a hand-written list, so a charged round is checked rather than
+trusted.** Each loop forces the things it produces, one call at a time, and the
+way that fails is by omission: four of the five arrays a round builds get forced
+and the fifth is still a graph node when the next round's drafter reads it. No
+timing assertion can see that, because the number it produces is a plausible
+one. `RoundPhases::log` therefore takes the arrays the round hands to its
+successor, under the names the loop calls them, and on a charged round reports
+any that are still unevaluated — `Array::is_available`, which asks MLX for the
+array's status rather than inferring it from a clock. The three omissions it
+now covers are described below. The check cannot tell whether a loop declared
+everything it carries; what it removes is the case where the declaration was
+right and the forcing was missing. **The standing check is a charged run with no
+`still unevaluated` line in it** — grep the run log for that phrase after any
+change to a round loop's phase spans.
+
+**Which loops this covers.** Three of the seven time their phases and can be
+charged: the Gemma4 MTP assistant, the Qwen3.5-family MTP sidecar and DFlash 2.
+The other four — DFlash 1, EAGLE-3 and the two two-model loops — keep only the
+request-level `draft_ms` and `verifier_ms`, pass `false` to
+`rollback_round_caches` and report `charged=false`, so **their drafter figure
+carries the same inflation and no setting corrects it**. DFlash 1's round has
+the same four phases as DFlash 2's and giving it the instrument is a port of
+that one. EAGLE-3's is not: its drafter re-runs over the accepted prefix in a
+fifth phase (`accept_and_reseed`), whose read-back of the reseed token is what
+forces that round's capture, so its capture lands in the residual rather than in
+the drafter and the four-phase record has no slot for the phase that pays it.
+Deciding where that phase goes is a change to the record's shape for every loop,
+not a port.
 
 And a charged request's `verifier_ms`, `loop_ms_per_round` and `decode_tps`
 describe a differently scheduled engine. `scripts/lib/spec_round_log.py` reads
@@ -312,6 +342,67 @@ enough on its own — `RUST_LOG` takes precedence over the `--log` preset
 (`crates/rmlx-cli/src/startup.rs`), so an ambient
 `RUST_LOG=info,rmlx::spec::phase=trace` reaches a bench run that never asked for
 it. Unset it before benching.
+
+#### What the charge moves, measured
+
+Milliseconds per round, meaned over every round the measured requests logged.
+`release-perf`, M5 Max, `--kv-quant none --max-ctx 8192`, temperature 0, seed
+42, 128 max tokens, one warmup and three measured requests per reading, each
+uncharged/charged pair taken back to back on the same binary.
+
+| Loop, verifier + drafter, block | rounds | | round | draft | verify | walk | rollback | other |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| DFlash 2, Qwen3.8-27B-4bit + 27B-DFlash2, 5 | 120 | uncharged | 106.23 | 22.98 | 58.78 | 0.00 | 24.33 | 0.14 |
+| | | charged | 107.93 | 20.88 | 57.38 | 0.00 | 29.01 | 0.67 |
+| MTP sidecar, Qwen3.8-27B-4bit + 27B-MTP-4bit, 3 | 213 | uncharged | 65.89 | 7.36 | 39.75 | 0.00 | 18.72 | 0.05 |
+| | | charged | 70.62 | 4.66 | 41.26 | 0.00 | 24.56 | 0.14 |
+| MTP assistant, gemma-4-e2b-it-mxfp8 + E2B-assistant-bf16, 6 | 114 | uncharged | 18.94 | 4.75 | 14.05 | 0.00 | 0.01 | 0.13 |
+| | | charged | 18.67 | 4.39 | 13.95 | 0.00 | 0.26 | 0.07 |
+
+**The uncharged drafter figure is not the drafter.** It is over-reported by 10%
+on DFlash 2, by 58% on the MTP sidecar and by 8% on the assistant, against the
+charged figure for the same configuration. The gap between the two sidecar
+drafters is where it matters: read uncharged, DFlash 2 drafts for 3.1× what the
+MTP sidecar does; read charged, 4.5×. An earlier revision of this document said
+the uncharged ratio *overstated* that gap. It understates it, and by more than
+the gap the two loops were being compared on.
+
+**The mechanism, isolated within one run.** Group a round's `draft_ms` by
+whether the *previous* round took the rollback replay. Uncharged, DFlash 2
+drafts for 24.09 ms after a replay against 20.33 ms after a full accept, and the
+sidecar 8.55 against 4.12 — the previous round's replay, paid inside this
+round's drafting. Charged, those differences are 0.35 ms and 0.004 ms. The
+comparison is between two figures from one run, so it does not depend on the
+host being quiet. The assistant loop is full attention and replayed on none of
+its 114 rounds, which is why its gap is the smallest of the three and is the
+K/V trim rather than a replay.
+
+**Three omissions in the charge, each now inside that check.** The MTP sidecar
+charged its rollback and never its capture: before that was fixed, a charged run's
+`verify_ms` was indistinguishable from an uncharged one's (39.97 against 40.48,
+the wrong way round), and the conditioning slice the next round's drafter reads
+was unevaluated on every charged round. It now rises by 1.51 ms when the
+drafter's figure falls, which is what the capture costs. DFlash 2 charged its
+capture but not the context it extends with it — a copy of every row the
+drafter's window reaches back over, which is why its charged `other_ms` is 0.67
+against the sidecar's 0.14. The assistant left the final-normed conditioning
+hidden lazy beside the K/V trim it already forced.
+
+**Charging costs the loop something, and how much is not uniform.** Round total
+moves +1.6% on DFlash 2, +7.2% on the sidecar and −1.4% on the assistant. That
+is the drained pipeline, and it is the reason a charged row is not a throughput
+row and the bench refuses to file one.
+
+**TAINTED: the host was not idle.** Other agents' CPU-only work ran throughout;
+the one-minute load average ranged 4.3 to 16.0 across the readings. There was no
+GPU contention — the single-MLX claim was held for every reading and never
+bypassed, and no other MLX process was alive. Thermal state was sampled with
+`pmset -g therm` before and after every reading and recorded no thermal,
+performance or CPU-power warning at any sample; that is the scheduler's
+advertised limits rather than a die temperature, and it is the weakest leg here.
+The per-round *shares* and the within-run replay grouping survive this; the
+absolute round totals should not be compared against readings from another
+session.
 
 ## Per-drafter Deep Dive
 
@@ -1353,19 +1444,18 @@ decode step** where the bandwidth roofline is nearer 4%. That is the ceiling
 every speculative arm on this machine meets, and this is a third drafter kind
 measuring it.
 
-**Those `draft ms` figures are upper bounds, and the sidecar's are less so.**
-Every row carries `charged=false`, which means each phase is timed but not
-forced, and this engine evaluates lazily. The verify forward produces two
-outputs: the logits, which the argmax reads back inside the verify span, and the
-conditioning capture, which hangs off the same forward and stays unevaluated
-until the next round's drafter call touches it — inside `draft ms`. Both sidecar
-loops have the same shape, but this drafter's capture is
-`len(target_layer_ids) = 5` times as wide as the MTP sidecar's single hidden, so
-the two columns are skewed by different amounts and the ratio between them
-overstates the gap. `RUST_LOG=rmlx::spec::phase=trace` forces each phase's work
-before its span closes and re-attributes the capture; those rows carry
-`charged=true` and describe a differently scheduled engine, which is why they are
-not these. Before optimising against this split, take it charged.
+**Those `draft ms` figures are upper bounds, and the sidecar's are the looser
+of the two.** Every row carries `charged=false`, which means each phase is timed
+but not forced, and this engine evaluates lazily, so the previous round's
+rollback replay and conditioning work are paid inside the next round's `draft
+ms`. Both sidecar loops have that shape and the sidecar has it worse: § "What
+the charge moves, measured" prices the same two configurations charged, and the
+`draft ms` ratio between them goes from 3.1× to 4.5×. It was expected to go the
+other way, on the reasoning that this drafter's capture is
+`len(target_layer_ids) = 5` times as wide as the MTP sidecar's single hidden and
+so skews its column more. The capture is real but small — 1.51 ms per round on
+the sidecar; what dominates is the rollback replay, and the sidecar replays on
+73% of its rounds. Before optimising against this split, take it charged.
 
 Drafting costs 19.5–24.4 ms per round almost independently of block and of
 prompt, against the sidecar's 5.9–6.9 ms. Two costs the port does not pay down

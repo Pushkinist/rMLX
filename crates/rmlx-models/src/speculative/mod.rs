@@ -1821,8 +1821,8 @@ pub(crate) fn accept_prefix(
 ///
 /// `charge` is the calling loop's per-request answer from
 /// [`phases_charged`], not a decision this function makes. Seven loops share it
-/// and two of them time their phases; reading the switch here would change the
-/// schedule of the other five with nothing on their records saying so.
+/// and three of them time their phases; reading the switch here would change the
+/// schedule of the other four with nothing on their records saying so.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,

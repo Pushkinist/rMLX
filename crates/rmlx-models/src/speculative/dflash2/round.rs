@@ -382,6 +382,15 @@ pub fn dflash2_generate(
             device,
         )?;
         h_ctx = drafter.extend_conditioning(&h_ctx, &committed_hidden)?;
+        if charge_phases {
+            // Extending the context copies every row the drafter's window
+            // reaches back over, at `len(target_layer_ids)` times the hidden
+            // width, and the next round's drafter is the first thing to read
+            // it. Forced here it lands in the round's unclaimed time, which is
+            // where slicing and bookkeeping belong; left lazy it lands in the
+            // drafter. See `phases_charged`.
+            h_ctx.eval()?;
+        }
         b = *new_tokens.last().unwrap_or(&b);
 
         tracing::debug!(
@@ -405,7 +414,13 @@ pub fn dflash2_generate(
             replayed,
             charged: charge_phases,
         }
-        .log(SpecLoop::DFlash2, rounds, accept, draft_tokens.len());
+        .log(
+            SpecLoop::DFlash2,
+            rounds,
+            accept,
+            draft_tokens.len(),
+            &[("h_ctx", &h_ctx)],
+        );
     }
 
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();
