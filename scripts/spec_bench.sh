@@ -93,7 +93,11 @@ SEED=42
 # not read from here — the round loop names its own cell and this script records
 # what it said (see the `decode_config` the log carries).
 DRAFT_KIND="mtp"
-DRAFT_BLOCK_SIZE=5
+# Empty means "let the engine resolve one", which it does from the drafter's own
+# declared depth and the serve default, and names on its startup line. A number
+# here would be a second producer of that resolution, and a bench recorded under
+# a block the engine would not otherwise have run is a row about this script.
+DRAFT_BLOCK_SIZE=""
 # Empty means "let the engine resolve one", which it always does and always
 # names in its startup log. Either way the recorded kv_quant is read back from
 # that log, never assumed here. Set with --kv-quant.
@@ -110,6 +114,7 @@ CROSS_CHECK_BAND_PCT=10
 DRY_RUN=false
 BENCH_TAG=""
 KV_QUANT_ARGS=()
+DRAFT_BLOCK_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=true; shift ;;
@@ -143,10 +148,13 @@ if ! [[ "${DRAFT_KIND}" =~ ^[a-z0-9_]+$ ]]; then
     exit 1
 fi
 
-if ! [[ "${DRAFT_BLOCK_SIZE}" =~ ^[0-9]+$ ]] || (( DRAFT_BLOCK_SIZE < 2 )); then
-    echo "ERROR: --draft-block-size '${DRAFT_BLOCK_SIZE}' must be an integer >= 2:" \
-         "a block of 1 leaves no room for a draft token" >&2
-    exit 1
+if [[ -n "${DRAFT_BLOCK_SIZE}" ]]; then
+    if ! [[ "${DRAFT_BLOCK_SIZE}" =~ ^[0-9]+$ ]] || (( DRAFT_BLOCK_SIZE < 2 )); then
+        echo "ERROR: --draft-block-size '${DRAFT_BLOCK_SIZE}' must be an integer >= 2:" \
+             "a block of 1 leaves no room for a draft token" >&2
+        exit 1
+    fi
+    DRAFT_BLOCK_ARGS=(--draft-block-size "${DRAFT_BLOCK_SIZE}")
 fi
 
 if [[ -n "${KV_QUANT}" ]]; then
@@ -731,7 +739,7 @@ echo ""
 
 # ── Phase 2: speculative decode ──────────────────────────────────────────────
 
-echo "==> Phase 2: speculative decode (draft_kind=${DRAFT_KIND} block_size=${DRAFT_BLOCK_SIZE})"
+echo "==> Phase 2: speculative decode (draft_kind=${DRAFT_KIND} block_size=${DRAFT_BLOCK_SIZE:-engine})"
 echo ""
 
 preflight
@@ -745,7 +753,7 @@ RMLX_LOG_CAP_MB=200 \
         --model "${VERIFIER_MODEL}" \
         --draft-model "${DRAFTER_MODEL}" \
         --draft-kind "${DRAFT_KIND}" \
-        --draft-block-size "${DRAFT_BLOCK_SIZE}" \
+        ${DRAFT_BLOCK_ARGS[@]+"${DRAFT_BLOCK_ARGS[@]}"} \
         ${KV_QUANT_ARGS[@]+"${KV_QUANT_ARGS[@]}"} \
         --max-ctx "${MAX_CTX}" \
         --port "${PORT}" \
