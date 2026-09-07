@@ -709,3 +709,15 @@ fn eagle3_drafter_cache_sized_from_max_seq_decodes_past_4096() {
         "cache must decode past 4096 without error"
     );
 }
+
+/// The block is the narrowest of the request, the checkpoint and the ceiling.
+#[test]
+fn the_round_block_is_bounded_by_the_request_the_checkpoint_and_the_ceiling() {
+    const CEILING: usize = crate::speculative::MAX_BLOCK_SIZE;
+    assert_eq!(eagle3_round_block_total(4, 8), 4);
+    assert_eq!(eagle3_round_block_total(8, 4), 4);
+    assert_eq!(eagle3_round_block_total(CEILING + 1, usize::MAX), CEILING);
+    assert_eq!(eagle3_round_block_total(usize::MAX, usize::MAX), CEILING);
+    assert_eq!(eagle3_round_block_total(1, 8), 2);
+    assert_eq!(eagle3_round_block_total(8, 1), 2);
+}

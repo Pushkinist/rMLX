@@ -107,3 +107,16 @@ fn dflash_module_compiles() {
     let _walk = walk_block_greedy;
     let _ = (_load, _bs, _walk);
 }
+
+/// The block the schedule starts from is the narrowest of the request, the
+/// checkpoint and the ceiling.
+#[test]
+fn the_starting_block_is_bounded_by_the_request_the_checkpoint_and_the_ceiling() {
+    const CEILING: usize = crate::speculative::MAX_BLOCK_SIZE;
+    assert_eq!(dflash_round_block_total(4, 16), 4);
+    assert_eq!(dflash_round_block_total(16, 4), 4);
+    assert_eq!(dflash_round_block_total(CEILING + 1, usize::MAX), CEILING);
+    assert_eq!(dflash_round_block_total(usize::MAX, usize::MAX), CEILING);
+    assert_eq!(dflash_round_block_total(1, 16), 2);
+    assert_eq!(dflash_round_block_total(16, 1), 2);
+}

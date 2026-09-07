@@ -520,6 +520,7 @@ impl SpeculativeDispatcher {
         if k == 0 {
             return Err(Error::Model("spec_generate_greedy: k must be >= 1".into()));
         }
+        let k = two_model_drafts_per_round(k);
         if n_tokens == 0 {
             return Ok(vec![]);
         }
@@ -1766,6 +1767,18 @@ pub(crate) fn argmax_tokens(bytes: &[u8], k: usize) -> Result<Vec<u32>> {
         .take(k)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
+}
+
+/// How many tokens a two-model round drafts, bounded by what one verify forward
+/// can score.
+///
+/// This loop takes a draft count where the sidecar loops take a block; the round
+/// verifies the carry token and every draft in one un-chunked pass, so the two
+/// are the same quantity offset by one and take the same ceiling. Clamped rather
+/// than refused, because the serve layer refuses an over-wide request at parse
+/// time and this is the loop's own guard against a caller that is not it.
+pub(crate) fn two_model_drafts_per_round(k: usize) -> usize {
+    k.min(MAX_BLOCK_SIZE - 1)
 }
 
 /// The greedy acceptance walk over one verified block.

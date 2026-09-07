@@ -1598,3 +1598,19 @@ fn a_round_tape_refolds_to_what_the_replay_produced() {
         }
     }
 }
+
+/// A two-model round drafts no more than one verify forward can score beside
+/// the carry token.
+#[test]
+fn the_two_model_draft_count_stops_at_the_verify_ceiling() {
+    assert_eq!(two_model_drafts_per_round(4), 4);
+    assert_eq!(
+        two_model_drafts_per_round(MAX_BLOCK_SIZE - 1),
+        MAX_BLOCK_SIZE - 1
+    );
+    assert_eq!(
+        two_model_drafts_per_round(MAX_BLOCK_SIZE),
+        MAX_BLOCK_SIZE - 1
+    );
+    assert_eq!(two_model_drafts_per_round(usize::MAX), MAX_BLOCK_SIZE - 1);
+}

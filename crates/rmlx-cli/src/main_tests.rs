@@ -287,3 +287,29 @@ fn kv_quant_none_matches_predicate() {
         "KvQuant::Planar must NOT match the paged-kv rejection predicate"
     );
 }
+
+/// `--draft-block-size` is refused at both ends, and told rather than clamped.
+///
+/// An operator who asked for 4096 and was quietly served 1024 would read the
+/// round's figures as belonging to the block they named. The round loops clamp
+/// as well, and that clamp is their guard against a caller that is not this one.
+#[test]
+fn a_draft_block_outside_what_a_round_can_run_is_refused_at_parse_time() {
+    use super::parse_draft_block_size;
+    const CEILING: usize = rmlx_models::speculative::MAX_BLOCK_SIZE;
+    for ok in [rmlx_server::MIN_DRAFT_BLOCK_SIZE, 5, 8, CEILING] {
+        assert_eq!(parse_draft_block_size(&ok.to_string()), Ok(ok));
+    }
+    for low in [0, rmlx_server::MIN_DRAFT_BLOCK_SIZE - 1] {
+        let msg = parse_draft_block_size(&low.to_string()).expect_err("refused");
+        assert!(msg.contains("no room for a draft token"), "{msg}");
+    }
+    for high in [CEILING + 1, 4096] {
+        let msg = parse_draft_block_size(&high.to_string()).expect_err("refused");
+        assert!(
+            msg.contains("more positions than one verify forward can score")
+                && msg.contains(&format!("max {CEILING}")),
+            "{msg}"
+        );
+    }
+}
