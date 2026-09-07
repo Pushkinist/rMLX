@@ -109,6 +109,13 @@ The property is not transitive across loops — each has its own rollback and it
 own acceptance walk, which is what the gate reads — so each of the six is its own
 pair rather than an inference from a neighbour.
 
+A pair resolves its own drafter by slug and stands down when the two halves
+declare different weight-quantization modes. `RMLX_DRAFT_TEST_MODEL` selects the
+pairs that do not run under `make gpu-test`; it does not decide which sidecar
+each of them takes, because it is one variable and they are several — three MTP
+pairs across two verifiers, whose sidecars carry the same width and the same
+tensor names and so load against either verifier and draft fluently.
+
 **Nor is it transitive across block widths.** A pair's `block` decides how many
 positions the verify forward scores in one pass, how many the acceptance walk
 reads back, and how long a rejected tail the rollback drops, so two blocks of one

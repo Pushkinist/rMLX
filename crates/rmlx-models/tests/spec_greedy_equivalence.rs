@@ -1709,7 +1709,20 @@ enum DrafterSource {
     /// Resolved by slug from `RMLX_O_MODELS_ROOT`, like the verifier — the pair
     /// runs wherever the snapshots are.
     Slug(&'static str),
-    /// Named by an operator or not run at all.
+    /// Run only when an operator asks, and then resolved by the slug named here.
+    ///
+    /// `RMLX_DRAFT_TEST_MODEL` is what asks. It is one variable and these are
+    /// several pairs, so it cannot also be what each of them resolves to: three
+    /// MTP pairs across two verifiers would all take whichever sidecar it held,
+    /// and a 4-bit sidecar loads against an mxfp8 verifier of the same width
+    /// without complaint. So the variable selects, the slug resolves, and the
+    /// path the variable holds is the fallback for a machine whose models root
+    /// does not carry the slug — checked against the verifier by
+    /// [`declared_quant_mode`] either way.
+    ///
+    /// `None` is a pair with no snapshot to name: the two-model arm's draft is a
+    /// full model of the verifier's family, and no sibling of these verifiers is
+    /// on this machine's models root, so the variable is its only handle.
     ///
     /// Its verifier drives an MLX quantized matmul whose `load_safe` bound is
     /// the one `scripts/gpu_validation_census.txt` records, so a run under Metal
@@ -1719,7 +1732,7 @@ enum DrafterSource {
     /// such a pair would make the census brittle rather than informative. Until
     /// that is settled these pairs run on request and `make gpu-test` reports
     /// them as skipped, with the variable that would run them named.
-    Named,
+    Named(Option<&'static str>),
 }
 
 /// The pair the floors were measured on: a full-attention-plus-SWA verifier
@@ -1745,7 +1758,7 @@ const MTP_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(Some("mlx-community__Qwen3.8-27B-MTP-mxfp8")),
     round_loop: RoundLoop::MtpSidecar,
     block: None,
 };
@@ -1764,7 +1777,7 @@ const MTP_4BIT_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(Some("mlx-community__Qwen3.8-27B-MTP-4bit")),
     round_loop: RoundLoop::MtpSidecar,
     block: None,
 };
@@ -1780,7 +1793,7 @@ const MTP_4BIT_PAIR: Pair = Pair {
 /// answer could move without the loop reporting anything.
 const MTP_4BIT_DEEP_PAIR: Pair = Pair {
     verifier: MTP_4BIT_PAIR.verifier,
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(Some("mlx-community__Qwen3.8-27B-MTP-4bit")),
     round_loop: RoundLoop::MtpSidecar,
     block: Some(DEEP_BLOCK),
 };
@@ -1805,7 +1818,7 @@ const DFLASH2_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(Some("z-lab__Qwen3.8-27B-DFlash2")),
     round_loop: RoundLoop::DFlash2,
     block: None,
 };
@@ -1825,7 +1838,7 @@ const DFLASH1_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(Some("z-lab__Qwen3.6-35B-A3B-DFlash")),
     round_loop: RoundLoop::DFlash1,
     block: None,
 };
@@ -1856,7 +1869,7 @@ const EAGLE3_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(Some("Dogacel__specdrift-qwen3.6-35b-a3b-eagle3")),
     round_loop: RoundLoop::Eagle3,
     block: None,
 };
@@ -1878,7 +1891,7 @@ const TWO_MODEL_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named,
+    drafter: DrafterSource::Named(None),
     round_loop: RoundLoop::TwoModelGreedy,
     block: None,
 };
@@ -1978,6 +1991,32 @@ fn declared_backbone_hidden(draft_path: &Path) -> Option<usize> {
     draft_config(draft_path)?["backbone_hidden_size"]
         .as_u64()
         .and_then(|v| usize::try_from(v).ok())
+}
+
+/// The weight-quantization mode a snapshot declares, if it declares one.
+///
+/// A sidecar is decoded through the verifier's own LM head and conditioned on
+/// its hidden states, so a pair whose halves were quantized differently is a
+/// pair in name only — and nothing downstream refuses it: both 27B sidecars
+/// carry the same width and the same tensor names, so a 4-bit one loads against
+/// an mxfp8 verifier and drafts fluently at a rate no reading here could be
+/// attributed to either checkpoint.
+///
+/// **Mode and not bits.** The shipped Qwen3.6 pair is an 8-bit verifier with a
+/// 5-bit sidecar, both affine, and it is the pair the MoE rows were measured on
+/// — so a width comparison would stand down a pairing that is real. The mode is
+/// what the two 27B pairs differ on and what nothing else separates them by.
+///
+/// `None` on either side is no opinion: the DFlash 2 and EAGLE-3 drafters
+/// declare no `quantization` block at all.
+fn declared_quant_mode(path: &Path) -> Option<String> {
+    let cfg = draft_config(path)?;
+    for at in [&cfg["quantization"], &cfg["text_config"]["quantization"]] {
+        if let Some(mode) = at["mode"].as_str() {
+            return Some(mode.to_owned());
+        }
+    }
+    None
 }
 
 /// The vocabulary a snapshot declares, from its own config or its text tower's.
@@ -2254,6 +2293,9 @@ struct Loaded {
     eos: Vec<u32>,
     /// The pair's [`Pair::block`], carried through to the round-loop call.
     block: Option<usize>,
+    /// The drafter snapshot these arms actually ran, so a reading names the
+    /// checkpoint it came from rather than the pair it was filed under.
+    drafter: std::path::PathBuf,
 }
 
 /// The verifier, and whatever drives the speculative arm against it.
@@ -2497,8 +2539,15 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
         .filter(|v| !v.is_empty());
     let draft_gate = match (&pair.drafter, named.is_some()) {
         (DrafterSource::Slug(slug), _) => resolve(DRAFT_MODEL_VAR, slug),
-        (DrafterSource::Named, true) => resolve(DRAFT_MODEL_VAR, ""),
-        (DrafterSource::Named, false) => common::Gate::Skip(format!(
+        // The variable asked for this pair; the pair says which sidecar it
+        // needs. Its own slug first, so a run with several of these selected
+        // does not hand all of them whichever one path the variable holds.
+        (DrafterSource::Named(Some(slug)), true) => match resolve("", slug) {
+            found @ common::Gate::Run { .. } => found,
+            common::Gate::Skip(_) | common::Gate::Fail(_) => resolve(DRAFT_MODEL_VAR, ""),
+        },
+        (DrafterSource::Named(None), true) => resolve(DRAFT_MODEL_VAR, ""),
+        (DrafterSource::Named(_), false) => common::Gate::Skip(format!(
             "{DRAFT_MODEL_VAR} is unset and this pair's drafter is not resolved by \
              slug — see the DrafterSource::Named note for why"
         )),
@@ -2516,6 +2565,23 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
         }
     }
     let model_path = common::model_for(&pair.verifier, test)?;
+    // A drafter quantized differently from its verifier is not this pair, and
+    // nothing downstream says so — see `declared_quant_mode`.
+    match (
+        declared_quant_mode(&draft_path),
+        declared_quant_mode(&model_path),
+    ) {
+        (Some(d), Some(v)) if d != v => {
+            eprintln!(
+                "SKIP {test}: {} is quantized {d} and {} is quantized {v}, so the two \
+                 are not this pair",
+                draft_path.display(),
+                model_path.display(),
+            );
+            return None;
+        }
+        _ => {}
+    }
     // The two-model loop's kind is an inference from the architecture registry,
     // so a full model of any family declares itself this pair's drafter. The
     // vocabulary is what separates them, and reading it here stands a mismatched
@@ -2564,6 +2630,7 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
         tokenizer,
         eos,
         block: pair.block,
+        drafter: draft_path,
     })
 }
 
@@ -2699,6 +2766,7 @@ fn report(
     test: &str,
     prompt: &Prompt,
     block: usize,
+    drafter: &Path,
     tk: &tokenizers::Tokenizer,
     spec: &[u32],
     plain: &[u32],
@@ -2726,12 +2794,16 @@ fn report(
         None => String::new(),
     };
     eprintln!(
-        "[{test}/{}] block={block} lcs={:.4} tail={tail_ratio:.4}@{tail_start} divergence={div} \
+        "[{test}/{}] block={block} drafter={} lcs={:.4} tail={tail_ratio:.4}@{tail_start} divergence={div} \
          margin={:.4} confidence={confidence:.4}{outside} \
          cycle spec={spec_cycle:.4}/p{spec_period}@{spec_from} \
          plain={plain_cycle:.4}/p{plain_period}@{plain_from} spec={} plain={}\n  \
          verdict = {verdict:?}\n  spec  = {:?}\n  plain = {:?}",
         prompt.name,
+        drafter
+            .file_name()
+            .unwrap_or(drafter.as_os_str())
+            .to_string_lossy(),
         lcs_ratio(spec, plain),
         margins.get(div).copied().unwrap_or(f32::NAN),
         spec.len(),
@@ -2903,6 +2975,7 @@ fn run_gate(test: &str, pair: &Pair) {
             test,
             prompt,
             block,
+            &loaded.drafter,
             &loaded.tokenizer,
             &spec,
             &plain,
