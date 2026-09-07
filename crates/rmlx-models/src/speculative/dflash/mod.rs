@@ -32,7 +32,7 @@
 //! `norm`, all 8 `DFlashDecoderLayer`s, **YARN RoPE** ([`crate::rope::compute_yarn_freqs`]),
 //! the drafter forward [`DFlashDrafter::draft_block`], the block-size schedule
 //! [`dflash_next_block_size`], the acceptance walk [`walk_block_greedy`], the
-//! [`DFlashRoundState`] GDN rollback, and the full round-loop
+//! GDN rollback, and the full round-loop
 //! [`dflash_generate`]. The three verifier-side seams are wired on
 //! [`crate::arch::Architecture`] for the Qwen3.6-MoE verifier:
 //!
@@ -542,56 +542,6 @@ impl DFlashDrafter {
     }
 }
 
-/// Per-generation GDN rollback bookkeeping for the DFlash round loop.
-///
-/// Wraps the verifier's `LinearAttnCache` snapshot/restore round-trip: take a
-/// snapshot of every GDN cache before a draft round, restore them on partial
-/// acceptance. This is the GDN-aware analogue of the Gemma4 spec path's
-/// `KvCache::truncate_to` rollback — GDN recurrent state has no sequence axis,
-/// so it cannot be truncated (see `linear_attn.rs`).
-#[allow(
-    clippy::exhaustive_structs,
-    reason = "internal closed rollback-state struct — private snapshots field; public API is snapshot() and restore_if_partial(); adding a field requires updating snapshot() and restore_if_partial()"
-)]
-#[allow(missing_debug_implementations)]
-pub struct DFlashRoundState {
-    /// Snapshot of each GDN cache taken at round start (index-aligned with the
-    /// verifier's linear-attention caches).
-    snapshots: Vec<LinearAttnCache>,
-}
-
-impl DFlashRoundState {
-    /// Snapshot all GDN caches before a draft round.
-    pub fn snapshot(lin_caches: &[LinearAttnCache]) -> Result<Self> {
-        let snapshots = lin_caches
-            .iter()
-            .map(|c| c.snapshot())
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self { snapshots })
-    }
-
-    /// Number of GDN caches snapshotted.
-    pub fn len(&self) -> usize {
-        self.snapshots.len()
-    }
-
-    /// True when no GDN cache was snapshotted (non-GDN verifier).
-    pub fn is_empty(&self) -> bool {
-        self.snapshots.is_empty()
-    }
-
-    /// Consume the round state and hand back the per-layer snapshots.
-    ///
-    /// Restoring them is only one third of a partial-accept rollback — it also
-    /// has to roll the KV caches back and replay the retained prefix through
-    /// them — so the snapshots are handed to the shared rollback rather than
-    /// restored here (mirrors `lm.rollback_speculative_cache` followed by the
-    /// next round's verify in `_dflash_rounds`).
-    pub fn into_snapshots(self) -> Vec<LinearAttnCache> {
-        self.snapshots
-    }
-}
-
 /// One greedy DFlash acceptance walk over a drafted block (port of the
 /// `_speculative_walk` half of `_dflash_rounds`).
 ///
@@ -812,8 +762,8 @@ pub fn dflash_generate(
         total_draft += draft_tokens.len();
 
         // -- Phase B: verifier scores [b, draft...] + captures hidden in one pass.
-        // Snapshot GDN state before the verify forward.
-        let round_snap = DFlashRoundState::snapshot(&v_lin)?;
+        // Arm the GDN round tape before the verify forward.
+        super::arm_lin_tapes(Some(&mut v_lin));
         let mut v_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
         v_input.push(b);
         v_input.extend_from_slice(&draft_tokens);
@@ -856,8 +806,8 @@ pub fn dflash_generate(
         // -- Phase D: rollback + next-round setup. ---------------------------
         // Committed positions this round = new_tokens.len(); the verifier
         // consumed v_k positions. On partial accept (accept < bs-1) the GDN
-        // recurrent state ran ahead — restore the snapshot and replay the
-        // kept prefix so it matches the truncated KV exactly.
+        // recurrent state ran ahead — refold the kept prefix from the round tape
+        // so it matches the truncated KV exactly.
         let n_committed = new_tokens.len();
         // Read the post-verify sequence offset from a FullAttention layer:
         // GDN (linear-attn) layers never advance their KvCache::offset (it
@@ -874,10 +824,8 @@ pub fn dflash_generate(
         if v_target < v_offset_before {
             let v_pre_round_offset = v_offset_before - v_k as i32;
             super::rollback_round_caches(
-                verifier,
                 &mut v_caches,
                 Some(&mut v_lin),
-                Some(round_snap.into_snapshots()),
                 &v_input,
                 v_pre_round_offset,
                 v_target,
@@ -886,8 +834,8 @@ pub fn dflash_generate(
                 device,
             )?;
         } else {
-            // Full accept — GDN already correct; drop the snapshot.
-            drop(round_snap);
+            // Full accept — GDN already correct; drop the tape.
+            super::disarm_lin_tapes(Some(&mut v_lin));
         }
 
         // Append this round's committed verifier hidden to the accumulated

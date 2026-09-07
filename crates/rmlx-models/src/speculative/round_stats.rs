@@ -180,10 +180,10 @@ pub(crate) const PHASE_TARGET: &str = "rmlx::spec::phase";
 ///
 /// The phase spans wrap call sites and this engine evaluates lazily, so a
 /// call's work is paid wherever the next blocking evaluation falls — not
-/// necessarily in the phase that issued it. The rollback replay is the clear
-/// case: its output is discarded and the state it writes is not read until the
-/// next round's verify forward, so with nothing forcing it the whole replay is
-/// billed to that round's verify span.
+/// necessarily in the phase that issued it. The rollback is the clear case: the
+/// recurrent state it refolds is not read until the next round's verify forward,
+/// so with nothing forcing it the whole refold is billed to that round's verify
+/// span.
 ///
 /// At TRACE on [`PHASE_TARGET`] each phase forces its own work before its span
 /// closes and the split becomes attributable. It is then also a different,
@@ -252,11 +252,11 @@ pub(crate) struct RoundPhases {
     /// Time inside the acceptance walk.
     pub(crate) walk_ns: u128,
     /// Time inside the rollback: cache truncation and, on a recurrent
-    /// verifier, the replay.
+    /// verifier, the refold of the accepted prefix.
     pub(crate) rollback_ns: u128,
-    /// Whether the round took the recurrent replay arm of
+    /// Whether the round took the recurrent refold arm of
     /// [`super::rollback_round_caches`].
-    pub(crate) replayed: bool,
+    pub(crate) refolded: bool,
     /// Whether the phases were charged for the work they issued.
     pub(crate) charged: bool,
 }
@@ -325,7 +325,7 @@ impl RoundPhases {
                 round,
                 accept,
                 num_draft,
-                replayed = self.replayed,
+                refolded = self.refolded,
                 charged = self.charged,
                 round_ms = ms(self.round_ns),
                 draft_ms = ms(self.draft_ns),
@@ -343,7 +343,7 @@ impl RoundPhases {
             round,
             accept,
             num_draft,
-            replayed = self.replayed,
+            refolded = self.refolded,
             charged = self.charged,
             round_ms = ms(self.round_ns),
             draft_ms = ms(self.draft_ns),

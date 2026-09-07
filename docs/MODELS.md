@@ -1419,8 +1419,8 @@ Properties:
   (e.g. 5 layers for Qwen3.6-MoE), projects the concatenation `5H → H` through
   the drafter `fc`.
 - **Adaptive block size.** Grows/shrinks based on acceptance history.
-- **GDN-aware rollback.** Snapshot/restore of `LinearAttnCache` + prefix replay
-  on partial acceptance.
+- **GDN-aware rollback.** A round tape over the `LinearAttnCache` stack, refolded
+  over the accepted prefix on partial acceptance.
 - **YARN RoPE** in the drafter layers (required for numeric alignment).
 - Target verifier: `Qwen3_5Moe` (`Architecture::forward_verify_capture`,
   `embed_tokens_raw`, `logits_from_hidden`).
@@ -1450,7 +1450,7 @@ Properties:
   concatenated hidden and the final RMSNorm'd hidden in one cached pass;
   `hot_logits_from_final_hidden` then computes restricted-vocab logits against
   only the `hot_ids` rows of the LM head.
-- **GDN rollback** reuses `DFlashRoundState` infrastructure.
+- **GDN rollback** reuses the shared round tape (`GdnTape`).
 - Target verifier: `Qwen3_5Moe`.
 - Status: reference-alignment pass complete (three structural divergences from
   mlx-vlm patched). Measured accept rate 0.263-0.362 against the

@@ -48,11 +48,10 @@ use rmlx_mlx::{Array, Device};
 use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
-use crate::speculative::dflash::DFlashRoundState;
 use crate::speculative::{
-    accept_prefix, emit_step, guard_verifier_prefill_logits, phases_charged, rollback_round_caches,
-    verifier_context, verifier_kv_bytes, DecodeWindow, RoundPhases, RoundStats, SpecLoop,
-    VerifierDraw,
+    accept_prefix, arm_lin_tapes, disarm_lin_tapes, emit_step, guard_verifier_prefill_logits,
+    phases_charged, rollback_round_caches, verifier_context, verifier_kv_bytes, DecodeWindow,
+    RoundPhases, RoundStats, SpecLoop, VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -296,7 +295,7 @@ pub fn dflash2_generate(
 
         // The verifier scores the carry token and every proposal in one pass,
         // capturing the conditioning hidden for the same positions.
-        let round_snap = DFlashRoundState::snapshot(&v_lin)?;
+        arm_lin_tapes(Some(&mut v_lin));
         let mut v_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
         v_input.push(b);
         v_input.extend_from_slice(&draft_tokens);
@@ -353,14 +352,12 @@ pub fn dflash2_generate(
         let t0 = Instant::now();
         let v_offset_before = v_caches.iter().map(KvCache::offset).max().unwrap_or(0);
         let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
-        let replayed = v_target < v_offset_before;
-        if replayed {
+        let refolded = v_target < v_offset_before;
+        if refolded {
             let v_pre_round_offset = v_offset_before - v_k as i32;
             rollback_round_caches(
-                verifier,
                 &mut v_caches,
                 Some(&mut v_lin),
-                Some(round_snap.into_snapshots()),
                 &v_input,
                 v_pre_round_offset,
                 v_target,
@@ -368,7 +365,7 @@ pub fn dflash2_generate(
                 device,
             )?;
         } else {
-            drop(round_snap);
+            disarm_lin_tapes(Some(&mut v_lin));
         }
         let round_rollback_ns = t0.elapsed().as_nanos();
 
@@ -411,7 +408,7 @@ pub fn dflash2_generate(
             verify_ns: round_verify_ns,
             walk_ns: round_walk_ns,
             rollback_ns: round_rollback_ns,
-            replayed,
+            refolded,
             charged: charge_phases,
         }
         .log(

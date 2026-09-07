@@ -13,7 +13,8 @@
 //!   update + SDPA dispatch.
 //! * `storage` — `QuantK` / `QuantV` / `QuantPlanarV` / `KvStorage` enum.
 //! * `kvcache` — `KvCache`, the per-layer cache struct.
-//! * `linear_attn` — `LinearAttnCache`, recurrent state for GatedDeltaNet.
+//! * `linear_attn` — `LinearAttnCache`, recurrent state for GatedDeltaNet, and
+//!   the `GdnTape` a speculative round arms to roll that state back.
 //! * `paged` — paged-KV block table + page allocator.
 //!
 //! Higher-level wiring (`KvQuant`, `KvCacheBuilder`, SSD spill/hydrate, arch
@@ -117,7 +118,7 @@ pub mod turboquant_msl;
 // than opening the whole module: the rest of `flash_decode_common` is internal.
 pub use flash_decode_common::VMirror;
 pub use kvcache::{KvCache, SharedKv};
-pub use linear_attn::LinearAttnCache;
+pub use linear_attn::{GdnTape, GdnTapeSegment, LinearAttnCache};
 pub use quant::{
     validate_mixed_side, validate_rotor_k_asym_v, KvQuant, KvQuantParseError, ALL_KV_QUANTS,
     KV_MAX_SEQ_DEFAULT,

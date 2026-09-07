@@ -517,7 +517,7 @@ fn phases(round_ns: u128, draft_ns: u128, verify_ns: u128) -> super::RoundPhases
         verify_ns,
         walk_ns: 1_000_000,
         rollback_ns: 2_000_000,
-        replayed: true,
+        refolded: true,
         charged: true,
     }
 }
@@ -549,7 +549,7 @@ fn a_round_with_one_phase_and_nothing_else_claims_all_of_it() {
         verify_ns: 0,
         walk_ns: 0,
         rollback_ns: 0,
-        replayed: false,
+        refolded: false,
         charged: false,
     };
     assert_eq!(p.unclaimed_ns(), Some(0));
@@ -652,7 +652,7 @@ fn charged_round(charged: bool) -> super::RoundPhases {
         verify_ns: 4_000_000,
         walk_ns: 1_000_000,
         rollback_ns: 1_000_000,
-        replayed: false,
+        refolded: false,
         charged,
     }
 }

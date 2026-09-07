@@ -43,13 +43,13 @@ use std::path::Path;
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{argmax, Array, Device, Dtype};
+use rmlx_mlx::{argmax, concatenate, Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 pub use draft_kind::{Declared, DraftKind};
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+use rmlx_kv_quant::{GdnTape, GdnTapeSegment, KvCache, KvQuant, LinearAttnCache};
 pub(crate) use round_stats::{phases_charged, RoundPhases, RoundStats, SpecLoop};
 
 /// Resolve the context bounds a speculative pair runs under.
@@ -714,16 +714,13 @@ impl SpeculativeDispatcher {
             // -- GDN rollback prep. ------------------------------------
             // The GatedDeltaNet recurrent state has NO sequence axis, so
             // `KvCache::truncate_to` cannot roll it back to an intermediate
-            // position on partial acceptance. We snapshot the pre-round GDN
-            // state for both models here. On partial acceptance the state is
-            // restored from the snapshot and then re-advanced ("replay") over
-            // the kept tokens with a single forward, leaving the GDN state
-            // exactly consistent with the truncated KvCache. On full
-            // acceptance no rollback is needed (state is already correct).
-            // Snapshots are deep clones of the small fixed-shape conv/delta
-            // tensors — cheap relative to a verifier forward.
-            let verifier_lin_snap = snapshot_lin(verifier_lin.as_deref())?;
-            let draft_lin_snap = snapshot_lin(draft_lin.as_deref())?;
+            // position on partial acceptance. Arm a round tape on both models
+            // instead: their forwards record the recurrence inputs, and a
+            // partial acceptance refolds the accepted prefix from those. The
+            // drafter takes one forward per drafted token, so its tape
+            // accumulates across the round.
+            arm_lin_tapes(verifier_lin.as_deref_mut());
+            arm_lin_tapes(draft_lin.as_deref_mut());
 
             // -- Phase A: draft generates `num_draft` tokens via cache. -
             let t0 = Instant::now();
@@ -829,15 +826,12 @@ impl SpeculativeDispatcher {
             let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
             // On a PARTIAL accept the KV keeps `v_target` positions and the GDN
             // recurrent state — which advanced by `v_k` and cannot be sliced —
-            // is rebuilt from the pre-round snapshot by replaying the retained
-            // prefix through the real caches. On a FULL accept nothing was
-            // dropped and the snapshot is discarded.
+            // is refolded from the round tape over the retained prefix. On a
+            // FULL accept nothing was dropped and the tape is discarded.
             if v_target < v_offset_before {
                 rollback_round_caches(
-                    &self.verifier,
                     &mut verifier_caches,
                     verifier_lin.as_deref_mut(),
-                    verifier_lin_snap,
                     &v_input,
                     v_offset_before - v_k as i32,
                     v_target,
@@ -846,7 +840,7 @@ impl SpeculativeDispatcher {
                     device,
                 )?;
             } else {
-                drop(verifier_lin_snap);
+                disarm_lin_tapes(verifier_lin.as_deref_mut());
             }
 
             // Draft cache: it processed num_draft tokens (1 carry + K-1
@@ -860,8 +854,9 @@ impl SpeculativeDispatcher {
             let d_target = d_offset_before - d_drop;
             // `draft_decode_n` fed `d_seed ++ draft_tokens[..num_draft-1]`
             // (each step's input is the prior step's output; the last output is
-            // never fed back), so that is the token sequence the rollback
-            // replays the retained prefix of.
+            // never fed back), so that is the token sequence the rollback keeps
+            // the retained prefix of — and the length its accumulated tape has
+            // to match.
             if d_target < d_offset_before {
                 let mut d_fed: Vec<u32> = Vec::with_capacity(d_seed.len() + draft_tokens.len());
                 d_fed.extend_from_slice(&d_seed);
@@ -870,10 +865,8 @@ impl SpeculativeDispatcher {
                 }
                 let d_pre_round_offset = d_offset_before - d_fed.len() as i32;
                 rollback_round_caches(
-                    draft,
                     &mut draft_caches,
                     draft_lin.as_deref_mut(),
-                    draft_lin_snap,
                     &d_fed,
                     d_pre_round_offset,
                     d_target,
@@ -882,7 +875,7 @@ impl SpeculativeDispatcher {
                     device,
                 )?;
             } else {
-                drop(draft_lin_snap);
+                disarm_lin_tapes(draft_lin.as_deref_mut());
             }
 
             // Setup next round's carry tokens. Verifier carry is always
@@ -1113,8 +1106,8 @@ impl SpeculativeDispatcher {
             let remaining = n_tokens - emitted.len();
             let num_draft = remaining.min(k).max(1);
 
-            let verifier_lin_snap = snapshot_lin(verifier_lin.as_deref())?;
-            let draft_lin_snap = snapshot_lin(draft_lin.as_deref())?;
+            arm_lin_tapes(verifier_lin.as_deref_mut());
+            arm_lin_tapes(draft_lin.as_deref_mut());
 
             // -- Phase A: draft samples `num_draft` tokens, recording q_i. ---
             let t0 = Instant::now();
@@ -1257,10 +1250,8 @@ impl SpeculativeDispatcher {
             let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
             if v_target < v_offset_before {
                 rollback_round_caches(
-                    &self.verifier,
                     &mut verifier_caches,
                     verifier_lin.as_deref_mut(),
-                    verifier_lin_snap,
                     &v_input,
                     v_offset_before - v_k as i32,
                     v_target,
@@ -1269,7 +1260,7 @@ impl SpeculativeDispatcher {
                     device,
                 )?;
             } else {
-                drop(verifier_lin_snap);
+                disarm_lin_tapes(verifier_lin.as_deref_mut());
             }
 
             let d_offset_before = draft_caches.iter().map(KvCache::offset).max().unwrap_or(0);
@@ -1283,10 +1274,8 @@ impl SpeculativeDispatcher {
                 }
                 let d_pre_round_offset = d_offset_before - d_fed.len() as i32;
                 rollback_round_caches(
-                    draft,
                     &mut draft_caches,
                     draft_lin.as_deref_mut(),
-                    draft_lin_snap,
                     &d_fed,
                     d_pre_round_offset,
                     d_target,
@@ -1295,7 +1284,7 @@ impl SpeculativeDispatcher {
                     device,
                 )?;
             } else {
-                drop(draft_lin_snap);
+                disarm_lin_tapes(draft_lin.as_deref_mut());
             }
 
             v_carry = vec![next_y_token];
@@ -1578,23 +1567,28 @@ fn prefill_chunked_with(
     Ok(())
 }
 
-/// Deep-clone snapshot of a per-layer GDN recurrent-state slice, if present.
+/// Arm a round tape on every recurrent cache in `lin`, discarding whatever the
+/// previous round left on it.
 ///
-/// Returns `None` for FullAttention-only archs (no `lin_caches`). The clone
-/// is a fixed-shape conv/delta tensor pair per layer — cheap relative to a
-/// forward. Used by the speculative loop to capture the pre-round GDN state
-/// before draft + verifier forwards, so partial-acceptance rollback can
-/// restore + replay (the recurrent state has no sequence axis to truncate).
-fn snapshot_lin(lin: Option<&[LinearAttnCache]>) -> Result<Option<Vec<LinearAttnCache>>> {
-    match lin {
-        None => Ok(None),
-        Some(caches) => {
-            let mut snap = Vec::with_capacity(caches.len());
-            for c in caches {
-                snap.push(c.snapshot()?);
-            }
-            Ok(Some(snap))
-        }
+/// A no-op for full-attention archs, which have no recurrent caches. Call it
+/// once per round, before the forwards that round takes: every GDN forward
+/// through an armed cache records its recurrence inputs, and
+/// [`rollback_round_caches`] refolds them when the round is partly rejected.
+fn arm_lin_tapes(lin: Option<&mut [LinearAttnCache]>) {
+    for c in lin.into_iter().flatten() {
+        c.arm_tape();
+    }
+}
+
+/// Drop the round tapes on every recurrent cache in `lin`.
+///
+/// A fully accepted round keeps the state its forwards produced and has nothing
+/// to refold, so its tape is dead the moment the round ends. Holding it to the
+/// next round's arming would keep a block's worth of activations per layer alive
+/// for no reader.
+fn disarm_lin_tapes(lin: Option<&mut [LinearAttnCache]>) {
+    for c in lin.into_iter().flatten() {
+        let _ = c.take_tape();
     }
 }
 
@@ -1789,60 +1783,44 @@ pub(crate) fn accept_prefix(
 /// acceptance — both the full-attention `kv` stack and, when the arch has one,
 /// the GDN recurrent state in `lin`.
 ///
-/// `pre_round_offset` is the KV offset before this round's verify forward ran;
-/// `round_tokens` are the tokens that forward consumed, in order, so that
+/// `pre_round_offset` is the KV offset before this round's forwards ran;
+/// `round_tokens` are the tokens those forwards consumed, in order, so that
 /// `round_tokens[..target_offset - pre_round_offset]` is exactly the retained
 /// prefix.
 ///
 /// **Full-attention arch** (`lin` empty or absent): every layer's KvCache
 /// carries the whole round, so dropping the rejected tail is the entire
-/// rollback — `kv` is truncated straight to `target_offset`.
+/// rollback.
 ///
 /// **GDN hybrid**: the recurrent state has no sequence axis (see
-/// `LinearAttnCache::truncate_to`), so it cannot be sliced to an intermediate
-/// position. It is restored from the pre-round `snapshot` and replayed over the
-/// retained prefix instead. That replay runs the WHOLE layer stack, and in this
-/// hybrid the full-attention layers are interleaved between the GDN layers:
-/// their output is the residual a later GDN layer consumes. So the replay must
-/// see the real KV caches at their real sequence offsets — replaying through a
-/// fresh scratch stack makes those FA layers attend a `kept`-token prefix at
-/// positions `0..kept`, and every downstream GDN layer then advances on a wrong
-/// hidden. The rollback therefore truncates `kv` to `pre_round_offset` and
-/// replays into it; the caches land on `target_offset` exactly as the direct
-/// truncation would have, and the GDN state lands byte-consistent with them.
+/// `LinearAttnCache`), so it cannot be sliced to an intermediate position. It is
+/// rebuilt instead, from the round tape the loop armed before its forwards:
+/// the recurrence inputs at the retained positions are the ones the forward
+/// already computed, so the state is refolded by the recurrence kernel over
+/// those alone. That reads no weights and takes no second forward, which is
+/// what makes a partly-accepted round cost the same as a fully accepted one.
 ///
-/// Truncation is guarded by `offset() >= n` because a GDN layer's KvCache never
-/// advances (it stays at 0); truncating it to a positive `n` would leave it
-/// reporting positions it does not hold.
+/// The K/V stack is truncated straight to `target_offset` on both arms. A
+/// windowed layer therefore only ever has to give back this round's rejected
+/// tail, which is inside any ring's reach.
 ///
 /// Call this only when the round actually dropped positions
 /// (`target_offset < offset_before`); on a full accept there is nothing to roll
-/// back and the snapshot is simply dropped.
+/// back and the tapes are dropped with [`disarm_lin_tapes`].
 ///
 /// `charge` is the calling loop's per-request answer from
 /// [`phases_charged`], not a decision this function makes. Seven loops share it
 /// and three of them time their phases; reading the switch here would change the
 /// schedule of the other four with nothing on their records saying so.
-#[allow(clippy::too_many_arguments)]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
 fn rollback_round_caches(
-    arch: &Architecture,
     kv: &mut [KvCache],
     lin: Option<&mut [LinearAttnCache]>,
-    snapshot: Option<Vec<LinearAttnCache>>,
     round_tokens: &[u32],
     pre_round_offset: i32,
     target_offset: i32,
     charge: bool,
     device: Device,
 ) -> Result<()> {
-    let Some((lin, snapshot)) = lin.zip(snapshot).filter(|(l, _)| !l.is_empty()) else {
-        return truncate_kv_to(kv, target_offset);
-    };
-
     let kept = (target_offset - pre_round_offset).max(0) as usize;
     if kept > round_tokens.len() {
         return Err(Error::Model(format!(
@@ -1853,41 +1831,192 @@ fn rollback_round_caches(
             round_tokens.len(),
         )));
     }
-
-    // The whole verify block, not the rejected tail: the recurrent state has no
-    // sequence axis to truncate, so it is restored from the pre-round snapshot
-    // and the accepted prefix replayed into KV caches that must start where the
-    // snapshot does. A sliding-window ring cannot serve that past its wrap — it
-    // can give back a rejected tail but not the block that established its
-    // window — so this branch and a sliding layer are mutually exclusive. No
-    // architecture wired today pairs the two (`Architecture::layer_sliding_window`
-    // names only the Gemma families, and neither carries recurrent state); the
-    // first one that does lands here rather than anywhere subtler.
-    truncate_kv_to(kv, pre_round_offset).map_err(|e| {
-        Error::Model(format!(
-            "rollback_round_caches: a recurrent verifier rolls the whole verify block off \
-             and replays the accepted prefix, which a sliding-window layer cannot do past \
-             its wrap — this architecture pairs recurrent state with a windowed KV layer \
-             and the round loop has no rollback for that combination: {e}"
-        ))
-    })?;
-    for (c, snap) in lin.iter_mut().zip(snapshot) {
-        c.restore_snapshot(snap);
-    }
-    if kept == 0 {
-        // Nothing retained beyond the pre-round state — the snapshot is
-        // already the answer and the caches are already at `target_offset`.
+    truncate_kv_to(kv, target_offset)?;
+    let Some(lin) = lin.filter(|l| !l.is_empty()) else {
         return Ok(());
+    };
+    refold_lin_tapes(lin, round_tokens.len(), kept, charge, device)
+}
+
+/// Rebuild every recurrent layer's state at `kept` positions into this round
+/// from the tape its forwards recorded.
+///
+/// `round_len` is how many positions the round fed. Each recurrent layer's tape
+/// must hold exactly that many, and this refuses the round rather than refolding
+/// when one does not: a tape that is short recorded fewer forwards than the
+/// round took — armed late, or a forward that ran with recording off — and
+/// refolding it would leave the recurrent state describing a different prefix
+/// from the K/V stack beside it, which no later call can detect and which shows
+/// up only as wrong tokens.
+///
+/// `lin` carries one slot per decoder layer, and on a hybrid most of them belong
+/// to full-attention layers that never touch a recurrence. Those record nothing
+/// and hold no state, and are skipped. Holding no state is what separates them
+/// from a recurrent layer whose forward failed to record: that one has a state
+/// this round advanced, and an empty tape for it is the defect above.
+fn refold_lin_tapes(
+    lin: &mut [LinearAttnCache],
+    round_len: usize,
+    kept: usize,
+    charge: bool,
+    device: Device,
+) -> Result<()> {
+    let mut refolded: Vec<Array> = Vec::new();
+    for (idx, cache) in lin.iter_mut().enumerate() {
+        let Some(tape) = cache.take_tape() else {
+            return Err(Error::Model(format!(
+                "refold_lin_tapes: recurrent layer {idx} has no round tape, so the \
+                 {round_len} positions this round fed through it were never recorded \
+                 and its state cannot be rolled back to {kept}"
+            )));
+        };
+        let taped = tape.positions();
+        if taped == 0 && cache.conv_state.is_none() && cache.delta_state.is_none() {
+            continue;
+        }
+        if taped != round_len {
+            return Err(Error::Model(format!(
+                "refold_lin_tapes: recurrent layer {idx} taped {taped} positions over \
+                 {} forwards but the round fed {round_len} — the tape does not describe \
+                 this round",
+                tape.segments().len(),
+            )));
+        }
+        let Some(state_in) = tape.state_in() else {
+            return Err(Error::Model(format!(
+                "refold_lin_tapes: recurrent layer {idx} taped {taped} positions with no \
+                 pre-round state"
+            )));
+        };
+        let conv = concat_tape_conv_input(&tape, device)?;
+        // What the conv1d carries into the next call is the `kernel - 1`
+        // positions before its next input, and the tape's conv input opens with
+        // exactly those, so the round's own carry sits at `kept`.
+        let pad = seq_len(&conv)? - taped as i32;
+        cache.conv_state = Some(seq_range(&conv, kept as i32, kept as i32 + pad, device)?);
+        cache.delta_state = Some(if kept == 0 {
+            state_in.try_clone()?
+        } else {
+            let (_y, state_out) = crate::gated_delta_msl::gated_delta_step_gpu(
+                &tape_prefix(&tape, |s| &s.q, kept, device)?,
+                &tape_prefix(&tape, |s| &s.k, kept, device)?,
+                &tape_prefix(&tape, |s| &s.v, kept, device)?,
+                &tape_prefix(&tape, |s| &s.g, kept, device)?,
+                &tape_prefix(&tape, |s| &s.beta, kept, device)?,
+                state_in,
+                device,
+            )?;
+            state_out
+        });
+        if charge {
+            // Nothing reads the refolded state until the next round's forward,
+            // so with nothing forcing it here the whole refold is billed to that
+            // round. See `phases_charged`. Issued for every layer first and
+            // waited on afterwards: draining each layer in turn would price the
+            // rollback at the cost of serialising it.
+            for a in [&cache.conv_state, &cache.delta_state]
+                .into_iter()
+                .flatten()
+            {
+                a.async_eval()?;
+                refolded.push(a.try_clone()?);
+            }
+        }
     }
-    let replayed =
-        arch.forward_seq_last_k_with_cache(&round_tokens[..kept], 1, kv, Some(lin), device)?;
-    if charge {
-        // Nothing reads this replay until the next round's verify forward, so
-        // with nothing forcing it here the whole second weight read is billed
-        // to that round's verify span. See `phases_charged`.
-        replayed.eval()?;
+    for a in &refolded {
+        a.eval()?;
     }
     Ok(())
+}
+
+/// The round's conv1d input across every taped forward, carried prefix included.
+///
+/// Each forward's input opens with the `kernel - 1` positions it carried in from
+/// its predecessor, and those are already in that predecessor's segment, so only
+/// the first segment contributes its prefix.
+fn concat_tape_conv_input(tape: &GdnTape, device: Device) -> Result<Array> {
+    let Some((first, rest)) = tape.segments().split_first() else {
+        return Err(Error::Model(
+            "concat_tape_conv_input: empty round tape".into(),
+        ));
+    };
+    if rest.is_empty() {
+        return first.conv_input.try_clone();
+    }
+    let pad = seq_len(&first.conv_input)? - first.len as i32;
+    let mut parts: Vec<Array> = Vec::with_capacity(rest.len() + 1);
+    parts.push(first.conv_input.try_clone()?);
+    for seg in rest {
+        let len = seq_len(&seg.conv_input)?;
+        parts.push(seq_range(&seg.conv_input, pad, len, device)?);
+    }
+    concatenate(&parts.iter().collect::<Vec<_>>(), 1, device)
+}
+
+/// One recurrence input over the round's first `kept` positions, joined across
+/// whatever forwards produced them.
+///
+/// `kept` is at most the tape's position count, checked by the caller.
+fn tape_prefix(
+    tape: &GdnTape,
+    field: fn(&GdnTapeSegment) -> &Array,
+    kept: usize,
+    device: Device,
+) -> Result<Array> {
+    let mut parts: Vec<Array> = Vec::new();
+    let mut taken = 0usize;
+    for seg in tape.segments() {
+        if taken >= kept {
+            break;
+        }
+        let want = (kept - taken).min(seg.len);
+        parts.push(seq_range(field(seg), 0, want as i32, device)?);
+        taken += want;
+    }
+    match parts.len() {
+        1 => parts
+            .pop()
+            .ok_or_else(|| Error::Model("tape_prefix: a one-part join lost its part".into())),
+        _ => concatenate(&parts.iter().collect::<Vec<_>>(), 1, device),
+    }
+}
+
+/// Length of `a`'s sequence axis, which every taped recurrence input carries at
+/// axis 1.
+fn seq_len(a: &Array) -> Result<i32> {
+    a.shape().get(1).copied().ok_or_else(|| {
+        Error::Model(format!(
+            "seq_len: a taped recurrence input carries its positions on axis 1, \
+             and this one has shape {:?}",
+            a.shape()
+        ))
+    })
+}
+
+/// `a[:, from..to, ...]` — a range of a taped recurrence input's positions.
+fn seq_range(a: &Array, from: i32, to: i32, device: Device) -> Result<Array> {
+    let len = seq_len(a)?;
+    if from < 0 || from > to || to > len {
+        return Err(Error::Model(format!(
+            "seq_range: positions {from}..{to} are not inside a taped input of \
+             length {len}"
+        )));
+    }
+    if from == 0 && to == len {
+        return a.try_clone();
+    }
+    let shape = a.shape();
+    let start: Vec<i32> = shape
+        .iter()
+        .enumerate()
+        .map(|(axis, _)| if axis == 1 { from } else { 0 })
+        .collect();
+    let stop: Vec<i32> = shape
+        .iter()
+        .enumerate()
+        .map(|(axis, &dim)| if axis == 1 { to } else { dim })
+        .collect();
+    a.slice(&start, &stop, &vec![1i32; shape.len()], device)
 }
 
 /// Truncate every KV cache in `kv` that actually holds `n` or more positions.

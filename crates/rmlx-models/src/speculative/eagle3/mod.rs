@@ -52,8 +52,8 @@
 //!    concatenated along the feature axis in one cached forward. We capture at
 //!    `[id - 1]` for each `eagle_aux_hidden_state_layer_ids` id (mlx-vlm
 //!    `capture_layer_ids`), i.e. `[2, 18, 34]`.
-//! 2. **GDN rollback** — reuses [`super::dflash::DFlashRoundState`]
-//!    snapshot/restore + kept-prefix replay on partial acceptance (GDN recurrent
+//! 2. **GDN rollback** — reuses the shared round tape
+//!    a round tape refolded over the kept prefix on partial acceptance (GDN recurrent
 //!    state has no sequence axis; it cannot be truncated).
 //! 3. **Raw embed accessor** — [`Architecture::embed_tokens_raw`] (the verifier
 //!    `embed_tokens` is the EAGLE-3 `bind()` target; the checkpoint ships no
@@ -122,7 +122,6 @@ use std::path::Path;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{add, argmax, concatenate, rope, Array, Device};
 
-use super::dflash::DFlashRoundState;
 use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
@@ -1048,7 +1047,7 @@ pub fn eagle3_generate(
         total_draft += draft_tokens.len();
 
         // -- Phase B: verifier scores [b, draft...] + captures multi-aux hidden. --
-        let round_snap = DFlashRoundState::snapshot(&v_lin)?;
+        super::arm_lin_tapes(Some(&mut v_lin));
         let mut v_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
         v_input.push(b);
         v_input.extend_from_slice(&draft_tokens);
@@ -1207,17 +1206,15 @@ pub fn eagle3_generate(
 
         // -- Phase D: roll back verifier KV/GDN caches on partial accept. --
         // The verifier consumed v_k positions; keep the committed prefix
-        // (pre-round + accept + 1 carry rows). Roll FA KV caches back, restore +
-        // replay the GDN recurrence.
+        // (pre-round + accept + 1 carry rows). Roll FA KV caches back and refold
+        // the GDN recurrence over the kept prefix.
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
         let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
         if v_target < v_offset_before {
             let v_pre_round_offset = v_offset_before - v_k as i32;
             super::rollback_round_caches(
-                verifier,
                 &mut v_caches,
                 Some(&mut v_lin),
-                Some(round_snap.into_snapshots()),
                 &v_input,
                 v_pre_round_offset,
                 v_target,
@@ -1226,7 +1223,7 @@ pub fn eagle3_generate(
                 device,
             )?;
         } else {
-            drop(round_snap);
+            super::disarm_lin_tapes(Some(&mut v_lin));
         }
 
         // -- Phase E: drafter accept-and-reseed. --

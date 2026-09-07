@@ -586,7 +586,7 @@ use crate::decode_loop::ProbeStep;
 /// [`super::VerifierDraw`] explains why the walk is still exact.
 ///
 /// The verifier is the Qwen3.5/3.6-MoE hybrid (carries GDN linear-attention
-/// state); rollback uses the [`super::dflash::DFlashRoundState`] snapshot/restore.
+/// state); rollback refolds that state from the round tape.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -611,7 +611,6 @@ pub fn mtp_generate(
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
 ) -> Result<Vec<ProbeStep>> {
-    use super::dflash::DFlashRoundState;
     use rmlx_kv_quant::LinearAttnCache;
     use std::time::Instant;
 
@@ -772,8 +771,8 @@ pub fn mtp_generate(
         total_draft += draft_tokens.len();
 
         // -- Phase B: verifier scores [b, draft...] + captures penultimate hidden
-        //    in one pass. Snapshot GDN state before the verify forward. --
-        let round_snap = DFlashRoundState::snapshot(&v_lin)?;
+        //    in one pass. Arm the GDN round tape before the verify forward. --
+        super::arm_lin_tapes(Some(&mut v_lin));
         let mut v_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
         v_input.push(b);
         v_input.extend_from_slice(&draft_tokens);
@@ -837,10 +836,8 @@ pub fn mtp_generate(
         if v_target < v_offset_before {
             let v_pre_round_offset = v_offset_before - v_k as i32;
             super::rollback_round_caches(
-                verifier,
                 &mut v_caches,
                 Some(&mut v_lin),
-                Some(round_snap.into_snapshots()),
                 &v_input,
                 v_pre_round_offset,
                 v_target,
@@ -848,7 +845,7 @@ pub fn mtp_generate(
                 device,
             )?;
         } else {
-            drop(round_snap);
+            super::disarm_lin_tapes(Some(&mut v_lin));
         }
 
         // Sidecar KV rollback: this round the head wrote `bs - 1` slots starting
@@ -888,7 +885,7 @@ pub fn mtp_generate(
             verify_ns: round_verify_ns,
             walk_ns: round_walk_ns,
             rollback_ns: round_rollback_ns,
-            replayed: v_target < v_offset_before,
+            refolded: v_target < v_offset_before,
             charged: charge_phases,
         }
         .log(

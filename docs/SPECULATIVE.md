@@ -88,9 +88,9 @@ caches with `KvCache::truncate_to`-based rollback on partial acceptance. This
 cuts per-round verifier cost from O(prompt\_len) to O(K).
 
 For hybrid architectures (Qwen3.5/3.6-MoE) that carry a GatedDeltaNet (GDN)
-recurrent state in addition to the standard KV cache, rollback requires
-snapshot/restore rather than truncation, because the GDN state has no sequence
-axis.
+recurrent state in addition to the standard KV cache, the recurrent half cannot
+be truncated — that state has no sequence axis — so it is rebuilt from a round
+tape instead. See § "One rollback, and the tape it rebuilds from".
 
 A round loop's rollback is not only about the store it can slice. A sliding-window
 layer's ring must give back the block tail it just wrote, and it can — see
@@ -126,7 +126,7 @@ ds = prompt[-1]   # draft seed
 
 # Per-round
 loop until n_tokens emitted:
-  if hybrid (GDN): snapshot_lin(verifier_lin), snapshot_lin(draft_lin)
+  if hybrid (GDN): arm_lin_tapes(verifier_lin), arm_lin_tapes(draft_lin)
 
   # Phase A — draft
   draft_tokens = draft.decode_n(ds, K, draft_caches, draft_lin)
@@ -146,9 +146,9 @@ loop until n_tokens emitted:
   # Phase D — cache rollback (one helper, both sides)
   v_drop = K - accept          # positions to discard from verifier cache
   d_drop = max(K - accept - 1, 0)
-  rollback_round_caches(verifier, verifier_caches, verifier_lin, verifier_lin_snap,
+  rollback_round_caches(verifier_caches, verifier_lin,
                         v_input, v_pre_round_offset, offset - v_drop)
-  rollback_round_caches(draft, draft_caches, draft_lin, draft_lin_snap,
+  rollback_round_caches(draft_caches, draft_lin,
                         d_fed, d_pre_round_offset, offset - d_drop)
 
   if accept == K:
@@ -260,18 +260,20 @@ numbers:
   sidecar loop used to close its span on the unevaluated forward and re-derive
   the LM head position by position afterwards, which put most of the verify
   forward into the residual and made the two loops' residuals incomparable.
-- **Uncharged, the drafter's span pays for the round before it.** The rollback
-  replay's output is discarded, the trimmed K/V and the extended conditioning
-  are not read until the next round drafts, and the drafter is the first thing
-  to block on any of them — so a partial-accept round's second weight read lands
-  in the *next* round's `draft_ms`. Measured on the three loops below.
+- **Uncharged, the drafter's span pays for the round before it.** The rollback's
+  rebuilt recurrent state, the trimmed K/V and the extended conditioning are not
+  read until the next round drafts, and the drafter is the first thing to block
+  on any of them — so a partial-accept round's rollback lands in the *next*
+  round's `draft_ms`. The figures below were measured when that rollback was a
+  second full read of the verifier's weights; the effect is the same shape now
+  and much smaller.
 
 Per-round attribution comes from the `speculative round` event, target
 `rmlx::spec::phase`, one per round at `debug`, emitted by one shared
 `RoundPhases::log` so the three loops cannot drift into three record shapes:
 
 ```
-loop_kind round accept num_draft replayed charged
+loop_kind round accept num_draft refolded charged
 round_ms draft_ms verify_ms walk_ms rollback_ms other_ms
 ```
 
@@ -279,7 +281,7 @@ round_ms draft_ms verify_ms walk_ms rollback_ms other_ms
 host bookkeeping. The four phases are disjoint sub-spans of the round, so
 claiming more than the round has means a timer started outside it — that is an
 `error!` naming the phases rather than an `other_ms` near zero that reads like
-rounding. `replayed` says whether that round took the GDN replay arm of
+rounding. `refolded` says whether that round took the recurrent arm of
 `rollback_round_caches`.
 
 `charged` is the field that says how to read the rest. At `debug` the phases are
@@ -296,8 +298,8 @@ charged run's `round_ms` against an uncharged one's before trusting either.
 record.** `phases_charged()` is read at the loop head and passed down — to
 `rollback_round_caches` as an argument, and onto `RoundStats::charged`, which
 every loop's `done` line carries. Two things depend on that.
-`rollback_round_caches` is shared by seven loops and only three of them time
-their phases; a switch it read on its own behalf would change how the other four
+`rollback_round_caches` is shared by eight call sites across seven loops and
+only three of those loops time their phases; a switch it read on its own behalf would change how the other four
 schedule work, with nothing on their records saying so — they pass `false` and
 report `charged=false`.
 
@@ -368,14 +370,15 @@ the uncharged ratio *overstated* that gap. It understates it, and by more than
 the gap the two loops were being compared on.
 
 **The mechanism, isolated within one run.** Group a round's `draft_ms` by
-whether the *previous* round took the rollback replay. Uncharged, DFlash 2
-drafts for 24.09 ms after a replay against 20.33 ms after a full accept, and the
-sidecar 8.55 against 4.12 — the previous round's replay, paid inside this
-round's drafting. Charged, those differences are 0.35 ms and 0.004 ms. The
-comparison is between two figures from one run, so it does not depend on the
-host being quiet. The assistant loop is full attention and replayed on none of
-its 114 rounds, which is why its gap is the smallest of the three and is the
-K/V trim rather than a replay.
+whether the *previous* round rolled back. Uncharged, DFlash 2 drafted for
+24.09 ms after a rollback against 20.33 ms after a full accept, and the sidecar
+8.55 against 4.12 — the previous round's rollback, paid inside this round's
+drafting. Charged, those differences are 0.35 ms and 0.004 ms. The comparison is
+between two figures from one run, so it does not depend on the host being quiet.
+The assistant loop is full attention and rolled back its K/V tail on none of its
+114 rounds, which is why its gap is the smallest of the three. These readings
+predate the tape: the rollback they group by was the layer-stack replay, so the
+gap they show is an upper bound on what the same grouping would show now.
 
 **Three omissions in the charge, each now inside that check.** The MTP sidecar
 charged its rollback and never its capture: before that was fixed, a charged run's
@@ -476,7 +479,7 @@ gates both the FFN-shape probe and the greedy-tracking property. The round-loop
 round-0 penultimate-hidden + first-bonus capture → per-round autoregressive
 `draft_n` (RoPE offset = sidecar `_next_position` = verifier prefix length +
 appended count) → one combined verify forward → `accept_prefix` walk over the
-verifier's own argmax → emit → GDN snapshot/restore verifier-KV rollback +
+verifier's own argmax → emit → recurrent refold + verifier-KV truncation +
 sidecar-KV `truncate_to` on partial acceptance.
 
 `draft_n` proposes `block_size - 1` tokens but only ever feeds back `block_size - 2`
@@ -499,42 +502,53 @@ so a default would load a top-8 checkpoint at top-1 and show up only as a quietl
 worse accept rate. It is carried as an `Option` and refused by name in the MoE
 branch of `MtpLayer::load`, which is the only branch that reads it.
 
-The GDN half of that rollback is not a truncation: the recurrent state has no
-sequence axis, so it is restored from a pre-round snapshot and **replayed** over
-the kept prefix. That replay runs the whole layer stack, and on this hybrid the
-full-attention layers sit between GDN layers — layer 3's output is the residual
-layers 4-6 consume. It therefore replays through the **real** KV caches, rolled
-back to the pre-round offset first, so the FA layers attend their true prefix at
-their true positions and land back on `v_target`. Replaying through a fresh
-scratch KV stack instead makes those FA layers attend a `v_kept`-token prefix at
-positions `0..v_kept`, and every downstream GDN layer advances on a wrong
-hidden.
+#### One rollback, and the tape it rebuilds from
 
-Every round loop that can partially accept goes through **one** implementation of
-this — `speculative::rollback_round_caches`. It owns the whole rollback: the
-full-attention `truncate_to` loop, the GDN snapshot restore, and the replay.
-A full-attention arch (`lin` absent or empty) takes its short arm and truncates
-straight to the target; a GDN hybrid takes the replay arm. Its seven callers are
-`mtp_generate`, `dflash_generate`, `eagle3_generate`, and
-the classic two-model loop's four (verifier + drafter, greedy + stochastic).
-There is deliberately no second copy: the defect below lived in four independent
+The GDN half of that rollback is not a truncation: the recurrent state has no
+sequence axis to slice. It is rebuilt instead, from a **round tape** the loop
+arms before its forwards.
+
+While a tape is armed, every GDN layer records the recurrence inputs it built —
+the normalised and scaled q and k, v, the per-position decay and update weight,
+and the depthwise-conv1d input with its carried tail — together with the state
+the round started from. Those inputs are causal and per-position: what the
+forward computed at position `i` does not depend on any position after it, so
+they are the same values a shorter forward would have produced. When the round is
+partly rejected the accepted prefix is folded back through the recurrence kernel
+alone, reading no weights and taking no second forward, and the full-attention
+K/V is truncated straight to the target the way it is on a full-attention arch.
+
+A round is not always one forward. A two-model loop's drafter takes one forward
+per drafted token and rolls back across the lot of them, so a tape accumulates
+segments in call order and the prefix to refold may span several; the pre-round
+state is recorded once, at the first. `GdnTape` in
+`crates/rmlx-kv-quant/src/linear_attn.rs` holds both shapes.
+
+Every round loop that can partially accept goes through **one** implementation —
+`speculative::rollback_round_caches`. A full-attention arch (`lin` absent or
+empty) truncates and stops; a GDN hybrid also refolds. Its eight call sites are
+`mtp_generate`, `dflash_generate`, `dflash2_generate`, `eagle3_generate`,
+`mtp_assistant_generate` (full attention, so truncation only) and the classic
+two-model loop's three recurrent ones — greedy verifier, greedy drafter and
+stochastic verifier — plus the stochastic drafter. There is deliberately no
+second copy: the defect the replay was written to fix lived in four independent
 implementations at once, and a rollback inlined per loop is how it got there.
 
-Measured, greedy, temp=0, one plain-greedy arm per pair (`common prefix` from the
-alignment suites in `crates/rmlx-models/tests/`), scratch-stack replay vs
-real-cache replay:
+The refold is checked against the replay it replaced —
+`a_round_tape_refolds_to_what_the_replay_produced` in
+`crates/rmlx-models/src/speculative/tests.rs` — on a dense hybrid and a mixture
+one, for a round taken as one verify forward and one taken as a forward per
+token. On the dense hybrid the two agree bit for bit at every accepted length.
+On the mixture they agree to about 2-4% relative, which is that stack's own
+disagreement between computing the round in one forward and stepping it: the
+test measures that disagreement in the same process and holds the refold to it,
+rather than to a constant.
 
-| Round loop | Pair | Scratch stack | Real caches |
-|---|---|---|---|
-| MTP sidecar | Qwen3.8-27B + its MTP sidecar | 4 / 31 | 31 / 31 |
-| EAGLE-3 | Qwen3.6-35B-A3B + specdrift eagle3 | 13 / 96 | 93 / 96 |
-| Two-model | Qwen3.8-27B + ornith-1.0-9b | 17 / 96 | 96 / 96 |
-
-The corrupted arm also degenerated into a repetition loop on longer prompts. The
-remaining flips in the correct arms are ordinary near-ties — the verify pass
-scores a whole block in one forward, which is a different reduction order from a
-one-token-at-a-time decode — which is why those gates assert a threshold and not
-bit-identity.
+That difference is worth knowing when reading an equivalence run on a mixture
+verifier. Recomputing the accepted prefix put its committed state in the stepped
+regime; keeping what the round computed puts it in the batched one, which is the
+regime the emitted tokens were chosen in and the one a fully accepted round has
+always been in.
 
 The classic two-model loop needed one more thing to reach the rollback at all: it
 read the pre-round offset from `caches[0]`, and on a GDN hybrid layer 0 is a
@@ -630,10 +644,10 @@ pinned by a test that verifies `mscale = 1.4158...` and specific frequency
 values against the mlx-lm reference output.
 
 **GDN-aware rollback.** The Qwen3.6-MoE verifier carries GDN (GatedDeltaNet)
-recurrent layers in addition to its KV cache. On partial acceptance,
-`DFlashRoundState::snapshot` captures all GDN layer states before the verify
-forward; `DFlashRoundState::restore` + a kept-prefix replay re-aligns the GDN
-state with the truncated KV cache.
+recurrent layers in addition to its KV cache. The loop arms a round tape on them
+before the verify forward, and on partial acceptance `rollback_round_caches`
+refolds the accepted prefix out of it to re-align the recurrent state with the
+truncated KV cache.
 
 **Accumulated conditioning context.** The drafter conditions on the
 accumulated verifier hidden across all rounds (equivalent to the Python
@@ -738,8 +752,8 @@ Dogacel checkpoint (it uses the configured block ceiling capped to the
 remaining budget). The DFlash adaptive schedule fires only when
 `adaptive_max_block_size` is present in the config.
 
-**GDN rollback.** Identical to the DFlash path: `DFlashRoundState::snapshot`
-before each verify forward, `restore` + kept-prefix replay on partial accept.
+**GDN rollback.** Identical to the DFlash path: a round tape armed before each
+verify forward, refolded over the accepted prefix on partial accept.
 
 Per-step trace is available via `RUST_LOG=rmlx_models::speculative::eagle3=trace`.
 
@@ -1001,13 +1015,12 @@ forward with `forward_seq_last_k_with_cache` discarding the returned logits;
 between chunks the KV cache state is flushed via `eval_prefill_state`. The
 `enter_prefill` / `exit_prefill` bracket optimises cache memory layout.
 
-GDN recurrent state is snapshotted before every draft round using
-`snapshot_lin`. On partial acceptance (`accept < K`), `rollback_round_caches`
-rolls the KV caches back to the pre-round offset, restores the pre-round GDN
-state, and re-runs the forward over the kept token prefix **through those same
-production caches** — which lands them on the truncated target and the GDN state
-byte-consistent with them. It must not be a throwaway scratch stack; see the
-partial-accept rollback section above for what that costs.
+A round tape is armed on the GDN recurrent state before every draft round with
+`arm_lin_tapes`, and dropped with `disarm_lin_tapes` when the round is fully
+accepted. On partial acceptance (`accept < K`), `rollback_round_caches` truncates
+the KV caches to the retained target and refolds the accepted prefix into the
+recurrent state from the tape — no second forward, and no weights read. See the
+partial-accept rollback section above.
 
 ## CLI
 
@@ -1452,28 +1465,28 @@ measuring it.
 **Those `draft ms` figures are upper bounds, and the sidecar's are the looser
 of the two.** Every row carries `charged=false`, which means each phase is timed
 but not forced, and this engine evaluates lazily, so the previous round's
-rollback replay and conditioning work are paid inside the next round's `draft
+rollback and conditioning work are paid inside the next round's `draft
 ms`. Both sidecar loops have that shape and the sidecar has it worse: § "What
 the charge moves, measured" prices the same two configurations charged, and the
 `draft ms` ratio between them goes from 3.1× to 4.5×. It was expected to go the
 other way, on the reasoning that this drafter's capture is
 `len(target_layer_ids) = 5` times as wide as the MTP sidecar's single hidden and
 so skews its column more. The capture is real but small — 1.51 ms per round on
-the sidecar; what dominates is the rollback replay, and the sidecar replays on
-73% of its rounds. Before optimising against this split, take it charged.
+the sidecar; what dominated was the rollback replay, and the sidecar rolled back
+on 73% of its rounds. Before optimising against this split, take it charged.
 
 Drafting costs 19.5–24.4 ms per round almost independently of block and of
 prompt, against the sidecar's 5.9–6.9 ms. Two costs the port does not pay down
 explain that floor: the forward re-projects the conditioning over as many rows as
 the drafter's window reaches back over (2047 here) every round rather than over
 the new rows only, and the drafter's 3.85 GB of bf16 weights are read every round.
-Removing the loop residual entirely — more than the remaining accepted-prefix
-replay work would do — takes the block-8 code round to 106.8 ms and 2.05×, and
-also bringing drafting to the sidecar's cost takes it to 90.6 ms and 2.42×. Both
-are computed from the rows above, not measured.
+Removing the loop residual entirely — more than removing the accepted-prefix
+replay would do — takes the block-8 code round to 106.8 ms and 2.05×, and also
+bringing drafting to the sidecar's cost takes it to 90.6 ms and 2.42×. Both are
+computed from the rows above, not measured.
 
-**The loop-overhead work is not landed** — its first half is, the accepted-prefix
-replay fix is not. Every number in this section was taken in that state.
+**Every number in this section was taken before the accepted-prefix replay was
+removed**, so the residual they price is the one the round tape sheds.
 
 Greedy losslessness holds through all of it: on the code prompt the plain arm,
 the block-5 arm and the block-8 arm return the same 429 characters under one
@@ -1708,7 +1721,7 @@ Qwen3.8-27B-4bit + MTP-4bit — GDN hybrid, plain step **30.77 ms** (32.5 t/s):
 | implied step cost vs plain | 1.39× | 1.89× |
 
 Gemma4-e4b-it-mxfp8 + E4B assistant — full attention, plain step **11.9 ms**
-(84 t/s), no recurrent state and so no replay:
+(84 t/s), no recurrent state and so no refold:
 
 | Phase | block 2 | block 6 |
 |---|---:|---:|
@@ -1721,14 +1734,17 @@ Gemma4-e4b-it-mxfp8 + E4B assistant — full attention, plain step **11.9 ms**
 
 Four things those say:
 
-- **The GDN replay is the sidecar loop's entire residual.** A partial-accept
-  round pays 31–32 ms for `rollback_round_caches`, a second full weight read of
-  the verifier; a full-accept round pays 0.027 ms. Everything else the residual
-  was ever suspected of — the 48-layer `LinearAttnCache` snapshot and restore,
-  the emission, the cache truncation — is 0.06 ms together.
-- **`kept` is never zero in these loops**, so the early return in
+- **The GDN replay was the sidecar loop's entire residual.** A partial-accept
+  round paid 31–32 ms for `rollback_round_caches`, a second full weight read of
+  the verifier; a full-accept round paid 0.027 ms. Everything else the residual
+  was ever suspected of — the 48-layer recurrent snapshot and restore, the
+  emission, the cache truncation — is 0.06 ms together. That replay is what the
+  round tape replaced; the table above is the measurement that scoped the work,
+  and the rows it attributes to the replay no longer describe the engine.
+- **`kept` is never zero in these loops**, so the zero-kept path in
   `rollback_round_caches` is unreachable from them and every partial round
-  replays. The retained prefix is `1 + accept`: the carry token is always kept.
+  rolls back. The retained prefix is `1 + accept`: the carry token is always
+  kept.
 - **Verifying one more position costs about a quarter of a plain step**, on both
   architectures: 7.27 ms against a 30.77 ms step on the 27B (0.236), 2.88 ms
   against an 11.9 ms step on e4b (0.242). A weight-bandwidth roofline says a
@@ -1757,11 +1773,12 @@ Four things those say:
   block 3 are the only two settings those pairs have, and 2 measured faster than
   3 on all three prompt classes for Qwen3.8-27B at both weight formats. The `block_size` field on the
   `mtp_generate: done` line reports the value actually used.
-- **The step cost the round loop pays is 1.39× a plain step at block 2 and 1.89×
-  at block 3** on Qwen3.8-27B-4bit, against 32.47 / 32.54 t/s no-drafter and
-  39.70 / 37.00 t/s with the sidecar. The split above says where the growth goes:
-  roughly half to the replay's rising partial-round fraction, roughly half to the
-  verify forward's per-position cost.
+- **The step cost the round loop paid was 1.39× a plain step at block 2 and
+  1.89× at block 3** on Qwen3.8-27B-4bit, against 32.47 / 32.54 t/s no-drafter
+  and 39.70 / 37.00 t/s with the sidecar. The split above says where the growth
+  went: roughly half to the replay's rising partial-round fraction, roughly half
+  to the verify forward's per-position cost. The first half is what the round
+  tape removes; these figures predate it and have not been re-measured.
 - **DFlash and EAGLE-3 are net decode losses on this verifier at every prompt
   class measured**, DFlash by 3-22% and EAGLE-3 by 26-39%. Both run correctly and
   accept real tokens; neither clears its own round-loop overhead.
@@ -1779,7 +1796,7 @@ Four things those say:
 ## See also
 
 - `docs/KV_CACHE.md` — KvCache asymmetric K/V quant, `truncate_to`, sliding
-  window cache, and `LinearAttnCache` GDN rollback.
+  window cache, and `LinearAttnCache` recurrent state.
 - `docs/MODELS.md` — architecture loading, `Architecture` trait surface, the
   verifier-side seams (`forward_verify_capture`, `forward_hidden_states_multi`,
   `embed_tokens_raw`, `hot_logits_from_final_hidden`).

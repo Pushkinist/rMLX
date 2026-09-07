@@ -35,7 +35,7 @@ dropped; callers import the items directly from `rmlx_kv_quant`:
 | `KvQuant`, `KvQuantParseError`             | `rmlx_kv_quant::quant`                       |
 | `KV_MAX_SEQ_DEFAULT`                       | `rmlx_kv_quant::quant`                       |
 | `KvCache`                                  | `rmlx_kv_quant::kvcache`                     |
-| `LinearAttnCache`                          | `rmlx_kv_quant::linear_attn`                 |
+| `LinearAttnCache`, `GdnTape`, `GdnTapeSegment` | `rmlx_kv_quant::linear_attn`             |
 | `KvStorage`, `QuantK`, `QuantV`, `QuantPlanarV` | `rmlx_kv_quant::storage`                |
 | `MixedKvState`, `MixedTuple`               | `rmlx_kv_quant::mixed_quant`                 |
 | `PagedKStorage`, `PagedVStorage`, `PagedPlanarVStorage`, `install_paged_kv`, `resolve_paged_kv`, `resolve_paged_kv_page_tokens` | `rmlx_kv_quant::paged` |

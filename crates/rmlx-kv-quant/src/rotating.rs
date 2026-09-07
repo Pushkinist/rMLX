@@ -154,9 +154,9 @@ impl RotatingState {
     ///   still covers the window the rolled-back offset needs. A block-verify
     ///   write of `s` positions can therefore always be rolled back over its own
     ///   rejected tail, which is at most `s - 1` long. Rolling the whole block
-    ///   back is one position too far and is refused — a caller that needs it
-    ///   (a recurrent round loop replaying from its pre-round offset) has no
-    ///   route through here.
+    ///   back is one position too far and is refused, and no round loop asks
+    ///   for it: a recurrent loop rebuilds its state from the round tape and
+    ///   truncates K/V to the same target a full-attention loop does.
     ///
     /// A ring left in rotated order by a single-token write
     /// (`update_in_place` past the wrap) is **not** rollable: the newest slots
