@@ -55,10 +55,28 @@ impl CapturedEvent {
     /// through this function's guesses.
     #[must_use]
     pub fn json_line(&self) -> String {
+        self.render(false)
+    }
+
+    /// The same object with every wall-clock field dropped.
+    ///
+    /// The shared round event carries five of them and they move on every run,
+    /// so a digest over the whole line compares two machines' load rather than
+    /// two engines. This is the form two runs are held to, and the suffix is
+    /// the rule: a timing field is named `*_ms`.
+    #[must_use]
+    pub fn stable_json_line(&self) -> String {
+        self.render(true)
+    }
+
+    fn render(&self, drop_timings: bool) -> String {
         let mut obj = serde_json::Map::new();
         obj.insert("target".to_owned(), self.target.clone().into());
         obj.insert("message".to_owned(), self.message.clone().into());
         for (name, value) in &self.fields {
+            if drop_timings && name.ends_with("_ms") {
+                continue;
+            }
             obj.insert(name.clone(), value.clone().into());
         }
         serde_json::Value::Object(obj).to_string()

@@ -2997,26 +2997,39 @@ fn report(
     );
 }
 
-/// Write one pair's round stream for one prompt, one JSON object per round, and
-/// say where it went.
+/// Write one pair's round stream for one prompt — one JSON object per round —
+/// beside the timing-free form two runs are compared on, and say where both
+/// went.
 ///
 /// Under `RMLX_HOME`'s `tmp/`. The streams are a run artifact of a suite that
 /// names no output directory of its own, and a variable for one would be
 /// invisible configuration for a path the run already prints.
+///
+/// The second file is what
+/// `crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256` pins,
+/// so `shasum -a 256` on it is the whole comparison. Its byte length is printed
+/// because a cell whose length already differs needs no digest to settle.
 fn write_round_stream(test: &str, prompt: &str, rounds: &[CapturedEvent]) {
     let dir = rmlx_core::paths::tmp_dir();
     std::fs::create_dir_all(&dir).expect("create the run's tmp directory");
-    let path = dir.join(format!("{test}.{prompt}.jsonl"));
-    let mut body = String::new();
+    let mut full = String::new();
+    let mut stable = String::new();
     for event in rounds {
-        body.push_str(&event.json_line());
-        body.push('\n');
+        full.push_str(&event.json_line());
+        full.push('\n');
+        stable.push_str(&event.stable_json_line());
+        stable.push('\n');
     }
-    std::fs::write(&path, body).expect("write the round stream");
+    let full_path = dir.join(format!("{test}.{prompt}.jsonl"));
+    let stable_path = dir.join(format!("{test}.{prompt}.stable.jsonl"));
+    let stable_len = stable.len();
+    std::fs::write(&full_path, full).expect("write the round stream");
+    std::fs::write(&stable_path, stable).expect("write the timing-free round stream");
     eprintln!(
-        "[{test}/{prompt}] rounds={} stream={}",
+        "[{test}/{prompt}] rounds={} stream={} stable={} stable_bytes={stable_len}",
         rounds.len(),
-        path.display()
+        full_path.display(),
+        stable_path.display(),
     );
 }
 
@@ -3028,6 +3041,7 @@ fn emit_one_round_of_each_shape() {
         round = 3,
         accept = 2,
         num_draft = 4,
+        round_ms = 20.5,
         "speculative round"
     );
     tracing::debug!(
@@ -3105,6 +3119,18 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
     assert_eq!(line["message"], "speculative round");
     assert_eq!(line["accept"], "2");
     assert_eq!(line["num_draft"], "4");
+    assert_eq!(line["round_ms"], "20.5");
+
+    // The form the baseline manifest pins: the same object without the fields
+    // that move between two runs of the same engine.
+    let stable: serde_json::Value = serde_json::from_str(&rounds[0].stable_json_line())
+        .expect("a round renders as one JSON object");
+    assert!(
+        stable.get("round_ms").is_none(),
+        "a wall-clock field survived into the form two runs are compared on: {stable}"
+    );
+    assert_eq!(stable["accept"], "2");
+    assert_eq!(stable["num_draft"], "4");
 
     assert!(
         recorder.declined_both_switches(),
