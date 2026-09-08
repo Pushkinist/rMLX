@@ -80,7 +80,7 @@ impl DFlash2Drafter {
     ///
     /// [`Error::Model`] when the rows are not the rank or the width
     /// `target_layer_ids` predicts.
-    pub(super) fn project_conditioning(&self, target_hidden: &Array) -> Result<Array> {
+    pub fn project_conditioning(&self, target_hidden: &Array) -> Result<Array> {
         let width = self.cfg.target_layer_ids.len() as i32 * self.cfg.hidden_size as i32;
         shaped(target_hidden, "target_hidden", &[1, -1, width])?;
         let projected = self.fc.forward(target_hidden, self.device)?;
@@ -372,7 +372,7 @@ impl DFlash2Drafter {
     /// [`check_config`](super::check_config) refuses a window that does not fit
     /// in one — past that this subtraction wraps negative and
     /// [`Self::trim_conditioning`] slices from beyond its own end.
-    pub(super) fn conditioning_rows(&self) -> i32 {
+    pub fn conditioning_rows(&self) -> i32 {
         self.cfg.sliding_window as i32 - 1
     }
 
