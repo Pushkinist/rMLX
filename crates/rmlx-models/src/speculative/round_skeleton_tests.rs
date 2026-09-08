@@ -46,8 +46,11 @@
 //! can fail rather than against a re-derivation of itself.
 
 use super::dflash::{dflash_next_block_size, walk_block_greedy};
-use super::eagle3::{eagle3_next_block_size, eagle3_walk};
-use super::{accept_prefix, two_model_drafts_per_round};
+use super::eagle3::eagle3_walk;
+use super::{
+    accept_prefix, draft_rows_to_drop, rollback_target_from_head, rollback_target_from_tail,
+    round_block, two_model_drafts_per_round, MAX_BLOCK_SIZE,
+};
 
 /// One acceptance walk over a drafted block, spelled three times.
 ///
@@ -56,6 +59,10 @@ use super::{accept_prefix, two_model_drafts_per_round};
 /// side. The extraction keeps one of them, so what has to survive is the answer
 /// all three give — accepted count and committed tokens — and the fact that
 /// `budget` caps the emission without capping the acceptance.
+///
+/// Each walk's own behaviour is pinned in `tests.rs` and `eagle3/tests.rs`; what
+/// is here is only what a collapse of the three has to preserve about all of
+/// them at once.
 ///
 /// Mutation: in `eagle3_walk`, change `new_tokens.truncate(budget)` to
 /// `new_tokens.truncate(budget + 1)`.
@@ -66,21 +73,20 @@ use super::{accept_prefix, two_model_drafts_per_round};
 )]
 fn the_three_acceptance_walks_commit_the_same_rows() {
     // (drafted, verifier's own tokens, budget, expected accepted, expected commit)
-    let cases: [(&[u32], &[u32], usize, usize, &[u32]); 6] = [
-        // Every proposal held: the walk commits them and the bonus past them.
-        (&[7, 8, 9], &[7, 8, 9, 10], 8, 3, &[7, 8, 9, 10]),
-        // The first proposal missed: nothing accepted, the correction alone.
-        (&[7, 8, 9], &[4, 8, 9, 10], 8, 0, &[4]),
-        // A miss in the middle: the agreed prefix and the correction at it.
-        (&[7, 8, 9], &[7, 8, 5, 10], 8, 2, &[7, 8, 5]),
+    let cases: [(&[u32], &[u32], usize, usize, &[u32]); 4] = [
         // The budget caps the commit and leaves the acceptance alone — the
         // round rolled its caches back to what it accepted, not to what it
-        // emitted.
-        (&[7, 8, 9], &[7, 8, 9, 10], 2, 3, &[7, 8]),
-        // A budget of one: the first agreed token only.
+        // emitted. A budget of one is the narrowest a round can run at.
         (&[7, 8, 9], &[7, 8, 9, 10], 1, 3, &[7]),
         // A single proposal, missed.
         (&[7], &[4, 5], 8, 0, &[4]),
+        // A single proposal, held.
+        (&[7], &[7, 5], 8, 1, &[7, 5]),
+        // No proposals at all: the shape the loops' empty-chain guard exists to
+        // refuse before it reaches a walk. All three still agree on it, so the
+        // guard is the only thing standing between a broken drafter and a round
+        // that silently emits one token.
+        (&[], &[4], 8, 0, &[4]),
     ];
     for (draft, verifier, budget, want_accept, want_commit) in cases {
         let (a1, c1) = walk_block_greedy(draft, verifier, budget);
@@ -105,70 +111,34 @@ fn the_three_acceptance_walks_commit_the_same_rows() {
     }
 }
 
-/// The one behaviour the three walks do **not** share.
-///
-/// `accept_prefix` refuses a call whose verifier rows are not the proposals plus
-/// one bonus slot — the shape a swapped call arrives in, which otherwise returns
-/// a plausible accept count that then drives a KV rollback. The two block walks
-/// take the same call and answer it. An extraction that keeps one walk decides
-/// which of the two behaviours the other four loops inherit, and this is what
-/// says the decision was made rather than fallen into.
-///
-/// Mutation: delete the length check at the head of `accept_prefix`.
-#[test]
-fn only_one_of_the_three_walks_refuses_a_swapped_call() {
-    let draft: &[u32] = &[7, 8, 9];
-    let verifier: &[u32] = &[7, 8, 9, 10];
-    assert!(
-        accept_prefix(draft, verifier, 8).is_err(),
-        "accept_prefix must refuse a call whose rows arrive the wrong way round"
-    );
-    // The block walks read the shorter slice and answer: four proposals
-    // accepted where only three were made, which is the count that would drive
-    // the rollback.
-    assert_eq!(
-        walk_block_greedy(verifier, draft, 8),
-        (4, vec![7, 8, 9, 10])
-    );
-    assert_eq!(eagle3_walk(verifier, draft, 8), (4, vec![7, 8, 9, 10]));
-}
-
 /// Every round narrows its block against the remaining budget, and over the
-/// domain a round can reach they are one function.
+/// domain a round can reach that is one function.
 ///
-/// Five spellings are in the tree: `eagle3_next_block_size(block, remaining+1)`;
-/// DFlash 2's inline `block.min(remaining + 1)`; the MTP sidecar's and the
-/// assistant's `block.min(remaining + 1).max(2)`; and the two-model loops'
-/// `remaining.min(k).max(1)`, in proposals rather than in blocks. A loop only
-/// narrows with at least one token left to emit and a block of at least two, and
-/// over that domain all five give `block.min(remaining + 1)`. The `.max(2)` and
-/// the `.max(1)` are dead there, which is what makes them safe to drop and worth
-/// pinning before they are.
+/// [`round_block`] is now the only producer, called by the MTP sidecar, DFlash 2,
+/// EAGLE-3 and the Gemma4 assistant. Three of those four used to spell it with a
+/// `.max(2)` that could never fire: a loop only narrows with at least one token
+/// left to emit, and every block resolver in the tree returns at least 2. The
+/// two-model loops count proposals rather than blocks and reach the same number
+/// one off, which is checked here because it is the one place the two units meet.
 ///
 /// DFlash 1 is the exception and stays its own function: its block follows the
 /// accept rate of the recent rounds.
 ///
-/// Mutation: change `eagle3_next_block_size` to
-/// `requested_block_total.min(remaining_budget + 1)`.
+/// Mutation: change `round_block` to `block_total.min(remaining)`.
 #[test]
 fn the_round_block_is_one_function_of_the_block_and_the_budget() {
     for block in 2..=24usize {
         for remaining in 1..=32usize {
-            let want = block.min(remaining + 1);
-            assert_eq!(
-                eagle3_next_block_size(block, remaining + 1),
-                want,
-                "eagle3 at block {block}, remaining {remaining}"
+            let want = round_block(block, remaining);
+            assert!(
+                (2..=block).contains(&want),
+                "a round must run a block of at least two and never wider than \
+                 the request: block {block}, remaining {remaining}, got {want}"
             );
-            assert_eq!(
-                block.min(remaining + 1),
-                want,
-                "dflash2 at block {block}, remaining {remaining}"
-            );
-            assert_eq!(
-                block.min(remaining + 1).max(2),
-                want,
-                "the sidecar spelling at block {block}, remaining {remaining}"
+            assert!(
+                want <= remaining + 1,
+                "a round cannot verify more positions than it may emit, plus its \
+                 own token: block {block}, remaining {remaining}, got {want}"
             );
             // The two-model loops count proposals: `k` is the block less the
             // verifier's own token, and the round's block is one more than the
@@ -181,10 +151,13 @@ fn the_round_block_is_one_function_of_the_block_and_the_budget() {
             );
         }
     }
-    // Absolute rows, so a rewritten sweep cannot pass by agreeing with itself.
-    assert_eq!(eagle3_next_block_size(8, 4), 4);
-    assert_eq!(eagle3_next_block_size(8, 9), 8);
-    assert_eq!(eagle3_next_block_size(2, 64), 2);
+    // Absolute rows.
+    assert_eq!(round_block(8, 3), 4);
+    assert_eq!(round_block(8, 8), 8);
+    assert_eq!(round_block(8, 64), 8);
+    assert_eq!(round_block(2, 64), 2);
+    // The two-model draft count is clamped to what one verify forward scores.
+    assert_eq!(two_model_drafts_per_round(4096), MAX_BLOCK_SIZE - 1);
     // The adaptive schedule is a different function, and stays one: with no
     // history it takes the same narrowing, and with a poor recent accept rate it
     // does not.
@@ -194,15 +167,16 @@ fn the_round_block_is_one_function_of_the_block_and_the_budget() {
 
 /// The verifier's rollback target, in the two spellings the loops use.
 ///
-/// Five loops compute it from the tail — `v_offset_before - (proposals -
-/// accept)` — and the assistant computes it from the head, `pre_round_offset +
-/// accept + 1`. They are the same position: the verify forward consumed the
-/// carry token and every proposal, so `v_offset_before = pre + 1 + proposals`.
-/// An extraction that keeps one spelling has to keep this equality, and an
-/// off-by-one in it leaves a rejected draft in the cache every partial round —
-/// the defect the equivalence pairs' broken engines are built from.
+/// Five loops call [`rollback_target_from_tail`] and the assistant calls
+/// [`rollback_target_from_head`], because it reads its offset before the verify
+/// forward rather than after. They must name the same position: the forward
+/// consumed the carry token and every proposal, so `v_offset_before = pre + 1 +
+/// proposals`. An off-by-one either way leaves a rejected draft in the cache
+/// every partial round — the defect the equivalence pairs' broken engines are
+/// built from.
 ///
-/// Mutation: change `want_target` below to `pre + accept as i32 + 2`.
+/// Mutation: change `rollback_target_from_head` to `pre_round_offset + accept as
+/// i32 + 2`, or `rollback_target_from_tail` to drop `proposals - accept + 1`.
 #[test]
 fn the_two_rollback_spellings_name_the_same_position() {
     for pre in [0_i32, 1, 37, 4096] {
@@ -210,74 +184,68 @@ fn the_two_rollback_spellings_name_the_same_position() {
             for accept in 0..=proposals {
                 let v_k = 1 + proposals as i32;
                 let v_offset_before = pre + v_k;
-                let from_tail = v_offset_before - (proposals as i32 - accept as i32);
-                let from_head = pre + accept as i32 + 1;
-                let want_target = pre + accept as i32 + 1;
+                let from_tail = rollback_target_from_tail(v_offset_before, proposals, accept);
+                let from_head = rollback_target_from_head(pre, accept);
                 assert_eq!(
-                    from_tail, want_target,
-                    "tail spelling at pre {pre}, {proposals} proposals, {accept} accepted"
+                    from_tail, from_head,
+                    "the two spellings part at pre {pre}, {proposals} proposals, {accept} accepted"
                 );
+                // The retained positions are the carry and the accepted prefix,
+                // and nothing else: the correction the round emits past them is
+                // a prediction the verifier has not processed.
                 assert_eq!(
-                    from_head, want_target,
-                    "head spelling at pre {pre}, {proposals} proposals, {accept} accepted"
+                    from_tail - pre,
+                    accept as i32 + 1,
+                    "retained rows at pre {pre}, {proposals} proposals, {accept} accepted"
                 );
-                // The pre-round offset the rollback replays from is the one the
-                // tail spelling reconstructs, not one the loop remembered.
-                assert_eq!(v_offset_before - v_k, pre);
+                // A full acceptance drops nothing.
+                if accept == proposals {
+                    assert_eq!(from_tail, v_offset_before);
+                }
             }
         }
     }
-    // Absolute rows, both spellings, one cell.
-    for (pre, proposals, accept, want) in [(4096_i32, 7_i32, 3_i32, 4100_i32), (0, 4, 0, 1)] {
-        assert_eq!(pre + accept + 1, want);
-        assert_eq!((pre + 1 + proposals) - (proposals - accept), want);
-    }
+    // Absolute rows, both spellings, one cell each.
+    assert_eq!(rollback_target_from_tail(4104, 7, 3), 4100);
+    assert_eq!(rollback_target_from_head(4096, 3), 4100);
+    assert_eq!(rollback_target_from_tail(5, 4, 0), 1);
+    assert_eq!(rollback_target_from_head(0, 0), 1);
 }
 
-/// The drafter side keeps one row fewer than the verifier, and both sidecar and
-/// two-model loops say so in their own arithmetic.
+/// The drafter side keeps one row more than the verifier drops.
 ///
-/// The two-model loop drops `(proposals - accept - 1).max(0)` rows from the
-/// draft cache because its drafting pass never feeds the last proposal back;
-/// the MTP sidecar keeps `draft_start + accept + 1` slots because its head wrote
-/// the carry seed into the first one. The two land on the same count of retained
-/// rows, and keeping one fewer degrades the accept rate every round with nothing
-/// saying so.
+/// The two-model loop calls [`draft_rows_to_drop`] because its drafting pass
+/// never feeds the last proposal back, so the draft cache is one row shorter
+/// than the verifier's for the same round. Dropping one too many discards the
+/// last accepted draft's K/V every partial round, which shows up only as a
+/// falling accept rate.
 ///
-/// Mutation: change the `.max(0)` in `d_drop` below to `.max(1)`.
+/// Mutation: change `draft_rows_to_drop` to `(proposals - accept).max(0)`.
 #[test]
 fn the_draft_side_keeps_the_carry_and_the_accepted_prefix() {
     for proposals in 1..=8usize {
         for accept in 0..=proposals {
             let d_offset_before = 100 + proposals as i32;
-            let d_drop = (proposals as i32 - accept as i32 - 1).max(0);
-            let two_model_target = d_offset_before - d_drop;
-            // The draft pass fed the seed plus every proposal but the last, so
-            // the round's own rows are `proposals` and the retained ones are the
-            // carry plus the accepted prefix.
-            let retained = two_model_target - 100;
+            let retained = d_offset_before - draft_rows_to_drop(proposals, accept) - 100;
             assert_eq!(
                 retained,
                 (accept as i32 + 1).min(proposals as i32),
                 "two-model retention at {proposals} proposals, {accept} accepted"
             );
-            // The sidecar counts from where its head started writing.
-            let draft_start = 100_i32;
-            let sidecar_target = draft_start + accept as i32 + 1;
+            // The verifier drops exactly one more than the drafter, except at a
+            // full acceptance where both drop nothing.
+            let v_drop = proposals as i32 - accept as i32;
             assert_eq!(
-                sidecar_target - draft_start,
-                accept as i32 + 1,
-                "sidecar retention at {proposals} proposals, {accept} accepted"
+                draft_rows_to_drop(proposals, accept),
+                (v_drop - 1).max(0),
+                "the two sides part at {proposals} proposals, {accept} accepted"
             );
         }
     }
-    // Absolute rows: a full accept drops nothing, a total reject drops all but
-    // the carry, and one short of a full accept drops nothing either.
-    for (proposals, accept, want_drop) in [(7_i32, 7_i32, 0_i32), (7, 0, 6), (7, 6, 0), (1, 0, 0)] {
-        assert_eq!(
-            (proposals - accept - 1).max(0),
-            want_drop,
-            "{proposals} proposals, {accept} accepted"
-        );
-    }
+    // Absolute rows: a full accept drops nothing, one short of a full accept
+    // drops nothing either, and a total reject drops all but the carry.
+    assert_eq!(draft_rows_to_drop(7, 7), 0);
+    assert_eq!(draft_rows_to_drop(7, 6), 0);
+    assert_eq!(draft_rows_to_drop(7, 0), 6);
+    assert_eq!(draft_rows_to_drop(1, 0), 0);
 }

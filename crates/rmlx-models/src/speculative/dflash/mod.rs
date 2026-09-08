@@ -892,7 +892,8 @@ pub fn dflash_generate(
         // verifier processed it as part of v_input only when it was a draft
         // token — i.e. the committed-position count is `accept` consumed
         // draft slots + the carry b). KV target = pre + accept + 1 carry-rows.
-        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
+        let v_target =
+            super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
         if v_target < v_offset_before {
             let v_pre_round_offset = v_offset_before - v_k as i32;
             super::rollback_round_caches(

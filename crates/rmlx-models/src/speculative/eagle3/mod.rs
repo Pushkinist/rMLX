@@ -128,17 +128,6 @@ use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
-/// Choose the next EAGLE-3 verify block size.
-///
-/// Pure port of `_eagle3_next_block_size` (non-adaptive branch). mlx-vlm's
-/// `_eagle3_rounds` honors the configured/requested size capped to the remaining
-/// budget (the Dogacel drafter advertises no `adaptive_max_block_size`, so the
-/// adaptive tier walk never fires). Returns the next block total (including the
-/// seed/bonus token).
-pub fn eagle3_next_block_size(requested_block_total: usize, remaining_budget: usize) -> usize {
-    requested_block_total.min(remaining_budget)
-}
-
 /// One greedy EAGLE-3 acceptance walk over a drafted block.
 ///
 /// Pure port of `_eagle3_walk`: accept drafted tokens up to the first mismatch
@@ -1039,7 +1028,7 @@ pub fn eagle3_generate(
     while emitted.len() < n_tokens {
         rounds += 1;
         let remaining = n_tokens - emitted.len();
-        let bs = eagle3_next_block_size(block_total, remaining + 1);
+        let bs = super::round_block(block_total, remaining);
         widest_bs = widest_bs.max(bs);
 
         // Track drafter cache offset before draft_block so accept_and_reseed
@@ -1225,7 +1214,8 @@ pub fn eagle3_generate(
         // (pre-round + accept + 1 carry rows). Roll FA KV caches back and refold
         // the GDN recurrence over the kept prefix.
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
-        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
+        let v_target =
+            super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
         if v_target < v_offset_before {
             let v_pre_round_offset = v_offset_before - v_k as i32;
             super::rollback_round_caches(

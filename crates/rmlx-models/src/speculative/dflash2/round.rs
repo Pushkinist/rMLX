@@ -56,8 +56,9 @@ use crate::decode_loop::ProbeStep;
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
     conditioning_residual, disarm_lin_tapes, emit_step, guard_round_conditioning,
-    guard_verifier_prefill_logits, phases_charged, rollback_round_caches, verifier_context,
-    verifier_kv_bytes, DecodeWindow, RoundPhases, RoundStats, SpecLoop, VerifierDraw,
+    guard_verifier_prefill_logits, phases_charged, rollback_round_caches,
+    rollback_target_from_tail, round_block, verifier_context, verifier_kv_bytes, DecodeWindow,
+    RoundPhases, RoundStats, SpecLoop, VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -304,7 +305,7 @@ pub fn dflash2_generate(
         let remaining = n_tokens - emitted.len();
         // The block never resizes: the drafter denoises the block it was
         // trained at, and only the token budget shortens it.
-        let bs = block_total.min(remaining + 1);
+        let bs = round_block(block_total, remaining);
         widest_bs = widest_bs.max(bs);
 
         let t0 = Instant::now();
@@ -378,7 +379,7 @@ pub fn dflash2_generate(
         // recurrent layer's KvCache never advances, so layer 0 would report 0.
         let t0 = Instant::now();
         let v_offset_before = v_caches.iter().map(KvCache::offset).max().unwrap_or(0);
-        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
+        let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
         let refolded = v_target < v_offset_before;
         if refolded {
             let v_pre_round_offset = v_offset_before - v_k as i32;
