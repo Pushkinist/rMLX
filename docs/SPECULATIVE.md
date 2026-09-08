@@ -1612,6 +1612,14 @@ by the drafter's window and is `hidden_size` wide rather than
 `len(target_layer_ids) * hidden_size`: 10 KiB per row on the published pair
 where the capture is 50 KiB.
 
+**The reduction is a trip count, not a measurement.** Per round the projection
+runs over the rows the round committed rather than over the window: `accept + 1`
+rows of `len(target_layer_ids) * hidden_size` where it was `sliding_window - 1`
+of them, which on the published pair is one to eight rows against 2047. That is
+what changed and all that is claimed here. No decode rate or per-phase time is
+quoted for it — a timing figure needs a quiet machine and belongs to the
+published protocol, where it is to be measured.
+
 **It is not bit-identical, and the reason is not the algebra.** `fc` is a matmul,
 and MLX accumulates it differently at different row counts, so a row projected in
 a call of three rows and the same row projected in a call of two thousand land
