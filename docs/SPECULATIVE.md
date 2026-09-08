@@ -1590,14 +1590,31 @@ caching them across rounds, so all of one call's positions are rotated together
 and only the query-key difference reaches the attention scores; a uniform shift
 of every position is then not observable, which the reference's own answer
 confirms — it moves by one bf16 place between two offsets that are
-mathematically the same. **The round loop keeps that choice**: it carries the
-committed hidden states forward and lets the forward re-derive the conditioning
-K/V, where the reference carries a per-layer rotating K/V cache and feeds it only
-each round's new rows. The two are the same answer — the cached rows are a
-deterministic function of those hidden states — and adopting the cache would make
-cached rows carry their own absolute RoPE, losing the invariance and the proof
-that rests on it. The buffer is bounded by the drafter's window rather than
-accumulated: unbounded it would grow by 50 KiB per emitted token.
+mathematically the same. **The round loop keeps that choice**, where the
+reference carries a per-layer rotating K/V cache and feeds it only each round's
+new rows. The two are the same answer — the cached rows are a deterministic
+function of the hidden states — and adopting the cache would make cached rows
+carry their own absolute RoPE, losing the invariance and the proof that rests
+on it.
+
+What the loop does carry is one step earlier than that cache and has no position
+in it. `fc` and `hidden_norm` are row-wise, so the conditioning projection of a
+row does not depend on which other rows were in the call; the loop projects each
+round's committed rows as it commits them and carries the projection, where it
+used to carry the capture and re-project its whole window every round. The
+per-layer K/V — the part RoPE reaches — is still rebuilt over the whole window on
+every call, so the invariance above is untouched. The carried buffer is bounded
+by the drafter's window and is `hidden_size` wide rather than
+`len(target_layer_ids) * hidden_size`: 10 KiB per row on the published pair
+where the capture is 50 KiB.
+
+**It is not bit-identical, and the reason is not the algebra.** `fc` is a matmul,
+and MLX accumulates it differently at different row counts, so a row projected in
+a call of three rows and the same row projected in a call of two thousand land
+one to four f32 units in the last place apart. The rows are the same rows; what
+this can move is which token the selector chain proposes at a near-tie, and so
+the accept rate. It cannot move the answer, because every emitted token is the
+verifier's own at a position the verifier scored.
 
 Three scalars the reference applies to the drafter's logit path —
 `input_embedding_scale`, `output_multiplier`, `final_logit_softcapping` — are
