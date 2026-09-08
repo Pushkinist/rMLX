@@ -126,6 +126,7 @@ use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
+use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Target of this loop's per-position step trace.
 pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
@@ -141,7 +142,6 @@ pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
 pub(crate) fn step_trace_enabled() -> bool {
     tracing::enabled!(target: STEP_TARGET, tracing::Level::TRACE)
 }
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// One greedy EAGLE-3 acceptance walk over a drafted block.
 ///

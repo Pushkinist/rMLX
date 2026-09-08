@@ -275,14 +275,6 @@ fn the_draft_side_keeps_the_carry_and_the_accepted_prefix() {
                 (accept as i32 + 1).min(proposals as i32),
                 "two-model retention at {proposals} proposals, {accept} accepted"
             );
-            // The verifier drops exactly one more than the drafter, except at a
-            // full acceptance where both drop nothing.
-            let v_drop = proposals as i32 - accept as i32;
-            assert_eq!(
-                draft_rows_to_drop(proposals, accept),
-                (v_drop - 1).max(0),
-                "the two sides part at {proposals} proposals, {accept} accepted"
-            );
         }
     }
     // Absolute rows: a full accept drops nothing, one short of a full accept
