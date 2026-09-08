@@ -1561,11 +1561,15 @@ loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
 read, and this loop passes the drafter's own `conditioning_rows`. Chunks that
 have fallen out of that tail are released as the prefill walks the prompt and
 the oldest one still held is cut to the part the tail reaches before anything is
-joined, so what is held is `sliding_window - 1 + PREFILL_CHUNK_SIZE` rows of
-`len(target_layer_ids) * hidden_size` at any prompt length. Joining every chunk
-first and trimming afterwards, which is what this did, held one such row per
-prompt token instead, and the trim then kept `sliding_window - 1` of them. Each
-row is 50 KiB on the published pair. The rows the round loop receives are the
+joined. Two bounds come out of that, and they are different numbers. What is
+*held* is up to `sliding_window - 1 + PREFILL_CHUNK_SIZE` rows, and with the
+chunk just evaluated alive beside it up to
+`sliding_window - 1 + 2 * PREFILL_CHUNK_SIZE` rows are live at once — a chunk is
+released only once the rows behind it reach the window. What is *materialised*
+is at most `sliding_window - 1` rows, which is what the cut before the join
+buys. Joining every chunk first and trimming afterwards, which is what this did,
+held and materialised one row per prompt token instead. Each row is
+`len(target_layer_ids) * hidden_size`, 50 KiB on the published pair. The rows the round loop receives are the
 same ones either way, and no figure in this document changed with it. EAGLE-3
 shares the seam and conditions its own KV prefill on every prompt position, so
 it passes no limit — which is why the bound is the capture's parameter rather

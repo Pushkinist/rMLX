@@ -969,7 +969,9 @@ impl Qwen3_5MoeText {
             );
 
             if let Some(last_logits) = last_logits_opt {
-                return Ok((last_logits, captured.finish(device)?));
+                let (hidden, materialised_rows) = captured.finish(device)?;
+                tracing::debug!(n, keep_last = ?keep_last, materialised_rows, "verify capture joined");
+                return Ok((last_logits, hidden));
             }
 
             pos = end;

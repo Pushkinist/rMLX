@@ -114,7 +114,7 @@ fn the_kept_rows_are_the_tail_the_unbounded_capture_would_have_returned() {
             unbounded_peak, n,
             "{case}: an unbounded accumulation holds every position"
         );
-        let whole = unbounded.finish(Device::Cpu).expect("join unbounded");
+        let (whole, _) = unbounded.finish(Device::Cpu).expect("join unbounded");
         let reference = whole
             .slice(
                 &[0, (n - want_rows) as i32, 0],
@@ -125,7 +125,7 @@ fn the_kept_rows_are_the_tail_the_unbounded_capture_would_have_returned() {
             .expect("slice the unbounded tail");
 
         let (bounded, peak) = accumulate(keep, chunk, n);
-        let kept = bounded.finish(Device::Cpu).expect("join bounded");
+        let (kept, materialised) = bounded.finish(Device::Cpu).expect("join bounded");
 
         assert_eq!(
             kept.shape(),
@@ -143,12 +143,24 @@ fn the_kept_rows_are_the_tail_the_unbounded_capture_would_have_returned() {
             "{case}: the kept rows differ from the tail the unbounded capture would have handed back"
         );
 
-        // A bound that held every chunk to the end returns the same rows, and
-        // only this says so.
+        // Two different things, and neither is the rows that came back.
+        //
+        // What is *held* is bounded by the release rule: a chunk survives until
+        // the rows behind it reach the window, so up to `keep + chunk - 1` rows
+        // sit in the accumulator between pushes. What is *materialised* is
+        // bounded by the cut before the join: joining everything held and
+        // slicing afterwards returns these same rows and builds an array of the
+        // held rows on the way, which is the difference this measures.
         if let Some(keep) = keep {
+            // One chunk is always held, however narrow the window.
+            let held_bound = (keep + chunk).saturating_sub(1).max(chunk);
             assert!(
-                peak <= keep + chunk,
-                "{case}: held {peak} rows, more than the window plus one chunk"
+                peak <= held_bound,
+                "{case}: held {peak} rows, past the {held_bound} the release rule allows"
+            );
+            assert!(
+                materialised <= keep,
+                "{case}: the join materialised {materialised} rows, past the window"
             );
         }
     }
@@ -178,7 +190,7 @@ fn a_chunk_of_the_wrong_rank_is_refused() {
 fn an_empty_accumulation_is_refused() {
     let tail = CaptureTail::new(None);
     match tail.finish(Device::Cpu) {
-        Ok(a) => panic!("an empty accumulation returned {:?}", a.shape()),
+        Ok((a, _)) => panic!("an empty accumulation returned {:?}", a.shape()),
         Err(e) => assert!(
             e.to_string().contains("no capture chunk"),
             "unexpected refusal: {e}"

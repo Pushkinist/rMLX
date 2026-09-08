@@ -682,11 +682,12 @@ fn the_bounded_prefill_capture_equals_the_whole_capture_trimmed() {
                 pos += rows;
             }
 
-            let kept = bounded
+            let (kept, _) = bounded
                 .finish(Device::Cpu)
                 .expect("join the bounded capture");
+            let (joined, _) = whole.finish(Device::Cpu).expect("join the whole capture");
             let trimmed = drafter
-                .trim_conditioning(&whole.finish(Device::Cpu).expect("join the whole capture"))
+                .trim_conditioning(&joined)
                 .expect("trim the whole capture");
 
             assert_eq!(kept.shape(), trimmed.shape(), "{case}: shapes differ");

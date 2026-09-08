@@ -21,7 +21,16 @@ mod capture_tail_tests;
 /// `keep` is that many trailing rows; `None` keeps every row. Chunks that have
 /// fallen out of the kept tail are released as the prefill walks forward, and
 /// the oldest one still held is cut to the part of it the tail reaches before
-/// anything is joined, so the peak is the tail plus the chunk being filled.
+/// anything is joined.
+///
+/// **What that bounds, exactly.** A chunk is only released once the rows behind
+/// it reach `keep` — and one chunk is always held, however narrow `keep` is — so
+/// what is held after a push is up to `keep + chunk - 1` rows, and during a push
+/// the chunk just evaluated is alive beside the rows held before it: up to
+/// `keep + 2 * chunk - 1` rows live at once. What the cut buys is on the other
+/// side of that: no array this **materialises** is wider than `keep` rows, where
+/// joining everything held and slicing afterwards would materialise the
+/// overshoot as well.
 pub(crate) struct CaptureTail {
     keep: Option<usize>,
     /// Row count and capture of each chunk still held, oldest first.
@@ -79,7 +88,13 @@ impl CaptureTail {
         Ok(())
     }
 
-    /// Join what is held into `[1, min(total_rows, keep), width]`.
+    /// Join what is held into `[1, min(total_rows, keep), width]`, and say how
+    /// many rows the array the join produced carries.
+    ///
+    /// That second figure is the one thing here a caller — or a test — cannot
+    /// recover afterwards: a join of everything held followed by a slice returns
+    /// exactly the same rows as a cut followed by a join, and differs only in
+    /// what it built on the way.
     ///
     /// # Errors
     ///
@@ -89,7 +104,7 @@ impl CaptureTail {
         clippy::indexing_slicing,
         reason = "axis 1 and 2 are read after push has established every chunk's rank"
     )]
-    pub(crate) fn finish(mut self, device: Device) -> Result<Array> {
+    pub(crate) fn finish(mut self, device: Device) -> Result<(Array, usize)> {
         if self.chunks.is_empty() {
             return Err(Error::Model(
                 "CaptureTail: no capture chunk was pushed".into(),
@@ -99,10 +114,12 @@ impl CaptureTail {
             self.cut_oldest_to_tail(keep, device)?;
         }
         let held: Vec<&Array> = self.chunks.iter().map(|(_, a)| a).collect();
-        match held.as_slice() {
-            [one] => one.try_clone(),
-            many => concatenate(many, 1, device),
-        }
+        let joined = match held.as_slice() {
+            [one] => one.try_clone()?,
+            many => concatenate(many, 1, device)?,
+        };
+        let materialised = joined.shape()[1].max(0) as usize;
+        Ok((joined, materialised))
     }
 
     /// Replace the oldest chunk with the suffix of it the kept tail reaches.
