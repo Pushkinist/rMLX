@@ -127,6 +127,13 @@ impl CaptureTail {
     /// Cutting before the join rather than slicing after it is what keeps the
     /// transient at one copy of the tail: a join of everything held would
     /// materialise the overshoot too, and then throw it away.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Model`] when the rows to drop reach past the oldest chunk, which
+    /// the release rule in [`Self::push`] makes unreachable and no layer below
+    /// would catch: `Array::slice` does not check that its start precedes its
+    /// stop, and would return some other number of rows rather than fail.
     #[allow(
         clippy::indexing_slicing,
         reason = "the first chunk is read only after the empty case has returned, and its rank is what push established"
@@ -137,7 +144,13 @@ impl CaptureTail {
         }
         let drop_rows = self.rows - keep;
         let (oldest_rows, oldest) = &self.chunks[0];
-        let (oldest_rows, kept_rows) = (*oldest_rows, oldest_rows.saturating_sub(drop_rows));
+        let oldest_rows = *oldest_rows;
+        if drop_rows > oldest_rows {
+            return Err(Error::Model(format!(
+                "CaptureTail: {drop_rows} rows to drop past a window of {keep} reach \
+                 beyond the oldest chunk's {oldest_rows}"
+            )));
+        }
         let shape = oldest.shape();
         let (start, end, width) = (
             i32::try_from(drop_rows),
@@ -151,7 +164,7 @@ impl CaptureTail {
             )));
         };
         let cut = oldest.slice(&[0, start, 0], &[1, end, width], &[1, 1, 1], device)?;
-        self.chunks[0] = (kept_rows, cut);
+        self.chunks[0] = (oldest_rows - drop_rows, cut);
         self.rows = keep;
         Ok(())
     }
