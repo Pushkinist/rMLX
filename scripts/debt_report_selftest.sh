@@ -78,11 +78,30 @@ check "round_loop_group_named" \
     contains "--- round-loop drivers (crates/rmlx-models/src/speculative) ---" \
     BASE_OUT
 
-for driver in mtp_generate dflash_generate dflash2_generate eagle3_generate \
-    mtp_assistant_generate spec_generate_greedy; do
+check "round_loop_driver_count" \
+    "all 8 signature-matching drivers are found — 6 pub loops plus the 2 private cached ones a name list misses" \
+    contains "  8 driver(s) found" \
+    BASE_OUT
+
+for entry in \
+    "mtp_generate:crates/rmlx-models/src/speculative/mtp.rs:5" \
+    "dflash_generate:crates/rmlx-models/src/speculative/dflash.rs:5" \
+    "dflash2_generate:crates/rmlx-models/src/speculative/dflash2.rs:5" \
+    "eagle3_generate:crates/rmlx-models/src/speculative/eagle3.rs:5" \
+    "mtp_assistant_generate:crates/rmlx-models/src/speculative/gemma4_assistant.rs:5" \
+    "spec_generate_greedy:crates/rmlx-models/src/speculative/mod.rs:5" \
+    "spec_generate_greedy_cached:crates/rmlx-models/src/speculative/cached.rs:5" \
+    "spec_generate_stochastic_cached:crates/rmlx-models/src/speculative/cached.rs:21"
+do
+    driver="${entry%%:*}"
+    where="${entry#*:}"
     check "round_loop_has_${driver}" \
-        "the round-loop group names ${driver}" \
+        "the round-loop group resolves ${driver} to its actual file:line, not just its name" \
         contains "  ${driver}" \
+        BASE_OUT
+    check "round_loop_path_${driver}" \
+        "${driver}'s resolved path is the one printed" \
+        contains "${where}" \
         BASE_OUT
 done
 
@@ -100,6 +119,39 @@ check "dead_path_not_attempted" \
     "dead-path counting says plainly that it is not attempted" \
     contains "dead-path (zero non-test callers): not attempted" \
     BASE_OUT
+
+# ---- negative case: a renamed driver is discovered under its new name, not --
+# ---- its old one, and the group's total count is unaffected by a rename ----
+
+RENAME_WORK="$(mktemp -d)"
+cp -R "$BASE" "$RENAME_WORK/base"
+sed -i.bak 's/pub fn mtp_generate(/pub fn zzz_renamed_driver(/' \
+    "$RENAME_WORK/base/crates/rmlx-models/src/speculative/mtp.rs"
+rm -f "$RENAME_WORK/base/crates/rmlx-models/src/speculative/mtp.rs.bak"
+
+RENAME_OUT=$(python3 "$TOOL" --root "$RENAME_WORK/base")
+
+check "renamed_driver_old_name_absent" \
+    "renaming a driver's fn (not its signature) removes its old name from the group" \
+    absent "mtp_generate" \
+    RENAME_OUT
+
+check "renamed_driver_new_name_present" \
+    "discovery is signature-driven, not name-driven — the renamed fn is still found, under its new name" \
+    contains "  zzz_renamed_driver" \
+    RENAME_OUT
+
+check "renamed_driver_new_path_present" \
+    "the renamed fn's resolved path is still the one printed" \
+    contains "crates/rmlx-models/src/speculative/mtp.rs:5" \
+    RENAME_OUT
+
+check "renamed_driver_count_unchanged" \
+    "the total driver count is unaffected by a pure rename (still 8) — a naive name-keyed implementation would lose one" \
+    contains "  8 driver(s) found" \
+    RENAME_OUT
+
+rm -rf "$RENAME_WORK"
 
 # ---- add/remove ratio on a synthetic two-commit repo -----------------------
 
