@@ -1908,13 +1908,17 @@ pub(crate) fn accept_prefix(
 /// The block a round runs, narrowed against what is left of the token budget.
 ///
 /// `block_total` counts the verifier's own token, so a round with `remaining`
-/// tokens still to emit can run at most `remaining + 1` of it. Every loop's
-/// block resolver returns at least 2 and every loop's guard gives at least one
-/// remaining token, so the `.max(2)` and `.max(1)` the call sites used to carry
-/// could never fire and are not reproduced here.
+/// tokens still to emit can run at most `remaining + 1` of it.
+///
+/// The floor is a no-op for every input a round loop reaches — every block
+/// resolver returns at least 2 and every loop's guard gives at least one
+/// remaining token, so `min` alone already answers at least 2 — and it is here
+/// for a caller that arrives at `remaining` some other way. A round of one
+/// verifies the carry token and drafts nothing, which is plain decode wearing a
+/// round's costs.
 #[must_use]
 pub(crate) fn round_block(block_total: usize, remaining: usize) -> usize {
-    block_total.min(remaining + 1)
+    block_total.min(remaining + 1).max(2)
 }
 
 /// The verifier KV offset a round rolls back to, counted from where the verify

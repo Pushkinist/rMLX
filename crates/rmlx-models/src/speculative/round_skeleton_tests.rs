@@ -150,11 +150,13 @@ fn the_three_acceptance_walks_commit_the_same_rows() {
 /// domain a round can reach that is one function.
 ///
 /// [`round_block`] is now the only producer, called by the MTP sidecar, DFlash 2,
-/// EAGLE-3 and the Gemma4 assistant. Three of those four used to spell it with a
-/// `.max(2)` that could never fire: a loop only narrows with at least one token
-/// left to emit, and every block resolver in the tree returns at least 2. The
-/// two-model loops count proposals rather than blocks and reach the same number
-/// one off, which is checked here because it is the one place the two units meet.
+/// EAGLE-3 and the Gemma4 assistant. Three of those four spelled it with a
+/// `.max(2)` that could not fire from inside a round — a loop only narrows with
+/// at least one token left to emit, and every block resolver in the tree returns
+/// at least 2 — and the shared producer keeps the floor anyway, for a caller
+/// that arrives at `remaining` some other way. The two-model loops count
+/// proposals rather than blocks and reach the same number one off, which is
+/// checked here because it is the one place the two units meet.
 ///
 /// DFlash 1 is the exception and stays its own function: its block follows the
 /// accept rate of the recent rounds.
@@ -187,6 +189,10 @@ fn the_round_block_is_one_function_of_the_block_and_the_budget() {
         }
     }
     // Absolute rows.
+    // A budget with nothing left to emit is outside the domain a round loop
+    // reaches, and the floor is what answers there — a round of one drafts
+    // nothing.
+    assert_eq!(round_block(8, 0), 2);
     assert_eq!(round_block(8, 3), 4);
     assert_eq!(round_block(8, 8), 8);
     assert_eq!(round_block(8, 64), 8);
