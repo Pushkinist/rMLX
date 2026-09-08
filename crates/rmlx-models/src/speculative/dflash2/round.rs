@@ -97,7 +97,7 @@ pub(super) const PREFILL_CHUNK_SIZE: usize = 1024;
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
-    reason = "the one index is axis 1 of the conditioning buffer, whose rank trim_conditioning checks before returning it"
+    reason = "every index is axis 1 of a rank-3 buffer whose rank the seam that produced it checked: the trim, the projection and the carried buffer they extend"
 )]
 pub fn dflash2_generate(
     verifier: &Architecture,
