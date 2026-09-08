@@ -573,6 +573,22 @@ fn conditioning_rows_at(first: i32, rows: i32, width: i32) -> Array {
     f32_array(&data, &[1, rows, width])
 }
 
+/// Rows that differ in **direction**, not only in scale: element `c` of the row
+/// at absolute position `r` is `sin(0.37 r + 0.11 c)`.
+///
+/// The projection is scale-invariant — `fc` carries no bias and `hidden_norm` is
+/// an RMSNorm — so rows that are multiples of one vector all project to nearly
+/// the same thing, and a test built on those cannot tell one row from another,
+/// let alone a permuted buffer from an ordered one. These rows are what gives
+/// the projection tests their power; `the_window_shifted_by_one_row_is_a_visible_difference`
+/// measures how much.
+fn varied_rows_at(first: i32, rows: i32, width: i32) -> Array {
+    let data: Vec<f32> = (first..first + rows)
+        .flat_map(|r| (0..width).map(move |c| (0.37 * r as f32 + 0.11 * c as f32).sin()))
+        .collect();
+    f32_array(&data, &[1, rows, width])
+}
+
 /// The first element of every row, which is that row's own number.
 #[allow(
     clippy::indexing_slicing,
@@ -707,13 +723,13 @@ fn advancing_the_carried_projection_leaves_it_at_the_bound() {
     let keep = drafter.conditioning_rows();
     let width = (drafter.cfg.target_layer_ids.len() * SCALE_HIDDEN) as i32;
 
-    let mut carried = match drafter.project_conditioning(&conditioning_rows_at(0, 2, width)) {
+    let mut carried = match drafter.project_conditioning(&varied_rows_at(0, 2, width)) {
         Ok(a) => a,
         Err(e) => panic!("project the seed rows: {e}"),
     };
     let mut next = 2;
     for round in 0..6 {
-        let committed = conditioning_rows_at(next, 3, width);
+        let committed = varied_rows_at(next, 3, width);
         next += 3;
         let (grown, projected) = match drafter.advance_conditioning(&carried, &committed) {
             Ok(pair) => pair,
@@ -776,7 +792,7 @@ fn the_carried_projection_equals_projecting_the_whole_history() {
         // The prompt's rows, then rounds committing a full block, a partial
         // accept, a single correction and a full block again.
         let prompt_rows = (keep + 3).min(37);
-        let mut history = conditioning_rows_at(0, prompt_rows, width);
+        let mut history = varied_rows_at(0, prompt_rows, width);
         let mut carried = match drafter.project_conditioning(&trimmed_of(&drafter, &history)) {
             Ok(a) => a,
             Err(e) => panic!("project the prompt rows: {e}"),
@@ -784,7 +800,7 @@ fn the_carried_projection_equals_projecting_the_whole_history() {
         let mut next = prompt_rows;
 
         for (round, commit) in [5, 3, 1, 5].into_iter().enumerate() {
-            let committed = conditioning_rows_at(next, commit, width);
+            let committed = varied_rows_at(next, commit, width);
             next += commit;
             let (grown, projected) = match drafter.advance_conditioning(&carried, &committed) {
                 Ok(pair) => pair,
@@ -815,6 +831,22 @@ fn the_carried_projection_equals_projecting_the_whole_history() {
                 diff < PROJECTION_TOL,
                 "{case}: the carried projection differs from projecting the whole \
                  history by {diff:e}"
+            );
+
+            // The same window one row over, projected the same way. Without it
+            // the bound above is a bound on nothing: it has to be small against
+            // a difference the test can produce, not against zero.
+            let rows = carried.shape()[1];
+            let shifted =
+                match drafter.project_conditioning(&varied_rows_at(next - rows + 1, rows, width)) {
+                    Ok(a) => a,
+                    Err(e) => panic!("project the shifted window at round {round}: {e}"),
+                };
+            let control = max_abs_diff(&carried, &shifted);
+            assert!(
+                control > 10.0 * PROJECTION_TOL,
+                "{case}: the window shifted by one row differs by only {control:e}, so \
+                 this fixture's rows are too alike for the bound above to separate them"
             );
         }
     }
