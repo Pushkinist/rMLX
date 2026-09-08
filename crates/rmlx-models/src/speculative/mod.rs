@@ -1933,8 +1933,12 @@ pub(crate) const PROJECTION_TOL: f32 = 1e-5;
 /// takes one. This reports that gap rather than assuming it away, which is why
 /// it is a measurement and not an assertion — a drafter conditioned on a
 /// last-place-different row proposes a different token only at a near-tie, and
-/// greedy verification emits the verifier's own tokens either way, so nothing
-/// else in a run would show it.
+/// the verifier then accepts a different number of them, which is where it shows
+/// up first. It does not stop there: a different accept split changes the next
+/// verify block's composition, so the verifier's own logits move in their last
+/// place too and a near-tie of its own can resolve the other way. Equivalence is
+/// judged by the oracle in `docs/SPEC_ANSWER_EQUIVALENCE.md`, not by byte
+/// equality.
 ///
 /// **What it does and does not reach.** Both arguments are `[1, rows, hidden]`
 /// and bounded by one block, so this is one small pass taken once per request —
@@ -1987,8 +1991,10 @@ fn guard_round_conditioning(round: usize, projected: i32, committed: usize) -> R
 /// caches keep only the first two — so a slice from the other end conditions the
 /// next round on drafts the verifier threw away. It is the same shape and the
 /// same row count either way, and greedy verification emits the verifier's own
-/// tokens whatever the drafter was conditioned on, so the answer would not move
-/// and only the accept rate would.
+/// tokens whatever the drafter was conditioned on, so what moves first is the
+/// accept rate rather than the text — far enough along, a changed accept split
+/// reshapes the verify blocks and the text can move too, at a near-tie of the
+/// verifier's own.
 ///
 /// Both DFlash loops commit through this, and they count their rows
 /// differently: one takes the accepted proposals plus the carry token, the other

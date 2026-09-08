@@ -577,7 +577,11 @@ impl RoundStats {
         let high = self.emitted_in_rounds.saturating_add(slack);
         (rows < low || rows > high).then(|| {
             format!(
-                "conditioned_rows {rows} against emitted_in_rounds {} over {} rounds: a                  request conditions on the rows its rounds committed, give or take the one                  round that stopped early and the one the budget cut, so these differ by                  more than the block {slack} only when the loop is taking the wrong rows",
+                "conditioned_rows {rows} against emitted_in_rounds {} over {} rounds: \
+                 a request conditions on the rows its rounds committed, give or take \
+                 the one round that stopped early and the one the budget cut, so these \
+                 differ by more than the block {slack} only when the loop is taking the \
+                 wrong rows",
                 self.emitted_in_rounds, self.rounds
             )
         })

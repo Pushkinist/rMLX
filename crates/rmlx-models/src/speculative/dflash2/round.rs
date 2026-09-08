@@ -209,8 +209,8 @@ pub fn dflash2_generate(
     // What the capture was asked to keep is a number at a call site, and the
     // trim above accepts a shorter buffer without a word. A drafter conditioned
     // on less than its window still proposes, and greedy verification then emits
-    // the verifier's own tokens whatever the proposals were — so the answer is
-    // unchanged and only the accept rate falls. Nothing else here would say so.
+    // the verifier's own tokens whatever the proposals were — so what falls is
+    // the accept rate, and nothing here would say so.
     let want_rows = keep_rows.min(i32::try_from(prompt_ids.len()).unwrap_or(i32::MAX));
     if prompt_ctx.shape()[1] != want_rows {
         return Err(Error::Model(format!(

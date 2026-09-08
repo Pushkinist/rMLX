@@ -668,33 +668,33 @@ its own commit and not the generation so far. `fc` is a bias-free linear and
 re-projection would have produced, and carrying the projection also holds a row
 at `hidden_size` rather than `len(target_layer_ids) * hidden_size`.
 
-**How exact that identity is.** Exact in exact arithmetic. At a checkpoint's
-dtype it is exact only up to the projection's own dispatch: `fc` is a matmul, and
-MLX chooses its kernel and reduction order by shape, so the same row projected at
-two different call heights is not guaranteed to give the same bits. What that can
-move and what it cannot are separate questions — under greedy verification the
-emitted tokens are the verifier's own whatever the drafter proposed, so **the
-answer cannot move**, while a drafted token at a near-tie can flip and with it
-the round's accept split.
-
-Measured on `Qwen3.6-35B-A3B-8bit` + `Qwen3.6-35B-A3B-DFlash` over 1024 greedy
-tokens, against a loop that re-projected its whole accumulated buffer every
-round: identical answer digest, identical 357 rounds, 1147 drafted and 667
-accepted, `conditioned_rows` 1023 — with four rounds' accept counts redistributed
-between neighbours. So the accept stream moved and nothing else did.
-
-Both loops report the residual once per request at `debug`
-(`conditioning_residual`, `dflash conditioning:` / `dflash2 conditioning:`),
-comparing the carried buffer's tail against a fresh projection of the rows it was
-built from. On that pair it reads **0.0** — the carry is bit-exact at the heights
-a round projects at, which are 1 to 5 rows. It does not reach the heights the
-re-projecting loop used, which ran to 1023 on the same request: getting there
-would mean holding the raw capture for the whole generation, the cost the carried
-projection removes. **The four moved rounds are therefore consistent with
-height-dependent dispatch and not demonstrated by it** — the mechanism is
-inferred, and unmeasured at the heights where the two loops differ. The fixtures'
+**How exact that identity is, and what it can move.** Exact in exact
+arithmetic. At a checkpoint's dtype it is exact only up to the projection's own
+dispatch: `fc` is a matmul, and MLX chooses its kernel and reduction order by
+shape, so the same row projected at two different call heights is not guaranteed
+to give the same bits. `crates/rmlx-models/tests/spec_conditioning_residual.rs`
+measures that on the shipped pairs, comparing a round's commits against all of
+them in one call at the height a generation reaches. It is a rounding
+difference and reads as one: on the DFlash 1 pair no row differs by as much as
+one `bf16` unit in the last place of its own scale, and on the DFlash 2 pair
+three rows of a few hundred reach a small multiple of one. The fixtures'
 `PROJECTION_TOL` is an `f32` bound on `f32` fixtures and is not a statement about
-a checkpoint's dtype either.
+either.
+
+**A last-place difference is not confined to the drafter.** A drafter proposing
+a different token at a near-tie changes what the round accepted; a different
+accept split changes the composition and the height of the next verify block; and
+the *verifier's* own logits at later positions are then computed under a
+different dispatch too. So a near-tie the verifier itself is sitting on can
+resolve the other way, and the emitted text can differ — later, and at a
+position whose top two candidates are near-tied. **Byte-equality against a
+no-drafter arm is therefore not the criterion**, and this repository does not use
+it as one: equivalence is judged by the divergence-confidence oracle in
+[`SPEC_ANSWER_EQUIVALENCE.md`](SPEC_ANSWER_EQUIVALENCE.md), which asks where the
+divergence sits in the plain arm's own margin distribution rather than whether it
+happened. The recorded evidence for both loops is the pairs in
+`crates/rmlx-models/tests/spec_greedy_equivalence.rs`, which run that oracle over
+a prompt set; a byte comparison on a single prompt is not evidence either way.
 
 **And it is not bounded, deliberately.** Unlike DFlash 2, this checkpoint
 declares `sliding_window: null`, `use_sliding_window: false` and eight
@@ -1607,13 +1607,13 @@ loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
 read, and this loop passes the drafter's own `conditioning_rows`. Chunks that
 have fallen out of that tail are released as the prefill walks the prompt and
 the oldest one still held is cut to the part the tail reaches before anything is
-joined. Two bounds come out of that, and they are different numbers. What is
-*held* is up to `sliding_window - 1 + PREFILL_CHUNK_SIZE` rows, and with the
-chunk just evaluated alive beside it up to
-`sliding_window - 1 + 2 * PREFILL_CHUNK_SIZE` rows are live at once — a chunk is
-released only once the rows behind it reach the window. What is *materialised*
-is at most `sliding_window - 1` rows, which is what the cut before the join
-buys. Joining every chunk first and trimming afterwards, which is what this did,
+joined. Two bounds come out of that, and they are different
+numbers: what is *held* overshoots the window by up to a chunk, because a chunk
+is released only once the rows behind it reach the window, while what is
+*materialised* is at most `sliding_window - 1` rows, which is what the cut before
+the join buys. `CaptureTail` states both in terms of its own `keep` and `chunk`
+and is the one place they are written down; restating the arithmetic here is how
+the two drift apart. Joining every chunk first and trimming afterwards, which is what this did,
 held and materialised one row per prompt token instead. Each row is
 `len(target_layer_ids) * hidden_size`, 50 KiB on the published pair. The rows the round loop receives are the
 same ones either way, and no figure in this document changed with it. EAGLE-3

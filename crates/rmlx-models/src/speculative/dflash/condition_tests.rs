@@ -8,8 +8,8 @@
 //! `PROJECTION_TOL`, whose doc says why that is not zero and why an `f32`
 //! fixture's figure does not carry to a checkpoint at its own dtype. And greedy
 //! verification emits the verifier's own tokens whatever the drafter was
-//! conditioned on, so a buffer built from the wrong rows changes only the accept
-//! rate. What is checked here is therefore the buffer itself: that it agrees
+//! conditioned on, so a buffer built from the wrong rows moves the accept rate
+//! before it moves anything a reader would notice. What is checked here is therefore the buffer itself: that it agrees
 //! with the whole history's projection, and that the rows each round put into it
 //! are the ones the round committed, by their position rather than by their
 //! count.
