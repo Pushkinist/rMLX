@@ -804,10 +804,10 @@ hidden. This precomputed token (`d_seed_tok`) is passed as `precomputed_first_to
 to the next `draft_block`, preventing the correction position from being
 processed twice (a structural bug fixed during the reference-alignment pass).
 
-**Block-size schedule.** `eagle3_next_block_size` is non-adaptive for the
-Dogacel checkpoint (it uses the configured block ceiling capped to the
-remaining budget). The DFlash adaptive schedule fires only when
-`adaptive_max_block_size` is present in the config.
+**Block-size schedule.** There is none. Each round takes the shared
+`round_block` — the request's block narrowed against the tokens it may still
+emit — and no more; the accept rate moves nothing here. DFlash 1's adaptive
+schedule is not reachable from this loop.
 
 **GDN rollback.** Identical to the DFlash path: a round tape armed before each
 verify forward, refolded over the accepted prefix on partial accept.
