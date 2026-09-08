@@ -570,6 +570,13 @@ impl RoundStats {
     /// within one block of each other. Drift proportional to the round count is
     /// a loop conditioning on the wrong rows every round, which nothing in an
     /// answer reports.
+    ///
+    /// It does not repeat the per-round guard, it outflanks it. That guard
+    /// compares the projection against the round's own count, so a count moved
+    /// at both the slice and the guard agrees with itself and passes; this one
+    /// compares against `emitted_in_rounds`, which is counted at the emit site
+    /// from the tokens rather than from the count, so the same edit still shows
+    /// up here as drift proportional to the round count.
     pub(crate) fn conditioning_violation(&self) -> Option<String> {
         let rows = self.conditioned_rows?;
         let slack = self.block_size;

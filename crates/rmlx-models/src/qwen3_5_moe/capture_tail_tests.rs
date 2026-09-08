@@ -143,14 +143,10 @@ fn the_kept_rows_are_the_tail_the_unbounded_capture_would_have_returned() {
             "{case}: the kept rows differ from the tail the unbounded capture would have handed back"
         );
 
-        // Two different things, and neither is the rows that came back.
-        //
-        // What is *held* is bounded by the release rule: a chunk survives until
-        // the rows behind it reach the window, so up to `keep + chunk - 1` rows
-        // sit in the accumulator between pushes. What is *materialised* is
-        // bounded by the cut before the join: joining everything held and
-        // slicing afterwards returns these same rows and builds an array of the
-        // held rows on the way, which is the difference this measures.
+        // Two different things, and neither is the rows that came back: what the
+        // accumulator holds between pushes, and what the join materialises. Both
+        // bounds are stated on `CaptureTail` itself; the arithmetic below is a
+        // reading of that statement and not a second one.
         if let Some(keep) = keep {
             // One chunk is always held, however narrow the window.
             let held_bound = (keep + chunk).saturating_sub(1).max(chunk);
