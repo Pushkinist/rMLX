@@ -1895,6 +1895,42 @@ pub(crate) fn accept_prefix(
     Ok((accepted, emit))
 }
 
+/// The rows a round commits out of its verify pass's capture: the **first**
+/// `rows` positions, the carry token followed by the tokens the walk kept.
+///
+/// Which end this takes is the whole of it. The verify pass scored the carry
+/// token, the accepted proposals and the rejected ones in one forward, and the
+/// caches keep only the first two — so a slice from the other end conditions the
+/// next round on drafts the verifier threw away. It is the same shape and the
+/// same row count either way, and greedy verification emits the verifier's own
+/// tokens whatever the drafter was conditioned on, so the answer would not move
+/// and only the accept rate would.
+///
+/// Both DFlash loops commit through this, and they count their rows
+/// differently: one takes the accepted proposals plus the carry token, the other
+/// the tokens it actually emitted, which the request's remaining budget can cut
+/// short. That is why the count is the caller's and the end is not.
+///
+/// # Errors
+///
+/// [`Error::Model`] when the capture holds fewer positions than the round
+/// commits, or from the slice.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "axis 1 is read on a capture the verify forward built at rank 3"
+)]
+fn committed_rows(v_hidden: &Array, rows: usize, width: i32, device: Device) -> Result<Array> {
+    let rows = rows as i32;
+    let have = v_hidden.shape()[1];
+    if rows > have {
+        return Err(Error::Model(format!(
+            "committed_rows: the round commits {rows} positions but its verify \
+             capture holds {have} positions"
+        )));
+    }
+    v_hidden.slice(&[0, 0, 0], &[1, rows, width], &[1, 1, 1], device)
+}
+
 /// Roll one speculative round's caches back to `target_offset` after a partial
 /// acceptance — both the full-attention `kv` stack and, when the arch has one,
 /// the GDN recurrent state in `lin`.

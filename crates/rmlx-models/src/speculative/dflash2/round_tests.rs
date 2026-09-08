@@ -13,7 +13,7 @@
 
 use rmlx_mlx::{concatenate, Array, Device};
 
-use super::committed_rows;
+use crate::speculative::committed_rows;
 use crate::speculative::dflash2::DFlash2Drafter;
 
 /// The fixture drafter's width, matching `forward_tests`.
@@ -107,7 +107,7 @@ fn a_round_commits_the_accepted_prefix_of_its_capture() {
         // The verify pass scores the carry token and four proposals. Only the
         // first `accept + 1` rows survive the round's rollback.
         let v_hidden = rows_at(next, 5, width);
-        let committed = committed_rows(&v_hidden, accept, width, Device::Cpu)
+        let committed = committed_rows(&v_hidden, accept + 1, width, Device::Cpu)
             .expect("slice the committed rows");
 
         assert_eq!(
@@ -166,9 +166,9 @@ fn a_round_commits_the_accepted_prefix_of_its_capture() {
 fn a_capture_shorter_than_the_accepted_prefix_is_refused() {
     let width = 4;
     let v_hidden = rows_at(0, 3, width);
-    let err = match committed_rows(&v_hidden, 5, width, Device::Cpu) {
+    let err = match committed_rows(&v_hidden, 6, width, Device::Cpu) {
         Ok(a) => panic!(
-            "a capture of 3 rows accepted 5 proposals, got {:?}",
+            "a capture of 3 rows committed 6 positions, got {:?}",
             a.shape()
         ),
         Err(e) => e.to_string(),

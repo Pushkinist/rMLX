@@ -659,8 +659,26 @@ truncated KV cache.
 **Accumulated conditioning context.** The drafter conditions on the
 accumulated verifier hidden across all rounds (equivalent to the Python
 reference's persistent draft KV cache). After each round the committed slice of
-the verifier hidden `v_hidden[:, :n_committed, :]` is concatenated onto
-`h_ctx_raw`; this grows monotonically and is projected freshly each round.
+the verifier hidden `v_hidden[:, :n_committed, :]` is projected through `fc` +
+`hidden_norm` and concatenated onto the projection carried from the last round.
+The buffer grows monotonically; each round's projection covers that round's
+commit rather than the whole of it, so the number of rows a round projects is
+its own commit and not the generation so far. `fc` is a bias-free linear and
+`hidden_norm` an RMSNorm — both row-wise — so a row projected once is the row a
+re-projection would have produced, and carrying the projection also holds a row
+at `hidden_size` rather than `len(target_layer_ids) * hidden_size`.
+
+**And it is not bounded, deliberately.** Unlike DFlash 2, this checkpoint
+declares `sliding_window: null`, `use_sliding_window: false` and eight
+`full_attention` layers, and the drafter's block attention runs with no mask
+over the context, so every carried row is read by every proposal query. Both
+reference implementations condition on the whole history by default — mlx-vlm
+allocates an unbounded KV cache per full-attention drafter layer, and SGLang's
+draft window defaults to off, documented as full attention/context. A draft
+window is an operator choice there, not a checkpoint declaration. Trimming the
+buffer would drop rows the drafter reads and shift the positions of the rest;
+under greedy verification the emitted tokens would not move and only the accept
+rate would fall, so nothing in an answer would report it.
 
 Weight layout:
 

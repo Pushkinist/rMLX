@@ -54,9 +54,10 @@ use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::{
-    accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, disarm_lin_tapes, emit_step,
-    guard_verifier_prefill_logits, phases_charged, rollback_round_caches, verifier_context,
-    verifier_kv_bytes, DecodeWindow, RoundPhases, RoundStats, SpecLoop, VerifierDraw,
+    accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows, disarm_lin_tapes,
+    emit_step, guard_verifier_prefill_logits, phases_charged, rollback_round_caches,
+    verifier_context, verifier_kv_bytes, DecodeWindow, RoundPhases, RoundStats, SpecLoop,
+    VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -374,7 +375,8 @@ pub fn dflash2_generate(
         }
         let round_rollback_ns = t0.elapsed().as_nanos();
 
-        let committed_hidden = committed_rows(&v_hidden, accept, condition_width, device)?;
+        // The carry token and the accepted proposals.
+        let committed_hidden = committed_rows(&v_hidden, accept + 1, condition_width, device)?;
         let projected_rows;
         (h_ctx, projected_rows) = drafter.advance_conditioning(&h_ctx, &committed_hidden)?;
         if charge_phases {
@@ -447,37 +449,6 @@ pub fn dflash2_generate(
         crate::decode_loop::PostDecode::seal(),
     );
     Ok((emitted, widest_bs))
-}
-
-/// The capture rows a round commits: the carry token and the accepted proposals,
-/// which are the **first** `accept + 1` positions of the verify pass's capture.
-///
-/// Which end this takes is the whole of it. The verify pass scored the carry
-/// token, the accepted proposals and the rejected ones in one forward, and the
-/// caches keep only the first two — so a slice from the other end conditions the
-/// next round on drafts the verifier threw away. It is the same shape and the
-/// same row count either way, and greedy verification emits the verifier's own
-/// tokens whatever the drafter was conditioned on, so the answer would not move
-/// and only the accept rate would.
-///
-/// # Errors
-///
-/// [`Error::Model`] when the capture has fewer positions than the round
-/// accepted, or from the slice.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "axis 1 is read on a capture the verify forward built at rank 3"
-)]
-fn committed_rows(v_hidden: &Array, accept: usize, width: i32, device: Device) -> Result<Array> {
-    let rows = accept as i32 + 1;
-    let have = v_hidden.shape()[1];
-    if rows > have {
-        return Err(Error::Model(format!(
-            "dflash2_generate: the round accepted {accept} proposals but its verify \
-             capture holds {have} positions"
-        )));
-    }
-    v_hidden.slice(&[0, 0, 0], &[1, rows, width], &[1, 1, 1], device)
 }
 
 /// One block of `bs - 1` proposals: mask the block behind the carry token,
