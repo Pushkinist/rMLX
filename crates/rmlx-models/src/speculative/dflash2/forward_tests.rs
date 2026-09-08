@@ -22,8 +22,11 @@ use std::path::{Path, PathBuf};
 
 use rmlx_mlx::Dtype;
 
+use super::super::round::PREFILL_CHUNK_SIZE;
 use super::*;
 use crate::layers::Linear;
+use crate::qwen3_5_moe::capture_tail::CaptureTail;
+use crate::speculative::PROJECTION_TOL;
 
 /// Where the reference snapshot and its expected outputs live.
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dflash2_scale");
@@ -550,6 +553,31 @@ fn conditioning_rows_of(rows: i32, width: i32) -> Array {
     f32_array(&data, &[1, rows, width])
 }
 
+/// `conditioning_rows_of` shifted to start at an absolute prompt position, so a
+/// capture assembled from several chunks numbers its rows continuously.
+fn conditioning_rows_at(first: i32, rows: i32, width: i32) -> Array {
+    let data: Vec<f32> = (first..first + rows)
+        .flat_map(|r| std::iter::repeat_n(r as f32, width as usize))
+        .collect();
+    f32_array(&data, &[1, rows, width])
+}
+
+/// Rows that differ in **direction**, not only in scale: element `c` of the row
+/// at absolute position `r` is `sin(0.37 r + 0.11 c)`.
+///
+/// The projection is scale-invariant — `fc` carries no bias and `hidden_norm` is
+/// an RMSNorm — so rows that are multiples of one vector all project to nearly
+/// the same thing, and a test built on those cannot tell one row from another,
+/// let alone a permuted buffer from an ordered one. These rows are what gives
+/// the projection tests their power; `the_window_shifted_by_one_row_is_a_visible_difference`
+/// measures how much.
+fn varied_rows_at(first: i32, rows: i32, width: i32) -> Array {
+    let data: Vec<f32> = (first..first + rows)
+        .flat_map(|r| (0..width).map(move |c| (0.37 * r as f32 + 0.11 * c as f32).sin()))
+        .collect();
+    f32_array(&data, &[1, rows, width])
+}
+
 /// The first element of every row, which is that row's own number.
 #[allow(
     clippy::indexing_slicing,
@@ -603,45 +631,223 @@ fn the_trim_keeps_the_newest_rows_and_carries_a_short_buffer_whole() {
     assert_eq!(row_numbers(&again), vec![5, 6, 7, 8]);
 }
 
-/// Extending the carried buffer bounds it in the same step, so a buffer already
-/// at the bound stays there however many rounds append to it.
+/// The prefill capture, bounded by this drafter's own window, hands back exactly
+/// what the whole capture trimmed would have.
 ///
-/// The round loop's per-round growth goes through this and nothing else. Growing
-/// without bounding produces the same tokens and an unbounded allocation, which
-/// is why the two are one operation rather than two lines at a call site.
+/// The round loop passes a row count to the capture and then trims what comes
+/// back, and the trim accepts a buffer shorter than the window without a word: a
+/// drafter conditioned on half its window still proposes, greedy verification
+/// still emits the verifier's own tokens, and the answer does not move. So the
+/// two paths are compared here on their bytes, at prompts either side of the
+/// window and at the chunk size the round loop passes.
 #[test]
-fn extending_the_carried_buffer_leaves_it_at_the_bound() {
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: a capture that cannot be accumulated or joined is the assertion failing"
+)]
+fn the_bounded_prefill_capture_equals_the_whole_capture_trimmed() {
+    for window in [5u64, 2048] {
+        let (drafter, _dir) = scale_drafter(Some(window));
+        let keep = drafter.conditioning_rows();
+        let width = (drafter.cfg.target_layer_ids.len() * SCALE_HIDDEN) as i32;
+
+        for n in [
+            keep - 1,
+            keep,
+            keep + 1,
+            keep + PREFILL_CHUNK_SIZE as i32 + 7,
+        ] {
+            let case = format!("window {window}, prompt {n} rows");
+            let mut bounded = CaptureTail::new(Some(keep as usize));
+            let mut whole = CaptureTail::new(None);
+            let mut pos = 0;
+            while pos < n {
+                let rows = PREFILL_CHUNK_SIZE.min((n - pos) as usize) as i32;
+                let chunk = conditioning_rows_at(pos, rows, width);
+                bounded
+                    .push(chunk.try_clone().expect("clone chunk"))
+                    .expect("push to the bounded capture");
+                whole.push(chunk).expect("push to the whole capture");
+                pos += rows;
+            }
+
+            let (kept, _) = bounded
+                .finish(Device::Cpu)
+                .expect("join the bounded capture");
+            let (joined, _) = whole.finish(Device::Cpu).expect("join the whole capture");
+            let trimmed = drafter
+                .trim_conditioning(&joined)
+                .expect("trim the whole capture");
+
+            assert_eq!(kept.shape(), trimmed.shape(), "{case}: shapes differ");
+            assert_eq!(
+                to_f32(&kept),
+                to_f32(&trimmed),
+                "{case}: the bounded capture is not the rows the trim would have kept"
+            );
+            assert_eq!(
+                row_numbers(&kept),
+                row_numbers(&trimmed),
+                "{case}: the bounded capture kept the wrong end"
+            );
+        }
+    }
+}
+
+/// Advancing the carried projection bounds it in the same step, so a buffer
+/// already at the bound stays there however many rounds append to it, and each
+/// round projects its own committed rows and no others.
+///
+/// The round loop's per-round growth goes through this and nothing else.
+/// Growing without bounding produces the same tokens and an unbounded
+/// allocation; re-projecting the carried rows produces the same tokens for work
+/// proportional to the window every round. Neither is visible in an answer,
+/// which is why the row count is returned and asserted here.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test assertion: the rank is the one the drafter's projection returns"
+)]
+fn advancing_the_carried_projection_leaves_it_at_the_bound() {
     let (drafter, _dir) = scale_drafter(Some(5));
     let keep = drafter.conditioning_rows();
     let width = (drafter.cfg.target_layer_ids.len() * SCALE_HIDDEN) as i32;
 
-    let mut carried = conditioning_rows_of(2, width);
+    let mut carried = match drafter.project_conditioning(&varied_rows_at(0, 2, width)) {
+        Ok(a) => a,
+        Err(e) => panic!("project the seed rows: {e}"),
+    };
     let mut next = 2;
     for round in 0..6 {
-        let committed = f32_array(
-            &(0..3 * width)
-                .map(|i| (next + i / width) as f32)
-                .collect::<Vec<f32>>(),
-            &[1, 3, width],
-        );
+        let committed = varied_rows_at(next, 3, width);
         next += 3;
-        carried = match drafter.extend_conditioning(&carried, &committed) {
-            Ok(a) => a,
-            Err(e) => panic!("extend_conditioning at round {round}: {e}"),
+        let (grown, projected) = match drafter.slide_conditioning(&carried, &committed) {
+            Ok(pair) => pair,
+            Err(e) => panic!("slide_conditioning at round {round}: {e}"),
         };
-        let rows = row_numbers(&carried);
-        assert!(
-            rows.len() as i32 <= keep,
-            "round {round} carries {} rows past a bound of {keep}",
-            rows.len()
-        );
+        carried = grown;
         assert_eq!(
-            rows.last().copied(),
-            Some(next - 1),
-            "round {round} must end on the newest committed row"
+            projected, 3,
+            "round {round} projected {projected} rows, not the three it committed"
+        );
+        let rows = carried.shape()[1];
+        assert!(
+            rows <= keep,
+            "round {round} carries {rows} rows past a bound of {keep}"
+        );
+        // The newest rows are this round's committed ones, projected.
+        let want = match drafter.project_conditioning(&committed) {
+            Ok(a) => a,
+            Err(e) => panic!("project the committed rows at round {round}: {e}"),
+        };
+        let tail = match carried.slice(
+            &[0, rows - 3, 0],
+            &[1, rows, SCALE_HIDDEN as i32],
+            &[1, 1, 1],
+            Device::Cpu,
+        ) {
+            Ok(a) => a,
+            Err(e) => panic!("slice the carried tail at round {round}: {e}"),
+        };
+        assert_eq!(
+            to_f32(&tail),
+            to_f32(&want),
+            "round {round} must end on this round's committed rows, projected"
         );
     }
-    assert_eq!(row_numbers(&carried).len() as i32, keep, "saturated");
+    assert_eq!(carried.shape()[1], keep, "saturated");
+}
+
+/// Carrying the projection forward is the same buffer as projecting the whole
+/// conditioning history every round.
+///
+/// This is the property the incremental projection rests on and the only one
+/// that can move: `fc` and `hidden_norm` are row-wise, so a row projected when
+/// it was committed must equal the same row projected in a call that also held
+/// every other row. Rounds commit a varying number of rows here — a partial
+/// accept, a full one, and enough rounds to push the first ones out of the
+/// window — because the shapes the projection runs at are what would break the
+/// row-wise assumption if anything did.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test assertion: the rank is the one the drafter's projection returns"
+)]
+fn the_carried_projection_equals_projecting_the_whole_history() {
+    for window in [5u64, 2048] {
+        let (drafter, _dir) = scale_drafter(Some(window));
+        let width = (drafter.cfg.target_layer_ids.len() * SCALE_HIDDEN) as i32;
+        let keep = drafter.conditioning_rows();
+
+        // The prompt's rows, then rounds committing a full block, a partial
+        // accept, a single correction and a full block again.
+        let prompt_rows = (keep + 3).min(37);
+        let mut history = varied_rows_at(0, prompt_rows, width);
+        let mut carried = match drafter.project_conditioning(&trimmed_of(&drafter, &history)) {
+            Ok(a) => a,
+            Err(e) => panic!("project the prompt rows: {e}"),
+        };
+        let mut next = prompt_rows;
+
+        for (round, commit) in [5, 3, 1, 5].into_iter().enumerate() {
+            let committed = varied_rows_at(next, commit, width);
+            next += commit;
+            let (grown, projected) = match drafter.slide_conditioning(&carried, &committed) {
+                Ok(pair) => pair,
+                Err(e) => panic!("slide_conditioning at round {round}: {e}"),
+            };
+            carried = grown;
+            assert_eq!(
+                projected, commit,
+                "window {window} round {round}: projected {projected} rows for {commit} committed"
+            );
+
+            history = match concatenate(&[&history, &committed], 1, Device::Cpu) {
+                Ok(a) => a,
+                Err(e) => panic!("extend the history at round {round}: {e}"),
+            };
+            let whole = match drafter.project_conditioning(&trimmed_of(&drafter, &history)) {
+                Ok(a) => a,
+                Err(e) => panic!("project the whole history at round {round}: {e}"),
+            };
+            let case = format!("window {window} round {round}");
+            assert_eq!(
+                carried.shape(),
+                whole.shape(),
+                "{case}: the carried projection is a different shape"
+            );
+            let diff = max_abs_diff(&carried, &whole);
+            assert!(
+                diff < PROJECTION_TOL,
+                "{case}: the carried projection differs from projecting the whole \
+                 history by {diff:e}"
+            );
+
+            // The same window one row over, projected the same way. Without it
+            // the bound above is a bound on nothing: it has to be small against
+            // a difference the test can produce, not against zero.
+            let rows = carried.shape()[1];
+            let shifted =
+                match drafter.project_conditioning(&varied_rows_at(next - rows + 1, rows, width)) {
+                    Ok(a) => a,
+                    Err(e) => panic!("project the shifted window at round {round}: {e}"),
+                };
+            let control = max_abs_diff(&carried, &shifted);
+            assert!(
+                control > 10.0 * PROJECTION_TOL,
+                "{case}: the window shifted by one row differs by only {control:e}, so \
+                 this fixture's rows are too alike for the bound above to separate them"
+            );
+        }
+    }
+}
+
+/// `trim_conditioning`, panicking rather than propagating, for the tests above.
+fn trimmed_of(drafter: &DFlash2Drafter, history: &Array) -> Array {
+    match drafter.trim_conditioning(history) {
+        Ok(a) => a,
+        Err(e) => panic!("trim the history: {e}"),
+    }
 }
 
 /// A conditioning buffer of another width or rank is refused rather than

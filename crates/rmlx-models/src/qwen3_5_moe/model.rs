@@ -16,6 +16,7 @@
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
 
+use super::capture_tail::CaptureTail;
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{DecoderLayer, MlpBlock};
 use super::layers::{Embedding, Linear, RmsNorm};
@@ -861,10 +862,18 @@ impl Qwen3_5MoeText {
     ///
     /// Splits the prompt into consecutive chunks of at most `chunk_size` tokens
     /// and runs each chunk through the verifier separately, accumulating the
-    /// KV/GDN caches normally. Concatenates the per-chunk `concat_hidden`
-    /// slices along the sequence axis to produce a single `[1, n, n_aux*hidden]`
-    /// tensor covering all prompt positions — identical to what a single-shot
-    /// `forward_verify_capture(..., k=n)` would return.
+    /// KV/GDN caches normally. The per-chunk `concat_hidden` slices are joined
+    /// along the sequence axis into one `[1, kept, n_aux*hidden]` tensor.
+    ///
+    /// `keep_last` is how many of the prompt's trailing capture rows the caller
+    /// will read: `None` for every one of them — what a single-shot
+    /// `forward_verify_capture(..., k=n)` returns — and `Some(k)` for a drafter
+    /// that conditions over a sliding window and can never read a row older than
+    /// it. A bounded caller's earlier chunks are released as the prefill walks
+    /// forward rather than held to the end of the prompt; what that bounds, and
+    /// to what, is [`CaptureTail`]'s to state. Each row is `n_aux * hidden`
+    /// wide, which reaches 50 KiB per prompt token on the published DFlash 2
+    /// pair.
     ///
     /// Unlike the single-shot path, logits are materialised only for the **last
     /// position of the last chunk** (shape `[1, 1, vocab]`), and the per-layer
@@ -879,7 +888,8 @@ impl Qwen3_5MoeText {
     /// Far below the 4-5 s Metal watchdog budget that a 4096-token single-shot
     /// would exceed (~2 GB logits alone).
     ///
-    /// Returns `(logits[1,1,vocab], concat_hidden[1,n,n_aux*hidden])`.
+    /// Returns `(logits[1,1,vocab], hidden[1,kept,n_aux*hidden])`, oldest kept
+    /// row first.
     ///
     /// When `ids.len() <= chunk_size` the entire prompt is a single chunk
     /// (no concatenation overhead).
@@ -895,6 +905,7 @@ impl Qwen3_5MoeText {
         kv_caches: &mut [KvCache],
         lin_caches: Option<&mut [LinearAttnCache]>,
         chunk_size: usize,
+        keep_last: Option<usize>,
         device: Device,
     ) -> Result<(Array, Array)> {
         let n = ids.len();
@@ -911,7 +922,7 @@ impl Qwen3_5MoeText {
 
         let chunk_size = chunk_size.max(1);
         let mut lin_opt: Option<&mut [LinearAttnCache]> = lin_caches;
-        let mut hidden_chunks: Vec<Array> = Vec::new();
+        let mut captured = CaptureTail::new(keep_last);
         let mut pos = 0usize;
 
         while pos < n {
@@ -919,8 +930,6 @@ impl Qwen3_5MoeText {
             let chunk = &ids[pos..end];
             let chunk_n = chunk.len();
             let is_last = end == n;
-
-            tracing::debug!(pos, end, chunk_n, is_last, "eagle3 prefill chunk");
 
             let (last_logits_opt, hidden_chunk) = if is_last {
                 // Final chunk: one pass — all aux hidden + last-position logits only.
@@ -948,16 +957,22 @@ impl Qwen3_5MoeText {
             // Materialise each chunk's GPU work before the next chunk so Metal
             // can reclaim intermediate buffers.
             hidden_chunk.eval()?;
-            hidden_chunks.push(hidden_chunk);
+            captured.push(hidden_chunk)?;
+
+            tracing::debug!(
+                pos,
+                end,
+                chunk_n,
+                is_last,
+                keep_last = ?keep_last,
+                held_rows_after_chunk = captured.retained_rows(),
+                "verify capture prefill chunk"
+            );
 
             if let Some(last_logits) = last_logits_opt {
-                let refs: Vec<&Array> = hidden_chunks.iter().collect();
-                let full_hidden = if refs.len() == 1 {
-                    refs[0].try_clone()?
-                } else {
-                    rmlx_mlx::concatenate(&refs, 1, device)?
-                };
-                return Ok((last_logits, full_hidden));
+                let (hidden, materialised_rows) = captured.finish(device)?;
+                tracing::debug!(n, keep_last = ?keep_last, materialised_rows, "verify capture joined");
+                return Ok((last_logits, hidden));
             }
 
             pos = end;

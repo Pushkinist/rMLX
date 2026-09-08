@@ -388,6 +388,16 @@ pub(crate) struct RoundStats {
     /// same thing today and drift the day a loop stops emitting one — silently,
     /// into an append-only store.
     pub(crate) seed_emitted: usize,
+    /// Conditioning rows the loop projected, over all rounds, or `None` for a
+    /// loop that carries no conditioning buffer between rounds.
+    ///
+    /// Counted from what the projection returned, not from what the loop meant
+    /// to hand it. A loop that conditions each round on the wrong number of rows
+    /// produces the same tokens — greedy verification emits the verifier's own
+    /// whatever the drafter saw — and only its accept rate falls, so this is
+    /// what says so. It is bounded against `emitted_in_rounds` by
+    /// [`Self::conditioning_violation`].
+    pub(crate) conditioned_rows: Option<usize>,
     /// Tokens the drafter proposed, over all rounds.
     pub(crate) total_draft: usize,
     /// Proposed tokens the verifier accepted, over all rounds.
@@ -549,6 +559,41 @@ impl RoundStats {
         })
     }
 
+    /// The conditioning the rounds projected against the tokens they emitted.
+    ///
+    /// The two are counted on separate paths — one from the array the projection
+    /// returned, the other at the emit site — and over a request they can differ
+    /// only at the edges: a round that stopped on the end-of-sequence token
+    /// emitted its tokens and left before conditioning on them, and a round
+    /// whose commit ran past the request's remaining budget conditioned on more
+    /// rows than it emitted. Each is one round, so a request's two counts sit
+    /// within one block of each other. Drift proportional to the round count is
+    /// a loop conditioning on the wrong rows every round, which nothing in an
+    /// answer reports.
+    ///
+    /// It does not repeat the per-round guard, it outflanks it. That guard
+    /// compares the projection against the round's own count, so a count moved
+    /// at both the slice and the guard agrees with itself and passes; this one
+    /// compares against `emitted_in_rounds`, which is counted at the emit site
+    /// from the tokens rather than from the count, so the same edit still shows
+    /// up here as drift proportional to the round count.
+    pub(crate) fn conditioning_violation(&self) -> Option<String> {
+        let rows = self.conditioned_rows?;
+        let slack = self.block_size;
+        let low = self.emitted_in_rounds.saturating_sub(slack);
+        let high = self.emitted_in_rounds.saturating_add(slack);
+        (rows < low || rows > high).then(|| {
+            format!(
+                "conditioned_rows {rows} against emitted_in_rounds {} over {} rounds: \
+                 a request conditions on the rows its rounds committed, give or take \
+                 the one round that stopped early and the one the budget cut, so these \
+                 differ by more than the block {slack} only when the loop is taking the \
+                 wrong rows",
+                self.emitted_in_rounds, self.rounds
+            )
+        })
+    }
+
     /// The cell this request's rows belong to.
     pub(crate) fn decode_config(&self) -> String {
         rmlx_metrics::cell::decode_config(
@@ -570,9 +615,13 @@ impl RoundStats {
     /// six callsites became one. `loop_kind` is a field so the loop is still
     /// selectable, by field rather than by module path.
     pub(crate) fn log_done(&self) {
-        for reason in [self.span_violation(), self.seed_violation()]
-            .into_iter()
-            .flatten()
+        for reason in [
+            self.span_violation(),
+            self.seed_violation(),
+            self.conditioning_violation(),
+        ]
+        .into_iter()
+        .flatten()
         {
             tracing::error!(
                 loop_kind = ?self.loop_kind,
@@ -585,6 +634,7 @@ impl RoundStats {
             emitted = self.emitted,
             seed_emitted = self.seed_emitted,
             emitted_in_rounds = self.emitted_in_rounds,
+            conditioned_rows = ?self.conditioned_rows,
             total_draft = self.total_draft,
             total_accept = self.total_accept,
             accept_rate = self.accept_rate(),

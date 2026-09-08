@@ -7,22 +7,27 @@
 //! `rollback_round_caches` and [`crate::speculative::VerifierDraw`] with them
 //! rather than restating any of it.
 //!
-//! # Conditioning: recomputed, not cached
+//! # Conditioning: the K/V is recomputed, the projection is carried
 //!
 //! The reference gives its drafter a per-layer rotating K/V cache and feeds it
-//! only each round's newly committed rows. This loop keeps the committed
-//! **hidden states** instead and lets [`DFlash2Drafter::forward_hidden`]
-//! re-derive the conditioning K/V from them every round. The two are the same
-//! answer — the cached rows are a deterministic function of those hidden states
-//! — and the recomputing form is what makes the drafter forward invariant to a
-//! uniform shift of every position, which is why it needs no absolute offset.
-//! Adopting the cache would mean cached rows carry their own absolute RoPE, and
-//! that invariance, and the proof that rests on it, would have to be rebuilt.
+//! only each round's newly committed rows. This loop rebuilds that K/V from the
+//! conditioning rows on every call instead. The two are the same answer — the
+//! cached rows are a deterministic function of those rows — and the recomputing
+//! form is what makes the drafter forward invariant to a uniform shift of every
+//! position, which is why it needs no absolute offset. Adopting the cache would
+//! mean cached rows carry their own absolute RoPE, and that invariance, and the
+//! proof that rests on it, would have to be rebuilt.
+//!
+//! One step before that K/V is [`DFlash2Drafter::project_conditioning`], which
+//! is row-wise and carries no position at all, and that is what this loop keeps:
+//! it projects each round's committed capture rows as it commits them and
+//! carries the projection. Re-projecting the whole window every round would give
+//! the same rows for work proportional to the window.
 //!
 //! The buffer is bounded, not accumulated: the drafter attends over one sliding
 //! window, so rows older than it can never be read and are dropped as they fall
-//! out. Each row is `len(target_layer_ids) * hidden` wide, so an unbounded one
-//! would grow by 50 KiB per emitted token on the published pair.
+//! out. Each carried row is `hidden` wide — 10 KiB on the published pair, where
+//! the capture it was projected from is 50 KiB.
 //!
 //! # Greedy only
 //!
@@ -43,13 +48,14 @@
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{Array, Device};
+use rmlx_mlx::{concatenate, Array, Device};
 
 use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::{
-    accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, disarm_lin_tapes, emit_step,
+    accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
+    conditioning_residual, disarm_lin_tapes, emit_step, guard_round_conditioning,
     guard_verifier_prefill_logits, phases_charged, rollback_round_caches, verifier_context,
     verifier_kv_bytes, DecodeWindow, RoundPhases, RoundStats, SpecLoop, VerifierDraw,
 };
@@ -60,7 +66,7 @@ use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 /// The capture returns one hidden row per prompt position, so a single-shot
 /// prefill of a long prompt would put the whole capture and a full-vocabulary
 /// logit tensor in one Metal command buffer.
-const PREFILL_CHUNK_SIZE: usize = 1024;
+pub(super) const PREFILL_CHUNK_SIZE: usize = 1024;
 
 /// Drive a DFlash 2 drafter against its verifier.
 ///
@@ -92,7 +98,7 @@ const PREFILL_CHUNK_SIZE: usize = 1024;
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
-    reason = "the one index is axis 1 of the conditioning buffer, whose rank trim_conditioning checks before returning it"
+    reason = "every index is axis 1 of a rank-3 buffer whose rank the seam that produced it checked: the trim, the projection and the carried buffer they extend"
 )]
 pub fn dflash2_generate(
     verifier: &Architecture,
@@ -173,9 +179,21 @@ pub fn dflash2_generate(
 
     let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
 
-    // Prefill the whole prompt, capturing every position's conditioning hidden.
-    // The reference conditions its first round on as much of the prompt as the
-    // drafter's window reaches back over, not on the last token alone.
+    // Prefill the whole prompt, keeping the conditioning hidden of as many of
+    // its positions as the drafter's window reaches back over — the depth the
+    // reference conditions its first round on, not the last token alone. The
+    // rows before that can never be read, so the capture releases them as the
+    // prefill walks the prompt rather than holding one row per prompt token at
+    // `len(target_layer_ids) * hidden_size` to the end of it.
+    let keep_rows = drafter.conditioning_rows();
+    // Defence in depth: `check_config` refuses a window under 2 or wider than an
+    // array axis, so this conversion cannot fail on a drafter that loaded.
+    let keep = usize::try_from(keep_rows).map_err(|_| {
+        Error::Model(format!(
+            "dflash2_generate: this drafter reaches back over {keep_rows} rows, \
+             which is not a row count"
+        ))
+    })?;
     let prefill_t0 = Instant::now();
     let (bonus_logits, prompt_hidden) = verifier.forward_verify_capture_chunked(
         prompt_ids,
@@ -183,17 +201,53 @@ pub fn dflash2_generate(
         &mut v_caches,
         Some(&mut v_lin),
         PREFILL_CHUNK_SIZE,
+        Some(keep),
         device,
     )?;
     guard_verifier_prefill_logits(verifier, &bonus_logits, prompt_ids.len())?;
-    let mut h_ctx = drafter.trim_conditioning(&prompt_hidden)?;
+    let prompt_ctx = drafter.trim_conditioning(&prompt_hidden)?;
+    // What the capture was asked to keep is a number at a call site, and the
+    // trim above accepts a shorter buffer without a word. A drafter conditioned
+    // on less than its window still proposes, and greedy verification then emits
+    // the verifier's own tokens whatever the proposals were — so what falls is
+    // the accept rate, and nothing here would say so.
+    let want_rows = keep_rows.min(i32::try_from(prompt_ids.len()).unwrap_or(i32::MAX));
+    if prompt_ctx.shape()[1] != want_rows {
+        return Err(Error::Model(format!(
+            "dflash2_generate: the prompt's capture kept {} conditioning rows where this \
+             drafter reaches back over {want_rows} of a {}-token prompt",
+            prompt_ctx.shape()[1],
+            prompt_ids.len()
+        )));
+    }
+    // The loop carries the projection, not the capture it came from: `fc` and
+    // `hidden_norm` are row-wise, so a row projected once here is the row every
+    // later round would have re-derived. The prompt's rows are projected in this
+    // one call and each round then projects only what it commits.
+    let mut h_ctx = drafter.project_conditioning(&prompt_ctx)?;
+    // The prompt's last raw row, kept until the first round has extended the
+    // buffer and then dropped: re-projecting it beside that round's commit is
+    // what says how far the carried projection sits from a fresh one at this
+    // checkpoint's dtype. One row, one round, and the probe releases it. See
+    // `conditioning_residual`.
+    let mut probe_seed = Some(committed_rows(
+        &prompt_ctx.slice(
+            &[0, prompt_ctx.shape()[1] - 1, 0],
+            &[1, prompt_ctx.shape()[1], condition_width],
+            &[1, 1, 1],
+            device,
+        )?,
+        1,
+        condition_width,
+        device,
+    )?);
     if charge_phases {
         // The guard above forced the logits, and so the whole prompt forward,
         // but not the capture: it hangs off a different output of that forward.
-        // Joining the chunks and trimming to the window is a copy of one row per
-        // prompt token at `len(target_layer_ids) * hidden_size` — and with
-        // nothing forcing it here the first round's drafter call pays for all of
-        // it. See `phases_charged`.
+        // Joining the kept chunks, trimming to the window and projecting it is a
+        // pass over one row per kept position — and with nothing forcing it here
+        // the first round's drafter call pays for all of it. See
+        // `phases_charged`.
         h_ctx.eval()?;
     }
     let prefill_ns = prefill_t0.elapsed().as_nanos();
@@ -210,6 +264,7 @@ pub fn dflash2_generate(
             emitted: emitted.len(),
             seed_emitted: emitted.len(),
             emitted_in_rounds: 0,
+            conditioned_rows: Some(0),
             total_draft: 0,
             total_accept: 0,
             prefill_ns,
@@ -237,6 +292,10 @@ pub fn dflash2_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    // Conditioning rows the rounds projected, read back from the projection
+    // rather than from what the loop meant to hand it. See
+    // `guard_round_conditioning`.
+    let mut conditioned_rows = 0usize;
     let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
@@ -337,23 +396,35 @@ pub fn dflash2_generate(
         }
         let round_rollback_ns = t0.elapsed().as_nanos();
 
-        // The conditioning rows are exactly the positions the caches kept: the
-        // carry token and the accepted proposals.
-        let committed = accept as i32 + 1;
-        let committed_hidden = v_hidden.slice(
-            &[0, 0, 0],
-            &[1, committed, condition_width],
-            &[1, 1, 1],
-            device,
-        )?;
-        h_ctx = drafter.extend_conditioning(&h_ctx, &committed_hidden)?;
+        // The carry token and the accepted proposals.
+        let committed_hidden = committed_rows(&v_hidden, accept + 1, condition_width, device)?;
+        let projected_rows;
+        (h_ctx, projected_rows) = drafter.slide_conditioning(&h_ctx, &committed_hidden)?;
+        guard_round_conditioning(rounds, projected_rows, accept + 1)?;
+        conditioned_rows += projected_rows.max(0) as usize;
+        if let Some(seed) = probe_seed.take() {
+            let raw = concatenate(&[&seed, &committed_hidden], 1, device)?;
+            let fresh = drafter.project_conditioning(&raw)?;
+            let hidden = drafter.cfg.hidden_size as i32;
+            let tail = h_ctx.shape()[1] - (1 + projected_rows);
+            let carried_tail = h_ctx.slice(
+                &[0, tail, 0],
+                &[1, tail + 1 + projected_rows, hidden],
+                &[1, 1, 1],
+                device,
+            )?;
+            tracing::debug!(
+                rows = 1 + projected_rows,
+                residual = conditioning_residual(&carried_tail, &fresh, device)?,
+                "dflash2 conditioning: carried projection against a fresh one"
+            );
+        }
         if charge_phases {
-            // Extending the context copies every row the drafter's window
-            // reaches back over, at `len(target_layer_ids)` times the hidden
-            // width, and the next round's drafter is the first thing to read
-            // it. Forced here it lands in the round's unclaimed time, which is
-            // where slicing and bookkeeping belong; left lazy it lands in the
-            // drafter. See `phases_charged`.
+            // Projecting this round's committed rows and copying the window they
+            // extend is work the next round's drafter is the first thing to read.
+            // Forced here it lands in the round's unclaimed time, which is where
+            // slicing and bookkeeping belong; left lazy it lands in the drafter.
+            // See `phases_charged`.
             h_ctx.eval()?;
         }
         b = *new_tokens.last().unwrap_or(&b);
@@ -365,6 +436,7 @@ pub fn dflash2_generate(
             n_committed = new_tokens.len(),
             emitted_total = emitted.len(),
             condition_rows = h_ctx.shape()[1],
+            projected_rows,
             v_offset_before,
             v_target,
             "dflash2 round"
@@ -396,6 +468,7 @@ pub fn dflash2_generate(
         emitted: emitted.len(),
         seed_emitted,
         emitted_in_rounds,
+        conditioned_rows: Some(conditioned_rows),
         total_draft,
         total_accept,
         prefill_ns,
@@ -440,9 +513,13 @@ fn draft_block(
     block_ids.resize(bs, drafter.cfg.mask_token_id as i32);
 
     let block = verifier.embed_tokens_raw(&block_ids, device)?;
-    let hidden = drafter.forward_hidden(&block, h_ctx)?;
+    let hidden = drafter.forward_hidden_conditioned(&block, h_ctx)?;
     // Row 0 is the seed, which is not drafted.
     let drafted = hidden.slice(&[0, 1, 0], &[1, bs as i32, hidden_size], &[1, 1, 1], device)?;
     let logits = verifier.logits_from_final_hidden(&drafted, device)?;
     drafter.select_chain(&drafted, &logits, seed)
 }
+
+#[cfg(test)]
+#[path = "round_tests.rs"]
+mod round_tests;

@@ -659,8 +659,54 @@ truncated KV cache.
 **Accumulated conditioning context.** The drafter conditions on the
 accumulated verifier hidden across all rounds (equivalent to the Python
 reference's persistent draft KV cache). After each round the committed slice of
-the verifier hidden `v_hidden[:, :n_committed, :]` is concatenated onto
-`h_ctx_raw`; this grows monotonically and is projected freshly each round.
+the verifier hidden `v_hidden[:, :n_committed, :]` is projected through `fc` +
+`hidden_norm` and concatenated onto the projection carried from the last round.
+The buffer grows monotonically; each round's projection covers that round's
+commit rather than the whole of it, so the number of rows a round projects is
+its own commit and not the generation so far. `fc` is a bias-free linear and
+`hidden_norm` an RMSNorm — both row-wise — so a row projected once is the row a
+re-projection would have produced, and carrying the projection also holds a row
+at `hidden_size` rather than `len(target_layer_ids) * hidden_size`.
+
+**How exact that identity is, and what it can move.** Exact in exact
+arithmetic. At a checkpoint's dtype it is exact only up to the projection's own
+dispatch: `fc` is a matmul, and MLX chooses its kernel and reduction order by
+shape, so the same row projected at two different call heights is not guaranteed
+to give the same bits. `crates/rmlx-models/tests/spec_conditioning_residual.rs`
+measures that on the shipped pairs, comparing a round's commits against all of
+them in one call at the height a generation reaches. It is a rounding
+difference and reads as one: on the DFlash 1 pair no row differs by as much as
+one `bf16` unit in the last place of its own scale, and on the DFlash 2 pair
+three rows of a few hundred reach a small multiple of one. The fixtures'
+`PROJECTION_TOL` is an `f32` bound on `f32` fixtures and is not a statement about
+either.
+
+**A last-place difference is not confined to the drafter.** A drafter proposing
+a different token at a near-tie changes what the round accepted; a different
+accept split changes the composition and the height of the next verify block; and
+the *verifier's* own logits at later positions are then computed under a
+different dispatch too. So a near-tie the verifier itself is sitting on can
+resolve the other way, and the emitted text can differ — later, and at a
+position whose top two candidates are near-tied. **Byte-equality against a
+no-drafter arm is therefore not the criterion**, and this repository does not use
+it as one: equivalence is judged by the divergence-confidence oracle in
+[`SPEC_ANSWER_EQUIVALENCE.md`](SPEC_ANSWER_EQUIVALENCE.md), which asks where the
+divergence sits in the plain arm's own margin distribution rather than whether it
+happened. The recorded evidence for both loops is the pairs in
+`crates/rmlx-models/tests/spec_greedy_equivalence.rs`, which run that oracle over
+a prompt set; a byte comparison on a single prompt is not evidence either way.
+
+**And it is not bounded, deliberately.** Unlike DFlash 2, this checkpoint
+declares `sliding_window: null`, `use_sliding_window: false` and eight
+`full_attention` layers, and the drafter's block attention runs with no mask
+over the context, so every carried row is read by every proposal query. Both
+reference implementations condition on the whole history by default — mlx-vlm
+allocates an unbounded KV cache per full-attention drafter layer, and SGLang's
+draft window defaults to off, documented as full attention/context. A draft
+window is an operator choice there, not a checkpoint declaration. Trimming the
+buffer would drop rows the drafter reads and shift the positions of the rest;
+under greedy verification the emitted tokens would not move and only the accept
+rate would fall, so nothing in an answer would report it.
 
 Weight layout:
 
@@ -741,7 +787,9 @@ the prefill seed — because that is not recoverable from the tokens afterwards.
 **Verifier prefill chunking.** For prompts longer than 1024 tokens, the
 verifier prefill uses `forward_verify_capture_chunked`: non-final chunks run
 `forward_hidden_states_multi` (no logit materialisation); only the final chunk
-runs `forward_verify_capture` to obtain the last-position logits. The drafter
+runs `forward_verify_capture` to obtain the last-position logits. This loop
+passes no trailing-row limit to that seam and cannot: the drafter prefill below
+conditions on every prompt position, so no captured row is spare. The drafter
 prefill uses 512-token windows (`DRAFTER_PREFILL_CHUNK`), driven by the Metal
 watchdog limit on the drafter's single-layer quadratic attention kernel.
 
@@ -1554,16 +1602,24 @@ the rest through the shared `rollback_round_caches`. The block is the one the
 drafter was trained at every round; only the token budget shortens it, so this
 loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
 
-**The prompt's capture is materialised whole and then mostly thrown away.**
-`forward_verify_capture_chunked` evaluates each chunk and concatenates every one
-of them before returning, so a prompt of `n` tokens allocates `n` rows at
-`len(target_layer_ids) * hidden_size` — 51.2 KiB each on the published pair, or
-about 1.6 GiB at a 32k prompt — and the trim then keeps the last 2047 of them.
-It is a transient peak at the prompt boundary, not a steady-state cost: the
-buffer the rounds carry is bounded by the drafter's window from the first trim
-onward. Bounding the peak means giving that seam a tail limit, and EAGLE-3 shares
-it and needs every row, so it is a two-caller parameter and not one this port
-added. It is not fixed and no figure in this document depends on it.
+**The prompt's capture is bounded by the same window.**
+`forward_verify_capture_chunked` takes the trailing row count its caller will
+read, and this loop passes the drafter's own `conditioning_rows`. Chunks that
+have fallen out of that tail are released as the prefill walks the prompt and
+the oldest one still held is cut to the part the tail reaches before anything is
+joined. Two bounds come out of that, and they are different
+numbers: what is *held* overshoots the window by up to a chunk, because a chunk
+is released only once the rows behind it reach the window, while what is
+*materialised* is at most `sliding_window - 1` rows, which is what the cut before
+the join buys. `CaptureTail` states both in terms of its own `keep` and `chunk`
+and is the one place they are written down; restating the arithmetic here is how
+the two drift apart. Joining every chunk first and trimming afterwards, which is what this did,
+held and materialised one row per prompt token instead. Each row is
+`len(target_layer_ids) * hidden_size`, 50 KiB on the published pair. The rows the round loop receives are the
+same ones either way, and no figure in this document changed with it. EAGLE-3
+shares the seam and conditions its own KV prefill on every prompt position, so
+it passes no limit — which is why the bound is the capture's parameter rather
+than a rule inside it.
 
 **Its drafter is greedy, and its acceptance is not.** `select_chain` traces a
 greedy chain and returns ids, no candidate distribution — and the reference's
@@ -1584,14 +1640,50 @@ caching them across rounds, so all of one call's positions are rotated together
 and only the query-key difference reaches the attention scores; a uniform shift
 of every position is then not observable, which the reference's own answer
 confirms — it moves by one bf16 place between two offsets that are
-mathematically the same. **The round loop keeps that choice**: it carries the
-committed hidden states forward and lets the forward re-derive the conditioning
-K/V, where the reference carries a per-layer rotating K/V cache and feeds it only
-each round's new rows. The two are the same answer — the cached rows are a
-deterministic function of those hidden states — and adopting the cache would make
-cached rows carry their own absolute RoPE, losing the invariance and the proof
-that rests on it. The buffer is bounded by the drafter's window rather than
-accumulated: unbounded it would grow by 50 KiB per emitted token.
+mathematically the same. **The round loop keeps that choice**, where the
+reference carries a per-layer rotating K/V cache and feeds it only each round's
+new rows. The two are the same answer — the cached rows are a deterministic
+function of the hidden states — and adopting the cache would make cached rows
+carry their own absolute RoPE, losing the invariance and the proof that rests
+on it.
+
+What the loop does carry is one step earlier than that cache and has no position
+in it. `fc` and `hidden_norm` are row-wise, so the conditioning projection of a
+row does not depend on which other rows were in the call; the loop projects each
+round's committed rows as it commits them and carries the projection, where it
+used to carry the capture and re-project its whole window every round. The
+per-layer K/V — the part RoPE reaches — is still rebuilt over the whole window on
+every call, so the invariance above is untouched. The carried buffer is bounded
+by the drafter's window and is `hidden_size` wide rather than
+`len(target_layer_ids) * hidden_size`: 10 KiB per row on the published pair
+where the capture is 50 KiB.
+
+**The reduction is a trip count, not a measurement.** Per round the projection
+runs over the rows the round committed rather than over the window: `accept + 1`
+rows of `len(target_layer_ids) * hidden_size` where it was `sliding_window - 1`
+of them, which on the published pair is one to eight rows against 2047. That is
+what changed and all that is claimed here. No decode rate or per-phase time is
+quoted for it — a timing figure needs a quiet machine and belongs to the
+published protocol, where it is to be measured.
+
+**It is not bit-identical, and the reason is not the algebra.** `fc` is a matmul,
+and MLX accumulates it differently at different row counts, so a row projected in
+a call of three rows and the same row projected in a call of two thousand land a
+few units in the last place apart. `crates/rmlx-models/tests/spec_conditioning_residual.rs`
+measures that on this pair at its own dtype rather than leaving it asserted: over
+a few hundred rows of a real generation, three of them reach a small multiple of
+one `bf16` unit in the last place of their own scale and the rest sit under one.
+
+The rows are the same rows; what this moves first is which token the selector
+chain proposes at a near-tie, and so the accept rate. It does not stop there. A
+different accept split changes the composition and the height of the next verify
+block, so the **verifier's** own logits at later positions are computed under a
+different dispatch too, and a near-tie of its own can resolve the other way — the
+emitted text can differ, later, at a position where the verifier itself was
+undecided. Byte-equality against a no-drafter arm is therefore not the criterion
+here either; equivalence is judged by the oracle in
+[`SPEC_ANSWER_EQUIVALENCE.md`](SPEC_ANSWER_EQUIVALENCE.md), and the recorded
+evidence is the pairs in `crates/rmlx-models/tests/spec_greedy_equivalence.rs`.
 
 Three scalars the reference applies to the drafter's logit path —
 `input_embedding_scale`, `output_multiplier`, `final_logit_softcapping` — are

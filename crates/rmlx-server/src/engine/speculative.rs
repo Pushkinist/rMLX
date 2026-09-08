@@ -211,8 +211,9 @@ fn decide_draft_kind(
 enum Drafter {
     /// EAGLE-3 drafter beside a verifier-only dispatcher.
     Eagle3(Arc<Mutex<rmlx_models::speculative::eagle3::Eagle3Drafter>>),
-    /// DFlash drafter beside a verifier-only dispatcher.
-    DFlash(Arc<Mutex<rmlx_models::speculative::dflash::DFlashDrafter>>),
+    /// DFlash drafter beside a verifier-only dispatcher; its round loop
+    /// borrows `&self`, so no `Mutex`.
+    DFlash(Arc<rmlx_models::speculative::dflash::DFlashDrafter>),
     /// DFlash 2 drafter; its round loop borrows `&self`, so no `Mutex`.
     DFlash2(Arc<rmlx_models::speculative::dflash2::DFlash2Drafter>),
     /// Gemma4 assistant, the shared-K/V `mtp` family; `draft_n` borrows `&self`.
@@ -233,7 +234,7 @@ impl Drafter {
     fn declared_block_size(&self) -> Option<usize> {
         match self {
             Drafter::Eagle3(d) => Some(d.lock().block_size()),
-            Drafter::DFlash(d) => Some(d.lock().block_size()),
+            Drafter::DFlash(d) => Some(d.block_size()),
             Drafter::DFlash2(d) => Some(d.cfg.block_size),
             Drafter::MtpSidecar(d) => d.lock().block_size(),
             Drafter::MtpAssistant(_) | Drafter::TwoModel => None,
@@ -431,7 +432,7 @@ impl SpeculativeGenerator {
                     hidden_size,
                     device,
                 )?;
-                (dispatcher, Drafter::DFlash(Arc::new(Mutex::new(drafter))))
+                (dispatcher, Drafter::DFlash(Arc::new(drafter)))
             }
             rmlx_models::DraftKind::DFlash2 => {
                 let dispatcher =
@@ -928,23 +929,20 @@ impl Generator for SpeculativeGenerator {
                         dispatcher.device(),
                     )
                 }
-                Drafter::DFlash(drafter_arc) => {
-                    let mut drafter = drafter_arc.lock();
-                    rmlx_models::speculative::dflash::dflash_generate(
-                        &dispatcher.verifier,
-                        &mut drafter,
-                        &tokenizer,
-                        &prompt_tokens,
-                        n_tokens,
-                        block_size,
-                        kv_quant_override,
-                        max_ctx_override,
-                        &eos_ids,
-                        &mut step_fn,
-                        &spec_sampler_cfg,
-                        dispatcher.device(),
-                    )
-                }
+                Drafter::DFlash(drafter) => rmlx_models::speculative::dflash::dflash_generate(
+                    &dispatcher.verifier,
+                    drafter,
+                    &tokenizer,
+                    &prompt_tokens,
+                    n_tokens,
+                    block_size,
+                    kv_quant_override,
+                    max_ctx_override,
+                    &eos_ids,
+                    &mut step_fn,
+                    &spec_sampler_cfg,
+                    dispatcher.device(),
+                ),
                 Drafter::DFlash2(drafter) => rmlx_models::speculative::dflash2::dflash2_generate(
                     &dispatcher.verifier,
                     drafter,

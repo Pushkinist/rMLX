@@ -83,7 +83,7 @@ fn dflash_round0_first_token_aligns() {
         "DFlash verifier must be the Qwen3.5/3.6-MoE hybrid"
     );
     let hidden = verifier.hidden_size();
-    let mut drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
+    let drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
     let tlids = drafter.target_layer_ids().to_vec();
 
     let tk =
@@ -203,7 +203,7 @@ fn dflash_live_loop_emits_coherent() {
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     let hidden = verifier.hidden_size();
-    let mut drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
+    let drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
 
     let tk =
         tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");
@@ -225,7 +225,7 @@ fn dflash_live_loop_emits_coherent() {
 
     let (steps, _block) = dflash_generate(
         &verifier,
-        &mut drafter,
+        &drafter,
         &tk,
         &prompt_ids,
         48,

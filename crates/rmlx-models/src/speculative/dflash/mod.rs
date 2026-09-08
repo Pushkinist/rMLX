@@ -1,3 +1,8 @@
+// LOC-exempt: one drafter's whole surface — config parse, weight load, the
+// block forward, the block-size schedule, the acceptance walk and the round
+// loop that drives them. The loop reads the drafter's private weights and
+// the forward reads the config it parsed, so a split would export internals
+// across a module boundary to buy line count.
 //! DFlash drafter loader + round-loop.
 //!
 //! Port of mlx-vlm `mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py`
@@ -150,8 +155,11 @@ pub fn dflash_next_block_size(
 /// One DFlash decoder layer (Qwen3 shape: GQA + per-head q/k RMSNorm + RoPE).
 ///
 /// Mirrors `DFlashDecoderLayer`: pre-norm self-attention with a context /
-/// proposal KV split (only context K/V go in the cache) followed by a SwiGLU
-/// MLP, both residual.
+/// proposal KV split followed by a SwiGLU MLP, both residual. The reference
+/// keeps the context K/V in a per-layer cache; this layer rebuilds it from the
+/// conditioning rows on every call, applying RoPE to the context K at offset 0
+/// each time, so conditioning row `i` carries position `i` exactly as a row the
+/// reference cached at absolute position `i` does.
 #[allow(missing_debug_implementations)]
 struct DFlashLayer {
     input_layernorm: RmsNorm,
@@ -184,8 +192,6 @@ pub struct DFlashDrafter {
     /// Final RMSNorm after the decoder stack.
     norm: RmsNorm,
     layers: Vec<DFlashLayer>,
-    /// Per-layer KV cache (the drafter's own; holds context K/V only).
-    caches: Vec<KvCache>,
     /// Precomputed YARN inverse-frequency table (`[head_dim/2]`), when the
     /// drafter config specifies `rope_scaling: {rope_type: yarn}`. `None`
     /// falls back to plain RoPE (`rope(theta)`). The Qwen3.6-35B DFlash drafter
@@ -241,10 +247,7 @@ impl DFlashDrafter {
     /// drafter `hidden_size` and `fc` input (`len(target_layer_ids)*H`) must
     /// match it.
     pub fn load(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<Self> {
-        let mut me = load_dflash(draft_dir, hidden_size, device)?;
-        me.caches = (0..me.cfg.num_hidden_layers)
-            .map(|_| KvCache::with_quant(KvQuant::None))
-            .collect();
+        let me = load_dflash(draft_dir, hidden_size, device)?;
         tracing::info!(
             draft = %draft_dir.display(),
             hidden_size,
@@ -254,13 +257,6 @@ impl DFlashDrafter {
             "DFlashDrafter: loaded drafter"
         );
         Ok(me)
-    }
-
-    /// Reset the drafter's KV cache between generations.
-    pub fn reset(&mut self) {
-        for c in &mut self.caches {
-            *c = KvCache::with_quant(KvQuant::None);
-        }
     }
 
     /// Trained / configured block size (the adaptive-schedule ceiling).
@@ -290,20 +286,76 @@ impl DFlashDrafter {
     /// at each `target_layer_id`, concatenated along the feature axis). Mirrors
     /// `DFlashDraftModel._hidden`'s `h_ctx = hidden_norm(fc(target_hidden))`.
     /// Real: `fc` + `hidden_norm` are loaded and run on-device.
+    ///
+    /// `fc` is a bias-free linear and `hidden_norm` an RMSNorm, so both are
+    /// row-wise: a row's projection does not depend on which other rows were in
+    /// the call. That is what lets the round loop project each round's committed
+    /// rows and carry the result — **exactly** in exact arithmetic, and to
+    /// within a last-place rounding difference at the checkpoint's dtype, where
+    /// the two calls are dispatched at different matmul heights. See
+    /// [`crate::speculative::conditioning_residual`], which measures that gap
+    /// per request, and `docs/SPECULATIVE.md` for what it can and cannot move.
+    /// The position-dependent part of the conditioning is the per-layer RoPE in
+    /// [`Self::layer_forward`], which is applied to the context K at offset 0 on
+    /// every call and so is not carried.
     pub fn project_condition(&self, concat_hidden: &Array) -> Result<Array> {
         let projected = self.fc.forward(concat_hidden, self.device)?;
         self.hidden_norm.forward(&projected, self.device)
     }
 
+    /// Project a round's committed capture rows and append them to the
+    /// projection carried from the last round.
+    ///
+    /// Returns the grown buffer and the rows it projected — which is the round's
+    /// committed rows and nothing else. Projecting and appending are one
+    /// operation because a caller that re-projected the rows it was already
+    /// carrying would produce the same buffer, to a last place, for a pass over
+    /// the whole conditioning history every round instead of over one round's
+    /// commit, and nothing in an answer would say so. The row count is what
+    /// does, which is why it is returned, traced and checked by
+    /// [`crate::speculative::guard_round_conditioning`].
+    ///
+    /// The buffer **grows** and is never bounded, which is what the name says
+    /// and what separates it from the DFlash 2 drafter's sliding equivalent:
+    /// this drafter declares no window, its layers are full-attention, and its
+    /// block queries read the whole context unmasked, so dropping the oldest
+    /// rows would take rows the drafter reads.
+    ///
+    /// `device` is the caller's, not the drafter's: the rows arrive sliced on
+    /// the loop's device and the buffer they extend is read there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Model`] when the committed rows are not
+    /// `[1, rows, len(target_layer_ids) * hidden_size]`, or from the projection
+    /// or the concatenation.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "each axis is read only after the rank has been compared against 3"
+    )]
+    fn grow_conditioning(
+        &self,
+        carried: &Array,
+        committed: &Array,
+        device: Device,
+    ) -> Result<(Array, i32)> {
+        let shape = committed.shape();
+        let width = (self.cfg.target_layer_ids.len() * self.cfg.hidden_size) as i32;
+        if shape.len() != 3 || shape[0] != 1 || shape[2] != width {
+            return Err(Error::Model(format!(
+                "DFlashDrafter: the committed conditioning rows have shape {shape:?}, \
+                 not the [1, rows, {width}] this drafter's fc reads"
+            )));
+        }
+        let rows = shape[1];
+        let projected = self.project_condition(committed)?;
+        let grown = concatenate(&[carried, &projected], 1, device)?;
+        Ok((grown, rows))
+    }
+
     /// Build the conditioning hidden by capturing the verifier hidden states at
     /// `target_layer_ids` and concatenating them.
     ///
-    /// **Awaiting verifier-side wiring (module docs).** rMLX's
-    /// `Architecture::forward_hidden_states` returns only the penultimate trunk
-    /// hidden and is Gemma4-only. DFlash needs per-`target_layer_id`
-    /// captures concatenated, which the Qwen3.6-MoE verifier path does not yet
-    /// expose. Returns [`Error::Model`] until that lands; the `fc`/`hidden_norm`
-    /// projection it would feed ([`project_condition`]) is implemented + tested.
     /// Capture the verifier's concatenated multi-layer hidden over `input_ids`
     /// (advancing the supplied caches) WITHOUT projecting. Returns
     /// `[1, k, len(target_layer_ids)*H]` for the last `k` positions. The
@@ -347,7 +399,7 @@ impl DFlashDrafter {
     /// run on-device. The seam is the *verifier* `embed_tokens` + `lm_head`
     /// accessor (threaded by the round-loop) — gated in [`embed_block`] below.
     pub fn draft_block(
-        &mut self,
+        &self,
         verifier: &Architecture,
         seed_tok: u32,
         h_ctx: &Array,
@@ -387,7 +439,7 @@ impl DFlashDrafter {
     /// Real port of `DFlashDraftModel._hidden` (sans embedding): for each layer,
     /// pre-norm self-attention with a context (`h_ctx`) / proposal (`h`) KV split
     /// followed by a SwiGLU MLP, then the final `norm`. Returns `[1, L, H]`.
-    fn forward_block(&mut self, h: &Array, h_ctx: &Array) -> Result<Array> {
+    fn forward_block(&self, h: &Array, h_ctx: &Array) -> Result<Array> {
         let mut x = h.try_clone()?;
         // The conditioning context is shared across layers (Python passes the
         // same `h_ctx` into every layer's attention as the KV-source prefix).
@@ -607,7 +659,7 @@ use crate::decode_loop::ProbeStep;
 )]
 pub fn dflash_generate(
     verifier: &Architecture,
-    drafter: &mut DFlashDrafter,
+    drafter: &DFlashDrafter,
     tokenizer: &tokenizers::Tokenizer,
     prompt_ids: &[u32],
     n_tokens: usize,
@@ -635,7 +687,7 @@ pub fn dflash_generate(
     }
 
     let target_layer_ids = drafter.cfg.target_layer_ids.clone();
-    let hidden = drafter.cfg.hidden_size as i32;
+    let condition_width = drafter.cfg.hidden_size as i32 * target_layer_ids.len() as i32;
     let block_total = crate::speculative::block_capped_by_checkpoint(
         requested_block_total,
         drafter.cfg.block_size,
@@ -664,8 +716,6 @@ pub fn dflash_generate(
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
         .collect();
-
-    drafter.reset();
 
     let mut draw = super::VerifierDraw::new(sampler_cfg);
 
@@ -703,13 +753,21 @@ pub fn dflash_generate(
         Some(&mut v_lin),
         device,
     )?;
-    // Accumulated conditioning context (concat of every round's committed
-    // verifier hidden along the sequence axis). The drafter conditions on the
-    // FULL accumulated context each round — equivalent to the Python ref's
-    // persistent draft KV cache (`cache.update_and_fetch`), which accumulates
-    // context K/V derived deterministically from these same hiddens.
+    // Accumulated conditioning context, held as the projection rather than the
+    // capture it came from. The drafter conditions on the FULL accumulated
+    // context each round — equivalent to the reference's persistent draft KV
+    // cache (`cache.update_and_fetch`), which accumulates context K/V derived
+    // deterministically from these same hiddens. `project_condition` is
+    // row-wise, so a row projected once here is the row every later round would
+    // have re-derived, and each round then projects only what it commits.
     super::guard_verifier_prefill_logits(verifier, &r0_logits, prompt_ids.len())?;
-    let mut h_ctx_raw = r0_hidden;
+    let mut h_ctx = drafter.project_condition(&r0_hidden)?;
+    // The seed's raw row, kept until the first round has extended the buffer and
+    // then dropped: re-projecting it beside that round's commit is what says how
+    // far the carried projection sits from a fresh one at this checkpoint's
+    // dtype. One row, one round, and the probe releases it. See
+    // `conditioning_residual`.
+    let mut probe_seed = Some(r0_hidden);
     let mut b = draw.seed_token(&r0_logits, device)?;
     // Emit the first bonus.
     emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
@@ -723,6 +781,7 @@ pub fn dflash_generate(
             emitted: emitted.len(),
             seed_emitted: emitted.len(),
             emitted_in_rounds: 0,
+            conditioned_rows: Some(0),
             total_draft: 0,
             total_accept: 0,
             prefill_ns,
@@ -749,6 +808,10 @@ pub fn dflash_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    // Conditioning rows the rounds projected, read back from the projection
+    // rather than from what the loop meant to hand it. See
+    // `guard_round_conditioning`.
+    let mut conditioned_rows = 0usize;
     let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
@@ -756,9 +819,6 @@ pub fn dflash_generate(
         let remaining = n_tokens - emitted.len();
         let bs = dflash_next_block_size(&recent, block_total, remaining + 1, false);
         widest_bs = widest_bs.max(bs);
-
-        // -- Project the committed verifier hidden into the conditioning ctx. --
-        let h_ctx = drafter.project_condition(&h_ctx_raw)?;
 
         // -- Phase A: drafter proposes bs-1 tokens (non-autoregressive block). --
         let t0 = Instant::now();
@@ -851,20 +911,33 @@ pub fn dflash_generate(
         }
 
         // Append this round's committed verifier hidden to the accumulated
-        // conditioning context (mlx-vlm: the committed `hidden[:, :accepted+1]`
-        // is fed as NEW context into the persistent draft cache, which holds
-        // all prior rounds). We accumulate the equivalent hidden buffer.
-        let committed_hidden = v_hidden.slice(
-            &[0, 0, 0],
-            &[
-                1,
-                n_committed as i32,
-                hidden * target_layer_ids.len() as i32,
-            ],
-            &[1, 1, 1],
-            device,
-        )?;
-        h_ctx_raw = concatenate(&[&h_ctx_raw, &committed_hidden], 1, device)?;
+        // conditioning context (the reference feeds the committed
+        // `hidden[:, :accepted+1]` as NEW context into the persistent draft
+        // cache, which holds all prior rounds). We accumulate the equivalent
+        // buffer, one projection per round's commit rather than one per round
+        // over the whole of it.
+        let committed_hidden =
+            super::committed_rows(&v_hidden, n_committed, condition_width, device)?;
+        let projected_rows;
+        (h_ctx, projected_rows) = drafter.grow_conditioning(&h_ctx, &committed_hidden, device)?;
+        super::guard_round_conditioning(rounds, projected_rows, n_committed)?;
+        conditioned_rows += projected_rows.max(0) as usize;
+        if let Some(seed) = probe_seed.take() {
+            let raw = concatenate(&[&seed, &committed_hidden], 1, device)?;
+            let fresh = drafter.project_condition(&raw)?;
+            let tail = h_ctx.shape().get(1).copied().unwrap_or(0) - (1 + projected_rows);
+            let carried_tail = h_ctx.slice(
+                &[0, tail, 0],
+                &[1, tail + 1 + projected_rows, drafter.cfg.hidden_size as i32],
+                &[1, 1, 1],
+                device,
+            )?;
+            tracing::debug!(
+                rows = 1 + projected_rows,
+                residual = super::conditioning_residual(&carried_tail, &fresh, device)?,
+                "dflash conditioning: carried projection against a fresh one"
+            );
+        }
         b = *new_tokens.last().unwrap_or(&b);
 
         tracing::debug!(
@@ -872,6 +945,7 @@ pub fn dflash_generate(
             accept,
             num_draft = draft_tokens.len(),
             n_committed,
+            projected_rows,
             emitted_total = emitted.len(),
             v_offset_before,
             v_target,
@@ -887,6 +961,7 @@ pub fn dflash_generate(
         emitted: emitted.len(),
         seed_emitted,
         emitted_in_rounds,
+        conditioned_rows: Some(conditioned_rows),
         total_draft,
         total_accept,
         prefill_ns,
@@ -1138,7 +1213,6 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
         hidden_norm,
         norm: final_norm,
         layers,
-        caches: Vec::new(),
         rope_freqs,
         rope_mscale,
         cfg,
@@ -1148,6 +1222,8 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
 
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod condition_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

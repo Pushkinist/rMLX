@@ -1,3 +1,9 @@
+// LOC-exempt: the shared round-loop layer is one contract. The seven loops
+// differ in their drafter and agree on everything a round does around it —
+// prefill chunking, the acceptance walk, the KV and recurrent rollback, the
+// conditioning slice and its guards, the emit site, the per-request record.
+// Splitting it by loop duplicates those; splitting it by phase separates a
+// guard from the step it guards.
 //! Speculative decoding.
 //!
 //! Wraps a (verifier, draft) pair of `Architecture` instances.
@@ -43,7 +49,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{argmax, concatenate, Array, Device, Dtype};
+use rmlx_mlx::{argmax, concatenate, subtract, Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::arch::{load_model, Architecture, LoadOpts};
@@ -880,6 +886,7 @@ impl SpeculativeDispatcher {
                     emitted: emitted.len(),
                     seed_emitted,
                     emitted_in_rounds,
+                    conditioned_rows: None,
                     total_draft: total_draft_tokens,
                     total_accept: total_accept_count,
                     prefill_ns,
@@ -1004,6 +1011,7 @@ impl SpeculativeDispatcher {
             emitted: emitted.len(),
             seed_emitted,
             emitted_in_rounds,
+            conditioned_rows: None,
             total_draft: total_draft_tokens,
             total_accept: total_accept_count,
             prefill_ns,
@@ -1314,6 +1322,7 @@ impl SpeculativeDispatcher {
                     emitted: emitted.len(),
                     seed_emitted,
                     emitted_in_rounds,
+                    conditioned_rows: None,
                     total_draft: total_draft_tokens,
                     total_accept: total_accept_count,
                     prefill_ns,
@@ -1407,6 +1416,7 @@ impl SpeculativeDispatcher {
             emitted: emitted.len(),
             seed_emitted,
             emitted_in_rounds,
+            conditioned_rows: None,
             total_draft: total_draft_tokens,
             total_accept: total_accept_count,
             prefill_ns,
@@ -1893,6 +1903,138 @@ pub(crate) fn accept_prefix(
         }
     }
     Ok((accepted, emit))
+}
+
+/// Largest difference allowed between a conditioning projection carried across
+/// rounds and the same rows projected in one call, in the host-side fixtures.
+///
+/// It is not zero and cannot be: `fc` is a matmul, and MLX's kernel for it
+/// accumulates differently at different row counts, so a row projected in a call
+/// of 3 rows and the same row projected in a call of 40 land one to four `f32`
+/// units in the last place apart — 1.2e-7 to 4.8e-7 at the magnitudes these
+/// fixtures reach. What the bound has to separate that from is a projection of
+/// the wrong rows, which differs by order 1, and it is twenty times the largest
+/// rounding difference observed and five orders under that.
+///
+/// It is an `f32` figure taken on `f32` fixtures and **does not carry to a
+/// checkpoint at its own dtype**, where the same two projections are dispatched
+/// at different matmul heights over fewer mantissa bits. That residual is
+/// reported per request by [`conditioning_residual`], not bounded here.
+#[cfg(test)]
+pub(crate) const PROJECTION_TOL: f32 = 1e-5;
+
+/// Largest element-wise gap between a carried conditioning buffer's tail and a
+/// fresh projection of the rows that tail was built from.
+///
+/// The two are the same rows through the same row-wise projection, so they agree
+/// exactly in exact arithmetic. They are **not** required to agree bit for bit
+/// at a checkpoint's dtype: a matmul's kernel and reduction order are chosen by
+/// shape, and the carried tail was projected in two calls where the comparison
+/// takes one. This reports that gap rather than assuming it away, which is why
+/// it is a measurement and not an assertion — a drafter conditioned on a
+/// last-place-different row proposes a different token only at a near-tie, and
+/// the verifier then accepts a different number of them, which is where it shows
+/// up first. It does not stop there: a different accept split changes the next
+/// verify block's composition, so the verifier's own logits move in their last
+/// place too and a near-tie of its own can resolve the other way. Equivalence is
+/// judged by the oracle in `docs/SPEC_ANSWER_EQUIVALENCE.md`, not by byte
+/// equality.
+///
+/// **What it does and does not reach.** Both arguments are `[1, rows, hidden]`
+/// and bounded by one block, so this is one small pass taken once per request —
+/// and so the heights it compares are the ones a round actually projects at, a
+/// few rows against a few more. It says nothing about a projection taken at the
+/// height of a whole generation, which is what a loop that re-projected its
+/// accumulated buffer every round would have used. Reaching that height would
+/// mean holding the raw capture for the whole request, which is the cost the
+/// carried projection exists to remove.
+///
+/// # Errors
+///
+/// From the subtraction or from reading the result back.
+fn conditioning_residual(carried_tail: &Array, reprojected: &Array, device: Device) -> Result<f32> {
+    let gap = subtract(carried_tail, reprojected, device)?;
+    let dtype = gap.dtype();
+    Ok(max_abs_from_bytes(&gap.to_bytes()?, dtype))
+}
+
+/// Refuse a round that conditioned on a different number of rows than it
+/// committed.
+///
+/// `projected` is read back from the array the projection returned; `committed`
+/// is the round's own count of what it kept. They are the same number by
+/// construction and nothing downstream reads both, which is the problem: a loop
+/// that hands the projection one row too few conditions every later round on a
+/// buffer missing its carry tokens, and greedy verification still emits the
+/// verifier's own tokens, so the request succeeds and only the accept rate
+/// falls.
+///
+/// # Errors
+///
+/// [`Error::Model`] when the two disagree.
+fn guard_round_conditioning(round: usize, projected: i32, committed: usize) -> Result<()> {
+    if projected < 0 || projected as usize != committed {
+        return Err(Error::Model(format!(
+            "speculative round {round} projected {projected} conditioning rows but \
+             committed {committed}: the rows a round conditions the next one on are the \
+             rows it kept, and nothing in an answer reports them diverging"
+        )));
+    }
+    Ok(())
+}
+
+/// The rows a round commits out of its verify pass's capture: the **first**
+/// `rows` positions, the carry token followed by the tokens the walk kept.
+///
+/// Which end this takes is the whole of it. The verify pass scored the carry
+/// token, the accepted proposals and the rejected ones in one forward, and the
+/// caches keep only the first two — so a slice from the other end conditions the
+/// next round on drafts the verifier threw away. It is the same shape and the
+/// same row count either way, and greedy verification emits the verifier's own
+/// tokens whatever the drafter was conditioned on, so what moves first is the
+/// accept rate rather than the text — far enough along, a changed accept split
+/// reshapes the verify blocks and the text can move too, at a near-tie of the
+/// verifier's own.
+///
+/// Both DFlash loops commit through this, and they count their rows
+/// differently: one takes the accepted proposals plus the carry token, the other
+/// the tokens it actually emitted, which the request's remaining budget can cut
+/// short. That is why the count is the caller's and the end is not.
+///
+/// # Errors
+///
+/// [`Error::Model`] when the capture is not `[1, positions, width]`, when it
+/// holds fewer positions than the round commits, when the round commits none, or
+/// from the slice.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "each axis is read only after the rank has been compared against 3"
+)]
+fn committed_rows(v_hidden: &Array, rows: usize, width: i32, device: Device) -> Result<Array> {
+    let shape = v_hidden.shape();
+    if shape.len() != 3 || shape[0] != 1 || shape[2] != width {
+        return Err(Error::Model(format!(
+            "committed_rows: the verify capture has shape {shape:?}, not the \
+             [1, positions, {width}] this drafter's conditioning reads"
+        )));
+    }
+    if rows == 0 {
+        return Err(Error::Model(
+            "committed_rows: a round commits no positions — every round keeps at least \
+             the carry token the verifier scored, so an empty commit is a miscounted \
+             round and not a round that kept nothing"
+                .to_owned(),
+        ));
+    }
+    let rows = rows as i32;
+    let have = shape[1];
+    if rows > have {
+        return Err(Error::Model(format!(
+            "committed_rows: the round commits {rows} positions but its verify \
+             capture holds {have} positions"
+        )));
+    }
+    v_hidden.slice(&[0, 0, 0], &[1, rows, width], &[1, 1, 1], device)
 }
 
 /// Roll one speculative round's caches back to `target_offset` after a partial
