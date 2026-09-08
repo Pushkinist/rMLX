@@ -2496,3 +2496,7 @@ pub(crate) fn unread_tensor_refusal(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "round_skeleton_tests.rs"]
+mod round_skeleton_tests;
