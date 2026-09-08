@@ -878,3 +878,122 @@ fn read_golden(path: &Path) -> Option<Vec<u32>> {
             .collect(),
     )
 }
+
+// ---------------------------------------------------------------------------
+// Capturing a speculative round stream without changing the run
+// ---------------------------------------------------------------------------
+
+/// The two targets a speculative round loop consults to decide what it *does*,
+/// as opposed to what it logs.
+///
+/// `rmlx::spec::phase` at TRACE makes every round force its carried arrays
+/// before its span closes; `rmlx_models::speculative::eagle3` at TRACE adds one
+/// event per verified position. A recorder that enables either is measuring a
+/// different, slower run than the one that ships.
+pub const BEHAVIOUR_SWITCH_TARGETS: [&str; 2] =
+    ["rmlx::spec::phase", "rmlx_models::speculative::eagle3"];
+
+/// A subscriber that keeps every event's target, level and rendered fields, and
+/// declines the two switches above.
+///
+/// Install it with [`tracing::subscriber::with_default`] and **never** with
+/// `set_global_default`: a global stays installed for every later test in the
+/// binary, and one whose `enabled` answers `true` leaves `phases_charged()` true
+/// for all of them.
+pub struct RoundStreamRecorder {
+    events: std::sync::Mutex<Vec<String>>,
+    asked: std::sync::Mutex<Vec<(String, tracing::Level)>>,
+}
+
+impl Default for RoundStreamRecorder {
+    fn default() -> Self {
+        Self {
+            events: std::sync::Mutex::new(Vec::new()),
+            asked: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl RoundStreamRecorder {
+    #[must_use]
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// Every event this recorder accepted, in order, one line each.
+    #[must_use]
+    pub fn events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every `(target, level)` it was asked about.
+    #[must_use]
+    pub fn questions(&self) -> Vec<(String, tracing::Level)> {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether both behaviour switches were consulted and declined.
+    ///
+    /// A capture that never saw the questions proves nothing about having
+    /// declined them, which is why this reads the questions rather than the run.
+    #[must_use]
+    pub fn declined_both_switches(&self) -> bool {
+        let asked = self.questions();
+        BEHAVIOUR_SWITCH_TARGETS.iter().all(|t| {
+            asked
+                .iter()
+                .any(|(target, level)| target == t && *level == tracing::Level::TRACE)
+        })
+    }
+}
+
+impl tracing::Subscriber for RoundStreamRecorder {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((meta.target().to_owned(), *meta.level()));
+        // The two switches are declined whatever level they are asked at, so a
+        // switch lowered to DEBUG is declined too rather than silently enabled.
+        if BEHAVIOUR_SWITCH_TARGETS.contains(&meta.target()) {
+            return false;
+        }
+        *meta.level() <= tracing::Level::DEBUG
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Render(String);
+        impl tracing::field::Visit for Render {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, " {}={v:?}", f.name());
+            }
+        }
+        let mut r = Render(event.metadata().target().to_owned());
+        event.record(&mut r);
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(r.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}

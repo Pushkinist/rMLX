@@ -126,6 +126,21 @@ use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
+
+/// Target of this loop's per-position step trace.
+pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
+
+/// Whether this request emits one trace event per verified position.
+///
+/// Like [`crate::speculative::phases_charged`] this reads process-global log
+/// state and changes what the round does — a block of `v_k` events per round,
+/// each reading back tokens the loop already holds. It is a named predicate so
+/// a recorder can be asked whether it declined it: a subscriber that enables
+/// everything turns this on, and a per-round stream captured under one is not
+/// the stream the loop emits by default.
+pub(crate) fn step_trace_enabled() -> bool {
+    tracing::enabled!(target: STEP_TARGET, tracing::Level::TRACE)
+}
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// One greedy EAGLE-3 acceptance walk over a drafted block.
@@ -1159,10 +1174,7 @@ pub fn eagle3_generate(
         let n_committed = new_tokens.len();
 
         // Per-step trace: enable with RUST_LOG=rmlx_models::speculative::eagle3=trace.
-        if tracing::enabled!(
-            target: "rmlx_models::speculative::eagle3",
-            tracing::Level::TRACE
-        ) {
+        if step_trace_enabled() {
             let running_ar = if total_draft > 0 {
                 (total_accept as f64) / (total_draft as f64)
             } else {
@@ -1170,7 +1182,7 @@ pub fn eagle3_generate(
             };
             for (i, (&dt, &vt)) in draft_tokens.iter().zip(v_tokens.iter()).enumerate() {
                 tracing::trace!(
-                    target: "rmlx_models::speculative::eagle3",
+                    target: STEP_TARGET,
                     round = rounds,
                     step = i,
                     draft_tok = dt,

@@ -415,20 +415,20 @@ fn loops_that_are_one_drafter_share_a_kind() {
 /// or lowered from `TRACE` to `DEBUG` — which would charge every `--log debug`
 /// run — changes the recorded question rather than the recorded answer, and a
 /// test that only checked the answer would stay green through both.
-struct AskRecorder {
+pub(crate) struct AskRecorder {
     verdict: bool,
     asked: std::sync::Mutex<Vec<(String, tracing::Level)>>,
 }
 
 impl AskRecorder {
-    fn new(verdict: bool) -> std::sync::Arc<Self> {
+    pub(crate) fn new(verdict: bool) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             verdict,
             asked: std::sync::Mutex::new(Vec::new()),
         })
     }
 
-    fn questions(&self) -> Vec<(String, tracing::Level)> {
+    pub(crate) fn questions(&self) -> Vec<(String, tracing::Level)> {
         // A poisoned lock still holds the questions; this fixture has no
         // invariant a panicking writer could have broken.
         self.asked
@@ -737,5 +737,54 @@ fn an_uncharged_round_is_not_asked_where_its_work_went() {
     assert!(
         errors.is_empty(),
         "the guard is a charged-run instrument, not a running commentary: {errors:?}"
+    );
+}
+
+/// A recorder used to capture a per-round stream must decline **both**
+/// behaviour-changing switches, and be asked about both.
+///
+/// `phases_charged` is not the only one. EAGLE-3's round loop gates a
+/// per-position trace block on its own target, and a subscriber that enables
+/// everything turns that on too — so a stream captured under it is not the
+/// stream the loop emits by default, and the run it was taken from is a
+/// different, slower run. Asserting the *questions* and not just the answers is
+/// what catches a switch retargeted at another string or lowered to `DEBUG`.
+#[test]
+fn a_capture_recorder_declines_both_behaviour_switches_and_is_asked_about_both() {
+    let rec = AskRecorder::new(false);
+    let (charged, stepping) =
+        tracing::subscriber::with_default(std::sync::Arc::clone(&rec), || {
+            (
+                super::phases_charged(),
+                crate::speculative::eagle3::step_trace_enabled(),
+            )
+        });
+    assert!(
+        !charged,
+        "a declining subscriber must leave the phases uncharged"
+    );
+    assert!(
+        !stepping,
+        "a declining subscriber must leave the per-position step trace off"
+    );
+    let asked = rec.questions();
+    let want_phase = (super::PHASE_TARGET.to_owned(), tracing::Level::TRACE);
+    let want_step = (
+        crate::speculative::eagle3::STEP_TARGET.to_owned(),
+        tracing::Level::TRACE,
+    );
+    assert!(
+        asked.contains(&want_phase),
+        "the phase switch was never asked about: {asked:?}"
+    );
+    assert!(
+        asked.contains(&want_step),
+        "the step-trace switch was never asked about: {asked:?}"
+    );
+    // Nothing else: a third switch appearing here is a third thing a capture
+    // run would have to decline, and it must be declared rather than discovered.
+    assert!(
+        asked.iter().all(|q| *q == want_phase || *q == want_step),
+        "an unexpected switch was consulted: {asked:?}"
     );
 }
