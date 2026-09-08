@@ -28,12 +28,19 @@ TOOL="$REPO_ROOT/scripts/lib/debt_report.py"
 BASE="$REPO_ROOT/scripts/fixtures/debt_report/base"
 
 for f in \
+    Makefile \
     crates/rmlx-kv-quant/src/storage/codec_alpha3.rs \
     crates/rmlx-kv-quant/src/storage/codec_alpha4.rs \
     crates/rmlx-kv-quant/src/storage/codec_beta3.rs \
     crates/rmlx-kv-quant/src/storage/codec_beta4.rs \
     crates/rmlx-kv-quant/src/storage/codec_gamma3.rs \
     crates/rmlx-kv-quant/src/storage/codec_gamma4.rs \
+    crates/rmlx-kv-quant/src/storage/counters_allow.rs \
+    crates/rmlx-kv-quant/src/storage/counters_debt.rs \
+    crates/rmlx-kv-quant/src/storage/counters_debt_tests.rs \
+    crates/rmlx-kv-quant/src/storage/counters_oversized.rs \
+    crates/rmlx-kv-quant/src/storage/counters_oversized_exempt.rs \
+    crates/rmlx-models/src/speculative/cached.rs \
     crates/rmlx-models/src/speculative/mtp.rs \
     crates/rmlx-models/src/speculative/dflash.rs \
     crates/rmlx-models/src/speculative/dflash2.rs \
@@ -155,6 +162,26 @@ check "doc_just_under_threshold_absent" \
 check "dead_path_not_attempted" \
     "dead-path counting says plainly that it is not attempted" \
     contains "dead-path (zero non-test callers): not attempted" \
+    BASE_OUT
+
+check "counter_allow_sites" \
+    "the one planted #[allow(...)] site is counted" \
+    contains "#[allow(...)] sites (non-test source only): 1" \
+    BASE_OUT
+
+check "counter_debt_comments" \
+    "both planted debt comments are counted — one in source, one in a _tests.rs file, proving the population is source + tests" \
+    contains "debt-marker comments (inert|dormant|deferred|kept for|future-reference|no longer; source + tests): 2" \
+    BASE_OUT
+
+check "counter_check_targets" \
+    "the fixture Makefile's two check-*: targets are counted, the non-check target is not" \
+    contains "check-* Make targets: 2" \
+    BASE_OUT
+
+check "counter_oversized" \
+    "the 1200-line file is counted; its LOC-exempt-marked twin is not" \
+    contains "files >1000 LOC without a LOC-exempt marker (non-test source only): 1" \
     BASE_OUT
 
 # ---- negative case: a renamed driver is discovered under its new name, not --
