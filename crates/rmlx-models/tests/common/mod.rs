@@ -883,19 +883,27 @@ fn read_golden(path: &Path) -> Option<Vec<u32>> {
 // Capturing a speculative round stream without changing the run
 // ---------------------------------------------------------------------------
 
-/// The two targets a speculative round loop consults to decide what it *does*,
-/// as opposed to what it logs.
-///
-/// `rmlx::spec::phase` at TRACE makes every round force its carried arrays
-/// before its span closes; `rmlx_models::speculative::eagle3` at TRACE adds one
-/// event per verified position. A recorder that enables either is measuring a
-/// different, slower run than the one that ships.
+/// At TRACE, every round forces its carried arrays before its span closes.
+pub const PHASE_SWITCH_TARGET: &str = "rmlx::spec::phase";
+
+/// At TRACE, EAGLE-3's round adds one event per verified position. The same
+/// target carries that loop's round event at DEBUG.
+pub const EAGLE3_STEP_SWITCH_TARGET: &str = "rmlx_models::speculative::eagle3";
+
+/// The two targets a **speculative round loop** consults to decide what it
+/// *does*, as opposed to what it logs. A recorder that enables either is
+/// measuring a different, slower run than the one that ships.
 ///
 /// Both are asked at TRACE and at no other level, and both targets carry a
 /// round event at DEBUG, so what a capture must decline is the level and not
 /// the target.
-pub const BEHAVIOUR_SWITCH_TARGETS: [&str; 2] =
-    ["rmlx::spec::phase", "rmlx_models::speculative::eagle3"];
+///
+/// **Not every behaviour-changing switch in the crate.** [`RoundStreamRecorder`]
+/// answers `true` for every DEBUG callsite, so it turns on any switch keyed on
+/// DEBUG — `multimodal_cache`'s `enabled!(Level::DEBUG)` is one, and it is a
+/// switch no round loop reaches, so a speculative capture is unaffected by it.
+/// A capture installed over any other path has to read that list for itself.
+pub const BEHAVIOUR_SWITCH_TARGETS: [&str; 2] = [PHASE_SWITCH_TARGET, EAGLE3_STEP_SWITCH_TARGET];
 
 /// One event as it was emitted: its target, its message, and its fields in the
 /// order the emitter wrote them, each rendered by the emitter's own `Debug`.

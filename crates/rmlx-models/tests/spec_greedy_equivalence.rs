@@ -2479,6 +2479,19 @@ impl Loaded {
     ) -> (usize, Vec<u32>, Vec<DecidedBy>, Vec<common::CapturedEvent>) {
         let mut spec_ids: Vec<u32> = Vec::new();
         let mut decided_by: Vec<DecidedBy> = Vec::new();
+        // EAGLE-3 is the one loop that consults the second switch, and its
+        // round event sits on that same target — so what the capture is held to
+        // is the question having been asked and declined, not the target being
+        // silent. Without it, `if step_trace_enabled()` rewritten to `if true`
+        // costs a per-position event per round and nothing here reads it: the
+        // recorder declines TRACE, so the events never arrive either way.
+        let asks_step_switch = matches!(
+            &self.engine,
+            Engine::Sidecar {
+                drafter: Drafter::Eagle3(_),
+                ..
+            }
+        );
         let recorder = common::RoundStreamRecorder::new();
         let ran = tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
             let mut step = |s: &rmlx_models::ProbeStep| {
@@ -2646,6 +2659,12 @@ impl Loaded {
         switches.sort_unstable();
         switches.dedup();
         eprintln!("switches declined: {switches:?}");
+        assert!(
+            !asks_step_switch || switches.contains(&common::EAGLE3_STEP_SWITCH_TARGET),
+            "this loop gates its per-position trace on {} and the capture was never \
+             asked about it, so the gate is no longer there: {switches:?}",
+            common::EAGLE3_STEP_SWITCH_TARGET
+        );
         (
             ran,
             spec_ids,
