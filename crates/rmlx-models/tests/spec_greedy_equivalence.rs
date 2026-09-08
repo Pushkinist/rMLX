@@ -2483,12 +2483,13 @@ impl Loaded {
     ) -> (usize, Vec<u32>, Vec<DecidedBy>, Vec<CapturedEvent>) {
         let mut spec_ids: Vec<u32> = Vec::new();
         let mut decided_by: Vec<DecidedBy> = Vec::new();
-        // EAGLE-3 is the one loop that consults the second switch, and its
-        // round event sits on that same target — so what the capture is held to
-        // is the question having been asked and declined, not the target being
-        // silent. Without it, `if step_trace_enabled()` rewritten to `if true`
-        // costs a per-position event per round and nothing here reads it: the
-        // recorder declines TRACE, so the events never arrive either way.
+        // EAGLE-3 is the one loop that consults the second switch, and what the
+        // capture is held to is how often. Its round event sits on that same
+        // target, so the target is never silent; and the recorder declines
+        // TRACE, so no event arrives whatever the guard does. What separates the
+        // two worlds is the *question*: the guard asks once per round, and
+        // `if step_trace_enabled()` rewritten to `if true` deletes that call and
+        // leaves the per-position `trace!` asking once per verified position.
         let asks_step_switch = matches!(
             &self.engine,
             Engine::Sidecar {
@@ -2663,13 +2664,21 @@ impl Loaded {
         switches.sort_unstable();
         switches.dedup();
         eprintln!("switches declined: {switches:?}");
+        let rounds = round_events(&recorder.events());
+        let step_questions = questions
+            .iter()
+            .filter(|(target, level, _)| {
+                target == EAGLE3_STEP_SWITCH_TARGET && *level == tracing::Level::TRACE
+            })
+            .count();
         assert!(
-            !asks_step_switch || switches.contains(&EAGLE3_STEP_SWITCH_TARGET),
-            "this loop gates its per-position trace on {EAGLE3_STEP_SWITCH_TARGET} and \
-             the capture was never asked about it, so the gate is no longer there: \
-             {switches:?}"
+            !asks_step_switch || step_questions == rounds.len(),
+            "this loop asks its per-position trace switch once per round: {} rounds \
+             closed and the switch was asked {step_questions} times. A guard replaced \
+             by a constant asks it once per verified position, or not at all.",
+            rounds.len()
         );
-        (ran, spec_ids, decided_by, round_events(&recorder.events()))
+        (ran, spec_ids, decided_by, rounds)
     }
 
     /// The target-vocabulary ids this pair's drafter can name, or `None` when it
