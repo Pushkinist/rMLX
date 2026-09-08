@@ -100,7 +100,7 @@ use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 /// - `prefer_requested` short-circuits to the requested size (config flag).
 ///
 /// Returns the next block total (including the seed token).
-pub fn dflash_next_block_size(
+pub(crate) fn dflash_next_block_size(
     recent: &[(usize, usize)],
     requested_block_total: usize,
     remaining: usize,

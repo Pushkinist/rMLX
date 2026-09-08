@@ -1,3 +1,9 @@
+// LOC-exempt: one gate over seven round loops. The oracle it applies — the
+// divergence-confidence judgement and the repetition control — is one argument
+// whose constants are set against the population of pairs and prompts the file
+// runs, and the pair table, the prompt sweep and the per-loop arms are that
+// population. Splitting it would put the constants in one file and the readings
+// that set them in another.
 //! Speculative decoding must not change what the model says.
 //!
 //! Greedy speculative decoding emits the verifier's own argmax at every
@@ -154,7 +160,8 @@ use std::path::Path;
 mod common;
 
 use common::round_stream::{
-    round_events, CapturedEvent, RoundStreamRecorder, EAGLE3_STEP_SWITCH_TARGET, ROUND_EVENT_FIELDS,
+    round_events, CapturedEvent, RoundStreamRecorder, EAGLE3_STEP_SWITCH_TARGET,
+    PHASE_SWITCH_TARGET, ROUND_EVENT_FIELDS,
 };
 
 use rmlx_mlx::Device;
@@ -3046,7 +3053,7 @@ fn write_round_stream(test: &str, prompt: &str, rounds: &[CapturedEvent]) {
 /// followed by a request-level line that is not a round.
 fn emit_one_round_of_each_shape() {
     tracing::debug!(
-        target: "rmlx::spec::phase",
+        target: PHASE_SWITCH_TARGET,
         round = 3,
         accept = 2,
         num_draft = 4,
@@ -3089,7 +3096,7 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
     let recorder = RoundStreamRecorder::new();
     tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
         // The two questions a round loop asks before it decides what to do.
-        assert!(!tracing::enabled!(target: "rmlx::spec::phase", tracing::Level::TRACE));
+        assert!(!tracing::enabled!(target: PHASE_SWITCH_TARGET, tracing::Level::TRACE));
         assert!(
             !tracing::enabled!(target: "rmlx_models::speculative::eagle3", tracing::Level::TRACE)
         );
@@ -3124,7 +3131,7 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
 
     let line: serde_json::Value =
         serde_json::from_str(&rounds[0].json_line()).expect("a round renders as one JSON object");
-    assert_eq!(line["target"], "rmlx::spec::phase");
+    assert_eq!(line["target"], PHASE_SWITCH_TARGET);
     assert_eq!(line["message"], "speculative round");
     assert_eq!(line["accept"], "2");
     assert_eq!(line["num_draft"], "4");
