@@ -55,9 +55,9 @@ use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows, disarm_lin_tapes,
-    emit_step, guard_verifier_prefill_logits, phases_charged, rollback_round_caches,
-    verifier_context, verifier_kv_bytes, DecodeWindow, RoundPhases, RoundStats, SpecLoop,
-    VerifierDraw,
+    emit_step, guard_round_conditioning, guard_verifier_prefill_logits, phases_charged,
+    rollback_round_caches, verifier_context, verifier_kv_bytes, DecodeWindow, RoundPhases,
+    RoundStats, SpecLoop, VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -248,6 +248,7 @@ pub fn dflash2_generate(
             emitted: emitted.len(),
             seed_emitted: emitted.len(),
             emitted_in_rounds: 0,
+            conditioned_rows: Some(0),
             total_draft: 0,
             total_accept: 0,
             prefill_ns,
@@ -275,6 +276,10 @@ pub fn dflash2_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    // Conditioning rows the rounds projected, read back from the projection
+    // rather than from what the loop meant to hand it. See
+    // `guard_round_conditioning`.
+    let mut conditioned_rows = 0usize;
     let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
@@ -378,15 +383,9 @@ pub fn dflash2_generate(
         // The carry token and the accepted proposals.
         let committed_hidden = committed_rows(&v_hidden, accept + 1, condition_width, device)?;
         let projected_rows;
-        (h_ctx, projected_rows) = drafter.advance_conditioning(&h_ctx, &committed_hidden)?;
-        if charge_phases {
-            // Projecting this round's committed rows and copying the window they
-            // extend is work the next round's drafter is the first thing to read.
-            // Forced here it lands in the round's unclaimed time, which is where
-            // slicing and bookkeeping belong; left lazy it lands in the drafter.
-            // See `phases_charged`.
-            h_ctx.eval()?;
-        }
+        (h_ctx, projected_rows) = drafter.slide_conditioning(&h_ctx, &committed_hidden)?;
+        guard_round_conditioning(rounds, projected_rows, accept + 1)?;
+        conditioned_rows += projected_rows.max(0) as usize;
         b = *new_tokens.last().unwrap_or(&b);
 
         tracing::debug!(
@@ -428,6 +427,7 @@ pub fn dflash2_generate(
         emitted: emitted.len(),
         seed_emitted,
         emitted_in_rounds,
+        conditioned_rows: Some(conditioned_rows),
         total_draft,
         total_accept,
         prefill_ns,

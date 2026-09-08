@@ -26,6 +26,7 @@ use super::super::round::PREFILL_CHUNK_SIZE;
 use super::*;
 use crate::layers::Linear;
 use crate::qwen3_5_moe::capture_tail::CaptureTail;
+use crate::speculative::PROJECTION_TOL;
 
 /// Where the reference snapshot and its expected outputs live.
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dflash2_scale");
@@ -44,18 +45,6 @@ const SCALE_HIDDEN: usize = 64;
 /// moves by the same one place between two absolute offsets that are
 /// mathematically identical. The cases are 0.60 apart, ~37x this bound.
 const REFERENCE_TOL: f32 = 0.016;
-
-/// Largest difference allowed between a projection carried across rounds and the
-/// same rows projected in one call.
-///
-/// It is not zero and cannot be: `fc` is a matmul, and MLX's kernel for it
-/// accumulates differently at different row counts, so a row projected in a call
-/// of 3 rows and the same row projected in a call of 40 land one to four f32
-/// units in the last place apart — 1.2e-7 to 4.8e-7 at the magnitudes this
-/// fixture reaches. What the bound has to separate that from is a projection of
-/// the wrong rows, which differs by order 1, and it is twenty times the largest
-/// rounding difference observed and five orders under that.
-const PROJECTION_TOL: f32 = 1e-5;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -732,9 +721,9 @@ fn advancing_the_carried_projection_leaves_it_at_the_bound() {
     for round in 0..6 {
         let committed = varied_rows_at(next, 3, width);
         next += 3;
-        let (grown, projected) = match drafter.advance_conditioning(&carried, &committed) {
+        let (grown, projected) = match drafter.slide_conditioning(&carried, &committed) {
             Ok(pair) => pair,
-            Err(e) => panic!("advance_conditioning at round {round}: {e}"),
+            Err(e) => panic!("slide_conditioning at round {round}: {e}"),
         };
         carried = grown;
         assert_eq!(
@@ -803,9 +792,9 @@ fn the_carried_projection_equals_projecting_the_whole_history() {
         for (round, commit) in [5, 3, 1, 5].into_iter().enumerate() {
             let committed = varied_rows_at(next, commit, width);
             next += commit;
-            let (grown, projected) = match drafter.advance_conditioning(&carried, &committed) {
+            let (grown, projected) = match drafter.slide_conditioning(&carried, &committed) {
                 Ok(pair) => pair,
-                Err(e) => panic!("advance_conditioning at round {round}: {e}"),
+                Err(e) => panic!("slide_conditioning at round {round}: {e}"),
             };
             carried = grown;
             assert_eq!(

@@ -449,7 +449,7 @@ impl DFlash2Drafter {
         clippy::indexing_slicing,
         reason = "the row count is read after project_conditioning has established the rank"
     )]
-    pub(super) fn advance_conditioning(
+    pub(super) fn slide_conditioning(
         &self,
         carried: &Array,
         committed: &Array,

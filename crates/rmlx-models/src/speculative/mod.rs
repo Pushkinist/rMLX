@@ -1,3 +1,9 @@
+// LOC-exempt: the shared round-loop layer is one contract. The seven loops
+// differ in their drafter and agree on everything a round does around it —
+// prefill chunking, the acceptance walk, the KV and recurrent rollback, the
+// conditioning slice and its guards, the emit site, the per-request record.
+// Splitting it by loop duplicates those; splitting it by phase separates a
+// guard from the step it guards.
 //! Speculative decoding.
 //!
 //! Wraps a (verifier, draft) pair of `Architecture` instances.
@@ -880,6 +886,7 @@ impl SpeculativeDispatcher {
                     emitted: emitted.len(),
                     seed_emitted,
                     emitted_in_rounds,
+                    conditioned_rows: None,
                     total_draft: total_draft_tokens,
                     total_accept: total_accept_count,
                     prefill_ns,
@@ -1004,6 +1011,7 @@ impl SpeculativeDispatcher {
             emitted: emitted.len(),
             seed_emitted,
             emitted_in_rounds,
+            conditioned_rows: None,
             total_draft: total_draft_tokens,
             total_accept: total_accept_count,
             prefill_ns,
@@ -1314,6 +1322,7 @@ impl SpeculativeDispatcher {
                     emitted: emitted.len(),
                     seed_emitted,
                     emitted_in_rounds,
+                    conditioned_rows: None,
                     total_draft: total_draft_tokens,
                     total_accept: total_accept_count,
                     prefill_ns,
@@ -1407,6 +1416,7 @@ impl SpeculativeDispatcher {
             emitted: emitted.len(),
             seed_emitted,
             emitted_in_rounds,
+            conditioned_rows: None,
             total_draft: total_draft_tokens,
             total_accept: total_accept_count,
             prefill_ns,
@@ -1895,6 +1905,44 @@ pub(crate) fn accept_prefix(
     Ok((accepted, emit))
 }
 
+/// Largest difference allowed between a conditioning projection carried across
+/// rounds and the same rows projected in one call, in the host-side fixtures.
+///
+/// It is not zero and cannot be: `fc` is a matmul, and MLX's kernel for it
+/// accumulates differently at different row counts, so a row projected in a call
+/// of 3 rows and the same row projected in a call of 40 land one to four `f32`
+/// units in the last place apart — 1.2e-7 to 4.8e-7 at the magnitudes these
+/// fixtures reach. What the bound has to separate that from is a projection of
+/// the wrong rows, which differs by order 1, and it is twenty times the largest
+/// rounding difference observed and five orders under that.
+#[cfg(test)]
+pub(crate) const PROJECTION_TOL: f32 = 1e-5;
+
+/// Refuse a round that conditioned on a different number of rows than it
+/// committed.
+///
+/// `projected` is read back from the array the projection returned; `committed`
+/// is the round's own count of what it kept. They are the same number by
+/// construction and nothing downstream reads both, which is the problem: a loop
+/// that hands the projection one row too few conditions every later round on a
+/// buffer missing its carry tokens, and greedy verification still emits the
+/// verifier's own tokens, so the request succeeds and only the accept rate
+/// falls.
+///
+/// # Errors
+///
+/// [`Error::Model`] when the two disagree.
+fn guard_round_conditioning(round: usize, projected: i32, committed: usize) -> Result<()> {
+    if projected < 0 || projected as usize != committed {
+        return Err(Error::Model(format!(
+            "speculative round {round} projected {projected} conditioning rows but \
+             committed {committed}: the rows a round conditions the next one on are the \
+             rows it kept, and nothing in an answer reports them diverging"
+        )));
+    }
+    Ok(())
+}
+
 /// The rows a round commits out of its verify pass's capture: the **first**
 /// `rows` positions, the carry token followed by the tokens the walk kept.
 ///
@@ -1913,15 +1961,31 @@ pub(crate) fn accept_prefix(
 ///
 /// # Errors
 ///
-/// [`Error::Model`] when the capture holds fewer positions than the round
-/// commits, or from the slice.
+/// [`Error::Model`] when the capture is not `[1, positions, width]`, when it
+/// holds fewer positions than the round commits, when the round commits none, or
+/// from the slice.
 #[allow(
     clippy::indexing_slicing,
-    reason = "axis 1 is read on a capture the verify forward built at rank 3"
+    reason = "each axis is read only after the rank has been compared against 3"
 )]
 fn committed_rows(v_hidden: &Array, rows: usize, width: i32, device: Device) -> Result<Array> {
+    let shape = v_hidden.shape();
+    if shape.len() != 3 || shape[0] != 1 || shape[2] != width {
+        return Err(Error::Model(format!(
+            "committed_rows: the verify capture has shape {shape:?}, not the \
+             [1, positions, {width}] this drafter's conditioning reads"
+        )));
+    }
+    if rows == 0 {
+        return Err(Error::Model(
+            "committed_rows: a round commits no positions — every round keeps at least \
+             the carry token the verifier scored, so an empty commit is a miscounted \
+             round and not a round that kept nothing"
+                .to_owned(),
+        ));
+    }
     let rows = rows as i32;
-    let have = v_hidden.shape()[1];
+    let have = shape[1];
     if rows > have {
         return Err(Error::Model(format!(
             "committed_rows: the round commits {rows} positions but its verify \

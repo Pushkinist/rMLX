@@ -13,16 +13,11 @@
 
 use rmlx_mlx::{concatenate, Array, Device};
 
-use crate::speculative::committed_rows;
 use crate::speculative::dflash2::DFlash2Drafter;
+use crate::speculative::{committed_rows, PROJECTION_TOL};
 
 /// The fixture drafter's width, matching `forward_tests`.
 const SCALE_HIDDEN: usize = 64;
-
-/// Largest difference two projections of the same rows may show — the same
-/// bound `forward_tests` derives, and five orders under a projection of
-/// different rows.
-const PROJECTION_TOL: f32 = 1e-5;
 
 #[allow(
     clippy::expect_used,
@@ -119,7 +114,7 @@ fn a_round_commits_the_accepted_prefix_of_its_capture() {
         );
 
         let (grown, projected) = drafter
-            .advance_conditioning(&carried, &committed)
+            .slide_conditioning(&carried, &committed)
             .expect("advance the conditioning");
         carried = grown;
         assert_eq!(projected, accept as i32 + 1, "round {round}");

@@ -43,6 +43,7 @@ fn sample(loop_kind: SpecLoop) -> RoundStats {
         emitted: seed_emitted + emitted_in_rounds,
         emitted_in_rounds,
         seed_emitted,
+        conditioned_rows: None,
         total_draft: 32,
         total_accept,
         prefill_ns: 500_000_000,

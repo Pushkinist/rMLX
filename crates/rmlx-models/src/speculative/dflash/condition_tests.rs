@@ -3,13 +3,14 @@
 //! The loop no longer re-projects its whole conditioning history every round: it
 //! projects each round's committed rows once and appends them to the projection
 //! it is carrying. Both halves are invisible in an answer. `project_condition`
-//! is row-wise, so the carried buffer is numerically the projection of the whole
-//! history and any re-projection would agree with it; and greedy verification
-//! emits the verifier's own tokens whatever the drafter was conditioned on, so a
-//! buffer built from the wrong rows changes only the accept rate. What is
-//! checked here is therefore the buffer itself: that it equals the whole
-//! history's projection, and that the rows each round put into it are the ones
-//! the round committed, by their position rather than by their count.
+//! is row-wise, so the carried buffer is the projection of the whole history and
+//! a re-projection agrees with it within `PROJECTION_TOL`; and greedy
+//! verification emits the verifier's own tokens whatever the drafter was
+//! conditioned on, so a buffer built from the wrong rows changes only the accept
+//! rate. What is checked here is therefore the buffer itself: that it agrees
+//! with the whole history's projection, and that the rows each round put into it
+//! are the ones the round committed, by their position rather than by their
+//! count.
 //!
 //! Rows that differ only in scale would pass the first check against almost any
 //! implementation — a bias-free linear followed by an RMSNorm is scale-invariant
@@ -24,7 +25,7 @@ use std::path::Path;
 use rmlx_mlx::{concatenate, Array, Device};
 
 use super::DFlashDrafter;
-use crate::speculative::committed_rows;
+use crate::speculative::{committed_rows, PROJECTION_TOL};
 
 /// The synthetic drafter's width.
 const HIDDEN: usize = 32;
@@ -35,11 +36,6 @@ const HEAD_DIM: usize = 8;
 const HEADS: usize = 4;
 const KV_HEADS: usize = 2;
 const INTERMEDIATE: usize = 16;
-
-/// Largest difference two projections of the same rows may show. The control in
-/// every case reports the difference against rows the round did not commit, so
-/// the margin this leaves is measured in the same run rather than assumed.
-const PROJECTION_TOL: f32 = 1e-5;
 
 /// A deterministic spread of weights, distinct per tensor and per element, so no
 /// two projections agree by symmetry.
@@ -198,11 +194,23 @@ fn the_carried_projection_is_the_history_and_the_rounds_commit_their_own_rows() 
     // emitted, which is this round's carry token and its capture's row 0.
     let mut next = 1;
 
-    // Blocks of four proposals accepting all four, one and none.
-    let block = 5;
-    for (round, accept) in [4usize, 1, 0].into_iter().enumerate() {
+    // `(block, accept, committed)`: a full accept, a partial one, a zero accept,
+    // and a round whose commit the request's remaining budget cut below the
+    // `accept + 1` the caches kept — the case the row count is a caller's
+    // argument for. The block varies per round because this drafter's schedule
+    // varies it, so the capture the commit is sliced out of is a different
+    // height each time.
+    for (round, (block, accept, n_committed)) in
+        [(5i32, 4usize, 5usize), (8, 1, 2), (3, 0, 1), (7, 4, 2)]
+            .into_iter()
+            .enumerate()
+    {
         let v_hidden = rows_at(next, block, width);
-        let n_committed = accept + 1;
+        assert!(
+            n_committed <= accept + 1,
+            "round {round}: a round commits the carry token and the proposals it \
+             kept, never more"
+        );
         let committed =
             committed_rows(&v_hidden, n_committed, width, Device::Cpu).expect("commit the rows");
 
@@ -211,13 +219,13 @@ fn the_carried_projection_is_the_history_and_the_rounds_commit_their_own_rows() 
             to_f32(&rows_at(next, n_committed as i32, width)),
             "round {round}: the committed rows are not positions {next}..={} of the \
              capture",
-            next + accept as i32
+            next + n_committed as i32 - 1
         );
 
         let projected_rows;
         (carried, projected_rows) = drafter
-            .advance_condition(&carried, &committed)
-            .expect("advance the conditioning");
+            .grow_conditioning(&carried, &committed, Device::Cpu)
+            .expect("grow the conditioning");
         assert_eq!(
             projected_rows, n_committed as i32,
             "round {round}: the round projected {projected_rows} rows, not the \
@@ -258,9 +266,10 @@ fn the_carried_projection_is_the_history_and_the_rounds_commit_their_own_rows() 
         next += n_committed as i32;
     }
 
-    // The first prompt row plus each round's carry token and accepted proposals.
+    // The first prompt row plus every round's commit, each position once.
     assert_eq!(
-        next, 9,
+        next,
+        1 + 5 + 2 + 1 + 2,
         "the rounds must have consumed each position exactly once"
     );
 }

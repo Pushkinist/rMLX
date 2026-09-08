@@ -1,3 +1,8 @@
+// LOC-exempt: one drafter's whole surface — config parse, weight load, the
+// block forward, the block-size schedule, the acceptance walk and the round
+// loop that drives them. The loop reads the drafter's private weights and
+// the forward reads the config it parsed, so a split would export internals
+// across a module boundary to buy line count.
 //! DFlash drafter loader + round-loop.
 //!
 //! Port of mlx-vlm `mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py`
@@ -152,8 +157,9 @@ pub fn dflash_next_block_size(
 /// Mirrors `DFlashDecoderLayer`: pre-norm self-attention with a context /
 /// proposal KV split followed by a SwiGLU MLP, both residual. The reference
 /// keeps the context K/V in a per-layer cache; this layer rebuilds it from the
-/// conditioning rows on every call, which is what makes the drafter forward
-/// invariant to a uniform shift of every position.
+/// conditioning rows on every call, applying RoPE to the context K at offset 0
+/// each time, so conditioning row `i` carries position `i` exactly as a row the
+/// reference cached at absolute position `i` does.
 #[allow(missing_debug_implementations)]
 struct DFlashLayer {
     input_layernorm: RmsNorm,
@@ -285,8 +291,9 @@ impl DFlashDrafter {
     /// row-wise: a row's projection does not depend on which other rows were in
     /// the call. That is what lets the round loop project each round's committed
     /// rows and carry the result. The position-dependent part of the
-    /// conditioning is the per-layer RoPE in [`Self::layer_forward`], which is
-    /// applied to the context K at offset 0 on every call and so is not carried.
+    /// conditioning is the per-layer RoPE in
+    /// [`Self::layer_forward`], which is applied to the context K at offset 0 on
+    /// every call and so is not carried.
     pub fn project_condition(&self, concat_hidden: &Array) -> Result<Array> {
         let projected = self.fc.forward(concat_hidden, self.device)?;
         self.hidden_norm.forward(&projected, self.device)
@@ -300,41 +307,51 @@ impl DFlashDrafter {
     /// operation because a caller that re-projected the rows it was already
     /// carrying would produce the same buffer for a pass over the whole
     /// conditioning history every round instead of over one round's commit, and
-    /// nothing in an answer would say so. The row count is what does, which is
-    /// why it is returned and traced.
+    /// nothing in an answer would say so. The row count is what
+    /// does, which is why it is returned, traced and checked by
+    /// [`crate::speculative::guard_round_conditioning`].
     ///
-    /// The buffer is not bounded here, and there is nothing to bound it to: this
-    /// drafter declares no window, its layers are full-attention, and its block
-    /// queries read the whole context unmasked. Dropping the oldest rows would
-    /// take rows the drafter reads.
+    /// The buffer **grows** and is never bounded, which is what the name says
+    /// and what separates it from the DFlash 2 drafter's sliding equivalent:
+    /// this drafter declares no window, its layers are full-attention, and its
+    /// block queries read the whole context unmasked, so dropping the oldest
+    /// rows would take rows the drafter reads.
+    ///
+    /// `device` is the caller's, not the drafter's: the rows arrive sliced on
+    /// the loop's device and the buffer they extend is read there.
     ///
     /// # Errors
     ///
-    /// [`Error::Model`] when the committed rows carry no sequence axis, or from
-    /// the projection or the concatenation.
-    fn advance_condition(&self, carried: &Array, committed: &Array) -> Result<(Array, i32)> {
+    /// [`Error::Model`] when the committed rows are not
+    /// `[1, rows, len(target_layer_ids) * hidden_size]`, or from the projection
+    /// or the concatenation.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "each axis is read only after the rank has been compared against 3"
+    )]
+    fn grow_conditioning(
+        &self,
+        carried: &Array,
+        committed: &Array,
+        device: Device,
+    ) -> Result<(Array, i32)> {
+        let shape = committed.shape();
+        let width = (self.cfg.target_layer_ids.len() * self.cfg.hidden_size) as i32;
+        if shape.len() != 3 || shape[0] != 1 || shape[2] != width {
+            return Err(Error::Model(format!(
+                "DFlashDrafter: the committed conditioning rows have shape {shape:?}, \
+                 not the [1, rows, {width}] this drafter's fc reads"
+            )));
+        }
+        let rows = shape[1];
         let projected = self.project_condition(committed)?;
-        let rows = projected.shape().get(1).copied().ok_or_else(|| {
-            Error::Model(format!(
-                "DFlashDrafter: the committed conditioning rows have shape {:?}, not \
-                 the [1, rows, len(target_layer_ids) * hidden_size] this drafter's fc \
-                 reads",
-                committed.shape()
-            ))
-        })?;
-        let grown = concatenate(&[carried, &projected], 1, self.device)?;
+        let grown = concatenate(&[carried, &projected], 1, device)?;
         Ok((grown, rows))
     }
 
     /// Build the conditioning hidden by capturing the verifier hidden states at
     /// `target_layer_ids` and concatenating them.
     ///
-    /// **Awaiting verifier-side wiring (module docs).** rMLX's
-    /// `Architecture::forward_hidden_states` returns only the penultimate trunk
-    /// hidden and is Gemma4-only. DFlash needs per-`target_layer_id`
-    /// captures concatenated, which the Qwen3.6-MoE verifier path does not yet
-    /// expose. Returns [`Error::Model`] until that lands; the `fc`/`hidden_norm`
-    /// projection it would feed ([`project_condition`]) is implemented + tested.
     /// Capture the verifier's concatenated multi-layer hidden over `input_ids`
     /// (advancing the supplied caches) WITHOUT projecting. Returns
     /// `[1, k, len(target_layer_ids)*H]` for the last `k` positions. The
@@ -754,6 +771,7 @@ pub fn dflash_generate(
             emitted: emitted.len(),
             seed_emitted: emitted.len(),
             emitted_in_rounds: 0,
+            conditioned_rows: Some(0),
             total_draft: 0,
             total_accept: 0,
             prefill_ns,
@@ -780,6 +798,10 @@ pub fn dflash_generate(
 
     let seed_emitted = emitted.len();
     let mut emitted_in_rounds = 0usize;
+    // Conditioning rows the rounds projected, read back from the projection
+    // rather than from what the loop meant to hand it. See
+    // `guard_round_conditioning`.
+    let mut conditioned_rows = 0usize;
     let mut widest_bs = 0usize;
     let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
@@ -887,7 +909,9 @@ pub fn dflash_generate(
         let committed_hidden =
             super::committed_rows(&v_hidden, n_committed, condition_width, device)?;
         let projected_rows;
-        (h_ctx, projected_rows) = drafter.advance_condition(&h_ctx, &committed_hidden)?;
+        (h_ctx, projected_rows) = drafter.grow_conditioning(&h_ctx, &committed_hidden, device)?;
+        super::guard_round_conditioning(rounds, projected_rows, n_committed)?;
+        conditioned_rows += projected_rows.max(0) as usize;
         b = *new_tokens.last().unwrap_or(&b);
 
         tracing::debug!(
@@ -911,6 +935,7 @@ pub fn dflash_generate(
         emitted: emitted.len(),
         seed_emitted,
         emitted_in_rounds,
+        conditioned_rows: Some(conditioned_rows),
         total_draft,
         total_accept,
         prefill_ns,
