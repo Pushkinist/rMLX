@@ -291,6 +291,7 @@ is gone.
 3. **Straight-forward core backend.** Inference path is sequential, sync, explicit. Async only at HTTP/file-I/O boundaries (already in coding style above).
 4. **Inline beats premature factoring.** Extract to a function/module only when 2+ real callers exist. Three similar lines is better than a wrong abstraction.
 5. **No env-gated one-caller knobs.** Prefer a fixed default or a CLI flag with a real second caller. Env vars are invisible config — each is a support and repro burden. Keep the existing env surface minimal; new env vars need explicit justification (and are an "Ask before" item).
+6. **No twins, and every change names its removals.** Two types, functions, kernels, or files whose bodies differ only in a compile-time constant (`bits`, `head_dim`, group size, a codebook) or in a component's name are one item and a parameter, not two — a const-generic or a trait-bound blanket impl, never a copy per caller (rule 1's "no premature generics" still governs the single-instantiation case). Standing violation: the speculative round loop exists once per drafter, and a cross-cutting change to it is made once per copy. A change that adds an item without deleting the twin it replaces is not done — every PR description says what it deletes, and "nothing" is a valid answer only if it is written down.
 
 ## Common commands (Makefile)
 
@@ -349,6 +350,21 @@ hand — keeps the CI gate and the local gate identical.
 | `make model-check-full MODEL=…` | `cargo test -p rmlx-{models,runtime,quant}` (note: **not** `rmlx-kv-quant`) + golden-token integration tests. Pass one model path; each golden reads `config.json` and skips gracefully when arch does not match — matching arch runs+passes, others skip. Target is green for any single test-target model. |
 
 `MODEL` and `PORT` override at the CLI: `make info MODEL=/path/to/snapshot`.
+
+**A draft-side change is not proven by byte equality.** Greedy verification
+emits the verifier's own argmax at every position regardless of what the
+drafter proposed, so a byte-identical stream after a drafter change shows that
+run's near-ties happened not to move, not that the round loop is unaffected.
+Judge it with one of three checks, each blind to something different: an
+identity-row CPU test on the drafter's own math (blind to the round loop and
+the verifier); the accept stream (`accept_rate`, `tokens_per_round` — a signal
+that moves on near-ties, not an oracle; blind to whether a moved rate is a
+defect or a legitimate flip); or an equivalence pair judged by the
+divergence-confidence oracle in
+[`docs/SPEC_ANSWER_EQUIVALENCE.md`](docs/SPEC_ANSWER_EQUIVALENCE.md) (judges
+near-tie vs. defect; blind wherever a pair is not gated by default — see its
+Coverage table). Full argument there and in
+[`docs/SPECULATIVE.md`](docs/SPECULATIVE.md).
 
 Run `make ci` before push, plus `make ci-perf` when the change touches
 `rmlx-kv-quant`, a `.metal` kernel, or a KV/decode path — `make ci` runs no GPU
