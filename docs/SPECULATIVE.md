@@ -668,6 +668,34 @@ its own commit and not the generation so far. `fc` is a bias-free linear and
 re-projection would have produced, and carrying the projection also holds a row
 at `hidden_size` rather than `len(target_layer_ids) * hidden_size`.
 
+**How exact that identity is.** Exact in exact arithmetic. At a checkpoint's
+dtype it is exact only up to the projection's own dispatch: `fc` is a matmul, and
+MLX chooses its kernel and reduction order by shape, so the same row projected at
+two different call heights is not guaranteed to give the same bits. What that can
+move and what it cannot are separate questions — under greedy verification the
+emitted tokens are the verifier's own whatever the drafter proposed, so **the
+answer cannot move**, while a drafted token at a near-tie can flip and with it
+the round's accept split.
+
+Measured on `Qwen3.6-35B-A3B-8bit` + `Qwen3.6-35B-A3B-DFlash` over 1024 greedy
+tokens, against a loop that re-projected its whole accumulated buffer every
+round: identical answer digest, identical 357 rounds, 1147 drafted and 667
+accepted, `conditioned_rows` 1023 — with four rounds' accept counts redistributed
+between neighbours. So the accept stream moved and nothing else did.
+
+Both loops report the residual once per request at `debug`
+(`conditioning_residual`, `dflash conditioning:` / `dflash2 conditioning:`),
+comparing the carried buffer's tail against a fresh projection of the rows it was
+built from. On that pair it reads **0.0** — the carry is bit-exact at the heights
+a round projects at, which are 1 to 5 rows. It does not reach the heights the
+re-projecting loop used, which ran to 1023 on the same request: getting there
+would mean holding the raw capture for the whole generation, the cost the carried
+projection removes. **The four moved rounds are therefore consistent with
+height-dependent dispatch and not demonstrated by it** — the mechanism is
+inferred, and unmeasured at the heights where the two loops differ. The fixtures'
+`PROJECTION_TOL` is an `f32` bound on `f32` fixtures and is not a statement about
+a checkpoint's dtype either.
+
 **And it is not bounded, deliberately.** Unlike DFlash 2, this checkpoint
 declares `sliding_window: null`, `use_sliding_window: false` and eight
 `full_attention` layers, and the drafter's block attention runs with no mask

@@ -48,16 +48,16 @@
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{Array, Device};
+use rmlx_mlx::{concatenate, Array, Device};
 
 use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::{
-    accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows, disarm_lin_tapes,
-    emit_step, guard_round_conditioning, guard_verifier_prefill_logits, phases_charged,
-    rollback_round_caches, verifier_context, verifier_kv_bytes, DecodeWindow, RoundPhases,
-    RoundStats, SpecLoop, VerifierDraw,
+    accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
+    conditioning_residual, disarm_lin_tapes, emit_step, guard_round_conditioning,
+    guard_verifier_prefill_logits, phases_charged, rollback_round_caches, verifier_context,
+    verifier_kv_bytes, DecodeWindow, RoundPhases, RoundStats, SpecLoop, VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -225,6 +225,22 @@ pub fn dflash2_generate(
     // later round would have re-derived. The prompt's rows are projected in this
     // one call and each round then projects only what it commits.
     let mut h_ctx = drafter.project_conditioning(&prompt_ctx)?;
+    // The prompt's last raw row, kept until the first round has extended the
+    // buffer and then dropped: re-projecting it beside that round's commit is
+    // what says how far the carried projection sits from a fresh one at this
+    // checkpoint's dtype. One row, one round, and the probe releases it. See
+    // `conditioning_residual`.
+    let mut probe_seed = Some(committed_rows(
+        &prompt_ctx.slice(
+            &[0, prompt_ctx.shape()[1] - 1, 0],
+            &[1, prompt_ctx.shape()[1], condition_width],
+            &[1, 1, 1],
+            device,
+        )?,
+        1,
+        condition_width,
+        device,
+    )?);
     if charge_phases {
         // The guard above forced the logits, and so the whole prompt forward,
         // but not the capture: it hangs off a different output of that forward.
@@ -386,6 +402,31 @@ pub fn dflash2_generate(
         (h_ctx, projected_rows) = drafter.slide_conditioning(&h_ctx, &committed_hidden)?;
         guard_round_conditioning(rounds, projected_rows, accept + 1)?;
         conditioned_rows += projected_rows.max(0) as usize;
+        if let Some(seed) = probe_seed.take() {
+            let raw = concatenate(&[&seed, &committed_hidden], 1, device)?;
+            let fresh = drafter.project_conditioning(&raw)?;
+            let hidden = drafter.cfg.hidden_size as i32;
+            let tail = h_ctx.shape()[1] - (1 + projected_rows);
+            let carried_tail = h_ctx.slice(
+                &[0, tail, 0],
+                &[1, tail + 1 + projected_rows, hidden],
+                &[1, 1, 1],
+                device,
+            )?;
+            tracing::debug!(
+                rows = 1 + projected_rows,
+                residual = conditioning_residual(&carried_tail, &fresh, device)?,
+                "dflash2 conditioning: carried projection against a fresh one"
+            );
+        }
+        if charge_phases {
+            // Projecting this round's committed rows and copying the window they
+            // extend is work the next round's drafter is the first thing to read.
+            // Forced here it lands in the round's unclaimed time, which is where
+            // slicing and bookkeeping belong; left lazy it lands in the drafter.
+            // See `phases_charged`.
+            h_ctx.eval()?;
+        }
         b = *new_tokens.last().unwrap_or(&b);
 
         tracing::debug!(

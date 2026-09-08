@@ -4,7 +4,9 @@
 //! projects each round's committed rows once and appends them to the projection
 //! it is carrying. Both halves are invisible in an answer. `project_condition`
 //! is row-wise, so the carried buffer is the projection of the whole history and
-//! a re-projection agrees with it within `PROJECTION_TOL`; and greedy
+//! a re-projection agrees with it — exactly in exact arithmetic, and here within
+//! `PROJECTION_TOL`, whose doc says why that is not zero and why an `f32`
+//! fixture's figure does not carry to a checkpoint at its own dtype. And greedy
 //! verification emits the verifier's own tokens whatever the drafter was
 //! conditioned on, so a buffer built from the wrong rows changes only the accept
 //! rate. What is checked here is therefore the buffer itself: that it agrees

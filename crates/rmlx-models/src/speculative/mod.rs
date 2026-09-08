@@ -49,7 +49,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{argmax, concatenate, Array, Device, Dtype};
+use rmlx_mlx::{argmax, concatenate, subtract, Array, Device, Dtype};
 use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 
 use crate::arch::{load_model, Architecture, LoadOpts};
@@ -1915,8 +1915,44 @@ pub(crate) fn accept_prefix(
 /// fixtures reach. What the bound has to separate that from is a projection of
 /// the wrong rows, which differs by order 1, and it is twenty times the largest
 /// rounding difference observed and five orders under that.
+///
+/// It is an `f32` figure taken on `f32` fixtures and **does not carry to a
+/// checkpoint at its own dtype**, where the same two projections are dispatched
+/// at different matmul heights over fewer mantissa bits. That residual is
+/// reported per request by [`conditioning_residual`], not bounded here.
 #[cfg(test)]
 pub(crate) const PROJECTION_TOL: f32 = 1e-5;
+
+/// Largest element-wise gap between a carried conditioning buffer's tail and a
+/// fresh projection of the rows that tail was built from.
+///
+/// The two are the same rows through the same row-wise projection, so they agree
+/// exactly in exact arithmetic. They are **not** required to agree bit for bit
+/// at a checkpoint's dtype: a matmul's kernel and reduction order are chosen by
+/// shape, and the carried tail was projected in two calls where the comparison
+/// takes one. This reports that gap rather than assuming it away, which is why
+/// it is a measurement and not an assertion — a drafter conditioned on a
+/// last-place-different row proposes a different token only at a near-tie, and
+/// greedy verification emits the verifier's own tokens either way, so nothing
+/// else in a run would show it.
+///
+/// **What it does and does not reach.** Both arguments are `[1, rows, hidden]`
+/// and bounded by one block, so this is one small pass taken once per request —
+/// and so the heights it compares are the ones a round actually projects at, a
+/// few rows against a few more. It says nothing about a projection taken at the
+/// height of a whole generation, which is what a loop that re-projected its
+/// accumulated buffer every round would have used. Reaching that height would
+/// mean holding the raw capture for the whole request, which is the cost the
+/// carried projection exists to remove.
+///
+/// # Errors
+///
+/// From the subtraction or from reading the result back.
+fn conditioning_residual(carried_tail: &Array, reprojected: &Array, device: Device) -> Result<f32> {
+    let gap = subtract(carried_tail, reprojected, device)?;
+    let dtype = gap.dtype();
+    Ok(max_abs_from_bytes(&gap.to_bytes()?, dtype))
+}
 
 /// Refuse a round that conditioned on a different number of rows than it
 /// committed.

@@ -290,8 +290,12 @@ impl DFlashDrafter {
     /// `fc` is a bias-free linear and `hidden_norm` an RMSNorm, so both are
     /// row-wise: a row's projection does not depend on which other rows were in
     /// the call. That is what lets the round loop project each round's committed
-    /// rows and carry the result. The position-dependent part of the
-    /// conditioning is the per-layer RoPE in
+    /// rows and carry the result — **exactly** in exact arithmetic, and to
+    /// within a last-place rounding difference at the checkpoint's dtype, where
+    /// the two calls are dispatched at different matmul heights. See
+    /// [`crate::speculative::conditioning_residual`], which measures that gap
+    /// per request, and `docs/SPECULATIVE.md` for what it can and cannot move.
+    /// The position-dependent part of the conditioning is the per-layer RoPE in
     /// [`Self::layer_forward`], which is applied to the context K at offset 0 on
     /// every call and so is not carried.
     pub fn project_condition(&self, concat_hidden: &Array) -> Result<Array> {
@@ -305,9 +309,9 @@ impl DFlashDrafter {
     /// Returns the grown buffer and the rows it projected — which is the round's
     /// committed rows and nothing else. Projecting and appending are one
     /// operation because a caller that re-projected the rows it was already
-    /// carrying would produce the same buffer for a pass over the whole
-    /// conditioning history every round instead of over one round's commit, and
-    /// nothing in an answer would say so. The row count is what
+    /// carrying would produce the same buffer, to a last place, for a pass over
+    /// the whole conditioning history every round instead of over one round's
+    /// commit, and nothing in an answer would say so. The row count is what
     /// does, which is why it is returned, traced and checked by
     /// [`crate::speculative::guard_round_conditioning`].
     ///
@@ -758,6 +762,12 @@ pub fn dflash_generate(
     // have re-derived, and each round then projects only what it commits.
     super::guard_verifier_prefill_logits(verifier, &r0_logits, prompt_ids.len())?;
     let mut h_ctx = drafter.project_condition(&r0_hidden)?;
+    // The seed's raw row, kept until the first round has extended the buffer and
+    // then dropped: re-projecting it beside that round's commit is what says how
+    // far the carried projection sits from a fresh one at this checkpoint's
+    // dtype. One row, one round, and the probe releases it. See
+    // `conditioning_residual`.
+    let mut probe_seed = Some(r0_hidden);
     let mut b = draw.seed_token(&r0_logits, device)?;
     // Emit the first bonus.
     emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
@@ -912,6 +922,22 @@ pub fn dflash_generate(
         (h_ctx, projected_rows) = drafter.grow_conditioning(&h_ctx, &committed_hidden, device)?;
         super::guard_round_conditioning(rounds, projected_rows, n_committed)?;
         conditioned_rows += projected_rows.max(0) as usize;
+        if let Some(seed) = probe_seed.take() {
+            let raw = concatenate(&[&seed, &committed_hidden], 1, device)?;
+            let fresh = drafter.project_condition(&raw)?;
+            let tail = h_ctx.shape().get(1).copied().unwrap_or(0) - (1 + projected_rows);
+            let carried_tail = h_ctx.slice(
+                &[0, tail, 0],
+                &[1, tail + 1 + projected_rows, drafter.cfg.hidden_size as i32],
+                &[1, 1, 1],
+                device,
+            )?;
+            tracing::debug!(
+                rows = 1 + projected_rows,
+                residual = super::conditioning_residual(&carried_tail, &fresh, device)?,
+                "dflash conditioning: carried projection against a fresh one"
+            );
+        }
         b = *new_tokens.last().unwrap_or(&b);
 
         tracing::debug!(
