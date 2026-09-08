@@ -67,9 +67,16 @@ fn max_abs_diff(a: &Array, b: &Array) -> f32 {
 /// The rows a round commits are the accepted prefix of its capture, and across
 /// rounds they tile the token sequence once each.
 ///
-/// The rounds here are a full accept, a partial one and a single-token one, over
-/// a window the buffer saturates, so the tail being compared is a mixture of
-/// rows committed by different rounds at different call shapes.
+/// The rounds here are a full accept, a partial one and a single-token one, so
+/// the buffer being compared is a mixture of rows committed by different rounds
+/// at different call shapes.
+///
+/// The window is not what this drives: the fixture's is wider than these rounds
+/// reach, so the trim inside `slide_conditioning` is inert here and nothing
+/// below could see it stop trimming.
+/// [`super::forward_tests::advancing_the_carried_projection_leaves_it_at_the_bound`]
+/// is the case that saturates one, and it owns both the bound and the identity
+/// of the rows that survive a trim.
 #[test]
 #[allow(
     clippy::indexing_slicing,
@@ -82,7 +89,6 @@ fn max_abs_diff(a: &Array, b: &Array) -> f32 {
 fn a_round_commits_the_accepted_prefix_of_its_capture() {
     let drafter = fixture_drafter();
     let width = (drafter.cfg.target_layer_ids.len() * SCALE_HIDDEN) as i32;
-    let keep = drafter.conditioning_rows();
 
     // The prompt's rows, then rounds of block 5 accepting 4, 1 and 0 proposals.
     let prompt_rows = 6;
@@ -140,11 +146,6 @@ fn a_round_commits_the_accepted_prefix_of_its_capture() {
         // the next round's carry token, and it is scored there for the first
         // time: no round commits it twice and none skips it.
         next += accept as i32 + 1;
-        assert!(
-            carried.shape()[1] <= keep,
-            "round {round} carries {} rows past a bound of {keep}",
-            carried.shape()[1]
-        );
     }
 
     // The prompt's rows plus each round's carry token and accepted proposals.
