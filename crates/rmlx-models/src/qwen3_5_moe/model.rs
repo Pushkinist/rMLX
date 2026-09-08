@@ -870,9 +870,10 @@ impl Qwen3_5MoeText {
     /// `forward_verify_capture(..., k=n)` returns — and `Some(k)` for a drafter
     /// that conditions over a sliding window and can never read a row older than
     /// it. A bounded caller's earlier chunks are released as the prefill walks
-    /// forward, so its peak is the kept tail plus one chunk rather than the
-    /// whole prompt; each row is `n_aux * hidden` wide, which reaches 51.2 KiB
-    /// per prompt token on the published DFlash 2 pair.
+    /// forward rather than held to the end of the prompt; what that bounds, and
+    /// to what, is [`CaptureTail`]'s to state. Each row is `n_aux * hidden`
+    /// wide, which reaches 50 KiB per prompt token on the published DFlash 2
+    /// pair.
     ///
     /// Unlike the single-shot path, logits are materialised only for the **last
     /// position of the last chunk** (shape `[1, 1, vocab]`), and the per-layer
