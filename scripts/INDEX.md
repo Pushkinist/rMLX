@@ -42,6 +42,9 @@ Conventions:
 | `metal_dirs.sh` | The list of directories holding gated `.metal` kernels. Sourced by the metal gates. |
 | `file_size_report.sh` | Advisory (non-failing) LOC report for source files >1000 lines. |
 | `target_size_report.sh` | Advisory (non-failing) `target/` size report. |
+| `debt_report.sh` | Advisory (non-failing) technical-debt report: sibling-file/fn similarity ("twins") in `crates/rmlx-kv-quant` and `crates/rmlx-models` — including the six speculative round-loop drivers as a named group — `#[allow(` and debt-marker-comment counts, the add/remove line ratio since the last tag, and `docs/*.md` files over 200 KB. Implementation in `lib/debt_report.py`. |
+| `debt_report_selftest.sh` | Recall test for the above over `fixtures/debt_report/base/` — a planted twin pair, a same-naming-shape pair whose bodies are unrelated, the round-loop group's six names, and a doc over/under the size threshold — plus a synthetic two-commit, one-tag repo built in a temp dir to prove the add/remove ratio. Asserts what each case found, not just that the tool ran. In `make ci`. |
+| `lib/debt_report.py` | The scan itself. Groups sibling files by digit-stripped filename stem (so a bare `quant_iso_v.rs` pairs with its explicitly-numbered `quant_iso_v4.rs`, not just `_v3`/`_v4`-style pairs), compares normalised text with `difflib`, and extracts `fn` bodies with a brace-depth scanner that skips string/char literals and comments. `--root` / `--since` for testing against a different tree or ref; no other input. |
 
 ## Test execution
 
