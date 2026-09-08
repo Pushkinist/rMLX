@@ -13,6 +13,20 @@
 //! answer-equivalence pair for the same drafter, judged by the
 //! divergence-confidence oracle in `docs/SPEC_ANSWER_EQUIVALENCE.md`.
 //!
+//! Two per-request facts belong in that list and are easy to leave out of it,
+//! because neither is a token and neither is a count of one:
+//!
+//! - **Whether the request reported its verifier's resident KV at all.**
+//!   `store_kv_cache_bytes` is called on the normal exit and skipped on one EOS
+//!   exit per loop — the seed EOS for the five sidecar loops, the in-round EOS
+//!   for the two two-model ones. A loop that changed which exit it takes reports
+//!   a different figure, or none, with every token identical.
+//! - **`RoundStats::charged`**, which is `phases_charged()` in three loops and a
+//!   literal `false` in four. It decides whether each round forces its carried
+//!   arrays before its span closes, so it moves the phase timings and the work
+//!   attributed to the drafter — and an extraction that hard-wires one value
+//!   silently re-attributes four loops' time.
+//!
 //! **The greedy digest is not evidence here.** Greedy verification emits the
 //! verifier's own argmax at every position whatever the drafter proposed, so a
 //! byte-identical token stream after a draft-side change says that run's
@@ -33,11 +47,32 @@
 //!   moved: a round that accepted one too many and a later one that accepted one
 //!   too few sum to the same request.
 //! - **The equivalence pairs** see the answer and are blind wherever a pair is
-//!   not resolvable, and blind by construction to the stochastic two-model loop,
-//!   which has no temperature-0 arm to compare against.
+//!   not resolvable, and blind to **every sampled arm**. That is wider than the
+//!   stochastic two-model loop: each sidecar loop's `VerifierDraw` draws from the
+//!   verifier's post-sampling distribution above temperature 0, and none of those
+//!   arms has a temperature-0 comparand either, because neither side is then a
+//!   function of the model alone. The only coverage a sampled arm has is
+//!   `make check-spec-sampling`, which reads that each driver takes the
+//!   request's sampler and does not read whether the distribution is right, and
+//!   `crates/rmlx-models/tests/spec_sampled_distribution.rs`, which reads that on
+//!   one pair under `make gpu-test`.
 //! - **The tests in this file** see the arithmetic and are blind to every
 //!   forward, every cache and every drafter: they fix what the loops compute
-//!   from counts, not what the model computes from weights.
+//!   from counts, not what the model computes from weights. They are also blind
+//!   to **which loop calls which helper**: every call site below is inside a
+//!   round loop that needs a model, a device and a drafter to execute, so a
+//!   call site wired to the wrong helper or the wrong argument passes every test
+//!   in this crate. Measured, not assumed — `mtp_generate` rolling its verifier
+//!   KV back one position short leaves the whole `rmlx-models` suite green.
+//!
+//! Two request shapes never reach any of this and the extraction must not make
+//! either reachable: a request carrying a sampler constraint is refused at the
+//! speculative entry (`spec_generate_greedy` returns `Error::Model`, and the
+//! sidecar routes never build a constraint engine), and a prompt-cache hit
+//! cannot occur because every loop allocates its own scratch cache stack per
+//! request and never consults or publishes a prompt-cache slot. A shared round
+//! loop that accepted a pre-filled cache, or that stopped refusing a
+//! constraint, would open a path neither the pairs nor these tests can see.
 //!
 //! # What is pinned here, and why by identity
 //!
