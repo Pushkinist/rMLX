@@ -1668,11 +1668,22 @@ published protocol, where it is to be measured.
 
 **It is not bit-identical, and the reason is not the algebra.** `fc` is a matmul,
 and MLX accumulates it differently at different row counts, so a row projected in
-a call of three rows and the same row projected in a call of two thousand land
-one to four f32 units in the last place apart. The rows are the same rows; what
-this can move is which token the selector chain proposes at a near-tie, and so
-the accept rate. It cannot move the answer, because every emitted token is the
-verifier's own at a position the verifier scored.
+a call of three rows and the same row projected in a call of two thousand land a
+few units in the last place apart. `crates/rmlx-models/tests/spec_conditioning_residual.rs`
+measures that on this pair at its own dtype rather than leaving it asserted: over
+a few hundred rows of a real generation, three of them reach a small multiple of
+one `bf16` unit in the last place of their own scale and the rest sit under one.
+
+The rows are the same rows; what this moves first is which token the selector
+chain proposes at a near-tie, and so the accept rate. It does not stop there. A
+different accept split changes the composition and the height of the next verify
+block, so the **verifier's** own logits at later positions are computed under a
+different dispatch too, and a near-tie of its own can resolve the other way — the
+emitted text can differ, later, at a position where the verifier itself was
+undecided. Byte-equality against a no-drafter arm is therefore not the criterion
+here either; equivalence is judged by the oracle in
+[`SPEC_ANSWER_EQUIVALENCE.md`](SPEC_ANSWER_EQUIVALENCE.md), and the recorded
+evidence is the pairs in `crates/rmlx-models/tests/spec_greedy_equivalence.rs`.
 
 Three scalars the reference applies to the drafter's logit path —
 `input_embedding_scale`, `output_multiplier`, `final_logit_softcapping` — are
