@@ -9,11 +9,15 @@
 #
 # HOW
 #   scripts/fixtures/debt_report/base/ is a synthetic scan root: a twin file
-#   pair, a same-naming-shape pair with unrelated bodies, the six speculative
-#   round-loop drivers, and one doc over the size threshold plus one under it.
-#   The add/remove-ratio case needs real git history, which the base fixture
-#   does not have on its own (it is a subtree of this repo's working copy) —
-#   it builds its own throwaway two-commit, one-tag repo in a temp dir instead.
+#   pair, a same-naming-shape pair with unrelated bodies, a same-naming-shape
+#   pair just under the similarity threshold, and the six speculative
+#   round-loop drivers. The two size-critical docs (over/under the 200 KB
+#   threshold) are generated into a throwaway copy of the fixture at run time
+#   rather than committed, so this test does not carry ~250 KB of filler into
+#   the tree's own churn count. The churn section needs real git history,
+#   which the base fixture does not have on its own (it is a subtree of this
+#   repo's working copy) — it builds its own throwaway two-commit, one-tag
+#   repo in a temp dir instead.
 #
 # Exit 0 = every case found what it was supposed to. Exit 1 = at least one did not.
 
@@ -28,13 +32,14 @@ for f in \
     crates/rmlx-kv-quant/src/storage/codec_alpha4.rs \
     crates/rmlx-kv-quant/src/storage/codec_beta3.rs \
     crates/rmlx-kv-quant/src/storage/codec_beta4.rs \
+    crates/rmlx-kv-quant/src/storage/codec_gamma3.rs \
+    crates/rmlx-kv-quant/src/storage/codec_gamma4.rs \
     crates/rmlx-models/src/speculative/mtp.rs \
     crates/rmlx-models/src/speculative/dflash.rs \
     crates/rmlx-models/src/speculative/dflash2.rs \
     crates/rmlx-models/src/speculative/eagle3.rs \
     crates/rmlx-models/src/speculative/gemma4_assistant.rs \
     crates/rmlx-models/src/speculative/mod.rs \
-    docs/BIG.md \
     docs/SMALL.md
 do
     [ -f "$BASE/$f" ] || {
@@ -61,7 +66,19 @@ check() {
     fi
 }
 
-BASE_OUT=$(python3 "$TOOL" --root "$BASE")
+STATIC_WORK="$(mktemp -d)"
+cp -R "$BASE" "$STATIC_WORK/base"
+
+python3 - "$STATIC_WORK/base/docs" <<'EOF'
+import sys
+docs = sys.argv[1]
+big = ("This is a filler line documenting a codec variant in detail.\n" * 4300)
+open(f"{docs}/BIG.md", "w").write("# Big doc\n\n" + big)  # ~257 KB, over the 200 KB threshold
+almost = ("This is a filler line documenting a codec variant in detail.\n" * 3200)
+open(f"{docs}/ALMOST.md", "w").write("# Almost doc\n\n" + almost)  # ~191 KB, under the threshold
+EOF
+
+BASE_OUT=$(python3 "$TOOL" --root "$STATIC_WORK/base")
 
 check "twin_pair_reported" \
     "a planted twin pair (differ only by the trailing digit) is reported" \
@@ -71,6 +88,11 @@ check "twin_pair_reported" \
 check "non_twin_pair_absent" \
     "a pair with the same naming shape but unrelated bodies is not reported" \
     absent "codec_beta" \
+    BASE_OUT
+
+check "near_threshold_pair_absent" \
+    "a pair measuring 57.1% shared (below the 60% line) is not reported" \
+    absent "codec_gamma" \
     BASE_OUT
 
 check "fn_level_append_shared" \
@@ -116,13 +138,18 @@ do
 done
 
 check "doc_over_threshold_listed" \
-    "BIG.md, above the 200 KB threshold, is listed" \
+    "BIG.md, generated over the 200 KB threshold, is listed" \
     contains "docs/BIG.md" \
     BASE_OUT
 
 check "doc_under_threshold_absent" \
-    "SMALL.md, below the threshold, is not listed" \
+    "SMALL.md, well under the threshold, is not listed" \
     absent "SMALL.md" \
+    BASE_OUT
+
+check "doc_just_under_threshold_absent" \
+    "ALMOST.md, generated just under the threshold, is not listed" \
+    absent "ALMOST.md" \
     BASE_OUT
 
 check "dead_path_not_attempted" \
@@ -161,7 +188,7 @@ check "renamed_driver_count_unchanged" \
     contains "  8 driver(s) found" \
     RENAME_OUT
 
-rm -rf "$RENAME_WORK"
+rm -rf "$STATIC_WORK" "$RENAME_WORK"
 
 # ---- add/remove ratio on a synthetic two-commit repo -----------------------
 
