@@ -101,9 +101,12 @@ impl DFlash2Drafter {
         let full_ctx = shaped(h_ctx, "h_ctx", &[1, -1, hidden])?;
 
         // Rows past the window are hidden by the mask either way; dropping them
-        // is the same answer for less attention.
+        // is the same answer for less attention. The trimmed buffer is what the
+        // attention reads, so it is also what says how long the context is: the
+        // mask and the key positions must be built against the same number the
+        // K/V projection sees.
         let h_ctx = self.trim_rows(h_ctx, hidden, "the carried projection h_ctx")?;
-        let ctx_len = full_ctx.min(self.conditioning_rows());
+        let ctx_len = shaped(&h_ctx, "h_ctx", &[1, -1, hidden])?;
 
         // One mask for the stack: every layer of this drafter is a sliding
         // layer over the same two lengths.
