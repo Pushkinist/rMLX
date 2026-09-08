@@ -22,10 +22,10 @@ USAGE
     verify   <dir> [manifest]  hold one capture to a manifest
 
 EXIT
-    0 agree, 1 a difference, 2 the comparison could not be made. A `verify` over
-    a capture holding only some of the pinned cells — one pair is six of
-    thirty-six — names the ones that did not run and says INCOMPLETE, because a
-    cell that could not run is not a cell that agreed.
+    0 agree, 1 a difference, 2 the comparison could not be made, 3 INCOMPLETE —
+    a `verify` over a capture holding only some of the pinned cells, which one
+    pair always is. It names the ones that did not run and does not report 0,
+    because a cell that could not run is not a cell that agreed.
 """
 
 from __future__ import annotations
@@ -40,6 +40,32 @@ DEFAULT_MANIFEST = (
     / "crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256"
 )
 
+# What a manifest is a manifest OF. Regenerating one from whatever happens to be
+# in a directory would re-bless a shrunken capture as the baseline — the six
+# cells of a single pair, or five prompts because one stood down, would render
+# as a complete manifest and read as one. These are the facts a regeneration
+# cannot supply for itself, so they are stated here and the emitter is held to
+# them. A change to the baseline that legitimately moves one is a change to this
+# file, in the same commit, with the reason in the message.
+PAIRS = (
+    "the_adaptive_round_loop_reproduces_plain_greedy",
+    "the_assistant_round_loop_reproduces_plain_greedy",
+    "the_block_round_loop_reproduces_plain_greedy",
+    "the_recurrent_round_loop_reproduces_plain_greedy",
+    "the_restricted_vocab_round_loop_reproduces_plain_greedy",
+    "the_two_model_round_loop_reproduces_plain_greedy",
+)
+PROMPTS = (
+    "database-isolation",
+    "hash-map-collisions",
+    "longctx-4k",
+    "photosynthesis",
+    "tcp-congestion",
+    "virtual-memory",
+)
+EXPECTED_CELLS = {f"{p}.{q}.stable.jsonl" for p in PAIRS for q in PROMPTS}
+TOTAL_ROUNDS = 4423
+
 
 def cells(directory: pathlib.Path) -> dict[str, pathlib.Path]:
     return {p.name: p for p in sorted(directory.glob("*.stable.jsonl"))}
@@ -53,11 +79,13 @@ def rounds(path: pathlib.Path) -> list[dict]:
         obj = json.loads(line)
         timing = [k for k in obj if k.endswith("_ms")]
         if timing:
-            raise SystemExit(
+            print(
                 f"{path.name}:{n} carries the wall-clock field(s) {timing}. The engine "
                 f"writes this file with those dropped, so either it stopped or this is "
-                f"not that file."
+                f"not that file.",
+                file=sys.stderr,
             )
+            raise SystemExit(2)
         out.append(obj)
     return out
 
@@ -126,6 +154,26 @@ def main(argv: list[str]) -> int:
         if not lines:
             print(f"no `*.stable.jsonl` cell in {directory}", file=sys.stderr)
             return 2
+        names = {line.split()[2] for line in lines}
+        missing = sorted(EXPECTED_CELLS - names)
+        extra = sorted(names - EXPECTED_CELLS)
+        if missing or extra:
+            if missing:
+                print(f"this capture is missing {len(missing)} of {len(EXPECTED_CELLS)} "
+                      f"cells, first {missing[0]}", file=sys.stderr)
+            if extra:
+                print(f"this capture holds {len(extra)} cell(s) the baseline is not "
+                      f"over, first {extra[0]}", file=sys.stderr)
+            print("A manifest is over all six pairs and all six prompts. Emitting one "
+                  "from a partial capture would re-bless it as the baseline.",
+                  file=sys.stderr)
+            return 2
+        total = sum(int(line.split()[1]) for line in lines)
+        if total != TOTAL_ROUNDS:
+            print(f"this capture ran {total} rounds and the baseline is {TOTAL_ROUNDS}. "
+                  f"A round count that moved is a round loop that changed: say which in "
+                  f"the commit that moves TOTAL_ROUNDS.", file=sys.stderr)
+            return 2
         print("\n".join(lines))
         return 0
 
@@ -176,7 +224,7 @@ def main(argv: list[str]) -> int:
                 print(f"  not in this capture: {name}", file=sys.stderr)
             print(f"INCOMPLETE: {matched} of {len(want)} pinned cells matched, "
                   f"{len(not_run)} did not run")
-            return 0
+            return 3
         print(f"{matched} cells match {path}")
         return 0
 

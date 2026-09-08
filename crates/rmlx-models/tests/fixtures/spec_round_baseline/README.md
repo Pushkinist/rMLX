@@ -54,8 +54,10 @@ python3 scripts/spec_round_stream_compare.py verify <RMLX_HOME>/tmp
 ```
 
 A capture holding fewer than 36 cells — one pair is six — reports the cells that
-did not run and says `INCOMPLETE`. A cell that ran and disagrees is exit 1,
-naming the cell and both digests.
+did not run and exits **3**, `INCOMPLETE`: a cell that could not run is not a
+cell that agreed, and 0 would say it was. A cell that ran and disagrees is exit
+1, naming the cell and both digests. Exit 2 is a comparison that could not be
+made at all — a missing directory, or a file still carrying a wall-clock field.
 
 To compare two captures field by field rather than by digest — which is what
 says *what* moved:
@@ -71,4 +73,9 @@ python3 scripts/spec_round_stream_compare.py manifest <RMLX_HOME>/tmp \
   > crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256
 ```
 
-Only from a capture of all six pairs, one pair at a time, on an idle machine.
+Only from a capture of all six pairs, one pair at a time, on an idle machine —
+and `manifest` refuses anything less. The six pair names, the six prompt slugs
+and the total round count are literals in that script, because a regeneration
+cannot supply them for itself: a shrunken capture would otherwise render as a
+complete manifest and read as one. A change that legitimately moves any of them
+moves the literal in the same commit, with the reason in the message.
