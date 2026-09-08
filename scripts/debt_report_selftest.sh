@@ -127,7 +127,7 @@ RATIO_OUT=$(python3 "$TOOL" --root "$RATIO_WORK")
 
 check "ratio_tag_resolved" \
     "the default ref (no --since) resolves to the planted tag" \
-    contains "=== add/remove ratio since v0.0.1 ===" \
+    contains "=== churn (summed over commits) since v0.0.1 ===" \
     RATIO_OUT
 
 check "ratio_source_computed" \
