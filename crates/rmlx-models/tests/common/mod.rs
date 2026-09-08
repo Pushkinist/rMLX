@@ -890,19 +890,81 @@ fn read_golden(path: &Path) -> Option<Vec<u32>> {
 /// before its span closes; `rmlx_models::speculative::eagle3` at TRACE adds one
 /// event per verified position. A recorder that enables either is measuring a
 /// different, slower run than the one that ships.
+///
+/// Both are asked at TRACE and at no other level, and both targets carry a
+/// round event at DEBUG, so what a capture must decline is the level and not
+/// the target.
 pub const BEHAVIOUR_SWITCH_TARGETS: [&str; 2] =
     ["rmlx::spec::phase", "rmlx_models::speculative::eagle3"];
 
-/// A subscriber that keeps every event's target, level and rendered fields, and
-/// declines the two switches above.
+/// One event as it was emitted: its target, its message, and its fields in the
+/// order the emitter wrote them, each rendered by the emitter's own `Debug`.
+#[derive(Clone, Debug)]
+pub struct CapturedEvent {
+    pub target: String,
+    pub message: String,
+    pub fields: Vec<(String, String)>,
+}
+
+impl CapturedEvent {
+    /// One field's rendered value.
+    #[must_use]
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(f, _)| f == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The event as one JSON object — `target`, `message`, then every field
+    /// under its own name.
+    ///
+    /// Values stay strings: `tracing`'s typed visits all fall through to
+    /// `record_debug`, so a rendered value is the only form every field has,
+    /// and re-typing some of them here would make two events comparable only
+    /// through this function's guesses.
+    #[must_use]
+    pub fn json_line(&self) -> String {
+        let mut obj = serde_json::Map::new();
+        obj.insert("target".to_owned(), self.target.clone().into());
+        obj.insert("message".to_owned(), self.message.clone().into());
+        for (name, value) in &self.fields {
+            obj.insert(name.clone(), value.clone().into());
+        }
+        serde_json::Value::Object(obj).to_string()
+    }
+}
+
+/// The events a round loop closes a round with, out of everything a run emits.
+///
+/// Read by shape rather than by message: every round event carries the round's
+/// index, what it accepted and how many proposals it accepted them from, and
+/// four of the five spellings carry a different set beyond that. A loop that
+/// renamed its message is still found; a loop that stopped reporting one of the
+/// three is not a round event any more, which is the answer the caller wants.
+#[must_use]
+pub fn round_events(events: &[CapturedEvent]) -> Vec<CapturedEvent> {
+    events
+        .iter()
+        .filter(|e| {
+            ["round", "accept", "num_draft"]
+                .iter()
+                .all(|f| e.field(f).is_some())
+        })
+        .cloned()
+        .collect()
+}
+
+/// A subscriber that keeps every event's target, message and rendered fields,
+/// and declines the two switches above.
 ///
 /// Install it with [`tracing::subscriber::with_default`] and **never** with
 /// `set_global_default`: a global stays installed for every later test in the
 /// binary, and one whose `enabled` answers `true` leaves `phases_charged()` true
 /// for all of them.
 pub struct RoundStreamRecorder {
-    events: std::sync::Mutex<Vec<String>>,
-    asked: std::sync::Mutex<Vec<(String, tracing::Level)>>,
+    events: std::sync::Mutex<Vec<CapturedEvent>>,
+    asked: std::sync::Mutex<Vec<(String, tracing::Level, bool)>>,
 }
 
 impl Default for RoundStreamRecorder {
@@ -920,35 +982,37 @@ impl RoundStreamRecorder {
         std::sync::Arc::new(Self::default())
     }
 
-    /// Every event this recorder accepted, in order, one line each.
+    /// Every event this recorder accepted, in order.
     #[must_use]
-    pub fn events(&self) -> Vec<String> {
+    pub fn events(&self) -> Vec<CapturedEvent> {
         self.events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
-    /// Every `(target, level)` it was asked about.
+    /// Every `(target, level, answer)` it was asked about.
     #[must_use]
-    pub fn questions(&self) -> Vec<(String, tracing::Level)> {
+    pub fn questions(&self) -> Vec<(String, tracing::Level, bool)> {
         self.asked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
-    /// Whether both behaviour switches were consulted and declined.
+    /// Whether both behaviour switches were consulted and answered `false`.
     ///
     /// A capture that never saw the questions proves nothing about having
-    /// declined them, which is why this reads the questions rather than the run.
+    /// declined them, which is why this reads the questions rather than the run
+    /// — and it reads the answer given, not the rule that should have produced
+    /// it.
     #[must_use]
     pub fn declined_both_switches(&self) -> bool {
         let asked = self.questions();
         BEHAVIOUR_SWITCH_TARGETS.iter().all(|t| {
-            asked
-                .iter()
-                .any(|(target, level)| target == t && *level == tracing::Level::TRACE)
+            asked.iter().any(|(target, level, answer)| {
+                target == t && *level == tracing::Level::TRACE && !answer
+            })
         })
     }
 }
@@ -962,16 +1026,17 @@ impl tracing::Subscriber for RoundStreamRecorder {
     }
 
     fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+        // Both switches are asked at TRACE and TRACE alone, and both switch
+        // targets also carry a round event at DEBUG — the shared one and
+        // EAGLE-3's. Declining the target rather than the level would leave
+        // four of the seven loops' rounds uncaptured while changing neither
+        // switch's answer.
+        let answer = *meta.level() <= tracing::Level::DEBUG;
         self.asked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((meta.target().to_owned(), *meta.level()));
-        // The two switches are declined whatever level they are asked at, so a
-        // switch lowered to DEBUG is declined too rather than silently enabled.
-        if BEHAVIOUR_SWITCH_TARGETS.contains(&meta.target()) {
-            return false;
-        }
-        *meta.level() <= tracing::Level::DEBUG
+            .push((meta.target().to_owned(), *meta.level(), answer));
+        answer
     }
 
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -980,19 +1045,35 @@ impl tracing::Subscriber for RoundStreamRecorder {
     fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        struct Render(String);
+        struct Render {
+            message: String,
+            fields: Vec<(String, String)>,
+        }
         impl tracing::field::Visit for Render {
             fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
-                use std::fmt::Write as _;
-                let _ = write!(self.0, " {}={v:?}", f.name());
+                let rendered = format!("{v:?}");
+                if f.name() == "message" {
+                    // The literal the emitter closed the event with, which
+                    // `tracing` carries as a field like any other.
+                    self.message = rendered;
+                } else {
+                    self.fields.push((f.name().to_owned(), rendered));
+                }
             }
         }
-        let mut r = Render(event.metadata().target().to_owned());
+        let mut r = Render {
+            message: String::new(),
+            fields: Vec::new(),
+        };
         event.record(&mut r);
         self.events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(r.0);
+            .push(CapturedEvent {
+                target: event.metadata().target().to_owned(),
+                message: r.message,
+                fields: r.fields,
+            });
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}

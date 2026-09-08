@@ -2432,25 +2432,67 @@ impl Loaded {
         &mut self,
         prompt: &Prompt,
         device: Device,
-    ) -> (usize, Vec<u32>, Vec<u32>, Vec<f32>, Vec<DecidedBy>) {
+    ) -> (
+        usize,
+        Vec<u32>,
+        Vec<u32>,
+        Vec<f32>,
+        Vec<DecidedBy>,
+        Vec<common::CapturedEvent>,
+    ) {
         let ids = prompt.ids(&self.tokenizer);
         let block = self.round_block();
+        let (ran, spec_ids, decided_by, rounds) = self.spec_arm(&ids, block, device);
+        let (plain_ids, margins) = plain_greedy(
+            self.engine.verifier(),
+            &self.tokenizer,
+            &ids,
+            &self.eos,
+            device,
+        );
+        assert!(
+            decided_by.is_empty() || decided_by.len() == spec_ids.len(),
+            "the loop reported which vocabulary decided {} tokens and emitted {} — the \
+             verdict indexes one by the other",
+            decided_by.len(),
+            spec_ids.len()
+        );
+        (ran, spec_ids, plain_ids, margins, decided_by, rounds)
+    }
+
+    /// The speculative arm alone: the widest block any of its rounds ran, the
+    /// ids it emitted, which vocabulary decided each of them, and the round
+    /// stream it reported while doing so.
+    ///
+    /// The capture is scoped here and nowhere wider. The reference arm runs no
+    /// round, and a subscriber left installed past this call would answer the
+    /// behaviour switches of every test after it in this binary.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per drafter, each a twelve-argument driver call; a function per arm would scatter the dispatch without shortening it"
+    )]
+    fn spec_arm(
+        &mut self,
+        ids: &[u32],
+        block: usize,
+        device: Device,
+    ) -> (usize, Vec<u32>, Vec<DecidedBy>, Vec<common::CapturedEvent>) {
         let mut spec_ids: Vec<u32> = Vec::new();
         let mut decided_by: Vec<DecidedBy> = Vec::new();
-        let ran;
-        {
+        let recorder = common::RoundStreamRecorder::new();
+        let ran = tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
             let mut step = |s: &rmlx_models::ProbeStep| {
                 spec_ids.push(s.token_id);
                 None
             };
-            ran = match &mut self.engine {
+            match &mut self.engine {
                 Engine::Sidecar { verifier, drafter } => match drafter {
                     Drafter::Assistant(drafter) => {
                         mtp_assistant_generate(
                             verifier,
                             drafter,
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             block,
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2471,7 +2513,7 @@ impl Loaded {
                             verifier,
                             drafter,
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             block,
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2493,7 +2535,7 @@ impl Loaded {
                             verifier,
                             drafter,
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             block,
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2515,7 +2557,7 @@ impl Loaded {
                             verifier,
                             drafter,
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             block,
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2533,7 +2575,7 @@ impl Loaded {
                             verifier,
                             drafter,
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             block,
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2557,7 +2599,7 @@ impl Loaded {
                     dispatcher
                         .spec_generate_greedy(
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             drafts_per_round(block),
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2571,23 +2613,45 @@ impl Loaded {
                         .expect("two-model speculative generate")
                         .1
                 }
-            };
-        }
-        let (plain_ids, margins) = plain_greedy(
-            self.engine.verifier(),
-            &self.tokenizer,
-            &ids,
-            &self.eos,
-            device,
+            }
+        });
+        let questions = recorder.questions();
+        let enabled_at_trace: Vec<&String> = questions
+            .iter()
+            .filter(|(_, level, answer)| *level == tracing::Level::TRACE && *answer)
+            .map(|(target, ..)| target)
+            .collect();
+        assert!(
+            enabled_at_trace.is_empty(),
+            "the capture enabled {enabled_at_trace:?} at TRACE, and this run is then a \
+             different, slower one than the engine ships"
         );
         assert!(
-            decided_by.is_empty() || decided_by.len() == spec_ids.len(),
-            "the loop reported which vocabulary decided {} tokens and emitted {} — the \
-             verdict indexes one by the other",
-            decided_by.len(),
-            spec_ids.len()
+            !questions.is_empty(),
+            "the capture was never consulted, so it is a recording of nothing rather \
+             than a recording of this arm"
         );
-        (ran, spec_ids, plain_ids, margins, decided_by)
+        // Which switches this loop asked about is a property of the loop and not
+        // of the capture: three consult the phase switch and four pass a literal
+        // `false`, so an empty list here is a fact about the loop rather than a
+        // capture that stood down.
+        let mut switches: Vec<&str> = questions
+            .iter()
+            .filter(|(target, level, _)| {
+                common::BEHAVIOUR_SWITCH_TARGETS.contains(&target.as_str())
+                    && *level == tracing::Level::TRACE
+            })
+            .map(|(target, ..)| target.as_str())
+            .collect();
+        switches.sort_unstable();
+        switches.dedup();
+        eprintln!("switches declined: {switches:?}");
+        (
+            ran,
+            spec_ids,
+            decided_by,
+            common::round_events(&recorder.events()),
+        )
     }
 
     /// The target-vocabulary ids this pair's drafter can name, or `None` when it
@@ -2915,6 +2979,113 @@ fn report(
     );
 }
 
+/// Write one pair's round stream for one prompt, one JSON object per round, and
+/// say where it went.
+///
+/// Under `RMLX_HOME`'s `tmp/`. The streams are a run artifact of a suite that
+/// names no output directory of its own, and a variable for one would be
+/// invisible configuration for a path the run already prints.
+fn write_round_stream(test: &str, prompt: &str, rounds: &[common::CapturedEvent]) {
+    let dir = rmlx_core::paths::tmp_dir();
+    std::fs::create_dir_all(&dir).expect("create the run's tmp directory");
+    let path = dir.join(format!("{test}.{prompt}.jsonl"));
+    let mut body = String::new();
+    for event in rounds {
+        body.push_str(&event.json_line());
+        body.push('\n');
+    }
+    std::fs::write(&path, body).expect("write the round stream");
+    eprintln!(
+        "[{test}/{prompt}] rounds={} stream={}",
+        rounds.len(),
+        path.display()
+    );
+}
+
+/// One round in each shape a loop emits, on the target that loop emits it on,
+/// followed by a request-level line that is not a round.
+fn emit_one_round_of_each_shape() {
+    tracing::debug!(
+        target: "rmlx::spec::phase",
+        round = 3,
+        accept = 2,
+        num_draft = 4,
+        "speculative round"
+    );
+    tracing::debug!(
+        target: "rmlx_models::speculative::eagle3",
+        round = 3,
+        accept = 2,
+        num_draft = 4,
+        n_committed = 3,
+        "eagle3 round"
+    );
+    tracing::debug!(
+        target: "rmlx_models::speculative::dflash",
+        round = 3,
+        accept = 2,
+        num_draft = 4,
+        n_committed = 3,
+        projected_rows = 3,
+        "dflash round"
+    );
+    tracing::debug!(target: "rmlx_models::speculative", "a request-level line, not a round");
+}
+
+/// The recorder keeps a round as a loop emits one, and charges no phase doing
+/// it.
+///
+/// The events below are emitted at the targets the loops use, and two of those
+/// targets are themselves behaviour switches: the shared round event sits on
+/// the phase target and EAGLE-3's on its own module. A capture that declined
+/// the target rather than the level would return nothing for either, which is
+/// four of the seven loops.
+///
+/// Mutation: in `RoundStreamRecorder::enabled`, answer `false` for every
+/// metadata whose target is in `BEHAVIOUR_SWITCH_TARGETS`.
+#[test]
+fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
+    let recorder = common::RoundStreamRecorder::new();
+    tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
+        // The two questions a round loop asks before it decides what to do.
+        assert!(!tracing::enabled!(target: "rmlx::spec::phase", tracing::Level::TRACE));
+        assert!(
+            !tracing::enabled!(target: "rmlx_models::speculative::eagle3", tracing::Level::TRACE)
+        );
+        emit_one_round_of_each_shape();
+    });
+
+    let rounds = common::round_events(&recorder.events());
+    assert_eq!(
+        rounds.len(),
+        3,
+        "three rounds were emitted and the request-level line is not one: {rounds:?}"
+    );
+    for round in &rounds {
+        for field in ["round", "accept", "num_draft"] {
+            assert!(
+                round.field(field).is_some(),
+                "a round the oracle can read carries {field}: {round:?}"
+            );
+        }
+    }
+    assert_eq!(rounds[1].field("n_committed"), Some("3"));
+    assert_eq!(rounds[2].field("projected_rows"), Some("3"));
+
+    let line: serde_json::Value =
+        serde_json::from_str(&rounds[0].json_line()).expect("a round renders as one JSON object");
+    assert_eq!(line["target"], "rmlx::spec::phase");
+    assert_eq!(line["message"], "speculative round");
+    assert_eq!(line["accept"], "2");
+    assert_eq!(line["num_draft"], "4");
+
+    assert!(
+        recorder.declined_both_switches(),
+        "both switches were asked at TRACE and both answers must have been no: {:?}",
+        recorder.questions()
+    );
+}
+
 // ── The gate ─────────────────────────────────────────────────────────────────
 
 /// The assistant pair reproduces plain greedy on every prompt it answers.
@@ -3085,7 +3256,14 @@ fn run_gate(test: &str, pair: &Pair) {
     let mut refusals: Vec<String> = Vec::new();
     let mut judged = 0usize;
     for prompt in PROMPTS {
-        let (block, spec, plain, margins, decided_by) = loaded.arms(prompt, device);
+        let (block, spec, plain, margins, decided_by, rounds) = loaded.arms(prompt, device);
+        assert!(
+            !rounds.is_empty(),
+            "{test}/{}: the speculative arm reported no round, so the stream the \
+             comparison rests on is empty",
+            prompt.name
+        );
+        write_round_stream(test, prompt.name, &rounds);
         // Every pair is judged at a block or not at all — the one it names, or
         // the one the serve layer resolves for a request that names none. The
         // readings below are all attributed to a block in the report line, and
