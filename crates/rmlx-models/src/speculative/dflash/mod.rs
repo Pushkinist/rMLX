@@ -150,8 +150,10 @@ pub fn dflash_next_block_size(
 /// One DFlash decoder layer (Qwen3 shape: GQA + per-head q/k RMSNorm + RoPE).
 ///
 /// Mirrors `DFlashDecoderLayer`: pre-norm self-attention with a context /
-/// proposal KV split (only context K/V go in the cache) followed by a SwiGLU
-/// MLP, both residual.
+/// proposal KV split followed by a SwiGLU MLP, both residual. The reference
+/// keeps the context K/V in a per-layer cache; this layer rebuilds it from the
+/// conditioning rows on every call, which is what makes the drafter forward
+/// invariant to a uniform shift of every position.
 #[allow(missing_debug_implementations)]
 struct DFlashLayer {
     input_layernorm: RmsNorm,
@@ -184,8 +186,6 @@ pub struct DFlashDrafter {
     /// Final RMSNorm after the decoder stack.
     norm: RmsNorm,
     layers: Vec<DFlashLayer>,
-    /// Per-layer KV cache (the drafter's own; holds context K/V only).
-    caches: Vec<KvCache>,
     /// Precomputed YARN inverse-frequency table (`[head_dim/2]`), when the
     /// drafter config specifies `rope_scaling: {rope_type: yarn}`. `None`
     /// falls back to plain RoPE (`rope(theta)`). The Qwen3.6-35B DFlash drafter
@@ -241,10 +241,7 @@ impl DFlashDrafter {
     /// drafter `hidden_size` and `fc` input (`len(target_layer_ids)*H`) must
     /// match it.
     pub fn load(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<Self> {
-        let mut me = load_dflash(draft_dir, hidden_size, device)?;
-        me.caches = (0..me.cfg.num_hidden_layers)
-            .map(|_| KvCache::with_quant(KvQuant::None))
-            .collect();
+        let me = load_dflash(draft_dir, hidden_size, device)?;
         tracing::info!(
             draft = %draft_dir.display(),
             hidden_size,
@@ -254,13 +251,6 @@ impl DFlashDrafter {
             "DFlashDrafter: loaded drafter"
         );
         Ok(me)
-    }
-
-    /// Reset the drafter's KV cache between generations.
-    pub fn reset(&mut self) {
-        for c in &mut self.caches {
-            *c = KvCache::with_quant(KvQuant::None);
-        }
     }
 
     /// Trained / configured block size (the adaptive-schedule ceiling).
@@ -388,7 +378,7 @@ impl DFlashDrafter {
     /// run on-device. The seam is the *verifier* `embed_tokens` + `lm_head`
     /// accessor (threaded by the round-loop) — gated in [`embed_block`] below.
     pub fn draft_block(
-        &mut self,
+        &self,
         verifier: &Architecture,
         seed_tok: u32,
         h_ctx: &Array,
@@ -428,7 +418,7 @@ impl DFlashDrafter {
     /// Real port of `DFlashDraftModel._hidden` (sans embedding): for each layer,
     /// pre-norm self-attention with a context (`h_ctx`) / proposal (`h`) KV split
     /// followed by a SwiGLU MLP, then the final `norm`. Returns `[1, L, H]`.
-    fn forward_block(&mut self, h: &Array, h_ctx: &Array) -> Result<Array> {
+    fn forward_block(&self, h: &Array, h_ctx: &Array) -> Result<Array> {
         let mut x = h.try_clone()?;
         // The conditioning context is shared across layers (Python passes the
         // same `h_ctx` into every layer's attention as the KV-source prefix).
@@ -648,7 +638,7 @@ use crate::decode_loop::ProbeStep;
 )]
 pub fn dflash_generate(
     verifier: &Architecture,
-    drafter: &mut DFlashDrafter,
+    drafter: &DFlashDrafter,
     tokenizer: &tokenizers::Tokenizer,
     prompt_ids: &[u32],
     n_tokens: usize,
@@ -705,8 +695,6 @@ pub fn dflash_generate(
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
         .collect();
-
-    drafter.reset();
 
     let mut draw = super::VerifierDraw::new(sampler_cfg);
 
@@ -1174,7 +1162,6 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
         hidden_norm,
         norm: final_norm,
         layers,
-        caches: Vec::new(),
         rope_freqs,
         rope_mscale,
         cfg,

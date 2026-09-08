@@ -929,10 +929,10 @@ impl Generator for SpeculativeGenerator {
                     )
                 }
                 Drafter::DFlash(drafter_arc) => {
-                    let mut drafter = drafter_arc.lock();
+                    let drafter = drafter_arc.lock();
                     rmlx_models::speculative::dflash::dflash_generate(
                         &dispatcher.verifier,
-                        &mut drafter,
+                        &drafter,
                         &tokenizer,
                         &prompt_tokens,
                         n_tokens,
