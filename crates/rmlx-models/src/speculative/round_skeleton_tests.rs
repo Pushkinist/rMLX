@@ -158,8 +158,10 @@ fn the_three_acceptance_walks_commit_the_same_rows() {
 /// proposals rather than blocks and reach the same number one off, which is
 /// checked here because it is the one place the two units meet.
 ///
-/// DFlash 1 is the exception and stays its own function: its block follows the
-/// accept rate of the recent rounds.
+/// DFlash 1 adapts on top of it rather than beside it: `dflash_next_block_size`
+/// opens with [`round_block`] and then moves the result with the accept rate of
+/// the recent rounds, so the narrowing has one producer and the schedule is the
+/// only part that is DFlash 1's own.
 ///
 /// Mutation: change `round_block` to `block_total.min(remaining)`.
 #[test]
@@ -202,8 +204,8 @@ fn the_round_block_is_one_function_of_the_block_and_the_budget() {
     // The adaptive schedule is a different function, and stays one: with no
     // history it takes the same narrowing, and with a poor recent accept rate it
     // does not.
-    assert_eq!(dflash_next_block_size(&[], 16, 9, false), 9);
-    assert_eq!(dflash_next_block_size(&[(0, 7), (0, 7)], 16, 17, false), 4);
+    assert_eq!(dflash_next_block_size(&[], 16, 8, false), 9);
+    assert_eq!(dflash_next_block_size(&[(0, 7), (0, 7)], 16, 16, false), 4);
 }
 
 /// The verifier's rollback target, in the two spellings the loops use.
