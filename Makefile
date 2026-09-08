@@ -109,7 +109,8 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         bench-codec-cell \
         smoke-codec-matrix \
         e2e \
-        file-size-report check-no-inline-tests check-no-scalar-f32-leak \
+        file-size-report debt-report debt-report-selftest \
+        check-no-inline-tests check-no-scalar-f32-leak \
         check-doc-source-citations \
         check-kv-layer-quants check-kv-codec-disposition \
         check-kv-codec-disposition-fixtures \
@@ -410,6 +411,12 @@ hooks:           ## install the pre-commit git hook
 file-size-report: ## advisory: print source files >1000 LOC (non-failing)
 	@bash scripts/file_size_report.sh
 
+debt-report: ## advisory: sibling similarity, debt counters, add/remove ratio, oversized docs (non-failing; also runs at the end of `make ci`)
+	@bash scripts/debt_report.sh
+
+debt-report-selftest: ## CI gate: recall test for debt-report over synthetic fixtures — a planted twin, a non-twin, the round-loop group, and a two-commit ratio repo
+	@bash scripts/debt_report_selftest.sh
+
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
 	@bash scripts/check_no_inline_tests.sh
 
@@ -544,6 +551,7 @@ check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips
 
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
+	@bash scripts/debt_report_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_kv_layer_quants.sh
@@ -582,6 +590,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true
 	@bash scripts/target_size_report.sh || true
+	@bash scripts/debt_report.sh || true
 	@echo "ci ok"
 
 # tag: derive v<version> from the single source of truth
