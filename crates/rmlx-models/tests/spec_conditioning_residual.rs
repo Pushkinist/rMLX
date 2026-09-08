@@ -20,7 +20,10 @@
 //! own scale, so a projection that lost or reordered rows is caught and a
 //! last-place difference is not.
 //!
-//! Server-free, one snapshot pair each. Run:
+//! Server-free, one snapshot pair each. Both cases are selected by the same two
+//! variables and neither runs without them; the DFlash 2 case resolves its own
+//! pair by slug from `RMLX_O_MODELS_ROOT`, for the reason [`slug_path`] gives.
+//! Run:
 //! RMLX_KV_TEST_MODEL=<path-to>/mlx-community__Qwen3.6-35B-A3B-8bit \
 //! RMLX_DRAFT_TEST_MODEL=<path-to>/z-lab__Qwen3.6-35B-A3B-DFlash \
 //! cargo test -p rmlx-models --test spec_conditioning_residual -- --ignored --nocapture
@@ -65,12 +68,17 @@ fn env_path(key: &str) -> Option<PathBuf> {
         .filter(|p| p.is_dir())
 }
 
-/// A snapshot resolved by slug under `RMLX_O_MODELS_ROOT`, the way the
-/// equivalence pairs resolve theirs.
+/// A snapshot resolved by slug under `RMLX_O_MODELS_ROOT`.
 ///
-/// The DFlash 2 pair reads no variable of its own: one pair of variables cannot
-/// name two pairs, and pointing them at this one would silently run the DFlash 1
-/// case against the wrong drafter.
+/// The variable selects and the slug resolves, which is what the equivalence
+/// pairs do and for the same two reasons. One pair of variables cannot name two
+/// pairs, so the DFlash 2 case cannot take whatever `RMLX_DRAFT_TEST_MODEL`
+/// holds — a DFlash 1 drafter loads against a verifier of the same width without
+/// complaint. And a case that resolves itself entirely by slug runs whenever the
+/// snapshots happen to be on the machine, including under `make gpu-test`, where
+/// this pair's verifier drives an MLX quantized matmul whose invalid loads the
+/// shader-validation census would then have to pin — a count that moves with
+/// every generation. So this runs when an operator asks and not otherwise.
 fn slug_path(slug: &str) -> Option<PathBuf> {
     std::env::var("RMLX_O_MODELS_ROOT")
         .ok()
@@ -270,6 +278,14 @@ fn dflash1_carried_projection_against_one_call_at_full_height() {
 #[ignore = "needs a Qwen3.8-27B verifier + DFlash2 drafter snapshot and the Metal context"]
 #[test]
 fn dflash2_carried_projection_against_one_call_at_full_height() {
+    if env_path("RMLX_KV_TEST_MODEL").is_none() || env_path("RMLX_DRAFT_TEST_MODEL").is_none() {
+        eprintln!(
+            "SKIP dflash2_carried_projection_against_one_call_at_full_height: \
+             RMLX_KV_TEST_MODEL and RMLX_DRAFT_TEST_MODEL must both name an existing \
+             snapshot directory — they select this case, and the slugs below resolve it"
+        );
+        return;
+    }
     let (Some(model_path), Some(draft_path)) = (
         slug_path("mlx-community__Qwen3.8-27B-4bit"),
         slug_path("z-lab__Qwen3.8-27B-DFlash2"),
