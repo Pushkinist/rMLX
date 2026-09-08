@@ -23,9 +23,12 @@ USAGE
 
 EXIT
     0 agree, 1 a difference, 2 the comparison could not be made, 3 INCOMPLETE —
-    a `verify` over a capture holding only some of the pinned cells, which one
-    pair always is. It names the ones that did not run and does not report 0,
-    because a cell that could not run is not a cell that agreed.
+    a `verify` or a `compare` over captures holding only some of the pinned
+    cells, which one pair always is. It names the ones that did not run and does
+    not report 0, because a cell that could not run is not a cell that agreed.
+
+    The manifest is held to the same three facts as the capture, at both ends: a
+    hand-shrunk manifest is exit 2, not a smaller pass.
 """
 
 from __future__ import annotations
@@ -90,6 +93,11 @@ def rounds(path: pathlib.Path) -> list[dict]:
     return out
 
 
+def incompleteness(names: set[str]) -> tuple[list[str], list[str]]:
+    """What a capture is missing, and what it holds that the baseline is not over."""
+    return sorted(EXPECTED_CELLS - names), sorted(names - EXPECTED_CELLS)
+
+
 def compare(a_dir: pathlib.Path, b_dir: pathlib.Path) -> int:
     a, b = cells(a_dir), cells(b_dir)
     if not a or not b:
@@ -117,6 +125,17 @@ def compare(a_dir: pathlib.Path, b_dir: pathlib.Path) -> int:
                           file=sys.stderr)
                     return 1
         total += len(ra)
+    missing, extra = incompleteness(set(a))
+    if extra:
+        print(f"these captures hold {len(extra)} cell(s) the baseline is not over, "
+              f"first {extra[0]}", file=sys.stderr)
+        return 1
+    if missing:
+        for name in missing:
+            print(f"  in neither capture: {name}", file=sys.stderr)
+        print(f"INCOMPLETE: {len(a)} of {len(EXPECTED_CELLS)} cells agreed on "
+              f"{total} round lines, {len(missing)} did not run")
+        return 3
     print(f"{len(a)} cells, {total} round lines, every field identical")
     return 0
 
@@ -187,6 +206,26 @@ def main(argv: list[str]) -> int:
             for line in path.read_text().splitlines()
             if line.strip() and not line.startswith("#")
         }
+        # The emitter is held to these three facts; so is the consumer. A
+        # hand-shrunk manifest and a capture shrunk to match it would otherwise
+        # agree with each other and report a pass over two cells.
+        missing, extra = incompleteness(set(want))
+        want_rounds = sum(int(v[1]) for v in want.values())
+        if missing or extra or want_rounds != TOTAL_ROUNDS:
+            print(f"{path} pins {len(want)} of {len(EXPECTED_CELLS)} cells over "
+                  f"{want_rounds} rounds, and the baseline is {len(EXPECTED_CELLS)} "
+                  f"over {TOTAL_ROUNDS}.", file=sys.stderr)
+            if missing:
+                print(f"  it pins no {missing[0]}" +
+                      (f" (and {len(missing) - 1} more)" if len(missing) > 1 else ""),
+                      file=sys.stderr)
+            if extra:
+                print(f"  it pins {extra[0]}, which the baseline is not over" +
+                      (f" (and {len(extra) - 1} more)" if len(extra) > 1 else ""),
+                      file=sys.stderr)
+            print("A manifest that is not over the whole baseline cannot say a capture "
+                  "agreed with it.", file=sys.stderr)
+            return 2
         have = {
             line.split()[2]: (line.split()[0], line.split()[1])
             for line in manifest_lines(directory)

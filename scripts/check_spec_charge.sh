@@ -39,10 +39,18 @@
 #   call and the value of every `charged:` field must be the same token.
 #
 # RULE 2 (the token means what it says)
-#   A loop whose token is `charge_phases` must bind it to `phases_charged()` in
-#   the same function. Without that the census reads a spelling: a loop that
-#   binds `charge_phases` to a literal charges on every request and this gate
-#   would have counted it among the three that ask.
+#   A loop whose token is `charge_phases` must bind it, in the same function, to
+#   exactly `phases_charged()` and nothing else — the whole right-hand side, not
+#   a prefix of it. Without that the census reads a spelling: a loop that binds
+#   the name to a literal, or ORs a second condition into the call, charges on
+#   requests the switch did not ask for, and this gate would have counted it
+#   among the three that ask.
+#
+# RULE 4 (nothing charges outside the population)
+#   A fn that is not a round loop and calls `rollback_round_caches` is either a
+#   loop the derivation lost or a rollback moved out of one. Both read as a
+#   census that moved, which invites the census to be edited; both are exit 2
+#   here instead.
 #
 # RULE 3 (the population)
 #   Across the round loops, the multiset of those tokens is exactly
@@ -53,9 +61,15 @@
 # EXIT
 #   0 clean, 1 a rule fired, 2 the gate could not scan — a missing tree, no
 #   round loop found, a driver with no charge site in it (a rollback delegated
-#   to a helper is not a rollback this gate can read), or a call or a field
-#   whose value it could not read back. A scan that finds nothing must not
-#   report a pass.
+#   to a helper is not a rollback this gate can read), a charge site outside the
+#   population, or a call, a field or a binding whose shape it could not read
+#   back. A scan that finds nothing must not report a pass.
+#
+# PORTABILITY
+#   The argument list is joined on `\x1f` inside awk. That escape is what
+#   BSD awk on macOS reads, which is the only awk `make ci` runs here; it is not
+#   exercised against gawk or mawk, and a run under either should check that a
+#   readable call is still read before trusting a clean result.
 
 set -uo pipefail
 
@@ -95,16 +109,18 @@ records=$(
     xargs -0 awk '
       function addtok(t) { if (!(t in toks)) { toks[t] = 1 } }
       function reset() {
-        in_sig = 0; in_body = 0; in_call = 0; fname = ""; depth = 0; paren = 0
-        args = ""; has_step = 0; has_stats = 0; has_bind = 0; nroll = 0; nrec = 0
+        in_sig = 0; awaiting_body = 0; in_body = 0; in_call = 0; fname = ""
+        depth = 0; paren = 0; args = ""; has_step = 0; has_stats = 0
+        bind_ok = 0; bind_bad = 0; bind_odd = 0; nroll = 0; nrec = 0
         delete toks
       }
       function flush(   t, joined) {
         if (fname != "") {
           joined = ""
           for (t in toks) { joined = (joined == "") ? t : joined " " t }
-          printf "%s\t%s\t%d\t%d\t%d\t%d\t%s\n", \
-            FILENAME, fname, (has_step && has_stats), nroll, nrec, has_bind, joined
+          printf "%s\t%s\t%d\t%d\t%d\t%s\t%s\n", \
+            FILENAME, fname, (has_step && has_stats), nroll, nrec, \
+            (bind_odd ? "odd" : (bind_ok ? "ok" : (bind_bad ? "bad" : "none"))), joined
         }
         reset()
       }
@@ -119,7 +135,7 @@ records=$(
       FNR == 1 { flush() }
 
       # -- a function item, when not already inside one --------------------
-      !in_body && !in_sig &&
+      !in_body && !in_sig && !awaiting_body &&
       /^[[:space:]]*(pub(\([a-z:]+\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[a-z_0-9]+/ {
         flush()
         line = $0
@@ -137,8 +153,23 @@ records=$(
         paren += gsub(/\(/, "(") - gsub(/\)/, ")")
         if (paren <= 0) {
           in_sig = 0
+          awaiting_body = 1
+          # A `where` clause sits between the closing parenthesis and the body,
+          # so the body opens at the next `{` and not necessarily here.
+          if (index($0, "{") > 0) {
+            awaiting_body = 0
+            in_body = 1
+            depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+            if (depth < 0) { depth = 0 }
+          }
+        }
+        next
+      }
+
+      awaiting_body {
+        if (index($0, "{") > 0) {
+          awaiting_body = 0
           in_body = 1
-          # The line that closes the list also opens the body.
           depth = gsub(/\{/, "{") - gsub(/\}/, "}")
           if (depth < 0) { depth = 0 }
         }
@@ -166,8 +197,19 @@ records=$(
 
       index(stripped, "RoundStats {") > 0 { has_stats = 1 }
 
-      stripped ~ /let[[:space:]]+charge_phases[[:space:]]*=[[:space:]]*([A-Za-z_0-9]+::)*phases_charged\(\)/ {
-        has_bind = 1
+      # Three answers, not two. A plain `let charge_phases = <expr>;` is a
+      # binding this scan reads: it is the call and nothing else, or it is a
+      # different decision. Anything else naming the binding — a `mut`, a type
+      # annotation, a right-hand side that does not end on the line — is a shape
+      # it cannot read, which is a scan error and not a verdict about the loop.
+      index(stripped, "charge_phases") > 0 && stripped ~ /^[[:space:]]*let[[:space:]]/ {
+        if (stripped ~ /^[[:space:]]*let[[:space:]]+charge_phases[[:space:]]*=[[:space:]]*([A-Za-z_0-9]+::)*phases_charged\(\);[[:space:]]*$/) {
+          bind_ok = 1
+        } else if (stripped ~ /^[[:space:]]*let[[:space:]]+charge_phases[[:space:]]*=.*;[[:space:]]*$/) {
+          bind_bad = 1
+        } else {
+          bind_odd = 1
+        }
       }
 
       # Only a call opens one: the definition carries no charge argument, and a
@@ -203,6 +245,8 @@ records=$(
 )
 
 drivers=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1')
+# RULE 4: a fn that is not a round loop and rolls a round's caches back.
+orphans=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 0 && $4 > 0')
 
 if [ -z "$drivers" ]; then
   note "check-spec-charge: found no round loop under ${loops_dir#"$root"/}."
@@ -214,6 +258,16 @@ fi
 
 loop_count=0
 census=""
+
+while IFS=$'\t' read -r file fn _driver _nroll _nrec _bind _tokens; do
+  [ -n "$fn" ] || continue
+  note "check-spec-charge: ${file#"$root"/}: \`$fn\` rolls a round's caches back and is"
+  note "  not one of the round loops this gate derived. Either the derivation lost a"
+  note "  loop — a \`RoundStats\` built by a constructor, a signature rustfmt wrapped, a"
+  note "  \`where\` clause — or a rollback moved out of one. Both read as a census that"
+  note "  moved, and editing the census would bury either."
+  scan_error=1
+done <<<"$orphans"
 
 while IFS=$'\t' read -r file fn _driver nroll nrec bind tokens; do
   [ -n "$fn" ] || continue
@@ -245,10 +299,19 @@ while IFS=$'\t' read -r file fn _driver nroll nrec bind tokens; do
     fail=1
     continue
   fi
-  if [ "$tokens" = "charge_phases" ] && [ "$bind" != "1" ]; then
+  if [ "$tokens" = "charge_phases" ] && [ "$bind" = "odd" ]; then
+    note "check-spec-charge: $rel: \`$fn\` binds \`charge_phases\` in a shape this gate"
+    note "  cannot read — a \`mut\`, a type annotation, or a right-hand side that does not"
+    note "  end on its own line. An unread binding is not a checked one, and refusing it"
+    note "  as RULE 2 would name the wrong defect."
+    scan_error=1
+    continue
+  fi
+  if [ "$tokens" = "charge_phases" ] && [ "$bind" != "ok" ]; then
     note "check-spec-charge: $rel: \`$fn\` charges on \`charge_phases\` and does not bind it"
-    note "  to \`phases_charged()\`. The census would then be reading a spelling: a loop"
-    note "  that binds the name to a literal charges every request and is counted here"
+    note "  to \`phases_charged()\` alone. The census would then be reading a spelling: a"
+    note "  loop that binds the name to a literal, or ORs a second condition into the"
+    note "  call, charges on requests the switch did not ask for and is counted here"
     note "  among the three that ask."
     fail=1
     continue
