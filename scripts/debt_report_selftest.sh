@@ -73,6 +73,16 @@ check "non_twin_pair_absent" \
     absent "codec_beta" \
     BASE_OUT
 
+check "fn_level_append_shared" \
+    "fn-level similarity is asserted, not just the file-level percentage — deleting the fn loop or extract_fns leaves this absent" \
+    contains "fn append (crates/rmlx-kv-quant/src/storage/codec_alpha3.rs:6 <-> crates/rmlx-kv-quant/src/storage/codec_alpha4.rs:6): 100.0% shared" \
+    BASE_OUT
+
+check "fn_level_byte_size_shared" \
+    "a second named fn-level line from the same twin pair is asserted" \
+    contains "fn byte_size (crates/rmlx-kv-quant/src/storage/codec_alpha3.rs:12 <-> crates/rmlx-kv-quant/src/storage/codec_alpha4.rs:12): 100.0% shared" \
+    BASE_OUT
+
 check "round_loop_group_named" \
     "the round-loop drivers group is printed" \
     contains "--- round-loop drivers (crates/rmlx-models/src/speculative) ---" \
