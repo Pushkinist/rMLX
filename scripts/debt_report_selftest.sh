@@ -85,7 +85,7 @@ almost = ("This is a filler line documenting a codec variant in detail.\n" * 320
 open(f"{docs}/ALMOST.md", "w").write("# Almost doc\n\n" + almost)  # ~191 KB, under the threshold
 EOF
 
-BASE_OUT=$(python3 "$TOOL" --root "$STATIC_WORK/base")
+BASE_OUT=$(python3 "$TOOL" --root "$STATIC_WORK/base" --since HEAD)
 
 check "twin_pair_reported" \
     "a planted twin pair (differ only by the trailing digit) is reported" \
@@ -193,7 +193,7 @@ sed -i.bak 's/pub fn mtp_generate(/pub fn zzz_renamed_driver(/' \
     "$RENAME_WORK/base/crates/rmlx-models/src/speculative/mtp.rs"
 rm -f "$RENAME_WORK/base/crates/rmlx-models/src/speculative/mtp.rs.bak"
 
-RENAME_OUT=$(python3 "$TOOL" --root "$RENAME_WORK/base")
+RENAME_OUT=$(python3 "$TOOL" --root "$RENAME_WORK/base" --since HEAD)
 
 check "renamed_driver_old_name_absent" \
     "renaming a driver's fn (not its signature) removes its old name from the group" \
@@ -217,27 +217,46 @@ check "renamed_driver_count_unchanged" \
 
 rm -rf "$STATIC_WORK" "$RENAME_WORK"
 
-# ---- add/remove ratio on a synthetic two-commit repo -----------------------
+# ---- churn on a synthetic two-commit repo -----------------------------------
 
 RATIO_WORK="$(mktemp -d)"
 trap 'rm -rf "$RATIO_WORK"' EXIT
 
-git -C "$RATIO_WORK" init -q
-git -C "$RATIO_WORK" config user.email "debt-report-selftest@example.invalid"
-git -C "$RATIO_WORK" config user.name "debt-report-selftest"
-mkdir -p "$RATIO_WORK/crates/fixture-crate/src" "$RATIO_WORK/docs"
+git_ratio() { git -c commit.gpgsign=false -C "$RATIO_WORK" "$@"; }
+
+git_ratio init -q || {
+    echo "debt-report selftest: git init failed for the ratio fixture" >&2
+    exit 1
+}
+git_ratio config user.email "debt-report-selftest@example.invalid" || exit 1
+git_ratio config user.name "debt-report-selftest" || exit 1
+mkdir -p "$RATIO_WORK/crates/fixture-crate/src" "$RATIO_WORK/docs" || exit 1
+
 printf 'line1\nline2\nline3\nline4\nline5\n' >"$RATIO_WORK/crates/fixture-crate/src/lib.rs"
 printf 'docline1\ndocline2\ndocline3\ndocline4\n' >"$RATIO_WORK/docs/A.md"
-git -C "$RATIO_WORK" add -A
-git -C "$RATIO_WORK" commit -q -m "initial"
-git -C "$RATIO_WORK" tag v0.0.1
+# A top-level *.md file, outside docs/ — proves the churn section's combined
+# pathspec still covers it; dropping the "*.md" half of that call would go
+# unnoticed if only docs/A.md (already covered by "docs") ever changed.
+printf 'r1\nr2\nr3\n' >"$RATIO_WORK/README.md"
 
-# +4/-2 in the source file, +3/-1 in the doc — unique lines on both sides of
-# the edit so the diff is unambiguous, not just plausible.
+git_ratio add -A || exit 1
+git_ratio commit -q -m "initial" || {
+    echo "debt-report selftest: initial commit failed for the ratio fixture" >&2
+    exit 1
+}
+git_ratio tag v0.0.1 || exit 1
+
+# +4/-2 in the source file, +3/-1 in docs/A.md, +2/-1 in README.md — unique
+# lines on both sides of each edit so the diff is unambiguous, not just
+# plausible.
 printf 'line1\nline2\nline3\nline6\nline7\nline8\nline9\n' >"$RATIO_WORK/crates/fixture-crate/src/lib.rs"
 printf 'docline1\ndocline2\ndocline3\ndocline5\ndocline6\ndocline7\n' >"$RATIO_WORK/docs/A.md"
-git -C "$RATIO_WORK" add -A
-git -C "$RATIO_WORK" commit -q -m "update"
+printf 'r1\nr2\nr4\nr5\n' >"$RATIO_WORK/README.md"
+git_ratio add -A || exit 1
+git_ratio commit -q -m "update" || {
+    echo "debt-report selftest: update commit failed for the ratio fixture" >&2
+    exit 1
+}
 
 RATIO_OUT=$(python3 "$TOOL" --root "$RATIO_WORK")
 
@@ -252,9 +271,17 @@ check "ratio_source_computed" \
     RATIO_OUT
 
 check "ratio_docs_computed" \
-    "docs insertions/deletions match the planted diff (+3/-1), not double-counted" \
-    contains "docs (docs/, *.md): +3 / -1  (ratio 3.00x)" \
+    "docs/A.md and the top-level README.md are both in the combined figure (+3/-1 and +2/-1), not double-counted" \
+    contains "docs (docs/, *.md): +5 / -2  (ratio 2.50x)" \
     RATIO_OUT
+
+# A ref that never existed: the section must say so, not print a silent 0.
+UNAVAILABLE_OUT=$(python3 "$TOOL" --root "$RATIO_WORK" --since v9.9.9-does-not-exist)
+
+check "ratio_unavailable_on_bad_ref" \
+    "an unresolvable --since is reported as unavailable, not read as zero churn" \
+    contains "unavailable (" \
+    UNAVAILABLE_OUT
 
 if [ "$FAILED" -ne 0 ]; then
     echo "debt-report selftest: FAIL ($FAILED of $((PASSED + FAILED)))" >&2
