@@ -274,7 +274,16 @@ def gap_matrix(raw):
     ]
 
 
-TOKENS = int(os.environ.get("STUB_TOKENS", "6"))
+# The round-loop math below (`emitted = TOKENS`) is written against a fixed
+# token count, so the speculative arm keeps the short default. A plain run has
+# no such fixed expectation, and its engine-vs-client cross-check is exactly
+# the one a busy host was seen tripping: `mean_ms` (the engine's declared
+# rate) is a config value the wire's real pacing cannot move, so a scheduling
+# delay only stretches the *client's* measured window. A longer wire — more
+# chunks at the same nominal gap, so the declared rate is unchanged — gives
+# that same delay a bigger window to be a small fraction of.
+_PLAIN_TOKENS = "6" if os.environ.get("STUB_SPECULATIVE", "") == "1" else "10"
+TOKENS = int(os.environ.get("STUB_TOKENS", _PLAIN_TOKENS))
 GAP_MS = gap_matrix(os.environ.get("STUB_GAP_MS", "") or "40")
 PASS = int(os.environ.get("STUB_PASS", "1"))
 PREFILL_S = float(os.environ.get("STUB_PREFILL_S", "0.15"))
