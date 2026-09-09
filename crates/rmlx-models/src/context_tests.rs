@@ -235,11 +235,12 @@ fn absurd_scaling_saturates() {
 
 // ── One resolution, enumerated ───────────────────────────────────────────────
 
-/// Every consumer of the context ceiling, by workspace-relative path.
+/// Every place a context ceiling is **resolved**, by workspace-relative path.
 ///
-/// Adding a call site is fine; leaving it off this list is not. The list is
-/// what makes "one resolution" checkable — a reviewer reads it and sees every
-/// place a context bound is decided.
+/// Not every place one is applied — a bound is read far more widely than it is
+/// decided, and this list is the deciding. Adding a call site is fine; leaving
+/// it off is not. The list is what makes "one resolution" checkable: a reviewer
+/// reads it and sees every place a context bound is arrived at.
 const CEILING_CONSUMERS: &[&str] = &[
     // KV ring sizing, one per architecture generate path.
     "crates/rmlx-models/src/gemma4/generate/mod.rs",
@@ -254,10 +255,8 @@ const CEILING_CONSUMERS: &[&str] = &[
     // CLI: the default `--max-prompt-tokens` cap.
     "crates/rmlx-cli/src/commands/baseline.rs",
     "crates/rmlx-cli/src/commands/bench.rs",
-    // Speculative: the verifier's limits bound the pair. `speculative/mod.rs`
-    // holds the `verifier_context` wrapper, and `round_common.rs` is where every
-    // round loop resolves its verifier's ceiling and cache stack.
-    "crates/rmlx-models/src/speculative/mod.rs",
+    // Speculative: the verifier's limits bound the pair, and every round loop
+    // resolves them here, with the cache stack they size.
     "crates/rmlx-models/src/speculative/round_common.rs",
 ];
 
@@ -374,7 +373,6 @@ fn files_containing(needle: &str) -> Vec<String> {
 #[test]
 fn ceiling_consumers_are_enumerated() {
     let mut found = files_containing("resolve_context(");
-    found.extend(files_containing("verifier_context("));
     found.sort();
     found.dedup();
     let mut expected: Vec<String> = CEILING_CONSUMERS.iter().map(|s| (*s).to_owned()).collect();

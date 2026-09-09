@@ -114,9 +114,9 @@ fn the_acceptance_walk_commits_the_rows_the_three_spellings_agreed_on() {
         // A single proposal, held.
         (&[7], &[7, 5], 8, 1, &[7, 5]),
         // No proposals at all: the shape the loops' empty-chain guard exists to
-        // refuse before it reaches a walk. All three still agree on it, so the
-        // guard is the only thing standing between a broken drafter and a round
-        // that silently emits one token.
+        // refuse before it reaches a walk. The walk answers it rather than
+        // refusing, so the guard is the only thing standing between a broken
+        // drafter and a round that silently emits one token.
         (&[], &[4], 8, 0, &[4]),
     ];
     for (draft, verifier, budget, want_accept, want_commit) in cases {

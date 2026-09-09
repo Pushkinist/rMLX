@@ -76,6 +76,7 @@ use rmlx_mlx::{
 use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
+use crate::speculative::round_common::verifier_cache_stack;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Choose the next DFlash verify block size from recent acceptance.
@@ -654,11 +655,8 @@ pub fn dflash_generate(
         drafter.cfg.block_size,
     );
 
-    let (kv_quant, _, mut v_caches) = crate::speculative::round_common::verifier_cache_stack(
-        verifier,
-        kv_quant_override,
-        max_ctx_override,
-    )?;
+    let (kv_quant, _, mut v_caches) =
+        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
         .collect();

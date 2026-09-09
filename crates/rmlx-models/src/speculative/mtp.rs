@@ -52,6 +52,7 @@ use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
+use crate::speculative::round_common::verifier_cache_stack;
 use rmlx_kv_quant::{KvCache, KvQuant};
 
 /// Loaded MTP-head sidecar weights (Qwen3.5 `mtp.*`, prefix stripped).
@@ -670,11 +671,8 @@ pub fn mtp_generate(
 
     let block_total = block_from_request(requested_block_total, drafter.block_size());
 
-    let (kv_quant, _, mut v_caches) = crate::speculative::round_common::verifier_cache_stack(
-        verifier,
-        kv_quant_override,
-        max_ctx_override,
-    )?;
+    let (kv_quant, _, mut v_caches) =
+        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
         .collect();

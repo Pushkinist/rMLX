@@ -73,6 +73,7 @@ use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
+use crate::speculative::round_common::verifier_cache_stack;
 
 /// One drafter decoder layer (Gemma4 shape, Q-only - K/V are shared).
 #[allow(missing_debug_implementations)]
@@ -769,11 +770,8 @@ pub fn mtp_assistant_generate(
     }
     let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
 
-    let (kv_quant, _, mut caches) = crate::speculative::round_common::verifier_cache_stack(
-        verifier,
-        kv_quant_override,
-        max_ctx_override,
-    )?;
+    let (kv_quant, _, mut caches) =
+        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
 
     let mut draw = super::VerifierDraw::new(sampler_cfg);
 

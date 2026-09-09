@@ -128,6 +128,7 @@ use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
+use crate::speculative::round_common::verifier_cache_stack;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Target of this loop's per-position step trace.
@@ -852,11 +853,8 @@ pub fn eagle3_generate(
         drafter.cfg.block_size,
     );
 
-    let (kv_quant, max_seq, mut v_caches) = crate::speculative::round_common::verifier_cache_stack(
-        verifier,
-        kv_quant_override,
-        max_ctx_override,
-    )?;
+    let (kv_quant, max_seq, mut v_caches) =
+        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
         .collect();

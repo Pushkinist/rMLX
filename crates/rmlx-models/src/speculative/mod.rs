@@ -53,27 +53,6 @@ pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{GdnTape, GdnTapeSegment, KvCache, KvQuant, LinearAttnCache};
 pub(crate) use round_stats::{phases_charged, RoundPhases, RoundStats, SpecLoop};
 
-/// Resolve the context bounds a speculative pair runs under.
-///
-/// The verifier owns the KV geometry — the drafter inherits its cache sizing
-/// and its positional limit — so the verifier's [`crate::context::ContextLimits`]
-/// are what bound the round loop. Routing through
-/// [`crate::context::resolve_context`] keeps the speculative path on the one
-/// resolution every other context cap reads, and gives it the same refusal:
-/// a `--max-ctx` above the verifier's positional capacity used to be taken
-/// verbatim here and only surfaced as a cache overflow mid-round.
-///
-/// # Errors
-///
-/// [`rmlx_core::error::Error::ContextCeilingExceeded`] when `max_ctx_override`
-/// is above the verifier's positional capacity.
-pub(crate) fn verifier_context(
-    verifier: &Architecture,
-    max_ctx_override: Option<i32>,
-) -> Result<crate::context::ResolvedContext> {
-    crate::context::resolve_context(&verifier.context_limits(), max_ctx_override)
-}
-
 /// Guard the one verifier logit row a speculative driver selects from at
 /// prefill.
 ///
@@ -680,13 +659,6 @@ impl SpeculativeDispatcher {
         let mut draft_ns: u128 = 0;
         let mut verifier_ns: u128 = 0;
 
-        // A layer that reports a sliding window gets the RotatingKvCache port
-        // whatever codec it is handed — the branch is `window > 0` alone
-        // (`KvCache::with_quant_max_seq_window`), so an SWA layer here is bf16
-        // at `sliding_window` tokens under every `kv_quant`, and only the
-        // full-attention layers quantize. A block-verify write leaves that ring
-        // holding its window plus the block, which is what lets the rollback
-        // below drop the rejected tail out of it losslessly.
         let (kv_quant, max_seq, mut verifier_caches) = round_common::verifier_cache_stack(
             &self.verifier,
             kv_quant_override,
