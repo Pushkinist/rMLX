@@ -715,6 +715,10 @@ impl SpeculativeDispatcher {
         let last_prompt = *prompt_ids.last().unwrap();
         let mut v_carry: Vec<u32> = vec![last_prompt];
         let mut d_seed: Vec<u32> = vec![last_prompt];
+        // The token sequence the draft model was fed this round, refilled per
+        // round rather than reallocated: it is read by the rollback below and
+        // by nothing that outlives the round.
+        let mut d_fed: Vec<u32> = Vec::new();
 
         // --- Spec loop. ------------------------------------------------
         let seed_emitted = emitted.len();
@@ -872,7 +876,7 @@ impl SpeculativeDispatcher {
             // never fed back), so that is the token sequence the rollback keeps
             // the retained prefix of — and the length its accumulated tape has
             // to match.
-            let mut d_fed: Vec<u32> = Vec::with_capacity(d_seed.len() + draft_tokens.len());
+            d_fed.clear();
             d_fed.extend_from_slice(&d_seed);
             if draft_tokens.len() > 1 {
                 d_fed.extend_from_slice(&draft_tokens[..draft_tokens.len() - 1]);
@@ -1076,6 +1080,10 @@ impl SpeculativeDispatcher {
         let last_prompt = *prompt_ids.last().unwrap();
         let mut v_carry: Vec<u32> = vec![last_prompt];
         let mut d_seed: Vec<u32> = vec![last_prompt];
+        // The token sequence the draft model was fed this round, refilled per
+        // round rather than reallocated: it is read by the rollback below and
+        // by nothing that outlives the round.
+        let mut d_fed: Vec<u32> = Vec::new();
 
         let seed_emitted = emitted.len();
         let mut emitted_in_rounds = 0usize;
@@ -1244,7 +1252,7 @@ impl SpeculativeDispatcher {
             let d_offset_before = draft_caches.iter().map(KvCache::offset).max().unwrap_or(0);
             let d_drop = draft_rows_to_drop(draft_tokens.len(), accept);
             let d_target = d_offset_before - d_drop;
-            let mut d_fed: Vec<u32> = Vec::with_capacity(d_seed.len() + draft_tokens.len());
+            d_fed.clear();
             d_fed.extend_from_slice(&d_seed);
             if draft_tokens.len() > 1 {
                 d_fed.extend_from_slice(&draft_tokens[..draft_tokens.len() - 1]);
