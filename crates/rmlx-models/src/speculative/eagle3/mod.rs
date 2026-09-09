@@ -112,12 +112,13 @@
     clippy::too_many_lines,
     clippy::used_underscore_binding
 )]
-// kv-layer-quants: uniform — the one cache built here is the drafter's own, a
-// single unquantized cache for a single-layer head rather than a per-layer
-// stack, and it lives for one request: never pushed to the prompt cache, never
-// spilled, never keyed by `layout_key`, so no on-disk description has to match
-// it. The verifier's stack is built by `speculative::round_common`, which
-// carries its own declaration.
+// kv-layer-quants: uniform — the caches built here are the drafter's own and
+// never a per-layer stack: one unquantized cache for a single-layer head, made
+// at load and re-made per request by `Eagle3Drafter::reset`. It lives for that
+// one request — never pushed to the prompt cache, never spilled, never keyed by
+// `layout_key` — so no on-disk description has to match it. The verifier's
+// stack is built by `speculative::round_common`, which carries its own
+// declaration.
 
 use std::path::Path;
 
