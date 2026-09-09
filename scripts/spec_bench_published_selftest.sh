@@ -281,7 +281,13 @@ def gap_matrix(raw):
 # rate) is a config value the wire's real pacing cannot move, so a scheduling
 # delay only stretches the *client's* measured window. A longer wire — more
 # chunks at the same nominal gap, so the declared rate is unchanged — gives
-# that same delay a bigger window to be a small fraction of.
+# that same delay a bigger window to be a small fraction of. The window is
+# `(TOKENS - 1) * gap`: six chunks at the default 40 ms gap is 200 ms, ten is
+# 360 ms — 1.8x, not the round number the chunk count suggests. Against the
+# two recorded trips (10.2%, 11.0% past the band on the 200 ms window) that
+# leaves roughly 5.7% and 6.1%, comfortably inside the 10% band without
+# touching it. This mitigates the same absolute delay; it does not make the
+# window immune to a larger one.
 _PLAIN_TOKENS = "6" if os.environ.get("STUB_SPECULATIVE", "") == "1" else "10"
 TOKENS = int(os.environ.get("STUB_TOKENS", _PLAIN_TOKENS))
 GAP_MS = gap_matrix(os.environ.get("STUB_GAP_MS", "") or "40")
@@ -769,6 +775,12 @@ run_case three_passes_of_every_sample 0 \
     "the result holds three passes of every sample and nothing else"
 [ "$(jq_of "len(r['samples'])")" = "24" ] ||
     note_bad "the result holds $(jq_of "len(r['samples'])") rows (want 3 x 8)"
+# A plain run's completion length is the window the engine-vs-client
+# cross-check is timed over, not the speculative arm's fixed six — pinned here
+# so a revert of the widening that mitigates the load flake fails a case
+# rather than only losing margin silently.
+[ "$(jq_of "sorted({s['completion_tokens'] for s in r['samples']})")" = "[10]" ] ||
+    note_bad "completion_tokens=$(jq_of "sorted({s['completion_tokens'] for s in r['samples']})") (want [10])"
 [ "$(jq_of "sorted({s['pass'] for s in r['samples']})")" = "[1, 2, 3]" ] ||
     note_bad "passes=$(jq_of "sorted({s['pass'] for s in r['samples']})")"
 verdict
@@ -969,7 +981,10 @@ verdict
 run_case fixed_prompt_disagreement_precedes_sampling_read 1 \
     "a fixed-prompt cross-check failure is the fixed-prompt band, not a lost sampling read" \
     'STUB_ITL_MEAN_MS=20' 'STUB_ITL_MEAN_FROM=0' \
-    'GREP:past the 10% band'
+    'GREP:published_fixed_run: pass 1: .*past the 10% band' \
+    'GREP:over the fixed prompt.s decode window' \
+    'NOGREP:sampling: ' \
+    'NOGREP:published_aggregate'
 no_result
 verdict
 
