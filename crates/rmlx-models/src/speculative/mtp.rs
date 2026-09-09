@@ -794,7 +794,7 @@ pub fn mtp_generate(
         let round_t0 = Instant::now();
         rounds += 1;
         let remaining = n_tokens - emitted.len();
-        let bs = block_total.min(remaining + 1).max(2);
+        let bs = super::round_block(block_total, remaining);
         widest_bs = widest_bs.max(bs);
 
         // -- Phase A: drafter proposes bs-1 tokens (autoregressive). The sidecar
@@ -875,7 +875,8 @@ pub fn mtp_generate(
         let t0 = Instant::now();
         let n_committed = new_tokens.len();
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
-        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
+        let v_target =
+            super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
         if v_target < v_offset_before {
             let v_pre_round_offset = v_offset_before - v_k as i32;
             super::rollback_round_caches(

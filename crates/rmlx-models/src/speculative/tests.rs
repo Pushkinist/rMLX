@@ -748,6 +748,35 @@ fn accept_prefix_refuses_a_block_that_is_not_its_proposals_plus_a_bonus() {
     // A block missing its bonus slot is the same defect arriving from the other
     // side: there is no correction to emit and nothing should guess one.
     assert!(accept_prefix(&[10, 11], &[10, 11], 8).is_err());
+    // And a block with more than one bonus slot. The refusal is `!=` and not
+    // `<`: a verifier block one too long is a verify forward that scored a
+    // position the round never proposed for, and reading a correction out of it
+    // emits a token from the wrong position.
+    assert!(accept_prefix(&[10, 11, 12, 99, 0], &[10, 11, 12], 8).is_err());
+}
+
+/// The block walks answer a call `accept_prefix` refuses, and the refusal is the
+/// behaviour a collapse of the three must keep.
+///
+/// `dflash::walk_block_greedy` and `eagle3::eagle3_walk` are the same source
+/// under two names, and neither checks that the verifier's block is the
+/// proposals plus one bonus slot. Handed the arguments the wrong way round they
+/// report **four proposals accepted where three were made** — a count that then
+/// drives a KV rollback past the position the round actually committed. Whoever
+/// collapses the three onto one walk inherits `accept_prefix`'s refusal, which
+/// is the point of writing this down rather than leaving it to be discovered.
+#[test]
+fn the_block_walks_answer_the_call_accept_prefix_refuses() {
+    let verifier = [10u32, 11, 12, 99];
+    let draft = [10u32, 11, 12];
+    assert!(accept_prefix(&draft, &verifier, 8).is_err());
+    let bogus = (4, vec![10, 11, 12, 99]);
+    assert_eq!(
+        dflash::walk_block_greedy(&verifier, &draft, 8),
+        bogus,
+        "recorded, not required: this is the answer the refusal exists to prevent"
+    );
+    assert_eq!(eagle3::eagle3_walk(&verifier, &draft, 8), bogus);
 }
 
 // ---------------------------------------------------------------------------

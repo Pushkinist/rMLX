@@ -100,6 +100,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         published-table check-published-table published-table-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
         check-spec-sampling check-spec-sampling-fixtures \
+        check-spec-charge check-spec-charge-fixtures \
         check-published-samples check-published-samples-fixtures \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
         profile-mst \
@@ -457,6 +458,14 @@ check-spec-sampling: ## CI gate: fail if a speculative round loop is not handed 
 check-spec-sampling-fixtures: ## CI gate: recall test for the above — 10 synthetic scan roots, each asserting the reason as well as exit 1 vs exit 2
 	@bash scripts/check_spec_sampling_fixtures.sh
 
+.PHONY: check-spec-charge
+check-spec-charge: ## CI gate: fail if a speculative round loop names more than one phase-charge decision, or the census over the loops moves
+	@bash scripts/check_spec_charge.sh
+
+.PHONY: check-spec-charge-fixtures
+check-spec-charge-fixtures: ## CI gate: recall test for the above — 23 synthetic scan roots, each asserting the reason as well as exit 1 vs exit 2
+	@bash scripts/check_spec_charge_fixtures.sh
+
 .PHONY: check-published-samples
 check-published-samples: ## CI gate: fail if the checked-in published sample sets do not re-derive from their recorded seeds, digests and templates
 	@python3 scripts/published_samples.py verify
@@ -564,6 +573,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_spec_metric_parity_fixtures.sh
 	@bash scripts/check_spec_sampling.sh
 	@bash scripts/check_spec_sampling_fixtures.sh
+	@bash scripts/check_spec_charge.sh
+	@bash scripts/check_spec_charge_fixtures.sh
 	@python3 scripts/published_samples.py verify
 	@bash scripts/check_published_samples_fixtures.sh
 	@bash scripts/check_doc_source_citations.sh

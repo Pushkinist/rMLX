@@ -919,7 +919,7 @@ impl SpeculativeDispatcher {
                 .map(KvCache::offset)
                 .max()
                 .unwrap_or(0);
-            let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
+            let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
             // On a PARTIAL accept the KV keeps `v_target` positions and the GDN
             // recurrent state — which advanced by `v_k` and cannot be sliced —
             // is refolded from the round tape over the retained prefix. On a
@@ -946,7 +946,7 @@ impl SpeculativeDispatcher {
             // - num_draft + accept + 1. Per mlx-lm:
             // trim_prompt_cache(draft_cache, max(num_draft - accept - 1, 0))
             let d_offset_before = draft_caches.iter().map(KvCache::offset).max().unwrap_or(0);
-            let d_drop = (draft_tokens.len() as i32 - accept as i32 - 1).max(0);
+            let d_drop = draft_rows_to_drop(draft_tokens.len(), accept);
             let d_target = d_offset_before - d_drop;
             // `draft_decode_n` fed `d_seed ++ draft_tokens[..num_draft-1]`
             // (each step's input is the prior step's output; the last output is
@@ -1347,7 +1347,7 @@ impl SpeculativeDispatcher {
                 .map(KvCache::offset)
                 .max()
                 .unwrap_or(0);
-            let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
+            let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
             if v_target < v_offset_before {
                 rollback_round_caches(
                     &mut verifier_caches,
@@ -1364,7 +1364,7 @@ impl SpeculativeDispatcher {
             }
 
             let d_offset_before = draft_caches.iter().map(KvCache::offset).max().unwrap_or(0);
-            let d_drop = (draft_tokens.len() as i32 - accept as i32 - 1).max(0);
+            let d_drop = draft_rows_to_drop(draft_tokens.len(), accept);
             let d_target = d_offset_before - d_drop;
             if d_target < d_offset_before {
                 let mut d_fed: Vec<u32> = Vec::with_capacity(d_seed.len() + draft_tokens.len());
@@ -1903,6 +1903,61 @@ pub(crate) fn accept_prefix(
         }
     }
     Ok((accepted, emit))
+}
+
+/// The block a round runs, narrowed against what is left of the token budget.
+///
+/// `block_total` counts the verifier's own token, so a round with `remaining`
+/// tokens still to emit can run at most `remaining + 1` of it.
+///
+/// The floor is a no-op for every input a round loop reaches — every block
+/// resolver returns at least 2 and every loop's guard gives at least one
+/// remaining token, so `min` alone already answers at least 2 — and it is here
+/// for a caller that arrives at `remaining` some other way. A round of one
+/// verifies the carry token and drafts nothing, which is plain decode wearing a
+/// round's costs.
+#[must_use]
+pub(crate) fn round_block(block_total: usize, remaining: usize) -> usize {
+    block_total.min(remaining + 1).max(2)
+}
+
+/// The verifier KV offset a round rolls back to, counted from where the verify
+/// forward left off.
+///
+/// The forward consumed the carry token and every proposal, so dropping the
+/// rejected tail — `proposals - accept` positions — leaves the carry and the
+/// accepted prefix. The correction the round emits past them is a prediction the
+/// verifier has not processed, and is not one of the retained positions.
+#[must_use]
+pub(crate) fn rollback_target_from_tail(
+    v_offset_before: i32,
+    proposals: usize,
+    accept: usize,
+) -> i32 {
+    v_offset_before - (proposals as i32 - accept as i32)
+}
+
+/// The same position, counted from where the round started.
+///
+/// Equal to [`rollback_target_from_tail`] whenever the verify forward consumed
+/// `1 + proposals` positions, which is what every round's `v_input` holds. A
+/// loop that reads its pre-round offset before the forward takes this form; one
+/// that reads the post-forward offset takes the other.
+#[must_use]
+pub(crate) fn rollback_target_from_head(pre_round_offset: i32, accept: usize) -> i32 {
+    pre_round_offset + accept as i32 + 1
+}
+
+/// Rows the two-model loop drops from the draft cache on a partial acceptance.
+///
+/// The drafting pass feeds its seed and every proposal but the last — the last
+/// output is never fed back — so the draft cache advanced by `proposals` and
+/// keeps the carry plus the accepted prefix. That is one row fewer dropped than
+/// the verifier's, and dropping the extra one would discard the last accepted
+/// draft's K/V every round, degrading the accept rate with nothing saying so.
+#[must_use]
+pub(crate) fn draft_rows_to_drop(proposals: usize, accept: usize) -> i32 {
+    (proposals as i32 - accept as i32 - 1).max(0)
 }
 
 /// Largest difference allowed between a conditioning projection carried across
@@ -2496,3 +2551,7 @@ pub(crate) fn unread_tensor_refusal(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "round_skeleton_tests.rs"]
+mod round_skeleton_tests;

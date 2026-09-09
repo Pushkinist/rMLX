@@ -1,3 +1,9 @@
+// LOC-exempt: one gate over seven round loops. The oracle it applies — the
+// divergence-confidence judgement and the repetition control — is one argument
+// whose constants are set against the population of pairs and prompts the file
+// runs, and the pair table, the prompt sweep and the per-loop arms are that
+// population. Splitting it would put the constants in one file and the readings
+// that set them in another.
 //! Speculative decoding must not change what the model says.
 //!
 //! Greedy speculative decoding emits the verifier's own argmax at every
@@ -152,6 +158,11 @@
 use std::path::Path;
 
 mod common;
+
+use common::round_stream::{
+    round_events, CapturedEvent, RoundStreamRecorder, EAGLE3_STEP_SWITCH_TARGET,
+    PHASE_SWITCH_TARGET, ROUND_EVENT_FIELDS,
+};
 
 use rmlx_mlx::Device;
 use rmlx_models::arch;
@@ -2432,25 +2443,81 @@ impl Loaded {
         &mut self,
         prompt: &Prompt,
         device: Device,
-    ) -> (usize, Vec<u32>, Vec<u32>, Vec<f32>, Vec<DecidedBy>) {
+    ) -> (
+        usize,
+        Vec<u32>,
+        Vec<u32>,
+        Vec<f32>,
+        Vec<DecidedBy>,
+        Vec<CapturedEvent>,
+    ) {
         let ids = prompt.ids(&self.tokenizer);
         let block = self.round_block();
+        let (ran, spec_ids, decided_by, rounds) = self.spec_arm(&ids, block, device);
+        let (plain_ids, margins) = plain_greedy(
+            self.engine.verifier(),
+            &self.tokenizer,
+            &ids,
+            &self.eos,
+            device,
+        );
+        assert!(
+            decided_by.is_empty() || decided_by.len() == spec_ids.len(),
+            "the loop reported which vocabulary decided {} tokens and emitted {} — the \
+             verdict indexes one by the other",
+            decided_by.len(),
+            spec_ids.len()
+        );
+        (ran, spec_ids, plain_ids, margins, decided_by, rounds)
+    }
+
+    /// The speculative arm alone: the widest block any of its rounds ran, the
+    /// ids it emitted, which vocabulary decided each of them, and the round
+    /// stream it reported while doing so.
+    ///
+    /// The capture is scoped here and nowhere wider. The reference arm runs no
+    /// round, and a subscriber left installed past this call would answer the
+    /// behaviour switches of every test after it in this binary.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per drafter, each a twelve-argument driver call; a function per arm would scatter the dispatch without shortening it"
+    )]
+    fn spec_arm(
+        &mut self,
+        ids: &[u32],
+        block: usize,
+        device: Device,
+    ) -> (usize, Vec<u32>, Vec<DecidedBy>, Vec<CapturedEvent>) {
         let mut spec_ids: Vec<u32> = Vec::new();
         let mut decided_by: Vec<DecidedBy> = Vec::new();
-        let ran;
-        {
+        // EAGLE-3 is the one loop that consults the second switch, and what the
+        // capture is held to is how often. Its round event sits on that same
+        // target, so the target is never silent; and the recorder declines
+        // TRACE, so no event arrives whatever the guard does. What separates the
+        // two worlds is the *question*: the guard asks once per round, and
+        // `if step_trace_enabled()` rewritten to `if true` deletes that call and
+        // leaves the per-position `trace!` asking once per verified position.
+        let asks_step_switch = matches!(
+            &self.engine,
+            Engine::Sidecar {
+                drafter: Drafter::Eagle3(_),
+                ..
+            }
+        );
+        let recorder = RoundStreamRecorder::new();
+        let ran = tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
             let mut step = |s: &rmlx_models::ProbeStep| {
                 spec_ids.push(s.token_id);
                 None
             };
-            ran = match &mut self.engine {
+            match &mut self.engine {
                 Engine::Sidecar { verifier, drafter } => match drafter {
                     Drafter::Assistant(drafter) => {
                         mtp_assistant_generate(
                             verifier,
                             drafter,
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             block,
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2471,7 +2538,7 @@ impl Loaded {
                             verifier,
                             drafter,
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             block,
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2493,7 +2560,7 @@ impl Loaded {
                             verifier,
                             drafter,
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             block,
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2515,7 +2582,7 @@ impl Loaded {
                             verifier,
                             drafter,
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             block,
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2533,7 +2600,7 @@ impl Loaded {
                             verifier,
                             drafter,
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             block,
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2557,7 +2624,7 @@ impl Loaded {
                     dispatcher
                         .spec_generate_greedy(
                             &self.tokenizer,
-                            &ids,
+                            ids,
                             N_TOKENS,
                             drafts_per_round(block),
                             Some(rmlx_kv_quant::KvQuant::None),
@@ -2571,23 +2638,58 @@ impl Loaded {
                         .expect("two-model speculative generate")
                         .1
                 }
-            };
-        }
-        let (plain_ids, margins) = plain_greedy(
-            self.engine.verifier(),
-            &self.tokenizer,
-            &ids,
-            &self.eos,
-            device,
+            }
+        });
+        let questions = recorder.questions();
+        let enabled_at_trace: Vec<&String> = questions
+            .iter()
+            .filter(|(_, level, answer)| *level == tracing::Level::TRACE && *answer)
+            .map(|(target, ..)| target)
+            .collect();
+        assert!(
+            enabled_at_trace.is_empty(),
+            "the capture enabled {enabled_at_trace:?} at TRACE, and this run is then a \
+             different, slower one than the engine ships"
         );
         assert!(
-            decided_by.is_empty() || decided_by.len() == spec_ids.len(),
-            "the loop reported which vocabulary decided {} tokens and emitted {} — the \
-             verdict indexes one by the other",
-            decided_by.len(),
-            spec_ids.len()
+            !questions.is_empty(),
+            "the capture was never consulted, so it is a recording of nothing rather \
+             than a recording of this arm"
         );
-        (ran, spec_ids, plain_ids, margins, decided_by)
+        // Which switches this loop asked about is a property of the loop and not
+        // of the capture: three consult the phase switch and four pass a literal
+        // `false`, so an empty list here is a fact about the loop rather than a
+        // capture that stood down.
+        let mut switches: Vec<&str> = questions
+            .iter()
+            .filter(|(target, level, _)| {
+                common::round_stream::BEHAVIOUR_SWITCH_TARGETS.contains(&target.as_str())
+                    && *level == tracing::Level::TRACE
+            })
+            .map(|(target, ..)| target.as_str())
+            .collect();
+        switches.sort_unstable();
+        switches.dedup();
+        eprintln!("switches declined: {switches:?}");
+        let rounds = round_events(&recorder.events());
+        let step_questions = questions
+            .iter()
+            .filter(|(target, level, _)| {
+                target == EAGLE3_STEP_SWITCH_TARGET && *level == tracing::Level::TRACE
+            })
+            .count();
+        // Two-sided: the loop that asks it asks once per round, and every other
+        // loop asks not at all. A loop that started consulting a switch it does
+        // not gate on would be as much of a change as one that stopped.
+        let want_step_questions = if asks_step_switch { rounds.len() } else { 0 };
+        assert!(
+            step_questions == want_step_questions,
+            "this pair asks its per-position trace switch {want_step_questions} times \
+             over {} rounds and it was asked {step_questions}. A guard replaced by a \
+             constant asks it once per verified position, or not at all.",
+            rounds.len()
+        );
+        (ran, spec_ids, decided_by, rounds)
     }
 
     /// The target-vocabulary ids this pair's drafter can name, or `None` when it
@@ -2915,6 +3017,148 @@ fn report(
     );
 }
 
+/// Write one pair's round stream for one prompt — one JSON object per round —
+/// beside the timing-free form two runs are compared on, and say where both
+/// went.
+///
+/// Under `RMLX_HOME`'s `tmp/`. The streams are a run artifact of a suite that
+/// names no output directory of its own, and a variable for one would be
+/// invisible configuration for a path the run already prints.
+///
+/// The second file is what
+/// `crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256` pins,
+/// so `shasum -a 256` on it is the whole comparison. Its byte length is printed
+/// because a cell whose length already differs needs no digest to settle.
+fn write_round_stream(test: &str, prompt: &str, rounds: &[CapturedEvent]) {
+    let dir = rmlx_core::paths::tmp_dir();
+    std::fs::create_dir_all(&dir).expect("create the run's tmp directory");
+    let mut full = String::new();
+    let mut stable = String::new();
+    for event in rounds {
+        full.push_str(&event.json_line());
+        full.push('\n');
+        stable.push_str(&event.stable_json_line());
+        stable.push('\n');
+    }
+    let full_path = dir.join(format!("{test}.{prompt}.jsonl"));
+    let stable_path = dir.join(format!("{test}.{prompt}.stable.jsonl"));
+    let stable_len = stable.len();
+    std::fs::write(&full_path, full).expect("write the round stream");
+    std::fs::write(&stable_path, stable).expect("write the timing-free round stream");
+    eprintln!(
+        "[{test}/{prompt}] rounds={} stream={} stable={} stable_bytes={stable_len}",
+        rounds.len(),
+        full_path.display(),
+        stable_path.display(),
+    );
+}
+
+/// One round in each shape a loop emits, on the target that loop emits it on,
+/// followed by a request-level line that is not a round.
+fn emit_one_round_of_each_shape() {
+    tracing::debug!(
+        target: PHASE_SWITCH_TARGET,
+        round = 3,
+        accept = 2,
+        num_draft = 4,
+        round_ms = 20.5,
+        "speculative round"
+    );
+    tracing::debug!(
+        target: "rmlx_models::speculative::eagle3",
+        round = 3,
+        accept = 2,
+        num_draft = 4,
+        n_committed = 3,
+        "eagle3 round"
+    );
+    tracing::debug!(
+        target: "rmlx_models::speculative::dflash",
+        round = 3,
+        accept = 2,
+        num_draft = 4,
+        n_committed = 3,
+        projected_rows = 3,
+        "dflash round"
+    );
+    tracing::debug!(target: "rmlx_models::speculative", "a request-level line, not a round");
+}
+
+/// The recorder keeps a round as a loop emits one, and charges no phase doing
+/// it.
+///
+/// The events below are emitted at the targets the loops use, and two of those
+/// targets are themselves behaviour switches: the shared round event sits on
+/// the phase target and EAGLE-3's on its own module. A capture that declined
+/// the target rather than the level would return nothing for either, which is
+/// four of the seven loops.
+///
+/// Mutation: in `RoundStreamRecorder::enabled`, answer `false` for every
+/// metadata whose target is in `BEHAVIOUR_SWITCH_TARGETS`.
+#[test]
+fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
+    let recorder = RoundStreamRecorder::new();
+    tracing::subscriber::with_default(std::sync::Arc::clone(&recorder), || {
+        // The two questions a round loop asks before it decides what to do.
+        assert!(!tracing::enabled!(target: PHASE_SWITCH_TARGET, tracing::Level::TRACE));
+        assert!(
+            !tracing::enabled!(target: "rmlx_models::speculative::eagle3", tracing::Level::TRACE)
+        );
+        emit_one_round_of_each_shape();
+    });
+
+    let captured = recorder.events();
+    let rounds = round_events(&captured);
+    assert_eq!(
+        rounds.len(),
+        3,
+        "three rounds were emitted and the request-level line is not one: {rounds:?}"
+    );
+    // The negative control has to be excluded for the reason `round_events`
+    // gives, not by luck: a request-level line that grew all three fields would
+    // otherwise quietly join the stream and this fixture would still read 3.
+    let control: Vec<&CapturedEvent> = captured
+        .iter()
+        .filter(|e| e.message == "a request-level line, not a round")
+        .collect();
+    assert_eq!(control.len(), 1, "the request-level line was captured");
+    assert!(
+        ROUND_EVENT_FIELDS
+            .iter()
+            .any(|f| control[0].field(f).is_none()),
+        "the line this fixture uses to show a non-round is excluded carries every one \
+         of {ROUND_EVENT_FIELDS:?}, so it no longer shows anything: {:?}",
+        control[0]
+    );
+    assert_eq!(rounds[1].field("n_committed"), Some("3"));
+    assert_eq!(rounds[2].field("projected_rows"), Some("3"));
+
+    let line: serde_json::Value =
+        serde_json::from_str(&rounds[0].json_line()).expect("a round renders as one JSON object");
+    assert_eq!(line["target"], PHASE_SWITCH_TARGET);
+    assert_eq!(line["message"], "speculative round");
+    assert_eq!(line["accept"], "2");
+    assert_eq!(line["num_draft"], "4");
+    assert_eq!(line["round_ms"], "20.5");
+
+    // The form the baseline manifest pins: the same object without the fields
+    // that move between two runs of the same engine.
+    let stable: serde_json::Value = serde_json::from_str(&rounds[0].stable_json_line())
+        .expect("a round renders as one JSON object");
+    assert!(
+        stable.get("round_ms").is_none(),
+        "a wall-clock field survived into the form two runs are compared on: {stable}"
+    );
+    assert_eq!(stable["accept"], "2");
+    assert_eq!(stable["num_draft"], "4");
+
+    assert!(
+        recorder.declined_both_switches(),
+        "both switches were asked at TRACE and both answers must have been no: {:?}",
+        recorder.questions()
+    );
+}
+
 // ── The gate ─────────────────────────────────────────────────────────────────
 
 /// The assistant pair reproduces plain greedy on every prompt it answers.
@@ -3085,7 +3329,19 @@ fn run_gate(test: &str, pair: &Pair) {
     let mut refusals: Vec<String> = Vec::new();
     let mut judged = 0usize;
     for prompt in PROMPTS {
-        let (block, spec, plain, margins, decided_by) = loaded.arms(prompt, device);
+        let (block, spec, plain, margins, decided_by, rounds) = loaded.arms(prompt, device);
+        // Written before it is judged: an empty stream is the case worth having
+        // the file for.
+        write_round_stream(test, prompt.name, &rounds);
+        assert!(
+            !rounds.is_empty() || spec.len() <= 1,
+            "{test}/{}: the speculative arm emitted {} tokens and reported no round. \
+             An arm that stopped on its seed closes no round and is the prompt; this \
+             one ran, so the stream the comparison rests on is empty because the loop \
+             stopped reporting one.",
+            prompt.name,
+            spec.len()
+        );
         // Every pair is judged at a block or not at all — the one it names, or
         // the one the serve layer resolves for a request that names none. The
         // readings below are all attributed to a block in the report line, and

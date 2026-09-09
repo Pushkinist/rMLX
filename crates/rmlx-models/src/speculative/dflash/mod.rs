@@ -93,20 +93,20 @@ use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 /// - `recent` is the recent `(accepted, drafted)` history (most-recent last);
 ///   the round-loop keeps the last 8.
 /// - `requested_block_total` is the configured/CLI block size.
-/// - `remaining_budget` caps the block to the remaining token budget.
+/// - `remaining` is how many tokens the request may still emit, in the same
+///   unit every other loop narrows against — the ceiling is
+///   [`super::round_block`] of it, so this schedule adapts a block it does not
+///   also define.
 /// - `prefer_requested` short-circuits to the requested size (config flag).
 ///
 /// Returns the next block total (including the seed token).
-pub fn dflash_next_block_size(
+pub(crate) fn dflash_next_block_size(
     recent: &[(usize, usize)],
     requested_block_total: usize,
-    remaining_budget: usize,
+    remaining: usize,
     prefer_requested: bool,
 ) -> usize {
-    let block_total = requested_block_total.min(remaining_budget);
-    if block_total <= 1 {
-        return block_total;
-    }
+    let block_total = super::round_block(requested_block_total, remaining);
     if prefer_requested {
         return block_total;
     }
@@ -817,7 +817,7 @@ pub fn dflash_generate(
     while emitted.len() < n_tokens {
         rounds += 1;
         let remaining = n_tokens - emitted.len();
-        let bs = dflash_next_block_size(&recent, block_total, remaining + 1, false);
+        let bs = dflash_next_block_size(&recent, block_total, remaining, false);
         widest_bs = widest_bs.max(bs);
 
         // -- Phase A: drafter proposes bs-1 tokens (non-autoregressive block). --
@@ -892,7 +892,8 @@ pub fn dflash_generate(
         // verifier processed it as part of v_input only when it was a draft
         // token — i.e. the committed-position count is `accept` consumed
         // draft slots + the carry b). KV target = pre + accept + 1 carry-rows.
-        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
+        let v_target =
+            super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
         if v_target < v_offset_before {
             let v_pre_round_offset = v_offset_before - v_k as i32;
             super::rollback_round_caches(

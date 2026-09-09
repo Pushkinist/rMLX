@@ -1,18 +1,6 @@
 use super::*;
 
 #[test]
-fn block_size_clamped_to_budget() {
-    assert_eq!(eagle3_next_block_size(5, 3), 3);
-    assert_eq!(eagle3_next_block_size(5, 100), 5);
-}
-
-#[test]
-fn block_size_one_or_zero_passthrough() {
-    assert_eq!(eagle3_next_block_size(5, 1), 1);
-    assert_eq!(eagle3_next_block_size(5, 0), 0);
-}
-
-#[test]
 fn walk_all_accepted_emits_bonus() {
     let draft = [10, 11, 12];
     let target = [10, 11, 12, 99];
@@ -75,12 +63,11 @@ fn d2t_out_of_range_passes_through() {
 #[test]
 fn eagle3_module_compiles() {
     let _load = Eagle3Drafter::load;
-    let _bs = eagle3_next_block_size;
     let _walk = eagle3_walk;
     let _d2t = draft_to_target;
     let _ffp = find_full_pos;
     let _gen = eagle3_generate;
-    let _ = (_load, _bs, _walk, _d2t, _ffp, _gen);
+    let _ = (_load, _walk, _d2t, _ffp, _gen);
 }
 
 // -----------------------------------------------------------------------

@@ -875,7 +875,7 @@ pub fn mtp_assistant_generate(
         let round_t0 = Instant::now();
         rounds += 1;
         let remaining = n_tokens - emitted.len();
-        let bs = (remaining + 1).min(block_size).max(2);
+        let bs = super::round_block(block_size, remaining);
         widest_bs = widest_bs.max(bs);
 
         // -- Phase A: drafter proposes bs-1 tokens (conditioned on hidden). --
@@ -946,7 +946,7 @@ pub fn mtp_assistant_generate(
         // The verifier consumed v_k positions; valid prefix = prev + accept + 1
         // (the correction v_tokens[accept] is a prediction, not yet processed).
         let t0 = Instant::now();
-        let v_target = pre_round_offset + accept as i32 + 1;
+        let v_target = super::rollback_target_from_head(pre_round_offset, accept);
         let rejected = v_k as i32 - (accept as i32 + 1);
         if rejected > 0 {
             super::rollback_round_caches(

@@ -128,15 +128,19 @@ use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
-/// Choose the next EAGLE-3 verify block size.
+/// Target of this loop's per-position step trace.
+pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
+
+/// Whether this request emits one trace event per verified position.
 ///
-/// Pure port of `_eagle3_next_block_size` (non-adaptive branch). mlx-vlm's
-/// `_eagle3_rounds` honors the configured/requested size capped to the remaining
-/// budget (the Dogacel drafter advertises no `adaptive_max_block_size`, so the
-/// adaptive tier walk never fires). Returns the next block total (including the
-/// seed/bonus token).
-pub fn eagle3_next_block_size(requested_block_total: usize, remaining_budget: usize) -> usize {
-    requested_block_total.min(remaining_budget)
+/// Like [`crate::speculative::phases_charged`] this reads process-global log
+/// state and changes what the round does — a block of `v_k` events per round,
+/// each reading back tokens the loop already holds. It is a named predicate so
+/// a recorder can be asked whether it declined it: a subscriber that enables
+/// everything turns this on, and a per-round stream captured under one is not
+/// the stream the loop emits by default.
+pub(crate) fn step_trace_enabled() -> bool {
+    tracing::enabled!(target: STEP_TARGET, tracing::Level::TRACE)
 }
 
 /// One greedy EAGLE-3 acceptance walk over a drafted block.
@@ -1039,7 +1043,7 @@ pub fn eagle3_generate(
     while emitted.len() < n_tokens {
         rounds += 1;
         let remaining = n_tokens - emitted.len();
-        let bs = eagle3_next_block_size(block_total, remaining + 1);
+        let bs = super::round_block(block_total, remaining);
         widest_bs = widest_bs.max(bs);
 
         // Track drafter cache offset before draft_block so accept_and_reseed
@@ -1170,10 +1174,7 @@ pub fn eagle3_generate(
         let n_committed = new_tokens.len();
 
         // Per-step trace: enable with RUST_LOG=rmlx_models::speculative::eagle3=trace.
-        if tracing::enabled!(
-            target: "rmlx_models::speculative::eagle3",
-            tracing::Level::TRACE
-        ) {
+        if step_trace_enabled() {
             let running_ar = if total_draft > 0 {
                 (total_accept as f64) / (total_draft as f64)
             } else {
@@ -1181,7 +1182,7 @@ pub fn eagle3_generate(
             };
             for (i, (&dt, &vt)) in draft_tokens.iter().zip(v_tokens.iter()).enumerate() {
                 tracing::trace!(
-                    target: "rmlx_models::speculative::eagle3",
+                    target: STEP_TARGET,
                     round = rounds,
                     step = i,
                     draft_tok = dt,
@@ -1225,7 +1226,8 @@ pub fn eagle3_generate(
         // (pre-round + accept + 1 carry rows). Roll FA KV caches back and refold
         // the GDN recurrence over the kept prefix.
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
-        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
+        let v_target =
+            super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
         if v_target < v_offset_before {
             let v_pre_round_offset = v_offset_before - v_k as i32;
             super::rollback_round_caches(
