@@ -715,9 +715,11 @@ impl SpeculativeDispatcher {
         let last_prompt = *prompt_ids.last().unwrap();
         let mut v_carry: Vec<u32> = vec![last_prompt];
         let mut d_seed: Vec<u32> = vec![last_prompt];
-        // The token sequence the draft model was fed this round, refilled per
-        // round rather than reallocated: it is read by the rollback below and
-        // by nothing that outlives the round.
+        // The two token sequences a round feeds, refilled per round rather than
+        // reallocated: what the verifier scored and what the draft model was
+        // fed. Both are read by the rollback below and by nothing that outlives
+        // the round.
+        let mut v_input: Vec<u32> = Vec::new();
         let mut d_fed: Vec<u32> = Vec::new();
 
         // --- Spec loop. ------------------------------------------------
@@ -761,7 +763,7 @@ impl SpeculativeDispatcher {
             // Input = v_carry + draft_tokens. v_carry is 1 token: either
             // the last prompt token (round 1) or the previous round's
             // emitted correction/bonus.
-            let mut v_input: Vec<u32> = Vec::with_capacity(v_carry.len() + draft_tokens.len());
+            v_input.clear();
             v_input.extend_from_slice(&v_carry);
             v_input.extend_from_slice(&draft_tokens);
             let v_k = v_input.len(); // = num_draft + 1
@@ -1080,9 +1082,11 @@ impl SpeculativeDispatcher {
         let last_prompt = *prompt_ids.last().unwrap();
         let mut v_carry: Vec<u32> = vec![last_prompt];
         let mut d_seed: Vec<u32> = vec![last_prompt];
-        // The token sequence the draft model was fed this round, refilled per
-        // round rather than reallocated: it is read by the rollback below and
-        // by nothing that outlives the round.
+        // The two token sequences a round feeds, refilled per round rather than
+        // reallocated: what the verifier scored and what the draft model was
+        // fed. Both are read by the rollback below and by nothing that outlives
+        // the round.
+        let mut v_input: Vec<u32> = Vec::new();
         let mut d_fed: Vec<u32> = Vec::new();
 
         let seed_emitted = emitted.len();
@@ -1116,7 +1120,7 @@ impl SpeculativeDispatcher {
             total_draft_tokens += draft_tokens.len();
 
             // -- Phase B: verifier scores num_draft+1 positions. -------------
-            let mut v_input: Vec<u32> = Vec::with_capacity(v_carry.len() + draft_tokens.len());
+            v_input.clear();
             v_input.extend_from_slice(&v_carry);
             v_input.extend_from_slice(&draft_tokens);
             let v_k = v_input.len();
