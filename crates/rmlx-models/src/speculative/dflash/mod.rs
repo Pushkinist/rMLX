@@ -73,12 +73,12 @@ use rmlx_mlx::{
     tanh, Array, Device,
 };
 
-use super::{emit_step, DecodeWindow};
+use super::DecodeWindow;
 use crate::arch::Architecture;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
-    RoundTotals,
+    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
+    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -660,9 +660,7 @@ pub fn dflash_generate(
 
     let (kv_quant, _, mut v_caches) =
         verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
-    let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
-        .map(|_| LinearAttnCache::new())
-        .collect();
+    let mut v_lin = lin_cache_stack(verifier);
 
     let mut draw = super::VerifierDraw::new(sampler_cfg);
 
@@ -807,18 +805,17 @@ pub fn dflash_generate(
         recent.push((accept, draft_tokens.len()));
 
         // -- Emit accepted prefix + 1 correction/bonus. ----------------------
-        let mut hit_eos = false;
-        for &id in &new_tokens {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            emitted_in_rounds += 1;
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
+        let hit_eos = emit_round_tokens(
+            tokenizer,
+            &new_tokens,
+            n_tokens,
+            eos_ids,
+            step_fn,
+            &mut emitted,
+            &mut emitted_in_rounds,
+            &mut window,
+            None,
+        );
         if hit_eos {
             break;
         }
@@ -842,22 +839,16 @@ pub fn dflash_generate(
         // draft slots + the carry b). KV target = pre + accept + 1 carry-rows.
         let v_target =
             super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        if v_target < v_offset_before {
-            let v_pre_round_offset = v_offset_before - v_k as i32;
-            super::rollback_round_caches(
-                &mut v_caches,
-                Some(&mut v_lin),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                // This loop times no phases, so it never charges one.
-                false,
-                device,
-            )?;
-        } else {
-            // Full accept — GDN already correct; drop the tape.
-            super::disarm_lin_tapes(Some(&mut v_lin));
-        }
+        rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_offset_before - v_k as i32,
+            v_target,
+            // This loop times no phases, so it never charges one.
+            false,
+            device,
+        )?;
 
         // Append this round's committed verifier hidden to the accumulated
         // conditioning context (the reference feeds the committed

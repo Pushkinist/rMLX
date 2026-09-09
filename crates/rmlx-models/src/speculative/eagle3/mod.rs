@@ -125,15 +125,15 @@ use std::path::Path;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{add, argmax, concatenate, rope, Array, Device};
 
-use super::{emit_step, DecodeWindow};
+use super::DecodeWindow;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
-    RoundTotals,
+    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
+    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
 };
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+use rmlx_kv_quant::{KvCache, KvQuant};
 
 /// Target of this loop's per-position step trace.
 pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
@@ -859,9 +859,7 @@ pub fn eagle3_generate(
 
     let (kv_quant, max_seq, mut v_caches) =
         verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
-    let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
-        .map(|_| LinearAttnCache::new())
-        .collect();
+    let mut v_lin = lin_cache_stack(verifier);
 
     // Size the drafter KV cache to the verifier context limit
     // (max_position_embeddings, capped to KV_MAX_SEQ_DEFAULT, or --max-ctx).
@@ -1155,26 +1153,21 @@ pub fn eagle3_generate(
         }
 
         // -- Emit accepted prefix + 1 correction/bonus. --
-        let mut hit_eos = false;
-        for (i, &id) in new_tokens.iter().enumerate() {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            // `new_tokens[..accept]` are the draft's own tokens, which the
-            // restricted argmax confirmed; `new_tokens[accept]` is the
-            // correction, taken over the whole vocabulary.
-            decided_by.push(if hot_path && i < accept {
-                DecidedBy::RestrictedVocab
-            } else {
-                DecidedBy::FullVocab
-            });
-            emitted_in_rounds += 1;
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
+        // `new_tokens[..accept]` are the draft's own tokens, which the
+        // restricted argmax confirmed; `new_tokens[accept]` is the correction,
+        // taken over the whole vocabulary.
+        let restricted = if hot_path { accept } else { 0 };
+        let hit_eos = emit_round_tokens(
+            tokenizer,
+            &new_tokens,
+            n_tokens,
+            eos_ids,
+            step_fn,
+            &mut emitted,
+            &mut emitted_in_rounds,
+            &mut window,
+            Some((&mut *decided_by, restricted)),
+        );
         if hit_eos {
             break;
         }
@@ -1186,21 +1179,16 @@ pub fn eagle3_generate(
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
         let v_target =
             super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        if v_target < v_offset_before {
-            let v_pre_round_offset = v_offset_before - v_k as i32;
-            super::rollback_round_caches(
-                &mut v_caches,
-                Some(&mut v_lin),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                // This loop times no phases, so it never charges one.
-                false,
-                device,
-            )?;
-        } else {
-            super::disarm_lin_tapes(Some(&mut v_lin));
-        }
+        rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_offset_before - v_k as i32,
+            v_target,
+            // This loop times no phases, so it never charges one.
+            false,
+            device,
+        )?;
 
         // -- Phase E: drafter accept-and-reseed. --
         //

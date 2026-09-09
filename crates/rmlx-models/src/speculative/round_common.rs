@@ -17,9 +17,11 @@
 
 use std::time::Instant;
 
-use rmlx_core::error::Result;
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+use rmlx_core::error::{Error, Result};
+use rmlx_kv_quant::{GdnTape, GdnTapeSegment, KvCache, KvQuant, LinearAttnCache};
+use rmlx_mlx::{concatenate, Array, Device};
 
+use super::eagle3::DecidedBy;
 use super::{DecodeWindow, RoundStats, SpecLoop};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
@@ -82,6 +84,23 @@ pub(crate) fn cache_stack(arch: &Architecture, kv_quant: KvQuant, max_seq: i32) 
         .collect()
 }
 
+/// One model's recurrent linear-attention state, one entry per layer.
+///
+/// Empty at the start of a request and grown by the forward: the state has no
+/// sequence axis, so a round's rollback restores it from the tape rather than
+/// slicing it.
+///
+/// The gate is the caller's: a sidecar loop refuses an architecture without
+/// recurrent layers outright and always has a stack, while the two-model loops
+/// serve both kinds and hold `None` for a verifier or a draft model that reads
+/// the parameter and ignores it.
+#[must_use]
+pub(crate) fn lin_cache_stack(arch: &Architecture) -> Vec<LinearAttnCache> {
+    (0..arch.num_hidden_layers())
+        .map(|_| LinearAttnCache::new())
+        .collect()
+}
+
 /// What a round loop counted and timed, handed to the one place that records it.
 ///
 /// [`RoundStats`] is this plus the figures a loop does not carry as a counter,
@@ -97,8 +116,8 @@ pub(crate) struct RoundTotals {
     /// carries no conditioning buffer between rounds.
     pub(crate) conditioned_rows: Option<usize>,
     /// Whether the request ran with its phases charged — the same token the
-    /// loop's `rollback_round_caches` calls take, and the one decision a loop
-    /// makes about how its own work is attributed.
+    /// loop's [`rollback_round`] calls take, and the one decision a loop makes
+    /// about how its own work is attributed.
     pub(crate) charged: bool,
     /// Rounds the loop entered.
     pub(crate) rounds: usize,
@@ -192,6 +211,341 @@ pub(crate) fn log_request_record(
     round_stats(totals, emitted, seed_emitted, window).log_done();
 }
 
+/// Emit the tokens a round committed, and say whether one of them stopped the
+/// request.
+///
+/// The budget is the request's and not the round's: a round emits only what is
+/// still owed, so a block that overruns the last token leaves the surplus
+/// unemitted and leaves the acceptance — which the rollback reads — alone.
+///
+/// `decided_by` is EAGLE-3's per-token attribution: the buffer, and the length
+/// of this round's restricted-vocabulary prefix. Tokens before it were the
+/// drafter's own, confirmed by a restricted argmax; the rest were taken over
+/// the whole vocabulary. One entry per emitted token, and every other loop
+/// passes `None`.
+#[must_use = "the stop signal is the caller's: a round whose token ended the request \
+                  must not run another one"]
+pub(crate) fn emit_round_tokens(
+    tokenizer: &tokenizers::Tokenizer,
+    round_tokens: &[u32],
+    n_tokens: usize,
+    eos_ids: &[u32],
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    emitted: &mut Vec<ProbeStep>,
+    emitted_in_rounds: &mut usize,
+    window: &mut DecodeWindow,
+    decided_by: Option<(&mut Vec<DecidedBy>, usize)>,
+) -> bool {
+    let (mut decided_by, restricted) = match decided_by {
+        Some((buf, restricted)) => (Some(buf), restricted),
+        None => (None, 0),
+    };
+    for (i, &id) in round_tokens.iter().enumerate() {
+        if emitted.len() >= n_tokens {
+            break;
+        }
+        super::emit_step(tokenizer, id, step_fn, emitted, window);
+        if let Some(buf) = decided_by.as_mut() {
+            buf.push(if i < restricted {
+                DecidedBy::RestrictedVocab
+            } else {
+                DecidedBy::FullVocab
+            });
+        }
+        *emitted_in_rounds += 1;
+        if eos_ids.contains(&id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Length of `a`'s sequence axis, which every taped recurrence input carries at
+/// axis 1.
+fn seq_len(a: &Array) -> Result<i32> {
+    a.shape().get(1).copied().ok_or_else(|| {
+        Error::Model(format!(
+            "seq_len: a taped recurrence input carries its positions on axis 1, \
+             and this one has shape {:?}",
+            a.shape()
+        ))
+    })
+}
+
+/// `a[:, from..to, ...]` — a range of a taped recurrence input's positions.
+fn seq_range(a: &Array, from: i32, to: i32, device: Device) -> Result<Array> {
+    let len = seq_len(a)?;
+    if from < 0 || from > to || to > len {
+        return Err(Error::Model(format!(
+            "seq_range: positions {from}..{to} are not inside a taped input of \
+             length {len}"
+        )));
+    }
+    if from == 0 && to == len {
+        return a.try_clone();
+    }
+    let shape = a.shape();
+    let start: Vec<i32> = shape
+        .iter()
+        .enumerate()
+        .map(|(axis, _)| if axis == 1 { from } else { 0 })
+        .collect();
+    let stop: Vec<i32> = shape
+        .iter()
+        .enumerate()
+        .map(|(axis, &dim)| if axis == 1 { to } else { dim })
+        .collect();
+    a.slice(&start, &stop, &vec![1i32; shape.len()], device)
+}
+
+/// Rebuild every recurrent layer's state at `kept` positions into this round
+/// from the tape its forwards recorded.
+///
+/// `round_len` is how many positions the round fed. Each recurrent layer's tape
+/// must hold exactly that many, and this refuses the round rather than refolding
+/// when one does not: a tape that is short recorded fewer forwards than the
+/// round took — armed late, or a forward that ran with recording off — and
+/// refolding it would leave the recurrent state describing a different prefix
+/// from the K/V stack beside it, which no later call can detect and which shows
+/// up only as wrong tokens.
+///
+/// `lin` carries one slot per decoder layer, and on a hybrid most of them belong
+/// to full-attention layers that never touch a recurrence. Those record nothing
+/// and hold no state, and are skipped. Holding no state is what separates them
+/// from a recurrent layer whose forward failed to record: that one has a state
+/// this round advanced, and an empty tape for it is the defect above.
+fn refold_lin_tapes(
+    lin: &mut [LinearAttnCache],
+    round_len: usize,
+    kept: usize,
+    charge: bool,
+    device: Device,
+) -> Result<()> {
+    let mut refolded: Vec<Array> = Vec::new();
+    for (idx, cache) in lin.iter_mut().enumerate() {
+        let Some(tape) = cache.take_tape() else {
+            return Err(Error::Model(format!(
+                "refold_lin_tapes: recurrent layer {idx} has no round tape, so the \
+                 {round_len} positions this round fed through it were never recorded \
+                 and its state cannot be rolled back to {kept}"
+            )));
+        };
+        let taped = tape.positions();
+        if taped == 0 && cache.conv_state.is_none() && cache.delta_state.is_none() {
+            continue;
+        }
+        if taped != round_len {
+            return Err(Error::Model(format!(
+                "refold_lin_tapes: recurrent layer {idx} taped {taped} positions over \
+                 {} forwards but the round fed {round_len} — the tape does not describe \
+                 this round",
+                tape.segments().len(),
+            )));
+        }
+        let Some(state_in) = tape.state_in() else {
+            return Err(Error::Model(format!(
+                "refold_lin_tapes: recurrent layer {idx} taped {taped} positions with no \
+                 pre-round state"
+            )));
+        };
+        let conv = concat_tape_conv_input(&tape, device)?;
+        // What the conv1d carries into the next call is the `kernel - 1`
+        // positions before its next input, and the tape's conv input opens with
+        // exactly those, so the round's own carry sits at `kept`.
+        let pad = seq_len(&conv)? - taped as i32;
+        cache.conv_state = Some(seq_range(&conv, kept as i32, kept as i32 + pad, device)?);
+        cache.delta_state = Some(if kept == 0 {
+            state_in.try_clone()?
+        } else {
+            let (_y, state_out) = crate::gated_delta_msl::gated_delta_step_gpu(
+                &tape_prefix(&tape, |s| &s.q, kept, device)?,
+                &tape_prefix(&tape, |s| &s.k, kept, device)?,
+                &tape_prefix(&tape, |s| &s.v, kept, device)?,
+                &tape_prefix(&tape, |s| &s.g, kept, device)?,
+                &tape_prefix(&tape, |s| &s.beta, kept, device)?,
+                state_in,
+                device,
+            )?;
+            state_out
+        });
+        if charge {
+            // Nothing reads the refolded state until the next round's forward,
+            // so with nothing forcing it here the whole refold is billed to that
+            // round. See `phases_charged`. Issued for every layer first and
+            // waited on afterwards: draining each layer in turn would price the
+            // rollback at the cost of serialising it.
+            for a in [&cache.conv_state, &cache.delta_state]
+                .into_iter()
+                .flatten()
+            {
+                a.async_eval()?;
+                refolded.push(a.try_clone()?);
+            }
+        }
+    }
+    for a in &refolded {
+        a.eval()?;
+    }
+    Ok(())
+}
+
+/// The round's conv1d input across every taped forward, carried prefix included.
+///
+/// Each forward's input opens with the `kernel - 1` positions it carried in from
+/// its predecessor, and those are already in that predecessor's segment, so only
+/// the first segment contributes its prefix.
+fn concat_tape_conv_input(tape: &GdnTape, device: Device) -> Result<Array> {
+    let Some((first, rest)) = tape.segments().split_first() else {
+        return Err(Error::Model(
+            "concat_tape_conv_input: empty round tape".into(),
+        ));
+    };
+    if rest.is_empty() {
+        return first.conv_input.try_clone();
+    }
+    let pad = seq_len(&first.conv_input)? - first.len as i32;
+    let mut parts: Vec<Array> = Vec::with_capacity(rest.len() + 1);
+    parts.push(first.conv_input.try_clone()?);
+    for seg in rest {
+        let len = seq_len(&seg.conv_input)?;
+        parts.push(seq_range(&seg.conv_input, pad, len, device)?);
+    }
+    concatenate(&parts.iter().collect::<Vec<_>>(), 1, device)
+}
+
+/// One recurrence input over the round's first `kept` positions, joined across
+/// whatever forwards produced them.
+///
+/// `kept` is at most the tape's position count, checked by the caller.
+fn tape_prefix(
+    tape: &GdnTape,
+    field: fn(&GdnTapeSegment) -> &Array,
+    kept: usize,
+    device: Device,
+) -> Result<Array> {
+    let mut parts: Vec<Array> = Vec::new();
+    let mut taken = 0usize;
+    for seg in tape.segments() {
+        if taken >= kept {
+            break;
+        }
+        let want = (kept - taken).min(seg.len);
+        parts.push(seq_range(field(seg), 0, want as i32, device)?);
+        taken += want;
+    }
+    match parts.len() {
+        1 => parts
+            .pop()
+            .ok_or_else(|| Error::Model("tape_prefix: a one-part join lost its part".into())),
+        _ => concatenate(&parts.iter().collect::<Vec<_>>(), 1, device),
+    }
+}
+
+/// Roll one speculative round's caches back to `target_offset` after a partial
+/// acceptance — both the full-attention `kv` stack and, when the arch has one,
+/// the GDN recurrent state in `lin`.
+///
+/// `pre_round_offset` is the KV offset before this round's forwards ran;
+/// `round_tokens` are the tokens those forwards consumed, in order, so that
+/// `round_tokens[..target_offset - pre_round_offset]` is exactly the retained
+/// prefix.
+///
+/// **Full-attention arch** (`lin` empty or absent): every layer's KvCache
+/// carries the whole round, so dropping the rejected tail is the entire
+/// rollback.
+///
+/// **GDN hybrid**: the recurrent state has no sequence axis (see
+/// `LinearAttnCache`), so it cannot be sliced to an intermediate position. It is
+/// rebuilt instead, from the round tape the loop armed before its forwards:
+/// the recurrence inputs at the retained positions are the ones the forward
+/// already computed, so the state is refolded by the recurrence kernel over
+/// those alone. That reads no weights and takes no second forward, which is
+/// what makes a partly-accepted round cost the same as a fully accepted one.
+///
+/// The K/V stack is truncated straight to `target_offset` on both arms. A
+/// windowed layer therefore only ever has to give back this round's rejected
+/// tail, which is inside any ring's reach.
+///
+/// Private to this module, and reached only through [`rollback_round`], which
+/// is what decides the arm: this is the partial-accept side, and on a full
+/// accept there is nothing to roll back and the tapes are dropped instead. A
+/// loop that could name this could make a second charge decision beside the one
+/// it declares at its own call site, and nothing would read it.
+///
+/// `charge` is the calling loop's per-request answer from
+/// [`super::phases_charged`], not a decision this function makes. Seven loops share it
+/// and three of them time their phases; reading the switch here would change the
+/// schedule of the other four with nothing on their records saying so.
+fn rollback_round_caches(
+    kv: &mut [KvCache],
+    lin: Option<&mut [LinearAttnCache]>,
+    round_tokens: &[u32],
+    pre_round_offset: i32,
+    target_offset: i32,
+    charge: bool,
+    device: Device,
+) -> Result<()> {
+    let kept = (target_offset - pre_round_offset).max(0) as usize;
+    if kept > round_tokens.len() {
+        return Err(Error::Model(format!(
+            "rollback_round_caches: retained prefix {kept} exceeds the {} tokens the \
+             round consumed (pre_round_offset={pre_round_offset}, \
+             target_offset={target_offset}) — the caller's offsets do not describe \
+             this round",
+            round_tokens.len(),
+        )));
+    }
+    super::truncate_kv_to(kv, target_offset)?;
+    let Some(lin) = lin.filter(|l| !l.is_empty()) else {
+        return Ok(());
+    };
+    refold_lin_tapes(lin, round_tokens.len(), kept, charge, device)
+}
+
+/// Return a round's caches to the prefix the verifier kept, or drop the round
+/// tape when it kept all of it.
+///
+/// `pre_round_offset` is where the caches stood before they consumed
+/// `round_tokens`, so `pre_round_offset + round_tokens.len()` is where they
+/// stand now and a `target_offset` below it is a partial accept. On a partial
+/// accept the attention caches are truncated and the recurrent state — which
+/// has no sequence axis to slice — is refolded from the tape over the retained
+/// prefix; on a full accept nothing was dropped and the tape is discarded.
+///
+/// `charge` is the loop's own phase-charge decision, forwarded rather than
+/// made here: it belongs at the call site, beside the record that has to name
+/// the same one.
+///
+/// # Errors
+///
+/// [`rmlx_core::error::Error::Model`] when the refold cannot replay the
+/// retained prefix. The low-level rollback also refuses a prefix longer than
+/// the round fed, which cannot be reached from here: this arm is taken only
+/// when `target_offset` is inside the round.
+pub(crate) fn rollback_round(
+    kv: &mut [KvCache],
+    lin: Option<&mut [LinearAttnCache]>,
+    round_tokens: &[u32],
+    pre_round_offset: i32,
+    target_offset: i32,
+    charge: bool,
+    device: Device,
+) -> Result<()> {
+    if target_offset < pre_round_offset + round_tokens.len() as i32 {
+        return rollback_round_caches(
+            kv,
+            lin,
+            round_tokens,
+            pre_round_offset,
+            target_offset,
+            charge,
+            device,
+        );
+    }
+    super::disarm_lin_tapes(lin);
+    Ok(())
+}
+
 /// Emit a sidecar loop's seed token, and say whether it ended the request.
 ///
 /// Every sidecar loop argmaxes one bonus token out of its prefill forward and
@@ -202,6 +556,8 @@ pub(crate) fn log_request_record(
 /// it.
 ///
 /// The two-model loops do not call this: they emit nothing before a round.
+#[must_use = "the stop signal is the caller's: a seed that ended the request must not \
+                  be followed by a round"]
 pub(crate) fn emit_seed_token(
     tokenizer: &tokenizers::Tokenizer,
     seed: u32,

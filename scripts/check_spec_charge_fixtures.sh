@@ -38,30 +38,26 @@ loop_src() {
   fi
   cat <<RS
     while emitted.len() < n_tokens {
-        if v_target < v_offset_before {
-            super::rollback_round_caches(
-                &mut v_caches,
-                Some(&mut v_lin),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                // This loop's one charge decision, first of two calls.
-                $token,
-                device,
-            )?;
-        }
-        if d_target < d_offset_before {
-            super::rollback_round_caches(
-                &mut d_caches,
-                Some(&mut d_lin),
-                &d_fed,
-                d_pre_round_offset,
-                d_target,
-                // The same decision, at the draft-side rollback.
-                $token,
-                device,
-            )?;
-        }
+        super::rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_pre_round_offset,
+            v_target,
+            // This loop's one charge decision, first of two calls.
+            $token,
+            device,
+        )?;
+        super::rollback_round(
+            &mut d_caches,
+            Some(&mut d_lin),
+            &d_fed,
+            d_pre_round_offset,
+            d_target,
+            // The same decision, at the draft-side rollback.
+            $token,
+            device,
+        )?;
         super::RoundPhases {
             round_ns: 0,
             charged: $token,
@@ -140,6 +136,37 @@ pub(crate) fn emit_seed_token(
 RS
 }
 
+# The shared refold-or-disarm: it is not a round loop and it calls the low-level
+# rollback, which RULE 4 would once have read as a rollback moved out of a loop.
+# It names no decision — it forwards the `charge` its caller named — and the
+# needle is the call the loops make, so it is not a site.
+shared_rollback_src() {
+  cat <<'RS'
+pub(crate) fn rollback_round(
+    kv: &mut [KvCache],
+    lin: Option<&mut [LinearAttnCache]>,
+    round_tokens: &[u32],
+    pre_round_offset: i32,
+    target_offset: i32,
+    charge: bool,
+    device: Device,
+) -> Result<()> {
+    if target_offset < pre_round_offset + round_tokens.len() as i32 {
+        return rollback_round_caches(
+            kv,
+            lin,
+            round_tokens,
+            pre_round_offset,
+            target_offset,
+            charge,
+            device,
+        );
+    }
+    Ok(())
+}
+RS
+}
+
 # The entry guard: a driver's signature, no round, no `RoundTotals`. It delegates.
 dispatcher_src() {
   cat <<'RS'
@@ -174,8 +201,14 @@ build_root() {
     recorder_src
     printf '\n'
     seed_emit_src
-    printf '\nfn rollback_round_caches(\n    caches: &mut [KvCache],\n    lin: Option<&mut [LinearAttnCache]>,\n    fed: &[u32],\n    pre_round_offset: i32,\n    target: i32,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    Ok(())\n}\n'
   } >"$root/crates/rmlx-models/src/speculative/mod.rs"
+
+  {
+    printf '//! The shared refold-or-disarm, and the low-level pair beneath it.\n\n'
+    shared_rollback_src
+    printf '\nfn rollback_round_caches(\n    caches: &mut [KvCache],\n    lin: Option<&mut [LinearAttnCache]>,\n    fed: &[u32],\n    pre_round_offset: i32,\n    target: i32,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    refold_lin_tapes(lin, fed.len(), 0, charge, device)\n}\n'
+    printf '\nfn refold_lin_tapes(\n    lin: Option<&mut [LinearAttnCache]>,\n    round_len: usize,\n    kept: usize,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    Ok(())\n}\n'
+  } >"$root/crates/rmlx-models/src/speculative/round_common.rs"
 
   loop_src "mtp_generate" "charge_phases" "bind" \
     >"$root/crates/rmlx-models/src/speculative/mtp.rs"
@@ -254,7 +287,7 @@ run "a loop whose rollback and record disagree is refused" 1 \
 
 # 2. The same defect the other way round, on a loop that charges nothing.
 build_root "$root"
-perl -0pi -e 's/                false,\n                device,/                charge_phases,\n                device,/' \
+perl -0pi -e 's/            false,\n            device,/            charge_phases,\n            device,/' \
   "$root/crates/rmlx-models/src/speculative/eagle3.rs"
 run "a rollback that charges where the record does not is refused" 1 \
   "\`eagle3_generate\` names more than one charge decision"
@@ -309,7 +342,7 @@ run "a loop deleted moves the census" 1 \
 #    still records a decision; the gate can no longer follow the other half of
 #    it, and a loop it cannot follow is not a loop it checks.
 build_root "$root"
-perl -0pi -e 's/            super::rollback_round_caches\(\n(?:.*\n)*?            \)\?;/            roll_it(\&mut v_caches, false, device)?;/g' \
+perl -0pi -e 's/        super::rollback_round\(\n(?:.*\n)*?        \)\?;/        roll_it(\&mut v_caches, false, device)?;/g' \
   "$root/crates/rmlx-models/src/speculative/dflash.rs"
 cat >>"$root/crates/rmlx-models/src/speculative/dflash.rs" <<'RS'
 
@@ -331,7 +364,7 @@ run "a driver whose rollback is delegated to a helper is a scan error" 2 \
 # 10. A call the scan cannot read the arguments of. One line is a legal Rust
 #     shape and an unread call is not a checked one.
 build_root "$root"
-perl -0pi -e 's/            super::rollback_round_caches\(\n(?:.*\n)*?            \)\?;/            super::rollback_round_caches(\&mut v_caches, None, \&v_input, 0, 0, false, device)?;/' \
+perl -0pi -e 's/        super::rollback_round\(\n(?:.*\n)*?        \)\?;/        super::rollback_round(\&mut v_caches, None, \&v_input, 0, 0, false, device)?;/' \
   "$root/crates/rmlx-models/src/speculative/mtp.rs"
 run "a call written on one line is a scan error" 2 \
   "\`mtp_generate\` has a charge site this gate could not read"
@@ -339,7 +372,7 @@ run "a call written on one line is a scan error" 2 \
 # 11. A call with an argument dropped is read back at the wrong position, so the
 #     scan refuses it rather than reporting whatever landed there.
 build_root "$root"
-perl -0pi -e 's/                &v_input,\n//' \
+perl -0pi -e 's/            &v_input,\n//' \
   "$root/crates/rmlx-models/src/speculative/dflash2/round.rs"
 run "a call with an argument dropped is a scan error" 2 \
   "\`dflash2_generate\` has a charge site this gate could not read"
@@ -347,7 +380,7 @@ run "a call with an argument dropped is a scan error" 2 \
 # 12. Both spellings renamed: the loops are still derived and now carry no
 #     decision at all. A scan that found nothing must not pass.
 build_root "$root"
-perl -0pi -e 's/rollback_round_caches/rewind_round_caches/g; s/charged:/billed:/g' \
+perl -0pi -e 's/rollback_round\(/rewind_round(/g; s/charged:/billed:/g' \
   "$root/crates/rmlx-models/src/speculative"/*.rs \
   "$root/crates/rmlx-models/src/speculative/dflash2"/*.rs
 run "both charge spellings renamed away is a scan error" 2 \
@@ -394,7 +427,7 @@ run "a binding this gate cannot read is a scan error, not a RULE 2 refusal" 2 \
 # 18. Every rollback, not the first one. A loop's second call carrying the other
 #     decision is the same defect at a site a first-match scan never reaches.
 build_root "$root"
-perl -0pi -e 's/                \/\/ The same decision, at the draft-side rollback\.\n                charge_phases,/                \/\/ The same decision, at the draft-side rollback.\n                false,/' \
+perl -0pi -e 's/            \/\/ The same decision, at the draft-side rollback\.\n            charge_phases,/            \/\/ The same decision, at the draft-side rollback.\n            false,/' \
   "$root/crates/rmlx-models/src/speculative/mtp.rs"
 run "a second rollback call carrying the other decision is refused" 1 \
   "\`mtp_generate\` names more than one charge decision"
@@ -478,7 +511,46 @@ perl -0pi -e 's/    log_request_record\(totals, emitted, emitted\.len\(\), windo
 run "a helper that builds its own totals joins the population and is refused" 2 \
   "\`emit_seed_token\` has 0 rollback and 1 record charge sites."
 
-# 27. The defect the gate exists for, at the seam the record moved to: the
+# 27. RULE 6: a loop that keeps its readable `rollback_round` call and reaches
+#     past it to the low-level rollback underneath. Every token this gate reads
+#     still agrees; the second decision is at a call it does not open. This is
+#     the shape the needle move to `rollback_round(` would otherwise have let
+#     through, and in the tree the same shape does not compile — the low-level
+#     rollback is private to `round_common`.
+build_root "$root"
+perl -0pi -e 's/        super::RoundPhases \{/        super::rollback_round_caches(\n            \&mut v_caches,\n            None,\n            \&v_input,\n            0,\n            0,\n            false,\n            device,\n        )?;\n        super::RoundPhases {/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a loop reaching past the shared rollback to the low-level one is a scan error" 2 \
+  "\`mtp_generate\` makes 1 call(s) to the low-level"
+
+# 28. RULE 6 by file: a helper one hop from a loop, which a
+#     fn-shaped rule read as a non-driver and let through. The loop's own
+#     `rollback_round` call still reads clean and still carries `false`.
+build_root "$root"
+cat >>"$root/crates/rmlx-models/src/speculative/dflash.rs" <<'RS'
+
+fn refold_it(lin: Option<&mut [LinearAttnCache]>, device: Device) -> Result<()> {
+    refold_lin_tapes(lin, 3, 2, true, device)
+}
+RS
+run "a helper one hop from a loop naming the low-level rollback is a scan error" 2 \
+  "\`refold_it\` makes 1 call(s) to the low-level"
+
+# 29. RULE 6 by fn: a round loop that lives in `round_common.rs`, which is where
+#     the shared skeleton is going. The file's exemption is for the code beneath
+#     `rollback_round`, not for a loop that happens to sit beside it, and its own
+#     `rollback_round` call still reads clean and still carries `false`.
+build_root "$root"
+{
+  printf '\n'
+  loop_src "round_common_generate" "false" "plain"
+} >>"$root/crates/rmlx-models/src/speculative/round_common.rs"
+perl -0pi -e 's/(fn round_common_generate\((?:.*\n)*?)    while emitted/$1    refold_lin_tapes(None, 3, 2, true, device)?;\n    while emitted/' \
+  "$root/crates/rmlx-models/src/speculative/round_common.rs"
+run "a round loop in round_common.rs is read for the low-level rollback too" 2 \
+  "\`round_common_generate\` makes 1 call(s) to the low-level"
+
+# 30. The defect the gate exists for, at the seam the record moved to: the
 #     totals handed over say the round was charged and the rollbacks say it was
 #     not. Every token and every count the loop reports is unchanged.
 build_root "$root"

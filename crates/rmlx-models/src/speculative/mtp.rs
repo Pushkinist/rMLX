@@ -48,13 +48,13 @@ use std::path::Path;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, concatenate, Array, Device};
 
-use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
+use super::{DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
-    RoundTotals,
+    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
+    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
 };
 use rmlx_kv_quant::{KvCache, KvQuant};
 
@@ -649,7 +649,6 @@ pub fn mtp_generate(
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
 ) -> Result<(Vec<ProbeStep>, usize)> {
-    use rmlx_kv_quant::LinearAttnCache;
     use std::time::Instant;
 
     if prompt_ids.len() < 2 {
@@ -676,9 +675,7 @@ pub fn mtp_generate(
 
     let (kv_quant, _, mut v_caches) =
         verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
-    let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
-        .map(|_| LinearAttnCache::new())
-        .collect();
+    let mut v_lin = lin_cache_stack(verifier);
 
     drafter.reset();
 
@@ -833,18 +830,17 @@ pub fn mtp_generate(
         total_accept += accept;
 
         // -- Emit accepted prefix + 1 correction/bonus. --
-        let mut hit_eos = false;
-        for &id in &new_tokens {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            emitted_in_rounds += 1;
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
+        let hit_eos = emit_round_tokens(
+            tokenizer,
+            &new_tokens,
+            n_tokens,
+            eos_ids,
+            step_fn,
+            &mut emitted,
+            &mut emitted_in_rounds,
+            &mut window,
+            None,
+        );
         if hit_eos {
             break;
         }
@@ -858,20 +854,15 @@ pub fn mtp_generate(
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
         let v_target =
             super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        if v_target < v_offset_before {
-            let v_pre_round_offset = v_offset_before - v_k as i32;
-            super::rollback_round_caches(
-                &mut v_caches,
-                Some(&mut v_lin),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                charge_phases,
-                device,
-            )?;
-        } else {
-            super::disarm_lin_tapes(Some(&mut v_lin));
-        }
+        rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_offset_before - v_k as i32,
+            v_target,
+            charge_phases,
+            device,
+        )?;
 
         // Sidecar KV rollback: this round the head wrote `bs - 1` slots starting
         // at `draft_start` — slot `draft_start+0` holds the carry seed `b`, then

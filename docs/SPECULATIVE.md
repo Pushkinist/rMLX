@@ -146,10 +146,10 @@ loop until n_tokens emitted:
   # Phase D — cache rollback (one helper, both sides)
   v_drop = K - accept          # positions to discard from verifier cache
   d_drop = max(K - accept - 1, 0)
-  rollback_round_caches(verifier_caches, verifier_lin,
-                        v_input, v_pre_round_offset, offset - v_drop)
-  rollback_round_caches(draft_caches, draft_lin,
-                        d_fed, d_pre_round_offset, offset - d_drop)
+  rollback_round(verifier_caches, verifier_lin,
+                 v_input, v_pre_round_offset, offset - v_drop)
+  rollback_round(draft_caches, draft_lin,
+                 d_fed, d_pre_round_offset, offset - d_drop)
 
   if accept == K:
     ds = [last_draft, y]   # draft cache lagged one position — prepend dK
@@ -282,7 +282,7 @@ host bookkeeping. The four phases are disjoint sub-spans of the round, so
 claiming more than the round has means a timer started outside it — that is an
 `error!` naming the phases rather than an `other_ms` near zero that reads like
 rounding. `refolded` says whether that round took the recurrent arm of
-`rollback_round_caches`.
+`rollback_round`.
 
 `charged` is the field that says how to read the rest. At `debug` the phases are
 timed but not forced, so the lazy tails above still move between them. At
@@ -296,12 +296,12 @@ charged run's `round_ms` against an uncharged one's before trusting either.
 
 **The decision is the loop's, made once per request, and it travels on the
 record.** `phases_charged()` is read at the loop head and passed down — to
-`rollback_round_caches` as an argument, and onto the `charged` of the
+`rollback_round` as an argument, and onto the `charged` of the
 `RoundTotals` each loop hands
 [`round_common::log_request_record`](../crates/rmlx-models/src/speculative/round_common.rs),
 the one place a `RoundStats` is assembled, so it reaches the `done` line every
 loop writes. Two things depend on that.
-`rollback_round_caches` is shared by eight call sites across seven loops and
+`rollback_round` is shared by nine call sites across seven loops and
 only three of those loops time their phases; a switch it read on its own behalf would change how the other four
 schedule work, with nothing on their records saying so — they pass `false` and
 report `charged=false`.
@@ -325,7 +325,7 @@ change to a round loop's phase spans.
 charged: the Gemma4 MTP assistant, the Qwen3.5-family MTP sidecar and DFlash 2.
 The other four — DFlash 1, EAGLE-3 and the two two-model loops — keep only the
 request-level `draft_ms` and `verifier_ms`, pass `false` to
-`rollback_round_caches` and report `charged=false`, so **their drafter figure
+`rollback_round` and report `charged=false`, so **their drafter figure
 carries the same inflation and no setting corrects it**. DFlash 1's round has
 the same four phases as DFlash 2's and giving it the instrument is a port of
 that one. EAGLE-3's is not: its drafter re-runs over the accepted prefix in a
@@ -535,20 +535,21 @@ state is recorded once, at the first. `GdnTape` in
 `crates/rmlx-kv-quant/src/linear_attn.rs` holds both shapes.
 
 Every round loop that can partially accept goes through **one** implementation —
-`speculative::rollback_round_caches`. A full-attention arch (`lin` absent or
-empty) truncates and stops; a GDN hybrid also refolds. Its eight call sites are
-`mtp_generate`, `dflash_generate`, `dflash2_generate`, `eagle3_generate`,
-`mtp_assistant_generate` (full attention, so truncation only) and the classic
-two-model loop's three recurrent ones — greedy verifier, greedy drafter and
-stochastic verifier — plus the stochastic drafter. There is deliberately no
+`speculative::round_common::rollback_round`, which decides the arm and, on a
+partial accept, calls the low-level `rollback_round_caches` beside it. A
+full-attention arch (`lin` absent or empty) truncates and stops; a GDN hybrid
+also refolds. Its nine call sites are `mtp_generate`, `dflash_generate`,
+`dflash2_generate`, `eagle3_generate`, `mtp_assistant_generate` (full attention,
+so truncation only) and the two-model loops' four — greedy verifier, greedy
+drafter, stochastic verifier and stochastic drafter. There is deliberately no
 second copy: the defect the replay was written to fix lived in four independent
 implementations at once, and a rollback inlined per loop is how it got there.
 
 The refold is checked against the replay it replaced —
 `a_round_tape_refolds_to_what_the_replay_produced` in
-`crates/rmlx-models/src/speculative/tests.rs` — on a dense hybrid and a mixture
-one, for a round taken as one verify forward and one taken as a forward per
-token. On the dense hybrid the two agree bit for bit at every accepted length.
+`crates/rmlx-models/src/speculative/round_common_tests.rs` — on a dense hybrid
+and a mixture one, for a round taken as one verify forward and one taken as a
+forward per token. On the dense hybrid the two agree bit for bit at every accepted length.
 On the mixture they agree to about 2-4% relative, which is that stack's own
 disagreement between computing the round in one forward and stepping it: the
 test measures that disagreement in the same process and holds the refold to it,
@@ -657,9 +658,9 @@ values against the mlx-lm reference output.
 
 **GDN-aware rollback.** The Qwen3.6-MoE verifier carries GDN (GatedDeltaNet)
 recurrent layers in addition to its KV cache. The loop arms a round tape on them
-before the verify forward, and on partial acceptance `rollback_round_caches`
-refolds the accepted prefix out of it to re-align the recurrent state with the
-truncated KV cache.
+before the verify forward, and on partial acceptance `rollback_round` refolds
+the accepted prefix out of it to re-align the recurrent state with the truncated
+KV cache.
 
 **Accumulated conditioning context.** The drafter conditions on the
 accumulated verifier hidden across all rounds (equivalent to the Python
@@ -824,8 +825,8 @@ Per-step trace is available via `RUST_LOG=rmlx_models::speculative::eagle3=trace
 The classic form: a smaller full model of the verifier's family proposes, the
 verifier scores. Nothing hooks into the verifier's forward pass — the draft is
 loaded as its own `Architecture`, keeps its own KV (and, on a GDN hybrid, its
-own recurrent state), and is rolled back through the same
-`rollback_round_caches` as the verifier. Any registered architecture can be the
+own recurrent state), and is rolled back through the same `rollback_round` as
+the verifier. Any registered architecture can be the
 draft, subject to the checks below; a pair of the same architecture is the
 normal case (`gemma-4-e4b` drafted by `gemma-4-e2b`, `Qwen3.8-27B` drafted by
 `ornith-1.0-9b`).
@@ -1083,8 +1084,8 @@ between chunks the KV cache state is flushed via `eval_prefill_state`. The
 
 A round tape is armed on the GDN recurrent state before every draft round with
 `arm_lin_tapes`, and dropped with `disarm_lin_tapes` when the round is fully
-accepted. On partial acceptance (`accept < K`), `rollback_round_caches` truncates
-the KV caches to the retained target and refolds the accepted prefix into the
+accepted. On partial acceptance (`accept < K`), `rollback_round` truncates the
+KV caches to the retained target and refolds the accepted prefix into the
 recurrent state from the tape — no second forward, and no weights read. See the
 partial-accept rollback section above.
 
@@ -1608,7 +1609,7 @@ drafter's window reaches back over (2047 here) — the depth the reference
 conditions on, not the last prompt token alone — then per round drafts a block,
 scores the carry token and every proposal in one verify forward, accepts the
 agreed prefix through the shared `accept_prefix`, and rolls the caches back over
-the rest through the shared `rollback_round_caches`. The block is the one the
+the rest through the shared `rollback_round`. The block is the one the
 drafter was trained at every round; only the token budget shortens it, so this
 loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
 

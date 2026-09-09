@@ -4,8 +4,8 @@
 //! the shape every sidecar loop in this module family has — prefill, a bonus
 //! token out of the prefill forward, then rounds of draft / verify / accept /
 //! roll back — so it shares [`crate::speculative::accept_prefix`],
-//! `rollback_round_caches` and [`crate::speculative::VerifierDraw`] with them
-//! rather than restating any of it.
+//! `round_common::rollback_round` and [`crate::speculative::VerifierDraw`] with
+//! them rather than restating any of it.
 //!
 //! # Conditioning: the K/V is recomputed, the projection is carried
 //!
@@ -48,16 +48,15 @@ use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
-    RoundTotals,
+    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
+    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
 };
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
-    conditioning_residual, disarm_lin_tapes, emit_step, guard_round_conditioning,
-    guard_verifier_prefill_logits, phases_charged, rollback_round_caches,
+    conditioning_residual, guard_round_conditioning, guard_verifier_prefill_logits, phases_charged,
     rollback_target_from_tail, round_block, DecodeWindow, RoundPhases, SpecLoop, VerifierDraw,
 };
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+use rmlx_kv_quant::{KvCache, KvQuant};
 
 /// Prompt positions per verifier prefill pass.
 ///
@@ -141,9 +140,7 @@ pub fn dflash2_generate(
 
     let (kv_quant, _, mut v_caches) =
         verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
-    let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
-        .map(|_| LinearAttnCache::new())
-        .collect();
+    let mut v_lin = lin_cache_stack(verifier);
 
     let mut draw = VerifierDraw::new(sampler_cfg);
 
@@ -338,18 +335,17 @@ pub fn dflash2_generate(
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
 
-        let mut hit_eos = false;
-        for &id in &new_tokens {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            emitted_in_rounds += 1;
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
+        let hit_eos = emit_round_tokens(
+            tokenizer,
+            &new_tokens,
+            n_tokens,
+            eos_ids,
+            step_fn,
+            &mut emitted,
+            &mut emitted_in_rounds,
+            &mut window,
+            None,
+        );
         if hit_eos {
             break;
         }
@@ -361,20 +357,15 @@ pub fn dflash2_generate(
         let v_offset_before = v_caches.iter().map(KvCache::offset).max().unwrap_or(0);
         let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
         let refolded = v_target < v_offset_before;
-        if refolded {
-            let v_pre_round_offset = v_offset_before - v_k as i32;
-            rollback_round_caches(
-                &mut v_caches,
-                Some(&mut v_lin),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                charge_phases,
-                device,
-            )?;
-        } else {
-            disarm_lin_tapes(Some(&mut v_lin));
-        }
+        rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_offset_before - v_k as i32,
+            v_target,
+            charge_phases,
+            device,
+        )?;
         let round_rollback_ns = t0.elapsed().as_nanos();
 
         // The carry token and the accepted proposals.

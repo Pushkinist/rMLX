@@ -69,13 +69,13 @@ use rmlx_mlx::{
     Array, Device, Dtype,
 };
 
-use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
+use super::{DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
-    RoundTotals,
+    emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
+    rollback_round, verifier_cache_stack, RoundTotals,
 };
 
 /// One drafter decoder layer (Gemma4 shape, Q-only - K/V are shared).
@@ -905,18 +905,17 @@ pub fn mtp_assistant_generate(
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
         // -- Emit accepted prefix + 1 correction/bonus. --
-        let mut hit_eos = false;
-        for &id in &new_tokens {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            emitted_in_rounds += 1;
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
+        let hit_eos = emit_round_tokens(
+            tokenizer,
+            &new_tokens,
+            n_tokens,
+            eos_ids,
+            step_fn,
+            &mut emitted,
+            &mut emitted_in_rounds,
+            &mut window,
+            None,
+        );
         if hit_eos {
             break;
         }
@@ -927,17 +926,15 @@ pub fn mtp_assistant_generate(
         let t0 = Instant::now();
         let v_target = super::rollback_target_from_head(pre_round_offset, accept);
         let rejected = v_k as i32 - (accept as i32 + 1);
-        if rejected > 0 {
-            super::rollback_round_caches(
-                &mut caches,
-                None,
-                &verify_input,
-                pre_round_offset,
-                v_target,
-                charge_phases,
-                device,
-            )?;
-        }
+        rollback_round(
+            &mut caches,
+            None,
+            &verify_input,
+            pre_round_offset,
+            v_target,
+            charge_phases,
+            device,
+        )?;
 
         // Next hidden = verifier penultimate at the accepted position, then
         // final-normed (speculative_draft_hidden) for the drafter conditioning.
