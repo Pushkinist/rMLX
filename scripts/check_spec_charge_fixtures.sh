@@ -87,12 +87,8 @@ RS
 # loop, and condition (a) of the derivation is the only thing that says so.
 stats_helper_src() {
   cat <<'RS'
-pub fn summarise_rounds(rounds: usize, accepted: usize) -> RoundTotals {
-    RoundTotals {
-        loop_kind: SpecLoop::Kind,
-        rounds,
-        charged: false,
-    }
+pub fn summarise_rounds(rounds: usize, totals: &RoundTotals) -> RoundTotals {
+    RoundTotals { rounds, ..*totals }
 }
 RS
 }
@@ -413,7 +409,33 @@ perl -0pi -e 's/\) -> Result<\(\)> \{/) -> Result<()>\nwhere\n    D: Drafter,\n{
 run "a loop with a \`where\` clause is still read" 0 \
   "7 speculative round loops, each naming one charge decision"
 
-# 23. Condition (b) is what keeps the shared seed emit out of the population,
+# 23. RULE 5, at the shape that opened it: the recorder reading the decision off
+#     the totals it was handed. The value is unreadable to this scan, and an
+#     unreadable value was refused only inside a round loop — so a helper that
+#     dropped the decision on the way through was a clean run.
+build_root "$root"
+perl -0pi -e 's/    log_request_record\(totals, emitted, emitted\.len\(\), window\);/    log_request_record(totals, emitted, emitted.len(), window);\n    let _ = Record { charged: totals.charged };/' \
+  "$root/crates/rmlx-models/src/speculative/mod.rs"
+run "a helper reading the decision off the totals it was handed is refused" 1 \
+  "\`emit_seed_token\` writes 1 \`charged:\` field(s)"
+
+# 24. The same rule with a value the scan can read. A decision named outside a
+#     round loop has no rollback beside it to be held to, whether or not the
+#     token is legible.
+build_root "$root"
+cat >>"$root/crates/rmlx-models/src/speculative/mtp.rs" <<'RS'
+
+fn summarise_uncharged(rounds: usize) -> super::RoundStats {
+    super::RoundStats {
+        rounds,
+        charged: false,
+    }
+}
+RS
+run "a decision named outside a round loop is refused" 1 \
+  "\`summarise_uncharged\` writes 1 \`charged:\` field(s) — false —"
+
+# 25. Condition (b) is what keeps the shared seed emit out of the population,
 #     and nothing else does: it carries a driver's signature. Give it totals of
 #     its own and it joins, with no rollback in it for the gate to read against.
 build_root "$root"
@@ -422,7 +444,7 @@ perl -0pi -e 's/    log_request_record\(totals, emitted, emitted\.len\(\), windo
 run "a helper that builds its own totals joins the population and is refused" 2 \
   "\`emit_seed_token\` has 0 rollback and 1 record charge sites."
 
-# 24. The defect the gate exists for, at the seam the record moved to: the
+# 26. The defect the gate exists for, at the seam the record moved to: the
 #     totals handed over say the round was charged and the rollbacks say it was
 #     not. Every token and every count the loop reports is unchanged.
 build_root "$root"

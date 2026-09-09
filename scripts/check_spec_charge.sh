@@ -57,6 +57,14 @@
 #   census that moved, which invites the census to be edited; both are exit 2
 #   here instead.
 #
+# RULE 5 (nothing names the decision outside the population either)
+#   A fn that is not a round loop and carries a `charged:` field names a
+#   decision this gate cannot check against a rollback, because there is none in
+#   it. The shared recorder is the one fn allowed to write the field at all, and
+#   it does so from a destructured binding — `charged,` — which is not a
+#   `charged:` site, so a `charged:` outside a round loop is a decision made
+#   where nothing can hold it to the loop that ordered it.
+#
 # RULE 3 (the population)
 #   Across the round loops, the multiset of those tokens is exactly
 #   `charge_phases` three times and `false` four times. This is a census, not a
@@ -252,6 +260,8 @@ records=$(
 drivers=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1')
 # RULE 4: a fn that is not a round loop and rolls a round's caches back.
 orphans=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 0 && $4 > 0')
+# RULE 5: a fn that is not a round loop and writes a `charged:` field.
+strays=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 0 && $5 > 0')
 
 if [ -z "$drivers" ]; then
   note "check-spec-charge: found no round loop under ${loops_dir#"$root"/}."
@@ -273,6 +283,15 @@ while IFS=$'\t' read -r file fn _driver _nroll _nrec _bind _tokens; do
   note "  moved, and editing the census would bury either."
   scan_error=1
 done <<<"$orphans"
+
+while IFS=$'\t' read -r file fn _driver _nroll nrec _bind tokens; do
+  [ -n "$fn" ] || continue
+  note "check-spec-charge: ${file#"$root"/}: \`$fn\` writes $nrec \`charged:\` field(s) — $tokens —"
+  note "  and is not a round loop, so no rollback in it says whether that is the decision"
+  note "  the loop ordered. The one fn that may write the field is the shared recorder,"
+  note "  which carries it across as a destructured \`charged,\` and names no value here."
+  fail=1
+done <<<"$strays"
 
 while IFS=$'\t' read -r file fn _driver nroll nrec bind tokens; do
   [ -n "$fn" ] || continue

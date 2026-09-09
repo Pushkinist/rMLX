@@ -118,7 +118,7 @@ pub(crate) struct RoundTotals {
     pub(crate) t_total: Instant,
 }
 
-/// Record one speculative request, once.
+/// The record a round loop's totals describe.
 ///
 /// Three figures are read here rather than carried: the tokens the loop handed
 /// the sink, the request's wall-clock, and the decode-window rate.
@@ -128,31 +128,64 @@ pub(crate) struct RoundTotals {
 /// reads it off its own local, and a request that stopped on its seed reads it
 /// off the buffer. Whether a loop emits a token before its rounds is a
 /// measurement either way, never a per-loop constant.
+///
+/// Separate from [`log_request_record`] because a mapping that returns its
+/// record can be read without a model, and nothing else in the tree can read
+/// it: a record is a `done` line, so a field written from the wrong place is a
+/// plausible row and no failure. `round_common_tests.rs` is what reads it.
+///
+/// `RoundTotals` is destructured rather than read field by field, so a field
+/// added to it and not carried across is a compile error and not a value left
+/// quietly behind.
+pub(crate) fn round_stats(
+    totals: &RoundTotals,
+    emitted: &[ProbeStep],
+    seed_emitted: usize,
+    window: &DecodeWindow,
+) -> RoundStats {
+    let &RoundTotals {
+        loop_kind,
+        block_size,
+        conditioned_rows,
+        charged,
+        rounds,
+        emitted_in_rounds,
+        total_draft,
+        total_accept,
+        prefill_ns,
+        draft_ns,
+        verifier_ns,
+        round_loop_ns,
+        t_total,
+    } = totals;
+    RoundStats {
+        loop_kind,
+        block_size,
+        rounds,
+        emitted: emitted.len(),
+        emitted_in_rounds,
+        seed_emitted,
+        conditioned_rows,
+        total_draft,
+        total_accept,
+        prefill_ns,
+        draft_ns,
+        verifier_ns,
+        round_loop_ns,
+        elapsed_ns: t_total.elapsed().as_nanos(),
+        decode_tps: window.tps(),
+        charged,
+    }
+}
+
+/// Record one speculative request, once.
 pub(crate) fn log_request_record(
     totals: &RoundTotals,
     emitted: &[ProbeStep],
     seed_emitted: usize,
     window: &DecodeWindow,
 ) {
-    RoundStats {
-        loop_kind: totals.loop_kind,
-        block_size: totals.block_size,
-        rounds: totals.rounds,
-        emitted: emitted.len(),
-        emitted_in_rounds: totals.emitted_in_rounds,
-        seed_emitted,
-        conditioned_rows: totals.conditioned_rows,
-        total_draft: totals.total_draft,
-        total_accept: totals.total_accept,
-        prefill_ns: totals.prefill_ns,
-        draft_ns: totals.draft_ns,
-        verifier_ns: totals.verifier_ns,
-        round_loop_ns: totals.round_loop_ns,
-        elapsed_ns: totals.t_total.elapsed().as_nanos(),
-        decode_tps: window.tps(),
-        charged: totals.charged,
-    }
-    .log_done();
+    round_stats(totals, emitted, seed_emitted, window).log_done();
 }
 
 /// Emit a sidecar loop's seed token, and say whether it ended the request.
@@ -203,3 +236,7 @@ pub(crate) fn report_verifier_kv_bytes(
         + lin.map_or(0, |l| l.iter().map(LinearAttnCache::resident_bytes).sum());
     verifier.store_kv_cache_bytes(bytes, crate::decode_loop::PostDecode::seal());
 }
+
+#[cfg(test)]
+#[path = "round_common_tests.rs"]
+mod round_common_tests;
