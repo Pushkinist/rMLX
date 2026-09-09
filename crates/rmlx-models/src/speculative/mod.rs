@@ -51,6 +51,7 @@ use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{GdnTape, GdnTapeSegment, KvCache, KvQuant, LinearAttnCache};
+pub(crate) use round_common::RoundTotals;
 pub(crate) use round_stats::{phases_charged, RoundPhases, RoundStats, SpecLoop};
 
 /// Guard the one verifier logit row a speculative driver selects from at
@@ -88,18 +89,6 @@ pub(crate) fn guard_verifier_prefill_logits(
         max_abs_logit,
         prompt_len,
     )
-}
-
-/// Resident KV bytes held by a verifier's own caches.
-///
-/// Same basis as the per-arch `generate_greedy` byte total: the attention
-/// caches plus, on hybrid archs, the recurrent linear-attention state. Only the
-/// verifier's caches count — the draft's are an implementation detail of the
-/// accelerator, and including them would make a speculative row incomparable
-/// with the ordinary row for the same model and context.
-pub(crate) fn verifier_kv_bytes(kv: &[KvCache], lin: Option<&[LinearAttnCache]>) -> u64 {
-    kv.iter().map(KvCache::resident_bytes).sum::<u64>()
-        + lin.map_or(0, |l| l.iter().map(LinearAttnCache::resident_bytes).sum())
 }
 
 /// Whether two snapshot paths name the same directory.
@@ -824,25 +813,26 @@ impl SpeculativeDispatcher {
                 }
             }
             if hit_eos {
-                RoundStats {
-                    loop_kind: SpecLoop::TwoModelGreedy,
-                    block_size: k + 1,
-                    rounds,
-                    emitted: emitted.len(),
+                round_common::log_request_record(
+                    &RoundTotals {
+                        loop_kind: SpecLoop::TwoModelGreedy,
+                        block_size: k + 1,
+                        conditioned_rows: None,
+                        charged: false,
+                        rounds,
+                        emitted_in_rounds,
+                        total_draft: total_draft_tokens,
+                        total_accept: total_accept_count,
+                        prefill_ns,
+                        draft_ns,
+                        verifier_ns,
+                        round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+                        t_total,
+                    },
+                    &emitted,
                     seed_emitted,
-                    emitted_in_rounds,
-                    conditioned_rows: None,
-                    total_draft: total_draft_tokens,
-                    total_accept: total_accept_count,
-                    prefill_ns,
-                    draft_ns,
-                    verifier_ns,
-                    round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-                    elapsed_ns: t_total.elapsed().as_nanos(),
-                    decode_tps: window.tps(),
-                    charged: false,
-                }
-                .log_done();
+                    &window,
+                );
                 return Ok((emitted, widest_draft));
             }
 
@@ -949,33 +939,31 @@ impl SpeculativeDispatcher {
             );
         }
 
-        RoundStats {
-            loop_kind: SpecLoop::TwoModelGreedy,
-            block_size: k + 1,
-            rounds,
-            emitted: emitted.len(),
+        round_common::log_request_record(
+            &RoundTotals {
+                loop_kind: SpecLoop::TwoModelGreedy,
+                block_size: k + 1,
+                conditioned_rows: None,
+                charged: false,
+                rounds,
+                emitted_in_rounds,
+                total_draft: total_draft_tokens,
+                total_accept: total_accept_count,
+                prefill_ns,
+                draft_ns,
+                verifier_ns,
+                round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+                t_total,
+            },
+            &emitted,
             seed_emitted,
-            emitted_in_rounds,
-            conditioned_rows: None,
-            total_draft: total_draft_tokens,
-            total_accept: total_accept_count,
-            prefill_ns,
-            draft_ns,
-            verifier_ns,
-            round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-            elapsed_ns: t_total.elapsed().as_nanos(),
-            decode_tps: window.tps(),
-            charged: false,
-        }
-        .log_done();
+            &window,
+        );
 
-        // Report the verifier's resident KV, so a caller that sampled the
-        // verifier arch around this call can attribute the figure to it. This
-        // path never goes through `Architecture::generate_greedy`, so nothing
-        // else writes it.
-        self.verifier.store_kv_cache_bytes(
-            verifier_kv_bytes(&verifier_caches, verifier_lin.as_deref()),
-            crate::decode_loop::PostDecode::seal(),
+        round_common::report_verifier_kv_bytes(
+            &self.verifier,
+            &verifier_caches,
+            verifier_lin.as_deref(),
         );
 
         Ok((emitted, widest_draft))
@@ -1241,25 +1229,26 @@ impl SpeculativeDispatcher {
                 }
             }
             if hit_eos {
-                RoundStats {
-                    loop_kind: SpecLoop::TwoModelStochastic,
-                    block_size: k + 1,
-                    rounds,
-                    emitted: emitted.len(),
+                round_common::log_request_record(
+                    &RoundTotals {
+                        loop_kind: SpecLoop::TwoModelStochastic,
+                        block_size: k + 1,
+                        conditioned_rows: None,
+                        charged: false,
+                        rounds,
+                        emitted_in_rounds,
+                        total_draft: total_draft_tokens,
+                        total_accept: total_accept_count,
+                        prefill_ns,
+                        draft_ns,
+                        verifier_ns,
+                        round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+                        t_total,
+                    },
+                    &emitted,
                     seed_emitted,
-                    emitted_in_rounds,
-                    conditioned_rows: None,
-                    total_draft: total_draft_tokens,
-                    total_accept: total_accept_count,
-                    prefill_ns,
-                    draft_ns,
-                    verifier_ns,
-                    round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-                    elapsed_ns: t_total.elapsed().as_nanos(),
-                    decode_tps: window.tps(),
-                    charged: false,
-                }
-                .log_done();
+                    &window,
+                );
                 return Ok((emitted, widest_draft));
             }
 
@@ -1335,31 +1324,31 @@ impl SpeculativeDispatcher {
             );
         }
 
-        RoundStats {
-            loop_kind: SpecLoop::TwoModelStochastic,
-            block_size: k + 1,
-            rounds,
-            emitted: emitted.len(),
+        round_common::log_request_record(
+            &RoundTotals {
+                loop_kind: SpecLoop::TwoModelStochastic,
+                block_size: k + 1,
+                conditioned_rows: None,
+                charged: false,
+                rounds,
+                emitted_in_rounds,
+                total_draft: total_draft_tokens,
+                total_accept: total_accept_count,
+                prefill_ns,
+                draft_ns,
+                verifier_ns,
+                round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+                t_total,
+            },
+            &emitted,
             seed_emitted,
-            emitted_in_rounds,
-            conditioned_rows: None,
-            total_draft: total_draft_tokens,
-            total_accept: total_accept_count,
-            prefill_ns,
-            draft_ns,
-            verifier_ns,
-            round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-            elapsed_ns: t_total.elapsed().as_nanos(),
-            decode_tps: window.tps(),
-            charged: false,
-        }
-        .log_done();
+            &window,
+        );
 
-        // See the greedy path: the verifier's own resident KV, reported so the
-        // caller can attribute it to this call.
-        self.verifier.store_kv_cache_bytes(
-            verifier_kv_bytes(&verifier_caches, verifier_lin.as_deref()),
-            crate::decode_loop::PostDecode::seal(),
+        round_common::report_verifier_kv_bytes(
+            &self.verifier,
+            &verifier_caches,
+            verifier_lin.as_deref(),
         );
 
         Ok((emitted, widest_draft))

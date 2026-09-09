@@ -73,7 +73,10 @@ use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
-use crate::speculative::round_common::verifier_cache_stack;
+use crate::speculative::round_common::{
+    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
+    RoundTotals,
+};
 
 /// One drafter decoder layer (Gemma4 shape, Q-only - K/V are shared).
 #[allow(missing_debug_implementations)]
@@ -807,32 +810,31 @@ pub fn mtp_assistant_generate(
     let mut hidden = verifier.apply_final_norm(&hidden_raw, device)?;
 
     // Emit the first bonus.
-    {
-        emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
-        if eos_ids.contains(&b) {
-            // The stop token arrived before a round could run. The request
-            // still happened, so it still leaves exactly one record.
-            super::RoundStats {
-                loop_kind: super::SpecLoop::MtpAssistant,
-                block_size,
-                rounds: 0,
-                emitted: emitted.len(),
-                seed_emitted: emitted.len(),
-                emitted_in_rounds: 0,
-                conditioned_rows: None,
-                total_draft: 0,
-                total_accept: 0,
-                prefill_ns,
-                draft_ns: 0,
-                verifier_ns: 0,
-                round_loop_ns: 0,
-                elapsed_ns: t_total.elapsed().as_nanos(),
-                decode_tps: window.tps(),
-                charged: charge_phases,
-            }
-            .log_done();
-            return Ok((emitted, block_size));
-        }
+    if emit_seed_token(
+        tokenizer,
+        b,
+        step_fn,
+        &mut emitted,
+        &mut window,
+        eos_ids,
+        &RoundTotals {
+            loop_kind: super::SpecLoop::MtpAssistant,
+            block_size,
+            conditioned_rows: None,
+            charged: charge_phases,
+            // No round ran.
+            rounds: 0,
+            emitted_in_rounds: 0,
+            total_draft: 0,
+            total_accept: 0,
+            prefill_ns,
+            draft_ns: 0,
+            verifier_ns: 0,
+            round_loop_ns: 0,
+            t_total,
+        },
+    ) {
+        return Ok((emitted, block_size));
     }
 
     tracing::info!(
@@ -1004,34 +1006,29 @@ pub fn mtp_assistant_generate(
     }
 
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();
-    super::RoundStats {
-        loop_kind: super::SpecLoop::MtpAssistant,
-        block_size,
-        rounds,
-        emitted: emitted.len(),
+    log_request_record(
+        &RoundTotals {
+            loop_kind: super::SpecLoop::MtpAssistant,
+            block_size,
+            conditioned_rows: None,
+            charged: charge_phases,
+            rounds,
+            emitted_in_rounds,
+            total_draft,
+            total_accept,
+            prefill_ns,
+            draft_ns,
+            verifier_ns,
+            round_loop_ns,
+            t_total,
+        },
+        &emitted,
         seed_emitted,
-        emitted_in_rounds,
-        conditioned_rows: None,
-        total_draft,
-        total_accept,
-        prefill_ns,
-        draft_ns,
-        verifier_ns,
-        round_loop_ns,
-        elapsed_ns: t_total.elapsed().as_nanos(),
-        decode_tps: window.tps(),
-        charged: charge_phases,
-    }
-    .log_done();
-
-    // Report the verifier's resident KV, so a caller that sampled the verifier
-    // arch around this call can attribute the figure to it. This round loop
-    // never goes through `Architecture::generate_greedy`, so nothing else
-    // writes it. Gemma4 is full-attention only — no recurrent state to add.
-    verifier.store_kv_cache_bytes(
-        crate::speculative::verifier_kv_bytes(&caches, None),
-        crate::decode_loop::PostDecode::seal(),
+        &window,
     );
+
+    // Gemma4 is full-attention only — no recurrent state to add.
+    report_verifier_kv_bytes(verifier, &caches, None);
     Ok((emitted, widest_bs))
 }
 

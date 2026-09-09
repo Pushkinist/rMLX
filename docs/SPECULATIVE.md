@@ -296,8 +296,11 @@ charged run's `round_ms` against an uncharged one's before trusting either.
 
 **The decision is the loop's, made once per request, and it travels on the
 record.** `phases_charged()` is read at the loop head and passed down — to
-`rollback_round_caches` as an argument, and onto `RoundStats::charged`, which
-every loop's `done` line carries. Two things depend on that.
+`rollback_round_caches` as an argument, and onto the `charged` of the
+`RoundTotals` each loop hands
+[`round_common::log_request_record`](../crates/rmlx-models/src/speculative/round_common.rs),
+the one place a `RoundStats` is assembled, so it reaches the `done` line every
+loop writes. Two things depend on that.
 `rollback_round_caches` is shared by eight call sites across seven loops and
 only three of those loops time their phases; a switch it read on its own behalf would change how the other four
 schedule work, with nothing on their records saying so — they pass `false` and

@@ -129,7 +129,10 @@ use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
-use crate::speculative::round_common::verifier_cache_stack;
+use crate::speculative::round_common::{
+    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
+    RoundTotals,
+};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Target of this loop's per-position step trace.
@@ -949,30 +952,31 @@ pub fn eagle3_generate(
     // prefill that conditions on it.
     let prefill_ns = prefill_t0.elapsed().as_nanos();
 
-    emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
     decided_by.push(DecidedBy::FullVocab);
-    if eos_ids.contains(&b) {
-        // The stop token arrived before a round could run. The request still
-        // happened, so it still leaves exactly one record.
-        super::RoundStats {
+    if emit_seed_token(
+        tokenizer,
+        b,
+        step_fn,
+        &mut emitted,
+        &mut window,
+        eos_ids,
+        &RoundTotals {
             loop_kind: super::SpecLoop::Eagle3,
             block_size: block_total,
-            rounds: 0,
-            emitted: emitted.len(),
-            seed_emitted: emitted.len(),
-            emitted_in_rounds: 0,
             conditioned_rows: None,
+            charged: false,
+            // No round ran.
+            rounds: 0,
+            emitted_in_rounds: 0,
             total_draft: 0,
             total_accept: 0,
             prefill_ns,
             draft_ns: 0,
             verifier_ns: 0,
             round_loop_ns: 0,
-            elapsed_ns: t_total.elapsed().as_nanos(),
-            decode_tps: window.tps(),
-            charged: false,
-        }
-        .log_done();
+            t_total,
+        },
+    ) {
         return Ok((emitted, block_total));
     }
 
@@ -1241,34 +1245,28 @@ pub fn eagle3_generate(
     }
 
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();
-    super::RoundStats {
-        loop_kind: super::SpecLoop::Eagle3,
-        block_size: block_total,
-        rounds,
-        emitted: emitted.len(),
+    log_request_record(
+        &RoundTotals {
+            loop_kind: super::SpecLoop::Eagle3,
+            block_size: block_total,
+            conditioned_rows: None,
+            charged: false,
+            rounds,
+            emitted_in_rounds,
+            total_draft,
+            total_accept,
+            prefill_ns,
+            draft_ns,
+            verifier_ns,
+            round_loop_ns,
+            t_total,
+        },
+        &emitted,
         seed_emitted,
-        emitted_in_rounds,
-        conditioned_rows: None,
-        total_draft,
-        total_accept,
-        prefill_ns,
-        draft_ns,
-        verifier_ns,
-        round_loop_ns,
-        elapsed_ns: t_total.elapsed().as_nanos(),
-        decode_tps: window.tps(),
-        charged: false,
-    }
-    .log_done();
-
-    // Report the verifier's resident KV, so a caller that sampled the verifier
-    // arch around this call can attribute the figure to it. This round loop
-    // never goes through `Architecture::generate_greedy`, so nothing else
-    // writes it.
-    verifier.store_kv_cache_bytes(
-        crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
-        crate::decode_loop::PostDecode::seal(),
+        &window,
     );
+
+    report_verifier_kv_bytes(verifier, &v_caches, Some(&v_lin));
     Ok((emitted, widest_bs))
 }
 
