@@ -84,9 +84,9 @@ pub(crate) fn cache_stack(arch: &Architecture, kv_quant: KvQuant, max_seq: i32) 
 
 /// What a round loop counted and timed, handed to the one place that records it.
 ///
-/// [`RoundStats`] is this plus the three figures a loop does not carry as a
-/// counter, and it is assembled in [`log_request_record`] and nowhere else. A
-/// loop names its own numbers here; a field added to the record is added once.
+/// [`RoundStats`] is this plus the figures a loop does not carry as a counter,
+/// and it is assembled in [`round_stats`] and nowhere else. A loop names its
+/// own numbers here; a field added to the record is added once.
 #[derive(Debug)]
 pub(crate) struct RoundTotals {
     /// Which loop produced the tokens.

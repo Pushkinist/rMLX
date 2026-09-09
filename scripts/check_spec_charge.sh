@@ -60,10 +60,20 @@
 # RULE 5 (nothing names the decision outside the population either)
 #   A fn that is not a round loop and carries a `charged:` field names a
 #   decision this gate cannot check against a rollback, because there is none in
-#   it. The shared recorder is the one fn allowed to write the field at all, and
-#   it does so from a destructured binding — `charged,` — which is not a
-#   `charged:` site, so a `charged:` outside a round loop is a decision made
-#   where nothing can hold it to the loop that ordered it.
+#   it. The shared recorder carries the field across from a destructured
+#   binding — `charged,`, which is not a `charged:` site — so a `charged:` in
+#   any fn that is not a round loop is a decision made where nothing can hold it
+#   to the loop that ordered it.
+#
+#   The reach is fn bodies, and only those: this scan opens at a `fn` item, so a
+#   `charged:` in a module-level `const` or `static` is outside it entirely. The
+#   rule is about functions, and a decision parked in a constant is a shape
+#   review has to catch.
+#
+#   A shared constructor for a loop's totals is refused by this rule, and that
+#   is the intent rather than a side effect: the token has to stay at the loop's
+#   own call site for the rollback beside it to be checked against, so a later
+#   collapse of the per-loop `RoundTotals` literals has to keep it there.
 #
 # RULE 3 (the population)
 #   Across the round loops, the multiset of those tokens is exactly

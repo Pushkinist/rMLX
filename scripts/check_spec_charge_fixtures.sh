@@ -93,6 +93,28 @@ pub fn summarise_rounds(rounds: usize, totals: &RoundTotals) -> RoundTotals {
 RS
 }
 
+# The shared recorder: the one fn that writes the record, from a destructured
+# binding rather than a named value. RULE 5 is about a `charged:` field outside
+# a round loop, and this is the fn it has to be exercised against — a rule that
+# only ever saw helpers nobody would write would not be checked where it matters.
+recorder_src() {
+  cat <<'RS'
+pub(crate) fn round_stats(totals: &RoundTotals, emitted: &[ProbeStep]) -> RoundStats {
+    let &RoundTotals {
+        loop_kind,
+        rounds,
+        charged,
+    } = totals;
+    RoundStats {
+        loop_kind,
+        rounds,
+        emitted: emitted.len(),
+        charged,
+    }
+}
+RS
+}
+
 # The shared seed emit: a driver's signature, and it names no decision of its
 # own — it is handed the loop's totals. Condition (b) is the only thing keeping
 # it out of the population, and a scan that counted it would report eight loops
@@ -148,6 +170,8 @@ build_root() {
     loop_src "spec_generate_stochastic_cached" "false" "plain"
     printf '\n'
     stats_helper_src
+    printf '\n'
+    recorder_src
     printf '\n'
     seed_emit_src
     printf '\nfn rollback_round_caches(\n    caches: &mut [KvCache],\n    lin: Option<&mut [LinearAttnCache]>,\n    fed: &[u32],\n    pre_round_offset: i32,\n    target: i32,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    Ok(())\n}\n'
@@ -435,7 +459,17 @@ RS
 run "a decision named outside a round loop is refused" 1 \
   "\`summarise_uncharged\` writes 1 \`charged:\` field(s) — false —"
 
-# 25. Condition (b) is what keeps the shared seed emit out of the population,
+# 25. RULE 5 against the fn it is about. The recorder carries the decision
+#     across as a destructured `charged,`; spelled as a field it becomes a value
+#     named where no rollback can be checked against it, and a rule that
+#     exempted the recorder by name would let exactly this through.
+build_root "$root"
+perl -0pi -e 's/        emitted: emitted\.len\(\),\n        charged,/        emitted: emitted.len(),\n        charged: false,/' \
+  "$root/crates/rmlx-models/src/speculative/mod.rs"
+run "the recorder naming the decision rather than carrying it across is refused" 1 \
+  "\`round_stats\` writes 1 \`charged:\` field(s) — false —"
+
+# 26. Condition (b) is what keeps the shared seed emit out of the population,
 #     and nothing else does: it carries a driver's signature. Give it totals of
 #     its own and it joins, with no rollback in it for the gate to read against.
 build_root "$root"
@@ -444,7 +478,7 @@ perl -0pi -e 's/    log_request_record\(totals, emitted, emitted\.len\(\), windo
 run "a helper that builds its own totals joins the population and is refused" 2 \
   "\`emit_seed_token\` has 0 rollback and 1 record charge sites."
 
-# 26. The defect the gate exists for, at the seam the record moved to: the
+# 27. The defect the gate exists for, at the seam the record moved to: the
 #     totals handed over say the round was charged and the rollbacks say it was
 #     not. Every token and every count the loop reports is unchanged.
 build_root "$root"
