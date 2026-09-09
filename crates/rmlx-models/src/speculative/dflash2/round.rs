@@ -48,15 +48,15 @@ use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::round_common::{
-    emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
-    rollback_round, verifier_cache_stack, RoundTotals,
+    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
+    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
 };
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
     conditioning_residual, guard_round_conditioning, guard_verifier_prefill_logits, phases_charged,
     rollback_target_from_tail, round_block, DecodeWindow, RoundPhases, SpecLoop, VerifierDraw,
 };
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+use rmlx_kv_quant::{KvCache, KvQuant};
 
 /// Prompt positions per verifier prefill pass.
 ///
@@ -140,9 +140,7 @@ pub fn dflash2_generate(
 
     let (kv_quant, _, mut v_caches) =
         verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
-    let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
-        .map(|_| LinearAttnCache::new())
-        .collect();
+    let mut v_lin = lin_cache_stack(verifier);
 
     let mut draw = VerifierDraw::new(sampler_cfg);
 

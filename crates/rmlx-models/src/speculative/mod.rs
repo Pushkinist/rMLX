@@ -671,24 +671,13 @@ impl SpeculativeDispatcher {
         // forward path ignores the parameter. The GDN recurrent state has
         // NO sequence axis, so spec rollback uses snapshot/restore (below)
         // rather than KvCache::truncate_to.
-        let mut verifier_lin: Option<Vec<LinearAttnCache>> = if self.verifier.needs_lin_caches() {
-            Some(
-                (0..self.verifier.num_hidden_layers())
-                    .map(|_| LinearAttnCache::new())
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        let mut draft_lin: Option<Vec<LinearAttnCache>> = if draft.needs_lin_caches() {
-            Some(
-                (0..draft.num_hidden_layers())
-                    .map(|_| LinearAttnCache::new())
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let mut verifier_lin = self
+            .verifier
+            .needs_lin_caches()
+            .then(|| round_common::lin_cache_stack(&self.verifier));
+        let mut draft_lin = draft
+            .needs_lin_caches()
+            .then(|| round_common::lin_cache_stack(draft));
 
         // --- Initial prefill on prompt[..-1] (mirrors mlx-lm _prefill). -
         // Last token becomes the carry-token `y` fed into round 1.
@@ -1057,24 +1046,13 @@ impl SpeculativeDispatcher {
 
         let mut draft_caches = round_common::cache_stack(draft, kv_quant, max_seq);
 
-        let mut verifier_lin: Option<Vec<LinearAttnCache>> = if self.verifier.needs_lin_caches() {
-            Some(
-                (0..self.verifier.num_hidden_layers())
-                    .map(|_| LinearAttnCache::new())
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        let mut draft_lin: Option<Vec<LinearAttnCache>> = if draft.needs_lin_caches() {
-            Some(
-                (0..draft.num_hidden_layers())
-                    .map(|_| LinearAttnCache::new())
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let mut verifier_lin = self
+            .verifier
+            .needs_lin_caches()
+            .then(|| round_common::lin_cache_stack(&self.verifier));
+        let mut draft_lin = draft
+            .needs_lin_caches()
+            .then(|| round_common::lin_cache_stack(draft));
 
         // Initial prefill on prompt[..-1]; last prompt token is round 1's carry.
         let prefill_t0 = Instant::now();

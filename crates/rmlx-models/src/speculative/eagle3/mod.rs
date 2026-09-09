@@ -130,10 +130,10 @@ use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use crate::speculative::round_common::{
-    emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
-    rollback_round, verifier_cache_stack, RoundTotals,
+    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
+    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
 };
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+use rmlx_kv_quant::{KvCache, KvQuant};
 
 /// Target of this loop's per-position step trace.
 pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
@@ -859,9 +859,7 @@ pub fn eagle3_generate(
 
     let (kv_quant, max_seq, mut v_caches) =
         verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
-    let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
-        .map(|_| LinearAttnCache::new())
-        .collect();
+    let mut v_lin = lin_cache_stack(verifier);
 
     // Size the drafter KV cache to the verifier context limit
     // (max_position_embeddings, capped to KV_MAX_SEQ_DEFAULT, or --max-ctx).

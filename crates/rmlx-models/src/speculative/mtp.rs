@@ -53,8 +53,8 @@ use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
 use crate::speculative::round_common::{
-    emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
-    rollback_round, verifier_cache_stack, RoundTotals,
+    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
+    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
 };
 use rmlx_kv_quant::{KvCache, KvQuant};
 
@@ -649,7 +649,6 @@ pub fn mtp_generate(
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
 ) -> Result<(Vec<ProbeStep>, usize)> {
-    use rmlx_kv_quant::LinearAttnCache;
     use std::time::Instant;
 
     if prompt_ids.len() < 2 {
@@ -676,9 +675,7 @@ pub fn mtp_generate(
 
     let (kv_quant, _, mut v_caches) =
         verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
-    let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
-        .map(|_| LinearAttnCache::new())
-        .collect();
+    let mut v_lin = lin_cache_stack(verifier);
 
     drafter.reset();
 

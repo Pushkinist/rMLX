@@ -84,6 +84,22 @@ pub(crate) fn cache_stack(arch: &Architecture, kv_quant: KvQuant, max_seq: i32) 
         .collect()
 }
 
+/// One model's recurrent linear-attention state, one entry per layer.
+///
+/// Empty at the start of a request and grown by the forward: the state has no
+/// sequence axis, so a round's rollback restores it from the tape rather than
+/// slicing it.
+///
+/// The gate is the caller's: a sidecar loop refuses an architecture without
+/// recurrent layers outright and always has a stack, while the two-model loops
+/// serve both kinds and hold `None` for a verifier or a draft model that reads
+/// the parameter and ignores it.
+pub(crate) fn lin_cache_stack(arch: &Architecture) -> Vec<LinearAttnCache> {
+    (0..arch.num_hidden_layers())
+        .map(|_| LinearAttnCache::new())
+        .collect()
+}
+
 /// What a round loop counted and timed, handed to the one place that records it.
 ///
 /// [`RoundStats`] is this plus the figures a loop does not carry as a counter,
