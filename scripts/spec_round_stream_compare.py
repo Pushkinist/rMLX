@@ -69,6 +69,13 @@ PROMPTS = (
 EXPECTED_CELLS = {f"{p}.{q}.stable.jsonl" for p in PAIRS for q in PROMPTS}
 TOTAL_ROUNDS = 4423
 
+# What every round event carries, whichever of the five spellings emitted it.
+# Mirrors `ROUND_EVENT_FIELDS` in `crates/rmlx-models/tests/common/round_stream.rs`,
+# which is the filter the engine writes these files through — stated again here
+# because this side has to be able to refuse a file of well-formed JSON that is
+# not a round stream.
+ROUND_EVENT_FIELDS = ("round", "accept", "num_draft")
+
 
 def cells(directory: pathlib.Path) -> dict[str, pathlib.Path]:
     return {p.name: p for p in sorted(directory.glob("*.stable.jsonl"))}
@@ -80,6 +87,15 @@ def rounds(path: pathlib.Path) -> list[dict]:
         if not line.strip():
             continue
         obj = json.loads(line)
+        absent = [f for f in ROUND_EVENT_FIELDS if f not in obj]
+        if absent:
+            print(
+                f"{path.name}:{n} carries no {absent}. A round event carries the round's "
+                f"index, what it accepted and how many proposals it accepted them from, "
+                f"so this line is not one and this file is not a round stream.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
         timing = [k for k in obj if k.endswith("_ms")]
         if timing:
             print(

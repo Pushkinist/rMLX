@@ -16,6 +16,12 @@ the run writes beside the full stream: the same JSON objects with every
 wall-clock `*_ms` field dropped, because those move between two runs of one
 engine and a digest over them compares two machines' load.
 
+A digest pins bytes and says nothing about what they are, so the script reads
+every line before it hashes one: a round event carries the round's index, what
+it accepted and how many proposals it accepted them from, and carries no
+wall-clock field. A file of well-formed JSON that is not a round stream is
+refused rather than digested.
+
 This is the observable the equivalence pairs cannot supply. They read the
 answer, and greedy verification emits the verifier's own argmax at every
 position whatever the drafter proposed — so a rollback off by one, a block

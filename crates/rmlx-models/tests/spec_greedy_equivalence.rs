@@ -2678,11 +2678,15 @@ impl Loaded {
                 target == EAGLE3_STEP_SWITCH_TARGET && *level == tracing::Level::TRACE
             })
             .count();
+        // Two-sided: the loop that asks it asks once per round, and every other
+        // loop asks not at all. A loop that started consulting a switch it does
+        // not gate on would be as much of a change as one that stopped.
+        let want_step_questions = if asks_step_switch { rounds.len() } else { 0 };
         assert!(
-            !asks_step_switch || step_questions == rounds.len(),
-            "this loop asks its per-position trace switch once per round: {} rounds \
-             closed and the switch was asked {step_questions} times. A guard replaced \
-             by a constant asks it once per verified position, or not at all.",
+            step_questions == want_step_questions,
+            "this pair asks its per-position trace switch {want_step_questions} times \
+             over {} rounds and it was asked {step_questions}. A guard replaced by a \
+             constant asks it once per verified position, or not at all.",
             rounds.len()
         );
         (ran, spec_ids, decided_by, rounds)
