@@ -39,12 +39,6 @@ pub(crate) mod draft_kind;
 pub(crate) mod round_common;
 pub(crate) mod round_stats;
 
-// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
-// caches a round builds live for that round only: they are never pushed to the
-// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
-// description has to match them. Applying the boundary promotion here would
-// change the codec of a stack whose only reader is the round that built it.
-
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Instant;
@@ -709,15 +703,7 @@ impl SpeculativeDispatcher {
         );
 
         // --- Allocate per-layer caches for the draft model. ------------
-        let mut draft_caches: Vec<KvCache> = (0..draft.num_hidden_layers())
-            .map(|i| {
-                let window = draft.layer_sliding_window(i);
-                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                    .with_max_seq_ceiling(max_seq)
-                    .with_layer_idx(i)
-                    .with_shares_kv(draft.shares_kv_across_layers())
-            })
-            .collect();
+        let mut draft_caches = round_common::cache_stack(draft, kv_quant, max_seq);
 
         // --- Recurrent (GatedDeltaNet) caches for hybrid archs. --------
         // Only Qwen3.5MoE needs these; Gemma4 leaves them None and the
@@ -1119,15 +1105,7 @@ impl SpeculativeDispatcher {
             "spec_generate_stochastic_cached: starting (Leviathan stochastic acceptance)"
         );
 
-        let mut draft_caches: Vec<KvCache> = (0..draft.num_hidden_layers())
-            .map(|i| {
-                let window = draft.layer_sliding_window(i);
-                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                    .with_max_seq_ceiling(max_seq)
-                    .with_layer_idx(i)
-                    .with_shares_kv(draft.shares_kv_across_layers())
-            })
-            .collect();
+        let mut draft_caches = round_common::cache_stack(draft, kv_quant, max_seq);
 
         let mut verifier_lin: Option<Vec<LinearAttnCache>> = if self.verifier.needs_lin_caches() {
             Some(

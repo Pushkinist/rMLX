@@ -32,16 +32,24 @@ pub(crate) fn verifier_cache_stack(
     max_ctx_override: Option<i32>,
 ) -> Result<(KvQuant, i32, Vec<KvCache>)> {
     let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    let ctx = super::verifier_context(verifier, max_ctx_override)?;
-    let max_seq = ctx.ceiling;
-    let caches = (0..verifier.num_hidden_layers())
+    let max_seq = super::verifier_context(verifier, max_ctx_override)?.ceiling;
+    Ok((kv_quant, max_seq, cache_stack(verifier, kv_quant, max_seq)))
+}
+
+/// One model's per-layer cache stack for one speculative request.
+///
+/// The two-model loops build a second one of these for the draft model, at the
+/// verifier's codec and the verifier's ceiling: the verifier owns the KV
+/// geometry of a pair, so the draft's stack is the same stack against a
+/// different layer count.
+pub(crate) fn cache_stack(arch: &Architecture, kv_quant: KvQuant, max_seq: i32) -> Vec<KvCache> {
+    (0..arch.num_hidden_layers())
         .map(|i| {
-            let window = verifier.layer_sliding_window(i);
+            let window = arch.layer_sliding_window(i);
             KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                .with_max_seq_ceiling(ctx.ceiling)
+                .with_max_seq_ceiling(max_seq)
                 .with_layer_idx(i)
-                .with_shares_kv(verifier.shares_kv_across_layers())
+                .with_shares_kv(arch.shares_kv_across_layers())
         })
-        .collect();
-    Ok((kv_quant, max_seq, caches))
+        .collect()
 }
