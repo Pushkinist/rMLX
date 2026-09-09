@@ -293,6 +293,10 @@ ITL_MEAN_MS = os.environ.get("STUB_ITL_MEAN_MS", "")
 # cells without the fixed prompt tripping the same guard first.
 ITL_MEAN_FROM = int(os.environ.get("STUB_ITL_MEAN_FROM", "0"))
 SAMPLED = os.environ.get("STUB_SAMPLED", "1") == "1"
+# A delay between the wire's last chunk and the sampler event's write, still
+# inside do_POST and so still before [DONE] closes the response. A caller
+# blocked on the streamed body cannot observe anything between the two.
+SAMPLER_DELAY_S = float(os.environ.get("STUB_SAMPLER_DELAY_S", "0"))
 SAMPLER_LINES = int(os.environ.get("STUB_SAMPLER_LINES", "-1"))
 SAMPLER_TOP_K = int(os.environ.get("STUB_SAMPLER_TOP_K", "20"))
 SAMPLER_TOP_K_PASS2 = os.environ.get("STUB_SAMPLER_TOP_K_PASS2", "")
@@ -469,6 +473,7 @@ class Handler(BaseHTTPRequestHandler):
         chunk({"choices": [], "usage": usage})
 
         if SAMPLED and (SAMPLER_LINES < 0 or served < SAMPLER_LINES):
+            time.sleep(SAMPLER_DELAY_S)
             top_k = SAMPLER_TOP_K
             if SAMPLER_TOP_K_PASS2 and PASS >= 2:
                 top_k = int(SAMPLER_TOP_K_PASS2)
@@ -938,6 +943,34 @@ run_case sampling_is_read_back_from_the_engine 0 \
 # replay a single RNG stream. That belongs in the record, not in a footnote.
 [ "$(jq_of "r['protocol']['sampling_resolved']['seed']")" = "42919" ] ||
     note_bad "seed=$(jq_of "r['protocol']['sampling_resolved']['seed']")"
+verdict
+
+# A busy host was seen stretching the client's reading of a decode window past
+# the engine's, on the fixed-length-prompt request specifically — the request
+# sent between the warmups and the cells, before a plain run has read back its
+# own sampling. `STUB_ITL_MEAN_FROM=0` stages that same disagreement without a
+# busy host: this pins that a fixed-prompt cross-check failure aborts the run
+# before sampling is ever read, which is why that field came back empty on the
+# host that hit it rather than the checkpoint being unreadable.
+run_case fixed_prompt_disagreement_precedes_sampling_read 1 \
+    "a fixed-prompt cross-check failure is the fixed-prompt band, not a lost sampling read" \
+    'STUB_ITL_MEAN_MS=20' 'STUB_ITL_MEAN_FROM=0' \
+    'GREP:past the 10% band'
+no_result
+verdict
+
+# The read this run's sampling comes back on is the same request whose body
+# already closed: do_POST writes the sampler event, then TTFT and ITL, then
+# `served += 1`, then the final SSE chunk — all before returning, so nothing
+# downstream of the response can observe the log mid-write. A multi-second
+# delay placed on the sampler write itself, still ahead of that same response,
+# is the sharpest version of "the read came before the write" this harness can
+# stage; it passing is what rules that mechanism out rather than assuming it.
+run_case sampler_write_delay_does_not_race_the_read 0 \
+    "a delayed sampler write is still ordered before the response that gates the read" \
+    'STUB_SAMPLER_TOP_K=20' 'STUB_SAMPLER_DELAY_S=2'
+[ "$(jq_of "r['protocol']['sampling_resolved']['top_k']")" = "20" ] ||
+    note_bad "top_k=$(jq_of "r['protocol']['sampling_resolved']['top_k']")"
 verdict
 
 # Two guards, two cases: one pass whose requests did not share a setting, and
