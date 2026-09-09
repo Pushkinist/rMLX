@@ -506,6 +506,18 @@ perl -0pi -e 's/    log_request_record\(totals, emitted, emitted\.len\(\), windo
 run "a helper that builds its own totals joins the population and is refused" 2 \
   "\`emit_seed_token\` has 0 rollback and 1 record charge sites."
 
+# 29. RULE 6: a loop that keeps its readable `rollback_round` call and reaches
+#     past it to the low-level rollback underneath. Every token this gate reads
+#     still agrees; the second decision is at a call it does not open. This is
+#     the shape the needle move to `rollback_round(` would otherwise have let
+#     through, and in the tree the same shape does not compile — the low-level
+#     rollback is private to `round_common`.
+build_root "$root"
+perl -0pi -e 's/        super::RoundPhases \{/        super::rollback_round_caches(\n            \&mut v_caches,\n            None,\n            \&v_input,\n            0,\n            0,\n            false,\n            device,\n        )?;\n        super::RoundPhases {/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a loop reaching past the shared rollback to the low-level one is a scan error" 2 \
+  "\`mtp_generate\` makes 1 call(s) to the low-level"
+
 # 27. The defect the gate exists for, at the seam the record moved to: the
 #     totals handed over say the round was charged and the rollbacks say it was
 #     not. Every token and every count the loop reports is unchanged.

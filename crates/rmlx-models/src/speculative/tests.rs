@@ -1133,27 +1133,6 @@ fn refold_refuses_a_tape_that_is_short_of_the_round() {
     );
 }
 
-/// The offsets the caller passes have to describe the round it is rolling back.
-#[test]
-fn rollback_refuses_offsets_that_overrun_the_round() {
-    let mut lin = vec![armed(vec![tape_segment(0, 3)], &tape_zero_state())];
-    let err = rollback_round_caches(
-        &mut [],
-        Some(&mut lin),
-        &[1, 2, 3],
-        100,
-        105,
-        false,
-        Device::Cpu,
-    )
-    .err()
-    .map_or_else(String::new, |e| e.to_string());
-    assert!(
-        err.contains("retained prefix 5 exceeds the 3 tokens"),
-        "offsets that overrun the round must be refused; got: {err:?}"
-    );
-}
-
 /// A hybrid hands one recurrent slot per decoder layer, and most of them belong
 /// to full-attention layers. Those record nothing and hold no state, and the
 /// refold walks past them.

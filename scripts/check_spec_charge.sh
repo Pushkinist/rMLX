@@ -64,6 +64,21 @@
 #   loop's own call site, where the rollback beside it can be read against it,
 #   and the shared code carries it rather than naming one.
 #
+# RULE 6 (a loop names the shared rollback, and nothing below it)
+#   `rollback_round` is the one rollback a round loop calls, and it is the one
+#   whose `charge` argument RULE 1 reads. The low-level pair beneath it —
+#   `rollback_round_caches`, which truncates and refolds, and `refold_lin_tapes`,
+#   which rebuilds the recurrent state — also take a `charge`, at a call this
+#   reader does not open. A loop that named one of those would make a second
+#   charge decision beside the one it declares, and this gate would report the
+#   declared one as the only one.
+#
+#   `rollback_round_caches` is private to `round_common` and no loop module can
+#   name it, so this rule is the second reader on a structural property rather
+#   than the only one. `refold_lin_tapes` is not private — it has nine unit
+#   tests that live with the tape fixtures in `speculative/tests.rs` — and for
+#   it this rule is the whole of the coverage.
+#
 # RULE 5 (nothing names the decision outside the population either)
 #   A fn that is not a round loop and carries a `charged:` field names a
 #   decision this gate cannot check against a rollback, because there is none in
@@ -91,7 +106,8 @@
 # EXIT
 #   0 clean, 1 a rule fired, 2 the gate could not scan — a missing tree, no
 #   round loop found, a driver with no charge site in it (a rollback delegated
-#   to a helper is not a rollback this gate can read), a charge site outside the
+#   to a helper is not a rollback this gate can read), a driver that reaches
+#   past the shared rollback to the low-level pair, a charge site outside the
 #   population, or a call, a field or a binding whose shape it could not read
 #   back. A scan that finds nothing must not report a pass.
 #
@@ -124,7 +140,8 @@ fi
 # awk walks each file once and emits one record per function:
 #
 #   <file> <TAB> <fn> <TAB> <driver> <TAB> <rollbacks> <TAB> <records> <TAB>
-#   <binds-phases_charged> <TAB> <tokens, space-joined>
+#   <low-level rollbacks> <TAB> <binds-phases_charged> <TAB>
+#   <tokens, space-joined>
 #
 # `driver` is 1 for a fn meeting both conditions above. A token of `?` is a site
 # whose value this scan could not read back — reported as a scan error rather
@@ -141,15 +158,15 @@ records=$(
       function reset() {
         in_sig = 0; awaiting_body = 0; in_body = 0; in_call = 0; fname = ""
         depth = 0; paren = 0; args = ""; has_step = 0; has_stats = 0
-        bind_ok = 0; bind_bad = 0; bind_odd = 0; nroll = 0; nrec = 0
+        bind_ok = 0; bind_bad = 0; bind_odd = 0; nroll = 0; nrec = 0; nlow = 0
         delete toks
       }
       function flush(   t, joined) {
         if (fname != "") {
           joined = ""
           for (t in toks) { joined = (joined == "") ? t : joined " " t }
-          printf "%s\t%s\t%d\t%d\t%d\t%s\t%s\n", \
-            FILENAME, fname, (has_step && has_stats), nroll, nrec, \
+          printf "%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n", \
+            FILENAME, fname, (has_step && has_stats), nroll, nrec, nlow, \
             (bind_odd ? "odd" : (bind_ok ? "ok" : (bind_bad ? "bad" : "none"))), joined
         }
         reset()
@@ -253,6 +270,15 @@ records=$(
         if (rest ~ /[^[:space:]]/) { addtok("?"); nroll++ } else { in_call = 1; args = "" }
       }
 
+      # RULE 6: the low-level pair the shared rollback is built on. Their own
+      # definitions are not calls, and neither is `rollback_round_caches` inside
+      # the shared rollback — that fn is not a round loop.
+      (index(stripped, "rollback_round_caches(") > 0 ||
+       index(stripped, "refold_lin_tapes(") > 0) &&
+      stripped !~ /fn[[:space:]]+(rollback_round_caches|refold_lin_tapes)[[:space:]]*\(/ {
+        nlow++
+      }
+
       # Symmetric with the rollback side: any `charged:` is a site, and one
       # whose value is not a bare identifier is unreadable rather than absent.
       # A trailing comma is not required — a record`s last field carries none.
@@ -293,7 +319,7 @@ fi
 loop_count=0
 census=""
 
-while IFS=$'\t' read -r file fn _driver _nroll _nrec _bind _tokens; do
+while IFS=$'\t' read -r file fn _driver _nroll _nrec _nlow _bind _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` rolls a round's caches back and is"
   note "  not one of the round loops this gate derived. Either the derivation lost a"
@@ -303,7 +329,7 @@ while IFS=$'\t' read -r file fn _driver _nroll _nrec _bind _tokens; do
   scan_error=1
 done <<<"$orphans"
 
-while IFS=$'\t' read -r file fn _driver _nroll nrec _bind tokens; do
+while IFS=$'\t' read -r file fn _driver _nroll nrec _nlow _bind tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` writes $nrec \`charged:\` field(s) — $tokens —"
   note "  and is not a round loop, so no rollback in it says whether that is the decision"
@@ -312,11 +338,19 @@ while IFS=$'\t' read -r file fn _driver _nroll nrec _bind tokens; do
   fail=1
 done <<<"$strays"
 
-while IFS=$'\t' read -r file fn _driver nroll nrec bind tokens; do
+while IFS=$'\t' read -r file fn _driver nroll nrec nlow bind tokens; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   loop_count=$((loop_count + 1))
 
+  if [ "$nlow" != "0" ]; then
+    note "check-spec-charge: $rel: \`$fn\` makes $nlow call(s) to the low-level"
+    note "  rollback beneath \`rollback_round\`. Those take a \`charge\` of their own at a"
+    note "  call this gate does not open, so the decision it reads at the loop's own"
+    note "  site is no longer the only one the loop makes."
+    scan_error=1
+    continue
+  fi
   if printf '%s\n' "$tokens" | tr ' ' '\n' | grep -qx '?'; then
     note "check-spec-charge: $rel: \`$fn\` has a charge site this gate could not read"
     note "  the value of. An unread site is not a checked site, and it is the one that"

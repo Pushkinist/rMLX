@@ -1,7 +1,8 @@
-//! The recorder's mapping from a loop's totals to the record that is ingested.
+//! What `round_common` can be read on the CPU: the recorder's mapping from a
+//! loop's totals to the record that is ingested, and the rollback's own
+//! contract on the offsets it is handed.
 //!
-//! This is the one piece of `round_common` a test can reach: it takes no
-//! device, no model and no cache, so it runs on the CPU. What it pins is the
+//! The mapping takes no device, no model and no cache. What it pins is the
 //! wiring, and the wiring is exactly what nothing else here can see — a record
 //! is a `done` line in a log, so a field written from the wrong place produces
 //! a plausible row and no failure anywhere. Two fields make that concrete:
@@ -18,7 +19,10 @@
 
 use std::time::{Duration, Instant};
 
-use super::{round_stats, RoundTotals};
+use rmlx_kv_quant::LinearAttnCache;
+use rmlx_mlx::Device;
+
+use super::{rollback_round_caches, round_stats, RoundTotals};
 use crate::decode_loop::ProbeStep;
 use crate::speculative::{DecodeWindow, SpecLoop};
 
@@ -177,4 +181,31 @@ fn every_counter_reaches_the_record_under_its_own_name() {
     // through rather than turning it into a throughput of zero.
     let empty = round_stats(&totals, &steps, 2, &DecodeWindow::new());
     assert_eq!(empty.decode_tps, None);
+}
+
+/// The offsets the caller passes have to describe the round it is rolling back.
+///
+/// Unreachable through [`super::rollback_round`], which takes this arm only
+/// when `target_offset` is inside the round — so this is the low-level
+/// contract, read directly, and it is why the branch above it is not the only
+/// thing standing between a caller's arithmetic and a wrong prefix. `lin` is
+/// never touched: the refusal is before it.
+#[test]
+fn rollback_refuses_offsets_that_overrun_the_round() {
+    let mut lin = vec![LinearAttnCache::new()];
+    let err = rollback_round_caches(
+        &mut [],
+        Some(&mut lin),
+        &[1, 2, 3],
+        100,
+        105,
+        false,
+        Device::Cpu,
+    )
+    .err()
+    .map_or_else(String::new, |e| e.to_string());
+    assert!(
+        err.contains("retained prefix 5 exceeds the 3 tokens"),
+        "offsets that overrun the round must be refused; got: {err:?}"
+    );
 }

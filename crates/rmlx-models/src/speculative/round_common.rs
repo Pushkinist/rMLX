@@ -17,7 +17,7 @@
 
 use std::time::Instant;
 
-use rmlx_core::error::Result;
+use rmlx_core::error::{Error, Result};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_mlx::Device;
 
@@ -257,6 +257,67 @@ pub(crate) fn emit_round_tokens(
     false
 }
 
+/// Roll one speculative round's caches back to `target_offset` after a partial
+/// acceptance — both the full-attention `kv` stack and, when the arch has one,
+/// the GDN recurrent state in `lin`.
+///
+/// `pre_round_offset` is the KV offset before this round's forwards ran;
+/// `round_tokens` are the tokens those forwards consumed, in order, so that
+/// `round_tokens[..target_offset - pre_round_offset]` is exactly the retained
+/// prefix.
+///
+/// **Full-attention arch** (`lin` empty or absent): every layer's KvCache
+/// carries the whole round, so dropping the rejected tail is the entire
+/// rollback.
+///
+/// **GDN hybrid**: the recurrent state has no sequence axis (see
+/// `LinearAttnCache`), so it cannot be sliced to an intermediate position. It is
+/// rebuilt instead, from the round tape the loop armed before its forwards:
+/// the recurrence inputs at the retained positions are the ones the forward
+/// already computed, so the state is refolded by the recurrence kernel over
+/// those alone. That reads no weights and takes no second forward, which is
+/// what makes a partly-accepted round cost the same as a fully accepted one.
+///
+/// The K/V stack is truncated straight to `target_offset` on both arms. A
+/// windowed layer therefore only ever has to give back this round's rejected
+/// tail, which is inside any ring's reach.
+///
+/// Private to this module, and reached only through [`rollback_round`], which
+/// is what decides the arm: this is the partial-accept side, and on a full
+/// accept there is nothing to roll back and the tapes are dropped instead. A
+/// loop that could name this could make a second charge decision beside the one
+/// it declares at its own call site, and nothing would read it.
+///
+/// `charge` is the calling loop's per-request answer from
+/// [`super::phases_charged`], not a decision this function makes. Seven loops share it
+/// and three of them time their phases; reading the switch here would change the
+/// schedule of the other four with nothing on their records saying so.
+fn rollback_round_caches(
+    kv: &mut [KvCache],
+    lin: Option<&mut [LinearAttnCache]>,
+    round_tokens: &[u32],
+    pre_round_offset: i32,
+    target_offset: i32,
+    charge: bool,
+    device: Device,
+) -> Result<()> {
+    let kept = (target_offset - pre_round_offset).max(0) as usize;
+    if kept > round_tokens.len() {
+        return Err(Error::Model(format!(
+            "rollback_round_caches: retained prefix {kept} exceeds the {} tokens the \
+             round consumed (pre_round_offset={pre_round_offset}, \
+             target_offset={target_offset}) — the caller's offsets do not describe \
+             this round",
+            round_tokens.len(),
+        )));
+    }
+    super::truncate_kv_to(kv, target_offset)?;
+    let Some(lin) = lin.filter(|l| !l.is_empty()) else {
+        return Ok(());
+    };
+    super::refold_lin_tapes(lin, round_tokens.len(), kept, charge, device)
+}
+
 /// Return a round's caches to the prefix the verifier kept, or drop the round
 /// tape when it kept all of it.
 ///
@@ -285,7 +346,7 @@ pub(crate) fn rollback_round(
     device: Device,
 ) -> Result<()> {
     if target_offset < pre_round_offset + round_tokens.len() as i32 {
-        return super::rollback_round_caches(
+        return rollback_round_caches(
             kv,
             lin,
             round_tokens,
