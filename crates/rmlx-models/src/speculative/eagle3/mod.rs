@@ -5,7 +5,8 @@
 //!
 //! Port of mlx-vlm `mlx_vlm/speculative/drafters/eagle3/eagle3.py`
 //! (`Eagle3DraftModel`) and the round-loop in `mlx_vlm/speculative/eagle3.py`
-//! (`_eagle3_next_block_size`, `_eagle3_rounds`, `_eagle3_walk`). The
+//! (`_eagle3_next_block_size`, `_eagle3_rounds`, `_eagle3_walk`, whose walk is
+//! the shared [`crate::speculative::accept_prefix`] here). The
 //! authoritative weight layout is the mainline SpecForge
 //! `LlamaForCausalLMEagle3` model
 //! (`sgl-project/SpecForge:specforge/modeling/draft/llama3_eagle.py`).
@@ -111,11 +112,13 @@
     clippy::too_many_lines,
     clippy::used_underscore_binding
 )]
-// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
-// caches a round builds live for that round only: they are never pushed to the
-// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
-// description has to match them. Applying the boundary promotion here would
-// change the codec of a stack whose only reader is the round that built it.
+// kv-layer-quants: uniform — the caches built here are the drafter's own and
+// never a per-layer stack: one unquantized cache for a single-layer head, made
+// at load and re-made per request by `Eagle3Drafter::reset`. It lives for that
+// one request — never pushed to the prompt cache, never spilled, never keyed by
+// `layout_key` — so no on-disk description has to match it. The verifier's
+// stack is built by `speculative::round_common`, which carries its own
+// declaration.
 
 use std::path::Path;
 
@@ -126,6 +129,7 @@ use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
+use crate::speculative::round_common::verifier_cache_stack;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Target of this loop's per-position step trace.
@@ -141,38 +145,6 @@ pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
 /// the stream the loop emits by default.
 pub(crate) fn step_trace_enabled() -> bool {
     tracing::enabled!(target: STEP_TARGET, tracing::Level::TRACE)
-}
-
-/// One greedy EAGLE-3 acceptance walk over a drafted block.
-///
-/// Pure port of `_eagle3_walk`: accept drafted tokens up to the first mismatch
-/// with the verifier's greedy choice, then take the verifier's correction/bonus
-/// at that position. Returns `(accepted, new_tokens)` capped at `budget`.
-/// `target_tokens` are the verifier's greedy predictions for positions
-/// `[b, d0, d1, ...]` — `draft_tokens.len() + 1` of them.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-pub fn eagle3_walk(
-    draft_tokens: &[u32],
-    target_tokens: &[u32],
-    budget: usize,
-) -> (usize, Vec<u32>) {
-    let n_draft = draft_tokens.len();
-    let mut accepted = n_draft;
-    for (i, (&d, &t)) in draft_tokens.iter().zip(target_tokens.iter()).enumerate() {
-        if d != t {
-            accepted = i;
-            break;
-        }
-    }
-    let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
-    if accepted < target_tokens.len() {
-        new_tokens.push(target_tokens[accepted]);
-    }
-    new_tokens.truncate(budget);
-    (accepted, new_tokens)
 }
 
 /// Find the first position where the restricted-vocab verifier token differs from the
@@ -882,26 +854,8 @@ pub fn eagle3_generate(
         drafter.cfg.block_size,
     );
 
-    // Same constant the verifier resolves — a spec pair must not run two
-    // different caches.
-    let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    // The verifier's limits bound the pair; an over-capacity `--max-ctx` is
-    // refused here rather than overflowing a cache mid-round.
-    let ctx = crate::speculative::verifier_context(verifier, max_ctx_override)?;
-    let max_seq = ctx.ceiling;
-
-    let mut v_caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
-        .map(|i| {
-            let window = verifier.layer_sliding_window(i);
-            KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                .with_max_seq_ceiling(ctx.ceiling)
-                .with_layer_idx(i)
-                // The verifier stack decides whether its layers read each
-                // other's K/V, and so whether Mixed/RotK keep their bf16
-                // mirror. A spec pair must not run two different caches.
-                .with_shares_kv(verifier.shares_kv_across_layers())
-        })
-        .collect();
+    let (kv_quant, max_seq, mut v_caches) =
+        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
         .collect();
@@ -1169,7 +1123,7 @@ pub fn eagle3_generate(
         };
 
         // -- Phase C: greedy acceptance walk. --
-        let (accept, new_tokens) = eagle3_walk(&draft_tokens, &v_tokens, remaining);
+        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         total_accept += accept;
         let n_committed = new_tokens.len();
 

@@ -61,12 +61,6 @@
 //! kv_offset`), mirroring `draft_block`'s single-position multi-token generator.
 
 #![allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
-// caches a round builds live for that round only: they are never pushed to the
-// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
-// description has to match them. Applying the boundary promotion here would
-// change the codec of a stack whose only reader is the round that built it.
-
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
@@ -79,6 +73,7 @@ use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
+use crate::speculative::round_common::verifier_cache_stack;
 
 /// One drafter decoder layer (Gemma4 shape, Q-only - K/V are shared).
 #[allow(missing_debug_implementations)]
@@ -775,26 +770,8 @@ pub fn mtp_assistant_generate(
     }
     let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
 
-    // Same constant the verifier resolves — a spec pair must not run two
-    // different caches.
-    let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    // The verifier's limits bound the pair; an over-capacity `--max-ctx` is
-    // refused here rather than overflowing a cache mid-round.
-    let ctx = crate::speculative::verifier_context(verifier, max_ctx_override)?;
-    let max_seq = ctx.ceiling;
-
-    let mut caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
-        .map(|i| {
-            let window = verifier.layer_sliding_window(i);
-            KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                .with_max_seq_ceiling(ctx.ceiling)
-                .with_layer_idx(i)
-                // The verifier stack decides whether its layers read each
-                // other's K/V, and so whether Mixed/RotK keep their bf16
-                // mirror. A spec pair must not run two different caches.
-                .with_shares_kv(verifier.shares_kv_across_layers())
-        })
-        .collect();
+    let (kv_quant, _, mut caches) =
+        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
 
     let mut draw = super::VerifierDraw::new(sampler_cfg);
 

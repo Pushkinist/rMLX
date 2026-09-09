@@ -36,8 +36,8 @@
 //! ([`DFlashDrafter::load`] + [`load_dflash`]) — `fc` (`5H->H`), `hidden_norm`,
 //! `norm`, all 8 `DFlashDecoderLayer`s, **YARN RoPE** ([`crate::rope::compute_yarn_freqs`]),
 //! the drafter forward [`DFlashDrafter::draft_block`], the block-size schedule
-//! [`dflash_next_block_size`], the acceptance walk [`walk_block_greedy`], the
-//! GDN rollback, and the full round-loop
+//! [`dflash_next_block_size`], the acceptance walk
+//! [`crate::speculative::accept_prefix`], the GDN rollback, and the full round-loop
 //! [`dflash_generate`]. The three verifier-side seams are wired on
 //! [`crate::arch::Architecture`] for the Qwen3.6-MoE verifier:
 //!
@@ -63,12 +63,6 @@
     clippy::too_many_lines,
     clippy::used_underscore_binding
 )]
-// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
-// caches a round builds live for that round only: they are never pushed to the
-// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
-// description has to match them. Applying the boundary promotion here would
-// change the codec of a stack whose only reader is the round that built it.
-
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::Path;
@@ -82,6 +76,7 @@ use rmlx_mlx::{
 use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
+use crate::speculative::round_common::verifier_cache_stack;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Choose the next DFlash verify block size from recent acceptance.
@@ -594,39 +589,6 @@ impl DFlashDrafter {
     }
 }
 
-/// One greedy DFlash acceptance walk over a drafted block (port of the
-/// `_speculative_walk` half of `_dflash_rounds`).
-///
-/// Accept drafted tokens up to the first mismatch with the verifier's greedy
-/// choice, then take the verifier's correction/bonus at that position. Returns
-/// `(accepted, new_tokens)` capped at `budget`. `target_tokens` are the
-/// verifier's greedy predictions for positions `[seed, d0, d1, ...]` — i.e.
-/// `draft_tokens.len() + 1` of them.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-pub fn walk_block_greedy(
-    draft_tokens: &[u32],
-    target_tokens: &[u32],
-    budget: usize,
-) -> (usize, Vec<u32>) {
-    let n_draft = draft_tokens.len();
-    let mut accepted = n_draft;
-    for (i, (&d, &t)) in draft_tokens.iter().zip(target_tokens.iter()).enumerate() {
-        if d != t {
-            accepted = i;
-            break;
-        }
-    }
-    let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
-    if accepted < target_tokens.len() {
-        new_tokens.push(target_tokens[accepted]);
-    }
-    new_tokens.truncate(budget);
-    (accepted, new_tokens)
-}
-
 use crate::decode_loop::ProbeStep;
 
 /// DFlash speculative-decoding round-loop (greedy / temp=0).
@@ -693,26 +655,8 @@ pub fn dflash_generate(
         drafter.cfg.block_size,
     );
 
-    // Same constant the verifier resolves — a spec pair must not run two
-    // different caches.
-    let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    // The verifier's limits bound the pair; an over-capacity `--max-ctx` is
-    // refused here rather than overflowing a cache mid-round.
-    let ctx = crate::speculative::verifier_context(verifier, max_ctx_override)?;
-    let max_seq = ctx.ceiling;
-
-    let mut v_caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
-        .map(|i| {
-            let window = verifier.layer_sliding_window(i);
-            KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                .with_max_seq_ceiling(ctx.ceiling)
-                .with_layer_idx(i)
-                // The verifier stack decides whether its layers read each
-                // other's K/V, and so whether Mixed/RotK keep their bf16
-                // mirror. A spec pair must not run two different caches.
-                .with_shares_kv(verifier.shares_kv_across_layers())
-        })
-        .collect();
+    let (kv_quant, _, mut v_caches) =
+        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
         .collect();
@@ -854,7 +798,7 @@ pub fn dflash_generate(
         verifier_ns += t0.elapsed().as_nanos();
 
         // -- Phase C: acceptance walk. ---------------------------------------
-        let (accept, new_tokens) = walk_block_greedy(&draft_tokens, &v_tokens, remaining);
+        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         total_accept += accept;
         recent.push((accept, draft_tokens.len()));
 

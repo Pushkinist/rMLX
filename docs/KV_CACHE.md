@@ -857,8 +857,11 @@ storage variants regardless of `--paged-kv`):
 When neither `--kv-quant` nor the primitives are passed, the codec is
 `rmlx_models::kv_cache::DEFAULT_KV_QUANT` - unquantised bf16 - for every
 architecture, every checkpoint and every prompt length. One constant, read by
-the CLI, the server load path, the image branch, the arch dispatcher and all
-six speculative drafter stacks.
+the CLI, the server load path, the image branch, the arch dispatcher and
+`speculative::round_common::verifier_cache_stack`
+(`crates/rmlx-models/src/speculative/round_common.rs`), which is the only
+reader on the speculative side: every round loop's verifier stack comes from
+it, and the two-model loops' draft stacks from the same builder.
 
 It replaced a per-arch table (keyed on arch class, `hidden_size`, the MoE flag,
 the PARO flag and `quantization.bits`) and a separate per-prompt-length server

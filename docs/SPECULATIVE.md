@@ -1052,11 +1052,16 @@ The verifier and draft KV caches are allocated at round-loop entry with
 layers receive their layer-specific `window` value; full-attention layers
 receive `max_seq`. The `max_seq` bound is the ceiling
 `rmlx_models::context::resolve_context` produced for the pair — the verifier
-owns the KV geometry, so its `ContextLimits` are what bound the round loop, and
-`speculative::verifier_context` is the one wrapper all six drivers call. A
-`--max-ctx` above the verifier's positional capacity is refused there, with the
-same message the non-speculative paths give, instead of being taken verbatim
-and overflowing a cache mid-round. See `docs/CLI.md` § "Context ceiling".
+owns the KV geometry, so its `ContextLimits` are what bound the round loop.
+There is one producer of all of it:
+`speculative::round_common::verifier_cache_stack`
+(`crates/rmlx-models/src/speculative/round_common.rs`) resolves the codec and
+the ceiling and builds the verifier's stack, and every round loop calls it; the
+two-model loops build the draft model's stack from the same builder at the
+verifier's codec and ceiling. A `--max-ctx` above the verifier's positional
+capacity is refused there, with the same message the non-speculative paths
+give, instead of being taken verbatim and overflowing a cache mid-round. See
+`docs/CLI.md` § "Context ceiling".
 
 Verifier prefill (all paths) uses `prefill_chunked`, which gates how much
 sequence length is dispatched per Metal command buffer. The chunk is the

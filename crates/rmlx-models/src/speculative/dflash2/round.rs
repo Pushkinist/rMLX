@@ -39,12 +39,6 @@
 //! this one is greedy, and the serve layer routes a sidecar request to it
 //! whatever the request's temperature.
 
-// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
-// caches a round builds live for that round only: they are never pushed to the
-// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
-// description has to match them. Applying the boundary promotion here would
-// change the codec of a stack whose only reader is the round that built it.
-
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
@@ -53,12 +47,13 @@ use rmlx_mlx::{concatenate, Array, Device};
 use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
+use crate::speculative::round_common::verifier_cache_stack;
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
     conditioning_residual, disarm_lin_tapes, emit_step, guard_round_conditioning,
     guard_verifier_prefill_logits, phases_charged, rollback_round_caches,
-    rollback_target_from_tail, round_block, verifier_context, verifier_kv_bytes, DecodeWindow,
-    RoundPhases, RoundStats, SpecLoop, VerifierDraw,
+    rollback_target_from_tail, round_block, verifier_kv_bytes, DecodeWindow, RoundPhases,
+    RoundStats, SpecLoop, VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -142,26 +137,8 @@ pub fn dflash2_generate(
     let condition_width = (drafter.cfg.hidden_size * target_layer_ids.len()) as i32;
     let block_total = block_capped_by_checkpoint(requested_block_total, drafter.cfg.block_size);
 
-    // Same constant the verifier resolves — a spec pair must not run two
-    // different caches.
-    let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    // The verifier's limits bound the pair; an over-capacity `--max-ctx` is
-    // refused here rather than overflowing a cache mid-round.
-    let ctx = verifier_context(verifier, max_ctx_override)?;
-    let max_seq = ctx.ceiling;
-
-    let mut v_caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
-        .map(|i| {
-            let window = verifier.layer_sliding_window(i);
-            KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                .with_max_seq_ceiling(ctx.ceiling)
-                .with_layer_idx(i)
-                // The verifier stack decides whether its layers read each
-                // other's K/V, and so whether Mixed/RotK keep their bf16
-                // mirror. A spec pair must not run two different caches.
-                .with_shares_kv(verifier.shares_kv_across_layers())
-        })
-        .collect();
+    let (kv_quant, _, mut v_caches) =
+        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
         .collect();
