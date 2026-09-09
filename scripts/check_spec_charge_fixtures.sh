@@ -118,7 +118,7 @@ pub(crate) fn emit_seed_token(
 RS
 }
 
-# The entry guard: a driver's signature, no round, no `RoundStats`. It delegates.
+# The entry guard: a driver's signature, no round, no `RoundTotals`. It delegates.
 dispatcher_src() {
   cat <<'RS'
 pub fn spec_generate_greedy(

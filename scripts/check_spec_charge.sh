@@ -7,8 +7,8 @@
 #   issue — `phases_charged()` in three loops, a literal `false` in four — and
 #   then repeats that decision in two unrelated places: the `charge` argument of
 #   every `rollback_round_caches(...)` it makes, and the `charged:` field of
-#   every `RoundPhases` / `RoundStats` record it builds. Nothing holds the two
-#   together. A loop whose rollback charges and whose record says it did not
+#   every `RoundPhases` event it logs and of the `RoundTotals` it hands the one
+#   recorder. Nothing holds the two together. A loop whose rollback charges and whose record says it did not
 #   moves the phase timings and re-attributes the work to the drafter, with
 #   every token identical and every count identical.
 #

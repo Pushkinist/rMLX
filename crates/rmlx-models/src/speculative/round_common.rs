@@ -1,10 +1,13 @@
 //! What every speculative round loop sets up, and closes out, the same way.
 //!
-//! Nothing here has a unit test, and cannot: an [`Architecture`] is only
-//! reachable by loading weights. What gates it is a round-loop run against a
-//! real pair — `the_assistant_round_loop_reproduces_plain_greedy` in
+//! The two cache-stack functions cannot have a unit test: an [`Architecture`]
+//! is only reachable by loading weights. What gates them is a round-loop run
+//! against a real pair — `the_assistant_round_loop_reproduces_plain_greedy` in
 //! `crates/rmlx-models/tests/spec_greedy_equivalence.rs` is the cheapest — and
 //! the per-round event stream that run writes.
+//!
+//! [`round_stats`] is the exception and is read on the CPU: it takes no model,
+//! no device and no cache, and `round_common_tests.rs` is what reads it.
 
 // kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
 // caches a round builds live for that round only: they are never pushed to the
@@ -84,6 +87,7 @@ pub(crate) fn cache_stack(arch: &Architecture, kv_quant: KvQuant, max_seq: i32) 
 /// [`RoundStats`] is this plus the three figures a loop does not carry as a
 /// counter, and it is assembled in [`log_request_record`] and nowhere else. A
 /// loop names its own numbers here; a field added to the record is added once.
+#[derive(Debug)]
 pub(crate) struct RoundTotals {
     /// Which loop produced the tokens.
     pub(crate) loop_kind: SpecLoop,

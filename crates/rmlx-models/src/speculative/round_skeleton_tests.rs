@@ -19,8 +19,10 @@
 //! - **Whether the request reported its verifier's resident KV at all.**
 //!   `round_common::report_verifier_kv_bytes` is called on the normal exit and
 //!   skipped on one EOS exit per loop — the seed EOS for the five sidecar
-//!   loops, the in-round EOS for the two two-model ones. A loop that changed which exit it takes reports
-//!   a different figure, or none, with every token identical.
+//!   loops, the in-round EOS for the two two-model ones. A loop that changed
+//!   which exit it takes reports a different figure, or none, with every token
+//!   identical. Nothing enforces this; pinned by review — a report added on a
+//!   seed-EOS exit leaves every gate green.
 //! - **`RoundStats::charged`**, which is `phases_charged()` in three loops and a
 //!   literal `false` in four. It decides whether each round forces its carried
 //!   arrays before its span closes, so it moves the phase timings and the work
