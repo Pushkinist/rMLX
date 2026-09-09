@@ -547,9 +547,9 @@ implementations at once, and a rollback inlined per loop is how it got there.
 
 The refold is checked against the replay it replaced —
 `a_round_tape_refolds_to_what_the_replay_produced` in
-`crates/rmlx-models/src/speculative/tests.rs` — on a dense hybrid and a mixture
-one, for a round taken as one verify forward and one taken as a forward per
-token. On the dense hybrid the two agree bit for bit at every accepted length.
+`crates/rmlx-models/src/speculative/round_common_tests.rs` — on a dense hybrid
+and a mixture one, for a round taken as one verify forward and one taken as a
+forward per token. On the dense hybrid the two agree bit for bit at every accepted length.
 On the mixture they agree to about 2-4% relative, which is that stack's own
 disagreement between computing the round in one forward and stepping it: the
 test measures that disagreement in the same process and holds the refold to it,

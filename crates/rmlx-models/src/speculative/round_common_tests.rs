@@ -22,10 +22,12 @@ use std::time::{Duration, Instant};
 use rmlx_kv_quant::{GdnTapeSegment, KvCache, KvQuant, LinearAttnCache};
 use rmlx_mlx::{Array, Device, Dtype};
 
-use super::{refold_lin_tapes, rollback_round, rollback_round_caches, round_stats, RoundTotals};
+use super::{
+    refold_lin_tapes, rollback_round, rollback_round_caches, round_stats, seq_range, RoundTotals,
+};
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
-use crate::speculative::{arm_lin_tapes, seq_range, DecodeWindow, SpecLoop};
+use crate::speculative::{arm_lin_tapes, DecodeWindow, SpecLoop};
 
 /// How far back the fixture's request started.
 ///

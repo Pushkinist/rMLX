@@ -73,12 +73,18 @@
 #   charge decision beside the one a loop declares, and this gate would report
 #   the declared one as the only one.
 #
-#   The rule is on the file, not on the fn: a `charge` named anywhere but
-#   `round_common.rs` is exit 2, whether it is in a round loop, in a helper the
-#   loop calls, or in a fn nothing calls. Both are private to `round_common`, so
-#   in the tree this is a second reader on a property the compiler already
-#   holds — but the compiler cannot see a source edit that has not been built,
-#   and a helper one hop away from a loop is the shape a fn-shaped rule missed.
+#   Two readings, because either alone has a hole. **By file**: a call from
+#   anywhere but `round_common.rs` is exit 2 — a round loop, a helper the loop
+#   calls, or a fn nothing calls, which is the shape a fn-shaped rule missed.
+#   **By fn**: a round loop is read wherever it lives, so a loop that moves into
+#   `round_common.rs` — the direction the shared skeleton is going — does not
+#   inherit the file's exemption. The exemption is anchored to that one path and
+#   not to a basename, so a `round_common.rs` added under any other directory is
+#   read like every other file.
+#
+#   Both fns are private to `round_common`, so in the tree this is a second
+#   reader on a property the compiler already holds — but the compiler cannot
+#   see a source edit that has not been built.
 #
 # RULE 5 (nothing names the decision outside the population either)
 #   A fn that is not a round loop and carries a `charged:` field names a
@@ -308,9 +314,10 @@ drivers=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1')
 orphans=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 0 && $4 > 0')
 # RULE 5: a fn that is not a round loop and writes a `charged:` field.
 strays=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 0 && $5 > 0')
-# RULE 6: any fn outside `round_common.rs` that names the low-level rollback.
+# RULE 6: the low-level rollback named outside `round_common.rs`, or named
+# inside it by a round loop, which the file's exemption is not for.
 lowlevel=$(printf '%s\n' "$records" |
-  awk -F'\t' '$6 > 0 && $1 !~ /\/round_common\.rs$/')
+  awk -v rc="$loops_dir/round_common.rs" -F'\t' '$6 > 0 && ($1 != rc || $3 == 1)')
 
 if [ -z "$drivers" ]; then
   note "check-spec-charge: found no round loop under ${loops_dir#"$root"/}."
@@ -336,9 +343,10 @@ done <<<"$orphans"
 while IFS=$'\t' read -r file fn _driver _nroll _nrec nlow _bind _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` makes $nlow call(s) to the low-level"
-  note "  rollback beneath \`rollback_round\`, from outside \`round_common.rs\`. Those take"
-  note "  a \`charge\` of their own at a call this gate does not open, so the decision it"
-  note "  reads at a loop's own site would no longer be the only one made."
+  note "  rollback beneath \`rollback_round\`. Those take a \`charge\` of their own at a call"
+  note "  this gate does not open, so the decision it reads at a loop's own site would no"
+  note "  longer be the only one made. Only \`round_common.rs\` may name them, and only"
+  note "  outside a round loop."
   scan_error=1
 done <<<"$lowlevel"
 

@@ -763,9 +763,7 @@ impl SpeculativeDispatcher {
             // Input = v_carry + draft_tokens. v_carry is 1 token: either
             // the last prompt token (round 1) or the previous round's
             // emitted correction/bonus.
-            v_input.clear();
-            v_input.extend_from_slice(&v_carry);
-            v_input.extend_from_slice(&draft_tokens);
+            fill_fed(&mut v_input, &v_carry, &draft_tokens);
             let v_k = v_input.len(); // = num_draft + 1
             if v_k < 2 {
                 return Err(Error::Model(format!(
@@ -878,11 +876,11 @@ impl SpeculativeDispatcher {
             // never fed back), so that is the token sequence the rollback keeps
             // the retained prefix of — and the length its accumulated tape has
             // to match.
-            d_fed.clear();
-            d_fed.extend_from_slice(&d_seed);
-            if draft_tokens.len() > 1 {
-                d_fed.extend_from_slice(&draft_tokens[..draft_tokens.len() - 1]);
-            }
+            fill_fed(
+                &mut d_fed,
+                &d_seed,
+                &draft_tokens[..draft_tokens.len().saturating_sub(1)],
+            );
             round_common::rollback_round(
                 &mut draft_caches,
                 draft_lin.as_deref_mut(),
@@ -1120,9 +1118,7 @@ impl SpeculativeDispatcher {
             total_draft_tokens += draft_tokens.len();
 
             // -- Phase B: verifier scores num_draft+1 positions. -------------
-            v_input.clear();
-            v_input.extend_from_slice(&v_carry);
-            v_input.extend_from_slice(&draft_tokens);
+            fill_fed(&mut v_input, &v_carry, &draft_tokens);
             let v_k = v_input.len();
             if v_k < 2 {
                 return Err(Error::Model(format!(
@@ -1256,11 +1252,11 @@ impl SpeculativeDispatcher {
             let d_offset_before = draft_caches.iter().map(KvCache::offset).max().unwrap_or(0);
             let d_drop = draft_rows_to_drop(draft_tokens.len(), accept);
             let d_target = d_offset_before - d_drop;
-            d_fed.clear();
-            d_fed.extend_from_slice(&d_seed);
-            if draft_tokens.len() > 1 {
-                d_fed.extend_from_slice(&draft_tokens[..draft_tokens.len() - 1]);
-            }
+            fill_fed(
+                &mut d_fed,
+                &d_seed,
+                &draft_tokens[..draft_tokens.len().saturating_sub(1)],
+            );
             round_common::rollback_round(
                 &mut draft_caches,
                 draft_lin.as_deref_mut(),
@@ -1551,6 +1547,17 @@ fn prefill_chunked_with(
         return Err(e);
     }
     Ok(())
+}
+
+/// Refill a round's token buffer in place.
+///
+/// One allocation per request rather than per round, and one place where the
+/// clear happens, so a caller cannot add a round that extends a buffer the
+/// previous round left full.
+fn fill_fed(buf: &mut Vec<u32>, head: &[u32], tail: &[u32]) {
+    buf.clear();
+    buf.extend_from_slice(head);
+    buf.extend_from_slice(tail);
 }
 
 /// Arm a round tape on every recurrent cache in `lin`, discarding whatever the
@@ -1975,44 +1982,6 @@ fn committed_rows(v_hidden: &Array, rows: usize, width: i32, device: Device) -> 
         )));
     }
     v_hidden.slice(&[0, 0, 0], &[1, rows, width], &[1, 1, 1], device)
-}
-
-/// Length of `a`'s sequence axis, which every taped recurrence input carries at
-/// axis 1.
-fn seq_len(a: &Array) -> Result<i32> {
-    a.shape().get(1).copied().ok_or_else(|| {
-        Error::Model(format!(
-            "seq_len: a taped recurrence input carries its positions on axis 1, \
-             and this one has shape {:?}",
-            a.shape()
-        ))
-    })
-}
-
-/// `a[:, from..to, ...]` — a range of a taped recurrence input's positions.
-fn seq_range(a: &Array, from: i32, to: i32, device: Device) -> Result<Array> {
-    let len = seq_len(a)?;
-    if from < 0 || from > to || to > len {
-        return Err(Error::Model(format!(
-            "seq_range: positions {from}..{to} are not inside a taped input of \
-             length {len}"
-        )));
-    }
-    if from == 0 && to == len {
-        return a.try_clone();
-    }
-    let shape = a.shape();
-    let start: Vec<i32> = shape
-        .iter()
-        .enumerate()
-        .map(|(axis, _)| if axis == 1 { from } else { 0 })
-        .collect();
-    let stop: Vec<i32> = shape
-        .iter()
-        .enumerate()
-        .map(|(axis, &dim)| if axis == 1 { to } else { dim })
-        .collect();
-    a.slice(&start, &stop, &vec![1i32; shape.len()], device)
 }
 
 /// Truncate every KV cache in `kv` that actually holds `n` or more positions.

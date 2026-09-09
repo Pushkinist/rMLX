@@ -511,7 +511,7 @@ perl -0pi -e 's/    log_request_record\(totals, emitted, emitted\.len\(\), windo
 run "a helper that builds its own totals joins the population and is refused" 2 \
   "\`emit_seed_token\` has 0 rollback and 1 record charge sites."
 
-# 29. RULE 6: a loop that keeps its readable `rollback_round` call and reaches
+# 27. RULE 6: a loop that keeps its readable `rollback_round` call and reaches
 #     past it to the low-level rollback underneath. Every token this gate reads
 #     still agrees; the second decision is at a call it does not open. This is
 #     the shape the needle move to `rollback_round(` would otherwise have let
@@ -523,7 +523,7 @@ perl -0pi -e 's/        super::RoundPhases \{/        super::rollback_round_cach
 run "a loop reaching past the shared rollback to the low-level one is a scan error" 2 \
   "\`mtp_generate\` makes 1 call(s) to the low-level"
 
-# 30. RULE 6 is on the file, not the fn: a helper one hop from a loop, which a
+# 28. RULE 6 by file: a helper one hop from a loop, which a
 #     fn-shaped rule read as a non-driver and let through. The loop's own
 #     `rollback_round` call still reads clean and still carries `false`.
 build_root "$root"
@@ -536,7 +536,21 @@ RS
 run "a helper one hop from a loop naming the low-level rollback is a scan error" 2 \
   "\`refold_it\` makes 1 call(s) to the low-level"
 
-# 27. The defect the gate exists for, at the seam the record moved to: the
+# 29. RULE 6 by fn: a round loop that lives in `round_common.rs`, which is where
+#     the shared skeleton is going. The file's exemption is for the code beneath
+#     `rollback_round`, not for a loop that happens to sit beside it, and its own
+#     `rollback_round` call still reads clean and still carries `false`.
+build_root "$root"
+{
+  printf '\n'
+  loop_src "round_common_generate" "false" "plain"
+} >>"$root/crates/rmlx-models/src/speculative/round_common.rs"
+perl -0pi -e 's/(fn round_common_generate\((?:.*\n)*?)    while emitted/$1    refold_lin_tapes(None, 3, 2, true, device)?;\n    while emitted/' \
+  "$root/crates/rmlx-models/src/speculative/round_common.rs"
+run "a round loop in round_common.rs is read for the low-level rollback too" 2 \
+  "\`round_common_generate\` makes 1 call(s) to the low-level"
+
+# 30. The defect the gate exists for, at the seam the record moved to: the
 #     totals handed over say the round was charged and the rollbacks say it was
 #     not. Every token and every count the loop reports is unchanged.
 build_root "$root"

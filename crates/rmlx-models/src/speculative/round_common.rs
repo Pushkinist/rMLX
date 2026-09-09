@@ -260,6 +260,44 @@ pub(crate) fn emit_round_tokens(
     false
 }
 
+/// Length of `a`'s sequence axis, which every taped recurrence input carries at
+/// axis 1.
+fn seq_len(a: &Array) -> Result<i32> {
+    a.shape().get(1).copied().ok_or_else(|| {
+        Error::Model(format!(
+            "seq_len: a taped recurrence input carries its positions on axis 1, \
+             and this one has shape {:?}",
+            a.shape()
+        ))
+    })
+}
+
+/// `a[:, from..to, ...]` — a range of a taped recurrence input's positions.
+fn seq_range(a: &Array, from: i32, to: i32, device: Device) -> Result<Array> {
+    let len = seq_len(a)?;
+    if from < 0 || from > to || to > len {
+        return Err(Error::Model(format!(
+            "seq_range: positions {from}..{to} are not inside a taped input of \
+             length {len}"
+        )));
+    }
+    if from == 0 && to == len {
+        return a.try_clone();
+    }
+    let shape = a.shape();
+    let start: Vec<i32> = shape
+        .iter()
+        .enumerate()
+        .map(|(axis, _)| if axis == 1 { from } else { 0 })
+        .collect();
+    let stop: Vec<i32> = shape
+        .iter()
+        .enumerate()
+        .map(|(axis, &dim)| if axis == 1 { to } else { dim })
+        .collect();
+    a.slice(&start, &stop, &vec![1i32; shape.len()], device)
+}
+
 /// Rebuild every recurrent layer's state at `kept` positions into this round
 /// from the tape its forwards recorded.
 ///
@@ -314,13 +352,8 @@ fn refold_lin_tapes(
         // What the conv1d carries into the next call is the `kernel - 1`
         // positions before its next input, and the tape's conv input opens with
         // exactly those, so the round's own carry sits at `kept`.
-        let pad = super::seq_len(&conv)? - taped as i32;
-        cache.conv_state = Some(super::seq_range(
-            &conv,
-            kept as i32,
-            kept as i32 + pad,
-            device,
-        )?);
+        let pad = seq_len(&conv)? - taped as i32;
+        cache.conv_state = Some(seq_range(&conv, kept as i32, kept as i32 + pad, device)?);
         cache.delta_state = Some(if kept == 0 {
             state_in.try_clone()?
         } else {
@@ -370,12 +403,12 @@ fn concat_tape_conv_input(tape: &GdnTape, device: Device) -> Result<Array> {
     if rest.is_empty() {
         return first.conv_input.try_clone();
     }
-    let pad = super::seq_len(&first.conv_input)? - first.len as i32;
+    let pad = seq_len(&first.conv_input)? - first.len as i32;
     let mut parts: Vec<Array> = Vec::with_capacity(rest.len() + 1);
     parts.push(first.conv_input.try_clone()?);
     for seg in rest {
-        let len = super::seq_len(&seg.conv_input)?;
-        parts.push(super::seq_range(&seg.conv_input, pad, len, device)?);
+        let len = seq_len(&seg.conv_input)?;
+        parts.push(seq_range(&seg.conv_input, pad, len, device)?);
     }
     concatenate(&parts.iter().collect::<Vec<_>>(), 1, device)
 }
@@ -397,7 +430,7 @@ fn tape_prefix(
             break;
         }
         let want = (kept - taken).min(seg.len);
-        parts.push(super::seq_range(field(seg), 0, want as i32, device)?);
+        parts.push(seq_range(field(seg), 0, want as i32, device)?);
         taken += want;
     }
     match parts.len() {
