@@ -17,9 +17,9 @@
 //! because neither is a token and neither is a count of one:
 //!
 //! - **Whether the request reported its verifier's resident KV at all.**
-//!   `store_kv_cache_bytes` is called on the normal exit and skipped on one EOS
-//!   exit per loop — the seed EOS for the five sidecar loops, the in-round EOS
-//!   for the two two-model ones. A loop that changed which exit it takes reports
+//!   `round_common::report_verifier_kv_bytes` is called on the normal exit and
+//!   skipped on one EOS exit per loop — the seed EOS for the five sidecar
+//!   loops, the in-round EOS for the two two-model ones. A loop that changed which exit it takes reports
 //!   a different figure, or none, with every token identical.
 //! - **`RoundStats::charged`**, which is `phases_charged()` in three loops and a
 //!   literal `false` in four. It decides whether each round forces its carried

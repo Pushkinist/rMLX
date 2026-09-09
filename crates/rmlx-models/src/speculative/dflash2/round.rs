@@ -48,14 +48,14 @@ use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, verifier_cache_stack, RoundTotals,
+    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
+    RoundTotals,
 };
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
     conditioning_residual, disarm_lin_tapes, emit_step, guard_round_conditioning,
     guard_verifier_prefill_logits, phases_charged, rollback_round_caches,
-    rollback_target_from_tail, round_block, verifier_kv_bytes, DecodeWindow, RoundPhases, SpecLoop,
-    VerifierDraw,
+    rollback_target_from_tail, round_block, DecodeWindow, RoundPhases, SpecLoop, VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -463,14 +463,7 @@ pub fn dflash2_generate(
         &window,
     );
 
-    // Report the verifier's resident KV, so a caller that sampled the verifier
-    // arch around this call can attribute the figure to it. This round loop
-    // never goes through `Architecture::generate_greedy`, so nothing else
-    // writes it.
-    verifier.store_kv_cache_bytes(
-        verifier_kv_bytes(&v_caches, Some(&v_lin)),
-        crate::decode_loop::PostDecode::seal(),
-    );
+    report_verifier_kv_bytes(verifier, &v_caches, Some(&v_lin));
     Ok((emitted, widest_bs))
 }
 

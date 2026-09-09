@@ -74,7 +74,8 @@ use crate::arch::Architecture;
 use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, verifier_cache_stack, RoundTotals,
+    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
+    RoundTotals,
 };
 
 /// One drafter decoder layer (Gemma4 shape, Q-only - K/V are shared).
@@ -1026,14 +1027,8 @@ pub fn mtp_assistant_generate(
         &window,
     );
 
-    // Report the verifier's resident KV, so a caller that sampled the verifier
-    // arch around this call can attribute the figure to it. This round loop
-    // never goes through `Architecture::generate_greedy`, so nothing else
-    // writes it. Gemma4 is full-attention only — no recurrent state to add.
-    verifier.store_kv_cache_bytes(
-        crate::speculative::verifier_kv_bytes(&caches, None),
-        crate::decode_loop::PostDecode::seal(),
-    );
+    // Gemma4 is full-attention only — no recurrent state to add.
+    report_verifier_kv_bytes(verifier, &caches, None);
     Ok((emitted, widest_bs))
 }
 

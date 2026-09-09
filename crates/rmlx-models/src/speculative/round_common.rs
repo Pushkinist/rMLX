@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use rmlx_core::error::Result;
-use rmlx_kv_quant::{KvCache, KvQuant};
+use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 use super::{DecodeWindow, RoundStats, SpecLoop};
 use crate::arch::Architecture;
@@ -180,4 +180,26 @@ pub(crate) fn emit_seed_token(
     }
     log_request_record(totals, emitted, emitted.len(), window);
     true
+}
+
+/// Report a verifier's resident KV after one speculative request.
+///
+/// A speculative round loop never goes through `Architecture::generate_greedy`,
+/// so nothing else writes this and a caller that sampled the verifier around the
+/// call would otherwise read whatever the previous request left.
+///
+/// Only the verifier's caches count, on the same basis as the per-arch
+/// `generate_greedy` byte total — the attention caches plus, on hybrid archs,
+/// the recurrent linear-attention state. The draft model's are an
+/// implementation detail of the accelerator, and including them would make a
+/// speculative row incomparable with the ordinary row for the same model and
+/// context.
+pub(crate) fn report_verifier_kv_bytes(
+    verifier: &Architecture,
+    kv: &[KvCache],
+    lin: Option<&[LinearAttnCache]>,
+) {
+    let bytes = kv.iter().map(KvCache::resident_bytes).sum::<u64>()
+        + lin.map_or(0, |l| l.iter().map(LinearAttnCache::resident_bytes).sum());
+    verifier.store_kv_cache_bytes(bytes, crate::decode_loop::PostDecode::seal());
 }

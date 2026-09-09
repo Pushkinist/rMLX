@@ -53,7 +53,8 @@ use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, verifier_cache_stack, RoundTotals,
+    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
+    RoundTotals,
 };
 use rmlx_kv_quant::{KvCache, KvQuant};
 
@@ -943,14 +944,7 @@ pub fn mtp_generate(
         &window,
     );
 
-    // Report the verifier's resident KV, so a caller that sampled the verifier
-    // arch around this call can attribute the figure to it. This round loop
-    // never goes through `Architecture::generate_greedy`, so nothing else
-    // writes it.
-    verifier.store_kv_cache_bytes(
-        crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
-        crate::decode_loop::PostDecode::seal(),
-    );
+    report_verifier_kv_bytes(verifier, &v_caches, Some(&v_lin));
     Ok((emitted, widest_bs))
 }
 
