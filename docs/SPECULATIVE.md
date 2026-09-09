@@ -658,9 +658,9 @@ values against the mlx-lm reference output.
 
 **GDN-aware rollback.** The Qwen3.6-MoE verifier carries GDN (GatedDeltaNet)
 recurrent layers in addition to its KV cache. The loop arms a round tape on them
-before the verify forward, and on partial acceptance `rollback_round_caches`
-refolds the accepted prefix out of it to re-align the recurrent state with the
-truncated KV cache.
+before the verify forward, and on partial acceptance `rollback_round` refolds
+the accepted prefix out of it to re-align the recurrent state with the truncated
+KV cache.
 
 **Accumulated conditioning context.** The drafter conditions on the
 accumulated verifier hidden across all rounds (equivalent to the Python
@@ -825,8 +825,8 @@ Per-step trace is available via `RUST_LOG=rmlx_models::speculative::eagle3=trace
 The classic form: a smaller full model of the verifier's family proposes, the
 verifier scores. Nothing hooks into the verifier's forward pass — the draft is
 loaded as its own `Architecture`, keeps its own KV (and, on a GDN hybrid, its
-own recurrent state), and is rolled back through the same
-`rollback_round_caches` as the verifier. Any registered architecture can be the
+own recurrent state), and is rolled back through the same `rollback_round` as
+the verifier. Any registered architecture can be the
 draft, subject to the checks below; a pair of the same architecture is the
 normal case (`gemma-4-e4b` drafted by `gemma-4-e2b`, `Qwen3.8-27B` drafted by
 `ornith-1.0-9b`).
@@ -1084,8 +1084,8 @@ between chunks the KV cache state is flushed via `eval_prefill_state`. The
 
 A round tape is armed on the GDN recurrent state before every draft round with
 `arm_lin_tapes`, and dropped with `disarm_lin_tapes` when the round is fully
-accepted. On partial acceptance (`accept < K`), `rollback_round_caches` truncates
-the KV caches to the retained target and refolds the accepted prefix into the
+accepted. On partial acceptance (`accept < K`), `rollback_round` truncates the
+KV caches to the retained target and refolds the accepted prefix into the
 recurrent state from the tape — no second forward, and no weights read. See the
 partial-accept rollback section above.
 

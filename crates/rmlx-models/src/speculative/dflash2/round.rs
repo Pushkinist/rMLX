@@ -4,9 +4,8 @@
 //! the shape every sidecar loop in this module family has — prefill, a bonus
 //! token out of the prefill forward, then rounds of draft / verify / accept /
 //! roll back — so it shares [`crate::speculative::accept_prefix`],
-//! [`crate::speculative::round_common::rollback_round`] and
-//! [`crate::speculative::VerifierDraw`] with them rather than restating any of
-//! it.
+//! `round_common::rollback_round` and [`crate::speculative::VerifierDraw`] with
+//! them rather than restating any of it.
 //!
 //! # Conditioning: the K/V is recomputed, the projection is carried
 //!

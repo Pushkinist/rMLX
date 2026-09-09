@@ -64,20 +64,21 @@
 #   loop's own call site, where the rollback beside it can be read against it,
 #   and the shared code carries it rather than naming one.
 #
-# RULE 6 (a loop names the shared rollback, and nothing below it)
+# RULE 6 (the low-level rollback is named in one file, and nowhere else)
 #   `rollback_round` is the one rollback a round loop calls, and it is the one
 #   whose `charge` argument RULE 1 reads. The low-level pair beneath it —
 #   `rollback_round_caches`, which truncates and refolds, and `refold_lin_tapes`,
 #   which rebuilds the recurrent state — also take a `charge`, at a call this
-#   reader does not open. A loop that named one of those would make a second
-#   charge decision beside the one it declares, and this gate would report the
-#   declared one as the only one.
+#   reader does not open. Anything that named one of those would make a second
+#   charge decision beside the one a loop declares, and this gate would report
+#   the declared one as the only one.
 #
-#   `rollback_round_caches` is private to `round_common` and no loop module can
-#   name it, so this rule is the second reader on a structural property rather
-#   than the only one. `refold_lin_tapes` is not private — it has nine unit
-#   tests that live with the tape fixtures in `speculative/tests.rs` — and for
-#   it this rule is the whole of the coverage.
+#   The rule is on the file, not on the fn: a `charge` named anywhere but
+#   `round_common.rs` is exit 2, whether it is in a round loop, in a helper the
+#   loop calls, or in a fn nothing calls. Both are private to `round_common`, so
+#   in the tree this is a second reader on a property the compiler already
+#   holds — but the compiler cannot see a source edit that has not been built,
+#   and a helper one hop away from a loop is the shape a fn-shaped rule missed.
 #
 # RULE 5 (nothing names the decision outside the population either)
 #   A fn that is not a round loop and carries a `charged:` field names a
@@ -307,6 +308,9 @@ drivers=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1')
 orphans=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 0 && $4 > 0')
 # RULE 5: a fn that is not a round loop and writes a `charged:` field.
 strays=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 0 && $5 > 0')
+# RULE 6: any fn outside `round_common.rs` that names the low-level rollback.
+lowlevel=$(printf '%s\n' "$records" |
+  awk -F'\t' '$6 > 0 && $1 !~ /\/round_common\.rs$/')
 
 if [ -z "$drivers" ]; then
   note "check-spec-charge: found no round loop under ${loops_dir#"$root"/}."
@@ -329,6 +333,15 @@ while IFS=$'\t' read -r file fn _driver _nroll _nrec _nlow _bind _tokens; do
   scan_error=1
 done <<<"$orphans"
 
+while IFS=$'\t' read -r file fn _driver _nroll _nrec nlow _bind _tokens; do
+  [ -n "$fn" ] || continue
+  note "check-spec-charge: ${file#"$root"/}: \`$fn\` makes $nlow call(s) to the low-level"
+  note "  rollback beneath \`rollback_round\`, from outside \`round_common.rs\`. Those take"
+  note "  a \`charge\` of their own at a call this gate does not open, so the decision it"
+  note "  reads at a loop's own site would no longer be the only one made."
+  scan_error=1
+done <<<"$lowlevel"
+
 while IFS=$'\t' read -r file fn _driver _nroll nrec _nlow _bind tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` writes $nrec \`charged:\` field(s) — $tokens —"
@@ -343,14 +356,6 @@ while IFS=$'\t' read -r file fn _driver nroll nrec nlow bind tokens; do
   rel="${file#"$root"/}"
   loop_count=$((loop_count + 1))
 
-  if [ "$nlow" != "0" ]; then
-    note "check-spec-charge: $rel: \`$fn\` makes $nlow call(s) to the low-level"
-    note "  rollback beneath \`rollback_round\`. Those take a \`charge\` of their own at a"
-    note "  call this gate does not open, so the decision it reads at the loop's own"
-    note "  site is no longer the only one the loop makes."
-    scan_error=1
-    continue
-  fi
   if printf '%s\n' "$tokens" | tr ' ' '\n' | grep -qx '?'; then
     note "check-spec-charge: $rel: \`$fn\` has a charge site this gate could not read"
     note "  the value of. An unread site is not a checked site, and it is the one that"

@@ -201,9 +201,14 @@ build_root() {
     recorder_src
     printf '\n'
     seed_emit_src
-    printf '\nfn rollback_round_caches(\n    caches: &mut [KvCache],\n    lin: Option<&mut [LinearAttnCache]>,\n    fed: &[u32],\n    pre_round_offset: i32,\n    target: i32,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    Ok(())\n}\n'
-    shared_rollback_src
   } >"$root/crates/rmlx-models/src/speculative/mod.rs"
+
+  {
+    printf '//! The shared refold-or-disarm, and the low-level pair beneath it.\n\n'
+    shared_rollback_src
+    printf '\nfn rollback_round_caches(\n    caches: &mut [KvCache],\n    lin: Option<&mut [LinearAttnCache]>,\n    fed: &[u32],\n    pre_round_offset: i32,\n    target: i32,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    refold_lin_tapes(lin, fed.len(), 0, charge, device)\n}\n'
+    printf '\nfn refold_lin_tapes(\n    lin: Option<&mut [LinearAttnCache]>,\n    round_len: usize,\n    kept: usize,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    Ok(())\n}\n'
+  } >"$root/crates/rmlx-models/src/speculative/round_common.rs"
 
   loop_src "mtp_generate" "charge_phases" "bind" \
     >"$root/crates/rmlx-models/src/speculative/mtp.rs"
@@ -517,6 +522,19 @@ perl -0pi -e 's/        super::RoundPhases \{/        super::rollback_round_cach
   "$root/crates/rmlx-models/src/speculative/mtp.rs"
 run "a loop reaching past the shared rollback to the low-level one is a scan error" 2 \
   "\`mtp_generate\` makes 1 call(s) to the low-level"
+
+# 30. RULE 6 is on the file, not the fn: a helper one hop from a loop, which a
+#     fn-shaped rule read as a non-driver and let through. The loop's own
+#     `rollback_round` call still reads clean and still carries `false`.
+build_root "$root"
+cat >>"$root/crates/rmlx-models/src/speculative/dflash.rs" <<'RS'
+
+fn refold_it(lin: Option<&mut [LinearAttnCache]>, device: Device) -> Result<()> {
+    refold_lin_tapes(lin, 3, 2, true, device)
+}
+RS
+run "a helper one hop from a loop naming the low-level rollback is a scan error" 2 \
+  "\`refold_it\` makes 1 call(s) to the low-level"
 
 # 27. The defect the gate exists for, at the seam the record moved to: the
 #     totals handed over say the round was charged and the rollbacks say it was

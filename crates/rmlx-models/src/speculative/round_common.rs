@@ -18,8 +18,8 @@
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_mlx::Device;
+use rmlx_kv_quant::{GdnTape, GdnTapeSegment, KvCache, KvQuant, LinearAttnCache};
+use rmlx_mlx::{concatenate, Array, Device};
 
 use super::eagle3::DecidedBy;
 use super::{DecodeWindow, RoundStats, SpecLoop};
@@ -260,6 +260,154 @@ pub(crate) fn emit_round_tokens(
     false
 }
 
+/// Rebuild every recurrent layer's state at `kept` positions into this round
+/// from the tape its forwards recorded.
+///
+/// `round_len` is how many positions the round fed. Each recurrent layer's tape
+/// must hold exactly that many, and this refuses the round rather than refolding
+/// when one does not: a tape that is short recorded fewer forwards than the
+/// round took — armed late, or a forward that ran with recording off — and
+/// refolding it would leave the recurrent state describing a different prefix
+/// from the K/V stack beside it, which no later call can detect and which shows
+/// up only as wrong tokens.
+///
+/// `lin` carries one slot per decoder layer, and on a hybrid most of them belong
+/// to full-attention layers that never touch a recurrence. Those record nothing
+/// and hold no state, and are skipped. Holding no state is what separates them
+/// from a recurrent layer whose forward failed to record: that one has a state
+/// this round advanced, and an empty tape for it is the defect above.
+fn refold_lin_tapes(
+    lin: &mut [LinearAttnCache],
+    round_len: usize,
+    kept: usize,
+    charge: bool,
+    device: Device,
+) -> Result<()> {
+    let mut refolded: Vec<Array> = Vec::new();
+    for (idx, cache) in lin.iter_mut().enumerate() {
+        let Some(tape) = cache.take_tape() else {
+            return Err(Error::Model(format!(
+                "refold_lin_tapes: recurrent layer {idx} has no round tape, so the \
+                 {round_len} positions this round fed through it were never recorded \
+                 and its state cannot be rolled back to {kept}"
+            )));
+        };
+        let taped = tape.positions();
+        if taped == 0 && cache.conv_state.is_none() && cache.delta_state.is_none() {
+            continue;
+        }
+        if taped != round_len {
+            return Err(Error::Model(format!(
+                "refold_lin_tapes: recurrent layer {idx} taped {taped} positions over \
+                 {} forwards but the round fed {round_len} — the tape does not describe \
+                 this round",
+                tape.segments().len(),
+            )));
+        }
+        let Some(state_in) = tape.state_in() else {
+            return Err(Error::Model(format!(
+                "refold_lin_tapes: recurrent layer {idx} taped {taped} positions with no \
+                 pre-round state"
+            )));
+        };
+        let conv = concat_tape_conv_input(&tape, device)?;
+        // What the conv1d carries into the next call is the `kernel - 1`
+        // positions before its next input, and the tape's conv input opens with
+        // exactly those, so the round's own carry sits at `kept`.
+        let pad = super::seq_len(&conv)? - taped as i32;
+        cache.conv_state = Some(super::seq_range(
+            &conv,
+            kept as i32,
+            kept as i32 + pad,
+            device,
+        )?);
+        cache.delta_state = Some(if kept == 0 {
+            state_in.try_clone()?
+        } else {
+            let (_y, state_out) = crate::gated_delta_msl::gated_delta_step_gpu(
+                &tape_prefix(&tape, |s| &s.q, kept, device)?,
+                &tape_prefix(&tape, |s| &s.k, kept, device)?,
+                &tape_prefix(&tape, |s| &s.v, kept, device)?,
+                &tape_prefix(&tape, |s| &s.g, kept, device)?,
+                &tape_prefix(&tape, |s| &s.beta, kept, device)?,
+                state_in,
+                device,
+            )?;
+            state_out
+        });
+        if charge {
+            // Nothing reads the refolded state until the next round's forward,
+            // so with nothing forcing it here the whole refold is billed to that
+            // round. See `phases_charged`. Issued for every layer first and
+            // waited on afterwards: draining each layer in turn would price the
+            // rollback at the cost of serialising it.
+            for a in [&cache.conv_state, &cache.delta_state]
+                .into_iter()
+                .flatten()
+            {
+                a.async_eval()?;
+                refolded.push(a.try_clone()?);
+            }
+        }
+    }
+    for a in &refolded {
+        a.eval()?;
+    }
+    Ok(())
+}
+
+/// The round's conv1d input across every taped forward, carried prefix included.
+///
+/// Each forward's input opens with the `kernel - 1` positions it carried in from
+/// its predecessor, and those are already in that predecessor's segment, so only
+/// the first segment contributes its prefix.
+fn concat_tape_conv_input(tape: &GdnTape, device: Device) -> Result<Array> {
+    let Some((first, rest)) = tape.segments().split_first() else {
+        return Err(Error::Model(
+            "concat_tape_conv_input: empty round tape".into(),
+        ));
+    };
+    if rest.is_empty() {
+        return first.conv_input.try_clone();
+    }
+    let pad = super::seq_len(&first.conv_input)? - first.len as i32;
+    let mut parts: Vec<Array> = Vec::with_capacity(rest.len() + 1);
+    parts.push(first.conv_input.try_clone()?);
+    for seg in rest {
+        let len = super::seq_len(&seg.conv_input)?;
+        parts.push(super::seq_range(&seg.conv_input, pad, len, device)?);
+    }
+    concatenate(&parts.iter().collect::<Vec<_>>(), 1, device)
+}
+
+/// One recurrence input over the round's first `kept` positions, joined across
+/// whatever forwards produced them.
+///
+/// `kept` is at most the tape's position count, checked by the caller.
+fn tape_prefix(
+    tape: &GdnTape,
+    field: fn(&GdnTapeSegment) -> &Array,
+    kept: usize,
+    device: Device,
+) -> Result<Array> {
+    let mut parts: Vec<Array> = Vec::new();
+    let mut taken = 0usize;
+    for seg in tape.segments() {
+        if taken >= kept {
+            break;
+        }
+        let want = (kept - taken).min(seg.len);
+        parts.push(super::seq_range(field(seg), 0, want as i32, device)?);
+        taken += want;
+    }
+    match parts.len() {
+        1 => parts
+            .pop()
+            .ok_or_else(|| Error::Model("tape_prefix: a one-part join lost its part".into())),
+        _ => concatenate(&parts.iter().collect::<Vec<_>>(), 1, device),
+    }
+}
+
 /// Roll one speculative round's caches back to `target_offset` after a partial
 /// acceptance — both the full-attention `kv` stack and, when the arch has one,
 /// the GDN recurrent state in `lin`.
@@ -318,7 +466,7 @@ fn rollback_round_caches(
     let Some(lin) = lin.filter(|l| !l.is_empty()) else {
         return Ok(());
     };
-    super::refold_lin_tapes(lin, round_tokens.len(), kept, charge, device)
+    refold_lin_tapes(lin, round_tokens.len(), kept, charge, device)
 }
 
 /// Return a round's caches to the prefix the verifier kept, or drop the round
