@@ -36,6 +36,7 @@ pub mod gemma4_assistant;
 pub mod mtp;
 
 pub(crate) mod draft_kind;
+pub(crate) mod round_common;
 pub(crate) mod round_stats;
 
 // kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
@@ -685,14 +686,18 @@ impl SpeculativeDispatcher {
         let mut draft_ns: u128 = 0;
         let mut verifier_ns: u128 = 0;
 
-        // Resolve KV quant — same value for verifier and draft. The drafter
-        // stack resolves its own default, so it must read the same constant the
-        // verifier does or a spec pair runs two different caches.
-        let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-        // The verifier's limits bound the pair; an over-capacity `--max-ctx`
-        // is refused here rather than overflowing a cache mid-round.
-        let ctx = verifier_context(&self.verifier, max_ctx_override)?;
-        let max_seq = ctx.ceiling;
+        // A layer that reports a sliding window gets the RotatingKvCache port
+        // whatever codec it is handed — the branch is `window > 0` alone
+        // (`KvCache::with_quant_max_seq_window`), so an SWA layer here is bf16
+        // at `sliding_window` tokens under every `kv_quant`, and only the
+        // full-attention layers quantize. A block-verify write leaves that ring
+        // holding its window plus the block, which is what lets the rollback
+        // below drop the rejected tail out of it losslessly.
+        let (kv_quant, max_seq, mut verifier_caches) = round_common::verifier_cache_stack(
+            &self.verifier,
+            kv_quant_override,
+            max_ctx_override,
+        )?;
 
         tracing::info!(
             k,
@@ -703,30 +708,12 @@ impl SpeculativeDispatcher {
             "spec_generate_greedy_cached: starting — persistent caches + truncate_to"
         );
 
-        // --- Allocate per-layer caches for verifier and draft. ---------
-        // A layer that reports a sliding window gets the RotatingKvCache port
-        // whatever codec it is handed — the branch is `window > 0` alone
-        // (`KvCache::with_quant_max_seq_window`), so an SWA layer here is bf16
-        // at `sliding_window` tokens under every `kv_quant`, and only the
-        // full-attention layers quantize. A block-verify write leaves that ring
-        // holding its window plus the block, which is what lets the rollback
-        // below drop the rejected tail out of it losslessly.
-        let mut verifier_caches: Vec<KvCache> = (0..self.verifier.num_hidden_layers())
-            .map(|i| {
-                let window = self.verifier.layer_sliding_window(i);
-                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                    .with_max_seq_ceiling(ctx.ceiling)
-                    .with_layer_idx(i)
-                    // The stack decides whether its layers read each other's
-                    // K/V, and so whether Mixed/RotK keep their bf16 mirror.
-                    .with_shares_kv(self.verifier.shares_kv_across_layers())
-            })
-            .collect();
+        // --- Allocate per-layer caches for the draft model. ------------
         let mut draft_caches: Vec<KvCache> = (0..draft.num_hidden_layers())
             .map(|i| {
                 let window = draft.layer_sliding_window(i);
                 KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                    .with_max_seq_ceiling(ctx.ceiling)
+                    .with_max_seq_ceiling(max_seq)
                     .with_layer_idx(i)
                     .with_shares_kv(draft.shares_kv_across_layers())
             })
@@ -1113,11 +1100,11 @@ impl SpeculativeDispatcher {
         let mut draft_ns: u128 = 0;
         let mut verifier_ns: u128 = 0;
 
-        // Same constant the verifier resolves — a spec pair must not run two
-        // different caches.
-        let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-        let ctx = verifier_context(&self.verifier, max_ctx_override)?;
-        let max_seq = ctx.ceiling;
+        let (kv_quant, max_seq, mut verifier_caches) = round_common::verifier_cache_stack(
+            &self.verifier,
+            kv_quant_override,
+            max_ctx_override,
+        )?;
 
         tracing::info!(
             k,
@@ -1132,22 +1119,11 @@ impl SpeculativeDispatcher {
             "spec_generate_stochastic_cached: starting (Leviathan stochastic acceptance)"
         );
 
-        let mut verifier_caches: Vec<KvCache> = (0..self.verifier.num_hidden_layers())
-            .map(|i| {
-                let window = self.verifier.layer_sliding_window(i);
-                KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                    .with_max_seq_ceiling(ctx.ceiling)
-                    .with_layer_idx(i)
-                    // The stack decides whether its layers read each other's
-                    // K/V, and so whether Mixed/RotK keep their bf16 mirror.
-                    .with_shares_kv(self.verifier.shares_kv_across_layers())
-            })
-            .collect();
         let mut draft_caches: Vec<KvCache> = (0..draft.num_hidden_layers())
             .map(|i| {
                 let window = draft.layer_sliding_window(i);
                 KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                    .with_max_seq_ceiling(ctx.ceiling)
+                    .with_max_seq_ceiling(max_seq)
                     .with_layer_idx(i)
                     .with_shares_kv(draft.shares_kv_across_layers())
             })

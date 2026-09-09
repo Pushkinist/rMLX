@@ -255,13 +255,10 @@ const CEILING_CONSUMERS: &[&str] = &[
     "crates/rmlx-cli/src/commands/baseline.rs",
     "crates/rmlx-cli/src/commands/bench.rs",
     // Speculative: the verifier's limits bound the pair. `speculative/mod.rs`
-    // holds the `verifier_context` wrapper the five sidecar drivers call.
-    "crates/rmlx-models/src/speculative/dflash/mod.rs",
-    "crates/rmlx-models/src/speculative/dflash2/round.rs",
-    "crates/rmlx-models/src/speculative/eagle3/mod.rs",
-    "crates/rmlx-models/src/speculative/gemma4_assistant.rs",
+    // holds the `verifier_context` wrapper, and `round_common.rs` is where every
+    // round loop resolves its verifier's ceiling and cache stack.
     "crates/rmlx-models/src/speculative/mod.rs",
-    "crates/rmlx-models/src/speculative/mtp.rs",
+    "crates/rmlx-models/src/speculative/round_common.rs",
 ];
 
 /// The only places allowed to name `max_position_embeddings` at all — the

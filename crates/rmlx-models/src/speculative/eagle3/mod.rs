@@ -851,26 +851,11 @@ pub fn eagle3_generate(
         drafter.cfg.block_size,
     );
 
-    // Same constant the verifier resolves — a spec pair must not run two
-    // different caches.
-    let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    // The verifier's limits bound the pair; an over-capacity `--max-ctx` is
-    // refused here rather than overflowing a cache mid-round.
-    let ctx = crate::speculative::verifier_context(verifier, max_ctx_override)?;
-    let max_seq = ctx.ceiling;
-
-    let mut v_caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
-        .map(|i| {
-            let window = verifier.layer_sliding_window(i);
-            KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                .with_max_seq_ceiling(ctx.ceiling)
-                .with_layer_idx(i)
-                // The verifier stack decides whether its layers read each
-                // other's K/V, and so whether Mixed/RotK keep their bf16
-                // mirror. A spec pair must not run two different caches.
-                .with_shares_kv(verifier.shares_kv_across_layers())
-        })
-        .collect();
+    let (kv_quant, max_seq, mut v_caches) = crate::speculative::round_common::verifier_cache_stack(
+        verifier,
+        kv_quant_override,
+        max_ctx_override,
+    )?;
     let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
         .collect();
