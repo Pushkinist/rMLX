@@ -304,8 +304,11 @@ ITL_MEAN_FROM = int(os.environ.get("STUB_ITL_MEAN_FROM", "0"))
 SAMPLED = os.environ.get("STUB_SAMPLED", "1") == "1"
 # A delay between the wire's last chunk and the sampler event's write, still
 # inside do_POST and so still before [DONE] closes the response. A caller
-# blocked on the streamed body cannot observe anything between the two.
-SAMPLER_DELAY_S = float(os.environ.get("STUB_SAMPLER_DELAY_S", "0"))
+# blocked on the streamed body cannot observe anything between the two. A
+# stub argument, not an environment variable — the one case that stages it
+# starts this server directly rather than through the CLI surface below,
+# which has no flag for it and should not grow one for a test-only delay.
+SAMPLER_DELAY_S = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
 SAMPLER_LINES = int(os.environ.get("STUB_SAMPLER_LINES", "-1"))
 SAMPLER_TOP_K = int(os.environ.get("STUB_SAMPLER_TOP_K", "20"))
 SAMPLER_TOP_K_PASS2 = os.environ.get("STUB_SAMPLER_TOP_K_PASS2", "")
@@ -540,10 +543,12 @@ metrics)
 serve)
 	port=8090
 	speculative=0
+	sampler_delay=0
 	while [ \$# -gt 0 ]; do
 		case "\$1" in
 		--port) port="\$2" ;;
 		--draft-model) speculative=1 ;;
+		--sampler-delay-s) sampler_delay="\$2" ;;
 		esac
 		shift
 	done
@@ -569,7 +574,7 @@ serve)
 		printf '%s\n' "{\"timestamp\":\"2026-09-06T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"\$kv\"}}" >>"\$log"
 	fi
 	export STUB_LOG="\$log" STUB_SPECULATIVE="\$speculative" STUB_PASS="\$pass"
-	exec python3 "${SERVER_PY}" "\$port"
+	exec python3 "${SERVER_PY}" "\$port" "\$sampler_delay"
 	;;
 esac
 STUBEOF
@@ -975,11 +980,46 @@ verdict
 # delay placed on the sampler write itself, still ahead of that same response,
 # is the sharpest version of "the read came before the write" this harness can
 # stage; it passing is what rules that mechanism out rather than assuming it.
-run_case sampler_write_delay_does_not_race_the_read 0 \
-    "a delayed sampler write is still ordered before the response that gates the read" \
-    'STUB_SAMPLER_TOP_K=20' 'STUB_SAMPLER_DELAY_S=2'
-[ "$(jq_of "r['protocol']['sampling_resolved']['top_k']")" = "20" ] ||
-    note_bad "top_k=$(jq_of "r['protocol']['sampling_resolved']['top_k']")"
+# `--sampler-delay-s` has no counterpart in the real CLI spec_bench_published.sh
+# validates against, so this drives the stub directly rather than through it —
+# one request is all the mechanism needs.
+CASE_NAME="sampler_write_delay_does_not_race_the_read"
+CASE_WHAT="a delayed sampler write is still ordered before the response that gates the read"
+CASE_BAD=""
+dir="${WORK}/sampler_delay"
+mkdir -p "${dir}/logs"
+CASE_OUT="${WORK}/${CASE_NAME}.log"
+RMLX_HOME="${dir}" "${STUB}" serve --port "${PORT}" --sampler-delay-s 2 \
+    >"${CASE_OUT}" 2>&1 &
+delay_pid=$!
+ready=""
+for _ in $(seq 1 50); do
+    curl -s -o /dev/null "http://127.0.0.1:${PORT}/v1/models" && { ready=1; break; }
+    sleep 0.1
+done
+if [ -z "${ready}" ]; then
+    CASE_BAD="the delayed server never answered /v1/models"
+else
+    curl -s -H "Content-Type: application/json" \
+        --data-binary '{"model":"stub","stream":true,"max_tokens":8,
+            "messages":[{"role":"user","content":"hi"}]}' \
+        "http://127.0.0.1:${PORT}/v1/chat/completions" -o /dev/null
+fi
+kill "${delay_pid}" 2>/dev/null || true
+wait "${delay_pid}" 2>/dev/null || true
+if [ -z "${CASE_BAD}" ]; then
+    log="$(ls "${dir}"/logs/*.jsonl 2>/dev/null | head -1)"
+    [ -n "${log}" ] || CASE_BAD="the delayed server wrote no run log"
+fi
+if [ -z "${CASE_BAD}" ]; then
+    top_k="$(python3 -c 'import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    fields = json.loads(line)["fields"]
+    if fields.get("message", "").startswith("generate: host categorical sampler"):
+        print(fields["top_k"])
+        break' "${log}" 2>/dev/null)"
+    [ "${top_k}" = "20" ] || CASE_BAD="top_k=${top_k} (want 20, or no sampler event at all)"
+fi
 verdict
 
 # Two guards, two cases: one pass whose requests did not share a setting, and
