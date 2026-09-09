@@ -112,11 +112,12 @@
     clippy::too_many_lines,
     clippy::used_underscore_binding
 )]
-// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
-// caches a round builds live for that round only: they are never pushed to the
-// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
-// description has to match them. Applying the boundary promotion here would
-// change the codec of a stack whose only reader is the round that built it.
+// kv-layer-quants: uniform — the one cache built here is the drafter's own, a
+// single unquantized cache for a single-layer head rather than a per-layer
+// stack, and it lives for one request: never pushed to the prompt cache, never
+// spilled, never keyed by `layout_key`, so no on-disk description has to match
+// it. The verifier's stack is built by `speculative::round_common`, which
+// carries its own declaration.
 
 use std::path::Path;
 
