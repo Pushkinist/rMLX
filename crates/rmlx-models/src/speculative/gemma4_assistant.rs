@@ -75,7 +75,7 @@ use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
 use crate::speculative::round_common::{
     emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
-    verifier_cache_stack, RoundTotals,
+    rollback_round, verifier_cache_stack, RoundTotals,
 };
 
 /// One drafter decoder layer (Gemma4 shape, Q-only - K/V are shared).
@@ -926,17 +926,15 @@ pub fn mtp_assistant_generate(
         let t0 = Instant::now();
         let v_target = super::rollback_target_from_head(pre_round_offset, accept);
         let rejected = v_k as i32 - (accept as i32 + 1);
-        if rejected > 0 {
-            super::rollback_round_caches(
-                &mut caches,
-                None,
-                &verify_input,
-                pre_round_offset,
-                v_target,
-                charge_phases,
-                device,
-            )?;
-        }
+        rollback_round(
+            &mut caches,
+            None,
+            &verify_input,
+            pre_round_offset,
+            v_target,
+            charge_phases,
+            device,
+        )?;
 
         // Next hidden = verifier penultimate at the accepted position, then
         // final-normed (speculative_draft_hidden) for the drafter conditioning.

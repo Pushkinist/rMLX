@@ -49,12 +49,11 @@ use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::round_common::{
     emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
-    verifier_cache_stack, RoundTotals,
+    rollback_round, verifier_cache_stack, RoundTotals,
 };
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
-    conditioning_residual, disarm_lin_tapes, guard_round_conditioning,
-    guard_verifier_prefill_logits, phases_charged, rollback_round_caches,
+    conditioning_residual, guard_round_conditioning, guard_verifier_prefill_logits, phases_charged,
     rollback_target_from_tail, round_block, DecodeWindow, RoundPhases, SpecLoop, VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
@@ -360,20 +359,15 @@ pub fn dflash2_generate(
         let v_offset_before = v_caches.iter().map(KvCache::offset).max().unwrap_or(0);
         let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
         let refolded = v_target < v_offset_before;
-        if refolded {
-            let v_pre_round_offset = v_offset_before - v_k as i32;
-            rollback_round_caches(
-                &mut v_caches,
-                Some(&mut v_lin),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                charge_phases,
-                device,
-            )?;
-        } else {
-            disarm_lin_tapes(Some(&mut v_lin));
-        }
+        rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_offset_before - v_k as i32,
+            v_target,
+            charge_phases,
+            device,
+        )?;
         let round_rollback_ns = t0.elapsed().as_nanos();
 
         // The carry token and the accepted proposals.

@@ -6,7 +6,7 @@
 #   A round loop decides once whether its phases are charged for the work they
 #   issue — `phases_charged()` in three loops, a literal `false` in four — and
 #   then repeats that decision in two unrelated places: the `charge` argument of
-#   every `rollback_round_caches(...)` it makes, and the `charged:` field of
+#   every `rollback_round(...)` it makes, and the `charged:` field of
 #   every `RoundPhases` event it logs and of the `RoundTotals` it hands the one
 #   recorder. Nothing holds the two together. A loop whose rollback charges and whose record says it did not
 #   moves the phase timings and re-attributes the work to the drafter, with
@@ -36,7 +36,7 @@
 #   rather than slipping past a number typed into this file.
 #
 # RULE 1 (one decision per loop)
-#   Within one round loop, the `charge` argument of every `rollback_round_caches`
+#   Within one round loop, the `charge` argument of every `rollback_round`
 #   call and the value of every `charged:` field must be the same token. The
 #   record is assembled elsewhere now, so the field the loop still writes is the
 #   `charged:` of the `RoundTotals` it hands over — the decision is named at the
@@ -52,10 +52,17 @@
 #   among the three that ask.
 #
 # RULE 4 (nothing charges outside the population)
-#   A fn that is not a round loop and calls `rollback_round_caches` is either a
-#   loop the derivation lost or a rollback moved out of one. Both read as a
-#   census that moved, which invites the census to be edited; both are exit 2
-#   here instead.
+#   A fn that is not a round loop and calls `rollback_round` is either a loop
+#   the derivation lost or a rollback moved out of one. Both read as a census
+#   that moved, which invites the census to be edited; both are exit 2 here
+#   instead.
+#
+#   `rollback_round` is the shared refold-or-disarm, and it is not itself a
+#   site: it forwards the `charge` its caller named, down to the low-level
+#   `rollback_round_caches`, whose name this needle does not match. That is the
+#   same split RULE 5 makes on the record side — the decision stays at the
+#   loop's own call site, where the rollback beside it can be read against it,
+#   and the shared code carries it rather than naming one.
 #
 # RULE 5 (nothing names the decision outside the population either)
 #   A fn that is not a round loop and carries a `charged:` field names a
@@ -148,7 +155,7 @@ records=$(
         reset()
       }
       # The `charge` argument of a call whose arguments are one per line:
-      # caches, lin, fed, pre-round offset, target, charge, device.
+      # caches, lin, round tokens, pre-round offset, target, charge, device.
       function close_call(   n) {
         n = split(args, a, "\x1f")
         addtok(n == 7 ? a[6] : "?")
@@ -237,10 +244,12 @@ records=$(
 
       # Only a call opens one: the definition carries no charge argument, and a
       # call written on one line is a shape this scan does not read back.
-      index(stripped, "rollback_round_caches(") > 0 &&
-      stripped !~ /fn[[:space:]]+rollback_round_caches/ {
+      # `rollback_round_caches(` does not contain this needle, so the shared
+      # helper forwarding its own `charge` is not a site.
+      index(stripped, "rollback_round(") > 0 &&
+      stripped !~ /fn[[:space:]]+rollback_round\(/ {
         rest = stripped
-        sub(/^.*rollback_round_caches\(/, "", rest)
+        sub(/^.*rollback_round\(/, "", rest)
         if (rest ~ /[^[:space:]]/) { addtok("?"); nroll++ } else { in_call = 1; args = "" }
       }
 

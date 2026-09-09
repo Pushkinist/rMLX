@@ -858,20 +858,16 @@ impl SpeculativeDispatcher {
             // recurrent state — which advanced by `v_k` and cannot be sliced —
             // is refolded from the round tape over the retained prefix. On a
             // FULL accept nothing was dropped and the tape is discarded.
-            if v_target < v_offset_before {
-                rollback_round_caches(
-                    &mut verifier_caches,
-                    verifier_lin.as_deref_mut(),
-                    &v_input,
-                    v_offset_before - v_k as i32,
-                    v_target,
-                    // This loop times no phases, so it never charges one.
-                    false,
-                    device,
-                )?;
-            } else {
-                disarm_lin_tapes(verifier_lin.as_deref_mut());
-            }
+            round_common::rollback_round(
+                &mut verifier_caches,
+                verifier_lin.as_deref_mut(),
+                &v_input,
+                v_offset_before - v_k as i32,
+                v_target,
+                // This loop times no phases, so it never charges one.
+                false,
+                device,
+            )?;
 
             // Draft cache: it processed num_draft tokens (1 carry + K-1
             // intermediates each producing the next, total cache advance
@@ -887,26 +883,21 @@ impl SpeculativeDispatcher {
             // never fed back), so that is the token sequence the rollback keeps
             // the retained prefix of — and the length its accumulated tape has
             // to match.
-            if d_target < d_offset_before {
-                let mut d_fed: Vec<u32> = Vec::with_capacity(d_seed.len() + draft_tokens.len());
-                d_fed.extend_from_slice(&d_seed);
-                if draft_tokens.len() > 1 {
-                    d_fed.extend_from_slice(&draft_tokens[..draft_tokens.len() - 1]);
-                }
-                let d_pre_round_offset = d_offset_before - d_fed.len() as i32;
-                rollback_round_caches(
-                    &mut draft_caches,
-                    draft_lin.as_deref_mut(),
-                    &d_fed,
-                    d_pre_round_offset,
-                    d_target,
-                    // This loop times no phases, so it never charges one.
-                    false,
-                    device,
-                )?;
-            } else {
-                disarm_lin_tapes(draft_lin.as_deref_mut());
+            let mut d_fed: Vec<u32> = Vec::with_capacity(d_seed.len() + draft_tokens.len());
+            d_fed.extend_from_slice(&d_seed);
+            if draft_tokens.len() > 1 {
+                d_fed.extend_from_slice(&draft_tokens[..draft_tokens.len() - 1]);
             }
+            round_common::rollback_round(
+                &mut draft_caches,
+                draft_lin.as_deref_mut(),
+                &d_fed,
+                d_offset_before - d_fed.len() as i32,
+                d_target,
+                // This loop times no phases, so it never charges one.
+                false,
+                device,
+            )?;
 
             // Setup next round's carry tokens. Verifier carry is always
             // 1 token (= correction or bonus). Draft seed prepends the
@@ -1261,44 +1252,35 @@ impl SpeculativeDispatcher {
                 .max()
                 .unwrap_or(0);
             let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-            if v_target < v_offset_before {
-                rollback_round_caches(
-                    &mut verifier_caches,
-                    verifier_lin.as_deref_mut(),
-                    &v_input,
-                    v_offset_before - v_k as i32,
-                    v_target,
-                    // This loop times no phases, so it never charges one.
-                    false,
-                    device,
-                )?;
-            } else {
-                disarm_lin_tapes(verifier_lin.as_deref_mut());
-            }
+            round_common::rollback_round(
+                &mut verifier_caches,
+                verifier_lin.as_deref_mut(),
+                &v_input,
+                v_offset_before - v_k as i32,
+                v_target,
+                // This loop times no phases, so it never charges one.
+                false,
+                device,
+            )?;
 
             let d_offset_before = draft_caches.iter().map(KvCache::offset).max().unwrap_or(0);
             let d_drop = draft_rows_to_drop(draft_tokens.len(), accept);
             let d_target = d_offset_before - d_drop;
-            if d_target < d_offset_before {
-                let mut d_fed: Vec<u32> = Vec::with_capacity(d_seed.len() + draft_tokens.len());
-                d_fed.extend_from_slice(&d_seed);
-                if draft_tokens.len() > 1 {
-                    d_fed.extend_from_slice(&draft_tokens[..draft_tokens.len() - 1]);
-                }
-                let d_pre_round_offset = d_offset_before - d_fed.len() as i32;
-                rollback_round_caches(
-                    &mut draft_caches,
-                    draft_lin.as_deref_mut(),
-                    &d_fed,
-                    d_pre_round_offset,
-                    d_target,
-                    // This loop times no phases, so it never charges one.
-                    false,
-                    device,
-                )?;
-            } else {
-                disarm_lin_tapes(draft_lin.as_deref_mut());
+            let mut d_fed: Vec<u32> = Vec::with_capacity(d_seed.len() + draft_tokens.len());
+            d_fed.extend_from_slice(&d_seed);
+            if draft_tokens.len() > 1 {
+                d_fed.extend_from_slice(&draft_tokens[..draft_tokens.len() - 1]);
             }
+            round_common::rollback_round(
+                &mut draft_caches,
+                draft_lin.as_deref_mut(),
+                &d_fed,
+                d_offset_before - d_fed.len() as i32,
+                d_target,
+                // This loop times no phases, so it never charges one.
+                false,
+                device,
+            )?;
 
             v_carry = vec![next_y_token];
             if accept == draft_tokens.len() {

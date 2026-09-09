@@ -146,10 +146,10 @@ loop until n_tokens emitted:
   # Phase D — cache rollback (one helper, both sides)
   v_drop = K - accept          # positions to discard from verifier cache
   d_drop = max(K - accept - 1, 0)
-  rollback_round_caches(verifier_caches, verifier_lin,
-                        v_input, v_pre_round_offset, offset - v_drop)
-  rollback_round_caches(draft_caches, draft_lin,
-                        d_fed, d_pre_round_offset, offset - d_drop)
+  rollback_round(verifier_caches, verifier_lin,
+                 v_input, v_pre_round_offset, offset - v_drop)
+  rollback_round(draft_caches, draft_lin,
+                 d_fed, d_pre_round_offset, offset - d_drop)
 
   if accept == K:
     ds = [last_draft, y]   # draft cache lagged one position — prepend dK
@@ -282,7 +282,7 @@ host bookkeeping. The four phases are disjoint sub-spans of the round, so
 claiming more than the round has means a timer started outside it — that is an
 `error!` naming the phases rather than an `other_ms` near zero that reads like
 rounding. `refolded` says whether that round took the recurrent arm of
-`rollback_round_caches`.
+`rollback_round`.
 
 `charged` is the field that says how to read the rest. At `debug` the phases are
 timed but not forced, so the lazy tails above still move between them. At
@@ -296,12 +296,12 @@ charged run's `round_ms` against an uncharged one's before trusting either.
 
 **The decision is the loop's, made once per request, and it travels on the
 record.** `phases_charged()` is read at the loop head and passed down — to
-`rollback_round_caches` as an argument, and onto the `charged` of the
+`rollback_round` as an argument, and onto the `charged` of the
 `RoundTotals` each loop hands
 [`round_common::log_request_record`](../crates/rmlx-models/src/speculative/round_common.rs),
 the one place a `RoundStats` is assembled, so it reaches the `done` line every
 loop writes. Two things depend on that.
-`rollback_round_caches` is shared by eight call sites across seven loops and
+`rollback_round` is shared by nine call sites across seven loops and
 only three of those loops time their phases; a switch it read on its own behalf would change how the other four
 schedule work, with nothing on their records saying so — they pass `false` and
 report `charged=false`.
@@ -325,7 +325,7 @@ change to a round loop's phase spans.
 charged: the Gemma4 MTP assistant, the Qwen3.5-family MTP sidecar and DFlash 2.
 The other four — DFlash 1, EAGLE-3 and the two two-model loops — keep only the
 request-level `draft_ms` and `verifier_ms`, pass `false` to
-`rollback_round_caches` and report `charged=false`, so **their drafter figure
+`rollback_round` and report `charged=false`, so **their drafter figure
 carries the same inflation and no setting corrects it**. DFlash 1's round has
 the same four phases as DFlash 2's and giving it the instrument is a port of
 that one. EAGLE-3's is not: its drafter re-runs over the accepted prefix in a
@@ -1608,7 +1608,7 @@ drafter's window reaches back over (2047 here) — the depth the reference
 conditions on, not the last prompt token alone — then per round drafts a block,
 scores the carry token and every proposal in one verify forward, accepts the
 agreed prefix through the shared `accept_prefix`, and rolls the caches back over
-the rest through the shared `rollback_round_caches`. The block is the one the
+the rest through the shared `rollback_round`. The block is the one the
 drafter was trained at every round; only the token budget shortens it, so this
 loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
 

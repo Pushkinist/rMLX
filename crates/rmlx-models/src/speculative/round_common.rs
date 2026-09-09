@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use rmlx_core::error::Result;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+use rmlx_mlx::Device;
 
 use super::eagle3::DecidedBy;
 use super::{DecodeWindow, RoundStats, SpecLoop};
@@ -238,6 +239,48 @@ pub(crate) fn emit_round_tokens(
         }
     }
     false
+}
+
+/// Return a round's caches to the prefix the verifier kept, or drop the round
+/// tape when it kept all of it.
+///
+/// `pre_round_offset` is where the caches stood before they consumed
+/// `round_tokens`, so `pre_round_offset + round_tokens.len()` is where they
+/// stand now and a `target_offset` below it is a partial accept. On a partial
+/// accept the attention caches are truncated and the recurrent state — which
+/// has no sequence axis to slice — is refolded from the tape over the retained
+/// prefix; on a full accept nothing was dropped and the tape is discarded.
+///
+/// `charge` is the loop's own phase-charge decision, forwarded rather than
+/// made here: it belongs at the call site, beside the record that has to name
+/// the same one.
+///
+/// # Errors
+///
+/// [`rmlx_core::error::Error::Model`] when the retained prefix is longer than
+/// the round fed, or the refold cannot replay it.
+pub(crate) fn rollback_round(
+    kv: &mut [KvCache],
+    lin: Option<&mut [LinearAttnCache]>,
+    round_tokens: &[u32],
+    pre_round_offset: i32,
+    target_offset: i32,
+    charge: bool,
+    device: Device,
+) -> Result<()> {
+    if target_offset < pre_round_offset + round_tokens.len() as i32 {
+        return super::rollback_round_caches(
+            kv,
+            lin,
+            round_tokens,
+            pre_round_offset,
+            target_offset,
+            charge,
+            device,
+        );
+    }
+    super::disarm_lin_tapes(lin);
+    Ok(())
 }
 
 /// Emit a sidecar loop's seed token, and say whether it ended the request.

@@ -78,7 +78,7 @@ use crate::arch::Architecture;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use crate::speculative::round_common::{
     emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
-    verifier_cache_stack, RoundTotals,
+    rollback_round, verifier_cache_stack, RoundTotals,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -841,22 +841,16 @@ pub fn dflash_generate(
         // draft slots + the carry b). KV target = pre + accept + 1 carry-rows.
         let v_target =
             super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        if v_target < v_offset_before {
-            let v_pre_round_offset = v_offset_before - v_k as i32;
-            super::rollback_round_caches(
-                &mut v_caches,
-                Some(&mut v_lin),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                // This loop times no phases, so it never charges one.
-                false,
-                device,
-            )?;
-        } else {
-            // Full accept — GDN already correct; drop the tape.
-            super::disarm_lin_tapes(Some(&mut v_lin));
-        }
+        rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_offset_before - v_k as i32,
+            v_target,
+            // This loop times no phases, so it never charges one.
+            false,
+            device,
+        )?;
 
         // Append this round's committed verifier hidden to the accumulated
         // conditioning context (the reference feeds the committed

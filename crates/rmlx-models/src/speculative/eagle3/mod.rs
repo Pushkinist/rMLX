@@ -131,7 +131,7 @@ use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use crate::speculative::round_common::{
     emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
-    verifier_cache_stack, RoundTotals,
+    rollback_round, verifier_cache_stack, RoundTotals,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -1181,21 +1181,16 @@ pub fn eagle3_generate(
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
         let v_target =
             super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        if v_target < v_offset_before {
-            let v_pre_round_offset = v_offset_before - v_k as i32;
-            super::rollback_round_caches(
-                &mut v_caches,
-                Some(&mut v_lin),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                // This loop times no phases, so it never charges one.
-                false,
-                device,
-            )?;
-        } else {
-            super::disarm_lin_tapes(Some(&mut v_lin));
-        }
+        rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_offset_before - v_k as i32,
+            v_target,
+            // This loop times no phases, so it never charges one.
+            false,
+            device,
+        )?;
 
         // -- Phase E: drafter accept-and-reseed. --
         //
