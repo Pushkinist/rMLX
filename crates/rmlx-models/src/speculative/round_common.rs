@@ -94,6 +94,7 @@ pub(crate) fn cache_stack(arch: &Architecture, kv_quant: KvQuant, max_seq: i32) 
 /// recurrent layers outright and always has a stack, while the two-model loops
 /// serve both kinds and hold `None` for a verifier or a draft model that reads
 /// the parameter and ignores it.
+#[must_use]
 pub(crate) fn lin_cache_stack(arch: &Architecture) -> Vec<LinearAttnCache> {
     (0..arch.num_hidden_layers())
         .map(|_| LinearAttnCache::new())
@@ -222,6 +223,8 @@ pub(crate) fn log_request_record(
 /// drafter's own, confirmed by a restricted argmax; the rest were taken over
 /// the whole vocabulary. One entry per emitted token, and every other loop
 /// passes `None`.
+#[must_use = "the stop signal is the caller's: a round whose token ended the request \
+                  must not run another one"]
 pub(crate) fn emit_round_tokens(
     tokenizer: &tokenizers::Tokenizer,
     round_tokens: &[u32],
@@ -370,6 +373,8 @@ pub(crate) fn rollback_round(
 /// it.
 ///
 /// The two-model loops do not call this: they emit nothing before a round.
+#[must_use = "the stop signal is the caller's: a seed that ended the request must not \
+                  be followed by a round"]
 pub(crate) fn emit_seed_token(
     tokenizer: &tokenizers::Tokenizer,
     seed: u32,
