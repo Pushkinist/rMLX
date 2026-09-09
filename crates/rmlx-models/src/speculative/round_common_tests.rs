@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use rmlx_kv_quant::LinearAttnCache;
 use rmlx_mlx::Device;
 
-use super::{rollback_round_caches, round_stats, RoundTotals};
+use super::{rollback_round, rollback_round_caches, round_stats, RoundTotals};
 use crate::decode_loop::ProbeStep;
 use crate::speculative::{DecodeWindow, SpecLoop};
 
@@ -208,4 +208,48 @@ fn rollback_refuses_offsets_that_overrun_the_round() {
         err.contains("retained prefix 5 exceeds the 3 tokens"),
         "offsets that overrun the round must be refused; got: {err:?}"
     );
+}
+
+/// Which arm the rollback takes is decided by the round's own extent, and it is
+/// decidable without a device.
+///
+/// The caches stand at `pre_round_offset + round_tokens.len()`, so a target
+/// below that dropped positions and one at or above it dropped none. A fresh
+/// recurrent cache separates the two arms: the refold arm asks it for the tape
+/// its forwards were supposed to record and refuses when there is none, and the
+/// disarm arm takes whatever tape is there and returns.
+///
+/// Mutation: `<` to `<=` in [`rollback_round`]. A full accept then refolds a
+/// prefix nothing rejected — which on a real round is a recurrent state rebuilt
+/// from a tape the loop was about to drop.
+#[test]
+fn the_rollback_refolds_only_when_the_round_dropped_positions() {
+    // (target offset, whether the round dropped anything)
+    let cases = [(99, true), (102, true), (103, false), (104, false)];
+    for (target, dropped) in cases {
+        let mut lin = vec![LinearAttnCache::new()];
+        let err = rollback_round(
+            &mut [],
+            Some(&mut lin),
+            &[1, 2, 3],
+            100,
+            target,
+            false,
+            Device::Cpu,
+        )
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+        let refolded = err.contains("recurrent layer 0 has no round tape");
+        assert_eq!(
+            refolded,
+            dropped,
+            "the caches stand at 103 having consumed three tokens from 100, so a \
+             target of {target} {} — got {err:?}",
+            if dropped {
+                "is a partial accept and must refold"
+            } else {
+                "dropped nothing and must only disarm"
+            }
+        );
+    }
 }
