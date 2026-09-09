@@ -1547,7 +1547,7 @@ fn prefill_chunked_with(
 /// A no-op for full-attention archs, which have no recurrent caches. Call it
 /// once per round, before the forwards that round takes: every GDN forward
 /// through an armed cache records its recurrence inputs, and
-/// [`rollback_round_caches`] refolds them when the round is partly rejected.
+/// [`refold_lin_tapes`] rebuilds them when the round is partly rejected.
 fn arm_lin_tapes(lin: Option<&mut [LinearAttnCache]>) {
     for c in lin.into_iter().flatten() {
         c.arm_tape();

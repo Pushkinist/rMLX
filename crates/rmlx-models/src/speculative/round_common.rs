@@ -116,8 +116,8 @@ pub(crate) struct RoundTotals {
     /// carries no conditioning buffer between rounds.
     pub(crate) conditioned_rows: Option<usize>,
     /// Whether the request ran with its phases charged — the same token the
-    /// loop's `rollback_round_caches` calls take, and the one decision a loop
-    /// makes about how its own work is attributed.
+    /// loop's [`rollback_round`] calls take, and the one decision a loop makes
+    /// about how its own work is attributed.
     pub(crate) charged: bool,
     /// Rounds the loop entered.
     pub(crate) rounds: usize,
@@ -337,8 +337,10 @@ fn rollback_round_caches(
 ///
 /// # Errors
 ///
-/// [`rmlx_core::error::Error::Model`] when the retained prefix is longer than
-/// the round fed, or the refold cannot replay it.
+/// [`rmlx_core::error::Error::Model`] when the refold cannot replay the
+/// retained prefix. The low-level rollback also refuses a prefix longer than
+/// the round fed, which cannot be reached from here: this arm is taken only
+/// when `target_offset` is inside the round.
 pub(crate) fn rollback_round(
     kv: &mut [KvCache],
     lin: Option<&mut [LinearAttnCache]>,

@@ -535,12 +535,13 @@ state is recorded once, at the first. `GdnTape` in
 `crates/rmlx-kv-quant/src/linear_attn.rs` holds both shapes.
 
 Every round loop that can partially accept goes through **one** implementation —
-`speculative::rollback_round_caches`. A full-attention arch (`lin` absent or
-empty) truncates and stops; a GDN hybrid also refolds. Its eight call sites are
-`mtp_generate`, `dflash_generate`, `dflash2_generate`, `eagle3_generate`,
-`mtp_assistant_generate` (full attention, so truncation only) and the classic
-two-model loop's three recurrent ones — greedy verifier, greedy drafter and
-stochastic verifier — plus the stochastic drafter. There is deliberately no
+`speculative::round_common::rollback_round`, which decides the arm and, on a
+partial accept, calls the low-level `rollback_round_caches` beside it. A
+full-attention arch (`lin` absent or empty) truncates and stops; a GDN hybrid
+also refolds. Its nine call sites are `mtp_generate`, `dflash_generate`,
+`dflash2_generate`, `eagle3_generate`, `mtp_assistant_generate` (full attention,
+so truncation only) and the two-model loops' four — greedy verifier, greedy
+drafter, stochastic verifier and stochastic drafter. There is deliberately no
 second copy: the defect the replay was written to fix lived in four independent
 implementations at once, and a rollback inlined per loop is how it got there.
 

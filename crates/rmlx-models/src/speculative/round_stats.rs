@@ -196,7 +196,7 @@ pub(crate) const PHASE_TARGET: &str = "rmlx::spec::phase";
 /// on its own behalf changes the schedule of every one of them — including the
 /// loops that emit no phase event, which would then run differently with
 /// nothing saying so. The answer travels as a `bool`: to
-/// [`super::rollback_round_caches`] as an argument, and onto
+/// [`super::round_common::rollback_round`] as an argument, and onto
 /// [`RoundStats::charged`], which is the field that keeps an ingested row
 /// honest about which schedule produced its `verifier_ms`.
 pub(crate) fn phases_charged() -> bool {
@@ -255,7 +255,7 @@ pub(crate) struct RoundPhases {
     /// verifier, the refold of the accepted prefix.
     pub(crate) rollback_ns: u128,
     /// Whether the round took the recurrent refold arm of
-    /// [`super::rollback_round_caches`].
+    /// [`super::round_common::rollback_round`] rather than its disarm arm.
     pub(crate) refolded: bool,
     /// Whether the phases were charged for the work they issued.
     pub(crate) charged: bool,
