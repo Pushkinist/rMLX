@@ -52,7 +52,7 @@ use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
-use crate::speculative::round_common::verifier_cache_stack;
+use crate::speculative::round_common::{log_request_record, verifier_cache_stack, RoundTotals};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
 /// Loaded MTP-head sidecar weights (Qwen3.5 `mtp.*`, prefix stripped).
@@ -919,25 +919,26 @@ pub fn mtp_generate(
     }
 
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();
-    super::RoundStats {
-        loop_kind: super::SpecLoop::MtpSidecar,
-        block_size: block_total,
-        rounds,
-        emitted: emitted.len(),
+    log_request_record(
+        &RoundTotals {
+            loop_kind: super::SpecLoop::MtpSidecar,
+            block_size: block_total,
+            conditioned_rows: None,
+            charged: charge_phases,
+            rounds,
+            emitted_in_rounds,
+            total_draft,
+            total_accept,
+            prefill_ns,
+            draft_ns,
+            verifier_ns,
+            round_loop_ns,
+            t_total,
+        },
+        &emitted,
         seed_emitted,
-        emitted_in_rounds,
-        conditioned_rows: None,
-        total_draft,
-        total_accept,
-        prefill_ns,
-        draft_ns,
-        verifier_ns,
-        round_loop_ns,
-        elapsed_ns: t_total.elapsed().as_nanos(),
-        decode_tps: window.tps(),
-        charged: charge_phases,
-    }
-    .log_done();
+        &window,
+    );
 
     // Report the verifier's resident KV, so a caller that sampled the verifier
     // arch around this call can attribute the figure to it. This round loop

@@ -1,4 +1,4 @@
-//! What every speculative round loop sets up the same way.
+//! What every speculative round loop sets up, and closes out, the same way.
 //!
 //! Nothing here has a unit test, and cannot: an [`Architecture`] is only
 //! reachable by loading weights. What gates it is a round-loop run against a
@@ -12,10 +12,14 @@
 // description has to match them. Applying the boundary promotion here would
 // change the codec of a stack whose only reader is the round that built it.
 
+use std::time::Instant;
+
 use rmlx_core::error::Result;
 use rmlx_kv_quant::{KvCache, KvQuant};
 
+use super::{DecodeWindow, RoundStats, SpecLoop};
 use crate::arch::Architecture;
+use crate::decode_loop::ProbeStep;
 
 /// The KV codec, context ceiling and per-layer cache stack a round loop runs
 /// its verifier on.
@@ -73,4 +77,80 @@ pub(crate) fn cache_stack(arch: &Architecture, kv_quant: KvQuant, max_seq: i32) 
                 .with_shares_kv(arch.shares_kv_across_layers())
         })
         .collect()
+}
+
+/// What a round loop counted and timed, handed to the one place that records it.
+///
+/// [`RoundStats`] is this plus the three figures a loop does not carry as a
+/// counter, and it is assembled in [`log_request_record`] and nowhere else. A
+/// loop names its own numbers here; a field added to the record is added once.
+pub(crate) struct RoundTotals {
+    /// Which loop produced the tokens.
+    pub(crate) loop_kind: SpecLoop,
+    /// The block the request was configured with, verifier token included.
+    pub(crate) block_size: usize,
+    /// Conditioning rows the rounds projected, or `None` for a loop that
+    /// carries no conditioning buffer between rounds.
+    pub(crate) conditioned_rows: Option<usize>,
+    /// Whether the request ran with its phases charged — the same token the
+    /// loop's `rollback_round_caches` calls take, and the one decision a loop
+    /// makes about how its own work is attributed.
+    pub(crate) charged: bool,
+    /// Rounds the loop entered.
+    pub(crate) rounds: usize,
+    /// Tokens the round loop itself emitted.
+    pub(crate) emitted_in_rounds: usize,
+    /// Tokens the drafter proposed, over all rounds.
+    pub(crate) total_draft: usize,
+    /// Proposed tokens the verifier accepted, over all rounds.
+    pub(crate) total_accept: usize,
+    /// Prompt prefill span.
+    pub(crate) prefill_ns: u128,
+    /// Wall-clock inside the drafter call, over all rounds.
+    pub(crate) draft_ns: u128,
+    /// Wall-clock inside the verify forward, over all rounds.
+    pub(crate) verifier_ns: u128,
+    /// Wall-clock of the whole round loop.
+    pub(crate) round_loop_ns: u128,
+    /// When the request started. The elapsed figure is read from it as the
+    /// record is written, so a loop cannot report a window that closed before
+    /// its last token.
+    pub(crate) t_total: Instant,
+}
+
+/// Record one speculative request, once.
+///
+/// Three figures are read here rather than carried: the tokens the loop handed
+/// the sink, the request's wall-clock, and the decode-window rate.
+///
+/// `seed_emitted` is the fourth, and it is an argument rather than a field
+/// because its source differs between the two callers — a loop that ran rounds
+/// reads it off its own local, and a request that stopped on its seed reads it
+/// off the buffer. Whether a loop emits a token before its rounds is a
+/// measurement either way, never a per-loop constant.
+pub(crate) fn log_request_record(
+    totals: &RoundTotals,
+    emitted: &[ProbeStep],
+    seed_emitted: usize,
+    window: &DecodeWindow,
+) {
+    RoundStats {
+        loop_kind: totals.loop_kind,
+        block_size: totals.block_size,
+        rounds: totals.rounds,
+        emitted: emitted.len(),
+        emitted_in_rounds: totals.emitted_in_rounds,
+        seed_emitted,
+        conditioned_rows: totals.conditioned_rows,
+        total_draft: totals.total_draft,
+        total_accept: totals.total_accept,
+        prefill_ns: totals.prefill_ns,
+        draft_ns: totals.draft_ns,
+        verifier_ns: totals.verifier_ns,
+        round_loop_ns: totals.round_loop_ns,
+        elapsed_ns: totals.t_total.elapsed().as_nanos(),
+        decode_tps: window.tps(),
+        charged: totals.charged,
+    }
+    .log_done();
 }

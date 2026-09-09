@@ -12,10 +12,11 @@
 # passes against it is passing against a shape this file states rather than
 # against whatever the repository happens to contain today. It carries the same
 # census the tree does — three loops that charge their phases and four that do
-# not — plus the two shapes that must not be counted as loops: a fn with a
-# driver's signature and no `RoundStats` (the entry guard), and a fn that builds
-# a `RoundStats` and takes no `step_fn` (a summary helper). Each pins one of the
-# derivation's two conditions.
+# not — plus the three shapes that must not be counted as loops: a fn with a
+# driver's signature and no `RoundTotals` (the entry guard), a fn that builds a
+# `RoundTotals` and takes no `step_fn` (a summary helper), and the shared seed
+# emit, which has the signature and is handed a loop's totals rather than naming
+# any of its own. Each pins one of the derivation's two conditions.
 
 set -uo pipefail
 
@@ -27,8 +28,8 @@ failures=0
 cases=0
 
 # One round loop: a driver's signature, a rollback whose charge argument and a
-# record whose `charged:` field name the same decision, and the `RoundStats` a
-# round loop closes with.
+# record whose `charged:` field name the same decision, and the `RoundTotals` a
+# round loop closes on and hands to the shared recorder.
 loop_src() {
   local name="$1" token="$2" bind="$3"
   printf 'pub fn %s(\n    verifier: &Architecture,\n    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,\n    device: Device,\n) -> Result<()> {\n' "$name"
@@ -67,25 +68,56 @@ loop_src() {
         }
         .log(SpecLoop::Kind, rounds, accept, num_draft, &[]);
     }
-    Ok(super::RoundStats {
-        loop_kind: SpecLoop::Kind,
-        rounds,
-        charged: $token,
-    })
+    log_request_record(
+        &RoundTotals {
+            loop_kind: SpecLoop::Kind,
+            rounds,
+            charged: $token,
+        },
+        &emitted,
+        seed_emitted,
+        &window,
+    );
+    Ok(())
 }
 RS
 }
 
-# A fn that builds a `RoundStats` and drives no generation. It is not a round
+# A fn that builds a `RoundTotals` and drives no generation. It is not a round
 # loop, and condition (a) of the derivation is the only thing that says so.
 stats_helper_src() {
   cat <<'RS'
-pub fn summarise_rounds(rounds: usize, accepted: usize) -> super::RoundStats {
-    super::RoundStats {
+pub fn summarise_rounds(rounds: usize, accepted: usize) -> RoundTotals {
+    RoundTotals {
         loop_kind: SpecLoop::Kind,
         rounds,
         charged: false,
     }
+}
+RS
+}
+
+# The shared seed emit: a driver's signature, and it names no decision of its
+# own — it is handed the loop's totals. Condition (b) is the only thing keeping
+# it out of the population, and a scan that counted it would report eight loops
+# and a census nobody wrote down.
+seed_emit_src() {
+  cat <<'RS'
+pub(crate) fn emit_seed_token(
+    tokenizer: &tokenizers::Tokenizer,
+    seed: u32,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    emitted: &mut Vec<ProbeStep>,
+    window: &mut DecodeWindow,
+    eos_ids: &[u32],
+    totals: &RoundTotals,
+) -> bool {
+    emit_step(tokenizer, seed, step_fn, emitted, window);
+    if !eos_ids.contains(&seed) {
+        return false;
+    }
+    log_request_record(totals, emitted, emitted.len(), window);
+    true
 }
 RS
 }
@@ -120,6 +152,8 @@ build_root() {
     loop_src "spec_generate_stochastic_cached" "false" "plain"
     printf '\n'
     stats_helper_src
+    printf '\n'
+    seed_emit_src
     printf '\nfn rollback_round_caches(\n    caches: &mut [KvCache],\n    lin: Option<&mut [LinearAttnCache]>,\n    fed: &[u32],\n    pre_round_offset: i32,\n    target: i32,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    Ok(())\n}\n'
   } >"$root/crates/rmlx-models/src/speculative/mod.rs"
 
@@ -208,7 +242,7 @@ run "a rollback that charges where the record does not is refused" 1 \
 # 3. A record's LAST field carries no comma. A matcher that required one read
 #    this loop as having no record site at all and passed it.
 build_root "$root"
-perl -0pi -e 's/        charged: false,\n    \}\)/        charged: true\n    })/' \
+perl -0pi -e 's/            charged: false,\n        \},/            charged: true\n        },/' \
   "$root/crates/rmlx-models/src/speculative/eagle3.rs"
 run "a record whose last field drops its comma is still read" 1 \
   "\`eagle3_generate\` names more than one charge decision"
@@ -301,7 +335,7 @@ run "both charge spellings renamed away is a scan error" 2 \
 
 # 13. The population itself renamed out from under the gate.
 build_root "$root"
-perl -0pi -e 's/RoundStats \{/RoundTotals {/g' \
+perl -0pi -e 's/RoundTotals \{/RoundLedger {/g' \
   "$root/crates/rmlx-models/src/speculative"/*.rs \
   "$root/crates/rmlx-models/src/speculative/dflash2"/*.rs
 run "a scan that derives no round loop is a scan error, not a pass" 2 \
@@ -352,11 +386,12 @@ run_env "the census cannot be waived from the environment" 0 \
   "census charge_phases:3 false:4" \
   WANT_CENSUS="charge_phases:9 false:9" SPEC_CHARGE_WANT_CENSUS="charge_phases:9 false:9"
 
-# 20. A `RoundStats` built by a constructor drops the loop out of the derived
-#     population. On its own that reads as a census that moved, which invites
-#     the census to be edited; the rollback it still makes says otherwise.
+# 20. A loop that hands the recorder totals built somewhere else names no
+#     decision of its own and drops out of the derived population. On its own
+#     that reads as a census that moved, which invites the census to be edited;
+#     the rollback it still makes says otherwise.
 build_root "$root"
-perl -0pi -e 's/    Ok\(super::RoundStats \{\n(?:.*\n)*?    \}\)/    Ok(super::RoundStats::new(rounds, false))/' \
+perl -0pi -e 's/    log_request_record\(\n        &RoundTotals \{\n(?:.*\n)*?    \);/    log_request_record(&totals_for(rounds, false), &emitted, seed_emitted, &window);/' \
   "$root/crates/rmlx-models/src/speculative/eagle3.rs"
 run "a loop that falls out of the population is not reported as a census move" 2 \
   "\`eagle3_generate\` rolls a round's caches back and is"
@@ -377,6 +412,24 @@ perl -0pi -e 's/\) -> Result<\(\)> \{/) -> Result<()>\nwhere\n    D: Drafter,\n{
   "$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
 run "a loop with a \`where\` clause is still read" 0 \
   "7 speculative round loops, each naming one charge decision"
+
+# 23. Condition (b) is what keeps the shared seed emit out of the population,
+#     and nothing else does: it carries a driver's signature. Give it totals of
+#     its own and it joins, with no rollback in it for the gate to read against.
+build_root "$root"
+perl -0pi -e 's/    log_request_record\(totals, emitted, emitted\.len\(\), window\);/    log_request_record(\n        \&RoundTotals \{\n            loop_kind: SpecLoop::Kind,\n            rounds: 0,\n            charged: false,\n        \},\n        emitted,\n        emitted.len(),\n        window,\n    );/' \
+  "$root/crates/rmlx-models/src/speculative/mod.rs"
+run "a helper that builds its own totals joins the population and is refused" 2 \
+  "\`emit_seed_token\` has 0 rollback and 1 record charge sites."
+
+# 24. The defect the gate exists for, at the seam the record moved to: the
+#     totals handed over say the round was charged and the rollbacks say it was
+#     not. Every token and every count the loop reports is unchanged.
+build_root "$root"
+perl -0pi -e 's/            charged: charge_phases,\n        \},/            charged: true,\n        },/' \
+  "$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
+run "a record call handing the recorder the other decision is refused" 1 \
+  "\`mtp_assistant_generate\` names more than one charge decision"
 
 echo
 if [ "$failures" != "0" ]; then

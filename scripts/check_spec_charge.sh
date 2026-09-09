@@ -25,18 +25,23 @@
 #     (a) the signature rule `check_spec_sampling.sh` uses — a fn whose
 #         parameters include `step_fn: &mut dyn FnMut(&ProbeStep)`, at any
 #         visibility. That argument is what makes a fn a generation driver.
-#     (b) it constructs a `RoundStats` record. That is what a *round* loop
-#         closes with, and it is what separates one from the two fns that
-#         satisfy (a) and run no round: `spec_generate_greedy`, which validates
-#         a request and delegates, and `emit_step`, the shared per-token emit
-#         helper. Neither builds a `RoundStats`; both delegate to or are called
-#         by something that does.
+#     (b) it constructs a `RoundTotals` — the numbers a round loop closes on,
+#         handed to the one function that assembles the record from them. That
+#         is what separates a round loop from the fns that satisfy (a) and run
+#         no round: `spec_generate_greedy`, which validates a request and
+#         delegates, `emit_step`, the shared per-token emit helper, and
+#         `emit_seed_token`, which emits a loop's seed and is handed the totals
+#         rather than naming any. None builds a `RoundTotals`.
 #   The population is derived, so a loop added or removed moves the census
 #   rather than slipping past a number typed into this file.
 #
 # RULE 1 (one decision per loop)
 #   Within one round loop, the `charge` argument of every `rollback_round_caches`
-#   call and the value of every `charged:` field must be the same token.
+#   call and the value of every `charged:` field must be the same token. The
+#   record is assembled elsewhere now, so the field the loop still writes is the
+#   `charged:` of the `RoundTotals` it hands over — the decision is named at the
+#   call site either way, which is the only place this gate can read it: what the
+#   shared recorder then does with the value is past its reach.
 #
 # RULE 2 (the token means what it says)
 #   A loop whose token is `charge_phases` must bind it, in the same function, to
@@ -195,7 +200,7 @@ records=$(
         next
       }
 
-      index(stripped, "RoundStats {") > 0 { has_stats = 1 }
+      index(stripped, "RoundTotals {") > 0 { has_stats = 1 }
 
       # Three answers, not two. A plain `let charge_phases = <expr>;` is a
       # binding this scan reads: it is the call and nothing else, or it is a
@@ -251,7 +256,7 @@ orphans=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 0 && $4 > 0')
 if [ -z "$drivers" ]; then
   note "check-spec-charge: found no round loop under ${loops_dir#"$root"/}."
   note "  A round loop is a fn taking \`step_fn: &mut dyn FnMut(&ProbeStep)\` that builds"
-  note "  a \`RoundStats\`. Either both were renamed out from under this gate or the scan"
+  note "  a \`RoundTotals\`. Either both were renamed out from under this gate or the scan"
   note "  is broken; a gate that matched nothing must not report a pass."
   exit 2
 fi
@@ -263,7 +268,7 @@ while IFS=$'\t' read -r file fn _driver _nroll _nrec _bind _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` rolls a round's caches back and is"
   note "  not one of the round loops this gate derived. Either the derivation lost a"
-  note "  loop — a \`RoundStats\` built by a constructor, a signature rustfmt wrapped, a"
+  note "  loop — a \`RoundTotals\` built by a constructor, a signature rustfmt wrapped, a"
   note "  \`where\` clause — or a rollback moved out of one. Both read as a census that"
   note "  moved, and editing the census would bury either."
   scan_error=1

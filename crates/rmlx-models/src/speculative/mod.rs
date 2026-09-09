@@ -51,6 +51,7 @@ use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{GdnTape, GdnTapeSegment, KvCache, KvQuant, LinearAttnCache};
+pub(crate) use round_common::RoundTotals;
 pub(crate) use round_stats::{phases_charged, RoundPhases, RoundStats, SpecLoop};
 
 /// Guard the one verifier logit row a speculative driver selects from at
@@ -824,25 +825,26 @@ impl SpeculativeDispatcher {
                 }
             }
             if hit_eos {
-                RoundStats {
-                    loop_kind: SpecLoop::TwoModelGreedy,
-                    block_size: k + 1,
-                    rounds,
-                    emitted: emitted.len(),
+                round_common::log_request_record(
+                    &RoundTotals {
+                        loop_kind: SpecLoop::TwoModelGreedy,
+                        block_size: k + 1,
+                        conditioned_rows: None,
+                        charged: false,
+                        rounds,
+                        emitted_in_rounds,
+                        total_draft: total_draft_tokens,
+                        total_accept: total_accept_count,
+                        prefill_ns,
+                        draft_ns,
+                        verifier_ns,
+                        round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+                        t_total,
+                    },
+                    &emitted,
                     seed_emitted,
-                    emitted_in_rounds,
-                    conditioned_rows: None,
-                    total_draft: total_draft_tokens,
-                    total_accept: total_accept_count,
-                    prefill_ns,
-                    draft_ns,
-                    verifier_ns,
-                    round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-                    elapsed_ns: t_total.elapsed().as_nanos(),
-                    decode_tps: window.tps(),
-                    charged: false,
-                }
-                .log_done();
+                    &window,
+                );
                 return Ok((emitted, widest_draft));
             }
 
@@ -949,25 +951,26 @@ impl SpeculativeDispatcher {
             );
         }
 
-        RoundStats {
-            loop_kind: SpecLoop::TwoModelGreedy,
-            block_size: k + 1,
-            rounds,
-            emitted: emitted.len(),
+        round_common::log_request_record(
+            &RoundTotals {
+                loop_kind: SpecLoop::TwoModelGreedy,
+                block_size: k + 1,
+                conditioned_rows: None,
+                charged: false,
+                rounds,
+                emitted_in_rounds,
+                total_draft: total_draft_tokens,
+                total_accept: total_accept_count,
+                prefill_ns,
+                draft_ns,
+                verifier_ns,
+                round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+                t_total,
+            },
+            &emitted,
             seed_emitted,
-            emitted_in_rounds,
-            conditioned_rows: None,
-            total_draft: total_draft_tokens,
-            total_accept: total_accept_count,
-            prefill_ns,
-            draft_ns,
-            verifier_ns,
-            round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-            elapsed_ns: t_total.elapsed().as_nanos(),
-            decode_tps: window.tps(),
-            charged: false,
-        }
-        .log_done();
+            &window,
+        );
 
         // Report the verifier's resident KV, so a caller that sampled the
         // verifier arch around this call can attribute the figure to it. This
@@ -1241,25 +1244,26 @@ impl SpeculativeDispatcher {
                 }
             }
             if hit_eos {
-                RoundStats {
-                    loop_kind: SpecLoop::TwoModelStochastic,
-                    block_size: k + 1,
-                    rounds,
-                    emitted: emitted.len(),
+                round_common::log_request_record(
+                    &RoundTotals {
+                        loop_kind: SpecLoop::TwoModelStochastic,
+                        block_size: k + 1,
+                        conditioned_rows: None,
+                        charged: false,
+                        rounds,
+                        emitted_in_rounds,
+                        total_draft: total_draft_tokens,
+                        total_accept: total_accept_count,
+                        prefill_ns,
+                        draft_ns,
+                        verifier_ns,
+                        round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+                        t_total,
+                    },
+                    &emitted,
                     seed_emitted,
-                    emitted_in_rounds,
-                    conditioned_rows: None,
-                    total_draft: total_draft_tokens,
-                    total_accept: total_accept_count,
-                    prefill_ns,
-                    draft_ns,
-                    verifier_ns,
-                    round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-                    elapsed_ns: t_total.elapsed().as_nanos(),
-                    decode_tps: window.tps(),
-                    charged: false,
-                }
-                .log_done();
+                    &window,
+                );
                 return Ok((emitted, widest_draft));
             }
 
@@ -1335,25 +1339,26 @@ impl SpeculativeDispatcher {
             );
         }
 
-        RoundStats {
-            loop_kind: SpecLoop::TwoModelStochastic,
-            block_size: k + 1,
-            rounds,
-            emitted: emitted.len(),
+        round_common::log_request_record(
+            &RoundTotals {
+                loop_kind: SpecLoop::TwoModelStochastic,
+                block_size: k + 1,
+                conditioned_rows: None,
+                charged: false,
+                rounds,
+                emitted_in_rounds,
+                total_draft: total_draft_tokens,
+                total_accept: total_accept_count,
+                prefill_ns,
+                draft_ns,
+                verifier_ns,
+                round_loop_ns: round_loop_t0.elapsed().as_nanos(),
+                t_total,
+            },
+            &emitted,
             seed_emitted,
-            emitted_in_rounds,
-            conditioned_rows: None,
-            total_draft: total_draft_tokens,
-            total_accept: total_accept_count,
-            prefill_ns,
-            draft_ns,
-            verifier_ns,
-            round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-            elapsed_ns: t_total.elapsed().as_nanos(),
-            decode_tps: window.tps(),
-            charged: false,
-        }
-        .log_done();
+            &window,
+        );
 
         // See the greedy path: the verifier's own resident KV, reported so the
         // caller can attribute it to this call.

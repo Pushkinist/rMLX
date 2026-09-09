@@ -47,7 +47,7 @@ use rmlx_mlx::{concatenate, Array, Device};
 use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
-use crate::speculative::round_common::verifier_cache_stack;
+use crate::speculative::round_common::{log_request_record, verifier_cache_stack, RoundTotals};
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
     conditioning_residual, disarm_lin_tapes, emit_step, guard_round_conditioning,
@@ -439,25 +439,26 @@ pub fn dflash2_generate(
     }
 
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();
-    RoundStats {
-        loop_kind: SpecLoop::DFlash2,
-        block_size: block_total,
-        rounds,
-        emitted: emitted.len(),
+    log_request_record(
+        &RoundTotals {
+            loop_kind: SpecLoop::DFlash2,
+            block_size: block_total,
+            conditioned_rows: Some(conditioned_rows),
+            charged: charge_phases,
+            rounds,
+            emitted_in_rounds,
+            total_draft,
+            total_accept,
+            prefill_ns,
+            draft_ns,
+            verifier_ns,
+            round_loop_ns,
+            t_total,
+        },
+        &emitted,
         seed_emitted,
-        emitted_in_rounds,
-        conditioned_rows: Some(conditioned_rows),
-        total_draft,
-        total_accept,
-        prefill_ns,
-        draft_ns,
-        verifier_ns,
-        round_loop_ns,
-        elapsed_ns: t_total.elapsed().as_nanos(),
-        decode_tps: window.tps(),
-        charged: charge_phases,
-    }
-    .log_done();
+        &window,
+    );
 
     // Report the verifier's resident KV, so a caller that sampled the verifier
     // arch around this call can attribute the figure to it. This round loop
