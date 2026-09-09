@@ -48,12 +48,12 @@ use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
-    RoundTotals,
+    emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
+    verifier_cache_stack, RoundTotals,
 };
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
-    conditioning_residual, disarm_lin_tapes, emit_step, guard_round_conditioning,
+    conditioning_residual, disarm_lin_tapes, guard_round_conditioning,
     guard_verifier_prefill_logits, phases_charged, rollback_round_caches,
     rollback_target_from_tail, round_block, DecodeWindow, RoundPhases, SpecLoop, VerifierDraw,
 };
@@ -338,18 +338,17 @@ pub fn dflash2_generate(
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
 
-        let mut hit_eos = false;
-        for &id in &new_tokens {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            emitted_in_rounds += 1;
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
+        let hit_eos = emit_round_tokens(
+            tokenizer,
+            &new_tokens,
+            n_tokens,
+            eos_ids,
+            step_fn,
+            &mut emitted,
+            &mut emitted_in_rounds,
+            &mut window,
+            None,
+        );
         if hit_eos {
             break;
         }

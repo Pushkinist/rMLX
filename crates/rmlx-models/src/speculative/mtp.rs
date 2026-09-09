@@ -48,13 +48,13 @@ use std::path::Path;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, concatenate, Array, Device};
 
-use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
+use super::{DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
-    RoundTotals,
+    emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
+    verifier_cache_stack, RoundTotals,
 };
 use rmlx_kv_quant::{KvCache, KvQuant};
 
@@ -833,18 +833,17 @@ pub fn mtp_generate(
         total_accept += accept;
 
         // -- Emit accepted prefix + 1 correction/bonus. --
-        let mut hit_eos = false;
-        for &id in &new_tokens {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            emitted_in_rounds += 1;
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
+        let hit_eos = emit_round_tokens(
+            tokenizer,
+            &new_tokens,
+            n_tokens,
+            eos_ids,
+            step_fn,
+            &mut emitted,
+            &mut emitted_in_rounds,
+            &mut window,
+            None,
+        );
         if hit_eos {
             break;
         }

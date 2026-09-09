@@ -20,6 +20,7 @@ use std::time::Instant;
 use rmlx_core::error::Result;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
+use super::eagle3::DecidedBy;
 use super::{DecodeWindow, RoundStats, SpecLoop};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
@@ -190,6 +191,53 @@ pub(crate) fn log_request_record(
     window: &DecodeWindow,
 ) {
     round_stats(totals, emitted, seed_emitted, window).log_done();
+}
+
+/// Emit the tokens a round committed, and say whether one of them stopped the
+/// request.
+///
+/// The budget is the request's and not the round's: a round emits only what is
+/// still owed, so a block that overruns the last token leaves the surplus
+/// unemitted and leaves the acceptance — which the rollback reads — alone.
+///
+/// `decided_by` is EAGLE-3's per-token attribution: the buffer, and the length
+/// of this round's restricted-vocabulary prefix. Tokens before it were the
+/// drafter's own, confirmed by a restricted argmax; the rest were taken over
+/// the whole vocabulary. One entry per emitted token, and every other loop
+/// passes `None`.
+pub(crate) fn emit_round_tokens(
+    tokenizer: &tokenizers::Tokenizer,
+    round_tokens: &[u32],
+    n_tokens: usize,
+    eos_ids: &[u32],
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    emitted: &mut Vec<ProbeStep>,
+    emitted_in_rounds: &mut usize,
+    window: &mut DecodeWindow,
+    decided_by: Option<(&mut Vec<DecidedBy>, usize)>,
+) -> bool {
+    let (mut decided_by, restricted) = match decided_by {
+        Some((buf, restricted)) => (Some(buf), restricted),
+        None => (None, 0),
+    };
+    for (i, &id) in round_tokens.iter().enumerate() {
+        if emitted.len() >= n_tokens {
+            break;
+        }
+        super::emit_step(tokenizer, id, step_fn, emitted, window);
+        if let Some(buf) = decided_by.as_mut() {
+            buf.push(if i < restricted {
+                DecidedBy::RestrictedVocab
+            } else {
+                DecidedBy::FullVocab
+            });
+        }
+        *emitted_in_rounds += 1;
+        if eos_ids.contains(&id) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Emit a sidecar loop's seed token, and say whether it ended the request.

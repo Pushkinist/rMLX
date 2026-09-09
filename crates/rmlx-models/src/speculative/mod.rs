@@ -800,18 +800,17 @@ impl SpeculativeDispatcher {
             total_accept_count += accept;
 
             // Emit accepted prefix + 1 correction/bonus.
-            let mut hit_eos = false;
-            for &id in &new_tokens {
-                if emitted.len() >= n_tokens {
-                    break;
-                }
-                emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-                emitted_in_rounds += 1;
-                if eos_ids.contains(&id) {
-                    hit_eos = true;
-                    break;
-                }
-            }
+            let hit_eos = round_common::emit_round_tokens(
+                tokenizer,
+                &new_tokens,
+                n_tokens,
+                eos_ids,
+                step_fn,
+                &mut emitted,
+                &mut emitted_in_rounds,
+                &mut window,
+                None,
+            );
             if hit_eos {
                 round_common::log_request_record(
                     &RoundTotals {
@@ -1216,18 +1215,17 @@ impl SpeculativeDispatcher {
             };
             round_tokens.push(extra);
 
-            let mut hit_eos = false;
-            for &id in &round_tokens {
-                if emitted.len() >= n_tokens {
-                    break;
-                }
-                emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-                emitted_in_rounds += 1;
-                if eos_ids.contains(&id) {
-                    hit_eos = true;
-                    break;
-                }
-            }
+            let hit_eos = round_common::emit_round_tokens(
+                tokenizer,
+                &round_tokens,
+                n_tokens,
+                eos_ids,
+                step_fn,
+                &mut emitted,
+                &mut emitted_in_rounds,
+                &mut window,
+                None,
+            );
             if hit_eos {
                 round_common::log_request_record(
                     &RoundTotals {

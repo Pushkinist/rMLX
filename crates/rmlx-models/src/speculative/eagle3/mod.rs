@@ -125,13 +125,13 @@ use std::path::Path;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{add, argmax, concatenate, rope, Array, Device};
 
-use super::{emit_step, DecodeWindow};
+use super::DecodeWindow;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 use crate::speculative::round_common::{
-    emit_seed_token, log_request_record, report_verifier_kv_bytes, verifier_cache_stack,
-    RoundTotals,
+    emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
+    verifier_cache_stack, RoundTotals,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
@@ -1155,26 +1155,21 @@ pub fn eagle3_generate(
         }
 
         // -- Emit accepted prefix + 1 correction/bonus. --
-        let mut hit_eos = false;
-        for (i, &id) in new_tokens.iter().enumerate() {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            // `new_tokens[..accept]` are the draft's own tokens, which the
-            // restricted argmax confirmed; `new_tokens[accept]` is the
-            // correction, taken over the whole vocabulary.
-            decided_by.push(if hot_path && i < accept {
-                DecidedBy::RestrictedVocab
-            } else {
-                DecidedBy::FullVocab
-            });
-            emitted_in_rounds += 1;
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
+        // `new_tokens[..accept]` are the draft's own tokens, which the
+        // restricted argmax confirmed; `new_tokens[accept]` is the correction,
+        // taken over the whole vocabulary.
+        let restricted = if hot_path { accept } else { 0 };
+        let hit_eos = emit_round_tokens(
+            tokenizer,
+            &new_tokens,
+            n_tokens,
+            eos_ids,
+            step_fn,
+            &mut emitted,
+            &mut emitted_in_rounds,
+            &mut window,
+            Some((&mut *decided_by, restricted)),
+        );
         if hit_eos {
             break;
         }
