@@ -52,7 +52,9 @@ use super::{emit_step, DecodeWindow, MAX_BLOCK_SIZE};
 use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
-use crate::speculative::round_common::{log_request_record, verifier_cache_stack, RoundTotals};
+use crate::speculative::round_common::{
+    emit_seed_token, log_request_record, verifier_cache_stack, RoundTotals,
+};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
 /// Loaded MTP-head sidecar weights (Qwen3.5 `mtp.*`, prefix stripped).
@@ -727,29 +729,30 @@ pub fn mtp_generate(
     super::guard_verifier_prefill_logits(verifier, &r0_logits, prompt_ids.len())?;
     let mut h_cond = r0_hidden;
     let mut b = draw.seed_token(&r0_logits, device)?;
-    emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
-    if eos_ids.contains(&b) {
-        // The stop token arrived before a round could run. The request still
-        // happened, so it still leaves exactly one record.
-        super::RoundStats {
+    if emit_seed_token(
+        tokenizer,
+        b,
+        step_fn,
+        &mut emitted,
+        &mut window,
+        eos_ids,
+        &RoundTotals {
             loop_kind: super::SpecLoop::MtpSidecar,
             block_size: block_total,
-            rounds: 0,
-            emitted: emitted.len(),
-            seed_emitted: emitted.len(),
-            emitted_in_rounds: 0,
             conditioned_rows: None,
+            charged: charge_phases,
+            // No round ran.
+            rounds: 0,
+            emitted_in_rounds: 0,
             total_draft: 0,
             total_accept: 0,
             prefill_ns,
             draft_ns: 0,
             verifier_ns: 0,
             round_loop_ns: 0,
-            elapsed_ns: t_total.elapsed().as_nanos(),
-            decode_tps: window.tps(),
-            charged: charge_phases,
-        }
-        .log_done();
+            t_total,
+        },
+    ) {
         return Ok((emitted, block_total));
     }
 

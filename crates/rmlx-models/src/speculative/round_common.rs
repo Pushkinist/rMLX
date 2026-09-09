@@ -154,3 +154,30 @@ pub(crate) fn log_request_record(
     }
     .log_done();
 }
+
+/// Emit a sidecar loop's seed token, and say whether it ended the request.
+///
+/// Every sidecar loop argmaxes one bonus token out of its prefill forward and
+/// emits it before the first round. When that token is a stop token no round
+/// ever runs, and the request still leaves exactly one record — of a request
+/// whose whole output is its seed. Returns whether the caller should return now;
+/// it owns `emitted` and the block it reports, so the return itself stays with
+/// it.
+///
+/// The two-model loops do not call this: they emit nothing before a round.
+pub(crate) fn emit_seed_token(
+    tokenizer: &tokenizers::Tokenizer,
+    seed: u32,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    emitted: &mut Vec<ProbeStep>,
+    window: &mut DecodeWindow,
+    eos_ids: &[u32],
+    totals: &RoundTotals,
+) -> bool {
+    super::emit_step(tokenizer, seed, step_fn, emitted, window);
+    if !eos_ids.contains(&seed) {
+        return false;
+    }
+    log_request_record(totals, emitted, emitted.len(), window);
+    true
+}

@@ -76,7 +76,9 @@ use rmlx_mlx::{
 use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
-use crate::speculative::round_common::{log_request_record, verifier_cache_stack, RoundTotals};
+use crate::speculative::round_common::{
+    emit_seed_token, log_request_record, verifier_cache_stack, RoundTotals,
+};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Choose the next DFlash verify block size from recent acceptance.
@@ -714,29 +716,30 @@ pub fn dflash_generate(
     let mut probe_seed = Some(r0_hidden);
     let mut b = draw.seed_token(&r0_logits, device)?;
     // Emit the first bonus.
-    emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
-    if eos_ids.contains(&b) {
-        // The stop token arrived before a round could run. The request still
-        // happened, so it still leaves exactly one record.
-        super::RoundStats {
+    if emit_seed_token(
+        tokenizer,
+        b,
+        step_fn,
+        &mut emitted,
+        &mut window,
+        eos_ids,
+        &RoundTotals {
             loop_kind: super::SpecLoop::DFlash,
             block_size: block_total,
-            rounds: 0,
-            emitted: emitted.len(),
-            seed_emitted: emitted.len(),
-            emitted_in_rounds: 0,
             conditioned_rows: Some(0),
+            charged: false,
+            // No round ran.
+            rounds: 0,
+            emitted_in_rounds: 0,
             total_draft: 0,
             total_accept: 0,
             prefill_ns,
             draft_ns: 0,
             verifier_ns: 0,
             round_loop_ns: 0,
-            elapsed_ns: t_total.elapsed().as_nanos(),
-            decode_tps: window.tps(),
-            charged: false,
-        }
-        .log_done();
+            t_total,
+        },
+    ) {
         return Ok((emitted, block_total));
     }
 

@@ -129,7 +129,9 @@ use super::{emit_step, DecodeWindow};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
-use crate::speculative::round_common::{log_request_record, verifier_cache_stack, RoundTotals};
+use crate::speculative::round_common::{
+    emit_seed_token, log_request_record, verifier_cache_stack, RoundTotals,
+};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Target of this loop's per-position step trace.
@@ -949,30 +951,31 @@ pub fn eagle3_generate(
     // prefill that conditions on it.
     let prefill_ns = prefill_t0.elapsed().as_nanos();
 
-    emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
     decided_by.push(DecidedBy::FullVocab);
-    if eos_ids.contains(&b) {
-        // The stop token arrived before a round could run. The request still
-        // happened, so it still leaves exactly one record.
-        super::RoundStats {
+    if emit_seed_token(
+        tokenizer,
+        b,
+        step_fn,
+        &mut emitted,
+        &mut window,
+        eos_ids,
+        &RoundTotals {
             loop_kind: super::SpecLoop::Eagle3,
             block_size: block_total,
-            rounds: 0,
-            emitted: emitted.len(),
-            seed_emitted: emitted.len(),
-            emitted_in_rounds: 0,
             conditioned_rows: None,
+            charged: false,
+            // No round ran.
+            rounds: 0,
+            emitted_in_rounds: 0,
             total_draft: 0,
             total_accept: 0,
             prefill_ns,
             draft_ns: 0,
             verifier_ns: 0,
             round_loop_ns: 0,
-            elapsed_ns: t_total.elapsed().as_nanos(),
-            decode_tps: window.tps(),
-            charged: false,
-        }
-        .log_done();
+            t_total,
+        },
+    ) {
         return Ok((emitted, block_total));
     }
 
