@@ -1,42 +1,6 @@
 use super::*;
 
 #[test]
-fn walk_all_accepted_emits_bonus() {
-    let draft = [10, 11, 12];
-    let target = [10, 11, 12, 99];
-    let (acc, emit) = eagle3_walk(&draft, &target, 8);
-    assert_eq!(acc, 3);
-    assert_eq!(emit, vec![10, 11, 12, 99]);
-}
-
-#[test]
-fn walk_partial_accept_emits_correction() {
-    let draft = [10, 11, 12];
-    let target = [10, 11, 55, 0];
-    let (acc, emit) = eagle3_walk(&draft, &target, 8);
-    assert_eq!(acc, 2);
-    assert_eq!(emit, vec![10, 11, 55]);
-}
-
-#[test]
-fn walk_zero_accept_emits_only_correction() {
-    let draft = [10, 11];
-    let target = [42, 0, 0];
-    let (acc, emit) = eagle3_walk(&draft, &target, 8);
-    assert_eq!(acc, 0);
-    assert_eq!(emit, vec![42]);
-}
-
-#[test]
-fn walk_respects_budget() {
-    let draft = [10, 11, 12];
-    let target = [10, 11, 12, 99];
-    let (acc, emit) = eagle3_walk(&draft, &target, 2);
-    assert_eq!(acc, 3);
-    assert_eq!(emit, vec![10, 11]);
-}
-
-#[test]
 fn d2t_remap_offsets_draft_to_target() {
     // target = draft + d2t[draft].
     let d2t = vec![0, 5, 100, -3];
@@ -63,11 +27,10 @@ fn d2t_out_of_range_passes_through() {
 #[test]
 fn eagle3_module_compiles() {
     let _load = Eagle3Drafter::load;
-    let _walk = eagle3_walk;
     let _d2t = draft_to_target;
     let _ffp = find_full_pos;
     let _gen = eagle3_generate;
-    let _ = (_load, _walk, _d2t, _ffp, _gen);
+    let _ = (_load, _d2t, _ffp, _gen);
 }
 
 // -----------------------------------------------------------------------

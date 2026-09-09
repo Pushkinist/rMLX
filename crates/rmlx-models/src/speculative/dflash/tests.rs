@@ -67,49 +67,10 @@ fn block_size_holds_on_moderate_acceptance() {
     assert_eq!(next, 11);
 }
 
-// --- walk_block_greedy acceptance ---
-
-#[test]
-fn walk_all_accepted_emits_bonus() {
-    let draft = [10, 11, 12];
-    let target = [10, 11, 12, 99]; // n_draft + 1 predictions
-    let (acc, emit) = walk_block_greedy(&draft, &target, 8);
-    assert_eq!(acc, 3);
-    assert_eq!(emit, vec![10, 11, 12, 99]);
-}
-
-#[test]
-fn walk_partial_accept_emits_correction() {
-    let draft = [10, 11, 12];
-    let target = [10, 11, 55, 0]; // diverge at pos 2
-    let (acc, emit) = walk_block_greedy(&draft, &target, 8);
-    assert_eq!(acc, 2);
-    assert_eq!(emit, vec![10, 11, 55]);
-}
-
-#[test]
-fn walk_zero_accept_emits_only_correction() {
-    let draft = [10, 11];
-    let target = [42, 0, 0];
-    let (acc, emit) = walk_block_greedy(&draft, &target, 8);
-    assert_eq!(acc, 0);
-    assert_eq!(emit, vec![42]);
-}
-
-#[test]
-fn walk_respects_budget() {
-    let draft = [10, 11, 12];
-    let target = [10, 11, 12, 99];
-    let (acc, emit) = walk_block_greedy(&draft, &target, 2);
-    assert_eq!(acc, 3);
-    assert_eq!(emit, vec![10, 11]);
-}
-
 /// Compile-check: the public DFlash surface exists with expected sigs.
 #[test]
 fn dflash_module_compiles() {
     let _load = DFlashDrafter::load;
     let _bs = dflash_next_block_size;
-    let _walk = walk_block_greedy;
-    let _ = (_load, _bs, _walk);
+    let _ = (_load, _bs);
 }

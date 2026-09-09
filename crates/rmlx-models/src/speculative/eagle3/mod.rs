@@ -5,7 +5,8 @@
 //!
 //! Port of mlx-vlm `mlx_vlm/speculative/drafters/eagle3/eagle3.py`
 //! (`Eagle3DraftModel`) and the round-loop in `mlx_vlm/speculative/eagle3.py`
-//! (`_eagle3_next_block_size`, `_eagle3_rounds`, `_eagle3_walk`). The
+//! (`_eagle3_next_block_size`, `_eagle3_rounds`, `_eagle3_walk`, whose walk is
+//! the shared [`crate::speculative::accept_prefix`] here). The
 //! authoritative weight layout is the mainline SpecForge
 //! `LlamaForCausalLMEagle3` model
 //! (`sgl-project/SpecForge:specforge/modeling/draft/llama3_eagle.py`).
@@ -141,38 +142,6 @@ pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
 /// the stream the loop emits by default.
 pub(crate) fn step_trace_enabled() -> bool {
     tracing::enabled!(target: STEP_TARGET, tracing::Level::TRACE)
-}
-
-/// One greedy EAGLE-3 acceptance walk over a drafted block.
-///
-/// Pure port of `_eagle3_walk`: accept drafted tokens up to the first mismatch
-/// with the verifier's greedy choice, then take the verifier's correction/bonus
-/// at that position. Returns `(accepted, new_tokens)` capped at `budget`.
-/// `target_tokens` are the verifier's greedy predictions for positions
-/// `[b, d0, d1, ...]` — `draft_tokens.len() + 1` of them.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-pub fn eagle3_walk(
-    draft_tokens: &[u32],
-    target_tokens: &[u32],
-    budget: usize,
-) -> (usize, Vec<u32>) {
-    let n_draft = draft_tokens.len();
-    let mut accepted = n_draft;
-    for (i, (&d, &t)) in draft_tokens.iter().zip(target_tokens.iter()).enumerate() {
-        if d != t {
-            accepted = i;
-            break;
-        }
-    }
-    let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
-    if accepted < target_tokens.len() {
-        new_tokens.push(target_tokens[accepted]);
-    }
-    new_tokens.truncate(budget);
-    (accepted, new_tokens)
 }
 
 /// Find the first position where the restricted-vocab verifier token differs from the
@@ -1169,7 +1138,7 @@ pub fn eagle3_generate(
         };
 
         // -- Phase C: greedy acceptance walk. --
-        let (accept, new_tokens) = eagle3_walk(&draft_tokens, &v_tokens, remaining);
+        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         total_accept += accept;
         let n_committed = new_tokens.len();
 

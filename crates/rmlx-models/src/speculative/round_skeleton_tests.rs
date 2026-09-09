@@ -80,33 +80,29 @@
 //! copy, at absolute values, so an extraction is judged against something that
 //! can fail rather than against a re-derivation of itself.
 
-use super::dflash::{dflash_next_block_size, walk_block_greedy};
-use super::eagle3::eagle3_walk;
+use super::dflash::dflash_next_block_size;
 use super::{
     accept_prefix, draft_rows_to_drop, rollback_target_from_head, rollback_target_from_tail,
     round_block, two_model_drafts_per_round, MAX_BLOCK_SIZE,
 };
 
-/// One acceptance walk over a drafted block, spelled three times.
+/// One acceptance walk over a drafted block, and the rows the three spellings
+/// agreed on before it was one.
 ///
-/// `dflash::walk_block_greedy` and `eagle3::eagle3_walk` are the same source
-/// under two names; `accept_prefix` reaches the same answer from the verifier's
-/// side. The extraction keeps one of them, so what has to survive is the answer
-/// all three give — accepted count and committed tokens — and the fact that
-/// `budget` caps the emission without capping the acceptance.
+/// The two block walks are gone and [`accept_prefix`] is what every round loop
+/// calls, so what these rows pin is the answer the collapse had to preserve —
+/// accepted count and committed tokens — and the fact that `budget` caps the
+/// emission without capping the acceptance. The empty-proposal row is the shape
+/// the loops' own guard refuses before a walk ever sees it.
 ///
-/// Each walk's own behaviour is pinned in `tests.rs` and `eagle3/tests.rs`; what
-/// is here is only what a collapse of the three has to preserve about all of
-/// them at once.
-///
-/// Mutation: in `eagle3_walk`, change `new_tokens.truncate(budget)` to
-/// `new_tokens.truncate(budget + 1)`.
+/// Mutation: change `new_tokens.truncate(budget)`'s equivalent in
+/// [`accept_prefix`] — `if emit.len() < budget` — to `<= budget`.
 #[test]
 #[allow(
     clippy::expect_used,
     reason = "the fixture rows below are same-length by construction, so accept_prefix's length guard cannot fire on them"
 )]
-fn the_three_acceptance_walks_commit_the_same_rows() {
+fn the_acceptance_walk_commits_the_rows_the_three_spellings_agreed_on() {
     // (drafted, verifier's own tokens, budget, expected accepted, expected commit)
     let cases: [(&[u32], &[u32], usize, usize, &[u32]); 4] = [
         // The budget caps the commit and leaves the acceptance alone — the
@@ -124,22 +120,10 @@ fn the_three_acceptance_walks_commit_the_same_rows() {
         (&[], &[4], 8, 0, &[4]),
     ];
     for (draft, verifier, budget, want_accept, want_commit) in cases {
-        let (a1, c1) = walk_block_greedy(draft, verifier, budget);
-        let (a2, c2) = eagle3_walk(draft, verifier, budget);
-        let (a3, c3) = accept_prefix(verifier, draft, budget)
+        let (accepted, commit) = accept_prefix(verifier, draft, budget)
             .expect("verifier rows are one longer than the proposals in every case above");
         assert_eq!(
-            (a1, c1.as_slice()),
-            (want_accept, want_commit),
-            "walk_block_greedy on {draft:?} against {verifier:?} at budget {budget}"
-        );
-        assert_eq!(
-            (a2, c2.as_slice()),
-            (want_accept, want_commit),
-            "eagle3_walk on {draft:?} against {verifier:?} at budget {budget}"
-        );
-        assert_eq!(
-            (a3, c3.as_slice()),
+            (accepted, commit.as_slice()),
             (want_accept, want_commit),
             "accept_prefix on {draft:?} against {verifier:?} at budget {budget}"
         );

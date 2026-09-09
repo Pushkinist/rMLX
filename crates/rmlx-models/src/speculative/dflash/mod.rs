@@ -36,8 +36,8 @@
 //! ([`DFlashDrafter::load`] + [`load_dflash`]) — `fc` (`5H->H`), `hidden_norm`,
 //! `norm`, all 8 `DFlashDecoderLayer`s, **YARN RoPE** ([`crate::rope::compute_yarn_freqs`]),
 //! the drafter forward [`DFlashDrafter::draft_block`], the block-size schedule
-//! [`dflash_next_block_size`], the acceptance walk [`walk_block_greedy`], the
-//! GDN rollback, and the full round-loop
+//! [`dflash_next_block_size`], the acceptance walk
+//! [`crate::speculative::accept_prefix`], the GDN rollback, and the full round-loop
 //! [`dflash_generate`]. The three verifier-side seams are wired on
 //! [`crate::arch::Architecture`] for the Qwen3.6-MoE verifier:
 //!
@@ -594,39 +594,6 @@ impl DFlashDrafter {
     }
 }
 
-/// One greedy DFlash acceptance walk over a drafted block (port of the
-/// `_speculative_walk` half of `_dflash_rounds`).
-///
-/// Accept drafted tokens up to the first mismatch with the verifier's greedy
-/// choice, then take the verifier's correction/bonus at that position. Returns
-/// `(accepted, new_tokens)` capped at `budget`. `target_tokens` are the
-/// verifier's greedy predictions for positions `[seed, d0, d1, ...]` — i.e.
-/// `draft_tokens.len() + 1` of them.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-pub fn walk_block_greedy(
-    draft_tokens: &[u32],
-    target_tokens: &[u32],
-    budget: usize,
-) -> (usize, Vec<u32>) {
-    let n_draft = draft_tokens.len();
-    let mut accepted = n_draft;
-    for (i, (&d, &t)) in draft_tokens.iter().zip(target_tokens.iter()).enumerate() {
-        if d != t {
-            accepted = i;
-            break;
-        }
-    }
-    let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
-    if accepted < target_tokens.len() {
-        new_tokens.push(target_tokens[accepted]);
-    }
-    new_tokens.truncate(budget);
-    (accepted, new_tokens)
-}
-
 use crate::decode_loop::ProbeStep;
 
 /// DFlash speculative-decoding round-loop (greedy / temp=0).
@@ -854,7 +821,7 @@ pub fn dflash_generate(
         verifier_ns += t0.elapsed().as_nanos();
 
         // -- Phase C: acceptance walk. ---------------------------------------
-        let (accept, new_tokens) = walk_block_greedy(&draft_tokens, &v_tokens, remaining);
+        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         total_accept += accept;
         recent.push((accept, draft_tokens.len()));
 
