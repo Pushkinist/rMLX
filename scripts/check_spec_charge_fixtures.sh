@@ -186,6 +186,132 @@ pub fn spec_generate_greedy(
 RS
 }
 
+write_round_common() {
+  local root="$1"
+  {
+    printf '//! The shared refold-or-disarm, and the low-level pair beneath it.\n\n'
+    shared_rollback_src
+    printf '\nfn rollback_round_caches(\n    caches: &mut [KvCache],\n    lin: Option<&mut [LinearAttnCache]>,\n    fed: &[u32],\n    pre_round_offset: i32,\n    target: i32,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    refold_lin_tapes(lin, fed.len(), 0, charge, device)\n}\n'
+    printf '\nfn refold_lin_tapes(\n    lin: Option<&mut [LinearAttnCache]>,\n    round_len: usize,\n    kept: usize,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    Ok(())\n}\n'
+  } >"$root/crates/rmlx-models/src/speculative/round_common.rs"
+}
+
+# The configuration an entry builds and the shared loop is handed. The scanner
+# resolves the forwarded parameter by this declared type, so the fixture states
+# it once — at module level, where no rule of this gate reaches.
+cfg_type_src() {
+  cat <<'RS'
+pub(crate) struct RoundCfg {
+    pub loop_kind: SpecLoop,
+    pub charged: bool,
+}
+RS
+}
+
+# The shared loop: it is handed its decision rather than making one, and every
+# site names the field it was handed, through one readable binding.
+forwarded_loop_src() {
+  cat <<'RS'
+pub(crate) fn round_loop_generate(
+    verifier: &Architecture,
+    cfg: &RoundCfg,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    device: Device,
+) -> Result<()> {
+    let charge = cfg.charged;
+    while emitted.len() < n_tokens {
+        super::rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_pre_round_offset,
+            v_target,
+            // The decision the entry made, first of two calls.
+            charge,
+            device,
+        )?;
+        super::rollback_round(
+            &mut d_caches,
+            Some(&mut d_lin),
+            &d_fed,
+            d_pre_round_offset,
+            d_target,
+            // The same decision, at the draft-side rollback.
+            charge,
+            device,
+        )?;
+        super::log_round(
+            &super::RoundReport {
+                loop_kind: cfg.loop_kind,
+                round: rounds,
+                charged: charge,
+            },
+            &[],
+        );
+    }
+    log_request_record(
+        &RoundTotals {
+            loop_kind: cfg.loop_kind,
+            rounds,
+            charged: charge,
+        },
+        &emitted,
+        seed_emitted,
+        &window,
+    );
+    Ok(())
+}
+RS
+}
+
+# One entry: the fn that starts a round loop, builds its configuration, and
+# names the decision once on the way in. It runs no round, so it holds no
+# totals and rolls nothing back.
+entry_src() {
+  local name="$1" token="$2" bind="$3"
+  printf 'pub fn %s(\n    verifier: &Architecture,\n    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,\n    device: Device,\n) -> Result<()> {\n' "$name"
+  if [ "$bind" = "bind" ]; then
+    printf '    let charge_phases = super::phases_charged();\n'
+  fi
+  cat <<RS
+    super::round_loop_generate(
+        verifier,
+        &RoundCfg {
+            loop_kind: SpecLoop::Kind,
+            charged: $token,
+        },
+        step_fn,
+        device,
+    )
+}
+RS
+}
+
+# A drafter rolling its own state back: outside every round loop, carrying the
+# decision it was handed as a field of one of its own parameters.
+drafter_rollback_src() {
+  local charge="$1"
+  cat <<RS
+
+fn rollback(
+    &mut self,
+    ctx: &RoundCtx<'_>,
+    v: &Verdict,
+) -> Result<Option<CacheSpan>> {
+    super::rollback_round(
+        &mut self.caches,
+        None,
+        &self.fed,
+        0,
+        v.target,
+        $charge,
+        ctx.device,
+    )?;
+    Ok(None)
+}
+RS
+}
+
 build_root() {
   local root="$1"
   rm -rf "$root"
@@ -206,12 +332,7 @@ build_root() {
     seed_emit_src
   } >"$root/crates/rmlx-models/src/speculative/mod.rs"
 
-  {
-    printf '//! The shared refold-or-disarm, and the low-level pair beneath it.\n\n'
-    shared_rollback_src
-    printf '\nfn rollback_round_caches(\n    caches: &mut [KvCache],\n    lin: Option<&mut [LinearAttnCache]>,\n    fed: &[u32],\n    pre_round_offset: i32,\n    target: i32,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    refold_lin_tapes(lin, fed.len(), 0, charge, device)\n}\n'
-    printf '\nfn refold_lin_tapes(\n    lin: Option<&mut [LinearAttnCache]>,\n    round_len: usize,\n    kept: usize,\n    charge: bool,\n    device: Device,\n) -> Result<()> {\n    Ok(())\n}\n'
-  } >"$root/crates/rmlx-models/src/speculative/round_common.rs"
+  write_round_common "$root"
 
   loop_src "mtp_generate" "charge_phases" "bind" \
     >"$root/crates/rmlx-models/src/speculative/mtp.rs"
@@ -228,6 +349,93 @@ build_root() {
   # is a legitimate thing for a test to build and is not a round loop.
   loop_src "a_charged_round_fixture" "true" "plain" \
     >"$root/crates/rmlx-models/src/speculative/round_stats_tests.rs"
+}
+
+# The tree mid-campaign: one drafter migrated. Its loop body is gone, the shared
+# loop runs its rounds, and the decision it used to make inside the body is made
+# at the entry that starts the loop. Six loops still carry their own body, and
+# the census is unchanged — which is the property the re-key exists to keep.
+build_mid_root() {
+  local root="$1"
+  rm -rf "$root"
+  mkdir -p "$root/crates/rmlx-models/src/speculative/dflash2"
+
+  {
+    printf '//! Two two-model loops, the entry guard, the shared helpers, and the\n//! configuration a migrated drafter builds.\n\n'
+    cfg_type_src
+    printf '\n'
+    dispatcher_src
+    printf '\n'
+    loop_src "spec_generate_greedy_cached" "false" "plain"
+    printf '\n'
+    loop_src "spec_generate_stochastic_cached" "false" "plain"
+    printf '\n'
+    stats_helper_src
+    printf '\n'
+    recorder_src
+    printf '\n'
+    seed_emit_src
+  } >"$root/crates/rmlx-models/src/speculative/mod.rs"
+
+  write_round_common "$root"
+
+  {
+    printf '//! The one round loop.\n\n'
+    forwarded_loop_src
+  } >"$root/crates/rmlx-models/src/speculative/round_loop.rs"
+
+  entry_src "mtp_generate" "charge_phases" "bind" \
+    >"$root/crates/rmlx-models/src/speculative/mtp.rs"
+  loop_src "mtp_assistant_generate" "charge_phases" "bind" \
+    >"$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
+  loop_src "dflash2_generate" "charge_phases" "bind" \
+    >"$root/crates/rmlx-models/src/speculative/dflash2/round.rs"
+  loop_src "dflash_generate" "false" "plain" \
+    >"$root/crates/rmlx-models/src/speculative/dflash.rs"
+  loop_src "eagle3_generate" "false" "plain" \
+    >"$root/crates/rmlx-models/src/speculative/eagle3.rs"
+}
+
+# The end state: one loop body, seven entries, and the same seven decisions.
+build_end_root() {
+  local root="$1"
+  rm -rf "$root"
+  mkdir -p "$root/crates/rmlx-models/src/speculative/dflash2"
+
+  {
+    printf '//! The entry guard, the two two-model entries, the shared helpers, and\n//! the configuration every entry builds.\n\n'
+    cfg_type_src
+    printf '\n'
+    dispatcher_src
+    printf '\n'
+    entry_src "spec_generate_greedy_cached" "false" "plain"
+    printf '\n'
+    entry_src "spec_generate_stochastic_cached" "false" "plain"
+    printf '\n'
+    stats_helper_src
+    printf '\n'
+    recorder_src
+    printf '\n'
+    seed_emit_src
+  } >"$root/crates/rmlx-models/src/speculative/mod.rs"
+
+  write_round_common "$root"
+
+  {
+    printf '//! The one round loop.\n\n'
+    forwarded_loop_src
+  } >"$root/crates/rmlx-models/src/speculative/round_loop.rs"
+
+  entry_src "mtp_generate" "charge_phases" "bind" \
+    >"$root/crates/rmlx-models/src/speculative/mtp.rs"
+  entry_src "mtp_assistant_generate" "charge_phases" "bind" \
+    >"$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
+  entry_src "dflash2_generate" "charge_phases" "bind" \
+    >"$root/crates/rmlx-models/src/speculative/dflash2/round.rs"
+  entry_src "dflash_generate" "false" "plain" \
+    >"$root/crates/rmlx-models/src/speculative/dflash.rs"
+  entry_src "eagle3_generate" "false" "plain" \
+    >"$root/crates/rmlx-models/src/speculative/eagle3.rs"
 }
 
 # run <name> <expected-exit> <reason-substring>
@@ -277,7 +485,7 @@ root="$work/root"
 
 build_root "$root"
 run "a clean root passes, and the entry guard is not a loop" 0 \
-  "7 speculative round loops, each naming one charge decision"
+  "OK: 7 classic, 0 forwarded, 0 entries; census charge_phases:3 false:4 (7 sites)."
 
 # 1. The rule the gate exists for: one loop whose rollback and record disagree.
 #    The record says the round was not charged, the rollback charges it, and
@@ -303,9 +511,11 @@ perl -0pi -e 's/            charged: false,\n        \},/            charged: tr
 run "a record whose last field drops its comma is still read" 1 \
   "\`eagle3_generate\` names more than one charge decision"
 
-# 4. A value that is not a bare identifier is unreadable, not absent.
+# 4. A value the token reader cannot read is unreadable, not absent. A field
+#    access is a token; a call that resembles one is not, which is what the
+#    delimiter anchor is for.
 build_root "$root"
-perl -0pi -e 's/            charged: false,/            charged: self.charged,/' \
+perl -0pi -e 's/            charged: false,/            charged: self.charged(),/' \
   "$root/crates/rmlx-models/src/speculative/dflash.rs"
 run "a record whose value the scan cannot read is a scan error" 2 \
   "\`dflash_generate\` has a charge site this gate could not read"
@@ -467,7 +677,7 @@ build_root "$root"
 perl -0pi -e 's/\) -> Result<\(\)> \{/) -> Result<()>\nwhere\n    D: Drafter,\n{/' \
   "$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
 run "a loop with a \`where\` clause is still read" 0 \
-  "7 speculative round loops, each naming one charge decision"
+  "OK: 7 classic, 0 forwarded, 0 entries; census charge_phases:3 false:4 (7 sites)."
 
 # 23. RULE 5, at the shape that opened it: the recorder reading the decision off
 #     the totals it was handed. The value is unreadable to this scan, and an
@@ -643,7 +853,303 @@ cat >>"$root/crates/rmlx-models/src/speculative/round_common.rs" <<'RS'
 fn seam_note() {}
 RS
 run "a doc comment naming the target and the emit is prose, not either" 0 \
-  "7 speculative round loops, each naming one charge decision"
+  "OK: 7 classic, 0 forwarded, 0 entries; census charge_phases:3 false:4 (7 sites)."
+
+# ---------------------------------------------------------------------------
+# The collapse: the decision travels as a value.
+#
+# The cases above are all one tree shape — seven loops, each deciding for
+# itself. Below are the two shapes the campaign passes through: mid-campaign,
+# where one drafter has been migrated and its decision now lives at the entry
+# that starts the shared loop, and the end state, where all seven do. The census
+# is the same seven decisions in every one of them, which is the property that
+# makes it worth reading at all.
+# ---------------------------------------------------------------------------
+
+# R1. The mid-campaign tree. The forwarded loop is named on the success line, so
+#     a fixture asserting that a loop is forwarded has a line to assert against.
+build_mid_root "$root"
+run "the mid-campaign tree passes, and names what it passed as" 0 \
+  "OK: 6 classic, 1 forwarded, 1 entries; census charge_phases:3 false:4 (7 sites). Forwarded: \`round_loop_generate\`."
+
+# R2. The mutation the re-key exists for: the forwarded loop hard-wires the
+#     decision it was handed. Both readings fire on the one tree — RULE 8 names
+#     the line, the census names the count.
+build_mid_root "$root"
+perl -0pi -e 's/    let charge = cfg\.charged;/    let charge = false;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop that hard-wires its charge is named by RULE 8" 1 \
+  "\`round_loop_generate\` is handed its charge in \`cfg\` and applies"
+run "the same hard-wire puts an eighth decision in the census" 1 \
+  "the charge census is \"charge:1 charge_phases:3 false:4\" (8 sites)"
+
+# R3. The whole right-hand side, not a prefix of it: a second condition ORed
+#     into the field charges on requests the entry did not ask for.
+build_mid_root "$root"
+perl -0pi -e 's/    let charge = cfg\.charged;/    let charge = cfg.charged || force_charge;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop ORing a condition into the field it was handed is refused" 1 \
+  "\`round_loop_generate\` is handed its charge in \`cfg\` and applies"
+
+# R4. The other legitimate spelling: no binding at all, the field named at every
+#     site. A field access is a token, which is the reader change this needs.
+build_mid_root "$root"
+perl -0pi -e 's/    let charge = cfg\.charged;\n//; s/^(\s+)charge,$/$1cfg.charged,/gm; s/charged: charge,/charged: cfg.charged,/g' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop naming the field at every site is read as one token" 0 \
+  "OK: 6 classic, 1 forwarded, 1 entries; census charge_phases:3 false:4 (7 sites)."
+
+# R5. An entry that drops its decision. Excluding the forwarded loop from the
+#     census must not hide it: RULE 5's zero-arm names the entry, and the census
+#     reads six sites where the tree records seven.
+build_end_root "$root"
+perl -0pi -e 's/            charged: charge_phases,\n//' \
+  "$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
+run "an entry that states no decision is named by RULE 5" 1 \
+  "\`mtp_assistant_generate\` builds a round loop's configuration and states"
+run "the same dropped decision is a census that lost a site" 1 \
+  "the charge census is \"charge_phases:2 false:4\" (6 sites)"
+
+# R6. RULE 2 over the entries: the token still has to mean the call.
+build_end_root "$root"
+perl -0pi -e 's/    let charge_phases = super::phases_charged\(\);/    let charge_phases = true;/' \
+  "$root/crates/rmlx-models/src/speculative/dflash2/round.rs"
+run "an entry binding \`charge_phases\` to a literal is refused" 1 \
+  "\`dflash2_generate\` charges on \`charge_phases\` and does not bind it"
+
+# R7. An entry genuinely moved from one schedule to the other, binding and all.
+build_end_root "$root"
+perl -0pi -e 's/            charged: false,/            charged: charge_phases,/' \
+  "$root/crates/rmlx-models/src/speculative/eagle3.rs"
+perl -0pi -e 's/(\) -> Result<\(\)> \{\n)/$1    let charge_phases = super::phases_charged();\n/' \
+  "$root/crates/rmlx-models/src/speculative/eagle3.rs"
+run "an entry moved between the two schedules is refused" 1 \
+  "the charge census is \"charge_phases:4 false:3\" (7 sites)"
+
+# R8. RULE 5 unchanged: a fn in neither population naming a decision.
+build_mid_root "$root"
+cat >>"$root/crates/rmlx-models/src/speculative/mtp.rs" <<'RS'
+
+fn summarise_uncharged(rounds: usize) -> super::RoundStats {
+    super::RoundStats {
+        rounds,
+        charged: false,
+    }
+}
+RS
+run "a decision named outside both populations is refused" 1 \
+  "\`summarise_uncharged\` writes 1 \`charged:\` field(s) — false —"
+
+# R9. RULE 4's new arm: a drafter rolling its own state back carries the
+#     decision it was handed, as a field of one of its own parameters.
+build_mid_root "$root"
+drafter_rollback_src "ctx.charged" \
+  >>"$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a drafter rollback carrying the decision it was handed passes" 0 \
+  "OK: 6 classic, 1 forwarded, 1 entries; census charge_phases:3 false:4 (7 sites)."
+
+# R10. The same rollback deciding for itself. A literal there is a second
+#      decision made where nothing can hold it to the loop that ordered it.
+build_mid_root "$root"
+drafter_rollback_src "false" \
+  >>"$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a drafter rollback that decides for itself is refused" 1 \
+  "\`rollback\` is handed the round's context in \`ctx\` and"
+
+# R11. An argument the scan cannot read back is unreadable, not absent — the
+#      same disposition the record side has.
+build_mid_root "$root"
+drafter_rollback_src "ctx.charge_flag()" \
+  >>"$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a drafter rollback on an unreadable charge is a scan error" 2 \
+  "\`rollback\` rolls a round back on a \`charge\` this gate"
+
+# R12. The end state: one loop body, seven entries, the same seven decisions.
+build_end_root "$root"
+run "the end state passes with every decision in an entry" 0 \
+  "OK: 0 classic, 1 forwarded, 7 entries; census charge_phases:3 false:4 (7 sites). Forwarded: \`round_loop_generate\`."
+
+# R13. The end state with the one loop deleted. A scan that finds nothing must
+#      not pass, and at the end state there is one body left to find.
+build_end_root "$root"
+rm -f "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "the end state with its one loop deleted is a scan error" 2 \
+  "found no round loop"
+
+# R14. RULE 6 over the shared loop: the low-level rollback is round_common's
+#      alone, and the loop beside it does not inherit that exemption.
+build_mid_root "$root"
+perl -0pi -e 's/        super::log_round\(/        super::rollback_round_caches(\n            \&mut v_caches,\n            None,\n            \&v_input,\n            0,\n            0,\n            false,\n            device,\n        )?;\n        super::log_round(/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "the shared loop reaching past the shared rollback is a scan error" 2 \
+  "\`round_loop_generate\` makes 1 call(s) to the low-level"
+
+# R15. RULE 7 over the shared loop: one round, one event.
+build_mid_root "$root"
+perl -0pi -e 's/(        super::log_round\(\n(?:.*\n)*?        \);\n)/$1$1/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "the shared loop closing its round twice is refused" 2 \
+  "\`round_loop_generate\` reaches the one round emit 2 time(s)."
+
+# R16. The shadow, on both arms. On the forwarded loop RULE 8 has something
+#      exact to say about the second binding, so it is exit 1 and names it; on a
+#      classic loop the same-token reading has become vacuous and it is exit 2.
+build_mid_root "$root"
+perl -0pi -e 's/(    let charge = cfg\.charged;\n)/$1    let charge = false;\n/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop shadowing its binding is named by RULE 8" 1 \
+  "\`round_loop_generate\` binds its charge token twice; the last binds it"
+
+build_mid_root "$root"
+perl -0pi -e 's/(    let charge_phases = super::phases_charged\(\);\n)/$1    let charge_phases = false;\n/' \
+  "$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
+run "a classic loop shadowing its binding is a scan error" 2 \
+  "\`mtp_assistant_generate\` binds its charge token more than once"
+
+# R17. RULE 5 over the entries: an entry names one decision, and two are two
+#      decisions with nothing saying which one the loop applies.
+build_end_root "$root"
+perl -0pi -e 's/(            charged: false,\n)/$1            charged: true,\n/' \
+  "$root/crates/rmlx-models/src/speculative/dflash.rs"
+run "an entry stating two decisions is refused" 1 \
+  "\`dflash_generate\` builds a round loop's configuration and states"
+
+# R18. The entry arm of R16, and not a corner: at the end state all seven
+#      decisions live in entries, so an unread shadow there is the whole census.
+build_end_root "$root"
+perl -0pi -e 's/(    let charge_phases = super::phases_charged\(\);\n)/$1    let charge_phases = false;\n/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "an entry shadowing its binding is a scan error" 2 \
+  "\`mtp_generate\` binds its charge token more than once"
+
+# R19. An entry that stops building the configuration leaves the population.
+#      That must read as a lost decision rather than as a clean scan, which is
+#      what the census does and no membership test could.
+build_end_root "$root"
+perl -0pi -e 's/    super::round_loop_generate\(\n(?:.*\n)*?    \)\n/    super::round_loop_legacy(verifier, charge_phases, step_fn, device)\n/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "an entry that stops building the configuration is a lost decision" 1 \
+  "the charge census is \"charge_phases:2 false:4\" (6 sites)"
+
+# R20. The configuration handed over is read-only inside the loop. A loop that
+#      builds its own and forwards faithfully from that writes no site any
+#      reading here can see.
+build_mid_root "$root"
+perl -0pi -e 's/    let charge = cfg\.charged;/    let cfg = RoundCfg::uncharged();\n    let charge = cfg.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop rebinding the configuration's name is a scan error" 2 \
+  "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
+
+# R21. The same, by assignment rather than by rebinding.
+build_mid_root "$root"
+perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: \&mut RoundCfg,/; s/    let charge = cfg\.charged;/    cfg.charged = false;\n    let charge = cfg.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop writing the configuration's charge field is a scan error" 2 \
+  "\`round_loop_generate\` takes its \`RoundCfg\` by \`&mut\` (or by"
+
+# R22. The delimiter anchor holds: a call is not the field it resembles, and a
+#      reader without the anchor would count this as forwarded.
+build_mid_root "$root"
+perl -0pi -e 's/                charged: charge,/                charged: cfg.charged(),/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a call that resembles the configuration field is a scan error" 2 \
+  "\`round_loop_generate\` has a charge site this gate could not read"
+
+# R23. Not a readable binding form. A reader that guesses is worse than one
+#      that refuses, and this is the shape rustfmt cannot introduce.
+build_mid_root "$root"
+perl -0pi -e 's/    let charge = cfg\.charged;/    let mut charge = cfg.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop binding through a \`let mut\` is a scan error" 2 \
+  "\`round_loop_generate\` binds \`charge\` in a shape this gate cannot"
+
+# R24. The other half of the per-binding reading: a token the sites name and no
+#      binding anywhere. The scan never saw what it means, so the census would
+#      be reading a name rather than a decision.
+build_root "$root"
+perl -0pi -e 's/    let charge_phases = super::phases_charged\(\);\n//' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a loop naming a token it never binds is refused" 1 \
+  "\`mtp_generate\` names \`charge_phases\` as its decision and never binds"
+
+# R25. The looser reading's own hole, closed. A second parameter carrying a
+#      field of the same name satisfies "a field of one of its own parameters"
+#      while holding a different decision, so where a fn is handed the round's
+#      context the charge comes off that and off nothing else.
+build_mid_root "$root"
+drafter_rollback_src "v.charged" \
+  >>"$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a drafter rollback charging off the wrong parameter is refused" 1 \
+  "\`rollback\` is handed the round's context in \`ctx\` and"
+
+# R26. RULE 8's read-only half is about the value and not one spelling of it:
+#      the whole configuration replaced through its own reference writes no site
+#      any other reading here can see.
+build_mid_root "$root"
+perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: \&mut RoundCfg,/; s/    let charge = cfg\.charged;/    *cfg = RoundCfg::uncharged();\n    let charge = cfg.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop assigning through the configuration's reference is a scan error" 2 \
+  "\`round_loop_generate\` takes its \`RoundCfg\` by \`&mut\` (or by"
+
+# R27. The same, moved rather than assigned.
+build_mid_root "$root"
+perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: \&mut RoundCfg,/; s/    let charge = cfg\.charged;/    let old = std::mem::replace(cfg, RoundCfg::uncharged());\n    let charge = old.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop swapping its configuration out is a scan error" 2 \
+  "\`round_loop_generate\` takes its \`RoundCfg\` by \`&mut\` (or by"
+
+# R28. Two parameters of the configuration's type. A rule that took the last one
+#      declared would read the loop's token against the wrong parameter, and
+#      which one it read would depend on the order they were written in.
+build_mid_root "$root"
+perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: \&RoundCfg,\n    fallback: \&RoundCfg,/; s/    let charge = cfg\.charged;/    let charge = fallback.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a loop taking two configurations is a scan error, not a guess" 2 \
+  "\`round_loop_generate\` takes a \`RoundCfg\` this gate could not name"
+
+# R29. Every needle reads code, the parameter list included. A comment naming a
+#      type in a signature is prose: read as declarations, it would make a
+#      classic loop forwarded and a helper a round loop.
+build_mid_root "$root"
+perl -0pi -e 's/    device: Device,\n\) -> Result<\(\)> \{/    device: Device, \/\/ not a RoundCfg, and not a RoundCtx either\n) -> Result<()> {/' \
+  "$root/crates/rmlx-models/src/speculative/dflash.rs"
+run "a comment in a parameter list is prose, not a declaration" 0 \
+  "OK: 6 classic, 1 forwarded, 1 entries; census charge_phases:3 false:4 (7 sites)."
+
+# R30. The property, not the spellings: a configuration handed over by value can
+#      be written the same ways, and a rule that read only the lines would have
+#      to enumerate them for ever.
+build_mid_root "$root"
+perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: RoundCfg,/; s/    let charge = cfg\.charged;/    cfg.set_charged(false);\n    let charge = cfg.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop taking its configuration by value is a scan error" 2 \
+  "\`round_loop_generate\` takes its \`RoundCfg\` by \`&mut\` (or by"
+
+# R31. The four line shapes are still read, which is what covers a write this
+#      gate can see on a parameter it has already accepted as immutable.
+build_mid_root "$root"
+perl -0pi -e 's/    let charge = cfg\.charged;/    cfg.charged = false;\n    let charge = cfg.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a write to the configuration is read even where the parameter is immutable" 2 \
+  "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
+
+# R32. A pair, because a case without its control proves nothing about which
+#      reading fired: the low-level rollback after a loop's record is refused,
+#      and it is refused just the same when a comment carrying an unbalanced
+#      brace sits in front of it. A body whose extent is read off the raw line
+#      ends at that comment, and every needle after it belongs to no function
+#      and is checked by no rule.
+build_root "$root"
+perl -0pi -e 's/    Ok\(\(\)\)\n\}/    super::rollback_round_caches(\&mut v_caches, None, \&\[\], 0, 0, false, device)?;\n    Ok(())\n}/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a low-level rollback after a loop record is refused" 2 \
+  "\`mtp_generate\` makes 1 call(s) to the low-level"
+
+build_root "$root"
+perl -0pi -e 's/    Ok\(\(\)\)\n\}/    \/\/ the round closes here }\n    super::rollback_round_caches(\&mut v_caches, None, \&\[\], 0, 0, false, device)?;\n    Ok(())\n}/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a comment carrying a brace does not end the body it sits in" 2 \
+  "\`mtp_generate\` makes 1 call(s) to the low-level"
 
 echo
 if [ "$failures" != "0" ]; then
