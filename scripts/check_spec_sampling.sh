@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# scripts/check_spec_sampling.sh — CI gate: every speculative round loop is
-# handed the request's sampling configuration, and every drafter arm passes it.
+# scripts/check_spec_sampling.sh — CI gate: every speculative generation path is
+# handed the request's sampling configuration and draws with it, and every
+# drafter arm passes it.
 #
 # WHY
 #   A round loop that takes no sampler decodes greedily. It does not fail, it
@@ -16,34 +17,114 @@
 #   The distributional gate (`spec_sampled_distribution`) is what proves a loop
 #   samples *correctly*. It needs two model snapshots and a Metal context, so it
 #   runs one pair under `make gpu-test` and stands down elsewhere. This gate is
-#   the part that runs everywhere and covers every loop: it cannot tell a right
-#   distribution from a wrong one, and it can tell that a loop was never given
+#   the part that runs everywhere and covers every path: it cannot tell a right
+#   distribution from a wrong one, and it can tell that a path was never given
 #   the chance to draw from either.
 #
-# RULE 1 (the loops)
-#   In crates/rmlx-models/src/speculative/, a `pub fn` whose parameters include
-#   `step_fn: &mut dyn FnMut(&ProbeStep)` is a generation driver — that argument
-#   is what makes it one. Every such function must
-#     (a) declare a `sampler_cfg: &...SamplerConfig` parameter, and
-#     (b) mention `sampler_cfg` in its body.
-#   (b) is not redundant: a parameter added to satisfy (a) and then ignored is
-#   the same defect with the signature repaired.
+# THE POPULATION
+#   Not "a `pub fn` driver". That rule found six fns while the two private
+#   two-model loops sat outside the gate entirely, and it would have kept
+#   finding the entries after the collapse while the one shared loop — which is
+#   `pub(crate)` — stayed outside it. Widening to any visibility alone is not
+#   free either: it enumerates the three emit helpers, which drive no
+#   generation and take no sampler.
 #
-# RULE 2 (the dispatch)
+#   So the population is `check_spec_charge.sh`'s, at any visibility, plus the
+#   fns that call one of them:
+#
+#     LOOPS   — the driver signature `step_fn: &mut dyn FnMut(&ProbeStep)` plus
+#               a `RoundTotals`.
+#     ENTRIES — the driver signature, no totals, no `rollback_round`, and it
+#               constructs the loop's `RoundCfg`.
+#     GUARDS  — a fn that calls a loop or an entry and is neither. There is one:
+#               the two-model entry guard, which routes a request to one of two
+#               loops by reading whether the sampler is active. That clause is
+#               not tidiness — the guard is where a sampled request can be
+#               routed to the greedy arm, which is this gate's own defect class,
+#               and it was in the gate before only because it happens to be
+#               `pub`.
+#
+#   Narrowing to the loops alone is the tempting move and it is wrong: at the
+#   end of the campaign the entries are the only place a request's sampler can
+#   be dropped, since each takes it and hands it to the loop's configuration,
+#   and a gate that stops reading them loses its own defect class at the one
+#   site that can still commit it.
+#
+# RULE 1 (a loop is handed the sampler and draws with it)
+#   Every loop must
+#     (a) declare a `sampler_cfg: &...SamplerConfig` parameter, or take the
+#         `RoundCfg` that carries the request's sampler for it, and
+#     (b) construct the draw it uses from that sampler — a
+#         `VerifierDraw::new(...)` naming `sampler_cfg`, which is why the
+#         configuration's field carrying it is named `sampler_cfg` too, so one
+#         needle reads `VerifierDraw::new(sampler_cfg)` and
+#         `VerifierDraw::new(cfg.sampler_cfg)` alike.
+#   (b) is not redundant, and it is deliberately the construction rather than a
+#   mention: a parameter added to satisfy (a) and then ignored is the same
+#   defect with the signature repaired, and a sampler assigned into a context
+#   field and read by nobody is the same defect with the body repaired.
+#
+#   One loop draws another way and is read by a second needle rather than
+#   waived: `spec_generate_stochastic_cached` is the one acceptance rule that is
+#   not the shared one — it seeds its whole draw stream with
+#   `Pcg32::new(sampler_cfg.seed_or_default())` and scores each position's own
+#   post-sampling distribution. That is still a draw constructed from the
+#   request's sampler, so it is a needle any loop may satisfy and not a name
+#   this gate exempts.
+#
+# RULE 2 (an entry hands the sampler to the loop)
+#   An entry declares the parameter and the configuration it builds carries it:
+#   the needle is `sampler_cfg` inside the `RoundCfg { ... }` literal, not the
+#   name appearing somewhere in the body. A `sampler_cfg` an entry accepts and
+#   leaves out of the configuration it hands over is exactly the shape this rule
+#   exists to refuse.
+#
+# RULE 3 (a guard passes it on)
+#   A guard declares the parameter and passes it at every call it makes to a
+#   loop or an entry that takes one.
+#
+# RULE 4 (the dispatch)
 #   In the server's speculative generator, every arm of the `match &drafter`
 #   that drives a generation must pass the resolved sampler configuration. One
 #   arm that does not is one drafter kind that decodes greedily, and the other
 #   arms passing it is what makes that invisible in review.
 #
+# THE ONE EXCEPTION, RECORDED
+#   `spec_generate_greedy_cached` takes no sampler at all. It is the two-model
+#   greedy loop, it runs only at temperature 0 where the verifier's argmax is
+#   the draw, and the guard above it routes every sampled request to the
+#   stochastic loop instead. So it is exempt from RULE 1, and no caller is
+#   asked to pass it a sampler it does not take. The exception is deleted in
+#   migration chunk 6, where that loop becomes a drafter whose `verify` draws
+#   through the context. It is the only name in this file.
+#
+# THE CENSUS
+#   The success line names the three populations, and the count of drafter
+#   paths — the loops that are not the shared forwarded one, plus the entries —
+#   is pinned at seven. That figure is invariant across the campaign by
+#   construction: a migrated drafter's loop body becomes its entry, one for one.
+#   A scan that finds six paths where the tree has seven has not passed, it has
+#   stopped looking, so a count that moves is exit 2 rather than a quieter run.
+#
 # EXIT
-#   0 clean, 1 a rule fired, 2 the gate could not scan (missing file, no
-#   drivers found — a scan that finds nothing must not pass).
+#   0 clean, 1 a rule fired, 2 the gate could not scan — a missing file, no
+#   loop found, a body it could not read back, or a drafter-path count that
+#   moved. A scan that finds nothing must not pass.
 
 set -uo pipefail
 
 root="${SPEC_SAMPLING_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 loops_dir="$root/crates/rmlx-models/src/speculative"
 dispatch="$root/crates/rmlx-server/src/engine/speculative.rs"
+
+# The one fn that drives a generation and takes no sampler, and the reason it
+# may — see THE ONE EXCEPTION above. It is a constant and not a knob: a gate
+# whose exemptions can be named from the environment is a gate that exempts
+# whatever the caller wants. The recall test proves it is load-bearing by
+# running a copy of this script with the name struck out.
+readonly EXEMPT_LOOP="spec_generate_greedy_cached"
+
+readonly WANT_PATHS=7
 
 fail=0
 scan_error=0
@@ -59,100 +140,318 @@ if [ ! -f "$dispatch" ]; then
   exit 2
 fi
 
-# ---- Rule 1 ----------------------------------------------------------------
+# ---- Pass 1: the populations, and what each member does with the sampler ----
 #
-# awk walks each file once. A `pub fn` opens a candidate; its parameter list runs
-# to the `) -> ` that closes it; the body runs to the line where the brace depth
-# returns to zero. Output is one record per driver: file, name, has-param,
-# uses-param.
+# One record per fn: file, name, driver signature, `RoundTotals`, a `RoundCfg`
+# parameter, a `RoundCfg` it builds, a `sampler_cfg` parameter, a draw built
+# from the sampler, a configuration carrying it. A body this scan cannot read
+# back is reported rather than skipped.
 
-drivers=$(
+records=$(
   find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
     xargs -0 awk '
+      function reset() {
+        in_sig = 0; awaiting_body = 0; in_body = 0; fname = ""
+        depth = 0; paren = 0; cfg_depth = 0
+        has_step = 0; has_stats = 0; has_cfg = 0; makes_cfg = 0
+        has_param = 0; draws = 0; cfg_carries = 0; unreadable = 0
+      }
       function flush() {
-        if (name != "" && is_driver) {
-          printf "%s\t%s\t%d\t%d\n", FILENAME, name, has_param, uses_param
+        if (fname != "") {
+          printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", \
+            FILENAME, fname, has_step, has_stats, has_cfg, makes_cfg, \
+            has_param, draws, cfg_carries, unreadable
         }
-        name = ""; is_driver = 0; has_param = 0; uses_param = 0
-        in_sig = 0; in_body = 0; depth = 0
+        reset()
       }
       FNR == 1 { flush() }
-      # A new `pub fn` while one is open means the previous never had a body we
-      # could read back — report it as unscannable rather than skipping it.
-      /^[[:space:]]*pub fn [a-z_0-9]+\(/ {
-        if (in_body) { printf "%s\t%s\t-1\t-1\n", FILENAME, name }
+
+      !in_body && !in_sig && !awaiting_body &&
+      /^[[:space:]]*(pub(\([a-z:]+\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[a-z_0-9]+/ {
         flush()
         line = $0
-        sub(/^[[:space:]]*pub fn /, "", line)
-        sub(/\(.*$/, "", line)
-        name = line
+        sub(/^.*fn[[:space:]]+/, "", line)
+        sub(/[^A-Za-z0-9_].*$/, "", line)
+        fname = line
         in_sig = 1
         paren = 0
       }
+
       in_sig {
-        if (index($0, "step_fn: &mut dyn FnMut(&ProbeStep)") > 0) { is_driver = 1 }
-        if ($0 ~ /sampler_cfg: &/) { has_param = 1 }
-        # The parameter list closes when its own parenthesis balances. A
-        # per-parameter `) -> ` — every `FnMut(..) -> ..` argument has one — is
-        # inside it and must not end the scan, which is how a `sampler_cfg`
-        # declared after `step_fn` went unseen.
+        if (index($0, "step_fn: &mut dyn FnMut(&ProbeStep)") > 0) { has_step = 1 }
+        if ($0 ~ /sampler_cfg:[[:space:]]*&/) { has_param = 1 }
+        if (index($0, "RoundCfg") > 0) { has_cfg = 1 }
+        # A per-parameter `) -> ` is inside the list and must not end the scan,
+        # which is how a `sampler_cfg` declared after `step_fn` went unseen.
         paren += gsub(/\(/, "(") - gsub(/\)/, ")")
         if (paren <= 0) {
           in_sig = 0
-          in_body = 1
-          # The line that closes the parameter list also opens the body, so its
-          # own braces start the depth count. Starting from zero instead ends
-          # the body on its first `}`.
-          depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+          awaiting_body = 1
+          if (index($0, "{") > 0) {
+            awaiting_body = 0
+            in_body = 1
+            depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+            if (depth < 0) { depth = 0 }
+          }
         }
         next
       }
-      in_body {
-        if (index($0, "sampler_cfg") > 0) { uses_param = 1 }
-        n = gsub(/\{/, "{"); m = gsub(/\}/, "}")
-        depth += n - m
-        if (depth <= 0 && (n > 0 || m > 0)) { flush() }
+
+      awaiting_body {
+        if (index($0, "{") > 0) {
+          awaiting_body = 0
+          in_body = 1
+          depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+          if (depth < 0) { depth = 0 }
+        }
         next
+      }
+
+      !in_body { next }
+
+      index($0, "RoundTotals {") > 0 { has_stats = 1 }
+
+      # The draw a loop uses, built from the request`s sampler. Two spellings:
+      # the shared `VerifierDraw`, and the stochastic acceptance rule`s own RNG
+      # stream seeded from the same configuration.
+      (index($0, "VerifierDraw::new(") > 0 && index($0, "sampler_cfg") > 0) ||
+      index($0, "Pcg32::new(sampler_cfg.seed_or_default())") > 0 {
+        draws = 1
+      }
+
+      # The configuration an entry builds, and whether the sampler is in it. The
+      # literal is followed to its closing brace, so a `sampler_cfg` further
+      # down the body is not read as one the entry handed over.
+      index($0, "RoundCfg {") > 0 {
+        makes_cfg = 1
+        rest = $0
+        sub(/^.*RoundCfg[[:space:]]*\{/, "", rest)
+        cfg_depth = 1 + gsub(/\{/, "{", rest) - gsub(/\}/, "}", rest)
+        if (index(rest, "sampler_cfg") > 0) { cfg_carries = 1 }
+        if (cfg_depth <= 0) { cfg_depth = 0 }
+        depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        if (depth <= 0) { flush() }
+        next
+      }
+      cfg_depth > 0 {
+        if (index($0, "sampler_cfg") > 0) { cfg_carries = 1 }
+        cfg_depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        if (cfg_depth < 0) { cfg_depth = 0 }
+      }
+
+      {
+        depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        if (depth <= 0) { flush() }
+      }
+      END {
+        if (in_sig || awaiting_body) { unreadable = 1 }
+        flush()
+      }
+    '
+)
+
+loops=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1 && $4 == 1')
+entries=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1 && $4 == 0 && $6 == 1')
+
+if [ -z "$loops" ]; then
+  note "check-spec-sampling: found no round loop under ${loops_dir#"$root"/}."
+  note "  A loop is a fn taking \`step_fn: &mut dyn FnMut(&ProbeStep)\` that builds a"
+  note "  \`RoundTotals\`. Either they were renamed out from under this gate, or the scan"
+  note "  is broken; a gate that matched nothing must not report a pass."
+  exit 2
+fi
+
+population=$(printf '%s\n%s\n' "$loops" "$entries" | awk -F'\t' '$2 != "" { print $2 }')
+# BSD awk cannot take a newline inside a `-v` value, so the list crosses on
+# spaces. Names are Rust identifiers; neither form can hold one.
+population_flat=$(printf '%s\n' "$population" | tr '\n' ' ')
+
+# ---- Pass 2: the guards -----------------------------------------------------
+#
+# A call to a member of the population, and whether the request's sampler goes
+# with it. The exempt loop takes none, so a call to it is counted and not
+# checked — otherwise the guard above it would be refused for honouring a
+# signature this file already records.
+
+callers=$(
+  find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
+    xargs -0 awk -v names="$population_flat" -v exempt="$EXEMPT_LOOP" '
+      BEGIN { n = split(names, list, " "); for (i = 1; i <= n; i++) { if (list[i] != "") { pop[list[i]] = 1 } } }
+      function reset() {
+        in_sig = 0; awaiting_body = 0; in_body = 0; fname = ""
+        depth = 0; paren = 0; ncalls = 0; nmissing = 0; missing = "-"
+        call_depth = 0; callee = ""; carries = 0
+      }
+      function close_call() {
+        if (callee != exempt) {
+          ncalls++
+          if (!carries) { nmissing++; if (missing == "-") { missing = callee } }
+        }
+        call_depth = 0; callee = ""; carries = 0
+      }
+      function flush() {
+        if (fname != "") {
+          printf "%s\t%s\t%d\t%d\t%s\n", FILENAME, fname, ncalls, nmissing, missing
+        }
+        reset()
+      }
+      FNR == 1 { flush() }
+
+      !in_body && !in_sig && !awaiting_body &&
+      /^[[:space:]]*(pub(\([a-z:]+\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[a-z_0-9]+/ {
+        flush()
+        line = $0
+        sub(/^.*fn[[:space:]]+/, "", line)
+        sub(/[^A-Za-z0-9_].*$/, "", line)
+        fname = line
+        in_sig = 1
+        paren = 0
+      }
+
+      in_sig {
+        paren += gsub(/\(/, "(") - gsub(/\)/, ")")
+        if (paren <= 0) {
+          in_sig = 0
+          awaiting_body = 1
+          if (index($0, "{") > 0) {
+            awaiting_body = 0; in_body = 1
+            depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+            if (depth < 0) { depth = 0 }
+          }
+        }
+        next
+      }
+      awaiting_body {
+        if (index($0, "{") > 0) {
+          awaiting_body = 0; in_body = 1
+          depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+          if (depth < 0) { depth = 0 }
+        }
+        next
+      }
+      !in_body { next }
+
+      call_depth > 0 {
+        if (index($0, "sampler_cfg") > 0) { carries = 1 }
+        call_depth += gsub(/\(/, "(") - gsub(/\)/, ")")
+        if (call_depth <= 0) { close_call() }
+        depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        if (depth <= 0) { flush() }
+        next
+      }
+
+      {
+        line = $0
+        while (match(line, /[A-Za-z_][A-Za-z0-9_]*\(/)) {
+          name = substr(line, RSTART, RLENGTH - 1)
+          line = substr(line, RSTART + RLENGTH)
+          if (!(name in pop) || name == fname) { continue }
+          callee = name
+          carries = (index(line, "sampler_cfg") > 0)
+          call_depth = 1 + gsub(/\(/, "(", line) - gsub(/\)/, ")", line)
+          if (call_depth <= 0) { close_call() }
+          break
+        }
+      }
+
+      {
+        depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        if (depth <= 0) { flush() }
       }
       END { flush() }
     '
 )
 
-if [ -z "$drivers" ]; then
-  note "check-spec-sampling: found no generation drivers under ${loops_dir#"$root"/}."
-  note "  A driver is a \`pub fn\` taking \`step_fn: &mut dyn FnMut(&ProbeStep)\`. Either"
-  note "  they were renamed out from under this gate, or the scan is broken; a gate that"
-  note "  matched nothing must not report a pass."
-  exit 2
-fi
+# ---- Rule 1: the loops ------------------------------------------------------
 
-driver_count=0
-while IFS=$'\t' read -r file name has uses; do
+loop_count=0
+entry_count=0
+path_count=0
+forwarded_count=0
+
+while IFS=$'\t' read -r file name _sig _stats has_cfg _mk has_param draws _carries unreadable; do
   [ -n "$name" ] || continue
   rel="${file#"$root"/}"
-  driver_count=$((driver_count + 1))
-  if [ "$has" = "-1" ]; then
+  loop_count=$((loop_count + 1))
+  if [ "$has_cfg" = "1" ]; then
+    forwarded_count=$((forwarded_count + 1))
+  else
+    path_count=$((path_count + 1))
+  fi
+  if [ "$unreadable" = "1" ]; then
     note "check-spec-sampling: $rel: \`$name\` opened a body this gate could not read back."
-    note "  A driver whose extent cannot be determined is not scanned, and an unscanned"
-    note "  driver is exactly the one that would decode greedily unnoticed."
+    note "  A loop whose extent cannot be determined is not scanned, and an unscanned"
+    note "  loop is exactly the one that would decode greedily unnoticed."
     scan_error=1
     continue
   fi
-  if [ "$has" != "1" ]; then
-    note "check-spec-sampling: $rel: \`$name\` drives a generation but takes no"
-    note "  \`sampler_cfg: &SamplerConfig\`, so every request it serves decodes greedily"
-    note "  whatever temperature the caller asked for, and says nothing."
+  if [ "$name" = "$EXEMPT_LOOP" ]; then
+    continue
+  fi
+  if [ "$has_param" != "1" ] && [ "$has_cfg" != "1" ]; then
+    note "check-spec-sampling: $rel: \`$name\` drives a generation but takes neither a"
+    note "  \`sampler_cfg: &SamplerConfig\` nor the \`RoundCfg\` that carries one, so every"
+    note "  request it serves decodes greedily whatever temperature the caller asked"
+    note "  for, and says nothing."
     fail=1
     continue
   fi
-  if [ "$uses" != "1" ]; then
-    note "check-spec-sampling: $rel: \`$name\` takes \`sampler_cfg\` and never reads it."
-    note "  The signature satisfies a caller and the loop still decodes greedily."
+  if [ "$draws" != "1" ]; then
+    note "check-spec-sampling: $rel: \`$name\` is handed the request's sampler and builds"
+    note "  no draw from it. The signature satisfies a caller and the loop still decodes"
+    note "  greedily: the draw has to be constructed from the configuration, not the"
+    note "  name mentioned somewhere in the body."
     fail=1
   fi
-done <<<"$drivers"
+done <<<"$loops"
 
-# ---- Rule 2 ----------------------------------------------------------------
+# ---- Rule 2: the entries ----------------------------------------------------
+
+while IFS=$'\t' read -r file name _sig _stats _cfgp _mk has_param _draws carries unreadable; do
+  [ -n "$name" ] || continue
+  rel="${file#"$root"/}"
+  entry_count=$((entry_count + 1))
+  path_count=$((path_count + 1))
+  if [ "$unreadable" = "1" ]; then
+    note "check-spec-sampling: $rel: \`$name\` opened a body this gate could not read back."
+    scan_error=1
+    continue
+  fi
+  if [ "$has_param" != "1" ]; then
+    note "check-spec-sampling: $rel: \`$name\` starts a round loop and takes no"
+    note "  \`sampler_cfg: &SamplerConfig\`, so the request's temperature stops here and"
+    note "  the loop it runs draws from a distribution nobody asked for."
+    fail=1
+    continue
+  fi
+  if [ "$carries" != "1" ]; then
+    note "check-spec-sampling: $rel: \`$name\` takes \`sampler_cfg\` and leaves it out of the"
+    note "  configuration it hands the loop. An entry is the last place a request's"
+    note "  sampler can be dropped, and a sampler that reaches no loop is the same"
+    note "  greedy answer under a sampled label."
+    fail=1
+  fi
+done <<<"$entries"
+
+# ---- Rule 3: the guards -----------------------------------------------------
+
+guard_count=0
+while IFS=$'\t' read -r file name ncalls nmissing missing; do
+  [ -n "$name" ] || continue
+  [ "$ncalls" != "0" ] || continue
+  printf '%s\n' "$population" | grep -qx -- "$name" && continue
+  rel="${file#"$root"/}"
+  guard_count=$((guard_count + 1))
+  if [ "$nmissing" != "0" ]; then
+    note "check-spec-sampling: $rel: \`$name\` runs \`$missing\` without passing the"
+    note "  request's sampler. A guard routes a request to one generation path or"
+    note "  another; one route that drops the configuration is one class of request"
+    note "  answered greedily while every other route honours it."
+    fail=1
+  fi
+done <<<"$callers"
+
+# ---- Rule 4: the dispatch ---------------------------------------------------
 
 arms=$(
   awk '
@@ -179,7 +478,7 @@ arms=$(
 
 if [ -z "$arms" ]; then
   note "check-spec-sampling: ${dispatch#"$root"/} has no \`let result = match &drafter {\`"
-  note "  dispatch this gate can read. Rule 2 scanned nothing."
+  note "  dispatch this gate can read. Rule 4 scanned nothing."
   exit 2
 fi
 
@@ -198,8 +497,15 @@ done <<<"$arms"
 if [ "$scan_error" = "1" ]; then
   exit 2
 fi
+if [ "$path_count" != "$WANT_PATHS" ]; then
+  note "check-spec-sampling: the tree has $path_count drafter generation paths and records"
+  note "  $WANT_PATHS. A migrated drafter's loop body becomes its entry, one for one, so"
+  note "  this figure does not move across the collapse. A scan that finds six paths"
+  note "  where the tree has seven has not passed, it has stopped looking."
+  exit 2
+fi
 if [ "$fail" = "1" ]; then
   exit 1
 fi
 
-echo "OK: $driver_count speculative generation drivers take and read the request's sampler; $arm_count drafter arms pass it."
+echo "OK: $loop_count loops ($forwarded_count forwarded), $entry_count entries, $guard_count guards — $path_count drafter paths take the request's sampler and draw with it; $arm_count drafter arms pass it."

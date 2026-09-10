@@ -689,15 +689,15 @@ On today's tree, which has no shared loop yet, it reads `7 classic, 0 forwarded,
 
 ### `make check-spec-sampling`
 
-RULE 1's population is `pub fn` drivers, which finds six fns today and will keep
+RULE 1's population was `pub fn` drivers, which found six fns and would have kept
 finding the seven entries after the collapse — while the one loop that reads the
-sampler is `pub(crate)` and outside the gate entirely. Widening to "any
-visibility" alone is not free: it enumerates `spec_generate_greedy_cached`, which
+sampler is `pub(crate)` and would have been outside the gate entirely. Widening to
+"any visibility" alone is not free: it enumerates `spec_generate_greedy_cached`, which
 takes no sampler at all, and `emit_step`, `emit_round_tokens` and
 `emit_seed_token`, which are helpers. All four fail condition (a) on the day the
 rule changes.
 
-Widen it to **any visibility, over the charge gate's populations (a) and (b)
+It is widened to **any visibility, over the charge gate's populations (a) and (b)
 and the fns that call one of them** — the one loop, the seven entries, and the
 two-model entry guard that routes a request to one of two loops by reading
 whether the sampler is active. That third clause is not tidiness: the guard is
@@ -712,26 +712,47 @@ rule this campaign already learned once — a re-keyed gate follows a defect cla
 it does not shed one.
 
 Over (a), condition (b) — the parameter is read, not merely declared — is
-satisfied in the shared loop by the `VerifierDraw::new(sampler_cfg)` construction
-in its body, and the needle must be that construction rather than a mention of
+satisfied in the shared loop by the `VerifierDraw::new(...)` construction in its
+body, and the needle is that construction rather than a mention of
 `sampler_cfg`. Over (b) it is satisfied by the sampler reaching the loop call:
 the needle is the configuration the entry builds carrying the sampler, not the
 name appearing somewhere in the body. A sampler assigned into a `RoundCtx` field
 and read by nobody is exactly the shape (b) exists to refuse, and so is a
 `sampler_cfg` an entry accepts and leaves out of the configuration it hands over.
 
+Two things the re-key had to settle, since the shared loop does not take a
+sampler parameter of its own — it is handed one inside `RoundCfg`. Condition (a)
+is met by either, and the draw needle reads a `VerifierDraw::new(...)` naming
+`sampler_cfg`, so `VerifierDraw::new(sampler_cfg)` and
+`VerifierDraw::new(cfg.sampler_cfg)` are one needle. **That names the
+configuration's field**: it is `sampler_cfg`, the same constraint on the engine
+that the charge field's short name is. And the two-model stochastic loop builds
+no `VerifierDraw` at all — its acceptance rule is its own, and it seeds the whole
+draw stream with `Pcg32::new(sampler_cfg.seed_or_default())`. That is still a
+draw constructed from the request's sampler, so it is a second needle any loop
+may satisfy rather than a second name the gate exempts.
+
 The census belongs on the success line for the same reason the charge gate's
-does: **one loop, seven entries, one guard**. A lost entry is then exit 2 — a
-scan that finds six drivers where the tree has seven has not passed, it has
-stopped looking.
+does: **one loop, seven entries, one guard**. What is *pinned* there is the one
+figure that does not move across the campaign — the drafter paths, being the
+loops that are not the shared one plus the entries, seven of them, because a
+migrated drafter's loop body becomes its entry one for one. A lost entry is then
+exit 2, and so is an eighth path: a scan that finds six drafter paths where the
+tree has seven has not passed, it has stopped looking. The loop and guard counts
+are printed beside it and not pinned, since the loop count is exactly what each
+migration moves.
 
 The three emit helpers are excluded without an exception: none constructs a
 `RoundTotals`, none constructs the loop's configuration, and none calls a fn that
 does — `emit_round_tokens` calls `emit_step`, which is in no population either. `spec_generate_greedy_cached` is
 the one real exception: it is the two-model greedy loop, it takes no sampler at
 all, and it runs only at temperature 0 where the verifier's argmax is the draw.
-Record it with that reason and delete the exception in migration chunk 6, where
-that loop becomes a drafter whose `verify` draws through the context.
+It is recorded with that reason, as a constant and not an environment knob, and
+no caller is asked to pass it a sampler it does not take. The recall test holds
+it in three directions — the loop it names passes, the same body renamed does
+not, and a copy of the gate with the name struck out refuses the clean tree by
+name — and the exception is deleted in migration chunk 6, where that loop
+becomes a drafter whose `verify` draws through the context.
 
 ### `make debt-report`
 
