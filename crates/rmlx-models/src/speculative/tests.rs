@@ -301,7 +301,7 @@ fn emit_step_advances_the_window_once_per_token() {
     clippy::expect_used,
     reason = "test-only: the vocabulary is the literal three lines above, so a build failure is a broken `tokenizers` dependency and the panic names it"
 )]
-fn tiny_tokenizer() -> tokenizers::Tokenizer {
+pub(super) fn tiny_tokenizer() -> tokenizers::Tokenizer {
     use tokenizers::models::wordlevel::WordLevel;
 
     let vocab = (0_u32..8).map(|i| (format!("tok{i}"), i)).collect();

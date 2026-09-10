@@ -27,6 +27,7 @@ use super::{
 };
 use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
+use crate::speculative::tests::tiny_tokenizer;
 use crate::speculative::{arm_lin_tapes, DecodeWindow, SpecLoop};
 
 /// How far back the fixture's request started.
@@ -848,4 +849,130 @@ fn a_round_tape_refolds_to_what_the_replay_produced() {
             }
         }
     }
+}
+
+/// The refold flag is what the rollback did, not what the offsets suggest.
+///
+/// A loop deriving it from `v_target < v_offset_before` reports the partial arm,
+/// which is the same answer only while the stack carries a recurrent state. On a
+/// full-attention or dense verifier every partial round then reads `refolded:
+/// true` for a round that refolded nothing, and no other observable disagrees —
+/// the tokens, the counts and the offsets on the same line are all unchanged.
+///
+/// Mutation: return `Ok(true)` from the `lin`-less arm of
+/// `rollback_round_caches`, or re-derive the flag at a call site. Either fails
+/// the first of these.
+#[test]
+fn a_partial_rollback_over_no_recurrent_state_refolds_nothing_and_says_so() {
+    let refolded = rollback_round(&mut [], None, &[1, 2, 3], 0, 1, false, Device::Cpu)
+        .unwrap_or_else(|e| panic!("rollback: {e}"));
+    assert!(
+        !refolded,
+        "a stack with no recurrent state has nothing to refold, however far back \
+         the target is"
+    );
+}
+
+/// A partial arm over a stack that does carry one.
+///
+/// The target keeps none of the round, which is what puts the refold on the
+/// clone-the-pre-round-state path rather than the recurrence kernel — the same
+/// shape `a_layer_that_holds_no_recurrence_is_walked_past` uses, and the reason
+/// this is a CPU test rather than one that needs Metal.
+#[test]
+fn a_partial_rollback_over_a_recurrent_layer_refolds_and_says_so() {
+    let mut lin = vec![armed(vec![tape_segment(0, 3)], &tape_zero_state())];
+    let refolded = rollback_round(
+        &mut [],
+        Some(&mut lin),
+        &[1, 2, 3],
+        0,
+        0,
+        false,
+        Device::Cpu,
+    )
+    .unwrap_or_else(|e| panic!("rollback: {e}"));
+    assert!(refolded, "a partial accept over a taped layer refolds it");
+}
+
+/// A full accept drops the tape and refolds nothing, recurrent stack or not.
+#[test]
+fn a_full_accept_refolds_nothing_and_says_so() {
+    let mut lin = vec![armed(vec![tape_segment(0, 3)], &tape_zero_state())];
+    let refolded = rollback_round(
+        &mut [],
+        Some(&mut lin),
+        &[1, 2, 3],
+        0,
+        3,
+        false,
+        Device::Cpu,
+    )
+    .unwrap_or_else(|e| panic!("rollback: {e}"));
+    assert!(
+        !refolded,
+        "nothing was dropped, so there is nothing to fold back"
+    );
+}
+
+/// A round's committed count is what reached the sink, not the length of what
+/// the loop handed over.
+///
+/// The budget is the request's: a block that overruns the last token leaves the
+/// surplus unemitted, and a loop reporting `round_tokens.len()` credits the
+/// round with tokens no reader ever saw and no rollback ever kept.
+///
+/// Mutation: return `round_tokens.len()` instead of the running count.
+#[test]
+fn a_round_clipped_by_the_budget_reports_what_it_emitted() {
+    let tokenizer = tiny_tokenizer();
+    let mut emitted: Vec<ProbeStep> = Vec::new();
+    let mut emitted_in_rounds = 0usize;
+    let mut window = DecodeWindow::new();
+    let mut step = |_: &ProbeStep| -> Option<u32> { None };
+
+    let emit = super::emit_round_tokens(
+        &tokenizer,
+        &[1, 2, 3, 4],
+        2,
+        &[],
+        &mut step,
+        &mut emitted,
+        &mut emitted_in_rounds,
+        &mut window,
+        None,
+    );
+    assert!(!emit.hit_eos, "no stop token was in the round");
+    assert_eq!(
+        emit.committed, 2,
+        "the request had two tokens left of its budget and the round handed over four"
+    );
+    assert_eq!(emitted_in_rounds, 2, "the counter and the answer agree");
+}
+
+/// The stop token ends the round where it falls, and the count says where.
+#[test]
+fn a_round_stopped_by_its_own_token_reports_what_it_emitted() {
+    let tokenizer = tiny_tokenizer();
+    let mut emitted: Vec<ProbeStep> = Vec::new();
+    let mut emitted_in_rounds = 0usize;
+    let mut window = DecodeWindow::new();
+    let mut step = |_: &ProbeStep| -> Option<u32> { None };
+
+    let emit = super::emit_round_tokens(
+        &tokenizer,
+        &[1, 2, 3, 4],
+        8,
+        &[3],
+        &mut step,
+        &mut emitted,
+        &mut emitted_in_rounds,
+        &mut window,
+        None,
+    );
+    assert!(emit.hit_eos, "the third token is the stop token");
+    assert_eq!(
+        emit.committed, 3,
+        "the stop token is emitted and the round ends on it"
+    );
 }

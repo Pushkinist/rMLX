@@ -795,7 +795,7 @@ impl SpeculativeDispatcher {
             total_accept_count += accept;
 
             // Emit accepted prefix + 1 correction/bonus.
-            let hit_eos = round_common::emit_round_tokens(
+            let emit = round_common::emit_round_tokens(
                 tokenizer,
                 &new_tokens,
                 n_tokens,
@@ -806,7 +806,7 @@ impl SpeculativeDispatcher {
                 &mut window,
                 None,
             );
-            if hit_eos {
+            if emit.hit_eos {
                 round_common::log_request_record(
                     &RoundTotals {
                         loop_kind: SpecLoop::TwoModelGreedy,
@@ -853,7 +853,7 @@ impl SpeculativeDispatcher {
             // recurrent state — which advanced by `v_k` and cannot be sliced —
             // is refolded from the round tape over the retained prefix. On a
             // FULL accept nothing was dropped and the tape is discarded.
-            round_common::rollback_round(
+            let refolded = round_common::rollback_round(
                 &mut verifier_caches,
                 verifier_lin.as_deref_mut(),
                 &v_input,
@@ -883,7 +883,9 @@ impl SpeculativeDispatcher {
                 &d_seed,
                 &draft_tokens[..draft_tokens.len().saturating_sub(1)],
             );
-            round_common::rollback_round(
+            // The drafter's own arm, whose answer is not the round's:
+            // `refolded` is reported beside `v_target` and reads the verifier.
+            let _ = round_common::rollback_round(
                 &mut draft_caches,
                 draft_lin.as_deref_mut(),
                 &d_fed,
@@ -914,7 +916,7 @@ impl SpeculativeDispatcher {
                     num_draft: draft_tokens.len(),
                     // What the round committed, which is `accept + 1` unless
                     // the request's token budget ran out mid-block.
-                    n_committed: new_tokens.len(),
+                    n_committed: emit.committed,
                     emitted_total: emitted.len(),
                     condition_rows: None,
                     projected_rows: None,
@@ -922,7 +924,7 @@ impl SpeculativeDispatcher {
                     v_target,
                     d_offset_before: Some(d_offset_before),
                     d_target: Some(d_target),
-                    refolded: v_target < v_offset_before,
+                    refolded,
                     // This loop times no phases, so it never charges one.
                     charged: false,
                     phases: None,
@@ -1201,7 +1203,7 @@ impl SpeculativeDispatcher {
             };
             round_tokens.push(extra);
 
-            let hit_eos = round_common::emit_round_tokens(
+            let emit = round_common::emit_round_tokens(
                 tokenizer,
                 &round_tokens,
                 n_tokens,
@@ -1212,7 +1214,7 @@ impl SpeculativeDispatcher {
                 &mut window,
                 None,
             );
-            if hit_eos {
+            if emit.hit_eos {
                 round_common::log_request_record(
                     &RoundTotals {
                         loop_kind: SpecLoop::TwoModelStochastic,
@@ -1247,7 +1249,7 @@ impl SpeculativeDispatcher {
                 .max()
                 .unwrap_or(0);
             let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-            round_common::rollback_round(
+            let refolded = round_common::rollback_round(
                 &mut verifier_caches,
                 verifier_lin.as_deref_mut(),
                 &v_input,
@@ -1266,7 +1268,9 @@ impl SpeculativeDispatcher {
                 &d_seed,
                 &draft_tokens[..draft_tokens.len().saturating_sub(1)],
             );
-            round_common::rollback_round(
+            // The drafter's own arm, whose answer is not the round's:
+            // `refolded` is reported beside `v_target` and reads the verifier.
+            let _ = round_common::rollback_round(
                 &mut draft_caches,
                 draft_lin.as_deref_mut(),
                 &d_fed,
@@ -1291,7 +1295,7 @@ impl SpeculativeDispatcher {
                     round: rounds,
                     accept,
                     num_draft: draft_tokens.len(),
-                    n_committed: round_tokens.len(),
+                    n_committed: emit.committed,
                     emitted_total: emitted.len(),
                     condition_rows: None,
                     projected_rows: None,
@@ -1299,7 +1303,7 @@ impl SpeculativeDispatcher {
                     v_target,
                     d_offset_before: Some(d_offset_before),
                     d_target: Some(d_target),
-                    refolded: v_target < v_offset_before,
+                    refolded,
                     // This loop times no phases, so it never charges one.
                     charged: false,
                     phases: None,

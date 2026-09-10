@@ -283,13 +283,15 @@ round_ms draft_ms verify_ms walk_ms rollback_ms other_ms
 
 The field set is the union of what the loops used to report separately, so the
 one event lost none of them. A figure a loop does not have is absent from the
-line rather than present as a zero: the conditioning pair for a loop that keeps
-no buffer across rounds, the drafter pair for a loop whose drafter keeps no
-cache, and every wall-clock field for the four loops that time their drafter and
+line rather than present as a zero: the conditioning pair for a loop that hands
+its drafter no buffer, the drafter pair for a loop whose drafter keeps no cache,
+and every wall-clock field for the four loops that time their drafter and
 verifier over the request and no phase within a round.
 
 `n_committed` is what the round committed — the accepted prefix and the one
-token the verifier added to it, less anything the request's budget cut.
+token the verifier added to it, less anything the request's budget cut. It is
+counted where the tokens reach the sink and reported from there, so a block the
+budget clipped is not reported as committed to a rollback that did not keep it.
 `v_offset_before` is the verifier offset that round's rollback target was
 computed from, which the six loops counting back from the tail read after their
 verify forward and the assistant reads before its own. `d_offset_before` and
@@ -302,9 +304,12 @@ restatement of it. `condition_rows` is read from the conditioning buffer and
 host bookkeeping. The four phases are disjoint sub-spans of the round, so
 claiming more than the round has means a timer started outside it — that is an
 `error!` naming the phases, and the round is still reported with no `other_ms`.
-`refolded` says whether that round's rollback refolded a recurrent state; the
-assistant's verifier is full attention and keeps none, so its rounds report
-`false`.
+`refolded` says whether that round's **verifier** rollback refolded a recurrent
+state. It comes back from `rollback_round`, which is the only thing that knows:
+true on the partial arm of a stack that carries a recurrent state, so a
+full-attention verifier — the assistant's — and a dense one read `false` for a
+partial round that refolded nothing. The loops with a drafter cache roll that
+back on its own arm, and its answer is not this field.
 
 `charged` is the field that says how to read the rest. At `debug` the phases are
 timed but not forced, so the lazy tails above still move between them. At

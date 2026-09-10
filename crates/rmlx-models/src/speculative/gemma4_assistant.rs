@@ -905,7 +905,7 @@ pub fn mtp_assistant_generate(
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
         // -- Emit accepted prefix + 1 correction/bonus. --
-        let hit_eos = emit_round_tokens(
+        let emit = emit_round_tokens(
             tokenizer,
             &new_tokens,
             n_tokens,
@@ -916,7 +916,7 @@ pub fn mtp_assistant_generate(
             &mut window,
             None,
         );
-        if hit_eos {
+        if emit.hit_eos {
             break;
         }
 
@@ -926,7 +926,7 @@ pub fn mtp_assistant_generate(
         let t0 = Instant::now();
         let v_target = super::rollback_target_from_head(pre_round_offset, accept);
         let rejected = v_k as i32 - (accept as i32 + 1);
-        rollback_round(
+        let refolded = rollback_round(
             &mut caches,
             None,
             &verify_input,
@@ -983,7 +983,7 @@ pub fn mtp_assistant_generate(
                 round: rounds,
                 accept,
                 num_draft: draft_tokens.len(),
-                n_committed: new_tokens.len(),
+                n_committed: emit.committed,
                 emitted_total: emitted.len(),
                 condition_rows: None,
                 projected_rows: None,
@@ -993,8 +993,7 @@ pub fn mtp_assistant_generate(
                 // its own to roll back.
                 d_offset_before: None,
                 d_target: None,
-                // Full attention: the rollback is a K/V tail slice, never a refold.
-                refolded: false,
+                refolded,
                 charged: charge_phases,
                 phases: Some(super::RoundPhases {
                     round_ns: round_t0.elapsed().as_nanos(),

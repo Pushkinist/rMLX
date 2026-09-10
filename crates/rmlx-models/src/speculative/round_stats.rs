@@ -319,11 +319,14 @@ pub(crate) struct RoundReport {
     /// Tokens the request has handed the sink, this round's included.
     pub(crate) emitted_total: usize,
     /// Rows the conditioning buffer holds leaving this round, or `None` for a
-    /// loop that keeps no buffer across rounds.
+    /// loop that hands its drafter no buffer.
     ///
-    /// Read from the buffer rather than from [`Self::projected_rows`], which is
-    /// what makes the two a cross-check: a slide that projects the right number
-    /// of rows into the wrong window moves this and leaves that alone.
+    /// Read from the buffer, not from what the loop meant to put in it. For the
+    /// two block loops it is a window that grows, and pairs with
+    /// [`Self::projected_rows`] as a cross-check — a slide that projects the
+    /// right number of rows into the wrong window moves this and leaves that
+    /// alone. For the sidecar it is the single verifier row the next round
+    /// conditions on, and reporting it is what pins that it stays one.
     pub(crate) condition_rows: Option<i32>,
     /// Conditioning rows the round's projection returned, or `None` for a loop
     /// that carries no conditioning buffer between rounds.
@@ -356,12 +359,14 @@ pub(crate) struct RoundReport {
     /// position from the verifier proposes against a prefix the verifier never
     /// scored, and greedy verification emits the verifier's own token anyway.
     pub(crate) d_target: Option<i32>,
-    /// Whether the round's rollback refolded a recurrent state.
+    /// Whether the round's verifier rollback refolded a recurrent state.
     ///
-    /// The partial-accept arm of [`super::round_common::rollback_round`] for
-    /// the six loops whose verifier keeps one; the assistant's is full
-    /// attention, so its rollback is a K/V tail slice and this is always
-    /// `false`.
+    /// Reported by [`super::round_common::rollback_round`] rather than derived
+    /// from the offsets beside it: it is true only on the partial arm of a
+    /// stack that carries a recurrent state, so a full-attention or dense
+    /// verifier reads `false` for a partial round that refolded nothing. The
+    /// loops with a drafter cache roll that back too, on its own arm; this
+    /// field is the verifier's, beside [`Self::v_target`].
     pub(crate) refolded: bool,
     /// Whether the phases were charged for the work they issued.
     pub(crate) charged: bool,

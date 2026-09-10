@@ -336,7 +336,7 @@ pub fn dflash2_generate(
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
 
-        let hit_eos = emit_round_tokens(
+        let emit = emit_round_tokens(
             tokenizer,
             &new_tokens,
             n_tokens,
@@ -347,7 +347,7 @@ pub fn dflash2_generate(
             &mut window,
             None,
         );
-        if hit_eos {
+        if emit.hit_eos {
             break;
         }
 
@@ -357,8 +357,7 @@ pub fn dflash2_generate(
         let t0 = Instant::now();
         let v_offset_before = v_caches.iter().map(KvCache::offset).max().unwrap_or(0);
         let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        let refolded = v_target < v_offset_before;
-        rollback_round(
+        let refolded = rollback_round(
             &mut v_caches,
             Some(&mut v_lin),
             &v_input,
@@ -408,7 +407,7 @@ pub fn dflash2_generate(
                 round: rounds,
                 accept,
                 num_draft: draft_tokens.len(),
-                n_committed: new_tokens.len(),
+                n_committed: emit.committed,
                 emitted_total: emitted.len(),
                 condition_rows: h_ctx.shape().get(1).copied(),
                 projected_rows: Some(projected_rows),

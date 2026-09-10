@@ -235,11 +235,12 @@ pub(crate) fn emit_round_tokens(
     emitted_in_rounds: &mut usize,
     window: &mut DecodeWindow,
     decided_by: Option<(&mut Vec<DecidedBy>, usize)>,
-) -> bool {
+) -> RoundEmit {
     let (mut decided_by, restricted) = match decided_by {
         Some((buf, restricted)) => (Some(buf), restricted),
         None => (None, 0),
     };
+    let mut committed = 0usize;
     for (i, &id) in round_tokens.iter().enumerate() {
         if emitted.len() >= n_tokens {
             break;
@@ -253,11 +254,32 @@ pub(crate) fn emit_round_tokens(
             });
         }
         *emitted_in_rounds += 1;
+        committed += 1;
         if eos_ids.contains(&id) {
-            return true;
+            return RoundEmit {
+                committed,
+                hit_eos: true,
+            };
         }
     }
-    false
+    RoundEmit {
+        committed,
+        hit_eos: false,
+    }
+}
+
+/// What [`emit_round_tokens`] did with a round's tokens.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoundEmit {
+    /// How many of them reached the sink.
+    ///
+    /// The round's committed count, and the one producer of it: a loop that
+    /// reports the length of what it *handed* this function reports the tokens
+    /// the request's budget cut as committed, and the rollback beside it does
+    /// not.
+    pub(crate) committed: usize,
+    /// Whether one of them ended the request.
+    pub(crate) hit_eos: bool,
 }
 
 /// Length of `a`'s sequence axis, which every taped recurrence input carries at
@@ -484,7 +506,7 @@ fn rollback_round_caches(
     target_offset: i32,
     charge: bool,
     device: Device,
-) -> Result<()> {
+) -> Result<bool> {
     let kept = (target_offset - pre_round_offset).max(0) as usize;
     if kept > round_tokens.len() {
         return Err(Error::Model(format!(
@@ -497,9 +519,10 @@ fn rollback_round_caches(
     }
     super::truncate_kv_to(kv, target_offset)?;
     let Some(lin) = lin.filter(|l| !l.is_empty()) else {
-        return Ok(());
+        return Ok(false);
     };
-    refold_lin_tapes(lin, round_tokens.len(), kept, charge, device)
+    refold_lin_tapes(lin, round_tokens.len(), kept, charge, device)?;
+    Ok(true)
 }
 
 /// Return a round's caches to the prefix the verifier kept, or drop the round
@@ -516,6 +539,11 @@ fn rollback_round_caches(
 /// made here: it belongs at the call site, beside the record that has to name
 /// the same one.
 ///
+/// Returns whether a recurrent state was refolded — true only on the partial
+/// arm of a stack that carries one. This is the one producer of that fact:
+/// every loop reports it, and a loop re-deriving it from its own offsets says
+/// `true` for a full-attention or dense verifier that refolded nothing.
+///
 /// # Errors
 ///
 /// [`rmlx_core::error::Error::Model`] when the refold cannot replay the
@@ -530,7 +558,7 @@ pub(crate) fn rollback_round(
     target_offset: i32,
     charge: bool,
     device: Device,
-) -> Result<()> {
+) -> Result<bool> {
     if target_offset < pre_round_offset + round_tokens.len() as i32 {
         return rollback_round_caches(
             kv,
@@ -543,7 +571,7 @@ pub(crate) fn rollback_round(
         );
     }
     super::disarm_lin_tapes(lin);
-    Ok(())
+    Ok(false)
 }
 
 /// Emit a sidecar loop's seed token, and say whether it ended the request.

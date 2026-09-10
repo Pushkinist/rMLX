@@ -830,7 +830,7 @@ pub fn mtp_generate(
         total_accept += accept;
 
         // -- Emit accepted prefix + 1 correction/bonus. --
-        let hit_eos = emit_round_tokens(
+        let emit = emit_round_tokens(
             tokenizer,
             &new_tokens,
             n_tokens,
@@ -841,7 +841,7 @@ pub fn mtp_generate(
             &mut window,
             None,
         );
-        if hit_eos {
+        if emit.hit_eos {
             break;
         }
 
@@ -850,11 +850,11 @@ pub fn mtp_generate(
         // positions this round = accept (consumed drafts) + 1 carry. Drop the
         // unaccepted draft tail from the FA KV caches.
         let t0 = Instant::now();
-        let n_committed = new_tokens.len();
+        let n_committed = emit.committed;
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
         let v_target =
             super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        rollback_round(
+        let refolded = rollback_round(
             &mut v_caches,
             Some(&mut v_lin),
             &v_input,
@@ -903,13 +903,13 @@ pub fn mtp_generate(
                 num_draft: draft_tokens.len(),
                 n_committed,
                 emitted_total: emitted.len(),
-                condition_rows: None,
+                condition_rows: h_cond.shape().get(1).copied(),
                 projected_rows: None,
                 v_offset_before,
                 v_target,
                 d_offset_before: Some(draft_start),
                 d_target: Some(d_target),
-                refolded: v_target < v_offset_before,
+                refolded,
                 charged: charge_phases,
                 phases: Some(super::RoundPhases {
                     round_ns: round_t0.elapsed().as_nanos(),

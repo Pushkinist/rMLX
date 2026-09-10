@@ -805,7 +805,7 @@ pub fn dflash_generate(
         recent.push((accept, draft_tokens.len()));
 
         // -- Emit accepted prefix + 1 correction/bonus. ----------------------
-        let hit_eos = emit_round_tokens(
+        let emit = emit_round_tokens(
             tokenizer,
             &new_tokens,
             n_tokens,
@@ -816,7 +816,7 @@ pub fn dflash_generate(
             &mut window,
             None,
         );
-        if hit_eos {
+        if emit.hit_eos {
             break;
         }
 
@@ -825,7 +825,7 @@ pub fn dflash_generate(
         // consumed v_k positions. On partial accept (accept < bs-1) the GDN
         // recurrent state ran ahead — refold the kept prefix from the round tape
         // so it matches the truncated KV exactly.
-        let n_committed = new_tokens.len();
+        let n_committed = emit.committed;
         // Read the post-verify sequence offset from a FullAttention layer:
         // GDN (linear-attn) layers never advance their KvCache::offset (it
         // stays 0), so `v_caches[0]` (layer 0 is GDN for the Qwen3.5/3.6-MoE
@@ -839,7 +839,7 @@ pub fn dflash_generate(
         // draft slots + the carry b). KV target = pre + accept + 1 carry-rows.
         let v_target =
             super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        rollback_round(
+        let refolded = rollback_round(
             &mut v_caches,
             Some(&mut v_lin),
             &v_input,
@@ -896,7 +896,7 @@ pub fn dflash_generate(
                 // `h_ctx` and re-reads it every round.
                 d_offset_before: None,
                 d_target: None,
-                refolded: v_target < v_offset_before,
+                refolded,
                 // This loop times no phases, so it never charges one.
                 charged: false,
                 phases: None,
