@@ -21,11 +21,14 @@
 //!   skipped on one EOS exit per loop — the seed EOS for the five sidecar
 //!   loops, the in-round EOS for the two two-model ones. A loop that changed
 //!   which exit it takes reports a different figure, or none, with every token
-//!   identical. Nothing at runtime enforces this — a report added on a seed-EOS
-//!   exit leaves every gate green — so what holds it is
-//!   [`every_round_loop_has_one_exit_that_reports_the_verifiers_resident_kv`]
-//!   below, which reads the disposition out of the source and is blind to what
-//!   the call does once it is made.
+//!   identical, and nothing at runtime sees it — a report added on a seed-EOS
+//!   exit leaves every gate green. What states it is the seven-row
+//!   [`DISPOSITIONS`] table below, one row per loop; what reads that table
+//!   against today's source is
+//!   [`every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares`],
+//!   positionally, so a call moved to the other exit fails rather than passing
+//!   on an unchanged total. The reading is of text and is blind to what the call
+//!   does once it is made.
 //! - **`RoundStats::charged`**, which is `phases_charged()` in three loops and a
 //!   literal `false` in four. It decides whether each round forces its carried
 //!   arrays before its span closes, so it moves the phase timings and the work
@@ -88,7 +91,7 @@
 use super::dflash::dflash_next_block_size;
 use super::{
     accept_prefix, draft_rows_to_drop, rollback_target_from_head, rollback_target_from_tail,
-    round_block, two_model_drafts_per_round, MAX_BLOCK_SIZE,
+    round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
 };
 
 /// One acceptance walk over a drafted block, and the rows the three spellings
@@ -275,18 +278,89 @@ fn the_draft_side_keeps_the_carry_and_the_accepted_prefix() {
 }
 
 // ---------------------------------------------------------------------------
-// What the seven loops do at their edges, read out of the source
+// What the seven loops declare at their edges
 // ---------------------------------------------------------------------------
 
-/// The seven round loops, by the file that holds each. `mod.rs` holds two.
-const LOOP_SOURCES: [(&str, &str, usize); 6] = [
+/// Which of a loop's two exits skips the report of the verifier's resident KV.
+#[derive(Debug, Clone, Copy)]
+enum ReportSkippedBy {
+    /// The seed EOS: the loop emits a token out of its prefill forward, and a
+    /// request whose whole output is that token returns before any round.
+    TheSeedExit,
+    /// The in-round EOS: the loop emits nothing before its first round, so the
+    /// only early exit it has is inside one.
+    TheInRoundExit,
+}
+
+/// How a loop refuses a drafter that proposed nothing.
+#[derive(Debug, Clone, Copy)]
+enum ChainRefusedBy {
+    /// On the proposals themselves, before the verify forward.
+    TheProposalChain,
+    /// On the verifier input the empty chain produces, one step later.
+    TheVerifierInput,
+}
+
+/// What each round loop declares at its edges, and the file that holds it.
+///
+/// This table is the statement; the two tests below are readings of it against
+/// today's source. Both facts become per-drafter declarations in the engine when
+/// the loops collapse, and this table is then re-keyed onto those declarations
+/// with the same seven rows — which is why it is data rather than seven
+/// assertions.
+const DISPOSITIONS: [(SpecLoop, &str, ReportSkippedBy, ChainRefusedBy); 7] = [
+    (
+        SpecLoop::MtpSidecar,
+        "mtp.rs",
+        ReportSkippedBy::TheSeedExit,
+        ChainRefusedBy::TheProposalChain,
+    ),
+    (
+        SpecLoop::DFlash,
+        "dflash/mod.rs",
+        ReportSkippedBy::TheSeedExit,
+        ChainRefusedBy::TheProposalChain,
+    ),
+    (
+        SpecLoop::DFlash2,
+        "dflash2/round.rs",
+        ReportSkippedBy::TheSeedExit,
+        ChainRefusedBy::TheProposalChain,
+    ),
+    (
+        SpecLoop::Eagle3,
+        "eagle3/mod.rs",
+        ReportSkippedBy::TheSeedExit,
+        ChainRefusedBy::TheProposalChain,
+    ),
+    (
+        SpecLoop::MtpAssistant,
+        "gemma4_assistant.rs",
+        ReportSkippedBy::TheSeedExit,
+        ChainRefusedBy::TheProposalChain,
+    ),
+    (
+        SpecLoop::TwoModelGreedy,
+        "mod.rs",
+        ReportSkippedBy::TheInRoundExit,
+        ChainRefusedBy::TheVerifierInput,
+    ),
+    (
+        SpecLoop::TwoModelStochastic,
+        "mod.rs",
+        ReportSkippedBy::TheInRoundExit,
+        ChainRefusedBy::TheVerifierInput,
+    ),
+];
+
+/// The files the table names, in the order it names them, each with its source.
+const LOOP_SOURCES: [(&str, &str); 6] = [
     (
         "mtp.rs",
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/speculative/mtp.rs"
         )),
-        1,
     ),
     (
         "dflash/mod.rs",
@@ -294,7 +368,6 @@ const LOOP_SOURCES: [(&str, &str, usize); 6] = [
             env!("CARGO_MANIFEST_DIR"),
             "/src/speculative/dflash/mod.rs"
         )),
-        1,
     ),
     (
         "dflash2/round.rs",
@@ -302,7 +375,6 @@ const LOOP_SOURCES: [(&str, &str, usize); 6] = [
             env!("CARGO_MANIFEST_DIR"),
             "/src/speculative/dflash2/round.rs"
         )),
-        1,
     ),
     (
         "eagle3/mod.rs",
@@ -310,7 +382,6 @@ const LOOP_SOURCES: [(&str, &str, usize); 6] = [
             env!("CARGO_MANIFEST_DIR"),
             "/src/speculative/eagle3/mod.rs"
         )),
-        1,
     ),
     (
         "gemma4_assistant.rs",
@@ -318,7 +389,6 @@ const LOOP_SOURCES: [(&str, &str, usize); 6] = [
             env!("CARGO_MANIFEST_DIR"),
             "/src/speculative/gemma4_assistant.rs"
         )),
-        1,
     ),
     (
         "mod.rs",
@@ -326,87 +396,142 @@ const LOOP_SOURCES: [(&str, &str, usize); 6] = [
             env!("CARGO_MANIFEST_DIR"),
             "/src/speculative/mod.rs"
         )),
-        2,
     ),
 ];
 
-/// How often `needle` appears in code, skipping whole-line comments.
+/// The four edge markers, each as the character the reading below renders it as.
 ///
-/// A needle written into the sentence that explains it would otherwise count as
-/// the call it describes — the same reading `scripts/check_spec_charge.sh`
+/// `E` is the early exit, `W` the head of the round loop, `G` either spelling of
+/// the empty-chain refusal, `P` the report of the verifier's resident KV.
+const MARKERS: [(char, &str); 5] = [
+    ('E', "return Ok((emitted"),
+    ('W', "while emitted.len() < n_tokens"),
+    ('G', "draft_tokens.is_empty()"),
+    ('G', "v_k < 2"),
+    ('P', "report_verifier_kv_bytes("),
+];
+
+/// Whether a line is code rather than a whole-line comment.
+///
+/// A marker written into the sentence that explains it would otherwise read as
+/// the statement it describes — the same reading `scripts/check_spec_charge.sh`
 /// takes, and for the same reason. A trailing comment on a line of code is not
-/// stripped: it would need a quote-aware scan, and no needle here is one a
-/// caller would write at the end of a statement.
-fn code_occurrences(src: &str, needle: &str) -> usize {
-    src.lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .map(|line| line.matches(needle).count())
-        .sum()
+/// stripped: that needs a quote-aware scan, and no marker here is one a caller
+/// would write at the end of a statement.
+fn is_code(line: &str) -> bool {
+    !line.trim_start().starts_with("//")
 }
 
-/// Each round loop has one exit that reports its verifier's resident KV and one
-/// that does not.
+/// The file's edge markers in source order, as characters.
+fn marker_sequence(src: &str) -> String {
+    let mut seen: Vec<(usize, char)> = Vec::new();
+    for (idx, line) in src.lines().enumerate().filter(|(_, l)| is_code(l)) {
+        for (mark, needle) in MARKERS {
+            if line.contains(needle) {
+                seen.push((idx, mark));
+            }
+        }
+    }
+    seen.sort_unstable();
+    seen.into_iter().map(|(_, mark)| mark).collect()
+}
+
+/// How the markers of one loop fall in source order, given which exit skips the
+/// report.
 ///
-/// The figure has one writer — a speculative request never goes through
-/// `Architecture::generate_greedy` — so a caller that samples the counter around
-/// the call reads whatever the previous request left when a loop skips it. Which
-/// exit skips it differs today: the five sidecar loops return on the seed EOS
-/// before reaching the report and fall through to it after an in-round EOS, and
-/// the two two-model loops do the opposite, having no seed. That difference is
-/// the one thing a single shared round loop cannot keep without carrying a
+/// A loop that skips it on the seed exit returns before the round loop opens and
+/// reports after it closes; a loop with no seed has its early exit inside the
+/// round loop, past the refusal. Those are two different orderings of the same
+/// four markers, which is what makes this reading positional rather than a count.
+fn expected_pattern(skipped_by: ReportSkippedBy) -> &'static str {
+    match skipped_by {
+        ReportSkippedBy::TheSeedExit => "EWGP",
+        ReportSkippedBy::TheInRoundExit => "WGEP",
+    }
+}
+
+/// Every loop's exits fall where the table says they do.
+///
+/// The report of the verifier's resident KV has one writer — a speculative
+/// request never goes through `Architecture::generate_greedy` — so a caller that
+/// samples the counter around the call reads whatever the previous request left
+/// when a loop skips it. Which exit skips it is the drafter's own fact, and it
+/// is the one thing a single shared round loop cannot keep without carrying a
 /// per-drafter flag for it, so a chunk that collapses the loops decides it here.
 ///
-/// **This reads text, not behaviour**, and the distance is exactly between "the
-/// call is still written" and "the call still reports the verifier's caches". A
-/// report computed from the drafter's stack passes this and every other check in
-/// the tree — see the mutation table in `docs/SPEC_ROUND_SKELETON.md`.
+/// The reading is by position and not by count, because the mutation this holds
+/// moves a call rather than adding one: a report hoisted above the seed-EOS
+/// return inverts the disposition and leaves every total unchanged.
 ///
-/// Mutation: delete the `report_verifier_kv_bytes` call from any loop's tail, or
-/// add one on a seed-EOS exit.
+/// **It reads text, and the distance to what it claims is exactly between "the
+/// call is written here" and "the call reports the verifier's caches".** A report
+/// computed from the drafter's stack passes this and every other check in the
+/// tree — see the mutation table in `docs/SPEC_ROUND_SKELETON.md`.
+///
+/// Mutation: move any loop's `report_verifier_kv_bytes` call above its early
+/// return, or delete it.
 #[test]
-fn every_round_loop_has_one_exit_that_reports_the_verifiers_resident_kv() {
-    for (name, src, loops) in LOOP_SOURCES {
+fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
+    for (file, src) in LOOP_SOURCES {
+        let want: String = DISPOSITIONS
+            .iter()
+            .filter(|(_, f, _, _)| *f == file)
+            .map(|&(_, _, skipped_by, _)| expected_pattern(skipped_by))
+            .collect();
         assert_eq!(
-            code_occurrences(src, "report_verifier_kv_bytes("),
-            loops,
-            "{name} holds {loops} round loop(s), and each reports its verifier's \
-             resident KV at exactly one exit"
-        );
-        assert_eq!(
-            code_occurrences(src, "return Ok((emitted"),
-            loops,
-            "{name} holds {loops} round loop(s), and each has exactly one early \
-             exit that returns before that report — the seed EOS for a sidecar \
-             loop, the in-round EOS for a two-model one"
+            marker_sequence(src),
+            want,
+            "{file}: the early exit (E), the round loop (W), the empty-chain \
+             refusal (G) and the resident-KV report (P) do not fall in the order \
+             the table declares for the loop(s) it holds"
         );
     }
 }
 
-/// Every round loop refuses a drafter that proposed nothing, before the walk.
+/// Every loop refuses a drafter that proposed nothing, by the measure the table
+/// names.
 ///
 /// The acceptance walk answers an empty chain rather than refusing it — pinned
 /// by [`the_acceptance_walk_commits_the_rows_the_three_spellings_agreed_on`]
-/// above — so the guard is the only thing standing between a broken drafter and
-/// a request that silently emits one token per round at full cost. Nothing at
-/// runtime covers its loss: no gate serves a drafter that proposes nothing.
+/// above — so the refusal is the only thing standing between a broken drafter
+/// and a request that silently emits one token per round at full cost. Nothing
+/// at runtime covers its loss: no gate serves a drafter that proposes nothing.
 ///
-/// The two two-model loops refuse the same shape one step later and by a
-/// different measure, on the verifier input the empty chain produces. A shared
-/// loop has one guard, so both spellings go at the same moment; this is what
-/// makes that visible rather than silent.
+/// The two spellings are not interchangeable. Five loops refuse the proposals;
+/// the two-model pair refuses the verifier input the empty chain produces, one
+/// step later, having already taken a drafting forward per proposal. A shared
+/// loop has one refusal, so both spellings go at the same moment and one of the
+/// two families changes where it stops.
 ///
-/// Mutation: drop the `is_empty` refusal from any sidecar loop, or either
-/// `v_k < 2` from the two-model pair.
+/// Mutation: drop either spelling from any loop, or move a loop from one
+/// spelling to the other without moving its row.
 #[test]
-fn every_round_loop_refuses_a_drafter_that_proposed_nothing() {
-    for (name, src, loops) in LOOP_SOURCES {
-        let by_chain = code_occurrences(src, "draft_tokens.is_empty()");
-        let by_input = code_occurrences(src, "v_k < 2");
-        assert_eq!(
-            by_chain + by_input,
-            loops,
-            "{name} holds {loops} round loop(s) and states {by_chain} empty-chain \
-             refusal(s) beside {by_input} on the verifier input"
-        );
+fn every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure() {
+    for (file, src) in LOOP_SOURCES {
+        for (mark, needle) in MARKERS {
+            if mark != 'G' {
+                continue;
+            }
+            let want = DISPOSITIONS
+                .iter()
+                .filter(|(_, f, _, refused_by)| {
+                    *f == file
+                        && needle
+                            == match refused_by {
+                                ChainRefusedBy::TheProposalChain => "draft_tokens.is_empty()",
+                                ChainRefusedBy::TheVerifierInput => "v_k < 2",
+                            }
+                })
+                .count();
+            let have = src
+                .lines()
+                .filter(|l| is_code(l) && l.contains(needle))
+                .count();
+            assert_eq!(
+                have, want,
+                "{file} states `{needle}` {have} time(s) where the table declares \
+                 {want} loop(s) refusing an empty chain that way"
+            );
+        }
     }
 }
