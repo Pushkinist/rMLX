@@ -229,12 +229,18 @@
 #   And the configuration the loop was handed is read-only inside it. RULE 8
 #   constrains the token; without this it constrains nothing, because the value
 #   can be moved instead, and every way of moving it writes no `charged:` site
-#   and passes every other reading. Four spellings, all exit 2: a `let` that
-#   rebinds the parameter's own name — the loop building its own configuration
-#   and forwarding faithfully from that — an assignment to the whole parameter
-#   through its reference, an assignment to one of its fields, and a `mem::`
-#   call that swaps it out. In each the decision the entry made is no longer the
-#   decision the loop applies, and no reading downstream can see it.
+#   and passes every other reading. The rule is therefore on the parameter and
+#   not on the lines: the configuration is handed over by `&RoundCfg`, and a
+#   loop taking it by `&mut` or by value is exit 2 — a loop that cannot write it
+#   cannot move it, whatever the spelling, and the spellings are unbounded (a
+#   `mem::` call, a method on the parameter, a helper it is passed to, an
+#   assignment wrapped over two lines). Four line shapes are still read as
+#   defence in depth: a `let` that rebinds the parameter's own name — the loop
+#   building its own configuration and forwarding faithfully from that — an
+#   assignment to the whole parameter through its reference, an assignment to
+#   one of its fields, and a `mem::` call that swaps it out. In each the
+#   decision the entry made is no longer the decision the loop applies, and no
+#   reading downstream can see it.
 #
 #   RULE 8 and the census are complementary and neither alone covers the
 #   hard-wire. A forwarded loop that writes `let charge = false;` is caught
@@ -309,12 +315,13 @@ fi
 
 # awk walks each file once and emits one record per function, tab-separated:
 #
-#   1 file          6 charged: sites      11 RoundCtx parameter
-#   2 fn            7 low-level rollbacks 12 constructs RoundCfg
-#   3 driver sig    8 round emits         13 writes the configuration
-#   4 RoundTotals   9 phase-target names  14 binding of the fn's token
-#   5 rollbacks    10 RoundCfg parameter  15 parameter names
-#                                         16 tokens, space-joined
+#   1 file          6 charged: sites      11 how it is handed over
+#   2 fn            7 low-level rollbacks 12 RoundCtx parameter
+#   3 driver sig    8 round emits         13 constructs RoundCfg
+#   4 RoundTotals   9 phase-target names  14 writes the configuration
+#   5 rollbacks    10 RoundCfg parameter  15 binding of the fn's token
+#                                         16 parameter names
+#                                         17 tokens, space-joined
 #
 # A token of `?` is a site whose value this scan could not read back — reported
 # as a scan error rather than skipped, because an unread site is exactly the one
@@ -327,7 +334,7 @@ fi
 # `decomment`, used everywhere below, and `blank_strings`, which this gate does
 # NOT use — RULE 7 reads the per-round event's target as a literal, and blanking
 # string bodies would make that rule unfireable.
-# shellcheck source=lib/awk_text.sh
+# shellcheck source=scripts/lib/awk_text.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/awk_text.sh"
 
 records=$(
@@ -346,7 +353,8 @@ records=$(
         in_sig = 0; awaiting_body = 0; in_body = 0; in_call = 0; fname = ""
         depth = 0; paren = 0; args = ""; has_step = 0; has_stats = 0
         nroll = 0; nrec = 0; nlow = 0; nemit = 0; ntarget = 0
-        cfg_param = ""; cfg_seen = 0; cfg_dup = 0; makes_cfg = 0; cfg_written = 0
+        cfg_param = ""; cfg_seen = 0; cfg_dup = 0; cfg_form = "-"
+        makes_cfg = 0; cfg_written = 0
         ctx_param = ""; ctx_seen = 0; ctx_dup = 0
         delete toks; delete bcount; delete bfirst; delete blast; delete bodd
         delete params
@@ -420,14 +428,21 @@ records=$(
         if (dup || name == "") { return "?" }
         return name
       }
-      # The parameter whose declared type is `want`, read off a signature line.
-      function param_of_type(line, want,   cand) {
+      # The parameter whose declared type is `want`, read off a signature line,
+      # with the form it is handed over in: `ref`, `mut` or `value`. The form is
+      # what RULE 8 rests on — a loop that cannot write the configuration cannot
+      # move the value out from under the token this gate reads.
+      function param_of_type(line, want,   cand, rest) {
         cand = line
         if (cand !~ ("[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:[[:space:]]*&?[[:space:]]*(mut[[:space:]]+)?" want)) { return "" }
         sub("[[:space:]]*:[[:space:]]*&?[[:space:]]*(mut[[:space:]]+)?" want ".*$", "", cand)
         sub(/^.*[^A-Za-z0-9_]/, "", cand)
-        if (cand ~ /^[A-Za-z_][A-Za-z0-9_]*$/) { return cand }
-        return ""
+        if (cand !~ /^[A-Za-z_][A-Za-z0-9_]*$/) { return "" }
+        rest = line
+        sub("^.*" cand "[[:space:]]*:[[:space:]]*", "", rest)
+        if (rest ~ ("^&[[:space:]]*mut[[:space:]]+" want)) { return cand "\x1f" "mut" }
+        if (rest ~ ("^&[[:space:]]*" want)) { return cand "\x1f" "ref" }
+        return cand "\x1f" "value"
       }
       function flush(   t, joined, plist) {
         if (fname != "") {
@@ -435,9 +450,9 @@ records=$(
           for (t in toks) { joined = (joined == "") ? t : joined " " t }
           plist = ""
           for (t in params) { plist = (plist == "") ? t : plist " " t }
-          printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n", \
+          printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n", \
             FILENAME, fname, has_step, has_stats, nroll, nrec, nlow, nemit, \
-            ntarget, typed_param(cfg_seen, cfg_param, cfg_dup), \
+            ntarget, typed_param(cfg_seen, cfg_param, cfg_dup), cfg_form, \
             typed_param(ctx_seen, ctx_param, ctx_dup), \
             makes_cfg, cfg_written, bindinfo(), (plist == "" ? "-" : plist), joined
         }
@@ -481,12 +496,18 @@ records=$(
         if (index(sig, "RoundCfg") > 0) {
           cfg_seen = 1
           cand = param_of_type(sig, "RoundCfg")
-          if (cand != "") { if (cfg_param != "") { cfg_dup = 1 } else { cfg_param = cand } }
+          if (cand != "") {
+            split(cand, pf, "\x1f")
+            if (cfg_param != "") { cfg_dup = 1 } else { cfg_param = pf[1]; cfg_form = pf[2] }
+          }
         }
         if (index(sig, "RoundCtx") > 0) {
           ctx_seen = 1
           cand = param_of_type(sig, "RoundCtx")
-          if (cand != "") { if (ctx_param != "") { ctx_dup = 1 } else { ctx_param = cand } }
+          if (cand != "") {
+            split(cand, pf, "\x1f")
+            if (ctx_param != "") { ctx_dup = 1 } else { ctx_param = pf[1] }
+          }
         }
         # A per-parameter `) -> ` is inside the list and must not end the scan.
         paren += gsub(/\(/, "(", sig) - gsub(/\)/, ")", sig)
@@ -616,8 +637,12 @@ records=$(
         nrec++
       }
 
+      # The extent of a body is read off the code too. A brace inside a comment
+      # would otherwise close the record early, and every needle after it —
+      # a second `charged:`, a low-level rollback — would be attributed to no
+      # function at all and checked by no rule.
       {
-        depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
         if (depth <= 0) { flush() }
       }
       END { flush() }
@@ -628,7 +653,7 @@ records=$(
 loops=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1 && $4 == 1')
 # (b) entries: the signature, no totals, no rollback, and it builds the config.
 entries=$(printf '%s\n' "$records" |
-  awk -F'\t' '$3 == 1 && $4 == 0 && $5 == 0 && $12 == 1')
+  awk -F'\t' '$3 == 1 && $4 == 0 && $5 == 0 && $13 == 1')
 # RULE 4: a rollback outside (a). A fn that also drives a generation or names a
 # `charged:` field is a loop the derivation lost, not a drafter's own rollback.
 lost=$(printf '%s\n' "$records" |
@@ -638,7 +663,7 @@ drafter_rollbacks=$(printf '%s\n' "$records" |
 # RULE 5: a `charged:` in a fn that is in neither population.
 strays=$(printf '%s\n' "$records" |
   awk -F'\t' '$6 > 0 && !($3 == 1 && $4 == 1) &&
-              !($3 == 1 && $4 == 0 && $5 == 0 && $12 == 1)')
+              !($3 == 1 && $4 == 0 && $5 == 0 && $13 == 1)')
 # RULE 6: the low-level rollback named outside `round_common.rs`, or named
 # inside it by a round loop, which the file's exemption is not for.
 lowlevel=$(printf '%s\n' "$records" |
@@ -687,7 +712,7 @@ report_shadow() {
   note "  nothing in this scan can say which binding governs which site."
 }
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg _ctx _mk _wr _bind _params _tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg _form _ctx _mk _wr _bind _params _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` rolls a round's caches back and is"
   note "  not one of the round loops this gate derived. Either the derivation lost a"
@@ -697,7 +722,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _
   scan_error=1
 done <<<"$lost"
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit ntarget _cfg _ctx _mk _wr _bind _params _tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit ntarget _cfg _form _ctx _mk _wr _bind _params _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` is a round loop and names the"
   note "  per-round event's target $ntarget time(s). The file that owns the target may"
@@ -716,7 +741,7 @@ while IFS= read -r file; do
   scan_error=1
 done <<<"$target_strays"
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec nlow _nemit _ntarget _cfg _ctx _mk _wr _bind _params _tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec nlow _nemit _ntarget _cfg _form _ctx _mk _wr _bind _params _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` makes $nlow call(s) to the low-level"
   note "  rollback beneath \`rollback_round\`. Those take a \`charge\` of their own at a call"
@@ -726,7 +751,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec nlow _nemit _ntarget _c
   scan_error=1
 done <<<"$lowlevel"
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _ctx _mk _wr _bind _params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _form _ctx _mk _wr _bind _params tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` writes $nrec \`charged:\` field(s) — $tokens —"
   note "  and is neither a round loop nor an entry that builds one's configuration, so"
@@ -738,7 +763,7 @@ done <<<"$strays"
 
 # RULE 4's new arm: a drafter rolling its own state back carries the decision it
 # was handed, as a field of one of its own parameters.
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg ctx _mk _wr _bind params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg _form ctx _mk _wr _bind params tokens; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   count=$(printf '%s\n' "$tokens" | tr ' ' '\n' | grep -c '[^[:space:]]')
@@ -783,7 +808,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _
 done <<<"$drafter_rollbacks"
 
 # Population (b): the entries.
-while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _ctx _mk _wr bind _params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _form _ctx _mk _wr bind _params tokens; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   entry_count=$((entry_count + 1))
@@ -836,7 +861,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _c
 done <<<"$entries"
 
 # Population (a): the round loops, classic and forwarded.
-while IFS=$'\t' read -r file fn _sig _stats nroll nrec _nlow nemit _ntarget cfg _ctx _mk cfg_written bind _params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats nroll nrec _nlow nemit _ntarget cfg cfg_form _ctx _mk cfg_written bind _params tokens; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   if [ "$cfg" != "-" ]; then
@@ -887,6 +912,15 @@ while IFS=$'\t' read -r file fn _sig _stats nroll nrec _nlow nemit _ntarget cfg 
       note "  a destructured parameter, or a shape it does not read. The rule resolves the"
       note "  configuration by its declared type, so a parameter it cannot name is a"
       note "  parameter it cannot hold the loop's token to."
+      scan_error=1
+      continue
+    fi
+    if [ "$cfg_form" != "ref" ]; then
+      note "check-spec-charge: $rel: \`$fn\` takes its \`RoundCfg\` by \`&mut\` (or by"
+      note "  value). The configuration is the entry's decision, and a loop that can write"
+      note "  it can move the value out from under the token this gate reads — through the"
+      note "  reference, through a \`mem::\` call, through a method — without writing a"
+      note "  \`charged:\` site any reading here can see. It is handed over by \`&RoundCfg\`."
       scan_error=1
       continue
     fi

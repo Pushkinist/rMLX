@@ -468,6 +468,22 @@ perl -0pi -e 's|    device: Device,\n\) -> Result<Vec<ProbeStep>> \{|    device:
 run "a comment in a parameter list is prose, not a declaration" 0 \
   "OK: 7 loops (0 forwarded), 0 entries, 1 guards"
 
+# 23. The dispatch scan reads code too, and it is the arm reading that is this
+#     gate's own defect class: a sampler kept as a comment is passed to nothing.
+build_root "$root"
+perl -0pi -e 's|            &spec_sampler_cfg,\n            dispatcher.device\(\),\n        \),\n    \};|            // \&spec_sampler_cfg,\n            dispatcher.device(),\n        ),\n    };|' \
+  "$root/crates/rmlx-server/src/engine/speculative.rs"
+run "a dispatch arm keeping the sampler in a comment is refused" 1 \
+  "the \`Drafter::DFlash2\` arm drives a"
+
+# 24. And the same through a string literal, which is text the arm prints rather
+#     than a configuration it passes.
+build_root "$root"
+perl -0pi -e 's|            &spec_sampler_cfg,\n            dispatcher.device\(\),\n        \),\n    \};|            tracing::debug!("no spec_sampler_cfg here"),\n            dispatcher.device(),\n        ),\n    };|' \
+  "$root/crates/rmlx-server/src/engine/speculative.rs"
+run "a dispatch arm naming the sampler inside a string literal is refused" 1 \
+  "the \`Drafter::DFlash2\` arm drives a"
+
 echo
 if [ "$failures" != "0" ]; then
   echo "check-spec-sampling-fixtures: $failures of $cases cases failed"

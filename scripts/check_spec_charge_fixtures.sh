@@ -1045,7 +1045,7 @@ build_mid_root "$root"
 perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: \&mut RoundCfg,/; s/    let charge = cfg\.charged;/    cfg.charged = false;\n    let charge = cfg.charged;/' \
   "$root/crates/rmlx-models/src/speculative/round_loop.rs"
 run "a forwarded loop writing the configuration's charge field is a scan error" 2 \
-  "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
+  "\`round_loop_generate\` takes its \`RoundCfg\` by \`&mut\` (or by"
 
 # R22. The delimiter anchor holds: a call is not the field it resembles, and a
 #      reader without the anchor would count this as forwarded.
@@ -1089,14 +1089,14 @@ build_mid_root "$root"
 perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: \&mut RoundCfg,/; s/    let charge = cfg\.charged;/    *cfg = RoundCfg::uncharged();\n    let charge = cfg.charged;/' \
   "$root/crates/rmlx-models/src/speculative/round_loop.rs"
 run "a forwarded loop assigning through the configuration's reference is a scan error" 2 \
-  "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
+  "\`round_loop_generate\` takes its \`RoundCfg\` by \`&mut\` (or by"
 
 # R27. The same, moved rather than assigned.
 build_mid_root "$root"
 perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: \&mut RoundCfg,/; s/    let charge = cfg\.charged;/    let old = std::mem::replace(cfg, RoundCfg::uncharged());\n    let charge = old.charged;/' \
   "$root/crates/rmlx-models/src/speculative/round_loop.rs"
 run "a forwarded loop swapping its configuration out is a scan error" 2 \
-  "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
+  "\`round_loop_generate\` takes its \`RoundCfg\` by \`&mut\` (or by"
 
 # R28. Two parameters of the configuration's type. A rule that took the last one
 #      declared would read the loop's token against the wrong parameter, and
@@ -1115,6 +1115,41 @@ perl -0pi -e 's/    device: Device,\n\) -> Result<\(\)> \{/    device: Device, \
   "$root/crates/rmlx-models/src/speculative/dflash.rs"
 run "a comment in a parameter list is prose, not a declaration" 0 \
   "OK: 6 classic, 1 forwarded, 1 entries; census charge_phases:3 false:4 (7 sites)."
+
+# R30. The property, not the spellings: a configuration handed over by value can
+#      be written the same ways, and a rule that read only the lines would have
+#      to enumerate them for ever.
+build_mid_root "$root"
+perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: RoundCfg,/; s/    let charge = cfg\.charged;/    cfg.set_charged(false);\n    let charge = cfg.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop taking its configuration by value is a scan error" 2 \
+  "\`round_loop_generate\` takes its \`RoundCfg\` by \`&mut\` (or by"
+
+# R31. The four line shapes are still read, which is what covers a write this
+#      gate can see on a parameter it has already accepted as immutable.
+build_mid_root "$root"
+perl -0pi -e 's/    let charge = cfg\.charged;/    cfg.charged = false;\n    let charge = cfg.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a write to the configuration is read even where the parameter is immutable" 2 \
+  "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
+
+# R32. A pair, because a case without its control proves nothing about which
+#      reading fired: the low-level rollback after a loop's record is refused,
+#      and it is refused just the same when a comment carrying an unbalanced
+#      brace sits in front of it. A body whose extent is read off the raw line
+#      ends at that comment, and every needle after it belongs to no function
+#      and is checked by no rule.
+build_root "$root"
+perl -0pi -e 's/    Ok\(\(\)\)\n\}/    super::rollback_round_caches(\&mut v_caches, None, \&\[\], 0, 0, false, device)?;\n    Ok(())\n}/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a low-level rollback after a loop record is refused" 2 \
+  "\`mtp_generate\` makes 1 call(s) to the low-level"
+
+build_root "$root"
+perl -0pi -e 's/    Ok\(\(\)\)\n\}/    \/\/ the round closes here }\n    super::rollback_round_caches(\&mut v_caches, None, \&\[\], 0, 0, false, device)?;\n    Ok(())\n}/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a comment carrying a brace does not end the body it sits in" 2 \
+  "\`mtp_generate\` makes 1 call(s) to the low-level"
 
 echo
 if [ "$failures" != "0" ]; then

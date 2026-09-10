@@ -590,8 +590,14 @@ The rules over them:
   `charged:` site and passes every reading. So does an assignment to the charge
   field of a `mut` parameter. Two more spell the same move: an assignment to
   the whole parameter through its reference, and a `mem::` call that swaps it
-  out. All four are **exit 2**: the decision the entry made is no longer the
-  decision the loop applies, and no reading downstream can see it.
+  out. All four are **exit 2**. But the spellings are unbounded — a method on
+  the parameter, a helper it is passed to, an assignment rustfmt wrapped — so
+  the rule is on the parameter and not on the lines: **the configuration is
+  handed over by `&RoundCfg`, and a loop taking it by `&mut` or by value is
+  exit 2.** A loop that cannot write it cannot move it, whatever the spelling.
+  The four line shapes stay as defence in depth. In each the decision the entry
+  made is no longer the decision the loop applies, and no reading downstream can
+  see it.
 
 The two readings are complementary and neither alone covers the hard-wire. A
 forwarded loop that writes `let charge = false;` is caught **twice**: by RULE 8,
@@ -658,11 +664,14 @@ built on one of two tree shapes the campaign passes through — mid-campaign, wi
 one drafter migrated, and the end state, with all seven decisions in entries.
 They are stated here with the exit and the reason each produces. Two of them
 assert two reasons on the one tree, and case 16 is run on both arms, so the
-twenty-three are twenty-six runs of the harness, beside the thirty-eight the
-gate already had and six more: a token whose sites name it and whose binding the
-scan never saw, the three further ways a forwarded loop can move its
-configuration rather than read it, a rollback that charges off the wrong
-parameter, and a comment in a parameter list, which is prose.
+twenty-three are twenty-six runs of the harness. The suite is 74 runs: those
+twenty-six, the thirty-eight the gate already had, and ten more that review
+found — a token whose sites name it and whose binding the scan never saw, three
+further ways a forwarded loop can move its configuration rather than read it, a
+configuration handed over by value, a write still read on an immutable
+parameter, a rollback that charges off the wrong parameter, a comment in a
+parameter list, which is prose, and a low-level rollback behind a comment
+carrying a brace, run against its own control.
 
 Cases 1 and 12 ask for a reason the old success line did not carry: it printed
 the loop count and the census and nothing about populations. The line now names

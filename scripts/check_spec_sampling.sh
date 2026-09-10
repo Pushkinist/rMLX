@@ -147,7 +147,7 @@ fi
 # a commented-out draw beside a greedy one, and a needle inside a literal a
 # program merely prints, are both a loop that decodes greedily and a scan that
 # says it does not.
-# shellcheck source=lib/awk_text.sh
+# shellcheck source=scripts/lib/awk_text.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/awk_text.sh"
 
 # ---- Pass 1: the populations, and what each member does with the sampler ----
@@ -498,18 +498,22 @@ done <<<"$callers"
 # ---- Rule 4: the dispatch ---------------------------------------------------
 
 arms=$(
-  awk '
-    /let result = match &drafter \{/ { in_match = 1; depth = 1; next }
+  awk "$AWK_TEXT_FNS"'
+    # This scan reads code like every other one here: an arm that keeps the
+    # sampler in a comment, or names it inside a string a line merely prints,
+    # passes it to nothing.
+    { code = blank_strings(decomment($0)) }
+    code ~ /let result = match &drafter \{/ { in_match = 1; depth = 1; next }
     in_match {
-      n = gsub(/\{/, "{"); m = gsub(/\}/, "}")
-      if (arm != "" ) { body = body $0 "\n" }
-      if ($0 ~ /^[[:space:]]*Drafter::[A-Za-z0-9_]+/) {
+      n = gsub(/\{/, "{", code); m = gsub(/\}/, "}", code)
+      if (arm != "" ) { body = body code "\n" }
+      if (code ~ /^[[:space:]]*Drafter::[A-Za-z0-9_]+/) {
         if (arm != "") { printf "%s\t%d\n", arm, (index(body, "spec_sampler_cfg") > 0) }
-        line = $0
+        line = code
         sub(/^[[:space:]]*Drafter::/, "", line)
         sub(/[^A-Za-z0-9_].*$/, "", line)
         arm = line
-        body = $0 "\n"
+        body = code "\n"
       }
       depth += n - m
       if (depth <= 0) {

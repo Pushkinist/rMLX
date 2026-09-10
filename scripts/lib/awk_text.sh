@@ -15,6 +15,13 @@
 #   `blank_strings(s)` — the line with the body of every string literal replaced
 #                        by spaces, the quotes kept so the shape still reads.
 #
+#   THE BOUNDARY. Both readers track the `"` and the backslash escape and
+#   nothing else, so a character literal holding a quote (`'\"'`) and a raw
+#   string (`r#"..."#`, whose inner quotes end nothing) are both mis-read — the
+#   raw string fails open, leaving the rest of the line unblanked. Neither
+#   occurs in the sources these gates scan today. A gate that starts scanning a
+#   file with either needs a real lexer, not a wider regex here.
+#
 #   Use `blank_strings` where a needle must not match text a program merely
 #   prints. Do NOT use it where the needle IS a literal: `check_spec_charge.sh`
 #   reads the per-round event's target that way, and blanking would make that
