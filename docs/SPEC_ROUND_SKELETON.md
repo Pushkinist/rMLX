@@ -428,7 +428,7 @@ answer after a draft-side change says that run's near-ties happened not to move.
 | the recurrent tape not armed before the verify | `refold_lin_tapes` refuses a tape that does not describe the round | yes |
 | a seed emitted where none was, or dropped | round stream `emitted_total` shifts on every line; `RoundStats::emission_violation` | yes |
 | the restricted prefix reported for a loop that has no restricted vocabulary | the EAGLE-3 boundary rule in the equivalence gate reads `DecidedBy` per token | yes |
-| the charge token hard-wired across the collapse | `make check-spec-charge`, re-keyed as below — the census on one reading, RULE 8 on the other | needs the re-key |
+| the charge token hard-wired across the collapse | `make check-spec-charge`, re-keyed as below — the census on one reading, RULE 8 on the other | yes |
 | the in-round EOS exit stops recording the request | round stream ends early; the request record is absent | yes |
 | **the seed-EOS exit stops returning early** | nothing at runtime: no round runs, so no round line is written, and no gate prompt has an EOS seed | **new, none** |
 | **the resident-KV report moved to another exit, or computed from the wrong caches** | nothing at runtime | **new, none** |
@@ -503,7 +503,9 @@ neither `phases_charged()` nor a literal. Both readings of the naive re-key fail
   the only reader of.
 
 **The decision: the token travels as a value, and a new RULE 8 holds the
-forwarded side, exactly as RULE 2 holds the deciding side.**
+forwarded side, exactly as RULE 2 holds the deciding side.** This is what the
+scanner does; the configuration type it resolves the forwarded parameter by is
+named `RoundCfg`, and the engine owes it that name.
 
 Three populations, all derived, none a name list:
 
@@ -520,7 +522,12 @@ Three populations, all derived, none a name list:
   report four fns as entries missing their decision, for ever. An entry that
   stops constructing the configuration leaves the population, which is what makes
   a dropped decision read as a lost entry rather than as a clean scan.
-- **(c) drafter rollbacks** — a fn outside (a) that calls `rollback_round`.
+- **(c) drafter rollbacks** — a fn outside (a) that calls `rollback_round` and
+  neither carries the driver signature nor names a `charged:` field of its own.
+  Those two exclusions are what keep the old reading alive: a fn that drives a
+  generation, or states a decision in a record, is a loop the derivation lost
+  rather than a drafter rolling its own state back, and stays exit 2. Without
+  them a lost loop would be read under RULE 4's argument rule and could pass.
 
 **Membership is read off the signature; the census is keyed on the binding, and
 the two must not be the same reading.** A loop that hard-wires its charge still
@@ -542,9 +549,9 @@ The rules over them:
   sites, `charge_phases:3 false:4`, at every step of the campaign. A forwarded
   loop that names or binds the field it was handed contributes nothing; the same
   loop hard-wiring a literal contributes one and the census reads eight.
-- **RULE 4** gains population (c): a rollback outside a round loop is no longer
-  exit 2 outright, but its `charge` argument must be a field of one of its own
-  parameters. A literal or a `phases_charged()` there is a second decision made
+- **RULE 4** gains population (c): a rollback outside a round loop that looks
+  like neither a loop nor a record is no longer exit 2 outright, but its
+  `charge` argument must be a field of one of its own parameters. A literal or a `phases_charged()` there is a second decision made
   where nothing can hold it to the loop that ordered it, and is exit 1; an
   argument the scan cannot read back stays exit 2.
 - **RULE 5** keeps its needle and inverts its verdict for population (b) alone:
@@ -586,11 +593,11 @@ then reads eight sites. RULE 8 can be edited out of the script; the census
 cannot, since it is what the gate exists to state. And the census alone names
 only a count, where RULE 8 names the line.
 
-**Two extractor changes go with it, not one.**
+**Two extractor changes went with it, not one.**
 
-1. The token reader reports `?` for anything that is not a bare identifier, so
-   `charged: cfg.charged` is unreadable today and would exit 2. It must read a
-   field access as a token — and **keep the delimiter anchor it already has**:
+1. The token reader reported `?` for anything that was not a bare identifier, so
+   `charged: cfg.charged` was unreadable and would have exited 2. It now reads a
+   field access as a token — and **keeps the delimiter anchor it already had**:
    `<ident>.<ident>` followed by `,`, `}` or the end of the line, and nothing
    else. `cfg.charged()`, `cfg.charged.into()`, `cfg.charged as bool` and
    `!cfg.charged` stay `?` and stay exit 2. The anchor is what stops the reader
@@ -598,13 +605,14 @@ only a count, where RULE 8 names the line.
    precisely how a decision gets inverted under a spelling the census still
    counts as forwarded.
 2. The binding reader records **per binding**, keyed to the loop's own charge
-   token. Today it sets one flag per function with a good binding outranking a
-   bad one, so a shadow passes. **Measured on this tree**: a `mtp.rs` that binds
+   token. It used to set one flag per function with a good binding outranking a
+   bad one, so a shadow passed. **Measured on this tree, before the re-key**: a `mtp.rs` that binds
    `charge_phases` to `super::phases_charged()` and then rebinds it to `false`
    on the next line exits 0 with `OK: 7 speculative round loops … census
    charge_phases:3 false:4` — a loop that charges nothing, counted among the
-   three that ask. That is a live hole on `main`, not a consequence of the
-   re-key, and the re-key chunk closes it.
+   three that ask. That was a live hole on `main`, not a consequence of the
+   re-key, and the re-key chunk closed it: the same edit now exits 2, naming the
+   loop that binds its charge token more than once.
 
    Under the per-binding reading a token bound twice in one fn is **exit 1** for
    a forwarded loop, where RULE 8 has something exact to say about the second
@@ -634,18 +642,24 @@ only a count, where RULE 8 names the line.
    which the census would count as an eighth decision; the exit-2 disposition
    above is what keeps that from being a silent miscount.
 
-#### The fixture cases the re-key must pass
+#### The fixture cases the re-key passes
 
-Twenty-three cases. None can run against today's scanner: populations (b) and
-(c) and RULE 8 do not exist in it, and a fixture root asserting them would fail
-`make check-spec-charge-fixtures` today. They are stated here with the exit and
-the reason each must produce, and the re-key chunk turns each into a scan root.
+Twenty-three cases, each a scan root in `scripts/check_spec_charge_fixtures.sh`
+built on one of two tree shapes the campaign passes through — mid-campaign, with
+one drafter migrated, and the end state, with all seven decisions in entries.
+They are stated here with the exit and the reason each produces. Two of them
+assert two reasons on the one tree, and case 16 is run on both arms, so the
+twenty-three are twenty-six runs of the harness, beside the thirty-eight the gate
+already had and one more for a token whose sites name it and whose binding the
+scan never saw.
 
-Cases 1 and 12 ask for a reason the current success line does not carry: it
-prints the loop count and the census and nothing about populations. The re-key
-changes it to name all three — `N classic, M forwarded, K entries; census …` —
-so a tree that passes says which shape it passed as, and a fixture asserting
-that a loop is forwarded has a line to assert against.
+Cases 1 and 12 ask for a reason the old success line did not carry: it printed
+the loop count and the census and nothing about populations. The line now names
+all three — `N classic, M forwarded, K entries; census … (N sites).` and the
+forwarded loops by name — so a tree that passes says which shape it passed as,
+and a fixture asserting that a loop is forwarded has a line to assert against.
+On today's tree, which has no shared loop yet, it reads `7 classic, 0 forwarded,
+0 entries; census charge_phases:3 false:4 (7 sites).`
 
 | # | the tree | exit | the reason it must give |
 |---|---|---|---|
