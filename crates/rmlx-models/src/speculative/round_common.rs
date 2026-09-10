@@ -336,13 +336,19 @@ fn seq_range(a: &Array, from: i32, to: i32, device: Device) -> Result<Array> {
 /// and hold no state, and are skipped. Holding no state is what separates them
 /// from a recurrent layer whose forward failed to record: that one has a state
 /// this round advanced, and an empty tape for it is the defect above.
+///
+/// Returns whether any layer was refolded. The stack's length does not answer
+/// that — `lin_cache_stack` builds one slot per decoder layer whatever the
+/// architecture, so a stack of nothing but skipped slots is a rollback that
+/// refolded nothing over a vector that is not empty.
 fn refold_lin_tapes(
     lin: &mut [LinearAttnCache],
     round_len: usize,
     kept: usize,
     charge: bool,
     device: Device,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut any = false;
     let mut refolded: Vec<Array> = Vec::new();
     for (idx, cache) in lin.iter_mut().enumerate() {
         let Some(tape) = cache.take_tape() else {
@@ -370,6 +376,7 @@ fn refold_lin_tapes(
                  pre-round state"
             )));
         };
+        any = true;
         let conv = concat_tape_conv_input(&tape, device)?;
         // What the conv1d carries into the next call is the `kernel - 1`
         // positions before its next input, and the tape's conv input opens with
@@ -408,7 +415,7 @@ fn refold_lin_tapes(
     for a in &refolded {
         a.eval()?;
     }
-    Ok(())
+    Ok(any)
 }
 
 /// The round's conv1d input across every taped forward, carried prefix included.
@@ -518,11 +525,10 @@ fn rollback_round_caches(
         )));
     }
     super::truncate_kv_to(kv, target_offset)?;
-    let Some(lin) = lin.filter(|l| !l.is_empty()) else {
+    let Some(lin) = lin else {
         return Ok(false);
     };
-    refold_lin_tapes(lin, round_tokens.len(), kept, charge, device)?;
-    Ok(true)
+    refold_lin_tapes(lin, round_tokens.len(), kept, charge, device)
 }
 
 /// Return a round's caches to the prefix the verifier kept, or drop the round

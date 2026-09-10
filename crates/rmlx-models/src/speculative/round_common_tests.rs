@@ -860,8 +860,13 @@ fn a_round_tape_refolds_to_what_the_replay_produced() {
 /// the tokens, the counts and the offsets on the same line are all unchanged.
 ///
 /// Mutation: return `Ok(true)` from the `lin`-less arm of
-/// `rollback_round_caches`, or re-derive the flag at a call site. Either fails
-/// the first of these.
+/// `rollback_round_caches`. The first of these then fails.
+///
+/// A call site that re-derived the flag instead of reporting the return is not
+/// something any test here reads — every call site needs a model, a device and a
+/// drafter to execute. The round-stream capture is the only thing that sees it,
+/// and only on a pair whose verifier keeps no recurrent state, which no pair in
+/// the baseline has.
 #[test]
 fn a_partial_rollback_over_no_recurrent_state_refolds_nothing_and_says_so() {
     let refolded = rollback_round(&mut [], None, &[1, 2, 3], 0, 1, false, Device::Cpu)
@@ -974,5 +979,37 @@ fn a_round_stopped_by_its_own_token_reports_what_it_emitted() {
     assert_eq!(
         emit.committed, 3,
         "the stop token is emitted and the round ends on it"
+    );
+}
+
+/// A stack that is not empty and holds nothing to refold answers `false`.
+///
+/// `lin_cache_stack` builds one slot per decoder layer whatever the
+/// architecture, and `refold_lin_tapes` walks past every slot that taped nothing
+/// and holds no state. Answering from the vector's length would therefore report
+/// a refold on any stack a non-recurrent verifier carries — the proxy holds only
+/// while the callers' own entry guards keep such a stack away from here, which
+/// is not a property this function has.
+///
+/// Mutation: answer from `!lin.is_empty()` in `rollback_round_caches`, or
+/// `Ok(true)` from the end of `refold_lin_tapes`. Either fails this.
+#[test]
+fn a_partial_rollback_over_a_stack_with_nothing_to_refold_says_so() {
+    let state_in = tape_zero_state();
+    let mut lin = vec![armed(vec![], &state_in), armed(vec![], &state_in)];
+    let refolded = rollback_round(
+        &mut [],
+        Some(&mut lin),
+        &[1, 2, 3],
+        0,
+        0,
+        false,
+        Device::Cpu,
+    )
+    .unwrap_or_else(|e| panic!("rollback: {e}"));
+    assert!(
+        !refolded,
+        "two full-attention slots are two slots and no recurrent state, and the \
+         answer is about the state"
     );
 }
