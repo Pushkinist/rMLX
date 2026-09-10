@@ -58,11 +58,14 @@ loop_src() {
             $token,
             device,
         )?;
-        super::RoundPhases {
-            round_ns: 0,
-            charged: $token,
-        }
-        .log(SpecLoop::Kind, rounds, accept, num_draft, &[]);
+        super::log_round(
+            &super::RoundReport {
+                loop_kind: SpecLoop::Kind,
+                round: rounds,
+                charged: $token,
+            },
+            &[],
+        );
     }
     log_request_record(
         &RoundTotals {
@@ -518,7 +521,7 @@ run "a helper that builds its own totals joins the population and is refused" 2 
 #     through, and in the tree the same shape does not compile — the low-level
 #     rollback is private to `round_common`.
 build_root "$root"
-perl -0pi -e 's/        super::RoundPhases \{/        super::rollback_round_caches(\n            \&mut v_caches,\n            None,\n            \&v_input,\n            0,\n            0,\n            false,\n            device,\n        )?;\n        super::RoundPhases {/' \
+perl -0pi -e 's/        super::log_round\(/        super::rollback_round_caches(\n            \&mut v_caches,\n            None,\n            \&v_input,\n            0,\n            0,\n            false,\n            device,\n        )?;\n        super::log_round(/' \
   "$root/crates/rmlx-models/src/speculative/mtp.rs"
 run "a loop reaching past the shared rollback to the low-level one is a scan error" 2 \
   "\`mtp_generate\` makes 1 call(s) to the low-level"
@@ -558,6 +561,89 @@ perl -0pi -e 's/            charged: charge_phases,\n        \},/            cha
   "$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
 run "a record call handing the recorder the other decision is refused" 1 \
   "\`mtp_assistant_generate\` names more than one charge decision"
+
+# 31. RULE 7 by call: a loop that keeps every charge decision this gate reads
+#     and writes its own round event instead of calling the one emitter. On its
+#     own module target, which is the shape the collapse replaced.
+build_root "$root"
+perl -0pi -e 's/        super::log_round\(\n(?:.*\n)*?        \);\n/        tracing::debug!(\n            target: "rmlx_models::speculative::mtp",\n            loop_kind = ?SpecLoop::Kind,\n            round = rounds,\n            charged = charge_phases,\n            "speculative round"\n        );\n/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a loop that writes its own round event instead of calling the emit" 2 \
+  "\`mtp_generate\` reaches the one round emit 0 time(s)."
+
+# 32. RULE 7 by name, and the mutation the rule was written for: the same
+#     bypass on the shared target. Every field in the same order, so the line it
+#     writes is byte-identical to the one the emitter would have written and no
+#     digest, pair or census can see it. Only the name can.
+build_root "$root"
+perl -0pi -e 's/        super::log_round\(\n(?:.*\n)*?        \);\n/        tracing::debug!(\n            target: super::PHASE_TARGET,\n            loop_kind = ?SpecLoop::Kind,\n            round = rounds,\n            charged = charge_phases,\n            "speculative round"\n        );\n/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a loop writing the shared target itself is refused by name" 2 \
+  "src/speculative/mtp.rs names the per-round event's target."
+
+# 33. RULE 7 by name, away from any loop: a helper that merely holds the string.
+#     Every loop still reaches the emitter exactly once, so the call reading is
+#     clean and the name reading is the only one that fires.
+build_root "$root"
+cat >>"$root/crates/rmlx-models/src/speculative/dflash.rs" <<'RS'
+
+fn phase_target() -> &'static str {
+    "rmlx::spec::phase"
+}
+RS
+run "a helper naming the phase target outside its file is refused" 2 \
+  "src/speculative/dflash.rs names the per-round event's target."
+
+# 34. RULE 7 by call, the other way: one loop closing its round twice. Two
+#     record shapes under one target is what the collapse removed, and a second
+#     line per round doubles that pair's count in the pinned baseline.
+build_root "$root"
+perl -0pi -e 's/(        super::log_round\(\n(?:.*\n)*?        \);\n)/$1$1/' \
+  "$root/crates/rmlx-models/src/speculative/eagle3.rs"
+run "a loop closing its round twice is refused" 2 \
+  "\`eagle3_generate\` reaches the one round emit 2 time(s)."
+
+# 35. RULE 7 by name, by fn: a round loop that *moved* into the file that owns
+#     the target — not an eighth loop, so the census is untouched and every
+#     other reading is clean. It calls the emitter once, and the file reading
+#     exempts the path, so the loop writes a second event on the target beside
+#     the one it emitted and only the fn reading sees it. This is the direction
+#     the shared skeleton is going, which is why the exemption cannot be by file
+#     alone.
+build_root "$root"
+{
+  printf '//! The shared record and the one round emit.\n\n'
+  loop_src "eagle3_generate" "false" "plain"
+} >"$root/crates/rmlx-models/src/speculative/round_stats.rs"
+printf '//! The loop that used to live here moved into the shared record.\n' \
+  >"$root/crates/rmlx-models/src/speculative/eagle3.rs"
+perl -0pi -e 's/(        super::log_round\(\n(?:.*\n)*?        \);\n)/$1        tracing::debug!(target: PHASE_TARGET, round = rounds, "speculative round");\n/' \
+  "$root/crates/rmlx-models/src/speculative/round_stats.rs"
+run "a round loop inside the target's own file does not inherit its exemption" 2 \
+  "\`eagle3_generate\` is a round loop and names the"
+
+# 36. The needle is code, not prose. A trailing comment naming the emit on a
+#     line that is not one would otherwise count as a call, and the loop that
+#     dropped its emit would read as one that still makes it.
+build_root "$root"
+perl -0pi -e 's/        super::log_round\(\n(?:.*\n)*?        \);\n/        rounds += 1; \/\/ the round the shared log_round( would have closed\n/' \
+  "$root/crates/rmlx-models/src/speculative/eagle3.rs"
+run "a trailing comment naming the emit is not a call to it" 2 \
+  "\`eagle3_generate\` reaches the one round emit 0 time(s)."
+
+# 37. Every needle reads code. A doc comment in a non-loop file naming the
+#     target is prose, not a second event on it — and the chunk that puts a
+#     round emit behind a skeleton wrapper has to write exactly this sentence in
+#     `round_common.rs`.
+build_root "$root"
+cat >>"$root/crates/rmlx-models/src/speculative/round_common.rs" <<'RS'
+
+/// The per-round event goes out on `PHASE_TARGET`, and every loop reaches it
+/// through the one `log_round(` call this gate counts.
+fn seam_note() {}
+RS
+run "a doc comment naming the target and the emit is prose, not either" 0 \
+  "7 speculative round loops, each naming one charge decision"
 
 echo
 if [ "$failures" != "0" ]; then

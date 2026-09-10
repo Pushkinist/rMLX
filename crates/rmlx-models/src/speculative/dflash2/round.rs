@@ -53,8 +53,9 @@ use crate::speculative::round_common::{
 };
 use crate::speculative::{
     accept_prefix, arm_lin_tapes, block_capped_by_checkpoint, committed_rows,
-    conditioning_residual, guard_round_conditioning, guard_verifier_prefill_logits, phases_charged,
-    rollback_target_from_tail, round_block, DecodeWindow, RoundPhases, SpecLoop, VerifierDraw,
+    conditioning_residual, guard_round_conditioning, guard_verifier_prefill_logits, log_round,
+    phases_charged, rollback_target_from_tail, round_block, DecodeWindow, RoundPhases, RoundReport,
+    SpecLoop, VerifierDraw,
 };
 use rmlx_kv_quant::{KvCache, KvQuant};
 
@@ -335,7 +336,7 @@ pub fn dflash2_generate(
         let round_walk_ns = t0.elapsed().as_nanos();
         total_accept += accept;
 
-        let hit_eos = emit_round_tokens(
+        let emit = emit_round_tokens(
             tokenizer,
             &new_tokens,
             n_tokens,
@@ -346,7 +347,7 @@ pub fn dflash2_generate(
             &mut window,
             None,
         );
-        if hit_eos {
+        if emit.hit_eos {
             break;
         }
 
@@ -356,8 +357,7 @@ pub fn dflash2_generate(
         let t0 = Instant::now();
         let v_offset_before = v_caches.iter().map(KvCache::offset).max().unwrap_or(0);
         let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        let refolded = v_target < v_offset_before;
-        rollback_round(
+        let refolded = rollback_round(
             &mut v_caches,
             Some(&mut v_lin),
             &v_input,
@@ -401,33 +401,31 @@ pub fn dflash2_generate(
         }
         b = *new_tokens.last().unwrap_or(&b);
 
-        tracing::debug!(
-            round = rounds,
-            accept,
-            num_draft = draft_tokens.len(),
-            n_committed = new_tokens.len(),
-            emitted_total = emitted.len(),
-            condition_rows = h_ctx.shape()[1],
-            projected_rows,
-            v_offset_before,
-            v_target,
-            "dflash2 round"
-        );
-
-        RoundPhases {
-            round_ns: round_t0.elapsed().as_nanos(),
-            draft_ns: round_draft_ns,
-            verify_ns: round_verify_ns,
-            walk_ns: round_walk_ns,
-            rollback_ns: round_rollback_ns,
-            refolded,
-            charged: charge_phases,
-        }
-        .log(
-            SpecLoop::DFlash2,
-            rounds,
-            accept,
-            draft_tokens.len(),
+        log_round(
+            &RoundReport {
+                loop_kind: SpecLoop::DFlash2,
+                round: rounds,
+                accept,
+                num_draft: draft_tokens.len(),
+                n_committed: emit.committed,
+                emitted_total: emitted.len(),
+                condition_rows: h_ctx.shape().get(1).copied(),
+                projected_rows: Some(projected_rows),
+                v_offset_before,
+                v_target,
+                // No drafter cache: the denoiser re-reads `h_ctx` every round.
+                d_offset_before: None,
+                d_target: None,
+                refolded,
+                charged: charge_phases,
+                phases: Some(RoundPhases {
+                    round_ns: round_t0.elapsed().as_nanos(),
+                    draft_ns: round_draft_ns,
+                    verify_ns: round_verify_ns,
+                    walk_ns: round_walk_ns,
+                    rollback_ns: round_rollback_ns,
+                }),
+            },
             &[("h_ctx", &h_ctx)],
         );
     }

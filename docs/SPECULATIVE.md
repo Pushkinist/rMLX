@@ -269,20 +269,67 @@ numbers:
   and much smaller.
 
 Per-round attribution comes from the `speculative round` event, target
-`rmlx::spec::phase`, one per round at `debug`, emitted by one shared
-`RoundPhases::log` so the three loops cannot drift into three record shapes:
+`rmlx::spec::phase`, one per round at `debug`. **Every** round loop emits it,
+through the one `round_stats::log_round`, so a round of one drafter and a round
+of another are read by the same query and a field added for one is added for
+all:
 
 ```
-loop_kind round accept num_draft refolded charged
+loop_kind round accept num_draft n_committed emitted_total
+condition_rows projected_rows
+v_offset_before v_target d_offset_before d_target refolded charged
 round_ms draft_ms verify_ms walk_ms rollback_ms other_ms
 ```
+
+The field set is the union of what the loops used to report separately, so the
+one event lost none of them. A figure a loop does not have is absent from the
+line rather than present as a zero: `condition_rows` for a loop that hands its
+drafter no buffer, `projected_rows` for one that does not project into a window
+across rounds, the drafter pair for a loop whose drafter keeps no cache, and
+every wall-clock field for the four loops that time their drafter and verifier
+over the request and no phase within a round.
+
+`n_committed` is what the round committed — the accepted prefix and the one
+token the verifier added to it, less anything the request's budget cut. It is
+counted where the tokens reach the sink and reported from there, so a block the
+budget clipped is not reported as committed to a rollback that did not keep it.
+
+`emitted_total` is `emitted.len()` at the end of the round: every token the
+request has handed the sink, **the seed included**. The five sidecar loops
+argmax one token out of the prefill forward and emit it before the first round,
+so on those this figure is one above the tokens the rounds produced.
+**It is not the `emitted_total` `scripts/lib/spec_round_log.py` prints**, which
+sums `emitted_in_rounds` over a run's done records and excludes the seed for the
+reason § "A round's tokens are the ones a round produced" gives — so the two
+differ by `seed_emitted` on every sidecar loop, permanently, and a reader
+comparing one against the other is comparing two definitions. Renaming either
+moves every digest in the pinned round-stream baseline, so the collision is
+recorded here rather than resolved in this chunk.
+`v_offset_before` is the verifier offset that round's rollback target was
+computed from, which the six loops counting back from the tail read after their
+verify forward and the assistant reads before its own. `d_offset_before` and
+`d_target` are the same two positions on the drafter's own cache, on their own
+arithmetic — which is what makes them a cross-check on `v_target` rather than a
+restatement of it.
+
+`condition_rows` is read from the conditioning buffer the round hands on, and
+what it is worth reading against differs by loop. The two block loops grow a
+window, so it moves with `projected_rows` beside it and the two are a
+cross-check: a slide that projects the right number of rows into the wrong
+window moves one and not the other. The sidecar carries a single verifier row
+and projects nothing, so it reports `condition_rows` and no `projected_rows`,
+and what that pins is that the row stays one. The rest carry neither.
 
 `other_ms` is what no phase claimed: emission, tokenizer decode, slicing and
 host bookkeeping. The four phases are disjoint sub-spans of the round, so
 claiming more than the round has means a timer started outside it — that is an
-`error!` naming the phases rather than an `other_ms` near zero that reads like
-rounding. `refolded` says whether that round took the recurrent arm of
-`rollback_round`.
+`error!` naming the phases, and the round is still reported with no `other_ms`.
+`refolded` says whether that round's **verifier** rollback refolded a recurrent
+state. It comes back from `rollback_round`, which is the only thing that knows:
+true on the partial arm of a stack that carries a recurrent state, so a
+full-attention verifier — the assistant's — and a dense one read `false` for a
+partial round that refolded nothing. The loops with a drafter cache roll that
+back on its own arm, and its answer is not this field.
 
 `charged` is the field that says how to read the rest. At `debug` the phases are
 timed but not forced, so the lazy tails above still move between them. At
@@ -311,7 +358,7 @@ trusted.** Each loop forces the things it produces, one call at a time, and the
 way that fails is by omission: four of the five arrays a round builds get forced
 and the fifth is still a graph node when the next round's drafter reads it. No
 timing assertion can see that, because the number it produces is a plausible
-one. `RoundPhases::log` therefore takes the arrays the round hands to its
+one. `log_round` therefore takes the arrays the round hands to its
 successor, under the names the loop calls them, and on a charged round reports
 any that are still unevaluated — `Array::is_available`, which asks MLX for the
 array's status rather than inferring it from a clock. The three omissions it

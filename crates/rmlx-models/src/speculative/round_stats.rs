@@ -45,7 +45,7 @@
 //! evaluations a loop makes by hand, one per thing it produces, and the failure
 //! mode is an omission: a phase forces four of the five arrays it built and the
 //! fifth is paid for by the next round's drafter, at no cost to any assertion.
-//! [`RoundPhases::log`] therefore takes the arrays the round hands on and, on a
+//! [`log_round`] therefore takes the arrays the round hands on and, on a
 //! charged round, names any that are still unevaluated — see [`unforced`].
 //! Whether a loop declared everything it carries is not something the check can
 //! know; what it removes is the case where the declaration was right and the
@@ -171,9 +171,16 @@ impl SpecLoop {
     }
 }
 
-/// The target the per-round phase split is logged under, and the switch that
-/// decides whether those phases are charged for the work they issue.
-pub(crate) const PHASE_TARGET: &str = "rmlx::spec::phase";
+/// The target the per-round event is logged under, and the switch that decides
+/// whether a round's phases are charged for the work they issue.
+///
+/// Private to this module. Naming it is what a loop would need to write a round
+/// event of its own beside the one [`log_round`] writes, and a second event on
+/// this target with the same fields is invisible to every observable in the
+/// crate — the digests agree because the line agrees. `make check-spec-charge`
+/// refuses the name outside this file for the same reason it refuses the
+/// low-level rollback outside `round_common.rs`.
+const PHASE_TARGET: &str = "rmlx::spec::phase";
 
 /// Whether this request's round loop should force each phase's work before
 /// closing its span.
@@ -238,10 +245,20 @@ fn unforced(carry: &[(&str, &Array)]) -> Vec<String> {
 ///
 /// The four phases are disjoint sub-spans of the round, so the round's own
 /// clock less their sum is what no phase claimed: emission, tokenizer decode,
-/// slicing and host bookkeeping. Read `charged` before reading any of it —
-/// uncharged, a phase is timed but not forced, and lazy work drifts between
-/// them (see [`phases_charged`]).
+/// slicing and host bookkeeping. Read [`RoundReport::charged`] before reading
+/// any of it — uncharged, a phase is timed but not forced, and lazy work drifts
+/// between them (see [`phases_charged`]).
+///
+/// Three of the seven round loops keep this split; the other four time their
+/// drafter and verifier over the request and no phase within a round, which is
+/// why [`RoundReport::phases`] is an `Option` and their rounds carry no
+/// wall-clock field at all rather than five zeroes.
 #[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the shared postfix is the unit: a bare `round: u128` beside `ms` and \
+              `*_ms` fields elsewhere in this module reads as a count"
+)]
 pub(crate) struct RoundPhases {
     /// The round's own wall clock.
     pub(crate) round_ns: u128,
@@ -254,11 +271,6 @@ pub(crate) struct RoundPhases {
     /// Time inside the rollback: cache truncation and, on a recurrent
     /// verifier, the refold of the accepted prefix.
     pub(crate) rollback_ns: u128,
-    /// Whether the round took the recurrent refold arm of
-    /// [`super::round_common::rollback_round`] rather than its disarm arm.
-    pub(crate) refolded: bool,
-    /// Whether the phases were charged for the work they issued.
-    pub(crate) charged: bool,
 }
 
 impl RoundPhases {
@@ -277,83 +289,187 @@ impl RoundPhases {
             .saturating_add(self.rollback_ns);
         self.round_ns.checked_sub(claimed)
     }
+}
 
-    /// Emit this round's split, and say so when it does not partition the
-    /// round.
+/// What one speculative round did, in the one shape every round loop reports.
+///
+/// One event, one target and one field set for all seven loops: a round of the
+/// two-model loop and a round of the assistant loop are read by the same query,
+/// and a field added for one drafter is added for all of them. Four of the
+/// loops used to emit their own `debug!` under their own module target with
+/// their own fields, so a reader comparing two drafters was comparing two
+/// record shapes.
+///
+/// The field set is the union of what the seven loops used to report, so the
+/// collapse loses no observable: a figure a loop does not have is `None` and is
+/// then absent from the line rather than present as a zero.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoundReport {
+    /// Which loop ran the round.
+    pub(crate) loop_kind: SpecLoop,
+    /// The round's index within the request.
+    pub(crate) round: usize,
+    /// Proposals the verifier accepted this round.
+    pub(crate) accept: usize,
+    /// Proposals the drafter made this round.
+    pub(crate) num_draft: usize,
+    /// Tokens the round committed — the accepted prefix and the one token the
+    /// verifier added to it, less anything the request's budget cut.
+    pub(crate) n_committed: usize,
+    /// Tokens the request has handed the sink, this round's included.
+    pub(crate) emitted_total: usize,
+    /// Rows the conditioning buffer holds leaving this round, or `None` for a
+    /// loop that hands its drafter no buffer.
     ///
-    /// One emitter for every loop that keeps a split: a field added at one call
-    /// site and not the other would put two incomparable record shapes under
-    /// one target. The overrun is an `error!` for the same reason
-    /// [`RoundStats::span_violation`] is — a phase timer that starts outside
-    /// the round it is attributed to is a defect in the instrument, and the
-    /// only reader who would otherwise notice is one already reading raw
-    /// JSON-Lines and already looking for it.
+    /// Read from the buffer, not from what the loop meant to put in it. For the
+    /// two block loops it is a window that grows, and pairs with
+    /// [`Self::projected_rows`] as a cross-check — a slide that projects the
+    /// right number of rows into the wrong window moves this and leaves that
+    /// alone. For the sidecar it is the single verifier row the next round
+    /// conditions on, and reporting it is what pins that it stays one.
+    pub(crate) condition_rows: Option<i32>,
+    /// Conditioning rows the round's projection returned, or `None` for a loop
+    /// that carries no conditioning buffer between rounds.
+    pub(crate) projected_rows: Option<i32>,
+    /// The verifier offset this round's rollback target was computed from.
     ///
-    /// `carry` is every array this round leaves for the next one's drafter to
-    /// read, each under the name the loop calls it. On a charged round they
-    /// must all be forced by now, and [`unforced`] says which are not — see
-    /// [`phases_charged`]. It is an argument rather than something this module
-    /// works out because only the loop knows what it carries; a loop that
-    /// genuinely carries no array passes an empty slice and says so where a
-    /// reader can see it.
-    pub(crate) fn log(
-        &self,
-        loop_kind: SpecLoop,
-        round: usize,
-        accept: usize,
-        num_draft: usize,
-        carry: &[(&str, &Array)],
-    ) {
-        if self.charged {
-            let unforced = unforced(carry);
-            if !unforced.is_empty() {
-                tracing::error!(
-                    target: PHASE_TARGET,
-                    ?loop_kind,
-                    round,
-                    unforced = %unforced.join(", "),
-                    "a charged round left work for the next round's drafter to pay for: \
-                     these arrays are still unevaluated, so the drafter's span is charged \
-                     the phase that built them"
-                );
-            }
-        }
-        let Some(unclaimed_ns) = self.unclaimed_ns() else {
+    /// Each loop's own basis, and the two are not the same position: the six
+    /// loops that count back from the tail read it after their verify forward,
+    /// the assistant reads it before — deliberately, since reading it
+    /// afterwards makes it a function of how far each layer happened to
+    /// advance. See [`super::rollback_target_from_tail`] and
+    /// [`super::rollback_target_from_head`].
+    pub(crate) v_offset_before: i32,
+    /// Where the rollback left the verifier's caches.
+    pub(crate) v_target: i32,
+    /// The drafter cache offset this round's drafter-side rollback was read
+    /// against, or `None` for a loop whose drafter keeps no cache across
+    /// rounds.
+    ///
+    /// Each loop's own basis, as with [`Self::v_offset_before`]: the two-model
+    /// loops read it after their drafting forwards and count back from there;
+    /// EAGLE-3 and the sidecar read it before theirs and count forward over
+    /// the accepted prefix.
+    pub(crate) d_offset_before: Option<i32>,
+    /// Where the round left the drafter's cache, or `None` for a loop whose
+    /// drafter keeps no cache across rounds.
+    ///
+    /// Computed on its own path, so it is a cross-check on
+    /// [`Self::v_target`] rather than a restatement: a drafter left one
+    /// position from the verifier proposes against a prefix the verifier never
+    /// scored, and greedy verification emits the verifier's own token anyway.
+    pub(crate) d_target: Option<i32>,
+    /// Whether the round's verifier rollback refolded a recurrent state.
+    ///
+    /// Reported by [`super::round_common::rollback_round`] rather than derived
+    /// from the offsets beside it: it is true only on the partial arm of a
+    /// stack that carries a recurrent state, so a full-attention or dense
+    /// verifier reads `false` for a partial round that refolded nothing. The
+    /// loops with a drafter cache roll that back too, on its own arm; this
+    /// field is the verifier's, beside [`Self::v_target`].
+    pub(crate) refolded: bool,
+    /// Whether the phases were charged for the work they issued.
+    pub(crate) charged: bool,
+    /// The round's wall clock split by phase, for the loops that keep one.
+    pub(crate) phases: Option<RoundPhases>,
+}
+
+/// Emit one round, and say so when its phases do not partition it.
+///
+/// The overrun is an `error!` for the same reason [`RoundStats::span_violation`]
+/// is — a phase timer that starts outside the round it is attributed to is a
+/// defect in the instrument, and the only reader who would otherwise notice is
+/// one already reading raw JSON-Lines and already looking for it. The round
+/// itself is still reported, with no `other_ms`: a missing round line would
+/// take the whole round out of a reader's stream over a broken timer.
+///
+/// `carry` is every array this round leaves for the next one's drafter to read,
+/// each under the name the loop calls it. On a charged round they must all be
+/// forced by now, and [`unforced`] says which are not — see [`phases_charged`].
+/// It is an argument rather than something this module works out because only
+/// the loop knows what it carries; a loop that genuinely carries no array
+/// passes an empty slice and says so where a reader can see it.
+///
+/// `report` is destructured, so a field added to [`RoundReport`] and not
+/// emitted is a compile error rather than a field quietly left off the line.
+pub(crate) fn log_round(report: &RoundReport, carry: &[(&str, &Array)]) {
+    let &RoundReport {
+        loop_kind,
+        round,
+        accept,
+        num_draft,
+        n_committed,
+        emitted_total,
+        condition_rows,
+        projected_rows,
+        v_offset_before,
+        v_target,
+        d_offset_before,
+        d_target,
+        refolded,
+        charged,
+        phases,
+    } = report;
+    if charged {
+        let unforced = unforced(carry);
+        if !unforced.is_empty() {
             tracing::error!(
                 target: PHASE_TARGET,
                 ?loop_kind,
                 round,
-                accept,
-                num_draft,
-                refolded = self.refolded,
-                charged = self.charged,
-                round_ms = ms(self.round_ns),
-                draft_ms = ms(self.draft_ns),
-                verify_ms = ms(self.verify_ns),
-                walk_ms = ms(self.walk_ns),
-                rollback_ms = ms(self.rollback_ns),
-                "speculative round phases claim more time than the round has: a phase \
-                 timer starts outside the round it is attributed to"
+                unforced = %unforced.join(", "),
+                "a charged round left work for the next round's drafter to pay for: \
+                 these arrays are still unevaluated, so the drafter's span is charged \
+                 the phase that built them"
             );
-            return;
-        };
-        tracing::debug!(
+        }
+    }
+    let unclaimed_ns = phases.and_then(|p| p.unclaimed_ns());
+    if let Some(p) = phases.filter(|p| p.unclaimed_ns().is_none()) {
+        // Field by field, not a `Debug` blob: the reader who has to act on this
+        // is searching a run's JSON-Lines for the phase that escaped, and a
+        // struct rendered into one string is not a field they can search.
+        tracing::error!(
             target: PHASE_TARGET,
             ?loop_kind,
             round,
             accept,
             num_draft,
-            refolded = self.refolded,
-            charged = self.charged,
-            round_ms = ms(self.round_ns),
-            draft_ms = ms(self.draft_ns),
-            verify_ms = ms(self.verify_ns),
-            walk_ms = ms(self.walk_ns),
-            rollback_ms = ms(self.rollback_ns),
-            other_ms = ms(unclaimed_ns),
-            "speculative round"
+            refolded,
+            charged,
+            round_ms = ms(p.round_ns),
+            draft_ms = ms(p.draft_ns),
+            verify_ms = ms(p.verify_ns),
+            walk_ms = ms(p.walk_ns),
+            rollback_ms = ms(p.rollback_ns),
+            "speculative round phases claim more time than the round has: a phase \
+             timer starts outside the round it is attributed to"
         );
     }
+    tracing::debug!(
+        target: PHASE_TARGET,
+        ?loop_kind,
+        round,
+        accept,
+        num_draft,
+        n_committed,
+        emitted_total,
+        condition_rows,
+        projected_rows,
+        v_offset_before,
+        v_target,
+        d_offset_before,
+        d_target,
+        refolded,
+        charged,
+        round_ms = phases.map(|p| ms(p.round_ns)),
+        draft_ms = phases.map(|p| ms(p.draft_ns)),
+        verify_ms = phases.map(|p| ms(p.verify_ns)),
+        walk_ms = phases.map(|p| ms(p.walk_ns)),
+        rollback_ms = phases.map(|p| ms(p.rollback_ns)),
+        other_ms = unclaimed_ns.map(ms),
+        "speculative round"
+    );
 }
 
 /// One speculative request's counters, and the per-round figures they imply.

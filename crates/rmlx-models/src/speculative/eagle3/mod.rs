@@ -1127,7 +1127,6 @@ pub fn eagle3_generate(
         // -- Phase C: greedy acceptance walk. --
         let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         total_accept += accept;
-        let n_committed = new_tokens.len();
 
         // Per-step trace: enable with RUST_LOG=rmlx_models::speculative::eagle3=trace.
         if step_trace_enabled() {
@@ -1157,7 +1156,7 @@ pub fn eagle3_generate(
         // restricted argmax confirmed; `new_tokens[accept]` is the correction,
         // taken over the whole vocabulary.
         let restricted = if hot_path { accept } else { 0 };
-        let hit_eos = emit_round_tokens(
+        let emit = emit_round_tokens(
             tokenizer,
             &new_tokens,
             n_tokens,
@@ -1168,9 +1167,10 @@ pub fn eagle3_generate(
             &mut window,
             Some((&mut *decided_by, restricted)),
         );
-        if hit_eos {
+        if emit.hit_eos {
             break;
         }
+        let n_committed = emit.committed;
 
         // -- Phase D: roll back verifier KV/GDN caches on partial accept. --
         // The verifier consumed v_k positions; keep the committed prefix
@@ -1179,7 +1179,7 @@ pub fn eagle3_generate(
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
         let v_target =
             super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        rollback_round(
+        let refolded = rollback_round(
             &mut v_caches,
             Some(&mut v_lin),
             &v_input,
@@ -1218,17 +1218,26 @@ pub fn eagle3_generate(
         d_seed_tok = Some(seed_tok);
         b = correction;
 
-        tracing::debug!(
-            round = rounds,
-            accept,
-            num_draft = draft_tokens.len(),
-            n_committed,
-            emitted_total = emitted.len(),
-            v_offset_before,
-            v_target,
-            draft_pre_round_offset,
-            draft_cache_after = drafter.cache_offset(),
-            "eagle3 round"
+        super::log_round(
+            &super::RoundReport {
+                loop_kind: super::SpecLoop::Eagle3,
+                round: rounds,
+                accept,
+                num_draft: draft_tokens.len(),
+                n_committed,
+                emitted_total: emitted.len(),
+                condition_rows: None,
+                projected_rows: None,
+                v_offset_before,
+                v_target,
+                d_offset_before: Some(draft_pre_round_offset),
+                d_target: Some(drafter.cache_offset()),
+                refolded,
+                // This loop times no phases, so it never charges one.
+                charged: false,
+                phases: None,
+            },
+            &[],
         );
     }
 

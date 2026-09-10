@@ -3053,33 +3053,42 @@ fn write_round_stream(test: &str, prompt: &str, rounds: &[CapturedEvent]) {
     );
 }
 
-/// One round in each shape a loop emits, on the target that loop emits it on,
-/// followed by a request-level line that is not a round.
-fn emit_one_round_of_each_shape() {
+/// A round in the shape every loop emits, one from a loop that keeps no phase
+/// split, the `error!` a round with a broken phase timer emits beside its own
+/// line, and a request-level line that is not a round.
+fn emit_two_rounds_an_overrun_and_a_request_line() {
     tracing::debug!(
         target: PHASE_SWITCH_TARGET,
         round = 3,
         accept = 2,
         num_draft = 4,
+        n_committed = 3,
+        emitted_total = 11,
+        projected_rows = 3,
         round_ms = 20.5,
         "speculative round"
     );
     tracing::debug!(
-        target: "rmlx_models::speculative::eagle3",
-        round = 3,
+        target: PHASE_SWITCH_TARGET,
+        round = 4,
         accept = 2,
         num_draft = 4,
         n_committed = 3,
-        "eagle3 round"
+        emitted_total = 14,
+        "speculative round"
     );
-    tracing::debug!(
-        target: "rmlx_models::speculative::dflash",
-        round = 3,
+    // The overrun report, on the round target, at ERROR, naming the round's own
+    // figures — which the recorder admits and the classifier reads by shape.
+    tracing::error!(
+        target: PHASE_SWITCH_TARGET,
+        round = 4,
         accept = 2,
         num_draft = 4,
-        n_committed = 3,
-        projected_rows = 3,
-        "dflash round"
+        refolded = false,
+        charged = false,
+        round_ms = 1.0,
+        draft_ms = 4.0,
+        "speculative round phases claim more time than the round has"
     );
     tracing::debug!(target: "rmlx_models::speculative", "a request-level line, not a round");
 }
@@ -3087,11 +3096,10 @@ fn emit_one_round_of_each_shape() {
 /// The recorder keeps a round as a loop emits one, and charges no phase doing
 /// it.
 ///
-/// The events below are emitted at the targets the loops use, and two of those
-/// targets are themselves behaviour switches: the shared round event sits on
-/// the phase target and EAGLE-3's on its own module. A capture that declined
-/// the target rather than the level would return nothing for either, which is
-/// four of the seven loops.
+/// The events below are emitted at the target every loop's round event uses,
+/// and that target is itself a behaviour switch — the phases are charged when
+/// it is enabled at TRACE. A capture that declined the target rather than the
+/// level would return no round at all.
 ///
 /// Mutation: in `RoundStreamRecorder::enabled`, answer `false` for every
 /// metadata whose target is in `BEHAVIOUR_SWITCH_TARGETS`.
@@ -3104,19 +3112,53 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
         assert!(
             !tracing::enabled!(target: "rmlx_models::speculative::eagle3", tracing::Level::TRACE)
         );
-        emit_one_round_of_each_shape();
+        emit_two_rounds_an_overrun_and_a_request_line();
     });
 
     let captured = recorder.events();
     let rounds = round_events(&captured);
     assert_eq!(
         rounds.len(),
-        3,
-        "three rounds were emitted and the request-level line is not one: {rounds:?}"
+        2,
+        "two rounds were emitted; neither the request-level line nor the overrun \
+         report is one: {rounds:?}"
     );
-    // The negative control has to be excluded for the reason `round_events`
-    // gives, not by luck: a request-level line that grew all three fields would
-    // otherwise quietly join the stream and this fixture would still read 3.
+    // The overrun is the negative control that matters. Two lines are emitted on
+    // the round's own target and at a level the recorder admits, and this is the
+    // one that is nearly a round: it names the round's index, what it accepted
+    // and how many proposals it accepted them from — three of the four — so what
+    // keeps it out is the fourth, and a classifier narrowed back to three would
+    // put a second line in this round's stream. The other, the carry check in
+    // `round_stats::log_round`, carries the round and the unforced arrays and
+    // neither `accept` nor `num_draft`, so it is already three fields short of a
+    // round; it also fires only on a charged round, which no capture is.
+    let overrun: Vec<&CapturedEvent> = captured
+        .iter()
+        .filter(|e| {
+            e.message
+                .starts_with("speculative round phases claim more time")
+        })
+        .collect();
+    assert_eq!(overrun.len(), 1, "the overrun report was captured");
+    assert_eq!(
+        overrun[0].field("emitted_total"),
+        None,
+        "the overrun is a statement about one round's clock and carries no running \
+         emitted total, which is what excludes it: {:?}",
+        overrun[0]
+    );
+    for f in ["round", "accept", "num_draft"] {
+        assert!(
+            overrun[0].field(f).is_some(),
+            "the overrun names the round's own figures, so {f} is not what excludes \
+             it: {:?}",
+            overrun[0]
+        );
+    }
+    // The second negative control, off the round's target: it has to be excluded
+    // for the reason `round_events` gives, not by luck. A request-level line
+    // that grew all four fields would otherwise quietly join the stream and this
+    // fixture would still read 2.
     let control: Vec<&CapturedEvent> = captured
         .iter()
         .filter(|e| e.message == "a request-level line, not a round")
@@ -3130,8 +3172,12 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
          of {ROUND_EVENT_FIELDS:?}, so it no longer shows anything: {:?}",
         control[0]
     );
-    assert_eq!(rounds[1].field("n_committed"), Some("3"));
-    assert_eq!(rounds[2].field("projected_rows"), Some("3"));
+    assert_eq!(rounds[0].field("n_committed"), Some("3"));
+    assert_eq!(rounds[0].field("projected_rows"), Some("3"));
+    // A loop that carries no conditioning buffer, and no phase split, leaves
+    // both off its line rather than reporting a zero for either.
+    assert_eq!(rounds[1].field("projected_rows"), None);
+    assert_eq!(rounds[1].field("round_ms"), None);
 
     let line: serde_json::Value =
         serde_json::from_str(&rounds[0].json_line()).expect("a round renders as one JSON object");
@@ -3156,6 +3202,60 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
         recorder.declined_both_switches(),
         "both switches were asked at TRACE and both answers must have been no: {:?}",
         recorder.questions()
+    );
+}
+
+/// Two facts the engine states and its readers restate, held to the engine's
+/// copy by reading the source.
+///
+/// **The round event's target.** `round_stats.rs` owns it and the constant is
+/// private, so a capture cannot import the name it must decline to enable at
+/// TRACE and restates the literal instead. Nothing held the two together: the
+/// only other assertion on the target compares a line this file emitted *with*
+/// `PHASE_SWITCH_TARGET` against `PHASE_SWITCH_TARGET`, which is circular, and
+/// `round_events` is target-blind. Editing either literal alone left every gate
+/// green and every capture reading a target the engine no longer writes on —
+/// which is not a failure, it is an empty stream that looks like a run with no
+/// rounds.
+///
+/// **What a round line carries.** `ROUND_EVENT_FIELDS` decides which events
+/// reach a capture; `spec_round_stream_compare.py` decides which lines it will
+/// read one back from. The silent direction is the engine gaining a field the
+/// script does not require: the script then accepts a line the engine would not
+/// have written, and a stream missing that field digests as a clean one.
+///
+/// Read out of the files rather than linked, because one of them is Python. The
+/// rendering is the Rust array's, so a fifth field added on this side does not
+/// compile into a passing assertion — it changes the string being looked for.
+#[test]
+fn the_engine_and_its_readers_state_the_same_target_and_round_fields() {
+    const ROUND_STATS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/speculative/round_stats.rs"
+    ));
+    const COMPARE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/spec_round_stream_compare.py"
+    ));
+
+    let target = format!("const PHASE_TARGET: &str = \"{PHASE_SWITCH_TARGET}\";");
+    assert!(
+        ROUND_STATS.contains(&target),
+        "`round_stats.rs` does not declare `{target}`, so the target this capture \
+         declines to enable at TRACE is not the one the engine writes rounds on"
+    );
+
+    let rendered = ROUND_EVENT_FIELDS
+        .iter()
+        .map(|f| format!("\"{f}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fields = format!("ROUND_EVENT_FIELDS = ({rendered})");
+    assert!(
+        COMPARE.contains(&fields),
+        "`scripts/spec_round_stream_compare.py` does not state `{fields}`, so the \
+         filter the engine writes a capture through and the filter that reads one \
+         back are two different rules"
     );
 }
 

@@ -8,17 +8,16 @@
 /// At TRACE, every round forces its carried arrays before its span closes.
 pub const PHASE_SWITCH_TARGET: &str = "rmlx::spec::phase";
 
-/// At TRACE, EAGLE-3's round adds one event per verified position. The same
-/// target carries that loop's round event at DEBUG.
+/// At TRACE, EAGLE-3's round adds one event per verified position.
 pub const EAGLE3_STEP_SWITCH_TARGET: &str = "rmlx_models::speculative::eagle3";
 
 /// The two targets a **speculative round loop** consults to decide what it
 /// *does*, as opposed to what it logs. A recorder that enables either is
 /// measuring a different, slower run than the one that ships.
 ///
-/// Both are asked at TRACE and at no other level, and both targets carry a
-/// round event at DEBUG, so what a capture must decline is the level and not
-/// the target.
+/// Both are asked at TRACE and at no other level, and the phase target carries
+/// every loop's round event at DEBUG, so what a capture must decline is the
+/// level and not the target.
 ///
 /// **Not every behaviour-changing switch in the crate.** [`RoundStreamRecorder`]
 /// answers `true` for every DEBUG callsite, so it turns on any switch keyed on
@@ -83,17 +82,26 @@ impl CapturedEvent {
     }
 }
 
-/// What every round event carries, whichever of the five spellings emitted it:
-/// the round's index, what it accepted, and how many proposals it accepted them
-/// from.
-pub const ROUND_EVENT_FIELDS: [&str; 3] = ["round", "accept", "num_draft"];
+/// What every round event carries: the round's index, what it accepted, how
+/// many proposals it accepted them from, and how many tokens the request has
+/// emitted by the end of it.
+///
+/// The last is what separates a round from the `error!` a round with a broken
+/// phase timer emits beside it. That report names the round's own figures so a
+/// reader can act on it, which gave it the first three; it carries no running
+/// emitted total, because it is a statement about one round's clock and not
+/// about the request's output. Without a fourth field an overrun would insert a
+/// second line into the round's stream — moving the cell, refusing the
+/// manifest, and doubling one round for every reader that counts them.
+pub const ROUND_EVENT_FIELDS: [&str; 4] = ["round", "accept", "num_draft", "emitted_total"];
 
 /// The events a round loop closes a round with, out of everything a run emits.
 ///
-/// Read by shape rather than by message: four of the five spellings carry a
-/// different set beyond [`ROUND_EVENT_FIELDS`]. A loop that renamed its message
-/// is still found; a loop that stopped reporting one of the three is not a
-/// round event any more, which is the answer the caller wants.
+/// Read by shape rather than by message: a figure a loop does not have is
+/// absent from its line, so the set beyond [`ROUND_EVENT_FIELDS`] still differs
+/// between loops. A loop that renamed its message is still found; a loop that
+/// stopped reporting one of the four is not a round event any more, which is
+/// the answer the caller wants.
 #[must_use]
 pub fn round_events(events: &[CapturedEvent]) -> Vec<CapturedEvent> {
     events
@@ -174,11 +182,10 @@ impl tracing::Subscriber for RoundStreamRecorder {
     }
 
     fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
-        // Both switches are asked at TRACE and TRACE alone, and both switch
-        // targets also carry a round event at DEBUG — the shared one and
-        // EAGLE-3's. Declining the target rather than the level would leave
-        // four of the seven loops' rounds uncaptured while changing neither
-        // switch's answer.
+        // Both switches are asked at TRACE and TRACE alone, and the phase
+        // target also carries every loop's round event at DEBUG. Declining the
+        // target rather than the level would leave the capture with no round
+        // at all while changing neither switch's answer.
         let answer = *meta.level() <= tracing::Level::DEBUG;
         self.asked
             .lock()

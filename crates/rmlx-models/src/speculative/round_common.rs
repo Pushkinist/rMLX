@@ -235,11 +235,12 @@ pub(crate) fn emit_round_tokens(
     emitted_in_rounds: &mut usize,
     window: &mut DecodeWindow,
     decided_by: Option<(&mut Vec<DecidedBy>, usize)>,
-) -> bool {
+) -> RoundEmit {
     let (mut decided_by, restricted) = match decided_by {
         Some((buf, restricted)) => (Some(buf), restricted),
         None => (None, 0),
     };
+    let mut committed = 0usize;
     for (i, &id) in round_tokens.iter().enumerate() {
         if emitted.len() >= n_tokens {
             break;
@@ -253,11 +254,32 @@ pub(crate) fn emit_round_tokens(
             });
         }
         *emitted_in_rounds += 1;
+        committed += 1;
         if eos_ids.contains(&id) {
-            return true;
+            return RoundEmit {
+                committed,
+                hit_eos: true,
+            };
         }
     }
-    false
+    RoundEmit {
+        committed,
+        hit_eos: false,
+    }
+}
+
+/// What [`emit_round_tokens`] did with a round's tokens.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoundEmit {
+    /// How many of them reached the sink.
+    ///
+    /// The round's committed count, and the one producer of it: a loop that
+    /// reports the length of what it *handed* this function reports the tokens
+    /// the request's budget cut as committed, and the rollback beside it does
+    /// not.
+    pub(crate) committed: usize,
+    /// Whether one of them ended the request.
+    pub(crate) hit_eos: bool,
 }
 
 /// Length of `a`'s sequence axis, which every taped recurrence input carries at
@@ -314,13 +336,19 @@ fn seq_range(a: &Array, from: i32, to: i32, device: Device) -> Result<Array> {
 /// and hold no state, and are skipped. Holding no state is what separates them
 /// from a recurrent layer whose forward failed to record: that one has a state
 /// this round advanced, and an empty tape for it is the defect above.
+///
+/// Returns whether any layer was refolded. The stack's length does not answer
+/// that — `lin_cache_stack` builds one slot per decoder layer whatever the
+/// architecture, so a stack of nothing but skipped slots is a rollback that
+/// refolded nothing over a vector that is not empty.
 fn refold_lin_tapes(
     lin: &mut [LinearAttnCache],
     round_len: usize,
     kept: usize,
     charge: bool,
     device: Device,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut any = false;
     let mut refolded: Vec<Array> = Vec::new();
     for (idx, cache) in lin.iter_mut().enumerate() {
         let Some(tape) = cache.take_tape() else {
@@ -348,6 +376,7 @@ fn refold_lin_tapes(
                  pre-round state"
             )));
         };
+        any = true;
         let conv = concat_tape_conv_input(&tape, device)?;
         // What the conv1d carries into the next call is the `kernel - 1`
         // positions before its next input, and the tape's conv input opens with
@@ -386,7 +415,7 @@ fn refold_lin_tapes(
     for a in &refolded {
         a.eval()?;
     }
-    Ok(())
+    Ok(any)
 }
 
 /// The round's conv1d input across every taped forward, carried prefix included.
@@ -484,7 +513,7 @@ fn rollback_round_caches(
     target_offset: i32,
     charge: bool,
     device: Device,
-) -> Result<()> {
+) -> Result<bool> {
     let kept = (target_offset - pre_round_offset).max(0) as usize;
     if kept > round_tokens.len() {
         return Err(Error::Model(format!(
@@ -496,8 +525,8 @@ fn rollback_round_caches(
         )));
     }
     super::truncate_kv_to(kv, target_offset)?;
-    let Some(lin) = lin.filter(|l| !l.is_empty()) else {
-        return Ok(());
+    let Some(lin) = lin else {
+        return Ok(false);
     };
     refold_lin_tapes(lin, round_tokens.len(), kept, charge, device)
 }
@@ -516,6 +545,19 @@ fn rollback_round_caches(
 /// made here: it belongs at the call site, beside the record that has to name
 /// the same one.
 ///
+/// Returns whether a recurrent state was refolded — true only on the partial
+/// arm of a stack that carries one. This is the one producer of that fact:
+/// every loop reports it, and a loop re-deriving it from its own offsets says
+/// `true` for a full-attention or dense verifier that refolded nothing.
+///
+/// Nothing forces a caller to read it. `rollback_round(…)?;` compiles and drops
+/// the answer — two call sites do that on purpose, the drafter-side arms of the
+/// two-model loops, whose answer is not the round's — and `make
+/// check-spec-charge` reads this call for its `charge` argument and not for what
+/// it returns. A loop that stopped reporting the flag and re-derived it would be
+/// caught by the round stream only on a pair whose verifier keeps no recurrent
+/// state, and the baseline has none.
+///
 /// # Errors
 ///
 /// [`rmlx_core::error::Error::Model`] when the refold cannot replay the
@@ -530,7 +572,7 @@ pub(crate) fn rollback_round(
     target_offset: i32,
     charge: bool,
     device: Device,
-) -> Result<()> {
+) -> Result<bool> {
     if target_offset < pre_round_offset + round_tokens.len() as i32 {
         return rollback_round_caches(
             kv,
@@ -543,7 +585,7 @@ pub(crate) fn rollback_round(
         );
     }
     super::disarm_lin_tapes(lin);
-    Ok(())
+    Ok(false)
 }
 
 /// Emit a sidecar loop's seed token, and say whether it ended the request.

@@ -17,9 +17,31 @@ WHAT IS COMPARED
     says it drops and hashes what it wrote.
 
 USAGE
-    compare  <dir-a> <dir-b>   field-by-field over every cell in both
+    compare  <dir-a> <dir-b> [--fields f[|alias],...]
+                               field-by-field over every cell in both, or over
+                               the named fields only
     manifest <dir>             emit a MANIFEST.sha256 for one capture
     verify   <dir> [manifest]  hold one capture to a manifest
+
+--fields
+    Two captures either side of a change that renamed, added or dropped a field
+    are not comparable line for line, and the fields that carry the round's
+    arithmetic still are. `--fields` names those: each entry is a field name, or
+    several under `|` when the two sides spell the same fact differently, and
+    the first alias present in a line is the one read. A field present on one
+    side and not the other is a difference; a field on neither is not a common
+    field of that cell and is skipped, and a group carried by some cells and not
+    others is reported as such rather than counted among the fields held
+    identical over every cell.
+
+    What it costs: the key-set check. Without `--fields` two lines are compared
+    key set and all, so a field added, dropped or renamed is a difference; with
+    it, anything outside the list is not read at all — `target` and `message`
+    included, which is how a loop that moved its event to another target reads
+    as identical. Every run therefore names the fields it did not cover, and a
+    list naming a field no line in either capture carries is exit 2 rather than
+    a pass over one fewer field than the caller asked for. The cell sets, the
+    round counts and the completeness statement are read the same way.
 
 EXIT
     0 agree, 1 a difference, 2 the comparison could not be made, 3 INCOMPLETE —
@@ -67,14 +89,16 @@ PROMPTS = (
     "virtual-memory",
 )
 EXPECTED_CELLS = {f"{p}.{q}.stable.jsonl" for p in PAIRS for q in PROMPTS}
-TOTAL_ROUNDS = 4423
+TOTAL_ROUNDS = 3862
 
-# What every round event carries, whichever of the five spellings emitted it.
+# What every round event carries.
 # Mirrors `ROUND_EVENT_FIELDS` in `crates/rmlx-models/tests/common/round_stream.rs`,
 # which is the filter the engine writes these files through — stated again here
 # because this side has to be able to refuse a file of well-formed JSON that is
-# not a round stream.
-ROUND_EVENT_FIELDS = ("round", "accept", "num_draft")
+# not a round stream. `emitted_total` is the fourth for the reason that side
+# gives: it is what a round line carries and the overrun `error!` beside it does
+# not, so a broken phase timer cannot put a second line in a round's stream.
+ROUND_EVENT_FIELDS = ("round", "accept", "num_draft", "emitted_total")
 
 
 def cells(directory: pathlib.Path) -> dict[str, pathlib.Path]:
@@ -91,8 +115,9 @@ def rounds(path: pathlib.Path) -> list[dict]:
         if absent:
             print(
                 f"{path.name}:{n} carries no {absent}. A round event carries the round's "
-                f"index, what it accepted and how many proposals it accepted them from, "
-                f"so this line is not one and this file is not a round stream.",
+                f"index, what it accepted, how many proposals it accepted them from and "
+                f"how many tokens the request had emitted by the end of it, so this line "
+                f"is not one and this file is not a round stream.",
                 file=sys.stderr,
             )
             raise SystemExit(2)
@@ -114,7 +139,41 @@ def incompleteness(names: set[str]) -> tuple[list[str], list[str]]:
     return sorted(EXPECTED_CELLS - names), sorted(names - EXPECTED_CELLS)
 
 
-def compare(a_dir: pathlib.Path, b_dir: pathlib.Path) -> int:
+def resolve(obj: dict, aliases: list[str]) -> tuple[str, object] | None:
+    """The first of `aliases` this line carries, under the name it carries it."""
+    for name in aliases:
+        if name in obj:
+            return name, obj[name]
+    return None
+
+
+def compare_fields(name: str, i: int, x: dict, y: dict, fields: list[list[str]],
+                   seen: set[int]) -> bool:
+    """Whether two round lines agree on every named field. Prints the first
+    disagreement, a field one side has and the other does not included.
+
+    `seen` collects the index of every group a line was actually read from, so
+    the caller can refuse a list naming a field nothing carries."""
+    for group, aliases in enumerate(fields):
+        got_a, got_b = resolve(x, aliases), resolve(y, aliases)
+        if got_a is not None or got_b is not None:
+            seen.add(group)
+        if got_a is None and got_b is None:
+            continue
+        if got_a is None or got_b is None:
+            side = "B" if got_a is None else "A"
+            print(f"{name} round-line {i} field {'|'.join(aliases)}: only {side} carries it",
+                  file=sys.stderr)
+            return False
+        if got_a[1] != got_b[1]:
+            print(f"{name} round-line {i} field {got_a[0]}/{got_b[0]}: "
+                  f"A={got_a[1]!r} B={got_b[1]!r}", file=sys.stderr)
+            return False
+    return True
+
+
+def compare(a_dir: pathlib.Path, b_dir: pathlib.Path,
+            fields: list[list[str]] | None = None) -> int:
     a, b = cells(a_dir), cells(b_dir)
     if not a or not b:
         print(f"no `*.stable.jsonl` cell in {a_dir if not a else b_dir}", file=sys.stderr)
@@ -124,12 +183,23 @@ def compare(a_dir: pathlib.Path, b_dir: pathlib.Path) -> int:
               f"only in B {sorted(b.keys() - a.keys())}", file=sys.stderr)
         return 1
     total = 0
+    lines_in: dict[str, int] = {}
+    # Per cell, not per run: a group carried by one pair and no other is read
+    # once and would otherwise let the summary claim it was compared over all 36.
+    seen: dict[str, set[int]] = {}
+    named = {n for group in (fields or []) for n in group}
+    skipped: set[str] = set()
     for name in a:
         ra, rb = rounds(a[name]), rounds(b[name])
         if len(ra) != len(rb):
             print(f"{name}: A ran {len(ra)} rounds and B ran {len(rb)}", file=sys.stderr)
             return 1
         for i, (x, y) in enumerate(zip(ra, rb)):
+            if fields is not None:
+                if not compare_fields(name, i, x, y, fields, seen.setdefault(name, set())):
+                    return 1
+                skipped |= (set(x) | set(y)) - named
+                continue
             if x.keys() != y.keys():
                 print(f"{name} round-line {i}: field sets differ — "
                       f"A only {sorted(x.keys() - y.keys())}, "
@@ -141,6 +211,32 @@ def compare(a_dir: pathlib.Path, b_dir: pathlib.Path) -> int:
                           file=sys.stderr)
                     return 1
         total += len(ra)
+        lines_in[name] = len(ra)
+    partial: list[tuple[str, list[str], int]] = []
+    if fields is not None:
+        with_rounds = [n for n in a if seen.get(n) is not None]
+        carried = {k: [n for n in with_rounds if k in seen[n]] for k in range(len(fields))}
+        unseen = ["|".join(fields[k]) for k, cells_ in carried.items() if not cells_]
+        if unseen:
+            print(f"--fields names {len(unseen)} field(s) no round line in either "
+                  f"capture carries: {', '.join(unseen)}. A field nothing was read "
+                  f"from is a field nothing was compared over, and a scan that found "
+                  f"nothing must not report a pass.", file=sys.stderr)
+            return 2
+        empty = sorted(set(a) - set(with_rounds))
+        if empty:
+            print(f"{len(empty)} cell(s) hold no round line, first {empty[0]}. A cell "
+                  f"with no round is a pair that did not run, which is a capture that "
+                  f"is incomplete rather than one that agreed.", file=sys.stderr)
+            return 2
+        partial = [("|".join(fields[k]), cells_, sum(lines_in[n] for n in cells_))
+                   for k, cells_ in carried.items()
+                   if 0 < len(cells_) < len(with_rounds)]
+        fields = [g for k, g in enumerate(fields)
+                  if len(carried[k]) == len(with_rounds)]
+    over = "every field" if fields is None else (
+        f"every one of {', '.join('|'.join(f) for f in fields)}" if fields
+        else "no field every cell carries")
     missing, extra = incompleteness(set(a))
     if extra:
         print(f"these captures hold {len(extra)} cell(s) the baseline is not over, "
@@ -150,10 +246,44 @@ def compare(a_dir: pathlib.Path, b_dir: pathlib.Path) -> int:
         for name in missing:
             print(f"  in neither capture: {name}", file=sys.stderr)
         print(f"INCOMPLETE: {len(a)} of {len(EXPECTED_CELLS)} cells agreed on "
-              f"{total} round lines, {len(missing)} did not run")
+              f"{total} round lines over {over}, {len(missing)} did not run")
+        report_partial(partial, len(a), total)
+        report_skipped(skipped)
         return 3
-    print(f"{len(a)} cells, {total} round lines, every field identical")
+    print(f"{len(a)} cells, {total} round lines, {over} identical")
+    report_partial(partial, len(a), total)
+    report_skipped(skipped)
     return 0
+
+
+def report_partial(partial: list[tuple[str, list[str], int]], cells_total: int,
+                   lines_total: int) -> None:
+    """Name every `--fields` group only some cells carried, and where.
+
+    The union is per loop by design — a figure a loop does not have is absent
+    from its line — so a group carried by some pairs and not others is the normal
+    case and refusing it would make the tool useless for the comparison it exists
+    for. What must not happen is the summary counting it among the fields held
+    identical over every cell. So it is moved out of that sentence and reported
+    here with the pairs that carried it, which is also where a field that was
+    *supposed* to be on every loop shows up as being on some."""
+    for group, cells_, lines in partial:
+        pairs = sorted({n.split(".")[0] for n in cells_})
+        print(f"  partial: {group} on {len(cells_)} of {cells_total} cells and "
+              f"{lines} of {lines_total} round lines ({', '.join(pairs)}) — compared "
+              f"where carried, not elsewhere")
+
+
+def report_skipped(skipped: set[str]) -> None:
+    """Name what `--fields` did not cover.
+
+    Without `--fields` the two lines are compared key set and all; with it, a
+    field added, dropped or moved outside the list is invisible. That is the
+    point of the flag and it is also how a `--fields` run reads "identical"
+    over a line that changed, so the run says which fields it did not read."""
+    if skipped:
+        print(f"  not compared ({len(skipped)}): {', '.join(sorted(skipped))} — "
+              f"carried by a capture and outside --fields")
 
 
 def manifest_lines(directory: pathlib.Path) -> list[str]:
@@ -175,14 +305,22 @@ def main(argv: list[str]) -> int:
         return 2
 
     if mode == "compare":
-        if len(argv) != 4:
+        rest = argv[4:]
+        fields = None
+        if rest[:1] == ["--fields"]:
+            if len(rest) != 2 or not rest[1]:
+                print("--fields takes one comma-separated list", file=sys.stderr)
+                return 2
+            fields = [alias.split("|") for alias in rest[1].split(",")]
+            rest = []
+        if len(argv) < 4 or rest:
             print(__doc__, file=sys.stderr)
             return 2
         other = pathlib.Path(argv[3])
         if not other.is_dir():
             print(f"{other} is not a directory", file=sys.stderr)
             return 2
-        return compare(directory, other)
+        return compare(directory, other, fields)
 
     if mode == "manifest":
         lines = manifest_lines(directory)
