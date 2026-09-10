@@ -603,6 +603,34 @@ perl -0pi -e 's/(        super::log_round\(\n(?:.*\n)*?        \);\n)/$1$1/' \
 run "a loop closing its round twice is refused" 2 \
   "\`eagle3_generate\` reaches the one round emit 2 time(s)."
 
+# 35. RULE 7 by name, by fn: a round loop that *moved* into the file that owns
+#     the target — not an eighth loop, so the census is untouched and every
+#     other reading is clean. It calls the emitter once, and the file reading
+#     exempts the path, so the loop writes a second event on the target beside
+#     the one it emitted and only the fn reading sees it. This is the direction
+#     the shared skeleton is going, which is why the exemption cannot be by file
+#     alone.
+build_root "$root"
+{
+  printf '//! The shared record and the one round emit.\n\n'
+  loop_src "eagle3_generate" "false" "plain"
+} >"$root/crates/rmlx-models/src/speculative/round_stats.rs"
+printf '//! The loop that used to live here moved into the shared record.\n' \
+  >"$root/crates/rmlx-models/src/speculative/eagle3.rs"
+perl -0pi -e 's/(        super::log_round\(\n(?:.*\n)*?        \);\n)/$1        tracing::debug!(target: PHASE_TARGET, round = rounds, "speculative round");\n/' \
+  "$root/crates/rmlx-models/src/speculative/round_stats.rs"
+run "a round loop inside the target's own file does not inherit its exemption" 2 \
+  "\`eagle3_generate\` is a round loop and names the"
+
+# 36. The needle is code, not prose. A trailing comment naming the emit on a
+#     line that is not one would otherwise count as a call, and the loop that
+#     dropped its emit would read as one that still makes it.
+build_root "$root"
+perl -0pi -e 's/        super::log_round\(\n(?:.*\n)*?        \);\n/        rounds += 1; \/\/ the round the shared log_round( would have closed\n/' \
+  "$root/crates/rmlx-models/src/speculative/eagle3.rs"
+run "a trailing comment naming the emit is not a call to it" 2 \
+  "\`eagle3_generate\` reaches the one round emit 0 time(s)."
+
 echo
 if [ "$failures" != "0" ]; then
   echo "check-spec-charge-fixtures: $failures of $cases cases failed"
