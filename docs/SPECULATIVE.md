@@ -283,10 +283,11 @@ round_ms draft_ms verify_ms walk_ms rollback_ms other_ms
 
 The field set is the union of what the loops used to report separately, so the
 one event lost none of them. A figure a loop does not have is absent from the
-line rather than present as a zero: the conditioning pair for a loop that hands
-its drafter no buffer, the drafter pair for a loop whose drafter keeps no cache,
-and every wall-clock field for the four loops that time their drafter and
-verifier over the request and no phase within a round.
+line rather than present as a zero: `condition_rows` for a loop that hands its
+drafter no buffer, `projected_rows` for one that does not project into a window
+across rounds, the drafter pair for a loop whose drafter keeps no cache, and
+every wall-clock field for the four loops that time their drafter and verifier
+over the request and no phase within a round.
 
 `n_committed` is what the round committed — the accepted prefix and the one
 token the verifier added to it, less anything the request's budget cut. It is
@@ -297,8 +298,15 @@ computed from, which the six loops counting back from the tail read after their
 verify forward and the assistant reads before its own. `d_offset_before` and
 `d_target` are the same two positions on the drafter's own cache, on their own
 arithmetic — which is what makes them a cross-check on `v_target` rather than a
-restatement of it. `condition_rows` is read from the conditioning buffer and
-`projected_rows` from what the projection returned, for the same reason.
+restatement of it.
+
+`condition_rows` is read from the conditioning buffer the round hands on, and
+what it is worth reading against differs by loop. The two block loops grow a
+window, so it moves with `projected_rows` beside it and the two are a
+cross-check: a slide that projects the right number of rows into the wrong
+window moves one and not the other. The sidecar carries a single verifier row
+and projects nothing, so it reports `condition_rows` and no `projected_rows`,
+and what that pins is that the row stays one. The rest carry neither.
 
 `other_ms` is what no phase claimed: emission, tokenizer decode, slicing and
 host bookkeeping. The four phases are disjoint sub-spans of the round, so
