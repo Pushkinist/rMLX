@@ -83,8 +83,16 @@ python3 scripts/spec_round_stream_compare.py compare <dir-a> <dir-b> \
 ```
 
 A field present on one side and not the other is a difference; a field on
-neither is not a common field of that cell and is skipped. Everything else about
-the comparison is unchanged, the completeness statement included.
+neither is not a common field of that cell and is skipped.
+
+What `--fields` costs is the key-set check. A digest and a plain `compare` read
+the whole line, so a field added, dropped or moved is a difference; under
+`--fields` anything outside the list is not read at all — `target` and `message`
+included, which is how a loop that moved its round event to another target reads
+as identical. Every run therefore prints the fields it did not cover, and a list
+naming a field no line in either capture carries is exit 2 rather than a pass
+over one fewer field than was asked for. The cell sets, the round counts and the
+completeness statement are read the same way.
 
 ## Regenerating
 
