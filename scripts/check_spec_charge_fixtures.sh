@@ -58,11 +58,14 @@ loop_src() {
             $token,
             device,
         )?;
-        super::RoundPhases {
-            round_ns: 0,
-            charged: $token,
-        }
-        .log(SpecLoop::Kind, rounds, accept, num_draft, &[]);
+        super::log_round(
+            &super::RoundReport {
+                loop_kind: SpecLoop::Kind,
+                round: rounds,
+                charged: $token,
+            },
+            &[],
+        );
     }
     log_request_record(
         &RoundTotals {
@@ -518,7 +521,7 @@ run "a helper that builds its own totals joins the population and is refused" 2 
 #     through, and in the tree the same shape does not compile — the low-level
 #     rollback is private to `round_common`.
 build_root "$root"
-perl -0pi -e 's/        super::RoundPhases \{/        super::rollback_round_caches(\n            \&mut v_caches,\n            None,\n            \&v_input,\n            0,\n            0,\n            false,\n            device,\n        )?;\n        super::RoundPhases {/' \
+perl -0pi -e 's/        super::log_round\(/        super::rollback_round_caches(\n            \&mut v_caches,\n            None,\n            \&v_input,\n            0,\n            0,\n            false,\n            device,\n        )?;\n        super::log_round(/' \
   "$root/crates/rmlx-models/src/speculative/mtp.rs"
 run "a loop reaching past the shared rollback to the low-level one is a scan error" 2 \
   "\`mtp_generate\` makes 1 call(s) to the low-level"

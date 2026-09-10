@@ -895,20 +895,30 @@ pub fn mtp_generate(
         b = *new_tokens.last().unwrap_or(&b);
         draft_pos += n_committed as i32;
 
-        super::RoundPhases {
-            round_ns: round_t0.elapsed().as_nanos(),
-            draft_ns: round_draft_ns,
-            verify_ns: round_verify_ns,
-            walk_ns: round_walk_ns,
-            rollback_ns: round_rollback_ns,
-            refolded: v_target < v_offset_before,
-            charged: charge_phases,
-        }
-        .log(
-            super::SpecLoop::MtpSidecar,
-            rounds,
-            accept,
-            draft_tokens.len(),
+        super::log_round(
+            &super::RoundReport {
+                loop_kind: super::SpecLoop::MtpSidecar,
+                round: rounds,
+                accept,
+                num_draft: draft_tokens.len(),
+                n_committed,
+                emitted_total: emitted.len(),
+                condition_rows: None,
+                projected_rows: None,
+                v_offset_before,
+                v_target,
+                d_offset_before: Some(draft_start),
+                d_target: Some(d_target),
+                refolded: v_target < v_offset_before,
+                charged: charge_phases,
+                phases: Some(super::RoundPhases {
+                    round_ns: round_t0.elapsed().as_nanos(),
+                    draft_ns: round_draft_ns,
+                    verify_ns: round_verify_ns,
+                    walk_ns: round_walk_ns,
+                    rollback_ns: round_rollback_ns,
+                }),
+            },
             &[("h_cond", &h_cond)],
         );
     }

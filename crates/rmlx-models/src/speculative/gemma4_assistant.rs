@@ -977,21 +977,33 @@ pub fn mtp_assistant_generate(
         }
         let round_rollback_ns = t0.elapsed().as_nanos();
 
-        super::RoundPhases {
-            round_ns: round_t0.elapsed().as_nanos(),
-            draft_ns: round_draft_ns,
-            verify_ns: round_verify_ns,
-            walk_ns: round_walk_ns,
-            rollback_ns: round_rollback_ns,
-            // Full attention: the rollback is a K/V tail slice, never a refold.
-            refolded: false,
-            charged: charge_phases,
-        }
-        .log(
-            super::SpecLoop::MtpAssistant,
-            rounds,
-            accept,
-            draft_tokens.len(),
+        super::log_round(
+            &super::RoundReport {
+                loop_kind: super::SpecLoop::MtpAssistant,
+                round: rounds,
+                accept,
+                num_draft: draft_tokens.len(),
+                n_committed: new_tokens.len(),
+                emitted_total: emitted.len(),
+                condition_rows: None,
+                projected_rows: None,
+                v_offset_before: pre_round_offset,
+                v_target,
+                // The drafter shares the verifier's K/V and keeps no cache of
+                // its own to roll back.
+                d_offset_before: None,
+                d_target: None,
+                // Full attention: the rollback is a K/V tail slice, never a refold.
+                refolded: false,
+                charged: charge_phases,
+                phases: Some(super::RoundPhases {
+                    round_ns: round_t0.elapsed().as_nanos(),
+                    draft_ns: round_draft_ns,
+                    verify_ns: round_verify_ns,
+                    walk_ns: round_walk_ns,
+                    rollback_ns: round_rollback_ns,
+                }),
+            },
             &[
                 ("hidden", &hidden),
                 ("sliding_k", &sliding_kv.0),

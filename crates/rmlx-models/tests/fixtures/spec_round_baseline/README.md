@@ -9,9 +9,9 @@
 
 ## What it pins, and what it does not
 
-Each round loop closes every round with a `tracing` event. The manifest pins
+Each round loop closes every round with one `tracing` event. The manifest pins
 the **whole sequence of those events** for one run of each of the six pairs
-over each of the six prompts — 36 cells, 4423 rounds — in the timing-free form
+over each of the six prompts — 36 cells, 3862 rounds — in the timing-free form
 the run writes beside the full stream: the same JSON objects with every
 wall-clock `*_ms` field dropped, because those move between two runs of one
 engine and a digest over them compares two machines' load.

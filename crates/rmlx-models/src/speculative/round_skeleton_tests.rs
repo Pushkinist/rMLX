@@ -42,9 +42,9 @@
 //!
 //! - **The per-round event stream** sees the round's shape — block, accept,
 //!   proposals, committed rows — and is blind to the *values* inside it: two
-//!   runs agreeing on every count can still be scoring different logits, and a
-//!   loop that emits no such event (four of the seven do not; see below) is
-//!   invisible to it entirely.
+//!   runs agreeing on every count can still be scoring different logits. Every
+//!   loop emits one event of one shape, so a figure a loop does not carry is
+//!   absent from its lines and is invisible to the stream for that loop.
 //! - **The accept counters** see the aggregate and are blind to which round
 //!   moved: a round that accepted one too many and a later one that accepted one
 //!   too few sum to the same request.

@@ -1218,17 +1218,26 @@ pub fn eagle3_generate(
         d_seed_tok = Some(seed_tok);
         b = correction;
 
-        tracing::debug!(
-            round = rounds,
-            accept,
-            num_draft = draft_tokens.len(),
-            n_committed,
-            emitted_total = emitted.len(),
-            v_offset_before,
-            v_target,
-            draft_pre_round_offset,
-            draft_cache_after = drafter.cache_offset(),
-            "eagle3 round"
+        super::log_round(
+            &super::RoundReport {
+                loop_kind: super::SpecLoop::Eagle3,
+                round: rounds,
+                accept,
+                num_draft: draft_tokens.len(),
+                n_committed,
+                emitted_total: emitted.len(),
+                condition_rows: None,
+                projected_rows: None,
+                v_offset_before,
+                v_target,
+                d_offset_before: Some(draft_pre_round_offset),
+                d_target: Some(drafter.cache_offset()),
+                refolded: v_target < v_offset_before,
+                // This loop times no phases, so it never charges one.
+                charged: false,
+                phases: None,
+            },
+            &[],
         );
     }
 

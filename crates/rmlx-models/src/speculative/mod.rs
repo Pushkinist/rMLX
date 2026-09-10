@@ -52,7 +52,9 @@ use crate::decode_loop::ProbeStep;
 pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 pub(crate) use round_common::RoundTotals;
-pub(crate) use round_stats::{phases_charged, RoundPhases, RoundStats, SpecLoop};
+pub(crate) use round_stats::{
+    log_round, phases_charged, RoundPhases, RoundReport, RoundStats, SpecLoop,
+};
 
 /// Guard the one verifier logit row a speculative driver selects from at
 /// prefill.
@@ -904,21 +906,28 @@ impl SpeculativeDispatcher {
                 d_seed = vec![next_y_token];
             }
 
-            tracing::debug!(
-                round = rounds,
-                accept,
-                num_draft = draft_tokens.len(),
-                // What the round emitted, which is `accept + 1` unless the
-                // request's token budget ran out mid-block. It used to be
-                // `accept + 1` unconditionally, so the two differ in the last
-                // round of a request that stops mid-block.
-                emitted_round = new_tokens.len(),
-                emitted_total = emitted.len(),
-                v_offset_before,
-                v_target,
-                d_offset_before,
-                d_target,
-                "spec round (cached)"
+            log_round(
+                &RoundReport {
+                    loop_kind: SpecLoop::TwoModelGreedy,
+                    round: rounds,
+                    accept,
+                    num_draft: draft_tokens.len(),
+                    // What the round committed, which is `accept + 1` unless
+                    // the request's token budget ran out mid-block.
+                    n_committed: new_tokens.len(),
+                    emitted_total: emitted.len(),
+                    condition_rows: None,
+                    projected_rows: None,
+                    v_offset_before,
+                    v_target,
+                    d_offset_before: Some(d_offset_before),
+                    d_target: Some(d_target),
+                    refolded: v_target < v_offset_before,
+                    // This loop times no phases, so it never charges one.
+                    charged: false,
+                    phases: None,
+                },
+                &[],
             );
         }
 
@@ -1276,17 +1285,26 @@ impl SpeculativeDispatcher {
                 d_seed = vec![next_y_token];
             }
 
-            tracing::debug!(
-                round = rounds,
-                accept,
-                num_draft = draft_tokens.len(),
-                rejected = correction.is_some(),
-                emitted_total = emitted.len(),
-                v_offset_before,
-                v_target,
-                d_offset_before,
-                d_target,
-                "spec round (stochastic)"
+            log_round(
+                &RoundReport {
+                    loop_kind: SpecLoop::TwoModelStochastic,
+                    round: rounds,
+                    accept,
+                    num_draft: draft_tokens.len(),
+                    n_committed: round_tokens.len(),
+                    emitted_total: emitted.len(),
+                    condition_rows: None,
+                    projected_rows: None,
+                    v_offset_before,
+                    v_target,
+                    d_offset_before: Some(d_offset_before),
+                    d_target: Some(d_target),
+                    refolded: v_target < v_offset_before,
+                    // This loop times no phases, so it never charges one.
+                    charged: false,
+                    phases: None,
+                },
+                &[],
             );
         }
 

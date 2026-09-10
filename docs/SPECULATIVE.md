@@ -269,20 +269,42 @@ numbers:
   and much smaller.
 
 Per-round attribution comes from the `speculative round` event, target
-`rmlx::spec::phase`, one per round at `debug`, emitted by one shared
-`RoundPhases::log` so the three loops cannot drift into three record shapes:
+`rmlx::spec::phase`, one per round at `debug`. **Every** round loop emits it,
+through the one `round_stats::log_round`, so a round of one drafter and a round
+of another are read by the same query and a field added for one is added for
+all:
 
 ```
-loop_kind round accept num_draft refolded charged
+loop_kind round accept num_draft n_committed emitted_total
+condition_rows projected_rows
+v_offset_before v_target d_offset_before d_target refolded charged
 round_ms draft_ms verify_ms walk_ms rollback_ms other_ms
 ```
+
+The field set is the union of what the loops used to report separately, so the
+one event lost none of them. A figure a loop does not have is absent from the
+line rather than present as a zero: the conditioning pair for a loop that keeps
+no buffer across rounds, the drafter pair for a loop whose drafter keeps no
+cache, and every wall-clock field for the four loops that time their drafter and
+verifier over the request and no phase within a round.
+
+`n_committed` is what the round committed — the accepted prefix and the one
+token the verifier added to it, less anything the request's budget cut.
+`v_offset_before` is the verifier offset that round's rollback target was
+computed from, which the six loops counting back from the tail read after their
+verify forward and the assistant reads before its own. `d_offset_before` and
+`d_target` are the same two positions on the drafter's own cache, on their own
+arithmetic — which is what makes them a cross-check on `v_target` rather than a
+restatement of it. `condition_rows` is read from the conditioning buffer and
+`projected_rows` from what the projection returned, for the same reason.
 
 `other_ms` is what no phase claimed: emission, tokenizer decode, slicing and
 host bookkeeping. The four phases are disjoint sub-spans of the round, so
 claiming more than the round has means a timer started outside it — that is an
-`error!` naming the phases rather than an `other_ms` near zero that reads like
-rounding. `refolded` says whether that round took the recurrent arm of
-`rollback_round`.
+`error!` naming the phases, and the round is still reported with no `other_ms`.
+`refolded` says whether that round's rollback refolded a recurrent state; the
+assistant's verifier is full attention and keeps none, so its rounds report
+`false`.
 
 `charged` is the field that says how to read the rest. At `debug` the phases are
 timed but not forced, so the lazy tails above still move between them. At
@@ -311,7 +333,7 @@ trusted.** Each loop forces the things it produces, one call at a time, and the
 way that fails is by omission: four of the five arrays a round builds get forced
 and the fifth is still a graph node when the next round's drafter reads it. No
 timing assertion can see that, because the number it produces is a plausible
-one. `RoundPhases::log` therefore takes the arrays the round hands to its
+one. `log_round` therefore takes the arrays the round hands to its
 successor, under the names the loop calls them, and on a charged round reports
 any that are still unevaluated — `Array::is_available`, which asks MLX for the
 array's status rather than inferring it from a clock. The three omissions it

@@ -880,16 +880,28 @@ pub fn dflash_generate(
         }
         b = *new_tokens.last().unwrap_or(&b);
 
-        tracing::debug!(
-            round = rounds,
-            accept,
-            num_draft = draft_tokens.len(),
-            n_committed,
-            projected_rows,
-            emitted_total = emitted.len(),
-            v_offset_before,
-            v_target,
-            "dflash round"
+        super::log_round(
+            &super::RoundReport {
+                loop_kind: super::SpecLoop::DFlash,
+                round: rounds,
+                accept,
+                num_draft: draft_tokens.len(),
+                n_committed,
+                emitted_total: emitted.len(),
+                condition_rows: h_ctx.shape().get(1).copied(),
+                projected_rows: Some(projected_rows),
+                v_offset_before,
+                v_target,
+                // No drafter cache: the block drafter is conditioned on
+                // `h_ctx` and re-reads it every round.
+                d_offset_before: None,
+                d_target: None,
+                refolded: v_target < v_offset_before,
+                // This loop times no phases, so it never charges one.
+                charged: false,
+                phases: None,
+            },
+            &[],
         );
     }
 

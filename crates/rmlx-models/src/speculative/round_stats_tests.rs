@@ -518,8 +518,6 @@ fn phases(round_ns: u128, draft_ns: u128, verify_ns: u128) -> super::RoundPhases
         verify_ns,
         walk_ns: 1_000_000,
         rollback_ns: 2_000_000,
-        refolded: true,
-        charged: true,
     }
 }
 
@@ -550,8 +548,6 @@ fn a_round_with_one_phase_and_nothing_else_claims_all_of_it() {
         verify_ns: 0,
         walk_ns: 0,
         rollback_ns: 0,
-        refolded: false,
-        charged: false,
     };
     assert_eq!(p.unclaimed_ns(), Some(0));
 }
@@ -646,15 +642,29 @@ fn phase_errors(f: impl FnOnce()) -> Vec<String> {
         .collect()
 }
 
-fn charged_round(charged: bool) -> super::RoundPhases {
-    super::RoundPhases {
-        round_ns: 10_000_000,
-        draft_ns: 4_000_000,
-        verify_ns: 4_000_000,
-        walk_ns: 1_000_000,
-        rollback_ns: 1_000_000,
+fn charged_round(charged: bool) -> super::RoundReport {
+    super::RoundReport {
+        loop_kind: SpecLoop::DFlash2,
+        round: 7,
+        accept: 3,
+        num_draft: 4,
+        n_committed: 4,
+        emitted_total: 29,
+        condition_rows: Some(31),
+        projected_rows: Some(4),
+        v_offset_before: 100,
+        v_target: 103,
+        d_offset_before: None,
+        d_target: None,
         refolded: false,
         charged,
+        phases: Some(super::RoundPhases {
+            round_ns: 10_000_000,
+            draft_ns: 4_000_000,
+            verify_ns: 4_000_000,
+            walk_ns: 1_000_000,
+            rollback_ns: 1_000_000,
+        }),
     }
 }
 
@@ -691,7 +701,7 @@ fn only_the_array_nobody_forced_is_named() {
 fn a_charged_round_that_left_its_carry_lazy_names_it() {
     let (_, lazy) = forced_and_lazy();
     let errors = phase_errors(|| {
-        charged_round(true).log(SpecLoop::DFlash2, 7, 3, 4, &[("h_ctx", &lazy)]);
+        super::log_round(&charged_round(true), &[("h_ctx", &lazy)]);
     });
     let [reason] = errors.as_slice() else {
         panic!("exactly one report per round, got: {errors:?}");
@@ -717,7 +727,7 @@ fn a_charged_round_that_forced_its_carry_is_silent() {
     let (_, lazy) = forced_and_lazy();
     lazy.eval().expect("eval failed");
     let errors = phase_errors(|| {
-        charged_round(true).log(SpecLoop::DFlash2, 7, 3, 4, &[("h_ctx", &lazy)]);
+        super::log_round(&charged_round(true), &[("h_ctx", &lazy)]);
     });
     assert!(
         errors.is_empty(),
@@ -732,7 +742,7 @@ fn a_charged_round_that_forced_its_carry_is_silent() {
 fn an_uncharged_round_is_not_asked_where_its_work_went() {
     let (_, lazy) = forced_and_lazy();
     let errors = phase_errors(|| {
-        charged_round(false).log(SpecLoop::DFlash2, 7, 3, 4, &[("h_ctx", &lazy)]);
+        super::log_round(&charged_round(false), &[("h_ctx", &lazy)]);
     });
     assert!(
         errors.is_empty(),

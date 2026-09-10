@@ -3053,33 +3053,26 @@ fn write_round_stream(test: &str, prompt: &str, rounds: &[CapturedEvent]) {
     );
 }
 
-/// One round in each shape a loop emits, on the target that loop emits it on,
-/// followed by a request-level line that is not a round.
-fn emit_one_round_of_each_shape() {
+/// A round in the shape every loop emits, one from a loop that keeps no phase
+/// split, and a request-level line that is not a round.
+fn emit_two_rounds_and_a_request_line() {
     tracing::debug!(
         target: PHASE_SWITCH_TARGET,
         round = 3,
         accept = 2,
         num_draft = 4,
+        n_committed = 3,
+        projected_rows = 3,
         round_ms = 20.5,
         "speculative round"
     );
     tracing::debug!(
-        target: "rmlx_models::speculative::eagle3",
-        round = 3,
+        target: PHASE_SWITCH_TARGET,
+        round = 4,
         accept = 2,
         num_draft = 4,
         n_committed = 3,
-        "eagle3 round"
-    );
-    tracing::debug!(
-        target: "rmlx_models::speculative::dflash",
-        round = 3,
-        accept = 2,
-        num_draft = 4,
-        n_committed = 3,
-        projected_rows = 3,
-        "dflash round"
+        "speculative round"
     );
     tracing::debug!(target: "rmlx_models::speculative", "a request-level line, not a round");
 }
@@ -3087,11 +3080,10 @@ fn emit_one_round_of_each_shape() {
 /// The recorder keeps a round as a loop emits one, and charges no phase doing
 /// it.
 ///
-/// The events below are emitted at the targets the loops use, and two of those
-/// targets are themselves behaviour switches: the shared round event sits on
-/// the phase target and EAGLE-3's on its own module. A capture that declined
-/// the target rather than the level would return nothing for either, which is
-/// four of the seven loops.
+/// The events below are emitted at the target every loop's round event uses,
+/// and that target is itself a behaviour switch — the phases are charged when
+/// it is enabled at TRACE. A capture that declined the target rather than the
+/// level would return no round at all.
 ///
 /// Mutation: in `RoundStreamRecorder::enabled`, answer `false` for every
 /// metadata whose target is in `BEHAVIOUR_SWITCH_TARGETS`.
@@ -3104,15 +3096,15 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
         assert!(
             !tracing::enabled!(target: "rmlx_models::speculative::eagle3", tracing::Level::TRACE)
         );
-        emit_one_round_of_each_shape();
+        emit_two_rounds_and_a_request_line();
     });
 
     let captured = recorder.events();
     let rounds = round_events(&captured);
     assert_eq!(
         rounds.len(),
-        3,
-        "three rounds were emitted and the request-level line is not one: {rounds:?}"
+        2,
+        "two rounds were emitted and the request-level line is not one: {rounds:?}"
     );
     // The negative control has to be excluded for the reason `round_events`
     // gives, not by luck: a request-level line that grew all three fields would
@@ -3130,8 +3122,12 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
          of {ROUND_EVENT_FIELDS:?}, so it no longer shows anything: {:?}",
         control[0]
     );
-    assert_eq!(rounds[1].field("n_committed"), Some("3"));
-    assert_eq!(rounds[2].field("projected_rows"), Some("3"));
+    assert_eq!(rounds[0].field("n_committed"), Some("3"));
+    assert_eq!(rounds[0].field("projected_rows"), Some("3"));
+    // A loop that carries no conditioning buffer, and no phase split, leaves
+    // both off its line rather than reporting a zero for either.
+    assert_eq!(rounds[1].field("projected_rows"), None);
+    assert_eq!(rounds[1].field("round_ms"), None);
 
     let line: serde_json::Value =
         serde_json::from_str(&rounds[0].json_line()).expect("a round renders as one JSON object");
