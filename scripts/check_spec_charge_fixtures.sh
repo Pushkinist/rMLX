@@ -631,6 +631,20 @@ perl -0pi -e 's/        super::log_round\(\n(?:.*\n)*?        \);\n/        roun
 run "a trailing comment naming the emit is not a call to it" 2 \
   "\`eagle3_generate\` reaches the one round emit 0 time(s)."
 
+# 37. Every needle reads code. A doc comment in a non-loop file naming the
+#     target is prose, not a second event on it — and the chunk that puts a
+#     round emit behind a skeleton wrapper has to write exactly this sentence in
+#     `round_common.rs`.
+build_root "$root"
+cat >>"$root/crates/rmlx-models/src/speculative/round_common.rs" <<'RS'
+
+/// The per-round event goes out on `PHASE_TARGET`, and every loop reaches it
+/// through the one `log_round(` call this gate counts.
+fn seam_note() {}
+RS
+run "a doc comment naming the target and the emit is prose, not either" 0 \
+  "7 speculative round loops, each naming one charge decision"
+
 echo
 if [ "$failures" != "0" ]; then
   echo "check-spec-charge-fixtures: $failures of $cases cases failed"

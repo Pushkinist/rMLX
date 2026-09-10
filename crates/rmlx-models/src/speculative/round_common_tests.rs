@@ -995,8 +995,12 @@ fn a_round_stopped_by_its_own_token_reports_what_it_emitted() {
 /// `Ok(true)` from the end of `refold_lin_tapes`. Either fails this.
 #[test]
 fn a_partial_rollback_over_a_stack_with_nothing_to_refold_says_so() {
-    let state_in = tape_zero_state();
-    let mut lin = vec![armed(vec![], &state_in), armed(vec![], &state_in)];
+    // A pre-round state neither slot records: `armed` pushes it per segment and
+    // these have none, which is what makes them the full-attention shape.
+    let mut lin = vec![
+        armed(vec![], &tape_zero_state()),
+        armed(vec![], &tape_zero_state()),
+    ];
     let refolded = rollback_round(
         &mut [],
         Some(&mut lin),

@@ -550,6 +550,14 @@ fn rollback_round_caches(
 /// every loop reports it, and a loop re-deriving it from its own offsets says
 /// `true` for a full-attention or dense verifier that refolded nothing.
 ///
+/// Nothing forces a caller to read it. `rollback_round(…)?;` compiles and drops
+/// the answer — two call sites do that on purpose, the drafter-side arms of the
+/// two-model loops, whose answer is not the round's — and `make
+/// check-spec-charge` reads this call for its `charge` argument and not for what
+/// it returns. A loop that stopped reporting the flag and re-derived it would be
+/// caught by the round stream only on a pair whose verifier keeps no recurrent
+/// state, and the baseline has none.
+///
 /// # Errors
 ///
 /// [`rmlx_core::error::Error::Model`] when the refold cannot replay the

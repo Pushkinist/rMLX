@@ -92,10 +92,11 @@
 #   is named in `round_stats.rs` alone. It is not the only copy of the string in
 #   the repo — `tests/common/round_stream.rs` restates the literal, because the
 #   constant is private and a capture has to name the target it declines to
-#   enable at TRACE. That copy is outside this scan and is held to the engine's
-#   by an assertion in `tests/spec_greedy_equivalence.rs`; what this rule
-#   enforces is the engine half. A loop that keeps its charge decision honest
-#   and writes its own
+#   enable at TRACE. That copy is outside this scan; it is held to the engine's
+#   by `the_engine_and_its_readers_state_the_same_target_and_round_fields` in
+#   `tests/spec_greedy_equivalence.rs`, which reads `round_stats.rs` and looks
+#   for the declaration. What this rule enforces is the engine half. A loop that
+#   keeps its charge decision honest and writes its own
 #   `tracing::debug!` on that target, with the same fields in the same order,
 #   produces a byte-identical line — so the pinned round-stream digests agree,
 #   the equivalence pairs agree, and this gate's own census agrees. Measured:
@@ -111,9 +112,16 @@
 #   `round_stats.rs` does not inherit that file's exemption — it would otherwise
 #   call the emit once, satisfy every other reading, and write a second event on
 #   the target beside it. **By call**: each round loop calls `log_round(` exactly
-#   once, at a statement position and off a line with its trailing comment
-#   removed. Zero is a loop that left the seam; two or more is a second record
-#   shape under one target, which is the shape the collapse removed.
+#   once, at a statement position. Zero is a loop that left the seam; two or more
+#   is a second record shape under one target, which is the shape the collapse
+#   removed.
+#
+#   Every needle in this gate reads a line's code and not the comment beside it,
+#   including this rule's by-file reading. A gate that read comments would go red
+#   on the sentence explaining the seam — which the chunk introducing a skeleton
+#   wrapper has to write in `round_common.rs` — and would count a `// … log_round(`
+#   note as the call a loop no longer makes. The stripper is quote-aware, so a
+#   `//` inside a string literal does not truncate the line.
 #
 #   The name is private to `round_stats.rs` in the tree, so the name reading is
 #   a second reader on a property the compiler already holds — and the compiler
@@ -128,7 +136,7 @@
 #   `rollback_round` — and, as there, the old seam has to become unreachable
 #   from the loops, or the gate has lost a defect class rather than followed
 #   it.
-
+#
 # RULE 5 (nothing names the decision outside the population either)
 #   A fn that is not a round loop and carries a `charged:` field names a
 #   decision this gate cannot check against a rollback, because there is none in
@@ -203,9 +211,26 @@ fi
 # A function opens at a `fn` item and closes when its brace depth returns to
 # zero. A nested `fn` inside a body is not opened: the enclosing loop is the
 # unit the rules are about.
+# A line's code, with any comment removed. Quote-aware, so a `//` inside a string
+# literal is not a comment and the line is not truncated at it. Shared by both of
+# this gate's readings: every needle below is a substring test, and a name is
+# most likely to be written without being used in the sentence explaining it.
+readonly DECOMMENT='
+      function decomment(s,   i, n, q, ch) {
+        n = length(s); q = 0
+        for (i = 1; i <= n; i++) {
+          ch = substr(s, i, 1)
+          if (q && ch == "\\") { i++; continue }
+          if (ch == "\"") { q = !q; continue }
+          if (!q && ch == "/" && substr(s, i + 1, 1) == "/") { return substr(s, 1, i - 1) }
+        }
+        return s
+      }
+'
+
 records=$(
   find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
-    xargs -0 awk '
+    xargs -0 awk "$DECOMMENT"'
       function addtok(t) { if (!(t in toks)) { toks[t] = 1 } }
       function reset() {
         in_sig = 0; awaiting_body = 0; in_body = 0; in_call = 0; fname = ""
@@ -280,39 +305,30 @@ records=$(
       !in_body { next }
 
       # -- inside a function body ------------------------------------------
-      {
-        stripped = $0
-        sub(/^[[:space:]]*\/\/.*$/, "", stripped)
-        # A trailing comment on a code line is not code. Without this a `//`
-        # note mentioning the emit or the target counts as one — the needles
-        # below are substrings, and a comment is where a name is most likely to
-        # be written without being used.
-        code = stripped
-        sub(/[[:space:]]\/\/.*$/, "", code)
-      }
+      { code = decomment($0) }
 
       in_call {
-        if (stripped ~ /^[[:space:]]*\)/) {
+        if (code ~ /^[[:space:]]*\)/) {
           close_call()
-        } else if (stripped ~ /[^[:space:]]/) {
-          arg = stripped
+        } else if (code ~ /[^[:space:]]/) {
+          arg = code
           gsub(/^[[:space:]]+|[[:space:]]*,[[:space:]]*$/, "", arg)
           args = (args == "") ? arg : args "\x1f" arg
         }
         next
       }
 
-      index(stripped, "RoundTotals {") > 0 { has_stats = 1 }
+      index(code, "RoundTotals {") > 0 { has_stats = 1 }
 
       # Three answers, not two. A plain `let charge_phases = <expr>;` is a
       # binding this scan reads: it is the call and nothing else, or it is a
       # different decision. Anything else naming the binding — a `mut`, a type
       # annotation, a right-hand side that does not end on the line — is a shape
       # it cannot read, which is a scan error and not a verdict about the loop.
-      index(stripped, "charge_phases") > 0 && stripped ~ /^[[:space:]]*let[[:space:]]/ {
-        if (stripped ~ /^[[:space:]]*let[[:space:]]+charge_phases[[:space:]]*=[[:space:]]*([A-Za-z_0-9]+::)*phases_charged\(\);[[:space:]]*$/) {
+      index(code, "charge_phases") > 0 && code ~ /^[[:space:]]*let[[:space:]]/ {
+        if (code ~ /^[[:space:]]*let[[:space:]]+charge_phases[[:space:]]*=[[:space:]]*([A-Za-z_0-9]+::)*phases_charged\(\);[[:space:]]*$/) {
           bind_ok = 1
-        } else if (stripped ~ /^[[:space:]]*let[[:space:]]+charge_phases[[:space:]]*=.*;[[:space:]]*$/) {
+        } else if (code ~ /^[[:space:]]*let[[:space:]]+charge_phases[[:space:]]*=.*;[[:space:]]*$/) {
           bind_bad = 1
         } else {
           bind_odd = 1
@@ -323,9 +339,9 @@ records=$(
       # call written on one line is a shape this scan does not read back.
       # `rollback_round_caches(` does not contain this needle, so the shared
       # helper forwarding its own `charge` is not a site.
-      index(stripped, "rollback_round(") > 0 &&
-      stripped !~ /fn[[:space:]]+rollback_round\(/ {
-        rest = stripped
+      index(code, "rollback_round(") > 0 &&
+      code !~ /fn[[:space:]]+rollback_round\(/ {
+        rest = code
         sub(/^.*rollback_round\(/, "", rest)
         if (rest ~ /[^[:space:]]/) { addtok("?"); nroll++ } else { in_call = 1; args = "" }
       }
@@ -333,9 +349,9 @@ records=$(
       # RULE 6: the low-level pair the shared rollback is built on. Their own
       # definitions are not calls, and neither is `rollback_round_caches` inside
       # the shared rollback — that fn is not a round loop.
-      (index(stripped, "rollback_round_caches(") > 0 ||
-       index(stripped, "refold_lin_tapes(") > 0) &&
-      stripped !~ /fn[[:space:]]+(rollback_round_caches|refold_lin_tapes)[[:space:]]*\(/ {
+      (index(code, "rollback_round_caches(") > 0 ||
+       index(code, "refold_lin_tapes(") > 0) &&
+      code !~ /fn[[:space:]]+(rollback_round_caches|refold_lin_tapes)[[:space:]]*\(/ {
         nlow++
       }
 
@@ -359,8 +375,8 @@ records=$(
       # Symmetric with the rollback side: any `charged:` is a site, and one
       # whose value is not a bare identifier is unreadable rather than absent.
       # A trailing comma is not required — a record`s last field carries none.
-      index(stripped, "charged:") > 0 {
-        tok = stripped
+      index(code, "charged:") > 0 {
+        tok = code
         sub(/^.*charged:[[:space:]]*/, "", tok)
         if (tok ~ /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*(,|\}|$)/) {
           sub(/[^A-Za-z0-9_].*$/, "", tok)
@@ -396,7 +412,11 @@ lowlevel=$(printf '%s\n' "$records" |
 # cannot open.
 target_strays=$(
   find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
-    xargs -0 grep -l -e 'PHASE_TARGET' -e 'rmlx::spec::phase' 2>/dev/null |
+    xargs -0 awk "$DECOMMENT"'
+      { c = decomment($0) }
+      (index(c, "PHASE_TARGET") > 0 || index(c, "rmlx::spec::phase") > 0) &&
+      !(FILENAME in seen) { seen[FILENAME] = 1; print FILENAME }
+    ' |
     grep -v -x -F "$loops_dir/round_stats.rs"
 )
 # RULE 7 by name, by fn: a round loop that moved into `round_stats.rs` does not

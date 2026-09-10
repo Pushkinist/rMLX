@@ -293,6 +293,18 @@ over the request and no phase within a round.
 token the verifier added to it, less anything the request's budget cut. It is
 counted where the tokens reach the sink and reported from there, so a block the
 budget clipped is not reported as committed to a rollback that did not keep it.
+
+`emitted_total` is `emitted.len()` at the end of the round: every token the
+request has handed the sink, **the seed included**. The five sidecar loops
+argmax one token out of the prefill forward and emit it before the first round,
+so on those this figure is one above the tokens the rounds produced.
+**It is not the `emitted_total` `scripts/lib/spec_round_log.py` prints**, which
+sums `emitted_in_rounds` over a run's done records and excludes the seed for the
+reason § "A round's tokens are the ones a round produced" gives — so the two
+differ by `seed_emitted` on every sidecar loop, permanently, and a reader
+comparing one against the other is comparing two definitions. Renaming either
+moves every digest in the pinned round-stream baseline, so the collision is
+recorded here rather than resolved in this chunk.
 `v_offset_before` is the verifier offset that round's rollback target was
 computed from, which the six loops counting back from the tail read after their
 verify forward and the assistant reads before its own. `d_offset_before` and

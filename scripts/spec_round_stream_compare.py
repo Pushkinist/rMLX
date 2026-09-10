@@ -115,8 +115,9 @@ def rounds(path: pathlib.Path) -> list[dict]:
         if absent:
             print(
                 f"{path.name}:{n} carries no {absent}. A round event carries the round's "
-                f"index, what it accepted and how many proposals it accepted them from, "
-                f"so this line is not one and this file is not a round stream.",
+                f"index, what it accepted, how many proposals it accepted them from and "
+                f"how many tokens the request had emitted by the end of it, so this line "
+                f"is not one and this file is not a round stream.",
                 file=sys.stderr,
             )
             raise SystemExit(2)
@@ -182,6 +183,7 @@ def compare(a_dir: pathlib.Path, b_dir: pathlib.Path,
               f"only in B {sorted(b.keys() - a.keys())}", file=sys.stderr)
         return 1
     total = 0
+    lines_in: dict[str, int] = {}
     # Per cell, not per run: a group carried by one pair and no other is read
     # once and would otherwise let the summary claim it was compared over all 36.
     seen: dict[str, set[int]] = {}
@@ -209,7 +211,8 @@ def compare(a_dir: pathlib.Path, b_dir: pathlib.Path,
                           file=sys.stderr)
                     return 1
         total += len(ra)
-    partial: list[tuple[str, list[str]]] = []
+        lines_in[name] = len(ra)
+    partial: list[tuple[str, list[str], int]] = []
     if fields is not None:
         with_rounds = [n for n in a if seen.get(n) is not None]
         carried = {k: [n for n in with_rounds if k in seen[n]] for k in range(len(fields))}
@@ -220,7 +223,13 @@ def compare(a_dir: pathlib.Path, b_dir: pathlib.Path,
                   f"from is a field nothing was compared over, and a scan that found "
                   f"nothing must not report a pass.", file=sys.stderr)
             return 2
-        partial = [("|".join(fields[k]), cells_)
+        empty = sorted(set(a) - set(with_rounds))
+        if empty:
+            print(f"{len(empty)} cell(s) hold no round line, first {empty[0]}. A cell "
+                  f"with no round is a pair that did not run, which is a capture that "
+                  f"is incomplete rather than one that agreed.", file=sys.stderr)
+            return 2
+        partial = [("|".join(fields[k]), cells_, sum(lines_in[n] for n in cells_))
                    for k, cells_ in carried.items()
                    if 0 < len(cells_) < len(with_rounds)]
         fields = [g for k, g in enumerate(fields)
@@ -238,16 +247,17 @@ def compare(a_dir: pathlib.Path, b_dir: pathlib.Path,
             print(f"  in neither capture: {name}", file=sys.stderr)
         print(f"INCOMPLETE: {len(a)} of {len(EXPECTED_CELLS)} cells agreed on "
               f"{total} round lines over {over}, {len(missing)} did not run")
-        report_partial(partial, len(a))
+        report_partial(partial, len(a), total)
         report_skipped(skipped)
         return 3
     print(f"{len(a)} cells, {total} round lines, {over} identical")
-    report_partial(partial, len(a))
+    report_partial(partial, len(a), total)
     report_skipped(skipped)
     return 0
 
 
-def report_partial(partial: list[tuple[str, list[str]]], cells_total: int) -> None:
+def report_partial(partial: list[tuple[str, list[str], int]], cells_total: int,
+                   lines_total: int) -> None:
     """Name every `--fields` group only some cells carried, and where.
 
     The union is per loop by design — a figure a loop does not have is absent
@@ -257,10 +267,11 @@ def report_partial(partial: list[tuple[str, list[str]]], cells_total: int) -> No
     identical over every cell. So it is moved out of that sentence and reported
     here with the pairs that carried it, which is also where a field that was
     *supposed* to be on every loop shows up as being on some."""
-    for group, cells_ in partial:
+    for group, cells_, lines in partial:
         pairs = sorted({n.split(".")[0] for n in cells_})
-        print(f"  partial: {group} on {len(cells_)} of {cells_total} cells "
-              f"({', '.join(pairs)}) — compared where carried, not elsewhere")
+        print(f"  partial: {group} on {len(cells_)} of {cells_total} cells and "
+              f"{lines} of {lines_total} round lines ({', '.join(pairs)}) — compared "
+              f"where carried, not elsewhere")
 
 
 def report_skipped(skipped: set[str]) -> None:
