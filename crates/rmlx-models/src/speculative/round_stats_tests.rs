@@ -629,6 +629,23 @@ impl tracing::Subscriber for EventLog {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
+/// Every round line the phase target carried during `f`, rendered field by
+/// field.
+///
+/// The round event is a DEBUG line and [`phase_errors`] reads ERROR alone, so
+/// nothing here saw the line the loops exist to write until this did.
+fn phase_rounds(f: impl FnOnce()) -> Vec<String> {
+    let log = EventLog::new();
+    tracing::subscriber::with_default(std::sync::Arc::clone(&log), f);
+    log.seen()
+        .into_iter()
+        .filter(|(target, level, _)| {
+            target == super::PHASE_TARGET && *level == tracing::Level::DEBUG
+        })
+        .map(|(_, _, fields)| fields)
+        .collect()
+}
+
 /// Every error the phase target carried during `f`.
 fn phase_errors(f: impl FnOnce()) -> Vec<String> {
     let log = EventLog::new();
@@ -796,5 +813,98 @@ fn a_capture_recorder_declines_both_behaviour_switches_and_is_asked_about_both()
     assert!(
         asked.iter().all(|q| *q == want_phase || *q == want_step),
         "an unexpected switch was consulted: {asked:?}"
+    );
+}
+
+/// A loop reports every figure it has, and the shared record leaves out the
+/// ones it does not — absent from the line, not present as a zero or a `None`.
+///
+/// The union is what makes one event able to replace seven, and the absence is
+/// what makes the union cost nothing to a loop that has no drafter cache. Both
+/// rest on `tracing`'s `Option` impl recording nothing for `None`, which is a
+/// dependency's behaviour and was pinned nowhere.
+///
+/// Mutation: emit any `Option` field as `.unwrap_or(-1)`. The field then appears
+/// on a loop that does not have it and the second half of this fails.
+#[test]
+fn a_round_line_carries_what_the_loop_has_and_omits_what_it_does_not() {
+    let [line] = phase_rounds(|| super::log_round(&charged_round(false), &[]))
+        .try_into()
+        .unwrap_or_else(|lines: Vec<String>| {
+            panic!("exactly one round line per round, got: {lines:?}")
+        });
+    for name in [
+        "loop_kind=",
+        "round=",
+        "accept=",
+        "num_draft=",
+        "n_committed=",
+        "emitted_total=",
+        "condition_rows=",
+        "projected_rows=",
+        "v_offset_before=",
+        "v_target=",
+        "refolded=",
+        "charged=",
+        "round_ms=",
+        "draft_ms=",
+        "verify_ms=",
+        "walk_ms=",
+        "rollback_ms=",
+        "other_ms=",
+    ] {
+        assert!(
+            line.contains(name),
+            "the round carries {name} and the line does not: {line}"
+        );
+    }
+    for name in ["d_offset_before=", "d_target="] {
+        assert!(
+            !line.contains(name),
+            "this loop's drafter keeps no cache, so {name} is absent rather than \
+             reported as a zero: {line}"
+        );
+    }
+}
+
+/// A round whose phases claim more time than the round has is still one round
+/// line, and the overrun is reported beside it.
+///
+/// A reader following one loop's stream counts rounds; dropping the line over a
+/// broken timer takes the whole round out of that count, and the round's own
+/// figures — what it accepted, what it committed, where it rolled back to — are
+/// not the thing that broke.
+///
+/// Mutation: return early from `log_round` when the phases do not partition the
+/// round, which is what the per-loop emitter used to do. The first assertion
+/// then finds no line at all.
+#[test]
+fn a_round_whose_phases_overrun_is_still_reported_once() {
+    let mut report = charged_round(false);
+    report.phases = Some(super::RoundPhases {
+        round_ns: 1_000_000,
+        draft_ns: 4_000_000,
+        verify_ns: 4_000_000,
+        walk_ns: 1_000_000,
+        rollback_ns: 1_000_000,
+    });
+
+    let rounds = phase_rounds(|| super::log_round(&report, &[]));
+    let [line] = rounds.as_slice() else {
+        panic!("a broken timer must not cost the round its line, got: {rounds:?}")
+    };
+    assert!(
+        !line.contains("other_ms="),
+        "no phase-free remainder exists to report: {line}"
+    );
+
+    let errors = phase_errors(|| super::log_round(&report, &[]));
+    let [reason] = errors.as_slice() else {
+        panic!("exactly one overrun report per round, got: {errors:?}")
+    };
+    assert!(
+        reason.contains("draft_ms=") && reason.contains("rollback_ms="),
+        "the overrun names the phases as fields a reader can search, not as one \
+         rendered struct: {reason}"
     );
 }

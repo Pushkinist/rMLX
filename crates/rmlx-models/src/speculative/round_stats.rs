@@ -425,12 +425,23 @@ pub(crate) fn log_round(report: &RoundReport, carry: &[(&str, &Array)]) {
         }
     }
     let unclaimed_ns = phases.and_then(|p| p.unclaimed_ns());
-    if phases.is_some() && unclaimed_ns.is_none() {
+    if let Some(p) = phases.filter(|p| p.unclaimed_ns().is_none()) {
+        // Field by field, not a `Debug` blob: the reader who has to act on this
+        // is searching a run's JSON-Lines for the phase that escaped, and a
+        // struct rendered into one string is not a field they can search.
         tracing::error!(
             target: PHASE_TARGET,
             ?loop_kind,
             round,
-            ?phases,
+            accept,
+            num_draft,
+            refolded,
+            charged,
+            round_ms = ms(p.round_ns),
+            draft_ms = ms(p.draft_ns),
+            verify_ms = ms(p.verify_ns),
+            walk_ms = ms(p.walk_ns),
+            rollback_ms = ms(p.rollback_ns),
             "speculative round phases claim more time than the round has: a phase \
              timer starts outside the round it is attributed to"
         );
