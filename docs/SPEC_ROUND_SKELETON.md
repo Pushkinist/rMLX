@@ -86,7 +86,8 @@ pub(crate) struct RoundOutcome { pub emit: RoundEmit, pub verifier_target: i32 }
 committed count and whether a token stopped the request. `verifier_target` is
 where the loop's own rollback left the verifier's caches, and it is handed over
 because the Gemma4 assistant reads it — its next round's shared K/V offset *is*
-that target. Without it in the signature the first migration would re-derive
+that target. It has one consumer and that consumer is `condition`, so `rollback`
+takes the `RoundEmit` alone until a migration finds a second one. Without it in the signature the first migration would re-derive
 `rollback_target_from_head` inside a drafter, which is the duplication this
 campaign exists to remove. One producer, the loop; one consumer today, the
 assistant's `condition`.
@@ -119,8 +120,8 @@ no drafter is asked for a fact it does not have.
 `projected` is optional because the MTP sidecar reports a conditioning row and
 no projection: it slices one verifier row per round rather than projecting one,
 so `condition_rows` is `Some` and `projected_rows` is `None` on every line it
-writes. A non-optional `projected` would put a number on twelve pinned cells
-that carry none. `rows` is optional for a weaker reason: every loop reads it off
+writes. A non-optional `projected` would put a number on the six pinned cells of the
+recurrent pair, which carry none. `rows` is optional for a weaker reason: every loop reads it off
 the buffer's shape and reports whatever that read returned, and making it
 non-optional would introduce either an unwrap or a refusal on a path no cell
 exercises.
@@ -236,6 +237,14 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    chunk 1, and each chunk drops its own file from the source scan in the same
    commit. Without the declaration the first migration would delete a loop the
    test still reads and leave nothing in its place.
+
+   **A declaration needs two readers, and chunk 1 owes the second.** That each
+   drafter declares an exit is one fact; that the loop honours what it declared
+   is another, and a drafter can declare the exit the loop ignores. The second
+   reader is the same marker reading, over `round_loop.rs`: its two exits, and
+   the two arms the constant is read at. So the source scan gains that file in
+   the very commit that drops the first migrated one, and its declared pattern is
+   the loop's own, not a drafter's.
 8. **What a round conditions on.** DFlash 1 conditions on the round's *committed*
    count and DFlash 2 on `accept + 1`, at the same two calls — the row count
    handed to `committed_rows` and the bound handed to `guard_round_conditioning`.
@@ -310,8 +319,9 @@ and a byte-identical round stream.
    single conditioning row with no projection beside it, and a
    `d_offset`/`d_target` pair on the round line.
 3. **DFlash 2.** A conditioning window that slides, a prompt-window capture, the
-   second charged loop, and the first drafter to declare a conditioning buffer
-   before its first round.
+   third charged loop — so the charged arm is exercised by chunk 1 and chunk 2
+   before it reaches here — and the first drafter to declare a conditioning
+   buffer before its first round.
 4. **DFlash 1.** The adaptive block, the one loop whose verify width is not
    fixed, and the other half of item 8 — it conditions on the committed count
    where DFlash 2 conditions on the acceptance.
@@ -332,6 +342,13 @@ and a byte-identical round stream.
    rule that is not the shared one and the only loop with no equivalence pair —
    its gate is `crates/rmlx-models/tests/two_model_stochastic.rs`, which pins
    that one seed reproduces one sequence.
+
+   It also closes the campaign in the docs, and names what it deletes: the
+   `CLAUDE.md` documentation-map row and the paragraph in `docs/SPECULATIVE.md`
+   both stop calling this file a proposal and describe the loop the tree has, the
+   seventh loop body goes, the sampling gate's `spec_generate_greedy_cached`
+   exception goes with chunk 6's, and the migration order above goes — a
+   completed order is a stale plan, not a reference.
 
 ## The oracle
 
@@ -494,9 +511,15 @@ Three populations, all derived, none a name list:
   a loop is **forwarded** when its *parameter list* carries the configuration
   type that holds the charge field, and **classic** otherwise.
 - **(b) entries** — a fn carrying the driver signature that constructs no
-  `RoundTotals` and calls no `rollback_round`. Seven of them at the end of the
-  campaign, each naming the decision once, at the call that runs the loop, in
-  the drafter's own module.
+  `RoundTotals`, calls no `rollback_round`, **and constructs the loop's
+  configuration type**. Seven of them at the end of the campaign, each naming the
+  decision once, at the call that runs the loop, in the drafter's own module.
+  The last conjunct is the discriminator, not a detail: without it the population
+  admits `spec_generate_greedy`, which validates a request and delegates, and the
+  three emit helpers, none of which decides anything — and the rule below would
+  report four fns as entries missing their decision, for ever. An entry that
+  stops constructing the configuration leaves the population, which is what makes
+  a dropped decision read as a lost entry rather than as a clean scan.
 - **(c) drafter rollbacks** — a fn outside (a) that calls `rollback_round`.
 
 **Membership is read off the signature; the census is keyed on the binding, and
@@ -513,11 +536,12 @@ The rules over them:
   way: one token at every `rollback_round` argument and every `charged:` field.
 - **RULE 2** is unchanged and reads populations (a)-classic and (b): a
   `charge_phases` token binds to exactly `phases_charged()`.
-- **RULE 3**, the census, is computed over **every charge token whose binding is
-  not the forwarded configuration field** — the classic loops' and population
-  (b)'s — seven sites, `charge_phases:3 false:4`, at every step of the campaign.
-  A forwarded loop that binds the field it was handed contributes nothing; the
-  same loop hard-wiring a literal contributes one and the census reads eight.
+- **RULE 3**, the census, is computed over **every charge token that is not the
+  forwarded configuration field — whether named directly at its sites or bound to
+  it in the same fn** — which is the classic loops' and population (b)'s: seven
+  sites, `charge_phases:3 false:4`, at every step of the campaign. A forwarded
+  loop that names or binds the field it was handed contributes nothing; the same
+  loop hard-wiring a literal contributes one and the census reads eight.
 - **RULE 4** gains population (c): a rollback outside a round loop is no longer
   exit 2 outright, but its `charge` argument must be a field of one of its own
   parameters. A literal or a `phases_charged()` there is a second decision made
@@ -541,6 +565,18 @@ The rules over them:
   configuration field it was handed — the whole right-hand side, not a prefix —
   or names that field directly at every site. *Every* binding of that token must
   be that field, so a second one is exit 1 naming it. Anything else is exit 1.
+  The parameter is resolved by its **declared type**, the configuration type, not
+  by RULE 4's looser "a field of one of its own parameters": a loop that took a
+  second parameter with a `charged` field could otherwise satisfy the rule from
+  the wrong one.
+
+  **And the configuration the loop was handed is read-only inside it.** RULE 8
+  constrains the token; without this it constrains nothing, because the value can
+  be moved instead. A `let` that rebinds the parameter's own name — the loop
+  building its own configuration and forwarding faithfully from that — writes no
+  `charged:` site and passes every reading. So does an assignment to the charge
+  field of a `mut` parameter. Both are **exit 2**: the decision the entry made is
+  no longer the decision the loop applies, and no reading downstream can see it.
 
 The two readings are complementary and neither alone covers the hard-wire. A
 forwarded loop that writes `let charge = false;` is caught **twice**: by RULE 8,
@@ -554,7 +590,13 @@ only a count, where RULE 8 names the line.
 
 1. The token reader reports `?` for anything that is not a bare identifier, so
    `charged: cfg.charged` is unreadable today and would exit 2. It must read a
-   field access as a token.
+   field access as a token — and **keep the delimiter anchor it already has**:
+   `<ident>.<ident>` followed by `,`, `}` or the end of the line, and nothing
+   else. `cfg.charged()`, `cfg.charged.into()`, `cfg.charged as bool` and
+   `!cfg.charged` stay `?` and stay exit 2. The anchor is what stops the reader
+   turning a call, a cast or a negation into the field it resembles, which is
+   precisely how a decision gets inverted under a spelling the census still
+   counts as forwarded.
 2. The binding reader records **per binding**, keyed to the loop's own charge
    token. Today it sets one flag per function with a good binding outranking a
    bad one, so a shadow passes. **Measured on this tree**: a `mtp.rs` that binds
@@ -566,15 +608,36 @@ only a count, where RULE 8 names the line.
 
    Under the per-binding reading a token bound twice in one fn is **exit 1** for
    a forwarded loop, where RULE 8 has something exact to say about the second
-   binding, and **exit 2** for a classic loop, where RULE 1's same-token reading
-   has become vacuous: with a shadow, the token at the `rollback_round` argument
-   and the token in the `charged:` field can be two different values under one
-   spelling, and nothing in the scan can say which binding governs which site.
+   binding, and **exit 2** for a classic loop and **for an entry**, where the
+   same-token reading has become vacuous: with a shadow, the token at the
+   `rollback_round` argument and the token in the `charged:` field can be two
+   different values under one spelling, and nothing in the scan can say which
+   binding governs which site. The entry arm is not a corner: at the end state
+   all seven decisions live in entries, so an unread shadow there is the whole
+   census.
+
+   **What counts as a readable binding**, since a reader that guesses is worse
+   than one that refuses. The only readable form is a body-level
+   `let <token> = <rhs>;` whose statement closes on its own line. `let mut`, a
+   type annotation, a right-hand side spanning more than one line, a destructure
+   in the body or in the parameter list, and a binding introduced by `if let` or
+   `match` are each **exit 2** — a shape this gate cannot read, reported rather
+   than skipped. A fn with zero readable bindings whose sites name a bare
+   identifier is **exit 1**: the token means something the scan never saw.
+
+   Two hazards go with that. A right-hand side long enough for rustfmt to break
+   over two lines turns a readable binding into an unreadable one on a
+   reformatting commit, so the configuration field's name has to stay short
+   enough that it cannot happen — a constraint on the engine, not on the scanner.
+   And a destructure of the configuration in the parameter list —
+   `let RoundCfg { charged: charge, .. }` — registers a `charged:` site today,
+   which the census would count as an eighth decision; the exit-2 disposition
+   above is what keeps that from being a silent miscount.
 
 #### The fixture cases the re-key must pass
 
-None of these can run against today's scanner: populations (b) and (c) and
-RULE 8 do not exist in it, and a fixture root asserting them would fail
+Twenty-three cases. None can run against today's scanner: populations (b) and
+(c) and RULE 8 do not exist in it, and a fixture root asserting them would fail
 `make check-spec-charge-fixtures` today. They are stated here with the exit and
 the reason each must produce, and the re-key chunk turns each into a scan root.
 
@@ -590,7 +653,7 @@ that a loop is forwarded has a line to assert against.
 | 2 | the forwarded loop writes `let charge = false;` at both sites | 1 | RULE 8, the binding is not the configuration field — and the census reads eight sites, both readings on one tree |
 | 3 | the forwarded loop writes `let charge = cfg.charged \|\| x;` | 1 | RULE 8, the whole right-hand side |
 | 4 | the forwarded loop names `cfg.charged` at both sites, no binding | 0 | forwarded, read as one token |
-| 5 | one of the seven entries drops its `charged:` | 1 | census of six sites — excluding the loop must not hide a lost entry |
+| 5 | one of the seven entries drops its `charged:` | 1 | both reasons on one tree: RULE 5's zero-arm names the entry, and the census reads six sites — excluding the loop must not hide a lost decision |
 | 6 | an entry binds `charge_phases` to a literal | 1 | RULE 2, unchanged |
 | 7 | an entry moves a token from `false` to `phases_charged()` | 1 | RULE 3, census `charge_phases:4 false:3` |
 | 8 | a fn with no driver signature writes `charged:` | 1 | RULE 5, unchanged |
@@ -603,6 +666,12 @@ that a loop is forwarded has a line to assert against.
 | 15 | the forwarded loop calls `log_round` twice | 2 | RULE 7, unchanged |
 | 16 | the forwarded loop shadows its binding — `let charge = cfg.charged;` then `let charge = false;` | 1 | RULE 8 names the second binding; the same shape on a classic loop is exit 2 |
 | 17 | an entry states two `charged:` fields | 1 | RULE 5 over (b): an entry names one decision |
+| 18 | an entry shadows its binding — `charge_phases` bound to `phases_charged()` then rebound to `false` | 2 | a shape this gate cannot read, the entry arm of case 16 |
+| 19 | an entry stops constructing the configuration and calls the loop some other way | 1 | it leaves (b), so the census reads six sites — a dropped decision is a lost entry, not a clean scan |
+| 20 | the forwarded loop builds its own configuration — `let cfg = RoundCfg::uncharged();` — and forwards from that | 2 | the configuration handed over is read-only inside the loop; a rebinding of its name writes no site any reading can see |
+| 21 | the forwarded loop assigns `cfg.charged = false;` on a `mut` parameter | 2 | the same, by assignment rather than by rebinding |
+| 22 | the forwarded loop writes `charged: cfg.charged()` | 2 | the delimiter anchor holds: a call is not the field it resembles |
+| 23 | the forwarded loop writes `let mut charge = cfg.charged;` | 2 | not a readable binding form; a reader that guesses is worse than one that refuses |
 
 ### `make check-spec-sampling`
 
@@ -615,7 +684,12 @@ takes no sampler at all, and `emit_step`, `emit_round_tokens` and
 rule changes.
 
 Widen it to **any visibility, over the charge gate's populations (a) and (b)
-together** — the one loop and the seven entries. Narrowing to (a) alone is the
+and the fns that call one of them** — the one loop, the seven entries, and the
+two-model entry guard that routes a request to one of two loops by reading
+whether the sampler is active. That third clause is not tidiness: the guard is
+where a sampled request can be routed to the greedy arm, which is this gate's
+own defect class, and it is in the gate today only because it happens to be
+`pub`. Narrowing to (a) alone is the
 tempting move and it is wrong: at the end of the campaign the entries are the
 only place a request's sampler can be dropped, since each takes `sampler_cfg`
 and hands it to the loop's configuration, and a gate that stops reading them
@@ -633,12 +707,13 @@ and read by nobody is exactly the shape (b) exists to refuse, and so is a
 `sampler_cfg` an entry accepts and leaves out of the configuration it hands over.
 
 The census belongs on the success line for the same reason the charge gate's
-does: **one loop and seven entries**. A lost entry is then exit 2 — a scan that
-finds six drivers where the tree has seven has not passed, it has stopped
-looking.
+does: **one loop, seven entries, one guard**. A lost entry is then exit 2 — a
+scan that finds six drivers where the tree has seven has not passed, it has
+stopped looking.
 
-The three emit helpers are excluded by (a) ∪ (b) without an exception, since none
-carries a `RoundTotals` and none is an entry. `spec_generate_greedy_cached` is
+The three emit helpers are excluded without an exception: none constructs a
+`RoundTotals`, none constructs the loop's configuration, and none calls a fn that
+does — `emit_round_tokens` calls `emit_step`, which is in no population either. `spec_generate_greedy_cached` is
 the one real exception: it is the two-model greedy loop, it takes no sampler at
 all, and it runs only at temperature 0 where the verifier's argmax is the draw.
 Record it with that reason and delete the exception in migration chunk 6, where
