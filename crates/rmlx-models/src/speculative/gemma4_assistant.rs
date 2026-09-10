@@ -69,14 +69,10 @@ use rmlx_mlx::{
     Array, Device, Dtype,
 };
 
-use super::{DecodeWindow, MAX_BLOCK_SIZE};
+use super::MAX_BLOCK_SIZE;
 use crate::arch::Architecture;
 use crate::gemma4::LayerType;
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
-use crate::speculative::round_common::{
-    emit_round_tokens, emit_seed_token, log_request_record, report_verifier_kv_bytes,
-    rollback_round, verifier_cache_stack, RoundTotals,
-};
 
 /// One drafter decoder layer (Gemma4 shape, Q-only - K/V are shared).
 #[allow(missing_debug_implementations)]
@@ -688,8 +684,12 @@ fn load_assistant(
 // ---------------------------------------------------------------------------
 
 use crate::decode_loop::ProbeStep;
-use rmlx_kv_quant::{KvCache, KvQuant};
+use rmlx_kv_quant::KvQuant;
 use std::time::Instant;
+
+use super::round_loop::{
+    run_rounds, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx, RoundDrafter, Verdict,
+};
 
 /// The block a request runs at: what it asked for, bounded by what one verify
 /// forward can score.
@@ -710,6 +710,225 @@ fn block_from_request(requested: usize) -> Result<usize> {
     Ok(requested.min(MAX_BLOCK_SIZE))
 }
 
+/// What the drafter carries from one round into the next.
+#[allow(missing_debug_implementations)]
+struct Conditioned {
+    /// The verifier's final-normed hidden at the position the next round drafts
+    /// from (`speculative_draft_hidden`, not the raw pre-norm hidden).
+    hidden: Array,
+    /// The verifier's last sliding-layer K/V, this round's rejected tail
+    /// dropped.
+    sliding_kv: (Array, Array),
+    /// The verifier's last full-attention-layer K/V, same tail dropped.
+    full_kv: (Array, Array),
+    /// The position those K/V end at, which is where the drafter's queries sit.
+    kv_offset: i32,
+}
+
+/// What one round's verify forward left for its conditioning.
+#[allow(missing_debug_implementations)]
+struct Scored {
+    /// The verifier's raw hidden at every verified position.
+    hidden: Array,
+    /// The verifier's last sliding-layer K/V, rejected tail still on it.
+    sliding_kv: (Array, Array),
+    /// The verifier's last full-attention-layer K/V, rejected tail still on it.
+    full_kv: (Array, Array),
+    /// Positions the forward consumed.
+    fed: usize,
+}
+
+/// One request's Gemma4-assistant drafting state.
+///
+/// The drafter reads the verifier's K/V and keeps no cache of its own, so
+/// [`RoundDrafter::rollback`] is the default: what a round has to return is the
+/// conditioning below, and that is rebuilt from the verify forward rather than
+/// rolled back.
+#[allow(missing_debug_implementations)]
+pub(crate) struct AssistantRound<'a> {
+    drafter: &'a Gemma4AssistantDrafter,
+    conditioned: Option<Conditioned>,
+    scored: Option<Scored>,
+}
+
+impl<'a> AssistantRound<'a> {
+    fn new(drafter: &'a Gemma4AssistantDrafter) -> Self {
+        Self {
+            drafter,
+            conditioned: None,
+            scored: None,
+        }
+    }
+
+    fn conditioned(&self) -> Result<&Conditioned> {
+        self.conditioned.as_ref().ok_or_else(|| {
+            Error::Model(
+                "mtp_assistant_generate: a round drafted before the prefill built the \
+                 conditioning it drafts from"
+                    .into(),
+            )
+        })
+    }
+}
+
+impl RoundDrafter for AssistantRound<'_> {
+    const KV_REPORT_SKIPPED_BY: ReportSkippedBy = ReportSkippedBy::TheSeedExit;
+
+    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled> {
+        let device = ctx.device;
+        let Some((&last_prompt, head)) = prompt.split_last() else {
+            return Err(Error::Model(
+                "mtp_assistant_generate: an empty prompt reached the round loop".into(),
+            ));
+        };
+        let prefill_t0 = Instant::now();
+        super::prefill_chunked(
+            ctx.verifier,
+            head,
+            &mut ctx.kv,
+            ctx.lin.as_deref_mut(),
+            device,
+        )?;
+        let prefill_ns = prefill_t0.elapsed().as_nanos();
+
+        // Round-0 seed: feed the last prompt token through the verifier in a
+        // one-token forward, capture its hidden and the shared K/V, and read the
+        // first bonus token off it.
+        let (hidden_raw, sliding_kv, full_kv, kv_offset) = ctx
+            .verifier
+            .forward_hidden_states_shared_kv(&[last_prompt], 1, &mut ctx.kv, device)?;
+        let logits = ctx.verifier.logits_from_hidden(&hidden_raw, device)?;
+        super::guard_verifier_prefill_logits(ctx.verifier, &logits, prompt.len())?;
+        let seed = ctx.draw.seed_token(&logits, device)?;
+        let hidden = ctx.verifier.apply_final_norm(&hidden_raw, device)?;
+        self.conditioned = Some(Conditioned {
+            hidden,
+            sliding_kv,
+            full_kv,
+            kv_offset,
+        });
+        Ok(Prefilled {
+            seed,
+            prefill_ns,
+            conditioned_rows: None,
+        })
+    }
+
+    fn propose(&mut self, ctx: &mut RoundCtx<'_>, carry: u32, block: usize) -> Result<Vec<u32>> {
+        let cond = self.conditioned()?;
+        self.drafter.draft_n(
+            ctx.verifier,
+            carry,
+            &cond.hidden,
+            (&cond.sliding_kv.0, &cond.sliding_kv.1),
+            (&cond.full_kv.0, &cond.full_kv.1),
+            cond.kv_offset,
+            block,
+        )
+    }
+
+    fn verify(&mut self, ctx: &mut RoundCtx<'_>, fed: &[u32], remaining: usize) -> Result<Verdict> {
+        let device = ctx.device;
+        let t0 = Instant::now();
+        let (hidden, sliding_kv, full_kv, _off) =
+            ctx.verifier
+                .forward_hidden_states_shared_kv(fed, fed.len(), &mut ctx.kv, device)?;
+        // The verifier's own token at each of the fed positions. Read inside
+        // this span rather than in the walk: the head is a separate quantised
+        // tensor, and a sampled request draws here too.
+        let logits = ctx.verifier.logits_from_hidden(&hidden, device)?;
+        let v_tokens = ctx.draw.block_tokens(&logits, fed.len(), device)?;
+        let verify_ns = t0.elapsed().as_nanos();
+
+        let t0 = Instant::now();
+        let proposals = fed.get(1..).unwrap_or_default();
+        let (accept, commit) = super::accept_prefix(&v_tokens, proposals, remaining)?;
+        let walk_ns = t0.elapsed().as_nanos();
+
+        self.scored = Some(Scored {
+            hidden,
+            sliding_kv,
+            full_kv,
+            fed: fed.len(),
+        });
+        Ok(Verdict {
+            accept,
+            commit,
+            verify_ns,
+            walk_ns,
+        })
+    }
+
+    fn condition(
+        &mut self,
+        ctx: &RoundCtx<'_>,
+        verdict: &Verdict,
+        verifier_target: i32,
+    ) -> Result<()> {
+        let device = ctx.device;
+        let Some(scored) = self.scored.take() else {
+            return Err(Error::Model(
+                "mtp_assistant_generate: a round conditioned on a verify forward that \
+                 did not run"
+                    .into(),
+            ));
+        };
+        let width = ctx.verifier.hidden_size() as i32;
+        let accept = verdict.accept as i32;
+        // Next hidden = the verifier's hidden at the accepted position, then
+        // final-normed (speculative_draft_hidden) for the drafter conditioning.
+        let row = scored
+            .hidden
+            .slice(&[0, accept, 0], &[1, accept + 1, width], &[1, 1, 1], device)?
+            .reshape(&[1, 1, width], device)?;
+        let hidden = ctx.verifier.apply_final_norm(&row, device)?;
+
+        // The verify call returned the *pre-rollback* K/V, so the rejected
+        // drafts are still on its tail; drop exactly those. Counting from the
+        // tail rather than slicing to an absolute length is what makes this
+        // right for both layer types: a full-attention layer's K/V is the whole
+        // sequence, a sliding layer's is a window that does not start at 0.
+        let rejected = scored.fed as i32 - (accept + 1);
+        let conditioned = Conditioned {
+            hidden,
+            sliding_kv: drop_kv_tail(&scored.sliding_kv, rejected, device)?,
+            full_kv: drop_kv_tail(&scored.full_kv, rejected, device)?,
+            kv_offset: verifier_target,
+        };
+        if ctx.charged {
+            // None of this is read until the next round's drafter call, so
+            // nothing forces it here and the whole next-round setup is billed
+            // to that round. The conditioning is in the list with the trimmed
+            // K/V: the verify span's read-back forced the hidden it is sliced
+            // from, but not the slice, the reshape or the norm over it. See
+            // `phases_charged`.
+            for a in [
+                &conditioned.hidden,
+                &conditioned.sliding_kv.0,
+                &conditioned.sliding_kv.1,
+                &conditioned.full_kv.0,
+                &conditioned.full_kv.1,
+            ] {
+                a.eval()?;
+            }
+        }
+        self.conditioned = Some(conditioned);
+        Ok(())
+    }
+
+    fn carry(&self) -> Vec<(&str, &Array)> {
+        self.conditioned.as_ref().map_or_else(Vec::new, |cond| {
+            vec![
+                ("hidden", &cond.hidden),
+                ("sliding_k", &cond.sliding_kv.0),
+                ("sliding_v", &cond.sliding_kv.1),
+                ("full_k", &cond.full_kv.0),
+                ("full_v", &cond.full_kv.1),
+            ]
+        })
+    }
+}
+
 /// Greedy Gemma4-assistant MTP speculative generation.
 ///
 /// Mirrors mlx-vlm `_mtp_rounds` (greedy / temp=0):
@@ -727,17 +946,14 @@ fn block_from_request(requested: usize) -> Result<usize> {
 /// Returns the emitted steps and **the widest block any round of this run
 /// actually ran**. Not the block resolved before the loop: a caller checking
 /// what it asked for against that would be trusting the very step it wanted
-/// checked, and every loop here narrows the block again per round against the
-/// remaining token budget.
+/// checked, and every round narrows the block again against the remaining token
+/// budget.
+///
+/// # Errors
+/// [`Error::Model`] for a prompt under two tokens, a block under two, or a
+/// verifier this drafter cannot be paired with; and whatever the round loop
+/// refuses.
 #[allow(clippy::too_many_arguments)]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
 pub fn mtp_assistant_generate(
     verifier: &Architecture,
     drafter: &Gemma4AssistantDrafter,
@@ -771,273 +987,27 @@ pub fn mtp_assistant_generate(
             verifier.arch_class()
         )));
     }
-    let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
-
-    let (kv_quant, _, mut caches) =
-        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
-
-    let mut draw = super::VerifierDraw::new(sampler_cfg);
-
-    // Diagnostics.
-    let mut total_draft: usize = 0;
-    let mut total_accept: usize = 0;
-    let mut rounds: usize = 0;
-    // One read of process-global log state per request, at the loop head.
+    // One read of process-global log state per request, at the entry.
     let charge_phases = super::phases_charged();
-    let t_total = Instant::now();
-    let mut window = DecodeWindow::new();
-    let mut draft_ns: u128 = 0;
-    let mut verifier_ns: u128 = 0;
-
-    // --- Prefill on prompt[..-1]; last token is round-0 carry. ----------
-    let prefill_slice = &prompt_ids[..prompt_ids.len() - 1];
-    let prefill_t0 = Instant::now();
-    super::prefill_chunked(verifier, prefill_slice, &mut caches, None, device)?;
-    let prefill_ns = prefill_t0.elapsed().as_nanos();
-
-    // Round-0 seed `b`: feed the last prompt token through the verifier (1-token
-    // forward), capture hidden + shared K/V, and argmax for the first bonus.
-    let last_prompt = *prompt_ids.last().unwrap();
-    let (hidden_raw, mut sliding_kv, mut full_kv, mut kv_offset) =
-        verifier.forward_hidden_states_shared_kv(&[last_prompt], 1, &mut caches, device)?;
-    let mut b = {
-        let logits = verifier.logits_from_hidden(&hidden_raw, device)?;
-        super::guard_verifier_prefill_logits(verifier, &logits, prompt_ids.len())?;
-        draw.seed_token(&logits, device)?
-    };
-    // MTP drafter conditions on the *normed* trunk hidden
-    // (speculative_draft_hidden = model.norm(h)), not the raw pre-norm hidden.
-    let mut hidden = verifier.apply_final_norm(&hidden_raw, device)?;
-
-    // Emit the first bonus.
-    if emit_seed_token(
-        tokenizer,
-        b,
+    let mut round = AssistantRound::new(drafter);
+    run_rounds(
+        verifier,
+        &mut round,
+        prompt_ids,
         step_fn,
-        &mut emitted,
-        &mut window,
-        eos_ids,
-        &RoundTotals {
+        &RoundCfg {
             loop_kind: super::SpecLoop::MtpAssistant,
             block_size,
-            conditioned_rows: None,
-            charged: charge_phases,
-            // No round ran.
-            rounds: 0,
-            emitted_in_rounds: 0,
-            total_draft: 0,
-            total_accept: 0,
-            prefill_ns,
-            draft_ns: 0,
-            verifier_ns: 0,
-            round_loop_ns: 0,
-            t_total,
-        },
-    ) {
-        return Ok((emitted, block_size));
-    }
-
-    tracing::info!(
-        block_size,
-        prompt_len = prompt_ids.len(),
-        n_tokens,
-        ?kv_quant,
-        temperature = sampler_cfg.temperature,
-        "mtp_assistant_generate: starting (Gemma4-assistant MTP)"
-    );
-
-    let seed_emitted = emitted.len();
-    let mut emitted_in_rounds = 0usize;
-    let mut widest_bs = 0usize;
-    let round_loop_t0 = Instant::now();
-    while emitted.len() < n_tokens {
-        let round_t0 = Instant::now();
-        rounds += 1;
-        let remaining = n_tokens - emitted.len();
-        let bs = super::round_block(block_size, remaining);
-        widest_bs = widest_bs.max(bs);
-
-        // -- Phase A: drafter proposes bs-1 tokens (conditioned on hidden). --
-        let t0 = Instant::now();
-        let draft_tokens = drafter.draft_n(
-            verifier,
-            b,
-            &hidden,
-            (&sliding_kv.0, &sliding_kv.1),
-            (&full_kv.0, &full_kv.1),
-            kv_offset,
-            bs,
-        )?;
-        let round_draft_ns = t0.elapsed().as_nanos();
-        draft_ns += round_draft_ns;
-        if draft_tokens.is_empty() {
-            return Err(Error::Model(format!(
-                "mtp_assistant_generate: the drafter proposed nothing at block {bs}; \
-                 draft_n returns block - 1 ids for any block of two or more, so an \
-                 empty chain is a broken drafter and not the end of the request"
-            )));
-        }
-        total_draft += draft_tokens.len();
-
-        // -- Phase B: verifier scores [b, draft...] in one cached forward. ---
-        let mut verify_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
-        verify_input.push(b);
-        verify_input.extend_from_slice(&draft_tokens);
-        let v_k = verify_input.len();
-
-        // Read before the forward: it is the position the rollback returns to,
-        // and reading it afterwards makes it a function of how far each layer
-        // happened to advance.
-        let pre_round_offset = caches.iter().map(KvCache::offset).max().unwrap_or(0);
-
-        let t0 = Instant::now();
-        let (v_hidden, new_sliding, new_full, _off) =
-            verifier.forward_hidden_states_shared_kv(&verify_input, v_k, &mut caches, device)?;
-        // The verifier's own token at each of the K+1 hidden positions.
-        let v_logits = verifier.logits_from_hidden(&v_hidden, device)?;
-        let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
-        let round_verify_ns = t0.elapsed().as_nanos();
-        verifier_ns += round_verify_ns;
-        let t0 = Instant::now();
-
-        // -- Phase C: acceptance walk. ---------------------------------------
-        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
-        let round_walk_ns = t0.elapsed().as_nanos();
-        total_accept += accept;
-        // -- Emit accepted prefix + 1 correction/bonus. --
-        let emit = emit_round_tokens(
-            tokenizer,
-            &new_tokens,
             n_tokens,
             eos_ids,
-            step_fn,
-            &mut emitted,
-            &mut emitted_in_rounds,
-            &mut window,
-            None,
-        );
-        if emit.hit_eos {
-            break;
-        }
-
-        // -- Phase D: rollback + next-round setup. ---------------------------
-        // The verifier consumed v_k positions; valid prefix = prev + accept + 1
-        // (the correction v_tokens[accept] is a prediction, not yet processed).
-        let t0 = Instant::now();
-        let v_target = super::rollback_target_from_head(pre_round_offset, accept);
-        let rejected = v_k as i32 - (accept as i32 + 1);
-        let refolded = rollback_round(
-            &mut caches,
-            None,
-            &verify_input,
-            pre_round_offset,
-            v_target,
-            charge_phases,
-            device,
-        )?;
-
-        // Next hidden = verifier penultimate at the accepted position, then
-        // final-normed (speculative_draft_hidden) for the drafter conditioning.
-        let h = verifier.hidden_size() as i32;
-        let hidden_slice = v_hidden.slice(
-            &[0, accept as i32, 0],
-            &[1, accept as i32 + 1, h],
-            &[1, 1, 1],
-            device,
-        )?;
-        let hidden_slice = hidden_slice.reshape(&[1, 1, h], device)?;
-        hidden = verifier.apply_final_norm(&hidden_slice, device)?;
-        b = v_tokens[accept];
-
-        // Shared K/V for the next round. The verify call returned the
-        // *pre-rollback* K/V, so the rejected drafts are still on its tail;
-        // drop exactly those. Counting from the tail rather than slicing to an
-        // absolute length is what makes this right for both layer types: a
-        // full-attention layer's K/V is the whole sequence, a sliding layer's
-        // is a window that does not start at position 0.
-        sliding_kv = drop_kv_tail(&new_sliding, rejected, device)?;
-        full_kv = drop_kv_tail(&new_full, rejected, device)?;
-        kv_offset = v_target;
-        if charge_phases {
-            // None of this is read until the next round's drafter call, so
-            // nothing forces it here and the whole next-round setup is billed
-            // to that round. The conditioning is in the list with the trimmed
-            // K/V: the verify span's argmax forced the hidden it is sliced
-            // from, but not the slice, the reshape or the norm over it. See
-            // `phases_charged`.
-            for a in [
-                &hidden,
-                &sliding_kv.0,
-                &sliding_kv.1,
-                &full_kv.0,
-                &full_kv.1,
-            ] {
-                a.eval()?;
-            }
-        }
-        let round_rollback_ns = t0.elapsed().as_nanos();
-
-        super::log_round(
-            &super::RoundReport {
-                loop_kind: super::SpecLoop::MtpAssistant,
-                round: rounds,
-                accept,
-                num_draft: draft_tokens.len(),
-                n_committed: emit.committed,
-                emitted_total: emitted.len(),
-                condition_rows: None,
-                projected_rows: None,
-                v_offset_before: pre_round_offset,
-                v_target,
-                // The drafter shares the verifier's K/V and keeps no cache of
-                // its own to roll back.
-                d_offset_before: None,
-                d_target: None,
-                refolded,
-                charged: charge_phases,
-                phases: Some(super::RoundPhases {
-                    round_ns: round_t0.elapsed().as_nanos(),
-                    draft_ns: round_draft_ns,
-                    verify_ns: round_verify_ns,
-                    walk_ns: round_walk_ns,
-                    rollback_ns: round_rollback_ns,
-                }),
-            },
-            &[
-                ("hidden", &hidden),
-                ("sliding_k", &sliding_kv.0),
-                ("sliding_v", &sliding_kv.1),
-                ("full_k", &full_kv.0),
-                ("full_v", &full_kv.1),
-            ],
-        );
-    }
-
-    let round_loop_ns = round_loop_t0.elapsed().as_nanos();
-    log_request_record(
-        &RoundTotals {
-            loop_kind: super::SpecLoop::MtpAssistant,
-            block_size,
-            conditioned_rows: None,
+            tokenizer,
+            sampler_cfg,
             charged: charge_phases,
-            rounds,
-            emitted_in_rounds,
-            total_draft,
-            total_accept,
-            prefill_ns,
-            draft_ns,
-            verifier_ns,
-            round_loop_ns,
-            t_total,
+            kv_quant_override,
+            max_ctx_override,
         },
-        &emitted,
-        seed_emitted,
-        &window,
-    );
-
-    // Gemma4 is full-attention only — no recurrent state to add.
-    report_verifier_kv_bytes(verifier, &caches, None);
-    Ok((emitted, widest_bs))
+        device,
+    )
 }
 
 /// Drop the last `drop` key positions (axis 2) from a shared `(K, V)` pair.

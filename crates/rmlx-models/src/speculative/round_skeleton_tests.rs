@@ -89,6 +89,8 @@
 //! can fail rather than against a re-derivation of itself.
 
 use super::dflash::dflash_next_block_size;
+use super::gemma4_assistant::AssistantRound;
+use super::round_loop::{ReportSkippedBy, RoundDrafter};
 use super::{
     accept_prefix, draft_rows_to_drop, rollback_target_from_head, rollback_target_from_tail,
     round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
@@ -281,17 +283,6 @@ fn the_draft_side_keeps_the_carry_and_the_accepted_prefix() {
 // What the seven loops declare at their edges
 // ---------------------------------------------------------------------------
 
-/// Which of a loop's two exits skips the report of the verifier's resident KV.
-#[derive(Debug, Clone, Copy)]
-enum ReportSkippedBy {
-    /// The seed EOS: the loop emits a token out of its prefill forward, and a
-    /// request whose whole output is that token returns before any round.
-    TheSeedExit,
-    /// The in-round EOS: the loop emits nothing before its first round, so the
-    /// only early exit it has is inside one.
-    TheInRoundExit,
-}
-
 /// How a loop refuses a drafter that proposed nothing.
 #[derive(Debug, Clone, Copy)]
 enum ChainRefusedBy {
@@ -303,14 +294,26 @@ enum ChainRefusedBy {
     TheVerifierInput,
 }
 
+/// The file the migrated loops share, and the order its own edge markers fall
+/// in.
+///
+/// It is not read off a row: the shared loop carries both exits at once and
+/// reads [`ReportSkippedBy`] at each of them, so its markers are the seed
+/// exit's report guard and return, the round loop, the empty-chain refusal, and
+/// the tail's record and report. What a migrated drafter declares is checked
+/// against its constant instead, by the test below.
+const SHARED_LOOP: &str = "round_loop.rs";
+const SHARED_LOOP_PATTERN: &str = "PEWGRP";
+
 /// What each round loop declares at its edges, and the file that holds it.
 ///
 /// This table is the statement; the two tests below are readings of it against
 /// today's source. It is data rather than seven assertions because it is what
-/// survives the collapse: the resident-KV disposition becomes a `RoundDrafter`
-/// declaration, the first migration re-keys the reading onto that declaration,
-/// and each migration drops its own file from [`LOOP_SOURCES`] in the same
-/// commit while these rows stay as they are. See `docs/SPEC_ROUND_SKELETON.md`.
+/// survives the collapse: the resident-KV disposition is a [`RoundDrafter`]
+/// declaration for a migrated loop, read here against its constant, and each
+/// migration drops its own file from [`LOOP_SOURCES`] and names
+/// [`SHARED_LOOP`] in its row instead, while these rows stay as they are. See
+/// `docs/SPEC_ROUND_SKELETON.md`.
 const DISPOSITIONS: [(SpecLoop, &str, ReportSkippedBy, ChainRefusedBy); 7] = [
     (
         SpecLoop::MtpSidecar,
@@ -338,7 +341,7 @@ const DISPOSITIONS: [(SpecLoop, &str, ReportSkippedBy, ChainRefusedBy); 7] = [
     ),
     (
         SpecLoop::MtpAssistant,
-        "gemma4_assistant.rs",
+        SHARED_LOOP,
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
     ),
@@ -387,10 +390,10 @@ const LOOP_SOURCES: [(&str, &str); 6] = [
         )),
     ),
     (
-        "gemma4_assistant.rs",
+        SHARED_LOOP,
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/speculative/gemma4_assistant.rs"
+            "/src/speculative/round_loop.rs"
         )),
     ),
     (
@@ -486,17 +489,36 @@ fn expected_pattern(skipped_by: ReportSkippedBy) -> &'static str {
 #[test]
 fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
     for (file, src) in LOOP_SOURCES {
-        let want: String = DISPOSITIONS
-            .iter()
-            .filter(|(_, f, _, _)| *f == file)
-            .map(|&(_, _, skipped_by, _)| expected_pattern(skipped_by))
-            .collect();
+        let want: String = if file == SHARED_LOOP {
+            SHARED_LOOP_PATTERN.to_owned()
+        } else {
+            DISPOSITIONS
+                .iter()
+                .filter(|(_, f, _, _)| *f == file)
+                .map(|&(_, _, skipped_by, _)| expected_pattern(skipped_by))
+                .collect()
+        };
         assert_eq!(
             marker_sequence(src),
             want,
             "{file}: the early exit (E), the round loop (W), the empty-chain \
              refusal (G), the request record (R) and the resident-KV report (P) \
              do not fall in the order the table declares for the loop(s) it holds"
+        );
+    }
+    // A migrated loop states its disposition rather than spelling it out, and a
+    // drafter can declare the exit the shared loop ignores. The marker reading
+    // above is the second reader: it is what says the loop honours both arms.
+    for (loop_kind, _, skipped_by, _) in DISPOSITIONS {
+        // One arm per migrated loop; the rest still spell their exit out in
+        // their own file and are read by the marker sequence above.
+        if !matches!(loop_kind, SpecLoop::MtpAssistant) {
+            continue;
+        }
+        assert_eq!(
+            <AssistantRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
+            skipped_by,
+            "the migrated {loop_kind:?} loop declares an exit the table does not"
         );
     }
 }

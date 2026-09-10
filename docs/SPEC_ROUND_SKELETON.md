@@ -1,8 +1,11 @@
 # One speculative round loop: the proposed interface
 
-**Status: proposal.** No engine code exists for any of it. This file is what a
-reviewer judges before the first drafter is migrated, and what each migration
-chunk is held to afterwards.
+**Status: migration chunk 1 has landed.** The loop is
+`crates/rmlx-models/src/speculative/round_loop.rs` and the Gemma4 assistant runs
+on it; the other six loops still carry their own bodies. This file is what a
+reviewer judged before the first drafter was migrated, and what each migration
+chunk is held to afterwards. What chunk 1 landed differently from the proposal
+below is listed under "What chunk 1 landed".
 
 Seven round loops in `crates/rmlx-models/src/speculative/` run one algorithm:
 
@@ -138,6 +141,44 @@ answers `None` to both, so introducing them with it would land two types with no
 producer. Chunk 1 passes the report's per-drafter half as the `None`s the
 assistant already writes; chunk 2 introduces the structs with the MTP sidecar,
 their first producer, and re-keys the report onto them.
+
+## What chunk 1 landed
+
+Seven differences from the proposal above, each because the shape it proposes
+has no producer yet and landing it would mean a type or a field nothing writes.
+They are the chunk-2 agenda as much as they are a record.
+
+- **`Prefilled::seed` is a `u32`, not an `Option<u32>`.** The `None` arm is the
+  two-model pair, which migrates in chunk 6; until then the loop would have to
+  invent a round-0 carry for a case no drafter reaches.
+- **`RoundOutcome` is not a type.** Its `emit` half has no reader in chunk 1 —
+  the assistant's `condition` reads the verifier target and nothing else — and a
+  struct field no one reads is a `dead_code` warning, not a seam. `rollback` and
+  `condition` take `verifier_target: i32` and the struct arrives with its second
+  reader.
+- **`Verdict` carries `verify_ns` and `walk_ns` and no `restricted`.** The
+  verify forward and the acceptance walk are two spans of the round line, and
+  the forward is inside `verify`, so the split is the drafter's to report.
+  `restricted` is EAGLE-3's and arrives with it.
+- **`RoundDrafter` has a seventh method, `carry`.** `log_round` takes every
+  array a round leaves for the next round's drafter, under the name that drafter
+  calls it, and checks on a charged round that they are forced. Only the drafter
+  knows what it carries.
+- **The loop always reports `RoundPhases`.** It times every phase it runs, so it
+  has the figures on every request. Four loops report `None` today and will stop
+  doing so as they migrate; the pinned round stream drops every `*_ms` field, so
+  it is blind to this.
+- **The verifier offset has one basis, the head spelling.** The assistant is the
+  only loop on the shared body and reads its offset before the verify forward.
+  The two-valued basis of item 6 arrives with the first tail-spelling drafter.
+- **No head-against-tail refusal.** Item 6 proposes one and owes it two controls;
+  chunk 1 neither adds it nor owes them.
+
+Two things chunk 1 does carry as proposed: `Prefilled` declares
+`conditioned_rows` (the assistant answers `None`), and `KV_REPORT_SKIPPED_BY` is
+read at both of the loop's exits, so the disposition test's seven-row table is
+now a reading of the constant for the migrated loop and of the source for the
+six that are not.
 
 ## What the interface cannot express, and what is proposed for it
 
