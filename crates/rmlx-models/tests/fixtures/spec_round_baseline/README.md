@@ -72,6 +72,20 @@ says *what* moved:
 python3 scripts/spec_round_stream_compare.py compare <dir-a> <dir-b>
 ```
 
+A change that renames, adds or drops a field makes two captures incomparable
+line for line while the round's arithmetic is still comparable. `--fields` names
+what to hold them to; an entry spelled `a|b` reads the first of the two a line
+carries, which is how a field that was renamed is still compared:
+
+```sh
+python3 scripts/spec_round_stream_compare.py compare <dir-a> <dir-b> \
+  --fields round,accept,num_draft,n_committed|emitted_round
+```
+
+A field present on one side and not the other is a difference; a field on
+neither is not a common field of that cell and is skipped. Everything else about
+the comparison is unchanged, the completeness statement included.
+
 ## Regenerating
 
 ```sh
