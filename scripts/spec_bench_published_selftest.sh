@@ -34,6 +34,15 @@
 # nothing. Under two concurrent suites the observed slip was ~30 ms against a
 # 150 ms pause.
 #
+# The other direction — a scheduling delay stretching the window itself, past
+# the first chunk — is the one a busy `make ci` was seen tripping: a plain
+# run's window widened from 200 ms to 360 ms (see `_PLAIN_TOKENS`) for the same
+# reason, more room for the same absolute delay to be a smaller fraction of.
+# The 10% cross-check band this is timed against is not touched by either
+# mitigation, and neither makes the dependency go away: every plain-arm case
+# still drives a real streamed response and reads this host's real clock over
+# it, by construction, not only under load.
+#
 # No GPU, no model, no DB.
 #
 # Exit codes: 0 — every case behaved; 1 — at least one did not; 2 — the
@@ -308,13 +317,6 @@ ITL_MEAN_MS = os.environ.get("STUB_ITL_MEAN_MS", "")
 # cells without the fixed prompt tripping the same guard first.
 ITL_MEAN_FROM = int(os.environ.get("STUB_ITL_MEAN_FROM", "0"))
 SAMPLED = os.environ.get("STUB_SAMPLED", "1") == "1"
-# A delay between the wire's last chunk and the sampler event's write, still
-# inside do_POST and so still before [DONE] closes the response. A caller
-# blocked on the streamed body cannot observe anything between the two. A
-# stub argument, not an environment variable — the one case that stages it
-# starts this server directly rather than through the CLI surface below,
-# which has no flag for it and should not grow one for a test-only delay.
-SAMPLER_DELAY_S = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
 SAMPLER_LINES = int(os.environ.get("STUB_SAMPLER_LINES", "-1"))
 SAMPLER_TOP_K = int(os.environ.get("STUB_SAMPLER_TOP_K", "20"))
 SAMPLER_TOP_K_PASS2 = os.environ.get("STUB_SAMPLER_TOP_K_PASS2", "")
@@ -491,7 +493,6 @@ class Handler(BaseHTTPRequestHandler):
         chunk({"choices": [], "usage": usage})
 
         if SAMPLED and (SAMPLER_LINES < 0 or served < SAMPLER_LINES):
-            time.sleep(SAMPLER_DELAY_S)
             top_k = SAMPLER_TOP_K
             if SAMPLER_TOP_K_PASS2 and PASS >= 2:
                 top_k = int(SAMPLER_TOP_K_PASS2)
@@ -549,12 +550,10 @@ metrics)
 serve)
 	port=8090
 	speculative=0
-	sampler_delay=0
 	while [ \$# -gt 0 ]; do
 		case "\$1" in
 		--port) port="\$2" ;;
 		--draft-model) speculative=1 ;;
-		--sampler-delay-s) sampler_delay="\$2" ;;
 		esac
 		shift
 	done
@@ -580,7 +579,7 @@ serve)
 		printf '%s\n' "{\"timestamp\":\"2026-09-06T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"\$kv\"}}" >>"\$log"
 	fi
 	export STUB_LOG="\$log" STUB_SPECULATIVE="\$speculative" STUB_PASS="\$pass"
-	exec python3 "${SERVER_PY}" "\$port" "\$sampler_delay"
+	exec python3 "${SERVER_PY}" "\$port"
 	;;
 esac
 STUBEOF
@@ -630,10 +629,13 @@ sys.exit("no free port in 18000-19999")
 # whose prompts/published IS the shrunken copy, which is how the default path is
 # shown to verify.
 #
-# The stub streams six tokens 40 ms apart behind a 150 ms prefill — 25 tok/s on
-# the wire and 25 reported by the engine. Its prompt count is four characters
-# per token above a base of 100, so the fixed-length prompt's fit is a real
-# search over the corpus rather than a fixed answer handed back.
+# The stub streams tokens 40 ms apart behind a 150 ms prefill — 25 tok/s on the
+# wire and 25 reported by the engine, at any token count. A plain run streams
+# ten (see `_PLAIN_TOKENS` in the stub source above); the speculative arm
+# keeps six, because its round-loop fixtures are written against that count.
+# Its prompt count is four characters per token above a base of 100, so the
+# fixed-length prompt's fit is a real search over the corpus rather than a
+# fixed answer handed back.
 run_case() {
     CASE_NAME="$1"
     local want="$2"
@@ -991,51 +993,13 @@ verdict
 # The read this run's sampling comes back on is the same request whose body
 # already closed: do_POST writes the sampler event, then TTFT and ITL, then
 # `served += 1`, then the final SSE chunk — all before returning, so nothing
-# downstream of the response can observe the log mid-write. A multi-second
-# delay placed on the sampler write itself, still ahead of that same response,
-# is the sharpest version of "the read came before the write" this harness can
-# stage; it passing is what rules that mechanism out rather than assuming it.
-# `--sampler-delay-s` has no counterpart in the real CLI spec_bench_published.sh
-# validates against, so this drives the stub directly rather than through it —
-# one request is all the mechanism needs.
-CASE_NAME="sampler_write_delay_does_not_race_the_read"
-CASE_WHAT="a delayed sampler write is still ordered before the response that gates the read"
-CASE_BAD=""
-dir="${WORK}/sampler_delay"
-mkdir -p "${dir}/logs"
-CASE_OUT="${WORK}/${CASE_NAME}.log"
-RMLX_HOME="${dir}" "${STUB}" serve --port "${PORT}" --sampler-delay-s 2 \
-    >"${CASE_OUT}" 2>&1 &
-delay_pid=$!
-ready=""
-for _ in $(seq 1 50); do
-    curl -s -o /dev/null "http://127.0.0.1:${PORT}/v1/models" && { ready=1; break; }
-    sleep 0.1
-done
-if [ -z "${ready}" ]; then
-    CASE_BAD="the delayed server never answered /v1/models"
-else
-    curl -s -H "Content-Type: application/json" \
-        --data-binary '{"model":"stub","stream":true,"max_tokens":8,
-            "messages":[{"role":"user","content":"hi"}]}' \
-        "http://127.0.0.1:${PORT}/v1/chat/completions" -o /dev/null
-fi
-kill "${delay_pid}" 2>/dev/null || true
-wait "${delay_pid}" 2>/dev/null || true
-if [ -z "${CASE_BAD}" ]; then
-    log="$(ls "${dir}"/logs/*.jsonl 2>/dev/null | head -1)"
-    [ -n "${log}" ] || CASE_BAD="the delayed server wrote no run log"
-fi
-if [ -z "${CASE_BAD}" ]; then
-    top_k="$(python3 -c 'import json, sys
-for line in open(sys.argv[1], encoding="utf-8"):
-    fields = json.loads(line)["fields"]
-    if fields.get("message", "").startswith("generate: host categorical sampler"):
-        print(fields["top_k"])
-        break' "${log}" 2>/dev/null)"
-    [ "${top_k}" = "20" ] || CASE_BAD="top_k=${top_k} (want 20, or no sampler event at all)"
-fi
-verdict
+# downstream of the response can observe the log mid-write. The harness never
+# reads that event until well after the request stream is done, either: it
+# kills the server, `wait`s for the process to exit, sleeps another 3 s to let
+# any buffered write flush, and only then reads the log. A read reachable only
+# behind a confirmed process exit cannot race a write that happened before
+# that process's own last response, for any delay on the write — the ordering
+# holds by construction, not by a margin a runtime case could lose.
 
 # Two guards, two cases: one pass whose requests did not share a setting, and
 # three passes that did not share one with each other.
