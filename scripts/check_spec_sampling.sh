@@ -35,7 +35,8 @@
 #     LOOPS   — the driver signature `step_fn: &mut dyn FnMut(&ProbeStep)` plus
 #               a `RoundTotals`.
 #     ENTRIES — the driver signature, no totals, no `rollback_round`, and it
-#               constructs the loop's `RoundCfg`.
+#               constructs the loop's `RoundCfg`. All four conjuncts, so the
+#               population is the charge gate's and not a near copy of it.
 #     GUARDS  — a fn that calls a loop or an entry and is neither. There is one:
 #               the two-model entry guard, which routes a request to one of two
 #               loops by reading whether the sampler is active. That clause is
@@ -94,9 +95,10 @@
 #   greedy loop, it runs only at temperature 0 where the verifier's argmax is
 #   the draw, and the guard above it routes every sampled request to the
 #   stochastic loop instead. So it is exempt from RULE 1, and no caller is
-#   asked to pass it a sampler it does not take. The exception is deleted in
-#   migration chunk 6, where that loop becomes a drafter whose `verify` draws
-#   through the context. It is the only name in this file.
+#   asked to pass it a sampler it does not take. The exception is deleted when
+#   that loop becomes a drafter whose `verify` draws through the round's
+#   context, which is what makes it no longer true. It is the only name in this
+#   file.
 #
 # THE CENSUS
 #   The success line names the three populations, and the count of drafter
@@ -140,27 +142,36 @@ if [ ! -f "$dispatch" ]; then
   exit 2
 fi
 
+# The two text readers, shared with the other source-scanning gates. Every
+# needle below reads a line's code with the body of its string literals blanked:
+# a commented-out draw beside a greedy one, and a needle inside a literal a
+# program merely prints, are both a loop that decodes greedily and a scan that
+# says it does not.
+# shellcheck source=lib/awk_text.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/awk_text.sh"
+
 # ---- Pass 1: the populations, and what each member does with the sampler ----
 #
 # One record per fn: file, name, driver signature, `RoundTotals`, a `RoundCfg`
 # parameter, a `RoundCfg` it builds, a `sampler_cfg` parameter, a draw built
-# from the sampler, a configuration carrying it. A body this scan cannot read
-# back is reported rather than skipped.
+# from the sampler, a configuration carrying it, an unreadable body, a
+# `rollback_round` call. A body this scan cannot read back is reported rather
+# than skipped.
 
 records=$(
   find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
-    xargs -0 awk '
+    xargs -0 awk "$AWK_TEXT_FNS"'
       function reset() {
         in_sig = 0; awaiting_body = 0; in_body = 0; fname = ""
-        depth = 0; paren = 0; cfg_depth = 0
+        depth = 0; paren = 0; cfg_depth = 0; draw_depth = 0
         has_step = 0; has_stats = 0; has_cfg = 0; makes_cfg = 0
-        has_param = 0; draws = 0; cfg_carries = 0; unreadable = 0
+        has_param = 0; draws = 0; cfg_carries = 0; unreadable = 0; has_roll = 0
       }
       function flush() {
         if (fname != "") {
-          printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", \
+          printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", \
             FILENAME, fname, has_step, has_stats, has_cfg, makes_cfg, \
-            has_param, draws, cfg_carries, unreadable
+            has_param, draws, cfg_carries, unreadable, has_roll
         }
         reset()
       }
@@ -178,19 +189,22 @@ records=$(
       }
 
       in_sig {
-        if (index($0, "step_fn: &mut dyn FnMut(&ProbeStep)") > 0) { has_step = 1 }
-        if ($0 ~ /sampler_cfg:[[:space:]]*&/) { has_param = 1 }
-        if (index($0, "RoundCfg") > 0) { has_cfg = 1 }
+        # A commented-out parameter is not a parameter, and a parenthesis inside
+        # a comment must not end the list.
+        sig = decomment($0)
+        if (index(sig, "step_fn: &mut dyn FnMut(&ProbeStep)") > 0) { has_step = 1 }
+        if (sig ~ /sampler_cfg:[[:space:]]*&/) { has_param = 1 }
+        if (index(sig, "RoundCfg") > 0) { has_cfg = 1 }
         # A per-parameter `) -> ` is inside the list and must not end the scan,
         # which is how a `sampler_cfg` declared after `step_fn` went unseen.
-        paren += gsub(/\(/, "(") - gsub(/\)/, ")")
+        paren += gsub(/\(/, "(", sig) - gsub(/\)/, ")", sig)
         if (paren <= 0) {
           in_sig = 0
           awaiting_body = 1
-          if (index($0, "{") > 0) {
+          if (index(sig, "{") > 0) {
             awaiting_body = 0
             in_body = 1
-            depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+            depth = gsub(/\{/, "{", sig) - gsub(/\}/, "}", sig)
             if (depth < 0) { depth = 0 }
           }
         }
@@ -198,10 +212,11 @@ records=$(
       }
 
       awaiting_body {
-        if (index($0, "{") > 0) {
+        head = decomment($0)
+        if (index(head, "{") > 0) {
           awaiting_body = 0
           in_body = 1
-          depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+          depth = gsub(/\{/, "{", head) - gsub(/\}/, "}", head)
           if (depth < 0) { depth = 0 }
         }
         next
@@ -209,38 +224,61 @@ records=$(
 
       !in_body { next }
 
-      index($0, "RoundTotals {") > 0 { has_stats = 1 }
+      { code = blank_strings(decomment($0)) }
 
-      # The draw a loop uses, built from the request`s sampler. Two spellings:
-      # the shared `VerifierDraw`, and the stochastic acceptance rule`s own RNG
-      # stream seeded from the same configuration.
-      (index($0, "VerifierDraw::new(") > 0 && index($0, "sampler_cfg") > 0) ||
-      index($0, "Pcg32::new(sampler_cfg.seed_or_default())") > 0 {
-        draws = 1
+      index(code, "RoundTotals {") > 0 { has_stats = 1 }
+      index(code, "rollback_round(") > 0 &&
+      code !~ /fn[[:space:]]+rollback_round\(/ { has_roll = 1 }
+
+      # The draw a loop uses, built from the request`s sampler. Two
+      # constructions: the shared `VerifierDraw`, and the stochastic acceptance
+      # rule`s own RNG stream seeded from the same configuration. Each is
+      # followed to its closing parenthesis, so a wrapped argument list reads
+      # like a single-line one — a gate that refused a correct loop for the
+      # width of its line would be repaired by widening the line.
+      draw_depth == 0 &&
+      (index(code, "VerifierDraw::new(") > 0 || index(code, "Pcg32::new(") > 0) {
+        rest = code
+        if (index(code, "VerifierDraw::new(") > 0) {
+          sub(/^.*VerifierDraw::new\(/, "", rest)
+        } else {
+          sub(/^.*Pcg32::new\(/, "", rest)
+        }
+        draw_depth = 1 + gsub(/\(/, "(", rest) - gsub(/\)/, ")", rest)
+        if (index(rest, "sampler_cfg") > 0) { draws = 1 }
+        if (draw_depth < 0) { draw_depth = 0 }
+        depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
+        if (depth <= 0) { flush() }
+        next
+      }
+      draw_depth > 0 {
+        if (index(code, "sampler_cfg") > 0) { draws = 1 }
+        draw_depth += gsub(/\(/, "(", code) - gsub(/\)/, ")", code)
+        if (draw_depth < 0) { draw_depth = 0 }
       }
 
       # The configuration an entry builds, and whether the sampler is in it. The
       # literal is followed to its closing brace, so a `sampler_cfg` further
       # down the body is not read as one the entry handed over.
-      index($0, "RoundCfg {") > 0 {
+      index(code, "RoundCfg {") > 0 {
         makes_cfg = 1
-        rest = $0
+        rest = code
         sub(/^.*RoundCfg[[:space:]]*\{/, "", rest)
         cfg_depth = 1 + gsub(/\{/, "{", rest) - gsub(/\}/, "}", rest)
         if (index(rest, "sampler_cfg") > 0) { cfg_carries = 1 }
         if (cfg_depth <= 0) { cfg_depth = 0 }
-        depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
         if (depth <= 0) { flush() }
         next
       }
       cfg_depth > 0 {
-        if (index($0, "sampler_cfg") > 0) { cfg_carries = 1 }
-        cfg_depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        if (index(code, "sampler_cfg") > 0) { cfg_carries = 1 }
+        cfg_depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
         if (cfg_depth < 0) { cfg_depth = 0 }
       }
 
       {
-        depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
         if (depth <= 0) { flush() }
       }
       END {
@@ -251,7 +289,7 @@ records=$(
 )
 
 loops=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1 && $4 == 1')
-entries=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1 && $4 == 0 && $6 == 1')
+entries=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1 && $4 == 0 && $6 == 1 && $11 == 0')
 
 if [ -z "$loops" ]; then
   note "check-spec-sampling: found no round loop under ${loops_dir#"$root"/}."
@@ -275,7 +313,7 @@ population_flat=$(printf '%s\n' "$population" | tr '\n' ' ')
 
 callers=$(
   find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
-    xargs -0 awk -v names="$population_flat" -v exempt="$EXEMPT_LOOP" '
+    xargs -0 awk -v names="$population_flat" -v exempt="$EXEMPT_LOOP" "$AWK_TEXT_FNS"'
       BEGIN { n = split(names, list, " "); for (i = 1; i <= n; i++) { if (list[i] != "") { pop[list[i]] = 1 } } }
       function reset() {
         in_sig = 0; awaiting_body = 0; in_body = 0; fname = ""
@@ -309,39 +347,43 @@ callers=$(
       }
 
       in_sig {
-        paren += gsub(/\(/, "(") - gsub(/\)/, ")")
+        sig = decomment($0)
+        paren += gsub(/\(/, "(", sig) - gsub(/\)/, ")", sig)
         if (paren <= 0) {
           in_sig = 0
           awaiting_body = 1
-          if (index($0, "{") > 0) {
+          if (index(sig, "{") > 0) {
             awaiting_body = 0; in_body = 1
-            depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+            depth = gsub(/\{/, "{", sig) - gsub(/\}/, "}", sig)
             if (depth < 0) { depth = 0 }
           }
         }
         next
       }
       awaiting_body {
-        if (index($0, "{") > 0) {
+        head = decomment($0)
+        if (index(head, "{") > 0) {
           awaiting_body = 0; in_body = 1
-          depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+          depth = gsub(/\{/, "{", head) - gsub(/\}/, "}", head)
           if (depth < 0) { depth = 0 }
         }
         next
       }
       !in_body { next }
 
+      { code = blank_strings(decomment($0)) }
+
       call_depth > 0 {
-        if (index($0, "sampler_cfg") > 0) { carries = 1 }
-        call_depth += gsub(/\(/, "(") - gsub(/\)/, ")")
+        if (index(code, "sampler_cfg") > 0) { carries = 1 }
+        call_depth += gsub(/\(/, "(", code) - gsub(/\)/, ")", code)
         if (call_depth <= 0) { close_call() }
-        depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
         if (depth <= 0) { flush() }
         next
       }
 
       {
-        line = $0
+        line = code
         while (match(line, /[A-Za-z_][A-Za-z0-9_]*\(/)) {
           name = substr(line, RSTART, RLENGTH - 1)
           line = substr(line, RSTART + RLENGTH)
@@ -355,7 +397,7 @@ callers=$(
       }
 
       {
-        depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+        depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
         if (depth <= 0) { flush() }
       }
       END { flush() }
@@ -368,8 +410,9 @@ loop_count=0
 entry_count=0
 path_count=0
 forwarded_count=0
+exempt_seen=0
 
-while IFS=$'\t' read -r file name _sig _stats has_cfg _mk has_param draws _carries unreadable; do
+while IFS=$'\t' read -r file name _sig _stats has_cfg _mk has_param draws _carries unreadable _roll; do
   [ -n "$name" ] || continue
   rel="${file#"$root"/}"
   loop_count=$((loop_count + 1))
@@ -386,6 +429,7 @@ while IFS=$'\t' read -r file name _sig _stats has_cfg _mk has_param draws _carri
     continue
   fi
   if [ "$name" = "$EXEMPT_LOOP" ]; then
+    exempt_seen=$((exempt_seen + 1))
     continue
   fi
   if [ "$has_param" != "1" ] && [ "$has_cfg" != "1" ]; then
@@ -407,7 +451,7 @@ done <<<"$loops"
 
 # ---- Rule 2: the entries ----------------------------------------------------
 
-while IFS=$'\t' read -r file name _sig _stats _cfgp _mk has_param _draws carries unreadable; do
+while IFS=$'\t' read -r file name _sig _stats _cfgp _mk has_param _draws carries unreadable _roll; do
   [ -n "$name" ] || continue
   rel="${file#"$root"/}"
   entry_count=$((entry_count + 1))
@@ -508,4 +552,5 @@ if [ "$fail" = "1" ]; then
   exit 1
 fi
 
-echo "OK: $loop_count loops ($forwarded_count forwarded), $entry_count entries, $guard_count guards — $path_count drafter paths take the request's sampler and draw with it; $arm_count drafter arms pass it."
+read_paths=$((path_count - exempt_seen))
+echo "OK: $loop_count loops ($forwarded_count forwarded), $entry_count entries, $guard_count guards — $read_paths of $path_count drafter paths take the request's sampler and draw with it (\`$EXEMPT_LOOP\` is the recorded exception); $arm_count drafter arms pass it."

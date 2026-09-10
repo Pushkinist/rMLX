@@ -455,7 +455,7 @@ check-spec-sampling: ## CI gate: fail if a speculative round loop is not handed 
 	@bash scripts/check_spec_sampling.sh
 
 .PHONY: check-spec-sampling-fixtures
-check-spec-sampling-fixtures: ## CI gate: recall test for the above — 18 cases over two tree shapes, each asserting the reason as well as exit 1 vs exit 2
+check-spec-sampling-fixtures: ## CI gate: recall test for the above — 23 cases over two tree shapes, each asserting the reason as well as exit 1 vs exit 2
 	@bash scripts/check_spec_sampling_fixtures.sh
 
 .PHONY: check-spec-charge
@@ -463,7 +463,7 @@ check-spec-charge: ## CI gate: fail if a speculative round loop names more than 
 	@bash scripts/check_spec_charge.sh
 
 .PHONY: check-spec-charge-fixtures
-check-spec-charge-fixtures: ## CI gate: recall test for the above — 65 cases over three tree shapes, each asserting the reason as well as exit 1 vs exit 2
+check-spec-charge-fixtures: ## CI gate: recall test for the above — 70 cases over three tree shapes, each asserting the reason as well as exit 1 vs exit 2
 	@bash scripts/check_spec_charge_fixtures.sh
 
 .PHONY: check-published-samples

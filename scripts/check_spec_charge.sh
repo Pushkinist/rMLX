@@ -39,7 +39,10 @@
 #              loop's seed and is handed the totals rather than naming any.
 #       Within (a) a loop is FORWARDED when its *parameter list* carries
 #       `RoundCfg`, the configuration type that holds the charge field, and
-#       CLASSIC otherwise. Membership is read off the signature and never off
+#       CLASSIC otherwise. The parameter is resolved by that declared type; a
+#       list that destructures it, or declares it twice, leaves this scan unable
+#       to say which parameter the rule is about, and it refuses rather than
+#       reading the last one written. Membership is read off the signature and never off
 #       the binding: a loop that hard-wires its charge still takes the
 #       configuration, so it is still forwarded and RULE 8 still reaches it.
 #       Reading membership off the binding instead would make RULE 8
@@ -85,11 +88,17 @@
 #   A fn that is not a round loop and calls `rollback_round` is either a loop
 #   the derivation lost or a drafter rolling its own state back. The first reads
 #   as a census that moved, which invites the census to be edited, and is exit 2.
-#   The second is population (c), and its `charge` argument must be a field of
-#   one of its own parameters — the decision handed down from the loop that
-#   ordered it. A literal or a `phases_charged()` there is a second decision
-#   made where nothing can hold it to that loop, and is exit 1; an argument this
-#   scan cannot read back is exit 2.
+#   The second is population (c), and its `charge` argument carries the decision
+#   handed down from the loop that ordered it. Where the fn is handed the
+#   round's context — a parameter whose declared type is `RoundCtx` — the charge
+#   is `<ctx>.charged` and nothing else; where it is not, the looser reading
+#   applies and any field of any of its own parameters will do. The strict arm
+#   closes the hole in the loose one: a second parameter carrying a field of the
+#   same name satisfies "a field of one of its own parameters" while holding a
+#   different decision, and nothing downstream can see which was read. A literal
+#   or a `phases_charged()` is a second decision made where nothing can hold it
+#   to that loop, and is exit 1; an argument this scan cannot read back is
+#   exit 2.
 #
 #   `rollback_round` is the shared refold-or-disarm, and it is not itself a
 #   site: it forwards the `charge` its caller named, down to the low-level
@@ -219,12 +228,13 @@
 #
 #   And the configuration the loop was handed is read-only inside it. RULE 8
 #   constrains the token; without this it constrains nothing, because the value
-#   can be moved instead. A `let` that rebinds the parameter's own name — the
-#   loop building its own configuration and forwarding faithfully from that —
-#   writes no `charged:` site and passes every reading. So does an assignment to
-#   the charge field of a `mut` parameter. Both are exit 2: the decision the
-#   entry made is no longer the decision the loop applies, and no reading
-#   downstream can see it.
+#   can be moved instead, and every way of moving it writes no `charged:` site
+#   and passes every other reading. Four spellings, all exit 2: a `let` that
+#   rebinds the parameter's own name — the loop building its own configuration
+#   and forwarding faithfully from that — an assignment to the whole parameter
+#   through its reference, an assignment to one of its fields, and a `mem::`
+#   call that swaps it out. In each the decision the entry made is no longer the
+#   decision the loop applies, and no reading downstream can see it.
 #
 #   RULE 8 and the census are complementary and neither alone covers the
 #   hard-wire. A forwarded loop that writes `let charge = false;` is caught
@@ -269,10 +279,12 @@
 #   finds nothing must not report a pass.
 #
 # PORTABILITY
-#   The argument list is joined on `\x1f` inside awk. That escape is what
-#   BSD awk on macOS reads, which is the only awk `make ci` runs here; it is not
-#   exercised against gawk or mawk, and a run under either should check that a
-#   readable call is still read before trusting a clean result.
+#   The argument list is joined on `\x1f` inside awk, which BSD awk on macOS
+#   reads and which is the awk `make ci` runs here. Measured under gawk 5.4.1
+#   and mawk 1.3.4 as well: both give the same verdict on the tree and on every
+#   case of the recall test. That is a measurement and not a guarantee — a
+#   needle that reaches for an extension one of the three does not have would
+#   break it silently, so a new one is worth running under all three.
 
 set -uo pipefail
 
@@ -297,11 +309,12 @@ fi
 
 # awk walks each file once and emits one record per function, tab-separated:
 #
-#   1 file          6 charged: sites      11 constructs RoundCfg
-#   2 fn            7 low-level rollbacks 12 writes the configuration
-#   3 driver sig    8 round emits         13 binding of the fn's token
-#   4 RoundTotals   9 phase-target names  14 parameter names
-#   5 rollbacks    10 RoundCfg parameter  15 tokens, space-joined
+#   1 file          6 charged: sites      11 RoundCtx parameter
+#   2 fn            7 low-level rollbacks 12 constructs RoundCfg
+#   3 driver sig    8 round emits         13 writes the configuration
+#   4 RoundTotals   9 phase-target names  14 binding of the fn's token
+#   5 rollbacks    10 RoundCfg parameter  15 parameter names
+#                                         16 tokens, space-joined
 #
 # A token of `?` is a site whose value this scan could not read back — reported
 # as a scan error rather than skipped, because an unread site is exactly the one
@@ -310,26 +323,16 @@ fi
 # A function opens at a `fn` item and closes when its brace depth returns to
 # zero. A nested `fn` inside a body is not opened: the enclosing loop is the
 # unit the rules are about.
-# A line's code, with any comment removed. Quote-aware, so a `//` inside a string
-# literal is not a comment and the line is not truncated at it. Shared by both of
-# this gate's readings: every needle below is a substring test, and a name is
-# most likely to be written without being used in the sentence explaining it.
-readonly DECOMMENT='
-      function decomment(s,   i, n, q, ch) {
-        n = length(s); q = 0
-        for (i = 1; i <= n; i++) {
-          ch = substr(s, i, 1)
-          if (q && ch == "\\") { i++; continue }
-          if (ch == "\"") { q = !q; continue }
-          if (!q && ch == "/" && substr(s, i + 1, 1) == "/") { return substr(s, 1, i - 1) }
-        }
-        return s
-      }
-'
+# The two text readers this gate shares with the other source-scanning gates:
+# `decomment`, used everywhere below, and `blank_strings`, which this gate does
+# NOT use — RULE 7 reads the per-round event's target as a literal, and blanking
+# string bodies would make that rule unfireable.
+# shellcheck source=lib/awk_text.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/awk_text.sh"
 
 records=$(
   find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
-    xargs -0 awk "$DECOMMENT"'
+    xargs -0 awk "$AWK_TEXT_FNS"'
       # A value this gate can read: a bare identifier, or one field access.
       # Anything else is `?` — a call, a cast, a negation or a chain is not the
       # field it resembles.
@@ -343,7 +346,8 @@ records=$(
         in_sig = 0; awaiting_body = 0; in_body = 0; in_call = 0; fname = ""
         depth = 0; paren = 0; args = ""; has_step = 0; has_stats = 0
         nroll = 0; nrec = 0; nlow = 0; nemit = 0; ntarget = 0
-        cfg_param = ""; cfg_seen = 0; makes_cfg = 0; cfg_written = 0
+        cfg_param = ""; cfg_seen = 0; cfg_dup = 0; makes_cfg = 0; cfg_written = 0
+        ctx_param = ""; ctx_seen = 0; ctx_dup = 0
         delete toks; delete bcount; delete bfirst; delete blast; delete bodd
         delete params
       }
@@ -407,15 +411,34 @@ records=$(
         if (bcount[name] > 1) { return "multi:" blast[name] }
         return "ok:" bfirst[name]
       }
+      # A parameter resolved by its declared type: its name, `-` when the type
+      # is not in the list, `?` when the list carries it and this scan cannot
+      # say which parameter it is — unnamed, destructured, or declared twice,
+      # where a rule that picked one would be reading the wrong one.
+      function typed_param(seen, name, dup) {
+        if (!seen) { return "-" }
+        if (dup || name == "") { return "?" }
+        return name
+      }
+      # The parameter whose declared type is `want`, read off a signature line.
+      function param_of_type(line, want,   cand) {
+        cand = line
+        if (cand !~ ("[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:[[:space:]]*&?[[:space:]]*(mut[[:space:]]+)?" want)) { return "" }
+        sub("[[:space:]]*:[[:space:]]*&?[[:space:]]*(mut[[:space:]]+)?" want ".*$", "", cand)
+        sub(/^.*[^A-Za-z0-9_]/, "", cand)
+        if (cand ~ /^[A-Za-z_][A-Za-z0-9_]*$/) { return cand }
+        return ""
+      }
       function flush(   t, joined, plist) {
         if (fname != "") {
           joined = ""
           for (t in toks) { joined = (joined == "") ? t : joined " " t }
           plist = ""
           for (t in params) { plist = (plist == "") ? t : plist " " t }
-          printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%d\t%d\t%s\t%s\t%s\n", \
+          printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n", \
             FILENAME, fname, has_step, has_stats, nroll, nrec, nlow, nemit, \
-            ntarget, (cfg_seen ? (cfg_param == "" ? "?" : cfg_param) : "-"), \
+            ntarget, typed_param(cfg_seen, cfg_param, cfg_dup), \
+            typed_param(ctx_seen, ctx_param, ctx_dup), \
             makes_cfg, cfg_written, bindinfo(), (plist == "" ? "-" : plist), joined
         }
         reset()
@@ -444,32 +467,38 @@ records=$(
 
       # -- the parameter list ----------------------------------------------
       in_sig {
-        if (index($0, "step_fn: &mut dyn FnMut(&ProbeStep)") > 0) { has_step = 1 }
-        collect_params($0)
-        # The configuration type, resolved by its declared type and not by the
-        # name of any binding. A parameter list that destructures it leaves the
-        # parameter unnamed, which is a shape this gate refuses rather than
-        # guesses at.
-        if (index($0, "RoundCfg") > 0) {
+        # Read the code and not the comment beside it, here as everywhere else:
+        # a `// not a RoundCfg` in a parameter list would otherwise name a type
+        # the fn does not take, and an unbalanced parenthesis inside a comment
+        # would end the parameter list early.
+        sig = decomment($0)
+        if (index(sig, "step_fn: &mut dyn FnMut(&ProbeStep)") > 0) { has_step = 1 }
+        collect_params(sig)
+        # The two types resolved by declaration and not by the name of any
+        # binding. A parameter list that destructures one, or declares it twice,
+        # leaves this scan unable to say which parameter a rule is about — a
+        # shape it refuses rather than guesses at.
+        if (index(sig, "RoundCfg") > 0) {
           cfg_seen = 1
-          cand = $0
-          if (cand ~ /[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:[[:space:]]*&?[[:space:]]*(mut[[:space:]]+)?RoundCfg/) {
-            sub(/[[:space:]]*:[[:space:]]*&?[[:space:]]*(mut[[:space:]]+)?RoundCfg.*$/, "", cand)
-            sub(/^.*[^A-Za-z0-9_]/, "", cand)
-            if (cand ~ /^[A-Za-z_][A-Za-z0-9_]*$/) { cfg_param = cand }
-          }
+          cand = param_of_type(sig, "RoundCfg")
+          if (cand != "") { if (cfg_param != "") { cfg_dup = 1 } else { cfg_param = cand } }
+        }
+        if (index(sig, "RoundCtx") > 0) {
+          ctx_seen = 1
+          cand = param_of_type(sig, "RoundCtx")
+          if (cand != "") { if (ctx_param != "") { ctx_dup = 1 } else { ctx_param = cand } }
         }
         # A per-parameter `) -> ` is inside the list and must not end the scan.
-        paren += gsub(/\(/, "(") - gsub(/\)/, ")")
+        paren += gsub(/\(/, "(", sig) - gsub(/\)/, ")", sig)
         if (paren <= 0) {
           in_sig = 0
           awaiting_body = 1
           # A `where` clause sits between the closing parenthesis and the body,
           # so the body opens at the next `{` and not necessarily here.
-          if (index($0, "{") > 0) {
+          if (index(sig, "{") > 0) {
             awaiting_body = 0
             in_body = 1
-            depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+            depth = gsub(/\{/, "{", sig) - gsub(/\}/, "}", sig)
             if (depth < 0) { depth = 0 }
           }
         }
@@ -477,10 +506,11 @@ records=$(
       }
 
       awaiting_body {
-        if (index($0, "{") > 0) {
+        head = decomment($0)
+        if (index(head, "{") > 0) {
           awaiting_body = 0
           in_body = 1
-          depth = gsub(/\{/, "{") - gsub(/\}/, "}")
+          depth = gsub(/\{/, "{", head) - gsub(/\}/, "}", head)
           if (depth < 0) { depth = 0 }
         }
         next
@@ -506,10 +536,17 @@ records=$(
       (index(code, "RoundCfg {") > 0 || index(code, "RoundCfg::") > 0) { makes_cfg = 1 }
 
       # RULE 8, the read-only half: the configuration handed over is neither
-      # rebound under its own name nor written through.
+      # rebound under its own name nor written through. Four spellings, because
+      # the rule constrains the token and the value can be moved instead — a
+      # rebinding, an assignment to the whole parameter through its reference, an
+      # assignment to one of its fields, and a `mem::` call that swaps it out.
       cfg_param != "" &&
       (code ~ ("^[[:space:]]*let[[:space:]]+(mut[[:space:]]+)?" cfg_param "[[:space:]]*[=:]") ||
-       code ~ ("^[[:space:]]*" cfg_param "\\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[^=]")) {
+       code ~ ("^[[:space:]]*\\*?[[:space:]]*" cfg_param "[[:space:]]*=[^=]") ||
+       code ~ ("^[[:space:]]*" cfg_param "\\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[^=]") ||
+       ((index(code, "mem::replace(") > 0 || index(code, "mem::swap(") > 0 ||
+         index(code, "mem::take(") > 0) &&
+        code ~ ("[^A-Za-z0-9_]" cfg_param "[^A-Za-z0-9_]"))) {
         cfg_written = 1
       }
 
@@ -591,7 +628,7 @@ records=$(
 loops=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1 && $4 == 1')
 # (b) entries: the signature, no totals, no rollback, and it builds the config.
 entries=$(printf '%s\n' "$records" |
-  awk -F'\t' '$3 == 1 && $4 == 0 && $5 == 0 && $11 == 1')
+  awk -F'\t' '$3 == 1 && $4 == 0 && $5 == 0 && $12 == 1')
 # RULE 4: a rollback outside (a). A fn that also drives a generation or names a
 # `charged:` field is a loop the derivation lost, not a drafter's own rollback.
 lost=$(printf '%s\n' "$records" |
@@ -601,7 +638,7 @@ drafter_rollbacks=$(printf '%s\n' "$records" |
 # RULE 5: a `charged:` in a fn that is in neither population.
 strays=$(printf '%s\n' "$records" |
   awk -F'\t' '$6 > 0 && !($3 == 1 && $4 == 1) &&
-              !($3 == 1 && $4 == 0 && $5 == 0 && $11 == 1)')
+              !($3 == 1 && $4 == 0 && $5 == 0 && $12 == 1)')
 # RULE 6: the low-level rollback named outside `round_common.rs`, or named
 # inside it by a round loop, which the file's exemption is not for.
 lowlevel=$(printf '%s\n' "$records" |
@@ -614,7 +651,7 @@ lowlevel=$(printf '%s\n' "$records" |
 # cannot open.
 target_strays=$(
   find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
-    xargs -0 awk "$DECOMMENT"'
+    xargs -0 awk "$AWK_TEXT_FNS"'
       { c = decomment($0) }
       (index(c, "PHASE_TARGET") > 0 || index(c, "rmlx::spec::phase") > 0) &&
       !(FILENAME in seen) { seen[FILENAME] = 1; print FILENAME }
@@ -650,7 +687,7 @@ report_shadow() {
   note "  nothing in this scan can say which binding governs which site."
 }
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg _mk _wr _bind _params _tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg _ctx _mk _wr _bind _params _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` rolls a round's caches back and is"
   note "  not one of the round loops this gate derived. Either the derivation lost a"
@@ -660,7 +697,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _
   scan_error=1
 done <<<"$lost"
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit ntarget _cfg _mk _wr _bind _params _tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit ntarget _cfg _ctx _mk _wr _bind _params _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` is a round loop and names the"
   note "  per-round event's target $ntarget time(s). The file that owns the target may"
@@ -679,7 +716,7 @@ while IFS= read -r file; do
   scan_error=1
 done <<<"$target_strays"
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec nlow _nemit _ntarget _cfg _mk _wr _bind _params _tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec nlow _nemit _ntarget _cfg _ctx _mk _wr _bind _params _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` makes $nlow call(s) to the low-level"
   note "  rollback beneath \`rollback_round\`. Those take a \`charge\` of their own at a call"
@@ -689,7 +726,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec nlow _nemit _ntarget _c
   scan_error=1
 done <<<"$lowlevel"
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _mk _wr _bind _params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _ctx _mk _wr _bind _params tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` writes $nrec \`charged:\` field(s) — $tokens —"
   note "  and is neither a round loop nor an entry that builds one's configuration, so"
@@ -701,7 +738,7 @@ done <<<"$strays"
 
 # RULE 4's new arm: a drafter rolling its own state back carries the decision it
 # was handed, as a field of one of its own parameters.
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg _mk _wr _bind params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg ctx _mk _wr _bind params tokens; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   count=$(printf '%s\n' "$tokens" | tr ' ' '\n' | grep -c '[^[:space:]]')
@@ -712,7 +749,29 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _
     scan_error=1
     continue
   fi
+  if [ "$ctx" = "?" ]; then
+    note "check-spec-charge: $rel: \`$fn\` takes a \`RoundCtx\` this gate could not name —"
+    note "  a destructured parameter, one declared twice, or a shape it does not read. The"
+    note "  rule resolves the context by its declared type, so a parameter it cannot name"
+    note "  is a parameter it cannot hold this rollback's charge to."
+    scan_error=1
+    continue
+  fi
   owner="${tokens%%.*}"
+  if [ "$ctx" != "-" ]; then
+    # The round's context is the one thing that carries the loop's decision
+    # down, so where a fn declares one, the charge comes off it and off nothing
+    # else. Any other parameter with a `charged`-shaped field would otherwise
+    # satisfy the looser reading below while carrying a different decision.
+    if [ "$tokens" != "$ctx.charged" ]; then
+      note "check-spec-charge: $rel: \`$fn\` is handed the round's context in \`$ctx\` and"
+      note "  rolls back on \`$tokens\`. A drafter's rollback charges what the loop handed"
+      note "  it — \`$ctx.charged\` — and a second parameter with a field of the same name is"
+      note "  a different decision under a spelling this gate would otherwise accept."
+      fail=1
+    fi
+    continue
+  fi
   if [ "$owner" = "$tokens" ] ||
     ! printf '%s\n' "$params" | tr ' ' '\n' | grep -qx -- "$owner"; then
     note "check-spec-charge: $rel: \`$fn\` rolls a round back on \`$tokens\`, which is not a"
@@ -724,7 +783,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _
 done <<<"$drafter_rollbacks"
 
 # Population (b): the entries.
-while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _mk _wr bind _params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _ctx _mk _wr bind _params tokens; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   entry_count=$((entry_count + 1))
@@ -777,7 +836,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _c
 done <<<"$entries"
 
 # Population (a): the round loops, classic and forwarded.
-while IFS=$'\t' read -r file fn _sig _stats nroll nrec _nlow nemit _ntarget cfg _mk cfg_written bind _params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats nroll nrec _nlow nemit _ntarget cfg _ctx _mk cfg_written bind _params tokens; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   if [ "$cfg" != "-" ]; then

@@ -380,6 +380,8 @@ run "the exempt loop renamed is no longer exempt" 1 \
 # 12. And the exemption is load-bearing rather than decorative: struck out of a
 #     copy of the gate, the clean tree is refused, naming the one loop it covers.
 build_root "$root"
+mkdir -p "$work/lib"
+cp "$(dirname "$script")/lib/awk_text.sh" "$work/lib/awk_text.sh"
 sed 's/^readonly EXEMPT_LOOP=.*/readonly EXEMPT_LOOP=""/' "$script" >"$work/no_exempt.sh"
 run_script "$work/no_exempt.sh" "the recorded exemption is what passes the two-model greedy loop" 1 \
   "\`spec_generate_greedy_cached\` drives a generation but takes neither a"
@@ -423,6 +425,48 @@ printf '//! The path that used to be here.\n' \
   >"$root/crates/rmlx-models/src/speculative/mtp.rs"
 run "a lost entry is a scan error, not a quieter run" 2 \
   "the tree has 6 drafter generation paths and records"
+
+# 18. A needle in a comment is not the call it names. The commented-out draw is
+#     what a change like this leaves behind, and beside a greedy one it is a
+#     loop that ignores the request while reading as one that honours it.
+build_root "$root"
+perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    // let mut draw = super::VerifierDraw::new(sampler_cfg);\n    let mut draw = super::VerifierDraw::new(\&greedy());|' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a commented-out draw is not a draw" 1 \
+  "\`mtp_generate\` is handed the request's sampler and builds"
+
+# 19. The same on the signature side: a commented-out parameter is not one, and
+#     a scan that read it would find a sampler the fn never takes.
+build_root "$root"
+perl -0pi -e 's|    sampler_cfg: &crate::sampler::SamplerConfig,|    // sampler_cfg: \&crate::sampler::SamplerConfig,|; s|super::VerifierDraw::new\(sampler_cfg\)|super::VerifierDraw::new(\&greedy())|' \
+  "$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
+run "a commented-out sampler parameter is not a parameter" 1 \
+  "\`mtp_assistant_generate\` drives a generation but takes neither a"
+
+# 20. And a needle inside a string literal is text a program prints, not a
+#     construction it makes.
+build_root "$root"
+perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    let note = "VerifierDraw::new(sampler_cfg)";\n    let mut draw = super::VerifierDraw::new(\&greedy());|' \
+  "$root/crates/rmlx-models/src/speculative/dflash.rs"
+run "a needle inside a string literal is not a draw" 1 \
+  "\`dflash_generate\` is handed the request's sampler and builds"
+
+# 21. The converse, and the reason the construction is followed to its closing
+#     parenthesis: a correct loop must not be refused for the width of its line.
+build_root "$root"
+perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    let mut draw = super::VerifierDraw::new(\n        sampler_cfg,\n    );|' \
+  "$root/crates/rmlx-models/src/speculative/eagle3.rs"
+run "a draw wrapped over two lines is still a draw" 0 \
+  "OK: 7 loops (0 forwarded), 0 entries, 1 guards"
+
+# 22. Every needle reads code, the parameter list included: a comment naming a
+#     type or a marker in a signature is prose, and reading it would move the
+#     population.
+build_root "$root"
+perl -0pi -e 's|    device: Device,\n\) -> Result<Vec<ProbeStep>> \{|    device: Device, // not a RoundCfg, and no step_fn: \&mut dyn FnMut(\&ProbeStep) here\n) -> Result<Vec<ProbeStep>> {|' \
+  "$root/crates/rmlx-models/src/speculative/dflash2/round.rs"
+run "a comment in a parameter list is prose, not a declaration" 0 \
+  "OK: 7 loops (0 forwarded), 0 entries, 1 guards"
 
 echo
 if [ "$failures" != "0" ]; then

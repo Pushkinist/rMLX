@@ -954,7 +954,7 @@ build_mid_root "$root"
 drafter_rollback_src "false" \
   >>"$root/crates/rmlx-models/src/speculative/mtp.rs"
 run "a drafter rollback that decides for itself is refused" 1 \
-  "\`rollback\` rolls a round back on \`false\`, which is not a"
+  "\`rollback\` is handed the round's context in \`ctx\` and"
 
 # R11. An argument the scan cannot read back is unreadable, not absent — the
 #      same disposition the record side has.
@@ -1071,6 +1071,50 @@ perl -0pi -e 's/    let charge_phases = super::phases_charged\(\);\n//' \
   "$root/crates/rmlx-models/src/speculative/mtp.rs"
 run "a loop naming a token it never binds is refused" 1 \
   "\`mtp_generate\` names \`charge_phases\` as its decision and never binds"
+
+# R25. The looser reading's own hole, closed. A second parameter carrying a
+#      field of the same name satisfies "a field of one of its own parameters"
+#      while holding a different decision, so where a fn is handed the round's
+#      context the charge comes off that and off nothing else.
+build_mid_root "$root"
+drafter_rollback_src "v.charged" \
+  >>"$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a drafter rollback charging off the wrong parameter is refused" 1 \
+  "\`rollback\` is handed the round's context in \`ctx\` and"
+
+# R26. RULE 8's read-only half is about the value and not one spelling of it:
+#      the whole configuration replaced through its own reference writes no site
+#      any other reading here can see.
+build_mid_root "$root"
+perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: \&mut RoundCfg,/; s/    let charge = cfg\.charged;/    *cfg = RoundCfg::uncharged();\n    let charge = cfg.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop assigning through the configuration's reference is a scan error" 2 \
+  "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
+
+# R27. The same, moved rather than assigned.
+build_mid_root "$root"
+perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: \&mut RoundCfg,/; s/    let charge = cfg\.charged;/    let old = std::mem::replace(cfg, RoundCfg::uncharged());\n    let charge = old.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a forwarded loop swapping its configuration out is a scan error" 2 \
+  "\`round_loop_generate\` rebinds or writes \`cfg\`, the configuration it"
+
+# R28. Two parameters of the configuration's type. A rule that took the last one
+#      declared would read the loop's token against the wrong parameter, and
+#      which one it read would depend on the order they were written in.
+build_mid_root "$root"
+perl -0pi -e 's/    cfg: &RoundCfg,/    cfg: \&RoundCfg,\n    fallback: \&RoundCfg,/; s/    let charge = cfg\.charged;/    let charge = fallback.charged;/' \
+  "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "a loop taking two configurations is a scan error, not a guess" 2 \
+  "\`round_loop_generate\` takes a \`RoundCfg\` this gate could not name"
+
+# R29. Every needle reads code, the parameter list included. A comment naming a
+#      type in a signature is prose: read as declarations, it would make a
+#      classic loop forwarded and a helper a round loop.
+build_mid_root "$root"
+perl -0pi -e 's/    device: Device,\n\) -> Result<\(\)> \{/    device: Device, \/\/ not a RoundCfg, and not a RoundCtx either\n) -> Result<()> {/' \
+  "$root/crates/rmlx-models/src/speculative/dflash.rs"
+run "a comment in a parameter list is prose, not a declaration" 0 \
+  "OK: 6 classic, 1 forwarded, 1 entries; census charge_phases:3 false:4 (7 sites)."
 
 echo
 if [ "$failures" != "0" ]; then

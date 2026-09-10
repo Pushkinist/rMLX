@@ -551,9 +551,15 @@ The rules over them:
   loop hard-wiring a literal contributes one and the census reads eight.
 - **RULE 4** gains population (c): a rollback outside a round loop that looks
   like neither a loop nor a record is no longer exit 2 outright, but its
-  `charge` argument must be a field of one of its own parameters. A literal or a `phases_charged()` there is a second decision made
-  where nothing can hold it to the loop that ordered it, and is exit 1; an
-  argument the scan cannot read back stays exit 2.
+  `charge` argument carries what the loop handed it. Where the fn is handed the
+  round's context — a parameter whose declared type is `RoundCtx` — that is
+  `<ctx>.charged` and nothing else; where it is not, any field of any of its own
+  parameters will do. The strict arm closes the loose one's hole: a second
+  parameter with a field of the same name satisfies "a field of one of its own
+  parameters" while carrying a different decision, and nothing downstream can
+  see which was read. A literal or a `phases_charged()` there is a second
+  decision made where nothing can hold it to the loop that ordered it, and is
+  exit 1; an argument the scan cannot read back stays exit 2.
 - **RULE 5** keeps its needle and inverts its verdict for population (b) alone:
   a `charged:` in a fn with no driver signature is exit 1 exactly as now. Over
   (b) it becomes a rule rather than a membership test — an entry states exactly
@@ -582,8 +588,10 @@ The rules over them:
   be moved instead. A `let` that rebinds the parameter's own name — the loop
   building its own configuration and forwarding faithfully from that — writes no
   `charged:` site and passes every reading. So does an assignment to the charge
-  field of a `mut` parameter. Both are **exit 2**: the decision the entry made is
-  no longer the decision the loop applies, and no reading downstream can see it.
+  field of a `mut` parameter. Two more spell the same move: an assignment to
+  the whole parameter through its reference, and a `mem::` call that swaps it
+  out. All four are **exit 2**: the decision the entry made is no longer the
+  decision the loop applies, and no reading downstream can see it.
 
 The two readings are complementary and neither alone covers the hard-wire. A
 forwarded loop that writes `let charge = false;` is caught **twice**: by RULE 8,
@@ -606,7 +614,8 @@ only a count, where RULE 8 names the line.
    counts as forwarded.
 2. The binding reader records **per binding**, keyed to the loop's own charge
    token. It used to set one flag per function with a good binding outranking a
-   bad one, so a shadow passed. **Measured on this tree, before the re-key**: a `mtp.rs` that binds
+   bad one, so a shadow passed. **Measured on this tree, before the re-key**: a
+   `mtp.rs` that binds
    `charge_phases` to `super::phases_charged()` and then rebinds it to `false`
    on the next line exits 0 with `OK: 7 speculative round loops … census
    charge_phases:3 false:4` — a loop that charges nothing, counted among the
@@ -649,9 +658,11 @@ built on one of two tree shapes the campaign passes through — mid-campaign, wi
 one drafter migrated, and the end state, with all seven decisions in entries.
 They are stated here with the exit and the reason each produces. Two of them
 assert two reasons on the one tree, and case 16 is run on both arms, so the
-twenty-three are twenty-six runs of the harness, beside the thirty-eight the gate
-already had and one more for a token whose sites name it and whose binding the
-scan never saw.
+twenty-three are twenty-six runs of the harness, beside the thirty-eight the
+gate already had and six more: a token whose sites name it and whose binding the
+scan never saw, the three further ways a forwarded loop can move its
+configuration rather than read it, a rollback that charges off the wrong
+parameter, and a comment in a parameter list, which is prose.
 
 Cases 1 and 12 ask for a reason the old success line did not carry: it printed
 the loop count and the census and nothing about populations. The line now names
