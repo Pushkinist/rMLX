@@ -18,9 +18,16 @@ engine and a digest over them compares two machines' load.
 
 A digest pins bytes and says nothing about what they are, so the script reads
 every line before it hashes one: a round event carries the round's index, what
-it accepted and how many proposals it accepted them from, and carries no
-wall-clock field. A file of well-formed JSON that is not a round stream is
-refused rather than digested.
+it accepted, how many proposals it accepted them from and how many tokens the
+request has emitted by the end of it, and carries no wall-clock field. A file of
+well-formed JSON that is not a round stream is refused rather than digested.
+
+The emitted total is the fourth for a reason worth stating: a round whose phase
+timers do not partition it emits an `error!` beside its own line, and that
+report names the round's index, its accepted count and its proposals so a reader
+can act on it. Three fields would let that report into the stream, moving the
+cell and doubling one round for everything that counts them. It carries no
+running emitted total, and that is what keeps it out.
 
 This is the observable the equivalence pairs cannot supply. They read the
 answer, and greedy verification emits the verifier's own argmax at every

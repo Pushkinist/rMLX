@@ -93,8 +93,10 @@ TOTAL_ROUNDS = 3862
 # Mirrors `ROUND_EVENT_FIELDS` in `crates/rmlx-models/tests/common/round_stream.rs`,
 # which is the filter the engine writes these files through — stated again here
 # because this side has to be able to refuse a file of well-formed JSON that is
-# not a round stream.
-ROUND_EVENT_FIELDS = ("round", "accept", "num_draft")
+# not a round stream. `emitted_total` is the fourth for the reason that side
+# gives: it is what a round line carries and the overrun `error!` beside it does
+# not, so a broken phase timer cannot put a second line in a round's stream.
+ROUND_EVENT_FIELDS = ("round", "accept", "num_draft", "emitted_total")
 
 
 def cells(directory: pathlib.Path) -> dict[str, pathlib.Path]:

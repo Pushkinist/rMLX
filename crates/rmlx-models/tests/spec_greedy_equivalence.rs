@@ -3054,14 +3054,16 @@ fn write_round_stream(test: &str, prompt: &str, rounds: &[CapturedEvent]) {
 }
 
 /// A round in the shape every loop emits, one from a loop that keeps no phase
-/// split, and a request-level line that is not a round.
-fn emit_two_rounds_and_a_request_line() {
+/// split, the `error!` a round with a broken phase timer emits beside its own
+/// line, and a request-level line that is not a round.
+fn emit_two_rounds_an_overrun_and_a_request_line() {
     tracing::debug!(
         target: PHASE_SWITCH_TARGET,
         round = 3,
         accept = 2,
         num_draft = 4,
         n_committed = 3,
+        emitted_total = 11,
         projected_rows = 3,
         round_ms = 20.5,
         "speculative round"
@@ -3072,7 +3074,21 @@ fn emit_two_rounds_and_a_request_line() {
         accept = 2,
         num_draft = 4,
         n_committed = 3,
+        emitted_total = 14,
         "speculative round"
+    );
+    // The overrun report, on the round target, at ERROR, naming the round's own
+    // figures — which the recorder admits and the classifier reads by shape.
+    tracing::error!(
+        target: PHASE_SWITCH_TARGET,
+        round = 4,
+        accept = 2,
+        num_draft = 4,
+        refolded = false,
+        charged = false,
+        round_ms = 1.0,
+        draft_ms = 4.0,
+        "speculative round phases claim more time than the round has"
     );
     tracing::debug!(target: "rmlx_models::speculative", "a request-level line, not a round");
 }
@@ -3096,7 +3112,7 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
         assert!(
             !tracing::enabled!(target: "rmlx_models::speculative::eagle3", tracing::Level::TRACE)
         );
-        emit_two_rounds_and_a_request_line();
+        emit_two_rounds_an_overrun_and_a_request_line();
     });
 
     let captured = recorder.events();
@@ -3104,11 +3120,42 @@ fn the_round_stream_recorder_keeps_a_round_and_charges_no_phase() {
     assert_eq!(
         rounds.len(),
         2,
-        "two rounds were emitted and the request-level line is not one: {rounds:?}"
+        "two rounds were emitted; neither the request-level line nor the overrun \
+         report is one: {rounds:?}"
     );
-    // The negative control has to be excluded for the reason `round_events`
-    // gives, not by luck: a request-level line that grew all three fields would
-    // otherwise quietly join the stream and this fixture would still read 3.
+    // The overrun is the negative control that matters, because it is the only
+    // non-round line emitted on the round's own target and at a level the
+    // recorder admits. It names the round's index, what it accepted and how many
+    // proposals it accepted them from — three of the four — so what keeps it out
+    // is the fourth, and a classifier narrowed back to three would put a second
+    // line in this round's stream.
+    let overrun: Vec<&CapturedEvent> = captured
+        .iter()
+        .filter(|e| {
+            e.message
+                .starts_with("speculative round phases claim more time")
+        })
+        .collect();
+    assert_eq!(overrun.len(), 1, "the overrun report was captured");
+    assert_eq!(
+        overrun[0].field("emitted_total"),
+        None,
+        "the overrun is a statement about one round's clock and carries no running \
+         emitted total, which is what excludes it: {:?}",
+        overrun[0]
+    );
+    for f in ["round", "accept", "num_draft"] {
+        assert!(
+            overrun[0].field(f).is_some(),
+            "the overrun names the round's own figures, so {f} is not what excludes \
+             it: {:?}",
+            overrun[0]
+        );
+    }
+    // The second negative control, off the round's target: it has to be excluded
+    // for the reason `round_events` gives, not by luck. A request-level line
+    // that grew all four fields would otherwise quietly join the stream and this
+    // fixture would still read 2.
     let control: Vec<&CapturedEvent> = captured
         .iter()
         .filter(|e| e.message == "a request-level line, not a round")
