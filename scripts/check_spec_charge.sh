@@ -86,6 +86,28 @@
 #   reader on a property the compiler already holds — but the compiler cannot
 #   see a source edit that has not been built.
 #
+# RULE 7 (one seam for the round event, and one file that can name its target)
+#   Every round loop closes its round through `log_round`, the one emitter, and
+#   the target that emitter writes on is named in `round_stats.rs` and nowhere
+#   else. A loop that keeps its charge decision honest and writes its own
+#   `tracing::debug!` on that target, with the same fields in the same order,
+#   produces a byte-identical line — so the pinned round-stream digests agree,
+#   the equivalence pairs agree, and this gate's own census agrees. Measured:
+#   that mutation passes every check in this tree. What it silently drops is the
+#   charged round's carry check and the guarantee that a field added to the
+#   shared record reaches that loop.
+#
+#   Two readings again, and both are needed. **By name**: `PHASE_TARGET` or the
+#   literal `rmlx::spec::phase` outside `round_stats.rs` is exit 2 — a loop that
+#   cannot name the target cannot write on it, which is the structural half.
+#   **By call**: each round loop calls `log_round(` exactly once. Zero is a loop
+#   that left the seam; two or more is a second record shape under one target,
+#   which is the shape the collapse removed.
+#
+#   The name is private to `round_stats.rs` in the tree, so the first reading is
+#   a second reader on a property the compiler already holds — and the compiler
+#   cannot see a source edit that has not been built.
+
 # RULE 5 (nothing names the decision outside the population either)
 #   A fn that is not a round loop and carries a `charged:` field names a
 #   decision this gate cannot check against a rollback, because there is none in
@@ -114,9 +136,11 @@
 #   0 clean, 1 a rule fired, 2 the gate could not scan — a missing tree, no
 #   round loop found, a driver with no charge site in it (a rollback delegated
 #   to a helper is not a rollback this gate can read), a driver that reaches
-#   past the shared rollback to the low-level pair, a charge site outside the
-#   population, or a call, a field or a binding whose shape it could not read
-#   back. A scan that finds nothing must not report a pass.
+#   past the shared rollback to the low-level pair, a driver that does not reach
+#   the one round emit exactly once, the phase target named outside
+#   `round_stats.rs`, a charge site outside the population, or a call, a field or
+#   a binding whose shape it could not read back. A scan that finds nothing must
+#   not report a pass.
 #
 # PORTABILITY
 #   The argument list is joined on `\x1f` inside awk. That escape is what
@@ -147,7 +171,7 @@ fi
 # awk walks each file once and emits one record per function:
 #
 #   <file> <TAB> <fn> <TAB> <driver> <TAB> <rollbacks> <TAB> <records> <TAB>
-#   <low-level rollbacks> <TAB> <binds-phases_charged> <TAB>
+#   <low-level rollbacks> <TAB> <round emits> <TAB> <binds-phases_charged> <TAB>
 #   <tokens, space-joined>
 #
 # `driver` is 1 for a fn meeting both conditions above. A token of `?` is a site
@@ -166,14 +190,15 @@ records=$(
         in_sig = 0; awaiting_body = 0; in_body = 0; in_call = 0; fname = ""
         depth = 0; paren = 0; args = ""; has_step = 0; has_stats = 0
         bind_ok = 0; bind_bad = 0; bind_odd = 0; nroll = 0; nrec = 0; nlow = 0
+        nemit = 0
         delete toks
       }
       function flush(   t, joined) {
         if (fname != "") {
           joined = ""
           for (t in toks) { joined = (joined == "") ? t : joined " " t }
-          printf "%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n", \
-            FILENAME, fname, (has_step && has_stats), nroll, nrec, nlow, \
+          printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", \
+            FILENAME, fname, (has_step && has_stats), nroll, nrec, nlow, nemit, \
             (bind_odd ? "odd" : (bind_ok ? "ok" : (bind_bad ? "bad" : "none"))), joined
         }
         reset()
@@ -286,6 +311,13 @@ records=$(
         nlow++
       }
 
+      # RULE 7: the one round emit. A call, not the definition — the emitter is
+      # not a round loop and is not counted against itself.
+      index(stripped, "log_round(") > 0 &&
+      stripped !~ /fn[[:space:]]+log_round[[:space:]]*\(/ {
+        nemit++
+      }
+
       # Symmetric with the rollback side: any `charged:` is a site, and one
       # whose value is not a bare identifier is unreadable rather than absent.
       # A trailing comma is not required — a record`s last field carries none.
@@ -319,6 +351,15 @@ strays=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 0 && $5 > 0')
 lowlevel=$(printf '%s\n' "$records" |
   awk -v rc="$loops_dir/round_common.rs" -F'\t' '$6 > 0 && ($1 != rc || $3 == 1)')
 
+# RULE 7 by name: the phase target belongs to `round_stats.rs`. Anchored to that
+# one path, like RULE 6's exemption, so the same basename under another
+# directory is read like every other file.
+target_strays=$(
+  find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
+    xargs -0 grep -l -e 'PHASE_TARGET' -e 'rmlx::spec::phase' 2>/dev/null |
+    grep -v -x -F "$loops_dir/round_stats.rs"
+)
+
 if [ -z "$drivers" ]; then
   note "check-spec-charge: found no round loop under ${loops_dir#"$root"/}."
   note "  A round loop is a fn taking \`step_fn: &mut dyn FnMut(&ProbeStep)\` that builds"
@@ -330,7 +371,7 @@ fi
 loop_count=0
 census=""
 
-while IFS=$'\t' read -r file fn _driver _nroll _nrec _nlow _bind _tokens; do
+while IFS=$'\t' read -r file fn _driver _nroll _nrec _nlow _nemit _bind _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` rolls a round's caches back and is"
   note "  not one of the round loops this gate derived. Either the derivation lost a"
@@ -340,7 +381,17 @@ while IFS=$'\t' read -r file fn _driver _nroll _nrec _nlow _bind _tokens; do
   scan_error=1
 done <<<"$orphans"
 
-while IFS=$'\t' read -r file fn _driver _nroll _nrec nlow _bind _tokens; do
+while IFS= read -r file; do
+  [ -n "$file" ] || continue
+  note "check-spec-charge: ${file#"$root"/} names the per-round event's target."
+  note "  That target is \`round_stats.rs\`'s alone: a fn that can name it can write a"
+  note "  second round event beside the one \`log_round\` writes, with the same fields"
+  note "  in the same order — and a line that agrees byte for byte is invisible to the"
+  note "  pinned digests, to the equivalence pairs and to this census."
+  scan_error=1
+done <<<"$target_strays"
+
+while IFS=$'\t' read -r file fn _driver _nroll _nrec nlow _nemit _bind _tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` makes $nlow call(s) to the low-level"
   note "  rollback beneath \`rollback_round\`. Those take a \`charge\` of their own at a call"
@@ -350,7 +401,7 @@ while IFS=$'\t' read -r file fn _driver _nroll _nrec nlow _bind _tokens; do
   scan_error=1
 done <<<"$lowlevel"
 
-while IFS=$'\t' read -r file fn _driver _nroll nrec _nlow _bind tokens; do
+while IFS=$'\t' read -r file fn _driver _nroll nrec _nlow _nemit _bind tokens; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` writes $nrec \`charged:\` field(s) — $tokens —"
   note "  and is not a round loop, so no rollback in it says whether that is the decision"
@@ -359,7 +410,7 @@ while IFS=$'\t' read -r file fn _driver _nroll nrec _nlow _bind tokens; do
   fail=1
 done <<<"$strays"
 
-while IFS=$'\t' read -r file fn _driver nroll nrec nlow bind tokens; do
+while IFS=$'\t' read -r file fn _driver nroll nrec nlow nemit bind tokens; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   loop_count=$((loop_count + 1))
@@ -404,6 +455,15 @@ while IFS=$'\t' read -r file fn _driver nroll nrec nlow bind tokens; do
     note "  call, charges on requests the switch did not ask for and is counted here"
     note "  among the three that ask."
     fail=1
+    continue
+  fi
+  if [ "$nemit" != "1" ]; then
+    note "check-spec-charge: $rel: \`$fn\` reaches the one round emit $nemit time(s)."
+    note "  Every round loop closes its round through \`log_round\`, once. None is a loop"
+    note "  that left the seam and writes its own event, which the digests cannot see"
+    note "  when the line agrees; more than one is a second record shape under the one"
+    note "  target, which is what the collapse removed."
+    scan_error=1
     continue
   fi
   census="$census$tokens"$'\n'

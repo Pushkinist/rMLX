@@ -562,6 +562,47 @@ perl -0pi -e 's/            charged: charge_phases,\n        \},/            cha
 run "a record call handing the recorder the other decision is refused" 1 \
   "\`mtp_assistant_generate\` names more than one charge decision"
 
+# 31. RULE 7 by call: a loop that keeps every charge decision this gate reads
+#     and writes its own round event instead of calling the one emitter. On its
+#     own module target, which is the shape the collapse replaced.
+build_root "$root"
+perl -0pi -e 's/        super::log_round\(\n(?:.*\n)*?        \);\n/        tracing::debug!(\n            target: "rmlx_models::speculative::mtp",\n            loop_kind = ?SpecLoop::Kind,\n            round = rounds,\n            charged = charge_phases,\n            "speculative round"\n        );\n/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a loop that writes its own round event instead of calling the emit" 2 \
+  "\`mtp_generate\` reaches the one round emit 0 time(s)."
+
+# 32. RULE 7 by name, and the mutation the rule was written for: the same
+#     bypass on the shared target. Every field in the same order, so the line it
+#     writes is byte-identical to the one the emitter would have written and no
+#     digest, pair or census can see it. Only the name can.
+build_root "$root"
+perl -0pi -e 's/        super::log_round\(\n(?:.*\n)*?        \);\n/        tracing::debug!(\n            target: super::PHASE_TARGET,\n            loop_kind = ?SpecLoop::Kind,\n            round = rounds,\n            charged = charge_phases,\n            "speculative round"\n        );\n/' \
+  "$root/crates/rmlx-models/src/speculative/mtp.rs"
+run "a loop writing the shared target itself is refused by name" 2 \
+  "src/speculative/mtp.rs names the per-round event's target."
+
+# 33. RULE 7 by name, away from any loop: a helper that merely holds the string.
+#     Every loop still reaches the emitter exactly once, so the call reading is
+#     clean and the name reading is the only one that fires.
+build_root "$root"
+cat >>"$root/crates/rmlx-models/src/speculative/dflash.rs" <<'RS'
+
+fn phase_target() -> &'static str {
+    "rmlx::spec::phase"
+}
+RS
+run "a helper naming the phase target outside its file is refused" 2 \
+  "src/speculative/dflash.rs names the per-round event's target."
+
+# 34. RULE 7 by call, the other way: one loop closing its round twice. Two
+#     record shapes under one target is what the collapse removed, and a second
+#     line per round doubles that pair's count in the pinned baseline.
+build_root "$root"
+perl -0pi -e 's/(        super::log_round\(\n(?:.*\n)*?        \);\n)/$1$1/' \
+  "$root/crates/rmlx-models/src/speculative/eagle3.rs"
+run "a loop closing its round twice is refused" 2 \
+  "\`eagle3_generate\` reaches the one round emit 2 time(s)."
+
 echo
 if [ "$failures" != "0" ]; then
   echo "check-spec-charge-fixtures: $failures of $cases cases failed"

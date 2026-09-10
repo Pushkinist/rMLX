@@ -171,9 +171,16 @@ impl SpecLoop {
     }
 }
 
-/// The target the per-round phase split is logged under, and the switch that
-/// decides whether those phases are charged for the work they issue.
-pub(crate) const PHASE_TARGET: &str = "rmlx::spec::phase";
+/// The target the per-round event is logged under, and the switch that decides
+/// whether a round's phases are charged for the work they issue.
+///
+/// Private to this module. Naming it is what a loop would need to write a round
+/// event of its own beside the one [`log_round`] writes, and a second event on
+/// this target with the same fields is invisible to every observable in the
+/// crate — the digests agree because the line agrees. `make check-spec-charge`
+/// refuses the name outside this file for the same reason it refuses the
+/// low-level rollback outside `round_common.rs`.
+const PHASE_TARGET: &str = "rmlx::spec::phase";
 
 /// Whether this request's round loop should force each phase's work before
 /// closing its span.
