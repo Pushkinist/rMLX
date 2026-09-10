@@ -297,17 +297,20 @@ enum ReportSkippedBy {
 enum ChainRefusedBy {
     /// On the proposals themselves, before the verify forward.
     TheProposalChain,
-    /// On the verifier input the empty chain produces, one step later.
+    /// On the verifier input the empty chain produces. The same test, one
+    /// statement later: a two-model round's verifier carry is always one token,
+    /// so the input is under two positions exactly when the chain is empty.
     TheVerifierInput,
 }
 
 /// What each round loop declares at its edges, and the file that holds it.
 ///
 /// This table is the statement; the two tests below are readings of it against
-/// today's source. Both facts become per-drafter declarations in the engine when
-/// the loops collapse, and this table is then re-keyed onto those declarations
-/// with the same seven rows — which is why it is data rather than seven
-/// assertions.
+/// today's source. It is data rather than seven assertions because it is what
+/// survives the collapse: the resident-KV disposition becomes a `RoundDrafter`
+/// declaration, the first migration re-keys the reading onto that declaration,
+/// and each migration drops its own file from [`LOOP_SOURCES`] in the same
+/// commit while these rows stay as they are. See `docs/SPEC_ROUND_SKELETON.md`.
 const DISPOSITIONS: [(SpecLoop, &str, ReportSkippedBy, ChainRefusedBy); 7] = [
     (
         SpecLoop::MtpSidecar,
@@ -399,15 +402,21 @@ const LOOP_SOURCES: [(&str, &str); 6] = [
     ),
 ];
 
-/// The four edge markers, each as the character the reading below renders it as.
+/// The five edge markers, each as the character the reading below renders it as.
 ///
 /// `E` is the early exit, `W` the head of the round loop, `G` either spelling of
-/// the empty-chain refusal, `P` the report of the verifier's resident KV.
-const MARKERS: [(char, &str); 5] = [
+/// the empty-chain refusal, `R` the request record a loop closes on, `P` the
+/// report of the verifier's resident KV.
+///
+/// `R` is what makes the reading see a report moved *into* the round loop: with
+/// four markers a report placed after the refusal reads the same as one at the
+/// tail, because nothing marked where the loop ended.
+const MARKERS: [(char, &str); 6] = [
     ('E', "return Ok((emitted"),
     ('W', "while emitted.len() < n_tokens"),
     ('G', "draft_tokens.is_empty()"),
     ('G', "v_k < 2"),
+    ('R', "log_request_record("),
     ('P', "report_verifier_kv_bytes("),
 ];
 
@@ -439,14 +448,16 @@ fn marker_sequence(src: &str) -> String {
 /// How the markers of one loop fall in source order, given which exit skips the
 /// report.
 ///
-/// A loop that skips it on the seed exit returns before the round loop opens and
-/// reports after it closes; a loop with no seed has its early exit inside the
-/// round loop, past the refusal. Those are two different orderings of the same
-/// four markers, which is what makes this reading positional rather than a count.
+/// A loop that skips it on the seed exit returns before the round loop opens,
+/// then records and reports after it closes. A loop with no seed has its early
+/// exit inside the round loop, past the refusal, and writes its own record
+/// before returning — so its record site appears twice, once on each exit. Those
+/// are two different orderings of the same five markers, which is what makes
+/// this reading positional rather than a count.
 fn expected_pattern(skipped_by: ReportSkippedBy) -> &'static str {
     match skipped_by {
-        ReportSkippedBy::TheSeedExit => "EWGP",
-        ReportSkippedBy::TheInRoundExit => "WGEP",
+        ReportSkippedBy::TheSeedExit => "EWGRP",
+        ReportSkippedBy::TheInRoundExit => "WGRERP",
     }
 }
 
@@ -459,17 +470,19 @@ fn expected_pattern(skipped_by: ReportSkippedBy) -> &'static str {
 /// is the one thing a single shared round loop cannot keep without carrying a
 /// per-drafter flag for it, so a chunk that collapses the loops decides it here.
 ///
-/// The reading is by position and not by count, because the mutation this holds
-/// moves a call rather than adding one: a report hoisted above the seed-EOS
-/// return inverts the disposition and leaves every total unchanged.
+/// The reading is by position and not by count, because the mutations this holds
+/// move a call rather than adding one: a report hoisted above the seed-EOS
+/// return inverts the disposition, and one lowered into the round loop skips it
+/// on both exits, each leaving every total unchanged.
 ///
-/// **It reads text, and the distance to what it claims is exactly between "the
-/// call is written here" and "the call reports the verifier's caches".** A report
-/// computed from the drafter's stack passes this and every other check in the
-/// tree — see the mutation table in `docs/SPEC_ROUND_SKELETON.md`.
+/// **It reads text, in statement order, and is blind past that.** The distance
+/// to what it claims is between "the call is written here" and "the call runs
+/// and reports the verifier's caches": a report at the declared position inside
+/// a branch that never executes reads identical, and so does one handed the
+/// drafter's stack. See the mutation table in `docs/SPEC_ROUND_SKELETON.md`.
 ///
 /// Mutation: move any loop's `report_verifier_kv_bytes` call above its early
-/// return, or delete it.
+/// return, or below the head of its round loop, or delete it.
 #[test]
 fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
     for (file, src) in LOOP_SOURCES {
@@ -482,8 +495,8 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
             marker_sequence(src),
             want,
             "{file}: the early exit (E), the round loop (W), the empty-chain \
-             refusal (G) and the resident-KV report (P) do not fall in the order \
-             the table declares for the loop(s) it holds"
+             refusal (G), the request record (R) and the resident-KV report (P) \
+             do not fall in the order the table declares for the loop(s) it holds"
         );
     }
 }
@@ -497,11 +510,14 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
 /// and a request that silently emits one token per round at full cost. Nothing
 /// at runtime covers its loss: no gate serves a drafter that proposes nothing.
 ///
-/// The two spellings are not interchangeable. Five loops refuse the proposals;
-/// the two-model pair refuses the verifier input the empty chain produces, one
-/// step later, having already taken a drafting forward per proposal. A shared
-/// loop has one refusal, so both spellings go at the same moment and one of the
-/// two families changes where it stops.
+/// The two spellings are the same test taken one statement apart, and both
+/// families reach it after every drafting forward the round takes — a two-model
+/// round's verifier carry is always one token, so an input under two positions
+/// is an empty chain and nothing else. Neither family stops anywhere the other
+/// would not, and a shared loop with one refusal moves no request. What it
+/// replaces is seven `Error::Model` texts with one, and what that one still has
+/// to say is that an empty chain is a broken drafter and not the end of the
+/// request.
 ///
 /// Mutation: drop either spelling from any loop, or move a loop from one
 /// spelling to the other without moving its row.

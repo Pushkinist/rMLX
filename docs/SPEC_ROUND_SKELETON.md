@@ -43,6 +43,10 @@ implements in its own module.
 
 ```rust
 pub(crate) trait RoundDrafter {
+    /// Which of this loop's two exits skips the report of the verifier's
+    /// resident KV. A declared per-loop skip — see item 7.
+    const KV_REPORT_SKIPPED_BY: ReportSkippedBy;
+
     /// Prefill, the token the request emits before its first round, and how long
     /// the prefill took. `None` is a pair that emits nothing until a round runs.
     fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled>;
@@ -58,23 +62,34 @@ pub(crate) trait RoundDrafter {
 
     /// Return the drafter's own state to the accepted prefix. `None` is a
     /// drafter that keeps nothing across rounds.
-    fn rollback(&mut self, ctx: &RoundCtx<'_>, v: &Verdict, emit: RoundEmit)
+    fn rollback(&mut self, ctx: &RoundCtx<'_>, v: &Verdict, out: RoundOutcome)
         -> Result<Option<CacheSpan>>;
 
     /// Condition the next round on what this one committed. `None` is a drafter
     /// that carries no conditioning buffer.
-    fn condition(&mut self, ctx: &RoundCtx<'_>, v: &Verdict, emit: RoundEmit)
+    fn condition(&mut self, ctx: &RoundCtx<'_>, v: &Verdict, out: RoundOutcome)
         -> Result<Option<Conditioning>>;
 }
 ```
 
 `Prefilled` carries the seed, this drafter's own `prefill_ns`, and whether the
-drafter carries a conditioning buffer — see items 9 and 10 below for why the
-last two are the drafter's to state. `Verdict` carries the accepted count, the
-tokens the round commits, and — for a restricted-vocabulary drafter — how long
-this round's restricted prefix is. `RoundEmit` is what
-`round_common::emit_round_tokens` already returns: the committed count and
-whether a token stopped the request.
+drafter projects a conditioning buffer and reports the rows it accumulated — see
+items 9 and 10 below for why the last two are the drafter's to state. `Verdict`
+carries the accepted count, the tokens the round commits, and — for a
+restricted-vocabulary drafter — how long this round's restricted prefix is.
+
+```rust
+pub(crate) struct RoundOutcome { pub emit: RoundEmit, pub verifier_target: i32 }
+```
+
+`RoundEmit` is what `round_common::emit_round_tokens` already returns: the
+committed count and whether a token stopped the request. `verifier_target` is
+where the loop's own rollback left the verifier's caches, and it is handed over
+because the Gemma4 assistant reads it — its next round's shared K/V offset *is*
+that target. Without it in the signature the first migration would re-derive
+`rollback_target_from_head` inside a drafter, which is the duplication this
+campaign exists to remove. One producer, the loop; one consumer today, the
+assistant's `condition`.
 
 `RoundCtx` carries the verifier, its two cache stacks, the device, the request's
 `VerifierDraw` and the charge decision. The draw is in it because every `verify`
@@ -125,8 +140,8 @@ their first producer, and re-keys the report onto them.
 
 ## What the interface cannot express, and what is proposed for it
 
-Ten things. Seven are expressible with no branch in the loop; three are decisions
-the owner has to take, marked as such.
+Eleven things. Nine are expressible with no branch in the loop; one is a declared
+per-loop skip; one is a decision the owner has to take, marked as such.
 
 1. **The stochastic acceptance rule.** `spec_generate_stochastic_cached` does not
    compare tokens: it builds the verifier's post-sampling distribution at every
@@ -151,19 +166,27 @@ the owner has to take, marked as such.
 4. **DFlash 1's adaptive block.** `dflash_next_block_size` opens with
    `round_block` and then moves the result by the accept rate of the recent
    rounds. Proposed: the `block` method, six defaults and one override.
-5. **The block figure the caller reads back, and its two exits.** The five
+5. **The block figure the caller reads back, and the five seed exits.** The five
    sidecar loops return the widest block any round ran; the two two-model loops
-   return the widest *proposal count*, one less. Both families return something
-   else again on the seed or in-round EOS exit — the *resolved* block, not the
-   widest that ran, which contradicts every one of their doc comments. The server
-   discards the figure for every loop; only
-   `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs` reads it, for the
-   MTP sidecar's normal exit. Proposed: the loop returns the widest block that
-   ran on every exit including the EOS ones, and the two-model entry subtracts
-   one, so the unit stays in the module that owns it. Changing the EOS exits'
-   value is a change to a figure with one reader on one loop, and that reader
-   does not exercise an EOS exit — which is why it is listed here rather than
-   done quietly.
+   return the widest *proposal count*, one less, and
+   `spec_generate_greedy` adds one back on the way out — the unit boundary is
+   that one `map` at the end of the dispatcher, and the two-model per-loop entry
+   is where the subtraction goes so the value the dispatcher receives is
+   unchanged.
+
+   **This figure is gated, on every arm and every prompt.** The equivalence
+   harness asserts the driver's returned block against the block the pair runs
+   at, for all six pairs, so it is not a figure the collapse may quietly move:
+   it must be byte-identical per loop, and no pair reading is re-blessed for it.
+   The server discards it, and
+   `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs` reads it too, but
+   the pairs are what pin it.
+
+   What is *not* gated is the five sidecar **seed** exits, which return the
+   resolved block rather than the widest that ran — a round has not run there, so
+   the two differ, and no gate prompt stops on its seed. The two in-round EOS
+   exits already return the widest that ran. Proposed: the loop returns the
+   widest block that ran on every exit, which changes those five values alone.
 6. **The verifier offset a round reports.** The Gemma4 assistant reads it before
    its verify forward and counts forward over the accepted prefix; the other six
    read it after and count back from the tail. The two spellings name the same
@@ -193,15 +216,26 @@ the owner has to take, marked as such.
    EOS; the two two-model loops do the opposite, having no seed. One loop has one
    exit shape.
 
-   **Proposed, and it is a behaviour change: every exit reports.** The figure has
-   one writer — a speculative request never goes through
-   `Architecture::generate_greedy` — so a request that skips it leaves the
-   previous request's figure readable to a caller that samples around the call.
-   The two exits that skip it today are the two that would read stale.
+   **Proposed: preserved exactly, as a declared per-loop skip.**
+   `KV_REPORT_SKIPPED_BY` is the declaration, and the loop reads it at its two
+   exits. It is the one per-drafter flag the loop branches on, and it is here
+   rather than hidden because the alternative is a behaviour change the campaign
+   is not for.
 
-   This changes no baseline cell, no pair reading and no gate. That is exactly
-   why it must be written down here rather than merged: see "the mutation I
-   could not catch" below.
+   The alternative is worth stating, and it is **not adopted**: the figure has
+   one writer — a speculative request never goes through
+   `Architecture::generate_greedy` — so a request that skips the report leaves
+   the previous request's figure readable to a caller that samples around the
+   call, and the two exits that skip it are the two that would read stale.
+   Unifying them changes no baseline cell, no pair reading and no gate, which is
+   exactly why it is not folded into a refactor whose contract is that nothing
+   moves. It is a separate change, on its own evidence, after the collapse.
+
+   The declaration is also what keeps the test below alive across the campaign:
+   the seven-row table is re-keyed onto `KV_REPORT_SKIPPED_BY` in migration
+   chunk 1, and each chunk drops its own file from the source scan in the same
+   commit. Without the declaration the first migration would delete a loop the
+   test still reads and leave nothing in its place.
 8. **What a round conditions on.** DFlash 1 conditions on the round's *committed*
    count and DFlash 2 on `accept + 1`, at the same two calls — the row count
    handed to `committed_rows` and the bound handed to `guard_round_conditioning`.
@@ -211,15 +245,26 @@ the owner has to take, marked as such.
    the emission, which happens between `verify` and `condition`. Proposed: the
    loop's order is verify, emit, verifier rollback, drafter rollback, condition,
    and the `RoundEmit` the emission returned is passed to the last two.
-9. **Whether a drafter carries a conditioning buffer, before its first round.**
+9. **Whether a drafter projects a conditioning buffer, before its first round.**
    The request record's `conditioned_rows` is `Some(0)` on the seed-EOS record of
    DFlash 1 and DFlash 2 and `None` on the other five — a statement about the
    drafter, made before any round has run. Fourteen `RoundTotals` literals state
    it today, and one loop-built literal cannot know it. Proposed: `Prefilled`
    declares it, and the loop reads that declaration for both the seed record and
-   the tail record. Without the declaration the two `Some(0)`s become `None` and
-   nothing anywhere sees it: `RoundStats::conditioning_violation` is guarded on
-   `None` and passes.
+   the tail record.
+
+   The discriminator is **"projects its conditioning and reports the rows it
+   accumulated"**, not "holds a conditioning buffer". The MTP sidecar holds one —
+   a single verifier row it slices per round — and reports `None`, because it
+   projects nothing and accumulates nothing. A declaration keyed on holding a
+   buffer would move the MTP sidecar's record, which is a cell that may not move.
+
+   The declaration decides `Some` against `None` and nothing else: the value
+   inside is an accumulator the two block loops add each round's projected rows
+   to, under a `.max(0)` clamp, and stays the loop's own running figure.
+
+   Without the declaration the two `Some(0)`s become `None` and nothing anywhere
+   sees it: `RoundStats::conditioning_violation` is guarded on `None` and passes.
 10. **What `prefill_ns` covers.** The three loops that prefill the prompt less
     its last token close the span before their round-0 carry forward; DFlash 2
     closes it after its whole-prompt capture, trim and projection but before the
@@ -228,6 +273,16 @@ the owner has to take, marked as such.
     `prefill` returns its own `prefill_ns` and the loop does not time it. A loop
     that timed the call would move the figure on five of seven records and no
     gate would see it.
+11. **What the empty-chain refusal says.** The two spellings are the same test:
+    a two-model round's verifier carry is always one token, so `v_k < 2` holds
+    exactly when the proposal chain is empty, and both families reach their check
+    after every drafting forward the round takes. Neither family stops anywhere
+    the other would not. What differs is the `Error::Model` message — seven
+    texts, each naming its own loop and its own reason. Proposed: one refusal
+    with one message, and the seven texts are the cost. They are not on any
+    gate's path, so the disposition is recorded here rather than defended: the
+    message that survives must still say that an empty chain is a broken drafter
+    and not the end of the request, which is the part a reader acts on.
 
 ## Migration order
 
@@ -241,11 +296,15 @@ and a byte-identical round stream.
    which snapshot to fetch. It exercises the charged arm (`phases_charged()` and
    `RoundPhases`), the head-basis offset of item 6, the `None` recurrent stack,
    a drafter that keeps no cache of its own, and the sliding-window ring's
-   rollback. It answers `None` to both `rollback` and `condition`, so it proves
-   the loop and the two optional arms and nothing about the two paired structs —
-   which is why those wait for chunk 2. This chunk also carries the gate re-key
-   below: a migrated entry leaves the charge gate's derived population the moment
-   its body goes.
+   rollback, and it is the one consumer of `RoundOutcome::verifier_target`. It
+   answers `None` to both `rollback` and `condition`, so it proves the loop and
+   the two optional arms and nothing about the two paired structs — which is why
+   those wait for chunk 2. This chunk also carries two re-keys: the charge gate
+   below, because a migrated entry leaves its derived population the moment its
+   body goes; and the disposition test below, which moves onto
+   `KV_REPORT_SKIPPED_BY` and drops `gemma4_assistant.rs` from its source scan in
+   the same commit. Every later chunk drops its own file the same way, and the
+   seven-row table is what does not change.
 2. **The MTP sidecar.** The complement, and the first producer of `CacheSpan` and
    `Conditioning`: a recurrent refold, a drafter cache rolled back by offset, a
    single conditioning row with no projection beside it, and a
@@ -258,7 +317,11 @@ and a byte-identical round stream.
    where DFlash 2 conditions on the acceptance.
 5. **EAGLE-3.** The restricted vocabulary, the attribution buffer, a drafter that
    rolls back by re-running, and the only `verify` that reads `draw.sampling()`
-   to decide which of two read-backs it may take.
+   to decide which of two read-backs it may take. Its `accept_and_reseed` is a
+   rollback, a conditioning and a reseed in one call, so all of it goes in
+   `rollback`, `condition` returns `None`, and the drafter-side target is read
+   back off the cache afterwards rather than computed — which is what makes it
+   the cross-check on the verifier's target that the round line calls it.
 6. **The two-model greedy loop.** Two full models, a draft-side rollback with its
    own tape, no seed, and the resync that prepends the last draft token on a full
    accept. It is also where the raw `argmax` read-back becomes the context's
@@ -323,6 +386,11 @@ answer after a draft-side change says that run's near-ties happened not to move.
 - The exit behaviour of every loop: the seed-EOS exit that returns before any
   round, the in-round EOS exit that stops the request, the empty-chain refusal,
   and the token budget that caps the emission without capping the acceptance.
+- The driver's returned block on every normal exit, which the equivalence
+  harness asserts for every arm on every prompt.
+- What the empty-chain refusal tells a reader: seven texts become one, and the
+  one that survives still has to say that an empty chain is a broken drafter and
+  not the end of the request.
 - The sampler read: every driver takes the request's sampler and reads it.
 - `charged` per drafter — three loops charge, four do not, and no migration
   changes which.
@@ -348,7 +416,8 @@ answer after a draft-side change says that run's near-ties happened not to move.
 | **the seed-EOS exit stops returning early** | nothing at runtime: no round runs, so no round line is written, and no gate prompt has an EOS seed | **new, none** |
 | **the resident-KV report moved to another exit, or computed from the wrong caches** | nothing at runtime | **new, none** |
 | **`conditioned_rows` on a seed-EOS record falls from `Some(0)` to `None`** | nothing: `conditioning_violation` is guarded on `None`, the round stream sees no request that ran no round, and no pair has an EOS seed | **new, none** |
-| **the block figure changes unit, or an EOS exit returns the widest instead of the resolved block** | nothing for six of the seven loops: the server discards it, and the one test that reads it reads the MTP sidecar's normal exit | **new, none** |
+| the block figure changes unit on a normal exit | the equivalence harness asserts the driver's returned block on every arm and every prompt | yes |
+| **a seed exit returns the widest that ran instead of the resolved block** | nothing: no gate prompt stops on its seed | **new, none** |
 | the empty-chain refusal lost | nothing at runtime — a drafter that proposes nothing makes the acceptance walk answer rather than refuse, and the round silently emits one token | **new, none** |
 | `prefill_ns` recomposed by the loop | nothing: five of seven records would move and the figure has no bound to fail | **new, none** |
 
@@ -358,9 +427,22 @@ a **seven-row table** naming, per loop, which exit skips the resident-KV report
 and how the loop refuses an empty proposal chain; the source scan is a *reading*
 of that table against today's tree, positional rather than by count, so a report
 moved to the other exit fails rather than passing on an unchanged total. The
-table is the part that survives the collapse: when the disposition becomes a
-per-drafter declaration in the engine, the test re-keys onto the declaration and
-keeps the same seven rows.
+table is the part that survives the collapse: `KV_REPORT_SKIPPED_BY` is the same
+statement in the engine, chunk 1 re-keys the test onto it, and each chunk drops
+its own file from the scan.
+
+Five markers, not four. The reading is of the early exit, the head of the round
+loop, the empty-chain refusal, the tail request record and the resident-KV
+report — measured, `EWGRP` for a loop that skips the report on its seed and
+`WGRERP` for one that skips it in a round, because an in-round EOS exit writes
+its own record before it returns. Four markers left an undeclared escape: a
+report moved *into* the round loop after the refusal read `EWGP`, unchanged,
+because there was no marker for where the loop ends.
+
+**The residual, declared.** The reading is of statement order and not of
+reachability. A report at the position the table names, inside a branch that
+never runs, reads identical — and so does one whose arguments are wrong, which is
+the row below.
 
 ### The mutation I could not catch
 
@@ -374,8 +456,9 @@ figure, a green `make ci`, a green `make gpu-test` and 36 of 36 matching
 round-stream cells. The table above pins where the call is, and cannot pin what
 it reads.
 
-The proposal in item 7 is itself in this class, which is the reason it is written
-here as a decision to take rather than merged as a tidy-up.
+The unification item 7 declines is itself in this class, which is the reason it
+is written there as a change to take on its own evidence rather than folded into
+a refactor.
 
 Naming what would close it, since it is out of this chunk's scope: the figure
 would need a second reader — a request-level assertion that the verifier's
@@ -408,13 +491,21 @@ forwarded side, exactly as RULE 2 holds the deciding side.**
 Three populations, all derived, none a name list:
 
 - **(a) round loops** — the signature plus a `RoundTotals`, unchanged. Within it,
-  a loop whose charge token binds to a field of one of its own parameters is
-  **forwarded**; every other member is **classic**.
-- **(b) entries** — a fn carrying the driver signature that writes exactly one
-  `charged:` field, constructs no `RoundTotals` and calls no `rollback_round`.
-  Seven of them at the end of the campaign, each naming the decision once, at
-  the call that runs the loop, in the drafter's own module.
+  a loop is **forwarded** when its *parameter list* carries the configuration
+  type that holds the charge field, and **classic** otherwise.
+- **(b) entries** — a fn carrying the driver signature that constructs no
+  `RoundTotals` and calls no `rollback_round`. Seven of them at the end of the
+  campaign, each naming the decision once, at the call that runs the loop, in
+  the drafter's own module.
 - **(c) drafter rollbacks** — a fn outside (a) that calls `rollback_round`.
+
+**Membership is read off the signature; the census is keyed on the binding, and
+the two must not be the same reading.** A loop that hard-wires its charge still
+takes the configuration, so it is still forwarded and RULE 8 still reaches it;
+what changes is its binding, which is what puts it back in the census. Defining
+"forwarded" by the binding instead — the first shape this file carried — makes
+RULE 8 unfireable: a loop failing it stops being forwarded and leaves the rule's
+population rather than failing it, and only the census is left.
 
 The rules over them:
 
@@ -422,16 +513,23 @@ The rules over them:
   way: one token at every `rollback_round` argument and every `charged:` field.
 - **RULE 2** is unchanged and reads populations (a)-classic and (b): a
   `charge_phases` token binds to exactly `phases_charged()`.
-- **RULE 3**, the census, is computed over **the classic loops' tokens and
-  population (b)'s tokens** — seven sites, `charge_phases:3 false:4`, at every
-  step of the campaign. A forwarded loop's token is not in it.
+- **RULE 3**, the census, is computed over **every charge token whose binding is
+  not the forwarded configuration field** — the classic loops' and population
+  (b)'s — seven sites, `charge_phases:3 false:4`, at every step of the campaign.
+  A forwarded loop that binds the field it was handed contributes nothing; the
+  same loop hard-wiring a literal contributes one and the census reads eight.
 - **RULE 4** gains population (c): a rollback outside a round loop is no longer
   exit 2 outright, but its `charge` argument must be a field of one of its own
   parameters. A literal or a `phases_charged()` there is a second decision made
   where nothing can hold it to the loop that ordered it, and is exit 1; an
   argument the scan cannot read back stays exit 2.
 - **RULE 5** keeps its needle and inverts its verdict for population (b) alone:
-  a `charged:` in a fn with no driver signature is exit 1 exactly as now.
+  a `charged:` in a fn with no driver signature is exit 1 exactly as now. Over
+  (b) it becomes a rule rather than a membership test — an entry states exactly
+  one `charged:`; zero or two is exit 1 naming the entry, and a field the scan
+  cannot read back is exit 2. Folding the count into membership instead would
+  put an entry with two decisions in no population at all, where no rule reaches
+  it.
 - **RULE 6** and **RULE 7** are untouched, provided the loop does **not** live in
   `crates/rmlx-models/src/speculative/round_common.rs` — that file's exemption
   for naming the low-level rollback is anchored to its path, and a loop moved
@@ -441,19 +539,37 @@ The rules over them:
 - **RULE 8 (the forwarded decision is the one that was handed over).** A
   forwarded loop binds its charge token, in the same fn, to exactly the
   configuration field it was handed — the whole right-hand side, not a prefix —
-  or names that field directly at every site. Anything else is exit 1.
+  or names that field directly at every site. *Every* binding of that token must
+  be that field, so a second one is exit 1 naming it. Anything else is exit 1.
 
-The two readings are complementary, and the second is what makes the first
-fail-closed: a loop that hard-wires stops binding to a parameter's field, so it
-is no longer forwarded, so it is classic, so its token joins the census and the
-census reads eight sites. RULE 8 fires beside it and names the binding. Neither
-reading alone covers the case — RULE 8 could be edited out, and the census alone
-cannot tell a forwarded token from a hard-wired one, since both are spelled by
-the local's name.
+The two readings are complementary and neither alone covers the hard-wire. A
+forwarded loop that writes `let charge = false;` is caught **twice**: by RULE 8,
+because the binding is not the configuration field, and by RULE 3, because a
+token bound to something other than that field is in the census and the census
+then reads eight sites. RULE 8 can be edited out of the script; the census
+cannot, since it is what the gate exists to state. And the census alone names
+only a count, where RULE 8 names the line.
 
-One extractor change goes with it: the token reader reports `?` for anything that
-is not a bare identifier, so `charged: cfg.charged` is unreadable today and would
-exit 2. It must learn to read a field access as a token.
+**Two extractor changes go with it, not one.**
+
+1. The token reader reports `?` for anything that is not a bare identifier, so
+   `charged: cfg.charged` is unreadable today and would exit 2. It must read a
+   field access as a token.
+2. The binding reader records **per binding**, keyed to the loop's own charge
+   token. Today it sets one flag per function with a good binding outranking a
+   bad one, so a shadow passes. **Measured on this tree**: a `mtp.rs` that binds
+   `charge_phases` to `super::phases_charged()` and then rebinds it to `false`
+   on the next line exits 0 with `OK: 7 speculative round loops … census
+   charge_phases:3 false:4` — a loop that charges nothing, counted among the
+   three that ask. That is a live hole on `main`, not a consequence of the
+   re-key, and the re-key chunk closes it.
+
+   Under the per-binding reading a token bound twice in one fn is **exit 1** for
+   a forwarded loop, where RULE 8 has something exact to say about the second
+   binding, and **exit 2** for a classic loop, where RULE 1's same-token reading
+   has become vacuous: with a shadow, the token at the `rollback_round` argument
+   and the token in the `charged:` field can be two different values under one
+   spelling, and nothing in the scan can say which binding governs which site.
 
 #### The fixture cases the re-key must pass
 
@@ -462,10 +578,16 @@ RULE 8 do not exist in it, and a fixture root asserting them would fail
 `make check-spec-charge-fixtures` today. They are stated here with the exit and
 the reason each must produce, and the re-key chunk turns each into a scan root.
 
+Cases 1 and 12 ask for a reason the current success line does not carry: it
+prints the loop count and the census and nothing about populations. The re-key
+changes it to name all three — `N classic, M forwarded, K entries; census …` —
+so a tree that passes says which shape it passed as, and a fixture asserting
+that a loop is forwarded has a line to assert against.
+
 | # | the tree | exit | the reason it must give |
 |---|---|---|---|
 | 1 | mid-campaign: one forwarded loop, six classic loops, one entry | 0 | seven charge sites, census `charge_phases:3 false:4`, one forwarded loop named |
-| 2 | the forwarded loop writes `let charge = false;` at both sites | 1 | RULE 8 names the binding; the census reads eight sites |
+| 2 | the forwarded loop writes `let charge = false;` at both sites | 1 | RULE 8, the binding is not the configuration field — and the census reads eight sites, both readings on one tree |
 | 3 | the forwarded loop writes `let charge = cfg.charged \|\| x;` | 1 | RULE 8, the whole right-hand side |
 | 4 | the forwarded loop names `cfg.charged` at both sites, no binding | 0 | forwarded, read as one token |
 | 5 | one of the seven entries drops its `charged:` | 1 | census of six sites — excluding the loop must not hide a lost entry |
@@ -479,6 +601,8 @@ the reason each must produce, and the re-key chunk turns each into a scan root.
 | 13 | the end state with the loop deleted | 2 | no round loop found; a scan that finds nothing must not pass |
 | 14 | the forwarded loop names `rollback_round_caches` | 2 | RULE 6, unchanged |
 | 15 | the forwarded loop calls `log_round` twice | 2 | RULE 7, unchanged |
+| 16 | the forwarded loop shadows its binding — `let charge = cfg.charged;` then `let charge = false;` | 1 | RULE 8 names the second binding; the same shape on a classic loop is exit 2 |
+| 17 | an entry states two `charged:` fields | 1 | RULE 5 over (b): an entry names one decision |
 
 ### `make check-spec-sampling`
 
@@ -490,19 +614,35 @@ takes no sampler at all, and `emit_step`, `emit_round_tokens` and
 `emit_seed_token`, which are helpers. All four fail condition (a) on the day the
 rule changes.
 
-Widen it to **any visibility and constructs a `RoundTotals`** — the charge gate's
-population (a). That admits the shared loop and excludes the three emit helpers
-by construction. `spec_generate_greedy_cached` is then the one exception, and it
-is a principled one: it is the two-model greedy loop, which runs only at
-temperature 0 and reads the verifier's argmax directly. Record it as an exception
-with that reason, and delete the exception in migration chunk 6, where that loop
-becomes a drafter whose `verify` draws through the context.
+Widen it to **any visibility, over the charge gate's populations (a) and (b)
+together** — the one loop and the seven entries. Narrowing to (a) alone is the
+tempting move and it is wrong: at the end of the campaign the entries are the
+only place a request's sampler can be dropped, since each takes `sampler_cfg`
+and hands it to the loop's configuration, and a gate that stops reading them
+loses its own defect class at the one site that can still commit it. That is the
+rule this campaign already learned once — a re-keyed gate follows a defect class,
+it does not shed one.
 
-Condition (b) — the parameter is read, not merely declared — is satisfied in the
-shared loop by the `VerifierDraw::new(sampler_cfg)` construction in its body, and
-the needle must be that construction rather than a mention of `sampler_cfg`. A
-sampler assigned into a `RoundCtx` field and read by nobody is exactly the shape
-(b) exists to refuse.
+Over (a), condition (b) — the parameter is read, not merely declared — is
+satisfied in the shared loop by the `VerifierDraw::new(sampler_cfg)` construction
+in its body, and the needle must be that construction rather than a mention of
+`sampler_cfg`. Over (b) it is satisfied by the sampler reaching the loop call:
+the needle is the configuration the entry builds carrying the sampler, not the
+name appearing somewhere in the body. A sampler assigned into a `RoundCtx` field
+and read by nobody is exactly the shape (b) exists to refuse, and so is a
+`sampler_cfg` an entry accepts and leaves out of the configuration it hands over.
+
+The census belongs on the success line for the same reason the charge gate's
+does: **one loop and seven entries**. A lost entry is then exit 2 — a scan that
+finds six drivers where the tree has seven has not passed, it has stopped
+looking.
+
+The three emit helpers are excluded by (a) ∪ (b) without an exception, since none
+carries a `RoundTotals` and none is an entry. `spec_generate_greedy_cached` is
+the one real exception: it is the two-model greedy loop, it takes no sampler at
+all, and it runs only at temperature 0 where the verifier's argmax is the draw.
+Record it with that reason and delete the exception in migration chunk 6, where
+that loop becomes a drafter whose `verify` draws through the context.
 
 ### `make debt-report`
 
