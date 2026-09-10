@@ -156,7 +156,9 @@ fi
 # parameter, a `RoundCfg` it builds, a `sampler_cfg` parameter, a draw built
 # from the sampler, a configuration carrying it, an unreadable body, a
 # `rollback_round` call. A body this scan cannot read back is reported rather
-# than skipped.
+# than skipped. A `fn` inside a `trait` or an `impl` block is read exactly like
+# a free one, and a `fn` with no body at all — what a trait declares — is closed
+# at its own `;` rather than at the next function's opening brace.
 
 records=$(
   find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
@@ -199,6 +201,11 @@ records=$(
         # which is how a `sampler_cfg` declared after `step_fn` went unseen.
         paren += gsub(/\(/, "(", sig) - gsub(/\)/, ")", sig)
         if (paren <= 0) {
+          # A declaration with no body — a trait method — ends here. Waiting for
+          # the next `{` would read the following function as this one`s body
+          # and record neither, and a lost loop whose slot a new entry fills is
+          # a census that does not move.
+          if (sig_is_bodiless(sig)) { flush(); next }
           in_sig = 0
           awaiting_body = 1
           if (index(sig, "{") > 0) {
@@ -213,6 +220,8 @@ records=$(
 
       awaiting_body {
         head = decomment($0)
+        # A `where` clause can carry the `;` that ends a bodiless declaration.
+        if (sig_is_bodiless(head)) { flush(); next }
         if (index(head, "{") > 0) {
           awaiting_body = 0
           in_body = 1
@@ -350,6 +359,11 @@ callers=$(
         sig = decomment($0)
         paren += gsub(/\(/, "(", sig) - gsub(/\)/, ")", sig)
         if (paren <= 0) {
+          # A declaration with no body — a trait method — ends here. Waiting for
+          # the next `{` would read the following function as this one`s body
+          # and record neither, and a lost loop whose slot a new entry fills is
+          # a census that does not move.
+          if (sig_is_bodiless(sig)) { flush(); next }
           in_sig = 0
           awaiting_body = 1
           if (index(sig, "{") > 0) {
@@ -362,6 +376,8 @@ callers=$(
       }
       awaiting_body {
         head = decomment($0)
+        # A `where` clause can carry the `;` that ends a bodiless declaration.
+        if (sig_is_bodiless(head)) { flush(); next }
         if (index(head, "{") > 0) {
           awaiting_body = 0; in_body = 1
           depth = gsub(/\{/, "{", head) - gsub(/\}/, "}", head)
@@ -541,6 +557,19 @@ while IFS=$'\t' read -r arm passes; do
     fail=1
   fi
 done <<<"$arms"
+
+# An entry exists to start the shared loop, so entries without one are a loop
+# the scan lost — and the path count cannot see it, because a lost loop's slot
+# is filled by the entry that replaced it, one for one. That is exactly the
+# shape a migration produces, and it is exactly the shape a scanner that read a
+# bodiless declaration as the next function's signature produced silently.
+if [ "$entry_count" != "0" ] && [ "$forwarded_count" = "0" ]; then
+  note "check-spec-sampling: the scan found $entry_count entries and no forwarded loop."
+  note "  An entry hands the request's sampler to the one loop that takes a \`RoundCfg\`,"
+  note "  so entries with no loop to enter mean the loop was lost. The drafter-path count"
+  note "  cannot see that: the lost loop's slot is the one the entry now fills."
+  scan_error=1
+fi
 
 if [ "$scan_error" = "1" ]; then
   exit 2

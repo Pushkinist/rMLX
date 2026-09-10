@@ -15,6 +15,16 @@
 #   `blank_strings(s)` — the line with the body of every string literal replaced
 #                        by spaces, the quotes kept so the shape still reads.
 #
+#   `sig_is_bodiless(s)` — true when a signature line ends the declaration
+#                        instead of opening a body: no `{`, and the statement
+#                        closed with `;`. A trait method declaration is a `fn`
+#                        item with no body, and a scanner that waits for the
+#                        next `{` swallows the next function whole — the one
+#                        after it is never recorded at all, which is a lost
+#                        population member and not a refusal. It reads the line
+#                        that closes the parameter list and, for a `where`
+#                        clause, every line until the body opens.
+#
 #   THE BOUNDARY. Both readers track the `"` and the backslash escape and
 #   nothing else, so a character literal holding a quote (`'\"'`) and a raw
 #   string (`r#"..."#`, whose inner quotes end nothing) are both mis-read — the
@@ -38,6 +48,9 @@ readonly AWK_TEXT_FNS='
           if (!q && ch == "/" && substr(s, i + 1, 1) == "/") { return substr(s, 1, i - 1) }
         }
         return s
+      }
+      function sig_is_bodiless(s) {
+        return (index(s, "{") == 0 && s ~ /;[[:space:]]*$/)
       }
       function blank_strings(s,   i, n, q, ch, out) {
         n = length(s); q = 0; out = ""

@@ -664,14 +664,16 @@ built on one of two tree shapes the campaign passes through — mid-campaign, wi
 one drafter migrated, and the end state, with all seven decisions in entries.
 They are stated here with the exit and the reason each produces. Two of them
 assert two reasons on the one tree, and case 16 is run on both arms, so the
-twenty-three are twenty-six runs of the harness. The suite is 74 runs: those
-twenty-six, the thirty-eight the gate already had, and ten more that review
-found — a token whose sites name it and whose binding the scan never saw, three
-further ways a forwarded loop can move its configuration rather than read it, a
+twenty-three are twenty-six runs of the harness. The suite is 76 runs: those
+twenty-six, the thirty-eight the gate already had, and twelve more that review
+and the first migration found — a token whose sites name it and whose binding
+the scan never saw, three further ways a forwarded loop can move its
+configuration rather than read it, a
 configuration handed over by value, a write still read on an immutable
 parameter, a rollback that charges off the wrong parameter, a comment in a
-parameter list, which is prose, and a low-level rollback behind a comment
-carrying a brace, run against its own control.
+parameter list, which is prose, a low-level rollback behind a comment carrying a
+brace, run against its own control, a trait of bodiless declarations above the
+loop, which must not swallow it, and an entry with no forwarded loop to enter.
 
 Cases 1 and 12 ask for a reason the old success line did not carry: it printed
 the loop count and the census and nothing about populations. The line now names

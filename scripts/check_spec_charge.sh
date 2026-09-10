@@ -329,7 +329,10 @@ fi
 #
 # A function opens at a `fn` item and closes when its brace depth returns to
 # zero. A nested `fn` inside a body is not opened: the enclosing loop is the
-# unit the rules are about.
+# unit the rules are about. A `fn` inside a `trait` or an `impl` block is read
+# exactly like a free one — the population rules are about what a function
+# does, not about where it is written — and a `fn` with no body at all, which
+# is what a trait declares, is recorded and closed at its own `;`.
 # The two text readers this gate shares with the other source-scanning gates:
 # `decomment`, used everywhere below, and `blank_strings`, which this gate does
 # NOT use — RULE 7 reads the per-round event's target as a literal, and blanking
@@ -512,6 +515,10 @@ records=$(
         # A per-parameter `) -> ` is inside the list and must not end the scan.
         paren += gsub(/\(/, "(", sig) - gsub(/\)/, ")", sig)
         if (paren <= 0) {
+          # A declaration with no body — a trait method — ends here. Waiting for
+          # the next `{` would read the following function as this one`s body
+          # and record neither.
+          if (sig_is_bodiless(sig)) { flush(); next }
           in_sig = 0
           awaiting_body = 1
           # A `where` clause sits between the closing parenthesis and the body,
@@ -528,6 +535,8 @@ records=$(
 
       awaiting_body {
         head = decomment($0)
+        # A `where` clause can carry the `;` that ends a bodiless declaration.
+        if (sig_is_bodiless(head)) { flush(); next }
         if (index(head, "{") > 0) {
           awaiting_body = 0
           in_body = 1
@@ -993,6 +1002,19 @@ while IFS=$'\t' read -r file fn _sig _stats nroll nrec _nlow nemit _ntarget cfg 
   fi
   census="$census$tokens"$'\n'
 done <<<"$loops"
+
+# An entry exists to start the shared loop, so entries without one are a loop
+# the scan lost. The census cannot see that on its own: a lost loop's decision
+# leaves the census exactly as a gained entry's decision enters it, one for one,
+# which is what a migration does on purpose.
+if [ "$entry_count" != "0" ] && [ "$forwarded_count" = "0" ]; then
+  note "check-spec-charge: the scan found $entry_count entries and no forwarded loop."
+  note "  An entry builds a \`RoundCfg\` and hands it to the one loop that takes it, so"
+  note "  entries with no loop to enter mean the loop was lost — a body this scan could"
+  note "  not read back, or a signature it did not open. The census would not see it:"
+  note "  the lost loop's decision leaves it exactly as the entry's decision enters it."
+  scan_error=1
+fi
 
 if [ "$scan_error" = "1" ]; then
   exit 2
