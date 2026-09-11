@@ -351,6 +351,31 @@ build_root() {
     >"$root/crates/rmlx-models/src/speculative/round_stats_tests.rs"
 }
 
+# A trait declaring what each drafter implements: bodiless method declarations,
+# one default body among them, and a `where` clause on one of them. A `fn` item
+# with no body is where a scanner that waits for the next `{` reads the
+# following function as this one's body and records neither.
+drafter_trait_src() {
+  cat <<'RS'
+pub(crate) trait RoundDrafter {
+    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled>;
+
+    fn block(&self, block_total: usize, remaining: usize) -> usize {
+        round_block(block_total, remaining)
+    }
+
+    fn verify(&mut self, ctx: &mut RoundCtx<'_>, fed: &[u32]) -> Result<Verdict>;
+
+    fn carry<T>(&self, v: &Verdict) -> T
+    where
+        T: From<u32>;
+
+    fn condition(&mut self, ctx: &RoundCtx<'_>, v: &Verdict) -> Result<Option<Conditioning>>;
+}
+
+RS
+}
+
 # The tree mid-campaign: one drafter migrated. Its loop body is gone, the shared
 # loop runs its rounds, and the decision it used to make inside the body is made
 # at the entry that starts the loop. Six loops still carry their own body, and
@@ -1150,6 +1175,32 @@ perl -0pi -e 's/    Ok\(\(\)\)\n\}/    \/\/ the round closes here }\n    super::
   "$root/crates/rmlx-models/src/speculative/mtp.rs"
 run "a comment carrying a brace does not end the body it sits in" 2 \
   "\`mtp_generate\` makes 1 call(s) to the low-level"
+
+# R33. A trait declaring the drafters' interface, in the file the shared loop
+#      lives in. Every bodiless declaration is a `fn` item with no body: a scan
+#      that waits for the next `{` reads the loop as `condition`'s body, so the
+#      loop is never recorded and the rollback and record sites in it are
+#      attributed to a trait method that has neither. One of them carries a
+#      `where` clause, where the `;` that ends the declaration is not on the
+#      line that closes the parameter list.
+build_mid_root "$root"
+loop_file="$root/crates/rmlx-models/src/speculative/round_loop.rs"
+{
+  head -2 "$loop_file"
+  drafter_trait_src
+  tail -n +3 "$loop_file"
+} >"$work/with_trait.rs"
+mv "$work/with_trait.rs" "$loop_file"
+run "a trait of bodiless declarations does not swallow the loop beneath it" 0 \
+  "OK: 6 classic, 1 forwarded, 1 entries; census charge_phases:3 false:4 (7 sites)."
+
+# R34. Entries with no loop to enter. The census cannot see a lost loop: its
+#      decision leaves the census exactly as the entry's decision enters it,
+#      one for one, which is what a migration does on purpose.
+build_mid_root "$root"
+rm -f "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "an entry with no forwarded loop to enter is a scan error" 2 \
+  "the scan found 1 entries and no forwarded loop"
 
 echo
 if [ "$failures" != "0" ]; then
