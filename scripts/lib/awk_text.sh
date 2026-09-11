@@ -25,6 +25,16 @@
 #                        that closes the parameter list and, for a `where`
 #                        clause, every line until the body opens.
 #
+#                        Its boundary: it reads `decomment`'s output, so a
+#                        declaration whose `;` is followed by a `/* ... */`
+#                        block comment reads as a line that opens a body and
+#                        swallows the next item. Neither reader knows block
+#                        comments, and no `/*` occurs in the sources these
+#                        gates scan. It fails closed rather than silently:
+#                        the swallowed item is a lost population member, and
+#                        both gates refuse entries with no forwarded loop to
+#                        enter.
+#
 #   THE BOUNDARY. Both readers track the `"` and the backslash escape and
 #   nothing else, so a character literal holding a quote (`'\"'`) and a raw
 #   string (`r#"..."#`, whose inner quotes end nothing) are both mis-read — the
