@@ -90,6 +90,7 @@
 
 use super::dflash::dflash_next_block_size;
 use super::gemma4_assistant::AssistantRound;
+use super::mtp::SidecarRound;
 use super::round_loop::{ReportSkippedBy, RoundDrafter};
 use super::{
     accept_prefix, draft_rows_to_drop, rollback_target_from_head, rollback_target_from_tail,
@@ -317,7 +318,7 @@ const SHARED_LOOP_PATTERN: &str = "SPEWGRIP";
 const DISPOSITIONS: [(SpecLoop, &str, ReportSkippedBy, ChainRefusedBy); 7] = [
     (
         SpecLoop::MtpSidecar,
-        "mtp.rs",
+        SHARED_LOOP,
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
     ),
@@ -360,14 +361,7 @@ const DISPOSITIONS: [(SpecLoop, &str, ReportSkippedBy, ChainRefusedBy); 7] = [
 ];
 
 /// The files the table names, in the order it names them, each with its source.
-const LOOP_SOURCES: [(&str, &str); 6] = [
-    (
-        "mtp.rs",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/speculative/mtp.rs"
-        )),
-    ),
+const LOOP_SOURCES: [(&str, &str); 5] = [
     (
         "dflash/mod.rs",
         include_str!(concat!(
@@ -559,12 +553,19 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
         // One arm per migrated loop, named rather than derived — a constant is
         // read through its drafter's own type. Each migration adds its drafter
         // here, the same cliff the refusal reading below carries.
-        if !matches!(loop_kind, SpecLoop::MtpAssistant) {
-            continue;
-        }
+        let declared = match loop_kind {
+            SpecLoop::MtpAssistant => <AssistantRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
+            SpecLoop::MtpSidecar => <SidecarRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
+            // The loops that still carry their own body: their disposition is
+            // read off their source above and there is no constant to read.
+            SpecLoop::DFlash
+            | SpecLoop::DFlash2
+            | SpecLoop::Eagle3
+            | SpecLoop::TwoModelGreedy
+            | SpecLoop::TwoModelStochastic => continue,
+        };
         assert_eq!(
-            <AssistantRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
-            skipped_by,
+            declared, skipped_by,
             "the migrated {loop_kind:?} loop declares an exit the table does not"
         );
     }

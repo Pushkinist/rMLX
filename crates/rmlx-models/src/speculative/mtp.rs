@@ -48,13 +48,13 @@ use std::path::Path;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{argmax, concatenate, Array, Device};
 
-use super::{DecodeWindow, MAX_BLOCK_SIZE};
+use super::MAX_BLOCK_SIZE;
 use crate::arch::Architecture;
 use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
-use crate::speculative::round_common::{
-    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
-    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
+use crate::speculative::round_loop::{
+    run_rounds, CacheSpan, Conditioning, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx,
+    RoundDrafter, RoundOutcome, Verdict, VerifierOffsetBasis,
 };
 use rmlx_kv_quant::{KvCache, KvQuant};
 
@@ -576,6 +576,7 @@ fn load_mtp_head(draft_dir: &Path, hidden_size: usize) -> Result<(MtpHeadWeights
 // ---------------------------------------------------------------------------
 
 use crate::decode_loop::ProbeStep;
+use std::time::Instant;
 
 /// The block a request runs at: what it asked for, bounded by what one verify
 /// forward can score, and never below the two positions a seed and one draft
@@ -602,15 +603,227 @@ fn block_from_request(requested: usize, declared: Option<usize>) -> usize {
     block
 }
 
-/// MTP speculative-decoding round-loop.
+/// One request's MTP-sidecar drafting state.
 ///
-/// Port of `_mtp_rounds` (mlx-vlm). Mirrors [`super::dflash::dflash_generate`]
-/// structurally: prefill the verifier, capture the penultimate hidden + first
-/// bonus, then per round draft `block_size - 1` tokens via [`MtpDrafter::draft_n`],
-/// verify all `block_size` positions in one cached forward (capturing both
-/// logits and the penultimate hidden), accept the prefix the verifier's own
-/// token agrees with, emit, and roll back the verifier KV (GDN-aware) and
-/// the sidecar KV on partial acceptance.
+/// The sidecar keeps its own KV cache and its own drafting position, so this
+/// carries both across the rounds of one request, beside the single verifier
+/// row the next round conditions on.
+#[allow(missing_debug_implementations)]
+pub(crate) struct SidecarRound<'a> {
+    drafter: &'a mut MtpDrafter,
+    /// The verifier's last decoder layer, whose pre-final-norm output the
+    /// sidecar conditions on.
+    capture_ids: [usize; 1],
+    /// The verifier's model width, for the conditioning slice.
+    hidden: i32,
+    /// The verifier row the next round drafts from.
+    h_cond: Option<Array>,
+    /// The verifier prefix the sidecar has consumed (`_next_position`).
+    draft_pos: i32,
+    /// Where the sidecar's cache stood when this round began.
+    draft_start: i32,
+    /// The verifier's capture at every position this round verified.
+    scored: Option<Array>,
+}
+
+impl<'a> SidecarRound<'a> {
+    fn new(drafter: &'a mut MtpDrafter, verifier: &Architecture) -> Self {
+        Self {
+            drafter,
+            capture_ids: [verifier.num_hidden_layers().saturating_sub(1)],
+            hidden: verifier.hidden_size() as i32,
+            h_cond: None,
+            draft_pos: 0,
+            draft_start: 0,
+            scored: None,
+        }
+    }
+}
+
+/// A round that reached for the conditioning row before one was built.
+fn missing_conditioning() -> Error {
+    Error::Model(
+        "mtp_generate: a round read the hidden it conditions on before the prefill \
+         built one"
+            .into(),
+    )
+}
+
+impl RoundDrafter for SidecarRound<'_> {
+    const KV_REPORT_SKIPPED_BY: ReportSkippedBy = ReportSkippedBy::TheSeedExit;
+    const VERIFIER_OFFSET_BASIS: VerifierOffsetBasis = VerifierOffsetBasis::AfterTheForward;
+
+    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled> {
+        let device = ctx.device;
+        let Some((&last_prompt, head)) = prompt.split_last() else {
+            return Err(Error::Model(
+                "mtp_generate: an empty prompt reached the round loop".into(),
+            ));
+        };
+        self.drafter.reset();
+        let prefill_t0 = Instant::now();
+        super::prefill_chunked(
+            ctx.verifier,
+            head,
+            &mut ctx.kv,
+            ctx.lin.as_deref_mut(),
+            device,
+        )?;
+        let prefill_ns = prefill_t0.elapsed().as_nanos();
+
+        // The sidecar's drafting position is the verifier prefix consumed so
+        // far. After the prompt less its last token, plus the carry forward
+        // below, it is the whole prompt.
+        self.draft_pos = head.len() as i32;
+
+        // Round-0: feed the last prompt token, capture its penultimate hidden
+        // and read the first bonus token off the same forward.
+        let (r0_logits, r0_hidden) = ctx.verifier.forward_verify_capture(
+            &[last_prompt],
+            1,
+            &self.capture_ids,
+            &mut ctx.kv,
+            ctx.lin.as_deref_mut(),
+            device,
+        )?;
+        self.draft_pos += 1;
+        super::guard_verifier_prefill_logits(ctx.verifier, &r0_logits, prompt.len())?;
+        self.h_cond = Some(r0_hidden);
+        let seed = ctx.draw.seed_token(&r0_logits, device)?;
+        Ok(Prefilled {
+            seed,
+            prefill_ns,
+            // The sidecar slices one verifier row per round and projects
+            // nothing, so it accumulates no conditioning to report.
+            conditioned_rows: None,
+        })
+    }
+
+    fn propose(&mut self, ctx: &mut RoundCtx<'_>, carry: u32, block: usize) -> Result<Vec<u32>> {
+        // The sidecar KV starts this round here, and its rollback counts
+        // forward from it over the accepted prefix.
+        self.draft_start = self.drafter.offset();
+        let h_cond = self.h_cond.as_ref().ok_or_else(missing_conditioning)?;
+        self.drafter
+            .draft_n(ctx.verifier, carry, h_cond, block, self.draft_pos)
+    }
+
+    fn verify(&mut self, ctx: &mut RoundCtx<'_>, fed: &[u32], remaining: usize) -> Result<Verdict> {
+        let device = ctx.device;
+        // Arm the GDN round tape before the forward: the refold replays the
+        // accepted prefix off it.
+        super::arm_lin_tapes(ctx.lin.as_deref_mut());
+
+        let t0 = Instant::now();
+        let (v_logits, v_hidden) = ctx.verifier.forward_verify_capture(
+            fed,
+            fed.len(),
+            &self.capture_ids,
+            &mut ctx.kv,
+            ctx.lin.as_deref_mut(),
+            device,
+        )?;
+        // The forward already projected all of `fed` through the LM head. Read
+        // that back inside this span rather than re-deriving the head one
+        // position at a time in the walk: the head is a separate quantised
+        // tensor and each re-derivation is another full read of it plus another
+        // pipeline drain. A sampled request draws here too, so the per-position
+        // host softmax lands here and not in the walk.
+        let v_tokens = ctx.draw.block_tokens(&v_logits, fed.len(), device)?;
+        let verify_ns = t0.elapsed().as_nanos();
+
+        let t0 = Instant::now();
+        let proposals = fed.get(1..).unwrap_or_default();
+        let (accept, commit) = super::accept_prefix(&v_tokens, proposals, remaining)?;
+        let walk_ns = t0.elapsed().as_nanos();
+
+        self.scored = Some(v_hidden);
+        Ok(Verdict {
+            accept,
+            commit,
+            verify_ns,
+            walk_ns,
+        })
+    }
+
+    fn rollback(
+        &mut self,
+        _ctx: &RoundCtx<'_>,
+        verdict: &Verdict,
+        _outcome: RoundOutcome,
+    ) -> Result<Option<CacheSpan>> {
+        // This round the head wrote `block - 1` slots from `draft_start`: slot
+        // `draft_start` holds the carry, then `draft_start+1..=+accept` hold the
+        // accepted drafts. Keep the carry plus the accepted prefix, mirroring
+        // the verifier's `pre + 1 + accept`. Keeping only `accept` would drop
+        // the last accepted draft's K/V every round, silently degrading the
+        // accept rate.
+        let target = self.draft_start + verdict.accept as i32 + 1;
+        self.drafter.truncate_to(target)?;
+        Ok(Some(CacheSpan {
+            before: self.draft_start,
+            target,
+        }))
+    }
+
+    fn condition(
+        &mut self,
+        ctx: &RoundCtx<'_>,
+        verdict: &Verdict,
+        outcome: RoundOutcome,
+    ) -> Result<Option<Conditioning>> {
+        let device = ctx.device;
+        let Some(scored) = self.scored.take() else {
+            return Err(Error::Model(
+                "mtp_generate: a round conditioned on a verify forward that did not run".into(),
+            ));
+        };
+        // The next round conditions on the verifier hidden at the newly
+        // accepted bonus slot.
+        let accept = verdict.accept as i32;
+        let h_cond = scored.slice(
+            &[0, accept, 0],
+            &[1, accept + 1, self.hidden],
+            &[1, 1, 1],
+            device,
+        )?;
+        if ctx.charged {
+            // Reading the verifier's tokens forced the logits and the trunk
+            // under them, but the capture hangs off a different output of that
+            // forward and this slice off the capture. The next round's drafter
+            // is the first thing to read either, so with nothing forcing them
+            // here the verifier's capture is billed to the drafter. See
+            // `phases_charged`.
+            h_cond.eval()?;
+        }
+        let rows = h_cond.shape().get(1).copied();
+        self.h_cond = Some(h_cond);
+        self.draft_pos += outcome.committed as i32;
+        Ok(Some(Conditioning {
+            rows,
+            projected: None,
+        }))
+    }
+
+    fn carry(&self, f: &mut dyn FnMut(&[(&str, &Array)])) -> Result<()> {
+        f(&[(
+            "h_cond",
+            self.h_cond.as_ref().ok_or_else(missing_conditioning)?,
+        )]);
+        Ok(())
+    }
+}
+
+/// MTP speculative-decoding round-loop entry.
+///
+/// Port of `_mtp_rounds` (mlx-vlm): prefill the verifier, capture the
+/// penultimate hidden and the first bonus, then per round draft
+/// `block_size - 1` tokens via [`MtpDrafter::draft_n`], verify all `block_size`
+/// positions in one cached forward capturing both logits and the penultimate
+/// hidden, accept the prefix the verifier's own token agrees with, emit, and
+/// roll back the verifier KV (GDN-aware) and the sidecar KV on partial
+/// acceptance. The rounds themselves run in [`run_rounds`]; what is here is what
+/// refuses before a cache stack is built, and the request's block.
 ///
 /// `sampler_cfg` decides what "the verifier's own token" means at each position
 /// — its argmax at temperature 0, a draw from its post-sampling distribution
@@ -623,18 +836,13 @@ fn block_from_request(requested: usize, declared: Option<usize>) -> usize {
 /// Returns the emitted steps and **the widest block any round of this run
 /// actually ran**. Not the block resolved before the loop: a caller checking
 /// what it asked for against that would be trusting the very step it wanted
-/// checked, and every loop here narrows the block again per round against the
-/// remaining token budget.
+/// checked, and every round narrows the block again against the remaining token
+/// budget.
+///
+/// # Errors
+/// [`Error::Model`] for a prompt under two tokens or a verifier that carries no
+/// recurrent state, and whatever the round loop refuses.
 #[allow(clippy::too_many_arguments)]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
-#[allow(clippy::too_many_lines)]
 pub fn mtp_generate(
     verifier: &Architecture,
     drafter: &mut MtpDrafter,
@@ -649,8 +857,6 @@ pub fn mtp_generate(
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
 ) -> Result<(Vec<ProbeStep>, usize)> {
-    use std::time::Instant;
-
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
             "mtp_generate: prompt must have >=2 tokens".into(),
@@ -663,290 +869,28 @@ pub fn mtp_generate(
                 .into(),
         ));
     }
-
-    // The MTP sidecar conditions on the verifier's penultimate (pre-final-norm)
-    // hidden — the residual-stream output of the LAST decoder layer. Capture it
-    // via the single-layer capture id [num_hidden_layers - 1].
-    let last_layer = verifier.num_hidden_layers().saturating_sub(1);
-    let capture_ids = [last_layer];
-    let hidden = verifier.hidden_size() as i32;
-
     let block_total = block_from_request(requested_block_total, drafter.block_size());
-
-    let (kv_quant, _, mut v_caches) =
-        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
-    let mut v_lin = lin_cache_stack(verifier);
-
-    drafter.reset();
-
-    let mut draw = super::VerifierDraw::new(sampler_cfg);
-
-    let mut total_draft = 0usize;
-    let mut total_accept = 0usize;
-    let mut rounds = 0usize;
-    // One read of process-global log state per request, at the loop head.
+    // One read of process-global log state per request, at the entry.
     let charge_phases = super::phases_charged();
-    let t_total = Instant::now();
-    let mut window = DecodeWindow::new();
-    let mut draft_ns: u128 = 0;
-    let mut verifier_ns: u128 = 0;
-
-    let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
-
-    // -- Prefill verifier on prompt[..-1]; last token is the round-0 carry. --
-    let prefill_slice = &prompt_ids[..prompt_ids.len() - 1];
-    let prefill_t0 = Instant::now();
-    super::prefill_chunked(
+    let mut round = SidecarRound::new(drafter, verifier);
+    run_rounds(
         verifier,
-        prefill_slice,
-        &mut v_caches,
-        Some(&mut v_lin),
-        device,
-    )?;
-    let prefill_ns = prefill_t0.elapsed().as_nanos();
-
-    // The sidecar's drafting position (`_next_position`) is the verifier prefix
-    // length consumed so far. After prefill + the round-0 carry forward below it
-    // equals the verifier's full prefix length (prompt length).
-    let mut draft_pos = prefill_slice.len() as i32;
-
-    // -- Round-0: feed the last prompt token, capture its penultimate hidden +
-    //    the first bonus token. --
-    // Non-empty by the same guard that makes `prompt_ids[..len-1]` above safe.
-    let last_prompt = prompt_ids[prompt_ids.len() - 1];
-    let (r0_logits, r0_hidden) = verifier.forward_verify_capture(
-        &[last_prompt],
-        1,
-        &capture_ids,
-        &mut v_caches,
-        Some(&mut v_lin),
-        device,
-    )?;
-    draft_pos += 1; // verifier consumed the carry token
-                    // Conditioning hidden for the first draft round = the carry position hidden.
-    super::guard_verifier_prefill_logits(verifier, &r0_logits, prompt_ids.len())?;
-    let mut h_cond = r0_hidden;
-    let mut b = draw.seed_token(&r0_logits, device)?;
-    if emit_seed_token(
-        tokenizer,
-        b,
+        &mut round,
+        prompt_ids,
         step_fn,
-        &mut emitted,
-        &mut window,
-        eos_ids,
-        &RoundTotals {
+        &RoundCfg {
             loop_kind: super::SpecLoop::MtpSidecar,
             block_size: block_total,
-            conditioned_rows: None,
-            charged: charge_phases,
-            // No round ran.
-            rounds: 0,
-            emitted_in_rounds: 0,
-            total_draft: 0,
-            total_accept: 0,
-            prefill_ns,
-            draft_ns: 0,
-            verifier_ns: 0,
-            round_loop_ns: 0,
-            t_total,
-        },
-    ) {
-        return Ok((emitted, block_total));
-    }
-
-    tracing::info!(
-        block_size = block_total,
-        prompt_len = prompt_ids.len(),
-        n_tokens,
-        ?kv_quant,
-        capture_layer = last_layer,
-        temperature = sampler_cfg.temperature,
-        "mtp_generate: starting (Qwen3.6-MoE verifier + MTP sidecar)"
-    );
-
-    let seed_emitted = emitted.len();
-    let mut emitted_in_rounds = 0usize;
-    let mut widest_bs = 0usize;
-    let round_loop_t0 = Instant::now();
-    while emitted.len() < n_tokens {
-        let round_t0 = Instant::now();
-        rounds += 1;
-        let remaining = n_tokens - emitted.len();
-        let bs = super::round_block(block_total, remaining);
-        widest_bs = widest_bs.max(bs);
-
-        // -- Phase A: drafter proposes bs-1 tokens (autoregressive). The sidecar
-        //    KV starts this round at `draft_pos` (verifier prefix length). --
-        let draft_start = drafter.offset();
-        let t0 = Instant::now();
-        let draft_tokens = drafter.draft_n(verifier, b, &h_cond, bs, draft_pos)?;
-        let round_draft_ns = t0.elapsed().as_nanos();
-        draft_ns += round_draft_ns;
-        if draft_tokens.is_empty() {
-            return Err(Error::Model(format!(
-                "mtp_generate: the sidecar proposed nothing at block {bs}; draft_n \
-                 returns block - 1 ids for any block of two or more, so an empty chain \
-                 is a broken drafter and not the end of the request"
-            )));
-        }
-        total_draft += draft_tokens.len();
-
-        // -- Phase B: verifier scores [b, draft...] + captures penultimate hidden
-        //    in one pass. Arm the GDN round tape before the verify forward. --
-        super::arm_lin_tapes(Some(&mut v_lin));
-        let mut v_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
-        v_input.push(b);
-        v_input.extend_from_slice(&draft_tokens);
-        let v_k = v_input.len();
-
-        let t0 = Instant::now();
-        let (v_logits, v_hidden) = verifier.forward_verify_capture(
-            &v_input,
-            v_k,
-            &capture_ids,
-            &mut v_caches,
-            Some(&mut v_lin),
-            device,
-        )?;
-        // The verify forward already projected all `v_k` positions through the
-        // LM head. Read that back once, here, rather than re-deriving the head
-        // one position at a time in the acceptance walk: the head is a separate
-        // quantised tensor and each re-derivation is another full read of it
-        // plus another pipeline drain. Reading it inside this span is also what
-        // makes `verifier_ms` the cost of the verify forward rather than the
-        // cost of building its graph — the assistant loop reads its verifier
-        // token back at the same point, and the two figures are only
-        // comparable because of it. Sampled requests draw here too, so the
-        // per-position host softmax lands in the same span rather than
-        // silently inflating the walk.
-        let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
-        let round_verify_ns = t0.elapsed().as_nanos();
-        verifier_ns += round_verify_ns;
-
-        // -- Phase C: acceptance walk over the verifier's own tokens.
-        let t0 = Instant::now();
-        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
-        let round_walk_ns = t0.elapsed().as_nanos();
-        total_accept += accept;
-
-        // -- Emit accepted prefix + 1 correction/bonus. --
-        let emit = emit_round_tokens(
-            tokenizer,
-            &new_tokens,
             n_tokens,
             eos_ids,
-            step_fn,
-            &mut emitted,
-            &mut emitted_in_rounds,
-            &mut window,
-            None,
-        );
-        if emit.hit_eos {
-            break;
-        }
-
-        // -- Phase D: rollback verifier KV (GDN-aware) + sidecar KV. --
-        // The verifier processed `v_k` positions (carry + bs-1 drafts). Committed
-        // positions this round = accept (consumed drafts) + 1 carry. Drop the
-        // unaccepted draft tail from the FA KV caches.
-        let t0 = Instant::now();
-        let n_committed = emit.committed;
-        let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
-        let v_target =
-            super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        let refolded = rollback_round(
-            &mut v_caches,
-            Some(&mut v_lin),
-            &v_input,
-            v_offset_before - v_k as i32,
-            v_target,
-            charge_phases,
-            device,
-        )?;
-
-        // Sidecar KV rollback: this round the head wrote `bs - 1` slots starting
-        // at `draft_start` — slot `draft_start+0` holds the carry seed `b`, then
-        // slots `draft_start+1..=draft_start+accept` hold the accepted drafts
-        // `draft[0..accept-1]`. Keep the carry + accepted prefix = `accept + 1`
-        // slots, mirroring the verifier's `pre + 1(carry) + accept` (Phase D
-        // above). Keeping only `accept` would drop the last accepted draft's KV
-        // every round, silently degrading draft accept-rate.
-        let d_target = draft_start + accept as i32 + 1;
-        drafter.truncate_to(d_target)?;
-        let round_rollback_ns = t0.elapsed().as_nanos();
-
-        // Next-round conditioning: the verifier hidden at the newly accepted
-        // bonus slot (= position `accept` of the captured penultimate hidden).
-        h_cond = v_hidden.slice(
-            &[0, accept as i32, 0],
-            &[1, accept as i32 + 1, hidden],
-            &[1, 1, 1],
-            device,
-        )?;
-        if charge_phases {
-            // Reading the verifier's tokens forced the logits and the trunk
-            // under them, but the capture hangs off a different output of that
-            // forward and this slice off the capture. The next round's drafter
-            // is the first thing to read either, so with nothing forcing them
-            // here the verifier's capture is billed to the drafter. See
-            // `phases_charged`.
-            h_cond.eval()?;
-        }
-        b = *new_tokens.last().unwrap_or(&b);
-        draft_pos += n_committed as i32;
-
-        super::log_round(
-            &super::RoundReport {
-                loop_kind: super::SpecLoop::MtpSidecar,
-                round: rounds,
-                accept,
-                num_draft: draft_tokens.len(),
-                n_committed,
-                emitted_total: emitted.len(),
-                condition_rows: h_cond.shape().get(1).copied(),
-                projected_rows: None,
-                v_offset_before,
-                v_target,
-                d_offset_before: Some(draft_start),
-                d_target: Some(d_target),
-                refolded,
-                charged: charge_phases,
-                phases: Some(super::RoundPhases {
-                    round_ns: round_t0.elapsed().as_nanos(),
-                    draft_ns: round_draft_ns,
-                    verify_ns: round_verify_ns,
-                    walk_ns: round_walk_ns,
-                    rollback_ns: round_rollback_ns,
-                }),
-            },
-            &[("h_cond", &h_cond)],
-        );
-    }
-
-    let round_loop_ns = round_loop_t0.elapsed().as_nanos();
-    log_request_record(
-        &RoundTotals {
-            loop_kind: super::SpecLoop::MtpSidecar,
-            block_size: block_total,
-            conditioned_rows: None,
+            tokenizer,
+            sampler_cfg,
             charged: charge_phases,
-            rounds,
-            emitted_in_rounds,
-            total_draft,
-            total_accept,
-            prefill_ns,
-            draft_ns,
-            verifier_ns,
-            round_loop_ns,
-            t_total,
+            kv_quant_override,
+            max_ctx_override,
         },
-        &emitted,
-        seed_emitted,
-        &window,
-    );
-
-    report_verifier_kv_bytes(verifier, &v_caches, Some(&v_lin));
-    Ok((emitted, widest_bs))
+        device,
+    )
 }
 
 // ---------------------------------------------------------------------------
