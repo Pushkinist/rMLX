@@ -236,6 +236,32 @@ build_root() {
   write_dispatch "$root"
 }
 
+# A trait declaring what each drafter implements: bodiless method declarations,
+# one default body among them, and a `where` clause on one of them. A `fn` item
+# with no body is where a scanner that waits for the next `{` reads the
+# following function as this one's body and records neither — and here the one
+# it records neither of is the loop that draws.
+drafter_trait_src() {
+  cat <<'RS'
+pub(crate) trait RoundDrafter {
+    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled>;
+
+    fn block(&self, block_total: usize, remaining: usize) -> usize {
+        round_block(block_total, remaining)
+    }
+
+    fn verify(&mut self, ctx: &mut RoundCtx<'_>, fed: &[u32]) -> Result<Verdict>;
+
+    fn carry<T>(&self, v: &Verdict) -> T
+    where
+        T: From<u32>;
+
+    fn condition(&mut self, ctx: &RoundCtx<'_>, v: &Verdict) -> Result<Option<Conditioning>>;
+}
+
+RS
+}
+
 # Mid-campaign: the MTP sidecar has been migrated. Its loop body is gone, its
 # path is an entry, and the shared loop runs its rounds — seven paths still.
 build_mid_root() {
@@ -483,6 +509,29 @@ perl -0pi -e 's|            &spec_sampler_cfg,\n            dispatcher.device\(\
   "$root/crates/rmlx-server/src/engine/speculative.rs"
 run "a dispatch arm naming the sampler inside a string literal is refused" 1 \
   "the \`Drafter::DFlash2\` arm drives a"
+
+# 25. The same trait, and here the loop it swallows is the one that draws. The
+#     path census cannot see the loss on its own: the entry that replaced the
+#     migrated drafter fills the slot, one for one, so a scan that lost the
+#     shared loop still counts seven paths and passes.
+build_mid_root "$root"
+loop_file="$root/crates/rmlx-models/src/speculative/round_loop.rs"
+{
+  head -2 "$loop_file"
+  drafter_trait_src
+  tail -n +3 "$loop_file"
+} >"$work/with_trait.rs"
+mv "$work/with_trait.rs" "$loop_file"
+run "a trait of bodiless declarations does not swallow the loop beneath it" 0 \
+  "OK: 7 loops (1 forwarded), 1 entries, 1 guards"
+
+# 26. And the invariant that would have caught it whatever the cause: an entry
+#     hands the sampler to a loop that takes a `RoundCfg`, so entries with none
+#     to enter are a loop the scan lost.
+build_mid_root "$root"
+rm -f "$root/crates/rmlx-models/src/speculative/round_loop.rs"
+run "an entry with no forwarded loop to enter is a scan error" 2 \
+  "the scan found 1 entries and no forwarded loop"
 
 echo
 if [ "$failures" != "0" ]; then
