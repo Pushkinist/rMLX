@@ -89,6 +89,8 @@
 //! can fail rather than against a re-derivation of itself.
 
 use super::dflash::dflash_next_block_size;
+use super::gemma4_assistant::AssistantRound;
+use super::round_loop::{ReportSkippedBy, RoundDrafter};
 use super::{
     accept_prefix, draft_rows_to_drop, rollback_target_from_head, rollback_target_from_tail,
     round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
@@ -281,17 +283,6 @@ fn the_draft_side_keeps_the_carry_and_the_accepted_prefix() {
 // What the seven loops declare at their edges
 // ---------------------------------------------------------------------------
 
-/// Which of a loop's two exits skips the report of the verifier's resident KV.
-#[derive(Debug, Clone, Copy)]
-enum ReportSkippedBy {
-    /// The seed EOS: the loop emits a token out of its prefill forward, and a
-    /// request whose whole output is that token returns before any round.
-    TheSeedExit,
-    /// The in-round EOS: the loop emits nothing before its first round, so the
-    /// only early exit it has is inside one.
-    TheInRoundExit,
-}
-
 /// How a loop refuses a drafter that proposed nothing.
 #[derive(Debug, Clone, Copy)]
 enum ChainRefusedBy {
@@ -303,14 +294,26 @@ enum ChainRefusedBy {
     TheVerifierInput,
 }
 
+/// The file the migrated loops share, and the order its own edge markers fall
+/// in.
+///
+/// It is not read off a row: the shared loop carries both exits at once and
+/// reads [`ReportSkippedBy`] at each of them, so its markers are the seed
+/// exit's guard, report and return, the round loop, the empty-chain refusal, and
+/// the tail's record, guard and report. What a migrated drafter declares is
+/// checked against its constant instead, by the test below.
+const SHARED_LOOP: &str = "round_loop.rs";
+const SHARED_LOOP_PATTERN: &str = "SPEWGRIP";
+
 /// What each round loop declares at its edges, and the file that holds it.
 ///
 /// This table is the statement; the two tests below are readings of it against
 /// today's source. It is data rather than seven assertions because it is what
-/// survives the collapse: the resident-KV disposition becomes a `RoundDrafter`
-/// declaration, the first migration re-keys the reading onto that declaration,
-/// and each migration drops its own file from [`LOOP_SOURCES`] in the same
-/// commit while these rows stay as they are. See `docs/SPEC_ROUND_SKELETON.md`.
+/// survives the collapse: the resident-KV disposition is a [`RoundDrafter`]
+/// declaration for a migrated loop, read here against its constant, and each
+/// migration drops its own file from [`LOOP_SOURCES`] and names
+/// [`SHARED_LOOP`] in its row instead, while these rows stay as they are. See
+/// `docs/SPEC_ROUND_SKELETON.md`.
 const DISPOSITIONS: [(SpecLoop, &str, ReportSkippedBy, ChainRefusedBy); 7] = [
     (
         SpecLoop::MtpSidecar,
@@ -338,7 +341,7 @@ const DISPOSITIONS: [(SpecLoop, &str, ReportSkippedBy, ChainRefusedBy); 7] = [
     ),
     (
         SpecLoop::MtpAssistant,
-        "gemma4_assistant.rs",
+        SHARED_LOOP,
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
     ),
@@ -387,10 +390,10 @@ const LOOP_SOURCES: [(&str, &str); 6] = [
         )),
     ),
     (
-        "gemma4_assistant.rs",
+        SHARED_LOOP,
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/speculative/gemma4_assistant.rs"
+            "/src/speculative/round_loop.rs"
         )),
     ),
     (
@@ -402,16 +405,42 @@ const LOOP_SOURCES: [(&str, &str); 6] = [
     ),
 ];
 
-/// The five edge markers, each as the character the reading below renders it as.
+/// The seven edge markers, each as the character the reading below renders it
+/// as.
 ///
-/// `E` is the early exit, `W` the head of the round loop, `G` either spelling of
-/// the empty-chain refusal, `R` the request record a loop closes on, `P` the
-/// report of the verifier's resident KV.
+/// `S` and `I` are the shared loop's two guards on the drafter's declared
+/// resident-KV exit, `E` is the early exit, `W` the head of the round loop, `G`
+/// either spelling of the empty-chain refusal, `R` the request record a loop
+/// closes on, `P` the report of the verifier's resident KV.
 ///
 /// `R` is what makes the reading see a report moved *into* the round loop: with
 /// four markers a report placed after the refusal reads the same as one at the
 /// tail, because nothing marked where the loop ended.
-const MARKERS: [(char, &str); 6] = [
+///
+/// **`S` and `I` are the whole guard line, matched exactly, and the other six
+/// are substrings.** The arm name alone is not a reader of the declaration: it
+/// is there whether the guard says `!matches!(…)` or `matches!(…)`, so dropping
+/// either `!` would invert which exit reports while every marker stays where
+/// the table says. Carrying the negation in a *substring* needle is not enough
+/// either — `|| true` appended, or `true ||` prefixed, leaves the needle inside
+/// the line and the sequence unchanged while the guard is now a constant. So
+/// these two are compared against the trimmed line, and nothing may be added to
+/// either side of them.
+///
+/// The cost is that a rename, or anything else that makes rustfmt wrap one of
+/// these two lines, fails this test rather than quietly passing it. That is the
+/// safe direction, and it is why the exactness is confined to these two: the
+/// other six markers name a call or a keyword that a loop may legitimately
+/// write in more than one shape.
+const MARKERS: [(char, &str); 8] = [
+    (
+        'S',
+        "if !matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheSeedExit) {",
+    ),
+    (
+        'I',
+        "if !(stopped_in_round && matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheInRoundExit)) {",
+    ),
     ('E', "return Ok((emitted"),
     ('W', "while emitted.len() < n_tokens"),
     ('G', "draft_tokens.is_empty()"),
@@ -436,13 +465,25 @@ fn marker_sequence(src: &str) -> String {
     let mut seen: Vec<(usize, char)> = Vec::new();
     for (idx, line) in src.lines().enumerate().filter(|(_, l)| is_code(l)) {
         for (mark, needle) in MARKERS {
-            if line.contains(needle) {
+            if marks_line(line, mark, needle) {
                 seen.push((idx, mark));
             }
         }
     }
     seen.sort_unstable();
     seen.into_iter().map(|(_, mark)| mark).collect()
+}
+
+/// The two markers read as a whole line rather than as a substring.
+const EXACT_MARKERS: [char; 2] = ['S', 'I'];
+
+/// Whether one line carries one marker, by that marker's own reading.
+fn marks_line(line: &str, mark: char, needle: &str) -> bool {
+    if EXACT_MARKERS.contains(&mark) {
+        line.trim() == needle
+    } else {
+        line.contains(needle)
+    }
 }
 
 /// How the markers of one loop fall in source order, given which exit skips the
@@ -483,20 +524,48 @@ fn expected_pattern(skipped_by: ReportSkippedBy) -> &'static str {
 ///
 /// Mutation: move any loop's `report_verifier_kv_bytes` call above its early
 /// return, or below the head of its round loop, or delete it.
+///
+/// Mutations on the shared loop's two declared-exit guards, each measured
+/// against `SPEWGRIP`: drop the `!` on the seed guard and it reads `PEWGRIP`;
+/// drop the `!` on the tail guard, `SPEWGRP`; swap the two arm names between
+/// the exits, `PEWGRP`; append `|| true` to either guard, the same as dropping
+/// its `!`, because the marker is the whole line.
 #[test]
 fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
     for (file, src) in LOOP_SOURCES {
-        let want: String = DISPOSITIONS
-            .iter()
-            .filter(|(_, f, _, _)| *f == file)
-            .map(|&(_, _, skipped_by, _)| expected_pattern(skipped_by))
-            .collect();
+        let want: String = if file == SHARED_LOOP {
+            SHARED_LOOP_PATTERN.to_owned()
+        } else {
+            DISPOSITIONS
+                .iter()
+                .filter(|(_, f, _, _)| *f == file)
+                .map(|&(_, _, skipped_by, _)| expected_pattern(skipped_by))
+                .collect()
+        };
         assert_eq!(
             marker_sequence(src),
             want,
-            "{file}: the early exit (E), the round loop (W), the empty-chain \
-             refusal (G), the request record (R) and the resident-KV report (P) \
-             do not fall in the order the table declares for the loop(s) it holds"
+            "{file}: the two declared-exit guards (S, I), the early exit (E), the \
+             round loop (W), the empty-chain refusal (G), the request record (R) \
+             and the resident-KV report (P) do not fall in the order the table \
+             declares for the loop(s) it holds"
+        );
+    }
+    // A migrated loop states its disposition rather than spelling it out, and a
+    // drafter can declare the exit the shared loop ignores. The `S` and `I`
+    // markers above are the second reader: they hold the loop to both arms of
+    // what was declared, so a guard whose sense is inverted fails here.
+    for (loop_kind, _, skipped_by, _) in DISPOSITIONS {
+        // One arm per migrated loop, named rather than derived — a constant is
+        // read through its drafter's own type. Each migration adds its drafter
+        // here, the same cliff the refusal reading below carries.
+        if !matches!(loop_kind, SpecLoop::MtpAssistant) {
+            continue;
+        }
+        assert_eq!(
+            <AssistantRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
+            skipped_by,
+            "the migrated {loop_kind:?} loop declares an exit the table does not"
         );
     }
 }
@@ -519,6 +588,13 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
 /// to say is that an empty chain is a broken drafter and not the end of the
 /// request.
 ///
+/// The shared loop is counted by spelling and not by row, which is the one
+/// place this reading differs from a per-file count. Every drafter that
+/// migrates names [`SHARED_LOOP`] in its row, so at the next chunk two rows
+/// point at one file — and the loop states each refusal once however many
+/// drafters route through it. Counting rows there would fail a correct tree the
+/// moment a second drafter arrives.
+///
 /// Mutation: drop either spelling from any loop, or move a loop from one
 /// spelling to the other without moving its row.
 #[test]
@@ -528,7 +604,7 @@ fn every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure() 
             if mark != 'G' {
                 continue;
             }
-            let want = DISPOSITIONS
+            let rows = DISPOSITIONS
                 .iter()
                 .filter(|(_, f, _, refused_by)| {
                     *f == file
@@ -539,14 +615,20 @@ fn every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure() 
                             }
                 })
                 .count();
+            let want = if file == SHARED_LOOP {
+                rows.min(1)
+            } else {
+                rows
+            };
             let have = src
                 .lines()
                 .filter(|l| is_code(l) && l.contains(needle))
                 .count();
             assert_eq!(
                 have, want,
-                "{file} states `{needle}` {have} time(s) where the table declares \
-                 {want} loop(s) refusing an empty chain that way"
+                "{file} states `{needle}` {have} time(s) where the table wants it \
+                 stated {want} time(s), over {rows} loop row(s) refusing an empty \
+                 chain that way"
             );
         }
     }

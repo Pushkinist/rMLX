@@ -37,6 +37,7 @@ pub mod mtp;
 
 pub(crate) mod draft_kind;
 pub(crate) mod round_common;
+pub(crate) mod round_loop;
 pub(crate) mod round_stats;
 
 use std::collections::{BTreeMap, HashMap};
