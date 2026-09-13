@@ -118,14 +118,14 @@ reference. It carries a pair for six of the seven round loops below; the seventh
 is the two-model stochastic one, which runs only above temperature 0 and so has
 no arm this gate can compare.
 
-**One loop, migrating.** The seven drafter paths run one algorithm, and six of
+**One loop, migrating.** The seven drafter paths run one algorithm, and five of
 them still carry their own copy of it;
 `docs/SPEC_ROUND_SKELETON.md` is the plan that collapses them: the drafter
 interface, what each loop does the interface cannot express, the migration
 order, and the mutations a skeleton could contain beside what catches each.
-Migration chunk 1 has landed: the shared loop is
-`crates/rmlx-models/src/speculative/round_loop.rs` and the Gemma4 assistant runs
-on it; the other six loops still carry their own bodies.
+Migration chunks 1 and 2 have landed: the shared loop is
+`crates/rmlx-models/src/speculative/round_loop.rs`, and the Gemma4 assistant and
+the MTP sidecar run on it; the other five loops still carry their own bodies.
 
 ```text
 # Initialisation
@@ -315,8 +315,9 @@ comparing one against the other is comparing two definitions. Renaming either
 moves every digest in the pinned round-stream baseline, so the collision is
 recorded here rather than resolved in this chunk.
 `v_offset_before` is the verifier offset that round's rollback target was
-computed from, which the six loops counting back from the tail read after their
-verify forward and the assistant reads before its own. `d_offset_before` and
+computed from, which the loops counting back from the tail read after their
+verify forward and the assistant reads before its own — the shared loop reads
+both and reports the one its drafter declares in `VERIFIER_OFFSET_BASIS`. `d_offset_before` and
 `d_target` are the same two positions on the drafter's own cache, on their own
 arithmetic — which is what makes them a cross-check on `v_target` rather than a
 restatement of it.
@@ -357,8 +358,8 @@ record.** `phases_charged()` is read at the loop head and passed down — to
 [`round_common::log_request_record`](../crates/rmlx-models/src/speculative/round_common.rs),
 the one place a `RoundStats` is assembled, so it reaches the `done` line every
 loop writes. Two things depend on that.
-`rollback_round` is shared by nine call sites across seven loops and
-only three of those loops time their phases; a switch it read on its own behalf would change how the other four
+`rollback_round` is shared by eight call sites across the seven drafter paths
+and only three of those paths time their phases; a switch it read on its own behalf would change how the other four
 schedule work, with nothing on their records saying so — they pass `false` and
 report `charged=false`.
 
@@ -533,8 +534,11 @@ Status: **fully wired + live-validated** against two pairs — the MoE sidecar
 `mlx-community/Qwen3.6-35B-A3B-MTP-5bit` + `mlx-community/Qwen3.6-35B-A3B-8bit`,
 and the dense sidecar `mlx-community/Qwen3.8-27B-MTP-mxfp8` +
 `mlx-community/Qwen3.8-27B-mxfp8`. `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs`
-gates both the FFN-shape probe and the greedy-tracking property. The round-loop
-(`mtp_generate`) mirrors the DFlash loop structurally: verifier prefill →
+gates both the FFN-shape probe and the greedy-tracking property. Its rounds run
+in the shared `run_rounds`; `mtp_generate` is the entry that refuses a prompt
+under two tokens and a verifier with no recurrent state, and resolves the
+request's block. The algorithm mirrors the DFlash loop structurally: verifier
+prefill →
 round-0 penultimate-hidden + first-bonus capture → per-round autoregressive
 `draft_n` (RoPE offset = sidecar `_next_position` = verifier prefix length +
 appended count) → one combined verify forward → `accept_prefix` walk over the
@@ -594,10 +598,11 @@ Every round loop that can partially accept goes through **one** implementation �
 `speculative::round_common::rollback_round`, which decides the arm and, on a
 partial accept, calls the low-level `rollback_round_caches` beside it. A
 full-attention arch (`lin` absent or empty) truncates and stops; a GDN hybrid
-also refolds. Its nine call sites are `mtp_generate`, `dflash_generate`,
-`dflash2_generate`, `eagle3_generate`, `mtp_assistant_generate` (full attention,
-so truncation only) and the two-model loops' four — greedy verifier, greedy
-drafter, stochastic verifier and stochastic drafter. There is deliberately no
+also refolds. Its eight call sites are `dflash_generate`, `dflash2_generate`,
+`eagle3_generate`, the shared `run_rounds` — which serves the Gemma4 assistant
+(full attention, so truncation only) and the MTP sidecar — and the two-model
+loops' four: greedy verifier, greedy drafter, stochastic verifier and stochastic
+drafter. There is deliberately no
 second copy: the defect the replay was written to fix lived in four independent
 implementations at once, and a rollback inlined per loop is how it got there.
 
