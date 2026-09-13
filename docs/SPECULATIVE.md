@@ -118,8 +118,9 @@ reference. It carries a pair for six of the seven round loops below; the seventh
 is the two-model stochastic one, which runs only above temperature 0 and so has
 no arm this gate can compare.
 
-**One loop, migrating.** The seven loops are one algorithm written seven times,
-and `docs/SPEC_ROUND_SKELETON.md` is the plan that collapses them: the drafter
+**One loop, migrating.** The seven drafter paths run one algorithm, and six of
+them still carry their own copy of it;
+`docs/SPEC_ROUND_SKELETON.md` is the plan that collapses them: the drafter
 interface, what each loop does the interface cannot express, the migration
 order, and the mutations a skeleton could contain beside what catches each.
 Migration chunk 1 has landed: the shared loop is

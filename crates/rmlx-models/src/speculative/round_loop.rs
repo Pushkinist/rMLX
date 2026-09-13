@@ -11,7 +11,11 @@
 //!
 //! What differs between drafters is how one proposes, what it conditions on, how
 //! it rolls its own state back and which of the verifier's outputs it captures.
-//! Those are [`RoundDrafter`]'s methods; everything above is [`run_rounds`].
+//! Those are [`RoundDrafter`]'s methods; the rest is [`run_rounds`], with two
+//! exceptions at the front. The prompt refusal and the block resolution stay in
+//! each drafter's own entry, which runs before the loop: both refuse before a
+//! cache stack is built, and the loop is handed a block that is already
+//! resolved.
 //!
 //! See `docs/SPEC_ROUND_SKELETON.md` for the interface's rationale and for the
 //! per-loop behaviour it is required to preserve.
@@ -207,10 +211,14 @@ pub(crate) trait RoundDrafter {
     /// path — a returned `Vec` would be allocated once per round of every
     /// request and dropped unread.
     ///
+    /// `f` must be invoked — it is where the round's line is written, and the
+    /// loop refuses a round that returns from here without it. A drafter that
+    /// carries nothing by design invokes it with an empty slice.
+    ///
     /// # Errors
-    /// Whatever a drafter with no carry to state refuses. Answering with an
-    /// empty slice instead would let the charged round's forcing check pass on a
-    /// drafter that lost the arrays it was supposed to be holding.
+    /// Whatever a drafter that has *lost* conditioning it should be holding
+    /// refuses. Answering that state with an empty slice instead would let the
+    /// charged round's forcing check pass on exactly the drafter it is for.
     fn carry(&self, f: &mut dyn FnMut(&[(&str, &Array)])) -> Result<()>;
 }
 
@@ -401,9 +409,24 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
                 rollback_ns: round_rollback_ns,
             }),
         };
+        // The emit is inside the callback, so a drafter that returns without
+        // invoking it deletes its own per-round stream and nothing else notices:
+        // the text gates read that the call is written, the marker reading reads
+        // where, and greedy verification answers the same either way. Only the
+        // snapshot-gated baseline would see it, and only on a machine holding
+        // the pair. A runtime refusal is what covers the rest.
+        let mut lined = false;
         drafter.carry(&mut |carried| {
+            lined = true;
             super::log_round(&report, carried);
         })?;
+        if !lined {
+            return Err(Error::Model(format!(
+                "{:?}: the drafter's `carry` returned without handing its list \
+                 over, so the round's line was never written",
+                cfg.loop_kind
+            )));
+        }
     }
 
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();

@@ -417,23 +417,29 @@ const LOOP_SOURCES: [(&str, &str); 6] = [
 /// four markers a report placed after the refusal reads the same as one at the
 /// tail, because nothing marked where the loop ended.
 ///
-/// **`S` and `I` carry the guard's sense, not just the arm it names.** They are
-/// the whole condition, negation included, because the declaration's second
-/// reader has two mutations to catch and the arm name alone catches one: swap
-/// the two arms between the exits and the sequence reads `IPEWGRSP`, but drop
-/// either `!` and the loop reports on exactly the exit the drafter declared it
-/// would skip while every arm still sits where the table says. Reading the
-/// condition is also why these two needles are long: a rename that makes
-/// rustfmt wrap one of them fails this test rather than quietly passing it,
-/// which is the safe direction.
+/// **`S` and `I` are the whole guard line, matched exactly, and the other six
+/// are substrings.** The arm name alone is not a reader of the declaration: it
+/// is there whether the guard says `!matches!(…)` or `matches!(…)`, so dropping
+/// either `!` would invert which exit reports while every marker stays where
+/// the table says. Carrying the negation in a *substring* needle is not enough
+/// either — `|| true` appended, or `true ||` prefixed, leaves the needle inside
+/// the line and the sequence unchanged while the guard is now a constant. So
+/// these two are compared against the trimmed line, and nothing may be added to
+/// either side of them.
+///
+/// The cost is that a rename, or anything else that makes rustfmt wrap one of
+/// these two lines, fails this test rather than quietly passing it. That is the
+/// safe direction, and it is why the exactness is confined to these two: the
+/// other six markers name a call or a keyword that a loop may legitimately
+/// write in more than one shape.
 const MARKERS: [(char, &str); 8] = [
     (
         'S',
-        "!matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheSeedExit)",
+        "if !matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheSeedExit) {",
     ),
     (
         'I',
-        "!(stopped_in_round && matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheInRoundExit))",
+        "if !(stopped_in_round && matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheInRoundExit)) {",
     ),
     ('E', "return Ok((emitted"),
     ('W', "while emitted.len() < n_tokens"),
@@ -459,13 +465,25 @@ fn marker_sequence(src: &str) -> String {
     let mut seen: Vec<(usize, char)> = Vec::new();
     for (idx, line) in src.lines().enumerate().filter(|(_, l)| is_code(l)) {
         for (mark, needle) in MARKERS {
-            if line.contains(needle) {
+            if marks_line(line, mark, needle) {
                 seen.push((idx, mark));
             }
         }
     }
     seen.sort_unstable();
     seen.into_iter().map(|(_, mark)| mark).collect()
+}
+
+/// The two markers read as a whole line rather than as a substring.
+const EXACT_MARKERS: [char; 2] = ['S', 'I'];
+
+/// Whether one line carries one marker, by that marker's own reading.
+fn marks_line(line: &str, mark: char, needle: &str) -> bool {
+    if EXACT_MARKERS.contains(&mark) {
+        line.trim() == needle
+    } else {
+        line.contains(needle)
+    }
 }
 
 /// How the markers of one loop fall in source order, given which exit skips the
@@ -506,6 +524,12 @@ fn expected_pattern(skipped_by: ReportSkippedBy) -> &'static str {
 ///
 /// Mutation: move any loop's `report_verifier_kv_bytes` call above its early
 /// return, or below the head of its round loop, or delete it.
+///
+/// Mutations on the shared loop's two declared-exit guards, each measured
+/// against `SPEWGRIP`: drop the `!` on the seed guard and it reads `PEWGRIP`;
+/// drop the `!` on the tail guard, `SPEWGRP`; swap the two arm names between
+/// the exits, `PEWGRP`; append `|| true` to either guard, the same as dropping
+/// its `!`, because the marker is the whole line.
 #[test]
 fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
     for (file, src) in LOOP_SOURCES {

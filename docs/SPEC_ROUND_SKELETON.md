@@ -190,7 +190,8 @@ They are the chunk-2 agenda as much as they are a record.
 - **The seed exit returns the resolved block, not the widest that ran.** This is
   the one deviation that is a preserved value rather than a missing producer:
   item 5 proposes the loop return the widest that ran on every exit, which would
-  move the five sidecar seed exits. The shared loop keeps `main`'s value — no
+  move the four remaining sidecar seed exits and this one. The shared loop keeps
+  `main`'s value — no
   round has run at that exit, so `widest_bs` is zero there and returning it would
   report a block of nothing. Item 5 is qualified below accordingly: the change it
   proposes is still owed, and it is owed as its own change, because the row in
@@ -208,11 +209,13 @@ it names — with the arm alone, dropping either `!` leaves every marker where t
 table says it should be while the loop reports on the exit it declared it would
 skip.
 
-One thing stays outside the loop and is not a deviation: the refusal of a prompt
-under two tokens is in the drafter's entry, beside the block resolution and the
-verifier-pairing check, because its message names the pairing. The loop's module
-doc lists it among what a request runs, and the entry is where a request meets
-it.
+Two things stay outside the loop and neither is a deviation: the refusal of a
+prompt under two tokens and the resolution of the request's block are both in
+the drafter's entry, beside the verifier-pairing check. They are there because
+they refuse before anything is built — no cache stack, no prefill, no round —
+and because the loop is handed a block that is already resolved and a prompt it
+may assume has a last token to seed from. The loop's module doc lists both among
+what a request runs and names the entry as where they run.
 
 ## What the interface cannot express, and what is proposed for it
 
@@ -258,10 +261,11 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs` reads it too, but
    the pairs are what pin it.
 
-   What is *not* gated is the five sidecar **seed** exits, which return the
-   resolved block rather than the widest that ran — a round has not run there, so
-   the two differ, and no gate prompt stops on its seed. The two in-round EOS
-   exits already return the widest that ran. Proposed: the loop returns the
+   What is *not* gated is the five **seed** exits — the four sidecar loops that
+   still carry their own body, and the shared loop the assistant runs on — which
+   return the resolved block rather than the widest that ran: a round has not run
+   there, so the two differ, and no gate prompt stops on its seed. The two
+   in-round EOS exits already return the widest that ran. Proposed: the loop returns the
    widest block that ran on every exit, which changes those five values alone.
 
    **Not adopted in chunk 1, and it is the eighth deviation above.** The shared
