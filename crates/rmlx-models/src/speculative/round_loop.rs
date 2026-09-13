@@ -15,6 +15,17 @@
 //!
 //! See `docs/SPEC_ROUND_SKELETON.md` for the interface's rationale and for the
 //! per-loop behaviour it is required to preserve.
+//!
+//! [`run_rounds`] cannot have a unit test, for the reason `round_common.rs`
+//! gives about its own cache-stack functions: it takes an [`Architecture`],
+//! which is only reachable by loading weights. Four readings hold it instead,
+//! each blind to something different — the equivalence pair
+//! `the_assistant_round_loop_reproduces_plain_greedy` in
+//! `crates/rmlx-models/tests/spec_greedy_equivalence.rs`, the per-round event
+//! stream that run writes against
+//! `crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256`, the
+//! edge-marker reading of this file in `round_skeleton_tests.rs`, and the text
+//! scans `make check-spec-charge` and `make check-spec-sampling`.
 
 use std::time::Instant;
 
@@ -187,9 +198,20 @@ pub(crate) trait RoundDrafter {
     ) -> Result<()>;
 
     /// Every array this round leaves for the next round's drafter to read, each
-    /// under the name this drafter calls it. On a charged round they must all be
-    /// forced by the time the round's line is written.
-    fn carry(&self) -> Vec<(&str, &Array)>;
+    /// under the name this drafter calls it, handed to `f` as one borrowed
+    /// slice. On a charged round they must all be forced by the time the round's
+    /// line is written.
+    ///
+    /// A callback rather than a returned collection: the list has one consumer,
+    /// [`super::log_round`]'s charged arm, and that arm is off on the default
+    /// path — a returned `Vec` would be allocated once per round of every
+    /// request and dropped unread.
+    ///
+    /// # Errors
+    /// Whatever a drafter with no carry to state refuses. Answering with an
+    /// empty slice instead would let the charged round's forcing check pass on a
+    /// drafter that lost the arrays it was supposed to be holding.
+    fn carry(&self, f: &mut dyn FnMut(&[(&str, &Array)])) -> Result<()>;
 }
 
 /// Run one speculative request's rounds.
@@ -266,13 +288,13 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         },
     ) {
         if !matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheSeedExit) {
-            report_verifier_kv_bytes(verifier, &ctx.kv, ctx.lin.as_deref());
+            report_verifier_kv_bytes(ctx.verifier, &ctx.kv, ctx.lin.as_deref());
         }
         return Ok((emitted, cfg.block_size));
     }
 
     tracing::info!(
-        ?cfg.loop_kind,
+        loop_kind = ?cfg.loop_kind,
         block_size = cfg.block_size,
         prompt_len = prompt_ids.len(),
         n_tokens,
@@ -345,39 +367,43 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             pre_round_offset,
             v_target,
             charge,
-            device,
+            ctx.device,
         )?;
         drafter.rollback(&ctx, &verdict, v_target)?;
         drafter.condition(&ctx, &verdict, v_target)?;
+        // The verifier's own token at the accepted position, read off the
+        // commit. The two part only on a full acceptance the request's budget
+        // truncated, where the request has emitted its last token and the loop
+        // leaves before any round reads what was stored here.
         carry = verdict.commit.last().copied().unwrap_or(carry);
         let round_rollback_ns = t0.elapsed().as_nanos();
 
-        super::log_round(
-            &super::RoundReport {
-                loop_kind: cfg.loop_kind,
-                round: rounds,
-                accept: verdict.accept,
-                num_draft: draft_tokens.len(),
-                n_committed: emit.committed,
-                emitted_total: emitted.len(),
-                condition_rows: None,
-                projected_rows: None,
-                v_offset_before: pre_round_offset,
-                v_target,
-                d_offset_before: None,
-                d_target: None,
-                refolded,
-                charged: charge,
-                phases: Some(super::RoundPhases {
-                    round_ns: round_t0.elapsed().as_nanos(),
-                    draft_ns: round_draft_ns,
-                    verify_ns: verdict.verify_ns,
-                    walk_ns: verdict.walk_ns,
-                    rollback_ns: round_rollback_ns,
-                }),
-            },
-            &drafter.carry(),
-        );
+        let report = super::RoundReport {
+            loop_kind: cfg.loop_kind,
+            round: rounds,
+            accept: verdict.accept,
+            num_draft: draft_tokens.len(),
+            n_committed: emit.committed,
+            emitted_total: emitted.len(),
+            condition_rows: None,
+            projected_rows: None,
+            v_offset_before: pre_round_offset,
+            v_target,
+            d_offset_before: None,
+            d_target: None,
+            refolded,
+            charged: charge,
+            phases: Some(super::RoundPhases {
+                round_ns: round_t0.elapsed().as_nanos(),
+                draft_ns: round_draft_ns,
+                verify_ns: verdict.verify_ns,
+                walk_ns: verdict.walk_ns,
+                rollback_ns: round_rollback_ns,
+            }),
+        };
+        drafter.carry(&mut |carried| {
+            super::log_round(&report, carried);
+        })?;
     }
 
     let round_loop_ns = round_loop_t0.elapsed().as_nanos();
@@ -402,7 +428,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         &window,
     );
     if !(stopped_in_round && matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheInRoundExit)) {
-        report_verifier_kv_bytes(verifier, &ctx.kv, ctx.lin.as_deref());
+        report_verifier_kv_bytes(ctx.verifier, &ctx.kv, ctx.lin.as_deref());
     }
     Ok((emitted, widest_bs))
 }

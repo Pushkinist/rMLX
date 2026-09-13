@@ -1,4 +1,4 @@
-# One speculative round loop: the proposed interface
+# One speculative round loop: the interface
 
 **Status: migration chunk 1 has landed.** The loop is
 `crates/rmlx-models/src/speculative/round_loop.rs` and the Gemma4 assistant runs
@@ -7,17 +7,19 @@ reviewer judged before the first drafter was migrated, and what each migration
 chunk is held to afterwards. What chunk 1 landed differently from the proposal
 below is listed under "What chunk 1 landed".
 
-Seven round loops in `crates/rmlx-models/src/speculative/` run one algorithm:
+Seven drafter paths in `crates/rmlx-models/src/speculative/` run one algorithm.
+Six still carry their own round-loop body; the seventh is an entry onto the
+shared loop:
 
-| loop | file |
-|---|---|
-| `mtp_generate` | `crates/rmlx-models/src/speculative/mtp.rs` |
-| `dflash_generate` | `crates/rmlx-models/src/speculative/dflash/mod.rs` |
-| `dflash2_generate` | `crates/rmlx-models/src/speculative/dflash2/round.rs` |
-| `eagle3_generate` | `crates/rmlx-models/src/speculative/eagle3/mod.rs` |
-| `mtp_assistant_generate` | `crates/rmlx-models/src/speculative/gemma4_assistant.rs` |
-| `spec_generate_greedy_cached` | `crates/rmlx-models/src/speculative/mod.rs` |
-| `spec_generate_stochastic_cached` | `crates/rmlx-models/src/speculative/mod.rs` |
+| drafter path | file | body |
+|---|---|---|
+| `mtp_generate` | `crates/rmlx-models/src/speculative/mtp.rs` | its own |
+| `dflash_generate` | `crates/rmlx-models/src/speculative/dflash/mod.rs` | its own |
+| `dflash2_generate` | `crates/rmlx-models/src/speculative/dflash2/round.rs` | its own |
+| `eagle3_generate` | `crates/rmlx-models/src/speculative/eagle3/mod.rs` | its own |
+| `mtp_assistant_generate` | `crates/rmlx-models/src/speculative/gemma4_assistant.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
+| `spec_generate_greedy_cached` | `crates/rmlx-models/src/speculative/mod.rs` | its own |
+| `spec_generate_stochastic_cached` | `crates/rmlx-models/src/speculative/mod.rs` | its own |
 
 `spec_generate_greedy` in the same file is the two-model entry guard and
 dispatcher, not a loop: it validates a request, resolves the draft count and
@@ -144,13 +146,17 @@ their first producer, and re-keys the report onto them.
 
 ## What chunk 1 landed
 
-Seven differences from the proposal above, each because the shape it proposes
-has no producer yet and landing it would mean a type or a field nothing writes.
+Eight differences from the proposal above. Seven are because the shape it
+proposes has no producer yet and landing it would mean a type or a field nothing
+writes; the eighth preserves a value on `main` the proposal would have moved.
 They are the chunk-2 agenda as much as they are a record.
 
 - **`Prefilled::seed` is a `u32`, not an `Option<u32>`.** The `None` arm is the
-  two-model pair, which migrates in chunk 6; until then the loop would have to
-  invent a round-0 carry for a case no drafter reaches.
+  two-model pair, which migrates in chunk 6. The cost of landing the `Option`
+  early is not a missing round-0 carry — it is that the loop emits the seed
+  unconditionally, through one `emit_seed_token` call that is also where the
+  seed-EOS record is written, so a `None` would have to be given a token to emit
+  and would emit an invented one. The arm arrives with the pair that needs it.
 - **`RoundOutcome` is not a type.** Its `emit` half has no reader in chunk 1 —
   the assistant's `condition` reads the verifier target and nothing else — and a
   struct field no one reads is a `dead_code` warning, not a seam. `rollback` and
@@ -159,11 +165,19 @@ They are the chunk-2 agenda as much as they are a record.
 - **`Verdict` carries `verify_ns` and `walk_ns` and no `restricted`.** The
   verify forward and the acceptance walk are two spans of the round line, and
   the forward is inside `verify`, so the split is the drafter's to report.
-  `restricted` is EAGLE-3's and arrives with it.
-- **`RoundDrafter` has a seventh method, `carry`.** `log_round` takes every
-  array a round leaves for the next round's drafter, under the name that drafter
-  calls it, and checks on a charged round that they are forced. Only the drafter
-  knows what it carries.
+  `restricted` is EAGLE-3's and arrives with it — together with the per-token
+  attribution buffer of item 3, which the loop has no carrier for either. Those
+  two are one chunk's work and neither has a producer before it.
+- **`RoundDrafter` has a seventh method, `carry`, and it takes a callback.**
+  `log_round` takes every array a round leaves for the next round's drafter,
+  under the name that drafter calls it, and checks on a charged round that they
+  are forced. Only the drafter knows what it carries. It hands the list to a
+  `&mut dyn FnMut(&[(&str, &Array)])` rather than returning one: the consumer is
+  `log_round`'s charged arm, which is off on the default path, so a returned
+  collection would be allocated every round of every request and dropped unread.
+  It returns a `Result` for the same reason the method exists — a drafter that
+  lost its carry refuses, where an empty slice would pass the charged round's
+  forcing check on exactly the state that check is for.
 - **The loop always reports `RoundPhases`.** It times every phase it runs, so it
   has the figures on every request. Four loops report `None` today and will stop
   doing so as they migrate; the pinned round stream drops every `*_ms` field, so
@@ -173,12 +187,32 @@ They are the chunk-2 agenda as much as they are a record.
   The two-valued basis of item 6 arrives with the first tail-spelling drafter.
 - **No head-against-tail refusal.** Item 6 proposes one and owes it two controls;
   chunk 1 neither adds it nor owes them.
+- **The seed exit returns the resolved block, not the widest that ran.** This is
+  the one deviation that is a preserved value rather than a missing producer:
+  item 5 proposes the loop return the widest that ran on every exit, which would
+  move the five sidecar seed exits. The shared loop keeps `main`'s value — no
+  round has run at that exit, so `widest_bs` is zero there and returning it would
+  report a block of nothing. Item 5 is qualified below accordingly: the change it
+  proposes is still owed, and it is owed as its own change, because the row in
+  the mutation table says nothing catches it. Migrating a drafter and moving that
+  value in the same chunk would be a behaviour change riding inside a refactor
+  whose contract is that nothing moves.
 
 Two things chunk 1 does carry as proposed: `Prefilled` declares
 `conditioned_rows` (the assistant answers `None`), and `KV_REPORT_SKIPPED_BY` is
 read at both of the loop's exits, so the disposition test's seven-row table is
 now a reading of the constant for the migrated loop and of the source for the
-six that are not.
+six that are not. The loop's own two guards on that constant are read by the
+same marker sequence, which carries each guard's negation and not only the arm
+it names — with the arm alone, dropping either `!` leaves every marker where the
+table says it should be while the loop reports on the exit it declared it would
+skip.
+
+One thing stays outside the loop and is not a deviation: the refusal of a prompt
+under two tokens is in the drafter's entry, beside the block resolution and the
+verifier-pairing check, because its message names the pairing. The loop's module
+doc lists it among what a request runs, and the entry is where a request meets
+it.
 
 ## What the interface cannot express, and what is proposed for it
 
@@ -229,6 +263,14 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    the two differ, and no gate prompt stops on its seed. The two in-round EOS
    exits already return the widest that ran. Proposed: the loop returns the
    widest block that ran on every exit, which changes those five values alone.
+
+   **Not adopted in chunk 1, and it is the eighth deviation above.** The shared
+   loop returns the resolved block on its seed exit, exactly as the assistant's
+   own body did. Taking the proposal instead would have this refactor move a
+   value nothing catches, in a chunk whose contract is that nothing moves; and
+   the value it would move to is zero, since `widest_bs` counts rounds that ran
+   and none has. Whoever takes it takes it on its own evidence, and the row in
+   the mutation table is what says there is none to be had at runtime.
 6. **The verifier offset a round reports.** The Gemma4 assistant reads it before
    its verify forward and counts forward over the accepted prefix; the other six
    read it after and count back from the tail. The two spellings name the same
@@ -279,13 +321,23 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    commit. Without the declaration the first migration would delete a loop the
    test still reads and leave nothing in its place.
 
-   **A declaration needs two readers, and chunk 1 owes the second.** That each
+   **A declaration needs two readers, and chunk 1 built the second.** That each
    drafter declares an exit is one fact; that the loop honours what it declared
    is another, and a drafter can declare the exit the loop ignores. The second
    reader is the same marker reading, over `round_loop.rs`: its two exits, and
-   the two arms the constant is read at. So the source scan gains that file in
+   the two guards the constant is read at. So the source scan gains that file in
    the very commit that drops the first migrated one, and its declared pattern is
-   the loop's own, not a drafter's.
+   the loop's own, not a drafter's — `SPEWGRIP`, where `S` and `I` are the two
+   guards.
+
+   **Each of those two markers is the whole guard, negation included.** The arm
+   name alone is not a reader of the declaration: it is present whether the guard
+   says `!matches!(…)` or `matches!(…)`, so dropping either `!` inverts which
+   exit reports while every marker stays exactly where the table says it should
+   be, and the constant assertion, the round stream, the pairs and both text
+   gates all stay green. Reading the condition catches that and the arm swap
+   alike; the cost is two long needles, and a rename that makes rustfmt wrap one
+   of them fails the test rather than quietly passing it.
 8. **What a round conditions on.** DFlash 1 conditions on the round's *committed*
    count and DFlash 2 on `accept + 1`, at the same two calls — the row count
    handed to `committed_rows` and the bound handed to `guard_round_conditioning`.

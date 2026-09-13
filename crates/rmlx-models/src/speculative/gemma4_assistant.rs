@@ -916,16 +916,16 @@ impl RoundDrafter for AssistantRound<'_> {
         Ok(())
     }
 
-    fn carry(&self) -> Vec<(&str, &Array)> {
-        self.conditioned.as_ref().map_or_else(Vec::new, |cond| {
-            vec![
-                ("hidden", &cond.hidden),
-                ("sliding_k", &cond.sliding_kv.0),
-                ("sliding_v", &cond.sliding_kv.1),
-                ("full_k", &cond.full_kv.0),
-                ("full_v", &cond.full_kv.1),
-            ]
-        })
+    fn carry(&self, f: &mut dyn FnMut(&[(&str, &Array)])) -> Result<()> {
+        let cond = self.conditioned()?;
+        f(&[
+            ("hidden", &cond.hidden),
+            ("sliding_k", &cond.sliding_kv.0),
+            ("sliding_v", &cond.sliding_kv.1),
+            ("full_k", &cond.full_kv.0),
+            ("full_v", &cond.full_kv.1),
+        ]);
+        Ok(())
     }
 }
 
