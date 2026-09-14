@@ -1,21 +1,22 @@
 # One speculative round loop: the interface
 
-**Status: migration chunks 1, 2 and 3 have landed.** The loop is
+**Status: migration chunks 1, 2, 3 and 4 have landed.** The loop is
 `crates/rmlx-models/src/speculative/round_loop.rs`; the Gemma4 assistant, the MTP
-sidecar and DFlash 2 run on it and the other four loops still carry their own
-bodies. This file is what a reviewer judged before the first drafter was
-migrated, and what each migration chunk is held to afterwards. What each chunk
-landed differently from the proposal below is listed under "What chunk 1
-landed", "What chunk 2 landed" and "What chunk 3 landed".
+sidecar, DFlash 2 and DFlash 1 run on it and the other three loops still carry
+their own bodies. This file is what a reviewer judged before the first drafter
+was migrated, and what each migration chunk is held to afterwards. What each
+chunk landed differently from the proposal below is listed under "What chunk 1
+landed", "What chunk 2 landed", "What chunk 3 landed" and "What chunk 4
+landed".
 
 Seven drafter paths in `crates/rmlx-models/src/speculative/` run one algorithm.
-Four still carry their own round-loop body; the other three are entries onto the
+Three still carry their own round-loop body; the other four are entries onto the
 shared loop:
 
 | drafter path | file | body |
 |---|---|---|
 | `mtp_generate` | `crates/rmlx-models/src/speculative/mtp.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
-| `dflash_generate` | `crates/rmlx-models/src/speculative/dflash/mod.rs` | its own |
+| `dflash_generate` | `crates/rmlx-models/src/speculative/dflash/round.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `dflash2_generate` | `crates/rmlx-models/src/speculative/dflash2/round.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `eagle3_generate` | `crates/rmlx-models/src/speculative/eagle3/mod.rs` | its own |
 | `mtp_assistant_generate` | `crates/rmlx-models/src/speculative/gemma4_assistant.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
@@ -337,6 +338,59 @@ reason, and four are values the migration had to preserve or move.
   taking its third row. DFlash 2's own refusal text is gone with its body —
   item 11's cost, paid a third time.
 
+## What chunk 4 landed
+
+Six notes. One is the cell disposition chunk 3 recorded for this chunk, one
+records a per-drafter fact that needed no interface growth, and four are values
+the migration had to preserve or move.
+
+- **The adaptive block goes through `block` and nothing else.** The schedule is
+  `dflash_next_block_size`, unchanged and still pinned by
+  `the_round_block_is_one_function_of_the_block_and_the_budget`; what moved is
+  its caller. `AdaptiveRound::block` is the one override of the trait's default,
+  the six other drafters keep `round_block`, and `run_rounds` carries no arm for
+  it. The history the schedule reads — `(accepted, drafted)` per round — is the
+  drafter's own field, written at the end of `verify` where the round's
+  acceptance is known and read at the head of the next round, which is the same
+  order the body it replaced wrote and read it in. No fact reaches `block` that
+  the interface did not already hand it.
+- **The cell disposition chunk 3 recorded, met.** DFlash 1 reported
+  `phases: None` and now reports `RoundPhases`, so its round line gains five
+  `*_ms` fields and reaches `log_round`'s overrun `error!` arm for the first
+  time. The pinned stream drops every `*_ms` field, so its cells do not move;
+  the overrun line carries no emitted total and stays out of the stream by the
+  rule that keeps it out for the three loops already there. The charge decision
+  is still DFlash 1's own and still `false` — the entry writes it into
+  `RoundCfg` and the census reads `charge_phases:3 false:4` over seven sites.
+- **DFlash 1's dispositions are preserved as the spec states them**: the seed
+  exit returns the resolved block and skips the resident-KV report
+  (`KV_REPORT_SKIPPED_BY::TheSeedExit`); it counts its rollback back from the
+  tail and reports the post-forward read
+  (`VERIFIER_OFFSET_BASIS::AfterTheForward`) while the target is computed from
+  the head spelling, which is the number the body it replaced computed; the
+  request record's `conditioned_rows` is `Some(0)` on the seed exit and
+  `Some(sum)` on the tail, under `projects_conditioning: true`; its round line
+  keeps `condition_rows: Some(..)` beside `projected_rows: Some(..)` and no
+  `d_offset_before` / `d_target`, the drafter keeping no cache of its own and
+  answering `rollback`'s default; and it charges no phase.
+- **The conditioning buffer still grows and is still never trimmed.** DFlash 2
+  slides a bounded window; this drafter's layers are full-attention and its
+  block queries read the whole context unmasked, so `grow_conditioning` appends
+  and drops nothing. The two are one method of the interface and two bodies of
+  the drafter, which is the split item 2 predicted.
+- **One figure moved and one log field went, and nothing reads either.** Its
+  `rollback_ms` used to close before the conditioning growth and now closes
+  after it, because the shared loop times its rollback across both drafter
+  calls. And its starting `info!` is the loop's, so the capture's target layers
+  are no longer on that line. The pinned stream drops every `*_ms` field and the
+  request record's spans have no bound to fail.
+- **The shared loop answers for four rows of the disposition table**, which is
+  the `rows.min(1)` arm of
+  `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`
+  taking its fourth row. DFlash 1's own refusal text is gone with its body —
+  item 11's cost, paid a fourth time. The drafter still returns an empty chain
+  for a block of one, and the loop is what refuses it.
+
 ## What the interface cannot express, and what is proposed for it
 
 Eleven things. Nine are expressible with no branch in the loop; one is a declared
@@ -365,6 +419,12 @@ per-loop skip; one is a decision the owner has to take, marked as such.
 4. **DFlash 1's adaptive block.** `dflash_next_block_size` opens with
    `round_block` and then moves the result by the accept rate of the recent
    rounds. Proposed: the `block` method, six defaults and one override.
+
+   **Landed in chunk 4, as proposed and with no new argument.** The schedule's
+   history — `(accepted, drafted)` per round — is the drafter's own state,
+   written in `verify` where the round's acceptance is known and read by
+   `block` at the head of the next round, so the two arguments the method
+   already takes are the two the schedule needs.
 5. **The block figure the caller reads back, and the five seed exits.** The five
    sidecar loops return the widest block any round ran; the two two-model loops
    return the widest *proposal count*, one less, and
@@ -478,6 +538,12 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    the emission, which happens between `verify` and `condition`. Proposed: the
    loop's order is verify, emit, verifier rollback, drafter rollback, condition,
    and the `RoundEmit` the emission returned is passed to the last two.
+
+   **Both halves are landed as of chunk 4, and neither needed an argument the
+   other did not.** The order is the loop's and `RoundOutcome` is what the last
+   two receive: DFlash 1's `condition` reads `outcome.committed`, DFlash 2's
+   reads `verdict.accept + 1`, and both hand their figure to `committed_rows`
+   and to `guard_round_conditioning` in the same two calls.
 9. **Whether a drafter projects a conditioning buffer, before its first round.**
    The request record's `conditioned_rows` is `Some(0)` on the seed-EOS record of
    DFlash 1 and DFlash 2 and `None` on the other five — a statement about the
@@ -1079,3 +1145,12 @@ Chunk 3 deleted the third, and the pair count goes 15 → 10. Measured with that
 same extractor and convention at both ends of this chunk, `origin/main` reads
 1182 matched lines over 1969 body lines and 15 pairs, and this chunk's head
 reads 718 over 1635 and 10.
+
+Chunk 4 deleted the fourth, and the pair count goes 10 → 6. Measured with that
+same extractor at both ends of this chunk, over the four remaining bodies plus
+`run_rounds` and then the three plus it, `origin/main` reads 719 matched lines
+over 1650 body lines and 10 pairs, and this chunk's head reads 421 over 1355
+and 6. This executor's convention differs from chunk 3's by a constant — the
+counts here are taken over the bodies `debt_report.py` extracts for fns
+carrying both the driver signature and a `RoundTotals`, which is the charge
+gate's population (a) — and the endpoints are what the chunk is judged on.
