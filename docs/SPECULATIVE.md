@@ -599,10 +599,10 @@ Every round loop that can partially accept goes through **one** implementation �
 `speculative::round_common::rollback_round`, which decides the arm and, on a
 partial accept, calls the low-level `rollback_round_caches` beside it. A
 full-attention arch (`lin` absent or empty) truncates and stops; a GDN hybrid
-also refolds. Its seven call sites are `dflash_generate`, `eagle3_generate`, the
-shared `run_rounds` — which serves the Gemma4 assistant (full attention, so
-truncation only), the MTP sidecar and DFlash 2 — and the two-model loops' four:
-greedy verifier, greedy drafter, stochastic verifier and stochastic drafter.
+also refolds. Its six call sites are `eagle3_generate`, the shared `run_rounds`
+— which serves the Gemma4 assistant (full attention, so truncation only), the
+MTP sidecar, DFlash 2 and DFlash 1 — and the two-model loops' four: greedy
+verifier, greedy drafter, stochastic verifier and stochastic drafter.
 There is deliberately no second copy: the defect the replay was written to fix
 lived in four independent implementations at once, and a rollback inlined per
 loop is how it got there.

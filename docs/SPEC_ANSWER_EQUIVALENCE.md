@@ -46,8 +46,8 @@ cannot be pinned that way — `two_model` is an inference from the architecture
 registry and every full model satisfies it — so that pair reads the vocabulary
 both snapshots declare and stands down when they differ.
 
-The DFlash 1 pair is the only one whose verify width is not fixed: its loop sets
-each round's block from the accept rate of the recent ones, so a run truncates an
+The DFlash 1 pair is the only one whose verify width is not fixed: its drafter
+sets each round's block from the accept rate of the recent ones, so a run truncates an
 8-wide append and follows it with a 4- or 6-wide one. Every individual width is
 exercised by some other pair; that sequence is not.
 
