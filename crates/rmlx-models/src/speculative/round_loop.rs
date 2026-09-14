@@ -68,6 +68,71 @@ pub(crate) enum ReportSkippedBy {
     TheInRoundExit,
 }
 
+/// Which read of the verifier's offset a round reports as the one its rollback
+/// target was computed from.
+///
+/// The two reads name the same position under two different numbers: a drafter
+/// that counts its rollback back from the tail reads the offset after its
+/// verify forward, one that counts forward over the accepted prefix reads it
+/// before. Both numbers are on the pinned round line, so which one a drafter
+/// reports is its own fact and it declares it; the loop computes the rollback
+/// from the head spelling whichever is declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifierOffsetBasis {
+    /// The offset before the verify forward, which is where the rollback
+    /// returns to.
+    BeforeTheForward,
+    /// The offset after it, from which the rejected tail is counted back.
+    AfterTheForward,
+}
+
+/// Where a drafter's own cache stood at the head of a round, and where the
+/// round's drafter-side rollback left it.
+///
+/// Built by the drafter and reported by the loop. That is what keeps a field
+/// added here a compile error at every drafter that keeps a cache, and no error
+/// at all in the ones that keep none — they answer `None` and owe no value.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CacheSpan {
+    /// The drafter cache offset the rollback was read against.
+    pub(crate) before: i32,
+    /// Where the rollback left that cache. Computed on the drafter's own path,
+    /// so it is a cross-check on the verifier's target rather than a
+    /// restatement of it.
+    pub(crate) target: i32,
+}
+
+/// What a round left for the next round's drafter to condition on.
+///
+/// Paired with [`CacheSpan`] for the same reason: the drafter that builds the
+/// buffer is the one that can say how many rows it holds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Conditioning {
+    /// Rows the buffer holds leaving this round, read off the buffer rather
+    /// than off what the round meant to put in it.
+    pub(crate) rows: Option<i32>,
+    /// Rows this round's projection returned, or `None` for a drafter that
+    /// slices a row rather than projecting one.
+    pub(crate) projected: Option<i32>,
+}
+
+/// What the round committed, and where the loop's own rollback left the
+/// verifier.
+///
+/// Handed to the drafter's rollback and conditioning because both run after the
+/// emission and neither can derive it: the committed count is what the
+/// request's budget left of the acceptance, and the verifier target is the
+/// loop's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoundOutcome {
+    /// Tokens the round handed the sink — the accepted prefix and the
+    /// verifier's own token, less anything the budget cut. A drafter that keeps
+    /// a drafting position advances it by this.
+    pub(crate) committed: usize,
+    /// Where the loop's rollback left the verifier's caches.
+    pub(crate) verifier_target: i32,
+}
+
 /// What one request runs at, decided by the drafter's own entry function.
 ///
 /// The charge decision travels here as a value rather than being made in the
@@ -151,6 +216,9 @@ pub(crate) trait RoundDrafter {
     /// resident KV.
     const KV_REPORT_SKIPPED_BY: ReportSkippedBy;
 
+    /// Which read of the verifier's offset this drafter's round line reports.
+    const VERIFIER_OFFSET_BASIS: VerifierOffsetBasis;
+
     /// Prefill the prompt and produce the token the request emits before its
     /// first round.
     ///
@@ -176,8 +244,9 @@ pub(crate) trait RoundDrafter {
     /// Whatever the verify forward or the acceptance walk refuses.
     fn verify(&mut self, ctx: &mut RoundCtx<'_>, fed: &[u32], remaining: usize) -> Result<Verdict>;
 
-    /// Return the drafter's own state to the accepted prefix. The default is a
-    /// drafter that keeps nothing across rounds.
+    /// Return the drafter's own state to the accepted prefix, and say what span
+    /// of its cache that moved. The default is a drafter that keeps nothing
+    /// across rounds.
     ///
     /// # Errors
     /// Whatever the drafter's own rollback refuses.
@@ -185,12 +254,13 @@ pub(crate) trait RoundDrafter {
         &mut self,
         _ctx: &RoundCtx<'_>,
         _verdict: &Verdict,
-        _verifier_target: i32,
-    ) -> Result<()> {
-        Ok(())
+        _outcome: RoundOutcome,
+    ) -> Result<Option<CacheSpan>> {
+        Ok(None)
     }
 
-    /// Condition the next round on what this one committed.
+    /// Condition the next round on what this one committed. `None` is a drafter
+    /// that carries no conditioning buffer.
     ///
     /// # Errors
     /// Whatever building the next round's conditioning refuses.
@@ -198,8 +268,8 @@ pub(crate) trait RoundDrafter {
         &mut self,
         ctx: &RoundCtx<'_>,
         verdict: &Verdict,
-        verifier_target: i32,
-    ) -> Result<()>;
+        outcome: RoundOutcome,
+    ) -> Result<Option<Conditioning>>;
 
     /// Every array this round leaves for the next round's drafter to read, each
     /// under the name this drafter calls it, handed to `f` as one borrowed
@@ -341,12 +411,21 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         fed.push(carry);
         fed.extend_from_slice(&draft_tokens);
 
-        // Read before the forward: it is the position the rollback returns to,
-        // and reading it afterwards makes it a function of how far each layer
-        // happened to advance.
+        // The rollback returns to the position the round started at, so the
+        // target is computed from this read and never from the one after the
+        // forward, which is a function of how far each layer happened to
+        // advance.
         let pre_round_offset = ctx.kv.iter().map(KvCache::offset).max().unwrap_or(0);
 
+        // Armed here rather than in each `verify`: the loop owns the recurrent
+        // stack and is the tape's only consumer, through the rollback below. A
+        // stack with no recurrent layer arms nothing.
+        super::arm_lin_tapes(ctx.lin.as_deref_mut());
         let verdict = drafter.verify(&mut ctx, &fed, remaining)?;
+        // Read again for the round line alone: a drafter that counts its
+        // rollback back from the tail reports this number, and it is the same
+        // position as the one above.
+        let post_round_offset = ctx.kv.iter().map(KvCache::offset).max().unwrap_or(0);
         verifier_ns += verdict.verify_ns;
         total_accept += verdict.accept;
 
@@ -377,8 +456,12 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             charge,
             ctx.device,
         )?;
-        drafter.rollback(&ctx, &verdict, v_target)?;
-        drafter.condition(&ctx, &verdict, v_target)?;
+        let outcome = RoundOutcome {
+            committed: emit.committed,
+            verifier_target: v_target,
+        };
+        let d_span = drafter.rollback(&ctx, &verdict, outcome)?;
+        let conditioning = drafter.condition(&ctx, &verdict, outcome)?;
         // The verifier's own token at the accepted position, read off the
         // commit. The two part only on a full acceptance the request's budget
         // truncated, where the request has emitted its last token and the loop
@@ -393,12 +476,15 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             num_draft: draft_tokens.len(),
             n_committed: emit.committed,
             emitted_total: emitted.len(),
-            condition_rows: None,
-            projected_rows: None,
-            v_offset_before: pre_round_offset,
+            condition_rows: conditioning.and_then(|c| c.rows),
+            projected_rows: conditioning.and_then(|c| c.projected),
+            v_offset_before: match D::VERIFIER_OFFSET_BASIS {
+                VerifierOffsetBasis::BeforeTheForward => pre_round_offset,
+                VerifierOffsetBasis::AfterTheForward => post_round_offset,
+            },
             v_target,
-            d_offset_before: None,
-            d_target: None,
+            d_offset_before: d_span.map(|s| s.before),
+            d_target: d_span.map(|s| s.target),
             refolded,
             charged: charge,
             phases: Some(super::RoundPhases {

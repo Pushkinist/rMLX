@@ -1,19 +1,20 @@
 # One speculative round loop: the interface
 
-**Status: migration chunk 1 has landed.** The loop is
-`crates/rmlx-models/src/speculative/round_loop.rs` and the Gemma4 assistant runs
-on it; the other six loops still carry their own bodies. This file is what a
-reviewer judged before the first drafter was migrated, and what each migration
-chunk is held to afterwards. What chunk 1 landed differently from the proposal
-below is listed under "What chunk 1 landed".
+**Status: migration chunks 1 and 2 have landed.** The loop is
+`crates/rmlx-models/src/speculative/round_loop.rs`; the Gemma4 assistant and the
+MTP sidecar run on it and the other five loops still carry their own bodies.
+This file is what a reviewer judged before the first drafter was migrated, and
+what each migration chunk is held to afterwards. What each chunk landed
+differently from the proposal below is listed under "What chunk 1 landed" and
+"What chunk 2 landed".
 
 Seven drafter paths in `crates/rmlx-models/src/speculative/` run one algorithm.
-Six still carry their own round-loop body; the seventh is an entry onto the
+Five still carry their own round-loop body; the other two are entries onto the
 shared loop:
 
 | drafter path | file | body |
 |---|---|---|
-| `mtp_generate` | `crates/rmlx-models/src/speculative/mtp.rs` | its own |
+| `mtp_generate` | `crates/rmlx-models/src/speculative/mtp.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `dflash_generate` | `crates/rmlx-models/src/speculative/dflash/mod.rs` | its own |
 | `dflash2_generate` | `crates/rmlx-models/src/speculative/dflash2/round.rs` | its own |
 | `eagle3_generate` | `crates/rmlx-models/src/speculative/eagle3/mod.rs` | its own |
@@ -138,11 +139,11 @@ value when the struct grows. The cost is that a `None` drafter is silent about a
 new field — which is right, since it has none — and the reviewer's job is to
 check that a drafter answering `None` really carries nothing.
 
-**Both structs land in migration chunk 2, not chunk 1.** The Gemma4 assistant
-answers `None` to both, so introducing them with it would land two types with no
-producer. Chunk 1 passes the report's per-drafter half as the `None`s the
-assistant already writes; chunk 2 introduces the structs with the MTP sidecar,
-their first producer, and re-keys the report onto them.
+**Both structs landed in migration chunk 2, not chunk 1.** The Gemma4 assistant
+answers `None` to both, so introducing them with it would have landed two types
+with no producer. Chunk 1 passed the report's per-drafter half as the `None`s
+the assistant already wrote; chunk 2 introduced the structs with the MTP
+sidecar, their first producer, and re-keyed the report onto them.
 
 ## What chunk 1 landed
 
@@ -217,6 +218,60 @@ and because the loop is handed a block that is already resolved and a prompt it
 may assume has a last token to seed from. The loop's module doc lists both among
 what a request runs and names the entry as where they run.
 
+## What chunk 2 landed
+
+Seven notes. Two close deviations chunk 1 recorded, one records a new deviation
+from the proposal above with its reason, one records what item 6 still owes, and
+three are values the migration had to preserve or move.
+
+- **`RoundOutcome` is a type now, and it carries the committed count rather
+  than the `RoundEmit`.** The sidecar advances its drafting position by what the
+  round committed, which is the second reader chunk 1 said the struct would
+  arrive with. It carries `committed: usize` and not `emit: RoundEmit`, which is
+  a deviation from the proposal: the loop breaks on `hit_eos` before it reaches
+  either `rollback` or `condition`, so the flag is structurally `false` at the
+  only sites a drafter could read it — the same objection that kept the struct
+  out of chunk 1, one field down.
+- **The verifier offset has the two-valued basis of item 6.**
+  `RoundDrafter::VERIFIER_OFFSET_BASIS` is the declaration and the loop reads
+  the offset before and after the forward. The sidecar counts its rollback back
+  from the tail and reports the post-forward read; the assistant counts forward
+  and reports the pre-forward one. They name the same position and are two
+  numbers on the round line, and both are pinned. The rollback target is
+  computed from the head spelling for both, which is what the target was on
+  `main` for each.
+- **No head-against-tail refusal, still.** Item 6 proposes one and owes it two
+  controls. Chunk 2 is the chunk that makes it expressible — the loop now holds
+  both reads — and it does not add it: the controls are a planted off-by-one and
+  a full 36-cell capture with the refusal armed, and neither is this chunk's
+  evidence.
+- **`rollback` keeps its default and the assistant keeps answering it.** The
+  assistant's only change is `condition`'s signature and its `Ok(None)`; it
+  produces neither paired struct, which is what the reviewer checks against its
+  claim to carry no cache.
+- **The sidecar's dispositions are preserved as the spec states them**: the seed
+  exit returns the resolved block and skips the resident-KV report
+  (`KV_REPORT_SKIPPED_BY::TheSeedExit`); the request record's
+  `conditioned_rows` stays `None`, because the sidecar slices a verifier row and
+  projects nothing; its round line keeps `condition_rows: Some(1)` beside
+  `projected_rows: None` and its `d_offset_before` / `d_target` pair; it charges
+  its phases; and its recurrent refold runs through `rollback_round` with the
+  recurrent stack, `refolded` read off the return.
+- **Two figures moved and one log field went, and nothing reads any of them.**
+  The sidecar's `rollback_ms` used to close before the conditioning slice and
+  now closes after it, because the shared loop times its rollback across both
+  drafter calls. Its `total_ms` now covers the drafter's cache reset, which used
+  to happen before the request's own clock started and is now the first
+  statement of `prefill`. The pinned stream drops every `*_ms` field and the
+  request record's spans have no bound to fail. And the sidecar's starting
+  `info!` is the loop's, so the capture layer it named is no longer on that
+  line; it is a property of the verifier, not of the request.
+- **The shared loop answers for two rows of the disposition table.** Its one
+  empty-chain refusal stands for both, which is the `rows.min(1)` arm of
+  `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`
+  taking its first second row. The sidecar's own refusal text is gone with its
+  body — item 11's cost, paid a second time.
+
 ## What the interface cannot express, and what is proposed for it
 
 Eleven things. Nine are expressible with no branch in the loop; one is a declared
@@ -288,6 +343,11 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    re-blessed baseline — moves 36 cells for a field whose meaning does not
    change, and costs a full capture.
 
+   **The basis landed in chunk 2 and the refusal did not.** The loop reads the
+   offset before and after the forward, computes the target from the head
+   spelling and reports whichever read the drafter declares in
+   `VERIFIER_OFFSET_BASIS`. What is still owed is the refusal below.
+
    The refusal is a new runtime error path taken on every round, and its
    correctness rests on an invariant nothing asserts: that the verifier's
    post-forward offset is exactly the pre-round offset plus the positions the
@@ -306,9 +366,11 @@ per-loop skip; one is a decision the owner has to take, marked as such.
 
    **Proposed: preserved exactly, as a declared per-loop skip.**
    `KV_REPORT_SKIPPED_BY` is the declaration, and the loop reads it at its two
-   exits. It is the one per-drafter flag the loop branches on, and it is here
-   rather than hidden because the alternative is a behaviour change the campaign
-   is not for.
+   exits. It was the only per-drafter flag the loop branches on until chunk 2
+   added item 6's `VERIFIER_OFFSET_BASIS`, and the two are the whole set: both
+   are here rather than hidden because the alternative in each case is a
+   behaviour change the campaign is not for. A third needs the same argument
+   made for it from scratch.
 
    The alternative is worth stating, and it is **not adopted**: the figure has
    one writer — a speculative request never goes through
@@ -520,6 +582,7 @@ answer after a draft-side change says that run's near-ties happened not to move.
 | the rollback target off by one at the loop's call site | round stream `v_target`; the pairs (this is the "rejected tail never rolled off" broken engine, refused 6 of 6); and, proposed above, the loop's own head-against-tail refusal | stream and pairs yes, the refusal is new and owes two controls |
 | a drafter's condition called on the wrong row | round stream `condition_rows` / `projected_rows`; `guard_round_conditioning` refuses a projection that does not match the commit | yes |
 | a round conditioned on the acceptance where the loop conditions on the commit | round stream `projected_rows`, on a prompt whose budget cuts a block | yes, on that prompt only |
+| a drafter's `CacheSpan::before` reported from the wrong read | round stream `d_offset_before` only — the truncation is driven by the span's `target`, computed on the drafter's own path, so a wrong `before` changes what the line says and not what the round does | yes, the pinned cells alone |
 | a capture handed to the wrong drafter | the type system — each drafter takes its own capture inside its own `verify` | new, structural |
 | the block narrowing dropped, or the adaptive schedule applied to the wrong drafter | round stream `num_draft` | yes |
 | the recurrent tape not armed before the verify | `refold_lin_tapes` refuses a tape that does not describe the round | yes |
@@ -557,6 +620,16 @@ because there was no marker for where the loop ends.
 reachability. A report at the position the table names, inside a branch that
 never runs, reads identical — and so does one whose arguments are wrong, which is
 the row below.
+
+**Chunk 2 closed one residual rather than declaring it.** Arming the recurrent
+round tape was a statement inside each loop's own body, and the first migration
+carried it into `SidecarRound::verify` — where moving it anywhere before the
+forward is invisible to every observable, and where four more drafters would
+have copied the line. It is now the loop's: `run_rounds` arms the tape
+immediately before the `verify` call, the loop owning the recurrent stack and
+being the tape's only consumer through its own rollback. A stack with no
+recurrent layer arms nothing, so the drafters on a full-attention verifier are
+unaffected.
 
 ### The mutation I could not catch
 
@@ -919,3 +992,14 @@ migration chunk reports the figure again, and a chunk that raises it has moved
 duplication rather than removed it. The figure only falls when a loop body is
 deleted, which is what this campaign is for: after the last migration there is
 one body and no pair.
+
+Chunk 1 deleted the first body and the figure fell for the first time. Chunk 2
+deleted the second, and the population falls with it: the bodies the campaign
+measures are the loops that still carry one plus `run_rounds`, so the pair count
+goes 21 → 15 and six pairs disappear with the sidecar rather than shrinking.
+Measured with the same extractor over the same convention at both ends — summed
+`difflib` matching-block lines over digit-folded bodies, `autojunk=False` —
+`origin/main` reads 1841 matched lines over 2253 body lines and 21 pairs, and
+this chunk's head reads 1180 over 1965 and 15. Each chunk's own convention has
+to be stated with its two readings: the absolute figure is not comparable across
+executors, only its endpoints against each other.

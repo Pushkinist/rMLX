@@ -1,3 +1,12 @@
+// LOC-exempt: the drafter's weights and its round behaviour are one contract
+// while the round loop is shared. The split line is the loader — `load_assistant`
+// and the tensor-presence detection of the two LM-head variants, roughly the
+// first two thirds — against the `RoundDrafter` impl and the entry beneath it,
+// and it is not taken yet because the impl reads the loaded stack directly at
+// every step (`draft_n` chains the drafter's own hidden through weights the
+// loader shapes). It becomes worth taking when a second shared-K/V drafter
+// loads the same way, which is what would give the loader a caller other than
+// this file.
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
 #![allow(unsafe_code)]
 
@@ -688,7 +697,8 @@ use rmlx_kv_quant::KvQuant;
 use std::time::Instant;
 
 use super::round_loop::{
-    run_rounds, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx, RoundDrafter, Verdict,
+    run_rounds, Conditioning, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx, RoundDrafter,
+    RoundOutcome, Verdict, VerifierOffsetBasis,
 };
 
 /// The block a request runs at: what it asked for, bounded by what one verify
@@ -773,6 +783,7 @@ impl<'a> AssistantRound<'a> {
 
 impl RoundDrafter for AssistantRound<'_> {
     const KV_REPORT_SKIPPED_BY: ReportSkippedBy = ReportSkippedBy::TheSeedExit;
+    const VERIFIER_OFFSET_BASIS: VerifierOffsetBasis = VerifierOffsetBasis::BeforeTheForward;
 
     fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled> {
         let device = ctx.device;
@@ -863,8 +874,8 @@ impl RoundDrafter for AssistantRound<'_> {
         &mut self,
         ctx: &RoundCtx<'_>,
         verdict: &Verdict,
-        verifier_target: i32,
-    ) -> Result<()> {
+        outcome: RoundOutcome,
+    ) -> Result<Option<Conditioning>> {
         let device = ctx.device;
         let Some(scored) = self.scored.take() else {
             return Err(Error::Model(
@@ -893,7 +904,7 @@ impl RoundDrafter for AssistantRound<'_> {
             hidden,
             sliding_kv: drop_kv_tail(&scored.sliding_kv, rejected, device)?,
             full_kv: drop_kv_tail(&scored.full_kv, rejected, device)?,
-            kv_offset: verifier_target,
+            kv_offset: outcome.verifier_target,
         };
         if ctx.charged {
             // None of this is read until the next round's drafter call, so
@@ -913,7 +924,10 @@ impl RoundDrafter for AssistantRound<'_> {
             }
         }
         self.conditioned = Some(conditioned);
-        Ok(())
+        // The drafter reads the verifier's K/V and keeps no conditioning buffer
+        // of its own to report rows off: the trimmed K/V above is the
+        // verifier's, rebuilt each round rather than carried.
+        Ok(None)
     }
 
     fn carry(&self, f: &mut dyn FnMut(&[(&str, &Array)])) -> Result<()> {
