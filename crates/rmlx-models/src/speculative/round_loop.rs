@@ -36,6 +36,7 @@ use std::time::Instant;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
+use super::eagle3::DecidedBy;
 use super::round_common::{
     emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
     report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
@@ -181,6 +182,10 @@ pub(crate) struct RoundCtx<'a> {
     pub(crate) kv: Vec<KvCache>,
     /// Its recurrent linear-attention state, on an architecture that keeps one.
     pub(crate) lin: Option<Vec<LinearAttnCache>>,
+    /// The context ceiling the caches above were built at. A drafter that
+    /// keeps a cache of its own sizes it from here, so it cannot overflow
+    /// before the verifier does.
+    pub(crate) max_seq: i32,
     /// The request's draw over the verifier's logits.
     pub(crate) draw: VerifierDraw,
     /// The loop's phase-charge decision, for a drafter that forces the arrays it
@@ -223,6 +228,11 @@ pub(crate) struct Verdict {
     pub(crate) verify_ns: u128,
     /// Wall clock of the acceptance walk.
     pub(crate) walk_ns: u128,
+    /// How many of `commit`'s opening tokens this round decided over a reduced
+    /// vocabulary rather than the verifier's whole one. Zero for a drafter that
+    /// scores every position over the whole vocabulary, which is all of them
+    /// but EAGLE-3 and EAGLE-3 itself on a sampled request.
+    pub(crate) restricted: usize,
 }
 
 /// What a drafter does that the shared loop cannot.
@@ -314,6 +324,15 @@ pub(crate) trait RoundDrafter {
 /// asked for would be trusting the very step it wanted checked. The seed exit is
 /// the exception and returns the resolved block: no round ran there.
 ///
+/// `decided_by` is the per-token attribution buffer of a drafter whose verify
+/// pass scores some positions over a reduced vocabulary: one entry per emitted
+/// token, in emission order. The loop is what holds it because the emission is
+/// the loop's and the request's budget can cut a round's tokens; the prefix
+/// length is [`Verdict::restricted`]. A drafter that scores every position over
+/// the verifier's whole vocabulary passes `None`, and the buffer is not cleared
+/// here — the entry owns that, so a request refused before the loop leaves its
+/// caller's buffer as it found it.
+///
 /// # Errors
 ///
 /// [`Error::Model`] when a drafter proposes nothing, and whatever the verifier's
@@ -324,11 +343,12 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     prompt_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     cfg: &RoundCfg<'_>,
+    mut decided_by: Option<&mut Vec<DecidedBy>>,
     device: Device,
 ) -> Result<(Vec<ProbeStep>, usize)> {
     let charge = cfg.charged;
     let n_tokens = cfg.n_tokens;
-    let (kv_quant, _, kv) =
+    let (kv_quant, max_seq, kv) =
         verifier_cache_stack(verifier, cfg.kv_quant_override, cfg.max_ctx_override)?;
     let lin = verifier
         .needs_lin_caches()
@@ -337,6 +357,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         verifier,
         kv,
         lin,
+        max_seq,
         draw: VerifierDraw::new(cfg.sampler_cfg),
         charged: charge,
         device,
@@ -356,6 +377,12 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     let mut conditioned_rows = prefilled.projects_conditioning.then_some(0usize);
     let mut carry = prefilled.seed;
 
+    // A loop that attributes its tokens attributes the seed to the whole
+    // vocabulary: it is drawn off the verifier's own prefill logits, and no
+    // reduced read-back reaches it.
+    if let Some(buf) = decided_by.as_deref_mut() {
+        buf.push(DecidedBy::FullVocab);
+    }
     if emit_seed_token(
         cfg.tokenizer,
         carry,
@@ -453,7 +480,9 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             &mut emitted,
             &mut emitted_in_rounds,
             &mut window,
-            None,
+            decided_by
+                .as_deref_mut()
+                .map(|buf| (buf, verdict.restricted)),
         );
         if emit.hit_eos {
             stopped_in_round = true;

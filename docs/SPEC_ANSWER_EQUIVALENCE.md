@@ -253,8 +253,10 @@ changes an answer at exactly the kind of token the boundary does: same reference
 token, same speculative token, same near-certain margin. Nothing in the two token
 streams tells the two apart. What separates them is which position the loop was
 at: the restriction reaches an accepted position by design and cannot reach the
-correction, which is scored over the whole vocabulary. So `eagle3_generate` fills
-a `DecidedBy` per emitted token, and the rule is:
+correction, which is scored over the whole vocabulary. So the EAGLE-3 request
+fills a `DecidedBy` per emitted token — the round reports its restricted prefix
+and the shared round loop writes one entry per token it emitted — and the rule
+is:
 
 - first divergence at a position the loop emitted from the drafter's own argmax,
   whose reference token that vocabulary cannot name — **the boundary**. Reported

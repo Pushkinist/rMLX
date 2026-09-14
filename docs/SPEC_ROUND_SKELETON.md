@@ -1,16 +1,16 @@
 # One speculative round loop: the interface
 
-**Status: migration chunks 1, 2, 3 and 4 have landed.** The loop is
+**Status: migration chunks 1, 2, 3, 4 and 5 have landed.** The loop is
 `crates/rmlx-models/src/speculative/round_loop.rs`; the Gemma4 assistant, the MTP
-sidecar, DFlash 2 and DFlash 1 run on it and the other three loops still carry
-their own bodies. This file is what a reviewer judged before the first drafter
-was migrated, and what each migration chunk is held to afterwards. What each
-chunk landed differently from the proposal below is listed under "What chunk 1
-landed", "What chunk 2 landed", "What chunk 3 landed" and "What chunk 4
-landed".
+sidecar, DFlash 2, DFlash 1 and EAGLE-3 run on it and the two two-model loops
+still carry their own bodies. This file is what a reviewer judged before the
+first drafter was migrated, and what each migration chunk is held to afterwards.
+What each chunk landed differently from the proposal below is listed under "What
+chunk 1 landed", "What chunk 2 landed", "What chunk 3 landed", "What chunk 4
+landed" and "What chunk 5 landed".
 
 Seven drafter paths in `crates/rmlx-models/src/speculative/` run one algorithm.
-Three still carry their own round-loop body; the other four are entries onto the
+Two still carry their own round-loop body; the other five are entries onto the
 shared loop:
 
 | drafter path | file | body |
@@ -18,7 +18,7 @@ shared loop:
 | `mtp_generate` | `crates/rmlx-models/src/speculative/mtp.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `dflash_generate` | `crates/rmlx-models/src/speculative/dflash/round.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `dflash2_generate` | `crates/rmlx-models/src/speculative/dflash2/round.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
-| `eagle3_generate` | `crates/rmlx-models/src/speculative/eagle3/mod.rs` | its own |
+| `eagle3_generate` | `crates/rmlx-models/src/speculative/eagle3/round.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `mtp_assistant_generate` | `crates/rmlx-models/src/speculative/gemma4_assistant.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `spec_generate_greedy_cached` | `crates/rmlx-models/src/speculative/mod.rs` | its own |
 | `spec_generate_stochastic_cached` | `crates/rmlx-models/src/speculative/mod.rs` | its own |
@@ -99,8 +99,8 @@ takes the `RoundEmit` alone until a migration finds a second one. Without it in 
 campaign exists to remove. One producer, the loop; one consumer today, the
 assistant's `condition`.
 
-`RoundCtx` carries the verifier, its two cache stacks, the device, the request's
-`VerifierDraw` and the charge decision. The draw is in it because every `verify`
+`RoundCtx` carries the verifier, its two cache stacks, the context ceiling they
+were built at, the device, the request's `VerifierDraw` and the charge decision. The draw is in it because every `verify`
 draws the verifier's tokens through it and EAGLE-3 additionally reads
 `draw.sampling()` to decide whether the restricted read-back may run at all;
 without it in the context, the loop would hold the sampler and hand it to nobody.
@@ -405,6 +405,92 @@ the migration had to preserve or move.
   item 11's cost, paid a fourth time. The drafter still returns an empty chain
   for a block of one, and the loop is what refuses it.
 
+## What chunk 5 landed
+
+Eight notes. Two are the interface growing by one field each, one records the
+cell disposition chunk 3 recorded for every remaining loop, one records a
+per-drafter fact the migration had to keep somewhere, and four are values the
+migration had to preserve or move.
+
+- **The attribution buffer is the loop's, and the prefix length is the
+  round's.** `run_rounds` takes `Option<&mut Vec<DecidedBy>>` and hands it to
+  `emit_round_tokens` with `Verdict::restricted` as the prefix, exactly as item
+  3 proposes. Neither half could sit anywhere else: the buffer is written, and
+  the configuration a loop is handed is `&RoundCfg` and read-only by the charge
+  gate's own structural rule; the prefix is one entry per token the request
+  *emitted*, and the request's budget can cut a round's commit below its
+  acceptance, so only the emission knows how many entries to write. The seed's
+  `DecidedBy::FullVocab` is now the loop's general rule rather than EAGLE-3's
+  statement. The four drafters that score every position over the verifier's
+  whole vocabulary write `restricted: 0` and their entries pass `None`, which is
+  the pairing property working: a field added to the drafter's half is a compile
+  error at every drafter.
+- **`RoundCtx` carries the context ceiling.** `verifier_cache_stack` already
+  resolved it and the loop dropped it; EAGLE-3 sizes its own KV cache from it, so
+  its drafter cannot overflow before the verifier does. The alternative is the
+  entry resolving the ceiling a second time through
+  `crate::context::resolve_context`, which is the same refusal raised twice on
+  one request and a second producer of a number that has one.
+- **`RoundCtx` did not need widening on `rollback`.** `accept_and_reseed` runs a
+  drafter forward and advances the *drafter's* cache, which the drafter owns; it
+  reads the verifier immutably and touches neither the verifier's caches nor the
+  draw. So `rollback` and `condition` still take `&RoundCtx<'_>`, and the one
+  signature widening chunk 4 budgeted for was not spent.
+- **`verify` reads the round's draw to choose its read-back.** The restricted
+  argmax is over a subset of the verifier's row and a distribution needs the
+  whole row's normalising constant, so a sampled request cannot take it. That
+  choice is `self.drafter.hot_path_active() && !ctx.draw.sampling()`, made inside
+  `verify` and nowhere else; the loop constructs the one `VerifierDraw` and the
+  drafter never builds one or reads `sampler_cfg`. It is pinned by text in
+  `crates/rmlx-models/src/speculative/eagle3/round_tests.rs`, because a dropped
+  negation hands a sampled request a reduction its distribution cannot survive
+  and the answer is still fluent.
+- **The cell disposition chunk 3 recorded, met a second time.** EAGLE-3 reported
+  `phases: None` and now reports `RoundPhases`, so its round line gains five
+  `*_ms` fields and reaches `log_round`'s overrun `error!` arm for the first
+  time. The pinned stream drops every `*_ms` field, so its cells do not move; the
+  overrun line carries no emitted total and stays out of the stream by the rule
+  that keeps it out for the four loops already there. The charge decision is
+  still EAGLE-3's own and still `false` — the entry writes it into `RoundCfg` and
+  the census reads `charge_phases:3 false:4` over seven sites.
+- **EAGLE-3's dispositions are preserved as the spec states them**: the seed
+  exit returns the resolved block and skips the resident-KV report
+  (`KV_REPORT_SKIPPED_BY::TheSeedExit`); it counts its rollback back from the
+  tail and reports the post-forward read
+  (`VERIFIER_OFFSET_BASIS::AfterTheForward`) while the target is computed from
+  the head spelling, which is the number the body it replaced computed; the
+  request record's `conditioned_rows` stays `None` under
+  `projects_conditioning: false`, because the drafter holds a KV cache and one
+  hidden row and projects nothing; its round line keeps `condition_rows: None`
+  beside `projected_rows: None` and its `d_offset_before` / `d_target` pair,
+  where the target is read back off the drafter's cache after the re-run rather
+  than computed — the cross-check item 5 of the migration order names; and it
+  charges no phase.
+- **Two figures moved and one log field went, and nothing reads any of them.**
+  The drafter cache offset the round opens at used to be read before the draft
+  span opened and is now the first statement of `propose`, so a getter is inside
+  that span; and `rollback_ms` is the shared loop's, closing after
+  `accept_and_reseed` rather than before it — which is where the re-run was
+  billed before, since this loop reported no phases at all. And its starting
+  `info!` is the loop's, so the aux layer ids, the draft vocabulary size and
+  whether this request took the restricted read-back are no longer on that line;
+  the last of those is on the round's own `Verdict` instead. The pinned stream
+  drops every `*_ms` field and the request record's spans have no bound to fail.
+- **The step trace keeps its own three counters, and they are the one thing this
+  chunk duplicated.** The per-position trace names the round index and a
+  cumulative accept rate, and it is written in `verify`, where the loop's
+  counters are not in scope. The drafter therefore counts its own rounds,
+  proposals and acceptances for it. They cannot drift — `verify` runs once per
+  round and after `propose`, so a round the loop counted is a round `verify`
+  counted — and nothing but the trace reads them. The alternative was moving the
+  trace into `rollback`, which a round that stopped on an EOS never reaches, so
+  the last round of a request would stop tracing.
+- **The shared loop answers for five rows of the disposition table**, which is
+  the `rows.min(1)` arm of
+  `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`
+  taking its fifth row. EAGLE-3's own refusal text is gone with its body — item
+  11's cost, paid a fifth time.
+
 ## What the interface cannot express, and what is proposed for it
 
 Eleven things. Nine are expressible with no branch in the loop; one is a declared
@@ -430,6 +516,16 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    already takes exactly that argument, with `Verdict::restricted` as the prefix
    length. The seed's `DecidedBy::FullVocab` becomes a general rule — a loop with
    an attribution buffer and a seed attributes the seed to the full vocabulary.
+
+   **Landed in chunk 5, as proposed.** The buffer is a `run_rounds` parameter
+   rather than a `RoundCfg` field, because the configuration is handed over by
+   `&RoundCfg` and the buffer is written; and the prefix length is a `Verdict`
+   field rather than something `verify` maps for itself, because the attribution
+   is one entry per token the request *emitted* and the request's budget can cut
+   a round's commit — so the length has to reach the emission, which is the
+   loop's. The entry clears the buffer, not the loop: a request refused before
+   the loop leaves its caller's buffer as it found it, which is what the public
+   signature already promised.
 4. **DFlash 1's adaptive block.** `dflash_next_block_size` opens with
    `round_block` and then moves the result by the accept rate of the recent
    rounds. Proposed: the `block` method, six defaults and one override.
@@ -1175,3 +1271,24 @@ migration moves *into* a drafter. A second figure covers that, over the four
 matched lines over 675 body lines and 6 pairs, after it 431 over 670. The
 refusal is outside both figures — it sits in each drafter's inherent impl — and
 is held by review.
+
+Chunk 5 deleted the fifth body, and the pair count goes 6 → 3. Measured with
+that same extractor at both ends of this chunk, over the three remaining bodies
+plus `run_rounds` and then the two plus it, `origin/main` reads 416 matched
+lines over 1355 body lines and 6 pairs, and this chunk's head reads 257 over 931
+and 3. This executor's convention differs from chunk 4's by a constant — 416
+against its 421 at the same tree — and the endpoints are what the chunk is
+judged on.
+
+The second figure rises, and the rise is accounted for line by line rather than
+waived. Over the `impl RoundDrafter` bodies it reads 430 matched lines over 670
+body lines and 6 pairs at `origin/main`, and 653 over 863 and 10 at this chunk's
+head. A fifth impl enters the population and brings four new pairs with it —
+EAGLE-3 against each of the four, 52, 53, 51 and 55 matched lines, the lowest
+ratios in the table at 27% to 32%, so there is no twin here to fold out. The six
+pairs that exist at both ends read 430 → 442, and the twelve lines are
+`Verdict::restricted` and its one comment, stated by each of the four drafters
+that score every position over the whole vocabulary: two lines per body, six
+pairs. That is the mechanism chunks 1b and 1d recorded — a field every drafter
+must state is what makes a new field a compile error at every drafter, and it
+costs an identical line in each — and not duplication this migration moved.

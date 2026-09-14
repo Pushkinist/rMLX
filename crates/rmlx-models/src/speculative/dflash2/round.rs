@@ -260,6 +260,8 @@ impl RoundDrafter for BlockRound<'_> {
             commit,
             verify_ns,
             walk_ns,
+            // Every position scored over the verifier's whole vocabulary.
+            restricted: 0,
         })
     }
 
@@ -407,6 +409,9 @@ pub fn dflash2_generate(
             kv_quant_override,
             max_ctx_override,
         },
+        // This drafter's verify pass scores every position over the verifier's
+        // whole vocabulary, so its tokens need no per-token attribution.
+        None,
         device,
     )
 }

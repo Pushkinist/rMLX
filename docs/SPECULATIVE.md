@@ -118,15 +118,15 @@ reference. It carries a pair for six of the seven round loops below; the seventh
 is the two-model stochastic one, which runs only above temperature 0 and so has
 no arm this gate can compare.
 
-**One loop, migrating.** The seven drafter paths run one algorithm, and four of
+**One loop, migrating.** The seven drafter paths run one algorithm, and two of
 them still carry their own copy of it;
 `docs/SPEC_ROUND_SKELETON.md` is the plan that collapses them: the drafter
 interface, what each loop does the interface cannot express, the migration
 order, and the mutations a skeleton could contain beside what catches each.
-Migration chunks 1, 2 and 3 have landed: the shared loop is
+Migration chunks 1 to 5 have landed: the shared loop is
 `crates/rmlx-models/src/speculative/round_loop.rs`, and the Gemma4 assistant, the
-MTP sidecar and DFlash 2 run on it; the other four loops still carry their own
-bodies.
+MTP sidecar, DFlash 2, DFlash 1 and EAGLE-3 run on it; the two two-model loops
+still carry their own bodies.
 
 ```text
 # Initialisation
@@ -599,10 +599,10 @@ Every round loop that can partially accept goes through **one** implementation �
 `speculative::round_common::rollback_round`, which decides the arm and, on a
 partial accept, calls the low-level `rollback_round_caches` beside it. A
 full-attention arch (`lin` absent or empty) truncates and stops; a GDN hybrid
-also refolds. Its six call sites are `eagle3_generate`, the shared `run_rounds`
-— which serves the Gemma4 assistant (full attention, so truncation only), the
-MTP sidecar, DFlash 2 and DFlash 1 — and the two-model loops' four: greedy
-verifier, greedy drafter, stochastic verifier and stochastic drafter.
+also refolds. Its five call sites are the shared `run_rounds` — which serves the
+Gemma4 assistant (full attention, so truncation only), the MTP sidecar, DFlash 2,
+DFlash 1 and EAGLE-3 — and the two-model loops' four: greedy verifier, greedy
+drafter, stochastic verifier and stochastic drafter.
 There is deliberately no second copy: the defect the replay was written to fix
 lived in four independent implementations at once, and a rollback inlined per
 loop is how it got there.
@@ -847,9 +847,11 @@ list so EOS can be selected at intermediate positions.
 This avoids materialising a `[1, K, 248320]` logit tensor for the accepted
 positions. It also means an accepted position carries the drafter's argmax and
 not the verifier's, and the two are the same token only when the verifier's is
-one the drafter can name. `eagle3_generate` therefore fills a `DecidedBy` per
-emitted token — restricted at an accepted position, full at the correction and
-the prefill seed — because that is not recoverable from the tokens afterwards.
+one the drafter can name. The round therefore reports how long its restricted
+prefix is (`Verdict::restricted`) and the shared loop fills a `DecidedBy` per
+emitted token from it — restricted at an accepted position, full at the
+correction and the prefill seed — because that is not recoverable from the
+tokens afterwards.
 `docs/SPEC_ANSWER_EQUIVALENCE.md` is where it is read and what it costs.
 
 **Verifier prefill chunking.** For prompts longer than 1024 tokens, the

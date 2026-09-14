@@ -91,6 +91,7 @@
 use super::dflash::dflash_next_block_size;
 use super::dflash::round::AdaptiveRound;
 use super::dflash2::round::BlockRound;
+use super::eagle3::round::Eagle3Round;
 use super::gemma4_assistant::AssistantRound;
 use super::mtp::SidecarRound;
 use super::round_loop::{ReportSkippedBy, RoundDrafter, VerifierOffsetBasis};
@@ -350,7 +351,7 @@ const DISPOSITIONS: [(
     ),
     (
         SpecLoop::Eagle3,
-        "eagle3/mod.rs",
+        SHARED_LOOP,
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
         VerifierOffsetBasis::AfterTheForward,
@@ -379,14 +380,7 @@ const DISPOSITIONS: [(
 ];
 
 /// The files the table names, in the order it names them, each with its source.
-const LOOP_SOURCES: [(&str, &str); 3] = [
-    (
-        "eagle3/mod.rs",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/speculative/eagle3/mod.rs"
-        )),
-    ),
+const LOOP_SOURCES: [(&str, &str); 2] = [
     (
         SHARED_LOOP,
         include_str!(concat!(
@@ -585,9 +579,13 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
                 <AdaptiveRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
                 <AdaptiveRound<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
             ),
+            SpecLoop::Eagle3 => (
+                <Eagle3Round<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
+                <Eagle3Round<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
+            ),
             // The loops that still carry their own body: their dispositions are
             // read off their source above and there is no constant to read.
-            SpecLoop::Eagle3 | SpecLoop::TwoModelGreedy | SpecLoop::TwoModelStochastic => continue,
+            SpecLoop::TwoModelGreedy | SpecLoop::TwoModelStochastic => continue,
         };
         assert_eq!(
             declared,
