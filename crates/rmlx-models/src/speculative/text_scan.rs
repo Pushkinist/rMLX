@@ -9,6 +9,10 @@
 //! **It reads text and is blind past that**, which every caller restates for its
 //! own needles: a statement at the position a test names, inside a branch that
 //! never runs, reads identical, and so does one whose arguments are wrong.
+//!
+//! It holds no `#[test]`, which is why it is not a `*_tests.rs` file: that
+//! suffix is what the file-hygiene gates read as "this file is a test body", and
+//! a helper wearing it would be scanned for tests it does not have.
 
 /// Whether a line is code rather than a whole-line comment.
 ///

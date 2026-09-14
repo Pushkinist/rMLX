@@ -19,6 +19,15 @@
 //! that arithmetic. The same asymmetry is what the resync below pays for: after
 //! a round that accepted every proposal the draft cache is one token behind, so
 //! the next drafting pass feeds that token ahead of the correction.
+//!
+//! # Why this path is greedy
+//!
+//! Nothing here is: `verify` draws every token through the round's own
+//! [`VerifierDraw`](super::VerifierDraw), at whatever temperature the request
+//! asked for. What makes the path greedy is one branch outside it — the entry
+//! guard routes a request whose sampler is active to the stochastic loop, whose
+//! acceptance rule is its own — so the draw this drafter reads is the device
+//! argmax on every request that reaches it.
 
 use std::time::Instant;
 
@@ -55,12 +64,12 @@ pub(crate) struct TwoModelRound<'a> {
     /// prefix of it, and a recurrent refold is refused unless its tape holds
     /// exactly this many positions.
     fed: Vec<u32>,
-    /// This round's proposals, kept because the rollback's retention and the
-    /// resync are both read off them.
-    proposed: Vec<u32>,
-    /// The carry token this round opened on, for a commit the request's budget
-    /// emptied.
-    carry_tok: u32,
+    /// How many tokens this round proposed. The rollback's retention and the
+    /// resync both read it, and neither reads the chain.
+    proposals: usize,
+    /// The last of them, which the drafting pass never fed back — the token the
+    /// resync hands the next pass on a round that accepted every proposal.
+    last_proposal: Option<u32>,
 }
 
 impl<'a> TwoModelRound<'a> {
@@ -71,8 +80,8 @@ impl<'a> TwoModelRound<'a> {
             lin: None,
             seed: Vec::new(),
             fed: Vec::new(),
-            proposed: Vec::new(),
-            carry_tok: 0,
+            proposals: 0,
+            last_proposal: None,
         }
     }
 
@@ -138,8 +147,10 @@ impl RoundDrafter for TwoModelRound<'_> {
 
     /// Draft `block - 1` tokens by stepping the draft model through its own
     /// cache.
-    fn propose(&mut self, ctx: &mut RoundCtx<'_>, carry: u32, block: usize) -> Result<Vec<u32>> {
-        self.carry_tok = carry;
+    /// The carry is the loop's and reaches the draft model inside `self.seed`,
+    /// which the last round's resync built: on a full acceptance it is two
+    /// tokens, and this parameter is only the second of them.
+    fn propose(&mut self, ctx: &mut RoundCtx<'_>, _carry: u32, block: usize) -> Result<Vec<u32>> {
         // The draft model's own round tape, armed before the forwards that write
         // it. The pass takes one forward per proposal, so the tape accumulates
         // across the whole round and the rollback replays it as one prefix.
@@ -159,7 +170,8 @@ impl RoundDrafter for TwoModelRound<'_> {
             &self.seed,
             proposed.split_last().map_or(&[], |(_, head)| head),
         );
-        self.proposed.clone_from(&proposed);
+        self.proposals = proposed.len();
+        self.last_proposal = proposed.last().copied();
         Ok(proposed)
     }
 
@@ -201,7 +213,7 @@ impl RoundDrafter for TwoModelRound<'_> {
         &mut self,
         ctx: &RoundCtx<'_>,
         verdict: &Verdict,
-        _outcome: RoundOutcome,
+        outcome: RoundOutcome,
     ) -> Result<Option<CacheSpan>> {
         let before = self.cache_offset();
         // The drafter's own arm, whose answer is not the round's: `refolded` is
@@ -211,18 +223,18 @@ impl RoundDrafter for TwoModelRound<'_> {
             self.lin.as_deref_mut(),
             &self.fed,
             before - self.fed.len() as i32,
-            before - draft_rows_to_drop(self.proposed.len(), verdict.accept),
+            before - draft_rows_to_drop(self.proposals, verdict.accept),
             ctx.charged,
             ctx.device,
         )?;
 
-        // The verifier's own token at the accepted position. It parts from the
-        // acceptance only on a commit the request's budget truncated, where the
-        // request has emitted its last token and no later round reads this.
-        let correction = verdict.commit.last().copied().unwrap_or(self.carry_tok);
+        // The token the next round carries, taken from the round rather than
+        // re-derived off the same `Verdict`: one producer, so the drafting seed
+        // and the loop's verify input cannot part.
+        let correction = outcome.carry;
         self.seed.clear();
-        if verdict.accept == self.proposed.len() {
-            self.seed.extend(self.proposed.last().copied());
+        if verdict.accept == self.proposals {
+            self.seed.extend(self.last_proposal);
         }
         self.seed.push(correction);
 

@@ -25,7 +25,7 @@
 //! real methods instead would need a verifier, which is a model load — the same
 //! reason `round_loop.rs` carries no unit test.
 
-use crate::speculative::text_scan_tests::lines_in_fns;
+use crate::speculative::text_scan::lines_in_fns;
 
 /// The drafter's own source, read as text.
 const ROUND_SRC: &str = include_str!("round.rs");

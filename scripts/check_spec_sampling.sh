@@ -565,4 +565,4 @@ if [ "$fail" = "1" ]; then
   exit 1
 fi
 
-echo "OK: $loop_count loops ($forwarded_count forwarded), $entry_count entries, $guard_count guards — every one of the $path_count drafter paths takes the request's sampler and draws with it; $arm_count drafter arms pass it."
+echo "OK: $loop_count loops ($forwarded_count forwarded), $entry_count entries, $guard_count guards — every one of the $path_count drafter paths carries the request's sampler to the loop that draws with it; $arm_count drafter arms pass it."

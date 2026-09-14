@@ -613,6 +613,21 @@ migration had to preserve or move — and one is a gate that lost its only name.
   round line gains five `*_ms` fields and reaches `log_round`'s overrun `error!`
   arm for the first time: the chunk-3 cell disposition, met a third time. The
   pinned stream drops every `*_ms` field.
+- **The round's carry has one producer, and it is the loop.** `RoundOutcome`
+  carries it. The loop takes the verifier's own token at the accepted position
+  off the commit, and a drafter that opens its next round on that token reads
+  `outcome.carry` rather than reading the same `Verdict` for itself. Two
+  producers agree until one changes, and then the drafting pass opens on a token
+  the verify input does not carry — which moves the accept rate and nothing
+  else, so no equivalence pair and no pinned cell can see it. The two-model
+  drafter's `propose` therefore ignores the `carry` it is handed: the token
+  reaches its draft model inside the seed the last round's resync built, which is
+  two tokens on a full acceptance and one otherwise.
+- **`draft_ns` widened, as it did for the five before it.** The span is the
+  whole `propose` call now — the tape arming, the drafting forwards, the fed
+  buffer and the two scalars the round keeps — where the body it replaced timed
+  `draft_decode_n` alone. Nothing bounds it: the pinned stream drops every `*_ms`
+  field and the request record's spans have no bound to fail.
 - **`make check-spec-sampling` names no fn any more.** Its one recorded
   exception was `spec_generate_greedy_cached` taking no sampler at all; that path
   is now an entry that carries the request's sampler in the `RoundCfg` it builds,
@@ -621,9 +636,12 @@ migration had to preserve or move — and one is a gate that lost its only name.
   test loses the three-direction exemption reading — the name passes, the body
   renamed does not, a copy with the name struck out refuses the clean tree — and
   gains two readings of that same path held to both of RULE 1's conditions like
-  every other: the signature stripped, and the sampler taken and never drawn
-  with. The case count is unchanged at 27, and the synthetic trees now carry no
-  sampler-less loop at all.
+  every other, taken against a third synthetic root that carries the shape the
+  tree now has — that path as an *entry* — rather than against a loop shape it
+  no longer wears: the sampler parameter stripped, and the sampler taken and
+  left out of the `RoundCfg` it hands over. 27 cases become 28, and no case
+  edits the gate any more: the suite's one self-mutation was of the exemption,
+  and it went with it.
 - **The shared loop answers for six rows of the disposition table**, which is the
   `rows.min(1)` arm of
   `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`
@@ -695,12 +713,14 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs` reads it too, but
    the pairs are what pin it.
 
-   What is *not* gated is the five **seed** exits — the four sidecar loops that
-   still carry their own body, and the shared loop the assistant runs on — which
-   return the resolved block rather than the widest that ran: a round has not run
-   there, so the two differ, and no gate prompt stops on its seed. The two
-   in-round EOS exits already return the widest that ran. Proposed: the loop returns the
-   widest block that ran on every exit, which changes those five values alone.
+   What is *not* gated is the **seed** exit. There is one of them now, in
+   `run_rounds`, and it serves the five drafters that draw a seed out of their
+   prefill forward; it returns the resolved block rather than the widest that
+   ran, because no round has run there and `widest_bs` is zero. No gate prompt
+   stops on its seed, so nothing sees the difference. The in-round EOS exit —
+   the two-model greedy pair's, and the stochastic loop's own — already returns
+   the widest that ran. Proposed: the loop returns the widest block that ran on
+   every exit, which changes that one value on those five drafters alone.
 
    **Not adopted in chunk 1, and it is the eighth deviation above.** The shared
    loop returns the resolved block on its seed exit, exactly as the assistant's

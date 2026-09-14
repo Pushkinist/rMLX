@@ -1,4 +1,4 @@
-//! Four wirings this drafter owns, pinned by text.
+//! Six wirings this drafter owns, pinned by text.
 //!
 //! The round loop is `round_loop.rs`'s and its own gates read it. What moved out
 //! of the two-model greedy loop body and into this file is wiring — an order, a
@@ -20,7 +20,16 @@
 //!    read back off the cache afterwards — computing it instead makes the line
 //!    restate this side's own arithmetic and stop being the cross-check the
 //!    round calls it.
-//! 4. **Where the round's tokens come from.** They are drawn through the round's
+//! 4. **Where the next round's carry comes from.** The round decides it and
+//!    hands it over; this drafter reads it and derives nothing. Derived a second
+//!    time off the same `Verdict`, a drift feeds the draft model a seed the
+//!    verifier is not scoring against — which moves the accept rate and nothing
+//!    else, so no pair and no pinned cell can see it.
+//! 5. **Which read of the draft cache the round line's `before` is.** It is the
+//!    one taken before the rollback; a second read taken after it reports the
+//!    span as empty on every partial round, and the target beside it still
+//!    agrees with the verifier's.
+//! 6. **Where the round's tokens come from.** They are drawn through the round's
 //!    own `VerifierDraw`, and this drafter builds no read-back of its own. That
 //!    one is not merely unseen by `make ci` — it is unseen by everything, since
 //!    this path runs at temperature 0 alone, where the draw is the argmax it
@@ -33,7 +42,7 @@
 //! the equivalence pair `the_two_model_round_loop_reproduces_plain_greedy` and
 //! the per-round stream it writes.
 
-use crate::speculative::text_scan_tests::{is_code, lines_in_fns};
+use crate::speculative::text_scan::{is_code, lines_in_fns};
 
 /// The drafter's own source, read as text.
 const ROUND_SRC: &str = include_str!("two_model.rs");
@@ -103,7 +112,7 @@ fn the_resync_prepends_the_last_proposal_on_a_full_acceptance_alone() {
          `{owner}`"
     );
     assert_eq!(
-        *line, "if verdict.accept == self.proposed.len() {",
+        *line, "if verdict.accept == self.proposals {",
         "a round that accepted every proposal is the one that left the draft cache a \
          token behind, and this drafter decides it by `{line}` — the committed count in \
          its place resyncs on a budget-cut round that did not accept everything"
@@ -117,7 +126,7 @@ fn the_resync_prepends_the_last_proposal_on_a_full_acceptance_alone() {
         resync,
         vec![
             "self.seed.clear();",
-            "self.seed.extend(self.proposed.last().copied());",
+            "self.seed.extend(self.last_proposal);",
             "self.seed.push(correction);",
         ],
         "the pass feeds the held-back proposal and then the correction, in that order, \
@@ -218,5 +227,91 @@ fn the_verify_pass_draws_through_the_rounds_own_draw() {
         raw.is_empty(),
         "a drafter that argmaxes the verifier's logits itself has a second read-back \
          beside the request's draw, and this one has {raw:?}"
+    );
+}
+
+/// The next round's carry is the round's, read off the outcome and derived
+/// nowhere in this drafter.
+///
+/// The loop takes the verifier's own token at the accepted position off the
+/// commit and hands it over on `RoundOutcome`. A drafter that reads the same
+/// `Verdict` for itself is a second producer of one token: the two agree until
+/// one of them changes, and then the drafting pass opens on a token the verify
+/// input does not carry. Every other observable is blind to that — the answer is
+/// the verifier's argmax either way, and the round line carries no seed — so the
+/// accept rate is all that moves.
+///
+/// Mutation: `verdict.commit.last().copied()` in place of `outcome.carry`;
+/// `verdict.commit.first()`, which no other reading here parts from.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion above establishes exactly one element, so the read cannot fail"
+)]
+fn the_next_rounds_carry_is_read_off_the_round_and_not_derived_again() {
+    let reads = lines_in_fns(ROUND_SRC, "outcome.carry");
+    assert_eq!(
+        reads.len(),
+        1,
+        "the drafter reads the round's carry once and this one reads it {} time(s): \
+         {reads:?}",
+        reads.len()
+    );
+    let (line, owner) = reads.first().expect("one read, asserted above");
+    assert_eq!(
+        *owner, "rollback",
+        "the carry is read where the next round's seed is built and this one is read \
+         in `{owner}`"
+    );
+    assert_eq!(
+        *line, "let correction = outcome.carry;",
+        "the carry is taken whole off the outcome and this drafter takes `{line}`"
+    );
+    let derived: Vec<&str> = ROUND_SRC
+        .lines()
+        .map(str::trim)
+        .filter(|l| is_code(l) && l.contains("verdict.commit"))
+        .collect();
+    assert!(
+        derived.is_empty(),
+        "a drafter that reads the round's commit for itself is a second producer of \
+         the carry, and this one reads {derived:?}"
+    );
+}
+
+/// The round line's `before` is the read taken before the rollback, and the
+/// target the read taken after it.
+///
+/// Both are `self.cache_offset()` and the difference is only where they sit, so
+/// a second read shadowing the first reports a span of zero on every partial
+/// round while the target still agrees with the verifier's — and the answer, the
+/// accept counters and every other field of the line are unmoved.
+///
+/// Mutation: rebind `before` immediately before the span is built; swap the two
+/// reads.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion above establishes exactly two elements, so the reads cannot fail"
+)]
+fn the_span_opens_on_the_read_taken_before_the_rollback() {
+    let reads = lines_in_fns(ROUND_SRC, "self.cache_offset()");
+    assert_eq!(
+        reads.len(),
+        2,
+        "the round reads the draft cache twice, once each side of its rollback, and \
+         this drafter reads it {} time(s): {reads:?}",
+        reads.len()
+    );
+    assert!(
+        reads.iter().all(|(_, owner)| owner == "rollback"),
+        "both reads belong to the round's rollback and these sit in {reads:?}"
+    );
+    let (first, _) = reads.first().expect("two reads, asserted above");
+    assert_eq!(
+        *first, "let before = self.cache_offset();",
+        "the first read is the one the span opens on, taken before anything is \
+         dropped, and this drafter takes `{first}` — a read taken after the rollback \
+         reports a span of nothing on every partial round"
     );
 }

@@ -158,6 +158,15 @@ pub(crate) struct RoundOutcome {
     pub(crate) committed: usize,
     /// Where the loop's rollback left the verifier's caches.
     pub(crate) verifier_target: i32,
+    /// The token the next round carries into its verify input: the verifier's
+    /// own token at the accepted position, read off the commit.
+    ///
+    /// The loop's, and the loop's alone. A drafter that opens its next round on
+    /// this token can derive the same value from the same `Verdict`, and two
+    /// producers of one token drift into a wrong drafting seed — which moves the
+    /// accept rate and nothing else, so no equivalence pair and no pinned cell
+    /// can see it.
+    pub(crate) carry: u32,
 }
 
 /// What one request runs at, decided by the drafter's own entry function.
@@ -572,10 +581,16 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             charge,
             ctx.device,
         )?;
+        // The verifier's own token at the accepted position, read off the
+        // commit. The two part only on a full acceptance the request's budget
+        // truncated, where the request has emitted its last token and the loop
+        // leaves before any round reads what was stored here.
+        carry = verdict.commit.last().copied().unwrap_or(carry);
         let outcome = RoundOutcome {
             round: rounds,
             committed: emit.committed,
             verifier_target: v_target,
+            carry,
         };
         let d_span = drafter.rollback(&ctx, &verdict, outcome)?;
         let conditioning = drafter.condition(&ctx, &verdict, outcome)?;
@@ -603,11 +618,6 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             // alternative is a `usize` cast of a negative.
             *total += projected.max(0) as usize;
         }
-        // The verifier's own token at the accepted position, read off the
-        // commit. The two part only on a full acceptance the request's budget
-        // truncated, where the request has emitted its last token and the loop
-        // leaves before any round reads what was stored here.
-        carry = verdict.commit.last().copied().unwrap_or(carry);
         let round_rollback_ns = t0.elapsed().as_nanos();
 
         let report = super::RoundReport {

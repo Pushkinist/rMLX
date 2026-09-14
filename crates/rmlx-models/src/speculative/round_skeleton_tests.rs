@@ -95,7 +95,7 @@ use super::eagle3::round::Eagle3Round;
 use super::gemma4_assistant::AssistantRound;
 use super::mtp::SidecarRound;
 use super::round_loop::{ReportSkippedBy, RoundDrafter, VerifierOffsetBasis};
-use super::text_scan_tests::is_code;
+use super::text_scan::is_code;
 use super::two_model::TwoModelRound;
 use super::{
     accept_prefix, draft_rows_to_drop, guard_restricted_prefix, rollback_target_from_head,

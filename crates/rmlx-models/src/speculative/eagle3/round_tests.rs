@@ -29,7 +29,7 @@
 //! the equivalence pair `the_restricted_vocab_round_loop_reproduces_plain_greedy`
 //! and the per-round stream it writes.
 
-use crate::speculative::text_scan_tests::{is_code, lines_in_fns};
+use crate::speculative::text_scan::{is_code, lines_in_fns};
 
 /// The drafter's own source, read as text.
 const ROUND_SRC: &str = include_str!("round.rs");

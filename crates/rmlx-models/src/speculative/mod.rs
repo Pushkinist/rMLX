@@ -42,7 +42,7 @@ pub(crate) mod round_stats;
 pub(crate) mod two_model;
 
 #[cfg(test)]
-pub(crate) mod text_scan_tests;
+pub(crate) mod text_scan;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -595,7 +595,13 @@ impl SpeculativeDispatcher {
         .map(|(emitted, widest_draft)| (emitted, widest_draft + 1))
     }
 
-    /// Greedy speculative decoding over two complete models, at temperature 0.
+    /// Speculative decoding over two complete models, greedy by routing.
+    ///
+    /// Nothing below decides to be greedy: the rounds draw every token through
+    /// the request's own `VerifierDraw`. What makes this path greedy is
+    /// [`Self::spec_generate_greedy`]'s branch above it, which routes a request
+    /// whose sampler is active to the stochastic loop instead — so the draw this
+    /// path reads is the device argmax on every request that reaches it.
     ///
     /// Mirrors mlx-lm `speculative_generate_step`: one prefill of the prompt
     /// less its last token on each model, then rounds of draft / verify /
