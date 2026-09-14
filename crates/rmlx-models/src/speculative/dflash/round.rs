@@ -48,8 +48,9 @@ use crate::speculative::round_loop::{
     RoundOutcome, Verdict, VerifierOffsetBasis,
 };
 use crate::speculative::{
-    accept_prefix, block_capped_by_checkpoint, committed_rows, conditioning_residual,
-    guard_round_conditioning, guard_verifier_prefill_logits, prefill_chunked, SpecLoop,
+    accept_prefix, block_capped_by_checkpoint, committed_rows, guard_round_conditioning,
+    guard_verifier_prefill_logits, missing_conditioning, prefill_chunked,
+    report_conditioning_residual, SpecLoop,
 };
 use rmlx_kv_quant::KvQuant;
 
@@ -87,7 +88,7 @@ pub(crate) struct AdaptiveRound<'a> {
 impl<'a> AdaptiveRound<'a> {
     fn new(drafter: &'a DFlashDrafter) -> Self {
         let target_layer_ids = drafter.cfg.target_layer_ids.clone();
-        let condition_width = (drafter.cfg.hidden_size * target_layer_ids.len()) as i32;
+        let condition_width = drafter.cfg.hidden_size as i32 * target_layer_ids.len() as i32;
         Self {
             drafter,
             target_layer_ids,
@@ -102,13 +103,9 @@ impl<'a> AdaptiveRound<'a> {
     /// The projection a round conditions on, or the refusal for a round that
     /// reached for it before the prefill built one.
     fn conditioning(&self) -> Result<&Array> {
-        self.h_ctx.as_ref().ok_or_else(|| {
-            Error::Model(
-                "dflash_generate: a round read the projection it conditions on before \
-                 the prefill built one"
-                    .into(),
-            )
-        })
+        self.h_ctx
+            .as_ref()
+            .ok_or_else(|| missing_conditioning(SpecLoop::DFlash))
     }
 }
 
@@ -229,19 +226,14 @@ impl RoundDrafter for AdaptiveRound<'_> {
         if let Some(seed) = self.probe_seed.take() {
             let raw = concatenate(&[&seed, &committed_hidden], 1, device)?;
             let fresh = self.drafter.project_condition(&raw)?;
-            let hidden = self.drafter.cfg.hidden_size as i32;
-            let tail = h_ctx.shape().get(1).copied().unwrap_or(0) - (1 + projected_rows);
-            let carried_tail = h_ctx.slice(
-                &[0, tail, 0],
-                &[1, tail + 1 + projected_rows, hidden],
-                &[1, 1, 1],
+            report_conditioning_residual(
+                SpecLoop::DFlash,
+                &h_ctx,
+                &fresh,
+                projected_rows,
+                self.drafter.cfg.hidden_size as i32,
                 device,
             )?;
-            tracing::debug!(
-                rows = 1 + projected_rows,
-                residual = conditioning_residual(&carried_tail, &fresh, device)?,
-                "dflash conditioning: carried projection against a fresh one"
-            );
         }
         let rows = h_ctx.shape().get(1).copied();
         self.h_ctx = Some(h_ctx);
@@ -336,3 +328,7 @@ pub fn dflash_generate(
         device,
     )
 }
+
+#[cfg(test)]
+#[path = "round_tests.rs"]
+mod round_tests;

@@ -378,12 +378,26 @@ the migration had to preserve or move.
   block queries read the whole context unmasked, so `grow_conditioning` appends
   and drops nothing. The two are one method of the interface and two bodies of
   the drafter, which is the split item 2 predicted.
-- **One figure moved and one log field went, and nothing reads either.** Its
-  `rollback_ms` used to close before the conditioning growth and now closes
-  after it, because the shared loop times its rollback across both drafter
-  calls. And its starting `info!` is the loop's, so the capture's target layers
-  are no longer on that line. The pinned stream drops every `*_ms` field and the
-  request record's spans have no bound to fail.
+- **One span arrived, one log field went, and nothing reads either.** This loop
+  reported `phases: None`, so it had no `rollback_ms` for the migration to move;
+  what it has now is the shared loop's, which closes *after* the conditioning
+  growth, so the growth is billed to the rollback span rather than left for the
+  next round's drafter to pay for. Nothing charges it either way — this request
+  is uncharged — and the pinned stream drops every `*_ms` field. And its
+  starting `info!` is the loop's, so the capture's target layers are no longer
+  on that line.
+- **The two block drafters' shared statements are one item each, not a copy
+  per drafter.** Migrating DFlash 1 onto the same interface DFlash 2 uses put
+  two pairs of near-identical bodies in the tree, which is what the twin rule
+  refuses: the residual probe each takes once per request, and the refusal a
+  round that read its conditioning early raises. Both are now one fn in
+  `crates/rmlx-models/src/speculative/mod.rs` —
+  `report_conditioning_residual`, which slices the carried tail, measures it
+  against a fresh projection and writes the line, and `missing_conditioning`,
+  which builds the refusal. Each takes the loop as an argument, which was the
+  whole of what differed. The MTP sidecar's own copy of the refusal went with
+  them, so its message is the shared one; it is built on a path no passing
+  request takes.
 - **The shared loop answers for four rows of the disposition table**, which is
   the `rows.min(1)` arm of
   `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`
@@ -1154,3 +1168,10 @@ and 6. This executor's convention differs from chunk 3's by a constant — the
 counts here are taken over the bodies `debt_report.py` extracts for fns
 carrying both the driver signature and a `RoundTotals`, which is the charge
 gate's population (a) — and the endpoints are what the chunk is judged on.
+
+That population holds no `RoundDrafter` impl, so it cannot see duplication the
+migration moves *into* a drafter. A second figure covers that, over the four
+`impl RoundDrafter` bodies and by the same measure: before the twin removal 435
+matched lines over 675 body lines and 6 pairs, after it 431 over 670. The
+refusal is outside both figures — it sits in each drafter's inherent impl — and
+is held by review.

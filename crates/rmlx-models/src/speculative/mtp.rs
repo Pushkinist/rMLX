@@ -640,15 +640,6 @@ impl<'a> SidecarRound<'a> {
     }
 }
 
-/// A round that reached for the conditioning row before one was built.
-fn missing_conditioning() -> Error {
-    Error::Model(
-        "mtp_generate: a round read the hidden it conditions on before the prefill \
-         built one"
-            .into(),
-    )
-}
-
 impl RoundDrafter for SidecarRound<'_> {
     const KV_REPORT_SKIPPED_BY: ReportSkippedBy = ReportSkippedBy::TheSeedExit;
     const VERIFIER_OFFSET_BASIS: VerifierOffsetBasis = VerifierOffsetBasis::AfterTheForward;
@@ -703,7 +694,10 @@ impl RoundDrafter for SidecarRound<'_> {
         // The sidecar KV starts this round here, and its rollback counts
         // forward from it over the accepted prefix.
         self.draft_start = self.drafter.offset();
-        let h_cond = self.h_cond.as_ref().ok_or_else(missing_conditioning)?;
+        let h_cond = self
+            .h_cond
+            .as_ref()
+            .ok_or_else(|| super::missing_conditioning(super::SpecLoop::MtpSidecar))?;
         self.drafter
             .draft_n(ctx.verifier, carry, h_cond, block, self.draft_pos)
     }
@@ -804,7 +798,9 @@ impl RoundDrafter for SidecarRound<'_> {
     fn carry(&self, f: &mut dyn FnMut(&[(&str, &Array)])) -> Result<()> {
         f(&[(
             "h_cond",
-            self.h_cond.as_ref().ok_or_else(missing_conditioning)?,
+            self.h_cond
+                .as_ref()
+                .ok_or_else(|| super::missing_conditioning(super::SpecLoop::MtpSidecar))?,
         )]);
         Ok(())
     }

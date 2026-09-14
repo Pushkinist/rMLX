@@ -53,8 +53,9 @@ use crate::speculative::round_loop::{
     RoundOutcome, Verdict, VerifierOffsetBasis,
 };
 use crate::speculative::{
-    accept_prefix, block_capped_by_checkpoint, committed_rows, conditioning_residual,
-    guard_round_conditioning, guard_verifier_prefill_logits, phases_charged, SpecLoop,
+    accept_prefix, block_capped_by_checkpoint, committed_rows, guard_round_conditioning,
+    guard_verifier_prefill_logits, missing_conditioning, phases_charged,
+    report_conditioning_residual, SpecLoop,
 };
 use rmlx_kv_quant::KvQuant;
 
@@ -109,13 +110,9 @@ impl<'a> BlockRound<'a> {
     /// The projection a round conditions on, or the refusal for a round that
     /// reached for it before the prefill built one.
     fn conditioning(&self) -> Result<&Array> {
-        self.h_ctx.as_ref().ok_or_else(|| {
-            Error::Model(
-                "dflash2_generate: a round read the projection it conditions on before \
-                 the prefill built one"
-                    .into(),
-            )
-        })
+        self.h_ctx
+            .as_ref()
+            .ok_or_else(|| missing_conditioning(SpecLoop::DFlash2))
     }
 }
 
@@ -292,19 +289,14 @@ impl RoundDrafter for BlockRound<'_> {
         if let Some(seed) = self.probe_seed.take() {
             let raw = concatenate(&[&seed, &committed_hidden], 1, device)?;
             let fresh = self.drafter.project_conditioning(&raw)?;
-            let hidden = self.drafter.cfg.hidden_size as i32;
-            let tail = h_ctx.shape()[1] - (1 + projected_rows);
-            let carried_tail = h_ctx.slice(
-                &[0, tail, 0],
-                &[1, tail + 1 + projected_rows, hidden],
-                &[1, 1, 1],
+            report_conditioning_residual(
+                SpecLoop::DFlash2,
+                &h_ctx,
+                &fresh,
+                projected_rows,
+                self.drafter.cfg.hidden_size as i32,
                 device,
             )?;
-            tracing::debug!(
-                rows = 1 + projected_rows,
-                residual = conditioning_residual(&carried_tail, &fresh, device)?,
-                "dflash2 conditioning: carried projection against a fresh one"
-            );
         }
         if ctx.charged {
             // Projecting this round's committed rows and copying the window

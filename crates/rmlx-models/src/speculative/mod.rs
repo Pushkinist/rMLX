@@ -1889,12 +1889,21 @@ pub(crate) fn draft_rows_to_drop(proposals: usize, accept: usize) -> i32 {
 /// It is an `f32` figure taken on `f32` fixtures and **does not carry to a
 /// checkpoint at its own dtype**, where the same two projections are dispatched
 /// at different matmul heights over fewer mantissa bits. That residual is
-/// reported per request by [`conditioning_residual`], not bounded here.
+/// reported per request by [`report_conditioning_residual`], not bounded here.
 #[cfg(test)]
 pub(crate) const PROJECTION_TOL: f32 = 1e-5;
 
-/// Largest element-wise gap between a carried conditioning buffer's tail and a
-/// fresh projection of the rows that tail was built from.
+/// Report the largest element-wise gap between a carried conditioning buffer's
+/// tail and a fresh projection of the rows that tail was built from.
+///
+/// `carried` is the buffer the round left, `fresh` the seed row beside this
+/// round's commit projected in one call, `projected` the rows the round
+/// projected and `hidden` the projection's width. The tail read is the last
+/// `1 + projected` rows of `carried`, which is what `fresh` holds.
+///
+/// Both block drafters take this probe once per request, on the round that
+/// first extends their buffer, and `loop_kind` is what names the drafter on the
+/// line. It is the whole of what differed between their two copies of it.
 ///
 /// The two are the same rows through the same row-wise projection, so they agree
 /// exactly in exact arithmetic. They are **not** required to agree bit for bit
@@ -1921,11 +1930,41 @@ pub(crate) const PROJECTION_TOL: f32 = 1e-5;
 ///
 /// # Errors
 ///
-/// From the subtraction or from reading the result back.
-fn conditioning_residual(carried_tail: &Array, reprojected: &Array, device: Device) -> Result<f32> {
-    let gap = subtract(carried_tail, reprojected, device)?;
+/// From the tail slice, the subtraction, or from reading the result back.
+pub(crate) fn report_conditioning_residual(
+    loop_kind: SpecLoop,
+    carried: &Array,
+    fresh: &Array,
+    projected: i32,
+    hidden: i32,
+    device: Device,
+) -> Result<()> {
+    let rows = 1 + projected;
+    let tail = carried.shape().get(1).copied().unwrap_or(0) - rows;
+    let carried_tail =
+        carried.slice(&[0, tail, 0], &[1, tail + rows, hidden], &[1, 1, 1], device)?;
+    let gap = subtract(&carried_tail, fresh, device)?;
     let dtype = gap.dtype();
-    Ok(max_abs_from_bytes(&gap.to_bytes()?, dtype))
+    tracing::debug!(
+        ?loop_kind,
+        rows,
+        residual = max_abs_from_bytes(&gap.to_bytes()?, dtype),
+        "conditioning: carried projection against a fresh one"
+    );
+    Ok(())
+}
+
+/// A round that reached for the conditioning it drafts from before the prefill
+/// built one.
+///
+/// Three drafters carry a buffer across rounds — a projection for the two block
+/// drafters, one sliced verifier row for the sidecar — and each refuses a round
+/// that read it early the same way. `loop_kind` is what names the request.
+pub(crate) fn missing_conditioning(loop_kind: SpecLoop) -> Error {
+    Error::Model(format!(
+        "{loop_kind:?}: a round read the conditioning it drafts from before the prefill \
+         built one"
+    ))
 }
 
 /// Refuse a round that conditioned on a different number of rows than it
