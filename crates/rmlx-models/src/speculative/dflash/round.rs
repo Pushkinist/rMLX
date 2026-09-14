@@ -149,6 +149,8 @@ impl RoundDrafter for AdaptiveRound<'_> {
         Ok(Prefilled {
             seed,
             prefill_ns,
+            // It scores every position over the verifier's whole vocabulary.
+            restricted_read_back: false,
             // It projects its committed rows every round and the loop counts
             // them. The round-0 row is the starting buffer, not a row a round
             // projected, so the count still opens at zero.
@@ -197,7 +199,6 @@ impl RoundDrafter for AdaptiveRound<'_> {
             commit,
             verify_ns,
             walk_ns,
-            // Every position scored over the verifier's whole vocabulary.
             restricted: 0,
         })
     }

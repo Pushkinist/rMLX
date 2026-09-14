@@ -4,12 +4,13 @@
 //! of the EAGLE-3 loop body and into this file is wiring — an order and a
 //! choice, not an arithmetic — and nothing else in `make ci` sees any of it:
 //!
-//! 1. **Which read-back the verify pass takes.** The restricted one is an argmax
-//!    over a subset of the verifier's row and is sound at temperature 0 only, so
-//!    the round's own draw decides it beside the drafter's offer. Drop the `!`
-//!    and a sampled request takes a reduction its distribution cannot survive,
-//!    with fluent text on the other side; drop the draw and every sampled
-//!    request takes it.
+//! 1. **Which read-back the verify pass takes, and the branch that takes it.**
+//!    The reduced one is an argmax over a subset of the verifier's row and is
+//!    sound at temperature 0 only, so the request's own draw decides it beside
+//!    the drafter's offer. Drop the `!` on the decision and a sampled request
+//!    takes a reduction its distribution cannot survive, with fluent text on the
+//!    other side; negate the branch that consumes the decision and the same
+//!    thing happens with the decision itself still reading correctly.
 //! 2. **The restricted prefix the loop attributes tokens from.** It is the
 //!    round's acceptance under that same condition and zero otherwise. Report it
 //!    unconditionally and a full-vocabulary request claims a restriction it did
@@ -61,36 +62,64 @@ fn lines_in_fns<'a>(src: &'a str, needle: &str) -> Vec<(&'a str, String)> {
     found
 }
 
-/// The round's draw decides the read-back beside the drafter's offer, and it
-/// decides it in `verify`.
+/// The request's draw decides the read-back beside the drafter's offer, and the
+/// branch that consumes that decision reads it in the same sense.
 ///
-/// Mutation: drop the `!`; drop the `&& !ctx.draw.sampling()` term; move the
-/// read into the entry, where the per-round `Verdict` cannot see it.
+/// Two readings, because either alone leaves a hole. The declaration alone is
+/// blind to a negated branch, which takes the reduced read-back on exactly the
+/// requests that may not have it while the decision line still reads correctly;
+/// the branch alone is blind to a decision that stopped consulting the draw.
+///
+/// Mutation: drop the `!` in the decision; drop its `&& !ctx.draw.sampling()`
+/// term; negate the branch — `if !self.restricted_read_back`.
 #[test]
 #[allow(
     clippy::expect_used,
-    reason = "the assertion above establishes exactly one element, so the read cannot fail"
+    reason = "the assertions above establish exactly one element each, so the reads cannot fail"
 )]
-fn the_round_draw_decides_which_read_back_the_verify_takes() {
+fn the_request_draw_decides_the_read_back_and_the_branch_reads_it() {
     let reads = lines_in_fns(ROUND_SRC, "hot_path_active()");
     assert_eq!(
         reads.len(),
         1,
-        "the read-back is chosen once per round and this drafter chooses it {} \
+        "the read-back is decided once per request and this drafter decides it {} \
          time(s): {reads:?}",
         reads.len()
     );
-    let (line, owner) = reads.first().expect("one chooser, asserted above");
+    let (line, owner) = reads.first().expect("one decision, asserted above");
     assert_eq!(
-        *owner, "verify",
-        "the choice is the verify pass's, and this one is made in `{owner}` — the \
-         loop hands the draw to `verify` and to nothing else"
+        *owner, "prefill",
+        "the decision is the request's and is taken before its first round, and \
+         this one is taken in `{owner}` — the loop's own per-request line reports \
+         what `prefill` declared"
     );
     assert_eq!(
-        *line, "let restricted_read_back = self.drafter.hot_path_active() && !ctx.draw.sampling();",
-        "a sampled request cannot take the reduced read-back, and this round \
-         chooses it by `{line}` — a dropped negation hands a sampled request an \
+        *line,
+        "self.restricted_read_back = self.drafter.hot_path_active() && !ctx.draw.sampling();",
+        "a sampled request cannot take the reduced read-back, and this request \
+         decides it by `{line}` — a dropped negation hands a sampled request an \
          argmax over a subset of the row, and the answer is still fluent"
+    );
+    let branches = lines_in_fns(ROUND_SRC, "= if self.restricted_read_back {");
+    assert_eq!(
+        branches.len(),
+        1,
+        "one branch consumes the decision and this drafter has {}: {branches:?} — a \
+         negated branch runs the reduced read-back on the requests that may not \
+         have it, with the decision line above still reading correctly",
+        branches.len()
+    );
+    let (line, owner) = branches.first().expect("one branch, asserted above");
+    assert_eq!(
+        *owner, "verify",
+        "the branch is the verify pass's and this one sits in `{owner}`"
+    );
+    assert_eq!(
+        *line,
+        "let (v_tokens, v_hidden, scored_over_reduced_vocab) = if self.restricted_read_back {",
+        "the arm that runs is what yields the round's reduced-prefix flag, and this \
+         branch reads `{line}` — a flag produced beside the branch rather than by \
+         it can name a read-back the round did not take"
     );
 }
 
@@ -120,7 +149,7 @@ fn the_restricted_prefix_is_the_acceptance_of_a_restricted_round() {
          `{owner}`"
     );
     assert_eq!(
-        *line, "restricted: if restricted_read_back { accept } else { 0 },",
+        *line, "restricted: if scored_over_reduced_vocab { accept } else { 0 },",
         "the prefix is the acceptance of a round that took the reduced read-back \
          and zero otherwise, and this round states `{line}` — either constant \
          makes the answer-equivalence boundary waive the wrong positions"

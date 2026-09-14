@@ -131,6 +131,10 @@ use rmlx_kv_quant::{KvCache, KvQuant};
 
 pub(super) mod round;
 
+/// Per-token attribution, produced by the shared round loop. Re-exported here
+/// because it is in [`round::eagle3_generate`]'s public signature and this is the
+/// only drafter that fills it.
+pub use crate::speculative::round_loop::DecidedBy;
 pub use round::eagle3_generate;
 
 /// Target of this loop's per-position step trace.
@@ -750,34 +754,6 @@ impl Eagle3Drafter {
         }
         Ok(())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Per-token attribution
-// ---------------------------------------------------------------------------
-
-/// Which vocabulary decided one emitted token.
-///
-/// The verify pass takes its argmax over the drafter's reduced target ids at
-/// every position it may accept, and over the verifier's whole vocabulary at
-/// the round's correction and at the prefill seed. The two argmaxes are the
-/// same token exactly when the verifier's own choice is one the drafter can
-/// name, so this is the only thing that says whether the restriction could have
-/// changed a token — and the token stream cannot express it.
-#[allow(
-    clippy::exhaustive_enums,
-    reason = "closed two-valued distinction: a verify position is scored over the drafter's ids or over the verifier's, and there is no third vocabulary"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecidedBy {
-    /// The drafter's reduced vocabulary — an accepted draft token. It differs
-    /// from the verifier's own argmax exactly when that argmax is a token the
-    /// drafter cannot name.
-    RestrictedVocab,
-    /// The verifier's whole vocabulary — a round's correction, the prefill
-    /// seed, or any position of a request that does not take the restricted
-    /// read-back at all. The restriction cannot have changed this token.
-    FullVocab,
 }
 
 // ---------------------------------------------------------------------------

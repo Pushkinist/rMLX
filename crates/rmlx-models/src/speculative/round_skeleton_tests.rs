@@ -96,8 +96,8 @@ use super::gemma4_assistant::AssistantRound;
 use super::mtp::SidecarRound;
 use super::round_loop::{ReportSkippedBy, RoundDrafter, VerifierOffsetBasis};
 use super::{
-    accept_prefix, draft_rows_to_drop, rollback_target_from_head, rollback_target_from_tail,
-    round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
+    accept_prefix, draft_rows_to_drop, guard_restricted_prefix, rollback_target_from_head,
+    rollback_target_from_tail, round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
 };
 
 /// One acceptance walk over a drafted block, and the rows the three spellings
@@ -282,6 +282,34 @@ fn the_draft_side_keeps_the_carry_and_the_accepted_prefix() {
     assert_eq!(draft_rows_to_drop(7, 6), 0);
     assert_eq!(draft_rows_to_drop(7, 0), 6);
     assert_eq!(draft_rows_to_drop(1, 0), 0);
+}
+
+/// A round's reduced-vocabulary prefix is bounded by its acceptance.
+///
+/// The correction past the accepted prefix is the verifier's own token over its
+/// whole vocabulary, so a prefix that covers it makes the declared boundary in
+/// `docs/SPEC_ANSWER_EQUIVALENCE.md` waive the one position that boundary
+/// judges — and the answer, the round line and the accept counters all read
+/// clean while it does. The bound is the **acceptance** and not the committed
+/// count: a round the request's budget cut commits fewer tokens than it
+/// accepted and its prefix stays where it was.
+///
+/// Mutation: bound it on the committed count; drop the refusal.
+#[test]
+fn the_reduced_vocabulary_prefix_is_bounded_by_the_acceptance() {
+    // Every accepted position over the reduced vocabulary, and none of them.
+    assert!(guard_restricted_prefix(SpecLoop::Eagle3, 1, 4, 4).is_ok());
+    assert!(guard_restricted_prefix(SpecLoop::Eagle3, 1, 0, 4).is_ok());
+    // A round of a budget that cut its commit to one: the acceptance is three
+    // and the prefix is three, which a bound on the commit would refuse.
+    assert!(guard_restricted_prefix(SpecLoop::Eagle3, 7, 3, 3).is_ok());
+    // One past the acceptance is the correction.
+    let refused = guard_restricted_prefix(SpecLoop::Eagle3, 7, 4, 3);
+    assert!(
+        refused.is_err(),
+        "a prefix reaching past the acceptance covers the correction, which is the \
+         verifier's own token over its whole vocabulary: {refused:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

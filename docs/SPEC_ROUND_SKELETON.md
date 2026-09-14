@@ -421,7 +421,9 @@ migration had to preserve or move.
   *emitted*, and the request's budget can cut a round's commit below its
   acceptance, so only the emission knows how many entries to write. The seed's
   `DecidedBy::FullVocab` is now the loop's general rule rather than EAGLE-3's
-  statement. The four drafters that score every position over the verifier's
+  statement, and `DecidedBy` itself moved to `round_loop.rs` beside its only
+  producer — `eagle3` re-exports it, because it is in `eagle3_generate`'s public
+  signature. The four drafters that score every position over the verifier's
   whole vocabulary write `restricted: 0` and their entries pass `None`, which is
   the pairing property working: a field added to the drafter's half is a compile
   error at every drafter.
@@ -436,15 +438,45 @@ migration had to preserve or move.
   reads the verifier immutably and touches neither the verifier's caches nor the
   draw. So `rollback` and `condition` still take `&RoundCtx<'_>`, and the one
   signature widening chunk 4 budgeted for was not spent.
-- **`verify` reads the round's draw to choose its read-back.** The restricted
-  argmax is over a subset of the verifier's row and a distribution needs the
-  whole row's normalising constant, so a sampled request cannot take it. That
-  choice is `self.drafter.hot_path_active() && !ctx.draw.sampling()`, made inside
-  `verify` and nowhere else; the loop constructs the one `VerifierDraw` and the
-  drafter never builds one or reads `sampler_cfg`. It is pinned by text in
-  `crates/rmlx-models/src/speculative/eagle3/round_tests.rs`, because a dropped
-  negation hands a sampled request a reduction its distribution cannot survive
-  and the answer is still fluent.
+- **The read-back is decided once per request, in `prefill`, and the branch
+  that runs yields the length.** The reduced argmax is over a subset of the
+  verifier's row and a distribution needs the whole row's normalising constant,
+  so a sampled request cannot take it: the decision is
+  `self.drafter.hot_path_active() && !ctx.draw.sampling()`. It is taken in
+  `prefill` rather than in `verify` because it is a *request*-level fact — both
+  terms are constant for the run — and because the loop's own per-request line
+  has to report it (below). The drafter still reads the context's draw and never
+  builds one or reads `sampler_cfg`, which is the rule the sampling gate holds.
+  The branch in `verify` then returns its own flag beside the tokens, so the
+  reported prefix cannot name a read-back the round did not take: reporting the
+  flag beside the branch instead left a swap of the two arms invisible to every
+  observable at temperature 0 while the boundary waived what it must refuse.
+  Both the decision and the branch are pinned by text in
+  `crates/rmlx-models/src/speculative/eagle3/round_tests.rs`, because each alone
+  is blind to the other's inversion.
+- **Whether a request took a reduced read-back is a field of the loop's own
+  line.** `Prefilled::restricted_read_back` is the declaration and the shared
+  `info!` carries it, so the fact survives as a structured field of the run's
+  `.jsonl` for every loop rather than for the one that happens to log it. It was
+  a field of EAGLE-3's own starting `info!` before the migration and the shared
+  line had nothing for it, which left it recoverable from no log at all — a
+  traceability regression the migration would have shipped silently. A `debug!`
+  from `prefill` would have covered the same fact and re-introduced the
+  per-drafter starting line chunks 2 to 4 deleted.
+- **The reduced prefix is bounded, and the bound is the acceptance.**
+  `guard_restricted_prefix` refuses a round whose `Verdict::restricted` reaches
+  past its acceptance: the correction is the verifier's own token over its whole
+  vocabulary, and attributing it to a reduced one makes the declared boundary
+  waive the position it exists to judge. The bound is not the committed count —
+  a round the budget cut commits fewer tokens than it accepted and its prefix
+  stays where it was. `round_skeleton_tests.rs` reads it on the CPU.
+- **An obligation for chunk 6.** The seed's `DecidedBy::FullVocab` is pushed on
+  every request that carries a buffer, and item 3's rule is "a loop with an
+  attribution buffer **and a seed**". The two are the same thing only while
+  `Prefilled::seed` is a `u32`; when chunk 6 makes it an `Option` for the
+  two-model pair, the push moves inside the `Some` arm beside
+  `emit_seed_token`, or a pair that emits no seed attributes one it never
+  emitted.
 - **The cell disposition chunk 3 recorded, met a second time.** EAGLE-3 reported
   `phases: None` and now reports `RoundPhases`, so its round line gains five
   `*_ms` fields and reaches `log_round`'s overrun `error!` arm for the first
@@ -523,9 +555,9 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    field rather than something `verify` maps for itself, because the attribution
    is one entry per token the request *emitted* and the request's budget can cut
    a round's commit — so the length has to reach the emission, which is the
-   loop's. The entry clears the buffer, not the loop: a request refused before
-   the loop leaves its caller's buffer as it found it, which is what the public
-   signature already promised.
+   loop's. The entry clears the buffer, not the loop, and it clears it before
+   its own refusals — which is what its public signature already promised, and
+   what the body it replaced did.
 4. **DFlash 1's adaptive block.** `dflash_next_block_size` opens with
    `round_block` and then moves the result by the accept rate of the recent
    rounds. Proposed: the `block` method, six defaults and one override.
@@ -1291,6 +1323,7 @@ ratios in the table at 27% to 32%, so there is no twin here to fold out. The six
 pairs that exist at both ends read 430 → 442, and the twelve lines are
 `Verdict::restricted` and its one comment, stated by each of the four drafters
 that score every position over the whole vocabulary: two lines per body, six
-pairs. That is the mechanism chunks 1b and 1d recorded — a field every drafter
-must state is what makes a new field a compile error at every drafter, and it
-costs an identical line in each — and not duplication this migration moved.
+pairs. That is the mechanism "Why the fields are paired" above states — a field
+every drafter must state is what makes a new field a compile error at every
+drafter, and it costs an identical line in each — and not duplication this
+migration moved.

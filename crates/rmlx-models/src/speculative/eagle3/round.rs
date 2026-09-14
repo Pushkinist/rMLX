@@ -94,6 +94,11 @@ pub(crate) struct Eagle3Round<'a> {
     /// that stopped on an EOS leaves it set — the loop breaks before `rollback`
     /// — and the request drops this struct immediately after.
     scored: Option<Array>,
+    /// Whether this request scores its accepted positions over the drafter's
+    /// reduced vocabulary. The drafter's offer and the request's draw together,
+    /// decided once in `prefill` and read by `verify` and by the loop's own
+    /// per-request line.
+    restricted_read_back: bool,
     /// Rounds, proposals and acceptances this request has run, for the
     /// per-position step trace alone. The request's own totals are the loop's;
     /// these are read by nothing else, and by nothing at all unless
@@ -115,6 +120,7 @@ impl<'a> Eagle3Round<'a> {
             d_offset_before: 0,
             proposed: Vec::new(),
             scored: None,
+            restricted_read_back: false,
             rounds: 0,
             total_draft: 0,
             total_accept: 0,
@@ -142,15 +148,11 @@ impl<'a> Eagle3Round<'a> {
     /// missed, or the bonus when it missed none.
     #[allow(
         clippy::indexing_slicing,
-        reason = "the correction index is `find_full_pos` over the same rows, so it is inside the token vector by construction"
+        reason = "both sites are bounded by the proposal count: the head slice is the proposals' own length, and the correction index is `find_full_pos` over that slice"
     )]
     #[allow(
         clippy::expect_used,
         reason = "structural invariant: this arm is taken only where the drafter offers its reduced ids, which is what the array's presence decides"
-    )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "the argmax read-back is a four-byte device buffer, sized by the array it came from"
     )]
     fn verify_restricted(
         &mut self,
@@ -206,8 +208,16 @@ impl<'a> Eagle3Round<'a> {
         let corr_logits = ctx.verifier.logits_from_final_hidden(&h_corr, device)?;
         let corr_am = argmax(&corr_logits, -1, device)?;
         corr_am.eval()?;
-        let corr_bytes = corr_am.to_bytes()?;
-        tokens[full_pos] = u32::from_le_bytes(corr_bytes[..4].try_into().unwrap());
+        // Read back through the same guarded reader as the reduced row above: a
+        // one-token read-back is still a device buffer whose length is the
+        // array's and not this function's to assume.
+        let corr = argmax_tokens(&corr_am.to_bytes()?, 1)?;
+        let Some(&correction) = corr.first() else {
+            return Err(Error::Model(
+                "eagle3_generate: the correction read-back returned no token".into(),
+            ));
+        };
+        tokens[full_pos] = correction;
         Ok((tokens, v_hidden))
     }
 
@@ -252,6 +262,11 @@ impl RoundDrafter for Eagle3Round<'_> {
     /// round.
     fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled> {
         let device = ctx.device;
+        // A sampled request cannot take the reduced read-back — see this module's
+        // header — so it is the request's draw and not the drafter alone that
+        // decides it, and it is decided once, here, for the round line and for
+        // every round's verify pass.
+        self.restricted_read_back = self.drafter.hot_path_active() && !ctx.draw.sampling();
         // The drafter advances one row per committed token beside the verifier,
         // so its cache is sized to the ceiling the verifier's stack was built
         // at and cannot overflow first.
@@ -301,6 +316,7 @@ impl RoundDrafter for Eagle3Round<'_> {
         Ok(Prefilled {
             seed: bonus,
             prefill_ns: prefill_t0.elapsed().as_nanos(),
+            restricted_read_back: self.restricted_read_back,
             // It carries no conditioning buffer: what crosses a round is its own
             // KV cache and one hidden row, and it projects no rows to report.
             projects_conditioning: false,
@@ -323,14 +339,13 @@ impl RoundDrafter for Eagle3Round<'_> {
     fn verify(&mut self, ctx: &mut RoundCtx<'_>, fed: &[u32], remaining: usize) -> Result<Verdict> {
         let device = ctx.device;
         let proposals = fed.get(1..).unwrap_or_default();
-        // A sampled request cannot take the restricted read-back — see this
-        // module's header — so it is the round's draw and not the drafter alone
-        // that decides which of the two the verify pass runs.
-        let restricted_read_back = self.drafter.hot_path_active() && !ctx.draw.sampling();
 
+        // The arm that runs is what says how long the round's reduced prefix is,
+        // so the flag cannot name a read-back the round did not take.
         let t0 = Instant::now();
-        let (v_tokens, v_hidden) = if restricted_read_back {
-            self.verify_restricted(ctx, fed, proposals)?
+        let (v_tokens, v_hidden, scored_over_reduced_vocab) = if self.restricted_read_back {
+            let (v_tokens, v_hidden) = self.verify_restricted(ctx, fed, proposals)?;
+            (v_tokens, v_hidden, true)
         } else {
             let (v_logits, v_hidden) = ctx.verifier.forward_verify_capture(
                 fed,
@@ -341,7 +356,7 @@ impl RoundDrafter for Eagle3Round<'_> {
                 device,
             )?;
             let v_tokens = ctx.draw.block_tokens(&v_logits, fed.len(), device)?;
-            (v_tokens, v_hidden)
+            (v_tokens, v_hidden, false)
         };
         let verify_ns = t0.elapsed().as_nanos();
 
@@ -361,10 +376,10 @@ impl RoundDrafter for Eagle3Round<'_> {
             verify_ns,
             walk_ns,
             // The accepted prefix carries the drafter's own tokens, which the
-            // restricted argmax confirmed; the correction past them is the
-            // verifier's over its whole vocabulary. A request that took the full
+            // reduced argmax confirmed; the correction past them is the
+            // verifier's over its whole vocabulary. A round that took the full
             // read-back restricted nothing.
-            restricted: if restricted_read_back { accept } else { 0 },
+            restricted: if scored_over_reduced_vocab { accept } else { 0 },
         })
     }
 

@@ -1967,6 +1967,40 @@ pub(crate) fn missing_conditioning(loop_kind: SpecLoop) -> Error {
     ))
 }
 
+/// Refuse a round that attributed more of its tokens to a reduced vocabulary
+/// than it accepted.
+///
+/// A round commits the accepted prefix and one correction, and the correction is
+/// the verifier's own token over its whole vocabulary whatever the positions
+/// before it were scored over. So the reduced prefix is bounded by the
+/// acceptance — and not by the committed count, which a request's remaining
+/// budget can cut below the acceptance while the prefix stays where it was.
+///
+/// A round reporting more makes the declared boundary in
+/// `docs/SPEC_ANSWER_EQUIVALENCE.md` waive the one position that boundary
+/// exists to judge, and nothing in an answer, a round line or an accept counter
+/// reports it.
+///
+/// # Errors
+///
+/// [`Error::Model`] when `restricted` is above `accept`.
+fn guard_restricted_prefix(
+    loop_kind: SpecLoop,
+    round: usize,
+    restricted: usize,
+    accept: usize,
+) -> Result<()> {
+    if restricted > accept {
+        return Err(Error::Model(format!(
+            "{loop_kind:?}: round {round} attributed {restricted} tokens to a reduced \
+             vocabulary over an acceptance of {accept}; the correction past the accepted \
+             prefix is the verifier's own token over its whole vocabulary, and waiving it \
+             at the equivalence boundary hides the position that boundary judges"
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse a round that conditioned on a different number of rows than it
 /// committed.
 ///

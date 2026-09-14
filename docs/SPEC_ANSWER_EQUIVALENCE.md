@@ -280,7 +280,7 @@ unjudgeable for length in every one of them:
 |---|---|---|
 | as shipped | 5 of 5 agree | `divergence_unnameable` false on all six; confidences 0.0000 to 0.0703 |
 | correction left on the restricted argmax | **refused, 1 of 5 judged** | confidence 0.8828, `divergence_unnameable` **true**, at a **correction** |
-| rollback target one position short | **refused, 5 of 5 judged** | `divergence_unnameable` false on all six; the repetition control takes all five |
+| rollback target one position short | **refused, 5 of 5 judged** | `divergence_unnameable` false on all five it read; the repetition control takes four and the confidence ceiling the fifth, at 0.5195. Retaken after the EAGLE-3 migration — see the note below |
 | the recurrent tape (a branch under review) | 5 of 5 agree | one at confidence 0.2617, `divergence_unnameable` **true**, at an **accepted** position |
 
 `unnameable` reads 1, 2, 2, 3, 4 and 5 tokens on the shipped arms — under 2% of a
@@ -292,7 +292,27 @@ refused because of where it happened and not what it changed** — its cell has
 waived precisely the defect the pair exists to catch. Reading the position as
 well keeps it. The third row is the pair's other broken engine and the waiver has
 no purchase on it at all: none of its divergences is at an unnameable token, and
-the refusals come from the repetition control, which the rule does not touch.
+the refusals come from the repetition control and the confidence ceiling, neither
+of which the rule touches.
+
+**The third row was retaken.** The body it was first measured against is gone —
+EAGLE-3 runs on the shared round loop, whose rollback target is spelled from the
+head where the old body spelled it from the tail. The two name the same position
+and the same edit keeps the same one rejected row, so it is the same engine;
+`scripts/spec_broken_engine.sh` applies it in `round_loop.rs` and the reading
+above is the retake, not the original. The verdict is unmoved — 5 of 5 judged,
+all refused, `divergence_unnameable` false on every one, confidences 0.0000 to
+0.8320 — and what moved is which check refuses: four cells by the repetition
+control and `database-isolation` by the confidence ceiling at 0.5195, where the
+original reading put all five on the control.
+
+The sixth cell of that retake is missing, and for a reason that is not the
+engine. On the broken arm the 4k document stops on an in-round EOS, and the
+harness's two-sided reading of the per-position trace switch counts one ask per
+round against the rounds that wrote a line — a round that stopped on an EOS
+writes none, so the assertion fails one short. That is a property of the harness
+on any in-round EOS, on any engine, and it stands the sixth cell down rather than
+reporting it.
 
 The fourth row is the case that forced the rule. That branch rebuilds a partly
 accepted round's recurrent state from a tape rather than replaying it; it does
