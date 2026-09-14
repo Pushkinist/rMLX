@@ -198,7 +198,7 @@ restricted-vocabulary one:
 | block pair, one rejected draft kept every partial round | 0.1758 to 0.6406 | 6 of 6 |
 | adaptive pair, one rejected draft kept every partial round | 0.0703 to 0.8320 | 5 of 5 judged |
 | restricted-vocabulary pair, one rejected draft kept every partial round | 0.0000 to 0.8320 | 5 of 5 judged |
-| restricted-vocabulary pair, correction left on the restricted argmax | 0.0000 to 0.8828 | 1 of 6 |
+| restricted-vocabulary pair, correction left on the restricted argmax | 0.0000 to 0.7891 | 1 of 6 |
 | two-model pair, one rejected draft kept every partial round | 0.0000 to 0.6680 | 6 of 6 |
 
 `MAX_DIVERGENCE_CONFIDENCE` is 0.12, inside the band the measurement leaves:
@@ -253,8 +253,10 @@ changes an answer at exactly the kind of token the boundary does: same reference
 token, same speculative token, same near-certain margin. Nothing in the two token
 streams tells the two apart. What separates them is which position the loop was
 at: the restriction reaches an accepted position by design and cannot reach the
-correction, which is scored over the whole vocabulary. So `eagle3_generate` fills
-a `DecidedBy` per emitted token, and the rule is:
+correction, which is scored over the whole vocabulary. So the EAGLE-3 request
+fills a `DecidedBy` per emitted token — the round reports its restricted prefix
+and the shared round loop writes one entry per token it emitted — and the rule
+is:
 
 - first divergence at a position the loop emitted from the drafter's own argmax,
   whose reference token that vocabulary cannot name — **the boundary**. Reported
@@ -277,8 +279,8 @@ unjudgeable for length in every one of them:
 | engine | verdict | where |
 |---|---|---|
 | as shipped | 5 of 5 agree | `divergence_unnameable` false on all six; confidences 0.0000 to 0.0703 |
-| correction left on the restricted argmax | **refused, 1 of 5 judged** | confidence 0.8828, `divergence_unnameable` **true**, at a **correction** |
-| rollback target one position short | **refused, 5 of 5 judged** | `divergence_unnameable` false on all six; the repetition control takes all five |
+| correction left on the restricted argmax | **refused, 1 of 5 judged** | confidence 0.7891, `divergence_unnameable` **true**, at a **correction** (`divergence_decided_by` `FullVocab`). Retaken after the EAGLE-3 migration — see the note below |
+| rollback target one position short | **refused, 5 of 5 judged** | `divergence_unnameable` false on all five it read; the repetition control takes four and the confidence ceiling the fifth, at 0.5195. Retaken after the EAGLE-3 migration — see the note below |
 | the recurrent tape (a branch under review) | 5 of 5 agree | one at confidence 0.2617, `divergence_unnameable` **true**, at an **accepted** position |
 
 `unnameable` reads 1, 2, 2, 3, 4 and 5 tokens on the shipped arms — under 2% of a
@@ -290,7 +292,40 @@ refused because of where it happened and not what it changed** — its cell has
 waived precisely the defect the pair exists to catch. Reading the position as
 well keeps it. The third row is the pair's other broken engine and the waiver has
 no purchase on it at all: none of its divergences is at an unnameable token, and
-the refusals come from the repetition control, which the rule does not touch.
+the refusals come from the repetition control and the confidence ceiling, neither
+of which the rule touches.
+
+**The second row was retaken too, and it is the row that carries the rule.**
+The statement it was first measured against is the one this branch rewrote: the
+correction is now read back through the same guarded reader as the reduced row
+beside it, so `scripts/spec_broken_engine.sh` drops the assignment that reader
+feeds rather than the one it replaced. The verdict is unmoved — refused, 1 of 5
+judged, the refusal on `photosynthesis` — and so is the shape the rule turns on:
+`divergence_unnameable` **true** at a position `divergence_decided_by` reports
+as `FullVocab`, which is the correction. A rule keyed on the unnameable field
+alone would waive it; reading the position refuses it. What moved is the
+confidence, 0.8828 to 0.7891, and the divergence, token 89 rather than the cell
+the original run named. Both are far above the 0.12 ceiling and neither touches
+the band that ceiling sits in.
+
+**The third row was retaken.** The body it was first measured against is gone —
+EAGLE-3 runs on the shared round loop, whose rollback target is spelled from the
+head where the old body spelled it from the tail. The two name the same position
+and the same edit keeps the same one rejected row, so it is the same engine;
+`scripts/spec_broken_engine.sh` applies it in `round_loop.rs` and the reading
+above is the retake, not the original. The verdict is unmoved — 5 of 5 judged,
+all refused, `divergence_unnameable` false on every one, confidences 0.0000 to
+0.8320 — and what moved is which check refuses: four cells by the repetition
+control and `database-isolation` by the confidence ceiling at 0.5195, where the
+original reading put all five on the control.
+
+The sixth cell of that retake is missing, and for a reason that is not the
+engine. On the broken arm the 4k document stops on an in-round EOS, and the
+harness's two-sided reading of the per-position trace switch counts one ask per
+round against the rounds that wrote a line — a round that stopped on an EOS
+writes none, so the assertion fails one short. That is a property of the harness
+on any in-round EOS, on any engine, and it stands the sixth cell down rather than
+reporting it.
 
 The fourth row is the case that forced the rule. That branch rebuilds a partly
 accepted round's recurrent state from a tape rather than replaying it; it does

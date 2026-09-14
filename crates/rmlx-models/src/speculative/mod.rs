@@ -1967,6 +1967,59 @@ pub(crate) fn missing_conditioning(loop_kind: SpecLoop) -> Error {
     ))
 }
 
+/// Refuse a round whose reduced-vocabulary prefix disagrees with what the
+/// request declared or with what it accepted.
+///
+/// Two bounds, and they see different things.
+///
+/// `declared` is the request's own `Prefilled::restricted_read_back`, read a
+/// frame above the round. A request that scores every position over the
+/// verifier's whole vocabulary has no reduced prefix at all, so any prefix on
+/// such a round is a round reporting a read-back the request did not take —
+/// which is what a per-round flag made of free constants can say while every
+/// text reading of the branch that produced it still passes.
+///
+/// The second bound is the acceptance. A round commits the accepted prefix and
+/// one correction, and the correction is the verifier's own token over its whole
+/// vocabulary whatever the positions before it were scored over. The bound is
+/// therefore the acceptance and not the committed count, which a request's
+/// remaining budget can cut below the acceptance while the prefix stays where it
+/// was.
+///
+/// Either way round the report makes the declared boundary in
+/// `docs/SPEC_ANSWER_EQUIVALENCE.md` waive a position that boundary exists to
+/// judge, and nothing in an answer, a round line or an accept counter reports
+/// it.
+///
+/// # Errors
+///
+/// [`Error::Model`] when a request that declared no reduced read-back reports a
+/// prefix, or when `restricted` is above `accept`.
+fn guard_restricted_prefix(
+    loop_kind: SpecLoop,
+    round: usize,
+    declared: bool,
+    restricted: usize,
+    accept: usize,
+) -> Result<()> {
+    if !declared && restricted > 0 {
+        return Err(Error::Model(format!(
+            "{loop_kind:?}: round {round} attributed {restricted} tokens to a reduced \
+             vocabulary on a request that declared it takes no reduced read-back; one of \
+             the two is wrong and the equivalence boundary reads the round"
+        )));
+    }
+    if restricted > accept {
+        return Err(Error::Model(format!(
+            "{loop_kind:?}: round {round} attributed {restricted} tokens to a reduced \
+             vocabulary over an acceptance of {accept}; the correction past the accepted \
+             prefix is the verifier's own token over its whole vocabulary, and waiving it \
+             at the equivalence boundary hides the position that boundary judges"
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse a round that conditioned on a different number of rows than it
 /// committed.
 ///

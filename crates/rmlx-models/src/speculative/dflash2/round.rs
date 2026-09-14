@@ -202,6 +202,8 @@ impl RoundDrafter for BlockRound<'_> {
         Ok(Prefilled {
             seed,
             prefill_ns,
+            // It scores every position over the verifier's whole vocabulary.
+            restricted_read_back: false,
             // It projects its committed rows every round and the loop counts
             // them. The prompt's rows are the starting window, not rows a round
             // projected, so the count still opens at zero.
@@ -260,6 +262,7 @@ impl RoundDrafter for BlockRound<'_> {
             commit,
             verify_ns,
             walk_ns,
+            restricted: 0,
         })
     }
 
@@ -407,6 +410,9 @@ pub fn dflash2_generate(
             kv_quant_override,
             max_ctx_override,
         },
+        // This drafter's verify pass scores every position over the verifier's
+        // whole vocabulary, so its tokens need no per-token attribution.
+        None,
         device,
     )
 }

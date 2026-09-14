@@ -21,7 +21,7 @@ use rmlx_core::error::{Error, Result};
 use rmlx_kv_quant::{GdnTape, GdnTapeSegment, KvCache, KvQuant, LinearAttnCache};
 use rmlx_mlx::{concatenate, Array, Device};
 
-use super::eagle3::DecidedBy;
+use super::round_loop::DecidedBy;
 use super::{DecodeWindow, RoundStats, SpecLoop};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;

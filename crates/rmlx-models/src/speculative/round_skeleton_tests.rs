@@ -91,12 +91,13 @@
 use super::dflash::dflash_next_block_size;
 use super::dflash::round::AdaptiveRound;
 use super::dflash2::round::BlockRound;
+use super::eagle3::round::Eagle3Round;
 use super::gemma4_assistant::AssistantRound;
 use super::mtp::SidecarRound;
 use super::round_loop::{ReportSkippedBy, RoundDrafter, VerifierOffsetBasis};
 use super::{
-    accept_prefix, draft_rows_to_drop, rollback_target_from_head, rollback_target_from_tail,
-    round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
+    accept_prefix, draft_rows_to_drop, guard_restricted_prefix, rollback_target_from_head,
+    rollback_target_from_tail, round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
 };
 
 /// One acceptance walk over a drafted block, and the rows the three spellings
@@ -283,6 +284,99 @@ fn the_draft_side_keeps_the_carry_and_the_accepted_prefix() {
     assert_eq!(draft_rows_to_drop(1, 0), 0);
 }
 
+/// The loop hands the round's reduced-vocabulary prefix to its guard, with the
+/// request's own declaration beside it.
+///
+/// The call is what makes the guard reachable, and nothing else in this crate
+/// reads it: a deleted call, or one handed the committed count where the bound
+/// is the acceptance, leaves every other observable clean. Read as text off the
+/// shared loop's own source, which is the file the table below already holds.
+///
+/// Mutation: delete the call; pass `verdict.commit.len()`; drop the
+/// declaration argument.
+#[test]
+fn the_loop_bounds_every_rounds_reduced_prefix_before_it_emits() {
+    let src = LOOP_SOURCES
+        .iter()
+        .find(|(f, _)| *f == SHARED_LOOP)
+        .map(|(_, s)| *s)
+        .unwrap_or_default();
+    let call: Vec<&str> = src
+        .lines()
+        .map(str::trim)
+        .filter(|l| is_code(l) && l.starts_with("guard_restricted_prefix("))
+        .collect();
+    assert_eq!(
+        call.len(),
+        1,
+        "the shared loop bounds each round's reduced prefix once and it calls the \
+         guard {} time(s): {call:?}",
+        call.len()
+    );
+    let args: Vec<&str> = src
+        .lines()
+        .skip_while(|l| !l.trim().starts_with("guard_restricted_prefix("))
+        .skip(1)
+        .take_while(|l| !l.trim().starts_with(")?"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        args,
+        vec![
+            "cfg.loop_kind,",
+            "rounds,",
+            "restricted_read_back,",
+            "verdict.restricted,",
+            "verdict.accept,",
+        ],
+        "the guard reads the request's declaration, the round's prefix and the \
+         round's acceptance — the committed count in the last place is a bound a \
+         budget-cut round fails for no defect, and a dropped declaration stops the \
+         guard seeing a prefix on a request that takes no reduced read-back"
+    );
+}
+
+/// A round's reduced-vocabulary prefix is bounded by its acceptance, and by what
+/// the request declared.
+///
+/// The correction past the accepted prefix is the verifier's own token over its
+/// whole vocabulary, so a prefix that covers it makes the declared boundary in
+/// `docs/SPEC_ANSWER_EQUIVALENCE.md` waive the one position that boundary
+/// judges — and the answer, the round line and the accept counters all read
+/// clean while it does. The bound is the **acceptance** and not the committed
+/// count: a round the request's budget cut commits fewer tokens than it
+/// accepted and its prefix stays where it was.
+///
+/// Mutation: bound it on the committed count; drop either refusal.
+#[test]
+fn the_reduced_vocabulary_prefix_is_bounded_by_the_acceptance() {
+    // Every accepted position over the reduced vocabulary, and none of them.
+    assert!(guard_restricted_prefix(SpecLoop::Eagle3, 1, true, 4, 4).is_ok());
+    assert!(guard_restricted_prefix(SpecLoop::Eagle3, 1, true, 0, 4).is_ok());
+    // A round of a budget that cut its commit to one: the acceptance is three
+    // and the prefix is three, which a bound on the commit would refuse.
+    assert!(guard_restricted_prefix(SpecLoop::Eagle3, 7, true, 3, 3).is_ok());
+    // One past the acceptance is the correction.
+    let refused = guard_restricted_prefix(SpecLoop::Eagle3, 7, true, 4, 3);
+    assert!(
+        refused.is_err(),
+        "a prefix reaching past the acceptance covers the correction, which is the \
+         verifier's own token over its whole vocabulary: {refused:?}"
+    );
+    // A request that scores every position over the verifier's whole vocabulary
+    // has no reduced prefix to report, whatever its rounds accepted. This is the
+    // arm a per-round flag made of free constants reaches: the acceptance bound
+    // above passes it, and so does every text reading of the branch that
+    // produced the flag.
+    assert!(guard_restricted_prefix(SpecLoop::MtpSidecar, 1, false, 0, 4).is_ok());
+    let undeclared = guard_restricted_prefix(SpecLoop::Eagle3, 2, false, 4, 4);
+    assert!(
+        undeclared.is_err(),
+        "a request that declared no reduced read-back cannot have a round that took \
+         one: {undeclared:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // What the seven loops declare at their edges
 // ---------------------------------------------------------------------------
@@ -350,7 +444,7 @@ const DISPOSITIONS: [(
     ),
     (
         SpecLoop::Eagle3,
-        "eagle3/mod.rs",
+        SHARED_LOOP,
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
         VerifierOffsetBasis::AfterTheForward,
@@ -379,14 +473,7 @@ const DISPOSITIONS: [(
 ];
 
 /// The files the table names, in the order it names them, each with its source.
-const LOOP_SOURCES: [(&str, &str); 3] = [
-    (
-        "eagle3/mod.rs",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/speculative/eagle3/mod.rs"
-        )),
-    ),
+const LOOP_SOURCES: [(&str, &str); 2] = [
     (
         SHARED_LOOP,
         include_str!(concat!(
@@ -585,9 +672,13 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
                 <AdaptiveRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
                 <AdaptiveRound<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
             ),
+            SpecLoop::Eagle3 => (
+                <Eagle3Round<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
+                <Eagle3Round<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
+            ),
             // The loops that still carry their own body: their dispositions are
             // read off their source above and there is no constant to read.
-            SpecLoop::Eagle3 | SpecLoop::TwoModelGreedy | SpecLoop::TwoModelStochastic => continue,
+            SpecLoop::TwoModelGreedy | SpecLoop::TwoModelStochastic => continue,
         };
         assert_eq!(
             declared,

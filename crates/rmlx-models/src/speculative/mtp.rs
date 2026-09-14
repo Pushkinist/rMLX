@@ -684,6 +684,8 @@ impl RoundDrafter for SidecarRound<'_> {
         Ok(Prefilled {
             seed,
             prefill_ns,
+            // It scores every position over the verifier's whole vocabulary.
+            restricted_read_back: false,
             // The sidecar slices one verifier row per round and projects
             // nothing, so it accumulates no conditioning to report.
             projects_conditioning: false,
@@ -733,6 +735,7 @@ impl RoundDrafter for SidecarRound<'_> {
             commit,
             verify_ns,
             walk_ns,
+            restricted: 0,
         })
     }
 
@@ -881,6 +884,9 @@ pub fn mtp_generate(
             kv_quant_override,
             max_ctx_override,
         },
+        // This drafter's verify pass scores every position over the verifier's
+        // whole vocabulary, so its tokens need no per-token attribution.
+        None,
         device,
     )
 }

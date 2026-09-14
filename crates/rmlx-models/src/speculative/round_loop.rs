@@ -40,10 +40,35 @@ use super::round_common::{
     emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
     report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
 };
-use super::{DecodeWindow, SpecLoop, VerifierDraw};
+use super::{guard_restricted_prefix, DecodeWindow, SpecLoop, VerifierDraw};
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+
+/// Which vocabulary decided one emitted token.
+///
+/// A drafter whose verify pass scores some positions over a vocabulary smaller
+/// than the verifier's emits tokens the verifier's own argmax would not always
+/// have chosen: a reduced argmax equals the true one exactly when the true one
+/// is in the reduced set. This is the only thing that says whether the
+/// reduction could have changed a token, and the token stream cannot express
+/// it. Produced here — the loop writes one entry per token it emits, from the
+/// round's [`Verdict::restricted`] — and read by the answer-equivalence gate.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed two-valued distinction: a verify position is scored over a reduced vocabulary or over the verifier's, and there is no third"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecidedBy {
+    /// A reduced vocabulary — an accepted draft token. It differs from the
+    /// verifier's own argmax exactly when that argmax is a token the reduced
+    /// set cannot name.
+    RestrictedVocab,
+    /// The verifier's whole vocabulary — a round's correction, the prefill
+    /// seed, or any position of a request that takes no reduced read-back at
+    /// all. The reduction cannot have changed this token.
+    FullVocab,
+}
 
 /// Which of the loop's two exits skips the report of the verifier's resident KV.
 ///
@@ -181,6 +206,10 @@ pub(crate) struct RoundCtx<'a> {
     pub(crate) kv: Vec<KvCache>,
     /// Its recurrent linear-attention state, on an architecture that keeps one.
     pub(crate) lin: Option<Vec<LinearAttnCache>>,
+    /// The context ceiling the caches above were built at. A drafter that
+    /// keeps a cache of its own sizes it from here, so it cannot overflow
+    /// before the verifier does.
+    pub(crate) max_seq: i32,
     /// The request's draw over the verifier's logits.
     pub(crate) draw: VerifierDraw,
     /// The loop's phase-charge decision, for a drafter that forces the arrays it
@@ -198,6 +227,16 @@ pub(crate) struct Prefilled {
     /// differs per drafter, and a loop that timed the call would move the figure
     /// on records no gate reads.
     pub(crate) prefill_ns: u128,
+    /// Whether this request scores any verified position over a vocabulary
+    /// smaller than the verifier's.
+    ///
+    /// A request-level fact, not a per-drafter one: it is the drafter's offer
+    /// and the request's sampler together, so a drafter that offers a reduced
+    /// read-back still answers `false` above temperature 0. The loop reports it
+    /// on the one line it writes per request, because whether a request's
+    /// accepted positions carry the verifier's own argmax is recoverable from
+    /// no other field of the run's log.
+    pub(crate) restricted_read_back: bool,
     /// Whether this drafter projects a conditioning buffer and reports the rows
     /// it accumulates.
     ///
@@ -223,6 +262,16 @@ pub(crate) struct Verdict {
     pub(crate) verify_ns: u128,
     /// Wall clock of the acceptance walk.
     pub(crate) walk_ns: u128,
+    /// How many of `commit`'s opening tokens this round decided over a reduced
+    /// vocabulary rather than the verifier's whole one. Zero for a drafter that
+    /// scores every position over the whole vocabulary, which is all of them
+    /// but EAGLE-3 and EAGLE-3 itself on a sampled request.
+    ///
+    /// Never above `accept` — the correction past the accepted prefix is the
+    /// verifier's own token over its whole vocabulary — and zero on a request
+    /// whose [`Prefilled::restricted_read_back`] is `false`. The loop refuses a
+    /// round that says otherwise; see [`super::guard_restricted_prefix`].
+    pub(crate) restricted: usize,
 }
 
 /// What a drafter does that the shared loop cannot.
@@ -314,6 +363,15 @@ pub(crate) trait RoundDrafter {
 /// asked for would be trusting the very step it wanted checked. The seed exit is
 /// the exception and returns the resolved block: no round ran there.
 ///
+/// `decided_by` is the per-token attribution buffer of a drafter whose verify
+/// pass scores some positions over a reduced vocabulary: one entry per emitted
+/// token, in emission order. The loop is what holds it because the emission is
+/// the loop's and the request's budget can cut a round's tokens; the prefix
+/// length is [`Verdict::restricted`]. A drafter that scores every position over
+/// the verifier's whole vocabulary passes `None`. The buffer is not cleared
+/// here: the entry clears it before its own refusals, which is what its public
+/// signature promises a caller.
+///
 /// # Errors
 ///
 /// [`Error::Model`] when a drafter proposes nothing, and whatever the verifier's
@@ -324,11 +382,12 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     prompt_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     cfg: &RoundCfg<'_>,
+    mut decided_by: Option<&mut Vec<DecidedBy>>,
     device: Device,
 ) -> Result<(Vec<ProbeStep>, usize)> {
     let charge = cfg.charged;
     let n_tokens = cfg.n_tokens;
-    let (kv_quant, _, kv) =
+    let (kv_quant, max_seq, kv) =
         verifier_cache_stack(verifier, cfg.kv_quant_override, cfg.max_ctx_override)?;
     let lin = verifier
         .needs_lin_caches()
@@ -337,6 +396,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         verifier,
         kv,
         lin,
+        max_seq,
         draw: VerifierDraw::new(cfg.sampler_cfg),
         charged: charge,
         device,
@@ -354,8 +414,15 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     let prefilled = drafter.prefill(&mut ctx, prompt_ids)?;
     let prefill_ns = prefilled.prefill_ns;
     let mut conditioned_rows = prefilled.projects_conditioning.then_some(0usize);
+    let restricted_read_back = prefilled.restricted_read_back;
     let mut carry = prefilled.seed;
 
+    // A loop that attributes its tokens attributes the seed to the whole
+    // vocabulary: it is drawn off the verifier's own prefill logits, and no
+    // reduced read-back reaches it.
+    if let Some(buf) = decided_by.as_deref_mut() {
+        buf.push(DecidedBy::FullVocab);
+    }
     if emit_seed_token(
         cfg.tokenizer,
         carry,
@@ -393,6 +460,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         n_tokens,
         ?kv_quant,
         temperature = cfg.sampler_cfg.temperature,
+        restricted_read_back,
         "speculative round loop: starting"
     );
 
@@ -444,6 +512,13 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         verifier_ns += verdict.verify_ns;
         total_accept += verdict.accept;
 
+        guard_restricted_prefix(
+            cfg.loop_kind,
+            rounds,
+            restricted_read_back,
+            verdict.restricted,
+            verdict.accept,
+        )?;
         let emit = emit_round_tokens(
             cfg.tokenizer,
             &verdict.commit,
@@ -453,7 +528,9 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             &mut emitted,
             &mut emitted_in_rounds,
             &mut window,
-            None,
+            decided_by
+                .as_deref_mut()
+                .map(|buf| (buf, verdict.restricted)),
         );
         if emit.hit_eos {
             stopped_in_round = true;

@@ -1,15 +1,14 @@
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
 #![allow(unsafe_code)]
 
-//! EAGLE-3 drafter loader + round-loop.
+//! EAGLE-3 drafter loader and forward.
 //!
 //! Port of mlx-vlm `mlx_vlm/speculative/drafters/eagle3/eagle3.py`
-//! (`Eagle3DraftModel`) and the round-loop in `mlx_vlm/speculative/eagle3.py`
-//! (`_eagle3_next_block_size`, `_eagle3_rounds`, `_eagle3_walk`, whose walk is
-//! the shared [`crate::speculative::accept_prefix`] here). The
-//! authoritative weight layout is the mainline SpecForge
-//! `LlamaForCausalLMEagle3` model
-//! (`sgl-project/SpecForge:specforge/modeling/draft/llama3_eagle.py`).
+//! (`Eagle3DraftModel`). The authoritative weight layout is the mainline
+//! SpecForge `LlamaForCausalLMEagle3` model
+//! (`sgl-project/SpecForge:specforge/modeling/draft/llama3_eagle.py`). The
+//! request's rounds are [`round::eagle3_generate`] onto the shared
+//! [`crate::speculative::round_loop::run_rounds`].
 //!
 //! # What an EAGLE-3 drafter is
 //!
@@ -82,16 +81,16 @@
 //! diff, two related bugs were identified:
 //!
 //! 1. **Prefill path**: `prefill_from_verifier_hidden` returned the drafter's
-//!    hidden at the bonus position. The round-loop then called
+//!    hidden at the bonus position. The round then called
 //!    `draft_block(bonus, h_seed)` which ran `forward_token(bonus, h_seed)` —
 //!    processing bonus through the drafter a SECOND time using its own output as
 //!    conditioning (the drafter had already processed bonus in the prefill).
 //! 2. **Per-round seeding**: `accept_and_reseed` returned `h_seed` (drafter's
-//!    hidden at correction). The round-loop then called
+//!    hidden at correction). The round then called
 //!    `draft_block(correction, h_seed)` which ran `forward_token(correction, h_seed)` —
 //!    again a second forward pass for correction.
 //!
-//! Root cause: the round-loop was treating `h_seed` as an INPUT conditioning
+//! Root cause: the round was treating `h_seed` as an INPUT conditioning
 //! hidden (to be fed with a new token), whereas `h_seed` is the drafter's OUTPUT
 //! at the seed position (the drafter has already processed the seed token).
 //!
@@ -99,7 +98,8 @@
 //! `(h_seed, seed_tok)` where `seed_tok = greedy_target_token(h_seed)` mirrors
 //! mlx-vlm's `_seed_token`. `draft_block` gains `precomputed_first_tok:
 //! Option<u32>` — when `Some(t)`, `t` is prepended as the first draft token
-//! WITHOUT a forward pass, and the loop runs `block_size - 2` more times.
+//! WITHOUT a forward pass, and the drafting loop runs `block_size - 2` more
+//! times.
 //! This exactly mirrors mlx-vlm `Eagle3DraftModel.draft_block` with `_seed_token`
 //! set. Net effect: each round the drafter makes one more genuine prediction.
 
@@ -125,15 +125,17 @@ use std::path::Path;
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{add, argmax, concatenate, rope, Array, Device};
 
-use super::DecodeWindow;
 use crate::arch::Architecture;
-use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
-use crate::speculative::round_common::{
-    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
-    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
-};
 use rmlx_kv_quant::{KvCache, KvQuant};
+
+pub(super) mod round;
+
+/// Per-token attribution, produced by the shared round loop. Re-exported here
+/// because it is in [`round::eagle3_generate`]'s public signature and this is the
+/// only drafter that fills it.
+pub use crate::speculative::round_loop::DecidedBy;
+pub use round::eagle3_generate;
 
 /// Target of this loop's per-position step trace.
 pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
@@ -752,519 +754,6 @@ impl Eagle3Drafter {
         }
         Ok(())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Round-loop
-// ---------------------------------------------------------------------------
-
-/// Which vocabulary decided one emitted token.
-///
-/// The verify pass takes its argmax over the drafter's reduced target ids at
-/// every position it may accept, and over the verifier's whole vocabulary at
-/// the round's correction and at the prefill seed. The two argmaxes are the
-/// same token exactly when the verifier's own choice is one the drafter can
-/// name, so this is the only thing that says whether the restriction could have
-/// changed a token — and the token stream cannot express it.
-#[allow(
-    clippy::exhaustive_enums,
-    reason = "closed two-valued distinction: a verify position is scored over the drafter's ids or over the verifier's, and there is no third vocabulary"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecidedBy {
-    /// The drafter's reduced vocabulary — an accepted draft token. It differs
-    /// from the verifier's own argmax exactly when that argmax is a token the
-    /// drafter cannot name.
-    RestrictedVocab,
-    /// The verifier's whole vocabulary — a round's correction, the prefill
-    /// seed, or any position of a request that does not take the restricted
-    /// read-back at all. The restriction cannot have changed this token.
-    FullVocab,
-}
-
-/// EAGLE-3 speculative-decoding round-loop (greedy / temp=0).
-///
-/// `decided_by` is filled with one [`DecidedBy`] per emitted token, in
-/// emission order, and is cleared first. A caller that only wants the tokens
-/// passes a scratch vector; the answer-equivalence gate reads it, because
-/// whether the restriction could have changed a token is a property of the
-/// round the token came out of and not of the token.
-///
-/// Port of `_eagle3_rounds` (mlx-vlm), now with correctness fixes:
-///
-/// 1. **Drafter KV prefill** (`prefill_from_verifier_hidden`): the drafter's
-///    KV cache is seeded from verifier hidden states.
-///
-/// 2. **Per-round `accept_and_reseed`**: after each acceptance walk,
-///    the drafter KV cache and hidden seed are updated.
-///
-/// Reuses the three verifier-side seams: multi-layer hidden capture,
-/// GDN snapshot/restore rollback, and raw embed accessor.
-///
-/// Returns the emitted steps and **the widest block any round of this run
-/// actually ran**. Not the block resolved before the loop: a caller checking
-/// what it asked for against that would be trusting the very step it wanted
-/// checked, and every loop here narrows the block again per round against the
-/// remaining token budget.
-#[allow(clippy::too_many_arguments)]
-#[allow(
-    clippy::expect_used,
-    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
-)]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-)]
-pub fn eagle3_generate(
-    verifier: &Architecture,
-    drafter: &mut Eagle3Drafter,
-    tokenizer: &tokenizers::Tokenizer,
-    prompt_ids: &[u32],
-    n_tokens: usize,
-    requested_block_total: usize,
-    kv_quant_override: Option<KvQuant>,
-    max_ctx_override: Option<i32>,
-    eos_ids: &[u32],
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
-    decided_by: &mut Vec<DecidedBy>,
-    sampler_cfg: &crate::sampler::SamplerConfig,
-    device: Device,
-) -> Result<(Vec<ProbeStep>, usize)> {
-    use std::time::Instant;
-
-    decided_by.clear();
-
-    if prompt_ids.len() < 2 {
-        return Err(Error::Model(
-            "eagle3_generate: prompt must have >=2 tokens".into(),
-        ));
-    }
-    if !verifier.needs_lin_caches() {
-        return Err(Error::Model(
-            "eagle3_generate: EAGLE-3 verifier must be the Qwen3.5/3.6-MoE \
-             hybrid (needs GDN lin_caches + multi-layer hidden capture)"
-                .into(),
-        ));
-    }
-
-    let aux_layer_ids = drafter.cfg.aux_layer_ids.clone();
-    let block_total = crate::speculative::block_capped_by_checkpoint(
-        requested_block_total,
-        drafter.cfg.block_size,
-    );
-
-    let (kv_quant, max_seq, mut v_caches) =
-        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
-    let mut v_lin = lin_cache_stack(verifier);
-
-    // Size the drafter KV cache to the verifier context limit
-    // (max_position_embeddings, capped to KV_MAX_SEQ_DEFAULT, or --max-ctx).
-    // This matches the verifier caches so the drafter cannot overflow before
-    // the verifier does — fixing the prior hardcoded 4096 that crashed once
-    // prompt + emitted tokens exceeded it (zero-length slice_update range in
-    // update_decode_fp16, broadcast-shape panic).
-    drafter.reset(max_seq);
-
-    let mut draw = super::VerifierDraw::new(sampler_cfg);
-    // Whether this request takes the restricted-vocabulary read-back at all. A
-    // sampled one cannot, so every position it emits is decided over the whole
-    // vocabulary.
-    let hot_path = drafter.hot_path_active() && !draw.sampling();
-
-    let mut total_draft = 0usize;
-    let mut total_accept = 0usize;
-    let mut rounds = 0usize;
-    let t_total = Instant::now();
-    let mut window = DecodeWindow::new();
-    let mut draft_ns: u128 = 0;
-    let mut verifier_ns: u128 = 0;
-
-    let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
-
-    // -- Verifier prefill + round-0 bonus + drafter KV prefill. --
-    //
-    // Run the verifier on the full prompt with multi-aux hidden capture,
-    // chunked to stay within the Metal command-buffer budget.
-    // `forward_verify_capture_chunked` splits into windows of PREFILL_CHUNK_SIZE
-    // tokens, runs non-final chunks with `forward_hidden_states_multi` (no logit
-    // materialisation), and runs only the final chunk with `forward_verify_capture`
-    // to obtain last-position logits.
-    //
-    // Returns `(logits[1,1,vocab], hidden[1,n,3H])`:
-    // - `logits` covers only the last prompt position (needed for bonus token).
-    // - `hidden` covers ALL n positions (needed for the drafter KV prefill,
-    // which mirrors mlx-vlm `prefill_from_target_hidden` with no length cutoff).
-    //
-    // For short prompts (n ≤ PREFILL_CHUNK_SIZE) this falls through to a single
-    // forward pass — numerically identical to the pre-path.
-    //
-    // `d_seed_tok`: the drafter's precomputed first draft token for the upcoming
-    // round (mirrors mlx-vlm `_seed_token`). Always `Some` after
-    // `prefill_from_verifier_hidden` and after each `accept_and_reseed`.
-    const PREFILL_CHUNK_SIZE: usize = 1024;
-    let n = prompt_ids.len();
-    tracing::debug!(
-        prompt_len = n,
-        chunk_size = PREFILL_CHUNK_SIZE,
-        "eagle3: verifier prefill (chunked)"
-    );
-    let prefill_t0 = Instant::now();
-    let (bonus_logits, all_hidden) = verifier.forward_verify_capture_chunked(
-        prompt_ids,
-        &aux_layer_ids,
-        &mut v_caches,
-        Some(&mut v_lin),
-        PREFILL_CHUNK_SIZE,
-        // This drafter's own KV prefill conditions on every prompt position, so
-        // no capture row can be released early.
-        None,
-        device,
-    )?;
-    // `bonus_logits` is [1,1,vocab] — the last prompt position only.
-    super::guard_verifier_prefill_logits(verifier, &bonus_logits, prompt_ids.len())?;
-    let bonus = draw.seed_token(&bonus_logits, device)?;
-
-    // Drafter prefill: shifted tokens = prompt[1..] + [bonus].
-    // Conditioned on verifier hidden at positions 0..n-1 (all_hidden).
-    // Mirrors mlx-vlm `prefill_from_target_hidden`:
-    // shifted = concat([input_ids[:, 1:], bonus], axis=1) → n tokens
-    // hidden = hidden[:, :n, :] → [1, n, 3H]
-    let mut shifted: Vec<u32> = Vec::with_capacity(n);
-    shifted.extend_from_slice(&prompt_ids[1..]);
-    shifted.push(bonus);
-    let (h_seed_init, seed_tok_init) =
-        drafter.prefill_from_verifier_hidden(verifier, &shifted, &all_hidden, device)?;
-    tracing::debug!(
-        prompt_len = n,
-        drafter_cache_offset = drafter.cache_offset(),
-        seed_tok = seed_tok_init,
-        "eagle3: drafter KV prefill done"
-    );
-
-    let (mut b, mut h_seed, mut d_seed_tok) = (bonus, h_seed_init, Some(seed_tok_init));
-    // Prefill for this loop is the verifier pass plus the drafter's own KV
-    // prefill that conditions on it.
-    let prefill_ns = prefill_t0.elapsed().as_nanos();
-
-    decided_by.push(DecidedBy::FullVocab);
-    if emit_seed_token(
-        tokenizer,
-        b,
-        step_fn,
-        &mut emitted,
-        &mut window,
-        eos_ids,
-        &RoundTotals {
-            loop_kind: super::SpecLoop::Eagle3,
-            block_size: block_total,
-            conditioned_rows: None,
-            charged: false,
-            // No round ran.
-            rounds: 0,
-            emitted_in_rounds: 0,
-            total_draft: 0,
-            total_accept: 0,
-            prefill_ns,
-            draft_ns: 0,
-            verifier_ns: 0,
-            round_loop_ns: 0,
-            t_total,
-        },
-    ) {
-        return Ok((emitted, block_total));
-    }
-
-    tracing::info!(
-        block_size = block_total,
-        prompt_len = prompt_ids.len(),
-        n_tokens,
-        ?kv_quant,
-        ?aux_layer_ids,
-        draft_vocab_size = drafter.cfg.draft_vocab_size,
-        temperature = sampler_cfg.temperature,
-        // A sampled request cannot take the restricted-vocabulary read-back, so
-        // report whether this one did rather than whether the drafter offers it.
-        hot_path,
-        "eagle3_generate: starting (Qwen3.6-MoE verifier + EAGLE-3 drafter)"
-    );
-
-    let seed_emitted = emitted.len();
-    let mut emitted_in_rounds = 0usize;
-    let mut widest_bs = 0usize;
-    let round_loop_t0 = Instant::now();
-    while emitted.len() < n_tokens {
-        rounds += 1;
-        let remaining = n_tokens - emitted.len();
-        let bs = super::round_block(block_total, remaining);
-        widest_bs = widest_bs.max(bs);
-
-        // Track drafter cache offset before draft_block so accept_and_reseed
-        // knows where to roll back to.
-        let draft_pre_round_offset = drafter.cache_offset();
-
-        // -- Phase A: drafter proposes bs-1 tokens autoregressively. --
-        // Pass the precomputed seed token (from the prior accept_and_reseed /
-        // prefill_from_verifier_hidden) so the correction position is not
-        // re-processed inside draft_block.
-        let t0 = Instant::now();
-        let draft_tokens = drafter.draft_block(verifier, b, &h_seed, d_seed_tok, bs)?;
-        draft_ns += t0.elapsed().as_nanos();
-        if draft_tokens.is_empty() {
-            return Err(Error::Model(format!(
-                "eagle3_generate: the drafter proposed nothing at block {bs}; a block \
-                 of two or more yields block - 1 ids, so an empty chain is a broken \
-                 drafter and not the end of the request"
-            )));
-        }
-        total_draft += draft_tokens.len();
-
-        // -- Phase B: verifier scores [b, draft...] + captures multi-aux hidden. --
-        super::arm_lin_tapes(Some(&mut v_lin));
-        let mut v_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
-        v_input.push(b);
-        v_input.extend_from_slice(&draft_tokens);
-        let v_k = v_input.len();
-
-        // hot-path: restricted-vocab logits for intermediate verifier positions,
-        // full-vocab only at the correction position.
-        //
-        // Mirrors Python `_eagle3_verify_target_hot`:
-        // 1. Run forward pass capturing final-normed hidden at all k positions.
-        // 2. Compute restricted-vocab logits for ALL k positions (draft_vocab=32000
-        // rows vs 248320) via hot_logits_from_final_hidden.
-        // 3. Map argmax → target-vocab ids via hot_ids_host for all k positions.
-        // 4. Find full_pos = first mismatch between draft_tokens and tokens[0..k-2],
-        // defaulting to k-1 (all accepted → correction is the bonus).
-        // 5. Compute full-vocab logits for ONLY the single position full_pos via
-        // logits_from_hidden on a sliced hidden — never materialise [1,k,vocab].
-        // 6. Replace tokens[full_pos] with the full-vocab correction token.
-        //
-        // This reduces logit materialisation by ~7.8× for accepted positions.
-        //
-        // A sampled request cannot use it. The restricted row is a logit vector
-        // over the drafter's 32000-id vocabulary, and a distribution needs the
-        // normalising constant of the whole row: softmaxing the subset spreads
-        // the missing mass over the ids that survived, and top-p and top-k then
-        // cut a different set than they would have. An argmax is indifferent to
-        // all of that, which is why the reduction is sound at temperature 0 and
-        // only there. Sampled requests pay the full-vocabulary projection at
-        // every verified position.
-        let t0 = Instant::now();
-        let (v_tokens, v_hidden) = if hot_path {
-            let (v_hidden, v_final_hidden) = verifier.forward_verify_capture_hot(
-                &v_input,
-                v_k,
-                &aux_layer_ids,
-                &mut v_caches,
-                Some(&mut v_lin),
-                device,
-            )?;
-            let hot_ids_arr = drafter
-                .hot_ids_arr()
-                .expect("hot_path_active but no hot_ids_arr");
-            let hot_ids_host = drafter.hot_ids_host();
-            let hidden_sz = drafter.hidden_size() as i32;
-
-            // Step 2-3: restricted logits for all k positions → target-vocab tokens.
-            let hot_logits =
-                verifier.hot_logits_from_final_hidden(&v_final_hidden, hot_ids_arr, device)?;
-            let hot_am = argmax(&hot_logits, -1, device)?;
-            hot_am.eval()?;
-            let hot_bytes = hot_am.to_bytes()?;
-            // Restricted vocabulary: the argmax is an index into `hot_ids`, not
-            // a token id, but the read-back is the same device buffer and the
-            // same guard applies to it.
-            let mut tokens: Vec<u32> = super::argmax_tokens(&hot_bytes, v_k)?
-                .into_iter()
-                .map(|draft_idx| {
-                    let draft_idx = draft_idx as usize;
-                    hot_ids_host
-                        .get(draft_idx)
-                        .copied()
-                        .unwrap_or(draft_idx as u32)
-                })
-                .collect();
-
-            // Step 4: find full_pos = first mismatch draft_tokens[i] vs tokens[i],
-            // for i in 0..k-1 (draft positions). Default to k-1 (all accepted).
-            let n_draft = v_k - 1; // = draft_tokens.len()
-            let full_pos = find_full_pos(&draft_tokens, &tokens[..n_draft]);
-
-            // Step 5-6: full-vocab token at full_pos, replace tokens[full_pos].
-            let h_corr = v_final_hidden.slice(
-                &[0, full_pos as i32, 0],
-                &[1, full_pos as i32 + 1, hidden_sz],
-                &[1, 1, 1],
-                device,
-            )?;
-            // `v_final_hidden` is final-normed by `forward_verify_capture_hot`.
-            let corr_logits = verifier.logits_from_final_hidden(&h_corr, device)?;
-            let corr_am = argmax(&corr_logits, -1, device)?;
-            corr_am.eval()?;
-            let corr_bytes = corr_am.to_bytes()?;
-            tokens[full_pos] = u32::from_le_bytes(corr_bytes[..4].try_into().unwrap());
-
-            verifier_ns += t0.elapsed().as_nanos();
-            (tokens, v_hidden)
-        } else {
-            let (v_logits, v_hidden) = verifier.forward_verify_capture(
-                &v_input,
-                v_k,
-                &aux_layer_ids,
-                &mut v_caches,
-                Some(&mut v_lin),
-                device,
-            )?;
-            let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
-            verifier_ns += t0.elapsed().as_nanos();
-            (v_tokens, v_hidden)
-        };
-
-        // -- Phase C: greedy acceptance walk. --
-        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
-        total_accept += accept;
-
-        // Per-step trace: enable with RUST_LOG=rmlx_models::speculative::eagle3=trace.
-        if step_trace_enabled() {
-            let running_ar = if total_draft > 0 {
-                (total_accept as f64) / (total_draft as f64)
-            } else {
-                0.0
-            };
-            for (i, (&dt, &vt)) in draft_tokens.iter().zip(v_tokens.iter()).enumerate() {
-                tracing::trace!(
-                    target: STEP_TARGET,
-                    round = rounds,
-                    step = i,
-                    draft_tok = dt,
-                    verifier_tok = vt,
-                    accepted = i < accept,
-                    cumulative_accept_rate = running_ar,
-                    carry_tok = b,
-                    seed_tok = ?d_seed_tok,
-                    "eagle3 step"
-                );
-            }
-        }
-
-        // -- Emit accepted prefix + 1 correction/bonus. --
-        // `new_tokens[..accept]` are the draft's own tokens, which the
-        // restricted argmax confirmed; `new_tokens[accept]` is the correction,
-        // taken over the whole vocabulary.
-        let restricted = if hot_path { accept } else { 0 };
-        let emit = emit_round_tokens(
-            tokenizer,
-            &new_tokens,
-            n_tokens,
-            eos_ids,
-            step_fn,
-            &mut emitted,
-            &mut emitted_in_rounds,
-            &mut window,
-            Some((&mut *decided_by, restricted)),
-        );
-        if emit.hit_eos {
-            break;
-        }
-        let n_committed = emit.committed;
-
-        // -- Phase D: roll back verifier KV/GDN caches on partial accept. --
-        // The verifier consumed v_k positions; keep the committed prefix
-        // (pre-round + accept + 1 carry rows). Roll FA KV caches back and refold
-        // the GDN recurrence over the kept prefix.
-        let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
-        let v_target =
-            super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-        let refolded = rollback_round(
-            &mut v_caches,
-            Some(&mut v_lin),
-            &v_input,
-            v_offset_before - v_k as i32,
-            v_target,
-            // This loop times no phases, so it never charges one.
-            false,
-            device,
-        )?;
-
-        // -- Phase E: drafter accept-and-reseed. --
-        //
-        // (a) Roll drafter KV cache back to pre-round offset.
-        // (b) Re-run drafter forward on accepted draft prefix + correction,
-        // conditioned on the verifier's 3-aux hiddens at those positions.
-        // (c) Sample the drafter's next-token prediction from the correction
-        // position hidden → `d_seed_tok` (mirrors mlx-vlm `_seed_token`).
-        // (d) Pass `d_seed_tok` to the next `draft_block` as `precomputed_first_tok`
-        // so the correction position is NOT re-processed a second time.
-        //
-        // `v_input` = [b, draft[0], ..., draft[num_draft-1]].
-        // `v_hidden` = [1, v_k, 3H] — verifier hidden for those positions.
-        // `accept_and_reseed` tokens: draft[0..accepted] + correction.
-        // Hiddens: v_hidden[:, 0..=accepted, :].
-        let correction = *new_tokens.last().unwrap_or(&b);
-        let (new_h_seed, seed_tok) = drafter.accept_and_reseed(
-            verifier,
-            draft_pre_round_offset,
-            &draft_tokens,
-            correction,
-            &v_hidden,
-            accept,
-            device,
-        )?;
-        h_seed = new_h_seed;
-        d_seed_tok = Some(seed_tok);
-        b = correction;
-
-        super::log_round(
-            &super::RoundReport {
-                loop_kind: super::SpecLoop::Eagle3,
-                round: rounds,
-                accept,
-                num_draft: draft_tokens.len(),
-                n_committed,
-                emitted_total: emitted.len(),
-                condition_rows: None,
-                projected_rows: None,
-                v_offset_before,
-                v_target,
-                d_offset_before: Some(draft_pre_round_offset),
-                d_target: Some(drafter.cache_offset()),
-                refolded,
-                // This loop times no phases, so it never charges one.
-                charged: false,
-                phases: None,
-            },
-            &[],
-        );
-    }
-
-    let round_loop_ns = round_loop_t0.elapsed().as_nanos();
-    log_request_record(
-        &RoundTotals {
-            loop_kind: super::SpecLoop::Eagle3,
-            block_size: block_total,
-            conditioned_rows: None,
-            charged: false,
-            rounds,
-            emitted_in_rounds,
-            total_draft,
-            total_accept,
-            prefill_ns,
-            draft_ns,
-            verifier_ns,
-            round_loop_ns,
-            t_total,
-        },
-        &emitted,
-        seed_emitted,
-        &window,
-    );
-
-    report_verifier_kv_bytes(verifier, &v_caches, Some(&v_lin));
-    Ok((emitted, widest_bs))
 }
 
 // ---------------------------------------------------------------------------

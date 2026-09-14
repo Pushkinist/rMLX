@@ -8,7 +8,10 @@
 #
 #   scripts/spec_broken_engine.sh <engine> <test-name>
 #
-# Engines, all on the EAGLE-3 round loop:
+# Engines. Each names the file it edits, because the two no longer live in one
+# place: the restricted read-back is the EAGLE-3 drafter's and the verifier's
+# rollback is the shared round loop's, which every migrated drafter runs on —
+# so the second edit reaches whichever pair the named test drives.
 #
 #   shipped              the tree as it stands, no edit
 #   correction-restricted  the round's correction left on the drafter's
@@ -26,38 +29,46 @@
 # verified by digest, so a failed or interrupted run cannot leave the tree
 # mutated.
 #
+# `<test-name>` is a substring filter, and the rollback edit is in the loop five
+# pairs run on, so name one pair exactly — a prefix that selects two runs the
+# second one against a broken engine it was not measured for.
+#
 # Environment: RMLX_O_MODELS_ROOT and RMLX_DRAFT_TEST_MODEL, as the gate itself
 # documents. No GPU work happens here that the gate would not do on its own.
 set -uo pipefail
 
 readonly ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-readonly TARGET="$ROOT/crates/rmlx-models/src/speculative/eagle3/mod.rs"
+readonly SPEC="$ROOT/crates/rmlx-models/src/speculative"
 
 engine="${1:-}"
 test_name="${2:-}"
 if [[ -z "$engine" || -z "$test_name" ]]; then
-    sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
     exit 2
 fi
 
 case "$engine" in
 shipped)
+    TARGET="$SPEC/eagle3/round.rs"
     find=""
     replace=""
     ;;
 correction-restricted)
-    find='            tokens[full_pos] = u32::from_le_bytes(corr_bytes[..4].try_into().unwrap());'
-    replace='            let _ = &corr_bytes;'
+    TARGET="$SPEC/eagle3/round.rs"
+    find='        tokens[full_pos] = correction;'
+    replace='        let _ = correction;'
     ;;
 rejected-draft-kept)
-    find='        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);'
-    replace='        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32) + 1;'
+    TARGET="$SPEC/round_loop.rs"
+    find='        let v_target = super::rollback_target_from_head(pre_round_offset, verdict.accept);'
+    replace='        let v_target = super::rollback_target_from_head(pre_round_offset, verdict.accept) + 1;'
     ;;
 *)
     echo "unknown engine: $engine" >&2
     exit 2
     ;;
 esac
+readonly TARGET
 
 snapshot=""
 restore() {

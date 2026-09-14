@@ -821,6 +821,8 @@ impl RoundDrafter for AssistantRound<'_> {
         Ok(Prefilled {
             seed,
             prefill_ns,
+            // It scores every position over the verifier's whole vocabulary.
+            restricted_read_back: false,
             // It reads the verifier's K/V and carries no conditioning buffer
             // of its own, so it projects nothing and accumulates nothing.
             projects_conditioning: false,
@@ -869,6 +871,7 @@ impl RoundDrafter for AssistantRound<'_> {
             commit,
             verify_ns,
             walk_ns,
+            restricted: 0,
         })
     }
 
@@ -1022,6 +1025,9 @@ pub fn mtp_assistant_generate(
             kv_quant_override,
             max_ctx_override,
         },
+        // This drafter's verify pass scores every position over the verifier's
+        // whole vocabulary, so its tokens need no per-token attribution.
+        None,
         device,
     )
 }
