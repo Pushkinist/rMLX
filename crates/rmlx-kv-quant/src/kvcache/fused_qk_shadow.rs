@@ -139,7 +139,7 @@ impl FusedQkLayout {
                     n_groups: 0,
                 }
             }
-            // Rotor-asym 3 / 4: codes = ceil(head_dim/3) u32, scales =
+            // Rotor-asym 3 / 4: codes = the row's dense code plane, scales =
             // ceil(head_dim/3) f32, 1 norm per token, plus a static
             // `[n_groups * 4]` rotor table broadcast across tokens.
             //
@@ -155,8 +155,9 @@ impl FusedQkLayout {
                     )));
                 }
                 let n_groups = n_groups_usize as i32;
+                let code_words = crate::rotorquant::row_words_for(hd, 3) as i32;
                 Self {
-                    codes_per_token: n_groups,
+                    codes_per_token: code_words,
                     scales_per_token: n_groups,
                     has_norm: true,
                     has_rotor_table: true,
@@ -171,8 +172,9 @@ impl FusedQkLayout {
                     )));
                 }
                 let n_groups = n_groups_usize as i32;
+                let code_words = crate::rotorquant::row_words_for(hd, 4) as i32;
                 Self {
-                    codes_per_token: n_groups,
+                    codes_per_token: code_words,
                     scales_per_token: n_groups,
                     has_norm: true,
                     has_rotor_table: true,

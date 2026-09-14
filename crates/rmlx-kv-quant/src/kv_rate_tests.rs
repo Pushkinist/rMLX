@@ -127,7 +127,13 @@ fn measure_planar(data: &[f32], bits: u8) -> u64 {
 /// constant is the thing that goes stale when a plane's stored width changes,
 /// and a stored-rate gate that restates it is measuring its own arithmetic.
 /// `max_seq == rows` keeps the page-rounding out of the figure.
-fn ring_bytes(codes: &[u32], scales: &[f32], norms: &[f32], n_groups: usize) -> u64 {
+fn ring_bytes(
+    codes: &[u32],
+    scales: &[f32],
+    norms: &[f32],
+    n_groups: usize,
+    code_words: usize,
+) -> u64 {
     let mut ring = QuantKGpuRing::default();
     ring.seed_from_cpu(
         codes,
@@ -135,6 +141,7 @@ fn ring_bytes(codes: &[u32], scales: &[f32], norms: &[f32], n_groups: usize) -> 
         norms,
         1,
         n_groups as i32,
+        code_words as i32,
         ROWS as i32,
         ROWS as i32,
         Device::Cpu,
@@ -150,7 +157,13 @@ fn ring_bytes(codes: &[u32], scales: &[f32], norms: &[f32], n_groups: usize) -> 
 fn measure_iso(data: &[f32], bits: u8) -> u64 {
     let (codes, scales, _quats, norms) =
         iso_encode_fast(data, HEAD_DIM, 4, bits).expect("iso_encode_fast");
-    ring_bytes(&codes, &scales, &norms, HEAD_DIM / 4)
+    ring_bytes(
+        &codes,
+        &scales,
+        &norms,
+        HEAD_DIM / 4,
+        crate::code_plane::row_words(HEAD_DIM, bits),
+    )
 }
 
 /// The TurboQuant family entry for a `bits`-wide V axis.
@@ -170,17 +183,22 @@ fn measure_rotor(data: &[f32], bits: u8) -> u64 {
     } else {
         rotor4_encode(data, &rotors, HEAD_DIM).expect("rotor4_encode")
     };
-    ring_bytes(&codes, &scales, &norms, n_groups_for(HEAD_DIM))
+    ring_bytes(
+        &codes,
+        &scales,
+        &norms,
+        n_groups_for(HEAD_DIM),
+        crate::rotorquant::row_words_for(HEAD_DIM, bits),
+    )
 }
 
 /// Every store family a shipped `KvQuant` variant can put an axis into.
 ///
-/// The remaining exemptions are what is left of the four families the
-/// accounting was written to surface. All of them spend one whole `u32` code
-/// word per group — 4 head-dim slots for iso, 3 for rotor, 32 for planar — so
-/// the nominal 3-bit and 4-bit member of each occupies byte-identical storage.
-/// Iso has since come under the floor on a sideband change; rotor and planar
-/// have not, and their code and scale cadences are why.
+/// The remaining exemptions are the planar pair. Planar spends one `f32` scale
+/// per *pair* of values and two rotation words per 32-element group, so its
+/// 3-bit and 4-bit members occupy byte-identical storage and neither reaches
+/// the floor — a scale cadence, not a code one. Iso and rotor cleared the floor
+/// when their code plane became dense across a row's groups.
 const FAMILIES: &[Family] = &[
     Family {
         name: "bf16",
@@ -244,9 +262,6 @@ const FAMILIES: &[Family] = &[
         verdict: Verdict::Exempt("same layout as planar3 — byte-identical at every head_dim"),
     },
     Family {
-        // Was exempt at 16.25 while the ring's scale and norm planes were f32.
-        // They are the sideband dtype now, which is what took iso under the
-        // floor — the code cadence did not change.
         name: "iso3",
         rate: Rate::Measured(|d| measure_iso(d, 3)),
         verdict: Verdict::UnderBf16,
@@ -259,19 +274,12 @@ const FAMILIES: &[Family] = &[
     Family {
         name: "rotor3",
         rate: Rate::Measured(|d| measure_rotor(d, 3)),
-        verdict: Verdict::Exempt(
-            "fidelity experiment, not a compression format: one u32 code word per 3-element \
-             group is 10.67 bits per value before any sideband, and five of the eight codes \
-             in each word are structurally zero (see crate::clifford). Narrowing the scale \
-             and norm planes to the stored sideband dtype cut this family from 21.75 to \
-             16.25 bits per value — a 25% saving that still does not reach bf16, because a \
-             sideband change cannot fix a code cadence",
-        ),
+        verdict: Verdict::UnderBf16,
     },
     Family {
         name: "rotor4",
         rate: Rate::Measured(|d| measure_rotor(d, 4)),
-        verdict: Verdict::Exempt("same layout as rotor3 — byte-identical at every head_dim"),
+        verdict: Verdict::UnderBf16,
     },
 ];
 
@@ -367,17 +375,17 @@ fn the_floor_rejects_a_store_that_grew_past_bf16() {
     );
 
     // And the predicate reads real encoder bytes, not a constant: turbo4 passes
-    // it and rotor3 does not, on the same fixture.
+    // it and planar3 does not, on the same fixture.
     let turbo = family_rate(family("turbo4"), &data);
-    let rotor = family_rate(family("rotor3"), &data);
+    let planar = family_rate(family("planar3"), &data);
     assert!(
         turbo <= BF16_BITS_PER_VALUE,
         "turbo4 measured {turbo:.2} bits per value — above the floor, so the gate's pass \
          side is not exercised by anything"
     );
     assert!(
-        rotor > BF16_BITS_PER_VALUE,
-        "rotor3 measured {rotor:.2} bits per value — at or below the floor, so the gate's \
+        planar > BF16_BITS_PER_VALUE,
+        "planar3 measured {planar:.2} bits per value — at or below the floor, so the gate's \
          fail side is not exercised by anything"
     );
 }
@@ -406,6 +414,7 @@ fn rotor_rate_splits_into_documented_code_scale_and_norm_bits() {
         &norms,
         1,
         n_groups as i32,
+        crate::rotorquant::row_words_for(HEAD_DIM, 3) as i32,
         ROWS as i32,
         ROWS as i32,
         Device::Cpu,
@@ -423,13 +432,13 @@ fn rotor_rate_splits_into_documented_code_scale_and_norm_bits() {
          norms {norm_bits:.2} = {total:.2} bits/value"
     );
 
-    // 43 groups per row of 128 values: 43 * 32 / 128 = 10.75 for the u32 codes
-    // and 43 * 16 / 128 = 5.375 for the bf16 scales; one bf16 norm per row is
-    // 16 / 128 = 0.125.
-    assert!((code_bits - 10.75).abs() < 1e-9, "code rate {code_bits}");
+    // 43 groups per row of 128 values, three codes each: ceil(129 * 3 / 32) =
+    // 13 u32 per row is 13 * 32 / 128 = 3.25 for the codes, 43 * 16 / 128 =
+    // 5.375 for the bf16 scales, and one bf16 norm per row is 16 / 128 = 0.125.
+    assert!((code_bits - 3.25).abs() < 1e-9, "code rate {code_bits}");
     assert!((scale_bits - 5.375).abs() < 1e-9, "scale rate {scale_bits}");
     assert!((norm_bits - 0.125).abs() < 1e-9, "norm rate {norm_bits}");
-    assert!((total - 16.25).abs() < 1e-9, "total rate {total}");
+    assert!((total - 8.75).abs() < 1e-9, "total rate {total}");
 
     // Two further assertions used to stand here — that the codes dominate the
     // sideband, and that the total clears the bf16 floor — with comments saying

@@ -27,14 +27,17 @@
 //! Buffers are flat and **sequence-major** — the canonical flat-KV layout in
 //! this crate. For a token at sequence position `s` and KV head `h`:
 //!
-//! * `codes[(s * kv_h + h) * n_groups + g]`  (1 u32 per group; what a group
-//!   spans is the codec's business — 8 Cl(3,0) multivector components for
-//!   rotor, one 4-element quaternion block for iso)
+//! * `codes[(s * kv_h + h) * code_words ..]`  (the row's dense code plane —
+//!   see [`crate::code_plane`]; how many codes a group contributes is the
+//!   codec's business, three grade-1 components for rotor and one 4-element
+//!   quaternion block for iso)
 //! * `scales[(s * kv_h + h) * n_groups + g]` (1 bf16 per group)
 //! * `norms[s * kv_h + h]`                   (1 bf16 per token)
 //!
-//! One sequence position therefore occupies `kv_h * n_groups` code words and
-//! `kv_h` norms, which is what lets an append land at a fixed per-step stride.
+//! One sequence position therefore occupies `kv_h * code_words` code words,
+//! `kv_h * n_groups` scales and `kv_h` norms, which is what lets an append land
+//! at a fixed per-step stride. The code plane and the scale plane have their own
+//! strides because a dense plane no longer holds one word per group.
 //!
 //! # Batch
 //!
@@ -53,24 +56,25 @@ use super::KV_PAGE_SIZE;
 /// A scale and an L2 norm are both a single positive magnitude reconstructed
 /// straight into a `float` accumulator by the decode kernels, so bf16's 8
 /// mantissa bits are the whole of what a consumer can use — an `f32` plane
-/// spends 16 bits per element that no reader reads. At `head_dim = 128` the
-/// two planes were 8.25 of iso's then-16.25 stored bits per value and 11.0 of
-/// rotor's then-21.75; halving them takes iso to 12.125 — under bf16 — and
-/// rotor to 16.25, which is still above it because a sideband change cannot
-/// fix a code cadence. [`ring_bits_per_value`] is where those figures come
-/// from.
+/// spends 16 bits per element that no reader reads. At `head_dim = 128` the two
+/// planes are 4.125 of iso3's 7.125 stored bits per value and 5.500 of rotor3's
+/// 8.750: past the dense code plane the sideband is the dominant term, and
+/// halving it again would need a scale cadence change, not a width change.
+/// [`ring_bits_per_value`] is where those figures come from.
 ///
 /// Single producer on purpose: `alloc`, `grow`, the upload path and every
 /// consumer that asserts a ring dtype read it from here, so the stored format
 /// cannot drift between the allocation and the reader.
 pub const KV_SIDEBAND_DTYPE: Dtype = Dtype::Bf16;
 
-/// Stored bits per input value for a ring holding `n_groups` code words per
-/// row of `head_dim` values.
+/// Stored bits per input value for a ring holding `code_words` code words and
+/// `n_groups` scales per row of `head_dim` values.
 ///
-/// One `u32` code word and one [`KV_SIDEBAND_DTYPE`] scale per group, plus one
-/// [`KV_SIDEBAND_DTYPE`] norm per row. `n_groups` is the codec's business —
-/// `head_dim / 4` for iso, `ceil(head_dim / 3)` for rotor.
+/// The row's dense code plane, one [`KV_SIDEBAND_DTYPE`] scale per group, plus
+/// one [`KV_SIDEBAND_DTYPE`] norm per row. Both counts are the codec's business
+/// — `n_groups` is `head_dim / 4` for iso and `ceil(head_dim / 3)` for rotor,
+/// and `code_words` is what [`crate::code_plane::row_words`] gives for that
+/// codec's codes at its width.
 ///
 /// This is the single producer of every ring rate figure the tree quotes: the
 /// operator's `--kv-quant` listing prints it rather than restating literals,
@@ -78,9 +82,9 @@ pub const KV_SIDEBAND_DTYPE: Dtype = Dtype::Bf16;
 /// sideband-width change therefore moves the printed figure, the measured one,
 /// and the check between them together.
 #[must_use]
-pub fn ring_bits_per_value(head_dim: u64, n_groups: u64) -> f64 {
+pub fn ring_bits_per_value(head_dim: u64, n_groups: u64, code_words: u64) -> f64 {
     let side = KV_SIDEBAND_DTYPE.itemsize() as u64;
-    let bytes_per_row = n_groups * (4 + side) + side;
+    let bytes_per_row = code_words * 4 + n_groups * side + side;
     (bytes_per_row * 8) as f64 / head_dim as f64
 }
 
@@ -146,8 +150,10 @@ pub struct QuantKGpuRing {
     pub scales: Option<Array>,
     /// Per-token L2 norms, flat [`KV_SIDEBAND_DTYPE`] `[capacity * kv_h]`.
     pub norms: Option<Array>,
-    /// Code words / scales per sequence position (`kv_h * n_groups`).
+    /// Code plane words per sequence position (`kv_h * code_words`).
     pub codes_per_step: i32,
+    /// Scales per sequence position (`kv_h * n_groups`).
+    pub scales_per_step: i32,
     /// Norms per sequence position (`kv_h`).
     pub norms_per_step: i32,
     /// Sequence positions the buffers are currently sized for.
@@ -196,6 +202,7 @@ impl QuantKGpuRing {
             norms,
             // Bookkeeping about the buffers above, not allocations of their own.
             codes_per_step: _,
+            scales_per_step: _,
             norms_per_step: _,
             capacity: _,
             filled: _,
@@ -210,14 +217,15 @@ impl QuantKGpuRing {
     /// `codes` / `scales` / `norms` are the GPU outputs of the codec's encode
     /// kernel for a **sequence-major** chunk of `new_seq` positions.
     ///
-    /// `n_groups` is the codec's per-token group count — passed in rather than
-    /// derived, so the ring stays codec-agnostic (rotor's `ceil(head_dim / 3)`
-    /// and iso's `head_dim / 4` are both just an integer here).
+    /// `n_groups` is the codec's per-token group count and `code_words` the
+    /// words its dense code plane holds per row — both passed in rather than
+    /// derived, so the ring stays codec-agnostic.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Quant`] on a shape-contract violation and [`Error::Mlx`]
     /// on an MLX allocation / slice failure.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_encoded(
         &mut self,
         codes: &Array,
@@ -225,30 +233,36 @@ impl QuantKGpuRing {
         norms: &Array,
         kv_h: i32,
         n_groups: i32,
+        code_words: i32,
         prev_seq: i32,
         new_seq: i32,
         max_seq: i32,
         device: Device,
     ) -> Result<()> {
-        if kv_h <= 0 || n_groups <= 0 || new_seq <= 0 || prev_seq < 0 {
+        if kv_h <= 0 || n_groups <= 0 || code_words <= 0 || new_seq <= 0 || prev_seq < 0 {
             return Err(Error::Quant(format!(
                 "QuantKGpuRing::append_encoded: bad shape kv_h={kv_h}, n_groups={n_groups}, \
-                 prev_seq={prev_seq}, new_seq={new_seq}"
+                 code_words={code_words}, prev_seq={prev_seq}, new_seq={new_seq}"
             )));
         }
-        let codes_per_step = kv_h * n_groups;
+        let codes_per_step = kv_h * code_words;
+        let scales_per_step = kv_h * n_groups;
         let norms_per_step = kv_h;
 
         if self.is_allocated()
-            && (self.codes_per_step != codes_per_step || self.norms_per_step != norms_per_step)
+            && (self.codes_per_step != codes_per_step
+                || self.scales_per_step != scales_per_step
+                || self.norms_per_step != norms_per_step)
         {
             return Err(Error::Quant(format!(
                 "QuantKGpuRing::append_encoded: stride changed under a live ring \
-                 (codes {} -> {codes_per_step}, norms {} -> {norms_per_step})",
-                self.codes_per_step, self.norms_per_step
+                 (codes {} -> {codes_per_step}, scales {} -> {scales_per_step}, \
+                 norms {} -> {norms_per_step})",
+                self.codes_per_step, self.scales_per_step, self.norms_per_step
             )));
         }
         self.codes_per_step = codes_per_step;
+        self.scales_per_step = scales_per_step;
         self.norms_per_step = norms_per_step;
 
         let needed = prev_seq
@@ -302,13 +316,17 @@ impl QuantKGpuRing {
             self.grow(cap, prev_seq, device)?;
         }
 
-        let (cps, nps) = (self.codes_per_step, self.norms_per_step);
+        let (cps, sps, nps) = (
+            self.codes_per_step,
+            self.scales_per_step,
+            self.norms_per_step,
+        );
         write_range(&mut self.codes, codes, prev_seq * cps, needed * cps, device)?;
         write_range(
             &mut self.scales,
             scales,
-            prev_seq * cps,
-            needed * cps,
+            prev_seq * sps,
+            needed * sps,
             device,
         )?;
         write_range(&mut self.norms, norms, prev_seq * nps, needed * nps, device)?;
@@ -342,6 +360,7 @@ impl QuantKGpuRing {
         norms: &[f32],
         kv_h: i32,
         n_groups: i32,
+        code_words: i32,
         filled_seq: i32,
         max_seq: i32,
         device: Device,
@@ -349,24 +368,26 @@ impl QuantKGpuRing {
         if self.is_allocated() {
             return Ok(());
         }
-        if kv_h <= 0 || n_groups <= 0 || filled_seq <= 0 {
+        if kv_h <= 0 || n_groups <= 0 || code_words <= 0 || filled_seq <= 0 {
             return Err(Error::Quant(format!(
                 "QuantKGpuRing::seed_from_cpu: bad shape kv_h={kv_h}, n_groups={n_groups}, \
-                 filled_seq={filled_seq}"
+                 code_words={code_words}, filled_seq={filled_seq}"
             )));
         }
-        self.codes_per_step = kv_h * n_groups;
+        self.codes_per_step = kv_h * code_words;
+        self.scales_per_step = kv_h * n_groups;
         self.norms_per_step = kv_h;
 
         let want_codes = i64::from(filled_seq) * i64::from(self.codes_per_step);
+        let want_scales = i64::from(filled_seq) * i64::from(self.scales_per_step);
         let want_norms = i64::from(filled_seq) * i64::from(self.norms_per_step);
         if codes.len() as i64 != want_codes
-            || scales.len() as i64 != want_codes
+            || scales.len() as i64 != want_scales
             || norms.len() as i64 != want_norms
         {
             return Err(Error::Quant(format!(
                 "QuantKGpuRing::seed_from_cpu: CPU prefix length mismatch at filled_seq={filled_seq} \
-                 (codes {} want {want_codes}, scales {} want {want_codes}, norms {} want \
+                 (codes {} want {want_codes}, scales {} want {want_scales}, norms {} want \
                  {want_norms})",
                 codes.len(),
                 scales.len(),
@@ -386,9 +407,13 @@ impl QuantKGpuRing {
         let scales_arr = f32_slice_to_sideband_array(scales, device)?;
         let norms_arr = f32_slice_to_sideband_array(norms, device)?;
 
-        let (cps, nps) = (self.codes_per_step, self.norms_per_step);
+        let (cps, sps, nps) = (
+            self.codes_per_step,
+            self.scales_per_step,
+            self.norms_per_step,
+        );
         write_range(&mut self.codes, &codes_arr, 0, filled_seq * cps, device)?;
-        write_range(&mut self.scales, &scales_arr, 0, filled_seq * cps, device)?;
+        write_range(&mut self.scales, &scales_arr, 0, filled_seq * sps, device)?;
         write_range(&mut self.norms, &norms_arr, 0, filled_seq * nps, device)?;
         self.filled = filled_seq;
         tracing::debug!(
@@ -438,9 +463,10 @@ impl QuantKGpuRing {
             )));
         }
         let cps = self.codes_per_step;
+        let sps = self.scales_per_step;
         let nps = self.norms_per_step;
         let codes = slice_prefix(self.codes.as_ref(), kv_seq * cps, "codes", device)?;
-        let scales = slice_prefix(self.scales.as_ref(), kv_seq * cps, "scales", device)?;
+        let scales = slice_prefix(self.scales.as_ref(), kv_seq * sps, "scales", device)?;
         let norms = slice_prefix(self.norms.as_ref(), kv_seq * nps, "norms", device)?;
         Ok(Some((codes, scales, norms)))
     }
@@ -482,18 +508,20 @@ impl QuantKGpuRing {
 
     fn alloc(&mut self, cap: i32, device: Device) -> Result<()> {
         let cps = self.codes_per_step;
+        let sps = self.scales_per_step;
         let nps = self.norms_per_step;
         self.codes = Some(zeros(&[cap * cps], Dtype::U32, device)?);
-        self.scales = Some(zeros(&[cap * cps], KV_SIDEBAND_DTYPE, device)?);
+        self.scales = Some(zeros(&[cap * sps], KV_SIDEBAND_DTYPE, device)?);
         self.norms = Some(zeros(&[cap * nps], KV_SIDEBAND_DTYPE, device)?);
         self.capacity = cap;
-        tracing::debug!(cap, cps, nps, "QuantKGpuRing: ring allocated");
+        tracing::debug!(cap, cps, sps, nps, "QuantKGpuRing: ring allocated");
         Ok(())
     }
 
     /// Reallocate to `cap` positions, copying the `prev_seq` filled prefix.
     fn grow(&mut self, cap: i32, prev_seq: i32, device: Device) -> Result<()> {
         let cps = self.codes_per_step;
+        let sps = self.scales_per_step;
         let nps = self.norms_per_step;
         let old_capacity = self.capacity;
         self.codes = Some(regrow(
@@ -506,8 +534,8 @@ impl QuantKGpuRing {
         )?);
         self.scales = Some(regrow(
             self.scales.take(),
-            cap * cps,
-            prev_seq * cps,
+            cap * sps,
+            prev_seq * sps,
             KV_SIDEBAND_DTYPE,
             "scales",
             device,

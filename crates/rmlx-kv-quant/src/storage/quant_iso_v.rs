@@ -39,9 +39,9 @@ pub const ISO3_GROUP_SIZE: usize = 4;
 /// path lands in T11d.
 #[derive(Debug, Clone)]
 pub struct IsoBlocks {
-    /// Packed `bits`-bit codes; layout determined by the owning `QuantIsoV*`
-    /// struct. Length per token = `n_groups * ceil(group_size / vals_per_word(bits))` u32s
-    /// where `vals_per_word(bits) = 32 / bits`.
+    /// The row's dense code plane (see [`crate::code_plane`]): `bits` per code,
+    /// four codes per quaternion group, packed across the row's groups.
+    /// Length per token = `iso_row_words(head_dim, bits)` u32s.
     pub codes: Vec<u32>,
     /// Per-group scale (one f32 per `(token, group)`).
     pub scales: Vec<f32>,
@@ -142,7 +142,7 @@ pub struct QuantIsoV3 {
     // `append_gpu` / `dequant_gpu` / `byte_size` / `try_deep_clone` /
     // `truncate_to` / `reset`.
     /// Pre-allocated u32 codes buffer on GPU. Length
-    /// `B * kv_h * max_seq * n_groups * WORDS_PER_GROUP`. Quaternion buffer is
+    /// `B * kv_h * max_seq * iso_row_words(head_dim, bits)`. Quaternion buffer is
     /// omitted on purpose — every group uses the same [`FIXED_QUAT`] constant
     /// (the `iso_dequantize_v3_gpu` kernel never reads it; see kernel source
     /// in `isoquant_msl.rs`). `None` until first GPU `append_gpu` call, or
@@ -398,7 +398,8 @@ impl QuantIsoV3 {
     /// `shape[2]`, or a ring-only tail exists but the ring is absent / too short).
     pub fn try_deep_clone(&self) -> Result<Self> {
         let blocks =
-            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, Device::Gpu)?.into_owned();
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, Device::Gpu)?
+                .into_owned();
         Ok(Self {
             // The clone starts CPU-only: `blocks` carries the full payload, so
             // the ring re-seeds from them on the clone's first GPU append.
@@ -502,13 +503,16 @@ impl QuantIsoV3 {
                 "QuantIsoV3::gpu_append: head_dim={head_dim} yields no quaternion groups"
             )));
         }
+        let code_words =
+            crate::storage::iso_code_words_i32(head_dim, ISO3_BITS, "QuantIsoV3::gpu_append")?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
-            self.gpu
-                .seed_from_cpu(&c, &s, &n, kv_h, n_groups, prev_seq, max_seq, device)?;
+            self.gpu.seed_from_cpu(
+                &c, &s, &n, kv_h, n_groups, code_words, prev_seq, max_seq, device,
+            )?;
         }
         self.gpu.append_encoded(
-            codes, scales, norms, kv_h, n_groups, prev_seq, new_seq, max_seq, device,
+            codes, scales, norms, kv_h, n_groups, code_words, prev_seq, new_seq, max_seq, device,
         )
     }
 
@@ -545,7 +549,7 @@ impl QuantIsoV3 {
             return Ok(());
         }
         if let std::borrow::Cow::Owned(full) =
-            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?
+            synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, device)?
         {
             self.blocks = full;
         }
@@ -644,7 +648,7 @@ impl QuantIsoV3 {
         // `shape[2]`), and this rebuilds it on demand rather than decoding a
         // short prefix and zero-padding the gap. Loud on any unrecoverable
         // disagreement.
-        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, device)?;
 
         if blocks.is_empty() {
             // Empty blocks are valid only when the store genuinely holds no
@@ -834,8 +838,12 @@ impl QuantIsoV3 {
         // shape is fixed at first encode). Derive once, then reuse.
         let words_per_step = b
             .checked_mul(kv_h)
-            .and_then(|v| v.checked_mul(n_groups))
-            .and_then(|v| v.checked_mul(crate::isoquant_msl::ISO3_WORDS_PER_GROUP))
+            .and_then(|v| {
+                v.checked_mul(crate::storage::iso_row_words(
+                    n_groups * ISO3_GROUP_SIZE,
+                    self.bits,
+                ))
+            })
             .ok_or_else(|| Error::Quant("append_gpu: words_per_step overflow".to_owned()))?;
         let groups_per_step = b
             .checked_mul(kv_h)
@@ -1216,7 +1224,7 @@ impl QuantIsoV3 {
         // reported as a shape disagreement instead of being read. `blocks` that
         // already cover `shape[2]` are borrowed, so the common path pays
         // nothing.
-        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, device)?;
+        let blocks = synced_iso_v_blocks(&self.blocks, &self.shape, &self.gpu, self.bits, device)?;
 
         // Build the kernel inputs with the token rows already in head-major
         // order, so the flat result *is* `[B, kv_h, S, D]` and needs no
@@ -1228,6 +1236,7 @@ impl QuantIsoV3 {
             &self.shape,
             n_groups,
             ISO3_GROUP_SIZE,
+            crate::storage::iso_row_words(head_dim, self.bits),
             "QuantIsoV3::dequant_gpu",
         )?;
 
@@ -1238,8 +1247,8 @@ impl QuantIsoV3 {
         }
 
         let n = inputs.total_groups as i32;
-        // WORDS_PER_GROUP = 1 for ISO3_GROUP_SIZE = 4.
-        let codes_arr = Array::from_bytes(&inputs.codes, &[n], Dtype::U32)?;
+        let n_words = (inputs.codes.len() / ISO_SLOT_BYTES) as i32;
+        let codes_arr = Array::from_bytes(&inputs.codes, &[n_words], Dtype::U32)?;
         let scales_arr = Array::from_bytes(&inputs.scales, &[n], Dtype::F32)?;
         let norms_arr = Array::from_bytes(&inputs.norms, &[n], Dtype::F32)?;
 
@@ -1279,7 +1288,7 @@ const ISO_SLOT_BYTES: usize = 4;
 /// is what the GPU mirror arm in `dequant_gpu` already did.
 #[derive(Debug)]
 pub(crate) struct IsoKernelInputs {
-    /// Packed codes, little-endian `u32`.
+    /// The dense code plane, little-endian `u32`, `code_words` per token.
     pub codes: Vec<u8>,
     /// Per-group scales, little-endian `f32`.
     pub scales: Vec<u8>,
@@ -1316,6 +1325,7 @@ pub(crate) fn iso_kernel_inputs_head_major(
     shape: &[i32],
     n_groups: usize,
     group_size: usize,
+    code_words: usize,
     what: &str,
 ) -> Result<IsoKernelInputs> {
     if shape.len() != 4 {
@@ -1355,8 +1365,9 @@ pub(crate) fn iso_kernel_inputs_head_major(
     )
     .map_err(|e| Error::Quant(format!("{what}: {e}")))?;
 
+    let total_tokens = total_groups.checked_div(n_groups).unwrap_or(0);
     let mut out = IsoKernelInputs {
-        codes: vec![0_u8; total_groups * ISO_SLOT_BYTES],
+        codes: vec![0_u8; total_tokens * code_words * ISO_SLOT_BYTES],
         scales: vec![0_u8; total_groups * ISO_SLOT_BYTES],
         norms: vec![0_u8; total_groups * ISO_SLOT_BYTES],
         total_groups,
@@ -1370,21 +1381,22 @@ pub(crate) fn iso_kernel_inputs_head_major(
         // quaternion table is checked too even though it is not scattered — a
         // block whose table disagrees with its row count is malformed whoever
         // reads it, and the CPU `dequant` does read it.
-        let want_codes = rows * n_groups;
+        let want_scales = rows * n_groups;
+        let want_codes = rows * code_words;
         if blk.codes.len() != want_codes
-            || blk.scales.len() != want_codes
-            || blk.quaternions.len() != want_codes * 4
+            || blk.scales.len() != want_scales
+            || blk.quaternions.len() != want_scales * 4
             || blk.norms.len() != rows
         {
             return Err(Error::Quant(format!(
-                "{what}: block payload disagrees with its {rows} rows at n_groups={n_groups} \
-                 (codes {} scales {} quaternions {} norms {}; want {want_codes} {want_codes} {} \
-                 {rows})",
+                "{what}: block payload disagrees with its {rows} rows at n_groups={n_groups}, \
+                 code_words={code_words} (codes {} scales {} quaternions {} norms {}; want \
+                 {want_codes} {want_scales} {} {rows})",
                 blk.codes.len(),
                 blk.scales.len(),
                 blk.quaternions.len(),
                 blk.norms.len(),
-                want_codes * 4,
+                want_scales * 4,
             )));
         }
         for r in 0..rows {
@@ -1396,8 +1408,8 @@ pub(crate) fn iso_kernel_inputs_head_major(
             };
             copy_f32_slots(
                 &mut out.codes,
-                dst_token * n_groups,
-                &blk.codes[r * n_groups..(r + 1) * n_groups],
+                dst_token * code_words,
+                &blk.codes[r * code_words..(r + 1) * code_words],
                 u32::to_le_bytes,
             );
             copy_f32_slots(
@@ -1484,6 +1496,7 @@ pub(crate) fn synced_iso_v_blocks<'a>(
     blocks: &'a [IsoBlocks],
     shape: &[i32],
     gpu: &QuantKGpuRing,
+    bits: u8,
     device: Device,
 ) -> Result<std::borrow::Cow<'a, [IsoBlocks]>> {
     if shape.len() != 4 {
@@ -1520,11 +1533,13 @@ pub(crate) fn synced_iso_v_blocks<'a>(
         )));
     };
     let n_groups = iso_n_groups_for(head_dim);
-    let want_codes = full_tokens * n_groups;
-    if codes.len() != want_codes || scales.len() != want_codes || norms.len() != full_tokens {
+    let want_scales = full_tokens * n_groups;
+    let want_codes = full_tokens * crate::storage::iso_row_words(head_dim, bits);
+    if codes.len() != want_codes || scales.len() != want_scales || norms.len() != full_tokens {
         return Err(Error::Quant(format!(
             "iso V store: ring readback size mismatch (codes {} scales {} norms {}, \
-             want codes/scales {want_codes} norms {full_tokens}) — cannot rebuild blocks",
+             want codes {want_codes} scales {want_scales} norms {full_tokens}) — cannot \
+             rebuild blocks",
             codes.len(),
             scales.len(),
             norms.len(),
@@ -1533,8 +1548,8 @@ pub(crate) fn synced_iso_v_blocks<'a>(
     // The ring drops the per-group quaternion table (it is the fixed constant on
     // every group); rebuild it so `iso_decode_fast` reads the same rotation the
     // encoder wrote.
-    let mut quaternions = Vec::with_capacity(want_codes * FIXED_QUAT.len());
-    for _ in 0..want_codes {
+    let mut quaternions = Vec::with_capacity(want_scales * FIXED_QUAT.len());
+    for _ in 0..want_scales {
         quaternions.extend_from_slice(&FIXED_QUAT);
     }
     Ok(std::borrow::Cow::Owned(vec![IsoBlocks {

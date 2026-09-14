@@ -1012,7 +1012,7 @@ fn validate_resolved_gemma4_k8v8_passes() {
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
 fn validate_resolved_qwen_moe_tsym4_rejected() {
-    // Arch guard: TurboSym4 (symmetric WHT-4 K + tq4 V) on Qwen MoE
+    // Arch guard: TurboSym4 (symmetric 4-bit Lloyd-Max K + tq4 V) on Qwen MoE
     // is the PPL-218→8641 disaster path (CLAUDE.md hard rule 6). Rejected by
     // `validate_resolved` with `QwenMoeKBitsTooLow(4)` (same error class as
     // the existing Mixed K<8 rejection — uniform exit code + hint surface).

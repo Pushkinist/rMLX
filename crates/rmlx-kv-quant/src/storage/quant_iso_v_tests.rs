@@ -1227,6 +1227,7 @@ fn iso_v3_kernel_inputs_do_not_depend_on_chunking() {
                 &store.shape,
                 n_groups,
                 ISO3_GROUP_SIZE,
+                crate::storage::iso_row_words(head_dim, 3),
                 "test",
             )
             .expect("well-formed store")
@@ -1264,6 +1265,7 @@ fn iso_v3_kernel_inputs_refuse_a_blocks_vs_shape_mismatch() {
         &vs.shape,
         n_groups,
         ISO3_GROUP_SIZE,
+        crate::storage::iso_row_words(head_dim, 3),
         "QuantIsoV3::dequant_gpu",
     )
     .expect_err("blocks short of shape[2] must be refused");
@@ -1374,6 +1376,7 @@ fn iso_v3_single_kv_head_head_dim_512_decodes_the_same_either_chunking() {
                 sh,
                 n_groups,
                 ISO3_GROUP_SIZE,
+                crate::storage::iso_row_words(head_dim, 3),
                 "test",
             )
             .expect("well-formed store")

@@ -39,9 +39,9 @@ float abs_max   = max(max(abs(rw), abs(rx)), max(abs(ry), abs(rz)));
 float scale     = float(bfloat((abs_max < 1e-12f) ? 1e-12f : (abs_max / ISO3_CB_MAX)));
 scales_out[gid] = bfloat(scale);
 
-// ── 3-bit quantize (codebook lookup) and pack via atomic OR ───────────────
-// ISO3_GS=4 elements → 1 u32 per group (4*3=12 bits ≤ 30).
-uint code_word = gid * ISO3_WPG; // = gid * 1 for ISO3_GS=4
+// ── 3-bit quantize (codebook lookup), written into the dense code plane ──
+// The plane is zero-initialised at dispatch, so cp_write_code's OR is a write.
+uint row_base = token * cp_row_words(n_groups_u);
 float rots[4];
 rots[0] = rw;
 rots[1] = rx;
@@ -55,9 +55,5 @@ for (uint e = 0u; e < ISO3_GS; e++) {
         if (norm_val > ISO3_BOUNDS[bi])
             idx++;
     }
-    uint word  = code_word + e / ISO3_VPW;
-    uint shift = (e % ISO3_VPW) * 3u;
-    atomic_fetch_or_explicit((device atomic_uint *)&codes_out[word],
-                             (idx & 0x7u) << shift,
-                             memory_order_relaxed);
+    cp_write_code(codes_out, row_base, grp * CP_CODES_PER_GROUP + e, idx);
 }

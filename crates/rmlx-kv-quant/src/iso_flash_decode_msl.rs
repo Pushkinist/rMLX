@@ -204,11 +204,14 @@ fn render_decode_fn() -> String {
          //\n\
          // `tok_idx` indexes the flat sequence-major token stream\n\
          // (`(b * kv_seq + t) * kv_h + kv_h_idx`); `lane` is the head-dim slot\n\
-         // in [0, head_dim). Bit-exact with the CPU iso_decode_fast.\n\
+         // in [0, head_dim). `row_words` is `cp_row_words(n_groups)`, hoisted\n\
+         // by the caller: it is loop-invariant and this runs per lane per KV\n\
+         // token. Bit-exact with the CPU iso_decode_fast.\n\
          //\n\
-         // Self-contained per lane: the group's four codes all live in one u32,\n\
-         // so the Hamilton product runs in registers with no threadgroup\n\
-         // staging and no barrier — callable from any kernel body.\n\
+         // Self-contained per lane: the group's four codes are four reads of\n\
+         // the row's code plane, so the Hamilton product runs in registers\n\
+         // with no threadgroup staging and no barrier — callable from any\n\
+         // kernel body.\n\
          //\n\
          // Shared surface: a quantized-V flash kernel calls this unchanged,\n\
          // passing the V store's (codes, scales, norms) instead of K's.\n\
@@ -218,19 +221,22 @@ fn render_decode_fn() -> String {
          \x20   device const bfloat* norms,\n\
          \x20   uint                tok_idx,\n\
          \x20   uint                n_groups,\n\
+         \x20   uint                row_words,\n\
          \x20   uint                lane) {{\n\
          \x20   // Each group of 4 head-dim slots is one quaternion block.\n\
          \x20   uint group_id_in_head = lane / {gs}u;\n\
          \x20   uint lane_in_group    = lane - group_id_in_head * {gs}u;\n\
          \n\
-         \x20   uint  word    = codes[tok_idx * n_groups + group_id_in_head];\n\
          \x20   float k_scale = scales[tok_idx * n_groups + group_id_in_head];\n\
          \n\
-         \x20   // Unpack the group's 4 IF_BITS-bit codes -> centroid x scale.\n\
-         \x20   float rw = ISO_CB[(word >> (0u * IF_BITS)) & IF_MASK] * k_scale;\n\
-         \x20   float rx = ISO_CB[(word >> (1u * IF_BITS)) & IF_MASK] * k_scale;\n\
-         \x20   float ry = ISO_CB[(word >> (2u * IF_BITS)) & IF_MASK] * k_scale;\n\
-         \x20   float rz = ISO_CB[(word >> (3u * IF_BITS)) & IF_MASK] * k_scale;\n\
+         \x20   // Read the group's 4 codes out of the row's dense plane in one\n\
+         \x20   // load -> centroid x scale.\n\
+         \x20   uint row_base = tok_idx * row_words;\n\
+         \x20   cp_group_t g = cp_read_group(codes, row_base, group_id_in_head);\n\
+         \x20   float rw = ISO_CB[g.x] * k_scale;\n\
+         \x20   float rx = ISO_CB[g.y] * k_scale;\n\
+         \x20   float ry = ISO_CB[g.z] * k_scale;\n\
+         \x20   float rz = ISO_CB[g.w] * k_scale;\n\
          \n\
          \x20   // Inverse rotation: r' = qbar * r, Hamilton product in the\n\
          \x20   // [w, x, y, z] convention. qbar = (ISO_QW, ISO_QCX, ISO_QCY,\n\
@@ -318,6 +324,10 @@ pub(crate) fn build_iso_flash_header(bits: u8) -> Result<String> {
         "\nconstant float ISO_CB[{n_entries}] = {{\n{cb_join}\n}};\n",
         cb_join = cb_hex.join(",\n")
     );
+    s.push_str(&crate::code_plane::render_msl_code_plane(
+        bits,
+        ISO_QUAT_BLOCK_SIZE,
+    ));
     s.push_str(&render_decode_fn());
     let _ = write!(
         s,
@@ -370,7 +380,7 @@ pub fn assert_fixed_quat_blocks(quaternions: &[f32], what: &str) -> Result<()> {
 // P1 buffer layout (must match `add_input` order in `iso_flash_decode_sdpa`):
 // K buffers are SEQUENCE-major (`[B, S, kv_h, ...]`); V stays head-major.
 // 0. query     : f32  [B * n_q_heads * head_dim]
-// 1. codes     : u32  [B * kv_seq * kv_h * n_groups]
+// 1. codes     : u32  [B * kv_seq * kv_h * code_words]
 // 2. scales    : f32  [B * kv_seq * kv_h * n_groups]
 // 3. norms     : f32  [B * kv_seq * kv_h]
 // 4. v_flat    : bf16 / f16 / f32 [B * kv_h * v_seq_stride * head_dim]
@@ -555,6 +565,9 @@ pub fn iso_flash_decode_sdpa<const BITS: u8>(
     let n_tiles = (kv_seq + TILE_SIZE - 1) / TILE_SIZE;
     let n_groups = iso_n_groups_for(head_dim as usize);
     let n_groups_i64 = n_groups as i64;
+    // The code plane is dense across the row's groups, so its stride is its own
+    // number; the scale plane stays one entry per group.
+    let code_words_i64 = crate::code_plane::row_words(head_dim as usize, BITS) as i64;
 
     // ── Flatten Q to [n_bh * head_dim] f32 ────────────────────────────────
     let q_total: i64 = i64::from(n_bh) * i64::from(head_dim);
@@ -567,14 +580,16 @@ pub fn iso_flash_decode_sdpa<const BITS: u8>(
 
     // ── Flatten K buffers ─────────────────────────────────────────────────
     let tok_count: i64 = i64::from(b) * i64::from(kv_h) * i64::from(kv_seq);
-    let codes_total: i64 = tok_count * n_groups_i64;
+    let codes_total: i64 = tok_count * code_words_i64;
+    let scales_total: i64 = tok_count * n_groups_i64;
 
     let codes_flat = k_codes.reshape(&[codes_total as i32], device)?;
     // Both planes are bound at the stored sideband dtype, which is what the
     // header's decode helper declares. MLX binds by the array's dtype and does
     // not convert, so a plane arriving at another dtype has to be cast here or
     // the kernel reads its bytes at the wrong stride.
-    let scales_flat = to_sideband_dtype(&k_scales.reshape(&[codes_total as i32], device)?, device)?;
+    let scales_flat =
+        to_sideband_dtype(&k_scales.reshape(&[scales_total as i32], device)?, device)?;
     let norms_flat = to_sideband_dtype(&k_norms.reshape(&[tok_count as i32], device)?, device)?;
 
     // ── V flat — keep native dtype (bf16 / f16 / f32) ─────────────────────

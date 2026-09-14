@@ -8,6 +8,10 @@ uint heads_per_kv = dims[4];
 uint n_tiles      = dims[5];
 uint has_mask     = dims[6];
 uint n_groups     = dims[7];
+// Words the dense code plane holds per row. Loop-invariant, and the
+// per-lane decode below runs once per KV token, so it is derived here
+// rather than inside the decode.
+uint row_words = cp_row_words(n_groups);
 
 uint tile_idx = threadgroup_position_in_grid.x;
 uint bh       = threadgroup_position_in_grid.y;
@@ -79,7 +83,7 @@ for (uint t = tile_start; t < tile_end; t++) {
     uint kv_tok = (b * kv_seq + t) * kv_h + kv_h_idx;
     if (lane_in_group == 0u) {
         float kg[RF_GROUP_SIZE];
-        rf_decode_k_group(k_codes, k_scales, k_norms, k_rotors, kv_tok, n_groups,
+        rf_decode_k_group(k_codes, k_scales, k_norms, k_rotors, kv_tok, n_groups, row_words,
                           group_id_in_head, kg);
         for (uint e = 0u; e < RF_GROUP_SIZE; ++e) {
             uint slot = tid + e;
@@ -134,7 +138,7 @@ for (uint t = tile_start; t < tile_end; t++) {
     // kernel deletes.
     if (lane_in_group == 0u) {
         float vg[RF_GROUP_SIZE];
-        rf_decode_k_group(v_codes, v_scales, v_norms, v_rotors, kv_tok, n_groups,
+        rf_decode_k_group(v_codes, v_scales, v_norms, v_rotors, kv_tok, n_groups, row_words,
                           group_id_in_head, vg);
         for (uint e = 0u; e < RF_GROUP_SIZE; ++e) {
             uint slot = tid + e;

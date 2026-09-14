@@ -155,13 +155,30 @@ type Result<T> = std::result::Result<T, SsdKvIndexError>;
 ///   the nondeterminism the tier must not introduce, so the version routes
 ///   those blocks through the wipe.
 ///
+/// - v7 → v8: the **stored code layout changed** for every iso and rotor
+///   codec, and two persisted layout tags were renamed. The packed K/V ring's
+///   code plane used to spend one whole `u32` per group whatever the codec's
+///   width; it is now packed densely across a row's groups, and the rotor
+///   encoders store three codes per group instead of eight — the five the
+///   Clifford sandwich leaves algebraically zero are no longer written. A block
+///   spilled by an older binary therefore carries a code plane the new unpacker
+///   reads at the wrong stride, which decodes to plausible K/V rather than to an
+///   error. `layout_key` cannot carry that: `compute_layout_key` folds arch,
+///   layer count, kv_heads, head_dim and the codec `Display` vector, none of
+///   which move when the bits inside a block are re-cadenced, so a v7 block
+///   still **hits**. The same bump also covers the `tsym3` / `tsym4` geometry
+///   tags, which named a Walsh-Hadamard transform the TurboQuant codecs do not
+///   apply and now name the Lloyd-Max codebook they do: hydrate dispatches on
+///   exact string equality, so the rename is a stored-format change on the same
+///   schedule.
+///
 /// v2 rows are **convertible** — `UPDATE kv_blocks SET last_used = last_used *
 /// 1000000` is the whole migration. They are wiped anyway, and that is a
 /// choice, not a constraint: rMLX is unreleased, the tier is a pure cache
 /// whose worst loss is one re-prefill per block, and carrying migration code
 /// (plus the branch in the wipe pass that has to let a v2 DB through so it can
 /// be converted) buys nothing a warm cache does not rebuild in minutes.
-pub(crate) const SCHEMA_VERSION: i64 = 7;
+pub(crate) const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_PRAGMAS: &str = "
 PRAGMA journal_mode = WAL;

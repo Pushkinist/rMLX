@@ -93,23 +93,27 @@ fn the_columns_differ_exactly_where_the_mirror_follows_shares_kv() {
     }
 }
 
-/// At least one live codec is strictly under the bf16 reference on a dense
-/// stack, and at least one is strictly over it.
+/// At least one cell of the listing is strictly under the bf16 reference and at
+/// least one is strictly over it.
 ///
-/// Without this the table could render every ratio as `1.000x` — the exact
-/// shape of a byte model that stopped reading the codec — and the two tests
-/// above would still pass.
+/// Both columns count: a codec can be under the reference on a dense stack and
+/// over it on a shared-KV one, where its store sits alongside two bf16 mirrors,
+/// and that spread is exactly what the two columns exist to show. Without this
+/// the table could render every ratio as `1.000x` — the exact shape of a byte
+/// model that stopped reading the codec — and the two tests above would still
+/// pass.
 #[test]
 fn the_listing_spans_both_sides_of_the_reference() {
     let rendered = kv_quant_residency_table();
     let rows = codec_rows(&rendered);
+    let ratio = |q: KvQuant, shares_kv: bool| {
+        let bf16 = KvQuant::None.estimated_resident_bytes_per_layer(4096, 128, 8, shares_kv) as f64;
+        q.estimated_resident_bytes_per_layer(4096, 128, 8, shares_kv) as f64 / bf16
+    };
     let ratios: Vec<f64> = rows
         .iter()
         .zip(ALL_KV_QUANTS)
-        .map(|(_, &q)| {
-            let bf16 = KvQuant::None.estimated_resident_bytes_per_layer(4096, 128, 8, false) as f64;
-            q.estimated_resident_bytes_per_layer(4096, 128, 8, false) as f64 / bf16
-        })
+        .map(|(_, &q)| ratio(q, false))
         .collect();
     assert!(
         ratios.iter().any(|r| *r < 0.999),
@@ -117,8 +121,10 @@ fn the_listing_spans_both_sides_of_the_reference() {
          1.000x is what a byte model that stopped reading the codec looks like:\n{rendered}"
     );
     assert!(
-        ratios.iter().any(|r| *r > 1.001),
-        "no codec renders above the bf16 reference:\n{rendered}"
+        ALL_KV_QUANTS
+            .iter()
+            .any(|&q| ratio(q, false) > 1.001 || ratio(q, true) > 1.001),
+        "no codec renders above the bf16 reference in either column:\n{rendered}"
     );
     // And the rendered text agrees with the arithmetic, not just the arithmetic
     // with itself.

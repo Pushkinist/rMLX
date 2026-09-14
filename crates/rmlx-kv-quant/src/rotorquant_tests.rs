@@ -11,9 +11,8 @@
 use crate::clifford::make_rotor_table;
 use crate::rotorquant::{
     make_qjl_projection, n_groups_for, rotor3_decode, rotor3_encode, rotor3_k_decode,
-    rotor3_k_encode, rotor4_decode, rotor4_encode, rotor4_k_decode, rotor4_k_encode,
-    unpack_qjl_signs, RotorQuantError, ROTOR3_GROUP_SIZE, ROTOR3_WORDS_PER_GROUP,
-    ROTOR4_WORDS_PER_GROUP,
+    rotor3_k_encode, rotor4_decode, rotor4_encode, rotor4_k_decode, rotor4_k_encode, row_words_for,
+    unpack_qjl_signs, RotorQuantError, ROTOR3_GROUP_SIZE,
 };
 use crate::test_utils::{cosine_similarity_per_row, lcg_data, TEST_SEED};
 
@@ -72,7 +71,7 @@ fn rotor3_encode_determinism() {
     assert_eq!(scales1, scales2, "scales differ between passes");
     assert_eq!(norms1, norms2, "norms differ between passes");
 
-    let expected_words = n_tokens * n_groups * ROTOR3_WORDS_PER_GROUP;
+    let expected_words = n_tokens * row_words_for(head_dim, 3);
     assert_eq!(
         codes1.len(),
         expected_words,
@@ -221,6 +220,7 @@ fn rotor3_encode_wrong_rotor_table_len() {
         }
         RotorQuantError::HeadDimZero
         | RotorQuantError::LenNotMultipleOfHeadDim { .. }
+        | RotorQuantError::CodePlaneLen { .. }
         | RotorQuantError::Codebook(_) => panic!("expected RotorTableLen, got {err:?}"),
     }
 }
@@ -241,6 +241,7 @@ fn rotor3_encode_len_not_multiple() {
         }
         RotorQuantError::HeadDimZero
         | RotorQuantError::RotorTableLen { .. }
+        | RotorQuantError::CodePlaneLen { .. }
         | RotorQuantError::Codebook(_) => panic!("expected LenNotMultipleOfHeadDim, got {err:?}"),
     }
 }
@@ -285,7 +286,7 @@ fn rotor4_encode_determinism() {
     assert_eq!(scales1, scales2, "scales must be identical");
     assert_eq!(norms1, norms2, "norms must be identical");
 
-    let expected_words = n_tokens * n_groups * ROTOR4_WORDS_PER_GROUP;
+    let expected_words = n_tokens * row_words_for(head_dim, 4);
     assert_eq!(codes1.len(), expected_words, "codes length");
     assert_eq!(scales1.len(), n_tokens * n_groups, "scales length");
     assert_eq!(norms1.len(), n_tokens, "norms length");

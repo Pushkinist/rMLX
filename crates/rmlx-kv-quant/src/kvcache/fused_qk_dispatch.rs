@@ -902,10 +902,11 @@ fn encode_chunk_to_head_major(
     }
 }
 
-/// Rotor chunk encode. Calls the K-side GPU quantize kernel and reshapes
-/// the flat `[n_tokens * n_groups]` outputs into the per-token head-major
-/// slabs the shadow stores. The per-token norm is extracted as the first
-/// group's norm slot (`rotor_gpu_outputs_to_cpu` convention).
+/// Rotor chunk encode. Calls the K-side GPU quantize kernel and reshapes its
+/// flat outputs into the per-token head-major slabs the shadow stores — the
+/// code plane at `row_words_for(head_dim, bits)` words per token, the scales at
+/// one per group. The per-token norm is extracted as the first group's norm
+/// slot (`rotor_gpu_outputs_to_cpu` convention).
 #[allow(clippy::too_many_arguments)]
 fn encode_chunk_rotor(
     k_f32: &Array,
@@ -932,9 +933,10 @@ fn encode_chunk_rotor(
     } else {
         rotor_quantize_v4_gpu(k_f32, rotors, d as usize, device)?
     };
-    // codes_flat shape: [n_tokens * n_groups]. Reshape to head-major.
+    // codes_flat is the dense code plane: row_words per token, not n_groups.
     let n_groups_i32 = n_groups as i32;
-    let codes_4d = codes_flat.reshape(&[b, kv_h, n, n_groups_i32], device)?;
+    let code_words = crate::rotorquant::row_words_for(d as usize, bits) as i32;
+    let codes_4d = codes_flat.reshape(&[b, kv_h, n, code_words], device)?;
     let scales_4d = scales_flat.reshape(&[b, kv_h, n, n_groups_i32], device)?;
     // norms_flat is per-group; deduplicate to per-token by slicing the
     // first slot of each token's group-tuple. Reshape to
@@ -942,7 +944,7 @@ fn encode_chunk_rotor(
     let norms_per_group = norms_flat.reshape(&[b, kv_h, n, n_groups_i32], device)?;
     let norms_4d =
         norms_per_group.slice(&[0_i32, 0, 0, 0], &[b, kv_h, n, 1], &[1_i32; 4], device)?;
-    assert_layout(layout, n_groups_i32, n_groups_i32)?;
+    assert_layout(layout, code_words, n_groups_i32)?;
     Ok(ChunkEncoded {
         codes: codes_4d,
         scales: scales_4d,

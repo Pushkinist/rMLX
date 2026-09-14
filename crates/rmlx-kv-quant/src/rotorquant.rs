@@ -43,69 +43,52 @@
 //!
 //! # Pack convention
 //!
-//! `vals_per_word = 10`, `mask = 0x7`. Element `e` within a group of `8`
-//! codes maps to `word = 0`, `shift = e * 3`. For `head_dim` not a multiple
-//! of 3 the padded tail elements still consume code slots — decode applies
-//! the mask **after** extracting the grade-1 components.
+//! The dense code plane ([`crate::code_plane`]): three codes per group, `bits`
+//! each, packed across the row's groups and padded to a whole `u32` per row.
+//! For `head_dim` not a multiple of 3 the padded tail elements still consume
+//! code slots — decode drops them when it writes the row back.
 //!
 //! # Single-codebook simplification
 //!
 //! The Python reference (`rotorquant/turboquant/rotorquant.py`) uses two
 //! codebooks (`vector` grade and `trivector` grade) with different bit
-//! budgets. This implementation ships a **single 8-centroid codebook** for
-//! all 8 components to keep the storage flat. The grade-aware variant is
-//! tracked as a follow-up (deferred); the cosine gate is measured empirically.
+//! budgets. This implementation ships a **single codebook** for the three
+//! stored components. The grade-aware variant is tracked as a follow-up
+//! (deferred); the cosine gate is measured empirically.
 //!
 //! # Effective bpe
 //!
-//! The single-codebook simplification ships at **~8 bpe pre-scale** — each
-//! group quantises 3 real grade-1 elements but stores 8 three-bit codes
-//! (24 bits) for the full 8-component multivector, plus one per-group scale and
-//! one per-token norm, both at
-//! [`crate::storage::KV_SIDEBAND_DTYPE`]. The grade-aware variant — which would
-//! drop the bit budget for the high grades and bring the storage closer to
-//! the 3.25 bpe target reported by the Python `rotorquant` reference — is
-//! gated on the follow-up (deferred).
+//! Each group quantises the 3 grade-1 components — the only ones the sandwich
+//! leaves non-zero — and stores one code per component in the row's dense code
+//! plane ([`crate::code_plane`]), plus one per-group scale and one per-token
+//! norm, both at [`crate::storage::KV_SIDEBAND_DTYPE`].
 //!
-//! **"Pre-scale" is doing a lot of work in that number, and the delivered
-//! figure is what matters.** At `head_dim = 128` there are
-//! `ceil(128 / 3) = 43` groups per row, and the store spends, per input value:
+//! At `head_dim = 128` there are `ceil(128 / 3) = 43` groups per row, so 129
+//! codes, and the store spends, per input value:
 //!
-//! | Component | Layout | Bits / value |
-//! |---|---|---|
-//! | codes | 43 `u32` per 128 values | **10.75** |
-//! | scales | 43 `bf16` per 128 values | **5.375** |
-//! | norm | 1 `bf16` per 128 values | **0.125** |
-//! | **total** | | **16.25** (bf16 is 16.0) |
+//! | Component | Layout | rotor3 | rotor4 |
+//! |---|---|---|---|
+//! | codes | `ceil(129 * bits / 32)` `u32` per 128 values | **3.250** | **4.250** |
+//! | scales | 43 `bf16` per 128 values | **5.375** | **5.375** |
+//! | norm | 1 `bf16` per 128 values | **0.125** | **0.125** |
+//! | **total** | | **8.750** | **9.750** |
 //!
 //! `rotor_rate_splits_into_documented_code_scale_and_norm_bits` measures that
 //! split off a real encode rather than restating it, and
 //! [`crate::storage::ring_bits_per_value`] is where the total comes from.
 //!
-//! It was 21.75 while the scale and norm planes were `f32`. Halving them was a
-//! 25% saving that still does not reach bf16, which is the point of the split
-//! above: a sideband change cannot fix a code cadence. Two independent
-//! overruns remain, with different fixes:
+//! **The scale is now the dominant term.** One `bf16` per 3 values is 5.375
+//! bits per value on its own — more than the codes at either width. A group of
+//! 3 sharing a whole scale is what keeps rotor behind iso, which shares one
+//! across 4, and no code-side change moves it.
 //!
-//! 1. **Dead components.** Only 3 of the 8 quantised components carry
-//!    information. A rotor sandwich is grade-preserving, so for the grade-1
-//!    input this codec embeds, the scalar, bivector and pseudoscalar slots are
-//!    algebraically zero on encode, and on decode the inverse sandwich keeps
-//!    every non-grade-1 part out of the reconstructed vector. 15 of the 24
-//!    code bits per group are therefore dead budget, not distortion — pinned by
-//!    `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` and
-//!    `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1`.
-//! 2. **Scale cadence.** One `bf16` per 3 values is 5.375 bits per value on its
-//!    own — a third of the total, and the dominant term after the codes. A
-//!    group of 3 sharing a whole scale is not a viable rate point at any code
-//!    width, at any sideband width.
-//!
-//! rotor4 fills all 32 code bits instead of 24 and therefore occupies
-//! *byte-identical* storage. No rotor codec is smaller than bf16 at any
-//! `head_dim`; see `docs/KV_QUANT.md` § "Memory truth" and the crate-wide
-//! stored-rate ceiling in `kv_rate_tests.rs`, where this family's overrun is a
-//! written exemption that `exempt_families_actually_exceed_the_floor` will
-//! reject the day it stops being one.
+//! The five non-grade-1 components are not stored. A rotor sandwich is
+//! grade-preserving, so for the grade-1 input this codec embeds, the scalar,
+//! bivector and pseudoscalar slots are algebraically zero on encode, and on
+//! decode the inverse sandwich keeps every non-grade-1 part out of the
+//! reconstructed vector — pinned by
+//! `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` and
+//! `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1`.
 //!
 //! # No QJL residual
 //!
@@ -141,19 +124,18 @@ pub const ROTOR4_GROUP_SIZE: usize = ROTOR3_GROUP_SIZE;
 /// Number of multivector components per group (Cl(3,0) basis size).
 pub const ROTOR3_MV_COMPONENTS: usize = MV_DIM;
 
-/// 3-bit values per u32 word (planar3 / iso3 convention — 30 bits used).
-pub const ROTOR3_VALS_PER_WORD: usize = 10;
+/// Codes stored per group: the three grade-1 components.
+///
+/// The rotor sandwich is grade-preserving, so the other five components of the
+/// rotated multivector are algebraically zero — `sandwich_of_grade1_in_3d_stays_grade1`
+/// and `inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1` in
+/// `clifford_tests.rs` pin that in both directions. Storing them spends five
+/// codes on quantizations of zero, and reconstructing them spends the decode's
+/// cancellation budget on removing that quantization noise again.
+pub const ROTOR_CODES_PER_GROUP: usize = ROTOR3_GROUP_SIZE;
 
-/// 4-bit values per u32 word — dense pack (32 bits used, 0 wasted — iso4
-/// convention).
-pub const ROTOR4_VALS_PER_WORD: usize = 8;
-
-/// Words per group for rotor3: 8 codes × 3 bits = 24 bits ≤ 30, fits in 1 u32.
-pub const ROTOR3_WORDS_PER_GROUP: usize = ROTOR3_MV_COMPONENTS.div_ceil(ROTOR3_VALS_PER_WORD);
-
-/// Words per group for rotor4: 8 codes × 4 bits = 32 bits, fits in 1 u32
-/// (dense pack — same u32-per-group count as rotor3, just denser).
-pub const ROTOR4_WORDS_PER_GROUP: usize = ROTOR3_MV_COMPONENTS.div_ceil(ROTOR4_VALS_PER_WORD);
+/// Multivector index of the first stored (grade-1) component.
+const GRADE1_BASE: usize = 1;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -189,6 +171,16 @@ pub enum RotorQuantError {
         /// The expected head dimension divisor.
         head_dim: usize,
     },
+    /// The code plane is shorter than `n_tokens` whole rows.
+    #[error("rotor: code plane holds {got} words for {n_tokens} rows, which need {expected}")]
+    CodePlaneLen {
+        /// Actual plane length in u32 words.
+        got: usize,
+        /// Words `n_tokens` rows occupy.
+        expected: usize,
+        /// Rows the norms vector asks for.
+        n_tokens: usize,
+    },
     /// The underlying Lloyd-Max codebook lookup failed (should be unreachable
     /// for `ROTOR3_BITS=3`; surfaced as defence in depth).
     #[error("rotor3: codebook error: {0}")]
@@ -207,35 +199,25 @@ pub fn n_groups_for(head_dim: usize) -> usize {
     head_dim.div_ceil(ROTOR3_GROUP_SIZE)
 }
 
-/// Number of u32 words needed to pack the codes for `n_tokens * n_groups`
-/// groups (`ROTOR3_WORDS_PER_GROUP` words per group, currently `1`).
+/// Codes one row of `head_dim` values holds: three per group.
 #[inline]
 #[must_use]
-pub fn n_code_words_for(n_tokens: usize, head_dim: usize) -> usize {
-    n_tokens * n_groups_for(head_dim) * ROTOR3_WORDS_PER_GROUP
+pub fn codes_per_row(head_dim: usize) -> usize {
+    n_groups_for(head_dim) * ROTOR_CODES_PER_GROUP
 }
 
-/// Pack 8 codes for one group into 1 u32 (planar3 / iso3 convention).
-///
-/// `mask = 0x7`; element `e` lands at bits `[e*3 .. e*3+3]`. With 8 elements
-/// the highest bit used is `7 * 3 + 2 = 23` — well within a single u32.
+/// `u32` words the dense code plane holds per row of `head_dim` values.
 #[inline]
-fn pack_group(codes: [u8; ROTOR3_MV_COMPONENTS]) -> u32 {
-    let mut w: u32 = 0;
-    for (e, &c) in codes.iter().enumerate() {
-        w |= (u32::from(c) & 0x7) << (e * 3);
-    }
-    w
+#[must_use]
+pub fn row_words_for(head_dim: usize, bits: u8) -> usize {
+    crate::code_plane::row_words(codes_per_row(head_dim), bits)
 }
 
-/// Unpack 1 u32 into 8 codes (inverse of [`pack_group`]).
+/// Number of u32 words the dense code plane holds for `n_tokens` rows.
 #[inline]
-fn unpack_group(word: u32) -> [u8; ROTOR3_MV_COMPONENTS] {
-    let mut out = [0_u8; ROTOR3_MV_COMPONENTS];
-    for (e, slot) in out.iter_mut().enumerate() {
-        *slot = ((word >> (e * 3)) & 0x7) as u8;
-    }
-    out
+#[must_use]
+pub fn n_code_words_for(n_tokens: usize, head_dim: usize, bits: u8) -> usize {
+    n_tokens * row_words_for(head_dim, bits)
 }
 
 // ── Encode ────────────────────────────────────────────────────────────────────
@@ -251,12 +233,7 @@ fn unpack_group(word: u32) -> [u8; ROTOR3_MV_COMPONENTS] {
 ///
 /// # Returns
 ///
-/// `(codes_packed, scales, norms)`:
-///
-/// - `codes_packed` — 3-bit indices packed at 10 per u32. Length
-///   `n_tokens * n_groups * ROTOR3_WORDS_PER_GROUP`.
-/// - `scales` — per-group f32 scale. Length `n_tokens * n_groups`.
-/// - `norms` — per-token L2 norm. Length `n_tokens`.
+/// `(codes_packed, scales, norms)` — see [`rotor_encode`].
 ///
 /// # Errors
 ///
@@ -267,6 +244,47 @@ pub fn rotor3_encode(
     v: &[f32],
     rotors: &[f32],
     head_dim: usize,
+) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>), RotorQuantError> {
+    rotor_encode(v, rotors, head_dim, ROTOR3_BITS)
+}
+
+/// Encode a V tensor with the rotor4 codec — [`rotor3_encode`] at 4 bits.
+///
+/// # Errors
+///
+/// Returns [`RotorQuantError`] for invalid inputs.
+pub fn rotor4_encode(
+    v: &[f32],
+    rotors: &[f32],
+    head_dim: usize,
+) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>), RotorQuantError> {
+    rotor_encode(v, rotors, head_dim, ROTOR4_BITS)
+}
+
+/// Encode a V tensor with the rotor codec at `bits`.
+///
+/// # Returns
+///
+/// `(codes_packed, scales, norms)`:
+///
+/// - `codes_packed` — the dense code plane (see [`crate::code_plane`]): three
+///   codes per group, [`row_words_for`]`(head_dim, bits)` words per row.
+/// - `scales` — per-group f32 scale. Length `n_tokens * n_groups`.
+/// - `norms` — per-token L2 norm. Length `n_tokens`.
+///
+/// Only the three grade-1 components of each rotated multivector are stored:
+/// the sandwich preserves grade, so the other five are algebraically zero. See
+/// [`ROTOR_CODES_PER_GROUP`].
+///
+/// # Errors
+///
+/// Returns [`RotorQuantError`] for invalid inputs (zero `head_dim`, `v.len()`
+/// not a multiple of `head_dim`, rotor table size mismatch, codebook fault).
+pub fn rotor_encode(
+    v: &[f32],
+    rotors: &[f32],
+    head_dim: usize,
+    bits: u8,
 ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>), RotorQuantError> {
     if head_dim == 0 {
         return Err(RotorQuantError::HeadDimZero);
@@ -287,20 +305,20 @@ pub fn rotor3_encode(
         });
     }
 
-    let codebook = lloyd_gaussian_codebook(ROTOR3_BITS)
-        .map_err(|e| RotorQuantError::Codebook(e.to_string()))?;
+    let codebook =
+        lloyd_gaussian_codebook(bits).map_err(|e| RotorQuantError::Codebook(e.to_string()))?;
     let max_centroid = codebook
         .iter()
         .copied()
         .fold(0.0_f32, |acc, c| acc.max(c.abs()));
 
     let n_tokens = v.len() / head_dim;
-    let words_per_group = ROTOR3_WORDS_PER_GROUP;
     let total_groups = n_tokens * n_groups;
 
-    let mut codes_all: Vec<u32> = Vec::with_capacity(total_groups * words_per_group);
+    let mut codes_all: Vec<u32> = Vec::with_capacity(n_code_words_for(n_tokens, head_dim, bits));
     let mut scales: Vec<f32> = Vec::with_capacity(total_groups);
     let mut norms: Vec<f32> = Vec::with_capacity(n_tokens);
+    let mut row_codes: Vec<u8> = Vec::with_capacity(codes_per_row(head_dim));
 
     for tok in 0..n_tokens {
         // tok < n_tokens = v.len() / head_dim guarantees the row slice fits.
@@ -316,6 +334,7 @@ pub fn rotor3_encode(
             bf16_round(sq.sqrt().max(1e-8))
         };
         norms.push(norm);
+        row_codes.clear();
 
         for grp in 0..n_groups {
             // Load the per-group rotor: `[s, b12, b13, b23]`.
@@ -333,9 +352,9 @@ pub fn rotor3_encode(
             ];
 
             // Load 3 grade-1 components, zero-padding the tail.
-            let grp_start = grp * ROTOR3_GROUP_SIZE;
+            let grp_start = grp * ROTOR_CODES_PER_GROUP;
             let mut mv = [0.0_f32; ROTOR3_MV_COMPONENTS];
-            for e in 0..ROTOR3_GROUP_SIZE {
+            for e in 0..ROTOR_CODES_PER_GROUP {
                 let idx = grp_start + e;
                 if idx < head_dim {
                     // idx < head_dim ≤ row.len() by construction.
@@ -344,7 +363,7 @@ pub fn rotor3_encode(
                         reason = "idx < head_dim = row.len() by construction"
                     )]
                     {
-                        mv[e + 1] = row[idx] / norm; // grade-1: e1, e2, e3 (indices 1, 2, 3)
+                        mv[e + GRADE1_BASE] = row[idx] / norm;
                     }
                 }
             }
@@ -357,8 +376,16 @@ pub fn rotor3_encode(
             // correct `R * mv * R̃`.
             let rotated = rotor_sandwich(r, &mv);
 
-            // Per-group max-abs over all 8 components → scale.
-            let max_abs = rotated
+            // Scale covers the stored components — the grade-1 three. The
+            // other five are algebraically zero and are not stored, so a max
+            // over all eight would be the same number reached through five
+            // rounding artefacts.
+            #[allow(
+                clippy::indexing_slicing,
+                reason = "GRADE1_BASE + ROTOR_CODES_PER_GROUP = 4 <= ROTOR3_MV_COMPONENTS = 8"
+            )]
+            let grade1 = &rotated[GRADE1_BASE..GRADE1_BASE + ROTOR_CODES_PER_GROUP];
+            let max_abs = grade1
                 .iter()
                 .copied()
                 .fold(0.0_f32, |acc, x| acc.max(x.abs()));
@@ -371,9 +398,8 @@ pub fn rotor3_encode(
             });
             scales.push(scale);
 
-            // Quantise each component → nearest centroid (linear scan; 8 entries).
-            let mut group_codes = [0_u8; ROTOR3_MV_COMPONENTS];
-            for (e, &rv) in rotated.iter().enumerate() {
+            // Quantise each stored component → nearest centroid (linear scan).
+            for &rv in grade1 {
                 let normalised = rv / scale;
                 let idx = codebook
                     .iter()
@@ -382,19 +408,11 @@ pub fn rotor3_encode(
                         (a - normalised).abs().total_cmp(&(b - normalised).abs())
                     })
                     .map_or(0, |(i, _)| i as u8);
-                // idx < 8 by construction (codebook has 8 entries); fits 3 bits.
-                #[allow(
-                    clippy::indexing_slicing,
-                    reason = "e < ROTOR3_MV_COMPONENTS = group_codes.len() by loop bound"
-                )]
-                {
-                    group_codes[e] = idx;
-                }
+                row_codes.push(idx);
             }
-
-            // Pack 8 codes into 1 u32 (planar3 / iso3 convention).
-            codes_all.push(pack_group(group_codes));
         }
+
+        crate::code_plane::pack_row_into(&row_codes, bits, &mut codes_all);
     }
 
     Ok((codes_all, scales, norms))
@@ -408,18 +426,6 @@ pub fn rotor3_encode(
 /// in particular, `rotors` must be the **same static table** the encoder
 /// saw — otherwise the inverse sandwich rotates into the wrong basis.
 ///
-/// # Arguments
-///
-/// - `codes_packed` — packed 3-bit indices (10 per u32).
-/// - `scales` — per-group f32 scale, length `n_tokens * n_groups`.
-/// - `norms` — per-token L2 norm, length `n_tokens`.
-/// - `rotors` — static per-(layer, head) rotor table (`n_groups * 4` f32).
-/// - `head_dim` — must be `> 0` and match the encode call.
-///
-/// # Returns
-///
-/// Dequantised f32 values of length `norms.len() * head_dim`.
-///
 /// # Errors
 ///
 /// Returns [`RotorQuantError`] for shape/length mismatches.
@@ -429,6 +435,49 @@ pub fn rotor3_decode(
     norms: &[f32],
     rotors: &[f32],
     head_dim: usize,
+) -> Result<Vec<f32>, RotorQuantError> {
+    rotor_decode(codes_packed, scales, norms, rotors, head_dim, ROTOR3_BITS)
+}
+
+/// Decode a rotor4-compressed V tensor — [`rotor3_decode`] at 4 bits.
+///
+/// # Errors
+///
+/// Returns [`RotorQuantError`] for shape/length mismatches.
+pub fn rotor4_decode(
+    codes_packed: &[u32],
+    scales: &[f32],
+    norms: &[f32],
+    rotors: &[f32],
+    head_dim: usize,
+) -> Result<Vec<f32>, RotorQuantError> {
+    rotor_decode(codes_packed, scales, norms, rotors, head_dim, ROTOR4_BITS)
+}
+
+/// Decode a rotor-compressed V tensor at `bits`.
+///
+/// # Arguments
+///
+/// - `codes_packed` — the dense code plane written by [`rotor_encode`].
+/// - `scales` — per-group f32 scale, length `n_tokens * n_groups`.
+/// - `norms` — per-token L2 norm, length `n_tokens`.
+/// - `rotors` — static per-(layer, head) rotor table (`n_groups * 4` f32).
+/// - `head_dim` — must be `> 0` and match the encode call.
+///
+/// # Returns
+///
+/// Dequantized f32 values of length `norms.len() * head_dim`.
+///
+/// # Errors
+///
+/// Returns [`RotorQuantError`] for shape/length mismatches.
+pub fn rotor_decode(
+    codes_packed: &[u32],
+    scales: &[f32],
+    norms: &[f32],
+    rotors: &[f32],
+    head_dim: usize,
+    bits: u8,
 ) -> Result<Vec<f32>, RotorQuantError> {
     if head_dim == 0 {
         return Err(RotorQuantError::HeadDimZero);
@@ -443,14 +492,29 @@ pub fn rotor3_decode(
         });
     }
 
-    let codebook = lloyd_gaussian_codebook(ROTOR3_BITS)
-        .map_err(|e| RotorQuantError::Codebook(e.to_string()))?;
+    let codebook =
+        lloyd_gaussian_codebook(bits).map_err(|e| RotorQuantError::Codebook(e.to_string()))?;
 
     let n_tokens = norms.len();
-    let words_per_group = ROTOR3_WORDS_PER_GROUP;
+    let row_words = row_words_for(head_dim, bits);
+    // The plane is read a row at a time; a short one would have a row read
+    // into its neighbour's words rather than fail.
+    if codes_packed.len() < n_tokens * row_words {
+        return Err(RotorQuantError::CodePlaneLen {
+            got: codes_packed.len(),
+            expected: n_tokens * row_words,
+            n_tokens,
+        });
+    }
     let mut out = vec![0.0_f32; n_tokens * head_dim];
 
     for (tok, &norm) in norms.iter().enumerate() {
+        // tok < n_tokens and the length was checked above.
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "codes_packed.len() >= n_tokens * row_words, checked above"
+        )]
+        let row = &codes_packed[tok * row_words..(tok + 1) * row_words];
         for grp in 0..n_groups {
             let flat_grp = tok * n_groups + grp;
             // flat_grp < n_tokens * n_groups = scales.len() by encode contract.
@@ -473,25 +537,19 @@ pub fn rotor3_decode(
                 rotors[r_base + 3],
             ];
 
-            // Unpack 8 codes from 1 u32.
-            let word_base = flat_grp * words_per_group;
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "word_base < codes_packed.len() by encode contract (total_groups * 1)"
-            )]
-            let word = codes_packed[word_base];
-            let codes = unpack_group(word);
-
-            // Dequantise: code → centroid → multiply by per-group scale.
+            // Dequantise the three stored components into their grade-1 slots;
+            // the rest of the multivector is the zero the encoder rotated.
             let mut mv_q = [0.0_f32; ROTOR3_MV_COMPONENTS];
-            for (slot, &c) in mv_q.iter_mut().zip(codes.iter()) {
-                // c < 8 = codebook.len() by construction (pack mask 0x7).
+            for e in 0..ROTOR_CODES_PER_GROUP {
+                let c = crate::code_plane::read_code(row, grp * ROTOR_CODES_PER_GROUP + e, bits);
+                // c < 2^bits = codebook.len() by the plane's mask.
                 #[allow(
                     clippy::indexing_slicing,
-                    reason = "c < 2^3 = codebook.len() by pack mask (0x7)"
+                    reason = "c < 2^bits = codebook.len() by the code plane's mask"
                 )]
-                let centroid = codebook[c as usize];
-                *slot = centroid * scale;
+                {
+                    mv_q[e + GRADE1_BASE] = codebook[c as usize] * scale;
+                }
             }
 
             // Inverse sandwich: R̃ * mv_q * R.
@@ -505,8 +563,8 @@ pub fn rotor3_decode(
 
             // Extract grade-1 components → original 3-vector slot.
             let out_row = tok * head_dim;
-            let grp_start = grp * ROTOR3_GROUP_SIZE;
-            for e in 0..ROTOR3_GROUP_SIZE {
+            let grp_start = grp * ROTOR_CODES_PER_GROUP;
+            for e in 0..ROTOR_CODES_PER_GROUP {
                 let idx = grp_start + e;
                 if idx < head_dim {
                     // idx < head_dim ≤ out.len() - tok*head_dim by construction.
@@ -515,301 +573,7 @@ pub fn rotor3_decode(
                         reason = "out_row + idx < n_tokens*head_dim = out.len() by construction"
                     )]
                     {
-                        // Grade-1 sits at MV indices 1..=3.
-                        out[out_row + idx] = restored[e + 1] * norm;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-// ── rotor4 pack / unpack ───────────────────────────────────────────────────────
-
-/// Pack 8 codes for one group into 1 u32 (rotor4 / iso4 dense convention).
-///
-/// `mask = 0xF`; element `e` lands at bits `[e*4 .. e*4+4]`. With 8 elements
-/// the highest bit used is `7 * 4 + 3 = 31` — fills the u32 exactly.
-#[inline]
-fn pack_group_4bit(codes: [u8; ROTOR3_MV_COMPONENTS]) -> u32 {
-    debug_assert!(
-        codes.iter().all(|&c| c < 16),
-        "pack_group_4bit: code out of range [0,15]"
-    );
-    let mut w: u32 = 0;
-    for (e, &c) in codes.iter().enumerate() {
-        w |= (u32::from(c) & 0xF) << (e * 4);
-    }
-    w
-}
-
-/// Unpack 1 u32 into 8 codes (inverse of [`pack_group_4bit`]).
-#[inline]
-fn unpack_group_4bit(word: u32) -> [u8; ROTOR3_MV_COMPONENTS] {
-    let mut out = [0_u8; ROTOR3_MV_COMPONENTS];
-    for (e, slot) in out.iter_mut().enumerate() {
-        *slot = ((word >> (e * 4)) & 0xF) as u8;
-    }
-    out
-}
-
-// ── rotor4 encode ─────────────────────────────────────────────────────────────
-
-/// Encode a V tensor with the rotor4 codec.
-///
-/// Identical algorithm to [`rotor3_encode`] except:
-/// - Uses [`lloyd_gaussian_codebook`]`(4)` (16 centroids).
-/// - Packs 8 codes per u32 at 4 bits each (dense iso4 convention — `mask = 0xF`).
-///
-/// # Arguments
-///
-/// - `v` — flat f32 slice of shape `[n_tokens, head_dim]`.
-/// - `rotors` — static per-(layer, head) rotor table, flat `[n_groups * 4]` f32.
-/// - `head_dim` — must be `> 0`.
-///
-/// # Returns
-///
-/// `(codes_packed, scales, norms)`:
-///
-/// - `codes_packed` — 4-bit indices packed at 8 per u32. Length
-///   `n_tokens * n_groups * ROTOR4_WORDS_PER_GROUP` (= `n_tokens * n_groups` u32s).
-/// - `scales` — per-group f32 scale. Length `n_tokens * n_groups`.
-/// - `norms` — per-token L2 norm. Length `n_tokens`.
-///
-/// # Errors
-///
-/// Returns [`RotorQuantError`] for invalid inputs.
-pub fn rotor4_encode(
-    v: &[f32],
-    rotors: &[f32],
-    head_dim: usize,
-) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>), RotorQuantError> {
-    if head_dim == 0 {
-        return Err(RotorQuantError::HeadDimZero);
-    }
-    if !v.len().is_multiple_of(head_dim) {
-        return Err(RotorQuantError::LenNotMultipleOfHeadDim {
-            len: v.len(),
-            head_dim,
-        });
-    }
-    let n_groups = n_groups_for(head_dim);
-    let expected = n_groups * 4;
-    if rotors.len() != expected {
-        return Err(RotorQuantError::RotorTableLen {
-            got: rotors.len(),
-            expected,
-            n_groups,
-        });
-    }
-
-    let codebook = lloyd_gaussian_codebook(ROTOR4_BITS)
-        .map_err(|e| RotorQuantError::Codebook(e.to_string()))?;
-    let max_centroid = codebook
-        .iter()
-        .copied()
-        .fold(0.0_f32, |acc, c| acc.max(c.abs()));
-
-    let n_tokens = v.len() / head_dim;
-    let words_per_group = ROTOR4_WORDS_PER_GROUP;
-    let total_groups = n_tokens * n_groups;
-
-    let mut codes_all: Vec<u32> = Vec::with_capacity(total_groups * words_per_group);
-    let mut scales: Vec<f32> = Vec::with_capacity(total_groups);
-    let mut norms: Vec<f32> = Vec::with_capacity(n_tokens);
-
-    for tok in 0..n_tokens {
-        // tok < n_tokens = v.len() / head_dim guarantees the row slice fits.
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "tok < n_tokens = v.len()/head_dim; row slice is in-bounds"
-        )]
-        let row = &v[tok * head_dim..(tok + 1) * head_dim];
-        // Rounded to the stored sideband precision before use — see
-        // `crate::isoquant`: the decode multiplies by the *stored* norm.
-        let norm = {
-            let sq: f32 = row.iter().map(|&x| x * x).sum();
-            bf16_round(sq.sqrt().max(1e-8))
-        };
-        norms.push(norm);
-
-        for grp in 0..n_groups {
-            let r_base = grp * 4;
-            // r_base + 3 < rotors.len() == n_groups * 4 by validation above.
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "r_base+3 < n_groups*4 = rotors.len() validated above"
-            )]
-            let r: Rotor = [
-                rotors[r_base],
-                rotors[r_base + 1],
-                rotors[r_base + 2],
-                rotors[r_base + 3],
-            ];
-
-            let grp_start = grp * ROTOR4_GROUP_SIZE;
-            let mut mv = [0.0_f32; ROTOR3_MV_COMPONENTS];
-            for e in 0..ROTOR4_GROUP_SIZE {
-                let idx = grp_start + e;
-                if idx < head_dim {
-                    #[allow(
-                        clippy::indexing_slicing,
-                        reason = "idx < head_dim = row.len() by construction"
-                    )]
-                    {
-                        mv[e + 1] = row[idx] / norm;
-                    }
-                }
-            }
-
-            // Forward sandwich: R * mv * R̃.
-            let rotated = rotor_sandwich(r, &mv);
-
-            let max_abs = rotated
-                .iter()
-                .copied()
-                .fold(0.0_f32, |acc, x| acc.max(x.abs()));
-            // Rounded to the stored sideband precision before the codes are
-            // chosen against it.
-            let scale = bf16_round(if max_abs < 1e-12 {
-                1e-12
-            } else {
-                max_abs / max_centroid
-            });
-            scales.push(scale);
-
-            let mut group_codes = [0_u8; ROTOR3_MV_COMPONENTS];
-            for (e, &rv) in rotated.iter().enumerate() {
-                let normalised = rv / scale;
-                let idx = codebook
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, &a), (_, &b)| {
-                        (a - normalised).abs().total_cmp(&(b - normalised).abs())
-                    })
-                    .map_or(0, |(i, _)| i as u8);
-                // idx < 16 by construction (codebook has 16 entries); fits 4 bits.
-                #[allow(
-                    clippy::indexing_slicing,
-                    reason = "e < ROTOR3_MV_COMPONENTS = group_codes.len() by loop bound"
-                )]
-                {
-                    group_codes[e] = idx;
-                }
-            }
-
-            // Pack 8 codes into 1 u32 (dense 4-bit / iso4 convention).
-            codes_all.push(pack_group_4bit(group_codes));
-        }
-    }
-
-    Ok((codes_all, scales, norms))
-}
-
-// ── rotor4 decode ─────────────────────────────────────────────────────────────
-
-/// Decode a rotor4-compressed V tensor.
-///
-/// Reverses [`rotor4_encode`]. All parameters must match the encode call.
-///
-/// # Arguments
-///
-/// - `codes_packed` — packed 4-bit indices (8 per u32).
-/// - `scales` — per-group f32 scale, length `n_tokens * n_groups`.
-/// - `norms` — per-token L2 norm, length `n_tokens`.
-/// - `rotors` — static per-(layer, head) rotor table (`n_groups * 4` f32).
-/// - `head_dim` — must be `> 0` and match the encode call.
-///
-/// # Returns
-///
-/// Dequantised f32 values of length `norms.len() * head_dim`.
-///
-/// # Errors
-///
-/// Returns [`RotorQuantError`] for shape/length mismatches.
-pub fn rotor4_decode(
-    codes_packed: &[u32],
-    scales: &[f32],
-    norms: &[f32],
-    rotors: &[f32],
-    head_dim: usize,
-) -> Result<Vec<f32>, RotorQuantError> {
-    if head_dim == 0 {
-        return Err(RotorQuantError::HeadDimZero);
-    }
-    let n_groups = n_groups_for(head_dim);
-    let expected = n_groups * 4;
-    if rotors.len() != expected {
-        return Err(RotorQuantError::RotorTableLen {
-            got: rotors.len(),
-            expected,
-            n_groups,
-        });
-    }
-
-    let codebook = lloyd_gaussian_codebook(ROTOR4_BITS)
-        .map_err(|e| RotorQuantError::Codebook(e.to_string()))?;
-
-    let n_tokens = norms.len();
-    let words_per_group = ROTOR4_WORDS_PER_GROUP;
-    let mut out = vec![0.0_f32; n_tokens * head_dim];
-
-    for (tok, &norm) in norms.iter().enumerate() {
-        for grp in 0..n_groups {
-            let flat_grp = tok * n_groups + grp;
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "flat_grp < n_tokens*n_groups = scales.len() by encode contract"
-            )]
-            let scale = scales[flat_grp];
-
-            let r_base = grp * 4;
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "r_base+3 < n_groups*4 = rotors.len() validated above"
-            )]
-            let r: Rotor = [
-                rotors[r_base],
-                rotors[r_base + 1],
-                rotors[r_base + 2],
-                rotors[r_base + 3],
-            ];
-
-            let word_base = flat_grp * words_per_group;
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "word_base < codes_packed.len() by encode contract"
-            )]
-            let word = codes_packed[word_base];
-            let codes = unpack_group_4bit(word);
-
-            let mut mv_q = [0.0_f32; ROTOR3_MV_COMPONENTS];
-            for (slot, &c) in mv_q.iter_mut().zip(codes.iter()) {
-                // c < 16 = codebook.len() by construction (pack mask 0xF).
-                #[allow(
-                    clippy::indexing_slicing,
-                    reason = "c < 2^4 = codebook.len() by pack mask (0xF)"
-                )]
-                let centroid = codebook[c as usize];
-                *slot = centroid * scale;
-            }
-
-            // Inverse sandwich: R̃ * mv_q * R.
-            let restored = rotor_sandwich(rotor_reverse(r), &mv_q);
-
-            let out_row = tok * head_dim;
-            let grp_start = grp * ROTOR4_GROUP_SIZE;
-            for e in 0..ROTOR4_GROUP_SIZE {
-                let idx = grp_start + e;
-                if idx < head_dim {
-                    #[allow(
-                        clippy::indexing_slicing,
-                        reason = "out_row + idx < n_tokens*head_dim = out.len() by construction"
-                    )]
-                    {
-                        out[out_row + idx] = restored[e + 1] * norm;
+                        out[out_row + idx] = restored[e + GRADE1_BASE] * norm;
                     }
                 }
             }

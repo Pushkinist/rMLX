@@ -292,12 +292,14 @@ fn rotor_k4_msl_matches_cpu_within_eps() {
 // The tests below pin the GPU encoder directly against the CPU encoder:
 //
 //   1. `..._gpu_encode_matches_cpu_encode` — same input fed through
-//      both encoders, assert ≥ 95% sub-code agreement.  Empirically the
-//      MEDIUM-2 caveat (GPU 3-of-8 scale shortcut vs CPU 8-of-8 max-abs)
-//      drives ~4–5% boundary-slip sub-codes — all of them are ±1 from the
-//      CPU centroid index, not algorithmic divergence.  Scales + norms must
-//      still agree within (1e-5 abs + 1e-4 rel) per element.  A sign error
-//      in `M(R)` would manifest as ≥30% disagreement, far below the gate.
+//      both encoders, assert ≥ 95% code agreement.  Both sides take their
+//      scale from the three stored grade-1 components, so what is left is
+//      the assignment rule: the CPU scans for the nearest centroid, the GPU
+//      compares against the midpoint boundaries, and the two can disagree
+//      only at a boundary — every disagreement is ±1 from the CPU centroid
+//      index, which `assert_one_step_slips` pins.  Scales + norms must still
+//      agree within (1e-5 abs + 1e-4 rel) per element.  A sign error in
+//      `M(R)` would manifest as ≥30% disagreement, far below the gate.
 //   2. `..._gpu_encode_then_cpu_decode_round_trip` — gpu encode + CPU
 //      decode, compare against the CPU encode + CPU decode of the same
 //      input within 5e-3 (the same tolerance the original 4 round-trip
@@ -325,8 +327,15 @@ fn gpu_encode_v3(
     )]
     let n_tokens = shape[0] as usize;
     let n_groups = head_dim.div_ceil(ROTOR3_GROUP_SIZE);
-    rotor_gpu_outputs_to_cpu(&codes_arr, &scales_arr, &norms_arr, n_tokens, n_groups)
-        .expect("rotor3 gpu outputs to cpu")
+    rotor_gpu_outputs_to_cpu(
+        &codes_arr,
+        &scales_arr,
+        &norms_arr,
+        n_tokens,
+        n_groups,
+        crate::rotorquant::row_words_for(head_dim, 3),
+    )
+    .expect("rotor3 gpu outputs to cpu")
 }
 
 #[allow(
@@ -348,60 +357,72 @@ fn gpu_encode_v4(
     )]
     let n_tokens = shape[0] as usize;
     let n_groups = head_dim.div_ceil(ROTOR3_GROUP_SIZE);
-    rotor_gpu_outputs_to_cpu(&codes_arr, &scales_arr, &norms_arr, n_tokens, n_groups)
-        .expect("rotor4 gpu outputs to cpu")
+    rotor_gpu_outputs_to_cpu(
+        &codes_arr,
+        &scales_arr,
+        &norms_arr,
+        n_tokens,
+        n_groups,
+        crate::rotorquant::row_words_for(head_dim, 4),
+    )
+    .expect("rotor4 gpu outputs to cpu")
 }
 
-/// Compare two packed-code streams element-wise; codes are u32 words holding
-/// 8 sub-codes each. Returns (n_pairs, n_disagree) where `n_pairs` is
-/// `min(a.len(), b.len()) * 8` and `n_disagree` counts mismatching sub-codes
-/// (whole words counted as 8 if all bits differ; in practice we expect at
-/// most a single boundary slip per group).
-fn count_code_disagreements(a: &[u32], b: &[u32], bits: u8) -> (usize, usize) {
-    assert_eq!(a.len(), b.len(), "code length mismatch");
-    let mask: u32 = (1u32 << bits) - 1;
-    let mut n_pairs = 0usize;
-    let mut n_disagree = 0usize;
-    for (&wa, &wb) in a.iter().zip(b.iter()) {
-        for e in 0..8u32 {
-            let shift = e * u32::from(bits);
-            let ca = (wa >> shift) & mask;
-            let cb = (wb >> shift) & mask;
-            n_pairs += 1;
-            if ca != cb {
-                n_disagree += 1;
-            }
+/// Every code of a dense-plane stream, row by row.
+///
+/// Reads through [`crate::code_plane::read_code`] rather than shifting the
+/// words here: a second unpack rule in the test would agree with itself while
+/// disagreeing with the store.
+fn plane_codes(words: &[u32], head_dim: usize, bits: u8) -> Vec<u8> {
+    let row_words = crate::rotorquant::row_words_for(head_dim, bits);
+    let per_row = crate::rotorquant::codes_per_row(head_dim);
+    let rows = words.len() / row_words;
+    let mut out = Vec::with_capacity(rows * per_row);
+    for r in 0..rows {
+        let row = &words[r * row_words..(r + 1) * row_words];
+        for i in 0..per_row {
+            out.push(crate::code_plane::read_code(row, i, bits));
         }
     }
-    (n_pairs, n_disagree)
+    out
 }
 
-/// Assert that every disagreeing sub-code differs from its CPU counterpart by
-/// exactly ±1 in the codebook index space. A sign error in `M(R)` or a
-/// packing-order bug would produce arbitrary multi-step jumps; the GPU
-/// 3-of-8 scale shortcut (MEDIUM-2) can only nudge a single boundary.
-fn assert_one_step_slips(a: &[u32], b: &[u32], bits: u8, name: &str) {
+/// Compare two dense code planes code by code. Returns (n_pairs, n_disagree).
+fn count_code_disagreements(a: &[u32], b: &[u32], head_dim: usize, bits: u8) -> (usize, usize) {
+    assert_eq!(a.len(), b.len(), "code length mismatch");
+    let (ca, cb) = (
+        plane_codes(a, head_dim, bits),
+        plane_codes(b, head_dim, bits),
+    );
+    let n_disagree = ca.iter().zip(cb.iter()).filter(|(x, y)| x != y).count();
+    (ca.len(), n_disagree)
+}
+
+/// Assert that every disagreeing code differs from its CPU counterpart by
+/// exactly ±1 in the codebook index space. A sign error in `M(R)`, or a
+/// packing-order bug, would produce arbitrary multi-step jumps; the two
+/// assignment rules — the CPU's nearest-centroid scan against the GPU's
+/// boundary comparisons — can only disagree at a boundary.
+fn assert_one_step_slips(a: &[u32], b: &[u32], head_dim: usize, bits: u8, name: &str) {
     assert_eq!(a.len(), b.len(), "[{name}] code length mismatch");
-    let mask: u32 = (1u32 << bits) - 1;
+    let (ca_all, cb_all) = (
+        plane_codes(a, head_dim, bits),
+        plane_codes(b, head_dim, bits),
+    );
     let mut bad_jumps = 0usize;
     let mut total_diff = 0usize;
-    for (&wa, &wb) in a.iter().zip(b.iter()) {
-        for e in 0..8u32 {
-            let shift = e * u32::from(bits);
-            let ca = ((wa >> shift) & mask) as i32;
-            let cb = ((wb >> shift) & mask) as i32;
-            let d = (cb - ca).abs();
-            if d != 0 {
-                total_diff += 1;
-                if d > 1 {
-                    bad_jumps += 1;
-                }
+    for (&ca, &cb) in ca_all.iter().zip(cb_all.iter()) {
+        let d = i32::from(cb) - i32::from(ca);
+        if d != 0 {
+            total_diff += 1;
+            if d.abs() > 1 {
+                bad_jumps += 1;
             }
         }
     }
     assert!(
         bad_jumps == 0,
-        "[{name}] {bad_jumps} sub-codes differ by >1 step ({total_diff} total diffs); \
+        "[{name}] {bad_jumps} codes differ by >1 step ({total_diff} total diffs); \
          boundary-slip-only invariant violated — possible algorithmic divergence",
     );
 }
@@ -445,15 +466,17 @@ fn rotor_v3_gpu_encode_matches_cpu_encode() {
     let (gpu_codes, gpu_scales, gpu_norms_per_grp) =
         gpu_encode_v3(&data, &rotors_arr, head_dim, &shape);
 
-    // Codes: ≥95% sub-code agreement (MEDIUM-2 caveat — boundary slips
-    // from the GPU 3-of-8 scale shortcut vs CPU 8-of-8 max-abs).
-    let (n_pairs, n_disagree) = count_code_disagreements(&cpu_codes, &gpu_codes, 3);
+    // Codes: >=95% agreement. Both sides now take their scale from the three
+    // stored grade-1 components, so what is left is the assignment rule — the
+    // CPU's nearest-centroid scan against the GPU's boundary comparisons — which
+    // can only disagree at a boundary.
+    let (n_pairs, n_disagree) = count_code_disagreements(&cpu_codes, &gpu_codes, head_dim, 3);
     let agree_pct = 100.0 * ((n_pairs - n_disagree) as f64) / (n_pairs as f64);
     assert!(
         agree_pct >= 95.0,
-        "rotor3 V code agreement {agree_pct:.4}% < 95% (disagree {n_disagree} / {n_pairs}, MEDIUM-2 caveat allows boundary slack but a sign bug would push this well below 70%)",
+        "rotor3 V code agreement {agree_pct:.4}% < 95% (disagree {n_disagree} / {n_pairs}, boundary slack is allowed but a sign bug would push this well below 70%)",
     );
-    assert_one_step_slips(&cpu_codes, &gpu_codes, 3, "rotor3 V");
+    assert_one_step_slips(&cpu_codes, &gpu_codes, head_dim, 3, "rotor3 V");
 
     // Scales: per-element within (1e-5 abs + 1e-4 rel).
     assert_close(&gpu_scales, &cpu_scales, 1e-5, 1e-4, "rotor3 V scales");
@@ -490,13 +513,13 @@ fn rotor_v4_gpu_encode_matches_cpu_encode() {
     let (gpu_codes, gpu_scales, gpu_norms_per_grp) =
         gpu_encode_v4(&data, &rotors_arr, head_dim, &shape);
 
-    let (n_pairs, n_disagree) = count_code_disagreements(&cpu_codes, &gpu_codes, 4);
+    let (n_pairs, n_disagree) = count_code_disagreements(&cpu_codes, &gpu_codes, head_dim, 4);
     let agree_pct = 100.0 * ((n_pairs - n_disagree) as f64) / (n_pairs as f64);
     assert!(
         agree_pct >= 95.0,
-        "rotor4 V code agreement {agree_pct:.4}% < 95% (disagree {n_disagree} / {n_pairs}, MEDIUM-2 caveat allows boundary slack but a sign bug would push this well below 70%)",
+        "rotor4 V code agreement {agree_pct:.4}% < 95% (disagree {n_disagree} / {n_pairs}, boundary slack is allowed but a sign bug would push this well below 70%)",
     );
-    assert_one_step_slips(&cpu_codes, &gpu_codes, 4, "rotor4 V");
+    assert_one_step_slips(&cpu_codes, &gpu_codes, head_dim, 4, "rotor4 V");
     assert_close(&gpu_scales, &cpu_scales, 1e-5, 1e-4, "rotor4 V scales");
     assert_close(&gpu_norms_per_grp, &cpu_norms, 1e-5, 1e-4, "rotor4 V norms");
 }
@@ -529,13 +552,13 @@ fn rotor_k3_gpu_encode_matches_cpu_encode() {
     let (gpu_codes, gpu_scales, gpu_norms_per_grp) =
         gpu_encode_v3(&data, &rotors_arr, head_dim, &shape);
 
-    let (n_pairs, n_disagree) = count_code_disagreements(&cpu_codes, &gpu_codes, 3);
+    let (n_pairs, n_disagree) = count_code_disagreements(&cpu_codes, &gpu_codes, head_dim, 3);
     let agree_pct = 100.0 * ((n_pairs - n_disagree) as f64) / (n_pairs as f64);
     assert!(
         agree_pct >= 95.0,
         "rotor3 K code agreement {agree_pct:.4}% < 95% (disagree {n_disagree} / {n_pairs})",
     );
-    assert_one_step_slips(&cpu_codes, &gpu_codes, 3, "rotor3 K");
+    assert_one_step_slips(&cpu_codes, &gpu_codes, head_dim, 3, "rotor3 K");
     assert_close(&gpu_scales, &cpu_scales, 1e-5, 1e-4, "rotor3 K scales");
     assert_close(&gpu_norms_per_grp, &cpu_norms, 1e-5, 1e-4, "rotor3 K norms");
 }
@@ -566,13 +589,13 @@ fn rotor_k4_gpu_encode_matches_cpu_encode() {
     let (gpu_codes, gpu_scales, gpu_norms_per_grp) =
         gpu_encode_v4(&data, &rotors_arr, head_dim, &shape);
 
-    let (n_pairs, n_disagree) = count_code_disagreements(&cpu_codes, &gpu_codes, 4);
+    let (n_pairs, n_disagree) = count_code_disagreements(&cpu_codes, &gpu_codes, head_dim, 4);
     let agree_pct = 100.0 * ((n_pairs - n_disagree) as f64) / (n_pairs as f64);
     assert!(
         agree_pct >= 95.0,
         "rotor4 K code agreement {agree_pct:.4}% < 95% (disagree {n_disagree} / {n_pairs})",
     );
-    assert_one_step_slips(&cpu_codes, &gpu_codes, 4, "rotor4 K");
+    assert_one_step_slips(&cpu_codes, &gpu_codes, head_dim, 4, "rotor4 K");
     assert_close(&gpu_scales, &cpu_scales, 1e-5, 1e-4, "rotor4 K scales");
     assert_close(&gpu_norms_per_grp, &cpu_norms, 1e-5, 1e-4, "rotor4 K norms");
 }

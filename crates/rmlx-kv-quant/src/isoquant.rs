@@ -6,11 +6,9 @@
 //! to groups of 4 elements before Lloyd-Max quantization.
 //!
 //! iso4 parameterizes the existing iso3 encoder/decoder over
-//! `bits ∈ {3, 4}`. The 4-bit path (iso4) is a trivial follow-on: it uses
-//! [`lloyd_gaussian_codebook(4)`] (16 centroids) and the dense 8-vals-per-u32
-//! pack (32 bits used, 0 wasted) instead of iso3's 10-vals-per-u32 pack (30
-//! bits used, 2 wasted). All other algorithmic steps — rotation, scale, group
-//! layout, quaternion / norm storage — are identical.
+//! `bits ∈ {3, 4}`: it uses [`lloyd_gaussian_codebook(4)`] (16 centroids) and
+//! the same dense code plane at 4 bits per code. All other algorithmic steps —
+//! rotation, scale, group layout, quaternion / norm storage — are identical.
 //!
 //! Pipeline per token:
 //!   1. L2-normalise the vector; store the norm separately.
@@ -20,8 +18,9 @@
 //!      unit quaternion (see [`FIXED_QUAT`]).
 //!   4. Within each group, compute a per-group scale (`max|r_i| / max_centroid`)
 //!      and quantize all elements against the `bits`-bit Lloyd-Max N(0,1) codebook.
-//!   5. Pack `32/bits` codes per u32 (`vals_per_word(bits)`) — same convention as
-//!      Planar3 pack convention to enable future kernel reuse.
+//!   5. Pack the row's codes into the dense code plane — `bits` per code,
+//!      packed across the row's groups, the row padded to a whole u32 (see
+//!      [`crate::code_plane`]).
 //!
 //! Dequantize reverses steps 5→1:
 //!   1. Unpack codes → centroid lookup → rescale by per-group scale.
@@ -54,11 +53,10 @@
 //!
 //! # Bit-packing
 //!
-//! Generic packer: `vals_per_word = 32 / bits`. Element `e` within a group maps
-//! to `word = e / vals_per_word`, `shift = (e % vals_per_word) * bits`.
-//!
-//! - `bits=3`: 10 vals/u32, 30 bits used, 2 wasted — Planar3 pack convention.
-//! - `bits=4`: 8 vals/u32, 32 bits used, 0 wasted — dense packing for iso4.
+//! [`crate::code_plane`], parameterised by `bits`: code `i` of a row starts at
+//! bit `i * bits`, and only the row's last word is partly unused. At
+//! `head_dim = 128` that is 12 words per row at 3 bits and 16 at 4, against the
+//! 32 a word-per-group cadence spends at either width.
 //!
 //! # Wire-up status
 //!
@@ -95,18 +93,6 @@ pub const FIXED_QUAT: [f32; 4] = {
     [1.0 / NORM, PHI / NORM, PHI_M1 / NORM, 1.0 / NORM]
 };
 
-/// Number of values packed per u32 word for `bits`.
-///
-/// - `bits=3` → 10 vals/u32 (30 bits used, 2 wasted — Planar3 convention).
-/// - `bits=4` → 8 vals/u32 (32 bits used, 0 wasted — dense iso4 packing).
-///
-/// Defined as `32 / bits`; only 3 and 4 are validated codec values.
-#[inline]
-fn vals_per_word(bits: u8) -> usize {
-    debug_assert!(bits == 3 || bits == 4, "vals_per_word: bits must be 3 or 4");
-    (32 / bits) as usize
-}
-
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors from the iso3 / iso4 codec.
@@ -131,6 +117,17 @@ pub enum IsoQuantError {
     InvalidGroupSize {
         /// The offending group size.
         group_size: usize,
+    },
+
+    /// The code plane is shorter than `n_tokens` whole rows.
+    #[error("isoquant: code plane holds {got} words for {n_tokens} rows, which need {expected}")]
+    CodePlaneLen {
+        /// Actual plane length in u32 words.
+        got: usize,
+        /// Words `n_tokens` rows occupy.
+        expected: usize,
+        /// Rows the norms vector asks for.
+        n_tokens: usize,
     },
 
     /// `head_dim` is not a multiple of `group_size`.
@@ -210,53 +207,6 @@ pub fn quat_conjugate(q: [f32; 4]) -> [f32; 4] {
 
 // ── Bit packing helpers ───────────────────────────────────────────────────────
 
-/// Pack `bits`-wide indices into u32 words at `32 / bits` values per word.
-///
-/// Element `e` within a flat sequence of `n_codes` indices maps to:
-///   `word  = e / vals_per_word(bits)`
-///   `shift = (e % vals_per_word(bits)) * bits`
-///
-/// `bits=3` matches the Planar3 pack convention; `bits=4` is the dense iso4
-/// pack. Higher bits are not used by this codec — caller must pass 3 or 4.
-fn pack_bits(indices: &[u8], bits: u8) -> Vec<u32> {
-    let vpw = vals_per_word(bits);
-    let mask: u32 = (1u32 << bits) - 1;
-    let n_words = indices.len().div_ceil(vpw);
-    let mut words = vec![0u32; n_words];
-    for (e, &idx) in indices.iter().enumerate() {
-        let word = e / vpw;
-        let shift = (e % vpw) * (bits as usize);
-        // word < n_words by construction: word = e / vpw < div_ceil(len, vpw) = n_words.
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "word = e / vpw < div_ceil(indices.len(), vpw) = n_words = words.len()"
-        )]
-        {
-            words[word] |= (u32::from(idx) & mask) << shift;
-        }
-    }
-    words
-}
-
-/// Unpack `bits`-wide indices from u32 words (`32 / bits` values per word).
-fn unpack_bits(words: &[u32], n_codes: usize, bits: u8) -> Vec<u8> {
-    let vpw = vals_per_word(bits);
-    let mask: u32 = (1u32 << bits) - 1;
-    let mut indices = Vec::with_capacity(n_codes);
-    for e in 0..n_codes {
-        let word = e / vpw;
-        let shift = (e % vpw) * (bits as usize);
-        // word < words.len() by construction: caller ensures words.len() == div_ceil(n_codes, vpw).
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "word = e / vpw < div_ceil(n_codes, vpw) = words.len()"
-        )]
-        let idx = ((words[word] >> shift) & mask) as u8;
-        indices.push(idx);
-    }
-    indices
-}
-
 // ── Encode ────────────────────────────────────────────────────────────────────
 
 /// Encode V tensor with iso3 / iso4: quaternion rotation + `bits`-bit Lloyd-Max
@@ -268,8 +218,8 @@ fn unpack_bits(words: &[u32], n_codes: usize, bits: u8) -> Vec<u8> {
 /// - `head_dim` — must be a positive multiple of 4.
 /// - `group_size` — elements per quantization group; must be a positive multiple of 4
 ///   and divide `head_dim` evenly. Typically 4 (one quaternion block per group).
-/// - `bits` — `3` for iso3 (10 vals/u32, Planar3 pack) or `4` for iso4
-///   (8 vals/u32, dense pack — iso4).
+/// - `bits` — `3` for iso3 or `4` for iso4; the code plane charges for the
+///   width either way.
 ///
 /// # Returns
 ///
@@ -325,12 +275,12 @@ pub fn iso_encode_fast(
 
     let n_tokens = v.len() / head_dim;
     let n_groups = head_dim / group_size;
-    let words_per_group = group_size.div_ceil(vals_per_word(bits));
 
     let total_groups = n_tokens * n_groups;
-    let total_words = total_groups * words_per_group;
+    let total_words = n_tokens * crate::code_plane::row_words(head_dim, bits);
 
     let mut codes_all = Vec::with_capacity(total_words);
+    let mut row_codes: Vec<u8> = Vec::with_capacity(head_dim);
     let mut scales = Vec::with_capacity(total_groups);
     let mut quaternions = Vec::with_capacity(total_groups * 4);
     let mut norms = Vec::with_capacity(n_tokens);
@@ -353,6 +303,7 @@ pub fn iso_encode_fast(
             bf16_round(sq.sqrt().max(1e-8))
         };
         norms.push(norm);
+        row_codes.clear();
 
         for grp in 0..n_groups {
             let grp_start = grp * group_size;
@@ -415,10 +366,11 @@ pub fn iso_encode_fast(
                 group_indices.push(idx);
             }
 
-            // Pack `bits`-bit indices.
-            let packed = pack_bits(&group_indices, bits);
-            codes_all.extend_from_slice(&packed);
+            row_codes.extend_from_slice(&group_indices);
         }
+
+        // One dense code plane row per token — see `crate::code_plane`.
+        crate::code_plane::pack_row_into(&row_codes, bits, &mut codes_all);
     }
 
     Ok((codes_all, scales, quaternions, norms))
@@ -478,11 +430,26 @@ pub fn iso_decode_fast(
 
     let n_tokens = norms.len();
     let n_groups = head_dim / group_size;
-    let words_per_group = group_size.div_ceil(vals_per_word(bits));
+    let row_words = crate::code_plane::row_words(head_dim, bits);
+    // The plane is read a row at a time; a short one would have a row read
+    // into its neighbour's words rather than fail.
+    if codes_packed.len() < n_tokens * row_words {
+        return Err(IsoQuantError::CodePlaneLen {
+            got: codes_packed.len(),
+            expected: n_tokens * row_words,
+            n_tokens,
+        });
+    }
 
     let mut out = vec![0.0_f32; n_tokens * head_dim];
 
     for (tok, &norm) in norms.iter().enumerate() {
+        // tok < n_tokens and the length was checked above.
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "codes_packed.len() >= n_tokens * row_words, checked above"
+        )]
+        let row = &codes_packed[tok * row_words..(tok + 1) * row_words];
         for grp in 0..n_groups {
             let flat_grp = tok * n_groups + grp;
 
@@ -508,15 +475,11 @@ pub fn iso_decode_fast(
             ];
             let q_l_conj = quat_conjugate(q_l);
 
-            // Unpack `bits`-bit codes for this group.
-            let code_base = flat_grp * words_per_group;
-            // code_base + words_per_group <= codes_packed.len() by encode contract.
-            #[allow(
-                clippy::indexing_slicing,
-                reason = "code_base+words_per_group <= codes_packed.len() by encode contract"
-            )]
-            let grp_words = &codes_packed[code_base..code_base + words_per_group];
-            let indices = unpack_bits(grp_words, group_size, bits);
+            // Read this group's codes out of the row's dense plane.
+            let code_base = grp * group_size;
+            let indices: Vec<u8> = (0..group_size)
+                .map(|e| crate::code_plane::read_code(row, code_base + e, bits))
+                .collect();
 
             // Dequantize: index → centroid → rescale.
             let mut dequant_vals = Vec::with_capacity(group_size);

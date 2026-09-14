@@ -326,12 +326,13 @@ fn assert_ring_is_counted(quant: KvQuant, prefill: i32) {
 ///
 /// This is the magnitude oracle the delta tests deliberately are not. It does
 /// not call `byte_size`'s arithmetic: it rebuilds the total from the layout
-/// `QuantKGpuRing` documents for its three buffers —
-/// `codes: u32[cap * kv_h * n_groups]` and the two sideband planes
+/// `QuantKGpuRing` documents for its three buffers — the dense code plane
+/// `codes: u32[cap * kv_h * row_words]` and the two sideband planes
 /// `scales[cap * kv_h * n_groups]` / `norms[cap * kv_h]` at
-/// `KV_SIDEBAND_DTYPE`, with iso's `n_groups = head_dim / 4` — and compares. A
-/// dtype or element-count error in the accounting (the 4-vs-8 byte class) fails
-/// here; the delta tests would sail through it.
+/// `KV_SIDEBAND_DTYPE`, with iso's `n_groups = head_dim / 4` and its row of
+/// `head_dim` codes — and compares. A dtype or element-count error in the
+/// accounting (the 4-vs-8 byte class) fails here; the delta tests would sail
+/// through it.
 ///
 /// The two widths are read from `Dtype::itemsize` rather than written as
 /// literals, but they are read from *different* sources than `byte_size` uses:
@@ -351,9 +352,11 @@ fn ring_bytes_match_independent_geometry() {
 
     let kv_h = KV_H as u64;
     let n_groups = HEAD_DIM as u64 / 4; // ISO_QUAT_BLOCK_SIZE
+                                        // One code per value at 3 bits, packed dense and padded to a whole word.
+    let row_words = (HEAD_DIM as u64 * 3).div_ceil(32);
     let code_w = Dtype::U32.itemsize() as u64;
     let side_w = KV_SIDEBAND_DTYPE.itemsize() as u64;
-    let codes = cap * kv_h * n_groups * code_w;
+    let codes = cap * kv_h * row_words * code_w;
     let scales = cap * kv_h * n_groups * side_w;
     let norms = cap * kv_h * side_w;
     let expected = codes + scales + norms;
