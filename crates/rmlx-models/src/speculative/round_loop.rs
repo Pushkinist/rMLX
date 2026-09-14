@@ -198,14 +198,17 @@ pub(crate) struct Prefilled {
     /// differs per drafter, and a loop that timed the call would move the figure
     /// on records no gate reads.
     pub(crate) prefill_ns: u128,
-    /// Conditioning rows the drafter has accumulated before its first round, or
-    /// `None` for a drafter that projects none.
+    /// Whether this drafter projects a conditioning buffer and reports the rows
+    /// it accumulates.
     ///
-    /// A statement made before any round has run, which is what the record of a
-    /// request that stopped on its seed reports. Past that the loop adds each
-    /// round's projected rows to it, so the tail record reports the request's
-    /// running total and a drafter that projects nothing keeps reporting `None`.
-    pub(crate) conditioned_rows: Option<usize>,
+    /// A statement about the drafter, made before any round has run. The rows
+    /// themselves are the loop's: it opens the count at zero for a drafter that
+    /// declares `true` and adds each round's projection to it, so the figure on
+    /// every record is the rows the request's rounds have projected so far —
+    /// zero before any round, and the drafter's starting window is not counted.
+    /// A drafter cannot supply an opening value, so a request cannot open at a
+    /// count no round projected.
+    pub(crate) projects_conditioning: bool,
 }
 
 /// What a round's verify forward decided.
@@ -350,7 +353,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
 
     let prefilled = drafter.prefill(&mut ctx, prompt_ids)?;
     let prefill_ns = prefilled.prefill_ns;
-    let mut conditioned_rows = prefilled.conditioned_rows;
+    let mut conditioned_rows = prefilled.projects_conditioning.then_some(0usize);
     let mut carry = prefilled.seed;
 
     if emit_seed_token(
@@ -478,10 +481,25 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         // Read back from what the projection returned rather than from what the
         // round meant to hand it, which is the reading the conditioning guard
         // takes too.
-        if let (Some(total), Some(projected)) = (
-            conditioned_rows.as_mut(),
-            conditioning.and_then(|c| c.projected),
-        ) {
+        let projected = conditioning.and_then(|c| c.projected);
+        // The declaration's second reader. Without one, a drafter that projects
+        // rows and declares it does not leaves the record reporting `None`, and
+        // `RoundStats::conditioning_violation` opens by returning on that
+        // `None` — so the bound over `emitted_in_rounds` is off for the whole
+        // request and every other observable reads clean.
+        if projected.is_some() && conditioned_rows.is_none() {
+            return Err(Error::Model(format!(
+                "{:?}: the drafter projected conditioning rows but declared it projects \
+                 none, so the request record reports `None` and the conditioning check \
+                 over `emitted_in_rounds` is guarded off for the whole request",
+                cfg.loop_kind
+            )));
+        }
+        if let (Some(total), Some(projected)) = (conditioned_rows.as_mut(), projected) {
+            // `guard_round_conditioning` refuses a negative projection inside
+            // `condition`, so this clamp cannot fire on any drafter on this
+            // loop. It is here for one that reports without guarding, where the
+            // alternative is a `usize` cast of a negative.
             *total += projected.max(0) as usize;
         }
         // The verifier's own token at the accepted position, read off the

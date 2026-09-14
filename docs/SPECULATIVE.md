@@ -602,9 +602,10 @@ full-attention arch (`lin` absent or empty) truncates and stops; a GDN hybrid
 also refolds. Its seven call sites are `dflash_generate`, `eagle3_generate`, the
 shared `run_rounds` — which serves the Gemma4 assistant (full attention, so
 truncation only), the MTP sidecar and DFlash 2 — and the two-model loops' four:
-greedy verifier, greedy drafter, stochastic verifier and stochastic drafter. There is deliberately no
-second copy: the defect the replay was written to fix lived in four independent
-implementations at once, and a rollback inlined per loop is how it got there.
+greedy verifier, greedy drafter, stochastic verifier and stochastic drafter.
+There is deliberately no second copy: the defect the replay was written to fix
+lived in four independent implementations at once, and a rollback inlined per
+loop is how it got there.
 
 The refold is checked against the replay it replaced —
 `a_round_tape_refolds_to_what_the_replay_produced` in

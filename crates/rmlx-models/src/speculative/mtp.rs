@@ -695,7 +695,7 @@ impl RoundDrafter for SidecarRound<'_> {
             prefill_ns,
             // The sidecar slices one verifier row per round and projects
             // nothing, so it accumulates no conditioning to report.
-            conditioned_rows: None,
+            projects_conditioning: false,
         })
     }
 

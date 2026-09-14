@@ -277,14 +277,23 @@ three are values the migration had to preserve or move.
 Six notes. One is a field the interface gained, one records a deviation with its
 reason, and four are values the migration had to preserve or move.
 
-- **`Prefilled::conditioned_rows` became an accumulator's opening value, and the
-  loop keeps the running total.** Item 9 proposed the declaration decide `Some`
-  against `None`; what landed is that plus the value the count opens at, which is
-  `Some(0)` for DFlash 2 and `None` for the two drafters that project nothing.
-  The seed record reports the declaration as it stands and the tail record
-  reports it plus every round's `Conditioning::projected`, under the `.max(0)`
-  clamp the loop it replaced applied. A drafter answering `None` accumulates
-  nothing, so the sidecar's and the assistant's records do not move.
+- **`Prefilled::projects_conditioning` is the declaration, exactly as item 9
+  proposes, and the rows are the loop's alone.** The drafter answers a `bool`;
+  the loop opens the count at zero for a `true` and adds each round's
+  `Conditioning::projected` to it under the `.max(0)` clamp the body it replaced
+  applied. An `Option<usize>` here would let a drafter supply an opening value,
+  and a non-zero one inside a block passes `RoundStats::conditioning_violation`
+  silently — the misreport class item 9 exists to prevent, re-admitted through
+  the field meant to close it. A drafter answering `false` accumulates nothing,
+  so the sidecar's and the assistant's records do not move.
+- **The declaration got a second reader, in the loop.** A drafter that projects
+  rows and declares it does not would leave the record reporting `None`, and
+  `conditioning_violation` opens by returning on that `None` — so the bound over
+  `emitted_in_rounds` is off for the whole request while every other observable
+  reads clean. `run_rounds` refuses a round whose `Conditioning` carries a
+  projection the request declared it would not make. It holds on this tree by
+  construction: the sidecar reports `projected: None`, the assistant reports no
+  `Conditioning` at all, and DFlash 2 reports `Some` under a `true`.
 - **`RoundOutcome` carries the round's index.** `guard_round_conditioning` names
   the round in its refusal, and the alternative — each drafter counting its own
   rounds — is a second counter beside the loop's that can drift, with the only
@@ -307,13 +316,21 @@ reason, and four are values the migration had to preserve or move.
   Some(..)` and no `d_offset_before` / `d_target`, the drafter keeping no cache
   and answering `rollback`'s default; and it charges its phases, the third loop
   to do so.
-- **Two figures moved and one log field went, and nothing reads any of them.**
-  Its `rollback_ms` used to close before the conditioning slide and now closes
-  after it, because the shared loop times its rollback across both drafter calls.
-  Its `total_ms` now covers the prefill's row-count conversion. And its starting
-  `info!` is the loop's, so the capture's target layers and the opening
-  conditioning row count are no longer on that line. The pinned stream drops
-  every `*_ms` field and the request record's spans have no bound to fail.
+- **One figure moved and one log field went, and nothing reads either.** Its
+  `rollback_ms` used to close before the conditioning slide and now closes after
+  it, because the shared loop times its rollback across both drafter calls. And
+  its starting `info!` is the loop's, so the capture's target layers and the
+  opening conditioning row count are no longer on that line. The pinned stream
+  drops every `*_ms` field and the request record's spans have no bound to fail.
+- **A cell disposition the next chunk inherits, recorded rather than
+  declared.** `run_rounds` always reports `RoundPhases`, and the four loops that
+  still carry a body all report `phases: None`. So each of them gains five
+  `*_ms` fields on its round line when it migrates, and reaches `log_round`'s
+  overrun `error!` arm — the one that fires when a round's phase timers claim
+  more time than the round has — for the first time. The pinned stream drops
+  every `*_ms` field, so the cells do not move for it; what can move is that
+  arm's own line, which carries no emitted total and so stays out of the stream
+  by the same rule that keeps it out today. DFlash 1 is the first to meet it.
 - **The shared loop answers for three rows of the disposition table**, which is
   the `rows.min(1)` arm of
   `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`

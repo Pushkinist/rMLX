@@ -85,7 +85,10 @@ pub(crate) struct BlockRound<'a> {
     /// checkpoint's dtype. One row, one round, and the probe releases it. See
     /// `conditioning_residual`.
     probe_seed: Option<Array>,
-    /// The verifier's capture at every position this round verified.
+    /// The verifier's capture at every position this round verified. A round
+    /// that stopped on an EOS leaves it set — the loop breaks before
+    /// `condition` — and the request drops this struct immediately after, so it
+    /// is released there rather than cleared on that path.
     scored: Option<Array>,
 }
 
@@ -202,10 +205,10 @@ impl RoundDrafter for BlockRound<'_> {
         Ok(Prefilled {
             seed,
             prefill_ns,
-            // The prompt's rows are the drafter's starting window and not rows
-            // a round projected; the request's own count opens at zero and the
-            // loop adds each round's projection to it.
-            conditioned_rows: Some(0),
+            // It projects its committed rows every round and the loop counts
+            // them. The prompt's rows are the starting window, not rows a round
+            // projected, so the count still opens at zero.
+            projects_conditioning: true,
         })
     }
 
@@ -306,9 +309,9 @@ impl RoundDrafter for BlockRound<'_> {
         if ctx.charged {
             // Projecting this round's committed rows and copying the window
             // they extend is work the next round's drafter is the first thing
-            // to read. Forced here it lands in the round's unclaimed time,
-            // which is where slicing and bookkeeping belong; left lazy it lands
-            // in the drafter. See `phases_charged`.
+            // to read. Forced here it lands in `rollback_ms`, which the loop
+            // closes after this call returns; left lazy it lands in the
+            // drafter. See `phases_charged`.
             h_ctx.eval()?;
         }
         let rows = h_ctx.shape().get(1).copied();
