@@ -1,67 +1,176 @@
-//! The block a round runs at.
+//! Which rows a round hands the drafter, by identity rather than by count.
 //!
-//! The rest of the round loop needs a verifier and is covered where that is
-//! available — the acceptance walk and the cache rollback in
-//! `speculative/tests.rs`, the drafter forward and the selector in
-//! `forward_tests.rs` and `selector_tests.rs`, and the loop end to end against
-//! plain greedy in `tests/spec_greedy_equivalence.rs`. What is here is the one
-//! decision the loop makes before any of that: how wide a block to run, which
-//! sizes every per-round allocation it then makes.
+//! The round loop slices its conditioning rows out of the verify pass's capture
+//! and projects them. Every wrong slice of the right length — the rejected tail,
+//! a shifted window, the rows in another order — produces a buffer of the same
+//! shape, and greedy verification then emits the verifier's own tokens whatever
+//! the drafter was conditioned on. So the answer cannot say which rows were
+//! taken, the row count cannot either, and this is what does: the capture's rows
+//! carry their absolute position, and the carried projection is compared against
+//! the projection of the rows the round is supposed to have kept.
+//!
+//! Runs on the CPU device against the fixture drafter; no snapshot, no verifier.
 
-use super::{round_block_total, MAX_BLOCK_SIZE};
+use rmlx_mlx::{concatenate, Array, Device};
 
-/// The request wins when it asks for less than the checkpoint was trained at.
-#[test]
-fn a_request_narrower_than_the_checkpoint_runs_at_the_request() {
-    assert_eq!(round_block_total(5, 8), 5);
+use crate::speculative::dflash2::DFlash2Drafter;
+use crate::speculative::{committed_rows, PROJECTION_TOL};
+
+/// The fixture drafter's width, matching `forward_tests`.
+const SCALE_HIDDEN: usize = 64;
+
+#[allow(
+    clippy::expect_used,
+    reason = "test helper: a fixture that cannot be loaded is the assertion failing"
+)]
+fn fixture_drafter() -> DFlash2Drafter {
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dflash2_scale");
+    DFlash2Drafter::load(std::path::Path::new(fixture), SCALE_HIDDEN, Device::Cpu)
+        .expect("the fixture snapshot loads")
 }
 
-/// The checkpoint wins when the request asks for more than it was trained at:
-/// the selector's chain is defined over the trained block and no wider.
-#[test]
-fn a_request_wider_than_the_checkpoint_runs_at_the_checkpoint() {
-    assert_eq!(round_block_total(8, 5), 5);
+/// Rows that differ in direction, element `c` of absolute position `r` being
+/// `sin(0.37 r + 0.11 c)` — the fixture `forward_tests` uses, for the reason it
+/// gives there.
+#[allow(
+    clippy::expect_used,
+    reason = "test helper: an array that cannot be built is the assertion failing"
+)]
+fn rows_at(first: i32, rows: i32, width: i32) -> Array {
+    let data: Vec<f32> = (first..first + rows)
+        .flat_map(|r| (0..width).map(move |c| (0.37 * r as f32 + 0.11 * c as f32).sin()))
+        .collect();
+    Array::from_f32_slice(&data, &[1, rows, width]).expect("build rows")
 }
 
-/// Two positions is the floor at both ends — a block of one is the seed alone
-/// and drafts nothing, so a request or a checkpoint below it still runs a round
-/// that proposes something.
-#[test]
-fn neither_side_can_take_the_block_below_a_seed_and_one_draft() {
-    assert_eq!(round_block_total(0, 8), 2);
-    assert_eq!(round_block_total(8, 1), 2);
-    assert_eq!(round_block_total(0, 0), 2);
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: an array that cannot be read back is the assertion failing"
+)]
+fn to_f32(a: &Array) -> Vec<f32> {
+    let bytes = a.to_bytes().expect("read array bytes");
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes is an f32")))
+        .collect()
 }
 
-/// A checkpoint whose config never went through `check_config` is still bounded.
+fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+    let (x, y) = (to_f32(a), to_f32(b));
+    assert_eq!(x.len(), y.len(), "compared arrays must have the same shape");
+    x.iter()
+        .zip(y.iter())
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0f32, f32::max)
+}
+
+/// The rows a round commits are the accepted prefix of its capture, and across
+/// rounds they tile the token sequence once each.
 ///
-/// This is the case the clamp exists for, and the only one that separates it
-/// from the loader's refusal: [`super::DFlash2Drafter`] is publicly
-/// constructible with public fields, so `declared` here is whatever the caller
-/// put in the struct. Without the clamp this returns that number, and the round
-/// sizes its token buffer, its verify input and its selector chain from it.
+/// The rounds here are a full accept, a partial one and a single-token one, so
+/// the buffer being compared is a mixture of rows committed by different rounds
+/// at different call shapes.
+///
+/// The window is not what this drives: the fixture's is wider than these rounds
+/// reach, so the trim inside `slide_conditioning` is inert here and nothing
+/// below could see it stop trimming.
+/// [`super::forward_tests::advancing_the_carried_projection_leaves_it_at_the_bound`]
+/// is the case that saturates one, and it owns both the bound and the identity
+/// of the rows that survive a trim.
 #[test]
-fn a_config_the_loader_never_saw_is_still_bounded_by_one_verify_forward() {
-    assert_eq!(round_block_total(usize::MAX, usize::MAX), MAX_BLOCK_SIZE);
-    assert_eq!(round_block_total(usize::MAX, 4_294_967_295), MAX_BLOCK_SIZE);
-    // And the request alone cannot lift it past the checkpoint either.
-    assert_eq!(round_block_total(usize::MAX, 8), 8);
+#[allow(
+    clippy::indexing_slicing,
+    reason = "test assertion: the rank is the one the drafter's projection returns"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: a projection that cannot be taken is the assertion failing"
+)]
+fn a_round_commits_the_accepted_prefix_of_its_capture() {
+    let drafter = fixture_drafter();
+    let width = (drafter.cfg.target_layer_ids.len() * SCALE_HIDDEN) as i32;
+
+    // The prompt's rows, then rounds of block 5 accepting 4, 1 and 0 proposals.
+    let prompt_rows = 6;
+    let mut history = rows_at(0, prompt_rows, width);
+    let mut carried = drafter
+        .project_conditioning(
+            &drafter
+                .trim_conditioning(&history)
+                .expect("trim the prompt"),
+        )
+        .expect("project the prompt");
+    // The next position the verifier will score: the correction the last round
+    // emitted, which is this round's carry token and its capture's row 0.
+    let mut next = prompt_rows;
+
+    for (round, accept) in [4usize, 1, 0].into_iter().enumerate() {
+        // The verify pass scores the carry token and four proposals. Only the
+        // first `accept + 1` rows survive the round's rollback.
+        let v_hidden = rows_at(next, 5, width);
+        let committed = committed_rows(&v_hidden, accept + 1, width, Device::Cpu)
+            .expect("slice the committed rows");
+
+        assert_eq!(
+            to_f32(&committed),
+            to_f32(&rows_at(next, accept as i32 + 1, width)),
+            "round {round}: the committed rows are not positions {next}..={} of the \
+             capture",
+            next + accept as i32
+        );
+
+        let (grown, projected) = drafter
+            .slide_conditioning(&carried, &committed)
+            .expect("advance the conditioning");
+        carried = grown;
+        assert_eq!(projected, accept as i32 + 1, "round {round}");
+
+        history = concatenate(&[&history, &committed], 1, Device::Cpu).expect("extend the history");
+        // Every position from the prompt through this round's accepted prefix,
+        // each exactly once, trimmed to the window.
+        let want = drafter
+            .project_conditioning(
+                &drafter
+                    .trim_conditioning(&history)
+                    .expect("trim the history"),
+            )
+            .expect("project the history");
+        let diff = max_abs_diff(&carried, &want);
+        assert!(
+            diff < PROJECTION_TOL,
+            "round {round}: the carried rows are not the accepted prefixes of every \
+             round so far — they differ by {diff:e}"
+        );
+
+        // The correction the verifier emitted at the first rejected position is
+        // the next round's carry token, and it is scored there for the first
+        // time: no round commits it twice and none skips it.
+        next += accept as i32 + 1;
+    }
+
+    // The prompt's rows plus each round's carry token and accepted proposals.
+    assert_eq!(
+        next,
+        prompt_rows + 5 + 2 + 1,
+        "the rounds must have consumed each position exactly once"
+    );
 }
 
-/// The ceiling admits its own value and refuses the next one, so it cannot be
-/// off by one in either direction.
+/// A capture shorter than the round accepted is refused rather than sliced past
+/// its own end.
 #[test]
-fn the_ceiling_admits_itself_and_nothing_above() {
-    assert_eq!(
-        round_block_total(MAX_BLOCK_SIZE, MAX_BLOCK_SIZE),
-        MAX_BLOCK_SIZE
-    );
-    assert_eq!(
-        round_block_total(MAX_BLOCK_SIZE + 1, MAX_BLOCK_SIZE + 1),
-        MAX_BLOCK_SIZE
-    );
-    assert_eq!(
-        round_block_total(MAX_BLOCK_SIZE - 1, MAX_BLOCK_SIZE),
-        MAX_BLOCK_SIZE - 1
+fn a_capture_shorter_than_the_accepted_prefix_is_refused() {
+    let width = 4;
+    let v_hidden = rows_at(0, 3, width);
+    let err = match committed_rows(&v_hidden, 6, width, Device::Cpu) {
+        Ok(a) => panic!(
+            "a capture of 3 rows committed 6 positions, got {:?}",
+            a.shape()
+        ),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("holds 3 positions"),
+        "the refusal does not say what it had: {err}"
     );
 }

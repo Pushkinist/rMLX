@@ -85,6 +85,8 @@ use rmlx_mlx::Device;
 use rmlx_models::arch;
 use rmlx_models::{Pcg32, PenaltyConfig, SamplerConfig};
 
+pub mod round_stream;
+
 #[cfg(test)]
 #[path = "snapshot_tests.rs"]
 mod snapshot_tests;

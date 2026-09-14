@@ -118,6 +118,16 @@ reference. It carries a pair for six of the seven round loops below; the seventh
 is the two-model stochastic one, which runs only above temperature 0 and so has
 no arm this gate can compare.
 
+**One loop, migrating.** The seven drafter paths run one algorithm, and four of
+them still carry their own copy of it;
+`docs/SPEC_ROUND_SKELETON.md` is the plan that collapses them: the drafter
+interface, what each loop does the interface cannot express, the migration
+order, and the mutations a skeleton could contain beside what catches each.
+Migration chunks 1, 2 and 3 have landed: the shared loop is
+`crates/rmlx-models/src/speculative/round_loop.rs`, and the Gemma4 assistant, the
+MTP sidecar and DFlash 2 run on it; the other four loops still carry their own
+bodies.
+
 ```text
 # Initialisation
 prefill verifier + draft on prompt[..-1]
@@ -146,10 +156,10 @@ loop until n_tokens emitted:
   # Phase D — cache rollback (one helper, both sides)
   v_drop = K - accept          # positions to discard from verifier cache
   d_drop = max(K - accept - 1, 0)
-  rollback_round_caches(verifier_caches, verifier_lin,
-                        v_input, v_pre_round_offset, offset - v_drop)
-  rollback_round_caches(draft_caches, draft_lin,
-                        d_fed, d_pre_round_offset, offset - d_drop)
+  rollback_round(verifier_caches, verifier_lin,
+                 v_input, v_pre_round_offset, offset - v_drop)
+  rollback_round(draft_caches, draft_lin,
+                 d_fed, d_pre_round_offset, offset - d_drop)
 
   if accept == K:
     ds = [last_draft, y]   # draft cache lagged one position — prepend dK
@@ -269,20 +279,68 @@ numbers:
   and much smaller.
 
 Per-round attribution comes from the `speculative round` event, target
-`rmlx::spec::phase`, one per round at `debug`, emitted by one shared
-`RoundPhases::log` so the three loops cannot drift into three record shapes:
+`rmlx::spec::phase`, one per round at `debug`. **Every** round loop emits it,
+through the one `round_stats::log_round`, so a round of one drafter and a round
+of another are read by the same query and a field added for one is added for
+all:
 
 ```
-loop_kind round accept num_draft refolded charged
+loop_kind round accept num_draft n_committed emitted_total
+condition_rows projected_rows
+v_offset_before v_target d_offset_before d_target refolded charged
 round_ms draft_ms verify_ms walk_ms rollback_ms other_ms
 ```
+
+The field set is the union of what the loops used to report separately, so the
+one event lost none of them. A figure a loop does not have is absent from the
+line rather than present as a zero: `condition_rows` for a loop that hands its
+drafter no buffer, `projected_rows` for one that does not project into a window
+across rounds, the drafter pair for a loop whose drafter keeps no cache, and
+every wall-clock field for the four loops that time their drafter and verifier
+over the request and no phase within a round.
+
+`n_committed` is what the round committed — the accepted prefix and the one
+token the verifier added to it, less anything the request's budget cut. It is
+counted where the tokens reach the sink and reported from there, so a block the
+budget clipped is not reported as committed to a rollback that did not keep it.
+
+`emitted_total` is `emitted.len()` at the end of the round: every token the
+request has handed the sink, **the seed included**. The five sidecar loops
+argmax one token out of the prefill forward and emit it before the first round,
+so on those this figure is one above the tokens the rounds produced.
+**It is not the `emitted_total` `scripts/lib/spec_round_log.py` prints**, which
+sums `emitted_in_rounds` over a run's done records and excludes the seed for the
+reason § "A round's tokens are the ones a round produced" gives — so the two
+differ by `seed_emitted` on every sidecar loop, permanently, and a reader
+comparing one against the other is comparing two definitions. Renaming either
+moves every digest in the pinned round-stream baseline, so the collision is
+recorded here rather than resolved in this chunk.
+`v_offset_before` is the verifier offset that round's rollback target was
+computed from, which the loops counting back from the tail read after their
+verify forward and the assistant reads before its own — the shared loop reads
+both and reports the one its drafter declares in `VERIFIER_OFFSET_BASIS`. `d_offset_before` and
+`d_target` are the same two positions on the drafter's own cache, on their own
+arithmetic — which is what makes them a cross-check on `v_target` rather than a
+restatement of it.
+
+`condition_rows` is read from the conditioning buffer the round hands on, and
+what it is worth reading against differs by loop. The two block loops grow a
+window, so it moves with `projected_rows` beside it and the two are a
+cross-check: a slide that projects the right number of rows into the wrong
+window moves one and not the other. The sidecar carries a single verifier row
+and projects nothing, so it reports `condition_rows` and no `projected_rows`,
+and what that pins is that the row stays one. The rest carry neither.
 
 `other_ms` is what no phase claimed: emission, tokenizer decode, slicing and
 host bookkeeping. The four phases are disjoint sub-spans of the round, so
 claiming more than the round has means a timer started outside it — that is an
-`error!` naming the phases rather than an `other_ms` near zero that reads like
-rounding. `refolded` says whether that round took the recurrent arm of
-`rollback_round_caches`.
+`error!` naming the phases, and the round is still reported with no `other_ms`.
+`refolded` says whether that round's **verifier** rollback refolded a recurrent
+state. It comes back from `rollback_round`, which is the only thing that knows:
+true on the partial arm of a stack that carries a recurrent state, so a
+full-attention verifier — the assistant's — and a dense one read `false` for a
+partial round that refolded nothing. The loops with a drafter cache roll that
+back on its own arm, and its answer is not this field.
 
 `charged` is the field that says how to read the rest. At `debug` the phases are
 timed but not forced, so the lazy tails above still move between them. At
@@ -296,10 +354,13 @@ charged run's `round_ms` against an uncharged one's before trusting either.
 
 **The decision is the loop's, made once per request, and it travels on the
 record.** `phases_charged()` is read at the loop head and passed down — to
-`rollback_round_caches` as an argument, and onto `RoundStats::charged`, which
-every loop's `done` line carries. Two things depend on that.
-`rollback_round_caches` is shared by eight call sites across seven loops and
-only three of those loops time their phases; a switch it read on its own behalf would change how the other four
+`rollback_round` as an argument, and onto the `charged` of the
+`RoundTotals` each loop hands
+[`round_common::log_request_record`](../crates/rmlx-models/src/speculative/round_common.rs),
+the one place a `RoundStats` is assembled, so it reaches the `done` line every
+loop writes. Two things depend on that.
+`rollback_round` is shared by eight call sites across the seven drafter paths
+and only three of those paths time their phases; a switch it read on its own behalf would change how the other four
 schedule work, with nothing on their records saying so — they pass `false` and
 report `charged=false`.
 
@@ -308,7 +369,7 @@ trusted.** Each loop forces the things it produces, one call at a time, and the
 way that fails is by omission: four of the five arrays a round builds get forced
 and the fifth is still a graph node when the next round's drafter reads it. No
 timing assertion can see that, because the number it produces is a plausible
-one. `RoundPhases::log` therefore takes the arrays the round hands to its
+one. `log_round` therefore takes the arrays the round hands to its
 successor, under the names the loop calls them, and on a charged round reports
 any that are still unevaluated — `Array::is_available`, which asks MLX for the
 array's status rather than inferring it from a clock. The three omissions it
@@ -322,7 +383,7 @@ change to a round loop's phase spans.
 charged: the Gemma4 MTP assistant, the Qwen3.5-family MTP sidecar and DFlash 2.
 The other four — DFlash 1, EAGLE-3 and the two two-model loops — keep only the
 request-level `draft_ms` and `verifier_ms`, pass `false` to
-`rollback_round_caches` and report `charged=false`, so **their drafter figure
+`rollback_round` and report `charged=false`, so **their drafter figure
 carries the same inflation and no setting corrects it**. DFlash 1's round has
 the same four phases as DFlash 2's and giving it the instrument is a port of
 that one. EAGLE-3's is not: its drafter re-runs over the accepted prefix in a
@@ -474,13 +535,23 @@ Status: **fully wired + live-validated** against two pairs — the MoE sidecar
 `mlx-community/Qwen3.6-35B-A3B-MTP-5bit` + `mlx-community/Qwen3.6-35B-A3B-8bit`,
 and the dense sidecar `mlx-community/Qwen3.8-27B-MTP-mxfp8` +
 `mlx-community/Qwen3.8-27B-mxfp8`. `crates/rmlx-models/tests/qwen3_5_mtp_drafter_alignment.rs`
-gates both the FFN-shape probe and the greedy-tracking property. The round-loop
-(`mtp_generate`) mirrors the DFlash loop structurally: verifier prefill →
+gates both the FFN-shape probe and the greedy-tracking property. Its rounds run
+in the shared `run_rounds`; `mtp_generate` is the entry that refuses a prompt
+under two tokens and a verifier with no recurrent state, and resolves the
+request's block. The algorithm mirrors the DFlash loop structurally: verifier
+prefill →
 round-0 penultimate-hidden + first-bonus capture → per-round autoregressive
 `draft_n` (RoPE offset = sidecar `_next_position` = verifier prefix length +
 appended count) → one combined verify forward → `accept_prefix` walk over the
 verifier's own argmax → emit → recurrent refold + verifier-KV truncation +
 sidecar-KV `truncate_to` on partial acceptance.
+
+Each `draft_n` step past the first conditions on the sidecar's own output
+hidden rather than the verifier's, so the chain runs to whatever depth the
+request asks for: the sidecar's declared `block_size` is the depth it was
+trained at, and the only bound the loop applies is what one un-chunked verify
+forward can score. Acceptance decays with depth — that is the trade, and it is
+the request's to make.
 
 `draft_n` proposes `block_size - 1` tokens but only ever feeds back `block_size - 2`
 of them, so the last one used to get no KV slot. A full-accept round then commits
@@ -525,20 +596,22 @@ state is recorded once, at the first. `GdnTape` in
 `crates/rmlx-kv-quant/src/linear_attn.rs` holds both shapes.
 
 Every round loop that can partially accept goes through **one** implementation —
-`speculative::rollback_round_caches`. A full-attention arch (`lin` absent or
-empty) truncates and stops; a GDN hybrid also refolds. Its eight call sites are
-`mtp_generate`, `dflash_generate`, `dflash2_generate`, `eagle3_generate`,
-`mtp_assistant_generate` (full attention, so truncation only) and the classic
-two-model loop's three recurrent ones — greedy verifier, greedy drafter and
-stochastic verifier — plus the stochastic drafter. There is deliberately no
-second copy: the defect the replay was written to fix lived in four independent
-implementations at once, and a rollback inlined per loop is how it got there.
+`speculative::round_common::rollback_round`, which decides the arm and, on a
+partial accept, calls the low-level `rollback_round_caches` beside it. A
+full-attention arch (`lin` absent or empty) truncates and stops; a GDN hybrid
+also refolds. Its seven call sites are `dflash_generate`, `eagle3_generate`, the
+shared `run_rounds` — which serves the Gemma4 assistant (full attention, so
+truncation only), the MTP sidecar and DFlash 2 — and the two-model loops' four:
+greedy verifier, greedy drafter, stochastic verifier and stochastic drafter.
+There is deliberately no second copy: the defect the replay was written to fix
+lived in four independent implementations at once, and a rollback inlined per
+loop is how it got there.
 
 The refold is checked against the replay it replaced —
 `a_round_tape_refolds_to_what_the_replay_produced` in
-`crates/rmlx-models/src/speculative/tests.rs` — on a dense hybrid and a mixture
-one, for a round taken as one verify forward and one taken as a forward per
-token. On the dense hybrid the two agree bit for bit at every accepted length.
+`crates/rmlx-models/src/speculative/round_common_tests.rs` — on a dense hybrid
+and a mixture one, for a round taken as one verify forward and one taken as a
+forward per token. On the dense hybrid the two agree bit for bit at every accepted length.
 On the mixture they agree to about 2-4% relative, which is that stack's own
 disagreement between computing the round in one forward and stepping it: the
 test measures that disagreement in the same process and holds the refold to it,
@@ -627,8 +700,10 @@ intentionally non-causal (`mask = None`) — the whole block is denoised at once
 The verifier LM head (with optional `final_logit_softcapping`) picks greedy
 tokens at positions `1..block_size`.
 
-**3. Adaptive block size.** `dflash_next_block_size` adjusts the block
-ceiling each round based on the last 8 rounds of `(accepted, drafted)` history:
+**3. Adaptive block size.** `dflash_next_block_size` takes the shared
+`round_block` ceiling — the request's block narrowed against the tokens it may
+still emit — and moves it each round from the last 8 rounds of
+`(accepted, drafted)` history:
 
 - `accept_rate < 0.30` or `mean_accept < 2.0`: halve (if current >= 8) or
   subtract 2, floored at `min(block_size, 4)`.
@@ -645,15 +720,61 @@ values against the mlx-lm reference output.
 
 **GDN-aware rollback.** The Qwen3.6-MoE verifier carries GDN (GatedDeltaNet)
 recurrent layers in addition to its KV cache. The loop arms a round tape on them
-before the verify forward, and on partial acceptance `rollback_round_caches`
-refolds the accepted prefix out of it to re-align the recurrent state with the
-truncated KV cache.
+before the verify forward, and on partial acceptance `rollback_round` refolds
+the accepted prefix out of it to re-align the recurrent state with the truncated
+KV cache.
 
 **Accumulated conditioning context.** The drafter conditions on the
 accumulated verifier hidden across all rounds (equivalent to the Python
 reference's persistent draft KV cache). After each round the committed slice of
-the verifier hidden `v_hidden[:, :n_committed, :]` is concatenated onto
-`h_ctx_raw`; this grows monotonically and is projected freshly each round.
+the verifier hidden `v_hidden[:, :n_committed, :]` is projected through `fc` +
+`hidden_norm` and concatenated onto the projection carried from the last round.
+The buffer grows monotonically; each round's projection covers that round's
+commit rather than the whole of it, so the number of rows a round projects is
+its own commit and not the generation so far. `fc` is a bias-free linear and
+`hidden_norm` an RMSNorm — both row-wise — so a row projected once is the row a
+re-projection would have produced, and carrying the projection also holds a row
+at `hidden_size` rather than `len(target_layer_ids) * hidden_size`.
+
+**How exact that identity is, and what it can move.** Exact in exact
+arithmetic. At a checkpoint's dtype it is exact only up to the projection's own
+dispatch: `fc` is a matmul, and MLX chooses its kernel and reduction order by
+shape, so the same row projected at two different call heights is not guaranteed
+to give the same bits. `crates/rmlx-models/tests/spec_conditioning_residual.rs`
+measures that on the shipped pairs, comparing a round's commits against all of
+them in one call at the height a generation reaches. It is a rounding
+difference and reads as one: on the DFlash 1 pair no row differs by as much as
+one `bf16` unit in the last place of its own scale, and on the DFlash 2 pair
+three rows of a few hundred reach a small multiple of one. The fixtures'
+`PROJECTION_TOL` is an `f32` bound on `f32` fixtures and is not a statement about
+either.
+
+**A last-place difference is not confined to the drafter.** A drafter proposing
+a different token at a near-tie changes what the round accepted; a different
+accept split changes the composition and the height of the next verify block; and
+the *verifier's* own logits at later positions are then computed under a
+different dispatch too. So a near-tie the verifier itself is sitting on can
+resolve the other way, and the emitted text can differ — later, and at a
+position whose top two candidates are near-tied. **Byte-equality against a
+no-drafter arm is therefore not the criterion**, and this repository does not use
+it as one: equivalence is judged by the divergence-confidence oracle in
+[`SPEC_ANSWER_EQUIVALENCE.md`](SPEC_ANSWER_EQUIVALENCE.md), which asks where the
+divergence sits in the plain arm's own margin distribution rather than whether it
+happened. The recorded evidence for both loops is the pairs in
+`crates/rmlx-models/tests/spec_greedy_equivalence.rs`, which run that oracle over
+a prompt set; a byte comparison on a single prompt is not evidence either way.
+
+**And it is not bounded, deliberately.** Unlike DFlash 2, this checkpoint
+declares `sliding_window: null`, `use_sliding_window: false` and eight
+`full_attention` layers, and the drafter's block attention runs with no mask
+over the context, so every carried row is read by every proposal query. Both
+reference implementations condition on the whole history by default — mlx-vlm
+allocates an unbounded KV cache per full-attention drafter layer, and SGLang's
+draft window defaults to off, documented as full attention/context. A draft
+window is an operator choice there, not a checkpoint declaration. Trimming the
+buffer would drop rows the drafter reads and shift the positions of the rest;
+under greedy verification the emitted tokens would not move and only the accept
+rate would fall, so nothing in an answer would report it.
 
 Weight layout:
 
@@ -734,7 +855,9 @@ the prefill seed — because that is not recoverable from the tokens afterwards.
 **Verifier prefill chunking.** For prompts longer than 1024 tokens, the
 verifier prefill uses `forward_verify_capture_chunked`: non-final chunks run
 `forward_hidden_states_multi` (no logit materialisation); only the final chunk
-runs `forward_verify_capture` to obtain the last-position logits. The drafter
+runs `forward_verify_capture` to obtain the last-position logits. This loop
+passes no trailing-row limit to that seam and cannot: the drafter prefill below
+conditions on every prompt position, so no captured row is spare. The drafter
 prefill uses 512-token windows (`DRAFTER_PREFILL_CHUNK`), driven by the Metal
 watchdog limit on the drafter's single-layer quadratic attention kernel.
 
@@ -747,10 +870,10 @@ hidden. This precomputed token (`d_seed_tok`) is passed as `precomputed_first_to
 to the next `draft_block`, preventing the correction position from being
 processed twice (a structural bug fixed during the reference-alignment pass).
 
-**Block-size schedule.** `eagle3_next_block_size` is non-adaptive for the
-Dogacel checkpoint (it uses the configured block ceiling capped to the
-remaining budget). The DFlash adaptive schedule fires only when
-`adaptive_max_block_size` is present in the config.
+**Block-size schedule.** There is none. Each round takes the shared
+`round_block` — the request's block narrowed against the tokens it may still
+emit — and no more; the accept rate moves nothing here. DFlash 1's adaptive
+schedule is not reachable from this loop.
 
 **GDN rollback.** Identical to the DFlash path: a round tape armed before each
 verify forward, refolded over the accepted prefix on partial accept.
@@ -764,8 +887,8 @@ Per-step trace is available via `RUST_LOG=rmlx_models::speculative::eagle3=trace
 The classic form: a smaller full model of the verifier's family proposes, the
 verifier scores. Nothing hooks into the verifier's forward pass — the draft is
 loaded as its own `Architecture`, keeps its own KV (and, on a GDN hybrid, its
-own recurrent state), and is rolled back through the same
-`rollback_round_caches` as the verifier. Any registered architecture can be the
+own recurrent state), and is rolled back through the same `rollback_round` as
+the verifier. Any registered architecture can be the
 draft, subject to the checks below; a pair of the same architecture is the
 normal case (`gemma-4-e4b` drafted by `gemma-4-e2b`, `Qwen3.8-27B` drafted by
 `ornith-1.0-9b`).
@@ -788,7 +911,7 @@ snapshot's own `config.json` like every other kind: a registered architecture
 there is a full model. `rmlx serve --model <verifier> --draft-model <draft>`
 is the whole invocation; `--draft-kind two_model` is accepted and says the same
 thing. `--draft-block-size` is the round block — the verifier's own token plus
-the drafted ones, default 5 — so the draft proposes one fewer; it means the
+the drafted ones — so the draft proposes one fewer; it means the
 same on every drafter kind, and `RoundStats.block_size` records that one
 number whichever loop ran.
 
@@ -836,11 +959,12 @@ loop: `p` and `q` are indexed by one id and must be the same width.
   which does not combine with probabilistic draft sampling.
 
 **Early stop on draft confidence.** llama.cpp has the knob:
-`--spec-draft-p-min` (default 0.75) stops the current chain at the first token
-whose draft top-1 probability falls below it — "only collect very
-high-confidence draft tokens" — and `--spec-draft-n-min` (default 0) discards a
-chain that came out shorter than `n_min`, so the verifier is not asked to
-batch-score one or two tokens. Both are per-request in its server
+`--spec-draft-p-min` stops the current chain at the first token whose draft
+top-1 probability falls below it, and `--spec-draft-n-min` (default 0) discards
+a chain that came out shorter than `n_min`, so the verifier is not asked to
+batch-score one or two tokens. `p_min` defaults to `0.0`, which is that knob's
+own documented way of disabling the early stop, so it ships off. Both are
+per-request in its server
 (`speculative.p_min`, `speculative.n_min`). `--spec-draft-p-split` is declared
 and unused. That is the idea of a chain whose depth follows the draft's own
 confidence, arrived at independently and shipped since the late-2024
@@ -994,11 +1118,16 @@ The verifier and draft KV caches are allocated at round-loop entry with
 layers receive their layer-specific `window` value; full-attention layers
 receive `max_seq`. The `max_seq` bound is the ceiling
 `rmlx_models::context::resolve_context` produced for the pair — the verifier
-owns the KV geometry, so its `ContextLimits` are what bound the round loop, and
-`speculative::verifier_context` is the one wrapper all six drivers call. A
-`--max-ctx` above the verifier's positional capacity is refused there, with the
-same message the non-speculative paths give, instead of being taken verbatim
-and overflowing a cache mid-round. See `docs/CLI.md` § "Context ceiling".
+owns the KV geometry, so its `ContextLimits` are what bound the round loop.
+There is one producer of all of it:
+`speculative::round_common::verifier_cache_stack`
+(`crates/rmlx-models/src/speculative/round_common.rs`) resolves the codec and
+the ceiling and builds the verifier's stack, and every round loop calls it; the
+two-model loops build the draft model's stack from the same builder at the
+verifier's codec and ceiling. A `--max-ctx` above the verifier's positional
+capacity is refused there, with the same message the non-speculative paths
+give, instead of being taken verbatim and overflowing a cache mid-round. See
+`docs/CLI.md` § "Context ceiling".
 
 Verifier prefill (all paths) uses `prefill_chunked`, which gates how much
 sequence length is dispatched per Metal command buffer. The chunk is the
@@ -1017,8 +1146,8 @@ between chunks the KV cache state is flushed via `eval_prefill_state`. The
 
 A round tape is armed on the GDN recurrent state before every draft round with
 `arm_lin_tapes`, and dropped with `disarm_lin_tapes` when the round is fully
-accepted. On partial acceptance (`accept < K`), `rollback_round_caches` truncates
-the KV caches to the retained target and refolds the accepted prefix into the
+accepted. On partial acceptance (`accept < K`), `rollback_round` truncates the
+KV caches to the retained target and refolds the accepted prefix into the
 recurrent state from the tape — no second forward, and no weights read. See the
 partial-accept rollback section above.
 
@@ -1032,7 +1161,7 @@ carry `draft_model` too (`docs/CLI.md` § Profiles), and runs the same way.
 |------|--------|---------|-------------|
 | `--draft-model <PATH>` | directory | (none) | The drafter snapshot: a sidecar head or a smaller full model. Which one it is is read from its `config.json`. |
 | `--draft-kind <KIND>` | `mtp`, `dflash`, `dflash2`, `eagle3`, `two_model` | (from the snapshot) | Names the kind for a snapshot whose `config.json` declares none. Requires `--draft-model`. Refused when it contradicts what the snapshot declares. |
-| `--draft-block-size <N>` | integer ≥ 2 | 5 | Round block: tokens the verifier scores per round, its own token included, so the drafter proposes one fewer. One meaning for every kind, and the `block_size` every `done` line and `decode_config` records. Refused below 2 at parse time. Upper-bounded by a sidecar's own `block_size`; an MTP sidecar config without that key takes the loader default of 3, which is what both shipped Qwen3.5-family sidecars do. |
+| `--draft-block-size <N>` | integer ≥ 2 | 5, capped by the declared depth | Round block: tokens the verifier scores per round, its own token included, so the drafter proposes one fewer. One meaning for every kind, and the `block_size` every `done` line and `decode_config` records. **Absent, the round runs at 5 capped by the depth the drafter's own checkpoint declares**, and at a flat 5 for a drafter that declares none. Refused below 2 or above 1024 at parse time. What further bounds an explicit request depends on the drafter: a DFlash checkpoint's own `block_size` caps it, because that block is the shape of the drafter's denoising input; the Qwen3.5-family MTP sidecars do not, because the head chains on its own output hidden and can propose past the depth it was trained at. Every loop is bounded above by what one un-chunked verify forward can score. |
 
 Environment variable fallbacks: `MLX_VLM_DRAFT_KIND` and
 `MLX_VLM_DRAFT_BLOCK_SIZE` for `--draft-kind` and `--draft-block-size`
@@ -1405,11 +1534,16 @@ table and change no answer.
 the CPU kernel — production drafts on Metal, whose partition is a different
 implementation of the same unspecified contract.
 
-**The comparison is not at equal depth and cannot be.** `MtpDrafter::block_size`
-is the sidecar's own `config.json` value (3 here) and the MTP round loop clamps
-`block_total` to it, so `--draft-block-size 8` against that sidecar runs at 3 and
-records `mtp/block=3`. The published comparison's "same 7 drafts" arm has no
-counterpart on this checkpoint; each drafter is shown at the depth it can run.
+**The comparison is not at equal depth.** These MTP rows were taken while the
+round loop clamped `block_total` to the sidecar's own `config.json` value (3
+here), so `--draft-block-size 8` against that sidecar ran at 3 and recorded
+`mtp/block=3`. That clamp is gone — the head chains on its own output hidden, so
+the declared value is the depth it was trained at and not one it can only propose
+to — and a deeper MTP block is now selectable. The rows above have not been
+re-taken at one; each drafter is shown at the depth its row was run at. The
+answer at a deeper block is gated: `spec_greedy_equivalence.rs` drives this pair
+at the declared block and at block 8, and both agree with plain greedy on all six
+prompts under the divergence-confidence oracle.
 
 **Nor is it the same measurement as the published one, even where the drafter is
 the same.** The third-party acceptance figures this checkpoint is known by were
@@ -1531,26 +1665,38 @@ the logits and from the chain the pairwise term alone would trace, and the two
 anchors trace different chains, so a selector that returned the argmax, dropped
 the logits or ignored the seed fails rather than passing quietly.
 
-`dflash2_generate` drives them. It prefills the whole prompt through
+`dflash2_generate` drives them, through the shared `run_rounds`: the entry
+refuses a prompt under two tokens and a verifier with no recurrent state and
+resolves the request's block, and `BlockRound` in the same file is the drafter
+side. Its prefill takes the whole prompt through
 `forward_verify_capture_chunked`, keeping as many conditioning rows as the
 drafter's window reaches back over (2047 here) — the depth the reference
-conditions on, not the last prompt token alone — then per round drafts a block,
-scores the carry token and every proposal in one verify forward, accepts the
-agreed prefix through the shared `accept_prefix`, and rolls the caches back over
-the rest through the shared `rollback_round_caches`. The block is the one the
-drafter was trained at every round; only the token budget shortens it, so this
-loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
+conditions on, not the last prompt token alone — then per round it drafts a
+block, scores the carry token and every proposal in one verify forward and
+accepts the agreed prefix through the shared `accept_prefix`, while the loop
+rolls the caches back over the rest through the shared `rollback_round`. The
+block is the one the drafter was trained at every round; only the token budget
+shortens it, so this loop is not in `ADAPTIVE_DRAFTERS` and its rows are
+`dflash2/block=<n>`.
 
-**The prompt's capture is materialised whole and then mostly thrown away.**
-`forward_verify_capture_chunked` evaluates each chunk and concatenates every one
-of them before returning, so a prompt of `n` tokens allocates `n` rows at
-`len(target_layer_ids) * hidden_size` — 51.2 KiB each on the published pair, or
-about 1.6 GiB at a 32k prompt — and the trim then keeps the last 2047 of them.
-It is a transient peak at the prompt boundary, not a steady-state cost: the
-buffer the rounds carry is bounded by the drafter's window from the first trim
-onward. Bounding the peak means giving that seam a tail limit, and EAGLE-3 shares
-it and needs every row, so it is a two-caller parameter and not one this port
-added. It is not fixed and no figure in this document depends on it.
+**The prompt's capture is bounded by the same window.**
+`forward_verify_capture_chunked` takes the trailing row count its caller will
+read, and this drafter's prefill passes its own `conditioning_rows`. Chunks that
+have fallen out of that tail are released as the prefill walks the prompt and
+the oldest one still held is cut to the part the tail reaches before anything is
+joined. Two bounds come out of that, and they are different
+numbers: what is *held* overshoots the window by up to a chunk, because a chunk
+is released only once the rows behind it reach the window, while what is
+*materialised* is at most `sliding_window - 1` rows, which is what the cut before
+the join buys. `CaptureTail` states both in terms of its own `keep` and `chunk`
+and is the one place they are written down; restating the arithmetic here is how
+the two drift apart. Joining every chunk first and trimming afterwards, which is what this did,
+held and materialised one row per prompt token instead. Each row is
+`len(target_layer_ids) * hidden_size`, 50 KiB on the published pair. The rows the round loop receives are the
+same ones either way, and no figure in this document changed with it. EAGLE-3
+shares the seam and conditions its own KV prefill on every prompt position, so
+it passes no limit — which is why the bound is the capture's parameter rather
+than a rule inside it.
 
 **Its drafter is greedy, and its acceptance is not.** `select_chain` traces a
 greedy chain and returns ids, no candidate distribution — and the reference's
@@ -1571,14 +1717,50 @@ caching them across rounds, so all of one call's positions are rotated together
 and only the query-key difference reaches the attention scores; a uniform shift
 of every position is then not observable, which the reference's own answer
 confirms — it moves by one bf16 place between two offsets that are
-mathematically the same. **The round loop keeps that choice**: it carries the
-committed hidden states forward and lets the forward re-derive the conditioning
-K/V, where the reference carries a per-layer rotating K/V cache and feeds it only
-each round's new rows. The two are the same answer — the cached rows are a
-deterministic function of those hidden states — and adopting the cache would make
-cached rows carry their own absolute RoPE, losing the invariance and the proof
-that rests on it. The buffer is bounded by the drafter's window rather than
-accumulated: unbounded it would grow by 50 KiB per emitted token.
+mathematically the same. **The round loop keeps that choice**, where the
+reference carries a per-layer rotating K/V cache and feeds it only each round's
+new rows. The two are the same answer — the cached rows are a deterministic
+function of the hidden states — and adopting the cache would make cached rows
+carry their own absolute RoPE, losing the invariance and the proof that rests
+on it.
+
+What the loop does carry is one step earlier than that cache and has no position
+in it. `fc` and `hidden_norm` are row-wise, so the conditioning projection of a
+row does not depend on which other rows were in the call; the loop projects each
+round's committed rows as it commits them and carries the projection, where it
+used to carry the capture and re-project its whole window every round. The
+per-layer K/V — the part RoPE reaches — is still rebuilt over the whole window on
+every call, so the invariance above is untouched. The carried buffer is bounded
+by the drafter's window and is `hidden_size` wide rather than
+`len(target_layer_ids) * hidden_size`: 10 KiB per row on the published pair
+where the capture is 50 KiB.
+
+**The reduction is a trip count, not a measurement.** Per round the projection
+runs over the rows the round committed rather than over the window: `accept + 1`
+rows of `len(target_layer_ids) * hidden_size` where it was `sliding_window - 1`
+of them, which on the published pair is one to eight rows against 2047. That is
+what changed and all that is claimed here. No decode rate or per-phase time is
+quoted for it — a timing figure needs a quiet machine and belongs to the
+published protocol, where it is to be measured.
+
+**It is not bit-identical, and the reason is not the algebra.** `fc` is a matmul,
+and MLX accumulates it differently at different row counts, so a row projected in
+a call of three rows and the same row projected in a call of two thousand land a
+few units in the last place apart. `crates/rmlx-models/tests/spec_conditioning_residual.rs`
+measures that on this pair at its own dtype rather than leaving it asserted: over
+a few hundred rows of a real generation, three of them reach a small multiple of
+one `bf16` unit in the last place of their own scale and the rest sit under one.
+
+The rows are the same rows; what this moves first is which token the selector
+chain proposes at a near-tie, and so the accept rate. It does not stop there. A
+different accept split changes the composition and the height of the next verify
+block, so the **verifier's** own logits at later positions are computed under a
+different dispatch too, and a near-tie of its own can resolve the other way — the
+emitted text can differ, later, at a position where the verifier itself was
+undecided. Byte-equality against a no-drafter arm is therefore not the criterion
+here either; equivalence is judged by the oracle in
+[`SPEC_ANSWER_EQUIVALENCE.md`](SPEC_ANSWER_EQUIVALENCE.md), and the recorded
+evidence is the pairs in `crates/rmlx-models/tests/spec_greedy_equivalence.rs`.
 
 Three scalars the reference applies to the drafter's logit path —
 `input_embedding_scale`, `output_multiplier`, `final_logit_softcapping` — are
@@ -1766,12 +1948,13 @@ Four things those say:
 - **MTP pays on both GDN hybrids and is the only drafter that does.** On the MoE
   it wins every prompt class at the shipped block size. On the dense 27B it wins
   every prompt class at block 2 and only the code class at block 3.
-- **`--draft-block-size` is capped by the sidecar's own `block_size`, and every
-  shipped Qwen3.5-family MTP sidecar declares that key as 3** — the Qwen3.6-35B
-  5-bit one and both Qwen3.8-27B ones, which is also the loader's default when
-  the key is absent. Any request above 3 is silently the same run. Block 2 and
-  block 3 are the only two settings those pairs have, and 2 measured faster than
-  3 on all three prompt classes for Qwen3.8-27B at both weight formats. The `block_size` field on the
+- **Every shipped Qwen3.5-family MTP sidecar declares `block_size: 3`** — the
+  Qwen3.6-35B 5-bit one and both Qwen3.8-27B ones — and that is the depth the
+  head was trained at, not a bound on what it can propose. The rows here were
+  taken while the round loop clamped the request to it, so block 2 and block 3
+  were the only two settings those pairs had, and 2 measured faster than 3 on all
+  three prompt classes for Qwen3.8-27B at both weight formats. The clamp is gone;
+  deeper blocks are selectable and unmeasured. The `block_size` field on the
   `mtp_generate: done` line reports the value actually used.
 - **The step cost the round loop paid was 1.39× a plain step at block 2 and
   1.89× at block 3** on Qwen3.8-27B-4bit, against 32.47 / 32.54 t/s no-drafter

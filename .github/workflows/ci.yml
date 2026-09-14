@@ -115,6 +115,12 @@ jobs:
       # as plausibly when the bound is wrong. These re-derive it.
       - name: the published-protocol table's bounds are the derived ones
         run: make published-table-selftest
+      # The advisory debt report's own detection power lives in its fn/file
+      # extraction and its round-loop driver discovery, not its exit code (it
+      # always exits 0). Pure bash + python3 over synthetic fixtures — no
+      # toolchain, no GPU, no model.
+      - name: the debt report finds what it claims to find
+        run: make debt-report-selftest
 
   msl:
     name: msl kernels (compile + format)

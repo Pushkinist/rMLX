@@ -56,9 +56,31 @@ of the recorded decode TPS.
    blocks — `make check-no-inline-tests` enforces this).
 4. `make ci` green locally — plus `make ci-perf` for codec-layer / `.metal`
    changes (see §Build & test).
-5. Open a PR into `main`. Fill in the PR template.
+5. Open a PR into `main`. Fill in the PR template, including the `Removals`
+   section — see below.
 
 `main` is protected: changes land via PR with CI green, not direct pushes.
+
+### No twins
+
+Before adding a second copy of something, ask whether it is really a second
+thing. Two types, functions, kernels, or files whose bodies differ only in a
+compile-time constant (`bits`, `head_dim`, group size, a codebook) or in a
+component's name are one item and a parameter — a const-generic or a
+trait-bound blanket impl — not a file per variant. (This does not license a
+generic with a single caller; that is still premature, see `CLAUDE.md`
+§Simplicity rules.)
+
+If your change touches speculative decoding's draft side, byte equality of
+the greedy stream is not evidence — see the oracle rule in `CLAUDE.md` and
+[`docs/SPEC_ANSWER_EQUIVALENCE.md`](docs/SPEC_ANSWER_EQUIVALENCE.md).
+
+### Removals
+
+Every PR names what it makes deletable — code, a gate, a flag, a doc section
+— in the `Removals` section of the PR template. "Nothing" is a valid answer,
+but write it down: deletion is a deliverable, not something that happens to
+get scheduled later.
 
 ## Commit messages
 

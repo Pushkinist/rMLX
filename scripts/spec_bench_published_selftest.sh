@@ -34,6 +34,15 @@
 # nothing. Under two concurrent suites the observed slip was ~30 ms against a
 # 150 ms pause.
 #
+# The other direction — a scheduling delay stretching the window itself, past
+# the first chunk — is the one a busy `make ci` was seen tripping: a plain
+# run's window widened from 200 ms to 360 ms (see `_PLAIN_TOKENS`) for the same
+# reason, more room for the same absolute delay to be a smaller fraction of.
+# The 10% cross-check band this is timed against is not touched by either
+# mitigation, and neither makes the dependency go away: every plain-arm case
+# still drives a real streamed response and reads this host's real clock over
+# it, by construction, not only under load.
+#
 # No GPU, no model, no DB.
 #
 # Exit codes: 0 — every case behaved; 1 — at least one did not; 2 — the
@@ -274,7 +283,22 @@ def gap_matrix(raw):
     ]
 
 
-TOKENS = int(os.environ.get("STUB_TOKENS", "6"))
+# The round-loop math below (`emitted = TOKENS`) is written against a fixed
+# token count, so the speculative arm keeps the short default. A plain run has
+# no such fixed expectation, and its engine-vs-client cross-check is exactly
+# the one a busy host was seen tripping: `mean_ms` (the engine's declared
+# rate) is a config value the wire's real pacing cannot move, so a scheduling
+# delay only stretches the *client's* measured window. A longer wire — more
+# chunks at the same nominal gap, so the declared rate is unchanged — gives
+# that same delay a bigger window to be a small fraction of. The window is
+# `(TOKENS - 1) * gap`: six chunks at the default 40 ms gap is 200 ms, ten is
+# 360 ms — 1.8x, not the round number the chunk count suggests. Against the
+# two recorded trips (10.2%, 11.0% past the band on the 200 ms window) that
+# leaves roughly 5.7% and 6.1%, comfortably inside the 10% band without
+# touching it. This mitigates the same absolute delay; it does not make the
+# window immune to a larger one.
+_PLAIN_TOKENS = "6" if os.environ.get("STUB_SPECULATIVE", "") == "1" else "10"
+TOKENS = int(os.environ.get("STUB_TOKENS", _PLAIN_TOKENS))
 GAP_MS = gap_matrix(os.environ.get("STUB_GAP_MS", "") or "40")
 PASS = int(os.environ.get("STUB_PASS", "1"))
 PREFILL_S = float(os.environ.get("STUB_PREFILL_S", "0.15"))
@@ -605,10 +629,13 @@ sys.exit("no free port in 18000-19999")
 # whose prompts/published IS the shrunken copy, which is how the default path is
 # shown to verify.
 #
-# The stub streams six tokens 40 ms apart behind a 150 ms prefill — 25 tok/s on
-# the wire and 25 reported by the engine. Its prompt count is four characters
-# per token above a base of 100, so the fixed-length prompt's fit is a real
-# search over the corpus rather than a fixed answer handed back.
+# The stub streams tokens 40 ms apart behind a 150 ms prefill — 25 tok/s on the
+# wire and 25 reported by the engine, at any token count. A plain run streams
+# ten (see `_PLAIN_TOKENS` in the stub source above); the speculative arm
+# keeps six, because its round-loop fixtures are written against that count.
+# Its prompt count is four characters per token above a base of 100, so the
+# fixed-length prompt's fit is a real search over the corpus rather than a
+# fixed answer handed back.
 run_case() {
     CASE_NAME="$1"
     local want="$2"
@@ -750,6 +777,12 @@ run_case three_passes_of_every_sample 0 \
     "the result holds three passes of every sample and nothing else"
 [ "$(jq_of "len(r['samples'])")" = "24" ] ||
     note_bad "the result holds $(jq_of "len(r['samples'])") rows (want 3 x 8)"
+# A plain run's completion length is the window the engine-vs-client
+# cross-check is timed over, not the speculative arm's fixed six — pinned here
+# so a revert of the widening that mitigates the load flake fails a case
+# rather than only losing margin silently.
+[ "$(jq_of "sorted({s['completion_tokens'] for s in r['samples']})")" = "[10]" ] ||
+    note_bad "completion_tokens=$(jq_of "sorted({s['completion_tokens'] for s in r['samples']})") (want [10])"
 [ "$(jq_of "sorted({s['pass'] for s in r['samples']})")" = "[1, 2, 3]" ] ||
     note_bad "passes=$(jq_of "sorted({s['pass'] for s in r['samples']})")"
 verdict
@@ -939,6 +972,34 @@ run_case sampling_is_read_back_from_the_engine 0 \
 [ "$(jq_of "r['protocol']['sampling_resolved']['seed']")" = "42919" ] ||
     note_bad "seed=$(jq_of "r['protocol']['sampling_resolved']['seed']")"
 verdict
+
+# A busy host was seen stretching the client's reading of a decode window past
+# the engine's, on the fixed-length-prompt request specifically — the request
+# sent between the warmups and the cells, before a plain run has read back its
+# own sampling. `STUB_ITL_MEAN_FROM=0` stages that same disagreement without a
+# busy host: this pins that a fixed-prompt cross-check failure aborts the run
+# before sampling is ever read, which is why that field came back empty on the
+# host that hit it rather than the checkpoint being unreadable.
+run_case fixed_prompt_disagreement_precedes_sampling_read 1 \
+    "a fixed-prompt cross-check failure is the fixed-prompt band, not a lost sampling read" \
+    'STUB_ITL_MEAN_MS=20' 'STUB_ITL_MEAN_FROM=0' \
+    'GREP:published_fixed_run: pass 1: .*past the 10% band' \
+    'GREP:over the fixed prompt.s decode window' \
+    'NOGREP:sampling: ' \
+    'NOGREP:published_aggregate'
+no_result
+verdict
+
+# The read this run's sampling comes back on is the same request whose body
+# already closed: do_POST writes the sampler event, then TTFT and ITL, then
+# `served += 1`, then the final SSE chunk — all before returning, so nothing
+# downstream of the response can observe the log mid-write. The harness never
+# reads that event until well after the request stream is done, either: it
+# kills the server, `wait`s for the process to exit, sleeps another 3 s to let
+# any buffered write flush, and only then reads the log. A read reachable only
+# behind a confirmed process exit cannot race a write that happened before
+# that process's own last response, for any delay on the write — the ordering
+# holds by construction, not by a margin a runtime case could lose.
 
 # Two guards, two cases: one pass whose requests did not share a setting, and
 # three passes that did not share one with each other.

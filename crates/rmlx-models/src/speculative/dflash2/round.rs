@@ -1,28 +1,34 @@
-//! The DFlash 2 round loop: draft a block, verify it, keep the agreed prefix.
+//! The DFlash 2 drafter's side of the shared round loop.
 //!
 //! Ported from the z-lab MLX reference `_stream_generate`. Verifier-side it is
-//! the shape every sidecar loop in this module family has — prefill, a bonus
+//! the shape every sidecar drafter in this module family has — prefill, a bonus
 //! token out of the prefill forward, then rounds of draft / verify / accept /
-//! roll back — so it shares [`crate::speculative::accept_prefix`],
-//! `rollback_round_caches` and [`crate::speculative::VerifierDraw`] with them
-//! rather than restating any of it.
+//! roll back — and that shape is [`run_rounds`]. What is here is the four
+//! methods the loop cannot supply: the whole-prompt capture its prefill takes,
+//! the block its denoiser drafts, the acceptance walk over the verify pass, and
+//! the conditioning window it slides.
 //!
-//! # Conditioning: recomputed, not cached
+//! # Conditioning: the K/V is recomputed, the projection is carried
 //!
 //! The reference gives its drafter a per-layer rotating K/V cache and feeds it
-//! only each round's newly committed rows. This loop keeps the committed
-//! **hidden states** instead and lets [`DFlash2Drafter::forward_hidden`]
-//! re-derive the conditioning K/V from them every round. The two are the same
-//! answer — the cached rows are a deterministic function of those hidden states
-//! — and the recomputing form is what makes the drafter forward invariant to a
-//! uniform shift of every position, which is why it needs no absolute offset.
-//! Adopting the cache would mean cached rows carry their own absolute RoPE, and
-//! that invariance, and the proof that rests on it, would have to be rebuilt.
+//! only each round's newly committed rows. This drafter rebuilds that K/V from
+//! the conditioning rows on every call instead. The two are the same answer —
+//! the cached rows are a deterministic function of those rows — and the
+//! recomputing form is what makes the drafter forward invariant to a uniform
+//! shift of every position, which is why it needs no absolute offset. Adopting
+//! the cache would mean cached rows carry their own absolute RoPE, and that
+//! invariance, and the proof that rests on it, would have to be rebuilt.
+//!
+//! One step before that K/V is [`DFlash2Drafter::project_conditioning`], which
+//! is row-wise and carries no position at all, and that is what this drafter
+//! keeps: it projects each round's committed capture rows as it commits them
+//! and carries the projection. Re-projecting the whole window every round would
+//! give the same rows for work proportional to the window.
 //!
 //! The buffer is bounded, not accumulated: the drafter attends over one sliding
 //! window, so rows older than it can never be read and are dropped as they fall
-//! out. Each row is `len(target_layer_ids) * hidden` wide, so an unbounded one
-//! would grow by 50 KiB per emitted token on the published pair.
+//! out. Each carried row is `hidden` wide — 10 KiB on the published pair, where
+//! the capture it was projected from is 50 KiB.
 //!
 //! # Greedy only
 //!
@@ -30,77 +36,296 @@
 //! selector's own candidate set, which is a different acceptance rule from the
 //! full-vocabulary one this crate's two-model loop implements, and
 //! [`DFlash2Drafter::select_chain`] traces a greedy chain and returns no
-//! candidate distribution to sample against. Like every other sidecar loop here
-//! this one is greedy, and the serve layer routes a sidecar request to it
+//! candidate distribution to sample against. Like every other sidecar drafter
+//! here this one is greedy, and the serve layer routes a sidecar request to it
 //! whatever the request's temperature.
-
-// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
-// caches a round builds live for that round only: they are never pushed to the
-// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
-// description has to match them. Applying the boundary promotion here would
-// change the codec of a stack whose only reader is the round that built it.
 
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_mlx::{Array, Device};
+use rmlx_mlx::{concatenate, Array, Device};
 
 use super::DFlash2Drafter;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
-use crate::speculative::{
-    accept_prefix, arm_lin_tapes, disarm_lin_tapes, emit_step, guard_verifier_prefill_logits,
-    phases_charged, rollback_round_caches, verifier_context, verifier_kv_bytes, DecodeWindow,
-    RoundPhases, RoundStats, SpecLoop, VerifierDraw,
+use crate::speculative::round_loop::{
+    run_rounds, Conditioning, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx, RoundDrafter,
+    RoundOutcome, Verdict, VerifierOffsetBasis,
 };
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+use crate::speculative::{
+    accept_prefix, block_capped_by_checkpoint, committed_rows, conditioning_residual,
+    guard_round_conditioning, guard_verifier_prefill_logits, phases_charged, SpecLoop,
+};
+use rmlx_kv_quant::KvQuant;
 
 /// Prompt positions per verifier prefill pass.
 ///
 /// The capture returns one hidden row per prompt position, so a single-shot
 /// prefill of a long prompt would put the whole capture and a full-vocabulary
 /// logit tensor in one Metal command buffer.
-const PREFILL_CHUNK_SIZE: usize = 1024;
+pub(super) const PREFILL_CHUNK_SIZE: usize = 1024;
 
-/// Largest block this loop can verify, and so the largest a checkpoint may
-/// declare.
+/// One request's DFlash 2 drafting state.
 ///
-/// **The block is scored in one un-chunked forward.** A round calls
-/// `Architecture::forward_verify_capture` once over the carry token and every
-/// proposal, and that forward materialises `block_size * vocab_size` logits in a
-/// single Metal command buffer — the round loop needs all of them, because it
-/// argmaxes every position to walk the acceptance. There is no chunked variant
-/// it could fall back on: `forward_verify_capture_chunked` exists precisely
-/// because that stops working, and it buys its headroom by materialising the
-/// *last* position's logits only, which a verify pass cannot do.
-///
-/// The number is the one that path already records as measured: a `[1, n, vocab]`
-/// logit tensor in one command buffer times the GPU out above roughly a thousand
-/// positions on this verifier's family, and a 4096-position single shot exceeds
-/// the Metal watchdog on logits alone. So a checkpoint declaring a block above
-/// this is describing a round that cannot be run rather than one that would be
-/// slow — and the block is what sizes the round's token buffer, the verify
-/// input, the selector's chain and a mask quadratic in it.
-///
-/// Real DFlash 2 blocks are single digits; the published checkpoint declares 8
-/// and its own guidance recommends 5 against a quantized pair. This is a
-/// structural ceiling with two orders of magnitude of headroom over anything
-/// that drafts, not a tuning knob.
-pub(super) const MAX_BLOCK_SIZE: usize = 1024;
+/// The drafter keeps no cache of its own — the denoiser re-reads the carried
+/// projection every round — so what crosses a round boundary is that projection
+/// and the verify pass's capture the next one is built from.
+#[allow(missing_debug_implementations)]
+pub(crate) struct BlockRound<'a> {
+    drafter: &'a DFlash2Drafter,
+    /// The verifier layers whose hidden the conditioning is projected from.
+    target_layer_ids: Vec<usize>,
+    /// One capture row's width, `len(target_layer_ids) * hidden_size`.
+    condition_width: i32,
+    /// The projection the next round's denoiser conditions on.
+    h_ctx: Option<Array>,
+    /// The prompt's last raw row, kept until the first round has extended the
+    /// buffer and then dropped: re-projecting it beside that round's commit is
+    /// what says how far the carried projection sits from a fresh one at this
+    /// checkpoint's dtype. One row, one round, and the probe releases it. See
+    /// `conditioning_residual`.
+    probe_seed: Option<Array>,
+    /// The verifier's capture at every position this round verified. A round
+    /// that stopped on an EOS leaves it set — the loop breaks before
+    /// `condition` — and the request drops this struct immediately after, so it
+    /// is released there rather than cleared on that path.
+    scored: Option<Array>,
+}
 
-/// The block a request runs at: what it asked for, what the checkpoint was
-/// trained at, and what one verify forward can score — whichever is smallest,
-/// and never below the two positions a seed and one draft need.
-///
-/// **The [`MAX_BLOCK_SIZE`] clamp is not the loader's guarantee restated.**
-/// [`DFlash2Drafter`] is a public struct with public fields, so a drafter
-/// reaching this loop need not have come through `DFlash2Drafter::load` and its
-/// config need not have been through `check_config` — the tests build one
-/// directly. The block sizes this round's token buffer, its verify input and its
-/// selector chain, so the loop bounds it on its own behalf rather than on a
-/// promise its argument did not have to make.
-pub(super) fn round_block_total(requested: usize, declared: usize) -> usize {
-    requested.min(declared).clamp(2, MAX_BLOCK_SIZE)
+impl<'a> BlockRound<'a> {
+    fn new(drafter: &'a DFlash2Drafter) -> Self {
+        let target_layer_ids = drafter.cfg.target_layer_ids.clone();
+        let condition_width = (drafter.cfg.hidden_size * target_layer_ids.len()) as i32;
+        Self {
+            drafter,
+            target_layer_ids,
+            condition_width,
+            h_ctx: None,
+            probe_seed: None,
+            scored: None,
+        }
+    }
+
+    /// The projection a round conditions on, or the refusal for a round that
+    /// reached for it before the prefill built one.
+    fn conditioning(&self) -> Result<&Array> {
+        self.h_ctx.as_ref().ok_or_else(|| {
+            Error::Model(
+                "dflash2_generate: a round read the projection it conditions on before \
+                 the prefill built one"
+                    .into(),
+            )
+        })
+    }
+}
+
+impl RoundDrafter for BlockRound<'_> {
+    const KV_REPORT_SKIPPED_BY: ReportSkippedBy = ReportSkippedBy::TheSeedExit;
+    const VERIFIER_OFFSET_BASIS: VerifierOffsetBasis = VerifierOffsetBasis::AfterTheForward;
+
+    /// Prefill the whole prompt, keeping the conditioning hidden of as many of
+    /// its positions as the drafter's window reaches back over — the depth the
+    /// reference conditions its first round on, not the last token alone. The
+    /// rows before that can never be read, so the capture releases them as the
+    /// prefill walks the prompt rather than holding one row per prompt token at
+    /// `len(target_layer_ids) * hidden_size` to the end of it.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "every index is axis 1 of a rank-3 buffer whose rank the seam that produced it checked: the trim and the row it takes the probe from"
+    )]
+    fn prefill(&mut self, ctx: &mut RoundCtx<'_>, prompt: &[u32]) -> Result<Prefilled> {
+        let device = ctx.device;
+        let keep_rows = self.drafter.conditioning_rows();
+        // Defence in depth: `check_config` refuses a window under 2 or wider
+        // than an array axis, so this conversion cannot fail on a drafter that
+        // loaded.
+        let keep = usize::try_from(keep_rows).map_err(|_| {
+            Error::Model(format!(
+                "dflash2_generate: this drafter reaches back over {keep_rows} rows, \
+                 which is not a row count"
+            ))
+        })?;
+        let prefill_t0 = Instant::now();
+        let (bonus_logits, prompt_hidden) = ctx.verifier.forward_verify_capture_chunked(
+            prompt,
+            &self.target_layer_ids,
+            &mut ctx.kv,
+            ctx.lin.as_deref_mut(),
+            PREFILL_CHUNK_SIZE,
+            Some(keep),
+            device,
+        )?;
+        guard_verifier_prefill_logits(ctx.verifier, &bonus_logits, prompt.len())?;
+        let prompt_ctx = self.drafter.trim_conditioning(&prompt_hidden)?;
+        // What the capture was asked to keep is a number at a call site, and
+        // the trim above accepts a shorter buffer without a word. A drafter
+        // conditioned on less than its window still proposes, and greedy
+        // verification then emits the verifier's own tokens whatever the
+        // proposals were — so what falls is the accept rate, and nothing here
+        // would say so.
+        let want_rows = keep_rows.min(i32::try_from(prompt.len()).unwrap_or(i32::MAX));
+        if prompt_ctx.shape()[1] != want_rows {
+            return Err(Error::Model(format!(
+                "dflash2_generate: the prompt's capture kept {} conditioning rows where this \
+                 drafter reaches back over {want_rows} of a {}-token prompt",
+                prompt_ctx.shape()[1],
+                prompt.len()
+            )));
+        }
+        // The projection is carried, not the capture it came from: `fc` and
+        // `hidden_norm` are row-wise, so a row projected once here is the row
+        // every later round would have re-derived. The prompt's rows are
+        // projected in this one call and each round then projects only what it
+        // commits.
+        let h_ctx = self.drafter.project_conditioning(&prompt_ctx)?;
+        self.probe_seed = Some(committed_rows(
+            &prompt_ctx.slice(
+                &[0, prompt_ctx.shape()[1] - 1, 0],
+                &[1, prompt_ctx.shape()[1], self.condition_width],
+                &[1, 1, 1],
+                device,
+            )?,
+            1,
+            self.condition_width,
+            device,
+        )?);
+        if ctx.charged {
+            // The guard above forced the logits, and so the whole prompt
+            // forward, but not the capture: it hangs off a different output of
+            // that forward. Joining the kept chunks, trimming to the window and
+            // projecting it is a pass over one row per kept position — and with
+            // nothing forcing it here the first round's drafter call pays for
+            // all of it. See `phases_charged`.
+            h_ctx.eval()?;
+        }
+        let prefill_ns = prefill_t0.elapsed().as_nanos();
+        self.h_ctx = Some(h_ctx);
+
+        let seed = ctx.draw.seed_token(&bonus_logits, device)?;
+        Ok(Prefilled {
+            seed,
+            prefill_ns,
+            // It projects its committed rows every round and the loop counts
+            // them. The prompt's rows are the starting window, not rows a round
+            // projected, so the count still opens at zero.
+            projects_conditioning: true,
+        })
+    }
+
+    fn propose(&mut self, ctx: &mut RoundCtx<'_>, carry: u32, block: usize) -> Result<Vec<u32>> {
+        // The block never resizes: the drafter denoises the block it was
+        // trained at, and only the token budget shortens it — which is the
+        // narrowing the loop already applied.
+        draft_block(
+            ctx.verifier,
+            self.drafter,
+            carry,
+            self.conditioning()?,
+            block,
+            ctx.device,
+        )
+    }
+
+    fn verify(&mut self, ctx: &mut RoundCtx<'_>, fed: &[u32], remaining: usize) -> Result<Verdict> {
+        let device = ctx.device;
+        // The verifier scores the carry token and every proposal in one pass,
+        // capturing the conditioning hidden for the same positions.
+        let t0 = Instant::now();
+        let (v_logits, v_hidden) = ctx.verifier.forward_verify_capture(
+            fed,
+            fed.len(),
+            &self.target_layer_ids,
+            &mut ctx.kv,
+            ctx.lin.as_deref_mut(),
+            device,
+        )?;
+        let v_tokens = ctx.draw.block_tokens(&v_logits, fed.len(), device)?;
+        if ctx.charged {
+            // Reading the verifier's tokens forced the logits and the trunk
+            // under them, but the capture is a different output of the same
+            // forward and stays lazy. The next round's drafter reads it, so
+            // with nothing forcing it here the verifier's own capture is billed
+            // to the drafter — and this drafter's capture is
+            // `len(target_layer_ids)` times as wide as the sidecar loops',
+            // which is the comparison that would mislead. See `phases_charged`.
+            v_hidden.eval()?;
+        }
+        let verify_ns = t0.elapsed().as_nanos();
+
+        let t0 = Instant::now();
+        let proposals = fed.get(1..).unwrap_or_default();
+        let (accept, commit) = accept_prefix(&v_tokens, proposals, remaining)?;
+        let walk_ns = t0.elapsed().as_nanos();
+
+        self.scored = Some(v_hidden);
+        Ok(Verdict {
+            accept,
+            commit,
+            verify_ns,
+            walk_ns,
+        })
+    }
+
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "axis 1 of a rank-3 buffer whose rank slide_conditioning established, and the width the drafter's fc reads"
+    )]
+    fn condition(
+        &mut self,
+        ctx: &RoundCtx<'_>,
+        verdict: &Verdict,
+        outcome: RoundOutcome,
+    ) -> Result<Option<Conditioning>> {
+        let device = ctx.device;
+        let Some(scored) = self.scored.take() else {
+            return Err(Error::Model(
+                "dflash2_generate: a round conditioned on a verify forward that did not run".into(),
+            ));
+        };
+        // The carry token and the accepted proposals.
+        let committed_hidden =
+            committed_rows(&scored, verdict.accept + 1, self.condition_width, device)?;
+        let (h_ctx, projected_rows) = self
+            .drafter
+            .slide_conditioning(self.conditioning()?, &committed_hidden)?;
+        guard_round_conditioning(outcome.round, projected_rows, verdict.accept + 1)?;
+        if let Some(seed) = self.probe_seed.take() {
+            let raw = concatenate(&[&seed, &committed_hidden], 1, device)?;
+            let fresh = self.drafter.project_conditioning(&raw)?;
+            let hidden = self.drafter.cfg.hidden_size as i32;
+            let tail = h_ctx.shape()[1] - (1 + projected_rows);
+            let carried_tail = h_ctx.slice(
+                &[0, tail, 0],
+                &[1, tail + 1 + projected_rows, hidden],
+                &[1, 1, 1],
+                device,
+            )?;
+            tracing::debug!(
+                rows = 1 + projected_rows,
+                residual = conditioning_residual(&carried_tail, &fresh, device)?,
+                "dflash2 conditioning: carried projection against a fresh one"
+            );
+        }
+        if ctx.charged {
+            // Projecting this round's committed rows and copying the window
+            // they extend is work the next round's drafter is the first thing
+            // to read. Forced here it lands in `rollback_ms`, which the loop
+            // closes after this call returns; left lazy it lands in the
+            // drafter. See `phases_charged`.
+            h_ctx.eval()?;
+        }
+        let rows = h_ctx.shape().get(1).copied();
+        self.h_ctx = Some(h_ctx);
+        Ok(Some(Conditioning {
+            rows,
+            projected: Some(projected_rows),
+        }))
+    }
+
+    fn carry(&self, f: &mut dyn FnMut(&[(&str, &Array)])) -> Result<()> {
+        f(&[("h_ctx", self.conditioning()?)]);
+        Ok(())
+    }
 }
 
 /// Drive a DFlash 2 drafter against its verifier.
@@ -119,16 +344,21 @@ pub(super) fn round_block_total(requested: usize, declared: usize) -> usize {
 /// forced-token contract the plain decode loop uses — is discarded here, as it
 /// is on every speculative loop: a round's tokens are already the verifier's.
 ///
+/// The rounds themselves run in [`run_rounds`]; what is here is what refuses
+/// before a cache stack is built, and the request's block.
+///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every round narrows the block again against the remaining token
+/// budget.
+///
 /// # Errors
 ///
 /// [`Error::Model`] when the prompt is too short to seed a round, when the
-/// verifier is not one this drafter's seams are wired for, or from any forward,
-/// acceptance or rollback below.
+/// verifier is not one this drafter's seams are wired for, and whatever the
+/// round loop refuses.
 #[allow(clippy::too_many_arguments)]
-#[allow(
-    clippy::indexing_slicing,
-    reason = "the one index is axis 1 of the conditioning buffer, whose rank trim_conditioning checks before returning it"
-)]
 pub fn dflash2_generate(
     verifier: &Architecture,
     drafter: &DFlash2Drafter,
@@ -142,14 +372,14 @@ pub fn dflash2_generate(
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
     sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
             "dflash2_generate: prompt must have >=2 tokens".into(),
         ));
     }
     // The recurrent state is a proxy, and an exact one today: the three seams
-    // this loop needs — the multi-layer hidden capture, the raw embedding and
+    // this drafter needs — the multi-layer hidden capture, the raw embedding and
     // the LM head over a final-normed hidden — are wired for the Qwen3.5 family
     // and nothing else, and that is the family that carries recurrent state.
     // Each of those seams refuses an architecture it is not wired for, so an
@@ -165,290 +395,28 @@ pub fn dflash2_generate(
                 .into(),
         ));
     }
-
-    let target_layer_ids = drafter.cfg.target_layer_ids.clone();
-    let condition_width = (drafter.cfg.hidden_size * target_layer_ids.len()) as i32;
-    let block_total = round_block_total(requested_block_total, drafter.cfg.block_size);
-
-    // Same constant the verifier resolves — a spec pair must not run two
-    // different caches.
-    let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    // The verifier's limits bound the pair; an over-capacity `--max-ctx` is
-    // refused here rather than overflowing a cache mid-round.
-    let ctx = verifier_context(verifier, max_ctx_override)?;
-    let max_seq = ctx.ceiling;
-
-    let mut v_caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
-        .map(|i| {
-            let window = verifier.layer_sliding_window(i);
-            KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                .with_max_seq_ceiling(ctx.ceiling)
-                .with_layer_idx(i)
-                // The verifier stack decides whether its layers read each
-                // other's K/V, and so whether Mixed/RotK keep their bf16
-                // mirror. A spec pair must not run two different caches.
-                .with_shares_kv(verifier.shares_kv_across_layers())
-        })
-        .collect();
-    let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
-        .map(|_| LinearAttnCache::new())
-        .collect();
-
-    let mut draw = VerifierDraw::new(sampler_cfg);
-
-    let mut total_draft = 0usize;
-    let mut total_accept = 0usize;
-    let mut rounds = 0usize;
-    // One read of process-global log state per request, at the loop head.
+    let block_total = block_capped_by_checkpoint(requested_block_total, drafter.cfg.block_size);
+    // One read of process-global log state per request, at the entry.
     let charge_phases = phases_charged();
-    let t_total = Instant::now();
-    let mut window = DecodeWindow::new();
-    let mut draft_ns: u128 = 0;
-    let mut verifier_ns: u128 = 0;
-
-    let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
-
-    // Prefill the whole prompt, capturing every position's conditioning hidden.
-    // The reference conditions its first round on as much of the prompt as the
-    // drafter's window reaches back over, not on the last token alone.
-    let prefill_t0 = Instant::now();
-    let (bonus_logits, prompt_hidden) = verifier.forward_verify_capture_chunked(
+    let mut round = BlockRound::new(drafter);
+    run_rounds(
+        verifier,
+        &mut round,
         prompt_ids,
-        &target_layer_ids,
-        &mut v_caches,
-        Some(&mut v_lin),
-        PREFILL_CHUNK_SIZE,
-        device,
-    )?;
-    guard_verifier_prefill_logits(verifier, &bonus_logits, prompt_ids.len())?;
-    let mut h_ctx = drafter.trim_conditioning(&prompt_hidden)?;
-    if charge_phases {
-        // The guard above forced the logits, and so the whole prompt forward,
-        // but not the capture: it hangs off a different output of that forward.
-        // Joining the chunks and trimming to the window is a copy of one row per
-        // prompt token at `len(target_layer_ids) * hidden_size` — and with
-        // nothing forcing it here the first round's drafter call pays for all of
-        // it. See `phases_charged`.
-        h_ctx.eval()?;
-    }
-    let prefill_ns = prefill_t0.elapsed().as_nanos();
-
-    let mut b = draw.seed_token(&bonus_logits, device)?;
-    emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
-    if eos_ids.contains(&b) {
-        // The stop token arrived before a round could run. The request still
-        // happened, so it still leaves exactly one record.
-        RoundStats {
+        step_fn,
+        &RoundCfg {
             loop_kind: SpecLoop::DFlash2,
             block_size: block_total,
-            rounds: 0,
-            emitted: emitted.len(),
-            seed_emitted: emitted.len(),
-            emitted_in_rounds: 0,
-            total_draft: 0,
-            total_accept: 0,
-            prefill_ns,
-            draft_ns: 0,
-            verifier_ns: 0,
-            round_loop_ns: 0,
-            elapsed_ns: t_total.elapsed().as_nanos(),
-            decode_tps: window.tps(),
+            n_tokens,
+            eos_ids,
+            tokenizer,
+            sampler_cfg,
             charged: charge_phases,
-        }
-        .log_done();
-        return Ok(emitted);
-    }
-
-    tracing::info!(
-        block_size = block_total,
-        prompt_len = prompt_ids.len(),
-        n_tokens,
-        ?kv_quant,
-        ?target_layer_ids,
-        condition_rows = h_ctx.shape()[1],
-        temperature = sampler_cfg.temperature,
-        "dflash2_generate: starting"
-    );
-
-    let seed_emitted = emitted.len();
-    let mut emitted_in_rounds = 0usize;
-    let round_loop_t0 = Instant::now();
-    while emitted.len() < n_tokens {
-        rounds += 1;
-        let round_t0 = Instant::now();
-        let remaining = n_tokens - emitted.len();
-        // The block never resizes: the drafter denoises the block it was
-        // trained at, and only the token budget shortens it.
-        let bs = block_total.min(remaining + 1);
-        if bs <= 1 {
-            break;
-        }
-
-        let t0 = Instant::now();
-        let draft_tokens = draft_block(verifier, drafter, b, &h_ctx, bs, device)?;
-        let round_draft_ns = t0.elapsed().as_nanos();
-        draft_ns += round_draft_ns;
-        if draft_tokens.is_empty() {
-            break;
-        }
-        total_draft += draft_tokens.len();
-
-        // The verifier scores the carry token and every proposal in one pass,
-        // capturing the conditioning hidden for the same positions.
-        arm_lin_tapes(Some(&mut v_lin));
-        let mut v_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
-        v_input.push(b);
-        v_input.extend_from_slice(&draft_tokens);
-        let v_k = v_input.len();
-
-        let t0 = Instant::now();
-        let (v_logits, v_hidden) = verifier.forward_verify_capture(
-            &v_input,
-            v_k,
-            &target_layer_ids,
-            &mut v_caches,
-            Some(&mut v_lin),
-            device,
-        )?;
-        let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
-        if charge_phases {
-            // Reading the verifier's tokens forced the logits and the trunk
-            // under them, but the
-            // capture is a different output of the same forward and stays lazy.
-            // The next round's drafter reads it, so with nothing forcing it here
-            // the verifier's own capture is billed to the drafter — and this
-            // drafter's capture is `len(target_layer_ids)` times as wide as the
-            // sidecar loops', which is the comparison that would mislead. See
-            // `phases_charged`.
-            v_hidden.eval()?;
-        }
-        let round_verify_ns = t0.elapsed().as_nanos();
-        verifier_ns += round_verify_ns;
-
-        let t0 = Instant::now();
-        let (accept, new_tokens) = accept_prefix(&v_tokens, &draft_tokens, remaining)?;
-        let round_walk_ns = t0.elapsed().as_nanos();
-        total_accept += accept;
-
-        let mut hit_eos = false;
-        for &id in &new_tokens {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            emitted_in_rounds += 1;
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
-        if hit_eos {
-            break;
-        }
-
-        // The verifier consumed `v_k` positions and keeps the carry token plus
-        // the accepted proposals. Read the offset from the deepest cache: a
-        // recurrent layer's KvCache never advances, so layer 0 would report 0.
-        let t0 = Instant::now();
-        let v_offset_before = v_caches.iter().map(KvCache::offset).max().unwrap_or(0);
-        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
-        let refolded = v_target < v_offset_before;
-        if refolded {
-            let v_pre_round_offset = v_offset_before - v_k as i32;
-            rollback_round_caches(
-                &mut v_caches,
-                Some(&mut v_lin),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                charge_phases,
-                device,
-            )?;
-        } else {
-            disarm_lin_tapes(Some(&mut v_lin));
-        }
-        let round_rollback_ns = t0.elapsed().as_nanos();
-
-        // The conditioning rows are exactly the positions the caches kept: the
-        // carry token and the accepted proposals.
-        let committed = accept as i32 + 1;
-        let committed_hidden = v_hidden.slice(
-            &[0, 0, 0],
-            &[1, committed, condition_width],
-            &[1, 1, 1],
-            device,
-        )?;
-        h_ctx = drafter.extend_conditioning(&h_ctx, &committed_hidden)?;
-        if charge_phases {
-            // Extending the context copies every row the drafter's window
-            // reaches back over, at `len(target_layer_ids)` times the hidden
-            // width, and the next round's drafter is the first thing to read
-            // it. Forced here it lands in the round's unclaimed time, which is
-            // where slicing and bookkeeping belong; left lazy it lands in the
-            // drafter. See `phases_charged`.
-            h_ctx.eval()?;
-        }
-        b = *new_tokens.last().unwrap_or(&b);
-
-        tracing::debug!(
-            round = rounds,
-            accept,
-            num_draft = draft_tokens.len(),
-            n_committed = new_tokens.len(),
-            emitted_total = emitted.len(),
-            condition_rows = h_ctx.shape()[1],
-            v_offset_before,
-            v_target,
-            "dflash2 round"
-        );
-
-        RoundPhases {
-            round_ns: round_t0.elapsed().as_nanos(),
-            draft_ns: round_draft_ns,
-            verify_ns: round_verify_ns,
-            walk_ns: round_walk_ns,
-            rollback_ns: round_rollback_ns,
-            refolded,
-            charged: charge_phases,
-        }
-        .log(
-            SpecLoop::DFlash2,
-            rounds,
-            accept,
-            draft_tokens.len(),
-            &[("h_ctx", &h_ctx)],
-        );
-    }
-
-    let round_loop_ns = round_loop_t0.elapsed().as_nanos();
-    RoundStats {
-        loop_kind: SpecLoop::DFlash2,
-        block_size: block_total,
-        rounds,
-        emitted: emitted.len(),
-        seed_emitted,
-        emitted_in_rounds,
-        total_draft,
-        total_accept,
-        prefill_ns,
-        draft_ns,
-        verifier_ns,
-        round_loop_ns,
-        elapsed_ns: t_total.elapsed().as_nanos(),
-        decode_tps: window.tps(),
-        charged: charge_phases,
-    }
-    .log_done();
-
-    // Report the verifier's resident KV, so a caller that sampled the verifier
-    // arch around this call can attribute the figure to it. This round loop
-    // never goes through `Architecture::generate_greedy`, so nothing else
-    // writes it.
-    verifier.store_kv_cache_bytes(
-        verifier_kv_bytes(&v_caches, Some(&v_lin)),
-        crate::decode_loop::PostDecode::seal(),
-    );
-    Ok(emitted)
+            kv_quant_override,
+            max_ctx_override,
+        },
+        device,
+    )
 }
 
 /// One block of `bs - 1` proposals: mask the block behind the carry token,
@@ -472,7 +440,7 @@ fn draft_block(
     block_ids.resize(bs, drafter.cfg.mask_token_id as i32);
 
     let block = verifier.embed_tokens_raw(&block_ids, device)?;
-    let hidden = drafter.forward_hidden(&block, h_ctx)?;
+    let hidden = drafter.forward_hidden_conditioned(&block, h_ctx)?;
     // Row 0 is the seed, which is not drafted.
     let drafted = hidden.slice(&[0, 1, 0], &[1, bs as i32, hidden_size], &[1, 1, 1], device)?;
     let logits = verifier.logits_from_final_hidden(&drafted, device)?;

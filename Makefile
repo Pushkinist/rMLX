@@ -100,6 +100,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         published-table check-published-table published-table-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
         check-spec-sampling check-spec-sampling-fixtures \
+        check-spec-charge check-spec-charge-fixtures \
         check-published-samples check-published-samples-fixtures \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
         profile-mst \
@@ -109,7 +110,8 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         bench-codec-cell \
         smoke-codec-matrix \
         e2e \
-        file-size-report check-no-inline-tests check-no-scalar-f32-leak \
+        file-size-report debt-report debt-report-selftest \
+        check-no-inline-tests check-no-scalar-f32-leak \
         check-doc-source-citations \
         check-kv-layer-quants check-kv-codec-disposition \
         check-kv-codec-disposition-fixtures \
@@ -410,6 +412,12 @@ hooks:           ## install the pre-commit git hook
 file-size-report: ## advisory: print source files >1000 LOC (non-failing)
 	@bash scripts/file_size_report.sh
 
+debt-report: ## advisory: sibling similarity, debt counters, add/remove ratio, oversized docs (non-failing; also runs at the end of `make ci`)
+	@bash scripts/debt_report.sh
+
+debt-report-selftest: ## CI gate: recall test for debt-report over synthetic fixtures — a planted twin, a non-twin, the round-loop group, and a two-commit ratio repo
+	@bash scripts/debt_report_selftest.sh
+
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
 	@bash scripts/check_no_inline_tests.sh
 
@@ -447,8 +455,16 @@ check-spec-sampling: ## CI gate: fail if a speculative round loop is not handed 
 	@bash scripts/check_spec_sampling.sh
 
 .PHONY: check-spec-sampling-fixtures
-check-spec-sampling-fixtures: ## CI gate: recall test for the above — 10 synthetic scan roots, each asserting the reason as well as exit 1 vs exit 2
+check-spec-sampling-fixtures: ## CI gate: recall test for the above — 27 cases over two tree shapes, each asserting the reason as well as exit 1 vs exit 2
 	@bash scripts/check_spec_sampling_fixtures.sh
+
+.PHONY: check-spec-charge
+check-spec-charge: ## CI gate: fail if a speculative round loop names more than one phase-charge decision, or the census over the loops moves
+	@bash scripts/check_spec_charge.sh
+
+.PHONY: check-spec-charge-fixtures
+check-spec-charge-fixtures: ## CI gate: recall test for the above — 76 cases over three tree shapes, each asserting the reason as well as exit 1 vs exit 2
+	@bash scripts/check_spec_charge_fixtures.sh
 
 .PHONY: check-published-samples
 check-published-samples: ## CI gate: fail if the checked-in published sample sets do not re-derive from their recorded seeds, digests and templates
@@ -544,6 +560,7 @@ check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips
 
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
+	@bash scripts/debt_report_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_kv_layer_quants.sh
@@ -556,6 +573,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_spec_metric_parity_fixtures.sh
 	@bash scripts/check_spec_sampling.sh
 	@bash scripts/check_spec_sampling_fixtures.sh
+	@bash scripts/check_spec_charge.sh
+	@bash scripts/check_spec_charge_fixtures.sh
 	@python3 scripts/published_samples.py verify
 	@bash scripts/check_published_samples_fixtures.sh
 	@bash scripts/check_doc_source_citations.sh
@@ -582,6 +601,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true
 	@bash scripts/target_size_report.sh || true
+	@bash scripts/debt_report.sh || true
 	@echo "ci ok"
 
 # tag: derive v<version> from the single source of truth

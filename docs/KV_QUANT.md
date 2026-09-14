@@ -3264,9 +3264,13 @@ parallel `cargo test`.
 **unquantised bf16** (`KvQuant::None`), for every architecture, every
 checkpoint and every prompt length. One constant,
 `rmlx_models::kv_cache::DEFAULT_KV_QUANT`, is the only producer; the CLI, the
-server load path, the image branch, the arch dispatcher and all six
-speculative drafter stacks read it and nothing else. There is no per-arch table
-and no per-context re-selection behind it.
+server load path, the image branch, the arch dispatcher and
+`speculative::round_common::verifier_cache_stack`
+(`crates/rmlx-models/src/speculative/round_common.rs`) read it and nothing
+else. That last is the only reader on the speculative side: every round loop's
+verifier stack comes from it, and the two-model loops' draft stacks from the
+same builder. There is no per-arch table and no per-context re-selection behind
+it.
 
 Two things this replaced, both removed rather than retuned:
 

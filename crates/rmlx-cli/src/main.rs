@@ -89,8 +89,13 @@ impl From<DraftKindArg> for rmlx_models::DraftKind {
     }
 }
 
-/// `--draft-block-size` at parse time: the engine's floor, refused before a
-/// model loads rather than on the first request after two have.
+/// `--draft-block-size` at parse time: the engine's floor and its ceiling,
+/// refused before a model loads rather than on the first request after two have.
+///
+/// The ceiling is refused rather than clamped for the same reason the floor is:
+/// an operator who asked for 4096 and was quietly served 1024 would read the
+/// round's figures as belonging to the block they named. The round loops clamp
+/// too, as their own guard against a caller that is not this one.
 fn parse_draft_block_size(s: &str) -> Result<usize, String> {
     let block: usize = s
         .parse()
@@ -99,6 +104,16 @@ fn parse_draft_block_size(s: &str) -> Result<usize, String> {
         return Err(format!(
             "a block of {block} leaves no room for a draft token; it must be at least {}",
             rmlx_server::MIN_DRAFT_BLOCK_SIZE
+        ));
+    }
+    if block > rmlx_models::speculative::MAX_BLOCK_SIZE {
+        return Err(format!(
+            "a block of {block} is more positions than one verify forward can score; \
+             the round scores the whole block in a single un-chunked pass that \
+             materialises one full-vocabulary logit row per position, and above about \
+             a thousand of them that pass times the GPU out rather than running \
+             slowly (max {})",
+            rmlx_models::speculative::MAX_BLOCK_SIZE
         ));
     }
     Ok(block)
@@ -631,7 +646,9 @@ enum Cmd {
         draft_kind: Option<DraftKindArg>,
         /// Speculative round block: tokens the verifier scores per round, its
         /// own token included, so the drafter proposes one fewer. The same
-        /// number for every drafter kind. Must be ≥ 2. Default 5.
+        /// number for every drafter kind. Must be ≥ 2 and ≤ 1024. Absent, the
+        /// round runs at 5 capped by the depth the drafter's own checkpoint
+        /// declares, and at a flat 5 for a drafter that declares none.
         /// Env: `MLX_VLM_DRAFT_BLOCK_SIZE` (fallback when flag is absent).
         #[arg(long, value_name = "N", env = "MLX_VLM_DRAFT_BLOCK_SIZE", value_parser = parse_draft_block_size)]
         draft_block_size: Option<usize>,

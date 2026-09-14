@@ -60,31 +60,53 @@ impl DFlash2Drafter {
         reason = "shape axes are established by construction: `shaped` validates both inputs' rank at the entry point and every array below is reshaped from them"
     )]
     pub fn forward_hidden(&self, block: &Array, target_hidden: &Array) -> Result<Array> {
+        let trimmed = self.trim_conditioning(target_hidden)?;
+        let h_ctx = self.project_conditioning(&trimmed)?;
+        self.forward_hidden_conditioned(block, &h_ctx)
+    }
+
+    /// The verifier's captured rows as this drafter's attention reads them:
+    /// `[1, rows, len(target_layer_ids) * hidden]` in, `[1, rows, hidden]` out.
+    ///
+    /// `fc` and `hidden_norm` are both row-wise, so a row's projection does not
+    /// depend on which other rows were in the call. That is what lets the round
+    /// loop project each round's newly committed rows and carry the result,
+    /// rather than re-projecting its whole window every round — and it is a
+    /// property of these two layers, not of the drafter: the position-dependent
+    /// part of the conditioning is the per-layer RoPE below, which is
+    /// recomputed over the whole window on every call.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Model`] when the rows are not the rank or the width
+    /// `target_layer_ids` predicts.
+    pub fn project_conditioning(&self, target_hidden: &Array) -> Result<Array> {
+        let width = self.cfg.target_layer_ids.len() as i32 * self.cfg.hidden_size as i32;
+        shaped(target_hidden, "target_hidden", &[1, -1, width])?;
+        let projected = self.fc.forward(target_hidden, self.device)?;
+        self.hidden_norm.forward(&projected, self.device)
+    }
+
+    /// [`Self::forward_hidden`] over conditioning rows already projected by
+    /// [`Self::project_conditioning`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Model`] when either input's rank or width is not the one the
+    /// config predicts, or when either is empty.
+    pub(super) fn forward_hidden_conditioned(&self, block: &Array, h_ctx: &Array) -> Result<Array> {
         let device = self.device;
         let hidden = self.cfg.hidden_size as i32;
         let block_len = shaped(block, "block", &[1, -1, hidden])?;
-        let full_ctx = shaped(
-            target_hidden,
-            "target_hidden",
-            &[1, -1, self.cfg.target_layer_ids.len() as i32 * hidden],
-        )?;
+        let full_ctx = shaped(h_ctx, "h_ctx", &[1, -1, hidden])?;
 
-        // `fc` and `hidden_norm` are row-wise, so dropping the unreachable rows
-        // before them is the same result for less work.
-        let keep = self.conditioning_rows();
-        let ctx_len = full_ctx.min(keep);
-        let trimmed = if full_ctx > keep {
-            target_hidden.slice(
-                &[0, full_ctx - keep, 0],
-                &[1, full_ctx, target_hidden.shape()[2]],
-                &[1, 1, 1],
-                device,
-            )?
-        } else {
-            target_hidden.try_clone()?
-        };
-        let projected = self.fc.forward(&trimmed, device)?;
-        let h_ctx = self.hidden_norm.forward(&projected, device)?;
+        // Rows past the window are hidden by the mask either way; dropping them
+        // is the same answer for less attention. The trimmed buffer is what the
+        // attention reads, so it is also what says how long the context is: the
+        // mask and the key positions must be built against the same number the
+        // K/V projection sees.
+        let h_ctx = self.trim_rows(h_ctx, hidden, "the carried projection h_ctx")?;
+        let ctx_len = shaped(&h_ctx, "h_ctx", &[1, -1, hidden])?;
 
         // One mask for the stack: every layer of this drafter is a sliding
         // layer over the same two lengths.
@@ -350,19 +372,19 @@ impl DFlash2Drafter {
     /// [`check_config`](super::check_config) refuses a window that does not fit
     /// in one — past that this subtraction wraps negative and
     /// [`Self::trim_conditioning`] slices from beyond its own end.
-    pub(super) fn conditioning_rows(&self) -> i32 {
+    pub fn conditioning_rows(&self) -> i32 {
         self.cfg.sliding_window as i32 - 1
     }
 
     /// Drop the conditioning rows no block query can read.
     ///
-    /// Two callers, and they are not interchangeable. [`Self::forward_hidden`]
-    /// calls it to avoid projecting rows the mask will hide, which changes no
-    /// output; the round loop calls it on the buffer it carries between rounds,
-    /// where it is the **bound** on something that would otherwise grow by
-    /// `len(target_layer_ids) * hidden_size` per emitted token forever. Only the
-    /// first is visible in an answer, so a round loop passing its own row count
-    /// could drift to any value at all and no test would move. It passes none.
+    /// Two callers, and they are not interchangeable. The prefill trims the
+    /// prompt's capture before projecting it, which changes no output; the round
+    /// loop trims the buffer it carries between rounds, where it is the **bound**
+    /// on something that would otherwise grow by `hidden_size` per emitted token
+    /// forever. Only the first is visible in an answer, so a round loop passing
+    /// its own row count could drift to any value at all and no test would move.
+    /// It passes none.
     ///
     /// `hidden` is `[1, rows, len(target_layer_ids) * hidden_size]`, oldest row
     /// first. Returned unchanged when it is already short enough.
@@ -373,18 +395,26 @@ impl DFlash2Drafter {
     /// drafter's `fc` reads — a capture taken at another set of target layers
     /// has the same rank and the same row count, and would be projected as
     /// though it were this one.
+    pub(super) fn trim_conditioning(&self, hidden: &Array) -> Result<Array> {
+        let width = self.cfg.target_layer_ids.len() as i32 * self.cfg.hidden_size as i32;
+        self.trim_rows(hidden, width, "the conditioning capture target_hidden")
+    }
+
+    /// The last [`Self::conditioning_rows`] rows of a `[1, rows, width]` buffer.
+    ///
+    /// `what` names the buffer in a refusal: the same trim runs over the
+    /// verifier's captured rows and over their projection, and those two widths
+    /// are what tells one from the other.
     #[allow(
         clippy::indexing_slicing,
         reason = "each axis is read only after the rank has been compared against 3"
     )]
-    pub(super) fn trim_conditioning(&self, hidden: &Array) -> Result<Array> {
-        let device = self.device;
-        let width = self.cfg.target_layer_ids.len() as i32 * self.cfg.hidden_size as i32;
+    fn trim_rows(&self, hidden: &Array, width: i32, what: &str) -> Result<Array> {
         let shape = hidden.shape();
         if shape.len() != 3 || shape[0] != 1 || shape[2] != width {
             return Err(Error::Model(format!(
-                "DFlash2Drafter: the conditioning buffer has shape {shape:?}, not the \
-                 [1, rows, {width}] this drafter's target_layer_ids predict"
+                "DFlash2Drafter: {what} has shape {shape:?}, not the \
+                 [1, rows, {width}] this drafter predicts"
             )));
         }
         let keep = self.conditioning_rows();
@@ -392,24 +422,47 @@ impl DFlash2Drafter {
         if rows <= keep {
             return hidden.try_clone();
         }
-        hidden.slice(&[0, rows - keep, 0], &[1, rows, width], &[1, 1, 1], device)
+        hidden.slice(
+            &[0, rows - keep, 0],
+            &[1, rows, width],
+            &[1, 1, 1],
+            self.device,
+        )
     }
 
-    /// Append a round's committed conditioning rows to the buffer carried from
-    /// the last one, bounded.
+    /// Project a round's committed capture rows and append them to the carried
+    /// projection, bounded.
     ///
-    /// Growing and bounding are one operation because the invariant is on the
-    /// result, not on either step: a caller that appended and did not trim would
-    /// produce the same tokens forever and grow without limit, and nothing in an
-    /// answer would say so. There is no way to reach the first half alone.
+    /// Returns the new buffer and the rows it projected — which is the round's
+    /// committed rows and nothing else. Projecting, appending and bounding are
+    /// one operation because the invariant is on the result, not on any step: a
+    /// caller that appended and did not trim would produce the same tokens
+    /// forever and grow without limit, and one that re-projected the rows it was
+    /// carrying would produce the same tokens for more work every round. Neither
+    /// is reachable from outside.
     ///
     /// # Errors
     ///
-    /// [`Error::Model`] when either side is not the rank or the width this
-    /// drafter's `fc` reads.
-    pub(super) fn extend_conditioning(&self, carried: &Array, committed: &Array) -> Result<Array> {
-        let grown = concatenate(&[carried, committed], 1, self.device)?;
-        self.trim_conditioning(&grown)
+    /// [`Error::Model`] when the carried buffer is not `[1, rows, hidden_size]`
+    /// or the committed rows are not the width this drafter's `fc` reads.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the row count is read after project_conditioning has established the rank"
+    )]
+    pub(super) fn slide_conditioning(
+        &self,
+        carried: &Array,
+        committed: &Array,
+    ) -> Result<(Array, i32)> {
+        let projected = self.project_conditioning(committed)?;
+        let rows = projected.shape()[1];
+        let grown = concatenate(&[carried, &projected], 1, self.device)?;
+        let bounded = self.trim_rows(
+            &grown,
+            self.cfg.hidden_size as i32,
+            "the carried projection h_ctx",
+        )?;
+        Ok((bounded, rows))
     }
 
     /// Channel groups the dynamic kernel's correction is shared over.

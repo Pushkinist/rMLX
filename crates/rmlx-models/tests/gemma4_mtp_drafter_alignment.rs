@@ -142,7 +142,7 @@ fn mtp_assistant_accept_rate_is_high() {
         seed: Some(0),
         top_logprobs_k: 0,
     };
-    let steps = mtp_assistant_generate(
+    let (steps, _block) = mtp_assistant_generate(
         &verifier,
         &drafter,
         &tk,
