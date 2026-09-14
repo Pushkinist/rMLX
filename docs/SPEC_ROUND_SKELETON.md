@@ -1,16 +1,15 @@
 # One speculative round loop: the interface
 
-**Status: migration chunks 1, 2, 3, 4 and 5 have landed.** The loop is
+**Status: migration chunks 1 to 6 have landed.** The loop is
 `crates/rmlx-models/src/speculative/round_loop.rs`; the Gemma4 assistant, the MTP
-sidecar, DFlash 2, DFlash 1 and EAGLE-3 run on it and the two two-model loops
-still carry their own bodies. This file is what a reviewer judged before the
-first drafter was migrated, and what each migration chunk is held to afterwards.
-What each chunk landed differently from the proposal below is listed under "What
-chunk 1 landed", "What chunk 2 landed", "What chunk 3 landed", "What chunk 4
-landed" and "What chunk 5 landed".
+sidecar, DFlash 2, DFlash 1, EAGLE-3 and the two-model greedy pair run on it and
+the two-model stochastic loop still carries its own body. This file is what a
+reviewer judged before the first drafter was migrated, and what each migration
+chunk is held to afterwards. What each chunk landed differently from the proposal
+below is listed under "What chunk 1 landed" through "What chunk 6 landed".
 
 Seven drafter paths in `crates/rmlx-models/src/speculative/` run one algorithm.
-Two still carry their own round-loop body; the other five are entries onto the
+One still carries its own round-loop body; the other six are entries onto the
 shared loop:
 
 | drafter path | file | body |
@@ -20,7 +19,7 @@ shared loop:
 | `dflash2_generate` | `crates/rmlx-models/src/speculative/dflash2/round.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `eagle3_generate` | `crates/rmlx-models/src/speculative/eagle3/round.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `mtp_assistant_generate` | `crates/rmlx-models/src/speculative/gemma4_assistant.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
-| `spec_generate_greedy_cached` | `crates/rmlx-models/src/speculative/mod.rs` | its own |
+| `spec_generate_greedy_cached` | `crates/rmlx-models/src/speculative/mod.rs`, drafter in `two_model.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `spec_generate_stochastic_cached` | `crates/rmlx-models/src/speculative/mod.rs` | its own |
 
 `spec_generate_greedy` in the same file is the two-model entry guard and
@@ -159,6 +158,11 @@ They are the chunk-2 agenda as much as they are a record.
   unconditionally, through one `emit_seed_token` call that is also where the
   seed-EOS record is written, so a `None` would have to be given a token to emit
   and would emit an invented one. The arm arrives with the pair that needs it.
+
+  **Closed in chunk 6, and not as an `Option`.** The two statements — which
+  token the first round carries, and whether the request emits it — are one
+  two-valued `Seed`, because a token beside a flag can be a flag about another
+  token.
 - **`RoundOutcome` is not a type.** Its `emit` half has no reader in chunk 1 —
   the assistant's `condition` reads the verifier target and nothing else — and a
   struct field no one reads is a `dead_code` warning, not a seam. `rollback` and
@@ -532,6 +536,100 @@ migration had to preserve or move.
   taking its fifth row. EAGLE-3's own refusal text is gone with its body — item
   11's cost, paid a fifth time.
 
+## What chunk 6 landed
+
+Nine notes. Two are the interface changing shape, two close deviations earlier
+chunks recorded, one is a declaration that moved and three are values the
+migration had to preserve or move — and one is a gate that lost its only name.
+
+- **`Prefilled::seed` is a two-valued `Seed` and not an `Option<u32>`.** A round
+  always opens on a token; what differs is whether the request is entitled to
+  emit it. `Seed::Emitted(t)` is a token the prefill forward drew past the whole
+  prompt, `Seed::Carried(t)` is the prompt's own last token that the pair's
+  prefill stopped short of. An `Option` beside a separate carry would let a
+  drafter state the two of different tokens, and the loop would have no way to
+  tell. The loop reads the carry out of either arm and the `Emitted` arm holds
+  all three of the seed's statements: the `DecidedBy::FullVocab` push chunk 5
+  named as this chunk's obligation, the `emit_seed_token` call, and the seed-EOS
+  return that reads `KV_REPORT_SKIPPED_BY`. The five migrated drafters re-signed
+  one field each; `run_rounds` carries no drafter-specific branch for it.
+- **`RoundCtx` carries the KV codec.** `verifier_cache_stack` already resolved
+  it and the loop only logged it; the two-model drafter builds a second cache
+  stack for the draft model and it must be the verifier's codec at the
+  verifier's ceiling, because the verifier owns a pair's KV geometry. The
+  alternative is the drafter resolving `kv_quant_override` against
+  `DEFAULT_KV_QUANT` a second time, which is a second producer of a number that
+  has one — the same argument that put `max_seq` there in chunk 5.
+- **The block figure keeps its unit, and the subtraction is the entry's.** The
+  loop returns the widest block that ran, as it does for the other six; the
+  two-model entry returns `drafts_per_round` of it, and
+  `spec_generate_greedy`'s one `map` adds the verifier's own token back. The
+  value the dispatcher receives is unchanged, which is what the equivalence
+  harness asserts on every arm and every prompt. `drafts_per_round` is the
+  existing one producer of that boundary, not a second spelling of it.
+- **`rollback` did not need `&mut RoundCtx`, for the second chunk running.** The
+  draft model, its cache stack and its recurrent state are the drafter's own
+  fields; the rollback reads the verifier not at all and the round's context only
+  for the device and the charge decision. So `rollback` and `condition` still
+  take `&RoundCtx<'_>`, and the one signature widening chunk 4 budgeted for is
+  still unspent.
+- **The full-accept resync is in `rollback`, and the drafter-side target is read
+  back.** The resync — the last proposal fed ahead of the correction on a round
+  that accepted every proposal — is a function of *this* round's acceptance, so
+  `propose`, which runs before it, cannot state it without keeping a second copy
+  of a fact the round already has. The span's `target` is read off the draft
+  cache after the rollback rather than computed from the retention, which is the
+  cross-check item 5 of the migration order names, and the same shape EAGLE-3
+  landed in chunk 5.
+- **The empty-chain refusal moved spelling, and the row moved with it.** The
+  loop refuses `draft_tokens.is_empty()`; this pair's own body refused `v_k < 2`
+  one statement later, on the verifier input the empty chain produced. Item 11
+  says the two are the same test — a two-model round's carry is always one token
+  — so the `DISPOSITIONS` row is now `ChainRefusedBy::TheProposalChain` and the
+  `rows.min(1)` arm takes its sixth row. No request stops anywhere it did not
+  stop before; what goes is the sixth of the seven texts, item 11's cost paid a
+  sixth time.
+- **The two-model dispositions are preserved as the spec states them**: the
+  in-round EOS exit writes its own record and returns before the resident-KV
+  report (`KV_REPORT_SKIPPED_BY::TheInRoundExit`, the first producer of that arm
+  — its `dead_code` allowance is gone); it counts its rollback back from the tail
+  and reports the post-forward read
+  (`VERIFIER_OFFSET_BASIS::AfterTheForward`) while the target is computed from
+  the head spelling, which is the number the body it replaced computed; the
+  request record's `conditioned_rows` stays `None` under
+  `projects_conditioning: false`; its round line keeps `condition_rows: None`
+  beside `projected_rows: None` and its `d_offset_before` / `d_target` pair; and
+  it charges no phase — the entry writes `charged: false` into `RoundCfg` and the
+  census reads `charge_phases:3 false:4` over seven sites, now `1 classic, 1
+  forwarded, 6 entries`.
+- **Two spans moved and one log field went, and nothing reads any of them.** The
+  request's own clock used to start before the verifier's cache stack was built
+  and now starts after it, because the shared loop opens `t_total` there; and the
+  draft model's cache stack is allocated inside `prefill`, before that drafter's
+  own `prefill_ns` opens, which is where the body it replaced allocated it
+  relative to its own span. Its starting `info!` is the loop's, so `max_seq` and
+  the draft count `k` are no longer on that line — the block is, and it is `k`
+  plus the verifier's own token. And this loop reported `phases: None`, so its
+  round line gains five `*_ms` fields and reaches `log_round`'s overrun `error!`
+  arm for the first time: the chunk-3 cell disposition, met a third time. The
+  pinned stream drops every `*_ms` field.
+- **`make check-spec-sampling` names no fn any more.** Its one recorded
+  exception was `spec_generate_greedy_cached` taking no sampler at all; that path
+  is now an entry that carries the request's sampler in the `RoundCfg` it builds,
+  and the gate reads seven of seven without it. The exemption, the `exempt` arm
+  of its call scan and the clause on its success line are deleted. Its recall
+  test loses the three-direction exemption reading — the name passes, the body
+  renamed does not, a copy with the name struck out refuses the clean tree — and
+  gains two readings of that same path held to both of RULE 1's conditions like
+  every other: the signature stripped, and the sampler taken and never drawn
+  with. The case count is unchanged at 27, and the synthetic trees now carry no
+  sampler-less loop at all.
+- **The shared loop answers for six rows of the disposition table**, which is the
+  `rows.min(1)` arm of
+  `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`
+  taking its sixth row, and the first time that arm folds two *spellings* rather
+  than two rows of one spelling.
+
 ## What the interface cannot express, and what is proposed for it
 
 Eleven things. Nine are expressible with no branch in the loop; one is a declared
@@ -583,6 +681,11 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    that one `map` at the end of the dispatcher, and the two-model per-loop entry
    is where the subtraction goes so the value the dispatcher receives is
    unchanged.
+
+   **Landed in chunk 6, as stated.** The loop returns the widest block that ran
+   for all six drafters on it; the two-model entry returns `drafts_per_round` of
+   that figure, and the dispatcher's one `map` adds the verifier's own token
+   back, so the value it receives is byte-identical.
 
    **This figure is gated, on every arm and every prompt.** The equivalence
    harness asserts the driver's returned block against the block the pair runs
@@ -739,6 +842,13 @@ per-loop skip; one is a decision the owner has to take, marked as such.
     gate's path, so the disposition is recorded here rather than defended: the
     message that survives must still say that an empty chain is a broken drafter
     and not the end of the request, which is the part a reader acts on.
+
+    **Six of the seven are gone as of chunk 6, and chunk 6 is the first to fold
+    the two *spellings* rather than two loops of one.** The two-model greedy
+    pair's row in `DISPOSITIONS` moved from `ChainRefusedBy::TheVerifierInput` to
+    `ChainRefusedBy::TheProposalChain` when its body went: the shared loop states
+    one refusal, and this is the claim that the move costs no request its
+    refusal.
 
 ## Migration order
 
@@ -1226,15 +1336,16 @@ migration moves.
 
 The three emit helpers are excluded without an exception: none constructs a
 `RoundTotals`, none constructs the loop's configuration, and none calls a fn that
-does — `emit_round_tokens` calls `emit_step`, which is in no population either. `spec_generate_greedy_cached` is
-the one real exception: it is the two-model greedy loop, it takes no sampler at
-all, and it runs only at temperature 0 where the verifier's argmax is the draw.
-It is recorded with that reason, as a constant and not an environment knob, and
-no caller is asked to pass it a sampler it does not take. The recall test holds
-it in three directions — the loop it names passes, the same body renamed does
-not, and a copy of the gate with the name struck out refuses the clean tree by
-name — and the exception is deleted in migration chunk 6, where that loop
-becomes a drafter whose `verify` draws through the context.
+does — `emit_round_tokens` calls `emit_step`, which is in no population either.
+
+`spec_generate_greedy_cached` was the one real exception while it was the
+two-model greedy loop, took no sampler at all and ran only at temperature 0 where
+the verifier's argmax is the draw. **It is gone as of chunk 6**, with the loop
+that justified it: that path is an entry now, it carries the request's sampler
+in the `RoundCfg` it builds, and the gate reads seven of seven. The gate names no
+fn at all, which is the state to keep it in — a name-shaped hole is somewhere to
+hide. The recall test's three-direction reading of the exemption went with it,
+and two readings of that same path took its place, one per condition of RULE 1.
 
 ### `make debt-report`
 
@@ -1336,3 +1447,23 @@ pairs. That is the mechanism "Why the fields are paired" above states — a fiel
 every drafter must state is what makes a new field a compile error at every
 drafter, and it costs an identical line in each — and not duplication this
 migration moved.
+
+Chunk 6 deleted the sixth body, and the pair count goes 3 → 1. Measured with
+that same extractor at both ends of this chunk, over the two remaining bodies
+plus `run_rounds` and then the one plus it, `origin/main` reads 262 matched
+lines over 940 body lines and 3 pairs, and this chunk's head reads 10 over 615
+and 1. This executor's convention differs from chunk 5's by a constant — 262
+against its 257 at the same tree — and the endpoints are what the chunk is
+judged on. The one pair left is `run_rounds` against the stochastic loop, at
+3.3%: the acceptance rule item 1 says cannot share a body.
+
+The second figure rises, and the rise is the sixth impl and nothing else. Over
+the `impl RoundDrafter` bodies it reads 639 matched lines over 862 body lines
+and 10 pairs at `origin/main`, and 932 over 1030 and 15 at this chunk's head. The
+ten pairs that exist at both ends read **639 → 639**, unchanged line for line, so
+the whole of the 293-line rise is the five new pairs the two-model impl brings:
+against DFlash 1, DFlash 2, EAGLE-3, the assistant and the sidecar at 59, 53, 66,
+49 and 66 matched lines, 38.3%, 28.5%, 37.1%, 29.5% and 39.5% — the middle of a
+table whose top is DFlash 1 against the sidecar at 54.9%, a pair that predates
+this chunk. No twin entered, and none of the six drafters that were already there
+gained a line.

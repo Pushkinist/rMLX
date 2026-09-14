@@ -29,38 +29,10 @@
 //! the equivalence pair `the_restricted_vocab_round_loop_reproduces_plain_greedy`
 //! and the per-round stream it writes.
 
+use crate::speculative::text_scan_tests::{is_code, lines_in_fns};
+
 /// The drafter's own source, read as text.
 const ROUND_SRC: &str = include_str!("round.rs");
-
-/// Whether a line is code rather than a whole-line comment.
-///
-/// The sentences above name these needles, and a reading that counted them
-/// would find its own explanation. A trailing comment on a line of code is not
-/// stripped: no needle here is one a caller would write at the end of a
-/// statement.
-fn is_code(line: &str) -> bool {
-    !line.trim_start().starts_with("//")
-}
-
-/// Every code line carrying `needle`, each with the name of the `fn` it sits
-/// in.
-fn lines_in_fns<'a>(src: &'a str, needle: &str) -> Vec<(&'a str, String)> {
-    let mut current = String::new();
-    let mut found = Vec::new();
-    for line in src.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("fn ") {
-            current = rest
-                .split(|c: char| !c.is_alphanumeric() && c != '_')
-                .next()
-                .unwrap_or_default()
-                .to_owned();
-        }
-        if is_code(line) && line.contains(needle) {
-            found.push((line.trim(), current.clone()));
-        }
-    }
-    found
-}
 
 /// The request's draw decides the read-back beside the drafter's offer, and the
 /// branch that consumes that decision reads it in the same sense.

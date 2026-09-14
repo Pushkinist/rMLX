@@ -39,6 +39,10 @@ pub(crate) mod draft_kind;
 pub(crate) mod round_common;
 pub(crate) mod round_loop;
 pub(crate) mod round_stats;
+pub(crate) mod two_model;
+
+#[cfg(test)]
+pub(crate) mod text_scan_tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -53,6 +57,7 @@ use crate::decode_loop::ProbeStep;
 pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 pub(crate) use round_common::RoundTotals;
+use round_loop::{run_rounds, RoundCfg};
 pub(crate) use round_stats::{
     log_round, phases_charged, RoundPhases, RoundReport, RoundStats, SpecLoop,
 };
@@ -582,6 +587,7 @@ impl SpeculativeDispatcher {
                 max_ctx_override,
                 eos_ids,
                 step_fn,
+                sampler_cfg,
             )
         }
         // The inner loops count drafts; every other loop here counts the block
@@ -589,38 +595,26 @@ impl SpeculativeDispatcher {
         .map(|(emitted, widest_draft)| (emitted, widest_draft + 1))
     }
 
-    /// Greedy spec generation with persistent verifier + draft KV
-    /// caches and `truncate_to`-based rollback.
+    /// Greedy speculative decoding over two complete models, at temperature 0.
     ///
-    /// Algorithm (mirrors mlx-lm `speculative_generate_step`):
+    /// Mirrors mlx-lm `speculative_generate_step`: one prefill of the prompt
+    /// less its last token on each model, then rounds of draft / verify /
+    /// accept, with both KV stacks rolled back to the accepted prefix. The draft
+    /// model keeps its own persistent cache, so a round costs `k` decode steps
+    /// at draft-model speed rather than a re-prefill.
     ///
-    /// ```text
-    /// # one-time prefill on prompt[..-1]; carry-token y = prompt[-1]
-    /// y = prompt[-1]
-    /// loop:
-    /// draft_tokens = K serial decode steps through draft cache
-    /// v_tokens = verifier.forward([y, draft_tokens]) → K+1 logits
-    /// accept = longest matching prefix of v_tokens vs draft_tokens
-    /// emit v_tokens[..=accept] # accept matched + 1 correction
-    /// y = v_tokens[accept] # next round's carry token
-    /// verifier.cache.truncate_to(L + accept + 1) # drop K+1-(accept+1)=K-accept
-    /// draft.cache.truncate_to(L + accept) # drop K-(accept+1)=K-accept-1
-    /// if accept == K: feed draft_tokens[-1] before y on next round
-    /// L = new prefix length
-    /// ```
+    /// The rounds run in [`run_rounds`]; what is here is the request's block and
+    /// the refusal that runs before a cache stack is built. The drafter is
+    /// [`two_model::TwoModelRound`].
     ///
-    /// Wires Gemma4 only (verifier + draft both Gemma4Text). An architecture
-    /// whose `forward_seq_last_k_with_cache` is unwired returns `Error::Model`
-    /// from here; there is no fallback path.
+    /// `k` is a **proposal** count where every sidecar loop takes a block, so
+    /// the block the loop is configured with is `k + 1` and what this returns is
+    /// the widest proposal count any round ran — its caller adds the verifier's
+    /// own token back.
+    ///
+    /// An architecture whose `forward_seq_last_k_with_cache` is unwired returns
+    /// `Error::Model` from the round loop; there is no fallback path.
     #[allow(clippy::too_many_arguments)]
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-    )]
     fn spec_generate_greedy_cached(
         &self,
         tokenizer: &tokenizers::Tokenizer,
@@ -631,337 +625,35 @@ impl SpeculativeDispatcher {
         max_ctx_override: Option<i32>,
         eos_ids: &[u32],
         step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+        sampler_cfg: &crate::sampler::SamplerConfig,
     ) -> Result<(Vec<ProbeStep>, usize)> {
-        let draft = self.draft_model()?;
-        let device = self.device;
-        let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
-
         if prompt_ids.len() < 2 {
             return Err(Error::Model(
-                "spec_generate_greedy_cached: prompt must have ≥2 tokens".into(),
+                "spec_generate_greedy_cached: prompt must have \u{2265}2 tokens".into(),
             ));
         }
-
-        // Diagnostic counters.
-        let mut total_draft_tokens: usize = 0;
-        let mut total_accept_count: usize = 0;
-        let mut rounds: usize = 0;
-        let t_total = Instant::now();
-        let mut window = DecodeWindow::new();
-        let mut draft_ns: u128 = 0;
-        let mut verifier_ns: u128 = 0;
-
-        let (kv_quant, max_seq, mut verifier_caches) = round_common::verifier_cache_stack(
+        let mut round = two_model::TwoModelRound::new(self.draft_model()?);
+        let (emitted, widest_block) = run_rounds(
             &self.verifier,
-            kv_quant_override,
-            max_ctx_override,
-        )?;
-
-        tracing::info!(
-            k,
-            prompt_len = prompt_ids.len(),
-            n_tokens,
-            ?kv_quant,
-            max_seq,
-            "spec_generate_greedy_cached: starting — persistent caches + truncate_to"
-        );
-
-        // --- Allocate per-layer caches for the draft model. ------------
-        let mut draft_caches = round_common::cache_stack(draft, kv_quant, max_seq);
-
-        // --- Recurrent (GatedDeltaNet) caches for hybrid archs. --------
-        // Only Qwen3.5MoE needs these; Gemma4 leaves them None and the
-        // forward path ignores the parameter. The GDN recurrent state has
-        // NO sequence axis, so spec rollback uses snapshot/restore (below)
-        // rather than KvCache::truncate_to.
-        let mut verifier_lin = self
-            .verifier
-            .needs_lin_caches()
-            .then(|| round_common::lin_cache_stack(&self.verifier));
-        let mut draft_lin = draft
-            .needs_lin_caches()
-            .then(|| round_common::lin_cache_stack(draft));
-
-        // --- Initial prefill on prompt[..-1] (mirrors mlx-lm _prefill). -
-        // Last token becomes the carry-token `y` fed into round 1.
-        let prefill_t0 = Instant::now();
-        if prompt_ids.len() <= 1 {
-            return Err(Error::Model(
-                "spec_generate_greedy_cached: prompt too short".into(),
-            ));
-        }
-        let prefill_slice = &prompt_ids[..prompt_ids.len() - 1];
-        prefill_chunked(
-            &self.verifier,
-            prefill_slice,
-            &mut verifier_caches,
-            verifier_lin.as_deref_mut(),
-            device,
-        )?;
-        prefill_chunked(
-            draft,
-            prefill_slice,
-            &mut draft_caches,
-            draft_lin.as_deref_mut(),
-            device,
-        )?;
-        let prefill_ns: u128 = prefill_t0.elapsed().as_nanos();
-
-        // Carry-tokens: per mlx-lm reference, verifier and draft each
-        // need their own "input seed" for the next round. They diverge
-        // when all draft tokens are accepted: the verifier consumed
-        // d1..dK in the K+1 forward, but the draft cache stopped one
-        // step earlier (only consumed d1..d_{K-1}). To resync, the next
-        // draft round must feed [dK, correction] (2 tokens) before
-        // generating new drafts; the verifier still feeds just
-        // [correction] as its carry.
-        let last_prompt = *prompt_ids.last().unwrap();
-        let mut v_carry: Vec<u32> = vec![last_prompt];
-        let mut d_seed: Vec<u32> = vec![last_prompt];
-        // The two token sequences a round feeds, refilled per round rather than
-        // reallocated: what the verifier scored and what the draft model was
-        // fed. Both are read by the rollback below and by nothing that outlives
-        // the round.
-        let mut v_input: Vec<u32> = Vec::new();
-        let mut d_fed: Vec<u32> = Vec::new();
-
-        // --- Spec loop. ------------------------------------------------
-        let seed_emitted = emitted.len();
-        let mut emitted_in_rounds = 0usize;
-        let mut widest_draft = 0usize;
-        let round_loop_t0 = Instant::now();
-        while emitted.len() < n_tokens {
-            rounds += 1;
-            let remaining = n_tokens - emitted.len();
-            // Mirror mlx-lm: num_draft = min(remaining, K). Always ≥ 1
-            // since loop guard ensures `remaining ≥ 1`.
-            let num_draft = remaining.min(k).max(1);
-            widest_draft = widest_draft.max(num_draft);
-
-            // -- GDN rollback prep. ------------------------------------
-            // The GatedDeltaNet recurrent state has NO sequence axis, so
-            // `KvCache::truncate_to` cannot roll it back to an intermediate
-            // position on partial acceptance. Arm a round tape on both models
-            // instead: their forwards record the recurrence inputs, and a
-            // partial acceptance refolds the accepted prefix from those. The
-            // drafter takes one forward per drafted token, so its tape
-            // accumulates across the round.
-            arm_lin_tapes(verifier_lin.as_deref_mut());
-            arm_lin_tapes(draft_lin.as_deref_mut());
-
-            // -- Phase A: draft generates `num_draft` tokens via cache. -
-            let t0 = Instant::now();
-            let draft_tokens = draft_decode_n(
-                draft,
-                &d_seed,
-                num_draft,
-                &mut draft_caches,
-                draft_lin.as_deref_mut(),
-                device,
-            )?;
-            draft_ns += t0.elapsed().as_nanos();
-            total_draft_tokens += draft_tokens.len();
-
-            // -- Phase B: verifier scores K+1 logits in one cached call.
-            // Input = v_carry + draft_tokens. v_carry is 1 token: either
-            // the last prompt token (round 1) or the previous round's
-            // emitted correction/bonus.
-            fill_fed(&mut v_input, &v_carry, &draft_tokens);
-            let v_k = v_input.len(); // = num_draft + 1
-            if v_k < 2 {
-                return Err(Error::Model(format!(
-                    "spec_generate_greedy_cached: v_k={v_k} too small"
-                )));
-            }
-
-            let t0 = Instant::now();
-            // Hybrid verifier (Qwen3.5MoE) advances its GDN lin caches here;
-            // Gemma4 passes None.
-            let v_logits = self.verifier.forward_seq_last_k_with_cache(
-                &v_input,
-                v_k,
-                &mut verifier_caches,
-                verifier_lin.as_deref_mut(),
-                device,
-            )?;
-            let v_argmax = argmax(&v_logits, -1, device)?;
-            v_argmax.eval()?;
-            let bytes = v_argmax.to_bytes()?;
-            verifier_ns += t0.elapsed().as_nanos();
-
-            let v_tokens = argmax_tokens(&bytes, v_k)?;
-
-            // -- Phase C: greedy acceptance. ---------------------------
-            let (accept, new_tokens) = accept_prefix(&v_tokens, &draft_tokens, remaining)?;
-            total_accept_count += accept;
-
-            // Emit accepted prefix + 1 correction/bonus.
-            let emit = round_common::emit_round_tokens(
-                tokenizer,
-                &new_tokens,
-                n_tokens,
-                eos_ids,
-                step_fn,
-                &mut emitted,
-                &mut emitted_in_rounds,
-                &mut window,
-                None,
-            );
-            if emit.hit_eos {
-                round_common::log_request_record(
-                    &RoundTotals {
-                        loop_kind: SpecLoop::TwoModelGreedy,
-                        block_size: k + 1,
-                        conditioned_rows: None,
-                        charged: false,
-                        rounds,
-                        emitted_in_rounds,
-                        total_draft: total_draft_tokens,
-                        total_accept: total_accept_count,
-                        prefill_ns,
-                        draft_ns,
-                        verifier_ns,
-                        round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-                        t_total,
-                    },
-                    &emitted,
-                    seed_emitted,
-                    &window,
-                );
-                return Ok((emitted, widest_draft));
-            }
-
-            // -- Phase D: setup next round. ----------------------------
-            // y = correction token (or bonus). It's already in v_tokens[accept].
-            let next_y_token = v_tokens[accept];
-
-            // Verifier cache: it processed `v_k = num_draft + 1` tokens
-            // ending at logical position L+v_k. We accepted (accept+1)
-            // emitted tokens, so its valid prefix length is L+accept+1
-            // (the last emitted = correction = v_tokens[accept], which is
-            // a *prediction* — verifier hasn't actually processed it
-            // yet). Trim by (v_k - (accept+1)) = num_draft - accept.
-            // `max()` and not `[0]`: on a GDN hybrid the recurrent layers'
-            // KvCache never advances, so layer 0 may sit at 0 while the
-            // full-attention layers carry the round.
-            let v_offset_before = verifier_caches
-                .iter()
-                .map(KvCache::offset)
-                .max()
-                .unwrap_or(0);
-            let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-            // On a PARTIAL accept the KV keeps `v_target` positions and the GDN
-            // recurrent state — which advanced by `v_k` and cannot be sliced —
-            // is refolded from the round tape over the retained prefix. On a
-            // FULL accept nothing was dropped and the tape is discarded.
-            let refolded = round_common::rollback_round(
-                &mut verifier_caches,
-                verifier_lin.as_deref_mut(),
-                &v_input,
-                v_offset_before - v_k as i32,
-                v_target,
-                // This loop times no phases, so it never charges one.
-                false,
-                device,
-            )?;
-
-            // Draft cache: it processed num_draft tokens (1 carry + K-1
-            // intermediates each producing the next, total cache advance
-            // = num_draft). Need to keep accept of those + the carry. So
-            // truncate to L_initial + 1 + accept = original_offset_before
-            // - num_draft + accept + 1. Per mlx-lm:
-            // trim_prompt_cache(draft_cache, max(num_draft - accept - 1, 0))
-            let d_offset_before = draft_caches.iter().map(KvCache::offset).max().unwrap_or(0);
-            let d_drop = draft_rows_to_drop(draft_tokens.len(), accept);
-            let d_target = d_offset_before - d_drop;
-            // `draft_decode_n` fed `d_seed ++ draft_tokens[..num_draft-1]`
-            // (each step's input is the prior step's output; the last output is
-            // never fed back), so that is the token sequence the rollback keeps
-            // the retained prefix of — and the length its accumulated tape has
-            // to match.
-            fill_fed(
-                &mut d_fed,
-                &d_seed,
-                &draft_tokens[..draft_tokens.len().saturating_sub(1)],
-            );
-            // The drafter's own arm, whose answer is not the round's:
-            // `refolded` is reported beside `v_target` and reads the verifier.
-            let _ = round_common::rollback_round(
-                &mut draft_caches,
-                draft_lin.as_deref_mut(),
-                &d_fed,
-                d_offset_before - d_fed.len() as i32,
-                d_target,
-                // This loop times no phases, so it never charges one.
-                false,
-                device,
-            )?;
-
-            // Setup next round's carry tokens. Verifier carry is always
-            // 1 token (= correction or bonus). Draft seed prepends the
-            // last draft token when all-accepted, since the draft cache
-            // hasn't yet consumed it.
-            v_carry = vec![next_y_token];
-            if accept == draft_tokens.len() {
-                let last_draft = *draft_tokens.last().unwrap();
-                d_seed = vec![last_draft, next_y_token];
-            } else {
-                d_seed = vec![next_y_token];
-            }
-
-            log_round(
-                &RoundReport {
-                    loop_kind: SpecLoop::TwoModelGreedy,
-                    round: rounds,
-                    accept,
-                    num_draft: draft_tokens.len(),
-                    // What the round committed, which is `accept + 1` unless
-                    // the request's token budget ran out mid-block.
-                    n_committed: emit.committed,
-                    emitted_total: emitted.len(),
-                    condition_rows: None,
-                    projected_rows: None,
-                    v_offset_before,
-                    v_target,
-                    d_offset_before: Some(d_offset_before),
-                    d_target: Some(d_target),
-                    refolded,
-                    // This loop times no phases, so it never charges one.
-                    charged: false,
-                    phases: None,
-                },
-                &[],
-            );
-        }
-
-        round_common::log_request_record(
-            &RoundTotals {
+            &mut round,
+            prompt_ids,
+            step_fn,
+            &RoundCfg {
                 loop_kind: SpecLoop::TwoModelGreedy,
                 block_size: k + 1,
-                conditioned_rows: None,
+                n_tokens,
+                eos_ids,
+                tokenizer,
+                sampler_cfg,
+                // This request times no phase, so it charges none.
                 charged: false,
-                rounds,
-                emitted_in_rounds,
-                total_draft: total_draft_tokens,
-                total_accept: total_accept_count,
-                prefill_ns,
-                draft_ns,
-                verifier_ns,
-                round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-                t_total,
+                kv_quant_override,
+                max_ctx_override,
             },
-            &emitted,
-            seed_emitted,
-            &window,
-        );
-
-        round_common::report_verifier_kv_bytes(
-            &self.verifier,
-            &verifier_caches,
-            verifier_lin.as_deref(),
-        );
-
-        Ok((emitted, widest_draft))
+            None,
+            self.device,
+        )?;
+        Ok((emitted, drafts_per_round(widest_block)))
     }
 
     /// Stochastic speculative decoding for `temperature > 0`.

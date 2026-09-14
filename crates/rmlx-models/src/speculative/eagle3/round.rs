@@ -52,7 +52,7 @@ use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::round_loop::{
     run_rounds, CacheSpan, Conditioning, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx,
-    RoundDrafter, RoundOutcome, Verdict, VerifierOffsetBasis,
+    RoundDrafter, RoundOutcome, Seed, Verdict, VerifierOffsetBasis,
 };
 use crate::speculative::{
     accept_prefix, argmax_tokens, block_capped_by_checkpoint, guard_verifier_prefill_logits,
@@ -314,7 +314,7 @@ impl RoundDrafter for Eagle3Round<'_> {
         self.h_seed = Some(h_seed);
         self.d_seed_tok = Some(seed_tok);
         Ok(Prefilled {
-            seed: bonus,
+            seed: Seed::Emitted(bonus),
             prefill_ns: prefill_t0.elapsed().as_nanos(),
             restricted_read_back: self.restricted_read_back,
             // It carries no conditioning buffer: what crosses a round is its own

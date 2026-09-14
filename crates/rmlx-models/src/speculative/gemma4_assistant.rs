@@ -698,7 +698,7 @@ use std::time::Instant;
 
 use super::round_loop::{
     run_rounds, Conditioning, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx, RoundDrafter,
-    RoundOutcome, Verdict, VerifierOffsetBasis,
+    RoundOutcome, Seed, Verdict, VerifierOffsetBasis,
 };
 
 /// The block a request runs at: what it asked for, bounded by what one verify
@@ -819,7 +819,7 @@ impl RoundDrafter for AssistantRound<'_> {
             kv_offset,
         });
         Ok(Prefilled {
-            seed,
+            seed: Seed::Emitted(seed),
             prefill_ns,
             // It scores every position over the verifier's whole vocabulary.
             restricted_read_back: false,

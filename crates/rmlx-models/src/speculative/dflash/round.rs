@@ -45,7 +45,7 @@ use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::round_loop::{
     run_rounds, Conditioning, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx, RoundDrafter,
-    RoundOutcome, Verdict, VerifierOffsetBasis,
+    RoundOutcome, Seed, Verdict, VerifierOffsetBasis,
 };
 use crate::speculative::{
     accept_prefix, block_capped_by_checkpoint, committed_rows, guard_round_conditioning,
@@ -147,7 +147,7 @@ impl RoundDrafter for AdaptiveRound<'_> {
 
         let seed = ctx.draw.seed_token(&r0_logits, device)?;
         Ok(Prefilled {
-            seed,
+            seed: Seed::Emitted(seed),
             prefill_ns,
             // It scores every position over the verifier's whole vocabulary.
             restricted_read_back: false,

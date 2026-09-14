@@ -11,9 +11,9 @@
 # The clean root is built here rather than copied from the tree, so a case that
 # passes against it is passing against a shape this file states rather than
 # against whatever the repository happens to contain today. It carries the same
-# seven drafter paths the tree does, one of them the exempt two-model greedy
-# loop and one of them the stochastic loop that draws through its own RNG rather
-# than the shared draw. Two roots are built: today's, where every path is a loop
+# seven drafter paths the tree does, one of them the two-model greedy path and
+# one of them the stochastic loop that draws through its own RNG rather than the
+# shared draw. Two roots are built: today's, where every path is a loop
 # body, and the mid-campaign one, where a drafter has been migrated and its path
 # is an entry that hands the sampler to the shared loop.
 
@@ -42,28 +42,6 @@ pub fn $name(
     if draw.sampling() {
         let _ = n_tokens;
     }
-    log_request_record(
-        &RoundTotals {
-            loop_kind: SpecLoop::Kind,
-            rounds,
-            charged: false,
-        },
-        &emitted,
-    );
-    Ok(vec![])
-}
-RS
-}
-
-# The two-model greedy loop: no sampler at all. It runs at temperature 0, where
-# the verifier's argmax is the draw, and it is the one name the gate exempts.
-greedy_cached_src() {
-  cat <<'RS'
-fn spec_generate_greedy_cached(
-    verifier: &Architecture,
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
-    device: Device,
-) -> Result<Vec<ProbeStep>> {
     log_request_record(
         &RoundTotals {
             loop_kind: SpecLoop::Kind,
@@ -115,7 +93,7 @@ pub fn spec_generate_greedy(
     if sampler_cfg.sampling_active() {
         spec_generate_stochastic_cached(verifier, step_fn, sampler_cfg, device)
     } else {
-        spec_generate_greedy_cached(verifier, step_fn, device)
+        spec_generate_greedy_cached(verifier, step_fn, sampler_cfg, device)
     }
 }
 RS
@@ -219,7 +197,7 @@ build_root() {
     printf '//! The entry guard and the two two-model loops.\n\n'
     guard_src
     printf '\n'
-    greedy_cached_src
+    loop_src "spec_generate_greedy_cached"
     printf '\n'
     stochastic_cached_src
     printf '\nfn summarise(rounds: usize) -> usize {\n    rounds\n}\n'
@@ -280,28 +258,6 @@ run() {
   cases=$((cases + 1))
   local out rc
   out="$(SPEC_SAMPLING_ROOT="$work/root" bash "$script" 2>&1)"
-  rc=$?
-  if [ "$rc" != "$want_exit" ]; then
-    printf 'FAIL %s: exit %s, expected %s\n%s\n' "$name" "$rc" "$want_exit" "$out"
-    failures=$((failures + 1))
-    return
-  fi
-  if [ -n "$want_reason" ] && ! printf '%s' "$out" | grep -qF -- "$want_reason"; then
-    printf 'FAIL %s: exit %s was right but the reason was not.\n  wanted: %s\n  got:\n%s\n' \
-      "$name" "$rc" "$want_reason" "$out"
-    failures=$((failures + 1))
-    return
-  fi
-  printf 'ok   %s (exit %s)\n' "$name" "$rc"
-}
-
-# run_script <script> <name> <expected-exit> <reason-substring> — the same, for
-# a case whose edit is to the gate itself rather than to the tree.
-run_script() {
-  local prog="$1" name="$2" want_exit="$3" want_reason="$4"
-  cases=$((cases + 1))
-  local out rc
-  out="$(SPEC_SAMPLING_ROOT="$work/root" bash "$prog" 2>&1)"
   rc=$?
   if [ "$rc" != "$want_exit" ]; then
     printf 'FAIL %s: exit %s, expected %s\n%s\n' "$name" "$rc" "$want_exit" "$out"
@@ -395,22 +351,23 @@ perl -0pi -e 's/spec_generate_stochastic_cached\(verifier, step_fn, sampler_cfg,
 run "a guard dropping the sampler on one route is refused" 1 \
   "\`spec_generate_greedy\` runs \`spec_generate_stochastic_cached\` without passing the"
 
-# 11. The exemption is by name and by nothing else: the same body under any
-#     other name is a loop that takes no sampler.
+# 11. The path the gate used to exempt by name, held to both of RULE 1's
+#     conditions like every other. First the signature: this is the shape the
+#     exemption waived for as long as that loop took no sampler at all.
 build_root "$root"
-perl -0pi -e 's/spec_generate_greedy_cached/spec_generate_plain_cached/g' \
+perl -0pi -e 's/(fn spec_generate_greedy_cached\(.*?)    sampler_cfg: &crate::sampler::SamplerConfig,\n/$1/s; s/super::VerifierDraw::new\(sampler_cfg\)/super::VerifierDraw::new(\&greedy())/' \
   "$root/crates/rmlx-models/src/speculative/mod.rs"
-run "the exempt loop renamed is no longer exempt" 1 \
-  "\`spec_generate_plain_cached\` drives a generation but takes neither a"
-
-# 12. And the exemption is load-bearing rather than decorative: struck out of a
-#     copy of the gate, the clean tree is refused, naming the one loop it covers.
-build_root "$root"
-mkdir -p "$work/lib"
-cp "$(dirname "$script")/lib/awk_text.sh" "$work/lib/awk_text.sh"
-sed 's/^readonly EXEMPT_LOOP=.*/readonly EXEMPT_LOOP=""/' "$script" >"$work/no_exempt.sh"
-run_script "$work/no_exempt.sh" "the recorded exemption is what passes the two-model greedy loop" 1 \
+run "the two-model greedy path buys nothing from its name" 1 \
   "\`spec_generate_greedy_cached\` drives a generation but takes neither a"
+
+# 12. And the draw: the same path taking the sampler and never drawing with it.
+#     No name is read anywhere in the gate, so this is the whole of what stands
+#     between that path and a request whose temperature stops at the guard.
+build_root "$root"
+perl -0pi -e 's/super::VerifierDraw::new\(sampler_cfg\)/super::VerifierDraw::new(\&greedy())/' \
+  "$root/crates/rmlx-models/src/speculative/mod.rs"
+run "the two-model greedy path that never draws is refused" 1 \
+  "\`spec_generate_greedy_cached\` is handed the request's sampler and builds"
 
 # 13. The mid-campaign tree: one path is an entry now, and the loop it runs is
 #     handed the sampler inside the configuration the entry built.
