@@ -91,7 +91,7 @@
 use super::dflash::dflash_next_block_size;
 use super::gemma4_assistant::AssistantRound;
 use super::mtp::SidecarRound;
-use super::round_loop::{ReportSkippedBy, RoundDrafter};
+use super::round_loop::{ReportSkippedBy, RoundDrafter, VerifierOffsetBasis};
 use super::{
     accept_prefix, draft_rows_to_drop, rollback_target_from_head, rollback_target_from_tail,
     round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
@@ -205,9 +205,10 @@ fn the_round_block_is_one_function_of_the_block_and_the_budget() {
 
 /// The verifier's rollback target, in the two spellings the loops use.
 ///
-/// Five loops call [`rollback_target_from_tail`] and the assistant calls
-/// [`rollback_target_from_head`], because it reads its offset before the verify
-/// forward rather than after. They must name the same position: the forward
+/// Five loops still call [`rollback_target_from_tail`], and the shared loop
+/// calls [`rollback_target_from_head`] for every drafter on it — it reads the
+/// offset before the verify forward, whichever read the drafter then reports on
+/// its round line. They must name the same position: the forward
 /// consumed the carry token and every proposal, so `v_offset_before = pre + 1 +
 /// proposals`. An off-by-one either way leaves a rejected draft in the cache
 /// every partial round — the defect the equivalence pairs' broken engines are
@@ -308,55 +309,70 @@ const SHARED_LOOP_PATTERN: &str = "SPEWGRIP";
 
 /// What each round loop declares at its edges, and the file that holds it.
 ///
-/// This table is the statement; the two tests below are readings of it against
-/// today's source. It is data rather than seven assertions because it is what
+/// Five facts per loop: which exit skips the resident-KV report, how the loop
+/// refuses an empty proposal chain, and which read of the verifier's offset its
+/// round line reports. This table is the statement; the two tests below are
+/// readings of it against today's source. It is data rather than seven assertions because it is what
 /// survives the collapse: the resident-KV disposition is a [`RoundDrafter`]
 /// declaration for a migrated loop, read here against its constant, and each
 /// migration drops its own file from [`LOOP_SOURCES`] and names
 /// [`SHARED_LOOP`] in its row instead, while these rows stay as they are. See
 /// `docs/SPEC_ROUND_SKELETON.md`.
-const DISPOSITIONS: [(SpecLoop, &str, ReportSkippedBy, ChainRefusedBy); 7] = [
+const DISPOSITIONS: [(
+    SpecLoop,
+    &str,
+    ReportSkippedBy,
+    ChainRefusedBy,
+    VerifierOffsetBasis,
+); 7] = [
     (
         SpecLoop::MtpSidecar,
         SHARED_LOOP,
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
+        VerifierOffsetBasis::AfterTheForward,
     ),
     (
         SpecLoop::DFlash,
         "dflash/mod.rs",
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
+        VerifierOffsetBasis::AfterTheForward,
     ),
     (
         SpecLoop::DFlash2,
         "dflash2/round.rs",
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
+        VerifierOffsetBasis::AfterTheForward,
     ),
     (
         SpecLoop::Eagle3,
         "eagle3/mod.rs",
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
+        VerifierOffsetBasis::AfterTheForward,
     ),
     (
         SpecLoop::MtpAssistant,
         SHARED_LOOP,
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
+        VerifierOffsetBasis::BeforeTheForward,
     ),
     (
         SpecLoop::TwoModelGreedy,
         "mod.rs",
         ReportSkippedBy::TheInRoundExit,
         ChainRefusedBy::TheVerifierInput,
+        VerifierOffsetBasis::AfterTheForward,
     ),
     (
         SpecLoop::TwoModelStochastic,
         "mod.rs",
         ReportSkippedBy::TheInRoundExit,
         ChainRefusedBy::TheVerifierInput,
+        VerifierOffsetBasis::AfterTheForward,
     ),
 ];
 
@@ -526,14 +542,25 @@ fn expected_pattern(skipped_by: ReportSkippedBy) -> &'static str {
 /// its `!`, because the marker is the whole line.
 #[test]
 fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
+    // Every row names a file this test reads. Without this, a row pointing at a
+    // file [`LOOP_SOURCES`] does not hold is read by neither test — it
+    // contributes to no `want` and its source is never scanned — so a migrated
+    // row reverted to its old file passes both readings while the loop it names
+    // is gone.
+    for (loop_kind, file, _, _, _) in DISPOSITIONS {
+        assert!(
+            LOOP_SOURCES.iter().any(|(f, _)| *f == file),
+            "the {loop_kind:?} row names `{file}`, which is not a file this test reads"
+        );
+    }
     for (file, src) in LOOP_SOURCES {
         let want: String = if file == SHARED_LOOP {
             SHARED_LOOP_PATTERN.to_owned()
         } else {
             DISPOSITIONS
                 .iter()
-                .filter(|(_, f, _, _)| *f == file)
-                .map(|&(_, _, skipped_by, _)| expected_pattern(skipped_by))
+                .filter(|(_, f, _, _, _)| *f == file)
+                .map(|&(_, _, skipped_by, _, _)| expected_pattern(skipped_by))
                 .collect()
         };
         assert_eq!(
@@ -549,14 +576,20 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
     // drafter can declare the exit the shared loop ignores. The `S` and `I`
     // markers above are the second reader: they hold the loop to both arms of
     // what was declared, so a guard whose sense is inverted fails here.
-    for (loop_kind, _, skipped_by, _) in DISPOSITIONS {
+    for (loop_kind, _, skipped_by, _, basis) in DISPOSITIONS {
         // One arm per migrated loop, named rather than derived — a constant is
         // read through its drafter's own type. Each migration adds its drafter
         // here, the same cliff the refusal reading below carries.
         let declared = match loop_kind {
-            SpecLoop::MtpAssistant => <AssistantRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
-            SpecLoop::MtpSidecar => <SidecarRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
-            // The loops that still carry their own body: their disposition is
+            SpecLoop::MtpAssistant => (
+                <AssistantRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
+                <AssistantRound<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
+            ),
+            SpecLoop::MtpSidecar => (
+                <SidecarRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
+                <SidecarRound<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
+            ),
+            // The loops that still carry their own body: their dispositions are
             // read off their source above and there is no constant to read.
             SpecLoop::DFlash
             | SpecLoop::DFlash2
@@ -565,8 +598,10 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
             | SpecLoop::TwoModelStochastic => continue,
         };
         assert_eq!(
-            declared, skipped_by,
-            "the migrated {loop_kind:?} loop declares an exit the table does not"
+            declared,
+            (skipped_by, basis),
+            "the migrated {loop_kind:?} loop declares an exit or an offset basis the \
+             table does not"
         );
     }
 }
@@ -607,7 +642,7 @@ fn every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure() 
             }
             let rows = DISPOSITIONS
                 .iter()
-                .filter(|(_, f, _, refused_by)| {
+                .filter(|(_, f, _, refused_by, _)| {
                     *f == file
                         && needle
                             == match refused_by {

@@ -331,13 +331,18 @@ pub(crate) struct RoundReport {
     /// Conditioning rows the round's projection returned, or `None` for a loop
     /// that carries no conditioning buffer between rounds.
     pub(crate) projected_rows: Option<i32>,
-    /// The verifier offset this round's rollback target was computed from.
+    /// The verifier offset this round reports its rollback against, on the
+    /// basis its own loop declares.
     ///
-    /// Each loop's own basis, and the two are not the same position: the six
-    /// loops that count back from the tail read it after their verify forward,
-    /// the assistant reads it before — deliberately, since reading it
-    /// afterwards makes it a function of how far each layer happened to
-    /// advance. See [`super::rollback_target_from_tail`] and
+    /// Two reads name one position under two numbers. The five loops that count
+    /// back from the tail read it after their verify forward; the shared loop
+    /// reads it before *and* after, computes its target from the read before —
+    /// which is the position the rollback returns to, where the read after is a
+    /// function of how far each layer happened to advance — and reports
+    /// whichever its drafter declares in `VERIFIER_OFFSET_BASIS`. So under the
+    /// tail basis this field is not the number the target was computed from; it
+    /// is the other name for the same place. See
+    /// [`super::rollback_target_from_tail`] and
     /// [`super::rollback_target_from_head`].
     pub(crate) v_offset_before: i32,
     /// Where the rollback left the verifier's caches.

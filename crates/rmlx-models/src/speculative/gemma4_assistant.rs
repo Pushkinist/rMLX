@@ -1,3 +1,12 @@
+// LOC-exempt: the drafter's weights and its round behaviour are one contract
+// while the round loop is shared. The split line is the loader — `load_assistant`
+// and the tensor-presence detection of the two LM-head variants, roughly the
+// first two thirds — against the `RoundDrafter` impl and the entry beneath it,
+// and it is not taken yet because the impl reads the loaded stack directly at
+// every step (`draft_n` chains the drafter's own hidden through weights the
+// loader shapes). It becomes worth taking when a second shared-K/V drafter
+// loads the same way, which is what would give the loader a caller other than
+// this file.
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
 #![allow(unsafe_code)]
 

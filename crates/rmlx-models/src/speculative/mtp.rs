@@ -710,10 +710,6 @@ impl RoundDrafter for SidecarRound<'_> {
 
     fn verify(&mut self, ctx: &mut RoundCtx<'_>, fed: &[u32], remaining: usize) -> Result<Verdict> {
         let device = ctx.device;
-        // Arm the GDN round tape before the forward: the refold replays the
-        // accepted prefix off it.
-        super::arm_lin_tapes(ctx.lin.as_deref_mut());
-
         let t0 = Instant::now();
         let (v_logits, v_hidden) = ctx.verifier.forward_verify_capture(
             fed,

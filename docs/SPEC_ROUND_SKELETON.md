@@ -220,9 +220,9 @@ what a request runs and names the entry as where they run.
 
 ## What chunk 2 landed
 
-Seven notes. Two close deviations chunk 1 recorded, one is a new deviation from
-the proposal above with its reason, and four are values the migration had to
-preserve or move.
+Seven notes. Two close deviations chunk 1 recorded, one records a new deviation
+from the proposal above with its reason, one records what item 6 still owes, and
+three are values the migration had to preserve or move.
 
 - **`RoundOutcome` is a type now, and it carries the committed count rather
   than the `RoundEmit`.** The sidecar advances its drafting position by what the
@@ -257,12 +257,15 @@ preserve or move.
   `projected_rows: None` and its `d_offset_before` / `d_target` pair; it charges
   its phases; and its recurrent refold runs through `rollback_round` with the
   recurrent stack, `refolded` read off the return.
-- **One figure moved and one log field went, and nothing reads either.** The
-  sidecar's `rollback_ms` used to close before the conditioning slice and now
-  closes after it, because the shared loop times its rollback across both
-  drafter calls — the pinned stream drops every `*_ms` field. And its own
-  starting `info!` is the loop's, so the capture layer it named is no longer on
-  that line; it is a property of the verifier, not of the request.
+- **Two figures moved and one log field went, and nothing reads any of them.**
+  The sidecar's `rollback_ms` used to close before the conditioning slice and
+  now closes after it, because the shared loop times its rollback across both
+  drafter calls. Its `total_ms` now covers the drafter's cache reset, which used
+  to happen before the request's own clock started and is now the first
+  statement of `prefill`. The pinned stream drops every `*_ms` field and the
+  request record's spans have no bound to fail. And the sidecar's starting
+  `info!` is the loop's, so the capture layer it named is no longer on that
+  line; it is a property of the verifier, not of the request.
 - **The shared loop answers for two rows of the disposition table.** Its one
   empty-chain refusal stands for both, which is the `rows.min(1)` arm of
   `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`
@@ -363,9 +366,11 @@ per-loop skip; one is a decision the owner has to take, marked as such.
 
    **Proposed: preserved exactly, as a declared per-loop skip.**
    `KV_REPORT_SKIPPED_BY` is the declaration, and the loop reads it at its two
-   exits. It is the one per-drafter flag the loop branches on, and it is here
-   rather than hidden because the alternative is a behaviour change the campaign
-   is not for.
+   exits. It was the only per-drafter flag the loop branches on until chunk 2
+   added item 6's `VERIFIER_OFFSET_BASIS`, and the two are the whole set: both
+   are here rather than hidden because the alternative in each case is a
+   behaviour change the campaign is not for. A third needs the same argument
+   made for it from scratch.
 
    The alternative is worth stating, and it is **not adopted**: the figure has
    one writer — a speculative request never goes through
@@ -577,6 +582,7 @@ answer after a draft-side change says that run's near-ties happened not to move.
 | the rollback target off by one at the loop's call site | round stream `v_target`; the pairs (this is the "rejected tail never rolled off" broken engine, refused 6 of 6); and, proposed above, the loop's own head-against-tail refusal | stream and pairs yes, the refusal is new and owes two controls |
 | a drafter's condition called on the wrong row | round stream `condition_rows` / `projected_rows`; `guard_round_conditioning` refuses a projection that does not match the commit | yes |
 | a round conditioned on the acceptance where the loop conditions on the commit | round stream `projected_rows`, on a prompt whose budget cuts a block | yes, on that prompt only |
+| a drafter's `CacheSpan::before` reported from the wrong read | round stream `d_offset_before` only — the truncation is driven by the span's `target`, computed on the drafter's own path, so a wrong `before` changes what the line says and not what the round does | yes, the pinned cells alone |
 | a capture handed to the wrong drafter | the type system — each drafter takes its own capture inside its own `verify` | new, structural |
 | the block narrowing dropped, or the adaptive schedule applied to the wrong drafter | round stream `num_draft` | yes |
 | the recurrent tape not armed before the verify | `refold_lin_tapes` refuses a tape that does not describe the round | yes |
@@ -614,6 +620,16 @@ because there was no marker for where the loop ends.
 reachability. A report at the position the table names, inside a branch that
 never runs, reads identical — and so does one whose arguments are wrong, which is
 the row below.
+
+**Chunk 2 closed one residual rather than declaring it.** Arming the recurrent
+round tape was a statement inside each loop's own body, and the first migration
+carried it into `SidecarRound::verify` — where moving it anywhere before the
+forward is invisible to every observable, and where four more drafters would
+have copied the line. It is now the loop's: `run_rounds` arms the tape
+immediately before the `verify` call, the loop owning the recurrent stack and
+being the tape's only consumer through its own rollback. A stack with no
+recurrent layer arms nothing, so the drafters on a full-attention verifier are
+unaffected.
 
 ### The mutation I could not catch
 

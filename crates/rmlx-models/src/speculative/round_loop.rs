@@ -77,7 +77,7 @@ pub(crate) enum ReportSkippedBy {
 /// before. Both numbers are on the pinned round line, so which one a drafter
 /// reports is its own fact and it declares it; the loop computes the rollback
 /// from the head spelling whichever is declared.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VerifierOffsetBasis {
     /// The offset before the verify forward, which is where the rollback
     /// returns to.
@@ -417,6 +417,10 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         // advance.
         let pre_round_offset = ctx.kv.iter().map(KvCache::offset).max().unwrap_or(0);
 
+        // Armed here rather than in each `verify`: the loop owns the recurrent
+        // stack and is the tape's only consumer, through the rollback below. A
+        // stack with no recurrent layer arms nothing.
+        super::arm_lin_tapes(ctx.lin.as_deref_mut());
         let verdict = drafter.verify(&mut ctx, &fed, remaining)?;
         // Read again for the round line alone: a drafter that counts its
         // rollback back from the tail reports this number, and it is the same
