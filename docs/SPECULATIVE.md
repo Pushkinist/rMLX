@@ -118,14 +118,15 @@ reference. It carries a pair for six of the seven round loops below; the seventh
 is the two-model stochastic one, which runs only above temperature 0 and so has
 no arm this gate can compare.
 
-**One loop, migrating.** The seven drafter paths run one algorithm, and five of
+**One loop, migrating.** The seven drafter paths run one algorithm, and four of
 them still carry their own copy of it;
 `docs/SPEC_ROUND_SKELETON.md` is the plan that collapses them: the drafter
 interface, what each loop does the interface cannot express, the migration
 order, and the mutations a skeleton could contain beside what catches each.
-Migration chunks 1 and 2 have landed: the shared loop is
-`crates/rmlx-models/src/speculative/round_loop.rs`, and the Gemma4 assistant and
-the MTP sidecar run on it; the other five loops still carry their own bodies.
+Migration chunks 1, 2 and 3 have landed: the shared loop is
+`crates/rmlx-models/src/speculative/round_loop.rs`, and the Gemma4 assistant, the
+MTP sidecar and DFlash 2 run on it; the other four loops still carry their own
+bodies.
 
 ```text
 # Initialisation
@@ -598,11 +599,10 @@ Every round loop that can partially accept goes through **one** implementation �
 `speculative::round_common::rollback_round`, which decides the arm and, on a
 partial accept, calls the low-level `rollback_round_caches` beside it. A
 full-attention arch (`lin` absent or empty) truncates and stops; a GDN hybrid
-also refolds. Its eight call sites are `dflash_generate`, `dflash2_generate`,
-`eagle3_generate`, the shared `run_rounds` — which serves the Gemma4 assistant
-(full attention, so truncation only) and the MTP sidecar — and the two-model
-loops' four: greedy verifier, greedy drafter, stochastic verifier and stochastic
-drafter. There is deliberately no
+also refolds. Its seven call sites are `dflash_generate`, `eagle3_generate`, the
+shared `run_rounds` — which serves the Gemma4 assistant (full attention, so
+truncation only), the MTP sidecar and DFlash 2 — and the two-model loops' four:
+greedy verifier, greedy drafter, stochastic verifier and stochastic drafter. There is deliberately no
 second copy: the defect the replay was written to fix lived in four independent
 implementations at once, and a rollback inlined per loop is how it got there.
 
@@ -1664,19 +1664,23 @@ the logits and from the chain the pairwise term alone would trace, and the two
 anchors trace different chains, so a selector that returned the argmax, dropped
 the logits or ignored the seed fails rather than passing quietly.
 
-`dflash2_generate` drives them. It prefills the whole prompt through
+`dflash2_generate` drives them, through the shared `run_rounds`: the entry
+refuses a prompt under two tokens and a verifier with no recurrent state and
+resolves the request's block, and `BlockRound` in the same file is the drafter
+side. Its prefill takes the whole prompt through
 `forward_verify_capture_chunked`, keeping as many conditioning rows as the
 drafter's window reaches back over (2047 here) — the depth the reference
-conditions on, not the last prompt token alone — then per round drafts a block,
-scores the carry token and every proposal in one verify forward, accepts the
-agreed prefix through the shared `accept_prefix`, and rolls the caches back over
-the rest through the shared `rollback_round`. The block is the one the
-drafter was trained at every round; only the token budget shortens it, so this
-loop is not in `ADAPTIVE_DRAFTERS` and its rows are `dflash2/block=<n>`.
+conditions on, not the last prompt token alone — then per round it drafts a
+block, scores the carry token and every proposal in one verify forward and
+accepts the agreed prefix through the shared `accept_prefix`, while the loop
+rolls the caches back over the rest through the shared `rollback_round`. The
+block is the one the drafter was trained at every round; only the token budget
+shortens it, so this loop is not in `ADAPTIVE_DRAFTERS` and its rows are
+`dflash2/block=<n>`.
 
 **The prompt's capture is bounded by the same window.**
 `forward_verify_capture_chunked` takes the trailing row count its caller will
-read, and this loop passes the drafter's own `conditioning_rows`. Chunks that
+read, and this drafter's prefill passes its own `conditioning_rows`. Chunks that
 have fallen out of that tail are released as the prefill walks the prompt and
 the oldest one still held is cut to the part the tail reaches before anything is
 joined. Two bounds come out of that, and they are different
