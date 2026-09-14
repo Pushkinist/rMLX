@@ -121,6 +121,24 @@ fn the_request_draw_decides_the_read_back_and_the_branch_reads_it() {
          branch reads `{line}` — a flag produced beside the branch rather than by \
          it can name a read-back the round did not take"
     );
+    // The two arm literals. They are free constants: the branch decides which
+    // one is returned and neither is derived from anything, so a flipped one
+    // reports a read-back its own arm did not take while both readings above
+    // still pass. `guard_restricted_prefix` refuses that at runtime on any
+    // request that runs the arm; this sees it on the arm no pair here executes,
+    // because every EAGLE-3 pair in the tree runs at temperature 0 with the
+    // reduced ids present and never takes the full-vocabulary branch.
+    let arms: Vec<&str> = ROUND_SRC
+        .lines()
+        .map(str::trim)
+        .filter(|l| is_code(l) && l.starts_with("(v_tokens, v_hidden, "))
+        .collect();
+    assert_eq!(
+        arms,
+        vec!["(v_tokens, v_hidden, true)", "(v_tokens, v_hidden, false)"],
+        "the reduced arm yields `true` and the full-vocabulary arm `false`, in that \
+         order, and this drafter yields {arms:?}"
+    );
 }
 
 /// The restricted prefix the loop attributes from is that same condition's

@@ -447,13 +447,22 @@ migration had to preserve or move.
   terms are constant for the run — and because the loop's own per-request line
   has to report it (below). The drafter still reads the context's draw and never
   builds one or reads `sampler_cfg`, which is the rule the sampling gate holds.
-  The branch in `verify` then returns its own flag beside the tokens, so the
-  reported prefix cannot name a read-back the round did not take: reporting the
-  flag beside the branch instead left a swap of the two arms invisible to every
-  observable at temperature 0 while the boundary waived what it must refuse.
-  Both the decision and the branch are pinned by text in
-  `crates/rmlx-models/src/speculative/eagle3/round_tests.rs`, because each alone
-  is blind to the other's inversion.
+  The branch in `verify` then returns its own flag beside the tokens, which
+  closes the *swap*: reporting the flag beside the branch instead left an
+  exchange of the two arms invisible to every observable at temperature 0 while
+  the boundary waived what it must refuse. It does not close the **flip** — the
+  two arm literals are free constants, so a `false` written `true` reports a
+  read-back its own arm did not take, and `restricted == accept` passes the
+  acceptance bound while every text reading of the branch still holds. What
+  closes that is the request's own declaration, one frame up: the loop hands
+  `Prefilled::restricted_read_back` to `guard_restricted_prefix` beside the
+  round's prefix, and a request that declared no reduced read-back is refused
+  the moment a round reports one. The decision, the branch and the two literals
+  are all read by text in
+  `crates/rmlx-models/src/speculative/eagle3/round_tests.rs` as well, because no
+  pair in the tree executes the full-vocabulary arm — every EAGLE-3 pair runs at
+  temperature 0 with the reduced ids present — so the runtime guard has nothing
+  here to fire on and the text is what sees the flip in `make ci`.
 - **Whether a request took a reduced read-back is a field of the loop's own
   line.** `Prefilled::restricted_read_back` is the declaration and the shared
   `info!` carries it, so the fact survives as a structured field of the run's

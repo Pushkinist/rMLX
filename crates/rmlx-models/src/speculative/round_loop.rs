@@ -267,9 +267,10 @@ pub(crate) struct Verdict {
     /// scores every position over the whole vocabulary, which is all of them
     /// but EAGLE-3 and EAGLE-3 itself on a sampled request.
     ///
-    /// Never above `accept`: the correction past the accepted prefix is the
-    /// verifier's own token over its whole vocabulary. The loop refuses a round
-    /// that says otherwise — see [`super::guard_restricted_prefix`].
+    /// Never above `accept` — the correction past the accepted prefix is the
+    /// verifier's own token over its whole vocabulary — and zero on a request
+    /// whose [`Prefilled::restricted_read_back`] is `false`. The loop refuses a
+    /// round that says otherwise; see [`super::guard_restricted_prefix`].
     pub(crate) restricted: usize,
 }
 
@@ -511,7 +512,13 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         verifier_ns += verdict.verify_ns;
         total_accept += verdict.accept;
 
-        guard_restricted_prefix(cfg.loop_kind, rounds, verdict.restricted, verdict.accept)?;
+        guard_restricted_prefix(
+            cfg.loop_kind,
+            rounds,
+            restricted_read_back,
+            verdict.restricted,
+            verdict.accept,
+        )?;
         let emit = emit_round_tokens(
             cfg.tokenizer,
             &verdict.commit,

@@ -55,8 +55,8 @@ shipped)
     ;;
 correction-restricted)
     TARGET="$SPEC/eagle3/round.rs"
-    find='        tokens[full_pos] = u32::from_le_bytes(corr_bytes[..4].try_into().unwrap());'
-    replace='        let _ = &corr_bytes;'
+    find='        tokens[full_pos] = correction;'
+    replace='        let _ = correction;'
     ;;
 rejected-draft-kept)
     TARGET="$SPEC/round_loop.rs"

@@ -211,12 +211,12 @@ impl<'a> Eagle3Round<'a> {
         // Read back through the same guarded reader as the reduced row above: a
         // one-token read-back is still a device buffer whose length is the
         // array's and not this function's to assume.
-        let corr = argmax_tokens(&corr_am.to_bytes()?, 1)?;
-        let Some(&correction) = corr.first() else {
-            return Err(Error::Model(
-                "eagle3_generate: the correction read-back returned no token".into(),
-            ));
-        };
+        let correction = argmax_tokens(&corr_am.to_bytes()?, 1)?
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                Error::Model("eagle3_generate: the correction read-back returned no token".into())
+            })?;
         tokens[full_pos] = correction;
         Ok((tokens, v_hidden))
     }
