@@ -752,3 +752,54 @@ fn every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure() 
         }
     }
 }
+
+/// The seed's attribution is written where the seed is emitted, and nowhere
+/// else.
+///
+/// `run_rounds` pushes one `DecidedBy::FullVocab` for the token a request emits
+/// before its first round. A pair that emits no seed emits no such token, so the
+/// push belongs inside the arm that opens on an emitted seed — between it and
+/// the emission. Hoisted above the arm, a request with no seed attributes a
+/// token it never emitted and every entry after it names the wrong token.
+///
+/// Nothing at runtime sees that: the one loop with no seed is the two-model
+/// greedy pair, whose entry passes no attribution buffer, so the hoisted push
+/// runs on no request that carries one. This reading is what stands in for it,
+/// until a drafter that emits no seed also attributes its tokens.
+///
+/// Mutation: hoist the push above `if let Seed::Emitted(seed)`; move it below
+/// the emission.
+#[test]
+fn the_seeds_attribution_is_written_only_where_a_seed_is_emitted() {
+    let src = LOOP_SOURCES
+        .iter()
+        .find(|(f, _)| *f == SHARED_LOOP)
+        .map(|(_, s)| *s)
+        .unwrap_or_default();
+    let at = |needle: &str| -> Vec<usize> {
+        src.lines()
+            .enumerate()
+            .filter(|(_, l)| is_code(l) && l.contains(needle))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let arm = at("if let Seed::Emitted(seed) = prefilled.seed {");
+    let push = at("buf.push(DecidedBy::FullVocab);");
+    let emit = at("if emit_seed_token(");
+    assert_eq!(
+        (arm.len(), push.len(), emit.len()),
+        (1, 1, 1),
+        "the loop opens one emitted-seed arm, attributes one seed and emits it once, \
+         and it states them {} / {} / {} time(s)",
+        arm.len(),
+        push.len(),
+        emit.len()
+    );
+    assert!(
+        arm < push && push < emit,
+        "the seed's attribution sits inside the arm that emits it, between the arm \
+         and the emission, and this loop writes them at lines {arm:?}, {push:?}, \
+         {emit:?} — a push above the arm attributes a token a seedless pair never \
+         emitted"
+    );
+}

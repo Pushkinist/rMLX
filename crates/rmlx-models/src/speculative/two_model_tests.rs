@@ -1,4 +1,4 @@
-//! Three wirings this drafter owns, pinned by text.
+//! Four wirings this drafter owns, pinned by text.
 //!
 //! The round loop is `round_loop.rs`'s and its own gates read it. What moved out
 //! of the two-model greedy loop body and into this file is wiring — an order, a
@@ -20,6 +20,11 @@
 //!    read back off the cache afterwards — computing it instead makes the line
 //!    restate this side's own arithmetic and stop being the cross-check the
 //!    round calls it.
+//! 4. **Where the round's tokens come from.** They are drawn through the round's
+//!    own `VerifierDraw`, and this drafter builds no read-back of its own. That
+//!    one is not merely unseen by `make ci` — it is unseen by everything, since
+//!    this path runs at temperature 0 alone, where the draw is the argmax it
+//!    would be replaced by.
 //!
 //! **It reads text and is blind past that.** A call at the position below inside
 //! a branch that never runs reads identical, and so does one whose arguments are
@@ -28,7 +33,7 @@
 //! the equivalence pair `the_two_model_round_loop_reproduces_plain_greedy` and
 //! the per-round stream it writes.
 
-use crate::speculative::text_scan_tests::lines_in_fns;
+use crate::speculative::text_scan_tests::{is_code, lines_in_fns};
 
 /// The drafter's own source, read as text.
 const ROUND_SRC: &str = include_str!("two_model.rs");
@@ -163,5 +168,55 @@ fn the_drafter_rolls_its_own_caches_back_and_reads_its_target_back() {
         *owner, "rollback",
         "the target is read back where the rollback left the cache and this one is read \
          in `{owner}`"
+    );
+}
+
+/// The verify pass draws the verifier's tokens through the round's own draw,
+/// and this drafter reads its logits back no other way.
+///
+/// At temperature 0 the draw *is* the device argmax, and this path runs at
+/// temperature 0 alone — the entry guard routes every sampled request to the
+/// stochastic loop — so a raw argmax read-back here decodes the same tokens
+/// today and nothing at runtime parts from it. `make check-spec-sampling` reads
+/// the loops and the entries, not a drafter's `verify`, and the one pair
+/// `crates/rmlx-models/tests/spec_sampled_distribution.rs` drives is the
+/// assistant's. This reading is what stands in their place, and what it is for
+/// is the day that routing changes.
+///
+/// Mutation: read the tokens back through `argmax(&v_logits, -1, device)` and
+/// `argmax_tokens`; move the draw into `propose`.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion above establishes exactly one element, so the read cannot fail"
+)]
+fn the_verify_pass_draws_through_the_rounds_own_draw() {
+    let draws = lines_in_fns(ROUND_SRC, "ctx.draw");
+    assert_eq!(
+        draws.len(),
+        1,
+        "the round reads the verifier's own tokens once, through the draw the loop \
+         built, and this drafter reads it {} time(s): {draws:?}",
+        draws.len()
+    );
+    let (line, owner) = draws.first().expect("one draw, asserted above");
+    assert_eq!(
+        *owner, "verify",
+        "the draw is the verify pass's and this one sits in `{owner}`"
+    );
+    assert_eq!(
+        *line, "let v_tokens = ctx.draw.block_tokens(&v_logits, fed.len(), device)?;",
+        "the round's tokens come off the request's draw at every verified position \
+         and this drafter reads `{line}`"
+    );
+    let raw: Vec<&str> = ROUND_SRC
+        .lines()
+        .map(str::trim)
+        .filter(|l| is_code(l) && l.contains("argmax"))
+        .collect();
+    assert!(
+        raw.is_empty(),
+        "a drafter that argmaxes the verifier's logits itself has a second read-back \
+         beside the request's draw, and this one has {raw:?}"
     );
 }
