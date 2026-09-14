@@ -35,7 +35,7 @@ dropped; callers import the items directly from `rmlx_kv_quant`:
 | `KvQuant`, `KvQuantParseError`             | `rmlx_kv_quant::quant`                       |
 | `KV_MAX_SEQ_DEFAULT`                       | `rmlx_kv_quant::quant`                       |
 | `KvCache`                                  | `rmlx_kv_quant::kvcache`                     |
-| `LinearAttnCache`                          | `rmlx_kv_quant::linear_attn`                 |
+| `LinearAttnCache`, `GdnTape`, `GdnTapeSegment` | `rmlx_kv_quant::linear_attn`             |
 | `KvStorage`, `QuantK`, `QuantV`, `QuantPlanarV` | `rmlx_kv_quant::storage`                |
 | `MixedKvState`, `MixedTuple`               | `rmlx_kv_quant::mixed_quant`                 |
 | `PagedKStorage`, `PagedVStorage`, `PagedPlanarVStorage`, `install_paged_kv`, `resolve_paged_kv`, `resolve_paged_kv_page_tokens` | `rmlx_kv_quant::paged` |
@@ -3266,9 +3266,13 @@ parallel `cargo test`.
 **unquantised bf16** (`KvQuant::None`), for every architecture, every
 checkpoint and every prompt length. One constant,
 `rmlx_models::kv_cache::DEFAULT_KV_QUANT`, is the only producer; the CLI, the
-server load path, the image branch, the arch dispatcher and all six
-speculative drafter stacks read it and nothing else. There is no per-arch table
-and no per-context re-selection behind it.
+server load path, the image branch, the arch dispatcher and
+`speculative::round_common::verifier_cache_stack`
+(`crates/rmlx-models/src/speculative/round_common.rs`) read it and nothing
+else. That last is the only reader on the speculative side: every round loop's
+verifier stack comes from it, and the two-model loops' draft stacks from the
+same builder. There is no per-arch table and no per-context re-selection behind
+it.
 
 Two things this replaced, both removed rather than retuned:
 
@@ -5134,16 +5138,14 @@ gemma4-assistant self-speculative path). Whether any of them can reach a
 - **Bonsai (`Qwen3ForCausalLM`, `kv_h = 8`)** — **reachable.** Its prompt-cache
   `ReusePolicy` is `ExactOnly`, so the partial-prefix trim never fires, but the
   speculative path does. Two reasons, both arch-generic:
-  1. `SpeculativeGenerator::from_snapshots_with_id` takes a fourth,
-     drafter-agnostic branch — `SpeculativeDispatcher::load_speculative` — when
-     `draft_kind` is `None`, and `rmlx-cli`'s serve gate keys on
-     `draft_path.is_some()` alone. `draft_model` has a `projects.toml` profile
-     key while `draft_kind` does not, so `draft_model = Some, draft_kind = None`
-     is reachable and never trips clap's `requires = "draft_kind"` (that only
-     binds CLI-supplied flags). That branch calls plain `load_model` on both
-     sides and `spec_generate_greedy_cached` builds caches from
-     `num_hidden_layers()` with **no arch check**, rolling back through
-     `KvCache::truncate_to`.
+  1. `SpeculativeGenerator::from_snapshots_with_id` takes the `two_model`
+     branch — `SpeculativeDispatcher::load_speculative` — for any
+     `--draft-model` whose `config.json` declares a registered architecture
+     (`docs/SPECULATIVE.md` § "Which drafter a snapshot is"), so a bare
+     `--draft-model <full model>` or a `profiles.toml` `draft_model` reaches
+     it. That branch calls plain `load_model` on both sides and
+     `spec_generate_greedy_cached` builds caches from `num_hidden_layers()`
+     with **no arch check**, rolling back through `KvCache::truncate_to`.
   2. No drafter gates the **verifier** arch at all. The
      `"Qwen3_5MoeForConditionalGeneration"` strings in `speculative/mtp.rs` and
      `speculative/dflash/mod.rs` are error-message text, not architecture

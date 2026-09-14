@@ -679,6 +679,34 @@ fn a_decode_configuration_outside_the_grammar_is_rejected() {
     assert!(r.validate().is_ok());
 }
 
+/// A record describing an adaptive drafter as fixed-block is refused.
+///
+/// DFlash has no fixed-block arm, so `dflash/block=16` names a configuration
+/// that has never run. Migration 008 emptied that cell of the eight rows that
+/// predated the term; refusing new ones at ingest is what keeps it empty, the
+/// same way `a_decode_configuration_spelling_the_defaults_is_refused` keeps the
+/// default cell from re-filling.
+#[test]
+fn a_decode_configuration_describing_an_adaptive_drafter_as_fixed_is_refused() {
+    let mut r = valid_record();
+    r.decode_config = Some("dflash/block=16".to_string());
+    let err = r.validate().unwrap_err();
+    let Error::InvalidIngestField { field, message } = err else {
+        panic!("expected an InvalidIngestField rejection");
+    };
+    assert_eq!(field, "decode_config");
+    assert!(
+        message.contains("dflash/block=16,dflash/depth=accept_rate"),
+        "the message must name the spelling the engine composes: {message}"
+    );
+
+    // The engine's own spelling is accepted, and so is a fixed-block drafter's.
+    r.decode_config = Some("dflash/block=16,dflash/depth=accept_rate".to_string());
+    assert!(r.validate().is_ok());
+    r.decode_config = Some("mtp/block=16".to_string());
+    assert!(r.validate().is_ok());
+}
+
 /// A record spelling out the engine's own defaults is refused, not normalised.
 ///
 /// Refused rather than quietly rewritten because a caller who spells a default

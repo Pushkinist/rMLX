@@ -57,16 +57,24 @@ use commands::metrics::{dispatch as metrics_dispatch, MetricsCmd};
 /// Clap `ValueEnum` adapter for `rmlx_models::DraftKind`.
 ///
 /// `rmlx-models` carries no clap dep, so the `ValueEnum` impl lives here.
-/// Conversion to the model-crate type is via `From<DraftKindArg>`.
+/// Conversion to the model-crate type is via `From<DraftKindArg>`. Each value
+/// is spelled as `DraftKind::as_str` spells it, so the flag, the log fields
+/// and the metrics `decode_config` say one thing.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum DraftKindArg {
-    /// Multi-Token Prediction drafter.
+    /// Multi-Token Prediction sidecar (Qwen3.5-family head, Gemma4 assistant).
     Mtp,
     /// Draft-Flash attention-based draft head.
     #[value(name = "dflash")]
     DFlash,
+    /// Draft-Flash 2: dynamic convolutions plus a candidate-path selector.
+    #[value(name = "dflash2")]
+    DFlash2,
     /// EAGLE-3 speculative drafter.
     Eagle3,
+    /// A separate full draft model of the verifier's family.
+    #[value(name = "two_model")]
+    TwoModel,
 }
 
 impl From<DraftKindArg> for rmlx_models::DraftKind {
@@ -74,9 +82,41 @@ impl From<DraftKindArg> for rmlx_models::DraftKind {
         match a {
             DraftKindArg::Mtp => rmlx_models::DraftKind::Mtp,
             DraftKindArg::DFlash => rmlx_models::DraftKind::DFlash,
+            DraftKindArg::DFlash2 => rmlx_models::DraftKind::DFlash2,
             DraftKindArg::Eagle3 => rmlx_models::DraftKind::Eagle3,
+            DraftKindArg::TwoModel => rmlx_models::DraftKind::TwoModel,
         }
     }
+}
+
+/// `--draft-block-size` at parse time: the engine's floor and its ceiling,
+/// refused before a model loads rather than on the first request after two have.
+///
+/// The ceiling is refused rather than clamped for the same reason the floor is:
+/// an operator who asked for 4096 and was quietly served 1024 would read the
+/// round's figures as belonging to the block they named. The round loops clamp
+/// too, as their own guard against a caller that is not this one.
+fn parse_draft_block_size(s: &str) -> Result<usize, String> {
+    let block: usize = s
+        .parse()
+        .map_err(|e| format!("not a whole number of tokens: {e}"))?;
+    if block < rmlx_server::MIN_DRAFT_BLOCK_SIZE {
+        return Err(format!(
+            "a block of {block} leaves no room for a draft token; it must be at least {}",
+            rmlx_server::MIN_DRAFT_BLOCK_SIZE
+        ));
+    }
+    if block > rmlx_models::speculative::MAX_BLOCK_SIZE {
+        return Err(format!(
+            "a block of {block} is more positions than one verify forward can score; \
+             the round scores the whole block in a single un-chunked pass that \
+             materialises one full-vocabulary logit row per position, and above about \
+             a thousand of them that pass times the GPU out rather than running \
+             slowly (max {})",
+            rmlx_models::speculative::MAX_BLOCK_SIZE
+        ));
+    }
+    Ok(block)
 }
 
 /// CLI value-enum wrapper for [`rmlx_models::prefix_index::PrefixIndexKind`].
@@ -591,24 +631,26 @@ enum Cmd {
         /// Default 4. Set to 1 for legacy single-slot exact-match behaviour.
         #[arg(long)]
         prompt_cache_slots: Option<usize>,
-        /// Path to a smaller "draft" model for speculative decoding.
-        /// Vocab size of draft must match the verifier (`--model`); enforced
-        /// at load time. Optional. Must be paired with `--draft-kind`.
-        #[arg(long, requires = "draft_kind")]
+        /// Drafter snapshot for speculative decoding: a sidecar head (MTP,
+        /// DFlash, EAGLE-3) or a smaller full model of the verifier's family.
+        /// Which one it is is read from its config.json. A full draft model
+        /// must carry the verifier's tokenizer; that is checked at load time.
+        #[arg(long)]
         draft_model: Option<PathBuf>,
-        /// Drafter architecture family.
+        /// Drafter kind, for a `--draft-model` whose config.json does not
+        /// declare one. Refused when it contradicts what the snapshot declares.
+        /// Requires `--draft-model`. Env: `MLX_VLM_DRAFT_KIND`.
         ///
-        /// Required when `--draft-model` is set; must not be used without it.
-        /// Env: `MLX_VLM_DRAFT_KIND` (fallback when flag is absent).
-        ///
-        /// Values: mtp, dflash, eagle3
+        /// Values: mtp, dflash, dflash2, eagle3, two_model
         #[arg(long, value_enum, requires = "draft_model", env = "MLX_VLM_DRAFT_KIND")]
         draft_kind: Option<DraftKindArg>,
-        /// Number of tokens the draft model proposes per speculative round.
-        ///
-        /// Must be ≥ 1. Default 4 when `--draft-model` is set.
+        /// Speculative round block: tokens the verifier scores per round, its
+        /// own token included, so the drafter proposes one fewer. The same
+        /// number for every drafter kind. Must be ≥ 2 and ≤ 1024. Absent, the
+        /// round runs at 5 capped by the depth the drafter's own checkpoint
+        /// declares, and at a flat 5 for a drafter that declares none.
         /// Env: `MLX_VLM_DRAFT_BLOCK_SIZE` (fallback when flag is absent).
-        #[arg(long, value_name = "N", env = "MLX_VLM_DRAFT_BLOCK_SIZE")]
+        #[arg(long, value_name = "N", env = "MLX_VLM_DRAFT_BLOCK_SIZE", value_parser = parse_draft_block_size)]
         draft_block_size: Option<usize>,
         /// Per-request `max_tokens` ceiling. Requests with a higher value
         /// receive HTTP 400 `invalid_request_error` instead of being silently
@@ -1530,7 +1572,7 @@ enum EvalCmd {
     /// Compute perplexity over a text corpus using sliding-window NLL.
     ///
     /// Loads `--model`, tokenizes `--text-file`, and runs the native PPL
-    /// scorer (Qwen3 family only — Bonsai is the smoke target).
+    /// scorer (Qwen3, Gemma4 and Qwen3.5 — Bonsai is the smoke target).
     /// Prints one JSON line to stdout: `{"ppl":..,"mean_nll":..,"scored_tokens":..,"windows":..}`.
     /// When `--corpus wikitext-2` (or any non-empty value) is supplied, also
     /// ingests one §8.5 universal `RunRecord` into `<RMLX_HOME>/metrics/runs.db`
@@ -2002,7 +2044,8 @@ fn main() -> Result<()> {
                 .or_else(|| p.and_then(|x| x.prompt_cache_slots))
                 .unwrap_or(DEFAULT_PROMPT_CACHE_SLOTS);
             let draft_model = draft_model.or_else(|| p.and_then(|x| x.draft_model.clone()));
-            // draft_kind / draft_block_size have no profile key yet.
+            // draft_kind / draft_block_size have no profile key; a profile's
+            // draft_model runs at the kind its snapshot declares.
             let draft_kind: Option<rmlx_models::DraftKind> = draft_kind.map(Into::into);
             let max_tokens_cap = max_tokens_cap
                 .or_else(|| p.and_then(|x| x.max_tokens_cap))
@@ -2127,13 +2170,14 @@ fn main() -> Result<()> {
                 return Err(anyhow::anyhow!("--image-max-tokens must be > 0"));
             }
             // projects.toml loading + cap resolution wired in run_serve.
-            // log draft flags at startup.
-            if let (Some(dp), Some(dk)) = (draft_model.as_deref(), draft_kind) {
+            // `draft_kind_flag`, not `draft_kind`: the resolved kind is
+            // logged under that name by the generator once the snapshot is read.
+            if let Some(dp) = draft_model.as_deref() {
                 info!(
                     draft_model = %dp.display(),
-                    draft_kind = %dk,
+                    draft_kind_flag = ?draft_kind,
                     draft_block_size = ?draft_block_size,
-                    "speculative decoding — draft_kind + draft_block_size"
+                    "speculative decoding — draft flags"
                 );
             }
             // Resolve --cache-type-* against the model config when a single

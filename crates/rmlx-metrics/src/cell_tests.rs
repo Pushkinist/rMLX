@@ -1,6 +1,7 @@
 use super::{
     decode_config, decode_config_from_notes, decode_config_is_all_defaults,
-    decode_config_is_well_formed, predicate, NotesVerdict, CELL_COLUMNS,
+    decode_config_is_well_formed, decode_config_names_a_drafter, predicate, NotesVerdict,
+    CELL_COLUMNS,
 };
 
 #[test]
@@ -39,12 +40,49 @@ fn the_partition_list_is_the_cell_key_plus_metric() {
 
 // ── Deriving `decode_config` from notes ───────────────────────────────────────
 
-/// The one place the format is written, pinned against the string
-/// `scripts/spec_bench.sh` records for the same run.
+/// The one place the format is written, pinned against the string the engine
+/// logs and `scripts/spec_bench.sh` records for the same run.
 #[test]
 fn decode_config_format_is_stable() {
-    assert_eq!(decode_config("mtp", 5), "mtp/block=5");
-    assert_eq!(decode_config("dflash", 16), "dflash/block=16");
+    assert_eq!(decode_config("mtp", 5, None), "mtp/block=5");
+    assert_eq!(decode_config("dflash", 16, None), "dflash/block=16");
+}
+
+/// An adaptive arm is a different cell from the fixed arm at the same ceiling,
+/// and both are legal `decode_config` values in term order.
+#[test]
+fn adaptive_depth_is_a_separate_well_formed_cell() {
+    let adaptive = decode_config("dflash", 16, Some("accept_rate"));
+    assert_eq!(adaptive, "dflash/block=16,dflash/depth=accept_rate");
+    assert!(decode_config_is_well_formed(&adaptive), "{adaptive}");
+    assert_ne!(adaptive, decode_config("dflash", 16, None));
+    assert!(!decode_config_is_all_defaults(&adaptive), "{adaptive}");
+
+    let confidence = decode_config("mtp", 8, Some("confidence"));
+    assert_eq!(confidence, "mtp/block=8,mtp/depth=confidence");
+    assert!(decode_config_is_well_formed(&confidence), "{confidence}");
+}
+
+/// The block reaches the term as the engine holds it. A narrower parameter
+/// would truncate or saturate here, and the row would name a block nothing ran
+/// in a table that cannot take it back out.
+#[test]
+fn a_block_beyond_a_narrower_type_is_not_truncated() {
+    let huge = u32::MAX as usize + 2;
+    assert_eq!(
+        decode_config("mtp", huge, None),
+        format!("mtp/block={huge}")
+    );
+    assert!(decode_config_is_well_formed(&decode_config(
+        "mtp", huge, None
+    )));
+
+    // The same value read back out of a row's notes, for the same reason.
+    let notes = format!("config=mtp draft_kind=mtp block_size={huge}");
+    assert_eq!(
+        decode_config_from_notes(&notes),
+        NotesVerdict::Speculative(format!("mtp/block={huge}")),
+    );
 }
 
 #[test]
@@ -54,9 +92,12 @@ fn notes_naming_a_drafter_classify_as_that_arm() {
             "config=mtp6b draft_kind=mtp block_size=6 decode_tps=client-side",
             "mtp/block=6",
         ),
+        // DFlash has no fixed-block arm, so a row recovered from notes must
+        // not be classified as one — it would land in a cell that misdescribes
+        // the loop and that migration 008 has just emptied.
         (
             "config=dflash16 draft_kind=dflash block_size=16",
-            "dflash/block=16",
+            "dflash/block=16,dflash/depth=accept_rate",
         ),
         (
             "config=eagle5 draft_kind=eagle block_size=5 tag=x",
@@ -120,10 +161,12 @@ fn the_shipped_decode_configurations_are_well_formed() {
         "eagle/block=5",
         "prefill_chunk=1024",
         "prefill_chunk=1024,spec/block=5",
+        "dflash/block=16,dflash/depth=accept_rate",
+        "two_model/block=5",
     ] {
         assert!(decode_config_is_well_formed(config), "{config}");
     }
-    assert!(decode_config_is_well_formed(&decode_config("mtp", 5)));
+    assert!(decode_config_is_well_formed(&decode_config("mtp", 5, None)));
 }
 
 /// The rejections that protect cell identity: a term order that would split
@@ -210,5 +253,107 @@ fn a_configuration_that_says_something_is_not_all_defaults() {
             !decode_config_is_all_defaults(&config),
             "{config:?} must not be read as the engine at its defaults"
         );
+    }
+}
+
+/// Not every `decode_config` is a drafter. A reader that keyed on "the column
+/// is not NULL" would pull a prefill-chunk sweep into the speculative table and
+/// report a blank round loop for it.
+#[test]
+fn only_a_block_term_names_a_drafter() {
+    for config in [
+        "mtp/block=5",
+        "dflash/block=16,dflash/depth=accept_rate",
+        "two_model/block=5",
+        "prefill_chunk=1024,spec/block=5",
+    ] {
+        assert!(decode_config_names_a_drafter(config), "{config}");
+    }
+    for config in [
+        "prefill_chunk=1024",
+        "kv_boundary/head=3,kv_boundary/tail=9",
+        "mtp/blocking=5",
+        "block=5",
+        "",
+        "mtp/block=",
+    ] {
+        assert!(!decode_config_names_a_drafter(config), "{config}");
+    }
+}
+
+/// A drafter that has always resized its block has no fixed-block spelling, and
+/// one place says which drafters those are.
+#[test]
+fn an_adaptive_drafter_has_no_fixed_block_spelling() {
+    use super::{decode_config_with_inherent_depth, inherent_depth_policy, ADAPTIVE_DRAFTERS};
+
+    assert_eq!(inherent_depth_policy("dflash"), Some("accept_rate"));
+    assert_eq!(inherent_depth_policy("mtp"), None);
+    assert_eq!(inherent_depth_policy("eagle3"), None);
+    assert_eq!(inherent_depth_policy("two_model"), None);
+
+    // The stale spelling is corrected; the correct one is left alone.
+    assert_eq!(
+        decode_config_with_inherent_depth("dflash/block=16").as_deref(),
+        Some("dflash/block=16,dflash/depth=accept_rate")
+    );
+    assert_eq!(
+        decode_config_with_inherent_depth("dflash/block=16,dflash/depth=accept_rate"),
+        None
+    );
+    // Every other term is carried through. Rebuilding the value from the
+    // drafter term would drop them — into an append-only column via migration
+    // 008, and back at an operator as the spelling to use via validate. The
+    // column already holds three-term values.
+    assert_eq!(
+        decode_config_with_inherent_depth("dflash/block=16,kv_boundary/head=2,kv_boundary/tail=4")
+            .as_deref(),
+        Some("dflash/block=16,dflash/depth=accept_rate,kv_boundary/head=2,kv_boundary/tail=4")
+    );
+    // The addition is merged in key order, not appended.
+    assert_eq!(
+        decode_config_with_inherent_depth("dflash/block=16,prefill_chunk=1024").as_deref(),
+        Some("dflash/block=16,dflash/depth=accept_rate,prefill_chunk=1024")
+    );
+    // A value whose first drafter term is fixed-block is still examined for a
+    // later adaptive one, rather than the scan aborting on the first `/block`.
+    assert_eq!(
+        decode_config_with_inherent_depth("dflash/block=16,mtp/block=5").as_deref(),
+        Some("dflash/block=16,dflash/depth=accept_rate,mtp/block=5")
+    );
+    // And a correction is never offered unless it is itself legal.
+    for corrected in [
+        decode_config_with_inherent_depth("dflash/block=16"),
+        decode_config_with_inherent_depth("dflash/block=16,kv_boundary/head=2,kv_boundary/tail=4"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(decode_config_is_well_formed(&corrected), "{corrected}");
+    }
+
+    // A fixed-block drafter's spelling is not touched, and neither is a
+    // non-drafter configuration or a malformed one.
+    for untouched in [
+        "mtp/block=5",
+        "eagle3/block=5",
+        "prefill_chunk=1024",
+        "kv_boundary/head=3,kv_boundary/tail=9",
+        "not a decode_config",
+        "",
+    ] {
+        assert_eq!(
+            decode_config_with_inherent_depth(untouched),
+            None,
+            "{untouched}"
+        );
+    }
+
+    // Every declared policy composes a legal cell, so the migration cannot
+    // write an out-of-grammar string into an append-only table.
+    for &(kind, policy) in ADAPTIVE_DRAFTERS {
+        let composed = decode_config(kind, 16, Some(policy));
+        assert!(decode_config_is_well_formed(&composed), "{composed}");
+        assert_eq!(decode_config_with_inherent_depth(&composed), None);
     }
 }

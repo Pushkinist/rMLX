@@ -23,6 +23,46 @@ fn write_config(dir: &TempDir, architectures: &[&str]) -> std::path::PathBuf {
 
 // -- B3: is_arch_supported predicate tests --------------------------------
 
+/// Every registered architecture is classified as generative or not, here,
+/// against the registry as a set — so a new entry fails this test until
+/// someone says which it is, rather than being inferred a full draft model
+/// and dying inside `load_model`.
+#[test]
+fn every_registered_architecture_is_classified_as_generative_or_not() {
+    let expected: &[(&str, bool)] = &[
+        ("Gemma4ForConditionalGeneration", true),
+        ("Gemma4UnifiedForConditionalGeneration", true),
+        ("Gemma3ForConditionalGeneration", true),
+        ("Qwen2ForCausalLM", true),
+        ("Qwen3ForCausalLM", true),
+        ("LagunaForCausalLM", true),
+        ("Qwen3_5MoeForConditionalGeneration", true),
+        ("Qwen3_5ForConditionalGeneration", true),
+        ("Qwen3VLMoeForConditionalGeneration", true),
+        ("BitNetForCausalLM", true),
+        ("JinaEmbeddingsV4Model", false),
+    ];
+    let mut covered: Vec<&str> = expected.iter().map(|(class, _)| *class).collect();
+    covered.sort_unstable();
+    let mut registered: Vec<&str> = KNOWN_ARCHS.to_vec();
+    registered.sort_unstable();
+    assert_eq!(
+        covered, registered,
+        "this table and the architecture registry describe different sets"
+    );
+    for (class, generative) in expected {
+        assert_eq!(
+            is_generative_arch(class),
+            *generative,
+            "{class} is classified the wrong way"
+        );
+    }
+    assert!(
+        !is_generative_arch("NotRegisteredForCausalLM"),
+        "an unregistered architecture is not generative either"
+    );
+}
+
 #[test]
 fn is_arch_supported_returns_true_for_known_archs() {
     // Spot-check a representative subset so any KNOWN_ARCHS typo is caught.

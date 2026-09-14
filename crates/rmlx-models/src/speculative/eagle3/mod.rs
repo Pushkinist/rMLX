@@ -5,7 +5,8 @@
 //!
 //! Port of mlx-vlm `mlx_vlm/speculative/drafters/eagle3/eagle3.py`
 //! (`Eagle3DraftModel`) and the round-loop in `mlx_vlm/speculative/eagle3.py`
-//! (`_eagle3_next_block_size`, `_eagle3_rounds`, `_eagle3_walk`). The
+//! (`_eagle3_next_block_size`, `_eagle3_rounds`, `_eagle3_walk`, whose walk is
+//! the shared [`crate::speculative::accept_prefix`] here). The
 //! authoritative weight layout is the mainline SpecForge
 //! `LlamaForCausalLMEagle3` model
 //! (`sgl-project/SpecForge:specforge/modeling/draft/llama3_eagle.py`).
@@ -52,8 +53,8 @@
 //!    concatenated along the feature axis in one cached forward. We capture at
 //!    `[id - 1]` for each `eagle_aux_hidden_state_layer_ids` id (mlx-vlm
 //!    `capture_layer_ids`), i.e. `[2, 18, 34]`.
-//! 2. **GDN rollback** — reuses [`super::dflash::DFlashRoundState`]
-//!    snapshot/restore + kept-prefix replay on partial acceptance (GDN recurrent
+//! 2. **GDN rollback** — reuses the shared round tape
+//!    a round tape refolded over the kept prefix on partial acceptance (GDN recurrent
 //!    state has no sequence axis; it cannot be truncated).
 //! 3. **Raw embed accessor** — [`Architecture::embed_tokens_raw`] (the verifier
 //!    `embed_tokens` is the EAGLE-3 `bind()` target; the checkpoint ships no
@@ -111,65 +112,42 @@
     clippy::too_many_lines,
     clippy::used_underscore_binding
 )]
-// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
-// caches a round builds live for that round only: they are never pushed to the
-// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
-// description has to match them. Applying the boundary promotion here would
-// change the codec of a stack whose only reader is the round that built it.
+// kv-layer-quants: uniform — the caches built here are the drafter's own and
+// never a per-layer stack: one unquantized cache for a single-layer head, made
+// at load and re-made per request by `Eagle3Drafter::reset`. It lives for that
+// one request — never pushed to the prompt cache, never spilled, never keyed by
+// `layout_key` — so no on-disk description has to match it. The verifier's
+// stack is built by `speculative::round_common`, which carries its own
+// declaration.
 
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{add, argmax, concatenate, rope, Array, Device};
 
-use super::dflash::DFlashRoundState;
-use super::{emit_step, DecodeWindow};
+use super::DecodeWindow;
 use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
+use crate::speculative::round_common::{
+    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
+    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
+};
+use rmlx_kv_quant::{KvCache, KvQuant};
 
-/// Choose the next EAGLE-3 verify block size.
-///
-/// Pure port of `_eagle3_next_block_size` (non-adaptive branch). mlx-vlm's
-/// `_eagle3_rounds` honors the configured/requested size capped to the remaining
-/// budget (the Dogacel drafter advertises no `adaptive_max_block_size`, so the
-/// adaptive tier walk never fires). Returns the next block total (including the
-/// seed/bonus token).
-pub fn eagle3_next_block_size(requested_block_total: usize, remaining_budget: usize) -> usize {
-    requested_block_total.min(remaining_budget)
-}
+/// Target of this loop's per-position step trace.
+pub(crate) const STEP_TARGET: &str = "rmlx_models::speculative::eagle3";
 
-/// One greedy EAGLE-3 acceptance walk over a drafted block.
+/// Whether this request emits one trace event per verified position.
 ///
-/// Pure port of `_eagle3_walk`: accept drafted tokens up to the first mismatch
-/// with the verifier's greedy choice, then take the verifier's correction/bonus
-/// at that position. Returns `(accepted, new_tokens)` capped at `budget`.
-/// `target_tokens` are the verifier's greedy predictions for positions
-/// `[b, d0, d1, ...]` — `draft_tokens.len() + 1` of them.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-pub fn eagle3_walk(
-    draft_tokens: &[u32],
-    target_tokens: &[u32],
-    budget: usize,
-) -> (usize, Vec<u32>) {
-    let n_draft = draft_tokens.len();
-    let mut accepted = n_draft;
-    for (i, (&d, &t)) in draft_tokens.iter().zip(target_tokens.iter()).enumerate() {
-        if d != t {
-            accepted = i;
-            break;
-        }
-    }
-    let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
-    if accepted < target_tokens.len() {
-        new_tokens.push(target_tokens[accepted]);
-    }
-    new_tokens.truncate(budget);
-    (accepted, new_tokens)
+/// Like [`crate::speculative::phases_charged`] this reads process-global log
+/// state and changes what the round does — a block of `v_k` events per round,
+/// each reading back tokens the loop already holds. It is a named predicate so
+/// a recorder can be asked whether it declined it: a subscriber that enables
+/// everything turns this on, and a per-round stream captured under one is not
+/// the stream the loop emits by default.
+pub(crate) fn step_trace_enabled() -> bool {
+    tracing::enabled!(target: STEP_TARGET, tracing::Level::TRACE)
 }
 
 /// Find the first position where the restricted-vocab verifier token differs from the
@@ -640,7 +618,7 @@ impl Eagle3Drafter {
         device: Device,
     ) -> Result<(Array, u32)> {
         // (1) Roll drafter KV cache back to pre-round state.
-        self.truncate_cache(pre_round_offset);
+        self.truncate_cache(pre_round_offset)?;
 
         // (2) Build token sequence: accepted draft prefix + correction.
         let n = accepted + 1;
@@ -768,10 +746,11 @@ impl Eagle3Drafter {
     }
 
     /// Truncate the drafter cache to `n` positions (partial-accept rollback).
-    pub fn truncate_cache(&mut self, n: i32) {
+    pub fn truncate_cache(&mut self, n: i32) -> Result<()> {
         if self.cache.offset() >= n {
-            self.cache.truncate_to(n);
+            self.cache.truncate_to(n)?;
         }
+        Ok(())
     }
 }
 
@@ -779,7 +758,37 @@ impl Eagle3Drafter {
 // Round-loop
 // ---------------------------------------------------------------------------
 
+/// Which vocabulary decided one emitted token.
+///
+/// The verify pass takes its argmax over the drafter's reduced target ids at
+/// every position it may accept, and over the verifier's whole vocabulary at
+/// the round's correction and at the prefill seed. The two argmaxes are the
+/// same token exactly when the verifier's own choice is one the drafter can
+/// name, so this is the only thing that says whether the restriction could have
+/// changed a token — and the token stream cannot express it.
+#[allow(
+    clippy::exhaustive_enums,
+    reason = "closed two-valued distinction: a verify position is scored over the drafter's ids or over the verifier's, and there is no third vocabulary"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecidedBy {
+    /// The drafter's reduced vocabulary — an accepted draft token. It differs
+    /// from the verifier's own argmax exactly when that argmax is a token the
+    /// drafter cannot name.
+    RestrictedVocab,
+    /// The verifier's whole vocabulary — a round's correction, the prefill
+    /// seed, or any position of a request that does not take the restricted
+    /// read-back at all. The restriction cannot have changed this token.
+    FullVocab,
+}
+
 /// EAGLE-3 speculative-decoding round-loop (greedy / temp=0).
+///
+/// `decided_by` is filled with one [`DecidedBy`] per emitted token, in
+/// emission order, and is cleared first. A caller that only wants the tokens
+/// passes a scratch vector; the answer-equivalence gate reads it, because
+/// whether the restriction could have changed a token is a property of the
+/// round the token came out of and not of the token.
 ///
 /// Port of `_eagle3_rounds` (mlx-vlm), now with correctness fixes:
 ///
@@ -791,6 +800,12 @@ impl Eagle3Drafter {
 ///
 /// Reuses the three verifier-side seams: multi-layer hidden capture,
 /// GDN snapshot/restore rollback, and raw embed accessor.
+///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::expect_used,
@@ -804,7 +819,7 @@ impl Eagle3Drafter {
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-pub fn eagle3_generate_greedy(
+pub fn eagle3_generate(
     verifier: &Architecture,
     drafter: &mut Eagle3Drafter,
     tokenizer: &tokenizers::Tokenizer,
@@ -815,49 +830,36 @@ pub fn eagle3_generate_greedy(
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    decided_by: &mut Vec<DecidedBy>,
+    sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     use std::time::Instant;
+
+    decided_by.clear();
 
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
-            "eagle3_generate_greedy: prompt must have >=2 tokens".into(),
+            "eagle3_generate: prompt must have >=2 tokens".into(),
         ));
     }
     if !verifier.needs_lin_caches() {
         return Err(Error::Model(
-            "eagle3_generate_greedy: EAGLE-3 verifier must be the Qwen3.5/3.6-MoE \
+            "eagle3_generate: EAGLE-3 verifier must be the Qwen3.5/3.6-MoE \
              hybrid (needs GDN lin_caches + multi-layer hidden capture)"
                 .into(),
         ));
     }
 
     let aux_layer_ids = drafter.cfg.aux_layer_ids.clone();
-    let block_total = requested_block_total.min(drafter.cfg.block_size).max(2);
+    let block_total = crate::speculative::block_capped_by_checkpoint(
+        requested_block_total,
+        drafter.cfg.block_size,
+    );
 
-    // Same constant the verifier resolves — a spec pair must not run two
-    // different caches.
-    let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    // The verifier's limits bound the pair; an over-capacity `--max-ctx` is
-    // refused here rather than overflowing a cache mid-round.
-    let ctx = crate::speculative::verifier_context(verifier, max_ctx_override)?;
-    let max_seq = ctx.ceiling;
-
-    let mut v_caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
-        .map(|i| {
-            let window = verifier.layer_sliding_window(i);
-            KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                .with_max_seq_ceiling(ctx.ceiling)
-                .with_layer_idx(i)
-                // The verifier stack decides whether its layers read each
-                // other's K/V, and so whether Mixed/RotK keep their bf16
-                // mirror. A spec pair must not run two different caches.
-                .with_shares_kv(verifier.shares_kv_across_layers())
-        })
-        .collect();
-    let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
-        .map(|_| LinearAttnCache::new())
-        .collect();
+    let (kv_quant, max_seq, mut v_caches) =
+        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
+    let mut v_lin = lin_cache_stack(verifier);
 
     // Size the drafter KV cache to the verifier context limit
     // (max_position_embeddings, capped to KV_MAX_SEQ_DEFAULT, or --max-ctx).
@@ -866,6 +868,12 @@ pub fn eagle3_generate_greedy(
     // prompt + emitted tokens exceeded it (zero-length slice_update range in
     // update_decode_fp16, broadcast-shape panic).
     drafter.reset(max_seq);
+
+    let mut draw = super::VerifierDraw::new(sampler_cfg);
+    // Whether this request takes the restricted-vocabulary read-back at all. A
+    // sampled one cannot, so every position it emits is decided over the whole
+    // vocabulary.
+    let hot_path = drafter.hot_path_active() && !draw.sampling();
 
     let mut total_draft = 0usize;
     let mut total_accept = 0usize;
@@ -904,19 +912,21 @@ pub fn eagle3_generate_greedy(
         chunk_size = PREFILL_CHUNK_SIZE,
         "eagle3: verifier prefill (chunked)"
     );
+    let prefill_t0 = Instant::now();
     let (bonus_logits, all_hidden) = verifier.forward_verify_capture_chunked(
         prompt_ids,
         &aux_layer_ids,
         &mut v_caches,
         Some(&mut v_lin),
         PREFILL_CHUNK_SIZE,
+        // This drafter's own KV prefill conditions on every prompt position, so
+        // no capture row can be released early.
+        None,
         device,
     )?;
     // `bonus_logits` is [1,1,vocab] — the last prompt position only.
     super::guard_verifier_prefill_logits(verifier, &bonus_logits, prompt_ids.len())?;
-    let am = argmax(&bonus_logits, -1, device)?;
-    am.eval()?;
-    let bonus = u32::from_le_bytes(am.to_bytes()?[..4].try_into().unwrap());
+    let bonus = draw.seed_token(&bonus_logits, device)?;
 
     // Drafter prefill: shifted tokens = prompt[1..] + [bonus].
     // Conditioned on verifier hidden at positions 0..n-1 (all_hidden).
@@ -936,10 +946,36 @@ pub fn eagle3_generate_greedy(
     );
 
     let (mut b, mut h_seed, mut d_seed_tok) = (bonus, h_seed_init, Some(seed_tok_init));
+    // Prefill for this loop is the verifier pass plus the drafter's own KV
+    // prefill that conditions on it.
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
 
-    emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
-    if eos_ids.contains(&b) {
-        return Ok(emitted);
+    decided_by.push(DecidedBy::FullVocab);
+    if emit_seed_token(
+        tokenizer,
+        b,
+        step_fn,
+        &mut emitted,
+        &mut window,
+        eos_ids,
+        &RoundTotals {
+            loop_kind: super::SpecLoop::Eagle3,
+            block_size: block_total,
+            conditioned_rows: None,
+            charged: false,
+            // No round ran.
+            rounds: 0,
+            emitted_in_rounds: 0,
+            total_draft: 0,
+            total_accept: 0,
+            prefill_ns,
+            draft_ns: 0,
+            verifier_ns: 0,
+            round_loop_ns: 0,
+            t_total,
+        },
+    ) {
+        return Ok((emitted, block_total));
     }
 
     tracing::info!(
@@ -949,16 +985,22 @@ pub fn eagle3_generate_greedy(
         ?kv_quant,
         ?aux_layer_ids,
         draft_vocab_size = drafter.cfg.draft_vocab_size,
-        "eagle3_generate_greedy: starting (Qwen3.6-MoE verifier + EAGLE-3 drafter)"
+        temperature = sampler_cfg.temperature,
+        // A sampled request cannot take the restricted-vocabulary read-back, so
+        // report whether this one did rather than whether the drafter offers it.
+        hot_path,
+        "eagle3_generate: starting (Qwen3.6-MoE verifier + EAGLE-3 drafter)"
     );
 
+    let seed_emitted = emitted.len();
+    let mut emitted_in_rounds = 0usize;
+    let mut widest_bs = 0usize;
+    let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
         let remaining = n_tokens - emitted.len();
-        let bs = eagle3_next_block_size(block_total, remaining + 1);
-        if bs <= 1 {
-            break;
-        }
+        let bs = super::round_block(block_total, remaining);
+        widest_bs = widest_bs.max(bs);
 
         // Track drafter cache offset before draft_block so accept_and_reseed
         // knows where to roll back to.
@@ -972,12 +1014,16 @@ pub fn eagle3_generate_greedy(
         let draft_tokens = drafter.draft_block(verifier, b, &h_seed, d_seed_tok, bs)?;
         draft_ns += t0.elapsed().as_nanos();
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "eagle3_generate: the drafter proposed nothing at block {bs}; a block \
+                 of two or more yields block - 1 ids, so an empty chain is a broken \
+                 drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 
         // -- Phase B: verifier scores [b, draft...] + captures multi-aux hidden. --
-        let round_snap = DFlashRoundState::snapshot(&v_lin)?;
+        super::arm_lin_tapes(Some(&mut v_lin));
         let mut v_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
         v_input.push(b);
         v_input.extend_from_slice(&draft_tokens);
@@ -998,8 +1044,17 @@ pub fn eagle3_generate_greedy(
         // 6. Replace tokens[full_pos] with the full-vocab correction token.
         //
         // This reduces logit materialisation by ~7.8× for accepted positions.
+        //
+        // A sampled request cannot use it. The restricted row is a logit vector
+        // over the drafter's 32000-id vocabulary, and a distribution needs the
+        // normalising constant of the whole row: softmaxing the subset spreads
+        // the missing mass over the ids that survived, and top-p and top-k then
+        // cut a different set than they would have. An argmax is indifferent to
+        // all of that, which is why the reduction is sound at temperature 0 and
+        // only there. Sampled requests pay the full-vocabulary projection at
+        // every verified position.
         let t0 = Instant::now();
-        let (v_tokens, v_hidden) = if drafter.hot_path_active() {
+        let (v_tokens, v_hidden) = if hot_path {
             let (v_hidden, v_final_hidden) = verifier.forward_verify_capture_hot(
                 &v_input,
                 v_k,
@@ -1020,11 +1075,13 @@ pub fn eagle3_generate_greedy(
             let hot_am = argmax(&hot_logits, -1, device)?;
             hot_am.eval()?;
             let hot_bytes = hot_am.to_bytes()?;
-            let mut tokens: Vec<u32> = (0..v_k)
-                .map(|i| {
-                    let draft_idx =
-                        u32::from_le_bytes(hot_bytes[i * 4..i * 4 + 4].try_into().unwrap())
-                            as usize;
+            // Restricted vocabulary: the argmax is an index into `hot_ids`, not
+            // a token id, but the read-back is the same device buffer and the
+            // same guard applies to it.
+            let mut tokens: Vec<u32> = super::argmax_tokens(&hot_bytes, v_k)?
+                .into_iter()
+                .map(|draft_idx| {
+                    let draft_idx = draft_idx as usize;
                     hot_ids_host
                         .get(draft_idx)
                         .copied()
@@ -1044,7 +1101,8 @@ pub fn eagle3_generate_greedy(
                 &[1, 1, 1],
                 device,
             )?;
-            let corr_logits = verifier.logits_from_hidden(&h_corr, device)?;
+            // `v_final_hidden` is final-normed by `forward_verify_capture_hot`.
+            let corr_logits = verifier.logits_from_final_hidden(&h_corr, device)?;
             let corr_am = argmax(&corr_logits, -1, device)?;
             corr_am.eval()?;
             let corr_bytes = corr_am.to_bytes()?;
@@ -1061,27 +1119,17 @@ pub fn eagle3_generate_greedy(
                 Some(&mut v_lin),
                 device,
             )?;
-            let v_argmax = argmax(&v_logits, -1, device)?;
-            v_argmax.eval()?;
-            let vb = v_argmax.to_bytes()?;
+            let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
             verifier_ns += t0.elapsed().as_nanos();
-            let mut toks = Vec::with_capacity(v_k);
-            for i in 0..v_k {
-                toks.push(u32::from_le_bytes(vb[i * 4..i * 4 + 4].try_into().unwrap()));
-            }
-            (toks, v_hidden)
+            (v_tokens, v_hidden)
         };
 
         // -- Phase C: greedy acceptance walk. --
-        let (accept, new_tokens) = eagle3_walk(&draft_tokens, &v_tokens, remaining);
+        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         total_accept += accept;
-        let n_committed = new_tokens.len();
 
         // Per-step trace: enable with RUST_LOG=rmlx_models::speculative::eagle3=trace.
-        if tracing::enabled!(
-            target: "rmlx_models::speculative::eagle3",
-            tracing::Level::TRACE
-        ) {
+        if step_trace_enabled() {
             let running_ar = if total_draft > 0 {
                 (total_accept as f64) / (total_draft as f64)
             } else {
@@ -1089,7 +1137,7 @@ pub fn eagle3_generate_greedy(
             };
             for (i, (&dt, &vt)) in draft_tokens.iter().zip(v_tokens.iter()).enumerate() {
                 tracing::trace!(
-                    target: "rmlx_models::speculative::eagle3",
+                    target: STEP_TARGET,
                     round = rounds,
                     step = i,
                     draft_tok = dt,
@@ -1104,42 +1152,43 @@ pub fn eagle3_generate_greedy(
         }
 
         // -- Emit accepted prefix + 1 correction/bonus. --
-        let mut hit_eos = false;
-        for &id in &new_tokens {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
-        if hit_eos {
+        // `new_tokens[..accept]` are the draft's own tokens, which the
+        // restricted argmax confirmed; `new_tokens[accept]` is the correction,
+        // taken over the whole vocabulary.
+        let restricted = if hot_path { accept } else { 0 };
+        let emit = emit_round_tokens(
+            tokenizer,
+            &new_tokens,
+            n_tokens,
+            eos_ids,
+            step_fn,
+            &mut emitted,
+            &mut emitted_in_rounds,
+            &mut window,
+            Some((&mut *decided_by, restricted)),
+        );
+        if emit.hit_eos {
             break;
         }
+        let n_committed = emit.committed;
 
         // -- Phase D: roll back verifier KV/GDN caches on partial accept. --
         // The verifier consumed v_k positions; keep the committed prefix
-        // (pre-round + accept + 1 carry rows). Roll FA KV caches back, restore +
-        // replay the GDN recurrence.
+        // (pre-round + accept + 1 carry rows). Roll FA KV caches back and refold
+        // the GDN recurrence over the kept prefix.
         let v_offset_before = v_caches.iter().map(|c| c.offset()).max().unwrap_or(0);
-        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
-        if v_target < v_offset_before {
-            let v_pre_round_offset = v_offset_before - v_k as i32;
-            super::rollback_round_caches(
-                verifier,
-                &mut v_caches,
-                Some(&mut v_lin),
-                Some(round_snap.into_snapshots()),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                device,
-            )?;
-        } else {
-            drop(round_snap);
-        }
+        let v_target =
+            super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
+        let refolded = rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_offset_before - v_k as i32,
+            v_target,
+            // This loop times no phases, so it never charges one.
+            false,
+            device,
+        )?;
 
         // -- Phase E: drafter accept-and-reseed. --
         //
@@ -1169,50 +1218,53 @@ pub fn eagle3_generate_greedy(
         d_seed_tok = Some(seed_tok);
         b = correction;
 
-        tracing::debug!(
-            round = rounds,
-            accept,
-            num_draft = draft_tokens.len(),
-            n_committed,
-            emitted_total = emitted.len(),
-            v_offset_before,
-            v_target,
-            draft_pre_round_offset,
-            draft_cache_after = drafter.cache_offset(),
-            "eagle3 round"
+        super::log_round(
+            &super::RoundReport {
+                loop_kind: super::SpecLoop::Eagle3,
+                round: rounds,
+                accept,
+                num_draft: draft_tokens.len(),
+                n_committed,
+                emitted_total: emitted.len(),
+                condition_rows: None,
+                projected_rows: None,
+                v_offset_before,
+                v_target,
+                d_offset_before: Some(draft_pre_round_offset),
+                d_target: Some(drafter.cache_offset()),
+                refolded,
+                // This loop times no phases, so it never charges one.
+                charged: false,
+                phases: None,
+            },
+            &[],
         );
     }
 
-    let elapsed_ms = (t_total.elapsed().as_nanos() as f64) / 1.0e6;
-    let accept_rate = if total_draft > 0 {
-        (total_accept as f64) / (total_draft as f64)
-    } else {
-        0.0
-    };
-
-    tracing::info!(
-        rounds,
-        emitted = emitted.len(),
-        total_draft,
-        total_accept,
-        accept_rate,
-        decode_tps = ?window.tps(),
-        elapsed_ms,
-        draft_ms = (draft_ns as f64) / 1.0e6,
-        verifier_ms = (verifier_ns as f64) / 1.0e6,
-        block_size = block_total,
-        "eagle3_generate_greedy: done"
+    let round_loop_ns = round_loop_t0.elapsed().as_nanos();
+    log_request_record(
+        &RoundTotals {
+            loop_kind: super::SpecLoop::Eagle3,
+            block_size: block_total,
+            conditioned_rows: None,
+            charged: false,
+            rounds,
+            emitted_in_rounds,
+            total_draft,
+            total_accept,
+            prefill_ns,
+            draft_ns,
+            verifier_ns,
+            round_loop_ns,
+            t_total,
+        },
+        &emitted,
+        seed_emitted,
+        &window,
     );
 
-    // Report the verifier's resident KV, so a caller that sampled the verifier
-    // arch around this call can attribute the figure to it. This round loop
-    // never goes through `Architecture::generate_greedy`, so nothing else
-    // writes it.
-    verifier.store_kv_cache_bytes(
-        crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
-        crate::decode_loop::PostDecode::seal(),
-    );
-    Ok(emitted)
+    report_verifier_kv_bytes(verifier, &v_caches, Some(&v_lin));
+    Ok((emitted, widest_bs))
 }
 
 // ---------------------------------------------------------------------------

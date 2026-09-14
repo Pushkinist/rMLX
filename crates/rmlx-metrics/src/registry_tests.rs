@@ -52,6 +52,10 @@ fn every_spec_metric_present() {
         "accept_tokens_total",
         "draft_rounds_total",
         "accepted_per_step",
+        "tokens_per_round",
+        "draft_ms_per_round",
+        "verify_ms_per_round",
+        "loop_ms_per_round",
         // SSD-tier observability (step2).
         "ssd_bytes_used",
         "ssd_evict_total",
@@ -69,6 +73,8 @@ fn every_spec_metric_present() {
         // one per `rmlx eval ppl` scorer: the cacheless full-window forward and
         // the cache-bearing teacher-forced one do not measure the same thing.
         "ppl_wikitext2_cached",
+        // resident memory has two counters and they are not the same number
+        "peak_phys_footprint_mb",
     ];
     for name in spec_names {
         assert!(
@@ -77,7 +83,7 @@ fn every_spec_metric_present() {
         );
     }
     // METRICS row count — bump when adding new metric ops.
-    assert_eq!(METRICS.len(), 56, "METRICS should have exactly 56 rows");
+    assert_eq!(METRICS.len(), 61, "METRICS should have exactly 61 rows");
 }
 
 #[test]

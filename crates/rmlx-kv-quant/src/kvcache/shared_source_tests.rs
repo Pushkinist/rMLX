@@ -474,7 +474,9 @@ fn mixed_truncate_to_keeps_the_prefix_it_was_told_to_keep() {
     let keep = 27_i32;
 
     let mut truncated = mixed_cache_prefilled(prefix, device);
-    truncated.truncate_to(keep);
+    truncated
+        .truncate_to(keep)
+        .expect("a full-attention store rolls back to any prefix");
     assert_eq!(
         truncated.offset(),
         keep,

@@ -118,13 +118,123 @@ pub enum NotesVerdict {
     Silent,
 }
 
-/// The canonical `decode_config` for a drafter and block size.
+/// Drafters whose round loop chooses each round's block rather than taking the
+/// configured one, and the policy it chooses by.
 ///
-/// One definition of the format. `scripts/spec_bench.sh` writes the same string
-/// when it records a speculative arm, and `decode_config_format_is_stable` pins
-/// the spelling so the two cannot drift apart unnoticed.
-pub fn decode_config(draft_kind: &str, block_size: u32) -> String {
-    format!("{draft_kind}/block={block_size}")
+/// One declaration. `rmlx_models::speculative`'s per-loop accessor reads it,
+/// [`decode_config_from_notes`] reads it when recovering a row from free-form
+/// notes, `RunRecord::validate` refuses a record that contradicts it, and
+/// migration 008 rewrites the rows that predate it. A second copy in the engine
+/// would be the drift this column exists to prevent.
+///
+/// DFlash is here because it has always been adaptive: its production call site
+/// passes `prefer_requested = false`, and the only caller passing `true` is a
+/// unit test. There has never been a fixed-block DFlash arm to describe.
+pub const ADAPTIVE_DRAFTERS: &[(&str, &str)] = &[("dflash", "accept_rate")];
+
+/// The depth policy `draft_kind`'s round loop always runs under, if it always
+/// runs under one.
+pub fn inherent_depth_policy(draft_kind: &str) -> Option<&'static str> {
+    ADAPTIVE_DRAFTERS
+        .iter()
+        .find(|(kind, _)| *kind == draft_kind)
+        .map(|(_, policy)| *policy)
+}
+
+/// The corrected spelling of `value`, when it describes an adaptive drafter as
+/// though its block were fixed.
+///
+/// `None` when nothing needs correcting — which includes a malformed value,
+/// since this answers "is it stale", not "is it legal".
+///
+/// The correction **adds a term**; it never rebuilds the value from one of them.
+/// A `decode_config` carries every non-default setting a run moved, and the
+/// column already holds three-term values, so recomposing from the drafter term
+/// would drop the rest — into an append-only classification column via migration
+/// 008, and back at an operator as the spelling to use via `RunRecord::validate`.
+/// Every other term is carried through untouched and the result is re-checked
+/// against the grammar before it is offered.
+pub fn decode_config_with_inherent_depth(value: &str) -> Option<String> {
+    if !decode_config_is_well_formed(value) {
+        return None;
+    }
+    let terms: Vec<&str> = value.split(',').collect();
+    let mut missing: Vec<String> = Vec::new();
+    for term in &terms {
+        // `continue`, not `?`: a value whose first drafter term is fixed-block
+        // must still be examined for a later adaptive one.
+        let Some((key, block)) = term.split_once('=') else {
+            continue;
+        };
+        let Some(kind) = key.strip_suffix("/block") else {
+            continue;
+        };
+        let Some(policy) = inherent_depth_policy(kind) else {
+            continue;
+        };
+        if block.parse::<usize>().is_err() {
+            continue;
+        }
+        let depth_key = format!("{kind}/depth");
+        if terms
+            .iter()
+            .any(|t| t.split_once('=').is_some_and(|(k, _)| k == depth_key))
+        {
+            continue;
+        }
+        missing.push(format!("{depth_key}={policy}"));
+    }
+    if missing.is_empty() {
+        return None;
+    }
+
+    // Terms are ordered by key, so the additions are merged rather than
+    // appended.
+    let key_of = |term: &str| term.split_once('=').map_or(term, |(key, _)| key).to_owned();
+    let mut merged: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+    merged.extend(missing);
+    merged.sort_by_key(|term| key_of(term));
+    let corrected = merged.join(",");
+    decode_config_is_well_formed(&corrected).then_some(corrected)
+}
+
+/// The canonical `decode_config` for a speculative arm.
+///
+/// `block_size` is the block the run was *configured* with. `depth_policy`
+/// names how the round loop picks each round's block when it does not simply
+/// take that one — `None` for a loop that drafts a fixed block every round.
+///
+/// The policy is part of cell identity because the block is not observable
+/// from the configured ceiling once a loop moves off it: DFlash halves and
+/// grows its block from the recent accept rate, so an adaptive arm at ceiling
+/// 16 and a fixed arm at block 16 are different configurations that would
+/// otherwise rank against each other under one label.
+///
+/// Absence of the term is the fixed block **for a drafter that has one**. For a
+/// drafter in [`ADAPTIVE_DRAFTERS`] there is no such arm, so a bare
+/// `dflash/block=16` describes a configuration that never ran: migration 008
+/// rewrites the rows carrying it and `RunRecord::validate` refuses a new one.
+/// Rows for every other drafter keep the cell they have always been in.
+///
+/// This is the only place the **drafter** terms are written: the engine composes
+/// the string here and logs it on its `done` line, and `scripts/spec_bench.sh`
+/// records what the engine said rather than spelling it a second time. It is not
+/// the only composer of the *column* — `rmlx_models::kv_cache`'s boundary terms,
+/// `scripts/ingest/{perf_ab,codec_inertness}_ingest.py` and
+/// `scripts/prefill_chunk_sweep.sh` each build their own, sharing the values
+/// through `check-kv-boundary-default-parity` but not the format.
+///
+/// `block_size` is a `usize` so the value the engine holds reaches the term
+/// unchanged. A narrower parameter would put a conversion at every call site,
+/// and a conversion that truncates or saturates here files a run under a block
+/// nothing ran — in a table that cannot take it back out.
+pub fn decode_config(draft_kind: &str, block_size: usize, depth_policy: Option<&str>) -> String {
+    match depth_policy {
+        Some(policy) => {
+            format!("{draft_kind}/block={block_size},{draft_kind}/depth={policy}")
+        }
+        None => format!("{draft_kind}/block={block_size}"),
+    }
 }
 
 /// Whether `value` is a well-formed `decode_config` — see `docs/METRICS_DB.md`
@@ -171,6 +281,21 @@ pub fn decode_config_is_well_formed(value: &str) -> bool {
         previous_key = Some(key);
     }
     previous_key.is_some()
+}
+
+/// Whether `value` names a speculative arm.
+///
+/// The drafter terms are the ones a round loop composes through
+/// [`decode_config`], so the shape is a `<drafter>/block=<n>` term. A
+/// prefill-chunk sweep and a KV-boundary setting are `decode_config` values too
+/// and are not drafters; a reader looking for speculative rows keys on this
+/// rather than on "the column is not NULL".
+pub fn decode_config_names_a_drafter(value: &str) -> bool {
+    decode_config_is_well_formed(value)
+        && value.split(',').any(|term| {
+            term.split_once('=')
+                .is_some_and(|(key, _)| key.ends_with("/block"))
+        })
 }
 
 /// Whether every term of `value` spells a setting's own shipped default.
@@ -234,7 +359,7 @@ pub fn decode_config_from_notes(notes: &str) -> NotesVerdict {
     let block = note_value(notes, "block_size=");
     match (kind, block) {
         (Some(kind), Some(block)) if kind != "none" => {
-            match block.parse::<u32>() {
+            match block.parse::<usize>() {
                 // The drafter name is lifted verbatim out of free-form notes,
                 // so it can be anything a bench script wrote — `Eagle3`, a
                 // typo, a word with a space in it. Composing that into a
@@ -243,7 +368,12 @@ pub fn decode_config_from_notes(notes: &str) -> NotesVerdict {
                 // back out. A row whose notes do not compose to a legal
                 // configuration does not say what it was.
                 Ok(block) => {
-                    let config = decode_config(kind, block);
+                    // Notes record the configured block and nothing about how
+                    // the loop chose each round's — but for a drafter that has
+                    // always been adaptive the policy is not a free variable,
+                    // and spelling the row as fixed would file it under a
+                    // configuration that never ran.
+                    let config = decode_config(kind, block, inherent_depth_policy(kind));
                     if decode_config_is_well_formed(&config) {
                         NotesVerdict::Speculative(config)
                     } else {

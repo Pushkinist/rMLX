@@ -542,6 +542,99 @@ fn stochastic_acceptance_preserves_target_distribution() {
     );
 }
 
+/// A greedy proposal is a point mass, and Leviathan holds for it unchanged.
+///
+/// Nothing in the theorem asks the proposal to spread its mass: with
+/// `q = δ_x` the acceptance ratio is `min(1, p(x)/1) = p(x)` and the residual
+/// `normalize((p − δ_x)+)` is `p` with `x` removed, so the emitted marginal is
+/// `p` again. A drafter that only ever hands back its argmax therefore needs no
+/// draft distribution at all — which is why every sidecar loop can be made
+/// distributionally exact without one.
+///
+/// The same run measures the rule a loop can implement without a residual: draw
+/// the verifier's own token `t ~ p`, accept when it equals the proposal, emit it
+/// either way. Both the emitted distribution and the acceptance frequency have
+/// to agree with the point-mass rule, or the two are not the same law and only
+/// one of them can be shipped.
+#[test]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn a_point_mass_proposal_emits_the_target_and_matches_sample_and_match() {
+    let p = vec![0.45f32, 0.25, 0.2, 0.1];
+    // The proposal the drafter actually hands over. Deliberately not p's argmax
+    // for every draw, so the two rules are compared over a spread of proposals.
+    let proposer = vec![0.1f32, 0.2, 0.3, 0.4];
+    let trials = 200_000usize;
+
+    let mut rng = Pcg32::new(0xC0FFEE);
+    let mut point_mass_counts = [0usize; 4];
+    let mut point_mass_accepts = 0usize;
+    for _ in 0..trials {
+        let x = sample_index(&proposer, &mut rng) as u32;
+        let mut q = vec![0.0f32; p.len()];
+        q[x as usize] = 1.0;
+        let emitted = match stochastic_accept(&p, &q, x, &mut rng).unwrap() {
+            AcceptDecision::Accept => {
+                point_mass_accepts += 1;
+                x
+            }
+            AcceptDecision::Reject(corr) => corr,
+        };
+        point_mass_counts[emitted as usize] += 1;
+    }
+
+    let mut match_counts = [0usize; 4];
+    let mut match_accepts = 0usize;
+    for _ in 0..trials {
+        let x = sample_index(&proposer, &mut rng) as u32;
+        let t = sample_index(&p, &mut rng) as u32;
+        if t == x {
+            match_accepts += 1;
+        }
+        match_counts[t as usize] += 1;
+    }
+
+    let tvd = |counts: &[usize; 4]| {
+        let mut d = 0.0f64;
+        for i in 0..4 {
+            d += (counts[i] as f64 / trials as f64 - f64::from(p[i])).abs();
+        }
+        d * 0.5
+    };
+    assert!(
+        tvd(&point_mass_counts) < 0.01,
+        "point-mass proposal must still emit p: TVD={:.4} counts={point_mass_counts:?}",
+        tvd(&point_mass_counts)
+    );
+    assert!(
+        tvd(&match_counts) < 0.01,
+        "sample-and-match must emit p: TVD={:.4} counts={match_counts:?}",
+        tvd(&match_counts)
+    );
+
+    // Both rules accept with probability p(x) given the proposal x, so the
+    // frequencies agree up to sampling noise (SE ≈ 0.0011 at 200k trials).
+    let point_mass_rate = point_mass_accepts as f64 / trials as f64;
+    let match_rate = match_accepts as f64 / trials as f64;
+    let expected: f64 = (0..4)
+        .map(|i| f64::from(proposer[i]) * f64::from(p[i]))
+        .sum();
+    assert!(
+        (point_mass_rate - expected).abs() < 0.01,
+        "point-mass acceptance is E[p(x)]={expected:.4}, got {point_mass_rate:.4}"
+    );
+    assert!(
+        (match_rate - expected).abs() < 0.01,
+        "sample-and-match acceptance is E[p(x)]={expected:.4}, got {match_rate:.4}"
+    );
+}
+
 #[test]
 #[allow(
     clippy::indexing_slicing,

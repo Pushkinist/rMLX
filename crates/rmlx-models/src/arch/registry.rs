@@ -41,6 +41,20 @@ pub fn is_arch_supported(arch: &str) -> bool {
     KNOWN_ARCHS.contains(&arch)
 }
 
+/// Registered architectures that are not causal language models.
+///
+/// The registry admits them so the server can route them to their own
+/// endpoint; `load_model` refuses them and nothing that needs a decoder — a
+/// draft model, for one — can be built from them.
+const ENCODER_ARCHS: &[&str] = &["JinaEmbeddingsV4Model"];
+
+/// Returns `true` if `arch` is a registered architecture `load_model` can
+/// build into a generative `Architecture`.
+#[inline]
+pub fn is_generative_arch(arch: &str) -> bool {
+    is_arch_supported(arch) && !ENCODER_ARCHS.contains(&arch)
+}
+
 /// Declared arch strings that rMLX deliberately reports under a different,
 /// canonical class — an alias, not a mismatch.
 ///

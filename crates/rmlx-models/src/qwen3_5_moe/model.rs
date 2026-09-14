@@ -16,6 +16,7 @@
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
 
+use super::capture_tail::CaptureTail;
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{DecoderLayer, MlpBlock};
 use super::layers::{Embedding, Linear, RmsNorm};
@@ -242,6 +243,44 @@ impl Qwen3_5MoeText {
         match &self.lm_head {
             Some(lm) => lm.forward(&h_last, device),
             None => self.embed_tokens.as_linear(&h_last, device),
+        }
+    }
+
+    /// Full-sequence forward returning logits at **every** position, shape
+    /// `[1, seq, vocab_size]`. The offline PPL scorer reads the per-position
+    /// log-likelihood of the actual corpus token off this tensor.
+    ///
+    /// Both cache kinds are absent, which on this hybrid means two different
+    /// things: the FullAttention layers recompute K/V inside the window, and
+    /// the GatedDeltaNet layers start from a zero conv tail and zero delta
+    /// state. Together that scores the window as a fresh document, which is
+    /// what a sliding-window scorer needs and what the same call on the two
+    /// non-hybrid architectures already gives.
+    pub fn forward_seq_logits_all(&self, ids: &[u32], device: Device) -> Result<Array> {
+        let seq = ids.len();
+        if seq == 0 {
+            return Err(rmlx_core::error::Error::Model(
+                "forward_seq_logits_all: empty prompt".to_owned(),
+            ));
+        }
+        let seq_i32 = seq as i32;
+        let ids_i32: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
+        let ids_arr = Array::from_i32_slice(&ids_i32, &[seq_i32])?;
+
+        let h = self.embed_tokens.forward(&ids_arr, device)?;
+        let mut h = h.reshape(&[1, seq_i32, self.cfg.hidden_size as i32], device)?;
+        // No prebuilt mask. `pick_attn_mask_mode` answers "causal" for every
+        // `seq` once the offset is 0, so there is no array mask to share;
+        // `forward_arr` builds one because its offset is a runtime value, and
+        // here it is the literal 0.
+        for layer in &self.layers {
+            h = layer.forward(&h, 0, None, None, None, device)?;
+        }
+        let h = self.final_norm.forward(&h, device)?;
+
+        match &self.lm_head {
+            Some(lm) => lm.forward(&h, device),
+            None => self.embed_tokens.as_linear(&h, device),
         }
     }
 
@@ -577,7 +616,7 @@ impl Qwen3_5MoeText {
         let h_normed = self.final_norm.forward(&h, device)?;
         let h_last = h_normed.slice(&[0, seq - k, 0], &[1, seq, hidden], &[1, 1, 1], device)?;
         let h_last = h_last.reshape(&[1, k, hidden], device)?;
-        let logits = self.logits_from_hidden(&h_last, device)?;
+        let logits = self.logits_from_final_hidden(&h_last, device)?;
 
         // Concat captures in requested order.
         let mut ordered: Vec<&Array> = Vec::with_capacity(capture_layer_ids.len());
@@ -796,7 +835,7 @@ impl Qwen3_5MoeText {
         let h_last_norm =
             h_normed.slice(&[0, seq_i - 1, 0], &[1, seq_i, hidden], &[1, 1, 1], device)?;
         let h_last_norm = h_last_norm.reshape(&[1, 1, hidden], device)?;
-        let last_logits = self.logits_from_hidden(&h_last_norm, device)?;
+        let last_logits = self.logits_from_final_hidden(&h_last_norm, device)?;
 
         // Re-order aux captures and slice to [1, seq, H] each.
         let mut ordered: Vec<Array> = Vec::with_capacity(capture_layer_ids.len());
@@ -823,10 +862,18 @@ impl Qwen3_5MoeText {
     ///
     /// Splits the prompt into consecutive chunks of at most `chunk_size` tokens
     /// and runs each chunk through the verifier separately, accumulating the
-    /// KV/GDN caches normally. Concatenates the per-chunk `concat_hidden`
-    /// slices along the sequence axis to produce a single `[1, n, n_aux*hidden]`
-    /// tensor covering all prompt positions — identical to what a single-shot
-    /// `forward_verify_capture(..., k=n)` would return.
+    /// KV/GDN caches normally. The per-chunk `concat_hidden` slices are joined
+    /// along the sequence axis into one `[1, kept, n_aux*hidden]` tensor.
+    ///
+    /// `keep_last` is how many of the prompt's trailing capture rows the caller
+    /// will read: `None` for every one of them — what a single-shot
+    /// `forward_verify_capture(..., k=n)` returns — and `Some(k)` for a drafter
+    /// that conditions over a sliding window and can never read a row older than
+    /// it. A bounded caller's earlier chunks are released as the prefill walks
+    /// forward rather than held to the end of the prompt; what that bounds, and
+    /// to what, is [`CaptureTail`]'s to state. Each row is `n_aux * hidden`
+    /// wide, which reaches 50 KiB per prompt token on the published DFlash 2
+    /// pair.
     ///
     /// Unlike the single-shot path, logits are materialised only for the **last
     /// position of the last chunk** (shape `[1, 1, vocab]`), and the per-layer
@@ -841,7 +888,8 @@ impl Qwen3_5MoeText {
     /// Far below the 4-5 s Metal watchdog budget that a 4096-token single-shot
     /// would exceed (~2 GB logits alone).
     ///
-    /// Returns `(logits[1,1,vocab], concat_hidden[1,n,n_aux*hidden])`.
+    /// Returns `(logits[1,1,vocab], hidden[1,kept,n_aux*hidden])`, oldest kept
+    /// row first.
     ///
     /// When `ids.len() <= chunk_size` the entire prompt is a single chunk
     /// (no concatenation overhead).
@@ -857,6 +905,7 @@ impl Qwen3_5MoeText {
         kv_caches: &mut [KvCache],
         lin_caches: Option<&mut [LinearAttnCache]>,
         chunk_size: usize,
+        keep_last: Option<usize>,
         device: Device,
     ) -> Result<(Array, Array)> {
         let n = ids.len();
@@ -873,7 +922,7 @@ impl Qwen3_5MoeText {
 
         let chunk_size = chunk_size.max(1);
         let mut lin_opt: Option<&mut [LinearAttnCache]> = lin_caches;
-        let mut hidden_chunks: Vec<Array> = Vec::new();
+        let mut captured = CaptureTail::new(keep_last);
         let mut pos = 0usize;
 
         while pos < n {
@@ -881,8 +930,6 @@ impl Qwen3_5MoeText {
             let chunk = &ids[pos..end];
             let chunk_n = chunk.len();
             let is_last = end == n;
-
-            tracing::debug!(pos, end, chunk_n, is_last, "eagle3 prefill chunk");
 
             let (last_logits_opt, hidden_chunk) = if is_last {
                 // Final chunk: one pass — all aux hidden + last-position logits only.
@@ -910,16 +957,22 @@ impl Qwen3_5MoeText {
             // Materialise each chunk's GPU work before the next chunk so Metal
             // can reclaim intermediate buffers.
             hidden_chunk.eval()?;
-            hidden_chunks.push(hidden_chunk);
+            captured.push(hidden_chunk)?;
+
+            tracing::debug!(
+                pos,
+                end,
+                chunk_n,
+                is_last,
+                keep_last = ?keep_last,
+                held_rows_after_chunk = captured.retained_rows(),
+                "verify capture prefill chunk"
+            );
 
             if let Some(last_logits) = last_logits_opt {
-                let refs: Vec<&Array> = hidden_chunks.iter().collect();
-                let full_hidden = if refs.len() == 1 {
-                    refs[0].try_clone()?
-                } else {
-                    rmlx_mlx::concatenate(&refs, 1, device)?
-                };
-                return Ok((last_logits, full_hidden));
+                let (hidden, materialised_rows) = captured.finish(device)?;
+                tracing::debug!(n, keep_last = ?keep_last, materialised_rows, "verify capture joined");
+                return Ok((last_logits, hidden));
             }
 
             pos = end;
@@ -946,11 +999,24 @@ impl Qwen3_5MoeText {
         h.reshape(&[1, n as i32, self.cfg.hidden_size as i32], device)
     }
 
-    /// Re-derive logits from a hidden state via the LM head.
+    /// Apply the final RMSNorm to a pre-final-norm hidden. `[1, n, hidden]`
+    /// in/out.
+    pub fn apply_final_norm(&self, hidden: &Array, device: Device) -> Result<Array> {
+        self.final_norm.forward(hidden, device)
+    }
+
+    /// Re-derive logits from a hidden state the caller has already
+    /// final-normed, via the LM head.
     ///
     /// `hidden`: `[1, n, hidden]` → `[1, n, vocab]`. Uses the tied
     /// `embed_tokens.as_linear` when `lm_head` is absent (mirrors `forward_arr`).
-    pub fn logits_from_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
+    ///
+    /// The norm is not applied here and must not be: a speculative loop holds a
+    /// normed or a raw hidden depending on where in the verify pass it captured,
+    /// and [`Architecture::logits_from_hidden`] is the one that takes the raw
+    /// one. Naming which is which keeps a missing — or doubled — `final_norm`
+    /// from becoming a silent reweighting of the vocabulary.
+    pub fn logits_from_final_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
         match &self.lm_head {
             Some(lm) => lm.forward(hidden, device),
             None => self.embed_tokens.as_linear(hidden, device),

@@ -25,7 +25,7 @@ use rmlx_mlx::{
     add, concatenate, conv1d, exp, log1p, multiply, rms_norm, sigmoid, silu, Array, Device, Dtype,
 };
 
-use rmlx_kv_quant::LinearAttnCache;
+use rmlx_kv_quant::{GdnTapeSegment, LinearAttnCache};
 
 use super::layers::Linear;
 
@@ -280,6 +280,24 @@ impl GatedDeltaNet {
         // mlx-lm reference: `cache[1] = state` and
         // `cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])`.
         if let Some(c) = cache {
+            // A speculative round arms this so a partly-accepted round can be
+            // rolled back by refolding the accepted prefix through the kernel
+            // alone. Every array here was built above; recording them copies
+            // nothing. See `GdnTape`.
+            if let Some(tape) = c.tape.as_mut() {
+                tape.push(
+                    &state_in,
+                    GdnTapeSegment {
+                        q: q4_scaled_full.try_clone()?,
+                        k: k4_scaled_full.try_clone()?,
+                        v: v4.try_clone()?,
+                        g: g_f32.try_clone()?,
+                        beta: beta_full.try_clone()?,
+                        conv_input: qkv_padded.try_clone()?,
+                        len: ts,
+                    },
+                )?;
+            }
             c.delta_state = Some(state_out);
 
             // Save the last (kernel-1) tokens of qkv_padded as the new

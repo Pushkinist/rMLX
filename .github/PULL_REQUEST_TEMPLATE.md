@@ -8,6 +8,11 @@
 
 -
 
+## Removals
+
+<!-- What this change makes deletable: code, a gate, a flag, a doc section.
+     "Nothing" is a valid answer — write it down. -->
+
 ## Checklist
 
 - [ ] `make ci` green locally (fmt + clippy + test + deny + audit)

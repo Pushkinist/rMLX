@@ -1,76 +1,53 @@
 use super::*;
 
-/// Pure mirror of the deferred-greedy acceptance accounting (the on-device
-/// `walk_deferred_greedy` differs only by deriving `target` from logits).
-/// Locks the semantics: longest greedy-matching prefix + one
-/// correction/bonus, capped at `budget`.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-fn walk_logic(target: &[u32], draft: &[u32], budget: usize) -> (usize, Vec<u32>) {
-    let n_draft = draft.len();
-    let mut accepted = 0usize;
-    let mut new_tokens = Vec::new();
-    for pos in 0..=n_draft {
-        let token = target[pos];
-        if pos < n_draft && token == draft[pos] {
-            accepted += 1;
-            if new_tokens.len() < budget {
-                new_tokens.push(token);
-            }
-            continue;
-        }
-        if new_tokens.len() < budget {
-            new_tokens.push(token);
-        }
-        break;
-    }
-    (accepted, new_tokens)
-}
-
-#[test]
-fn walk_all_accepted_emits_bonus() {
-    let draft = [10, 11, 12];
-    let target = [10, 11, 12, 99]; // n_draft+1 verifier predictions
-    let (acc, emit) = walk_logic(&target, &draft, 8);
-    assert_eq!(acc, 3);
-    assert_eq!(emit, vec![10, 11, 12, 99]);
-}
-
-#[test]
-fn walk_partial_accept_emits_correction() {
-    let draft = [10, 11, 12];
-    let target = [10, 11, 55, 0]; // diverge at pos 2
-    let (acc, emit) = walk_logic(&target, &draft, 8);
-    assert_eq!(acc, 2);
-    assert_eq!(emit, vec![10, 11, 55]); // 2 accepted + correction
-}
-
-#[test]
-fn walk_zero_accept_emits_only_correction() {
-    let draft = [10, 11];
-    let target = [42, 0, 0];
-    let (acc, emit) = walk_logic(&target, &draft, 8);
-    assert_eq!(acc, 0);
-    assert_eq!(emit, vec![42]);
-}
-
-#[test]
-fn walk_respects_budget() {
-    let draft = [10, 11, 12];
-    let target = [10, 11, 12, 99];
-    let (acc, emit) = walk_logic(&target, &draft, 2);
-    assert_eq!(acc, 3);
-    assert_eq!(emit, vec![10, 11]); // capped at budget=2
-}
-
 /// Compile-check: the public MTP surface exists with the expected sigs.
 #[test]
 fn mtp_module_compiles() {
     // Reference the items so the symbols are checked at compile time
     // without spelling out their (clippy-flagged complex) fn types.
     let _load = MtpDrafter::load;
-    let _walk = walk_deferred_greedy;
-    let _ = (_load, _walk);
+    let _ = _load;
+}
+
+/// The sidecar's declared block is the depth it was trained at, and the loop
+/// runs the depth the request asks for whatever that declaration says.
+///
+/// Every shipped Qwen3.5-family sidecar declares `block_size: 3`, so a request
+/// clamped to the declaration could never run a deeper block on any checkpoint
+/// that exists. The declaration is passed in at every case here for that reason:
+/// a resolution that narrowed to it would read as correct against a `None`.
+#[test]
+fn a_request_deeper_than_the_declared_block_runs_at_the_request() {
+    for declared in [None, Some(2), Some(3), Some(8)] {
+        for requested in [4, 6, 8, 16] {
+            assert_eq!(
+                block_from_request(requested, declared),
+                requested,
+                "declared={declared:?} requested={requested}"
+            );
+        }
+    }
+}
+
+/// A request past what one verify forward can score is clamped to it.
+#[test]
+fn a_request_past_the_verify_ceiling_runs_at_the_ceiling() {
+    for declared in [None, Some(3), Some(MAX_BLOCK_SIZE)] {
+        assert_eq!(block_from_request(MAX_BLOCK_SIZE, declared), MAX_BLOCK_SIZE);
+        assert_eq!(
+            block_from_request(MAX_BLOCK_SIZE + 1, declared),
+            MAX_BLOCK_SIZE
+        );
+        assert_eq!(block_from_request(usize::MAX, declared), MAX_BLOCK_SIZE);
+    }
+}
+
+/// Below two there is a seed and no draft, so there is no round to run.
+#[test]
+fn a_request_below_two_runs_at_two() {
+    for declared in [None, Some(3), Some(8)] {
+        assert_eq!(block_from_request(0, declared), 2);
+        assert_eq!(block_from_request(1, declared), 2);
+        assert_eq!(block_from_request(2, declared), 2);
+    }
 }

@@ -43,7 +43,7 @@ use rmlx_kv_quant::{KvCache, LinearAttnCache};
 use rmlx_mlx::{argmax, Device};
 use rmlx_models::arch;
 use rmlx_models::kv_cache::DEFAULT_KV_QUANT;
-use rmlx_models::speculative::dflash::{dflash_generate_greedy, DFlashDrafter};
+use rmlx_models::speculative::dflash::{dflash_generate, DFlashDrafter};
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key)
@@ -69,7 +69,10 @@ fn dflash_round0_first_token_aligns() {
         env_path("RMLX_KV_TEST_MODEL"),
         env_path("RMLX_DRAFT_TEST_MODEL"),
     ) else {
-        eprintln!("[dflash_align] verifier/draft model unset/absent - skipping");
+        eprintln!(
+            "SKIP dflash_round0_first_token_aligns: RMLX_KV_TEST_MODEL and \
+             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
+        );
         return;
     };
     let device = Device::Gpu;
@@ -80,7 +83,7 @@ fn dflash_round0_first_token_aligns() {
         "DFlash verifier must be the Qwen3.5/3.6-MoE hybrid"
     );
     let hidden = verifier.hidden_size();
-    let mut drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
+    let drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
     let tlids = drafter.target_layer_ids().to_vec();
 
     let tk =
@@ -190,14 +193,17 @@ fn dflash_live_loop_emits_coherent() {
         env_path("RMLX_KV_TEST_MODEL"),
         env_path("RMLX_DRAFT_TEST_MODEL"),
     ) else {
-        eprintln!("[dflash_align] verifier/draft model unset/absent - skipping");
+        eprintln!(
+            "SKIP dflash_live_loop_emits_coherent: RMLX_KV_TEST_MODEL and \
+             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
+        );
         return;
     };
     let device = Device::Gpu;
     let verifier =
         arch::load_model(&model_path, device, &arch::LoadOpts::default()).expect("load verifier");
     let hidden = verifier.hidden_size();
-    let mut drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
+    let drafter = DFlashDrafter::load(&draft_path, hidden, device).expect("load drafter");
 
     let tk =
         tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json")).expect("tokenizer");
@@ -217,9 +223,9 @@ fn dflash_live_loop_emits_coherent() {
         .chain(std::iter::once(248046u32))
         .collect();
 
-    let steps = dflash_generate_greedy(
+    let (steps, _block) = dflash_generate(
         &verifier,
-        &mut drafter,
+        &drafter,
         &tk,
         &prompt_ids,
         48,
@@ -228,6 +234,14 @@ fn dflash_live_loop_emits_coherent() {
         None,
         &eos,
         &mut step_fn,
+        &rmlx_models::sampler::SamplerConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            seed: Some(0),
+            top_logprobs_k: 0,
+        },
         device,
     )
     .expect("dflash generate");

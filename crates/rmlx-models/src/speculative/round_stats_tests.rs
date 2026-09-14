@@ -1,0 +1,910 @@
+//! Round-stat derivation: the formulas, the emission accounting each loop has,
+//! and the cell every loop's rows land in.
+
+use super::{RoundStats, SpecLoop};
+
+/// What each loop emits before its round loop starts, as the loops themselves
+/// measure it: the sidecar paths argmax a bonus token out of the prefill
+/// forward, the two-model paths emit nothing until a round has run.
+///
+/// This is the fixture's model of the loops, not the engine's — the engine
+/// measures it. It exists so the two accountings are both exercised here.
+fn seed_of(loop_kind: SpecLoop) -> usize {
+    match loop_kind {
+        SpecLoop::MtpAssistant
+        | SpecLoop::MtpSidecar
+        | SpecLoop::DFlash
+        | SpecLoop::DFlash2
+        | SpecLoop::Eagle3 => 1,
+        SpecLoop::TwoModelGreedy | SpecLoop::TwoModelStochastic => 0,
+    }
+}
+
+/// A request as `loop_kind` would really have accounted it: 8 rounds at block
+/// 5, every round drafting 4 and the verifier accepting 12 of the 32, plus the
+/// seed token the loop emits outside its rounds.
+///
+/// The three timings are pairwise distinct multiples of the round count, so
+/// swapping any two of the three derivations fails rather than cancelling:
+/// 200 / 400 / 1200 ms give 25 / 50 / 75 ms per round.
+fn sample(loop_kind: SpecLoop) -> RoundStats {
+    let rounds = 8usize;
+    let total_accept = 12usize;
+    let seed_emitted = seed_of(loop_kind);
+    // One token under the emission budget, deliberately: an earlier revision
+    // inferred the seed drift from that inequality, and its fixtures were built
+    // to sit exactly at the budget — the only place it could fire. On real
+    // requests it fired on one of the four reachable loops.
+    let emitted_in_rounds = total_accept + rounds - 1;
+    RoundStats {
+        loop_kind,
+        block_size: 5,
+        rounds,
+        emitted: seed_emitted + emitted_in_rounds,
+        emitted_in_rounds,
+        seed_emitted,
+        conditioned_rows: None,
+        total_draft: 32,
+        total_accept,
+        prefill_ns: 500_000_000,
+        draft_ns: 200_000_000,
+        verifier_ns: 400_000_000,
+        round_loop_ns: 1_200_000_000,
+        elapsed_ns: 1_800_000_000,
+        charged: false,
+        decode_tps: Some(20.0),
+    }
+}
+
+#[test]
+#[allow(
+    clippy::float_cmp,
+    reason = "the derivation is the same division as the expectation, so the two \
+              are bit-identical and an epsilon band would hide a changed formula"
+)]
+fn derived_figures_are_the_documented_formulas() {
+    let stats = sample(SpecLoop::MtpSidecar);
+    assert_eq!(stats.emitted, 20, "1 seed + the 19 the rounds emitted");
+    assert_eq!(stats.accept_rate(), 12.0 / 32.0);
+    assert_eq!(stats.accepted_per_step(), 12.0 / 8.0);
+    // The seed token is not a round's product and does not reach the figure.
+    assert_eq!(stats.tokens_per_round(), 19.0 / 8.0);
+    assert_eq!(stats.draft_ms_per_round(), 200.0 / 8.0);
+    assert_eq!(stats.verify_ms_per_round(), 400.0 / 8.0);
+    // 1200 ms in the loop, 200 drafting, 400 verifying: 600 ms of loop over 8
+    // rounds. Prefill is outside the round loop and does not reach it.
+    assert_eq!(stats.loop_ms_per_round(), 600.0 / 8.0);
+}
+
+/// Each of the three per-round timings is a different number, so a swap of any
+/// two derivations changes an assertion rather than cancelling out.
+#[test]
+fn the_three_timings_are_pairwise_distinct() {
+    let stats = sample(SpecLoop::DFlash);
+    let figures = [
+        stats.draft_ms_per_round(),
+        stats.verify_ms_per_round(),
+        stats.loop_ms_per_round(),
+    ];
+    for (i, a) in figures.iter().enumerate() {
+        for b in figures.iter().skip(i + 1) {
+            assert!(
+                (a - b).abs() > 1.0,
+                "two per-round timings read {a} and {b}; a fixture that cannot tell \
+                 them apart cannot tell a swap of their derivations apart either"
+            );
+        }
+    }
+}
+
+/// The three spans partition the round loop, so the per-round figures sum back
+/// to it. A `loop_ms_per_round` derived from `elapsed` instead would carry the
+/// prefill and this would not hold.
+#[test]
+fn the_per_round_split_sums_back_to_the_round_loop() {
+    let stats = sample(SpecLoop::DFlash);
+    let summed =
+        (stats.draft_ms_per_round() + stats.verify_ms_per_round() + stats.loop_ms_per_round())
+            * stats.rounds as f64;
+    assert!(
+        (summed - 1200.0).abs() < 1e-9,
+        "per-round split sums to {summed} ms, round loop was 1200 ms"
+    );
+}
+
+/// A request that emitted its stop token before entering a round still closes,
+/// and every per-round figure is zero rather than NaN — a NaN would be refused
+/// at ingest and take the whole record with it.
+#[test]
+#[allow(
+    clippy::float_cmp,
+    reason = "the assertion is that the value is exactly zero rather than NaN or \
+              near-zero; a band would accept both of the values it rules out"
+)]
+fn a_request_with_no_round_derives_zeros_not_nan() {
+    let mut stats = sample(SpecLoop::Eagle3);
+    stats.rounds = 0;
+    stats.emitted = 1;
+    stats.total_draft = 0;
+    stats.total_accept = 0;
+    for value in [
+        stats.accept_rate(),
+        stats.accepted_per_step(),
+        stats.tokens_per_round(),
+        stats.draft_ms_per_round(),
+        stats.verify_ms_per_round(),
+        stats.loop_ms_per_round(),
+    ] {
+        assert_eq!(value, 0.0, "no round means no per-round figure");
+    }
+}
+
+// ── The emission accounting, per loop ────────────────────────────────────────
+
+/// The identity `1 + accept_rate * (block - 1)` recovers `tokens_per_round`
+/// while every round drafted the configured block — on **every** loop, which is
+/// the whole point of subtracting the seed token. Counting the seed makes it
+/// false on the four sidecar loops and true on the two-model ones, so a fixture
+/// that models only one accounting cannot see the difference.
+#[test]
+fn the_fixed_block_identity_holds_on_every_loop() {
+    for &loop_kind in SpecLoop::ALL {
+        // The identity describes a run whose every round emitted `accept + 1`;
+        // the sample is one token under that on purpose, so this case restores
+        // it rather than the sample being built to satisfy it.
+        let mut stats = sample(loop_kind);
+        stats.emitted_in_rounds = stats.total_accept + stats.rounds;
+        stats.emitted = stats.seed_emitted + stats.emitted_in_rounds;
+        assert_eq!(
+            stats.total_draft,
+            stats.rounds * (stats.block_size - 1),
+            "{loop_kind:?}: the sample must be a run that never resized its block"
+        );
+        let from_fixed_block = 1.0 + stats.accept_rate() * (stats.block_size as f64 - 1.0);
+        assert!(
+            (stats.tokens_per_round() - from_fixed_block).abs() < 1e-9,
+            "{loop_kind:?}: the identity gives {from_fixed_block}, the loop measured {}",
+            stats.tokens_per_round()
+        );
+    }
+}
+
+/// Two loops that ran the same rounds report the same figure whatever they
+/// emitted before them — which is the whole reason the seed is subtracted.
+#[test]
+fn what_a_loop_emitted_before_its_rounds_does_not_reach_the_figure() {
+    for &loop_kind in SpecLoop::ALL {
+        let stats = sample(loop_kind);
+        assert_eq!(stats.emitted - stats.round_emitted(), stats.seed_emitted);
+        assert_eq!(stats.round_emitted(), 19, "{loop_kind:?}");
+    }
+}
+
+/// The three counts must add up on every request, and this is the drift they
+/// exist to catch: a seed captured one line before the pre-round emission.
+///
+/// The point of counting at the emit site is that this fires **whatever the
+/// request looked like**. The predecessor inferred the drift from an
+/// emission-budget inequality, which only bites when a request's rounds exactly
+/// saturate `total_accept + rounds`; the sample here deliberately sits one token
+/// under that, where the old check was blind and three of the four reachable
+/// loops actually live.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion is that the drift is named; unwrapping the None case \
+              here is the failure the test exists to report"
+)]
+fn a_seed_taken_before_the_pre_round_emission_is_named_on_any_request() {
+    for &loop_kind in SpecLoop::ALL {
+        let sound = sample(loop_kind);
+        assert!(
+            sound.seed_violation().is_none(),
+            "{loop_kind:?} must be sound"
+        );
+        assert!(
+            sound.emitted_in_rounds < sound.total_accept + sound.rounds,
+            "{loop_kind:?}: the sample must sit under the emission budget, or this \
+             would not distinguish the equality from the inequality it replaced"
+        );
+
+        // A loop that emits nothing outside its rounds has no earlier line to
+        // take the seed from, which is why the two-model paths are exempt rather
+        // than untested.
+        if sound.seed_emitted == 0 {
+            continue;
+        }
+        let mut drifted = sample(loop_kind);
+        drifted.seed_emitted -= 1;
+        let reason = drifted.seed_violation().expect("must be named");
+        assert!(reason.contains("accounts for"), "{loop_kind:?}: {reason}");
+    }
+}
+
+/// Any disagreement between the three counts is named, not only the seed drift:
+/// a round loop that emitted more than it counted, or counted more than it
+/// emitted, is the same inconsistency from the other side.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion is that the inconsistency is named; unwrapping the \
+              None case here is the failure the test exists to report"
+)]
+fn any_disagreement_between_the_three_counts_is_named() {
+    let mut miscounted = sample(SpecLoop::DFlash);
+    miscounted.emitted_in_rounds += 1;
+    let reason = miscounted.seed_violation().expect("must be named");
+    assert!(reason.contains("accounts for"), "{reason}");
+
+    let mut over_budget = sample(SpecLoop::MtpSidecar);
+    over_budget.emitted_in_rounds = over_budget.total_accept + over_budget.rounds + 1;
+    over_budget.emitted = over_budget.seed_emitted + over_budget.emitted_in_rounds;
+    let reason = over_budget.seed_violation().expect("must be named");
+    assert!(reason.contains("could have produced"), "{reason}");
+}
+
+/// `ALL` and `index` are two halves of one list and the compiler holds both: a
+/// eighth variant does not compile until it has an index, and does not pass
+/// here until it is in `ALL` at that index.
+#[test]
+fn every_variant_is_in_all_once() {
+    for (position, &loop_kind) in SpecLoop::ALL.iter().enumerate() {
+        assert_eq!(loop_kind.index(), position, "{loop_kind:?}");
+    }
+    let mut indices: Vec<usize> = SpecLoop::ALL.iter().map(|k| k.index()).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    assert_eq!(
+        indices.len(),
+        SpecLoop::ALL.len(),
+        "two variants share an index"
+    );
+}
+
+/// Counting the seed token would read `+1/rounds` high, and the two loop
+/// families would stop being comparable. Stated as a number so a change back
+/// fails here.
+#[test]
+fn counting_the_seed_token_would_bias_the_sidecar_loops() {
+    let sidecar = sample(SpecLoop::MtpSidecar);
+    let two_model = sample(SpecLoop::TwoModelGreedy);
+    assert!(
+        (sidecar.tokens_per_round() - two_model.tokens_per_round()).abs() < 1e-9,
+        "two loops that produced the same rounds must report the same figure"
+    );
+    let naive = sidecar.emitted as f64 / sidecar.rounds as f64;
+    assert!(
+        (naive - sidecar.tokens_per_round() - 1.0 / sidecar.rounds as f64).abs() < 1e-9,
+        "the bias is exactly one token per round"
+    );
+}
+
+/// A loop that starts a phase timer before its round loop makes the residual
+/// negative. The value is left as it is — a clamp would hide it — and the
+/// violation is named so the field is identifiable before ingest refuses the
+/// whole record over a negative duration.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion is that the violation is named; unwrapping the None \
+              case here is the failure the test exists to report"
+)]
+fn a_phase_span_reaching_outside_the_round_loop_is_named() {
+    let mut stats = sample(SpecLoop::MtpSidecar);
+    assert!(stats.span_violation().is_none(), "the sample must be sound");
+
+    stats.draft_ns = 1_000_000_000;
+    let reason = stats.span_violation().expect("must be named");
+    assert!(reason.contains("outside the round loop"), "{reason}");
+    assert!(
+        stats.loop_ms_per_round() < 0.0,
+        "the residual must stay visible rather than be clamped"
+    );
+}
+
+// ── Identity of the loops ────────────────────────────────────────────────────
+
+#[test]
+fn every_loop_names_a_distinct_done_event() {
+    let mut seen: Vec<&str> = Vec::new();
+    for &loop_kind in SpecLoop::ALL {
+        let event = loop_kind.done_event();
+        assert!(!seen.contains(&event), "{event} is claimed by two loops");
+        assert!(
+            event.ends_with(": done"),
+            "{event} must end the request, and the log reader keys on that"
+        );
+        seen.push(event);
+    }
+}
+
+/// Every loop composes a `decode_config` the ingest gate accepts, and the
+/// adaptive loop's is a different cell from the fixed loops' at the same block.
+#[test]
+fn every_loop_composes_a_well_formed_cell() {
+    let mut adaptive: Vec<String> = Vec::new();
+    let mut fixed: Vec<String> = Vec::new();
+    for &loop_kind in SpecLoop::ALL {
+        let config = sample(loop_kind).decode_config();
+        assert!(
+            rmlx_metrics::cell::decode_config_is_well_formed(&config),
+            "{loop_kind:?} composed {config}"
+        );
+        assert!(
+            !rmlx_metrics::cell::decode_config_is_all_defaults(&config),
+            "{loop_kind:?} composed {config}, which says the engine was at its \
+             defaults — a drafter never is"
+        );
+        if loop_kind.depth_policy().is_some() {
+            adaptive.push(config);
+        } else {
+            fixed.push(config);
+        }
+    }
+    assert!(!adaptive.is_empty(), "no loop declares an adaptive block");
+    for a in &adaptive {
+        assert!(
+            !fixed.contains(a),
+            "{a} shares a cell with a fixed-block arm"
+        );
+    }
+}
+
+/// Every loop's depth policy, written down once per variant.
+///
+/// `every_loop_composes_a_well_formed_cell` only asserts the adaptive set is
+/// non-empty, which one existing loop satisfies forever. This table has an entry
+/// per variant and is checked against `SpecLoop::ALL`, so an eighth loop fails
+/// here until someone records what its block policy is — and is checked against
+/// `ADAPTIVE_DRAFTERS`, so the engine's match and the shared list cannot
+/// disagree about it.
+#[test]
+fn every_loop_is_classified_against_the_shared_list() {
+    let expected: &[(SpecLoop, Option<&str>)] = &[
+        (SpecLoop::MtpAssistant, None),
+        (SpecLoop::MtpSidecar, None),
+        (SpecLoop::DFlash, Some("accept_rate")),
+        (SpecLoop::DFlash2, None),
+        (SpecLoop::Eagle3, None),
+        (SpecLoop::TwoModelGreedy, None),
+        (SpecLoop::TwoModelStochastic, None),
+    ];
+    assert_eq!(
+        expected.len(),
+        SpecLoop::ALL.len(),
+        "a loop was added without recording whether its block is the configured one"
+    );
+    for &(loop_kind, want) in expected {
+        assert!(SpecLoop::ALL.contains(&loop_kind), "{loop_kind:?}");
+        assert_eq!(loop_kind.depth_policy(), want, "{loop_kind:?}");
+        assert_eq!(
+            loop_kind.depth_policy(),
+            rmlx_metrics::cell::inherent_depth_policy(loop_kind.draft_kind()),
+            "{loop_kind:?}: the loop's match and ADAPTIVE_DRAFTERS disagree"
+        );
+    }
+}
+
+/// Both MTP paths record as one drafter, and the two-model loops as one that is
+/// neither.
+#[test]
+fn loops_that_are_one_drafter_share_a_kind() {
+    assert_eq!(
+        SpecLoop::MtpAssistant.draft_kind(),
+        SpecLoop::MtpSidecar.draft_kind()
+    );
+    assert_eq!(
+        SpecLoop::TwoModelGreedy.draft_kind(),
+        SpecLoop::TwoModelStochastic.draft_kind()
+    );
+    assert_ne!(
+        SpecLoop::TwoModelGreedy.draft_kind(),
+        SpecLoop::MtpSidecar.draft_kind()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The charge switch
+// ---------------------------------------------------------------------------
+
+/// A subscriber that answers `enabled` from a fixed verdict and keeps every
+/// question it was asked.
+///
+/// Not a filter. It exists to record *what* [`phases_charged`] asks about,
+/// which is the part a mutation moves: a switch retargeted at another string,
+/// or lowered from `TRACE` to `DEBUG` — which would charge every `--log debug`
+/// run — changes the recorded question rather than the recorded answer, and a
+/// test that only checked the answer would stay green through both.
+pub(crate) struct AskRecorder {
+    verdict: bool,
+    asked: std::sync::Mutex<Vec<(String, tracing::Level)>>,
+}
+
+impl AskRecorder {
+    pub(crate) fn new(verdict: bool) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            verdict,
+            asked: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) fn questions(&self) -> Vec<(String, tracing::Level)> {
+        // A poisoned lock still holds the questions; this fixture has no
+        // invariant a panicking writer could have broken.
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl tracing::Subscriber for AskRecorder {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        // Installing a dispatcher rebuilds interest for every callsite already
+        // registered in the process, and the default implementation answers
+        // that by calling `enabled` on each — which would bury the one question
+        // this fixture exists to see under every callsite the rest of the test
+        // binary has touched. `sometimes` keeps `enabled` consulted per event,
+        // which is the only route `tracing::enabled!` takes anyway.
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((meta.target().to_owned(), *meta.level()));
+        self.verdict
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[test]
+fn the_charge_switch_asks_about_the_phase_target_at_trace() {
+    let rec = AskRecorder::new(true);
+    let charged =
+        tracing::subscriber::with_default(std::sync::Arc::clone(&rec), super::phases_charged);
+    assert!(
+        charged,
+        "a subscriber that enables everything must leave the phases charged"
+    );
+    let asked = rec.questions();
+    assert!(
+        !asked.is_empty(),
+        "the switch consulted no subscriber, so this test asserts nothing about it"
+    );
+    let want = (super::PHASE_TARGET.to_owned(), tracing::Level::TRACE);
+    // Every question, not their number: the macro is free to ask more than
+    // once, and pinning the count would pin its implementation rather than the
+    // switch's.
+    assert!(
+        asked.iter().all(|q| *q == want),
+        "the switch must ask about {} at TRACE and nothing else — at DEBUG it would \
+         charge every `--log debug` run, and on another target it would answer to a \
+         filter no documentation names. Asked: {asked:?}",
+        super::PHASE_TARGET
+    );
+}
+
+#[test]
+fn a_subscriber_that_declines_the_phase_target_leaves_the_phases_uncharged() {
+    let rec = AskRecorder::new(false);
+    let charged = tracing::subscriber::with_default(rec, super::phases_charged);
+    assert!(
+        !charged,
+        "the default schedule is the uncharged one: a filter that does not enable \
+         the phase target must not make the engine drain its pipeline per round"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The per-round phase split
+// ---------------------------------------------------------------------------
+
+fn phases(round_ns: u128, draft_ns: u128, verify_ns: u128) -> super::RoundPhases {
+    super::RoundPhases {
+        round_ns,
+        draft_ns,
+        verify_ns,
+        walk_ns: 1_000_000,
+        rollback_ns: 2_000_000,
+    }
+}
+
+#[test]
+fn the_unclaimed_round_time_is_what_no_phase_spent() {
+    let p = phases(50_000_000, 4_000_000, 40_000_000);
+    assert_eq!(p.unclaimed_ns(), Some(3_000_000));
+}
+
+#[test]
+fn phases_that_claim_more_than_the_round_are_not_reported_as_a_small_residual() {
+    // Five f64 milliseconds subtracted from each other would make this read as
+    // a near-zero negative, which is indistinguishable from rounding. The
+    // phases are sub-spans of the round, so this is a timer that escaped it.
+    let p = phases(40_000_000, 4_000_000, 40_000_000);
+    assert_eq!(
+        p.unclaimed_ns(),
+        None,
+        "an overrun must be a distinct answer, not a residual near zero"
+    );
+}
+
+#[test]
+fn a_round_with_one_phase_and_nothing_else_claims_all_of_it() {
+    let p = super::RoundPhases {
+        round_ns: 10_000_000,
+        draft_ns: 10_000_000,
+        verify_ns: 0,
+        walk_ns: 0,
+        rollback_ns: 0,
+    };
+    assert_eq!(p.unclaimed_ns(), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// What a charged round left behind
+// ---------------------------------------------------------------------------
+
+/// An array holding host data, and the unevaluated result of an op over it.
+///
+/// Everything here runs on the CPU device and forces nothing it does not mean
+/// to: the point of the fixture is an array that is deliberately still a graph
+/// node.
+#[allow(
+    clippy::expect_used,
+    reason = "an array the fixture could not build leaves the test asserting nothing, \
+              so failing here is the right report"
+)]
+fn forced_and_lazy() -> (rmlx_mlx::Array, rmlx_mlx::Array) {
+    let bytes = 1.0f32.to_le_bytes();
+    let seed = rmlx_mlx::Array::from_bytes(&bytes, &[1], rmlx_mlx::Dtype::F32)
+        .expect("Array::from_bytes failed");
+    let lazy = rmlx_mlx::add(&seed, &seed, rmlx_mlx::Device::Cpu).expect("add failed");
+    (seed, lazy)
+}
+
+/// A subscriber that keeps every event's target, level and rendered fields.
+struct EventLog {
+    events: std::sync::Mutex<Vec<(String, tracing::Level, String)>>,
+}
+
+impl EventLog {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            events: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<(String, tracing::Level, String)> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+struct Render(String);
+
+impl tracing::field::Visit for Render {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, " {}={value}", field.name());
+    }
+}
+
+impl tracing::Subscriber for EventLog {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut render = Render(String::new());
+        event.record(&mut render);
+        let meta = event.metadata();
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((meta.target().to_owned(), *meta.level(), render.0));
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Every round line the phase target carried during `f`, rendered field by
+/// field.
+///
+/// The round event is a DEBUG line and [`phase_errors`] reads ERROR alone, so
+/// nothing here saw the line the loops exist to write until this did.
+fn phase_rounds(f: impl FnOnce()) -> Vec<String> {
+    let log = EventLog::new();
+    tracing::subscriber::with_default(std::sync::Arc::clone(&log), f);
+    log.seen()
+        .into_iter()
+        .filter(|(target, level, _)| {
+            target == super::PHASE_TARGET && *level == tracing::Level::DEBUG
+        })
+        .map(|(_, _, fields)| fields)
+        .collect()
+}
+
+/// Every error the phase target carried during `f`.
+fn phase_errors(f: impl FnOnce()) -> Vec<String> {
+    let log = EventLog::new();
+    tracing::subscriber::with_default(std::sync::Arc::clone(&log), f);
+    log.seen()
+        .into_iter()
+        .filter(|(target, level, _)| {
+            target == super::PHASE_TARGET && *level == tracing::Level::ERROR
+        })
+        .map(|(_, _, fields)| fields)
+        .collect()
+}
+
+fn charged_round(charged: bool) -> super::RoundReport {
+    super::RoundReport {
+        loop_kind: SpecLoop::DFlash2,
+        round: 7,
+        accept: 3,
+        num_draft: 4,
+        n_committed: 4,
+        emitted_total: 29,
+        condition_rows: Some(31),
+        projected_rows: Some(4),
+        v_offset_before: 100,
+        v_target: 103,
+        d_offset_before: None,
+        d_target: None,
+        refolded: false,
+        charged,
+        phases: Some(super::RoundPhases {
+            round_ns: 10_000_000,
+            draft_ns: 4_000_000,
+            verify_ns: 4_000_000,
+            walk_ns: 1_000_000,
+            rollback_ns: 1_000_000,
+        }),
+    }
+}
+
+/// The predicate the whole guard rests on: it separates an array whose data is
+/// there from one whose is not, and names only the second.
+///
+/// A predicate that answered one way for everything would leave the guard
+/// either silent on every real defect or shouting on every clean round, and
+/// both end the same way — with it switched off.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "a forcing step that failed makes the second arm meaningless, so it \
+              must stop the test rather than be reported as a clean round"
+)]
+fn only_the_array_nobody_forced_is_named() {
+    let (forced, lazy) = forced_and_lazy();
+    assert_eq!(
+        super::unforced(&[("forced", &forced), ("lazy", &lazy)]),
+        vec!["lazy".to_owned()],
+        "the host-data array holds its data and the unevaluated sum does not"
+    );
+
+    lazy.eval().expect("eval failed");
+    assert!(
+        super::unforced(&[("forced", &forced), ("lazy", &lazy)]).is_empty(),
+        "once forced, neither array has work left for the next phase to pay for"
+    );
+}
+
+/// A charged round that leaves its conditioning unevaluated says so, and says
+/// which array and whose span will be charged for it.
+#[test]
+fn a_charged_round_that_left_its_carry_lazy_names_it() {
+    let (_, lazy) = forced_and_lazy();
+    let errors = phase_errors(|| {
+        super::log_round(&charged_round(true), &[("h_ctx", &lazy)]);
+    });
+    let [reason] = errors.as_slice() else {
+        panic!("exactly one report per round, got: {errors:?}");
+    };
+    assert!(
+        reason.contains("h_ctx"),
+        "the report must name the array a reader has to go and find: {reason}"
+    );
+    assert!(
+        reason.contains("drafter"),
+        "and whose span is charged for it, which is the finding: {reason}"
+    );
+}
+
+/// The same round with its carry forced reports nothing.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "if the forcing step failed the round did leave lazy work behind, and \
+              a silent pass here would read as the guard clearing it"
+)]
+fn a_charged_round_that_forced_its_carry_is_silent() {
+    let (_, lazy) = forced_and_lazy();
+    lazy.eval().expect("eval failed");
+    let errors = phase_errors(|| {
+        super::log_round(&charged_round(true), &[("h_ctx", &lazy)]);
+    });
+    assert!(
+        errors.is_empty(),
+        "a round that forced everything it carries has nothing to report: {errors:?}"
+    );
+}
+
+/// Uncharged, every phase leaves lazy work behind by design — that is what
+/// `charged=false` on the record means. Reporting it per round would put an
+/// error on every round of every ordinary run and train readers to skip it.
+#[test]
+fn an_uncharged_round_is_not_asked_where_its_work_went() {
+    let (_, lazy) = forced_and_lazy();
+    let errors = phase_errors(|| {
+        super::log_round(&charged_round(false), &[("h_ctx", &lazy)]);
+    });
+    assert!(
+        errors.is_empty(),
+        "the guard is a charged-run instrument, not a running commentary: {errors:?}"
+    );
+}
+
+/// A recorder used to capture a per-round stream must decline **both**
+/// behaviour-changing switches, and be asked about both.
+///
+/// `phases_charged` is not the only one. EAGLE-3's round loop gates a
+/// per-position trace block on its own target, and a subscriber that enables
+/// everything turns that on too — so a stream captured under it is not the
+/// stream the loop emits by default, and the run it was taken from is a
+/// different, slower run. Asserting the *questions* and not just the answers is
+/// what catches a switch retargeted at another string or lowered to `DEBUG`.
+#[test]
+fn a_capture_recorder_declines_both_behaviour_switches_and_is_asked_about_both() {
+    let rec = AskRecorder::new(false);
+    let (charged, stepping) =
+        tracing::subscriber::with_default(std::sync::Arc::clone(&rec), || {
+            (
+                super::phases_charged(),
+                crate::speculative::eagle3::step_trace_enabled(),
+            )
+        });
+    assert!(
+        !charged,
+        "a declining subscriber must leave the phases uncharged"
+    );
+    assert!(
+        !stepping,
+        "a declining subscriber must leave the per-position step trace off"
+    );
+    let asked = rec.questions();
+    let want_phase = (super::PHASE_TARGET.to_owned(), tracing::Level::TRACE);
+    let want_step = (
+        crate::speculative::eagle3::STEP_TARGET.to_owned(),
+        tracing::Level::TRACE,
+    );
+    assert!(
+        asked.contains(&want_phase),
+        "the phase switch was never asked about: {asked:?}"
+    );
+    assert!(
+        asked.contains(&want_step),
+        "the step-trace switch was never asked about: {asked:?}"
+    );
+    // Nothing else: a third switch appearing here is a third thing a capture
+    // run would have to decline, and it must be declared rather than discovered.
+    assert!(
+        asked.iter().all(|q| *q == want_phase || *q == want_step),
+        "an unexpected switch was consulted: {asked:?}"
+    );
+}
+
+/// A loop reports every figure it has, and the shared record leaves out the
+/// ones it does not — absent from the line, not present as a zero or a `None`.
+///
+/// The union is what makes one event able to replace seven, and the absence is
+/// what makes the union cost nothing to a loop that has no drafter cache. Both
+/// rest on `tracing`'s `Option` impl recording nothing for `None`, which is a
+/// dependency's behaviour and was pinned nowhere.
+///
+/// Mutation: emit any `Option` field as `.unwrap_or(-1)`. The field then appears
+/// on a loop that does not have it and the second half of this fails.
+#[test]
+fn a_round_line_carries_what_the_loop_has_and_omits_what_it_does_not() {
+    let [line] = phase_rounds(|| super::log_round(&charged_round(false), &[]))
+        .try_into()
+        .unwrap_or_else(|lines: Vec<String>| {
+            panic!("exactly one round line per round, got: {lines:?}")
+        });
+    for name in [
+        "loop_kind=",
+        "round=",
+        "accept=",
+        "num_draft=",
+        "n_committed=",
+        "emitted_total=",
+        "condition_rows=",
+        "projected_rows=",
+        "v_offset_before=",
+        "v_target=",
+        "refolded=",
+        "charged=",
+        "round_ms=",
+        "draft_ms=",
+        "verify_ms=",
+        "walk_ms=",
+        "rollback_ms=",
+        "other_ms=",
+    ] {
+        assert!(
+            line.contains(name),
+            "the round carries {name} and the line does not: {line}"
+        );
+    }
+    for name in ["d_offset_before=", "d_target="] {
+        assert!(
+            !line.contains(name),
+            "this loop's drafter keeps no cache, so {name} is absent rather than \
+             reported as a zero: {line}"
+        );
+    }
+}
+
+/// A round whose phases claim more time than the round has is still one round
+/// line, and the overrun is reported beside it.
+///
+/// A reader following one loop's stream counts rounds; dropping the line over a
+/// broken timer takes the whole round out of that count, and the round's own
+/// figures — what it accepted, what it committed, where it rolled back to — are
+/// not the thing that broke.
+///
+/// Mutation: return early from `log_round` when the phases do not partition the
+/// round, which is what the per-loop emitter used to do. The first assertion
+/// then finds no line at all.
+#[test]
+fn a_round_whose_phases_overrun_is_still_reported_once() {
+    let mut report = charged_round(false);
+    report.phases = Some(super::RoundPhases {
+        round_ns: 1_000_000,
+        draft_ns: 4_000_000,
+        verify_ns: 4_000_000,
+        walk_ns: 1_000_000,
+        rollback_ns: 1_000_000,
+    });
+
+    let rounds = phase_rounds(|| super::log_round(&report, &[]));
+    let [line] = rounds.as_slice() else {
+        panic!("a broken timer must not cost the round its line, got: {rounds:?}")
+    };
+    assert!(
+        !line.contains("other_ms="),
+        "no phase-free remainder exists to report: {line}"
+    );
+
+    let errors = phase_errors(|| super::log_round(&report, &[]));
+    let [reason] = errors.as_slice() else {
+        panic!("exactly one overrun report per round, got: {errors:?}")
+    };
+    assert!(
+        reason.contains("draft_ms=") && reason.contains("rollback_ms="),
+        "the overrun names the phases as fields a reader can search, not as one \
+         rendered struct: {reason}"
+    );
+}

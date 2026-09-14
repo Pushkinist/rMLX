@@ -12,6 +12,8 @@
 //! # Public API
 //!
 //! - [`LinearAttnCache`] — the recurrent state holder.
+//! - [`GdnTape`] / [`GdnTapeSegment`] — the round tape a speculative loop arms
+//!   so a partly-accepted round can be rolled back without a second forward.
 //!
 //! # See also
 //!
@@ -54,6 +56,9 @@ pub struct LinearAttnCache {
     /// `None` until the first prefill call, in which case the layer starts at
     /// zero.
     pub delta_state: Option<Array>,
+    /// The recurrence inputs of the forwards taken since [`LinearAttnCache::arm_tape`],
+    /// or `None` when nothing is recording. See [`GdnTape`].
+    pub tape: Option<GdnTape>,
 }
 
 impl LinearAttnCache {
@@ -62,6 +67,7 @@ impl LinearAttnCache {
         Self {
             conv_state: None,
             delta_state: None,
+            tape: None,
         }
     }
 
@@ -69,46 +75,22 @@ impl LinearAttnCache {
     pub fn reset(&mut self) {
         self.conv_state = None;
         self.delta_state = None;
+        self.tape = None;
     }
 
-    /// Conceptual "truncate to sequence position N" — NOT implementable by slicing.
+    /// Start recording a round tape, discarding any the previous round left.
     ///
-    /// # Why truncate_to cannot work for LinearAttnCache
-    ///
-    /// `KvCache::truncate_to(n)` works because K/V tensors have an explicit
-    /// sequence axis: positions `[0..n]` are simply sliced off and returned.
-    ///
-    /// `LinearAttnCache` has **no sequence axis**: `conv_state` and `delta_state`
-    /// are the *compressed* recurrent state at the end of the most recent call.
-    /// There is no way to recover the state at an earlier position `n` by slicing —
-    /// the recurrence has consumed and discarded the intermediate states.
-    ///
-    /// The correct rollback mechanism is [`snapshot`] + [`restore_snapshot`]:
-    /// take a deep clone of the state before the speculative draft round, then
-    /// call `restore_snapshot` on partial rejection.
-    ///
-    /// This method exists so that callers can discover the semantic gap at
-    /// compile time. It panics unconditionally. Do NOT call it on a live cache.
-    ///
-    /// # L36 context
-    ///
-    /// The spec decoder must call `snapshot()` before each draft round and
-    /// `restore_snapshot()` on partial acceptance. See
-    /// `docs/research/L36-spec-decoding-design.md` §1.3.
-    #[allow(dead_code)]
-    #[allow(
-        clippy::panic,
-        reason = "LinearAttnCache::truncate_to is structurally non-implementable: the GDN \
-                  recurrent state has no sequence axis to truncate. Any caller must use \
-                  snapshot()/restore_snapshot() instead; this panic surfaces misuse at \
-                  call sites that have not yet been ported."
-    )]
-    pub fn truncate_to(&self, _n: i32) {
-        panic!(
-            "LinearAttnCache::truncate_to is not implementable: GDN recurrent state has no \
-             sequence axis. Use snapshot() + restore_snapshot() for speculative decoding rollback. \
-             See docs/research/L36-spec-decoding-design.md §1.3."
-        );
+    /// While a tape is armed every GDN forward through this cache appends its
+    /// recurrence inputs to it, which is what makes [`GdnTape`] able to rebuild
+    /// the state at an interior position. Arm it once per speculative round,
+    /// before the forwards that round takes.
+    pub fn arm_tape(&mut self) {
+        self.tape = Some(GdnTape::new());
+    }
+
+    /// Stop recording and hand back what was recorded, if anything.
+    pub fn take_tape(&mut self) -> Option<GdnTape> {
+        self.tape.take()
     }
 
     /// Resident RAM held by this recurrent state, in bytes.
@@ -120,7 +102,11 @@ impl LinearAttnCache {
     /// as the attention caches, and a hard-coded item size is how such a sum
     /// silently drifts away from the memory it claims to measure.
     ///
-    /// Returns 0 if neither field has been populated yet.
+    /// Returns 0 if neither state has been populated yet.
+    ///
+    /// An armed [`GdnTape`] counts: it holds real buffers for as long as a
+    /// speculative round is open, and a total that ignored them would read low
+    /// for exactly the rounds that allocate the most.
     ///
     /// The exhaustive destructure is the drift guard: a new buffer cannot be
     /// added to this struct without this failing to compile.
@@ -128,38 +114,11 @@ impl LinearAttnCache {
         let Self {
             conv_state,
             delta_state,
+            tape,
         } = self;
         crate::bytes::opt_array_bytes(conv_state.as_ref())
             + crate::bytes::opt_array_bytes(delta_state.as_ref())
-    }
-
-    /// Snapshot the recurrent state at the start of a speculative round.
-    ///
-    /// Returns a deep clone of both `conv_state` and `delta_state` as they
-    /// stand at the current end-of-sequence position. The caller must store
-    /// this snapshot and call `restore_snapshot` if the spec round is partially
-    /// rejected.
-    ///
-    /// # M23 / L36 design note
-    ///
-    /// `LinearAttnCache` holds fixed-shape recurrent state, not per-position
-    /// tensors. There is no sequence-position axis to slice into — state at
-    /// position N is produced by running the GDN recurrence from 0 to N.
-    ///
-    /// dflash's `RecurrentRollbackCache` solves this by recording a QKV/K/G
-    /// *tape* during the spec draft round and then replaying the recurrence
-    /// forward from the pre-round snapshot via a Metal `tape_replay_kernel`.
-    /// Porting that approach to rMLX requires (a) making the GDN kernel
-    /// callable from inside `LinearAttnCache` and (b) plumbing tape recording
-    /// through the decode hot path — both are multi-day L36 work.
-    ///
-    /// For now (M23 audit result), spec decoding on Qwen3.5MoE GDN layers is
-    /// deferred. Gemma4 (which has NO GDN layers) uses `KvCache::truncate_to`
-    /// for spec rollback and is unaffected by this gap. This `snapshot` /
-    /// `restore_snapshot` pair is the correct future interface; it will be
-    /// wired through the speculative decoder in L36.
-    pub fn snapshot(&self) -> Result<Self> {
-        self.try_deep_clone()
+            + tape.as_ref().map_or(0, GdnTape::resident_bytes)
     }
 
     /// Materialize this cache's GPU `Array` buffers on the calling (inference)
@@ -175,16 +134,10 @@ impl LinearAttnCache {
         Ok(())
     }
 
-    /// Restore previously snapshotted recurrent state (see [`snapshot`]).
-    ///
-    /// Replaces both `conv_state` and `delta_state` with the values from
-    /// `snap`. The snapshot is consumed.
-    pub fn restore_snapshot(&mut self, snap: Self) {
-        self.conv_state = snap.conv_state;
-        self.delta_state = snap.delta_state;
-    }
-
     /// Deep clone of the recurrent state (used by prompt cache).
+    ///
+    /// The clone carries no tape: a tape describes one speculative round of one
+    /// live cache, and a stored prompt-cache entry is neither.
     pub fn try_deep_clone(&self) -> Result<Self> {
         Ok(Self {
             conv_state: match &self.conv_state {
@@ -195,11 +148,147 @@ impl LinearAttnCache {
                 Some(a) => Some(a.try_clone()?),
                 None => None,
             },
+            tape: None,
         })
     }
 }
 
 impl Default for LinearAttnCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// -- GdnTape (speculative-round rollback) ------------------------------------
+
+/// One GDN forward's recurrence inputs, in the shapes the recurrence kernel
+/// takes them.
+///
+/// Every field is a handle on an array the forward had already built, so
+/// recording a segment copies nothing.
+#[allow(
+    clippy::exhaustive_structs,
+    reason = "internal closed record - the fields are exactly the recurrence kernel's inputs; adding one means the kernel takes another argument"
+)]
+#[allow(missing_debug_implementations)]
+pub struct GdnTapeSegment {
+    /// `[B, T, Hk, Dk]` - query, normalised and scaled.
+    pub q: Array,
+    /// `[B, T, Hk, Dk]` - key, normalised and scaled.
+    pub k: Array,
+    /// `[B, T, Hv, Dv]` - value.
+    pub v: Array,
+    /// `[B, T, Hv]` f32 - the per-position decay.
+    pub g: Array,
+    /// `[B, T, Hv]` - the per-position update weight.
+    pub beta: Array,
+    /// `[B, kernel - 1 + T, conv_dim]` - the depthwise-conv1d input this call
+    /// ran over, the tail carried in from the previous call included.
+    pub conv_input: Array,
+    /// Positions this call consumed: `T`.
+    pub len: usize,
+}
+
+impl GdnTapeSegment {
+    /// Resident RAM this segment's handles keep alive, in bytes.
+    ///
+    /// The exhaustive destructure is the drift guard, as in
+    /// [`LinearAttnCache::resident_bytes`].
+    pub fn resident_bytes(&self) -> u64 {
+        let Self {
+            q,
+            k,
+            v,
+            g,
+            beta,
+            conv_input,
+            len: _,
+        } = self;
+        [q, k, v, g, beta, conv_input]
+            .into_iter()
+            .map(crate::bytes::array_bytes)
+            .sum()
+    }
+}
+
+/// The recurrence inputs of every GDN forward a speculative round took, plus
+/// the state the round started from.
+///
+/// # Why a tape rather than a snapshot
+///
+/// The recurrent state has no sequence axis, so a partly-accepted round cannot
+/// slice it back to the accepted position the way a K/V cache is truncated. The
+/// rollback used to restore a pre-round snapshot and re-run the accepted prefix
+/// through the whole layer stack - a second full read of the model's weights,
+/// paid on every partial round.
+///
+/// The inputs the recurrence consumes are causal and per-position: the value
+/// the forward computed at position `i` does not depend on any position after
+/// it, so the ones a shorter forward would have produced are exactly the ones
+/// this forward already produced. Keeping them lets the accepted prefix be
+/// re-folded by the recurrence kernel alone, reading no weights at all.
+///
+/// # Accumulating across forwards
+///
+/// A round is not always one forward. A two-model loop's drafter takes one
+/// forward per drafted token and rolls back across the lot of them, so segments
+/// accumulate in call order and the prefix to refold may span several. The
+/// pre-round state is recorded once, at the first segment.
+#[allow(missing_debug_implementations)]
+pub struct GdnTape {
+    state_in: Option<Array>,
+    segments: Vec<GdnTapeSegment>,
+}
+
+impl GdnTape {
+    /// An armed, empty tape.
+    pub fn new() -> Self {
+        Self {
+            state_in: None,
+            segments: Vec::new(),
+        }
+    }
+
+    /// Record one forward's recurrence inputs.
+    ///
+    /// `state_in` is the recurrent state that forward started from; it is kept
+    /// from the first call only, because that is the state the round started
+    /// from and every later segment starts where its predecessor ended.
+    pub fn push(&mut self, state_in: &Array, segment: GdnTapeSegment) -> Result<()> {
+        if self.state_in.is_none() {
+            self.state_in = Some(state_in.try_clone()?);
+        }
+        self.segments.push(segment);
+        Ok(())
+    }
+
+    /// Positions recorded, over every segment.
+    pub fn positions(&self) -> usize {
+        self.segments.iter().map(|s| s.len).sum()
+    }
+
+    /// The recurrent state the round started from, or `None` on an empty tape.
+    pub fn state_in(&self) -> Option<&Array> {
+        self.state_in.as_ref()
+    }
+
+    /// The recorded forwards, in the order they ran.
+    pub fn segments(&self) -> &[GdnTapeSegment] {
+        &self.segments
+    }
+
+    /// Resident RAM this tape keeps alive, in bytes.
+    pub fn resident_bytes(&self) -> u64 {
+        crate::bytes::opt_array_bytes(self.state_in.as_ref())
+            + self
+                .segments
+                .iter()
+                .map(GdnTapeSegment::resident_bytes)
+                .sum::<u64>()
+    }
+}
+
+impl Default for GdnTape {
     fn default() -> Self {
         Self::new()
     }

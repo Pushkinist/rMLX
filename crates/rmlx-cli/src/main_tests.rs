@@ -22,7 +22,114 @@ fn default_env_filter_does_not_contain_debug() {
     );
 }
 
+/// The verbose preset must not raise the *global* default level.
+///
+/// A bare `trace` there puts every dependency's trace events in the log and
+/// satisfies engine-side `tracing::enabled!(target: ...)` checks that were
+/// written to be opt-in by target — the speculative round loops' phase-charging
+/// switch is one, and satisfying it changes how the engine schedules work. The
+/// preset's own doc comment has always said "trace on rmlx crates"; this pins
+/// the string to it.
+#[test]
+fn verbose_env_filter_leaves_the_global_default_at_info() {
+    let filter_str = LogLevel::Verbose.env_filter();
+    assert!(
+        filter_str.starts_with("info,"),
+        "verbose EnvFilter must leave the global default at info and raise only \
+         the rmlx crates, got: {filter_str:?}"
+    );
+}
+
 // ── clap parse-time validation ───────────────────────────────────
+
+/// `--draft-model` stands alone: the drafter kind is read from the snapshot.
+/// A `requires = "draft_kind"` here is what made the two-model loop
+/// unreachable from the command line.
+#[test]
+fn draft_model_parses_without_draft_kind() {
+    let r = Cli::try_parse_from([
+        "rmlx",
+        "serve",
+        "--model",
+        "/tmp/m",
+        "--draft-model",
+        "/tmp/d",
+    ]);
+    assert!(
+        r.is_ok(),
+        "--draft-model alone must parse, got: {:?}",
+        r.err()
+    );
+}
+
+/// `--draft-kind` without a draft is meaningless and stays refused.
+#[test]
+fn draft_kind_requires_draft_model() {
+    let r = Cli::try_parse_from(["rmlx", "serve", "--model", "/tmp/m", "--draft-kind", "mtp"]);
+    let msg = r.err().map_or_else(String::new, |e| e.to_string());
+    assert!(
+        msg.contains("--draft-model"),
+        "--draft-kind without --draft-model must be refused naming the missing flag, got: {msg}"
+    );
+}
+
+/// A block with no room for a draft token is refused at parse time, naming the
+/// floor — not after both models have loaded, on the first request.
+#[test]
+fn draft_block_size_below_the_floor_is_refused_at_parse_time() {
+    for bad in ["0", "1"] {
+        let r = Cli::try_parse_from([
+            "rmlx",
+            "serve",
+            "--model",
+            "/tmp/m",
+            "--draft-model",
+            "/tmp/d",
+            "--draft-block-size",
+            bad,
+        ]);
+        let msg = r.err().map_or_else(String::new, |e| e.to_string());
+        assert!(
+            msg.contains(&format!("at least {}", rmlx_server::MIN_DRAFT_BLOCK_SIZE)),
+            "--draft-block-size {bad} must be refused naming the floor, got: {msg}"
+        );
+    }
+    let floor = rmlx_server::MIN_DRAFT_BLOCK_SIZE.to_string();
+    let r = Cli::try_parse_from([
+        "rmlx",
+        "serve",
+        "--model",
+        "/tmp/m",
+        "--draft-model",
+        "/tmp/d",
+        "--draft-block-size",
+        &floor,
+    ]);
+    assert!(r.is_ok(), "the floor itself must parse, got: {:?}", r.err());
+}
+
+/// Every kind the engine ships is a value the flag accepts, spelled as the
+/// engine spells it in its logs and metrics.
+#[test]
+fn every_draft_kind_is_a_flag_value() {
+    for &kind in rmlx_models::DraftKind::ALL {
+        let r = Cli::try_parse_from([
+            "rmlx",
+            "serve",
+            "--model",
+            "/tmp/m",
+            "--draft-model",
+            "/tmp/d",
+            "--draft-kind",
+            kind.as_str(),
+        ]);
+        assert!(
+            r.is_ok(),
+            "--draft-kind {kind} must parse, got: {:?}",
+            r.err()
+        );
+    }
+}
 
 use super::Cli;
 use clap::Parser;
@@ -178,5 +285,51 @@ fn kv_quant_none_matches_predicate() {
     assert!(
         !matches!(KvQuant::Planar, KvQuant::None),
         "KvQuant::Planar must NOT match the paged-kv rejection predicate"
+    );
+}
+
+/// A block wider than one verify forward can score is refused at parse time,
+/// naming the ceiling — not clamped.
+///
+/// An operator who asked for 4096 and was quietly served 1024 would read the
+/// round's figures as belonging to the block they named. The round loops clamp
+/// as well, and that clamp is their guard against a caller that is not this one.
+#[test]
+fn draft_block_size_above_the_ceiling_is_refused_at_parse_time() {
+    const CEILING: usize = rmlx_models::speculative::MAX_BLOCK_SIZE;
+    for bad in [CEILING + 1, 4096] {
+        let bad = bad.to_string();
+        let r = Cli::try_parse_from([
+            "rmlx",
+            "serve",
+            "--model",
+            "/tmp/m",
+            "--draft-model",
+            "/tmp/d",
+            "--draft-block-size",
+            &bad,
+        ]);
+        let msg = r.err().map_or_else(String::new, |e| e.to_string());
+        assert!(
+            msg.contains("more positions than one verify forward can score")
+                && msg.contains(&format!("max {CEILING}")),
+            "--draft-block-size {bad} must be refused naming the ceiling, got: {msg}"
+        );
+    }
+    let ceiling = CEILING.to_string();
+    let r = Cli::try_parse_from([
+        "rmlx",
+        "serve",
+        "--model",
+        "/tmp/m",
+        "--draft-model",
+        "/tmp/d",
+        "--draft-block-size",
+        &ceiling,
+    ]);
+    assert!(
+        r.is_ok(),
+        "the ceiling itself must parse, got: {:?}",
+        r.err()
     );
 }

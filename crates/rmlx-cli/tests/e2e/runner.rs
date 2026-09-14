@@ -78,10 +78,11 @@ pub struct Case {
     #[serde(default)]
     pub ctv: Option<String>,
     /// Speculative-decoding drafter spec (path/slug/alias, resolved like
-    /// `model`). Pairs with `draft_kind`. Used by the `spec_decode` assert.
+    /// `model`). Used by the `spec_decode` assert.
     #[serde(default)]
     pub draft_model: Option<String>,
-    /// Drafter architecture family for `--draft-kind` (`mtp` | `dflash` | `eagle3`).
+    /// `--draft-kind` value, when the case wants to pass the flag; absent, the
+    /// engine reads the kind off the drafter's config.json.
     #[serde(default)]
     pub draft_kind: Option<String>,
     pub assert: Assert,
@@ -1006,7 +1007,7 @@ fn run_serve_case(
 
     // Speculative decoding owns a verbose-logging serve with the drafter flags
     // (`--draft-model`/`--draft-kind`) so it can scrape the round-loop's
-    // `<kind>_generate_greedy: done` accept_rate from the run jsonl. Hand off
+    // `<kind>_generate: done` accept_rate from the run jsonl. Hand off
     // before the shared spawn (which pins no draft model and RUST_LOG=warn).
     if kind == "spec_decode" {
         return assert_spec_decode(case, model, &id, port, mk);
@@ -2705,7 +2706,7 @@ fn assert_tool_call(
 /// Serves the verifier (`model`) with a real drafter (`--draft-model` resolved
 /// from `case.draft_model`, `--draft-kind` from `case.draft_kind`) under verbose
 /// logging, drives one generation, and scrapes the round-loop summary
-/// (`<kind>_generate_greedy: done`) from the run jsonl. PASS = the round-loop
+/// (`<kind>_generate: done`) from the run jsonl. PASS = the round-loop
 /// fired with `accept_rate > 0` AND the output is coherent (mentions the
 /// expected token in `content` or, for a thinking model, `reasoning_content`).
 /// Proves the drafter actually proposes accepted tokens end-to-end, not just
@@ -2729,7 +2730,9 @@ fn assert_spec_decode(
             format!("drafter `{spec}` unresolved — snapshot absent"),
         );
     };
-    let kind = case.draft_kind.as_deref().unwrap_or("mtp");
+    // The engine reads the kind off the drafter's config.json; a case names
+    // one only to exercise the flag.
+    let kind = case.draft_kind.as_deref();
     // The expected coherence token (default "Paris") may land in the thinking
     // block on a reasoning model, so a generous budget lets it close the block.
     let want = case.assert.expect.as_deref().unwrap_or("Paris");
@@ -2741,19 +2744,24 @@ fn assert_spec_decode(
     }
 
     claim_preflight();
-    let extra = vec![
+    let mut extra = vec![
         "--draft-model".to_owned(),
         draft.to_string_lossy().into_owned(),
-        "--draft-kind".to_owned(),
-        kind.to_owned(),
         "--max-ctx".to_owned(),
         "16384".to_owned(),
     ];
+    if let Some(kind) = kind {
+        extra.push("--draft-kind".to_owned());
+        extra.push(kind.to_owned());
+    }
     let guard = match spawn_serve_verbose_flags(model, port, &home, &extra) {
         Ok(g) => g,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&home);
-            return mk(Verdict::Fail, format!("spec serve ({kind}): {e}"));
+            return mk(
+                Verdict::Fail,
+                format!("spec serve ({}): {e}", kind.unwrap_or("kind from config")),
+            );
         }
     };
 
@@ -2789,6 +2797,7 @@ fn assert_spec_decode(
     let scraped = scrape_spec_accept(&home);
     let _ = std::fs::remove_dir_all(&home);
 
+    let kind = kind.unwrap_or("declared-kind");
     if !coherent || !mentions {
         return mk(
             Verdict::Fail,
@@ -2819,10 +2828,10 @@ fn assert_spec_decode(
     }
 }
 
-/// Scrape the speculative round-loop summary (`<kind>_generate_greedy: done`)
+/// Scrape the speculative round-loop summary (`<kind>_generate: done`)
 /// from the newest run jsonl under `<home>/logs/`. Returns the LAST summary's
 /// `(accept_rate, rounds)`. The fields shape (verified empirically):
-/// `fields.message == "<kind>_generate_greedy: done"`, `fields.accept_rate`,
+/// `fields.message == "<kind>_generate: done"`, `fields.accept_rate`,
 /// `fields.rounds`.
 fn scrape_spec_accept(home: &std::path::Path) -> Result<(f64, u64), String> {
     let logs = home.join("logs");
@@ -2851,13 +2860,13 @@ fn scrape_spec_accept(home: &std::path::Path) -> Result<(f64, u64), String> {
         };
         let fields = &v["fields"];
         let msg = fields["message"].as_str().unwrap_or_default();
-        if msg.ends_with("_generate_greedy: done") {
+        if msg.ends_with("_generate: done") {
             let ar = fields["accept_rate"].as_f64().unwrap_or(-1.0);
             let rounds = fields["rounds"].as_u64().unwrap_or(0);
             found = Some((ar, rounds));
         }
     }
-    found.ok_or_else(|| "no `<kind>_generate_greedy: done` summary line".to_owned())
+    found.ok_or_else(|| "no `<kind>_generate: done` summary line".to_owned())
 }
 
 /// **REAL** arch-guard refusal proof (`serve_refused`).

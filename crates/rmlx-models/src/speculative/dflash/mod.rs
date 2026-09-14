@@ -1,3 +1,8 @@
+// LOC-exempt: one drafter's whole surface — config parse, weight load, the
+// block forward, the block-size schedule, the acceptance walk and the round
+// loop that drives them. The loop reads the drafter's private weights and
+// the forward reads the config it parsed, so a split would export internals
+// across a module boundary to buy line count.
 //! DFlash drafter loader + round-loop.
 //!
 //! Port of mlx-vlm `mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py`
@@ -31,9 +36,9 @@
 //! ([`DFlashDrafter::load`] + [`load_dflash`]) — `fc` (`5H->H`), `hidden_norm`,
 //! `norm`, all 8 `DFlashDecoderLayer`s, **YARN RoPE** ([`crate::rope::compute_yarn_freqs`]),
 //! the drafter forward [`DFlashDrafter::draft_block`], the block-size schedule
-//! [`dflash_next_block_size`], the acceptance walk [`walk_block_greedy`], the
-//! [`DFlashRoundState`] GDN rollback, and the full round-loop
-//! [`dflash_generate_greedy`]. The three verifier-side seams are wired on
+//! [`dflash_next_block_size`], the acceptance walk
+//! [`crate::speculative::accept_prefix`], the GDN rollback, and the full round-loop
+//! [`dflash_generate`]. The three verifier-side seams are wired on
 //! [`crate::arch::Architecture`] for the Qwen3.6-MoE verifier:
 //!
 //! 1. **Multi-layer hidden capture** — [`Architecture::forward_verify_capture`]
@@ -58,12 +63,8 @@
     clippy::too_many_lines,
     clippy::used_underscore_binding
 )]
-// kv-layer-quants: uniform — speculative scratch stack. The drafter/verifier
-// caches a round builds live for that round only: they are never pushed to the
-// prompt cache, never spilled, and never keyed by `layout_key`, so no on-disk
-// description has to match them. Applying the boundary promotion here would
-// change the codec of a stack whose only reader is the round that built it.
-
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::Path;
 
 use rmlx_core::error::{Error, Result};
@@ -72,9 +73,13 @@ use rmlx_mlx::{
     tanh, Array, Device,
 };
 
-use super::{emit_step, DecodeWindow};
+use super::DecodeWindow;
 use crate::arch::Architecture;
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
+use crate::speculative::round_common::{
+    emit_round_tokens, emit_seed_token, lin_cache_stack, log_request_record,
+    report_verifier_kv_bytes, rollback_round, verifier_cache_stack, RoundTotals,
+};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 
 /// Choose the next DFlash verify block size from recent acceptance.
@@ -86,20 +91,20 @@ use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 /// - `recent` is the recent `(accepted, drafted)` history (most-recent last);
 ///   the round-loop keeps the last 8.
 /// - `requested_block_total` is the configured/CLI block size.
-/// - `remaining_budget` caps the block to the remaining token budget.
+/// - `remaining` is how many tokens the request may still emit, in the same
+///   unit every other loop narrows against — the ceiling is
+///   [`super::round_block`] of it, so this schedule adapts a block it does not
+///   also define.
 /// - `prefer_requested` short-circuits to the requested size (config flag).
 ///
 /// Returns the next block total (including the seed token).
-pub fn dflash_next_block_size(
+pub(crate) fn dflash_next_block_size(
     recent: &[(usize, usize)],
     requested_block_total: usize,
-    remaining_budget: usize,
+    remaining: usize,
     prefer_requested: bool,
 ) -> usize {
-    let block_total = requested_block_total.min(remaining_budget);
-    if block_total <= 1 {
-        return block_total;
-    }
+    let block_total = super::round_block(requested_block_total, remaining);
     if prefer_requested {
         return block_total;
     }
@@ -148,8 +153,11 @@ pub fn dflash_next_block_size(
 /// One DFlash decoder layer (Qwen3 shape: GQA + per-head q/k RMSNorm + RoPE).
 ///
 /// Mirrors `DFlashDecoderLayer`: pre-norm self-attention with a context /
-/// proposal KV split (only context K/V go in the cache) followed by a SwiGLU
-/// MLP, both residual.
+/// proposal KV split followed by a SwiGLU MLP, both residual. The reference
+/// keeps the context K/V in a per-layer cache; this layer rebuilds it from the
+/// conditioning rows on every call, applying RoPE to the context K at offset 0
+/// each time, so conditioning row `i` carries position `i` exactly as a row the
+/// reference cached at absolute position `i` does.
 #[allow(missing_debug_implementations)]
 struct DFlashLayer {
     input_layernorm: RmsNorm,
@@ -182,8 +190,6 @@ pub struct DFlashDrafter {
     /// Final RMSNorm after the decoder stack.
     norm: RmsNorm,
     layers: Vec<DFlashLayer>,
-    /// Per-layer KV cache (the drafter's own; holds context K/V only).
-    caches: Vec<KvCache>,
     /// Precomputed YARN inverse-frequency table (`[head_dim/2]`), when the
     /// drafter config specifies `rope_scaling: {rope_type: yarn}`. `None`
     /// falls back to plain RoPE (`rope(theta)`). The Qwen3.6-35B DFlash drafter
@@ -239,10 +245,7 @@ impl DFlashDrafter {
     /// drafter `hidden_size` and `fc` input (`len(target_layer_ids)*H`) must
     /// match it.
     pub fn load(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<Self> {
-        let mut me = load_dflash(draft_dir, hidden_size, device)?;
-        me.caches = (0..me.cfg.num_hidden_layers)
-            .map(|_| KvCache::with_quant(KvQuant::None))
-            .collect();
+        let me = load_dflash(draft_dir, hidden_size, device)?;
         tracing::info!(
             draft = %draft_dir.display(),
             hidden_size,
@@ -252,13 +255,6 @@ impl DFlashDrafter {
             "DFlashDrafter: loaded drafter"
         );
         Ok(me)
-    }
-
-    /// Reset the drafter's KV cache between generations.
-    pub fn reset(&mut self) {
-        for c in &mut self.caches {
-            *c = KvCache::with_quant(KvQuant::None);
-        }
     }
 
     /// Trained / configured block size (the adaptive-schedule ceiling).
@@ -288,20 +284,76 @@ impl DFlashDrafter {
     /// at each `target_layer_id`, concatenated along the feature axis). Mirrors
     /// `DFlashDraftModel._hidden`'s `h_ctx = hidden_norm(fc(target_hidden))`.
     /// Real: `fc` + `hidden_norm` are loaded and run on-device.
+    ///
+    /// `fc` is a bias-free linear and `hidden_norm` an RMSNorm, so both are
+    /// row-wise: a row's projection does not depend on which other rows were in
+    /// the call. That is what lets the round loop project each round's committed
+    /// rows and carry the result — **exactly** in exact arithmetic, and to
+    /// within a last-place rounding difference at the checkpoint's dtype, where
+    /// the two calls are dispatched at different matmul heights. See
+    /// [`crate::speculative::conditioning_residual`], which measures that gap
+    /// per request, and `docs/SPECULATIVE.md` for what it can and cannot move.
+    /// The position-dependent part of the conditioning is the per-layer RoPE in
+    /// [`Self::layer_forward`], which is applied to the context K at offset 0 on
+    /// every call and so is not carried.
     pub fn project_condition(&self, concat_hidden: &Array) -> Result<Array> {
         let projected = self.fc.forward(concat_hidden, self.device)?;
         self.hidden_norm.forward(&projected, self.device)
     }
 
+    /// Project a round's committed capture rows and append them to the
+    /// projection carried from the last round.
+    ///
+    /// Returns the grown buffer and the rows it projected — which is the round's
+    /// committed rows and nothing else. Projecting and appending are one
+    /// operation because a caller that re-projected the rows it was already
+    /// carrying would produce the same buffer, to a last place, for a pass over
+    /// the whole conditioning history every round instead of over one round's
+    /// commit, and nothing in an answer would say so. The row count is what
+    /// does, which is why it is returned, traced and checked by
+    /// [`crate::speculative::guard_round_conditioning`].
+    ///
+    /// The buffer **grows** and is never bounded, which is what the name says
+    /// and what separates it from the DFlash 2 drafter's sliding equivalent:
+    /// this drafter declares no window, its layers are full-attention, and its
+    /// block queries read the whole context unmasked, so dropping the oldest
+    /// rows would take rows the drafter reads.
+    ///
+    /// `device` is the caller's, not the drafter's: the rows arrive sliced on
+    /// the loop's device and the buffer they extend is read there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Model`] when the committed rows are not
+    /// `[1, rows, len(target_layer_ids) * hidden_size]`, or from the projection
+    /// or the concatenation.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "each axis is read only after the rank has been compared against 3"
+    )]
+    fn grow_conditioning(
+        &self,
+        carried: &Array,
+        committed: &Array,
+        device: Device,
+    ) -> Result<(Array, i32)> {
+        let shape = committed.shape();
+        let width = (self.cfg.target_layer_ids.len() * self.cfg.hidden_size) as i32;
+        if shape.len() != 3 || shape[0] != 1 || shape[2] != width {
+            return Err(Error::Model(format!(
+                "DFlashDrafter: the committed conditioning rows have shape {shape:?}, \
+                 not the [1, rows, {width}] this drafter's fc reads"
+            )));
+        }
+        let rows = shape[1];
+        let projected = self.project_condition(committed)?;
+        let grown = concatenate(&[carried, &projected], 1, device)?;
+        Ok((grown, rows))
+    }
+
     /// Build the conditioning hidden by capturing the verifier hidden states at
     /// `target_layer_ids` and concatenating them.
     ///
-    /// **Awaiting verifier-side wiring (module docs).** rMLX's
-    /// `Architecture::forward_hidden_states` returns only the penultimate trunk
-    /// hidden and is Gemma4-only. DFlash needs per-`target_layer_id`
-    /// captures concatenated, which the Qwen3.6-MoE verifier path does not yet
-    /// expose. Returns [`Error::Model`] until that lands; the `fc`/`hidden_norm`
-    /// projection it would feed ([`project_condition`]) is implemented + tested.
     /// Capture the verifier's concatenated multi-layer hidden over `input_ids`
     /// (advancing the supplied caches) WITHOUT projecting. Returns
     /// `[1, k, len(target_layer_ids)*H]` for the last `k` positions. The
@@ -345,7 +397,7 @@ impl DFlashDrafter {
     /// run on-device. The seam is the *verifier* `embed_tokens` + `lm_head`
     /// accessor (threaded by the round-loop) — gated in [`embed_block`] below.
     pub fn draft_block(
-        &mut self,
+        &self,
         verifier: &Architecture,
         seed_tok: u32,
         h_ctx: &Array,
@@ -385,7 +437,7 @@ impl DFlashDrafter {
     /// Real port of `DFlashDraftModel._hidden` (sans embedding): for each layer,
     /// pre-norm self-attention with a context (`h_ctx`) / proposal (`h`) KV split
     /// followed by a SwiGLU MLP, then the final `norm`. Returns `[1, L, H]`.
-    fn forward_block(&mut self, h: &Array, h_ctx: &Array) -> Result<Array> {
+    fn forward_block(&self, h: &Array, h_ctx: &Array) -> Result<Array> {
         let mut x = h.try_clone()?;
         // The conditioning context is shared across layers (Python passes the
         // same `h_ctx` into every layer's attention as the KV-source prefix).
@@ -523,7 +575,8 @@ impl DFlashDrafter {
                 &[1, 1, 1],
                 device,
             )?;
-            let mut logits = verifier.logits_from_hidden(&row, device)?;
+            // `forward_block` ends with the drafter's own final norm.
+            let mut logits = verifier.logits_from_final_hidden(&row, device)?;
             if let Some(cap) = self.cfg.final_logit_softcapping {
                 let cap_arr = scalar_f32(cap).astype(logits.dtype(), device)?;
                 let scaled = divide(&logits, &cap_arr, device)?;
@@ -537,89 +590,6 @@ impl DFlashDrafter {
         }
         Ok(tokens)
     }
-}
-
-/// Per-generation GDN rollback bookkeeping for the DFlash round loop.
-///
-/// Wraps the verifier's `LinearAttnCache` snapshot/restore round-trip: take a
-/// snapshot of every GDN cache before a draft round, restore them on partial
-/// acceptance. This is the GDN-aware analogue of the Gemma4 spec path's
-/// `KvCache::truncate_to` rollback — GDN recurrent state has no sequence axis,
-/// so it cannot be truncated (see `linear_attn.rs`).
-#[allow(
-    clippy::exhaustive_structs,
-    reason = "internal closed rollback-state struct — private snapshots field; public API is snapshot() and restore_if_partial(); adding a field requires updating snapshot() and restore_if_partial()"
-)]
-#[allow(missing_debug_implementations)]
-pub struct DFlashRoundState {
-    /// Snapshot of each GDN cache taken at round start (index-aligned with the
-    /// verifier's linear-attention caches).
-    snapshots: Vec<LinearAttnCache>,
-}
-
-impl DFlashRoundState {
-    /// Snapshot all GDN caches before a draft round.
-    pub fn snapshot(lin_caches: &[LinearAttnCache]) -> Result<Self> {
-        let snapshots = lin_caches
-            .iter()
-            .map(|c| c.snapshot())
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self { snapshots })
-    }
-
-    /// Number of GDN caches snapshotted.
-    pub fn len(&self) -> usize {
-        self.snapshots.len()
-    }
-
-    /// True when no GDN cache was snapshotted (non-GDN verifier).
-    pub fn is_empty(&self) -> bool {
-        self.snapshots.is_empty()
-    }
-
-    /// Consume the round state and hand back the per-layer snapshots.
-    ///
-    /// Restoring them is only one third of a partial-accept rollback — it also
-    /// has to roll the KV caches back and replay the retained prefix through
-    /// them — so the snapshots are handed to the shared rollback rather than
-    /// restored here (mirrors `lm.rollback_speculative_cache` followed by the
-    /// next round's verify in `_dflash_rounds`).
-    pub fn into_snapshots(self) -> Vec<LinearAttnCache> {
-        self.snapshots
-    }
-}
-
-/// One greedy DFlash acceptance walk over a drafted block (port of the
-/// `_speculative_walk` half of `_dflash_rounds`).
-///
-/// Accept drafted tokens up to the first mismatch with the verifier's greedy
-/// choice, then take the verifier's correction/bonus at that position. Returns
-/// `(accepted, new_tokens)` capped at `budget`. `target_tokens` are the
-/// verifier's greedy predictions for positions `[seed, d0, d1, ...]` — i.e.
-/// `draft_tokens.len() + 1` of them.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-pub fn walk_block_greedy(
-    draft_tokens: &[u32],
-    target_tokens: &[u32],
-    budget: usize,
-) -> (usize, Vec<u32>) {
-    let n_draft = draft_tokens.len();
-    let mut accepted = n_draft;
-    for (i, (&d, &t)) in draft_tokens.iter().zip(target_tokens.iter()).enumerate() {
-        if d != t {
-            accepted = i;
-            break;
-        }
-    }
-    let mut new_tokens: Vec<u32> = draft_tokens[..accepted].to_vec();
-    if accepted < target_tokens.len() {
-        new_tokens.push(target_tokens[accepted]);
-    }
-    new_tokens.truncate(budget);
-    (accepted, new_tokens)
 }
 
 use crate::decode_loop::ProbeStep;
@@ -637,6 +607,12 @@ use crate::decode_loop::ProbeStep;
 /// `step_fn` is invoked once per emitted (verifier-confirmed) token; return
 /// `Some(id)` to force the next token (unused here — kept symmetric with the
 /// MTP path). Returns the emitted token ids.
+///
+/// Returns the emitted steps and **the widest block any round of this run
+/// actually ran**. Not the block resolved before the loop: a caller checking
+/// what it asked for against that would be trusting the very step it wanted
+/// checked, and every loop here narrows the block again per round against the
+/// remaining token budget.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::indexing_slicing,
@@ -646,9 +622,9 @@ use crate::decode_loop::ProbeStep;
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
-pub fn dflash_generate_greedy(
+pub fn dflash_generate(
     verifier: &Architecture,
-    drafter: &mut DFlashDrafter,
+    drafter: &DFlashDrafter,
     tokenizer: &tokenizers::Tokenizer,
     prompt_ids: &[u32],
     n_tokens: usize,
@@ -657,52 +633,36 @@ pub fn dflash_generate_greedy(
     max_ctx_override: Option<i32>,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    sampler_cfg: &crate::sampler::SamplerConfig,
     device: Device,
-) -> Result<Vec<ProbeStep>> {
+) -> Result<(Vec<ProbeStep>, usize)> {
     use std::time::Instant;
 
     if prompt_ids.len() < 2 {
         return Err(Error::Model(
-            "dflash_generate_greedy: prompt must have >=2 tokens".into(),
+            "dflash_generate: prompt must have >=2 tokens".into(),
         ));
     }
     if !verifier.needs_lin_caches() {
         return Err(Error::Model(
-            "dflash_generate_greedy: DFlash verifier must be the Qwen3.5/3.6-MoE \
+            "dflash_generate: DFlash verifier must be the Qwen3.5/3.6-MoE \
              hybrid (needs GDN lin_caches)"
                 .into(),
         ));
     }
 
     let target_layer_ids = drafter.cfg.target_layer_ids.clone();
-    let hidden = drafter.cfg.hidden_size as i32;
-    let block_total = requested_block_total.min(drafter.cfg.block_size).max(2);
+    let condition_width = drafter.cfg.hidden_size as i32 * target_layer_ids.len() as i32;
+    let block_total = crate::speculative::block_capped_by_checkpoint(
+        requested_block_total,
+        drafter.cfg.block_size,
+    );
 
-    // Same constant the verifier resolves — a spec pair must not run two
-    // different caches.
-    let kv_quant = kv_quant_override.unwrap_or(crate::kv_cache::DEFAULT_KV_QUANT);
-    // The verifier's limits bound the pair; an over-capacity `--max-ctx` is
-    // refused here rather than overflowing a cache mid-round.
-    let ctx = crate::speculative::verifier_context(verifier, max_ctx_override)?;
-    let max_seq = ctx.ceiling;
+    let (kv_quant, _, mut v_caches) =
+        verifier_cache_stack(verifier, kv_quant_override, max_ctx_override)?;
+    let mut v_lin = lin_cache_stack(verifier);
 
-    let mut v_caches: Vec<KvCache> = (0..verifier.num_hidden_layers())
-        .map(|i| {
-            let window = verifier.layer_sliding_window(i);
-            KvCache::with_quant_max_seq_window(kv_quant, max_seq, window)
-                .with_max_seq_ceiling(ctx.ceiling)
-                .with_layer_idx(i)
-                // The verifier stack decides whether its layers read each
-                // other's K/V, and so whether Mixed/RotK keep their bf16
-                // mirror. A spec pair must not run two different caches.
-                .with_shares_kv(verifier.shares_kv_across_layers())
-        })
-        .collect();
-    let mut v_lin: Vec<LinearAttnCache> = (0..verifier.num_hidden_layers())
-        .map(|_| LinearAttnCache::new())
-        .collect();
-
-    drafter.reset();
+    let mut draw = super::VerifierDraw::new(sampler_cfg);
 
     // Diagnostics.
     let mut total_draft = 0usize;
@@ -718,6 +678,7 @@ pub fn dflash_generate_greedy(
 
     // -- Prefill verifier on prompt[..-1]; last token is the round-0 carry. --
     let prefill_slice = &prompt_ids[..prompt_ids.len() - 1];
+    let prefill_t0 = Instant::now();
     super::prefill_chunked(
         verifier,
         prefill_slice,
@@ -725,6 +686,7 @@ pub fn dflash_generate_greedy(
         Some(&mut v_lin),
         device,
     )?;
+    let prefill_ns = prefill_t0.elapsed().as_nanos();
 
     // -- Round-0: feed the last prompt token, capture its hidden + first bonus. --
     let last_prompt = *prompt_ids.last().unwrap();
@@ -736,22 +698,48 @@ pub fn dflash_generate_greedy(
         Some(&mut v_lin),
         device,
     )?;
-    // Accumulated conditioning context (concat of every round's committed
-    // verifier hidden along the sequence axis). The drafter conditions on the
-    // FULL accumulated context each round — equivalent to the Python ref's
-    // persistent draft KV cache (`cache.update_and_fetch`), which accumulates
-    // context K/V derived deterministically from these same hiddens.
+    // Accumulated conditioning context, held as the projection rather than the
+    // capture it came from. The drafter conditions on the FULL accumulated
+    // context each round — equivalent to the reference's persistent draft KV
+    // cache (`cache.update_and_fetch`), which accumulates context K/V derived
+    // deterministically from these same hiddens. `project_condition` is
+    // row-wise, so a row projected once here is the row every later round would
+    // have re-derived, and each round then projects only what it commits.
     super::guard_verifier_prefill_logits(verifier, &r0_logits, prompt_ids.len())?;
-    let mut h_ctx_raw = r0_hidden;
-    let mut b = {
-        let am = argmax(&r0_logits, -1, device)?;
-        am.eval()?;
-        u32::from_le_bytes(am.to_bytes()?[..4].try_into().unwrap())
-    };
+    let mut h_ctx = drafter.project_condition(&r0_hidden)?;
+    // The seed's raw row, kept until the first round has extended the buffer and
+    // then dropped: re-projecting it beside that round's commit is what says how
+    // far the carried projection sits from a fresh one at this checkpoint's
+    // dtype. One row, one round, and the probe releases it. See
+    // `conditioning_residual`.
+    let mut probe_seed = Some(r0_hidden);
+    let mut b = draw.seed_token(&r0_logits, device)?;
     // Emit the first bonus.
-    emit_step(tokenizer, b, step_fn, &mut emitted, &mut window);
-    if eos_ids.contains(&b) {
-        return Ok(emitted);
+    if emit_seed_token(
+        tokenizer,
+        b,
+        step_fn,
+        &mut emitted,
+        &mut window,
+        eos_ids,
+        &RoundTotals {
+            loop_kind: super::SpecLoop::DFlash,
+            block_size: block_total,
+            conditioned_rows: Some(0),
+            charged: false,
+            // No round ran.
+            rounds: 0,
+            emitted_in_rounds: 0,
+            total_draft: 0,
+            total_accept: 0,
+            prefill_ns,
+            draft_ns: 0,
+            verifier_ns: 0,
+            round_loop_ns: 0,
+            t_total,
+        },
+    ) {
+        return Ok((emitted, block_total));
     }
 
     tracing::info!(
@@ -760,32 +748,40 @@ pub fn dflash_generate_greedy(
         n_tokens,
         ?kv_quant,
         ?target_layer_ids,
-        "dflash_generate_greedy: starting (Qwen3.6-MoE verifier + DFlash drafter)"
+        temperature = sampler_cfg.temperature,
+        "dflash_generate: starting (Qwen3.6-MoE verifier + DFlash drafter)"
     );
 
+    let seed_emitted = emitted.len();
+    let mut emitted_in_rounds = 0usize;
+    // Conditioning rows the rounds projected, read back from the projection
+    // rather than from what the loop meant to hand it. See
+    // `guard_round_conditioning`.
+    let mut conditioned_rows = 0usize;
+    let mut widest_bs = 0usize;
+    let round_loop_t0 = Instant::now();
     while emitted.len() < n_tokens {
         rounds += 1;
         let remaining = n_tokens - emitted.len();
-        let bs = dflash_next_block_size(&recent, block_total, remaining + 1, false);
-        if bs <= 1 {
-            break;
-        }
-
-        // -- Project the committed verifier hidden into the conditioning ctx. --
-        let h_ctx = drafter.project_condition(&h_ctx_raw)?;
+        let bs = dflash_next_block_size(&recent, block_total, remaining, false);
+        widest_bs = widest_bs.max(bs);
 
         // -- Phase A: drafter proposes bs-1 tokens (non-autoregressive block). --
         let t0 = Instant::now();
         let draft_tokens = drafter.draft_block(verifier, b, &h_ctx, bs)?;
         draft_ns += t0.elapsed().as_nanos();
         if draft_tokens.is_empty() {
-            break;
+            return Err(Error::Model(format!(
+                "dflash_generate: the drafter denoised nothing at block {bs}; a block \
+                 of two or more yields block - 1 proposals, so an empty block is a \
+                 broken drafter and not the end of the request"
+            )));
         }
         total_draft += draft_tokens.len();
 
         // -- Phase B: verifier scores [b, draft...] + captures hidden in one pass.
-        // Snapshot GDN state before the verify forward.
-        let round_snap = DFlashRoundState::snapshot(&v_lin)?;
+        // Arm the GDN round tape before the verify forward.
+        super::arm_lin_tapes(Some(&mut v_lin));
         let mut v_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
         v_input.push(b);
         v_input.extend_from_slice(&draft_tokens);
@@ -800,42 +796,36 @@ pub fn dflash_generate_greedy(
             Some(&mut v_lin),
             device,
         )?;
-        let v_argmax = argmax(&v_logits, -1, device)?;
-        v_argmax.eval()?;
-        let vb = v_argmax.to_bytes()?;
+        let v_tokens = draw.block_tokens(&v_logits, v_k, device)?;
         verifier_ns += t0.elapsed().as_nanos();
-        let mut v_tokens: Vec<u32> = Vec::with_capacity(v_k);
-        for i in 0..v_k {
-            v_tokens.push(u32::from_le_bytes(vb[i * 4..i * 4 + 4].try_into().unwrap()));
-        }
 
-        // -- Phase C: greedy acceptance walk. --------------------------------
-        let (accept, new_tokens) = walk_block_greedy(&draft_tokens, &v_tokens, remaining);
+        // -- Phase C: acceptance walk. ---------------------------------------
+        let (accept, new_tokens) = super::accept_prefix(&v_tokens, &draft_tokens, remaining)?;
         total_accept += accept;
         recent.push((accept, draft_tokens.len()));
 
         // -- Emit accepted prefix + 1 correction/bonus. ----------------------
-        let mut hit_eos = false;
-        for &id in &new_tokens {
-            if emitted.len() >= n_tokens {
-                break;
-            }
-            emit_step(tokenizer, id, step_fn, &mut emitted, &mut window);
-            if eos_ids.contains(&id) {
-                hit_eos = true;
-                break;
-            }
-        }
-        if hit_eos {
+        let emit = emit_round_tokens(
+            tokenizer,
+            &new_tokens,
+            n_tokens,
+            eos_ids,
+            step_fn,
+            &mut emitted,
+            &mut emitted_in_rounds,
+            &mut window,
+            None,
+        );
+        if emit.hit_eos {
             break;
         }
 
         // -- Phase D: rollback + next-round setup. ---------------------------
         // Committed positions this round = new_tokens.len(); the verifier
         // consumed v_k positions. On partial accept (accept < bs-1) the GDN
-        // recurrent state ran ahead — restore the snapshot and replay the
-        // kept prefix so it matches the truncated KV exactly.
-        let n_committed = new_tokens.len();
+        // recurrent state ran ahead — refold the kept prefix from the round tape
+        // so it matches the truncated KV exactly.
+        let n_committed = emit.committed;
         // Read the post-verify sequence offset from a FullAttention layer:
         // GDN (linear-attn) layers never advance their KvCache::offset (it
         // stays 0), so `v_caches[0]` (layer 0 is GDN for the Qwen3.5/3.6-MoE
@@ -847,93 +837,98 @@ pub fn dflash_generate_greedy(
         // verifier processed it as part of v_input only when it was a draft
         // token — i.e. the committed-position count is `accept` consumed
         // draft slots + the carry b). KV target = pre + accept + 1 carry-rows.
-        let v_target = v_offset_before - (draft_tokens.len() as i32 - accept as i32);
-        if v_target < v_offset_before {
-            let v_pre_round_offset = v_offset_before - v_k as i32;
-            super::rollback_round_caches(
-                verifier,
-                &mut v_caches,
-                Some(&mut v_lin),
-                Some(round_snap.into_snapshots()),
-                &v_input,
-                v_pre_round_offset,
-                v_target,
-                device,
-            )?;
-        } else {
-            // Full accept — GDN already correct; drop the snapshot.
-            drop(round_snap);
-        }
-
-        // Append this round's committed verifier hidden to the accumulated
-        // conditioning context (mlx-vlm: the committed `hidden[:, :accepted+1]`
-        // is fed as NEW context into the persistent draft cache, which holds
-        // all prior rounds). We accumulate the equivalent hidden buffer.
-        let committed_hidden = v_hidden.slice(
-            &[0, 0, 0],
-            &[
-                1,
-                n_committed as i32,
-                hidden * target_layer_ids.len() as i32,
-            ],
-            &[1, 1, 1],
+        let v_target =
+            super::rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
+        let refolded = rollback_round(
+            &mut v_caches,
+            Some(&mut v_lin),
+            &v_input,
+            v_offset_before - v_k as i32,
+            v_target,
+            // This loop times no phases, so it never charges one.
+            false,
             device,
         )?;
-        h_ctx_raw = concatenate(&[&h_ctx_raw, &committed_hidden], 1, device)?;
+
+        // Append this round's committed verifier hidden to the accumulated
+        // conditioning context (the reference feeds the committed
+        // `hidden[:, :accepted+1]` as NEW context into the persistent draft
+        // cache, which holds all prior rounds). We accumulate the equivalent
+        // buffer, one projection per round's commit rather than one per round
+        // over the whole of it.
+        let committed_hidden =
+            super::committed_rows(&v_hidden, n_committed, condition_width, device)?;
+        let projected_rows;
+        (h_ctx, projected_rows) = drafter.grow_conditioning(&h_ctx, &committed_hidden, device)?;
+        super::guard_round_conditioning(rounds, projected_rows, n_committed)?;
+        conditioned_rows += projected_rows.max(0) as usize;
+        if let Some(seed) = probe_seed.take() {
+            let raw = concatenate(&[&seed, &committed_hidden], 1, device)?;
+            let fresh = drafter.project_condition(&raw)?;
+            let tail = h_ctx.shape().get(1).copied().unwrap_or(0) - (1 + projected_rows);
+            let carried_tail = h_ctx.slice(
+                &[0, tail, 0],
+                &[1, tail + 1 + projected_rows, drafter.cfg.hidden_size as i32],
+                &[1, 1, 1],
+                device,
+            )?;
+            tracing::debug!(
+                rows = 1 + projected_rows,
+                residual = super::conditioning_residual(&carried_tail, &fresh, device)?,
+                "dflash conditioning: carried projection against a fresh one"
+            );
+        }
         b = *new_tokens.last().unwrap_or(&b);
 
-        tracing::debug!(
-            round = rounds,
-            accept,
-            num_draft = draft_tokens.len(),
-            n_committed,
-            emitted_total = emitted.len(),
-            v_offset_before,
-            v_target,
-            "dflash round"
+        super::log_round(
+            &super::RoundReport {
+                loop_kind: super::SpecLoop::DFlash,
+                round: rounds,
+                accept,
+                num_draft: draft_tokens.len(),
+                n_committed,
+                emitted_total: emitted.len(),
+                condition_rows: h_ctx.shape().get(1).copied(),
+                projected_rows: Some(projected_rows),
+                v_offset_before,
+                v_target,
+                // No drafter cache: the block drafter is conditioned on
+                // `h_ctx` and re-reads it every round.
+                d_offset_before: None,
+                d_target: None,
+                refolded,
+                // This loop times no phases, so it never charges one.
+                charged: false,
+                phases: None,
+            },
+            &[],
         );
     }
 
-    let elapsed_ms = (t_total.elapsed().as_nanos() as f64) / 1.0e6;
-    let accept_rate = if total_draft > 0 {
-        (total_accept as f64) / (total_draft as f64)
-    } else {
-        0.0
-    };
-
-    tracing::info!(
-        rounds,
-        emitted = emitted.len(),
-        total_draft,
-        total_accept,
-        accept_rate,
-        decode_tps = ?window.tps(),
-        elapsed_ms,
-        draft_ms = (draft_ns as f64) / 1.0e6,
-        verifier_ms = (verifier_ns as f64) / 1.0e6,
-        block_size = block_total,
-        "dflash_generate_greedy: done"
-    );
-    tracing::debug!(
-        rounds,
-        emitted = emitted.len(),
-        total_draft,
-        total_accept,
-        accept_rate,
-        decode_tps = ?window.tps(),
-        elapsed_ms,
-        "[dflash] debug summary"
+    let round_loop_ns = round_loop_t0.elapsed().as_nanos();
+    log_request_record(
+        &RoundTotals {
+            loop_kind: super::SpecLoop::DFlash,
+            block_size: block_total,
+            conditioned_rows: Some(conditioned_rows),
+            charged: false,
+            rounds,
+            emitted_in_rounds,
+            total_draft,
+            total_accept,
+            prefill_ns,
+            draft_ns,
+            verifier_ns,
+            round_loop_ns,
+            t_total,
+        },
+        &emitted,
+        seed_emitted,
+        &window,
     );
 
-    // Report the verifier's resident KV, so a caller that sampled the verifier
-    // arch around this call can attribute the figure to it. This round loop
-    // never goes through `Architecture::generate_greedy`, so nothing else
-    // writes it.
-    verifier.store_kv_cache_bytes(
-        crate::speculative::verifier_kv_bytes(&v_caches, Some(&v_lin)),
-        crate::decode_loop::PostDecode::seal(),
-    );
-    Ok(emitted)
+    report_verifier_kv_bytes(verifier, &v_caches, Some(&v_lin));
+    Ok((emitted, widest_bs))
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,7 +1021,16 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
     let shards = ShardSet::open(draft_dir, &idx)
         .map_err(|e| Error::Model(format!("DFlashDrafter: open: {e}")))?;
 
+    // Which tensor names the loader actually consumed. A drafter checkpoint of
+    // a DFlash generation newer than this loader carries weight families it has
+    // no code for; loading it then silently yields this architecture built out
+    // of the subset it does recognise, running at an accept rate that is not the
+    // checkpoint's. The set is compared against the snapshot below so that
+    // downgrade is stated.
+    let consumed: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+
     let load = |name: &str| -> Result<Array> {
+        consumed.borrow_mut().insert(name.to_owned());
         for (_, handle) in shards.iter() {
             let st = handle
                 .safetensors()
@@ -1097,6 +1101,17 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
         });
     }
 
+    // A set, not a list: a name carried by two shard files would otherwise be
+    // counted and listed twice in the refusal.
+    let mut present: HashSet<String> = HashSet::new();
+    for (_, handle) in shards.iter() {
+        let st = handle
+            .safetensors()
+            .map_err(|e| Error::Model(format!("DFlashDrafter: safetensors: {e}")))?;
+        present.extend(st.names().into_iter().map(ToOwned::to_owned));
+    }
+    super::unread_tensor_refusal("DFlashDrafter", &present, &consumed.borrow())?;
+
     // YARN RoPE: the Qwen3.6 DFlash drafter is trained with rope_scaling
     // {rope_type: yarn}. Precompute its inverse-freq table + mscale so the
     // drafter attention matches the checkpoint (plain RoPE diverges materially
@@ -1144,7 +1159,6 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
         hidden_norm,
         norm: final_norm,
         layers,
-        caches: Vec::new(),
         rope_freqs,
         rope_mscale,
         cfg,
@@ -1154,6 +1168,8 @@ fn load_dflash(draft_dir: &Path, hidden_size: usize, device: Device) -> Result<D
 
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod condition_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

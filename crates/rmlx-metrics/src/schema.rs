@@ -27,6 +27,10 @@ pub static MIGRATIONS: &[(u32, &str)] = &[
         7,
         include_str!("migrations/007_null_default_decode_config.sql"),
     ),
+    (
+        8,
+        include_str!("migrations/008_adaptive_depth_decode_config.sql"),
+    ),
 ];
 
 // ---------------------------------------------------------------------------

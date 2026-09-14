@@ -207,9 +207,33 @@ a spelling of that and is refused.
 
 | Terms | Setting | Emitted by |
 |---|---|---|
-| `mtp/block=<n>` | speculative-decode arm and its block size | `rmlx_metrics::cell::decode_config` |
+| `<drafter>/block=<n>` | speculative-decode arm and the block it was configured with | `rmlx_metrics::cell::decode_config`, composed by the round loop and logged on its `done` line |
+| `<drafter>/depth=<policy>` | how the loop picks each round's block, when it does not simply take the configured one | same |
 | `prefill_chunk=<n>` | non-default prefill chunk size | prefill-chunk sweeps |
 | `kv_boundary/head=<h>,kv_boundary/tail=<t>` | `--kv-boundary-layers` off its default | `rmlx baseline --record`, `rmlx eval ppl`, `scripts/ingest/{codec_inertness,perf_ab}_ingest.py` |
+
+The `<drafter>/depth` term is absent when the loop drafts the configured block
+every round. It is present when the loop resizes: DFlash halves and grows its
+block from the recent accept rate, so its arm is
+`dflash/block=16,dflash/depth=accept_rate` and is a different cell from a fixed
+arm at block 16 — which it must be, because the two do not emit the same number
+of tokens per round.
+
+**DFlash has no fixed-block arm at all**, and never had: its production call
+site has always passed `prefer_requested = false`, and the only caller passing
+`true` is a unit test. So the bare `dflash/block=<n>` names a configuration that
+has never run. `rmlx_metrics::cell::ADAPTIVE_DRAFTERS` is the one list of
+drafters in that position — the engine's per-loop accessor reads it,
+`decode_config_from_notes` reads it when recovering a row from notes,
+`RunRecord::validate` refuses a record that contradicts it, and **migration
+008** rewrote the eight rows (ids 122743–122750) that predated it. Rows for
+every other drafter keep the cell they have always been in. The round loop composes both terms and puts the result on
+its `done` line, and `scripts/spec_bench.sh` records what it finds there; a
+bench script that spelled the string itself would file a run under a
+configuration the engine did not use, which is the defect that motivated
+moving it. `scripts/ingest/published_ingest.py` is in the same position: it
+carries through the string its result file recorded off that `done` line and
+composes none of its own.
 
 The `kv_boundary/*` pair is always written together and always in that order
 (`head` sorts before `tail`), because a head count without a tail count does
@@ -231,6 +255,15 @@ term. Putting it here would have fenced both off from every `mlx_lm` row, which
 can never carry a term this engine invented. The test is the one stated above:
 a setting the engine moved off its default belongs here; a different
 measurement is a different metric.
+
+**One producer of the drafter terms, not of the column.**
+`rmlx_metrics::cell::decode_config` is the only site that composes a
+`<drafter>/block` or `<drafter>/depth` term, and `scripts/spec_bench.sh` records
+the string the engine logged rather than spelling it again. The column has other
+composers — `rmlx_models::kv_cache`'s boundary terms,
+`scripts/ingest/perf_ab_ingest.py`, `scripts/ingest/codec_inertness_ingest.py`
+and `scripts/prefill_chunk_sweep.sh` — whose *values* are held together by
+`check-kv-boundary-default-parity` but whose *format* is not.
 
 `rmlx_metrics::cell::decode_config_is_well_formed` is the one implementation,
 enforced at ingest (`RunRecord::validate`) so a private spelling is rejected
@@ -510,7 +543,8 @@ Source of truth for `observations.metric`, `.unit`, `.direction`. Add to this ta
 | `itl_p95_ms`          | `ms`    | `lower_better`  | Inter-token latency, 95th percentile. Kept for backward compat alongside `tpot_p95_ms`. |
 | `step_ms_mean`        | `ms`    | `lower_better`  | Mean per-token wall time (= `wall / completion_tokens`).                |
 | `model_load_ms`       | `ms`    | `lower_better`  | Wall time from `serve` start to "ready" log line.                       |
-| `peak_rss_mb`         | `mb`    | `lower_better`  | Peak resident set during the run.                                       |
+| `peak_rss_mb`         | `mb`    | `lower_better`  | Peak resident set during the run — `MACH_TASK_BASIC_INFO.resident_size`, the pages in RAM right now. |
+| `peak_phys_footprint_mb` | `mb` | `lower_better`  | Peak of `TASK_VM_INFO.phys_footprint` during the run — Apple's pressure metric, what Activity Monitor shows and what the OOM killer reads, so it counts compressed pages that `peak_rss_mb` does not (`docs/PROFILING.md` §9). A separate column and not a redefinition of `peak_rss_mb`: the two answer different questions and merging them would make the history mean neither. Emitters that sample a gauge rather than watching a high-water mark are reporting a lower bound on the peak and say so in `notes` with their sampling interval. |
 | `metal_peak_alloc_mb` | `mb`    | `lower_better`  | Peak Metal device allocation over the **process lifetime** (rMLX: `rmlx_mlx::mlx_peak_memory_bytes`; other backends: `mx.metal.get_peak_memory()`). Deliberately unscoped, so rows stay comparable across backends that expose only the lifetime figure. The region-scoped variant (`rmlx baseline`'s `metal_gen_alloc_mb`, from `rmlx_mlx::PeakBracket`) is a stdout diagnostic for A/B work and is **not** recorded here — mixing the two definitions into one column would make the history meaningless. |
 | `kv_cache_bytes`      | `bytes` | `lower_better`  | Live-inference KV resident bytes at end of generation: the *filled* prefix of the cache that actually serves decode (packed codes + scales + rotation/residual buffers, plus the per-position bf16/f32 decode buffers scaled to the filled length). Reads real Array shapes × dtype via `KvCache::resident_bytes`, but counts only `offset` positions of the seq-scaled buffers — the bf16/f32 decode mirrors are pre-allocated to the `--max-ctx` ceiling, so counting the whole allocation would inflate the figure and make bytes-per-KV-token depend on the ceiling rather than the prompt. Excludes any prompt-cache snapshot clone (held separately, never summed). Sampled at ONE lifecycle point on every arch — **after the decode loop**, when the decode-time GPU ring of a ring-backed codec is resident — so the figure is comparable across archs and across prompt-cache hit/miss. "One lifecycle point" means post-decode *and only when a decode ran*: an immediate-EOS run (no decode loop) does not refresh this metric and keeps the prior value — uniform across archs, and lossless since with no decode there is no ring. A NaN prefill is not in that category: it aborts the request outright, so there is no run to attribute a byte count to. The requirement is gated by a witness: `KvBytesCounter::store` takes a `PostDecode` minted only by a completed decode loop, so re-co-locating the store at the prefill snapshot fails to compile (the loop's witness is not in scope there). It is a raised bar + review convention backed by a manual-GPU re-drift test, not an unforgeable compile guarantee — `seal()` is `pub(crate)`. **Reading it back:** the "keeps the prior value" case above means a bare byte count cannot be attributed to a particular generation. `Architecture::kv_cache_bytes_sample()` therefore returns `(bytes, seq)`, where `seq` counts the stores on **that model instance** — the counter is a field on the model struct (`kv_bytes::KvBytesCounter`), not a per-arch static, so a second model of the same architecture generating concurrently cannot advance this one's sequence and have its byte count read back under this one's name. A caller that *records* the figure samples the pair before and after the generation and requires `seq` to have advanced; if it did not, the readable count belongs to an earlier generation (or is the unset `0` initialiser) and must be refused, not written. `Architecture::kv_cache_bytes()` returns the bare count and is for display surfaces (`/metrics/cache`) that have no generation boundary to check against — do not record from it. |
 | `tps_per_gb_ram`      | `ratio` | `higher_better` | `decode_tps_warm / peak_rss_gb` — runtime efficiency.                   |
@@ -529,13 +563,17 @@ Source of truth for `observations.metric`, `.unit`, `.direction`. Add to this ta
 | `accept_tokens_total`            | `count` | `higher_better` | Speculative decoding: cumulative verifier-accepted token count over the request. rmlx-only. |
 | `draft_rounds_total`             | `count` | `higher_better` | Speculative decoding: number of verifier rounds (one round = drafter proposes block, verifier accepts prefix). rmlx-only. |
 | `accepted_per_step`              | `ratio` | `higher_better` | Speculative decoding: `accept_tokens_total / draft_rounds_total` (mean accepted tokens per verifier step). rmlx-only. |
+| `tokens_per_round`               | `ratio` | `higher_better` | Speculative decoding: tokens the **rounds** produced per round, counted at the loops' own emit sites. The sidecar loops emit one bonus token out of the prefill forward before the first round and it is excluded, or their rows would read `+1/rounds` above a two-model row that did the same work (measured +1.35% and +0.98%). `1 + accept_rate x (block - 1)` only while every round drafts the configured block, which an adaptive drafter does not, so it is recorded and not derived. rmlx-only. |
+| `draft_ms_per_round`             | `ms`    | `lower_better`  | Speculative decoding: wall clock inside the drafter call, per round. rmlx-only. |
+| `verify_ms_per_round`            | `ms`    | `lower_better`  | Speculative decoding: wall clock inside the verify forward, per round. rmlx-only. |
+| `loop_ms_per_round`              | `ms`    | `lower_better`  | Speculative decoding: the round loop's own overhead per round — rollback, snapshot and restore, acceptance walks, sampling. A residual: the three `*_ms_per_round` partition one round's wall clock. rmlx-only. |
 | `ssd_bytes_used`                 | `bytes` | `lower_better`  | SSD-tier: current on-disk KV-block cache footprint per namespace. Unbounded growth is a budget risk; LowerBetter keeps regression gate alert on runaway accumulation. rmlx-only. |
 | `ssd_evict_total`                | `count` | `lower_better`  | SSD-tier: lifetime LRU eviction count. More evictions = more cache thrash. rmlx-only. |
 | `ssd_spill_ms`                   | `ms`    | `lower_better`  | SSD-tier: raw per-spill duration observation (drain thread, off-hot-path). One SQLite row per event. Real p50/p99 aggregation via Prometheus histogram `rmlx_ssd_spill_us_bucket`. rmlx-only. |
 | `ssd_hydrate_ms`                 | `ms`    | `lower_better`  | SSD-tier: raw per-hydrate duration observation (on request thread, RAM-miss cold path). One SQLite row per event. Real p50/p99 aggregation via Prometheus histogram `rmlx_ssd_hydrate_us_bucket`. rmlx-only. |
 | `ssd_spill_mb_per_s`             | `mb/s`  | `higher_better` | SSD-tier: spill throughput (bytes_written / dur_us). rmlx-only. |
 | `ssd_hydrate_mb_per_s`           | `mb/s`  | `higher_better` | SSD-tier: hydrate throughput (bytes_read / dur_us). rmlx-only. |
-| `ppl_wikitext2`                  | `ppl`   | `lower_better`  | Sliding-window perplexity over the wikitext-2 raw test split, computed by `rmlx eval ppl`. Architecture support: Qwen3 only (HTTP `echo` follow-up will widen coverage). rmlx-only. |
+| `ppl_wikitext2`                  | `ppl`   | `lower_better`  | Sliding-window perplexity over the wikitext-2 raw test split, computed by `rmlx eval ppl`. Architecture support: Qwen3, Gemma4, Qwen3.5. rmlx-only. |
 | `ppl_mean_nll`                   | `nat`   | `lower_better`  | Per-token mean negative log-likelihood from the same scorer (natural-log nats). Audit field paired with `ppl_*`. rmlx-only. |
 | `ppl_scored_tokens`              | `count` | `higher_better` | Number of corpus positions scored. Audit field. rmlx-only. |
 | `ppl_windows`                    | `count` | `higher_better` | Number of sliding-window forwards the scorer ran. Audit field. rmlx-only. |
@@ -564,7 +602,7 @@ floor is itself a measurement:
 | Durations (`ms`) | `0` included | 3.6e6 (1 h) | Millisecond resolution rounds a sub-ms span to zero. A single span past an hour is a hung run. |
 | Counters (`count`) | `0` included | 1e12 | Zero cache hits is a real observation. |
 | Gauges (`mb`, `bytes`) | `0` included, except `peak_rss_mb` | 1e9 MB / 1e13 B | A live process always has RSS; a run can genuinely allocate no Metal. |
-| Ratios (`ratio`) | `0` included | 1.0 (or 1e3 for `accepted_per_step`) | Rates of acceptance are honestly zero. |
+| Ratios (`ratio`) | `0` included | 1.0 (or 1e3 for `accepted_per_step` / `tokens_per_round`) | Rates of acceptance are honestly zero, and a per-round count is not a fraction. |
 
 Ceilings are deliberately loose — several × the best value ever recorded — so
 they reject fabrications, not fast machines. NaN and infinities are outside
@@ -703,6 +741,76 @@ because nothing enforces it.
     AND prompt_id IN (SELECT id FROM prompts WHERE name LIKE 'wikitext-2_ctx2048%');
   ```
 
+- **35 `ppl_*` rows (7 runs) on `Ternary-Bonsai-8B-mlx-2bit`, scored with a
+  warm-up one slot too late** — the non-BOS scorer skipped `ctx_window - stride`
+  leading slots where the slot that scores the first unseen corpus position is
+  `ctx_window - stride - 1`, so exactly one corpus position per window boundary
+  was never scored. `ppl_scored_tokens` is the metric that moved most: it *is*
+  the denominator that changed, by `windows - 1`, and `ppl_mean_nll` and
+  `ppl_windows` come off the same runs — which is why the predicate below covers
+  the whole `ppl_` family and not just the headline metric.
+
+  The arithmetic, all in rows (a run files five `ppl_*` rows, so run counts are
+  a fifth of these and mixing the two units is what makes the subtraction look
+  wrong): **365 total − 230 Gemma4 − 80 at `stride == ctx_window` − 20 post-fix
+  = 35**.
+
+  **Three conditions, all necessary**, and the selector is narrow because a
+  predicate that flags good rows is one readers learn to ignore:
+
+  - **Not the Gemma4 scorer.** It prepends BOS, which shifts each target one
+    slot, and it already subtracted the one. It was always correct. 230 rows
+    (46 runs). The predicate names the affected model rather than excluding a
+    `gemma%` prefix: `medgemma-1.5-4b-it-8bit` is already in `observations` and
+    does not start with `gemma`, so a prefix test would flag its future `ppl_*`
+    rows as affected — the exact over-selection this entry exists to avoid.
+  - **`stride < ctx_window`.** At `stride == ctx_window` the old expression gives
+    `ctx_window - stride = 0` and the new gives `0.saturating_sub(1) = 0`:
+    identical, and the scored sets are byte-identical. The whole `2026-09-03`
+    Bonsai batch is in that case. 80 rows (16 runs). `COALESCE(notes, '')`
+    because a bare `LIKE` against a NULL `notes` evaluates to NULL and drops the
+    row from the affected set — a fail-open in the direction that matters, and
+    this predicate is the durable artifact.
+  - **A pre-fix binary.** `git_sha` is the discriminator, not the date. This
+    change was made on a branch, so a run from a pre-fix binary *after* the fix
+    landed files an affected row that no date predicate catches; the four shas
+    below are what the DB holds today, and a fifth would have to be added here
+    rather than inferred. 20 rows (4 runs) carry the post-fix sha. No affected
+    row has a NULL `git_sha`.
+
+  At the default `--ctx-window 4096 --stride 2048` the effect is one position in
+  2048 — 0.05% of the denominator — and the resulting shift in `ppl` is far under
+  any gate it has been used for. At `stride == 1` it was total: every window
+  after the first scored nothing.
+
+  ```sql
+  SELECT * FROM observations
+  WHERE metric LIKE 'ppl_%'
+    AND model = 'Ternary-Bonsai-8B-mlx-2bit'
+    AND COALESCE(notes, '') NOT LIKE
+        '%ctx_window=' || ctx_max || ' stride=' || ctx_max || '%'
+    AND git_sha IN ('2bcf206', '2bcf206-dirty', '6eeb4ae-dirty', 'a71d88b-dirty');
+  ```
+
+- **`dflash/*` rows on `Qwen3.8-27B-4bit`, measured against a DFlash 2
+  checkpoint** — the drafter loader implements the earlier DFlash architecture
+  and reads none of the candidate-selector or per-layer dynamic-convolution
+  tensors a DFlash 2 snapshot ships. It used to build the drafter out of the
+  rest and serve, so the rows are honest measurements of *that* drafter and not
+  of the published one. `decode_config` says `dflash/block=N` either way and
+  cannot tell them apart, which is why the loader now refuses such a snapshot
+  outright: no further row of this kind can be written. The `2026-09-04`
+  block-16 rows and the `2026-09-05` block-8 ones are the ones already here. Do
+  not compare them against a row taken once the full drafter is implemented.
+  `z-lab/Qwen3.6-35B-A3B-DFlash` reads every tensor it ships and is unaffected
+  by the refusal.
+
+  ```sql
+  SELECT * FROM observations
+  WHERE decode_config LIKE 'dflash/%'
+    AND model = 'Qwen3.8-27B-4bit';
+  ```
+
 - **Two synthetic rows from an ingest-refusal probe** — a review of the
   boundary-layer work exercised the ingest path's refusals by handing it
   near-real records, and two of them were accepted instead of refused. They
@@ -768,6 +876,19 @@ because nothing enforces it.
   from that row's own fields into a column that was NULL for want of existing;
   no measurement is written, corrected or moved.
 
+- **`eagle/block=5` beside `eagle3/block=5`** — two cells, one drafter, from a
+  bench script that wrote the drafter's name as `eagle` where the engine writes
+  `eagle3` (`DraftKind::as_str`). 16 rows carry the old name (ids 122751–122766)
+  and rank against nothing. Unlike the DFlash split that migration 008 closed,
+  this is a **name** and not a policy the loop always had: nothing recorded says
+  the two populations ran the same drafter on the same code, so reclassifying
+  them would be an assertion rather than a correction. Re-running the cell is
+  what fills it.
+
+  ```sql
+  SELECT * FROM observations WHERE decode_config LIKE 'eagle/%';
+  ```
+
 Anything anchoring on a recorded rate — a roofline, a champion table, a
 `rmlx metrics rank` — should read `bests`, or one of the `query::*` functions,
 all of which apply the bound already. A consumer that genuinely needs the raw
@@ -818,6 +939,10 @@ itself.
 | `accept_tokens_total`             | yes | no | no | no | no | no | no | no |
 | `draft_rounds_total`              | yes | no | no | no | no | no | no | no |
 | `accepted_per_step`               | yes | no | no | no | no | no | no | no |
+| `tokens_per_round`                | yes | no | no | no | no | no | no | no |
+| `draft_ms_per_round`              | yes | no | no | no | no | no | no | no |
+| `verify_ms_per_round`             | yes | no | no | no | no | no | no | no |
+| `loop_ms_per_round`               | yes | no | no | no | no | no | no | no |
 
 `no` = backend genuinely can't measure. `maybe` = backend exposes it but recording path not wired. rMLX TTFT/ITL/kv_cache_bytes are wired via the EventRecorder → `events` table; cold/warm TTFT is distinguished by a first-load flag. Metal peak alloc is also wired.
 
@@ -1608,9 +1733,33 @@ This:
 1. Queries `bests` for the canonical 5-model × N-KV grid.
 2. Renders cells per the existing layout in `BENCHMARK_CHAMPIONS.md`.
 3. Marks unsupported cells `N/A`, broken-output cells `x` (manual flag in `description`).
-4. Footer lines list the run_id + git_sha behind each champion cell.
+4. Names, in each row's `Updated` column, the run behind that row's metric columns.
 
 The hand-edit rule remains: if you didn't run a bench, don't touch the file. Now: if you didn't UPSERT a strictly-better row, the file won't change.
+
+### 9.1 What the `Updated` column means
+
+Every metric column of a row is a separate `bests` lookup — one partition per
+cell **and metric** (§3.3) — so a row's decode record and its memory record can
+come from two runs, and often do once a cell has been measured more than once.
+The column therefore reports provenance for the metric columns and nothing
+else:
+
+- **One run behind all of them** — its date, its `run_id` and its notes.
+- **More than one** — `no single run —` followed by each `run_id` and the
+  columns it backs. There is no single run to name and the column says so;
+  naming the newest, or any other one of them, would put a run id and its notes
+  beside numbers that run does not contain, which reads as provenance and is
+  not.
+- **No metric column printed at all** — `-`.
+
+`git_sha` is not in this column. It reaches `--csv`, `--json` and `--jsonl`,
+which emit one record per champion row and so carry it per value; from a
+markdown row, `run_id` is the key to look it up in `observations`.
+
+`KV GB` and `reduction vs bf16` are outside the column's scope. Both are minima
+over every cell matching the model, across backends and prompts, and back to no
+single observation.
 
 ---
 

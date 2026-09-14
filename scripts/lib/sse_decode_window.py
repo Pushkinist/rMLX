@@ -28,17 +28,30 @@ reading of the same window; see `scripts/spec_bench.sh`.
 
 Output (stdout), one `key=value` per line:
 
-    tokens=<n>          completion tokens, from the usage chunk when present
+    tokens=<n>          completion tokens from the usage chunk, or — when it
+                        carried none — the count of content chunks. A caller
+                        that must not publish a client derivation under an
+                        engine field's name reads `completion_tokens` instead.
+    completion_tokens=<n>  from the usage chunk; omitted when it carried none
     content_chunks=<n>  chunks that carried text — the window's token count
     prompt_tokens=<n>   from the usage chunk; omitted when it carried none
     decode_tps=<f>      omitted when the response has no measurable window
+    answer_sha256=<hex> sha256 of the whole completion, reasoning included
     preview=<text>      first 64 characters of the completion, newlines folded
+
+`answer_sha256` is what a caller comparing two responses reads. `preview` is 64
+characters, and two answers that agree for a sentence and then diverge share it,
+so comparing previews would call them one answer. The digest covers
+`reasoning_content` as well as `content`, for the same reason the window counts
+both: they are tokens the model generated, and a run that thought differently
+answered differently.
 
 Exit codes: 0 — read; 2 — `--raw` could not be written; 3 — more content chunks
 arrived than the completion had tokens.
 """
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -106,12 +119,15 @@ def report(arrivals, text, usage_tokens, prompt_tokens):
         )
     tokens = usage_tokens if usage_tokens is not None else len(arrivals)
     lines = [f"tokens={tokens}", f"content_chunks={len(arrivals)}"]
+    if usage_tokens is not None:
+        lines.append(f"completion_tokens={usage_tokens}")
     if prompt_tokens is not None:
         lines.append(f"prompt_tokens={prompt_tokens}")
     if len(arrivals) >= 2:
         window = arrivals[-1] - arrivals[0]
         if window > 0:
             lines.append(f"decode_tps={(len(arrivals) - 1) / window:.6f}")
+    lines.append(f"answer_sha256={hashlib.sha256(text.encode('utf-8')).hexdigest()}")
     preview = text[:PREVIEW_CHARS].replace("\n", " ").replace("\r", " ")
     lines.append(f"preview={preview}")
     return lines

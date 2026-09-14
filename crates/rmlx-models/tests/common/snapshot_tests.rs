@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{apply, choose, override_snapshot, slug_snapshot, Gate, GoldenModel, Snapshot};
+use super::{apply, choose, override_snapshot, slug_snapshot, Gate, GoldenModel, Role, Snapshot};
 
 const SLUG: &str = "vendor__model-8b-2bit";
 const ARCH: &str = "ExampleForCausalLM";
@@ -50,6 +50,12 @@ const RECORDING: bool = true;
 ///   `model.safetensors.index.json`, else `model.safetensors`, else errors.
 const HARNESS_OPENS_ALL: [&str; 2] = ["config.json", "tokenizer.json"];
 const HARNESS_OPENS_ANY: [&str; 2] = ["model.safetensors.index.json", "model.safetensors"];
+
+/// What a drafter's loader opens, transcribed the same way: every
+/// `<Kind>Drafter::load` in `rmlx_models::speculative` reads `config.json` and
+/// the weights, and none of them constructs a tokenizer — the round loop is
+/// handed the verifier's.
+const SIDECAR_OPENS_ALL: [&str; 1] = ["config.json"];
 
 /// Create `<parent>/<name>/` holding every file a runnable snapshot needs,
 /// with `architectures[0]` set to `arch`.
@@ -80,36 +86,42 @@ fn as_str(p: &Path) -> &str {
 #[test]
 fn a_dir_built_from_the_constants_satisfies_every_harness_call_site() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let dir = tmp.path().join("exactly-the-constants");
-    std::fs::create_dir_all(&dir).expect("create dir");
-    for f in super::REQUIRED_FILES {
-        std::fs::write(dir.join(f), b"{}").expect("write required file");
-    }
-    // The sharded shape, because it is the one every large snapshot uses: the
-    // index entrypoint plus the shard it names.
-    std::fs::write(dir.join("model.safetensors.index.json"), b"{}").expect("write index");
-    std::fs::write(dir.join("model-00001-of-00001.safetensors"), b"").expect("write shard");
+    for (role, opened_all) in [
+        (Role::Standalone, &HARNESS_OPENS_ALL[..]),
+        (Role::Sidecar, &SIDECAR_OPENS_ALL[..]),
+    ] {
+        let dir = tmp.path().join(format!("exactly-the-constants-{role:?}"));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        for f in super::required_files(role) {
+            std::fs::write(dir.join(f), b"{}").expect("write required file");
+        }
+        // The sharded shape, because it is the one every large snapshot uses: the
+        // index entrypoint plus the shard it names.
+        std::fs::write(dir.join("model.safetensors.index.json"), b"{}").expect("write index");
+        std::fs::write(dir.join("model-00001-of-00001.safetensors"), b"").expect("write shard");
 
-    for opened in HARNESS_OPENS_ALL {
+        for opened in opened_all {
+            assert!(
+                dir.join(opened).exists(),
+                "a {role:?} caller opens {opened} by name, but the minimum directory the \
+                 constants describe does not contain it"
+            );
+        }
         assert!(
-            dir.join(opened).exists(),
-            "the harness opens {opened} by name, but the minimum directory the \
-             constants describe does not contain it"
+            HARNESS_OPENS_ANY.iter().any(|f| dir.join(f).exists()),
+            "load_shard_index needs one of {HARNESS_OPENS_ANY:?}, but the minimum \
+             directory contains neither"
+        );
+        assert!(
+            super::has_any_shard(&dir),
+            "an entrypoint names weights that must exist; the minimum directory has none"
+        );
+        assert!(
+            super::is_snapshot_dir(&dir, role),
+            "the minimum {role:?} directory the constants describe must satisfy the check \
+             that reads them"
         );
     }
-    assert!(
-        HARNESS_OPENS_ANY.iter().any(|f| dir.join(f).exists()),
-        "load_shard_index needs one of {HARNESS_OPENS_ANY:?}, but the minimum \
-         directory contains neither"
-    );
-    assert!(
-        super::has_any_shard(&dir),
-        "an entrypoint names weights that must exist; the minimum directory has none"
-    );
-    assert!(
-        super::is_snapshot_dir(&dir),
-        "the minimum directory the constants describe must satisfy the check that reads them"
-    );
 }
 
 /// The majority half-written shape: JSONs and the index all present, shards
@@ -130,10 +142,10 @@ fn an_index_naming_shards_that_are_absent_is_not_runnable() {
     std::fs::write(dir.join("model.safetensors.index.json"), b"{}").expect("write index");
 
     assert!(
-        !super::is_snapshot_dir(&dir),
+        !super::is_snapshot_dir(&dir, Role::Standalone),
         "an index with no shard behind it is a download in flight, not a snapshot"
     );
-    let got = slug_snapshot(Some(as_str(root.path())), SLUG);
+    let got = slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone);
     assert!(
         matches!(got, Snapshot::Absent(_)),
         "got {got:?} for a sharded snapshot whose shards have not arrived"
@@ -152,7 +164,7 @@ fn models_root_alone_resolves_the_snapshot() {
     let dir = make_snapshot(root.path(), SLUG, ARCH);
 
     assert_eq!(
-        slug_snapshot(Some(as_str(root.path())), SLUG),
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
         Snapshot::Found {
             path: dir,
             arch: ARCH.to_owned()
@@ -169,7 +181,7 @@ fn a_root_without_the_slug_is_absent() {
     let root = tempfile::tempdir().expect("tempdir");
     make_snapshot(root.path(), "some-other-model", ARCH);
 
-    let got = slug_snapshot(Some(as_str(root.path())), SLUG);
+    let got = slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone);
 
     assert!(
         matches!(got, Snapshot::Absent(_)),
@@ -185,7 +197,7 @@ fn a_root_that_does_not_exist_is_misconfigured() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("o-modles-typo");
 
-    let got = slug_snapshot(Some(as_str(&root)), SLUG);
+    let got = slug_snapshot(Some(as_str(&root)), SLUG, Role::Standalone);
 
     assert!(
         matches!(got, Snapshot::Misconfigured(_)),
@@ -200,7 +212,7 @@ fn a_root_that_is_a_file_is_misconfigured() {
     let root = tmp.path().join("not-a-dir");
     std::fs::write(&root, b"x").expect("write file");
 
-    let got = slug_snapshot(Some(as_str(&root)), SLUG);
+    let got = slug_snapshot(Some(as_str(&root)), SLUG, Role::Standalone);
 
     assert!(matches!(got, Snapshot::Misconfigured(_)), "got {got:?}");
 }
@@ -224,12 +236,77 @@ fn a_half_written_snapshot_under_the_root_is_absent() {
             std::fs::write(partial.join(f), b"{}").expect("write partial file");
         }
 
-        let got = slug_snapshot(Some(as_str(root.path())), SLUG);
+        let got = slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone);
 
         assert!(
             matches!(got, Snapshot::Absent(_)),
             "a snapshot holding only {present:?} must not resolve as runnable; got {got:?}"
         );
+    }
+}
+
+/// Create `<parent>/<name>/` the way mlx-community ships a drafter sidecar:
+/// config and weights, no tokenizer of its own.
+fn make_sidecar(parent: &Path, name: &str, arch: &str) -> PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).expect("create sidecar dir");
+    std::fs::write(
+        dir.join("config.json"),
+        format!(r#"{{"architectures":["{arch}"]}}"#),
+    )
+    .expect("write config.json");
+    std::fs::write(dir.join("model.safetensors"), b"").expect("write weights");
+    dir
+}
+
+/// A drafter is decoded with the verifier's tokenizer and ships none, so
+/// requiring one of it turns a checkpoint that is on disk into an absence — and
+/// an absence stands the gate down while it reports `ok`. Both directions are
+/// asserted here: the sidecar resolves, and the same directory asked for as a
+/// standalone model does not, naming the file it lacks.
+#[test]
+fn a_sidecar_resolves_without_the_tokenizer_it_does_not_ship() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = make_sidecar(root.path(), SLUG, ARCH);
+
+    assert_eq!(
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Sidecar),
+        Snapshot::Found {
+            path: dir,
+            arch: ARCH.to_owned()
+        },
+        "a drafter sidecar must resolve from the root that holds it"
+    );
+
+    let got = slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone);
+    match got {
+        Snapshot::Absent(why) => assert!(
+            why.contains("tokenizer.json"),
+            "a standalone caller stands down because the tokenizer is missing, and must \
+             say which file: {why}"
+        ),
+        other => panic!("a snapshot with no tokenizer cannot serve a standalone caller: {other:?}"),
+    }
+}
+
+/// The sidecar role drops the tokenizer requirement and nothing else. Each
+/// case names the file it is missing, because the whole point of the split is
+/// that a diagnosis says what to put on disk.
+#[test]
+fn a_sidecar_still_needs_its_config_and_its_weights() {
+    for missing in ["config.json", "model.safetensors"] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = make_sidecar(root.path(), SLUG, ARCH);
+        std::fs::remove_file(dir.join(missing)).expect("remove the file under test");
+
+        let got = slug_snapshot(Some(as_str(root.path())), SLUG, Role::Sidecar);
+        match got {
+            Snapshot::Absent(why) => assert!(
+                why.contains(missing) || why.contains("model.safetensors[.index.json]"),
+                "a sidecar without {missing} must name what it lacks: {why}"
+            ),
+            other => panic!("a sidecar without {missing} is not runnable: {other:?}"),
+        }
     }
 }
 
@@ -266,7 +343,7 @@ fn both_real_weight_layouts_complete_a_snapshot() {
 
         assert!(
             matches!(
-                slug_snapshot(Some(as_str(root.path())), SLUG),
+                slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
                 Snapshot::Found { .. }
             ),
             "the {what} layout must resolve"
@@ -277,10 +354,13 @@ fn both_real_weight_layouts_complete_a_snapshot() {
 /// No configuration at all — a developer without weights, and the hosted CI.
 #[test]
 fn nothing_configured_is_absent() {
-    let got = slug_snapshot(None, SLUG);
+    let got = slug_snapshot(None, SLUG, Role::Standalone);
     assert!(matches!(got, Snapshot::Absent(_)), "got {got:?}");
     assert!(
-        matches!(slug_snapshot(Some(""), SLUG), Snapshot::Absent(_)),
+        matches!(
+            slug_snapshot(Some(""), SLUG, Role::Standalone),
+            Snapshot::Absent(_)
+        ),
         "an empty root must not resolve to the filesystem root"
     );
 }
@@ -290,8 +370,8 @@ fn nothing_configured_is_absent() {
 /// Unset, or the empty string a shell uses to mean unset.
 #[test]
 fn an_unset_or_empty_override_is_none() {
-    assert!(override_snapshot(None).is_none());
-    assert!(override_snapshot(Some("")).is_none());
+    assert!(override_snapshot(None, Role::Standalone).is_none());
+    assert!(override_snapshot(Some(""), Role::Standalone).is_none());
 }
 
 #[test]
@@ -300,7 +380,7 @@ fn an_override_naming_a_runnable_snapshot_is_found() {
     let dir = make_snapshot(tmp.path(), "single", OTHER_ARCH);
 
     assert_eq!(
-        override_snapshot(Some(as_str(&dir))),
+        override_snapshot(Some(as_str(&dir)), Role::Standalone),
         Some(Snapshot::Found {
             path: dir,
             arch: OTHER_ARCH.to_owned()
@@ -339,7 +419,7 @@ fn an_override_naming_anything_unrunnable_is_misconfigured() {
         .expect("write index");
 
     for dir in [&absent, &empty, &config_only, &no_shards, &index_no_shards] {
-        let got = override_snapshot(Some(as_str(dir)));
+        let got = override_snapshot(Some(as_str(dir)), Role::Standalone);
         assert!(
             matches!(got, Some(Snapshot::Misconfigured(_))),
             "{} must be a hard failure, got {got:?}",

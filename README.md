@@ -52,7 +52,7 @@ coding agent (Claude Code, Cursor, Aider, OpenCode).
 - **Quantization** — affine 2–8 bit, mxfp4 / mxfp8, nvfp4, ParoQuant weights;
   KV-cache quant incl. fp8, TurboQuant, RotorQuant, PlanarQuant, IsoQuant,
   paged-KV, mixed / asymmetric K/V, and an SSD KV tier.
-- **Speculative decoding** — MTP, DFlash, and Eagle3 drafters.
+- **Speculative decoding** — MTP, DFlash and Eagle3 sidecar drafters, or a smaller full model of the same family as the draft.
 - **Prompt caching** — automatic prefix caching with block hashing.
 
 Conversion (`rmlx convert`, MLX → MLX re-quantize / layout repack) is a roadmap

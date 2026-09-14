@@ -25,7 +25,7 @@ pub(crate) mod registry;
 
 pub use loader::{load_model, run_smoke_probe, smoke_prompt_ids, LoadOpts, SMOKE_PROMPT};
 pub use phases::{read_load_phases, LoadPhases};
-pub use registry::{is_arch_supported, KNOWN_ARCHS};
+pub use registry::{is_arch_supported, is_generative_arch, KNOWN_ARCHS};
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
@@ -431,10 +431,15 @@ impl Architecture {
     ///
     /// Processes `ids` in windows of at most `chunk_size` tokens, accumulating
     /// KV/GDN caches normally across chunks. Returns
-    /// `(logits[1,1,vocab], concat_hidden[1,n,n_aux*hidden])` where logits
-    /// covers only the single last prompt position (sufficient for the first
-    /// bonus token) and `concat_hidden` covers all `n` positions (needed for
-    /// the drafter KV prefill).
+    /// `(logits[1,1,vocab], hidden[1,kept,n_aux*hidden])` where logits covers
+    /// only the single last prompt position (sufficient for the first bonus
+    /// token).
+    ///
+    /// `keep_last` is how many trailing capture rows the caller will read:
+    /// `None` for all `n` of them, which is what a drafter conditioning its own
+    /// KV prefill on every prompt position needs, and `Some(k)` for one that
+    /// attends over a sliding window, whose earlier chunks are then released
+    /// during the prefill instead of joined and thrown away.
     ///
     /// Avoids materialising a `[1, n, vocab]` logit tensor in a single Metal
     /// command buffer, eliminating GPU timeouts for n > ~1k on Qwen3.6-MoE.
@@ -451,6 +456,7 @@ impl Architecture {
         kv_caches: &mut [rmlx_kv_quant::KvCache],
         lin_caches: Option<&mut [rmlx_kv_quant::LinearAttnCache]>,
         chunk_size: usize,
+        keep_last: Option<usize>,
         device: Device,
     ) -> Result<(Array, Array)> {
         match self {
@@ -460,6 +466,7 @@ impl Architecture {
                 kv_caches,
                 lin_caches,
                 chunk_size,
+                keep_last,
                 device,
             ),
             _ => Err(Error::Model(
@@ -509,8 +516,14 @@ impl Architecture {
         }
     }
 
-    /// Apply the verifier's final RMSNorm to a pre-final-norm hidden (MTP
-    /// drafter conditioning -- `speculative_draft_hidden`). Gemma4 only.
+    /// Apply the architecture's final RMSNorm to a pre-final-norm hidden (MTP
+    /// drafter conditioning -- `speculative_draft_hidden`).
+    ///
+    /// This is the only place the norm is applied on this path:
+    /// [`Architecture::logits_from_hidden`] composes it with the head, so an
+    /// architecture supplies the norm and the head and never its own spelling of
+    /// the pair. One that supplies the head alone fails here rather than scoring
+    /// an un-normed hidden through it.
     #[allow(
         clippy::wildcard_enum_match_arm,
         reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
@@ -518,45 +531,50 @@ impl Architecture {
     pub fn apply_final_norm(&self, hidden: &Array, device: Device) -> Result<Array> {
         match self {
             Architecture::Gemma4(m) => m.apply_final_norm(hidden, device),
-            _ => Err(Error::Model(
-                "apply_final_norm: Gemma4 only (assistant MTP)".into(),
-            )),
+            Architecture::Qwen3_5Moe(m) => m.apply_final_norm(hidden, device),
+            other => Err(Error::Model(format!(
+                "apply_final_norm not yet wired for {}",
+                other.arch_class()
+            ))),
         }
     }
 
-    /// Re-derive logits from a pre-final-norm hidden state.
+    /// Re-derive logits from a **pre-final-norm** hidden state: `final_norm`
+    /// then the LM head.
     ///
     /// Inverse of the tail dropped by [`Architecture::forward_hidden_states`].
-    /// Routes to `Gemma4Text::logits_from_hidden`; other architectures return
-    /// `Error::Model`. `hidden`: `[1, n, hidden]` -> `[1, n, vocab]`.
-    #[allow(
-        clippy::unreachable,
-        reason = "Architecture::Gemma4 and Qwen3_5Moe arms are handled by the outer match; \
-                  the inner arms are structurally unreachable -- required to exhaust the enum \
-                  for the arch-name string table"
-    )]
+    /// A caller holding an already-normed hidden wants
+    /// [`Architecture::logits_from_final_hidden`] instead. The two contracts
+    /// used to share this one name, and the architecture that supplied the head
+    /// alone quietly reweighted the vocabulary by the norm's own weight vector
+    /// for every caller that handed it a raw capture.
+    ///
+    /// Composed here rather than per architecture, so there is one place the
+    /// norm and the head meet and no second implementation to agree with.
+    /// `hidden`: `[1, n, hidden]` -> `[1, n, vocab]`.
+    pub fn logits_from_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
+        let normed = self.apply_final_norm(hidden, device)?;
+        self.logits_from_final_hidden(&normed, device)
+    }
+
+    /// Logits from a hidden state the caller has **already final-normed**.
+    ///
+    /// The counterpart of [`Architecture::logits_from_hidden`]: LM head (and
+    /// the architecture's logit softcap) with no norm. A verify pass that
+    /// captured after the final norm — or a drafter with a final norm of its
+    /// own — holds this shape.
     #[allow(
         clippy::wildcard_enum_match_arm,
         reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
     )]
-    pub fn logits_from_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
+    pub fn logits_from_final_hidden(&self, hidden: &Array, device: Device) -> Result<Array> {
         match self {
-            Architecture::Gemma4(m) => m.logits_from_hidden(hidden, device),
-            Architecture::Qwen3_5Moe(m) => m.logits_from_hidden(hidden, device),
-            other => {
-                let arch = match other {
-                    Architecture::Gemma4(_) | Architecture::Qwen3_5Moe(_) => unreachable!(),
-                    Architecture::Gemma3(_) => "Gemma3",
-                    Architecture::Qwen2(_) => "Qwen2",
-                    Architecture::Qwen3(_) => "Qwen3",
-                    Architecture::Laguna(_) => "Laguna",
-                    Architecture::Qwen3VlMoe(_) => "Qwen3VlMoe",
-                    Architecture::BitNet(_) => "BitNet",
-                };
-                Err(Error::Model(format!(
-                    "logits_from_hidden not yet wired for {arch} (Gemma4 only)"
-                )))
-            }
+            Architecture::Gemma4(m) => m.logits_from_final_hidden(hidden, device),
+            Architecture::Qwen3_5Moe(m) => m.logits_from_final_hidden(hidden, device),
+            other => Err(Error::Model(format!(
+                "logits_from_final_hidden not yet wired for {}",
+                other.arch_class()
+            ))),
         }
     }
 

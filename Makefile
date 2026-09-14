@@ -96,6 +96,12 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest \
         canary-ab-host-gate-fixtures llama-ab-selftest spec-bench-selftest \
+        spec-bench-published-selftest published-ingest-selftest \
+        published-table check-published-table published-table-selftest \
+        check-spec-metric-parity check-spec-metric-parity-fixtures \
+        check-spec-sampling check-spec-sampling-fixtures \
+        check-spec-charge check-spec-charge-fixtures \
+        check-published-samples check-published-samples-fixtures \
         mlx-preflight mlx-restore-pin target-gc target-size-report profile-gputrace \
         profile-mst \
         build-capture test-capture gputrace-preflight traces-gc \
@@ -104,7 +110,8 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         bench-codec-cell \
         smoke-codec-matrix \
         e2e \
-        file-size-report check-no-inline-tests check-no-scalar-f32-leak \
+        file-size-report debt-report debt-report-selftest \
+        check-no-inline-tests check-no-scalar-f32-leak \
         check-doc-source-citations \
         check-kv-layer-quants check-kv-codec-disposition \
         check-kv-codec-disposition-fixtures \
@@ -241,6 +248,12 @@ test-perf:       ## cargo test --profile release-perf (release-perf profile, pan
 #     visits five crates and holds the GPU while it does. Fail on the broad,
 #     shareable step before spending exclusive-GPU minutes.
 #
+# The last line reads the runner's own verdict rather than asserting one. A
+# suite whose snapshot is not on disk stands down, which is not a failure and
+# has no exit code — so a `ci-perf ok` printed after it claimed a gate had held
+# when it had never been asked. The runner marks such a run INCOMPLETE on its
+# final line and lists what stood down; this target says so instead of `ok`.
+#
 # The runner is invoked directly rather than through `$(MAKE) gpu-test`. Make
 # propagates command-line variables to sub-makes, so `make ci-perf CRATE=…` or
 # `VALIDATE=0` would silently reach the runner and narrow or disarm the gate:
@@ -264,8 +277,14 @@ test-perf:       ## cargo test --profile release-perf (release-perf profile, pan
 ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (separate from make ci; run before merging perf-sensitive or codec-layer changes)
 	@bash scripts/run_gpu_tests.sh --preflight
 	$(MAKE) test-perf
-	@bash scripts/run_gpu_tests.sh
-	@echo "ci-perf ok"
+	@log="$$(mktemp)"; rc="$$(mktemp)"; \
+	{ bash scripts/run_gpu_tests.sh; echo $$? >"$$rc"; } | tee "$$log"; \
+	code="$$(cat "$$rc")"; rm -f "$$rc"; \
+	if [ "$$code" -ne 0 ]; then rm -f "$$log"; exit "$$code"; fi; \
+	if grep -q INCOMPLETE "$$log"; then \
+	  echo "ci-perf INCOMPLETE — the GPU suite did not run every gate it names (see above)"; \
+	else echo "ci-perf ok"; fi; \
+	rm -f "$$log"
 
 # gpu-test: the execution step for the tests `check-gpu-tests-ignored` mandates.
 # Every test reaching Device::Gpu must carry #[ignore] (a shared Metal context
@@ -393,6 +412,12 @@ hooks:           ## install the pre-commit git hook
 file-size-report: ## advisory: print source files >1000 LOC (non-failing)
 	@bash scripts/file_size_report.sh
 
+debt-report: ## advisory: sibling similarity, debt counters, add/remove ratio, oversized docs (non-failing; also runs at the end of `make ci`)
+	@bash scripts/debt_report.sh
+
+debt-report-selftest: ## CI gate: recall test for debt-report over synthetic fixtures — a planted twin, a non-twin, the round-loop group, and a two-commit ratio repo
+	@bash scripts/debt_report_selftest.sh
+
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
 	@bash scripts/check_no_inline_tests.sh
 
@@ -416,6 +441,75 @@ check-kv-byte-model-parity-fixtures: ## CI gate: recall test for the above — 8
 
 check-kv-boundary-default-parity: ## CI gate: fail if the CLI help, docs/CLI.md or the ingest resolver names a different default KV boundary than the engine
 	@bash scripts/check_kv_boundary_default_parity.sh
+
+.PHONY: check-spec-metric-parity
+check-spec-metric-parity: ## CI gate: fail if the speculative metrics the engine declares are not the ones the bench records
+	@bash scripts/check_spec_metric_parity.sh
+
+.PHONY: check-spec-metric-parity-fixtures
+check-spec-metric-parity-fixtures: ## CI gate: recall test for the above — one synthetic scan root per case, asserting the reason as well as the exit code
+	@bash scripts/check_spec_metric_parity_fixtures.sh
+
+.PHONY: check-spec-sampling
+check-spec-sampling: ## CI gate: fail if a speculative round loop is not handed the request's sampler, or a drafter arm does not pass it
+	@bash scripts/check_spec_sampling.sh
+
+.PHONY: check-spec-sampling-fixtures
+check-spec-sampling-fixtures: ## CI gate: recall test for the above — 27 cases over two tree shapes, each asserting the reason as well as exit 1 vs exit 2
+	@bash scripts/check_spec_sampling_fixtures.sh
+
+.PHONY: check-spec-charge
+check-spec-charge: ## CI gate: fail if a speculative round loop names more than one phase-charge decision, or the census over the loops moves
+	@bash scripts/check_spec_charge.sh
+
+.PHONY: check-spec-charge-fixtures
+check-spec-charge-fixtures: ## CI gate: recall test for the above — 76 cases over three tree shapes, each asserting the reason as well as exit 1 vs exit 2
+	@bash scripts/check_spec_charge_fixtures.sh
+
+.PHONY: check-published-samples
+check-published-samples: ## CI gate: fail if the checked-in published sample sets do not re-derive from their recorded seeds, digests and templates
+	@python3 scripts/published_samples.py verify
+
+.PHONY: check-published-samples-fixtures
+check-published-samples-fixtures: ## CI gate: recall test for the above — one synthetic sample-set root per case, asserting the reason as well as the exit code
+	@bash scripts/check_published_samples_fixtures.sh
+
+# The committed published-protocol table is generated, never hand-written. It
+# is rendered from the checked-in fixture until a real three-pass run's result
+# files are checked in beside it; regenerating it from real results and leaving
+# the fixture as the gate's input turns `check-published-table` red, which is
+# the intended way to find out that the inputs to a published number were not
+# recorded.
+PUBLISHED_TABLE_FIXTURES := scripts/fixtures/published_table
+PUBLISHED_TABLE_RESULTS ?= $(PUBLISHED_TABLE_FIXTURES)/result_plain.json \
+                           $(PUBLISHED_TABLE_FIXTURES)/result_mtp.json \
+                           $(PUBLISHED_TABLE_FIXTURES)/result_dflash.json
+PUBLISHED_TABLE_MODEL ?= $(PUBLISHED_TABLE_FIXTURES)/fixture__published-table-16L
+
+.PHONY: published-table
+published-table: ## regenerate docs/PUBLISHED_PROTOCOL.md (PUBLISHED_TABLE_RESULTS= / PUBLISHED_TABLE_MODEL= to render a real run)
+	@python3 scripts/lib/published_table.py $(PUBLISHED_TABLE_RESULTS) \
+		--model $(PUBLISHED_TABLE_MODEL) --out docs/PUBLISHED_PROTOCOL.md
+	@echo "wrote docs/PUBLISHED_PROTOCOL.md"
+
+.PHONY: check-published-table
+check-published-table: ## CI gate: the committed published-protocol table is what the emitter renders from its checked-in inputs
+	@rendered=$$(mktemp) && trap 'rm -f "$$rendered"' EXIT && \
+	python3 scripts/lib/published_table.py \
+		$(PUBLISHED_TABLE_FIXTURES)/result_plain.json \
+		$(PUBLISHED_TABLE_FIXTURES)/result_mtp.json \
+		$(PUBLISHED_TABLE_FIXTURES)/result_dflash.json \
+		--model $(PUBLISHED_TABLE_FIXTURES)/fixture__published-table-16L \
+		--out "$$rendered" && \
+	diff -u docs/PUBLISHED_PROTOCOL.md "$$rendered" || { \
+		echo "ERROR: docs/PUBLISHED_PROTOCOL.md is not what the emitter renders."; \
+		echo "  It is generated, never hand-written: run \`make published-table\`,"; \
+		echo "  or check in the result files the committed table was rendered from."; \
+		exit 1; }
+
+.PHONY: published-table-selftest
+published-table-selftest: ## CI gate: mutation check for the published-protocol table emitter (no GPU, no model)
+	@bash scripts/published_table_selftest.sh
 
 check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited in docs/ does not exist
 	@bash scripts/check_doc_source_citations.sh
@@ -466,6 +560,7 @@ check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips
 
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
+	@bash scripts/debt_report_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_kv_layer_quants.sh
@@ -474,6 +569,14 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_kv_byte_model_parity.sh
 	@bash scripts/check_kv_byte_model_parity_fixtures.sh
 	@bash scripts/check_kv_boundary_default_parity.sh
+	@bash scripts/check_spec_metric_parity.sh
+	@bash scripts/check_spec_metric_parity_fixtures.sh
+	@bash scripts/check_spec_sampling.sh
+	@bash scripts/check_spec_sampling_fixtures.sh
+	@bash scripts/check_spec_charge.sh
+	@bash scripts/check_spec_charge_fixtures.sh
+	@python3 scripts/published_samples.py verify
+	@bash scripts/check_published_samples_fixtures.sh
 	@bash scripts/check_doc_source_citations.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_eval_lock.sh
@@ -490,10 +593,15 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/perf_ab_ingest_selftest.sh
 	@bash scripts/bench_llama_ab_selftest.sh
 	@bash scripts/spec_bench_selftest.sh
+	@bash scripts/spec_bench_published_selftest.sh
+	@bash scripts/published_ingest_selftest.sh
+	@bash scripts/published_table_selftest.sh
+	@$(MAKE) --no-print-directory check-published-table
 	@bash scripts/check_metal_format.sh
 	@bash scripts/check_metal_compiles.sh
 	@bash scripts/file_size_report.sh || true
 	@bash scripts/target_size_report.sh || true
+	@bash scripts/debt_report.sh || true
 	@echo "ci ok"
 
 # tag: derive v<version> from the single source of truth
@@ -673,6 +781,13 @@ llama-ab-selftest: ## mutation-check the llama-server A/B harness against a stub
 
 spec-bench-selftest: ## mutation-check the spec-decode bench against a stub server (no GPU, no model, no DB write)
 	bash scripts/spec_bench_selftest.sh
+
+spec-bench-published-selftest: ## mutation-check the published-protocol bench against a stub server (no GPU, no model)
+	bash scripts/spec_bench_published_selftest.sh
+
+.PHONY: published-ingest-selftest
+published-ingest-selftest: ## mutation-check the published-protocol runs.db ingester against synthetic results (no DB write)
+	bash scripts/published_ingest_selftest.sh
 
 canary-gate:        ## gate TPS regressions via runs.db (SHA= required; e.g. make canary-gate SHA=3ba8aee)
 	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make canary-gate SHA=<last-green-sha>"; exit 125; }

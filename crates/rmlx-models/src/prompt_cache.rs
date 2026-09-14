@@ -23,7 +23,8 @@
 //! `PromptCacheEntry` exposes:
 //! - `prompt_token_ids() -> &[u32]` — key for prefix matching.
 //! - `deep_clone() -> Result<Self>` — cheap refcount clone of MLX arrays.
-//! - `truncate_kv_to(prefix_len: usize)` — trim KV caches to prefix length.
+//! - `truncate_kv_to(prefix_len: usize) -> Result<()>` — trim KV caches to
+//!   prefix length.
 //! - `kv_bytes() -> u64` — RAM estimate for eviction budget.
 //!
 //! ## Stats
@@ -340,21 +341,27 @@ pub(crate) trait PromptCacheEntry: Sized {
     ///
     /// Called on a cloned entry before re-prefilling the tail. The default
     /// body trims only the KV caches (`offset() > 0` guard skips never-filled
-    /// layers). The recurrent GDN [`lin_caches`] are deliberately NOT reachable
+    /// layers). It fails when a layer cannot reach `prefix_len` without losing
+    /// state it still has to serve — a wrapped SWA ring. Callers gate on
+    /// `KvCache::can_truncate_to` and degrade to a re-prefill, so the failure
+    /// path here is the gate having gone out of step with the caches.
+    ///
+    /// The recurrent GDN [`lin_caches`] are deliberately NOT reachable
     /// from this default — that "never truncate linear state" invariant is now
     /// structural: linear state is re-run on the tail, never sliced. Override
     /// only for a mock or a genuinely different per-arch policy.
     ///
     /// [`lin_caches`]: PromptCacheEntry::lin_caches
-    fn truncate_kv_to(&mut self, prefix_len: usize) {
+    fn truncate_kv_to(&mut self, prefix_len: usize) -> Result<()> {
         for kv in self.kv_caches_mut() {
             if kv.offset() > 0 {
-                kv.truncate_to(prefix_len as i32);
+                kv.truncate_to(prefix_len as i32)?;
             }
         }
         // lin caches deliberately untouched: recurrent GDN state is re-run on
         // the tail, never truncated. Structural now — the default body cannot
         // reach them.
+        Ok(())
     }
 
     /// Block-aligned truncation: trim KV caches to `block_count` full blocks.
@@ -365,8 +372,8 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// (every layer cache trimmable — no wrapped-SWA desync). Qwen3.5-MoE never
     /// calls it: its recurrent GDN `lin_caches` cannot be reconstructed from a
     /// block-truncated KV, so MoE is gated to full-token-equality (Exact) reuse.
-    fn truncate_kv_to_block(&mut self, block_count: usize) {
-        self.truncate_kv_to(block_count * BLOCK_TOKENS);
+    fn truncate_kv_to_block(&mut self, block_count: usize) -> Result<()> {
+        self.truncate_kv_to(block_count * BLOCK_TOKENS)
     }
 
     /// Approximate RAM held by this entry's KV/recurrent state, in bytes.
@@ -1337,9 +1344,12 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     ///    clones (+ truncates) for reuse. Hook `None` or an incomplete hydrate
     ///    degrades to `Miss`.
     ///
-    /// Every degrade branch emits exactly one `debug!{branch, reason}` so the
-    /// decision is reconstructable from a single run's log — the cached arches
-    /// previously had silent degrade arms.
+    /// Every arm that resolves to `Miss` emits exactly one
+    /// `debug!{branch, reason}`, including the two that carry no degrade — the
+    /// plain no-slot-match (`no_match`) and the not-yet-built cache
+    /// (`no_cache`). A silent `Miss` is worse than an unlogged one: a reader
+    /// counting branch events cannot tell it from an event that was emitted and
+    /// lost, so the two failures look identical in a captured stream.
     ///
     /// `n_layers` is the asking model's decoder-layer count — it sizes the
     /// per-layer mixture folded into the seed, so it must be the same count the
@@ -1388,8 +1398,17 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         // the value instead of re-reading a global.
         let dispatch_policy = rmlx_core::dispatch_policy();
 
-        self.with_inner_mut(|guard| match guard.as_mut() {
-            Some(cache) => Self::decide_locked(
+        self.with_inner_mut(|guard| {
+            let Some(cache) = guard.as_mut() else {
+                tracing::debug!(
+                    arch,
+                    branch = "no_cache",
+                    reason = "no cache built for this arch yet — prefill",
+                    prompt_len = prompt_ids.len(),
+                );
+                return Consumed::Miss;
+            };
+            Self::decide_locked(
                 arch,
                 policy,
                 cache,
@@ -1397,8 +1416,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
                 kv_quant,
                 seed,
                 dispatch_policy,
-            ),
-            None => Consumed::Miss,
+            )
         })
     }
 
@@ -1439,33 +1457,35 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
 
         // (4) Quant-mismatch guard. The snapshot is only safe to
         // reuse when the stored KvQuant equals the runtime quant.
-        let (slot_idx, block_count) = match raw_match {
-            Some((slot_idx, block_count)) => {
-                let stored = cache.slots[slot_idx].entry.kv_quant();
-                if stored == Some(kv_quant) {
-                    (slot_idx, block_count)
-                } else {
-                    tracing::debug!(
-                        arch,
-                        branch = "quant_mismatch",
-                        reason = "stored KV quant differs from runtime — evict + re-prefill",
-                        stored = ?stored,
-                        runtime = ?kv_quant,
-                        prompt_len = prompt_ids.len(),
-                    );
-                    tracing::warn!(
-                        stored = ?stored,
-                        runtime = ?kv_quant,
-                        prompt_len = prompt_ids.len(),
-                        "prompt cache KV quant mismatch — evicting entry, \
-                         degrading to re-prefill"
-                    );
-                    cache.evict_slot(slot_idx);
-                    return Consumed::Miss;
-                }
-            }
-            None => return Consumed::Miss,
+        let Some((slot_idx, block_count)) = raw_match else {
+            tracing::debug!(
+                arch,
+                branch = "no_match",
+                reason = "no stored slot shares a block-aligned prefix with this prompt — prefill",
+                prompt_len = prompt_ids.len(),
+            );
+            return Consumed::Miss;
         };
+        let stored = cache.slots[slot_idx].entry.kv_quant();
+        if stored != Some(kv_quant) {
+            tracing::debug!(
+                arch,
+                branch = "quant_mismatch",
+                reason = "stored KV quant differs from runtime — evict + re-prefill",
+                stored = ?stored,
+                runtime = ?kv_quant,
+                prompt_len = prompt_ids.len(),
+            );
+            tracing::warn!(
+                stored = ?stored,
+                runtime = ?kv_quant,
+                prompt_len = prompt_ids.len(),
+                "prompt cache KV quant mismatch — evicting entry, \
+                 degrading to re-prefill"
+            );
+            cache.evict_slot(slot_idx);
+            return Consumed::Miss;
+        }
 
         let entry = &cache.slots[slot_idx].entry;
         let is_ssd_hydrated = entry.is_ssd_hydrated();

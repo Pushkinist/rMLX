@@ -862,19 +862,27 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
     let db = dir.join("index.db");
     let fx = Arc::new(seed_race_fixture(&dir, &db, device));
     // Sized so both arms of the race stay well populated: the writer's filler
-    // keeps the namespace over the ceiling (so the budget pass always has work
-    // and lookups keep missing), while the prompt blocks are not crowded down to
-    // a survival rate that would let a slow box reach zero hits and skip the
-    // content check entirely. A hit does touch its block to the back of the
-    // eviction queue, but the writer records fresh filler continuously and every
-    // one of those lands ahead of it, so a prompt block survives only until
-    // enough newer filler arrives — the headroom is what keeps `hits > 0`
-    // robust rather than lucky. Measured: ~32-42% hits over 240 lookups.
-    let budget = fx.block_bytes * (RACE_PROMPTS as u64 * 4);
+    // keeps the namespace over the ceiling (so the budget pass always has work),
+    // while the prompt blocks are not crowded down to a survival rate that would
+    // let a slow box reach zero hits and skip the content check entirely. A hit
+    // touches its block to the back of the eviction queue and the writer's
+    // filler lands ahead of it, so a prompt block survives until enough newer
+    // filler arrives — the headroom is what keeps `hits > 0` robust rather than
+    // lucky. Measured: 228-240 hits of 240 lookups.
+    let budget = fx.block_bytes * RACE_BUDGET_BLOCKS;
+
+    // Seed the namespace over the ceiling before the race starts. Without this
+    // the only thing pushing it over is the writer thread, which has to win
+    // enough rounds against the request thread's 240 lookups to get there; on a
+    // loaded box it does not, and the budget pass then has nothing to evict
+    // through no fault of the code under test.
+    seed_race_filler(&dir, &db, fx.block_bytes, RACE_PRESEED_FILLER);
 
     // Pre-race pass on quiet state: every prompt hits and its content is its
     // own. This is what stops the racing assertions below from passing on a run
-    // that only ever saw misses.
+    // that only ever saw misses. It also touches every prompt block to the back
+    // of the eviction queue, leaving the filler seeded just above as the oldest
+    // rows — so the forced eviction takes filler and the prompts survive it.
     {
         let hydrator = SsdHydrator::with_index(
             MODEL_ID,
@@ -914,9 +922,17 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
         std::thread::spawn(move || {
             let idx = SsdKvIndex::open_at(&db).unwrap();
             barrier.wait();
-            while stop.load(Ordering::Acquire) == 0 {
+            // At least one pass, always: the stop flag is only raised once the
+            // request thread has finished, but nothing orders this thread's
+            // first read of it against that, and a thread that observed the
+            // raised flag on its first look would leave the seeded
+            // over-ceiling state unenforced.
+            loop {
                 let n = crate::ssd_tier::enforce_namespace_budget(&idx, NS, budget);
                 evicted_total.fetch_add(n, Ordering::AcqRel);
+                if stop.load(Ordering::Acquire) != 0 {
+                    break;
+                }
                 std::thread::yield_now();
             }
         })
@@ -1021,10 +1037,19 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
         (RACE_PASSES * RACE_PROMPTS) as u64,
         "every racing lookup must resolve to a hit or a miss"
     );
+    // The namespace was seeded `RACE_FORCED_EVICTIONS` blocks over the ceiling
+    // and the budget pass runs at least once, so this floor holds whatever the
+    // three threads' scheduling does. It is not a restatement of the setup: a
+    // budget pass that stopped evicting — an `evict_lru_until` that reads the
+    // footprint wrong, or a namespace whose rows it no longer selects — reaches
+    // the floor from below and fails here, rather than leaving the racing
+    // assertions above to run against a tier nothing was evicting from.
+    let evicted = evicted_total.load(Ordering::Acquire);
     assert!(
-        evicted_total.load(Ordering::Acquire) > 0,
-        "the budget pass must have actually evicted during the race, \
-         otherwise nothing was raced"
+        evicted >= RACE_FORCED_EVICTIONS,
+        "the budget pass evicted {evicted} blocks from a namespace seeded \
+         {RACE_FORCED_EVICTIONS} blocks over its ceiling, so the racing lookups \
+         above ran against a tier nothing was evicting from"
     );
 }
 
@@ -1032,6 +1057,12 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
 const RACE_PROMPTS: usize = 6;
 /// Layout key the racing-budget fixture spills and probes under.
 const RACE_LK: u64 = 0x00c0_ffee_0000_0001;
+/// Blocks the racing-budget namespace ceiling admits.
+const RACE_BUDGET_BLOCKS: u64 = RACE_PROMPTS as u64 * 4;
+/// Filler blocks seeded before the race, on top of the one block per prompt.
+const RACE_PRESEED_FILLER: u64 = RACE_BUDGET_BLOCKS;
+/// Blocks the ceiling forces out of the seeded state, before the race adds any.
+const RACE_FORCED_EVICTIONS: u64 = RACE_PROMPTS as u64 + RACE_PRESEED_FILLER - RACE_BUDGET_BLOCKS;
 
 /// One indexed block per prompt, plus everything a checker needs to tell those
 /// blocks apart after a round trip through the tier.
@@ -1094,6 +1125,32 @@ fn seed_race_fixture(dir: &std::path::Path, db: &std::path::Path, device: Device
         expected_k,
         kvb_bytes,
         block_bytes,
+    }
+}
+
+/// Record `count` filler blocks of `block_bytes` each into `dir`'s index, so the
+/// namespace starts the race above its ceiling. Filler carries no content
+/// anything reads back; it exists to be evicted.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test-only: fixture setup against a fresh TempDir, where a failure is a broken fixture rather than a result to interpret"
+)]
+fn seed_race_filler(dir: &std::path::Path, db: &std::path::Path, block_bytes: u64, count: u64) {
+    let index = SsdKvIndex::open_at(db).unwrap();
+    for n in 0..count {
+        let key = format!("preseed{n:012x}");
+        let path = dir.join(format!("{key}.kvb"));
+        std::fs::write(&path, vec![0u8; block_bytes as usize]).unwrap();
+        index
+            .record(
+                &key,
+                RACE_LK,
+                &path,
+                MODEL_ID,
+                &QUANT.to_string(),
+                block_bytes,
+            )
+            .unwrap();
     }
 }
 

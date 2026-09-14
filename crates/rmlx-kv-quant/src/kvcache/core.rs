@@ -457,24 +457,27 @@ impl KvCache {
         self.rotating.is_some()
     }
 
-    /// True if this cache can be losslessly rolled back via [`truncate_to`].
+    /// True if [`KvCache::truncate_to`] can reach `n` without losing a
+    /// position this cache would still have to serve.
     ///
-    /// Byte-for-byte port of mlx-lm `can_trim_prompt_cache`'s per-cache
-    /// predicate (`cache.py`): plain `KVCache` / `QuantizedKVCache` are
-    /// always trimmable (`is_trimmable() -> True`); a `RotatingKVCache` is
-    /// trimmable only while it has NOT wrapped (`offset < max_size`,
-    /// `cache.py:542-543`). Once an SWA ring buffer wraps, the pre-wrap K/V
-    /// have been overwritten and `truncate_to` silently no-ops on it
-    /// (`rotating::trim_lossless` returns 0) — truncating the other layers
-    /// while this one stays full would desync the caches and corrupt the
-    /// re-prefilled tail. C1's gemma4 partial-prefix path uses this to gate
-    /// the block-truncate fast path: it only fires when EVERY layer cache
-    /// reports `is_trimmable()` (mlx-lm `all(c.is_trimmable())`).
-    pub fn is_trimmable(&self) -> bool {
-        match &self.rotating {
-            Some(rot) => rot.offset < rot.max_size,
-            None => true,
-        }
+    /// Plain and quantized stores carry the whole sequence, so any `n` at or
+    /// under the offset is reachable. A sliding-window ring is reachable while
+    /// it has not wrapped — mlx-lm's `is_trimmable` (`cache.py:542-543`) — and,
+    /// past the wrap, while it is still in the temporal order a block write
+    /// leaves it in and holds enough positions to spare `n` of them. That
+    /// second regime is what makes a speculative round's rejected tail
+    /// rollable; see `rotating::RotatingState::can_trim`.
+    ///
+    /// `truncate_to` fails on exactly the cases this refuses. A caller that can
+    /// re-prefill instead — the gemma4 partial-prefix path — asks first and
+    /// takes the slower route; a caller with no second route lets the failure
+    /// surface.
+    pub fn can_truncate_to(&self, n: i32) -> bool {
+        n <= self.offset
+            && self
+                .rotating
+                .as_ref()
+                .is_none_or(|rot| rot.can_trim(self.offset - n))
     }
 
     /// Current fill offset in tokens (number of tokens appended so far).

@@ -394,7 +394,9 @@ mod tests {
         cache.update(&k, &v, device).expect("update must not fail");
         assert_eq!(cache.offset(), 8);
 
-        cache.truncate_to(3);
+        cache
+            .truncate_to(3)
+            .expect("a full-attention store rolls back to any prefix");
         assert_eq!(cache.offset(), 3, "offset must equal truncation target");
         match &cache.storage {
             KvStorage::K8V8 { k, v, .. } => {
@@ -457,7 +459,9 @@ mod tests {
         assert_eq!(cache.offset(), total_tokens);
 
         let keep = 3;
-        cache.truncate_to(keep);
+        cache
+            .truncate_to(keep)
+            .expect("a full-attention store rolls back to any prefix");
         assert_eq!(cache.offset(), keep, "offset must equal truncation target");
         match &cache.storage {
             KvStorage::IsoV3 { v, .. } => {

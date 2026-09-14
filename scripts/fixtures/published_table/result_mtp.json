@@ -1,0 +1,155 @@
+{
+ "schema_version": 1,
+ "backend": "rmlx",
+ "backend_version": "0.4.1",
+ "build_profile": "release-perf",
+ "hardware_tag": "m5_max_128gb",
+ "synthetic_arms": true,
+ "unverified_samples": false,
+ "arm": "speculative",
+ "model_namespace": "fixture",
+ "model": "published-table-16L",
+ "weight_quant": "bf16",
+ "kv_quant": "none",
+ "ctx_max": 8192,
+ "ts_utc": "2026-09-06T10:00:00Z",
+ "samples_root": "prompts/published",
+ "range_refusal_pct": 5,
+ "protocol": {
+  "passes": 3,
+  "warmups_per_pass": 1,
+  "macro_max_tokens": 1024,
+  "sampling_resolved": {
+   "temperature": 0.7,
+   "top_p": 0.95,
+   "top_k": 20,
+   "min_p": 0.0,
+   "seed": 42919
+  },
+  "thinking": "on, counted as output",
+  "seed_policy": "engine default, identical in all three passes"
+ },
+ "binary": {
+  "path": "target/release-perf/rmlx",
+  "sha256": "327e90b6f5e4f41efe7bedebaa79368b100a3ba64ac8e75a4113162caec385ce",
+  "size_bytes": 41000000,
+  "arm": "speculative",
+  "markers": {
+   "generate_streaming: TTFT": 1
+  }
+ },
+ "host": {
+  "pass_windows": [
+   "synthetic \u2014 no reading taken off this machine",
+   "synthetic \u2014 no reading taken off this machine",
+   "synthetic \u2014 no reading taken off this machine"
+  ],
+  "thermal": [],
+  "thermal_source": "pmset -g therm",
+  "taint": ""
+ },
+ "cells": {
+  "mt_bench:1024": {
+   "pass_means": [
+    104.8,
+    105.2192,
+    104.48559999999999
+   ],
+   "mean": 104.83493333333332,
+   "range_pct": 0.6997667444185366,
+   "stable": true,
+   "dataset": "mt_bench",
+   "max_tokens": 1024,
+   "samples": 80,
+   "ttft_ms_mean": 67.686,
+   "prompt_tokens_mean": 85.4,
+   "completion_tokens_mean": 381.2,
+   "sample_range_pct_max": 3.4,
+   "divergent_samples": 1,
+   "tokens_per_round": 3.412,
+   "accepted_per_step": 2.412,
+   "accept_rate": 0.40199999999999997
+  },
+  "math_500:1024": {
+   "pass_means": [
+    99.3,
+    99.6972,
+    99.0021
+   ],
+   "mean": 99.3331,
+   "range_pct": 0.6997667444185236,
+   "stable": true,
+   "dataset": "math_500",
+   "max_tokens": 1024,
+   "samples": 128,
+   "ttft_ms_mean": 70.143,
+   "prompt_tokens_mean": 112.7,
+   "completion_tokens_mean": 903.6,
+   "sample_range_pct_max": 3.4,
+   "divergent_samples": 2,
+   "tokens_per_round": 3.412,
+   "accepted_per_step": 2.412,
+   "accept_rate": 0.40199999999999997
+  },
+  "humaneval:1024": {
+   "pass_means": [
+    118.6,
+    119.0744,
+    118.24419999999999
+   ],
+   "mean": 118.63953333333332,
+   "range_pct": 0.6997667444185315,
+   "stable": true,
+   "dataset": "humaneval",
+   "max_tokens": 1024,
+   "samples": 128,
+   "ttft_ms_mean": 76.371,
+   "prompt_tokens_mean": 181.9,
+   "completion_tokens_mean": 312.4,
+   "sample_range_pct_max": 3.4,
+   "divergent_samples": 0,
+   "tokens_per_round": 3.412,
+   "accepted_per_step": 2.412,
+   "accept_rate": 0.40199999999999997
+  },
+  "math_500:4096": {
+   "pass_means": [
+    96.1,
+    96.4844,
+    95.81169999999999
+   ],
+   "mean": 96.13203333333333,
+   "range_pct": 0.6997667444185335,
+   "stable": true,
+   "dataset": "math_500",
+   "max_tokens": 4096,
+   "samples": 128,
+   "ttft_ms_mean": 70.143,
+   "prompt_tokens_mean": 112.7,
+   "completion_tokens_mean": 2604.8,
+   "sample_range_pct_max": 3.4,
+   "divergent_samples": 4,
+   "tokens_per_round": 3.412,
+   "accepted_per_step": 2.412,
+   "accept_rate": 0.40199999999999997
+  }
+ },
+ "macro": {
+  "pass_means": [
+   107.56666666666666,
+   107.99693333333333,
+   107.24396666666667
+  ],
+  "mean": 107.60252222222222,
+  "range_pct": 0.6997667444185263,
+  "stable": true,
+  "cells": [
+   "humaneval:1024",
+   "math_500:1024",
+   "mt_bench:1024"
+  ],
+  "max_tokens": 1024
+ },
+ "decode_config": "mtp_sidecar/block=7",
+ "block_size": 7
+}

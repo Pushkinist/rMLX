@@ -1,0 +1,215 @@
+{
+ "schema_version": 1,
+ "backend": "rmlx",
+ "backend_version": "0.4.1",
+ "build_profile": "release-perf",
+ "hardware_tag": "m5_max_128gb",
+ "synthetic_arms": true,
+ "unverified_samples": false,
+ "arm": "plain",
+ "model_namespace": "fixture",
+ "model": "published-table-16L",
+ "weight_quant": "bf16",
+ "kv_quant": "none",
+ "ctx_max": 8192,
+ "ts_utc": "2026-09-06T09:00:00Z",
+ "samples_root": "prompts/published",
+ "range_refusal_pct": 5,
+ "protocol": {
+  "passes": 3,
+  "warmups_per_pass": 1,
+  "macro_max_tokens": 1024,
+  "sampling_resolved": {
+   "temperature": 0.7,
+   "top_p": 0.95,
+   "top_k": 20,
+   "min_p": 0.0,
+   "seed": 42919
+  },
+  "thinking": "on, counted as output",
+  "seed_policy": "engine default, identical in all three passes"
+ },
+ "binary": {
+  "path": "target/release-perf/rmlx",
+  "sha256": "327e90b6f5e4f41efe7bedebaa79368b100a3ba64ac8e75a4113162caec385ce",
+  "size_bytes": 41000000,
+  "arm": "plain",
+  "markers": {
+   "generate_streaming: TTFT": 1
+  }
+ },
+ "host": {
+  "pass_windows": [
+   "synthetic \u2014 no reading taken off this machine",
+   "synthetic \u2014 no reading taken off this machine",
+   "synthetic \u2014 no reading taken off this machine"
+  ],
+  "thermal": [],
+  "thermal_source": "pmset -g therm",
+  "taint": ""
+ },
+ "cells": {
+  "mt_bench:1024": {
+   "pass_means": [
+    62.4,
+    62.6496,
+    62.2128
+   ],
+   "mean": 62.42080000000001,
+   "range_pct": 0.6997667444185239,
+   "stable": true,
+   "dataset": "mt_bench",
+   "max_tokens": 1024,
+   "samples": 80,
+   "ttft_ms_mean": 67.686,
+   "prompt_tokens_mean": 85.4,
+   "completion_tokens_mean": 381.2,
+   "sample_range_pct_max": 3.4,
+   "divergent_samples": 0
+  },
+  "math_500:1024": {
+   "pass_means": [
+    61.7,
+    61.9468,
+    61.514900000000004
+   ],
+   "mean": 61.72056666666668,
+   "range_pct": 0.6997667444185252,
+   "stable": true,
+   "dataset": "math_500",
+   "max_tokens": 1024,
+   "samples": 128,
+   "ttft_ms_mean": 70.143,
+   "prompt_tokens_mean": 112.7,
+   "completion_tokens_mean": 903.6,
+   "sample_range_pct_max": 3.4,
+   "divergent_samples": 2
+  },
+  "humaneval:1024": {
+   "pass_means": [
+    63.1,
+    63.3524,
+    62.9107
+   ],
+   "mean": 63.12103333333334,
+   "range_pct": 0.6997667444185341,
+   "stable": true,
+   "dataset": "humaneval",
+   "max_tokens": 1024,
+   "samples": 128,
+   "ttft_ms_mean": 76.371,
+   "prompt_tokens_mean": 181.9,
+   "completion_tokens_mean": 312.4,
+   "sample_range_pct_max": 3.4,
+   "divergent_samples": 0
+  },
+  "math_500:4096": {
+   "pass_means": [
+    60.2,
+    60.4408,
+    60.019400000000005
+   ],
+   "mean": 60.220066666666675,
+   "range_pct": 0.6997667444185245,
+   "stable": true,
+   "dataset": "math_500",
+   "max_tokens": 4096,
+   "samples": 128,
+   "ttft_ms_mean": 70.143,
+   "prompt_tokens_mean": 112.7,
+   "completion_tokens_mean": 2604.8,
+   "sample_range_pct_max": 3.4,
+   "divergent_samples": 3
+  }
+ },
+ "macro": {
+  "pass_means": [
+   62.400000000000006,
+   62.6496,
+   62.212799999999994
+  ],
+  "mean": 62.42079999999999,
+  "range_pct": 0.6997667444185355,
+  "stable": true,
+  "cells": [
+   "humaneval:1024",
+   "math_500:1024",
+   "mt_bench:1024"
+  ],
+  "max_tokens": 1024
+ },
+ "fixed_prompt": {
+  "prompt_tokens": 1355,
+  "target_tokens": 1355,
+  "max_tokens": 1024,
+  "body_sha256": "33b3a415d4922f9c948fedf2bc4bf427fff6991e16443464d1ba0b08d4d45a7a",
+  "corpus": "longctx_4k.json",
+  "corpus_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "memory_poll_ms": 250,
+  "words": 981,
+  "filler_word": "the",
+  "filler_reps": 3,
+  "messages": [
+   {
+    "role": "user",
+    "content": "A fixed 1355-token body."
+   }
+  ],
+  "decode_tps": {
+   "pass_means": [
+    61.8,
+    62.1,
+    61.6
+   ],
+   "mean": 61.833333333333336,
+   "range_pct": 0.8086253369272237,
+   "stable": true
+  },
+  "prefill_tps": {
+   "pass_means": [
+    4820.0,
+    4795.0,
+    4841.0
+   ],
+   "mean": 4818.666666666667,
+   "range_pct": 0.9546209186496954,
+   "stable": true
+  },
+  "ttft_ms": {
+   "pass_means": [
+    281.1,
+    282.5,
+    279.9
+   ],
+   "mean": 281.17,
+   "range_pct": 0.925
+  },
+  "completion_tokens": {
+   "pass_means": [
+    1024.0,
+    1024.0,
+    1024.0
+   ],
+   "mean": 1024.0,
+   "range_pct": 0.0
+  },
+  "phys_footprint_bytes": {
+   "run_values": [
+    9612000000,
+    9640000000,
+    9628000000
+   ],
+   "max": 9640000000,
+   "min": 9612000000
+  },
+  "rss_bytes": {
+   "run_values": [
+    9401000000,
+    9418000000,
+    9409000000
+   ],
+   "max": 9418000000,
+   "min": 9401000000
+  }
+ }
+}

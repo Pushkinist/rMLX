@@ -34,9 +34,7 @@ use std::path::PathBuf;
 
 use rmlx_mlx::Device;
 use rmlx_models::arch;
-use rmlx_models::speculative::gemma4_assistant::{
-    mtp_assistant_generate_greedy, Gemma4AssistantDrafter,
-};
+use rmlx_models::speculative::gemma4_assistant::{mtp_assistant_generate, Gemma4AssistantDrafter};
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key)
@@ -63,7 +61,10 @@ fn l2(bytes: &[u8]) -> f32 {
 #[test]
 fn embed_token_raw_applies_sqrt_hidden_scale() {
     let Some(model_path) = env_path("RMLX_KV_TEST_MODEL") else {
-        eprintln!("[mtp_align] RMLX_KV_TEST_MODEL unset/absent - skipping");
+        eprintln!(
+            "SKIP embed_token_raw_applies_sqrt_hidden_scale: RMLX_KV_TEST_MODEL does not \
+             name an existing snapshot directory"
+        );
         return;
     };
     let device = Device::Gpu;
@@ -97,7 +98,10 @@ fn mtp_assistant_accept_rate_is_high() {
         env_path("RMLX_KV_TEST_MODEL"),
         env_path("RMLX_DRAFT_TEST_MODEL"),
     ) else {
-        eprintln!("[mtp_align] verifier/draft model unset/absent - skipping");
+        eprintln!(
+            "SKIP mtp_assistant_accept_rate_is_high: RMLX_KV_TEST_MODEL and \
+             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
+        );
         return;
     };
     let device = Device::Gpu;
@@ -130,7 +134,15 @@ fn mtp_assistant_accept_rate_is_high() {
         None
     };
     let eos: Vec<u32> = Vec::new();
-    let steps = mtp_assistant_generate_greedy(
+    let sampler_cfg = rmlx_models::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(0),
+        top_logprobs_k: 0,
+    };
+    let (steps, _block) = mtp_assistant_generate(
         &verifier,
         &drafter,
         &tk,
@@ -141,6 +153,7 @@ fn mtp_assistant_accept_rate_is_high() {
         None,
         &eos,
         &mut step_fn,
+        &sampler_cfg,
         device,
     )
     .expect("mtp generate");

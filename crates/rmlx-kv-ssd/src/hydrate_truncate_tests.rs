@@ -61,6 +61,10 @@ fn build_kvcache_quant(quant: KvQuant, kv_h: i32, seq: i32, seed: u64) -> KvCach
     clippy::unwrap_used,
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertion: an unreachable rollback failure is the defect the test reports"
+)]
 fn a_prefilled_cache_has_no_block_list_to_cut() {
     let device = Device::Cpu;
     let shape = [1i32, 2, 64, 128];
@@ -84,7 +88,8 @@ fn a_prefilled_cache_has_no_block_list_to_cut() {
              cut this file exercises has nothing to act on"
         );
 
-        c.truncate_to(16);
+        c.truncate_to(16)
+            .expect("a full-attention store rolls back to any prefix");
         assert_eq!(c.offset(), 16, "{quant:?}: truncate moves the cache offset");
         assert_eq!(
             c.storage().resident_bytes(),
@@ -202,7 +207,9 @@ fn hydrated_truncate_keeps_prefix_and_correction(quant: KvQuant, kv_h: i32) {
         "{label}: full V decode length"
     );
 
-    cache.truncate_to(keep);
+    cache
+        .truncate_to(keep)
+        .expect("a full-attention store rolls back to any prefix");
 
     // The correction: distinct raw f32 from its own LCG stream.
     let corr_shape = [1_i32, kv_h, corr, head_dim];

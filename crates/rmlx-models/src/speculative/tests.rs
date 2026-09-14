@@ -301,7 +301,7 @@ fn emit_step_advances_the_window_once_per_token() {
     clippy::expect_used,
     reason = "test-only: the vocabulary is the literal three lines above, so a build failure is a broken `tokenizers` dependency and the panic names it"
 )]
-fn tiny_tokenizer() -> tokenizers::Tokenizer {
+pub(super) fn tiny_tokenizer() -> tokenizers::Tokenizer {
     use tokenizers::models::wordlevel::WordLevel;
 
     let vocab = (0_u32..8).map(|i| (format!("tok{i}"), i)).collect();
@@ -399,4 +399,673 @@ fn verifier_prefill_cuts_the_prompt_at_the_architectures_chunk() {
             "{class} prefill did not cut the prompt at its own chunk"
         );
     }
+}
+
+/// Deterministic `[1, 1, s, 2]` f32 K/V pair for the rollback tests below.
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn rollback_kv(s: i32, base: f32) -> Array {
+    let mut data: Vec<f32> = Vec::with_capacity((s * 2) as usize);
+    for p in 0..s {
+        data.push(base + p as f32);
+        data.push(base + p as f32 + 0.5);
+    }
+    Array::from_f32_slice(&data, &[1, 1, s, 2]).unwrap()
+}
+
+/// A prompt then three decode steps, which leaves a windowed layer rotated and
+/// a plain one able to roll back to anywhere.
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+fn filled_layer(window: Option<i32>, device: Device) -> KvCache {
+    let mut cache = KvCache::with_quant_max_seq_window(KvQuant::None, 512, window);
+    cache
+        .update(&rollback_kv(6, 0.0), &rollback_kv(6, 100.0), device)
+        .unwrap();
+    for step in 0..3 {
+        let p = (6 + step) as f32;
+        cache
+            .update(&rollback_kv(1, p), &rollback_kv(1, 100.0 + p), device)
+            .unwrap();
+    }
+    cache
+}
+
+/// `truncate_kv_to` moves every layer or none.
+///
+/// A stack left half rolled back is the same desync the ring fix exists to
+/// stop, reached through the failure path instead of through a silent no-op:
+/// the layers that did move sit behind an offset the refusing one still holds,
+/// and no caller can put them back. So the refusal is decided before any layer
+/// is touched, and it names the layer that decided it.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
+)]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the stack is built with two layers immediately above"
+)]
+#[allow(
+    clippy::panic,
+    reason = "the else-branch of a let-else that only a broken gate can reach"
+)]
+fn a_stack_with_one_layer_that_cannot_roll_back_moves_no_layer() {
+    let device = Device::Cpu;
+    // Layer 0 could reach the target on its own. Layer 1 is a window that
+    // decode writes left rotated, and cannot.
+    let mut stack = vec![filled_layer(None, device), filled_layer(Some(4), device)];
+    assert_eq!((stack[0].offset(), stack[1].offset()), (9, 9));
+    assert!(stack[0].can_truncate_to(8));
+    assert!(!stack[1].can_truncate_to(8));
+
+    let Err(err) = truncate_kv_to(&mut stack, 8) else {
+        panic!("a stack holding a layer that cannot reach 8 must not report success")
+    };
+    assert_eq!(
+        (stack[0].offset(), stack[1].offset()),
+        (9, 9),
+        "the layer that could roll back must not have"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("layer 1"),
+        "the refusal must name the layer: {msg}"
+    );
+    assert!(
+        msg.contains("cannot be rolled back to 8"),
+        "and the target it could not reach: {msg}"
+    );
+
+    // And the gate does not stand in the way of a rollback the whole stack can
+    // make. A target both layers are already at would prove nothing — it is
+    // `roll_back(0)` on one and a no-op on the other, and a loop that skipped
+    // the truncation outright would still pass it. So this one moves.
+    let mut reachable = vec![filled_layer(None, device), filled_layer(None, device)];
+    assert!(truncate_kv_to(&mut reachable, 7).is_ok());
+    assert_eq!(
+        (reachable[0].offset(), reachable[1].offset()),
+        (7, 7),
+        "a target every layer can reach must move every layer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Vocabulary pairing
+// ---------------------------------------------------------------------------
+
+/// A literal vocabulary: `pieces[i]` is the piece at id `i`.
+fn vocab_of(pieces: &[&str]) -> HashMap<String, u32> {
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(id, piece)| ((*piece).to_owned(), id as u32))
+        .collect()
+}
+
+/// The pairs `load_speculative` admits: one vocabulary spelled twice, and one
+/// that differs only by a short tail of specials the other side never emits —
+/// the shape a base and an audio release of one family actually ship.
+#[test]
+fn vocab_verdict_admits_identical_and_short_tail_pairs() {
+    let base = vocab_of(&["<pad>", "<bos>", "a", "b", "c"]);
+    assert!(vocab_pairing_verdict(&base, &base).is_ok());
+
+    let mut with_tail = base.clone();
+    for i in 0..7_u32 {
+        with_tail.insert(format!("<|special_{i}|>"), 5 + i);
+    }
+    assert!(vocab_pairing_verdict(&base, &with_tail).is_ok());
+    assert!(
+        vocab_pairing_verdict(&with_tail, &base).is_ok(),
+        "the tolerance is symmetric — either side may carry the tail"
+    );
+}
+
+/// A pair that agrees on size and disagrees on meaning is the case a
+/// `vocab_size` comparison cannot see, and the one that serves garbage rather
+/// than failing. The refusal names the id and both pieces.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_a_piece_that_differs_and_names_it() {
+    let verifier = vocab_of(&["<pad>", "<bos>", "a", "b", "c"]);
+    let draft = vocab_of(&["<pad>", "<bos>", "a", "B", "c"]);
+    let msg = vocab_pairing_verdict(&verifier, &draft)
+        .expect_err("same size, different piece at id 3")
+        .to_string();
+    assert!(msg.contains("token id 3"), "names the id: {msg}");
+    assert!(
+        msg.contains("\"b\"") && msg.contains("\"B\""),
+        "names both pieces: {msg}"
+    );
+
+    // An id one side skips inside the shared range is a difference too, not a
+    // tail: the other side can propose it.
+    let mut holed = verifier.clone();
+    holed.remove("a");
+    let msg = vocab_pairing_verdict(&verifier, &holed)
+        .expect_err("a hole inside the shared range")
+        .to_string();
+    assert!(
+        msg.contains("token id 2") && msg.contains("absent"),
+        "{msg}"
+    );
+}
+
+/// A tail past the tolerance is a different vocabulary, however well the
+/// prefix agrees. The bound is the one llama.cpp admits, so the two engines
+/// accept the same pairs.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_a_tail_past_the_tolerance() {
+    let base = vocab_of(&["<pad>", "<bos>", "a"]);
+    let mut long_tail = base.clone();
+    for i in 0..=(VOCAB_TAIL_TOLERANCE as u32) {
+        long_tail.insert(format!("<|extra_{i}|>"), 3 + i);
+    }
+    let msg = vocab_pairing_verdict(&base, &long_tail)
+        .expect_err("a tail of tolerance + 1 ids")
+        .to_string();
+    assert!(
+        msg.contains(&format!("{} more ids", VOCAB_TAIL_TOLERANCE + 1)),
+        "names the tail size: {msg}"
+    );
+
+    long_tail.remove(&format!("<|extra_{VOCAB_TAIL_TOLERANCE}|>"));
+    assert!(
+        vocab_pairing_verdict(&base, &long_tail).is_ok(),
+        "exactly the tolerance is admitted"
+    );
+}
+
+/// An id two pieces claim has no single meaning, and letting one win by hash
+/// order would make the verdict irreproducible. Refused naming the id and both
+/// pieces, on either side.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_an_id_two_pieces_claim() {
+    let clean = vocab_of(&["<pad>", "<bos>", "a", "b"]);
+    let mut doubled = clean.clone();
+    doubled.insert("B".to_owned(), 3);
+    for (verifier, draft, side) in [(&clean, &doubled, "draft"), (&doubled, &clean, "verifier")] {
+        let msg = vocab_pairing_verdict(verifier, draft)
+            .expect_err("two pieces at id 3")
+            .to_string();
+        assert!(
+            msg.contains(side) && msg.contains("token id 3 twice"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("\"b\"") && msg.contains("\"B\""),
+            "names both pieces: {msg}"
+        );
+    }
+}
+
+/// A vocabulary reaching past the ceiling is refused by name rather than
+/// walked, so one sentinel at a huge id cannot turn model load into a spin.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: expect_err IS the assertion — an Ok here is the defect under test"
+)]
+fn vocab_verdict_refuses_an_id_past_the_ceiling() {
+    let mut huge = vocab_of(&["<pad>", "<bos>", "a"]);
+    huge.insert("<sentinel>".to_owned(), VOCAB_ID_CEILING);
+    let msg = vocab_pairing_verdict(&huge, &huge)
+        .expect_err("a shared id at the ceiling")
+        .to_string();
+    assert!(
+        msg.contains(&format!("token id {VOCAB_ID_CEILING}")),
+        "names the id: {msg}"
+    );
+}
+
+/// `load_speculative` runs the verdict before it reads a config or a weight.
+///
+/// Two snapshot directories holding nothing but a `tokenizer.json` each: with
+/// the gate in place the refusal names the differing id; without it the call
+/// fails later, on the missing `config.json`, and says nothing about tokens.
+/// Every other test drives the verdict directly, so this is the one that fails
+/// when the call is deleted.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the tokenizers are literal and the tempdir is this process's own, so a failure to write either names a broken environment"
+)]
+fn load_speculative_refuses_a_foreign_tokenizer_before_reading_weights() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let write = |name: &str, pieces: &[&str]| -> std::path::PathBuf {
+        use tokenizers::models::wordlevel::WordLevel;
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).expect("snapshot dir");
+        let vocab = pieces
+            .iter()
+            .enumerate()
+            .map(|(id, piece)| ((*piece).to_owned(), id as u32))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".to_owned())
+            .build()
+            .expect("literal vocabulary builds a WordLevel model");
+        tokenizers::Tokenizer::new(model)
+            .save(dir.join("tokenizer.json"), false)
+            .expect("write tokenizer.json");
+        dir
+    };
+    let verifier = write("verifier", &["<unk>", "<bos>", "sea", "sky"]);
+    let draft = write("draft", &["<unk>", "<bos>", "sea", "SKY"]);
+
+    let msg = SpeculativeDispatcher::load_speculative(&verifier, &draft, Device::Cpu)
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(
+        msg.contains("token id 3"),
+        "the pair must be refused on the token, before any weight is read: {msg:?}"
+    );
+    assert!(
+        !msg.contains("config.json"),
+        "the refusal reached the config read — the vocabulary gate did not run: {msg:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance walk
+// ---------------------------------------------------------------------------
+
+/// The walk, unwrapped, for the cases whose block is well formed.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: each caller passes a block one longer than its proposals, which is the shape the walk accepts"
+)]
+fn walk(verifier: &[u32], draft: &[u32], budget: usize) -> (usize, Vec<u32>) {
+    accept_prefix(verifier, draft, budget).expect("a block one longer than its proposals")
+}
+
+#[test]
+fn accept_prefix_all_accepted_emits_the_bonus_token() {
+    let (acc, emit) = walk(&[10, 11, 12, 99], &[10, 11, 12], 8);
+    assert_eq!(acc, 3);
+    assert_eq!(emit, vec![10, 11, 12, 99]);
+}
+
+#[test]
+fn accept_prefix_stops_at_the_first_disagreement_and_emits_the_correction() {
+    let (acc, emit) = walk(&[10, 11, 55, 0], &[10, 11, 12], 8);
+    assert_eq!(acc, 2);
+    assert_eq!(emit, vec![10, 11, 55]);
+}
+
+#[test]
+fn accept_prefix_emits_only_the_correction_when_nothing_is_accepted() {
+    let (acc, emit) = walk(&[42, 0, 0], &[10, 11], 8);
+    assert_eq!(acc, 0);
+    assert_eq!(emit, vec![42]);
+}
+
+#[test]
+fn accept_prefix_budget_caps_the_emission_and_not_the_acceptance() {
+    // The round committed three drafts to the caches whatever the token budget
+    // was; a walk that reported two accepts here would leave the KV holding a
+    // position the loop believes it rolled back.
+    let (acc, emit) = walk(&[10, 11, 12, 99], &[10, 11, 12], 2);
+    assert_eq!(acc, 3);
+    assert_eq!(emit, vec![10, 11]);
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the call is deliberately malformed and an Ok here is the assertion failing"
+)]
+fn accept_prefix_refuses_a_block_that_is_not_its_proposals_plus_a_bonus() {
+    // The two arguments are same-typed slices and the order carries the whole
+    // meaning. Swapped, this compiles and — before the check — returned an
+    // accept count that then drove the KV rollback.
+    let verifier = [10u32, 11, 12, 99];
+    let draft = [10u32, 11, 12];
+    let err = accept_prefix(&draft, &verifier, 8).expect_err("arguments the wrong way round");
+    let msg = err.to_string();
+    assert!(
+        msg.contains('3') && msg.contains('4'),
+        "the refusal must name both counts so a swapped call site is identifiable, got: {msg}"
+    );
+    // A block missing its bonus slot is the same defect arriving from the other
+    // side: there is no correction to emit and nothing should guess one.
+    assert!(accept_prefix(&[10, 11], &[10, 11], 8).is_err());
+    // And a block with more than one bonus slot. The refusal is `!=` and not
+    // `<`: a verifier block one too long is a verify forward that scored a
+    // position the round never proposed for, and reading a correction out of it
+    // emits a token from the wrong position.
+    assert!(accept_prefix(&[10, 11, 12, 99, 0], &[10, 11, 12], 8).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Reading the verifier's argmax back
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the fixture buffer is built two lines above with the byte count the call asks for, so an Err here is the assertion failing"
+)]
+fn argmax_tokens_reads_one_id_per_verified_position() {
+    let bytes: Vec<u8> = [7u32, 9, 11].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let got = argmax_tokens(&bytes, 3).expect("three positions, twelve bytes");
+    assert_eq!(got, vec![7, 9, 11]);
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the fixture buffer is built two lines above with the byte count the call asks for, so an Err here is the assertion failing"
+)]
+fn argmax_tokens_stops_at_the_block_and_ignores_a_longer_buffer() {
+    let bytes: Vec<u8> = [7u32, 9, 11].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let got = argmax_tokens(&bytes, 2).expect("two positions asked for");
+    assert_eq!(got, vec![7, 9]);
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the fixture buffer is built two lines above with the byte count the call asks for, so an Err here is the assertion failing"
+)]
+fn argmax_tokens_names_a_short_buffer_instead_of_panicking() {
+    // The read runs once per round. A slice-and-unwrap here aborts the request
+    // with a bounds panic and no mention of the device that came back short.
+    let bytes: Vec<u8> = [7u32, 9].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let err = argmax_tokens(&bytes, 3).expect_err("three positions, eight bytes");
+    let msg = err.to_string();
+    assert!(
+        msg.contains('8') && msg.contains("12") && msg.contains('3'),
+        "the refusal must name the bytes it got, the bytes it needed and the \
+         positions it was reading for, got: {msg}"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the fixture buffer is built two lines above with the byte count the call asks for, so an Err here is the assertion failing"
+)]
+fn argmax_tokens_of_an_empty_block_reads_nothing() {
+    assert_eq!(
+        argmax_tokens(&[], 0).expect("no positions"),
+        Vec::<u32>::new()
+    );
+}
+
+// --- unread_tensor_refusal ---
+
+/// A snapshot every tensor of which was read loads; one carrying tensors the
+/// loader has no code for is refused, naming them and naming the loader that
+/// refused.
+///
+/// Both directions, because the quiet direction is what keeps the check from
+/// decaying into noise a reader learns to skip. Mutation this fails on:
+/// `!consumed.contains(name)` -> `consumed.contains(name)`, which refuses the
+/// supported checkpoint and admits the unsupported one.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test assertions: panicking on unexpected values is intentional"
+)]
+fn a_snapshot_a_loader_only_half_reads_is_refused_and_a_whole_one_is_not() {
+    use std::collections::HashSet;
+
+    let read_by_the_loader = ["fc.weight", "hidden_norm.weight", "norm.weight"];
+    let consumed: HashSet<String> = read_by_the_loader.iter().map(|s| (*s).to_owned()).collect();
+
+    let whole: HashSet<String> = read_by_the_loader.iter().map(|s| (*s).to_owned()).collect();
+    assert!(
+        unread_tensor_refusal("DFlashDrafter", &whole, &consumed).is_ok(),
+        "a snapshot the loader reads entirely must load"
+    );
+
+    // A checkpoint generation newer than the loader: weight families it has no
+    // code for.
+    let mut partial = whole;
+    partial.insert("candidate_selector.successor_codebook".to_owned());
+    partial.insert("layers.0.attention_conv.base_kernel".to_owned());
+    let err = unread_tensor_refusal("DFlashDrafter", &partial, &consumed).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("DFlashDrafter"),
+        "the refusal must name the loader that issued it: {msg}"
+    );
+    assert!(
+        msg.contains('2'),
+        "refusal must count the unread tensors: {msg}"
+    );
+    assert!(
+        msg.contains("candidate_selector.successor_codebook")
+            && msg.contains("layers.0.attention_conv.base_kernel"),
+        "refusal must name the unread tensors: {msg}"
+    );
+    assert!(
+        !msg.contains("fc.weight"),
+        "a consumed tensor must not be reported unread: {msg}"
+    );
+}
+
+// ── VerifierDraw ─────────────────────────────────────────────────────────────
+
+/// Build a `[1, k, vocab]` logits array from row-major f32 values.
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn logits_block(rows: &[[f32; 4]]) -> Array {
+    let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+    let bytes: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
+    Array::from_bytes(&bytes, &[1, rows.len() as i32, 4], Dtype::F32)
+        .expect("a well-formed logits block")
+}
+
+fn greedy_cfg() -> crate::sampler::SamplerConfig {
+    crate::sampler::SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        seed: Some(7),
+        top_logprobs_k: 0,
+    }
+}
+
+fn sampled_cfg() -> crate::sampler::SamplerConfig {
+    crate::sampler::SamplerConfig {
+        temperature: 0.7,
+        top_p: 0.95,
+        top_k: 20,
+        min_p: 0.0,
+        seed: Some(7),
+        top_logprobs_k: 0,
+    }
+}
+
+/// At temperature 0 the draw is each row's own argmax, and nothing else reaches
+/// it.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn a_greedy_draw_is_the_argmax_of_every_row() {
+    let block = logits_block(&[
+        [0.1, 9.0, 0.2, 0.3],
+        [4.0, 0.0, 0.5, 8.5],
+        [7.0, 1.0, 2.0, 3.0],
+    ]);
+    let mut draw = VerifierDraw::new(&greedy_cfg());
+    assert!(!draw.sampling(), "temperature 0 must not sample");
+    let got = draw
+        .block_tokens(&block, 3, Device::Cpu)
+        .expect("three rows");
+    assert_eq!(
+        got,
+        vec![1, 3, 0],
+        "each position takes its own row's argmax"
+    );
+}
+
+/// The seed a loop emits after prefill is the draw the round loop would take,
+/// at a block of one.
+///
+/// The two seams are separate calls on separate shapes — a `[1, 1, vocab]`
+/// prefill row against a `[1, k, vocab]` verified block — so a loop that sampled
+/// its block and argmaxed its seed would look right at every position but the
+/// first, and one position in a stream is below what a distributional gate can
+/// resolve. This is what covers it instead.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn the_seed_draw_is_the_block_draw_at_one_position() {
+    for cfg in [greedy_cfg(), sampled_cfg()] {
+        let row = logits_block(&[[2.0, 2.1, 1.9, 0.4]]);
+        let seed = VerifierDraw::new(&cfg)
+            .seed_token(&row, Device::Cpu)
+            .expect("one seed token");
+        let block = VerifierDraw::new(&cfg)
+            .block_tokens(&row, 1, Device::Cpu)
+            .expect("one block token");
+        assert_eq!(
+            vec![seed],
+            block,
+            "the prefill seam and the round seam must draw the same token from the same \
+             row at temperature {}",
+            cfg.temperature
+        );
+    }
+}
+
+/// A sampled draw reaches past the argmax, and reproduces itself from its seed.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
+)]
+fn a_sampled_draw_is_neither_the_argmax_nor_irreproducible() {
+    // Four near-equal logits: id 1 is the argmax at every position, so a block
+    // that comes back all ones is an argmax wearing a temperature.
+    let rows = [[2.00_f32, 2.05, 2.02, 1.98]; 64];
+    let block = logits_block(&rows);
+    let cfg = sampled_cfg();
+    let first = VerifierDraw::new(&cfg)
+        .block_tokens(&block, 64, Device::Cpu)
+        .expect("sixty-four rows");
+    let again = VerifierDraw::new(&cfg)
+        .block_tokens(&block, 64, Device::Cpu)
+        .expect("sixty-four rows");
+    assert_eq!(first, again, "one seed must give one stream");
+    assert!(
+        first.iter().any(|&t| t != 1),
+        "every position took the argmax, so this is not sampling: {first:?}"
+    );
+    assert!(
+        first
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            >= 3,
+        "four near-equal logits must reach more than two ids over sixty-four draws: {first:?}"
+    );
+}
+
+/// A two-model round drafts no more than one verify forward can score beside
+/// the carry token.
+#[test]
+fn the_two_model_draft_count_stops_at_the_verify_ceiling() {
+    assert_eq!(two_model_drafts_per_round(4), 4);
+    assert_eq!(
+        two_model_drafts_per_round(MAX_BLOCK_SIZE - 1),
+        MAX_BLOCK_SIZE - 1
+    );
+    assert_eq!(
+        two_model_drafts_per_round(MAX_BLOCK_SIZE),
+        MAX_BLOCK_SIZE - 1
+    );
+    assert_eq!(two_model_drafts_per_round(usize::MAX), MAX_BLOCK_SIZE - 1);
+}
+
+// ── block_capped_by_checkpoint ───────────────────────────────────────────────
+
+/// The request wins when it asks for less than the checkpoint was trained at.
+#[test]
+fn a_request_narrower_than_the_checkpoint_runs_at_the_request() {
+    assert_eq!(block_capped_by_checkpoint(5, 8), 5);
+}
+
+/// The checkpoint wins when the request asks for more than it was trained at:
+/// the selector's chain is defined over the trained block and no wider.
+#[test]
+fn a_request_wider_than_the_checkpoint_runs_at_the_checkpoint() {
+    assert_eq!(block_capped_by_checkpoint(8, 5), 5);
+}
+
+/// Two positions is the floor at both ends — a block of one is the seed alone
+/// and drafts nothing, so a request or a checkpoint below it still runs a round
+/// that proposes something.
+#[test]
+fn neither_side_can_take_the_block_below_a_seed_and_one_draft() {
+    assert_eq!(block_capped_by_checkpoint(0, 8), 2);
+    assert_eq!(block_capped_by_checkpoint(8, 1), 2);
+    assert_eq!(block_capped_by_checkpoint(0, 0), 2);
+}
+
+/// A checkpoint whose config never went through `check_config` is still bounded.
+///
+/// This is the case the clamp exists for, and the only one that separates it
+/// from the loader's refusal: `DFlash2Drafter` is publicly
+/// constructible with public fields, so `declared` here is whatever the caller
+/// put in the struct. Without the clamp this returns that number, and the round
+/// sizes its token buffer, its verify input and its selector chain from it.
+#[test]
+fn a_config_the_loader_never_saw_is_still_bounded_by_one_verify_forward() {
+    assert_eq!(
+        block_capped_by_checkpoint(usize::MAX, usize::MAX),
+        MAX_BLOCK_SIZE
+    );
+    assert_eq!(
+        block_capped_by_checkpoint(usize::MAX, 4_294_967_295),
+        MAX_BLOCK_SIZE
+    );
+    // And the request alone cannot lift it past the checkpoint either.
+    assert_eq!(block_capped_by_checkpoint(usize::MAX, 8), 8);
+}
+
+/// The ceiling admits its own value and refuses the next one, so it cannot be
+/// off by one in either direction.
+#[test]
+fn the_ceiling_admits_itself_and_nothing_above() {
+    assert_eq!(
+        block_capped_by_checkpoint(MAX_BLOCK_SIZE, MAX_BLOCK_SIZE),
+        MAX_BLOCK_SIZE
+    );
+    assert_eq!(
+        block_capped_by_checkpoint(MAX_BLOCK_SIZE + 1, MAX_BLOCK_SIZE + 1),
+        MAX_BLOCK_SIZE
+    );
+    assert_eq!(
+        block_capped_by_checkpoint(MAX_BLOCK_SIZE - 1, MAX_BLOCK_SIZE),
+        MAX_BLOCK_SIZE - 1
+    );
 }

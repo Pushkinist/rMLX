@@ -53,8 +53,8 @@ variables above:
 | Variable | Used by | Purpose |
 |----------|---------|---------|
 | `RMLX_TEST_MODEL` | `rmlx-server/tests/ssd_cache_restart.rs` | Generic single-model override for the SSD-restart smoke test. |
-| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path; the Qwen3.5-family alignment tests take a **verifier** here instead (see below). |
-| `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
+| `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs`, `spec_greedy_equivalence.rs`, `projects_toml_e2e.rs`, `cli_flags_e2e.rs`, and as the single-model override for the golden-token suites | Model snapshot for KV-cache equivalence and drafter-alignment tests. Typically set to a Gemma4-e4b path; the Qwen3.5-family alignment tests take a **verifier** here instead (see below). |
+| `RMLX_DRAFT_TEST_MODEL` | `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs`, `qwen3_5_mtp_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `qwen3_5_two_model_alignment.rs`, `spec_greedy_equivalence.rs`, `spec_sampled_distribution.rs` | Draft model snapshot path. Used alongside `RMLX_KV_TEST_MODEL` for speculative-decode alignment tests. |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | Vision-language model snapshot for VL text-parity tests. |
 | `RMLX_PROMPT_CACHE_TEST_MODEL_A` / `_B` | `rmlx-models/tests/prompt_cache_cross_model.rs` | **Two** snapshots of the same architecture with the same KV shape but different weights — the prompt cache is one static per arch, and this pair is what shows whether its key separates two resident models. `mlx-community__gemma-4-e2b-it-mxfp8` + `mlx-community__gemma-4-E2B-it-qat-4bit` fit (both `Gemma4ForConditionalGeneration`, 35 layers x 1 KV head x head_dim 256). Same-shape matters: a shape mismatch would fail for the wrong reason. Different weights matter: identical outputs make the comparison vacuous, and the test refuses rather than passing. |
 
@@ -69,16 +69,119 @@ passes while never running. The pairs their thresholds are calibrated against:
 | `qwen3_5_eagle3_alignment.rs` | `mlx-community__Qwen3.6-35B-A3B-8bit` | `Dogacel__specdrift-qwen3.6-35b-a3b-eagle3` |
 | `qwen3_5_two_model_alignment.rs` | `mlx-community__Qwen3.8-27B-mxfp8` | `sahilchachra__ornith-1.0-9b-mxfp8-mlx` (a full model, not a drafter head — both halves must be GDN hybrids sharing a vocabulary) |
 
+`two_model_stochastic.rs` is the two-model loop's other acceptance rule: it runs
+`spec_generate_greedy` at `temperature 1.0` on `mlx-community__gemma-4-e4b-it-mxfp8`
+drafted by `mlx-community__gemma-4-e2b-it-mxfp8`, both resolved by slug from
+`RMLX_O_MODELS_ROOT`, and pins that one seed reproduces one sequence while a
+second seed and `temperature 0` do not — the Leviathan loop is sampling, and it
+is the loop that ran. It is the only gate on that loop; every alignment suite
+runs greedy. It resolves by slug, so `make gpu-test` runs it wherever the
+snapshots are; under `scripts/run_gpu_tests.sh` with shader validation on it
+passes in about 80 s and produces **zero** validation hits, which is why it has
+no entry in `scripts/gpu_validation_census.txt` — the runner fails on an
+unpinned hit, so a clean pass is the evidence, not the absence of a pin.
+
 Point either at a different pair and re-measure both arms before reading a
 failure as a regression.
 
-`dflash_drafter_alignment.rs` is **not** one of those three and does not gate the
+`dflash2_loader.rs` takes no model variable at all: it resolves
+`z-lab__Qwen3.8-27B-DFlash2` by slug from `RMLX_O_MODELS_ROOT`, like
+`two_model_stochastic.rs`, so `make gpu-test` runs it wherever the snapshot is.
+It goes through `tests/common`'s `slug_snapshot` at `Role::Sidecar` — the role
+that asks only for the files a drafter checkpoint carries, since it is decoded
+with the verifier's tokenizer and ships none of its own. Each of its tests
+passes its own function name, so a stand-down announces
+`SKIP <that test>: <why>` and `run_gpu_tests.sh` can attribute it; a notice
+naming the file instead is counted as unattributable and listed nowhere. It
+loads the weights, asserts the names and shapes, and runs the forward and the
+selector against the committed reference. It has no entry in
+`scripts/gpu_validation_census.txt` — the runner fails on an unpinned hit, so a
+clean pass is the evidence, not the absence of a pin.
+
+`spec_sampled_distribution.rs` is the sidecar half of the same question, above
+temperature 0, and it is a distributional one: not what the arm emitted but what
+it drew from. Every emitted token carries a surprise under the distribution the
+plain path would have drawn from at the same prefix, and if the arm draws from
+that distribution the stream's total surprise has a mean and a variance those
+distributions fix exactly — so the verdict is a `z` with no threshold measured
+on a healthy engine first. It runs
+`mlx-community__gemma-4-e2b-it-mxfp8` drafted by
+`mlx-community__gemma-4-E2B-it-assistant-bf16`, both resolved by slug, over five
+prose questions, and it runs a second arm at temperature 0 as a positive control
+that the run is red unless it *refuses*: a verifier that is nearly certain at
+every position passes under every acceptance rule, so a prompt set with no
+evidence in it must report that rather than a pass. Measured, +0.58 for the
+sampled arm and -8.70 for the control. It produces zero shader-validation hits
+and so has no census entry.
+
+Its `RMLX_DRAFT_TEST_MODEL` override names the drafter; a named path that is not
+a snapshot fails, and a models root that does not hold the slug skips. The four
+CPU cases in the same file need no snapshot at all and pin the statistic's power
+against a greedy stream, a stream drawn at the wrong temperature and one drawn
+without the request's filters — the last of which the surprise test does not
+refuse on its own, which is why the file carries a second oracle over the tokens
+that carry no target mass.
+
+`spec_greedy_equivalence.rs` asks a different question from the three alignment
+suites: not
+whether the round loop keeps the verifier's state consistent for a while, but
+whether the run produces the answer the verifier produces alone, over 256 tokens
+and every prompt the file carries. Its oracle is where the two arms first differ
+and how sure the verifier was there — a rank in the reference arm's own margin
+distribution, so one ceiling covers two models whose logits are not on the same
+scale. It is documented in full in `docs/SPEC_ANSWER_EQUIVALENCE.md`, including
+why the obvious oracle (how much of one answer the arms share) cannot be
+thresholded at all.
+
+Unlike those suites, its **assistant pair resolves both halves by slug** from
+`RMLX_O_MODELS_ROOT`, so `make gpu-test` runs that pair on a machine holding the
+snapshots and `run_gpu_tests.sh` reports a machine without them as INCOMPLETE.
+The other five pairs are the exceptions and are not gated: their
+drafter comes from `RMLX_DRAFT_TEST_MODEL` or the pair does not run, because
+their verifiers' quantized matmuls trip the shader-validation census (see the
+table below and `docs/SPEC_ANSWER_EQUIVALENCE.md`). That one variable names one
+drafter, so a pair whose loop does not drive the kind that snapshot declares
+stands down naming both. Its drafter goes through the same
+`slug_snapshot` at `Role::Sidecar` that `dflash2_loader.rs` does — one copy of
+the rules, and the role a drafter checkpoint can satisfy — and every stand-down
+names the test function it happened in, so `run_gpu_tests.sh` can attribute it.
+The verifier goes through the golden harness's own resolver
+(`common::model_for`); `RMLX_DRAFT_TEST_MODEL` overrides the drafter. Both
+`-e2b-` and `-e4b-` assistant snapshots declare the same architecture, so the
+harness's arch stand-down cannot separate them: the drafter's
+`backbone_hidden_size` is checked against the verifier's width before the drafter
+is loaded, and a mismatched pair skips with that reason rather than panicking in
+the loader. The two-model pair has the same problem in a different form —
+`two_model` is inferred from the architecture registry, which every full model
+satisfies — and the declared vocabulary is what separates those.
+
+| Pair | verifier | drafter | selected by |
+|---|---|---|---|
+| assistant | `mlx-community__gemma-4-e2b-it-mxfp8` | `mlx-community__gemma-4-E2B-it-assistant-bf16` | slug |
+| recurrent | `mlx-community__Qwen3.8-27B-mxfp8` | `mlx-community__Qwen3.8-27B-MTP-mxfp8` | `RMLX_DRAFT_TEST_MODEL` only |
+| block | `mlx-community__Qwen3.8-27B-4bit` | `z-lab__Qwen3.8-27B-DFlash2` | `RMLX_DRAFT_TEST_MODEL` only |
+| adaptive | `mlx-community__Qwen3.6-35B-A3B-8bit` | `z-lab__Qwen3.6-35B-A3B-DFlash` | `RMLX_DRAFT_TEST_MODEL` only |
+| restricted-vocabulary | `mlx-community__Qwen3.6-35B-A3B-8bit` | `Dogacel__specdrift-qwen3.6-35b-a3b-eagle3` | `RMLX_DRAFT_TEST_MODEL` only |
+| two-model | `mlx-community__Qwen3.8-27B-mxfp8` | `sahilchachra__ornith-1.0-9b-mxfp8-mlx` | `RMLX_DRAFT_TEST_MODEL` only |
+
+The assistant pair produces **zero** Metal shader-validation hits and so has no
+entry in `scripts/gpu_validation_census.txt` and needs none. The other pairs'
+verifiers drive MLX's mxfp8 or affine quantized matmul and a narrowed run reports
+1344 invalid loads from it — the same `load_safe` bound the census already records
+for the affine instantiation, in a kernel this repo does not compile. The census
+pins one exact count per test and a count from a 256-token generation is not
+stable across a prompt change, so those pairs are named rather than slug-resolved
+and `make gpu-test` reports them as skipped. See
+`docs/SPEC_ANSWER_EQUIVALENCE.md`.
+
+`dflash_drafter_alignment.rs` is **not** one of the alignment suites above and
+does not gate the
 same property. It asserts that the drafter's round-0 first-block proposal aligns
 with the verifier's greedy continuation (`accept > 0`) and that the live loop
 emits coherent prose — a round-0 check, taken before any partial-accept rollback
 has happened. It cannot see a rollback that corrupts the verifier state part-way
-through a run, which is what the three suites above exist to catch. DFlash on a
-GDN hybrid therefore has no greedy-tracking gate.
+through a run. What does, for DFlash 1 on a GDN hybrid, is
+`the_adaptive_round_loop_reproduces_plain_greedy` in `spec_greedy_equivalence.rs`.
 
 The Whisper audio integration tests (`crates/rmlx-audio/tests/transcribe.rs`)
 deliberately use **no** dedicated env var — they resolve the
@@ -247,13 +350,24 @@ The run / skip / fail rule:
 | `RMLX_O_MODELS_ROOT` is set but is not an existing directory | **fail** — one keystroke disarms all five gates |
 | the slug under the models root is a snapshot of the wrong arch | **fail** |
 
-"Runnable" means the directory holds every file the harness opens **by name**:
+"Runnable" means the directory holds every file the caller opens **by name**,
+and which files those are depends on what the caller will do with it. The probe
+takes that as a `Role`:
 
-| file | opened by |
-|---|---|
-| `config.json` | `model_arch`, `arch::load_model` |
-| `tokenizer.json` | `run_golden_test`'s `Tokenizer::from_file` |
-| `model.safetensors.index.json` **or** `model.safetensors` | `rmlx_loader::load_shard_index`, which tries them in that order and errors if neither exists |
+| file | opened by | `Standalone` | `Sidecar` |
+|---|---|---|---|
+| `config.json` | `model_arch`, `arch::load_model`, every `<Kind>Drafter::load` | required | required |
+| `tokenizer.json` | `run_golden_test`'s `Tokenizer::from_file` | required | — |
+| `model.safetensors.index.json` **or** `model.safetensors` | `rmlx_loader::load_shard_index`, which tries them in that order and errors if neither exists | required | required |
+
+`Sidecar` is the drafter case, and it exists because a drafter has no tokenizer:
+it proposes ids for a verifier and is decoded with the verifier's, and
+mlx-community ships those snapshots without one. Requiring a `tokenizer.json` of
+a drafter turned a checkpoint sitting on disk into an absence — which is a skip,
+and a skip in `spec_greedy_equivalence.rs` reads exactly like the equivalence
+holding. `two_model_stochastic.rs` resolves both of its models as `Standalone`,
+because there both sides are full models and the pair is loaded through
+`load_speculative`, which reads a tokenizer from each.
 
 The weight entrypoints are not padding. A download writes the small JSON files
 first and the multi-GB shards last, so `config.json` + `tokenizer.json` + no
@@ -277,10 +391,11 @@ Metal context, and `make ci` passes no `--ignored`. `make gpu-test` /
 classifies them as GPU tests through the cross-file `common::run_golden_test`
 helper, and `scripts/run_gpu_tests.sh` runs everything that classifier names.
 
-**Residual, stated rather than papered over:** libtest discards a passing test's
-output, so a golden that *skipped* prints its reason into a stream nothing shows.
-The gate cannot report "0 goldens checked" from inside a normal run. Add
-`--nocapture` when you need to see which ones stood down:
+libtest discards a passing test's output, so a golden that *skipped* prints its
+reason into a stream a bare `cargo test` does not show. `make gpu-test` and
+`make ci-perf` pass `--nocapture` and report every stand-down by name — see *A
+cell that stood down is reported* below. Running the golden by hand, add the
+flag yourself when you need to see which ones stood down:
 
 ```bash
 cargo test -p rmlx-models --test bonsai_golden_tokens -- --ignored --nocapture
@@ -762,6 +877,54 @@ It is fail-closed in three ways:
 * **Exclusive GPU.** It refuses to start while another MLX process holds the
   Metal context (CLAUDE.md hard rule 8).
 
+#### A cell that stood down is reported, and it is not a pass
+
+A model-gated cell whose snapshot is not on disk returns before asserting
+anything, and libtest prints `ok` for it exactly as for a cell that ran. That
+is the difference this runner reports rather than folds away:
+
+```
+stood down — these selected GPU tests announced they did not run:
+  rmlx-models the_recurrent_round_loop_reproduces_plain_greedy: RMLX_DRAFT_TEST_MODEL is unset …
+
+OK: 1 GPU tests passed across 1 workspace member(s) … — INCOMPLETE: 1 selected
+GPU test(s) stood down and 0 further notice(s) named no test; they asserted
+nothing (listed above)
+```
+
+The notice is the cell's own: **`SKIP <test>: <why>`**, printed to stderr and
+visible because the runner passes `--nocapture`. The name is what makes it
+attributable, and the reason is where the variable or the snapshot that would
+arm the cell is named — so both are printed. The same notice is what lets the
+census pin below drop that cell's hit count instead of waiving the entry, which
+is why an entry's test must print one.
+
+**A stand-down is not a failure and has no exit code.** A developer without the
+weights must not be blocked by this suite, and turning an absent snapshot red
+would do exactly that. What it must not do is look identical to a run that
+checked the cell, which is how a green `ci-perf` came to be quoted over
+speculative answer-equivalence gates that had never been asked. `make ci-perf`
+reads the runner's final line and prints `ci-perf INCOMPLETE` rather than
+`ci-perf ok` when it carries that marker.
+
+Both directions are pinned in `scripts/run_gpu_tests_selftest.sh`
+(`make gpu-runner-selftest`): a stand-down is listed with its reason, the final
+line of a run that stood a test down differs from the same run without it, the
+report survives `--no-shader-validation`, and a notice that named no test is
+counted without being attributed to whichever test was nearby.
+
+**The shape is not the attribution.** A notice is attributed only when the name
+it carries is a classified GPU test in that crate. `SKIP: <why>` — the older
+spelling still in much of the tree — names nothing; `SKIP <suite or file>:
+<why>` names something no libtest filter reaches, which in a report is worse
+than saying nothing, because the reader tries to run it. Both are counted with
+the reason they could not be attributed and left off the list. The count rides
+on the final line for the same reason the named ones do: a report that silently
+dropped them would claim a completeness it does not have.
+
+Write new ones as `SKIP <its own test fn>: <why>`. Converting the sites that
+predate this is mechanical and unfinished.
+
 **No test in this suite is known-red on `main`, and this runner tracks no
 known-red list of tests.** (Shader-validation hits are the one thing it does
 track a baseline for, and that baseline is exact — see the census pin below. It
@@ -820,14 +983,16 @@ means.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 
-`make ci-perf` is three lines, and it is the only shared gate that executes the
-GPU tests:
+`make ci-perf` is the only shared gate that executes the GPU tests. In order: a
+preflight on the environment, the `release-perf` workspace suite, the GPU suite,
+and a final line that reports the GPU suite's verdict rather than asserting one
+— `ci-perf ok` only when that run did not mark itself INCOMPLETE:
 
 ```make
 ci-perf:
 	@bash scripts/run_gpu_tests.sh --preflight
 	$(MAKE) test-perf
-	@bash scripts/run_gpu_tests.sh
+	@… bash scripts/run_gpu_tests.sh …   # then: ok, or INCOMPLETE if it stood cells down
 ```
 
 It is deliberately **not** in `make ci`. Two costs rule that out: the suite needs
