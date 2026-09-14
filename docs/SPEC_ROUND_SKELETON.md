@@ -844,6 +844,8 @@ answer after a draft-side change says that run's near-ties happened not to move.
 | **a seed exit returns the widest that ran instead of the resolved block** | nothing: no gate prompt stops on its seed | **new, none** |
 | the empty-chain refusal lost | nothing at runtime — a drafter that proposes nothing makes the acceptance walk answer rather than refuse, and the round silently emits one token | **new, none** |
 | `prefill_ns` recomposed by the loop | nothing: five of seven records would move and the figure has no bound to fail | **new, none** |
+| **a seed attributed to the restricted vocabulary instead of the whole one** | nothing: the seed is the verifier's own argmax on both arms, so no pair parts at it and `Restriction` never reads `decided_by[0]`; the buffer's length is unmoved and the round stream carries no attribution. Measured on the restricted-vocabulary pair — it passes and 6 of 6 cells are identical | **new, none** |
+| **`projects_conditioning` declared by a drafter that projects nothing** | nothing: the record's `conditioned_rows` moves from `None` to `Some(0)`, `conditioning_violation` passes on both, the loop's own refusal fires only the other way, and the round stream carries no request-level field. Measured the same way, same result. The inverse of the `Some(0)` row above | **new, none** |
 
 Two of those rows get a text-level catcher in this chunk, in
 `crates/rmlx-models/src/speculative/round_skeleton_tests.rs`. What holds them is
