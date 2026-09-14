@@ -89,6 +89,7 @@
 //! can fail rather than against a re-derivation of itself.
 
 use super::dflash::dflash_next_block_size;
+use super::dflash2::round::BlockRound;
 use super::gemma4_assistant::AssistantRound;
 use super::mtp::SidecarRound;
 use super::round_loop::{ReportSkippedBy, RoundDrafter, VerifierOffsetBasis};
@@ -341,7 +342,7 @@ const DISPOSITIONS: [(
     ),
     (
         SpecLoop::DFlash2,
-        "dflash2/round.rs",
+        SHARED_LOOP,
         ReportSkippedBy::TheSeedExit,
         ChainRefusedBy::TheProposalChain,
         VerifierOffsetBasis::AfterTheForward,
@@ -377,19 +378,12 @@ const DISPOSITIONS: [(
 ];
 
 /// The files the table names, in the order it names them, each with its source.
-const LOOP_SOURCES: [(&str, &str); 5] = [
+const LOOP_SOURCES: [(&str, &str); 4] = [
     (
         "dflash/mod.rs",
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/speculative/dflash/mod.rs"
-        )),
-    ),
-    (
-        "dflash2/round.rs",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/speculative/dflash2/round.rs"
         )),
     ),
     (
@@ -589,10 +583,13 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
                 <SidecarRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
                 <SidecarRound<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
             ),
+            SpecLoop::DFlash2 => (
+                <BlockRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
+                <BlockRound<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
+            ),
             // The loops that still carry their own body: their dispositions are
             // read off their source above and there is no constant to read.
             SpecLoop::DFlash
-            | SpecLoop::DFlash2
             | SpecLoop::Eagle3
             | SpecLoop::TwoModelGreedy
             | SpecLoop::TwoModelStochastic => continue,

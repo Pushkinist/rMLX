@@ -53,7 +53,7 @@ use rmlx_mlx::{Array, Device};
 use crate::layers::{Activation, Linear, Mlp, RmsNorm};
 
 mod forward;
-mod round;
+pub(super) mod round;
 mod selector;
 
 pub use round::dflash2_generate;

@@ -1,22 +1,22 @@
 # One speculative round loop: the interface
 
-**Status: migration chunks 1 and 2 have landed.** The loop is
-`crates/rmlx-models/src/speculative/round_loop.rs`; the Gemma4 assistant and the
-MTP sidecar run on it and the other five loops still carry their own bodies.
-This file is what a reviewer judged before the first drafter was migrated, and
-what each migration chunk is held to afterwards. What each chunk landed
-differently from the proposal below is listed under "What chunk 1 landed" and
-"What chunk 2 landed".
+**Status: migration chunks 1, 2 and 3 have landed.** The loop is
+`crates/rmlx-models/src/speculative/round_loop.rs`; the Gemma4 assistant, the MTP
+sidecar and DFlash 2 run on it and the other four loops still carry their own
+bodies. This file is what a reviewer judged before the first drafter was
+migrated, and what each migration chunk is held to afterwards. What each chunk
+landed differently from the proposal below is listed under "What chunk 1
+landed", "What chunk 2 landed" and "What chunk 3 landed".
 
 Seven drafter paths in `crates/rmlx-models/src/speculative/` run one algorithm.
-Five still carry their own round-loop body; the other two are entries onto the
+Four still carry their own round-loop body; the other three are entries onto the
 shared loop:
 
 | drafter path | file | body |
 |---|---|---|
 | `mtp_generate` | `crates/rmlx-models/src/speculative/mtp.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `dflash_generate` | `crates/rmlx-models/src/speculative/dflash/mod.rs` | its own |
-| `dflash2_generate` | `crates/rmlx-models/src/speculative/dflash2/round.rs` | its own |
+| `dflash2_generate` | `crates/rmlx-models/src/speculative/dflash2/round.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `eagle3_generate` | `crates/rmlx-models/src/speculative/eagle3/mod.rs` | its own |
 | `mtp_assistant_generate` | `crates/rmlx-models/src/speculative/gemma4_assistant.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `spec_generate_greedy_cached` | `crates/rmlx-models/src/speculative/mod.rs` | its own |
@@ -272,6 +272,71 @@ three are values the migration had to preserve or move.
   taking its first second row. The sidecar's own refusal text is gone with its
   body — item 11's cost, paid a second time.
 
+## What chunk 3 landed
+
+Six notes. One is a field the interface gained, one records a deviation with its
+reason, and four are values the migration had to preserve or move.
+
+- **`Prefilled::projects_conditioning` is the declaration, exactly as item 9
+  proposes, and the rows are the loop's alone.** The drafter answers a `bool`;
+  the loop opens the count at zero for a `true` and adds each round's
+  `Conditioning::projected` to it under the `.max(0)` clamp the body it replaced
+  applied. An `Option<usize>` here would let a drafter supply an opening value,
+  and a non-zero one inside a block passes `RoundStats::conditioning_violation`
+  silently — the misreport class item 9 exists to prevent, re-admitted through
+  the field meant to close it. A drafter answering `false` accumulates nothing,
+  so the sidecar's and the assistant's records do not move.
+- **The declaration got a second reader, in the loop.** A drafter that projects
+  rows and declares it does not would leave the record reporting `None`, and
+  `conditioning_violation` opens by returning on that `None` — so the bound over
+  `emitted_in_rounds` is off for the whole request while every other observable
+  reads clean. `run_rounds` refuses a round whose `Conditioning` carries a
+  projection the request declared it would not make. It holds on this tree by
+  construction: the sidecar reports `projected: None`, the assistant reports no
+  `Conditioning` at all, and DFlash 2 reports `Some` under a `true`.
+- **`RoundOutcome` carries the round's index.** `guard_round_conditioning` names
+  the round in its refusal, and the alternative — each drafter counting its own
+  rounds — is a second counter beside the loop's that can drift, with the only
+  consequence being a reader sent to the wrong round and nothing to catch it. It
+  is the loop's own half of the report, so it is one compile error at one site,
+  which is the property the pairing exists to keep. DFlash 1 calls the same guard
+  and reads the same field.
+- **`CaptureTail` stayed drafter-internal and the loop learned nothing about
+  it.** The bounded prompt-window capture is a parameter of
+  `forward_verify_capture_chunked`, passed from inside `BlockRound::prefill` as
+  the drafter's own `conditioning_rows`; no fact about it reaches `run_rounds`.
+- **DFlash 2's dispositions are preserved as the spec states them**: the seed
+  exit returns the resolved block and skips the resident-KV report
+  (`KV_REPORT_SKIPPED_BY::TheSeedExit`); it counts its rollback back from the
+  tail and reports the post-forward read
+  (`VERIFIER_OFFSET_BASIS::AfterTheForward`) while the target is computed from
+  the head spelling, which is the number `main` computed; the request record's
+  `conditioned_rows` is `Some(0)` on the seed exit and `Some(sum)` on the tail;
+  its round line keeps `condition_rows: Some(..)` beside `projected_rows:
+  Some(..)` and no `d_offset_before` / `d_target`, the drafter keeping no cache
+  and answering `rollback`'s default; and it charges its phases, the third loop
+  to do so.
+- **One figure moved and one log field went, and nothing reads either.** Its
+  `rollback_ms` used to close before the conditioning slide and now closes after
+  it, because the shared loop times its rollback across both drafter calls. And
+  its starting `info!` is the loop's, so the capture's target layers and the
+  opening conditioning row count are no longer on that line. The pinned stream
+  drops every `*_ms` field and the request record's spans have no bound to fail.
+- **A cell disposition the next chunk inherits, recorded rather than
+  declared.** `run_rounds` always reports `RoundPhases`, and the four loops that
+  still carry a body all report `phases: None`. So each of them gains five
+  `*_ms` fields on its round line when it migrates, and reaches `log_round`'s
+  overrun `error!` arm — the one that fires when a round's phase timers claim
+  more time than the round has — for the first time. The pinned stream drops
+  every `*_ms` field, so the cells do not move for it; what can move is that
+  arm's own line, which carries no emitted total and so stays out of the stream
+  by the same rule that keeps it out today. DFlash 1 is the first to meet it.
+- **The shared loop answers for three rows of the disposition table**, which is
+  the `rows.min(1)` arm of
+  `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`
+  taking its third row. DFlash 2's own refusal text is gone with its body —
+  item 11's cost, paid a third time.
+
 ## What the interface cannot express, and what is proposed for it
 
 Eleven things. Nine are expressible with no branch in the loop; one is a declared
@@ -433,6 +498,12 @@ per-loop skip; one is a decision the owner has to take, marked as such.
 
    Without the declaration the two `Some(0)`s become `None` and nothing anywhere
    sees it: `RoundStats::conditioning_violation` is guarded on `None` and passes.
+
+   **Landed in chunk 3, with the opening value beside the declaration.**
+   `Prefilled::conditioned_rows` is the count before any round has run —
+   `Some(0)` for DFlash 2, `None` for a drafter that projects nothing — and the
+   loop adds each round's `Conditioning::projected` to it under the clamp. One
+   reading serves both records and no drafter is branched on.
 10. **What `prefill_ns` covers.** The three loops that prefill the prompt less
     its last token close the span before their round-0 carry forward; DFlash 2
     closes it after its whole-prompt capture, trim and projection but before the
@@ -1003,3 +1074,8 @@ Measured with the same extractor over the same convention at both ends — summe
 this chunk's head reads 1180 over 1965 and 15. Each chunk's own convention has
 to be stated with its two readings: the absolute figure is not comparable across
 executors, only its endpoints against each other.
+
+Chunk 3 deleted the third, and the pair count goes 15 → 10. Measured with that
+same extractor and convention at both ends of this chunk, `origin/main` reads
+1182 matched lines over 1969 body lines and 15 pairs, and this chunk's head
+reads 718 over 1635 and 10.

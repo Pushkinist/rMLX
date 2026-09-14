@@ -821,7 +821,9 @@ impl RoundDrafter for AssistantRound<'_> {
         Ok(Prefilled {
             seed,
             prefill_ns,
-            conditioned_rows: None,
+            // It reads the verifier's K/V and carries no conditioning buffer
+            // of its own, so it projects nothing and accumulates nothing.
+            projects_conditioning: false,
         })
     }
 
