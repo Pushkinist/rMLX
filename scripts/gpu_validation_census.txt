@@ -29,8 +29,13 @@
 #   kind      | the access as the layer worded it (`device load`); a store is
 #             | never pinnable — an invalid write is corruption, not a
 #             | validated-benign read, so the runner refuses such an entry
-#   count     | this test's own number of diagnostics, measured by running that
-#             | test alone (`make gpu-test CRATE=<crate> FILTER=<test>`)
+#   count     | this test's own number of diagnostics. Derive it either by
+#             | running that test alone (`make gpu-test CRATE=<crate>
+#             | FILTER=<test>`), or by attributing a full run's diagnostics to
+#             | the test libtest last announced — the suite runs
+#             | `--test-threads=1 --nocapture`, so the `test <name> ... ` marker
+#             | is the running test until the next one. The second way is what
+#             | keeps a sum over entries equal to the total a full run prints.
 #   crate     | the workspace member the test belongs to
 #   test      | exactly one test fn name. It must be a classified GPU test, and
 #             | it must print a NAMED `SKIP <test>: <why>` notice when it skips,
@@ -54,20 +59,40 @@
 #
 # kernel | kind | count | crate | test | reference
 #
-# The three entries below are MLX's own quantized matmul, not a kernel this repo
+# A GPU test that reaches a kernel no entry names, or that makes a load an
+# existing entry does not count — a new snapshot, a new shape, a longer sweep —
+# derives its own entry in the SAME change, from a run of its own. Landing it
+# without one moves the failure to the next `make ci-perf` on `main`, where it
+# arrives as a delta nobody can attribute. A reviewer checks the census line
+# against the test the change adds or touches.
+#
+# The entries below are MLX's own quantized matmul, not a kernel this repo
 # compiles or can specialise. `QuantizedBlockLoader::load_safe` in
 # `mlx/backend/metal/kernels/quantized.h` bounds its row index against the
 # tile's COLUMN extent, so the guard can never fire and a transposed quantized
 # matmul whose N is not a multiple of the output tile width reads the
 # out-of-range rows of the packed weight and the scales. rMLX passes correctly
-# sized operands; the reachable tensor is a 1-row quantized `shared_expert_gate`,
-# which is legal input. Every diagnostic is a load, and the loaded lanes were
+# sized operands; on the mixture the reachable tensor is a 1-row quantized
+# `shared_expert_gate`, which is legal input — the dense hybrid's unaligned N is
+# not identified to one tensor, and the bound is the kernel's either way.
+# Every diagnostic is a load, and the loaded lanes were
 # shown bitwise not to reach the output — including with the out-of-range rows
 # held at NaN under the same kernel instantiation. The selector is identical in
 # the next MLX release, so moving the pinned MLX does not remove it.
 #
-# All three run `mlx-community__Qwen3.6-35B-A3B-8bit`; the counts were measured
-# one test at a time and sum to the 160 a full run reports.
+# The wrong selector does not depend on the weight's bit width. The analysis
+# measured affine at bits 2, 3, 4, 5, 6 and 8 across group sizes 32, 64 and 128
+# and every one of the 18 cells reports, and the output-reachability arms were
+# run at bits 2 and at bits 8, either side of bits 4. So `b_4` and `b_8` are one
+# defect at two instantiations of one template, and one analysis covers both.
+#
+# The first three entries run `mlx-community__Qwen3.6-35B-A3B-8bit` and are the
+# 8-bit instantiation alone. The fourth originating test sweeps two GDN hybrids
+# in one body — `mlx-community__Qwen3.8-27B-4bit` and that same 8-bit mixture —
+# so it carries one entry per instantiation. A full run reports 2496 `b_4` and
+# 1174 `b_8`.
 affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_5_moe_forward_seq_last_k_equals_reference | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
 affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 80 | rmlx-models | thinking_budget_exact_hit_qwen3_5_moe | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
 affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_moe_golden_tokens_k8v8 | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 1014 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 2496 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
