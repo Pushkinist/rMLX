@@ -612,25 +612,35 @@ const TAPE_REPLAY_SLUGS: &[&str] = &[
     "mlx-community__Qwen3.6-35B-A3B-8bit",
 ];
 
-/// The snapshots present on this machine, or a named stand-down the GPU runner
-/// counts for each that is not.
+/// The snapshots present on this machine.
+///
+/// A missing slug is noted, not announced as a stand-down: `run_gpu_tests.sh`
+/// harvests `SKIP <test>:` and drops **every** census entry naming that test, so
+/// announcing one slug's absence while running on the other would leave the
+/// hits this test does produce unexpected. The named notice belongs to the one
+/// case where dropping the entries is right — nothing resolved and the test
+/// asserts nothing.
 fn tape_replay_models(test: &str) -> Vec<std::path::PathBuf> {
     let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT") else {
         eprintln!("SKIP {test}: RMLX_O_MODELS_ROOT is not set");
         return Vec::new();
     };
     let root = std::path::PathBuf::from(root);
-    TAPE_REPLAY_SLUGS
+    let present: Vec<std::path::PathBuf> = TAPE_REPLAY_SLUGS
         .iter()
         .filter_map(|slug| {
             let path = root.join(slug);
             if path.join("config.json").exists() {
                 return Some(path);
             }
-            eprintln!("SKIP {test}: {slug} is not under RMLX_O_MODELS_ROOT");
+            eprintln!("note {test}: {slug} is not under RMLX_O_MODELS_ROOT");
             None
         })
-        .collect()
+        .collect();
+    if present.is_empty() {
+        eprintln!("SKIP {test}: no hybrid of {TAPE_REPLAY_SLUGS:?} is under RMLX_O_MODELS_ROOT");
+    }
+    present
 }
 
 /// A fresh unquantized cache stack, so nothing between the two arms differs but

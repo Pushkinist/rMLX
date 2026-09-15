@@ -460,12 +460,13 @@ census_pin_line() {
         "${CENSUS_KERNEL}" "$2" "$4" "$3"
 }
 
-# census_log <root> <crate> <n> [skip-test] [passed] — a clean libtest log
-# carrying <n> loads of CENSUS_KERNEL, glued onto the passing test's line, and
-# optionally the named test's own skip notice. <passed> must cover the crate's
-# classified population or the runner reports an under-match instead.
+# census_log <root> <crate> <n> [skip-test] [passed] [note-test] — a clean
+# libtest log carrying <n> loads of CENSUS_KERNEL, glued onto the passing test's
+# line, and optionally the named test's own skip notice or a plain note naming
+# it. <passed> must cover the crate's classified population or the runner
+# reports an under-match instead.
 census_log() {
-    local root="$1" crate="$2" n="$3" skip="${4:-}" passed="${5:-1}" i=0 line=""
+    local root="$1" crate="$2" n="$3" skip="${4:-}" passed="${5:-1}" note="${6:-}" i=0 line=""
     while [ "${i}" -lt "${n}" ]; do
         line="${line}Invalid device load at offset $((4096 + i * 64)), executing kernel function: \"${CENSUS_KERNEL}\""
         i=$((i + 1))
@@ -473,6 +474,7 @@ census_log() {
     {
         echo 'Metal GPU Validation Enabled'
         echo "running ${passed} tests"
+        [ -n "${note}" ] && echo "note ${note}: one of its snapshots is not on this machine"
         [ -n "${skip}" ] && echo "test kv::gpu_alpha ... SKIP ${skip}: no snapshot on this machine"
         echo "test kv::gpu_alpha ... ok${line}"
         echo "test result: ok. ${passed} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s"
@@ -495,6 +497,24 @@ expect_no_out "ERROR:"
 # A run that accepted four invalid accesses is not a clean one, and saying so
 # would put the operator back where a permanently red gate left them.
 expect_no_out "shader validation clean"
+
+# A cell that names an absence without standing down keeps its entry in the
+# expectation. A test resolving several snapshots and running on the ones it
+# found must not announce `SKIP <itself>:` for the ones it did not: the harvest
+# is per test, so that notice drops every entry naming it — including the kernel
+# the test did produce hits for — and the run then fails on a count it has
+# dropped the expectation for. A plain note is invisible to both scans, which is
+# the property this case holds.
+new_case census_unnamed_note_keeps_the_entry || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+census_pin "${CASE_ROOT}" 4
+census_log "${CASE_ROOT}" rmlx-kv-quant 4 "" 1 kv_gpu_alpha
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "census matches the pin"
+expect_out "kv_gpu_alpha = 4"
+expect_no_out "not enforced in full"
+expect_no_out "named no test"
 
 # A kernel the pin does not name is a new hit, whatever the pinned ones did.
 new_case census_new_kernel || exit 1

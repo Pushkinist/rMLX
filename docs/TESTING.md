@@ -1245,8 +1245,11 @@ diagnostic from a kernel this repo neither compiles nor can fix would otherwise
 do to `make gpu-test` and `make ci-perf`.
 
 So the accepted hits are pinned, in `scripts/gpu_validation_census.txt`, **one
-entry per originating test** carrying that test's own count, the crate it
-belongs to, and the reference to the analysis that says the hit is benign. The
+entry per `(kernel, kind, crate, test)`** carrying that test's own count for that
+kernel and the reference to the analysis that says the hit is benign. One test
+that drives two instantiations of a template — two checkpoints at different bit
+widths — therefore carries two entries, and the runner refuses a second entry
+for the same four. The
 five entries there sum to what a full run reports — 2496 at `b_4` and 1174 at
 `b_8`. At `b_8`: 40 from `qwen3_5_moe_forward_seq_last_k_equals_reference`, 80
 from `thinking_budget_exact_hit_qwen3_5_moe`, 40 from
@@ -1264,6 +1267,15 @@ diagnostics to the test libtest last announced — the suite runs
 running test until the next one. The second way is what keeps the entries
 summing to the total the run prints, and it is how the tape-refold counts above
 were taken.
+
+Attributing that way, **split each output line before matching, and attribute
+every piece of it — including the tail of the announce line itself.** The layer
+writes to stderr while libtest is mid-line, so a test's first diagnostic
+routinely lands appended to its own `test <name> ... ` prefix; an implementation
+that consumes the announce line as a marker and moves on loses exactly one hit
+per test. It is the same hazard the access mix is counted around above, one
+level up: there, per diagnostic rather than per line; here, per diagnostic
+*within* a line that is also a marker.
 
 For each `(crate, access kind, kernel)` the runner expects **the sum of the
 pinned counts whose test actually ran in this run**. A test the selection
