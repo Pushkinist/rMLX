@@ -20,14 +20,19 @@
 //! a round that accepted every proposal the draft cache is one token behind, so
 //! the next drafting pass feeds that token ahead of the correction.
 //!
-//! # Why this path is greedy
+//! # The two acceptance rules
 //!
-//! Nothing here is: `verify` draws every token through the round's own
-//! [`VerifierDraw`](super::VerifierDraw), at whatever temperature the request
-//! asked for. What makes the path greedy is one branch outside it — the entry
-//! guard routes a request whose sampler is active to the stochastic loop, whose
-//! acceptance rule is its own — so the draw this drafter reads is the device
-//! argmax on every request that reaches it.
+//! A two-model request runs one of two rules, and it is the only thing that
+//! differs between the pair's two paths: the greedy prefix walk at temperature
+//! 0, and Leviathan's stochastic test above it. [`Acceptance`] is that choice,
+//! carried as a field of this one drafter rather than as a second drafter —
+//! everything either rule does with a cache, a tape or a seed is the same, and
+//! the rule is a statement about `propose` and `verify` alone.
+//!
+//! Neither rule decides its own temperature: every token of either comes off
+//! the round's own [`VerifierDraw`](super::VerifierDraw), which is the request's
+//! one sampling stream. What routes a request to one rule or the other is the
+//! entry guard above both.
 
 use std::time::Instant;
 
@@ -40,11 +45,34 @@ use super::round_loop::{
     Seed, Verdict, VerifierOffsetBasis,
 };
 use super::{
-    accept_prefix, arm_lin_tapes, draft_decode_n, draft_rows_to_drop, drafts_per_round, fill_fed,
-    prefill_chunked,
+    accept_prefix, arm_lin_tapes, draft_decode_n, draft_decode_n_stochastic, draft_rows_to_drop,
+    drafts_per_round, fill_fed, prefill_chunked,
 };
 use crate::arch::Architecture;
+use crate::sampler::{sample_index, stochastic_accept, AcceptDecision, Pcg32};
 use rmlx_kv_quant::{KvCache, LinearAttnCache};
+
+/// How a round decides which of its proposals the verifier stands behind.
+///
+/// The one thing item 1 of `docs/SPEC_ROUND_SKELETON.md` says cannot be shared:
+/// the greedy walk compares tokens, and the stochastic one compares the two
+/// distributions each position was drawn from. Both commit the same shape — an
+/// accepted prefix and one token the verifier stands behind — which is why one
+/// [`Verdict`] carries either.
+#[allow(missing_debug_implementations)]
+pub(crate) enum Acceptance {
+    /// The verifier's own token at each position against the proposal made for
+    /// it, accepting the agreed prefix. Exact at any temperature: the walk emits
+    /// the verifier's draw at every position it reaches, and it only reaches a
+    /// position whose proposals all agreed.
+    Prefix,
+    /// Leviathan's test: accept a proposal with probability `min(1, p(x)/q(x))`,
+    /// and on the first rejection commit a correction drawn from the residual
+    /// `normalize((p - q)+)`. Carries the distributions this round's proposals
+    /// were drawn from — `q` — which only this rule draws and only this rule
+    /// reads.
+    Stochastic(Vec<Vec<f32>>),
+}
 
 /// One request's two-model drafting state: the draft model and everything of
 /// this round that its own rollback reads.
@@ -70,10 +98,13 @@ pub(crate) struct TwoModelRound<'a> {
     /// The last of them, which the drafting pass never fed back — the token the
     /// resync hands the next pass on a round that accepted every proposal.
     last_proposal: Option<u32>,
+    /// Which rule this request's rounds accept by, and whatever state that rule
+    /// carries across a round's two halves.
+    accept: Acceptance,
 }
 
 impl<'a> TwoModelRound<'a> {
-    pub(crate) fn new(draft: &'a Architecture) -> Self {
+    pub(crate) fn new(draft: &'a Architecture, accept: Acceptance) -> Self {
         Self {
             draft,
             kv: Vec::new(),
@@ -82,6 +113,7 @@ impl<'a> TwoModelRound<'a> {
             fed: Vec::new(),
             proposals: 0,
             last_proposal: None,
+            accept,
         }
     }
 
@@ -107,7 +139,7 @@ impl RoundDrafter for TwoModelRound<'_> {
         let device = ctx.device;
         let Some((&last, head)) = prompt.split_last() else {
             return Err(Error::Model(
-                "spec_generate_greedy_cached: the prompt has no last token for the first \
+                "the two-model prefill: the prompt has no last token for the first \
                  round to carry"
                     .into(),
             ));
@@ -146,32 +178,56 @@ impl RoundDrafter for TwoModelRound<'_> {
     }
 
     /// Draft `block - 1` tokens by stepping the draft model through its own
-    /// cache.
+    /// cache, greedily or by drawing each one, as this request's rule asks.
+    ///
     /// The carry is the loop's and reaches the draft model inside `self.seed`,
     /// which the last round's resync built: on a full acceptance it is two
     /// tokens, and this parameter is only the second of them.
     fn propose(&mut self, ctx: &mut RoundCtx<'_>, _carry: u32, block: usize) -> Result<Vec<u32>> {
+        let Self {
+            draft,
+            kv,
+            lin,
+            seed,
+            fed,
+            proposals,
+            last_proposal,
+            accept,
+        } = self;
         // The draft model's own round tape, armed before the forwards that write
         // it. The pass takes one forward per proposal, so the tape accumulates
         // across the whole round and the rollback replays it as one prefix.
-        arm_lin_tapes(self.lin.as_deref_mut());
-        let proposed = draft_decode_n(
-            self.draft,
-            &self.seed,
-            drafts_per_round(block),
-            &mut self.kv,
-            self.lin.as_deref_mut(),
-            ctx.device,
-        )?;
+        arm_lin_tapes(lin.as_deref_mut());
+        let n = drafts_per_round(block);
+        let proposed = match accept {
+            Acceptance::Prefix => {
+                draft_decode_n(draft, seed, n, kv, lin.as_deref_mut(), ctx.device)?
+            }
+            // The distributions the proposals were drawn from are half of what
+            // the rule tests, so the pass that drew them is what keeps them.
+            Acceptance::Stochastic(q) => {
+                let (proposed, drawn) = draft_decode_n_stochastic(
+                    draft,
+                    seed,
+                    n,
+                    kv,
+                    lin.as_deref_mut(),
+                    &mut ctx.draw,
+                    ctx.device,
+                )?;
+                *q = drawn;
+                proposed
+            }
+        };
         // What the pass actually fed, which is what its tape recorded and what
         // the rollback keeps a prefix of.
         fill_fed(
-            &mut self.fed,
-            &self.seed,
+            fed,
+            seed,
             proposed.split_last().map_or(&[], |(_, head)| head),
         );
-        self.proposals = proposed.len();
-        self.last_proposal = proposed.last().copied();
+        *proposals = proposed.len();
+        *last_proposal = proposed.last().copied();
         Ok(proposed)
     }
 
@@ -185,13 +241,34 @@ impl RoundDrafter for TwoModelRound<'_> {
             ctx.lin.as_deref_mut(),
             device,
         )?;
-        let v_tokens = ctx.draw.block_tokens(&v_logits, fed.len(), device)?;
-        let verify_ns = t0.elapsed().as_nanos();
-
-        let t0 = Instant::now();
-        let (accept, commit) =
-            accept_prefix(&v_tokens, fed.get(1..).unwrap_or_default(), remaining)?;
-        let walk_ns = t0.elapsed().as_nanos();
+        let proposed = fed.get(1..).unwrap_or_default();
+        // Each rule reads the verifier's block back the way it judges it — one
+        // token per position, or one whole distribution — so the read-back is
+        // inside the arm and its cost is billed to the verify span either way.
+        let (accept, commit, verify_ns, walk_ns) = match &mut self.accept {
+            Acceptance::Prefix => {
+                let v_tokens = ctx.draw.block_tokens(&v_logits, fed.len(), device)?;
+                let verify_ns = t0.elapsed().as_nanos();
+                let t0 = Instant::now();
+                let (accept, commit) = accept_prefix(&v_tokens, proposed, remaining)?;
+                (accept, commit, verify_ns, t0.elapsed().as_nanos())
+            }
+            // Taken, not borrowed. The distributions belong to the drafting pass
+            // that drew them and to the one verify that judges it, so a second
+            // read finds nothing: a `verify` that ran twice, or one whose
+            // `propose` returned before drawing, would otherwise test this
+            // round's `p` against the last round's `q`. Only a shape change is
+            // refused below, and a stale round of the same width has the same
+            // shape — which is a wrong answer with nothing to say so.
+            Acceptance::Stochastic(q) => {
+                let q = std::mem::take(q);
+                let p = ctx.draw.block_distributions(&v_logits, fed.len(), device)?;
+                let verify_ns = t0.elapsed().as_nanos();
+                let t0 = Instant::now();
+                let (accept, commit) = stochastic_prefix(&p, &q, proposed, ctx.draw.rng())?;
+                (accept, commit, verify_ns, t0.elapsed().as_nanos())
+            }
+        };
         Ok(Verdict {
             accept,
             commit,
@@ -265,6 +342,68 @@ impl RoundDrafter for TwoModelRound<'_> {
         f(&[]);
         Ok(())
     }
+}
+
+/// The Leviathan acceptance walk over one verified block.
+///
+/// `p` is the verifier's post-sampling distribution at each of the block's
+/// positions and `q` the distribution each proposal was drawn from, so `p` holds
+/// exactly one position more than `q` — the bonus slot past the last proposal.
+/// Each proposal is accepted with probability `min(1, p(x)/q(x))` against one
+/// draw of `rng`; the first rejection commits a correction drawn from the
+/// residual instead, and a round that rejected nothing commits the verifier's
+/// own draw past the last proposal. Either way the request's output
+/// distribution is the verifier's (Leviathan 2023, Thm 1).
+///
+/// Returns the accepted count and the tokens the round commits. The request's
+/// budget is not read here: it caps the emission in the loop, and a round that
+/// ran out of budget still committed the KV it committed.
+///
+/// The three slices' lengths carry the whole meaning and two of them are
+/// same-typed, so a swapped or short argument list returns a plausible accept
+/// count that then drives a KV rollback. That is what the refusal below is for.
+fn stochastic_prefix(
+    p: &[Vec<f32>],
+    q: &[Vec<f32>],
+    proposals: &[u32],
+    rng: &mut Pcg32,
+) -> Result<(usize, Vec<u32>)> {
+    if p.len() != proposals.len() + 1 || q.len() != proposals.len() {
+        return Err(Error::Model(format!(
+            "stochastic_prefix: {} verifier distributions and {} proposal distributions \
+             against {} proposals — a verified block is the proposals plus one bonus \
+             slot, and one distribution per proposal",
+            p.len(),
+            q.len(),
+            proposals.len()
+        )));
+    }
+    let mut accept = 0usize;
+    let mut correction: Option<u32> = None;
+    for ((p_i, q_i), &x) in p.iter().zip(q.iter()).zip(proposals.iter()) {
+        match stochastic_accept(p_i, q_i, x, rng)? {
+            AcceptDecision::Accept => accept += 1,
+            AcceptDecision::Reject(corr) => {
+                correction = Some(corr);
+                break;
+            }
+        }
+    }
+    let mut commit: Vec<u32> = Vec::with_capacity(accept + 1);
+    commit.extend(proposals.iter().take(accept));
+    // The one token the verifier stands behind: the correction where a proposal
+    // was rejected, its own draw at the bonus slot where none was. The length
+    // refusal above is what says there is such a slot.
+    let closing = if let Some(corr) = correction {
+        corr
+    } else {
+        let bonus = p.last().ok_or_else(|| {
+            Error::Model("stochastic_prefix: the verified block has no bonus slot".into())
+        })?;
+        sample_index(bonus, rng) as u32
+    };
+    commit.push(closing);
+    Ok((accept, commit))
 }
 
 #[cfg(test)]

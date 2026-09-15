@@ -60,7 +60,11 @@ the emitted distribution and on the acceptance rate.
 `VerifierDraw` in `crates/rmlx-models/src/speculative/mod.rs` owns both seams a
 sidecar loop reads the verifier through — the seed token after prefill and the
 block each round — so a loop takes the argmax or the draw at one place rather
-than two.
+than two. It is also the request's one RNG stream: the stochastic two-model rule
+draws its proposals, its acceptance coins and its corrections through it rather
+than seeding a generator of its own, because two generators off one seed are two
+correlated streams and only one of them is the one a seeded request is pinned
+to.
 
 **What a sampled sidecar request gives up.** The argmax is a single device
 reduction over the whole verified block; a draw is a host round trip and a
@@ -82,9 +86,9 @@ it did not get, rather than having them dropped in silence.
 
 ## Round-loop
 
-The production path (`spec_generate_greedy_cached`, an entry onto the shared
-round loop, and `spec_generate_stochastic_cached`, which still carries its own
-body): persistent per-layer verifier and draft KV caches with
+The production path (`spec_generate_greedy_cached` and
+`spec_generate_stochastic_cached`, two entries onto the shared round loop):
+persistent per-layer verifier and draft KV caches with
 `KvCache::truncate_to`-based rollback on partial acceptance. This cuts per-round
 verifier cost from O(prompt\_len) to O(K).
 
@@ -115,19 +119,20 @@ vocabulary by the norm's weight vector for every caller handing it a raw capture
 notice, and neither was visible to the 48-token prefix checks the alignment
 suites run. `crates/rmlx-models/tests/spec_greedy_equivalence.rs` is the gate that
 found them, over 256 generated tokens; `docs/SPEC_ANSWER_EQUIVALENCE.md` is its
-reference. It carries a pair for six of the seven round loops below; the seventh
+reference. It carries a pair for six of the seven drafter paths below; the seventh
 is the two-model stochastic one, which runs only above temperature 0 and so has
 no arm this gate can compare.
 
-**One loop, migrating.** The seven drafter paths run one algorithm, and two of
-them still carry their own copy of it;
-`docs/SPEC_ROUND_SKELETON.md` is the plan that collapses them: the drafter
-interface, what each loop does the interface cannot express, the migration
-order, and the mutations a skeleton could contain beside what catches each.
-Migration chunks 1 to 5 have landed: the shared loop is
-`crates/rmlx-models/src/speculative/round_loop.rs`, and the Gemma4 assistant, the
-MTP sidecar, DFlash 2, DFlash 1 and EAGLE-3 run on it; the two two-model loops
-still carry their own bodies.
+**One loop.** The seven drafter paths run one algorithm and there is one copy of
+it: `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs`. Each
+path is an entry that resolves its request's block, refuses a prompt under two
+tokens and hands its rounds to that loop with its own `RoundDrafter` — the
+Gemma4 assistant, the MTP sidecar, DFlash 2, DFlash 1, EAGLE-3 and the two-model
+pair, whose two paths are one drafter under two acceptance rules.
+`docs/SPEC_ROUND_SKELETON.md` is the interface: what a drafter states, what each
+chunk of the collapse landed and what it had to preserve, the two things the
+interface still cannot express, and the mutations a shared skeleton can contain
+beside what catches each.
 
 ```text
 # Initialisation
@@ -898,14 +903,16 @@ normal case (`gemma-4-e4b` drafted by `gemma-4-e2b`, `Qwen3.8-27B` drafted by
 
 It is the one drafter kind whose sampled arm scores against a drafter
 distribution, because it is the one whose drafter samples. At `temperature == 0`
-the loop is `spec_generate_greedy_cached`; above it,
+the entry is `spec_generate_greedy_cached`; above it,
 `spec_generate_stochastic_cached` — full rejection sampling over the same
-post-sampling distributions the ordinary sampler builds. The sidecar kinds run
+post-sampling distributions the ordinary sampler builds, and the same
+`VerifierDraw` stream the verifier's own tokens come off, so a seeded request
+reproduces one sequence. The sidecar kinds run
 the point-mass form of the same rule (see [Acceptance rules](#speculative-decoding)).
 `crates/rmlx-models/tests/two_model_stochastic.rs` is the gate that the
-stochastic loop runs at all: it pins that one seed reproduces one sequence, that
+stochastic rule runs at all: it pins that one seed reproduces one sequence, that
 a second seed and `temperature == 0` do not, on the `gemma-4-e4b` / `gemma-4-e2b`
-pair resolved by slug. It says nothing about *what* the loop samples from;
+pair resolved by slug. It says nothing about *what* the rule samples from;
 `crates/rmlx-models/tests/spec_sampled_distribution.rs` is what reads that, on a
 sidecar pair.
 
@@ -979,7 +986,7 @@ the last eight rounds, per round and after the fact, not per token from the
 draft's confidence. A `p_min` for the two-model loop would need the draft's
 probability at each step; `draft_decode_n` today batches its argmaxes and
 syncs once per round, so that is one host readback per draft token, the same
-cost the stochastic loop already pays. Not implemented here.
+cost the stochastic rule already pays. Not implemented here.
 
 **Measured** (temperature 0, `--kv-quant none`, `--max-ctx 8192`, block 5, 128
 tokens, one warmup and three measured requests, `scripts/spec_bench.sh`), rows
@@ -1110,9 +1117,9 @@ Two constructors, because the two shapes hold different numbers of models:
 - Otherwise routes to `spec_generate_greedy_cached` (deterministic argmax,
   temperature == 0).
 
-Both paths share the same KV cache structure and rollback logic — the greedy
-one through `run_rounds` and `two_model::TwoModelRound`, the stochastic one in
-its own body until it migrates. There is no
+Both paths share the same KV cache structure and rollback logic, and now the
+same body: both run `run_rounds` with `two_model::TwoModelRound`, under
+`Acceptance::Prefix` and `Acceptance::Stochastic` respectively. There is no
 re-prefill fallback: an architecture whose `forward_seq_last_k_with_cache` is
 unwired surfaces that error.
 

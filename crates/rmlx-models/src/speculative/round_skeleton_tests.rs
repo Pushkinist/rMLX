@@ -95,11 +95,11 @@ use super::eagle3::round::Eagle3Round;
 use super::gemma4_assistant::AssistantRound;
 use super::mtp::SidecarRound;
 use super::round_loop::{ReportSkippedBy, RoundDrafter, VerifierOffsetBasis};
-use super::text_scan::is_code;
+use super::text_scan::{is_code, lines_in_fns};
 use super::two_model::TwoModelRound;
 use super::{
     accept_prefix, draft_rows_to_drop, guard_restricted_prefix, rollback_target_from_head,
-    rollback_target_from_tail, round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
+    round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
 };
 
 /// One acceptance walk over a drafted block, and the rows the three spellings
@@ -208,51 +208,56 @@ fn the_round_block_is_one_function_of_the_block_and_the_budget() {
     assert_eq!(dflash_next_block_size(&[(0, 7), (0, 7)], 16, 16, false), 4);
 }
 
-/// The verifier's rollback target, in the two spellings the loops use.
+/// The verifier's rollback target keeps the carry and the accepted prefix, and
+/// names the position the post-forward read names.
 ///
-/// Five loops still call [`rollback_target_from_tail`], and the shared loop
-/// calls [`rollback_target_from_head`] for every drafter on it — it reads the
-/// offset before the verify forward, whichever read the drafter then reports on
-/// its round line. They must name the same position: the forward
-/// consumed the carry token and every proposal, so `v_offset_before = pre + 1 +
-/// proposals`. An off-by-one either way leaves a rejected draft in the cache
-/// every partial round — the defect the equivalence pairs' broken engines are
-/// built from.
+/// [`rollback_target_from_head`] is the one producer: the shared loop reads the
+/// offset before the verify forward and computes the target from it, whichever
+/// read the drafter then reports on its round line. An off-by-one either way
+/// leaves a rejected draft in the cache every partial round — the defect the
+/// equivalence pairs' broken engines are built from.
+///
+/// The second reading is the one the round line rests on. Six of the seven
+/// drafters report the offset read *after* the forward, and that number names
+/// this same position counted back from the tail — `v_offset_before -
+/// (proposals - accept)` — because the forward consumed the carry token and
+/// every proposal, so `v_offset_before = pre + 1 + proposals`. The tail
+/// arithmetic is written out here rather than called: no loop computes a target
+/// that way any more, and a helper kept for one test to compare against itself
+/// would be a re-derivation rather than a pin.
 ///
 /// Mutation: change `rollback_target_from_head` to `pre_round_offset + accept as
-/// i32 + 2`, or `rollback_target_from_tail` to drop `proposals - accept + 1`.
+/// i32 + 2`.
 #[test]
-fn the_two_rollback_spellings_name_the_same_position() {
+fn the_rollback_target_retains_the_carry_and_the_accepted_prefix() {
     for pre in [0_i32, 1, 37, 4096] {
         for proposals in 1..=8usize {
             for accept in 0..=proposals {
                 let v_k = 1 + proposals as i32;
                 let v_offset_before = pre + v_k;
-                let from_tail = rollback_target_from_tail(v_offset_before, proposals, accept);
+                let from_tail = v_offset_before - (proposals as i32 - accept as i32);
                 let from_head = rollback_target_from_head(pre, accept);
                 assert_eq!(
                     from_tail, from_head,
-                    "the two spellings part at pre {pre}, {proposals} proposals, {accept} accepted"
+                    "the two readings part at pre {pre}, {proposals} proposals, {accept} accepted"
                 );
                 // The retained positions are the carry and the accepted prefix,
                 // and nothing else: the correction the round emits past them is
                 // a prediction the verifier has not processed.
                 assert_eq!(
-                    from_tail - pre,
+                    from_head - pre,
                     accept as i32 + 1,
                     "retained rows at pre {pre}, {proposals} proposals, {accept} accepted"
                 );
                 // A full acceptance drops nothing.
                 if accept == proposals {
-                    assert_eq!(from_tail, v_offset_before);
+                    assert_eq!(from_head, v_offset_before);
                 }
             }
         }
     }
-    // Absolute rows, both spellings, one cell each.
-    assert_eq!(rollback_target_from_tail(4104, 7, 3), 4100);
+    // Absolute rows, one cell each.
     assert_eq!(rollback_target_from_head(4096, 3), 4100);
-    assert_eq!(rollback_target_from_tail(5, 4, 0), 1);
     assert_eq!(rollback_target_from_head(0, 0), 1);
 }
 
@@ -384,14 +389,15 @@ fn the_reduced_vocabulary_prefix_is_bounded_by_the_acceptance() {
 // ---------------------------------------------------------------------------
 
 /// How a loop refuses a drafter that proposed nothing.
+///
+/// One arm, because one loop states one refusal. The two-model bodies refused
+/// the verifier input the empty chain produced — the same test one statement
+/// later, a two-model round's carry being always one token — and that spelling
+/// went with the last of them.
 #[derive(Debug, Clone, Copy)]
 enum ChainRefusedBy {
     /// On the proposals themselves, before the verify forward.
     TheProposalChain,
-    /// On the verifier input the empty chain produces. The same test, one
-    /// statement later: a two-model round's verifier carry is always one token,
-    /// so the input is under two positions exactly when the chain is empty.
-    TheVerifierInput,
 }
 
 /// The file the migrated loops share, and the order its own edge markers fall
@@ -472,30 +478,25 @@ const DISPOSITIONS: [(
     ),
     (
         SpecLoop::TwoModelStochastic,
-        "mod.rs",
+        SHARED_LOOP,
         ReportSkippedBy::TheInRoundExit,
-        ChainRefusedBy::TheVerifierInput,
+        ChainRefusedBy::TheProposalChain,
         VerifierOffsetBasis::AfterTheForward,
     ),
 ];
 
 /// The files the table names, in the order it names them, each with its source.
-const LOOP_SOURCES: [(&str, &str); 2] = [
-    (
-        SHARED_LOOP,
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/speculative/round_loop.rs"
-        )),
-    ),
-    (
-        "mod.rs",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/speculative/mod.rs"
-        )),
-    ),
-];
+///
+/// One, as of the last migration: every row names [`SHARED_LOOP`]. It stays a
+/// table rather than a constant because a drafter that ever leaves the shared
+/// loop names its own file here again, and the readings below are of the table.
+const LOOP_SOURCES: [(&str, &str); 1] = [(
+    SHARED_LOOP,
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/speculative/round_loop.rs"
+    )),
+)];
 
 /// The seven edge markers, each as the character the reading below renders it
 /// as.
@@ -524,7 +525,7 @@ const LOOP_SOURCES: [(&str, &str); 2] = [
 /// safe direction, and it is why the exactness is confined to these two: the
 /// other six markers name a call or a keyword that a loop may legitimately
 /// write in more than one shape.
-const MARKERS: [(char, &str); 8] = [
+const MARKERS: [(char, &str); 7] = [
     (
         'S',
         "if !matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheSeedExit) {",
@@ -536,7 +537,6 @@ const MARKERS: [(char, &str); 8] = [
     ('E', "return Ok((emitted"),
     ('W', "while emitted.len() < n_tokens"),
     ('G', "draft_tokens.is_empty()"),
-    ('G', "v_k < 2"),
     ('R', "log_request_record("),
     ('P', "report_verifier_kv_bytes("),
 ];
@@ -564,22 +564,6 @@ fn marks_line(line: &str, mark: char, needle: &str) -> bool {
         line.trim() == needle
     } else {
         line.contains(needle)
-    }
-}
-
-/// How the markers of one loop fall in source order, given which exit skips the
-/// report.
-///
-/// A loop that skips it on the seed exit returns before the round loop opens,
-/// then records and reports after it closes. A loop with no seed has its early
-/// exit inside the round loop, past the refusal, and writes its own record
-/// before returning — so its record site appears twice, once on each exit. Those
-/// are two different orderings of the same five markers, which is what makes
-/// this reading positional rather than a count.
-fn expected_pattern(skipped_by: ReportSkippedBy) -> &'static str {
-    match skipped_by {
-        ReportSkippedBy::TheSeedExit => "EWGRP",
-        ReportSkippedBy::TheInRoundExit => "WGRERP",
     }
 }
 
@@ -624,23 +608,14 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
             "the {loop_kind:?} row names `{file}`, which is not a file this test reads"
         );
     }
-    for (file, src) in LOOP_SOURCES {
-        let want: String = if file == SHARED_LOOP {
-            SHARED_LOOP_PATTERN.to_owned()
-        } else {
-            DISPOSITIONS
-                .iter()
-                .filter(|(_, f, _, _, _)| *f == file)
-                .map(|&(_, _, skipped_by, _, _)| expected_pattern(skipped_by))
-                .collect()
-        };
+    for (_, src) in LOOP_SOURCES {
         assert_eq!(
             marker_sequence(src),
-            want,
-            "{file}: the two declared-exit guards (S, I), the early exit (E), the \
-             round loop (W), the empty-chain refusal (G), the request record (R) \
-             and the resident-KV report (P) do not fall in the order the table \
-             declares for the loop(s) it holds"
+            SHARED_LOOP_PATTERN,
+            "{SHARED_LOOP}: the two declared-exit guards (S, I), the early exit (E), \
+             the round loop (W), the empty-chain refusal (G), the request record (R) \
+             and the resident-KV report (P) do not fall in the order the loop that \
+             carries every row's exits is declared to write them in"
         );
     }
     // A migrated loop states its disposition rather than spelling it out, and a
@@ -672,13 +647,12 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
                 <Eagle3Round<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
                 <Eagle3Round<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
             ),
-            SpecLoop::TwoModelGreedy => (
+            // Two paths, one drafter: the acceptance rule is a field of it and
+            // nothing either rule does reaches an exit or an offset basis.
+            SpecLoop::TwoModelGreedy | SpecLoop::TwoModelStochastic => (
                 <TwoModelRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
                 <TwoModelRound<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
             ),
-            // The loop that still carries its own body: its dispositions are
-            // read off its source above and there is no constant to read.
-            SpecLoop::TwoModelStochastic => continue,
         };
         assert_eq!(
             declared,
@@ -708,14 +682,21 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
 /// request.
 ///
 /// The shared loop is counted by spelling and not by row, which is the one
-/// place this reading differs from a per-file count. Every drafter that
-/// migrates names [`SHARED_LOOP`] in its row, so at the next chunk two rows
-/// point at one file — and the loop states each refusal once however many
-/// drafters route through it. Counting rows there would fail a correct tree the
-/// moment a second drafter arrives.
+/// place this reading differs from a per-file count. Every drafter names
+/// [`SHARED_LOOP`] in its row, so seven rows point at one file — and the loop
+/// states each refusal once however many drafters route through it. Counting
+/// rows there would fail a correct tree.
 ///
-/// Mutation: drop either spelling from any loop, or move a loop from one
-/// spelling to the other without moving its row.
+/// **What this reading can still catch, now that the table has one file and one
+/// spelling.** A row pointing at the wrong file or the wrong measure is a
+/// compile error or is caught by the file check in the test above, so what is
+/// left is the source: the refusal deleted from the loop, which reads zero
+/// against a wanted one, and the refusal stated twice, which reads two. Those
+/// are the mutations this test is for from here, and neither is hypothetical —
+/// the first is the "empty-chain refusal lost" row of the mutation table in
+/// `docs/SPEC_ROUND_SKELETON.md`, which nothing at runtime covers.
+///
+/// Mutation: delete `draft_tokens.is_empty()` from the loop; state it twice.
 #[test]
 fn every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure() {
     for (file, src) in LOOP_SOURCES {
@@ -730,15 +711,12 @@ fn every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure() 
                         && needle
                             == match refused_by {
                                 ChainRefusedBy::TheProposalChain => "draft_tokens.is_empty()",
-                                ChainRefusedBy::TheVerifierInput => "v_k < 2",
                             }
                 })
                 .count();
-            let want = if file == SHARED_LOOP {
-                rows.min(1)
-            } else {
-                rows
-            };
+            // The shared loop states each refusal once however many drafters
+            // route through it, which is now all seven.
+            let want = rows.min(1);
             let have = src
                 .lines()
                 .filter(|l| is_code(l) && l.contains(needle))
@@ -801,5 +779,142 @@ fn the_seeds_attribution_is_written_only_where_a_seed_is_emitted() {
          and the emission, and this loop writes them at lines {arm:?}, {push:?}, \
          {emit:?} — a push above the arm attributes a token a seedless pair never \
          emitted"
+    );
+}
+
+/// One generator serves a speculative request, and it is the round's draw.
+///
+/// `VerifierDraw` holds the request's `Pcg32` and every draw of the request goes
+/// through it — the verifier's own tokens, the verifier's distributions, a
+/// drafter's sampled proposals and an acceptance rule's coins. A second
+/// generator seeded from the same `seed_or_default()` is two correlated streams,
+/// and the defect it carries is invisible to every other reading in this tree:
+/// each stream reproduces under its seed, parts from a second seed and parts
+/// from greedy, so the gate in
+/// `crates/rmlx-models/tests/two_model_stochastic.rs` passes on both. Only a
+/// diff of one seed's tokens across two commits sees it, and that is a control a
+/// reviewer runs, not a gate that runs itself.
+///
+/// This is the reading that runs itself, and it is over the **whole** module
+/// family rather than one drafter: a loop or a drafter that builds
+/// `VerifierDraw::new(sampler_cfg)` *and* seeds a `Pcg32` of its own satisfies
+/// `make check-spec-sampling`'s RULE 1 and every per-drafter reading beside it.
+///
+/// **It reads text and is blind past that** — a construction inside a branch
+/// that never runs reads identical. The owner it names is a *declaration* and
+/// not a path: `lines_in_fns` knows nothing of `impl` blocks, and `mod.rs`
+/// declares three `fn new`. What identifies the site is therefore the line
+/// beside the owner, which is asserted whole.
+///
+/// Mutation: seed a second `Pcg32` in any loop, drafter or entry under
+/// `crates/rmlx-models/src/speculative/`.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: a source tree this test's own crate cannot read back is a broken checkout, and the panic names the path"
+)]
+fn the_requests_draw_stream_has_one_generator() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/speculative");
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the speculative source directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let is_rust = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
+            if !is_rust || name.ends_with("_tests.rs") || name == "tests.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("a source file this crate ships");
+            let rel = path
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(name);
+            for (line, owner) in lines_in_fns(&src, "Pcg32::new(") {
+                found.push((rel.clone(), owner, line.to_owned()));
+            }
+        }
+    }
+    found.sort();
+    assert_eq!(
+        found,
+        vec![(
+            "mod.rs".to_owned(),
+            "new".to_owned(),
+            "rng: crate::sampler::Pcg32::new(cfg.seed_or_default()),".to_owned()
+        )],
+        "a speculative request seeds one generator, in `VerifierDraw::new` — named \
+         here by its declaration and its line, there being three `fn new` in that \
+         file — and this tree seeds them at {found:?}: a second one off the same \
+         seed is a second stream that reproduces just as well and is drawn from \
+         just as wrongly"
+    );
+}
+
+/// The owner these readings report is the declaration a line sits in, whatever
+/// stands before its `fn`.
+///
+/// Every text pin in this module family holds a statement to a *place* — a
+/// rollback in `rollback` and not in `verify`, a draw in `propose` and not in
+/// `condition` — and the place is the owner [`lines_in_fns`] reports. A
+/// qualifier the reader skips past silently hands the statement the previous
+/// declaration's name, so the pin passes while reading the wrong fn, and the one
+/// that matters here is real: `mod.rs` declares `pub const fn drafts_per_round`
+/// and four more `const fn`s, and the generator scan above sits inside a
+/// `pub(crate) fn new`.
+///
+/// Mutation: drop any arm of `declared_fn`'s qualifier loop; drop its `is_code`
+/// guard.
+#[test]
+fn the_owner_reading_names_the_declaration_a_line_sits_in() {
+    const SRC: &str = "\
+fn outer() {
+    let a = MARK;
+}
+pub const fn counted(n: usize) -> usize {
+    let b = MARK;
+}
+pub(crate) unsafe fn raw() {
+    let c = MARK;
+}
+const unsafe extern \"C\" fn abi() {
+    let d = MARK;
+}
+// fn commented() {
+    let e = MARK;
+}
+pub async fn later() {
+    let f = MARK;
+}
+";
+    let found = lines_in_fns(SRC, "MARK");
+    let read: Vec<(&str, &str)> = found
+        .iter()
+        .map(|(line, owner)| (*line, owner.as_str()))
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            ("let a = MARK;", "outer"),
+            ("let b = MARK;", "counted"),
+            ("let c = MARK;", "raw"),
+            ("let d = MARK;", "abi"),
+            // A commented-out declaration is prose: the statement under it
+            // belongs to the last declaration that was code.
+            ("let e = MARK;", "abi"),
+            ("let f = MARK;", "later"),
+        ],
+        "a qualifier the reader skips past leaves a statement attributed to the \
+         declaration above it, and every text pin in this module family reads that \
+         owner"
     );
 }

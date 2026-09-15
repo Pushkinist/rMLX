@@ -1,16 +1,14 @@
 # One speculative round loop: the interface
 
-**Status: migration chunks 1 to 6 have landed.** The loop is
-`crates/rmlx-models/src/speculative/round_loop.rs`; the Gemma4 assistant, the MTP
-sidecar, DFlash 2, DFlash 1, EAGLE-3 and the two-model greedy pair run on it and
-the two-model stochastic loop still carries its own body. This file is what a
-reviewer judged before the first drafter was migrated, and what each migration
-chunk is held to afterwards. What each chunk landed differently from the proposal
-below is listed under "What chunk 1 landed" through "What chunk 6 landed".
+**Status: the collapse is done — migration chunks 1 to 7 have landed.** The loop
+is `crates/rmlx-models/src/speculative/round_loop.rs` and every drafter runs on
+it. This file is what a reviewer judged before the first drafter was migrated,
+and what each migration chunk was held to afterwards. What each chunk landed
+differently from the proposal below is listed under "What chunk 1 landed"
+through "What chunk 7 landed".
 
-Seven drafter paths in `crates/rmlx-models/src/speculative/` run one algorithm.
-One still carries its own round-loop body; the other six are entries onto the
-shared loop:
+Seven drafter paths in `crates/rmlx-models/src/speculative/` run one algorithm,
+and each is an entry onto the one loop:
 
 | drafter path | file | body |
 |---|---|---|
@@ -20,13 +18,13 @@ shared loop:
 | `eagle3_generate` | `crates/rmlx-models/src/speculative/eagle3/round.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `mtp_assistant_generate` | `crates/rmlx-models/src/speculative/gemma4_assistant.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 | `spec_generate_greedy_cached` | `crates/rmlx-models/src/speculative/mod.rs`, drafter in `two_model.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
-| `spec_generate_stochastic_cached` | `crates/rmlx-models/src/speculative/mod.rs` | its own |
+| `spec_generate_stochastic_cached` | `crates/rmlx-models/src/speculative/mod.rs`, drafter in `two_model.rs` | entry; `run_rounds` in `crates/rmlx-models/src/speculative/round_loop.rs` |
 
 `spec_generate_greedy` in the same file is the two-model entry guard and
 dispatcher, not a loop: it validates a request, resolves the draft count and
 delegates.
 
-## The shared skeleton, read off the seven bodies
+## The shared skeleton, read off the seven bodies it replaced
 
 Every one of them, in this order: refuse a prompt under two tokens; resolve the
 request's block; build the verifier's cache stack and its recurrent stack;
@@ -39,7 +37,8 @@ verifier's resident KV, and a block figure the caller reads back.
 
 What differs is five things: how a drafter proposes, what it conditions on, how
 it rolls its own state back, which of the verifier's outputs it needs captured,
-and — for one loop — what "the verifier accepted this" means.
+and — for one drafter, under one of its two rules — what "the verifier accepted
+this" means.
 
 ## The interface
 
@@ -509,7 +508,7 @@ migration had to preserve or move.
   hidden row and projects nothing; its round line keeps `condition_rows: None`
   beside `projected_rows: None` and its `d_offset_before` / `d_target` pair,
   where the target is read back off the drafter's cache after the re-run rather
-  than computed — the cross-check item 5 of the migration order names; and it
+  than computed — the cross-check EAGLE-3's migration was chosen to land; and it
   charges no phase.
 - **Two figures moved and one log field went, and nothing reads any of them.**
   The drafter cache offset the round opens at used to be read before the draft
@@ -579,8 +578,8 @@ migration had to preserve or move — and one is a gate that lost its only name.
   `propose`, which runs before it, cannot state it without keeping a second copy
   of a fact the round already has. The span's `target` is read off the draft
   cache after the rollback rather than computed from the retention, which is the
-  cross-check item 5 of the migration order names, and the same shape EAGLE-3
-  landed in chunk 5.
+  cross-check the round line calls for, and the same shape EAGLE-3 landed in
+  chunk 5.
 - **The empty-chain refusal moved spelling, and the row moved with it.** The
   loop refuses `draft_tokens.is_empty()`; this pair's own body refused `v_k < 2`
   one statement later, on the verifier input the empty chain produced. Item 11
@@ -656,6 +655,131 @@ migration had to preserve or move — and one is a gate that lost its only name.
   taking its sixth row, and the first time that arm folds two *spellings* rather
   than two rows of one spelling.
 
+## What chunk 7 landed
+
+Nine notes. Two are the interface reached rather than grown — the last migration
+added no field and no method — one is a rule that moved into a drafter, one is a
+helper the migration orphaned, one records what the campaign leaves owed, and
+four are values the migration had to preserve or move.
+
+- **The acceptance rule is a field of the one two-model drafter, not a second
+  drafter.** `two_model::Acceptance` is two-valued: `Prefix` is the greedy walk
+  and `Stochastic(q)` is Leviathan's test, carrying the distributions this
+  round's proposals were drawn from — the state only that rule has, in the arm
+  that has it. `propose` and `verify` are the two methods that read it and
+  nothing else in the drafter branches: the prefill, the tape, the rollback, the
+  resync and the round's carry are the same statements either way, which is what
+  item 1 predicted when it said the rule is a second implementation of one
+  method rather than a second drafter. `run_rounds` gained no arm.
+- **`Verdict` expressed the stochastic round without growing.** "The accepted
+  prefix plus one resampled correction, or a bonus" is `accept` and `commit`
+  exactly as the greedy walk fills them: the correction and the bonus are both
+  "the one token the verifier stands behind", which is the last element of
+  `commit` under either rule. The one growth the chunk was allowed was not
+  spent.
+- **One RNG stream per request, and `VerifierDraw` is where it lives.** The
+  deleted body seeded a `Pcg32` from `sampler_cfg.seed_or_default()` and drew
+  its proposals, its acceptance coins and its corrections from it;
+  `VerifierDraw` seeds one from the same value for every request on the shared
+  loop. A drafter seeding a second from the same seed would be two correlated
+  streams, each reading as reproducible on its own — so the draw is where the
+  stream stays and the drafter draws through it: `block_distributions` for the
+  verifier's own distributions, `proposal` for a drafted token and the
+  distribution it came from, and `rng` for the coins the rule tosses itself. The
+  rule is the drafter's because it is the drafter's; the stream is the
+  request's. `block_tokens` and `block_distributions` share one row slice, so
+  the two read-backs cannot drift into slicing differently.
+- **The draw order did not move, and it was read rather than argued.** The
+  stream advances in the same order it did in the body — `n` proposal draws,
+  then one coin per proposal, then one residual draw on the round that rejected
+  or one bonus draw on the round that did not — off a generator seeded from the
+  same value. That is the argument. It is not evidence, and nothing already in
+  the tree could be: `crates/rmlx-models/tests/two_model_stochastic.rs` asserts
+  self-consistency *within* a build, which a reordered stream satisfies exactly
+  as well; the pinned round stream and the equivalence pairs run at temperature
+  0, where the verifier's tokens come off an argmax that reaches no draw; and
+  `crates/rmlx-models/tests/spec_sampled_distribution.rs` drives a sidecar pair.
+
+  **The reading is the same seed at two commits.** `origin/main` and this
+  chunk's head, each built in its own worktree with its own `CARGO_TARGET_DIR`,
+  and one harness copied unchanged into both. Eight cells per side: two prompts
+  — one that stops on an EOS near 50 tokens, one that runs its whole budget —
+  two temperatures, 0.7 and 1.0, and two seeds, 7 and 8, at 256 tokens on the
+  `gemma-4-e4b` / `gemma-4-e2b` pair. **Eight of eight identical, id for id and
+  text for text**, under one sha256 over each side's cell lines — the same
+  digest on both. Re-read at every later revision of the chunk, the
+  `std::mem::take` in `verify` included, with the same result.
+
+  The control is now
+  `print_the_seeded_stochastic_streams_for_a_cross_commit_diff`, beside the gate
+  it complements, and that file's doc carries the recipe — so the next change to
+  this stream has a control to run rather than an argument to make. Nothing in
+  `two_model_stochastic.rs` was re-blessed: it pins no literal sequence.
+- **`rollback_target_from_tail` is deleted.** Its last caller was the deleted
+  body; every drafter on the shared loop has its target computed from the head
+  spelling. The equality the two spellings had — the post-forward read names the
+  same position — is the invariant a round line reporting
+  `VERIFIER_OFFSET_BASIS::AfterTheForward` rests on, and it is stated on
+  `rollback_target_from_head` and driven by
+  `the_rollback_target_retains_the_carry_and_the_accepted_prefix`, which writes
+  the tail arithmetic out rather than calling a helper kept for one test to
+  compare against itself. `mod.rs`'s re-export of `RoundTotals` went the same
+  way.
+- **The two-model dispositions are preserved for the second path as the spec
+  states them**: the in-round EOS exit writes its own record and returns before
+  the resident-KV report (`KV_REPORT_SKIPPED_BY::TheInRoundExit`); the round line
+  reports the post-forward read (`VERIFIER_OFFSET_BASIS::AfterTheForward`) while
+  the target is computed from the head spelling, which is the number the body
+  computed from the tail; `conditioned_rows` stays `None` under
+  `projects_conditioning: false`; the round line keeps `condition_rows: None`
+  beside `projected_rows: None` and its `d_offset_before` / `d_target` pair; the
+  block figure goes back through `drafts_per_round` at the entry; the empty
+  chain is refused by `ChainRefusedBy::TheProposalChain`; and it charges no
+  phase — the entry writes `charged: false` into `RoundCfg` and the census reads
+  `charge_phases:3 false:4` over seven sites, now `0 classic, 1 forwarded, 7
+  entries`.
+- **Two figures moved and one log field went, and nothing reads any of them.**
+  The request's own clock used to start before the verifier's cache stack was
+  built and now starts after it; the draft model's cache stack is allocated
+  inside `prefill`. Its `verify_ns` used to cover the forward and the whole
+  block of post-sampling distributions built off it and still does — the
+  read-back is inside each rule's own arm, so the span means the same thing
+  under both — where the acceptance test, which the body billed to nothing, is
+  now `walk_ns`. Its starting `info!` is the loop's, so `k`, `max_seq`, the
+  temperature's three filters and the request's seed are no longer on that line;
+  the temperature still is. And this loop reported `phases: None`, so its round
+  line gains five `*_ms` fields and reaches `log_round`'s overrun `error!` arm
+  for the first time: the chunk-3 cell disposition, met a fourth time. The
+  pinned stream drops every `*_ms` field.
+- **The two entries are the closest thing this campaign leaves to a twin, and
+  the gate is why.** `spec_generate_greedy_cached` and
+  `spec_generate_stochastic_cached` are fifteen shared lines around three
+  statements each makes alone: its `SpecLoop`, its `Acceptance`, and its own
+  refusal text. Folding them into one entry with a parameter is what the twin
+  rule would ask for, and it is refused here for a stated reason: the charge
+  census and the sampling gate both pin **seven drafter paths**, one entry per
+  path, and a fold would leave six entries and a wrapper in no population at
+  all. `each_two_model_entry_names_its_own_rule_its_own_loop_kind_and_its_own_block`
+  in `crates/rmlx-models/src/speculative/tests.rs` is what holds the three
+  statements apart, which is the risk a near-copy carries.
+- **The shared loop answers for all seven rows of the disposition table**, which
+  is the `rows.min(1)` arm of
+  `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`
+  taking its seventh row and the last. `LOOP_SOURCES` holds `round_loop.rs`
+  alone, `ChainRefusedBy` has one arm — the `v_k < 2` spelling went with the
+  body that stated it, and `TheVerifierInput` with the spelling — and
+  `expected_pattern` went with the last row that named a file of its own. The
+  seventh `Error::Model` text is gone: item 11's cost, paid the seventh and last
+  time.
+
+**What the campaign leaves owed.** Item 5's change — the seed exit returning the
+widest block that ran rather than the resolved block — is **not** taken here and
+is owed as its own change, on its own evidence. It applies to exactly one site:
+the `return Ok((emitted, cfg.block_size))` inside `run_rounds`'s emitted-seed
+arm. The mutation table's row for it still says nothing at runtime catches the
+difference, which is why it is not folded into a refactor whose contract is that
+nothing moves.
+
 ## What the interface cannot express, and what is proposed for it
 
 Eleven things. Nine are expressible with no branch in the loop; one is a declared
@@ -669,6 +793,15 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    shared greedy body (forward, read back the verifier's own tokens,
    `accept_prefix`), one has its own. That is a second implementation of one
    method, not a branch in the loop and not a twin — the shared body exists once.
+
+   **Landed in chunk 7, one step short of the proposal.** The rule is a
+   `verify` arm, as proposed, but it is an arm of the *same drafter* rather than
+   a seventh one: `two_model::Acceptance` is a two-valued field of
+   `TwoModelRound`, because everything either rule does outside `propose` and
+   `verify` — the prefill, the tape, the rollback, the resync, the carry — is
+   the same statement. `accept_prefix` is the shared body six drafters delegate
+   to, `stochastic_prefix` is the seventh path's own, and `run_rounds` carries
+   no arm for either.
 2. **The four capture shapes.** Multi-layer hidden capture (the MTP sidecar,
    both DFlash loops, EAGLE-3 cold), shared K/V plus a raw hidden (the Gemma4
    assistant), no capture (both two-model loops), and EAGLE-3's restricted
@@ -726,9 +859,13 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    prefill forward; it returns the resolved block rather than the widest that
    ran, because no round has run there and `widest_bs` is zero. No gate prompt
    stops on its seed, so nothing sees the difference. The in-round EOS exit is
-   one exit too, shared by the six drafters on the loop and spelled once more in
-   the stochastic loop's own body, and it already returns the widest that ran. Proposed: the loop returns the widest block that ran on
+   one exit too, shared now by all seven drafters, and it already returns the
+   widest that ran. Proposed: the loop returns the widest block that ran on
    every exit, which changes that one value on those five drafters alone.
+
+   **Still owed at the end of the campaign, and now a one-site change.** The
+   value is the `return Ok((emitted, cfg.block_size))` in `run_rounds`'s
+   emitted-seed arm. Whoever takes it takes it on its own evidence.
 
    **Not adopted in chunk 1, and it is the eighth deviation above.** The shared
    loop returns the resolved block on its seed exit, exactly as the assistant's
@@ -871,69 +1008,14 @@ per-loop skip; one is a decision the owner has to take, marked as such.
     message that survives must still say that an empty chain is a broken drafter
     and not the end of the request, which is the part a reader acts on.
 
-    **Six of the seven are gone as of chunk 6, and chunk 6 is the first to fold
-    the two *spellings* rather than two loops of one.** The two-model greedy
-    pair's row in `DISPOSITIONS` moved from `ChainRefusedBy::TheVerifierInput` to
-    `ChainRefusedBy::TheProposalChain` when its body went: the shared loop states
-    one refusal, and this is the claim that the move costs no request its
-    refusal.
-
-## Migration order
-
-One drafter per chunk after this one, each its own PR, each proving its own pair
-and a byte-identical round stream.
-
-1. **The Gemma4 assistant.** Its pair is the only one that resolves both halves
-   by slug and runs under `make gpu-test` on any machine holding the snapshots —
-   every other pair needs an operator-named `RMLX_DRAFT_TEST_MODEL`, so this is
-   the only first choice whose proof a reviewer can reproduce without being told
-   which snapshot to fetch. It exercises the charged arm (`phases_charged()` and
-   `RoundPhases`), the head-basis offset of item 6, the `None` recurrent stack,
-   a drafter that keeps no cache of its own, and the sliding-window ring's
-   rollback, and it is the one consumer of `RoundOutcome::verifier_target`. It
-   answers `None` to both `rollback` and `condition`, so it proves the loop and
-   the two optional arms and nothing about the two paired structs — which is why
-   those wait for chunk 2. This chunk also carries two re-keys: the charge gate
-   below, because a migrated entry leaves its derived population the moment its
-   body goes; and the disposition test below, which moves onto
-   `KV_REPORT_SKIPPED_BY` and drops `gemma4_assistant.rs` from its source scan in
-   the same commit. Every later chunk drops its own file the same way, and the
-   seven-row table is what does not change.
-2. **The MTP sidecar.** The complement, and the first producer of `CacheSpan` and
-   `Conditioning`: a recurrent refold, a drafter cache rolled back by offset, a
-   single conditioning row with no projection beside it, and a
-   `d_offset`/`d_target` pair on the round line.
-3. **DFlash 2.** A conditioning window that slides, a prompt-window capture, the
-   third charged loop — so the charged arm is exercised by chunk 1 and chunk 2
-   before it reaches here — and the first drafter to declare a conditioning
-   buffer before its first round.
-4. **DFlash 1.** The adaptive block, the one loop whose verify width is not
-   fixed, and the other half of item 8 — it conditions on the committed count
-   where DFlash 2 conditions on the acceptance.
-5. **EAGLE-3.** The restricted vocabulary, the attribution buffer, a drafter that
-   rolls back by re-running, and the only `verify` that reads `draw.sampling()`
-   to decide which of two read-backs it may take. Its `accept_and_reseed` is a
-   rollback, a conditioning and a reseed in one call, so all of it goes in
-   `rollback`, `condition` returns `None`, and the drafter-side target is read
-   back off the cache afterwards rather than computed — which is what makes it
-   the cross-check on the verifier's target that the round line calls it.
-6. **The two-model greedy loop.** Two full models, a draft-side rollback with its
-   own tape, no seed, and the resync that prepends the last draft token on a full
-   accept. It is also where the raw `argmax` read-back becomes the context's
-   `VerifierDraw`; the two are the same at temperature 0, and
-   `the_two_model_round_loop_reproduces_plain_greedy` is what says so rather than
-   the claim.
-7. **The two-model stochastic loop.** Last, because it is the only acceptance
-   rule that is not the shared one and the only loop with no equivalence pair —
-   its gate is `crates/rmlx-models/tests/two_model_stochastic.rs`, which pins
-   that one seed reproduces one sequence.
-
-   It also closes the campaign in the docs, and names what it deletes: the
-   `CLAUDE.md` documentation-map row and the paragraph in `docs/SPECULATIVE.md`
-   both stop calling this file a proposal and describe the loop the tree has, the
-   seventh loop body goes, the sampling gate's `spec_generate_greedy_cached`
-   exception goes with chunk 6's, and the migration order above goes — a
-   completed order is a stale plan, not a reference.
+    **All seven are gone as of chunk 7.** Chunk 6 was the first to fold the two
+    *spellings* rather than two loops of one, moving the two-model greedy pair's
+    row in `DISPOSITIONS` from `ChainRefusedBy::TheVerifierInput` to
+    `ChainRefusedBy::TheProposalChain`; chunk 7 moved the last row the same way
+    and the `v_k < 2` spelling left the tree with the body that stated it. The
+    enum has one arm, which is the claim that no request lost its refusal: the
+    shared loop states one, before the verify forward, where both spellings
+    always fired on the same round.
 
 ## The oracle
 
@@ -960,9 +1042,9 @@ Five observables, and each is blind to something different.
   `emission_violation` are guarded, so a figure that becomes `None` passes.
 - **The equivalence pairs**, judged by the divergence-confidence oracle in
   `docs/SPEC_ANSWER_EQUIVALENCE.md` at the readings recorded there. They see the
-  answer. They are blind to every sampled arm, blind to the stochastic loop
-  entirely, and blind wherever a pair's drafter is not resolvable on the machine
-  running them.
+  answer. They are blind to every sampled arm, blind to the stochastic path
+  entirely — which has no temperature-0 comparand and so no pair at all — and
+  blind wherever a pair's drafter is not resolvable on the machine running them.
 - **`make check-spec-charge`**, whose census must read `charge_phases:3 false:4`
   over seven charge sites at every step of the campaign — see the gate section.
   It sees a decision that moved. It cannot see whether the schedule it describes
@@ -1278,8 +1360,8 @@ the loop count and the census and nothing about populations. The line now names
 all three — `N classic, M forwarded, K entries; census … (N sites).` and the
 forwarded loops by name — so a tree that passes says which shape it passed as,
 and a fixture asserting that a loop is forwarded has a line to assert against.
-On today's tree, which has no shared loop yet, it reads `7 classic, 0 forwarded,
-0 entries; census charge_phases:3 false:4 (7 sites).`
+On the tree the campaign ends at it reads `0 classic, 1 forwarded, 7 entries;
+census charge_phases:3 false:4 (7 sites).`
 
 | # | the tree | exit | the reason it must give |
 |---|---|---|---|
@@ -1319,7 +1401,7 @@ rule changes.
 
 It is widened to **any visibility, over the charge gate's populations (a) and (b)
 and the fns that call one of them** — the one loop, the seven entries, and the
-two-model entry guard that routes a request to one of two loops by reading
+two-model entry guard that routes a request to one of two entries by reading
 whether the sampler is active. That third clause is not tidiness: the guard is
 where a sampled request can be routed to the greedy arm, which is this gate's
 own defect class, and it is in the gate today only because it happens to be
@@ -1346,11 +1428,30 @@ is met by either, and the draw needle reads a `VerifierDraw::new(...)` naming
 `sampler_cfg`, so `VerifierDraw::new(sampler_cfg)` and
 `VerifierDraw::new(cfg.sampler_cfg)` are one needle. **That names the
 configuration's field**: it is `sampler_cfg`, the same constraint on the engine
-that the charge field's short name is. And the two-model stochastic loop builds
-no `VerifierDraw` at all — its acceptance rule is its own, and it seeds the whole
-draw stream with `Pcg32::new(sampler_cfg.seed_or_default())`. That is still a
-draw constructed from the request's sampler, so it is a second needle any loop
-may satisfy rather than a second name the gate exempts.
+that the charge field's short name is. And the two-model stochastic loop built
+no `VerifierDraw` at all while it had a body — its acceptance rule is its own,
+and it seeded the whole draw stream with
+`Pcg32::new(sampler_cfg.seed_or_default())` — so the re-key read that
+construction as a second needle any loop could satisfy rather than as a name the
+gate exempted.
+
+**Chunk 7 deleted the second needle with the body.** That rule draws its coins
+and its proposals through the round's `VerifierDraw` now, which seeds one
+generator from the same value, so the tree has one draw construction and the
+`Pcg32::new(` needle matched nothing. A needle that matches nothing cannot fire,
+and what this one would admit is exactly what the migration removed: a loop
+seeding a second generator from the request's seed, which is a second stream
+correlated with the first and reads as reproducible on its own. Case 29 of the
+recall suite asserts that shape is now refused by RULE 1(b).
+
+**And a second generator beside a correct draw is not RULE 1(b)'s to catch.** A
+loop that builds `VerifierDraw::new(sampler_cfg)` *and* seeds a `Pcg32` of its
+own passes this gate, because the draw it must construct is there. What reads
+that is `the_requests_draw_stream_has_one_generator` in
+`crates/rmlx-models/src/speculative/round_skeleton_tests.rs`, a CPU scan of every
+non-test source under `crates/rmlx-models/src/speculative/` for a `Pcg32::new(`
+outside `VerifierDraw::new` — one producer of the request's stream, read over the
+whole module family rather than over the one drafter that happens to own a rule.
 
 The census belongs on the success line for the same reason the charge gate's
 does: **one loop, seven entries, one guard**. What is *pinned* there is the one
@@ -1377,13 +1478,14 @@ and two readings of that same path took its place, one per condition of RULE 1.
 
 ### `make debt-report`
 
-Its driver group is discovered by the `step_fn` signature alone, so it already
-lists `emit_step`, `emit_round_tokens` and `emit_seed_token` beside the loops —
-eleven fns where the campaign measures seven. Narrowing it to the charge gate's
-population (a) is an open item in its own right. At the end of the campaign the
-group must list one driver plus the per-drafter `propose` / `condition` /
-`rollback` implementations, whose pairwise similarity is what their real
-differences warrant.
+Its driver group is discovered by the `step_fn` signature alone, so it lists
+`emit_step`, `emit_round_tokens` and `emit_seed_token` beside the loops and the
+entries. Narrowing it to the charge gate's population (a) is an open item in its
+own right, and it is the one gate change the campaign leaves unmade: at the end
+of the campaign the group should list one driver plus the per-drafter `propose`
+/ `condition` / `rollback` implementations, whose pairwise similarity is what
+their real differences warrant, and it still lists every fn carrying the
+signature.
 
 ## Duplication at the base of the campaign
 
@@ -1495,3 +1597,24 @@ against DFlash 1, DFlash 2, EAGLE-3, the assistant and the sidecar at 59, 53, 66
 table whose top is DFlash 1 against the sidecar at 54.9%, a pair that predates
 this chunk. No twin entered, and none of the six drafters that were already there
 gained a line.
+
+Chunk 7 deleted the last body, and the pair count goes 1 → 0. Measured with that
+same extractor at both ends of this chunk, over the one remaining body plus
+`run_rounds` and then `run_rounds` alone, `origin/main` reads 10 matched lines
+over 616 body lines and 1 pair, and this chunk's head reads **0 over 282 and 0**.
+There is one body and no pair, which is what the campaign was for. The figure
+cannot fall further and this measurement retires with it: from here the
+population is one fn, and what a future chunk moves is measured over the
+drafters instead.
+
+The second figure **falls**, for the first time in the campaign, and the fall is
+the same 37 lines the two-model impl grew by. Over the six `impl RoundDrafter`
+bodies it reads 956 matched lines over 1045 body lines and 15 pairs at
+`origin/main`, and 919 over 1082 and 15 at this chunk's head. The ten pairs that
+do not involve the two-model drafter read **663 → 663**, unchanged line for
+line; its own five pairs read 293 → 256, each falling — against DFlash 1,
+DFlash 2, EAGLE-3, the assistant and the sidecar at 42, 49, 60, 47 and 58
+matched lines where they were 61, 55, 63, 51 and 63, and 23.9%, 23.6%, 30.0%,
+25.0% and 30.7% where they were 38.7%, 29.0%, 34.7%, 30.1% and 37.0%. That is
+what a rule no other drafter has looks like when it lands inside one that
+already existed: the body grows and its similarity to every other body falls.

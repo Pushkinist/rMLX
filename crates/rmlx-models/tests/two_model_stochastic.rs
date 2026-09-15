@@ -17,11 +17,35 @@
 //! - a different seed gives a different sequence, and so does `temperature ==
 //!   0` — the loop is sampling, not argmaxing under another name.
 //!
+//! **What it cannot see, and what does.** Every assertion here is
+//! self-consistency *within one build*, so a change that **reorders** the
+//! request's draws passes it: the reordered stream is as reproducible under its
+//! seed as the old one was, as different from a second seed, and as far from
+//! greedy. Nothing else reaches it either — the pinned round stream and the
+//! equivalence pairs run at temperature 0, where the verifier's tokens come off
+//! an argmax that never reaches a draw. The only reading of a moved draw order
+//! is **the same seed at two commits**, which is what the control below prints.
+//! The recipe in full, because two of its steps are where it silently stops
+//! being a comparison:
+//!
+//! 1. Check the other commit out into its own worktree and build it with its
+//!    own `CARGO_TARGET_DIR`. **Never a shared `target/`**: one binary
+//!    overwrites the other and the run compares a commit against itself.
+//! 2. **Copy this file unchanged into that worktree** — at an older commit the
+//!    control does not exist, and a re-typed harness is a second variable — and
+//!    record one digest over both copies to say they are the same file.
+//! 3. Before trusting either run, confirm each binary carries a string only its
+//!    own side has (`strings <binary>`): a build that silently reused the other
+//!    side's artefacts reads as agreement.
+//! 4. Run this test with `--nocapture` in both and diff the `CELL` lines. They
+//!    must be identical id for id; a difference is a moved stream and not
+//!    something to re-bless.
+//!
 //! The pair is a Gemma4 verifier with the smaller Gemma4 as its full draft
 //! model — the classic two-model form — resolved by slug from
 //! `RMLX_O_MODELS_ROOT` so `make gpu-test` runs it wherever the snapshots are.
-//! Two runs reaching Metal per assertion, so the test is `#[ignore]`d and
-//! serialised by that target.
+//! Several runs reaching Metal, so the test is `#[ignore]`d and serialised by
+//! that target.
 //!
 //! Run:
 //! RMLX_O_MODELS_ROOT=<models-root> \
@@ -58,6 +82,27 @@ const PROMPT: &str =
 
 const N_TOKENS: usize = 64;
 const K: usize = 4;
+
+/// The control's own prompts, one that stops on an EOS well inside the budget
+/// and one that runs the whole of it, so the cross-commit diff covers both a
+/// request that ends itself and a request the budget ends.
+const CONTROL_PROMPTS: [(&str, &str); 2] = [
+    ("sea", PROMPT),
+    (
+        "cache",
+        "<bos><start_of_turn>user\nExplain what a KV cache is and why it helps.<end_of_turn>\n<start_of_turn>model\n",
+    ),
+];
+
+/// The control's cells: every temperature against every seed. A reordered draw
+/// stream moves every one of them; a filter that stopped being applied moves the
+/// two temperatures differently.
+const CONTROL_TEMPERATURES: [f32; 2] = [0.7, 1.0];
+const CONTROL_SEEDS: [u64; 2] = [7, 8];
+
+/// The control's budget. Long enough that a moved draw order cannot hide in a
+/// prefix the verifier is confident about.
+const CONTROL_TOKENS: usize = 256;
 
 /// A snapshot by slug, or the reason this test stands down. A misconfigured
 /// root is a failure — see `tests/common/mod.rs`.
@@ -101,6 +146,17 @@ fn generate(
     eos: &[u32],
     cfg: &SamplerConfig,
 ) -> Vec<u32> {
+    generate_n(dispatcher, tk, prompt_ids, eos, cfg, N_TOKENS)
+}
+
+fn generate_n(
+    dispatcher: &SpeculativeDispatcher,
+    tk: &tokenizers::Tokenizer,
+    prompt_ids: &[u32],
+    eos: &[u32],
+    cfg: &SamplerConfig,
+    n_tokens: usize,
+) -> Vec<u32> {
     let mut ids: Vec<u32> = Vec::new();
     let mut step_fn = |s: &rmlx_models::ProbeStep| {
         ids.push(s.token_id);
@@ -110,7 +166,7 @@ fn generate(
         .spec_generate_greedy(
             tk,
             prompt_ids,
-            N_TOKENS,
+            n_tokens,
             K,
             Some(rmlx_kv_quant::KvQuant::None),
             None,
@@ -175,4 +231,83 @@ fn stochastic_two_model_loop_samples_reproducibly() {
         sampled, greedy,
         "temperature 1.0 reproduced the greedy sequence over {N_TOKENS} tokens — the request was routed to the greedy loop"
     );
+}
+
+/// Print the token stream each seeded cell produces, for a diff against another
+/// commit.
+///
+/// **Not a gate, and its own assertions are not the point.** What it asserts is
+/// that every cell emitted and that two seeds part at each temperature; what it
+/// is *for* is the eight `CELL` lines it prints, which are the only reading in
+/// this tree of a change that reordered the request's draws. The recipe is in
+/// this file's own doc: the same test, at two commits, in two trees with their
+/// own target directories, diffed.
+///
+/// It sits in this file because it is the gate above's complement, on the same
+/// pair and one of the same prompts: what that one reads within a build, this
+/// one reads across two. It does **not** share that test's model load — each
+/// builds its own dispatcher in its own body — and it earns its place in
+/// `make gpu-test` anyway, at about a minute on a gate of twenty-one, because
+/// it is the only reading in the tree with power over the draw stream.
+#[ignore]
+#[test]
+fn print_the_seeded_stochastic_streams_for_a_cross_commit_diff() {
+    let (verifier_path, draft_path) = match (snapshot(VERIFIER_SLUG), snapshot(DRAFT_SLUG)) {
+        (Ok(v), Ok(d)) => (v, d),
+        (Err(why), _) | (_, Err(why)) => {
+            eprintln!("SKIP print_the_seeded_stochastic_streams_for_a_cross_commit_diff: {why}");
+            return;
+        }
+    };
+    let device = Device::Gpu;
+    let dispatcher = SpeculativeDispatcher::load_speculative(&verifier_path, &draft_path, device)
+        .expect("load verifier + draft");
+    let tk =
+        tokenizers::Tokenizer::from_file(verifier_path.join("tokenizer.json")).expect("tokenizer");
+    let eos = eos_ids(&verifier_path);
+    assert!(
+        !eos.is_empty(),
+        "the verifier config must name its stop ids"
+    );
+
+    for (prompt_name, prompt) in CONTROL_PROMPTS {
+        let prompt_ids: Vec<u32> = tk.encode(prompt, false).expect("encode").get_ids().to_vec();
+        for temperature in CONTROL_TEMPERATURES {
+            let mut first: Option<Vec<u32>> = None;
+            for seed in CONTROL_SEEDS {
+                let ids = generate_n(
+                    &dispatcher,
+                    &tk,
+                    &prompt_ids,
+                    &eos,
+                    &sampler(temperature, seed),
+                    CONTROL_TOKENS,
+                );
+                assert!(
+                    !ids.is_empty(),
+                    "the {prompt_name} cell at temperature {temperature} seed {seed} emitted nothing"
+                );
+                let joined: Vec<String> = ids.iter().map(u32::to_string).collect();
+                println!(
+                    "CELL prompt={prompt_name} temp={temperature} seed={seed} n={} ids={}",
+                    ids.len(),
+                    joined.join(",")
+                );
+                println!(
+                    "TEXT prompt={prompt_name} temp={temperature} seed={seed} {}",
+                    tk.decode(&ids, false)
+                        .unwrap_or_default()
+                        .replace('\n', "\\n")
+                );
+                match first {
+                    Some(ref prev) => assert_ne!(
+                        *prev, ids,
+                        "the {prompt_name} cells at temperature {temperature} gave one stream \
+                         for two seeds, so the seed is not reaching the draws"
+                    ),
+                    None => first = Some(ids),
+                }
+            }
+        }
+    }
 }

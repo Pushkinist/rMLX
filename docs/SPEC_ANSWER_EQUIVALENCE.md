@@ -86,9 +86,9 @@ the census analysis extended to these kernels and models, or a stable count.
 
 ## Coverage
 
-Seven round loops exist. Six have a pair here. The seventh **cannot have one**:
-`spec_generate_stochastic_cached` is the two-model loop's Leviathan acceptance
-rule, which only runs at `temperature > 0`. There is no temperature-0 arm of it
+Seven drafter paths exist. Six have a pair here. The seventh **cannot have
+one**: `spec_generate_stochastic_cached` is the two-model drafter's Leviathan
+acceptance rule, which only runs at `temperature > 0`. There is no temperature-0 arm of it
 to compare against plain greedy, and at any other temperature neither arm is a
 function of the model alone. Its own gate is
 `crates/rmlx-models/tests/two_model_stochastic.rs`, which pins that one seed

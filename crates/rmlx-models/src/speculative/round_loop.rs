@@ -282,7 +282,9 @@ pub(crate) struct Verdict {
     /// Proposals the verifier accepted.
     pub(crate) accept: usize,
     /// The tokens the round commits: the agreed prefix and the one token the
-    /// verifier stands behind, less anything the request's budget cut.
+    /// verifier stands behind. A rule may cut it to the request's remaining
+    /// budget and the greedy walk does; one that does not is not reporting more
+    /// than it committed, since the emission caps at the budget either way.
     pub(crate) commit: Vec<u32>,
     /// Wall clock of the verify forward and its read-back.
     pub(crate) verify_ns: u128,
