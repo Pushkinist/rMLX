@@ -56,7 +56,6 @@ use crate::arch::{load_model, Architecture, LoadOpts};
 use crate::decode_loop::ProbeStep;
 pub use draft_kind::{Declared, DraftKind};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-pub(crate) use round_common::RoundTotals;
 use round_loop::{run_rounds, RoundCfg};
 pub(crate) use round_stats::{
     log_round, phases_charged, RoundPhases, RoundReport, RoundStats, SpecLoop,
@@ -638,7 +637,8 @@ impl SpeculativeDispatcher {
                 "spec_generate_greedy_cached: prompt must have \u{2265}2 tokens".into(),
             ));
         }
-        let mut round = two_model::TwoModelRound::new(self.draft_model()?);
+        let mut round =
+            two_model::TwoModelRound::new(self.draft_model()?, two_model::Acceptance::Prefix);
         let (emitted, widest_block) = run_rounds(
             &self.verifier,
             &mut round,
@@ -662,39 +662,37 @@ impl SpeculativeDispatcher {
         Ok((emitted, drafts_per_round(widest_block)))
     }
 
-    /// Stochastic speculative decoding for `temperature > 0`.
+    /// Speculative decoding over two complete models, sampled by routing.
     ///
-    /// Identical cache structure / rollback to `spec_generate_greedy_cached`,
-    /// but acceptance is the Leviathan (2023, §2.3) stochastic rule instead of
-    /// argmax-prefix matching:
+    /// The same pair, the same caches and the same rollback as
+    /// [`Self::spec_generate_greedy_cached`]; what differs is the rule a round
+    /// accepts by. Above temperature 0 the draft model draws each proposal from
+    /// its own post-sampling distribution `q_i`, the verifier scores the block's
+    /// own `p_i`, and each proposal is accepted with probability
+    /// `min(1, p_i(x_i)/q_i(x_i))` — on the first rejection the round commits a
+    /// correction drawn from the residual `normalize((p_i - q_i)+)`, and a round
+    /// that rejected nothing commits the verifier's own draw past the last
+    /// proposal. That preserves the verifier's output distribution exactly
+    /// (Leviathan 2023 §2.3, Thm 1), which matching sampled proposals against an
+    /// argmax would not.
     ///
-    /// ```text
-    /// loop:
-    /// draft proposes num_draft tokens; for each, record its post-sampling
-    /// distribution q_i and sample x_i ~ q_i
-    /// verifier scores num_draft+1 positions → post-sampling p_0..p_{num_draft}
-    /// for i in 0..num_draft:
-    /// accept x_i with prob min(1, p_i(x_i)/q_i(x_i)) vs Uniform[0,1]
-    /// on first reject: emit corr ~ normalize((p_i − q_i)+); stop round
-    /// if all accepted: emit a bonus token ~ p_{num_draft}
-    /// ```
+    /// `p` and `q` are drawn through the request's one
+    /// [`VerifierDraw`](super::speculative::VerifierDraw), so they are the same
+    /// post-temperature / post-top-p / post-top-k / post-min-p distributions the
+    /// ordinary decode path builds — a hard correctness requirement, since
+    /// mismatched `p` and `q` bias the output — and they advance one seeded
+    /// stream, which is what
+    /// `crates/rmlx-models/tests/two_model_stochastic.rs` reproduces.
     ///
-    /// `p` and `q` are built with [`crate::sampler::sampling_distribution`] so
-    /// they are the SAME post-temperature / post-top-p / post-top-k / post-min-p
-    /// distributions the host sampler uses — a hard correctness requirement
-    /// (mismatched p/q biases the output; see Leviathan Thm 1).
+    /// The rounds run in [`run_rounds`]; what is here is the request's block and
+    /// the refusal that runs before a cache stack is built. The drafter is
+    /// [`two_model::TwoModelRound`] under [`two_model::Acceptance::Stochastic`].
     ///
-    /// The per-request `Pcg32` is seeded from `sampler_cfg.seed_or_default()`
-    /// so draws are reproducible (tests rely on this).
+    /// `k` is a **proposal** count where every sidecar loop takes a block, so
+    /// the block the loop is configured with is `k + 1` and what this returns is
+    /// the widest proposal count any round ran — its caller adds the verifier's
+    /// own token back.
     #[allow(clippy::too_many_arguments)]
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-    )]
     fn spec_generate_stochastic_cached(
         &self,
         tokenizer: &tokenizers::Tokenizer,
@@ -707,338 +705,36 @@ impl SpeculativeDispatcher {
         step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
         sampler_cfg: &crate::sampler::SamplerConfig,
     ) -> Result<(Vec<ProbeStep>, usize)> {
-        use crate::sampler::{
-            sample_index, sampling_distribution, stochastic_accept, AcceptDecision, Pcg32,
-        };
-
-        let draft = self.draft_model()?;
-        let device = self.device;
-        let mut emitted: Vec<ProbeStep> = Vec::with_capacity(n_tokens);
-
         if prompt_ids.len() < 2 {
             return Err(Error::Model(
-                "spec_generate_stochastic_cached: prompt must have ≥2 tokens".into(),
+                "spec_generate_stochastic_cached: prompt must have \u{2265}2 tokens".into(),
             ));
         }
-
-        // No penalties / constraint on the spec path (rejected upstream); the
-        // distribution builder still needs a no-op config + empty window.
-        let penalty_cfg = crate::sampler::PenaltyConfig::default();
-        let recent: &[u32] = &[];
-        // One RNG threaded through the whole generation so the draw stream is
-        // contiguous and reproducible (draft samples + accept tests + residual
-        // resamples all advance it in a fixed order).
-        let mut rng = Pcg32::new(sampler_cfg.seed_or_default());
-
-        // Diagnostic counters.
-        let mut total_draft_tokens: usize = 0;
-        let mut total_accept_count: usize = 0;
-        let mut rounds: usize = 0;
-        let t_total = Instant::now();
-        let mut window = DecodeWindow::new();
-        let mut draft_ns: u128 = 0;
-        let mut verifier_ns: u128 = 0;
-
-        let (kv_quant, max_seq, mut verifier_caches) = round_common::verifier_cache_stack(
-            &self.verifier,
-            kv_quant_override,
-            max_ctx_override,
-        )?;
-
-        tracing::info!(
-            k,
-            prompt_len = prompt_ids.len(),
-            n_tokens,
-            ?kv_quant,
-            max_seq,
-            temperature = sampler_cfg.temperature,
-            top_p = sampler_cfg.top_p,
-            top_k = sampler_cfg.top_k,
-            seed = sampler_cfg.seed_or_default(),
-            "spec_generate_stochastic_cached: starting (Leviathan stochastic acceptance)"
+        let mut round = two_model::TwoModelRound::new(
+            self.draft_model()?,
+            two_model::Acceptance::Stochastic(Vec::new()),
         );
-
-        let mut draft_caches = round_common::cache_stack(draft, kv_quant, max_seq);
-
-        let mut verifier_lin = self
-            .verifier
-            .needs_lin_caches()
-            .then(|| round_common::lin_cache_stack(&self.verifier));
-        let mut draft_lin = draft
-            .needs_lin_caches()
-            .then(|| round_common::lin_cache_stack(draft));
-
-        // Initial prefill on prompt[..-1]; last prompt token is round 1's carry.
-        let prefill_t0 = Instant::now();
-        let prefill_slice = &prompt_ids[..prompt_ids.len() - 1];
-        prefill_chunked(
+        let (emitted, widest_block) = run_rounds(
             &self.verifier,
-            prefill_slice,
-            &mut verifier_caches,
-            verifier_lin.as_deref_mut(),
-            device,
-        )?;
-        prefill_chunked(
-            draft,
-            prefill_slice,
-            &mut draft_caches,
-            draft_lin.as_deref_mut(),
-            device,
-        )?;
-        let prefill_ns: u128 = prefill_t0.elapsed().as_nanos();
-
-        let last_prompt = *prompt_ids.last().unwrap();
-        let mut v_carry: Vec<u32> = vec![last_prompt];
-        let mut d_seed: Vec<u32> = vec![last_prompt];
-        // The two token sequences a round feeds, refilled per round rather than
-        // reallocated: what the verifier scored and what the draft model was
-        // fed. Both are read by the rollback below and by nothing that outlives
-        // the round.
-        let mut v_input: Vec<u32> = Vec::new();
-        let mut d_fed: Vec<u32> = Vec::new();
-
-        let seed_emitted = emitted.len();
-        let mut emitted_in_rounds = 0usize;
-        let mut widest_draft = 0usize;
-        let round_loop_t0 = Instant::now();
-        while emitted.len() < n_tokens {
-            rounds += 1;
-            let remaining = n_tokens - emitted.len();
-            let num_draft = remaining.min(k).max(1);
-            widest_draft = widest_draft.max(num_draft);
-
-            arm_lin_tapes(verifier_lin.as_deref_mut());
-            arm_lin_tapes(draft_lin.as_deref_mut());
-
-            // -- Phase A: draft samples `num_draft` tokens, recording q_i. ---
-            let t0 = Instant::now();
-            let (draft_tokens, draft_q) = draft_decode_n_stochastic(
-                draft,
-                &d_seed,
-                num_draft,
-                &mut draft_caches,
-                draft_lin.as_deref_mut(),
-                sampler_cfg,
-                &penalty_cfg,
-                recent,
-                &mut rng,
-                device,
-            )?;
-            draft_ns += t0.elapsed().as_nanos();
-            total_draft_tokens += draft_tokens.len();
-
-            // -- Phase B: verifier scores num_draft+1 positions. -------------
-            fill_fed(&mut v_input, &v_carry, &draft_tokens);
-            let v_k = v_input.len();
-            if v_k < 2 {
-                return Err(Error::Model(format!(
-                    "spec_generate_stochastic_cached: v_k={v_k} too small"
-                )));
-            }
-
-            let t0 = Instant::now();
-            let v_logits = self.verifier.forward_seq_last_k_with_cache(
-                &v_input,
-                v_k,
-                &mut verifier_caches,
-                verifier_lin.as_deref_mut(),
-                device,
-            )?;
-            // v_logits: [1, v_k, vocab]. Build p_i for each of the v_k
-            // positions via the SAME post-sampling pipeline as q.
-            let vocab = self.vocab_size() as i32;
-            let mut p_dists: Vec<Vec<f32>> = Vec::with_capacity(v_k);
-            for i in 0..v_k {
-                // Slice position i → [1, 1, vocab] → reshape [1, vocab].
-                let row = v_logits.slice(
-                    &[0, i as i32, 0],
-                    &[1, i as i32 + 1, vocab],
-                    &[1, 1, 1],
-                    device,
-                )?;
-                let row = row.reshape(&[1, vocab], device)?;
-                p_dists.push(sampling_distribution(
-                    &row,
-                    sampler_cfg,
-                    None,
-                    &penalty_cfg,
-                    recent,
-                )?);
-            }
-            verifier_ns += t0.elapsed().as_nanos();
-
-            // -- Phase C: Leviathan stochastic acceptance. -------------------
-            // p_dists[i] is the verifier's distribution AT position i (predicts
-            // the token after v_input[i]); compare against draft x_i = the
-            // draft token proposed at that position, drawn from q_i.
-            let mut accept = 0usize;
-            let mut correction: Option<u32> = None;
-            for i in 0..draft_tokens.len() {
-                let x = draft_tokens[i];
-                match stochastic_accept(&p_dists[i], &draft_q[i], x, &mut rng)? {
-                    AcceptDecision::Accept => {
-                        accept += 1;
-                    }
-                    AcceptDecision::Reject(corr) => {
-                        correction = Some(corr);
-                        break;
-                    }
-                }
-            }
-            total_accept_count += accept;
-
-            // Determine the emitted tokens this round: accepted draft prefix
-            // plus one extra (correction on reject, bonus from p_{num_draft}
-            // on full accept).
-            let mut round_tokens: Vec<u32> = Vec::with_capacity(accept + 1);
-            round_tokens.extend_from_slice(&draft_tokens[..accept]);
-            let extra = match correction {
-                Some(corr) => corr,
-                None => {
-                    // All accepted ⇒ bonus token from the verifier's last
-                    // distribution p_{num_draft} (index v_k - 1).
-                    sample_index(&p_dists[v_k - 1], &mut rng) as u32
-                }
-            };
-            round_tokens.push(extra);
-
-            let emit = round_common::emit_round_tokens(
-                tokenizer,
-                &round_tokens,
-                n_tokens,
-                eos_ids,
-                step_fn,
-                &mut emitted,
-                &mut emitted_in_rounds,
-                &mut window,
-                None,
-            );
-            if emit.hit_eos {
-                round_common::log_request_record(
-                    &RoundTotals {
-                        loop_kind: SpecLoop::TwoModelStochastic,
-                        block_size: k + 1,
-                        conditioned_rows: None,
-                        charged: false,
-                        rounds,
-                        emitted_in_rounds,
-                        total_draft: total_draft_tokens,
-                        total_accept: total_accept_count,
-                        prefill_ns,
-                        draft_ns,
-                        verifier_ns,
-                        round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-                        t_total,
-                    },
-                    &emitted,
-                    seed_emitted,
-                    &window,
-                );
-                return Ok((emitted, widest_draft));
-            }
-
-            // -- Phase D: cache rollback (identical to the greedy path). -----
-            // Verifier processed v_k positions; we keep accept+1 (the accepted
-            // prefix + the extra, which the verifier has NOT yet processed as
-            // input — `extra` is a prediction). Trim v_k - (accept+1).
-            let next_y_token = extra;
-            let v_offset_before = verifier_caches
-                .iter()
-                .map(KvCache::offset)
-                .max()
-                .unwrap_or(0);
-            let v_target = rollback_target_from_tail(v_offset_before, draft_tokens.len(), accept);
-            let refolded = round_common::rollback_round(
-                &mut verifier_caches,
-                verifier_lin.as_deref_mut(),
-                &v_input,
-                v_offset_before - v_k as i32,
-                v_target,
-                // This loop times no phases, so it never charges one.
-                false,
-                device,
-            )?;
-
-            let d_offset_before = draft_caches.iter().map(KvCache::offset).max().unwrap_or(0);
-            let d_drop = draft_rows_to_drop(draft_tokens.len(), accept);
-            let d_target = d_offset_before - d_drop;
-            fill_fed(
-                &mut d_fed,
-                &d_seed,
-                &draft_tokens[..draft_tokens.len().saturating_sub(1)],
-            );
-            // The drafter's own arm, whose answer is not the round's:
-            // `refolded` is reported beside `v_target` and reads the verifier.
-            let _ = round_common::rollback_round(
-                &mut draft_caches,
-                draft_lin.as_deref_mut(),
-                &d_fed,
-                d_offset_before - d_fed.len() as i32,
-                d_target,
-                // This loop times no phases, so it never charges one.
-                false,
-                device,
-            )?;
-
-            v_carry = vec![next_y_token];
-            if accept == draft_tokens.len() {
-                let last_draft = *draft_tokens.last().unwrap();
-                d_seed = vec![last_draft, next_y_token];
-            } else {
-                d_seed = vec![next_y_token];
-            }
-
-            log_round(
-                &RoundReport {
-                    loop_kind: SpecLoop::TwoModelStochastic,
-                    round: rounds,
-                    accept,
-                    num_draft: draft_tokens.len(),
-                    n_committed: emit.committed,
-                    emitted_total: emitted.len(),
-                    condition_rows: None,
-                    projected_rows: None,
-                    v_offset_before,
-                    v_target,
-                    d_offset_before: Some(d_offset_before),
-                    d_target: Some(d_target),
-                    refolded,
-                    // This loop times no phases, so it never charges one.
-                    charged: false,
-                    phases: None,
-                },
-                &[],
-            );
-        }
-
-        round_common::log_request_record(
-            &RoundTotals {
+            &mut round,
+            prompt_ids,
+            step_fn,
+            &RoundCfg {
                 loop_kind: SpecLoop::TwoModelStochastic,
                 block_size: k + 1,
-                conditioned_rows: None,
+                n_tokens,
+                eos_ids,
+                tokenizer,
+                sampler_cfg,
+                // This request times no phase, so it charges none.
                 charged: false,
-                rounds,
-                emitted_in_rounds,
-                total_draft: total_draft_tokens,
-                total_accept: total_accept_count,
-                prefill_ns,
-                draft_ns,
-                verifier_ns,
-                round_loop_ns: round_loop_t0.elapsed().as_nanos(),
-                t_total,
+                kv_quant_override,
+                max_ctx_override,
             },
-            &emitted,
-            seed_emitted,
-            &window,
-        );
-
-        round_common::report_verifier_kv_bytes(
-            &self.verifier,
-            &verifier_caches,
-            verifier_lin.as_deref(),
-        );
-
-        Ok((emitted, widest_draft))
+            None,
+            self.device,
+        )?;
+        Ok((emitted, drafts_per_round(widest_block)))
     }
 }
 
@@ -1325,7 +1021,11 @@ fn disarm_lin_tapes(lin: Option<&mut [LinearAttnCache]>) {
 /// against the residual form.
 ///
 /// Holds its own RNG, one per request, so the draw stream is contiguous across
-/// rounds and a seeded request reproduces byte for byte.
+/// rounds and a seeded request reproduces byte for byte. It is the request's
+/// **one** sampling stream: a drafter that samples its own proposals draws them
+/// here too, through [`Self::proposal`], rather than seeding a second generator
+/// from the same seed — two streams off one seed are correlated, and only one
+/// of them is the stream a reproducibility pin describes.
 pub(crate) struct VerifierDraw {
     cfg: crate::sampler::SamplerConfig,
     penalties: crate::sampler::PenaltyConfig,
@@ -1381,23 +1081,75 @@ impl VerifierDraw {
             let bytes = am.to_bytes()?;
             return argmax_tokens(&bytes, v_k);
         }
-        let vocab = vocab_axis(logits)?;
         let mut tokens = Vec::with_capacity(v_k);
         for i in 0..v_k {
-            let i = i as i32;
-            let row = logits
-                .slice(&[0, i, 0], &[1, i + 1, vocab], &[1, 1, 1], device)?
-                .reshape(&[1, vocab], device)?;
+            let row = block_row(logits, i, device)?;
             tokens.push(self.draw_row(&row)? as u32);
         }
         Ok(tokens)
     }
 
+    /// The verifier's whole post-sampling distribution at each of the `v_k`
+    /// positions of one verified block.
+    ///
+    /// What an acceptance rule that compares distributions needs, where
+    /// [`Self::block_tokens`] hands back the draw alone. Both build the same
+    /// rows through the same pipeline; this one keeps them.
+    pub(crate) fn block_distributions(
+        &self,
+        logits: &Array,
+        v_k: usize,
+        device: Device,
+    ) -> Result<Vec<Vec<f32>>> {
+        let mut dists = Vec::with_capacity(v_k);
+        for i in 0..v_k {
+            dists.push(self.row_dist(&block_row(logits, i, device)?)?);
+        }
+        Ok(dists)
+    }
+
+    /// One token drawn from a drafting step's own logits, with the distribution
+    /// it came from.
+    ///
+    /// The distribution is the request's, built exactly as the verifier's is,
+    /// which is what makes a stochastic acceptance test unbiased — the rule
+    /// compares two post-sampling distributions and is wrong if they are built
+    /// differently.
+    pub(crate) fn proposal(&mut self, logits: &Array) -> Result<(u32, Vec<f32>)> {
+        let q = self.row_dist(logits)?;
+        let id = crate::sampler::sample_index(&q, &mut self.rng) as u32;
+        Ok((id, q))
+    }
+
+    /// The request's draw stream, for an acceptance rule that draws its own
+    /// coins.
+    ///
+    /// Handed out rather than wrapped because the rule that reads it is the
+    /// drafter's and belongs there; what may not move is the stream, which is
+    /// one per request.
+    pub(crate) fn rng(&mut self) -> &mut crate::sampler::Pcg32 {
+        &mut self.rng
+    }
+
+    /// One row's post-sampling distribution, from a `[1, vocab]` or
+    /// `[1, 1, vocab]` logits array.
+    fn row_dist(&self, row: &Array) -> Result<Vec<f32>> {
+        crate::sampler::sampling_distribution(row, &self.cfg, None, &self.penalties, &[])
+    }
+
     fn draw_row(&mut self, row: &Array) -> Result<usize> {
-        let probs =
-            crate::sampler::sampling_distribution(row, &self.cfg, None, &self.penalties, &[])?;
+        let probs = self.row_dist(row)?;
         Ok(crate::sampler::sample_index(&probs, &mut self.rng))
     }
+}
+
+/// Position `i` of a `[1, v_k, vocab]` block of logits, as a `[1, vocab]` row.
+fn block_row(logits: &Array, i: usize, device: Device) -> Result<Array> {
+    let vocab = vocab_axis(logits)?;
+    let i = i as i32;
+    logits
+        .slice(&[0, i, 0], &[1, i + 1, vocab], &[1, 1, 1], device)?
+        .reshape(&[1, vocab], device)
 }
 
 /// The vocabulary extent of a logits array — its last axis.
@@ -1534,28 +1286,24 @@ pub(crate) fn round_block(block_total: usize, remaining: usize) -> usize {
     block_total.min(remaining + 1).max(2)
 }
 
-/// The verifier KV offset a round rolls back to, counted from where the verify
-/// forward left off.
+/// The verifier KV offset a round rolls back to, counted from where the round
+/// started.
 ///
-/// The forward consumed the carry token and every proposal, so dropping the
-/// rejected tail — `proposals - accept` positions — leaves the carry and the
-/// accepted prefix. The correction the round emits past them is a prediction the
-/// verifier has not processed, and is not one of the retained positions.
-#[must_use]
-pub(crate) fn rollback_target_from_tail(
-    v_offset_before: i32,
-    proposals: usize,
-    accept: usize,
-) -> i32 {
-    v_offset_before - (proposals as i32 - accept as i32)
-}
-
-/// The same position, counted from where the round started.
+/// The forward consumed the carry token and every proposal, so keeping the carry
+/// and the accepted prefix is what drops the rejected tail. The correction the
+/// round emits past them is a prediction the verifier has not processed, and is
+/// not one of the retained positions.
 ///
-/// Equal to [`rollback_target_from_tail`] whenever the verify forward consumed
-/// `1 + proposals` positions, which is what every round's `v_input` holds. A
-/// loop that reads its pre-round offset before the forward takes this form; one
-/// that reads the post-forward offset takes the other.
+/// Counted from the post-forward offset the same position is
+/// `v_offset_before - (proposals - accept)`, and the two agree whenever the
+/// forward consumed `1 + proposals` positions, which is what every round's
+/// verify input holds. That is the invariant a round line reporting the
+/// post-forward read under `VERIFIER_OFFSET_BASIS::AfterTheForward` rests on —
+/// it names this position under another number — and
+/// `the_rollback_target_retains_the_carry_and_the_accepted_prefix` is what
+/// holds the two together. The target itself is computed here and only here:
+/// the pre-round read is the position the rollback returns to, where the
+/// post-forward one is a function of how far each layer happened to advance.
 #[must_use]
 pub(crate) fn rollback_target_from_head(pre_round_offset: i32, accept: usize) -> i32 {
     pre_round_offset + accept as i32 + 1
@@ -1911,10 +1659,10 @@ fn draft_decode_n(
 /// one GPU→host transfer per draft step (the same per-token transfer the
 /// standard `temp > 0` decode already pays).
 ///
-/// `q_i` is built with [`crate::sampler::sampling_distribution`] using the same
-/// `SamplerConfig` / `PenaltyConfig` as the verifier's `p_i`, so acceptance is
-/// unbiased (Leviathan: p and q must be the matched post-sampling distributions).
-#[allow(clippy::too_many_arguments)]
+/// `q_i` is built through the request's own [`VerifierDraw`], which is the same
+/// pipeline and the same RNG stream the verifier's `p_i` and every other draw of
+/// the request go through — Leviathan needs `p` and `q` to be the matched
+/// post-sampling distributions, and one stream is what a seeded run reproduces.
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -1925,14 +1673,9 @@ fn draft_decode_n_stochastic(
     n: usize,
     caches: &mut [KvCache],
     mut lin_caches: Option<&mut [LinearAttnCache]>,
-    sampler_cfg: &crate::sampler::SamplerConfig,
-    penalty_cfg: &crate::sampler::PenaltyConfig,
-    recent: &[u32],
-    rng: &mut crate::sampler::Pcg32,
+    draw: &mut VerifierDraw,
     device: Device,
 ) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
-    use crate::sampler::{sample_index, sampling_distribution};
-
     if n == 0 {
         return Ok((vec![], vec![]));
     }
@@ -1954,10 +1697,9 @@ fn draft_decode_n_stochastic(
             lin_caches.as_deref_mut(),
             device,
         )?;
-        // logits shape: [1, 1, vocab]. sampling_distribution reads vocab from
+        // logits shape: [1, 1, vocab]. The distribution builder reads vocab from
         // the last axis, so the [1,1,vocab] shape is accepted directly.
-        let q = sampling_distribution(&logits, sampler_cfg, None, penalty_cfg, recent)?;
-        let id = sample_index(&q, rng) as u32;
+        let (id, q) = draw.proposal(&logits)?;
         q_dists.push(q);
         tokens.push(id);
         // Feed the sampled token into the next step.

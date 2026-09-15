@@ -1069,3 +1069,82 @@ fn the_ceiling_admits_itself_and_nothing_above() {
         MAX_BLOCK_SIZE - 1
     );
 }
+
+// ── The two-model entries ────────────────────────────────────────────────────
+
+/// This module's own source, read as text.
+const MOD_SRC: &str = include_str!("mod.rs");
+
+/// The two two-model paths, and what each of them alone must say.
+///
+/// One drafter serves both, so what tells a request's rounds apart is three
+/// statements made in one entry and not the other — and the two entries are
+/// otherwise the same fifteen lines, which is exactly where a copy keeps the
+/// line it was copied from.
+const TWO_MODEL_ENTRIES: [(&str, &str, &str); 2] = [
+    (
+        "spec_generate_greedy_cached",
+        "loop_kind: SpecLoop::TwoModelGreedy,",
+        "two_model::Acceptance::Prefix",
+    ),
+    (
+        "spec_generate_stochastic_cached",
+        "loop_kind: SpecLoop::TwoModelStochastic,",
+        "two_model::Acceptance::Stochastic(Vec::new()),",
+    ),
+];
+
+/// Each two-model entry names its own acceptance rule and its own loop kind, and
+/// hands the round's block back in proposals.
+///
+/// The three facts each entry states alone. None has another reader for the
+/// sampled path: the equivalence harness asserts the returned block on every
+/// greedy arm and there is no sampled pair; `SpecLoop` reaches the round line,
+/// the request record and the metrics row and no assertion in this crate; and a
+/// sampled request handed `Acceptance::Prefix` still samples — the verifier's
+/// own draw at every position — so it answers plausibly, reproduces under its
+/// seed and parts from greedy, which is every assertion
+/// `crates/rmlx-models/tests/two_model_stochastic.rs` makes. What it stops being
+/// is Leviathan: the draft model's own distribution is drawn and then never
+/// tested against the verifier's.
+///
+/// **It reads text and is blind past that** — a statement at the position below
+/// inside a branch that never runs reads identical.
+///
+/// Mutation: give both entries one loop kind; give both one acceptance rule;
+/// return `widest_block` rather than its proposals.
+#[test]
+fn each_two_model_entry_names_its_own_rule_its_own_loop_kind_and_its_own_block() {
+    for (entry, loop_kind, rule) in TWO_MODEL_ENTRIES {
+        for needle in [
+            loop_kind,
+            rule,
+            "block_size: k + 1,",
+            "Ok((emitted, drafts_per_round(widest_block)))",
+        ] {
+            let found = text_scan::lines_in_fns(MOD_SRC, needle);
+            let owners: Vec<&str> = found.iter().map(|(_, owner)| owner.as_str()).collect();
+            let mine = owners.iter().filter(|owner| **owner == entry).count();
+            assert_eq!(
+                mine, 1,
+                "`{entry}` states `{needle}` {mine} time(s); the two-model entries are \
+                 one statement apart and a copy that kept the line it was copied from \
+                 serves one request's rounds under the other's rule. Found in {owners:?}"
+            );
+        }
+    }
+    // And the two rules are two: an entry that states both, or the pair naming
+    // one kind twice, passes the per-entry reading above.
+    for (_, loop_kind, rule) in TWO_MODEL_ENTRIES {
+        for needle in [loop_kind, rule] {
+            let found = text_scan::lines_in_fns(MOD_SRC, needle);
+            assert_eq!(
+                found.len(),
+                1,
+                "`{needle}` is one path's statement and this module makes it \
+                 {} time(s): {found:?}",
+                found.len()
+            );
+        }
+    }
+}
