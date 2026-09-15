@@ -53,6 +53,9 @@ Conventions:
 | `run_gpu_tests.sh` | `make gpu-test` | Runs the `#[ignore]` Metal tests per member crate, `--test-threads=1`, under Metal shader validation. |
 | `gpu_validation_census.txt` | — | Data, not a script: the shader-validation hits `run_gpu_tests.sh` accepts, one entry per originating test — kernel, access kind, that test's count, crate, and the analysis it rests on. The expectation is the sum over the tests that ran; anything else fails naming the delta. |
 | `run_gpu_tests_selftest.sh` | `make gpu-runner-selftest` | Recall test for the runner's reporting: a shader-validation hit and a crate failure in the same run are both reported, the access mix is the one observed, every census-pin verdict fails (or passes) with its own reason, and the tracked pin parses against the real classifier's population. Stubbed crates, no GPU. |
+| `check_named_skip_notices.sh` | `make check-named-skip-notices` | Every classified GPU test that announces its own stand-down names itself while doing it. A notice spelled `SKIP: <why>` is counted by the runner and listed nowhere, so the run is INCOMPLETE with a number and no name. |
+| `check_named_skip_notices_fixtures.sh` | `make check-named-skip-notices-fixtures` | Recall test for the above: every planted notice shape reaches its own reason, and exit 1 is told from exit 2. |
+| `lib/skip_notice_patterns.sh` | — | The stand-down notice's shape, defined once. Read by both `check_named_skip_notices.sh` and `run_gpu_tests.sh` — a source gate accepting a shape the runner counts as nameless would pass CI and leave every run INCOMPLETE. |
 | `eval_lock_stress.sh` | `make eval-lock-stress` | Drives the evaluation-lock reproducer across N fresh processes. Deliberately out of `make ci`. |
 | `schema_constraint_canary.sh` | — | Real-model proof for the `json_schema` constrained-decoding path. |
 | `ssd_canary.sh` | — | End-to-end long-session SSD prompt-cache tier canary (see `docs/SSD_CANARY.md`). |

@@ -59,6 +59,9 @@ pub mod sampler;
 pub mod speculative;
 pub mod ssd_tier;
 
+#[cfg(test)]
+mod test_snapshot;
+
 // The MSL wrapper re-exports (`rmlx_models::{q8_msl,
 // turboquant_msl, planarquant_msl, turbo_flash_msl}`) were
 // dropped — there were zero callers in the workspace. Import directly from

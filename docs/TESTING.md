@@ -1032,22 +1032,25 @@ One rule, and it is the one the tree already uses in three places
 
 1. **The slug resolves; the variable overrides.** Every model-gated cell names
    the slug it needs and resolves it under `RMLX_O_MODELS_ROOT`, through
-   `common::slug_snapshot` where the harness is reachable and through the same
-   `<root>/<slug>` join where it is not.
-2. **An unset override is not a stand-down.** It is what the
-   `DrafterSource::Named` arms treat it as today, and it is why they stand down
-   on a host holding their snapshots. The variable stops being a selector.
+   `common::slug_or_override` where the harness is reachable and through
+   `rmlx_models::test_snapshot::snapshot` — the same `<root>/<slug>` join — where
+   it is not.
+2. **An unset override is not a stand-down.** The variable stops being a
+   selector. That single change is what arms twenty cells on a host that already
+   held every snapshot they needed.
 3. **The pair's own slug outranks the override path.** One variable holding one
    path cannot serve nine pairs; ranking it first would hand all of them whichever
    drafter it holds, and a 4-bit sidecar loads against an mxfp8 verifier of the
    same width without complaint. The override is the fallback for a root that
    does not hold the slug.
 4. **A misconfigured root fails; an absent slug skips.** That split is
-   `slug_snapshot`'s, not a second copy of its rules.
-5. **`DrafterSource` collapses to the slug.** With rule 2, `Named(Some(slug))`
-   and `Slug(slug)` differ only in rule 3's ranking, which rule 3 makes uniform —
-   two variants and one meaning. The enum becomes
-   `Option<&'static str>`: a slug, or the ceiling class below.
+   `slug_snapshot`'s and `override_snapshot`'s, not a second copy of their rules.
+   `common::choose_by_slug` is the pure decision over the two probes and the one
+   place the ranking is written.
+5. **A pair names one slug.** With rule 2 the old `DrafterSource`'s two arms
+   differed only in rule 3's ranking, which rule 3 makes uniform — two variants
+   and one meaning. `Pair::drafter` is now `Option<&'static str>`: a slug, or the
+   ceiling class below.
 6. **Every stand-down notice names its own test.** `SKIP <test>: <why>`, enforced
    at the source line by `make check-named-skip-notices`. The notice's shape has
    one producer, `scripts/lib/skip_notice_patterns.sh`, which both that gate and
@@ -1056,8 +1059,8 @@ One rule, and it is the one the tree already uses in three places
    and no name, which is exactly the state being fixed.
 
 Rule 3 is the one behaviour change for an operator, and it reaches **exactly one
-pair**: `ASSISTANT_PAIR`, the only `DrafterSource::Slug` in the table and so the
-only one whose override outranks its slug today. `two_model_stochastic.rs` and
+pair**: `ASSISTANT_PAIR`, the only one in the table whose override outranked its
+slug before. `two_model_stochastic.rs` and
 `dflash2_loader.rs` resolve entirely by slug and read no override, so neither
 changes. After the rule, `RMLX_DRAFT_TEST_MODEL` pointed at an assistant drafter
 no longer wins while the canonical slug is under the models root.
@@ -1078,9 +1081,9 @@ of these verifiers is on the models root. **That is no longer true.**
 `qwen3_5_two_model_alignment.rs` is calibrated against
 `mlx-community__Qwen3.8-27B-mxfp8` drafted by
 `sahilchachra__ornith-1.0-9b-mxfp8-mlx`, both in the snapshot table above, and
-the two declare the same 248320-token vocabulary — which is the discriminator
-`declared_vocab_size` already reads before either model loads. So the two-model
-pair takes that slug and the ceiling class is defined but empty.
+the two name the same piece at every id either carries — which is what
+`vocab_pairing` reads before either model loads. So the two-model pair takes
+that slug and the ceiling class is defined but empty.
 
 One cell is a ceiling of a different kind: `rmlx-audio`'s `codec_decoder_debug`
 hard-codes a **cwd-relative** `models/<slug>/speech_tokenizer` path, which
@@ -1109,10 +1112,9 @@ only `RMLX_KV_TEST_MODEL`.
 | KV-cache equivalence (`embed_token_raw_applies_sqrt_hidden_scale`) | 1 | verifier only |
 | Unattributed notices in lib unit tests | 13 | one per-architecture `RMLX_TEST_MODEL_*` each, plus one cwd-relative path |
 
-A pair that genuinely had no slug would keep the `Named(None)` shape and print a
-named `SKIP <test>: <why>` naming `RMLX_DRAFT_TEST_MODEL` as the only handle. It
-would be INCOMPLETE by contract, not silent — which is the whole point of the
-contract.
+A pair that genuinely had no slug is `Pair::drafter: None`, and prints a named
+`SKIP <test>: <why>` naming `RMLX_DRAFT_TEST_MODEL` as the only handle. It is
+INCOMPLETE by contract, not silent — which is the whole point of the contract.
 
 ##### The runtime, and who pays
 
@@ -1172,7 +1174,8 @@ shape that keeps nine pairs in the table and runs four of them can never reach
 
 ##### Why the opt-in existed, and what changed
 
-`DrafterSource::Named`'s own note gives the reason, and it is **not** cost: these
+The old `DrafterSource::Named`'s own note gave the reason, and it was **not**
+cost: these
 verifiers drive an MLX quantized matmul whose invalid loads the shader-validation
 census would have to pin, "a count that moves with every generation". That
 objection is now answerable. The census pins one exact count per originating
@@ -1256,9 +1259,9 @@ arms, and the rule keeps both:
 `declared_kind` cannot pin it: `two_model` is an inference from the architecture
 registry that every full model satisfies. `declared_quant_mode` exempts it by
 design, because its draft is an independent model whose weight format is
-unrelated to the verifier's. That leaves `declared_vocab_size`, and it is a
-**necessary condition only** — an integer. Two snapshots can both declare 248320
-and map those ids to different pieces; the drafter then proposes ids that mean
+unrelated to the verifier's. That left a declared-`vocab_size` comparison, and it is a
+**necessary condition only** — an integer. Two snapshots can both declare the
+same count and map those ids to different pieces; the drafter then proposes ids that mean
 other tokens, the verifier's greedy argmax is emitted at every accepted position
 regardless, and the pair passes green having tested nothing. This gate has no
 agreement floor to catch it, deliberately — how much of one answer two correct
@@ -1279,17 +1282,19 @@ before any weight is read — but the harness does not go through
 constructor pins the two `vocab_size` values equal and nothing more. So the
 engine's check exists and the gate never reaches it.
 
-**The wiring, and it adds no second implementation.** Export that composition as
+**The wiring adds no second implementation.** That composition is exported as
 one `pub fn vocab_pairing(verifier_dir, draft_dir) -> Result<()>` in
-`crates/rmlx-models/src/speculative/mod.rs`, and have `load_speculative` call it
+`crates/rmlx-models/src/speculative/mod.rs`, and `load_speculative` calls it
 rather than composing the two calls itself — one producer, and the engine and
-the harness then run the same line. The harness calls it in `load()`'s
+the harness run the same line. The harness calls it in `load()`'s
 `TwoModelGreedy` branch, after both paths resolve and before either model loads,
 and turns an `Err` into a named `SKIP <test>: <why>` carrying the verdict's own
-reason, which names the first id whose piece differs. `declared_vocab_size` is
-then strictly weaker than its replacement with no other caller, and is deleted
-in the same change. A tokenizer-digest comparison would be a twin of this and is
-not written.
+reason, which names the first id whose piece differs. The declared-`vocab_size`
+reader was strictly weaker than its replacement with no other caller, and is
+deleted. A tokenizer-digest comparison would be a twin of this and is not
+written. `vocab_pairing_refuses_two_equal_sized_vocabularies_over_different_pieces`
+is the CPU case: two synthetic snapshots holding only a `tokenizer.json`, the
+same number of ids over different pieces, refused on the id that differs.
 
 Each refusal fires before either model is read, and each prints a named notice,
 so a mis-pairing is INCOMPLETE rather than a quiet green.

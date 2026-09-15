@@ -37,20 +37,25 @@
     clippy::needless_pass_by_value
 )]
 
-use std::path::PathBuf;
-
 use rmlx_kv_quant::{KvCache, LinearAttnCache};
 use rmlx_mlx::{argmax, Device};
 use rmlx_models::arch;
 use rmlx_models::kv_cache::DEFAULT_KV_QUANT;
 use rmlx_models::speculative::dflash::{dflash_generate, DFlashDrafter};
 
-fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var(key)
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-}
+mod common;
+
+/// The verifier this suite is calibrated against.
+const VERIFIER: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__Qwen3.6-35B-A3B-8bit",
+    archs: &["Qwen3_5MoeForConditionalGeneration"],
+};
+
+/// The DFlash 1 sidecar it is calibrated against.
+const DRAFT_SLUG: &str = "z-lab__Qwen3.6-35B-A3B-DFlash";
+
+/// Draft-model override, for a models root that does not hold [`DRAFT_SLUG`].
+const DRAFT_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 
 fn argmax_id(logits: &rmlx_mlx::Array, device: Device) -> u32 {
     let am = argmax(logits, -1, device).expect("argmax");
@@ -65,14 +70,14 @@ fn argmax_id(logits: &rmlx_mlx::Array, device: Device) -> u32 {
 #[ignore]
 #[test]
 fn dflash_round0_first_token_aligns() {
-    let (Some(model_path), Some(draft_path)) = (
-        env_path("RMLX_KV_TEST_MODEL"),
-        env_path("RMLX_DRAFT_TEST_MODEL"),
+    let test = "dflash_round0_first_token_aligns";
+    let Some(model_path) = common::model_for(&VERIFIER, test) else {
+        return;
+    };
+    let Some(draft_path) = common::apply(
+        common::slug_or_override(DRAFT_VAR, DRAFT_SLUG, common::Role::Sidecar),
+        test,
     ) else {
-        eprintln!(
-            "SKIP dflash_round0_first_token_aligns: RMLX_KV_TEST_MODEL and \
-             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
-        );
         return;
     };
     let device = Device::Gpu;
@@ -189,14 +194,14 @@ fn dflash_round0_first_token_aligns() {
 #[ignore]
 #[test]
 fn dflash_live_loop_emits_coherent() {
-    let (Some(model_path), Some(draft_path)) = (
-        env_path("RMLX_KV_TEST_MODEL"),
-        env_path("RMLX_DRAFT_TEST_MODEL"),
+    let test = "dflash_live_loop_emits_coherent";
+    let Some(model_path) = common::model_for(&VERIFIER, test) else {
+        return;
+    };
+    let Some(draft_path) = common::apply(
+        common::slug_or_override(DRAFT_VAR, DRAFT_SLUG, common::Role::Sidecar),
+        test,
     ) else {
-        eprintln!(
-            "SKIP dflash_live_loop_emits_coherent: RMLX_KV_TEST_MODEL and \
-             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
-        );
         return;
     };
     let device = Device::Gpu;
