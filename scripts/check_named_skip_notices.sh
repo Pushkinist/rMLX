@@ -31,10 +31,17 @@
 #
 # WHAT IS ACCEPTED
 #   A notice whose name is the enclosing test fn, either written out or built
-#   from a format placeholder (`SKIP {test}: …`, the spelling a test that passes
-#   its own name uses). A notice naming a DIFFERENT test is refused: the runner
-#   would list it under that other name and send the reader after a cell that
-#   ran.
+#   from the `{test}` placeholder — the spelling a test that passes its own name
+#   uses. That placeholder is accepted by its exact text and no other: `{other}`
+#   reads identically here and names a cell that ran.
+#
+#   A notice naming a DIFFERENT test is refused for the same reason: the runner
+#   would list it under a name no libtest filter reaches.
+#
+#   The notice's SHAPE is not defined here. `scripts/lib/skip_notice_patterns.sh`
+#   holds it, and `scripts/run_gpu_tests.sh` reads the same file — a source gate
+#   that accepted `SKIP  foo:` while the runner counted it as nameless would pass
+#   CI and leave every run INCOMPLETE with a number and no name.
 #
 # Exit 0 = every notice in a classified GPU test names its own test.
 # Exit 1 = at least one does not; each is named with its file, line and reason.
@@ -43,6 +50,8 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/skip_notice_patterns.sh
+. "${ROOT}/scripts/lib/skip_notice_patterns.sh"
 while [ $# -gt 0 ]; do
     case "$1" in
         --root) ROOT="${2:?--root needs a value}"; shift 2 ;;
@@ -80,7 +89,8 @@ fi
 # to the helper, which the attribution step below then drops.
 notices="$(printf '%s\n' "${files}" | while IFS= read -r f; do
     [ -n "${f}" ] || continue
-    awk -v FILE="${f}" '
+    awk -v FILE="${f}" \
+        -v ANY="${ANY_SKIP}" -v NAMED="${NAMED_SKIP}" -v PLACEHOLDER="${NAMED_SKIP_PLACEHOLDER}" '
         match($0, /^[[:space:]]*(pub[[:space:]]+(\([^)]*\)[[:space:]]*)?)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
             head = substr($0, RSTART, RLENGTH)
             sub(/^.*fn[[:space:]]+/, "", head)
@@ -89,14 +99,14 @@ notices="$(printf '%s\n' "${files}" | while IFS= read -r f; do
         # A stand-down notice is a quoted literal carrying SKIP as a whole word.
         # Both halves are required: the bare word appears in prose comments and
         # in variable names, and a quote alone is every other string in the file.
-        /"/ && /(^|[^A-Za-z0-9_])SKIP([^A-Za-z0-9_]|$)/ {
+        $0 ~ /"/ && $0 ~ ANY {
             verdict = "none"
-            if (match($0, /SKIP[[:space:]]+\{[^}]*\}[[:space:]]*:/)) {
+            if (match($0, PLACEHOLDER)) {
                 verdict = "self"
-            } else if (match($0, /SKIP[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/)) {
+            } else if (match($0, NAMED)) {
                 named = substr($0, RSTART, RLENGTH)
-                sub(/^SKIP[[:space:]]+/, "", named)
-                sub(/[[:space:]]*:$/, "", named)
+                sub(/^SKIP /, "", named)
+                sub(/:$/, "", named)
                 verdict = (named == cur) ? "self" : "other:" named
             }
             text = $0

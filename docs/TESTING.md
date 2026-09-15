@@ -928,9 +928,25 @@ Write new ones as `SKIP <its own test fn>: <why>`.
 report: it takes the classified GPU tests from the same
 `check_gpu_tests_ignored.sh --list` the runner selects from, and fails on a
 notice in one of them that names no test or names another one. It accepts the
-enclosing fn's name written out or built from a format placeholder
-(`SKIP {test}: …`). Converting the sites that predate the rule is mechanical and
-unfinished; the gate names every one that is left.
+enclosing fn's name written out, or the exact `{test}` placeholder a test that
+passes its own name uses — no other placeholder, since `{other}` reads
+identically and can hold the name of a cell that ran.
+
+The notice's SHAPE is not defined in either tool. `scripts/lib/skip_notice_patterns.sh`
+holds it and both read that file, because a gate that accepted `SKIP  foo:` while
+the runner counted the same line as nameless would be green on both sides of a
+defect neither could see.
+
+`scripts/check_named_skip_notices_fixtures.sh`
+(`make check-named-skip-notices-fixtures`, in `make ci`) is its recall test: 13
+synthetic roots, one edit each, asserting the reason as well as the exit code — a
+named notice, an unnamed one, one naming another test, one in a helper, the two
+whitespace variants above, both placeholders, an unclassified test, prose that
+merely says the word, a notice under the wrong crate, an empty classification and
+an empty source tree.
+
+Converting the sites that predate the rule is mechanical and unfinished; the gate
+names every one that is left.
 
 **No test in this suite is known-red on `main`, and this runner tracks no
 known-red list of tests.** (Shader-validation hits are the one thing it does
@@ -1033,11 +1049,25 @@ One rule, and it is the one the tree already uses in three places
    two variants and one meaning. The enum becomes
    `Option<&'static str>`: a slug, or the ceiling class below.
 6. **Every stand-down notice names its own test.** `SKIP <test>: <why>`, enforced
-   at the source line by `make check-named-skip-notices`.
+   at the source line by `make check-named-skip-notices`. The notice's shape has
+   one producer, `scripts/lib/skip_notice_patterns.sh`, which both that gate and
+   `scripts/run_gpu_tests.sh` read: a source gate accepting a shape the runner
+   counts as nameless would pass CI and leave every run INCOMPLETE with a number
+   and no name, which is exactly the state being fixed.
 
-Rule 3 is the one behaviour change for an operator: `RMLX_DRAFT_TEST_MODEL`
-pointed at a drafter whose slug is also under the models root no longer wins.
-Point the root elsewhere, or move the slug, to override such a pair.
+Rule 3 is the one behaviour change for an operator, and it reaches **exactly one
+pair**: `ASSISTANT_PAIR`, the only `DrafterSource::Slug` in the table and so the
+only one whose override outranks its slug today. `two_model_stochastic.rs` and
+`dflash2_loader.rs` resolve entirely by slug and read no override, so neither
+changes. After the rule, `RMLX_DRAFT_TEST_MODEL` pointed at an assistant drafter
+no longer wins while the canonical slug is under the models root.
+
+The workaround costs more than it looks: the override is the fallback for a root
+that does not hold the slug, so reaching it means pointing
+`RMLX_O_MODELS_ROOT` somewhere that does not — which disarms **every other pair
+in the same run**. Overriding one pair by moving the root is therefore a
+single-pair run, and the stand-downs it produces are on the final line where the
+operator can see what it cost.
 
 ##### The ceiling class, and why it is empty
 
@@ -1057,6 +1087,27 @@ hard-codes a **cwd-relative** `models/<slug>/speech_tokenizer` path, which
 resolves under no configuration this repo has — the snapshot is on the models
 root under that same slug, so it too resolves by rule 1 once the join is the
 root's.
+
+**The pair table is not the whole inventory.** Nine of the twenty stand-downs are
+the equivalence pairs; the other eleven are the alignment suites, and each of
+those gates on a **pair** of overrides, so rule 1 has to convert both halves —
+the verifier from `RMLX_KV_TEST_MODEL` as well as the drafter from
+`RMLX_DRAFT_TEST_MODEL`. `crates/rmlx-models/tests/qwen3_5_two_model_alignment.rs`
+is the clearest case: it refuses unless both name an existing directory, and the
+pair it is calibrated against (`mlx-community__Qwen3.8-27B-mxfp8` +
+`sahilchachra__ornith-1.0-9b-mxfp8-mlx`) is in the snapshot table above.
+`crates/rmlx-models/tests/spec_conditioning_residual.rs` already shows the shape
+the conversion takes — the variables select and named slugs resolve — so the
+change there is to drop the selecting guard, not to write a resolver. The one
+single-variable cell is `embed_token_raw_applies_sqrt_hidden_scale`, which needs
+only `RMLX_KV_TEST_MODEL`.
+
+| Population | Cells | Overrides to convert |
+|---|---|---|
+| Equivalence pairs (`spec_greedy_equivalence.rs`) | 9 | drafter only; the verifier already resolves through `common::model_for` |
+| Alignment suites (MTP, DFlash, EAGLE-3, two-model, conditioning residual) | 10 | verifier **and** drafter |
+| KV-cache equivalence (`embed_token_raw_applies_sqrt_hidden_scale`) | 1 | verifier only |
+| Unattributed notices in lib unit tests | 13 | one per-architecture `RMLX_TEST_MODEL_*` each, plus one cwd-relative path |
 
 A pair that genuinely had no slug would keep the `Named(None)` shape and print a
 named `SKIP <test>: <why>` naming `RMLX_DRAFT_TEST_MODEL` as the only handle. It
@@ -1084,19 +1135,40 @@ is no shortest-prompt-set notion in the tree, and inventing one would be a knob
 that contradicts that argument.** The prompt set is paid in full per pair or the
 pair is not run.
 
-**Projected, not measured.** The one armed pair costs ~240–305 s on a 2B
-verifier. The nine that would arm run 27B dense and 35B-A3B verifiers — five to
-eight times the per-token decode cost on the dense ones, plus 30–60 s of load per
-model, times two models per pair. That puts the GPU half in **hours, not
-minutes**, against ~50 min today, and every `make ci-perf` pays it. *This number
-must be measured before it is paid* — one pair, timed, is enough to scale the
-rest, and it is the first thing the implementing change does.
+The two longest rows are per-pair figures already: **~5 min** for the two-model
+stochastic pair and **~9 min** for the sampled-distribution one. Both are
+*slug-resolved pairs that already run* — and both are Gemma4, 2B and 4B. So they
+are a floor for the nine, not an estimate of them.
 
-If the measurement lands where the projection says, the lever is the **pair
-table**, not a knob: four of the nine pairs are `_DEEP` variants that drive a
-pair already in the set at a second block width. Dropping one is a recorded
-coverage decision with an owner, and it is the only kind of reduction that does
-not reintroduce a skip that reads like a pass.
+**Projected from the shape of the measured pair, not measured.** The equivalence
+gate's budget is `N_TOKENS = 256` per arm over 6 prompts × 2 arms = 3072 tokens,
+one prompt carrying a 4k document. At e2b that decode is ~30 s of the pair's
+~240 s, so the measured figure is dominated by **load and prefill**, not by
+decode. Scaling that: a 27B-dense or 35B-A3B pair pays ~40–60 s of load per model
+× 2, a 4k prefill twice, and 3072 tokens at 20–35 TPS instead of ~120 — which
+lands each pair in the same **5–9 min** band the two measured pairs occupy, not
+an order above it. Nine pairs ≈ **+45–80 min** on a ~50 min GPU half.
+
+*(An earlier reading of this section said "hours, not minutes". It was wrong: it
+scaled the 240 s figure as though decode dominated it. The 256-token budget is
+what bounds this, and it is a constant of the gate.)*
+
+**The decision rule, stated before the measurement.** The implementing change
+arms all nine and takes one full run.
+
+* GPU half **≤ 90 min** → all nine stay armed. That is the end state.
+* GPU half **> 90 min** → the four `_DEEP` pairs leave the *default* table. Each
+  drives a pair already in the set at a second block width, so what is lost is
+  stated where it is lost — at the pair table, as a coverage decision with the
+  recall it gives up written beside it — and they stay reachable by
+  `make gpu-test FILTER=…`.
+
+**Leaving them in the table but skipped is not an option**, and that is
+structural rather than a preference: a cell that prints a named `SKIP` is counted
+as stood down, and any stand-down puts `INCOMPLETE` on the runner's final line,
+which is the marker `make ci-perf` reads to decide whether it may say `ok`. A
+shape that keeps nine pairs in the table and runs four of them can never reach
+`ci-perf ok`. Either a pair is armed, or it is not in the default table.
 
 ##### Why the opt-in existed, and what changed
 
@@ -1170,32 +1242,71 @@ on a non-affine kernel is a new analysis or a red run.
 
 The blind spot they share is **mis-pairing**, and it is the hazard a by-slug
 fallback creates: a same-width verifier handed the wrong drafter loads without
-complaint and produces a plausible answer. Three refusals already in
-`spec_greedy_equivalence.rs` close it, and the rule keeps all three:
+complaint and produces a plausible answer. Two refusals in
+`crates/rmlx-models/tests/spec_greedy_equivalence.rs` close it for the sidecar
+arms, and the rule keeps both:
 
 * `declared_kind` — the drafter's snapshot must declare the kind this pair's
   round loop drives (`SKIP <test>: … declares {kind}, and this pair's loop drives
   a {want} drafter`).
 * `declared_quant_mode` — a sidecar quantized differently from its verifier is
-  not this pair. The two-model arm is exempt: its draft is an independent model.
-* `declared_vocab_size` — the two-model arm's discriminator, since `two_model` is
-  an inference from the architecture registry that every full model satisfies.
+  not this pair.
 
-Each fires before either model is read, and each prints a named notice, so a
-mis-pairing is INCOMPLETE rather than a quiet green.
+**Neither covers the two-model arm, and the third check does not either.**
+`declared_kind` cannot pin it: `two_model` is an inference from the architecture
+registry that every full model satisfies. `declared_quant_mode` exempts it by
+design, because its draft is an independent model whose weight format is
+unrelated to the verifier's. That leaves `declared_vocab_size`, and it is a
+**necessary condition only** — an integer. Two snapshots can both declare 248320
+and map those ids to different pieces; the drafter then proposes ids that mean
+other tokens, the verifier's greedy argmax is emitted at every accepted position
+regardless, and the pair passes green having tested nothing. This gate has no
+agreement floor to catch it, deliberately — how much of one answer two correct
+arms share is decided by where their first near-tie lands and by nothing else.
+
+The engine already has the check this needs, and it is piece-by-piece rather
+than by size: `vocab_pairing_verdict` in
+`crates/rmlx-models/src/speculative/mod.rs` compares the two tokenizers id by id
+over every id both carry, and tolerates only a trailing run of special tokens
+(`VOCAB_TAIL_TOLERANCE`, 128 — llama.cpp's `SPEC_VOCAB_MAX_SIZE_DIFFERENCE`, so
+the two engines admit the same pairs). Its own note gives the case the integer
+misses: Gemma 3 and Gemma 4 both declare 262144 and share no vocabulary.
+
+`load_speculative` composes it as
+`vocab_pairing_verdict(&snapshot_vocab(verifier_dir)?, &snapshot_vocab(draft_dir)?)`,
+before any weight is read — but the harness does not go through
+`load_speculative`. It builds `SpeculativeDispatcher::new` directly, and that
+constructor pins the two `vocab_size` values equal and nothing more. So the
+engine's check exists and the gate never reaches it.
+
+**The wiring, and it adds no second implementation.** Export that composition as
+one `pub fn vocab_pairing(verifier_dir, draft_dir) -> Result<()>` in
+`crates/rmlx-models/src/speculative/mod.rs`, and have `load_speculative` call it
+rather than composing the two calls itself — one producer, and the engine and
+the harness then run the same line. The harness calls it in `load()`'s
+`TwoModelGreedy` branch, after both paths resolve and before either model loads,
+and turns an `Err` into a named `SKIP <test>: <why>` carrying the verdict's own
+reason, which names the first id whose piece differs. `declared_vocab_size` is
+then strictly weaker than its replacement with no other caller, and is deleted
+in the same change. A tokenizer-digest comparison would be a twin of this and is
+not written.
+
+Each refusal fires before either model is read, and each prints a named notice,
+so a mis-pairing is INCOMPLETE rather than a quiet green.
 
 ##### Mutations, and what catches each
 
 | Mutation | Caught by |
 |---|---|
 | The slug fallback dropped for one pair | the final line: that pair is named on the stand-down list and the run is INCOMPLETE |
-| The slug fallback resolving the wrong snapshot | `declared_kind` / `declared_quant_mode` / `declared_vocab_size`, each a named `SKIP`; the resolver half is CPU-testable against a synthetic root without a model |
+| The slug fallback resolving the wrong sidecar | `declared_kind` / `declared_quant_mode`, each a named `SKIP`; the resolver half is CPU-testable against a synthetic root without a model |
+| The slug fallback resolving the wrong **full model** for the two-model arm — two snapshots declaring the same 248320 ids over different pieces | `vocab_pairing`, wired as above: a named `SKIP` carrying the first id whose piece differs. Nothing else in the tree sees it — the size check passes, the loop runs, and greedy emits the verifier's argmax either way |
 | The override ranked above the pair's own slug | a run with `RMLX_DRAFT_TEST_MODEL` set and several pairs selected: the pairs whose slug the root holds must still take their own, provable from the paths in their notices |
 | A notice that still omits the test name | `make check-named-skip-notices` at the source line, and `run_gpu_tests_selftest.sh`'s `unattributed_stand_down_is_counted` at the report |
 | A notice that names another test | `make check-named-skip-notices`; the runner would list it under a name that does not run |
 | A newly armed test's hits left unpinned | the census delta — `not pinned: N <kind> "<kernel>"` — which is the implementing change's own proof |
 | The census pin edited to fit the run rather than re-derived | a count below the expectation is a failure in its own right, and the pin's header says to re-derive |
-| A pair armed but returning early (a cheap pass) | not caught by wall time; caught by its own assertions and by the census, which expects its hits |
+| A pair armed but returning early (a cheap pass) | not caught by wall time, and not by an agreement floor — this gate has none by design. Its **census entry** is the positive control: a pair that did the work produces the hit count the pin names for it, and one that returned early produces none and fails as `no longer fires`. That is why the pin is re-derived in the same change and why each newly armed pair carries its own entry rather than sharing one |
 
 ##### What this does not change
 

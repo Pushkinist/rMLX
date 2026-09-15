@@ -118,7 +118,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-kv-byte-model-parity check-kv-byte-model-parity-fixtures \
         check-no-decode-swallow check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures gpu-runner-selftest \
-        check-named-skip-notices \
+        check-named-skip-notices check-named-skip-notices-fixtures \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
         check-kernel-dtype-contract check-kernel-dtype-contract-fixtures \
@@ -539,6 +539,9 @@ gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a sha
 check-named-skip-notices: ## CI gate: a classified GPU test that announces its own stand-down names itself, so the runner can attribute it
 	@bash scripts/check_named_skip_notices.sh
 
+check-named-skip-notices-fixtures: ## CI gate: recall test for the above, 13 synthetic roots, each asserting the reason as well as the exit code
+	@bash scripts/check_named_skip_notices_fixtures.sh
+
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
 	@bash scripts/check_no_kernel_input_eval.sh
 
@@ -589,6 +592,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_gpu_tests_ignored_fixtures.sh
 	@bash scripts/run_gpu_tests_selftest.sh
 	@bash scripts/check_named_skip_notices.sh
+	@bash scripts/check_named_skip_notices_fixtures.sh
 	@bash scripts/check_no_kernel_input_eval.sh
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
 	@bash scripts/check_kernel_dtype_contract.sh
