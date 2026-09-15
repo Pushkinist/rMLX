@@ -5,6 +5,10 @@ the add/remove line ratio since the last tag, and oversized docs. Reads only
 files under ``--root`` (default: the repo this file lives in) plus ``git log``
 against that same working tree — no network, no other machine path.
 
+``--matched-lines {drivers,impls}`` is a second mode: prints the summed
+pairwise ``difflib`` matched-line count for one named population and exits,
+instead of the four-section report.
+
 Deterministic for a given tree: every collection is name-sorted before it is
 printed, and the "twin" measure is the normalised-diff idea that found the
 rotor/iso/turbo pairs by hand, generalised from those specific spellings to
@@ -20,6 +24,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import itertools
+import os
 import re
 import subprocess
 import sys
@@ -33,12 +38,15 @@ LOC_THRESHOLD = 1000
 SIBLING_DIRS = ("crates/rmlx-kv-quant", "crates/rmlx-models")
 SPEC_DIR = "crates/rmlx-models/src/speculative"
 WORKSPACE_SOURCE_DIR = "crates"
+CHECK_SPEC_CHARGE_SCRIPT = Path(__file__).resolve().parents[1] / "check_spec_charge.sh"
 
-# The same rule scripts/check_spec_sampling.sh uses to find a round-loop
-# driver — generalised from "pub fn" to any visibility, which is what
-# surfaces the private cached loops a pub-only list misses. Not a name list:
-# a driver is whatever currently carries this parameter, in the tree, today.
+# Population (a) — round loops — is check_spec_charge.sh's, not a second copy
+# of it: the driver signature alone (scripts/check_spec_sampling.sh's rule)
+# also matches the entries and the emit helpers, which is why the group used
+# to over-report. `list_driver_population()` runs the gate's own derivation
+# via `--list-drivers`; this string is kept only for the report's own prose.
 DRIVER_SIGNATURE_MARKER = "step_fn: &mut dyn FnMut(&ProbeStep)"
+ROUND_TOTALS_MARKER = "RoundTotals {"
 
 DEBT_COMMENT_RE = re.compile(
     r"\b(inert|dormant|deferred|kept for|future-reference|no longer)\b",
@@ -224,6 +232,43 @@ def fns_in_file(root: Path, path: Path) -> tuple[list[FnInfo], int]:
     return fns, skipped
 
 
+_IMPL_ROUND_DRAFTER = re.compile(
+    r"^impl(?:<[^>{]*>)?\s+RoundDrafter\s+for\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)",
+    re.MULTILINE,
+)
+
+
+def extract_round_drafter_impls(text: str) -> list[FnInfo]:
+    """Every `impl RoundDrafter for <Type>` block in `text`, whole-block body
+    (every method it implements, not one at a time) — the unit the migration
+    chunks measured duplication over once a drafter's round loop collapsed
+    into the shared one and its own logic moved into this impl. Reuses
+    `_scan_after_name`, the same balanced-brace scanner `extract_fns` uses:
+    an impl header carries no `(` or `[` before its opening `{`, so the scan
+    that finds a fn's body finds an impl block's just as well."""
+    out: list[FnInfo] = []
+    for m in _IMPL_ROUND_DRAFTER.finditer(text):
+        _sig, body_span = _scan_after_name(text, m.end())
+        if body_span is None:
+            continue
+        start, end = body_span
+        line = text.count("\n", 0, m.start()) + 1
+        out.append(FnInfo(name=m.group("name"), line=line, signature="", body=text[start:end]))
+    return out
+
+
+def round_drafter_impls(root: Path) -> list[FnInfo]:
+    items: list[FnInfo] = []
+    for f in rust_files(root, SPEC_DIR, include_tests=False):
+        text = f.read_text(errors="ignore")
+        rel = str(f.relative_to(root))
+        for impl in extract_round_drafter_impls(text):
+            impl.file = rel
+            items.append(impl)
+    items.sort(key=lambda fn: (fn.file, fn.line))
+    return items
+
+
 # ---- section 1: sibling similarity ("twins") --------------------------------
 
 
@@ -259,20 +304,97 @@ def similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a_lines, b_lines, autojunk=False).ratio()
 
 
+def matched_lines(a: str, b: str) -> int:
+    """Summed size of every matching block `difflib.SequenceMatcher` finds
+    between `a` and `b`, over the same digit-folded, `autojunk=False` lines
+    `similarity()` compares — a line count, not a ratio. This is the figure
+    the round-loop migration chunks reported by hand; `--matched-lines` is
+    its one producer now."""
+    a_lines = normalize(a).splitlines()
+    b_lines = normalize(b).splitlines()
+    sm = difflib.SequenceMatcher(None, a_lines, b_lines, autojunk=False)
+    return sum(block.size for block in sm.get_matching_blocks())
+
+
 @dataclass
 class DriverGroup:
     drivers: list[FnInfo] = field(default_factory=list)
     skipped: int = 0
 
 
+def list_driver_population(root: Path) -> list[tuple[str, str]]:
+    """``(file, fn)`` pairs for population (a) — round loops — exactly as
+    ``check_spec_charge.sh``'s ``check-spec-charge`` gate derives them: the
+    driver signature plus a constructed ``RoundTotals``. Runs the real gate
+    script in ``--list-drivers`` mode, pointed at ``root`` through
+    ``SPEC_CHARGE_ROOT`` — the same variable its own fixture recall test uses
+    to aim the gate at a synthetic tree — so this is the population's one
+    producer rather than a second copy of its rule."""
+    if not CHECK_SPEC_CHARGE_SCRIPT.is_file():
+        raise RuntimeError(f"check_spec_charge.sh not found at {CHECK_SPEC_CHARGE_SCRIPT}")
+    env = dict(os.environ)
+    env["SPEC_CHARGE_ROOT"] = str(root)
+    proc = subprocess.run(
+        ["bash", str(CHECK_SPEC_CHARGE_SCRIPT), "--list-drivers"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if proc.returncode == 2 and "no speculative source directory" in proc.stderr:
+        return []
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"check_spec_charge.sh --list-drivers failed (exit {proc.returncode}): "
+            f"{proc.stderr.strip()}"
+        )
+    pairs: list[tuple[str, str]] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        rel_file, fn_name = line.split("\t", 1)
+        pairs.append((rel_file, fn_name))
+    return pairs
+
+
 def discover_drivers(root: Path) -> DriverGroup:
     group = DriverGroup()
+    fns_by_key: dict[tuple[str, str], list[FnInfo]] = {}
     for f in rust_files(root, SPEC_DIR, include_tests=False):
         fns, skipped = fns_in_file(root, f)
         group.skipped += skipped
-        group.drivers.extend(fn for fn in fns if DRIVER_SIGNATURE_MARKER in fn.signature)
+        for fn in fns:
+            fns_by_key.setdefault((fn.file, fn.name), []).append(fn)
+    for rel_file, fn_name in list_driver_population(root):
+        group.drivers.extend(fns_by_key.get((rel_file, fn_name), []))
     group.drivers.sort(key=lambda fn: (fn.file, fn.line))
     return group
+
+
+def _driver_items(root: Path) -> list[FnInfo]:
+    return discover_drivers(root).drivers
+
+
+MATCHED_LINES_POPULATIONS = {
+    "drivers": ("round-loop drivers", _driver_items),
+    "impls": ("impl RoundDrafter bodies", round_drafter_impls),
+}
+
+
+def matched_lines_report(root: Path, population: str) -> str:
+    """`--matched-lines <population>` — the summed pairwise `matched_lines()`
+    over one named population under SPEC_DIR, the way the round-loop
+    migration chunks reported the campaign's duplication figure by hand:
+    `<label>: <matched> matched lines over <body-lines> body lines
+    (<n> item(s), <pairs> pair(s))`."""
+    label, collect = MATCHED_LINES_POPULATIONS[population]
+    items = collect(root)
+    total_matched = sum(matched_lines(a.body, b.body) for a, b in itertools.combinations(items, 2))
+    total_body_lines = sum(len(item.body.splitlines()) for item in items)
+    pairs = len(items) * (len(items) - 1) // 2
+    return (
+        f"{label} ({SPEC_DIR}): {total_matched} matched lines over {total_body_lines} "
+        f"body lines ({len(items)} item(s), {pairs} pair(s))"
+    )
 
 
 def report_sibling_similarity(root: Path, lines: list[str]) -> None:
@@ -282,30 +404,39 @@ def report_sibling_similarity(root: Path, lines: list[str]) -> None:
         "text (autojunk off); no other normalisation"
     )
 
-    # Named group: whichever functions under SPEC_DIR currently carry the
-    # round-loop driver signature. Always printed, not gated on the
-    # similarity threshold — this is the standing violation the twin rule
-    # names, not a candidate. Discovered, not a literal name list: a name
-    # list is itself a second producer of the same fact
-    # scripts/check_spec_sampling.sh already derives from the tree.
+    # Named group: population (a) of check-spec-charge — the round loops —
+    # read from check_spec_charge.sh --list-drivers, not re-derived here.
+    # Always printed, not gated on the similarity threshold — this is the
+    # standing violation the twin rule names, not a candidate.
     lines.append("")
     lines.append(f"--- round-loop drivers ({SPEC_DIR}) ---")
-    lines.append(f"  a driver is any fn whose signature contains `{DRIVER_SIGNATURE_MARKER}`")
-    group = discover_drivers(root)
+    lines.append(
+        f"  a driver is any fn whose signature contains `{DRIVER_SIGNATURE_MARKER}` "
+        f"and whose body constructs `{ROUND_TOTALS_MARKER}` "
+        "(check-spec-charge's population (a))"
+    )
+    try:
+        group = discover_drivers(root)
+    except RuntimeError as exc:
+        lines.append(f"  unavailable ({exc})")
+        group = DriverGroup()
     lines.append(f"  {len(group.drivers)} driver(s) found")
     if group.skipped:
         lines.append(f"  ({group.skipped} fn declaration(s) skipped: body-less or unscannable)")
-    if len(group.drivers) < 2:
-        lines.append("  no round-loop drivers group (fewer than two found)")
+    if not group.drivers:
+        lines.append("  no round-loop drivers found")
     else:
         for fn in group.drivers:
             lines.append(f"  {fn.name:<32} {fn.file}:{fn.line}")
-        lines.append("  pairwise similarity:")
-        for a, b in itertools.combinations(group.drivers, 2):
-            pct = similarity(a.body, b.body) * 100
-            lines.append(
-                f"    {a.name}@{a.file}:{a.line} <-> {b.name}@{b.file}:{b.line}: {pct:.1f}%"
-            )
+        if len(group.drivers) < 2:
+            lines.append("  no pairwise similarity (fewer than two drivers)")
+        else:
+            lines.append("  pairwise similarity:")
+            for a, b in itertools.combinations(group.drivers, 2):
+                pct = similarity(a.body, b.body) * 100
+                lines.append(
+                    f"    {a.name}@{a.file}:{a.line} <-> {b.name}@{b.file}:{b.line}: {pct:.1f}%"
+                )
 
     # General file-level twins across the two crates, name-paired by digit
     # normalisation, filtered to >= SIM_THRESHOLD.
@@ -506,12 +637,23 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="git ref for the churn section (default: last tag)",
     )
+    parser.add_argument(
+        "--matched-lines",
+        choices=sorted(MATCHED_LINES_POPULATIONS),
+        default=None,
+        help="print the summed pairwise matched-line count for one named "
+        "population under SPEC_DIR and exit, instead of the full report",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root)
     if not root.is_dir():
         print(f"debt-report: --root {root} is not a directory", file=sys.stderr)
         return 1
+
+    if args.matched_lines:
+        print(matched_lines_report(root, args.matched_lines))
+        return 0
 
     lines: list[str] = []
     report_sibling_similarity(root, lines)

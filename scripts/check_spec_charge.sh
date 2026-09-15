@@ -291,8 +291,21 @@
 #   case of the recall test. That is a measurement and not a guarantee — a
 #   needle that reaches for an extension one of the three does not have would
 #   break it silently, so a new one is worth running under all three.
+#
+# --list-drivers
+#   Prints population (a) — one `<file>\t<fn>` line per round loop, file
+#   relative to `root`, sorted — and exits 0 without running RULE 1-8. This is
+#   the population's one producer: a caller that needs "which fns are round
+#   loops today" (scripts/lib/debt_report.py's driver group) reads it from
+#   here instead of re-deriving (a1)+(a2) on its own.
 
 set -uo pipefail
+
+list_drivers=0
+if [ "${1:-}" = "--list-drivers" ]; then
+  list_drivers=1
+  shift
+fi
 
 # The only variable here: the fixtures point the scan at a synthetic root. The
 # rules themselves are constants — a gate whose expectations can be relaxed from
@@ -660,6 +673,17 @@ records=$(
 
 # (a) round loops: the driver signature and a `RoundTotals`.
 loops=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1 && $4 == 1')
+
+if [ "$list_drivers" = "1" ]; then
+  listing=""
+  while IFS=$'\t' read -r file fn _rest; do
+    [ -n "$fn" ] || continue
+    listing="$listing${file#"$root"/}"$'\t'"$fn"$'\n'
+  done <<<"$loops"
+  printf '%s' "$listing" | grep -v '^$' | LC_ALL=C sort
+  exit 0
+fi
+
 # (b) entries: the signature, no totals, no rollback, and it builds the config.
 entries=$(printf '%s\n' "$records" |
   awk -F'\t' '$3 == 1 && $4 == 0 && $5 == 0 && $13 == 1')
