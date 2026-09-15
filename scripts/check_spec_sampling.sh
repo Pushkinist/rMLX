@@ -65,13 +65,16 @@
 #   defect with the signature repaired, and a sampler assigned into a context
 #   field and read by nobody is the same defect with the body repaired.
 #
-#   One loop draws another way and is read by a second needle rather than
-#   waived: `spec_generate_stochastic_cached` is the one acceptance rule that is
-#   not the shared one — it seeds its whole draw stream with
-#   `Pcg32::new(sampler_cfg.seed_or_default())` and scores each position's own
-#   post-sampling distribution. That is still a draw constructed from the
-#   request's sampler, so it is a needle any loop may satisfy and not a name
-#   this gate exempts.
+#   One construction, not two. This rule read a bare
+#   `Pcg32::new(sampler_cfg.seed_or_default())` as a draw too, for as long as the
+#   stochastic acceptance rule seeded its own generator; that rule now draws its
+#   coins and its proposals through the round's `VerifierDraw`, which seeds one
+#   from the same value, so the tree has one draw and the second needle would
+#   match nothing. It is gone rather than kept: a needle that matches nothing
+#   cannot fire, and what it would admit is precisely the shape the collapse
+#   removed — a second generator seeded from the request's seed, which is a
+#   second stream correlated with the first while looking reproducible on its
+#   own.
 #
 # RULE 2 (an entry hands the sampler to the loop)
 #   An entry declares the parameter and the configuration it builds carries it:
@@ -228,20 +231,15 @@ records=$(
       index(code, "rollback_round(") > 0 &&
       code !~ /fn[[:space:]]+rollback_round\(/ { has_roll = 1 }
 
-      # The draw a loop uses, built from the request`s sampler. Two
-      # constructions: the shared `VerifierDraw`, and the stochastic acceptance
-      # rule`s own RNG stream seeded from the same configuration. Each is
-      # followed to its closing parenthesis, so a wrapped argument list reads
+      # The draw a loop uses, built from the request`s sampler. One
+      # construction, the request`s own `VerifierDraw`, which every rule — the
+      # shared acceptance walk and the stochastic one alike — draws through. It
+      # is followed to its closing parenthesis, so a wrapped argument list reads
       # like a single-line one — a gate that refused a correct loop for the
       # width of its line would be repaired by widening the line.
-      draw_depth == 0 &&
-      (index(code, "VerifierDraw::new(") > 0 || index(code, "Pcg32::new(") > 0) {
+      draw_depth == 0 && index(code, "VerifierDraw::new(") > 0 {
         rest = code
-        if (index(code, "VerifierDraw::new(") > 0) {
-          sub(/^.*VerifierDraw::new\(/, "", rest)
-        } else {
-          sub(/^.*Pcg32::new\(/, "", rest)
-        }
+        sub(/^.*VerifierDraw::new\(/, "", rest)
         draw_depth = 1 + gsub(/\(/, "(", rest) - gsub(/\)/, ")", rest)
         if (index(rest, "sampler_cfg") > 0) { draws = 1 }
         if (draw_depth < 0) { draw_depth = 0 }

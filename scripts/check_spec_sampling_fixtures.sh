@@ -11,11 +11,11 @@
 # The clean root is built here rather than copied from the tree, so a case that
 # passes against it is passing against a shape this file states rather than
 # against whatever the repository happens to contain today. It carries the same
-# seven drafter paths the tree does, one of them the two-model greedy path and
-# one of them the stochastic loop that draws through its own RNG rather than the
-# shared draw. Two roots are built: today's, where every path is a loop
-# body, and the mid-campaign one, where a drafter has been migrated and its path
-# is an entry that hands the sampler to the shared loop.
+# seven drafter paths the tree does. Four roots are built: the all-loops shape
+# the campaign started from, the mid-campaign one where a drafter has been
+# migrated and its path is an entry that hands the sampler to the shared loop,
+# the one where the two-model greedy path is an entry beside a loop, and the end
+# state the tree now has — one shared loop and seven entries.
 
 set -uo pipefail
 
@@ -42,31 +42,6 @@ pub fn $name(
     if draw.sampling() {
         let _ = n_tokens;
     }
-    log_request_record(
-        &RoundTotals {
-            loop_kind: SpecLoop::Kind,
-            rounds,
-            charged: false,
-        },
-        &emitted,
-    );
-    Ok(vec![])
-}
-RS
-}
-
-# The stochastic loop: the one acceptance rule that is not the shared one. Its
-# draw is a per-request RNG stream seeded from the same configuration, which is
-# a needle any loop may satisfy rather than a name the gate exempts.
-stochastic_cached_src() {
-  cat <<'RS'
-fn spec_generate_stochastic_cached(
-    verifier: &Architecture,
-    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
-    sampler_cfg: &crate::sampler::SamplerConfig,
-    device: Device,
-) -> Result<Vec<ProbeStep>> {
-    let mut rng = Pcg32::new(sampler_cfg.seed_or_default());
     log_request_record(
         &RoundTotals {
             loop_kind: SpecLoop::Kind,
@@ -199,7 +174,7 @@ build_root() {
     printf '\n'
     loop_src "spec_generate_greedy_cached"
     printf '\n'
-    stochastic_cached_src
+    loop_src "spec_generate_stochastic_cached"
     printf '\nfn summarise(rounds: usize) -> usize {\n    rounds\n}\n'
   } >"$root/crates/rmlx-models/src/speculative/mod.rs"
 
@@ -267,19 +242,28 @@ build_entry_root() {
     printf '\n'
     entry_src "spec_generate_greedy_cached"
     printf '\n'
-    stochastic_cached_src
+    loop_src "spec_generate_stochastic_cached"
     printf '\nfn summarise(rounds: usize) -> usize {\n    rounds\n}\n'
   } >"$root/crates/rmlx-models/src/speculative/mod.rs"
 }
 
-# The tree's own census: six entries and two loops, one of them the shared
-# forwarded one and the other the stochastic acceptance rule, which is the one
-# body the collapse does not remove. The charge gate's fixtures carry this shape;
-# without it here, every case of this suite would be taken against a tree the
-# gate never actually scans.
+# The tree's own census, which is the end state: one shared loop and seven
+# entries, the stochastic acceptance rule among them — it is a rule a drafter
+# owns now, not a loop. The charge gate's fixtures carry this shape; without it
+# here, every case of this suite would be taken against a tree the gate never
+# actually scans.
 build_tree_root() {
   local root="$1"
   build_entry_root "$root"
+  {
+    printf '//! The entry guard and the two two-model entries.\n\n'
+    guard_src
+    printf '\n'
+    entry_src "spec_generate_greedy_cached"
+    printf '\n'
+    entry_src "spec_generate_stochastic_cached"
+    printf '\nfn summarise(rounds: usize) -> usize {\n    rounds\n}\n'
+  } >"$root/crates/rmlx-models/src/speculative/mod.rs"
   entry_src "mtp_assistant_generate" \
     >"$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
   entry_src "dflash_generate" >"$root/crates/rmlx-models/src/speculative/dflash.rs"
@@ -410,12 +394,12 @@ perl -0pi -e 's/(fn spec_generate_greedy_cached\(.*?RoundCfg \{.*?)            s
 run "the two-model greedy entry that drops the sampler is refused" 1 \
   "\`spec_generate_greedy_cached\` takes \`sampler_cfg\` and leaves it out of the"
 
-# 14. The tree's own census: one shared loop, one acceptance rule with a body of
-#     its own, and every other drafter an entry. This is the shape every case
-#     above is evidence about, and the suite has to be able to state it.
+# 14. The tree's own census: one shared loop and seven entries, which is the end
+#     state the collapse reaches. This is the shape every case above is evidence
+#     about, and the suite has to be able to state it.
 build_tree_root "$root"
 run "the tree's own census passes, and names what it passed as" 0 \
-  "OK: 2 loops (1 forwarded), 6 entries, 1 guards"
+  "OK: 1 loops (1 forwarded), 7 entries, 1 guards"
 
 # 15. The mid-campaign tree: one path is an entry now, and the loop it runs is
 #     handed the sampler inside the configuration the entry built.
@@ -537,6 +521,18 @@ build_mid_root "$root"
 rm -f "$root/crates/rmlx-models/src/speculative/round_loop.rs"
 run "an entry with no forwarded loop to enter is a scan error" 2 \
   "the scan found 1 entries and no forwarded loop"
+
+# 29. The shape the second needle used to admit, and the reason it is gone: a
+#     loop that seeds its own generator from the request's seed draws from a
+#     stream nothing else in the request shares. It reads as reproducible on its
+#     own — one seed, one sequence — while being a second stream correlated with
+#     the one the round's draw advances, and only one of them is the stream a
+#     reproducibility pin describes.
+build_root "$root"
+perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    let mut rng = Pcg32::new(sampler_cfg.seed_or_default());|' \
+  "$root/crates/rmlx-models/src/speculative/mod.rs"
+run "a loop that seeds a second generator instead of drawing is refused" 1 \
+  "\`spec_generate_greedy_cached\` is handed the request's sampler and builds"
 
 echo
 if [ "$failures" != "0" ]; then
