@@ -953,7 +953,7 @@ saw — each hit's own `device load` / `device store` wording, counted per
 diagnostic rather than per output line, since the layer writes while libtest is
 mid-line and reports routinely share a line — so it is
 read off the run rather than assumed; the one standing hit in this tree is
-160/160 loads, see the entry below on `affine_qmm_t_splitk`. The converse does
+3670/3670 loads, see the entry below on `affine_qmm_t_splitk`. The converse does
 not hold either: a clean scan does not establish that nothing read out of
 bounds, for the buffer-versus-array reason recorded with that entry.
 
@@ -1205,13 +1205,13 @@ and ml-explore/mlx#3461). Still a hypothesis, and tracked outside this
 document.
 
 Current state: four of the five crates run clean under validation. That is an
-inference from matching totals (a narrowed `CRATE=rmlx-models` run and the
-full five-crate run both total 160, and `rmlx-models` is the only crate a
-narrowed run can attribute anything to), not a directly observed clean pass
-over each of the other four individually — `run_gpu_tests.sh` prints a
-per-crate line only for a crate with a nonzero hit count.
-`rmlx-models` does not — it reports 160 invalid device **loads**, all in MLX's
-own `affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false`. Those 160 are pinned
+inference from a per-crate banner (`run_gpu_tests.sh` prints a line only for a
+crate with a nonzero hit count, and `rmlx-models` is the only crate that gets
+one), not a directly observed clean pass over each of the other four
+individually.
+`rmlx-models` reports 3670 invalid device **loads**, all in MLX's own
+`affine_qmm_t_splitk_bfloat16_t_gs_64_b_{4,8}_alN_false` — 2496 at bits 4, 1174
+at bits 8. They are pinned
 (next section), so a run that reproduces them exactly is green and prints the
 census it accepted. The cause is in
 `mlx/backend/metal/kernels/quantized.h`: `QuantizedBlockLoader::load_safe`
@@ -1245,14 +1245,37 @@ diagnostic from a kernel this repo neither compiles nor can fix would otherwise
 do to `make gpu-test` and `make ci-perf`.
 
 So the accepted hits are pinned, in `scripts/gpu_validation_census.txt`, **one
-entry per originating test** carrying that test's own count, the crate it
-belongs to, and the reference to the analysis that says the hit is benign. The
-three entries there were measured one test at a time
-(`make gpu-test CRATE=rmlx-models FILTER=<test>`) and sum to the 160 a full run
-reports: 40 from `qwen3_5_moe_forward_seq_last_k_equals_reference`, 80 from
-`thinking_budget_exact_hit_qwen3_5_moe`, 40 from `qwen3_moe_golden_tokens_k8v8`.
-A fourth Qwen3.5-MoE cell contributes nothing: it resolves only from
-`RMLX_TEST_MODEL_QWEN36` and skips here.
+entry per `(kernel, kind, crate, test)`** carrying that test's own count for that
+kernel and the reference to the analysis that says the hit is benign. One test
+that drives two instantiations of a template — two checkpoints at different bit
+widths — therefore carries two entries, and the runner refuses a second entry
+for the same four. The
+five entries there sum to what a full run reports — 2496 at `b_4` and 1174 at
+`b_8`. At `b_8`: 40 from `qwen3_5_moe_forward_seq_last_k_equals_reference`, 80
+from `thinking_budget_exact_hit_qwen3_5_moe`, 40 from
+`qwen3_moe_golden_tokens_k8v8`, 1014 from
+`a_round_tape_refolds_to_what_the_replay_produced`; at `b_4`, 2496 from that
+same tape-refold sweep, which drives a second verifier
+(`mlx-community__Qwen3.8-27B-4bit`) in the same test body. A fourth Qwen3.5-MoE
+cell contributes nothing: it resolves only from `RMLX_TEST_MODEL_QWEN36` and
+skips here.
+
+A count is derived either by running the test alone
+(`make gpu-test CRATE=rmlx-models FILTER=<test>`) or by attributing a full run's
+diagnostics to the test libtest last announced — the suite runs
+`--test-threads=1 --nocapture`, so the `test <name> ... ` marker names the
+running test until the next one. The second way is what keeps the entries
+summing to the total the run prints, and it is how the tape-refold counts above
+were taken.
+
+Attributing that way, **split each output line before matching, and attribute
+every piece of it — including the tail of the announce line itself.** The layer
+writes to stderr while libtest is mid-line, so a test's first diagnostic
+routinely lands appended to its own `test <name> ... ` prefix; an implementation
+that consumes the announce line as a marker and moves on loses exactly one hit
+per test. It is the same hazard the access mix is counted around above, one
+level up: there, per diagnostic rather than per line; here, per diagnostic
+*within* a line that is also a marker.
 
 For each `(crate, access kind, kernel)` the runner expects **the sum of the
 pinned counts whose test actually ran in this run**. A test the selection
@@ -1313,6 +1336,18 @@ bounds the MTLBuffer rather than the array, so absence of a diagnostic is not
 absence of an out-of-bounds access. A count that came in low is never edited down
 to fit the run in front of you — re-derive it from a full run and record what
 changed.
+
+**A change derives its own entry, in the same change.** A PR that adds a GPU
+test, or that makes an existing one perform a load it did not perform before — a
+new snapshot, a new shape, a longer sweep — takes its own count and writes the
+census line with it. Hosted CI has no Metal, so nothing else will: an entry left
+out surfaces as a `not pinned` or `count moved up` delta at the next
+`make ci-perf` on `main`, against a tree that has moved on and with no
+attribution left to read. Reviewing such a PR, look at two places — the
+`#[ignore]`d test the diff adds or touches, and the `scripts/gpu_validation_census.txt`
+line naming it. A diff that has the first and not the second is unfinished
+unless its author states that the test produces no hits, which is a claim a
+`make gpu-test CRATE=<crate> FILTER=<test>` run settles in minutes.
 
 To exercise the skipped-entry path on a machine that *does* hold the snapshots,
 point the root at an empty directory — `make gpu-test CRATE=rmlx-models
