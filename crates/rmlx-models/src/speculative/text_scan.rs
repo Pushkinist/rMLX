@@ -25,6 +25,29 @@ pub(crate) fn is_code(line: &str) -> bool {
     !line.trim_start().starts_with("//")
 }
 
+/// The name this line declares a `fn` under, visibility and `async` included.
+///
+/// Read off the head of the line rather than off `fn ` alone: a `pub(crate) fn`
+/// whose name a reading skipped would hand that reading the *previous*
+/// declaration's name, so a statement inside it reads as one inside whatever was
+/// declared above — which is a wrong owner rather than a missing one.
+fn declared_fn(line: &str) -> Option<&str> {
+    let mut head = line.trim_start();
+    if let Some(rest) = head.strip_prefix("pub") {
+        head = match rest.strip_prefix('(') {
+            Some(scope) => scope.split_once(')').map_or(scope, |(_, tail)| tail),
+            None => rest,
+        }
+        .trim_start();
+    }
+    head = head.strip_prefix("async ").unwrap_or(head).trim_start();
+    head.strip_prefix("fn ").map(|rest| {
+        rest.split(|c: char| !c.is_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or_default()
+    })
+}
+
 /// Every code line of `src` carrying `needle`, each with the name of the `fn` it
 /// sits in.
 ///
@@ -35,12 +58,8 @@ pub(crate) fn lines_in_fns<'a>(src: &'a str, needle: &str) -> Vec<(&'a str, Stri
     let mut current = String::new();
     let mut found = Vec::new();
     for line in src.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("fn ") {
-            current = rest
-                .split(|c: char| !c.is_alphanumeric() && c != '_')
-                .next()
-                .unwrap_or_default()
-                .to_owned();
+        if let Some(name) = declared_fn(line) {
+            current = name.to_owned();
         }
         if is_code(line) && line.contains(needle) {
             found.push((line.trim(), current.clone()));

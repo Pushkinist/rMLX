@@ -1,9 +1,9 @@
-// LOC-exempt: the shared round-loop layer is one contract. The seven loops
-// differ in their drafter and agree on everything a round does around it —
-// prefill chunking, the acceptance walk, the KV and recurrent rollback, the
-// conditioning slice and its guards, the emit site, the per-request record.
-// Splitting it by loop duplicates those; splitting it by phase separates a
-// guard from the step it guards.
+// LOC-exempt: the shared round-loop layer is one contract. Seven drafter paths
+// enter one loop through one interface, and what is here is what they share —
+// prefill chunking, the acceptance walk, the request's draw, the block
+// arithmetic, the guards a round is refused by, the emit site. Splitting it by
+// drafter duplicates those; splitting it by phase separates a guard from the
+// step it guards.
 //! Speculative decoding.
 //!
 //! Wraps a (verifier, draft) pair of `Architecture` instances.
@@ -1081,9 +1081,10 @@ impl VerifierDraw {
             let bytes = am.to_bytes()?;
             return argmax_tokens(&bytes, v_k);
         }
+        let vocab = vocab_axis(logits)?;
         let mut tokens = Vec::with_capacity(v_k);
         for i in 0..v_k {
-            let row = block_row(logits, i, device)?;
+            let row = block_row(logits, i, vocab, device)?;
             tokens.push(self.draw_row(&row)? as u32);
         }
         Ok(tokens)
@@ -1101,9 +1102,10 @@ impl VerifierDraw {
         v_k: usize,
         device: Device,
     ) -> Result<Vec<Vec<f32>>> {
+        let vocab = vocab_axis(logits)?;
         let mut dists = Vec::with_capacity(v_k);
         for i in 0..v_k {
-            dists.push(self.row_dist(&block_row(logits, i, device)?)?);
+            dists.push(self.row_dist(&block_row(logits, i, vocab, device)?)?);
         }
         Ok(dists)
     }
@@ -1144,8 +1146,11 @@ impl VerifierDraw {
 }
 
 /// Position `i` of a `[1, v_k, vocab]` block of logits, as a `[1, vocab]` row.
-fn block_row(logits: &Array, i: usize, device: Device) -> Result<Array> {
-    let vocab = vocab_axis(logits)?;
+///
+/// `vocab` is the caller's, read once per block: a block is one array and its
+/// vocabulary axis does not change between its positions, where reading it here
+/// would allocate a shape per verified position.
+fn block_row(logits: &Array, i: usize, vocab: i32, device: Device) -> Result<Array> {
     let i = i as i32;
     logits
         .slice(&[0, i, 0], &[1, i + 1, vocab], &[1, 1, 1], device)?

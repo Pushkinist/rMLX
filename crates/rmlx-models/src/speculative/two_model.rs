@@ -245,7 +245,7 @@ impl RoundDrafter for TwoModelRound<'_> {
         // Each rule reads the verifier's block back the way it judges it — one
         // token per position, or one whole distribution — so the read-back is
         // inside the arm and its cost is billed to the verify span either way.
-        let (accept, commit, verify_ns, walk_ns) = match &self.accept {
+        let (accept, commit, verify_ns, walk_ns) = match &mut self.accept {
             Acceptance::Prefix => {
                 let v_tokens = ctx.draw.block_tokens(&v_logits, fed.len(), device)?;
                 let verify_ns = t0.elapsed().as_nanos();
@@ -253,11 +253,19 @@ impl RoundDrafter for TwoModelRound<'_> {
                 let (accept, commit) = accept_prefix(&v_tokens, proposed, remaining)?;
                 (accept, commit, verify_ns, t0.elapsed().as_nanos())
             }
+            // Taken, not borrowed. The distributions belong to the drafting pass
+            // that drew them and to the one verify that judges it, so a second
+            // read finds nothing: a `verify` that ran twice, or one whose
+            // `propose` returned before drawing, would otherwise test this
+            // round's `p` against the last round's `q`. Only a shape change is
+            // refused below, and a stale round of the same width has the same
+            // shape — which is a wrong answer with nothing to say so.
             Acceptance::Stochastic(q) => {
+                let q = std::mem::take(q);
                 let p = ctx.draw.block_distributions(&v_logits, fed.len(), device)?;
                 let verify_ns = t0.elapsed().as_nanos();
                 let t0 = Instant::now();
-                let (accept, commit) = stochastic_prefix(&p, q, proposed, ctx.draw.rng())?;
+                let (accept, commit) = stochastic_prefix(&p, &q, proposed, ctx.draw.rng())?;
                 (accept, commit, verify_ns, t0.elapsed().as_nanos())
             }
         };

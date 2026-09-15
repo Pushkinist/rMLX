@@ -578,8 +578,8 @@ migration had to preserve or move — and one is a gate that lost its only name.
   `propose`, which runs before it, cannot state it without keeping a second copy
   of a fact the round already has. The span's `target` is read off the draft
   cache after the rollback rather than computed from the retention, which is the
-  cross-check the round line calls it, and the same shape EAGLE-3
-  landed in chunk 5.
+  cross-check the round line calls for, and the same shape EAGLE-3 landed in
+  chunk 5.
 - **The empty-chain refusal moved spelling, and the row moved with it.** The
   loop refuses `draft_tokens.is_empty()`; this pair's own body refused `v_k < 2`
   one statement later, on the verifier input the empty chain produced. Item 11
@@ -839,7 +839,7 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    `run_rounds`, and it serves the five drafters that draw a seed out of their
    prefill forward; it returns the resolved block rather than the widest that
    ran, because no round has run there and `widest_bs` is zero. No gate prompt
-   stops on its seed, so nothing sees the difference. No gate prompt stops on its seed, so nothing sees the difference. The in-round EOS exit is
+   stops on its seed, so nothing sees the difference. The in-round EOS exit is
    one exit too, shared now by all seven drafters, and it already returns the
    widest that ran. Proposed: the loop returns the widest block that ran on
    every exit, which changes that one value on those five drafters alone.
@@ -1424,6 +1424,15 @@ and what this one would admit is exactly what the migration removed: a loop
 seeding a second generator from the request's seed, which is a second stream
 correlated with the first and reads as reproducible on its own. Case 29 of the
 recall suite asserts that shape is now refused by RULE 1(b).
+
+**And a second generator beside a correct draw is not RULE 1(b)'s to catch.** A
+loop that builds `VerifierDraw::new(sampler_cfg)` *and* seeds a `Pcg32` of its
+own passes this gate, because the draw it must construct is there. What reads
+that is `the_requests_draw_stream_has_one_generator` in
+`crates/rmlx-models/src/speculative/round_skeleton_tests.rs`, a CPU scan of every
+non-test source under `crates/rmlx-models/src/speculative/` for a `Pcg32::new(`
+outside `VerifierDraw::new` — one producer of the request's stream, read over the
+whole module family rather than over the one drafter that happens to own a rule.
 
 The census belongs on the success line for the same reason the charge gate's
 does: **one loop, seven entries, one guard**. What is *pinned* there is the one

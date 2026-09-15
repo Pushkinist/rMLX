@@ -95,7 +95,7 @@ use super::eagle3::round::Eagle3Round;
 use super::gemma4_assistant::AssistantRound;
 use super::mtp::SidecarRound;
 use super::round_loop::{ReportSkippedBy, RoundDrafter, VerifierOffsetBasis};
-use super::text_scan::is_code;
+use super::text_scan::{is_code, lines_in_fns};
 use super::two_model::TwoModelRound;
 use super::{
     accept_prefix, draft_rows_to_drop, guard_restricted_prefix, rollback_target_from_head,
@@ -682,14 +682,21 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
 /// request.
 ///
 /// The shared loop is counted by spelling and not by row, which is the one
-/// place this reading differs from a per-file count. Every drafter that
-/// migrates names [`SHARED_LOOP`] in its row, so at the next chunk two rows
-/// point at one file — and the loop states each refusal once however many
-/// drafters route through it. Counting rows there would fail a correct tree the
-/// moment a second drafter arrives.
+/// place this reading differs from a per-file count. Every drafter names
+/// [`SHARED_LOOP`] in its row, so seven rows point at one file — and the loop
+/// states each refusal once however many drafters route through it. Counting
+/// rows there would fail a correct tree.
 ///
-/// Mutation: drop either spelling from any loop, or move a loop from one
-/// spelling to the other without moving its row.
+/// **What this reading can still catch, now that the table has one file and one
+/// spelling.** A row pointing at the wrong file or the wrong measure is a
+/// compile error or is caught by the file check in the test above, so what is
+/// left is the source: the refusal deleted from the loop, which reads zero
+/// against a wanted one, and the refusal stated twice, which reads two. Those
+/// are the mutations this test is for from here, and neither is hypothetical —
+/// the first is the "empty-chain refusal lost" row of the mutation table in
+/// `docs/SPEC_ROUND_SKELETON.md`, which nothing at runtime covers.
+///
+/// Mutation: delete `draft_tokens.is_empty()` from the loop; state it twice.
 #[test]
 fn every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure() {
     for (file, src) in LOOP_SOURCES {
@@ -772,5 +779,78 @@ fn the_seeds_attribution_is_written_only_where_a_seed_is_emitted() {
          and the emission, and this loop writes them at lines {arm:?}, {push:?}, \
          {emit:?} — a push above the arm attributes a token a seedless pair never \
          emitted"
+    );
+}
+
+/// One generator serves a speculative request, and it is the round's draw.
+///
+/// `VerifierDraw` holds the request's `Pcg32` and every draw of the request goes
+/// through it — the verifier's own tokens, the verifier's distributions, a
+/// drafter's sampled proposals and an acceptance rule's coins. A second
+/// generator seeded from the same `seed_or_default()` is two correlated streams,
+/// and the defect it carries is invisible to every other reading in this tree:
+/// each stream reproduces under its seed, parts from a second seed and parts
+/// from greedy, so the gate in
+/// `crates/rmlx-models/tests/two_model_stochastic.rs` passes on both. Only a
+/// diff of one seed's tokens across two commits sees it, and that is a control a
+/// reviewer runs, not a gate that runs itself.
+///
+/// This is the reading that runs itself, and it is over the **whole** module
+/// family rather than one drafter: a loop or a drafter that builds
+/// `VerifierDraw::new(sampler_cfg)` *and* seeds a `Pcg32` of its own satisfies
+/// `make check-spec-sampling`'s RULE 1 and every per-drafter reading beside it.
+///
+/// **It reads text and is blind past that** — a construction inside a branch
+/// that never runs reads identical.
+///
+/// Mutation: seed a second `Pcg32` in any loop, drafter or entry under
+/// `src/speculative/`.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: a source tree this test's own crate cannot read back is a broken checkout, and the panic names the path"
+)]
+fn the_requests_draw_stream_has_one_generator() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/speculative");
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the speculative source directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let is_rust = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
+            if !is_rust || name.ends_with("_tests.rs") || name == "tests.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("a source file this crate ships");
+            let rel = path
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(name);
+            for (line, owner) in lines_in_fns(&src, "Pcg32::new(") {
+                found.push((rel.clone(), owner, line.to_owned()));
+            }
+        }
+    }
+    found.sort();
+    assert_eq!(
+        found,
+        vec![(
+            "mod.rs".to_owned(),
+            "new".to_owned(),
+            "rng: crate::sampler::Pcg32::new(cfg.seed_or_default()),".to_owned()
+        )],
+        "a speculative request seeds one generator, in `VerifierDraw::new`, and this \
+         tree seeds them at {found:?} — a second one off the same seed is a second \
+         stream that reproduces just as well and is drawn from just as wrongly"
     );
 }

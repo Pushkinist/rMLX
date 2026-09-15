@@ -228,7 +228,7 @@ fn every_token_of_a_round_comes_off_the_rounds_own_draw() {
                 "verify"
             ),
             (
-                "let (accept, commit) = stochastic_prefix(&p, q, proposed, ctx.draw.rng())?;",
+                "let (accept, commit) = stochastic_prefix(&p, &q, proposed, ctx.draw.rng())?;",
                 "verify"
             ),
         ],
@@ -245,6 +245,45 @@ fn every_token_of_a_round_comes_off_the_rounds_own_draw() {
         "a drafter that argmaxes the verifier's logits itself has a second read-back \
          beside the request's draw, and one that builds a draw or seeds a generator \
          of its own has a second stream beside the request's; this one has {raw:?}"
+    );
+}
+
+/// The round's proposal distributions are taken by the verify that judges them,
+/// not borrowed.
+///
+/// `q` is drawn in `propose` and read in `verify`, and only a *shape* change is
+/// refused: a stale round of the same width has the same shape, so a second
+/// `verify`, or one whose `propose` returned before drawing, would test this
+/// round's `p` against the last round's `q` and answer plausibly. Taking the
+/// value is what makes the second read find nothing —
+/// [`the_stochastic_rule_commits_the_prefix_and_one_token_the_verifier_stands_behind`]
+/// drives what it then does, which is to refuse. The two halves are split
+/// because `verify` cannot be driven without two models.
+///
+/// Mutation: bind `q` by reference; move the take into `propose`, where it
+/// clears what that pass is about to write.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion above establishes exactly one element, so the read cannot fail"
+)]
+fn the_rounds_proposal_distributions_are_taken_by_the_verify_that_judges_them() {
+    let takes = lines_in_fns(ROUND_SRC, "std::mem::take(");
+    assert_eq!(
+        takes.len(),
+        1,
+        "the round's distributions are taken once and this drafter takes them {} \
+         time(s): {takes:?}",
+        takes.len()
+    );
+    let (line, owner) = takes.first().expect("one take, asserted above");
+    assert_eq!(
+        (*line, owner.as_str()),
+        ("let q = std::mem::take(q);", "verify"),
+        "the take is the verify's first statement about the round's proposals, and \
+         this drafter writes `{line}` in `{owner}` — a take in `propose` clears what \
+         that pass is about to write, and a borrow leaves a second read able to \
+         succeed on a stale round"
     );
 }
 
@@ -458,5 +497,14 @@ fn the_stochastic_rule_commits_the_prefix_and_one_token_the_verifier_stands_behi
         )
         .is_err(),
         "a proposal with no distribution behind it is a proposal this rule cannot test"
+    );
+    // The shape a second `verify` of one round finds: `verify` takes the round's
+    // distributions rather than borrowing them, so the drawn `q` is gone and the
+    // second read is refused here rather than judging this round's `p` against a
+    // `q` no pass of this round drew.
+    assert!(
+        stochastic_prefix(&[spread(0), spread(1), point(3)], &[], &[0, 1], &mut rng).is_err(),
+        "a round whose proposal distributions were already taken has nothing to test \
+         its proposals against"
     );
 }
