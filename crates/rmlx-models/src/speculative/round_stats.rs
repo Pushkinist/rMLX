@@ -334,15 +334,13 @@ pub(crate) struct RoundReport {
     /// The verifier offset this round reports its rollback against, on the
     /// basis its own loop declares.
     ///
-    /// Two reads name one position under two numbers. The five loops that count
-    /// back from the tail read it after their verify forward; the shared loop
-    /// reads it before *and* after, computes its target from the read before —
-    /// which is the position the rollback returns to, where the read after is a
-    /// function of how far each layer happened to advance — and reports
-    /// whichever its drafter declares in `VERIFIER_OFFSET_BASIS`. So under the
-    /// tail basis this field is not the number the target was computed from; it
-    /// is the other name for the same place. See
-    /// [`super::rollback_target_from_tail`] and
+    /// Two reads name one position under two numbers. The loop reads the offset
+    /// before *and* after the verify forward, computes its target from the read
+    /// before — which is the position the rollback returns to, where the read
+    /// after is a function of how far each layer happened to advance — and
+    /// reports whichever its drafter declares in `VERIFIER_OFFSET_BASIS`. So
+    /// under the tail basis this field is not the number the target was computed
+    /// from; it is the other name for the same place. See
     /// [`super::rollback_target_from_head`].
     pub(crate) v_offset_before: i32,
     /// Where the rollback left the verifier's caches.

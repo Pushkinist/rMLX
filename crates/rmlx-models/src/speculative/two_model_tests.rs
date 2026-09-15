@@ -243,8 +243,8 @@ fn every_token_of_a_round_comes_off_the_rounds_own_draw() {
     assert!(
         raw.is_empty(),
         "a drafter that argmaxes the verifier's logits itself has a second read-back \
-         beside the request's draw, and one that seeds its own generator has a second \
-         draw stream beside the request's; this one has {raw:?}"
+         beside the request's draw, and one that builds a draw or seeds a generator \
+         of its own has a second stream beside the request's; this one has {raw:?}"
     );
 }
 
