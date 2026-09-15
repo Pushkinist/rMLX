@@ -10,14 +10,16 @@
 # HOW
 #   scripts/fixtures/debt_report/base/ is a synthetic scan root: a twin file
 #   pair, a same-naming-shape pair with unrelated bodies, a same-naming-shape
-#   pair just under the similarity threshold, and the six speculative
-#   round-loop drivers. The two size-critical docs (over/under the 200 KB
-#   threshold) are generated into a throwaway copy of the fixture at run time
-#   rather than committed, so this test does not carry ~250 KB of filler into
-#   the tree's own churn count. The churn section needs real git history,
-#   which the base fixture does not have on its own (it is a subtree of this
-#   repo's working copy) — it builds its own throwaway two-commit, one-tag
-#   repo in a temp dir instead.
+#   pair just under the similarity threshold, one speculative fn carrying both
+#   the driver signature and a constructed RoundTotals (the sole round-loop
+#   driver) beside seven that carry the signature alone, and two planted impl
+#   RoundDrafter bodies for the matched-lines figure. The two size-critical
+#   docs (over/under the 200 KB threshold) are generated into a throwaway copy
+#   of the fixture at run time rather than committed, so this test does not
+#   carry ~250 KB of filler into the tree's own churn count. The churn section
+#   needs real git history, which the base fixture does not have on its own
+#   (it is a subtree of this repo's working copy) — it builds its own
+#   throwaway two-commit, one-tag repo in a temp dir instead.
 #
 # Exit 0 = every case found what it was supposed to. Exit 1 = at least one did not.
 
@@ -47,6 +49,8 @@ for f in \
     crates/rmlx-models/src/speculative/eagle3.rs \
     crates/rmlx-models/src/speculative/gemma4_assistant.rs \
     crates/rmlx-models/src/speculative/mod.rs \
+    crates/rmlx-models/src/speculative/round_impl_alpha.rs \
+    crates/rmlx-models/src/speculative/round_impl_beta.rs \
     docs/SMALL.md
 do
     [ -f "$BASE/$f" ] || {
@@ -118,31 +122,218 @@ check "round_loop_group_named" \
     BASE_OUT
 
 check "round_loop_driver_count" \
-    "all 8 signature-matching drivers are found — 6 pub loops plus the 2 private cached ones a name list misses" \
-    contains "  8 driver(s) found" \
+    "population (a) — the driver signature AND a constructed RoundTotals, check_spec_charge.sh's own rule — finds exactly the one fn that carries both, not every signature match" \
+    contains "  1 driver(s) found" \
     BASE_OUT
 
-for entry in \
-    "mtp_generate:crates/rmlx-models/src/speculative/mtp.rs:5" \
-    "dflash_generate:crates/rmlx-models/src/speculative/dflash.rs:5" \
-    "dflash2_generate:crates/rmlx-models/src/speculative/dflash2.rs:5" \
-    "eagle3_generate:crates/rmlx-models/src/speculative/eagle3.rs:5" \
-    "mtp_assistant_generate:crates/rmlx-models/src/speculative/gemma4_assistant.rs:5" \
-    "spec_generate_greedy:crates/rmlx-models/src/speculative/mod.rs:5" \
-    "spec_generate_greedy_cached:crates/rmlx-models/src/speculative/cached.rs:5" \
-    "spec_generate_stochastic_cached:crates/rmlx-models/src/speculative/cached.rs:21"
+check "round_loop_has_mtp_generate" \
+    "the sole (signature + RoundTotals) fn is resolved to its actual file:line" \
+    contains "  mtp_generate                     crates/rmlx-models/src/speculative/mtp.rs:5" \
+    BASE_OUT
+
+check "round_loop_no_pairwise" \
+    "one driver has no pair to compare against" \
+    contains "  no pairwise similarity (fewer than two drivers)" \
+    BASE_OUT
+
+# A dead producer (check_spec_charge.sh missing/broken) also reports 0
+# drivers, which would make every absent-check below pass for the wrong
+# reason. This pins that BASE_OUT is a genuinely healthy scan, not that.
+check "base_out_not_unavailable" \
+    "the healthy scan the exclude-checks below read from is not itself a swallowed error" \
+    absent "  unavailable (" \
+    BASE_OUT
+
+# Each of these carries the driver signature but never constructs a
+# RoundTotals — under the old signature-only rule every one of them was
+# reported as a driver; under population (a) none is.
+for driver in \
+    dflash_generate \
+    dflash2_generate \
+    eagle3_generate \
+    mtp_assistant_generate \
+    spec_generate_greedy \
+    spec_generate_greedy_cached \
+    spec_generate_stochastic_cached
 do
-    driver="${entry%%:*}"
-    where="${entry#*:}"
-    check "round_loop_has_${driver}" \
-        "the round-loop group resolves ${driver} to its actual file:line, not just its name" \
-        contains "  ${driver}" \
-        BASE_OUT
-    check "round_loop_path_${driver}" \
-        "${driver}'s resolved path is the one printed" \
-        contains "${where}" \
+    check "round_loop_excludes_${driver}" \
+        "${driver} has the signature and no RoundTotals — population (a) excludes it" \
+        absent "  ${driver}" \
         BASE_OUT
 done
+
+# ---- negative case: renaming the driver AND dropping its RoundTotals in ----
+# ---- the same fixture copy is a refusal, never a silent 0 -----------------
+
+TOTALS_WORK="$(mktemp -d)"
+cp -R "$BASE" "$TOTALS_WORK/base"
+sed -i.bak \
+    -e '/let _totals = RoundTotals { total: out.len() as u32 };/d' \
+    -e 's/pub fn mtp_generate(/pub fn zzz_renamed_and_detotaled(/' \
+    "$TOTALS_WORK/base/crates/rmlx-models/src/speculative/mtp.rs"
+rm -f "$TOTALS_WORK/base/crates/rmlx-models/src/speculative/mtp.rs.bak"
+
+TOTALS_OUT=$(python3 "$TOOL" --root "$TOTALS_WORK/base" --since HEAD)
+
+check "totals_removed_reports_unavailable" \
+    "renaming the sole driver and removing its RoundTotals leaves check_spec_charge.sh's own population empty, which is a refusal (exit 2, 'found no round loop'), not a silent 0" \
+    contains "  unavailable (check_spec_charge.sh --list-drivers failed (exit 2): check-spec-charge: found no round loop" \
+    TOTALS_OUT
+
+check "totals_removed_no_driver_count_line" \
+    "once the section is unavailable, no stale 'driver(s) found' line follows it" \
+    absent "driver(s) found" \
+    TOTALS_OUT
+
+check "totals_removed_old_name_absent" \
+    "the renamed, detotaled fn's old name is gone from the section too" \
+    absent "mtp_generate" \
+    TOTALS_OUT
+
+rm -rf "$TOTALS_WORK"
+
+# ---- a dead producer (check_spec_charge.sh unreachable) is unavailable, ---
+# ---- never a silent 0 — the concrete failure the guard above rules out ----
+
+DEAD_OUT=$(python3 - "$REPO_ROOT/scripts/lib" "$STATIC_WORK/base" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import debt_report as dr
+from pathlib import Path
+dr.CHECK_SPEC_CHARGE_SCRIPT = Path("/nonexistent/check_spec_charge.sh")
+lines = []
+dr.report_sibling_similarity(Path(sys.argv[2]), lines)
+print("\n".join(lines))
+EOF
+)
+
+check "dead_producer_reports_unavailable" \
+    "pointing the gate script at a path that does not exist surfaces as unavailable" \
+    contains "  unavailable (check_spec_charge.sh not found at /nonexistent/check_spec_charge.sh)" \
+    DEAD_OUT
+
+check "dead_producer_no_driver_count_line" \
+    "the stale 'driver(s) found' line is not printed once the section is unavailable — this is the shape the guard above rules out for the healthy runs" \
+    absent "driver(s) found" \
+    DEAD_OUT
+
+# ---- two same-named, same-file drivers join 1:1 by (file, fn, line) — 2 --
+# ---- drivers, not the 4 a name-only join would produce --------------------
+
+DUP_WORK="$(mktemp -d)"
+cp -R "$BASE" "$DUP_WORK/base"
+cat >>"$DUP_WORK/base/crates/rmlx-models/src/speculative/mtp.rs" <<'EOF'
+
+mod inner {
+    use super::ProbeStep;
+
+    pub fn mtp_generate(
+        prompt_ids: &[u32],
+        n_tokens: usize,
+        step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        for _ in 0..n_tokens {
+            let next = prompt_ids.last().copied().unwrap_or(0) + 1;
+            if step_fn(&ProbeStep { token: next }).is_none() {
+                break;
+            }
+            out.push(next);
+        }
+        let _totals = RoundTotals { total: out.len() as u32 };
+        out
+    }
+}
+EOF
+
+DUP_OUT=$(python3 "$TOOL" --root "$DUP_WORK/base" --since HEAD)
+
+check "duplicate_named_driver_count_is_two_not_four" \
+    "two same-named, same-file drivers at different lines join 1:1 by (file, fn, line) — a name-only join would extend by both Python matches for each of the 2 gate-listed lines and read 4" \
+    contains "  2 driver(s) found" \
+    DUP_OUT
+
+rm -rf "$DUP_WORK"
+
+# ---- a gate-listed driver Python's own scan excludes (moved under a -------
+# ---- speculative/tests/ subdirectory) is reported unresolved, not dropped -
+
+MOVED_WORK="$(mktemp -d)"
+cp -R "$BASE" "$MOVED_WORK/base"
+sed -i.bak '/let _totals = RoundTotals { total: out.len() as u32 };/d' \
+    "$MOVED_WORK/base/crates/rmlx-models/src/speculative/mtp.rs"
+rm -f "$MOVED_WORK/base/crates/rmlx-models/src/speculative/mtp.rs.bak"
+
+mkdir -p "$MOVED_WORK/base/crates/rmlx-models/src/speculative/tests"
+cat >"$MOVED_WORK/base/crates/rmlx-models/src/speculative/tests/moved_driver.rs" <<'EOF'
+pub struct ProbeStep {
+    pub token: u32,
+}
+
+pub fn moved_generate(
+    prompt_ids: &[u32],
+    n_tokens: usize,
+    step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    for _ in 0..n_tokens {
+        let next = prompt_ids.last().copied().unwrap_or(0) + 1;
+        if step_fn(&ProbeStep { token: next }).is_none() {
+            break;
+        }
+        out.push(next);
+    }
+    let _totals = RoundTotals { total: out.len() as u32 };
+    out
+}
+EOF
+
+MOVED_OUT=$(python3 "$TOOL" --root "$MOVED_WORK/base" --since HEAD)
+
+check "unresolved_driver_reported_not_zero" \
+    "check_spec_charge.sh excludes only by filename (*_tests.rs / tests.rs) and still lists a driver under a tests/ subdirectory; rust_files() excludes the whole subdirectory by path component and cannot resolve it — this reads as 1 listed, 0 resolved, not a silent 0 driver(s) found" \
+    contains "  1 listed, 0 resolved" \
+    MOVED_OUT
+
+check "unresolved_driver_named" \
+    "the unresolved entry names the fn and where the gate found it, so nothing is silently dropped" \
+    contains "    unresolved: moved_generate crates/rmlx-models/src/speculative/tests/moved_driver.rs:5" \
+    MOVED_OUT
+
+rm -rf "$MOVED_WORK"
+
+# ---- --matched-lines: one producer for the campaign's duplication figure --
+
+DRIVERS_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines drivers)
+
+check "matched_lines_drivers_single_item" \
+    "one driver has no pair, so the summed matched-line count over the driver population is 0" \
+    contains "round-loop drivers (crates/rmlx-models/src/speculative): 0 matched lines over 12 body lines (1 item(s), 0 pair(s))" \
+    DRIVERS_ML
+
+IMPLS_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines impls)
+
+check "matched_lines_impls_planted_pair" \
+    "the two planted impl RoundDrafter bodies are identical but for their type name, which sits outside the extracted body — the matched-line count is the full 7-line body, known in advance" \
+    contains "impl RoundDrafter bodies (crates/rmlx-models/src/speculative): 7 matched lines over 14 body lines (2 item(s), 1 pair(s))" \
+    IMPLS_ML
+
+# A body edit lowers the matched-line count below the planted 7 — the figure
+# reads the actual bodies each time, not a cached constant.
+DIVERGED_WORK="$(mktemp -d)"
+cp -R "$BASE" "$DIVERGED_WORK/base"
+sed -i.bak 's/base \* 2/base * 3/' \
+    "$DIVERGED_WORK/base/crates/rmlx-models/src/speculative/round_impl_beta.rs"
+rm -f "$DIVERGED_WORK/base/crates/rmlx-models/src/speculative/round_impl_beta.rs.bak"
+
+DIVERGED_ML=$(python3 "$TOOL" --root "$DIVERGED_WORK/base" --matched-lines impls)
+
+check "matched_lines_impls_diverged_pair_drops" \
+    "editing one planted body's last statement drops the matched count from the planted 7 to 6" \
+    contains "impl RoundDrafter bodies (crates/rmlx-models/src/speculative): 6 matched lines over 14 body lines (2 item(s), 1 pair(s))" \
+    DIVERGED_ML
+
+rm -rf "$DIVERGED_WORK"
 
 check "doc_over_threshold_listed" \
     "BIG.md, generated over the 200 KB threshold, is listed" \
@@ -201,7 +392,7 @@ check "renamed_driver_old_name_absent" \
     RENAME_OUT
 
 check "renamed_driver_new_name_present" \
-    "discovery is signature-driven, not name-driven — the renamed fn is still found, under its new name" \
+    "discovery is structural (signature + RoundTotals), not name-driven — the renamed fn is still found, under its new name" \
     contains "  zzz_renamed_driver" \
     RENAME_OUT
 
@@ -211,8 +402,13 @@ check "renamed_driver_new_path_present" \
     RENAME_OUT
 
 check "renamed_driver_count_unchanged" \
-    "the total driver count is unaffected by a pure rename (still 8) — a naive name-keyed implementation would lose one" \
-    contains "  8 driver(s) found" \
+    "the total driver count is unaffected by a pure rename (still 1) — a naive name-keyed implementation would lose it" \
+    contains "  1 driver(s) found" \
+    RENAME_OUT
+
+check "rename_out_not_unavailable" \
+    "the rename-case scan the old-name-absent check above reads from is a genuinely healthy scan, not a dead-producer artifact" \
+    absent "  unavailable (" \
     RENAME_OUT
 
 rm -rf "$STATIC_WORK" "$RENAME_WORK"

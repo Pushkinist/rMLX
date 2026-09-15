@@ -15,5 +15,6 @@ pub fn mtp_generate(
         }
         out.push(next);
     }
+    let _totals = RoundTotals { total: out.len() as u32 };
     out
 }

@@ -1478,14 +1478,15 @@ and two readings of that same path took its place, one per condition of RULE 1.
 
 ### `make debt-report`
 
-Its driver group is discovered by the `step_fn` signature alone, so it lists
-`emit_step`, `emit_round_tokens` and `emit_seed_token` beside the loops and the
-entries. Narrowing it to the charge gate's population (a) is an open item in its
-own right, and it is the one gate change the campaign leaves unmade: at the end
-of the campaign the group should list one driver plus the per-drafter `propose`
-/ `condition` / `rollback` implementations, whose pairwise similarity is what
-their real differences warrant, and it still lists every fn carrying the
-signature.
+**Closed.** Its driver group used to be discovered by the `step_fn` signature
+alone, so it listed `emit_step`, `emit_round_tokens` and `emit_seed_token`
+beside the loops and the entries. It now reads the charge gate's own
+population (a) — `check_spec_charge.sh --list-drivers`, not a second copy of
+the (a1)+(a2) rule — and lists the one driver, `run_rounds`. Duplication moved
+into the per-drafter `impl RoundDrafter` bodies is a second, separate
+population: `scripts/lib/debt_report.py --matched-lines {drivers,impls}` is
+the one command that reports either figure — see "Duplication at the base of
+the campaign" below.
 
 ## Duplication at the base of the campaign
 
@@ -1607,10 +1608,11 @@ cannot fall further and this measurement retires with it: from here the
 population is one fn, and what a future chunk moves is measured over the
 drafters instead.
 
-The second figure **falls**, for the first time in the campaign, and the fall is
-the same 37 lines the two-model impl grew by. Over the six `impl RoundDrafter`
-bodies it reads 956 matched lines over 1045 body lines and 15 pairs at
-`origin/main`, and 919 over 1082 and 15 at this chunk's head. The ten pairs that
+The second figure **falls**, for the first time in the campaign: the matched
+count drops by 37 lines while the two-model impl's own body grows by 45 — two
+different numbers, not one. Over the six `impl RoundDrafter` bodies it reads
+956 matched lines over 1045 body lines and 15 pairs at `origin/main`, and 919
+over 1090 and 15 at this chunk's head. The ten pairs that
 do not involve the two-model drafter read **663 → 663**, unchanged line for
 line; its own five pairs read 293 → 256, each falling — against DFlash 1,
 DFlash 2, EAGLE-3, the assistant and the sidecar at 42, 49, 60, 47 and 58
@@ -1618,3 +1620,13 @@ matched lines where they were 61, 55, 63, 51 and 63, and 23.9%, 23.6%, 30.0%,
 25.0% and 30.7% where they were 38.7%, 29.0%, 34.7%, 30.1% and 37.0%. That is
 what a rule no other drafter has looks like when it lands inside one that
 already existed: the body grows and its similarity to every other body falls.
+
+**One command for both figures, going forward.**
+`scripts/lib/debt_report.py --matched-lines drivers` and `--matched-lines
+impls` read the driver group and the `impl RoundDrafter` bodies with the same
+extractor and convention the report itself uses, callable directly instead of
+re-run by hand per executor. At this chunk's head they read `0 matched lines
+over 282 body lines (1 item(s), 0 pair(s))` for `drivers` — `run_rounds`
+alone, nothing to pair it against — and `919 matched lines over 1090 body
+lines (6 item(s), 15 pair(s))` for `impls`, agreeing with the measured
+figures above on both counts.
