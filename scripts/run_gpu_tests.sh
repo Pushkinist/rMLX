@@ -224,13 +224,12 @@ VALIDATION_DIAGNOSTIC='Invalid .{0,120}(at offset [0-9]+|executing kernel functi
 # The name is what makes the notice attributable — to the census expectation
 # below, and to the stand-down report the operator reads — so the two scans
 # share one definition of it: a run where they disagreed would list a notice as
-# attributed and count it as unattributed at the same time. Neither is anchored
-# at line start, because under --nocapture the notice lands after libtest's
-# `test some::name ... ` prefix.
-NAMED_SKIP='SKIP [A-Za-z_][A-Za-z0-9_]*:'
-# Any stand-down announcement, named or not. The surrounding character classes
-# keep `RMLX_SKIP_GPU` and words merely containing the letters from counting.
-ANY_SKIP='(^|[^A-Za-z0-9_])SKIP([^A-Za-z0-9_]|$)'
+# attributed and count it as unattributed at the same time. That is why the
+# shape lives in one file both this runner and the source gate read, rather than
+# in each of them. Neither pattern is anchored at line start, because under
+# --nocapture the notice lands after libtest's `test some::name ... ` prefix.
+# shellcheck source=lib/skip_notice_patterns.sh
+. "${REPO_ROOT}/scripts/lib/skip_notice_patterns.sh"
 
 # One `<kind><TAB><kernel>` record per diagnostic, read from stdin one
 # diagnostic per line.

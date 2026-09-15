@@ -56,8 +56,13 @@ new_case() {
     CASE="$1"
     CASE_ROOT="${WORK}/$1"
     local root="${CASE_ROOT}"
-    mkdir -p "${root}/scripts" "${root}/bin" "${root}/logs" || return 1
+    mkdir -p "${root}/scripts/lib" "${root}/bin" "${root}/logs" || return 1
     cp "${RUNNER}" "${root}/scripts/run_gpu_tests.sh" || return 1
+    # Symlinked, not copied: the runner reads the stand-down notice's shape from
+    # this file and so does the source gate, and a fixture carrying its own copy
+    # would keep passing after the real shape moved.
+    ln -sf "${ROOT}/scripts/lib/skip_notice_patterns.sh" \
+        "${root}/scripts/lib/skip_notice_patterns.sh" || return 1
     : >"${root}/classified"
     # The pin is a tracked file and its absence is its own error, so every case
     # starts from an empty one and says so; the cases that pin something
