@@ -689,13 +689,32 @@ four are values the migration had to preserve or move.
   rule is the drafter's because it is the drafter's; the stream is the
   request's. `block_tokens` and `block_distributions` share one row slice, so
   the two read-backs cannot drift into slicing differently.
-- **The draw order did not move, so the seeded-reproducibility pin did not.**
-  The stream advances in the same order it did in the body — `n` proposal draws,
+- **The draw order did not move, and it was read rather than argued.** The
+  stream advances in the same order it did in the body — `n` proposal draws,
   then one coin per proposal, then one residual draw on the round that rejected
   or one bonus draw on the round that did not — off a generator seeded from the
-  same value. `crates/rmlx-models/tests/two_model_stochastic.rs` pins no literal
-  sequence: it pins that one seed reproduces one sequence, that another seed
-  does not, and that neither is the greedy answer. Nothing there was re-blessed.
+  same value. That is the argument. It is not evidence, and nothing already in
+  the tree could be: `crates/rmlx-models/tests/two_model_stochastic.rs` asserts
+  self-consistency *within* a build, which a reordered stream satisfies exactly
+  as well; the pinned round stream and the equivalence pairs run at temperature
+  0, where the verifier's tokens come off an argmax that reaches no draw; and
+  `crates/rmlx-models/tests/spec_sampled_distribution.rs` drives a sidecar pair.
+
+  **The reading is the same seed at two commits.** `origin/main` and this
+  chunk's head, each built in its own worktree with its own `CARGO_TARGET_DIR`,
+  and one harness copied unchanged into both. Eight cells per side: two prompts
+  — one that stops on an EOS near 50 tokens, one that runs its whole budget —
+  two temperatures, 0.7 and 1.0, and two seeds, 7 and 8, at 256 tokens on the
+  `gemma-4-e4b` / `gemma-4-e2b` pair. **Eight of eight identical, id for id and
+  text for text**, under one sha256 over each side's cell lines — the same
+  digest on both. Re-read at every later revision of the chunk, the
+  `std::mem::take` in `verify` included, with the same result.
+
+  The control is now
+  `print_the_seeded_stochastic_streams_for_a_cross_commit_diff`, beside the gate
+  it complements, and that file's doc carries the recipe — so the next change to
+  this stream has a control to run rather than an argument to make. Nothing in
+  `two_model_stochastic.rs` was re-blessed: it pins no literal sequence.
 - **`rollback_target_from_tail` is deleted.** Its last caller was the deleted
   body; every drafter on the shared loop has its target computed from the head
   spelling. The equality the two spellings had — the post-forward read names the
@@ -1382,7 +1401,7 @@ rule changes.
 
 It is widened to **any visibility, over the charge gate's populations (a) and (b)
 and the fns that call one of them** — the one loop, the seven entries, and the
-two-model entry guard that routes a request to one of two loops by reading
+two-model entry guard that routes a request to one of two entries by reading
 whether the sampler is active. That third clause is not tidiness: the guard is
 where a sampled request can be routed to the greedy arm, which is this gate's
 own defect class, and it is in the gate today only because it happens to be

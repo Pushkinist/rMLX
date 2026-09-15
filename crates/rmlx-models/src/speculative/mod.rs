@@ -1,9 +1,18 @@
-// LOC-exempt: the shared round-loop layer is one contract. Seven drafter paths
-// enter one loop through one interface, and what is here is what they share —
-// prefill chunking, the acceptance walk, the request's draw, the block
-// arithmetic, the guards a round is refused by, the emit site. Splitting it by
-// drafter duplicates those; splitting it by phase separates a guard from the
-// step it guards.
+// LOC-exempt. Three things live here and the first two cannot be separated:
+// `SpeculativeDispatcher`, which owns the pair and the two two-model entries,
+// and what every drafter path shares — prefill chunking, the acceptance walk,
+// the request's draw, the block arithmetic, the guards a round is refused by,
+// the emit site. Splitting those by drafter duplicates them; splitting them by
+// phase separates a guard from the step it guards; and the entries are where a
+// request is refused before a cache stack is built, which is one statement away
+// from the dispatcher that holds the models.
+//
+// The third could leave: the snapshot and vocabulary pairing block —
+// `vocab_pairing_verdict`, `unread_tensor_refusal` and the vocabulary readers
+// under them — is a loader-side check with no round-loop caller, and it is the
+// natural first split of this file. It has not moved because nothing this
+// change does touches it, and a move is a diff across every caller of a check
+// whose whole value is that it refuses before a model is built.
 //! Speculative decoding.
 //!
 //! Wraps a (verifier, draft) pair of `Architecture` instances.

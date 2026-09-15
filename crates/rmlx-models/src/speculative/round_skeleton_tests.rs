@@ -801,10 +801,13 @@ fn the_seeds_attribution_is_written_only_where_a_seed_is_emitted() {
 /// `make check-spec-sampling`'s RULE 1 and every per-drafter reading beside it.
 ///
 /// **It reads text and is blind past that** — a construction inside a branch
-/// that never runs reads identical.
+/// that never runs reads identical. The owner it names is a *declaration* and
+/// not a path: `lines_in_fns` knows nothing of `impl` blocks, and `mod.rs`
+/// declares three `fn new`. What identifies the site is therefore the line
+/// beside the owner, which is asserted whole.
 ///
 /// Mutation: seed a second `Pcg32` in any loop, drafter or entry under
-/// `src/speculative/`.
+/// `crates/rmlx-models/src/speculative/`.
 #[test]
 #[allow(
     clippy::expect_used,
@@ -849,8 +852,69 @@ fn the_requests_draw_stream_has_one_generator() {
             "new".to_owned(),
             "rng: crate::sampler::Pcg32::new(cfg.seed_or_default()),".to_owned()
         )],
-        "a speculative request seeds one generator, in `VerifierDraw::new`, and this \
-         tree seeds them at {found:?} — a second one off the same seed is a second \
-         stream that reproduces just as well and is drawn from just as wrongly"
+        "a speculative request seeds one generator, in `VerifierDraw::new` — named \
+         here by its declaration and its line, there being three `fn new` in that \
+         file — and this tree seeds them at {found:?}: a second one off the same \
+         seed is a second stream that reproduces just as well and is drawn from \
+         just as wrongly"
+    );
+}
+
+/// The owner these readings report is the declaration a line sits in, whatever
+/// stands before its `fn`.
+///
+/// Every text pin in this module family holds a statement to a *place* — a
+/// rollback in `rollback` and not in `verify`, a draw in `propose` and not in
+/// `condition` — and the place is the owner [`lines_in_fns`] reports. A
+/// qualifier the reader skips past silently hands the statement the previous
+/// declaration's name, so the pin passes while reading the wrong fn, and the one
+/// that matters here is real: `mod.rs` declares `pub const fn drafts_per_round`
+/// and four more `const fn`s, and the generator scan above sits inside a
+/// `pub(crate) fn new`.
+///
+/// Mutation: drop any arm of `declared_fn`'s qualifier loop; drop its `is_code`
+/// guard.
+#[test]
+fn the_owner_reading_names_the_declaration_a_line_sits_in() {
+    const SRC: &str = "\
+fn outer() {
+    let a = MARK;
+}
+pub const fn counted(n: usize) -> usize {
+    let b = MARK;
+}
+pub(crate) unsafe fn raw() {
+    let c = MARK;
+}
+const unsafe extern \"C\" fn abi() {
+    let d = MARK;
+}
+// fn commented() {
+    let e = MARK;
+}
+pub async fn later() {
+    let f = MARK;
+}
+";
+    let found = lines_in_fns(SRC, "MARK");
+    let read: Vec<(&str, &str)> = found
+        .iter()
+        .map(|(line, owner)| (*line, owner.as_str()))
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            ("let a = MARK;", "outer"),
+            ("let b = MARK;", "counted"),
+            ("let c = MARK;", "raw"),
+            ("let d = MARK;", "abi"),
+            // A commented-out declaration is prose: the statement under it
+            // belongs to the last declaration that was code.
+            ("let e = MARK;", "abi"),
+            ("let f = MARK;", "later"),
+        ],
+        "a qualifier the reader skips past leaves a statement attributed to the \
+         declaration above it, and every text pin in this module family reads that \
+         owner"
     );
 }

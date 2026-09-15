@@ -25,22 +25,50 @@ pub(crate) fn is_code(line: &str) -> bool {
     !line.trim_start().starts_with("//")
 }
 
-/// The name this line declares a `fn` under, visibility and `async` included.
+/// The name this line declares a `fn` under, whatever qualifiers stand before
+/// the keyword.
 ///
-/// Read off the head of the line rather than off `fn ` alone: a `pub(crate) fn`
-/// whose name a reading skipped would hand that reading the *previous*
-/// declaration's name, so a statement inside it reads as one inside whatever was
-/// declared above — which is a wrong owner rather than a missing one.
+/// Read as tokens off the head of the line rather than off `fn ` alone: a
+/// `pub(crate) fn`, a `const fn` or an `unsafe fn` whose name a reading skipped
+/// would hand that reading the *previous* declaration's name, so a statement
+/// inside it reads as one inside whatever was declared above — a wrong owner
+/// rather than a missing one. `pub`, `pub(...)`, `async`, `unsafe`, `const` and
+/// `extern "…"` are skipped in any order, which is every order the language
+/// permits and a few it does not.
+///
+/// **Two shapes it does not read, and both are silent.** A `fn` nested inside
+/// another never restores the outer name, so a statement after it is attributed
+/// to the inner one; and an attribute on the same line as the declaration —
+/// `#[inline] fn f()` — is not a declaration this reader sees at all. Neither
+/// exists in the sources these readings scan, and a caller that grows one gets a
+/// wrong owner rather than a refusal.
 fn declared_fn(line: &str) -> Option<&str> {
-    let mut head = line.trim_start();
-    if let Some(rest) = head.strip_prefix("pub") {
-        head = match rest.strip_prefix('(') {
-            Some(scope) => scope.split_once(')').map_or(scope, |(_, tail)| tail),
-            None => rest,
-        }
-        .trim_start();
+    if !is_code(line) {
+        return None;
     }
-    head = head.strip_prefix("async ").unwrap_or(head).trim_start();
+    let mut head = line.trim_start();
+    loop {
+        let rest = if let Some(rest) = head.strip_prefix("pub") {
+            match rest.strip_prefix('(') {
+                Some(scope) => scope.split_once(')').map_or(scope, |(_, tail)| tail),
+                None => rest,
+            }
+        } else if let Some(rest) = head.strip_prefix("extern") {
+            // `extern "C"`, and a bare `extern` too.
+            rest.trim_start().strip_prefix('"').map_or(rest, |abi| {
+                abi.split_once('"').map_or(abi, |(_, tail)| tail)
+            })
+        } else if let Some(rest) = head
+            .strip_prefix("async ")
+            .or_else(|| head.strip_prefix("unsafe "))
+            .or_else(|| head.strip_prefix("const "))
+        {
+            rest
+        } else {
+            break;
+        };
+        head = rest.trim_start();
+    }
     head.strip_prefix("fn ").map(|rest| {
         rest.split(|c: char| !c.is_alphanumeric() && c != '_')
             .next()

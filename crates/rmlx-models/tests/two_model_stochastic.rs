@@ -24,11 +24,22 @@
 //! greedy. Nothing else reaches it either — the pinned round stream and the
 //! equivalence pairs run at temperature 0, where the verifier's tokens come off
 //! an argmax that never reaches a draw. The only reading of a moved draw order
-//! is **the same seed at two commits**, which is what the control below prints:
-//! build the other commit in its own worktree with its own `CARGO_TARGET_DIR`
-//! (never a shared `target/`), run this test with `--nocapture` in both, and
-//! diff the `CELL` lines. They must be identical id for id; a difference is a
-//! moved stream and not a re-blessing.
+//! is **the same seed at two commits**, which is what the control below prints.
+//! The recipe in full, because two of its steps are where it silently stops
+//! being a comparison:
+//!
+//! 1. Check the other commit out into its own worktree and build it with its
+//!    own `CARGO_TARGET_DIR`. **Never a shared `target/`**: one binary
+//!    overwrites the other and the run compares a commit against itself.
+//! 2. **Copy this file unchanged into that worktree** — at an older commit the
+//!    control does not exist, and a re-typed harness is a second variable — and
+//!    record one digest over both copies to say they are the same file.
+//! 3. Before trusting either run, confirm each binary carries a string only its
+//!    own side has (`strings <binary>`): a build that silently reused the other
+//!    side's artefacts reads as agreement.
+//! 4. Run this test with `--nocapture` in both and diff the `CELL` lines. They
+//!    must be identical id for id; a difference is a moved stream and not
+//!    something to re-bless.
 //!
 //! The pair is a Gemma4 verifier with the smaller Gemma4 as its full draft
 //! model — the classic two-model form — resolved by slug from
@@ -232,7 +243,12 @@ fn stochastic_two_model_loop_samples_reproducibly() {
 /// this file's own doc: the same test, at two commits, in two trees with their
 /// own target directories, diffed.
 ///
-/// It shares this file with the gate above so the pair is loaded once.
+/// It sits in this file because it is the gate above's complement, on the same
+/// pair and one of the same prompts: what that one reads within a build, this
+/// one reads across two. It does **not** share that test's model load — each
+/// builds its own dispatcher in its own body — and it earns its place in
+/// `make gpu-test` anyway, at about a minute on a gate of twenty-one, because
+/// it is the only reading in the tree with power over the draw stream.
 #[ignore]
 #[test]
 fn print_the_seeded_stochastic_streams_for_a_cross_commit_diff() {
