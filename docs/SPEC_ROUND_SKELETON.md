@@ -622,7 +622,13 @@ migration had to preserve or move — and one is a gate that lost its only name.
   else, so no equivalence pair and no pinned cell can see it. The two-model
   drafter's `propose` therefore ignores the `carry` it is handed: the token
   reaches its draft model inside the seed the last round's resync built, which is
-  two tokens on a full acceptance and one otherwise.
+  two tokens on a full acceptance and one otherwise. EAGLE-3 held the same second
+  producer — the identical arithmetic off the identical `Verdict`, for the
+  correction its re-run conditions on — and reads `outcome.carry` as of this
+  chunk; its `carry_tok` stays, because the per-position trace names the token
+  the round *opened* on and that is `propose`'s parameter, not the next round's
+  carry. Both drafters pin the read by text and refuse any line of their own that
+  reads the round's commit.
 - **`draft_ns` widened, as it did for the five before it.** The span is the
   whole `propose` call now — the tape arming, the drafting forwards, the fed
   buffer and the two scalars the round keeps — where the body it replaced timed
@@ -639,9 +645,11 @@ migration had to preserve or move — and one is a gate that lost its only name.
   every other, taken against a third synthetic root that carries the shape the
   tree now has — that path as an *entry* — rather than against a loop shape it
   no longer wears: the sampler parameter stripped, and the sampler taken and
-  left out of the `RoundCfg` it hands over. 27 cases become 28, and no case
-  edits the gate any more: the suite's one self-mutation was of the exemption,
-  and it went with it.
+  left out of the `RoundCfg` it hands over. 27 cases become 29 over four roots —
+  the fourth being the tree's own census, one shared loop and one acceptance rule
+  with a body of its own beside six entries, which the suite could not state
+  before — and no case edits the gate any more: the suite's one self-mutation was
+  of the exemption, and it went with it.
 - **The shared loop answers for six rows of the disposition table**, which is the
   `rows.min(1)` arm of
   `every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure`
@@ -692,7 +700,7 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    written in `verify` where the round's acceptance is known and read by
    `block` at the head of the next round, so the two arguments the method
    already takes are the two the schedule needs.
-5. **The block figure the caller reads back, and the five seed exits.** The five
+5. **The block figure the caller reads back, and the seed exit.** The five
    sidecar loops return the widest block any round ran; the two two-model loops
    return the widest *proposal count*, one less, and
    `spec_generate_greedy` adds one back on the way out — the unit boundary is
@@ -717,9 +725,9 @@ per-loop skip; one is a decision the owner has to take, marked as such.
    `run_rounds`, and it serves the five drafters that draw a seed out of their
    prefill forward; it returns the resolved block rather than the widest that
    ran, because no round has run there and `widest_bs` is zero. No gate prompt
-   stops on its seed, so nothing sees the difference. The in-round EOS exit —
-   the two-model greedy pair's, and the stochastic loop's own — already returns
-   the widest that ran. Proposed: the loop returns the widest block that ran on
+   stops on its seed, so nothing sees the difference. The in-round EOS exit is
+   one exit too, shared by the six drafters on the loop and spelled once more in
+   the stochastic loop's own body, and it already returns the widest that ran. Proposed: the loop returns the widest block that ran on
    every exit, which changes that one value on those five drafters alone.
 
    **Not adopted in chunk 1, and it is the eighth deviation above.** The shared

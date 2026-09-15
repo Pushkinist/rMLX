@@ -252,11 +252,12 @@ build_mid_root() {
   } >"$root/crates/rmlx-models/src/speculative/round_loop.rs"
 }
 
-# The shape the tree carries today: the two-model greedy path is an entry too,
-# beside the migrated sidecar, and the stochastic loop still has a body. This is
-# the root the two readings of that path are taken against — it was the one name
-# the gate exempted, and holding it to a loop's rules would be holding it to a
-# shape it no longer has.
+# Two entries: the two-model greedy path beside a migrated sidecar, with the
+# other four drafters still loop bodies. Not the tree's census — that is
+# `build_tree_root` below — but the smallest root in which the greedy path wears
+# the shape it wears in the tree, which is what the two readings of it need: it
+# was the one name the gate exempted, and holding it to a loop's rules would be
+# holding it to a shape it no longer has.
 build_entry_root() {
   local root="$1"
   build_mid_root "$root"
@@ -269,6 +270,21 @@ build_entry_root() {
     stochastic_cached_src
     printf '\nfn summarise(rounds: usize) -> usize {\n    rounds\n}\n'
   } >"$root/crates/rmlx-models/src/speculative/mod.rs"
+}
+
+# The tree's own census: six entries and two loops, one of them the shared
+# forwarded one and the other the stochastic acceptance rule, which is the one
+# body the collapse does not remove. The charge gate's fixtures carry this shape;
+# without it here, every case of this suite would be taken against a tree the
+# gate never actually scans.
+build_tree_root() {
+  local root="$1"
+  build_entry_root "$root"
+  entry_src "mtp_assistant_generate" \
+    >"$root/crates/rmlx-models/src/speculative/gemma4_assistant.rs"
+  entry_src "dflash_generate" >"$root/crates/rmlx-models/src/speculative/dflash.rs"
+  entry_src "dflash2_generate" >"$root/crates/rmlx-models/src/speculative/dflash2/round.rs"
+  entry_src "eagle3_generate" >"$root/crates/rmlx-models/src/speculative/eagle3.rs"
 }
 
 # run <name> <expected-exit> <reason-substring>
@@ -394,13 +410,20 @@ perl -0pi -e 's/(fn spec_generate_greedy_cached\(.*?RoundCfg \{.*?)            s
 run "the two-model greedy entry that drops the sampler is refused" 1 \
   "\`spec_generate_greedy_cached\` takes \`sampler_cfg\` and leaves it out of the"
 
-# 14. The mid-campaign tree: one path is an entry now, and the loop it runs is
+# 14. The tree's own census: one shared loop, one acceptance rule with a body of
+#     its own, and every other drafter an entry. This is the shape every case
+#     above is evidence about, and the suite has to be able to state it.
+build_tree_root "$root"
+run "the tree's own census passes, and names what it passed as" 0 \
+  "OK: 2 loops (1 forwarded), 6 entries, 1 guards"
+
+# 15. The mid-campaign tree: one path is an entry now, and the loop it runs is
 #     handed the sampler inside the configuration the entry built.
 build_mid_root "$root"
 run "the mid-campaign tree passes, and names what it passed as" 0 \
   "OK: 7 loops (1 forwarded), 1 entries, 1 guards"
 
-# 15. The shape the entries exist to refuse: a sampler an entry accepts and
+# 16. The shape the entries exist to refuse: a sampler an entry accepts and
 #     leaves out of the configuration it hands over. Nothing else can see it —
 #     the signature is right, the name appears in the body, and the loop draws
 #     from whatever the configuration carried.
@@ -410,14 +433,14 @@ perl -0pi -e 's/            sampler_cfg,\n//; s/\) -> Result<Vec<ProbeStep>> \{\
 run "an entry that leaves the sampler out of the configuration is refused" 1 \
   "\`mtp_generate\` takes \`sampler_cfg\` and leaves it out of the"
 
-# 16. An entry that never took one. The request's temperature stops there.
+# 17. An entry that never took one. The request's temperature stops there.
 build_mid_root "$root"
 perl -0pi -e 's/    sampler_cfg: &crate::sampler::SamplerConfig,\n//; s/            sampler_cfg,\n//' \
   "$root/crates/rmlx-models/src/speculative/mtp.rs"
 run "an entry with no sampler parameter is refused" 1 \
   "\`mtp_generate\` starts a round loop and takes no"
 
-# 17. The shared loop reading the sampler out of the configuration is the read
+# 18. The shared loop reading the sampler out of the configuration is the read
 #     RULE 1 asks for; the same loop drawing from a greedy default is not.
 build_mid_root "$root"
 perl -0pi -e 's/super::VerifierDraw::new\(cfg\.sampler_cfg\)/super::VerifierDraw::new(\&greedy());\n    let _ = cfg.sampler_cfg/' \
@@ -425,7 +448,7 @@ perl -0pi -e 's/super::VerifierDraw::new\(cfg\.sampler_cfg\)/super::VerifierDraw
 run "the shared loop that draws from no sampler is refused" 1 \
   "\`round_loop_generate\` is handed the request's sampler and builds"
 
-# 18. A lost entry. The seven paths are what the campaign moves between shapes,
+# 19. A lost entry. The seven paths are what the campaign moves between shapes,
 #     never the count, so six of them is a scan that stopped looking rather than
 #     a tree with one drafter fewer.
 build_mid_root "$root"
@@ -434,7 +457,7 @@ printf '//! The path that used to be here.\n' \
 run "a lost entry is a scan error, not a quieter run" 2 \
   "the tree has 6 drafter generation paths and records"
 
-# 19. A needle in a comment is not the call it names. The commented-out draw is
+# 20. A needle in a comment is not the call it names. The commented-out draw is
 #     what a change like this leaves behind, and beside a greedy one it is a
 #     loop that ignores the request while reading as one that honours it.
 build_root "$root"
@@ -443,7 +466,7 @@ perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    
 run "a commented-out draw is not a draw" 1 \
   "\`mtp_generate\` is handed the request's sampler and builds"
 
-# 20. The same on the signature side: a commented-out parameter is not one, and
+# 21. The same on the signature side: a commented-out parameter is not one, and
 #     a scan that read it would find a sampler the fn never takes.
 build_root "$root"
 perl -0pi -e 's|    sampler_cfg: &crate::sampler::SamplerConfig,|    // sampler_cfg: \&crate::sampler::SamplerConfig,|; s|super::VerifierDraw::new\(sampler_cfg\)|super::VerifierDraw::new(\&greedy())|' \
@@ -451,7 +474,7 @@ perl -0pi -e 's|    sampler_cfg: &crate::sampler::SamplerConfig,|    // sampler_
 run "a commented-out sampler parameter is not a parameter" 1 \
   "\`mtp_assistant_generate\` drives a generation but takes neither a"
 
-# 21. And a needle inside a string literal is text a program prints, not a
+# 22. And a needle inside a string literal is text a program prints, not a
 #     construction it makes.
 build_root "$root"
 perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    let note = "VerifierDraw::new(sampler_cfg)";\n    let mut draw = super::VerifierDraw::new(\&greedy());|' \
@@ -459,7 +482,7 @@ perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    
 run "a needle inside a string literal is not a draw" 1 \
   "\`dflash_generate\` is handed the request's sampler and builds"
 
-# 22. The converse, and the reason the construction is followed to its closing
+# 23. The converse, and the reason the construction is followed to its closing
 #     parenthesis: a correct loop must not be refused for the width of its line.
 build_root "$root"
 perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    let mut draw = super::VerifierDraw::new(\n        sampler_cfg,\n    );|' \
@@ -467,7 +490,7 @@ perl -0pi -e 's|    let mut draw = super::VerifierDraw::new\(sampler_cfg\);|    
 run "a draw wrapped over two lines is still a draw" 0 \
   "OK: 7 loops (0 forwarded), 0 entries, 1 guards"
 
-# 23. Every needle reads code, the parameter list included: a comment naming a
+# 24. Every needle reads code, the parameter list included: a comment naming a
 #     type or a marker in a signature is prose, and reading it would move the
 #     population.
 build_root "$root"
@@ -476,7 +499,7 @@ perl -0pi -e 's|    device: Device,\n\) -> Result<Vec<ProbeStep>> \{|    device:
 run "a comment in a parameter list is prose, not a declaration" 0 \
   "OK: 7 loops (0 forwarded), 0 entries, 1 guards"
 
-# 24. The dispatch scan reads code too, and it is the arm reading that is this
+# 25. The dispatch scan reads code too, and it is the arm reading that is this
 #     gate's own defect class: a sampler kept as a comment is passed to nothing.
 build_root "$root"
 perl -0pi -e 's|            &spec_sampler_cfg,\n            dispatcher.device\(\),\n        \),\n    \};|            // \&spec_sampler_cfg,\n            dispatcher.device(),\n        ),\n    };|' \
@@ -484,7 +507,7 @@ perl -0pi -e 's|            &spec_sampler_cfg,\n            dispatcher.device\(\
 run "a dispatch arm keeping the sampler in a comment is refused" 1 \
   "the \`Drafter::DFlash2\` arm drives a"
 
-# 25. And the same through a string literal, which is text the arm prints rather
+# 26. And the same through a string literal, which is text the arm prints rather
 #     than a configuration it passes.
 build_root "$root"
 perl -0pi -e 's|            &spec_sampler_cfg,\n            dispatcher.device\(\),\n        \),\n    \};|            tracing::debug!("no spec_sampler_cfg here"),\n            dispatcher.device(),\n        ),\n    };|' \
@@ -492,7 +515,7 @@ perl -0pi -e 's|            &spec_sampler_cfg,\n            dispatcher.device\(\
 run "a dispatch arm naming the sampler inside a string literal is refused" 1 \
   "the \`Drafter::DFlash2\` arm drives a"
 
-# 26. The same trait, and here the loop it swallows is the one that draws. The
+# 27. The same trait, and here the loop it swallows is the one that draws. The
 #     path census cannot see the loss on its own: the entry that replaced the
 #     migrated drafter fills the slot, one for one, so a scan that lost the
 #     shared loop still counts seven paths and passes.
@@ -507,7 +530,7 @@ mv "$work/with_trait.rs" "$loop_file"
 run "a trait of bodiless declarations does not swallow the loop beneath it" 0 \
   "OK: 7 loops (1 forwarded), 1 entries, 1 guards"
 
-# 27. And the invariant that would have caught it whatever the cause: an entry
+# 28. And the invariant that would have caught it whatever the cause: an entry
 #     hands the sampler to a loop that takes a `RoundCfg`, so entries with none
 #     to enter are a loop the scan lost.
 build_mid_root "$root"

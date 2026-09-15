@@ -1,4 +1,4 @@
-//! Three wirings this drafter owns, pinned by text.
+//! Four wirings this drafter owns, pinned by text.
 //!
 //! The round loop is `round_loop.rs`'s and its own gates read it. What moved out
 //! of the EAGLE-3 loop body and into this file is wiring — an order and a
@@ -16,7 +16,13 @@
 //!    unconditionally and a full-vocabulary request claims a restriction it did
 //!    not take; report zero always and the boundary rule in
 //!    `docs/SPEC_ANSWER_EQUIVALENCE.md` waives nothing it should.
-//! 3. **The drafter-side rollback and the target it reports.** The cache is
+//! 3. **Where the re-run's correction comes from.** The round decides the next
+//!    round's carry and hands it over; this drafter reads it and derives
+//!    nothing. Derived a second time off the same `Verdict`, a drift re-runs the
+//!    drafter over a correction the verifier is not scoring against — which
+//!    moves the accept rate and nothing else, so no pair and no pinned cell can
+//!    see it.
+//! 4. **The drafter-side rollback and the target it reports.** The cache is
 //!    rolled back by re-running it, exactly once per round, and the round line's
 //!    target is read back off the cache afterwards — computing it instead makes
 //!    the line restate the verifier's own number and stop being the cross-check
@@ -201,5 +207,59 @@ fn the_drafter_rolls_back_by_re_running_and_reads_its_target_back() {
         *owner, "rollback",
         "the target is read back where the rollback left the cache and this one is \
          read in `{owner}`"
+    );
+}
+
+/// The correction the re-run conditions on is the round's carry, read off the
+/// outcome and derived nowhere in this drafter.
+///
+/// The loop takes the verifier's own token at the accepted position off the
+/// commit and hands it over on `RoundOutcome`. A drafter that reads the same
+/// `Verdict` for itself is a second producer of one token: the two agree until
+/// one of them changes, and then the re-run conditions on a token the next
+/// round's verify input does not carry. Every other observable is blind to that
+/// — the answer is the verifier's own token either way, and the round line
+/// carries no correction — so the accept rate is all that moves.
+///
+/// `carry_tok` is not that second producer and stays: it is the token `propose`
+/// was handed, copied for the per-position trace, and the trace names the round
+/// it opened rather than the one after it.
+///
+/// Mutation: `verdict.commit.last().copied().unwrap_or(self.carry_tok)` in
+/// place of `outcome.carry`; `verdict.commit.first()`, which no other reading
+/// here parts from.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "the assertion above establishes exactly one element, so the read cannot fail"
+)]
+fn the_re_runs_correction_is_read_off_the_round_and_not_derived_again() {
+    let reads = lines_in_fns(ROUND_SRC, "outcome.carry");
+    assert_eq!(
+        reads.len(),
+        1,
+        "the drafter reads the round's carry once and this one reads it {} time(s): \
+         {reads:?}",
+        reads.len()
+    );
+    let (line, owner) = reads.first().expect("one read, asserted above");
+    assert_eq!(
+        *owner, "rollback",
+        "the carry is read where the re-run conditions on it and this one is read in \
+         `{owner}`"
+    );
+    assert_eq!(
+        *line, "let correction = outcome.carry;",
+        "the carry is taken whole off the outcome and this drafter takes `{line}`"
+    );
+    let derived: Vec<&str> = ROUND_SRC
+        .lines()
+        .map(str::trim)
+        .filter(|l| is_code(l) && l.contains("verdict.commit"))
+        .collect();
+    assert!(
+        derived.is_empty(),
+        "a drafter that reads the round's commit for itself is a second producer of \
+         the carry, and this one reads {derived:?}"
     );
 }
