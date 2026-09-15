@@ -125,10 +125,12 @@
 //! | `Qwen3.6-35B-A3B-8bit` | `specdrift-qwen3.6-35b-a3b-eagle3` | EAGLE-3 | KV truncation + recurrent snapshot/replay |
 //! | `Qwen3.8-27B-mxfp8` | `ornith-1.0-9b-mxfp8-mlx` | two full models, greedy | both models' KV + recurrent state |
 //!
-//! The first runs wherever the snapshots are; the others run on request — see
-//! [`DrafterSource`] for the shader-validation reason. `RMLX_DRAFT_TEST_MODEL`
-//! names one drafter, so a pair it does not belong to stands down on the kind
-//! its snapshot declares rather than loading it as something else.
+//! Each runs wherever its snapshots are: both halves resolve by slug, and
+//! `RMLX_DRAFT_TEST_MODEL` overrides a drafter only where the models root does
+//! not hold its slug. Nine cells share that one variable, which is why the slug
+//! outranks it — a drafter of the right width loads against the wrong verifier
+//! without complaint, and the checks below are what refuse the pairing that
+//! reaches anyway.
 //!
 //! The seventh round loop the engine ships is the two-model **stochastic** one,
 //! and it can have no pair here: it runs only above temperature 0, where neither
@@ -1691,7 +1693,16 @@ impl RoundLoop {
 /// One verifier + drafter the gate can run.
 struct Pair {
     verifier: common::GoldenModel,
-    drafter: DrafterSource,
+    /// The slug this pair's drafter is resolved by, or `None` for a drafter no
+    /// slug names.
+    ///
+    /// `RMLX_DRAFT_TEST_MODEL` overrides it for a models root that does not hold
+    /// the slug — [`common::choose_by_slug`] holds why that order and not the
+    /// reverse. `None` is the class of pair this rule cannot arm: a draft with
+    /// no snapshot to name, which stands down naming the variable as its only
+    /// handle. The class is empty, and a pair entering it is INCOMPLETE by
+    /// contract rather than silent.
+    drafter: Option<&'static str>,
     round_loop: RoundLoop,
     /// The round block to drive this pair at, or `None` for the block the engine
     /// serves a request that names none.
@@ -1708,38 +1719,6 @@ struct Pair {
     block: Option<usize>,
 }
 
-/// How a pair's drafter is found, and so whether `make gpu-test` selects the
-/// pair on a machine that merely holds the snapshots.
-enum DrafterSource {
-    /// Resolved by slug from `RMLX_O_MODELS_ROOT`, like the verifier — the pair
-    /// runs wherever the snapshots are.
-    Slug(&'static str),
-    /// Run only when an operator asks, and then resolved by the slug named here.
-    ///
-    /// `RMLX_DRAFT_TEST_MODEL` is what asks. It is one variable and these are
-    /// several pairs, so it cannot also be what each of them resolves to: three
-    /// MTP pairs across two verifiers would all take whichever sidecar it held,
-    /// and a 4-bit sidecar loads against an mxfp8 verifier of the same width
-    /// without complaint. So the variable selects, the slug resolves, and the
-    /// path the variable holds is the fallback for a machine whose models root
-    /// does not carry the slug — checked against the verifier by
-    /// [`declared_quant_mode`] either way.
-    ///
-    /// `None` is a pair with no snapshot to name: the two-model arm's draft is a
-    /// full model of the verifier's family, and no sibling of these verifiers is
-    /// on this machine's models root, so the variable is its only handle.
-    ///
-    /// Its verifier drives an MLX quantized matmul whose `load_safe` bound is
-    /// the one `scripts/gpu_validation_census.txt` records, so a run under Metal
-    /// shader validation reports over a thousand invalid loads from a kernel
-    /// this repo does not compile. The census pins one exact count per test, and
-    /// a count from a 256-token generation moves with every prompt — so pinning
-    /// such a pair would make the census brittle rather than informative. Until
-    /// that is settled these pairs run on request and `make gpu-test` reports
-    /// them as skipped, with the variable that would run them named.
-    Named(Option<&'static str>),
-}
-
 /// The pair the floors were measured on: a full-attention-plus-SWA verifier
 /// whose rollback is a KV truncation.
 const ASSISTANT_PAIR: Pair = Pair {
@@ -1747,7 +1726,7 @@ const ASSISTANT_PAIR: Pair = Pair {
         slug: "mlx-community__gemma-4-e2b-it-mxfp8",
         archs: &["Gemma4ForConditionalGeneration"],
     },
-    drafter: DrafterSource::Slug("mlx-community__gemma-4-E2B-it-assistant-bf16"),
+    drafter: Some("mlx-community__gemma-4-E2B-it-assistant-bf16"),
     round_loop: RoundLoop::Gemma4Assistant,
     block: None,
 };
@@ -1763,7 +1742,7 @@ const MTP_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named(Some("mlx-community__Qwen3.8-27B-MTP-mxfp8")),
+    drafter: Some("mlx-community__Qwen3.8-27B-MTP-mxfp8"),
     round_loop: RoundLoop::MtpSidecar,
     block: None,
 };
@@ -1782,7 +1761,7 @@ const MTP_4BIT_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named(Some("mlx-community__Qwen3.8-27B-MTP-4bit")),
+    drafter: Some("mlx-community__Qwen3.8-27B-MTP-4bit"),
     round_loop: RoundLoop::MtpSidecar,
     block: None,
 };
@@ -1798,7 +1777,7 @@ const MTP_4BIT_PAIR: Pair = Pair {
 /// answer could move without the loop reporting anything.
 const MTP_4BIT_DEEP_PAIR: Pair = Pair {
     verifier: MTP_4BIT_PAIR.verifier,
-    drafter: DrafterSource::Named(Some("mlx-community__Qwen3.8-27B-MTP-4bit")),
+    drafter: Some("mlx-community__Qwen3.8-27B-MTP-4bit"),
     round_loop: RoundLoop::MtpSidecar,
     block: Some(DEEP_BLOCK),
 };
@@ -1813,10 +1792,6 @@ const DEEP_BLOCK: usize = 8;
 /// verifier as a rejected proposal rather than as a failure — which the
 /// acceptance walk absorbs, and this gate does not. The declared width is
 /// [`DFLASH2_DEEP_PAIR`]'s.
-///
-/// Named for the same reason [`MTP_PAIR`] is, and more so: its verifier is
-/// 4-bit, so it drives the same MLX quantized matmul at a group size the
-/// census does not pin.
 const DFLASH2_PAIR: Pair = Pair {
     verifier: common::GoldenModel {
         slug: "mlx-community__Qwen3.8-27B-4bit",
@@ -1825,7 +1800,7 @@ const DFLASH2_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named(Some("z-lab__Qwen3.8-27B-DFlash2")),
+    drafter: Some("z-lab__Qwen3.8-27B-DFlash2"),
     round_loop: RoundLoop::DFlash2,
     block: None,
 };
@@ -1839,7 +1814,7 @@ const DFLASH2_PAIR: Pair = Pair {
 /// against the one before it is not the chain re-picking seven.
 const DFLASH2_DEEP_PAIR: Pair = Pair {
     verifier: DFLASH2_PAIR.verifier,
-    drafter: DrafterSource::Named(Some("z-lab__Qwen3.8-27B-DFlash2")),
+    drafter: Some("z-lab__Qwen3.8-27B-DFlash2"),
     round_loop: RoundLoop::DFlash2,
     block: Some(8),
 };
@@ -1850,9 +1825,6 @@ const DFLASH2_DEEP_PAIR: Pair = Pair {
 /// width changes between rounds here as at any block. The schedule's full
 /// range is [`DFLASH1_DEEP_PAIR`]'s: at the served 5 this one oscillates over
 /// {4, 5}.
-///
-/// Named for the same reason [`MTP_PAIR`] is: an 8-bit verifier drives the same
-/// MLX quantized matmul the census records for the affine instantiation.
 const DFLASH1_PAIR: Pair = Pair {
     verifier: common::GoldenModel {
         slug: "mlx-community__Qwen3.6-35B-A3B-8bit",
@@ -1861,7 +1833,7 @@ const DFLASH1_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named(Some("z-lab__Qwen3.6-35B-A3B-DFlash")),
+    drafter: Some("z-lab__Qwen3.6-35B-A3B-DFlash"),
     round_loop: RoundLoop::DFlash1,
     block: None,
 };
@@ -1877,7 +1849,7 @@ const DFLASH1_PAIR: Pair = Pair {
 /// the schedule is.
 const DFLASH1_DEEP_PAIR: Pair = Pair {
     verifier: DFLASH1_PAIR.verifier,
-    drafter: DrafterSource::Named(Some("z-lab__Qwen3.6-35B-A3B-DFlash")),
+    drafter: Some("z-lab__Qwen3.6-35B-A3B-DFlash"),
     round_loop: RoundLoop::DFlash1,
     block: Some(16),
 };
@@ -1908,7 +1880,7 @@ const EAGLE3_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named(Some("Dogacel__specdrift-qwen3.6-35b-a3b-eagle3")),
+    drafter: Some("Dogacel__specdrift-qwen3.6-35b-a3b-eagle3"),
     round_loop: RoundLoop::Eagle3,
     block: None,
 };
@@ -1918,10 +1890,12 @@ const EAGLE3_PAIR: Pair = Pair {
 /// partial round. Both halves are GDN hybrids, so a round rolls back two kinds
 /// of state on each of two models.
 ///
-/// Named, and its drafter is the one kind [`RoundLoop::declares`] cannot pin to
-/// a snapshot: `two_model` is an inference from the architecture registry, which
-/// every full model satisfies. [`declared_vocab_size`] is the discriminator that
-/// stands a mismatched pair down before either model is read.
+/// Its drafter is the one kind [`RoundLoop::declares`] cannot pin to a
+/// snapshot: `two_model` is an inference from the architecture registry, which
+/// every full model satisfies, and the weight-format check exempts it because
+/// an independent model's format is unrelated to the verifier's. The engine's
+/// `vocab_pairing` is what separates them, id by id, before either model is
+/// read.
 const TWO_MODEL_PAIR: Pair = Pair {
     verifier: common::GoldenModel {
         slug: "mlx-community__Qwen3.8-27B-mxfp8",
@@ -1930,7 +1904,7 @@ const TWO_MODEL_PAIR: Pair = Pair {
             "Qwen3_5MoeForConditionalGeneration",
         ],
     },
-    drafter: DrafterSource::Named(None),
+    drafter: Some("sahilchachra__ornith-1.0-9b-mxfp8-mlx"),
     round_loop: RoundLoop::TwoModelGreedy,
     block: None,
 };
@@ -1938,63 +1912,22 @@ const TWO_MODEL_PAIR: Pair = Pair {
 /// Draft-model override, the variable the sibling alignment suites take.
 const DRAFT_MODEL_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 
-/// Resolve the **drafter**, which the golden harness has no variable for: an
-/// operator's override if they named one, otherwise the slug under
-/// `RMLX_O_MODELS_ROOT`. The verifier goes through `common::model_for`.
+/// Resolve the **drafter**, which the golden harness has no variable for: the
+/// pair's own slug under `RMLX_O_MODELS_ROOT`, overridden by
+/// [`DRAFT_MODEL_VAR`] only where that root does not hold it. The verifier goes
+/// through `common::model_for`.
 ///
 /// Resolving by slug is what puts this gate inside `make gpu-test` on a machine
 /// holding the snapshots: it joins the population `run_gpu_tests.sh` already
-/// reports as INCOMPLETE when the models root is unset, instead of being a
-/// third variable nobody exports and a green run that asserted nothing.
+/// reports as INCOMPLETE when the models root is unset, instead of a variable
+/// nobody exports and a green run that asserted nothing.
 ///
-/// A path the operator named that is not a snapshot fails; a models root that
-/// simply does not hold the slug skips. That split is the harness's
-/// (`tests/common/mod.rs`), not a second copy of its rules.
-///
-/// Both probes ask for a [`common::Role::Sidecar`]: a drafter is decoded with
-/// the verifier's tokenizer and ships none of its own, so requiring one would
-/// turn a checkpoint sitting on this machine's disk into a skip — and a skip in
-/// this gate reads exactly like the equivalence holding. The harness names its
-/// own override variable in the messages it builds; this half of the pair is
-/// overridden by a different one, so that name is substituted.
-fn resolve(var: &str, slug: &str) -> common::Gate {
-    named_path(var).unwrap_or_else(|| by_slug(var, slug))
-}
-
-/// What the path in `var` resolves to, or `None` when the variable holds none.
-///
-/// An operator who named a path meant it, so a typo or a moved snapshot breaks
-/// the run rather than skipping it. `override_snapshot` reports only an unset or
-/// empty value as `None`, so the inner `unwrap_or_else` covers a case the outer
-/// `?` has already excluded.
-fn named_path(var: &str) -> Option<common::Gate> {
-    let named = std::env::var(var).ok().filter(|v| !v.is_empty())?;
-    let probed =
-        common::override_snapshot(Some(&named), common::Role::Sidecar).unwrap_or_else(|| {
-            common::Snapshot::Misconfigured(format!("{var} is set to an empty value"))
-        });
-    Some(match probed {
-        common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
-        common::Snapshot::Absent(why) | common::Snapshot::Misconfigured(why) => {
-            common::Gate::Fail(why.replace(common::SINGLE_MODEL_VAR, var))
-        }
-    })
-}
-
-/// What a slug resolves to under `RMLX_O_MODELS_ROOT`, reading no variable.
-///
-/// `blame` names the variable a message should point at — the one that would
-/// have overridden this — because the harness's own messages name its single
-/// override and this half of a pair is overridden by a different one.
-fn by_slug(blame: &str, slug: &str) -> common::Gate {
-    let root = std::env::var(common::MODELS_ROOT_VAR).ok();
-    match common::slug_snapshot(root.as_deref(), slug, common::Role::Sidecar) {
-        common::Snapshot::Found { path, .. } => common::Gate::Run { path, note: None },
-        common::Snapshot::Absent(why) => {
-            common::Gate::Skip(why.replace(common::SINGLE_MODEL_VAR, blame))
-        }
-        common::Snapshot::Misconfigured(why) => common::Gate::Fail(why),
-    }
+/// [`common::Role::Sidecar`]: a drafter is decoded with the verifier's
+/// tokenizer and ships none of its own, so requiring one would turn a
+/// checkpoint sitting on this machine's disk into a skip — and a skip in this
+/// gate reads exactly like the equivalence holding.
+fn resolve(slug: &str) -> common::Gate {
+    common::slug_or_override(DRAFT_MODEL_VAR, slug, common::Role::Sidecar)
 }
 
 /// Whether `draft_path` is the dedicated Gemma4 assistant drafter snapshot.
@@ -2074,21 +2007,6 @@ fn declared_quant_mode(path: &Path) -> Option<String> {
         }
     }
     None
-}
-
-/// The vocabulary a snapshot declares, from its own config or its text tower's.
-///
-/// The two-model pair needs this because its loop's kind is an inference from
-/// the architecture registry rather than a marker: every full model declares
-/// itself a `two_model` drafter, so the kind check cannot tell one family's from
-/// another's. A draft whose vocabulary is not the verifier's is refused inside
-/// `load_speculative`, which would fail the run rather than stand it down.
-fn declared_vocab_size(path: &Path) -> Option<usize> {
-    let cfg = draft_config(path)?;
-    cfg["vocab_size"]
-        .as_u64()
-        .or_else(|| cfg["text_config"]["vocab_size"].as_u64())
-        .and_then(|v| usize::try_from(v).ok())
 }
 
 // ── Prompts ──────────────────────────────────────────────────────────────────
@@ -2716,40 +2634,13 @@ impl Loaded {
 
 /// Load a pair, or say why the gate stood down.
 fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
-    // The drafter first: a pair the operator has not named stands down before
-    // anything loads a verifier.
-    let named = std::env::var(DRAFT_MODEL_VAR)
-        .ok()
-        .filter(|v| !v.is_empty());
-    // Both arms below that reach this are guarded on the variable being set, so
-    // it always resolves to something; the fallback names the guard it fell
-    // through rather than restating the message a `false` arm already gives.
-    let named_gate = || {
-        named_path(DRAFT_MODEL_VAR).unwrap_or_else(|| {
-            common::Gate::Fail(format!(
-                "{DRAFT_MODEL_VAR} was set when this pair was selected and is not now"
-            ))
-        })
-    };
-    let draft_gate = match (&pair.drafter, named.is_some()) {
-        (DrafterSource::Slug(slug), _) => resolve(DRAFT_MODEL_VAR, slug),
-        // The variable asked for this pair; the pair says which sidecar it
-        // needs. Its own slug first, so a run with several of these selected
-        // does not hand all of them whichever one path the variable holds.
-        // Only a models root that simply does not carry the slug falls back to
-        // the path the variable holds. A root that is misconfigured is the
-        // operator's mistake, and swallowing it would reinstate the one
-        // cross-pairing the slug is here to prevent — with the drafter that
-        // happens to be in the variable, silently.
-        (DrafterSource::Named(Some(slug)), true) => match by_slug(DRAFT_MODEL_VAR, slug) {
-            found @ common::Gate::Run { .. } => found,
-            failed @ common::Gate::Fail(_) => failed,
-            common::Gate::Skip(_) => named_gate(),
-        },
-        (DrafterSource::Named(None), true) => named_gate(),
-        (DrafterSource::Named(_), false) => common::Gate::Skip(format!(
-            "{DRAFT_MODEL_VAR} is unset and this pair's drafter is not resolved by \
-             slug — see the DrafterSource::Named note for why"
+    // The drafter first: a pair whose drafter this machine does not hold stands
+    // down before anything loads a verifier.
+    let draft_gate = match pair.drafter {
+        Some(slug) => resolve(slug),
+        None => common::Gate::Skip(format!(
+            "this pair's drafter is named by no slug, so {DRAFT_MODEL_VAR} is the only \
+             handle that can arm it"
         )),
     };
     let draft_path = common::apply(draft_gate, test)?;
@@ -2787,23 +2678,16 @@ fn load(pair: &Pair, test: &str, device: Device) -> Option<Loaded> {
         }
     }
     // The two-model loop's kind is an inference from the architecture registry,
-    // so a full model of any family declares itself this pair's drafter. The
-    // vocabulary is what separates them, and reading it here stands a mismatched
-    // pair down instead of failing inside the dispatcher's own check.
+    // so a full model of any family declares itself this pair's drafter and
+    // neither check above separates them. The vocabulary does, and comparing
+    // sizes does not: two snapshots can declare the same count over different
+    // pieces, and the drafter then proposes ids that mean other tokens while
+    // greedy emits the verifier's argmax at every accepted position and the
+    // pair passes green. `vocab_pairing` is the engine's own check, piece by
+    // piece, and it reads both tokenizers before either model is built.
     if pair.round_loop == RoundLoop::TwoModelGreedy {
-        let (draft_vocab, verifier_vocab) = (
-            declared_vocab_size(&draft_path),
-            declared_vocab_size(&model_path),
-        );
-        if draft_vocab.is_some() && draft_vocab != verifier_vocab {
-            eprintln!(
-                "SKIP {test}: {} declares a {:?}-token vocabulary and {} declares {:?}, \
-                 so the two are not a two-model pair",
-                draft_path.display(),
-                draft_vocab.unwrap_or(0),
-                model_path.display(),
-                verifier_vocab.unwrap_or(0),
-            );
+        if let Err(why) = rmlx_models::speculative::vocab_pairing(&model_path, &draft_path) {
+            eprintln!("SKIP {test}: {why}");
             return None;
         }
     }

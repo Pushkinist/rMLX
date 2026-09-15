@@ -28,13 +28,19 @@ use super::prompt_cache::Qwen35MoeEntry;
 use crate::prompt_cache::{PromptCache, BLOCK_TOKENS};
 use rmlx_kv_ssd::chained_block_hashes;
 
-fn paro_model_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("RMLX_TEST_MODEL_QWEN36_PARO").map(std::path::PathBuf::from)
-}
+/// The PARO snapshot the PARO cells below read, and the variable that overrides
+/// it for a models root that does not hold it.
+const PARO_SLUG: &str = "z-lab__Qwen3.6-27B-PARO";
+const PARO_VAR: &str = "RMLX_TEST_MODEL_QWEN36_PARO";
+const PARO_ARCHS: [&str; 1] = ["Qwen3_5ForConditionalGeneration"];
 
-fn qwen36_model_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("RMLX_TEST_MODEL_QWEN36").map(std::path::PathBuf::from)
-}
+/// The Qwen3.5-MoE snapshot the remaining model-gated cells read.
+const MOE_SLUG: &str = "mlx-community__Qwen3.6-35B-A3B-8bit";
+const MOE_VAR: &str = "RMLX_TEST_MODEL_QWEN36";
+const MOE_ARCHS: [&str; 2] = [
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+];
 
 /// Verify the softmax -> argsort top-K -> optional normalize routing math.
 ///
@@ -725,15 +731,15 @@ fn embed_lookup_bf16_scales_passthrough_arm() {
 )]
 fn quantize_paro_embed_row760() {
     use rmlx_loader::{load_shard_index, ShardSet};
-    let Some(model_dir_buf) = paro_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "quantize_paro_embed_row760",
+        PARO_VAR,
+        PARO_SLUG,
+        &PARO_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: PARO model dir not found");
-        return;
-    }
     let idx = load_shard_index(model_dir).expect("shard index");
     let shards = ShardSet::open(model_dir, &idx).expect("shards");
 
@@ -1036,15 +1042,12 @@ fn paro_linear_fwd_layer0() {
     use rmlx_loader::{load_shard_index, ShardSet};
     use rmlx_mlx::{Array, Device, Dtype};
 
-    let Some(model_dir_buf) = paro_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+    let Some(model_dir_buf) =
+        crate::test_snapshot::snapshot("paro_linear_fwd_layer0", PARO_VAR, PARO_SLUG, &PARO_ARCHS)
+    else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: PARO model dir not found");
-        return;
-    }
 
     let _shard_path = model_dir.join("model.safetensors");
     let idx = load_shard_index(model_dir).expect("shard index");
@@ -1210,15 +1213,12 @@ fn paro_linear_fwd_layer0() {
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
 fn paro_layer0_trace() {
-    let Some(model_dir_buf) = paro_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+    let Some(model_dir_buf) =
+        crate::test_snapshot::snapshot("paro_layer0_trace", PARO_VAR, PARO_SLUG, &PARO_ARCHS)
+    else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: PARO model dir not found");
-        return;
-    }
 
     println!("Loading PARO model for layer0 trace...");
     let model = load_from_path_paro(model_dir).expect("load PARO model");
@@ -1449,15 +1449,15 @@ fn paro_layer0_trace() {
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
 fn integration_paro_forward() {
-    let Some(model_dir_buf) = paro_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "integration_paro_forward",
+        PARO_VAR,
+        PARO_SLUG,
+        &PARO_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: PARO model dir not found");
-        return;
-    }
 
     println!("Loading PARO model...");
     let model = load_from_path_paro(model_dir).expect("load PARO model");
@@ -1591,15 +1591,15 @@ fn integration_paro_forward() {
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
 fn integration_paro_generate_greedy() {
-    let Some(model_dir_buf) = paro_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "integration_paro_generate_greedy",
+        PARO_VAR,
+        PARO_SLUG,
+        &PARO_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: PARO model dir not found");
-        return;
-    }
 
     println!("Loading PARO model...");
     let model = load_from_path_paro(model_dir).expect("load PARO model");
@@ -1710,15 +1710,15 @@ fn paro_rotation_kernel_vs_python() {
     use rmlx_loader::{load_shard_index, ShardSet};
     use rmlx_mlx::{Array, Device, Dtype};
 
-    let Some(model_dir_buf) = paro_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36_PARO not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "paro_rotation_kernel_vs_python",
+        PARO_VAR,
+        PARO_SLUG,
+        &PARO_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: PARO model dir not found");
-        return;
-    }
 
     let idx = load_shard_index(model_dir).expect("shard index");
     let shards = ShardSet::open(model_dir, &idx).expect("shards");
@@ -1901,15 +1901,15 @@ fn paro_rotation_kernel_vs_python() {
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
 fn integration_qwen3_5_moe_35b() {
-    let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "integration_qwen3_5_moe_35b",
+        MOE_VAR,
+        MOE_SLUG,
+        &MOE_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: model dir not found");
-        return;
-    }
     let model = load_from_path(model_dir).expect("load failed");
     let ids = vec![1u32, 2, 3, 4, 5, 6, 7, 8];
     let result = model.forward_seq(&ids, Device::Cpu);
@@ -1967,35 +1967,15 @@ fn integration_qwen3_5_moe_35b() {
     reason = "bounds established by construction: indices bounded by slice length validated before call"
 )]
 fn hydrated_tail_produces_identical_output() {
-    let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "hydrated_tail_produces_identical_output",
+        MOE_VAR,
+        MOE_SLUG,
+        &MOE_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
-        return;
-    }
-
-    // Verify this is the expected arch before touching the model.
-    let arch_str = {
-        let cfg_path = model_dir.join("config.json");
-        let data = std::fs::read(&cfg_path).expect("read config.json");
-        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
-        v.get("architectures")
-            .and_then(|a| a.get(0))
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_owned()
-    };
-    let expected_archs = [
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    ];
-    if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
-        return;
-    }
 
     println!("Loading model from {}", model_dir.display());
     let model = load_from_path(model_dir).expect("load model");
@@ -2343,34 +2323,15 @@ fn hydrated_tail_produces_identical_output() {
     reason = "bounds established by construction: indices bounded by slice length validated before call"
 )]
 fn hydrated_exact_block_no_tail_not_placeholder() {
-    let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "hydrated_exact_block_no_tail_not_placeholder",
+        MOE_VAR,
+        MOE_SLUG,
+        &MOE_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
-        return;
-    }
-
-    let arch_str = {
-        let cfg_path = model_dir.join("config.json");
-        let data = std::fs::read(&cfg_path).expect("read config.json");
-        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
-        v.get("architectures")
-            .and_then(|a| a.get(0))
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_owned()
-    };
-    let expected_archs = [
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    ];
-    if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
-        return;
-    }
 
     println!("Loading model from {}", model_dir.display());
     let model = load_from_path(model_dir).expect("load model");
@@ -2613,34 +2574,15 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
     reason = "bounds established by construction: indices bounded by slice length validated before call"
 )]
 fn hydrated_tail_k8v8_equivalence() {
-    let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "hydrated_tail_k8v8_equivalence",
+        MOE_VAR,
+        MOE_SLUG,
+        &MOE_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
-        return;
-    }
-
-    let arch_str = {
-        let cfg_path = model_dir.join("config.json");
-        let data = std::fs::read(&cfg_path).expect("read config.json");
-        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
-        v.get("architectures")
-            .and_then(|a| a.get(0))
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_owned()
-    };
-    let expected_archs = [
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    ];
-    if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
-        return;
-    }
 
     println!("Loading model from {}", model_dir.display());
     let model = load_from_path(model_dir).expect("load model");
@@ -2891,33 +2833,15 @@ fn hydrated_tail_k8v8_equivalence() {
     reason = "test-only: a single golden covering the three reachable moe consume outcomes (RAM-partial degrade / hydrated strict-prefix HydratedTail / hydrated equal-length exclusion) reads clearest as one sequential fixture"
 )]
 fn qwen3_5_moe_consume_engine_migration_golden() {
-    let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "qwen3_5_moe_consume_engine_migration_golden",
+        MOE_VAR,
+        MOE_SLUG,
+        &MOE_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
-        return;
-    }
-    let arch_str = {
-        let cfg_path = model_dir.join("config.json");
-        let data = std::fs::read(&cfg_path).expect("read config.json");
-        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
-        v.get("architectures")
-            .and_then(|a| a.get(0))
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_owned()
-    };
-    let expected_archs = [
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    ];
-    if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
-        return;
-    }
 
     println!("Loading model from {}", model_dir.display());
     let model = load_from_path(model_dir).expect("load model");
