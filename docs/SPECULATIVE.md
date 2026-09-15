@@ -82,10 +82,11 @@ it did not get, rather than having them dropped in silence.
 
 ## Round-loop
 
-The production path (`spec_generate_greedy_cached` /
-`spec_generate_stochastic_cached`): persistent per-layer verifier and draft KV
-caches with `KvCache::truncate_to`-based rollback on partial acceptance. This
-cuts per-round verifier cost from O(prompt\_len) to O(K).
+The production path (`spec_generate_greedy_cached`, an entry onto the shared
+round loop, and `spec_generate_stochastic_cached`, which still carries its own
+body): persistent per-layer verifier and draft KV caches with
+`KvCache::truncate_to`-based rollback on partial acceptance. This cuts per-round
+verifier cost from O(prompt\_len) to O(K).
 
 For hybrid architectures (Qwen3.5/3.6-MoE) that carry a GatedDeltaNet (GDN)
 recurrent state in addition to the standard KV cache, the recurrent half cannot
@@ -1109,7 +1110,9 @@ Two constructors, because the two shapes hold different numbers of models:
 - Otherwise routes to `spec_generate_greedy_cached` (deterministic argmax,
   temperature == 0).
 
-Both paths share the same KV cache structure and rollback logic. There is no
+Both paths share the same KV cache structure and rollback logic — the greedy
+one through `run_rounds` and `two_model::TwoModelRound`, the stochastic one in
+its own body until it migrates. There is no
 re-prefill fallback: an architecture whose `forward_seq_last_k_with_cache` is
 unwired surfaces that error.
 

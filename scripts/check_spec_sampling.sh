@@ -90,15 +90,11 @@
 #   arm that does not is one drafter kind that decodes greedily, and the other
 #   arms passing it is what makes that invisible in review.
 #
-# THE ONE EXCEPTION, RECORDED
-#   `spec_generate_greedy_cached` takes no sampler at all. It is the two-model
-#   greedy loop, it runs only at temperature 0 where the verifier's argmax is
-#   the draw, and the guard above it routes every sampled request to the
-#   stochastic loop instead. So it is exempt from RULE 1, and no caller is
-#   asked to pass it a sampler it does not take. The exception is deleted when
-#   that loop becomes a drafter whose `verify` draws through the round's
-#   context, which is what makes it no longer true. It is the only name in this
-#   file.
+# NO EXCEPTION
+#   This gate names no fn. It carried one while the two-model greedy loop took
+#   no sampler at all and ran only at temperature 0; that loop is now an entry
+#   whose `verify` draws through the round's context, so every path is read by
+#   the rules above and a name-shaped hole would only be somewhere to hide.
 #
 # THE CENSUS
 #   The success line names the three populations, and the count of drafter
@@ -118,13 +114,6 @@ set -uo pipefail
 root="${SPEC_SAMPLING_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 loops_dir="$root/crates/rmlx-models/src/speculative"
 dispatch="$root/crates/rmlx-server/src/engine/speculative.rs"
-
-# The one fn that drives a generation and takes no sampler, and the reason it
-# may — see THE ONE EXCEPTION above. It is a constant and not a knob: a gate
-# whose exemptions can be named from the environment is a gate that exempts
-# whatever the caller wants. The recall test proves it is load-bearing by
-# running a copy of this script with the name struck out.
-readonly EXEMPT_LOOP="spec_generate_greedy_cached"
 
 readonly WANT_PATHS=7
 
@@ -316,13 +305,11 @@ population_flat=$(printf '%s\n' "$population" | tr '\n' ' ')
 # ---- Pass 2: the guards -----------------------------------------------------
 #
 # A call to a member of the population, and whether the request's sampler goes
-# with it. The exempt loop takes none, so a call to it is counted and not
-# checked — otherwise the guard above it would be refused for honouring a
-# signature this file already records.
+# with it. Every member takes one, so every call is checked.
 
 callers=$(
   find "$loops_dir" -name '*.rs' ! -name '*_tests.rs' ! -name 'tests.rs' -print0 |
-    xargs -0 awk -v names="$population_flat" -v exempt="$EXEMPT_LOOP" "$AWK_TEXT_FNS"'
+    xargs -0 awk -v names="$population_flat" "$AWK_TEXT_FNS"'
       BEGIN { n = split(names, list, " "); for (i = 1; i <= n; i++) { if (list[i] != "") { pop[list[i]] = 1 } } }
       function reset() {
         in_sig = 0; awaiting_body = 0; in_body = 0; fname = ""
@@ -330,10 +317,8 @@ callers=$(
         call_depth = 0; callee = ""; carries = 0
       }
       function close_call() {
-        if (callee != exempt) {
-          ncalls++
-          if (!carries) { nmissing++; if (missing == "-") { missing = callee } }
-        }
+        ncalls++
+        if (!carries) { nmissing++; if (missing == "-") { missing = callee } }
         call_depth = 0; callee = ""; carries = 0
       }
       function flush() {
@@ -426,7 +411,6 @@ loop_count=0
 entry_count=0
 path_count=0
 forwarded_count=0
-exempt_seen=0
 
 while IFS=$'\t' read -r file name _sig _stats has_cfg _mk has_param draws _carries unreadable _roll; do
   [ -n "$name" ] || continue
@@ -442,10 +426,6 @@ while IFS=$'\t' read -r file name _sig _stats has_cfg _mk has_param draws _carri
     note "  A loop whose extent cannot be determined is not scanned, and an unscanned"
     note "  loop is exactly the one that would decode greedily unnoticed."
     scan_error=1
-    continue
-  fi
-  if [ "$name" = "$EXEMPT_LOOP" ]; then
-    exempt_seen=$((exempt_seen + 1))
     continue
   fi
   if [ "$has_param" != "1" ] && [ "$has_cfg" != "1" ]; then
@@ -585,5 +565,4 @@ if [ "$fail" = "1" ]; then
   exit 1
 fi
 
-read_paths=$((path_count - exempt_seen))
-echo "OK: $loop_count loops ($forwarded_count forwarded), $entry_count entries, $guard_count guards — $read_paths of $path_count drafter paths take the request's sampler and draw with it (\`$EXEMPT_LOOP\` is the recorded exception); $arm_count drafter arms pass it."
+echo "OK: $loop_count loops ($forwarded_count forwarded), $entry_count entries, $guard_count guards — every one of the $path_count drafter paths carries the request's sampler to the loop that draws with it; $arm_count drafter arms pass it."

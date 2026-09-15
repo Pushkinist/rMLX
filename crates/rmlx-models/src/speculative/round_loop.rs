@@ -84,12 +84,6 @@ pub(crate) enum ReportSkippedBy {
     TheSeedExit,
     /// The in-round EOS: the drafter emits nothing before its first round, so
     /// the only early exit it has is inside one.
-    #[allow(
-        dead_code,
-        reason = "declared by the two two-model loops, which have not migrated onto this \
-                  loop yet; the seven-row disposition table in `round_skeleton_tests.rs` \
-                  states it for them until they do"
-    )]
     TheInRoundExit,
 }
 
@@ -164,6 +158,15 @@ pub(crate) struct RoundOutcome {
     pub(crate) committed: usize,
     /// Where the loop's rollback left the verifier's caches.
     pub(crate) verifier_target: i32,
+    /// The token the next round carries into its verify input: the verifier's
+    /// own token at the accepted position, read off the commit.
+    ///
+    /// The loop's, and the loop's alone. A drafter that opens its next round on
+    /// this token can derive the same value from the same `Verdict`, and two
+    /// producers of one token drift into a wrong drafting seed — which moves the
+    /// accept rate and nothing else, so no equivalence pair and no pinned cell
+    /// can see it.
+    pub(crate) carry: u32,
 }
 
 /// What one request runs at, decided by the drafter's own entry function.
@@ -210,6 +213,11 @@ pub(crate) struct RoundCtx<'a> {
     /// keeps a cache of its own sizes it from here, so it cannot overflow
     /// before the verifier does.
     pub(crate) max_seq: i32,
+    /// The codec the caches above were built at. A drafter that builds a second
+    /// stack of its own reads it here rather than resolving the request's
+    /// override against the default a second time: a pair must run one codec,
+    /// and a second resolution is a second answer waiting to differ.
+    pub(crate) kv_quant: KvQuant,
     /// The request's draw over the verifier's logits.
     pub(crate) draw: VerifierDraw,
     /// The loop's phase-charge decision, for a drafter that forces the arrays it
@@ -218,11 +226,29 @@ pub(crate) struct RoundCtx<'a> {
     pub(crate) device: Device,
 }
 
+/// The token a request's first round carries, and whether the request emits it
+/// before that round runs.
+///
+/// Two statements in one value rather than a token beside a flag: every round
+/// opens on a token, and only some of them come out of a prefill forward the
+/// request is entitled to emit. A drafter that stated the two separately could
+/// state them of different tokens.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Seed {
+    /// A token the prefill forward drew past the whole prompt. The request emits
+    /// it before its first round, and that round carries it.
+    Emitted(u32),
+    /// The prompt's own last token, which the prefill stopped short of. The
+    /// first round carries it and the request emits nothing until a round
+    /// commits.
+    Carried(u32),
+}
+
 /// What a drafter's prefill left the request with.
 #[allow(missing_debug_implementations)]
 pub(crate) struct Prefilled {
-    /// The token the request emits before its first round.
-    pub(crate) seed: u32,
+    /// The token the first round carries, and whether the request emits it.
+    pub(crate) seed: Seed,
     /// How long the prefill took, timed by the drafter: what the span covers
     /// differs per drafter, and a loop that timed the call would move the figure
     /// on records no gate reads.
@@ -397,6 +423,7 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
         kv,
         lin,
         max_seq,
+        kv_quant,
         draw: VerifierDraw::new(cfg.sampler_cfg),
         charged: charge,
         device,
@@ -415,42 +442,48 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
     let prefill_ns = prefilled.prefill_ns;
     let mut conditioned_rows = prefilled.projects_conditioning.then_some(0usize);
     let restricted_read_back = prefilled.restricted_read_back;
-    let mut carry = prefilled.seed;
+    let mut carry = match prefilled.seed {
+        Seed::Emitted(token) | Seed::Carried(token) => token,
+    };
 
-    // A loop that attributes its tokens attributes the seed to the whole
-    // vocabulary: it is drawn off the verifier's own prefill logits, and no
-    // reduced read-back reaches it.
-    if let Some(buf) = decided_by.as_deref_mut() {
-        buf.push(DecidedBy::FullVocab);
-    }
-    if emit_seed_token(
-        cfg.tokenizer,
-        carry,
-        step_fn,
-        &mut emitted,
-        &mut window,
-        cfg.eos_ids,
-        &RoundTotals {
-            loop_kind: cfg.loop_kind,
-            block_size: cfg.block_size,
-            conditioned_rows,
-            charged: charge,
-            // No round ran.
-            rounds: 0,
-            emitted_in_rounds: 0,
-            total_draft: 0,
-            total_accept: 0,
-            prefill_ns,
-            draft_ns: 0,
-            verifier_ns: 0,
-            round_loop_ns: 0,
-            t_total,
-        },
-    ) {
-        if !matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheSeedExit) {
-            report_verifier_kv_bytes(ctx.verifier, &ctx.kv, ctx.lin.as_deref());
+    // A pair that emits nothing before its first round has no seed to emit, to
+    // attribute or to stop on, so all three are this arm's.
+    if let Seed::Emitted(seed) = prefilled.seed {
+        // A loop that attributes its tokens attributes the seed to the whole
+        // vocabulary: it is drawn off the verifier's own prefill logits, and no
+        // reduced read-back reaches it.
+        if let Some(buf) = decided_by.as_deref_mut() {
+            buf.push(DecidedBy::FullVocab);
         }
-        return Ok((emitted, cfg.block_size));
+        if emit_seed_token(
+            cfg.tokenizer,
+            seed,
+            step_fn,
+            &mut emitted,
+            &mut window,
+            cfg.eos_ids,
+            &RoundTotals {
+                loop_kind: cfg.loop_kind,
+                block_size: cfg.block_size,
+                conditioned_rows,
+                charged: charge,
+                // No round ran.
+                rounds: 0,
+                emitted_in_rounds: 0,
+                total_draft: 0,
+                total_accept: 0,
+                prefill_ns,
+                draft_ns: 0,
+                verifier_ns: 0,
+                round_loop_ns: 0,
+                t_total,
+            },
+        ) {
+            if !matches!(D::KV_REPORT_SKIPPED_BY, ReportSkippedBy::TheSeedExit) {
+                report_verifier_kv_bytes(ctx.verifier, &ctx.kv, ctx.lin.as_deref());
+            }
+            return Ok((emitted, cfg.block_size));
+        }
     }
 
     tracing::info!(
@@ -548,10 +581,16 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             charge,
             ctx.device,
         )?;
+        // The verifier's own token at the accepted position, read off the
+        // commit. The two part only on a full acceptance the request's budget
+        // truncated, where the request has emitted its last token and the loop
+        // leaves before any round reads what was stored here.
+        carry = verdict.commit.last().copied().unwrap_or(carry);
         let outcome = RoundOutcome {
             round: rounds,
             committed: emit.committed,
             verifier_target: v_target,
+            carry,
         };
         let d_span = drafter.rollback(&ctx, &verdict, outcome)?;
         let conditioning = drafter.condition(&ctx, &verdict, outcome)?;
@@ -579,11 +618,6 @@ pub(crate) fn run_rounds<D: RoundDrafter>(
             // alternative is a `usize` cast of a negative.
             *total += projected.max(0) as usize;
         }
-        // The verifier's own token at the accepted position, read off the
-        // commit. The two part only on a full acceptance the request's budget
-        // truncated, where the request has emitted its last token and the loop
-        // leaves before any round reads what was stored here.
-        carry = verdict.commit.last().copied().unwrap_or(carry);
         let round_rollback_ns = t0.elapsed().as_nanos();
 
         let report = super::RoundReport {

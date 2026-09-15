@@ -52,7 +52,7 @@ use crate::arch::Architecture;
 use crate::decode_loop::ProbeStep;
 use crate::speculative::round_loop::{
     run_rounds, CacheSpan, Conditioning, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx,
-    RoundDrafter, RoundOutcome, Verdict, VerifierOffsetBasis,
+    RoundDrafter, RoundOutcome, Seed, Verdict, VerifierOffsetBasis,
 };
 use crate::speculative::{
     accept_prefix, argmax_tokens, block_capped_by_checkpoint, guard_verifier_prefill_logits,
@@ -81,8 +81,10 @@ pub(crate) struct Eagle3Round<'a> {
     /// The drafter's own prediction at that position, handed to the next block
     /// so the correction is not run through the drafter twice.
     d_seed_tok: Option<u32>,
-    /// The carry token this round opened on, kept for the round's own trace and
-    /// for a commit the request's budget emptied.
+    /// The token this round opened on, for the per-position trace alone. It is
+    /// the carry the loop handed `propose`, copied — not a carry this drafter
+    /// derives, which is the loop's and reaches `rollback` on the round's
+    /// outcome.
     carry_tok: u32,
     /// The drafter cache offset this round opened at, which the rollback
     /// re-runs from.
@@ -314,7 +316,7 @@ impl RoundDrafter for Eagle3Round<'_> {
         self.h_seed = Some(h_seed);
         self.d_seed_tok = Some(seed_tok);
         Ok(Prefilled {
-            seed: bonus,
+            seed: Seed::Emitted(bonus),
             prefill_ns: prefill_t0.elapsed().as_nanos(),
             restricted_read_back: self.restricted_read_back,
             // It carries no conditioning buffer: what crosses a round is its own
@@ -390,7 +392,7 @@ impl RoundDrafter for Eagle3Round<'_> {
         &mut self,
         ctx: &RoundCtx<'_>,
         verdict: &Verdict,
-        _outcome: RoundOutcome,
+        outcome: RoundOutcome,
     ) -> Result<Option<CacheSpan>> {
         let Some(scored) = self.scored.take() else {
             return Err(Error::Model(
@@ -398,10 +400,10 @@ impl RoundDrafter for Eagle3Round<'_> {
                     .into(),
             ));
         };
-        // The verifier's own token at the accepted position. It parts from the
-        // acceptance only on a commit the request's budget truncated, where the
-        // request has emitted its last token and no later round reads this.
-        let correction = verdict.commit.last().copied().unwrap_or(self.carry_tok);
+        // The token the next round carries, taken from the round rather than
+        // re-derived off the same `Verdict`: one producer, so the drafter's
+        // re-run and the loop's verify input cannot part.
+        let correction = outcome.carry;
         let (h_seed, seed_tok) = self.drafter.accept_and_reseed(
             ctx.verifier,
             self.d_offset_before,

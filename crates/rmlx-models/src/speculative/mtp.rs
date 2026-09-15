@@ -54,7 +54,7 @@ use crate::layers::{Linear, RmsNorm};
 use crate::qwen3_5_moe::{MtpLayer, MtpLayerDims};
 use crate::speculative::round_loop::{
     run_rounds, CacheSpan, Conditioning, Prefilled, ReportSkippedBy, RoundCfg, RoundCtx,
-    RoundDrafter, RoundOutcome, Verdict, VerifierOffsetBasis,
+    RoundDrafter, RoundOutcome, Seed, Verdict, VerifierOffsetBasis,
 };
 use rmlx_kv_quant::{KvCache, KvQuant};
 
@@ -682,7 +682,7 @@ impl RoundDrafter for SidecarRound<'_> {
         self.h_cond = Some(r0_hidden);
         let seed = ctx.draw.seed_token(&r0_logits, device)?;
         Ok(Prefilled {
-            seed,
+            seed: Seed::Emitted(seed),
             prefill_ns,
             // It scores every position over the verifier's whole vocabulary.
             restricted_read_back: false,

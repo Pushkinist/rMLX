@@ -95,6 +95,8 @@ use super::eagle3::round::Eagle3Round;
 use super::gemma4_assistant::AssistantRound;
 use super::mtp::SidecarRound;
 use super::round_loop::{ReportSkippedBy, RoundDrafter, VerifierOffsetBasis};
+use super::text_scan::is_code;
+use super::two_model::TwoModelRound;
 use super::{
     accept_prefix, draft_rows_to_drop, guard_restricted_prefix, rollback_target_from_head,
     rollback_target_from_tail, round_block, two_model_drafts_per_round, SpecLoop, MAX_BLOCK_SIZE,
@@ -458,9 +460,14 @@ const DISPOSITIONS: [(
     ),
     (
         SpecLoop::TwoModelGreedy,
-        "mod.rs",
+        SHARED_LOOP,
         ReportSkippedBy::TheInRoundExit,
-        ChainRefusedBy::TheVerifierInput,
+        // Its own body refused the verifier input the empty chain produced, one
+        // statement past where the shared loop refuses the chain itself. The two
+        // are the same test — a two-model round's carry is one token, so an
+        // input under two positions is an empty chain and nothing else — and the
+        // shared loop states one of them.
+        ChainRefusedBy::TheProposalChain,
         VerifierOffsetBasis::AfterTheForward,
     ),
     (
@@ -533,17 +540,6 @@ const MARKERS: [(char, &str); 8] = [
     ('R', "log_request_record("),
     ('P', "report_verifier_kv_bytes("),
 ];
-
-/// Whether a line is code rather than a whole-line comment.
-///
-/// A marker written into the sentence that explains it would otherwise read as
-/// the statement it describes — the same reading `scripts/check_spec_charge.sh`
-/// takes, and for the same reason. A trailing comment on a line of code is not
-/// stripped: that needs a quote-aware scan, and no marker here is one a caller
-/// would write at the end of a statement.
-fn is_code(line: &str) -> bool {
-    !line.trim_start().starts_with("//")
-}
 
 /// The file's edge markers in source order, as characters.
 fn marker_sequence(src: &str) -> String {
@@ -676,9 +672,13 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
                 <Eagle3Round<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
                 <Eagle3Round<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
             ),
-            // The loops that still carry their own body: their dispositions are
-            // read off their source above and there is no constant to read.
-            SpecLoop::TwoModelGreedy | SpecLoop::TwoModelStochastic => continue,
+            SpecLoop::TwoModelGreedy => (
+                <TwoModelRound<'_> as RoundDrafter>::KV_REPORT_SKIPPED_BY,
+                <TwoModelRound<'_> as RoundDrafter>::VERIFIER_OFFSET_BASIS,
+            ),
+            // The loop that still carries its own body: its dispositions are
+            // read off its source above and there is no constant to read.
+            SpecLoop::TwoModelStochastic => continue,
         };
         assert_eq!(
             declared,
@@ -751,4 +751,55 @@ fn every_loop_refuses_a_drafter_that_proposed_nothing_by_its_declared_measure() 
             );
         }
     }
+}
+
+/// The seed's attribution is written where the seed is emitted, and nowhere
+/// else.
+///
+/// `run_rounds` pushes one `DecidedBy::FullVocab` for the token a request emits
+/// before its first round. A pair that emits no seed emits no such token, so the
+/// push belongs inside the arm that opens on an emitted seed — between it and
+/// the emission. Hoisted above the arm, a request with no seed attributes a
+/// token it never emitted and every entry after it names the wrong token.
+///
+/// Nothing at runtime sees that: the one loop with no seed is the two-model
+/// greedy pair, whose entry passes no attribution buffer, so the hoisted push
+/// runs on no request that carries one. This reading is what stands in for it,
+/// until a drafter that emits no seed also attributes its tokens.
+///
+/// Mutation: hoist the push above `if let Seed::Emitted(seed)`; move it below
+/// the emission.
+#[test]
+fn the_seeds_attribution_is_written_only_where_a_seed_is_emitted() {
+    let src = LOOP_SOURCES
+        .iter()
+        .find(|(f, _)| *f == SHARED_LOOP)
+        .map(|(_, s)| *s)
+        .unwrap_or_default();
+    let at = |needle: &str| -> Vec<usize> {
+        src.lines()
+            .enumerate()
+            .filter(|(_, l)| is_code(l) && l.contains(needle))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let arm = at("if let Seed::Emitted(seed) = prefilled.seed {");
+    let push = at("buf.push(DecidedBy::FullVocab);");
+    let emit = at("if emit_seed_token(");
+    assert_eq!(
+        (arm.len(), push.len(), emit.len()),
+        (1, 1, 1),
+        "the loop opens one emitted-seed arm, attributes one seed and emits it once, \
+         and it states them {} / {} / {} time(s)",
+        arm.len(),
+        push.len(),
+        emit.len()
+    );
+    assert!(
+        arm < push && push < emit,
+        "the seed's attribution sits inside the arm that emits it, between the arm \
+         and the emission, and this loop writes them at lines {arm:?}, {push:?}, \
+         {emit:?} — a push above the arm attributes a token a seedless pair never \
+         emitted"
+    );
 }
