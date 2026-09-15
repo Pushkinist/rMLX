@@ -440,7 +440,7 @@ deliberate rather than drift. What a suite asserts decides what it may accept:
 | golden-token (`tests/common/mod.rs`) | `RMLX_KV_TEST_MODEL` + slug | **fails** |
 | `tests/niah_long_context.rs` | `RMLX_TEST_MODEL_*` only | skips |
 | `tests/resolved_arch_class.rs` | `RMLX_TEST_MODEL_*`, then slug | skips |
-| `rmlx-cli/src/commands/kv_calibrate_tests.rs` | `RMLX_TEST_MODEL_*`, then slug | falls through to the slug |
+| `crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` | `RMLX_TEST_MODEL_*`, then slug | falls through to the slug |
 
 The goldens are the strict case because they are the only ones pinning **exact
 bytes from one checkpoint**. The other three make semantic assertions — a needle
@@ -922,8 +922,15 @@ the reason they could not be attributed and left off the list. The count rides
 on the final line for the same reason the named ones do: a report that silently
 dropped them would claim a completeness it does not have.
 
-Write new ones as `SKIP <its own test fn>: <why>`. Converting the sites that
-predate this is mechanical and unfinished.
+Write new ones as `SKIP <its own test fn>: <why>`.
+`scripts/check_named_skip_notices.sh` (`make check-named-skip-notices`, in
+`make ci`) is where that rule is enforced, at the source line rather than at the
+report: it takes the classified GPU tests from the same
+`check_gpu_tests_ignored.sh --list` the runner selects from, and fails on a
+notice in one of them that names no test or names another one. It accepts the
+enclosing fn's name written out or built from a format placeholder
+(`SKIP {test}: …`). Converting the sites that predate the rule is mechanical and
+unfinished; the gate names every one that is left.
 
 **No test in this suite is known-red on `main`, and this runner tracks no
 known-red list of tests.** (Shader-validation hits are the one thing it does
@@ -980,6 +987,223 @@ an under-match, a missing banner and two diagnostics sharing one output line, an
 each case asserts the reason that reaches the final report rather than only the
 exit code. The census-pin verdicts are pinned in the same file, by the same
 means.
+
+#### Why `ci-perf` is INCOMPLETE on a full host, and the rule that ends it
+
+On a machine holding every snapshot this suite can name, `make ci-perf` still
+ends in `ci-perf INCOMPLETE`. The last full run reads:
+
+```
+OK: 383 GPU tests passed across 5 workspace member(s), shader validation matches
+the pinned census. — INCOMPLETE: 20 selected GPU test(s) stood down and 13
+further notice(s) named no test; they asserted nothing (listed above)
+```
+
+Neither number is a missing snapshot. Both are resolution: a cell that **could**
+find its model refuses to look, because it is waiting to be selected by an
+environment variable that can name exactly one path. Twenty cells are selected by
+`RMLX_KV_TEST_MODEL` / `RMLX_DRAFT_TEST_MODEL`, and one pair of variables cannot
+select nine speculative pairs and four alignment suites at once — so no single
+run arms them all, and the operator who exports a pair disarms the rest. Thirteen
+more announce a stand-down that names no test, which the runner can count and
+cannot list.
+
+##### The rule
+
+One rule, and it is the one the tree already uses in three places
+(`two_model_stochastic.rs`, `dflash2_loader.rs`, and the `Slug` arm of
+`spec_greedy_equivalence.rs`'s pair table):
+
+1. **The slug resolves; the variable overrides.** Every model-gated cell names
+   the slug it needs and resolves it under `RMLX_O_MODELS_ROOT`, through
+   `common::slug_snapshot` where the harness is reachable and through the same
+   `<root>/<slug>` join where it is not.
+2. **An unset override is not a stand-down.** It is what the
+   `DrafterSource::Named` arms treat it as today, and it is why they stand down
+   on a host holding their snapshots. The variable stops being a selector.
+3. **The pair's own slug outranks the override path.** One variable holding one
+   path cannot serve nine pairs; ranking it first would hand all of them whichever
+   drafter it holds, and a 4-bit sidecar loads against an mxfp8 verifier of the
+   same width without complaint. The override is the fallback for a root that
+   does not hold the slug.
+4. **A misconfigured root fails; an absent slug skips.** That split is
+   `slug_snapshot`'s, not a second copy of its rules.
+5. **`DrafterSource` collapses to the slug.** With rule 2, `Named(Some(slug))`
+   and `Slug(slug)` differ only in rule 3's ranking, which rule 3 makes uniform —
+   two variants and one meaning. The enum becomes
+   `Option<&'static str>`: a slug, or the ceiling class below.
+6. **Every stand-down notice names its own test.** `SKIP <test>: <why>`, enforced
+   at the source line by `make check-named-skip-notices`.
+
+Rule 3 is the one behaviour change for an operator: `RMLX_DRAFT_TEST_MODEL`
+pointed at a drafter whose slug is also under the models root no longer wins.
+Point the root elsewhere, or move the slug, to override such a pair.
+
+##### The ceiling class, and why it is empty
+
+A pair whose drafter has no slug to name cannot be armed by this rule, and the
+two-model pair was recorded as that case — its draft is a full model of the
+verifier's family rather than a sidecar head, and its table entry says no sibling
+of these verifiers is on the models root. **That is no longer true.**
+`qwen3_5_two_model_alignment.rs` is calibrated against
+`mlx-community__Qwen3.8-27B-mxfp8` drafted by
+`sahilchachra__ornith-1.0-9b-mxfp8-mlx`, both in the snapshot table above, and
+the two declare the same 248320-token vocabulary — which is the discriminator
+`declared_vocab_size` already reads before either model loads. So the two-model
+pair takes that slug and the ceiling class is defined but empty.
+
+One cell is a ceiling of a different kind: `rmlx-audio`'s `codec_decoder_debug`
+hard-codes a **cwd-relative** `models/<slug>/speech_tokenizer` path, which
+resolves under no configuration this repo has — the snapshot is on the models
+root under that same slug, so it too resolves by rule 1 once the join is the
+root's.
+
+A pair that genuinely had no slug would keep the `Named(None)` shape and print a
+named `SKIP <test>: <why>` naming `RMLX_DRAFT_TEST_MODEL` as the only handle. It
+would be INCOMPLETE by contract, not silent — which is the whole point of the
+contract.
+
+##### The runtime, and who pays
+
+**Measured**, from the two full runs the pin was derived on (dev profile, Metal
+shader validation on, `--test-threads=1`):
+
+| Cell | Arms | Wall |
+|---|---|---|
+| Whole GPU half, 383 tests | — | 2961 s / 3879 s |
+| `spec_greedy_equivalence` | one pair armed (Gemma4-e2b), nine stood down | 242 s / 307 s |
+| `spec_sampled_distribution` | one Gemma4-e2b pair, 5 prompts + a control | 529 s / 570 s |
+| `two_model_stochastic` | one Gemma4-e4b/e2b pair, two seeds | 290 s / 314 s |
+| `qwen3_5_moe_forward_seq_last_k` | one 35B-A3B load + one forward | 34 s |
+
+The equivalence gate's unit is a **pair**, and its cost is fixed by its own
+recorded design: six prompts, one of them carrying a 4k document, two full
+generations each — `run_gate`'s doc states why it is every prompt and not a
+chosen one (recall is a property of the set; one prompt is a coin toss). **There
+is no shortest-prompt-set notion in the tree, and inventing one would be a knob
+that contradicts that argument.** The prompt set is paid in full per pair or the
+pair is not run.
+
+**Projected, not measured.** The one armed pair costs ~240–305 s on a 2B
+verifier. The nine that would arm run 27B dense and 35B-A3B verifiers — five to
+eight times the per-token decode cost on the dense ones, plus 30–60 s of load per
+model, times two models per pair. That puts the GPU half in **hours, not
+minutes**, against ~50 min today, and every `make ci-perf` pays it. *This number
+must be measured before it is paid* — one pair, timed, is enough to scale the
+rest, and it is the first thing the implementing change does.
+
+If the measurement lands where the projection says, the lever is the **pair
+table**, not a knob: four of the nine pairs are `_DEEP` variants that drive a
+pair already in the set at a second block width. Dropping one is a recorded
+coverage decision with an owner, and it is the only kind of reduction that does
+not reintroduce a skip that reads like a pass.
+
+##### Why the opt-in existed, and what changed
+
+`DrafterSource::Named`'s own note gives the reason, and it is **not** cost: these
+verifiers drive an MLX quantized matmul whose invalid loads the shader-validation
+census would have to pin, "a count that moves with every generation". That
+objection is now answerable. The census pins one exact count per originating
+test, and `a_round_tape_refolds_to_what_the_replay_produced` — which loads
+`mlx-community__Qwen3.8-27B-4bit` and `mlx-community__Qwen3.6-35B-A3B-8bit` and
+generates on both — carries 2496 and 1014, derived from a full run and
+reproduced exactly on the next one. A temperature-0 generation over a fixed
+prompt set is deterministic, so its hit count is too. Brittleness was the
+recorded blocker; it is answered by derivation, which is what the census rule
+already requires of any change that adds a GPU load.
+
+##### The thirteen unattributed notices
+
+Each is a classified GPU test whose stand-down says `SKIP: <why>`. The runner
+counts them and lists none. `make check-named-skip-notices` names every source
+line; there are more lines than tests because a cell announces the variable, the
+missing directory and the architecture mismatch separately.
+
+| Variable | Tests | Crate / file |
+|---|---|---|
+| `RMLX_TEST_MODEL_QWEN36_PARO` (5) | `paro_linear_fwd_layer0`, `paro_layer0_trace`, `integration_paro_forward`, `integration_paro_generate_greedy`, `paro_rotation_kernel_vs_python` | `crates/rmlx-models/src/qwen3_5_moe/tests.rs` |
+| `RMLX_TEST_MODEL_QWEN36` (4) | `hydrated_tail_produces_identical_output`, `hydrated_exact_block_no_tail_not_placeholder`, `hydrated_tail_k8v8_equivalence`, `qwen3_5_moe_consume_engine_migration_golden` | `crates/rmlx-models/src/qwen3_5_moe/tests.rs` |
+| `RMLX_TEST_MODEL_BONSAI` (2) | `qwen3_hydrated_exact_no_tail_not_placeholder`, `qwen3_consume_engine_migration_golden` | `crates/rmlx-models/src/qwen3_tests.rs` |
+| `RMLX_TEST_MODEL_GEMMA4_E2B` (1) | `gemma4_consume_engine_migration_golden` | `crates/rmlx-models/src/gemma4/prompt_cache_tests.rs` |
+| none — a cwd-relative path | `codec_decoder_debug` | `crates/rmlx-audio/src/tts_tests.rs` |
+
+A fourteenth site is the same defect in the other direction and did not fire on
+either run, because its cell ran: `shader_validation_canary_emits_an_invalid_access_report`
+announces `SKIP shader_validation_canary:`, a name no libtest filter reaches, so
+an uninstrumented run would count it unattributed. The gate refuses it.
+
+These sites are **lib** unit tests under `src/`, so `tests/common`'s resolver is
+not reachable from them. The join is the one
+`crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` already makes:
+`<RMLX_O_MODELS_ROOT>/<slug>`, with the per-architecture variable as the
+override. Slugs come from the snapshot table at the top of this file.
+
+##### The census entries this moves, and their class
+
+The pin is re-derived in the same change, as the census rule requires. Expected,
+with the class each falls into:
+
+| Newly armed | Verifier / snapshot | Expected | Class |
+|---|---|---|---|
+| `the_recurrent_round_loop_reproduces_plain_greedy{,_at_the_declared_block,_past_the_declared_block}`, `the_block_round_loop_reproduces_plain_greedy{,_at_the_declared_block}` | `Qwen3.8-27B-4bit` | `…b_4_alN_false` device loads, one entry per test | **#438 class** — the same template instantiation already pinned on that snapshot |
+| `the_adaptive_round_loop_reproduces_plain_greedy{,_over_its_whole_schedule}`, `the_restricted_vocab_round_loop_reproduces_plain_greedy` | `Qwen3.6-35B-A3B-8bit` | `…b_8_alN_false` on `shared_expert_gate` | **#438 class** — the pinned 1-row `[1, 2048]` mixture tensor |
+| the four `RMLX_TEST_MODEL_QWEN36` cells | `Qwen3.6-35B-A3B-8bit` | `…b_8_alN_false` | **#438 class** — a fourth Qwen3.5-MoE cell on the same gate |
+| `the_recurrent_round_loop_…` (mxfp8 arm), `the_two_model_round_loop_reproduces_plain_greedy` | `Qwen3.8-27B-mxfp8` + `ornith-1.0-9b-mxfp8-mlx` | unknown — mxfp8 is not the affine kernel | **not #438** until measured; a hit here needs its own analysis |
+| the five `RMLX_TEST_MODEL_QWEN36_PARO` cells | `z-lab__Qwen3.6-27B-PARO` | unknown — a different weight codec | **not #438**; its own analysis or a clean pass |
+| the two `RMLX_TEST_MODEL_BONSAI` cells | `Ternary-Bonsai-8B-mlx-2bit` | a `…b_2_…` kernel no entry names — `lm_head` / `model.embed_tokens` at N = 151669, unaligned | **#438 class if it is a load** — same template, third instantiation, and the structural argument in the pin's header does not mention `bits` |
+| `gemma4_consume_engine_migration_golden` | `gemma-4-e2b-it-mxfp8` | none — the assistant pair already runs that snapshot with no unpinned hit | — |
+| `codec_decoder_debug` | `Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit` | unknown | **not #438** until measured |
+
+An entry is only added for a hit whose analysis says it is benign, with the
+reference in the entry. A **store** is never pinnable. A `b_2` load that the
+`tile_matmad` argument covers is one analysis extended, not a new one; anything
+on a non-affine kernel is a new analysis or a red run.
+
+##### The oracle, and what each observable cannot see
+
+| Observable | Sees | Blind to |
+|---|---|---|
+| The runner's final line (`ci-perf ok` / `INCOMPLETE …`) | that a selected cell asserted nothing, and how many notices could not be attributed | *which* cell, when the notice named no test; and whether a cell that ran asserted anything meaningful |
+| The census line and its delta | a hit that moved, a new kernel, a pinned kernel that stopped firing, any store | a pair that resolved the **wrong** snapshot at the same width — the kernel and the count can be identical |
+| Selected-tests ran vs stood down | coverage of the selection | a test that ran against a mispaired drafter, which is a pass |
+| Wall time | that the cost was paid | which pair paid it; a pair that loaded and returned early looks like a cheap pair |
+
+The blind spot they share is **mis-pairing**, and it is the hazard a by-slug
+fallback creates: a same-width verifier handed the wrong drafter loads without
+complaint and produces a plausible answer. Three refusals already in
+`spec_greedy_equivalence.rs` close it, and the rule keeps all three:
+
+* `declared_kind` — the drafter's snapshot must declare the kind this pair's
+  round loop drives (`SKIP <test>: … declares {kind}, and this pair's loop drives
+  a {want} drafter`).
+* `declared_quant_mode` — a sidecar quantized differently from its verifier is
+  not this pair. The two-model arm is exempt: its draft is an independent model.
+* `declared_vocab_size` — the two-model arm's discriminator, since `two_model` is
+  an inference from the architecture registry that every full model satisfies.
+
+Each fires before either model is read, and each prints a named notice, so a
+mis-pairing is INCOMPLETE rather than a quiet green.
+
+##### Mutations, and what catches each
+
+| Mutation | Caught by |
+|---|---|
+| The slug fallback dropped for one pair | the final line: that pair is named on the stand-down list and the run is INCOMPLETE |
+| The slug fallback resolving the wrong snapshot | `declared_kind` / `declared_quant_mode` / `declared_vocab_size`, each a named `SKIP`; the resolver half is CPU-testable against a synthetic root without a model |
+| The override ranked above the pair's own slug | a run with `RMLX_DRAFT_TEST_MODEL` set and several pairs selected: the pairs whose slug the root holds must still take their own, provable from the paths in their notices |
+| A notice that still omits the test name | `make check-named-skip-notices` at the source line, and `run_gpu_tests_selftest.sh`'s `unattributed_stand_down_is_counted` at the report |
+| A notice that names another test | `make check-named-skip-notices`; the runner would list it under a name that does not run |
+| A newly armed test's hits left unpinned | the census delta — `not pinned: N <kind> "<kernel>"` — which is the implementing change's own proof |
+| The census pin edited to fit the run rather than re-derived | a count below the expectation is a failure in its own right, and the pin's header says to re-derive |
+| A pair armed but returning early (a cheap pass) | not caught by wall time; caught by its own assertions and by the census, which expects its hits |
+
+##### What this does not change
+
+A real stand-down stays INCOMPLETE. Nothing here makes a skip read as a pass, the
+runner's exit code keeps meaning what it means — a failing test, an unpinned hit,
+or a run that executed nothing — and a developer without the weights is still not
+blocked. `ci-perf ok` becomes reachable because the cells resolve, not because
+the bar moved.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 
