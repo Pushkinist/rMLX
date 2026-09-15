@@ -293,24 +293,57 @@
 #   break it silently, so a new one is worth running under all three.
 #
 # --list-drivers
-#   Prints population (a) — one `<file>\t<fn>` line per round loop, file
-#   relative to `root`, sorted — and exits 0 without running RULE 1-8. This is
-#   the population's one producer: a caller that needs "which fns are round
-#   loops today" (scripts/lib/debt_report.py's driver group) reads it from
-#   here instead of re-deriving (a1)+(a2) on its own.
+#   Prints population (a) — one `<file>\t<fn>\t<line>` line per round loop,
+#   file relative to `root`, sorted — after the same "found no round loop"
+#   refusal the full gate makes (exit 2): an empty population is a refusal
+#   here too, never a silent empty listing. This is the population's one
+#   producer: a caller that needs "which fns are round loops today"
+#   (scripts/lib/debt_report.py's driver group) reads it from here instead of
+#   re-deriving (a1)+(a2) on its own. The line number is part of the join key
+#   a caller resolves each entry against its own fn scan with — file and fn
+#   name alone collide when two same-named fns live in one file (nested
+#   modules, say).
+#
+# --root <dir>
+#   Scan <dir> instead of this script's own repo root. The one way to point
+#   this gate at a synthetic tree: check_spec_charge_fixtures.sh's `run` /
+#   `run_env`, and debt_report.py's `--list-drivers` caller, both use it.
+#   Everything else here is a constant — a gate whose expectations can be
+#   relaxed from the environment is a gate that passes for whoever sets them
+#   (see "the census cannot be waived from the environment" below).
+#
+# An argument this scan does not recognise is refused (exit 2) rather than
+# read as the default invocation — `--list-driver`, one letter short, used to
+# run the full gate silently.
 
 set -uo pipefail
 
-list_drivers=0
-if [ "${1:-}" = "--list-drivers" ]; then
-  list_drivers=1
-  shift
-fi
+note() { printf '%s\n' "$*" >&2; }
 
-# The only variable here: the fixtures point the scan at a synthetic root. The
-# rules themselves are constants — a gate whose expectations can be relaxed from
-# the environment is a gate that passes for whoever sets them.
-root="${SPEC_CHARGE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+list_drivers=0
+custom_root=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --list-drivers)
+      list_drivers=1
+      shift
+      ;;
+    --root)
+      if [ $# -lt 2 ]; then
+        note "check-spec-charge: --root needs a directory argument."
+        exit 2
+      fi
+      custom_root="$2"
+      shift 2
+      ;;
+    *)
+      note "check-spec-charge: unknown argument: $1"
+      exit 2
+      ;;
+  esac
+done
+
+root="${custom_root:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 loops_dir="$root/crates/rmlx-models/src/speculative"
 
 readonly WANT_CENSUS="charge_phases:3 false:4"
@@ -318,8 +351,6 @@ readonly WANT_SITES=7
 
 fail=0
 scan_error=0
-
-note() { printf '%s\n' "$*" >&2; }
 
 if [ ! -d "$loops_dir" ]; then
   note "check-spec-charge: no speculative source directory at ${loops_dir#"$root"/}"
@@ -335,6 +366,7 @@ fi
 #   5 rollbacks    10 RoundCfg parameter  15 binding of the fn's token
 #                                         16 parameter names
 #                                         17 tokens, space-joined
+#                                         18 fn start line (1-based)
 #
 # A token of `?` is a site whose value this scan could not read back — reported
 # as a scan error rather than skipped, because an unread site is exactly the one
@@ -367,6 +399,7 @@ records=$(
       function addtok(t) { if (!(t in toks)) { toks[t] = 1 } }
       function reset() {
         in_sig = 0; awaiting_body = 0; in_body = 0; in_call = 0; fname = ""
+        fn_line = 0
         depth = 0; paren = 0; args = ""; has_step = 0; has_stats = 0
         nroll = 0; nrec = 0; nlow = 0; nemit = 0; ntarget = 0
         cfg_param = ""; cfg_seen = 0; cfg_dup = 0; cfg_form = "-"
@@ -466,11 +499,11 @@ records=$(
           for (t in toks) { joined = (joined == "") ? t : joined " " t }
           plist = ""
           for (t in params) { plist = (plist == "") ? t : plist " " t }
-          printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n", \
+          printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%d\n", \
             FILENAME, fname, has_step, has_stats, nroll, nrec, nlow, nemit, \
             ntarget, typed_param(cfg_seen, cfg_param, cfg_dup), cfg_form, \
             typed_param(ctx_seen, ctx_param, ctx_dup), \
-            makes_cfg, cfg_written, bindinfo(), (plist == "" ? "-" : plist), joined
+            makes_cfg, cfg_written, bindinfo(), (plist == "" ? "-" : plist), joined, fn_line
         }
         reset()
       }
@@ -492,6 +525,7 @@ records=$(
         sub(/^.*fn[[:space:]]+/, "", line)
         sub(/[^A-Za-z0-9_].*$/, "", line)
         fname = line
+        fn_line = FNR
         in_sig = 1
         paren = 0
       }
@@ -674,12 +708,20 @@ records=$(
 # (a) round loops: the driver signature and a `RoundTotals`.
 loops=$(printf '%s\n' "$records" | awk -F'\t' '$3 == 1 && $4 == 1')
 
+if [ -z "$loops" ]; then
+  note "check-spec-charge: found no round loop under ${loops_dir#"$root"/}."
+  note "  A round loop is a fn taking \`step_fn: &mut dyn FnMut(&ProbeStep)\` that builds"
+  note "  a \`RoundTotals\`. Either both were renamed out from under this gate or the scan"
+  note "  is broken; a gate that matched nothing must not report a pass."
+  exit 2
+fi
+
 if [ "$list_drivers" = "1" ]; then
   listing=""
-  while IFS=$'\t' read -r file fn _rest; do
+  while IFS=$'\t' read -r file fn fn_line; do
     [ -n "$fn" ] || continue
-    listing="$listing${file#"$root"/}"$'\t'"$fn"$'\n'
-  done <<<"$loops"
+    listing="$listing${file#"$root"/}"$'\t'"$fn"$'\t'"$fn_line"$'\n'
+  done < <(printf '%s\n' "$loops" | awk -F'\t' '{ print $1 "\t" $2 "\t" $18 }')
   printf '%s' "$listing" | grep -v '^$' | LC_ALL=C sort
   exit 0
 fi
@@ -722,14 +764,6 @@ target_strays=$(
 target_loops=$(printf '%s\n' "$records" |
   awk -v rs="$loops_dir/round_stats.rs" -F'\t' '$9 > 0 && $1 == rs && $3 == 1 && $4 == 1')
 
-if [ -z "$loops" ]; then
-  note "check-spec-charge: found no round loop under ${loops_dir#"$root"/}."
-  note "  A round loop is a fn taking \`step_fn: &mut dyn FnMut(&ProbeStep)\` that builds"
-  note "  a \`RoundTotals\`. Either both were renamed out from under this gate or the scan"
-  note "  is broken; a gate that matched nothing must not report a pass."
-  exit 2
-fi
-
 classic_count=0
 forwarded_count=0
 entry_count=0
@@ -745,7 +779,7 @@ report_shadow() {
   note "  nothing in this scan can say which binding governs which site."
 }
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg _form _ctx _mk _wr _bind _params _tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg _form _ctx _mk _wr _bind _params _tokens _fn_line; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` rolls a round's caches back and is"
   note "  not one of the round loops this gate derived. Either the derivation lost a"
@@ -755,7 +789,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _
   scan_error=1
 done <<<"$lost"
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit ntarget _cfg _form _ctx _mk _wr _bind _params _tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit ntarget _cfg _form _ctx _mk _wr _bind _params _tokens _fn_line; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` is a round loop and names the"
   note "  per-round event's target $ntarget time(s). The file that owns the target may"
@@ -774,7 +808,7 @@ while IFS= read -r file; do
   scan_error=1
 done <<<"$target_strays"
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec nlow _nemit _ntarget _cfg _form _ctx _mk _wr _bind _params _tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec nlow _nemit _ntarget _cfg _form _ctx _mk _wr _bind _params _tokens _fn_line; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` makes $nlow call(s) to the low-level"
   note "  rollback beneath \`rollback_round\`. Those take a \`charge\` of their own at a call"
@@ -784,7 +818,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec nlow _nemit _ntarget _c
   scan_error=1
 done <<<"$lowlevel"
 
-while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _form _ctx _mk _wr _bind _params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _form _ctx _mk _wr _bind _params tokens _fn_line; do
   [ -n "$fn" ] || continue
   note "check-spec-charge: ${file#"$root"/}: \`$fn\` writes $nrec \`charged:\` field(s) — $tokens —"
   note "  and is neither a round loop nor an entry that builds one's configuration, so"
@@ -796,7 +830,7 @@ done <<<"$strays"
 
 # RULE 4's new arm: a drafter rolling its own state back carries the decision it
 # was handed, as a field of one of its own parameters.
-while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg _form ctx _mk _wr _bind params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _cfg _form ctx _mk _wr _bind params tokens _fn_line; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   count=$(printf '%s\n' "$tokens" | tr ' ' '\n' | grep -c '[^[:space:]]')
@@ -841,7 +875,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll _nrec _nlow _nemit _ntarget _
 done <<<"$drafter_rollbacks"
 
 # Population (b): the entries.
-while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _form _ctx _mk _wr bind _params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _cfg _form _ctx _mk _wr bind _params tokens _fn_line; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   entry_count=$((entry_count + 1))
@@ -894,7 +928,7 @@ while IFS=$'\t' read -r file fn _sig _stats _nroll nrec _nlow _nemit _ntarget _c
 done <<<"$entries"
 
 # Population (a): the round loops, classic and forwarded.
-while IFS=$'\t' read -r file fn _sig _stats nroll nrec _nlow nemit _ntarget cfg cfg_form _ctx _mk cfg_written bind _params tokens; do
+while IFS=$'\t' read -r file fn _sig _stats nroll nrec _nlow nemit _ntarget cfg cfg_form _ctx _mk cfg_written bind _params tokens _fn_line; do
   [ -n "$fn" ] || continue
   rel="${file#"$root"/}"
   if [ "$cfg" != "-" ]; then

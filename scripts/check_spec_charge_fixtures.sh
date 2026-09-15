@@ -468,7 +468,7 @@ run() {
   local name="$1" want_exit="$2" want_reason="$3"
   cases=$((cases + 1))
   local out rc
-  out="$(SPEC_CHARGE_ROOT="$work/root" bash "$script" 2>&1)"
+  out="$(bash "$script" --root "$work/root" 2>&1)"
   rc=$?
   if [ "$rc" != "$want_exit" ]; then
     printf 'FAIL %s: exit %s, expected %s\n%s\n' "$name" "$rc" "$want_exit" "$out"
@@ -490,7 +490,7 @@ run_env() {
   shift 3
   cases=$((cases + 1))
   local out rc
-  out="$(env "$@" SPEC_CHARGE_ROOT="$work/root" bash "$script" 2>&1)"
+  out="$(env "$@" bash "$script" --root "$work/root" 2>&1)"
   rc=$?
   if [ "$rc" != "$want_exit" ]; then
     printf 'FAIL %s: exit %s, expected %s\n%s\n' "$name" "$rc" "$want_exit" "$out"

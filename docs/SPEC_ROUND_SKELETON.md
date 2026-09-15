@@ -1608,10 +1608,11 @@ cannot fall further and this measurement retires with it: from here the
 population is one fn, and what a future chunk moves is measured over the
 drafters instead.
 
-The second figure **falls**, for the first time in the campaign, and the fall is
-the same 37 lines the two-model impl grew by. Over the six `impl RoundDrafter`
-bodies it reads 956 matched lines over 1045 body lines and 15 pairs at
-`origin/main`, and 919 over 1082 and 15 at this chunk's head. The ten pairs that
+The second figure **falls**, for the first time in the campaign: the matched
+count drops by 37 lines while the two-model impl's own body grows by 45 — two
+different numbers, not one. Over the six `impl RoundDrafter` bodies it reads
+956 matched lines over 1045 body lines and 15 pairs at `origin/main`, and 919
+over 1090 and 15 at this chunk's head. The ten pairs that
 do not involve the two-model drafter read **663 → 663**, unchanged line for
 line; its own five pairs read 293 → 256, each falling — against DFlash 1,
 DFlash 2, EAGLE-3, the assistant and the sidecar at 42, 49, 60, 47 and 58
@@ -1627,8 +1628,5 @@ extractor and convention the report itself uses, callable directly instead of
 re-run by hand per executor. At this chunk's head they read `0 matched lines
 over 282 body lines (1 item(s), 0 pair(s))` for `drivers` — `run_rounds`
 alone, nothing to pair it against — and `919 matched lines over 1090 body
-lines (6 item(s), 15 pair(s))` for `impls`. The matched-line count agrees
-with the 919 measured above; the body-line sum differs by a constant 8 (1090
-against 1082) — a fixed per-tree offset between this extractor's whole-impl-
-block body boundary and whatever ad hoc tool produced the figures above it,
-not a second measurement of the same bodies disagreeing.
+lines (6 item(s), 15 pair(s))` for `impls`, agreeing with the measured
+figures above on both counts.
