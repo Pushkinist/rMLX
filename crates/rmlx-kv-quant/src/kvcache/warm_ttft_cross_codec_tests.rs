@@ -614,6 +614,13 @@ fn mixed_family_mirror_is_built_exactly_when_the_arch_shares_kv() {
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"
 )]
 fn shares_kv_moves_only_the_mixed_machinery() {
+    // The sweep is over every codec, and the rotor K stores read the
+    // process-global QJL toggle at construction. Without the lock, a sibling
+    // test flipping that toggle between this test's two `prefill` calls builds
+    // the two arms under different codecs and the residency comparison fails
+    // on a difference the topology did not cause. Held for the whole sweep,
+    // because the toggle is read per store, not once.
+    let _env = crate::test_utils::env_lock();
     let device = Device::Cpu;
 
     let prefill = |quant: KvQuant, shares_kv: bool| -> KvCache {
