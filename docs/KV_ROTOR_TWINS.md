@@ -265,8 +265,8 @@ Not deleted, and stated so the list is not read as covering them:
 The oracle in §4 is only as good as what it can turn red. Every mutation below
 was applied to the tree, run, and reverted from a pre-mutation snapshot whose
 sha256 was re-verified afterwards. The file names are the **pre-collapse**
-tree's; §11 records the re-run against the unified bodies. "Uncaught" rows are the file's blind spots
-and are restated in the test module doc.
+tree's; §11 records the re-run against the unified bodies. "Uncaught" rows are
+the file's blind spots and are restated in the test module doc.
 
 | # | Edit | Caught by |
 |---|---|---|
@@ -384,6 +384,27 @@ in what they store, not in a constant), and neither was in the before-figure.
 
 `make debt-report`'s file-pair scan no longer reports a rotor row at all; its
 `70.0 %` and `75.2 %` entries went with the deleted files.
+
+### Mutations, re-run against the unified bodies
+
+Four of §8's edits re-applied to the collapsed files, each from a snapshot whose
+sha256 was re-verified after the revert (`git checkout --` is not used: it would
+revert uncommitted work, see the mutation-harness trap).
+
+| # | Edit, on the unified file | Result |
+|---|---|---|
+| §8 M1 | `quant_rotor_v.rs` `append` — encode at `ROTOR3_BITS` instead of `BITS`, i.e. the generic instantiated at the wrong width | RED, 4 of the 5 pin tests, first line `rotor4 decode: rotor: code plane holds 312 words for 24 rows, which need 408` |
+| §8 M3 | `quant_rotor_k.rs` `append` — `make_rotor_table(head_idx, layer_idx, …)`, arguments swapped | RED, the pin **only**: `rotor3_sym @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved` |
+| §8 M8 | `quant_rotor_v.rs` `truncate_to` — `(n - 1).max(0)` | RED, the pin's **truncate** column: `rotor3 @ kv_h=1 head_dim=128: packed store bytes after truncate_to moved` |
+| §8 M7 | `quant_rotor_v.rs` `gpu_append` — `n_groups + 1` | **GREEN — uncaught**, 5 passed, exactly as before the collapse |
+
+M1, M3 and M8 name the 3-bit cell where the pre-collapse run named the 4-bit one,
+which is the collapse working: one body, so either instantiation surfaces it.
+M7 stays uncaught, and it is the answer to "what does no test in the tree catch":
+the ring-side geometry. `gpu_append`, `gpu_packed_view`, the ring-readback branch
+of the two sync helpers, `from_cpu_blocks` and `try_deep_clone` are not reachable
+from a `Device::Cpu` drive, so the CPU pin cannot see them and only
+`make ci-perf`'s GPU suite can.
 
 ### The GPU-ring question, closed by reading the diff
 
