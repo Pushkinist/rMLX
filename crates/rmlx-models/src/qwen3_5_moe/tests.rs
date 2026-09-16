@@ -2066,12 +2066,15 @@ fn integration_qwen3_5_moe_35b() {
 )]
 fn hydrated_tail_produces_identical_output() {
     let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+        println!("SKIP hydrated_tail_produces_identical_output: RMLX_TEST_MODEL_QWEN36 not set");
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
+        println!(
+            "SKIP hydrated_tail_produces_identical_output: model dir not found at {}",
+            model_dir.display()
+        );
         return;
     }
 
@@ -2091,7 +2094,7 @@ fn hydrated_tail_produces_identical_output() {
         "Qwen3_5MoeForConditionalGeneration",
     ];
     if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
+        println!("SKIP hydrated_tail_produces_identical_output: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
         return;
     }
 
@@ -2455,12 +2458,17 @@ fn hydrated_tail_produces_identical_output() {
 )]
 fn hydrated_exact_block_no_tail_not_placeholder() {
     let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+        println!(
+            "SKIP hydrated_exact_block_no_tail_not_placeholder: RMLX_TEST_MODEL_QWEN36 not set"
+        );
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
+        println!(
+            "SKIP hydrated_exact_block_no_tail_not_placeholder: model dir not found at {}",
+            model_dir.display()
+        );
         return;
     }
 
@@ -2479,7 +2487,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
         "Qwen3_5MoeForConditionalGeneration",
     ];
     if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
+        println!("SKIP hydrated_exact_block_no_tail_not_placeholder: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
         return;
     }
 
@@ -2747,12 +2755,15 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
 )]
 fn hydrated_tail_k8v8_equivalence() {
     let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+        println!("SKIP hydrated_tail_k8v8_equivalence: RMLX_TEST_MODEL_QWEN36 not set");
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
+        println!(
+            "SKIP hydrated_tail_k8v8_equivalence: model dir not found at {}",
+            model_dir.display()
+        );
         return;
     }
 
@@ -2771,7 +2782,9 @@ fn hydrated_tail_k8v8_equivalence() {
         "Qwen3_5MoeForConditionalGeneration",
     ];
     if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
+        println!(
+            "SKIP hydrated_tail_k8v8_equivalence: arch \"{arch_str}\" is not a Qwen3.5-MoE arch"
+        );
         return;
     }
 
@@ -3037,12 +3050,17 @@ fn hydrated_tail_k8v8_equivalence() {
 )]
 fn qwen3_5_moe_consume_engine_migration_golden() {
     let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+        println!(
+            "SKIP qwen3_5_moe_consume_engine_migration_golden: RMLX_TEST_MODEL_QWEN36 not set"
+        );
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
+        println!(
+            "SKIP qwen3_5_moe_consume_engine_migration_golden: model dir not found at {}",
+            model_dir.display()
+        );
         return;
     }
     let arch_str = {
@@ -3060,7 +3078,7 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
         "Qwen3_5MoeForConditionalGeneration",
     ];
     if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
+        println!("SKIP qwen3_5_moe_consume_engine_migration_golden: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
         return;
     }
 
