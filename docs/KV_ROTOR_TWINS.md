@@ -356,9 +356,9 @@ The collapse, measured on the branch.
 | Population | + | − | net |
 |---|---|---|---|
 | `crates/rmlx-kv-quant/src/storage/` (source) | 142 | 990 | **−848** |
-| `crates/rmlx-kv-quant/src/storage/` (its `*_tests.rs`) | 232 | 665 | **−433** |
+| `crates/rmlx-kv-quant/src/storage/` (its `*_tests.rs`) | 234 | 667 | **−433** |
 | `crates/rmlx-kv-quant/src/kvcache/update.rs` | 488 | 909 | **−421** |
-| **total** | **862** | **2564** | **−1702** |
+| **total** | **864** | **2566** | **−1702** |
 
 `rotorquant.rs` is +65 / −20 on top, for the two parametric K entries and the
 two collapsed `bits ==` forks. The issue expected roughly −900; the difference
@@ -413,3 +413,51 @@ from a `Device::Cpu` drive, so the CPU pin cannot see them and only
 between the two widths modulo the width token, so the unified body is the same
 code at both instantiations. The 4-bit path takes no route it did not take
 before, and the 3-bit path takes none it did not either.
+
+### The gates, as run
+
+| §5 row | Result |
+|---|---|
+| 2 | `rotor_store_bytes_tests.rs`: 5 passed, 0 failed. The file is untouched in the branch diff — **no pin was re-baselined**. |
+| 4 | The 36-cell served capture re-run and diffed under §10's key: identical in every column except `binary_sha256`, which differs. `exit_code` is `0` and `n_ids` is `200` on both sides. The `none` control is unchanged in all four of its cells. |
+| 6 | The table above. |
+| 7 | §7, rewritten rather than appended to. |
+
+`cargo test -p rmlx-kv-quant` reports 566 passed, 0 failed, 257 ignored before
+the collapse and the same after, five runs on each side. The cell count did not
+fall: the folded test bodies kept one `#[test]` per width.
+
+The CI gates the code chunk owns are green: `make fmt-check`, `make lint`,
+`cargo check --workspace --all-targets`, `make check-doc-source-citations`
+(242 cited paths resolve), `make check-no-inline-tests`,
+`make check-gpu-tests-ignored`, `make check-kv-codec-disposition` (28 codecs
+classified, 17 inert) and `make check-kv-layer-quants`.
+
+### `make ci-perf`
+
+Invoked as `make ci-perf`, in the foreground, on an idle GPU. 88 minutes. No
+test failed in either half.
+
+The census verdict:
+
+```
+shader validation: census matches the pin (scripts/gpu_validation_census.txt)
+```
+
+The GPU suite, per crate, as banner-selected / libtest-passed: `rmlx-audio`
+7 / 7, `rmlx-kv-quant` 253 / 253, `rmlx-kv-ssd` 12 / 12, `rmlx-mlx` 10 / 10,
+`rmlx-models` 100 / 101 — libtest's filters are substrings, so a name that is a
+prefix of another selects both, and the extra cell passed too.
+
+The last two lines, verbatim:
+
+```
+OK: 383 GPU tests passed across 5 workspace member(s), shader validation matches the pinned census. — INCOMPLETE: 24 selected GPU test(s) stood down and 9 further notice(s) named no test; they asserted nothing (listed above)
+ci-perf INCOMPLETE — the GPU suite did not run every gate it names (see above)
+```
+
+Every stand-down names an unset environment variable — `RMLX_TEST_MODEL_QWEN36`,
+or the one-variable drafter case `CLAUDE.md` already records. This is the
+INCOMPLETE the repository ends on today; it is not new, and no stand-down names
+a rotor test. `rmlx-kv-quant`'s 253 are the gate over the ring-side bodies §8's
+M7 showed the CPU pin cannot see, and all 253 passed.
