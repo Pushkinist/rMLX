@@ -1,29 +1,31 @@
-//! Tests for [`QuantRotorV3`].
+//! Tests for [`QuantRotorV`], run at both code widths.
+//!
+//! Every case whose body differs between the widths only in the width token is
+//! one generic body below plus one `#[test]` per width, so the cell count is
+//! the same as when the two widths had their own files.
 #![allow(
     clippy::identity_op,
     reason = "explicit `B * kv_h * seq * head_dim` element counts kept as-is for readability — `1 * 2 * n_tokens * head_dim` mirrors the canonical [B, kv_h, S, D] shape literally"
 )]
 
-use crate::storage::quant_rotor_v3::{QuantRotorV3, ROTOR3_V_BITS};
+use crate::storage::quant_rotor_v::{QuantRotorV, QuantRotorV3, ROTOR3_V_BITS, ROTOR4_V_BITS};
 
-/// Newly-constructed `QuantRotorV3` carries the requested init shape and bit
+/// A newly-constructed store carries the requested init shape and bit
 /// tag; no rotors yet (lazily generated on first append).
-#[test]
-fn quant_rotor_v3_new_carries_shape_and_bits() {
+fn new_carries_shape_and_bits<const BITS: u8>(expect_bits: u8) {
     let shape = vec![1_i32, 2, 0, 96];
-    let qv = QuantRotorV3::new(shape.clone(), 4096, 7);
+    let qv = QuantRotorV::<BITS>::new(shape.clone(), 4096, 7);
     assert_eq!(qv.shape, shape, "shape preserved");
     assert_eq!(qv.max_seq, 4096, "max_seq preserved");
-    assert_eq!(qv.bits, ROTOR3_V_BITS, "bits tag");
+    assert_eq!(qv.bits, expect_bits, "bits tag");
     assert_eq!(qv.layer_idx, 7, "layer_idx preserved");
     assert!(qv.rotors.is_empty(), "rotors empty before first append");
     assert!(qv.blocks.is_empty(), "no blocks before append");
 }
 
 /// First `append` lazily generates the rotor table (`n_groups * 4` f32).
-#[test]
-fn quant_rotor_v3_append_generates_rotor_table() {
-    let mut qv = QuantRotorV3::new(vec![1_i32, 2, 0, 96], 4096, 0);
+fn append_generates_rotor_table<const BITS: u8>() {
+    let mut qv = QuantRotorV::<BITS>::new(vec![1_i32, 2, 0, 96], 4096, 0);
     let n_tokens = 4;
     let head_dim = 96;
     let n: usize = 1 * 2 * n_tokens * head_dim;
@@ -42,9 +44,8 @@ fn quant_rotor_v3_append_generates_rotor_table() {
 }
 
 /// `truncate_to` drops trailing blocks but keeps the rotor table.
-#[test]
-fn quant_rotor_v3_truncate_keeps_rotors() {
-    let mut qv = QuantRotorV3::new(vec![1_i32, 1, 0, 96], 4096, 3);
+fn truncate_keeps_rotors<const BITS: u8>() {
+    let mut qv = QuantRotorV::<BITS>::new(vec![1_i32, 1, 0, 96], 4096, 3);
     let head_dim = 96;
     let new_shape = [1_i32, 1, 4, head_dim as i32];
     let data = vec![0.3_f32; 1 * 1 * 4 * head_dim];
@@ -58,9 +59,8 @@ fn quant_rotor_v3_truncate_keeps_rotors() {
 }
 
 /// `reset` clears blocks but keeps the rotor table.
-#[test]
-fn quant_rotor_v3_reset_keeps_rotors() {
-    let mut qv = QuantRotorV3::new(vec![1_i32, 1, 0, 96], 4096, 2);
+fn reset_keeps_rotors<const BITS: u8>() {
+    let mut qv = QuantRotorV::<BITS>::new(vec![1_i32, 1, 0, 96], 4096, 2);
     let head_dim = 96;
     let new_shape = [1_i32, 1, 4, head_dim as i32];
     let data = vec![0.3_f32; 1 * 1 * 4 * head_dim];
@@ -74,9 +74,8 @@ fn quant_rotor_v3_reset_keeps_rotors() {
 }
 
 /// `byte_size` counts rotors exactly once + accumulated blocks.
-#[test]
-fn quant_rotor_v3_byte_size_counts_rotors_once() {
-    let mut qv = QuantRotorV3::new(vec![1_i32, 1, 0, 96], 4096, 0);
+fn byte_size_counts_rotors_once<const BITS: u8>() {
+    let mut qv = QuantRotorV::<BITS>::new(vec![1_i32, 1, 0, 96], 4096, 0);
     let head_dim = 96;
     let new_shape = [1_i32, 1, 4, head_dim as i32];
     let data = vec![0.5_f32; 1 * 1 * 4 * head_dim];
@@ -101,9 +100,8 @@ fn quant_rotor_v3_byte_size_counts_rotors_once() {
 }
 
 /// `try_deep_clone` clones rotors + blocks + meta.
-#[test]
-fn quant_rotor_v3_deep_clone() {
-    let mut qv = QuantRotorV3::new(vec![1_i32, 1, 0, 96], 4096, 1);
+fn deep_clone<const BITS: u8>(expect_bits: u8) {
+    let mut qv = QuantRotorV::<BITS>::new(vec![1_i32, 1, 0, 96], 4096, 1);
     let head_dim = 96;
     let new_shape = [1_i32, 1, 2, head_dim as i32];
     let data = vec![0.1_f32; 1 * 1 * 2 * head_dim];
@@ -115,6 +113,7 @@ fn quant_rotor_v3_deep_clone() {
     assert_eq!(cloned.blocks.len(), qv.blocks.len());
     assert_eq!(cloned.blocks[0].codes, qv.blocks[0].codes);
     assert_eq!(cloned.layer_idx, qv.layer_idx);
+    assert_eq!(cloned.bits, expect_bits, "bits tag preserved in clone");
 }
 
 /// Multi-append with `kv_h > 1` must match a single-shot append of the
@@ -122,8 +121,7 @@ fn quant_rotor_v3_deep_clone() {
 /// rotor table is group-position-keyed (not token), so the seq-major reorder
 /// leaves it correctly associated. Per-(head, token, dim) distinct values
 /// surface any head transposition as a large error.
-#[test]
-fn quant_rotor_v3_multi_append_matches_single_shot_gqa() {
+fn multi_append_matches_single_shot_gqa<const BITS: u8>() {
     let kv_h = 3_usize;
     let head_dim = 96_usize;
     let chunk_a = 2_usize;
@@ -145,7 +143,7 @@ fn quant_rotor_v3_multi_append_matches_single_shot_gqa() {
         out
     };
     // Same layer_idx so both caches share the same static rotor table.
-    let mut qref = QuantRotorV3::new(vec![1, kv_h as i32, 0, head_dim as i32], 64, 7);
+    let mut qref = QuantRotorV::<BITS>::new(vec![1, kv_h as i32, 0, head_dim as i32], 64, 7);
     qref.append(
         &build(0, s_total),
         &[1, kv_h as i32, s_total as i32, head_dim as i32],
@@ -153,7 +151,7 @@ fn quant_rotor_v3_multi_append_matches_single_shot_gqa() {
     .unwrap();
     let reference = qref.dequant().unwrap();
 
-    let mut qv = QuantRotorV3::new(vec![1, kv_h as i32, 0, head_dim as i32], 64, 7);
+    let mut qv = QuantRotorV::<BITS>::new(vec![1, kv_h as i32, 0, head_dim as i32], 64, 7);
     qv.append(
         &build(0, chunk_a),
         &[1, kv_h as i32, chunk_a as i32, head_dim as i32],
@@ -173,9 +171,8 @@ fn quant_rotor_v3_multi_append_matches_single_shot_gqa() {
         .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
     assert!(
         max_abs < 1.0,
-        "rotor3 multi-append vs single-shot max_abs_err = {max_abs:.6} (>= 1.0) — head↔seq scramble"
+        "rotor{BITS} multi-append vs single-shot max_abs_err = {max_abs:.6} (>= 1.0) — head↔seq scramble"
     );
-    let _ = ROTOR3_V_BITS;
 }
 
 /// Falsifies #284: at `kv_h > 1`, `truncate_to(n)` must keep exactly the
@@ -193,8 +190,7 @@ fn quant_rotor_v3_multi_append_matches_single_shot_gqa() {
 /// Mutation check: reverting `truncate_to` to compare
 /// `acc + blk.n_tokens <= n as usize` (raw, not row-scaled) makes the
 /// `kv_h > 1` case RED — `blocks.len()` drops and `dequant()` returns `Err`.
-#[test]
-fn quant_rotor_v3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+fn truncate_to_kv_h_gt_1_keeps_exact_prefix<const BITS: u8>() {
     let head_dim = 96_usize;
     let total_tokens = 4_usize;
     let keep_tokens = 2_usize;
@@ -214,7 +210,8 @@ fn quant_rotor_v3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
         };
         let new_shape = [1_i32, kv_h as i32, 1, head_dim as i32];
 
-        let mut store = QuantRotorV3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64, 5);
+        let mut store =
+            QuantRotorV::<BITS>::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64, 5);
         for tok in 0..total_tokens {
             store.append(&token_data(tok), &new_shape).unwrap();
         }
@@ -246,7 +243,8 @@ fn quant_rotor_v3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
             .dequant()
             .expect("dequant must succeed after truncate at kv_h>1 (#284)");
 
-        let mut reference = QuantRotorV3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64, 5);
+        let mut reference =
+            QuantRotorV::<BITS>::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64, 5);
         for tok in 0..keep_tokens {
             reference.append(&token_data(tok), &new_shape).unwrap();
         }
@@ -444,17 +442,17 @@ fn quant_rotor_v3_truncate_at_b_gt_1_stays_loud() {
 /// what makes it the oracle here.
 ///
 /// Mutation check: put `seq_layout::transpose_seq_heads` over the whole
-/// concatenation back in `QuantRotorV3::dequant` and this goes red at
+/// concatenation back in `QuantRotorV::dequant` and this goes red at
 /// `b = 2` while staying green at `b = 1` — which is how the defect stayed
 /// invisible.
-#[test]
-fn quant_rotor_v3_two_block_decode_matches_one_block_at_b_gt_1() {
+fn two_block_decode_matches_one_block_at_b_gt_1<const BITS: u8>() {
     for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
         let head_dim = 96_usize;
         let (n0, n1) = (2_usize, 3_usize);
         let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
 
-        let mut one = QuantRotorV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512, 5);
+        let mut one =
+            QuantRotorV::<BITS>::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512, 5);
         one.append(
             &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0 + n1, head_dim),
             &shape(n0 + n1),
@@ -462,7 +460,8 @@ fn quant_rotor_v3_two_block_decode_matches_one_block_at_b_gt_1() {
         .expect("single append");
         let oracle = one.dequant().expect("one-block dequant");
 
-        let mut two = QuantRotorV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512, 5);
+        let mut two =
+            QuantRotorV::<BITS>::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512, 5);
         two.append(
             &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0, head_dim),
             &shape(n0),
@@ -480,4 +479,96 @@ fn quant_rotor_v3_two_block_decode_matches_one_block_at_b_gt_1() {
             "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}"
         );
     }
+}
+
+// ── One `#[test]` per width over the generic bodies above ─────────────
+
+#[test]
+fn quant_rotor_v3_new_carries_shape_and_bits() {
+    new_carries_shape_and_bits::<3>(ROTOR3_V_BITS);
+}
+
+#[test]
+fn quant_rotor_v4_new_carries_shape_and_bits() {
+    new_carries_shape_and_bits::<4>(ROTOR4_V_BITS);
+}
+
+#[test]
+fn quant_rotor_v3_append_generates_rotor_table() {
+    append_generates_rotor_table::<3>();
+}
+
+#[test]
+fn quant_rotor_v4_append_generates_rotor_table() {
+    append_generates_rotor_table::<4>();
+}
+
+#[test]
+fn quant_rotor_v3_truncate_keeps_rotors() {
+    truncate_keeps_rotors::<3>();
+}
+
+#[test]
+fn quant_rotor_v4_truncate_keeps_rotors() {
+    truncate_keeps_rotors::<4>();
+}
+
+#[test]
+fn quant_rotor_v3_reset_keeps_rotors() {
+    reset_keeps_rotors::<3>();
+}
+
+#[test]
+fn quant_rotor_v4_reset_keeps_rotors() {
+    reset_keeps_rotors::<4>();
+}
+
+#[test]
+fn quant_rotor_v3_byte_size_counts_rotors_once() {
+    byte_size_counts_rotors_once::<3>();
+}
+
+#[test]
+fn quant_rotor_v4_byte_size_counts_rotors_once() {
+    byte_size_counts_rotors_once::<4>();
+}
+
+#[test]
+fn quant_rotor_v3_deep_clone() {
+    deep_clone::<3>(ROTOR3_V_BITS);
+}
+
+#[test]
+fn quant_rotor_v4_deep_clone() {
+    deep_clone::<4>(ROTOR4_V_BITS);
+}
+
+#[test]
+fn quant_rotor_v3_multi_append_matches_single_shot_gqa() {
+    multi_append_matches_single_shot_gqa::<3>();
+}
+
+#[test]
+fn quant_rotor_v4_multi_append_matches_single_shot_gqa() {
+    multi_append_matches_single_shot_gqa::<4>();
+}
+
+#[test]
+fn quant_rotor_v3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+    truncate_to_kv_h_gt_1_keeps_exact_prefix::<3>();
+}
+
+#[test]
+fn quant_rotor_v4_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+    truncate_to_kv_h_gt_1_keeps_exact_prefix::<4>();
+}
+
+#[test]
+fn quant_rotor_v3_two_block_decode_matches_one_block_at_b_gt_1() {
+    two_block_decode_matches_one_block_at_b_gt_1::<3>();
+}
+
+#[test]
+fn quant_rotor_v4_two_block_decode_matches_one_block_at_b_gt_1() {
+    two_block_decode_matches_one_block_at_b_gt_1::<4>();
 }

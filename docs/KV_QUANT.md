@@ -2705,7 +2705,8 @@ overhead.
 
 **Sequence-major buffer layout (whole Iso / Rotor family).** Every `Vec<Blocks>`
 rotation-KV codec — `QuantIsoV3` / `QuantIsoV4`, `QuantIsoK3` / `QuantIsoK4`,
-`QuantRotorV3` / `QuantRotorV4`, `QuantRotorK3` / `QuantRotorK4` — accumulates
+`QuantRotorV<BITS>` (`QuantRotorV3` / `QuantRotorV4`), `QuantRotorK<BITS>`
+(`QuantRotorK3` / `QuantRotorK4`) — accumulates
 one `*Blocks` entry per `append` and concatenates them on `dequant`. Because
 the caller reshapes the concatenation head-major `[B, kv_h, S, D]`, a head-major
 per-block store transposes per-head values across a multi-append GQA cache
@@ -2913,7 +2914,7 @@ iso3 / iso4). Tests are `#[ignore]`-gated:
 |---|---|
 | Clifford module (`crate::clifford`) | Done (compile-time `MUL_TABLE`, sandwich, random rotor table) |
 | CPU encode/decode (`crate::rotorquant`) | Done (single-codebook, planar3 / iso3 pack convention) |
-| `KvStorage::RotorV3` variant + `QuantRotorV3` storage struct | Done (static rotors + per-token blocks; rotors counted once in `byte_size`) |
+| `KvStorage::RotorV3` variant + `QuantRotorV3` storage struct (`QuantRotorV<3>`) | Done (static rotors + per-token blocks; rotors counted once in `byte_size`) |
 | `KvQuant::Rotor3` + `CacheType::Rotor3` | Done (with `rotor3` / `rotor_v_3` dual-spelling parse) |
 | `KvCache::update_rotor3` decode dispatch | Done |
 | SDPA dispatch wiring | Done (dequant-then-SDPA legacy fallback, mirrors iso3) |
@@ -2976,17 +2977,18 @@ codebook and packing:
 | `head_dim` constraint | None — same tail-padding as rotor3 |
 | MSL kernel | **Yes** — `rotorquant_msl.rs`, shared with rotor3 via `rotor_quantize_v{3,4}_gpu` / `rotor_dequantize_v{3,4}_gpu` |
 
-**Fork pattern.** `QuantRotorV4` is a fork of `QuantRotorV3` with `bits=4`
-and `rotor4_encode`/`rotor4_decode` from `crate::rotorquant`. `RotorBlocks`
-is bits-agnostic and shared. The encode/decode functions are the only
-variant-specific code.
+**One type, two widths.** `QuantRotorV4` and `QuantRotorV3` are aliases of
+`QuantRotorV<4>` and `QuantRotorV<3>`: one const-generic store that encodes and
+decodes through `rotor_encode` / `rotor_decode` at its own `BITS`. `RotorBlocks`
+is bits-agnostic and shared. The code width is the only thing that differs
+between the two spellings.
 
 **Wire-up status:**
 
 | Component | Status |
 |---|---|
 | CPU encode/decode (`crate::rotorquant`) | Done (`rotor4_encode` / `rotor4_decode` with 4-bit pack and 16-centroid codebook) |
-| `KvStorage::RotorV4` variant + `QuantRotorV4` storage struct | Done (mirrors RotorV3; rotors counted once in `byte_size`) |
+| `KvStorage::RotorV4` variant + `QuantRotorV4` storage struct | Done (`QuantRotorV<4>`, the same store as RotorV3 at 4 bits; rotors counted once in `byte_size`) |
 | `KvQuant::Rotor4` + `CacheType::Rotor4` | Done (with `rotor4` / `rotor_v_4` dual-spelling parse) |
 | `KvCache::update_rotor4` decode dispatch | Done |
 | SDPA dispatch wiring | Done (dequant-then-SDPA legacy fallback, mirrors rotor3) |
@@ -4876,7 +4878,7 @@ same position. So the planner drops the block there and lets the reconciliation
 guard report the gap. `sdpa::rotor_flash_shape_ok` refuses `b != 1` separately,
 because the GPU ring's per-step stride does not interleave batch — which is also
 why a `b > 1` store never has a ring to rebuild from. Pinned by
-`quant_rotor_v3_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`.
+`quant_rotor_v_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`.
 
 Reading the *concatenation* of the blocks used to be a second, independent bound
 and is no longer one. Every store ended `dequant` with
@@ -4925,8 +4927,8 @@ implementation per block type, so the unit conversion and the split are defined
 once rather than re-derived per codec. Tests: `storage/truncate_plan_tests.rs`
 (planner + a payload-carrying fake block, including the `b > 1` refusal and the
 non-row-divisible refusal), and one store-level round trip per block type in
-`quant_rotor_k3_tests.rs` (`RotorKBlocks`, QJL sideband on),
-`quant_rotor_v3_tests.rs` (`RotorBlocks`) and `quant_iso_v_tests.rs`
+`quant_rotor_k_tests.rs` (`RotorKBlocks`, QJL sideband on),
+`quant_rotor_v_tests.rs` (`RotorBlocks`) and `quant_iso_v_tests.rs`
 (`IsoBlocks`, quaternion sideband).
 
 **Scope — every CPU-side store now cuts, and every one of them is loud.** The
@@ -5270,7 +5272,7 @@ sandwich runs once per Cl(3,0) block per axis rather than once per lane.
   counters; reuses the sibling's header builder.
 * `crates/rmlx-kv-quant/src/metal/rotor_flash_decode_symv_p1.metal` — pass-1
   body (one body for both bit widths). Pass-2 is the shared LSE merge.
-* `crates/rmlx-kv-quant/src/storage/quant_rotor_v{3,4}.rs` — the V stores gain
+* `crates/rmlx-kv-quant/src/storage/quant_rotor_v.rs` — the V store gains
   the same `QuantKGpuRing` the K stores carry, fed via `RingFeed::Maintain` from
   the symmetric append.
 * `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_rotor_sym_fused` —

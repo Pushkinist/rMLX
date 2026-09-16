@@ -14,7 +14,7 @@ use rmlx_mlx::{zeros, Array, Device, Dtype};
 
 use crate::storage::{
     iso_n_groups_for, IsoBlocks, KvStorage, QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK,
-    QuantKTurbo3, QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorV3, QuantRotorV4, QuantV,
+    QuantKTurbo3, QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorK, QuantRotorV, QuantV,
     RotorBlocks, RotorKBlocks, ISO_K3_BITS, ISO_K4_BITS,
 };
 use crate::turbo_flash_msl::{turbo_flash_sdpa, turbo_flash_should_run};
@@ -375,32 +375,28 @@ fn collapse_group_norms_to_token(
 }
 
 /// Ensure `vs.rotors` is initialised for `head_dim` (mirrors the lazy-init
-/// branch inside [`QuantRotorV3::append`] / [`QuantRotorV4::append`]).
+/// branch inside [`QuantRotorV::append`]).
 ///
 /// The CPU `append` lazy-inits the rotor table on first call; the GPU path
 /// bypasses that, so the helpers below seed the table once before dispatch.
-fn ensure_v3_rotors(vs: &mut QuantRotorV3, head_dim: usize) {
+///
+/// The group size is the same at every rotor width, so this reads the same
+/// constant whatever `BITS` is.
+fn ensure_rotor_v_table<const BITS: u8>(vs: &mut QuantRotorV<BITS>, head_dim: usize) {
     if vs.rotors.is_empty() {
         let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
         vs.rotors = crate::clifford::make_rotor_table(vs.layer_idx, vs.head_idx, n_groups);
     }
 }
 
-fn ensure_v4_rotors(vs: &mut QuantRotorV4, head_dim: usize) {
-    if vs.rotors.is_empty() {
-        let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
-        vs.rotors = crate::clifford::make_rotor_table(vs.layer_idx, vs.head_idx, n_groups);
-    }
-}
-
-/// The CPU `QuantRotorK3::append` couples rotor-table init with QJL
+/// The CPU `QuantRotorK::append` couples rotor-table init with QJL
 /// projection-matrix init under a single `if self.rotors.is_empty()` guard.
 /// The GPU encode path bypasses that `append`, so seed both here too —
 /// otherwise a mid-run CPU fallback after a GPU first-chunk would find
 /// `rotors` non-empty, skip QJL init, and silently encode without QJL. We
 /// always seed when `rotor_qjl_enabled()` is true; the GPU encode itself
 /// ignores the JL projection, so this is harmless on the pure-GPU path.
-fn ensure_k3_rotors(ks: &mut crate::storage::QuantRotorK3, head_dim: usize) {
+fn ensure_rotor_k_table<const BITS: u8>(ks: &mut QuantRotorK<BITS>, head_dim: usize) {
     if ks.rotors.is_empty() {
         let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
         ks.rotors = crate::clifford::make_rotor_table(ks.layer_idx, ks.head_idx, n_groups);
@@ -410,37 +406,17 @@ fn ensure_k3_rotors(ks: &mut crate::storage::QuantRotorK3, head_dim: usize) {
     }
 }
 
-/// See [`ensure_k3_rotors`] for the QJL-init coupling rationale.
-fn ensure_k4_rotors(ks: &mut crate::storage::QuantRotorK4, head_dim: usize) {
-    if ks.rotors.is_empty() {
-        let n_groups = head_dim.div_ceil(crate::rotorquant::ROTOR3_GROUP_SIZE);
-        ks.rotors = crate::clifford::make_rotor_table(ks.layer_idx, ks.head_idx, n_groups);
-        if crate::rotor_qjl::rotor_qjl_enabled() && ks.qjl_s_matrix.is_none() {
-            ks.qjl_s_matrix = Some(crate::rotorquant::make_qjl_projection(head_dim));
-        }
-    }
-}
-
-/// Push a pre-built [`RotorBlocks`] onto a [`QuantRotorV3`] buffer and update
-/// `vs.shape` the same way [`QuantRotorV3::append`] does.
+/// Push a pre-built [`RotorBlocks`] onto a [`QuantRotorV`] buffer and update
+/// `vs.shape` the same way [`QuantRotorV::append`] does.
 #[allow(
     clippy::indexing_slicing,
     reason = "vs.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
 )]
-fn push_rotor3_v_block(vs: &mut QuantRotorV3, block: RotorBlocks, new_shape: &[i32]) {
-    vs.blocks.push(block);
-    if vs.shape.len() != 4 || vs.shape[0] == 0 {
-        vs.shape = new_shape.to_vec();
-    } else {
-        vs.shape[2] += new_shape[2];
-    }
-}
-
-#[allow(
-    clippy::indexing_slicing,
-    reason = "vs.shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
-)]
-fn push_rotor4_v_block(vs: &mut QuantRotorV4, block: RotorBlocks, new_shape: &[i32]) {
+fn push_rotor_v_block<const BITS: u8>(
+    vs: &mut QuantRotorV<BITS>,
+    block: RotorBlocks,
+    new_shape: &[i32],
+) {
     vs.blocks.push(block);
     if vs.shape.len() != 4 || vs.shape[0] == 0 {
         vs.shape = new_shape.to_vec();
@@ -465,27 +441,11 @@ fn bump_rotor_k_shape(shape: &mut Vec<i32>, new_shape: &[i32]) {
     }
 }
 
-/// Push a pre-built [`RotorBlocks`] onto a [`QuantRotorK3`] buffer (QJL OFF
+/// Push a pre-built [`RotorBlocks`] onto a [`QuantRotorK`] buffer (QJL OFF
 /// path — caller has already verified [`crate::rotor_qjl::rotor_qjl_enabled`]
 /// is `false`).
-fn push_rotor3_k_block(
-    ks: &mut crate::storage::QuantRotorK3,
-    block: RotorBlocks,
-    new_shape: &[i32],
-) {
-    ks.blocks.push(RotorKBlocks {
-        codes: block.codes,
-        scales: block.scales,
-        norms: block.norms,
-        qjl_codes: Vec::new(),
-        qjl_norms: Vec::new(),
-        n_tokens: block.n_tokens,
-    });
-    bump_rotor_k_shape(&mut ks.shape, new_shape);
-}
-
-fn push_rotor4_k_block(
-    ks: &mut crate::storage::QuantRotorK4,
+fn push_rotor_k_block<const BITS: u8>(
+    ks: &mut QuantRotorK<BITS>,
     block: RotorBlocks,
     new_shape: &[i32],
 ) {
@@ -520,8 +480,8 @@ fn head_dim_from_shape(new_shape: &[i32], ctx: &str) -> Result<usize> {
     Ok(d as usize)
 }
 
-/// V-side convenience wrapper: GPU-encode + push onto a [`QuantRotorV3`]
-/// buffer. Lazy-inits the rotor table on first call.
+/// V-side convenience wrapper: GPU-encode + push onto a [`QuantRotorV`]
+/// buffer at the store's own width. Lazy-inits the rotor table on first call.
 ///
 /// `feed` decides whether the GPU ring is maintained — see [`RingFeed`]. Only
 /// the symmetric codecs have a kernel that reads the V ring; the V-only rotor
@@ -532,34 +492,29 @@ fn head_dim_from_shape(new_shape: &[i32], ctx: &str) -> Result<usize> {
 /// contract as the K-side sibling. Ignored when `feed` is `Skip`.
 ///
 /// The chunk is reordered head-major -> sequence-major before encoding, exactly
-/// as the CPU `QuantRotorV3::append` and the K GPU path already do: the ring and
+/// as the CPU `QuantRotorV::append` and the K GPU path already do: the ring and
 /// `dequant()` both read sequence-major, so a multi-token chunk with `kv_h > 1`
 /// must not be encoded head-major. For the decode step (`S == 1`) the reorder is
 /// the identity.
-fn rotor3_gpu_append_into_blocks(
-    vs: &mut QuantRotorV3,
+fn rotor_gpu_append_into_v_blocks<const BITS: u8>(
+    vs: &mut QuantRotorV<BITS>,
     new_v: &Array,
     new_shape: &[i32],
     device: Device,
     feed: RingFeed,
     max_seq: i32,
 ) -> Result<()> {
-    let head_dim = head_dim_from_shape(new_shape, "rotor3_gpu_append_into_blocks")?;
-    ensure_v3_rotors(vs, head_dim);
+    let head_dim = head_dim_from_shape(new_shape, "rotor_gpu_append_into_v_blocks")?;
+    ensure_rotor_v_table(vs, head_dim);
     let seq_major = packed_k_chunk_seq_major(new_v, new_shape, device)?;
     if is_ring_only_append(feed, new_shape) {
         // Ring-only tail: feed the GPU ring, advance `shape[2]`, and skip the
         // per-step host download + CPU block push. The ring is the source of
         // truth for the decode tail; the blocks are rebuilt on demand at a
         // `dequant()` / SSD-spill boundary (`synced_rotor_v_blocks`). Mirror of
-        // the K-side `rotor3_gpu_append_into_k_blocks`.
-        let gpu = rotor_gpu_encode_ring_only(
-            &seq_major,
-            new_shape,
-            &vs.rotors,
-            crate::rotorquant::ROTOR3_BITS,
-        )?;
-        rotor3_v_sync_ring(
+        // the K-side `rotor_gpu_append_into_k_blocks`.
+        let gpu = rotor_gpu_encode_ring_only(&seq_major, new_shape, &vs.rotors, BITS)?;
+        rotor_v_sync_ring(
             vs,
             &gpu,
             RingFeed::Maintain,
@@ -575,95 +530,26 @@ fn rotor3_gpu_append_into_blocks(
     // (Skip). A ring-only feed that reaches here is a `b > 1` chunk — normalise
     // it to Maintain so the shared ring feeder clears the ring for the
     // un-representable batch and the CPU block carries the data.
-    materialize_rotor_v3_ring_tail(vs, device)?;
+    materialize_rotor_v_ring_tail(vs, device)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
         RingFeed::Maintain
     };
-    let (block, gpu) = rotor_gpu_encode_block_retaining(
-        &seq_major,
-        new_shape,
-        &vs.rotors,
-        crate::rotorquant::ROTOR3_BITS,
-    )?;
-    rotor3_v_sync_ring(vs, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
-    push_rotor3_v_block(vs, block, new_shape);
+    let (block, gpu) = rotor_gpu_encode_block_retaining(&seq_major, new_shape, &vs.rotors, BITS)?;
+    rotor_v_sync_ring(vs, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
+    push_rotor_v_block(vs, block, new_shape);
     Ok(())
 }
 
 /// Reconcile a pre-existing ring-only decode tail into `vs.blocks` before a
-/// block-path append — mirror of [`materialize_rotor_k3_ring_tail`]. No-op when
+/// block-path append — mirror of [`materialize_rotor_k_ring_tail`]. No-op when
 /// `blocks` already cover `shape[2]` (the common prefill / V-only case — reads
 /// no GPU).
-fn materialize_rotor_v3_ring_tail(vs: &mut QuantRotorV3, device: Device) -> Result<()> {
-    if !vs.gpu.is_allocated() {
-        return Ok(());
-    }
-    let rebuilt = match crate::storage::synced_rotor_v_blocks(
-        &vs.blocks, &vs.shape, &vs.gpu, vs.bits, device,
-    )? {
-        std::borrow::Cow::Owned(full) => Some(full),
-        std::borrow::Cow::Borrowed(_) => None,
-    };
-    if let Some(full) = rebuilt {
-        vs.blocks = full;
-    }
-    Ok(())
-}
-
-/// Mirror of [`rotor3_gpu_append_into_blocks`] for [`QuantRotorV4`].
-fn rotor4_gpu_append_into_blocks(
-    vs: &mut QuantRotorV4,
-    new_v: &Array,
-    new_shape: &[i32],
+fn materialize_rotor_v_ring_tail<const BITS: u8>(
+    vs: &mut QuantRotorV<BITS>,
     device: Device,
-    feed: RingFeed,
-    max_seq: i32,
 ) -> Result<()> {
-    let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_blocks")?;
-    ensure_v4_rotors(vs, head_dim);
-    let seq_major = packed_k_chunk_seq_major(new_v, new_shape, device)?;
-    if is_ring_only_append(feed, new_shape) {
-        // Ring-only tail — see [`rotor3_gpu_append_into_blocks`].
-        let gpu = rotor_gpu_encode_ring_only(
-            &seq_major,
-            new_shape,
-            &vs.rotors,
-            crate::rotorquant::ROTOR4_BITS,
-        )?;
-        rotor4_v_sync_ring(
-            vs,
-            &gpu,
-            RingFeed::Maintain,
-            new_shape,
-            head_dim,
-            max_seq,
-            device,
-        )?;
-        bump_rotor_k_shape(&mut vs.shape, new_shape);
-        return Ok(());
-    }
-    // Block path — see [`rotor3_gpu_append_into_blocks`].
-    materialize_rotor_v4_ring_tail(vs, device)?;
-    let block_feed = if feed == RingFeed::Skip {
-        RingFeed::Skip
-    } else {
-        RingFeed::Maintain
-    };
-    let (block, gpu) = rotor_gpu_encode_block_retaining(
-        &seq_major,
-        new_shape,
-        &vs.rotors,
-        crate::rotorquant::ROTOR4_BITS,
-    )?;
-    rotor4_v_sync_ring(vs, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
-    push_rotor4_v_block(vs, block, new_shape);
-    Ok(())
-}
-
-/// Mirror of [`materialize_rotor_v3_ring_tail`] for [`QuantRotorV4`].
-fn materialize_rotor_v4_ring_tail(vs: &mut QuantRotorV4, device: Device) -> Result<()> {
     if !vs.gpu.is_allocated() {
         return Ok(());
     }
@@ -679,14 +565,14 @@ fn materialize_rotor_v4_ring_tail(vs: &mut QuantRotorV4, device: Device) -> Resu
     Ok(())
 }
 
-/// V-side mirror of [`rotor3_sync_ring`] for [`QuantRotorV3`].
+/// V-side mirror of [`rotor_k_sync_ring`] for [`QuantRotorV`].
 ///
 /// Same invariant, same `b > 1` skip, same self-healing re-seed — the ring type
 /// and its contract are axis-agnostic. Only ever receives `Maintain` (ring-only
 /// tail and block path both feed the ring) or `Skip` (V-only), so anything other
 /// than `Maintain` clears.
-fn rotor3_v_sync_ring(
-    vs: &mut QuantRotorV3,
+fn rotor_v_sync_ring<const BITS: u8>(
+    vs: &mut QuantRotorV<BITS>,
     gpu: &PackedKEncodedGpu,
     feed: RingFeed,
     new_shape: &[i32],
@@ -699,37 +585,8 @@ fn rotor3_v_sync_ring(
         vs.gpu.clear();
         return Ok(());
     }
-    // Feed BEFORE `push_rotor3_v_block` — the push bumps `vs.shape[2]`, and the
+    // Feed BEFORE `push_rotor_v_block` — the push bumps `vs.shape[2]`, and the
     // ring append needs `prev_seq`, the length before this chunk.
-    let prev_seq = accumulated_seq(&vs.shape);
-    vs.gpu_append(
-        &gpu.codes,
-        &gpu.scales,
-        &gpu.norms,
-        kv_h,
-        head_dim as i32,
-        prev_seq,
-        new_seq,
-        max_seq,
-        device,
-    )
-}
-
-/// Mirror of [`rotor3_v_sync_ring`] for [`QuantRotorV4`].
-fn rotor4_v_sync_ring(
-    vs: &mut QuantRotorV4,
-    gpu: &PackedKEncodedGpu,
-    feed: RingFeed,
-    new_shape: &[i32],
-    head_dim: usize,
-    max_seq: i32,
-    device: Device,
-) -> Result<()> {
-    let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
-    if feed != RingFeed::Maintain || b != 1 {
-        vs.gpu.clear();
-        return Ok(());
-    }
     let prev_seq = accumulated_seq(&vs.shape);
     vs.gpu_append(
         &gpu.codes,
@@ -824,8 +681,8 @@ const LEGACY_ROTOR_K_ONLY_FEED: RingFeed = RingFeed::Maintain;
 /// `kv_h * n_groups` and does not interleave batch, so a batched chunk cannot be
 /// laid into it. The CPU blocks (which do handle `b > 1`) stay the source of
 /// truth and the flash dispatcher's own `b == 1` gate keeps the kernel away.
-fn rotor3_sync_ring(
-    ks: &mut crate::storage::QuantRotorK3,
+fn rotor_k_sync_ring<const BITS: u8>(
+    ks: &mut QuantRotorK<BITS>,
     gpu: &PackedKEncodedGpu,
     feed: RingFeed,
     new_shape: &[i32],
@@ -854,55 +711,26 @@ fn rotor3_sync_ring(
     )
 }
 
-/// Mirror of [`rotor3_sync_ring`] for [`crate::storage::QuantRotorK4`].
-fn rotor4_sync_ring(
-    ks: &mut crate::storage::QuantRotorK4,
-    gpu: &PackedKEncodedGpu,
-    feed: RingFeed,
-    new_shape: &[i32],
-    head_dim: usize,
-    max_seq: i32,
-    device: Device,
-) -> Result<()> {
-    let (b, kv_h, new_seq) = b_kv_h_new_seq(new_shape)?;
-    if feed == RingFeed::Skip || b != 1 {
-        ks.gpu.clear();
-        return Ok(());
-    }
-    let prev_seq = accumulated_seq(&ks.shape);
-    ks.gpu_append(
-        &gpu.codes,
-        &gpu.scales,
-        &gpu.norms,
-        kv_h,
-        head_dim as i32,
-        prev_seq,
-        new_seq,
-        max_seq,
-        device,
-    )
-}
-
 /// K-side convenience wrapper, QJL off only. Caller MUST check
 /// [`crate::rotor_qjl::rotor_qjl_enabled`] returns `false` before invoking
-/// this; with QJL enabled, fall back to the CPU [`QuantRotorK3::append`] path
+/// this; with QJL enabled, fall back to the CPU [`QuantRotorK::append`] path
 /// (the K-side QJL residual is not implemented in MSL — see
 /// `rotorquant_msl.rs`).
 ///
 /// `feed` decides whether the GPU ring is maintained — see [`RingFeed`].
 /// `max_seq` is the window the cache is currently provisioned for, read from
 /// the active `KvStorage` variant by the caller and forwarded to the ring.
-fn rotor3_gpu_append_into_k_blocks(
-    ks: &mut crate::storage::QuantRotorK3,
+fn rotor_gpu_append_into_k_blocks<const BITS: u8>(
+    ks: &mut QuantRotorK<BITS>,
     new_k: &Array,
     new_shape: &[i32],
     device: Device,
     feed: RingFeed,
     max_seq: i32,
 ) -> Result<()> {
-    let head_dim = head_dim_from_shape(new_shape, "rotor3_gpu_append_into_k_blocks")?;
-    ensure_k3_rotors(ks, head_dim);
-    // qjl_s_matrix is seeded inside `ensure_k3_rotors` when `rotor_qjl_enabled()`
+    let head_dim = head_dim_from_shape(new_shape, "rotor_gpu_append_into_k_blocks")?;
+    ensure_rotor_k_table(ks, head_dim);
+    // qjl_s_matrix is seeded inside `ensure_rotor_k_table` when `rotor_qjl_enabled()`
     // is true (mid-run CPU fallback after a GPU first-chunk needs it). The GPU
     // encode itself ignores the JL projection — this path is QJL-off-only by
     // dispatcher contract.
@@ -912,13 +740,8 @@ fn rotor3_gpu_append_into_k_blocks(
         // per-step host download + CPU block push. The ring is the source of
         // truth for the decode tail; the blocks are rebuilt on demand at a
         // `dequant()` / SSD-spill boundary.
-        let gpu = rotor_gpu_encode_ring_only(
-            &seq_major,
-            new_shape,
-            &ks.rotors,
-            crate::rotorquant::ROTOR3_BITS,
-        )?;
-        rotor3_sync_ring(
+        let gpu = rotor_gpu_encode_ring_only(&seq_major, new_shape, &ks.rotors, BITS)?;
+        rotor_k_sync_ring(
             ks,
             &gpu,
             RingFeed::Maintain,
@@ -935,20 +758,15 @@ fn rotor3_gpu_append_into_k_blocks(
     // is a `b > 1` chunk — normalise it to Maintain so the shared ring feeder
     // clears the ring for the un-representable batch and the CPU block carries
     // the data.
-    materialize_rotor_k3_ring_tail(ks, device)?;
+    materialize_rotor_k_ring_tail(ks, device)?;
     let block_feed = if feed == RingFeed::Skip {
         RingFeed::Skip
     } else {
         RingFeed::Maintain
     };
-    let (block, gpu) = rotor_gpu_encode_block_retaining(
-        &seq_major,
-        new_shape,
-        &ks.rotors,
-        crate::rotorquant::ROTOR3_BITS,
-    )?;
-    rotor3_sync_ring(ks, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
-    push_rotor3_k_block(ks, block, new_shape);
+    let (block, gpu) = rotor_gpu_encode_block_retaining(&seq_major, new_shape, &ks.rotors, BITS)?;
+    rotor_k_sync_ring(ks, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
+    push_rotor_k_block(ks, block, new_shape);
     Ok(())
 }
 
@@ -975,8 +793,8 @@ fn rotor3_gpu_append_into_k_blocks(
 /// `dequant` would take exactly this readback itself if `blocks` were left
 /// short. Doing it here instead repairs `blocks` once, so the following chunks
 /// of the same multi-chunk append pay nothing.
-fn materialize_rotor_k3_ring_tail(
-    ks: &mut crate::storage::QuantRotorK3,
+fn materialize_rotor_k_ring_tail<const BITS: u8>(
+    ks: &mut QuantRotorK<BITS>,
     device: Device,
 ) -> Result<()> {
     if !ks.gpu.is_allocated() {
@@ -991,77 +809,6 @@ fn materialize_rotor_k3_ring_tail(
     if let Some(full) = rebuilt {
         ks.blocks = full;
     }
-    Ok(())
-}
-
-/// Mirror of [`materialize_rotor_k3_ring_tail`] for [`crate::storage::QuantRotorK4`].
-fn materialize_rotor_k4_ring_tail(
-    ks: &mut crate::storage::QuantRotorK4,
-    device: Device,
-) -> Result<()> {
-    if !ks.gpu.is_allocated() {
-        return Ok(());
-    }
-    let rebuilt = match crate::storage::synced_rotor_k_blocks(
-        &ks.blocks, &ks.shape, &ks.gpu, ks.bits, device,
-    )? {
-        std::borrow::Cow::Owned(full) => Some(full),
-        std::borrow::Cow::Borrowed(_) => None,
-    };
-    if let Some(full) = rebuilt {
-        ks.blocks = full;
-    }
-    Ok(())
-}
-
-/// Mirror of [`rotor3_gpu_append_into_k_blocks`] for `QuantRotorK4`.
-fn rotor4_gpu_append_into_k_blocks(
-    ks: &mut crate::storage::QuantRotorK4,
-    new_k: &Array,
-    new_shape: &[i32],
-    device: Device,
-    feed: RingFeed,
-    max_seq: i32,
-) -> Result<()> {
-    let head_dim = head_dim_from_shape(new_shape, "rotor4_gpu_append_into_k_blocks")?;
-    ensure_k4_rotors(ks, head_dim);
-    let seq_major = packed_k_chunk_seq_major(new_k, new_shape, device)?;
-    if is_ring_only_append(feed, new_shape) {
-        // Ring-only tail — see [`rotor3_gpu_append_into_k_blocks`].
-        let gpu = rotor_gpu_encode_ring_only(
-            &seq_major,
-            new_shape,
-            &ks.rotors,
-            crate::rotorquant::ROTOR4_BITS,
-        )?;
-        rotor4_sync_ring(
-            ks,
-            &gpu,
-            RingFeed::Maintain,
-            new_shape,
-            head_dim,
-            max_seq,
-            device,
-        )?;
-        bump_rotor_k_shape(&mut ks.shape, new_shape);
-        return Ok(());
-    }
-    // Block path — see [`rotor3_gpu_append_into_k_blocks`] (b>1 ring-only
-    // fallback normalises to Maintain).
-    materialize_rotor_k4_ring_tail(ks, device)?;
-    let block_feed = if feed == RingFeed::Skip {
-        RingFeed::Skip
-    } else {
-        RingFeed::Maintain
-    };
-    let (block, gpu) = rotor_gpu_encode_block_retaining(
-        &seq_major,
-        new_shape,
-        &ks.rotors,
-        crate::rotorquant::ROTOR4_BITS,
-    )?;
-    rotor4_sync_ring(ks, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
-    push_rotor4_k_block(ks, block, new_shape);
     Ok(())
 }
 
@@ -1099,7 +846,7 @@ pub(super) fn rotor3_k_only_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorKOnly3 K buffer absent after init".into()));
     };
-    rotor3_gpu_append_into_k_blocks(
+    rotor_gpu_append_into_k_blocks::<3>(
         ks,
         new_k,
         new_shape,
@@ -1112,7 +859,7 @@ pub(super) fn rotor3_k_only_gpu_append(
     // resident in `blocks` for the whole request on top of the ring that already
     // holds the same packed bytes, inflating the codec's resident KV well above
     // what its own layout costs.
-    drop_blocks_when_ring_live_k3(ks);
+    drop_blocks_when_ring_live_rotor_k(ks);
     Ok(())
 }
 
@@ -1148,7 +895,7 @@ pub(super) fn rotor4_k_only_gpu_append(
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorKOnly4 K buffer absent after init".into()));
     };
-    rotor4_gpu_append_into_k_blocks(
+    rotor_gpu_append_into_k_blocks::<4>(
         ks,
         new_k,
         new_shape,
@@ -1157,7 +904,7 @@ pub(super) fn rotor4_k_only_gpu_append(
         max_seq,
     )?;
     // Ring is the sole resident store — see [`rotor3_k_only_gpu_append`].
-    drop_blocks_when_ring_live_k4(ks);
+    drop_blocks_when_ring_live_rotor_k(ks);
     Ok(())
 }
 
@@ -1198,12 +945,12 @@ pub(super) fn rotor3_sym_gpu_append(
         ));
     }
     if v.is_none() {
-        *v = Some(QuantRotorV3::new(init_shape, max_seq, layer_idx));
+        *v = Some(QuantRotorV::<3>::new(init_shape, max_seq, layer_idx));
     }
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorSym3 K buffer absent after init".into()));
     };
-    rotor3_gpu_append_into_k_blocks(
+    rotor_gpu_append_into_k_blocks::<3>(
         ks,
         new_k,
         new_shape,
@@ -1215,11 +962,11 @@ pub(super) fn rotor3_sym_gpu_append(
     // (the prefill prefix, seeded into the ring on the first fused-decode step).
     // See the note in the V append below; this is what turns the codec's ~34%
     // logical compression into a resident-RAM win.
-    drop_blocks_when_ring_live_k3(ks);
+    drop_blocks_when_ring_live_rotor_k(ks);
     let Some(vs) = v.as_mut() else {
         return Err(Error::Mlx("RotorSym3 V buffer absent after init".into()));
     };
-    rotor3_gpu_append_into_blocks(
+    rotor_gpu_append_into_v_blocks::<3>(
         vs,
         new_v,
         new_shape,
@@ -1232,22 +979,14 @@ pub(super) fn rotor3_sym_gpu_append(
     // from it (`synced_rotor_v_blocks`). A later GPU chunk (spec-verify) takes
     // the block path, which materialises the ring tail before its Skip clear, so
     // no ring-clear ever loses data; a CPU-only run never allocates the ring.
-    drop_blocks_when_ring_live_v3(vs);
+    drop_blocks_when_ring_live_rotor_v(vs);
     Ok(())
 }
 
 /// Drop a rotor K store's CPU blocks once its GPU ring is live — the ring is
 /// then the sole resident copy. No-op until the ring is allocated (before the
 /// first GPU append) or for any store that never feeds a ring.
-fn drop_blocks_when_ring_live_k3(ks: &mut crate::storage::QuantRotorK3) {
-    if ks.gpu.is_allocated() {
-        ks.blocks.clear();
-        ks.blocks.shrink_to_fit();
-    }
-}
-
-/// Mirror of [`drop_blocks_when_ring_live_k3`] for [`QuantRotorK4`].
-fn drop_blocks_when_ring_live_k4(ks: &mut crate::storage::QuantRotorK4) {
+fn drop_blocks_when_ring_live_rotor_k<const BITS: u8>(ks: &mut QuantRotorK<BITS>) {
     if ks.gpu.is_allocated() {
         ks.blocks.clear();
         ks.blocks.shrink_to_fit();
@@ -1255,15 +994,7 @@ fn drop_blocks_when_ring_live_k4(ks: &mut crate::storage::QuantRotorK4) {
 }
 
 /// Drop a rotor V store's CPU blocks once its GPU ring is live.
-fn drop_blocks_when_ring_live_v3(vs: &mut QuantRotorV3) {
-    if vs.gpu.is_allocated() {
-        vs.blocks.clear();
-        vs.blocks.shrink_to_fit();
-    }
-}
-
-/// Mirror of [`drop_blocks_when_ring_live_v3`] for [`QuantRotorV4`].
-fn drop_blocks_when_ring_live_v4(vs: &mut QuantRotorV4) {
+fn drop_blocks_when_ring_live_rotor_v<const BITS: u8>(vs: &mut QuantRotorV<BITS>) {
     if vs.gpu.is_allocated() {
         vs.blocks.clear();
         vs.blocks.shrink_to_fit();
@@ -1302,12 +1033,12 @@ pub(super) fn rotor4_sym_gpu_append(
         ));
     }
     if v.is_none() {
-        *v = Some(QuantRotorV4::new(init_shape, max_seq, layer_idx));
+        *v = Some(QuantRotorV::<4>::new(init_shape, max_seq, layer_idx));
     }
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorSym4 K buffer absent after init".into()));
     };
-    rotor4_gpu_append_into_k_blocks(
+    rotor_gpu_append_into_k_blocks::<4>(
         ks,
         new_k,
         new_shape,
@@ -1315,11 +1046,11 @@ pub(super) fn rotor4_sym_gpu_append(
         RingFeed::MaintainRingOnly,
         max_seq,
     )?;
-    drop_blocks_when_ring_live_k4(ks);
+    drop_blocks_when_ring_live_rotor_k(ks);
     let Some(vs) = v.as_mut() else {
         return Err(Error::Mlx("RotorSym4 V buffer absent after init".into()));
     };
-    rotor4_gpu_append_into_blocks(
+    rotor_gpu_append_into_v_blocks::<4>(
         vs,
         new_v,
         new_shape,
@@ -1327,7 +1058,7 @@ pub(super) fn rotor4_sym_gpu_append(
         RingFeed::MaintainRingOnly,
         max_seq,
     )?;
-    drop_blocks_when_ring_live_v4(vs);
+    drop_blocks_when_ring_live_rotor_v(vs);
     Ok(())
 }
 
@@ -1931,7 +1662,7 @@ fn iso4_v_sync_ring(
 
 /// Feed one encoded iso3 chunk into the store's GPU ring.
 ///
-/// `b > 1` is a skip for the same reason [`rotor3_sync_ring`] skips it:
+/// `b > 1` is a skip for the same reason [`rotor_k_sync_ring`] skips it:
 /// [`crate::storage::QuantKGpuRing`]'s per-step stride does not interleave
 /// batch. A skipped feed *clears* rather than leaving a stale ring — see the
 /// [`RingFeed`] invariant.
@@ -3340,7 +3071,8 @@ impl KvCache {
                     shape: init_shape.clone(),
                     max_seq,
                 };
-                let mut qv = QuantRotorV3::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                let mut qv =
+                    QuantRotorV::<3>::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
                 qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
                 qv.append(&v_f32, &new_shape)?;
                 *k = Some(qk);
@@ -3379,7 +3111,8 @@ impl KvCache {
                     shape: init_shape.clone(),
                     max_seq,
                 };
-                let mut qv = QuantRotorV4::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                let mut qv =
+                    QuantRotorV::<4>::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
                 qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
                 qv.append(&v_f32, &new_shape)?;
                 *k = Some(qk);
@@ -3638,7 +3371,8 @@ impl KvCache {
                     init_shape.clone(),
                     layer_idx_u32(self.layer_idx),
                 );
-                let mut qv = QuantRotorV3::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                let mut qv =
+                    QuantRotorV::<3>::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
                 qk.append(&k_f32, &new_shape)?;
                 qv.append(&v_f32, &new_shape)?;
                 *k = Some(qk);
@@ -3673,7 +3407,8 @@ impl KvCache {
                     init_shape.clone(),
                     layer_idx_u32(self.layer_idx),
                 );
-                let mut qv = QuantRotorV4::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                let mut qv =
+                    QuantRotorV::<4>::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
                 qk.append(&k_f32, &new_shape)?;
                 qv.append(&v_f32, &new_shape)?;
                 *k = Some(qk);
@@ -7211,23 +6946,15 @@ impl KvCache {
     /// Rotor3 decode update — K = affine q8_0, V = rotor3
     /// (Cl(3,0) Clifford rotor sandwich + 3-bit Lloyd-Max codebook).
     ///
-    /// Structurally mirrors [`Self::update_iso4`] with the V side bound to
-    /// `QuantRotorV3` instead of `QuantIsoV4`. CPU dequant only — no MSL
-    /// kernel for rotor3 (deferred, see [`crate::rotorquant`] module docs).
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Option is Some by construction immediately above this fn body's assignments"
-    )]
+    /// The body is [`rotor_v_update`] at 3 bits; this entry resolves the
+    /// storage variant and takes the warm-TTFT bf16 shortcut.
     fn update_rotor3(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
         let KvStorage::RotorV3 { k, v, max_seq } = &mut self.storage else {
             return Err(Error::Mlx(format!(
                 "storage mismatch: expected RotorV3, got {}",
@@ -7240,93 +6967,21 @@ impl KvCache {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        let new_shape = new_k.shape();
-
-        // K-side: GPU-capable affine q8_0 (same as iso3 / iso4 / K8V4).
-        // V-side: routes encode through the rotor3 MSL kernel when
-        // `device == Device::Gpu`; CPU encode remains the fallback. This
-        // hot path is shadowed by the warm-TTFT bf16 seed: the GPU encode
-        // fires once at exit_prefill (large `new_v` slice), not per decode step.
-        let k_f32 = if device == Device::Gpu {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_k, device)?
-        };
-        let v_f32 = if device == Device::Gpu {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_v, Device::Cpu)?
-        };
-
-        if k.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *k = Some(QuantK {
-                codes: Vec::new(),
-                scales: Vec::new(),
-                gpu_codes_buf: None,
-                gpu_scales_buf: None,
-                gpu_words_per_step: 0,
-                gpu_scales_per_step: 0,
-                gpu_capacity: 0,
-                shape: init_shape,
-                max_seq,
-            });
-        }
-        let ks = k.as_mut().unwrap();
-        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
-        let k_shape = ks.shape.clone();
-        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
-        let k_full = match k_arr_opt {
-            Some(arr) => arr,
-            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
-        };
-
-        if v.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            // Thread the real model-layer index into the rotor3 seed
-            // so each layer gets a distinct rotor table. The rotor table is
-            // deterministic and persists via SSD round-trip.
-            *v = Some(QuantRotorV3::new(
-                init_shape,
-                max_seq,
-                layer_idx_u32(self.layer_idx),
-            ));
-        }
-        let vs = v.as_mut().unwrap();
-        if device == Device::Gpu {
-            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
-        } else {
-            vs.append(&v_f32, &new_shape)?;
-        }
-        let v_shape = vs.shape.clone();
-        let v_recon_f32 = vs.dequant()?;
-        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
-
-        Ok((k_full, v_full))
+        rotor_v_update::<3>(k, v, max_seq, layer_idx, new_k, new_v, device)
     }
 
     /// Rotor4 decode update — K = affine q8_0, V = rotor4
     /// (Cl(3,0) Clifford rotor sandwich + 4-bit Lloyd-Max codebook).
     ///
-    /// Structurally mirrors [`Self::update_rotor3`] with the V side bound to
-    /// `QuantRotorV4` instead of `QuantRotorV3`. CPU dequant only — no MSL
-    /// kernel for rotor4 (deferred, same rationale as rotor3).
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Option is Some by construction immediately above this fn body's assignments"
-    )]
+    /// The body is [`rotor_v_update`] at 4 bits; this entry resolves the
+    /// storage variant and takes the warm-TTFT bf16 shortcut.
     fn update_rotor4(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
         let KvStorage::RotorV4 { k, v, max_seq } = &mut self.storage else {
             return Err(Error::Mlx(format!(
                 "storage mismatch: expected RotorV4, got {}",
@@ -7339,90 +6994,23 @@ impl KvCache {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        let new_shape = new_k.shape();
-
-        // K-side: GPU-capable affine q8_0 (same as rotor3 / iso3 / iso4 / K8V4).
-        // V-side: routes encode through the rotor4 MSL kernel when
-        // `device == Device::Gpu`; CPU encode remains the fallback. This
-        // hot path is shadowed by the warm-TTFT bf16 seed: the GPU encode
-        // fires once at exit_prefill, not per decode step.
-        let k_f32 = if device == Device::Gpu {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_k, device)?
-        };
-        let v_f32 = if device == Device::Gpu {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_v, Device::Cpu)?
-        };
-
-        if k.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *k = Some(QuantK {
-                codes: Vec::new(),
-                scales: Vec::new(),
-                gpu_codes_buf: None,
-                gpu_scales_buf: None,
-                gpu_words_per_step: 0,
-                gpu_scales_per_step: 0,
-                gpu_capacity: 0,
-                shape: init_shape,
-                max_seq,
-            });
-        }
-        let ks = k.as_mut().unwrap();
-        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
-        let k_shape = ks.shape.clone();
-        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
-        let k_full = match k_arr_opt {
-            Some(arr) => arr,
-            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
-        };
-
-        if v.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            // Thread the real model-layer index into the rotor4 seed
-            // so each layer gets a distinct rotor table. The rotor table is
-            // deterministic and persists via SSD round-trip.
-            *v = Some(QuantRotorV4::new(
-                init_shape,
-                max_seq,
-                layer_idx_u32(self.layer_idx),
-            ));
-        }
-        let vs = v.as_mut().unwrap();
-        if device == Device::Gpu {
-            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
-        } else {
-            vs.append(&v_f32, &new_shape)?;
-        }
-        let v_shape = vs.shape.clone();
-        let v_recon_f32 = vs.dequant()?;
-        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
-
-        Ok((k_full, v_full))
+        rotor_v_update::<4>(k, v, max_seq, layer_idx, new_k, new_v, device)
     }
 
-    /// Rotor3Sym decode update: K and V both quantize through the rotor3
-    /// (Cl(3,0) Clifford rotor) codec (CPU-only). K-side carries the optional
-    /// 1-bit QJL residual sideband when
+    /// Rotor3Sym decode update: K and V both quantize through the
+    /// 3-bit rotor (Cl(3,0) Clifford rotor) codec. The K side carries the
+    /// optional 1-bit QJL residual sideband when
     /// [`crate::rotor_qjl::rotor_qjl_enabled`] is `true` at first append.
     ///
-    /// Structurally mirrors [`Self::update_iso3_sym`] with the codec
-    /// bound to `QuantRotorK3` / `QuantRotorV3` instead of the iso K/V types.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction"
-    )]
+    /// The body is [`rotor_sym_update`] at 3 bits; this entry resolves the
+    /// storage variant and takes the warm-TTFT bf16 shortcut.
     fn update_rotor3_sym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
         let KvStorage::RotorSym3 { k, v, max_seq } = &mut self.storage else {
             return Err(Error::Mlx(format!(
                 "storage mismatch: expected RotorSym3, got {}",
@@ -7435,94 +7023,23 @@ impl KvCache {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        let new_shape = new_k.shape();
-        // GPU encode for both K and V when device == GPU and the store carries
-        // no QJL residual. The QJL decision is sticky to the store (fixed at
-        // first append) — a later process-env toggle must not reinterpret bytes
-        // already written; read the store's own flag, same as the sdpa fast path
-        // and `update_rotor_k_only_*`. Env is the fallback only before the store
-        // exists. With QJL on the K-side falls back to CPU (the GPU kernel cannot
-        // replicate the QJL residual — see rotor_fused_qk_msl.rs).
-        let store_uses_qjl = match k.as_ref() {
-            Some(ks) => ks.use_qjl(),
-            None => crate::rotor_qjl::rotor_qjl_enabled(),
-        };
-        let use_gpu = device == Device::Gpu;
-        let gpu_k_ok = use_gpu && !store_uses_qjl;
-        let k_f32 = if gpu_k_ok {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_k, Device::Cpu)?
-        };
-        let v_f32 = if use_gpu {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_v, Device::Cpu)?
-        };
-
-        if k.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *k = Some(crate::storage::QuantRotorK3::new(
-                init_shape,
-                layer_idx_u32(self.layer_idx),
-            ));
-        }
-        let Some(ks) = k.as_mut() else {
-            return Err(Error::Mlx("RotorSym3 K buffer absent after init".into()));
-        };
-        if gpu_k_ok {
-            rotor3_gpu_append_into_k_blocks(
-                ks,
-                new_k,
-                &new_shape,
-                device,
-                LEGACY_ROTOR_SYM_FEED,
-                max_seq,
-            )?;
-        } else {
-            ks.append(&k_f32, &new_shape)?;
-        }
-        let k_shape = ks.shape.clone();
-        let k_recon_f32 = ks.dequant()?;
-        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
-
-        if v.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *v = Some(QuantRotorV3::new(
-                init_shape,
-                max_seq,
-                layer_idx_u32(self.layer_idx),
-            ));
-        }
-        let Some(vs) = v.as_mut() else {
-            return Err(Error::Mlx("RotorSym3 V buffer absent after init".into()));
-        };
-        if use_gpu {
-            rotor3_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
-        } else {
-            vs.append(&v_f32, &new_shape)?;
-        }
-        let v_shape = vs.shape.clone();
-        let v_recon_f32 = vs.dequant()?;
-        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
-
-        Ok((k_full, v_full))
+        rotor_sym_update::<3>(k, v, max_seq, layer_idx, "RotorSym3", new_k, new_v, device)
     }
 
-    /// Rotor4Sym decode update. Mirror of
-    /// [`Self::update_rotor3_sym`] with `bits=4`.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction"
-    )]
+    /// Rotor4Sym decode update: K and V both quantize through the
+    /// 4-bit rotor (Cl(3,0) Clifford rotor) codec. The K side carries the
+    /// optional 1-bit QJL residual sideband when
+    /// [`crate::rotor_qjl::rotor_qjl_enabled`] is `true` at first append.
+    ///
+    /// The body is [`rotor_sym_update`] at 4 bits; this entry resolves the
+    /// storage variant and takes the warm-TTFT bf16 shortcut.
     fn update_rotor4_sym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
         let KvStorage::RotorSym4 { k, v, max_seq } = &mut self.storage else {
             return Err(Error::Mlx(format!(
                 "storage mismatch: expected RotorSym4, got {}",
@@ -7535,80 +7052,11 @@ impl KvCache {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        let new_shape = new_k.shape();
-        // GPU encode when device == GPU. K-side opts out when the store carries
-        // the QJL residual — read the store's sticky flag, not the live env (see
-        // rotor3_sym mirror).
-        let store_uses_qjl = match k.as_ref() {
-            Some(ks) => ks.use_qjl(),
-            None => crate::rotor_qjl::rotor_qjl_enabled(),
-        };
-        let use_gpu = device == Device::Gpu;
-        let gpu_k_ok = use_gpu && !store_uses_qjl;
-        let k_f32 = if gpu_k_ok {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_k, Device::Cpu)?
-        };
-        let v_f32 = if use_gpu {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_v, Device::Cpu)?
-        };
-
-        if k.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *k = Some(crate::storage::QuantRotorK4::new(
-                init_shape,
-                layer_idx_u32(self.layer_idx),
-            ));
-        }
-        let Some(ks) = k.as_mut() else {
-            return Err(Error::Mlx("RotorSym4 K buffer absent after init".into()));
-        };
-        if gpu_k_ok {
-            rotor4_gpu_append_into_k_blocks(
-                ks,
-                new_k,
-                &new_shape,
-                device,
-                LEGACY_ROTOR_SYM_FEED,
-                max_seq,
-            )?;
-        } else {
-            ks.append(&k_f32, &new_shape)?;
-        }
-        let k_shape = ks.shape.clone();
-        let k_recon_f32 = ks.dequant()?;
-        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
-
-        if v.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *v = Some(QuantRotorV4::new(
-                init_shape,
-                max_seq,
-                layer_idx_u32(self.layer_idx),
-            ));
-        }
-        let Some(vs) = v.as_mut() else {
-            return Err(Error::Mlx("RotorSym4 V buffer absent after init".into()));
-        };
-        if use_gpu {
-            rotor4_gpu_append_into_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
-        } else {
-            vs.append(&v_f32, &new_shape)?;
-        }
-        let v_shape = vs.shape.clone();
-        let v_recon_f32 = vs.dequant()?;
-        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
-
-        Ok((k_full, v_full))
+        rotor_sym_update::<4>(k, v, max_seq, layer_idx, "RotorSym4", new_k, new_v, device)
     }
 
-    /// RotorKOnly3 decode update. K is rotor3 (CPU); V stays
-    /// bf16 on `decode_fp16_v`.
+    /// RotorKOnly3 decode update. K is rotor 3-bit; V stays bf16 on
+    /// `decode_fp16_v`.
     ///
     /// **CRITICAL** (HIGH bug guard): uses
     /// [`Self::update_decode_fp16_v_only`] for the V side, NOT
@@ -7616,16 +7064,15 @@ impl KvCache {
     /// side-effect, which causes the `decode_fp16_k.is_some()` early-return
     /// guard to short-circuit the K codec on the *next* decode step (silent
     /// bf16-K regression).
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction"
-    )]
+    ///
+    /// The K side is [`rotor_k_only_k_side`] at 3 bits.
     fn update_rotor_k_only_3(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
         let KvStorage::RotorKOnly3 { k, max_seq } = &mut self.storage else {
             return Err(Error::KvStorageMismatch {
                 expected: "RotorKOnly3",
@@ -7634,68 +7081,31 @@ impl KvCache {
         };
         let max_seq = *max_seq;
 
-        let new_shape = new_k.shape();
-        // GPU encode for K when device == GPU AND this store was written without
-        // QJL. The QJL decision is sticky to the store — fixed at first append —
-        // so a later process-env toggle must not reinterpret bytes already
-        // written. Read the store's own flag, the same source the sdpa fused
-        // fast path consults; fall back to the env only before the store exists,
-        // i.e. the value the store is about to be built with.
-        let store_uses_qjl = match k.as_ref() {
-            Some(ks) => ks.use_qjl(),
-            None => crate::rotor_qjl::rotor_qjl_enabled(),
-        };
-        let gpu_k_ok = device == Device::Gpu && !store_uses_qjl;
-        let k_f32 = if gpu_k_ok {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_k, Device::Cpu)?
-        };
-
-        if k.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *k = Some(crate::storage::QuantRotorK3::new(
-                init_shape,
-                layer_idx_u32(self.layer_idx),
-            ));
-        }
-        let Some(ks) = k.as_mut() else {
-            return Err(Error::Mlx("RotorKOnly3 K buffer absent after init".into()));
-        };
-        if gpu_k_ok {
-            rotor3_gpu_append_into_k_blocks(
-                ks,
-                new_k,
-                &new_shape,
-                device,
-                LEGACY_ROTOR_K_ONLY_FEED,
-                max_seq,
-            )?;
-        } else {
-            ks.append(&k_f32, &new_shape)?;
-        }
-        let k_shape = ks.shape.clone();
-        let k_recon_f32 = ks.dequant()?;
-        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+        let k_full = rotor_k_only_k_side::<3>(k, max_seq, layer_idx, "RotorKOnly3", new_k, device)?;
 
         // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
         let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
         Ok((k_full, v_full))
     }
 
-    /// RotorKOnly4 decode update. Mirror of
-    /// [`Self::update_rotor_k_only_3`] with `bits=4`.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction"
-    )]
+    /// RotorKOnly4 decode update. K is rotor 4-bit; V stays bf16 on
+    /// `decode_fp16_v`.
+    ///
+    /// **CRITICAL** (HIGH bug guard): uses
+    /// [`Self::update_decode_fp16_v_only`] for the V side, NOT
+    /// `update_decode_fp16`. The latter populates `self.decode_fp16_k` as a
+    /// side-effect, which causes the `decode_fp16_k.is_some()` early-return
+    /// guard to short-circuit the K codec on the *next* decode step (silent
+    /// bf16-K regression).
+    ///
+    /// The K side is [`rotor_k_only_k_side`] at 4 bits.
     fn update_rotor_k_only_4(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
         let KvStorage::RotorKOnly4 { k, max_seq } = &mut self.storage else {
             return Err(Error::KvStorageMismatch {
                 expected: "RotorKOnly4",
@@ -7704,59 +7114,18 @@ impl KvCache {
         };
         let max_seq = *max_seq;
 
-        let new_shape = new_k.shape();
-        // See `update_rotor_k_only_3`: gate the GPU encode on the store's sticky
-        // QJL flag (fixed at first append), not the current process env, so a
-        // later toggle cannot reinterpret bytes already written. Env is the
-        // fallback only before the store exists.
-        let store_uses_qjl = match k.as_ref() {
-            Some(ks) => ks.use_qjl(),
-            None => crate::rotor_qjl::rotor_qjl_enabled(),
-        };
-        let gpu_k_ok = device == Device::Gpu && !store_uses_qjl;
-        let k_f32 = if gpu_k_ok {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_k, Device::Cpu)?
-        };
-
-        if k.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *k = Some(crate::storage::QuantRotorK4::new(
-                init_shape,
-                layer_idx_u32(self.layer_idx),
-            ));
-        }
-        let Some(ks) = k.as_mut() else {
-            return Err(Error::Mlx("RotorKOnly4 K buffer absent after init".into()));
-        };
-        if gpu_k_ok {
-            rotor4_gpu_append_into_k_blocks(
-                ks,
-                new_k,
-                &new_shape,
-                device,
-                LEGACY_ROTOR_K_ONLY_FEED,
-                max_seq,
-            )?;
-        } else {
-            ks.append(&k_f32, &new_shape)?;
-        }
-        let k_shape = ks.shape.clone();
-        let k_recon_f32 = ks.dequant()?;
-        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+        let k_full = rotor_k_only_k_side::<4>(k, max_seq, layer_idx, "RotorKOnly4", new_k, device)?;
 
         // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
         let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
         Ok((k_full, v_full))
     }
 
-    /// RotorK3Asym decode update. K is rotor3 (CPU); V is MLX
-    /// affine `v_bits` / `v_group_size` (reuses [`QuantV`]).
+    /// RotorKAsym3 decode update. K is rotor 3-bit; V is MLX affine
+    /// `v_bits` / `v_group_size` (reuses [`QuantV`]).
     ///
-    /// Mirrors [`Self::update_rotor_k_only_3`] for K and [`Self::update_k8v4`]
-    /// for V (affine path) on the **seedless** path only.
+    /// Mirrors [`Self::update_rotor_k_only_3`] for K and
+    /// [`Self::update_k8v4`] for V (affine path) on the **seedless** path only.
     ///
     /// **Warm-TTFT.** Unlike `RotorKOnly3`, this asym variant DOES carry the
     /// `decode_fp16_k.is_some()` shortcut (below): once the bf16 seed is live
@@ -7771,20 +7140,15 @@ impl KvCache {
     /// NB: `RotorKOnly3` (no asym V) is the opposite — it has **no** seed
     /// shortcut in its body, so its rotor-K codec runs every decode step
     /// (K-only family). Do not assume the two share K-side decode semantics.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction"
-    )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Option is Some by construction immediately above this fn body's assignments"
-    )]
+    ///
+    /// The body is [`rotor_k_asym_update`] at 3 bits.
     fn update_rotor_k_asym_3(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
         let KvStorage::RotorKAsym3 {
             k,
             v,
@@ -7806,84 +7170,37 @@ impl KvCache {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        let new_shape = new_k.shape();
-        // Gate the GPU K encode on the store's sticky QJL flag (fixed at first
-        // append), not the live env — a later toggle must not reinterpret bytes
-        // already written. Env is the fallback only before the store exists.
-        let store_uses_qjl = match k.as_ref() {
-            Some(ks) => ks.use_qjl(),
-            None => crate::rotor_qjl::rotor_qjl_enabled(),
-        };
-        let gpu_k_ok = device == Device::Gpu && !store_uses_qjl;
-        let k_f32 = if gpu_k_ok {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_k, Device::Cpu)?
-        };
-        let v_f32 = if device == Device::Gpu {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_v, device)?
-        };
-
-        if k.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *k = Some(crate::storage::QuantRotorK3::new(
-                init_shape,
-                layer_idx_u32(self.layer_idx),
-            ));
-        }
-        let ks = k.as_mut().unwrap();
-        if gpu_k_ok {
-            rotor3_gpu_append_into_k_blocks(
-                ks,
-                new_k,
-                &new_shape,
-                device,
-                LEGACY_ROTOR_SYM_FEED,
-                max_seq,
-            )?;
-        } else {
-            ks.append(&k_f32, &new_shape)?;
-        }
-        let k_shape = ks.shape.clone();
-        let k_recon_f32 = ks.dequant()?;
-        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
-
-        if v.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *v = Some(QuantV::new_affine_decode(init_shape, v_bits, max_seq));
-        }
-        let vs = v.as_mut().unwrap();
-        vs.append(&v_f32, &new_shape, new_v, device, max_seq)?;
-        let v_shape = vs.shape.clone();
-        let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(device, new_v.dtype())?;
-        let v_full = match v_arr_opt {
-            Some(arr) => arr,
-            None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
-        };
-
-        Ok((k_full, v_full))
+        rotor_k_asym_update::<3>(k, v, max_seq, v_bits, layer_idx, new_k, new_v, device)
     }
 
-    /// RotorK4Asym decode update. Mirror of
-    /// [`Self::update_rotor_k_asym_3`] with rotor4 K.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction"
-    )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Option is Some by construction immediately above this fn body's assignments"
-    )]
+    /// RotorKAsym4 decode update. K is rotor 4-bit; V is MLX affine
+    /// `v_bits` / `v_group_size` (reuses [`QuantV`]).
+    ///
+    /// Mirrors [`Self::update_rotor_k_only_4`] for K and
+    /// [`Self::update_k8v4`] for V (affine path) on the **seedless** path only.
+    ///
+    /// **Warm-TTFT.** Unlike `RotorKOnly4`, this asym variant DOES carry the
+    /// `decode_fp16_k.is_some()` shortcut (below): once the bf16 seed is live
+    /// (always, post-`exit_prefill` — see `exit_prefill`'s
+    /// generic seed tail), the entire decode step routes through
+    /// [`Self::update_decode_fp16`] and serves **both** K and V from bf16. The
+    /// rotor-K and affine-V codecs are quiescent for the whole decode window;
+    /// they re-encode only at `exit_prefill` or on a seedless cache. This is
+    /// the universal warm-TTFT decode contract documented in
+    /// `docs/KV_CACHE.md` §9.6.
+    ///
+    /// NB: `RotorKOnly4` (no asym V) is the opposite — it has **no** seed
+    /// shortcut in its body, so its rotor-K codec runs every decode step
+    /// (K-only family). Do not assume the two share K-side decode semantics.
+    ///
+    /// The body is [`rotor_k_asym_update`] at 4 bits.
     fn update_rotor_k_asym_4(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
         let KvStorage::RotorKAsym4 {
             k,
             v,
@@ -7905,67 +7222,329 @@ impl KvCache {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        let new_shape = new_k.shape();
-        // Gate the GPU K encode on the store's sticky QJL flag (fixed at first
-        // append), not the live env — a later toggle must not reinterpret bytes
-        // already written. Env is the fallback only before the store exists.
-        let store_uses_qjl = match k.as_ref() {
-            Some(ks) => ks.use_qjl(),
-            None => crate::rotor_qjl::rotor_qjl_enabled(),
-        };
-        let gpu_k_ok = device == Device::Gpu && !store_uses_qjl;
-        let k_f32 = if gpu_k_ok {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_k, Device::Cpu)?
-        };
-        let v_f32 = if device == Device::Gpu {
-            Vec::new()
-        } else {
-            array_to_f32_vec(new_v, device)?
-        };
-
-        if k.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *k = Some(crate::storage::QuantRotorK4::new(
-                init_shape,
-                layer_idx_u32(self.layer_idx),
-            ));
-        }
-        let ks = k.as_mut().unwrap();
-        if gpu_k_ok {
-            rotor4_gpu_append_into_k_blocks(
-                ks,
-                new_k,
-                &new_shape,
-                device,
-                LEGACY_ROTOR_SYM_FEED,
-                max_seq,
-            )?;
-        } else {
-            ks.append(&k_f32, &new_shape)?;
-        }
-        let k_shape = ks.shape.clone();
-        let k_recon_f32 = ks.dequant()?;
-        let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
-
-        if v.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *v = Some(QuantV::new_affine_decode(init_shape, v_bits, max_seq));
-        }
-        let vs = v.as_mut().unwrap();
-        vs.append(&v_f32, &new_shape, new_v, device, max_seq)?;
-        let v_shape = vs.shape.clone();
-        let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(device, new_v.dtype())?;
-        let v_full = match v_arr_opt {
-            Some(arr) => arr,
-            None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
-        };
-
-        Ok((k_full, v_full))
+        rotor_k_asym_update::<4>(k, v, max_seq, v_bits, layer_idx, new_k, new_v, device)
     }
+}
+
+// ── Rotor decode-update bodies, one per family over both code widths ─────────
+//
+// The eight `KvCache::update_rotor*` entries above resolve their storage
+// variant and hand the stores here; a body below is the one arithmetic each
+// pair of entries shares, with the code width as the store's `BITS`.
+
+/// Decode update for `RotorV3` / `RotorV4`: K = affine q8_0, V = rotor at
+/// `BITS` (Cl(3,0) Clifford rotor sandwich + Lloyd-Max codebook).
+///
+/// Structurally mirrors [`KvCache::update_iso4`] with the V side bound to
+/// [`QuantRotorV`] instead of `QuantIsoV4`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Option is Some by construction immediately above this fn body's assignments"
+)]
+#[allow(clippy::too_many_arguments)]
+fn rotor_v_update<const BITS: u8>(
+    k: &mut Option<QuantK>,
+    v: &mut Option<QuantRotorV<BITS>>,
+    max_seq: i32,
+    layer_idx: u32,
+    new_k: &Array,
+    new_v: &Array,
+    device: Device,
+) -> Result<(Array, Array)> {
+    let new_shape = new_k.shape();
+
+    // K-side: GPU-capable affine q8_0 (same as iso3 / iso4 / K8V4).
+    // V-side: routes encode through the rotor MSL kernel when
+    // `device == Device::Gpu`; CPU encode remains the fallback. This
+    // hot path is shadowed by the warm-TTFT bf16 seed: the GPU encode
+    // fires once at exit_prefill (large `new_v` slice), not per decode step.
+    let k_f32 = if device == Device::Gpu {
+        Vec::new()
+    } else {
+        array_to_f32_vec(new_k, device)?
+    };
+    let v_f32 = if device == Device::Gpu {
+        Vec::new()
+    } else {
+        array_to_f32_vec(new_v, Device::Cpu)?
+    };
+
+    if k.is_none() {
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        *k = Some(QuantK {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            max_seq,
+        });
+    }
+    let ks = k.as_mut().unwrap();
+    ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+    let k_shape = ks.shape.clone();
+    let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+    let k_full = match k_arr_opt {
+        Some(arr) => arr,
+        None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+    };
+
+    if v.is_none() {
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        // Thread the real model-layer index into the rotor seed so each layer
+        // gets a distinct rotor table. The rotor table is deterministic and
+        // persists via SSD round-trip.
+        *v = Some(QuantRotorV::<BITS>::new(init_shape, max_seq, layer_idx));
+    }
+    let vs = v.as_mut().unwrap();
+    if device == Device::Gpu {
+        rotor_gpu_append_into_v_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
+    } else {
+        vs.append(&v_f32, &new_shape)?;
+    }
+    let v_shape = vs.shape.clone();
+    let v_recon_f32 = vs.dequant()?;
+    let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+    Ok((k_full, v_full))
+}
+
+/// Decode update for `RotorSym3` / `RotorSym4`: K and V both quantize through
+/// the rotor codec at `BITS`.
+///
+/// Structurally mirrors [`KvCache::update_iso3_sym`] with the codec bound to
+/// [`QuantRotorK`] / [`QuantRotorV`] instead of the iso K/V types. `variant` is
+/// the storage spelling the caller resolved, used only in the "buffer absent
+/// after init" diagnostic.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction"
+)]
+#[allow(clippy::too_many_arguments)]
+fn rotor_sym_update<const BITS: u8>(
+    k: &mut Option<QuantRotorK<BITS>>,
+    v: &mut Option<QuantRotorV<BITS>>,
+    max_seq: i32,
+    layer_idx: u32,
+    variant: &'static str,
+    new_k: &Array,
+    new_v: &Array,
+    device: Device,
+) -> Result<(Array, Array)> {
+    let new_shape = new_k.shape();
+    // GPU encode for both K and V when device == GPU and the store carries
+    // no QJL residual. The QJL decision is sticky to the store (fixed at
+    // first append) — a later process-env toggle must not reinterpret bytes
+    // already written; read the store's own flag, same as the sdpa fast path
+    // and the K-only body. Env is the fallback only before the store exists.
+    // With QJL on the K-side falls back to CPU (the GPU kernel cannot
+    // replicate the QJL residual — see rotor_fused_qk_msl.rs).
+    let store_uses_qjl = match k.as_ref() {
+        Some(ks) => ks.use_qjl(),
+        None => crate::rotor_qjl::rotor_qjl_enabled(),
+    };
+    let use_gpu = device == Device::Gpu;
+    let gpu_k_ok = use_gpu && !store_uses_qjl;
+    let k_f32 = if gpu_k_ok {
+        Vec::new()
+    } else {
+        array_to_f32_vec(new_k, Device::Cpu)?
+    };
+    let v_f32 = if use_gpu {
+        Vec::new()
+    } else {
+        array_to_f32_vec(new_v, Device::Cpu)?
+    };
+
+    if k.is_none() {
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        *k = Some(QuantRotorK::<BITS>::new(init_shape, layer_idx));
+    }
+    let Some(ks) = k.as_mut() else {
+        return Err(Error::Mlx(format!("{variant} K buffer absent after init")));
+    };
+    if gpu_k_ok {
+        rotor_gpu_append_into_k_blocks(
+            ks,
+            new_k,
+            &new_shape,
+            device,
+            LEGACY_ROTOR_SYM_FEED,
+            max_seq,
+        )?;
+    } else {
+        ks.append(&k_f32, &new_shape)?;
+    }
+    let k_shape = ks.shape.clone();
+    let k_recon_f32 = ks.dequant()?;
+    let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+
+    if v.is_none() {
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        *v = Some(QuantRotorV::<BITS>::new(init_shape, max_seq, layer_idx));
+    }
+    let Some(vs) = v.as_mut() else {
+        return Err(Error::Mlx(format!("{variant} V buffer absent after init")));
+    };
+    if use_gpu {
+        rotor_gpu_append_into_v_blocks(vs, new_v, &new_shape, device, RingFeed::Skip, max_seq)?;
+    } else {
+        vs.append(&v_f32, &new_shape)?;
+    }
+    let v_shape = vs.shape.clone();
+    let v_recon_f32 = vs.dequant()?;
+    let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+
+    Ok((k_full, v_full))
+}
+
+/// K side of the `RotorKOnly3` / `RotorKOnly4` decode update: rotor K at
+/// `BITS`, returning the reconstructed K. The V side stays bf16 and is the
+/// caller's, because it needs `&mut self` (see the entries above).
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction"
+)]
+fn rotor_k_only_k_side<const BITS: u8>(
+    k: &mut Option<QuantRotorK<BITS>>,
+    max_seq: i32,
+    layer_idx: u32,
+    variant: &'static str,
+    new_k: &Array,
+    device: Device,
+) -> Result<Array> {
+    let new_shape = new_k.shape();
+    // GPU encode for K when device == GPU AND this store was written without
+    // QJL. The QJL decision is sticky to the store — fixed at first append —
+    // so a later process-env toggle must not reinterpret bytes already
+    // written. Read the store's own flag, the same source the sdpa fused
+    // fast path consults; fall back to the env only before the store exists,
+    // i.e. the value the store is about to be built with.
+    let store_uses_qjl = match k.as_ref() {
+        Some(ks) => ks.use_qjl(),
+        None => crate::rotor_qjl::rotor_qjl_enabled(),
+    };
+    let gpu_k_ok = device == Device::Gpu && !store_uses_qjl;
+    let k_f32 = if gpu_k_ok {
+        Vec::new()
+    } else {
+        array_to_f32_vec(new_k, Device::Cpu)?
+    };
+
+    if k.is_none() {
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        *k = Some(QuantRotorK::<BITS>::new(init_shape, layer_idx));
+    }
+    let Some(ks) = k.as_mut() else {
+        return Err(Error::Mlx(format!("{variant} K buffer absent after init")));
+    };
+    if gpu_k_ok {
+        rotor_gpu_append_into_k_blocks(
+            ks,
+            new_k,
+            &new_shape,
+            device,
+            LEGACY_ROTOR_K_ONLY_FEED,
+            max_seq,
+        )?;
+    } else {
+        ks.append(&k_f32, &new_shape)?;
+    }
+    let k_shape = ks.shape.clone();
+    let k_recon_f32 = ks.dequant()?;
+    f32_vec_to_array(&k_recon_f32, &k_shape)
+}
+
+/// Decode update for `RotorKAsym3` / `RotorKAsym4`: K is rotor at `BITS`, V is
+/// MLX affine `v_bits` (reuses [`QuantV`]).
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction"
+)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "Option is Some by construction immediately above this fn body's assignments"
+)]
+#[allow(clippy::too_many_arguments)]
+fn rotor_k_asym_update<const BITS: u8>(
+    k: &mut Option<QuantRotorK<BITS>>,
+    v: &mut Option<QuantV>,
+    max_seq: i32,
+    v_bits: u8,
+    layer_idx: u32,
+    new_k: &Array,
+    new_v: &Array,
+    device: Device,
+) -> Result<(Array, Array)> {
+    let new_shape = new_k.shape();
+    // Gate the GPU K encode on the store's sticky QJL flag (fixed at first
+    // append), not the live env — a later toggle must not reinterpret bytes
+    // already written. Env is the fallback only before the store exists.
+    let store_uses_qjl = match k.as_ref() {
+        Some(ks) => ks.use_qjl(),
+        None => crate::rotor_qjl::rotor_qjl_enabled(),
+    };
+    let gpu_k_ok = device == Device::Gpu && !store_uses_qjl;
+    let k_f32 = if gpu_k_ok {
+        Vec::new()
+    } else {
+        array_to_f32_vec(new_k, Device::Cpu)?
+    };
+    let v_f32 = if device == Device::Gpu {
+        Vec::new()
+    } else {
+        array_to_f32_vec(new_v, device)?
+    };
+
+    if k.is_none() {
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        *k = Some(QuantRotorK::<BITS>::new(init_shape, layer_idx));
+    }
+    let ks = k.as_mut().unwrap();
+    if gpu_k_ok {
+        rotor_gpu_append_into_k_blocks(
+            ks,
+            new_k,
+            &new_shape,
+            device,
+            LEGACY_ROTOR_SYM_FEED,
+            max_seq,
+        )?;
+    } else {
+        ks.append(&k_f32, &new_shape)?;
+    }
+    let k_shape = ks.shape.clone();
+    let k_recon_f32 = ks.dequant()?;
+    let k_full = f32_vec_to_array(&k_recon_f32, &k_shape)?;
+
+    if v.is_none() {
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        *v = Some(QuantV::new_affine_decode(init_shape, v_bits, max_seq));
+    }
+    let vs = v.as_mut().unwrap();
+    vs.append(&v_f32, &new_shape, new_v, device, max_seq)?;
+    let v_shape = vs.shape.clone();
+    let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(device, new_v.dtype())?;
+    let v_full = match v_arr_opt {
+        Some(arr) => arr,
+        None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
+    };
+
+    Ok((k_full, v_full))
 }
 
 // ── KV hard-cap helpers ──────────────────────────────────────────────────────

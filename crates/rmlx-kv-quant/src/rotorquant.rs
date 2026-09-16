@@ -731,7 +731,7 @@ pub fn rotor3_k_encode(
     head_dim: usize,
     qjl_s_matrix: Option<&[f32]>,
 ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>, Vec<u8>, Vec<f32>), RotorQuantError> {
-    rotor_k_encode_inner(k, rotors, head_dim, qjl_s_matrix, ROTOR3_BITS)
+    rotor_k_encode_at(k, rotors, head_dim, qjl_s_matrix, ROTOR3_BITS)
 }
 
 /// Encode a K tensor with the rotor4 codec and an optional 1-bit QJL residual
@@ -743,7 +743,7 @@ pub fn rotor4_k_encode(
     head_dim: usize,
     qjl_s_matrix: Option<&[f32]>,
 ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>, Vec<u8>, Vec<f32>), RotorQuantError> {
-    rotor_k_encode_inner(k, rotors, head_dim, qjl_s_matrix, ROTOR4_BITS)
+    rotor_k_encode_at(k, rotors, head_dim, qjl_s_matrix, ROTOR4_BITS)
 }
 
 /// Decode a rotor3-K compressed tensor with optional QJL residual.
@@ -761,9 +761,17 @@ pub fn rotor3_k_decode(
     qjl_norms: &[f32],
     qjl_s_matrix: Option<&[f32]>,
 ) -> Result<Vec<f32>, RotorQuantError> {
-    let mut out = rotor3_decode(codes_packed, scales, norms, rotors, head_dim)?;
-    apply_qjl_correction(&mut out, head_dim, qjl_packed, qjl_norms, qjl_s_matrix);
-    Ok(out)
+    rotor_k_decode_at(
+        codes_packed,
+        scales,
+        norms,
+        rotors,
+        head_dim,
+        qjl_packed,
+        qjl_norms,
+        qjl_s_matrix,
+        ROTOR3_BITS,
+    )
 }
 
 /// Decode a rotor4-K compressed tensor with optional QJL residual.
@@ -777,36 +785,73 @@ pub fn rotor4_k_decode(
     qjl_norms: &[f32],
     qjl_s_matrix: Option<&[f32]>,
 ) -> Result<Vec<f32>, RotorQuantError> {
-    let mut out = rotor4_decode(codes_packed, scales, norms, rotors, head_dim)?;
+    rotor_k_decode_at(
+        codes_packed,
+        scales,
+        norms,
+        rotors,
+        head_dim,
+        qjl_packed,
+        qjl_norms,
+        qjl_s_matrix,
+        ROTOR4_BITS,
+    )
+}
+
+/// Decode a rotor-K compressed tensor at `bits`, with optional QJL residual.
+///
+/// The width-named wrappers above are the public spelling; the rotor K store is
+/// one type over both widths and calls this form with its own `bits`.
+///
+/// When `qjl_packed` is non-empty and `qjl_s_matrix` is `Some(&S)`, the
+/// per-token QJL correction is added to the rotor-reconstructed values;
+/// otherwise behaves identically to [`rotor_decode`].
+///
+/// # Errors
+///
+/// Returns [`RotorQuantError`] for shape/length mismatches.
+#[allow(clippy::too_many_arguments)]
+pub fn rotor_k_decode_at(
+    codes_packed: &[u32],
+    scales: &[f32],
+    norms: &[f32],
+    rotors: &[f32],
+    head_dim: usize,
+    qjl_packed: &[u8],
+    qjl_norms: &[f32],
+    qjl_s_matrix: Option<&[f32]>,
+    bits: u8,
+) -> Result<Vec<f32>, RotorQuantError> {
+    let mut out = rotor_decode(codes_packed, scales, norms, rotors, head_dim, bits)?;
     apply_qjl_correction(&mut out, head_dim, qjl_packed, qjl_norms, qjl_s_matrix);
     Ok(out)
 }
 
-/// Internal common path for rotor-K encode: runs the rotor MSE forward, then
-/// (when `qjl_s_matrix` is `Some`) captures the residual = original − recon
-/// and projects to qjl signs.
+/// Encode a K tensor with the rotor codec at `bits` plus an optional 1-bit QJL
+/// residual stage: runs the rotor MSE forward, then (when `qjl_s_matrix` is
+/// `Some`) captures the residual = original − recon and projects to qjl signs.
+///
+/// The width-named wrappers above are the public spelling; the rotor K store is
+/// one type over both widths and calls this form with its own `bits`.
+///
+/// # Errors
+///
+/// Returns [`RotorQuantError`] for invalid inputs (zero `head_dim`,
+/// length mismatch, rotor table size mismatch, codebook fault).
 #[allow(clippy::type_complexity)]
-fn rotor_k_encode_inner(
+pub fn rotor_k_encode_at(
     k: &[f32],
     rotors: &[f32],
     head_dim: usize,
     qjl_s_matrix: Option<&[f32]>,
     bits: u8,
 ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>, Vec<u8>, Vec<f32>), RotorQuantError> {
-    let (codes, scales, norms) = if bits == ROTOR3_BITS {
-        rotor3_encode(k, rotors, head_dim)?
-    } else {
-        rotor4_encode(k, rotors, head_dim)?
-    };
+    let (codes, scales, norms) = rotor_encode(k, rotors, head_dim, bits)?;
 
     let mut qjl_packed: Vec<u8> = Vec::new();
     let mut qjl_norms: Vec<f32> = Vec::new();
     if let Some(s_matrix) = qjl_s_matrix {
-        let recon = if bits == ROTOR3_BITS {
-            rotor3_decode(&codes, &scales, &norms, rotors, head_dim)?
-        } else {
-            rotor4_decode(&codes, &scales, &norms, rotors, head_dim)?
-        };
+        let recon = rotor_decode(&codes, &scales, &norms, rotors, head_dim, bits)?;
         let n_tokens = norms.len();
         let qjl_bytes_per_tok = head_dim.div_ceil(8);
         qjl_packed.reserve(n_tokens * qjl_bytes_per_tok);

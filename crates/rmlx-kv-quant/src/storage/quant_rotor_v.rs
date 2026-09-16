@@ -1,42 +1,57 @@
-// Rotor3 (Cl(3,0) Clifford sandwich) 3-bit V storage.
+// Rotor (Cl(3,0) Clifford sandwich) V storage, one type over both code widths.
 //
 // Mirrors `quant_iso_v.rs` (`QuantIsoV3`) for the per-token bookkeeping but
 // holds a **static per-(layer, head)** rotor table — generated once on first
 // append, never per-token. Tokens carry only (codes, scales, norms).
+//
+// The 3-bit and 4-bit codecs differ in exactly one scalar, the code width:
+// `ROTOR4_GROUP_SIZE` is defined as `ROTOR3_GROUP_SIZE`, and the encode /
+// decode entries are already parametric over `bits`. So the store is one
+// `QuantRotorV<BITS>` and the width-named spellings are type aliases.
 #![allow(
     unreachable_pub,
     clippy::exhaustive_structs,
     clippy::indexing_slicing,
     clippy::doc_lazy_continuation
 )]
-//! Quantized V buffer: `QuantRotorV3` (rotor3 V codec).
+//! Quantized V buffer: `QuantRotorV<BITS>` (rotor V codec), spelled
+//! `QuantRotorV3` / `QuantRotorV4`.
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
 use crate::clifford::make_rotor_table;
 use crate::rotorquant::{
-    n_groups_for, rotor3_decode, rotor3_encode, RotorQuantError, ROTOR3_BITS, ROTOR3_GROUP_SIZE,
+    n_groups_for, rotor_decode, rotor_encode, RotorQuantError, ROTOR3_BITS, ROTOR3_GROUP_SIZE,
+    ROTOR4_BITS, ROTOR4_GROUP_SIZE,
 };
 
 use super::QuantKGpuRing;
 
 /// Bit-width of the rotor3 V codec (fixed at 3-bit — see
-/// [`crate::rotorquant::rotor3_encode`]).
+/// [`crate::rotorquant::rotor_encode`]).
 pub const ROTOR3_V_BITS: u8 = ROTOR3_BITS;
+
+/// Bit-width of the rotor4 V codec (fixed at 4-bit).
+pub const ROTOR4_V_BITS: u8 = ROTOR4_BITS;
 
 /// Multivector group size (3 grade-1 elements per group; one rotor).
 pub const ROTOR3_V_GROUP_SIZE: usize = ROTOR3_GROUP_SIZE;
 
-/// One token-batch's rotor3 payload: codes + per-group scales + per-token L2 norm.
+/// Multivector group size for the rotor4 V codec — identical to rotor3.
+pub const ROTOR4_V_GROUP_SIZE: usize = ROTOR4_GROUP_SIZE;
+
+/// One token-batch's rotor payload: codes + per-group scales + per-token L2
+/// norm.
 ///
 /// The rotor table is **not** stored per-block — it lives on the parent
-/// `QuantRotorV3` (one table per layer/head). Each `RotorBlocks` is one
-/// append-call's worth of tokens.
+/// `QuantRotorV` (one table per layer/head). Each `RotorBlocks` is one
+/// append-call's worth of tokens. The struct is width-agnostic: only the
+/// number of `codes` words per row follows `BITS`.
 #[derive(Debug, Clone)]
 pub struct RotorBlocks {
-    /// The row's dense code plane: three 3-bit codes per Cl(3,0) group.
-    /// Length per block = `n_tokens * n_groups * 1` u32 words.
+    /// The row's dense code plane: three codes per Cl(3,0) group.
+    /// Length per block = `n_tokens * row_words_for(head_dim, BITS)` u32 words.
     pub codes: Vec<u32>,
     /// Per-group scale: `n_tokens * n_groups` f32 entries (flat).
     pub scales: Vec<f32>,
@@ -93,7 +108,7 @@ impl super::BlockRows for RotorBlocks {
     }
 }
 
-/// Accumulated rotor3 V cache.
+/// Accumulated rotor V cache at code width `BITS`.
 ///
 /// Holds:
 ///   * `rotors` — static `[n_groups, 4]` table generated once at first append
@@ -113,7 +128,7 @@ impl super::BlockRows for RotorBlocks {
 /// The ring type is named for the K side it landed with, but its payload
 /// (codes / per-group scales / per-token L2 norms) is exactly the rotor codec's
 /// own — the codec is axis-agnostic, so the V side reuses it verbatim.
-pub struct QuantRotorV3 {
+pub struct QuantRotorV<const BITS: u8> {
     /// Static rotor table for this layer/head, flat `[n_groups * 4]` f32 in
     /// `[s, b12, b13, b23]` per-rotor order. Initialised lazily on first
     /// `append`; never replaced.
@@ -133,13 +148,20 @@ pub struct QuantRotorV3 {
     /// Currently always `0` (one rotor table per layer; per-head decorrelation
     /// is via the codec's per-token scale + norm, not per-head rotors).
     pub head_idx: u32,
-    /// Bit-width tag (always [`ROTOR3_V_BITS`] for this codec).
+    /// Bit-width tag (always `BITS` for this codec).
     pub bits: u8,
 }
 
-impl std::fmt::Debug for QuantRotorV3 {
+/// The 3-bit rotor V store.
+pub type QuantRotorV3 = QuantRotorV<3>;
+
+/// The 4-bit rotor V store.
+pub type QuantRotorV4 = QuantRotorV<4>;
+
+impl<const BITS: u8> std::fmt::Debug for QuantRotorV<BITS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QuantRotorV3")
+        let name = format!("QuantRotorV{BITS}");
+        f.debug_struct(&name)
             .field("n_rotors", &(self.rotors.len() / 4))
             .field("gpu_resident", &self.gpu.is_allocated())
             .field("n_blocks", &self.blocks.len())
@@ -152,8 +174,8 @@ impl std::fmt::Debug for QuantRotorV3 {
     }
 }
 
-impl QuantRotorV3 {
-    /// Construct an empty `QuantRotorV3` for `init_shape = [B, kv_h, 0, D]`.
+impl<const BITS: u8> QuantRotorV<BITS> {
+    /// Construct an empty store for `init_shape = [B, kv_h, 0, D]`.
     ///
     /// `rotors` is left empty — it is generated lazily on the first `append`
     /// call once `head_dim = init_shape[3]` is known. Use
@@ -169,7 +191,7 @@ impl QuantRotorV3 {
             max_seq,
             layer_idx,
             head_idx: 0,
-            bits: ROTOR3_V_BITS,
+            bits: BITS,
         }
     }
 
@@ -190,11 +212,11 @@ impl QuantRotorV3 {
             max_seq,
             layer_idx,
             head_idx: 0,
-            bits: ROTOR3_V_BITS,
+            bits: BITS,
         }
     }
 
-    /// Build a `QuantRotorV3` from pre-computed CPU blocks (SSD hydrate path).
+    /// Build a store from pre-computed CPU blocks (SSD hydrate path).
     #[must_use]
     pub fn from_cpu_blocks(
         rotors: Vec<f32>,
@@ -204,7 +226,7 @@ impl QuantRotorV3 {
     ) -> Self {
         debug_assert!(
             shape.len() == 4,
-            "QuantRotorV3::from_cpu_blocks expects a 4-element [B, kv_h, S, D] shape, got {shape:?}"
+            "QuantRotorV{BITS}::from_cpu_blocks expects a 4-element [B, kv_h, S, D] shape, got {shape:?}"
         );
         let max_seq = if shape.len() >= 3 { shape[2] } else { 0 };
         Self {
@@ -217,7 +239,7 @@ impl QuantRotorV3 {
             max_seq,
             layer_idx,
             head_idx: 0,
-            bits: ROTOR3_V_BITS,
+            bits: BITS,
         }
     }
 
@@ -229,11 +251,11 @@ impl QuantRotorV3 {
     ///
     /// # Errors
     ///
-    /// Forwards any [`RotorQuantError`] from [`rotor3_encode`].
+    /// Forwards any [`RotorQuantError`] from [`rotor_encode`].
     pub fn append(&mut self, f32_data: &[f32], new_shape: &[i32]) -> Result<()> {
         if new_shape.len() != 4 {
             return Err(Error::Mlx(format!(
-                "QuantRotorV3::append: expected 4D new_shape, got {new_shape:?}"
+                "QuantRotorV{BITS}::append: expected 4D new_shape, got {new_shape:?}"
             )));
         }
         let b = new_shape[0] as usize;
@@ -256,8 +278,8 @@ impl QuantRotorV3 {
         let seq_major =
             super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, head_dim);
 
-        let (codes, scales, norms) = rotor3_encode(&seq_major, &self.rotors, head_dim)
-            .map_err(|e: RotorQuantError| Error::Mlx(format!("rotor3 encode: {e}")))?;
+        let (codes, scales, norms) = rotor_encode(&seq_major, &self.rotors, head_dim, BITS)
+            .map_err(|e: RotorQuantError| Error::Mlx(format!("rotor{BITS} encode: {e}")))?;
 
         self.blocks.push(RotorBlocks {
             codes,
@@ -415,18 +437,18 @@ impl QuantRotorV3 {
         let n_groups = i32::try_from(n_groups_for(usize::try_from(head_dim.max(0)).unwrap_or(0)))
             .map_err(|_| {
             Error::Quant(format!(
-                "QuantRotorV3::gpu_append: n_groups for head_dim={head_dim} exceeds i32::MAX"
+                "QuantRotorV{BITS}::gpu_append: n_groups for head_dim={head_dim} exceeds i32::MAX"
             ))
         })?;
         // The dense code plane's row width is the codec's too — a plane no
         // longer holds one word per group.
         let code_words = i32::try_from(crate::rotorquant::row_words_for(
             usize::try_from(head_dim.max(0)).unwrap_or(0),
-            ROTOR3_BITS,
+            BITS,
         ))
         .map_err(|_| {
             Error::Quant(format!(
-                "QuantRotorV3::gpu_append: code words for head_dim={head_dim} exceeds i32::MAX"
+                "QuantRotorV{BITS}::gpu_append: code words for head_dim={head_dim} exceeds i32::MAX"
             ))
         })?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
@@ -484,13 +506,13 @@ impl QuantRotorV3 {
     ///
     /// # Errors
     ///
-    /// Returns an `Error::Mlx` if the underlying [`rotor3_decode`] fails for any
+    /// Returns an `Error::Mlx` if the underlying [`rotor_decode`] fails for any
     /// block, if `rotors` is empty (no append happened yet), or a
     /// [`synced_rotor_v_blocks`] reconciliation error.
     pub fn dequant(&self) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
             return Err(Error::Mlx(format!(
-                "QuantRotorV3::dequant: malformed shape {:?}",
+                "QuantRotorV{BITS}::dequant: malformed shape {:?}",
                 self.shape
             )));
         }
@@ -513,14 +535,21 @@ impl QuantRotorV3 {
         }
 
         if self.rotors.is_empty() {
-            return Err(Error::Mlx(
-                "QuantRotorV3::dequant: rotor table is empty but blocks were appended".into(),
-            ));
+            return Err(Error::Mlx(format!(
+                "QuantRotorV{BITS}::dequant: rotor table is empty but blocks were appended"
+            )));
         }
 
         for blk in blocks.iter() {
-            let dec = rotor3_decode(&blk.codes, &blk.scales, &blk.norms, &self.rotors, head_dim)
-                .map_err(|e: RotorQuantError| Error::Mlx(format!("rotor3 decode: {e}")))?;
+            let dec = rotor_decode(
+                &blk.codes,
+                &blk.scales,
+                &blk.norms,
+                &self.rotors,
+                head_dim,
+                BITS,
+            )
+            .map_err(|e: RotorQuantError| Error::Mlx(format!("rotor{BITS} decode: {e}")))?;
             out.extend_from_slice(&dec);
         }
         // `synced_rotor_v_blocks` guarantees the blocks cover `shape[2]`, so a
@@ -528,7 +557,7 @@ impl QuantRotorV3 {
         // rather than zero-padding or truncating a decoded prefix.
         if out.len() != total_elems {
             return Err(Error::Mlx(format!(
-                "QuantRotorV3::dequant: decoded {} elems but shape {:?} implies {total_elems} — \
+                "QuantRotorV{BITS}::dequant: decoded {} elems but shape {:?} implies {total_elems} — \
                  refusing to zero-pad / truncate",
                 out.len(),
                 self.shape
@@ -570,9 +599,9 @@ impl QuantRotorV3 {
 /// blocks fall short of `shape[2]` and the ring cannot make up the difference is
 /// an `Error` — the caller must not fabricate a zeroed gap.
 ///
-/// Shared by [`QuantRotorV3`] and [`super::QuantRotorV4`] (the block payload and
-/// ring layout are identical modulo codes bit-width). Mirror of the K-side
-/// `synced_rotor_k_blocks`.
+/// Shared by every [`QuantRotorV`] width (the block payload and ring layout are
+/// identical modulo codes bit-width, which arrives as `bits`). Mirror of the
+/// K-side `synced_rotor_k_blocks`.
 ///
 /// # Errors
 ///
@@ -644,5 +673,5 @@ pub(crate) fn synced_rotor_v_blocks<'a>(
 }
 
 #[cfg(test)]
-#[path = "quant_rotor_v3_tests.rs"]
-mod quant_rotor_v3_tests;
+#[path = "quant_rotor_v_tests.rs"]
+mod quant_rotor_v_tests;

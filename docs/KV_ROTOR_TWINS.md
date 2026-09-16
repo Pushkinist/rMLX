@@ -156,8 +156,9 @@ to `SPEC_DIR` (`crates/rmlx-models/src/speculative`). **It cannot produce a
 before-figure for the rotor population as it stands.**
 
 The advisory half of the same script *does* already reach the rotor file
-twins, because the file-pair scan runs over `crates/rmlx-kv-quant`. Its current
-output at the branch point:
+twins, because the file-pair scan runs over `crates/rmlx-kv-quant`. Its output
+at the branch point — the paths below are the pre-collapse tree's, and §11
+records what the same scan prints now:
 
 ```
 crates/rmlx-kv-quant/src/storage/quant_rotor_k3.rs <-> .../quant_rotor_k4.rs: 70.0% shared
@@ -202,31 +203,46 @@ Per pair: `v3↔v4` 413 (75.2 %), `k3↔k4` 401 (70.0 %); `update_rotor3↔4` 82
 
 ## 7. Removals
 
-The code chunk deletes, by file and by name:
+The collapse deleted, by file and by name:
 
-* `crates/rmlx-kv-quant/src/storage/quant_rotor_v4.rs` — the whole file; its
-  `QuantRotorV4` becomes `QuantRotorV<4>`.
-* `crates/rmlx-kv-quant/src/storage/quant_rotor_k4.rs` — likewise for
-  `QuantRotorK4`.
-* `crates/rmlx-kv-quant/src/storage/quant_rotor_v3.rs` and
-  `quant_rotor_k3.rs` — renamed to `quant_rotor_v.rs` / `quant_rotor_k.rs`,
-  not deleted; the shared payload types and sync helpers stay.
+* `storage/quant_rotor_v4.rs` — the whole file; its `QuantRotorV4` is now
+  `pub type QuantRotorV4 = QuantRotorV<4>`.
+* `storage/quant_rotor_k4.rs` — likewise for `QuantRotorK4`.
+* `storage/quant_rotor_v3.rs` and `quant_rotor_k3.rs` — renamed to
+  `storage/quant_rotor_v.rs` / `storage/quant_rotor_k.rs`, not deleted; the
+  shared payload types (`RotorBlocks`, `RotorKBlocks`), their `BlockRows` impls
+  and the two `synced_rotor_*_blocks` helpers stay there.
 * `KvCache::update_rotor4`, `update_rotor4_sym`, `update_rotor_k_only_4`,
-  `update_rotor_k_asym_4` in `kvcache/update.rs` — four bodies, replaced by the
-  generic form of their 3-bit siblings.
-* The twin halves of the storage test files:
-  `quant_rotor_v4_tests.rs` and `quant_rotor_k4_tests.rs` are folded into
-  `quant_rotor_v_tests.rs` / `quant_rotor_k_tests.rs`. What is deleted is the
-  duplicated **body**, not the coverage: a test whose body differs from its
-  3-bit sibling only in the width token becomes one body with the width as a
-  parameter, still run at both widths. The **cell count does not fall.** The PR
-  reports `cargo test -p rmlx-kv-quant` passed-test counts before and after, and
-  a count that drops is a deleted case, not a collapsed twin.
+  `update_rotor_k_asym_4` in `kvcache/update.rs` — four bodies. All eight
+  entries survive as the storage-variant resolver plus the warm-TTFT shortcut,
+  over four shared bodies: `rotor_v_update`, `rotor_sym_update`,
+  `rotor_k_only_k_side` and `rotor_k_asym_update`, each generic over the store's
+  `BITS`.
+* The twin halves of the storage test files: `quant_rotor_v4_tests.rs` and
+  `quant_rotor_k4_tests.rs` are folded into `quant_rotor_v_tests.rs` /
+  `quant_rotor_k_tests.rs`. What is deleted is the duplicated **body**, not the
+  coverage: each such case is one generic body with the width as a parameter
+  plus one `#[test]` per width, so the cell count does not fall.
 
-The deletions above make this section's own `crates/...` paths dangle, which
-`make check-doc-source-citations` fails on. The code chunk corrects §7 in the
-same commit that deletes the files — it is a generated-from-fact section, not a
-historical record.
+**Deleted beyond the list above, and why it is not scope creep.** Once the
+store is one type over both widths, the `update.rs` helpers that take a store
+by reference cannot stay per-width — the shared body could not call them. Twelve
+further twin pairs therefore became twelve fns: `ensure_rotor_v_table`,
+`ensure_rotor_k_table`, `push_rotor_v_block`, `push_rotor_k_block`,
+`rotor_gpu_append_into_v_blocks`, `rotor_gpu_append_into_k_blocks`,
+`materialize_rotor_v_ring_tail`, `materialize_rotor_k_ring_tail`,
+`rotor_v_sync_ring`, `rotor_k_sync_ring`,
+`drop_blocks_when_ring_live_rotor_{v,k}`. In `rotorquant.rs` the two `bits ==
+ROTOR3_BITS` forks inside the K encode path collapsed onto `rotor_encode` /
+`rotor_decode`, and the K side gained the parametric entries the V side already
+had (`rotor_k_encode_at`, `rotor_k_decode_at`); the four width-named `rotor{3,4}_k_*`
+wrappers stay as the public spelling.
+
+**Kept, though it is the same shape.** The four `pub(super)` fused-append
+entries `rotor{3,4}_k_only_gpu_append` / `rotor{3,4}_sym_gpu_append` still exist
+once per width. They resolve a `KvStorage` variant exactly as the `update_*`
+entries do, and they are not on this list; they now call the generic helpers at
+their own width.
 
 Not deleted, and stated so the list is not read as covering them:
 
@@ -235,19 +251,21 @@ Not deleted, and stated so the list is not read as covering them:
   `check-kv-codec-disposition` gate keys on `ALL_KV_QUANTS` plus the
   disposition predicates, which are untouched.
 * No `.metal` kernel. `rotorquant_{quantize,dequantize}_rotor{3,4}.metal`
-  remain four files; the issue puts them out of scope, and folding their
-  constants into Metal function constants is a separate change with its own
-  `probes/kernels.manifest` and native-compile consequences.
+  remain four files; the issue puts them out of scope.
 * No `docs/KV_QUANT.md` section. The rotor sections describe codecs, not
-  storage types; the type names they cite are checked by
-  `make check-doc-source-citations` (paths only), and any cited path that moves
-  is corrected in the same commit rather than appended to.
+  storage types; the paths and type names they cite that moved are corrected in
+  the same commit rather than appended to.
+* `scripts/lib/debt_report.py` is **not** extended with a rotor population —
+  that is the next chunk's work (§6 records the design). The after-figure in
+  §11 is hand-run through the same module's `normalize()` / `matched_lines()`,
+  the way §6's before-figure was.
 
 ## 8. Mutations
 
 The oracle in §4 is only as good as what it can turn red. Every mutation below
 was applied to the tree, run, and reverted from a pre-mutation snapshot whose
-sha256 was re-verified afterwards. "Uncaught" rows are the file's blind spots
+sha256 was re-verified afterwards. The file names are the **pre-collapse**
+tree's; §11 records the re-run against the unified bodies. "Uncaught" rows are the file's blind spots
 and are restated in the test module doc.
 
 | # | Edit | Caught by |
@@ -328,3 +346,49 @@ both captures; a row missing either is a stop, not a difference.
 carry the absolute model-snapshot path and must never be pasted into a commit
 message, a PR body, an issue or any other public surface. `commands.txt` is
 written with the model root elided for exactly this reason.
+
+## 11. What landed
+
+The collapse, measured on the branch.
+
+### Net line count
+
+| Population | + | − | net |
+|---|---|---|---|
+| `crates/rmlx-kv-quant/src/storage/` (source) | 142 | 990 | **−848** |
+| `crates/rmlx-kv-quant/src/storage/` (its `*_tests.rs`) | 232 | 665 | **−433** |
+| `crates/rmlx-kv-quant/src/kvcache/update.rs` | 488 | 909 | **−421** |
+| **total** | **862** | **2564** | **−1702** |
+
+`rotorquant.rs` is +65 / −20 on top, for the two parametric K entries and the
+two collapsed `bits ==` forks. The issue expected roughly −900; the difference
+is the twelve helper pairs in §7 and the folded test bodies, neither of which
+its estimate covered.
+
+### Duplication, after
+
+Hand-run through `scripts/lib/debt_report.py`'s own `normalize()` and
+`matched_lines()`, the same way §6's before-figure was.
+
+| Population | Pairs | Matched lines | Over |
+|---|---|---|---|
+| rotor storage twins | none — one file per axis | 0 | 1394 file lines |
+| rotor `update_*` twins | none — one body per family | 0 | 234 body lines |
+
+Both populations were defined as same-axis / same-family pairs, and the collapse
+leaves no such pair, so the figure is zero by construction rather than by
+measurement of a smaller remainder. For scale: the two surviving storage files
+share 430 matched lines *across* the K/V axis, and the four surviving update
+bodies share 181 across families — neither is a twin under the rule (they differ
+in what they store, not in a constant), and neither was in the before-figure.
+
+`make debt-report`'s file-pair scan no longer reports a rotor row at all; its
+`70.0 %` and `75.2 %` entries went with the deleted files.
+
+### The GPU-ring question, closed by reading the diff
+
+§1 predicted "it already did". The diff confirms it: `gpu_append`,
+`gpu_packed_view`, `from_cpu_blocks` and `try_deep_clone` were byte-identical
+between the two widths modulo the width token, so the unified body is the same
+code at both instantiations. The 4-bit path takes no route it did not take
+before, and the 3-bit path takes none it did not either.
