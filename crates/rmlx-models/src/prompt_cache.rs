@@ -1010,6 +1010,53 @@ impl<E: PromptCacheEntry> PromptCache<E> {
 // Consumed / ReuseKind — outcome of the shared consume engine
 // ---------------------------------------------------------------------------
 
+/// Why the consume engine refused to reuse a slot.
+///
+/// Every variant re-prefills the same prompt, so every one of them agrees with
+/// a cold baseline — a test that asserts only "it missed" has asserted nothing
+/// about the guard it is named for. Carrying the reason out lets the caller
+/// name which refusal it expects.
+///
+/// [`label`] is the string `decide_locked` puts on its `branch` field, so the
+/// event a run logs and the value a caller reads are one value and cannot
+/// drift apart.
+///
+/// [`label`]: MissReason::label
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MissReason {
+    /// Image prompt — the token-id-keyed cache is bypassed before any lookup.
+    HasImage,
+    /// No cache has been built for this arch yet.
+    NoCache,
+    /// No stored slot shares a block-aligned prefix with this prompt.
+    NoMatch,
+    /// The stored entry's KV codec is not the one this request runs.
+    QuantMismatch,
+    /// A clone of the matched entry failed.
+    DeepCloneErr,
+    /// A hydrated entry has a payload-less attended layer.
+    IncompleteHydrate,
+    /// The matched slot is not a reusable prefix for this prompt.
+    NonReusable,
+    /// The matched slot is not Exact-eligible and reuse is not permitted.
+    HydratedDeclinedToExact,
+}
+
+impl MissReason {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::HasImage => "has_image",
+            Self::NoCache => "no_cache",
+            Self::NoMatch => "no_match",
+            Self::QuantMismatch => "quant_mismatch",
+            Self::DeepCloneErr => "deep_clone_err",
+            Self::IncompleteHydrate => "incomplete_hydrate",
+            Self::NonReusable => "non_reusable",
+            Self::HydratedDeclinedToExact => "hydrated_declined_to_exact",
+        }
+    }
+}
+
 /// Outcome of a prompt-cache consume decision.
 ///
 /// Read-only — the engine that produces this never `push`es. The arch maps each
@@ -1029,8 +1076,17 @@ pub(crate) enum Consumed<E> {
     /// reads as dead until a prefix-reusing arch is routed through the engine.
     #[allow(dead_code)]
     Reuse { entry: E, kind: ReuseKind },
-    /// No usable entry — re-prefill from scratch.
-    Miss,
+    /// No usable entry — re-prefill from scratch, for the reason given.
+    ///
+    /// Every arch's generate path treats all refusals alike, so nothing on the
+    /// serving path reads the reason; it is carried so a caller that must
+    /// distinguish them can, which today is the cache tests. The engine logs
+    /// the same value on its `branch` field.
+    #[allow(
+        dead_code,
+        reason = "read by the prompt-cache tests; the serving paths treat every refusal alike"
+    )]
+    Miss(MissReason),
 }
 
 /// How a `Consumed::Reuse` prefix relates to the request prompt.
@@ -1369,13 +1425,14 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
     ) -> Consumed<E> {
         // (1) Image prompts bypass the cache entirely — no find, no evict.
         if has_image {
+            let reason = MissReason::HasImage;
             tracing::debug!(
                 arch = self.arch_name,
-                branch = "has_image",
+                branch = reason.label(),
                 reason = "image prompt bypasses the token-id-keyed cache",
                 "prompt cache consume: Miss (image)"
             );
-            return Consumed::Miss;
+            return Consumed::Miss(reason);
         }
 
         // (2) Partitioned seed: identical to the per-arch push seed, so a slot
@@ -1400,13 +1457,14 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
 
         self.with_inner_mut(|guard| {
             let Some(cache) = guard.as_mut() else {
+                let reason = MissReason::NoCache;
                 tracing::debug!(
                     arch,
-                    branch = "no_cache",
+                    branch = reason.label(),
                     reason = "no cache built for this arch yet — prefill",
                     prompt_len = prompt_ids.len(),
                 );
-                return Consumed::Miss;
+                return Consumed::Miss(reason);
             };
             Self::decide_locked(
                 arch,
@@ -1458,19 +1516,21 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         // (4) Quant-mismatch guard. The snapshot is only safe to
         // reuse when the stored KvQuant equals the runtime quant.
         let Some((slot_idx, block_count)) = raw_match else {
+            let reason = MissReason::NoMatch;
             tracing::debug!(
                 arch,
-                branch = "no_match",
+                branch = reason.label(),
                 reason = "no stored slot shares a block-aligned prefix with this prompt — prefill",
                 prompt_len = prompt_ids.len(),
             );
-            return Consumed::Miss;
+            return Consumed::Miss(reason);
         };
         let stored = cache.slots[slot_idx].entry.kv_quant();
         if stored != Some(kv_quant) {
+            let reason = MissReason::QuantMismatch;
             tracing::debug!(
                 arch,
-                branch = "quant_mismatch",
+                branch = reason.label(),
                 reason = "stored KV quant differs from runtime — evict + re-prefill",
                 stored = ?stored,
                 runtime = ?kv_quant,
@@ -1484,7 +1544,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
                  degrading to re-prefill"
             );
             cache.evict_slot(slot_idx);
-            return Consumed::Miss;
+            return Consumed::Miss(reason);
         }
 
         let entry = &cache.slots[slot_idx].entry;
@@ -1497,14 +1557,15 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             return match entry.deep_clone() {
                 Ok(cloned) => Consumed::Exact(cloned),
                 Err(e) => {
+                    let reason = MissReason::DeepCloneErr;
                     tracing::debug!(
                         arch,
-                        branch = "deep_clone_err",
+                        branch = reason.label(),
                         reason = "Exact deep_clone failed — re-prefill (source slot untouched)",
                         error = %e,
                         prompt_len = prompt_ids.len(),
                     );
-                    Consumed::Miss
+                    Consumed::Miss(reason)
                 }
             };
         }
@@ -1517,13 +1578,14 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             if entry.is_hydrate_complete() {
                 true
             } else {
+                let reason = MissReason::IncompleteHydrate;
                 tracing::debug!(
                     arch,
-                    branch = "incomplete_hydrate",
+                    branch = reason.label(),
                     reason = "hydrated entry has a payload-less attended layer — re-prefill",
                     prompt_len = prompt_ids.len(),
                 );
-                return Consumed::Miss;
+                return Consumed::Miss(reason);
             }
         } else {
             policy == ReusePolicy::Partial
@@ -1539,38 +1601,41 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
                         kind,
                     },
                     Err(e) => {
+                        let reason = MissReason::DeepCloneErr;
                         tracing::debug!(
                             arch,
-                            branch = "deep_clone_err",
+                            branch = reason.label(),
                             reason = "prepare_reuse failed — re-prefill (source slot untouched)",
                             error = %e,
                             prompt_len = prompt_ids.len(),
                         );
-                        Consumed::Miss
+                        Consumed::Miss(reason)
                     }
                 };
             }
+            let reason = MissReason::NonReusable;
             tracing::debug!(
                 arch,
-                branch = "non_reusable",
+                branch = reason.label(),
                 reason = "matched slot is not a reusable prefix for this prompt — re-prefill",
                 prompt_len = prompt_ids.len(),
                 block_count,
             );
-            return Consumed::Miss;
+            return Consumed::Miss(reason);
         }
 
         // A matched non-hydrated partial under a non-Partial policy, or a
         // hydrated entry that declined the strict-prefix hook (e.g. the
         // block-aligned equal-length case) — re-prefill.
+        let reason = MissReason::HydratedDeclinedToExact;
         tracing::debug!(
             arch,
-            branch = "hydrated_declined_to_exact",
+            branch = reason.label(),
             reason = "matched slot is not Exact-eligible and reuse is not permitted — re-prefill",
             is_ssd_hydrated,
             prompt_len = prompt_ids.len(),
         );
-        Consumed::Miss
+        Consumed::Miss(reason)
     }
 
     /// Read the current hit/miss/bytes stats, or `None` if the cache has not

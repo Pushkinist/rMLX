@@ -2054,7 +2054,7 @@ fn tag<E>(c: &Consumed<E>) -> ConsumedTag {
     match c {
         Consumed::Exact(_) => ConsumedTag::Exact,
         Consumed::Reuse { kind, .. } => ConsumedTag::Reuse(*kind),
-        Consumed::Miss => ConsumedTag::Miss,
+        Consumed::Miss(_) => ConsumedTag::Miss,
     }
 }
 

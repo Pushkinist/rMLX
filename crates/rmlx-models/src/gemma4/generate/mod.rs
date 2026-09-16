@@ -226,7 +226,7 @@ pub fn generate_greedy<'a>(
             );
             prefix_hit = Some((cloned.kv_caches, prefix_len));
         }
-        Consumed::Miss => {}
+        Consumed::Miss(_) => {}
     }
 
     // Derive the initial ring size and the virtual ceiling (issue #25):

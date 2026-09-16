@@ -36,6 +36,120 @@ fn qwen36_model_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("RMLX_TEST_MODEL_QWEN36").map(std::path::PathBuf::from)
 }
 
+/// The digest seed the moe consume engine queries with, for a test that pushes
+/// an entry by hand.
+///
+/// `consume` derives its seed from the request's own codec mixture, the layout
+/// key, the layer count and the model signature. A push seeded with the bare
+/// FNV offset stores digests that query can never reproduce, so the entry is
+/// invisible and every warm arm silently becomes a Miss.
+fn moe_push_seed(model: &Qwen3_5MoeText, kv_quant: rmlx_kv_quant::KvQuant) -> u64 {
+    crate::prompt_cache::request_cache_seed(
+        prompt_cache::active_layout_key(),
+        kv_quant,
+        model.cfg.num_hidden_layers,
+        SHARES_KV_ACROSS_LAYERS,
+        model.model_sig,
+    )
+}
+
+/// The consume-engine branch the moe prompt cache reaches for `prompt_ids` in
+/// its current state, as a label a failure message can name.
+///
+/// Every hydrated-resume test here compares a warm run against a cold one, and
+/// a warm run that never reached `HydratedTail` agrees with that baseline for
+/// free — a Miss re-prefills the same prompt and decodes the same tokens. The
+/// branch is therefore measured rather than inferred from the tokens: a stored
+/// digest the query cannot reproduce (a push seeded differently from
+/// `request_cache_seed`) makes every such test pass while exercising nothing.
+///
+/// A refusal reports the engine's own `branch` label rather than a flat
+/// "Miss": every refusal re-prefills the same prompt and agrees with a cold
+/// baseline, so an arm that only asserts "it missed" has not separated the
+/// guard it is named for from a digest nothing could match.
+///
+/// Calling this leaves the slot in place — the engine never evicts on a reuse —
+/// so the generation that follows reaches the same branch.
+fn moe_consume_branch(
+    model: &Qwen3_5MoeText,
+    prompt_ids: &[u32],
+    kv_quant: rmlx_kv_quant::KvQuant,
+) -> String {
+    use crate::prompt_cache::{Consumed, ReuseKind};
+    match prompt_cache::PROMPT_CACHE.consume(
+        prompt_ids,
+        kv_quant,
+        model.cfg.num_hidden_layers,
+        false,
+        model.model_sig,
+    ) {
+        Consumed::Exact(_) => "Exact".to_owned(),
+        Consumed::Reuse {
+            kind: ReuseKind::StrictPrefix { prefix_len },
+            ..
+        } => format!("HydratedTail{{prefix_len={prefix_len}}}"),
+        Consumed::Reuse { kind, .. } => format!("Reuse{kind:?}"),
+        Consumed::Miss(reason) => reason.label().to_owned(),
+    }
+}
+
+/// Rows of a `[1, n_rows, vocab]` logits array as `f32`.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: each call is on a value this fn itself constructed from an already-materialised Array"
+)]
+fn logit_rows(logits: &Array, n_rows: usize, device: Device) -> Vec<Vec<f32>> {
+    let f32_logits = logits.astype(Dtype::F32, device).expect("astype f32");
+    Array::eval(&f32_logits).expect("materialise logits");
+    let flat: Vec<f32> = f32_logits
+        .to_bytes()
+        .expect("to_bytes")
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().expect("four bytes")))
+        .collect();
+    assert!(n_rows > 0, "logit_rows: n_rows must be non-zero");
+    let vocab = flat.len() / n_rows;
+    assert!(
+        vocab > 0,
+        "logit_rows: {n_rows} rows do not fit {} values",
+        flat.len()
+    );
+    flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect()
+}
+
+/// Index of the largest element of `row`.
+fn argmax_row(row: &[f32]) -> usize {
+    row.iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |best, (i, &x)| {
+            if x > best.1 {
+                (i, x)
+            } else {
+                best
+            }
+        })
+        .0
+}
+
+/// Largest absolute per-element difference between two logit rows.
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+/// Bound on how far two chunkings of the same arithmetic may move one logit.
+///
+/// `tests/qwen3_5_moe_forward_seq_last_k.rs` carries the same number as its own
+/// literal and the two are kept in step by hand: that file is an integration
+/// test and cannot see a `#[cfg(test)]` item of this crate's library.
+///
+/// Measured on `Qwen3.6-35B-A3B-8bit` at `KvQuant::None`: bf16 reassociation
+/// over a 248K-wide vocabulary moves a row by 0.77, a tail written at the wrong
+/// rows by 3.47, and a tail never written by 7.87.
+const TAIL_LOGIT_NOISE_BOUND: f32 = 2.0;
+
 /// Verify the softmax -> argsort top-K -> optional normalize routing math.
 ///
 /// For a two-token batch with 4 experts and top_k=2:
@@ -1968,12 +2082,15 @@ fn integration_qwen3_5_moe_35b() {
 )]
 fn hydrated_tail_produces_identical_output() {
     let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+        println!("SKIP hydrated_tail_produces_identical_output: RMLX_TEST_MODEL_QWEN36 not set");
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
+        println!(
+            "SKIP hydrated_tail_produces_identical_output: model dir not found at {}",
+            model_dir.display()
+        );
         return;
     }
 
@@ -1993,7 +2110,7 @@ fn hydrated_tail_produces_identical_output() {
         "Qwen3_5MoeForConditionalGeneration",
     ];
     if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
+        println!("SKIP hydrated_tail_produces_identical_output: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
         return;
     }
 
@@ -2002,8 +2119,10 @@ fn hydrated_tail_produces_identical_output() {
     let n_layers = model.cfg.num_hidden_layers;
     let device = Device::Gpu;
 
-    // Use unquantized KV so the test is noise-free: COLD and WARM must produce
-    // token-identical output.
+    // Unquantized KV: the codec adds no error of its own, so what remains
+    // between the two paths is the reassociation of one arithmetic chunked two
+    // ways. That is small, but it is not zero — see the note on the primary
+    // assertion below.
     let kv_quant = rmlx_kv_quant::KvQuant::None;
     let max_seq = 4096i32;
 
@@ -2133,7 +2252,7 @@ fn hydrated_tail_produces_identical_output() {
             let prefix_ids = prompt_ids[..prefix_len].to_vec();
             let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
                 &prefix_ids,
-                crate::prompt_cache::FNV_OFFSET,
+                moe_push_seed(&model, kv_quant),
             );
             let kv_snap: rmlx_core::error::Result<Vec<_>> = prefix_kv_caches
                 .iter()
@@ -2157,6 +2276,13 @@ fn hydrated_tail_produces_identical_output() {
             });
         }
     });
+
+    assert_eq!(
+        moe_consume_branch(&model, &prompt_ids, kv_quant),
+        format!("HydratedTail{{prefix_len={prefix_len}}}"),
+        "the hydrated prefix must reach HydratedTail — a Miss re-prefills the same prompt \
+         and agrees with the cold baseline while exercising nothing"
+    );
 
     let warm_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
@@ -2186,6 +2312,13 @@ fn hydrated_tail_produces_identical_output() {
     println!("WARM tokens: {warm_tokens:?}");
 
     // PRIMARY ASSERTION: HydratedTail must produce byte-identical output to COLD.
+    //
+    // This baseline is a single-shot prefill, not one split where the resume
+    // splits, so the comparison holds only while no row of this prompt carries
+    // a near-tie: one would flip the argmax and turn a correct resume red. It
+    // survives because this prompt's continuation is high-confidence. The
+    // golden's arm (b) carries the principled form — a same-split baseline for
+    // the stream, and the tail logits against the single-shot one.
     assert_eq!(
         warm_tokens, cold_tokens,
         "HydratedTail output must be byte-identical to cold prefill.\n\
@@ -2213,7 +2346,7 @@ fn hydrated_tail_produces_identical_output() {
             let prefix_ids = prompt_ids[..prefix_len].to_vec();
             let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
                 &prefix_ids,
-                crate::prompt_cache::FNV_OFFSET,
+                moe_push_seed(&model, kv_quant),
             );
             let kv_snap: rmlx_core::error::Result<Vec<_>> = prefix_kv_caches
                 .iter()
@@ -2236,6 +2369,13 @@ fn hydrated_tail_produces_identical_output() {
             });
         }
     });
+
+    assert_eq!(
+        moe_consume_branch(&model, &divergent_prompt, kv_quant),
+        "non_reusable",
+        "a stored prefix that is not a prefix of the request must be matched and then \
+         refused — a failure to match says nothing about the strict-prefix gate"
+    );
 
     let divergent_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
@@ -2344,12 +2484,17 @@ fn hydrated_tail_produces_identical_output() {
 )]
 fn hydrated_exact_block_no_tail_not_placeholder() {
     let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+        println!(
+            "SKIP hydrated_exact_block_no_tail_not_placeholder: RMLX_TEST_MODEL_QWEN36 not set"
+        );
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
+        println!(
+            "SKIP hydrated_exact_block_no_tail_not_placeholder: model dir not found at {}",
+            model_dir.display()
+        );
         return;
     }
 
@@ -2368,7 +2513,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
         "Qwen3_5MoeForConditionalGeneration",
     ];
     if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
+        println!("SKIP hydrated_exact_block_no_tail_not_placeholder: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
         return;
     }
 
@@ -2499,7 +2644,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
             cache.clear();
             let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
                 &prompt_ids,
-                crate::prompt_cache::FNV_OFFSET,
+                moe_push_seed(&model, kv_quant),
             );
             let kv_snap: rmlx_core::error::Result<Vec<_>> = full_kv_caches
                 .iter()
@@ -2526,6 +2671,28 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
             });
         }
     });
+
+    // A Miss also spells "nothing matched", so the entry is shown to be findable
+    // first: one more token makes the same stored ids a strict prefix, which
+    // must reach the tail path. The equal-length Miss below is then the
+    // strict-`<` guard declining, not an invisible digest.
+    let extended_prompt: Vec<u32> = {
+        let mut v = prompt_ids.clone();
+        v.push(1);
+        v
+    };
+    assert_eq!(
+        moe_consume_branch(&model, &extended_prompt, kv_quant),
+        format!("HydratedTail{{prefix_len={}}}", prompt_ids.len()),
+        "the stored hydrated entry must be findable — otherwise the Miss below says nothing \
+         about the strict-< guard"
+    );
+    assert_eq!(
+        moe_consume_branch(&model, &prompt_ids, kv_quant),
+        "non_reusable",
+        "the strict-< guard must refuse a matched block-aligned equal-length hydrated \
+         entry — a failure to match says nothing about the guard"
+    );
 
     let warm_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
@@ -2614,12 +2781,15 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
 )]
 fn hydrated_tail_k8v8_equivalence() {
     let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+        println!("SKIP hydrated_tail_k8v8_equivalence: RMLX_TEST_MODEL_QWEN36 not set");
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
+        println!(
+            "SKIP hydrated_tail_k8v8_equivalence: model dir not found at {}",
+            model_dir.display()
+        );
         return;
     }
 
@@ -2638,7 +2808,9 @@ fn hydrated_tail_k8v8_equivalence() {
         "Qwen3_5MoeForConditionalGeneration",
     ];
     if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
+        println!(
+            "SKIP hydrated_tail_k8v8_equivalence: arch \"{arch_str}\" is not a Qwen3.5-MoE arch"
+        );
         return;
     }
 
@@ -2761,7 +2933,7 @@ fn hydrated_tail_k8v8_equivalence() {
             let prefix_ids = prompt_ids[..prefix_len].to_vec();
             let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
                 &prefix_ids,
-                crate::prompt_cache::FNV_OFFSET,
+                moe_push_seed(&model, kv_quant),
             );
             let kv_snap: rmlx_core::error::Result<Vec<_>> = prefix_kv_caches
                 .iter()
@@ -2784,6 +2956,13 @@ fn hydrated_tail_k8v8_equivalence() {
             });
         }
     });
+
+    assert_eq!(
+        moe_consume_branch(&model, &prompt_ids, kv_quant),
+        format!("HydratedTail{{prefix_len={prefix_len}}}"),
+        "the K8V8 hydrated prefix must reach HydratedTail — a Miss re-prefills the same \
+         prompt and agrees with the cold baseline while exercising nothing"
+    );
 
     let warm_tokens: Vec<u32> = {
         let mut rng = crate::sampler::Pcg32::new(sampler_cfg.seed_or_default());
@@ -2829,7 +3008,11 @@ fn hydrated_tail_k8v8_equivalence() {
         println!("WARM: {warm_tokens:?}");
     }
 
-    // ASSERTION: byte-identical.  If this fails, the evidence is already printed.
+    // ASSERTION: byte-identical. If this fails, the evidence is already printed.
+    //
+    // As in the unquantized sibling, the baseline is a single-shot prefill: the
+    // comparison holds while no row of this prompt carries a near-tie, and the
+    // golden's arm (b) carries the principled form.
     assert_eq!(
         warm_tokens, cold_tokens,
         "BUG-2: HydratedTail at K8V8 diverged from cold prefill.\n\
@@ -2849,8 +3032,9 @@ fn hydrated_tail_k8v8_equivalence() {
 /// Pins that routing qwen3.5-moe through the shared `consume()` engine is
 /// behavior-identical to the pre-migration inline dispatch across all three
 /// outcomes reachable for this hybrid GDN arch under `ReusePolicy::ExactOnly`.
-/// At temp 0, every reuse/degrade path must decode token-identically to a cold
-/// (Miss) baseline of the SAME prompt:
+/// Every arm asserts the branch the engine actually reached, then its own
+/// outcome; a degrade arm decodes token-identically to a cold (Miss) baseline
+/// of the SAME prompt, and the resume arm is judged on its logits:
 ///   (a) ExactOnly forbids a RAM (non-hydrated) PARTIAL match: a 512-token RAM
 ///       snapshot whose first block is shared with a divergent 512-token request
 ///       (1 shared full block, then diverges) → the ExactOnly policy gate
@@ -2858,8 +3042,12 @@ fn hydrated_tail_k8v8_equivalence() {
 ///       GDN `lin_caches` are never block-truncated.
 ///   (b) hydrated strict-prefix HydratedTail resume: an SSD-hydrated 512-token
 ///       block-aligned prefix that the request extends to 520 tokens →
-///       `Reuse{StrictPrefix}` → restore + tail-only re-prefill → WARM ==
-///       COLD(520).
+///       `Reuse{StrictPrefix}` → restore + tail-only re-prefill. Judged on the
+///       tail logits against a single-shot cold forward (argmax at every tail
+///       position, plus the `qwen3_5_moe_forward_seq_last_k` bound), not on
+///       the decoded stream: the two paths chunk the same arithmetic
+///       differently, so a bf16 tie in a 248K-wide row decodes different text
+///       from two equally correct states.
 ///   (c) hydrated block-aligned EQUAL-length exclusion (the strict-`<` guard): an
 ///       SSD-hydrated 512-token entry whose prefix length equals the full
 ///       512-token prompt (no tail, placeholder first_id 0) → both the Exact
@@ -2892,12 +3080,17 @@ fn hydrated_tail_k8v8_equivalence() {
 )]
 fn qwen3_5_moe_consume_engine_migration_golden() {
     let Some(model_dir_buf) = qwen36_model_dir() else {
-        println!("SKIP: RMLX_TEST_MODEL_QWEN36 not set");
+        println!(
+            "SKIP qwen3_5_moe_consume_engine_migration_golden: RMLX_TEST_MODEL_QWEN36 not set"
+        );
         return;
     };
     let model_dir = model_dir_buf.as_path();
     if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
+        println!(
+            "SKIP qwen3_5_moe_consume_engine_migration_golden: model dir not found at {}",
+            model_dir.display()
+        );
         return;
     }
     let arch_str = {
@@ -2915,7 +3108,7 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
         "Qwen3_5MoeForConditionalGeneration",
     ];
     if !expected_archs.contains(&arch_str.as_str()) {
-        println!("SKIP: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
+        println!("SKIP qwen3_5_moe_consume_engine_migration_golden: arch \"{arch_str}\" is not a Qwen3.5-MoE arch");
         return;
     }
 
@@ -2924,8 +3117,10 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
     let n_layers = model.cfg.num_hidden_layers;
     let device = Device::Gpu;
 
-    // Unquantized KV so the comparison is noise-free: warm == cold must hold
-    // token-for-token.
+    // Unquantized KV: the codec adds no error of its own. What remains between
+    // a resume and a single-shot prefill is the reassociation of one arithmetic
+    // chunked two ways — small, and not zero, which is why the resume arm is
+    // judged against a cold baseline split where it splits.
     let kv_quant = rmlx_kv_quant::KvQuant::None;
     let max_seq = 4096i32;
     let n_decode = 6usize; // short — Qwen3.6 is a 35B model
@@ -2980,21 +3175,29 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
 
     // Build a real (physically correct) KV/lin snapshot for `ids` via the same
     // KV stack + enter/exit_prefill bracketing as generate_greedy's Miss path.
-    let make_snapshot = |ids: &[u32]| -> (
+    let fresh_caches = || -> (
         Vec<rmlx_kv_quant::KvCache>,
         Vec<rmlx_kv_quant::LinearAttnCache>,
     ) {
-        let mut kv_caches: Vec<rmlx_kv_quant::KvCache> =
+        (
             crate::kv_cache::kv_layer_quants(n_layers, kv_quant, false)
                 .into_iter()
                 .enumerate()
                 .map(|(i, q)| {
                     rmlx_kv_quant::KvCache::with_quant_max_seq(q, max_seq).with_layer_idx(i)
                 })
-                .collect();
-        let mut lin_caches: Vec<rmlx_kv_quant::LinearAttnCache> = (0..n_layers)
-            .map(|_| rmlx_kv_quant::LinearAttnCache::new())
-            .collect();
+                .collect(),
+            (0..n_layers)
+                .map(|_| rmlx_kv_quant::LinearAttnCache::new())
+                .collect(),
+        )
+    };
+
+    let make_snapshot = |ids: &[u32]| -> (
+        Vec<rmlx_kv_quant::KvCache>,
+        Vec<rmlx_kv_quant::LinearAttnCache>,
+    ) {
+        let (mut kv_caches, mut lin_caches) = fresh_caches();
         for c in &mut kv_caches {
             c.enter_prefill();
         }
@@ -3038,13 +3241,7 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
             if let Some(cache) = guard.as_mut() {
                 let block_hashes = crate::prompt_cache::chained_block_hashes_seeded(
                     key_ids,
-                    crate::prompt_cache::request_cache_seed(
-                        prompt_cache::active_layout_key(),
-                        kv_quant,
-                        model.cfg.num_hidden_layers,
-                        SHARES_KV_ACROSS_LAYERS,
-                        model.model_sig,
-                    ),
+                    moe_push_seed(&model, kv_quant),
                 );
                 cache.push(Qwen35MoeEntry {
                     prompt_token_ids: key_ids.to_vec(),
@@ -3089,6 +3286,11 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
     // a (forbidden) partial reuse would be detectable, but the test asserts the
     // tokens equal the cold re-prefill regardless.
     push_entry(&p512, kv512, lin512, false, 7u32);
+    assert_eq!(
+        moe_consume_branch(&model, &p512_div, kv_quant),
+        "hydrated_declined_to_exact",
+        "(a) ExactOnly must refuse a matched non-hydrated partial — not fail to match it"
+    );
     let warm_partial = run(&p512_div);
     println!("(a) RAM-partial degrade: cold={cold_div:?} warm={warm_partial:?}");
     assert_eq!(
@@ -3097,19 +3299,123 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
          equal to the cold baseline for the divergent prompt"
     );
 
-    // ── (b) hydrated strict-prefix HydratedTail resume → warm == cold ────────
+    // ── (b) hydrated strict-prefix HydratedTail resume ───────────────────────
     // SSD-hydrated 512-token block-aligned prefix; request extends it to 520
     // tokens. The strict-`<` HydratedTail gate fires → restore + tail-only
-    // re-prefill → WARM == COLD(520).
+    // re-prefill.
+    //
+    // The oracle is the tail logits, not the decoded stream. A resumed tail and
+    // a single-shot cold prefill are the same arithmetic in a different
+    // chunking, so their rows agree to bf16 noise and never bit-for-bit; across
+    // a 248K-wide vocabulary a row can hold an exact tie, and two equally
+    // correct states then decode different text from it. Measured on this
+    // prompt at KvQuant::None: the two paths agree on the argmax at all eight
+    // tail positions and no row moves by more than 0.77, but one decode step
+    // on, two ids sit at 10.125 apiece — an exact bf16 tie, broken toward the
+    // lower id — so a 6-token stream comparison reports a tie-break as
+    // corruption. Argmax at every tail position plus the
+    // `qwen3_5_moe_forward_seq_last_k` bound is what a stale, zeroed or
+    // mis-placed tail cannot pass: those move a row by tens.
     let p520: Vec<u32> = {
         let mut v = p512.clone();
         v.extend(make_ids(8, 5)); // 8-token tail with a distinct salt
         v
     };
+    let tail_len = p520.len() - p512.len();
     clear_cache();
     let cold_520 = run(&p520);
+    assert_eq!(cold_520.len(), n_decode);
+
+    // The same cold prompt, prefilled in the two chunks the resume splits it
+    // into. This is what the resume claims to equal — "identical to pausing and
+    // resuming the original prefill at the block boundary" — and it is the only
+    // baseline the whole decoded stream can be held to: the single-shot cold
+    // above runs one 520-query attention and lands on the other side of a bf16
+    // tie one decode step in. Measured byte-identical to the resume, logits and
+    // all, which is what makes the six-token comparison below meaningful rather
+    // than lucky.
+    let cold_520_chunked = {
+        crate::prefill_chunk::set_prefill_chunk(p512.len());
+        clear_cache();
+        let tokens = run(&p520);
+        crate::prefill_chunk::set_prefill_chunk(0);
+        tokens
+    };
+    println!("(b) cold at the resume's own 512|8 split: {cold_520_chunked:?}");
+
     let (kv_pref, lin_pref) = make_snapshot(&p512);
+
+    // (b.1) The seam's numerics: the tail forwarded on top of the restored
+    // caches, against a single-shot cold forward of the whole prompt.
+    let hydrated_rows = {
+        let mut kv: Vec<rmlx_kv_quant::KvCache> = kv_pref
+            .iter()
+            .map(|c| c.try_deep_clone().expect("clone hydrated kv"))
+            .collect();
+        let mut lin: Vec<rmlx_kv_quant::LinearAttnCache> = lin_pref
+            .iter()
+            .map(|c| c.try_deep_clone().expect("clone hydrated lin"))
+            .collect();
+        let logits = model
+            .forward_seq_last_k_with_cache(
+                &p520[p512.len()..],
+                tail_len,
+                &mut kv,
+                Some(&mut lin),
+                device,
+            )
+            .expect("hydrated tail forward");
+        logit_rows(&logits, tail_len, device)
+    };
+    let reference_rows = {
+        let (mut kv, mut lin) = fresh_caches();
+        let logits = model
+            .forward_seq_last_k_with_cache(&p520, tail_len, &mut kv, Some(&mut lin), device)
+            .expect("cold reference forward");
+        logit_rows(&logits, tail_len, device)
+    };
+    assert_eq!(hydrated_rows.len(), tail_len);
+    assert_eq!(reference_rows.len(), tail_len);
+    let mut tail_max_diff = 0.0f32;
+    for (pos, (warm_row, cold_row)) in hydrated_rows.iter().zip(reference_rows.iter()).enumerate() {
+        assert!(
+            !warm_row.iter().any(|x| x.is_nan()),
+            "(b) hydrated tail logits contain NaN at tail position {pos}"
+        );
+        // The comparisons below cannot see a NaN on the cold side: `f32::max`
+        // and `argmax_row` both skip it, so a NaN reference row reads as
+        // agreement.
+        assert!(
+            !cold_row.iter().any(|x| x.is_nan()),
+            "(b) cold reference logits contain NaN at tail position {pos}"
+        );
+        tail_max_diff = tail_max_diff.max(max_abs_diff(warm_row, cold_row));
+        assert_eq!(
+            argmax_row(warm_row),
+            argmax_row(cold_row),
+            "(b) hydrated tail argmax differs from the single-shot cold reference at tail \
+             position {pos} (max_abs_diff so far {tail_max_diff}) — the restored tail is not \
+             the prompt's own state at that position"
+        );
+    }
+    assert!(
+        tail_max_diff < TAIL_LOGIT_NOISE_BOUND,
+        "(b) hydrated tail logits diverge from the single-shot cold reference beyond bf16 \
+         reassociation: max_abs_diff={tail_max_diff}"
+    );
+    println!(
+        "(b) hydrated tail logits == cold reference: positions={tail_len} \
+         max_abs_diff={tail_max_diff}"
+    );
+
+    // (b.2) The dispatch this arm is named for, and the first decoded token.
     push_entry(&p512, kv_pref, lin_pref, true, 0u32);
+    let branch = moe_consume_branch(&model, &p520, kv_quant);
+    assert_eq!(
+        branch,
+        format!("HydratedTail{{prefix_len={}}}", p512.len()),
+        "(b) the engine must reach HydratedTail for a hydrated strict prefix"
+    );
     let warm_tail = run(&p520);
     println!("(b) HydratedTail: cold={cold_520:?} warm={warm_tail:?}");
     assert_ne!(
@@ -3118,9 +3424,20 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
         "(b) HydratedTail resume must decode a real first token, never the placeholder 0"
     );
     assert_eq!(
-        warm_tail, cold_520,
-        "(b) hydrated strict-prefix HydratedTail resume must equal the cold baseline for the \
-         extended 520-token prompt"
+        warm_tail.first(),
+        cold_520.first(),
+        "(b) the resumed state must select the same first token as the single-shot cold \
+         baseline"
+    );
+
+    // (b.3) The whole stream. Everything above stops at the tail: the GDN state
+    // the tail leaves behind, and the first KV append on a resumed offset, are
+    // reached only by decoding. #571's own symptom — token 0 right and a cycle
+    // from token 1 — lives entirely in that gap.
+    assert_eq!(
+        warm_tail, cold_520_chunked,
+        "(b) the resumed stream must equal a cold prefill split at the same boundary, \
+         token for token"
     );
 
     // ── (c) hydrated block-aligned EQUAL-length exclusion (strict-`<` guard) ──
@@ -3133,6 +3450,21 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
     assert_ne!(cold_512[0], 0, "cold 512 first token is 0 — anomaly");
     let (kv_full, lin_full) = make_snapshot(&p512);
     push_entry(&p512, kv_full, lin_full, true, 0u32);
+    // A Miss also spells "nothing matched", so the entry is shown to be
+    // findable first: the same stored prefix under a request that extends it
+    // reaches the tail path. What declines the equal-length request is then the
+    // strict-`<` guard, not an invisible digest.
+    assert_eq!(
+        moe_consume_branch(&model, &p520, kv_quant),
+        format!("HydratedTail{{prefix_len={}}}", p512.len()),
+        "(c) the stored hydrated entry must be findable — otherwise the Miss below says \
+         nothing about the strict-< guard"
+    );
+    assert_eq!(
+        moe_consume_branch(&model, &p512, kv_quant),
+        "non_reusable",
+        "(c) the strict-< guard must refuse a matched block-aligned equal-length hydrated entry"
+    );
     let warm_equal = run(&p512);
     println!("(c) hydrated equal-length exclusion: cold={cold_512:?} warm={warm_equal:?}");
     assert_ne!(
@@ -3147,8 +3479,8 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
     );
 
     println!(
-        "PASS: qwen3_5_moe consume-engine migration golden — RAM-partial degrade / \
-         hydrated strict-prefix HydratedTail / hydrated equal-length exclusion all match \
-         their cold baselines"
+        "PASS: qwen3_5_moe consume-engine migration golden — RAM-partial degrade and \
+         hydrated equal-length exclusion match their cold baselines, hydrated strict-prefix \
+         HydratedTail matches the cold reference logits"
     );
 }

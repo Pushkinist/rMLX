@@ -335,6 +335,42 @@ full-token-equality Exact hit is routed to `CacheLookup::Miss` and triggers a
 full re-prefill. The Exact path verifies token identity by comparing
 `entry.prompt_token_ids()` byte-for-byte with the incoming prompt.
 
+### Judging a resume arm
+
+**A resume arm cannot be judged by byte equality against a cold baseline, and a
+warm arm that agrees with one has not necessarily run.** Two things make the
+obvious oracle wrong, and both have been measured on
+`Qwen3.6-35B-A3B-8bit` at `KvQuant::None`:
+
+- *A resume is not a re-prefill.* Restoring at a block boundary and forwarding
+  the tail is the same arithmetic a single-shot prefill runs, chunked
+  differently, so the rows agree to bf16 noise but not, in general, bit for bit.
+  Over a 248K-wide vocabulary a row can hold an exact tie: on a 512-token prefix
+  extended to 520, the two paths pick the same id at all eight tail positions
+  and differ by at most **0.77**, and one decode step on, two ids sit at 10.125
+  apiece. The argmax breaks that toward the lower id, and six greedy tokens
+  later the two streams share nothing. A stream comparison reports it as
+  corruption.
+
+  Four numbers set the oracle, all measured on that pair at `KvQuant::None`:
+  reassociation moves a logit by **0.77**; the tolerance is **2.0**, the literal
+  `tests/qwen3_5_moe_forward_seq_last_k.rs` uses; a tail written at the wrong
+  rows moves one by **3.47**; a tail never written moves one by **7.87**. Both
+  mutations also flip an argmax inside the eight tail positions, which is the
+  primary check — the tolerance is the secondary one.
+
+  The decoded stream can still be compared token for token, but only against a
+  cold prefill **split where the resume splits** (`set_prefill_chunk`). That
+  pair is byte-identical, logits included, and it is the only baseline that
+  reaches what the tail leaves behind: the recurrent state after the tail, and
+  the first KV append on a resumed offset.
+- *A Miss agrees with the cold baseline for free.* It re-prefills the same
+  prompt. A test that pushes an entry by hand must seed its block digests with
+  `request_cache_seed` — the seed `consume` queries with — or the entry is
+  invisible, every warm arm is a Miss, and the comparison passes while
+  exercising nothing. Assert the branch the engine reached, and where that
+  branch is itself `Miss`, show first that the entry was findable.
+
 ---
 
 ## LRU eviction
