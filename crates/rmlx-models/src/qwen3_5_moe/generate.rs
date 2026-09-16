@@ -181,7 +181,7 @@ pub fn generate_greedy<'a>(
                  degrading to full re-prefill"
             );
         }
-        Consumed::Miss => {}
+        Consumed::Miss(_) => {}
     }
 
     // Path A: exact match

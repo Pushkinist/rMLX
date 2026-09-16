@@ -344,16 +344,26 @@ obvious oracle wrong, and both have been measured on
 
 - *A resume is not a re-prefill.* Restoring at a block boundary and forwarding
   the tail is the same arithmetic a single-shot prefill runs, chunked
-  differently, so the rows agree to bf16 noise and never bit for bit. Over a
-  248K-wide vocabulary a row can hold an exact tie: on a 512-token prefix
+  differently, so the rows agree to bf16 noise but not, in general, bit for bit.
+  Over a 248K-wide vocabulary a row can hold an exact tie: on a 512-token prefix
   extended to 520, the two paths pick the same id at all eight tail positions
-  and differ by at most 0.77, and one decode step on, two ids sit at 10.125
+  and differ by at most **0.77**, and one decode step on, two ids sit at 10.125
   apiece. The argmax breaks that toward the lower id, and six greedy tokens
   later the two streams share nothing. A stream comparison reports it as
-  corruption. The bound that separates the two is the one
-  `tests/qwen3_5_moe_forward_seq_last_k.rs` uses — argmax at every position plus
-  a per-logit tolerance; a stale, zeroed or mis-placed tail moves a row by tens
-  (measured: 3.5 to 7.9, with an argmax flip inside the first six positions).
+  corruption.
+
+  Four numbers set the oracle, all measured on that pair at `KvQuant::None`:
+  reassociation moves a logit by **0.77**; the tolerance is **2.0**, the literal
+  `tests/qwen3_5_moe_forward_seq_last_k.rs` uses; a tail written at the wrong
+  rows moves one by **3.47**; a tail never written moves one by **7.87**. Both
+  mutations also flip an argmax inside the eight tail positions, which is the
+  primary check — the tolerance is the secondary one.
+
+  The decoded stream can still be compared token for token, but only against a
+  cold prefill **split where the resume splits** (`set_prefill_chunk`). That
+  pair is byte-identical, logits included, and it is the only baseline that
+  reaches what the tail leaves behind: the recurrent state after the tail, and
+  the first KV append on a resumed offset.
 - *A Miss agrees with the cold baseline for free.* It re-prefills the same
   prompt. A test that pushes an entry by hand must seed its block digests with
   `request_cache_seed` — the seed `consume` queries with — or the entry is
