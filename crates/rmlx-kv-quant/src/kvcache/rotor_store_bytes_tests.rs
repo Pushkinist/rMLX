@@ -51,6 +51,39 @@
 //! `Rotor{3,4}` needs `B * kv_h * seq * head_dim % 128 == 0` on **every**
 //! chunk including a one-token step, and the turbo V side of the asym pair
 //! needs `head_dim % 32 == 0`. Both shapes satisfy both.
+//!
+//! # What this pin cannot see
+//!
+//! Named so the collapse's reviewer knows where this file stops. Every item
+//! here is inside, or reached from, the four files the collapse unifies, and no
+//! assertion in this file can turn red on a defect in it.
+//!
+//! * **The `exit_prefill` bulk-encode arms** (`kvcache/update.rs`, the
+//!   `Rotor*` arms of the `exit_prefill` match). This file drives `update`
+//!   with `in_prefill` false, which is the only CPU route on which all eight
+//!   spellings write a store — but it is *not* the route production takes.
+//!   For the four spellings that do read their store at decode, the store a
+//!   served request reads is the one those arms bulk-encode. A defect confined
+//!   to an arm is invisible here and shows only in a served digest.
+//! * **`gpu_append` and `gpu_packed_view`** on all four stores, and the
+//!   ring-readback branch of `synced_rotor_v_blocks` / `synced_rotor_k_blocks`.
+//!   Unreachable from a `Device::Cpu` drive. These are six of the differing
+//!   sites in each storage pair, so they are the largest unseen surface.
+//!   Only the `#[ignore]` GPU suite reaches them.
+//! * **`from_cpu_blocks` and `try_deep_clone`** — the SSD-hydrate and
+//!   branch-clone constructors. Never called on this path.
+//! * **The five unpinned asymmetric V configurations.**
+//!   `validate_rotor_k_asym_v` accepts `(4, 128|64|32)` and `(3|2, 64)`: ten
+//!   cells across the two asym K widths, of which four are pinned here
+//!   (`v4_g64`, from `ALL_KV_QUANTS`, and `v2_g64`). A defect that appears only
+//!   at `v4_g128`, `v4_g32` or `v3_g64` is not seen.
+//! * **Bit-exactness under a different toolchain.** The pins are f32 results
+//!   from this host's codegen. They judge one change on one toolchain; they are
+//!   not a portable golden.
+//!
+//! `truncate_to` **is** covered — the drive rolls back into the bulk chunk
+//! after the decode steps, so both halves of the truncate plan run and the
+//! post-truncate store bytes are a pinned column.
 
 use super::core::KvCache;
 use crate::rotor_qjl::rotor_qjl_enabled;
@@ -351,6 +384,12 @@ struct CellObservation {
     store_after_chunk: u64,
     /// Store digest after the last decode step.
     store_after_decode: u64,
+    /// Store digest after truncating back into the bulk chunk.
+    ///
+    /// `truncate_to` is inside the files the collapse unifies and is reached by
+    /// no other assertion in the tree — the block-truncate suite states that it
+    /// covers the plan, not the rotor stores' calls to it.
+    store_after_truncate: u64,
     /// Digest of the K/V rows the attention received, chunk and every step.
     rows: u64,
     /// `KvCache::resident_bytes` after the last decode step.
@@ -395,38 +434,75 @@ fn drive(quant: KvQuant, shape: (i32, i32)) -> CellObservation {
         rows.extend_from_slice(&array_bytes(&vo));
     }
 
+    let store_after_decode = store_digest(&cache.storage);
+    let resident_bytes = cache.resident_bytes();
+
+    // Roll back into the bulk chunk: drops whole decode blocks and splits the
+    // chunk block, so both halves of the truncate plan run.
+    cache
+        .truncate_to(CHUNK_SEQ + 1)
+        .expect("truncate into the bulk chunk");
+
     CellObservation {
         store_after_chunk,
-        store_after_decode: store_digest(&cache.storage),
+        store_after_decode,
+        store_after_truncate: store_digest(&cache.storage),
         rows: fnv1a64(&rows),
-        resident_bytes: cache.resident_bytes(),
+        resident_bytes,
     }
 }
 
-/// The eight rotor spellings, in `ALL_KV_QUANTS` order.
+/// Every rotor spelling the enum can spell, in `ALL_KV_QUANTS` order.
+///
+/// The filter is the enum's own `Display`, not a hand-written variant list. A
+/// list would name only the variants that existed when it was written, so a
+/// ninth rotor variant would never enter `want` and the census below would stay
+/// green with nothing pinned — a gate that cannot fail on the one event it
+/// exists for. Every `Display` arm whose text contains `rotor` is a rotor
+/// spelling and no other arm's text does (`RotK` renders `rot_k_v8g64`), so the
+/// text is the membership test. `ROTOR_SPELLING_COUNT` is the anchor beside it:
+/// a variant added to the enum and not to `ALL_KV_QUANTS` moves the count
+/// rather than passing quietly.
 fn rotor_spellings() -> Vec<KvQuant> {
     ALL_KV_QUANTS
         .iter()
         .copied()
-        .filter(|q| {
-            matches!(
-                q,
-                KvQuant::Rotor3
-                    | KvQuant::Rotor4
-                    | KvQuant::Rotor3Sym
-                    | KvQuant::Rotor4Sym
-                    | KvQuant::RotorKOnly3
-                    | KvQuant::RotorKOnly4
-                    | KvQuant::RotorK3Asym { .. }
-                    | KvQuant::RotorK4Asym { .. }
-            )
-        })
+        .filter(|q| q.to_string().contains("rotor"))
         .collect()
 }
 
+/// Rotor spellings `ALL_KV_QUANTS` holds today.
+const ROTOR_SPELLING_COUNT: usize = 8;
+
+/// Legal asymmetric-V configurations pinned beyond the one `ALL_KV_QUANTS`
+/// lists.
+///
+/// `validate_rotor_k_asym_v` accepts `(4, 128|64|32)` and `(3|2, 64)` — five V
+/// configurations per asym K width, ten cells, of which `ALL_KV_QUANTS` names
+/// two (`v4_g64`). One more per width is pinned here so the turbo V companion
+/// plane is exercised at a second width; the remaining six are named as a blind
+/// spot in the module doc.
+const EXTRA_ASYM_CELLS: &[KvQuant] = &[
+    KvQuant::RotorK3Asym {
+        v_bits: 2,
+        v_group_size: 64,
+    },
+    KvQuant::RotorK4Asym {
+        v_bits: 2,
+        v_group_size: 64,
+    },
+];
+
+/// Every cell this file pins: the census population plus the extra asym ones.
+fn pinned_spellings() -> Vec<KvQuant> {
+    let mut v = rotor_spellings();
+    v.extend_from_slice(EXTRA_ASYM_CELLS);
+    v
+}
+
 /// One pinned cell: `(spelling, kv_h, head_dim, store_after_chunk,
-/// store_after_decode, rows, resident_bytes)`.
-type Pin = (&'static str, i32, i32, u64, u64, u64, u64);
+/// store_after_decode, store_after_truncate, rows, resident_bytes)`.
+type Pin = (&'static str, i32, i32, u64, u64, u64, u64, u64);
 
 /// The "before" side of the oracle, captured on the tree the unification
 /// starts from. Any generic type that produces a different byte anywhere in a
@@ -439,6 +515,7 @@ const PINS: &[Pin] = &[
         128,
         0x1ed845adb123e5ee,
         0x1e571e07547424e2,
+        0xf82cf5a28169ab93,
         0xe7647b0b20c759c3,
         10408,
     ),
@@ -448,6 +525,7 @@ const PINS: &[Pin] = &[
         96,
         0x5a9a75ad98dbff6e,
         0xb5a91bb8732a70e3,
+        0xe883cf5c009430d5,
         0x2eaa7c3738755823,
         29348,
     ),
@@ -457,6 +535,7 @@ const PINS: &[Pin] = &[
         128,
         0x5019a8983d996afb,
         0x3b9449664bfe5ee9,
+        0xfbaa64d468b60e22,
         0x09cb079e9d9c0162,
         10840,
     ),
@@ -466,6 +545,7 @@ const PINS: &[Pin] = &[
         96,
         0x5604a3481e53d582,
         0x957c315504d7762e,
+        0xbe7687612cfa6f42,
         0x0734d38d67915639,
         30644,
     ),
@@ -475,6 +555,7 @@ const PINS: &[Pin] = &[
         128,
         0x089c86e490eae161,
         0x243891f2ec0372d3,
+        0x86c7ac2a3ff92278,
         0x3f584ea60f053542,
         13688,
     ),
@@ -484,6 +565,7 @@ const PINS: &[Pin] = &[
         96,
         0x00e0eb309de8abef,
         0x083dcfad1d9e7cd1,
+        0x6c90492265b304ab,
         0xb67d5fffa6001c79,
         37312,
     ),
@@ -493,6 +575,7 @@ const PINS: &[Pin] = &[
         128,
         0x7e7bab52e333a78e,
         0xc8b1ce91d3ca5cd0,
+        0xf590e158285dc43d,
         0x3214878d3d23cbb0,
         14552,
     ),
@@ -502,6 +585,7 @@ const PINS: &[Pin] = &[
         96,
         0x136ab1a37d733720,
         0xf2bd9beafc3a6fad,
+        0x4947b7f23c9d75bd,
         0x58fc19598bce7220,
         39904,
     ),
@@ -511,6 +595,7 @@ const PINS: &[Pin] = &[
         128,
         0xe15421eb720f5bf6,
         0x8e1e446cf171a70c,
+        0xab0fbda0b7ce237a,
         0x9114ea2b45c7252a,
         20668,
     ),
@@ -520,6 +605,7 @@ const PINS: &[Pin] = &[
         96,
         0x2ce1794f8a160e1e,
         0x881874691537c40c,
+        0x96894cb8d7eec498,
         0x98dd682b49ca4a0f,
         60128,
     ),
@@ -529,6 +615,7 @@ const PINS: &[Pin] = &[
         128,
         0x21b7b28b9ccbbc50,
         0x097e70bb08c9d3ec,
+        0x801ca86955ac7a4e,
         0x955a08ac7bb6b53d,
         21100,
     ),
@@ -538,6 +625,7 @@ const PINS: &[Pin] = &[
         96,
         0x196729fd5de0a073,
         0x78b22765f4d5d5c9,
+        0x07eb676905b1d9cd,
         0x0aa5a5e6d96acf64,
         61424,
     ),
@@ -547,6 +635,7 @@ const PINS: &[Pin] = &[
         128,
         0x23c9d791bd7f63b1,
         0x248e9ec82dbfce08,
+        0x560c46b783a4dbf1,
         0xbebe17013e29623a,
         9004,
     ),
@@ -556,6 +645,7 @@ const PINS: &[Pin] = &[
         96,
         0x89e2ca6de16a00fd,
         0xdf1edf05cd8a6c9c,
+        0xf909ef33322bd90e,
         0x014e5234606b831e,
         25136,
     ),
@@ -565,6 +655,7 @@ const PINS: &[Pin] = &[
         128,
         0xae9d7a1b3db30a4b,
         0x0bdb862c5dc9a3e8,
+        0x29e88962f8f5467d,
         0x7c094ddc85b88e75,
         9436,
     ),
@@ -574,8 +665,49 @@ const PINS: &[Pin] = &[
         96,
         0xce80650dc2fd9a9e,
         0x51049c4dabafe681,
+        0xc9ef829eb8b2a65f,
         0x917c916ab86c2e89,
         26432,
+    ),
+    (
+        "rotor_k_3_asym_v2_g64",
+        1,
+        128,
+        0x81aa509679c2f5fb,
+        0x5f88a19815279032,
+        0x386546877a5f6a40,
+        0x74451fea33532a74,
+        8140,
+    ),
+    (
+        "rotor_k_3_asym_v2_g64",
+        4,
+        96,
+        0x0aa34997cbaa2b26,
+        0x7e3dba5449561f16,
+        0x6a7a97da4547e2fd,
+        0xbced5e69c4fb3c23,
+        22544,
+    ),
+    (
+        "rotor_k_4_asym_v2_g64",
+        1,
+        128,
+        0x65436689dd57d7b9,
+        0x1b7486829a862092,
+        0xae961aa1f44a8ad4,
+        0xb8c83ffd009a9d6f,
+        8572,
+    ),
+    (
+        "rotor_k_4_asym_v2_g64",
+        4,
+        96,
+        0x1a4839b920be76e9,
+        0x31b37924da91e83b,
+        0x49ad9decdcdf5adc,
+        0x007c598a3eaac36c,
+        23840,
     ),
 ];
 
@@ -606,17 +738,18 @@ fn rotor_store_bytes_are_pinned_per_spelling_and_shape() {
     assert_qjl_off();
     let mut missing = Vec::new();
     let mut observed = Vec::new();
-    for quant in rotor_spellings() {
+    for quant in pinned_spellings() {
         let name = quant.to_string();
         for shape in [SHAPE_A, SHAPE_B] {
             let obs = drive(quant, shape);
             observed.push(format!(
-                "    (\"{}\", {}, {}, {:#018x}, {:#018x}, {:#018x}, {}),",
+                "    (\"{}\", {}, {}, {:#018x}, {:#018x}, {:#018x}, {:#018x}, {}),",
                 name,
                 shape.0,
                 shape.1,
                 obs.store_after_chunk,
                 obs.store_after_decode,
+                obs.store_after_truncate,
                 obs.rows,
                 obs.resident_bytes
             ));
@@ -636,12 +769,17 @@ fn rotor_store_bytes_are_pinned_per_spelling_and_shape() {
                 shape.0, shape.1
             );
             assert_eq!(
-                obs.rows, pin.5,
+                obs.store_after_truncate, pin.5,
+                "{name} @ kv_h={} head_dim={}: packed store bytes after truncate_to moved",
+                shape.0, shape.1
+            );
+            assert_eq!(
+                obs.rows, pin.6,
                 "{name} @ kv_h={} head_dim={}: the K/V rows attention receives moved",
                 shape.0, shape.1
             );
             assert_eq!(
-                obs.resident_bytes, pin.6,
+                obs.resident_bytes, pin.7,
                 "{name} @ kv_h={} head_dim={}: resident_bytes moved",
                 shape.0, shape.1
             );
@@ -663,8 +801,14 @@ fn rotor_store_bytes_are_pinned_per_spelling_and_shape() {
 #[test]
 fn every_rotor_spelling_is_pinned_at_both_shapes() {
     let want: Vec<String> = rotor_spellings().iter().map(ToString::to_string).collect();
-    assert_eq!(want.len(), 8, "rotor spelling census: {want:?}");
-    for name in &want {
+    assert_eq!(
+        want.len(),
+        ROTOR_SPELLING_COUNT,
+        "rotor spelling census moved — a rotor variant was added to or removed from \
+         ALL_KV_QUANTS and this file's pins did not follow: {want:?}"
+    );
+    let all: Vec<String> = pinned_spellings().iter().map(ToString::to_string).collect();
+    for name in &all {
         for shape in [SHAPE_A, SHAPE_B] {
             assert!(
                 pin_for(name, shape).is_some(),
@@ -676,19 +820,44 @@ fn every_rotor_spelling_is_pinned_at_both_shapes() {
     }
     assert_eq!(
         PINS.len(),
-        want.len() * 2,
+        all.len() * 2,
         "PINS holds {} rows for {} spellings x 2 shapes — a stale row pins nothing",
         PINS.len(),
-        want.len()
+        all.len()
     );
 }
 
-/// The store geometry follows the spelling's own bit width, derived from the
-/// codec's geometry helpers rather than from a pinned constant.
+/// Multivector groups one row of `head_dim` values occupies.
+///
+/// The rotor codec works on `Cl(3,0)` multivectors, so a row is cut into groups
+/// of three components and the last group is zero-padded when `head_dim` is not
+/// a multiple of three. Written out rather than imported: a test that asks the
+/// code under test what shape it should be is not an oracle.
+const fn expected_n_groups(head_dim: usize) -> usize {
+    head_dim.div_ceil(3)
+}
+
+/// `u32` words one row of `head_dim` values occupies in the dense code plane.
+///
+/// Three codes per group, `bits` bits per code, rows padded to a whole word.
+const fn expected_code_words(head_dim: usize, bits: u8) -> usize {
+    let codes_per_row = expected_n_groups(head_dim) * 3;
+    (codes_per_row * bits as usize).div_ceil(32)
+}
+
+/// The store geometry follows the spelling's own bit width, derived from
+/// arithmetic written out here rather than from a pinned constant or from the
+/// code under test.
 ///
 /// This is the half of the oracle that survives a re-baseline: a const-generic
 /// instantiated at the wrong width writes a code plane of the wrong length,
 /// which this catches without knowing what the right bytes are.
+///
+/// The expected lengths are restated from the codec's published layout, not
+/// read back from `crate::rotorquant`. Calling `n_groups_for` /
+/// `row_words_for` would make the storage layer agree with the helper that
+/// sizes it — true for free, and silent if the collapse rewrote both. See
+/// [`expected_code_words`].
 #[allow(
     clippy::expect_used,
     reason = "test: a store the driver just populated is present, and a panic names the spelling that failed to populate it"
@@ -701,7 +870,7 @@ fn every_rotor_spelling_is_pinned_at_both_shapes() {
 fn rotor_store_geometry_follows_the_codec_bit_width() {
     let _guard = env_lock();
     assert_qjl_off();
-    for quant in rotor_spellings() {
+    for quant in pinned_spellings() {
         let name = quant.to_string();
         for (kv_h, head_dim) in [SHAPE_A, SHAPE_B] {
             let device = Device::Cpu;
@@ -715,7 +884,7 @@ fn rotor_store_geometry_follows_the_codec_bit_width() {
 
             let hd = head_dim as usize;
             let tokens = (kv_h as usize) * (CHUNK_SEQ as usize);
-            let n_groups = crate::rotorquant::n_groups_for(hd);
+            let n_groups = expected_n_groups(hd);
 
             // `(bits, codes, scales, norms)` of whichever rotor plane the
             // spelling writes.
@@ -765,9 +934,9 @@ fn rotor_store_geometry_follows_the_codec_bit_width() {
             );
             assert_eq!(
                 codes,
-                tokens * crate::rotorquant::row_words_for(hd, want_bits),
+                tokens * expected_code_words(hd, want_bits),
                 "{name} @ kv_h={kv_h} head_dim={head_dim}: code-plane words must be \
-                 tokens * row_words_for(head_dim, {want_bits})"
+                 tokens * ceil(3 * ceil(head_dim / 3) * {want_bits} / 32)"
             );
             assert_eq!(
                 scales,
@@ -834,10 +1003,16 @@ fn three_and_four_bit_twins_hold_different_stores() {
 fn a_rotor_cell_is_reproducible() {
     let _guard = env_lock();
     assert_qjl_off();
-    for quant in rotor_spellings() {
+    for quant in pinned_spellings() {
         for shape in [SHAPE_A, SHAPE_B] {
             let a = drive(quant, shape);
             let b = drive(quant, shape);
+            assert_eq!(
+                a.store_after_truncate, b.store_after_truncate,
+                "{quant} @ kv_h={} head_dim={}: post-truncate store bytes differ between two \
+                 identical drives",
+                shape.0, shape.1
+            );
             assert_eq!(
                 a.store_after_decode, b.store_after_decode,
                 "{quant} @ kv_h={} head_dim={}: store bytes differ between two identical \

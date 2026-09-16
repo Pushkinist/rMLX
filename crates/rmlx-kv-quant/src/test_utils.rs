@@ -73,6 +73,15 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// write, and it is deliberately not `OnceLock`-latched, so a leaked value
 /// changes what every later test observes. Keys that tests merely *read*
 /// (`RMLX_SKIP_GPU`, `RMLX_TURBO_FLASH`) need the lock, not restoration.
+///
+/// **Who is a reader.** A test that constructs a rotor K store and asserts on
+/// its bytes, its residency or its dequantised rows is a reader of
+/// `RMLX_ROTOR_QJL` and takes this lock, even though it writes nothing and
+/// never names the variable: the toggle is read at *every* store construction,
+/// and turning it on adds the `[head_dim, head_dim]` f32 projection matrix plus
+/// a per-token sign plane and norm to the store. Two stores a test builds
+/// either side of a concurrent writer's window are then two different codecs,
+/// and the assertion fails on a difference the test did not cause.
 const MANAGED_ENV_KEYS: [&str; 1] = ["RMLX_ROTOR_QJL"];
 
 /// Holds [`ENV_LOCK`] and restores [`MANAGED_ENV_KEYS`] to their pre-acquisition

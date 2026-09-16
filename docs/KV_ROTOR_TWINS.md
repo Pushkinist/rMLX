@@ -115,7 +115,12 @@ cautions from the same capture: `k_rotor3` and `rotor3_sym` share a digest at
 4k on both models (they diverge at 32k), so a 4k-only digest table would
 conflate two spellings.
 
-The CPU store-bytes pin is the oracle that covers all eight.
+The CPU store-bytes pin is the oracle that covers all eight, plus two extra
+asymmetric-V configurations. It is not exhaustive, and §8 lists what it cannot
+see: the `exit_prefill` bulk-encode arms (the route production takes for the
+four live spellings), `gpu_append` / `gpu_packed_view` and the ring-readback
+branch of the two sync helpers, `from_cpu_blocks` / `try_deep_clone`, and six of
+the ten legal `rotor_k_*_asym_*` V configurations.
 
 ## 5. Proof rows for the code chunk
 
@@ -171,6 +176,19 @@ over its own directory/fn set, reusing the existing `normalize()` and
 `matched_lines()`. No new normalisation, no new script, no new Make target
 beyond what `debt-report-selftest` already covers.
 
+Two constraints on that edit, both of which a naive version gets wrong:
+
+* `matched_lines_report` renders `f"{label} ({SPEC_DIR}): …"` — the directory in
+  the label is a module constant, so a rotor population would print a
+  speculative path beside a rotor figure. **The label's directory must come from
+  the population entry**, alongside its label and collector, not from
+  `SPEC_DIR`.
+* `debt_report_selftest.sh` asserts what each case found, not that the tool ran.
+  **Each new population gets its own selftest case**, asserting a planted
+  matched-line figure over a synthetic fixture and the `unavailable` path when
+  its directory is missing — the same two directions the existing populations
+  are held to.
+
 **Before-figure, by hand this once**, computed by importing that module's own
 `normalize()` and `matched_lines()` so the normalisation is not retyped:
 
@@ -198,9 +216,12 @@ The code chunk deletes, by file and by name:
   generic form of their 3-bit siblings.
 * The twin halves of the storage test files:
   `quant_rotor_v4_tests.rs` and `quant_rotor_k4_tests.rs` are folded into
-  `quant_rotor_v_tests.rs` / `quant_rotor_k_tests.rs` as width-parameterised
-  cases. Any test whose body differs from its 3-bit sibling only in the width
-  token is deleted, not copied.
+  `quant_rotor_v_tests.rs` / `quant_rotor_k_tests.rs`. What is deleted is the
+  duplicated **body**, not the coverage: a test whose body differs from its
+  3-bit sibling only in the width token becomes one body with the width as a
+  parameter, still run at both widths. The **cell count does not fall.** The PR
+  reports `cargo test -p rmlx-kv-quant` passed-test counts before and after, and
+  a count that drops is a deleted case, not a collapsed twin.
 
 The deletions above make this section's own `crates/...` paths dangle, which
 `make check-doc-source-citations` fails on. The code chunk corrects §7 in the
@@ -222,10 +243,88 @@ Not deleted, and stated so the list is not read as covering them:
   `make check-doc-source-citations` (paths only), and any cited path that moves
   is corrected in the same commit rather than appended to.
 
-## 8. Baseline
+## 8. Mutations
+
+The oracle in §4 is only as good as what it can turn red. Every mutation below
+was applied to the tree, run, and reverted from a pre-mutation snapshot whose
+sha256 was re-verified afterwards. "Uncaught" rows are the file's blind spots
+and are restated in the test module doc.
+
+| # | Edit | Caught by |
+|---|---|---|
+| M1 | `storage/quant_rotor_v4.rs` `append` — encode through `rotor3_encode` (a generic instantiated at the wrong width) | `rotor_store_bytes_are_pinned_per_spelling_and_shape`, `rotor_store_geometry_follows_the_codec_bit_width`, `three_and_four_bit_twins_hold_different_stores`, `a_rotor_cell_is_reproducible`; first line `rotor4 decode: code plane holds 312 words for 24 rows, which need 408` |
+| M2 | `storage/quant_rotor_v4.rs` `new` — `bits: 3` instead of `ROTOR4_V_BITS` | `rotor_store_geometry_follows_the_codec_bit_width` (bit tag) and the pin |
+| M3 | `storage/quant_rotor_k4.rs` `append` — `make_rotor_table(head_idx, layer_idx, …)`, arguments swapped | the pin **only** (`rotor4_sym @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`); geometry stays green |
+| M4 | `storage/quant_rotor_v3.rs` `append` — drop `transpose_heads_seq`, store head-major | the pin, **at shape B only** (`rotor3 @ kv_h=4 head_dim=96`) |
+| M5 | `storage/quant_rotor_v4.rs` `append` — drop the last `norms` entry | geometry (norm count) and the pin; first line `decoded 2944 elems but shape [1, 1, 24, 128] implies 3072` |
+| M6 | `storage/quant_rotor_v4.rs` `dequant` — drop `transpose_chunked_seq_heads`; store untouched | the pin's **rows** assertion only, at shape B (`rotor4 @ kv_h=4 head_dim=96: the K/V rows attention receives moved`) |
+| M7 | `storage/quant_rotor_v4.rs` `gpu_append` — `n_groups + 1` | **uncaught** — exit 0, all tests green |
+| M8 | `storage/quant_rotor_v4.rs` `truncate_to` — `(n - 1).max(0)` | the pin's **truncate** column (`rotor4 @ kv_h=1 head_dim=128: packed store bytes after truncate_to moved`) |
+| M9 | `quant.rs` — a ninth rotor variant (`Rotor5`) added to the enum, to `ALL_KV_QUANTS` and to `Display`, wired through all 26 exhaustive matches | `every_rotor_spelling_is_pinned_at_both_shapes` (`rotor spelling census moved … ["rotor3", "rotor4", "rotor5", …]`) and `rotor_store_bytes_are_pinned_per_spelling_and_shape` (`no pin for 2 cell(s)`) |
+
+M9 is the regression test for the census itself: with a hand-written
+`matches!` variant list in place of the `Display`-derived filter, `rotor5` never
+enters the population and both tests stay green with nothing pinned.
+
+M3, M4, M6 and M8 are each caught by exactly one assertion, which is why all
+four columns and both shapes are load-bearing rather than redundant.
+
+Uncaught by inspection, not measured, same class as M7: `gpu_packed_view`, the
+ring-readback branch of `synced_rotor_v_blocks` / `synced_rotor_k_blocks`,
+`from_cpu_blocks` and `try_deep_clone`. All are `Device::Gpu` or SSD-hydrate
+paths that a CPU drive never enters; `make ci-perf`'s GPU suite is their only
+gate.
+
+## 9. Carried over into the unified bodies
+
+* `update.rs`, the `update_rotor4_sym` doc comment, says "no MSL kernel for
+  rotor4" while the body a few lines above dispatches
+  `rotor4_gpu_append_into_blocks`. The comment is stale. It is **not** edited in
+  the test chunk — that file is engine code — but the unified body must not
+  carry it forward; the collapse writes one doc comment per unified fn, and it
+  states what the fn does now.
+
+### The QJL toggle's full residency term
+
+Adding a long CPU test to `crates/rmlx-kv-quant/src/kvcache/` turned
+`warm_ttft_cross_codec_tests::shares_kv_moves_only_the_mixed_machinery` red in
+three runs of four: `Rotor4Sym: residency must be byte-identical under both
+topologies, left 1107296 right 1000800`. That sweep builds every codec twice and
+took no `env_lock`, so a sibling test toggling `RMLX_ROTOR_QJL` between the two
+arms built them as two different codecs. It now takes the lock.
+
+The delta is 106 496 B, measured at the sweep's geometry (`kv_h = 8`,
+`head_dim = 128`, prefill 256 → 2048 rows) by building the same cache with the
+toggle off and on:
+
+| Term | Bytes | Shape |
+|---|---|---|
+| `qjl_s_matrix` | 65 536 | `[head_dim, head_dim]` f32 — static, one per store |
+| `qjl_codes` | 32 768 | 2048 rows × `head_dim / 8` packed sign bytes |
+| `qjl_norms` | 8 192 | 2048 rows × one f32 |
+| **total** | **106 496** | equals the observed delta exactly |
+
+The per-row planes alone are 40 960 B; the static projection matrix is the other
+65 536 B and is the term easy to miss. Both are allocated at the first append
+under the **same** `rotor_qjl_enabled()` read, so there is no second term
+outside the lock's governance and the fix is complete.
+
+## 10. Baseline
 
 `.rmlx/analysis/482/baseline/` (gitignored) holds `cells.csv` (36 cells),
 `commands.txt` (the exact command line per cell, with the model root elided),
 the per-cell raw logs, and `MANIFEST.sha256` covering all of them plus the
 `rmlx` binary the capture ran on. The code chunk re-runs `capture.sh` against
 the same snapshots and diffs `cells.csv`.
+
+**Diff key.** A cell is `(model, prompt_tokens, codec)`. The before/after
+comparison is over **every column except `binary_sha256`**, which must differ —
+a run whose binary digest did not change did not test the change. The two binary
+digests are reported separately, beside the diff, so "identical rows" and "same
+binary" cannot be confused. `exit_code` must be `0` and `n_ids` exactly `200` in
+both captures; a row missing either is a stop, not a difference.
+
+**What the PR may quote.** `commands.txt` only. The per-cell logs under `raw/`
+carry the absolute model-snapshot path and must never be pasted into a commit
+message, a PR body, an issue or any other public surface. `commands.txt` is
+written with the model root elided for exactly this reason.
