@@ -335,6 +335,32 @@ full-token-equality Exact hit is routed to `CacheLookup::Miss` and triggers a
 full re-prefill. The Exact path verifies token identity by comparing
 `entry.prompt_token_ids()` byte-for-byte with the incoming prompt.
 
+### Judging a resume arm
+
+**A resume arm cannot be judged by byte equality against a cold baseline, and a
+warm arm that agrees with one has not necessarily run.** Two things make the
+obvious oracle wrong, and both have been measured on
+`Qwen3.6-35B-A3B-8bit` at `KvQuant::None`:
+
+- *A resume is not a re-prefill.* Restoring at a block boundary and forwarding
+  the tail is the same arithmetic a single-shot prefill runs, chunked
+  differently, so the rows agree to bf16 noise and never bit for bit. Over a
+  248K-wide vocabulary a row can hold an exact tie: on a 512-token prefix
+  extended to 520, the two paths pick the same id at all eight tail positions
+  and differ by at most 0.77, and one decode step on, two ids sit at 10.125
+  apiece. The argmax breaks that toward the lower id, and six greedy tokens
+  later the two streams share nothing. A stream comparison reports it as
+  corruption. The bound that separates the two is the one
+  `tests/qwen3_5_moe_forward_seq_last_k.rs` uses — argmax at every position plus
+  a per-logit tolerance; a stale, zeroed or mis-placed tail moves a row by tens
+  (measured: 3.5 to 7.9, with an argmax flip inside the first six positions).
+- *A Miss agrees with the cold baseline for free.* It re-prefills the same
+  prompt. A test that pushes an entry by hand must seed its block digests with
+  `request_cache_seed` — the seed `consume` queries with — or the entry is
+  invisible, every warm arm is a Miss, and the comparison passes while
+  exercising nothing. Assert the branch the engine reached, and where that
+  branch is itself `Miss`, show first that the entry was findable.
+
 ---
 
 ## LRU eviction

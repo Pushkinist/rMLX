@@ -2638,6 +2638,21 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
         }
     });
 
+    // A Miss also spells "nothing matched", so the entry is shown to be findable
+    // first: one more token makes the same stored ids a strict prefix, which
+    // must reach the tail path. The equal-length Miss below is then the
+    // strict-`<` guard declining, not an invisible digest.
+    let extended_prompt: Vec<u32> = {
+        let mut v = prompt_ids.clone();
+        v.push(1);
+        v
+    };
+    assert_eq!(
+        moe_consume_branch(&model, &extended_prompt, kv_quant),
+        format!("HydratedTail{{prefix_len={}}}", prompt_ids.len()),
+        "the stored hydrated entry must be findable — otherwise the Miss below says nothing \
+         about the strict-< guard"
+    );
     assert_eq!(
         moe_consume_branch(&model, &prompt_ids, kv_quant),
         "Miss",
@@ -3348,6 +3363,16 @@ fn qwen3_5_moe_consume_engine_migration_golden() {
     assert_ne!(cold_512[0], 0, "cold 512 first token is 0 — anomaly");
     let (kv_full, lin_full) = make_snapshot(&p512);
     push_entry(&p512, kv_full, lin_full, true, 0u32);
+    // A Miss also spells "nothing matched", so the entry is shown to be
+    // findable first: the same stored prefix under a request that extends it
+    // reaches the tail path. What declines the equal-length request is then the
+    // strict-`<` guard, not an invisible digest.
+    assert_eq!(
+        moe_consume_branch(&model, &p520, kv_quant),
+        format!("HydratedTail{{prefix_len={}}}", p512.len()),
+        "(c) the stored hydrated entry must be findable — otherwise the Miss below says \
+         nothing about the strict-< guard"
+    );
     assert_eq!(
         moe_consume_branch(&model, &p512, kv_quant),
         "Miss",
