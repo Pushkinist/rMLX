@@ -371,6 +371,16 @@ near-tie vs. defect; blind wherever a pair is not gated by default — see its
 Coverage table). Full argument there and in
 [`docs/SPECULATIVE.md`](docs/SPECULATIVE.md).
 
+**A cache-resume change is not proven by byte equality either.** A restored
+prefix plus a tail forward is one arithmetic in a different chunking from a
+single-shot prefill, so its rows agree to bf16 noise and not, in general, bit
+for bit, and one exact tie in a wide vocabulary decodes an unrelated stream
+from two equally correct states. Judge a resume arm on the tail logits (argmax
+at every position plus a per-logit bound), or against a cold baseline forced
+to the same chunk split, and assert the consume branch it reached, because a
+`Miss` agrees with a cold baseline for free. See
+[`docs/PROMPT_CACHE.md`](docs/PROMPT_CACHE.md) "Judging a resume arm".
+
 Run `make ci` before push, plus `make ci-perf` when the change touches
 `rmlx-kv-quant`, a `.metal` kernel, or a KV/decode path — `make ci` runs no GPU
 test. The per-commit `pre-commit` hook only runs the
