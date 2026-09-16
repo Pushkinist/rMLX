@@ -504,7 +504,8 @@ fn rotor_gpu_append_into_v_blocks<const BITS: u8>(
     feed: RingFeed,
     max_seq: i32,
 ) -> Result<()> {
-    let head_dim = head_dim_from_shape(new_shape, "rotor_gpu_append_into_v_blocks")?;
+    let head_dim =
+        head_dim_from_shape(new_shape, &format!("rotor{BITS}_gpu_append_into_v_blocks"))?;
     ensure_rotor_v_table(vs, head_dim);
     let seq_major = packed_k_chunk_seq_major(new_v, new_shape, device)?;
     if is_ring_only_append(feed, new_shape) {
@@ -728,7 +729,8 @@ fn rotor_gpu_append_into_k_blocks<const BITS: u8>(
     feed: RingFeed,
     max_seq: i32,
 ) -> Result<()> {
-    let head_dim = head_dim_from_shape(new_shape, "rotor_gpu_append_into_k_blocks")?;
+    let head_dim =
+        head_dim_from_shape(new_shape, &format!("rotor{BITS}_gpu_append_into_k_blocks"))?;
     ensure_rotor_k_table(ks, head_dim);
     // qjl_s_matrix is seeded inside `ensure_rotor_k_table` when `rotor_qjl_enabled()`
     // is true (mid-run CPU fallback after a GPU first-chunk needs it). The GPU
@@ -945,7 +947,9 @@ pub(super) fn rotor3_sym_gpu_append(
         ));
     }
     if v.is_none() {
-        *v = Some(QuantRotorV::<3>::new(init_shape, max_seq, layer_idx));
+        *v = Some(crate::storage::QuantRotorV3::new(
+            init_shape, max_seq, layer_idx,
+        ));
     }
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorSym3 K buffer absent after init".into()));
@@ -1033,7 +1037,9 @@ pub(super) fn rotor4_sym_gpu_append(
         ));
     }
     if v.is_none() {
-        *v = Some(QuantRotorV::<4>::new(init_shape, max_seq, layer_idx));
+        *v = Some(crate::storage::QuantRotorV4::new(
+            init_shape, max_seq, layer_idx,
+        ));
     }
     let Some(ks) = k.as_mut() else {
         return Err(Error::Mlx("RotorSym4 K buffer absent after init".into()));
@@ -3071,8 +3077,11 @@ impl KvCache {
                     shape: init_shape.clone(),
                     max_seq,
                 };
-                let mut qv =
-                    QuantRotorV::<3>::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                let mut qv = crate::storage::QuantRotorV3::new(
+                    init_shape,
+                    max_seq,
+                    layer_idx_u32(self.layer_idx),
+                );
                 qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
                 qv.append(&v_f32, &new_shape)?;
                 *k = Some(qk);
@@ -3111,8 +3120,11 @@ impl KvCache {
                     shape: init_shape.clone(),
                     max_seq,
                 };
-                let mut qv =
-                    QuantRotorV::<4>::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                let mut qv = crate::storage::QuantRotorV4::new(
+                    init_shape,
+                    max_seq,
+                    layer_idx_u32(self.layer_idx),
+                );
                 qk.append(&k_f32, &new_shape, &k_full, device, max_seq)?;
                 qv.append(&v_f32, &new_shape)?;
                 *k = Some(qk);
@@ -3371,8 +3383,11 @@ impl KvCache {
                     init_shape.clone(),
                     layer_idx_u32(self.layer_idx),
                 );
-                let mut qv =
-                    QuantRotorV::<3>::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                let mut qv = crate::storage::QuantRotorV3::new(
+                    init_shape,
+                    max_seq,
+                    layer_idx_u32(self.layer_idx),
+                );
                 qk.append(&k_f32, &new_shape)?;
                 qv.append(&v_f32, &new_shape)?;
                 *k = Some(qk);
@@ -3407,8 +3422,11 @@ impl KvCache {
                     init_shape.clone(),
                     layer_idx_u32(self.layer_idx),
                 );
-                let mut qv =
-                    QuantRotorV::<4>::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
+                let mut qv = crate::storage::QuantRotorV4::new(
+                    init_shape,
+                    max_seq,
+                    layer_idx_u32(self.layer_idx),
+                );
                 qk.append(&k_f32, &new_shape)?;
                 qv.append(&v_f32, &new_shape)?;
                 *k = Some(qk);
@@ -7245,7 +7263,12 @@ impl KvCache {
     clippy::unwrap_used,
     reason = "Option is Some by construction immediately above this fn body's assignments"
 )]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rotor update bodies carry both stores, the ring geometry and the \
+              width the caller resolved; a parameter struct would exist for \
+              this one call"
+)]
 fn rotor_v_update<const BITS: u8>(
     k: &mut Option<QuantK>,
     v: &mut Option<QuantRotorV<BITS>>,
@@ -7329,7 +7352,12 @@ fn rotor_v_update<const BITS: u8>(
     clippy::indexing_slicing,
     reason = "bounds established by construction"
 )]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rotor update bodies carry both stores, the ring geometry and the \
+              width the caller resolved; a parameter struct would exist for \
+              this one call"
+)]
 fn rotor_sym_update<const BITS: u8>(
     k: &mut Option<QuantRotorK<BITS>>,
     v: &mut Option<QuantRotorV<BITS>>,
@@ -7477,7 +7505,12 @@ fn rotor_k_only_k_side<const BITS: u8>(
     clippy::unwrap_used,
     reason = "Option is Some by construction immediately above this fn body's assignments"
 )]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rotor update bodies carry both stores, the ring geometry and the \
+              width the caller resolved; a parameter struct would exist for \
+              this one call"
+)]
 fn rotor_k_asym_update<const BITS: u8>(
     k: &mut Option<QuantRotorK<BITS>>,
     v: &mut Option<QuantV>,

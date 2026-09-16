@@ -238,11 +238,24 @@ ROTOR3_BITS` forks inside the K encode path collapsed onto `rotor_encode` /
 had (`rotor_k_encode_at`, `rotor_k_decode_at`); the four width-named `rotor{3,4}_k_*`
 wrappers stay as the public spelling.
 
-**Kept, though it is the same shape.** The four `pub(super)` fused-append
-entries `rotor{3,4}_k_only_gpu_append` / `rotor{3,4}_sym_gpu_append` still exist
-once per width. They resolve a `KvStorage` variant exactly as the `update_*`
-entries do, and they are not on this list; they now call the generic helpers at
-their own width.
+**Kept, though it is the same shape.** Nine twin pairs still exist once per
+width. Four are the `pub(super)` fused-append entries
+`rotor{3,4}_k_only_gpu_append` / `rotor{3,4}_sym_gpu_append` in `update.rs`:
+they resolve a `KvStorage` variant exactly as the `update_*` entries do, and
+they now call the generic helpers at their own width. The other five each bind
+a per-width `.metal` kernel or its dispatch counter, and the kernels are out of
+scope for this chunk:
+
+| Pair | File |
+|---|---|
+| `rotor{3,4}_quant_kernel` | `crates/rmlx-kv-quant/src/rotorquant_msl.rs` |
+| `rotor{3,4}_dequant_kernel` | `crates/rmlx-kv-quant/src/rotorquant_msl.rs` |
+| `rotor{3,4}_fused_qk_sdpa` | `crates/rmlx-kv-quant/src/rotor_fused_qk_msl.rs` |
+| `rotor{3,4}_fused_qk_dispatch_count` | `crates/rmlx-kv-quant/src/rotor_fused_qk_msl.rs` |
+| `rotor{3,4}_flash_decode_dispatch_count` | `crates/rmlx-kv-quant/src/rotor_flash_decode_msl.rs` |
+
+Each of the five names a distinct `.metal` entry point, so collapsing the Rust
+side would have to collapse the kernels with it. That is a separate change.
 
 Not deleted, and stated so the list is not read as covering them:
 
@@ -291,16 +304,16 @@ Uncaught by inspection, not measured, same class as M7: `gpu_packed_view`, the
 ring-readback branch of `synced_rotor_v_blocks` / `synced_rotor_k_blocks`,
 `from_cpu_blocks` and `try_deep_clone`. All are `Device::Gpu` or SSD-hydrate
 paths that a CPU drive never enters; `make ci-perf`'s GPU suite is their only
-gate.
+gate. §11 measures that claim on `gpu_append`.
 
 ## 9. Carried over into the unified bodies
 
-* `update.rs`, the `update_rotor4_sym` doc comment, says "no MSL kernel for
-  rotor4" while the body a few lines above dispatches
-  `rotor4_gpu_append_into_blocks`. The comment is stale. It is **not** edited in
-  the test chunk — that file is engine code — but the unified body must not
-  carry it forward; the collapse writes one doc comment per unified fn, and it
-  states what the fn does now.
+* `update.rs`, the `update_rotor4_sym` doc comment, said "no MSL kernel for
+  rotor4" while the body a few lines above dispatched
+  `rotor4_gpu_append_into_blocks`. The comment was stale. It was **not** edited
+  in the test chunk — that file is engine code — and the unified body did not
+  carry it forward: the collapse writes one doc comment per unified fn, stating
+  what the fn does now. §11 records that the sentence is gone from the tree.
 
 ### The QJL toggle's full residency term
 
@@ -355,12 +368,14 @@ The collapse, measured on the branch.
 
 | Population | + | − | net |
 |---|---|---|---|
-| `crates/rmlx-kv-quant/src/storage/` (source) | 142 | 990 | **−848** |
-| `crates/rmlx-kv-quant/src/storage/` (its `*_tests.rs`) | 234 | 667 | **−433** |
-| `crates/rmlx-kv-quant/src/kvcache/update.rs` | 488 | 909 | **−421** |
-| **total** | **864** | **2566** | **−1702** |
+| `crates/rmlx-kv-quant/src/storage/` (source) | 155 | 990 | **−835** |
+| `crates/rmlx-kv-quant/src/storage/` (its `*_tests.rs`) | 235 | 668 | **−433** |
+| `crates/rmlx-kv-quant/src/kvcache/update.rs` | 524 | 912 | **−388** |
+| **total** | **914** | **2570** | **−1656** |
 
-`rotorquant.rs` is +65 / −20 on top, for the two parametric K entries and the
+From `git diff --numstat -M` against the branch point, so a renamed file counts
+as the edit it carries and not as a whole file added and a whole file deleted.
+`rotorquant.rs` is +70 / −20 on top, for the two parametric K entries and the
 two collapsed `bits ==` forks. The issue expected roughly −900; the difference
 is the twelve helper pairs in §7 and the folded test bodies, neither of which
 its estimate covered.
@@ -396,15 +411,31 @@ revert uncommitted work, see the mutation-harness trap).
 | §8 M1 | `quant_rotor_v.rs` `append` — encode at `ROTOR3_BITS` instead of `BITS`, i.e. the generic instantiated at the wrong width | RED, 4 of the 5 pin tests, first line `rotor4 decode: rotor: code plane holds 312 words for 24 rows, which need 408` |
 | §8 M3 | `quant_rotor_k.rs` `append` — `make_rotor_table(head_idx, layer_idx, …)`, arguments swapped | RED, the pin **only**: `rotor3_sym @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved` |
 | §8 M8 | `quant_rotor_v.rs` `truncate_to` — `(n - 1).max(0)` | RED, the pin's **truncate** column: `rotor3 @ kv_h=1 head_dim=128: packed store bytes after truncate_to moved` |
-| §8 M7 | `quant_rotor_v.rs` `gpu_append` — `n_groups + 1` | **GREEN — uncaught**, 5 passed, exactly as before the collapse |
+| §8 M7 | `quant_rotor_v.rs` `gpu_append` — `n_groups + 1` | **GREEN** against the CPU pin, 5 passed, exactly as before the collapse. **RED** under `make gpu-test CRATE=rmlx-kv-quant` — see below |
 
 M1, M3 and M8 name the 3-bit cell where the pre-collapse run named the 4-bit one,
 which is the collapse working: one body, so either instantiation surfaces it.
-M7 stays uncaught, and it is the answer to "what does no test in the tree catch":
-the ring-side geometry. `gpu_append`, `gpu_packed_view`, the ring-readback branch
-of the two sync helpers, `from_cpu_blocks` and `try_deep_clone` are not reachable
-from a `Device::Cpu` drive, so the CPU pin cannot see them and only
-`make ci-perf`'s GPU suite can.
+
+M7 is the ring-side geometry: `gpu_append`, `gpu_packed_view`, the ring-readback
+branch of the two sync helpers, `from_cpu_blocks` and `try_deep_clone` are not
+reachable from a `Device::Cpu` drive, so the CPU pin cannot see them. The claim
+that the GPU suite is the gate over them was measured, not assumed: M7 was
+re-applied from a sha256-verified snapshot and `make gpu-test
+CRATE=rmlx-kv-quant` was run on an idle GPU. It is **red**, 225 passed and 2
+failed, on:
+
+* `kvcache::rotor_flash_dispatch_tests::rotor_sym3_multi_token_append_after_fused_decode_drops_the_ring`
+* `kvcache::rotor_flash_dispatch_tests::rotor_sym4_multi_token_append_after_fused_decode_drops_the_ring`
+
+with the decisive line
+
+```
+decode update_and_sdpa: Quant("QuantKGpuRing::seed_from_cpu: CPU prefix length mismatch at filled_seq=24 (codes 624 want 624, scales 2064 want 2112, norms 48 want 48)")
+```
+
+Both widths fail, which is again the collapse working. The file was restored and
+its sha256 re-verified against the snapshot. So the ring-side bodies are covered
+— by the GPU suite only, never by a CPU drive.
 
 ### The GPU-ring question, closed by reading the diff
 
@@ -422,6 +453,9 @@ before, and the 3-bit path takes none it did not either.
 | 4 | The 36-cell served capture re-run and diffed under §10's key: identical in every column except `binary_sha256`, which differs. `exit_code` is `0` and `n_ids` is `200` on both sides. The `none` control is unchanged in all four of its cells. |
 | 6 | The table above. |
 | 7 | §7, rewritten rather than appended to. |
+
+§9's stale sentence is gone: no `.rs` file in the tree now says "no MSL kernel
+for rotor4".
 
 `cargo test -p rmlx-kv-quant` reports 566 passed, 0 failed, 257 ignored before
 the collapse and the same after, five runs on each side. The cell count did not

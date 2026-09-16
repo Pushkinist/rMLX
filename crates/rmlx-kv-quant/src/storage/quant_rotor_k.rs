@@ -173,8 +173,13 @@ pub type QuantRotorK4 = QuantRotorK<4>;
 
 impl<const BITS: u8> std::fmt::Debug for QuantRotorK<BITS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = format!("QuantRotorK{BITS}");
-        f.debug_struct(&name)
+        // The two widths the codecs ship, resolved at compile time: the
+        // struct name must not allocate on a formatting path.
+        let name = match BITS {
+            ROTOR3_BITS => "QuantRotorK3",
+            _ => "QuantRotorK4",
+        };
+        f.debug_struct(name)
             .field("n_rotors", &(self.rotors.len() / 4))
             .field("use_qjl", &self.qjl_s_matrix.is_some())
             .field("gpu_resident", &self.gpu.is_allocated())

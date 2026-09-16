@@ -810,8 +810,13 @@ pub fn rotor4_k_decode(
 /// # Errors
 ///
 /// Returns [`RotorQuantError`] for shape/length mismatches.
-#[allow(clippy::too_many_arguments)]
-pub fn rotor_k_decode_at(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rotor K decode takes its four code planes, the rotor table, \
+              the two QJL sideband planes and the width; grouping them into a \
+              struct would exist for this one call"
+)]
+pub(crate) fn rotor_k_decode_at(
     codes_packed: &[u32],
     scales: &[f32],
     norms: &[f32],
@@ -839,7 +844,7 @@ pub fn rotor_k_decode_at(
 /// Returns [`RotorQuantError`] for invalid inputs (zero `head_dim`,
 /// length mismatch, rotor table size mismatch, codebook fault).
 #[allow(clippy::type_complexity)]
-pub fn rotor_k_encode_at(
+pub(crate) fn rotor_k_encode_at(
     k: &[f32],
     rotors: &[f32],
     head_dim: usize,

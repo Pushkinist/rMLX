@@ -332,7 +332,7 @@ fn quant_rotor_k3_reset_drops_the_gpu_ring() {
 ///
 /// Reproduces the fused decode path's state exactly: the store carries a
 /// **ring-only tail** — `blocks` empty (dropped once the ring went live, the way
-/// `drop_blocks_when_ring_live_k3` does it) while the ring holds the whole
+/// `drop_blocks_when_ring_live_rotor_k` does it) while the ring holds the whole
 /// prefix and `shape[2]` tracks it. The ring is then the only copy of every
 /// token. Clearing it in `truncate_to` (the pre-fix behaviour) strands the kept
 /// prefix with nothing to rebuild it from, and `dequant()` / an SSD spill hits
