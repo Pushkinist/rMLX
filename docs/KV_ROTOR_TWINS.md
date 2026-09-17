@@ -471,6 +471,34 @@ two collapsed `bits ==` forks. The issue expected roughly −900; the difference
 is the twelve helper pairs in §7 and the folded test bodies, neither of which
 its estimate covered.
 
+### The entry collapse
+
+The eight `update_rotor{3,4}*` entries and the four `pub(super)` fused-append
+entries are gone; four and two survive, each resolving the width from the
+`KvStorage` variant it was dispatched on. §7 lists them by name. The diff
+against the branch point, `git diff --numstat -M`:
+
+| File | + | − | net |
+|---|---|---|---|
+| `crates/rmlx-kv-quant/src/kvcache/update.rs` | 250 | 345 | **−95** |
+| `crates/rmlx-kv-quant/src/kvcache/sdpa.rs` | 3 | 43 | **−40** |
+| the four `*_tests.rs` / `quant.rs` citation edits | 8 | 11 | −3 |
+
+`update.rs` is 7633 lines, from 7728.
+
+A **mis-resolved width does not compile.** The first mutation run instantiated
+an entry's body at the other width — `rotor_v_update::<4>` on the `RotorV3`
+arm — and every one of the four was a type error, not a test failure:
+
+```
+expected mutable reference `&mut Option<QuantRotorV<4>>`
+   found mutable reference `&mut Option<QuantRotorV<3>>`
+```
+
+The store carries its width in its type, so the one class of defect the
+resolver could introduce is unrepresentable. The mutations below are therefore
+edits that *do* compile.
+
 ### Duplication, after
 
 The figure is no longer hand-run. `scripts/debt_report.sh --matched-lines
@@ -480,21 +508,45 @@ reconciles them against what was measured by hand here first.
 
 ```
 rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
-rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched lines over 146 body lines (8 item(s), 4 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 111 body lines (4 item(s), 0 pair(s))
 ```
 
-The storage twin is closed: one file per axis, no same-axis pair left, a
-measured 0 with the population still found. **The update twin is not.** This
-subsection first recorded `0 over 234 body lines` for it, which was measured
-over the generic bodies the entries delegate to — one per family — and not
-over the `update_rotor*` entries the population names. Those eight entries
-survive, each pair still differing only in the width digit, so the population
-is 8 items and 4 pairs before and after; what the collapse bought is their
-size, 293 matched over 610 lines down to 69 over 146. A 76 % reduction, not a
-removal.
+Both twins are closed, and closed in the one sense the rule admits: a measured
+`0` with the population still found — two storage files on one axis each, four
+`update_rotor_*` entries no two of which differ in a width digit. The
+intermediate state is recorded in §6: after the storage and body collapse the
+update population still read 8 items and 4 pairs, 69 matched over 146, because
+the eight entries survived as width dispatchers. A 76 % reduction is not a
+removal; the entry collapse is what removes it.
 
 `make debt-report`'s file-pair scan no longer reports a rotor row at all; its
 `70.0 %` and `75.2 %` entries went with the deleted files.
+
+### Mutations, against the surviving entries
+
+One per surviving entry, each applied from a snapshot whose sha256 was
+re-verified after the revert, each run against
+`cargo test -p rmlx-kv-quant --lib rotor_store_bytes`. All four edits compile;
+see the type-error note above for the ones that do not.
+
+| # | Edit | Result |
+|---|---|---|
+| E1 | `update_rotor_v`, `RotorV3` arm — `new_k` and `new_v` swapped | RED, the pin: `rotor3 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved` |
+| E2 | `update_rotor_sym`, `RotorSym4` arm — `new_k` and `new_v` swapped | RED, the pin: `rotor4_sym @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved` |
+| E3 | `update_rotor_k_only`, `RotorKOnly3` arm — `layer_idx.wrapping_add(1)` | RED, the pin: `k_rotor3 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved` |
+| E4 | `update_rotor_k_asym`, `RotorKAsym4` arm — `layer_idx.wrapping_add(1)` | RED, the pin: `rotor_k_4_asym_v4_g64 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved` |
+| E5 | `rotor_k_only_gpu_append`, `RotorKOnly3` arm — `layer_idx.wrapping_add(1)` | **GREEN** against the CPU pin (5 passed) **and green under `make gpu-test CRATE=rmlx-kv-quant`** (227 passed, 0 failed) |
+
+E5 is the chunk's uncaught mutation and it is a different blind spot from
+§8's M7. The fused-append entry's `layer_idx` reaches only the
+`QuantRotorK::<BITS>::new` call in the `k.is_none()` branch, where it seeds
+the per-`(layer, head)` rotor table. A wrong table is *self-consistent*:
+encode and decode both read the store's own table, so the round trip closes,
+the rings agree, the shapes agree, and nothing in the tree compares a store's
+table against the layer it belongs to. Only a cross-layer comparison, or a pin
+on the table itself at a known layer, could see it — the CPU pin fixes
+`TEST_LAYER_IDX` and never reaches this entry, and the GPU suite builds its
+caches at one layer too.
 
 ### Mutations, re-run against the unified bodies
 
@@ -562,6 +614,28 @@ The CI gates the code chunk owns are green: `make fmt-check`, `make lint`,
 (242 cited paths resolve), `make check-no-inline-tests`,
 `make check-gpu-tests-ignored`, `make check-kv-codec-disposition` (28 codecs
 classified, 17 inert) and `make check-kv-layer-quants`.
+
+### The gates, as run — entry collapse
+
+| §5 row | Result |
+|---|---|
+| 2 | `rotor_store_bytes_tests.rs`: 5 passed, 0 failed. The file is absent from `git diff origin/main --numstat` — **no pin was re-baselined**. |
+| 4 | The 36-cell capture re-run on the new binary into `.rmlx/analysis/482/after_chunk3/` and diffed under §10's key: **0 differing cells** over every column but `binary_sha256`. Binary digests: baseline `0b308321…`, after `37d78e6b…`. `exit_code` `0` and `n_ids` `200` on both sides, all 36. Positive control: `none` and `rotor3_sym` carry different digests *and* different `kv_cache_bytes` at all four (model, context) pairs, so the capture separates codecs rather than reporting one stream four times. |
+| 6 | The net line count table above. |
+| 7 | §7, rewritten rather than appended to. |
+
+`cargo test -p rmlx-kv-quant` reports 566 passed, 0 failed, 257 ignored, three
+runs on the collapsed tree — the branch point's figure. No cell was added or
+removed.
+
+The CI gates the code chunk owns are green: `make fmt-check`, `make lint`,
+`make check`, `make check-doc-source-citations` (248 cited paths resolve),
+`make check-no-inline-tests`, `make check-gpu-tests-ignored` (354 files across
+12 members), `make check-kv-codec-disposition` (28 codecs, 17 inert) and
+`make check-kv-layer-quants`. `make debt-report`'s file-pair scan reports no
+rotor row at all — its `70.0 %` / `75.2 %` storage entries went with the
+deleted files, and the update entries live in one file, which a file-pair scan
+cannot reach.
 
 ### `make ci-perf`
 
