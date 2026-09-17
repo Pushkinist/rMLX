@@ -1643,7 +1643,7 @@ impl KvCache {
         }
 
         // Append K into the rotor store (GPU encode → packed ring) and V into
-        // the bf16 mirror. `update_rotor_k_only_{3,4}` also runs the O(seq)
+        // the bf16 mirror. `update_rotor_k_only` also runs the O(seq)
         // dequant, so go through the storage append directly.
         let prev_seq = self.offset;
         // Not a rotor K-only cache: the caller's gate should have kept us out.
@@ -1658,7 +1658,7 @@ impl KvCache {
         // below and the bf16 V mirror further down are capped by the storage
         // `max_seq`, so it has to cover `prev_seq + new_seq` first.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
-        self.rotor_k_gpu_append(new_k, &new_shape, device)?;
+        super::update::rotor_k_only_gpu_append(self, new_k, &new_shape, device)?;
 
         // CRITICAL: advance `self.offset` BEFORE `update_decode_fp16_v_only` —
         // the V-only helper computes its write window as
@@ -1841,25 +1841,6 @@ impl KvCache {
         (head_dim as u32).is_power_of_two()
     }
 
-    /// GPU-append `new_k` into whichever rotor K-only store is active.
-    fn rotor_k_gpu_append(
-        &mut self,
-        new_k: &Array,
-        new_shape: &[i32],
-        device: Device,
-    ) -> Result<()> {
-        if matches!(self.storage, KvStorage::RotorKOnly3 { .. }) {
-            super::update::rotor3_k_only_gpu_append(self, new_k, new_shape, device)
-        } else if matches!(self.storage, KvStorage::RotorKOnly4 { .. }) {
-            super::update::rotor4_k_only_gpu_append(self, new_k, new_shape, device)
-        } else {
-            Err(Error::KvStorageMismatch {
-                expected: "RotorKOnly3 | RotorKOnly4",
-                got: storage_variant_name(&self.storage),
-            })
-        }
-    }
-
     /// `(codes, scales, norms, rotors)` GPU view of the active rotor K store at
     /// `kv_seq`, or `None` when the ring is not live.
     fn rotor_k_packed_view(
@@ -1949,7 +1930,7 @@ impl KvCache {
         // it crosses that bound — on both axes here, since neither has a bf16
         // mirror to fall back to.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
-        self.rotor_sym_gpu_append(new_k, new_v, &new_shape, device)?;
+        super::update::rotor_sym_gpu_append(self, new_k, new_v, &new_shape, device)?;
         self.offset = prev_seq + new_seq;
 
         // Take `kv_seq` from the store the rings were written from, not from
@@ -2089,27 +2070,6 @@ impl KvCache {
         };
         // The dispatcher restores the query dtype itself.
         Ok(flash_out)
-    }
-
-    /// GPU-append `new_k` / `new_v` into whichever rotor symmetric store is
-    /// active.
-    fn rotor_sym_gpu_append(
-        &mut self,
-        new_k: &Array,
-        new_v: &Array,
-        new_shape: &[i32],
-        device: Device,
-    ) -> Result<()> {
-        if matches!(self.storage, KvStorage::RotorSym3 { .. }) {
-            super::update::rotor3_sym_gpu_append(self, new_k, new_v, new_shape, device)
-        } else if matches!(self.storage, KvStorage::RotorSym4 { .. }) {
-            super::update::rotor4_sym_gpu_append(self, new_k, new_v, new_shape, device)
-        } else {
-            Err(Error::KvStorageMismatch {
-                expected: "RotorSym3 | RotorSym4",
-                got: storage_variant_name(&self.storage),
-            })
-        }
     }
 
     /// `(codes, scales, norms, rotors)` GPU views of BOTH axes of the active

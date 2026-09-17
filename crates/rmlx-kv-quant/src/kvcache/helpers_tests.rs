@@ -297,7 +297,7 @@ fn rotor_k_only_4_dispatch() {
     assert!(matches!(cache.storage(), KvStorage::RotorKOnly4 { .. }));
 }
 
-/// Regression: `update_rotor_k_only_3` must NOT populate `decode_fp16_k` as a side-effect.
+/// Regression: `update_rotor_k_only` must NOT populate `decode_fp16_k` as a side-effect.
 #[test]
 #[allow(
     clippy::unwrap_used,

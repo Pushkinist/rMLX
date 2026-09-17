@@ -49,7 +49,7 @@ fn metal_codecs_carry_msl_and_are_not_cpu_fallback() {
 #[test]
 fn v_only_iso_rotor_families_are_cpu_fallback_with_reason() {
     // V-only iso / rotor codecs and the rotor-K-asym variants: `update_iso3*` /
-    // `update_rotor3*` early-return to the bf16 decode seed, so the iso/rotor
+    // `update_rotor_{v,sym,k_asym}` early-return to the bf16 decode seed, so the iso/rotor
     // encode that runs (at prefill) is CPU. They carry MSL (q8 K-side) but must
     // report a CPU-hot-path reason. This is grounded in the dispatcher, not by
     // fiat — flip the verdict and this test must flip with it.

@@ -73,8 +73,10 @@ the generic body calls the parametric form with `BITS` and the four
 width-named wrappers stay as the public spelling.
 
 `kvcache/update.rs`: the eight `update_rotor*` bodies become four, each
-generic over the store's `BITS`. The `KvStorage` variants stay eight — a
-variant is a spelling, and no spelling is removed (issue §Sequencing).
+generic over the store's `BITS`, and the eight entries above them become four
+as well, each resolving the width from the storage variant it was dispatched
+on. The `KvStorage` variants stay eight — a variant is a spelling, and no
+spelling is removed (issue §Sequencing).
 
 Rule 1 of the simplicity rules still governs: the generic is introduced
 because there are two instantiations of every item, not to admit a third.
@@ -199,12 +201,25 @@ Per pair, storage: `quant_rotor_k3` <-> `quant_rotor_k4` 401 (70.0 %),
 `update_rotor3` <-> `update_rotor4` 77 (97.5 %), `_sym` 81 (94.2 %),
 `_k_only` 52 (91.2 %), `_k_asym` 83 (100.0 %).
 
-### After, on the collapsed tree
+### After the storage and body collapse
 
 ```
 rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
 rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched lines over 146 body lines (8 item(s), 4 pair(s))
 ```
+
+The storage axis was closed there; the update axis was not — the eight
+entries survived as width dispatchers. They are now four.
+
+### After the entry collapse
+
+```
+rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 111 body lines (4 item(s), 0 pair(s))
+```
+
+Both axes now read a measured `0` with the population still found: four
+`update_rotor_*` entries, no two of which differ in a width digit.
 
 ### Reconciliation with the figures computed by hand
 
@@ -213,7 +228,8 @@ rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched line
 | storage, before | 814 over 2244 | 814 over 2244 | none |
 | updates, before | 313 over 650 | 293 over 610 | −20 matched, −40 lines |
 | storage, after | 0 over 1394 | 0 over 1404 | −10 lines |
-| updates, after | 0 over 234 | **69 over 146** | a different population |
+| updates, after the body collapse | 0 over 234 | **69 over 146** | a different population |
+| updates, after the entry collapse | — | 0 over 111 | closed |
 
 * **Updates, before.** The hand run compared each fn from its `fn NAME(` line
   through its closing brace; the tool compares `FnInfo.body`, which starts at
@@ -230,14 +246,16 @@ rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched line
   after-figure's matched count is 0 either way, so the ten lines are a slip in
   the hand count, not a difference in the rule. The tool's number stands.
 * **Updates, after.** The hand after-figure was taken over the *generic*
-  bodies the entries now delegate to — one per family — which is not the
-  population the rule names. Under the rule, the eight `update_rotor{3,4}*`
-  entries still exist, and each pair still differs only in the width digit, so
-  the population is 8 items and 4 pairs on both trees. What the collapse bought
-  is the size of the bodies: 293 matched over 610 lines became 69 over 146.
-  The twin is reduced by 76 %, not removed. Closing it means the eight entries
-  collapsing onto a width-generic dispatch of their own, which this chunk did
-  not do and no proof row claimed.
+  bodies the entries delegated to — one per family — which is not the
+  population the rule names. Under the rule the eight `update_rotor{3,4}*`
+  entries still existed, each pair still differing only in the width digit, so
+  the population was 8 items and 4 pairs on both trees and the body collapse
+  bought only their size: 293 matched over 610 lines became 69 over 146, a
+  76 % reduction and not a removal. The entry collapse is what closes it. The
+  eight entries are four — `update_rotor_v`, `update_rotor_sym`,
+  `update_rotor_k_only`, `update_rotor_k_asym` — each resolving the width from
+  the storage variant, so the population is 4 items, 0 pairs, 0 matched lines,
+  and it is still found.
 
 ### The advisory half
 
@@ -271,11 +289,27 @@ The collapse deleted, by file and by name:
   shared payload types (`RotorBlocks`, `RotorKBlocks`), their `BlockRows` impls
   and the two `synced_rotor_*_blocks` helpers stay there.
 * `KvCache::update_rotor4`, `update_rotor4_sym`, `update_rotor_k_only_4`,
-  `update_rotor_k_asym_4` in `kvcache/update.rs` — four bodies. All eight
-  entries survive as the storage-variant resolver plus the warm-TTFT shortcut,
-  over four shared bodies: `rotor_v_update`, `rotor_sym_update`,
-  `rotor_k_only_k_side` and `rotor_k_asym_update`, each generic over the store's
-  `BITS`.
+  `update_rotor_k_asym_4` in `kvcache/update.rs` — four bodies, over four
+  shared bodies: `rotor_v_update`, `rotor_sym_update`, `rotor_k_only_k_side`
+  and `rotor_k_asym_update`, each generic over the store's `BITS`.
+* The eight entries above those bodies, in the same file:
+  `KvCache::update_rotor3`, `update_rotor4`, `update_rotor3_sym`,
+  `update_rotor4_sym`, `update_rotor_k_only_3`, `update_rotor_k_only_4`,
+  `update_rotor_k_asym_3`, `update_rotor_k_asym_4`. Four survive —
+  `update_rotor_v`, `update_rotor_sym`, `update_rotor_k_only`,
+  `update_rotor_k_asym` — each reading the width off the `KvStorage` variant it
+  was dispatched on and instantiating its body at 3 or 4. `update()` dispatches
+  both widths of a family to one arm. Added with them: `rotor_storage_mismatch`,
+  the one `storage mismatch` error the V and symmetric entries build.
+* The four `pub(super)` fused-append entries `rotor3_k_only_gpu_append`,
+  `rotor4_k_only_gpu_append`, `rotor3_sym_gpu_append` and
+  `rotor4_sym_gpu_append` — two entries now, `rotor_k_only_gpu_append` and
+  `rotor_sym_gpu_append`, over two new width-generic bodies
+  (`rotor_k_only_gpu_append_at`, `rotor_sym_gpu_append_at`). With them went
+  their two one-caller wrappers in `kvcache/sdpa.rs`, `KvCache::rotor_k_gpu_append`
+  and `KvCache::rotor_sym_gpu_append`, whose only work was the width resolution
+  the entry now does; both call sites call the entry directly. No `.metal` file
+  is touched.
 * The twin halves of the storage test files: `quant_rotor_v4_tests.rs` and
   `quant_rotor_k4_tests.rs` are folded into `quant_rotor_v_tests.rs` /
   `quant_rotor_k_tests.rs`. What is deleted is the duplicated **body**, not the
@@ -296,13 +330,11 @@ ROTOR3_BITS` forks inside the K encode path collapsed onto `rotor_encode` /
 had (`rotor_k_encode_at`, `rotor_k_decode_at`); the four width-named `rotor{3,4}_k_*`
 wrappers stay as the public spelling.
 
-**Kept, though it is the same shape.** Nine twin pairs still exist once per
-width. Four are the `pub(super)` fused-append entries
-`rotor{3,4}_k_only_gpu_append` / `rotor{3,4}_sym_gpu_append` in `update.rs`:
-they resolve a `KvStorage` variant exactly as the `update_*` entries do, and
-they now call the generic helpers at their own width. The other five each bind
-a per-width `.metal` kernel or its dispatch counter, and the kernels are out of
-scope for this chunk:
+**Kept, though it is the same shape.** Five twin pairs still exist once per
+width. The four fused-append entries recorded here as kept — they resolved a
+`KvStorage` variant exactly as the `update_*` entries did — went with the entry
+collapse, for that same reason. The five that remain each bind a per-width
+`.metal` kernel or its dispatch counter, and the kernels are out of scope:
 
 | Pair | File |
 |---|---|
@@ -439,6 +471,34 @@ two collapsed `bits ==` forks. The issue expected roughly −900; the difference
 is the twelve helper pairs in §7 and the folded test bodies, neither of which
 its estimate covered.
 
+### The entry collapse
+
+The eight `update_rotor{3,4}*` entries and the four `pub(super)` fused-append
+entries are gone; four and two survive, each resolving the width from the
+`KvStorage` variant it was dispatched on. §7 lists them by name. The diff
+against the branch point, `git diff --numstat -M`:
+
+| File | + | − | net |
+|---|---|---|---|
+| `crates/rmlx-kv-quant/src/kvcache/update.rs` | 250 | 345 | **−95** |
+| `crates/rmlx-kv-quant/src/kvcache/sdpa.rs` | 3 | 43 | **−40** |
+| six further files: `rotor_flash_dispatch_tests.rs` (2 / 6, the folded call plus a citation), `quant.rs` (4 / 3), `helpers_tests.rs`, `resident_ring_tests.rs`, `precompile_tests.rs` (1 / 1 each) and `tests/rotor_decode_grow_legacy.rs` (2 / 2), all fn-name citations | 11 | 14 | **−3** |
+
+`update.rs` is 7633 lines, from 7728.
+
+A **mis-resolved width does not compile.** The first mutation run instantiated
+an entry's body at the other width — `rotor_v_update::<4>` on the `RotorV3`
+arm — and every one of the four was a type error, not a test failure:
+
+```
+expected mutable reference `&mut Option<QuantRotorV<4>>`
+   found mutable reference `&mut Option<QuantRotorV<3>>`
+```
+
+The store carries its width in its type, so the one class of defect the
+resolver could introduce is unrepresentable. The mutations below are therefore
+edits that *do* compile.
+
 ### Duplication, after
 
 The figure is no longer hand-run. `scripts/debt_report.sh --matched-lines
@@ -448,21 +508,80 @@ reconciles them against what was measured by hand here first.
 
 ```
 rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
-rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched lines over 146 body lines (8 item(s), 4 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 111 body lines (4 item(s), 0 pair(s))
 ```
 
-The storage twin is closed: one file per axis, no same-axis pair left, a
-measured 0 with the population still found. **The update twin is not.** This
-subsection first recorded `0 over 234 body lines` for it, which was measured
-over the generic bodies the entries delegate to — one per family — and not
-over the `update_rotor*` entries the population names. Those eight entries
-survive, each pair still differing only in the width digit, so the population
-is 8 items and 4 pairs before and after; what the collapse bought is their
-size, 293 matched over 610 lines down to 69 over 146. A 76 % reduction, not a
-removal.
+`--matched-lines rotor-updates` is a **width-twin detector**: it pairs only
+inside a group whose names agree once every digit run is removed, and its glob
+is the `update_rotor*` fns of one file, so the `*_gpu_append` entries are
+outside it entirely. Its `0` says no two entries differ only in a width digit;
+it does not say there is no duplication left. The width-resolution idiom — read
+the family's `max_seq`, then an `if let` per width — now appears six times
+(`update.rs:866-900`, `1007-1046`, `6962-6990`, `6998-7030`, `7044-7075`,
+`7101-7135`). It is left inline on purpose: six short bodies that read as
+themselves beat a macro that hides the dispatch (simplicity rule 1).
+
+Both twins are closed, and closed in the one sense the rule admits: a measured
+`0` with the population still found — two storage files on one axis each, four
+`update_rotor_*` entries no two of which differ in a width digit. The
+intermediate state is recorded in §6: after the storage and body collapse the
+update population still read 8 items and 4 pairs, 69 matched over 146, because
+the eight entries survived as width dispatchers. A 76 % reduction is not a
+removal; the entry collapse is what removes it.
 
 `make debt-report`'s file-pair scan no longer reports a rotor row at all; its
 `70.0 %` and `75.2 %` entries went with the deleted files.
+
+### Mutations, against the surviving entries
+
+One per surviving entry, each applied from a snapshot whose sha256 was
+re-verified after the revert, each run against
+`cargo test -p rmlx-kv-quant --lib rotor_store_bytes`. All four edits compile;
+see the type-error note above for the ones that do not.
+
+| # | Edit | Result |
+|---|---|---|
+| E1 | `update_rotor_v`, `RotorV3` arm — `new_k` and `new_v` swapped | RED, the pin: `rotor3 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved` |
+| E2 | `update_rotor_sym`, `RotorSym4` arm — `new_k` and `new_v` swapped | RED, the pin: `rotor4_sym @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved` |
+| E3 | `update_rotor_k_only`, `RotorKOnly3` arm — `layer_idx.wrapping_add(1)` | RED, the pin: `k_rotor3 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved` |
+| E4 | `update_rotor_k_asym`, `RotorKAsym4` arm — `layer_idx.wrapping_add(1)` | RED, the pin: `rotor_k_4_asym_v4_g64 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved` |
+| E5 | `rotor_k_only_gpu_append`, `RotorKOnly3` arm — `layer_idx.wrapping_add(1)` | **GREEN** against the CPU pin (5 passed) **and green under `make gpu-test CRATE=rmlx-kv-quant`** (227 passed, 0 failed) |
+
+E5 is the chunk's uncaught mutation and it is a different blind spot from
+§8's M7. The fused-append entry's `layer_idx` reaches only the
+`QuantRotorK::<BITS>::new` call in the `k.is_none()` branch, where it seeds
+the per-`(layer, head)` rotor table. A wrong table is *self-consistent*:
+encode and decode both read the store's own table, so the round trip closes,
+the rings agree and the shapes agree.
+
+Two facts say why nothing turned red, and they are different facts.
+
+* **A table pin at a known layer already exists.** This file's store
+  serialisation hashes `s.rotors` and `s.layer_idx` for both rotor-K stores
+  (`rotor_store_bytes_tests.rs:176,179` and `:198,201`), and every cell is
+  built `.with_layer_idx(TEST_LAYER_IDX)`. A seed at the wrong layer would move
+  that digest. The pin simply never drives the fused-append entry — it drives
+  `KvCache::update`.
+* **The one direct test of the entry never executes the mutated line.**
+  `rotor_flash_dispatch_tests.rs:309`, `batched_ring_feed_is_skipped`, is the
+  only test that calls `rotor_k_only_gpu_append` directly, and it builds its
+  cache with `seeded_cache_b`, which constructs the storage with
+  `k: Some(QuantRotorK{3,4}::from_cpu_blocks(…))`. `k.is_none()` is false, so
+  the `new` call is not reached. E5 is green partly because the line is
+  unreached, not only because a wrong table is self-consistent.
+
+**The closer, named and not implemented here.** Build a `RotorKOnly3` cache
+with `k: None` at `.with_layer_idx(3)`, call `rotor_k_only_gpu_append`, and
+assert `ks.layer_idx == 3` and `ks.rotors == make_rotor_table(3, 0, n_groups)`
+— ten lines, `Device::Gpu`, `#[ignore]`. It is a follow-up, not this chunk: a
+new GPU test owes a `scripts/gpu_validation_census.txt` derivation in the same
+change and a `make ci-perf` re-run, which is outside the owner's pause.
+
+**The blind spot is pre-existing.** The deleted `rotor3_k_only_gpu_append` had
+the same unpinned seed at the same `k.is_none()` branch; this change did not
+open it. What is new is that `layer_idx` is now a *threaded parameter* of a
+width-generic body rather than a value read at the entry — a wrong argument at
+one call site is a shape the old code did not have.
 
 ### Mutations, re-run against the unified bodies
 
@@ -521,6 +640,12 @@ before, and the 3-bit path takes none it did not either.
 §9's stale sentence is gone: no `.rs` file in the tree now says "no MSL kernel
 for rotor4".
 
+Dated process artifacts under `docs/superpowers/` are left as written —
+`gemma4_scout_report.md:23` still cites `update_rotor3:5575`, at a line number
+that was already stale before this change. `CLAUDE.md` classes that directory
+as process artifacts, not a subsystem reference, so a report is a record of
+what was seen on its date and is not rewritten when the tree moves.
+
 `cargo test -p rmlx-kv-quant` reports 566 passed, 0 failed, 257 ignored before
 the collapse and the same after, five runs on each side. The cell count did not
 fall: the folded test bodies kept one `#[test]` per width.
@@ -530,6 +655,50 @@ The CI gates the code chunk owns are green: `make fmt-check`, `make lint`,
 (242 cited paths resolve), `make check-no-inline-tests`,
 `make check-gpu-tests-ignored`, `make check-kv-codec-disposition` (28 codecs
 classified, 17 inert) and `make check-kv-layer-quants`.
+
+### The gates, as run — entry collapse
+
+| §5 row | Result |
+|---|---|
+| 2 | `rotor_store_bytes_tests.rs`: 5 passed, 0 failed. The file is absent from `git diff origin/main --numstat` — **no pin was re-baselined**. |
+| 4 | The 36-cell capture re-run on the new binary into `.rmlx/analysis/482/after_chunk3/` and diffed under §10's key: **0 differing cells** over every column but `binary_sha256`. Binary digests: baseline `0b308321…`, after `37d78e6b…`. `exit_code` `0` and `n_ids` `200` on both sides, all 36. Positive control: `none` and `rotor3_sym` carry different digests *and* different `kv_cache_bytes` at all four (model, context) pairs, so the capture separates codecs rather than reporting one stream four times. |
+| 6 | The net line count table above. |
+| 7 | §7, rewritten rather than appended to. |
+
+`cargo test -p rmlx-kv-quant` reports 566 passed, 0 failed, 257 ignored, three
+runs on the collapsed tree — the branch point's figure. No cell was added or
+removed.
+
+The CI gates the code chunk owns are green: `make fmt-check`, `make lint`,
+`make check`, `make check-doc-source-citations` (250 cited paths resolve),
+`make check-no-inline-tests`, `make check-gpu-tests-ignored` (354 files across
+12 members), `make check-kv-codec-disposition` (28 codecs, 17 inert) and
+`make check-kv-layer-quants`. `make debt-report`'s file-pair scan reports no
+rotor row at all — its `70.0 %` / `75.2 %` storage entries went with the
+deleted files, and the update entries live in one file, which a file-pair scan
+cannot reach.
+
+`make ci-perf`, invoked directly, in the foreground, on an idle GPU. 97
+minutes. No test failed in either half. The census verdict:
+
+```
+shader validation: census matches the pin (scripts/gpu_validation_census.txt)
+```
+
+The GPU suite, libtest-passed per crate: `rmlx-audio` 7, `rmlx-kv-quant` 253,
+`rmlx-kv-ssd` 12, `rmlx-mlx` 10, `rmlx-models` 101 — 383, the same per-crate
+split the previous chunk recorded. The last two lines, verbatim:
+
+```
+OK: 383 GPU tests passed across 5 workspace member(s), shader validation matches the pinned census. — INCOMPLETE: 24 selected GPU test(s) stood down and 9 further notice(s) named no test; they asserted nothing (listed above)
+ci-perf INCOMPLETE — the GPU suite did not run every gate it names (see above)
+```
+
+Byte for byte the previous chunk's two lines. Every stand-down names an unset
+environment variable — `RMLX_TEST_MODEL_QWEN36`, `RMLX_KV_TEST_MODEL` /
+`RMLX_DRAFT_TEST_MODEL`, or the one-variable drafter case `CLAUDE.md` records.
+No stand-down names a rotor test, and `rmlx-kv-quant`'s 253 are the gate over
+the ring-side bodies the CPU pin cannot see.
 
 ### `make ci-perf`
 

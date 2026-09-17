@@ -467,7 +467,8 @@ be classified or the build fails.
   not in assumptions (CLAUDE.md hard rule 7):
 
   * **V-only iso / rotor** (`iso3/4(/sym)`, `rotor3/4(/sym)`,
-    `rotor_k_*_asym_*`) → **`Some`**. At decode, `update_iso3*` / `update_rotor3*`
+    `rotor_k_*_asym_*`) → **`Some`**. At decode, `update_iso3*` /
+    `update_rotor_{v,sym,k_asym}`
     early-return to the warm-TTFT bf16 decode seed (`decode_fp16_k.is_some()`),
     so the GPU iso/rotor branch is shadowed; the codec encode that runs (at
     prefill) is CPU. The rotor family's GPU fused-QK encoder is gated OFF by
@@ -480,7 +481,7 @@ be classified or the build fails.
     growing prefix host-side and re-uploaded it via `Array::from_bytes` — which
     is what held these codecs at single-digit TPS.
   * **K-only rotor** (`k_rotor3` / `k_rotor4`) → **QJL-dependent, default
-    off**. No bf16 early-return; `update_rotor_k_only_{3,4}` gates the GPU K
+    off**. No bf16 early-return; `update_rotor_k_only` gates the GPU K
     encode on the store's sticky `use_qjl()` flag — fixed at first append, the
     same source the sdpa fast path reads, so a later env toggle cannot
     reinterpret bytes already written. QJL **off** (default) →
@@ -2886,8 +2887,9 @@ applies the Cl(3,0) sandwich as a closed-form 3×3 SO(3) rotation matrix
 cancel identically for grade-1 input — verified algebraically). The
 per-(layer, head, group) rotor table is passed as a buffer argument
 (`rotors_in : f32 [n_groups, 4]`); kernels do not hardcode the table.
-Dispatch is wired into `update_rotor3` / `update_rotor4` / sym variants /
-`update_rotor_k_only_{3,4}` / `update_rotor_k_asym_{3,4}` and fires when
+Dispatch is wired into `update_rotor_v` / `update_rotor_sym` /
+`update_rotor_k_only` / `update_rotor_k_asym` — one entry per family over both
+code widths — and fires when
 `device == Device::Gpu`. The CPU encoder remains the fallback. The V-side hot
 path is shadowed by the warm-TTFT bf16 seed — the GPU encode fires once at
 `exit_prefill` (large prefill slice), not per decode step; the speedup shows
@@ -2916,7 +2918,7 @@ iso3 / iso4). Tests are `#[ignore]`-gated:
 | CPU encode/decode (`crate::rotorquant`) | Done (single-codebook, planar3 / iso3 pack convention) |
 | `KvStorage::RotorV3` variant + `QuantRotorV3` storage struct (`QuantRotorV<3>`) | Done (static rotors + per-token blocks; rotors counted once in `byte_size`) |
 | `KvQuant::Rotor3` + `CacheType::Rotor3` | Done (with `rotor3` / `rotor_v_3` dual-spelling parse) |
-| `KvCache::update_rotor3` decode dispatch | Done |
+| `KvCache::update_rotor_v` decode dispatch, 3-bit arm | Done |
 | SDPA dispatch wiring | Done (dequant-then-SDPA legacy fallback, mirrors iso3) |
 | `KvBlockWriter`/`Reader` integration | Done (layout tag `rotor_v_3`; V via `write_quant_rotor_v3` / `read_quant_rotor_v3`; rotor table persisted on disk) |
 | SSD tier integration | Done — round-trip parity in `roundtrip_rotor3` |
@@ -2990,7 +2992,7 @@ between the two spellings.
 | CPU encode/decode (`crate::rotorquant`) | Done (`rotor4_encode` / `rotor4_decode` with 4-bit pack and 16-centroid codebook) |
 | `KvStorage::RotorV4` variant + `QuantRotorV4` storage struct | Done (`QuantRotorV<4>`, the same store as RotorV3 at 4 bits; rotors counted once in `byte_size`) |
 | `KvQuant::Rotor4` + `CacheType::Rotor4` | Done (with `rotor4` / `rotor_v_4` dual-spelling parse) |
-| `KvCache::update_rotor4` decode dispatch | Done |
+| `KvCache::update_rotor_v` decode dispatch, 4-bit arm | Done |
 | SDPA dispatch wiring | Done (dequant-then-SDPA legacy fallback, mirrors rotor3) |
 | `KvBlockWriter`/`Reader` integration | Done (layout tag `rotor_v_4`; V via `write_quant_rotor_v4` / `read_quant_rotor_v4`; rotor table persisted on disk) |
 | SSD tier integration | Done — round-trip parity in `roundtrip_rotor4` |
@@ -4686,7 +4688,7 @@ decode step. The rotor codec's Cl(3,0) K-decode runs **inside** the attention
 inner loop, so no bf16 / f32 K is materialised and nothing restages through the
 host.
 
-**What it replaced.** `update_rotor_k_only_{3,4}` called
+**What it replaced.** `update_rotor_k_only` called
 `QuantRotorK{3,4}::dequant()` on every decode step — a full-prefix **CPU** rotor
 decode into a `Vec<f32>` plus a re-upload. That is O(seq) host work per token
 with the GPU idle, and it is what pinned the K-only rotor family in the
@@ -4760,11 +4762,11 @@ must not change how existing bytes are read.
 GPU encode takes a `RingFeed` from its caller, one of three modes:
 
 - **`Maintain`** — feed the ring **and** push a CPU block. Used by prefill
-  (`update_rotor_k_only_*`) and the non-fused decode fallback, which `dequant()`
+  (`update_rotor_k_only`) and the non-fused decode fallback, which `dequant()`
   the whole prefix on the same step and so need the block immediately.
 - **`MaintainRingOnly`** — feed the ring **without** pushing a CPU block: a
   **ring-only tail**. Used by the fused decode entry
-  (`rotor{3,4}_k_only_gpu_append`). The flash kernel reads the ring, never the
+  (`rotor_k_only_gpu_append`). The flash kernel reads the ring, never the
   block, so skipping the per-step host download (`rotor_gpu_outputs_to_cpu`) is
   the win; `shape[2]` still advances so the ring and the attention length stay
   in lockstep.
