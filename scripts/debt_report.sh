@@ -10,9 +10,12 @@
 # report, so its exit code is forwarded rather than swallowed — a broken
 # producer must fail loud, not print no figure and exit 0.
 #
+# The --matched-lines populations, their roots and their pairing rules are
+# documented in scripts/lib/debt_report.py's header; --help lists the names.
+#
 # Usage:
 #   bash scripts/debt_report.sh [--root DIR] [--since REF]
-#   bash scripts/debt_report.sh --matched-lines {drivers,impls}
+#   bash scripts/debt_report.sh --matched-lines {drivers,impls,rotor-storage,rotor-updates}
 
 set -uo pipefail
 
