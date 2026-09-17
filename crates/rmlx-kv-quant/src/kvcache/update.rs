@@ -618,7 +618,7 @@ fn rotor_v_sync_ring<const BITS: u8>(
 /// Passed down from the caller rather than inferred here, so eligibility lives
 /// with the dispatcher that knows it.
 ///
-/// Both K-only paths maintain — the prefill-time `update_rotor_k_only_*` as well
+/// Both K-only paths maintain — the prefill-time `update_rotor_k_only` as well
 /// as the fused decode entry. They only reach a GPU append when QJL is off,
 /// which is exactly when the flash kernel is eligible, so the ring they build is
 /// the one decode reads. Letting prefill fill it incrementally also avoids
@@ -814,41 +814,31 @@ fn materialize_rotor_k_ring_tail<const BITS: u8>(
     Ok(())
 }
 
-/// Append `new_k` into a live `RotorKOnly3` store's GPU ring (+ CPU blocks),
-/// lazily creating the store on first use. No dequant — this is the entry
-/// point the rotor flash-decode SDPA path uses.
-///
-/// # Errors
-///
-/// Returns [`Error::KvStorageMismatch`] when the active storage is not
-/// `RotorKOnly3`, and forwards encode / ring errors.
-pub(super) fn rotor3_k_only_gpu_append(
-    cache: &mut KvCache,
+/// Append `new_k` into a live rotor K-only store's GPU ring (+ CPU blocks) at
+/// `BITS`, lazily creating the store on first use. No dequant — the fused
+/// rotor flash-decode SDPA path reaches this through
+/// [`rotor_k_only_gpu_append`]. `variant` is the storage spelling the caller
+/// resolved, used only in the "buffer absent after init" diagnostic.
+fn rotor_k_only_gpu_append_at<const BITS: u8>(
+    k: &mut Option<QuantRotorK<BITS>>,
+    max_seq: i32,
+    layer_idx: u32,
+    variant: &'static str,
     new_k: &Array,
     new_shape: &[i32],
     device: Device,
 ) -> Result<()> {
-    let KvStorage::RotorKOnly3 { k, max_seq } = &mut cache.storage else {
-        return Err(Error::KvStorageMismatch {
-            expected: "RotorKOnly3",
-            got: storage_variant_name(&cache.storage),
-        });
-    };
-    let max_seq = *max_seq;
     if k.is_none() {
         let mut init_shape = new_shape.to_vec();
         if let Some(s) = init_shape.get_mut(2) {
             *s = 0;
         }
-        *k = Some(crate::storage::QuantRotorK3::new(
-            init_shape,
-            layer_idx_u32(cache.layer_idx),
-        ));
+        *k = Some(QuantRotorK::<BITS>::new(init_shape, layer_idx));
     }
     let Some(ks) = k.as_mut() else {
-        return Err(Error::Mlx("RotorKOnly3 K buffer absent after init".into()));
+        return Err(Error::Mlx(format!("{variant} K buffer absent after init")));
     };
-    rotor_gpu_append_into_k_blocks::<3>(
+    rotor_gpu_append_into_k_blocks::<BITS>(
         ks,
         new_k,
         new_shape,
@@ -865,126 +855,58 @@ pub(super) fn rotor3_k_only_gpu_append(
     Ok(())
 }
 
-/// Mirror of [`rotor3_k_only_gpu_append`] for `RotorKOnly4`.
+/// Append `new_k` into whichever rotor K-only store is active — `RotorKOnly3`
+/// at 3 bits, `RotorKOnly4` at 4 — lazily creating it on first use. This is
+/// the entry point the rotor flash-decode SDPA path uses.
 ///
 /// # Errors
 ///
-/// Returns [`Error::KvStorageMismatch`] when the active storage is not
-/// `RotorKOnly4`, and forwards encode / ring errors.
-pub(super) fn rotor4_k_only_gpu_append(
+/// Returns [`Error::KvStorageMismatch`] when the active storage is neither
+/// `RotorKOnly3` nor `RotorKOnly4`, and forwards encode / ring errors.
+pub(super) fn rotor_k_only_gpu_append(
     cache: &mut KvCache,
     new_k: &Array,
-    new_shape: &[i32],
-    device: Device,
-) -> Result<()> {
-    let KvStorage::RotorKOnly4 { k, max_seq } = &mut cache.storage else {
-        return Err(Error::KvStorageMismatch {
-            expected: "RotorKOnly4",
-            got: storage_variant_name(&cache.storage),
-        });
-    };
-    let max_seq = *max_seq;
-    if k.is_none() {
-        let mut init_shape = new_shape.to_vec();
-        if let Some(s) = init_shape.get_mut(2) {
-            *s = 0;
-        }
-        *k = Some(crate::storage::QuantRotorK4::new(
-            init_shape,
-            layer_idx_u32(cache.layer_idx),
-        ));
-    }
-    let Some(ks) = k.as_mut() else {
-        return Err(Error::Mlx("RotorKOnly4 K buffer absent after init".into()));
-    };
-    rotor_gpu_append_into_k_blocks::<4>(
-        ks,
-        new_k,
-        new_shape,
-        device,
-        RingFeed::MaintainRingOnly,
-        max_seq,
-    )?;
-    // Ring is the sole resident store — see [`rotor3_k_only_gpu_append`].
-    drop_blocks_when_ring_live_rotor_k(ks);
-    Ok(())
-}
-
-/// Append `new_k` / `new_v` into a live `RotorSym3` store's GPU rings (+ CPU
-/// blocks), lazily creating the stores on first use. No dequant on either axis —
-/// this is the entry point the rotor symmetric quant-V flash-decode SDPA path
-/// uses.
-///
-/// Both axes maintain their ring: the quant-V kernel reads K's *and* V's.
-///
-/// # Errors
-///
-/// Returns [`Error::KvStorageMismatch`] when the active storage is not
-/// `RotorSym3`, and forwards encode / ring errors.
-pub(super) fn rotor3_sym_gpu_append(
-    cache: &mut KvCache,
-    new_k: &Array,
-    new_v: &Array,
     new_shape: &[i32],
     device: Device,
 ) -> Result<()> {
     let layer_idx = layer_idx_u32(cache.layer_idx);
-    let KvStorage::RotorSym3 { k, v, max_seq } = &mut cache.storage else {
+    let (KvStorage::RotorKOnly3 { max_seq, .. } | KvStorage::RotorKOnly4 { max_seq, .. }) =
+        &cache.storage
+    else {
         return Err(Error::KvStorageMismatch {
-            expected: "RotorSym3",
+            expected: "RotorKOnly3 | RotorKOnly4",
             got: storage_variant_name(&cache.storage),
         });
     };
     let max_seq = *max_seq;
-    let mut init_shape = new_shape.to_vec();
-    if let Some(s) = init_shape.get_mut(2) {
-        *s = 0;
-    }
-    if k.is_none() {
-        *k = Some(crate::storage::QuantRotorK3::new(
-            init_shape.clone(),
+
+    if let KvStorage::RotorKOnly3 { k, .. } = &mut cache.storage {
+        rotor_k_only_gpu_append_at::<3>(
+            k,
+            max_seq,
             layer_idx,
-        ));
+            "RotorKOnly3",
+            new_k,
+            new_shape,
+            device,
+        )
+    } else if let KvStorage::RotorKOnly4 { k, .. } = &mut cache.storage {
+        rotor_k_only_gpu_append_at::<4>(
+            k,
+            max_seq,
+            layer_idx,
+            "RotorKOnly4",
+            new_k,
+            new_shape,
+            device,
+        )
+    } else {
+        // Unreachable: the width read above accepted no other variant.
+        Err(Error::KvStorageMismatch {
+            expected: "RotorKOnly3 | RotorKOnly4",
+            got: storage_variant_name(&cache.storage),
+        })
     }
-    if v.is_none() {
-        *v = Some(crate::storage::QuantRotorV3::new(
-            init_shape, max_seq, layer_idx,
-        ));
-    }
-    let Some(ks) = k.as_mut() else {
-        return Err(Error::Mlx("RotorSym3 K buffer absent after init".into()));
-    };
-    rotor_gpu_append_into_k_blocks::<3>(
-        ks,
-        new_k,
-        new_shape,
-        device,
-        RingFeed::MaintainRingOnly,
-        max_seq,
-    )?;
-    // Ring is now the sole resident store for K — drop the redundant CPU blocks
-    // (the prefill prefix, seeded into the ring on the first fused-decode step).
-    // See the note in the V append below; this is what turns the codec's ~34%
-    // logical compression into a resident-RAM win.
-    drop_blocks_when_ring_live_rotor_k(ks);
-    let Some(vs) = v.as_mut() else {
-        return Err(Error::Mlx("RotorSym3 V buffer absent after init".into()));
-    };
-    rotor_gpu_append_into_v_blocks::<3>(
-        vs,
-        new_v,
-        new_shape,
-        device,
-        RingFeed::MaintainRingOnly,
-        max_seq,
-    )?;
-    // The GPU ring holds the full prefix; the fused decode reads the ring, and
-    // `dequant` / SSD spill / clone / truncate rebuild the CPU blocks on demand
-    // from it (`synced_rotor_v_blocks`). A later GPU chunk (spec-verify) takes
-    // the block path, which materialises the ring tail before its Skip clear, so
-    // no ring-clear ever loses data; a CPU-only run never allocates the ring.
-    drop_blocks_when_ring_live_rotor_v(vs);
-    Ok(())
 }
 
 /// Drop a rotor K store's CPU blocks once its GPU ring is live — the ring is
@@ -1005,46 +927,42 @@ fn drop_blocks_when_ring_live_rotor_v<const BITS: u8>(vs: &mut QuantRotorV<BITS>
     }
 }
 
-/// Mirror of [`rotor3_sym_gpu_append`] for `RotorSym4`.
-///
-/// # Errors
-///
-/// Returns [`Error::KvStorageMismatch`] when the active storage is not
-/// `RotorSym4`, and forwards encode / ring errors.
-pub(super) fn rotor4_sym_gpu_append(
-    cache: &mut KvCache,
+/// Append `new_k` / `new_v` into a live rotor symmetric store's GPU rings
+/// (+ CPU blocks) at `BITS`, lazily creating the stores on first use. No
+/// dequant on either axis. Both axes maintain their ring: the quant-V kernel
+/// reads K's *and* V's. `variant` is the storage spelling the caller resolved,
+/// used only in the "buffer absent after init" diagnostics.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fused append carries both stores, the ring geometry and the \
+              width the caller resolved; a parameter struct would exist for \
+              this one call"
+)]
+fn rotor_sym_gpu_append_at<const BITS: u8>(
+    k: &mut Option<QuantRotorK<BITS>>,
+    v: &mut Option<QuantRotorV<BITS>>,
+    max_seq: i32,
+    layer_idx: u32,
+    variant: &'static str,
     new_k: &Array,
     new_v: &Array,
     new_shape: &[i32],
     device: Device,
 ) -> Result<()> {
-    let layer_idx = layer_idx_u32(cache.layer_idx);
-    let KvStorage::RotorSym4 { k, v, max_seq } = &mut cache.storage else {
-        return Err(Error::KvStorageMismatch {
-            expected: "RotorSym4",
-            got: storage_variant_name(&cache.storage),
-        });
-    };
-    let max_seq = *max_seq;
     let mut init_shape = new_shape.to_vec();
     if let Some(s) = init_shape.get_mut(2) {
         *s = 0;
     }
     if k.is_none() {
-        *k = Some(crate::storage::QuantRotorK4::new(
-            init_shape.clone(),
-            layer_idx,
-        ));
+        *k = Some(QuantRotorK::<BITS>::new(init_shape.clone(), layer_idx));
     }
     if v.is_none() {
-        *v = Some(crate::storage::QuantRotorV4::new(
-            init_shape, max_seq, layer_idx,
-        ));
+        *v = Some(QuantRotorV::<BITS>::new(init_shape, max_seq, layer_idx));
     }
     let Some(ks) = k.as_mut() else {
-        return Err(Error::Mlx("RotorSym4 K buffer absent after init".into()));
+        return Err(Error::Mlx(format!("{variant} K buffer absent after init")));
     };
-    rotor_gpu_append_into_k_blocks::<4>(
+    rotor_gpu_append_into_k_blocks::<BITS>(
         ks,
         new_k,
         new_shape,
@@ -1052,11 +970,15 @@ pub(super) fn rotor4_sym_gpu_append(
         RingFeed::MaintainRingOnly,
         max_seq,
     )?;
+    // Ring is now the sole resident store for K — drop the redundant CPU blocks
+    // (the prefill prefix, seeded into the ring on the first fused-decode step).
+    // See the note in the V append below; this is what turns the codec's ~34%
+    // logical compression into a resident-RAM win.
     drop_blocks_when_ring_live_rotor_k(ks);
     let Some(vs) = v.as_mut() else {
-        return Err(Error::Mlx("RotorSym4 V buffer absent after init".into()));
+        return Err(Error::Mlx(format!("{variant} V buffer absent after init")));
     };
-    rotor_gpu_append_into_v_blocks::<4>(
+    rotor_gpu_append_into_v_blocks::<BITS>(
         vs,
         new_v,
         new_shape,
@@ -1064,8 +986,73 @@ pub(super) fn rotor4_sym_gpu_append(
         RingFeed::MaintainRingOnly,
         max_seq,
     )?;
+    // The GPU ring holds the full prefix; the fused decode reads the ring, and
+    // `dequant` / SSD spill / clone / truncate rebuild the CPU blocks on demand
+    // from it (`synced_rotor_v_blocks`). A later GPU chunk (spec-verify) takes
+    // the block path, which materialises the ring tail before its Skip clear, so
+    // no ring-clear ever loses data; a CPU-only run never allocates the ring.
     drop_blocks_when_ring_live_rotor_v(vs);
     Ok(())
+}
+
+/// Append `new_k` / `new_v` into whichever rotor symmetric store is active —
+/// `RotorSym3` at 3 bits, `RotorSym4` at 4 — lazily creating the stores on
+/// first use. This is the entry point the rotor symmetric quant-V
+/// flash-decode SDPA path uses.
+///
+/// # Errors
+///
+/// Returns [`Error::KvStorageMismatch`] when the active storage is neither
+/// `RotorSym3` nor `RotorSym4`, and forwards encode / ring errors.
+pub(super) fn rotor_sym_gpu_append(
+    cache: &mut KvCache,
+    new_k: &Array,
+    new_v: &Array,
+    new_shape: &[i32],
+    device: Device,
+) -> Result<()> {
+    let layer_idx = layer_idx_u32(cache.layer_idx);
+    let (KvStorage::RotorSym3 { max_seq, .. } | KvStorage::RotorSym4 { max_seq, .. }) =
+        &cache.storage
+    else {
+        return Err(Error::KvStorageMismatch {
+            expected: "RotorSym3 | RotorSym4",
+            got: storage_variant_name(&cache.storage),
+        });
+    };
+    let max_seq = *max_seq;
+
+    if let KvStorage::RotorSym3 { k, v, .. } = &mut cache.storage {
+        rotor_sym_gpu_append_at::<3>(
+            k,
+            v,
+            max_seq,
+            layer_idx,
+            "RotorSym3",
+            new_k,
+            new_v,
+            new_shape,
+            device,
+        )
+    } else if let KvStorage::RotorSym4 { k, v, .. } = &mut cache.storage {
+        rotor_sym_gpu_append_at::<4>(
+            k,
+            v,
+            max_seq,
+            layer_idx,
+            "RotorSym4",
+            new_k,
+            new_v,
+            new_shape,
+            device,
+        )
+    } else {
+        // Unreachable: the width read above accepted no other variant.
+        Err(Error::KvStorageMismatch {
+            expected: "RotorSym3 | RotorSym4",
+            got: storage_variant_name(&cache.storage),
+        })
+    }
 }
 
 /// Accumulated sequence length held by a rotor K storage `shape`
@@ -1361,7 +1348,7 @@ pub(super) fn iso4_k_only_gpu_append(
 /// Append `new_k` / `new_v` into a live `IsoSym3` store's GPU rings (ring-only
 /// tail on both axes), lazily creating the stores on first use. No dequant on
 /// either axis — this is the entry point the iso symmetric quant-V flash-decode
-/// SDPA path uses. Mirror of [`rotor3_sym_gpu_append`].
+/// SDPA path uses. Mirror of [`rotor_sym_gpu_append`].
 ///
 /// # Errors
 ///

@@ -1124,7 +1124,8 @@ impl KvQuant {
     /// [`crate::kvcache`]'s `update_*` functions — not in assumptions:
     ///
     /// - **V-only iso / rotor** (`Iso3/4(/Sym)`, `Rotor3/4(/Sym)`,
-    ///   `RotorK{3,4}Asym`): `update_iso3*` / `update_rotor3*` early-return to
+    ///   `RotorK{3,4}Asym`): `update_iso3*` / `update_rotor_{v,sym,k_asym}`
+    ///   early-return to
     ///   the warm-TTFT bf16 decode seed (`decode_fp16_k.is_some()`) at decode,
     ///   so the GPU iso/rotor branch is shadowed and the codec encode that does
     ///   run (at prefill) is CPU → `Some(reason)`.
@@ -1133,7 +1134,7 @@ impl KvQuant {
     ///   GPU-resident end to end: the flash-decode kernel reads the packed ring
     ///   in place, so the growing prefix never crosses to the host).
     /// - **K-only rotor** (`RotorKOnly3/4`): NO bf16 early-return; the runtime
-    ///   dispatcher (`update_rotor_k_only_{3,4}` and the sdpa fast path) gates
+    ///   dispatcher (`update_rotor_k_only` and the sdpa fast path) gates
     ///   the GPU K encode on the store's sticky `use_qjl()` flag. QJL off
     ///   (default) → Metal (`None`); QJL on (opt-in `--rotor-qjl on`) → CPU
     ///   (`Some`). This classifier reads the process-global
@@ -1212,7 +1213,7 @@ impl KvQuant {
                 }
             }
             // K-only rotor variants: NO bf16 decode-seed early-return — the rotor
-            // K codec fires every decode step. `update_rotor_k_only_{3,4}` gates
+            // K codec fires every decode step. `update_rotor_k_only` gates
             // the GPU K encode on the store's sticky QJL flag (`use_qjl()`, fixed
             // at first append), matching the sdpa fast path:
             //   - QJL on (opt-in `--rotor-qjl on`): K append runs on CPU → CPU hot path.

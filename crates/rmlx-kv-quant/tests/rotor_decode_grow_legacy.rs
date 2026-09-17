@@ -4,7 +4,7 @@
 // flash-decode helper only when `rotor_flash_shape_ok` accepts the shape, which
 // requires a power-of-two `head_dim` (the kernel tree-reduces over `head_dim`
 // threads). Any other `head_dim` — 96 and 192 are ordinary attention shapes —
-// falls through to the legacy `update_rotor_k_only_{3,4}` path instead.
+// falls through to the legacy `update_rotor_k_only` path instead.
 //
 // That fall-through still feeds the same GPU ring, so it is bound by the same
 // provisioned `max_seq` and must grow with it. A fix applied only to the fused
@@ -105,7 +105,7 @@ fn prefill_then_decode(quant: KvQuant, head_dim: i32, n: i32, steps: u64) -> Res
 /// A saturated prompt must decode on the legacy path too, not just the fused one.
 ///
 /// `head_dim=96` is the whole point: it is the shape the flash kernel cannot
-/// take, so the step routes through `update_rotor_k_only_3`. Both paths feed the
+/// take, so the step routes through `update_rotor_k_only`. Both paths feed the
 /// same ring and are bound by the same `max_seq`.
 fn legacy_path_grows(quant: KvQuant, label: &str) {
     if skip_gpu() {

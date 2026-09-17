@@ -2429,7 +2429,7 @@ single structural finding:
 - **`iso3_vec_to_array` >5%** — Not triggered. Zero decode-site events.
 - **iso4 MSL kernel** — Independent of the above gate.
 - **rotor3 / rotor4 MSL kernels** — Independent of the above gate. Note:
-  rotor3 currently shares the bf16-seed-shadow shape (`update_rotor3` has the
+  rotor3 currently shares the bf16-seed-shadow shape (`update_rotor_v` has the
   same early-return guard), so kernels alone will not move decode TPS until
   the shadow is addressed.
 - **`rotor_fused_qk_msl` to RotorKOnly{3,4} + RotorKAsym{3,4}** —
@@ -2542,9 +2542,10 @@ Both at parity with their pre-change anchors.
 ## rotor3 + rotor4 MSL kernels + dispatch wiring (2026-06-03)
 
 Lands the rotor3 / rotor4 MSL encode + decode kernels and wires GPU
-encode dispatch into the six rotor V/K update paths (`update_rotor3`,
-`update_rotor4`, `update_rotor3_sym`, `update_rotor4_sym`,
-`update_rotor_k_only_{3,4}`, `update_rotor_k_asym_{3,4}`).
+encode dispatch into the rotor V/K update paths — six per-width bodies then,
+today the four entries `update_rotor_v`, `update_rotor_sym`,
+`update_rotor_k_only` and `update_rotor_k_asym`, one per family over both code
+widths.
 
 ### What landed
 
@@ -2579,7 +2580,7 @@ encode dispatch into the six rotor V/K update paths (`update_rotor3`,
 ### Warm-TTFT bf16-seed caveat (carried over)
 
 Rotor V codecs are shadowed by the bf16 `exit_prefill` seed:
-`update_rotor3` / `update_rotor4` short-circuit on
+`update_rotor_v` short-circuits at both widths on
 `self.decode_fp16_k.is_some()` from the second decode step onward. The
 GPU encode therefore fires **once at exit_prefill** (large `new_v` slice
 — meaningful work), not per decode step. The wall-clock benefit lands on

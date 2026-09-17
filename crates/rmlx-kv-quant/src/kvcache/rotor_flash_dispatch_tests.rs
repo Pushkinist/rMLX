@@ -306,11 +306,7 @@ fn batched_ring_feed_is_skipped(quant: KvQuant, bits_label: &str) {
         &shape,
     );
 
-    let res = if quant == KvQuant::RotorKOnly4 {
-        super::update::rotor4_k_only_gpu_append(&mut cache, &k, &shape, device)
-    } else {
-        super::update::rotor3_k_only_gpu_append(&mut cache, &k, &shape, device)
-    };
+    let res = super::update::rotor_k_only_gpu_append(&mut cache, &k, &shape, device);
     res.unwrap_or_else(|e| {
         panic!("{bits_label}: batched GPU append must not error, got: {e}");
     });
@@ -694,7 +690,7 @@ fn rotor_k_only_4_ring_only_tail_truncate_then_decode() {
 ///
 /// This is the observable consequence `ring_feed_routing_tests` cannot reach:
 /// those tests assert how `LEGACY_ROTOR_K_ONLY_FEED` routes, not that
-/// `update_rotor_k_only_*` still passes it. Here the fused steps empty
+/// `update_rotor_k_only` still passes it. Here the fused steps empty
 /// `blocks` (the ring becomes the sole copy), and the following `q_seq > 1`
 /// forward — a speculative verify chunk, or a continuation turn's prompt tokens
 /// against a warm cache — falls out of the fused gate (`q_seq == 1`) into the

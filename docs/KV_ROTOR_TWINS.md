@@ -73,8 +73,10 @@ the generic body calls the parametric form with `BITS` and the four
 width-named wrappers stay as the public spelling.
 
 `kvcache/update.rs`: the eight `update_rotor*` bodies become four, each
-generic over the store's `BITS`. The `KvStorage` variants stay eight — a
-variant is a spelling, and no spelling is removed (issue §Sequencing).
+generic over the store's `BITS`, and the eight entries above them become four
+as well, each resolving the width from the storage variant it was dispatched
+on. The `KvStorage` variants stay eight — a variant is a spelling, and no
+spelling is removed (issue §Sequencing).
 
 Rule 1 of the simplicity rules still governs: the generic is introduced
 because there are two instantiations of every item, not to admit a third.
@@ -199,12 +201,25 @@ Per pair, storage: `quant_rotor_k3` <-> `quant_rotor_k4` 401 (70.0 %),
 `update_rotor3` <-> `update_rotor4` 77 (97.5 %), `_sym` 81 (94.2 %),
 `_k_only` 52 (91.2 %), `_k_asym` 83 (100.0 %).
 
-### After, on the collapsed tree
+### After the storage and body collapse
 
 ```
 rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
 rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched lines over 146 body lines (8 item(s), 4 pair(s))
 ```
+
+The storage axis was closed there; the update axis was not — the eight
+entries survived as width dispatchers. They are now four.
+
+### After the entry collapse
+
+```
+rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 111 body lines (4 item(s), 0 pair(s))
+```
+
+Both axes now read a measured `0` with the population still found: four
+`update_rotor_*` entries, no two of which differ in a width digit.
 
 ### Reconciliation with the figures computed by hand
 
@@ -213,7 +228,8 @@ rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched line
 | storage, before | 814 over 2244 | 814 over 2244 | none |
 | updates, before | 313 over 650 | 293 over 610 | −20 matched, −40 lines |
 | storage, after | 0 over 1394 | 0 over 1404 | −10 lines |
-| updates, after | 0 over 234 | **69 over 146** | a different population |
+| updates, after the body collapse | 0 over 234 | **69 over 146** | a different population |
+| updates, after the entry collapse | — | 0 over 111 | closed |
 
 * **Updates, before.** The hand run compared each fn from its `fn NAME(` line
   through its closing brace; the tool compares `FnInfo.body`, which starts at
@@ -230,14 +246,16 @@ rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched line
   after-figure's matched count is 0 either way, so the ten lines are a slip in
   the hand count, not a difference in the rule. The tool's number stands.
 * **Updates, after.** The hand after-figure was taken over the *generic*
-  bodies the entries now delegate to — one per family — which is not the
-  population the rule names. Under the rule, the eight `update_rotor{3,4}*`
-  entries still exist, and each pair still differs only in the width digit, so
-  the population is 8 items and 4 pairs on both trees. What the collapse bought
-  is the size of the bodies: 293 matched over 610 lines became 69 over 146.
-  The twin is reduced by 76 %, not removed. Closing it means the eight entries
-  collapsing onto a width-generic dispatch of their own, which this chunk did
-  not do and no proof row claimed.
+  bodies the entries delegated to — one per family — which is not the
+  population the rule names. Under the rule the eight `update_rotor{3,4}*`
+  entries still existed, each pair still differing only in the width digit, so
+  the population was 8 items and 4 pairs on both trees and the body collapse
+  bought only their size: 293 matched over 610 lines became 69 over 146, a
+  76 % reduction and not a removal. The entry collapse is what closes it. The
+  eight entries are four — `update_rotor_v`, `update_rotor_sym`,
+  `update_rotor_k_only`, `update_rotor_k_asym` — each resolving the width from
+  the storage variant, so the population is 4 items, 0 pairs, 0 matched lines,
+  and it is still found.
 
 ### The advisory half
 
@@ -271,11 +289,27 @@ The collapse deleted, by file and by name:
   shared payload types (`RotorBlocks`, `RotorKBlocks`), their `BlockRows` impls
   and the two `synced_rotor_*_blocks` helpers stay there.
 * `KvCache::update_rotor4`, `update_rotor4_sym`, `update_rotor_k_only_4`,
-  `update_rotor_k_asym_4` in `kvcache/update.rs` — four bodies. All eight
-  entries survive as the storage-variant resolver plus the warm-TTFT shortcut,
-  over four shared bodies: `rotor_v_update`, `rotor_sym_update`,
-  `rotor_k_only_k_side` and `rotor_k_asym_update`, each generic over the store's
-  `BITS`.
+  `update_rotor_k_asym_4` in `kvcache/update.rs` — four bodies, over four
+  shared bodies: `rotor_v_update`, `rotor_sym_update`, `rotor_k_only_k_side`
+  and `rotor_k_asym_update`, each generic over the store's `BITS`.
+* The eight entries above those bodies, in the same file:
+  `KvCache::update_rotor3`, `update_rotor4`, `update_rotor3_sym`,
+  `update_rotor4_sym`, `update_rotor_k_only_3`, `update_rotor_k_only_4`,
+  `update_rotor_k_asym_3`, `update_rotor_k_asym_4`. Four survive —
+  `update_rotor_v`, `update_rotor_sym`, `update_rotor_k_only`,
+  `update_rotor_k_asym` — each reading the width off the `KvStorage` variant it
+  was dispatched on and instantiating its body at 3 or 4. `update()` dispatches
+  both widths of a family to one arm. Added with them: `rotor_storage_mismatch`,
+  the one `storage mismatch` error the V and symmetric entries build.
+* The four `pub(super)` fused-append entries `rotor3_k_only_gpu_append`,
+  `rotor4_k_only_gpu_append`, `rotor3_sym_gpu_append` and
+  `rotor4_sym_gpu_append` — two entries now, `rotor_k_only_gpu_append` and
+  `rotor_sym_gpu_append`, over two new width-generic bodies
+  (`rotor_k_only_gpu_append_at`, `rotor_sym_gpu_append_at`). With them went
+  their two one-caller wrappers in `kvcache/sdpa.rs`, `KvCache::rotor_k_gpu_append`
+  and `KvCache::rotor_sym_gpu_append`, whose only work was the width resolution
+  the entry now does; both call sites call the entry directly. No `.metal` file
+  is touched.
 * The twin halves of the storage test files: `quant_rotor_v4_tests.rs` and
   `quant_rotor_k4_tests.rs` are folded into `quant_rotor_v_tests.rs` /
   `quant_rotor_k_tests.rs`. What is deleted is the duplicated **body**, not the
@@ -296,13 +330,11 @@ ROTOR3_BITS` forks inside the K encode path collapsed onto `rotor_encode` /
 had (`rotor_k_encode_at`, `rotor_k_decode_at`); the four width-named `rotor{3,4}_k_*`
 wrappers stay as the public spelling.
 
-**Kept, though it is the same shape.** Nine twin pairs still exist once per
-width. Four are the `pub(super)` fused-append entries
-`rotor{3,4}_k_only_gpu_append` / `rotor{3,4}_sym_gpu_append` in `update.rs`:
-they resolve a `KvStorage` variant exactly as the `update_*` entries do, and
-they now call the generic helpers at their own width. The other five each bind
-a per-width `.metal` kernel or its dispatch counter, and the kernels are out of
-scope for this chunk:
+**Kept, though it is the same shape.** Five twin pairs still exist once per
+width. The four fused-append entries recorded here as kept — they resolved a
+`KvStorage` variant exactly as the `update_*` entries did — went with the entry
+collapse, for that same reason. The five that remain each bind a per-width
+`.metal` kernel or its dispatch counter, and the kernels are out of scope:
 
 | Pair | File |
 |---|---|
