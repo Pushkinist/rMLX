@@ -1,26 +1,29 @@
-//! Unit tests for [`QuantRotorK3`].
+//! Unit tests for [`QuantRotorK`], run at both code widths.
 //!
-//! Mirror of `quant_iso_k_tests.rs` adapted to the rotor3 K codec. The
+//! Mirror of `quant_iso_k_tests.rs` adapted to the rotor K codec. The
 //! `_with_qjl` / `_no_qjl` variants exercise both QJL branches.
+//!
+//! Every case whose body differs between the widths only in the width token
+//! (and, for the cosine floor, in the bound the wider codec earns) is one
+//! generic body below plus one `#[test]` per width, so the cell count is the
+//! same as when the two widths had their own files.
 #![allow(unsafe_code)]
 
 use crate::clifford::make_rotor_table;
-use crate::rotorquant::{n_groups_for, rotor3_decode, rotor3_encode};
-use crate::storage::quant_rotor_k3::{QuantRotorK3, ROTOR3_K_BITS};
+use crate::rotorquant::{n_groups_for, rotor3_decode, rotor_decode, rotor_encode};
+use crate::storage::quant_rotor_k::{QuantRotorK, QuantRotorK3, ROTOR3_K_BITS, ROTOR4_K_BITS};
 use crate::test_utils::{cosine_similarity_per_row, lcg_data, TEST_SEED};
 
-#[test]
-fn quant_rotor_k3_new_shapes_correct() {
+fn new_shapes_correct<const BITS: u8>(expect_bits: u8) {
     let init_shape = vec![1_i32, 4, 0, 128];
-    let q = QuantRotorK3::new(init_shape.clone(), 0);
+    let q = QuantRotorK::<BITS>::new(init_shape.clone(), 0);
     assert_eq!(q.shape, init_shape, "shape preserved after new()");
-    assert_eq!(q.bits, ROTOR3_K_BITS);
+    assert_eq!(q.bits, expect_bits);
     assert!(q.blocks.is_empty(), "no blocks after new()");
     assert!(!q.use_qjl(), "use_qjl false before first append");
 }
 
-#[test]
-fn quant_rotor_k3_roundtrip_no_qjl_matches_v_side() {
+fn roundtrip_no_qjl_matches_v_side<const BITS: u8>() {
     let _guard = crate::test_utils::env_lock();
     // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
@@ -33,7 +36,7 @@ fn quant_rotor_k3_roundtrip_no_qjl_matches_v_side() {
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
     let new_shape = [b as i32, kv_h as i32, n_seq as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK3::new(vec![b as i32, kv_h as i32, 0_i32, head_dim as i32], 0);
+    let mut qk = QuantRotorK::<BITS>::new(vec![b as i32, kv_h as i32, 0_i32, head_dim as i32], 0);
     qk.append(&data, &new_shape).expect("append");
     assert_eq!(qk.blocks.len(), 1);
     assert_eq!(qk.shape[2], n_seq as i32);
@@ -44,8 +47,9 @@ fn quant_rotor_k3_roundtrip_no_qjl_matches_v_side() {
     // axis-agnostic when QJL is off).
     let n_groups = n_groups_for(head_dim);
     let rotors = make_rotor_table(0, 0, n_groups);
-    let (ref_codes, ref_scales, ref_norms) = rotor3_encode(&data, &rotors, head_dim).unwrap();
-    let reference = rotor3_decode(&ref_codes, &ref_scales, &ref_norms, &rotors, head_dim).unwrap();
+    let (ref_codes, ref_scales, ref_norms) = rotor_encode(&data, &rotors, head_dim, BITS).unwrap();
+    let reference =
+        rotor_decode(&ref_codes, &ref_scales, &ref_norms, &rotors, head_dim, BITS).unwrap();
 
     assert_eq!(decoded.len(), reference.len());
     let max_abs_err = decoded
@@ -55,7 +59,7 @@ fn quant_rotor_k3_roundtrip_no_qjl_matches_v_side() {
         .fold(0.0_f32, f32::max);
     assert!(
         max_abs_err < 1e-5,
-        "rotor3_k (no QJL) vs rotor3 V: max_abs_err = {max_abs_err:.6} (>= 1e-5)"
+        "rotor{BITS}_k (no QJL) vs rotor{BITS} V: max_abs_err = {max_abs_err:.6} (>= 1e-5)"
     );
 
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
@@ -138,14 +142,13 @@ fn quant_rotor_k3_roundtrip_under_ambient_qjl_setting() {
     assert_eq!(qk.blocks.len(), 1);
 }
 
-#[test]
-fn quant_rotor_k3_reset_clears_seq() {
+fn reset_clears_seq<const BITS: u8>() {
     let head_dim = 9;
     let n_seq = 4;
     let data = lcg_data(n_seq * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_seq as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], 0);
+    let mut qk = QuantRotorK::<BITS>::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     assert_eq!(qk.shape[2], n_seq as i32);
 
@@ -158,8 +161,7 @@ fn quant_rotor_k3_reset_clears_seq() {
 /// Matches V-side rotor3 (axis-agnostic) at this seed/shape: measured ≈
 /// 0.985. Gate at 0.97 (measured − 0.015 floor, accommodates LCG drift +
 /// the rotor3 single-codebook simplification noise).
-#[test]
-fn quant_rotor_k3_cosine_empirical_floor_head_dim_128_no_qjl() {
+fn cosine_empirical_floor_head_dim_128_no_qjl<const BITS: u8>(floor: f32) {
     let _guard = crate::test_utils::env_lock();
     // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
@@ -169,13 +171,13 @@ fn quant_rotor_k3_cosine_empirical_floor_head_dim_128_no_qjl() {
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_rows as i32, head_dim as i32];
 
-    let mut qk = QuantRotorK3::new(vec![1, 1, 0, head_dim as i32], 0);
+    let mut qk = QuantRotorK::<BITS>::new(vec![1, 1, 0, head_dim as i32], 0);
     qk.append(&data, &new_shape).unwrap();
     let decoded = qk.dequant().unwrap();
     let stats = cosine_similarity_per_row(&data, &decoded, head_dim);
     assert!(
-        stats.min >= 0.65,
-        "rotor3_k cosine min={:.6} below empirical floor 0.65",
+        stats.min >= floor,
+        "rotor{BITS}_k cosine min={:.6} below empirical floor {floor}",
         stats.min
     );
     unsafe { std::env::remove_var("RMLX_ROTOR_QJL") };
@@ -187,8 +189,7 @@ fn quant_rotor_k3_cosine_empirical_floor_head_dim_128_no_qjl() {
 /// group/projection-keyed (not token); the per-token QJL sideband (qjl_codes /
 /// qjl_norms) reorders with the token rows. Per-(head, token, dim) distinct
 /// values surface any head transposition as a large error.
-#[test]
-fn quant_rotor_k3_multi_append_matches_single_shot_gqa_with_qjl() {
+fn multi_append_matches_single_shot_gqa_with_qjl<const BITS: u8>() {
     let _guard = crate::test_utils::env_lock();
     // SAFETY: env lock held — no concurrent env reader/writer in this binary.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "1") };
@@ -213,7 +214,7 @@ fn quant_rotor_k3_multi_append_matches_single_shot_gqa_with_qjl() {
         }
         out
     };
-    let mut qref = QuantRotorK3::new(vec![1, kv_h as i32, 0, head_dim as i32], 7);
+    let mut qref = QuantRotorK::<BITS>::new(vec![1, kv_h as i32, 0, head_dim as i32], 7);
     qref.append(
         &build(0, s_total),
         &[1, kv_h as i32, s_total as i32, head_dim as i32],
@@ -222,7 +223,7 @@ fn quant_rotor_k3_multi_append_matches_single_shot_gqa_with_qjl() {
     assert!(qref.use_qjl(), "QJL must be ON for this test");
     let reference = qref.dequant().unwrap();
 
-    let mut qv = QuantRotorK3::new(vec![1, kv_h as i32, 0, head_dim as i32], 7);
+    let mut qv = QuantRotorK::<BITS>::new(vec![1, kv_h as i32, 0, head_dim as i32], 7);
     qv.append(
         &build(0, chunk_a),
         &[1, kv_h as i32, chunk_a as i32, head_dim as i32],
@@ -331,7 +332,7 @@ fn quant_rotor_k3_reset_drops_the_gpu_ring() {
 ///
 /// Reproduces the fused decode path's state exactly: the store carries a
 /// **ring-only tail** — `blocks` empty (dropped once the ring went live, the way
-/// `drop_blocks_when_ring_live_k3` does it) while the ring holds the whole
+/// `drop_blocks_when_ring_live_rotor_k` does it) while the ring holds the whole
 /// prefix and `shape[2]` tracks it. The ring is then the only copy of every
 /// token. Clearing it in `truncate_to` (the pre-fix behaviour) strands the kept
 /// prefix with nothing to rebuild it from, and `dequant()` / an SSD spill hits
@@ -435,8 +436,7 @@ fn quant_rotor_k3_truncate_to_keeps_the_gpu_ring() {
 /// `kv_h > 1` case RED — `blocks.len()` drops to `keep_tokens / kv_h` and
 /// `dequant()` returns `Err` (blocks short of `shape[2]`, no ring to rebuild
 /// from).
-#[test]
-fn quant_rotor_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+fn truncate_to_kv_h_gt_1_keeps_exact_prefix<const BITS: u8>() {
     let _guard = crate::test_utils::env_lock();
     // SAFETY: env lock held — no concurrent env reader/writer.
     unsafe { std::env::set_var("RMLX_ROTOR_QJL", "0") };
@@ -460,7 +460,7 @@ fn quant_rotor_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
         };
         let new_shape = [1_i32, kv_h as i32, 1, head_dim as i32];
 
-        let mut store = QuantRotorK3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 5);
+        let mut store = QuantRotorK::<BITS>::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 5);
         for tok in 0..total_tokens {
             store.append(&token_data(tok), &new_shape).unwrap();
         }
@@ -492,7 +492,8 @@ fn quant_rotor_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
             .dequant()
             .expect("dequant must succeed after truncate at kv_h>1 (#284)");
 
-        let mut reference = QuantRotorK3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 5);
+        let mut reference =
+            QuantRotorK::<BITS>::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 5);
         for tok in 0..keep_tokens {
             reference.append(&token_data(tok), &new_shape).unwrap();
         }
@@ -657,8 +658,7 @@ fn quant_rotor_k3_truncate_mid_block_splits_at_this_shape() {
 /// concatenation back in `QuantRotorK3::dequant` and this goes red at
 /// `b = 2` while staying green at `b = 1` — which is how the defect stayed
 /// invisible.
-#[test]
-fn quant_rotor_k3_two_block_decode_matches_one_block_at_b_gt_1() {
+fn two_block_decode_matches_one_block_at_b_gt_1<const BITS: u8>() {
     // The QJL sideband is read from the process env at each `append`, so a
     // concurrent env-mutating test could otherwise encode the two stores under
     // different settings. Hold the lock and pin both settings explicitly — the
@@ -678,7 +678,7 @@ fn quant_rotor_k3_two_block_decode_matches_one_block_at_b_gt_1() {
         let (n0, n1) = (2_usize, 3_usize);
         let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
 
-        let mut one = QuantRotorK3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 5);
+        let mut one = QuantRotorK::<BITS>::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 5);
         one.append(
             &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0 + n1, head_dim),
             &shape(n0 + n1),
@@ -686,7 +686,7 @@ fn quant_rotor_k3_two_block_decode_matches_one_block_at_b_gt_1() {
         .expect("single append");
         let oracle = one.dequant().expect("one-block dequant");
 
-        let mut two = QuantRotorK3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 5);
+        let mut two = QuantRotorK::<BITS>::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 5);
         two.append(
             &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0, head_dim),
             &shape(n0),
@@ -704,4 +704,76 @@ fn quant_rotor_k3_two_block_decode_matches_one_block_at_b_gt_1() {
             "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}, qjl={qjl}"
         );
     }
+}
+
+// ── One `#[test]` per width over the generic bodies above ─────────────
+
+#[test]
+fn quant_rotor_k3_new_shapes_correct() {
+    new_shapes_correct::<3>(ROTOR3_K_BITS);
+}
+
+#[test]
+fn quant_rotor_k4_new_shapes_correct() {
+    new_shapes_correct::<4>(ROTOR4_K_BITS);
+}
+
+#[test]
+fn quant_rotor_k3_roundtrip_no_qjl_matches_v_side() {
+    roundtrip_no_qjl_matches_v_side::<3>();
+}
+
+#[test]
+fn quant_rotor_k4_roundtrip_no_qjl_matches_v_side() {
+    roundtrip_no_qjl_matches_v_side::<4>();
+}
+
+#[test]
+fn quant_rotor_k3_reset_clears_seq() {
+    reset_clears_seq::<3>();
+}
+
+#[test]
+fn quant_rotor_k4_reset_clears_seq() {
+    reset_clears_seq::<4>();
+}
+
+#[test]
+fn quant_rotor_k3_cosine_empirical_floor_head_dim_128_no_qjl() {
+    cosine_empirical_floor_head_dim_128_no_qjl::<3>(0.65);
+}
+
+#[test]
+fn quant_rotor_k4_cosine_empirical_floor_head_dim_128_no_qjl() {
+    cosine_empirical_floor_head_dim_128_no_qjl::<4>(0.75);
+}
+
+#[test]
+fn quant_rotor_k3_multi_append_matches_single_shot_gqa_with_qjl() {
+    multi_append_matches_single_shot_gqa_with_qjl::<3>();
+}
+
+#[test]
+fn quant_rotor_k4_multi_append_matches_single_shot_gqa_with_qjl() {
+    multi_append_matches_single_shot_gqa_with_qjl::<4>();
+}
+
+#[test]
+fn quant_rotor_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+    truncate_to_kv_h_gt_1_keeps_exact_prefix::<3>();
+}
+
+#[test]
+fn quant_rotor_k4_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+    truncate_to_kv_h_gt_1_keeps_exact_prefix::<4>();
+}
+
+#[test]
+fn quant_rotor_k3_two_block_decode_matches_one_block_at_b_gt_1() {
+    two_block_decode_matches_one_block_at_b_gt_1::<3>();
+}
+
+#[test]
+fn quant_rotor_k4_two_block_decode_matches_one_block_at_b_gt_1() {
+    two_block_decode_matches_one_block_at_b_gt_1::<4>();
 }

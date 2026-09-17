@@ -623,8 +623,9 @@ green on real Metal).
 ### 5.7.3 The Iso / Rotor `Vec<Blocks>` codecs use the same sequence-major rule
 
 The rotation-KV `Vec<Blocks>` codecs — `QuantIsoV3` / `QuantIsoV4`,
-`QuantIsoK3` / `QuantIsoK4`, `QuantRotorV3` / `QuantRotorV4`,
-`QuantRotorK3` / `QuantRotorK4` — accumulate one `*Blocks` entry per `append`
+`QuantIsoK3` / `QuantIsoK4`, `QuantRotorV<BITS>` (`QuantRotorV3` /
+`QuantRotorV4`), `QuantRotorK<BITS>` (`QuantRotorK3` / `QuantRotorK4`) —
+accumulate one `*Blocks` entry per `append`
 and concatenate them on `dequant`, with the caller reshaping head-major
 `[B, kv_h, S, D]`. That is the **same** cross-block head transposition as
 `QuantV` (a multi-append GQA cache with `kv_h > 1` scrambles per-head values).

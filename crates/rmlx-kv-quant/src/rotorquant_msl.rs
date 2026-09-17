@@ -767,8 +767,8 @@ fn rotor_dequantize_gpu_impl(
 // ── Materialise GPU outputs to CPU vectors ────────────────────────────────────
 
 /// Read the GPU rotor encode outputs back to host and return the CPU vectors
-/// used by [`crate::storage::quant_rotor_v3::RotorBlocks`] /
-/// [`crate::storage::quant_rotor_v4`]. The per-group GPU norm slots are
+/// used by [`crate::storage::RotorBlocks`] at either rotor width. The
+/// per-group GPU norm slots are
 /// deduplicated to per-token (first slot of each token).
 ///
 /// # Errors

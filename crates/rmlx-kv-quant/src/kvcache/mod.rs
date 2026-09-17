@@ -109,6 +109,12 @@ mod windowed_ring_sizing_tests;
 #[path = "rotor_flash_dispatch_tests.rs"]
 mod rotor_flash_dispatch_tests;
 
+// Byte-level pin on the rotor storage layer: what every rotor spelling writes
+// into its packed store, and what the attention reads back from it.
+#[cfg(test)]
+#[path = "rotor_store_bytes_tests.rs"]
+mod rotor_store_bytes_tests;
+
 // Iso K-only flash-decode reaches the kernel from the production
 // `update_and_sdpa` entry point, and its ring bookkeeping holds.
 #[cfg(test)]

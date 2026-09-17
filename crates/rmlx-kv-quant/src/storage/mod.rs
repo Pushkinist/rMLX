@@ -42,10 +42,8 @@ mod quant_k_turbo3;
 mod quant_k_turbo4;
 mod quant_planar_k;
 mod quant_planar_v;
-mod quant_rotor_k3;
-mod quant_rotor_k4;
-mod quant_rotor_v3;
-mod quant_rotor_v4;
+mod quant_rotor_k;
+mod quant_rotor_v;
 mod quant_v;
 mod seq_layout;
 
@@ -75,12 +73,19 @@ pub use quant_k_turbo3::{QuantKTurbo3, TURBO3_K_BITS};
 pub use quant_k_turbo4::QuantKTurbo4;
 pub use quant_planar_k::QuantPlanarK;
 pub use quant_planar_v::QuantPlanarV;
-pub(crate) use quant_rotor_k3::synced_rotor_k_blocks;
-pub use quant_rotor_k3::{QuantRotorK3, RotorKBlocks, ROTOR3_K_BITS, ROTOR3_K_GROUP_SIZE};
-pub use quant_rotor_k4::{QuantRotorK4, ROTOR4_K_BITS, ROTOR4_K_GROUP_SIZE};
-pub(crate) use quant_rotor_v3::synced_rotor_v_blocks;
-pub use quant_rotor_v3::{QuantRotorV3, RotorBlocks, ROTOR3_V_BITS, ROTOR3_V_GROUP_SIZE};
-pub use quant_rotor_v4::{QuantRotorV4, ROTOR4_V_BITS, ROTOR4_V_GROUP_SIZE};
+// The width-parametric stores stay crate-internal: the two widths the codecs
+// ship are the aliases below, and a third instantiation has no codec, no
+// kernel and no spelling. Callers outside the crate name the aliases.
+pub(crate) use quant_rotor_k::{synced_rotor_k_blocks, QuantRotorK};
+pub use quant_rotor_k::{
+    QuantRotorK3, QuantRotorK4, RotorKBlocks, ROTOR3_K_BITS, ROTOR3_K_GROUP_SIZE, ROTOR4_K_BITS,
+    ROTOR4_K_GROUP_SIZE,
+};
+pub(crate) use quant_rotor_v::{synced_rotor_v_blocks, QuantRotorV};
+pub use quant_rotor_v::{
+    QuantRotorV3, QuantRotorV4, RotorBlocks, ROTOR3_V_BITS, ROTOR3_V_GROUP_SIZE, ROTOR4_V_BITS,
+    ROTOR4_V_GROUP_SIZE,
+};
 pub use quant_v::QuantV;
 
 #[cfg(test)]

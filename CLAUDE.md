@@ -46,6 +46,7 @@ areas before touching code:
 | [`docs/WEIGHT_QUANTS.md`](docs/WEIGHT_QUANTS.md) | Weight quantization formats (mxfp, affine, TurboQuant, PlanarQuant, ParoQuant) |
 | [`docs/KV_QUANT.md`](docs/KV_QUANT.md) | KV-cache quantization variants (K8V4, K8V8, Mixed, Planar, Paged, rot_k) |
 | [`docs/KV_CACHE.md`](docs/KV_CACHE.md) | KV cache architecture (block alignment, ring buffer, SWA snapshot, chunked prefill) |
+| [`docs/KV_ROTOR_TWINS.md`](docs/KV_ROTOR_TWINS.md) | Rotor 3/4-bit storage + update twins: measured premise, the store-bytes oracle, mutations, removals |
 | [`docs/SSD_TIER.md`](docs/SSD_TIER.md) | SSD KV tier (layout_key, ssd_index schema, hydrate, spill, cross-namespace LRU) |
 | [`docs/SSD_CANARY.md`](docs/SSD_CANARY.md) | SSD KV cross-restart smoke probe |
 | [`docs/PROMPT_CACHE.md`](docs/PROMPT_CACHE.md) | Prompt cache + automatic prefix caching (block hashing, ReusePolicy, prefix index) |
