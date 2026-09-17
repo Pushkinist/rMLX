@@ -150,56 +150,114 @@ visible against it.
 
 ## 6. Duplication figure
 
-`scripts/debt_report.sh --matched-lines {drivers,impls}` is the one producer of
-the campaign's duplication figure, but both of its populations are hard-coded
-to `SPEC_DIR` (`crates/rmlx-models/src/speculative`). **It cannot produce a
-before-figure for the rotor population as it stands.**
+`scripts/debt_report.sh --matched-lines <population>` is the one producer of
+this figure. It carried two populations, both hard-coded to `SPEC_DIR`
+(`crates/rmlx-models/src/speculative`); it now carries four, each with its own
+root and its own pairing rule, over the same `normalize()` and
+`matched_lines()` the speculative populations use. No second matcher, no
+second script, no new Make target.
 
-The advisory half of the same script *does* already reach the rotor file
-twins, because the file-pair scan runs over `crates/rmlx-kv-quant`. Its output
-at the branch point — the paths below are the pre-collapse tree's, and §11
-records what the same scan prints now:
+**The rule**, verbatim from the header of `scripts/lib/debt_report.py`:
+
+> * `rotor-storage` — the non-test `quant_rotor_*.rs` files under
+>   `crates/rmlx-kv-quant/src/storage`, paired inside a group sharing the
+>   filename stem with every digit run removed (`quant_rotor_v3` and
+>   `quant_rotor_v4` -> `quant_rotor_v`): same axis, different width. A group
+>   of one contributes an item and no pair, so a collapsed axis reads 0
+>   matched lines with the population still found.
+> * `rotor-updates` — the `update_rotor*` fns of
+>   `crates/rmlx-kv-quant/src/kvcache/update.rs`, paired by the same
+>   digit-stripped-name rule (`update_rotor_k_only_3` and `_4` ->
+>   `update_rotor_k_only_`).
+>
+> Neither rotor population is a literal file or fn list: both are a glob plus
+> a name rule, so the same command measures a tree that still carries the
+> twins and one that does not.
+
+Two properties the figure depends on:
+
+* **The label names the population's own root.** `matched_lines_report`
+  rendered every label beside `SPEC_DIR`, so a rotor figure would have printed
+  a speculative path. The root is now a field of the population entry.
+* **An empty population is `unavailable`, not `0`.** It prints to stderr and
+  exits 1. A collapsed population — members present, no same-axis pair left —
+  is a measured `0` and exits 0. The two are different answers and only the
+  second is a measurement.
+
+### Before, on the pre-collapse tree
+
+Run from this branch with `--root` pointed at a separate worktree of the
+branch point, so the tool is one version and the tree is the other:
 
 ```
-crates/rmlx-kv-quant/src/storage/quant_rotor_k3.rs <-> .../quant_rotor_k4.rs: 70.0% shared
-crates/rmlx-kv-quant/src/storage/quant_rotor_v3.rs <-> .../quant_rotor_v4.rs: 75.2% shared
+rotor storage twins (crates/rmlx-kv-quant/src/storage): 814 matched lines over 2244 body lines (4 item(s), 2 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 293 matched lines over 610 body lines (8 item(s), 4 pair(s))
 ```
 
-What it cannot reach is (a) the summed matched-line count for that population,
-and (b) the eight `update_*` bodies, which live in one file and so are invisible
-to a file-pair scan.
+Per pair, storage: `quant_rotor_k3` <-> `quant_rotor_k4` 401 (70.0 %),
+`quant_rotor_v3` <-> `quant_rotor_v4` 413 (75.2 %). Updates:
+`update_rotor3` <-> `update_rotor4` 77 (97.5 %), `_sym` 81 (94.2 %),
+`_k_only` 52 (91.2 %), `_k_asym` 83 (100.0 %).
 
-**Smallest extension that keeps one producer** (design item for the code
-chunk): give `--matched-lines` a population argument rather than a second tool
-— add a `rotor-storage` and a `rotor-updates` entry to
-`MATCHED_LINES_POPULATIONS` in `scripts/lib/debt_report.py`, each a collector
-over its own directory/fn set, reusing the existing `normalize()` and
-`matched_lines()`. No new normalisation, no new script, no new Make target
-beyond what `debt-report-selftest` already covers.
+### After, on the collapsed tree
 
-Two constraints on that edit, both of which a naive version gets wrong:
+```
+rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched lines over 146 body lines (8 item(s), 4 pair(s))
+```
 
-* `matched_lines_report` renders `f"{label} ({SPEC_DIR}): …"` — the directory in
-  the label is a module constant, so a rotor population would print a
-  speculative path beside a rotor figure. **The label's directory must come from
-  the population entry**, alongside its label and collector, not from
-  `SPEC_DIR`.
-* `debt_report_selftest.sh` asserts what each case found, not that the tool ran.
-  **Each new population gets its own selftest case**, asserting a planted
-  matched-line figure over a synthetic fixture and the `unavailable` path when
-  its directory is missing — the same two directions the existing populations
-  are held to.
+### Reconciliation with the figures computed by hand
 
-**Before-figure, by hand this once**, computed by importing that module's own
-`normalize()` and `matched_lines()` so the normalisation is not retyped:
-
-| Population | Pairs | Matched lines | Over |
+| Population | By hand | By the tool | Difference |
 |---|---|---|---|
-| rotor storage twins | `v3↔v4`, `k3↔k4` | 814 | 2244 file lines |
-| rotor `update_*` twins | the four 3↔4 pairs | 313 | 650 body lines |
+| storage, before | 814 over 2244 | 814 over 2244 | none |
+| updates, before | 313 over 650 | 293 over 610 | −20 matched, −40 lines |
+| storage, after | 0 over 1394 | 0 over 1404 | −10 lines |
+| updates, after | 0 over 234 | **69 over 146** | a different population |
 
-Per pair: `v3↔v4` 413 (75.2 %), `k3↔k4` 401 (70.0 %); `update_rotor3↔4` 82
-(97.6 %), `_sym` 86 (94.5 %), `_k_only` 57 (91.9 %), `_k_asym` 88 (100.0 %).
+* **Updates, before.** The hand run compared each fn from its `fn NAME(` line
+  through its closing brace; the tool compares `FnInfo.body`, which starts at
+  the opening brace, the same unit the two speculative populations are measured
+  over. Each of the eight fns carries exactly five signature lines above that
+  brace, and those five fold identical across a pair, so the hand figure is
+  larger by 8 × 5 = 40 lines and 4 × 5 = 20 matched lines. Per pair the
+  whole-fn count reproduces the hand numbers exactly (82 / 86 / 57 / 88).
+  Nothing else differs.
+* **Storage, after.** The hand run recorded 1394 body lines where the tool
+  reads 1404. (A storage item is a whole file, so its body is that file; the
+  tool prints "body lines" for all four populations and this doc uses that one
+  term throughout.) The 814 / 2244 before-figure reproduces to the line, and the
+  after-figure's matched count is 0 either way, so the ten lines are a slip in
+  the hand count, not a difference in the rule. The tool's number stands.
+* **Updates, after.** The hand after-figure was taken over the *generic*
+  bodies the entries now delegate to — one per family — which is not the
+  population the rule names. Under the rule, the eight `update_rotor{3,4}*`
+  entries still exist, and each pair still differs only in the width digit, so
+  the population is 8 items and 4 pairs on both trees. What the collapse bought
+  is the size of the bodies: 293 matched over 610 lines became 69 over 146.
+  The twin is reduced by 76 %, not removed. Closing it means the eight entries
+  collapsing onto a width-generic dispatch of their own, which this chunk did
+  not do and no proof row claimed.
+
+### The advisory half
+
+`make debt-report`'s file-pair scan reached the storage twins on its own, at
+70.0 % and 75.2 % shared. Those rows went with the deleted files. It never
+reached the update bodies, which live in one file and so are invisible to a
+file-pair scan, nor the summed matched-line count for either population —
+which is what `--matched-lines` adds.
+
+For scale, and outside the figure on both trees: the two surviving storage
+files share 434 matched lines *across* the K/V axis, and the eight surviving
+update entries share 228 across families. Neither is a twin under the rule —
+they differ in what they store, not in a constant — and neither was ever in
+the before-figure. (§11 recorded 430 for the first of those; the tool reads
+434.)
+
+`scripts/debt_report_selftest.sh` holds all of this: 19 of its 64 cases are
+the two rotor populations, each asserting a planted figure, a measured 0 with
+the population still found, and `unavailable` for a missing root and for a
+root that is there and empty — reason and exit code both.
 
 ## 7. Removals
 
@@ -268,10 +326,11 @@ Not deleted, and stated so the list is not read as covering them:
 * No `docs/KV_QUANT.md` section. The rotor sections describe codecs, not
   storage types; the paths and type names they cite that moved are corrected in
   the same commit rather than appended to.
-* `scripts/lib/debt_report.py` is **not** extended with a rotor population —
-  that is the next chunk's work (§6 records the design). The after-figure in
-  §11 is hand-run through the same module's `normalize()` / `matched_lines()`,
-  the way §6's before-figure was.
+* `scripts/lib/debt_report.py` keeps every population it had. The two rotor
+  ones — `rotor-storage` and `rotor-updates` — were added beside them, not in
+  place of them, and the two speculative populations report the same figures
+  over the same roots as before. §6 states the derivation rule; §11's
+  after-figure is that tool's output, not a hand run.
 
 ## 8. Mutations
 
@@ -382,20 +441,25 @@ its estimate covered.
 
 ### Duplication, after
 
-Hand-run through `scripts/lib/debt_report.py`'s own `normalize()` and
-`matched_lines()`, the same way §6's before-figure was.
+The figure is no longer hand-run. `scripts/debt_report.sh --matched-lines
+rotor-storage` and `--matched-lines rotor-updates` produce it, over the rule
+§6 states; the numbers below are that tool's output on this tree, and §6
+reconciles them against what was measured by hand here first.
 
-| Population | Pairs | Matched lines | Over |
-|---|---|---|---|
-| rotor storage twins | none — one file per axis | 0 | 1394 file lines |
-| rotor `update_*` twins | none — one body per family | 0 | 234 body lines |
+```
+rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched lines over 146 body lines (8 item(s), 4 pair(s))
+```
 
-Both populations were defined as same-axis / same-family pairs, and the collapse
-leaves no such pair, so the figure is zero by construction rather than by
-measurement of a smaller remainder. For scale: the two surviving storage files
-share 430 matched lines *across* the K/V axis, and the four surviving update
-bodies share 181 across families — neither is a twin under the rule (they differ
-in what they store, not in a constant), and neither was in the before-figure.
+The storage twin is closed: one file per axis, no same-axis pair left, a
+measured 0 with the population still found. **The update twin is not.** This
+subsection first recorded `0 over 234 body lines` for it, which was measured
+over the generic bodies the entries delegate to — one per family — and not
+over the `update_rotor*` entries the population names. Those eight entries
+survive, each pair still differing only in the width digit, so the population
+is 8 items and 4 pairs before and after; what the collapse bought is their
+size, 293 matched over 610 lines down to 69 over 146. A 76 % reduction, not a
+removal.
 
 `make debt-report`'s file-pair scan no longer reports a rotor row at all; its
 `70.0 %` and `75.2 %` entries went with the deleted files.

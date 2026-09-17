@@ -5,11 +5,33 @@ the add/remove line ratio since the last tag, and oversized docs. Reads only
 files under ``--root`` (default: the repo this file lives in) plus ``git log``
 against that same working tree — no network, no other machine path.
 
-``--matched-lines {drivers,impls}`` is a second, non-advisory mode: prints the
+``--matched-lines <population>`` is a second, non-advisory mode: prints the
 summed pairwise ``difflib`` matched-line count for one named population and
 exits, instead of the four-section report. Unlike the report, it exits 1 (not
 0) when the population it needs is unavailable — a measurement with no figure
-behind it must not read as a passing one.
+behind it must not read as a passing one, and a population that resolves to
+zero members is unavailable, never a ``0`` indistinguishable from a real one.
+
+The populations, each carrying its own root and its own pairing rule (see
+``MATCHED_LINES_POPULATIONS``):
+
+* ``drivers`` / ``impls`` — the speculative round-loop drivers and the
+  ``impl RoundDrafter`` bodies, one family, so every item pairs with every
+  other.
+* ``rotor-storage`` — the non-test ``quant_rotor_*.rs`` files under
+  ``crates/rmlx-kv-quant/src/storage``, paired inside a group sharing the
+  filename stem with every digit run removed (``quant_rotor_v3`` and
+  ``quant_rotor_v4`` -> ``quant_rotor_v``): same axis, different width. A
+  group of one contributes an item and no pair, so a collapsed axis reads 0
+  matched lines with the population still found.
+* ``rotor-updates`` — the ``update_rotor*`` fns of
+  ``crates/rmlx-kv-quant/src/kvcache/update.rs``, paired by the same
+  digit-stripped-name rule (``update_rotor_k_only_3`` and ``_4`` ->
+  ``update_rotor_k_only_``).
+
+Neither rotor population is a literal file or fn list: both are a glob plus a
+name rule, so the same command measures a tree that still carries the twins
+and one that does not.
 
 Deterministic for a given tree: every collection is name-sorted before it is
 printed, and the "twin" measure is the normalised-diff idea that found the
@@ -32,6 +54,7 @@ import itertools
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,6 +64,10 @@ LOC_THRESHOLD = 1000
 
 SIBLING_DIRS = ("crates/rmlx-kv-quant", "crates/rmlx-models")
 SPEC_DIR = "crates/rmlx-models/src/speculative"
+ROTOR_STORAGE_DIR = "crates/rmlx-kv-quant/src/storage"
+ROTOR_STORAGE_GLOB = "quant_rotor_*.rs"
+ROTOR_UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
+ROTOR_UPDATE_FN_PREFIX = "update_rotor"
 WORKSPACE_SOURCE_DIR = "crates"
 CHECK_SPEC_CHARGE_SCRIPT = Path(__file__).resolve().parents[1] / "check_spec_charge.sh"
 
@@ -385,26 +412,117 @@ def _driver_items(root: Path) -> list[FnInfo]:
     return discover_drivers(root).drivers
 
 
+def width_pair_key(item: FnInfo) -> str:
+    """Pairing key for the rotor populations: the item's own name with every
+    digit run removed, so `quant_rotor_v3` and `quant_rotor_v4` land in the
+    group `quant_rotor_v`, and `quant_rotor_k3` in a different one. Stripping
+    rather than folding to a placeholder also groups a bare name against its
+    explicitly-numbered sibling — the same rule `file_pairs()` uses.
+
+    A run of `_` or `-` left behind by the stripping collapses to one, so a
+    width spelled as its own segment joins the group it belongs to:
+    `update_rotor_5_sym` -> `update_rotor__sym` -> `update_rotor_sym`, the
+    same group as `update_rotor3_sym`. Without that step the separator the
+    width carried would be the only thing keeping the two apart, and the pair
+    would go unmeasured with nothing saying so."""
+    return re.sub(r"[_-]{2,}", "_", re.sub(r"\d+", "", item.name))
+
+
+def rotor_storage_items(root: Path) -> list[FnInfo]:
+    """Every non-test file matching ROTOR_STORAGE_GLOB under
+    ROTOR_STORAGE_DIR, as one item whose "body" is the whole file — a glob
+    and a name rule, never a file list, so this reads a tree that carries the
+    width twins and one that has collapsed them."""
+    base = root / ROTOR_STORAGE_DIR
+    if not base.is_dir():
+        raise RuntimeError(f"{ROTOR_STORAGE_DIR} is not a directory")
+    items: list[FnInfo] = []
+    for path in sorted(base.glob(ROTOR_STORAGE_GLOB)):
+        rel = path.relative_to(root)
+        if is_test_path(rel):
+            continue
+        items.append(
+            FnInfo(
+                name=path.stem,
+                line=1,
+                signature="",
+                body=path.read_text(errors="ignore"),
+                file=str(rel),
+            )
+        )
+    return items
+
+
+def rotor_update_items(root: Path) -> list[FnInfo]:
+    """Every fn of ROTOR_UPDATE_FILE whose name starts with
+    ROTOR_UPDATE_FN_PREFIX, body only — the same `extract_fns` scan the twin
+    section uses, so the body is brace to brace and the signature lines above
+    it are not counted."""
+    path = root / ROTOR_UPDATE_FILE
+    if not path.is_file():
+        raise RuntimeError(f"{ROTOR_UPDATE_FILE} is not a file")
+    fns, _skipped = fns_in_file(root, path)
+    return [fn for fn in fns if fn.name.startswith(ROTOR_UPDATE_FN_PREFIX)]
+
+
+@dataclass(frozen=True)
+class Population:
+    label: str
+    # The population's own root, printed beside its label. Not SPEC_DIR: a
+    # figure measured over one directory must not print another's path.
+    root: str
+    collect: Callable[[Path], list[FnInfo]]
+    # None — one family: every item pairs with every other. Otherwise items
+    # pair only inside a group sharing this key.
+    pair_key: Callable[[FnInfo], str] | None = None
+
+
 MATCHED_LINES_POPULATIONS = {
-    "drivers": ("round-loop drivers", _driver_items),
-    "impls": ("impl RoundDrafter bodies", round_drafter_impls),
+    "drivers": Population("round-loop drivers", SPEC_DIR, _driver_items),
+    "impls": Population("impl RoundDrafter bodies", SPEC_DIR, round_drafter_impls),
+    "rotor-storage": Population(
+        "rotor storage twins", ROTOR_STORAGE_DIR, rotor_storage_items, width_pair_key
+    ),
+    "rotor-updates": Population(
+        "rotor update twins", ROTOR_UPDATE_FILE, rotor_update_items, width_pair_key
+    ),
 }
+
+
+def population_pairs(
+    items: list[FnInfo], pair_key: Callable[[FnInfo], str] | None
+) -> list[tuple[FnInfo, FnInfo]]:
+    if pair_key is None:
+        return list(itertools.combinations(items, 2))
+    groups: dict[str, list[FnInfo]] = {}
+    for item in items:
+        groups.setdefault(pair_key(item), []).append(item)
+    pairs: list[tuple[FnInfo, FnInfo]] = []
+    for key in sorted(groups):
+        pairs.extend(itertools.combinations(groups[key], 2))
+    return pairs
 
 
 def matched_lines_report(root: Path, population: str) -> str:
     """`--matched-lines <population>` — the summed pairwise `matched_lines()`
-    over one named population under SPEC_DIR, the way the round-loop
-    migration chunks reported the campaign's duplication figure by hand:
-    `<label>: <matched> matched lines over <body-lines> body lines
-    (<n> item(s), <pairs> pair(s))`."""
-    label, collect = MATCHED_LINES_POPULATIONS[population]
-    items = collect(root)
-    total_matched = sum(matched_lines(a.body, b.body) for a, b in itertools.combinations(items, 2))
+    over one named population, the way the round-loop migration chunks and
+    the rotor collapse reported their duplication figure by hand:
+    `<label> (<root>): <matched> matched lines over <body-lines> body lines
+    (<n> item(s), <pairs> pair(s))`.
+
+    A population that resolves to zero members raises rather than printing a
+    `0` — an empty population and a collapsed one are different answers, and
+    only the second is a measurement."""
+    pop = MATCHED_LINES_POPULATIONS[population]
+    items = pop.collect(root)
+    if not items:
+        raise RuntimeError(f"{pop.root}: population is empty")
+    pairs = population_pairs(items, pop.pair_key)
+    total_matched = sum(matched_lines(a.body, b.body) for a, b in pairs)
     total_body_lines = sum(len(item.body.splitlines()) for item in items)
-    pairs = len(items) * (len(items) - 1) // 2
     return (
-        f"{label} ({SPEC_DIR}): {total_matched} matched lines over {total_body_lines} "
-        f"body lines ({len(items)} item(s), {pairs} pair(s))"
+        f"{pop.label} ({pop.root}): {total_matched} matched lines over {total_body_lines} "
+        f"body lines ({len(items)} item(s), {len(pairs)} pair(s))"
     )
 
 
@@ -660,7 +778,8 @@ def main(argv: list[str] | None = None) -> int:
         choices=sorted(MATCHED_LINES_POPULATIONS),
         default=None,
         help="print the summed pairwise matched-line count for one named "
-        "population under SPEC_DIR and exit, instead of the full report",
+        "population, over that population's own root, and exit, instead of "
+        "the full report",
     )
     args = parser.parse_args(argv)
 

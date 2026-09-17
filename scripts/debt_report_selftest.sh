@@ -13,7 +13,14 @@
 #   pair just under the similarity threshold, one speculative fn carrying both
 #   the driver signature and a constructed RoundTotals (the sole round-loop
 #   driver) beside seven that carry the signature alone, and two planted impl
-#   RoundDrafter bodies for the matched-lines figure. The two size-critical
+#   RoundDrafter bodies for the matched-lines figure, two same-axis rotor
+#   storage files (a three-member V group, a two-member K group, plus a test
+#   file matching the same glob) and five update_rotor* fns beside one
+#   update_affine, for the two rotor populations. A group of three is what
+#   separates every-pair-in-a-group from consecutive-only pairing; a width
+#   spelled as its own segment (update_rotor_5_sym) is what separates a
+#   separator-collapsing key from one that leaves a doubled separator behind.
+#   The two size-critical
 #   docs (over/under the 200 KB threshold) are generated into a throwaway copy
 #   of the fixture at run time rather than committed, so this test does not
 #   carry ~250 KB of filler into the tree's own churn count. The churn section
@@ -37,6 +44,13 @@ for f in \
     crates/rmlx-kv-quant/src/storage/codec_beta4.rs \
     crates/rmlx-kv-quant/src/storage/codec_gamma3.rs \
     crates/rmlx-kv-quant/src/storage/codec_gamma4.rs \
+    crates/rmlx-kv-quant/src/storage/quant_rotor_v2.rs \
+    crates/rmlx-kv-quant/src/storage/quant_rotor_v3.rs \
+    crates/rmlx-kv-quant/src/storage/quant_rotor_v4.rs \
+    crates/rmlx-kv-quant/src/storage/quant_rotor_v3_tests.rs \
+    crates/rmlx-kv-quant/src/storage/quant_rotor_k3.rs \
+    crates/rmlx-kv-quant/src/storage/quant_rotor_k4.rs \
+    crates/rmlx-kv-quant/src/kvcache/update.rs \
     crates/rmlx-kv-quant/src/storage/counters_allow.rs \
     crates/rmlx-kv-quant/src/storage/counters_debt.rs \
     crates/rmlx-kv-quant/src/storage/counters_debt_tests.rs \
@@ -74,6 +88,18 @@ check() {
     else
         FAILED=$((FAILED + 1))
         printf '  FAIL %-32s (mode=%s needle=%q) — %s\n' "$name" "$mode" "$needle" "$what"
+    fi
+}
+
+# check_exit <name> <what it proves> <expected> <actual>
+check_exit() {
+    local name="$1" what="$2" want="$3" got="$4"
+    if [ "$want" = "$got" ]; then
+        PASSED=$((PASSED + 1))
+        printf '  ok   %-32s — %s\n' "$name" "$what"
+    else
+        FAILED=$((FAILED + 1))
+        printf '  FAIL %-32s (want exit %s, got %s) — %s\n' "$name" "$want" "$got" "$what"
     fi
 }
 
@@ -334,6 +360,186 @@ check "matched_lines_impls_diverged_pair_drops" \
     DIVERGED_ML
 
 rm -rf "$DIVERGED_WORK"
+
+# ---- the empty-population rule is not rotor-only: it governs every ---------
+# ---- population, and it changed what an impls scan with no bodies prints ---
+
+EMPTY_IMPLS_WORK="$(mktemp -d)"
+cp -R "$BASE" "$EMPTY_IMPLS_WORK/base"
+rm -f "$EMPTY_IMPLS_WORK/base/crates/rmlx-models/src/speculative"/round_impl_*.rs
+
+EMPTY_IMPLS_ML=$(python3 "$TOOL" --root "$EMPTY_IMPLS_WORK/base" --matched-lines impls 2>&1)
+EMPTY_IMPLS_STATUS=$?
+
+check "matched_lines_impls_empty_unavailable" \
+    "the speculative directory is there and holds no impl RoundDrafter body: unavailable, where this used to print 0 matched lines over 0 body lines (0 item(s), 0 pair(s)) and exit 0 — the rule is the population's, not the rotor populations'" \
+    contains "debt-report --matched-lines impls: unavailable (crates/rmlx-models/src/speculative: population is empty)" \
+    EMPTY_IMPLS_ML
+
+check_exit "matched_lines_impls_empty_exit" \
+    "an empty impls population exits 1, like every other unavailable one" \
+    1 "$EMPTY_IMPLS_STATUS"
+
+rm -rf "$EMPTY_IMPLS_WORK"
+
+# ---- --matched-lines: the two rotor populations ---------------------------
+#
+# Each is derived from the fixture by a glob plus a name rule, never a file or
+# fn list: the non-test quant_rotor_*.rs files under the storage directory,
+# and the update_rotor* fns of the update file, both paired inside a group
+# sharing the name with every digit run removed. The fixture plants two
+# same-axis pairs per population, so an implementation that paired every item
+# with every other would report 6 (storage) or 6 (updates) pairs, not 2.
+
+ROTOR_STORAGE_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines rotor-storage 2>&1)
+ROTOR_STORAGE_STATUS=$?
+
+check "matched_lines_rotor_storage_pairs" \
+    "the five planted storage files are a three-member V group and a two-member K group: every pair inside a group, so 3 + 1 = 4 pairs (14 folded lines of 15 per V pair, all 9 for K), not the ten an all-pairs population compares and not the 3 pairs / 37 lines consecutive-only pairing would leave; quant_rotor_v3_tests.rs matches the glob and is excluded as a test path" \
+    contains "rotor storage twins (crates/rmlx-kv-quant/src/storage): 51 matched lines over 63 body lines (5 item(s), 4 pair(s))" \
+    ROTOR_STORAGE_ML
+
+check_exit "matched_lines_rotor_storage_exit" \
+    "a population with members is a measurement, exit 0" \
+    0 "$ROTOR_STORAGE_STATUS"
+
+check "matched_lines_rotor_storage_label_own_root" \
+    "the label names the population's own root, taken from the population entry" \
+    contains "rotor storage twins (crates/rmlx-kv-quant/src/storage):" \
+    ROTOR_STORAGE_ML
+
+check "matched_lines_rotor_storage_label_not_spec_dir" \
+    "the label does not name SPEC_DIR — the module constant the two speculative populations use, which a shared render would print beside every figure" \
+    absent "speculative" \
+    ROTOR_STORAGE_ML
+
+ROTOR_UPDATES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines rotor-updates 2>&1)
+ROTOR_UPDATES_STATUS=$?
+
+check "matched_lines_rotor_updates_pairs" \
+    "the five planted update_rotor* fns are a two-member plain family and a three-member sym family, 1 + 3 = 4 pairs; update_rotor_5_sym spells its width as its own segment and still joins the sym group, which a key that left the doubled separator behind would split off (2 pairs, 7 matched); update_affine in the same impl is outside the prefix — widening the prefix to update_ would read 6 item(s)" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 15 matched lines over 23 body lines (5 item(s), 4 pair(s))" \
+    ROTOR_UPDATES_ML
+
+check_exit "matched_lines_rotor_updates_exit" \
+    "a population with members is a measurement, exit 0" \
+    0 "$ROTOR_UPDATES_STATUS"
+
+check "matched_lines_rotor_updates_label_own_root" \
+    "a population root can be a single file, and it is the one printed" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs):" \
+    ROTOR_UPDATES_ML
+
+# ---- collapsed: the width twin is gone, the population is still found -----
+
+COLLAPSED_WORK="$(mktemp -d)"
+cp -R "$BASE" "$COLLAPSED_WORK/base"
+rm -f "$COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/storage/quant_rotor_v2.rs" \
+    "$COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/storage/quant_rotor_v4.rs" \
+    "$COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/storage/quant_rotor_k4.rs"
+python3 - "$COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+# Drop the two 4-bit entries the way the collapse did — the 3-bit ones stay.
+for name in ("update_rotor4", "update_rotor4_sym", "update_rotor_5_sym"):
+    text = re.sub(r"\n    fn " + name + r"\(.*?\n    \}\n", "\n", text, flags=re.S)
+open(path, "w").write(text)
+EOF
+
+COLLAPSED_STORAGE_ML=$(python3 "$TOOL" --root "$COLLAPSED_WORK/base" --matched-lines rotor-storage 2>&1)
+COLLAPSED_STORAGE_STATUS=$?
+
+check "matched_lines_rotor_storage_collapsed_zero" \
+    "deleting the 4-bit files leaves one item per axis and so no pair: 0 matched lines with the population still found, which is a different answer from an empty population" \
+    contains "rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 24 body lines (2 item(s), 0 pair(s))" \
+    COLLAPSED_STORAGE_ML
+
+check_exit "matched_lines_rotor_storage_collapsed_exit" \
+    "a collapsed population is a measured 0, exit 0" \
+    0 "$COLLAPSED_STORAGE_STATUS"
+
+COLLAPSED_UPDATES_ML=$(python3 "$TOOL" --root "$COLLAPSED_WORK/base" --matched-lines rotor-updates 2>&1)
+COLLAPSED_UPDATES_STATUS=$?
+
+check "matched_lines_rotor_updates_collapsed_zero" \
+    "deleting the two 4-bit entries leaves one body per family: 0 matched lines over the 9 body lines that remain, population still found" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 9 body lines (2 item(s), 0 pair(s))" \
+    COLLAPSED_UPDATES_ML
+
+check_exit "matched_lines_rotor_updates_collapsed_exit" \
+    "a collapsed population is a measured 0, exit 0" \
+    0 "$COLLAPSED_UPDATES_STATUS"
+
+rm -rf "$COLLAPSED_WORK"
+
+# ---- absent: zero members, and a missing root, are unavailable not 0 ------
+
+ABSENT_WORK="$(mktemp -d)"
+cp -R "$BASE" "$ABSENT_WORK/base"
+rm -f "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"/quant_rotor_*.rs
+python3 - "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read().replace("fn update_rotor", "fn update_affine_rotor")
+open(path, "w").write(text)
+EOF
+
+EMPTY_STORAGE_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines rotor-storage 2>&1)
+EMPTY_STORAGE_STATUS=$?
+
+check "matched_lines_rotor_storage_empty_unavailable" \
+    "the directory is there and nothing in it matches the glob: unavailable, never a 0 indistinguishable from a collapsed population" \
+    contains "debt-report --matched-lines rotor-storage: unavailable (crates/rmlx-kv-quant/src/storage: population is empty)" \
+    EMPTY_STORAGE_ML
+
+check_exit "matched_lines_rotor_storage_empty_exit" \
+    "an unavailable population exits 1 — a measurement with no figure behind it must not read as a passing one" \
+    1 "$EMPTY_STORAGE_STATUS"
+
+EMPTY_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines rotor-updates 2>&1)
+EMPTY_UPDATES_STATUS=$?
+
+check "matched_lines_rotor_updates_empty_unavailable" \
+    "renaming every update_rotor* fn out of the prefix empties the population: unavailable, not 0" \
+    contains "debt-report --matched-lines rotor-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs: population is empty)" \
+    EMPTY_UPDATES_ML
+
+check_exit "matched_lines_rotor_updates_empty_exit" \
+    "an unavailable population exits 1" \
+    1 "$EMPTY_UPDATES_STATUS"
+
+rm -rf "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"
+rm -f "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs"
+
+MISSING_STORAGE_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines rotor-storage 2>&1)
+MISSING_STORAGE_STATUS=$?
+
+check "matched_lines_rotor_storage_missing_root" \
+    "a missing root names itself, and is told apart from a root that is there and empty" \
+    contains "debt-report --matched-lines rotor-storage: unavailable (crates/rmlx-kv-quant/src/storage is not a directory)" \
+    MISSING_STORAGE_ML
+
+check_exit "matched_lines_rotor_storage_missing_exit" \
+    "a missing root exits 1" \
+    1 "$MISSING_STORAGE_STATUS"
+
+MISSING_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines rotor-updates 2>&1)
+MISSING_UPDATES_STATUS=$?
+
+check "matched_lines_rotor_updates_missing_root" \
+    "a missing single-file root names itself too" \
+    contains "debt-report --matched-lines rotor-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs is not a file)" \
+    MISSING_UPDATES_ML
+
+check_exit "matched_lines_rotor_updates_missing_exit" \
+    "a missing root exits 1" \
+    1 "$MISSING_UPDATES_STATUS"
+
+rm -rf "$ABSENT_WORK"
 
 check "doc_over_threshold_listed" \
     "BIG.md, generated over the 200 KB threshold, is listed" \

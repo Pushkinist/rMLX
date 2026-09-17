@@ -1484,7 +1484,7 @@ beside the loops and the entries. It now reads the charge gate's own
 population (a) — `check_spec_charge.sh --list-drivers`, not a second copy of
 the (a1)+(a2) rule — and lists the one driver, `run_rounds`. Duplication moved
 into the per-drafter `impl RoundDrafter` bodies is a second, separate
-population: `scripts/lib/debt_report.py --matched-lines {drivers,impls}` is
+population: `scripts/lib/debt_report.py --matched-lines <population>` is
 the one command that reports either figure — see "Duplication at the base of
 the campaign" below.
 
