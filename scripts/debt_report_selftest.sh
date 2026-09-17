@@ -14,9 +14,13 @@
 #   the driver signature and a constructed RoundTotals (the sole round-loop
 #   driver) beside seven that carry the signature alone, and two planted impl
 #   RoundDrafter bodies for the matched-lines figure, two same-axis rotor
-#   storage pairs (plus a test file matching the same glob) and four
-#   update_rotor* fns beside one update_affine, for the two rotor
-#   populations. The two size-critical
+#   storage files (a three-member V group, a two-member K group, plus a test
+#   file matching the same glob) and five update_rotor* fns beside one
+#   update_affine, for the two rotor populations. A group of three is what
+#   separates every-pair-in-a-group from consecutive-only pairing; a width
+#   spelled as its own segment (update_rotor_5_sym) is what separates a
+#   separator-collapsing key from one that leaves a doubled separator behind.
+#   The two size-critical
 #   docs (over/under the 200 KB threshold) are generated into a throwaway copy
 #   of the fixture at run time rather than committed, so this test does not
 #   carry ~250 KB of filler into the tree's own churn count. The churn section
@@ -40,6 +44,7 @@ for f in \
     crates/rmlx-kv-quant/src/storage/codec_beta4.rs \
     crates/rmlx-kv-quant/src/storage/codec_gamma3.rs \
     crates/rmlx-kv-quant/src/storage/codec_gamma4.rs \
+    crates/rmlx-kv-quant/src/storage/quant_rotor_v2.rs \
     crates/rmlx-kv-quant/src/storage/quant_rotor_v3.rs \
     crates/rmlx-kv-quant/src/storage/quant_rotor_v4.rs \
     crates/rmlx-kv-quant/src/storage/quant_rotor_v3_tests.rs \
@@ -356,6 +361,27 @@ check "matched_lines_impls_diverged_pair_drops" \
 
 rm -rf "$DIVERGED_WORK"
 
+# ---- the empty-population rule is not rotor-only: it governs every ---------
+# ---- population, and it changed what an impls scan with no bodies prints ---
+
+EMPTY_IMPLS_WORK="$(mktemp -d)"
+cp -R "$BASE" "$EMPTY_IMPLS_WORK/base"
+rm -f "$EMPTY_IMPLS_WORK/base/crates/rmlx-models/src/speculative"/round_impl_*.rs
+
+EMPTY_IMPLS_ML=$(python3 "$TOOL" --root "$EMPTY_IMPLS_WORK/base" --matched-lines impls 2>&1)
+EMPTY_IMPLS_STATUS=$?
+
+check "matched_lines_impls_empty_unavailable" \
+    "the speculative directory is there and holds no impl RoundDrafter body: unavailable, where this used to print 0 matched lines over 0 body lines (0 item(s), 0 pair(s)) and exit 0 — the rule is the population's, not the rotor populations'" \
+    contains "debt-report --matched-lines impls: unavailable (crates/rmlx-models/src/speculative: population is empty)" \
+    EMPTY_IMPLS_ML
+
+check_exit "matched_lines_impls_empty_exit" \
+    "an empty impls population exits 1, like every other unavailable one" \
+    1 "$EMPTY_IMPLS_STATUS"
+
+rm -rf "$EMPTY_IMPLS_WORK"
+
 # ---- --matched-lines: the two rotor populations ---------------------------
 #
 # Each is derived from the fixture by a glob plus a name rule, never a file or
@@ -369,8 +395,8 @@ ROTOR_STORAGE_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines ro
 ROTOR_STORAGE_STATUS=$?
 
 check "matched_lines_rotor_storage_pairs" \
-    "the four planted storage files are two same-axis pairs (v3<->v4 14 of 15 folded lines, k3<->k4 all 9), not the six an all-pairs population would compare; quant_rotor_v3_tests.rs matches the glob and is excluded as a test path" \
-    contains "rotor storage twins (crates/rmlx-kv-quant/src/storage): 23 matched lines over 48 body lines (4 item(s), 2 pair(s))" \
+    "the five planted storage files are a three-member V group and a two-member K group: every pair inside a group, so 3 + 1 = 4 pairs (14 folded lines of 15 per V pair, all 9 for K), not the ten an all-pairs population compares and not the 3 pairs / 37 lines consecutive-only pairing would leave; quant_rotor_v3_tests.rs matches the glob and is excluded as a test path" \
+    contains "rotor storage twins (crates/rmlx-kv-quant/src/storage): 51 matched lines over 63 body lines (5 item(s), 4 pair(s))" \
     ROTOR_STORAGE_ML
 
 check_exit "matched_lines_rotor_storage_exit" \
@@ -391,8 +417,8 @@ ROTOR_UPDATES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines ro
 ROTOR_UPDATES_STATUS=$?
 
 check "matched_lines_rotor_updates_pairs" \
-    "the four planted update_rotor* fns are two families (3 of 4 folded body lines, 4 of 5), and update_affine in the same impl is outside the prefix — widening the prefix to update_ would read 5 item(s)" \
-    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 7 matched lines over 18 body lines (4 item(s), 2 pair(s))" \
+    "the five planted update_rotor* fns are a two-member plain family and a three-member sym family, 1 + 3 = 4 pairs; update_rotor_5_sym spells its width as its own segment and still joins the sym group, which a key that left the doubled separator behind would split off (2 pairs, 7 matched); update_affine in the same impl is outside the prefix — widening the prefix to update_ would read 6 item(s)" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 15 matched lines over 23 body lines (5 item(s), 4 pair(s))" \
     ROTOR_UPDATES_ML
 
 check_exit "matched_lines_rotor_updates_exit" \
@@ -408,7 +434,8 @@ check "matched_lines_rotor_updates_label_own_root" \
 
 COLLAPSED_WORK="$(mktemp -d)"
 cp -R "$BASE" "$COLLAPSED_WORK/base"
-rm -f "$COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/storage/quant_rotor_v4.rs" \
+rm -f "$COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/storage/quant_rotor_v2.rs" \
+    "$COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/storage/quant_rotor_v4.rs" \
     "$COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/storage/quant_rotor_k4.rs"
 python3 - "$COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
 import re
@@ -417,7 +444,7 @@ import sys
 path = sys.argv[1]
 text = open(path).read()
 # Drop the two 4-bit entries the way the collapse did — the 3-bit ones stay.
-for name in ("update_rotor4", "update_rotor4_sym"):
+for name in ("update_rotor4", "update_rotor4_sym", "update_rotor_5_sym"):
     text = re.sub(r"\n    fn " + name + r"\(.*?\n    \}\n", "\n", text, flags=re.S)
 open(path, "w").write(text)
 EOF

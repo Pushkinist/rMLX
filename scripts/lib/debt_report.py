@@ -417,8 +417,15 @@ def width_pair_key(item: FnInfo) -> str:
     digit run removed, so `quant_rotor_v3` and `quant_rotor_v4` land in the
     group `quant_rotor_v`, and `quant_rotor_k3` in a different one. Stripping
     rather than folding to a placeholder also groups a bare name against its
-    explicitly-numbered sibling — the same rule `file_pairs()` uses."""
-    return re.sub(r"\d+", "", item.name)
+    explicitly-numbered sibling — the same rule `file_pairs()` uses.
+
+    A run of `_` or `-` left behind by the stripping collapses to one, so a
+    width spelled as its own segment joins the group it belongs to:
+    `update_rotor_5_sym` -> `update_rotor__sym` -> `update_rotor_sym`, the
+    same group as `update_rotor3_sym`. Without that step the separator the
+    width carried would be the only thing keeping the two apart, and the pair
+    would go unmeasured with nothing saying so."""
+    return re.sub(r"[_-]{2,}", "_", re.sub(r"\d+", "", item.name))
 
 
 def rotor_storage_items(root: Path) -> list[FnInfo]:

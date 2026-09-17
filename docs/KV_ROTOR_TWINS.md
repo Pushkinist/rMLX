@@ -223,8 +223,10 @@ rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched line
   larger by 8 × 5 = 40 lines and 4 × 5 = 20 matched lines. Per pair the
   whole-fn count reproduces the hand numbers exactly (82 / 86 / 57 / 88).
   Nothing else differs.
-* **Storage, after.** The hand run recorded 1394 file lines where the tool
-  reads 1404. The 814 / 2244 before-figure reproduces to the line, and the
+* **Storage, after.** The hand run recorded 1394 body lines where the tool
+  reads 1404. (A storage item is a whole file, so its body is that file; the
+  tool prints "body lines" for all four populations and this doc uses that one
+  term throughout.) The 814 / 2244 before-figure reproduces to the line, and the
   after-figure's matched count is 0 either way, so the ten lines are a slip in
   the hand count, not a difference in the rule. The tool's number stands.
 * **Updates, after.** The hand after-figure was taken over the *generic*
@@ -324,10 +326,11 @@ Not deleted, and stated so the list is not read as covering them:
 * No `docs/KV_QUANT.md` section. The rotor sections describe codecs, not
   storage types; the paths and type names they cite that moved are corrected in
   the same commit rather than appended to.
-* `scripts/lib/debt_report.py` is **not** extended with a rotor population —
-  that is the next chunk's work (§6 records the design). The after-figure in
-  §11 is hand-run through the same module's `normalize()` / `matched_lines()`,
-  the way §6's before-figure was.
+* `scripts/lib/debt_report.py` keeps every population it had. The two rotor
+  ones — `rotor-storage` and `rotor-updates` — were added beside them, not in
+  place of them, and the two speculative populations report the same figures
+  over the same roots as before. §6 states the derivation rule; §11's
+  after-figure is that tool's output, not a hand run.
 
 ## 8. Mutations
 
