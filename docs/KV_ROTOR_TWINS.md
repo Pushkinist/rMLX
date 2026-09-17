@@ -637,6 +637,28 @@ rotor row at all — its `70.0 %` / `75.2 %` storage entries went with the
 deleted files, and the update entries live in one file, which a file-pair scan
 cannot reach.
 
+`make ci-perf`, invoked directly, in the foreground, on an idle GPU. 97
+minutes. No test failed in either half. The census verdict:
+
+```
+shader validation: census matches the pin (scripts/gpu_validation_census.txt)
+```
+
+The GPU suite, libtest-passed per crate: `rmlx-audio` 7, `rmlx-kv-quant` 253,
+`rmlx-kv-ssd` 12, `rmlx-mlx` 10, `rmlx-models` 101 — 383, the same per-crate
+split the previous chunk recorded. The last two lines, verbatim:
+
+```
+OK: 383 GPU tests passed across 5 workspace member(s), shader validation matches the pinned census. — INCOMPLETE: 24 selected GPU test(s) stood down and 9 further notice(s) named no test; they asserted nothing (listed above)
+ci-perf INCOMPLETE — the GPU suite did not run every gate it names (see above)
+```
+
+Byte for byte the previous chunk's two lines. Every stand-down names an unset
+environment variable — `RMLX_TEST_MODEL_QWEN36`, `RMLX_KV_TEST_MODEL` /
+`RMLX_DRAFT_TEST_MODEL`, or the one-variable drafter case `CLAUDE.md` records.
+No stand-down names a rotor test, and `rmlx-kv-quant`'s 253 are the gate over
+the ring-side bodies the CPU pin cannot see.
+
 ### `make ci-perf`
 
 Invoked as `make ci-perf`, in the foreground, on an idle GPU. 88 minutes. No
