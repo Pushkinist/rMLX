@@ -629,7 +629,7 @@ runs on the collapsed tree — the branch point's figure. No cell was added or
 removed.
 
 The CI gates the code chunk owns are green: `make fmt-check`, `make lint`,
-`make check`, `make check-doc-source-citations` (248 cited paths resolve),
+`make check`, `make check-doc-source-citations` (250 cited paths resolve),
 `make check-no-inline-tests`, `make check-gpu-tests-ignored` (354 files across
 12 members), `make check-kv-codec-disposition` (28 codecs, 17 inert) and
 `make check-kv-layer-quants`. `make debt-report`'s file-pair scan reports no
