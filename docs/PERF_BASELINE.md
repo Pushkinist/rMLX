@@ -2579,8 +2579,9 @@ widths.
 
 ### Warm-TTFT bf16-seed caveat (carried over)
 
-Rotor V codecs are shadowed by the bf16 `exit_prefill` seed:
-`update_rotor_v` short-circuits at both widths on
+Rotor V codecs are shadowed by the bf16 `exit_prefill` seed: the V entry —
+`update_rotor3` / `update_rotor4` then, today the one `update_rotor_v` over
+both code widths — short-circuits on
 `self.decode_fp16_k.is_some()` from the second decode step onward. The
 GPU encode therefore fires **once at exit_prefill** (large `new_v` slice
 — meaningful work), not per decode step. The wall-clock benefit lands on

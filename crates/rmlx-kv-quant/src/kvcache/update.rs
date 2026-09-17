@@ -7148,6 +7148,11 @@ impl KvCache {
 /// The `storage mismatch` error a rotor decode entry returns when the dispatch
 /// hands it a variant outside its family. `expected` names both widths of that
 /// family, since one entry now serves both.
+///
+/// Two of the four entries call it — [`KvCache::update_rotor_v`] and
+/// [`KvCache::update_rotor_sym`], the pair whose mismatch is an
+/// [`Error::Mlx`]. The K-only and asym entries return
+/// [`Error::KvStorageMismatch`] and build it inline.
 fn rotor_storage_mismatch(expected: &'static str, storage: &KvStorage) -> Error {
     Error::Mlx(format!(
         "storage mismatch: expected {expected}, got {}",

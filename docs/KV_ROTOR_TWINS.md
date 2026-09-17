@@ -482,7 +482,7 @@ against the branch point, `git diff --numstat -M`:
 |---|---|---|---|
 | `crates/rmlx-kv-quant/src/kvcache/update.rs` | 250 | 345 | **−95** |
 | `crates/rmlx-kv-quant/src/kvcache/sdpa.rs` | 3 | 43 | **−40** |
-| the four `*_tests.rs` / `quant.rs` citation edits | 8 | 11 | −3 |
+| six further files: `rotor_flash_dispatch_tests.rs` (2 / 6, the folded call plus a citation), `quant.rs` (4 / 3), `helpers_tests.rs`, `resident_ring_tests.rs`, `precompile_tests.rs` (1 / 1 each) and `tests/rotor_decode_grow_legacy.rs` (2 / 2), all fn-name citations | 11 | 14 | **−3** |
 
 `update.rs` is 7633 lines, from 7728.
 
@@ -510,6 +510,16 @@ reconciles them against what was measured by hand here first.
 rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
 rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 111 body lines (4 item(s), 0 pair(s))
 ```
+
+`--matched-lines rotor-updates` is a **width-twin detector**: it pairs only
+inside a group whose names agree once every digit run is removed, and its glob
+is the `update_rotor*` fns of one file, so the `*_gpu_append` entries are
+outside it entirely. Its `0` says no two entries differ only in a width digit;
+it does not say there is no duplication left. The width-resolution idiom — read
+the family's `max_seq`, then an `if let` per width — now appears six times
+(`update.rs:866-900`, `1007-1046`, `6962-6990`, `6998-7030`, `7044-7075`,
+`7101-7135`). It is left inline on purpose: six short bodies that read as
+themselves beat a macro that hides the dispatch (simplicity rule 1).
 
 Both twins are closed, and closed in the one sense the rule admits: a measured
 `0` with the population still found — two storage files on one axis each, four
@@ -542,11 +552,36 @@ E5 is the chunk's uncaught mutation and it is a different blind spot from
 `QuantRotorK::<BITS>::new` call in the `k.is_none()` branch, where it seeds
 the per-`(layer, head)` rotor table. A wrong table is *self-consistent*:
 encode and decode both read the store's own table, so the round trip closes,
-the rings agree, the shapes agree, and nothing in the tree compares a store's
-table against the layer it belongs to. Only a cross-layer comparison, or a pin
-on the table itself at a known layer, could see it — the CPU pin fixes
-`TEST_LAYER_IDX` and never reaches this entry, and the GPU suite builds its
-caches at one layer too.
+the rings agree and the shapes agree.
+
+Two facts say why nothing turned red, and they are different facts.
+
+* **A table pin at a known layer already exists.** This file's store
+  serialisation hashes `s.rotors` and `s.layer_idx` for both rotor-K stores
+  (`rotor_store_bytes_tests.rs:176,179` and `:198,201`), and every cell is
+  built `.with_layer_idx(TEST_LAYER_IDX)`. A seed at the wrong layer would move
+  that digest. The pin simply never drives the fused-append entry — it drives
+  `KvCache::update`.
+* **The one direct test of the entry never executes the mutated line.**
+  `rotor_flash_dispatch_tests.rs:309`, `batched_ring_feed_is_skipped`, is the
+  only test that calls `rotor_k_only_gpu_append` directly, and it builds its
+  cache with `seeded_cache_b`, which constructs the storage with
+  `k: Some(QuantRotorK{3,4}::from_cpu_blocks(…))`. `k.is_none()` is false, so
+  the `new` call is not reached. E5 is green partly because the line is
+  unreached, not only because a wrong table is self-consistent.
+
+**The closer, named and not implemented here.** Build a `RotorKOnly3` cache
+with `k: None` at `.with_layer_idx(3)`, call `rotor_k_only_gpu_append`, and
+assert `ks.layer_idx == 3` and `ks.rotors == make_rotor_table(3, 0, n_groups)`
+— ten lines, `Device::Gpu`, `#[ignore]`. It is a follow-up, not this chunk: a
+new GPU test owes a `scripts/gpu_validation_census.txt` derivation in the same
+change and a `make ci-perf` re-run, which is outside the owner's pause.
+
+**The blind spot is pre-existing.** The deleted `rotor3_k_only_gpu_append` had
+the same unpinned seed at the same `k.is_none()` branch; this change did not
+open it. What is new is that `layer_idx` is now a *threaded parameter* of a
+width-generic body rather than a value read at the entry — a wrong argument at
+one call site is a shape the old code did not have.
 
 ### Mutations, re-run against the unified bodies
 
@@ -604,6 +639,12 @@ before, and the 3-bit path takes none it did not either.
 
 §9's stale sentence is gone: no `.rs` file in the tree now says "no MSL kernel
 for rotor4".
+
+Dated process artifacts under `docs/superpowers/` are left as written —
+`gemma4_scout_report.md:23` still cites `update_rotor3:5575`, at a line number
+that was already stale before this change. `CLAUDE.md` classes that directory
+as process artifacts, not a subsystem reference, so a report is a record of
+what was seen on its date and is not rewritten when the tree moves.
 
 `cargo test -p rmlx-kv-quant` reports 566 passed, 0 failed, 257 ignored before
 the collapse and the same after, five runs on each side. The cell count did not
