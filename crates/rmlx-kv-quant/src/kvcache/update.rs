@@ -1807,10 +1807,11 @@ impl KvCache {
             KvStorage::IsoV3 { .. } => self.update_iso3(new_k, new_v, device),
             // IsoV4 decode update — K = affine q8_0, V = IsoQuant 4-bit (CPU).
             KvStorage::IsoV4 { .. } => self.update_iso4(new_k, new_v, device),
-            // RotorV3 decode update — K = affine q8_0, V = rotor3 (CPU).
-            KvStorage::RotorV3 { .. } => self.update_rotor3(new_k, new_v, device),
-            // RotorV4 decode update — K = affine q8_0, V = rotor4 (CPU).
-            KvStorage::RotorV4 { .. } => self.update_rotor4(new_k, new_v, device),
+            // RotorV3 / RotorV4 decode update — K = affine q8_0, V = rotor at
+            // the variant's code width (CPU).
+            KvStorage::RotorV3 { .. } | KvStorage::RotorV4 { .. } => {
+                self.update_rotor_v(new_k, new_v, device)
+            }
             // K8VTurbo3Tcq decode update — same code path as
             // K8VTurbo3 but with Viterbi trellis encode-side assignment.
             KvStorage::K8VTurbo3Tcq { .. } => self.update_k8vturbo3_tcq(new_k, new_v, device),
@@ -1822,14 +1823,18 @@ impl KvCache {
             KvStorage::IsoSym4 { .. } => self.update_iso4_sym(new_k, new_v, device),
             KvStorage::IsoKOnly3 { .. } => self.update_iso_k_only_3(new_k, new_v, device),
             KvStorage::IsoKOnly4 { .. } => self.update_iso_k_only_4(new_k, new_v, device),
-            // Symmetric / K-only rotor variants.
-            KvStorage::RotorSym3 { .. } => self.update_rotor3_sym(new_k, new_v, device),
-            KvStorage::RotorSym4 { .. } => self.update_rotor4_sym(new_k, new_v, device),
-            KvStorage::RotorKOnly3 { .. } => self.update_rotor_k_only_3(new_k, new_v, device),
-            KvStorage::RotorKOnly4 { .. } => self.update_rotor_k_only_4(new_k, new_v, device),
+            // Symmetric / K-only rotor variants, one entry per family over
+            // both code widths.
+            KvStorage::RotorSym3 { .. } | KvStorage::RotorSym4 { .. } => {
+                self.update_rotor_sym(new_k, new_v, device)
+            }
+            KvStorage::RotorKOnly3 { .. } | KvStorage::RotorKOnly4 { .. } => {
+                self.update_rotor_k_only(new_k, new_v, device)
+            }
             // Asymmetric rotor K + affine V variants.
-            KvStorage::RotorKAsym3 { .. } => self.update_rotor_k_asym_3(new_k, new_v, device),
-            KvStorage::RotorKAsym4 { .. } => self.update_rotor_k_asym_4(new_k, new_v, device),
+            KvStorage::RotorKAsym3 { .. } | KvStorage::RotorKAsym4 { .. } => {
+                self.update_rotor_k_asym(new_k, new_v, device)
+            }
         }
     }
 
@@ -6961,23 +6966,23 @@ impl KvCache {
         Ok((k_full, v_full))
     }
 
-    /// Rotor3 decode update — K = affine q8_0, V = rotor3
-    /// (Cl(3,0) Clifford rotor sandwich + 3-bit Lloyd-Max codebook).
+    /// Rotor V decode update — K = affine q8_0, V = rotor (Cl(3,0) Clifford
+    /// rotor sandwich + Lloyd-Max codebook) at the code width the active
+    /// storage variant carries: `RotorV3` is 3 bits, `RotorV4` is 4.
     ///
-    /// The body is [`rotor_v_update`] at 3 bits; this entry resolves the
+    /// The body is [`rotor_v_update`] at that width; this entry resolves the
     /// storage variant and takes the warm-TTFT bf16 shortcut.
-    fn update_rotor3(
+    fn update_rotor_v(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
         let layer_idx = layer_idx_u32(self.layer_idx);
-        let KvStorage::RotorV3 { k, v, max_seq } = &mut self.storage else {
-            return Err(Error::Mlx(format!(
-                "storage mismatch: expected RotorV3, got {}",
-                storage_variant_name(&self.storage)
-            )));
+        let (KvStorage::RotorV3 { max_seq, .. } | KvStorage::RotorV4 { max_seq, .. }) =
+            &self.storage
+        else {
+            return Err(rotor_storage_mismatch("RotorV3 | RotorV4", &self.storage));
         };
         let max_seq = *max_seq;
 
@@ -6985,55 +6990,38 @@ impl KvCache {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        rotor_v_update::<3>(k, v, max_seq, layer_idx, new_k, new_v, device)
-    }
-
-    /// Rotor4 decode update — K = affine q8_0, V = rotor4
-    /// (Cl(3,0) Clifford rotor sandwich + 4-bit Lloyd-Max codebook).
-    ///
-    /// The body is [`rotor_v_update`] at 4 bits; this entry resolves the
-    /// storage variant and takes the warm-TTFT bf16 shortcut.
-    fn update_rotor4(
-        &mut self,
-        new_k: &Array,
-        new_v: &Array,
-        device: Device,
-    ) -> Result<(Array, Array)> {
-        let layer_idx = layer_idx_u32(self.layer_idx);
-        let KvStorage::RotorV4 { k, v, max_seq } = &mut self.storage else {
-            return Err(Error::Mlx(format!(
-                "storage mismatch: expected RotorV4, got {}",
-                storage_variant_name(&self.storage)
-            )));
-        };
-        let max_seq = *max_seq;
-
-        if self.decode_fp16_k.is_some() {
-            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        if let KvStorage::RotorV3 { k, v, .. } = &mut self.storage {
+            rotor_v_update::<3>(k, v, max_seq, layer_idx, new_k, new_v, device)
+        } else if let KvStorage::RotorV4 { k, v, .. } = &mut self.storage {
+            rotor_v_update::<4>(k, v, max_seq, layer_idx, new_k, new_v, device)
+        } else {
+            // Unreachable: the width read above accepted no other variant.
+            Err(rotor_storage_mismatch("RotorV3 | RotorV4", &self.storage))
         }
-
-        rotor_v_update::<4>(k, v, max_seq, layer_idx, new_k, new_v, device)
     }
 
-    /// Rotor3Sym decode update: K and V both quantize through the
-    /// 3-bit rotor (Cl(3,0) Clifford rotor) codec. The K side carries the
-    /// optional 1-bit QJL residual sideband when
+    /// Rotor symmetric decode update: K and V both quantize through the rotor
+    /// (Cl(3,0) Clifford rotor) codec at the code width the active storage
+    /// variant carries — `RotorSym3` is 3 bits, `RotorSym4` is 4. The K side
+    /// carries the optional 1-bit QJL residual sideband when
     /// [`crate::rotor_qjl::rotor_qjl_enabled`] is `true` at first append.
     ///
-    /// The body is [`rotor_sym_update`] at 3 bits; this entry resolves the
+    /// The body is [`rotor_sym_update`] at that width; this entry resolves the
     /// storage variant and takes the warm-TTFT bf16 shortcut.
-    fn update_rotor3_sym(
+    fn update_rotor_sym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
         let layer_idx = layer_idx_u32(self.layer_idx);
-        let KvStorage::RotorSym3 { k, v, max_seq } = &mut self.storage else {
-            return Err(Error::Mlx(format!(
-                "storage mismatch: expected RotorSym3, got {}",
-                storage_variant_name(&self.storage)
-            )));
+        let (KvStorage::RotorSym3 { max_seq, .. } | KvStorage::RotorSym4 { max_seq, .. }) =
+            &self.storage
+        else {
+            return Err(rotor_storage_mismatch(
+                "RotorSym3 | RotorSym4",
+                &self.storage,
+            ));
         };
         let max_seq = *max_seq;
 
@@ -7041,40 +7029,22 @@ impl KvCache {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        rotor_sym_update::<3>(k, v, max_seq, layer_idx, "RotorSym3", new_k, new_v, device)
-    }
-
-    /// Rotor4Sym decode update: K and V both quantize through the
-    /// 4-bit rotor (Cl(3,0) Clifford rotor) codec. The K side carries the
-    /// optional 1-bit QJL residual sideband when
-    /// [`crate::rotor_qjl::rotor_qjl_enabled`] is `true` at first append.
-    ///
-    /// The body is [`rotor_sym_update`] at 4 bits; this entry resolves the
-    /// storage variant and takes the warm-TTFT bf16 shortcut.
-    fn update_rotor4_sym(
-        &mut self,
-        new_k: &Array,
-        new_v: &Array,
-        device: Device,
-    ) -> Result<(Array, Array)> {
-        let layer_idx = layer_idx_u32(self.layer_idx);
-        let KvStorage::RotorSym4 { k, v, max_seq } = &mut self.storage else {
-            return Err(Error::Mlx(format!(
-                "storage mismatch: expected RotorSym4, got {}",
-                storage_variant_name(&self.storage)
-            )));
-        };
-        let max_seq = *max_seq;
-
-        if self.decode_fp16_k.is_some() {
-            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+        if let KvStorage::RotorSym3 { k, v, .. } = &mut self.storage {
+            rotor_sym_update::<3>(k, v, max_seq, layer_idx, "RotorSym3", new_k, new_v, device)
+        } else if let KvStorage::RotorSym4 { k, v, .. } = &mut self.storage {
+            rotor_sym_update::<4>(k, v, max_seq, layer_idx, "RotorSym4", new_k, new_v, device)
+        } else {
+            // Unreachable: the width read above accepted no other variant.
+            Err(rotor_storage_mismatch(
+                "RotorSym3 | RotorSym4",
+                &self.storage,
+            ))
         }
-
-        rotor_sym_update::<4>(k, v, max_seq, layer_idx, "RotorSym4", new_k, new_v, device)
     }
 
-    /// RotorKOnly3 decode update. K is rotor 3-bit; V stays bf16 on
-    /// `decode_fp16_v`.
+    /// Rotor K-only decode update. K is rotor at the code width the active
+    /// storage variant carries (`RotorKOnly3` is 3 bits, `RotorKOnly4` is 4);
+    /// V stays bf16 on `decode_fp16_v`.
     ///
     /// **CRITICAL** (HIGH bug guard): uses
     /// [`Self::update_decode_fp16_v_only`] for the V side, NOT
@@ -7083,71 +7053,51 @@ impl KvCache {
     /// guard to short-circuit the K codec on the *next* decode step (silent
     /// bf16-K regression).
     ///
-    /// The K side is [`rotor_k_only_k_side`] at 3 bits.
-    fn update_rotor_k_only_3(
+    /// The K side is [`rotor_k_only_k_side`] at the resolved width.
+    fn update_rotor_k_only(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
         let layer_idx = layer_idx_u32(self.layer_idx);
-        let KvStorage::RotorKOnly3 { k, max_seq } = &mut self.storage else {
+        let (KvStorage::RotorKOnly3 { max_seq, .. } | KvStorage::RotorKOnly4 { max_seq, .. }) =
+            &self.storage
+        else {
             return Err(Error::KvStorageMismatch {
-                expected: "RotorKOnly3",
+                expected: "RotorKOnly3 | RotorKOnly4",
                 got: storage_variant_name(&self.storage),
             });
         };
         let max_seq = *max_seq;
 
-        let k_full = rotor_k_only_k_side::<3>(k, max_seq, layer_idx, "RotorKOnly3", new_k, device)?;
+        let k_full = if let KvStorage::RotorKOnly3 { k, .. } = &mut self.storage {
+            rotor_k_only_k_side::<3>(k, max_seq, layer_idx, "RotorKOnly3", new_k, device)?
+        } else if let KvStorage::RotorKOnly4 { k, .. } = &mut self.storage {
+            rotor_k_only_k_side::<4>(k, max_seq, layer_idx, "RotorKOnly4", new_k, device)?
+        } else {
+            // Unreachable: the width read above accepted no other variant.
+            return Err(Error::KvStorageMismatch {
+                expected: "RotorKOnly3 | RotorKOnly4",
+                got: storage_variant_name(&self.storage),
+            });
+        };
 
         // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
         let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
         Ok((k_full, v_full))
     }
 
-    /// RotorKOnly4 decode update. K is rotor 4-bit; V stays bf16 on
-    /// `decode_fp16_v`.
+    /// Rotor asymmetric decode update. K is rotor at the code width the active
+    /// storage variant carries (`RotorKAsym3` is 3 bits, `RotorKAsym4` is 4);
+    /// V is MLX affine `v_bits` / `v_group_size` (reuses [`QuantV`]).
     ///
-    /// **CRITICAL** (HIGH bug guard): uses
-    /// [`Self::update_decode_fp16_v_only`] for the V side, NOT
-    /// `update_decode_fp16`. The latter populates `self.decode_fp16_k` as a
-    /// side-effect, which causes the `decode_fp16_k.is_some()` early-return
-    /// guard to short-circuit the K codec on the *next* decode step (silent
-    /// bf16-K regression).
+    /// Mirrors [`Self::update_rotor_k_only`] for K and [`Self::update_k8v4`]
+    /// for V (affine path) on the **seedless** path only.
     ///
-    /// The K side is [`rotor_k_only_k_side`] at 4 bits.
-    fn update_rotor_k_only_4(
-        &mut self,
-        new_k: &Array,
-        new_v: &Array,
-        device: Device,
-    ) -> Result<(Array, Array)> {
-        let layer_idx = layer_idx_u32(self.layer_idx);
-        let KvStorage::RotorKOnly4 { k, max_seq } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "RotorKOnly4",
-                got: storage_variant_name(&self.storage),
-            });
-        };
-        let max_seq = *max_seq;
-
-        let k_full = rotor_k_only_k_side::<4>(k, max_seq, layer_idx, "RotorKOnly4", new_k, device)?;
-
-        // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
-        let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
-        Ok((k_full, v_full))
-    }
-
-    /// RotorKAsym3 decode update. K is rotor 3-bit; V is MLX affine
-    /// `v_bits` / `v_group_size` (reuses [`QuantV`]).
-    ///
-    /// Mirrors [`Self::update_rotor_k_only_3`] for K and
-    /// [`Self::update_k8v4`] for V (affine path) on the **seedless** path only.
-    ///
-    /// **Warm-TTFT.** Unlike `RotorKOnly3`, this asym variant DOES carry the
-    /// `decode_fp16_k.is_some()` shortcut (below): once the bf16 seed is live
-    /// (always, post-`exit_prefill` — see `exit_prefill`'s
+    /// **Warm-TTFT.** Unlike `RotorKOnly{3,4}`, these asym variants DO carry
+    /// the `decode_fp16_k.is_some()` shortcut (below): once the bf16 seed is
+    /// live (always, post-`exit_prefill` — see `exit_prefill`'s
     /// generic seed tail), the entire decode step routes through
     /// [`Self::update_decode_fp16`] and serves **both** K and V from bf16. The
     /// rotor-K and affine-V codecs are quiescent for the whole decode window;
@@ -7155,100 +7105,68 @@ impl KvCache {
     /// the universal warm-TTFT decode contract documented in
     /// `docs/KV_CACHE.md` §9.6.
     ///
-    /// NB: `RotorKOnly3` (no asym V) is the opposite — it has **no** seed
-    /// shortcut in its body, so its rotor-K codec runs every decode step
-    /// (K-only family). Do not assume the two share K-side decode semantics.
+    /// NB: `RotorKOnly{3,4}` (no asym V) is the opposite — that entry has
+    /// **no** seed shortcut in its body, so its rotor-K codec runs every
+    /// decode step (K-only family). Do not assume the two share K-side decode
+    /// semantics.
     ///
-    /// The body is [`rotor_k_asym_update`] at 3 bits.
-    fn update_rotor_k_asym_3(
+    /// The body is [`rotor_k_asym_update`] at the resolved width.
+    fn update_rotor_k_asym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
         let layer_idx = layer_idx_u32(self.layer_idx);
-        let KvStorage::RotorKAsym3 {
-            k,
-            v,
-            max_seq,
-            v_bits,
-            v_group_size,
-        } = &mut self.storage
+        let (KvStorage::RotorKAsym3 {
+            max_seq, v_bits, ..
+        }
+        | KvStorage::RotorKAsym4 {
+            max_seq, v_bits, ..
+        }) = &self.storage
         else {
             return Err(Error::KvStorageMismatch {
-                expected: "RotorKAsym3",
+                expected: "RotorKAsym3 | RotorKAsym4",
                 got: storage_variant_name(&self.storage),
             });
         };
         let max_seq = *max_seq;
         let v_bits = *v_bits;
-        let _ = v_group_size;
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        rotor_k_asym_update::<3>(k, v, max_seq, v_bits, layer_idx, new_k, new_v, device)
-    }
-
-    /// RotorKAsym4 decode update. K is rotor 4-bit; V is MLX affine
-    /// `v_bits` / `v_group_size` (reuses [`QuantV`]).
-    ///
-    /// Mirrors [`Self::update_rotor_k_only_4`] for K and
-    /// [`Self::update_k8v4`] for V (affine path) on the **seedless** path only.
-    ///
-    /// **Warm-TTFT.** Unlike `RotorKOnly4`, this asym variant DOES carry the
-    /// `decode_fp16_k.is_some()` shortcut (below): once the bf16 seed is live
-    /// (always, post-`exit_prefill` — see `exit_prefill`'s
-    /// generic seed tail), the entire decode step routes through
-    /// [`Self::update_decode_fp16`] and serves **both** K and V from bf16. The
-    /// rotor-K and affine-V codecs are quiescent for the whole decode window;
-    /// they re-encode only at `exit_prefill` or on a seedless cache. This is
-    /// the universal warm-TTFT decode contract documented in
-    /// `docs/KV_CACHE.md` §9.6.
-    ///
-    /// NB: `RotorKOnly4` (no asym V) is the opposite — it has **no** seed
-    /// shortcut in its body, so its rotor-K codec runs every decode step
-    /// (K-only family). Do not assume the two share K-side decode semantics.
-    ///
-    /// The body is [`rotor_k_asym_update`] at 4 bits.
-    fn update_rotor_k_asym_4(
-        &mut self,
-        new_k: &Array,
-        new_v: &Array,
-        device: Device,
-    ) -> Result<(Array, Array)> {
-        let layer_idx = layer_idx_u32(self.layer_idx);
-        let KvStorage::RotorKAsym4 {
-            k,
-            v,
-            max_seq,
-            v_bits,
-            v_group_size,
-        } = &mut self.storage
-        else {
-            return Err(Error::KvStorageMismatch {
-                expected: "RotorKAsym4",
+        if let KvStorage::RotorKAsym3 { k, v, .. } = &mut self.storage {
+            rotor_k_asym_update::<3>(k, v, max_seq, v_bits, layer_idx, new_k, new_v, device)
+        } else if let KvStorage::RotorKAsym4 { k, v, .. } = &mut self.storage {
+            rotor_k_asym_update::<4>(k, v, max_seq, v_bits, layer_idx, new_k, new_v, device)
+        } else {
+            // Unreachable: the width read above accepted no other variant.
+            Err(Error::KvStorageMismatch {
+                expected: "RotorKAsym3 | RotorKAsym4",
                 got: storage_variant_name(&self.storage),
-            });
-        };
-        let max_seq = *max_seq;
-        let v_bits = *v_bits;
-        let _ = v_group_size;
-
-        if self.decode_fp16_k.is_some() {
-            return self.update_decode_fp16(new_k, new_v, max_seq, device);
+            })
         }
-
-        rotor_k_asym_update::<4>(k, v, max_seq, v_bits, layer_idx, new_k, new_v, device)
     }
 }
 
 // ── Rotor decode-update bodies, one per family over both code widths ─────────
 //
-// The eight `KvCache::update_rotor*` entries above resolve their storage
-// variant and hand the stores here; a body below is the one arithmetic each
-// pair of entries shares, with the code width as the store's `BITS`.
+// The four `KvCache::update_rotor_*` entries above resolve their storage
+// variant to a code width and hand the stores here; a body below is the one
+// arithmetic both widths of a family share, with the width as the store's
+// `BITS`.
+
+/// The `storage mismatch` error a rotor decode entry returns when the dispatch
+/// hands it a variant outside its family. `expected` names both widths of that
+/// family, since one entry now serves both.
+fn rotor_storage_mismatch(expected: &'static str, storage: &KvStorage) -> Error {
+    Error::Mlx(format!(
+        "storage mismatch: expected {expected}, got {}",
+        storage_variant_name(storage)
+    ))
+}
 
 /// Decode update for `RotorV3` / `RotorV4`: K = affine q8_0, V = rotor at
 /// `BITS` (Cl(3,0) Clifford rotor sandwich + Lloyd-Max codebook).
