@@ -1322,10 +1322,13 @@ the bar moved.
 
 #### Splitting the GPU suite by what it guards
 
-**Design. Nothing below is wired yet** — the halves, the producer and the
-`--half` selection are the next change; what is landed now is this section and
-the cases under `THE HALVES` in `scripts/run_gpu_tests_selftest.sh`, which fail
-until it is.
+**Landed**, less the census pin: the producer, the `--half` selection, the
+`HALF` variable on both targets and the nine converted stand-downs are in the
+tree, and the cases under `THE HALVES` in `scripts/run_gpu_tests_selftest.sh`
+are green over them. What is NOT landed is every figure a real run of one half
+produces — the per-half wall below is still the projection, and the census pin
+is still the whole-run one. Both are re-derived from one real run of each
+half.
 
 Arming every cell settled the coverage question and left the cost one, measured
 above. The bound cannot be met by dropping pairs, so the suite is partitioned
@@ -1465,7 +1468,9 @@ expectation for a half is the sum over **that** set and nothing else.
 | `rest` | the `crates/rmlx-models/tests/` binaries that select no codec or only `None`, and `rmlx-audio` | 34 | 8869 s = **148 min** |
 | whole | both | 383 | 13964 s = **233 min** |
 
-The wall column is **measured**, from the run the walls were taken from — the sum
+The wall column is a **projection**, not a measurement of a half: it is read off
+one whole run, per crate and per Cargo target, and no half has yet been run on
+its own. The per-half wall stays unmeasured until one has. The figures are the sum
 of every `finished in Ns` that run printed, grouped by crate and by Cargo target.
 That run ended red and with nine silent stand-downs (below), so its rest-half
 figure is a **floor**, not a total. The run's own wall was **279 min**, so 46 min
@@ -1519,27 +1524,45 @@ its own producer rule rather than a name glob.
 
 ##### The hole the rest half inherits
 
-Nine classified GPU cells stand down by printing a bare
+Nine classified GPU cells stood down by printing a bare
 `eprintln!("RMLX_KV_TEST_MODEL not set — skipping")` and returning:
 `crates/rmlx-models/tests/gemma4_kv_cache_equivalence.rs` (3 cells over 4 such
 sites), `crates/rmlx-models/tests/kv_bytes_sample_point.rs` (4 cells, one site),
 `crates/rmlx-models/tests/prompt_cache_cross_model.rs` (1) and
-`crates/rmlx-models/tests/qwen3_vl_moe_text_parity.rs` (1). The line carries no
-`SKIP` token, so it is not a stand-down notice at all: the runner's harvest never
-sees it, `make check-named-skip-notices` cannot see it either — that gate reads
-the notice's *shape*, and a line without the token is not a notice to it — and
-libtest reports the cell as `ok`. Those cells are counted as passes today.
+`crates/rmlx-models/tests/qwen3_vl_moe_text_parity.rs` (1). The line carried no
+`SKIP` token, so it was not a stand-down notice at all: the runner's harvest
+never saw it, `make check-named-skip-notices` could not see it either — that
+gate reads the notice's *shape*, and a line without the token is not a notice to
+it — and libtest reports the cell as `ok`. Those cells were counted as passes.
 
-This is **pre-existing and not caused by the split**, but it bears on property 3
-below: for those nine, a stand-down does not reach `INCOMPLETE` in either half.
-Eight are in codec files under the rule above, so the codec half inherits nearly
-all of it; the one in `qwen3_vl_moe_text_parity.rs` sits in `rest`. Converting
-the nine to the
-`SKIP <test>: <why>` contract is an item of the implementing change, together
-with the scan that can see the shape at all — a classified GPU test that returns
-early from a missing-model guard and prints no notice. That is a new rule for
-`check_named_skip_notices.sh`, not a fixture for the existing one, and its own
-fixture case comes with it.
+This was **pre-existing and not caused by the split**, and it bore on property 3
+below: for those nine, a stand-down reached `INCOMPLETE` in neither half. Eight
+are in codec files under the rule above, so the codec half inherited nearly all
+of it; the one in `qwen3_vl_moe_text_parity.rs` sits in `rest`.
+
+All nine now print `SKIP <test>: <why>`. The two that guard from a file-local
+helper — `kv_bytes_sample_point.rs` and `prompt_cache_cross_model.rs` — take the
+caller's test name as an argument and print `SKIP {test}:`, because no libtest
+filter reaches a helper and a notice naming one would be counted and listed
+nowhere.
+
+`check_named_skip_notices.sh` gained the rule that can see the shape at all: a
+block opened by a line reading an environment variable and closed by a `return`
+with no notice inside it. Three things scope it. Its population is the
+**declaring files** of the classified GPU tests, not the test fns, because two of
+the nine guards were in a helper and a rule over test bodies reads a helper's
+silent return as a clean scan. `RMLX_SKIP_GPU` is excluded, because the runner
+refuses to start with that variable set and every classified test opens with such
+a guard. And the block is followed by brace depth over the line's *code* — string
+bodies blanked through `scripts/lib/awk_text.sh` — so a brace inside a literal
+does not close a guard one line early. Six fixture cases in
+`scripts/check_named_skip_notices_fixtures.sh` hold it: the silent guard in a
+test and in a helper, the same guard announced, the off switch, a file declaring
+no classified test, and the brace in a literal.
+
+The census entries for those nine are **not** re-derived here: a cell that was
+counted as a pass and now announces itself changes what a run observes, and that
+is read off the same real run of each half the pin is.
 
 ##### The census slice
 
@@ -1566,8 +1589,11 @@ Three distinctions the slice has to keep:
   an entry naming a test no crate declares is still refused, in either half, so a
   renamed or deleted test cannot silently leave the expectation.
 
-The pin is re-derived from a real run of **each** half in the implementing
-change, as the census rule requires of any change that moves what a run observes.
+The pin is **not re-derived yet**. The slice above is the current whole-run pin
+read through the rule. The entries themselves are re-derived from one real run of
+each half, as the census rule requires of any change that moves what a run
+observes; until that run, every per-half figure here is derived rather than
+observed.
 
 ##### What cannot move
 
@@ -1586,14 +1612,11 @@ The observables are what each half's report says it executed, the census verdict
 per half, and each half's final line. Each of the five is a case in
 `scripts/run_gpu_tests_selftest.sh` — stub crates, no GPU.
 
-**The runner does not report an executed set today.** It prints a per-crate
-banner carrying that crate's classified count and a total on the final line, so
-the cases assert those plus the *absence* of the other half's cells, which is
-what separates a per-test partition from a per-crate one when a single crate
-spans both halves. The implementing change adds the executed set — one line per
-executed test — to the report, and the cases then assert it directly; until it
-does, a half that ran the right count of the wrong tests within one crate is
-outside the oracle.
+**The runner reports the executed set.** It prints the names it asked cargo to
+run under each crate's banner, beside that crate's classified count, so a half
+that ran the right count of the wrong tests within one crate is inside the
+oracle. The cases read that set from the libtest filters the runner issued,
+which is the one observable that says WHICH cell a half asked for.
 
 ##### Mutations, and what catches each
 
@@ -1621,8 +1644,8 @@ it is stated rather than hidden.
 
 ##### Which half a PR runs
 
-Draft of the rule; the implementing change writes it into `CLAUDE.md` beside the
-`gpu-test` and `ci-perf` rows:
+The rule, as it is written into `CLAUDE.md` beside the `gpu-test` and `ci-perf`
+rows:
 
 > A PR runs `make ci-perf HALF=codec` when its diff touches only crates below the
 > model layer, only `crates/rmlx-models/src/`, or only integration binaries that
@@ -1632,29 +1655,45 @@ Draft of the rule; the implementing change writes it into `CLAUDE.md` beside the
 > a half-run's final line reads `ci-perf <half>-half ok — NOT the whole gate` and
 > never the string `ci-perf ok`.
 
-##### What the implementing change lands
+##### What landed, and what has not
+
+Landed:
 
 * `scripts/gpu_test_halves.sh` — the producer, with `--root`, emitting
-  `half<TAB>crate<TAB>test`, refusing an empty derived codec-name set.
-* `check_gpu_tests_ignored.sh` — a listing mode carrying the declaring file.
-  `--list` keeps its two columns, so the runner's existing reader is untouched.
+  `half<TAB>crate<TAB>test`, refusing an empty derived codec-name set. Over this
+  tree it places **349** tests in `codec` and **34** in `rest`, and its rows and
+  the classification cover each other exactly.
+* `check_gpu_tests_ignored.sh` — `--list-files`, the same population with the
+  declaring file as a third column. `--list` keeps its two columns, cut from the
+  same record, so the two modes cannot name different populations.
 * `scripts/run_gpu_tests.sh` — `--half`, the producer refusals, the sliced
   census, the executed set in the report, and the half on the final line. The
   invocation stays `cargo test -p <crate> --tests`, so the comment there
   beginning *"`--tests` selects every target with `test = true`"* stays true and
   the `classified == executed` check keeps its meaning.
-* `Makefile` — `HALF` on `gpu-test`, and on `ci-perf` with the value checked and
+* `Makefile` — `HALF` on `gpu-test` and on `ci-perf`, with the value checked and
   an accidental export dropped; the `ci-perf` comment beginning *"The runner is
-  invoked directly rather than through `$(MAKE) gpu-test`"* corrected in the same
-  commit.
-* `scripts/gpu_validation_census.txt` — re-derived from one real run of each
-  half, which is also what turns the cases above green, and the measured wall of
-  each half replacing the projection above.
-* The nine silent stand-downs converted to `SKIP <test>: <why>`, and the scan in
-  `check_named_skip_notices.sh` that can see a missing notice at all, with its
-  fixture case.
-* `CLAUDE.md` — the rows quoted above.
-* `scripts/INDEX.md` — the producer's entry.
+  invoked directly rather than through `$(MAKE) gpu-test`"* says what `HALF` may
+  and may not do.
+* The nine silent stand-downs converted to `SKIP <test>: <why>`, and the rule in
+  `check_named_skip_notices.sh` that can see a missing notice at all, with six
+  fixture cases.
+* `CLAUDE.md` — the rows quoted above. `scripts/INDEX.md` — the producer's entry.
+
+Not landed, and both wait on the same thing — one real run of each half:
+
+* `scripts/gpu_validation_census.txt`, re-derived per half. The slice table above
+  is the whole-run pin read through the rule, not a run's observation.
+* The measured wall of each half, replacing the projection above. **The ≤ 90 min
+  bound is still not claimed**, and cannot be until then.
+
+**The codec-name set is derived from this checkout, not from `--root`.** The
+producer's `--root` is the tree it *classifies*; the codec names always come
+from this checkout's `crates/rmlx-kv-quant/src/quant.rs`. A fixture workspace
+carries no codec crate source, and an empty derived set is a refusal — so a
+producer that read the names from `--root` would refuse every fixture tree
+rather than place `codec_sweep.rs` in the codec half. The design above says all
+three facts are read from "the tree"; for the codec names that is this one.
 
 One latent hazard the split does not create and does not close: the runner turns
 each selected test into a libtest **substring** filter, not `--exact`
