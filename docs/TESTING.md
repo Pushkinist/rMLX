@@ -1325,10 +1325,12 @@ the bar moved.
 **Landed**, less the census pin: the producer, the `--half` selection, the
 `HALF` variable on both targets and the nine converted stand-downs are in the
 tree, and the cases under `THE HALVES` in `scripts/run_gpu_tests_selftest.sh`
-are green over them. What is NOT landed is every figure a real run of one half
-produces — the per-half wall below is still the projection, and the census pin
-is still the whole-run one. Both are re-derived from one real run of each
-half.
+are green over them. What is **deferred to the integration run** — the one
+GPU window at the end of the integration, `make gpu-test HALF=codec` there and
+the rest half verified by the whole `make ci-perf` — is every figure a real
+run of one half produces: the per-half wall below is still the projection,
+and the census pin is still the whole-run one. Both are re-derived at that
+run, from one real run of each half.
 
 Arming every cell settled the coverage question and left the cost one, measured
 above. The bound cannot be met by dropping pairs, so the suite is partitioned
@@ -1483,8 +1485,8 @@ between **85 and 131 min**, the rest half between **148 and 194 min**.
 and a half pays for a build wider than the tests it runs: `cargo test -p
 rmlx-models --tests` builds all thirty integration binaries to execute the ones
 the half selected, and that is deliberate — see the next paragraph. The figure is
-measured in the implementing change, from one real run of each half, and replaces
-this projection.
+measured at the integration run, from one real run of each half, and replaces
+this projection there.
 
 **Each half still invokes `cargo test -p <crate> --tests`, unchanged.** A
 per-target invocation — the producer carrying the Cargo target and the runner
@@ -1562,7 +1564,8 @@ no classified test, and the brace in a literal.
 
 The census entries for those nine are **not** re-derived here: a cell that was
 counted as a pass and now announces itself changes what a run observes, and that
-is read off the same real run of each half the pin is.
+is read off the same real run of each half the pin is, deferred to the
+integration run.
 
 ##### The census slice
 
@@ -1589,11 +1592,11 @@ Three distinctions the slice has to keep:
   an entry naming a test no crate declares is still refused, in either half, so a
   renamed or deleted test cannot silently leave the expectation.
 
-The pin is **not re-derived yet**. The slice above is the current whole-run pin
-read through the rule. The entries themselves are re-derived from one real run of
-each half, as the census rule requires of any change that moves what a run
-observes; until that run, every per-half figure here is derived rather than
-observed.
+The pin is **deferred to the integration run**. The slice above is the current
+whole-run pin read through the rule. The entries themselves are re-derived from
+one real run of each half at that run, as the census rule requires of any
+change that moves what a run observes; until then, every per-half figure here
+is derived rather than observed.
 
 ##### What cannot move
 
@@ -1680,7 +1683,10 @@ Landed:
   fixture cases.
 * `CLAUDE.md` — the rows quoted above. `scripts/INDEX.md` — the producer's entry.
 
-Not landed, and both wait on the same thing — one real run of each half:
+Deferred to the integration run — the one GPU window at the end of the
+integration, `make gpu-test HALF=codec` there and the rest half verified by
+the whole `make ci-perf` — and both wait on the same thing at that run: one
+real run of each half:
 
 * `scripts/gpu_validation_census.txt`, re-derived per half. The slice table above
   is the whole-run pin read through the rule, not a run's observation.
