@@ -16,7 +16,9 @@
 #   RoundDrafter bodies for the matched-lines figure, two same-axis rotor
 #   storage files (a three-member V group, a two-member K group, plus a test
 #   file matching the same glob) and five update_rotor* fns beside one
-#   update_affine, for the two rotor populations. A group of three is what
+#   update_affine, for the two rotor populations, and two per-arch hydrate
+#   bodies beside a hydrate_from_ssd and a test-path copy, for the
+#   ssd-hydrate population. A group of three is what
 #   separates every-pair-in-a-group from consecutive-only pairing; a width
 #   spelled as its own segment (update_rotor_5_sym) is what separates a
 #   separator-collapsing key from one that leaves a doubled separator behind.
@@ -65,6 +67,10 @@ for f in \
     crates/rmlx-models/src/speculative/mod.rs \
     crates/rmlx-models/src/speculative/round_impl_alpha.rs \
     crates/rmlx-models/src/speculative/round_impl_beta.rs \
+    crates/rmlx-models/src/hydrate_alpha/prompt_cache.rs \
+    crates/rmlx-models/src/hydrate_alpha/prompt_cache_tests.rs \
+    crates/rmlx-models/src/hydrate_beta/prompt_cache.rs \
+    crates/rmlx-models/src/hydrate_gamma/prompt_cache.rs \
     docs/SMALL.md
 do
     [ -f "$BASE/$f" ] || {
@@ -474,6 +480,73 @@ check_exit "matched_lines_rotor_updates_collapsed_exit" \
     0 "$COLLAPSED_UPDATES_STATUS"
 
 rm -rf "$COLLAPSED_WORK"
+
+# ---- --matched-lines: the ssd-hydrate population, both tree shapes --------
+#
+# The rule is two exact fn names, because one name spans only one tree: the
+# per-arch `hydrate` bodies before the blanket impl, the short `from_hydrated`
+# constructors after it. The fixture plants both shapes, so dropping either
+# name from the rule turns one of the two figures below red — the pre-collapse
+# figure by count, the post-collapse one by going unavailable.
+
+SSD_HYDRATE_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines ssd-hydrate 2>&1)
+SSD_HYDRATE_STATUS=$?
+
+check "matched_lines_ssd_hydrate_before" \
+    "the two planted per-arch hydrate bodies differ only in the entry name the struct literal carries, so 13 of each 14-line body match; hydrate_from_ssd is a third name and is outside the rule, and the hydrate in prompt_cache_tests.rs is a test path — either one counted would read 3 item(s)" \
+    contains "ssd hydrate twins (crates/rmlx-models/src): 13 matched lines over 28 body lines (2 item(s), 1 pair(s))" \
+    SSD_HYDRATE_ML
+
+check_exit "matched_lines_ssd_hydrate_before_exit" \
+    "a population with members is a measurement, exit 0" \
+    0 "$SSD_HYDRATE_STATUS"
+
+# The collapsed tree: each planted arch keeps a short `from_hydrated`
+# constructor and no `hydrate` body at all, which is what the blanket impl
+# leaves behind.
+HYDRATE_WORK="$(mktemp -d)"
+cp -R "$BASE" "$HYDRATE_WORK/base"
+python3 - "$HYDRATE_WORK/base/crates/rmlx-models/src/hydrate_alpha/prompt_cache.rs" \
+    "$HYDRATE_WORK/base/crates/rmlx-models/src/hydrate_beta/prompt_cache.rs" <<'EOF'
+import pathlib
+import re
+import sys
+
+for path in sys.argv[1:]:
+    p = pathlib.Path(path)
+    text = p.read_text()
+    m = re.search(r"impl SsdHydrate<(\w+)> for SsdHydrator \{.*?\n\}\n", text, re.S)
+    entry = m.group(1)
+    collapsed = (
+        f"impl HydratedEntry for {entry} {{\n"
+        "    const SHARES_KV: bool = false;\n"
+        "\n"
+        "    fn from_hydrated(block: HydratedBlock, block_hashes: Vec<u64>) -> Self {\n"
+        "        Self {\n"
+        "            prompt_token_ids: block.prompt_ids,\n"
+        "            block_hashes,\n"
+        "            kv_caches: block.kv_caches,\n"
+        "            is_ssd_hydrated: true,\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+    p.write_text(text[: m.start()] + collapsed + text[m.end() :])
+EOF
+
+COLLAPSED_HYDRATE_ML=$(python3 "$TOOL" --root "$HYDRATE_WORK/base" --matched-lines ssd-hydrate 2>&1)
+COLLAPSED_HYDRATE_STATUS=$?
+
+check "matched_lines_ssd_hydrate_after" \
+    "the collapsed tree has no hydrate body left: the population is the two short from_hydrated constructors, whose 8-line bodies are identical because the entry name sits in the impl header. A rule naming hydrate alone reads unavailable here" \
+    contains "ssd hydrate twins (crates/rmlx-models/src): 8 matched lines over 16 body lines (2 item(s), 1 pair(s))" \
+    COLLAPSED_HYDRATE_ML
+
+check_exit "matched_lines_ssd_hydrate_after_exit" \
+    "the collapsed population is still found, so it is a measurement, exit 0" \
+    0 "$COLLAPSED_HYDRATE_STATUS"
+
+rm -rf "$HYDRATE_WORK"
 
 # ---- absent: zero members, and a missing root, are unavailable not 0 ------
 
