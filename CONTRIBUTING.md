@@ -68,8 +68,10 @@ open, or check open PRs for the name).
    deny + audit). `make ci-perf` and the real-model regression smoke run once
    at the end, on `next/<name>` itself, right before the release PR — not per
    issue branch (see §Build & test).
-6. Open a PR into `next/<name>`. Fill in the PR template, including the
-   `Removals` section — see below. A maintainer squash-merges it.
+6. Open a PR into `next/<name>`. The hosted checks
+   (`.github/workflows/ci.yml`) run on every PR into `main` and into
+   `next/<name>`, as the branch rulesets require. Fill in the PR template,
+   including the `Removals` section — see below. A maintainer squash-merges it.
 
 Both `main` and `next/<name>` are protected: changes land via PR with the
 required checks green, never a direct push or a force-push. Only a

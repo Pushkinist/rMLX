@@ -9,9 +9,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'next/**']
   pull_request:
-    branches: [main]
+    branches: [main, 'next/**']
 
 # Every job only checks out the repo and compiles — no PR comments, no releases,
 # no package writes. Pinning least-privilege here rather than relying on the
