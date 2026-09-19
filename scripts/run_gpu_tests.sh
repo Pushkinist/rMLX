@@ -115,6 +115,7 @@
 #   bash scripts/run_gpu_tests.sh
 #   bash scripts/run_gpu_tests.sh --crate rmlx-kv-quant
 #   bash scripts/run_gpu_tests.sh --crate rmlx-kv-quant --filter rotor_flash
+#   bash scripts/run_gpu_tests.sh --half codec
 #   bash scripts/run_gpu_tests.sh --no-shader-validation
 #   bash scripts/run_gpu_tests.sh --preflight   # preconditions only, no tests
 #
@@ -123,6 +124,28 @@
 #   population in lockstep with the executed one, so the coverage check below
 #   cannot tell a narrowed run from a complete one, and `--no-shader-validation`
 #   disarms the instrumentation entirely.
+#
+# HALVES (--half)
+#   `--half` narrows to one side of the partition `scripts/gpu_test_halves.sh`
+#   computes, so a change can pay for the part of the suite that guards what it
+#   touched. It has the same narrowing hazard as `--crate`, and the defence is
+#   that a half-run SAYS SO on its final line: the half is named there, and
+#   `make ci-perf` prints `<half>-half ok — NOT the whole gate` rather than
+#   `ci-perf ok`. Three things hold it to being a gate rather than a subset:
+#
+#     * A classified test the producer places in NO half is a refusal naming
+#       the test, not a note. A test that runs under neither half runs under no
+#       gate at all, and a run that quietly skipped it prints the same green
+#       line as one that ran it. A producer row naming no classified test is
+#       refused for the mirror reason.
+#     * The census expectation is the half's OWN slice of the one pin, keyed on
+#       `(crate, test)`. The other half's entries are silent — neither expected
+#       nor reported as unchecked, because an entry belonging to the other half
+#       is neither. The pin's validity check still reads the whole
+#       classification, so a renamed or deleted test is refused in either half.
+#     * A stand-down inside a half is still a stand-down, and still INCOMPLETE.
+#       This is the one a split can launder: a test the selection never asked
+#       for is only `not enforced in full`, which carries no INCOMPLETE.
 #
 # Exit 0 = every selected GPU test passed and every shader-validation hit was
 # one the census pin accounts for. Exit 1 = a failing test, a hit the pin does
@@ -141,11 +164,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 usage() {
     cat <<'USAGE'
 Usage: run_gpu_tests.sh [--crate <name>] [--filter <substring>]
+                        [--half codec|rest]
                         [--shader-validation | --no-shader-validation]
        run_gpu_tests.sh --preflight
 
   --crate <name>          restrict to one workspace member (e.g. rmlx-kv-quant)
   --filter <substring>    restrict to GPU test fns whose name contains <substring>
+  --half codec|rest       run one side of the partition scripts/gpu_test_halves.sh
+                          computes; the half is named on the final line
   --shader-validation     instrument every Metal pipeline and fail on an invalid
                           memory access (default)
   --no-shader-validation  run the tests uninstrumented
@@ -157,12 +183,14 @@ USAGE
 
 ONLY_CRATE=""
 FILTER=""
+HALF=""
 SHADER_VALIDATION=1
 PREFLIGHT=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --crate)  ONLY_CRATE="${2:?--crate needs a value}"; shift 2 ;;
         --filter) FILTER="${2:?--filter needs a value}"; shift 2 ;;
+        --half)   HALF="${2:?--half needs a value}"; shift 2 ;;
         --shader-validation)    SHADER_VALIDATION=1; shift ;;
         --no-shader-validation) SHADER_VALIDATION=0; shift ;;
         --preflight) PREFLIGHT=1; shift ;;
@@ -170,6 +198,17 @@ while [ $# -gt 0 ]; do
         *) echo "ERROR: unknown argument '$1'" >&2; usage >&2; exit 1 ;;
     esac
 done
+
+# The value, not just its presence: an empty `--half ''` would otherwise fall
+# through to the whole gate under a name that says otherwise.
+HALF_NOTE=""
+if [ -n "${HALF}" ]; then
+    case "${HALF}" in
+        codec|rest) HALF_NOTE=" in the ${HALF} half" ;;
+        *) echo "ERROR: --half '${HALF}' is not a half — expected 'codec' or 'rest'." >&2
+           exit 1 ;;
+    esac
+fi
 
 # Pinned rather than inherited. Every one of these can silently disarm the
 # gate: DEFAULT_STATE=none skips instrumenting pipelines, DISABLE_PIPELINES
@@ -353,10 +392,65 @@ fi
 # the feature is off and it is not compiled at all.
 CANARY_TEST="shader_validation_canary_emits_an_invalid_access_report"
 
+# The partition, from its one producer, and only when a half was asked for: the
+# whole gate is the same run it has always been, and consulting the producer on
+# every run would make it a precondition of one.
+#
+# Both directions are refusals rather than notes. A classified test in no half
+# runs under no gate at all, and the run that skipped it prints the green line
+# of one that ran it; a producer row naming no classified test means the two
+# populations have drifted, and the half it describes is no longer the half this
+# script selects.
+half_rows=""
+if [ -n "${HALF}" ]; then
+    if ! halves_out="$(bash "${REPO_ROOT}/scripts/gpu_test_halves.sh" --root "${REPO_ROOT}" 2>&1)"; then
+        echo "ERROR: the GPU-suite partition could not be computed:" >&2
+        printf '%s\n' "${halves_out}" >&2
+        echo "Refusing to run a half whose other half is unknown." >&2
+        exit 1
+    fi
+    partition_errors=""
+    half_all=""
+    while IFS=$'\t' read -r h_half h_crate h_test; do
+        [ -z "${h_half}" ] && continue
+        case $'\n'"${listing}"$'\n' in
+            *$'\n'"${h_crate}"$'\t'"${h_test}"$'\n'*) ;;
+            *) partition_errors="${partition_errors}  ${h_crate} ${h_test}: placed in the ${h_half} half but is not a classified GPU test"$'\n'
+               continue ;;
+        esac
+        half_all="${half_all}${h_crate}"$'\t'"${h_test}"$'\n'
+        [ "${h_half}" = "${HALF}" ] &&
+            half_rows="${half_rows}${h_crate}"$'\t'"${h_test}"$'\n'
+    done <<< "${halves_out}"
+    while IFS=$'\t' read -r c_crate c_test; do
+        [ -z "${c_crate}" ] && continue
+        [ "${c_test}" = "${CANARY_TEST}" ] && continue
+        case $'\n'"${half_all}" in
+            *$'\n'"${c_crate}"$'\t'"${c_test}"$'\n'*) ;;
+            *) partition_errors="${partition_errors}  ${c_crate} ${c_test}: in no half"$'\n' ;;
+        esac
+    done <<< "${listing}"
+    if [ -n "${partition_errors}" ]; then
+        echo "ERROR: the partition and the classification do not cover each other:" >&2
+        printf '%s' "${partition_errors}" >&2
+        echo >&2
+        echo "Every classified GPU test belongs to exactly one half, or it runs under" >&2
+        echo "no gate. Fix scripts/gpu_test_halves.sh, or run the whole suite with no" >&2
+        echo "--half. See docs/TESTING.md." >&2
+        exit 1
+    fi
+fi
+
 selected=""
 while IFS=$'\t' read -r crate fn_name; do
     [ -z "${crate}" ] && continue
     [ "${fn_name}" = "${CANARY_TEST}" ] && continue
+    if [ -n "${HALF}" ]; then
+        case $'\n'"${half_rows}" in
+            *$'\n'"${crate}"$'\t'"${fn_name}"$'\n'*) ;;
+            *) continue ;;
+        esac
+    fi
     if [ -n "${ONLY_CRATE}" ] && [ "${crate}" != "${ONLY_CRATE}" ]; then continue; fi
     case "${fn_name}" in
         *"${FILTER}"*) selected="${selected}${crate}"$'\t'"${fn_name}"$'\n' ;;
@@ -438,6 +532,10 @@ for crate in "${crates[@]}"; do
         [ -n "${fn_name}" ] && filters+=("${fn_name}")
     done < <(printf '%s' "${selected}" | awk -F'\t' -v c="${crate}" '$1 == c {print $2}' | sort -u)
     echo "── ${crate} (${classified} GPU tests) ──────────────────────────"
+    # The names, not just the count. A per-crate count says nothing about WHICH
+    # cells a narrowed run asked for, and with one crate declaring a cell in
+    # each half the two halves print the same count.
+    [ ${#filters[@]} -gt 0 ] && printf '    %s\n' "${filters[@]}"
 
     log="$(mktemp "${TMPDIR:-/tmp}/rmlx-gpu-test-${crate}.XXXXXX")"
     # `--tests` selects every target with `test = true` — the lib's unit tests,
@@ -688,6 +786,18 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
                 *) pin_errors="${pin_errors}    line ${pin_lineno}: ${p_crate} has no classified GPU test '${p_test}' — a renamed or deleted test would silently drop this entry from every expectation"$'\n'
                    continue ;;
             esac
+            # The pin stays one file and its VALIDITY is read whole, above: an
+            # entry naming a test no crate declares is refused in either half.
+            # The EXPECTATION is the half's own slice. An entry in the other
+            # half is dropped silently rather than noted as unchecked — `not
+            # enforced in full` means an entry this run was supposed to check
+            # and could not, and the other half's is neither.
+            if [ -n "${HALF}" ]; then
+                case $'\n'"${half_rows}" in
+                    *$'\n'"${p_crate}"$'\t'"${p_test}"$'\n'*) ;;
+                    *) continue ;;
+                esac
+            fi
             case "${pin_entries}" in
                 *"${p_crate}"$'\t'"${p_kind}"$'\t'"${p_kernel}"$'\t'"${p_test}"$'\t'*)
                     pin_errors="${pin_errors}    line ${pin_lineno}: \"${p_kernel}\" ${p_kind} in ${p_crate} is pinned twice for ${p_test} — one entry per kernel, kind and test"$'\n'
@@ -841,11 +951,11 @@ if [ "${n_stood_down}" -gt 0 ] || [ "${n_unattributed}" -gt 0 ]; then
     incomplete="${incomplete} — INCOMPLETE: ${n_stood_down} selected GPU test(s) stood down and $((n_unattributed)) further notice(s) named no test; they asserted nothing (listed above)"
 fi
 if [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${census_notes}" ]; then
-    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader-validation census NOT enforced in full (see above).${incomplete}"
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE}, shader-validation census NOT enforced in full (see above).${incomplete}"
 elif [ "${SHADER_VALIDATION}" = "1" ] && [ -n "${census_accepted}" ]; then
-    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader validation matches the pinned census.${incomplete}"
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE}, shader validation matches the pinned census.${incomplete}"
 elif [ "${SHADER_VALIDATION}" = "1" ]; then
-    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s), shader validation clean.${incomplete}"
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE}, shader validation clean.${incomplete}"
 else
-    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s) (uninstrumented).${incomplete}"
+    echo "OK: ${total_passed} GPU tests passed across ${#crates[@]} workspace member(s)${HALF_NOTE} (uninstrumented).${incomplete}"
 fi
