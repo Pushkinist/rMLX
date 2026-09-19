@@ -52,6 +52,8 @@ OUT=""
 STATUS=0
 REPORT=""
 MIX=""
+ARGV=""
+HALVES_OUT=""
 
 # new_case <name> — build a throwaway repo root: a copy of the runner, a stub
 # classifier reading this case's population, and a stub PATH. Sets CASE_ROOT.
@@ -99,9 +101,15 @@ STUB
 exit 1
 STUB
 
+    # The stub records its own argv. The runner reports a per-crate count and no
+    # executed set, so with one crate declaring a cell in each half the two
+    # halves print the same count — the libtest filters the runner actually
+    # issued are the only observable that says WHICH cell it asked for.
+    : >"${root}/cargo_argv"
     cat >"${root}/bin/cargo" <<STUB
 #!/usr/bin/env bash
 set -u
+printf '%s\n' "\$@" >>"${root}/cargo_argv"
 crate=""
 prev=""
 for a in "\$@"; do
@@ -180,9 +188,11 @@ pin() {
 run_case() {
     local root="$1"
     shift
+    : >"${root}/cargo_argv"
     OUT="$(PATH="${root}/bin:${PATH}" env -u RMLX_SKIP_GPU \
         RMLX_O_MODELS_ROOT="${WORK}" bash "${root}/scripts/run_gpu_tests.sh" "$@" 2>&1)"
     STATUS=$?
+    ARGV="$(cat "${root}/cargo_argv")"
     REPORT="$(printf '%s\n' "${OUT}" | awk '
         /^ERROR: Metal shader validation reported invalid memory access:/ { seen = 1 }
         /^ERROR: the shader-validation census does not match the pin:/ { seen = 1 }
@@ -239,6 +249,21 @@ expect_out() {
 expect_no_out() {
     case "${OUT}" in
         *"$1"*) fail "output should not mention: $1" ;;
+    esac
+}
+
+# The executed set, read from the libtest filters the runner issued rather than
+# from its report, which carries a count and no names.
+expect_ran() {
+    case $'\n'"${ARGV}"$'\n' in
+        *$'\n'"$1"$'\n'*) ;;
+        *) fail "the runner did not ask cargo to run: $1" ;;
+    esac
+}
+
+expect_did_not_run() {
+    case $'\n'"${ARGV}"$'\n' in
+        *$'\n'"$1"$'\n'*) fail "the runner asked cargo to run: $1" ;;
     esac
 }
 
@@ -975,6 +1000,9 @@ expect_status 0
 expect_out "rmlx-kv-quant (2 GPU tests)"
 expect_out "OK: 2 GPU tests passed"
 expect_out "codec half"
+expect_ran "kv_gpu_alpha"
+expect_ran "kv_gpu_beta"
+expect_did_not_run "models_gpu_alpha"
 # The stub cargo has no canned log for rmlx-models and exits 99 if asked for
 # one, so reaching that crate would be loud. This asserts the quieter half of
 # the same property: the crate is not even visited.
@@ -1035,9 +1063,12 @@ test kv::gpu_alpha ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
 LOG
 run_case "${CASE_ROOT}" --half codec
+# The exit code alone is not the assertion here — an unimplemented `--half` also
+# exits 1. The refusal must name the stranded test and must run nothing.
 expect_status 1
 expect_out "kv_gpu_beta"
 expect_out "no half"
+expect_did_not_run "kv_gpu_alpha"
 
 # The pin stays one file. A half reads the slice of it whose tests the half
 # selects, and expects exactly that slice's sum — not the whole pin, which would
@@ -1064,23 +1095,84 @@ expect_out "kv_gpu_alpha = 4"
 expect_no_out "not enforced in full"
 expect_no_out "models_gpu_alpha"
 
-# The slice is keyed on the pin's crate column as well as its test. Two crates
-# can carry a test of the same name — seven names are defined in more than one
-# module today — and a slice that matched on the name alone would charge one
-# half with the other half's expectation and call the observed hits accounted
-# for.
-new_case half_census_slice_keys_on_the_crate_column || exit 1
-classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
-classify "${CASE_ROOT}" rmlx-models kv_gpu_alpha
+# One crate, one kernel, one access kind, two pinned cells — and the half is the
+# only thing that separates them. The runner already keys its expectation on
+# (crate, kind, kernel), so a case whose two entries sit in different crates
+# would pass on that keying alone and say nothing about the slice. Here both
+# entries survive it, and only the half decides which is expected: 4, not 10.
+new_case half_census_slice_is_the_half_not_the_crate || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
 halves "${CASE_ROOT}" <<'HALVES'
 codec	rmlx-kv-quant	kv_gpu_alpha
-rest	rmlx-models	kv_gpu_alpha
+rest	rmlx-kv-quant	kv_gpu_beta
 HALVES
-census_pin "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-models
+{
+    census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
+    census_pin_line "${CASE_ROOT}" 6 kv_gpu_beta rmlx-kv-quant
+} >"${CASE_ROOT}/scripts/gpu_validation_census.txt"
 census_log "${CASE_ROOT}" rmlx-kv-quant 4
 run_case "${CASE_ROOT}" --half codec
-expect_status 1
-expect_report "not pinned: 4 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
+expect_status 0
+expect_out "census matches the pin"
+expect_out "kv_gpu_alpha = 4"
+# The other half's entry is not this run's business: not expected, and not
+# reported as an entry this run failed to check.
+expect_no_out "kv_gpu_beta"
+expect_no_out "not enforced in full"
+
+# One crate declaring a cell in each half. Both halves report the same count, so
+# a partition keyed on the crate rather than on the test passes every count
+# assertion in this file — what separates them is WHICH cell each half asked for.
+new_case half_one_crate_spans_both_halves || exit 1
+classify "${CASE_ROOT}" rmlx-models a_unit_cell an_integration_cell
+halves "${CASE_ROOT}" <<'HALVES'
+codec	rmlx-models	a_unit_cell
+rest	rmlx-models	an_integration_cell
+HALVES
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test models::a_unit_cell ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}" --half codec
+expect_status 0
+expect_out "rmlx-models (1 GPU tests)"
+expect_ran "a_unit_cell"
+expect_did_not_run "an_integration_cell"
+run_case "${CASE_ROOT}" --half rest
+expect_status 0
+expect_out "rmlx-models (1 GPU tests)"
+expect_ran "an_integration_cell"
+expect_did_not_run "a_unit_cell"
+
+# Property 5 at the census: one pin, three runs, and the two halves' accepted
+# expectations sum to the unnarrowed run's. A slice that double-counts or drops
+# an entry is invisible to every per-half case above — each of them is
+# self-consistent — and shows up only here.
+new_case half_census_sum_equals_the_whole || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+halves "${CASE_ROOT}" <<'HALVES'
+codec	rmlx-kv-quant	kv_gpu_alpha
+rest	rmlx-kv-quant	kv_gpu_beta
+HALVES
+{
+    census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
+    census_pin_line "${CASE_ROOT}" 6 kv_gpu_beta rmlx-kv-quant
+} >"${CASE_ROOT}/scripts/gpu_validation_census.txt"
+census_log "${CASE_ROOT}" rmlx-kv-quant 4
+run_case "${CASE_ROOT}" --half codec
+expect_status 0
+expect_out "4 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
+census_log "${CASE_ROOT}" rmlx-kv-quant 6
+run_case "${CASE_ROOT}" --half rest
+expect_status 0
+expect_out "6 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
+census_log "${CASE_ROOT}" rmlx-kv-quant 10 "" 2
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "10 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
+expect_out "census matches the pin"
 
 # A stand-down inside a half is still a stand-down. This is the one the split
 # can launder: a test the selection never asked for is only `not enforced in
@@ -1109,9 +1201,16 @@ tree="${CASE_ROOT}/tree"
 mkdir -p "${tree}/crates/rmlx-kv-quant/src" \
     "${tree}/crates/rmlx-models/src" "${tree}/crates/rmlx-models/tests" \
     "${tree}/crates/rmlx-audio/src" || exit 1
+# One member per line: the classifier reads this list line by line, and a
+# single-line array parses as zero members and fails closed — which would make
+# this case permanently red for a reason that has nothing to do with the rule.
 cat >"${tree}/Cargo.toml" <<'TOML'
 [workspace]
-members = ["crates/rmlx-kv-quant", "crates/rmlx-models", "crates/rmlx-audio"]
+members = [
+    "crates/rmlx-kv-quant",
+    "crates/rmlx-models",
+    "crates/rmlx-audio",
+]
 TOML
 for member in rmlx-kv-quant rmlx-models rmlx-audio; do
     printf '[package]\nname = "%s"\n\n[dependencies]\n' "${member}" \
