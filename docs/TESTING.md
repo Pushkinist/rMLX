@@ -1172,6 +1172,14 @@ which is the marker `make ci-perf` reads to decide whether it may say `ok`. A
 shape that keeps nine pairs in the table and runs four of them can never reach
 `ci-perf ok`. Either a pair is armed, or it is not in the default table.
 
+**The measurement, and what it decided.** The run came in at **279 min**, and the
+second branch's lever does not reach it: the four `_DEEP` pairs are worth about
+**6 min** between them. The time is in the `rmlx-models` lib suite (~55 min), the
+`rmlx-models` integration binaries (~144 min, of which one file is 106) and audio
+(~15 min) — none of it in the pairs the lever drops. So all nine stay armed and
+the bound is met by partitioning the suite instead; see *Splitting the GPU suite
+by what it guards* below.
+
 ##### Why the opt-in existed, and what changed
 
 The old `DrafterSource::Named`'s own note gave the reason, and it was **not**
@@ -1320,6 +1328,176 @@ runner's exit code keeps meaning what it means — a failing test, an unpinned h
 or a run that executed nothing — and a developer without the weights is still not
 blocked. `ci-perf ok` becomes reachable because the cells resolve, not because
 the bar moved.
+
+#### Splitting the GPU suite by what it guards
+
+**Design. Nothing below is wired yet** — the halves, the producer and the
+`--half` selection are the next change; what is landed now is this section and
+the cases under `THE HALVES` in `scripts/run_gpu_tests_selftest.sh`, which fail
+until it is.
+
+Arming every cell settled the coverage question and left the cost one. With
+everything armed the GPU half is **279 min**, and the `_DEEP` lever the decision
+rule above offered is worth about 6 of them — the 90-minute bound cannot be met
+by dropping pairs, because the time is not in the pairs that were dropped. So
+the suite is partitioned instead, and a change pays for the part of it that
+guards what the change touched.
+
+##### The rule, and its one producer
+
+> A classified GPU test is in the **`codec`** half if and only if its declaring
+> file is under a workspace member that `rmlx-models` depends on, or under
+> `crates/rmlx-models/src/`. Every other classified GPU test is in the **`rest`**
+> half.
+
+Both facts are read from the tree and neither is a test name: the member list
+from `crates/rmlx-models/Cargo.toml`, the declaring file from the classifier. A
+test that moves file moves half; a test that is renamed does not.
+
+The one producer is **`scripts/gpu_test_halves.sh`**, which prints
+`half<TAB>crate<TAB>test` for every classified test and is the only place the
+partition is computed. Its consumers:
+
+| Consumer | Reads it for |
+|---|---|
+| `scripts/run_gpu_tests.sh --half <name>` | narrowing `selected`, and slicing the census pin |
+| `make gpu-test HALF=<name>` | the hand-driven entry point |
+| `make ci-perf HALF=<name>` | the pre-merge gate for one half |
+| `scripts/run_gpu_tests_selftest.sh` | stubbed per case, and run for real over a fixture tree in `half_rule_is_read_from_the_tree` |
+
+It takes the tree it reads as `--root <dir>`, forwarded to
+`check_gpu_tests_ignored.sh`, so the fixture case points it at a synthetic tree
+rather than at this one.
+
+`HALF` is a Make variable with two callers and no environment variable behind
+it. `make ci-perf` with no `HALF` runs the whole suite, exactly as today.
+
+##### What each half selects, and what it costs
+
+`selected(half)` is `{ (crate, test) in the classification : the producer places
+it in that half }`, then narrowed by `--crate` / `--filter` as before. The census
+expectation for a half is the sum over **that** set and nothing else.
+
+| Half | Selects | Tests | Measured libtest wall |
+|---|---|---|---|
+| `codec` | `rmlx-kv-quant`, `rmlx-kv-ssd`, `rmlx-mlx` (both targets), and `crates/rmlx-models/src/` | 321 | 4372 s = **73 min** |
+| `rest` | `crates/rmlx-models/tests/`, and `rmlx-audio` | 62 | 9591 s = **160 min** |
+| whole | both | 383 | 13964 s = **233 min** |
+
+The wall column is **measured**, from the full run the halves were derived on —
+the sum of every `finished in Ns` that run printed, grouped by crate and Cargo
+target. The run's own wall was **279 min**, so 46 min of it is build, the
+shader-validation canary and the preflight, which that log does not attribute
+per crate. Each half's wall is therefore **projected** as its measured libtest
+wall plus a build this run cannot separate: the codec half between **73 and 119
+min**, the rest half between **160 and 206 min**. The projection is replaced by a
+measurement when each half is first run.
+
+What the codec half guards is the KV/decode arithmetic: the codec crate's own
+kernels and cache, the SSD tier, the FFI bridge, and the model layer's unit
+tests, which is where each architecture's forward and decode path is asserted.
+What the rest half guards is the pipelines standing on it — the speculative
+equivalence pairs, the golden-token and alignment suites, and audio
+transcription.
+
+##### A third cut, named and not designed
+
+The rest half is one family: `crates/rmlx-models/tests/spec_*.rs`, the four
+`*_alignment.rs` suites and `two_model_stochastic.rs` are **7954 s = 133 min** of
+its 160, and `spec_greedy_equivalence.rs` alone is **6386 s = 106 min** — 38% of
+the whole GPU half. `rmlx-audio` is the other 928 s = 15 min. So a speculative
+cut would be worth 133 min and an audio cut 15. Neither is designed here: two
+halves is what the split needs to buy the iteration loop, and a third would need
+its own producer rule rather than a name glob.
+
+##### The census slice
+
+The pin stays **one file**, keyed as it is today on `(kernel, kind, crate,
+test)`. A half reads the slice whose `(crate, test)` the half's producer rows
+name, and expects that slice's sum.
+
+| Half | Slice of the current pin | Expected |
+|---|---|---|
+| `codec` | `a_round_tape_refolds_to_what_the_replay_produced` (`src/speculative/round_common_tests.rs`) | `…b_8` 1014, `…b_4` 2496 |
+| `rest` | `qwen3_5_moe_forward_seq_last_k_equals_reference` 40, `thinking_budget_exact_hit_qwen3_5_moe` 80, `qwen3_moe_golden_tokens_k8v8` 40 | `…b_8` 160 |
+| whole | all five entries | `…b_8` 1174, `…b_4` 2496 |
+
+The two slices sum to the whole, which is the pin's own recorded full-run total.
+
+Three distinctions the slice has to keep:
+
+* An entry **outside** the half is silent — neither expected nor noted. `not
+  enforced in full` means an entry this run was supposed to check and could not,
+  and an entry belonging to the other half is neither.
+* An entry **inside** the half that `--crate` / `--filter` dropped, or whose test
+  stood down, is `not enforced in full` exactly as today.
+* The pin's **validity** check is unchanged and reads the whole classification:
+  an entry naming a test no crate declares is still refused, in either half, so a
+  renamed or deleted test cannot silently leave the expectation.
+
+The pin is re-derived from a real run of **each** half in the implementing
+change, as the census rule requires of any change that moves what a run observes.
+
+##### What cannot move
+
+1. The union of the halves' selected tests equals the whole suite's selected
+   tests. No classified test falls out of every gate.
+2. A test declared under a crate the model layer stands on is in the codec half,
+   whatever it is named and whichever target it is declared in.
+3. A selected GPU test that did not run still ends its half `INCOMPLETE`. The
+   split must not turn a stand-down into a non-selection.
+4. The census expectation for a half is the sum over that half's selected pin
+   entries, exactly — not the whole pin, and not a waiver.
+5. The whole suite's result is the sum of the halves': the same tests run, the
+   same census total is expected.
+
+The observables are the set of tests each half executed, taken from the runner's
+own report; the census verdict per half; and each half's final line. Each of the
+five is a case in `scripts/run_gpu_tests_selftest.sh` — stub crates, no GPU.
+
+##### Mutations, and what catches each
+
+| Mutation | Caught by |
+|---|---|
+| A classified test dropped from both halves | `half_a_test_in_no_half_is_refused` — a refusal, not a note: a run that quietly skipped it prints the same green line as one that ran it |
+| A codec test moved to the other half | `half_rule_is_read_from_the_tree`, which runs the real producer over a fixture tree and asserts the placement of a test under a member the model layer depends on |
+| A stand-down reclassified as unselected | `half_stand_down_stays_incomplete`. This is the one the split can launder: a test the selection never asked for is only `not enforced in full`, which carries no `INCOMPLETE`, and `make ci-perf` then prints `ok` |
+| A half's census slice that ignores the `crate` column | `half_census_slice_keys_on_the_crate_column` — two crates carrying a test of the same name, where a name-only slice charges one half with the other's expectation and calls the observed hits accounted for |
+| The selection producer replaced by a literal list of test names | `half_rule_is_read_from_the_tree`'s second half: the fixture test is renamed and must keep its half |
+| A half that overlaps the other, or leaves a gap | `half_union_equals_the_unnarrowed_run` — the two halves' totals must sum to the unnarrowed run's |
+| A half that visits the other half's crates | `half_runs_only_its_own_tests` |
+
+**The mutation this cannot catch.** A half that is *correct* and *insufficient* —
+a codec change that passes the codec half and breaks a golden or an equivalence
+pair in the rest half. Nothing in the partition sees it, because the partition is
+about which tests run and not about which tests a change can break. `main` runs
+the whole gate, so it is caught there rather than on the PR, one merge later than
+it would have been. That is the cost the split buys the iteration loop with, and
+it is stated rather than hidden.
+
+##### Which half a PR runs
+
+Draft of the rule; the implementing change writes it into `CLAUDE.md` beside the
+`gpu-test` and `ci-perf` rows:
+
+> A PR runs `make ci-perf HALF=codec` when its diff touches only crates below the
+> model layer or only `crates/rmlx-models/src/`, and `HALF=rest` when it touches
+> only `crates/rmlx-models/tests/` or `crates/rmlx-audio/`. Anything else, and
+> every merge to `main`, runs the whole `make ci-perf`. A half's final line names
+> the half — `ci-perf ok (codec half)` is never the whole gate's verdict.
+
+##### What the implementing change lands
+
+* `scripts/gpu_test_halves.sh` — the producer, with `--root`.
+* `check_gpu_tests_ignored.sh` — a listing mode carrying the declaring file.
+  `--list` keeps its two columns, so the runner's existing reader is untouched.
+* `scripts/run_gpu_tests.sh` — `--half`, the producer refusals, the sliced census
+  and the half on the final line.
+* `Makefile` — `HALF` on `gpu-test` and on `ci-perf`.
+* `scripts/gpu_validation_census.txt` — re-derived from one real run of each
+  half, which is also what turns the seven cases above green.
+* `CLAUDE.md` — the rows quoted above.
+* `scripts/INDEX.md` — the producer's entry.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 

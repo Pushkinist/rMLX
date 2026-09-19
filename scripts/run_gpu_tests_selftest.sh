@@ -30,6 +30,11 @@
 # output the report is supposed to summarise — so a runner that exits 1 while
 # reporting the wrong half of the run still fails here.
 #
+# The suite is also partitioned, so a change can pay for the part of it that
+# guards what the change touched, and that partition is a gate of its own: the
+# cases under THE HALVES below hold it to a union that loses nothing, a census
+# slice keyed on the pin's own crate and test, and a stand-down that stays one.
+#
 # Exit 0 = every case reported exactly what it should.
 
 set -uo pipefail
@@ -75,6 +80,16 @@ new_case() {
 cat "${root}/classified"
 STUB
 
+    # The half each classified test belongs to. It is a second population on top
+    # of the classification, so it gets its own stub: a case states the
+    # partition it is testing instead of re-deriving it from a fixture tree,
+    # and the one case that does exercise the real rule runs the real producer.
+    : >"${root}/halves"
+    cat >"${root}/scripts/gpu_test_halves.sh" <<STUB
+#!/usr/bin/env bash
+cat "${root}/halves"
+STUB
+
     # The GPU-free preconditions are not what this file exercises, and one of
     # them reads the whole host: stub the process check so a live MLX server
     # cannot decide the outcome of a reporting test, and answer the shader
@@ -117,6 +132,25 @@ classify() {
     for fn in "$@"; do
         printf '%s\t%s\n' "${crate}" "${fn}" >>"${root}/classified"
     done
+}
+
+# halves <root> — the partition this case runs under, `half<TAB>crate<TAB>test`
+# rows on stdin.
+halves() {
+    cat >"$1/halves"
+}
+
+# gpu_fixture_test <file> <fn> — a test the classifier reads as GPU-touching and
+# compliant, for the one case that runs the real half producer over a tree.
+gpu_fixture_test() {
+    cat >"$1" <<TEST
+#[test]
+#[ignore = "GPU: needs the Metal context to itself"]
+fn $2() {
+    let device = Device::Gpu;
+    let _ = device;
+}
+TEST
 }
 
 # crate_log <root> <crate> <cargo-exit-code> — canned libtest log on stdin.
@@ -903,6 +937,213 @@ expect_out "INCOMPLETE: 0 selected GPU test(s) stood down"
 expect_no_out "rmlx-models dflash2_loader:"
 
 # ---------------------------------------------------------------------------
+# THE HALVES
+#
+# The suite is partitioned so a change can pay for the part of it that guards
+# what the change touched. A partition is only a gate if three things hold, and
+# each is a case below: no classified test falls out of every half, a half's
+# census expectation is its own slice of the one pin and not the whole of it,
+# and a stand-down inside a half is still a stand-down. The third is the one a
+# split can quietly break — a test the selection drops is merely `not enforced
+# in full`, which carries no INCOMPLETE, so a half that turned a stand-down into
+# a non-selection would buy a green run by not asking.
+#
+# The partition itself comes from `scripts/gpu_test_halves.sh`, which is the one
+# producer of it. Every case here stubs that producer, so the case states its
+# own partition; the last case runs the real one over a fixture tree, which is
+# what holds the rule to the tree instead of to a list of test names.
+
+# A half runs its own tests and no others.
+new_case half_runs_only_its_own_tests || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+classify "${CASE_ROOT}" rmlx-models models_gpu_alpha models_gpu_beta
+halves "${CASE_ROOT}" <<'HALVES'
+codec	rmlx-kv-quant	kv_gpu_alpha
+codec	rmlx-kv-quant	kv_gpu_beta
+rest	rmlx-models	models_gpu_alpha
+rest	rmlx-models	models_gpu_beta
+HALVES
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test kv::gpu_alpha ... ok
+test kv::gpu_beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}" --half codec
+expect_status 0
+expect_out "rmlx-kv-quant (2 GPU tests)"
+expect_out "OK: 2 GPU tests passed"
+expect_out "codec half"
+# The stub cargo has no canned log for rmlx-models and exits 99 if asked for
+# one, so reaching that crate would be loud. This asserts the quieter half of
+# the same property: the crate is not even visited.
+expect_no_out "rmlx-models ("
+
+# The complement runs the rest, and the two together are the whole suite. A
+# split whose halves overlap or leave a gap reports a total here that is not the
+# unnarrowed run's.
+new_case half_union_equals_the_unnarrowed_run || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+classify "${CASE_ROOT}" rmlx-models models_gpu_alpha models_gpu_beta
+halves "${CASE_ROOT}" <<'HALVES'
+codec	rmlx-kv-quant	kv_gpu_alpha
+codec	rmlx-kv-quant	kv_gpu_beta
+rest	rmlx-models	models_gpu_alpha
+rest	rmlx-models	models_gpu_beta
+HALVES
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test kv::gpu_alpha ... ok
+test kv::gpu_beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+Metal GPU Validation Enabled
+running 2 tests
+test models::gpu_alpha ... ok
+test models::gpu_beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}" --half codec
+expect_status 0
+expect_out "OK: 2 GPU tests passed"
+run_case "${CASE_ROOT}" --half rest
+expect_status 0
+expect_out "OK: 2 GPU tests passed"
+expect_out "rest half"
+run_case "${CASE_ROOT}"
+expect_status 0
+expect_out "OK: 4 GPU tests passed"
+expect_no_out "codec half"
+expect_no_out "rest half"
+
+# A classified test the producer places in no half runs under no gate at all,
+# which is the shape the whole suite exists to prevent. It is a refusal, not a
+# note: a run that quietly skipped it would report the same green line as one
+# that ran it.
+new_case half_a_test_in_no_half_is_refused || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha kv_gpu_beta
+halves "${CASE_ROOT}" <<'HALVES'
+codec	rmlx-kv-quant	kv_gpu_alpha
+HALVES
+crate_log "${CASE_ROOT}" rmlx-kv-quant 0 <<'LOG'
+Metal GPU Validation Enabled
+running 1 test
+test kv::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}" --half codec
+expect_status 1
+expect_out "kv_gpu_beta"
+expect_out "no half"
+
+# The pin stays one file. A half reads the slice of it whose tests the half
+# selects, and expects exactly that slice's sum — not the whole pin, which would
+# be red on every half, and not a waiver, which would be a pin that cannot fire.
+# The other half's entry is silent here rather than `not enforced in full`: that
+# note means an entry this run was supposed to check and could not, and an entry
+# belonging to the other half is neither.
+new_case half_census_slice_is_its_own_entries || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+classify "${CASE_ROOT}" rmlx-models models_gpu_alpha
+halves "${CASE_ROOT}" <<'HALVES'
+codec	rmlx-kv-quant	kv_gpu_alpha
+rest	rmlx-models	models_gpu_alpha
+HALVES
+{
+    census_pin_line "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-kv-quant
+    census_pin_line "${CASE_ROOT}" 6 models_gpu_alpha rmlx-models
+} >"${CASE_ROOT}/scripts/gpu_validation_census.txt"
+census_log "${CASE_ROOT}" rmlx-kv-quant 4
+run_case "${CASE_ROOT}" --half codec
+expect_status 0
+expect_out "census matches the pin"
+expect_out "kv_gpu_alpha = 4"
+expect_no_out "not enforced in full"
+expect_no_out "models_gpu_alpha"
+
+# The slice is keyed on the pin's crate column as well as its test. Two crates
+# can carry a test of the same name — seven names are defined in more than one
+# module today — and a slice that matched on the name alone would charge one
+# half with the other half's expectation and call the observed hits accounted
+# for.
+new_case half_census_slice_keys_on_the_crate_column || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+classify "${CASE_ROOT}" rmlx-models kv_gpu_alpha
+halves "${CASE_ROOT}" <<'HALVES'
+codec	rmlx-kv-quant	kv_gpu_alpha
+rest	rmlx-models	kv_gpu_alpha
+HALVES
+census_pin "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-models
+census_log "${CASE_ROOT}" rmlx-kv-quant 4
+run_case "${CASE_ROOT}" --half codec
+expect_status 1
+expect_report "not pinned: 4 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
+
+# A stand-down inside a half is still a stand-down. This is the one the split
+# can launder: a test the selection never asked for is only `not enforced in
+# full`, which carries no INCOMPLETE and lets `make ci-perf` print `ok`.
+new_case half_stand_down_stays_incomplete || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+classify "${CASE_ROOT}" rmlx-models models_gpu_alpha
+halves "${CASE_ROOT}" <<'HALVES'
+codec	rmlx-kv-quant	kv_gpu_alpha
+rest	rmlx-models	models_gpu_alpha
+HALVES
+census_log "${CASE_ROOT}" rmlx-kv-quant 0 kv_gpu_alpha
+run_case "${CASE_ROOT}" --half codec
+expect_status 0
+expect_out "INCOMPLETE: 1 selected GPU test(s) stood down"
+expect_out "rmlx-kv-quant kv_gpu_alpha:"
+
+# The rule reads the tree, not a list of names. This is the one case that runs
+# the real producer, over a fixture tree it is pointed at by argument: a crate
+# the model layer stands on is codec whichever target its test is declared in,
+# the model layer's own unit test is codec and its integration binary is not,
+# and a crate the model layer does not depend on is neither. Renaming a test
+# moves nothing, which is what a producer carrying a literal list cannot do.
+new_case half_rule_is_read_from_the_tree || exit 1
+tree="${CASE_ROOT}/tree"
+mkdir -p "${tree}/crates/rmlx-kv-quant/src" \
+    "${tree}/crates/rmlx-models/src" "${tree}/crates/rmlx-models/tests" \
+    "${tree}/crates/rmlx-audio/src" || exit 1
+cat >"${tree}/Cargo.toml" <<'TOML'
+[workspace]
+members = ["crates/rmlx-kv-quant", "crates/rmlx-models", "crates/rmlx-audio"]
+TOML
+for member in rmlx-kv-quant rmlx-models rmlx-audio; do
+    printf '[package]\nname = "%s"\n\n[dependencies]\n' "${member}" \
+        >"${tree}/crates/${member}/Cargo.toml"
+done
+printf 'rmlx-kv-quant = { workspace = true }\n' \
+    >>"${tree}/crates/rmlx-models/Cargo.toml"
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_tests.rs" codec_decodes
+gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
+gpu_fixture_test "${tree}/crates/rmlx-models/tests/pipeline.rs" pipeline_agrees
+gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
+HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+for expected in \
+    "codec	rmlx-kv-quant	codec_decodes" \
+    "codec	rmlx-models	arch_forwards" \
+    "rest	rmlx-models	pipeline_agrees" \
+    "rest	rmlx-audio	asr_transcribes"; do
+    case $'\n'"${HALVES_OUT}"$'\n' in
+        *$'\n'"${expected}"$'\n'*) ;;
+        *) fail "the producer did not place: ${expected}" ;;
+    esac
+done
+# The same test under a different name keeps its half, because the half came
+# from where the test is declared.
+gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_tests.rs" codec_decodes_renamed
+HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+case $'\n'"${HALVES_OUT}"$'\n' in
+    *$'\n'"codec	rmlx-kv-quant	codec_decodes_renamed"$'\n'*) ;;
+    *) fail "a renamed test lost its half — the rule is not reading the path" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # The harness's own positive control: with nothing wrong, the same stubs produce
 # a green run. Without this, every case above could be passing because the stub
 # crates never ran at all.
@@ -928,4 +1169,4 @@ if [ "${failures}" -ne 0 ]; then
     exit 1
 fi
 
-echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, and the census pin accepts only what it names."
+echo "run_gpu_tests_selftest: OK — every kind of red is reported, the access mix is the one observed, the census pin accepts only what it names, and each half runs its own tests against its own slice of that pin."
