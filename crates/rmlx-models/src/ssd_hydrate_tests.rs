@@ -84,6 +84,13 @@ const MODEL_SIG: u64 = 0x00c0_ffee_0bad_f00d;
 /// mismatch can differ from.
 const LAYOUT_KEY: u64 = 0x5eed_1a70_07de_c0de;
 
+/// Why every entry test reads `is_ssd_hydrated`. An entry that comes back
+/// unflagged is served through the exact fast path, which replays its
+/// placeholder first token instead of re-prefilling for the real one.
+const HYDRATED_FLAG: &str =
+    "a hydrated entry must be flagged so the exact fast path excludes it — \
+     replaying its placeholder first token poisons generation";
+
 /// Head dimension of every fixture cache. A power of two, kept small so the
 /// debug-profile probes stay cheap — the oracle reads layer identity and
 /// ordering, neither of which depends on the width.
@@ -319,6 +326,18 @@ fn ids(n: usize) -> Vec<u32> {
     (0..n as u32).collect()
 }
 
+/// `stored` plus a tail the tier never saw.
+///
+/// Every entry test probes with this rather than with the stored block itself.
+/// A request equal to the block cannot tell an entry that carries the block's
+/// tokens from one that echoes the request's, and that is the difference the
+/// generate loop reads to decide whether the tail still needs prefilling.
+fn request_longer_than(stored: &[u32]) -> Vec<u32> {
+    let mut request = stored.to_vec();
+    request.extend(stored.len() as u32..stored.len() as u32 + 40);
+    request
+}
+
 // ── pure attention, kv_h == 1 ───────────────────────────────────────────────
 
 /// A `kv_h == 1` pure-attention entry gets back every layer it spilled, in
@@ -340,13 +359,18 @@ fn laguna_entry_restores_every_layer_in_order_at_kv_h_1() {
         kv_layer(BLOCK_TOKENS as i32, 1, 0xB2),
         kv_layer(BLOCK_TOKENS as i32, 1, 0xC3),
     ];
-    let prompt = ids(BLOCK_TOKENS);
-    let s = spill(&ns, LAYOUT_KEY, &prompt, &kv, &[]);
+    let stored = ids(BLOCK_TOKENS);
+    let s = spill(&ns, LAYOUT_KEY, &stored, &kv, &[]);
     assert_pairwise_distinct(&s.kv_digests);
 
     let h = hydrator(&ns, LAYOUT_KEY);
     let entry: LagunaEntry = h
-        .hydrate(&prompt, s.seed, QUANT, DispatchPolicy::default())
+        .hydrate(
+            &request_longer_than(&stored),
+            s.seed,
+            QUANT,
+            DispatchPolicy::default(),
+        )
         .expect("hydrate must not error")
         .expect("the block the fixture spilled must be found");
 
@@ -365,11 +389,7 @@ fn laguna_entry_restores_every_layer_in_order_at_kv_h_1() {
         Some(QUANT),
         "the entry records the codec the request ran"
     );
-    assert!(
-        entry.is_ssd_hydrated(),
-        "a hydrated entry must be flagged so the exact fast path excludes it — \
-         replaying its placeholder first token poisons generation"
-    );
+    assert!(entry.is_ssd_hydrated(), "{HYDRATED_FLAG}");
 }
 
 // ── pure attention, kv_h > 1 ────────────────────────────────────────────────
@@ -394,13 +414,18 @@ fn qwen3_entry_restores_every_layer_in_order_at_kv_h_4() {
         kv_layer(BLOCK_TOKENS as i32, 4, 0xF6),
         kv_layer(BLOCK_TOKENS as i32, 4, 0x17),
     ];
-    let prompt = ids(BLOCK_TOKENS);
-    let s = spill(&ns, LAYOUT_KEY, &prompt, &kv, &[]);
+    let stored = ids(BLOCK_TOKENS);
+    let s = spill(&ns, LAYOUT_KEY, &stored, &kv, &[]);
     assert_pairwise_distinct(&s.kv_digests);
 
     let h = hydrator(&ns, LAYOUT_KEY);
     let entry: Qwen3Entry = h
-        .hydrate(&prompt, s.seed, QUANT, DispatchPolicy::default())
+        .hydrate(
+            &request_longer_than(&stored),
+            s.seed,
+            QUANT,
+            DispatchPolicy::default(),
+        )
         .expect("hydrate must not error")
         .expect("the block the fixture spilled must be found");
 
@@ -414,7 +439,7 @@ fn qwen3_entry_restores_every_layer_in_order_at_kv_h_4() {
         s.prompt_ids.as_slice(),
         "the entry's tokens are the block's tokens"
     );
-    assert!(entry.is_ssd_hydrated());
+    assert!(entry.is_ssd_hydrated(), "{HYDRATED_FLAG}");
 }
 
 // ── hybrid ──────────────────────────────────────────────────────────────────
@@ -436,14 +461,19 @@ fn qwen3_5_moe_entry_restores_the_linear_state_beside_the_kv() {
         kv_layer(BLOCK_TOKENS as i32, 2, 0x39),
     ];
     let lin = vec![lin_layer(0x4A), lin_layer(0x5B)];
-    let prompt = ids(BLOCK_TOKENS);
-    let s = spill(&ns, LAYOUT_KEY, &prompt, &kv, &lin);
+    let stored = ids(BLOCK_TOKENS);
+    let s = spill(&ns, LAYOUT_KEY, &stored, &kv, &lin);
     assert_pairwise_distinct(&s.kv_digests);
     assert_pairwise_distinct(&s.lin_digests);
 
     let h = hydrator(&ns, LAYOUT_KEY);
     let entry: Qwen35MoeEntry = h
-        .hydrate(&prompt, s.seed, QUANT, DispatchPolicy::default())
+        .hydrate(
+            &request_longer_than(&stored),
+            s.seed,
+            QUANT,
+            DispatchPolicy::default(),
+        )
         .expect("hydrate must not error")
         .expect("the block the fixture spilled must be found");
 
@@ -463,7 +493,7 @@ fn qwen3_5_moe_entry_restores_the_linear_state_beside_the_kv() {
          would leave this empty and decode from a zeroed GDN state"
     );
     assert_eq!(entry.prompt_token_ids(), s.prompt_ids.as_slice());
-    assert!(entry.is_ssd_hydrated());
+    assert!(entry.is_ssd_hydrated(), "{HYDRATED_FLAG}");
 }
 
 // ── the argument the eight bodies do not agree on ───────────────────────────
@@ -509,6 +539,7 @@ fn each_arch_hydrates_under_its_own_cross_layer_kv_topology() {
         "a gemma4 hydrate must build caches at gemma4's topology — a hard-coded \
          `false` here drops a bf16 mirror the arch reads"
     );
+    assert!(gemma.is_ssd_hydrated(), "{HYDRATED_FLAG}");
 
     let laguna_ns = Namespace::new("laguna-no-shares-kv");
     let l = spill(
@@ -527,6 +558,7 @@ fn each_arch_hydrates_under_its_own_cross_layer_kv_topology() {
         "a laguna hydrate must build caches at laguna's topology — a hard-coded \
          `true` here builds a mirror the arch never reads"
     );
+    assert!(laguna.is_ssd_hydrated(), "{HYDRATED_FLAG}");
 }
 
 // ── the tokens come from the block, not the request ─────────────────────────
@@ -554,11 +586,13 @@ fn the_entry_carries_the_blocks_tokens_not_the_requests() {
         &[],
     );
 
-    let mut request = stored.clone();
-    request.extend(BLOCK_TOKENS as u32..BLOCK_TOKENS as u32 + 40);
-
     let entry: BitNetEntry = hydrator(&ns, LAYOUT_KEY)
-        .hydrate(&request, s.seed, QUANT, DispatchPolicy::default())
+        .hydrate(
+            &request_longer_than(&stored),
+            s.seed,
+            QUANT,
+            DispatchPolicy::default(),
+        )
         .expect("hydrate must not error")
         .expect("the longer request shares the stored block as its prefix");
 
@@ -567,6 +601,7 @@ fn the_entry_carries_the_blocks_tokens_not_the_requests() {
         stored.as_slice(),
         "the entry holds the block-aligned prefix that was actually prefilled"
     );
+    assert!(entry.is_ssd_hydrated(), "{HYDRATED_FLAG}");
     assert_eq!(
         entry
             .kv_caches()
