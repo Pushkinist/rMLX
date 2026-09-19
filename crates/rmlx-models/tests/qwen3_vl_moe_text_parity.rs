@@ -70,7 +70,7 @@ fn argmax_logits(logits: &Array, device: Device) -> u32 {
 #[test]
 fn qwen3_vl_moe_text_decode_matches_mlx_vlm() {
     let Ok(p) = std::env::var("RMLX_VL_TEST_MODEL") else {
-        eprintln!("RMLX_VL_TEST_MODEL not set — skipping qwen3_vl_moe text parity test");
+        eprintln!("SKIP qwen3_vl_moe_text_decode_matches_mlx_vlm: RMLX_VL_TEST_MODEL not set");
         return;
     };
     let model_path = PathBuf::from(p);

@@ -326,16 +326,29 @@ set -euo pipefail
 # a GPU test this gate mandates is by construction a GPU test that gets run.
 #   (Macro-generated tests are the stated exception; see LIST vs ENFORCE above.)
 #
+# --list-files: the same population with the declaring file as a third column,
+# `<crate><TAB><fn><TAB><file>`. `scripts/gpu_test_halves.sh` needs the file to
+# decide which half a test guards, and `scripts/check_named_skip_notices.sh`
+# needs it to bound its scan. Both columns of `--list` are the first two of this
+# one — the classification is built once and printed at the width the caller
+# asked for, so the two modes cannot name different populations.
+#
 # --root <dir>: scan <dir> instead of the repository. Used by
 # `scripts/check_gpu_tests_ignored_fixtures.sh` to drive the classifier over
 # synthetic workspaces whose expected exit code is known, so a change that loses
 # recall fails there rather than passing silently on the real tree.
 LIST_MODE=0
+LIST_FILES=0
 ROOT_OVERRIDE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --list)
             LIST_MODE=1
+            shift
+            ;;
+        --list-files)
+            LIST_MODE=1
+            LIST_FILES=1
             shift
             ;;
         --root)
@@ -347,7 +360,7 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         *)
-            echo "ERROR: unknown argument '$1' (expected --list and/or --root <dir>)." >&2
+            echo "ERROR: unknown argument '$1' (expected --list, --list-files and/or --root <dir>)." >&2
             exit 1
             ;;
     esac
@@ -959,7 +972,8 @@ for crate in "${members[@]}"; do
             "U  "*) unreadable="${unreadable}  ${line#U  }"$'\n' ;;
             "S  "*) macro_generated="${macro_generated}  ${line#S  }"$'\n' ;;
             "N  "*) declared_unscanned="${declared_unscanned}  ${line#N  }"$'\n' ;;
-            "T  "*) gpu_tests="${gpu_tests}${pkg_name}"$'\t'"${line##*: }"$'\n' ;;
+            "T  "*) t_rec="${line#T  }"
+                    gpu_tests="${gpu_tests}${pkg_name}"$'\t'"${t_rec##*: }"$'\t'"${t_rec%%: *}"$'\n' ;;
         esac
     done <<< "$out"
 done
@@ -1062,7 +1076,11 @@ if [ "${LIST_MODE}" -eq 1 ]; then
         echo "The detector found nothing to run; refusing to emit an empty list." >&2
         exit 1
     fi
-    printf '%s' "${gpu_tests}"
+    if [ "${LIST_FILES}" -eq 1 ]; then
+        printf '%s' "${gpu_tests}"
+    else
+        printf '%s' "${gpu_tests}" | cut -f1,2
+    fi
     exit 0
 fi
 

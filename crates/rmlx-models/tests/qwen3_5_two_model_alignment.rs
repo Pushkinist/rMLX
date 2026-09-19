@@ -30,9 +30,8 @@
 //! on an open-ended "describe five cities" one — where the correct arm would
 //! fail a gate the corrupted arm also fails.
 //!
-//! Server-free. Run:
-//! RMLX_KV_TEST_MODEL=<path-to>/mlx-community__Qwen3.8-27B-mxfp8 \
-//! RMLX_DRAFT_TEST_MODEL=<path-to>/sahilchachra__ornith-1.0-9b-mxfp8-mlx \
+//! Server-free. Both halves resolve by slug under `RMLX_O_MODELS_ROOT`, so a
+//! machine holding the snapshots runs this with nothing exported. Run:
 //! cargo test -p rmlx-models --test qwen3_5_two_model_alignment -- --ignored --nocapture
 
 #![allow(
@@ -47,17 +46,23 @@
     clippy::too_many_lines
 )]
 
-use std::path::PathBuf;
-
 use rmlx_mlx::Device;
 use rmlx_models::speculative::SpeculativeDispatcher;
 
-fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var(key)
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-}
+mod common;
+
+/// The verifier this suite is calibrated against.
+const VERIFIER: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__Qwen3.8-27B-mxfp8",
+    archs: &["Qwen3_5ForConditionalGeneration"],
+};
+
+/// The draft model it is calibrated against: a smaller GDN hybrid sharing the
+/// verifier's vocabulary.
+const DRAFT_SLUG: &str = "sahilchachra__ornith-1.0-9b-mxfp8-mlx";
+
+/// Draft-model override, for a models root that does not hold [`DRAFT_SLUG`].
+const DRAFT_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 
 fn config_json(model_path: &std::path::Path) -> Option<serde_json::Value> {
     let raw = std::fs::read(model_path.join("config.json")).ok()?;
@@ -101,15 +106,14 @@ const PROMPT: &str = "<|im_start|>user\nList the first twelve prime numbers, sep
 #[ignore]
 #[test]
 fn two_model_greedy_tracks_plain_greedy_for_a_long_prefix() {
-    let (Some(model_path), Some(draft_path)) = (
-        env_path("RMLX_KV_TEST_MODEL"),
-        env_path("RMLX_DRAFT_TEST_MODEL"),
+    let test = "two_model_greedy_tracks_plain_greedy_for_a_long_prefix";
+    let Some(model_path) = common::model_for(&VERIFIER, test) else {
+        return;
+    };
+    let Some(draft_path) = common::apply(
+        common::slug_or_override(DRAFT_VAR, DRAFT_SLUG, common::Role::Sidecar),
+        test,
     ) else {
-        eprintln!(
-            "SKIP two_model_greedy_tracks_plain_greedy_for_a_long_prefix: \
-             RMLX_KV_TEST_MODEL and RMLX_DRAFT_TEST_MODEL must both name an existing \
-             snapshot directory"
-        );
         return;
     };
     if !is_gdn_hybrid(&model_path) || !is_gdn_hybrid(&draft_path) {

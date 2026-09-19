@@ -4,6 +4,12 @@ use rmlx_core::DispatchPolicy;
 use rmlx_kv_quant::storage::KvStorage;
 use rmlx_kv_quant::KvQuant;
 
+/// The Gemma4 snapshot the model-gated cell below reads, and the variable that
+/// overrides it for a models root that does not hold it.
+const E2B_SLUG: &str = "mlx-community__gemma-4-e2b-it-mxfp8";
+const E2B_VAR: &str = "RMLX_TEST_MODEL_GEMMA4_E2B";
+const E2B_ARCHS: [&str; 1] = ["Gemma4ForConditionalGeneration"];
+
 fn entry_with(kv_caches: Vec<KvCache>, ids: Vec<u32>) -> Gemma4Entry {
     let block_hashes = rmlx_kv_ssd::chained_block_hashes(&ids);
     Gemma4Entry {
@@ -504,31 +510,15 @@ fn gemma4_consume_engine_migration_golden() {
     use crate::gemma4::{generate_greedy, load_from_path};
     use rmlx_mlx::Device;
 
-    let Some(model_dir_buf) =
-        std::env::var_os("RMLX_TEST_MODEL_GEMMA4_E2B").map(std::path::PathBuf::from)
-    else {
-        println!("SKIP: RMLX_TEST_MODEL_GEMMA4_E2B not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "gemma4_consume_engine_migration_golden",
+        E2B_VAR,
+        E2B_SLUG,
+        &E2B_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
-        return;
-    }
-    let arch_str = {
-        let cfg_path = model_dir.join("config.json");
-        let data = std::fs::read(&cfg_path).expect("read config.json");
-        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
-        v.get("architectures")
-            .and_then(|a| a.get(0))
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_owned()
-    };
-    if arch_str != "Gemma4ForConditionalGeneration" {
-        println!("SKIP: arch \"{arch_str}\" is not Gemma4ForConditionalGeneration");
-        return;
-    }
 
     let model = load_from_path(model_dir).expect("load model");
     let device = Device::Gpu;

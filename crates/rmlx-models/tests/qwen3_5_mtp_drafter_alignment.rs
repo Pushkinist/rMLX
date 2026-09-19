@@ -33,9 +33,8 @@
 //! the checkpoint. Point it at a different pair and re-measure both arms before
 //! reading a failure as a regression. The first check is pair-independent.
 //!
-//! Server-free. Run (verifier + sidecar present):
-//! RMLX_KV_TEST_MODEL=<path-to>/mlx-community__Qwen3.8-27B-mxfp8 \
-//! RMLX_DRAFT_TEST_MODEL=<path-to>/mlx-community__Qwen3.8-27B-MTP-mxfp8 \
+//! Server-free. Both halves resolve by slug under `RMLX_O_MODELS_ROOT`, so a
+//! machine holding the snapshots runs this with nothing exported. Run:
 //! cargo test -p rmlx-models --test qwen3_5_mtp_drafter_alignment -- --ignored --nocapture
 
 #![allow(
@@ -50,18 +49,23 @@
     clippy::too_many_lines
 )]
 
-use std::path::PathBuf;
-
 use rmlx_mlx::Device;
 use rmlx_models::arch;
 use rmlx_models::speculative::mtp::{mtp_generate, MtpDrafter};
 
-fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var(key)
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-}
+mod common;
+
+/// The verifier this suite is calibrated against.
+const VERIFIER: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__Qwen3.8-27B-mxfp8",
+    archs: &["Qwen3_5ForConditionalGeneration"],
+};
+
+/// The drafter it is calibrated against.
+const DRAFT_SLUG: &str = "mlx-community__Qwen3.8-27B-MTP-mxfp8";
+
+/// Draft-model override, for a models root that does not hold [`DRAFT_SLUG`].
+const DRAFT_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 
 /// The verifier's stop ids, read from its `config.json` the same way the server
 /// reads them (`eos_token_id` is a scalar on some checkpoints, an array on
@@ -100,14 +104,14 @@ const PROMPT: &str = "<|im_start|>user\nWhat is the capital of France? Answer in
 #[ignore]
 #[test]
 fn mtp_sidecar_loads_whatever_ffn_it_carries() {
-    let (Some(model_path), Some(draft_path)) = (
-        env_path("RMLX_KV_TEST_MODEL"),
-        env_path("RMLX_DRAFT_TEST_MODEL"),
+    let test = "mtp_sidecar_loads_whatever_ffn_it_carries";
+    let Some(model_path) = common::model_for(&VERIFIER, test) else {
+        return;
+    };
+    let Some(draft_path) = common::apply(
+        common::slug_or_override(DRAFT_VAR, DRAFT_SLUG, common::Role::Sidecar),
+        test,
     ) else {
-        eprintln!(
-            "SKIP mtp_sidecar_loads_whatever_ffn_it_carries: RMLX_KV_TEST_MODEL and \
-             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
-        );
         return;
     };
     let device = Device::Gpu;
@@ -143,14 +147,14 @@ fn mtp_sidecar_loads_whatever_ffn_it_carries() {
 #[ignore]
 #[test]
 fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
-    let (Some(model_path), Some(draft_path)) = (
-        env_path("RMLX_KV_TEST_MODEL"),
-        env_path("RMLX_DRAFT_TEST_MODEL"),
+    let test = "mtp_greedy_tracks_plain_greedy_for_a_long_prefix";
+    let Some(model_path) = common::model_for(&VERIFIER, test) else {
+        return;
+    };
+    let Some(draft_path) = common::apply(
+        common::slug_or_override(DRAFT_VAR, DRAFT_SLUG, common::Role::Sidecar),
+        test,
     ) else {
-        eprintln!(
-            "SKIP mtp_greedy_tracks_plain_greedy_for_a_long_prefix: RMLX_KV_TEST_MODEL and \
-             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
-        );
         return;
     };
     let device = Device::Gpu;
@@ -290,15 +294,14 @@ fn mtp_greedy_tracks_plain_greedy_for_a_long_prefix() {
 #[ignore]
 #[test]
 fn the_round_loop_runs_a_block_deeper_than_the_sidecar_declares() {
-    let (Some(model_path), Some(draft_path)) = (
-        env_path("RMLX_KV_TEST_MODEL"),
-        env_path("RMLX_DRAFT_TEST_MODEL"),
+    let test = "the_round_loop_runs_a_block_deeper_than_the_sidecar_declares";
+    let Some(model_path) = common::model_for(&VERIFIER, test) else {
+        return;
+    };
+    let Some(draft_path) = common::apply(
+        common::slug_or_override(DRAFT_VAR, DRAFT_SLUG, common::Role::Sidecar),
+        test,
     ) else {
-        eprintln!(
-            "SKIP the_round_loop_runs_a_block_deeper_than_the_sidecar_declares: \
-             RMLX_KV_TEST_MODEL and RMLX_DRAFT_TEST_MODEL must both name an existing \
-             snapshot directory"
-        );
         return;
     };
     let device = Device::Gpu;

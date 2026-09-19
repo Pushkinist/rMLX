@@ -111,15 +111,26 @@ fn synthesize_valid_voice_returns_load_error() {
 #[test]
 #[ignore = "requires real model weights at Open Models path; run manually for debugging"]
 fn codec_decoder_debug() {
-    let codec_path = std::path::Path::new(
-        "models/mlx-community__Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit/speech_tokenizer",
-    );
+    // `<RMLX_O_MODELS_ROOT>/<slug>`, the join every other model-gated cell makes.
+    // The path this used to carry was relative to the process's working
+    // directory and resolved under no configuration this repo has, so the cell
+    // stood down on every host including the ones holding the snapshot.
+    let Some(root) = std::env::var_os("RMLX_O_MODELS_ROOT") else {
+        eprintln!("SKIP codec_decoder_debug: RMLX_O_MODELS_ROOT is unset");
+        return;
+    };
+    let codec_path = std::path::Path::new(&root)
+        .join("mlx-community__Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit")
+        .join("speech_tokenizer");
     if !codec_path.exists() {
-        eprintln!("SKIP: codec path not found");
+        eprintln!(
+            "SKIP codec_decoder_debug: no codec decoder at {}",
+            codec_path.display()
+        );
         return;
     }
 
-    let decoder = load_codec_decoder(codec_path).expect("load codec decoder");
+    let decoder = load_codec_decoder(&codec_path).expect("load codec decoder");
 
     // codes: [1, 16, 12] — code 100 for semantic, 50 for acoustic (same as Python reference)
     let t = 12i32;

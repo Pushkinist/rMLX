@@ -448,6 +448,55 @@ pub fn choose(over: Option<Snapshot>, slug: Snapshot, model: &GoldenModel, regen
     }
 }
 
+/// Decide for a cell that names its own **slug** and takes `blame` as an
+/// override. Pure; [`slug_or_override`] reads the two variables.
+///
+/// The slug ranks first and the override is the fallback for a models root that
+/// does not hold it. That order is forced: one variable holds one path while a
+/// run selects many cells, so ranking the variable first hands every one of them
+/// whichever snapshot it names — and a drafter of the same width as the one a
+/// pair wanted loads against that pair's verifier without complaint. It also
+/// makes an **unset** variable stop being a stand-down: the slug is what arms
+/// the cell, so a machine holding the snapshots runs it.
+///
+/// Reaching the fallback means the root does not hold the slug, which disarms
+/// every other cell resolving from that root in the same run. [`apply`] prints
+/// the note so that cost is on the operator's screen.
+///
+/// Which outcome is a skip and which a failure is [`slug_snapshot`]'s and
+/// [`override_snapshot`]'s, not a second copy of their rules. `blame` is the
+/// variable a message should name — the harness's own messages name
+/// [`SINGLE_MODEL_VAR`], and a drafter is overridden by a different one.
+pub fn choose_by_slug(over: Option<Snapshot>, slug: Snapshot, blame: &str) -> Gate {
+    match slug {
+        Snapshot::Found { path, .. } => Gate::Run { path, note: None },
+        Snapshot::Misconfigured(why) => Gate::Fail(why),
+        Snapshot::Absent(why) => match over {
+            None => Gate::Skip(why.replace(SINGLE_MODEL_VAR, blame)),
+            Some(Snapshot::Found { path, .. }) => Gate::Run {
+                path,
+                note: Some(format!("{why}; {blame} decides instead")),
+            },
+            Some(Snapshot::Misconfigured(w) | Snapshot::Absent(w)) => {
+                Gate::Fail(w.replace(SINGLE_MODEL_VAR, blame))
+            }
+        },
+    }
+}
+
+/// Resolve one snapshot a cell names by slug, overridden by `var`.
+///
+/// The env-reading half of [`choose_by_slug`], which holds the rule.
+pub fn slug_or_override(var: &str, slug: &str, role: Role) -> Gate {
+    let root = std::env::var(MODELS_ROOT_VAR).ok();
+    let named = std::env::var(var).ok();
+    choose_by_slug(
+        override_snapshot(named.as_deref(), role),
+        slug_snapshot(root.as_deref(), slug, role),
+        var,
+    )
+}
+
 /// Turn a decision into what [`model_for`] returns. Split out so the
 /// `Fail` → `panic!` edge is covered by a test rather than only by a hand-run
 /// invocation: it is the step that makes a wrong pointer visible at all.

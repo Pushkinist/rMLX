@@ -6,9 +6,8 @@
 //! un-scaled embed the `b`-token conditioning was ~40x too small and the
 //! drafter's proposals essentially never matched the verifier (accept ~ 0).
 //!
-//! Server-free. Run (both models present):
-//! RMLX_KV_TEST_MODEL=/path/to/gemma-4-e2b-it-mxfp8 \
-//! RMLX_DRAFT_TEST_MODEL=/path/to/gemma-4-E2B-it-assistant-bf16 \
+//! Server-free. Both halves resolve by slug under `RMLX_O_MODELS_ROOT`, so a
+//! machine holding the snapshots runs this with nothing exported. Run:
 //! cargo test -p rmlx-models --test gemma4_mtp_drafter_alignment -- --ignored --nocapture
 
 #![allow(
@@ -30,18 +29,23 @@
     clippy::needless_pass_by_value
 )]
 
-use std::path::PathBuf;
-
 use rmlx_mlx::Device;
 use rmlx_models::arch;
 use rmlx_models::speculative::gemma4_assistant::{mtp_assistant_generate, Gemma4AssistantDrafter};
 
-fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var(key)
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-}
+mod common;
+
+/// The verifier this suite is calibrated against.
+const VERIFIER: common::GoldenModel = common::GoldenModel {
+    slug: "mlx-community__gemma-4-e2b-it-mxfp8",
+    archs: &["Gemma4ForConditionalGeneration"],
+};
+
+/// The drafter it is calibrated against.
+const DRAFT_SLUG: &str = "mlx-community__gemma-4-E2B-it-assistant-bf16";
+
+/// Draft-model override, for a models root that does not hold [`DRAFT_SLUG`].
+const DRAFT_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
 
 fn l2(bytes: &[u8]) -> f32 {
     bytes
@@ -60,11 +64,9 @@ fn l2(bytes: &[u8]) -> f32 {
 #[ignore]
 #[test]
 fn embed_token_raw_applies_sqrt_hidden_scale() {
-    let Some(model_path) = env_path("RMLX_KV_TEST_MODEL") else {
-        eprintln!(
-            "SKIP embed_token_raw_applies_sqrt_hidden_scale: RMLX_KV_TEST_MODEL does not \
-             name an existing snapshot directory"
-        );
+    let Some(model_path) =
+        common::model_for(&VERIFIER, "embed_token_raw_applies_sqrt_hidden_scale")
+    else {
         return;
     };
     let device = Device::Gpu;
@@ -94,14 +96,14 @@ fn embed_token_raw_applies_sqrt_hidden_scale() {
 #[ignore]
 #[test]
 fn mtp_assistant_accept_rate_is_high() {
-    let (Some(model_path), Some(draft_path)) = (
-        env_path("RMLX_KV_TEST_MODEL"),
-        env_path("RMLX_DRAFT_TEST_MODEL"),
+    let test = "mtp_assistant_accept_rate_is_high";
+    let Some(model_path) = common::model_for(&VERIFIER, test) else {
+        return;
+    };
+    let Some(draft_path) = common::apply(
+        common::slug_or_override(DRAFT_VAR, DRAFT_SLUG, common::Role::Sidecar),
+        test,
     ) else {
-        eprintln!(
-            "SKIP mtp_assistant_accept_rate_is_high: RMLX_KV_TEST_MODEL and \
-             RMLX_DRAFT_TEST_MODEL must both name an existing snapshot directory"
-        );
         return;
     };
     let device = Device::Gpu;

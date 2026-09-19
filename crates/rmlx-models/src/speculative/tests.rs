@@ -637,6 +637,32 @@ fn vocab_verdict_refuses_an_id_past_the_ceiling() {
 
 /// `load_speculative` runs the verdict before it reads a config or a weight.
 ///
+/// A snapshot directory holding nothing but a `tokenizer.json` naming `pieces`
+/// at ids `0..pieces.len()`.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the tokenizer is literal and the tempdir is this process's own, so a failure to write it names a broken environment"
+)]
+fn vocab_only_snapshot(parent: &Path, name: &str, pieces: &[&str]) -> std::path::PathBuf {
+    use tokenizers::models::wordlevel::WordLevel;
+    let dir = parent.join(name);
+    std::fs::create_dir(&dir).expect("snapshot dir");
+    let vocab = pieces
+        .iter()
+        .enumerate()
+        .map(|(id, piece)| ((*piece).to_owned(), id as u32))
+        .collect();
+    let model = WordLevel::builder()
+        .vocab(vocab)
+        .unk_token("<unk>".to_owned())
+        .build()
+        .expect("literal vocabulary builds a WordLevel model");
+    tokenizers::Tokenizer::new(model)
+        .save(dir.join("tokenizer.json"), false)
+        .expect("write tokenizer.json");
+    dir
+}
+
 /// Two snapshot directories holding nothing but a `tokenizer.json` each: with
 /// the gate in place the refusal names the differing id; without it the call
 /// fails later, on the missing `config.json`, and says nothing about tokens.
@@ -645,31 +671,12 @@ fn vocab_verdict_refuses_an_id_past_the_ceiling() {
 #[test]
 #[allow(
     clippy::expect_used,
-    reason = "test-only: the tokenizers are literal and the tempdir is this process's own, so a failure to write either names a broken environment"
+    reason = "test-only: the tempdir is this process's own, so a failure to create it names a broken environment"
 )]
 fn load_speculative_refuses_a_foreign_tokenizer_before_reading_weights() {
     let tmp = tempfile::tempdir().expect("temp dir");
-    let write = |name: &str, pieces: &[&str]| -> std::path::PathBuf {
-        use tokenizers::models::wordlevel::WordLevel;
-        let dir = tmp.path().join(name);
-        std::fs::create_dir(&dir).expect("snapshot dir");
-        let vocab = pieces
-            .iter()
-            .enumerate()
-            .map(|(id, piece)| ((*piece).to_owned(), id as u32))
-            .collect();
-        let model = WordLevel::builder()
-            .vocab(vocab)
-            .unk_token("<unk>".to_owned())
-            .build()
-            .expect("literal vocabulary builds a WordLevel model");
-        tokenizers::Tokenizer::new(model)
-            .save(dir.join("tokenizer.json"), false)
-            .expect("write tokenizer.json");
-        dir
-    };
-    let verifier = write("verifier", &["<unk>", "<bos>", "sea", "sky"]);
-    let draft = write("draft", &["<unk>", "<bos>", "sea", "SKY"]);
+    let verifier = vocab_only_snapshot(tmp.path(), "verifier", &["<unk>", "<bos>", "sea", "sky"]);
+    let draft = vocab_only_snapshot(tmp.path(), "draft", &["<unk>", "<bos>", "sea", "SKY"]);
 
     let msg = SpeculativeDispatcher::load_speculative(&verifier, &draft, Device::Cpu)
         .err()
@@ -682,6 +689,35 @@ fn load_speculative_refuses_a_foreign_tokenizer_before_reading_weights() {
         !msg.contains("config.json"),
         "the refusal reached the config read — the vocabulary gate did not run: {msg:?}"
     );
+}
+
+/// The same refusal through the exported entry point, which is what a caller
+/// that builds the dispatcher itself has to reach.
+///
+/// Two vocabularies of the same size over different pieces is the one
+/// mis-pairing nothing else in the tree sees: the size check passes, the round
+/// loop runs, and greedy emits the verifier's argmax at every accepted position
+/// whatever the draft proposed. The count being equal is the point of the case.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test-only: the tempdir is this process's own, so a failure to create it names a broken environment"
+)]
+fn vocab_pairing_refuses_two_equal_sized_vocabularies_over_different_pieces() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let verifier = vocab_only_snapshot(tmp.path(), "verifier", &["<unk>", "<bos>", "sea", "sky"]);
+    let draft = vocab_only_snapshot(tmp.path(), "draft", &["<unk>", "<bos>", "sea", "SKY"]);
+
+    let msg = vocab_pairing(&verifier, &draft)
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    assert!(msg.contains("token id 3"), "{msg:?}");
+    assert!(
+        msg.contains("\"sky\"") && msg.contains("\"SKY\""),
+        "{msg:?}"
+    );
+
+    vocab_pairing(&verifier, &verifier).expect("a snapshot pairs with its own tokenizer");
 }
 
 // ---------------------------------------------------------------------------

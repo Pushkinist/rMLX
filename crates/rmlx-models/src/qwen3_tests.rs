@@ -2,6 +2,12 @@ use super::*;
 use crate::prompt_cache::{PromptCache, SpillSink, BLOCK_TOKENS, FNV_OFFSET};
 use rmlx_kv_ssd::chained_block_hashes;
 
+/// The Qwen3 snapshot the model-gated cells below read, and the variable that
+/// overrides it for a models root that does not hold it.
+const BONSAI_SLUG: &str = "prism-ml__Ternary-Bonsai-8B-mlx-2bit";
+const BONSAI_VAR: &str = "RMLX_TEST_MODEL_BONSAI";
+const BONSAI_ARCHS: [&str; 1] = ["Qwen3ForCausalLM"];
+
 /// Unit test: per-head q_norm shape is preserved.
 ///
 /// Build a synthetic [1, seq=2, n_heads=4, head_dim=8] tensor,
@@ -116,17 +122,15 @@ fn integration_qwen3_dr_venus() {
     reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
 )]
 fn integration_qwen3_ternary_bonsai() {
-    let Some(model_dir_buf) =
-        std::env::var_os("RMLX_TEST_MODEL_BONSAI").map(std::path::PathBuf::from)
-    else {
-        eprintln!("integration_qwen3_ternary_bonsai: skipping: RMLX_TEST_MODEL_BONSAI not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "integration_qwen3_ternary_bonsai",
+        BONSAI_VAR,
+        BONSAI_SLUG,
+        &BONSAI_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        eprintln!("integration_qwen3_ternary_bonsai: snapshot absent, skipping");
-        return;
-    }
 
     let model = load_from_path(model_dir, None).expect("load_from_path failed");
     assert_eq!(model.cfg.quant_bits, 2, "expected 2-bit quantization");
@@ -379,32 +383,15 @@ fn qwen3_arch_policy_is_exact_only() {
     reason = "bounds established by construction: indices bounded by slice length validated before call"
 )]
 fn qwen3_hydrated_exact_no_tail_not_placeholder() {
-    let Some(model_dir_buf) =
-        std::env::var_os("RMLX_TEST_MODEL_BONSAI").map(std::path::PathBuf::from)
-    else {
-        println!("SKIP: RMLX_TEST_MODEL_BONSAI not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "qwen3_hydrated_exact_no_tail_not_placeholder",
+        BONSAI_VAR,
+        BONSAI_SLUG,
+        &BONSAI_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
-        return;
-    }
-
-    let arch_str = {
-        let cfg_path = model_dir.join("config.json");
-        let data = std::fs::read(&cfg_path).expect("read config.json");
-        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
-        v.get("architectures")
-            .and_then(|a| a.get(0))
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_owned()
-    };
-    if arch_str != "Qwen3ForCausalLM" {
-        println!("SKIP: arch \"{arch_str}\" is not Qwen3ForCausalLM");
-        return;
-    }
 
     println!("Loading model from {}", model_dir.display());
     let model = load_from_path(model_dir, None).expect("load model");
@@ -638,31 +625,15 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
     reason = "test-only: a single golden covering the four reachable consume cases (cold/RAM/SSD/Miss) reads clearest as one sequential fixture"
 )]
 fn qwen3_consume_engine_migration_golden() {
-    let Some(model_dir_buf) =
-        std::env::var_os("RMLX_TEST_MODEL_BONSAI").map(std::path::PathBuf::from)
-    else {
-        println!("SKIP: RMLX_TEST_MODEL_BONSAI not set");
+    let Some(model_dir_buf) = crate::test_snapshot::snapshot(
+        "qwen3_consume_engine_migration_golden",
+        BONSAI_VAR,
+        BONSAI_SLUG,
+        &BONSAI_ARCHS,
+    ) else {
         return;
     };
     let model_dir = model_dir_buf.as_path();
-    if !model_dir.exists() {
-        println!("SKIP: model dir not found at {}", model_dir.display());
-        return;
-    }
-    let arch_str = {
-        let cfg_path = model_dir.join("config.json");
-        let data = std::fs::read(&cfg_path).expect("read config.json");
-        let v: serde_json::Value = serde_json::from_slice(&data).expect("parse config.json");
-        v.get("architectures")
-            .and_then(|a| a.get(0))
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_owned()
-    };
-    if arch_str != "Qwen3ForCausalLM" {
-        println!("SKIP: arch \"{arch_str}\" is not Qwen3ForCausalLM");
-        return;
-    }
 
     let model = load_from_path(model_dir, None).expect("load model");
     let n_layers = model.cfg.num_hidden_layers;

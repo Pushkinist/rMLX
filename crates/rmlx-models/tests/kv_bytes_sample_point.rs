@@ -54,9 +54,11 @@ use rmlx_models::{Pcg32, PenaltyConfig, SamplerConfig};
 /// decode phase — exactly the allocation a pre-decode sample cannot see.
 const RING_CODEC: KvQuant = KvQuant::IsoKOnly3;
 
-fn model_path() -> Option<PathBuf> {
+/// `test` is the calling test's own fn name: the stand-down notice has to name
+/// a cell a libtest filter reaches, and this helper is not one.
+fn model_path(test: &str) -> Option<PathBuf> {
     let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") else {
-        eprintln!("RMLX_KV_TEST_MODEL not set — skipping kv_bytes_sample_point");
+        eprintln!("SKIP {test}: RMLX_KV_TEST_MODEL not set");
         return None;
     };
     Some(PathBuf::from(p))
@@ -126,8 +128,8 @@ fn process_rss_bytes() -> u64 {
         * 1024
 }
 
-fn load() -> Option<(arch::Architecture, tokenizers::Tokenizer)> {
-    let path = model_path()?;
+fn load(test: &str) -> Option<(arch::Architecture, tokenizers::Tokenizer)> {
+    let path = model_path(test)?;
     let device = Device::Gpu;
     let model =
         arch::load_model(&path, device, &arch::LoadOpts::default()).expect("arch::load_model");
@@ -146,7 +148,7 @@ fn load() -> Option<(arch::Architecture, tokenizers::Tokenizer)> {
 #[ignore]
 #[test]
 fn kv_bytes_hit_equals_miss() {
-    let Some((model, tokenizer)) = load() else {
+    let Some((model, tokenizer)) = load("kv_bytes_hit_equals_miss") else {
         return;
     };
 
@@ -221,7 +223,7 @@ fn kv_bytes_hit_equals_miss() {
 #[ignore]
 #[test]
 fn kv_bytes_anchored_to_rss() {
-    let Some((model, tokenizer)) = load() else {
+    let Some((model, tokenizer)) = load("kv_bytes_anchored_to_rss") else {
         return;
     };
 
@@ -284,7 +286,7 @@ fn kv_bytes_anchored_to_rss() {
 #[ignore]
 #[test]
 fn kv_bytes_grows_with_decode_length() {
-    let Some((model, tokenizer)) = load() else {
+    let Some((model, tokenizer)) = load("kv_bytes_grows_with_decode_length") else {
         return;
     };
 
@@ -354,10 +356,11 @@ fn kv_bytes_grows_with_decode_length() {
 #[ignore]
 #[test]
 fn kv_bytes_counter_is_per_model_instance() {
-    let Some((model_a, tokenizer)) = load() else {
+    const TEST: &str = "kv_bytes_counter_is_per_model_instance";
+    let Some((model_a, tokenizer)) = load(TEST) else {
         return;
     };
-    let Some((model_b, _)) = load() else {
+    let Some((model_b, _)) = load(TEST) else {
         return;
     };
 

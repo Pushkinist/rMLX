@@ -440,7 +440,7 @@ deliberate rather than drift. What a suite asserts decides what it may accept:
 | golden-token (`tests/common/mod.rs`) | `RMLX_KV_TEST_MODEL` + slug | **fails** |
 | `tests/niah_long_context.rs` | `RMLX_TEST_MODEL_*` only | skips |
 | `tests/resolved_arch_class.rs` | `RMLX_TEST_MODEL_*`, then slug | skips |
-| `rmlx-cli/src/commands/kv_calibrate_tests.rs` | `RMLX_TEST_MODEL_*`, then slug | falls through to the slug |
+| `crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` | `RMLX_TEST_MODEL_*`, then slug | falls through to the slug |
 
 The goldens are the strict case because they are the only ones pinning **exact
 bytes from one checkpoint**. The other three make semantic assertions — a needle
@@ -922,8 +922,31 @@ the reason they could not be attributed and left off the list. The count rides
 on the final line for the same reason the named ones do: a report that silently
 dropped them would claim a completeness it does not have.
 
-Write new ones as `SKIP <its own test fn>: <why>`. Converting the sites that
-predate this is mechanical and unfinished.
+Write new ones as `SKIP <its own test fn>: <why>`.
+`scripts/check_named_skip_notices.sh` (`make check-named-skip-notices`, in
+`make ci`) is where that rule is enforced, at the source line rather than at the
+report: it takes the classified GPU tests from the same
+`check_gpu_tests_ignored.sh --list` the runner selects from, and fails on a
+notice in one of them that names no test or names another one. It accepts the
+enclosing fn's name written out, or the exact `{test}` placeholder a test that
+passes its own name uses — no other placeholder, since `{other}` reads
+identically and can hold the name of a cell that ran.
+
+The notice's SHAPE is not defined in either tool. `scripts/lib/skip_notice_patterns.sh`
+holds it and both read that file, because a gate that accepted `SKIP  foo:` while
+the runner counted the same line as nameless would be green on both sides of a
+defect neither could see.
+
+`scripts/check_named_skip_notices_fixtures.sh`
+(`make check-named-skip-notices-fixtures`, in `make ci`) is its recall test: 13
+synthetic roots, one edit each, asserting the reason as well as the exit code — a
+named notice, an unnamed one, one naming another test, one in a helper, the two
+whitespace variants above, both placeholders, an unclassified test, prose that
+merely says the word, a notice under the wrong crate, an empty classification and
+an empty source tree.
+
+Converting the sites that predate the rule is mechanical and unfinished; the gate
+names every one that is left.
 
 **No test in this suite is known-red on `main`, and this runner tracks no
 known-red list of tests.** (Shader-validation hits are the one thing it does
@@ -980,6 +1003,710 @@ an under-match, a missing banner and two diagnostics sharing one output line, an
 each case asserts the reason that reaches the final report rather than only the
 exit code. The census-pin verdicts are pinned in the same file, by the same
 means.
+
+#### Why `ci-perf` is INCOMPLETE on a full host, and the rule that ends it
+
+On a machine holding every snapshot this suite can name, `make ci-perf` still
+ends in `ci-perf INCOMPLETE`. The last full run reads:
+
+```
+OK: 383 GPU tests passed across 5 workspace member(s), shader validation matches
+the pinned census. — INCOMPLETE: 20 selected GPU test(s) stood down and 13
+further notice(s) named no test; they asserted nothing (listed above)
+```
+
+Neither number is a missing snapshot. Both are resolution: a cell that **could**
+find its model refuses to look, because it is waiting to be selected by an
+environment variable that can name exactly one path. Twenty cells are selected by
+`RMLX_KV_TEST_MODEL` / `RMLX_DRAFT_TEST_MODEL`, and one pair of variables cannot
+select nine speculative pairs and four alignment suites at once — so no single
+run arms them all, and the operator who exports a pair disarms the rest. Thirteen
+more announce a stand-down that names no test, which the runner can count and
+cannot list.
+
+##### The rule
+
+One rule, and it is the one the tree already uses in three places
+(`two_model_stochastic.rs`, `dflash2_loader.rs`, and the `Slug` arm of
+`spec_greedy_equivalence.rs`'s pair table):
+
+1. **The slug resolves; the variable overrides.** Every model-gated cell names
+   the slug it needs and resolves it under `RMLX_O_MODELS_ROOT`, through
+   `common::slug_or_override` where the harness is reachable and through
+   `rmlx_models::test_snapshot::snapshot` — the same `<root>/<slug>` join — where
+   it is not.
+2. **An unset override is not a stand-down.** The variable stops being a
+   selector. That single change is what arms twenty cells on a host that already
+   held every snapshot they needed.
+3. **The pair's own slug outranks the override path.** One variable holding one
+   path cannot serve nine pairs; ranking it first would hand all of them whichever
+   drafter it holds, and a 4-bit sidecar loads against an mxfp8 verifier of the
+   same width without complaint. The override is the fallback for a root that
+   does not hold the slug.
+4. **A misconfigured root fails; an absent slug skips.** That split is
+   `slug_snapshot`'s and `override_snapshot`'s, not a second copy of their rules.
+   `common::choose_by_slug` is the pure decision over the two probes and the one
+   place the ranking is written.
+5. **A pair names one slug.** With rule 2 the old `DrafterSource`'s two arms
+   differed only in rule 3's ranking, which rule 3 makes uniform — two variants
+   and one meaning. `Pair::drafter` is now `Option<&'static str>`: a slug, or the
+   ceiling class below.
+6. **Every stand-down notice names its own test.** `SKIP <test>: <why>`, enforced
+   at the source line by `make check-named-skip-notices`. The notice's shape has
+   one producer, `scripts/lib/skip_notice_patterns.sh`, which both that gate and
+   `scripts/run_gpu_tests.sh` read: a source gate accepting a shape the runner
+   counts as nameless would pass CI and leave every run INCOMPLETE with a number
+   and no name, which is exactly the state being fixed.
+
+Rule 3 is the one behaviour change for an operator, and it reaches **exactly one
+pair**: `ASSISTANT_PAIR`, the only one in the table whose override outranked its
+slug before. `two_model_stochastic.rs` and
+`dflash2_loader.rs` resolve entirely by slug and read no override, so neither
+changes. After the rule, `RMLX_DRAFT_TEST_MODEL` pointed at an assistant drafter
+no longer wins while the canonical slug is under the models root.
+
+The workaround costs more than it looks: the override is the fallback for a root
+that does not hold the slug, so reaching it means pointing
+`RMLX_O_MODELS_ROOT` somewhere that does not — which disarms **every other pair
+in the same run**. Overriding one pair by moving the root is therefore a
+single-pair run, and the stand-downs it produces are on the final line where the
+operator can see what it cost.
+
+##### The ceiling class, and why it is empty
+
+A pair whose drafter has no slug to name cannot be armed by this rule, and the
+two-model pair was recorded as that case — its draft is a full model of the
+verifier's family rather than a sidecar head, and its table entry says no sibling
+of these verifiers is on the models root. **That is no longer true.**
+`qwen3_5_two_model_alignment.rs` is calibrated against
+`mlx-community__Qwen3.8-27B-mxfp8` drafted by
+`sahilchachra__ornith-1.0-9b-mxfp8-mlx`, both in the snapshot table above, and
+the two name the same piece at every id either carries — which is what
+`vocab_pairing` reads before either model loads. So the two-model pair takes
+that slug and the ceiling class is defined but empty.
+
+One cell is a ceiling of a different kind: `rmlx-audio`'s `codec_decoder_debug`
+hard-codes a **cwd-relative** `models/<slug>/speech_tokenizer` path, which
+resolves under no configuration this repo has — the snapshot is on the models
+root under that same slug, so it too resolves by rule 1 once the join is the
+root's.
+
+**The pair table is not the whole inventory.** Nine of the twenty stand-downs are
+the equivalence pairs; the other eleven are the alignment suites, and each of
+those gates on a **pair** of overrides, so rule 1 has to convert both halves —
+the verifier from `RMLX_KV_TEST_MODEL` as well as the drafter from
+`RMLX_DRAFT_TEST_MODEL`. `crates/rmlx-models/tests/qwen3_5_two_model_alignment.rs`
+is the clearest case: it refuses unless both name an existing directory, and the
+pair it is calibrated against (`mlx-community__Qwen3.8-27B-mxfp8` +
+`sahilchachra__ornith-1.0-9b-mxfp8-mlx`) is in the snapshot table above.
+`crates/rmlx-models/tests/spec_conditioning_residual.rs` already shows the shape
+the conversion takes — the variables select and named slugs resolve — so the
+change there is to drop the selecting guard, not to write a resolver. The one
+single-variable cell is `embed_token_raw_applies_sqrt_hidden_scale`, which needs
+only `RMLX_KV_TEST_MODEL`.
+
+| Population | Cells | Overrides to convert |
+|---|---|---|
+| Equivalence pairs (`spec_greedy_equivalence.rs`) | 9 | drafter only; the verifier already resolves through `common::model_for` |
+| Alignment suites (MTP, DFlash, EAGLE-3, two-model, conditioning residual) | 10 | verifier **and** drafter |
+| KV-cache equivalence (`embed_token_raw_applies_sqrt_hidden_scale`) | 1 | verifier only |
+| Unattributed notices in lib unit tests | 13 | one per-architecture `RMLX_TEST_MODEL_*` each, plus one cwd-relative path |
+
+A pair that genuinely had no slug is `Pair::drafter: None`, and prints a named
+`SKIP <test>: <why>` naming `RMLX_DRAFT_TEST_MODEL` as the only handle. It is
+INCOMPLETE by contract, not silent — which is the whole point of the contract.
+
+##### The runtime, and who pays
+
+**Measured**, from the two full runs the pin was derived on (dev profile, Metal
+shader validation on, `--test-threads=1`):
+
+| Cell | Arms | Wall |
+|---|---|---|
+| Whole GPU half, 383 tests | — | 2961 s / 3879 s |
+| `spec_greedy_equivalence` | one pair armed (Gemma4-e2b), nine stood down | 242 s / 307 s |
+| `spec_sampled_distribution` | one Gemma4-e2b pair, 5 prompts + a control | 529 s / 570 s |
+| `two_model_stochastic` | one Gemma4-e4b/e2b pair, two seeds | 290 s / 314 s |
+| `qwen3_5_moe_forward_seq_last_k` | one 35B-A3B load + one forward | 34 s |
+
+The equivalence gate's unit is a **pair**, and its cost is fixed by its own
+recorded design: six prompts, one of them carrying a 4k document, two full
+generations each — `run_gate`'s doc states why it is every prompt and not a
+chosen one (recall is a property of the set; one prompt is a coin toss). **There
+is no shortest-prompt-set notion in the tree, and inventing one would be a knob
+that contradicts that argument.** The prompt set is paid in full per pair or the
+pair is not run.
+
+The two longest rows are per-pair figures already: **~5 min** for the two-model
+stochastic pair and **~9 min** for the sampled-distribution one. Both are
+*slug-resolved pairs that already run* — and both are Gemma4, 2B and 4B. So they
+are a floor for the nine, not an estimate of them.
+
+**Projected from the shape of the measured pair, not measured.** The equivalence
+gate's budget is `N_TOKENS = 256` per arm over 6 prompts × 2 arms = 3072 tokens,
+one prompt carrying a 4k document. At e2b that decode is ~30 s of the pair's
+~240 s, so the measured figure is dominated by **load and prefill**, not by
+decode. Scaling that: a 27B-dense or 35B-A3B pair pays ~40–60 s of load per model
+× 2, a 4k prefill twice, and 3072 tokens at 20–35 TPS instead of ~120 — which
+lands each pair in the same **5–9 min** band the two measured pairs occupy, not
+an order above it. Nine pairs ≈ **+45–80 min** on a ~50 min GPU half.
+
+*(An earlier reading of this section said "hours, not minutes". It was wrong: it
+scaled the 240 s figure as though decode dominated it. The 256-token budget is
+what bounds this, and it is a constant of the gate.)*
+
+**The decision rule was stated before the measurement**, offering to drop the
+four `_DEEP` pairs from the default table if the armed GPU half exceeded 90 min.
+**The measurement was 279 min and the lever is worth about 6 of them** — the time
+is in the `rmlx-models` lib suite (~55 min), the `rmlx-models` integration
+binaries (~144 min, of which one file is 106) and audio (~15 min), none of it in
+the pairs the lever drops. So all nine stay armed, nothing is dropped for
+nothing, and the bound is pursued by partitioning the suite instead; see
+*Splitting the GPU suite by what it guards* below.
+
+**Leaving a pair in the table but skipped is not an option**, and that is
+structural rather than a preference: a cell that prints a named `SKIP` is counted
+as stood down, and any stand-down puts `INCOMPLETE` on the runner's final line,
+which is the marker `make ci-perf` reads to decide whether it may say `ok`. A
+shape that keeps nine pairs in the table and runs four of them can never reach
+`ci-perf ok`. Either a pair is armed, or it is not in the default table.
+
+##### Why the opt-in existed, and what changed
+
+The old `DrafterSource::Named`'s own note gave the reason, and it was **not**
+cost: these
+verifiers drive an MLX quantized matmul whose invalid loads the shader-validation
+census would have to pin, "a count that moves with every generation". That
+objection is now answerable. The census pins one exact count per originating
+test, and `a_round_tape_refolds_to_what_the_replay_produced` — which loads
+`mlx-community__Qwen3.8-27B-4bit` and `mlx-community__Qwen3.6-35B-A3B-8bit` and
+generates on both — carries 2496 and 1014, derived from a full run and
+reproduced exactly on the next one. A temperature-0 generation over a fixed
+prompt set is deterministic, so its hit count is too. Brittleness was the
+recorded blocker; it is answered by derivation, which is what the census rule
+already requires of any change that adds a GPU load.
+
+##### The thirteen unattributed notices
+
+Each is a classified GPU test whose stand-down says `SKIP: <why>`. The runner
+counts them and lists none. `make check-named-skip-notices` names every source
+line; there are more lines than tests because a cell announces the variable, the
+missing directory and the architecture mismatch separately.
+
+| Variable | Tests | Crate / file |
+|---|---|---|
+| `RMLX_TEST_MODEL_QWEN36_PARO` (5) | `paro_linear_fwd_layer0`, `paro_layer0_trace`, `integration_paro_forward`, `integration_paro_generate_greedy`, `paro_rotation_kernel_vs_python` | `crates/rmlx-models/src/qwen3_5_moe/tests.rs` |
+| `RMLX_TEST_MODEL_QWEN36` (4) | `hydrated_tail_produces_identical_output`, `hydrated_exact_block_no_tail_not_placeholder`, `hydrated_tail_k8v8_equivalence`, `qwen3_5_moe_consume_engine_migration_golden` | `crates/rmlx-models/src/qwen3_5_moe/tests.rs` |
+| `RMLX_TEST_MODEL_BONSAI` (2) | `qwen3_hydrated_exact_no_tail_not_placeholder`, `qwen3_consume_engine_migration_golden` | `crates/rmlx-models/src/qwen3_tests.rs` |
+| `RMLX_TEST_MODEL_GEMMA4_E2B` (1) | `gemma4_consume_engine_migration_golden` | `crates/rmlx-models/src/gemma4/prompt_cache_tests.rs` |
+| none — a cwd-relative path | `codec_decoder_debug` | `crates/rmlx-audio/src/tts_tests.rs` |
+
+A fourteenth site is the same defect in the other direction and did not fire on
+either run, because its cell ran: `shader_validation_canary_emits_an_invalid_access_report`
+announces `SKIP shader_validation_canary:`, a name no libtest filter reaches, so
+an uninstrumented run would count it unattributed. The gate refuses it.
+
+These sites are **lib** unit tests under `src/`, so `tests/common`'s resolver is
+not reachable from them. The join is the one
+`crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` already makes:
+`<RMLX_O_MODELS_ROOT>/<slug>`, with the per-architecture variable as the
+override. Slugs come from the snapshot table at the top of this file.
+
+##### The census entries this moves, and their class
+
+The pin is re-derived in the same change, as the census rule requires. Expected,
+with the class each falls into:
+
+| Newly armed | Verifier / snapshot | Expected | Class |
+|---|---|---|---|
+| `the_recurrent_round_loop_reproduces_plain_greedy{,_at_the_declared_block,_past_the_declared_block}`, `the_block_round_loop_reproduces_plain_greedy{,_at_the_declared_block}` | `Qwen3.8-27B-4bit` | `…b_4_alN_false` device loads, one entry per test | **#438 class** — the same template instantiation already pinned on that snapshot |
+| `the_adaptive_round_loop_reproduces_plain_greedy{,_over_its_whole_schedule}`, `the_restricted_vocab_round_loop_reproduces_plain_greedy` | `Qwen3.6-35B-A3B-8bit` | `…b_8_alN_false` on `shared_expert_gate` | **#438 class** — the pinned 1-row `[1, 2048]` mixture tensor |
+| the four `RMLX_TEST_MODEL_QWEN36` cells | `Qwen3.6-35B-A3B-8bit` | `…b_8_alN_false` | **#438 class** — a fourth Qwen3.5-MoE cell on the same gate |
+| `the_recurrent_round_loop_…` (mxfp8 arm), `the_two_model_round_loop_reproduces_plain_greedy` | `Qwen3.8-27B-mxfp8` + `ornith-1.0-9b-mxfp8-mlx` | unknown — mxfp8 is not the affine kernel | **not #438** until measured; a hit here needs its own analysis |
+| the five `RMLX_TEST_MODEL_QWEN36_PARO` cells | `z-lab__Qwen3.6-27B-PARO` | unknown — a different weight codec | **not #438**; its own analysis or a clean pass |
+| the two `RMLX_TEST_MODEL_BONSAI` cells | `Ternary-Bonsai-8B-mlx-2bit` | a `…b_2_…` kernel no entry names — `lm_head` / `model.embed_tokens` at N = 151669, unaligned | **#438 class if it is a load** — same template, third instantiation, and the structural argument in the pin's header does not mention `bits` |
+| `gemma4_consume_engine_migration_golden` | `gemma-4-e2b-it-mxfp8` | none — the assistant pair already runs that snapshot with no unpinned hit | — |
+| `codec_decoder_debug` | `Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit` | unknown | **not #438** until measured |
+
+An entry is only added for a hit whose analysis says it is benign, with the
+reference in the entry. A **store** is never pinnable. A `b_2` load that the
+`tile_matmad` argument covers is one analysis extended, not a new one; anything
+on a non-affine kernel is a new analysis or a red run.
+
+##### The oracle, and what each observable cannot see
+
+| Observable | Sees | Blind to |
+|---|---|---|
+| The runner's final line (`ci-perf ok` / `INCOMPLETE …`) | that a selected cell asserted nothing, and how many notices could not be attributed | *which* cell, when the notice named no test; and whether a cell that ran asserted anything meaningful |
+| The census line and its delta | a hit that moved, a new kernel, a pinned kernel that stopped firing, any store | a pair that resolved the **wrong** snapshot at the same width — the kernel and the count can be identical |
+| Selected-tests ran vs stood down | coverage of the selection | a test that ran against a mispaired drafter, which is a pass |
+| Wall time | that the cost was paid | which pair paid it; a pair that loaded and returned early looks like a cheap pair |
+
+The blind spot they share is **mis-pairing**, and it is the hazard a by-slug
+fallback creates: a same-width verifier handed the wrong drafter loads without
+complaint and produces a plausible answer. Two refusals in
+`crates/rmlx-models/tests/spec_greedy_equivalence.rs` close it for the sidecar
+arms, and the rule keeps both:
+
+* `declared_kind` — the drafter's snapshot must declare the kind this pair's
+  round loop drives (`SKIP <test>: … declares {kind}, and this pair's loop drives
+  a {want} drafter`).
+* `declared_quant_mode` — a sidecar quantized differently from its verifier is
+  not this pair.
+
+**Neither covers the two-model arm, and the third check does not either.**
+`declared_kind` cannot pin it: `two_model` is an inference from the architecture
+registry that every full model satisfies. `declared_quant_mode` exempts it by
+design, because its draft is an independent model whose weight format is
+unrelated to the verifier's. That left a declared-`vocab_size` comparison, and it is a
+**necessary condition only** — an integer. Two snapshots can both declare the
+same count and map those ids to different pieces; the drafter then proposes ids that mean
+other tokens, the verifier's greedy argmax is emitted at every accepted position
+regardless, and the pair passes green having tested nothing. This gate has no
+agreement floor to catch it, deliberately — how much of one answer two correct
+arms share is decided by where their first near-tie lands and by nothing else.
+
+The engine already has the check this needs, and it is piece-by-piece rather
+than by size: `vocab_pairing_verdict` in
+`crates/rmlx-models/src/speculative/mod.rs` compares the two tokenizers id by id
+over every id both carry, and tolerates only a trailing run of special tokens
+(`VOCAB_TAIL_TOLERANCE`, 128 — llama.cpp's `SPEC_VOCAB_MAX_SIZE_DIFFERENCE`, so
+the two engines admit the same pairs). Its own note gives the case the integer
+misses: Gemma 3 and Gemma 4 both declare 262144 and share no vocabulary.
+
+`load_speculative` composes it as
+`vocab_pairing_verdict(&snapshot_vocab(verifier_dir)?, &snapshot_vocab(draft_dir)?)`,
+before any weight is read — but the harness does not go through
+`load_speculative`. It builds `SpeculativeDispatcher::new` directly, and that
+constructor pins the two `vocab_size` values equal and nothing more. So the
+engine's check exists and the gate never reaches it.
+
+**The wiring adds no second implementation.** That composition is exported as
+one `pub fn vocab_pairing(verifier_dir, draft_dir) -> Result<()>` in
+`crates/rmlx-models/src/speculative/mod.rs`, and `load_speculative` calls it
+rather than composing the two calls itself — one producer, and the engine and
+the harness run the same line. The harness calls it in `load()`'s
+`TwoModelGreedy` branch, after both paths resolve and before either model loads,
+and turns an `Err` into a named `SKIP <test>: <why>` carrying the verdict's own
+reason, which names the first id whose piece differs. The declared-`vocab_size`
+reader was strictly weaker than its replacement with no other caller, and is
+deleted. A tokenizer-digest comparison would be a twin of this and is not
+written. `vocab_pairing_refuses_two_equal_sized_vocabularies_over_different_pieces`
+is the CPU case: two synthetic snapshots holding only a `tokenizer.json`, the
+same number of ids over different pieces, refused on the id that differs.
+
+Each refusal fires before either model is read, and each prints a named notice,
+so a mis-pairing is INCOMPLETE rather than a quiet green.
+
+##### Mutations, and what catches each
+
+| Mutation | Caught by |
+|---|---|
+| The slug fallback dropped for one pair | the final line: that pair is named on the stand-down list and the run is INCOMPLETE |
+| The slug fallback resolving the wrong sidecar | `declared_kind` / `declared_quant_mode`, each a named `SKIP`; the resolver half is CPU-testable against a synthetic root without a model |
+| The slug fallback resolving the wrong **full model** for the two-model arm — two snapshots declaring the same 248320 ids over different pieces | `vocab_pairing`, wired as above: a named `SKIP` carrying the first id whose piece differs. Nothing else in the tree sees it — the size check passes, the loop runs, and greedy emits the verifier's argmax either way |
+| The override ranked above the pair's own slug | a run with `RMLX_DRAFT_TEST_MODEL` set and several pairs selected: the pairs whose slug the root holds must still take their own, provable from the paths in their notices |
+| A notice that still omits the test name | `make check-named-skip-notices` at the source line, and `run_gpu_tests_selftest.sh`'s `unattributed_stand_down_is_counted` at the report |
+| A notice that names another test | `make check-named-skip-notices`; the runner would list it under a name that does not run |
+| A newly armed test's hits left unpinned | the census delta — `not pinned: N <kind> "<kernel>"` — which is the implementing change's own proof |
+| The census pin edited to fit the run rather than re-derived | a count below the expectation is a failure in its own right, and the pin's header says to re-derive |
+| A pair armed but returning early (a cheap pass) | not caught by wall time, and not by an agreement floor — this gate has none by design. Its **census entry** is the positive control: a pair that did the work produces the hit count the pin names for it, and one that returned early produces none and fails as `no longer fires`. That is why the pin is re-derived in the same change and why each newly armed pair carries its own entry rather than sharing one |
+
+##### What this does not change
+
+A real stand-down stays INCOMPLETE. Nothing here makes a skip read as a pass, the
+runner's exit code keeps meaning what it means — a failing test, an unpinned hit,
+or a run that executed nothing — and a developer without the weights is still not
+blocked. `ci-perf ok` becomes reachable because the cells resolve, not because
+the bar moved.
+
+#### Splitting the GPU suite by what it guards
+
+**Landed**, less the census pin: the producer, the `--half` selection, the
+`HALF` variable on both targets and the nine converted stand-downs are in the
+tree, and the cases under `THE HALVES` in `scripts/run_gpu_tests_selftest.sh`
+are green over them. What is **deferred to the integration run** — the one
+GPU window at the end of the integration, `make gpu-test HALF=codec` there and
+the rest half verified by the whole `make ci-perf` — is every figure a real
+run of one half produces: the per-half wall below is still the projection,
+and the census pin is still the whole-run one. Both are re-derived at that
+run, from one real run of each half.
+
+Arming every cell settled the coverage question and left the cost one, measured
+above. The bound cannot be met by dropping pairs, so the suite is partitioned
+instead and a change pays for the part of it that guards what the change touched.
+
+##### The rule, and its one producer
+
+> A classified GPU test is in the **`codec`** half if and only if its declaring
+> file is under a workspace member that `rmlx-models` depends on, or under
+> `crates/rmlx-models/src/`, or **selects a KV codec** — names `DEFAULT_KV_QUANT`,
+> or a `KvQuant::<V>` whose `<V>` is one of the variants of `ALL_KV_QUANTS`
+> other than `None`. Every other classified GPU test is in the **`rest`** half.
+
+All three facts are read from the tree and none is a test name: the member list
+from `crates/rmlx-models/Cargo.toml`, the declaring file from the classifier, the
+codec names from `ALL_KV_QUANTS` in `crates/rmlx-kv-quant/src/quant.rs` — the
+list a codec must already be on to be constructible anywhere in that crate. A
+test that moves file moves half; a test that is renamed does not.
+
+**The codec-name set is derived, not a pattern.** A bare
+`KvQuant::[A-Za-z0-9_]+` needle is not a codec test: it matches
+`KvQuant::FromStr` and `KvQuant::materialises_packed_store`, which are a trait
+path and a method and name no codec. The producer reads the twenty-eight variants
+of `ALL_KV_QUANTS`, drops `None`, and matches the remaining twenty-seven names.
+**An empty derived set is a hard refusal**, not an empty match: a producer that
+read zero codec names would place every integration binary in `rest` and report a
+clean partition while the codec half guarded nothing.
+
+`DEFAULT_KV_QUANT` is in the needle for the same reason.
+`crates/rmlx-models/tests/dflash_drafter_alignment.rs` and
+`crates/rmlx-models/tests/gemma4_mtp_drafter_alignment.rs` select their codec
+through it and name no variant, so they sit in `rest` only for as long as that
+default is `None` (`crates/rmlx-models/src/kv_cache/mod.rs`). Reading the
+constant instead of its current value is what keeps the partition from moving
+silently when the default does.
+
+The third clause is what makes the halves a partition **by what a change can
+break** rather than by build topology. A file that selects a codec has chosen
+one, and a codec change can move what it asserts. A file that names only
+`KvQuant::None` has pinned the codec off so it can measure something else — a
+drafter, a router, a CLI flag — and the `None` store path it does leave live is
+covered in the codec half by `rmlx-kv-quant`'s own suites, whose bytes-per-element
+invariants are exactly that path. The clause is read per **file**, not per test:
+a file that sweeps `Mixed` and `None` is one codec suite, and splitting it would
+put two cells of one sweep in two gates.
+
+Two rules were weighed and lost:
+
+* **Any mention of `rmlx_kv_quant` / `KvQuant`.** It collapses the split.
+  `crates/rmlx-models/tests/spec_greedy_equivalence.rs` names
+  `rmlx_kv_quant::KvQuant::None` seven times to hold the codec constant, and that
+  one file is 106 min — 38% of the whole GPU half. The `rest` half would hold
+  about a minute and the split would buy nothing.
+* **Moving the codec-guarding integration cells under `crates/rmlx-models/src/`**,
+  so the path clause alone is right by construction. Two of the five files —
+  `bonsai_golden_tokens.rs` and `qwen3_golden_tokens.rs` — are built on
+  `tests/common` (`common::GoldenModel`, `common::run_golden_test`), which a lib
+  unit test cannot reach; that unreachability is why
+  `crates/rmlx-models/src/test_snapshot.rs` exists at all. Moving them means a
+  second copy of the golden harness under `src/`, which is a twin of
+  `tests/common` and refused by the twin rule. The tree can state the rule
+  directly instead of being rearranged to fit a weaker one.
+
+The clause moves twenty-eight cells out of `rest`, fourteen of which the review
+of the first draft found stranded:
+
+| File | Codec it selects | GPU cells |
+|---|---|---|
+| `sparse_attn_dispatch.rs` | `PlanarK` | 4 |
+| `kv_bytes_sample_point.rs` | `IsoKOnly3` | 4 |
+| `gemma4_kv_cache_equivalence.rs` | `K8V4`, `K8V8`, `Planar` | 3 |
+| `bonsai_golden_tokens.rs` | `K8V8`, `Mixed` | 5 |
+| `qwen3_golden_tokens.rs` | `K8V8` | 2 |
+| `medgemma_golden_tokens.rs` | `K8V8` | 2 |
+| `bitnet_golden_tokens.rs`, `bitnet_logprobs.rs`, `gemma4_golden_tokens.rs`, `prompt_cache_cross_model.rs` | `K8V8` | 1 each |
+| `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs` | `DEFAULT_KV_QUANT` | 2 each |
+
+The `rest` half keeps the speculative family, the drafter suites that pin `None`
+and the loader cells: 34 cells, 148 min. It stays the larger half by wall.
+
+The one producer is **`scripts/gpu_test_halves.sh`**, which prints
+`half<TAB>crate<TAB>test` for every classified test and is the only place the
+partition is computed. Its consumers:
+
+| Consumer | Reads it for |
+|---|---|
+| `scripts/run_gpu_tests.sh --half <name>` | narrowing `selected`, and slicing the census pin |
+| `make gpu-test HALF=<name>` | the hand-driven entry point |
+| `make ci-perf HALF=<name>` | the pre-merge gate for one half |
+| `scripts/run_gpu_tests_selftest.sh` | stubbed per case, and run for real over a fixture tree in `half_rule_is_read_from_the_tree` |
+
+It takes the tree it reads as `--root <dir>`, forwarded to
+`check_gpu_tests_ignored.sh`, so the fixture case points it at a synthetic tree
+rather than at this one.
+
+`HALF` is a Make variable with two callers. It is the narrowing hazard the
+`ci-perf` comment beginning *"The runner is invoked directly rather than through
+`$(MAKE) gpu-test`"* closes for `CRATE` and `VALIDATE`: a narrowed population
+shrinks the classified set in lockstep with the executed one, so the runner's own
+coverage check cannot tell that run from a complete one, and `--half` has exactly
+that property. Three rules, in order of how much weight each carries:
+
+1. **The final line is structurally unmistakable, and this is the load-bearing
+   one.** A half-run never prints the string `ci-perf ok`: it reads `ci-perf
+   codec-half ok — NOT the whole gate`. Nothing in this repo greps that marker
+   today, so the defence is for the reader of a run's record, and it holds
+   however the variable arrived.
+2. **The value is checked, not just its origin.** `HALF` must be exactly `codec`
+   or `rest`; anything else, including the empty string, is a refusal. An
+   origin-only test passes an empty `HALF=` on the command line and would then
+   fall through to the whole gate under a name that says otherwise.
+3. **`$(origin HALF)` = `command line` closes the *accidental* export only.** An
+   exported `HALF` in a dev shell reaches Make with origin `environment` and is
+   ignored. It is not a seal: `MAKEFLAGS=HALF=codec make ci-perf` arrives with
+   origin `command line`, and so does a wrapper or a recipe line. Rule 1 is what
+   makes that harmless.
+
+`make ci-perf` with no `HALF` runs the whole suite, exactly as today. Hosted CI
+(`.github/workflows/ci.yml`) runs neither `ci-perf` nor `gpu-test` — it has no
+Metal — and never passes `HALF`, so none of this reaches it.
+
+The implementing change updates that comment and the `CLAUDE.md` `ci-perf` row in
+the same commit that adds `HALF`, so neither states something the change makes
+false.
+
+##### What each half selects, and what it costs
+
+`selected(half)` is `{ (crate, test) in the classification : the producer places
+it in that half }`, then narrowed by `--crate` / `--filter` as before. The census
+expectation for a half is the sum over **that** set and nothing else.
+
+| Half | Selects | Tests | Measured libtest wall |
+|---|---|---|---|
+| Half | Selects | Tests | Measured libtest wall |
+|---|---|---|---|
+| `codec` | **every target** of `rmlx-kv-quant` (its `tests/` dir carries 11 binaries and 26 cells), `rmlx-kv-ssd` and `rmlx-mlx`; `crates/rmlx-models/src/`; and the `crates/rmlx-models/tests/` binaries that select a codec | 349 | 5095 s = **85 min** |
+| `rest` | the `crates/rmlx-models/tests/` binaries that select no codec or only `None`, and `rmlx-audio` | 34 | 8869 s = **148 min** |
+| whole | both | 383 | 13964 s = **233 min** |
+
+The wall column is a **projection**, not a measurement of a half: it is read off
+one whole run, per crate and per Cargo target, and no half has yet been run on
+its own. The per-half wall stays unmeasured until one has. The figures are the sum
+of every `finished in Ns` that run printed, grouped by crate and by Cargo target.
+That run ended red and with nine silent stand-downs (below), so its rest-half
+figure is a **floor**, not a total. The run's own wall was **279 min**, so 46 min
+of it is build, the shader-validation canary and the preflight, which the log
+does not attribute per crate. Each half's wall is therefore **projected** as its
+measured libtest wall plus a build the log cannot separate: the codec half
+between **85 and 131 min**, the rest half between **148 and 194 min**.
+
+**The ≤ 90 min bound is not claimed.** The codec half's projection straddles it,
+and a half pays for a build wider than the tests it runs: `cargo test -p
+rmlx-models --tests` builds all thirty integration binaries to execute the ones
+the half selected, and that is deliberate — see the next paragraph. The figure is
+measured at the integration run, from one real run of each half, and replaces
+this projection there.
+
+**Each half still invokes `cargo test -p <crate> --tests`, unchanged.** A
+per-target invocation — the producer carrying the Cargo target and the runner
+passing `--lib` or `--test <name>` per row — would cut that build, and it was
+rejected. `--tests` selects exactly the target set the classifier scans, which is
+what makes the runner's `classified == executed` coverage check a real check;
+splitting the invocation per target breaks that equality by construction, needs a
+second coverage check per (crate, target) to restore it, and `--lib` hard-errors
+with *"no library targets found in package"* on a bin-only member such as
+`rmlx-cli`, which the classifier does scan. That trades one fail-closed invariant
+the runner already has for build time. Build time is the cheaper thing to lose.
+
+What the codec half guards is the KV/decode arithmetic: the codec crate's own
+kernels and cache, the SSD tier, the FFI bridge, the model layer's unit tests —
+where each architecture's forward and decode path is asserted — and every
+end-to-end binary that selects a codec, which is where a codec change shows up as
+moved golden tokens. What the rest half guards is the pipelines that pinned the
+codec off: the speculative equivalence pairs, the drafter suites that take
+`KvQuant::None`, and audio transcription.
+
+The path clause takes the `rmlx-models` **lib** target whole — 3319 s of the
+codec half's 5095 — and that target also carries cells with no codec in them,
+`src/sampler_tests.rs` and `src/speculative/round_common_tests.rs` among them. It
+is one binary, so there is nothing finer to select: the lib is in the codec half
+or it is not, and a codec change reaches most of it.
+
+##### A third cut, named and not designed
+
+The rest half is one family: `crates/rmlx-models/tests/spec_*.rs`, the three
+`*_alignment.rs` suites left in it and `two_model_stochastic.rs` are **7825 s =
+130 min** of its 148, and `spec_greedy_equivalence.rs` alone is **6386 s = 106
+min** — 38% of the whole GPU half. `rmlx-audio` is the other 928 s = 15 min. So a
+speculative cut would be worth 130 min and an audio cut 15. Neither is designed
+here: two
+halves is what the split needs to buy the iteration loop, and a third would need
+its own producer rule rather than a name glob.
+
+##### The hole the rest half inherits
+
+Nine classified GPU cells stood down by printing a bare
+`eprintln!("RMLX_KV_TEST_MODEL not set — skipping")` and returning:
+`crates/rmlx-models/tests/gemma4_kv_cache_equivalence.rs` (3 cells over 4 such
+sites), `crates/rmlx-models/tests/kv_bytes_sample_point.rs` (4 cells, one site),
+`crates/rmlx-models/tests/prompt_cache_cross_model.rs` (1) and
+`crates/rmlx-models/tests/qwen3_vl_moe_text_parity.rs` (1). The line carried no
+`SKIP` token, so it was not a stand-down notice at all: the runner's harvest
+never saw it, `make check-named-skip-notices` could not see it either — that
+gate reads the notice's *shape*, and a line without the token is not a notice to
+it — and libtest reports the cell as `ok`. Those cells were counted as passes.
+
+This was **pre-existing and not caused by the split**, and it bore on property 3
+below: for those nine, a stand-down reached `INCOMPLETE` in neither half. Eight
+are in codec files under the rule above, so the codec half inherited nearly all
+of it; the one in `qwen3_vl_moe_text_parity.rs` sits in `rest`.
+
+All nine now print `SKIP <test>: <why>`. The two that guard from a file-local
+helper — `kv_bytes_sample_point.rs` and `prompt_cache_cross_model.rs` — take the
+caller's test name as an argument and print `SKIP {test}:`, because no libtest
+filter reaches a helper and a notice naming one would be counted and listed
+nowhere.
+
+`check_named_skip_notices.sh` gained the rule that can see the shape at all: a
+block opened by a line reading an environment variable and closed by a `return`
+with no notice inside it. Three things scope it. Its population is the
+**declaring files** of the classified GPU tests, not the test fns, because two of
+the nine guards were in a helper and a rule over test bodies reads a helper's
+silent return as a clean scan. `RMLX_SKIP_GPU` is excluded, because the runner
+refuses to start with that variable set and every classified test opens with such
+a guard. And the block is followed by brace depth over the line's *code* — string
+bodies blanked through `scripts/lib/awk_text.sh` — so a brace inside a literal
+does not close a guard one line early. Six fixture cases in
+`scripts/check_named_skip_notices_fixtures.sh` hold it: the silent guard in a
+test and in a helper, the same guard announced, the off switch, a file declaring
+no classified test, and the brace in a literal.
+
+The census entries for those nine are **not** re-derived here: a cell that was
+counted as a pass and now announces itself changes what a run observes, and that
+is read off the same real run of each half the pin is, deferred to the
+integration run.
+
+##### The census slice
+
+The pin stays **one file**, keyed as it is today on `(kernel, kind, crate,
+test)`. A half reads the slice whose `(crate, test)` the half's producer rows
+name, and expects that slice's sum.
+
+| Half | Slice of the current pin | Expected |
+|---|---|---|
+| `codec` | `a_round_tape_refolds_to_what_the_replay_produced` (`src/speculative/…`) 1014 + 2496, `thinking_budget_exact_hit_qwen3_5_moe` 80, `qwen3_moe_golden_tokens_k8v8` 40 — the last two in `tests/qwen3_golden_tokens.rs`, which names `K8V8` | `…b_8` 1134, `…b_4` 2496 |
+| `rest` | `qwen3_5_moe_forward_seq_last_k_equals_reference` 40 (`tests/qwen3_5_moe_forward_seq_last_k.rs` names only `None`) | `…b_8` 40 |
+| whole | all five entries | `…b_8` 1174, `…b_4` 2496 |
+
+The two slices sum to the whole, which is the pin's own recorded full-run total.
+
+Three distinctions the slice has to keep:
+
+* An entry **outside** the half is silent — neither expected nor noted. `not
+  enforced in full` means an entry this run was supposed to check and could not,
+  and an entry belonging to the other half is neither.
+* An entry **inside** the half that `--crate` / `--filter` dropped, or whose test
+  stood down, is `not enforced in full` exactly as today.
+* The pin's **validity** check is unchanged and reads the whole classification:
+  an entry naming a test no crate declares is still refused, in either half, so a
+  renamed or deleted test cannot silently leave the expectation.
+
+The pin is **deferred to the integration run**. The slice above is the current
+whole-run pin read through the rule. The entries themselves are re-derived from
+one real run of each half at that run, as the census rule requires of any
+change that moves what a run observes; until then, every per-half figure here
+is derived rather than observed.
+
+##### What cannot move
+
+1. The union of the halves' selected tests equals the whole suite's selected
+   tests. No classified test falls out of every gate.
+2. A test declared under a crate the model layer stands on is in the codec half,
+   whatever it is named and whichever target it is declared in.
+3. A selected GPU test that did not run still ends its half `INCOMPLETE`. The
+   split must not turn a stand-down into a non-selection.
+4. The census expectation for a half is the sum over that half's selected pin
+   entries, exactly — not the whole pin, and not a waiver.
+5. The whole suite's result is the sum of the halves': the same tests run, the
+   same census expectation is the sum of the two halves'.
+
+The observables are what each half's report says it executed, the census verdict
+per half, and each half's final line. Each of the five is a case in
+`scripts/run_gpu_tests_selftest.sh` — stub crates, no GPU.
+
+**The runner reports the executed set.** It prints the names it asked cargo to
+run under each crate's banner, beside that crate's classified count, so a half
+that ran the right count of the wrong tests within one crate is inside the
+oracle. The cases read that set from the libtest filters the runner issued,
+which is the one observable that says WHICH cell a half asked for.
+
+##### Mutations, and what catches each
+
+| Mutation | Caught by |
+|---|---|
+| A classified test dropped from both halves | `half_a_test_in_no_half_is_refused` — a refusal, not a note: a run that quietly skipped it prints the same green line as one that ran it |
+| A codec test moved to the other half | `half_rule_is_read_from_the_tree`, which runs the real producer over a fixture tree and asserts the placement of a test under a member the model layer depends on, and of one whose file names a codec |
+| A half keyed on the crate rather than on the test | `half_one_crate_spans_both_halves` — one crate declaring a cell in each half; a crate-keyed selection runs both or neither, and the case asserts which cells ran, not how many |
+| The census sum of the halves drifting from the whole's | `half_census_sum_equals_the_whole` — one pin, three runs, the two halves' accepted expectations summing to the unnarrowed run's |
+| A stand-down reclassified as unselected | `half_stand_down_stays_incomplete`. This is the one the split can launder: a test the selection never asked for is only `not enforced in full`, which carries no `INCOMPLETE`, and `make ci-perf` then prints `ok` |
+| A half's census slice that ignores the half and reads the crate's whole pin | `half_census_slice_is_the_half_not_the_crate` — two entries in one crate on one kernel, where the runner's own `(crate, kind, kernel)` key separates nothing and only the half decides that 4 is expected and not 10 |
+| A half's census slice matched on the test name alone | `half_census_slice_keys_on_the_crate_column` — two crates carrying a test of the same name, one per half. It is a different mutation from the row above and needs its own case: a same-crate pair is blind to a name-only match, and a two-crate pair is blind to a slice that reads the crate's whole pin |
+| The codec-name set read from a bare `KvQuant::<ident>` pattern rather than from `ALL_KV_QUANTS` | `half_a_non_codec_kv_quant_item_stays_rest` — a fixture file naming only `KvQuant::FromStr`, which is a trait path and no codec |
+| The selection producer replaced by a literal list of test names | `half_rule_is_read_from_the_tree`'s second half: the fixture test is renamed and must keep its half |
+| A half that overlaps the other, or leaves a gap | `half_union_equals_the_unnarrowed_run` — the two halves' totals must sum to the unnarrowed run's |
+| A half that visits the other half's crates | `half_runs_only_its_own_tests` |
+
+**The mutation this cannot catch.** A half that is *correct* and *insufficient* —
+a codec change that passes the codec half and breaks a golden or an equivalence
+pair in the rest half. Nothing in the partition sees it, because the partition is
+about which tests run and not about which tests a change can break. `main` runs
+the whole gate, so it is caught there rather than on the PR, one merge later than
+it would have been. That is the cost the split buys the iteration loop with, and
+it is stated rather than hidden.
+
+##### Which half a PR runs
+
+The rule, as it is written into `CLAUDE.md` beside the `gpu-test` and `ci-perf`
+rows:
+
+> A PR runs `make ci-perf HALF=codec` when its diff touches only crates below the
+> model layer, only `crates/rmlx-models/src/`, or only integration binaries that
+> select a KV codec; `HALF=rest` when it touches only the binaries that do not.
+> Anything else, and every merge to `main`, runs the whole `make ci-perf`. `HALF`
+> must be exactly `codec` or `rest`, and an accidentally exported one is ignored;
+> a half-run's final line reads `ci-perf <half>-half ok — NOT the whole gate` and
+> never the string `ci-perf ok`.
+
+##### What landed, and what has not
+
+Landed:
+
+* `scripts/gpu_test_halves.sh` — the producer, with `--root`, emitting
+  `half<TAB>crate<TAB>test`, refusing an empty derived codec-name set. Over this
+  tree it places **349** tests in `codec` and **34** in `rest`, and its rows and
+  the classification cover each other exactly.
+* `check_gpu_tests_ignored.sh` — `--list-files`, the same population with the
+  declaring file as a third column. `--list` keeps its two columns, cut from the
+  same record, so the two modes cannot name different populations.
+* `scripts/run_gpu_tests.sh` — `--half`, the producer refusals, the sliced
+  census, the executed set in the report, and the half on the final line. The
+  invocation stays `cargo test -p <crate> --tests`, so the comment there
+  beginning *"`--tests` selects every target with `test = true`"* stays true and
+  the `classified == executed` check keeps its meaning.
+* `Makefile` — `HALF` on `gpu-test` and on `ci-perf`, with the value checked and
+  an accidental export dropped; the `ci-perf` comment beginning *"The runner is
+  invoked directly rather than through `$(MAKE) gpu-test`"* says what `HALF` may
+  and may not do.
+* The nine silent stand-downs converted to `SKIP <test>: <why>`, and the rule in
+  `check_named_skip_notices.sh` that can see a missing notice at all, with six
+  fixture cases.
+* `CLAUDE.md` — the rows quoted above. `scripts/INDEX.md` — the producer's entry.
+
+Deferred to the integration run — the one GPU window at the end of the
+integration, `make gpu-test HALF=codec` there and the rest half verified by
+the whole `make ci-perf` — and both wait on the same thing at that run: one
+real run of each half:
+
+* `scripts/gpu_validation_census.txt`, re-derived per half. The slice table above
+  is the whole-run pin read through the rule, not a run's observation.
+* The measured wall of each half, replacing the projection above. **The ≤ 90 min
+  bound is still not claimed**, and cannot be until then.
+
+**The codec-name set is derived from this checkout, not from `--root`.** The
+producer's `--root` is the tree it *classifies*; the codec names always come
+from this checkout's `crates/rmlx-kv-quant/src/quant.rs`. A fixture workspace
+carries no codec crate source, and an empty derived set is a refusal — so a
+producer that read the names from `--root` would refuse every fixture tree
+rather than place `codec_sweep.rs` in the codec half. The design above says all
+three facts are read from "the tree"; for the codec names that is this one.
+
+One latent hazard the split does not create and does not close: the runner turns
+each selected test into a libtest **substring** filter, not `--exact`
+(`scripts/run_gpu_tests.sh`), so a codec-half test whose name is a substring of a
+rest-half test would run in both halves. No such pair exists today, and
+over-matching inflates `executed` rather than hiding a shortfall, so it is a
+double-run and not a gap.
 
 #### Where it runs: `make ci-perf`, not `make ci`
 
