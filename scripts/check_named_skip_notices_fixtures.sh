@@ -430,6 +430,90 @@ run_case
 expect_status 1
 expect_out "gpu_alpha returns from an environment guard with no stand-down notice"
 
+# ---------------------------------------------------------------------------
+# A guard whose exits all carry a value has answered, not skipped. The
+# two-env-key resolvers in this tree are exactly this shape, and a rule that
+# read any `return` would be red on correct code the day one of them is
+# classified.
+new_case value_carrying_return_is_not_a_stand_down
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+fn chunk() -> usize {
+    if let Ok(v) = std::env::var("RMLX_CHUNK") {
+        return v.parse().unwrap_or(4096);
+    }
+    4096
+}
+
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let _ = chunk();
+}
+RS
+run_case
+expect_status 0
+
+# ---------------------------------------------------------------------------
+# The guard body on the opening line. A needle anchored at line start reads
+# this as a block with no return in it, which is the whole defect passing as a
+# clean scan.
+new_case one_line_if_guard_is_seen
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    if std::env::var("RMLX_KV_TEST_MODEL").is_err() { return; }
+}
+RS
+run_case
+expect_status 1
+expect_out "gpu_alpha returns from an environment guard with no stand-down notice"
+
+# ---------------------------------------------------------------------------
+# The other one-line spelling, and the commoner one.
+new_case one_line_let_else_guard_is_seen
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") else { return; };
+    let _ = p;
+}
+RS
+run_case
+expect_status 1
+expect_out "gpu_alpha returns from an environment guard with no stand-down notice"
+
+# ---------------------------------------------------------------------------
+# Both defects in one tree. The two blocks are independent and co-occur in a
+# half-converted suite; a gate that exits inside the first sends the reader
+# back for the second one run later.
+new_case both_kinds_are_reported
+classify rmlx-models src/alpha_tests.rs gpu_alpha gpu_beta
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") else {
+        return;
+    };
+    let _ = p;
+}
+
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_beta() {
+    eprintln!("SKIP: no snapshot");
+}
+RS
+run_case
+expect_status 1
+expect_out "gpu_alpha returns from an environment guard with no stand-down notice"
+expect_out "gpu_beta names no test"
+
 if [ "${failures}" -gt 0 ]; then
     echo "check_named_skip_notices_fixtures: ${failures} case(s) failed" >&2
     exit 1

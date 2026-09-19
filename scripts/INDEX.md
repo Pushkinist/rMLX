@@ -50,7 +50,7 @@ Conventions:
 
 | Script | Via | What it does |
 |---|---|---|
-| `run_gpu_tests.sh` | `make gpu-test` | Runs the `#[ignore]` Metal tests per member crate, `--test-threads=1`, under Metal shader validation. `--half codec|rest` runs one side of the partition and names it on the final line. |
+| `run_gpu_tests.sh` | `make gpu-test` | Runs the `#[ignore]` Metal tests per member crate, `--test-threads=1`, under Metal shader validation. `--half codec\|rest` runs one side of the partition and names it on the final line. |
 | `gpu_test_halves.sh` | — | The one producer of the GPU-suite partition: `half<TAB>crate<TAB>test` per classified test. A test is `codec` when its declaring file is under a member `rmlx-models` depends on, under the model layer's own `src/`, or selects a KV codec — a name from `ALL_KV_QUANTS` less `None`, or `DEFAULT_KV_QUANT`; everything else is `rest`. An empty derived codec-name set is a refusal, not an empty match. |
 | `gpu_validation_census.txt` | — | Data, not a script: the shader-validation hits `run_gpu_tests.sh` accepts, one entry per originating test — kernel, access kind, that test's count, crate, and the analysis it rests on. The expectation is the sum over the tests that ran; anything else fails naming the delta. |
 | `run_gpu_tests_selftest.sh` | `make gpu-runner-selftest` | Recall test for the runner's reporting: a shader-validation hit and a crate failure in the same run are both reported, the access mix is the one observed, every census-pin verdict fails (or passes) with its own reason, and the tracked pin parses against the real classifier's population. Stubbed crates, no GPU. |

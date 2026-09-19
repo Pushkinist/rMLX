@@ -46,9 +46,18 @@
 #   gate in the tree, and no number of snapshots changes that.
 #
 #   The shape is a block opened by a line reading an environment variable and
-#   closed by a `return` with no notice inside it. `RMLX_SKIP_GPU` is out of it:
-#   `scripts/run_gpu_tests.sh` refuses to start with that variable set, so a
-#   guard on it cannot stand a cell down in this suite.
+#   closed by a `return` that CARRIES NO VALUE, with no notice inside it.
+#   `return;`, a bare `return`, `return None;` and `return Ok(());` stand a cell
+#   down; `return Some(p);` or `return v.parse().unwrap_or(4096);` is a result,
+#   and a guard whose every exit carries one has answered rather than skipped —
+#   the two-env-key resolvers in this tree are that shape. The needle is not
+#   anchored at line start either, or a one-line guard body
+#   (`let Ok(p) = std::env::var("X") else { return; };`) reads as a block with
+#   no return in it at all.
+#
+#   `RMLX_SKIP_GPU` is out of it: `scripts/run_gpu_tests.sh` refuses to start
+#   with that variable set, so a guard on it cannot stand a cell down in this
+#   suite.
 #
 #   Its population is the DECLARING FILES of the classified GPU tests, not the
 #   test fns: such a guard is routinely in a file-local helper, and a rule
@@ -203,7 +212,7 @@ done <<< "$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
             closes = gsub(/\}/, "}", code)
             depth += opens - closes
             if (raw ~ /"/ && raw ~ ANY) notice = 1
-            if (code ~ /^[[:space:]]*return[;[:space:]]/ || code ~ /^[[:space:]]*return$/) ret = 1
+            if (code ~ /(^|[^A-Za-z0-9_])return([[:space:]]*(;|$)|[[:space:]]+(None|Ok\(\(\)\))[[:space:]]*;)/) ret = 1
             if (depth <= 0) {
                 if (ret && !notice)
                     printf "%s\t%d\t%s\t%s\n", FILE, gl, gfn, gtext
@@ -212,6 +221,11 @@ done <<< "$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
         }
     ' "${f}"
 done)"
+
+# Both kinds are printed before the single exit at the end. They co-occur — a
+# suite half-converted has one of each — and a gate that exits inside the first
+# block sends the reader back for the second one run later.
+red=0
 
 if [ "${n_silent}" -gt 0 ]; then
     echo "ERROR: ${n_silent} environment guard(s) in classified GPU tests' files stand a" >&2
@@ -224,7 +238,7 @@ if [ "${n_silent}" -gt 0 ]; then
     echo "A helper takes the caller's test name as an argument and prints" >&2
     echo "\`SKIP {test}: <why>\`; it cannot name itself, because no libtest filter" >&2
     echo "reaches a helper. See docs/TESTING.md." >&2
-    exit 1
+    red=1
 fi
 
 if [ "${n}" -gt 0 ]; then
@@ -235,6 +249,10 @@ if [ "${n}" -gt 0 ]; then
     echo "is INCOMPLETE with a number and no name. Write it as" >&2
     echo "  SKIP <this test fn>: <why>" >&2
     echo "See docs/TESTING.md." >&2
+    red=1
+fi
+
+if [ "${red}" = "1" ]; then
     exit 1
 fi
 

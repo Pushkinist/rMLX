@@ -43,6 +43,14 @@
 #   producer that read zero codec names would place every integration binary in
 #   `rest` and report a clean partition while the codec half guarded nothing.
 #
+#   Both the list and the needle read the line's CODE — comments removed and
+#   string bodies blanked, through `scripts/lib/awk_text.sh`, as the sibling
+#   source gates do. A commented-out `KvQuant::K8V8` is a codec the file no
+#   longer selects, and a codec named inside a string literal is text a program
+#   prints rather than a codec it constructs; either one placing a whole
+#   integration binary in the codec half would make the half a property of the
+#   prose in it.
+#
 #   `DEFAULT_KV_QUANT` is in the needle for the same reason. The suites that
 #   select their codec through it name no variant, so they sit in `rest` only
 #   for as long as that default is `None`. Reading the constant instead of its
@@ -65,6 +73,9 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="${REPO_ROOT}"
+
+# shellcheck source=lib/awk_text.sh
+. "${REPO_ROOT}/scripts/lib/awk_text.sh"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -91,12 +102,19 @@ fi
 # The variants of ALL_KV_QUANTS, less `None`. Read from the const's own body so
 # a codec added to the enum but not to that list is not a codec this can select
 # — it is not constructible through the list either.
-codec_names="$(awk '
+codec_names="$(awk "${AWK_TEXT_FNS}"'
+    { code = decomment($0) }
     /^pub const ALL_KV_QUANTS/ { in_list = 1; next }
     in_list && /^\];/ { in_list = 0 }
-    in_list && match($0, /KvQuant::[A-Za-z_][A-Za-z0-9_]*/) {
-        name = substr($0, RSTART + 9, RLENGTH - 9)
-        if (name != "None") print name
+    in_list {
+        # Every variant on the line, not the first: two on one line would
+        # otherwise narrow the set silently, which is the empty-set refusal
+        # below arriving one name at a time.
+        while (match(code, /KvQuant::[A-Za-z_][A-Za-z0-9_]*/)) {
+            name = substr(code, RSTART + 9, RLENGTH - 9)
+            if (name != "None") print name
+            code = substr(code, RSTART + RLENGTH)
+        }
     }
 ' "${QUANT_RS}" | sort -u)"
 
@@ -191,7 +209,10 @@ fi
 selects_codec=""
 while IFS= read -r file; do
     [ -n "${file}" ] || continue
-    if grep -Eq "${CODEC_NEEDLE}" "${file}" 2>/dev/null; then
+    if awk -v NEEDLE="${CODEC_NEEDLE}" "${AWK_TEXT_FNS}"'
+        blank_strings(decomment($0)) ~ NEEDLE { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "${file}" 2>/dev/null; then
         selects_codec="${selects_codec}${file}"$'\n'
     fi
 done < <(printf '%s\n' "${listing}" | cut -f3 | sort -u)

@@ -1295,6 +1295,22 @@ expect_placed rest rmlx-models flag_parses
 expect_placed rest rmlx-models none_is_pinned
 
 # ---------------------------------------------------------------------------
+# The half's marker line. It is the split's ONE structural defence — a half
+# narrows the classified population in lockstep with the executed one, so no
+# check inside the runner can tell a half from a complete run, and what keeps a
+# half-run's record honest is that it never reads `ci-perf ok`. Nothing else in
+# the tree greps that string, so without this case the marker can be replaced by
+# the whole gate's and every gate stays green.
+#
+# `make -n`: the recipe is read, nothing is executed, no GPU is touched.
+new_case half_marker_is_pinned || exit 1
+OUT="$(cd "${ROOT}" && make -n ci-perf HALF=codec 2>&1)"
+STATUS=$?
+expect_status 0
+expect_out "ci-perf codec-half ok — NOT the whole gate"
+expect_no_out "ci-perf ok"
+
+# ---------------------------------------------------------------------------
 # The harness's own positive control: with nothing wrong, the same stubs produce
 # a green run. Without this, every case above could be passing because the stub
 # crates never ran at all.

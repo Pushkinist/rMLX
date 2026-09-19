@@ -231,6 +231,10 @@ test-perf:       ## cargo test --profile release-perf (release-perf profile, pan
 # computes. The value is checked rather than its origin alone: an empty HALF=
 # on the command line has origin `command line` too, and would otherwise run
 # the whole gate while its final line claimed a half.
+# Checked at parse time, so `make lint HALF=bogus` errors too. That is the
+# cheaper of the two wrongs: a refusal on a target the value does not reach
+# costs a retype, and a value silently accepted on the two targets it does
+# reach costs a gate.
 GPU_HALF_ARG :=
 GPU_HALF_NAME :=
 ifeq ($(origin HALF),command line)

@@ -356,10 +356,11 @@ fn kv_bytes_grows_with_decode_length() {
 #[ignore]
 #[test]
 fn kv_bytes_counter_is_per_model_instance() {
-    let Some((model_a, tokenizer)) = load("kv_bytes_counter_is_per_model_instance") else {
+    const TEST: &str = "kv_bytes_counter_is_per_model_instance";
+    let Some((model_a, tokenizer)) = load(TEST) else {
         return;
     };
-    let Some((model_b, _)) = load("kv_bytes_counter_is_per_model_instance") else {
+    let Some((model_b, _)) = load(TEST) else {
         return;
     };
 
