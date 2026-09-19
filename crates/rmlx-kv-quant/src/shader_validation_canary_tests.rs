@@ -15,7 +15,8 @@ fn shader_validation_canary_emits_an_invalid_access_report() {
     // write into an MLX-owned buffer, which is not something to do for a test.
     if !shader_validation_enabled() {
         println!(
-            "SKIP shader_validation_canary: MTL_SHADER_VALIDATION is not set, so the \
+            "SKIP shader_validation_canary_emits_an_invalid_access_report: \
+             MTL_SHADER_VALIDATION is not set, so the \
              deliberate out-of-bounds store would be a real one."
         );
         return;

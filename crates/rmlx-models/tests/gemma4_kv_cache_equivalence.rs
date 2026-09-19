@@ -48,7 +48,7 @@ fn kv_cache_k8v4_prefill_decode_sane() {
     let model_path = if let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") {
         std::path::PathBuf::from(p)
     } else {
-        eprintln!("RMLX_KV_TEST_MODEL not set — skipping");
+        eprintln!("SKIP kv_cache_k8v4_prefill_decode_sane: RMLX_KV_TEST_MODEL not set");
         return;
     };
 
@@ -149,7 +149,7 @@ fn kv_cache_planar_prefill_decode_sane() {
     let model_path = if let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") {
         std::path::PathBuf::from(p)
     } else {
-        eprintln!("RMLX_KV_TEST_MODEL not set — skipping");
+        eprintln!("SKIP kv_cache_planar_prefill_decode_sane: RMLX_KV_TEST_MODEL not set");
         return;
     };
 
@@ -258,7 +258,7 @@ fn gemma4_partial_prefix_reuse_cold_equal() {
     let model_path = if let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") {
         std::path::PathBuf::from(p)
     } else {
-        eprintln!("RMLX_KV_TEST_MODEL not set — skipping");
+        eprintln!("SKIP gemma4_partial_prefix_reuse_cold_equal: RMLX_KV_TEST_MODEL not set");
         return;
     };
 
@@ -481,7 +481,7 @@ fn gemma4_b1_swa_snapshot_restore_multiturn_token_identical() {
     let model_path = if let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") {
         std::path::PathBuf::from(p)
     } else {
-        eprintln!("RMLX_KV_TEST_MODEL not set — skipping");
+        eprintln!("SKIP gemma4_b1_swa_snapshot_restore_multiturn_token_identical: RMLX_KV_TEST_MODEL not set");
         return;
     };
 

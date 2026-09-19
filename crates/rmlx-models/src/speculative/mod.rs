@@ -313,6 +313,21 @@ pub(crate) fn vocab_pairing_verdict(
     Ok(())
 }
 
+/// Whether the draft snapshot's tokenizer can stand in for the verifier's,
+/// read from the two snapshot directories.
+///
+/// [`SpeculativeDispatcher::load_speculative`] applies this before any weight is
+/// read. It is public because the gate that judges a two-model pair has to apply
+/// the same check on the same pair before it builds the dispatcher directly, and
+/// two readings of "is this a pair" that can disagree are worse than one.
+///
+/// # Errors
+/// [`Error::SpeculativePairing`] with the verdict's reason; [`Error::Model`]
+/// when either `tokenizer.json` cannot be read.
+pub fn vocab_pairing(verifier_dir: &Path, draft_dir: &Path) -> Result<()> {
+    vocab_pairing_verdict(&snapshot_vocab(verifier_dir)?, &snapshot_vocab(draft_dir)?)
+}
+
 /// Holds a verifier and, for the two-model path, a draft `Architecture`.
 ///
 /// When a draft is present:
@@ -412,7 +427,7 @@ impl SpeculativeDispatcher {
                 verifier_dir.display()
             )));
         }
-        vocab_pairing_verdict(&snapshot_vocab(verifier_dir)?, &snapshot_vocab(draft_dir)?)?;
+        vocab_pairing(verifier_dir, draft_dir)?;
         tracing::info!(
             verifier = %verifier_dir.display(),
             draft = %draft_dir.display(),

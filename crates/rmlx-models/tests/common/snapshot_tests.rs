@@ -25,7 +25,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{apply, choose, override_snapshot, slug_snapshot, Gate, GoldenModel, Role, Snapshot};
+use super::{
+    apply, choose, choose_by_slug, override_snapshot, slug_snapshot, Gate, GoldenModel, Role,
+    Snapshot,
+};
 
 const SLUG: &str = "vendor__model-8b-2bit";
 const ARCH: &str = "ExampleForCausalLM";
@@ -784,4 +787,139 @@ fn the_verdict_names_the_index_and_both_ids() {
         panic!("expected a write");
     };
     assert!(why.contains("index 1"), "{why}");
+}
+
+// ── the by-slug decision ─────────────────────────────────────────────────
+
+/// The variable a drafter is overridden by. Named here so the cases below read
+/// the same substitution the callers ask for.
+const DRAFT_VAR: &str = "RMLX_DRAFT_TEST_MODEL";
+
+/// The rule, in the configuration every cell on a machine holding the snapshots
+/// is in: the variable is unset and the slug arms the cell.
+///
+/// This is the case the whole change turns on. Before it, an unset variable was
+/// a stand-down and a host holding every snapshot still ran none of these cells.
+#[test]
+fn an_unset_override_leaves_the_slug_to_arm_the_cell() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = make_snapshot(root.path(), SLUG, ARCH);
+
+    assert_eq!(
+        choose_by_slug(
+            None,
+            slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+            DRAFT_VAR,
+        ),
+        Gate::Run {
+            path: dir,
+            note: None
+        }
+    );
+}
+
+/// The ranking. An override naming another runnable snapshot does not take the
+/// cell away from its own slug — that is the mispairing this order prevents.
+#[test]
+fn the_slug_outranks_an_override_that_also_resolves() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mine = make_snapshot(root.path(), SLUG, ARCH);
+    let theirs = make_snapshot(root.path(), "vendor__someone-elses-drafter", ARCH);
+
+    assert_eq!(
+        choose_by_slug(
+            override_snapshot(Some(as_str(&theirs)), Role::Standalone),
+            slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+            DRAFT_VAR,
+        ),
+        Gate::Run {
+            path: mine,
+            note: None
+        }
+    );
+}
+
+/// The fallback, and that it says so. A root that does not hold the slug is the
+/// one case the override decides, and reaching it disarms every other cell
+/// resolving from that root — so the note carries why.
+#[test]
+fn a_root_without_the_slug_falls_back_to_the_override_with_a_note() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let named = make_snapshot(elsewhere.path(), "named-by-hand", ARCH);
+
+    let Gate::Run { path, note } = choose_by_slug(
+        override_snapshot(Some(as_str(&named)), Role::Standalone),
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+        DRAFT_VAR,
+    ) else {
+        panic!("a named runnable snapshot must run");
+    };
+    assert_eq!(path, named);
+    let note = note.expect("the fallback must be announced");
+    assert!(note.contains(SLUG), "{note}");
+    assert!(note.contains(DRAFT_VAR), "{note}");
+}
+
+/// Nothing anywhere is a skip that names what is missing.
+///
+/// A root that exists without the slug names the root and the slug; with no
+/// root configured at all there is nothing to name but the variables, and the
+/// one named is this cell's rather than the harness's single override.
+#[test]
+fn neither_the_slug_nor_an_override_is_a_skip_naming_what_is_missing() {
+    let root = tempfile::tempdir().expect("tempdir");
+
+    let Gate::Skip(why) = choose_by_slug(
+        None,
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+        DRAFT_VAR,
+    ) else {
+        panic!("an absent slug with no override is a skip");
+    };
+    assert!(why.contains(SLUG), "{why}");
+
+    let Gate::Skip(why) =
+        choose_by_slug(None, slug_snapshot(None, SLUG, Role::Standalone), DRAFT_VAR)
+    else {
+        panic!("nothing configured is a skip");
+    };
+    assert!(why.contains(DRAFT_VAR), "{why}");
+    assert!(!why.contains(super::SINGLE_MODEL_VAR), "{why}");
+}
+
+/// A misconfigured root fails even though an override would have resolved: one
+/// keystroke there disarms every cell in the run, and falling through would
+/// reinstate the cross-pairing the slug is there to prevent.
+#[test]
+fn a_misconfigured_root_fails_rather_than_taking_the_override() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let named = make_snapshot(tmp.path(), "named-by-hand", ARCH);
+    let missing = tmp.path().join("no-such-root");
+
+    assert!(matches!(
+        choose_by_slug(
+            override_snapshot(Some(as_str(&named)), Role::Standalone),
+            slug_snapshot(Some(as_str(&missing)), SLUG, Role::Standalone),
+            DRAFT_VAR,
+        ),
+        Gate::Fail(_)
+    ));
+}
+
+/// An override the operator named and got wrong breaks the run rather than
+/// skipping it, and the message names their variable.
+#[test]
+fn an_unrunnable_override_fails_naming_this_cell_s_variable() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let nowhere = root.path().join("was-moved-away");
+
+    let Gate::Fail(why) = choose_by_slug(
+        override_snapshot(Some(as_str(&nowhere)), Role::Standalone),
+        slug_snapshot(Some(as_str(root.path())), SLUG, Role::Standalone),
+        DRAFT_VAR,
+    ) else {
+        panic!("a named path that is not a snapshot must fail");
+    };
+    assert!(why.contains(DRAFT_VAR), "{why}");
 }

@@ -48,9 +48,11 @@ const SLOTS: usize = 4;
 
 const CODEC: KvQuant = KvQuant::K8V8;
 
-fn load(var: &str) -> Option<(arch::Architecture, tokenizers::Tokenizer)> {
+/// `test` is the calling test's own fn name: the stand-down notice has to name
+/// a cell a libtest filter reaches, and this helper is not one.
+fn load(test: &str, var: &str) -> Option<(arch::Architecture, tokenizers::Tokenizer)> {
     let Ok(p) = std::env::var(var) else {
-        eprintln!("{var} not set — skipping prompt_cache_cross_model");
+        eprintln!("SKIP {test}: {var} not set");
         return None;
     };
     let path = PathBuf::from(p);
@@ -110,10 +112,11 @@ fn hits_misses(model: &arch::Architecture) -> (u64, u64) {
 #[ignore]
 #[test]
 fn second_model_of_the_same_arch_is_not_served_the_first_models_kv() {
-    let Some((model_a, tok_a)) = load("RMLX_PROMPT_CACHE_TEST_MODEL_A") else {
+    const TEST: &str = "second_model_of_the_same_arch_is_not_served_the_first_models_kv";
+    let Some((model_a, tok_a)) = load(TEST, "RMLX_PROMPT_CACHE_TEST_MODEL_A") else {
         return;
     };
-    let Some((model_b, _tok_b)) = load("RMLX_PROMPT_CACHE_TEST_MODEL_B") else {
+    let Some((model_b, _tok_b)) = load(TEST, "RMLX_PROMPT_CACHE_TEST_MODEL_B") else {
         return;
     };
     assert_eq!(

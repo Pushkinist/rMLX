@@ -118,6 +118,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         check-kv-byte-model-parity check-kv-byte-model-parity-fixtures \
         check-no-decode-swallow check-gpu-tests-ignored \
         check-gpu-tests-ignored-fixtures gpu-runner-selftest \
+        check-named-skip-notices check-named-skip-notices-fixtures \
         check-eval-lock check-eval-lock-fixtures eval-lock-stress \
         check-no-kernel-input-eval check-no-kernel-input-eval-fixtures \
         check-kernel-dtype-contract check-kernel-dtype-contract-fixtures \
@@ -226,6 +227,26 @@ build-debug:     ## cargo build --profile release-debug (opt-level=3 + full DWAR
 test-perf:       ## cargo test --profile release-perf (release-perf profile, panic=unwind forced by cargo for test harness)
 	cargo test --workspace --profile release-perf
 
+# HALF selects one side of the GPU-suite partition scripts/gpu_test_halves.sh
+# computes. The value is checked rather than its origin alone: an empty HALF=
+# on the command line has origin `command line` too, and would otherwise run
+# the whole gate while its final line claimed a half.
+# Checked at parse time, so `make lint HALF=bogus` errors too. That is the
+# cheaper of the two wrongs: a refusal on a target the value does not reach
+# costs a retype, and a value silently accepted on the two targets it does
+# reach costs a gate.
+GPU_HALF_ARG :=
+GPU_HALF_NAME :=
+ifeq ($(origin HALF),command line)
+ifeq ($(filter codec rest,$(HALF)),)
+$(error HALF='$(HALF)' is not a half — expected codec or rest)
+endif
+GPU_HALF_ARG := --half $(HALF)
+GPU_HALF_NAME := $(HALF)
+endif
+CI_PERF_OK := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half ok — NOT the whole gate,ci-perf ok)
+CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMPLETE,ci-perf INCOMPLETE)
+
 # ci-perf runs the GPU/Metal suite after `test-perf`, and it is the only shared
 # gate that does. `make ci` cannot: the GPU tests need the Metal context to
 # themselves (hard rule 8) and take minutes, which is the wrong price on every
@@ -261,6 +282,19 @@ test-perf:       ## cargo test --profile release-perf (release-perf profile, pan
 # so the runner's own coverage check cannot tell that run from a complete one.
 # The knobs stay on `gpu-test`, where a human asking for a subset means it.
 #
+# HALF is the one exception, and it is deliberate: `make ci-perf HALF=codec`
+# runs one side of the partition and SAYS SO, on the last line and on every
+# final line the runner printed. It has the same narrowing property as CRATE —
+# a half's classified set shrinks in lockstep with its executed one — so what
+# makes it safe is not a check the runner can do but the fact that the record
+# of the run never reads `ci-perf ok`. What HALF may do: select `codec` or
+# `rest`. What it may not: anything else, including the empty string, which is
+# refused rather than falling through to the whole gate under a name that says
+# otherwise. An accidentally exported HALF reaches Make with origin
+# `environment` and is ignored; that closes the stale-export case and nothing
+# more — `MAKEFLAGS=HALF=codec` arrives as `command line`, and so does a
+# wrapper. The last line is what makes that harmless.
+#
 # The two halves run under different profiles on purpose. The GPU run builds
 # under `dev`, where debug assertions are live — 61 `debug_assert!` sites in
 # rmlx-kv-quant alone — and those are correctness guards on correctness tests.
@@ -269,21 +303,21 @@ test-perf:       ## cargo test --profile release-perf (release-perf profile, pan
 # runs a GPU test with debug-assertions off, so a defect that only appears there
 # has to be reproduced by hand.
 #
-# Cost: the GPU half is ~4.5 min warm (318 tests, serialized, under Metal shader
-# validation). Whole target after a codec-layer edit, measured: ~21 min. The dev
-# profile is not shared with `test-perf` and is what `make target-gc` prunes
-# first, so a run after a GC pays a cold opt-level-0 build on top. See
-# docs/TESTING.md.
-ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (separate from make ci; run before merging perf-sensitive or codec-layer changes)
+# Cost: the GPU suite is 383 tests, serialized, under Metal shader validation,
+# and one measured whole run of it took 279 min on a host holding every
+# snapshot — which is what HALF exists for. The dev profile is not shared with
+# `test-perf` and is what `make target-gc` prunes first, so a run after a GC
+# pays a cold opt-level-0 build on top. See docs/TESTING.md.
+ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (HALF=codec|rest runs one side of the partition; separate from make ci)
 	@bash scripts/run_gpu_tests.sh --preflight
 	$(MAKE) test-perf
 	@log="$$(mktemp)"; rc="$$(mktemp)"; \
-	{ bash scripts/run_gpu_tests.sh; echo $$? >"$$rc"; } | tee "$$log"; \
+	{ bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG); echo $$? >"$$rc"; } | tee "$$log"; \
 	code="$$(cat "$$rc")"; rm -f "$$rc"; \
 	if [ "$$code" -ne 0 ]; then rm -f "$$log"; exit "$$code"; fi; \
 	if grep -q INCOMPLETE "$$log"; then \
-	  echo "ci-perf INCOMPLETE — the GPU suite did not run every gate it names (see above)"; \
-	else echo "ci-perf ok"; fi; \
+	  echo "$(CI_PERF_INCOMPLETE) — the GPU suite did not run every gate it names (see above)"; \
+	else echo "$(CI_PERF_OK)"; fi; \
 	rm -f "$$log"
 
 # gpu-test: the execution step for the tests `check-gpu-tests-ignored` mandates.
@@ -315,8 +349,8 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 # or any store fails and names the delta. That is what keeps a standing
 # diagnostic from a kernel we do not own out of the exit code, where it would
 # train everyone to read a red run as noise.
-gpu-test:        ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation (CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation); needs exclusive machine access
-	@bash scripts/run_gpu_tests.sh $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
+gpu-test:        ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation); needs exclusive machine access
+	@bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG) $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
 		$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
 
 # model-check: run only the model-logic crates (rmlx-models, rmlx-runtime,
@@ -535,6 +569,12 @@ check-gpu-tests-ignored-fixtures: ## CI gate: the #[ignore] gate still fires on 
 gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a shader-validation hit in the same run, reports the access mix it saw, and reaches every census-pin verdict (stubbed crates, no GPU)
 	@bash scripts/run_gpu_tests_selftest.sh
 
+check-named-skip-notices: ## CI gate: a classified GPU test that announces its own stand-down names itself, so the runner can attribute it
+	@bash scripts/check_named_skip_notices.sh
+
+check-named-skip-notices-fixtures: ## CI gate: recall test for the above, 13 synthetic roots, each asserting the reason as well as the exit code
+	@bash scripts/check_named_skip_notices_fixtures.sh
+
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
 	@bash scripts/check_no_kernel_input_eval.sh
 
@@ -584,6 +624,8 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@bash scripts/check_gpu_tests_ignored.sh
 	@bash scripts/check_gpu_tests_ignored_fixtures.sh
 	@bash scripts/run_gpu_tests_selftest.sh
+	@bash scripts/check_named_skip_notices.sh
+	@bash scripts/check_named_skip_notices_fixtures.sh
 	@bash scripts/check_no_kernel_input_eval.sh
 	@bash scripts/check_no_kernel_input_eval_fixtures.sh
 	@bash scripts/check_kernel_dtype_contract.sh
