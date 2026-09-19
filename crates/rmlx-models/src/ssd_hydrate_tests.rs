@@ -78,11 +78,14 @@ use rmlx_kv_ssd::{
 };
 
 use crate::bitnet::prompt_cache::BitNetEntry;
+use crate::gemma3::prompt_cache::Gemma3Entry;
 use crate::gemma4::prompt_cache::Gemma4Entry;
 use crate::laguna::prompt_cache::LagunaEntry;
 use crate::prompt_cache::PromptCacheEntry;
+use crate::qwen2::prompt_cache::Qwen2Entry;
 use crate::qwen3::Qwen3Entry;
 use crate::qwen3_5_moe::prompt_cache::Qwen35MoeEntry;
+use crate::qwen3_vl_moe::prompt_cache::Qwen3VlMoeEntry;
 
 /// The codec every fixture spills under. `K8V8` keeps a packed store that
 /// survives the round trip byte for byte, which is what makes a per-layer
@@ -373,39 +376,46 @@ fn request_longer_than(stored: &[u32]) -> Vec<u32> {
 
 // ── pure attention, kv_h == 1 ───────────────────────────────────────────────
 
-/// A `kv_h == 1` pure-attention entry gets back every layer it spilled, in
-/// order, with the same bytes, and the block's tokens.
+/// Spill `layers` distinguishable layers at `kv_h`, hydrate them back as `E`,
+/// and read everything the entry is supposed to carry.
 ///
-/// `kv_h == 1` is the shared-KV-head shape (gemma4-e2b and friends); the
-/// layer-major byte layout collapses differently there than at `kv_h > 1`, so
-/// a hydrate that mixes up its per-layer slicing can hold at one and fail at
-/// the other.
-#[test]
-#[allow(
-    clippy::expect_used,
-    reason = "test: a hydrate that misses where the fixture just spilled is the failure under test and must abort loudly"
-)]
-fn laguna_entry_restores_every_layer_in_order_at_kv_h_1() {
-    let ns = Namespace::new("laguna-kv-h-1");
-    let kv = vec![
-        kv_layer(BLOCK_TOKENS as i32, 1, 0xA1),
-        kv_layer(BLOCK_TOKENS as i32, 1, 0xB2),
-        kv_layer(BLOCK_TOKENS as i32, 1, 0xC3),
-    ];
+/// One body, every pure-attention entry. The per-arch tests below differ only
+/// in the entry type and the shape, which is the whole point: the impls they
+/// exercise differ only in the entry type too, so a copy per arch would be the
+/// duplication this oracle exists to retire.
+fn round_trip<E>(tag: &str, kv_h: i32, layers: usize)
+where
+    E: PromptCacheEntry,
+    SsdHydrator: SsdHydrate<E>,
+{
+    #[allow(
+        clippy::expect_used,
+        reason = "test: a hydrate that misses where the fixture just spilled is the failure under test and must abort loudly"
+    )]
+    fn hydrate_or_panic<E>(h: &SsdHydrator, req: &[u32], seed: u64) -> E
+    where
+        SsdHydrator: SsdHydrate<E>,
+    {
+        h.hydrate(req, seed, QUANT, DispatchPolicy::default())
+            .expect("hydrate must not error")
+            .expect("the block the fixture spilled must be found")
+    }
+
+    let ns = Namespace::new(tag);
+    // Each layer gets its own data, so the ordered comparison below has
+    // something to be wrong about.
+    let kv: Vec<KvCache> = (0..layers)
+        .map(|i| kv_layer(BLOCK_TOKENS as i32, kv_h, 0xA1 ^ (i as u64) << 8))
+        .collect();
     let stored = ids(BLOCK_TOKENS);
     let s = spill(&ns, LAYOUT_KEY, &stored, &kv, &[]);
     assert_pairwise_distinct(&s.kv_digests);
 
-    let h = hydrator(&ns, LAYOUT_KEY);
-    let entry: LagunaEntry = h
-        .hydrate(
-            &request_longer_than(&stored),
-            s.seed,
-            QUANT,
-            DispatchPolicy::default(),
-        )
-        .expect("hydrate must not error")
-        .expect("the block the fixture spilled must be found");
+    let entry: E = hydrate_or_panic(
+        &hydrator(&ns, LAYOUT_KEY),
+        &request_longer_than(&stored),
+        s.seed,
+    );
 
     assert_eq!(
         digest_layers(entry.kv_caches(), Device::Cpu),
@@ -425,54 +435,46 @@ fn laguna_entry_restores_every_layer_in_order_at_kv_h_1() {
     assert!(entry.is_ssd_hydrated(), "{HYDRATED_FLAG}");
 }
 
-// ── pure attention, kv_h > 1 ────────────────────────────────────────────────
+/// `kv_h == 1` — the shared-KV-head shape (gemma4-e2b and friends).
+///
+/// The layer-major byte layout collapses differently at one KV head, so a
+/// hydrate that mixes up its per-layer slicing can hold here and fail at
+/// `kv_h > 1`.
+#[test]
+fn laguna_entry_restores_every_layer_in_order_at_kv_h_1() {
+    round_trip::<LagunaEntry>("laguna-kv-h-1", 1, 3);
+}
 
-/// The same oracle at `kv_h > 1`, on the entry that carries an extra field
-/// beyond the shared seven.
+/// `kv_h > 1`, on the entry that carries an extra field beyond the shared
+/// seven.
 ///
 /// `Qwen3Entry` sets `first_logprobs: None` on top of what the other
-/// pure-attention entries set. A blanket impl has to keep that field's hydrate
-/// value, which is what makes this entry the one worth reading at the second
-/// shape.
+/// pure-attention entries set. A shared body has to keep that field's hydrate
+/// value.
 #[test]
-#[allow(
-    clippy::expect_used,
-    reason = "test: a hydrate that misses where the fixture just spilled is the failure under test and must abort loudly"
-)]
 fn qwen3_entry_restores_every_layer_in_order_at_kv_h_4() {
-    let ns = Namespace::new("qwen3-kv-h-4");
-    let kv = vec![
-        kv_layer(BLOCK_TOKENS as i32, 4, 0xD4),
-        kv_layer(BLOCK_TOKENS as i32, 4, 0xE5),
-        kv_layer(BLOCK_TOKENS as i32, 4, 0xF6),
-        kv_layer(BLOCK_TOKENS as i32, 4, 0x17),
-    ];
-    let stored = ids(BLOCK_TOKENS);
-    let s = spill(&ns, LAYOUT_KEY, &stored, &kv, &[]);
-    assert_pairwise_distinct(&s.kv_digests);
+    round_trip::<Qwen3Entry>("qwen3-kv-h-4", 4, 4);
+}
 
-    let h = hydrator(&ns, LAYOUT_KEY);
-    let entry: Qwen3Entry = h
-        .hydrate(
-            &request_longer_than(&stored),
-            s.seed,
-            QUANT,
-            DispatchPolicy::default(),
-        )
-        .expect("hydrate must not error")
-        .expect("the block the fixture spilled must be found");
+/// The three entries that had no fixture of their own.
+///
+/// They are not spares. The collapse replaces each of their bodies with one
+/// short constructor, and nothing else in the tree reads what those
+/// constructors return. An arch whose entry is only ever exercised by the
+/// compiler is an arch whose hydrate can be wrong in release and green in CI.
+#[test]
+fn gemma3_entry_restores_every_layer_in_order() {
+    round_trip::<Gemma3Entry>("gemma3", 2, 3);
+}
 
-    assert_eq!(
-        digest_layers(entry.kv_caches(), Device::Cpu),
-        s.kv_digests,
-        "every layer must come back, in the order it was spilled, byte for byte"
-    );
-    assert_eq!(
-        entry.prompt_token_ids(),
-        s.prompt_ids.as_slice(),
-        "the entry's tokens are the block's tokens"
-    );
-    assert!(entry.is_ssd_hydrated(), "{HYDRATED_FLAG}");
+#[test]
+fn qwen2_entry_restores_every_layer_in_order() {
+    round_trip::<Qwen2Entry>("qwen2", 1, 3);
+}
+
+#[test]
+fn qwen3_vl_moe_entry_restores_every_layer_in_order() {
+    round_trip::<Qwen3VlMoeEntry>("qwen3-vl-moe", 8, 3);
 }
 
 // ── hybrid ──────────────────────────────────────────────────────────────────
@@ -654,6 +656,95 @@ fn the_entry_carries_the_blocks_tokens_not_the_requests() {
         BLOCK_TOKENS as i32,
         "and its KV is that prefix's length, not the request's"
     );
+}
+
+// ── the census ──────────────────────────────────────────────────────────────
+
+/// Every arch that hydrates has a fixture in this file.
+///
+/// The eight entry types are read out of the tree, not listed here. A ninth
+/// arch that adds an `impl SsdHydrate<…>` and no fixture fails this test with
+/// its own name in the message, instead of joining the three entries that sat
+/// uncovered until the mutation run found them.
+///
+/// The coverage check is textual on purpose. Rust has no way to ask which
+/// types a test module instantiated, and a hand-kept list is the thing this
+/// test exists to replace. The needles are built from the scanned name, so no
+/// literal in this file can satisfy one by accident — a fixture has to name
+/// its entry type, in a turbofish or in a binding, for the name to be found.
+///
+/// The scan skips test sources the same way `scripts/lib/debt_report.py` does:
+/// a `tests` path component, a `tests.rs`, or a `*_tests.rs`. The mock impls
+/// in `prompt_cache_tests.rs` and `qwen3_tests.rs` are therefore out, and this
+/// file is out of its own scan.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: a source tree this test cannot read is a broken checkout and must abort loudly"
+)]
+fn every_arch_that_hydrates_has_a_fixture_here() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut entries = Vec::new();
+    collect_hydrate_impls(&src, &mut entries);
+    entries.sort();
+    entries.dedup();
+
+    assert!(
+        entries.len() >= 8,
+        "the scan found {} hydrate impls; it used to find eight, so it has \
+         stopped reading the tree rather than the tree having shrunk: {entries:?}",
+        entries.len()
+    );
+
+    // A fixture names its entry either as a turbofish on the shared round
+    // trip or as the type of the binding it hydrates into. Both needles are
+    // built from the scanned name, so nothing written here can satisfy one by
+    // accident.
+    let this_file = include_str!("ssd_hydrate_tests.rs");
+    let uncovered: Vec<&String> = entries
+        .iter()
+        .filter(|name| {
+            !this_file.contains(&format!("<{name}>")) && !this_file.contains(&format!(": {name} ="))
+        })
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "these arch entries hydrate but have no fixture in this file: \
+         {uncovered:?}. Add one `round_trip::<Entry>(…)` per name, or a test \
+         that reads whatever that entry carries beyond the shared fields."
+    );
+}
+
+/// Push the `E` of every `impl SsdHydrate<E> for …` in the non-test sources
+/// under `dir` onto `out`.
+#[allow(
+    clippy::expect_used,
+    reason = "test: a source tree this test cannot read is a broken checkout and must abort loudly"
+)]
+fn collect_hydrate_impls(dir: &std::path::Path, out: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).expect("read crate sources") {
+        let path = entry.expect("read dir entry").path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if path.is_dir() {
+            if name != "tests" {
+                collect_hydrate_impls(&path, out);
+            }
+            continue;
+        }
+        if !name.ends_with(".rs") || name == "tests.rs" || name.ends_with("_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source file");
+        for line in text.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("impl SsdHydrate<") else {
+                continue;
+            };
+            let Some(ty) = rest.split_once('>').map(|(ty, _)| ty) else {
+                continue;
+            };
+            out.push(ty.to_owned());
+        }
+    }
 }
 
 // ── the miss branch ─────────────────────────────────────────────────────────

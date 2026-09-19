@@ -663,7 +663,7 @@ arch reads.
 ### The oracle
 
 `crates/rmlx-models/src/ssd_hydrate_tests.rs` reads the entry the arch impl
-returns. Eight tests, all on `Device::Cpu`, none `#[ignore]`. The whole
+returns. Twelve tests, all on `Device::Cpu`, none `#[ignore]`. The whole
 spill/hydrate chain is device-parameterised, so no test here takes a Metal
 context.
 
@@ -681,34 +681,36 @@ tests use — is `#[cfg(test)]` of that crate and unreachable from
 and one-shot. A unique namespace is the hermetic unit that is available, and
 the fixture removes its directory on drop.
 
-Coverage: `LagunaEntry` at `kv_h == 1`, `Qwen3Entry` at `kv_h == 4`,
-`Qwen35MoeEntry` (hybrid, with linear state), `Gemma4Entry` and `LagunaEntry`
-as the topology pair, `BitNetEntry` for the block-aligned token rule, and a
-two-block fixture for the longest-prefix rule. `Gemma3Entry`, `Qwen2Entry` and
-`Qwen3VlMoeEntry` have no test of their own.
+Coverage is every entry that hydrates, and the file does not take that on
+trust. `every_arch_that_hydrates_has_a_fixture_here` scans the crate's
+non-test sources for `impl SsdHydrate<E>` blocks — skipping test paths the
+same way `scripts/lib/debt_report.py` does — and fails, naming the type, for
+any `E` this file never mentions. A ninth arch that adds an impl and no
+fixture is red rather than silent. The needles are built from the scanned
+name, so nothing written in the file can satisfy one by accident.
 
-**Cost, and where it goes.** These tests take the `rmlx-models` lib suite from
-41 s to 171 s. That is a real figure on `make test` and on `make ci`, and it
-is almost entirely one fixed cost that is not this file's arithmetic.
+Eight entries, eight fixtures: `LagunaEntry` at `kv_h == 1`, `Qwen2Entry` at
+`kv_h == 1`, `Gemma3Entry` at `kv_h == 2`, `Qwen3Entry` at `kv_h == 4`,
+`Qwen3VlMoeEntry` at `kv_h == 8`, `Qwen35MoeEntry` (hybrid, with linear
+state), `Gemma4Entry` in the topology pair, and `BitNetEntry` for the
+block-aligned token rule. A two-block fixture covers the longest-prefix rule.
 
-The first `Array` construction in a fresh test binary blocks for **73 s** on
-this machine, measured directly: `arr 72.8s` for the first call, `arr 76 µs`
-for the second. Every later MLX call in the file is sub-millisecond — a
-`KvCache::update` is 1.0 ms, a K-plus-V dequant probe 0.2 ms. The whole
-fixture work of all eight tests is under a second.
+The five pure-attention round trips share one generic body, `round_trip::<E>`.
+The impls they exercise differ only in the entry type, so a copy per arch
+would be the duplication this work exists to retire.
 
-The cost is a property of the machine, not of this file. The pre-existing
-MLX-touching CPU tests in `rmlx-kv-ssd` pay the same: its hydrate tests take
-77 s and its whole lib suite 70 s, for 118 tests that do far less work than
-that figure suggests. What changed is which binary pays it. Before this file
-the `rmlx-models` lib suite never touched MLX, which is why 891 tests ran in
-41 s.
+**Cost.** None that is measurable. On an idle machine, three rounds each:
+the `rmlx-models` lib suite runs in 29.8–30.2 s without these tests and
+29.9–30.0 s with them. The file on its own also takes 29.7 s, which is the
+same fixed per-binary cost showing through — the twelve tests' own work does
+not rise above the noise.
 
-Two of the 130 s are therefore separable: about 73 s is the one MLX
-first-touch the binary now pays, and the rest appears while that
-initialisation runs against 891 other tests on a loaded machine. The second
-part is not attributed further here. Reducing the test count would not move
-either: the cost is once per process, not once per test.
+Measure this on a quiet machine or not at all. An earlier reading of the same
+pair, taken while several `cargo` jobs of a mutation run were competing for
+the same cores, reported 41 s against 171 s and pointed at a 73 s first
+`Array` construction. Both numbers were contention. The instrumented figures
+that survive an idle re-run are the small ones: a `KvCache::update` is about
+1 ms, a K-plus-V dequant probe about 0.2 ms.
 
 ### Mutation list
 
@@ -728,27 +730,39 @@ Each mutation was applied by hand to the current tree, run, and reverted.
 | The `layout_key` salt changes | the value pin in `crates/rmlx-kv-ssd/src/ssd_tier_tests.rs` | red |
 | The `cache_seed` formula changes | the value pin in `crates/rmlx-kv-ssd/src/hashing_tests.rs` | red |
 | The index stops matching rows on the layout key (its `AND layout_key = ?` clause deleted) | `a_block_does_not_hydrate_under_a_different_layout_key` | red |
-| An entry impl no test reads is wrong (`Qwen2Entry` drops a layer) | none | **green — see below** |
+| An entry impl that had no fixture is wrong (`Qwen2Entry`, `Gemma3Entry`, `Qwen3VlMoeEntry` each drop a layer) | that arch's own `round_trip` fixture | red |
+| A ninth arch adds an `impl SsdHydrate<…>` and no fixture | `every_arch_that_hydrates_has_a_fixture_here` | red |
+| A new arch declares the wrong `SHARES_KV` | none | **green — see below** |
 
 ### The mutation the oracle cannot catch
 
-An entry impl that no test reads. `Gemma3Entry`, `Qwen2Entry` and
-`Qwen3VlMoeEntry` have no fixture here. Dropping a layer inside `Qwen2Entry`'s
-reconstruction leaves all eight tests green, and it still will after the
-collapse, because each arch keeps its own `from_hydrated` body and its own
-`SHARES_KV`. The arch set is fixed at compile time, so a new arch that forgets
-the trait fails to build — but one that supplies a wrong topology constant
-passes.
+A new arch that declares the wrong `SHARES_KV`.
 
-The digest-salt gap that used to sit here is closed. Before, no test anywhere
-pinned the **output** of `compute_layout_key` or `cache_seed` for a fixed
-input; the existing tests check determinism and separation, and both stay true
-under an added salt term. Two value pins now name the numbers, so a salt bump
-is red in-process rather than only after a restart. A cross-restart run still
-matters and is a separate obligation: the pins hold the formula, not the bytes
-already on disk. `crates/rmlx-server/tests/ssd_cache_restart.rs` is the probe
-that reads blocks a previous process wrote, and `docs/SSD_CANARY.md` carries
-the warm-restart hit rate a moved key drops to zero.
+The topology pair reads gemma4 against laguna, and a `const` block above it
+refuses to compile if those two ever stop spanning both values. Neither
+covers a ninth arch. Its fixture is compulsory — the census makes sure of
+that — and its layers, tokens and flag all get read, but nothing compares its
+topology constant against the arch's own `SHARES_KV_ACROSS_LAYERS`. The two
+can disagree and every test passes.
+
+What would close it is a test over the entry trait itself, asserting
+`E::SHARES_KV` equals what `Architecture::shares_kv_across_layers` returns for
+that arch. The constant does not exist until the collapse lands, so that test
+belongs to the change that introduces it.
+
+Two gaps that used to sit here are closed. An entry impl no test read is
+covered now: `Gemma3Entry`, `Qwen2Entry` and `Qwen3VlMoeEntry` have fixtures,
+and dropping a layer in any of the three is red. The digest-salt gap is closed
+by two value pins — before them, no test anywhere pinned the **output** of
+`compute_layout_key` or `cache_seed` for a fixed input, and the existing tests
+compare one key against another from the same build, so all of them stay true
+under an added salt term.
+
+A cross-restart run is a separate obligation either way: the pins hold the
+formula, not the bytes already on disk.
+`crates/rmlx-server/tests/ssd_cache_restart.rs` is the probe that reads blocks
+a previous process wrote, and `docs/SSD_CANARY.md` carries the warm-restart
+hit rate a moved key drops to zero.
 
 ---
 
