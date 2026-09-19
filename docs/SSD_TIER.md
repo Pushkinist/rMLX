@@ -541,6 +541,172 @@ Corruption is always handled as a graceful miss: the bad file and row are
 deleted, a `warn!` is emitted, and the caller falls through to a full prefill.
 The hydrator never panics.
 
+### The per-arch entry impls
+
+`SsdHydrate<E>` is implemented once per arch entry type, on `SsdHydrator`.
+There are eight blocks. Seven cover pure-attention entries and one covers the
+hybrid entry.
+
+| File | `hydrate` body lines |
+|---|---|
+| `crates/rmlx-models/src/bitnet/prompt_cache.rs` | 27 |
+| `crates/rmlx-models/src/gemma3/prompt_cache.rs` | 27 |
+| `crates/rmlx-models/src/gemma4/prompt_cache.rs` | 28 |
+| `crates/rmlx-models/src/laguna/prompt_cache.rs` | 27 |
+| `crates/rmlx-models/src/qwen2/prompt_cache.rs` | 27 |
+| `crates/rmlx-models/src/qwen3.rs` | 29 |
+| `crates/rmlx-models/src/qwen3_vl_moe/prompt_cache.rs` | 27 |
+| `crates/rmlx-models/src/qwen3_5_moe/prompt_cache.rs` | 29 (hybrid) |
+
+The seven pure-attention bodies are one body. Three of them — laguna, gemma3
+and bitnet — are byte-identical once the arch name is removed from their
+identifiers. `qwen3_vl_moe` differs from them by one comment. `qwen3` differs
+by two lines, because `Qwen3Entry` carries a `first_logprobs` field the other
+entries do not. `gemma4` differs by the one line that matters: it passes its
+own `SHARES_KV_ACROSS_LAYERS` where the other six pass a literal `false`.
+
+`scripts/debt_report.sh` has no population over these bodies. Measured by hand
+with the same producer the rotor populations use
+(`scripts/lib/debt_report.py`'s `normalize` + `matched_lines`, all pairs, one
+family):
+
+```text
+ssd hydrate twins (crates/rmlx-models/src): 670 matched lines over 221 body lines (8 item(s), 28 pair(s))
+```
+
+### What a shared hydrate body must still express
+
+The issue's sketch is `fn from_layers(layers: Vec<KvCache>, tokens: Vec<u32>)`.
+That signature cannot carry everything the seven bodies set. A shared body
+also hands over the recomputed `block_hashes`, the request's `kv_quant`, and
+the `is_ssd_hydrated` flag. `Qwen3Entry` sets `first_logprobs: None` on top of
+those.
+
+The cross-layer-KV topology is not a field of the entry. It is an argument of
+`SsdHydrator::lookup_seeded`, and it lands on every restored `KvCache`. Today
+gemma4 is the only arch that passes `true`; `Architecture::shares_kv_across_layers`
+already dispatches the same fact for other callers. A shared body therefore
+needs the flag from the entry trait — an associated `const` reading the arch's
+own `SHARES_KV_ACROSS_LAYERS` — and must not hard-code either value. A
+hard-coded `false` drops a bf16 mirror gemma4 reads after a tail extension. A
+hard-coded `true` builds a mirror no other arch reads.
+
+A blanket `impl<E: PureAttentionEntry> SsdHydrate<E> for SsdHydrator` is legal
+beside the concrete `impl SsdHydrate<TestEntry> for SsdHydrator` in
+`crates/rmlx-models/src/prompt_cache_tests.rs`. `TestEntry` does not implement
+the entry trait, and the coherence check accepts that for a local type. It
+becomes `E0119` the moment a test type implements both.
+
+### Invariants — what the change must not move
+
+- **The hydrated bytes per layer.** Each restored `KvCache` holds the bytes the
+  block stored, at the layer index it stored them at.
+- **The token vector.** The entry carries the block-aligned prefix the tier
+  stored, never the request's full prompt.
+- **The hybrid entry's linear-attention state.** `Qwen35MoeEntry` restores
+  `lin_caches` beside `kv_caches`. A pure-attention body discards them.
+- **The `layout_key` and the digest salt.** A salt bump invalidates every block
+  every installed binary wrote. This change has no reason to touch either.
+- **The hit/miss branch.** A true miss stays `Ok(None)`, and corruption stays a
+  graceful miss.
+- **The `rmlx-kv-ssd` dependency edges.** `crates/rmlx-kv-ssd/Cargo.toml`
+  depends on `rmlx-core`, `rmlx-mlx`, `rmlx-kv-quant` and `rmlx-metrics`. It
+  gains no dependency on `rmlx-models`. The entry trait and the blanket impl
+  both live in `rmlx-models`.
+
+### The oracle
+
+`crates/rmlx-models/src/ssd_hydrate_tests.rs` reads the entry the arch impl
+returns. Seven tests, all on `Device::Cpu`, none `#[ignore]`. The whole
+spill/hydrate chain is device-parameterised, so no test here takes a Metal
+context.
+
+Each fixture spills a known block under a unique namespace below
+`rmlx_core::paths::kv_cache_dir`, then hydrates it back through the arch impl
+and compares per-layer FNV-1a-64 digests of the K and V dequants. The digests
+are round-trip, not literal constants, so a codec change does not turn them
+red. Every fixture first asserts its own layers are pairwise distinguishable,
+so a hydrate that drops or reorders a layer cannot pass by accident.
+
+`SsdHydrator::with_index` — the hermetic constructor the `rmlx-kv-ssd` unit
+tests use — is `#[cfg(test)]` of that crate and unreachable from
+`rmlx-models`. `rmlx_core::paths::home()` caches its resolution in a
+`OnceLock`, so an environment override set from a test is both process-global
+and one-shot. A unique namespace is the hermetic unit that is available, and
+the fixture removes its directory on drop.
+
+Coverage: `LagunaEntry` at `kv_h == 1`, `Qwen3Entry` at `kv_h == 4`,
+`Qwen35MoeEntry` (hybrid, with linear state), `Gemma4Entry` and `LagunaEntry`
+as the topology pair, and `BitNetEntry` for the block-aligned token rule.
+`Gemma3Entry`, `Qwen2Entry` and `Qwen3VlMoeEntry` have no test of their own.
+
+### Mutation list
+
+Each mutation was applied by hand to the current tree, run, and reverted.
+
+| Mutation | Assertion that catches it | Result |
+|---|---|---|
+| The body drops a layer | per-layer digest list length and contents, `laguna_entry_restores_every_layer_in_order_at_kv_h_1` | red |
+| The body reverses the layers | the same digest list, ordered | red |
+| The entry takes the request's tokens, not the block's | `prompt_token_ids` against the stored prefix, in every entry test | red |
+| The reconstruction swaps the per-layer shape terms (`offset` against `layer_idx`) | the digest folds `seq_len`; red at both `kv_h == 1` and `kv_h > 1` | red |
+| The probe moves the layout key | `a_block_does_not_hydrate_under_a_different_layout_key`, plus every hit test | red |
+| The hybrid entry loses its linear state | `qwen3_5_moe_entry_restores_the_linear_state_beside_the_kv` | red |
+| gemma4's body hard-codes the topology flag to `false` | `each_arch_hydrates_under_its_own_cross_layer_kv_topology` | red |
+| The body clears `is_ssd_hydrated` | the flag assertion in every entry test | red |
+| The `layout_key` salt changes | none | **green — see below** |
+
+### The mutation the oracle cannot catch
+
+Adding a term to `compute_layout_key` leaves every test green. The fixtures
+spill and hydrate inside one process under one key, so a changed salt stays
+self-consistent. Only a probe that reads blocks an earlier binary wrote can
+see it.
+
+Two coverage gaps sit beside it. `Gemma3Entry`, `Qwen2Entry` and
+`Qwen3VlMoeEntry` are not read by any test here, so a defect that enters
+through one of their own trait impls passes. The arch set is also fixed at
+compile time: a new arch that forgets its entry trait impl fails to build, but
+a new arch that supplies a wrong topology constant passes.
+
+### Deferred proof
+
+The integration run that closes the salt gap is not part of this change. It
+must show:
+
+1. `crates/rmlx-server/tests/ssd_cache_restart.rs` green on one pure-attention
+   arch and on Qwen3.6 (hybrid), with the hydrate happening in a **second**
+   process reading the first process's blocks.
+2. The warm-restart SSD hit rate unchanged against the reading in
+   `docs/SSD_CANARY.md`. A hit rate that drops to zero is the signature of a
+   moved key.
+
+### Removals the implementing chunk owes
+
+- The seven pure-attention `impl SsdHydrate<…Entry> for SsdHydrator` blocks.
+  The hybrid block stays.
+- The module doc bullet in each of those files that names the removed impl.
+- Every `prompt_cache.rs` that holds nothing else after the removal. The file
+  is deleted, not emptied, and its `mod prompt_cache;` line goes with it.
+- Unused imports left behind in the touched files — `HydratedBlock`,
+  `SsdHydrator`, `DispatchPolicy`, `SsdHydrate`.
+- The `ArchPromptCache` doc in `crates/rmlx-models/src/prompt_cache.rs` states
+  that `impl SsdHydrate<Entry> for SsdHydrator` is a genuinely per-arch part.
+  That sentence becomes false and must be rewritten, not appended to.
+- `docs/ADDING_A_MODEL.md` row 5 and its per-arch points list say a new arch
+  writes a hydrate impl. After the change a pure-attention arch writes a
+  three-line entry trait impl instead. The LOC estimate in the same file
+  ("~25 LOC of hydrate") moves with it.
+- `scripts/lib/debt_report.py` gains an `ssd-hydrate` population, defined the
+  way the rotor populations are: a glob plus a name rule, never a file list.
+  The rule that resolves to exactly the eight bodies today and to one after the
+  change is *every non-test fn named exactly `hydrate` under
+  `crates/rmlx-models/src`* — `hydrate_from_ssd` is a different name and stays
+  out. One family, every item paired with every other, like `drivers` and
+  `impls`. `scripts/debt_report_selftest.sh` gains the matching case. The
+  population must still resolve after the collapse: one item is a measured
+  `0`, an empty population is `unavailable`.
+
 ---
 
 ## Spill Path (RAM Eviction → SSD Write)
