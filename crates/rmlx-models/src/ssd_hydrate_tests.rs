@@ -21,6 +21,21 @@
 //! resolver's return value. A hydrate that returns the right entry shape with
 //! the wrong bytes in it is the defect these exist to catch.
 //!
+//! One assertion is an exception and is marked as one: the topology arms read
+//! `KvCache::shares_kv`, a flag echoed back, one level above the bytes. The
+//! consequence the flag decides — the `exit_prefill` gate a tail extension
+//! re-runs, and the bf16 mirror it does or does not build — needs a cache that
+//! is extended after the hydrate, which no test here does. Each arm therefore
+//! compares its restored layers first, so the flag is never the only thing
+//! read.
+//!
+//! `spill` restates the block-key derivation rather than driving `SsdSpiller`,
+//! whose hermetic constructor is `#[cfg(test)]` of `rmlx-kv-ssd`. A spill side
+//! that changed its key formula would leave these fixtures green and the
+//! production tier cold. `crates/rmlx-kv-ssd/src/hydrate_tests.rs`
+//! (`lookup_seeded_matches_arch_recompute`) is what holds the two formulas
+//! together.
+//!
 //! ## Why the digests are round-trip, not literal constants
 //!
 //! The spilled cache is digested before the write and the hydrated cache after
@@ -91,6 +106,12 @@ const HYDRATED_FLAG: &str =
     "a hydrated entry must be flagged so the exact fast path excludes it — \
      replaying its placeholder first token poisons generation";
 
+/// Why a topology arm compares its layers before it reads the flag. `all` on
+/// an empty vector is true and `!any` on one is true, so a flag assertion
+/// alone passes against an entry that restored nothing.
+const LAYERS_FIRST: &str = "the restored layers must be the spilled ones — a flag read over an \
+     empty vector asserts nothing";
+
 /// Head dimension of every fixture cache. A power of two, kept small so the
 /// debug-profile probes stay cheap — the oracle reads layer identity and
 /// ordering, neither of which depends on the width.
@@ -100,6 +121,15 @@ const HEAD_DIM: i32 = 32;
 
 /// A `.kvb` directory plus index DB under `paths::kv_cache_dir`, unique to one
 /// test and removed when the test ends.
+///
+/// The name is one path segment. `wipe_stale_schema_namespaces` and
+/// `evict_pool_lru_until` both read the KV root one level deep and treat every
+/// entry there as a namespace, so a two-segment name would leave its parent
+/// behind after `Drop` removed the leaf.
+///
+/// The name also carries a wall-clock term. A test binary that dies without
+/// unwinding runs no `Drop`, and a process id is reused, so a name built from
+/// the id and a counter alone would reopen that run's `index.db`.
 struct Namespace {
     name: String,
     dir: PathBuf,
@@ -108,8 +138,11 @@ struct Namespace {
 impl Namespace {
     fn new(tag: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
         let name = format!(
-            "ssd-hydrate-oracle/{tag}-{}-{}",
+            "ssd-hydrate-oracle-{tag}-{}-{nanos}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
@@ -161,7 +194,7 @@ fn arr(data: &[f32], shape: &[i32]) -> Array {
     reason = "test fixture: a KV update that fails on a freshly built cache is a fixture bug and must abort the test loudly"
 )]
 fn kv_layer(seq: i32, kv_h: i32, seed: u64) -> KvCache {
-    let mut c = KvCache::with_quant_max_seq(QUANT, 2 * BLOCK_TOKENS as i32);
+    let mut c = KvCache::with_quant_max_seq(QUANT, 2 * seq);
     let shape = [1_i32, kv_h, seq, HEAD_DIM];
     let n: usize = shape.iter().map(|&x| x as usize).product();
     c.update(
@@ -534,6 +567,11 @@ fn each_arch_hydrates_under_its_own_cross_layer_kv_topology() {
         .hydrate(&prompt, g.seed, QUANT, DispatchPolicy::default())
         .expect("hydrate must not error")
         .expect("the block the fixture spilled must be found");
+    assert_eq!(
+        digest_layers(gemma.kv_caches(), Device::Cpu),
+        g.kv_digests,
+        "{LAYERS_FIRST}"
+    );
     assert!(
         gemma.kv_caches().iter().all(KvCache::shares_kv),
         "a gemma4 hydrate must build caches at gemma4's topology — a hard-coded \
@@ -553,6 +591,11 @@ fn each_arch_hydrates_under_its_own_cross_layer_kv_topology() {
         .hydrate(&prompt, l.seed, QUANT, DispatchPolicy::default())
         .expect("hydrate must not error")
         .expect("the block the fixture spilled must be found");
+    assert_eq!(
+        digest_layers(laguna.kv_caches(), Device::Cpu),
+        l.kv_digests,
+        "{LAYERS_FIRST}"
+    );
     assert!(
         !laguna.kv_caches().iter().any(KvCache::shares_kv),
         "a laguna hydrate must build caches at laguna's topology — a hard-coded \
@@ -643,6 +686,60 @@ fn a_prompt_the_tier_never_saw_is_a_miss() {
     );
 }
 
+/// A prefix of several blocks comes back whole.
+///
+/// Every other fixture stores exactly one block, so none of them can tell a
+/// hydrate that returns the longest matching prefix from one that returns the
+/// first block of it. A short return is not a miss. The entry looks valid, the
+/// generate loop trusts its token count, and it re-prefills from the wrong
+/// offset.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: a hydrate that misses where the fixture just spilled is the failure under test and must abort loudly"
+)]
+fn a_multi_block_prefix_comes_back_whole() {
+    let ns = Namespace::new("multi-block");
+    let stored = ids(2 * BLOCK_TOKENS);
+    let s = spill(
+        &ns,
+        LAYOUT_KEY,
+        &stored,
+        &[kv_layer(2 * BLOCK_TOKENS as i32, 2, 0xBC)],
+        &[],
+    );
+
+    let entry: LagunaEntry = hydrator(&ns, LAYOUT_KEY)
+        .hydrate(
+            &request_longer_than(&stored),
+            s.seed,
+            QUANT,
+            DispatchPolicy::default(),
+        )
+        .expect("hydrate must not error")
+        .expect("the two-block prefix the fixture spilled must be found");
+
+    assert_eq!(
+        entry.prompt_token_ids(),
+        stored.as_slice(),
+        "the whole matched prefix must come back, not its first block"
+    );
+    assert_eq!(
+        entry
+            .kv_caches()
+            .first()
+            .expect("a hydrated entry holds the layer the fixture spilled")
+            .seq_len(),
+        2 * BLOCK_TOKENS as i32,
+        "and the restored KV must be that prefix's length"
+    );
+    assert_eq!(
+        digest_layers(entry.kv_caches(), Device::Cpu),
+        s.kv_digests,
+        "byte for byte, over both blocks"
+    );
+}
+
 /// The layout key is part of what a probe matches on.
 ///
 /// The key is the SSD tier's shape identity. A block written under one layout
@@ -673,14 +770,12 @@ fn a_block_does_not_hydrate_under_a_different_layout_key() {
          below proves nothing"
     );
 
-    let other_key = LAYOUT_KEY ^ 1;
-    let miss: Option<LagunaEntry> = hydrator(&ns, other_key)
-        .hydrate(
-            &prompt,
-            cache_seed(other_key, QUANT, &[QUANT], MODEL_SIG),
-            QUANT,
-            DispatchPolicy::default(),
-        )
+    // The probe keeps the seed that just hit, so the chained digests still
+    // name the stored row and the layout key is the only term that moved. A
+    // re-seeded probe would miss on the digest alone, and the index clause
+    // that matches the key could be deleted with this test still green.
+    let miss: Option<LagunaEntry> = hydrator(&ns, LAYOUT_KEY ^ 1)
+        .hydrate(&prompt, s.seed, QUANT, DispatchPolicy::default())
         .expect("hydrate must not error");
     assert!(
         miss.is_none(),
