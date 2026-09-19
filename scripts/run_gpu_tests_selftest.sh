@@ -148,8 +148,9 @@ halves() {
     cat >"$1/halves"
 }
 
-# gpu_fixture_test <file> <fn> — a test the classifier reads as GPU-touching and
-# compliant, for the one case that runs the real half producer over a tree.
+# gpu_fixture_test <file> <fn> [body-line] — a test the classifier reads as
+# GPU-touching and compliant, for the cases that run the real half producer over
+# a tree. The optional body line is what a file uses to name a codec.
 gpu_fixture_test() {
     cat >"$1" <<TEST
 #[test]
@@ -157,8 +158,47 @@ gpu_fixture_test() {
 fn $2() {
     let device = Device::Gpu;
     let _ = device;
+    ${3:-}
 }
 TEST
+}
+
+# halves_fixture_tree <dir> — a three-member workspace the real producer and the
+# real classifier can both read: one member the model layer depends on, the model
+# layer, and one it does not depend on.
+#
+# One member per line: the classifier reads the list line by line, and a
+# single-line array parses as zero members and fails closed — which would make
+# every case over this tree permanently red for a reason that has nothing to do
+# with the rule.
+halves_fixture_tree() {
+    local tree="$1" member
+    mkdir -p "${tree}/crates/rmlx-kv-quant/src" \
+        "${tree}/crates/rmlx-models/src" "${tree}/crates/rmlx-models/tests" \
+        "${tree}/crates/rmlx-audio/src" || return 1
+    cat >"${tree}/Cargo.toml" <<'TOML'
+[workspace]
+members = [
+    "crates/rmlx-kv-quant",
+    "crates/rmlx-models",
+    "crates/rmlx-audio",
+]
+TOML
+    for member in rmlx-kv-quant rmlx-models rmlx-audio; do
+        printf '[package]\nname = "%s"\n\n[dependencies]\n' "${member}" \
+            >"${tree}/crates/${member}/Cargo.toml"
+    done
+    printf 'rmlx-kv-quant = { workspace = true }\n' \
+        >>"${tree}/crates/rmlx-models/Cargo.toml"
+}
+
+# expect_placed <half> <crate> <test> — a row the producer must emit for the
+# fixture tree most recently read into HALVES_OUT.
+expect_placed() {
+    case $'\n'"${HALVES_OUT}"$'\n' in
+        *$'\n'"$1	$2	$3"$'\n'*) ;;
+        *) fail "the producer did not place: $1 $2 $3" ;;
+    esac
 }
 
 # crate_log <root> <crate> <cargo-exit-code> — canned libtest log on stdin.
@@ -1120,6 +1160,26 @@ expect_out "kv_gpu_alpha = 4"
 expect_no_out "kv_gpu_beta"
 expect_no_out "not enforced in full"
 
+# The other way a slice can go wrong, and a different mutation from the one
+# above: matched on the test name alone. Two crates carry a cell of the same
+# name — seven names are defined in more than one module today — one per half.
+# The case above is blind to this one (its two entries share a crate, so a
+# name-only match and a half match agree), and this one is blind to that one (its
+# two entries are separated by the runner's own crate key before the half is
+# consulted). Both are kept.
+new_case half_census_slice_keys_on_the_crate_column || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+classify "${CASE_ROOT}" rmlx-models kv_gpu_alpha
+halves "${CASE_ROOT}" <<'HALVES'
+codec	rmlx-kv-quant	kv_gpu_alpha
+rest	rmlx-models	kv_gpu_alpha
+HALVES
+census_pin "${CASE_ROOT}" 4 kv_gpu_alpha rmlx-models
+census_log "${CASE_ROOT}" rmlx-kv-quant 4
+run_case "${CASE_ROOT}" --half codec
+expect_status 1
+expect_report "not pinned: 4 device load \"${CENSUS_KERNEL}\" in rmlx-kv-quant"
+
 # One crate declaring a cell in each half. Both halves report the same count, so
 # a partition keyed on the crate rather than on the test passes every count
 # assertion in this file — what separates them is WHICH cell each half asked for.
@@ -1190,57 +1250,49 @@ expect_status 0
 expect_out "INCOMPLETE: 1 selected GPU test(s) stood down"
 expect_out "rmlx-kv-quant kv_gpu_alpha:"
 
-# The rule reads the tree, not a list of names. This is the one case that runs
-# the real producer, over a fixture tree it is pointed at by argument: a crate
-# the model layer stands on is codec whichever target its test is declared in,
-# the model layer's own unit test is codec and its integration binary is not,
-# and a crate the model layer does not depend on is neither. Renaming a test
-# moves nothing, which is what a producer carrying a literal list cannot do.
+# The rule reads the tree, not a list of names. This case and the next run the
+# real producer, over a fixture tree it is pointed at by argument: a crate the
+# model layer stands on is codec whichever target its test is declared in, the
+# model layer's own unit test is codec, its integration binary is codec when the
+# binary selects a codec and rest when it does not, and a crate the model layer
+# does not depend on is neither. Renaming a test moves nothing, which is what a
+# producer carrying a literal list cannot do.
 new_case half_rule_is_read_from_the_tree || exit 1
 tree="${CASE_ROOT}/tree"
-mkdir -p "${tree}/crates/rmlx-kv-quant/src" \
-    "${tree}/crates/rmlx-models/src" "${tree}/crates/rmlx-models/tests" \
-    "${tree}/crates/rmlx-audio/src" || exit 1
-# One member per line: the classifier reads this list line by line, and a
-# single-line array parses as zero members and fails closed — which would make
-# this case permanently red for a reason that has nothing to do with the rule.
-cat >"${tree}/Cargo.toml" <<'TOML'
-[workspace]
-members = [
-    "crates/rmlx-kv-quant",
-    "crates/rmlx-models",
-    "crates/rmlx-audio",
-]
-TOML
-for member in rmlx-kv-quant rmlx-models rmlx-audio; do
-    printf '[package]\nname = "%s"\n\n[dependencies]\n' "${member}" \
-        >"${tree}/crates/${member}/Cargo.toml"
-done
-printf 'rmlx-kv-quant = { workspace = true }\n' \
-    >>"${tree}/crates/rmlx-models/Cargo.toml"
+halves_fixture_tree "${tree}" || exit 1
 gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_tests.rs" codec_decodes
 gpu_fixture_test "${tree}/crates/rmlx-models/src/arch_tests.rs" arch_forwards
 gpu_fixture_test "${tree}/crates/rmlx-models/tests/pipeline.rs" pipeline_agrees
+gpu_fixture_test "${tree}/crates/rmlx-models/tests/codec_sweep.rs" sweep_holds \
+    'let q = rmlx_kv_quant::KvQuant::K8V8;'
 gpu_fixture_test "${tree}/crates/rmlx-audio/src/asr_tests.rs" asr_transcribes
 HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
-for expected in \
-    "codec	rmlx-kv-quant	codec_decodes" \
-    "codec	rmlx-models	arch_forwards" \
-    "rest	rmlx-models	pipeline_agrees" \
-    "rest	rmlx-audio	asr_transcribes"; do
-    case $'\n'"${HALVES_OUT}"$'\n' in
-        *$'\n'"${expected}"$'\n'*) ;;
-        *) fail "the producer did not place: ${expected}" ;;
-    esac
-done
+expect_placed codec rmlx-kv-quant codec_decodes
+expect_placed codec rmlx-models arch_forwards
+expect_placed codec rmlx-models sweep_holds
+expect_placed rest rmlx-models pipeline_agrees
+expect_placed rest rmlx-audio asr_transcribes
 # The same test under a different name keeps its half, because the half came
 # from where the test is declared.
 gpu_fixture_test "${tree}/crates/rmlx-kv-quant/src/codec_tests.rs" codec_decodes_renamed
 HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
-case $'\n'"${HALVES_OUT}"$'\n' in
-    *$'\n'"codec	rmlx-kv-quant	codec_decodes_renamed"$'\n'*) ;;
-    *) fail "a renamed test lost its half — the rule is not reading the path" ;;
-esac
+expect_placed codec rmlx-kv-quant codec_decodes_renamed
+
+# The codec-name set comes from `ALL_KV_QUANTS`, not from a pattern. `FromStr` is
+# a trait path under the same `KvQuant::` prefix and names no codec, so a file
+# whose only mention is that one has not selected anything and stays in rest. A
+# bare `KvQuant::<ident>` needle places it in codec and the half loses its
+# meaning.
+new_case half_a_non_codec_kv_quant_item_stays_rest || exit 1
+tree="${CASE_ROOT}/tree"
+halves_fixture_tree "${tree}" || exit 1
+gpu_fixture_test "${tree}/crates/rmlx-models/tests/parses_a_flag.rs" flag_parses \
+    'let q = <rmlx_kv_quant::KvQuant as std::str::FromStr>::from_str("none");'
+gpu_fixture_test "${tree}/crates/rmlx-models/tests/pins_none.rs" none_is_pinned \
+    'let q = rmlx_kv_quant::KvQuant::None;'
+HALVES_OUT="$(bash "${ROOT}/scripts/gpu_test_halves.sh" --root "${tree}" 2>&1)"
+expect_placed rest rmlx-models flag_parses
+expect_placed rest rmlx-models none_is_pinned
 
 # ---------------------------------------------------------------------------
 # The harness's own positive control: with nothing wrong, the same stubs produce

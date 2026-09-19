@@ -1155,29 +1155,21 @@ an order above it. Nine pairs ≈ **+45–80 min** on a ~50 min GPU half.
 scaled the 240 s figure as though decode dominated it. The 256-token budget is
 what bounds this, and it is a constant of the gate.)*
 
-**The decision rule, stated before the measurement.** The implementing change
-arms all nine and takes one full run.
+**The decision rule was stated before the measurement**, offering to drop the
+four `_DEEP` pairs from the default table if the armed GPU half exceeded 90 min.
+**The measurement was 279 min and the lever is worth about 6 of them** — the time
+is in the `rmlx-models` lib suite (~55 min), the `rmlx-models` integration
+binaries (~144 min, of which one file is 106) and audio (~15 min), none of it in
+the pairs the lever drops. So all nine stay armed, nothing is dropped for
+nothing, and the bound is pursued by partitioning the suite instead; see
+*Splitting the GPU suite by what it guards* below.
 
-* GPU half **≤ 90 min** → all nine stay armed. That is the end state.
-* GPU half **> 90 min** → the four `_DEEP` pairs leave the *default* table.
-
-**The second branch was not taken.** The run came in at 279 min and the `_DEEP`
-lever is worth about 6 of them, so dropping those pairs does not reach the bound
-and would give up recall for nothing. All nine stay armed and the bound is
-pursued by partitioning the suite instead; see *Splitting the GPU suite by what
-it guards* below.
-
-**Leaving them in the table but skipped is not an option**, and that is
+**Leaving a pair in the table but skipped is not an option**, and that is
 structural rather than a preference: a cell that prints a named `SKIP` is counted
 as stood down, and any stand-down puts `INCOMPLETE` on the runner's final line,
 which is the marker `make ci-perf` reads to decide whether it may say `ok`. A
 shape that keeps nine pairs in the table and runs four of them can never reach
 `ci-perf ok`. Either a pair is armed, or it is not in the default table.
-
-**The measurement.** The run came in at **279 min**. The time is in the
-`rmlx-models` lib suite (~55 min), the `rmlx-models` integration binaries (~144
-min, of which one file is 106) and audio (~15 min) — none of it in the pairs the
-`_DEEP` lever drops.
 
 ##### Why the opt-in existed, and what changed
 
@@ -1335,28 +1327,44 @@ the bar moved.
 the cases under `THE HALVES` in `scripts/run_gpu_tests_selftest.sh`, which fail
 until it is.
 
-Arming every cell settled the coverage question and left the cost one. With
-everything armed the GPU half is **279 min**, and the `_DEEP` lever the decision
-rule above offered is worth about 6 of them — the 90-minute bound cannot be met
-by dropping pairs, because the time is not in the pairs that were dropped. So
-the suite is partitioned instead, and a change pays for the part of it that
-guards what the change touched.
+Arming every cell settled the coverage question and left the cost one, measured
+above. The bound cannot be met by dropping pairs, so the suite is partitioned
+instead and a change pays for the part of it that guards what the change touched.
 
 ##### The rule, and its one producer
 
 > A classified GPU test is in the **`codec`** half if and only if its declaring
 > file is under a workspace member that `rmlx-models` depends on, or under
-> `crates/rmlx-models/src/`, or **names a `KvQuant::` codec other than
-> `KvQuant::None`**. Every other classified GPU test is in the **`rest`** half.
+> `crates/rmlx-models/src/`, or **selects a KV codec** — names `DEFAULT_KV_QUANT`,
+> or a `KvQuant::<V>` whose `<V>` is one of the variants of `ALL_KV_QUANTS`
+> other than `None`. Every other classified GPU test is in the **`rest`** half.
 
 All three facts are read from the tree and none is a test name: the member list
 from `crates/rmlx-models/Cargo.toml`, the declaring file from the classifier, the
-codec spellings from that file's own text. A test that moves file moves half; a
-test that is renamed does not.
+codec names from `ALL_KV_QUANTS` in `crates/rmlx-kv-quant/src/quant.rs` — the
+list a codec must already be on to be constructible anywhere in that crate. A
+test that moves file moves half; a test that is renamed does not.
+
+**The codec-name set is derived, not a pattern.** A bare
+`KvQuant::[A-Za-z0-9_]+` needle is not a codec test: it matches
+`KvQuant::FromStr` and `KvQuant::materialises_packed_store`, which are a trait
+path and a method and name no codec. The producer reads the twenty-eight variants
+of `ALL_KV_QUANTS`, drops `None`, and matches the remaining twenty-seven names.
+**An empty derived set is a hard refusal**, not an empty match: a producer that
+read zero codec names would place every integration binary in `rest` and report a
+clean partition while the codec half guarded nothing.
+
+`DEFAULT_KV_QUANT` is in the needle for the same reason.
+`crates/rmlx-models/tests/dflash_drafter_alignment.rs` and
+`crates/rmlx-models/tests/gemma4_mtp_drafter_alignment.rs` select their codec
+through it and name no variant, so they sit in `rest` only for as long as that
+default is `None` (`crates/rmlx-models/src/kv_cache/mod.rs`). Reading the
+constant instead of its current value is what keeps the partition from moving
+silently when the default does.
 
 The third clause is what makes the halves a partition **by what a change can
-break** rather than by build topology. A file that names a codec has chosen one,
-and a codec change can move what it asserts. A file that names only
+break** rather than by build topology. A file that selects a codec has chosen
+one, and a codec change can move what it asserts. A file that names only
 `KvQuant::None` has pinned the codec off so it can measure something else — a
 drafter, a router, a CLI flag — and the `None` store path it does leave live is
 covered in the codec half by `rmlx-kv-quant`'s own suites, whose bytes-per-element
@@ -1381,27 +1389,26 @@ Two rules were weighed and lost:
   `tests/common` and refused by the twin rule. The tree can state the rule
   directly instead of being rearranged to fit a weaker one.
 
-The clause moves fourteen cells the reviewer of the first draft found stranded,
-and ten more in the same files:
+The clause moves twenty-eight cells out of `rest`, fourteen of which the review
+of the first draft found stranded:
 
-| File | Codec it names | GPU cells |
+| File | Codec it selects | GPU cells |
 |---|---|---|
 | `sparse_attn_dispatch.rs` | `PlanarK` | 4 |
 | `kv_bytes_sample_point.rs` | `IsoKOnly3` | 4 |
 | `gemma4_kv_cache_equivalence.rs` | `K8V4`, `K8V8`, `Planar` | 3 |
 | `bonsai_golden_tokens.rs` | `K8V8`, `Mixed` | 5 |
 | `qwen3_golden_tokens.rs` | `K8V8` | 2 |
-| `bitnet_golden_tokens.rs`, `bitnet_logprobs.rs`, `gemma4_golden_tokens.rs`, `medgemma_golden_tokens.rs`, `prompt_cache_cross_model.rs` | `K8V8` | 1 each |
+| `medgemma_golden_tokens.rs` | `K8V8` | 2 |
+| `bitnet_golden_tokens.rs`, `bitnet_logprobs.rs`, `gemma4_golden_tokens.rs`, `prompt_cache_cross_model.rs` | `K8V8` | 1 each |
+| `dflash_drafter_alignment.rs`, `gemma4_mtp_drafter_alignment.rs` | `DEFAULT_KV_QUANT` | 2 each |
 
-The `rest` half keeps the speculative family, the alignment suites and the cells
-that pin `None`: 31 cells, 150 min. It stays the larger half by wall.
+The `rest` half keeps the speculative family, the drafter suites that pin `None`
+and the loader cells: 34 cells, 148 min. It stays the larger half by wall.
 
 The one producer is **`scripts/gpu_test_halves.sh`**, which prints
-`half<TAB>crate<TAB>target<TAB>test` for every classified test and is the only
-place the partition is computed. The `target` column is the Cargo test target the
-declaring file compiles into — `lib`, or the integration binary's name — because
-without it a half runs `cargo test -p rmlx-models --tests` and builds all thirty
-integration binaries to execute the two it selected. Its consumers:
+`half<TAB>crate<TAB>test` for every classified test and is the only place the
+partition is computed. Its consumers:
 
 | Consumer | Reads it for |
 |---|---|
@@ -1414,22 +1421,31 @@ It takes the tree it reads as `--root <dir>`, forwarded to
 `check_gpu_tests_ignored.sh`, so the fixture case points it at a synthetic tree
 rather than at this one.
 
-`HALF` is a Make variable with two callers. Three rules keep it from becoming the
-narrowing hazard the `ci-perf` comment at `Makefile:258-263` closes for `CRATE`
-and `VALIDATE` — a narrowed population shrinks the classified set in lockstep
-with the executed one, so the runner's own coverage check cannot tell that run
-from a complete one, and `--half` has exactly that property:
+`HALF` is a Make variable with two callers. It is the narrowing hazard the
+`ci-perf` comment beginning *"The runner is invoked directly rather than through
+`$(MAKE) gpu-test`"* closes for `CRATE` and `VALIDATE`: a narrowed population
+shrinks the classified set in lockstep with the executed one, so the runner's own
+coverage check cannot tell that run from a complete one, and `--half` has exactly
+that property. Three rules, in order of how much weight each carries:
 
-1. **It is honoured only from the command line.** `make ci-perf` reads it under
-   `$(origin HALF)` = `command line`; an exported `HALF` in a dev shell reaches
-   Make with origin `environment` and is ignored. Without this, a Make variable
-   is an environment variable in disguise and `HALF=codec make ci-perf` narrows
-   the gate from a shell export.
-2. **A half-run's final line is structurally unmistakable.** It never contains
-   the string `ci-perf ok`: it reads `ci-perf codec-half ok — NOT the whole
-   gate`. A reader grepping the record for `ci-perf ok`, and any tool doing the
-   same, cannot mistake a half for the gate.
-3. **`make ci-perf` with no `HALF` runs the whole suite**, exactly as today.
+1. **The final line is structurally unmistakable, and this is the load-bearing
+   one.** A half-run never prints the string `ci-perf ok`: it reads `ci-perf
+   codec-half ok — NOT the whole gate`. Nothing in this repo greps that marker
+   today, so the defence is for the reader of a run's record, and it holds
+   however the variable arrived.
+2. **The value is checked, not just its origin.** `HALF` must be exactly `codec`
+   or `rest`; anything else, including the empty string, is a refusal. An
+   origin-only test passes an empty `HALF=` on the command line and would then
+   fall through to the whole gate under a name that says otherwise.
+3. **`$(origin HALF)` = `command line` closes the *accidental* export only.** An
+   exported `HALF` in a dev shell reaches Make with origin `environment` and is
+   ignored. It is not a seal: `MAKEFLAGS=HALF=codec make ci-perf` arrives with
+   origin `command line`, and so does a wrapper or a recipe line. Rule 1 is what
+   makes that harmless.
+
+`make ci-perf` with no `HALF` runs the whole suite, exactly as today. Hosted CI
+(`.github/workflows/ci.yml`) runs neither `ci-perf` nor `gpu-test` — it has no
+Metal — and never passes `HALF`, so none of this reaches it.
 
 The implementing change updates that comment and the `CLAUDE.md` `ci-perf` row in
 the same commit that adds `HALF`, so neither states something the change makes
@@ -1443,8 +1459,10 @@ expectation for a half is the sum over **that** set and nothing else.
 
 | Half | Selects | Tests | Measured libtest wall |
 |---|---|---|---|
-| `codec` | `rmlx-kv-quant`, `rmlx-kv-ssd` (lib only — neither has a `tests/` dir), `rmlx-mlx` (lib; its one integration binary declares no GPU cell), `crates/rmlx-models/src/`, and the `crates/rmlx-models/tests/` binaries that name a codec | 345 | 4965 s = **83 min** |
-| `rest` | the `crates/rmlx-models/tests/` binaries that name no codec or only `None`, and `rmlx-audio` | 38 | 8999 s = **150 min** |
+| Half | Selects | Tests | Measured libtest wall |
+|---|---|---|---|
+| `codec` | **every target** of `rmlx-kv-quant` (its `tests/` dir carries 11 binaries and 26 cells), `rmlx-kv-ssd` and `rmlx-mlx`; `crates/rmlx-models/src/`; and the `crates/rmlx-models/tests/` binaries that select a codec | 349 | 5095 s = **85 min** |
+| `rest` | the `crates/rmlx-models/tests/` binaries that select no codec or only `None`, and `rmlx-audio` | 34 | 8869 s = **148 min** |
 | whole | both | 383 | 13964 s = **233 min** |
 
 The wall column is **measured**, from the run the walls were taken from — the sum
@@ -1452,42 +1470,61 @@ of every `finished in Ns` that run printed, grouped by crate and by Cargo target
 That run ended red and with nine silent stand-downs (below), so its rest-half
 figure is a **floor**, not a total. The run's own wall was **279 min**, so 46 min
 of it is build, the shader-validation canary and the preflight, which the log
-does not attribute per crate or per target. Each half's wall is therefore
-**projected** as its measured libtest wall plus a build the log cannot separate:
-the codec half between **83 and 129 min**, the rest half between **150 and 196
-min**.
+does not attribute per crate. Each half's wall is therefore **projected** as its
+measured libtest wall plus a build the log cannot separate: the codec half
+between **85 and 131 min**, the rest half between **148 and 194 min**.
 
 **The ≤ 90 min bound is not claimed.** The codec half's projection straddles it,
-and until the target column above lands, a half also pays to build binaries it
-does not run. Both are measured in the implementing change, from one real run of
-each half, and the figure replaces this projection.
+and a half pays for a build wider than the tests it runs: `cargo test -p
+rmlx-models --tests` builds all thirty integration binaries to execute the ones
+the half selected, and that is deliberate — see the next paragraph. The figure is
+measured in the implementing change, from one real run of each half, and replaces
+this projection.
+
+**Each half still invokes `cargo test -p <crate> --tests`, unchanged.** A
+per-target invocation — the producer carrying the Cargo target and the runner
+passing `--lib` or `--test <name>` per row — would cut that build, and it was
+rejected. `--tests` selects exactly the target set the classifier scans, which is
+what makes the runner's `classified == executed` coverage check a real check;
+splitting the invocation per target breaks that equality by construction, needs a
+second coverage check per (crate, target) to restore it, and `--lib` hard-errors
+with *"no library targets found in package"* on a bin-only member such as
+`rmlx-cli`, which the classifier does scan. That trades one fail-closed invariant
+the runner already has for build time. Build time is the cheaper thing to lose.
 
 What the codec half guards is the KV/decode arithmetic: the codec crate's own
 kernels and cache, the SSD tier, the FFI bridge, the model layer's unit tests —
 where each architecture's forward and decode path is asserted — and every
 end-to-end binary that selects a codec, which is where a codec change shows up as
 moved golden tokens. What the rest half guards is the pipelines that pinned the
-codec off: the speculative equivalence pairs, the drafter alignment suites and
-audio transcription.
+codec off: the speculative equivalence pairs, the drafter suites that take
+`KvQuant::None`, and audio transcription.
+
+The path clause takes the `rmlx-models` **lib** target whole — 3319 s of the
+codec half's 5095 — and that target also carries cells with no codec in them,
+`src/sampler_tests.rs` and `src/speculative/round_common_tests.rs` among them. It
+is one binary, so there is nothing finer to select: the lib is in the codec half
+or it is not, and a codec change reaches most of it.
 
 ##### A third cut, named and not designed
 
-The rest half is one family: `crates/rmlx-models/tests/spec_*.rs`, the four
-`*_alignment.rs` suites and `two_model_stochastic.rs` are **7954 s = 133 min** of
-its 150, and `spec_greedy_equivalence.rs` alone is **6386 s = 106 min** — 38% of
-the whole GPU half. `rmlx-audio` is the other 928 s = 15 min. So a speculative
-cut would be worth 133 min and an audio cut 15. Neither is designed here: two
+The rest half is one family: `crates/rmlx-models/tests/spec_*.rs`, the three
+`*_alignment.rs` suites left in it and `two_model_stochastic.rs` are **7825 s =
+130 min** of its 148, and `spec_greedy_equivalence.rs` alone is **6386 s = 106
+min** — 38% of the whole GPU half. `rmlx-audio` is the other 928 s = 15 min. So a
+speculative cut would be worth 130 min and an audio cut 15. Neither is designed
+here: two
 halves is what the split needs to buy the iteration loop, and a third would need
 its own producer rule rather than a name glob.
 
 ##### The hole the rest half inherits
 
 Nine classified GPU cells stand down by printing a bare
-`eprintln!("RMLX_KV_TEST_MODEL not set — skipping")` and returning —
-`crates/rmlx-models/tests/gemma4_kv_cache_equivalence.rs` (4),
-`crates/rmlx-models/tests/kv_bytes_sample_point.rs`,
-`crates/rmlx-models/tests/prompt_cache_cross_model.rs` and
-`crates/rmlx-models/tests/qwen3_vl_moe_text_parity.rs`. The line carries no
+`eprintln!("RMLX_KV_TEST_MODEL not set — skipping")` and returning:
+`crates/rmlx-models/tests/gemma4_kv_cache_equivalence.rs` (3 cells over 4 such
+sites), `crates/rmlx-models/tests/kv_bytes_sample_point.rs` (4 cells, one site),
+`crates/rmlx-models/tests/prompt_cache_cross_model.rs` (1) and
+`crates/rmlx-models/tests/qwen3_vl_moe_text_parity.rs` (1). The line carries no
 `SKIP` token, so it is not a stand-down notice at all: the runner's harvest never
 sees it, `make check-named-skip-notices` cannot see it either — that gate reads
 the notice's *shape*, and a line without the token is not a notice to it — and
@@ -1495,8 +1532,9 @@ libtest reports the cell as `ok`. Those cells are counted as passes today.
 
 This is **pre-existing and not caused by the split**, but it bears on property 3
 below: for those nine, a stand-down does not reach `INCOMPLETE` in either half.
-Seven of the nine are codec files under the rule above, so the codec half
-inherits most of it; the other two sit in `rest`. Converting the nine to the
+Eight are in codec files under the rule above, so the codec half inherits nearly
+all of it; the one in `qwen3_vl_moe_text_parity.rs` sits in `rest`. Converting
+the nine to the
 `SKIP <test>: <why>` contract is an item of the implementing change, together
 with the scan that can see the shape at all — a classified GPU test that returns
 early from a missing-model guard and prints no notice. That is a new rule for
@@ -1567,6 +1605,8 @@ outside the oracle.
 | The census sum of the halves drifting from the whole's | `half_census_sum_equals_the_whole` — one pin, three runs, the two halves' accepted expectations summing to the unnarrowed run's |
 | A stand-down reclassified as unselected | `half_stand_down_stays_incomplete`. This is the one the split can launder: a test the selection never asked for is only `not enforced in full`, which carries no `INCOMPLETE`, and `make ci-perf` then prints `ok` |
 | A half's census slice that ignores the half and reads the crate's whole pin | `half_census_slice_is_the_half_not_the_crate` — two entries in one crate on one kernel, where the runner's own `(crate, kind, kernel)` key separates nothing and only the half decides that 4 is expected and not 10 |
+| A half's census slice matched on the test name alone | `half_census_slice_keys_on_the_crate_column` — two crates carrying a test of the same name, one per half. It is a different mutation from the row above and needs its own case: a same-crate pair is blind to a name-only match, and a two-crate pair is blind to a slice that reads the crate's whole pin |
+| The codec-name set read from a bare `KvQuant::<ident>` pattern rather than from `ALL_KV_QUANTS` | `half_a_non_codec_kv_quant_item_stays_rest` — a fixture file naming only `KvQuant::FromStr`, which is a trait path and no codec |
 | The selection producer replaced by a literal list of test names | `half_rule_is_read_from_the_tree`'s second half: the fixture test is renamed and must keep its half |
 | A half that overlaps the other, or leaves a gap | `half_union_equals_the_unnarrowed_run` — the two halves' totals must sum to the unnarrowed run's |
 | A half that visits the other half's crates | `half_runs_only_its_own_tests` |
@@ -1588,21 +1628,25 @@ Draft of the rule; the implementing change writes it into `CLAUDE.md` beside the
 > model layer, only `crates/rmlx-models/src/`, or only integration binaries that
 > select a KV codec; `HALF=rest` when it touches only the binaries that do not.
 > Anything else, and every merge to `main`, runs the whole `make ci-perf`. `HALF`
-> is read only from the command line — an exported one is ignored — and a
-> half-run's final line reads `ci-perf <half>-half ok — NOT the whole gate`,
-> never `ci-perf ok`.
+> must be exactly `codec` or `rest`, and an accidentally exported one is ignored;
+> a half-run's final line reads `ci-perf <half>-half ok — NOT the whole gate` and
+> never the string `ci-perf ok`.
 
 ##### What the implementing change lands
 
 * `scripts/gpu_test_halves.sh` — the producer, with `--root`, emitting
-  `half<TAB>crate<TAB>target<TAB>test`.
+  `half<TAB>crate<TAB>test`, refusing an empty derived codec-name set.
 * `check_gpu_tests_ignored.sh` — a listing mode carrying the declaring file.
   `--list` keeps its two columns, so the runner's existing reader is untouched.
 * `scripts/run_gpu_tests.sh` — `--half`, the producer refusals, the sliced
-  census, the executed set in the report, per-target invocation from the
-  producer's `target` column, and the half on the final line.
-* `Makefile` — `HALF` on `gpu-test`, and on `ci-perf` under `$(origin HALF)` =
-  `command line`; the comment at `Makefile:258-263` corrected in the same commit.
+  census, the executed set in the report, and the half on the final line. The
+  invocation stays `cargo test -p <crate> --tests`, so the comment there
+  beginning *"`--tests` selects every target with `test = true`"* stays true and
+  the `classified == executed` check keeps its meaning.
+* `Makefile` — `HALF` on `gpu-test`, and on `ci-perf` with the value checked and
+  an accidental export dropped; the `ci-perf` comment beginning *"The runner is
+  invoked directly rather than through `$(MAKE) gpu-test`"* corrected in the same
+  commit.
 * `scripts/gpu_validation_census.txt` — re-derived from one real run of each
   half, which is also what turns the cases above green, and the measured wall of
   each half replacing the projection above.
