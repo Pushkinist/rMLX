@@ -61,7 +61,7 @@ areas before touching code:
 | [`docs/PROFILING.md`](docs/PROFILING.md) | samply / Instruments flamegraph workflow |
 | [`docs/PROJECTS_CONFIG.md`](docs/PROJECTS_CONFIG.md) | Per-project cap defaults via `<RMLX_HOME>/projects.toml` |
 | [`docs/TESTING.md`](docs/TESTING.md) | RMLX_TEST_MODEL_* env vars + RMLX_O_MODELS_ROOT for test snapshot resolution |
-| [`docs/RELEASING.md`](docs/RELEASING.md) | Release flow: single-source version, `make tag` / `release-package` / `tap-sync`, Homebrew formula + tap, `CHANGELOG.md` |
+| [`docs/RELEASING.md`](docs/RELEASING.md) | Release flow: single-source version, `make tag` / `release-package` / `tap-sync`, Homebrew formula + tap, `CHANGELOG.md`, branch model (`next/*`, hotfix, fast-forward release) |
 
 Subdir `docs/superpowers/` holds process artifacts — not a subsystem reference.
 

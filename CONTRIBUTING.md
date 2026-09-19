@@ -50,16 +50,36 @@ of the recorded decode TPS.
 
 ## Workflow
 
-1. Branch from `main` (`feat/…`, `fix/…`, `chore/…`).
+`main` holds released state only — tag it, or fast-forward it at release
+time, but do not target it with a normal PR. Day-to-day work lands on the
+current accumulation branch, `next/<name>` (ask a maintainer which one is
+open, or check open PRs for the name).
+
+1. Branch from `next/<name>`, not from `main` (`feat/…`, `fix/…`, `chore/…`).
+   One issue gets one branch, one PR, and — once merged — one commit on
+   `next/<name>`; commits inside the branch itself are unlimited.
 2. Keep changes surgical — match existing style, no drive-by refactors.
 3. Tests live in sibling `*_tests.rs` files (no inline `#[cfg(test)] mod`
    blocks — `make check-no-inline-tests` enforces this).
-4. `make ci` green locally — plus `make ci-perf` for codec-layer / `.metal`
-   changes (see §Build & test).
-5. Open a PR into `main`. Fill in the PR template, including the `Removals`
-   section — see below.
+4. Keep the branch current with `next/<name>` by rebasing onto it — never
+   merge `next/<name>` into the branch, and never open a second PR for the
+   same issue.
+5. `make ci` green locally on every chunk you push (fmt + clippy + test +
+   deny + audit). `make ci-perf` and the real-model regression smoke run once
+   at the end, on `next/<name>` itself, right before the release PR — not per
+   issue branch (see §Build & test).
+6. Open a PR into `next/<name>`. Fill in the PR template, including the
+   `Removals` section — see below. A maintainer squash-merges it.
 
-`main` is protected: changes land via PR with CI green, not direct pushes.
+Both `main` and `next/<name>` are protected: changes land via PR with the
+required checks green, never a direct push or a force-push. Only a
+maintainer moves commits from `next/<name>` onto `main`, by fast-forward, at
+release time — see `docs/RELEASING.md`. A fix for a bug already released on
+`main` branches from `main` directly as `hotfix/<issue>`; see the Hotfix
+procedure in `docs/RELEASING.md`.
+
+An issue scheduled for the next release carries the `next` label and that
+release's milestone, so what ships next is readable from the label alone.
 
 ### No twins
 
