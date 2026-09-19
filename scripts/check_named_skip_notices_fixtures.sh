@@ -51,17 +51,25 @@ new_case() {
     : >"${CASE_ROOT}/listing"
     cat >"${CASE_ROOT}/scripts/check_gpu_tests_ignored.sh" <<'STUB'
 #!/usr/bin/env bash
-# Stub classifier: prints the canned listing beside it.
+# Stub classifier: prints the canned listing beside it, at the width the caller
+# asked for — the same two-from-three relationship the real one has.
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cat "${root}/listing"
+if [ "${1:-}" = "--list-files" ]; then cat "${root}/listing"; else cut -f1,2 "${root}/listing"; fi
 STUB
+    ln -s "${REPO_ROOT}/scripts/lib/awk_text.sh" "${CASE_ROOT}/scripts/lib/awk_text.sh"
 }
 
-# `classify <crate> <test>...` — what the stub classifier will name.
+# `classify <crate> <declaring file, relative to the crate> <test>...` — what
+# the stub classifier will name. The file is an argument because the gate's
+# second rule is scoped by it: a case that could not state where its test is
+# declared could not state which files that rule reads.
 classify() {
-    local crate="$1"; shift
+    local crate="$1" rel="$2"; shift 2
     local t
-    for t in "$@"; do printf '%s\t%s\n' "${crate}" "${t}" >>"${CASE_ROOT}/listing"; done
+    for t in "$@"; do
+        printf '%s\t%s\t%s\n' "${crate}" "${t}" \
+            "${CASE_ROOT}/crates/${crate}/${rel}" >>"${CASE_ROOT}/listing"
+    done
 }
 
 # `source_file <crate> <relative path>` — body on stdin.
@@ -92,7 +100,7 @@ expect_no_out() {
 # The clean shape. Everything below is one edit away from this, so a case that
 # fails for a reason this one shares is a broken fixture rather than a finding.
 new_case named_notice_passes
-classify rmlx-models gpu_alpha
+classify rmlx-models src/alpha_tests.rs gpu_alpha
 source_file rmlx-models src/alpha_tests.rs <<'RS'
 #[test]
 #[ignore = "GPU Metal"]
@@ -111,7 +119,7 @@ expect_out "every stand-down notice"
 # The thirteen sites' own shape: the notice names nothing, so the runner counts
 # it and lists it nowhere.
 new_case unnamed_notice_fails
-classify rmlx-models gpu_alpha
+classify rmlx-models src/alpha_tests.rs gpu_alpha
 source_file rmlx-models src/alpha_tests.rs <<'RS'
 #[test]
 fn gpu_alpha() {
@@ -127,7 +135,7 @@ expect_out "src/alpha_tests.rs:3"
 # Worse than nameless: the runner WOULD list this, under a name that ran. The
 # reason has to separate the two or the reader chases the wrong cell.
 new_case notice_naming_another_test_fails
-classify rmlx-models gpu_alpha gpu_beta
+classify rmlx-models src/alpha_tests.rs gpu_alpha gpu_beta
 source_file rmlx-models src/alpha_tests.rs <<'RS'
 #[test]
 fn gpu_alpha() {
@@ -144,7 +152,7 @@ expect_no_out "names no test"
 # `SKIP {test}:` shape), and the helper is not a cell the runner selects. Fail on
 # it and the gate is red on every correctly-written suite in the tree.
 new_case notice_in_a_helper_is_dropped
-classify rmlx-models gpu_alpha
+classify rmlx-models src/alpha_tests.rs gpu_alpha
 source_file rmlx-models src/alpha_tests.rs <<'RS'
 fn resolve(test: &str) -> Option<()> {
     eprintln!("SKIP {test}: no snapshot");
@@ -177,7 +185,7 @@ expect_out "produced no GPU tests"
 # No test-bearing sources is the same failure one layer down: a find that stopped
 # matching reports every notice as absent.
 new_case no_sources_is_exit_2
-classify rmlx-models gpu_alpha
+classify rmlx-models src/alpha_tests.rs gpu_alpha
 run_case
 expect_status 2
 expect_out "no test-bearing sources"
@@ -187,7 +195,7 @@ expect_out "no test-bearing sources"
 # as nameless; a gate that called it attributed would pass CI and leave the run
 # INCOMPLETE with a number and no name.
 new_case double_space_is_not_a_name
-classify rmlx-models gpu_alpha
+classify rmlx-models src/alpha_tests.rs gpu_alpha
 source_file rmlx-models src/alpha_tests.rs <<'RS'
 #[test]
 fn gpu_alpha() {
@@ -201,7 +209,7 @@ expect_out "gpu_alpha names no test"
 # ---------------------------------------------------------------------------
 # A space before the colon, for the same reason and from the other side.
 new_case space_before_colon_is_not_a_name
-classify rmlx-models gpu_alpha
+classify rmlx-models src/alpha_tests.rs gpu_alpha
 source_file rmlx-models src/alpha_tests.rs <<'RS'
 #[test]
 fn gpu_alpha() {
@@ -216,7 +224,7 @@ expect_out "gpu_alpha names no test"
 # The placeholder a test that passes its own name uses. It expands to the
 # runner's shape, so it is accepted — by its exact text.
 new_case test_placeholder_is_accepted
-classify rmlx-models gpu_alpha
+classify rmlx-models src/alpha_tests.rs gpu_alpha
 source_file rmlx-models src/alpha_tests.rs <<'RS'
 #[test]
 fn gpu_alpha() {
@@ -231,7 +239,7 @@ expect_status 0
 # Any other placeholder reads identically and can hold the name of a cell that
 # ran. The gate cannot check what is inside it, so it does not accept it.
 new_case other_placeholder_is_refused
-classify rmlx-models gpu_alpha
+classify rmlx-models src/alpha_tests.rs gpu_alpha
 source_file rmlx-models src/alpha_tests.rs <<'RS'
 #[test]
 fn gpu_alpha() {
@@ -246,7 +254,7 @@ expect_out "gpu_alpha names no test"
 # A notice in a fn the classifier does not name is out of scope: the runner never
 # selects it, so it never reaches a report.
 new_case unclassified_test_is_dropped
-classify rmlx-models gpu_beta
+classify rmlx-models src/alpha_tests.rs gpu_beta
 source_file rmlx-models src/alpha_tests.rs <<'RS'
 #[test]
 fn gpu_alpha() {
@@ -260,7 +268,7 @@ expect_status 0
 # Prose. The word appears in comments and in variable names throughout the tree,
 # and a gate that fired on those would be turned off within a week.
 new_case prose_mentioning_skip_is_not_a_notice
-classify rmlx-models gpu_alpha
+classify rmlx-models src/alpha_tests.rs gpu_alpha
 source_file rmlx-models src/alpha_tests.rs <<'RS'
 #[test]
 fn gpu_alpha() {
@@ -276,7 +284,7 @@ expect_status 0
 # The crate is read from the path, so a notice under one crate must not be
 # attributed to a same-named test classified under another.
 new_case crate_is_read_from_the_path
-classify rmlx-models gpu_alpha
+classify rmlx-models src/alpha_tests.rs gpu_alpha
 source_file rmlx-audio src/alpha_tests.rs <<'RS'
 #[test]
 fn gpu_alpha() {
@@ -285,6 +293,142 @@ fn gpu_alpha() {
 RS
 run_case
 expect_status 0
+
+# ---------------------------------------------------------------------------
+# The second rule. A guard that reads an environment variable and returns
+# without announcing anything is the shape the first rule cannot see at all:
+# there is no notice to read, libtest prints `ok`, and the cell is counted as a
+# pass by every gate in the tree.
+new_case silent_env_guard_fails
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") else {
+        eprintln!("RMLX_KV_TEST_MODEL not set — skipping");
+        return;
+    };
+    let _ = p;
+}
+RS
+run_case
+expect_status 1
+expect_out "gpu_alpha returns from an environment guard with no stand-down notice"
+
+# ---------------------------------------------------------------------------
+# The same guard, announced. Nothing else changes, so a gate that fired here
+# would be firing on the guard rather than on its silence.
+new_case announced_env_guard_passes
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") else {
+        eprintln!("SKIP gpu_alpha: RMLX_KV_TEST_MODEL not set");
+        return;
+    };
+    let _ = p;
+}
+RS
+run_case
+expect_status 0
+
+# ---------------------------------------------------------------------------
+# The guard is routinely in a file-local helper, which is why this rule is
+# scoped to the FILE and not to the test fns: a rule that read test bodies only
+# would call this a clean scan.
+new_case silent_env_guard_in_a_helper_fails
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+fn model_path() -> Option<String> {
+    let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") else {
+        eprintln!("RMLX_KV_TEST_MODEL not set — skipping");
+        return None;
+    };
+    Some(p)
+}
+
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let Some(p) = model_path() else {
+        return;
+    };
+    let _ = p;
+}
+RS
+run_case
+expect_status 1
+expect_out "model_path returns from an environment guard with no stand-down notice"
+
+# ---------------------------------------------------------------------------
+# The process-wide GPU off switch is not a missing-model guard: the runner
+# refuses to start with it set, so a cell behind it never stands down in that
+# suite. Every classified test opens with one, so a rule that fired here would
+# be red on the whole tree.
+new_case skip_gpu_guard_is_not_a_stand_down
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    if std::env::var("RMLX_SKIP_GPU").as_deref() == Ok("1") {
+        return;
+    }
+}
+RS
+run_case
+expect_status 0
+
+# ---------------------------------------------------------------------------
+# A guard in a file that declares no classified GPU test is out of scope, the
+# same boundary the first rule has: the runner never selects such a cell, so its
+# silence never reaches a report.
+new_case silent_guard_in_an_unclassified_file_is_dropped
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let _ = 1;
+}
+RS
+source_file rmlx-models src/beta_tests.rs <<'RS'
+#[test]
+fn cpu_beta() {
+    let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") else {
+        eprintln!("not set — skipping");
+        return;
+    };
+    let _ = p;
+}
+RS
+run_case
+expect_status 0
+
+# ---------------------------------------------------------------------------
+# The guard block is followed by brace depth over the line's CODE, so a brace
+# inside a string literal does not close it early. Here the literal's `}` would
+# end the block one line before the silent return, and the defect would read as
+# a clean scan.
+new_case a_brace_in_a_literal_does_not_close_the_guard
+classify rmlx-models src/alpha_tests.rs gpu_alpha
+source_file rmlx-models src/alpha_tests.rs <<'RS'
+#[test]
+#[ignore = "GPU Metal"]
+fn gpu_alpha() {
+    let Ok(p) = std::env::var("RMLX_KV_TEST_MODEL") else {
+        eprintln!("the model root is spelled }} on this host");
+        return;
+    };
+    let _ = p;
+}
+RS
+run_case
+expect_status 1
+expect_out "gpu_alpha returns from an environment guard with no stand-down notice"
 
 if [ "${failures}" -gt 0 ]; then
     echo "check_named_skip_notices_fixtures: ${failures} case(s) failed" >&2

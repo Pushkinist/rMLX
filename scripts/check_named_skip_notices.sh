@@ -38,12 +38,29 @@
 #   A notice naming a DIFFERENT test is refused for the same reason: the runner
 #   would list it under a name no libtest filter reaches.
 #
+# WHAT IS ALSO REFUSED: A GUARD THAT SAYS NOTHING AT ALL
+#   The rule above reads notices. The second rule reads their ABSENCE, which is
+#   the shape the first one cannot see: a line carrying no SKIP token is not a
+#   notice to it, libtest reports the cell as `ok`, and the runner's harvest
+#   never finds it — so a cell that stood down is counted as a pass by every
+#   gate in the tree, and no number of snapshots changes that.
+#
+#   The shape is a block opened by a line reading an environment variable and
+#   closed by a `return` with no notice inside it. `RMLX_SKIP_GPU` is out of it:
+#   `scripts/run_gpu_tests.sh` refuses to start with that variable set, so a
+#   guard on it cannot stand a cell down in this suite.
+#
+#   Its population is the DECLARING FILES of the classified GPU tests, not the
+#   test fns: such a guard is routinely in a file-local helper, and a rule
+#   scoped to test bodies reads a helper's silent return as a clean scan.
+#
 #   The notice's SHAPE is not defined here. `scripts/lib/skip_notice_patterns.sh`
 #   holds it, and `scripts/run_gpu_tests.sh` reads the same file — a source gate
 #   that accepted `SKIP  foo:` while the runner counted it as nameless would pass
 #   CI and leave every run INCOMPLETE with a number and no name.
 #
-# Exit 0 = every notice in a classified GPU test names its own test.
+# Exit 0 = every notice in a classified GPU test names its own test, and every
+# environment guard in those tests' files announces the stand-down it takes.
 # Exit 1 = at least one does not; each is named with its file, line and reason.
 # Exit 2 = the scan could not be trusted (no classification, no crates).
 
@@ -52,6 +69,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/skip_notice_patterns.sh
 . "${ROOT}/scripts/lib/skip_notice_patterns.sh"
+# shellcheck source=lib/awk_text.sh
+. "${ROOT}/scripts/lib/awk_text.sh"
 while [ $# -gt 0 ]; do
     case "$1" in
         --root) ROOT="${2:?--root needs a value}"; shift 2 ;;
@@ -59,12 +78,17 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-listing="$(bash "${ROOT}/scripts/check_gpu_tests_ignored.sh" --list --root "${ROOT}" 2>/dev/null)"
-if [ -z "${listing}" ]; then
-    echo "ERROR: check_gpu_tests_ignored.sh --list produced no GPU tests — the scan would" >&2
-    echo "pass by having nothing to look at." >&2
+# `--list-files` rather than `--list`: the second rule's population is the files
+# the classified tests are declared in, and the first rule's is the same
+# classification at two columns. One call, one population.
+classification="$(bash "${ROOT}/scripts/check_gpu_tests_ignored.sh" --list-files --root "${ROOT}" 2>/dev/null)"
+if [ -z "${classification}" ]; then
+    echo "ERROR: check_gpu_tests_ignored.sh --list-files produced no GPU tests — the scan" >&2
+    echo "would pass by having nothing to look at." >&2
     exit 2
 fi
+listing="$(printf '%s\n' "${classification}" | cut -f1,2)"
+gpu_files="$(printf '%s\n' "${classification}" | cut -f3 | sort -u)"
 
 # The test-bearing files, in the classifier's own population: sibling test files
 # under src/ and the integration tests. A notice anywhere else is in a fn the
@@ -138,6 +162,71 @@ while IFS=$'\t' read -r v_file v_line v_fn v_verdict v_text; do
     n=$((n + 1))
 done <<< "${notices}"
 
+# The guards that stand a cell down and announce nothing. One record per guard
+# block that returns with no notice in it, `<file>\t<line>\t<fn>\t<text>`.
+#
+# The block is followed by brace depth over the line's CODE — comments removed
+# and string bodies blanked, so a literal carrying a brace does not close a
+# guard early — while the notice and the guarded variable are read from the
+# line as written, because both of those ARE literals.
+silent=""
+n_silent=0
+while IFS=$'\t' read -r s_file s_line s_fn s_text; do
+    [ -n "${s_file:-}" ] || continue
+    rel="${s_file#"${ROOT}"/crates/}"
+    silent="${silent}    ${rel}:${s_line} — ${s_fn} returns from an environment guard with no stand-down notice"$'\n'
+    silent="${silent}        ${s_text}"$'\n'
+    n_silent=$((n_silent + 1))
+done <<< "$(printf '%s\n' "${gpu_files}" | while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    awk -v FILE="${f}" -v ANY="${ANY_SKIP}" "${AWK_TEXT_FNS}"'
+        {
+            raw = $0
+            code = blank_strings(decomment(raw))
+            bare = decomment(raw)
+        }
+        match(code, /^[[:space:]]*(pub[[:space:]]+(\([^)]*\)[[:space:]]*)?)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
+            head = substr(code, RSTART, RLENGTH)
+            sub(/^.*fn[[:space:]]+/, "", head)
+            cur = head
+        }
+        # The process-wide GPU off switch is not a missing-model guard: the
+        # runner refuses to start with it set, so a cell behind it never
+        # stands down in that suite.
+        !g && code ~ /env::var/ && bare !~ /RMLX_SKIP_GPU/ && index(code, "{") > 0 {
+            g = 1; gl = NR; gfn = cur; gtext = raw
+            sub(/^[[:space:]]+/, "", gtext)
+            depth = 0; notice = 0; ret = 0
+        }
+        g {
+            opens = gsub(/\{/, "{", code)
+            closes = gsub(/\}/, "}", code)
+            depth += opens - closes
+            if (raw ~ /"/ && raw ~ ANY) notice = 1
+            if (code ~ /^[[:space:]]*return[;[:space:]]/ || code ~ /^[[:space:]]*return$/) ret = 1
+            if (depth <= 0) {
+                if (ret && !notice)
+                    printf "%s\t%d\t%s\t%s\n", FILE, gl, gfn, gtext
+                g = 0
+            }
+        }
+    ' "${f}"
+done)"
+
+if [ "${n_silent}" -gt 0 ]; then
+    echo "ERROR: ${n_silent} environment guard(s) in classified GPU tests' files stand a" >&2
+    echo "       cell down and announce nothing:" >&2
+    printf '%s' "${silent}" >&2
+    echo >&2
+    echo "libtest reports such a cell as \`ok\` and scripts/run_gpu_tests.sh never sees" >&2
+    echo "it, so a cell that could not run is counted as one that passed. Announce it:" >&2
+    echo "  SKIP <the test fn>: <why>" >&2
+    echo "A helper takes the caller's test name as an argument and prints" >&2
+    echo "\`SKIP {test}: <why>\`; it cannot name itself, because no libtest filter" >&2
+    echo "reaches a helper. See docs/TESTING.md." >&2
+    exit 1
+fi
+
 if [ "${n}" -gt 0 ]; then
     echo "ERROR: ${n} stand-down notice(s) in classified GPU tests do not name their test:" >&2
     printf '%s' "${violations}" >&2
@@ -149,4 +238,5 @@ if [ "${n}" -gt 0 ]; then
     exit 1
 fi
 
-echo "OK: every stand-down notice in a classified GPU test names its own test."
+echo "OK: every stand-down notice in a classified GPU test names its own test, and
+every environment guard in those files announces the stand-down it takes."
