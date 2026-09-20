@@ -24,8 +24,10 @@ fn tmp_path(name: &str) -> std::path::PathBuf {
     p
 }
 
-// Deterministic LCG f32 data in [-1, 1].
-fn lcg(n: usize, seed: u64) -> Vec<f32> {
+// Deterministic LCG f32 data in [-1, 1]. Shared with the sibling turbo
+// hydrate pin, which drives the same writer and reader over the same fixture
+// shape — a second copy would be a byte-identical twin.
+pub(super) fn lcg(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {

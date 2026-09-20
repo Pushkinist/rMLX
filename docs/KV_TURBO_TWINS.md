@@ -122,11 +122,23 @@ of which the 4-bit file has — three more 3-bit-only items the issue's list
 omits.
 
 **Constraint.** One constructor, `QuantKTurbo::<BITS>::new(init_shape,
-max_seq)`, used by all four construction sites. **Observable:** the CPU pin's
-`store_after_chunk` at both widths — a constructor that leaves a field at the
-wrong initial value moves it. Note that `crates/rmlx-kv-quant/src/storage/quant_planar_k.rs`
-documents its own GPU-path init as "matching the `QuantKTurbo4` inline-literal
-signature", so deleting the literal leaves that comment false; §7 lists it.
+max_seq)`, used by all four construction sites.
+
+**Observable: the CPU pin's `store_after_chunk` at both widths — over two of
+the four sites, not four.** The pin drives `in_prefill` false and so reaches
+only the two decode arms. The other two are the `exit_prefill` literals, and
+`exit_prefill` returns at its `materialises_packed_store()` gate before every
+turbo arm, so **those two execute for no turbo spelling today**. They are kept
+deliberately — they are the re-enable path a codec takes when it grows a decode
+kernel over its own store — and the guard that pins them unreachable is
+`warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`,
+which sweeps every variant and fails the moment an arm and its classification
+disagree. A collapse that gets those two literals wrong is therefore caught by
+nothing in this campaign's oracles; it is caught the day the predicate flips.
+
+Note that `crates/rmlx-kv-quant/src/storage/quant_planar_k.rs` documents its own
+GPU-path init as "matching the `QuantKTurbo4` inline-literal signature", so
+deleting the literal leaves that comment false; §7 lists it.
 
 ### (2) `from_cpu_blocks` and the hydrated window — the 3-bit form is the reference
 
@@ -203,7 +215,16 @@ width-substitution.
 |---|---|---|
 | V `append` device | `Device::Cpu`, always | the caller's `device` |
 | V `dequantize_choice` device | `Device::Cpu`, always | the caller's `device` |
+| what it does with `v_arr_opt` | discards it (`_`) and always rebuilds the rows from the f32 vec | takes the `Array` when the GPU returned one |
 | `v_f32` materialised | always | only when the caller's device is CPU |
+
+The third row is the one a reader skips. `dequantize_choice` returns
+`(Vec<f32>, Option<Array>)` and fills the `Array` only on the GPU path; the
+3-bit body discards it because, on `Device::Cpu`, it is always `None`. A
+collapsed body that kept the 3-bit spelling would silently drop the 4-bit GPU
+result and round-trip it through the host vector instead — correct output, one
+device-to-host copy per decode step. So the width rule governs three sites, not
+two.
 
 On a CPU drive the two are the same routing. On a GPU drive they are not, and
 the 3-bit forcing is **load-bearing, not a perf preference**: `QuantV::append`
@@ -299,6 +320,14 @@ This is not the turbo K collapse's business and nothing in this change touches
 it. It is recorded because two identical pin rows with no explanation read as a
 copy-paste error, and because the property should be a measurement with its
 reason attached rather than a coincidence.
+
+A second stale statement, in the same area and also not this issue's to fix:
+`decode_reads_packed_store`'s own comment calls the bf16-mirror family's store
+one "written once at `exit_prefill` and never read again on a seeded cache".
+For every member whose `materialises_packed_store()` is false — which is all
+six turbo spellings — `exit_prefill` returns before writing anything and clears
+what is there. The store is not written once; it is not written at all. A
+removal the implementing chunk owes if it touches that comment's file.
 `the_tcq_spellings_set_the_flag_and_still_write_the_plain_bytes` asserts the
 flag and the identity together, so a change that makes the trellis constrain
 the level set turns red and names itself. **Follow-up, not this issue's:
@@ -312,27 +341,64 @@ one cell per width plus a control. Field by field, not a digest: the
 copying them across to build a digest would plant the twin this campaign
 removes — and a collapse's reviewer wants the field named, not the store.
 
-The third test asserts the two widths answer `max_seq` differently today, so
-that the collapse making them agree is a deliberate, visible move rather than
-two cells quietly converging.
+Both the store and its one block are destructured **exhaustively**, so a field
+added to either — or a constructor that starts filling one that used to sit at
+its default — fails to compile here rather than passing unread. The hydrated
+store is also asserted to claim no GPU buffer and no buffer bookkeeping: a
+hydrate builds a CPU-path store, and a capacity it invented would hand the next
+append a geometry no buffer backs.
+
+The third test spills and hydrates **both** widths and compares what the two
+engines returned. Comparing the two pinned constants instead would execute no
+engine code, and a `from_cpu_blocks` that started forwarding the window would
+make the widths agree and leave such a control green — which is the one event
+it exists for. §4's U1 is the measurement.
 
 ### What the CPU oracle cannot see, and the GPU tests the collapse owes
 
 | Unseen | GPU test owed | Census disposition |
 |---|---|---|
-| The V-axis device split (divergence 5) at `Device::Gpu` — the one defect a blind merge introduces | a `Device::Gpu` prefill at `tsym3` and at `tsym4`, asserting the append succeeds and the store bytes match the CPU cells' payload. `tsym3` on the 4-bit routing returns `Error::Quant`, so this is a hard red, not a tolerance | derived from a run: `scripts/gpu_validation_census.txt` pins accepted invalid accesses, so a test producing no shader-validation hit carries no entry. Re-derive if a cell gains a load |
+| The V-axis device split (divergence 5) at `Device::Gpu` — the one defect a blind merge introduces | **a `Device::Gpu` drive of `KvCache::update` with `in_prefill` false and no bf16 seed** — the GPU twin of this file's own drive — at `tsym3` and `tsym4`, asserting the append succeeds and the store payload matches the CPU cell's. Under the lost width rule the 3-bit cell fails on its first append: `QuantV::append` enters its GPU branch on the device alone and returns `Error::Quant` for `bits != 4`. A hard red, not a tolerance. **Not a served prefill** — see the note below the table | derived from a run: `scripts/gpu_validation_census.txt` pins accepted invalid accesses, so a test producing no shader-validation hit carries no entry. Re-derive if a cell gains a load |
 | The GPU `append` path — buffer allocation, paged growth, the MSL encode dispatch at both widths | already covered by `storage::quant_k_turbo3_tests::quant_k_turbo3_gpu_two_append_multi_head_roundtrip` and its 4-bit sibling, both `#[ignore]`-gated | no new entry |
 | The hydrated-init upload branch, where divergence 3 lives | a `Device::Gpu` append on a store built by `from_cpu_blocks`, at both widths, asserting the uploaded scales match the CPU blocks | derived from a run |
 | CPU/MSL parity of the K codec | `quant_k_turbo3_cpu_msl_parity` exists at 3-bit and has **no 4-bit counterpart** — one of the seven 3-bit-only tests. §7 says what it owes | derived from a run |
 | The fused-QK decode kernels | `turbo_k3_fused_qk_msl_tests` / `turbo_k4_fused_qk_msl_tests`, unchanged by the collapse | no |
+
+#### Which routes reach the turbo V append at all
+
+This decides what the first row can ask for, and the obvious answer — "serve a
+prefill on the GPU" — is wrong.
+
+* **A served prefill does not reach it.** `KvCache::update` with `in_prefill`
+  true returns into `update_prefill_raw` and never enters the storage
+  dispatch, and `exit_prefill` returns at its `materialises_packed_store()`
+  gate, before every arm that would bulk encode. Neither touches
+  `update_tsym3`.
+* **A served decode step does not reach it either.** `update_tsym3` opens with
+  `if self.decode_fp16_k.is_some() { return self.update_decode_fp16(..) }`,
+  and `exit_prefill` is what installs that seed. On a normally-prefilled cache
+  every decode step short-circuits.
+
+Two routes do reach it, and one of them is the GPU test the implementing chunk
+owes:
+
+1. **A `Device::Gpu` drive of `KvCache::update` with `in_prefill` false and no
+   bf16 seed** — the same drive this file's CPU cells use, on the other device.
+   This is the one to write: it is hermetic, needs no model, and fails on the
+   first append under the lost width rule.
+2. **An SSD-hydrated `tsym3` cache resuming decode on `Device::Gpu`.** A
+   hydrated entry carries a store and no mirror, so `decode_fp16_k` is `None`
+   and the dispatch reaches `update_tsym3` for real. It is the production route
+   that would hit the defect, and it needs a spilled block plus a device, so it
+   belongs beside the SSD suite rather than beside the store-bytes pin.
 
 ## 4. Mutations
 
 Every mutation below was applied to the tree by hand, run, and reverted from a
 snapshot whose sha256 of the **working** file was compared before and after —
 `git checkout --` is not used; it would revert uncommitted work. Each row names
-the assertion that caught it, not just that something failed. Thirteen of
-sixteen red.
+the assertion that caught it, not just that something failed. Sixteen of
+nineteen red.
 
 | # | Edit | Caught by |
 |---|---|---|
@@ -353,12 +419,29 @@ sixteen red.
 | M14 | `write_quant_k_turbo3` — scale the serialised scale plane by 2 | the SSD pin's payload (`tsym3: the scale plane changed across the spill/hydrate round trip`) |
 | M15 | `update_tsym3` — V axis routed to the caller's `device` instead of `Device::Cpu` | **uncaught** — 8 passed, exit 0 |
 | M16 | `read_quant_k_turbo3` — add the two `.eval()` calls | **uncaught** — 3 passed, exit 0 |
+| U1 | `QuantKTurbo4::from_cpu_blocks` — `max_seq: 0` -> `4096`, i.e. divergence 2 resolved the recommended way | the SSD pin's 4-bit window cell **and** `the_two_widths_hydrate_a_different_window_today`. The control measures both hydrates rather than comparing two constants, which is what lets it see the widths converge |
+| U2 | `QuantKTurbo4::from_cpu_blocks` — `gpu_capacity: 0` -> `7`, a hydrated store claiming a buffer it has none of | the SSD pin's GPU-bookkeeping assertion (`the hydrated store carries GPU buffer bookkeeping for a buffer it does not have`). Both stores are destructured exhaustively, so a field the pin does not read cannot exist |
+| U3 | `KvQuant::K8VTurbo2Tcq` — `Display` text changed to a third token (`lloyd2tcq`) **and** its storage redirected to `KvStorage::TurboSym3`: a spelling that builds the K twin and that the census filter does not select | the scope anchor, by name (`lloyd2tcq is backed by the K-side turbo store and the Display filter does not select it`), plus the census count. **Its control is below** |
 
 M4, M5, M6, M7, M8b and M12 are each caught by exactly one assertion, and M5,
 M6, M7 and M8b each by exactly one **column** — truncate, rows, resident_bytes
 and store_after_decode. With M1 and M3 on the chunk column, **all five columns
 are load-bearing** rather than redundant. M6 fires at one shape only, which is
 what says both shapes are.
+
+### U3's control, and why the scope anchor sweeps the enum
+
+The anchor used to iterate `turbo_spellings()` — the `Display`-filtered subset
+— which made it and the census share one blind spot: a spelling the filter does
+not select is invisible to both, so the census pins nothing for it and the
+anchor never counts it. Measured, not argued: re-running U3 with the anchor's
+loop reverted to `turbo_spellings()` leaves the anchor **green**, exit 0.
+
+It sweeps `ALL_KV_QUANTS` now and asserts that every quant whose storage is a
+symmetric turbo variant is a member of `turbo_spellings()`, so the filter is
+checked against the thing it claims to select. It reads the variant
+`KvStorage::new` sets at construction and drives nothing — the claim does not
+rest on an append.
 
 **The width guard is the other half of M1.** The collapsed type should refuse
 `QuantKTurbo<5>` at monomorphisation the way the iso stores do — a named
@@ -393,7 +476,7 @@ byte, taken in both directions so the claim is not one-sided. The decision in
 §2(4) is therefore about convention, and the doc says so rather than inventing
 a behavioural reason for it.
 
-Two more things this run cannot see, stated so the 13-of-16 is not read as
+Two more things this run cannot see, stated so the 16-of-19 is not read as
 wider than it is. No row mutates the GPU append path, because the pin never
 dispatches a kernel. And no row mutates the `.metal` kernels, which are out of
 scope and which no CPU test compiles.
@@ -492,7 +575,7 @@ What the run must show:
 | 5 | Positive control | `tsym3` and `none` carry different digests **and** different `kv_cache_bytes` at every (model, context) pair. Without it a table of identical rows cannot be told from a table of nothing |
 | 6 | `exit_code` and `n_ids` | `0` and exactly `200` in both arms, all 8 cells. A row missing either is a stop, not a difference |
 | 7 | Binary digest | must **differ** between the arms. A run whose binary digest did not change did not test the change. Reported beside the diff, never folded into it |
-| 8 | A `Device::Gpu` prefill at `tsym3` | must succeed. This is the one row that covers divergence 5, which §4's M15 shows no CPU test can. A collapse that lost the V-axis width rule fails here with `Error::Quant`, on the first chunk |
+| 8 | An **SSD-hydrated `tsym3` cache resuming decode on `Device::Gpu`** | must succeed. This is the served route that covers divergence 5, which §4's M15 shows no CPU test can. A served prefill does **not** cover it — §3's route note says why — so this row is a hydrate-and-resume, not a cold prompt. A collapse that lost the V-axis width rule fails here with `Error::Quant` on the first decode step that reaches the store |
 | 9 | Decode TPS, `tsym3` and `tsym4` | within ±1 % of the recorded anchor — **owner-gated**, requested as one batched ask with the cell list it covers. No change is the expected result: the collapse adds no entry to a decode route |
 
 Per-cell raw logs carry the absolute model-snapshot path and must never reach a
@@ -514,8 +597,16 @@ body lists them again with the net line count.
   goes with it either way.
 * `QuantKTurbo4`'s two inline struct literals in `kvcache/update.rs` — the
   `exit_prefill` arm and the decode arm — replaced by the one constructor.
+  **The `exit_prefill` arms are rewritten, not deleted.** They execute for no
+  turbo spelling today (`exit_prefill` returns at its
+  `materialises_packed_store()` gate first), and they are kept on purpose as
+  the re-enable path for a codec that grows a decode kernel over its own store.
+  `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`
+  is the guard that holds an arm and its classification together, and it is the
+  only thing that will ever execute those two sites.
   `storage/quant_planar_k.rs`'s comment "matching the `QuantKTurbo4`
-  inline-literal signature" is made false by that and must go or be reworded.
+  inline-literal signature" is made false by the rewrite and must go or be
+  reworded.
 * `KvCache::update_tsym3` and `update_tsym4` — two entries over one,
   resolving the width from the `KvStorage` variant, the shape
   `update_rotor_v` and `update_iso_v` already have. Its body carries the
@@ -579,6 +670,7 @@ number.
 |---|---|
 | `cargo test -p rmlx-kv-quant --lib turbo_store_bytes` | 8 passed, 0 failed |
 | `cargo test -p rmlx-kv-ssd --lib block_io_turbo_hydrate` | 3 passed, 0 failed |
+| `make ci` | green, `CI_EXIT=0`, run by the orchestrator in the main tree |
 | `cargo fmt` | clean |
 | `make lint` | clean, `-D warnings` across the workspace |
 | `make check-no-inline-tests` | OK |

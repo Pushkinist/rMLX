@@ -44,11 +44,13 @@
 //!   two stores encode their scale bytes differently (one safe, one `unsafe`),
 //!   needs a `Device::Gpu` append after the hydrate. `make gpu-test` owns it.
 
+use super::block_io_tests::lcg;
 use super::{KvBlockReader, KvBlockWriter};
 use rmlx_kv_quant::storage::{KvStorage, QuantKTurbo3, QuantKTurbo4, QuantV};
 use rmlx_kv_quant::turboquant::{turbo_quantize_v, TurboBlocks};
 use rmlx_kv_quant::KvQuant;
 use rmlx_mlx::Device;
+use tempfile::TempDir;
 
 const MODEL_ID: &str = "Qwen3ForCausalLM/turbo-hydrate-pin";
 
@@ -68,28 +70,6 @@ const WRITTEN_MAX_SEQ: i32 = 4096;
 /// resolution moves one of these two numbers.
 const HYDRATED_K_MAX_SEQ_3BIT: i32 = WRITTEN_MAX_SEQ;
 const HYDRATED_K_MAX_SEQ_4BIT: i32 = 0;
-
-/// Deterministic f32 data in [-1, 1].
-fn lcg(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed;
-    (0..n)
-        .map(|_| {
-            s = s
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            ((s >> 33) as f32 / u32::MAX as f32).mul_add(2.0, -1.0)
-        })
-        .collect()
-}
-
-fn tmp_path(name: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "rmlx_turbo_hydrate_{name}_{}.safetensors",
-        std::process::id()
-    ));
-    p
-}
 
 /// One CPU-path symmetric turbo storage at `bits`, plus the K block it holds.
 #[allow(
@@ -126,12 +106,18 @@ fn build(bits: u8) -> (KvStorage, TurboBlocks) {
     (storage, k_block)
 }
 
-/// What one hydrated K store answers.
+/// What one hydrated K store answers — every field of the store, so a
+/// constructor that starts filling one this file does not read cannot pass.
 struct HydratedK {
     shape: Vec<i32>,
     bits: u8,
     max_seq: i32,
     blocks: Vec<TurboBlocks>,
+    gpu_codes_live: bool,
+    gpu_scales_live: bool,
+    gpu_words_per_step: i32,
+    gpu_scales_per_step: i32,
+    gpu_capacity: i32,
 }
 
 /// Spill one symmetric turbo cache and hydrate it back.
@@ -147,14 +133,17 @@ fn spill_and_hydrate(name: &str, quant: KvQuant, bits: u8) -> (HydratedK, TurboB
     let device = Device::Cpu;
     let (storage, k_block) = build(bits);
     let layers = vec![storage];
-    let path = tmp_path(name);
+    // A TempDir, not a named path removed on the success path: a failing
+    // assertion below would otherwise leave the block behind, and the next run
+    // of the same test in the same process id would read it.
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join(format!("{name}.safetensors"));
 
     KvBlockWriter::new(MODEL_ID, quant, &layers, &[])
         .write(&path, device)
         .expect("spill");
     let reader = KvBlockReader::open(&path).expect("open the spilled block");
     let (rebuilt, _bf16, _lin) = reader.hydrate(MODEL_ID, quant, device).expect("hydrate");
-    let _ = std::fs::remove_file(&path);
 
     assert_eq!(rebuilt.len(), 1, "{name}: layer count");
     let layer = rebuilt.into_iter().next().expect("one layer");
@@ -166,11 +155,27 @@ fn spill_and_hydrate(name: &str, quant: KvQuant, bits: u8) -> (HydratedK, TurboB
                  not survive the round trip"
             );
             let k = k.expect("hydrated K store");
+            let QuantKTurbo3 {
+                blocks,
+                gpu_codes_buf,
+                gpu_scales_buf,
+                gpu_words_per_step,
+                gpu_scales_per_step,
+                gpu_capacity,
+                shape,
+                bits,
+                max_seq,
+            } = k;
             HydratedK {
-                shape: k.shape,
-                bits: k.bits,
-                max_seq: k.max_seq,
-                blocks: k.blocks,
+                shape,
+                bits,
+                max_seq,
+                blocks,
+                gpu_codes_live: gpu_codes_buf.is_some(),
+                gpu_scales_live: gpu_scales_buf.is_some(),
+                gpu_words_per_step,
+                gpu_scales_per_step,
+                gpu_capacity,
             }
         }
         KvStorage::TurboSym4 { k, max_seq, .. } => {
@@ -180,11 +185,27 @@ fn spill_and_hydrate(name: &str, quant: KvQuant, bits: u8) -> (HydratedK, TurboB
                  not survive the round trip"
             );
             let k = k.expect("hydrated K store");
+            let QuantKTurbo4 {
+                blocks,
+                gpu_codes_buf,
+                gpu_scales_buf,
+                gpu_words_per_step,
+                gpu_scales_per_step,
+                gpu_capacity,
+                shape,
+                bits,
+                max_seq,
+            } = k;
             HydratedK {
-                shape: k.shape,
-                bits: k.bits,
-                max_seq: k.max_seq,
-                blocks: k.blocks,
+                shape,
+                bits,
+                max_seq,
+                blocks,
+                gpu_codes_live: gpu_codes_buf.is_some(),
+                gpu_scales_live: gpu_scales_buf.is_some(),
+                gpu_words_per_step,
+                gpu_scales_per_step,
+                gpu_capacity,
             }
         }
         _ => panic!(
@@ -195,31 +216,60 @@ fn spill_and_hydrate(name: &str, quant: KvQuant, bits: u8) -> (HydratedK, TurboB
     (hydrated, k_block)
 }
 
-/// The spilled K payload comes back byte for byte, at both widths.
+/// The spilled K payload comes back byte for byte, at both widths, and the
+/// hydrated store claims no GPU buffer.
 ///
-/// This is the half that cannot move. Every field is named so a collapse that
-/// drops one says which.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "test: the block count is asserted immediately above every index"
-)]
+/// This is the half that cannot move. Both the store and its one block are
+/// destructured exhaustively, so a field added to either — or a constructor
+/// that starts filling one it used to leave at its default — fails to compile
+/// here rather than passing unread.
 fn assert_payload_survives(name: &str, hydrated: &HydratedK, written: &TurboBlocks, bits: u8) {
     assert_eq!(hydrated.shape, SHAPE.to_vec(), "{name}: accumulated shape");
     assert_eq!(hydrated.bits, bits, "{name}: store bit tag");
     assert_eq!(hydrated.blocks.len(), 1, "{name}: hydrated block count");
-    let block = &hydrated.blocks[0];
-    assert_eq!(block.bits, bits, "{name}: per-block bit tag");
+    let Some(block) = hydrated.blocks.first() else {
+        panic!("{name}: the hydrate produced no block");
+    };
+    let TurboBlocks {
+        codes,
+        scales,
+        original_shape,
+        bits: block_bits,
+    } = block;
+    assert_eq!(*block_bits, bits, "{name}: per-block bit tag");
     assert_eq!(
-        block.original_shape, written.original_shape,
+        *original_shape, written.original_shape,
         "{name}: per-block original shape"
     );
     assert_eq!(
-        block.codes, written.codes,
+        *codes, written.codes,
         "{name}: the packed code plane changed across the spill/hydrate round trip"
     );
     assert_eq!(
-        block.scales, written.scales,
+        *scales, written.scales,
         "{name}: the scale plane changed across the spill/hydrate round trip"
+    );
+
+    // A hydrate builds a CPU-path store: no GPU mirror exists yet, and the
+    // bookkeeping that sizes one is set by the first `append`, not here. A
+    // constructor that invented a capacity would hand the next append a
+    // geometry no buffer backs.
+    assert!(
+        !hydrated.gpu_codes_live,
+        "{name}: the hydrated store claims a GPU codes buffer"
+    );
+    assert!(
+        !hydrated.gpu_scales_live,
+        "{name}: the hydrated store claims a GPU scales buffer"
+    );
+    assert_eq!(
+        (
+            hydrated.gpu_words_per_step,
+            hydrated.gpu_scales_per_step,
+            hydrated.gpu_capacity
+        ),
+        (0, 0, 0),
+        "{name}: the hydrated store carries GPU buffer bookkeeping for a buffer it does not have"
     );
 }
 
@@ -249,16 +299,19 @@ fn tsym4_hydrate_restores_the_k_payload_but_not_the_window() {
     );
 }
 
-/// The two widths really do answer differently, and the pin above is reading
-/// that and not a constant.
+/// The two widths really do answer differently, measured.
 ///
-/// Without this, both cells could be asserting the same number and the
-/// divergence would be invisible — which is the state the collapse creates and
-/// which must be a deliberate, visible move rather than a quiet one.
+/// It spills and hydrates both widths and compares what the two engines
+/// returned. Comparing the two pinned constants instead would execute no
+/// engine code: a `from_cpu_blocks` that started forwarding the window would
+/// make the widths agree and leave a constant-to-constant control green, which
+/// is the one event this test exists for.
 #[test]
 fn the_two_widths_hydrate_a_different_window_today() {
+    let (three, _) = spill_and_hydrate("tsym3_control", KvQuant::TurboSym3, 3);
+    let (four, _) = spill_and_hydrate("tsym4_control", KvQuant::TurboSym4, 4);
     assert_ne!(
-        HYDRATED_K_MAX_SEQ_3BIT, HYDRATED_K_MAX_SEQ_4BIT,
+        three.max_seq, four.max_seq,
         "the two widths now restore the same K-store window. That is the collapse's one \
          intended observable change, and the cell it moved is named by whichever of the two \
          pins above was re-baselined"

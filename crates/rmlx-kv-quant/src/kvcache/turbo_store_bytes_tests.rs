@@ -34,13 +34,18 @@
 //! Stronger here than on any other family. All six turbo spellings report
 //! `decode_reads_packed_store() == false`, `feeds_bf16_k_at_decode(false)`
 //! and `feeds_bf16_v_at_decode(false)`, so `materialises_packed_store()` is
-//! false for every one of them and `exit_prefill` clears the payload outright.
-//! The packed store is written once during prefill and then dropped. **No
-//! served capture can read a single turbo store byte**, at any width, on any
-//! model: a run against an empty store and a run against a correct one emit
-//! the same tokens. The store bytes are observable here and nowhere else,
-//! which is why this file drives `update` with `in_prefill` false and no bf16
-//! seed — that is the one CPU route on which all six codecs write their store.
+//! false for every one of them, and the form that takes is stronger than "the
+//! store stops being read". `exit_prefill` returns at its
+//! `materialises_packed_store()` gate, **before** every arm that would bulk
+//! encode one, and clears whatever payload the cache arrived carrying. A
+//! served prefill therefore writes no turbo store at all, and the decode
+//! entries short-circuit to `update_decode_fp16` while the bf16 seed is live.
+//! **No served capture can read a single turbo store byte**, at any width, on
+//! any model: a run against an empty store and a run against a correct one
+//! emit the same tokens. The store bytes are observable here and nowhere
+//! else, which is why this file drives `update` with `in_prefill` false and no
+//! bf16 seed — that is the one CPU route on which all six codecs write their
+//! store.
 //!
 //! # Shapes
 //!
@@ -564,36 +569,41 @@ fn every_turbo_spelling_is_pinned_at_both_shapes() {
 /// The K-side store the collapse unifies is built by exactly two spellings,
 /// and the scope of the whole change rests on that.
 ///
-/// Read off the live storage the driver produced, not off a name list: the
-/// claim is about which spellings construct a `QuantKTurbo*`, and the enum
-/// variant that holds one is what says so. A spelling that started to build
-/// the K twin — or stopped — moves the count and names itself.
+/// It sweeps **`ALL_KV_QUANTS`, not the `Display`-filtered subset**, and that
+/// is the point. The filter and this anchor would otherwise share one blind
+/// spot: a seventh spelling that builds `KvStorage::TurboSym*` under a third
+/// token would enter neither, so the census would stay green with nothing
+/// pinned and the scope anchor would stay green with the spelling outside its
+/// scope. Sweeping the enum closes the loop — the anchor asserts that every
+/// quant whose storage is a symmetric turbo variant is a member of
+/// `turbo_spellings()`, so the filter is checked against the thing it claims
+/// to select rather than against itself.
+///
+/// It reads the storage `KvStorage::new` built at construction and drives
+/// nothing: the variant is decided there, so a drive would only add the cost
+/// of an append the claim does not rest on.
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "the two arms named are the claim under test; every other turbo variant is the negative case and is counted as one"
+    reason = "the two arms named are the claim under test; every other storage variant is the negative case and needs no arm of its own"
 )]
 #[test]
 fn only_the_symmetric_spellings_build_the_k_side_turbo_store() {
     let _guard = env_lock();
+    let census: Vec<String> = turbo_spellings().iter().map(ToString::to_string).collect();
     let mut with_k_twin = Vec::new();
-    for quant in turbo_spellings() {
-        let mut cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ);
-        let (kv_h, head_dim) = SHAPE_A;
-        let shape = [1_i32, kv_h, CHUNK_SEQ, head_dim];
-        let n: usize = shape.iter().map(|&d| d as usize).product();
-        let k = f32_arr(&lcg_data(n, TEST_SEED), &shape);
-        let v = f32_arr(&lcg_data(n, TEST_SEED ^ 0x5a5a), &shape);
-        let _ = cache.update(&k, &v, Device::Cpu);
-        match &cache.storage {
-            KvStorage::TurboSym3 { k, .. } => {
-                assert!(k.is_some(), "{quant}: symmetric variant built no K store");
-                with_k_twin.push(quant.to_string());
-            }
-            KvStorage::TurboSym4 { k, .. } => {
-                assert!(k.is_some(), "{quant}: symmetric variant built no K store");
-                with_k_twin.push(quant.to_string());
-            }
-            _ => {}
+    for quant in ALL_KV_QUANTS.iter().copied() {
+        let cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ);
+        if matches!(
+            cache.storage,
+            KvStorage::TurboSym3 { .. } | KvStorage::TurboSym4 { .. }
+        ) {
+            let name = quant.to_string();
+            assert!(
+                census.contains(&name),
+                "{name} is backed by the K-side turbo store and the Display filter does not \
+                 select it — the census pins nothing for it and the count below cannot see it"
+            );
+            with_k_twin.push(name);
         }
     }
     assert_eq!(
