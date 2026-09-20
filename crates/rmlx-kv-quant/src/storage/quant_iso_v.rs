@@ -195,12 +195,10 @@ pub type QuantIsoV4 = QuantIsoV<4>;
 
 impl<const BITS: u8> std::fmt::Debug for QuantIsoV<BITS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The two widths the codec ships, resolved at compile time: the struct
-        // name must not allocate on a formatting path.
-        let name = match BITS {
-            ISO3_BITS => "QuantIsoV3",
-            _ => "QuantIsoV4",
-        };
+        // Resolved at compile time; the struct name must not allocate on a
+        // formatting path. Reading `NAME` also means a width the codec does
+        // not ship cannot be formatted at all.
+        let name = Self::NAME;
         // GPU buffers are Option<Array>; logging the full handle is noisy.
         // Summarise mirror presence + sizing instead.
         f.debug_struct(name)
@@ -236,10 +234,25 @@ impl<const BITS: u8> QuantIsoV<BITS> {
     );
 
     /// Name of this width's store, for a diagnostic that must not allocate.
-    const NAME: &'static str = if BITS == ISO3_BITS {
-        "QuantIsoV3"
+    ///
+    /// Reads [`Self::WIDTH_IS_A_SHIPPED_ONE`] first. A sibling const does not
+    /// force another, so without that line a store reached only through
+    /// `NAME` — or through a constructor that never mentions the guard — would
+    /// compile at a width the codec does not ship and print as the 4-bit one.
+    const NAME: &'static str = {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
+        if BITS == ISO3_BITS {
+            "QuantIsoV3"
+        } else {
+            "QuantIsoV4"
+        }
+    };
+
+    /// `what` for the ring-append diagnostics, naming the width that asked.
+    const GPU_APPEND_WHAT: &'static str = if BITS == ISO3_BITS {
+        "QuantIsoV3::gpu_append"
     } else {
-        "QuantIsoV4"
+        "QuantIsoV4::gpu_append"
     };
 
     /// Construct an empty store for `init_shape = [B, kv_h, 0, D]`.
@@ -332,6 +345,7 @@ impl<const BITS: u8> QuantIsoV<BITS> {
     pub fn from_cpu_blocks(blocks: Vec<IsoBlocks>, shape: Vec<i32>) -> Self {
         // Caller (SSD hydrate `read_quant_iso_v3`) always provides a 4-element
         // [B, kv_h, S, D] shape. A shorter shape means a coding error upstream.
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         debug_assert!(
             shape.len() == 4,
             "QuantIsoV{BITS}::from_cpu_blocks expects a 4-element [B, kv_h, S, D] shape, got {shape:?}"
@@ -539,7 +553,7 @@ impl<const BITS: u8> QuantIsoV<BITS> {
                 "QuantIsoV{BITS}::gpu_append: head_dim={head_dim} yields no quaternion groups"
             )));
         }
-        let code_words = crate::storage::iso_code_words_i32(head_dim, BITS, Self::NAME)?;
+        let code_words = crate::storage::iso_code_words_i32(head_dim, BITS, Self::GPU_APPEND_WHAT)?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
             self.gpu.seed_from_cpu(

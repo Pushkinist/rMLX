@@ -6406,12 +6406,6 @@ impl KvCache {
     clippy::indexing_slicing,
     reason = "bounds established by construction"
 )]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the V axis carries its store, both forms of the chunk, the ring \
-              geometry and the spelling the caller resolved; a parameter struct \
-              would exist for these two calls"
-)]
 fn iso_v_encode_decode<const BITS: u8>(
     v: &mut Option<QuantIsoV<BITS>>,
     new_v: &Array,
@@ -6454,7 +6448,6 @@ fn iso_v_encode_decode<const BITS: u8>(
     // On GPU, skip the CPU dequant + vec_to_array round-trip and dispatch the
     // dequant kernel over the packed plane directly. Single-pass GPU side, no
     // intermediate Vec<f32> materialisation.
-    let v_shape = vs.shape.clone();
     if device == Device::Gpu {
         let t_deq = std::time::Instant::now();
         let arr = vs.dequant_gpu(device)?;
@@ -6470,6 +6463,7 @@ fn iso_v_encode_decode<const BITS: u8>(
         );
         return Ok(arr);
     }
+    let v_shape = vs.shape.clone();
     let t_deq = std::time::Instant::now();
     let v_recon_f32 = vs.dequant_on(device)?;
     tracing::trace!(
@@ -6509,12 +6503,6 @@ fn iso_v_encode_decode<const BITS: u8>(
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the iso update bodies carry both stores, the ring geometry and the \
-              width the caller resolved; a parameter struct would exist for \
-              this one call"
 )]
 fn iso_v_update<const BITS: u8>(
     k: &mut Option<QuantK>,

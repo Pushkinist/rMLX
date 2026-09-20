@@ -83,7 +83,7 @@ KV_UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
 # unchanged; `iso` is every fn of the update file whose name says which codec
 # it belongs to.
 ROTOR_UPDATE_FN_PATTERN = r"^update_rotor"
-ISO_UPDATE_FN_PATTERN = r"iso"
+ISO_UPDATE_FN_PATTERN = r"(^|_)iso(\d|_|$)"
 MODELS_SOURCE_DIR = "crates/rmlx-models/src"
 SSD_HYDRATE_FN_NAMES = ("from_hydrated", "hydrate")
 WORKSPACE_SOURCE_DIR = "crates"
@@ -529,11 +529,15 @@ MATCHED_LINES_POPULATIONS = {
         functools.partial(storage_file_items, glob=ISO_STORAGE_GLOB),
         width_pair_key,
     ),
+    # Every pair, not `width_pair_key`: the iso update family's live
+    # duplication is between same-width bodies of different entries, and a
+    # width key puts those in two groups and compares them never — a counter
+    # that cannot move off 0 whatever the file holds. The width-twin question
+    # for this family is `iso-storage`'s.
     "iso-updates": Population(
-        "iso update-file twins",
+        "iso update fns",
         KV_UPDATE_FILE,
         functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=ISO_UPDATE_FN_PATTERN),
-        width_pair_key,
     ),
     "rotor-storage": Population(
         "rotor storage twins",

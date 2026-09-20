@@ -260,7 +260,8 @@ family:
   drive cannot reach, so **nothing below is evidence that the 4-bit store holds
   the same bytes under `append_gpu`.** What says so is a read of the two
   appenders, not a measurement: `QuantIsoV::append_gpu` and the deleted
-  `iso_gpu_append_into_v_blocks(.., RingFeed::Skip, ..)` build their CPU block
+  `RingFeed::Skip` call on `iso_gpu_append_into_v_blocks` — the appender itself
+  is live, on the fused path, at `RingFeed::MaintainRingOnly` — build their CPU block
   from the same `iso_gpu_outputs_to_cpu` call at the same
   `(n_tokens_total, n_groups, bits)`; `reconcile_ring(device, Drop)` is
   `reconcile_ring(device, Keep)` followed by `gpu.clear()`, which is what the
@@ -330,13 +331,28 @@ unchanged: 13 of 14 red, and M11 is still the one it cannot catch.
 | M14 | `lib.rs` — `GPU_RESIDENT_ISO_PRODUCTION` flipped to `true` | `the_production_gpu_resident_iso_mirror_is_off` (`the GPU-resident iso V mirror is on in production`). Its control is below |
 
 **The other half of "width mis-resolved" is a compile error.** `QuantIsoV<5>`
-and `QuantIsoK<5>` are rejected by a `const _: ()` assertion in each
-`impl<const BITS: u8>` block, evaluated through `Self::NAME` and the
-constructor. Measured: instantiating `QuantIsoV::<5>::new` fails with
-`evaluation panicked: the iso codec ships 3-bit and 4-bit only`. It fires at
-**monomorphisation**, so `cargo build` and `cargo test` catch it and
-`cargo check` / `cargo clippy` do not — the error is post-monomorphisation and
-a check-only pass never instantiates the type. Before that assertion the extra
+and `QuantIsoK<5>` are rejected by a named associated const —
+`WIDTH_IS_A_SHIPPED_ONE: ()`, an `assert!` over `BITS` — in each
+`impl<const BITS: u8>` block.
+
+**A guard is only reached where something reads it**, and that is the whole
+design of this one. A sibling const does not force another, so `Self::NAME`
+reading the width table on its own would leave a store born through a path that
+never mentions the guard unprotected. So `NAME` opens with
+`let () = Self::WIDTH_IS_A_SHIPPED_ONE;`, both `Debug` impls take their string
+from `NAME`, and **both** birth paths — `new` and `from_cpu_blocks`, the second
+being the SSD-hydrate route — read the guard directly. Measured, each on its
+own throwaway probe:
+
+```
+QuantIsoV::<5>::new              -> error[E0080]: evaluation panicked: the iso codec ships 3-bit and 4-bit only
+QuantIsoV::<5>::from_cpu_blocks  -> error[E0080]: (same)
+QuantIsoV::<5>::NAME             -> error[E0080]: (same)
+```
+
+It fires at **monomorphisation**, so `cargo build` and `cargo test` catch it and
+`cargo check` / `cargo clippy` do not — the error is post-monomorphisation and a
+check-only pass never instantiates the type. Before the assertion the extra
 width compiled, was refused only at runtime by the kernel dispatch, and printed
 through the `Debug` impl's `_` arm as the 4-bit store.
 
@@ -418,14 +434,17 @@ $ bash scripts/debt_report.sh --matched-lines iso-storage     # before
 iso storage twins (crates/rmlx-kv-quant/src/storage): 651 matched lines over 2984 body lines (4 item(s), 2 pair(s))
 $ bash scripts/debt_report.sh --matched-lines iso-updates     # before
 iso update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 162 matched lines over 532 body lines (6 item(s), 3 pair(s))
-  (the "before" arm is read with the pattern this chunk started from,
-   `^update_iso`; the "after" arm is the widened one below, which is why the
-   item count rises rather than falls)
+  (the "before" arm is read with the rule this chunk started from — the prefix
+   `update_iso`, paired on width — and the "after" arm with the rule below: the
+   codec token, every pair compared. The two are not one series. What the
+   before arm says is that the width twins it could see are gone; what the
+   after arm says is where the family's duplication now is, which the first
+   rule could not have reported at all)
 
 $ bash scripts/debt_report.sh --matched-lines iso-storage     # after
 iso storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 2234 body lines (2 item(s), 0 pair(s))
 $ bash scripts/debt_report.sh --matched-lines iso-updates     # after
-iso update-file twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 625 body lines (21 item(s), 0 pair(s))
+iso update fns (crates/rmlx-kv-quant/src/kvcache/update.rs): 875 matched lines over 625 body lines (21 item(s), 210 pair(s))
 ```
 
 The "before" arm is the tool run with `--root` pointing at a worktree of the
@@ -452,13 +471,28 @@ place of them, each a glob plus a name rule:
   `quant_iso_v`).
 * **`iso-updates`** — every fn of
   `crates/rmlx-kv-quant/src/kvcache/update.rs` whose name carries the codec
-  token `iso`, paired by the same digit-stripped-name rule. A name **pattern**,
-  not a prefix: the collapse split the family into entries (`update_iso_*`) and
-  the bodies they enter (`iso_v_update`, `iso_sym_update`,
-  `iso_k_only_k_side`), which share no prefix, and a population that could not
-  see the bodies would have reported a clean scan over the entries alone. The
-  rotor entry keeps prefix behaviour by anchoring its pattern
-  (`^update_rotor`), so its figure is unchanged.
+  token `iso`, **every pair compared**. Two departures from the rotor entry,
+  each for a stated reason.
+
+  A name **pattern**, not a prefix: the collapse split the family into entries
+  (`update_iso_*`) and the bodies they enter (`iso_v_update`, `iso_sym_update`,
+  `iso_k_only_k_side`), which share no prefix, so a prefix population would
+  have reported a clean scan over the entries alone. The pattern is
+  `(^|_)iso(\d|_|$)` — the token on a segment boundary, with the width digit
+  admitted where it is glued to it (`update_iso3`), which is how the rule reads
+  the pre-collapse tree as well as this one. The rotor entry keeps prefix
+  behaviour by anchoring its own pattern (`^update_rotor`), so its figures are
+  unchanged.
+
+  **No `width_pair_key`**, which is the bigger departure. That key groups by
+  the digit-stripped name, so it compares a 3-bit body with its 4-bit sibling
+  and with nothing else. After the collapse no two iso fns in this file share a
+  digit-stripped name, so a width-keyed population would report `0 pair(s)` and
+  `0 matched lines` *whatever the file held* — a counter that cannot move. The
+  live duplication in this family is between **same-width** bodies of different
+  entries, which is exactly what a width key is blind to, so this population
+  pairs every item with every other. The width-twin question for the iso family
+  is `iso-storage`'s, and it keeps the key.
 
 Three things it gets right, each for a stated reason.
 
@@ -482,27 +516,32 @@ Three things it gets right, each for a stated reason.
 Registering two more copies of the rotor collectors would plant the twin the
 campaign exists to remove.
 
-`scripts/debt_report_selftest.sh` carries the matching cases, 70 to 87: a
+`scripts/debt_report_selftest.sh` carries the matching cases, 70 to 89: a
 planted figure per population (four `quant_iso_*.rs` files at 23 matched lines
-over 48, six iso fns of the update file at 7 over 28, 2 pairs each), a measured
-`0` with the population still found once a width twin is deleted, and
-`unavailable` — reason **and** exit code — for a missing root and for a root
-that is there and empty. The iso fixtures sit in the same directory and the
-same file as the rotor ones, so a widened glob or a widened pattern reads the
-wrong item count on one of the two families. Two of the six planted iso fns are
-`iso_v_update` / `iso_sym_update`: an anchored `^update_iso` pattern reads four
-items there, so the case that pins six is what holds the widened rule.
+over 48, 2 pairs; six iso fns of the update file at 41 over 28, 15 pairs),
+`iso-storage` measured at `0` with the population still found once a width twin
+is deleted, and `unavailable` — reason **and** exit code — for a missing root
+and for a root that is there and empty.
 
-**What an `iso-updates` population cannot see, and the residual it missed.**
-It is a **width-twin** detector: `width_pair_key` groups items by their name
-with every digit run removed, so it pairs a 3-bit body with its 4-bit sibling
-and with nothing else. A same-width pair — two entries of different families at
-one width — lands in two different groups and is never compared, whatever the
-name rule is. That is the axis the collapse does not address and this
-population is blind to by construction.
+`iso-updates` is held in both directions a counter can move. Deleting the two
+4-bit entries drops it from 41 over 6 items to 17 over 4 — a width collapse
+moves it even though it is not keyed on width. Collapsing the planted
+**same-width** twin (`iso_v_update` / `iso_sym_update`) drops it from 41 to 27
+over 5 items — that is the case a `width_pair_key` population could not have,
+because it would read the same figure with the duplication present or gone.
 
-There was one, and it was larger than the width twin this chunk removed.
-Measured with the module's own `normalize()` and `matched_lines()`:
+The iso fixtures sit in the same directory and the same file as the rotor ones,
+so a widened glob or a widened pattern reads the wrong item count on one of the
+two families; and a token pattern that did not admit a glued width digit would
+drop `update_iso3` / `update_iso4` and read four items where six are planted.
+
+**The same-width residual, and what the population now reports.** The axis the
+collapse does not address is the one within a width: two entries of different
+families, at one width, sharing a skeleton. It is the axis a `width_pair_key`
+population is blind to by construction, which is why this one does not use it.
+
+There was such a pair, and it was larger than the width twin this chunk
+removed. Measured with the module's own `normalize()` and `matched_lines()`:
 
 ```
 iso_v_update <-> iso_sym_update:  80 matched lines, shorter body 103 (ratio 0.777)
@@ -531,8 +570,38 @@ different — one drives `QuantK` (affine q8_0), the other `QuantIsoK<BITS>` —
 plus the shared `array_to_f32_vec` preamble and the `Ok((k_full, v_full))`
 tail.
 
-The rotor population has the same width-twin boundary and the rotor doc
-records it.
+**The pair that is left, and why it stays.** The extraction created the file's
+largest iso pair, which the all-pairs population duly reports at the top of its
+210:
+
+```
+iso_v_encode_decode <-> iso_k_only_k_side:  50 matched lines, bodies 76 and 75 (ratio 0.667)
+```
+
+Same lines on both sides: the lazy store creation, the let-else bind, four
+trace phases, the GPU early return, `dequant_on`, `f32_vec_to_array`. **They
+are not twins under the twin rule, and collapsing them would cost more than it
+removes.** The rule names two items whose bodies differ only in a compile-time
+constant or in a component's name. These differ in the *operation on the axis*:
+the V body encodes through the store's own `QuantIsoV::append_gpu`, which
+dispatches the encode kernel, reconciles and drops the ring and pushes the CPU
+block; the K body encodes through the `kvcache` ring-aware appender
+`iso_gpu_append_into_k_blocks` with an explicit `RingFeed`, which is a
+different mechanism with different ring semantics and a different signature.
+Their constructors differ too (`new(init_shape)` against
+`new(init_shape, max_seq)`).
+
+One body over both would need a store-side trait with an encode-GPU, an
+encode-CPU, a constructor, a sequence length and two dequant entries — seven
+methods, two implementors, introduced to share a trace-and-branch skeleton.
+That is the single-use trait tower the simplicity rules forbid, and it would
+hide the one thing a reader of either body needs to see: which appender the
+axis goes through. So the pair stays, the figure is recorded here, and the
+population that reports it is the one that would show the figure moving if the
+two ever did converge onto a constant.
+
+The rotor population is a width-twin detector and the rotor doc records that
+boundary; this one is not, and records that instead.
 
 ## 6. Real-model rows — deferred
 
@@ -632,8 +701,8 @@ PR body lists them again with the net line count.
 * `rotor_storage_mismatch` — renamed `storage_mismatch`. The iso V and
   symmetric entries build the same `Error::Mlx`, and a second copy would have
   been the twin this change exists to remove.
-* `iso_storage_mismatch` — an `Error::KvStorageMismatch` builder for two call
-  sites in a file that constructs that variant inline at fifteen others. One
+* `iso_storage_mismatch` — an `Error::KvStorageMismatch` builder for six call
+  sites in a file that constructs that variant inline at sixteen others. One
   shape per file: the iso sites are inline now, like the rotor K-only and asym
   ones.
 * The V axis of `iso_v_update` and `iso_sym_update` — one block, twice. It is
@@ -696,7 +765,7 @@ ran the collapse and re-ran everything below.
 | `make check-kv-codec-disposition` | OK, 28 codecs classified, 17 inert — the verdict per codec is unchanged |
 | `make check-kv-layer-quants` | OK |
 | `make check-metal-compiles` | SKIP — this host has Xcode selected without the Metal Toolchain component. The hosted `msl` job is strict |
-| `make debt-report-selftest` | OK, 87 cases (the iso update-file figures moved with the widened pattern; the case count did not) |
+| `make debt-report-selftest` | OK, 89 cases |
 | `make gpu-runner-selftest` | OK |
 | `make gpu-test CRATE=rmlx-kv-quant FILTER=iso` | 63 selected tests, second run clean. See below |
 

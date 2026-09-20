@@ -516,8 +516,8 @@ ISO_UPDATES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines iso-
 ISO_UPDATES_STATUS=$?
 
 check "matched_lines_iso_updates_pairs" \
-    "the six planted iso fns are the four update_iso* ones (a two-member plain family and a two-member K-only family, 1 + 1 = 2 pairs) plus iso_v_update / iso_sym_update, which an anchored ^update_iso pattern misses entirely — that reads 4 item(s); the update_rotor* fns in the same file carry no iso token and would read 11 item(s) if the pattern widened to update_" \
-    contains "iso update-file twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 7 matched lines over 28 body lines (6 item(s), 2 pair(s))" \
+    "the six planted iso fns are the four update_iso* ones plus iso_v_update / iso_sym_update, which an anchored ^update_iso pattern misses entirely — that reads 4 item(s); this population pairs every item with every other, so 6 items give 15 pairs, and a width key would give 2 pairs and never compare the same-width bodies at all; the update_rotor* fns carry no iso token and would read 11 item(s) if the pattern widened to update_, while a token pattern that did not admit a glued width digit would drop update_iso3 / update_iso4 and read 4" \
+    contains "iso update fns (crates/rmlx-kv-quant/src/kvcache/update.rs): 41 matched lines over 28 body lines (6 item(s), 15 pair(s))" \
     ISO_UPDATES_ML
 
 check_exit "matched_lines_iso_updates_exit" \
@@ -557,16 +557,51 @@ check_exit "matched_lines_iso_storage_collapsed_exit" \
 ISO_COLLAPSED_UPDATES_ML=$(python3 "$TOOL" --root "$ISO_COLLAPSED_WORK/base" --matched-lines iso-updates 2>&1)
 ISO_COLLAPSED_UPDATES_STATUS=$?
 
-check "matched_lines_iso_updates_collapsed_zero" \
-    "deleting the two 4-bit entries leaves one body per family, and the two same-width iso_*_update fns pair with nothing: 0 matched lines with the population still found, which is a different answer from an empty population" \
-    contains "iso update-file twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 19 body lines (4 item(s), 0 pair(s))" \
+check "matched_lines_iso_updates_collapsed_width_twin" \
+    "deleting the two 4-bit entries drops the figure from 41 over 6 items to 17 over 4, population still found — a width collapse moves this counter even though it is not keyed on width" \
+    contains "iso update fns (crates/rmlx-kv-quant/src/kvcache/update.rs): 17 matched lines over 19 body lines (4 item(s), 6 pair(s))" \
     ISO_COLLAPSED_UPDATES_ML
 
 check_exit "matched_lines_iso_updates_collapsed_exit" \
-    "a collapsed population is a measured 0, exit 0" \
+    "a collapsed population is still a measurement, exit 0" \
     0 "$ISO_COLLAPSED_UPDATES_STATUS"
 
 rm -rf "$ISO_COLLAPSED_WORK"
+
+# ---- the same-width residual the width key cannot see, and its collapse ----
+#
+# `iso_v_update` / `iso_sym_update` are one width and two entries. A
+# `width_pair_key` population puts them in two groups and compares them never,
+# so it would read the same figure whether the duplication is there or not.
+# This pair is what says the iso update population can move on it.
+
+ISO_SAMEWIDTH_WORK="$(mktemp -d)"
+cp -R "$BASE" "$ISO_SAMEWIDTH_WORK/base"
+python3 - "$ISO_SAMEWIDTH_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+# Collapse the planted same-width twin the way the engine collapsed its own:
+# one body, one caller left.
+text = re.sub(r"\n    fn iso_sym_update\(.*?\n    \}\n", "\n", text, flags=re.S)
+open(path, "w").write(text)
+EOF
+
+ISO_SAMEWIDTH_ML=$(python3 "$TOOL" --root "$ISO_SAMEWIDTH_WORK/base" --matched-lines iso-updates 2>&1)
+ISO_SAMEWIDTH_STATUS=$?
+
+check "matched_lines_iso_updates_same_width_twin_drops" \
+    "collapsing the planted same-width twin drops the figure from 41 over 6 items to 27 over 5 — the duplication a width key is blind to by construction is one this population reports" \
+    contains "iso update fns (crates/rmlx-kv-quant/src/kvcache/update.rs): 27 matched lines over 23 body lines (5 item(s), 10 pair(s))" \
+    ISO_SAMEWIDTH_ML
+
+check_exit "matched_lines_iso_updates_same_width_exit" \
+    "still a measurement, exit 0" \
+    0 "$ISO_SAMEWIDTH_STATUS"
+
+rm -rf "$ISO_SAMEWIDTH_WORK"
 
 # ---- --matched-lines: the ssd-hydrate population, both tree shapes --------
 #

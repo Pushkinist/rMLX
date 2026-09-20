@@ -163,12 +163,10 @@ pub type QuantIsoK4 = QuantIsoK<4>;
 
 impl<const BITS: u8> std::fmt::Debug for QuantIsoK<BITS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The two widths the codec ships, resolved at compile time: the struct
-        // name must not allocate on a formatting path.
-        let name = match BITS {
-            ISO_K3_BITS => "QuantIsoK3",
-            _ => "QuantIsoK4",
-        };
+        // Resolved at compile time; the struct name must not allocate on a
+        // formatting path. Reading `NAME` also means a width the codec does
+        // not ship cannot be formatted at all.
+        let name = Self::NAME;
         f.debug_struct(name)
             .field("n_blocks", &self.blocks.len())
             .field("gpu_resident", &self.gpu.is_allocated())
@@ -188,10 +186,23 @@ impl<const BITS: u8> QuantIsoK<BITS> {
     );
 
     /// Name of this width's store, for a diagnostic that must not allocate.
-    const NAME: &'static str = if BITS == ISO_K3_BITS {
-        "QuantIsoK3"
+    ///
+    /// Reads [`Self::WIDTH_IS_A_SHIPPED_ONE`] first, for the reason the
+    /// sibling const on [`super::QuantIsoV`] gives.
+    const NAME: &'static str = {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
+        if BITS == ISO_K3_BITS {
+            "QuantIsoK3"
+        } else {
+            "QuantIsoK4"
+        }
+    };
+
+    /// `what` for the ring-append diagnostics, naming the width that asked.
+    const GPU_APPEND_WHAT: &'static str = if BITS == ISO_K3_BITS {
+        "QuantIsoK3::gpu_append"
     } else {
-        "QuantIsoK4"
+        "QuantIsoK4::gpu_append"
     };
 
     /// Construct an empty store for `init_shape = [B, kv_h, 0, D]`.
@@ -264,6 +275,7 @@ impl<const BITS: u8> QuantIsoK<BITS> {
     /// fit within the true model window.
     #[must_use]
     pub fn from_cpu_blocks(blocks: Vec<IsoBlocks>, shape: Vec<i32>, max_seq: i32) -> Self {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         debug_assert!(
             shape.len() == 4,
             "QuantIsoK{BITS}::from_cpu_blocks expects a 4-element [B, kv_h, S, D] shape, got {shape:?}"
@@ -402,8 +414,8 @@ impl<const BITS: u8> QuantIsoK<BITS> {
         max_seq: i32,
         device: Device,
     ) -> Result<()> {
-        let n_groups = iso_n_groups_i32(head_dim, Self::NAME)?;
-        let code_words = iso_code_words_i32(head_dim, BITS, Self::NAME)?;
+        let n_groups = iso_n_groups_i32(head_dim, Self::GPU_APPEND_WHAT)?;
+        let code_words = iso_code_words_i32(head_dim, BITS, Self::GPU_APPEND_WHAT)?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
             self.gpu.seed_from_cpu(

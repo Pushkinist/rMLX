@@ -654,9 +654,9 @@ MSL kernels; lazy-transpose strides are ignored), and both `dequant_gpu` paths
 `[B, S, kv_h, D]` then transpose back. A one-token chunk is already
 sequence-major, so the transpose-plus-copy is skipped on the decode step — the
 same shortcut `packed_k_chunk_seq_major` takes for the `kvcache` appenders. The
-remaining six are CPU-only on the append side (`QuantIsoK<BITS>` also drives
-the iso dequant kernel for its own width via the CPU-staged path; rotor has no
-MSL kernel). The `.kvb` SSD format is
+remaining six take no GPU encode through `isoquant_msl_dispatch`;
+`QuantIsoK<BITS>` drives the iso dequant kernel for its own width and its own
+ring append, and rotor has no MSL kernel. The `.kvb` SSD format is
 byte-stable — only the token-row order **within** a block changes, and spill
 and dequant agree on sequence-major. GPU round-trip verified on `QuantIsoV3`
 (two-append GQA vs single-shot, `kv_h=1` control).
