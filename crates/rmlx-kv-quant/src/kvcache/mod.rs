@@ -127,6 +127,12 @@ mod iso_flash_dispatch_tests;
 #[path = "iso_store_bytes_tests.rs"]
 mod iso_store_bytes_tests;
 
+// Byte-level pin on the TurboQuant storage layer: what every turbo spelling
+// writes into its packed store, and what the attention reads back from it.
+#[cfg(test)]
+#[path = "turbo_store_bytes_tests.rs"]
+mod turbo_store_bytes_tests;
+
 // A flash-decode step strides over the bf16 V mirror instead of copying its
 // `..kv_seq` prefix.
 #[cfg(test)]
