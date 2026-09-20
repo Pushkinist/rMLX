@@ -253,7 +253,48 @@ applied to the tree, run, and reverted from a snapshot whose sha256 of the
 it would revert uncommitted work. Each row names the assertion that caught it,
 not just that something failed.
 
-<!-- MUTATION-TABLE -->
+| # | Edit | Caught by |
+|---|---|---|
+| M1 | `quant_iso_v4.rs` `append` — encode at `3` instead of `ISO4_BITS`, i.e. a generic instantiated at the wrong width | 4 of the 6 tests: the pin, the geometry, the twins control and the reproducibility drive. First line `iso4 decode: isoquant: code plane holds 288 words for 24 rows, which need 384` |
+| M2 | `quant_iso_v4.rs` `append` — drop the last code word (`codes.pop()`) | the same 4. First line `code plane holds 383 words for 24 rows, which need 384` |
+| M3 | `quant_iso_v.rs` — `ISO3_GROUP_SIZE` 4 -> 8, moving the quaternion group boundary | the pin (`iso3 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`) **and** the geometry (scale count 384 against 768) |
+| M4 | `isoquant.rs` — `FIXED_QUAT` replaced by `[0.5, 0.5, 0.5, 0.5]`, the codec's one rotation constant | the pin **only** (`iso3 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`); geometry stays green, because the code plane is the same length |
+| M5 | `update_iso4_sym` — the K store appends `v_f32`, so the symmetric entry writes V's data on both axes | the pin **only** (`iso4_sym @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`) |
+| M6 | `update_iso_k_only_4` — the K store appends `new_v`, so the K-only entry stores the V stream | the pin **only** (`k_iso4 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`) |
+| M7 | `quant_iso_v.rs` `truncate_to` — `(n - 1).max(0)` | the pin's **truncate** column **only** (`iso3 @ kv_h=1 head_dim=128: packed store bytes after truncate_to moved`) |
+| M8 | `quant_iso_v4.rs` `dequant` — drop `transpose_chunked_seq_heads`; the store is untouched, only the rows the attention receives move | the pin's **rows** column only, at **shape B only** (`iso4 @ kv_h=4 head_dim=96: the K/V rows attention receives moved`). This is the 4-bit CPU decode, and it is the reference the future GPU entry is compared against |
+| M9 | `quant.rs` — `KvQuant::Iso4` removed from `ALL_KV_QUANTS` | the census (`iso spelling census moved … ["iso3", "iso3_sym", "iso4_sym", "k_iso3", "k_iso4"]`, left 5 right 6) |
+| M10 | `quant.rs` — `KvQuant::Iso3` listed twice in `ALL_KV_QUANTS`, standing in for a seventh iso spelling | the census (left 7 right 6). It exercises the count anchor only: a genuinely new variant would also miss `pin_for` and turn the pin test red, which this stand-in cannot show without wiring a variant through every exhaustive match |
+| M11 | `quant_iso_v4.rs` `gpu_append` — `n_groups + 1` into `append_encoded` | **uncaught** — 6 passed, exit 0 |
+| M12 | `quant_iso_v4.rs` `byte_size` — drop the CPU-blocks term | the pin's **resident_bytes** column only (`iso4 @ kv_h=1 head_dim=128: resident_bytes moved`, left 3564 right 22680) |
+
+M4, M5, M6, M7, M8 and M12 are each caught by exactly one assertion, and M7,
+M8 and M12 each by exactly one **column**, which is why all five columns are
+load-bearing rather than redundant. M8 fires at one shape only, which is why
+both shapes are.
+
+### The mutation I could not catch
+
+**M11.** `QuantIsoV4::gpu_append` is handed one more quaternion group than the
+head dimension has, and every one of the six tests passes.
+
+The reason is structural, not an oversight in the assertions: `gpu_append`
+writes the GPU ring, and a `Device::Cpu` drive never calls it. Neither does
+anything else this file reaches — `CPU append` clears the ring rather than
+feeding it. The same blind spot covers `gpu_packed_view`, `reconcile_ring`, the
+ring-readback branch of `synced_iso_v_blocks`, `from_cpu_blocks` and
+`try_deep_clone`. It is the same class the rotor pilot recorded and measured:
+there, re-applying the equivalent edit and running `make gpu-test
+CRATE=rmlx-kv-quant` turned it red, on two named tests. That measurement is
+**not repeated here** — it needs an idle GPU and belongs to the integration
+window.
+
+So the honest statement of this oracle's power: it covers the CPU encode, the
+CPU decode, the block bookkeeping, `truncate_to` and residency at both widths
+and both shapes, and it covers **nothing on the ring**. `make gpu-test
+HALF=codec` is the only gate over the ring, and the collapse's reviewer must
+read its result rather than this file's.
+
 
 ## 5. Duplication figure
 
