@@ -180,9 +180,24 @@ impl<const BITS: u8> std::fmt::Debug for QuantIsoK<BITS> {
 }
 
 impl<const BITS: u8> QuantIsoK<BITS> {
+    /// The codec ships two widths and one kernel pair per width — see the
+    /// sibling constant on [`super::QuantIsoV`].
+    const WIDTH_IS_A_SHIPPED_ONE: () = assert!(
+        BITS == ISO_K3_BITS || BITS == ISO_K4_BITS,
+        "the iso codec ships 3-bit and 4-bit only"
+    );
+
+    /// Name of this width's store, for a diagnostic that must not allocate.
+    const NAME: &'static str = if BITS == ISO_K3_BITS {
+        "QuantIsoK3"
+    } else {
+        "QuantIsoK4"
+    };
+
     /// Construct an empty store for `init_shape = [B, kv_h, 0, D]`.
     #[must_use]
     pub fn new(init_shape: Vec<i32>, max_seq: i32) -> Self {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         Self {
             blocks: Vec::new(),
             gpu: QuantKGpuRing::default(),
@@ -387,8 +402,8 @@ impl<const BITS: u8> QuantIsoK<BITS> {
         max_seq: i32,
         device: Device,
     ) -> Result<()> {
-        let n_groups = iso_n_groups_i32(head_dim, "QuantIsoK::gpu_append")?;
-        let code_words = iso_code_words_i32(head_dim, BITS, "QuantIsoK::gpu_append")?;
+        let n_groups = iso_n_groups_i32(head_dim, Self::NAME)?;
+        let code_words = iso_code_words_i32(head_dim, BITS, Self::NAME)?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
             self.gpu.seed_from_cpu(

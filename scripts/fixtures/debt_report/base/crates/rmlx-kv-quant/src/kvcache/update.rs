@@ -53,6 +53,18 @@ impl Cache {
         self.seq * 4
     }
 
+    fn iso_v_update(&mut self, n: usize) -> usize {
+        let groups = n / 4;
+        self.seq += groups;
+        self.seq
+    }
+
+    fn iso_sym_update(&mut self, n: usize) -> usize {
+        let groups = n / 4;
+        self.seq += groups;
+        self.seq * 2
+    }
+
     fn update_affine(&mut self, n: usize) -> usize {
         self.seq += n;
         self.seq

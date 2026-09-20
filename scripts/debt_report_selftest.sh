@@ -17,8 +17,9 @@
 #   storage files (a three-member V group, a two-member K group, plus a test
 #   file matching the same glob) and five update_rotor* fns beside one
 #   update_affine, for the two rotor populations, the same shape at two
-#   members per group in quant_iso_*.rs and update_iso* for the two iso
-#   populations, and two per-arch hydrate
+#   members per group in quant_iso_*.rs and update_iso* — plus an
+#   iso_v_update / iso_sym_update pair that only an unanchored name pattern
+#   reaches — for the two iso populations, and two per-arch hydrate
 #   bodies beside a hydrate_from_ssd and a test-path copy, for the
 #   ssd-hydrate population. A group of three is what
 #   separates every-pair-in-a-group from consecutive-only pairing; a width
@@ -515,8 +516,8 @@ ISO_UPDATES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines iso-
 ISO_UPDATES_STATUS=$?
 
 check "matched_lines_iso_updates_pairs" \
-    "the four planted update_iso* fns are a two-member plain family and a two-member K-only family, 1 + 1 = 2 pairs; the update_rotor* fns in the same file are outside this prefix and would read 9 item(s) if it widened to update_" \
-    contains "iso update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 7 matched lines over 18 body lines (4 item(s), 2 pair(s))" \
+    "the six planted iso fns are the four update_iso* ones (a two-member plain family and a two-member K-only family, 1 + 1 = 2 pairs) plus iso_v_update / iso_sym_update, which an anchored ^update_iso pattern misses entirely — that reads 4 item(s); the update_rotor* fns in the same file carry no iso token and would read 11 item(s) if the pattern widened to update_" \
+    contains "iso update-file twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 7 matched lines over 28 body lines (6 item(s), 2 pair(s))" \
     ISO_UPDATES_ML
 
 check_exit "matched_lines_iso_updates_exit" \
@@ -557,8 +558,8 @@ ISO_COLLAPSED_UPDATES_ML=$(python3 "$TOOL" --root "$ISO_COLLAPSED_WORK/base" --m
 ISO_COLLAPSED_UPDATES_STATUS=$?
 
 check "matched_lines_iso_updates_collapsed_zero" \
-    "deleting the two 4-bit entries leaves one body per family: 0 matched lines over the 9 body lines that remain, population still found" \
-    contains "iso update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 9 body lines (2 item(s), 0 pair(s))" \
+    "deleting the two 4-bit entries leaves one body per family, and the two same-width iso_*_update fns pair with nothing: 0 matched lines with the population still found, which is a different answer from an empty population" \
+    contains "iso update-file twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 19 body lines (4 item(s), 0 pair(s))" \
     ISO_COLLAPSED_UPDATES_ML
 
 check_exit "matched_lines_iso_updates_collapsed_exit" \
@@ -645,7 +646,10 @@ import sys
 
 path = sys.argv[1]
 text = open(path).read().replace("fn update_rotor", "fn update_affine_rotor")
-text = text.replace("fn update_iso", "fn update_affine_iso")
+# The iso pattern is unanchored and keys on the codec token, so emptying that
+# population means removing the token, not moving it off the front.
+text = text.replace("fn update_iso", "fn update_quat")
+text = text.replace("fn iso_", "fn quat_")
 open(path, "w").write(text)
 EOF
 
@@ -689,7 +693,7 @@ ISO_EMPTY_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-line
 ISO_EMPTY_UPDATES_STATUS=$?
 
 check "matched_lines_iso_updates_empty_unavailable" \
-    "renaming every update_iso* fn out of the prefix empties the population: unavailable, not 0" \
+    "renaming the codec token out of every iso fn empties the population: unavailable, not 0" \
     contains "debt-report --matched-lines iso-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs: population is empty)" \
     ISO_EMPTY_UPDATES_ML
 

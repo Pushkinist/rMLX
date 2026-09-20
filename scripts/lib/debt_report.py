@@ -76,8 +76,14 @@ KV_STORAGE_DIR = "crates/rmlx-kv-quant/src/storage"
 ROTOR_STORAGE_GLOB = "quant_rotor_*.rs"
 ISO_STORAGE_GLOB = "quant_iso_*.rs"
 KV_UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
-ROTOR_UPDATE_FN_PREFIX = "update_rotor"
-ISO_UPDATE_FN_PREFIX = "update_iso"
+# Name patterns, not prefixes: a family is a shape, and the iso one outgrew a
+# prefix when its entries (`update_iso_*`) and the bodies they enter
+# (`iso_*_update`, `iso_k_only_k_side`) stopped sharing one. `^update_rotor` is
+# the rotor prefix written as an anchored pattern, so that population is
+# unchanged; `iso` is every fn of the update file whose name says which codec
+# it belongs to.
+ROTOR_UPDATE_FN_PATTERN = r"^update_rotor"
+ISO_UPDATE_FN_PATTERN = r"iso"
 MODELS_SOURCE_DIR = "crates/rmlx-models/src"
 SSD_HYDRATE_FN_NAMES = ("from_hydrated", "hydrate")
 WORKSPACE_SOURCE_DIR = "crates"
@@ -469,18 +475,22 @@ def storage_file_items(root: Path, *, glob: str) -> list[FnInfo]:
     return items
 
 
-def file_fn_items(root: Path, *, file: str, prefix: str) -> list[FnInfo]:
-    """Every fn of `file` whose name starts with `prefix`, body only — the
-    same `extract_fns` scan the twin section uses, so the body is brace to
-    brace and the signature lines above it are not counted.
+def file_fn_items(root: Path, *, file: str, pattern: str) -> list[FnInfo]:
+    """Every fn of `file` whose name matches `pattern` (`re.search`), body only
+    — the same `extract_fns` scan the twin section uses, so the body is brace
+    to brace and the signature lines above it are not counted.
 
-    `file` and `prefix` arrive from the registration site, for the reason
-    [`storage_file_items`] gives for its glob."""
+    `file` and `pattern` arrive from the registration site, for the reason
+    [`storage_file_items`] gives for its glob. A pattern rather than a prefix
+    because a family is a shape: anchor it (`^update_rotor`) to get prefix
+    behaviour, leave it unanchored (`iso`) to name a family whose entries and
+    bodies do not share one."""
     path = root / file
     if not path.is_file():
         raise RuntimeError(f"{file} is not a file")
+    matches = re.compile(pattern).search
     fns, _skipped = fns_in_file(root, path)
-    return [fn for fn in fns if fn.name.startswith(prefix)]
+    return [fn for fn in fns if matches(fn.name)]
 
 
 def ssd_hydrate_items(root: Path) -> list[FnInfo]:
@@ -520,9 +530,9 @@ MATCHED_LINES_POPULATIONS = {
         width_pair_key,
     ),
     "iso-updates": Population(
-        "iso update twins",
+        "iso update-file twins",
         KV_UPDATE_FILE,
-        functools.partial(file_fn_items, file=KV_UPDATE_FILE, prefix=ISO_UPDATE_FN_PREFIX),
+        functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=ISO_UPDATE_FN_PATTERN),
         width_pair_key,
     ),
     "rotor-storage": Population(
@@ -534,7 +544,7 @@ MATCHED_LINES_POPULATIONS = {
     "rotor-updates": Population(
         "rotor update twins",
         KV_UPDATE_FILE,
-        functools.partial(file_fn_items, file=KV_UPDATE_FILE, prefix=ROTOR_UPDATE_FN_PREFIX),
+        functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=ROTOR_UPDATE_FN_PATTERN),
         width_pair_key,
     ),
     "ssd-hydrate": Population("ssd hydrate twins", MODELS_SOURCE_DIR, ssd_hydrate_items),

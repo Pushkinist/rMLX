@@ -646,13 +646,17 @@ parameters stay correctly associated after the value reorder:
   by token — the reorder leaves them untouched. The **per-token** QJL sideband
   (`qjl_codes` / `qjl_norms`) permutes with the value rows.
 
-`QuantIsoV3` is the one GPU-resident member: its `append_gpu` adds
-`Array::contiguous` after the heads↔seq transpose before the iso3 encode kernel
-(raw-linear-index MSL kernel; lazy-transpose strides are ignored), and both
-`dequant_gpu` paths (mirror fast-path and CPU-staged `from_bytes`) reshape the
-flat decode to `[B, S, kv_h, D]` then transpose back. The remaining seven are
-CPU-only (`QuantIsoK<BITS>` also drives the iso dequant kernel for its own
-width via the CPU-staged path; rotor has no MSL kernel). The `.kvb` SSD format is
+`QuantIsoV<BITS>` is the GPU-resident member, at **both** widths: its
+`append_gpu` adds `Array::contiguous` after the heads↔seq transpose before the
+encode kernel `isoquant_msl_dispatch` selects for its width (raw-linear-index
+MSL kernels; lazy-transpose strides are ignored), and both `dequant_gpu` paths
+(mirror fast-path and CPU-staged `from_bytes`) reshape the flat decode to
+`[B, S, kv_h, D]` then transpose back. A one-token chunk is already
+sequence-major, so the transpose-plus-copy is skipped on the decode step — the
+same shortcut `packed_k_chunk_seq_major` takes for the `kvcache` appenders. The
+remaining six are CPU-only on the append side (`QuantIsoK<BITS>` also drives
+the iso dequant kernel for its own width via the CPU-staged path; rotor has no
+MSL kernel). The `.kvb` SSD format is
 byte-stable — only the token-row order **within** a block changes, and spill
 and dequant agree on sequence-major. GPU round-trip verified on `QuantIsoV3`
 (two-append GQA vs single-shot, `kv_h=1` control).

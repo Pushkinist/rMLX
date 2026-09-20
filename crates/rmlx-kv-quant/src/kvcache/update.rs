@@ -1158,16 +1158,6 @@ fn iso_gpu_encode_ring_only(
     })
 }
 
-/// The [`Error::KvStorageMismatch`] a fused iso append returns when the
-/// dispatch hands it a variant outside its family. `expected` names both widths
-/// of that family, since one entry now serves both.
-fn iso_storage_mismatch(expected: &'static str, storage: &KvStorage) -> Error {
-    Error::KvStorageMismatch {
-        expected,
-        got: storage_variant_name(storage),
-    }
-}
-
 /// Append `new_k` into a live iso K-only store's GPU ring (+ CPU blocks) at
 /// `BITS`, lazily creating the store on first use. No dequant — the fused iso
 /// K-only flash-decode SDPA path reaches this through
@@ -1223,10 +1213,10 @@ pub(super) fn iso_k_only_gpu_append(
     let (KvStorage::IsoKOnly3 { max_seq, .. } | KvStorage::IsoKOnly4 { max_seq, .. }) =
         &cache.storage
     else {
-        return Err(iso_storage_mismatch(
-            "IsoKOnly3 | IsoKOnly4",
-            &cache.storage,
-        ));
+        return Err(Error::KvStorageMismatch {
+            expected: "IsoKOnly3 | IsoKOnly4",
+            got: storage_variant_name(&cache.storage),
+        });
     };
     let max_seq = *max_seq;
 
@@ -1236,10 +1226,10 @@ pub(super) fn iso_k_only_gpu_append(
         iso_k_only_gpu_append_at::<4>(k, max_seq, "IsoKOnly4", new_k, new_shape, device)
     } else {
         // Unreachable: the width read above accepted no other variant.
-        Err(iso_storage_mismatch(
-            "IsoKOnly3 | IsoKOnly4",
-            &cache.storage,
-        ))
+        Err(Error::KvStorageMismatch {
+            expected: "IsoKOnly3 | IsoKOnly4",
+            got: storage_variant_name(&cache.storage),
+        })
     }
 }
 
@@ -1325,7 +1315,10 @@ pub(super) fn iso_sym_gpu_append(
 ) -> Result<()> {
     let (KvStorage::IsoSym3 { max_seq, .. } | KvStorage::IsoSym4 { max_seq, .. }) = &cache.storage
     else {
-        return Err(iso_storage_mismatch("IsoSym3 | IsoSym4", &cache.storage));
+        return Err(Error::KvStorageMismatch {
+            expected: "IsoSym3 | IsoSym4",
+            got: storage_variant_name(&cache.storage),
+        });
     };
     let max_seq = *max_seq;
 
@@ -1335,7 +1328,10 @@ pub(super) fn iso_sym_gpu_append(
         iso_sym_gpu_append_at::<4>(k, v, max_seq, "IsoSym4", new_k, new_v, new_shape, device)
     } else {
         // Unreachable: the width read above accepted no other variant.
-        Err(iso_storage_mismatch("IsoSym3 | IsoSym4", &cache.storage))
+        Err(Error::KvStorageMismatch {
+            expected: "IsoSym3 | IsoSym4",
+            got: storage_variant_name(&cache.storage),
+        })
     }
 }
 
@@ -6121,9 +6117,9 @@ impl KvCache {
         }
 
         if let KvStorage::IsoV3 { k, v, .. } = &mut self.storage {
-            iso_v_update::<3>(k, v, max_seq, new_k, new_v, device)
+            iso_v_update::<3>(k, v, max_seq, "IsoV3", new_k, new_v, device)
         } else if let KvStorage::IsoV4 { k, v, .. } = &mut self.storage {
-            iso_v_update::<4>(k, v, max_seq, new_k, new_v, device)
+            iso_v_update::<4>(k, v, max_seq, "IsoV4", new_k, new_v, device)
         } else {
             // Unreachable: the width read above accepted no other variant.
             Err(storage_mismatch("IsoV3 | IsoV4", &self.storage))
@@ -6185,7 +6181,10 @@ impl KvCache {
         let (KvStorage::IsoKOnly3 { max_seq, .. } | KvStorage::IsoKOnly4 { max_seq, .. }) =
             &self.storage
         else {
-            return Err(iso_storage_mismatch("IsoKOnly3 | IsoKOnly4", &self.storage));
+            return Err(Error::KvStorageMismatch {
+                expected: "IsoKOnly3 | IsoKOnly4",
+                got: storage_variant_name(&self.storage),
+            });
         };
         let max_seq = *max_seq;
 
@@ -6195,7 +6194,10 @@ impl KvCache {
             iso_k_only_k_side::<4>(k, max_seq, "IsoKOnly4", new_k, device)?
         } else {
             // Unreachable: the width read above accepted no other variant.
-            return Err(iso_storage_mismatch("IsoKOnly3 | IsoKOnly4", &self.storage));
+            return Err(Error::KvStorageMismatch {
+                expected: "IsoKOnly3 | IsoKOnly4",
+                got: storage_variant_name(&self.storage),
+            });
         };
 
         // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
@@ -6388,6 +6390,113 @@ impl KvCache {
 // to a code width and hand the stores here; a body below is the one arithmetic
 // both widths of a family share, with the width as the store's `BITS`.
 
+/// Encode one V chunk into an iso V store and return the V rows attention
+/// receives — the whole V axis of [`iso_v_update`] and [`iso_sym_update`].
+///
+/// Lazily creates the store, takes the GPU encode when `device` is
+/// `Device::Gpu` and the CPU one otherwise, and decodes through the matching
+/// entry. Each phase emits one structured `trace!` event, off by default; opt
+/// in with `--log verbose` or `RUST_LOG=rmlx_kv_quant=trace`. `variant` is the
+/// storage spelling the caller resolved: it names the store in the
+/// "buffer absent after init" diagnostic and in every trace event, which is
+/// what tells the two callers' events apart.
+///
+/// `v_f32` is read on the CPU route only; the GPU route takes `new_v`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the V axis carries its store, both forms of the chunk, the ring \
+              geometry and the spelling the caller resolved; a parameter struct \
+              would exist for these two calls"
+)]
+fn iso_v_encode_decode<const BITS: u8>(
+    v: &mut Option<QuantIsoV<BITS>>,
+    new_v: &Array,
+    v_f32: &[f32],
+    new_shape: &[i32],
+    max_seq: i32,
+    variant: &'static str,
+    device: Device,
+) -> Result<Array> {
+    if v.is_none() {
+        let mut init_shape = new_shape.to_vec();
+        init_shape[2] = 0;
+        *v = Some(QuantIsoV::<BITS>::new(init_shape));
+    }
+    let Some(vs) = v.as_mut() else {
+        return Err(Error::Mlx(format!("{variant} V buffer absent after init")));
+    };
+    let kv_h = new_shape[1];
+    let head_dim = new_shape[3];
+    let t_enc = std::time::Instant::now();
+    if device == Device::Gpu {
+        // `QuantIsoV::append_gpu` retains the encode outputs in a
+        // pre-allocated per-struct buffer so `dequant_gpu` below can skip the
+        // CPU-staged `Array::from_bytes` upload on every step.
+        vs.append_gpu(new_v, new_shape, max_seq, device)?;
+    } else {
+        vs.append(v_f32, new_shape)?;
+    }
+    let s_total = vs.shape[2];
+    tracing::trace!(
+        phase = "iso_encode",
+        bits = BITS,
+        variant,
+        ms = t_enc.elapsed().as_secs_f64() * 1e3,
+        s_total = s_total,
+        kv_h,
+        head_dim,
+        "iso hot-path"
+    );
+    // On GPU, skip the CPU dequant + vec_to_array round-trip and dispatch the
+    // dequant kernel over the packed plane directly. Single-pass GPU side, no
+    // intermediate Vec<f32> materialisation.
+    let v_shape = vs.shape.clone();
+    if device == Device::Gpu {
+        let t_deq = std::time::Instant::now();
+        let arr = vs.dequant_gpu(device)?;
+        tracing::trace!(
+            phase = "iso_dequant_gpu",
+            bits = BITS,
+            variant,
+            ms = t_deq.elapsed().as_secs_f64() * 1e3,
+            s_total = s_total,
+            kv_h,
+            head_dim,
+            "iso hot-path"
+        );
+        return Ok(arr);
+    }
+    let t_deq = std::time::Instant::now();
+    let v_recon_f32 = vs.dequant_on(device)?;
+    tracing::trace!(
+        phase = "iso_dequant_cpu",
+        bits = BITS,
+        variant,
+        ms = t_deq.elapsed().as_secs_f64() * 1e3,
+        s_total = s_total,
+        kv_h,
+        head_dim,
+        "iso hot-path"
+    );
+    let t_mat = std::time::Instant::now();
+    let arr = f32_vec_to_array(&v_recon_f32, &v_shape)?;
+    tracing::trace!(
+        phase = "iso_vec_to_array",
+        bits = BITS,
+        variant,
+        ms = t_mat.elapsed().as_secs_f64() * 1e3,
+        s_total = s_total,
+        kv_h,
+        head_dim,
+        "iso hot-path"
+    );
+    Ok(arr)
+}
+
 /// Decode update for `IsoV3` / `IsoV4`: K = affine q8_0, V = IsoQuant at
 /// `BITS`.
 ///
@@ -6402,13 +6511,16 @@ impl KvCache {
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
 #[allow(
-    clippy::unwrap_used,
-    reason = "Option is Some by construction immediately above this fn body's assignments"
+    clippy::too_many_arguments,
+    reason = "the iso update bodies carry both stores, the ring geometry and the \
+              width the caller resolved; a parameter struct would exist for \
+              this one call"
 )]
 fn iso_v_update<const BITS: u8>(
     k: &mut Option<QuantK>,
     v: &mut Option<QuantIsoV<BITS>>,
     max_seq: i32,
+    variant: &'static str,
     new_k: &Array,
     new_v: &Array,
     device: Device,
@@ -6441,7 +6553,9 @@ fn iso_v_update<const BITS: u8>(
             max_seq,
         });
     }
-    let ks = k.as_mut().unwrap();
+    let Some(ks) = k.as_mut() else {
+        return Err(Error::Mlx(format!("{variant} K buffer absent after init")));
+    };
     ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
     let k_shape = ks.shape.clone();
     let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
@@ -6450,78 +6564,8 @@ fn iso_v_update<const BITS: u8>(
         None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
     };
 
-    if v.is_none() {
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        *v = Some(QuantIsoV::<BITS>::new(init_shape));
-    }
-    let vs = v.as_mut().unwrap();
-    // Per-phase trace instrumentation for the iso V hot path. Each phase emits
-    // one structured `trace!` event. Off by default; opt in with `--log
-    // verbose` or `RUST_LOG=rmlx_kv_quant=trace`.
-    let kv_h = new_shape[1];
-    let head_dim = new_shape[3];
-    let t_enc = std::time::Instant::now();
-    if device == Device::Gpu {
-        // `QuantIsoV::append_gpu` retains the encode outputs in a
-        // pre-allocated per-struct buffer so `dequant_gpu` below can skip the
-        // CPU-staged `Array::from_bytes` upload on every step.
-        vs.append_gpu(new_v, &new_shape, max_seq, device)?;
-    } else {
-        vs.append(&v_f32, &new_shape)?;
-    }
-    let s_total = vs.shape[2];
-    tracing::trace!(
-        phase = "iso_encode",
-        bits = BITS,
-        ms = t_enc.elapsed().as_secs_f64() * 1e3,
-        s_total = s_total,
-        kv_h,
-        head_dim,
-        "iso hot-path"
-    );
-    // On GPU, skip the CPU dequant + vec_to_array round-trip and dispatch the
-    // dequant kernel over the packed plane directly. Single-pass GPU side, no
-    // intermediate Vec<f32> materialisation.
-    let v_shape = vs.shape.clone();
-    let v_full = if device == Device::Gpu {
-        let t_deq = std::time::Instant::now();
-        let arr = vs.dequant_gpu(device)?;
-        tracing::trace!(
-            phase = "iso_dequant_gpu",
-            bits = BITS,
-            ms = t_deq.elapsed().as_secs_f64() * 1e3,
-            s_total = s_total,
-            kv_h,
-            head_dim,
-            "iso hot-path"
-        );
-        arr
-    } else {
-        let t_deq = std::time::Instant::now();
-        let v_recon_f32 = vs.dequant_on(device)?;
-        tracing::trace!(
-            phase = "iso_dequant_cpu",
-            bits = BITS,
-            ms = t_deq.elapsed().as_secs_f64() * 1e3,
-            s_total = s_total,
-            kv_h,
-            head_dim,
-            "iso hot-path"
-        );
-        let t_mat = std::time::Instant::now();
-        let arr = f32_vec_to_array(&v_recon_f32, &v_shape)?;
-        tracing::trace!(
-            phase = "iso_vec_to_array",
-            bits = BITS,
-            ms = t_mat.elapsed().as_secs_f64() * 1e3,
-            s_total = s_total,
-            kv_h,
-            head_dim,
-            "iso hot-path"
-        );
-        arr
-    };
+    let v_full =
+        iso_v_encode_decode::<BITS>(v, new_v, &v_f32, &new_shape, max_seq, variant, device)?;
 
     Ok((k_full, v_full))
 }
@@ -6584,72 +6628,8 @@ fn iso_sym_update<const BITS: u8>(
         f32_vec_to_array(&k_recon_f32, &k_shape)?
     };
 
-    if v.is_none() {
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        *v = Some(QuantIsoV::<BITS>::new(init_shape));
-    }
-    let Some(vs) = v.as_mut() else {
-        return Err(Error::Mlx(format!("{variant} V buffer absent after init")));
-    };
-    // Per-phase trace instrumentation for the iso V side of the sym path.
-    let kv_h = new_shape[1];
-    let head_dim = new_shape[3];
-    let t_enc = std::time::Instant::now();
-    if device == Device::Gpu {
-        vs.append_gpu(new_v, &new_shape, max_seq, device)?;
-    } else {
-        vs.append(&v_f32, &new_shape)?;
-    }
-    let s_total = vs.shape[2];
-    tracing::trace!(
-        phase = "iso_encode",
-        bits = BITS,
-        ms = t_enc.elapsed().as_secs_f64() * 1e3,
-        s_total = s_total,
-        kv_h,
-        head_dim,
-        "iso hot-path (sym V)"
-    );
-    let v_shape = vs.shape.clone();
-    let v_full = if device == Device::Gpu {
-        let t_deq = std::time::Instant::now();
-        let arr = vs.dequant_gpu(device)?;
-        tracing::trace!(
-            phase = "iso_dequant_gpu",
-            bits = BITS,
-            ms = t_deq.elapsed().as_secs_f64() * 1e3,
-            s_total = s_total,
-            kv_h,
-            head_dim,
-            "iso hot-path (sym V)"
-        );
-        arr
-    } else {
-        let t_deq = std::time::Instant::now();
-        let v_recon_f32 = vs.dequant_on(device)?;
-        tracing::trace!(
-            phase = "iso_dequant_cpu",
-            bits = BITS,
-            ms = t_deq.elapsed().as_secs_f64() * 1e3,
-            s_total = s_total,
-            kv_h,
-            head_dim,
-            "iso hot-path (sym V)"
-        );
-        let t_mat = std::time::Instant::now();
-        let arr = f32_vec_to_array(&v_recon_f32, &v_shape)?;
-        tracing::trace!(
-            phase = "iso_vec_to_array",
-            bits = BITS,
-            ms = t_mat.elapsed().as_secs_f64() * 1e3,
-            s_total = s_total,
-            kv_h,
-            head_dim,
-            "iso hot-path (sym V)"
-        );
-        arr
-    };
+    let v_full =
+        iso_v_encode_decode::<BITS>(v, new_v, &v_f32, &new_shape, max_seq, variant, device)?;
 
     Ok((k_full, v_full))
 }

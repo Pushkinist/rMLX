@@ -2675,7 +2675,8 @@ The GPU dispatch is on: when `device == Device::Gpu`, `update_iso_v` /
 `QuantIsoK::dequant_gpu`. The dequant methods concatenate per-block CPU
 payload (codes / scales / quaternions / per-token-norm-expanded-to-per-group)
 into single byte buffers, upload them to the GPU **once** via
-`Array::from_bytes`, dispatch `iso_dequantize_v3_gpu`, then reshape the flat
+`Array::from_bytes`, dispatch the dequant kernel `isoquant_msl_dispatch`
+selects for the store's width, then reshape the flat
 f32 output to `[B, kv_h, S, D]`. No intermediate `Vec<f32>` is materialised
 on the CPU side. CPU path remains intact and is the fallback for `Device::Cpu`.
 

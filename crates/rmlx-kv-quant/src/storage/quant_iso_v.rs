@@ -226,12 +226,29 @@ impl<const BITS: u8> std::fmt::Debug for QuantIsoV<BITS> {
 }
 
 impl<const BITS: u8> QuantIsoV<BITS> {
+    /// The codec ships two widths and one kernel pair per width. A third
+    /// instantiation has neither, so it is refused where a reader can see it —
+    /// at compile time — rather than by a `_` arm that would format it as the
+    /// 4-bit store and by a runtime refusal from the kernel dispatch.
+    const WIDTH_IS_A_SHIPPED_ONE: () = assert!(
+        BITS == ISO3_BITS || BITS == ISO4_BITS,
+        "the iso codec ships 3-bit and 4-bit only"
+    );
+
+    /// Name of this width's store, for a diagnostic that must not allocate.
+    const NAME: &'static str = if BITS == ISO3_BITS {
+        "QuantIsoV3"
+    } else {
+        "QuantIsoV4"
+    };
+
     /// Construct an empty store for `init_shape = [B, kv_h, 0, D]`.
     ///
     /// The seq dim of `init_shape` should be 0 — the first `append` call
     /// supplies `new_shape` with the actual seq increment.
     #[must_use]
     pub fn new(init_shape: Vec<i32>) -> Self {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         Self {
             blocks: Vec::new(),
             gpu: QuantKGpuRing::default(),
@@ -522,8 +539,7 @@ impl<const BITS: u8> QuantIsoV<BITS> {
                 "QuantIsoV{BITS}::gpu_append: head_dim={head_dim} yields no quaternion groups"
             )));
         }
-        let code_words =
-            crate::storage::iso_code_words_i32(head_dim, BITS, "QuantIsoV::gpu_append")?;
+        let code_words = crate::storage::iso_code_words_i32(head_dim, BITS, Self::NAME)?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
             self.gpu.seed_from_cpu(
@@ -809,7 +825,14 @@ impl<const BITS: u8> QuantIsoV<BITS> {
         // `quats_gpu` is a constant FIXED_QUAT-filled placeholder that the
         // dequant kernel never reads; we forward it to the readback for ABI
         // parity and then drop it.
-        let v_seq_major = v_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
+        // A one-token chunk is its own sequence-major form, so skip the copy
+        // on the decode hot path — the same shortcut `packed_k_chunk_seq_major`
+        // takes for the `kvcache` appenders.
+        let v_seq_major = if s_new == 1 {
+            v_arr.try_clone()?
+        } else {
+            v_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?
+        };
         let (codes_gpu, scales_gpu, quats_gpu, norms_gpu) =
             crate::isoquant_msl_dispatch::iso_quantize_gpu(
                 &v_seq_major,
