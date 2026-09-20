@@ -1,14 +1,22 @@
 # Iso storage and update twins
 
-The 3-bit and 4-bit iso storage types and their `update_*` bodies are the
-second width-twin pair in `rmlx-kv-quant`, after the rotor pilot.
+The 3-bit and 4-bit iso storage types and their `update_*` bodies were the
+second width-twin pair in `rmlx-kv-quant`, after the rotor pilot. They are
+collapsed: the stores are `QuantIsoV<BITS>` and `QuantIsoK<BITS>` with the
+width-named spellings as type aliases, and the six `update_iso*` entries are
+three, each resolving the width from the `KvStorage` variant it was
+dispatched on.
+
+This doc is the record of that collapse: the premise it was decided on, the
+bound the one behaviour change is held to, the oracle, the mutation run
+against the collapsed tree, and what was removed.
 
 **The method is not restated here.** [`docs/KV_ROTOR_TWINS.md`](KV_ROTOR_TWINS.md)
 holds it: how a premise is re-measured against the tree, why a served digest is
 not the oracle, what a store-bytes pin is, how a mutation run is conducted, and
 how the duplication figure is produced. This doc holds only what the iso family
 does differently — the drift, the GPU decision the collapse forces, the fidelity
-bound, the iso mutation list, and the removals owed.
+bound, the iso mutation list, and the removals the collapse made.
 
 **Why a second doc rather than a widened one.** The method is about a tenth of
 the rotor doc's text; the premise, the mutation list and the removals are the
@@ -21,7 +29,11 @@ doc is already 41 KB against the 200 KB advisory ceiling
 The oracle itself is
 `crates/rmlx-kv-quant/src/kvcache/iso_store_bytes_tests.rs`.
 
-## 1. Premise, re-measured against the tree
+## 1. Premise, re-measured against the tree — the pre-collapse baseline
+
+**Everything in this section describes the tree before the collapse.** It is
+kept because it is the evidence the decision was taken on, and because a
+"removed N duplicated lines" claim with no measured baseline is not a claim.
 
 Re-derived at the branch point, not restated. Method: strip the width digit from
 every iso token in both members of a pair (`iso3`/`iso4` -> `iso`, `ISO3_`/`ISO4_`
@@ -39,6 +51,10 @@ files carry very different amounts of prose.
 | `update_iso_k_only_3` / `_4` | 92 / 40 | 62 | — | new row; the issue's table omits this pair |
 | `isoquant_dequantize_iso3.metal` / `iso4` | 37 / 36 | 2 | 27 / 27, **0** | MOVED (issue: 3) |
 | `isoquant_quantize_iso3.metal` / `iso4` | 59 / 62 | 28 | 39 / 39, **2** | new row |
+
+Measured after the collapse, by the same tool and the same rule (§5): both
+storage pairs and all three `update_iso*` pairs are gone, and the two
+populations report a measured `0` with the population still found.
 
 The `update_*` line counts are fn **bodies**, brace to brace, which is the unit
 `scripts/lib/debt_report.py` measures and the unit §5 quotes. The issue's
@@ -98,11 +114,12 @@ expected to move**, and a cell that does is a finding, not the intended change.
 `exit_prefill` is symmetric too: its `Iso3Sym`/`Iso4Sym` and
 `IsoKOnly3`/`IsoKOnly4` arms are the same CPU bulk `append` at both widths.
 
-### The one live behaviour difference
+### The one live behaviour difference — what the collapse removed
 
-It is on the **non-fused** route, which runs on a `Device::Cpu` drive, at
+It was on the **non-fused** route, which runs on a `Device::Gpu` drive at
 `q_seq > 1`, and whenever `iso_flash_shape_ok` rejects — a batched cache, or a
-`head_dim` that is not a power of two — and the step falls through to `update()`:
+`head_dim` that is not a power of two — and the step falls through to
+`update()`. Before the collapse:
 
 | Entry | 3-bit | 4-bit |
 |---|---|---|
@@ -110,9 +127,12 @@ It is on the **non-fused** route, which runs on a `Device::Cpu` drive, at
 | `update_iso*_sym` (K axis) | `ks.dequant_gpu(device)` on GPU | `ks.dequant()` |
 | `update_iso_k_only_*` | `ks.dequant_gpu(device)` on GPU | `ks.dequant()` |
 
-`QuantIsoV4` has no `dequant_gpu` and no `dequant_on`; `QuantIsoK4` has neither
-either. That is the asymmetry the collapse removes, and it is a real behaviour
-change — just not on the route the issue named.
+`QuantIsoV4` had no `dequant_gpu` and no `dequant_on`; `QuantIsoK4` had
+neither either. That is the asymmetry the collapse removed, and it is a real
+behaviour change — just not on the route the issue named. Both widths now
+reach the same `dequant_gpu` / `dequant_on` body, and both reach their own
+kernel through `crate::isoquant_msl_dispatch`, which is the one place `bits`
+selects a kernel module.
 
 ### Three facts the issue's list does not carry
 
@@ -126,27 +146,31 @@ change — just not on the route the issue named.
    stale the moment the window grows — the same trap `QuantRotorK{3,4}` used to
    carry". `QuantIsoK3` and `QuantIsoK4` both carry one and both call it inert.
    The constructors differ accordingly: `QuantIsoV3::new(init_shape)` against
-   `QuantIsoV4::new(init_shape, max_seq)`. The collapse must resolve this, and
-   the direction the tree already argues for is to drop the field — see §7.
+   `QuantIsoV4::new(init_shape, max_seq)`. The collapse resolved it by dropping
+   the field, which is the direction the V3 comment already argued for; the
+   unified constructor is `QuantIsoV::<BITS>::new(init_shape)`.
 3. **`crates/rmlx-kv-quant/src/kvcache/sdpa.rs` carries no iso width twins.**
    Its fourteen iso helpers are already width-generic: each reads the width off
-   the live `KvStorage` variant. The collapse touches `update.rs` and
-   `storage/`, not `sdpa.rs`.
+   the live `KvStorage` variant. The collapse touched `update.rs` and
+   `storage/`, plus two lines of `sdpa.rs`: its `iso_k_gpu_append` and
+   `iso_sym_gpu_append` wrappers existed only to pick between the two
+   width-named entries, so they went with those entries and their one caller
+   each now calls the update dispatcher directly.
 
-## 2. The GPU decision, stated as a constraint
+## 2. The GPU decision, as taken
 
-The issue leaves one decision open: does the 4-bit iso path get the GPU mirror?
-§1 splits that question in two, and the two halves have different answers.
+The issue left one decision open: does the 4-bit iso path get the GPU mirror?
+§1 splits that question in two, and the two halves got different answers.
 
-**The GPU *decode* entry: yes, and it is forced.** Once `QuantIsoV<BITS>` and
-`QuantIsoK<BITS>` are one type each, `dequant_gpu` and `dequant_on` are one body
-each and both widths have them. Leaving the 4-bit width without them would mean
-keeping two types, which is the thing being removed. This is the behaviour
-change, and §"What may move" below states its bound.
+**The GPU *decode* entry: yes, and it was forced.** With `QuantIsoV<BITS>` and
+`QuantIsoK<BITS>` one type each, `dequant_gpu` and `dequant_on` are one body
+each and both widths have them. Leaving the 4-bit width without them would have
+meant keeping two types, which is the thing being removed. This is the
+behaviour change, and §"What may move" below states its bound.
 
-**The GPU-resident *mirror*: it comes along, and it changes nothing.** The
+**The GPU-resident *mirror*: it came along, and it changes nothing.** The
 mirror write in `append_gpu` is behind a `false` constant in production, so
-generic-ing it hands the 4-bit width a path that writes no byte. That is not a
+generic-ing it handed the 4-bit width a path that writes no byte. That is not a
 new dead path — it is the existing dead path, now one copy instead of
 one-and-a-half. **Deleting the mirror outright is the better change and it is
 not this issue's.** It is dead code behind a gate no production build can open,
@@ -169,8 +193,9 @@ done here.
   `KvStorage` variants, the CLI names, the layout tags, the four `.metal` kernel
   entry points and `scripts/gpu_validation_census.txt`.
 * `make check-kv-codec-disposition`'s verdict per codec. No disposition
-  predicate arm changes: the collapse moves no codec between the bf16-mirror
-  class and the store-reading class.
+  predicate arm changed: the collapse moved no codec between the bf16-mirror
+  class and the store-reading class. Measured after: 28 codecs classified, 17
+  inert — the same verdict as before.
 
 ### (b) What may move, and how far
 
@@ -190,12 +215,14 @@ The bound is documented and the 3-bit path is already held to it. From
 > tolerance) and additionally enforces a strict ≤ 1e-6 bound.
 
 The test itself asserts both: a per-element `diff <= 5e-3` and, after the loop,
-`max_abs <= 1e-6`. **The 4-bit path is held to the same pair.** What exists for
-it today is weaker — `iso_v4_msl_matches_cpu_within_eps` in
-`crates/rmlx-kv-quant/src/isoquant_msl_v4_tests.rs` gates at 5e-3 only, on the
-kernel rather than on `dequant_gpu`, because there is no 4-bit `dequant_gpu` to
-compare against. The code chunk owes the two 4-bit siblings of the 3-bit tests,
-at the same two bounds. §4 names them.
+`max_abs <= 1e-6`. **The 4-bit path is held to the same pair**, by
+`iso_v4_dequant_gpu_matches_dequant_cpu` and
+`iso_k4_dequant_gpu_matches_dequant_cpu` in
+`crates/rmlx-kv-quant/src/isoquant_msl_v4_tests.rs`, both `#[ignore]`-gated.
+They share one `assert_dequant_parity` body, because writing the two bounds out
+twice would plant the twin this change removes. What existed before is weaker
+and stays beside them: `iso_v4_msl_matches_cpu_within_eps` gates at 5e-3 only
+and compares the kernels, not the store entries a decode step calls.
 
 The codec's own quality floors are unchanged by the collapse and are restated
 here only so the two kinds of bound are not confused: `iso3_cosine_gate` gates
@@ -227,8 +254,8 @@ family:
   stores that carry one and absent on the fourth; pinning it would force a
   re-baseline whichever way §7's removal goes.
 * **The 4-bit rows are the reference.** They are the CPU side the future 4-bit
-  `dequant_gpu` is compared against. They are not allowed to move: the new
-  entry is on `Device::Gpu` and every cell here drives `Device::Cpu`.
+  `dequant_gpu` is compared against. They did not move: the new entry is on
+  `Device::Gpu` and every cell here drives `Device::Cpu`.
 
 ### The census
 
@@ -245,21 +272,21 @@ are exactly the six the list holds. **No iso spelling is missing from the list,
 and the list names none the issue omits.** That is where this family differs
 from the rotor pilot, whose census found two omitted pairs.
 
-### What the CPU oracle cannot see, and the GPU test owed for each
+### What the CPU oracle cannot see, and the GPU test that covers each
 
-| Unseen | GPU test owed | Census entry owed |
+| Unseen | GPU test that covers it | Census entry |
 |---|---|---|
-| 4-bit `dequant_gpu` against the CPU reference, V axis | `iso_v4_dequant_gpu_matches_dequant_cpu`, sibling of the 3-bit test in `isoquant_msl_v4_tests.rs`, both bounds (5e-3 per element, `max_abs <= 1e-6`) | yes — a new `#[ignore]` GPU test that loads no checkpoint still derives its `scripts/gpu_validation_census.txt` entry from the kernels it dispatches |
-| 4-bit `dequant_gpu` against the CPU reference, K axis | `iso_k4_dequant_gpu_matches_dequant_cpu`, same file, same bounds | yes |
+| 4-bit `dequant_gpu` against the CPU reference, V axis | `iso_v4_dequant_gpu_matches_dequant_cpu` in `isoquant_msl_v4_tests.rs`, both bounds (5e-3 per element, `max_abs <= 1e-6`) — **written** | derived from a run: the runner fails on an unpinned hit, so a clean pass is the evidence and no entry is the answer |
+| 4-bit `dequant_gpu` against the CPU reference, K axis | `iso_k4_dequant_gpu_matches_dequant_cpu`, same file, same bounds — **written** | same |
 | `gpu_append` / `gpu_packed_view` / `reconcile_ring` at both widths | already covered: `kvcache::iso_flash_dispatch_tests` and `kvcache::resident_ring_tests` | no new entry; re-derive if a cell gains a load |
 | The ring-readback branch of `synced_iso_v_blocks` | `kvcache::iso_flash_dispatch_tests` | no |
 | `QuantIsoV::append_gpu`'s mirror write | none, and §4's M14 is why that is safe to say: the production value is the constant `GPU_RESIDENT_ISO_PRODUCTION`, `the_production_gpu_resident_iso_mirror_is_off` asserts on that constant, and flipping it turns the assertion red. The test dispatches nothing | no |
 | The `exit_prefill` bulk-encode arms | the served capture in §6 | no |
 
-**No GPU test is written in this chunk.** Each of the two owed ones needs a
-`scripts/gpu_validation_census.txt` entry derived in the same change and a
-`make gpu-test HALF=codec` run to bless it, which is the integration window's
-work, not chunk 0's.
+Both tests are written. Their census disposition is derived from a run rather
+than asserted: `scripts/gpu_validation_census.txt` records **accepted invalid
+accesses**, so a test that produces no shader-validation hit carries no entry,
+and that is the same disposition the 3-bit pair has.
 
 ## 4. Mutations
 
@@ -269,21 +296,26 @@ applied to the tree, run, and reverted from a snapshot whose sha256 of the
 it would revert uncommitted work. Each row names the assertion that caught it,
 not just that something failed.
 
+**The run below is against the collapsed tree.** Each row states its target in
+the collapsed tree; where the collapse merged two bodies, the same edit now
+reaches both widths and the row says which cell reports it. The recall is
+unchanged: 13 of 14 red, and M11 is still the one it cannot catch.
+
 | # | Edit | Caught by |
 |---|---|---|
-| M1 | `quant_iso_v4.rs` `append` — encode at `3` instead of `ISO4_BITS`, i.e. a generic instantiated at the wrong width | 4 of the 6 tests: the pin, the geometry, the twins control and the reproducibility drive. First line `iso4 decode: isoquant: code plane holds 288 words for 24 rows, which need 384` |
-| M2 | `quant_iso_v4.rs` `append` — drop the last code word (`codes.pop()`) | the same 4. First line `code plane holds 383 words for 24 rows, which need 384` |
-| M3 | `quant_iso_v.rs` — `ISO3_GROUP_SIZE` 4 -> 8, moving the quaternion group boundary | the pin (`iso3 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`) **and** the geometry (scale count 384 against 768) |
+| M1 | `QuantIsoV::append` — encode at the literal `3` instead of `BITS`, i.e. a generic instantiated at the wrong width | 4 of the 6 tests: the pin, the geometry, the twins control and the reproducibility drive. **This is the width mis-resolution case, and it is red, not a compile error**: `BITS` and a literal are both `u8`, so nothing in the type system separates them |
+| M2 | `QuantIsoV::append` — drop the last code word (`codes.pop()`) | the same 4 |
+| M3 | `quant_iso_k.rs` — `ISO_QUAT_BLOCK_SIZE` 4 -> 8, moving the quaternion group boundary. One constant now, where the pre-collapse run edited `ISO3_GROUP_SIZE` | the pin (`iso3 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`) **and** the geometry (scale count 384 against 768) |
 | M4 | `isoquant.rs` — `FIXED_QUAT` replaced by `[0.5, 0.5, 0.5, 0.5]`, the codec's one rotation constant | the pin **only** (`iso3 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`); geometry stays green, because the code plane is the same length |
-| M5 | `update_iso4_sym` — the K store appends `v_f32`, so the symmetric entry writes V's data on both axes | the pin **only** (`iso4_sym @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`) |
-| M6 | `update_iso_k_only_4` — the K store appends `new_v`, so the K-only entry stores the V stream | the pin **only** (`k_iso4 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`) |
-| M7 | `quant_iso_v.rs` `truncate_to` — `(n - 1).max(0)` | the pin's **truncate** column **only** (`iso3 @ kv_h=1 head_dim=128: packed store bytes after truncate_to moved`) |
-| M8 | `quant_iso_v4.rs` `dequant` — drop `transpose_chunked_seq_heads`; the store is untouched, only the rows the attention receives move | the pin's **rows** column only, at **shape B only** (`iso4 @ kv_h=4 head_dim=96: the K/V rows attention receives moved`). This is the 4-bit CPU decode, and it is the reference the future GPU entry is compared against |
+| M5 | `iso_sym_update` — the K store appends `v_f32`, so the symmetric entry writes V's data on both axes | the pin **only**. It now reports at `iso3_sym` rather than `iso4_sym`, because one body serves both widths and the 3-bit cell is driven first |
+| M6 | `KvCache::update_iso_k_only` — `new_v` handed to `iso_k_only_k_side` instead of `new_k`, so the K-only entry stores the V stream | the pin **only** (`k_iso3 @ kv_h=1 head_dim=128: packed store bytes after the bulk append moved`) |
+| M7 | `QuantIsoV::truncate_to` — `(n - 1).max(0)` | the pin's **truncate** column **only** (`iso3 @ kv_h=1 head_dim=128: packed store bytes after truncate_to moved`) |
+| M8 | `QuantIsoV::dequant_on` — drop `transpose_chunked_seq_heads`; the store is untouched, only the rows the attention receives move | the pin's **rows** column only, at **shape B only** (`iso3 @ kv_h=4 head_dim=96: the K/V rows attention receives moved`) |
 | M9 | `quant.rs` — `KvQuant::Iso4` removed from `ALL_KV_QUANTS` | the census (`iso spelling census moved … ["iso3", "iso3_sym", "iso4_sym", "k_iso3", "k_iso4"]`, left 5 right 6) |
 | M10 | `quant.rs` — `KvQuant::Iso3` listed twice in `ALL_KV_QUANTS`, standing in for a seventh iso spelling | the census (left 7 right 6). It exercises the count anchor only: a genuinely new variant would also miss `pin_for` and turn the pin test red, which this stand-in cannot show without wiring a variant through every exhaustive match |
-| M11 | `quant_iso_v4.rs` `gpu_append` — `n_groups + 1` into `append_encoded` | **uncaught** — 6 passed, exit 0 |
-| M12 | `quant_iso_v4.rs` `byte_size` — drop the CPU-blocks term | the pin's **resident_bytes** column only (`iso4 @ kv_h=1 head_dim=128: resident_bytes moved`, left 3564 right 22680) |
-| M13 | `quant_iso_k4.rs` `append` — coalesce a one-token block into its predecessor after the push, so the payload is identical and only the block boundaries move | the pin's **store_after_decode** column only (`iso4_sym @ kv_h=1 head_dim=128: packed store bytes after 3 decode steps moved`). The chunk column and the geometry stay green: the first append has no predecessor to merge into, and the summed plane lengths do not change |
+| M11 | `QuantIsoV::gpu_append` — `n_groups + 1` into `append_encoded` | **uncaught** — 6 passed, exit 0 |
+| M12 | `QuantIsoV::byte_size` — drop the CPU-blocks term | the pin's **resident_bytes** column only (`iso3 @ kv_h=1 head_dim=128: resident_bytes moved`, left 3564 right 22248) |
+| M13 | `QuantIsoK::append` — coalesce a one-token block into its predecessor after the push, so the payload is identical and only the block boundaries move | the pin's **store_after_decode** column only (`iso3_sym @ kv_h=1 head_dim=128: packed store bytes after 3 decode steps moved`). The chunk column and the geometry stay green: the first append has no predecessor to merge into, and the summed plane lengths do not change |
 | M14 | `lib.rs` — `GPU_RESIDENT_ISO_PRODUCTION` flipped to `true` | `the_production_gpu_resident_iso_mirror_is_off` (`the GPU-resident iso V mirror is on in production`). Its control is below |
 
 M4, M5, M6, M7, M8, M12 and M13 are each caught by exactly one assertion, and
@@ -291,6 +323,17 @@ M7, M8, M12 and M13 each by exactly one **column** — truncate, rows,
 resident_bytes and store_after_decode respectively. With M1 and M2 on the chunk
 column, all five columns are load-bearing rather than redundant. M8 fires at one
 shape only, which is why both shapes are.
+
+**What the collapse cost the mutation set, and what it did not.** Five rows
+(M5, M6, M8, M12, M13) used to name a 4-bit-only body and now name a shared
+one, so each reports at the 3-bit cell instead of the 4-bit one. The assertion
+that fires, the column it fires on and the count of cells that fail are
+otherwise unchanged. What is genuinely lost is the *independence* of the two
+widths under those five edits: before, an edit to the 4-bit body could not
+move a 3-bit cell, and the pin said so. After, one body serves both, and the
+pin's answer to "did the 4-bit width move on its own?" is a question the tree
+no longer has a place to ask. That is the intended consequence of having one
+body, not a gap in the oracle.
 
 ### M14's control, and why the assertion reads a constant
 
@@ -312,7 +355,7 @@ held a lock against — and it needs no lock to be free of it.
 
 ### The mutation I could not catch
 
-**M11.** `QuantIsoV4::gpu_append` is handed one more quaternion group than the
+**M11.** `QuantIsoV::gpu_append` is handed one more quaternion group than the
 head dimension has, and every one of the six tests passes.
 
 The reason is structural, not an oversight in the assertions: `gpu_append`
@@ -326,6 +369,14 @@ CRATE=rmlx-kv-quant` turned it red, on two named tests. That measurement is
 **not repeated here** — it needs an idle GPU and belongs to the integration
 window.
 
+Two further things this run cannot see, both stated so the reviewer does not
+read the 13-of-14 as wider than it is. The pin drives `Device::Cpu`, so the
+new 4-bit `dequant_gpu` entry — the collapse's one behaviour change — is
+outside every row above; the two GPU parity tests in §3 are what covers it.
+And no row mutates the width dispatch in `isoquant_msl_dispatch`, because the
+pin never dispatches a kernel; a width sent to the wrong kernel module is a
+`make gpu-test` finding, not a `make ci` one.
+
 So the honest statement of this oracle's power: it covers the CPU encode, the
 CPU decode, the block bookkeeping, `truncate_to` and residency at both widths
 and both shapes, and it covers **nothing on the ring**. `make gpu-test
@@ -335,30 +386,40 @@ read its result rather than this file's.
 
 ## 5. Duplication figure
 
-`scripts/debt_report.sh --matched-lines` carries no iso population today. Its
-five populations are `drivers`, `impls`, `rotor-storage`, `rotor-updates` and
-`ssd-hydrate`; none of them reaches a `quant_iso_*` file or an `update_iso*` fn.
-
-The figures below are a **hand-run** of that module's own `normalize()` and
-`matched_lines()` over two populations defined exactly as the rotor ones are —
-a glob plus the digit-stripped `width_pair_key`, never a file or fn list. No
-second matcher was written: the script was imported and its functions called.
+`scripts/debt_report.sh --matched-lines` now carries `iso-storage` and
+`iso-updates`, beside the rotor pair and not in place of it. One command
+measures both tree shapes, which is what makes the before and after
+comparable:
 
 ```
+$ bash scripts/debt_report.sh --matched-lines iso-storage     # before
 iso storage twins (crates/rmlx-kv-quant/src/storage): 651 matched lines over 2984 body lines (4 item(s), 2 pair(s))
-    quant_iso_k <-> quant_iso_k4: 338 (86.0 % of the shorter body)
-    quant_iso_v <-> quant_iso_v4: 313 (76.9 % of the shorter body)
+$ bash scripts/debt_report.sh --matched-lines iso-updates     # before
 iso update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 162 matched lines over 532 body lines (6 item(s), 3 pair(s))
-    update_iso3 <-> update_iso4: 69 (86.2 % of the shorter body)
-    update_iso_k_only_3 <-> update_iso_k_only_4: 38 (95.0 % of the shorter body)
-    update_iso3_sym <-> update_iso4_sym: 55 (76.4 % of the shorter body)
+
+$ bash scripts/debt_report.sh --matched-lines iso-storage     # after
+iso storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 2234 body lines (2 item(s), 0 pair(s))
+$ bash scripts/debt_report.sh --matched-lines iso-updates     # after
+iso update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 62 body lines (3 item(s), 0 pair(s))
 ```
 
-### The population design item the code chunk owes
+The "before" arm is the tool run with `--root` pointing at a worktree of the
+commit before the collapse, so the same code produces both figures. A measured
+`0` **with the population still found** is the answer that matters: a deleted
+population would print `unavailable` and exit 1, and a population that quietly
+resolved to nothing would be indistinguishable from a collapsed one if the
+module let it print `0`.
+
+The pre-collapse per-pair breakdown, for the record: `quant_iso_k` against
+`quant_iso_k4` 338 lines (86.0 % of the shorter body), `quant_iso_v` against
+`quant_iso_v4` 313 (76.9 %); `update_iso3` against `update_iso4` 69 (86.2 %),
+`update_iso_k_only_3` against `_4` 38 (95.0 %), `update_iso3_sym` against
+`update_iso4_sym` 55 (76.4 %).
+
+### The population design
 
 Two entries in `MATCHED_LINES_POPULATIONS`, beside the rotor ones and not in
-place of them, each a glob plus a name rule so one command measures the tree
-that carries the width twins and the tree that has collapsed them:
+place of them, each a glob plus a name rule:
 
 * **`iso-storage`** — the non-test `quant_iso_*.rs` files under
   `crates/rmlx-kv-quant/src/storage`, paired inside a group sharing the filename
@@ -368,32 +429,36 @@ that carries the width twins and the tree that has collapsed them:
   `crates/rmlx-kv-quant/src/kvcache/update.rs`, paired by the same
   digit-stripped-name rule.
 
-Three things the code chunk should not get wrong, because the record already
-carries what is needed.
+Three things it gets right, each for a stated reason.
 
-1. **Parameterise at the registration site, not on the record.** `Population`
+1. **Parameterised at the registration site, not on the record.** `Population`
    already carries `collect` and `root`; the collector is a plain
-   `Callable[[Path], list[FnInfo]]`. So `rotor_storage_items` generalises to a
-   `storage_file_items(root, *, glob)` and both entries register
-   `functools.partial(storage_file_items, glob=...)`; `rotor_update_items`
-   generalises to a `file_fn_items(root, *, file, prefix)` the same way. Adding
-   a `glob` or `prefix` **field** to `Population` would make `drivers`, `impls`
-   and `ssd-hydrate` carry a field none of them reads.
-2. **`iso-storage` needs one new constant, not two.** `ROTOR_STORAGE_DIR` is
-   already `crates/rmlx-kv-quant/src/storage`, which is the iso stores' root
-   too; only the glob is new. (The name wants widening to `KV_STORAGE_DIR` in
-   the same change, since it will then have two callers and name neither.)
-3. **No CLI change is owed.** `--matched-lines`'s `choices` are
+   `Callable[[Path], list[FnInfo]]`. So `rotor_storage_items` generalised to
+   `storage_file_items(root, *, glob)` and all four width-twin entries register
+   `functools.partial(...)`; `rotor_update_items` generalised to
+   `file_fn_items(root, *, file, prefix)` the same way. A `glob` or `prefix`
+   **field** on `Population` would make `drivers`, `impls` and `ssd-hydrate`
+   carry a field none of them reads.
+2. **One root constant, not two.** `ROTOR_STORAGE_DIR` was already
+   `crates/rmlx-kv-quant/src/storage`, which is the iso stores' root too, and
+   `ROTOR_UPDATE_FILE` was already the one update file. Both now have two
+   callers and named neither, so they are `KV_STORAGE_DIR` and
+   `KV_UPDATE_FILE`.
+3. **No CLI change was owed.** `--matched-lines`'s `choices` are
    `sorted(MATCHED_LINES_POPULATIONS)`, so registering the two entries is what
-   adds them to the flag.
+   added them to the flag.
 
 Registering two more copies of the rotor collectors would plant the twin the
 campaign exists to remove.
 
-`scripts/debt_report_selftest.sh` owes matching cases: a planted figure per
-population, a measured `0` with the population still found once a width twin is
-deleted, and `unavailable` (reason **and** exit code) for a missing root and for
-a root that is there and empty. The rotor cases are the template.
+`scripts/debt_report_selftest.sh` carries the matching cases, 70 to 87: a
+planted figure per population (four `quant_iso_*.rs` files at 23 matched lines
+over 48, four `update_iso*` fns at 7 over 18, 2 pairs each), a measured `0`
+with the population still found once a width twin is deleted, and
+`unavailable` — reason **and** exit code — for a missing root and for a root
+that is there and empty. The iso fixtures sit in the same directory and the
+same file as the rotor ones, so a widened glob or a widened prefix reads the
+wrong item count on one of the two families.
 
 **What an `iso-updates` population cannot see.** Its glob is the `update_iso*`
 fns of one file, so the eight further iso width-twin pairs in that same file are
@@ -410,9 +475,8 @@ Not run in this chunk, and not run by the code chunk on its own initiative. They
 belong to the integration run at the end of the integration branch, and the
 decode-TPS row is owner-gated.
 
-**The "before" arm is built from the commit before the collapse.** The
-implementing chunk records that SHA in its PR body; it is not named here,
-because this doc is written before the collapse commit exists.
+**The "before" arm is the commit before the collapse**, which the PR body
+records by SHA.
 
 What the run must show:
 
@@ -445,57 +509,73 @@ Per-cell raw logs carry the absolute model-snapshot path and must never reach a
 commit message, a PR body, an issue or any other public surface. Only a
 commands file written with the model root elided may be quoted.
 
-## 7. Removals the code chunk owes
+## 7. Removals, done
 
-By file and by name.
+By file and by name. Every item below is deleted on the collapse commit; the
+PR body lists them again with the net line count.
 
-* `storage/quant_iso_v4.rs` — the whole file; its `QuantIsoV4` becomes
+* `storage/quant_iso_v4.rs` — the whole file; `QuantIsoV4` is now
   `pub type QuantIsoV4 = QuantIsoV<4>`.
 * `storage/quant_iso_k4.rs` — likewise for `QuantIsoK4`.
 * `storage/quant_iso_v.rs` and `quant_iso_k.rs` — kept and made generic, not
   deleted. `IsoBlocks`, its `BlockRows` impl, `synced_iso_v_blocks`,
-  `iso_n_groups_for` and `iso_row_words` are already width-agnostic and move
-  as-is.
+  `iso_n_groups_for` and `iso_row_words` are already width-agnostic and moved
+  as-is. `ISO4_BITS`, `ISO4_GROUP_SIZE`, `ISO_K4_BITS` and `ISO_K4_GROUP_SIZE`
+  moved with their types and keep their spellings, because `rmlx-kv-ssd`'s
+  tests name them.
 * `QuantIsoV4::max_seq` — the field, and the second parameter of
-  `QuantIsoV4::new`. `QuantIsoV3` deliberately carries neither and its own
-  comment gives the reason. Resolving the asymmetry the other way would
-  re-introduce the stale-window trap that comment names. The `KvStorage`
+  `QuantIsoV4::new`. `QuantIsoV3` deliberately carried neither and its own
+  comment gives the reason. Resolving the asymmetry the other way would have
+  re-introduced the stale-window trap that comment names. The `KvStorage`
   variants keep their `max_seq`; that is where the live window is read from.
-* `KvCache::update_iso4`, `update_iso4_sym`, `update_iso_k_only_4` in
-  `kvcache/update.rs` — three bodies, over three shared bodies generic over the
-  store's `BITS`.
-* The three entries above them — `update_iso3`, `update_iso3_sym`,
-  `update_iso_k_only_3` — become three, each resolving the width from the
-  `KvStorage` variant it was dispatched on, the shape `update_rotor_v` and its
-  siblings already have.
-* The eight further width-twin pairs in the same file, which cannot stay
-  per-width once the store is one type — a shared body could not call them:
-  `iso{3,4}_gpu_append_into_k_blocks`, `iso{3,4}_gpu_append_into_v_blocks`,
-  `iso{3,4}_k_only_gpu_append`, `iso{3,4}_sym_gpu_append`, `iso{3,4}_sync_ring`,
-  `iso{3,4}_v_sync_ring`, `push_iso{3,4}_k_block`,
-  `drop_blocks_when_ring_live_iso_k{3,4}` and
-  `drop_blocks_when_ring_live_iso_v{3,4}`. Sixteen fns become eight. With them
-  goes `iso4_v_gpu_append_for_test`, whose only job is to name the private
-  4-bit appender for a test.
-* `LEGACY_ISO4_V_FEED` — a `const RingFeed` with one width's name on it. The
-  unified V appender takes the feed its caller states. It has a live test
-  caller: `kvcache/ring_feed_routing_tests.rs` imports it and asserts on it
-  twice, so that cell becomes a cell over the feed the caller states rather
-  than over a width-named constant.
+* `KvCache::update_iso3`, `update_iso4`, `update_iso3_sym`, `update_iso4_sym`,
+  `update_iso_k_only_3` and `update_iso_k_only_4` — six entries over three:
+  `update_iso_v`, `update_iso_sym` and `update_iso_k_only`, each resolving the
+  width from the `KvStorage` variant it was dispatched on, the shape
+  `update_rotor_v` and its siblings already had. Their bodies are
+  `iso_v_update<BITS>`, `iso_sym_update<BITS>` and `iso_k_only_k_side<BITS>`,
+  beside the rotor bodies.
+* Nine further width-twin pairs in the same file, which could not stay
+  per-width once the store is one type — a shared body could not call them.
+  Eighteen fns over nine: `push_iso_k_block`, `iso_gpu_append_into_k_blocks`,
+  `iso_gpu_append_into_v_blocks`, `iso_k_sync_ring`, `iso_v_sync_ring`,
+  `drop_blocks_when_ring_live_iso_k`, `drop_blocks_when_ring_live_iso_v`,
+  `iso_k_only_gpu_append` and `iso_sym_gpu_append` (the last two a dispatcher
+  plus an `_at<BITS>` body, the rotor shape). With them went
+  `iso4_v_gpu_append_for_test`, whose only job was to name the private 4-bit
+  appender for a test; the seam is now `iso_v_gpu_append_for_test<BITS>` and
+  states its own feed.
+* `sdpa.rs`'s `iso_k_gpu_append` and `iso_sym_gpu_append` — two wrappers whose
+  only job was picking between the two width-named entries. Each had one
+  caller, which now calls the update dispatcher directly.
+* `LEGACY_ISO4_V_FEED` — a `const RingFeed` with one width's name on it. Its
+  `kvcache/ring_feed_routing_tests.rs` cell is now
+  `a_skip_feed_reaches_the_iso_v_block_path_at_every_shape`, over the feed the
+  caller states rather than over a width-named constant.
+* The two `bits` match blocks in `iso_gpu_encode_block_retaining` and
+  `iso_gpu_encode_ring_only`. Width dispatch has one home,
+  `crate::isoquant_msl_dispatch`, shared with the stores' `append_gpu` and
+  `dequant_gpu`. Without it the collapse would have planted three more copies
+  of that match.
 * The twin halves of the storage test files: `quant_iso_v4_tests.rs` and
-  `quant_iso_k4_tests.rs` fold into `quant_iso_v_tests.rs` /
+  `quant_iso_k4_tests.rs` folded into `quant_iso_v_tests.rs` /
   `quant_iso_k_tests.rs`. What is deleted is the duplicated **body**, not the
-  coverage: each case becomes one generic body with the width as a parameter
-  plus one `#[test]` per width, so the cell count does not fall.
-* The stale comment in `QuantIsoV3::append_gpu` that reads "in test mode it uses
-  OnceLock latching on first read". The `OnceLock` was removed; `lib.rs` says so
-  three lines from the gate. The unified body does not carry it forward.
+  coverage: each case is one generic body with the width as a parameter plus
+  one `#[test]` per width, so the cell count did not fall —
+  `cargo test -p rmlx-kv-quant` reports 572 passed on both sides of the
+  collapse.
+* `rotor_storage_mismatch` — renamed `storage_mismatch`. The iso V and
+  symmetric entries build the same `Error::Mlx`, and a second copy would have
+  been the twin this change exists to remove.
+* The stale comment in `QuantIsoV3::append_gpu` that read "in test mode it uses
+  OnceLock latching on first read". The `OnceLock` was removed; `lib.rs` says
+  so three lines from the gate.
 * The `QuantIsoV4` doc comment "CPU-only. The existing MSL kernel is hard-coded
-  for `bits=3`; an iso4 MSL kernel variant is deferred." Both halves are false
+  for `bits=3`; an iso4 MSL kernel variant is deferred." Both halves were false
   on this tree: the store carries a GPU ring, and
   `crates/rmlx-kv-quant/src/isoquant_msl_v4.rs` dispatches an iso4 kernel pair.
-  The same sentence is in the `KvStorage::IsoV4` variant doc and in
-  `KvStorage::IsoSym3`/`IsoSym4` ("CPU-only"), and goes with them.
+  The sentences in `docs/KV_QUANT.md` and `docs/KV_CACHE.md` that said the same
+  went with it.
 
 ### Kept, and why
 
@@ -514,34 +594,38 @@ By file and by name.
   is the better change — but it is not this one. §2 states the argument.
 * **No `KvQuant` variant, no `KvStorage` variant, no CLI spelling, no layout
   tag, no census entry.** Retirement is a separate session. Every spelling that
-  exists before exists after, with the same bytes and the same tokens.
+  existed before exists after, with the same bytes and the same tokens.
 * **No `check-*` Make target.** None keys on the iso storage file names;
   `check-kv-codec-disposition` keys on `ALL_KV_QUANTS` plus the disposition
   predicates, which are untouched.
 * **`scripts/lib/debt_report.py`'s existing populations.** The two iso ones are
   added beside them, not in place of them.
 
-## 8. What the test chunk ran
+## 8. What each chunk ran
 
-The oracle, the doc and the mutation run. No engine code, no GPU test, no
-served capture, no performance number.
+The test chunk ran the oracle, this doc and the first mutation run — no engine
+code, no GPU test, no served capture, no performance number. The code chunk
+ran the collapse and re-ran everything below.
 
 | Gate | Result |
 |---|---|
-| `cargo test -p rmlx-kv-quant --lib iso_store_bytes` | 6 passed, 0 failed |
-| `cargo test -p rmlx-kv-quant --lib rotor_store_bytes` | 5 passed, 0 failed — **no rotor pin was re-baselined**; the rotor file's `PINS` table is untouched |
-| `cargo test -p rmlx-kv-quant` | 572 passed, 0 failed, 257 ignored. The six added cells are the whole delta |
+| `cargo test -p rmlx-kv-quant --lib iso_store_bytes` | 6 passed, 0 failed, **0 pins edited** |
+| `cargo test -p rmlx-kv-quant --lib rotor_store_bytes` | 5 passed, 0 failed — the rotor `PINS` table is untouched |
+| `cargo test -p rmlx-kv-quant` | 572 passed, 0 failed, 257 ignored before the GPU tests landed; 259 ignored after |
 | `cargo fmt` | clean |
 | `make lint` | clean, `-D warnings` across the workspace |
 | `make check-no-inline-tests` | OK |
-| `make check-gpu-tests-ignored` | OK, 356 files across 12 workspace members |
+| `make check-gpu-tests-ignored` | OK, 354 files across 12 workspace members |
+| `make check-gpu-tests-ignored-fixtures` | OK |
 | `make check-doc-source-citations` | OK, 310 cited paths resolve |
-| `make check-kv-codec-disposition` | OK, 28 codecs classified, 17 inert |
+| `make check-kv-codec-disposition` | OK, 28 codecs classified, 17 inert — the verdict per codec is unchanged |
 | `make check-kv-layer-quants` | OK |
+| `make check-metal-compiles` | SKIP — this host has Xcode selected without the Metal Toolchain component. The hosted `msl` job is strict |
+| `make debt-report-selftest` | OK, 87 cases |
+| `make gpu-runner-selftest` | OK |
 
-`make ci` and `make ci-perf` are not run here. `make ci-perf` needs an idle GPU
-and belongs to the integration window with the two owed GPU tests and the
-served capture.
+`make ci` belongs to the orchestrator and `make ci-perf` to the integration
+window, which also owns the served capture in §6.
 
 ### The helper extraction
 

@@ -146,10 +146,10 @@ pub use quant::{
 
 // ── GPU-resident iso-blocks mirror gate ──────────────────────────────────────
 
-/// Returns `true` when the GPU-resident `QuantIsoV3` mirror is enabled.
+/// Returns `true` when the GPU-resident `QuantIsoV` mirror is enabled.
 ///
 /// **Hardcoded OFF** (bench-driven decision; no env-var opt-in). A/B bench
-/// showed deltas within noise on the `update_iso3` hot path because the
+/// showed deltas within noise on the iso V hot path because the
 /// warm-TTFT bf16 seed absorbs the dequant cost before the mirror is reached.
 /// See `docs/PERF_BASELINE.md` for bench numbers. The gate exists as a
 /// forward-compatibility hook for future seedless decode paths where
@@ -183,7 +183,7 @@ pub(crate) const GPU_RESIDENT_ISO_PRODUCTION: bool = false;
 /// scope belongs to a guard.
 ///
 /// Reading an `AtomicBool` per call is safe because the single production read
-/// site is inside `QuantIsoV3::append_gpu`, which dispatches a Metal kernel and
+/// site is inside `QuantIsoV::append_gpu`, which dispatches a Metal kernel and
 /// is therefore only reachable from `#[ignore]`d GPU tests — and those run
 /// `--test-threads=1`, so no two of them observe the flag concurrently.
 #[cfg(test)]
