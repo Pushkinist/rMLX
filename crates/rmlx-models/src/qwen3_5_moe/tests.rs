@@ -2419,7 +2419,7 @@ fn hydrated_tail_produces_identical_output() {
 /// When a SSD-hydrated entry's `prompt_token_ids.len()` is an exact multiple of
 /// `BLOCK_TOKENS` (no tail), the old Exact-arm guard (`prompt_token_ids() == prompt_ids`)
 /// fired BEFORE the HydratedTail arm.  That path emitted `first_id = 0` (the
-/// placeholder set in `SsdHydrate::hydrate`) as the first real decode token →
+/// placeholder set in `HydratedEntry::from_hydrated`) as the first real decode token →
 /// silent output corruption.
 ///
 /// The fix adds `!is_ssd_hydrated` to the Exact arm guard, forcing a hydrated
@@ -2434,7 +2434,7 @@ fn hydrated_tail_produces_identical_output() {
 ///    theoretically possible but would be a separate model bug; for the
 ///    prompt used here the model emits a non-zero token).
 /// 2. WARM: inject the block-aligned KV/lin snapshot marked `is_ssd_hydrated=true`
-///    with `first_id=0, first_piece=""` (exactly what `SsdHydrate::hydrate`
+///    with `first_id=0, first_piece=""` (exactly what `HydratedEntry::from_hydrated`
 ///    produces).  Before the fix, `generate_greedy` served this as Exact →
 ///    `warm[0] == 0` (placeholder).  After the fix it must fall to Miss and
 ///    produce `warm == cold`.
@@ -2589,7 +2589,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
 
     // ── Step 3: WARM — inject SSD-hydrated FULL-PROMPT snapshot ──────────────
     // Crucially: `first_id=0, first_piece=""` — the placeholder a real
-    // SsdHydrate::hydrate sets.  Before the BUG-1 fix this entry is served
+    // HydratedEntry::from_hydrated sets.  Before the BUG-1 fix this entry is served
     // as Exact → warm[0] == 0 (placeholder corruption).  After the fix it
     // must fall to Miss → full re-prefill → warm == cold.
     prompt_cache::PROMPT_CACHE.with_inner_mut(|guard| {
@@ -2613,7 +2613,7 @@ fn hydrated_exact_block_no_tail_not_placeholder() {
                 block_hashes,
                 kv_caches: kv_snap,
                 lin_caches: lin_snap,
-                // Placeholder values — exactly what SsdHydrate::hydrate emits.
+                // Placeholder values — exactly what HydratedEntry::from_hydrated emits.
                 first_id: 0,
                 first_piece: String::new(),
                 kv_quant: Some(kv_quant),

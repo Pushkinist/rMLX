@@ -55,7 +55,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use rmlx_core::error::{Error, Result};
-use rmlx_core::DispatchPolicy;
 use rmlx_loader::{load_config, load_shard_index, ShardSet};
 use rmlx_mlx::compile::{compile_shapeless, Closure};
 use rmlx_mlx::{
@@ -75,11 +74,10 @@ use crate::layers::{resolve_quant, QuantParams};
 use crate::load_util::{bf16_param, bf16_scales, Weights};
 use crate::prompt_cache::{
     chained_block_hashes_seeded, ArchPromptCache, Consumed, PromptCacheEntry, ReusePolicy,
-    SsdHydrate,
 };
 use crate::sampler::TokenLogprobs;
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
+use rmlx_kv_ssd::{HydratedBlock, HydratedEntry};
 
 /// OpenAI `top_logprobs` ceiling (`0..=20`, enforced server-side). The
 /// prompt-cache entry captures the first-token logprobs at this width so any
@@ -137,7 +135,7 @@ pub(crate) struct Qwen3Entry {
     /// an entry from the Exact fast path so it falls through to a full
     /// re-prefill that recomputes the real first token.
     ///
-    /// MUST be set only in `SsdHydrate::hydrate`; never by the RAM-cache push
+    /// MUST be set only in `HydratedEntry::from_hydrated`; never by the RAM-cache push
     /// path. Do NOT use the `first_id == 0` heuristic as a substitute —
     /// `<bos>` token id is 0 for some models.
     pub(crate) is_ssd_hydrated: bool,
@@ -226,41 +224,28 @@ fn qwen3_active_layout_key() -> u64 {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// SSD-hydrate source
+// SSD-hydrate entry
 // ---------------------------------------------------------------------------
 
-/// Hydrate a `Qwen3Entry` from the SSD tier on a RAM-cache miss.
+/// What an SSD-restored block becomes as a `Qwen3Entry`.
 ///
-/// Pure-attention arch: the reconstructed block carries `kv_caches` only (no
-/// GDN linear state — `lin_caches` from the block is discarded). The matched
-/// block-aligned prefix token IDs become the entry's `prompt_token_ids`; block
-/// hashes are recomputed and the runtime `kv_quant` recorded. `first_id` /
-/// `first_piece` are sentinels (the SSD block stores no first decode token), so
-/// the entry is flagged `is_ssd_hydrated = true`; the generate loop excludes it
-/// from the Exact fast path and recomputes the real first token via re-prefill.
-impl SsdHydrate<Qwen3Entry> for SsdHydrator {
-    fn hydrate(
-        &self,
-        prompt_ids: &[u32],
-        seed: u64,
-        kv_quant: KvQuant,
-        policy: DispatchPolicy,
-    ) -> Result<Option<Qwen3Entry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(
-            prompt_ids, seed, kv_quant, policy,
-            // No cross-layer KV sharing on this stack: nothing reads a
-            // Mixed/RotK bf16 mirror, so a hydrated cache builds none.
-            false,
-        )?
-        else {
-            return Ok(None);
-        };
+/// Pure-attention arch: the block carries `kv_caches` only, and its
+/// `lin_caches` are discarded. The matched block-aligned prefix token IDs
+/// become the entry's `prompt_token_ids`, and the runtime `kv_quant` is
+/// recorded. `first_id` / `first_piece` are sentinels (the SSD block stores no
+/// first decode token), so the entry is flagged `is_ssd_hydrated = true`; the
+/// generate loop excludes it from the Exact fast path and recomputes the real
+/// first token via re-prefill.
+impl HydratedEntry for Qwen3Entry {
+    const SHARES_KV: bool = SHARES_KV_ACROSS_LAYERS;
+
+    fn from_hydrated(block: HydratedBlock, block_hashes: Vec<u64>, kv_quant: KvQuant) -> Self {
         let HydratedBlock {
             prompt_ids,
             kv_caches,
             lin_caches: _, // pure-attention arch has no GDN state
         } = block;
-        Ok(Some(Qwen3Entry {
+        Self {
             prompt_token_ids: prompt_ids,
             block_hashes,
             kv_caches,
@@ -272,7 +257,7 @@ impl SsdHydrate<Qwen3Entry> for SsdHydrator {
             // Block-aligned prefix only; the placeholder first_id must not be
             // replayed — the generate loop re-prefills to recompute it.
             is_ssd_hydrated: true,
-        }))
+        }
     }
 }
 

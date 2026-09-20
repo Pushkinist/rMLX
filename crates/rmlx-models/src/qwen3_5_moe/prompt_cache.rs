@@ -12,7 +12,10 @@
 //!   tail (the default body structurally cannot reach them). The SSD spill path
 //!   is the blanket `SpillSink<E> for SsdSpiller` in `crate::prompt_cache`,
 //!   which spills both `kv_caches()` and `lin_caches()` (hybrid).
-//! - `impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator`: hybrid hydrate.
+//! - `impl HydratedEntry for Qwen35MoeEntry`: what an SSD-restored block
+//!   becomes here. This is the one entry that keeps the block's `lin_caches`;
+//!   the pure-attention entries drop them. The probe itself is the blanket
+//!   `SsdHydrate<E> for SsdHydrator` in `rmlx-kv-ssd`.
 //!
 //! The per-arch shell (`PROMPT_CACHE`, ensure/stats wrappers) is pure
 //! delegation to `ArchPromptCache`; SSD attach is invoked directly on the
@@ -30,13 +33,10 @@
 
 #![allow(clippy::redundant_closure_for_method_calls)]
 use rmlx_core::error::Result;
-use rmlx_core::DispatchPolicy;
 
-use crate::prompt_cache::{
-    ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy, SsdHydrate,
-};
+use crate::prompt_cache::{ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
+use rmlx_kv_ssd::{HydratedBlock, HydratedEntry};
 
 // ---------------------------------------------------------------------------
 // Entry type
@@ -67,7 +67,7 @@ pub(crate) struct Qwen35MoeEntry {
     /// flag to take the `HydratedTail` path: it re-prefills only the missing
     /// tail on top of the restored KV/lin state, then decodes normally.
     ///
-    /// MUST be set only in `SsdHydrate::hydrate`; never set by the normal
+    /// MUST be set only in `HydratedEntry::from_hydrated`; never set by the normal
     /// RAM-cache push path. Do NOT use the `first_id == 0` heuristic as a
     /// substitute — `<bos>` token id is 0 for some models.
     pub(crate) is_ssd_hydrated: bool,
@@ -172,32 +172,19 @@ impl PromptCacheEntry for Qwen35MoeEntry {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// SSD-hydrate source — hybrid: reconstructs both KV and lin caches.
+// SSD-hydrate entry — hybrid: keeps both the KV and the lin caches.
 // ---------------------------------------------------------------------------
 
-impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
-    fn hydrate(
-        &self,
-        prompt_ids: &[u32],
-        seed: u64,
-        kv_quant: KvQuant,
-        policy: DispatchPolicy,
-    ) -> Result<Option<Qwen35MoeEntry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(
-            prompt_ids, seed, kv_quant, policy,
-            // No cross-layer KV sharing on this stack: nothing reads a
-            // Mixed/RotK bf16 mirror, so a hydrated cache builds none.
-            false,
-        )?
-        else {
-            return Ok(None);
-        };
+impl HydratedEntry for Qwen35MoeEntry {
+    const SHARES_KV: bool = crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS;
+
+    fn from_hydrated(block: HydratedBlock, block_hashes: Vec<u64>, kv_quant: KvQuant) -> Self {
         let HydratedBlock {
             prompt_ids,
             kv_caches,
             lin_caches,
         } = block;
-        Ok(Some(Qwen35MoeEntry {
+        Self {
             prompt_token_ids: prompt_ids,
             block_hashes,
             kv_caches,
@@ -209,7 +196,7 @@ impl SsdHydrate<Qwen35MoeEntry> for SsdHydrator {
             // The generate loop uses this flag to re-prefill the tail tokens
             // before decoding (HydratedTail path). See `Qwen35MoeEntry::is_ssd_hydrated`.
             is_ssd_hydrated: true,
-        }))
+        }
     }
 }
 

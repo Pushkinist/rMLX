@@ -13,8 +13,9 @@
 //! - [`ssd_tier`] — `install_config`, `attach_at_load`, `compute_layout_key`,
 //!   stale-schema namespace wipe.
 //! - [`hooks`] — process-global Prometheus hook setters + SSD event recorder.
-//! - [`traits::SsdHydrate`] — single trait arch entries implement; bridges the
-//!   prompt cache to the SSD hydrator.
+//! - [`traits`] — [`SsdHydrate`], the probe the prompt cache calls on a RAM
+//!   miss, [`HydratedEntry`], what an arch entry states about itself, and the
+//!   one blanket impl that joins them.
 //! - [`hashing`] — chained FNV-1a-64 block-digest helpers, the `BLOCK_TOKENS`
 //!   constant, and `cache_seed` — all shared between `prompt_cache` (RAM) and
 //!   the SSD tier (disk), which must agree on the digest stream byte for byte.
@@ -68,4 +69,4 @@ pub use ssd_tier::{
     active as active_ssd_tier_config, compute_layout_key, install_config, prepare_attach,
     AttachInfo, SsdTierConfig,
 };
-pub use traits::SsdHydrate;
+pub use traits::{HydratedEntry, SsdHydrate};

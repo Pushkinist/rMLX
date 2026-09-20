@@ -59,9 +59,9 @@ use crate::kv_cache::kv_layer_quants;
 ///
 /// The per-namespace SSD work (maintenance, layout-key compute,
 /// logging) lives in [`rmlx_kv_ssd::prepare_attach`]; only the per-arch
-/// `attach_ssd_tier` dispatch remains here because the trait impls
-/// (`SsdSpiller: SpillSink<…>`, `SsdHydrator: SsdHydrate<…>`) live in
-/// `rmlx-models`.
+/// `attach_ssd_tier` dispatch remains here because the arch-side impls the
+/// bounds need (`SsdSpiller: SpillSink<…>` and each entry's `HydratedEntry`,
+/// which is what gives `SsdHydrator: SsdHydrate<…>`) live in `rmlx-models`.
 pub fn attach_at_load(
     arch: &str,
     model_id: &str,

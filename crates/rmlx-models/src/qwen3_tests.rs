@@ -263,6 +263,11 @@ fn qwen3_spill_sink_skips_entry_with_no_full_block() {
 fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
     use std::sync::{atomic::AtomicU64, Arc};
 
+    // The probe trait and its request-side argument: the module under test
+    // implements `HydratedEntry` and no longer names either.
+    use rmlx_core::DispatchPolicy;
+    use rmlx_kv_ssd::SsdHydrate;
+
     /// Mock SSD source: returns a prebuilt `Qwen3Entry` if the prompt
     /// covers at least one full block, else a miss.
     struct MockSrc {
@@ -295,7 +300,7 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
                 first_piece: String::new(),
                 first_logprobs: None,
                 kv_quant: Some(KvQuant::K8V8),
-                // Mirrors SsdHydrate::hydrate — hydrated entries are flagged.
+                // Mirrors HydratedEntry::from_hydrated — hydrated entries are flagged.
                 is_ssd_hydrated: true,
             }))
         }
@@ -359,7 +364,7 @@ fn qwen3_arch_policy_is_exact_only() {
 ///    (exact multiple of BLOCK_TOKENS, no tail) → record N_DECODE token ids.
 /// 2. WARM: inject a real KV snapshot of the SAME full prompt, marked
 ///    `is_ssd_hydrated=true` with `first_id=0, first_piece=""` (exactly what
-///    `SsdHydrate::hydrate` produces). Before the fix this is served as Exact →
+///    `HydratedEntry::from_hydrated` produces). Before the fix this is served as Exact →
 ///    `warm[0] == 0`. After the fix it falls to Miss → `warm == cold`.
 ///
 /// Run:
@@ -504,7 +509,7 @@ fn qwen3_hydrated_exact_no_tail_not_placeholder() {
     };
 
     // ── Step 3: WARM — inject SSD-hydrated FULL-PROMPT snapshot ──────────────
-    // first_id=0, first_piece="" — the placeholder a real SsdHydrate::hydrate
+    // first_id=0, first_piece="" — the placeholder a real HydratedEntry::from_hydrated
     // sets. Before the fix this entry is served as Exact → warm[0] == 0.
     QWEN3_PROMPT_CACHE.with_inner_mut(|guard| {
         if let Some(cache) = guard.as_mut() {

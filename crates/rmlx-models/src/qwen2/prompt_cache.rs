@@ -16,11 +16,12 @@
 //!   reusable, and the only reuse the engine permits (a hydrated strict-prefix)
 //!   is declined here (`is_reusable_prefix_of` → `None`), so the only reachable
 //!   consume outcomes are `Exact` and `Miss`.
-//! - `impl SsdHydrate<Qwen2Entry> for SsdHydrator`: pure-attention hydrate (the
-//!   reconstructed block carries `kv_caches` only; `lin_caches` is discarded).
-//!   The SSD spill path is the blanket `SpillSink<E> for SsdSpiller` in
-//!   `crate::prompt_cache`, which spills `kv_caches()` only for a pure-attention
-//!   entry (`lin_caches()` is `&[]`).
+//! - `impl HydratedEntry for Qwen2Entry`: what an SSD-restored block becomes
+//!   here (pure-attention: the block's `lin_caches` are discarded). The probe
+//!   itself is the blanket `SsdHydrate<E> for SsdHydrator` in `rmlx-kv-ssd`,
+//!   and the SSD spill path is the blanket `SpillSink<E> for SsdSpiller` in
+//!   `crate::prompt_cache`, which spills `kv_caches()` only for a
+//!   pure-attention entry (`lin_caches()` is `&[]`).
 //!
 //! ## Reuse policy — Exact-only
 //!
@@ -32,11 +33,10 @@
 
 #![allow(clippy::redundant_closure_for_method_calls)]
 use rmlx_core::error::Result;
-use rmlx_core::DispatchPolicy;
 
-use crate::prompt_cache::{ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy, SsdHydrate};
+use crate::prompt_cache::{ArchPromptCache, CacheStats, PromptCacheEntry, ReusePolicy};
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
+use rmlx_kv_ssd::{HydratedBlock, HydratedEntry};
 
 // ---------------------------------------------------------------------------
 // Entry type
@@ -68,7 +68,7 @@ pub(crate) struct Qwen2Entry {
     /// an entry from the Exact fast path so it falls through to a full
     /// re-prefill that recomputes the real first token.
     ///
-    /// MUST be set only in `SsdHydrate::hydrate`; never by the RAM-cache push
+    /// MUST be set only in `HydratedEntry::from_hydrated`; never by the RAM-cache push
     /// path. Do NOT use the `first_id == 0` heuristic as a substitute —
     /// `<bos>` token id is 0 for some models.
     pub(crate) is_ssd_hydrated: bool,
@@ -129,41 +129,28 @@ impl PromptCacheEntry for Qwen2Entry {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// SSD-hydrate source
+// SSD-hydrate entry
 // ---------------------------------------------------------------------------
 
-/// Hydrate a `Qwen2Entry` from the SSD tier on a RAM-cache miss.
+/// What an SSD-restored block becomes as a `Qwen2Entry`.
 ///
-/// Pure-attention arch: the reconstructed block carries `kv_caches` only (the
-/// `lin_caches` from the block are discarded). The matched block-aligned prefix
-/// token IDs become the entry's `prompt_token_ids`; block hashes are recomputed
-/// and the runtime `kv_quant` recorded. `first_id` / `first_piece` are sentinels
-/// (the SSD block stores no first decode token), so the entry is flagged
-/// `is_ssd_hydrated = true`; the consume engine excludes it from the Exact fast
-/// path and the generate loop recomputes the real first token via re-prefill.
-impl SsdHydrate<Qwen2Entry> for SsdHydrator {
-    fn hydrate(
-        &self,
-        prompt_ids: &[u32],
-        seed: u64,
-        kv_quant: KvQuant,
-        policy: DispatchPolicy,
-    ) -> Result<Option<Qwen2Entry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(
-            prompt_ids, seed, kv_quant, policy,
-            // No cross-layer KV sharing on this stack: nothing reads a
-            // Mixed/RotK bf16 mirror, so a hydrated cache builds none.
-            false,
-        )?
-        else {
-            return Ok(None);
-        };
+/// Pure-attention arch: the block carries `kv_caches` only, and its
+/// `lin_caches` are discarded. The matched block-aligned prefix token IDs
+/// become the entry's `prompt_token_ids`, and the runtime `kv_quant` is
+/// recorded. `first_id` / `first_piece` are sentinels (the SSD block stores no
+/// first decode token), so the entry is flagged `is_ssd_hydrated = true`; the
+/// consume engine excludes it from the Exact fast path and the generate loop
+/// recomputes the real first token via re-prefill.
+impl HydratedEntry for Qwen2Entry {
+    const SHARES_KV: bool = crate::qwen2::SHARES_KV_ACROSS_LAYERS;
+
+    fn from_hydrated(block: HydratedBlock, block_hashes: Vec<u64>, kv_quant: KvQuant) -> Self {
         let HydratedBlock {
             prompt_ids,
             kv_caches,
             lin_caches: _, // pure-attention arch has no GDN state
         } = block;
-        Ok(Some(Qwen2Entry {
+        Self {
             prompt_token_ids: prompt_ids,
             block_hashes,
             kv_caches,
@@ -173,7 +160,7 @@ impl SsdHydrate<Qwen2Entry> for SsdHydrator {
             // Block-aligned prefix only; the placeholder first_id must not be
             // replayed — the generate loop re-prefills to recompute it.
             is_ssd_hydrated: true,
-        }))
+        }
     }
 }
 

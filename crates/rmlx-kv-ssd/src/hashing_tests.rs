@@ -11,6 +11,34 @@ use super::cache_seed;
 const LK: u64 = 0xa55a_5aa5_a55a_5aa5;
 const SIG: u64 = 0x1234_5678_9abc_def0;
 
+/// The value `cache_seed_pins_its_value_for_a_fixed_tuple` expects.
+const CACHE_SEED_PIN: u64 = 0x6eb7_b753_b430_cdad;
+
+/// The seed for one fixed tuple is this exact `u64`.
+///
+/// Every other test in this file reads one seed against another from the same
+/// build, so all of them stay true when a term is added to the formula. The
+/// digests already stored on disk do not move with it, and a probe that seeds
+/// differently from the push that wrote them finds nothing. That failure has
+/// no error and no log line: the tier simply stops hitting.
+///
+/// This pin is the only assertion that fails on that change. Update it only
+/// with a deliberate salt bump, and say so in the change that bumps it.
+#[test]
+fn cache_seed_pins_its_value_for_a_fixed_tuple() {
+    assert_eq!(
+        cache_seed(
+            LK,
+            KvQuant::K8V8,
+            &[KvQuant::K8V8, KvQuant::K8V4, KvQuant::None],
+            SIG,
+        ),
+        CACHE_SEED_PIN,
+        "the cache seed moved — every block an installed binary wrote is now \
+         unreachable. Bump this only on a deliberate salt change."
+    );
+}
+
 /// Two requests whose per-layer mixtures differ must not share a digest stream,
 /// even at the same layout key, codec and model.
 ///
