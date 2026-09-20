@@ -579,10 +579,14 @@ pure-attention entries set. Every entry sets `is_ssd_hydrated: true` and the
 sentinel `first_id` / `first_piece`. Each destructures `HydratedBlock` rather
 than reading its fields, so a field added to the block is a compile error at
 every arch instead of a silent drop at seven of them.
+`every_entry_destructures_the_block_exhaustively` is what keeps that shape: a
+`..` in one destructure opts that arch out of the compile error silently.
 
 Every entry's `SHARES_KV` names its own arch's `SHARES_KV_ACROSS_LAYERS`, the
-same const `Architecture::shares_kv_across_layers` dispatches. Today gemma4 is
-the only arch whose value is `true`. Hard-coding either value in the shared
+same const `Architecture::shares_kv_across_layers` dispatches, and
+`every_entry_names_its_archs_topology_constant` reads the declaration to hold
+it there. A bare literal equal to its arch today goes stale the day the arch
+flips. Today gemma4 is the only arch whose value is `true`. Hard-coding either value in the shared
 body would be right for one arch and silently wrong for the other: a
 hard-coded `false` drops a bf16 mirror gemma4 reads after a tail extension, a
 hard-coded `true` builds a mirror no other arch reads.
@@ -655,6 +659,15 @@ before: ssd hydrate twins (crates/rmlx-models/src): 670 matched lines over 221 b
 after:  ssd hydrate twins (crates/rmlx-models/src): 472 matched lines over 148 body lines (8 item(s), 28 pair(s))
 ```
 
+The residual 472 is not duplicated logic. Six of the eight `from_hydrated`
+bodies are byte-identical once comments are stripped — bitnet, gemma3, gemma4,
+laguna, qwen2 and qwen3_vl_moe — and what those six bodies copy is their entry
+struct: the same seven fields, `prompt_token_ids`, `block_hashes`, `kv_caches`,
+`first_id`, `first_piece`, `kv_quant` and `is_ssd_hydrated`, with `Qwen3Entry`
+adding `first_logprobs` and `Qwen35MoeEntry` adding `lin_caches`. The residual
+twin is therefore the entry structs, a separate and larger item than this
+change, and a macro over the constructors would hide it rather than remove it.
+
 ### Invariants — what the change must not move
 
 - **The hydrated bytes per layer.** Each restored `KvCache` holds the bytes the
@@ -675,7 +688,7 @@ after:  ssd hydrate twins (crates/rmlx-models/src): 472 matched lines over 148 b
 ### The oracle
 
 `crates/rmlx-models/src/ssd_hydrate_tests.rs` reads the entry the blanket impl
-returns. Fourteen tests, all on `Device::Cpu`, none `#[ignore]`. The whole
+returns. Seventeen tests, all on `Device::Cpu`, none `#[ignore]`. The whole
 spill/hydrate chain is device-parameterised, so no test here takes a Metal
 context.
 
@@ -755,7 +768,10 @@ Each mutation was applied by hand to the current tree, run, and reverted.
 | An arch declares a `SHARES_KV` its own arch does not run | `every_entry_declares_its_archs_cross_layer_kv_topology` | red |
 | A ninth arch declares a `SHARES_KV` nothing reads | `every_hydrating_entry_has_a_topology_assertion` | red |
 | The blanket impl reads a literal instead of `E::SHARES_KV` | `each_arch_hydrates_under_its_own_cross_layer_kv_topology` | red |
-| An entry drops a field from its `HydratedBlock` destructure | the compiler — the destructure is exhaustive | red |
+| An entry drops a field from its `HydratedBlock` destructure | the compiler — the destructure is exhaustive, and `every_entry_destructures_the_block_exhaustively` is what keeps it so | red |
+| An entry opts out of that destructure with `..` | `every_entry_destructures_the_block_exhaustively` | red |
+| An arch writes its own `impl SsdHydrate<NinthEntry> for SsdHydrator` and skips the entry trait | `no_production_entry_bypasses_the_blanket_impl` | red |
+| An entry hard-codes its `SHARES_KV` instead of naming its arch constant | `every_entry_names_its_archs_topology_constant` | red |
 
 ### The mutation the oracle cannot catch
 

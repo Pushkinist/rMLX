@@ -65,7 +65,7 @@ Versus the pre-refactor era, a new arch no longer hand-copies:
 - **~40 LOC of spill + ~25 LOC of hydrate + truncate** impls per arch. Spill is
   the blanket `SpillSink<E>`; truncate / `kv_bytes` are defaulted on
   `PromptCacheEntry`; hydrate is the blanket `SsdHydrate<E>`, leaving an arch
-  a **~15-LOC `HydratedEntry`** impl — one `const` and one struct literal.
+  a **~20-LOC `HydratedEntry`** impl — one `const` and one struct literal.
 - **~130 LOC of `load_array` / `embed` / `linear` boilerplate** per loader,
   now `Weights` accessors.
 - The **FNV seed formula**, previously re-typed from a sibling arch and a
