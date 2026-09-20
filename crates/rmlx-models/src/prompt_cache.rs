@@ -1170,9 +1170,11 @@ pub(crate) struct AttachParams {
 /// The genuinely per-arch parts that stay outside this struct:
 /// - the `Entry` struct (Gemma4 = KV only, Qwen3 = KV only, Qwen3.5-MoE =
 ///   KV + LinearAttn);
-/// - the `impl SsdHydrate<Entry> for SsdHydrator` block (Entry-shape specific —
-///   reconstruction needs the concrete entry's extra fields). The spill side is
-///   the blanket `impl SpillSink<E> for SsdSpiller` above, shared by every arch.
+/// - the `impl HydratedEntry for Entry` block, which states what a restored
+///   block becomes and what topology the arch reads. The probe itself is the
+///   blanket `impl SsdHydrate<E> for SsdHydrator` in `rmlx-kv-ssd`, and the
+///   spill side is the blanket `impl SpillSink<E> for SsdSpiller` above; both
+///   are shared by every arch.
 /// - the in-`generate.rs` `CacheLookup` match (Exact / Prefix / Miss), which
 ///   queries [`ArchPromptCache::policy`] to enforce [`ReusePolicy::ExactOnly`]
 ///   as a hard runtime check.

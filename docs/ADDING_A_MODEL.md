@@ -24,7 +24,7 @@ Shared seams live at the crate root (`crates/rmlx-models/src/`) and under
 | 2 | Model + layers | `<arch>/model.rs`, `<arch>/layers.rs` (or a `<arch>/layers/` dir) | Arch-specific forward math. Attention goes through `KvCache::update_and_sdpa` (`rmlx-kv-quant`); build masks with `layers/mask.rs` (`build_chunked_prefill_mask`, `build_swa_prefill_mask`, `pick_attn_mask_mode`). The model struct also carries two shared fields: `kv_bytes: KvBytesCounter` and `model_sig: u64`. Both are set by the loader row, written/read by the generate row and the enum-variant row. Per instance, never a static — the KV-byte counter cross-attributes two resident models of the same arch, and `model_sig` is what the generate row folds into `cache_seed`, which keeps the shared per-arch prompt cache — and the SSD tier behind it — from serving one model's K/V to another's request. |
 | 3 | Loader | `<arch>/loader.rs` | Thin: `Weights` (`load_util.rs`) for tensor fetch + `resolve_quant` (`layers/quant.rs`) for the per-tensor quant rule + per-arch wiring (MoE expert stacking, `k == v` head sharing, PARO rotation parts) only where present. |
 | 4 | Generate | `<arch>/generate.rs` (or a `<arch>/generate/` dir) | Prompt-cache policy + cache construction + a `forward_step` closure handed to the shared `decode_loop` (`pipelined_decode` / `chunked_prefill` / `choose_token`). Build the per-layer cache vector from `kv_cache::kv_layer_quants(n_layers, kv_quant)` — never a local `kv_quant_for_layer` loop. That vector is also what the SSD `layout_key` and the per-request `cache_seed` describe, so a second copy of the loop lets a description drift from what the arch builds; `make check-kv-layer-quants` fails on one. A stack that is deliberately uniform (a speculative scratch stack) declares itself with a `// kv-layer-quants: uniform — <reason>` marker instead. No decode-loop copy. Every prefill path — ordinary or speculative — calls `reject_nan_prefill` on its logit row **before** selecting a token. Per-*step* decode rows are deliberately not scanned (that would be a host readback per token); see the seam list below. |
-| 5 | Prompt cache (optional) | `<arch>/prompt_cache.rs` | `Entry` struct + accessor one-liners impl'ing `PromptCacheEntry`; `kv_bytes` / `truncate_kv_to` and the SSD spill path are inherited. Hydrate = `SsdHydrator::lookup_seeded` + a struct literal. |
+| 5 | Prompt cache (optional) | `<arch>/prompt_cache.rs` | `Entry` struct + accessor one-liners impl'ing `PromptCacheEntry`; `kv_bytes` / `truncate_kv_to` and the SSD spill path are inherited. The SSD hydrate probe is inherited too: implement `HydratedEntry` (`rmlx-kv-ssd`) — one `const SHARES_KV` naming the arch's own `SHARES_KV_ACROSS_LAYERS`, and one `from_hydrated` struct literal — and the blanket `impl<E: HydratedEntry> SsdHydrate<E> for SsdHydrator` does the probe. |
 | 6 | Enum variant | `arch/mod.rs` | One `Architecture` variant + the match arms (`forward_seq`, `Debug`, config summary, …). |
 | 7 | Registry string | `arch/registry.rs`, `arch/loader.rs` | ~2 lines: add `architectures[0]` to `KNOWN_ARCHS` and a `load_model` match arm. When one arch string covers several checkpoint shapes (quant codec, dense vs MoE), branch the match arm on **checkpoint facts** — e.g. `cfg.is_paroquant()`, tensor presence — not on the arch string alone. The Qwen3.5 arm routes PARO vs standard this way. |
 | 8 | SSD attach (optional) | `ssd_tier.rs` | 1 match arm wiring the arch's `PROMPT_CACHE` into `attach_at_load`. |
@@ -51,6 +51,7 @@ list.
   - `resolve_quant(tensor_name, has_biases, defaults, overrides) -> Result<QuantParams>` — the shared `.biases`-sibling / affine rule. `QuantParams`, `QuantMode` live here too.
 - `lookup_seeded` lives in **`rmlx-kv-ssd`** (`crates/rmlx-kv-ssd/src/hydrate.rs`, `SsdHydrator::lookup_seeded`) — single-sources the FNV seed so no arch re-types the seed formula.
 - The blanket `impl<E: PromptCacheEntry> SpillSink<E> for SsdSpiller` lives in `crates/rmlx-models/src/prompt_cache.rs` — one spill impl covers every arch's `Entry`.
+- The blanket `impl<E: HydratedEntry> SsdHydrate<E> for SsdHydrator` lives in `crates/rmlx-kv-ssd/src/traits.rs` — one hydrate probe covers every arch's `Entry`, the hybrid one included. It cannot live in `rmlx-models`: both the trait and `Self` are foreign there and the type parameter is uncovered, so the orphan rule rejects it. An arch writes only its `HydratedEntry` impl.
 
 ---
 
@@ -63,7 +64,8 @@ Versus the pre-refactor era, a new arch no longer hand-copies:
   closure into `pipelined_decode` / `chunked_prefill`.
 - **~40 LOC of spill + ~25 LOC of hydrate + truncate** impls per arch. Spill is
   the blanket `SpillSink<E>`; truncate / `kv_bytes` are defaulted on
-  `PromptCacheEntry`; hydrate collapses to `lookup_seeded` + a struct literal.
+  `PromptCacheEntry`; hydrate is the blanket `SsdHydrate<E>`, leaving an arch
+  a **~20-LOC `HydratedEntry`** impl — one `const` and one struct literal.
 - **~130 LOC of `load_array` / `embed` / `linear` boilerplate** per loader,
   now `Weights` accessors.
 - The **FNV seed formula**, previously re-typed from a sibling arch and a

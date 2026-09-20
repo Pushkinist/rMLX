@@ -62,6 +62,11 @@ pub mod ssd_tier;
 #[cfg(test)]
 mod test_snapshot;
 
+/// Oracle for the per-arch SSD-hydrate entry impls.
+#[cfg(test)]
+#[path = "ssd_hydrate_tests.rs"]
+mod ssd_hydrate_tests;
+
 // The MSL wrapper re-exports (`rmlx_models::{q8_msl,
 // turboquant_msl, planarquant_msl, turbo_flash_msl}`) were
 // dropped — there were zero callers in the workspace. Import directly from

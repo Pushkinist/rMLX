@@ -28,10 +28,17 @@ The populations, each carrying its own root and its own pairing rule (see
   ``crates/rmlx-kv-quant/src/kvcache/update.rs``, paired by the same
   digit-stripped-name rule (``update_rotor_k_only_3`` and ``_4`` ->
   ``update_rotor_k_only_``).
+* ``ssd-hydrate`` — the non-test fns under ``crates/rmlx-models/src`` named
+  exactly ``hydrate`` or exactly ``from_hydrated``, one family. Both names
+  are needed because one name spans only one tree: before the SSD-hydrate
+  collapse the population is the per-arch ``hydrate`` bodies, after it the
+  short ``from_hydrated`` constructors. ``hydrate_from_ssd`` is a third name
+  and stays out.
 
 Neither rotor population is a literal file or fn list: both are a glob plus a
 name rule, so the same command measures a tree that still carries the twins
-and one that does not.
+and one that does not. ``ssd-hydrate`` is a glob plus a name rule for the
+same reason.
 
 Deterministic for a given tree: every collection is name-sorted before it is
 printed, and the "twin" measure is the normalised-diff idea that found the
@@ -68,6 +75,8 @@ ROTOR_STORAGE_DIR = "crates/rmlx-kv-quant/src/storage"
 ROTOR_STORAGE_GLOB = "quant_rotor_*.rs"
 ROTOR_UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
 ROTOR_UPDATE_FN_PREFIX = "update_rotor"
+MODELS_SOURCE_DIR = "crates/rmlx-models/src"
+SSD_HYDRATE_FN_NAMES = ("from_hydrated", "hydrate")
 WORKSPACE_SOURCE_DIR = "crates"
 CHECK_SPEC_CHARGE_SCRIPT = Path(__file__).resolve().parents[1] / "check_spec_charge.sh"
 
@@ -465,6 +474,21 @@ def rotor_update_items(root: Path) -> list[FnInfo]:
     return [fn for fn in fns if fn.name.startswith(ROTOR_UPDATE_FN_PREFIX)]
 
 
+def ssd_hydrate_items(root: Path) -> list[FnInfo]:
+    """Every non-test fn under MODELS_SOURCE_DIR whose name is one of
+    SSD_HYDRATE_FN_NAMES, body only — a glob plus a name rule, never a file
+    list, so one command measures the tree that carries the per-arch hydrate
+    bodies and the tree that has collapsed them onto one blanket impl."""
+    base = root / MODELS_SOURCE_DIR
+    if not base.is_dir():
+        raise RuntimeError(f"{MODELS_SOURCE_DIR} is not a directory")
+    items: list[FnInfo] = []
+    for path in rust_files(root, MODELS_SOURCE_DIR, include_tests=False):
+        fns, _skipped = fns_in_file(root, path)
+        items.extend(fn for fn in fns if fn.name in SSD_HYDRATE_FN_NAMES)
+    return items
+
+
 @dataclass(frozen=True)
 class Population:
     label: str
@@ -486,6 +510,7 @@ MATCHED_LINES_POPULATIONS = {
     "rotor-updates": Population(
         "rotor update twins", ROTOR_UPDATE_FILE, rotor_update_items, width_pair_key
     ),
+    "ssd-hydrate": Population("ssd hydrate twins", MODELS_SOURCE_DIR, ssd_hydrate_items),
 }
 
 

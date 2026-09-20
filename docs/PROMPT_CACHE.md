@@ -626,7 +626,9 @@ The SSD tier adds two hooks to `PromptCache<E>`:
   the `SsdKvIndex` for the longest matching block-hash prefix, reads the `.kvb`
   file, verifies `model_id` and `kv_quant` metadata, and reconstructs the arch
   entry under the caller's `DispatchPolicy` (per-request like `seed` and
-  `kv_quant`, never read off the source). Corruption (bad read, metadata mismatch, missing file) is handled
+  `kv_quant`, never read off the source). One blanket impl in `rmlx-kv-ssd`
+  serves every arch; an arch states only what a restored block becomes, as
+  `HydratedEntry` (`docs/SSD_TIER.md` § "The per-arch entry impls"). Corruption (bad read, metadata mismatch, missing file) is handled
   internally (delete + `warn!`) and surfaces as `Ok(None)` — the caller falls
   through to full re-prefill.
 

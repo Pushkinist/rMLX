@@ -26,6 +26,36 @@ fn namespace_falls_back_to_model_id() {
 
 // ── compute_layout_key ────────────────────────────────────────────
 
+/// The key for one fixed tuple is this exact `u64`.
+///
+/// Every other test in this section reads the key against another key from
+/// the same build — determinism, and separation between tuples. Both stay
+/// true when a term is added to the formula, because both sides move
+/// together. The stored blocks do not move with them: a changed key reads
+/// every `.kvb` an installed binary wrote as a miss, and a tier that silently
+/// stops hitting looks exactly like a cold cache.
+///
+/// This pin is the only assertion that fails on that change. Update it only
+/// with a deliberate salt bump, and say so in the change that bumps it.
+#[test]
+fn compute_layout_key_pins_its_value_for_a_fixed_tuple() {
+    assert_eq!(
+        compute_layout_key(
+            "Qwen3ForCausalLM",
+            &[KvQuant::K8V8, KvQuant::K8V4, KvQuant::None],
+            4,
+            128,
+            KvQuant::K8V8,
+        ),
+        LAYOUT_KEY_PIN,
+        "the layout key moved — every block an installed binary wrote is now a \
+         miss. Bump this only on a deliberate salt change."
+    );
+}
+
+/// The value `compute_layout_key_pins_its_value_for_a_fixed_tuple` expects.
+const LAYOUT_KEY_PIN: u64 = 0x88d8_43b9_5b81_4861;
+
 /// unit test #1: deterministic across calls for a fixed tuple.
 #[test]
 fn compute_layout_key_is_deterministic() {
