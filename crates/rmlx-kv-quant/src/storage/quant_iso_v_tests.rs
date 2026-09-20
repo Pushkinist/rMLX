@@ -1,7 +1,13 @@
-//! Unit tests for [`QuantIsoV3`] (includes GPU-mirror path).
+//! Unit tests for [`QuantIsoV`] (includes GPU-mirror path).
+//!
+//! The cases the two code widths share are one generic body plus one `#[test]`
+//! per width. The GPU-mirror and ring cases below drive the 3-bit width only:
+//! they are about the mirror and the ring, which are one body over both
+//! widths, not about the codebook.
 
 use crate::isoquant::{iso_decode_fast, iso_encode_fast};
-use crate::storage::quant_iso_v::{IsoBlocks, QuantIsoV3, ISO3_BITS, ISO3_GROUP_SIZE};
+use crate::storage::quant_iso_v::{IsoBlocks, QuantIsoV, QuantIsoV3, ISO3_GROUP_SIZE};
+use crate::storage::ISO_QUAT_BLOCK_SIZE;
 use crate::test_utils::{cosine_similarity_per_row, lcg_data, skip_if_no_gpu_env, TEST_SEED};
 use rmlx_mlx::{Array, Device, Dtype};
 
@@ -9,22 +15,30 @@ use rmlx_mlx::{Array, Device, Dtype};
 /// append, so the mirror grows by pages rather than clamping.
 const ISO_TEST_MAX_SEQ: i32 = 4096;
 
-/// Newly-constructed `QuantIsoV3` carries the requested init shape and bit
-/// width; no blocks yet.
-#[test]
-fn quant_iso_v_new_shapes_correct() {
+/// A newly-constructed store carries the requested init shape and bit width;
+/// no blocks yet.
+fn new_shapes_correct<const BITS: u8>() {
     let init_shape = vec![1_i32, 4, 0, 128];
-    let q = QuantIsoV3::new(init_shape.clone());
+    let q = QuantIsoV::<BITS>::new(init_shape.clone());
     assert_eq!(q.shape, init_shape, "shape preserved after new()");
-    assert_eq!(q.bits, ISO3_BITS, "bits should be ISO3_BITS (3)");
+    assert_eq!(q.bits, BITS, "bits should be the store's own width");
     assert!(q.blocks.is_empty(), "no blocks after new()");
     assert_eq!(q.byte_size(), 0, "byte_size 0 with no blocks");
 }
 
-/// Roundtrip: encode → store in QuantIsoV3 → `dequant` → compare against the
-/// raw `iso_decode_fast` reference. Equal element-by-element.
 #[test]
-fn quant_iso_v_roundtrip_dequant() {
+fn quant_iso_v_new_shapes_correct() {
+    new_shapes_correct::<3>();
+}
+
+#[test]
+fn quant_iso_v4_new_shapes_correct() {
+    new_shapes_correct::<4>();
+}
+
+/// Roundtrip: encode → store → `dequant` → compare against the raw
+/// `iso_decode_fast` reference at the same width. Equal element-by-element.
+fn roundtrip_dequant<const BITS: u8>() {
     // Small fixture: B=1, kv_h=2, n_seq=4, head_dim=8 → 8 tokens of length 8.
     let b = 1;
     let kv_h = 2;
@@ -35,7 +49,7 @@ fn quant_iso_v_roundtrip_dequant() {
 
     let new_shape = [b as i32, kv_h as i32, n_seq as i32, head_dim as i32];
 
-    let mut qv = QuantIsoV3::new(vec![b as i32, kv_h as i32, 0_i32, head_dim as i32]);
+    let mut qv = QuantIsoV::<BITS>::new(vec![b as i32, kv_h as i32, 0_i32, head_dim as i32]);
     qv.append(&data, &new_shape).expect("append should succeed");
 
     assert_eq!(qv.blocks.len(), 1, "one append → one block");
@@ -49,22 +63,22 @@ fn quant_iso_v_roundtrip_dequant() {
 
     // Reference: call iso_decode_fast directly on the same codes.
     let (ref_codes, ref_scales, ref_quats, ref_norms) =
-        iso_encode_fast(&data, head_dim, ISO3_GROUP_SIZE, ISO3_BITS).expect("encode reference");
+        iso_encode_fast(&data, head_dim, ISO_QUAT_BLOCK_SIZE, BITS).expect("encode reference");
     let reference = iso_decode_fast(
         &ref_codes,
         &ref_scales,
         &ref_quats,
         &ref_norms,
         head_dim,
-        ISO3_GROUP_SIZE,
-        ISO3_BITS,
+        ISO_QUAT_BLOCK_SIZE,
+        BITS,
     )
     .expect("decode reference");
 
     assert_eq!(
         decoded.len(),
         reference.len(),
-        "QuantIsoV3::dequant length should match iso_decode_fast"
+        "QuantIsoV{BITS}::dequant length should match iso_decode_fast"
     );
 
     let mut max_abs_err = 0.0_f32;
@@ -76,8 +90,18 @@ fn quant_iso_v_roundtrip_dequant() {
     }
     assert!(
         max_abs_err < 1e-3,
-        "QuantIsoV3::dequant vs iso_decode_fast max_abs_err = {max_abs_err:.6} (>= 1e-3)"
+        "QuantIsoV{BITS}::dequant vs iso_decode_fast max_abs_err = {max_abs_err:.6} (>= 1e-3)"
     );
+}
+
+#[test]
+fn quant_iso_v_roundtrip_dequant() {
+    roundtrip_dequant::<3>();
+}
+
+#[test]
+fn quant_iso_v4_roundtrip_dequant() {
+    roundtrip_dequant::<4>();
 }
 
 /// Multi-append with `kv_h > 1` must produce the same dequant output as a
@@ -88,8 +112,7 @@ fn quant_iso_v_roundtrip_dequant() {
 ///
 /// Fixture: per-(head, token) distinct values so any head transposition shows
 /// up as a large error (>> quant noise).
-#[test]
-fn quant_iso_v_multi_append_matches_single_shot_gqa() {
+fn multi_append_matches_single_shot_gqa<const BITS: u8>() {
     let b = 1_usize;
     let kv_h = 3_usize;
     let head_dim = 8_usize;
@@ -112,7 +135,7 @@ fn quant_iso_v_multi_append_matches_single_shot_gqa() {
     }
 
     // Reference: one append of the whole sequence.
-    let mut qref = QuantIsoV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32]);
+    let mut qref = QuantIsoV::<BITS>::new(vec![b as i32, kv_h as i32, 0, head_dim as i32]);
     qref.append(
         &full,
         &[b as i32, kv_h as i32, s_total as i32, head_dim as i32],
@@ -133,7 +156,7 @@ fn quant_iso_v_multi_append_matches_single_shot_gqa() {
         }
         out
     };
-    let mut qv = QuantIsoV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32]);
+    let mut qv = QuantIsoV::<BITS>::new(vec![b as i32, kv_h as i32, 0, head_dim as i32]);
     qv.append(
         &extract(0, chunk_a),
         &[b as i32, kv_h as i32, chunk_a as i32, head_dim as i32],
@@ -164,16 +187,25 @@ fn quant_iso_v_multi_append_matches_single_shot_gqa() {
     );
 }
 
+#[test]
+fn quant_iso_v_multi_append_matches_single_shot_gqa() {
+    multi_append_matches_single_shot_gqa::<3>();
+}
+
+#[test]
+fn quant_iso_v4_multi_append_matches_single_shot_gqa() {
+    multi_append_matches_single_shot_gqa::<4>();
+}
+
 /// After `append` then `reset`, the storage reports seq = 0 and dequant returns
 /// the zero-element prefix only.
-#[test]
-fn quant_iso_v_reset_clears_seq() {
+fn reset_clears_seq<const BITS: u8>() {
     let head_dim = 8;
     let n_seq = 4;
     let data = lcg_data(n_seq * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_seq as i32, head_dim as i32];
 
-    let mut qv = QuantIsoV3::new(vec![1, 1, 0, head_dim as i32]);
+    let mut qv = QuantIsoV::<BITS>::new(vec![1, 1, 0, head_dim as i32]);
     qv.append(&data, &new_shape).unwrap();
     assert_eq!(qv.shape[2], n_seq as i32);
 
@@ -182,16 +214,25 @@ fn quant_iso_v_reset_clears_seq() {
     assert!(qv.blocks.is_empty(), "blocks cleared on reset");
 }
 
+#[test]
+fn quant_iso_v_reset_clears_seq() {
+    reset_clears_seq::<3>();
+}
+
+#[test]
+fn quant_iso_v4_reset_clears_seq() {
+    reset_clears_seq::<4>();
+}
+
 /// After `append` of N tokens then `truncate_to(N/2)`, the dequant prefix
 /// retains the first N/2 tokens (when appended one token per call).
-#[test]
-fn quant_iso_v_truncate_to_keeps_first_n() {
+fn truncate_to_keeps_first_n<const BITS: u8>() {
     let head_dim = 8;
     let n_seq_each = 1; // one token per append call so truncate boundaries align
     let total_tokens = 4;
     let data_full = lcg_data(total_tokens * head_dim, TEST_SEED);
 
-    let mut qv = QuantIsoV3::new(vec![1, 1, 0, head_dim as i32]);
+    let mut qv = QuantIsoV::<BITS>::new(vec![1, 1, 0, head_dim as i32]);
     for tok in 0..total_tokens {
         let row = &data_full[tok * head_dim..(tok + 1) * head_dim];
         let new_shape = [1_i32, 1, n_seq_each, head_dim as i32];
@@ -217,15 +258,15 @@ fn quant_iso_v_truncate_to_keeps_first_n() {
     // Reference: encode + decode the first `keep * head_dim` f32 of the original data.
     let prefix = &data_full[..(keep as usize) * head_dim];
     let (codes, scales, quats, norms) =
-        iso_encode_fast(prefix, head_dim, ISO3_GROUP_SIZE, ISO3_BITS).unwrap();
+        iso_encode_fast(prefix, head_dim, ISO_QUAT_BLOCK_SIZE, BITS).unwrap();
     let reference = iso_decode_fast(
         &codes,
         &scales,
         &quats,
         &norms,
         head_dim,
-        ISO3_GROUP_SIZE,
-        ISO3_BITS,
+        ISO_QUAT_BLOCK_SIZE,
+        BITS,
     )
     .unwrap();
 
@@ -239,6 +280,16 @@ fn quant_iso_v_truncate_to_keeps_first_n() {
         stats.min
     );
     let _ = reference; // reference computed for shape parity check
+}
+
+#[test]
+fn quant_iso_v_truncate_to_keeps_first_n() {
+    truncate_to_keeps_first_n::<3>();
+}
+
+#[test]
+fn quant_iso_v4_truncate_to_keeps_first_n() {
+    truncate_to_keeps_first_n::<4>();
 }
 
 // ── GPU-resident mirror tests ─────────────────────────────────────────────────
@@ -737,8 +788,7 @@ fn iso_v3_ssd_roundtrip_preserves_dequant_output() {
 /// Mutation check: reverting `truncate_to` to compare
 /// `acc + blk.n_tokens <= n as usize` (raw, not row-scaled) makes the
 /// `kv_h > 1` case RED — `blocks.len()` drops and `dequant()` returns `Err`.
-#[test]
-fn quant_iso_v_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+fn truncate_to_kv_h_gt_1_keeps_exact_prefix<const BITS: u8>() {
     let head_dim = 8_usize;
     let total_tokens = 4_usize;
     let keep_tokens = 2_usize;
@@ -758,7 +808,7 @@ fn quant_iso_v_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
         };
         let new_shape = [1_i32, kv_h as i32, 1, head_dim as i32];
 
-        let mut store = QuantIsoV3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32]);
+        let mut store = QuantIsoV::<BITS>::new(vec![1_i32, kv_h as i32, 0, head_dim as i32]);
         for tok in 0..total_tokens {
             store.append(&token_data(tok), &new_shape).unwrap();
         }
@@ -790,7 +840,7 @@ fn quant_iso_v_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
             .dequant()
             .expect("dequant must succeed after truncate at kv_h>1 (#284)");
 
-        let mut reference = QuantIsoV3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32]);
+        let mut reference = QuantIsoV::<BITS>::new(vec![1_i32, kv_h as i32, 0, head_dim as i32]);
         for tok in 0..keep_tokens {
             reference.append(&token_data(tok), &new_shape).unwrap();
         }
@@ -802,6 +852,16 @@ fn quant_iso_v_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
              first keep_tokens (kv_h={kv_h})"
         );
     }
+}
+
+#[test]
+fn quant_iso_v_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+    truncate_to_kv_h_gt_1_keeps_exact_prefix::<3>();
+}
+
+#[test]
+fn quant_iso_v4_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+    truncate_to_kv_h_gt_1_keeps_exact_prefix::<4>();
 }
 
 /// The mid-block split covers the iso block layout too — a third per-row
@@ -889,17 +949,16 @@ fn quant_iso_v3_truncate_mid_block_splits_instead_of_dropping() {
 /// what makes it the oracle here.
 ///
 /// Mutation check: put `seq_layout::transpose_seq_heads` over the whole
-/// concatenation back in `QuantIsoV3::dequant` and this goes red at
+/// concatenation back in `QuantIsoV::dequant` and this goes red at
 /// `b = 2` while staying green at `b = 1` — which is how the defect stayed
 /// invisible.
-#[test]
-fn quant_iso_v3_two_block_decode_matches_one_block_at_b_gt_1() {
+fn two_block_decode_matches_one_block_at_b_gt_1<const BITS: u8>() {
     for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
         let head_dim = 8_usize;
         let (n0, n1) = (2_usize, 3_usize);
         let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
 
-        let mut one = QuantIsoV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32]);
+        let mut one = QuantIsoV::<BITS>::new(vec![b as i32, kv_h as i32, 0, head_dim as i32]);
         one.append(
             &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0 + n1, head_dim),
             &shape(n0 + n1),
@@ -907,7 +966,7 @@ fn quant_iso_v3_two_block_decode_matches_one_block_at_b_gt_1() {
         .expect("single append");
         let oracle = one.dequant().expect("one-block dequant");
 
-        let mut two = QuantIsoV3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32]);
+        let mut two = QuantIsoV::<BITS>::new(vec![b as i32, kv_h as i32, 0, head_dim as i32]);
         two.append(
             &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0, head_dim),
             &shape(n0),
@@ -925,6 +984,16 @@ fn quant_iso_v3_two_block_decode_matches_one_block_at_b_gt_1() {
             "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}"
         );
     }
+}
+
+#[test]
+fn quant_iso_v3_two_block_decode_matches_one_block_at_b_gt_1() {
+    two_block_decode_matches_one_block_at_b_gt_1::<3>();
+}
+
+#[test]
+fn quant_iso_v4_two_block_decode_matches_one_block_at_b_gt_1() {
+    two_block_decode_matches_one_block_at_b_gt_1::<4>();
 }
 
 // ── Block append over a live GPU ring ─────────────────────────────────────────

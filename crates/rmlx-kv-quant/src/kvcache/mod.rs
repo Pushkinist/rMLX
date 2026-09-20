@@ -121,6 +121,12 @@ mod rotor_store_bytes_tests;
 #[path = "iso_flash_dispatch_tests.rs"]
 mod iso_flash_dispatch_tests;
 
+// Byte-level pin on the iso storage layer: what every iso spelling writes into
+// its packed store, and what the attention reads back from it.
+#[cfg(test)]
+#[path = "iso_store_bytes_tests.rs"]
+mod iso_store_bytes_tests;
+
 // A flash-decode step strides over the bf16 V mirror instead of copying its
 // `..kv_seq` prefix.
 #[cfg(test)]

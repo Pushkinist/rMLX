@@ -1,29 +1,41 @@
-//! Unit tests for [`QuantIsoK3`].
+//! Unit tests for [`QuantIsoK`], at both code widths.
 //!
 //! Mirror of `quant_iso_v_tests.rs` — the codec is axis-agnostic, so the
 //! K-side struct exercises the same encode/decode invariants as the V-side
 //! struct. Cosine floor uses the empirical-floor pattern (measure, then gate
 //! at measured − 0.001).
+//!
+//! The cases the two widths share are one generic body plus one `#[test]` per
+//! width. The width-specific expectations a body cannot derive — the cosine
+//! floor — arrive as parameters.
 
 use crate::isoquant::{iso_decode_fast, iso_encode_fast};
-use crate::storage::quant_iso_k::{QuantIsoK3, ISO_K3_BITS, ISO_K3_GROUP_SIZE};
+use crate::storage::quant_iso_k::{QuantIsoK, QuantIsoK3, ISO_K3_GROUP_SIZE, ISO_QUAT_BLOCK_SIZE};
 use crate::test_utils::{cosine_similarity_per_row, lcg_data, skip_if_no_gpu_env, TEST_SEED};
 use rmlx_mlx::{Array, Device, Dtype};
 
-#[test]
-fn quant_iso_k3_new_shapes_correct() {
+fn new_shapes_correct<const BITS: u8>() {
     let init_shape = vec![1_i32, 4, 0, 128];
     let max_seq = 64_i32;
-    let q = QuantIsoK3::new(init_shape.clone(), max_seq);
+    let q = QuantIsoK::<BITS>::new(init_shape.clone(), max_seq);
     assert_eq!(q.shape, init_shape, "shape preserved after new()");
     assert_eq!(q.max_seq, max_seq, "max_seq preserved");
-    assert_eq!(q.bits, ISO_K3_BITS, "bits should be ISO_K3_BITS (3)");
+    assert_eq!(q.bits, BITS, "bits should be the store's own width");
     assert!(q.blocks.is_empty(), "no blocks after new()");
     assert_eq!(q.byte_size(), 0, "byte_size 0 with no blocks");
 }
 
 #[test]
-fn quant_iso_k3_roundtrip_dequant() {
+fn quant_iso_k3_new_shapes_correct() {
+    new_shapes_correct::<3>();
+}
+
+#[test]
+fn quant_iso_k4_new_shapes_correct() {
+    new_shapes_correct::<4>();
+}
+
+fn roundtrip_dequant<const BITS: u8>() {
     let b = 1;
     let kv_h = 2;
     let n_seq = 4;
@@ -33,7 +45,7 @@ fn quant_iso_k3_roundtrip_dequant() {
 
     let new_shape = [b as i32, kv_h as i32, n_seq as i32, head_dim as i32];
 
-    let mut qk = QuantIsoK3::new(
+    let mut qk = QuantIsoK::<BITS>::new(
         vec![b as i32, kv_h as i32, 0_i32, head_dim as i32],
         n_seq as i32,
     );
@@ -46,15 +58,15 @@ fn quant_iso_k3_roundtrip_dequant() {
     let decoded = qk.dequant().expect("dequant should succeed");
 
     let (ref_codes, ref_scales, ref_quats, ref_norms) =
-        iso_encode_fast(&data, head_dim, ISO_K3_GROUP_SIZE, ISO_K3_BITS).expect("encode reference");
+        iso_encode_fast(&data, head_dim, ISO_QUAT_BLOCK_SIZE, BITS).expect("encode reference");
     let reference = iso_decode_fast(
         &ref_codes,
         &ref_scales,
         &ref_quats,
         &ref_norms,
         head_dim,
-        ISO_K3_GROUP_SIZE,
-        ISO_K3_BITS,
+        ISO_QUAT_BLOCK_SIZE,
+        BITS,
     )
     .expect("decode reference");
 
@@ -66,18 +78,27 @@ fn quant_iso_k3_roundtrip_dequant() {
         .fold(0.0_f32, f32::max);
     assert!(
         max_abs_err < 1e-3,
-        "QuantIsoK3::dequant vs iso_decode_fast max_abs_err = {max_abs_err:.6} (>= 1e-3)"
+        "QuantIsoK{BITS}::dequant vs iso_decode_fast max_abs_err = {max_abs_err:.6} (>= 1e-3)"
     );
 }
 
 #[test]
-fn quant_iso_k3_reset_clears_seq() {
+fn quant_iso_k3_roundtrip_dequant() {
+    roundtrip_dequant::<3>();
+}
+
+#[test]
+fn quant_iso_k4_roundtrip_dequant() {
+    roundtrip_dequant::<4>();
+}
+
+fn reset_clears_seq<const BITS: u8>() {
     let head_dim = 8;
     let n_seq = 4;
     let data = lcg_data(n_seq * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_seq as i32, head_dim as i32];
 
-    let mut qk = QuantIsoK3::new(vec![1, 1, 0, head_dim as i32], 16);
+    let mut qk = QuantIsoK::<BITS>::new(vec![1, 1, 0, head_dim as i32], 16);
     qk.append(&data, &new_shape).unwrap();
     assert_eq!(qk.shape[2], n_seq as i32);
 
@@ -86,36 +107,58 @@ fn quant_iso_k3_reset_clears_seq() {
     assert!(qk.blocks.is_empty());
 }
 
-/// Empirical cosine floor for the iso_k3 codec at a realistic head_dim=128.
-/// The codec is axis-agnostic, so the floor matches V-side iso3. Cosine
-/// measured on first run, then gated at measured − 0.001.
 #[test]
-fn quant_iso_k3_cosine_empirical_floor_head_dim_128() {
+fn quant_iso_k3_reset_clears_seq() {
+    reset_clears_seq::<3>();
+}
+
+#[test]
+fn quant_iso_k4_reset_clears_seq() {
+    reset_clears_seq::<4>();
+}
+
+/// Empirical cosine floor for the iso K codec at a realistic head_dim=128.
+///
+/// The codec is axis-agnostic, so the floor matches the V side at the same
+/// width. `floor` is measured on first run and gated at measured − 0.001, with
+/// a safety margin to absorb LCG drift between machines; it is a parameter
+/// because it is the one thing the two widths do not share.
+fn cosine_empirical_floor_head_dim_128<const BITS: u8>(floor: f32) {
     let head_dim = 128;
     let n_rows = 16;
     let data = lcg_data(n_rows * head_dim, TEST_SEED);
     let new_shape = [1_i32, 1, n_rows as i32, head_dim as i32];
 
-    let mut qk = QuantIsoK3::new(vec![1, 1, 0, head_dim as i32], n_rows as i32);
+    let mut qk = QuantIsoK::<BITS>::new(vec![1, 1, 0, head_dim as i32], n_rows as i32);
     qk.append(&data, &new_shape).unwrap();
     let decoded = qk.dequant().unwrap();
 
     let stats = cosine_similarity_per_row(&data, &decoded, head_dim);
-    // Empirical floor: measured min cosine at this seed/shape is ≈ 0.98 with
-    // iso3 quaternion rotation + 3-bit Lloyd-Max. Gate at 0.97 (measured −
-    // 0.001 with safety margin to absorb LCG drift between machines).
     assert!(
-        stats.min >= 0.97,
-        "iso_k3 cosine min={:.6} below empirical floor 0.97",
+        stats.min >= floor,
+        "iso_k{BITS} cosine min={:.6} below empirical floor {floor}",
         stats.min
     );
+}
+
+#[test]
+fn quant_iso_k3_cosine_empirical_floor_head_dim_128() {
+    // Measured min cosine at this seed/shape is ≈ 0.98 with quaternion
+    // rotation + 3-bit Lloyd-Max.
+    cosine_empirical_floor_head_dim_128::<3>(0.97);
+}
+
+#[test]
+fn quant_iso_k4_cosine_empirical_floor_head_dim_128() {
+    // 4-bit is higher fidelity than 3-bit, so the measured min clears 0.99
+    // comfortably.
+    cosine_empirical_floor_head_dim_128::<4>(0.99);
 }
 
 /// Multi-append with `kv_h > 1` must match a single-shot append of the
 /// concatenated head-major buffer (head↔seq layout invariant). Per-(head,
 /// token, dim) distinct values surface any head transposition as a large error.
-#[test]
-fn quant_iso_k3_multi_append_matches_single_shot_gqa() {
+fn multi_append_matches_single_shot_gqa<const BITS: u8>() {
     let kv_h = 3_usize;
     let head_dim = 8_usize;
     let chunk_a = 2_usize;
@@ -136,7 +179,7 @@ fn quant_iso_k3_multi_append_matches_single_shot_gqa() {
         }
         out
     };
-    let mut qref = QuantIsoK3::new(vec![1, kv_h as i32, 0, head_dim as i32], 64);
+    let mut qref = QuantIsoK::<BITS>::new(vec![1, kv_h as i32, 0, head_dim as i32], 64);
     qref.append(
         &build(0, s_total),
         &[1, kv_h as i32, s_total as i32, head_dim as i32],
@@ -144,7 +187,7 @@ fn quant_iso_k3_multi_append_matches_single_shot_gqa() {
     .expect("single-shot append");
     let reference = qref.dequant().expect("single-shot dequant");
 
-    let mut qv = QuantIsoK3::new(vec![1, kv_h as i32, 0, head_dim as i32], 64);
+    let mut qv = QuantIsoK::<BITS>::new(vec![1, kv_h as i32, 0, head_dim as i32], 64);
     qv.append(
         &build(0, chunk_a),
         &[1, kv_h as i32, chunk_a as i32, head_dim as i32],
@@ -164,9 +207,19 @@ fn quant_iso_k3_multi_append_matches_single_shot_gqa() {
         .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
     assert!(
         max_abs < 1.0,
-        "iso_k3 multi-append vs single-shot max_abs_err = {max_abs:.6} (>= 1.0) — head↔seq scramble"
+        "iso_k{BITS} multi-append vs single-shot max_abs_err = {max_abs:.6} (>= 1.0) — \
+         head↔seq scramble"
     );
-    let _ = (ISO_K3_BITS, ISO_K3_GROUP_SIZE);
+}
+
+#[test]
+fn quant_iso_k3_multi_append_matches_single_shot_gqa() {
+    multi_append_matches_single_shot_gqa::<3>();
+}
+
+#[test]
+fn quant_iso_k4_multi_append_matches_single_shot_gqa() {
+    multi_append_matches_single_shot_gqa::<4>();
 }
 
 /// GPU multi-append with `kv_h > 1` must match a single-shot CPU-append +
@@ -261,8 +314,7 @@ fn iso_k3_gpu_multi_append_matches_single_shot_gqa() {
 /// Mutation check: reverting `truncate_to` to compare
 /// `acc + blk.n_tokens <= n as usize` (raw, not row-scaled) makes the
 /// `kv_h > 1` case RED — `blocks.len()` drops and `dequant()` returns `Err`.
-#[test]
-fn quant_iso_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+fn truncate_to_kv_h_gt_1_keeps_exact_prefix<const BITS: u8>() {
     let head_dim = 8_usize;
     let total_tokens = 4_usize;
     let keep_tokens = 2_usize;
@@ -282,7 +334,7 @@ fn quant_iso_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
         };
         let new_shape = [1_i32, kv_h as i32, 1, head_dim as i32];
 
-        let mut store = QuantIsoK3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64);
+        let mut store = QuantIsoK::<BITS>::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64);
         for tok in 0..total_tokens {
             store.append(&token_data(tok), &new_shape).unwrap();
         }
@@ -314,7 +366,8 @@ fn quant_iso_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
             .dequant()
             .expect("dequant must succeed after truncate at kv_h>1 (#284)");
 
-        let mut reference = QuantIsoK3::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64);
+        let mut reference =
+            QuantIsoK::<BITS>::new(vec![1_i32, kv_h as i32, 0, head_dim as i32], 64);
         for tok in 0..keep_tokens {
             reference.append(&token_data(tok), &new_shape).unwrap();
         }
@@ -326,6 +379,16 @@ fn quant_iso_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
              first keep_tokens (kv_h={kv_h})"
         );
     }
+}
+
+#[test]
+fn quant_iso_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+    truncate_to_kv_h_gt_1_keeps_exact_prefix::<3>();
+}
+
+#[test]
+fn quant_iso_k4_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
+    truncate_to_kv_h_gt_1_keeps_exact_prefix::<4>();
 }
 
 // ── Batch-axis block-boundary parity ──────────────────────────────────
@@ -340,17 +403,16 @@ fn quant_iso_k3_truncate_to_kv_h_gt_1_keeps_exact_prefix() {
 /// what makes it the oracle here.
 ///
 /// Mutation check: put `seq_layout::transpose_seq_heads` over the whole
-/// concatenation back in `QuantIsoK3::dequant` and this goes red at
+/// concatenation back in `QuantIsoK::dequant` and this goes red at
 /// `b = 2` while staying green at `b = 1` — which is how the defect stayed
 /// invisible.
-#[test]
-fn quant_iso_k3_two_block_decode_matches_one_block_at_b_gt_1() {
+fn two_block_decode_matches_one_block_at_b_gt_1<const BITS: u8>() {
     for (b, kv_h) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
         let head_dim = 8_usize;
         let (n0, n1) = (2_usize, 3_usize);
         let shape = |n: usize| [b as i32, kv_h as i32, n as i32, head_dim as i32];
 
-        let mut one = QuantIsoK3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512);
+        let mut one = QuantIsoK::<BITS>::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512);
         one.append(
             &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0 + n1, head_dim),
             &shape(n0 + n1),
@@ -358,7 +420,7 @@ fn quant_iso_k3_two_block_decode_matches_one_block_at_b_gt_1() {
         .expect("single append");
         let oracle = one.dequant().expect("one-block dequant");
 
-        let mut two = QuantIsoK3::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512);
+        let mut two = QuantIsoK::<BITS>::new(vec![b as i32, kv_h as i32, 0, head_dim as i32], 512);
         two.append(
             &crate::test_utils::batch_head_chunk(b, kv_h, 0, n0, head_dim),
             &shape(n0),
@@ -376,6 +438,16 @@ fn quant_iso_k3_two_block_decode_matches_one_block_at_b_gt_1() {
             "two-block decode must equal the one-block oracle at b={b} kv_h={kv_h}"
         );
     }
+}
+
+#[test]
+fn quant_iso_k3_two_block_decode_matches_one_block_at_b_gt_1() {
+    two_block_decode_matches_one_block_at_b_gt_1::<3>();
+}
+
+#[test]
+fn quant_iso_k4_two_block_decode_matches_one_block_at_b_gt_1() {
+    two_block_decode_matches_one_block_at_b_gt_1::<4>();
 }
 
 // ── Ring-only tail is readable by both dequant paths ──────────────────────────

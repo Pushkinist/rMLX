@@ -75,6 +75,7 @@ pub mod iso_flash_decode_msl;
 pub mod iso_flash_decode_symv_msl;
 pub mod isoquant;
 pub mod isoquant_msl;
+pub(crate) mod isoquant_msl_dispatch;
 pub mod isoquant_msl_v4;
 pub mod k8vturbo3_append_msl;
 pub mod kvcache;
@@ -145,18 +146,29 @@ pub use quant::{
 
 // ── GPU-resident iso-blocks mirror gate ──────────────────────────────────────
 
-/// Returns `true` when the GPU-resident `QuantIsoV3` mirror is enabled.
+/// Returns `true` when the GPU-resident `QuantIsoV` mirror is enabled.
 ///
 /// **Hardcoded OFF** (bench-driven decision; no env-var opt-in). A/B bench
-/// showed deltas within noise on the `update_iso3` hot path because the
+/// showed deltas within noise on the iso V hot path because the
 /// warm-TTFT bf16 seed absorbs the dequant cost before the mirror is reached.
 /// See `docs/PERF_BASELINE.md` for bench numbers. The gate exists as a
 /// forward-compatibility hook for future seedless decode paths where
 /// `decode_fp16_k.is_none()` during steady-state decode.
+///
+/// The value is [`GPU_RESIDENT_ISO_PRODUCTION`] rather than a literal, because
+/// `cfg(test)` replaces this whole body: a test that called this fn would read
+/// the override flag below and learn nothing about production.
 #[cfg(not(test))]
 pub fn gpu_resident_iso_enabled() -> bool {
-    false
+    GPU_RESIDENT_ISO_PRODUCTION
 }
+
+/// What the production [`gpu_resident_iso_enabled`] returns.
+///
+/// Split out of that fn so a test can assert on it. The fn itself is behind
+/// `cfg(not(test))` and is not compiled into a test binary at all, so it is
+/// unreachable from the one place that would check it.
+pub(crate) const GPU_RESIDENT_ISO_PRODUCTION: bool = false;
 
 /// Test-only override for `gpu_resident_iso_enabled`, scoped to whoever holds
 /// the [`GpuResidentIsoForTest`] guard.
@@ -171,7 +183,7 @@ pub fn gpu_resident_iso_enabled() -> bool {
 /// scope belongs to a guard.
 ///
 /// Reading an `AtomicBool` per call is safe because the single production read
-/// site is inside `QuantIsoV3::append_gpu`, which dispatches a Metal kernel and
+/// site is inside `QuantIsoV::append_gpu`, which dispatches a Metal kernel and
 /// is therefore only reachable from `#[ignore]`d GPU tests — and those run
 /// `--test-threads=1`, so no two of them observe the flag concurrently.
 #[cfg(test)]

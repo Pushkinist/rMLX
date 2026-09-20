@@ -220,11 +220,7 @@ fn batched_ring_feed_is_skipped(quant: KvQuant, bits_label: &str) {
         &shape,
     );
 
-    let res = if quant == KvQuant::IsoKOnly4 {
-        super::update::iso4_k_only_gpu_append(&mut cache, &k, &shape, device)
-    } else {
-        super::update::iso3_k_only_gpu_append(&mut cache, &k, &shape, device)
-    };
+    let res = super::update::iso_k_only_gpu_append(&mut cache, &k, &shape, device);
     res.unwrap_or_else(|e| {
         panic!("{bits_label}: batched GPU append must not error, got: {e}");
     });
@@ -277,12 +273,8 @@ fn cpu_append_drops_a_live_ring(quant: KvQuant, bits_label: &str) {
     let k = f32_array(&lcg_data(n, 11), &shape);
 
     // 1. GPU append -> ring live.
-    if quant == KvQuant::IsoKOnly4 {
-        super::update::iso4_k_only_gpu_append(&mut cache, &k, &shape, device)
-    } else {
-        super::update::iso3_k_only_gpu_append(&mut cache, &k, &shape, device)
-    }
-    .unwrap_or_else(|e| panic!("{bits_label}: gpu_append: {e}"));
+    super::update::iso_k_only_gpu_append(&mut cache, &k, &shape, device)
+        .unwrap_or_else(|e| panic!("{bits_label}: gpu_append: {e}"));
     assert!(
         ring_live(&cache),
         "{bits_label}: precondition — the GPU append must leave a live ring, else this \
@@ -337,8 +329,8 @@ fn iso4_cpu_append_drops_a_live_gpu_ring() {
 /// does: sequence-major.
 ///
 /// `update_iso4` / `update_iso4_sym` used to encode `new_v` head-major, straight
-/// off the model's `[B, kv_h, S, D]` tensor, while `QuantIsoV4::append` reorders
-/// heads↔seq first and `QuantIsoV4::dequant` reorders back. At `kv_h == 1` or
+/// off the model's `[B, kv_h, S, D]` tensor, while `QuantIsoV::append` reorders
+/// heads↔seq first and `QuantIsoV::dequant` reorders back. At `kv_h == 1` or
 /// `S == 1` the two coincide, which is why it survived; a multi-token chunk at
 /// `kv_h > 1` — a speculative verify chunk, or a continuation turn's prompt
 /// tokens against a warm cache — was stored transposed and decoded scrambled,
@@ -363,7 +355,7 @@ fn iso4_v_gpu_append_matches_cpu_append_at_kv_h_gt_1() {
         let init = vec![b as i32, kv_h as i32, 0, head_dim as i32];
         let data = crate::test_utils::batch_head_chunk(b, kv_h, 0, seq, head_dim);
 
-        let mut cpu = crate::storage::QuantIsoV4::new(init.clone(), MAX_SEQ);
+        let mut cpu = crate::storage::QuantIsoV4::new(init.clone());
         cpu.append(&data, &shape).expect("cpu append");
         let oracle = cpu.dequant().expect("cpu dequant");
 
@@ -371,8 +363,8 @@ fn iso4_v_gpu_append_matches_cpu_append_at_kv_h_gt_1() {
         // append it now shares, then compare the decoded values.
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let arr = Array::from_bytes(&bytes, &shape, Dtype::F32).expect("chunk array");
-        let mut gpu = crate::storage::QuantIsoV4::new(init, MAX_SEQ);
-        super::update::iso4_v_gpu_append_for_test(&mut gpu, &arr, &shape, Device::Gpu, MAX_SEQ)
+        let mut gpu = crate::storage::QuantIsoV4::new(init);
+        super::update::iso_v_gpu_append_for_test::<4>(&mut gpu, &arr, &shape, Device::Gpu, MAX_SEQ)
             .expect("gpu append");
         let got = gpu.dequant().expect("gpu-appended dequant");
 

@@ -15,7 +15,8 @@
 #
 # Usage:
 #   bash scripts/debt_report.sh [--root DIR] [--since REF]
-#   bash scripts/debt_report.sh --matched-lines {drivers,impls,rotor-storage,rotor-updates,ssd-hydrate}
+#   bash scripts/debt_report.sh --matched-lines \
+#       {drivers,impls,iso-storage,iso-updates,rotor-storage,rotor-updates,ssd-hydrate}
 
 set -uo pipefail
 
