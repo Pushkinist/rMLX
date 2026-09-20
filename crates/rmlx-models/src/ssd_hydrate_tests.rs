@@ -536,12 +536,12 @@ fn qwen3_5_moe_entry_restores_the_linear_state_beside_the_kv() {
 
 /// Each arch's hydrate carries that arch's own cross-layer-KV topology.
 ///
-/// Seven of the eight bodies pass a literal `false`; gemma4 passes its own
-/// `SHARES_KV_ACROSS_LAYERS`, which is the only `true` in the tree. The flag
-/// lands on every restored cache, and a hydrated cache can be tail-extended,
-/// which re-runs the `exit_prefill` gate this flag decides. A shared body that
-/// hard-codes either value is right for one arch and silently wrong for the
-/// other, so both are read in one test.
+/// The blanket impl passes `E::SHARES_KV`, the constant each entry declares.
+/// gemma4 is the only arch whose value is `true`. The flag lands on every
+/// restored cache, and a hydrated cache can be tail-extended, which re-runs the
+/// `exit_prefill` gate this flag decides. A shared body that hard-codes either
+/// value is right for one arch and silently wrong for the other, so both values
+/// are read in this one test.
 #[test]
 #[allow(
     clippy::expect_used,
@@ -659,7 +659,134 @@ fn the_entry_carries_the_blocks_tokens_not_the_requests() {
     );
 }
 
-// ── the census ──────────────────────────────────────────────────────────────
+// ── the census ───────────────────────────────────────────────────────────
+
+/// What one walk of the crate's non-test sources found about the hydrate seam.
+///
+/// The scan is textual on purpose. Rust has no way to ask which types a test
+/// module instantiated, and a hand-kept list is what the census tests below
+/// exist to replace. Every line is read with its `//` comment blanked, so a
+/// needle inside a comment is not a fact about the code.
+///
+/// The walk skips test sources the same way `scripts/lib/debt_report.py` does:
+/// a `tests` path component, a `tests.rs`, or a `*_tests.rs`. A test entry that
+/// implements the trait is therefore out, and this file is out of its own scan.
+struct HydrateScan {
+    /// The `E` of every `impl HydratedEntry for E`.
+    entries: Vec<String>,
+    /// Sources that write an `impl SsdHydrate<…>` of their own.
+    bypasses: Vec<String>,
+    /// Entries whose `SHARES_KV` does not name an arch constant.
+    unnamed_topology: Vec<String>,
+    /// Entries that do not name every `HydratedBlock` field.
+    partial_destructures: Vec<String>,
+}
+
+fn scan_hydrate_seam() -> HydrateScan {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut scan = HydrateScan {
+        entries: Vec::new(),
+        bypasses: Vec::new(),
+        unnamed_topology: Vec::new(),
+        partial_destructures: Vec::new(),
+    };
+    read_sources_into(&src, &src, &mut scan);
+    scan.entries.sort();
+    scan.entries.dedup();
+    scan.bypasses.sort();
+    scan.bypasses.dedup();
+    scan
+}
+
+/// Read every non-test `.rs` source below `dir` into `scan`.
+///
+/// `root` is the crate's `src`. It is used only to name a file by its path
+/// inside the crate.
+#[allow(
+    clippy::expect_used,
+    reason = "test: a source tree this test cannot read is a broken checkout and must abort loudly"
+)]
+fn read_sources_into(root: &std::path::Path, dir: &std::path::Path, scan: &mut HydrateScan) {
+    for entry in std::fs::read_dir(dir).expect("read crate sources") {
+        let path = entry.expect("read dir entry").path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if path.is_dir() {
+            if name != "tests" {
+                read_sources_into(root, &path, scan);
+            }
+            continue;
+        }
+        if !name.ends_with(".rs") || name == "tests.rs" || name.ends_with("_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source file");
+        let shown = match path.strip_prefix(root) {
+            Ok(rel) => rel.to_string_lossy(),
+            Err(_) => path.to_string_lossy(),
+        };
+        read_source(&shown, &text, scan);
+    }
+}
+
+/// Read one non-test source into `scan`.
+fn read_source(file: &str, text: &str, scan: &mut HydrateScan) {
+    let lines: Vec<String> = text.lines().map(without_comment).collect();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("impl SsdHydrate<") {
+            scan.bypasses.push(file.to_owned());
+        }
+        let Some(rest) = trimmed.strip_prefix("impl HydratedEntry for ") else {
+            continue;
+        };
+        let Some(ty) = rest.split_whitespace().next() else {
+            continue;
+        };
+        scan.entries.push(ty.to_owned());
+        read_entry_impl(ty, &entry_impl_body(&lines, i), scan);
+    }
+}
+
+/// The lines of the `impl HydratedEntry` block that opens at `start`.
+///
+/// The block runs to the first line that is exactly `}` — a closing brace at
+/// column zero, which is what `cargo fmt` writes.
+fn entry_impl_body(lines: &[String], start: usize) -> Vec<&str> {
+    lines
+        .iter()
+        .skip(start)
+        .map(String::as_str)
+        .take_while(|l| *l != "}")
+        .collect()
+}
+
+/// One line with its `//` comment blanked.
+fn without_comment(line: &str) -> String {
+    match line.find("//") {
+        Some(at) => line[..at].to_owned(),
+        None => line.to_owned(),
+    }
+}
+
+/// Read one `impl HydratedEntry for E` block into `scan`.
+fn read_entry_impl(ty: &str, body: &[&str], scan: &mut HydrateScan) {
+    let declared = body
+        .iter()
+        .find(|l| l.trim_start().starts_with("const SHARES_KV"));
+    if !declared.is_some_and(|l| l.contains("SHARES_KV_ACROSS_LAYERS")) {
+        scan.unnamed_topology.push(ty.to_owned());
+    }
+
+    let text = body.join("\n");
+    let exhaustive = text.find("let HydratedBlock {").is_some_and(|at| {
+        let tail = &text[at..];
+        let close = tail.find("} =").unwrap_or(tail.len());
+        !tail[..close].contains("..")
+    });
+    if !exhaustive {
+        scan.partial_destructures.push(ty.to_owned());
+    }
+}
 
 /// Every arch that hydrates has a fixture in this file.
 ///
@@ -668,41 +795,26 @@ fn the_entry_carries_the_blocks_tokens_not_the_requests() {
 /// its own name in the message, instead of joining the three entries that sat
 /// uncovered until the mutation run found them.
 ///
-/// The coverage check is textual on purpose. Rust has no way to ask which
-/// types a test module instantiated, and a hand-kept list is the thing this
-/// test exists to replace. The needles are built from the scanned name, so no
-/// literal in this file can satisfy one by accident — a fixture has to name
-/// its entry type, in a turbofish or in a binding, for the name to be found.
-///
-/// The scan skips test sources the same way `scripts/lib/debt_report.py` does:
-/// a `tests` path component, a `tests.rs`, or a `*_tests.rs`. A test entry
-/// that implements the trait is therefore out, and this file is out of its own
-/// scan.
+/// The needles are built from the scanned name, so no literal in this file can
+/// satisfy one by accident. A fixture has to name its entry type, in a
+/// turbofish or in a binding, for the name to be found.
 #[test]
-#[allow(
-    clippy::expect_used,
-    reason = "test: a source tree this test cannot read is a broken checkout and must abort loudly"
-)]
 fn every_arch_that_hydrates_has_a_fixture_here() {
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut entries = Vec::new();
-    collect_hydrate_impls(&src, &mut entries);
-    entries.sort();
-    entries.dedup();
+    let scan = scan_hydrate_seam();
 
     assert!(
-        entries.len() >= 8,
+        scan.entries.len() >= 8,
         "the scan found {} hydrate impls; it used to find eight, so it has \
-         stopped reading the tree rather than the tree having shrunk: {entries:?}",
-        entries.len()
+         stopped reading the tree rather than the tree having shrunk: {:?}",
+        scan.entries.len(),
+        scan.entries
     );
 
-    // A fixture names its entry either as a turbofish on the shared round
-    // trip or as the type of the binding it hydrates into. Both needles are
-    // built from the scanned name, so nothing written here can satisfy one by
-    // accident.
+    // A fixture names its entry either as a turbofish on the shared round trip
+    // or as the type of the binding it hydrates into.
     let this_file = include_str!("ssd_hydrate_tests.rs");
-    let uncovered: Vec<&String> = entries
+    let uncovered: Vec<&String> = scan
+        .entries
         .iter()
         .filter(|name| {
             !this_file.contains(&format!("<{name}>")) && !this_file.contains(&format!(": {name} ="))
@@ -716,36 +828,44 @@ fn every_arch_that_hydrates_has_a_fixture_here() {
     );
 }
 
-/// Push the `E` of every `impl HydratedEntry for E` in the non-test sources
-/// under `dir` onto `out`.
-#[allow(
-    clippy::expect_used,
-    reason = "test: a source tree this test cannot read is a broken checkout and must abort loudly"
-)]
-fn collect_hydrate_impls(dir: &std::path::Path, out: &mut Vec<String>) {
-    for entry in std::fs::read_dir(dir).expect("read crate sources") {
-        let path = entry.expect("read dir entry").path();
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if path.is_dir() {
-            if name != "tests" {
-                collect_hydrate_impls(&path, out);
-            }
-            continue;
-        }
-        if !name.ends_with(".rs") || name == "tests.rs" || name.ends_with("_tests.rs") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).expect("read source file");
-        for line in text.lines() {
-            let Some(rest) = line.trim_start().strip_prefix("impl HydratedEntry for ") else {
-                continue;
-            };
-            let Some(ty) = rest.split_whitespace().next() else {
-                continue;
-            };
-            out.push(ty.to_owned());
-        }
-    }
+/// No production entry reaches the tier through a probe of its own.
+///
+/// The census above reads `impl HydratedEntry for E`. An arch can skip the
+/// entry trait and write `impl SsdHydrate<NinthEntry> for SsdHydrator`
+/// directly. That compiles while `NinthEntry` does not implement
+/// `HydratedEntry`, and every needle keyed on the entry trait is blind to it.
+/// Such an impl is a second copy of the shared probe body, which is the item
+/// this seam exists to hold at one. Test sources may write one:
+/// `crates/rmlx-models/src/prompt_cache_tests.rs` does, to satisfy a trait
+/// bound the SSD tier never serves.
+#[test]
+fn no_production_entry_bypasses_the_blanket_impl() {
+    let scan = scan_hydrate_seam();
+    assert!(
+        scan.bypasses.is_empty(),
+        "these non-test sources write an SsdHydrate impl of their own: {:?}. \
+         The blanket impl is the one probe body, and an entry reaches it by \
+         implementing HydratedEntry.",
+        scan.bypasses
+    );
+}
+
+/// Each entry names every `HydratedBlock` field it was handed.
+///
+/// An exhaustive destructure is what makes a field added to `HydratedBlock` an
+/// `E0027` at every entry. A `..` opts that entry out silently. For the hybrid
+/// entry the field it would then drop is `lin_caches`, and the request decodes
+/// from a zeroed GatedDeltaNet state.
+#[test]
+fn every_entry_destructures_the_block_exhaustively() {
+    let scan = scan_hydrate_seam();
+    assert!(
+        scan.partial_destructures.is_empty(),
+        "these entries do not name every HydratedBlock field: {:?}. A `..` in \
+         the destructure, or a body that reads the block without one, opts the \
+         entry out of the compile error a new block field raises.",
+        scan.partial_destructures
+    );
 }
 
 // ── the topology constant every entry declares ──────────────────────
@@ -815,26 +935,36 @@ fn every_entry_declares_its_archs_cross_layer_kv_topology() {
     }
 }
 
-/// Every entry the tree hydrates is read by the test above.
+/// Each entry's `SHARES_KV` names its arch's own constant.
+///
+/// The test above compares the two values. A literal that happens to equal its
+/// arch today passes that comparison, and goes stale the day the arch flips.
+/// This test reads the declaration itself, out of the tree.
+#[test]
+fn every_entry_names_its_archs_topology_constant() {
+    let scan = scan_hydrate_seam();
+    assert!(
+        scan.unnamed_topology.is_empty(),
+        "these entries hard-code their cross-layer-KV topology instead of \
+         naming SHARES_KV_ACROSS_LAYERS: {:?}. A literal that matches its arch \
+         today stops matching the day the arch flips, and nothing moves it.",
+        scan.unnamed_topology
+    );
+}
+
+/// Every entry the tree hydrates is read by the table above.
 ///
 /// The names come out of the tree, so a ninth arch that implements the trait
-/// and is left out of that list fails here with its own name, rather than
+/// and is left out of that table fails here with its own name, rather than
 /// carrying an unread constant. The needle is built from the scanned name, so
 /// nothing written in this file can satisfy one by accident.
 #[test]
-#[allow(
-    clippy::expect_used,
-    reason = "test: a source tree this test cannot read is a broken checkout and must abort loudly"
-)]
 fn every_hydrating_entry_has_a_topology_assertion() {
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut entries = Vec::new();
-    collect_hydrate_impls(&src, &mut entries);
-    entries.sort();
-    entries.dedup();
+    let scan = scan_hydrate_seam();
 
     let this_file = include_str!("ssd_hydrate_tests.rs");
-    let unread: Vec<&String> = entries
+    let unread: Vec<&String> = scan
+        .entries
         .iter()
         .filter(|name| !this_file.contains(&format!("<{name} as HydratedEntry>::SHARES_KV")))
         .collect();
