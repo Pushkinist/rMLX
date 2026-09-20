@@ -622,8 +622,9 @@ green on real Metal).
 
 ### 5.7.3 The Iso / Rotor `Vec<Blocks>` codecs use the same sequence-major rule
 
-The rotation-KV `Vec<Blocks>` codecs — `QuantIsoV3` / `QuantIsoV4`,
-`QuantIsoK3` / `QuantIsoK4`, `QuantRotorV<BITS>` (`QuantRotorV3` /
+The rotation-KV `Vec<Blocks>` codecs — `QuantIsoV<BITS>` (`QuantIsoV3` /
+`QuantIsoV4`), `QuantIsoK<BITS>` (`QuantIsoK3` / `QuantIsoK4`),
+`QuantRotorV<BITS>` (`QuantRotorV3` /
 `QuantRotorV4`), `QuantRotorK<BITS>` (`QuantRotorK3` / `QuantRotorK4`) —
 accumulate one `*Blocks` entry per `append`
 and concatenate them on `dequant`, with the caller reshaping head-major
@@ -645,13 +646,17 @@ parameters stay correctly associated after the value reorder:
   by token — the reorder leaves them untouched. The **per-token** QJL sideband
   (`qjl_codes` / `qjl_norms`) permutes with the value rows.
 
-`QuantIsoV3` is the one GPU-resident member: its `append_gpu` adds
-`Array::contiguous` after the heads↔seq transpose before the iso3 encode kernel
-(raw-linear-index MSL kernel; lazy-transpose strides are ignored), and both
-`dequant_gpu` paths (mirror fast-path and CPU-staged `from_bytes`) reshape the
-flat decode to `[B, S, kv_h, D]` then transpose back. The remaining seven are
-CPU-only (`QuantIsoK3` also drives the shared iso3 dequant kernel via the
-CPU-staged path; iso4 / rotor have no MSL kernel). The `.kvb` SSD format is
+`QuantIsoV<BITS>` is the GPU-resident member, at **both** widths: its
+`append_gpu` adds `Array::contiguous` after the heads↔seq transpose before the
+encode kernel `isoquant_msl_dispatch` selects for its width (raw-linear-index
+MSL kernels; lazy-transpose strides are ignored), and both `dequant_gpu` paths
+(mirror fast-path and CPU-staged `from_bytes`) reshape the flat decode to
+`[B, S, kv_h, D]` then transpose back. A one-token chunk is already
+sequence-major, so the transpose-plus-copy is skipped on the decode step — the
+same shortcut `packed_k_chunk_seq_major` takes for the `kvcache` appenders. The
+remaining six take no GPU encode through `isoquant_msl_dispatch`;
+`QuantIsoK<BITS>` drives the iso dequant kernel for its own width and its own
+ring append, and rotor has no MSL kernel. The `.kvb` SSD format is
 byte-stable — only the token-row order **within** a block changes, and spill
 and dequant agree on sequence-major. GPU round-trip verified on `QuantIsoV3`
 (two-append GQA vs single-shot, `kv_h=1` control).
@@ -1241,8 +1246,8 @@ not normal generation. The fused-QK / flash-decode perf gates must be read as
 
 ### GPU-resident V mirror analysis (iso3 V)
 
-Settled by code + `warm_ttft_cross_codec_tests`: `update_iso3` and
-`update_iso3_sym` (the codecs where the GPU-resident `QuantIsoV3` mirror's
+Settled by code + `warm_ttft_cross_codec_tests`: `update_iso_v` and
+`update_iso_sym` (the entries where the GPU-resident `QuantIsoV` mirror's
 `append_gpu`/`dequant_gpu` live) both begin with the
 `decode_fp16_k.is_some()` shortcut. In normal generate the seed is live, so
 their per-step `append_gpu`/`dequant_gpu` **never runs** — and for `Iso3`,

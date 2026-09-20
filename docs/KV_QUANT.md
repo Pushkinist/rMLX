@@ -467,7 +467,7 @@ be classified or the build fails.
   not in assumptions (CLAUDE.md hard rule 7):
 
   * **V-only iso / rotor** (`iso3/4(/sym)`, `rotor3/4(/sym)`,
-    `rotor_k_*_asym_*`) → **`Some`**. At decode, `update_iso3*` /
+    `rotor_k_*_asym_*`) → **`Some`**. At decode, `update_iso_{v,sym}` /
     `update_rotor_{v,sym,k_asym}`
     early-return to the warm-TTFT bf16 decode seed (`decode_fp16_k.is_some()`),
     so the GPU iso/rotor branch is shadowed; the codec encode that runs (at
@@ -2659,27 +2659,28 @@ a different measurement condition; rMLX LCG fixture measures mean ≈ 0.994
 | CPU encode/decode (`isoquant.rs`) | Done |
 | `KvStorage::IsoV3` variant | Done |
 | `KvQuant::Iso3` + `CacheType::Iso3` | Done |
-| `KvCache::update_iso3` decode dispatch | Done |
+| `KvCache::update_iso_v` decode dispatch | Done (one entry over both widths) |
 | SDPA dispatch wiring | Done (dequant-then-SDPA legacy fallback; iso3 has no fused fast path, mirrors K8VTurbo3) |
 | `KvBlockWriter`/`Reader` integration | Done (layout tag `iso_v_3`; K via `write_quant_k`; V via `write_quant_iso_v3` / `read_quant_iso_v3`) |
 | SSD tier integration | Done |
 | MSL kernel hook (`isoquant_msl.rs`) | Done |
-| **MSL encode dispatch + on-demand `Array::from_bytes` dequant** | **Done — `update_iso3` / `update_iso3_sym` / `update_iso_k_only_3` route encode and dequant through `iso_quantize_v3_gpu` + `iso_dequantize_v3_gpu` when `device == Device::Gpu`; `QuantIsoV3::dequant_gpu` / `QuantIsoK3::dequant_gpu` rebuild GPU Arrays directly from CPU blocks via `Array::from_bytes` (no intermediate `Vec<f32>`)** |
-| **GPU-resident `QuantIsoV3` mirror** | **Landed; hardcoded OFF (bench decision — bench showed no measurable benefit on the warm-TTFT path where the bf16 seed absorbs the dequant). `QuantIsoV3::append_gpu` retains the mirror infrastructure for future seedless workloads but the gate `gpu_resident_iso_enabled()` returns `false` unconditionally in production. CPU blocks are still populated for SSD spill (`.kvb` on-disk format unchanged). See `docs/PERF_BASELINE.md` for the bench rationale.** |
+| **MSL encode dispatch + on-demand `Array::from_bytes` dequant** | **Done — `update_iso_v` / `update_iso_sym` / `update_iso_k_only` route encode and dequant through the width the storage variant carries when `device == Device::Gpu`; `QuantIsoV::dequant_gpu` / `QuantIsoK::dequant_gpu` rebuild GPU Arrays directly from CPU blocks via `Array::from_bytes` (no intermediate `Vec<f32>`)** |
+| **GPU-resident `QuantIsoV` mirror** | **Landed; hardcoded OFF (bench decision — bench showed no measurable benefit on the warm-TTFT path where the bf16 seed absorbs the dequant). `QuantIsoV::append_gpu` retains the mirror infrastructure for future seedless workloads but the gate `gpu_resident_iso_enabled()` returns `false` unconditionally in production. CPU blocks are still populated for SSD spill (`.kvb` on-disk format unchanged). See `docs/PERF_BASELINE.md` for the bench rationale.** |
 | `--kv-quant iso3` CLI flag | Done |
 
-The MSL kernel ships as a future-reference hook. The GPU dispatch is on:
-when `device == Device::Gpu`, `update_iso3` / `update_iso3_sym` /
-`update_iso_k_only_3` route encode through `iso_quantize_v3_gpu` and
-dequant through `QuantIsoV3::dequant_gpu` /
-`QuantIsoK3::dequant_gpu`. The dequant methods concatenate per-block CPU
+The GPU dispatch is on: when `device == Device::Gpu`, `update_iso_v` /
+`update_iso_sym` / `update_iso_k_only` route encode and dequant through
+`isoquant_msl_dispatch`, which selects the kernel module from the store's own
+`BITS`, and the store entries are `QuantIsoV::dequant_gpu` /
+`QuantIsoK::dequant_gpu`. The dequant methods concatenate per-block CPU
 payload (codes / scales / quaternions / per-token-norm-expanded-to-per-group)
 into single byte buffers, upload them to the GPU **once** via
-`Array::from_bytes`, dispatch `iso_dequantize_v3_gpu`, then reshape the flat
+`Array::from_bytes`, dispatch the dequant kernel `isoquant_msl_dispatch`
+selects for the store's width, then reshape the flat
 f32 output to `[B, kv_h, S, D]`. No intermediate `Vec<f32>` is materialised
 on the CPU side. CPU path remains intact and is the fallback for `Device::Cpu`.
 
-**Warm-TTFT caveat:** the per-decode-step `update_iso3` codec is shadowed by
+**Warm-TTFT caveat:** the per-decode-step iso codec is shadowed by
 the warm-TTFT bf16 seed when `KvCache::decode_fp16_k.is_some()`, which is
 the case for all current arch wirings (Bonsai 8B, Gemma4, Qwen3.6). The
 GPU dispatch therefore fires once at `exit_prefill` and on cold cache
@@ -2705,7 +2706,8 @@ reflects CPU-heavy V dequant on the initial version; GPU encode path reduces
 overhead.
 
 **Sequence-major buffer layout (whole Iso / Rotor family).** Every `Vec<Blocks>`
-rotation-KV codec — `QuantIsoV3` / `QuantIsoV4`, `QuantIsoK3` / `QuantIsoK4`,
+rotation-KV codec — `QuantIsoV<BITS>` (`QuantIsoV3` / `QuantIsoV4`),
+`QuantIsoK<BITS>` (`QuantIsoK3` / `QuantIsoK4`),
 `QuantRotorV<BITS>` (`QuantRotorV3` / `QuantRotorV4`), `QuantRotorK<BITS>`
 (`QuantRotorK3` / `QuantRotorK4`) — accumulates
 one `*Blocks` entry per `append` and concatenates them on `dequant`. Because
@@ -2754,7 +2756,7 @@ differences are the codebook (16 centroids vs 8) and the pack density
 | Rotation | Golden-ratio fixed quaternion (`FIXED_QUAT`) | Same |
 | Group size | 4 elements (one quaternion block) | Same |
 | `head_dim` constraint | `% 4 == 0` | Same |
-| MSL kernel | **Yes** — encode + dequant dispatch wired into `update_iso3` / `update_iso3_sym` / `update_iso_k_only_3`; `QuantIsoV3::dequant_gpu` / `QuantIsoK3::dequant_gpu` upload CPU blocks via `Array::from_bytes` (no intermediate `Vec<f32>`) | **Yes** — `iso_quantize_v4_gpu` / `iso_dequantize_v4_gpu` in `crates/rmlx-kv-quant/src/isoquant_msl_v4.rs`; encode dispatch wired into `update_iso4` / `update_iso4_sym` / `update_iso_k_only_4` when `device == Device::Gpu` |
+| MSL kernel | **Yes** — `iso_quantize_v3_gpu` / `iso_dequantize_v3_gpu` in `crates/rmlx-kv-quant/src/isoquant_msl.rs` | **Yes** — `iso_quantize_v4_gpu` / `iso_dequantize_v4_gpu` in `crates/rmlx-kv-quant/src/isoquant_msl_v4.rs`. Both widths reach their kernels through `isoquant_msl_dispatch` from the one set of entries (`update_iso_v` / `update_iso_sym` / `update_iso_k_only`, `QuantIsoV::dequant_gpu` / `QuantIsoK::dequant_gpu`) when `device == Device::Gpu` |
 
 **Codebook divergence — same as iso3.** rMLX uses Gaussian Lloyd-Max
 (N(0,1)) `lloyd_gaussian_codebook(4)`; Python references use Beta Lloyd.
@@ -2771,35 +2773,39 @@ mid-points derived from `lloyd_gaussian_codebook(4)`). The bodies live in
 `src/metal/isoquant_quantize_iso4.metal` and
 `src/metal/isoquant_dequantize_iso4.metal`, gated by `make check-metal-compiles`
 against the captured header snapshot `src/metal/probes/isoquant_iso4.hdr.metal`.
-The encode side is wired into the three iso4 update paths (`update_iso4`,
-`update_iso4_sym`, `update_iso_k_only_4`) under
-`device == Device::Gpu`; the CPU codec remains the fallback.
+Both the encode and the decode side are wired into the three iso update
+entries (`update_iso_v`, `update_iso_sym`, `update_iso_k_only`) under
+`device == Device::Gpu`, which reach this width through
+`isoquant_msl_dispatch`; the CPU codec remains the fallback.
 
 **Warm-TTFT caveat.** The iso V hot path is shadowed by the bf16 exit-prefill
 seed: the GPU encode fires **once at exit_prefill**, not per decode step. The
 measured benefit lands on TTFT (large prefill chunk) rather than steady-state
-decode TPS. The CPU dequant remains primary for the returned `v_full` Array —
-full GPU end-to-end dequant is deferred (current CPU bookkeeping preserves SSD
-spill / truncate semantics; switching to GPU-resident state is a follow-up).
+decode TPS.
 
-**CPU ↔ GPU parity.** `iso_v4_msl_matches_cpu_within_eps` in
-`crates/rmlx-kv-quant/src/isoquant_msl_v4_tests.rs` asserts CPU
-(`iso_encode_fast` + `iso_decode_fast`, `bits=4`) ↔ MSL bit-identity
-within 5e-3 on a 32×128 LCG fixture (`#[ignore]`-gated; run via
+**CPU ↔ GPU parity.** Three tests in
+`crates/rmlx-kv-quant/src/isoquant_msl_v4_tests.rs`, all `#[ignore]`-gated
+(run via
 `cargo test -p rmlx-kv-quant -- --ignored isoquant_msl_v4 --test-threads=1`).
+`iso_v4_msl_matches_cpu_within_eps` asserts CPU (`iso_encode_fast` +
+`iso_decode_fast`, `bits=4`) ↔ MSL agreement within 5e-3 on a 32×128 LCG
+fixture, on the kernels. `iso_v4_dequant_gpu_matches_dequant_cpu` and
+`iso_k4_dequant_gpu_matches_dequant_cpu` assert the same on the store entries
+a decode step calls, at the 3-bit pair's two bounds: 5e-3 per element and a
+strict `max|cpu-gpu| ≤ 1e-6`.
 
 **Wire-up status:**
 
 | Component | Status |
 |---|---|
 | CPU encode/decode (parameterized `iso_encode_fast` / `iso_decode_fast`) | Done (bits ∈ {3, 4}) |
-| `KvStorage::IsoV4` variant + `QuantIsoV4` storage struct | Done |
+| `KvStorage::IsoV4` variant + `QuantIsoV4` storage alias | Done (`QuantIsoV<4>`) |
 | `KvQuant::Iso4` + `CacheType::Iso4` | Done |
-| `KvCache::update_iso4` decode dispatch | Done |
+| `KvCache::update_iso_v` decode dispatch | Done (one entry over both widths) |
 | SDPA dispatch wiring | Done (dequant-then-SDPA legacy fallback, mirrors iso3) |
 | `KvBlockWriter`/`Reader` integration | Done (layout tag `iso_v_4`; V via `write_quant_iso_v4` / `read_quant_iso_v4`) |
 | SSD tier integration | Done |
-| MSL kernel hook | Done (`isoquant_msl_v4.rs`, encode dispatch wired into `update_iso4` / `update_iso4_sym` / `update_iso_k_only_4`) |
+| MSL kernel hook | Done (`isoquant_msl_v4.rs`, reached from the three iso entries through `isoquant_msl_dispatch`) |
 | `--kv-quant iso4` / `--ctv iso4` CLI flags | Done |
 
 **Cosine quality (LCG fixture, group_size=4, head_dim=128, bits=4):**
@@ -2809,13 +2815,15 @@ in `crates/rmlx-kv-quant/src/isoquant_tests.rs`. SSD round-trip:
 all four V buffers (codes_packed, scales, quaternions, norms)
 bit-identical post-hydrate.
 
-**Parameterize vs fork decision.**
+**Parameterize, not fork.**
 The encode/decode CPU functions are parameterized over `bits ∈ {3, 4}` (the
-shared dense code plane, `crate::code_plane`). The storage
-struct is forked (`QuantIsoV3` + `QuantIsoV4`) because the bit-width is
-fixed per storage variant and a generic rename would create large
-cross-crate churn for no benefit. `IsoBlocks` is shared (codes:
-`Vec<u32>` is bits-agnostic).
+shared dense code plane, `crate::code_plane`), and so is the storage struct:
+one `QuantIsoV<BITS>` and one `QuantIsoK<BITS>`, with `QuantIsoV3` /
+`QuantIsoV4` / `QuantIsoK3` / `QuantIsoK4` as type aliases, so every caller
+outside the crate keeps its spelling. `IsoBlocks` is shared (codes:
+`Vec<u32>` is bits-agnostic). The stores were forked until the collapse
+recorded in `docs/KV_ISO_TWINS.md`; the fork is what left the 4-bit width
+without a `dequant_gpu`.
 
 ---
 
@@ -4826,20 +4834,20 @@ smoke test.
 
 **Every block push reconciles, and every reader derives its count from the same
 place.** Two holes in that used to be reachable and are now closed. The iso-V
-GPU-encode append (`QuantIsoV3::append_gpu`, the V side of the legacy
-`update_iso3` / `update_iso3_sym` entries) pushed a CPU block without touching a
+GPU-encode append (`QuantIsoV::append_gpu`, the V side of the legacy
+`update_iso_v` / `update_iso_sym` entries) pushed a CPU block without touching a
 live ring, leaving the ring stale *and* the blocks short — it now calls
-`QuantIsoV3::reconcile_ring(device, RingDisposition::Drop)`, which takes the
+`QuantIsoV::reconcile_ring(device, RingDisposition::Drop)`, which takes the
 ring's prefix back and then drops the ring, matching what the CPU `append` does
-by clearing. That is one body, shared with `materialize_iso_v3_ring_tail`, which
-passes `RingDisposition::Keep` because its caller's `sync_ring` decides the
+by clearing. That is one body, shared with the `kvcache` append helpers, which
+pass `RingDisposition::Keep` because their `sync_ring` decides the
 ring's fate immediately after — the disposition is a parameter precisely because
-it is the only thing the two callers disagree on. The iso4 V
-side had the same hole in a separate ring-unaware helper; both of its callers now
-go through the ring-aware `iso4_gpu_append_into_v_blocks` with a `Skip` feed, and
-the helper is gone (it also stored its block head-major, unlike every other iso
-append). On the read side `QuantIsoK3::dequant_gpu` and
-`QuantIsoV3::dequant_gpu` counted `self.blocks` directly while their CPU siblings
+it is the only thing the two callers disagree on. The 4-bit V
+side had the same hole in a separate ring-unaware helper; it went with the
+storage collapse, and the fused 4-bit caller now goes through the ring-aware
+`iso_gpu_append_into_v_blocks` (it also stored its block head-major, unlike
+every other iso append). On the read side `QuantIsoK::dequant_gpu` and
+`QuantIsoV::dequant_gpu` counted `self.blocks` directly while their CPU siblings
 counted the ring-reconciled list, so a legitimate ring-only tail was rejected as
 a blocks-vs-shape disagreement (`dequant_gpu: actual_total=... !=
 declared_total=...`); both now start from `synced_iso_v_blocks`, which borrows
@@ -5390,7 +5398,7 @@ the packed iso K store + online softmax + bf16-V SV, in two Metal dispatches per
 decode step. Same two-pass shell, same shared
 `metal/flash_decode_merge_p2.metal`; only the K-decode differs.
 
-**What it replaced.** `update_iso_k_only_{3,4}` called `QuantIsoK{3,4}::dequant()`
+**What it replaced.** `update_iso_k_only` called `QuantIsoK::dequant()`
 on every decode step — a full-prefix **CPU** iso decode into a `Vec<f32>` plus a
 re-upload. That is O(seq) host work per token with the GPU idle, and it is what
 pinned the K-only iso family in the "Tier 3 — CPU-bound" bucket. The store is now
@@ -5405,8 +5413,8 @@ it directly.
   body for **both** bit widths).
 * `crates/rmlx-kv-quant/src/metal/flash_decode_merge_p2.metal` — codec-agnostic
   pass-2 log-sum-exp merge, shared with `rotor_flash_decode` / `planar_flash_decode`.
-* `crates/rmlx-kv-quant/src/storage/quant_iso_k.rs` / `quant_iso_k4.rs` — the iso
-  K stores, each embedding a `QuantKGpuRing`.
+* `crates/rmlx-kv-quant/src/storage/quant_iso_k.rs` — the iso K store
+  (`QuantIsoK<BITS>`), embedding a `QuantKGpuRing`.
 * `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_iso_k_fused` —
   dispatch site (plus `try_dispatch_shared_store` / `sdpa_shared` for shared-KV
   models).

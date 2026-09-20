@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::isoquant::{iso_decode_fast, iso_encode_fast};
+use crate::storage::{IsoBlocks, QuantIsoK4, QuantIsoV4};
 use crate::test_utils::{lcg_data, skip_if_no_gpu_env, vectorized_parity_check};
 
 /// Build a test `Array` from a f32 slice and shape.
@@ -104,6 +105,121 @@ fn iso_v4_msl_matches_cpu_within_eps() {
         &data,
         5e-3_f32,
         "iso4 CPU vs MSL",
+    );
+}
+
+/// `QuantIsoV4::dequant_gpu` matches `QuantIsoV4::dequant` (CPU) within codec
+/// tolerance, and within the strict numeric bound the 3-bit sibling holds.
+///
+/// The 4-bit width had no `dequant_gpu` until the storage collapse gave it
+/// one, so `iso_v4_msl_matches_cpu_within_eps` above could only compare the
+/// kernels. This compares the store entries a decode step actually calls, at
+/// the same two bounds as `iso_v3_dequant_gpu_matches_dequant_cpu`.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test -p rmlx-kv-quant -- --ignored isoquant_msl_v4 --test-threads=1"]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture: panic on Result::Err from encode/dequant paths is the desired test failure mode"
+)]
+fn iso_v4_dequant_gpu_matches_dequant_cpu() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    // A [B, kv_h, S, D] layout matching the iso V decode contract.
+    let b: usize = 1;
+    let kv_h: usize = 4;
+    let s_tokens: usize = 16;
+    let head_dim: usize = 128;
+    let n_tokens = b * kv_h * s_tokens;
+    let data = lcg_data(n_tokens * head_dim, 0x179C_BEEF_u64);
+
+    let storage_shape: Vec<i32> = vec![b as i32, kv_h as i32, s_tokens as i32, head_dim as i32];
+
+    // Build the storage by stuffing one CPU-encoded block.
+    let (codes, scales, quaternions, norms) =
+        iso_encode_fast(&data, head_dim, 4, 4).expect("iso_encode_fast bits=4");
+    let mut vs = QuantIsoV4::new(storage_shape);
+    vs.blocks.push(IsoBlocks {
+        codes,
+        scales,
+        quaternions,
+        norms,
+        n_tokens,
+    });
+
+    let cpu = vs.dequant().expect("dequant cpu");
+    let arr = vs.dequant_gpu(Device::Gpu).expect("dequant_gpu");
+    let gpu = array_to_f32_vec(&arr);
+
+    assert_dequant_parity(&cpu, &gpu, "V4");
+}
+
+/// `QuantIsoK4::dequant_gpu` matches `QuantIsoK4::dequant` (CPU) within codec
+/// tolerance and the strict bound.
+///
+/// K-side mirror of the V4 test; same axis-agnostic kernel, same tolerances.
+#[test]
+#[ignore = "GPU Metal context — run in isolation: cargo test -p rmlx-kv-quant -- --ignored isoquant_msl_v4 --test-threads=1"]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixture: panic on Result::Err from encode/dequant paths is the desired test failure mode"
+)]
+fn iso_k4_dequant_gpu_matches_dequant_cpu() {
+    if skip_if_no_gpu_env() {
+        return;
+    }
+    let b: usize = 1;
+    let kv_h: usize = 4;
+    let s_tokens: usize = 16;
+    let head_dim: usize = 128;
+    let n_tokens = b * kv_h * s_tokens;
+    let data = lcg_data(n_tokens * head_dim, 0x179D_BEEF_u64);
+
+    let storage_shape: Vec<i32> = vec![b as i32, kv_h as i32, s_tokens as i32, head_dim as i32];
+
+    let (codes, scales, quaternions, norms) =
+        iso_encode_fast(&data, head_dim, 4, 4).expect("iso_encode_fast bits=4");
+    let mut ks = QuantIsoK4::new(storage_shape, s_tokens as i32);
+    ks.blocks.push(IsoBlocks {
+        codes,
+        scales,
+        quaternions,
+        norms,
+        n_tokens,
+    });
+
+    let cpu = ks.dequant().expect("dequant cpu");
+    let arr = ks.dequant_gpu(Device::Gpu).expect("dequant_gpu");
+    let gpu = array_to_f32_vec(&arr);
+
+    assert_dequant_parity(&cpu, &gpu, "K4");
+}
+
+/// The two bounds a `dequant_gpu` parity test holds, shared by the V and K
+/// cases above.
+///
+/// `5e-3` is the codebook tolerance. The strict `1e-6` is the real gate: the
+/// CPU and GPU paths reduce through different fp32 summation orders inside the
+/// MSL kernel, so a few ULPs are expected and anything larger is codec drift,
+/// which would otherwise surface only as a perplexity regression.
+fn assert_dequant_parity(cpu: &[f32], gpu: &[f32], axis: &str) {
+    assert_eq!(cpu.len(), gpu.len(), "{axis} dequant length mismatch");
+    let mut max_abs = 0.0_f32;
+    for (i, (c, g)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        let diff = (c - g).abs();
+        if diff > max_abs {
+            max_abs = diff;
+        }
+        assert!(
+            diff <= 5e-3_f32,
+            "{axis} dequant mismatch @ idx {i}: cpu={c}, gpu={g}, diff={diff}"
+        );
+    }
+    eprintln!("{axis} dequant_gpu max|cpu-gpu| = {max_abs:.8}");
+    assert!(
+        max_abs <= 1e-6_f32,
+        "{axis} dequant_gpu strict bound broken: max|cpu-gpu| = {max_abs}; expected ≤ 1e-6. \
+         If the new observation is intentional, update docs/KV_QUANT.md to the new bound."
     );
 }
 

@@ -1,42 +1,53 @@
-// IsoQuant 3-bit V storage struct.
+// IsoQuant V storage, one type over both code widths.
 //
 // LOC-exempt: the GPU mirror adds ~360 LOC in append_gpu + dequant_gpu;
 // planned split to sibling iso_gpu_mirror.rs once the remaining codec
 // mirrors land. The split is deferred to keep the review surface contained.
 //
-// Mirrors the `QuantPlanarV` layout (CPU-side `Vec` buffers); GPU buffers are
-// reserved for T11d when the MSL kernel lands. Promoted to `pub` so the SSD
-// modules (in `rmlx-kv-ssd`) can reach across the crate boundary once T11c
-// wires SSD spill/hydrate.
+// Mirrors the `QuantPlanarV` layout (CPU-side `Vec` buffers). Promoted to `pub`
+// so the SSD modules (in `rmlx-kv-ssd`) can reach across the crate boundary.
+//
+// The 3-bit and 4-bit codecs differ in exactly one scalar, the code width: the
+// quaternion group is four components at either width, and
+// `iso_encode_fast` / `iso_decode_fast` are already parametric over `bits`. So
+// the store is one `QuantIsoV<BITS>` and the width-named spellings are type
+// aliases.
 #![allow(
     unreachable_pub,
     clippy::exhaustive_structs,
     clippy::indexing_slicing,
     clippy::doc_lazy_continuation
 )]
-//! Quantized V buffer: `QuantIsoV3` (IsoQuant 3-bit V codec).
+//! Quantized V buffer: `QuantIsoV<BITS>` (IsoQuant V codec), spelled
+//! `QuantIsoV3` / `QuantIsoV4`.
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{zeros, Array, Device, Dtype};
 
 use crate::isoquant::{iso_decode_fast, iso_encode_fast, IsoQuantError, FIXED_QUAT};
 
-use super::{iso_n_groups_for, QuantKGpuRing, KV_PAGE_SIZE};
+use super::{iso_n_groups_for, QuantKGpuRing, ISO_QUAT_BLOCK_SIZE, KV_PAGE_SIZE};
 
 /// Bit-width of the iso3 V codec (fixed at 3-bit — see
 /// [`crate::isoquant::iso_encode_fast`]).
 pub const ISO3_BITS: u8 = 3;
 
-/// Quaternion-block size for the iso3 codec (fixed at 4 elements / group; one
-/// quaternion per group in fast mode).
-pub const ISO3_GROUP_SIZE: usize = 4;
+/// Bit-width of the iso4 V codec (fixed at 4-bit).
+pub const ISO4_BITS: u8 = 4;
 
-/// One token's iso3 payload: codes + per-group scales + per-group quaternion +
+/// Quaternion-block size for the iso3 V codec. Alias of
+/// [`ISO_QUAT_BLOCK_SIZE`] — see it for why this is not independently tunable.
+pub const ISO3_GROUP_SIZE: usize = ISO_QUAT_BLOCK_SIZE;
+
+/// Quaternion-block size for the iso4 V codec — identical to iso3.
+pub const ISO4_GROUP_SIZE: usize = ISO_QUAT_BLOCK_SIZE;
+
+/// One token's iso payload: codes + per-group scales + per-group quaternion +
 /// L2 norm.
 ///
 /// Mirrors the [`crate::planarquant::PlanarBlocks`] shape but stores quaternions
-/// + per-token norm rather than per-pair rotations. CPU-side only — the GPU
-/// path lands in T11d.
+/// + per-token norm rather than per-pair rotations. The struct is
+/// width-agnostic: only the number of `codes` words per row follows `BITS`.
 #[derive(Debug, Clone)]
 pub struct IsoBlocks {
     /// The row's dense code plane (see [`crate::code_plane`]): `bits` per code,
@@ -104,16 +115,13 @@ impl super::BlockRows for IsoBlocks {
     }
 }
 
-/// Accumulated IsoQuant V cache (3-bit, quaternion SO(4) fast mode).
+/// Accumulated IsoQuant V cache at code width `BITS` (quaternion SO(4) fast
+/// mode).
 ///
 /// Storage parallels [`crate::storage::QuantPlanarV`] but the per-group
 /// rotation is a 4-component quaternion rather than a 4-bit rotation index, and
 /// a per-token norm scalar is preserved separately.
-///
-/// CPU-only. GPU buffers are not yet allocated — the MSL kernel is deferred.
-/// The SDPA dispatch falls through to the dequant-then-SDPA legacy path
-/// (see `kvcache::sdpa`).
-pub struct QuantIsoV3 {
+pub struct QuantIsoV<const BITS: u8> {
     /// Accumulated per-token blocks (one entry per append call; `dequant`
     /// flattens them).
     pub blocks: Vec<IsoBlocks>,
@@ -132,8 +140,9 @@ pub struct QuantIsoV3 {
     // `KvStorage` variant, grows as the sequence does, and is passed to
     // `append_gpu` per call. A cached copy is a snapshot that goes stale the
     // moment the window grows — the same trap `QuantRotorK{3,4}` used to carry.
-    /// Bit-width tag (always [`ISO3_BITS`] for this codec; kept as a field for
-    /// symmetry with the other `Quant*` structs and future-proofing).
+    /// Bit-width tag (always `BITS` for this codec; kept as a field for
+    /// symmetry with the other `Quant*` structs and so a consumer holding an
+    /// erased store can still read the width).
     pub bits: u8,
     // ── GPU-resident codec mirror ────────────────────────────────────────────
     //
@@ -178,11 +187,21 @@ pub struct QuantIsoV3 {
     pub(crate) gpu_offset: i32,
 }
 
-impl std::fmt::Debug for QuantIsoV3 {
+/// The 3-bit iso V store.
+pub type QuantIsoV3 = QuantIsoV<3>;
+
+/// The 4-bit iso V store.
+pub type QuantIsoV4 = QuantIsoV<4>;
+
+impl<const BITS: u8> std::fmt::Debug for QuantIsoV<BITS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Resolved at compile time; the struct name must not allocate on a
+        // formatting path. Reading `NAME` also means a width the codec does
+        // not ship cannot be formatted at all.
+        let name = Self::NAME;
         // GPU buffers are Option<Array>; logging the full handle is noisy.
         // Summarise mirror presence + sizing instead.
-        f.debug_struct("QuantIsoV3")
+        f.debug_struct(name)
             .field("n_blocks", &self.blocks.len())
             .field("gpu_resident", &self.gpu.is_allocated())
             .field("shape", &self.shape)
@@ -204,18 +223,50 @@ impl std::fmt::Debug for QuantIsoV3 {
     }
 }
 
-impl QuantIsoV3 {
-    /// Construct an empty `QuantIsoV3` for `init_shape = [B, kv_h, 0, D]`.
+impl<const BITS: u8> QuantIsoV<BITS> {
+    /// The codec ships two widths and one kernel pair per width. A third
+    /// instantiation has neither, so it is refused where a reader can see it —
+    /// at compile time — rather than by a `_` arm that would format it as the
+    /// 4-bit store and by a runtime refusal from the kernel dispatch.
+    const WIDTH_IS_A_SHIPPED_ONE: () = assert!(
+        BITS == ISO3_BITS || BITS == ISO4_BITS,
+        "the iso codec ships 3-bit and 4-bit only"
+    );
+
+    /// Name of this width's store, for a diagnostic that must not allocate.
+    ///
+    /// Reads [`Self::WIDTH_IS_A_SHIPPED_ONE`] first. A sibling const does not
+    /// force another, so without that line a store reached only through
+    /// `NAME` — or through a constructor that never mentions the guard — would
+    /// compile at a width the codec does not ship and print as the 4-bit one.
+    const NAME: &'static str = {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
+        if BITS == ISO3_BITS {
+            "QuantIsoV3"
+        } else {
+            "QuantIsoV4"
+        }
+    };
+
+    /// `what` for the ring-append diagnostics, naming the width that asked.
+    const GPU_APPEND_WHAT: &'static str = if BITS == ISO3_BITS {
+        "QuantIsoV3::gpu_append"
+    } else {
+        "QuantIsoV4::gpu_append"
+    };
+
+    /// Construct an empty store for `init_shape = [B, kv_h, 0, D]`.
     ///
     /// The seq dim of `init_shape` should be 0 — the first `append` call
     /// supplies `new_shape` with the actual seq increment.
     #[must_use]
     pub fn new(init_shape: Vec<i32>) -> Self {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         Self {
             blocks: Vec::new(),
             gpu: QuantKGpuRing::default(),
             shape: init_shape,
-            bits: ISO3_BITS,
+            bits: BITS,
             gpu_codes_buf: None,
             gpu_scales_buf: None,
             gpu_norms_buf: None,
@@ -239,7 +290,7 @@ impl QuantIsoV3 {
     pub fn append(&mut self, f32_data: &[f32], new_shape: &[i32]) -> Result<()> {
         if new_shape.len() != 4 {
             return Err(Error::Mlx(format!(
-                "QuantIsoV3::append: expected 4D new_shape, got {new_shape:?}"
+                "QuantIsoV{BITS}::append: expected 4D new_shape, got {new_shape:?}"
             )));
         }
         let b = new_shape[0] as usize;
@@ -259,8 +310,8 @@ impl QuantIsoV3 {
             super::seq_layout::transpose_heads_seq(f32_data, b, kv_h, new_seq, head_dim);
 
         let (codes, scales, quaternions, norms) =
-            iso_encode_fast(&seq_major, head_dim, ISO3_GROUP_SIZE, ISO3_BITS)
-                .map_err(|e: IsoQuantError| Error::Mlx(format!("iso3 encode: {e}")))?;
+            iso_encode_fast(&seq_major, head_dim, ISO_QUAT_BLOCK_SIZE, BITS)
+                .map_err(|e: IsoQuantError| Error::Mlx(format!("iso{BITS} encode: {e}")))?;
 
         self.blocks.push(IsoBlocks {
             codes,
@@ -285,20 +336,19 @@ impl QuantIsoV3 {
         Ok(())
     }
 
-    /// Construct a `QuantIsoV3` from pre-computed CPU blocks (SSD hydrate path).
+    /// Construct a store from pre-computed CPU blocks (SSD hydrate path).
     ///
     /// Mirrors `QuantPlanarV::from_cpu_blocks` — caller supplies the flat
     /// concatenated buffers (one `IsoBlocks` per call from `block_io`) and the
-    /// 4-D shape `[B, kv_h, S, D]`. `max_seq` defaults to `shape[2]` (the
-    /// hydrated sequence length); callers that need a larger window update it
-    /// separately after construction.
+    /// 4-D shape `[B, kv_h, S, D]`.
     #[must_use]
     pub fn from_cpu_blocks(blocks: Vec<IsoBlocks>, shape: Vec<i32>) -> Self {
         // Caller (SSD hydrate `read_quant_iso_v3`) always provides a 4-element
         // [B, kv_h, S, D] shape. A shorter shape means a coding error upstream.
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         debug_assert!(
             shape.len() == 4,
-            "QuantIsoV3::from_cpu_blocks expects a 4-element [B, kv_h, S, D] shape, got {shape:?}"
+            "QuantIsoV{BITS}::from_cpu_blocks expects a 4-element [B, kv_h, S, D] shape, got {shape:?}"
         );
         Self {
             blocks,
@@ -306,7 +356,7 @@ impl QuantIsoV3 {
             // the next GPU append.
             gpu: QuantKGpuRing::default(),
             shape,
-            bits: ISO3_BITS,
+            bits: BITS,
             // Hydrate path leaves the GPU mirror unallocated. The next
             // `dequant_gpu` call falls back to the CPU-staged upload path
             // until the next `append_gpu` lazily re-allocates the mirror.
@@ -495,16 +545,15 @@ impl QuantIsoV3 {
         ))
         .map_err(|_| {
             Error::Quant(format!(
-                "QuantIsoV3::gpu_append: n_groups for head_dim={head_dim} exceeds i32::MAX"
+                "QuantIsoV{BITS}::gpu_append: n_groups for head_dim={head_dim} exceeds i32::MAX"
             ))
         })?;
         if n_groups <= 0 {
             return Err(Error::Quant(format!(
-                "QuantIsoV3::gpu_append: head_dim={head_dim} yields no quaternion groups"
+                "QuantIsoV{BITS}::gpu_append: head_dim={head_dim} yields no quaternion groups"
             )));
         }
-        let code_words =
-            crate::storage::iso_code_words_i32(head_dim, ISO3_BITS, "QuantIsoV3::gpu_append")?;
+        let code_words = crate::storage::iso_code_words_i32(head_dim, BITS, Self::GPU_APPEND_WHAT)?;
         if !self.gpu.is_allocated() && prev_seq > 0 {
             let (c, s, n) = self.flatten_blocks();
             self.gpu.seed_from_cpu(
@@ -635,7 +684,7 @@ impl QuantIsoV3 {
     pub fn dequant_on(&self, device: Device) -> Result<Vec<f32>> {
         if self.shape.len() != 4 {
             return Err(Error::Mlx(format!(
-                "QuantIsoV3::dequant: malformed shape {:?}",
+                "QuantIsoV{BITS}::dequant: malformed shape {:?}",
                 self.shape
             )));
         }
@@ -658,8 +707,8 @@ impl QuantIsoV3 {
             // than fabricate a zeroed prefix.
             if total_elems != 0 {
                 return Err(Error::Mlx(format!(
-                    "QuantIsoV3::dequant: no blocks but shape {:?} implies {total_elems} elems — \
-                     refusing to zero-pad a lost decode tail",
+                    "QuantIsoV{BITS}::dequant: no blocks but shape {:?} implies {total_elems} \
+                     elems — refusing to zero-pad a lost decode tail",
                     self.shape
                 )));
             }
@@ -673,10 +722,10 @@ impl QuantIsoV3 {
                 &blk.quaternions,
                 &blk.norms,
                 head_dim,
-                ISO3_GROUP_SIZE,
-                ISO3_BITS,
+                ISO_QUAT_BLOCK_SIZE,
+                BITS,
             )
-            .map_err(|e: IsoQuantError| Error::Mlx(format!("iso3 decode: {e}")))?;
+            .map_err(|e: IsoQuantError| Error::Mlx(format!("iso{BITS} decode: {e}")))?;
             out.extend_from_slice(&dec);
         }
         // `synced_iso_v_blocks` guarantees the blocks cover `shape[2]`, so a
@@ -684,8 +733,8 @@ impl QuantIsoV3 {
         // loudly rather than zero-padding or truncating a decoded prefix.
         if out.len() != total_elems {
             return Err(Error::Mlx(format!(
-                "QuantIsoV3::dequant: decoded {} elems but shape {:?} implies {total_elems} — \
-                 refusing to zero-pad / truncate",
+                "QuantIsoV{BITS}::dequant: decoded {} elems but shape {:?} implies \
+                 {total_elems} — refusing to zero-pad / truncate",
                 out.len(),
                 self.shape
             )));
@@ -710,7 +759,7 @@ impl QuantIsoV3 {
 
     /// GPU-resident encode + mirror update.
     ///
-    /// Dispatches the iso3 MSL encode kernel directly on `v_arr` and:
+    /// Dispatches the MSL encode kernel for `BITS` directly on `v_arr` and:
     ///
     /// 1. Reads the GPU outputs back into CPU `IsoBlocks` (SSD spill stays on
     ///    the CPU-blocks path; on-disk format unchanged).
@@ -719,8 +768,8 @@ impl QuantIsoV3 {
     ///    per-struct buffer via `slice_update`, so the next `dequant_gpu`
     ///    call can skip the `Array::from_bytes` re-upload.
     ///
-    /// Replaces the `iso3_gpu_append_into_blocks` callsite in
-    /// `update_iso3` / `update_iso3_sym`.
+    /// This is the V-side GPU append the `KvCache::update_iso` entry makes at
+    /// either width.
     ///
     /// # Errors
     ///
@@ -743,25 +792,27 @@ impl QuantIsoV3 {
     ) -> Result<()> {
         if new_shape.len() != 4 {
             return Err(Error::Mlx(format!(
-                "QuantIsoV3::append_gpu: expected 4D new_shape, got {new_shape:?}"
+                "QuantIsoV{BITS}::append_gpu: expected 4D new_shape, got {new_shape:?}"
             )));
         }
         let b = new_shape[0] as usize;
         let kv_h = new_shape[1] as usize;
         let s_new = new_shape[2] as usize;
         let head_dim = new_shape[3] as usize;
-        if head_dim == 0 || !head_dim.is_multiple_of(ISO3_GROUP_SIZE) {
+        if head_dim == 0 || !head_dim.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
             return Err(Error::Quant(format!(
-                "QuantIsoV3::append_gpu: head_dim={head_dim} must be a positive multiple of \
-                 ISO3_GROUP_SIZE={ISO3_GROUP_SIZE}"
+                "QuantIsoV{BITS}::append_gpu: head_dim={head_dim} must be a positive multiple \
+                 of the quaternion block size {ISO_QUAT_BLOCK_SIZE}"
             )));
         }
-        let n_groups = head_dim / ISO3_GROUP_SIZE;
+        let n_groups = head_dim / ISO_QUAT_BLOCK_SIZE;
         let n_tokens_total = b
             .checked_mul(kv_h)
             .and_then(|v| v.checked_mul(s_new))
             .ok_or_else(|| {
-                Error::Quant("QuantIsoV3::append_gpu: n_tokens_total overflow".to_owned())
+                Error::Quant(format!(
+                    "QuantIsoV{BITS}::append_gpu: n_tokens_total overflow"
+                ))
             })?;
 
         // ── 0. Take the ring's prefix back, then drop the ring. ────────────
@@ -783,27 +834,42 @@ impl QuantIsoV3 {
         // store + head-major reshape on `dequant_gpu` transposes heads across
         // multi-append GQA caches (kv_h>1). Reorder the chunk to sequence-major
         // `[B, new_seq, kv_h, D]` before quantizing — `transpose` yields a
-        // strided view, and the iso3 MSL kernel reads its input by raw linear
-        // offset (ignores MLX strides), so materialize with `contiguous` first.
+        // strided view, and the iso MSL kernels read their input by raw linear
+        // offset (ignore MLX strides), so materialize with `contiguous` first.
         // `quats_gpu` is a constant FIXED_QUAT-filled placeholder that the
-        // dequant kernel never reads (see `iso_dequantize_v3_gpu`); we forward
-        // it to `iso3_gpu_outputs_to_cpu` for ABI parity and then drop it.
-        let v_seq_major = v_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
+        // dequant kernel never reads; we forward it to the readback for ABI
+        // parity and then drop it.
+        // A one-token chunk is its own sequence-major form, so skip the copy
+        // on the decode hot path — the same shortcut `packed_k_chunk_seq_major`
+        // takes for the `kvcache` appenders.
+        let v_seq_major = if s_new == 1 {
+            v_arr.try_clone()?
+        } else {
+            v_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?
+        };
         let (codes_gpu, scales_gpu, quats_gpu, norms_gpu) =
-            crate::isoquant_msl::iso_quantize_v3_gpu(&v_seq_major, head_dim, device)?;
+            crate::isoquant_msl_dispatch::iso_quantize_gpu(
+                &v_seq_major,
+                head_dim,
+                BITS,
+                "QuantIsoV::append_gpu",
+                device,
+            )?;
 
         // ── 2. Read back into CPU blocks (SSD spill compatibility). ────────
         // Reuse the shared helper so this path stays bit-identical with the
         // CPU-block layout (matters for SSD round-trip — same byte order as
         // `write_quant_iso_v3`).
         let (codes_cpu, scales_cpu, quats_cpu, norms_cpu) =
-            crate::isoquant_msl::iso3_gpu_outputs_to_cpu(
+            crate::isoquant_msl_dispatch::iso_gpu_outputs_to_cpu(
                 &codes_gpu,
                 &scales_gpu,
                 &quats_gpu,
                 &norms_gpu,
                 n_tokens_total,
                 n_groups,
+                BITS,
+                "QuantIsoV::append_gpu",
             )?;
         self.blocks.push(IsoBlocks {
             codes: codes_cpu,
@@ -825,10 +891,6 @@ impl QuantIsoV3 {
             self.shape[2] += new_shape[2];
         }
 
-        // SAFETY: `gpu_resident_iso_enabled()` is hardcoded `false` in
-        // production; in test mode it uses OnceLock latching on first read.
-        // Either way the gate state cannot toggle between prev_seq capture
-        // (above) and this check, so prev_seq is safe to use unconditionally.
         // ── 4. GPU mirror write (gated). ───────────────────────────────────
         if !crate::gpu_resident_iso_enabled() {
             return Ok(());
@@ -840,7 +902,7 @@ impl QuantIsoV3 {
             .checked_mul(kv_h)
             .and_then(|v| {
                 v.checked_mul(crate::storage::iso_row_words(
-                    n_groups * ISO3_GROUP_SIZE,
+                    n_groups * ISO_QUAT_BLOCK_SIZE,
                     self.bits,
                 ))
             })
@@ -871,22 +933,24 @@ impl QuantIsoV3 {
         match mirror_result {
             Ok(()) => {
                 tracing::trace!(
-                    target: "rmlx::kv_quant::iso3_gpu",
+                    target: "rmlx::kv_quant::iso_gpu",
+                    bits = BITS,
                     prev_seq,
                     s_new,
                     new_offset,
-                    "iso3 V GPU mirror update"
+                    "iso V GPU mirror update"
                 );
                 self.gpu_offset = new_offset;
                 Ok(())
             }
             Err(e) => {
                 tracing::warn!(
-                    target: "rmlx::kv_quant::iso3_gpu",
+                    target: "rmlx::kv_quant::iso_gpu",
+                    bits = BITS,
                     error = %e,
                     prev_seq,
                     s_new,
-                    "iso3 V GPU mirror update failed; resetting mirror to fall back to CPU-staged dequant"
+                    "iso V GPU mirror update failed; resetting mirror to fall back to CPU-staged dequant"
                 );
                 self.gpu_codes_buf = None;
                 self.gpu_scales_buf = None;
@@ -953,17 +1017,18 @@ impl QuantIsoV3 {
             self.gpu_capacity = init_cap;
             self.gpu_offset = 0;
             tracing::debug!(
-                target: "rmlx::kv_quant::iso3_gpu",
+                target: "rmlx::kv_quant::iso_gpu",
+                bits = BITS,
                 init_cap,
                 words_per_step,
                 groups_per_step,
-                "iso3 V GPU mirror init"
+                "iso V GPU mirror init"
             );
         } else {
             debug_assert_eq!(
                 self.gpu_words_per_step as usize, words_per_step,
                 "append_gpu: words_per_step changed across appends — \
-                 (B, kv_h, head_dim) must be fixed for the lifetime of a QuantIsoV3"
+                 (B, kv_h, head_dim) must be fixed for the lifetime of a QuantIsoV"
             );
             debug_assert_eq!(
                 self.gpu_groups_per_step as usize, groups_per_step,
@@ -1052,9 +1117,10 @@ impl QuantIsoV3 {
             self.gpu_norms_buf = Some(new_norms);
             self.gpu_capacity = new_cap;
             tracing::debug!(
-                target: "rmlx::kv_quant::iso3_gpu",
+                target: "rmlx::kv_quant::iso_gpu",
+                bits = BITS,
                 new_cap,
-                "iso3 V GPU mirror grow"
+                "iso V GPU mirror grow"
             );
         }
 
@@ -1125,22 +1191,22 @@ impl QuantIsoV3 {
     ///
     /// - `Error::Mlx` if `Array::from_bytes` / kernel dispatch fails.
     /// - `Error::Quant` if `shape` is malformed (rank ≠ 4) or `head_dim` is
-    ///   not a positive multiple of [`ISO3_GROUP_SIZE`].
+    ///   not a positive multiple of [`ISO_QUAT_BLOCK_SIZE`].
     pub fn dequant_gpu(&self, device: Device) -> Result<Array> {
         if self.shape.len() != 4 {
             return Err(Error::Mlx(format!(
-                "QuantIsoV3::dequant_gpu: malformed shape {:?}",
+                "QuantIsoV{BITS}::dequant_gpu: malformed shape {:?}",
                 self.shape
             )));
         }
         let head_dim = self.shape[3] as usize;
-        if head_dim == 0 || !head_dim.is_multiple_of(ISO3_GROUP_SIZE) {
+        if head_dim == 0 || !head_dim.is_multiple_of(ISO_QUAT_BLOCK_SIZE) {
             return Err(Error::Quant(format!(
-                "QuantIsoV3::dequant_gpu: head_dim={head_dim} must be a positive multiple of \
-                 ISO3_GROUP_SIZE={ISO3_GROUP_SIZE}"
+                "QuantIsoV{BITS}::dequant_gpu: head_dim={head_dim} must be a positive multiple \
+                 of the quaternion block size {ISO_QUAT_BLOCK_SIZE}"
             )));
         }
-        let n_groups = head_dim / ISO3_GROUP_SIZE;
+        let n_groups = head_dim / ISO_QUAT_BLOCK_SIZE;
 
         // ── GPU mirror fast path ────────────────────────────────────────────
         // When the GPU mirror is populated, slice the active region directly
@@ -1179,7 +1245,7 @@ impl QuantIsoV3 {
             // scrambled tensor — the block path handles every `B`.
             if self.shape[0] != 1 && self.shape[2] != 0 {
                 return Err(Error::Quant(format!(
-                    "QuantIsoV3::dequant_gpu: the GPU mirror is b == 1 only (its per-step \
+                    "QuantIsoV{BITS}::dequant_gpu: the GPU mirror is b == 1 only (its per-step \
                      stride does not interleave batch), got shape {:?}",
                     self.shape
                 )));
@@ -1199,13 +1265,15 @@ impl QuantIsoV3 {
             // pointer is never dereferenced for codes data). Reuse `codes_slice`
             // for that slot to avoid a per-decode `Array::from_bytes`
             // allocation — cheapest option, kernel ignores it.
-            let flat = crate::isoquant_msl::iso_dequantize_v3_gpu(
+            let flat = crate::isoquant_msl_dispatch::iso_dequantize_gpu(
                 &codes_slice,
                 &scales_slice,
                 &codes_slice,
                 &norms_slice,
                 head_dim,
+                BITS,
                 Dtype::F32,
+                "QuantIsoV::dequant_gpu",
                 device,
             )?;
             // Mirror/blocks are sequence-major (see `append_gpu`): reshape the
@@ -1235,9 +1303,9 @@ impl QuantIsoV3 {
             &blocks,
             &self.shape,
             n_groups,
-            ISO3_GROUP_SIZE,
+            ISO_QUAT_BLOCK_SIZE,
             crate::storage::iso_row_words(head_dim, self.bits),
-            "QuantIsoV3::dequant_gpu",
+            "QuantIsoV::dequant_gpu",
         )?;
 
         if inputs.total_groups == 0 {
@@ -1252,17 +1320,19 @@ impl QuantIsoV3 {
         let scales_arr = Array::from_bytes(&inputs.scales, &[n], Dtype::F32)?;
         let norms_arr = Array::from_bytes(&inputs.norms, &[n], Dtype::F32)?;
 
-        // The kernel's quaternion parameter is `_quaternions` and is never bound
-        // as a kernel input (see `iso_dequantize_v3_gpu`); every group uses the
-        // constant `FIXED_QUAT`. Pass `codes_arr` rather than uploading a buffer
-        // the kernel discards — the same reuse the GPU mirror arm above makes.
-        let flat = crate::isoquant_msl::iso_dequantize_v3_gpu(
+        // The kernel's quaternion parameter is never bound as a kernel input;
+        // every group uses the constant `FIXED_QUAT`. Pass `codes_arr` rather
+        // than uploading a buffer the kernel discards — the same reuse the GPU
+        // mirror arm above makes.
+        let flat = crate::isoquant_msl_dispatch::iso_dequantize_gpu(
             &codes_arr,
             &scales_arr,
             &codes_arr,
             &norms_arr,
             head_dim,
+            BITS,
             Dtype::F32,
+            "QuantIsoV::dequant_gpu",
             device,
         )?;
         flat.reshape(&self.shape, device)
@@ -1481,11 +1551,11 @@ fn copy_f32_slots<T: Copy>(dst: &mut [u8], slot_offset: usize, src: &[T], to_le:
 /// would lose it with no error. No such caller exists today: every block push on
 /// these stores either feeds the ring or drops it first.
 ///
-/// Shared by [`QuantIsoV3`] / [`super::QuantIsoV4`] and the iso K stores
-/// ([`super::QuantIsoK3`] / [`super::QuantIsoK4`]) — the `IsoBlocks` payload and
-/// ring layout are identical across both axes and both bit widths (iso carries
-/// no K-side sideband, unlike the rotor codec). Mirror of the rotor-side
-/// `synced_rotor_v_blocks`, plus the fixed-quaternion synthesis.
+/// Shared by [`QuantIsoV`] and the iso K store [`super::QuantIsoK`] at either
+/// width — the `IsoBlocks` payload and ring layout are identical across both
+/// axes and both bit widths (iso carries no K-side sideband, unlike the rotor
+/// codec). Mirror of the rotor-side `synced_rotor_v_blocks`, plus the
+/// fixed-quaternion synthesis.
 ///
 /// # Errors
 ///

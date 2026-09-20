@@ -819,6 +819,124 @@ pub(crate) fn fwht_normalize(buf: &mut [f32], n: usize) {
     }
 }
 
+// ── Store-byte serialisation, shared by the storage-layer byte pins ──────────
+//
+// The width-twin collapses are judged by a digest of everything a codec wrote
+// into its packed store. Every family builds that digest the same way and
+// differs only in which fields it pushes, so the builder lives here and each
+// family's pin file holds only its own field list.
+
+/// FNV-1a-64 over a byte stream. Written out here rather than imported from a
+/// hashing crate: the digest is an identity, not a checksum of anything
+/// shared, and a test that imports its oracle from the code under test is not
+/// an oracle.
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Canonical byte serialisation of a store payload, built field by field with
+/// an explicit length prefix per field so that moving a value from one field to
+/// another cannot leave the digest unchanged.
+#[derive(Default)]
+pub(crate) struct StoreBytes(Vec<u8>);
+
+impl StoreBytes {
+    pub(crate) fn tag(&mut self, name: &str) {
+        self.0.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        self.0.extend_from_slice(name.as_bytes());
+    }
+    pub(crate) fn u32s(&mut self, name: &str, v: &[u32]) {
+        self.tag(name);
+        self.0.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        for x in v {
+            self.0.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    pub(crate) fn u8s(&mut self, name: &str, v: &[u8]) {
+        self.tag(name);
+        self.0.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        self.0.extend_from_slice(v);
+    }
+    pub(crate) fn f32s(&mut self, name: &str, v: &[f32]) {
+        self.tag(name);
+        self.0.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        for x in v {
+            self.0.extend_from_slice(&x.to_bits().to_le_bytes());
+        }
+    }
+    pub(crate) fn i32s(&mut self, name: &str, v: &[i32]) {
+        self.tag(name);
+        self.0.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        for x in v {
+            self.0.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    pub(crate) fn usize_(&mut self, name: &str, v: usize) {
+        self.tag(name);
+        self.0.extend_from_slice(&(v as u64).to_le_bytes());
+    }
+    pub(crate) fn u8_(&mut self, name: &str, v: u8) {
+        self.tag(name);
+        self.0.push(v);
+    }
+    pub(crate) fn digest(&self) -> u64 {
+        fnv1a64(&self.0)
+    }
+}
+
+/// Raw bytes of an array, at its own dtype — no cast, so a dtype change is a
+/// digest change.
+#[allow(
+    clippy::expect_used,
+    reason = "test helper: an array the engine just returned must evaluate and serialise, and a panic names the failure at the site"
+)]
+pub(crate) fn array_bytes(a: &rmlx_mlx::Array) -> Vec<u8> {
+    a.eval().expect("eval");
+    let mut out = Vec::new();
+    out.extend_from_slice(&(a.shape().len() as u64).to_le_bytes());
+    for d in a.shape() {
+        out.extend_from_slice(&d.to_le_bytes());
+    }
+    out.push(dtype_tag(a.dtype()));
+    out.extend_from_slice(&a.to_bytes().expect("to_bytes"));
+    out
+}
+
+/// One byte per dtype, so a store that changed width changes its digest.
+pub(crate) fn dtype_tag(d: rmlx_mlx::Dtype) -> u8 {
+    match d {
+        rmlx_mlx::Dtype::F32 => 1,
+        rmlx_mlx::Dtype::Bf16 => 2,
+        rmlx_mlx::Dtype::F16 => 3,
+        rmlx_mlx::Dtype::U8 => 4,
+        rmlx_mlx::Dtype::U32 => 5,
+        rmlx_mlx::Dtype::I32 => 6,
+    }
+}
+
+/// Deterministic f32 array at an explicit shape.
+#[allow(
+    clippy::expect_used,
+    reason = "test helper: a fixture array of a known length and shape always builds; a panic names the failure at the site"
+)]
+pub(crate) fn f32_arr(data: &[f32], shape: &[i32]) -> rmlx_mlx::Array {
+    let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+    rmlx_mlx::Array::from_bytes(&bytes, shape, rmlx_mlx::Dtype::F32).expect("Array::from_bytes")
+}
+
+/// Serialise the affine q8_0 K companion plane.
+pub(crate) fn push_quant_k(out: &mut StoreBytes, side: &str, s: &crate::storage::QuantK) {
+    out.tag(side);
+    out.u8s("codes", &s.codes);
+    out.f32s("scales", &s.scales);
+    out.i32s("shape", &s.shape);
+}
+
 // ── Unit tests for the harness itself ────────────────────────────────────────
 
 #[cfg(test)]

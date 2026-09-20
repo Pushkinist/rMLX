@@ -88,9 +88,11 @@
 use super::core::KvCache;
 use crate::rotor_qjl::rotor_qjl_enabled;
 use crate::storage::KvStorage;
-use crate::test_utils::{env_lock, lcg_data, TEST_SEED};
+use crate::test_utils::{
+    array_bytes, env_lock, f32_arr, fnv1a64, lcg_data, push_quant_k, StoreBytes, TEST_SEED,
+};
 use crate::{KvQuant, ALL_KV_QUANTS};
-use rmlx_mlx::{Array, Device, Dtype};
+use rmlx_mlx::Device;
 
 /// Layer index every cell is built at. The rotor table is seeded from
 /// `(layer_idx, head_idx)`, so the pin is only meaningful at a fixed one.
@@ -105,68 +107,6 @@ const DECODE_STEPS: usize = 3;
 /// `(kv_h, head_dim)` — see the shape table in the module doc.
 const SHAPE_A: (i32, i32) = (1, 128);
 const SHAPE_B: (i32, i32) = (4, 96);
-
-/// FNV-1a-64 over a byte stream. Local on purpose: the digest is an identity,
-/// not a checksum of anything shared, and a test that imports its oracle from
-/// the code under test is not an oracle.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-/// Canonical byte serialisation of a store payload, built field by field with
-/// an explicit length prefix per field so that moving a value from one field to
-/// another cannot leave the digest unchanged.
-#[derive(Default)]
-struct StoreBytes(Vec<u8>);
-
-impl StoreBytes {
-    fn tag(&mut self, name: &str) {
-        self.0.extend_from_slice(&(name.len() as u64).to_le_bytes());
-        self.0.extend_from_slice(name.as_bytes());
-    }
-    fn u32s(&mut self, name: &str, v: &[u32]) {
-        self.tag(name);
-        self.0.extend_from_slice(&(v.len() as u64).to_le_bytes());
-        for x in v {
-            self.0.extend_from_slice(&x.to_le_bytes());
-        }
-    }
-    fn u8s(&mut self, name: &str, v: &[u8]) {
-        self.tag(name);
-        self.0.extend_from_slice(&(v.len() as u64).to_le_bytes());
-        self.0.extend_from_slice(v);
-    }
-    fn f32s(&mut self, name: &str, v: &[f32]) {
-        self.tag(name);
-        self.0.extend_from_slice(&(v.len() as u64).to_le_bytes());
-        for x in v {
-            self.0.extend_from_slice(&x.to_bits().to_le_bytes());
-        }
-    }
-    fn i32s(&mut self, name: &str, v: &[i32]) {
-        self.tag(name);
-        self.0.extend_from_slice(&(v.len() as u64).to_le_bytes());
-        for x in v {
-            self.0.extend_from_slice(&x.to_le_bytes());
-        }
-    }
-    fn usize_(&mut self, name: &str, v: usize) {
-        self.tag(name);
-        self.0.extend_from_slice(&(v as u64).to_le_bytes());
-    }
-    fn u8_(&mut self, name: &str, v: u8) {
-        self.tag(name);
-        self.0.push(v);
-    }
-    fn digest(&self) -> u64 {
-        fnv1a64(&self.0)
-    }
-}
 
 /// Serialise a rotor V store (3-bit or 4-bit — the two carry the same fields).
 macro_rules! push_rotor_v {
@@ -215,14 +155,6 @@ macro_rules! push_rotor_k {
             $out.usize_("n_tokens", b.n_tokens);
         }
     }};
-}
-
-/// Serialise the affine q8_0 K companion plane.
-fn push_quant_k(out: &mut StoreBytes, side: &str, s: &crate::storage::QuantK) {
-    out.tag(side);
-    out.u8s("codes", &s.codes);
-    out.f32s("scales", &s.scales);
-    out.i32s("shape", &s.shape);
 }
 
 /// Serialise the turbo V companion plane of the asym spellings.
@@ -337,45 +269,6 @@ fn store_digest(storage: &KvStorage) -> u64 {
         ),
     }
     out.digest()
-}
-
-/// Raw bytes of an array, at its own dtype — no cast, so a dtype change is a
-/// digest change.
-#[allow(
-    clippy::expect_used,
-    reason = "test helper: an array the engine just returned must evaluate and serialise, and a panic names the failure at the site"
-)]
-fn array_bytes(a: &Array) -> Vec<u8> {
-    a.eval().expect("eval");
-    let mut out = Vec::new();
-    out.extend_from_slice(&(a.shape().len() as u64).to_le_bytes());
-    for d in a.shape() {
-        out.extend_from_slice(&d.to_le_bytes());
-    }
-    out.push(dtype_tag(a.dtype()));
-    out.extend_from_slice(&a.to_bytes().expect("to_bytes"));
-    out
-}
-
-fn dtype_tag(d: Dtype) -> u8 {
-    match d {
-        Dtype::F32 => 1,
-        Dtype::Bf16 => 2,
-        Dtype::F16 => 3,
-        Dtype::U8 => 4,
-        Dtype::U32 => 5,
-        Dtype::I32 => 6,
-    }
-}
-
-/// Deterministic f32 array.
-#[allow(
-    clippy::expect_used,
-    reason = "test helper: a fixture array of a known length and shape always builds; a panic names the failure at the site"
-)]
-fn f32_arr(data: &[f32], shape: &[i32]) -> Array {
-    let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-    Array::from_bytes(&bytes, shape, Dtype::F32).expect("Array::from_bytes")
 }
 
 /// What one cell observes.

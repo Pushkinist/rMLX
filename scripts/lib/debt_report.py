@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import functools
 import itertools
 import re
 import subprocess
@@ -71,10 +72,18 @@ LOC_THRESHOLD = 1000
 
 SIBLING_DIRS = ("crates/rmlx-kv-quant", "crates/rmlx-models")
 SPEC_DIR = "crates/rmlx-models/src/speculative"
-ROTOR_STORAGE_DIR = "crates/rmlx-kv-quant/src/storage"
+KV_STORAGE_DIR = "crates/rmlx-kv-quant/src/storage"
 ROTOR_STORAGE_GLOB = "quant_rotor_*.rs"
-ROTOR_UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
-ROTOR_UPDATE_FN_PREFIX = "update_rotor"
+ISO_STORAGE_GLOB = "quant_iso_*.rs"
+KV_UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
+# Name patterns, not prefixes: a family is a shape, and the iso one outgrew a
+# prefix when its entries (`update_iso_*`) and the bodies they enter
+# (`iso_*_update`, `iso_k_only_k_side`) stopped sharing one. `^update_rotor` is
+# the rotor prefix written as an anchored pattern, so that population is
+# unchanged; `iso` is every fn of the update file whose name says which codec
+# it belongs to.
+ROTOR_UPDATE_FN_PATTERN = r"^update_rotor"
+ISO_UPDATE_FN_PATTERN = r"(^|_)iso(\d|_|$)"
 MODELS_SOURCE_DIR = "crates/rmlx-models/src"
 SSD_HYDRATE_FN_NAMES = ("from_hydrated", "hydrate")
 WORKSPACE_SOURCE_DIR = "crates"
@@ -437,16 +446,20 @@ def width_pair_key(item: FnInfo) -> str:
     return re.sub(r"[_-]{2,}", "_", re.sub(r"\d+", "", item.name))
 
 
-def rotor_storage_items(root: Path) -> list[FnInfo]:
-    """Every non-test file matching ROTOR_STORAGE_GLOB under
-    ROTOR_STORAGE_DIR, as one item whose "body" is the whole file — a glob
-    and a name rule, never a file list, so this reads a tree that carries the
-    width twins and one that has collapsed them."""
-    base = root / ROTOR_STORAGE_DIR
+def storage_file_items(root: Path, *, glob: str) -> list[FnInfo]:
+    """Every non-test file matching `glob` under KV_STORAGE_DIR, as one item
+    whose "body" is the whole file — a glob and a name rule, never a file
+    list, so this reads a tree that carries the width twins and one that has
+    collapsed them.
+
+    `glob` arrives from the registration site rather than from a field on
+    `Population`: the other populations read no glob, and a field none of them
+    uses is the shape this module exists to discourage."""
+    base = root / KV_STORAGE_DIR
     if not base.is_dir():
-        raise RuntimeError(f"{ROTOR_STORAGE_DIR} is not a directory")
+        raise RuntimeError(f"{KV_STORAGE_DIR} is not a directory")
     items: list[FnInfo] = []
-    for path in sorted(base.glob(ROTOR_STORAGE_GLOB)):
+    for path in sorted(base.glob(glob)):
         rel = path.relative_to(root)
         if is_test_path(rel):
             continue
@@ -462,16 +475,22 @@ def rotor_storage_items(root: Path) -> list[FnInfo]:
     return items
 
 
-def rotor_update_items(root: Path) -> list[FnInfo]:
-    """Every fn of ROTOR_UPDATE_FILE whose name starts with
-    ROTOR_UPDATE_FN_PREFIX, body only — the same `extract_fns` scan the twin
-    section uses, so the body is brace to brace and the signature lines above
-    it are not counted."""
-    path = root / ROTOR_UPDATE_FILE
+def file_fn_items(root: Path, *, file: str, pattern: str) -> list[FnInfo]:
+    """Every fn of `file` whose name matches `pattern` (`re.search`), body only
+    — the same `extract_fns` scan the twin section uses, so the body is brace
+    to brace and the signature lines above it are not counted.
+
+    `file` and `pattern` arrive from the registration site, for the reason
+    [`storage_file_items`] gives for its glob. A pattern rather than a prefix
+    because a family is a shape: anchor it (`^update_rotor`) to get prefix
+    behaviour, leave it unanchored (`iso`) to name a family whose entries and
+    bodies do not share one."""
+    path = root / file
     if not path.is_file():
-        raise RuntimeError(f"{ROTOR_UPDATE_FILE} is not a file")
+        raise RuntimeError(f"{file} is not a file")
+    matches = re.compile(pattern).search
     fns, _skipped = fns_in_file(root, path)
-    return [fn for fn in fns if fn.name.startswith(ROTOR_UPDATE_FN_PREFIX)]
+    return [fn for fn in fns if matches(fn.name)]
 
 
 def ssd_hydrate_items(root: Path) -> list[FnInfo]:
@@ -504,11 +523,33 @@ class Population:
 MATCHED_LINES_POPULATIONS = {
     "drivers": Population("round-loop drivers", SPEC_DIR, _driver_items),
     "impls": Population("impl RoundDrafter bodies", SPEC_DIR, round_drafter_impls),
+    "iso-storage": Population(
+        "iso storage twins",
+        KV_STORAGE_DIR,
+        functools.partial(storage_file_items, glob=ISO_STORAGE_GLOB),
+        width_pair_key,
+    ),
+    # Every pair, not `width_pair_key`: the iso update family's live
+    # duplication is between same-width bodies of different entries, and a
+    # width key puts those in two groups and compares them never — a counter
+    # that cannot move off 0 whatever the file holds. The width-twin question
+    # for this family is `iso-storage`'s.
+    "iso-updates": Population(
+        "iso update fns",
+        KV_UPDATE_FILE,
+        functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=ISO_UPDATE_FN_PATTERN),
+    ),
     "rotor-storage": Population(
-        "rotor storage twins", ROTOR_STORAGE_DIR, rotor_storage_items, width_pair_key
+        "rotor storage twins",
+        KV_STORAGE_DIR,
+        functools.partial(storage_file_items, glob=ROTOR_STORAGE_GLOB),
+        width_pair_key,
     ),
     "rotor-updates": Population(
-        "rotor update twins", ROTOR_UPDATE_FILE, rotor_update_items, width_pair_key
+        "rotor update twins",
+        KV_UPDATE_FILE,
+        functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=ROTOR_UPDATE_FN_PATTERN),
+        width_pair_key,
     ),
     "ssd-hydrate": Population("ssd hydrate twins", MODELS_SOURCE_DIR, ssd_hydrate_items),
 }
