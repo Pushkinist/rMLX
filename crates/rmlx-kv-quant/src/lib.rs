@@ -153,10 +153,21 @@ pub use quant::{
 /// See `docs/PERF_BASELINE.md` for bench numbers. The gate exists as a
 /// forward-compatibility hook for future seedless decode paths where
 /// `decode_fp16_k.is_none()` during steady-state decode.
+///
+/// The value is [`GPU_RESIDENT_ISO_PRODUCTION`] rather than a literal, because
+/// `cfg(test)` replaces this whole body: a test that called this fn would read
+/// the override flag below and learn nothing about production.
 #[cfg(not(test))]
 pub fn gpu_resident_iso_enabled() -> bool {
-    false
+    GPU_RESIDENT_ISO_PRODUCTION
 }
+
+/// What the production [`gpu_resident_iso_enabled`] returns.
+///
+/// Split out of that fn so a test can assert on it. The fn itself is behind
+/// `cfg(not(test))` and is not compiled into a test binary at all, so it is
+/// unreachable from the one place that would check it.
+pub(crate) const GPU_RESIDENT_ISO_PRODUCTION: bool = false;
 
 /// Test-only override for `gpu_resident_iso_enabled`, scoped to whoever holds
 /// the [`GpuResidentIsoForTest`] guard.

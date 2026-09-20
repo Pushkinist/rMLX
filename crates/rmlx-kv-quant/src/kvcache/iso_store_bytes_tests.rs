@@ -34,11 +34,12 @@
 //! Two of the six iso spellings — `Iso3` and `Iso4` — report
 //! `decode_reads_packed_store() == false` and feed both axes from the bf16
 //! mirror, so `materialises_packed_store()` is false and `exit_prefill` clears
-//! their payload outright. A served generation on those two emits the same
-//! token ids as `--kv-quant none`, whatever the storage layer does. Their bytes
-//! are observable here and nowhere else, which is why this file drives `update`
-//! with `in_prefill` false and no bf16 seed: that is the one CPU route on which
-//! all six codecs write their store.
+//! their payload outright. Nothing reads their store bytes at decode, so a
+//! served capture cannot tell a correct store from an empty one on those two,
+//! whatever the storage layer does. Their bytes are observable here and nowhere
+//! else, which is why this file drives `update` with `in_prefill` false and no
+//! bf16 seed: that is the one CPU route on which all six codecs write their
+//! store.
 //!
 //! The four that do read the packed store at decode — `Iso3Sym`, `Iso4Sym`,
 //! `IsoKOnly3`, `IsoKOnly4` — are pinned here as well, so the two oracles
@@ -78,18 +79,24 @@
 //!   that read their store at decode, the store a served request reads is the
 //!   one those arms bulk-encode.
 //! * **The fused flash-decode arms.** `update_and_sdpa`'s iso K-only and iso
-//!   symmetric arms are gated on `device == Device::Gpu` and `q_seq == 1`, and
+//!   symmetric arms are gated on `device == Device::Gpu`, `q_seq == 1` and
+//!   `iso_flash_shape_ok` — which requires `b == 1`, `head_dim % 4 == 0`,
+//!   `head_dim <= 512` and `head_dim` a **power of two**. Where all four hold
 //!   they are the production decode route for `k_iso3`, `k_iso4`, `iso3_sym`
-//!   and `iso4_sym` at both widths. A CPU drive never reaches them. The GPU
-//!   test owed for them is
-//!   `kvcache::iso_flash_dispatch_tests`, which already covers the K-only arm.
+//!   and `iso4_sym` at both widths. A CPU drive never reaches them, and
+//!   **shape B is a shape they reject**: `head_dim = 96` is not a power of two,
+//!   so a served request at that head dimension takes the same host decode this
+//!   file drives. The GPU test that covers the arms is
+//!   `kvcache::iso_flash_dispatch_tests`.
 //! * **`gpu_append`, `gpu_packed_view` and `reconcile_ring`** on all four
 //!   stores, and the ring-readback branch of `synced_iso_v_blocks`.
 //!   Unreachable from a `Device::Cpu` drive, and the largest unseen surface in
 //!   each storage pair.
 //! * **`QuantIsoV3::append_gpu` and its GPU-resident mirror.** The mirror write
-//!   is behind `crate::gpu_resident_iso_enabled`, which is a `false` constant
-//!   outside `cfg(test)`, so it writes no byte in production at either width.
+//!   is behind `crate::gpu_resident_iso_enabled`, whose production value is
+//!   `crate::GPU_RESIDENT_ISO_PRODUCTION` — `false`, so it writes no byte in
+//!   production at either width. That is the one thing about the mirror this
+//!   file does assert; see the last test.
 //! * **`dequant_gpu` / `dequant_on`**, which is the one live behaviour
 //!   difference between the widths. See "What cannot move".
 //! * **`from_cpu_blocks` and `try_deep_clone`** — the SSD-hydrate and
@@ -712,6 +719,12 @@ fn three_and_four_bit_twins_hold_different_stores() {
 ///
 /// Without this, every assertion above could be pinning a value that is not
 /// reproducible, and a red cell would be read as flake rather than defect.
+///
+/// It drives both arms itself rather than reusing the pin test's observations.
+/// Borrowing them would make this test's verdict depend on that test having
+/// run, and a test whose outcome depends on which other tests ran is the shape
+/// the mirror-gate latch in `storage/quant_iso_v_tests.rs` was removed for. The
+/// cost is one extra drive per cell.
 #[test]
 fn an_iso_cell_is_reproducible() {
     let _guard = env_lock();
@@ -749,17 +762,24 @@ fn an_iso_cell_is_reproducible() {
 /// The GPU-resident iso V mirror writes no byte in production.
 ///
 /// `QuantIsoV3::append_gpu` guards its mirror write on
-/// [`crate::gpu_resident_iso_enabled`], which is a `false` constant outside
-/// `cfg(test)`. The collapse hands the mirror to the 4-bit width as a
-/// consequence of making the store one type, and this is what says that hand-off
-/// changes no production byte. It is a device-policy assertion, not a dispatch:
-/// nothing here touches Metal.
+/// `crate::gpu_resident_iso_enabled`. The collapse hands the mirror to the
+/// 4-bit width as a consequence of making the store one type, and this is what
+/// says that hand-off changes no production byte.
+///
+/// It reads the constant, not the fn. Under `cfg(test)` the fn is a different
+/// body — an override flag a sibling test can turn on — so asserting on the fn
+/// would assert on that flag and pass whichever way production was set. Reading
+/// the constant also removes the only shared mutable state this test touched,
+/// so its outcome no longer depends on which other tests ran.
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "the constant is the point: this asserts a documented production value, so that changing it is a named failure rather than a silent one. The lint's usual target — an assertion that cannot fail — is what this would be if the value were inlined here instead of read from its one definition."
+)]
 #[test]
-fn the_gpu_resident_iso_mirror_is_off_unless_a_test_forces_it() {
-    let _guard = env_lock();
+fn the_production_gpu_resident_iso_mirror_is_off() {
     assert!(
-        !crate::gpu_resident_iso_enabled(),
-        "the GPU-resident iso V mirror is on in this process — the pins above were taken \
-         with it off, and production reads a `false` constant"
+        !crate::GPU_RESIDENT_ISO_PRODUCTION,
+        "the GPU-resident iso V mirror is on in production — the pins above were taken \
+         with it off, and the collapse hands it to the 4-bit width"
     );
 }
