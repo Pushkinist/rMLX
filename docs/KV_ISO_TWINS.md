@@ -623,9 +623,36 @@ ran the collapse and re-ran everything below.
 | `make check-metal-compiles` | SKIP — this host has Xcode selected without the Metal Toolchain component. The hosted `msl` job is strict |
 | `make debt-report-selftest` | OK, 87 cases |
 | `make gpu-runner-selftest` | OK |
+| `make gpu-test CRATE=rmlx-kv-quant FILTER=iso` | 63 selected tests, second run clean. See below |
 
 `make ci` belongs to the orchestrator and `make ci-perf` to the integration
 window, which also owns the served capture in §6.
+
+### The GPU run, and the one red it produced
+
+The two new parity tests ran and passed, and the run produced **no
+shader-validation hit**, so neither derives a
+`scripts/gpu_validation_census.txt` entry — the runner fails on an unpinned
+hit, so a clean pass is the evidence and the 3-bit pair carries no entry
+either. The narrowed selection leaves the `rmlx-models` entries reported as
+"not enforced in full", which is what a filtered run is supposed to say.
+
+**One test went red on the first validated run and not the second:**
+`kvcache::v_mirror_alloc_tests::iso_decode_does_not_copy_the_v_mirror`, at
+`688 per mille of a V prefix copy, outside the measured band 500..=660`. It is
+a resident-memory growth measurement, and the band it missed is the **clean
+floor** — the packed-K view's own per-token materialisation — not the defect
+bound. The defect bound is 1500 per mille and held with better than 2x margin
+in the failing run, so the V mirror was not being copied at any point.
+
+Measured after: it passes in isolation, it passes on a second
+`make gpu-test CRATE=rmlx-kv-quant FILTER=iso`, and it passes three times in a
+row under the same crate-and-filter selection without shader validation. One
+red in five runs of a byte-counting probe, on the reading that instrumenting
+every Metal pipeline perturbs. **The base-commit arm was not run**, which is
+what would separate an inherited flake from one this change introduced; that
+comparison belongs to the integration window, and until it is made this is an
+unattributed red rather than a clean run.
 
 ### The helper extraction
 
