@@ -16,7 +16,9 @@
 #   RoundDrafter bodies for the matched-lines figure, two same-axis rotor
 #   storage files (a three-member V group, a two-member K group, plus a test
 #   file matching the same glob) and five update_rotor* fns beside one
-#   update_affine, for the two rotor populations, and two per-arch hydrate
+#   update_affine, for the two rotor populations, the same shape at two
+#   members per group in quant_iso_*.rs and update_iso* for the two iso
+#   populations, and two per-arch hydrate
 #   bodies beside a hydrate_from_ssd and a test-path copy, for the
 #   ssd-hydrate population. A group of three is what
 #   separates every-pair-in-a-group from consecutive-only pairing; a width
@@ -52,6 +54,10 @@ for f in \
     crates/rmlx-kv-quant/src/storage/quant_rotor_v3_tests.rs \
     crates/rmlx-kv-quant/src/storage/quant_rotor_k3.rs \
     crates/rmlx-kv-quant/src/storage/quant_rotor_k4.rs \
+    crates/rmlx-kv-quant/src/storage/quant_iso_v3.rs \
+    crates/rmlx-kv-quant/src/storage/quant_iso_v4.rs \
+    crates/rmlx-kv-quant/src/storage/quant_iso_k3.rs \
+    crates/rmlx-kv-quant/src/storage/quant_iso_k4.rs \
     crates/rmlx-kv-quant/src/kvcache/update.rs \
     crates/rmlx-kv-quant/src/storage/counters_allow.rs \
     crates/rmlx-kv-quant/src/storage/counters_debt.rs \
@@ -481,6 +487,86 @@ check_exit "matched_lines_rotor_updates_collapsed_exit" \
 
 rm -rf "$COLLAPSED_WORK"
 
+# ---- --matched-lines: the two iso populations -----------------------------
+#
+# Same rule as the rotor pair and a different glob and prefix, both supplied at
+# the registration site. The fixture plants one two-member group per axis, so a
+# population that paired every item with every other would report 6 pairs, not
+# 2, and one that read the rotor glob would report the rotor files' figure.
+
+ISO_STORAGE_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines iso-storage 2>&1)
+ISO_STORAGE_STATUS=$?
+
+check "matched_lines_iso_storage_pairs" \
+    "the four planted iso storage files are a two-member V group and a two-member K group: 1 + 1 = 2 pairs, not the 6 an all-pairs population compares; the rotor files in the same directory are outside this glob and would read 9 item(s) if the glob widened" \
+    contains "iso storage twins (crates/rmlx-kv-quant/src/storage): 23 matched lines over 48 body lines (4 item(s), 2 pair(s))" \
+    ISO_STORAGE_ML
+
+check_exit "matched_lines_iso_storage_exit" \
+    "a population with members is a measurement, exit 0" \
+    0 "$ISO_STORAGE_STATUS"
+
+check "matched_lines_iso_storage_label_own_root" \
+    "the label names the population's own root, and the iso and rotor storage populations share it" \
+    contains "iso storage twins (crates/rmlx-kv-quant/src/storage):" \
+    ISO_STORAGE_ML
+
+ISO_UPDATES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines iso-updates 2>&1)
+ISO_UPDATES_STATUS=$?
+
+check "matched_lines_iso_updates_pairs" \
+    "the four planted update_iso* fns are a two-member plain family and a two-member K-only family, 1 + 1 = 2 pairs; the update_rotor* fns in the same file are outside this prefix and would read 9 item(s) if it widened to update_" \
+    contains "iso update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 7 matched lines over 18 body lines (4 item(s), 2 pair(s))" \
+    ISO_UPDATES_ML
+
+check_exit "matched_lines_iso_updates_exit" \
+    "a population with members is a measurement, exit 0" \
+    0 "$ISO_UPDATES_STATUS"
+
+# ---- collapsed: the iso width twin is gone, the population is still found --
+
+ISO_COLLAPSED_WORK="$(mktemp -d)"
+cp -R "$BASE" "$ISO_COLLAPSED_WORK/base"
+rm -f "$ISO_COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/storage/quant_iso_v4.rs" \
+    "$ISO_COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/storage/quant_iso_k4.rs"
+python3 - "$ISO_COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+# Drop the two 4-bit entries the way the collapse did — the 3-bit ones stay.
+for name in ("update_iso4", "update_iso_k_only_4"):
+    text = re.sub(r"\n    fn " + name + r"\(.*?\n    \}\n", "\n", text, flags=re.S)
+open(path, "w").write(text)
+EOF
+
+ISO_COLLAPSED_STORAGE_ML=$(python3 "$TOOL" --root "$ISO_COLLAPSED_WORK/base" --matched-lines iso-storage 2>&1)
+ISO_COLLAPSED_STORAGE_STATUS=$?
+
+check "matched_lines_iso_storage_collapsed_zero" \
+    "deleting the 4-bit files leaves one item per axis and so no pair: 0 matched lines with the population still found, which is a different answer from an empty population" \
+    contains "iso storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 24 body lines (2 item(s), 0 pair(s))" \
+    ISO_COLLAPSED_STORAGE_ML
+
+check_exit "matched_lines_iso_storage_collapsed_exit" \
+    "a collapsed population is a measured 0, exit 0" \
+    0 "$ISO_COLLAPSED_STORAGE_STATUS"
+
+ISO_COLLAPSED_UPDATES_ML=$(python3 "$TOOL" --root "$ISO_COLLAPSED_WORK/base" --matched-lines iso-updates 2>&1)
+ISO_COLLAPSED_UPDATES_STATUS=$?
+
+check "matched_lines_iso_updates_collapsed_zero" \
+    "deleting the two 4-bit entries leaves one body per family: 0 matched lines over the 9 body lines that remain, population still found" \
+    contains "iso update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 9 body lines (2 item(s), 0 pair(s))" \
+    ISO_COLLAPSED_UPDATES_ML
+
+check_exit "matched_lines_iso_updates_collapsed_exit" \
+    "a collapsed population is a measured 0, exit 0" \
+    0 "$ISO_COLLAPSED_UPDATES_STATUS"
+
+rm -rf "$ISO_COLLAPSED_WORK"
+
 # ---- --matched-lines: the ssd-hydrate population, both tree shapes --------
 #
 # The rule is two exact fn names, because one name spans only one tree: the
@@ -552,12 +638,14 @@ rm -rf "$HYDRATE_WORK"
 
 ABSENT_WORK="$(mktemp -d)"
 cp -R "$BASE" "$ABSENT_WORK/base"
-rm -f "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"/quant_rotor_*.rs
+rm -f "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"/quant_rotor_*.rs \
+    "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"/quant_iso_*.rs
 python3 - "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
 import sys
 
 path = sys.argv[1]
 text = open(path).read().replace("fn update_rotor", "fn update_affine_rotor")
+text = text.replace("fn update_iso", "fn update_affine_iso")
 open(path, "w").write(text)
 EOF
 
@@ -585,6 +673,30 @@ check_exit "matched_lines_rotor_updates_empty_exit" \
     "an unavailable population exits 1" \
     1 "$EMPTY_UPDATES_STATUS"
 
+ISO_EMPTY_STORAGE_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines iso-storage 2>&1)
+ISO_EMPTY_STORAGE_STATUS=$?
+
+check "matched_lines_iso_storage_empty_unavailable" \
+    "the directory is there and nothing in it matches the iso glob: unavailable, never a 0 indistinguishable from a collapsed population" \
+    contains "debt-report --matched-lines iso-storage: unavailable (crates/rmlx-kv-quant/src/storage: population is empty)" \
+    ISO_EMPTY_STORAGE_ML
+
+check_exit "matched_lines_iso_storage_empty_exit" \
+    "an unavailable population exits 1" \
+    1 "$ISO_EMPTY_STORAGE_STATUS"
+
+ISO_EMPTY_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines iso-updates 2>&1)
+ISO_EMPTY_UPDATES_STATUS=$?
+
+check "matched_lines_iso_updates_empty_unavailable" \
+    "renaming every update_iso* fn out of the prefix empties the population: unavailable, not 0" \
+    contains "debt-report --matched-lines iso-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs: population is empty)" \
+    ISO_EMPTY_UPDATES_ML
+
+check_exit "matched_lines_iso_updates_empty_exit" \
+    "an unavailable population exits 1" \
+    1 "$ISO_EMPTY_UPDATES_STATUS"
+
 rm -rf "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"
 rm -f "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs"
 
@@ -611,6 +723,30 @@ check "matched_lines_rotor_updates_missing_root" \
 check_exit "matched_lines_rotor_updates_missing_exit" \
     "a missing root exits 1" \
     1 "$MISSING_UPDATES_STATUS"
+
+ISO_MISSING_STORAGE_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines iso-storage 2>&1)
+ISO_MISSING_STORAGE_STATUS=$?
+
+check "matched_lines_iso_storage_missing_root" \
+    "a missing root names itself, and is told apart from a root that is there and empty" \
+    contains "debt-report --matched-lines iso-storage: unavailable (crates/rmlx-kv-quant/src/storage is not a directory)" \
+    ISO_MISSING_STORAGE_ML
+
+check_exit "matched_lines_iso_storage_missing_exit" \
+    "a missing root exits 1" \
+    1 "$ISO_MISSING_STORAGE_STATUS"
+
+ISO_MISSING_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines iso-updates 2>&1)
+ISO_MISSING_UPDATES_STATUS=$?
+
+check "matched_lines_iso_updates_missing_root" \
+    "a missing single-file root names itself too" \
+    contains "debt-report --matched-lines iso-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs is not a file)" \
+    ISO_MISSING_UPDATES_ML
+
+check_exit "matched_lines_iso_updates_missing_exit" \
+    "a missing root exits 1" \
+    1 "$ISO_MISSING_UPDATES_STATUS"
 
 rm -rf "$ABSENT_WORK"
 

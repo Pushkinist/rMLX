@@ -31,6 +31,28 @@ impl Cache {
         self.seq
     }
 
+    fn update_iso3(&mut self, n: usize) -> usize {
+        let groups = n / 4;
+        self.seq += groups * 3;
+        self.seq
+    }
+
+    fn update_iso4(&mut self, n: usize) -> usize {
+        let groups = n / 4;
+        self.seq += groups * 4;
+        self.seq
+    }
+
+    fn update_iso_k_only_3(&mut self, n: usize) -> usize {
+        self.seq += n;
+        self.seq * 3
+    }
+
+    fn update_iso_k_only_4(&mut self, n: usize) -> usize {
+        self.seq += n;
+        self.seq * 4
+    }
+
     fn update_affine(&mut self, n: usize) -> usize {
         self.seq += n;
         self.seq
