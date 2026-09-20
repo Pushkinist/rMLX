@@ -16,13 +16,12 @@
 //!    bit tag, the accumulated shape and the block count. **This cannot move
 //!    at either width.** The collapse changes no byte on the wire and no byte
 //!    coming back off it.
-//! 2. **`max_seq` on the hydrated K store.** This is the divergence, and today
-//!    the two widths answer differently: `read_quant_k_turbo3` forwards the
-//!    geometry's `max_seq` into `QuantKTurbo3::from_cpu_blocks`, while
-//!    `QuantKTurbo4::from_cpu_blocks` takes no such argument and always sets
-//!    `0`. The values below are what the tree does today, not what it should
-//!    do; `docs/KV_TURBO_TWINS.md` records which width is the reference and
-//!    therefore which of these two numbers the collapse moves.
+//! 2. **`max_seq` on the hydrated K store.** This was the divergence: the
+//!    3-bit hydrate forwarded the geometry's `max_seq` and the 4-bit one
+//!    dropped it, because its `from_cpu_blocks` took no such argument. The
+//!    K-storage collapse resolved it the 3-bit way, so both widths now restore
+//!    the window that was written, and the 4-bit constant below moved from `0`
+//!    to it. `docs/KV_TURBO_TWINS.md` records the decision.
 //!
 //! Field-by-field rather than one digest: a digest names the store, and these
 //! assertions name the field, which is what a reviewer of a collapse needs.
@@ -35,14 +34,14 @@
 //! * **The spill side's GPU trim.** `write_quant_k_turbo{3,4}` takes its
 //!   `gpu_codes_buf` branch only when the store carries one, which a CPU-built
 //!   store does not. The two write bodies are byte-identical anyway.
-//! * **`.eval()` on the loaded tensors.** `read_quant_k_turbo4` calls it and
-//!   `read_quant_k_turbo3` does not. Both cells below are green, which is the
-//!   measurement: on a safetensors-loaded tensor the call changes no byte. It
-//!   is a convention decision, not a behaviour one, and this file cannot make
-//!   it for the reader — see the doc.
-//! * **The GPU hydrate upload.** `append`'s hydrated-init branch, where the
-//!   two stores encode their scale bytes differently (one safe, one `unsafe`),
-//!   needs a `Device::Gpu` append after the hydrate. `make gpu-test` owns it.
+//! * **`.eval()` on the loaded tensors.** The two readers disagreed on it and
+//!   all three cells were green either way, which is the measurement: on a
+//!   safetensors-loaded tensor the call changes no byte. The collapsed reader
+//!   keeps the call, which is a convention decision this file cannot make for
+//!   the reader — see the doc.
+//! * **The GPU hydrate upload.** `append`'s hydrated-init branch, which the
+//!   collapse reduced to the one safe scale-byte form, needs a `Device::Gpu`
+//!   append after the hydrate. `make gpu-test` owns it.
 
 use super::block_io_tests::lcg;
 use super::{KvBlockReader, KvBlockWriter};
@@ -63,13 +62,13 @@ const SHAPE: [i32; 4] = [1, 2, 4, 128];
 /// would make the two widths agree for the wrong reason.
 const WRITTEN_MAX_SEQ: i32 = 4096;
 
-/// `max_seq` each width's K store carries after a hydrate, as the tree stands.
+/// `max_seq` each width's K store carries after a hydrate.
 ///
-/// The 4-bit store has no way to receive the value: its `from_cpu_blocks` does
-/// not take one. That is the divergence the collapse resolves, and the
-/// resolution moves one of these two numbers.
+/// The collapse gave both widths one `from_cpu_blocks` that takes the window,
+/// so both restore what was written. The 4-bit constant is the one cell this
+/// campaign moved, from `0`.
 const HYDRATED_K_MAX_SEQ_3BIT: i32 = WRITTEN_MAX_SEQ;
-const HYDRATED_K_MAX_SEQ_4BIT: i32 = 0;
+const HYDRATED_K_MAX_SEQ_4BIT: i32 = WRITTEN_MAX_SEQ;
 
 /// One CPU-path symmetric turbo storage at `bits`, plus the K block it holds.
 #[allow(
@@ -87,7 +86,6 @@ fn build(bits: u8) -> (KvStorage, TurboBlocks) {
             k: Some(QuantKTurbo3::from_cpu_blocks(
                 vec![k_block.clone()],
                 shape,
-                bits,
                 WRITTEN_MAX_SEQ,
             )),
             v,
@@ -97,7 +95,7 @@ fn build(bits: u8) -> (KvStorage, TurboBlocks) {
             k: Some(QuantKTurbo4::from_cpu_blocks(
                 vec![k_block.clone()],
                 shape,
-                bits,
+                WRITTEN_MAX_SEQ,
             )),
             v,
             max_seq: WRITTEN_MAX_SEQ,
@@ -288,32 +286,36 @@ fn tsym3_hydrate_restores_the_k_payload_and_the_window() {
 
 /// The 4-bit symmetric turbo cache survives a spill and a hydrate.
 #[test]
-fn tsym4_hydrate_restores_the_k_payload_but_not_the_window() {
+fn tsym4_hydrate_restores_the_k_payload_and_the_window() {
     let (hydrated, written) = spill_and_hydrate("tsym4", KvQuant::TurboSym4, 4);
     assert_payload_survives("tsym4", &hydrated, &written, 4);
     assert_eq!(
         hydrated.max_seq, HYDRATED_K_MAX_SEQ_4BIT,
-        "tsym4: the 4-bit hydrate drops the geometry's max_seq because \
-         QuantKTurbo4::from_cpu_blocks takes none. If this moved to the written window, the \
-         collapse resolved the from_cpu_blocks divergence and this is the expected change"
+        "tsym4: the 4-bit hydrate forwards the geometry's max_seq into the K store, as the \
+         3-bit one always did. This cell read 0 before the K-storage collapse; if it moved \
+         back, the collapse's one intended observable change was reverted"
     );
 }
 
-/// The two widths really do answer differently, measured.
+/// The two widths answer the same, measured.
 ///
 /// It spills and hydrates both widths and compares what the two engines
-/// returned. Comparing the two pinned constants instead would execute no
-/// engine code: a `from_cpu_blocks` that started forwarding the window would
-/// make the widths agree and leave a constant-to-constant control green, which
-/// is the one event this test exists for.
+/// returned, then holds the agreed value to the window that was written.
+/// Comparing the two pinned constants instead would execute no engine code: a
+/// `from_cpu_blocks` that stopped forwarding the window at one width would
+/// still leave a constant-to-constant control green, which is the one event
+/// this test exists for.
 #[test]
-fn the_two_widths_hydrate_a_different_window_today() {
+fn the_two_widths_hydrate_the_same_window() {
     let (three, _) = spill_and_hydrate("tsym3_control", KvQuant::TurboSym3, 3);
     let (four, _) = spill_and_hydrate("tsym4_control", KvQuant::TurboSym4, 4);
-    assert_ne!(
+    assert_eq!(
         three.max_seq, four.max_seq,
-        "the two widths now restore the same K-store window. That is the collapse's one \
-         intended observable change, and the cell it moved is named by whichever of the two \
-         pins above was re-baselined"
+        "the two widths restore a different K-store window. One from_cpu_blocks stopped \
+         forwarding the geometry's max_seq"
+    );
+    assert_eq!(
+        three.max_seq, WRITTEN_MAX_SEQ,
+        "the two widths agree on a window that is not the one the spill wrote"
     );
 }

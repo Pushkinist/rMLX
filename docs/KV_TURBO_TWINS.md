@@ -14,10 +14,12 @@ figure is produced. [`docs/KV_ISO_TWINS.md`](KV_ISO_TWINS.md) holds the second
 worked example and the argument for a doc per family. This doc holds only what
 the turbo family does differently.
 
-**Written before the collapse.** Everything below describes the tree as it
-stands at the branch point. The test chunk wrote the oracle, this doc and the
-first mutation run; it changed no engine code. Where a section states a
-decision, that decision is owed to the implementing chunk, not already taken.
+**The collapse has landed.** The test chunk wrote the oracle, this doc and the
+first mutation run and changed no engine code; the implementing chunk took
+every decision below and this doc now records the tree as it is. §1's premise
+table is the **branch-point** measurement and is kept as the record of what was
+collapsed, not as a description of the tree; §5 carries the after arm beside
+the before one. Real-model rows (§6) are still deferred to the integration run.
 
 The oracles are
 `crates/rmlx-kv-quant/src/kvcache/turbo_store_bytes_tests.rs` (the CPU store
@@ -31,6 +33,9 @@ identifier to `N`) plus `matched_lines()`, hand-run before the populations of
 §5 existed and re-run through them after. The "differing" column strips `//`
 line comments, applies the same digit fold, then counts non-`equal` `difflib`
 opcode lines.
+
+Measured at the branch point, before the collapse. The rows are what was
+removed, not what the tree holds.
 
 | Pair | Lines | Matched | Differing | Verdict |
 |---|---|---|---|---|
@@ -121,8 +126,12 @@ carries `reset()`, `dequant()` and the exported constant `TURBO3_K_BITS`, none
 of which the 4-bit file has — three more 3-bit-only items the issue's list
 omits.
 
-**Constraint.** One constructor, `QuantKTurbo::<BITS>::new(init_shape,
-max_seq)`, used by all four construction sites.
+**Decision, landed.** One constructor, `QuantKTurbo::<BITS>::new(init_shape,
+max_seq)`, used by all four construction sites. `reset()` and `dequant()` are
+now available at both widths rather than at 3-bit only, which is the iso
+store's shape and costs no behaviour: neither has a non-test caller, and both
+are exercised per width by `quant_k_turbo_tests.rs`. `TURBO3_K_BITS` is gone;
+`TURBO_K3_BITS` and `TURBO_K4_BITS` replace it, both read by the width guard.
 
 **Observable: the CPU pin's `store_after_chunk` at both widths — over two of
 the four sites, not four.** The pin drives `in_prefill` false and so reaches
@@ -136,9 +145,9 @@ which sweeps every variant and fails the moment an arm and its classification
 disagree. A collapse that gets those two literals wrong is therefore caught by
 nothing in this campaign's oracles; it is caught the day the predicate flips.
 
-Note that `crates/rmlx-kv-quant/src/storage/quant_planar_k.rs` documents its own
-GPU-path init as "matching the `QuantKTurbo4` inline-literal signature", so
-deleting the literal leaves that comment false; §7 lists it.
+`crates/rmlx-kv-quant/src/storage/quant_planar_k.rs` documented its own
+GPU-path init as "matching the `QuantKTurbo4` inline-literal signature". The
+literal is gone and so is that clause.
 
 ### (2) `from_cpu_blocks` and the hydrated window — the 3-bit form is the reference
 
@@ -151,12 +160,18 @@ for the `KvStorage` field — and simply does not forward it.
 measures: after a spill and a hydrate of the same cache, the 3-bit K store
 carries `4096` and the 4-bit one carries `0`.
 
-**Decision: the 3-bit behaviour is the reference.** The collapsed
-`from_cpu_blocks` takes `max_seq`, `read_quant_k_turbo4`'s caller forwards the
-value it already has, and **the 4-bit hydrate pin moves from `0` to the written
-window.** That is the collapse's one intended observable change, and
-`tsym4_hydrate_restores_the_k_payload_but_not_the_window` is the cell that
-records it.
+**Decision, landed: the 3-bit behaviour is the reference.** The collapsed
+`from_cpu_blocks(blocks, shape, max_seq)` takes the window at both widths, the
+one `read_quant_k_turbo` forwards the value it already has, and **the 4-bit
+hydrate pin moved from `0` to the written window** —
+`HYDRATED_K_MAX_SEQ_4BIT`, the one expectation constant this campaign changed.
+The cell that records it is now
+`tsym4_hydrate_restores_the_k_payload_and_the_window`; it was named
+`..._but_not_the_window`, which the move made false.
+
+The `bits` parameter went with the change. A const-generic store states its own
+width, so a second `bits` argument beside it is a way for a caller to disagree
+with the type. `from_cpu_blocks` sets `bits: BITS`.
 
 Why this direction and not the other:
 
@@ -181,12 +196,12 @@ In `append`'s GPU hydrated-init branch, the 3-bit store builds its scale bytes
 with `flat_scales.iter().flat_map(f32::to_le_bytes).collect()` and the 4-bit
 store with `unsafe { std::slice::from_raw_parts(...) }`. Same operation.
 
-**Constraint.** The safe form, once. **Observable:** not the CPU pin — that
-branch needs a `Device::Gpu` append after a hydrate, which no test here drives.
-What holds it is that the two forms produce the same bytes by construction
-(`f32::to_le_bytes` is the definition of the little-endian layout the cast
-reinterprets), plus `make gpu-test`. The collapse removes one `unsafe` block
-from the crate and adds none.
+**Decision, landed.** The safe form, once. **Observable:** not the CPU pin —
+that branch needs a `Device::Gpu` append after a hydrate, which no test here
+drives. What holds it is that the two forms produce the same bytes by
+construction (`f32::to_le_bytes` is the definition of the little-endian layout
+the cast reinterprets), plus `make gpu-test`. The collapse removed one `unsafe`
+block from the crate and added none.
 
 ### (4) `.eval()` before `to_bytes()` — the 4-bit form is the reference
 
@@ -199,7 +214,7 @@ unnecessary.
 cells green. This is a convention decision, not a behaviour one, and the doc
 says so rather than dressing it up.
 
-**Decision: keep the call.** Every other reader in the same file —
+**Decision, landed: keep the call.** Every other reader in the same file —
 `read_quant_k`, `read_quant_v_bits`, `read_quant_planar_v` — calls it.
 `read_quant_k_turbo3` is the one outlier in the file, and a collapsed helper
 that reads differently from its four neighbours costs a future reader a
@@ -234,12 +249,14 @@ device and get `Error::Quant` on every prefill chunk. A collapsed body that
 adopted the 3-bit shape would take the 4-bit V axis off the GPU, which changes
 its store and its speed.
 
-**Constraint.** The collapsed body resolves the V device from the width: the
-caller's `device` at `BITS == 4`, `Device::Cpu` at `BITS == 3`, and `v_f32` is
-materialised exactly when that resolved device is CPU — which is the one rule
-that reproduces both bodies. **Observable: none on CPU.** §4's M15 drops the
-forcing and every cell stays green. The gates are `make gpu-test` and the
-served capture in §6.
+**Decision, landed.** `tsym_update` resolves the V device from the width: the
+caller's `device` at `BITS == TURBO_K4_BITS`, `Device::Cpu` otherwise, `v_f32`
+materialised exactly when that resolved device is CPU, and the `Array` the
+dequant returns taken when it returns one. That is the one rule that reproduces
+both bodies. **Observable: none on CPU.** §4's M15 drops the forcing and every
+CPU cell stays green. The gate is the `#[ignore]` pair in
+`crates/rmlx-kv-quant/src/kvcache/turbo_v_axis_gpu_tests.rs`, which the
+implementing chunk added for exactly this, plus the served capture in §6.
 
 ### What cannot move
 
@@ -350,18 +367,21 @@ append a geometry no buffer backs.
 
 The third test spills and hydrates **both** widths and compares what the two
 engines returned. Comparing the two pinned constants instead would execute no
-engine code, and a `from_cpu_blocks` that started forwarding the window would
-make the widths agree and leave such a control green — which is the one event
-it exists for. §4's U1 is the measurement.
+engine code. Before the collapse it asserted the two windows differed; the
+collapse made them agree, so it is now
+`the_two_widths_hydrate_the_same_window` and asserts two things: that the two
+engines return the same window, and that the agreed window is the one the spill
+wrote. The second assertion is what stops the pair agreeing on a wrong value.
+§4's U1 was the measurement that predicted the move.
 
 ### What the CPU oracle cannot see, and the GPU tests the collapse owes
 
 | Unseen | GPU test owed | Census disposition |
 |---|---|---|
-| The V-axis device split (divergence 5) at `Device::Gpu` — the one defect a blind merge introduces | **a `Device::Gpu` drive of `KvCache::update` with `in_prefill` false and no bf16 seed** — the GPU twin of this file's own drive — at `tsym3` and `tsym4`, asserting the append succeeds and the store payload matches the CPU cell's. Under the lost width rule the 3-bit cell fails on its first append: `QuantV::append` enters its GPU branch on the device alone and returns `Error::Quant` for `bits != 4`. A hard red, not a tolerance. **Not a served prefill** — see the note below the table | derived from a run: `scripts/gpu_validation_census.txt` pins accepted invalid accesses, so a test producing no shader-validation hit carries no entry. Re-derive if a cell gains a load |
-| The GPU `append` path — buffer allocation, paged growth, the MSL encode dispatch at both widths | already covered by `storage::quant_k_turbo3_tests::quant_k_turbo3_gpu_two_append_multi_head_roundtrip` and its 4-bit sibling, both `#[ignore]`-gated | no new entry |
-| The hydrated-init upload branch, where divergence 3 lives | a `Device::Gpu` append on a store built by `from_cpu_blocks`, at both widths, asserting the uploaded scales match the CPU blocks | derived from a run |
-| CPU/MSL parity of the K codec | `quant_k_turbo3_cpu_msl_parity` exists at 3-bit and has **no 4-bit counterpart** — one of the seven 3-bit-only tests. §7 says what it owes | derived from a run |
+| The V-axis device split (divergence 5) at `Device::Gpu` — the one defect a blind merge introduces | **landed**: `kvcache/turbo_v_axis_gpu_tests.rs`, a `Device::Gpu` drive of `KvCache::update` with `in_prefill` false and no bf16 seed — the GPU twin of this file's own drive — at `tsym3` and `tsym4`. It asserts the appends succeed, the row shapes, and the V store's own disposition per width: no GPU mirror and one CPU block per append at 3 bits, a GPU mirror and no CPU block at 4. Under the lost width rule the 3-bit cell fails on its first append, because `QuantV::append` enters its GPU branch on the device alone and returns `Error::Quant` for `bits != 4`; under the reverse edit the 4-bit cell fails on its disposition. A hard red, not a tolerance. **Not a served prefill** — see the note below the table | derived from a run: no shader-validation hit, so no census entry |
+| The GPU `append` path — buffer allocation, paged growth, the MSL encode dispatch at both widths | covered by `storage::quant_k_turbo_tests::quant_k_turbo3_gpu_two_append_multi_head_roundtrip` and its 4-bit sibling, both `#[ignore]`-gated | no new entry |
+| The hydrated-init upload branch, where divergence 3 lives | **not written.** The branch is one safe conversion after the collapse and the two forms it replaced produce the same bytes by construction; a test for it would assert `f32::to_le_bytes`. Recorded as owed rather than claimed | — |
+| CPU/MSL parity of the K codec | **landed at both widths**: `cpu_msl_parity` is one generic body with `quant_k_turbo3_cpu_msl_parity` and `quant_k_turbo4_cpu_msl_parity` entering it | derived from a run: no hit |
 | The fused-QK decode kernels | `turbo_k3_fused_qk_msl_tests` / `turbo_k4_fused_qk_msl_tests`, unchanged by the collapse | no |
 
 #### Which routes reach the turbo V append at all
@@ -373,8 +393,8 @@ prefill on the GPU" — is wrong.
   true returns into `update_prefill_raw` and never enters the storage
   dispatch, and `exit_prefill` returns at its `materialises_packed_store()`
   gate, before every arm that would bulk encode. Neither touches
-  `update_tsym3`.
-* **A served decode step does not reach it either.** `update_tsym3` opens with
+  `update_tsym`.
+* **A served decode step does not reach it either.** `update_tsym` opens with
   `if self.decode_fp16_k.is_some() { return self.update_decode_fp16(..) }`,
   and `exit_prefill` is what installs that seed. On a normally-prefilled cache
   every decode step short-circuits.
@@ -384,11 +404,12 @@ owes:
 
 1. **A `Device::Gpu` drive of `KvCache::update` with `in_prefill` false and no
    bf16 seed** — the same drive this file's CPU cells use, on the other device.
-   This is the one to write: it is hermetic, needs no model, and fails on the
-   first append under the lost width rule.
+   This is the one that was written (`kvcache/turbo_v_axis_gpu_tests.rs`): it is
+   hermetic, needs no model, and fails on the first append under the lost width
+   rule.
 2. **An SSD-hydrated `tsym3` cache resuming decode on `Device::Gpu`.** A
    hydrated entry carries a store and no mirror, so `decode_fp16_k` is `None`
-   and the dispatch reaches `update_tsym3` for real. It is the production route
+   and the dispatch reaches `update_tsym` for real. It is the production route
    that would hit the defect, and it needs a spilled block plus a device, so it
    belongs beside the SSD suite rather than beside the store-bytes pin.
 
@@ -443,11 +464,13 @@ checked against the thing it claims to select. It reads the variant
 `KvStorage::new` sets at construction and drives nothing — the claim does not
 rest on an append.
 
-**The width guard is the other half of M1.** The collapsed type should refuse
-`QuantKTurbo<5>` at monomorphisation the way the iso stores do — a named
-associated const read by `new`, by `from_cpu_blocks` and by the `Debug` impl,
-so no birth path can miss it. That is owed to the implementing chunk; this
-tree has two separate types and no such guard to mutate.
+**The width guard is the other half of M1.** The collapsed type refuses
+`QuantKTurbo<5>` at monomorphisation the way the iso stores do:
+`WIDTH_IS_A_SHIPPED_ONE` is read by `NAME`, by `new`, by `from_cpu_blocks` and
+by the two MSL width selectors, so no birth path and no kernel dispatch can
+miss it. It is a `const` assert, so there is no run to mutate — a tree that
+lost it fails to build at the first `QuantKTurbo<5>`, and a tree that kept it
+never reaches one.
 
 ### The mutation I could not catch
 
@@ -481,7 +504,7 @@ wider than it is. No row mutates the GPU append path, because the pin never
 dispatches a kernel. And no row mutates the `.metal` kernels, which are out of
 scope and which no CPU test compiles.
 
-## 5. Duplication figure — the "before" arm
+## 5. Duplication figure — before and after
 
 Three populations, registered in `scripts/lib/debt_report.py`'s
 `MATCHED_LINES_POPULATIONS` beside the rotor and iso ones and not in place of
@@ -501,10 +524,35 @@ Per-pair, for the record: `write_quant_k_turbo3` against `_4` 36 lines of 36
 `read_tsym3` against `read_tsym4` 8 of 9, `k_turbo3_shape` against
 `k_turbo4_shape` 3 of 3.
 
-**After the collapse all three must read a measured `0` with the population
-still found.** A deleted population prints `unavailable` and exits 1, and a
-population that quietly resolved to nothing would be indistinguishable from a
-collapsed one if the module let it print `0`.
+After the collapse, on the same three commands:
+
+```
+turbo storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 597 body lines (1 item(s), 0 pair(s))
+turbo update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 90 body lines (2 item(s), 0 pair(s))
+turbo ssd helper twins (crates/rmlx-kv-ssd/src/block_io.rs): 0 matched lines over 81 body lines (4 item(s), 0 pair(s))
+```
+
+All three read a measured `0` with the population still found, which is the
+answer the issue asks for. A deleted population prints `unavailable` and exits
+1, and a population that quietly resolved to nothing would be
+indistinguishable from a collapsed one if the module let it print `0`.
+
+`turbo-ssd` reads four items, not one: the four helpers keep their turbo token
+and lose their width, and `width_pair_key` puts each in a group of its own. The
+digit-free pattern is what makes that a `0` instead of an `unavailable`.
+
+**`TURBO_UPDATE_FN_PATTERN` widened**, from `^update_tsym` to
+`(^|_)tsym(\d|_|$)`. The collapsed entry is `update_tsym` and the
+width-parametric body it enters is `tsym_update`, which spell the token on
+opposite sides of the name; an anchored prefix would have measured the 23-line
+entry and never the body, so a re-split of that body into two width bodies
+would have left this counter at `0`. The token still admits nothing else in the
+file — `update_k8vturbo3` and its siblings carry no `tsym` — so the exclusion
+§5's design paragraph asks for is unchanged, and the selftest's own base and
+collapsed fixtures read the same figures they did. The one selftest case that
+moved is the empty-population one, which used to empty the population by moving
+the prefix off the front; it now removes the token, the way the iso case
+already did.
 
 ### The population design
 
@@ -515,9 +563,9 @@ measures the tree that carries the twins and the tree that has collapsed them.
 * **`turbo-storage`** — the non-test `quant_k_turbo*.rs` files under
   `crates/rmlx-kv-quant/src/storage`, `width_pair_key`. Reuses
   `storage_file_items` with a third glob.
-* **`turbo-updates`** — the `update_tsym*` fns of the KV update file,
-  `width_pair_key`, through `file_fn_items` with a third pattern. **Anchored on
-  the symmetric entries on purpose.** The same file carries two more turbo
+* **`turbo-updates`** — the fns of the KV update file whose name carries the
+  `tsym` token as a whole segment, `width_pair_key`, through `file_fn_items`
+  with a third pattern. **Keyed on the symmetric token on purpose.** The same file carries two more turbo
   width pairs — `update_k8vturbo3` against `update_k8vturbo2` (72 matched
   lines) and their TCQ siblings (73) — which a `(turbo|tsym)` pattern would
   fold in, at 204 matched lines over 6 items. Those are a different family's
@@ -538,11 +586,11 @@ rule the label carries — so folding them in would print the kv-quant storage
 directory beside a number measured partly in kv-ssd.
 
 **Its pattern carries no width digit**, which is the one subtle thing about it.
-After the collapse those four helpers keep their names without a width suffix
-(`read_quant_k_turbo`, `read_tsym`, …). A digit-bearing pattern would then
-match nothing, report `unavailable` and exit 1 — the one answer a collapse must
-not produce. `matched_lines_turbo_ssd_collapsed_zero` is the selftest case that
-pins it.
+The four collapsed helpers keep their names without a width suffix
+(`read_quant_k_turbo`, `read_tsym`, …). A digit-bearing pattern would match
+nothing, report `unavailable` and exit 1 — the one answer a collapse must not
+produce. `matched_lines_turbo_ssd_collapsed_zero` is the selftest case that
+pins it, and the live tree now confirms it.
 
 `scripts/debt_report_selftest.sh` carries 25 new cases, red both ways: the
 planted figure and its item and pair counts for each population, the collapsed
@@ -582,19 +630,21 @@ Per-cell raw logs carry the absolute model-snapshot path and must never reach a
 commit message, a PR body, an issue or any other public surface. Only a
 commands file written with the model root elided may be quoted.
 
-## 7. Removals the collapse owes
+## 7. Removals, as landed
 
-Written before the collapse; the implementing chunk deletes these and the PR
-body lists them again with the net line count.
-
-* `storage/quant_k_turbo3.rs` and `storage/quant_k_turbo4.rs` — one becomes
-  `QuantKTurbo<BITS>` and the other goes. The width-named spellings stay as
-  type aliases, because `rmlx-kv-ssd` and `rmlx-kv-quant::storage::kv_storage`
-  name them.
-* `TURBO3_K_BITS` — a constant with one width's name on it, exported from
-  `storage/mod.rs`. It has no 4-bit counterpart. Either it becomes
-  `QuantKTurbo::<BITS>::BITS` or it goes; `storage/mod.rs`'s re-export line
-  goes with it either way.
+* `storage/quant_k_turbo3.rs` and `storage/quant_k_turbo4.rs` — both gone.
+  `storage/quant_k_turbo.rs` holds `QuantKTurbo<BITS>`; the width-named
+  spellings stay as type aliases, because `rmlx-kv-ssd` and
+  `rmlx-kv-quant::storage::kv_storage` name them. The generic name is exported
+  `pub` rather than `pub(crate)`, unlike the iso and rotor stores: the four
+  collapsed SSD helpers live in another crate and are width-parametric, so they
+  have to name it. The guard against a third width is
+  `QuantKTurbo::WIDTH_IS_A_SHIPPED_ONE`, a const assert that fires at
+  monomorphisation wherever the instantiation is written, so nothing rests on
+  the visibility.
+* `TURBO3_K_BITS` — gone, with its `storage/mod.rs` re-export.
+  `TURBO_K3_BITS` and `TURBO_K4_BITS` replace it, one per shipped width, both
+  read by the width guard and by `NAME`.
 * `QuantKTurbo4`'s two inline struct literals in `kvcache/update.rs` — the
   `exit_prefill` arm and the decode arm — replaced by the one constructor.
   **The `exit_prefill` arms are rewritten, not deleted.** They execute for no
@@ -605,16 +655,19 @@ body lists them again with the net line count.
   is the guard that holds an arm and its classification together, and it is the
   only thing that will ever execute those two sites.
   `storage/quant_planar_k.rs`'s comment "matching the `QuantKTurbo4`
-  inline-literal signature" is made false by the rewrite and must go or be
-  reworded.
-* `KvCache::update_tsym3` and `update_tsym4` — two entries over one,
-  resolving the width from the `KvStorage` variant, the shape
-  `update_rotor_v` and `update_iso_v` already have. Its body carries the
-  V-axis width rule from §2(5).
+  inline-literal signature" went with the rewrite.
+* `KvCache::update_tsym3` and `update_tsym4` — gone. `KvCache::update_tsym`
+  resolves the width from the `KvStorage` variant and enters `tsym_update`,
+  the free generic body, the shape `update_iso_sym` already had. That body
+  carries the V-axis width rule from §2(5).
 * The four `block_io.rs` helper pairs — `k_turbo3_shape` / `k_turbo4_shape`,
   `write_quant_k_turbo3` / `_4`, `read_tsym3` / `read_tsym4`,
-  `read_quant_k_turbo3` / `_4` — eight fns over four. The write pair's bodies
-  are byte-identical, so that one is a pure deletion.
+  `read_quant_k_turbo3` / `_4` — eight fns over four: `k_turbo_shape`,
+  `write_quant_k_turbo` and `read_quant_k_turbo` are const-generic over the
+  width, and `read_tsym` takes the width as a runtime `u8` because the two
+  widths land in two `KvStorage` variants and only that fn knows which to
+  build. It refuses any other width rather than falling through to one of the
+  two it has.
 * `read_quant_k_turbo3`'s doc comment "Note: tensors loaded from safetensors
   are pre-materialized byte-buffers; `.to_bytes()` is sufficient" — false as a
   justification once §2(4)'s decision keeps the call, and it is the comment
@@ -624,23 +677,41 @@ body lists them again with the net line count.
   `max_seq` and by `.eval()` — and neither has anything to mirror once there is
   one body.
 * The two Rust MSL wrappers `turbo_k3_fused_qk_msl.rs` /
-  `turbo_k4_fused_qk_msl.rs` (220 matched lines of 241 / 246) — **the issue
-  lists them and this doc does not decide them.** They dispatch the two
-  `.metal` kernels, which are out of scope, so collapsing the wrappers means
-  deciding what a width-generic wrapper over two genuinely different kernels
-  looks like. If the implementing chunk collapses them it says so; if it does
-  not, it says that, with the figure.
-* **The seven 3-bit-only tests.** `quant_k_turbo3_new_shapes_correct`,
-  `_roundtrip_cpu_single_step`, `_append_cpu_path`, `_reset_clears_seq`,
-  `_cosine_empirical_floor_head_dim_128`, `_from_cpu_blocks_max_seq_explicit`
-  and `_cpu_msl_parity` have no 4-bit counterpart. The iso precedent is that
-  each case becomes one generic body plus one `#[test]` per width, so the cell
-  count does not fall. Two of these need a decision rather than a translation:
-  `_cosine_empirical_floor_head_dim_128` carries a 3-bit quality floor that is
-  not the 4-bit floor, so it takes a per-width bound or stays 3-bit-only; and
-  `_from_cpu_blocks_max_seq_explicit` is the test for divergence 2 and must
-  follow whichever way §2(2) is resolved. **The PR states, for each of the
-  seven, ported-to-both-widths or stays-3-bit-only.**
+  `turbo_k4_fused_qk_msl.rs` (220 matched lines of 241 / 246) — **not
+  collapsed.** The reason is structural rather than a preference. Each wrapper
+  owns a `static AtomicU64` dispatch counter and a `static
+  OnceLock<MetalKernel>` holding its own kernel, built from its own `.metal`
+  source and header. A `static` declared inside a generic fn in Rust is **one**
+  item shared across every instantiation, so a width-generic wrapper cannot
+  keep the two counters and the two kernel singletons the tree reads by name in
+  `kvcache/fused_qk_dispatch.rs` and in
+  `crates/rmlx-kv-quant/tests/kv_decode_dtype_contract.rs`; it would have to
+  move them out into per-width tables, which replaces two readable modules with
+  one module plus two tables and deletes neither kernel nor counter. The
+  width-selection layer the iso family gets from `isoquant_msl_dispatch` the
+  turbo family already has, in `kvcache/fused_qk_dispatch.rs`'s `TURBO_K3_FN` /
+  `TURBO_K4_FN`. **220 matched lines of wrapper duplication therefore stay**,
+  and collapsing them is a kernel-shape decision that belongs with the `.metal`
+  pair the issue puts out of scope.
+* **The seven 3-bit-only tests — all seven ported to both widths.** Each is
+  one generic body plus one `#[test]` per width, the iso precedent, so the cell
+  count rose rather than fell.
+
+  | Test | Disposition |
+  |---|---|
+  | `_new_shapes_correct` | ported; asserts `bits == BITS` instead of the constant |
+  | `_roundtrip_cpu_single_step` | ported |
+  | `_append_cpu_path` | ported |
+  | `_reset_clears_seq` | ported; `reset()` is a both-width method now |
+  | `_cosine_empirical_floor_head_dim_128` | ported, floor as a parameter. 3-bit keeps its 0.9807 gate unchanged; 4-bit measured 0.996401 at the same seed and shape, gated at 0.9954 |
+  | `_from_cpu_blocks_max_seq_explicit` | ported; follows §2(2), so both widths assert the explicit window |
+  | `_cpu_msl_parity` | ported, `#[ignore]` at both widths |
+
+  The 4-bit file's three tests came across with it. Two of them were unprefixed
+  (`cpu_two_append_multi_head_roundtrip`, `gpu_two_append_multi_head_roundtrip`)
+  and are now `quant_k_turbo4_two_append_multi_head_roundtrip` and
+  `quant_k_turbo4_gpu_two_append_multi_head_roundtrip`, because one merged file
+  carrying both widths cannot leave one of them unnamed.
 
 ### Kept, and why
 
@@ -658,9 +729,9 @@ body lists them again with the net line count.
   tag, no census entry, no layout-key salt.** Every spelling that existed
   before exists after, with the same bytes and the same tokens.
 * **`scripts/lib/debt_report.py`'s existing populations.** The three turbo ones
-  are added beside them.
+  sit beside them; the count stays ten.
 
-## 8. What this chunk ran
+## 8. What each chunk ran
 
 The test chunk ran the two oracles, this doc, the populations and the first
 mutation run — no engine code, no GPU test, no served capture, no performance

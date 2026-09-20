@@ -14,8 +14,8 @@ use rmlx_mlx::{zeros, Array, Device, Dtype};
 
 use crate::storage::{
     iso_n_groups_for, IsoBlocks, KvStorage, QuantIsoK, QuantIsoV, QuantIsoV3, QuantIsoV4, QuantK,
-    QuantKTurbo3, QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorK, QuantRotorV, QuantV,
-    RotorBlocks, RotorKBlocks,
+    QuantKTurbo, QuantKTurbo3, QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorK, QuantRotorV,
+    QuantV, RotorBlocks, RotorKBlocks, TURBO_K4_BITS,
 };
 use crate::turbo_flash_msl::{turbo_flash_sdpa, turbo_flash_should_run};
 use crate::KvQuant;
@@ -1537,12 +1537,11 @@ impl KvCache {
             )),
             // K8VTurbo3 decode update — same structure as K8V4 but bits=3 on V.
             KvStorage::K8VTurbo3 { .. } => self.update_k8vturbo3(new_k, new_v, device),
-            // TurboSym3 decode update — symmetric 3-bit Lloyd-Max K + turbo3 V.
-            // K side uses the GPU turbo3 MSL kernel; V side forced CPU
-            // (same K8VTurbo3 precedent: GPU V-side dispatch regressed −2% TPS gate).
-            KvStorage::TurboSym3 { .. } => self.update_tsym3(new_k, new_v, device),
-            // TurboSym4 decode update — symmetric 4-bit Lloyd-Max K + tq4 V.
-            KvStorage::TurboSym4 { .. } => self.update_tsym4(new_k, new_v, device),
+            // TurboSym3 / TurboSym4 decode update — symmetric Lloyd-Max K + V
+            // at the variant's code width, one entry over both.
+            KvStorage::TurboSym3 { .. } | KvStorage::TurboSym4 { .. } => {
+                self.update_tsym(new_k, new_v, device)
+            }
             // PlanarK decode update — K is PlanarQuant 4-bit, V bf16.
             KvStorage::PlanarK { .. } => self.update_planar_k(new_k, new_v, device),
             // K8VTurbo2 decode update — same structure as K8V4 but bits=2 on V.
@@ -2572,17 +2571,7 @@ impl KvCache {
                 };
                 let mut init_shape = new_shape.clone();
                 init_shape[2] = 0;
-                let mut qk = QuantKTurbo4 {
-                    blocks: Vec::new(),
-                    gpu_codes_buf: None,
-                    gpu_scales_buf: None,
-                    gpu_words_per_step: 0,
-                    gpu_scales_per_step: 0,
-                    gpu_capacity: 0,
-                    shape: init_shape.clone(),
-                    bits: 4,
-                    max_seq,
-                };
+                let mut qk = QuantKTurbo4::new(init_shape.clone(), max_seq);
                 let mut qv = QuantV {
                     blocks: Vec::new(),
                     gpu_codes_buf: None,
@@ -4305,32 +4294,22 @@ impl KvCache {
         Ok((k_full, v_full))
     }
 
-    /// TurboSym3 decode update — K = `QuantKTurbo3` (GPU-capable
-    /// turbo3 MSL kernel), V = `QuantV` (bits=3, **CPU-forced**; GPU V-side
-    /// dispatch failed the −2% TPS gate on K8VTurbo3, see `update_k8vturbo3`
-    /// doc-comment).
+    /// Symmetric TurboQuant decode update, both code widths.
     ///
-    /// Mirrors `update_tsym4` for the K side with `bits=3`; mirrors
-    /// `update_k8vturbo3` for the V side (forced `Device::Cpu`).
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-    )]
-    fn update_tsym3(
+    /// K is [`QuantKTurbo`] at the width the active storage variant carries
+    /// (`TurboSym3` is 3 bits, `TurboSym4` is 4); V is [`QuantV`] at the same
+    /// width. The body is [`tsym_update`] — see it for the V-axis device rule,
+    /// which is the one thing the two widths do not share.
+    fn update_tsym(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let KvStorage::TurboSym3 { k, v, max_seq } = &mut self.storage else {
-            return Err(Error::Mlx(format!(
-                "storage mismatch: expected TurboSym3, got {}",
-                storage_variant_name(&self.storage)
-            )));
+        let (KvStorage::TurboSym3 { max_seq, .. } | KvStorage::TurboSym4 { max_seq, .. }) =
+            &self.storage
+        else {
+            return Err(storage_mismatch("TurboSym3 | TurboSym4", &self.storage));
         };
         let max_seq = *max_seq;
 
@@ -4338,66 +4317,16 @@ impl KvCache {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        tracing::trace!(quant = "tsym3", "update_tsym3: decode step");
-
-        let new_shape = new_k.shape();
-
-        // K-side: GPU-capable turbo3 MSL kernel (Decision B: reuse existing
-        // k8vturbo3 MSL kernel, axis-agnostic). V-side: force CPU for 3-bit
-        // (GPU V-side dispatch regressed −2% TPS gate on K8VTurbo3).
-        let k_f32 = if device == Device::Gpu {
-            Vec::new()
+        if let KvStorage::TurboSym3 { k, v, .. } = &mut self.storage {
+            tracing::trace!(quant = "tsym3", "update_tsym: decode step");
+            tsym_update::<3>(k, v, max_seq, "TurboSym3", new_k, new_v, device)
+        } else if let KvStorage::TurboSym4 { k, v, .. } = &mut self.storage {
+            tracing::trace!(quant = "tsym4", "update_tsym: decode step");
+            tsym_update::<4>(k, v, max_seq, "TurboSym4", new_k, new_v, device)
         } else {
-            array_to_f32_vec(new_k, device)?
-        };
-        let v_f32 = array_to_f32_vec(new_v, Device::Cpu)?;
-
-        if k.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *k = Some(QuantKTurbo3::new(init_shape, max_seq));
+            // Unreachable: the width read above accepted no other variant.
+            Err(storage_mismatch("TurboSym3 | TurboSym4", &self.storage))
         }
-        let Some(ks) = k.as_mut() else {
-            return Err(Error::Mlx("TurboSym3 K buffer absent after init".into()));
-        };
-        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
-        let k_shape = ks.shape.clone();
-        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
-        let k_full = match k_arr_opt {
-            Some(arr) => arr,
-            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
-        };
-
-        if v.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *v = Some(QuantV {
-                blocks: Vec::new(),
-                gpu_codes_buf: None,
-                gpu_scales_buf: None,
-                gpu_words_per_step: 0,
-                gpu_scales_per_step: 0,
-                gpu_capacity: 0,
-                shape: init_shape,
-                bits: 3,
-                max_seq,
-                high_precision_indices: None,
-                value_codebook: None,
-                value_codebook_gpu: None,
-                use_tcq: false,
-            });
-        }
-        let Some(vs) = v.as_mut() else {
-            return Err(Error::Mlx("TurboSym3 V buffer absent after init".into()));
-        };
-        // V-side: force CPU path for 3-bit (GPU kernel wired but disabled;
-        // see doc-comment + K8VTurbo3 precedent for the −2% gate fail).
-        vs.append(&v_f32, &new_shape, new_v, Device::Cpu, max_seq)?;
-        let v_shape = vs.shape.clone();
-        let (v_recon_f32, _) = vs.dequantize_choice(Device::Cpu, new_v.dtype())?;
-        let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
-
-        Ok((k_full, v_full))
     }
 
     /// K8VTurbo3Tcq decode update — K = affine q8_0,
@@ -4596,102 +4525,6 @@ impl KvCache {
         let v_shape = vs.shape.clone();
         let (v_recon_f32, _) = vs.dequantize_choice(Device::Cpu, new_v.dtype())?;
         let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
-
-        Ok((k_full, v_full))
-    }
-
-    /// TurboSym4 decode update — symmetric 4-bit Lloyd-Max K + tq4 V.
-    ///
-    /// Mirrors `update_k8v4` but the K side uses [`QuantKTurbo4`] (TurboQuant
-    /// 4-bit) instead of `QuantK` (q8_0). Both K and V dispatch through the
-    /// axis-agnostic `turbo_quantize_v4_gpu` / `turbo_dequantize_v4_gpu` MSL
-    /// kernel — no kernel fork.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    fn update_tsym4(
-        &mut self,
-        new_k: &Array,
-        new_v: &Array,
-        device: Device,
-    ) -> Result<(Array, Array)> {
-        let KvStorage::TurboSym4 { k, v, max_seq } = &mut self.storage else {
-            return Err(Error::Mlx(format!(
-                "storage mismatch: expected TurboSym4, got {}",
-                storage_variant_name(&self.storage)
-            )));
-        };
-        let max_seq = *max_seq;
-
-        if self.decode_fp16_k.is_some() {
-            return self.update_decode_fp16(new_k, new_v, max_seq, device);
-        }
-
-        tracing::trace!(quant = "tsym4", "update_tsym4: decode step");
-
-        let new_shape = new_k.shape();
-        let (k_f32, v_f32) = if device == Device::Gpu {
-            (Vec::new(), Vec::new())
-        } else {
-            arrays_to_f32(new_k, new_v, device)?
-        };
-
-        if k.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *k = Some(QuantKTurbo4 {
-                blocks: Vec::new(),
-                gpu_codes_buf: None,
-                gpu_scales_buf: None,
-                gpu_words_per_step: 0,
-                gpu_scales_per_step: 0,
-                gpu_capacity: 0,
-                shape: init_shape,
-                bits: 4,
-                max_seq,
-            });
-        }
-        let Some(ks) = k.as_mut() else {
-            return Err(Error::Mlx("TurboSym4 K buffer absent after init".into()));
-        };
-        ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
-        let k_shape = ks.shape.clone();
-        let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
-        let k_full = match k_arr_opt {
-            Some(arr) => arr,
-            None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
-        };
-
-        if v.is_none() {
-            let mut init_shape = new_shape.clone();
-            init_shape[2] = 0;
-            *v = Some(QuantV {
-                blocks: Vec::new(),
-                gpu_codes_buf: None,
-                gpu_scales_buf: None,
-                gpu_words_per_step: 0,
-                gpu_scales_per_step: 0,
-                gpu_capacity: 0,
-                shape: init_shape,
-                bits: 4,
-                max_seq,
-                high_precision_indices: None,
-                value_codebook: None,
-                value_codebook_gpu: None,
-                use_tcq: false,
-            });
-        }
-        let Some(vs) = v.as_mut() else {
-            return Err(Error::Mlx("TurboSym4 V buffer absent after init".into()));
-        };
-        vs.append(&v_f32, &new_shape, new_v, device, max_seq)?;
-        let v_shape = vs.shape.clone();
-        let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(device, new_v.dtype())?;
-        let v_full = match v_arr_opt {
-            Some(arr) => arr,
-            None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
-        };
 
         Ok((k_full, v_full))
     }
@@ -6554,6 +6387,108 @@ fn iso_v_update<const BITS: u8>(
 
     let v_full =
         iso_v_encode_decode::<BITS>(v, new_v, &v_f32, &new_shape, max_seq, variant, device)?;
+
+    Ok((k_full, v_full))
+}
+
+/// Decode update for `TurboSym3` / `TurboSym4`: K is [`QuantKTurbo`] at
+/// `BITS`, V is [`QuantV`] at the same width.
+///
+/// # The V-axis device rule
+///
+/// The K axis always takes the caller's device. The V axis takes it at 4 bits
+/// and is pinned to `Device::Cpu` at 3, and that is load-bearing rather than a
+/// tuning choice: [`QuantV::append`] enters its GPU branch on the device alone
+/// and then refuses `bits != 4`, so handing a 3-bit V store the caller's
+/// device returns `Error::Quant` on every GPU append. The 3-bit V GPU dispatch
+/// also failed the −2% TPS gate on `K8VTurbo3`. The host vector `v_f32` is
+/// materialised exactly when the resolved V device is the CPU, and the GPU
+/// `Array` the dequant returns is taken when it returns one — rebuilding those
+/// rows from the host vector instead costs one device-to-host copy per step.
+///
+/// `variant` is the storage spelling the caller resolved, used only in the
+/// "buffer absent after init" diagnostics.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the body carries both stores, the window and the width the caller \
+              resolved; a parameter struct would exist for this one call"
+)]
+fn tsym_update<const BITS: u8>(
+    k: &mut Option<QuantKTurbo<BITS>>,
+    v: &mut Option<QuantV>,
+    max_seq: i32,
+    variant: &'static str,
+    new_k: &Array,
+    new_v: &Array,
+    device: Device,
+) -> Result<(Array, Array)> {
+    let new_shape = new_k.shape();
+    let v_device = if BITS == TURBO_K4_BITS {
+        device
+    } else {
+        Device::Cpu
+    };
+
+    let k_f32 = if device == Device::Gpu {
+        Vec::new()
+    } else {
+        array_to_f32_vec(new_k, device)?
+    };
+    let v_f32 = if v_device == Device::Gpu {
+        Vec::new()
+    } else {
+        array_to_f32_vec(new_v, Device::Cpu)?
+    };
+
+    if k.is_none() {
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        *k = Some(QuantKTurbo::<BITS>::new(init_shape, max_seq));
+    }
+    let Some(ks) = k.as_mut() else {
+        return Err(Error::Mlx(format!("{variant} K buffer absent after init")));
+    };
+    ks.append(&k_f32, &new_shape, new_k, device, max_seq)?;
+    let k_shape = ks.shape.clone();
+    let (k_recon_f32, k_arr_opt) = ks.dequantize_choice(device, new_k.dtype())?;
+    let k_full = match k_arr_opt {
+        Some(arr) => arr,
+        None => f32_vec_to_array(&k_recon_f32, &k_shape)?,
+    };
+
+    if v.is_none() {
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        *v = Some(QuantV {
+            blocks: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            bits: BITS,
+            max_seq,
+            high_precision_indices: None,
+            value_codebook: None,
+            value_codebook_gpu: None,
+            use_tcq: false,
+        });
+    }
+    let Some(vs) = v.as_mut() else {
+        return Err(Error::Mlx(format!("{variant} V buffer absent after init")));
+    };
+    vs.append(&v_f32, &new_shape, new_v, v_device, max_seq)?;
+    let v_shape = vs.shape.clone();
+    let (v_recon_f32, v_arr_opt) = vs.dequantize_choice(v_device, new_v.dtype())?;
+    let v_full = match v_arr_opt {
+        Some(arr) => arr,
+        None => f32_vec_to_array(&v_recon_f32, &v_shape)?,
+    };
 
     Ok((k_full, v_full))
 }

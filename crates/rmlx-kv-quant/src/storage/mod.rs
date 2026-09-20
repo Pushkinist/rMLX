@@ -36,8 +36,7 @@ mod quant_iso_k;
 mod quant_iso_v;
 mod quant_k;
 mod quant_k_gpu_ring;
-mod quant_k_turbo3;
-mod quant_k_turbo4;
+mod quant_k_turbo;
 mod quant_planar_k;
 mod quant_planar_v;
 mod quant_rotor_k;
@@ -69,8 +68,12 @@ pub use quant_k_gpu_ring::{
     bf16_round, ring_bits_per_value, sideband_to_f32_vec, to_sideband_dtype, QuantKGpuRing,
     KV_SIDEBAND_DTYPE,
 };
-pub use quant_k_turbo3::{QuantKTurbo3, TURBO3_K_BITS};
-pub use quant_k_turbo4::QuantKTurbo4;
+// The turbo K store is the one width-parametric store exported by its
+// generic name: `rmlx-kv-ssd`'s four SSD helpers are one each over both
+// widths and cannot name a type they cannot see. A third instantiation is
+// refused by `QuantKTurbo::WIDTH_IS_A_SHIPPED_ONE` at monomorphisation, so
+// the guard is the const assert and not this visibility.
+pub use quant_k_turbo::{QuantKTurbo, QuantKTurbo3, QuantKTurbo4, TURBO_K3_BITS, TURBO_K4_BITS};
 pub use quant_planar_k::QuantPlanarK;
 pub use quant_planar_v::QuantPlanarV;
 // The width-parametric stores stay crate-internal: the two widths the codecs
@@ -427,7 +430,7 @@ pub(crate) fn retain_rows_in<T>(buf: &mut Vec<T>, total_rows: usize, keep_rows: 
 ///
 /// The whole cut sequence for the turbo / planar stores, in one place: clamp the
 /// target, plan the block walk, apply it, then lower `shape[2]`. Five stores
-/// share it (`QuantV`, `QuantKTurbo3`, `QuantKTurbo4`, `QuantPlanarK`,
+/// share it (`QuantV`, `QuantKTurbo` at both widths, `QuantPlanarK`,
 /// `QuantPlanarV`) and the order is load-bearing — the clamp has to run before
 /// the plan, and `shape[2]` has to move after it. Independent copies of that
 /// sequence are the same drift surface that let twelve `KvStorage` arms keep a

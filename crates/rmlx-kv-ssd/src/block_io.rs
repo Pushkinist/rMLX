@@ -72,16 +72,16 @@ use rmlx_kv_quant::linear_attn::LinearAttnCache;
 use rmlx_kv_quant::mixed_quant::{MixedKvState, MixedTuple};
 use rmlx_kv_quant::paged::{PagedKStorage, PagedPlanarVStorage, PagedVStorage};
 use rmlx_kv_quant::storage::{
-    IsoBlocks, KvStorage, QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK, QuantKTurbo3,
-    QuantKTurbo4, QuantPlanarK, QuantPlanarV, QuantRotorK3, QuantRotorK4, QuantRotorV3,
-    QuantRotorV4, QuantV, RotorBlocks, RotorKBlocks, ISOV3_LAYOUT_TAG, ISOV4_LAYOUT_TAG,
-    ISO_K_ONLY_3_LAYOUT_TAG, ISO_K_ONLY_4_LAYOUT_TAG, ISO_SYM_3_LAYOUT_TAG, ISO_SYM_4_LAYOUT_TAG,
-    K8VTURBO2_TCQ_LAYOUT_TAG, K8VTURBO3_TCQ_LAYOUT_TAG, PLANARK4_LAYOUT_TAG, ROTORV3_LAYOUT_TAG,
-    ROTORV4_LAYOUT_TAG, ROTOR_K_ASYM_3_LAYOUT_PREFIX, ROTOR_K_ASYM_3_QJL_LAYOUT_PREFIX,
-    ROTOR_K_ASYM_4_LAYOUT_PREFIX, ROTOR_K_ASYM_4_QJL_LAYOUT_PREFIX, ROTOR_K_ONLY_3_LAYOUT_TAG,
-    ROTOR_K_ONLY_3_QJL_LAYOUT_TAG, ROTOR_K_ONLY_4_LAYOUT_TAG, ROTOR_K_ONLY_4_QJL_LAYOUT_TAG,
-    ROTOR_SYM_3_LAYOUT_TAG, ROTOR_SYM_3_QJL_LAYOUT_TAG, ROTOR_SYM_4_LAYOUT_TAG,
-    ROTOR_SYM_4_QJL_LAYOUT_TAG, TURBOSYM3_LAYOUT_TAG, TURBOSYM4_LAYOUT_TAG,
+    IsoBlocks, KvStorage, QuantIsoK3, QuantIsoK4, QuantIsoV3, QuantIsoV4, QuantK, QuantKTurbo,
+    QuantPlanarK, QuantPlanarV, QuantRotorK3, QuantRotorK4, QuantRotorV3, QuantRotorV4, QuantV,
+    RotorBlocks, RotorKBlocks, ISOV3_LAYOUT_TAG, ISOV4_LAYOUT_TAG, ISO_K_ONLY_3_LAYOUT_TAG,
+    ISO_K_ONLY_4_LAYOUT_TAG, ISO_SYM_3_LAYOUT_TAG, ISO_SYM_4_LAYOUT_TAG, K8VTURBO2_TCQ_LAYOUT_TAG,
+    K8VTURBO3_TCQ_LAYOUT_TAG, PLANARK4_LAYOUT_TAG, ROTORV3_LAYOUT_TAG, ROTORV4_LAYOUT_TAG,
+    ROTOR_K_ASYM_3_LAYOUT_PREFIX, ROTOR_K_ASYM_3_QJL_LAYOUT_PREFIX, ROTOR_K_ASYM_4_LAYOUT_PREFIX,
+    ROTOR_K_ASYM_4_QJL_LAYOUT_PREFIX, ROTOR_K_ONLY_3_LAYOUT_TAG, ROTOR_K_ONLY_3_QJL_LAYOUT_TAG,
+    ROTOR_K_ONLY_4_LAYOUT_TAG, ROTOR_K_ONLY_4_QJL_LAYOUT_TAG, ROTOR_SYM_3_LAYOUT_TAG,
+    ROTOR_SYM_3_QJL_LAYOUT_TAG, ROTOR_SYM_4_LAYOUT_TAG, ROTOR_SYM_4_QJL_LAYOUT_TAG,
+    TURBOSYM3_LAYOUT_TAG, TURBOSYM4_LAYOUT_TAG, TURBO_K3_BITS, TURBO_K4_BITS,
 };
 use rmlx_kv_quant::KvQuant;
 
@@ -737,10 +737,10 @@ fn write_layer(
         // K is `QuantKTurbo3` (3-bit codes, same GPU pack as V-side turbo3).
         // Layout tag: TURBOSYM3_LAYOUT_TAG = "tsym3_lloyd_3_3".
         KvStorage::TurboSym3 { k, v, max_seq } => {
-            let seq = write_quant_k_turbo3(idx, k.as_ref(), device, out)?;
+            let seq = write_quant_k_turbo(idx, k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((
-                geom_kv(TURBOSYM3_LAYOUT_TAG, *max_seq, k_turbo3_shape(k.as_ref())),
+                geom_kv(TURBOSYM3_LAYOUT_TAG, *max_seq, k_turbo_shape(k.as_ref())),
                 seq,
             ))
         }
@@ -748,10 +748,10 @@ fn write_layer(
         // Both axes use TurboQuant 4-bit; K is `QuantKTurbo4` (not `QuantK`).
         // Geometry tag is `TURBOSYM4_LAYOUT_TAG` = "tsym4_lloyd_4_4".
         KvStorage::TurboSym4 { k, v, max_seq } => {
-            let seq = write_quant_k_turbo4(idx, k.as_ref(), device, out)?;
+            let seq = write_quant_k_turbo(idx, k.as_ref(), device, out)?;
             write_quant_v(idx, v.as_ref(), device, out)?;
             Ok((
-                geom_kv(TURBOSYM4_LAYOUT_TAG, *max_seq, k_turbo4_shape(k.as_ref())),
+                geom_kv(TURBOSYM4_LAYOUT_TAG, *max_seq, k_turbo_shape(k.as_ref())),
                 seq,
             ))
         }
@@ -950,78 +950,26 @@ fn write_layer(
     }
 }
 
-/// Capture shape of a `QuantKTurbo3` for geometry serialization.
-fn k_turbo3_shape(k: Option<&QuantKTurbo3>) -> Vec<i32> {
+/// Capture shape of a turbo K store for geometry serialization.
+fn k_turbo_shape<const BITS: u8>(k: Option<&QuantKTurbo<BITS>>) -> Vec<i32> {
     k.map(|q| q.shape.clone()).unwrap_or_default()
 }
 
-/// Write a `QuantKTurbo3` (TurboQuant 3-bit) on the K side. Returns seq length.
+/// Write a turbo K store on the K side, at either code width. Returns seq
+/// length.
 ///
-/// Mirrors `write_quant_k_turbo4` exactly — identical codes/scales layout;
-/// only the bit-width differs. Trims GPU buffers to the filled prefix (C3 trim).
+/// The wire layout is the same at both widths — `u32` codes plus `f32` scales,
+/// or the CPU `TurboBlocks` when no GPU mirror is live — so the width only
+/// changes how many code words a token occupies, which the store already
+/// carries in `gpu_words_per_step`. Trims GPU buffers to the filled prefix
+/// (C3 trim).
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
 )]
-fn write_quant_k_turbo3(
+fn write_quant_k_turbo<const BITS: u8>(
     idx: usize,
-    k: Option<&QuantKTurbo3>,
-    device: Device,
-    out: &mut Vec<(String, OwnedTensor)>,
-) -> Result<i32> {
-    let Some(qk) = k else { return Ok(0) };
-    if let (Some(codes), Some(scales)) = (&qk.gpu_codes_buf, &qk.gpu_scales_buf) {
-        let prev_seq = qk.shape[2];
-        let filled_codes = prev_seq * qk.gpu_words_per_step;
-        let filled_scales = prev_seq * qk.gpu_scales_per_step;
-        let codes_trimmed = if filled_codes < codes.shape()[0] {
-            codes.slice(&[0], &[filled_codes], &[1], device)?
-        } else {
-            codes.try_clone()?
-        };
-        let scales_trimmed = if filled_scales < scales.shape()[0] {
-            scales.slice(&[0], &[filled_scales], &[1], device)?
-        } else {
-            scales.try_clone()?
-        };
-        out.push((
-            format!("l{idx}.k.codes"),
-            OwnedTensor::from_array(&codes_trimmed)?,
-        ));
-        out.push((
-            format!("l{idx}.k.scales"),
-            OwnedTensor::from_array(&scales_trimmed)?,
-        ));
-    } else {
-        let mut codes = Vec::new();
-        let mut scales = Vec::new();
-        for b in &qk.blocks {
-            codes.extend_from_slice(&b.codes);
-            scales.extend_from_slice(&b.scales);
-        }
-        out.push((format!("l{idx}.k.codes"), OwnedTensor::from_u8(&codes)));
-        out.push((format!("l{idx}.k.scales"), OwnedTensor::from_f32(&scales)));
-    }
-    Ok(qk.shape[2])
-}
-
-/// Capture shape of a `QuantKTurbo4` for geometry serialization.
-fn k_turbo4_shape(k: Option<&QuantKTurbo4>) -> Vec<i32> {
-    k.map(|q| q.shape.clone()).unwrap_or_default()
-}
-
-/// Write a `QuantKTurbo4` (TurboQuant 4-bit) on the K side. Returns seq length.
-///
-/// Mirrors `write_quant_v` exactly — identical layout (`gpu_codes_buf` u32 +
-/// `gpu_scales_buf` f32 + CPU `blocks: Vec<TurboBlocks>`). Trims GPU buffers
-/// to the filled prefix before serialising (C3 trim).
-#[allow(
-    clippy::indexing_slicing,
-    reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-)]
-fn write_quant_k_turbo4(
-    idx: usize,
-    k: Option<&QuantKTurbo4>,
+    k: Option<&QuantKTurbo<BITS>>,
     device: Device,
     out: &mut Vec<(String, OwnedTensor)>,
 ) -> Result<i32> {
@@ -2215,10 +2163,10 @@ fn read_layer(st: &SafeTensors<'_>, idx: usize, geom: &str, device: Device) -> R
         }
         // TurboSym3 — symmetric 3-bit Lloyd-Max K + turbo3 V. Match against the canonical
         // layout tag constant.
-        tag if tag == TURBOSYM3_LAYOUT_TAG => read_tsym3(st, idx, geom),
+        tag if tag == TURBOSYM3_LAYOUT_TAG => read_tsym(st, idx, geom, TURBO_K3_BITS),
         // TurboSym4 — symmetric 4-bit Lloyd-Max K + tq4 V. Match against the canonical
         // layout tag constant.
-        tag if tag == TURBOSYM4_LAYOUT_TAG => read_tsym4(st, idx, geom),
+        tag if tag == TURBOSYM4_LAYOUT_TAG => read_tsym(st, idx, geom, TURBO_K4_BITS),
         // PlanarK — K-only payload (codes/scales/rotations); V is bf16
         // off-storage. Match against the canonical layout tag constant.
         tag if tag == PLANARK4_LAYOUT_TAG => {
@@ -2438,64 +2386,49 @@ fn parse_v_suffix(rest: &str) -> Option<(u8, u16)> {
     Some((bits, group))
 }
 
-/// Hydrate a `KvStorage::TurboSym3` from a `"tsym3_lloyd_3_3"`-tagged geometry.
-/// Mirrors `read_tsym4` exactly but for 3-bit codes.
-fn read_tsym3(st: &SafeTensors<'_>, idx: usize, geom: &str) -> Result<KvStorage> {
+/// Hydrate a symmetric turbo `KvStorage` from a `"tsym{3,4}_lloyd_*"`-tagged
+/// geometry.
+///
+/// `bits` is the width the caller read off the layout tag. It is a runtime
+/// argument and not a const generic because the two widths land in two
+/// `KvStorage` variants, and only this fn knows which one to build.
+fn read_tsym(st: &SafeTensors<'_>, idx: usize, geom: &str, bits: u8) -> Result<KvStorage> {
     let max_seq = geom_i32(geom, "max_seq")?;
     let shape = geom_shape(geom)?;
-    Ok(KvStorage::TurboSym3 {
-        k: Some(read_quant_k_turbo3(st, idx, &shape, max_seq)?),
-        v: Some(read_quant_v(st, idx, &shape)?),
-        max_seq,
-    })
+    let v = Some(read_quant_v(st, idx, &shape)?);
+    match bits {
+        TURBO_K3_BITS => Ok(KvStorage::TurboSym3 {
+            k: Some(read_quant_k_turbo::<TURBO_K3_BITS>(
+                st, idx, &shape, max_seq,
+            )?),
+            v,
+            max_seq,
+        }),
+        TURBO_K4_BITS => Ok(KvStorage::TurboSym4 {
+            k: Some(read_quant_k_turbo::<TURBO_K4_BITS>(
+                st, idx, &shape, max_seq,
+            )?),
+            v,
+            max_seq,
+        }),
+        other => Err(Error::Mlx(format!(
+            "read_tsym: layout tag claims {other}-bit symmetric turbo, and the codec ships \
+             3-bit and 4-bit only"
+        ))),
+    }
 }
 
-/// Hydrate a CPU-path `QuantKTurbo3` from serialized codes + scales tensors.
-/// Mirrors `read_quant_k_turbo4` exactly: same on-disk layout (`u8` codes +
-/// `f32` scales packed via `TurboBlocks`), 3-bit width.
+/// Hydrate a CPU-path turbo K store from serialized codes + scales tensors, at
+/// either code width.
 ///
-/// Note: tensors loaded from safetensors are pre-materialized byte-buffers;
-/// `.to_bytes()` is sufficient — no separate graph-eval step needed.
-fn read_quant_k_turbo3(
+/// `max_seq` is the provisioned window the geometry recorded, forwarded so the
+/// hydrated store restores the window it was spilled with rather than `0`.
+fn read_quant_k_turbo<const BITS: u8>(
     st: &SafeTensors<'_>,
     idx: usize,
     shape: &[i32],
     max_seq: i32,
-) -> Result<QuantKTurbo3> {
-    let codes_t = tensor_req(st, &format!("l{idx}.k.codes"))?;
-    let scales_t = tensor_req(st, &format!("l{idx}.k.scales"))?;
-    let block = TurboBlocks {
-        codes: codes_t.to_bytes()?,
-        scales: tensor_to_f32(&scales_t, "scales_t")?,
-        original_shape: shape4(shape),
-        bits: 3,
-    };
-    Ok(QuantKTurbo3::from_cpu_blocks(
-        vec![block],
-        shape.to_vec(),
-        3,
-        max_seq,
-    ))
-}
-
-/// Hydrate a `KvStorage::TurboSym4` from a `"tsym4_lloyd_4_4"`-tagged geometry.
-/// Mirrors `read_quant_v` for the V side, and uses [`read_quant_k_turbo4`]
-/// for the K side (identical TurboQuant codes/scales layout, different Rust
-/// type).
-fn read_tsym4(st: &SafeTensors<'_>, idx: usize, geom: &str) -> Result<KvStorage> {
-    let max_seq = geom_i32(geom, "max_seq")?;
-    let shape = geom_shape(geom)?;
-    Ok(KvStorage::TurboSym4 {
-        k: Some(read_quant_k_turbo4(st, idx, &shape)?),
-        v: Some(read_quant_v(st, idx, &shape)?),
-        max_seq,
-    })
-}
-
-/// Hydrate a CPU-path `QuantKTurbo4` from serialized codes + scales tensors.
-/// Mirrors `read_quant_v` exactly: same on-disk layout (`u8` codes + `f32`
-/// scales packed via `TurboBlocks`).
-fn read_quant_k_turbo4(st: &SafeTensors<'_>, idx: usize, shape: &[i32]) -> Result<QuantKTurbo4> {
+) -> Result<QuantKTurbo<BITS>> {
     let codes_t = tensor_req(st, &format!("l{idx}.k.codes"))?;
     let scales_t = tensor_req(st, &format!("l{idx}.k.scales"))?;
     codes_t.eval()?;
@@ -2504,12 +2437,12 @@ fn read_quant_k_turbo4(st: &SafeTensors<'_>, idx: usize, shape: &[i32]) -> Resul
         codes: codes_t.to_bytes()?,
         scales: tensor_to_f32(&scales_t, "scales_t")?,
         original_shape: shape4(shape),
-        bits: 4,
+        bits: BITS,
     };
-    Ok(QuantKTurbo4::from_cpu_blocks(
+    Ok(QuantKTurbo::<BITS>::from_cpu_blocks(
         vec![block],
         shape.to_vec(),
-        4,
+        max_seq,
     ))
 }
 

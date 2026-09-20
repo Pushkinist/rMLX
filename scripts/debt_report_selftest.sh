@@ -824,8 +824,9 @@ text = open(update_path).read().replace("fn update_rotor", "fn update_affine_rot
 # population means removing the token, not moving it off the front.
 text = text.replace("fn update_iso", "fn update_quat")
 text = text.replace("fn iso_", "fn quat_")
-# The turbo update pattern is anchored, so moving it off the front is enough.
-text = text.replace("fn update_tsym", "fn decode_update_tsym")
+# The turbo update pattern keys on the codec token as a whole segment and not
+# on a prefix, so emptying that population means removing the token.
+text = text.replace("fn update_tsym", "fn update_sym_lloyd")
 open(update_path, "w").write(text)
 
 # The SSD pattern keys on the codec token and admits no width digit, so
@@ -899,7 +900,7 @@ TURBO_EMPTY_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-li
 TURBO_EMPTY_UPDATES_STATUS=$?
 
 check "matched_lines_turbo_updates_empty_unavailable" \
-    "renaming every update_tsym* fn off the front of the prefix empties the population: unavailable, not 0" \
+    "renaming the codec token out of every update_tsym* fn empties the population: unavailable, not 0 — moving it off the front would not, since the pattern matches the token wherever in the name it sits" \
     contains "debt-report --matched-lines turbo-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs: population is empty)" \
     TURBO_EMPTY_UPDATES_ML
 

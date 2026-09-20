@@ -136,10 +136,9 @@ const SHAPE_B: (i32, i32) = (4, 96);
 /// payload type (`TurboBlocks`) and the same header fields, so one body covers
 /// both axes.
 ///
-/// A macro, not a fn: `QuantKTurbo3`, `QuantKTurbo4` and `QuantV` are three
-/// distinct types today, so one fn cannot take them all. When the two K stores
-/// become one const-generic type this shrinks to two arms — which is the point
-/// of the exercise.
+/// A macro, not a fn: the K store is `QuantKTurbo<BITS>` and the V store is
+/// `QuantV`, two unrelated types, so one fn cannot take both. The two K widths
+/// are one type since the K-storage collapse and need no arm of their own.
 macro_rules! push_turbo {
     ($out:expr, $side:expr, $store:expr) => {{
         let s = $store;

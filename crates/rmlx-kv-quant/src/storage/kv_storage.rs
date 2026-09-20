@@ -1313,7 +1313,7 @@ impl KvStorage {
                 },
                 max_seq: *max_seq,
             },
-            // TurboSym3 — deep-clone both QuantKTurbo3 + QuantV (bits=3).
+            // TurboSym3 — deep-clone both the 3-bit turbo K store and QuantV.
             Self::TurboSym3 { k, v, max_seq } => Self::TurboSym3 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),
@@ -1325,7 +1325,7 @@ impl KvStorage {
                 },
                 max_seq: *max_seq,
             },
-            // TurboSym4 — deep-clone both QuantKTurbo4 + QuantV.
+            // TurboSym4 — deep-clone both the 4-bit turbo K store and QuantV.
             Self::TurboSym4 { k, v, max_seq } => Self::TurboSym4 {
                 k: match k {
                     Some(qk) => Some(qk.try_deep_clone()?),

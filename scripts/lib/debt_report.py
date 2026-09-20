@@ -94,12 +94,18 @@ KV_SSD_BLOCK_IO_FILE = "crates/rmlx-kv-ssd/src/block_io.rs"
 # it belongs to.
 ROTOR_UPDATE_FN_PATTERN = r"^update_rotor"
 ISO_UPDATE_FN_PATTERN = r"(^|_)iso(\d|_|$)"
-# The symmetric turbo entries only. The same file carries two further width
-# pairs — `update_k8vturbo3` / `update_k8vturbo2` and their TCQ siblings — that
-# a `(turbo|tsym)` pattern would fold in; those are a different family's twins
-# and are not what the turbo K-storage collapse removes, so the population that
-# has to read a measured 0 after it is anchored on the entries that do.
-TURBO_UPDATE_FN_PATTERN = r"^update_tsym"
+# The symmetric turbo entries and the bodies they enter, and nothing else. The
+# same file carries two further width pairs — `update_k8vturbo3` /
+# `update_k8vturbo2` and their TCQ siblings — that a `(turbo|tsym)` pattern
+# would fold in; those are a different family's twins and are not what the
+# turbo K-storage collapse removes, so the population that has to read a
+# measured 0 after it names only the `tsym` token. The token is matched as a
+# whole segment rather than as a prefix, because the collapsed entry
+# (`update_tsym`) and the width-parametric body it enters (`tsym_update`) spell
+# it on opposite sides of the name: an anchored `^update_tsym` would see the
+# entry and not the body, and a re-split of that body into two width bodies
+# would then be invisible to this counter.
+TURBO_UPDATE_FN_PATTERN = r"(^|_)tsym(\d|_|$)"
 # No digit in the pattern: after the collapse the SSD helpers lose their width
 # suffix, and a digit-bearing pattern would find nothing and report the
 # population unavailable rather than a measured 0.
