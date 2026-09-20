@@ -7,15 +7,16 @@ they can be reloaded on subsequent requests without a full re-prefill.
 > **Crate ownership:** The SSD tier lives in the workspace member crate
 > **`rmlx-kv-ssd`** — `crates/rmlx-kv-ssd/`. It owns the index, spill,
 > hydrate, block-I/O, layout-key salt, the 5 Prometheus hook globals, the
-> `SsdHydrate<E>` trait, the chained FNV-1a-64 block-digest helpers
+> `SsdHydrate<E>` and `HydratedEntry` traits with the one blanket impl that
+> joins them, the chained FNV-1a-64 block-digest helpers
 > (`BLOCK_TOKENS`, `chained_block_hashes`, `chained_block_hashes_seeded`,
 > `FNV_OFFSET`, `FNV_PRIME`) and the `cache_seed` those helpers are seeded
 > with — which the RAM prompt cache in `rmlx-models` re-exports rather than
 > redefines, so both tiers hash under one formula. The per-arch
 > `attach_ssd_tier` dispatcher
 > (Gemma4 / Qwen3 / Qwen3.5-MoE) stays in `rmlx-models::ssd_tier` because the
-> arch-specific `SsdHydrate<Entry>` / `SpillSink<Entry>` impls live in
-> `rmlx-models`. Dep edge: `rmlx-models → rmlx-kv-ssd → rmlx-kv-quant`
+> arch-specific `SpillSink<Entry>` impls and the per-arch `HydratedEntry`
+> impls live in `rmlx-models`. Dep edge: `rmlx-models → rmlx-kv-ssd → rmlx-kv-quant`
 > (acyclic; no back-edge).
 
 ## Overview
@@ -534,8 +535,9 @@ Phase 5 — SQLite touch
 
 The hydrated block is returned as a `HydratedBlock` containing the matched
 token-ID prefix (`block_count * 256` tokens) and reconstructed `Vec<KvCache>` +
-`Vec<LinearAttnCache>`. The arch impl wraps this into its concrete prompt-cache
-entry type.
+`Vec<LinearAttnCache>`. The blanket impl hands it to the arch entry's
+`HydratedEntry::from_hydrated`, which is where it becomes a concrete
+prompt-cache entry.
 
 Corruption is always handled as a graceful miss: the bad file and row are
 deleted, a `warn!` is emitted, and the caller falls through to a full prefill.
@@ -543,43 +545,49 @@ The hydrator never panics.
 
 ### The per-arch entry impls
 
-`SsdHydrate<E>` is implemented once per arch entry type, on `SsdHydrator`.
-There are eight blocks. Seven cover pure-attention entries and one covers the
-hybrid entry.
+`SsdHydrate<E>` has one production implementation: the blanket
+`impl<E: HydratedEntry> SsdHydrate<E> for SsdHydrator` in
+`crates/rmlx-kv-ssd/src/traits.rs`. It runs the probe, and hands the restored
+block to `E::from_hydrated` under the arch's own `E::SHARES_KV`. Each arch
+entry writes that one short impl and nothing else. The hybrid entry is one of
+them: it keeps the block's `lin_caches`, the seven pure-attention entries drop
+them.
 
-The table below is the **pre-collapse baseline**. It records what the seam
-looked like before the blanket impl landed, so a later reader can check the
-duplication figure against the bodies it was measured over.
-
-| File | `hydrate` body lines |
-|---|---|
-| `crates/rmlx-models/src/bitnet/prompt_cache.rs` | 27 |
-| `crates/rmlx-models/src/gemma3/prompt_cache.rs` | 27 |
-| `crates/rmlx-models/src/gemma4/prompt_cache.rs` | 28 |
-| `crates/rmlx-models/src/laguna/prompt_cache.rs` | 27 |
-| `crates/rmlx-models/src/qwen2/prompt_cache.rs` | 27 |
-| `crates/rmlx-models/src/qwen3.rs` | 29 |
-| `crates/rmlx-models/src/qwen3_vl_moe/prompt_cache.rs` | 27 |
-| `crates/rmlx-models/src/qwen3_5_moe/prompt_cache.rs` | 29 (hybrid) |
-
-The seven pure-attention bodies are one body. Four of them — laguna, gemma3,
-bitnet and qwen2 — are byte-identical once the arch name is removed from their
-identifiers. `qwen3_vl_moe` differs from them by one comment line, and `qwen3`
-by two lines, because `Qwen3Entry` carries a `first_logprobs` field the other
-entries do not. `gemma4` differs by eleven lines, but only one of them
-matters: it passes its own `SHARES_KV_ACROSS_LAYERS` where the other six pass
-a literal `false`.
-
-`scripts/debt_report.sh` has no population over these bodies. Measured by hand
-with the same producer the rotor populations use
-(`scripts/lib/debt_report.py`'s `normalize` + `matched_lines`, all pairs, one
-family):
-
-```text
-ssd hydrate twins (crates/rmlx-models/src): 670 matched lines over 221 body lines (8 item(s), 28 pair(s))
+```rust
+pub trait HydratedEntry: Sized {
+    /// The arch's `SHARES_KV_ACROSS_LAYERS`.
+    const SHARES_KV: bool;
+    fn from_hydrated(block: HydratedBlock, block_hashes: Vec<u64>, kv_quant: KvQuant) -> Self;
+}
 ```
 
-### Where the shared body can live
+The eight `impl HydratedEntry` blocks:
+
+| File | Entry |
+|---|---|
+| `crates/rmlx-models/src/bitnet/prompt_cache.rs` | `BitNetEntry` |
+| `crates/rmlx-models/src/gemma3/prompt_cache.rs` | `Gemma3Entry` |
+| `crates/rmlx-models/src/gemma4/prompt_cache.rs` | `Gemma4Entry` |
+| `crates/rmlx-models/src/laguna/prompt_cache.rs` | `LagunaEntry` |
+| `crates/rmlx-models/src/qwen2/prompt_cache.rs` | `Qwen2Entry` |
+| `crates/rmlx-models/src/qwen3.rs` | `Qwen3Entry` |
+| `crates/rmlx-models/src/qwen3_vl_moe/prompt_cache.rs` | `Qwen3VlMoeEntry` |
+| `crates/rmlx-models/src/qwen3_5_moe/prompt_cache.rs` | `Qwen35MoeEntry` (hybrid) |
+
+`Qwen3Entry` sets `first_logprobs: None` on top of what the other
+pure-attention entries set. Every entry sets `is_ssd_hydrated: true` and the
+sentinel `first_id` / `first_piece`. Each destructures `HydratedBlock` rather
+than reading its fields, so a field added to the block is a compile error at
+every arch instead of a silent drop at seven of them.
+
+Every entry's `SHARES_KV` names its own arch's `SHARES_KV_ACROSS_LAYERS`, the
+same const `Architecture::shares_kv_across_layers` dispatches. Today gemma4 is
+the only arch whose value is `true`. Hard-coding either value in the shared
+body would be right for one arch and silently wrong for the other: a
+hard-coded `false` drops a bf16 mirror gemma4 reads after a tail extension, a
+hard-coded `true` builds a mirror no other arch reads.
+
+### Where the shared body lives
 
 A blanket `impl<E: …> SsdHydrate<E> for SsdHydrator` **cannot** live in
 `rmlx-models`. Both `SsdHydrate` and `SsdHydrator` are foreign there, and the
@@ -612,36 +620,40 @@ blanket carries no semver obligation to an outside implementor. It is an
 internal bridge, the same status `HydratedBlock` already records in its
 `exhaustive_structs` allow.
 
-### What a shared body must still express
+### The duplication this replaced
 
-The obvious sketch — `fn from_layers(layers: Vec<KvCache>, tokens: Vec<u32>)`
-on a pure-attention-only trait — cannot carry everything the eight bodies set,
-and it leaves the hybrid entry outside as a hand-written exception.
+The table below is the **pre-collapse baseline**. It records what the seam
+looked like before the blanket impl landed, so a later reader can check the
+duplication figure against the bodies it was measured over.
 
-One constructor over the whole block carries all of it and collapses all
-eight:
+| File | `hydrate` body lines |
+|---|---|
+| `crates/rmlx-models/src/bitnet/prompt_cache.rs` | 27 |
+| `crates/rmlx-models/src/gemma3/prompt_cache.rs` | 27 |
+| `crates/rmlx-models/src/gemma4/prompt_cache.rs` | 28 |
+| `crates/rmlx-models/src/laguna/prompt_cache.rs` | 27 |
+| `crates/rmlx-models/src/qwen2/prompt_cache.rs` | 27 |
+| `crates/rmlx-models/src/qwen3.rs` | 29 |
+| `crates/rmlx-models/src/qwen3_vl_moe/prompt_cache.rs` | 27 |
+| `crates/rmlx-models/src/qwen3_5_moe/prompt_cache.rs` | 29 (hybrid) |
 
-```rust
-pub trait HydratedEntry: Sized {
-    /// The arch's `SHARES_KV_ACROSS_LAYERS`.
-    const SHARES_KV: bool;
-    fn from_hydrated(block: HydratedBlock, block_hashes: Vec<u64>, kv_quant: KvQuant) -> Self;
-}
+The seven pure-attention bodies were one body. Four of them — laguna, gemma3,
+bitnet and qwen2 — were byte-identical once the arch name was removed from
+their identifiers. `qwen3_vl_moe` differed by one comment line, and `qwen3` by
+two, because `Qwen3Entry` carries a `first_logprobs` field the other entries
+do not. `gemma4` differed by eleven lines, but only one of them mattered: it
+passed its own `SHARES_KV_ACROSS_LAYERS` where the other six passed a literal
+`false`.
+
+`scripts/debt_report.sh --matched-lines ssd-hydrate` is the one producer of
+the figure. The population is a glob plus a name rule — every non-test fn
+under `crates/rmlx-models/src` named exactly `hydrate` or exactly
+`from_hydrated` — so one command measures both tree shapes:
+
+```text
+before: ssd hydrate twins (crates/rmlx-models/src): 670 matched lines over 221 body lines (8 item(s), 28 pair(s))
+after:  ssd hydrate twins (crates/rmlx-models/src): 472 matched lines over 148 body lines (8 item(s), 28 pair(s))
 ```
-
-The hybrid entry reads `block.lin_caches`; the seven pure-attention entries
-drop it. `Qwen3Entry` sets `first_logprobs: None` in its own body. Every entry
-sets `is_ssd_hydrated: true` and the sentinel `first_id` / `first_piece`
-there too. No arch keeps a hand-written `SsdHydrate` impl.
-
-The cross-layer-KV topology is not a field of the entry. It is an argument of
-`SsdHydrator::lookup_seeded`, and it lands on every restored `KvCache`. Today
-gemma4 is the only arch that passes `true`;
-`Architecture::shares_kv_across_layers` already dispatches the same fact for
-other callers. The associated `const` is what keeps the shared body from
-hard-coding either value. A hard-coded `false` drops a bf16 mirror gemma4
-reads after a tail extension. A hard-coded `true` builds a mirror no other
-arch reads.
 
 ### Invariants — what the change must not move
 
@@ -662,13 +674,13 @@ arch reads.
 
 ### The oracle
 
-`crates/rmlx-models/src/ssd_hydrate_tests.rs` reads the entry the arch impl
-returns. Twelve tests, all on `Device::Cpu`, none `#[ignore]`. The whole
+`crates/rmlx-models/src/ssd_hydrate_tests.rs` reads the entry the blanket impl
+returns. Fourteen tests, all on `Device::Cpu`, none `#[ignore]`. The whole
 spill/hydrate chain is device-parameterised, so no test here takes a Metal
 context.
 
 Each fixture spills a known block under a unique namespace below
-`rmlx_core::paths::kv_cache_dir`, then hydrates it back through the arch impl
+`rmlx_core::paths::kv_cache_dir`, then hydrates it back as the arch's entry
 and compares per-layer FNV-1a-64 digests of the K and V dequants. The digests
 are round-trip, not literal constants, so a codec change does not turn them
 red. Every fixture first asserts its own layers are pairwise distinguishable,
@@ -683,11 +695,18 @@ the fixture removes its directory on drop.
 
 Coverage is every entry that hydrates, and the file does not take that on
 trust. `every_arch_that_hydrates_has_a_fixture_here` scans the crate's
-non-test sources for `impl SsdHydrate<E>` blocks — skipping test paths the
-same way `scripts/lib/debt_report.py` does — and fails, naming the type, for
-any `E` this file never mentions. A ninth arch that adds an impl and no
+non-test sources for `impl HydratedEntry for E` blocks — skipping test paths
+the same way `scripts/lib/debt_report.py` does — and fails, naming the type,
+for any `E` this file never mentions. A ninth arch that adds an impl and no
 fixture is red rather than silent. The needles are built from the scanned
 name, so nothing written in the file can satisfy one by accident.
+
+`every_hydrating_entry_has_a_topology_assertion` runs the same scan for the
+other coverage question: every entry the tree hydrates must be read by
+`every_entry_declares_its_archs_cross_layer_kv_topology`, which holds each
+`E::SHARES_KV` to that arch's own `SHARES_KV_ACROSS_LAYERS` — the const the
+arms of `Architecture::shares_kv_across_layers` return. A ninth arch whose
+entry declares a topology its arch does not run is red, by name.
 
 Eight entries, eight fixtures: `LagunaEntry` at `kv_h == 1`, `Qwen2Entry` at
 `kv_h == 1`, `Gemma3Entry` at `kv_h == 2`, `Qwen3Entry` at `kv_h == 4`,
@@ -702,8 +721,9 @@ would be the duplication this work exists to retire.
 **Cost.** None that is measurable. On an idle machine, three rounds each:
 the `rmlx-models` lib suite runs in 29.8–30.2 s without these tests and
 29.9–30.0 s with them. The file on its own also takes 29.7 s, which is the
-same fixed per-binary cost showing through — the twelve tests' own work does
-not rise above the noise.
+same fixed per-binary cost showing through — the tests' own work does not rise
+above the noise. The two topology tests added with the collapse read consts
+and scan the source tree; neither touches a device.
 
 Measure this on a quiet machine or not at all. An earlier reading of the same
 pair, taken while several `cargo` jobs of a mutation run were competing for
@@ -725,32 +745,35 @@ Each mutation was applied by hand to the current tree, run, and reverted.
 | The reconstruction swaps the per-layer shape terms (`offset` against `layer_idx`) | the digest folds `seq_len`; red at both `kv_h == 1` and `kv_h > 1` | red |
 | The probe moves the layout key | `a_block_does_not_hydrate_under_a_different_layout_key`, which keeps the seed that just hit so the key is the only term that moved | red |
 | The hybrid entry loses its linear state | `qwen3_5_moe_entry_restores_the_linear_state_beside_the_kv` | red |
-| gemma4's body hard-codes the topology flag to `false` | `each_arch_hydrates_under_its_own_cross_layer_kv_topology` | red |
+| The shared body hard-codes the topology flag to `false` | `each_arch_hydrates_under_its_own_cross_layer_kv_topology` | red |
 | The body clears `is_ssd_hydrated` | the flag assertion in every entry test | red |
 | The `layout_key` salt changes | the value pin in `crates/rmlx-kv-ssd/src/ssd_tier_tests.rs` | red |
 | The `cache_seed` formula changes | the value pin in `crates/rmlx-kv-ssd/src/hashing_tests.rs` | red |
 | The index stops matching rows on the layout key (its `AND layout_key = ?` clause deleted) | `a_block_does_not_hydrate_under_a_different_layout_key` | red |
 | An entry impl that had no fixture is wrong (`Qwen2Entry`, `Gemma3Entry`, `Qwen3VlMoeEntry` each drop a layer) | that arch's own `round_trip` fixture | red |
-| A ninth arch adds an `impl SsdHydrate<…>` and no fixture | `every_arch_that_hydrates_has_a_fixture_here` | red |
-| A new arch declares the wrong `SHARES_KV` | none | **green — see below** |
+| A ninth arch adds an `impl HydratedEntry` and no fixture | `every_arch_that_hydrates_has_a_fixture_here` | red |
+| An arch declares a `SHARES_KV` its own arch does not run | `every_entry_declares_its_archs_cross_layer_kv_topology` | red |
+| A ninth arch declares a `SHARES_KV` nothing reads | `every_hydrating_entry_has_a_topology_assertion` | red |
+| The blanket impl reads a literal instead of `E::SHARES_KV` | `each_arch_hydrates_under_its_own_cross_layer_kv_topology` | red |
+| An entry drops a field from its `HydratedBlock` destructure | the compiler — the destructure is exhaustive | red |
 
 ### The mutation the oracle cannot catch
 
-A new arch that declares the wrong `SHARES_KV`.
+Nothing here reads the **consequence** of the topology flag.
 
-The topology pair reads gemma4 against laguna, and a `const` block above it
-refuses to compile if those two ever stop spanning both values. Neither
-covers a ninth arch. Its fixture is compulsory — the census makes sure of
-that — and its layers, tokens and flag all get read, but nothing compares its
-topology constant against the arch's own `SHARES_KV_ACROSS_LAYERS`. The two
-can disagree and every test passes.
+The topology pair reads `KvCache::shares_kv` off the restored caches, one
+level above the bytes. What the flag decides — the `exit_prefill` gate a tail
+extension re-runs, and the bf16 mirror it does or does not build — needs a
+cache that is extended after the hydrate, which no test in this file does.
+Each arm therefore compares its restored layers first, so the flag is never
+the only thing read; but a change that kept every flag right and broke what
+the gate does with it would pass here.
 
-What would close it is a test over the entry trait itself, asserting
-`E::SHARES_KV` equals what `Architecture::shares_kv_across_layers` returns for
-that arch. The constant does not exist until the collapse lands, so that test
-belongs to the change that introduces it.
-
-Two gaps that used to sit here are closed. An entry impl no test read is
+Three gaps that used to sit here are closed. A new arch declaring the wrong
+`SHARES_KV` is now red: the constant exists, and
+`every_entry_declares_its_archs_cross_layer_kv_topology` reads it against the
+arch's own const, with `every_hydrating_entry_has_a_topology_assertion`
+keeping that table complete from the tree. An entry impl no test read is
 covered now: `Gemma3Entry`, `Qwen2Entry` and `Qwen3VlMoeEntry` have fixtures,
 and dropping a layer in any of the three is red. The digest-salt gap is closed
 by two value pins — before them, no test anywhere pinned the **output** of

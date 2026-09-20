@@ -1,4 +1,5 @@
-//! Oracle for the per-arch `impl SsdHydrate<Entry> for SsdHydrator` blocks.
+//! Oracle for the per-arch `impl HydratedEntry for Entry` blocks and the one
+//! blanket `impl SsdHydrate<E> for SsdHydrator` they are read through.
 //!
 //! ## What these tests read
 //!
@@ -73,8 +74,8 @@ use rmlx_mlx::{Array, Device};
 
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
 use rmlx_kv_ssd::{
-    cache_seed, chained_block_hashes_seeded, hash_to_hex, write_caches, SsdHydrate, SsdHydrator,
-    SsdKvIndex, BLOCK_TOKENS,
+    cache_seed, chained_block_hashes_seeded, hash_to_hex, write_caches, HydratedEntry, SsdHydrate,
+    SsdHydrator, SsdKvIndex, BLOCK_TOKENS,
 };
 
 use crate::bitnet::prompt_cache::BitNetEntry;
@@ -663,7 +664,7 @@ fn the_entry_carries_the_blocks_tokens_not_the_requests() {
 /// Every arch that hydrates has a fixture in this file.
 ///
 /// The eight entry types are read out of the tree, not listed here. A ninth
-/// arch that adds an `impl SsdHydrate<…>` and no fixture fails this test with
+/// arch that adds an `impl HydratedEntry` and no fixture fails this test with
 /// its own name in the message, instead of joining the three entries that sat
 /// uncovered until the mutation run found them.
 ///
@@ -674,9 +675,9 @@ fn the_entry_carries_the_blocks_tokens_not_the_requests() {
 /// its entry type, in a turbofish or in a binding, for the name to be found.
 ///
 /// The scan skips test sources the same way `scripts/lib/debt_report.py` does:
-/// a `tests` path component, a `tests.rs`, or a `*_tests.rs`. The mock impls
-/// in `prompt_cache_tests.rs` and `qwen3_tests.rs` are therefore out, and this
-/// file is out of its own scan.
+/// a `tests` path component, a `tests.rs`, or a `*_tests.rs`. A test entry
+/// that implements the trait is therefore out, and this file is out of its own
+/// scan.
 #[test]
 #[allow(
     clippy::expect_used,
@@ -715,7 +716,7 @@ fn every_arch_that_hydrates_has_a_fixture_here() {
     );
 }
 
-/// Push the `E` of every `impl SsdHydrate<E> for …` in the non-test sources
+/// Push the `E` of every `impl HydratedEntry for E` in the non-test sources
 /// under `dir` onto `out`.
 #[allow(
     clippy::expect_used,
@@ -736,15 +737,113 @@ fn collect_hydrate_impls(dir: &std::path::Path, out: &mut Vec<String>) {
         }
         let text = std::fs::read_to_string(&path).expect("read source file");
         for line in text.lines() {
-            let Some(rest) = line.trim_start().strip_prefix("impl SsdHydrate<") else {
+            let Some(rest) = line.trim_start().strip_prefix("impl HydratedEntry for ") else {
                 continue;
             };
-            let Some(ty) = rest.split_once('>').map(|(ty, _)| ty) else {
+            let Some(ty) = rest.split_whitespace().next() else {
                 continue;
             };
             out.push(ty.to_owned());
         }
     }
+}
+
+// ── the topology constant every entry declares ──────────────────────
+
+/// Each entry's `SHARES_KV` is its own arch's `SHARES_KV_ACROSS_LAYERS`.
+///
+/// The blanket impl hands `E::SHARES_KV` to the probe, so this constant is
+/// what decides the topology every restored cache carries. The gemma4/laguna
+/// pair above reads the two values a hydrate can be built under; it says
+/// nothing about a ninth arch whose constant disagrees with its own arch. The
+/// same per-arch consts are the arms of `Architecture::shares_kv_across_layers`
+/// in `crates/rmlx-models/src/arch/mod.rs`, which is what every other caller
+/// of this fact dispatches through, so an entry held to its arch's const is
+/// held to what the rest of the engine reads. That accessor takes a loaded
+/// model, which no test on this file's budget can build, and the consts are
+/// what it returns.
+#[test]
+fn every_entry_declares_its_archs_cross_layer_kv_topology() {
+    for (entry, declared, arch) in [
+        (
+            "BitNetEntry",
+            <BitNetEntry as HydratedEntry>::SHARES_KV,
+            crate::bitnet::SHARES_KV_ACROSS_LAYERS,
+        ),
+        (
+            "Gemma3Entry",
+            <Gemma3Entry as HydratedEntry>::SHARES_KV,
+            crate::gemma3::SHARES_KV_ACROSS_LAYERS,
+        ),
+        (
+            "Gemma4Entry",
+            <Gemma4Entry as HydratedEntry>::SHARES_KV,
+            crate::gemma4::SHARES_KV_ACROSS_LAYERS,
+        ),
+        (
+            "LagunaEntry",
+            <LagunaEntry as HydratedEntry>::SHARES_KV,
+            crate::laguna::SHARES_KV_ACROSS_LAYERS,
+        ),
+        (
+            "Qwen2Entry",
+            <Qwen2Entry as HydratedEntry>::SHARES_KV,
+            crate::qwen2::SHARES_KV_ACROSS_LAYERS,
+        ),
+        (
+            "Qwen3Entry",
+            <Qwen3Entry as HydratedEntry>::SHARES_KV,
+            crate::qwen3::SHARES_KV_ACROSS_LAYERS,
+        ),
+        (
+            "Qwen35MoeEntry",
+            <Qwen35MoeEntry as HydratedEntry>::SHARES_KV,
+            crate::qwen3_5_moe::SHARES_KV_ACROSS_LAYERS,
+        ),
+        (
+            "Qwen3VlMoeEntry",
+            <Qwen3VlMoeEntry as HydratedEntry>::SHARES_KV,
+            crate::qwen3_vl_moe::SHARES_KV_ACROSS_LAYERS,
+        ),
+    ] {
+        assert_eq!(
+            declared, arch,
+            "{entry} hydrates under a topology its own arch does not run — \
+             a disagreement here builds or drops a bf16 mirror on every \
+             restored cache"
+        );
+    }
+}
+
+/// Every entry the tree hydrates is read by the test above.
+///
+/// The names come out of the tree, so a ninth arch that implements the trait
+/// and is left out of that list fails here with its own name, rather than
+/// carrying an unread constant. The needle is built from the scanned name, so
+/// nothing written in this file can satisfy one by accident.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test: a source tree this test cannot read is a broken checkout and must abort loudly"
+)]
+fn every_hydrating_entry_has_a_topology_assertion() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut entries = Vec::new();
+    collect_hydrate_impls(&src, &mut entries);
+    entries.sort();
+    entries.dedup();
+
+    let this_file = include_str!("ssd_hydrate_tests.rs");
+    let unread: Vec<&String> = entries
+        .iter()
+        .filter(|name| !this_file.contains(&format!("<{name} as HydratedEntry>::SHARES_KV")))
+        .collect();
+    assert!(
+        unread.is_empty(),
+        "these entries declare a SHARES_KV nothing reads against their arch: \
+         {unread:?}. Add each to the table in \
+         every_entry_declares_its_archs_cross_layer_kv_topology."
+    );
 }
 
 // ── the miss branch ─────────────────────────────────────────────────────────

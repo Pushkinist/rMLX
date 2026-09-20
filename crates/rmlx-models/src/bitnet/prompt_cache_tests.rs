@@ -92,7 +92,7 @@ fn non_hydrated_partial_is_not_reusable() {
 
 /// An SSD-hydrated entry carries placeholder first-token fields (`first_id == 0`,
 /// empty `first_piece`) and the `is_ssd_hydrated` flag set, mirroring exactly
-/// what `SsdHydrate::hydrate` constructs. The consume engine excludes such an
+/// what `HydratedEntry::from_hydrated` constructs. The consume engine excludes such an
 /// entry from the Exact fast path so the generate loop recomputes the real
 /// first token via re-prefill. Even as a strict prefix of a longer prompt it is
 /// declined here (the default hook returns `None`), so BitNet stays Exact-only.

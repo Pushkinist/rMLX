@@ -122,7 +122,7 @@ pub fn generate_greedy<'a>(
     // hard runtime gate: Qwen3.5-MoE must be on the ExactOnly policy. A wrong
     // policy here would expose the unsafe partial-prefix path on the GDN
     // `lin_caches` (see Qwen35MoeEntry docs). Compile-time would also fail at
-    // SsdHydrate impl resolution, but this catches a misconfigured arch table
+    // HydratedEntry impl resolution, but this catches a misconfigured arch table
     // before any cache lookup happens. A real (not debug_) assert so the
     // tripwire fires under release-perf too.
     assert_eq!(

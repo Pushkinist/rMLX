@@ -2593,7 +2593,9 @@ fn consume_miss_arms_that_are_not_degrades_still_name_their_branch() {
 //
 // The tests below need `ensure`, which is bounded on `SsdHydrator:
 // SsdHydrate<E>`. The SSD tier is never attached here, so this impl exists only
-// to satisfy that bound and is never called.
+// to satisfy that bound and is never called. It sits beside the blanket
+// `impl<E: HydratedEntry> SsdHydrate<E> for SsdHydrator` because `TestEntry`
+// does not implement `HydratedEntry`; making it do so is `E0119`.
 impl SsdHydrate<TestEntry> for SsdHydrator {
     fn hydrate(
         &self,

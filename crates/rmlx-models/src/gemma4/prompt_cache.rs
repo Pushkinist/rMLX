@@ -10,7 +10,9 @@
 //!   truncate / kv_bytes come from the trait defaults (pure-attention, no GDN).
 //!   The SSD spill path is the blanket `SpillSink<E> for SsdSpiller` in
 //!   `crate::prompt_cache` (pure-attention: `lin_caches()` is `&[]`).
-//! - `impl SsdHydrate<Gemma4Entry> for SsdHydrator`: pure-attention hydrate.
+//! - `impl HydratedEntry for Gemma4Entry`: what an SSD-restored block becomes
+//!   here (pure-attention: the block's `lin_caches` are discarded). The probe
+//!   itself is the blanket `SsdHydrate<E> for SsdHydrator` in `rmlx-kv-ssd`.
 //! - SWA helpers `can_truncate_to_block` / `is_strict_prefix_of` consumed by
 //!   `gemma4/generate.rs`'s `consume()` dispatch (/ B1 snapshot/restore).
 //!
@@ -28,13 +30,12 @@
 //! and is correct for wrapped SWA.
 
 use rmlx_core::error::Result;
-use rmlx_core::DispatchPolicy;
 
 use crate::prompt_cache::{
-    ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy, SsdHydrate, BLOCK_TOKENS,
+    ArchPromptCache, CacheStats, PromptCacheEntry, ReuseKind, ReusePolicy, BLOCK_TOKENS,
 };
 use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache};
-use rmlx_kv_ssd::{HydratedBlock, SsdHydrator};
+use rmlx_kv_ssd::{HydratedBlock, HydratedEntry};
 
 // ---------------------------------------------------------------------------
 // Entry type
@@ -63,7 +64,7 @@ pub(crate) struct Gemma4Entry {
     /// an entry from the Exact fast path so it falls through to a re-prefill
     /// that recomputes the real first token.
     ///
-    /// MUST be set only in `SsdHydrate::hydrate`; never by the RAM-cache push
+    /// MUST be set only in `HydratedEntry::from_hydrated`; never by the RAM-cache push
     /// path. Do NOT use the `first_id == 0` heuristic as a substitute —
     /// `<bos>` token id is 0 for some models.
     pub(crate) is_ssd_hydrated: bool,
@@ -300,33 +301,19 @@ impl PromptCacheEntry for Gemma4Entry {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// SSD-hydrate source — pure-attention: lin_caches from block discarded.
+// SSD-hydrate entry — pure-attention: lin_caches from block discarded.
 // ---------------------------------------------------------------------------
 
-impl SsdHydrate<Gemma4Entry> for SsdHydrator {
-    fn hydrate(
-        &self,
-        prompt_ids: &[u32],
-        seed: u64,
-        kv_quant: KvQuant,
-        policy: DispatchPolicy,
-    ) -> Result<Option<Gemma4Entry>> {
-        let Some((block, block_hashes)) = self.lookup_seeded(
-            prompt_ids,
-            seed,
-            kv_quant,
-            policy,
-            crate::gemma4::SHARES_KV_ACROSS_LAYERS,
-        )?
-        else {
-            return Ok(None);
-        };
+impl HydratedEntry for Gemma4Entry {
+    const SHARES_KV: bool = crate::gemma4::SHARES_KV_ACROSS_LAYERS;
+
+    fn from_hydrated(block: HydratedBlock, block_hashes: Vec<u64>, kv_quant: KvQuant) -> Self {
         let HydratedBlock {
             prompt_ids,
             kv_caches,
             lin_caches: _,
         } = block;
-        Ok(Some(Gemma4Entry {
+        Self {
             prompt_token_ids: prompt_ids,
             block_hashes,
             kv_caches,
@@ -336,7 +323,7 @@ impl SsdHydrate<Gemma4Entry> for SsdHydrator {
             // Block-aligned prefix only; the placeholder first_id must not be
             // replayed — the generate loop re-prefills to recompute it.
             is_ssd_hydrated: true,
-        }))
+        }
     }
 }
 
