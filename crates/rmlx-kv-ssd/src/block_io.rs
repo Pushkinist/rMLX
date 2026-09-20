@@ -3228,3 +3228,9 @@ fn read_quant_rotor_k4(
 #[cfg(test)]
 #[path = "block_io_tests.rs"]
 mod block_io_tests;
+
+// Pin on the SSD hydrate path of the two TurboQuant K stores: what the payload
+// round-trips, and the one field the two widths answer differently.
+#[cfg(test)]
+#[path = "block_io_turbo_hydrate_tests.rs"]
+mod block_io_turbo_hydrate_tests;
