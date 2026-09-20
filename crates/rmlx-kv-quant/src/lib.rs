@@ -75,6 +75,7 @@ pub mod iso_flash_decode_msl;
 pub mod iso_flash_decode_symv_msl;
 pub mod isoquant;
 pub mod isoquant_msl;
+pub(crate) mod isoquant_msl_dispatch;
 pub mod isoquant_msl_v4;
 pub mod k8vturbo3_append_msl;
 pub mod kvcache;

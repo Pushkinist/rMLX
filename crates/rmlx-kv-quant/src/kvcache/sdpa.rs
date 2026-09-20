@@ -2186,7 +2186,7 @@ impl KvCache {
         // below and the bf16 V mirror further down are capped by the storage
         // `max_seq`, so it has to cover `prev_seq + new_seq` first.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
-        self.iso_k_gpu_append(new_k, &new_shape, device)?;
+        super::update::iso_k_only_gpu_append(self, new_k, &new_shape, device)?;
 
         // CRITICAL: advance `self.offset` BEFORE `update_decode_fp16_v_only` —
         // the V-only helper computes its write window as
@@ -2364,20 +2364,6 @@ impl KvCache {
         (head_dim as u32).is_power_of_two()
     }
 
-    /// GPU-append `new_k` into whichever iso K-only store is active.
-    fn iso_k_gpu_append(&mut self, new_k: &Array, new_shape: &[i32], device: Device) -> Result<()> {
-        if matches!(self.storage, KvStorage::IsoKOnly3 { .. }) {
-            super::update::iso3_k_only_gpu_append(self, new_k, new_shape, device)
-        } else if matches!(self.storage, KvStorage::IsoKOnly4 { .. }) {
-            super::update::iso4_k_only_gpu_append(self, new_k, new_shape, device)
-        } else {
-            Err(Error::KvStorageMismatch {
-                expected: "IsoKOnly3 | IsoKOnly4",
-                got: storage_variant_name(&self.storage),
-            })
-        }
-    }
-
     /// `(codes, scales, norms)` GPU view of the active iso K store at `kv_seq`,
     /// or `None` when the ring is not live.
     fn iso_k_packed_view(
@@ -2447,7 +2433,7 @@ impl KvCache {
         // capped by the storage `max_seq`, so it has to cover `prev_seq + new_seq`
         // before either append runs.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
-        self.iso_sym_gpu_append(new_k, new_v, &new_shape, device)?;
+        super::update::iso_sym_gpu_append(self, new_k, new_v, &new_shape, device)?;
         self.offset = prev_seq + new_seq;
 
         // Take `kv_seq` from the store the rings were written from, not from
@@ -2576,26 +2562,6 @@ impl KvCache {
         };
         // The dispatcher restores the query dtype itself.
         Ok(flash_out)
-    }
-
-    /// GPU-append `new_k` / `new_v` into whichever iso symmetric store is active.
-    fn iso_sym_gpu_append(
-        &mut self,
-        new_k: &Array,
-        new_v: &Array,
-        new_shape: &[i32],
-        device: Device,
-    ) -> Result<()> {
-        if matches!(self.storage, KvStorage::IsoSym3 { .. }) {
-            super::update::iso3_sym_gpu_append(self, new_k, new_v, new_shape, device)
-        } else if matches!(self.storage, KvStorage::IsoSym4 { .. }) {
-            super::update::iso4_sym_gpu_append(self, new_k, new_v, new_shape, device)
-        } else {
-            Err(Error::KvStorageMismatch {
-                expected: "IsoSym3 | IsoSym4",
-                got: storage_variant_name(&self.storage),
-            })
-        }
     }
 
     /// `(codes, scales, norms)` GPU views of BOTH axes of the active iso
