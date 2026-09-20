@@ -459,3 +459,35 @@ By file and by name.
   predicates, which are untouched.
 * **`scripts/lib/debt_report.py`'s existing populations.** The two iso ones are
   added beside them, not in place of them.
+
+## 8. What the test chunk ran
+
+The oracle, the doc and the mutation run. No engine code, no GPU test, no
+served capture, no performance number.
+
+| Gate | Result |
+|---|---|
+| `cargo test -p rmlx-kv-quant --lib iso_store_bytes` | 6 passed, 0 failed |
+| `cargo test -p rmlx-kv-quant --lib rotor_store_bytes` | 5 passed, 0 failed — **no rotor pin was re-baselined**; the rotor file's `PINS` table is untouched |
+| `cargo test -p rmlx-kv-quant` | 572 passed, 0 failed, 257 ignored. The six added cells are the whole delta |
+| `cargo fmt` | clean |
+| `make lint` | clean, `-D warnings` across the workspace |
+| `make check-no-inline-tests` | OK |
+| `make check-gpu-tests-ignored` | OK, 356 files across 12 workspace members |
+| `make check-doc-source-citations` | OK, 309 cited paths resolve |
+| `make check-kv-codec-disposition` | OK, 28 codecs classified, 17 inert |
+| `make check-kv-layer-quants` | OK |
+
+`make ci` and `make ci-perf` are not run here. `make ci-perf` needs an idle GPU
+and belongs to the integration window with the two owed GPU tests and the
+served capture.
+
+### The helper extraction
+
+The store-byte serialisation the rotor pin carried — `fnv1a64`, `StoreBytes`,
+`array_bytes`, `dtype_tag`, `f32_arr` and `push_quant_k` — moved to
+`crates/rmlx-kv-quant/src/test_utils.rs` and is shared by both pin files.
+Copying it into a second file would have planted a twin in the change whose
+purpose is removing one. `rotor_store_bytes_tests.rs` lost those six items and
+gained one `use`; its pins, its drive and its assertions are unchanged, which
+the 5-passed run above is what says.
