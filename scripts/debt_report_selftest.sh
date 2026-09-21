@@ -59,6 +59,9 @@ for f in \
     crates/rmlx-kv-quant/src/storage/quant_iso_v4.rs \
     crates/rmlx-kv-quant/src/storage/quant_iso_k3.rs \
     crates/rmlx-kv-quant/src/storage/quant_iso_k4.rs \
+    crates/rmlx-kv-quant/src/storage/quant_k_turbo3.rs \
+    crates/rmlx-kv-quant/src/storage/quant_k_turbo4.rs \
+    crates/rmlx-kv-ssd/src/block_io.rs \
     crates/rmlx-kv-quant/src/kvcache/update.rs \
     crates/rmlx-kv-quant/src/storage/counters_allow.rs \
     crates/rmlx-kv-quant/src/storage/counters_debt.rs \
@@ -603,6 +606,139 @@ check_exit "matched_lines_iso_updates_same_width_exit" \
 
 rm -rf "$ISO_SAMEWIDTH_WORK"
 
+# ---- --matched-lines: the three turbo populations -------------------------
+#
+# Same rule as the rotor and iso pairs, and one departure: the third population
+# roots on a file in another crate, because the turbo width twins are not all
+# in one place. Each entry supplies its own glob or pattern at the registration
+# site, so widening any of the three is visible as a moved item count below.
+
+TURBO_STORAGE_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines turbo-storage 2>&1)
+TURBO_STORAGE_STATUS=$?
+
+check "matched_lines_turbo_storage_pairs" \
+    "the two planted quant_k_turbo*.rs files are one group and so one pair; the rotor and iso files share the directory and would read 11 item(s) if the glob widened to quant_*" \
+    contains "turbo storage twins (crates/rmlx-kv-quant/src/storage): 15 matched lines over 39 body lines (2 item(s), 1 pair(s))" \
+    TURBO_STORAGE_ML
+
+check_exit "matched_lines_turbo_storage_exit" \
+    "a population with members is a measurement, exit 0" \
+    0 "$TURBO_STORAGE_STATUS"
+
+check "matched_lines_turbo_storage_label_own_root" \
+    "the label names the population's own root, which all three storage populations share" \
+    contains "turbo storage twins (crates/rmlx-kv-quant/src/storage):" \
+    TURBO_STORAGE_ML
+
+TURBO_UPDATES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines turbo-updates 2>&1)
+TURBO_UPDATES_STATUS=$?
+
+check "matched_lines_turbo_updates_pairs" \
+    "the pattern is anchored on the symmetric entries, so the two planted update_tsym* fns are the whole population: 2 item(s), 1 pair. The planted update_k8vturbo3 / update_k8vturbo2 are the same file's other turbo width pair and belong to a different collapse — a (turbo|tsym) pattern reads 4 item(s) and 2 pair(s) and would never reach a measured 0 for this one" \
+    contains "turbo update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 4 matched lines over 10 body lines (2 item(s), 1 pair(s))" \
+    TURBO_UPDATES_ML
+
+check_exit "matched_lines_turbo_updates_exit" \
+    "a population with members is a measurement, exit 0" \
+    0 "$TURBO_UPDATES_STATUS"
+
+TURBO_SSD_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines turbo-ssd 2>&1)
+TURBO_SSD_STATUS=$?
+
+check "matched_lines_turbo_ssd_pairs" \
+    "the eight planted block_io helpers are four two-member groups, so four pairs; the read_quant_k beside them carries no turbo token and would read 9 item(s) if the pattern widened to (read|write|shape)" \
+    contains "turbo ssd helper twins (crates/rmlx-kv-ssd/src/block_io.rs): 12 matched lines over 30 body lines (8 item(s), 4 pair(s))" \
+    TURBO_SSD_ML
+
+check_exit "matched_lines_turbo_ssd_exit" \
+    "a population with members is a measurement, exit 0" \
+    0 "$TURBO_SSD_STATUS"
+
+check "matched_lines_turbo_ssd_label_own_root" \
+    "the figure prints the file it was measured over, in the crate it lives in — which is why this is its own population and not a widened turbo-storage glob" \
+    contains "turbo ssd helper twins (crates/rmlx-kv-ssd/src/block_io.rs):" \
+    TURBO_SSD_ML
+
+check "matched_lines_turbo_ssd_not_storage_root" \
+    "and it does not print the kv-quant storage directory, which a shared root would" \
+    absent "turbo ssd helper twins (crates/rmlx-kv-quant" \
+    TURBO_SSD_ML
+
+# ---- collapsed: the turbo width twins are gone, the populations remain -----
+#
+# The third case is the one that pins the digit-free SSD pattern: after the
+# collapse those helpers keep their names without a width suffix, and a pattern
+# that required a digit would find nothing and report unavailable instead of a
+# measured 0.
+
+TURBO_COLLAPSED_WORK="$(mktemp -d)"
+cp -R "$BASE" "$TURBO_COLLAPSED_WORK/base"
+rm -f "$TURBO_COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/storage/quant_k_turbo4.rs"
+python3 - "$TURBO_COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" \
+    "$TURBO_COLLAPSED_WORK/base/crates/rmlx-kv-ssd/src/block_io.rs" <<'EOF'
+import re
+import sys
+
+update_path, block_io_path = sys.argv[1], sys.argv[2]
+
+text = open(update_path).read()
+# Drop the 4-bit entry the way the collapse does — the 3-bit one stays.
+text = re.sub(r"\n    fn update_tsym4\(.*?\n    \}\n", "\n", text, flags=re.S)
+open(update_path, "w").write(text)
+
+text = open(block_io_path).read()
+# The SSD helpers collapse by losing the width, not by one width winning: the
+# 4-bit bodies go and the 3-bit ones are renamed without their suffix.
+for name in ("k_turbo4_shape", "write_quant_k_turbo4", "read_tsym4", "read_quant_k_turbo4"):
+    text = re.sub(r"\n    fn " + name + r"\(.*?\n    \}\n", "\n", text, flags=re.S)
+for old, new in (
+    ("k_turbo3_shape", "k_turbo_shape"),
+    ("write_quant_k_turbo3", "write_quant_k_turbo"),
+    ("read_tsym3", "read_tsym"),
+    ("read_quant_k_turbo3", "read_quant_k_turbo"),
+):
+    text = text.replace(old, new)
+open(block_io_path, "w").write(text)
+EOF
+
+TURBO_COLLAPSED_STORAGE_ML=$(python3 "$TOOL" --root "$TURBO_COLLAPSED_WORK/base" --matched-lines turbo-storage 2>&1)
+TURBO_COLLAPSED_STORAGE_STATUS=$?
+
+check "matched_lines_turbo_storage_collapsed_zero" \
+    "deleting the 4-bit file leaves one item and so no pair: 0 matched lines with the population still found, which is a different answer from an empty population" \
+    contains "turbo storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 23 body lines (1 item(s), 0 pair(s))" \
+    TURBO_COLLAPSED_STORAGE_ML
+
+check_exit "matched_lines_turbo_storage_collapsed_exit" \
+    "a collapsed population is a measured 0, exit 0" \
+    0 "$TURBO_COLLAPSED_STORAGE_STATUS"
+
+TURBO_COLLAPSED_UPDATES_ML=$(python3 "$TOOL" --root "$TURBO_COLLAPSED_WORK/base" --matched-lines turbo-updates 2>&1)
+TURBO_COLLAPSED_UPDATES_STATUS=$?
+
+check "matched_lines_turbo_updates_collapsed_zero" \
+    "deleting the 4-bit entry leaves one body: 0 matched lines over the 5 that remain, population still found — and the other turbo width pair in the same file, which this population deliberately does not name, cannot hold the figure above 0" \
+    contains "turbo update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 5 body lines (1 item(s), 0 pair(s))" \
+    TURBO_COLLAPSED_UPDATES_ML
+
+check_exit "matched_lines_turbo_updates_collapsed_exit" \
+    "a collapsed population is a measured 0, exit 0" \
+    0 "$TURBO_COLLAPSED_UPDATES_STATUS"
+
+TURBO_COLLAPSED_SSD_ML=$(python3 "$TOOL" --root "$TURBO_COLLAPSED_WORK/base" --matched-lines turbo-ssd 2>&1)
+TURBO_COLLAPSED_SSD_STATUS=$?
+
+check "matched_lines_turbo_ssd_collapsed_zero" \
+    "the four collapsed helpers keep their turbo token and lose their width, so the population is still found at 4 item(s) and reports a measured 0; a pattern that required a width digit would report unavailable here, which is the answer a collapse must not produce" \
+    contains "turbo ssd helper twins (crates/rmlx-kv-ssd/src/block_io.rs): 0 matched lines over 15 body lines (4 item(s), 0 pair(s))" \
+    TURBO_COLLAPSED_SSD_ML
+
+check_exit "matched_lines_turbo_ssd_collapsed_exit" \
+    "a collapsed population is a measured 0, exit 0" \
+    0 "$TURBO_COLLAPSED_SSD_STATUS"
+
+rm -rf "$TURBO_COLLAPSED_WORK"
+
 # ---- --matched-lines: the ssd-hydrate population, both tree shapes --------
 #
 # The rule is two exact fn names, because one name spans only one tree: the
@@ -675,17 +811,29 @@ rm -rf "$HYDRATE_WORK"
 ABSENT_WORK="$(mktemp -d)"
 cp -R "$BASE" "$ABSENT_WORK/base"
 rm -f "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"/quant_rotor_*.rs \
-    "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"/quant_iso_*.rs
-python3 - "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
+    "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"/quant_iso_*.rs \
+    "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"/quant_k_turbo*.rs
+python3 - "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" \
+    "$ABSENT_WORK/base/crates/rmlx-kv-ssd/src/block_io.rs" <<'EOF'
 import sys
 
-path = sys.argv[1]
-text = open(path).read().replace("fn update_rotor", "fn update_affine_rotor")
+update_path, block_io_path = sys.argv[1], sys.argv[2]
+
+text = open(update_path).read().replace("fn update_rotor", "fn update_affine_rotor")
 # The iso pattern is unanchored and keys on the codec token, so emptying that
 # population means removing the token, not moving it off the front.
 text = text.replace("fn update_iso", "fn update_quat")
 text = text.replace("fn iso_", "fn quat_")
-open(path, "w").write(text)
+# The turbo update pattern keys on the codec token as a whole segment and not
+# on a prefix, so emptying that population means removing the token.
+text = text.replace("fn update_tsym", "fn update_sym_lloyd")
+open(update_path, "w").write(text)
+
+# The SSD pattern keys on the codec token and admits no width digit, so
+# emptying that population means removing the token.
+text = open(block_io_path).read()
+text = text.replace("turbo", "lloyd").replace("tsym", "sym_lloyd")
+open(block_io_path, "w").write(text)
 EOF
 
 EMPTY_STORAGE_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines rotor-storage 2>&1)
@@ -736,8 +884,45 @@ check_exit "matched_lines_iso_updates_empty_exit" \
     "an unavailable population exits 1" \
     1 "$ISO_EMPTY_UPDATES_STATUS"
 
+TURBO_EMPTY_STORAGE_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines turbo-storage 2>&1)
+TURBO_EMPTY_STORAGE_STATUS=$?
+
+check "matched_lines_turbo_storage_empty_unavailable" \
+    "the directory is there and nothing in it matches the turbo glob: unavailable, never a 0 indistinguishable from a collapsed population" \
+    contains "debt-report --matched-lines turbo-storage: unavailable (crates/rmlx-kv-quant/src/storage: population is empty)" \
+    TURBO_EMPTY_STORAGE_ML
+
+check_exit "matched_lines_turbo_storage_empty_exit" \
+    "an unavailable population exits 1" \
+    1 "$TURBO_EMPTY_STORAGE_STATUS"
+
+TURBO_EMPTY_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines turbo-updates 2>&1)
+TURBO_EMPTY_UPDATES_STATUS=$?
+
+check "matched_lines_turbo_updates_empty_unavailable" \
+    "renaming the codec token out of every update_tsym* fn empties the population: unavailable, not 0 — moving it off the front would not, since the pattern matches the token wherever in the name it sits" \
+    contains "debt-report --matched-lines turbo-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs: population is empty)" \
+    TURBO_EMPTY_UPDATES_ML
+
+check_exit "matched_lines_turbo_updates_empty_exit" \
+    "an unavailable population exits 1" \
+    1 "$TURBO_EMPTY_UPDATES_STATUS"
+
+TURBO_EMPTY_SSD_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines turbo-ssd 2>&1)
+TURBO_EMPTY_SSD_STATUS=$?
+
+check "matched_lines_turbo_ssd_empty_unavailable" \
+    "removing the turbo token from every block_io helper empties the population: unavailable, not 0" \
+    contains "debt-report --matched-lines turbo-ssd: unavailable (crates/rmlx-kv-ssd/src/block_io.rs: population is empty)" \
+    TURBO_EMPTY_SSD_ML
+
+check_exit "matched_lines_turbo_ssd_empty_exit" \
+    "an unavailable population exits 1" \
+    1 "$TURBO_EMPTY_SSD_STATUS"
+
 rm -rf "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/storage"
 rm -f "$ABSENT_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs"
+rm -f "$ABSENT_WORK/base/crates/rmlx-kv-ssd/src/block_io.rs"
 
 MISSING_STORAGE_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines rotor-storage 2>&1)
 MISSING_STORAGE_STATUS=$?
@@ -786,6 +971,30 @@ check "matched_lines_iso_updates_missing_root" \
 check_exit "matched_lines_iso_updates_missing_exit" \
     "a missing root exits 1" \
     1 "$ISO_MISSING_UPDATES_STATUS"
+
+TURBO_MISSING_STORAGE_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines turbo-storage 2>&1)
+TURBO_MISSING_STORAGE_STATUS=$?
+
+check "matched_lines_turbo_storage_missing_root" \
+    "a missing root names itself, and is told apart from a root that is there and empty" \
+    contains "debt-report --matched-lines turbo-storage: unavailable (crates/rmlx-kv-quant/src/storage is not a directory)" \
+    TURBO_MISSING_STORAGE_ML
+
+check_exit "matched_lines_turbo_storage_missing_exit" \
+    "a missing root exits 1" \
+    1 "$TURBO_MISSING_STORAGE_STATUS"
+
+TURBO_MISSING_SSD_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines turbo-ssd 2>&1)
+TURBO_MISSING_SSD_STATUS=$?
+
+check "matched_lines_turbo_ssd_missing_root" \
+    "the third population's root is a file in another crate, and a missing one names that file and not the storage directory" \
+    contains "debt-report --matched-lines turbo-ssd: unavailable (crates/rmlx-kv-ssd/src/block_io.rs is not a file)" \
+    TURBO_MISSING_SSD_ML
+
+check_exit "matched_lines_turbo_ssd_missing_exit" \
+    "a missing root exits 1" \
+    1 "$TURBO_MISSING_SSD_STATUS"
 
 rm -rf "$ABSENT_WORK"
 

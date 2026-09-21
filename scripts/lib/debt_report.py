@@ -28,6 +28,14 @@ The populations, each carrying its own root and its own pairing rule (see
   ``crates/rmlx-kv-quant/src/kvcache/update.rs``, paired by the same
   digit-stripped-name rule (``update_rotor_k_only_3`` and ``_4`` ->
   ``update_rotor_k_only_``).
+* ``turbo-storage`` — the non-test ``quant_k_turbo*.rs`` files under the same
+  storage directory, same digit-stripped-stem pairing.
+* ``turbo-updates`` — the ``update_tsym*`` fns of the update file, same
+  pairing. Anchored on the symmetric entries: the same file carries two other
+  turbo width pairs that belong to a different collapse.
+* ``turbo-ssd`` — the turbo helper fns of
+  ``crates/rmlx-kv-ssd/src/block_io.rs``, same pairing. A population of its
+  own because its root is a file in another crate.
 * ``ssd-hydrate`` — the non-test fns under ``crates/rmlx-models/src`` named
   exactly ``hydrate`` or exactly ``from_hydrated``, one family. Both names
   are needed because one name spans only one tree: before the SSD-hydrate
@@ -75,7 +83,9 @@ SPEC_DIR = "crates/rmlx-models/src/speculative"
 KV_STORAGE_DIR = "crates/rmlx-kv-quant/src/storage"
 ROTOR_STORAGE_GLOB = "quant_rotor_*.rs"
 ISO_STORAGE_GLOB = "quant_iso_*.rs"
+TURBO_STORAGE_GLOB = "quant_k_turbo*.rs"
 KV_UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
+KV_SSD_BLOCK_IO_FILE = "crates/rmlx-kv-ssd/src/block_io.rs"
 # Name patterns, not prefixes: a family is a shape, and the iso one outgrew a
 # prefix when its entries (`update_iso_*`) and the bodies they enter
 # (`iso_*_update`, `iso_k_only_k_side`) stopped sharing one. `^update_rotor` is
@@ -84,6 +94,22 @@ KV_UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
 # it belongs to.
 ROTOR_UPDATE_FN_PATTERN = r"^update_rotor"
 ISO_UPDATE_FN_PATTERN = r"(^|_)iso(\d|_|$)"
+# The symmetric turbo entries and the bodies they enter, and nothing else. The
+# same file carries two further width pairs — `update_k8vturbo3` /
+# `update_k8vturbo2` and their TCQ siblings — that a `(turbo|tsym)` pattern
+# would fold in; those are a different family's twins and are not what the
+# turbo K-storage collapse removes, so the population that has to read a
+# measured 0 after it names only the `tsym` token. The token is matched as a
+# whole segment rather than as a prefix, because the collapsed entry
+# (`update_tsym`) and the width-parametric body it enters (`tsym_update`) spell
+# it on opposite sides of the name: an anchored `^update_tsym` would see the
+# entry and not the body, and a re-split of that body into two width bodies
+# would then be invisible to this counter.
+TURBO_UPDATE_FN_PATTERN = r"(^|_)tsym(\d|_|$)"
+# No digit in the pattern: after the collapse the SSD helpers lose their width
+# suffix, and a digit-bearing pattern would find nothing and report the
+# population unavailable rather than a measured 0.
+TURBO_SSD_FN_PATTERN = r"(turbo|tsym)"
 MODELS_SOURCE_DIR = "crates/rmlx-models/src"
 SSD_HYDRATE_FN_NAMES = ("from_hydrated", "hydrate")
 WORKSPACE_SOURCE_DIR = "crates"
@@ -538,6 +564,32 @@ MATCHED_LINES_POPULATIONS = {
         "iso update fns",
         KV_UPDATE_FILE,
         functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=ISO_UPDATE_FN_PATTERN),
+    ),
+    "turbo-storage": Population(
+        "turbo storage twins",
+        KV_STORAGE_DIR,
+        functools.partial(storage_file_items, glob=TURBO_STORAGE_GLOB),
+        width_pair_key,
+    ),
+    "turbo-updates": Population(
+        "turbo update twins",
+        KV_UPDATE_FILE,
+        functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=TURBO_UPDATE_FN_PATTERN),
+        width_pair_key,
+    ),
+    # Its own population rather than a widened `turbo-storage` glob, for two
+    # reasons. `storage_file_items` reads whole files under one directory of
+    # one crate and these are fns inside one file of another, so no glob
+    # reaches them. And a figure prints the root it was measured over, so
+    # folding them in would print the kv-quant storage directory beside a
+    # number measured partly in kv-ssd.
+    "turbo-ssd": Population(
+        "turbo ssd helper twins",
+        KV_SSD_BLOCK_IO_FILE,
+        functools.partial(
+            file_fn_items, file=KV_SSD_BLOCK_IO_FILE, pattern=TURBO_SSD_FN_PATTERN
+        ),
+        width_pair_key,
     ),
     "rotor-storage": Population(
         "rotor storage twins",

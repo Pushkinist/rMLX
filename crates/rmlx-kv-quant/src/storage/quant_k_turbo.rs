@@ -1,84 +1,194 @@
-// K-side TurboQuant 4-bit storage, mirror of `QuantV`'s turbo4 layout.
+// K-side TurboQuant storage, one type over both code widths.
 //
-// Promoted to `pub` for the SSD modules (block_io / hydrate / spill) under
-// the same rationale as the sibling `QuantK` / `QuantV` structs.
+// CPU + MSL codec reuse: the V-side codec `turbo_quantize_v` and the per-width
+// MSL kernels (`turbo_quantize_v3_gpu` / `turbo_dequantize_v3_gpu` at 3 bits,
+// `turbo_quantize_v4_gpu` / `turbo_dequantize_v4_gpu` at 4) are positional —
+// they group a flat buffer over the last axis and do not interpret the
+// head/seq axes. The K side reuses them directly, so there is no K-side kernel
+// fork. Because the codec is positional, the *physical buffer order* is what
+// determines correctness across appends: `append` stores every chunk
+// sequence-major (`[B, S, kv_h, D]`) — reordering the head-major input
+// heads↔seq before quantizing — and `dequantize_choice` reorders back to the
+// logical `[B, kv_h, S, D]`. A flat head-major store would transpose heads
+// across a multi-append GQA cache (the dequant reshapes head-major over the
+// full sequence), so the reorder is load-bearing, not cosmetic.
 #![allow(
     missing_docs,
     unreachable_pub,
     clippy::exhaustive_structs,
     clippy::exhaustive_enums
 )]
-//! Quantized K buffer with **TurboQuant 4-bit** layout: [`QuantKTurbo4`].
+//! Quantized K buffer with **TurboQuant** layout: [`QuantKTurbo<BITS>`],
+//! spelled [`QuantKTurbo3`] / [`QuantKTurbo4`].
 //!
-//! This is the K-side counterpart to [`super::QuantV`] (V-side TurboQuant 4-bit).
-//! The two structs are independent — symmetric 4-bit Lloyd-Max K + tq4 V form the new
-//! [`super::KvStorage::TurboSym4`] storage variant.
-//!
-//! The CPU codec ([`crate::turboquant::turbo_quantize_v`] / `turbo_dequantize`)
-//! and MSL kernel ([`crate::turboquant_msl::turbo_quantize_v4_gpu`] /
-//! `turbo_dequantize_v4_gpu`) are positional — they take a flat f32 buffer plus
-//! a 4-D shape, group over the last axis, and produce flat codes/scales without
-//! interpreting the head/seq axes. Re-using them for the K side is exact: no
-//! kernel fork (decision documented in `docs/KV_QUANT.md`). Because the codec is
-//! positional, `append` stores every chunk sequence-major (`[B, S, kv_h, D]`)
-//! and `dequantize_choice` reorders back to the logical `[B, kv_h, S, D]`; a
-//! flat head-major store would transpose heads across a multi-append GQA cache.
+//! This is the K-side counterpart to the V-side turbo path (the `bits=3` and
+//! `bits=4` branches of [`super::QuantV`]). The K and V stores stay separate
+//! types so the two axes remain decoupled in
+//! [`super::KvStorage::TurboSym3`] / [`super::KvStorage::TurboSym4`] dispatch.
 //!
 //! # Layout
 //!
-//! * GPU codes  — `u32 [B × kv_h × max_seq × D / 8]`  (8 nibble indices / u32)
+//! * GPU codes  — `u32 [B × kv_h × max_seq × D × BITS / 32]` (`BITS` u32 words
+//!   per group of 32 values)
 //! * GPU scales — `f32 [B × kv_h × max_seq × D / 32]` (one f32 / 32-elem group)
-//! * CPU blocks — `Vec<TurboBlocks>` (one per decode step), bit-packed indices
+//! * CPU blocks — `Vec<TurboBlocks>` (one per append), bit-packed indices
 //!
-//! Identical to [`super::QuantV`] except the contained K vectors are the
-//! attention-key projections rather than the value projections.
+//! Identical to the same-width branch of [`super::QuantV`] except the
+//! contained vectors are the attention-key projections rather than the value
+//! projections.
 #![allow(clippy::too_many_lines)]
 
 use rmlx_core::error::Result;
 use rmlx_mlx::{zeros, Array, Device, Dtype};
 
-use crate::turboquant_msl::{turbo_dequantize_v4_gpu, turbo_quantize_v4_gpu};
-
+use crate::k8vturbo3_append_msl::{turbo_dequantize_v3_gpu, turbo_quantize_v3_gpu};
 use crate::turboquant::{turbo_dequantize, turbo_quantize_v, TurboBlocks, GROUP_SIZE};
+use crate::turboquant_msl::{turbo_dequantize_v4_gpu, turbo_quantize_v4_gpu};
 
 use super::KV_PAGE_SIZE;
 
-// ── Quantized K (turbo4) storage ─────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Accumulated TurboQuant K4 cache — symmetric counterpart of [`super::QuantV`].
+/// Bit-width of the turbo3 K codec — identical codebook to the V-side turbo3
+/// path in [`super::QuantV`].
+pub const TURBO_K3_BITS: u8 = 3;
+
+/// Bit-width of the turbo4 K codec — identical codebook to the V-side turbo4
+/// path in [`super::QuantV`].
+pub const TURBO_K4_BITS: u8 = 4;
+
+// ── Quantized K (turbo) storage ───────────────────────────────────────────────
+
+/// Accumulated TurboQuant K cache at code width `BITS` — symmetric counterpart
+/// of [`super::QuantV`] at the same width.
 ///
-/// The struct mirrors `QuantV`'s field layout exactly. The two are kept as
-/// independent types (not a renamed wrapper) so the K-side and V-side buffers
-/// remain decoupled in [`super::KvStorage::TurboSym4`] dispatch (Step 0
-/// requirement from the TurboSym4 symmetric variant).
+/// # GPU codes layout
+///
+/// For a group of `GROUP_SIZE = 32` elements at `BITS` bits per element:
+/// `32 * BITS` bits = exactly `BITS` `u32` words, the same pack the V side
+/// uses. `gpu_words_per_step` = `b * kv_h * d * BITS / GROUP_SIZE`.
 #[derive(Debug)]
-pub struct QuantKTurbo4 {
-    // ── CPU path ────────────────────────────────────────────────────────────
-    /// Per-decode-step TurboQuant blocks accumulated on the CPU path.
+pub struct QuantKTurbo<const BITS: u8> {
+    // ── CPU path ─────────────────────────────────────────────────────────────
+    /// Per-append TurboQuant blocks accumulated on the CPU path.
     pub blocks: Vec<TurboBlocks>,
-    // ── GPU path ────────────────────────────────────────────────────────────
-    /// Pre-allocated codes buffer (`u32`, 4 words per group of GROUP_SIZE=32 elements).
-    /// Length: `B * kv_h * max_seq * D / 8`.
+    // ── GPU path ─────────────────────────────────────────────────────────────
+    /// Pre-allocated codes buffer (`u32`, `BITS` words per group of
+    /// `GROUP_SIZE` = 32 elements).
+    /// Length: `B * kv_h * max_seq * D * BITS / GROUP_SIZE`.
     pub gpu_codes_buf: Option<Array>,
     /// Pre-allocated scales buffer (`f32`, one per group of GROUP_SIZE=32).
     /// Length: `B * kv_h * max_seq * D / GROUP_SIZE`.
     pub gpu_scales_buf: Option<Array>,
-    /// Number of u32 codes written per single-step.
+    /// Number of u32 codes written per single decode step.
     pub gpu_words_per_step: i32,
-    /// Number of f32 scales written per single-step.
+    /// Number of f32 scales written per single decode step.
     pub gpu_scales_per_step: i32,
     /// Current allocated capacity in tokens (paged growth).
     pub gpu_capacity: i32,
-    // ── Shared ──────────────────────────────────────────────────────────────
+    // ── Shared ───────────────────────────────────────────────────────────────
     /// Accumulated shape `[B, kv_h, S_total, D]`.
     pub shape: Vec<i32>,
-    /// Quantization bit-width (always 4 for this struct).
+    /// Quantization bit-width tag (always `BITS`).
     pub bits: u8,
     /// Maximum sequence length the GPU buffer was sized for.
     pub max_seq: i32,
 }
 
-impl QuantKTurbo4 {
+/// The 3-bit turbo K store.
+pub type QuantKTurbo3 = QuantKTurbo<3>;
+
+/// The 4-bit turbo K store.
+pub type QuantKTurbo4 = QuantKTurbo<4>;
+
+impl<const BITS: u8> QuantKTurbo<BITS> {
+    /// The codec ships two widths and one MSL kernel pair per width.
+    ///
+    /// Every method that reads or writes the store forces this const, so a
+    /// third width is refused at monomorphisation rather than at the first GPU
+    /// append. The fields are `pub`, so a caller can still write the struct
+    /// literal at an unshipped width; that store is inert — no method of it
+    /// compiles, and no `KvStorage` variant can hold one, because the two
+    /// symmetric variants name the two aliases.
+    const WIDTH_IS_A_SHIPPED_ONE: () = assert!(
+        BITS == TURBO_K3_BITS || BITS == TURBO_K4_BITS,
+        "the turbo K codec ships 3-bit and 4-bit only"
+    );
+
+    /// Name of this width's store, for diagnostics that must not allocate.
+    ///
+    /// Reads [`Self::WIDTH_IS_A_SHIPPED_ONE`] first, so every path that names
+    /// the store also forces the width guard.
+    const NAME: &'static str = {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
+        if BITS == TURBO_K3_BITS {
+            "QuantKTurbo3"
+        } else {
+            "QuantKTurbo4"
+        }
+    };
+
+    /// Construct an empty store for `init_shape = [B, kv_h, 0, D]`.
+    #[must_use]
+    pub fn new(init_shape: Vec<i32>, max_seq: i32) -> Self {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
+        Self {
+            blocks: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            bits: BITS,
+            max_seq,
+        }
+    }
+
+    /// Reconstruct a CPU-path store from serialized TurboQuant blocks. GPU
+    /// buffers stay empty.
+    ///
+    /// The field this writes is inert: nothing sizes a buffer from it, and the
+    /// first GPU `append` overwrites it from its own parameter. The argument
+    /// exists so an SSD hydrate restores the window the spill recorded instead
+    /// of `0` — see `docs/KV_TURBO_TWINS.md` §2(2). Pass the provisioned model
+    /// window, not the accumulated length at spill time (`shape[2]`).
+    #[must_use]
+    pub fn from_cpu_blocks(blocks: Vec<TurboBlocks>, shape: Vec<i32>, max_seq: i32) -> Self {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
+        Self {
+            blocks,
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape,
+            bits: BITS,
+            max_seq,
+        }
+    }
+
+    /// Reset the accumulated sequence length to zero (for context eviction /
+    /// cache-clear paths).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: shape is always [B, kv_h, S, D]; \
+                  the `>= 3` guard above ensures index 2 is in bounds"
+    )]
+    pub fn reset(&mut self) {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
+        self.blocks.clear();
+        self.gpu_codes_buf = None;
+        self.gpu_scales_buf = None;
+        self.gpu_words_per_step = 0;
+        self.gpu_scales_per_step = 0;
+        self.gpu_capacity = 0;
+        if self.shape.len() >= 3 {
+            self.shape[2] = 0;
+        }
+    }
+
     /// Resident bytes held by this store: CPU blocks plus the GPU mirror.
     ///
     /// Both are summed unconditionally — an SSD-hydrate init leaves the
@@ -89,6 +199,7 @@ impl QuantKTurbo4 {
     /// added to this struct without this failing to compile.
     #[must_use]
     pub fn byte_size(&self) -> u64 {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         let Self {
             blocks,
             gpu_codes_buf,
@@ -114,11 +225,26 @@ impl QuantKTurbo4 {
     /// is clamped to the store's current `shape[2]`
     /// ([`super::clamp_truncate_target`]).
     pub fn truncate_to(&mut self, n: i32) {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         super::truncate_block_store(&mut self.blocks, &mut self.shape, n);
     }
 
-    /// Append a new K slice. CPU path uses scalar Rust; GPU path uses MSL kernel
-    /// + pre-allocated 1D buffer with `slice_update`.
+    /// Dequantize all accumulated K slices to a flat f32 vec (CPU path).
+    ///
+    /// For the GPU path use [`Self::dequantize_choice`] with `Device::Gpu`.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any error from [`crate::turboquant::turbo_dequantize`], and the
+    /// block-coverage error from [`Self::dequantize_choice`].
+    pub fn dequant(&self) -> Result<Vec<f32>> {
+        let (out, _gpu_arr) = self.dequantize_choice(Device::Cpu, Dtype::F32)?;
+        Ok(out)
+    }
+
+    /// Append a new K slice. The CPU path uses the scalar Rust codec; the GPU
+    /// path uses this width's MSL kernel, which is the V-side kernel at the
+    /// same width (the codec is axis-agnostic — no K-side kernel fork).
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
@@ -144,9 +270,9 @@ impl QuantKTurbo4 {
             let d = new_shape[3] as usize;
 
             if self.gpu_codes_buf.is_none() {
-                // TurboQuant 4-bit: 4 u32 codes per group of GROUP_SIZE=32 elements
-                // (same layout as the V-side path — axis-agnostic kernel).
-                let words_per_step = b * kv_h * d * 4 / GROUP_SIZE;
+                // `BITS` u32 codes per group of GROUP_SIZE=32 elements, the
+                // same pack the V-side kernel at this width writes.
+                let words_per_step = b * kv_h * d * BITS as usize / GROUP_SIZE;
                 let scales_per_step = b * kv_h * d / GROUP_SIZE;
                 self.gpu_words_per_step = words_per_step as i32;
                 self.gpu_scales_per_step = scales_per_step as i32;
@@ -170,7 +296,7 @@ impl QuantKTurbo4 {
                     device,
                 )?;
                 // Hydrated init: upload CPU TurboBlocks to GPU when prev_seq > 0
-                // and self.blocks is non-empty. Same layout policy as QuantV.
+                // and self.blocks is non-empty (same policy as QuantV).
                 let (codes_buf, scales_buf) = if !self.blocks.is_empty() && prev_seq > 0 {
                     let mut flat_codes: Vec<u8> = Vec::new();
                     let mut flat_scales: Vec<f32> = Vec::new();
@@ -180,20 +306,12 @@ impl QuantKTurbo4 {
                     }
                     let cpu_words = flat_codes.len() / 4;
                     let cpu_scales = flat_scales.len();
-                    // SAFETY: `flat_scales` is `Vec<f32>`; `f32` is `Copy` with a
-                    // fixed 4-byte LE layout. Reinterpreting as `&[u8]` is safe
-                    // because `f32` and `u8` have no alignment or validity
-                    // requirements beyond what `Vec` guarantees.
-                    let scales_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            flat_scales.as_ptr().cast::<u8>(),
-                            flat_scales.len() * 4,
-                        )
-                    };
+                    let scales_bytes: Vec<u8> =
+                        flat_scales.iter().flat_map(|x| x.to_le_bytes()).collect();
                     let cpu_codes_arr =
                         Array::from_bytes(&flat_codes, &[cpu_words as i32], Dtype::U32)?;
                     let cpu_scales_arr =
-                        Array::from_bytes(scales_bytes, &[cpu_scales as i32], Dtype::F32)?;
+                        Array::from_bytes(&scales_bytes, &[cpu_scales as i32], Dtype::F32)?;
                     let codes_buf = codes_buf.slice_update(
                         &cpu_codes_arr,
                         &[0],
@@ -209,11 +327,12 @@ impl QuantKTurbo4 {
                         device,
                     )?;
                     tracing::debug!(
+                        store = Self::NAME,
                         prev_seq,
                         init_cap,
                         cpu_words,
                         cpu_scales,
-                        "QuantKTurbo4 hydrated init: uploaded CPU TurboBlocks -> GPU"
+                        "turbo K hydrated init: uploaded CPU TurboBlocks → GPU"
                     );
                     (codes_buf, scales_buf)
                 } else {
@@ -223,7 +342,7 @@ impl QuantKTurbo4 {
                 self.gpu_scales_buf = Some(scales_buf);
             }
 
-            // ── Grow if needed ───────────────────────────────────────────────
+            // ── Grow if needed ─────────────────────────────────────────────
             let needed = self.shape[2];
             if needed > self.gpu_capacity {
                 let new_cap = {
@@ -289,7 +408,7 @@ impl QuantKTurbo4 {
             // its input by raw linear offset (ignores MLX strides), so
             // materialize the permutation with `contiguous` first.
             let k_seq_major = k_arr.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
-            let (new_codes, new_scales) = turbo_quantize_v4_gpu(&k_seq_major, device)?;
+            let (new_codes, new_scales) = Self::quantize_gpu(&k_seq_major, device)?;
 
             let codes_start = prev_seq * words_per_seq;
             let codes_stop = (prev_seq + new_seq) * words_per_seq;
@@ -319,8 +438,8 @@ impl QuantKTurbo4 {
             )?);
         } else {
             // CPU path: scalar Rust quantization (axis-agnostic — same codec as
-            // V-side; the codebook is N(0,1) Lloyd-Max regardless of which axis
-            // the data came from). Store the chunk sequence-major so the CPU
+            // the V side at this width; the codebook is N(0,1) Lloyd-Max
+            // regardless of axis). Store the chunk sequence-major so the CPU
             // blocks share one layout with the GPU buffer (spill/hydrate moves
             // codes between them); `f32_data` is head-major, reorder to
             // `[B, new_seq, kv_h, D]` and pass the matching shape.
@@ -378,14 +497,15 @@ impl QuantKTurbo4 {
                 // block list makes possible and this buffer does not.
                 if self.shape[0] != 1 && self.shape[2] != 0 {
                     return Err(rmlx_core::error::Error::Quant(format!(
-                        "QuantKTurbo4::dequantize_choice: the flat GPU buffer is b == 1 only \
+                        "{}::dequantize_choice: the flat GPU buffer is b == 1 only \
                          (its per-step stride does not interleave batch), got shape {:?}",
+                        Self::NAME,
                         self.shape
                     )));
                 }
                 let seq_major_shape = [self.shape[0], self.shape[2], self.shape[1], self.shape[3]];
                 let out =
-                    turbo_dequantize_v4_gpu(&codes, &scales, &seq_major_shape, out_dtype, device)?;
+                    Self::dequantize_gpu(&codes, &scales, &seq_major_shape, out_dtype, device)?;
                 let out = out.transpose(&[0, 2, 1, 3], device)?.contiguous(device)?;
                 return Ok((Vec::new(), Some(out)));
             }
@@ -405,8 +525,9 @@ impl QuantKTurbo4 {
         // fabricates a gap. See `super::QuantV::dequantize_choice`.
         if out.len() != total {
             return Err(rmlx_core::error::Error::Quant(format!(
-                "QuantKTurbo4::dequantize_choice: CPU blocks decode to {} elems but shape \
+                "{}::dequantize_choice: CPU blocks decode to {} elems but shape \
                  {:?} implies {total} — refusing to zero-pad / truncate",
+                Self::NAME,
                 out.len(),
                 self.shape,
             )));
@@ -430,23 +551,8 @@ impl QuantKTurbo4 {
         Ok((out, None))
     }
 
-    /// Reconstruct a CPU-path `QuantKTurbo4` from serialized TurboQuant blocks.
-    /// GPU buffers stay empty.
-    pub fn from_cpu_blocks(blocks: Vec<TurboBlocks>, shape: Vec<i32>, bits: u8) -> Self {
-        Self {
-            blocks,
-            gpu_codes_buf: None,
-            gpu_scales_buf: None,
-            gpu_words_per_step: 0,
-            gpu_scales_per_step: 0,
-            gpu_capacity: 0,
-            shape,
-            bits,
-            max_seq: 0,
-        }
-    }
-
     pub fn try_deep_clone(&self) -> Result<Self> {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         Ok(Self {
             blocks: self.blocks.clone(),
             gpu_codes_buf: match &self.gpu_codes_buf {
@@ -465,8 +571,38 @@ impl QuantKTurbo4 {
             max_seq: self.max_seq,
         })
     }
+
+    /// Encode one sequence-major chunk with this width's MSL kernel.
+    ///
+    /// The `else` arm is 4-bit because [`Self::WIDTH_IS_A_SHIPPED_ONE`] admits
+    /// no third width.
+    fn quantize_gpu(k_seq_major: &Array, device: Device) -> Result<(Array, Array)> {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
+        if BITS == TURBO_K3_BITS {
+            turbo_quantize_v3_gpu(k_seq_major, device)
+        } else {
+            turbo_quantize_v4_gpu(k_seq_major, device)
+        }
+    }
+
+    /// Decode a packed plane with this width's MSL kernel — the read side of
+    /// [`Self::quantize_gpu`], and the same width rule.
+    fn dequantize_gpu(
+        codes: &Array,
+        scales: &Array,
+        seq_major_shape: &[i32; 4],
+        out_dtype: Dtype,
+        device: Device,
+    ) -> Result<Array> {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
+        if BITS == TURBO_K3_BITS {
+            turbo_dequantize_v3_gpu(codes, scales, seq_major_shape, out_dtype, device)
+        } else {
+            turbo_dequantize_v4_gpu(codes, scales, seq_major_shape, out_dtype, device)
+        }
+    }
 }
 
 #[cfg(test)]
-#[path = "quant_k_turbo4_tests.rs"]
-mod quant_k_turbo4_tests;
+#[path = "quant_k_turbo_tests.rs"]
+mod quant_k_turbo_tests;

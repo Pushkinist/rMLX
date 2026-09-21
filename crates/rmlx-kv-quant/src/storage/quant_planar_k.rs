@@ -87,7 +87,7 @@ impl QuantPlanarK {
     /// Create an empty `QuantPlanarK` with the accumulated shape initialised
     /// to `init_shape` (seq dimension = 0) and GPU buffers unallocated.
     /// Mirrors the `from_cpu_blocks` pattern but sets `max_seq` for later
-    /// GPU-path init, matching the `QuantKTurbo4` inline-literal signature.
+    /// GPU-path init.
     pub fn new(init_shape: Vec<i32>, max_seq: i32) -> Self {
         Self {
             blocks: Vec::new(),

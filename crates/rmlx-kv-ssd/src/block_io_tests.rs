@@ -24,8 +24,10 @@ fn tmp_path(name: &str) -> std::path::PathBuf {
     p
 }
 
-// Deterministic LCG f32 data in [-1, 1].
-fn lcg(n: usize, seed: u64) -> Vec<f32> {
+// Deterministic LCG f32 data in [-1, 1]. Shared with the sibling turbo
+// hydrate pin, which drives the same writer and reader over the same fixture
+// shape — a second copy would be a byte-identical twin.
+pub(super) fn lcg(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;
     (0..n)
         .map(|_| {
@@ -161,7 +163,6 @@ fn build_storage(
                 k: Some(QuantKTurbo3::from_cpu_blocks(
                     vec![kblk],
                     shape.to_vec(),
-                    3,
                     4096,
                 )),
                 v: Some(QuantV::from_cpu_blocks(vec![vblk], shape.to_vec(), 3)),
@@ -170,11 +171,16 @@ fn build_storage(
         }
         // TurboSym4 — symmetric 4-bit Lloyd-Max K + tq4 V (CPU-only build).
         KvQuant::TurboSym4 => {
+            use rmlx_kv_quant::storage::QuantKTurbo4;
             use rmlx_kv_quant::turboquant::turbo_quantize_v;
             let kblk = turbo_quantize_v(&k_data, 4, shape).unwrap();
             let vblk = turbo_quantize_v(&v_data, 4, shape).unwrap();
             KvStorage::TurboSym4 {
-                k: Some(QuantKTurbo4::from_cpu_blocks(vec![kblk], shape.to_vec(), 4)),
+                k: Some(QuantKTurbo4::from_cpu_blocks(
+                    vec![kblk],
+                    shape.to_vec(),
+                    4096,
+                )),
                 v: Some(QuantV::from_cpu_blocks(vec![vblk], shape.to_vec(), 4)),
                 max_seq: 4096,
             }

@@ -1002,8 +1002,11 @@ impl KvQuant {
             | KvQuant::Rotor3Sym
             | KvQuant::Rotor4Sym => true,
             // `None` has no packed store to read; the rest are the bf16-mirror
-            // family, whose store is written once at `exit_prefill` and never
-            // read again on a seeded cache.
+            // family, which decodes off the mirror. `materialises_packed_store`
+            // is false for every one of them, so `exit_prefill` does not build
+            // their store at all — it returns at that gate and clears what is
+            // there. The store is the authority only for a cache with no
+            // mirror: an SSD hydrate, or one that never bracketed a prefill.
             KvQuant::None
             | KvQuant::K8V4
             | KvQuant::K8V8

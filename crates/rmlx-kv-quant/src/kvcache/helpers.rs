@@ -48,9 +48,9 @@ impl KvCache {
                         .map(|(flat, _)| flat),
                 )
             }
-            // TurboSym3 — K is `QuantKTurbo3`, independent type from
-            // `QuantK` and `QuantKTurbo4`. Same dequantize_choice API, dispatched
-            // separately so the type checker stays happy.
+            // TurboSym3 — K is the 3-bit turbo store. `QuantKTurbo<3>` and
+            // `QuantKTurbo<4>` are distinct types, so the two widths dispatch
+            // in separate arms even though the call is the same.
             KvStorage::TurboSym3 { k, .. } => {
                 let k = k.as_ref()?;
                 Some(
@@ -58,9 +58,8 @@ impl KvCache {
                         .map(|(flat, _)| flat),
                 )
             }
-            // TurboSym4 — K is a `QuantKTurbo4`, independent type
-            // from `QuantK`. Same dequantize_choice signature, dispatched
-            // separately so the type checker stays happy.
+            // TurboSym4 — K is the 4-bit turbo store; see the arm above for
+            // why the two widths are not one arm.
             KvStorage::TurboSym4 { k, .. } => {
                 let k = k.as_ref()?;
                 Some(
