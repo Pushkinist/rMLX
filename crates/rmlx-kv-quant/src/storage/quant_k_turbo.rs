@@ -102,9 +102,14 @@ pub type QuantKTurbo3 = QuantKTurbo<3>;
 pub type QuantKTurbo4 = QuantKTurbo<4>;
 
 impl<const BITS: u8> QuantKTurbo<BITS> {
-    /// The codec ships two widths and one MSL kernel pair per width. A third
-    /// instantiation has no kernel, so it is refused at monomorphisation
-    /// rather than at the first GPU append.
+    /// The codec ships two widths and one MSL kernel pair per width.
+    ///
+    /// Every method that reads or writes the store forces this const, so a
+    /// third width is refused at monomorphisation rather than at the first GPU
+    /// append. The fields are `pub`, so a caller can still write the struct
+    /// literal at an unshipped width; that store is inert — no method of it
+    /// compiles, and no `KvStorage` variant can hold one, because the two
+    /// symmetric variants name the two aliases.
     const WIDTH_IS_A_SHIPPED_ONE: () = assert!(
         BITS == TURBO_K3_BITS || BITS == TURBO_K4_BITS,
         "the turbo K codec ships 3-bit and 4-bit only"
@@ -143,9 +148,11 @@ impl<const BITS: u8> QuantKTurbo<BITS> {
     /// Reconstruct a CPU-path store from serialized TurboQuant blocks. GPU
     /// buffers stay empty.
     ///
-    /// `max_seq` must be the provisioned model window for this layer, **not**
-    /// the accumulated sequence length at spill time (`shape[2]`). Passing
-    /// `shape[2]` here would set a stale ceiling equal to the spilled length.
+    /// The field this writes is inert: nothing sizes a buffer from it, and the
+    /// first GPU `append` overwrites it from its own parameter. The argument
+    /// exists so an SSD hydrate restores the window the spill recorded instead
+    /// of `0` — see `docs/KV_TURBO_TWINS.md` §2(2). Pass the provisioned model
+    /// window, not the accumulated length at spill time (`shape[2]`).
     #[must_use]
     pub fn from_cpu_blocks(blocks: Vec<TurboBlocks>, shape: Vec<i32>, max_seq: i32) -> Self {
         let () = Self::WIDTH_IS_A_SHIPPED_ONE;
@@ -170,6 +177,7 @@ impl<const BITS: u8> QuantKTurbo<BITS> {
                   the `>= 3` guard above ensures index 2 is in bounds"
     )]
     pub fn reset(&mut self) {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         self.blocks.clear();
         self.gpu_codes_buf = None;
         self.gpu_scales_buf = None;
@@ -191,6 +199,7 @@ impl<const BITS: u8> QuantKTurbo<BITS> {
     /// added to this struct without this failing to compile.
     #[must_use]
     pub fn byte_size(&self) -> u64 {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         let Self {
             blocks,
             gpu_codes_buf,
@@ -216,6 +225,7 @@ impl<const BITS: u8> QuantKTurbo<BITS> {
     /// is clamped to the store's current `shape[2]`
     /// ([`super::clamp_truncate_target`]).
     pub fn truncate_to(&mut self, n: i32) {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         super::truncate_block_store(&mut self.blocks, &mut self.shape, n);
     }
 
@@ -322,7 +332,7 @@ impl<const BITS: u8> QuantKTurbo<BITS> {
                         init_cap,
                         cpu_words,
                         cpu_scales,
-                        "turbo K hydrated init: uploaded CPU TurboBlocks -> GPU"
+                        "turbo K hydrated init: uploaded CPU TurboBlocks → GPU"
                     );
                     (codes_buf, scales_buf)
                 } else {
@@ -542,6 +552,7 @@ impl<const BITS: u8> QuantKTurbo<BITS> {
     }
 
     pub fn try_deep_clone(&self) -> Result<Self> {
+        let () = Self::WIDTH_IS_A_SHIPPED_ONE;
         Ok(Self {
             blocks: self.blocks.clone(),
             gpu_codes_buf: match &self.gpu_codes_buf {

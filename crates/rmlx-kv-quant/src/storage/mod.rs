@@ -70,9 +70,12 @@ pub use quant_k_gpu_ring::{
 };
 // The turbo K store is the one width-parametric store exported by its
 // generic name: `rmlx-kv-ssd`'s four SSD helpers are one each over both
-// widths and cannot name a type they cannot see. A third instantiation is
-// refused by `QuantKTurbo::WIDTH_IS_A_SHIPPED_ONE` at monomorphisation, so
-// the guard is the const assert and not this visibility.
+// widths and cannot name a type they cannot see. Every method that reads or
+// writes the store forces `QuantKTurbo::WIDTH_IS_A_SHIPPED_ONE`, so a third
+// width fails to compile at the first method call; the fields are `pub`, so a
+// bare struct literal at that width still builds, and it is inert — no method
+// of it compiles, and no `KvStorage` variant can hold one, because the two
+// symmetric variants name the two aliases.
 pub use quant_k_turbo::{QuantKTurbo, QuantKTurbo3, QuantKTurbo4, TURBO_K3_BITS, TURBO_K4_BITS};
 pub use quant_planar_k::QuantPlanarK;
 pub use quant_planar_v::QuantPlanarV;

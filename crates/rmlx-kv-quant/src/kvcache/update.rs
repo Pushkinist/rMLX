@@ -4300,6 +4300,10 @@ impl KvCache {
     /// (`TurboSym3` is 3 bits, `TurboSym4` is 4); V is [`QuantV`] at the same
     /// width. The body is [`tsym_update`] — see it for the V-axis device rule,
     /// which is the one thing the two widths do not share.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the dispatch routes only the two symmetric turbo variants here; a future variant belongs in its own entry, and the fall-through names the mismatch rather than adding a branch per KvStorage variant"
+    )]
     fn update_tsym(
         &mut self,
         new_k: &Array,
@@ -4317,15 +4321,16 @@ impl KvCache {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        if let KvStorage::TurboSym3 { k, v, .. } = &mut self.storage {
-            tracing::trace!(quant = "tsym3", "update_tsym: decode step");
-            tsym_update::<3>(k, v, max_seq, "TurboSym3", new_k, new_v, device)
-        } else if let KvStorage::TurboSym4 { k, v, .. } = &mut self.storage {
-            tracing::trace!(quant = "tsym4", "update_tsym: decode step");
-            tsym_update::<4>(k, v, max_seq, "TurboSym4", new_k, new_v, device)
-        } else {
-            // Unreachable: the width read above accepted no other variant.
-            Err(storage_mismatch("TurboSym3 | TurboSym4", &self.storage))
+        match &mut self.storage {
+            KvStorage::TurboSym3 { k, v, .. } => {
+                tracing::trace!(quant = "tsym3", "update_tsym: decode step");
+                tsym_update::<3>(k, v, max_seq, "TurboSym3", new_k, new_v, device)
+            }
+            KvStorage::TurboSym4 { k, v, .. } => {
+                tracing::trace!(quant = "tsym4", "update_tsym: decode step");
+                tsym_update::<4>(k, v, max_seq, "TurboSym4", new_k, new_v, device)
+            }
+            other => Err(storage_mismatch("TurboSym3 | TurboSym4", other)),
         }
     }
 
@@ -6411,11 +6416,6 @@ fn iso_v_update<const BITS: u8>(
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the body carries both stores, the window and the width the caller \
-              resolved; a parameter struct would exist for this one call"
 )]
 fn tsym_update<const BITS: u8>(
     k: &mut Option<QuantKTurbo<BITS>>,

@@ -592,9 +592,9 @@ Per-pair, for the record: `write_quant_k_turbo3` against `_4` 36 lines of 36
 After the collapse, on the same three commands:
 
 ```
-turbo storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 597 body lines (1 item(s), 0 pair(s))
-turbo update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 90 body lines (2 item(s), 0 pair(s))
-turbo ssd helper twins (crates/rmlx-kv-ssd/src/block_io.rs): 0 matched lines over 81 body lines (4 item(s), 0 pair(s))
+turbo storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 608 body lines (1 item(s), 0 pair(s))
+turbo update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 91 body lines (2 item(s), 0 pair(s))
+turbo ssd helper twins (crates/rmlx-kv-ssd/src/block_io.rs): 0 matched lines over 82 body lines (4 item(s), 0 pair(s))
 ```
 
 All three read a measured `0` with the population still found, which is the
@@ -704,9 +704,21 @@ commands file written with the model root elided may be quoted.
   `pub` rather than `pub(crate)`, unlike the iso and rotor stores: the four
   collapsed SSD helpers live in another crate and are width-parametric, so they
   have to name it. The guard against a third width is
-  `QuantKTurbo::WIDTH_IS_A_SHIPPED_ONE`, a const assert that fires at
-  monomorphisation wherever the instantiation is written, so nothing rests on
-  the visibility.
+  `QuantKTurbo::WIDTH_IS_A_SHIPPED_ONE`, a const assert that **every method
+  that reads or writes the store forces** — `new`, `from_cpu_blocks`, `reset`,
+  `byte_size`, `truncate_to`, `try_deep_clone`, the two MSL width selectors and
+  `NAME`, which `append` and `dequantize_choice` read. State the boundary that
+  holds rather than a wider one: the nine fields are `pub` and the file allows
+  `clippy::exhaustive_structs`, so a caller can write the struct literal at an
+  unshipped width and it builds. That store is inert — no method of it
+  compiles, and no `KvStorage` variant can hold one, because the two symmetric
+  variants name the two aliases. Measured with a `QuantKTurbo::<7>` literal
+  probe: the bare literal builds, and `reset`, `byte_size`, `truncate_to` and
+  `try_deep_clone` each fail `E0080` naming the method they were instantiated
+  from. `#[non_exhaustive]` is deliberately **not** used: the SSD hydrate pin
+  destructures both the store and its block exhaustively, and that is the drift
+  guard which catches a constructor that starts filling a field it used to
+  leave at its default.
 * `TURBO3_K_BITS` — gone, with its `storage/mod.rs` re-export.
   `TURBO_K3_BITS` and `TURBO_K4_BITS` replace it, one per shipped width, both
   read by the width guard and by `NAME`.

@@ -2395,20 +2395,21 @@ fn parse_v_suffix(rest: &str) -> Option<(u8, u16)> {
 fn read_tsym(st: &SafeTensors<'_>, idx: usize, geom: &str, bits: u8) -> Result<KvStorage> {
     let max_seq = geom_i32(geom, "max_seq")?;
     let shape = geom_shape(geom)?;
-    let v = Some(read_quant_v(st, idx, &shape)?);
+    // K before V in each arm, which is the order a truncated spill is refused
+    // in: the tensor the reader misses first is the one the refusal names.
     match bits {
         TURBO_K3_BITS => Ok(KvStorage::TurboSym3 {
             k: Some(read_quant_k_turbo::<TURBO_K3_BITS>(
                 st, idx, &shape, max_seq,
             )?),
-            v,
+            v: Some(read_quant_v(st, idx, &shape)?),
             max_seq,
         }),
         TURBO_K4_BITS => Ok(KvStorage::TurboSym4 {
             k: Some(read_quant_k_turbo::<TURBO_K4_BITS>(
                 st, idx, &shape, max_seq,
             )?),
-            v,
+            v: Some(read_quant_v(st, idx, &shape)?),
             max_seq,
         }),
         other => Err(Error::Mlx(format!(

@@ -67,6 +67,10 @@ const WRITTEN_MAX_SEQ: i32 = 4096;
 /// The collapse gave both widths one `from_cpu_blocks` that takes the window,
 /// so both restore what was written. The 4-bit constant is the one cell this
 /// campaign moved, from `0`.
+///
+/// Two constants holding one value, on purpose: each names the width whose
+/// cell it pins, so a future divergence moves one of them and the control
+/// below turns red rather than both moving together and nothing saying so.
 const HYDRATED_K_MAX_SEQ_3BIT: i32 = WRITTEN_MAX_SEQ;
 const HYDRATED_K_MAX_SEQ_4BIT: i32 = WRITTEN_MAX_SEQ;
 

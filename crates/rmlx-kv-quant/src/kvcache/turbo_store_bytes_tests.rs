@@ -73,10 +73,10 @@
 //! inside, or reached from, the files the collapse unifies, and no assertion
 //! here can turn red on a defect in it.
 //!
-//! * **The V-axis device split.** `update_tsym3` forces `Device::Cpu` for the
-//!   V axis and `update_tsym4` passes the caller's device through. On a CPU
-//!   drive the two are the same routing, so **nothing in this file can tell a
-//!   collapsed body that kept the split from one that lost it.** The split is
+//! * **The V-axis device split.** `tsym_update` resolves the V device from
+//!   `BITS` — `Device::Cpu` at 3, the caller's device at 4. On a CPU drive the
+//!   two are the same routing, so **nothing in this file can tell a body that
+//!   keeps the rule from one that lost it.** The rule is
 //!   load-bearing: `QuantV::append` enters its GPU branch on `device ==
 //!   Device::Gpu` with no bit-width guard and then returns `Error::Quant` for
 //!   `bits != 4`, so a 3-bit V handed `Device::Gpu` fails the append. The gate
