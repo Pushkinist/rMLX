@@ -21,11 +21,11 @@
 //!
 //! # What this file cannot see
 //!
-//! * **The `exit_prefill` bulk-encode arms.** The drive appends with
-//!   `in_prefill` false, which is the only CPU route on which all eight
-//!   spellings write a store — but it is not the route production takes. For
-//!   the four spellings that read their store at decode, the store a served
-//!   request reads is the one those arms bulk-encode.
+//! * **The `exit_prefill` bulk-encode arms of the four mirror-family
+//!   spellings.** The gate returns before them, so no CPU route runs them.
+//!   The other four — `rotor3_sym`, `rotor4_sym`, `k_rotor3`, `k_rotor4` —
+//!   do run theirs, and the shared oracle's second drive is what pins the
+//!   bytes those arms write.
 //! * **`gpu_append` and `gpu_packed_view`**, and the ring-readback branch of
 //!   `synced_rotor_v_blocks` / `synced_rotor_k_blocks`. Unreachable from a
 //!   `Device::Cpu` drive, and the largest unseen surface in the storage pair.
@@ -40,7 +40,8 @@
 
 use super::core::KvCache;
 use super::store_bytes_tests::{
-    drive, pinned_spellings, shapes_for, CHUNK_SEQ, TEST_LAYER_IDX, TEST_MAX_SEQ,
+    assert_width_twins_differ, pinned_spellings, shapes_for, CHUNK_SEQ, TEST_LAYER_IDX,
+    TEST_MAX_SEQ,
 };
 use crate::rotor_qjl::rotor_qjl_enabled;
 use crate::storage::KvStorage;
@@ -222,46 +223,30 @@ fn rotor_store_geometry_follows_the_codec_bit_width() {
     }
 }
 
-/// The 3-bit and 4-bit members of each twin pair are not the same store.
+/// The rotor width pairs, handed to the shared control.
 ///
-/// The positive control for the pin table: a unification that collapsed both
-/// widths onto one instantiation would leave every assertion above satisfied
-/// by a re-baseline, and this one red.
+/// The pair list is the only part of the claim that is about the rotor codec;
+/// the drive, the columns and the assertions are the oracle's, in
+/// `store_bytes_tests.rs`.
 #[test]
 fn three_and_four_bit_twins_hold_different_stores() {
-    let _guard = env_lock();
     assert_qjl_off();
-    let pairs: [(KvQuant, KvQuant); 4] = [
-        (KvQuant::Rotor3, KvQuant::Rotor4),
-        (KvQuant::Rotor3Sym, KvQuant::Rotor4Sym),
-        (KvQuant::RotorKOnly3, KvQuant::RotorKOnly4),
-        (
-            KvQuant::RotorK3Asym {
-                v_bits: 4,
-                v_group_size: 64,
-            },
-            KvQuant::RotorK4Asym {
-                v_bits: 4,
-                v_group_size: 64,
-            },
-        ),
-    ];
-    for (three, four) in pairs {
-        for shape in shapes_for(three) {
-            let a = drive(three, shape);
-            let b = drive(four, shape);
-            assert_ne!(
-                a.store_after_chunk, b.store_after_chunk,
-                "{three} and {four} @ kv_h={} head_dim={}: the two widths wrote the same \
-                 store bytes — one width is not being applied",
-                shape.0, shape.1
-            );
-            assert_ne!(
-                a.store_after_decode, b.store_after_decode,
-                "{three} and {four} @ kv_h={} head_dim={}: the two widths wrote the same \
-                 store bytes after decode",
-                shape.0, shape.1
-            );
-        }
-    }
+    assert_width_twins_differ(
+        &[
+            (KvQuant::Rotor3, KvQuant::Rotor4),
+            (KvQuant::Rotor3Sym, KvQuant::Rotor4Sym),
+            (KvQuant::RotorKOnly3, KvQuant::RotorKOnly4),
+            (
+                KvQuant::RotorK3Asym {
+                    v_bits: 4,
+                    v_group_size: 64,
+                },
+                KvQuant::RotorK4Asym {
+                    v_bits: 4,
+                    v_group_size: 64,
+                },
+            ),
+        ],
+        "one K-side width",
+    );
 }

@@ -8,7 +8,12 @@
 //! five observed columns, the same census shape — and differed in the spelling
 //! filter, the family name and the per-variant field list. That is the twin
 //! shape the repo's own rule names, so the machinery lives here once and the
-//! three family files keep only the claims that are about their family.
+//! three family files keep only the claims that are about their family. The
+//! width-twin control is the same shape and moved here too, as
+//! [`assert_width_twins_differ`]; what stays with each family is its pair
+//! list. Their three `*_store_geometry_follows_the_codec_bit_width` tests stay
+//! apart, because each restates a different codec's published layout
+//! arithmetic and one body cannot carry three.
 //!
 //! The method is stated in [`docs/KV_ROTOR_TWINS.md`] and is not restated here.
 //! What this file adds to it is coverage: the three family files pinned 20 of
@@ -29,22 +34,36 @@
 //!
 //! A restructure that moves any of them is a defect, not a re-baseline. The
 //! pin values the three family files captured are carried here unchanged; a
-//! reader comparing this table against the deleted ones finds the same 40 rows
+//! reader comparing this table against the deleted ones finds the same 44 rows
 //! with the same five numbers each.
 //!
-//! # What a served digest cannot see
+//! # Two drives, two populations
 //!
 //! `exit_prefill` returns at its `materialises_packed_store()` gate for every
 //! spelling that reports `false`, **before** every arm that would bulk encode a
-//! store, and clears whatever payload the cache arrived carrying. For those
-//! spellings a served prefill writes no packed store at all and the decode
-//! entries short-circuit to the bf16 seed, so a served capture against an empty
-//! store and one against a correct store emit the same tokens. Their bytes are
-//! observable here and nowhere else. The count is derived and asserted below
-//! rather than written into prose, so it moves when the dispositions move.
+//! store, and clears whatever payload the cache arrived carrying. That splits
+//! every spelling into two populations, and each needs a drive of its own.
 //!
-//! This is why every cell is driven with `in_prefill` false and no bf16 seed:
-//! it is the one CPU route on which every spelling writes its store.
+//! **The 18 that report `false`.** A served prefill writes them no packed
+//! store and the decode entries short-circuit to the bf16 seed, so a served
+//! capture against an empty store and one against a correct store emit the
+//! same tokens. Their bytes are observable here and nowhere else, and the one
+//! route on which they write a store at all is a decode-dispatch append with
+//! `in_prefill` false — which is what [`drive`] does. Their `exit_prefill`
+//! arms are unreachable, and that the gate leaves them empty is pinned by
+//! `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`.
+//!
+//! **The 10 that report `true`.** Their `exit_prefill` arms run, and the bytes
+//! those arms bulk-encode are what a served decode reads. [`drive`] never
+//! reaches those arms, and the guard above reads only whether the store is
+//! non-empty, so before this table nothing in the tree read a byte one of them
+//! wrote. [`drive_prefill`] brackets the chunk and pins three columns per
+//! spelling per shape: the store the arm bulk-encoded, `resident_bytes()` at
+//! the same point, and the rows the first decode step after the bracket hands
+//! back.
+//!
+//! Both counts are derived from the predicate and asserted below rather than
+//! written into prose, so they move when the dispositions move.
 //!
 //! # Shapes
 //!
@@ -59,7 +78,10 @@
 //! Both satisfy the floors the codecs impose on a one-token step: the affine
 //! q8_0 K side needs `B * kv_h * seq * head_dim % 128 == 0` (3072 and 128 at
 //! shape A, 9216 and 384 at shape B), and the planar codecs need
-//! `head_dim % 32 == 0` (128 and 96). No shape here has a ragged group.
+//! `head_dim % 32 == 0` (128 and 96). For the codecs that group by a power of
+//! two neither shape leaves a ragged group. The rotor family is the exception
+//! and the reason shape A is kept: it groups by three, so `head_dim = 128`
+//! pads its last group (`128 = 42*3 + 2`) while `head_dim = 96` does not.
 //!
 //! # What this pin cannot see
 //!
@@ -72,7 +94,10 @@
 //!   the fused flash-decode arms, the hydrated-init upload branch. A
 //!   `Device::Cpu` drive reaches none of them, and they are the largest unseen
 //!   surface in the storage layer. `make gpu-test` is the gate over them.
-//! * **`exit_prefill`**, which this drive deliberately does not call.
+//! * **The `exit_prefill` arms of the 18 decode-inert spellings.** The gate
+//!   returns before them and no CPU route reaches them, so they are dead code
+//!   under every drive here. The guard named above is what says the gate keeps
+//!   them that way.
 //! * **`from_cpu_blocks` and `try_deep_clone`** — the SSD-hydrate and
 //!   branch-clone constructors, pinned in `rmlx-kv-ssd`.
 //! * **`max_seq`.** Deliberately not a digest field: the stores that carry one
@@ -504,11 +529,12 @@ fn append(
 
 /// Drive one spelling at one shape with `in_prefill` false throughout.
 ///
-/// The prefill bracket is deliberately absent: `exit_prefill` clears the
+/// The prefill bracket is deliberately absent here: `exit_prefill` clears the
 /// payload of every spelling whose `materialises_packed_store()` is false, so a
 /// prefill-bracketed drive would pin empty stores for them and read as a clean
 /// scan. Appending straight into the decode dispatch is the one CPU route on
-/// which every spelling writes its store.
+/// which every spelling writes its store. [`drive_prefill`] is the other half:
+/// it runs the bracket for the spellings that do materialise one.
 #[allow(
     clippy::expect_used,
     reason = "test driver: every append here is on a shape the spelling accepts, so a failure is the defect under test and the panic names it"
@@ -554,6 +580,104 @@ pub(super) fn drive(quant: KvQuant, shape: (i32, i32)) -> CellObservation {
     }
 }
 
+/// What one prefill-bracketed cell observes.
+///
+/// Three columns, not the five [`CellObservation`] carries: the bracket runs
+/// one bulk encode and one step, so there is no second append to observe and
+/// no truncate plan in play. What it adds is the arm that wrote the bytes.
+pub(super) struct PrefillObservation {
+    /// Store digest after `exit_prefill` bulk-encoded the chunk.
+    pub(super) store_after_exit_prefill: u64,
+    /// `KvCache::resident_bytes` at the same point.
+    pub(super) resident_bytes: u64,
+    /// Digest of the rows the first decode step after the bracket handed back.
+    pub(super) rows: u64,
+}
+
+/// Drive one spelling at one shape through the prefill bracket production
+/// takes: `enter_prefill`, one bulk chunk, `exit_prefill`, one decode step.
+///
+/// [`drive`] appends straight into the decode dispatch. That is the one CPU
+/// route on which *every* spelling writes a store, which is why the pin table
+/// above uses it — and it is also the one route that runs no `exit_prefill`
+/// bulk-encode arm at all. Those arms are what a served prefill executes, and
+/// the bytes they write are what a served decode then reads.
+///
+/// Only a spelling whose `materialises_packed_store()` is true is driven here.
+/// For the rest `exit_prefill` returns at its gate and clears the payload, so
+/// their arms are unreachable; that store-is-empty property is pinned by
+/// `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`,
+/// which reads the byte count and not the bytes.
+#[allow(
+    clippy::expect_used,
+    reason = "test driver: every append here is on a shape the spelling accepts, so a failure is the defect under test and the panic names it"
+)]
+pub(super) fn drive_prefill(quant: KvQuant, shape: (i32, i32)) -> PrefillObservation {
+    let (kv_h, head_dim) = shape;
+    let device = Device::Cpu;
+    let mut cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ).with_layer_idx(TEST_LAYER_IDX);
+    cache.enter_prefill();
+
+    let chunk_shape = [1_i32, kv_h, CHUNK_SEQ, head_dim];
+    let n_chunk: usize = chunk_shape.iter().map(|&d| d as usize).product();
+    let k = f32_arr(&lcg_data(n_chunk, TEST_SEED), &chunk_shape);
+    let v = f32_arr(&lcg_data(n_chunk, TEST_SEED ^ 0x5a5a), &chunk_shape);
+    // In prefill every spelling takes the same raw-accumulation route, the
+    // mixed pair included, so `update` is the append here and the rows it
+    // hands back are the raw chunk rather than a store read.
+    cache.update(&k, &v, device).expect("prefill chunk");
+    cache.exit_prefill(device).expect("exit_prefill");
+
+    let store_after_exit_prefill = store_digest(&cache.storage);
+    let resident_bytes = cache.resident_bytes();
+
+    let step_shape = [1_i32, kv_h, 1, head_dim];
+    let n_step: usize = step_shape.iter().map(|&d| d as usize).product();
+    let seed = TEST_SEED.wrapping_add(1);
+    let ks = f32_arr(&lcg_data(n_step, seed), &step_shape);
+    let vs = f32_arr(&lcg_data(n_step, seed ^ 0x5a5a), &step_shape);
+    let mut rows = Vec::new();
+    append(&mut cache, quant, &ks, &vs, &mut rows, device);
+
+    PrefillObservation {
+        store_after_exit_prefill,
+        resident_bytes,
+        rows: fnv1a64(&rows),
+    }
+}
+
+/// The two members of each pair write different stores.
+///
+/// The positive control for the pin tables: a unification that collapsed two
+/// settings onto one instantiation would leave every geometry assertion above
+/// satisfied by a re-baseline, and this one red.
+///
+/// The drive and the columns are this file's, so the check is too. What stays
+/// with each family is its pair list, which is the only part of the claim that
+/// is about one codec. `what` names the setting the pair differs in, so a red
+/// assertion says which one stopped being applied.
+pub(super) fn assert_width_twins_differ(pairs: &[(KvQuant, KvQuant)], what: &str) {
+    let _guard = env_lock();
+    for &(left, right) in pairs {
+        for shape in shapes_for(left) {
+            let a = drive(left, shape);
+            let b = drive(right, shape);
+            assert_ne!(
+                a.store_after_chunk, b.store_after_chunk,
+                "{left} and {right} @ kv_h={} head_dim={}: the two wrote the same store bytes \
+                 after the bulk append — {what} is not being applied",
+                shape.0, shape.1
+            );
+            assert_ne!(
+                a.store_after_decode, b.store_after_decode,
+                "{left} and {right} @ kv_h={} head_dim={}: the two wrote the same store bytes \
+                 after decode — {what} is not being applied",
+                shape.0, shape.1
+            );
+        }
+    }
+}
+
 /// Spellings `ALL_KV_QUANTS` holds today. An anchor beside the derived sweep:
 /// a spelling added to the enum and not to `ALL_KV_QUANTS` moves this count
 /// rather than passing quietly.
@@ -589,6 +713,19 @@ pub(super) fn pinned_spellings() -> Vec<KvQuant> {
     let mut v: Vec<KvQuant> = ALL_KV_QUANTS.to_vec();
     v.extend_from_slice(EXTRA_PARAMETERISATIONS);
     v
+}
+
+/// The spellings whose `exit_prefill` arm runs — the population
+/// [`drive_prefill`] sweeps.
+///
+/// Derived from the disposition predicate, not from a list: a codec that grows
+/// a decode kernel over its own store flips that predicate and enters this
+/// population, and the pin census below then says it owes rows.
+pub(super) fn materialising_spellings() -> Vec<KvQuant> {
+    pinned_spellings()
+        .into_iter()
+        .filter(KvQuant::materialises_packed_store)
+        .collect()
 }
 
 /// One pinned cell: `(spelling, kv_h, head_dim, store_after_chunk,
@@ -1309,6 +1446,255 @@ fn every_spelling_is_pinned_at_both_shapes() {
     );
 }
 
+/// One pinned prefill cell: `(spelling, kv_h, head_dim,
+/// store_after_exit_prefill, resident_bytes, rows)`.
+type PrefillPin = (&'static str, i32, i32, u64, u64, u64);
+
+/// The "before" side of the prefill oracle.
+///
+/// Every row here is new. No file in the tree read the bytes an
+/// `exit_prefill` arm wrote before this one: the pin table above drives a
+/// route that runs none of those arms, and the guard that does run them reads
+/// only whether the store is non-empty.
+const PREFILL_PINS: &[PrefillPin] = &[
+    (
+        "mixed_k8g64_v4g64",
+        1,
+        128,
+        0x8335af25efd0fef0,
+        4992,
+        0x3ec6ab35eb546b3f,
+    ),
+    (
+        "mixed_k8g64_v4g64",
+        4,
+        128,
+        0x731372a4cccf895a,
+        19968,
+        0xf0ae10a6fdafb465,
+    ),
+    (
+        "rot_k_v8g64",
+        1,
+        128,
+        0x03fa4ac7ed91f708,
+        72064,
+        0x9455f93c9ca69906,
+    ),
+    (
+        "rot_k_v8g64",
+        4,
+        128,
+        0x50e95c202355bfdb,
+        91648,
+        0xdf725b46270642d2,
+    ),
+    (
+        "iso3_sym",
+        1,
+        128,
+        0xadba4f7bb77a55ad,
+        33216,
+        0xad069e5080b3a3f7,
+    ),
+    (
+        "iso3_sym",
+        4,
+        96,
+        0x2689c78a863f3f06,
+        99840,
+        0xbbddb7ff340f3fd8,
+    ),
+    (
+        "iso4_sym",
+        1,
+        128,
+        0x5f848dd01a15acc7,
+        33984,
+        0xce6e0599d6eb1839,
+    ),
+    (
+        "iso4_sym",
+        4,
+        96,
+        0xf9e7089609b2ec37,
+        102144,
+        0x8ad58a674158c26f,
+    ),
+    (
+        "k_iso3",
+        1,
+        128,
+        0xbb9e90fee8d84779,
+        22752,
+        0x8e848d5595e061af,
+    ),
+    (
+        "k_iso3",
+        4,
+        96,
+        0x4b62a9e06e2b5772,
+        68352,
+        0xc4e7767e0d74beb8,
+    ),
+    (
+        "k_iso4",
+        1,
+        128,
+        0x05eb1b63429e6060,
+        23136,
+        0x4046f97170a2603a,
+    ),
+    (
+        "k_iso4",
+        4,
+        96,
+        0x2dda5c30f346be33,
+        69504,
+        0xd23846fa568fe3d5,
+    ),
+    (
+        "rotor3_sym",
+        1,
+        128,
+        0x6626a18505e29f77,
+        12320,
+        0xaba52798cfbc5408,
+    ),
+    (
+        "rotor3_sym",
+        4,
+        96,
+        0x415cdf8ffaadf097,
+        33280,
+        0x44626bcd24b0f4ba,
+    ),
+    (
+        "rotor4_sym",
+        1,
+        128,
+        0x75949e7159ba5c6c,
+        13088,
+        0x4eccdcf45ece1da8,
+    ),
+    (
+        "rotor4_sym",
+        4,
+        96,
+        0x8acc3dade9ad35ce,
+        35584,
+        0x5609c90cfab335a6,
+    ),
+    (
+        "k_rotor3",
+        1,
+        128,
+        0xff94a3ecc882a908,
+        12304,
+        0xe5c15bc5f72f2e55,
+    ),
+    (
+        "k_rotor3",
+        4,
+        96,
+        0x968acb5046ce0839,
+        35072,
+        0x1d4b89b7d79dcfd9,
+    ),
+    (
+        "k_rotor4",
+        1,
+        128,
+        0x3101b4f9c159866e,
+        12688,
+        0x7af8e17246f9c2eb,
+    ),
+    (
+        "k_rotor4",
+        4,
+        96,
+        0x974461cdf0716469,
+        36224,
+        0x98e2ba20ee211ea8,
+    ),
+];
+
+/// Look a prefill pin up by spelling and shape.
+fn prefill_pin_for(name: &str, shape: (i32, i32)) -> Option<&'static PrefillPin> {
+    PREFILL_PINS
+        .iter()
+        .find(|p| p.0 == name && p.1 == shape.0 && p.2 == shape.1)
+}
+
+/// The bytes the live `exit_prefill` arms write, at both shapes.
+#[test]
+fn exit_prefill_bulk_encode_bytes_are_pinned_per_spelling_and_shape() {
+    let _guard = env_lock();
+    let mut missing = Vec::new();
+    let mut observed = Vec::new();
+    for quant in materialising_spellings() {
+        let name = quant.to_string();
+        for shape in shapes_for(quant) {
+            let obs = drive_prefill(quant, shape);
+            observed.push(format!(
+                "    (\"{}\", {}, {}, {:#018x}, {}, {:#018x}),",
+                name, shape.0, shape.1, obs.store_after_exit_prefill, obs.resident_bytes, obs.rows
+            ));
+            let Some(pin) = prefill_pin_for(&name, shape) else {
+                missing.push(format!("{name} @ kv_h={} head_dim={}", shape.0, shape.1));
+                continue;
+            };
+            assert_eq!(
+                obs.store_after_exit_prefill, pin.3,
+                "{name} @ kv_h={} head_dim={}: the store exit_prefill bulk-encoded moved",
+                shape.0, shape.1
+            );
+            assert_eq!(
+                obs.resident_bytes, pin.4,
+                "{name} @ kv_h={} head_dim={}: resident_bytes after exit_prefill moved",
+                shape.0, shape.1
+            );
+            assert_eq!(
+                obs.rows, pin.5,
+                "{name} @ kv_h={} head_dim={}: the rows the first decode step after \
+                 exit_prefill handed back moved",
+                shape.0, shape.1
+            );
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "no prefill pin for {} cell(s): {missing:?}\nobserved table:\n{}",
+        missing.len(),
+        observed.join("\n")
+    );
+}
+
+/// The prefill pin table names every materialising spelling at both shapes —
+/// and nothing else.
+#[test]
+fn every_materialising_spelling_is_pinned_through_the_prefill_bracket() {
+    let live = materialising_spellings();
+    for quant in live.iter().copied() {
+        let name = quant.to_string();
+        for shape in shapes_for(quant) {
+            assert!(
+                prefill_pin_for(&name, shape).is_some(),
+                "{name} @ kv_h={} head_dim={} has no prefill pin",
+                shape.0,
+                shape.1
+            );
+        }
+    }
+    assert_eq!(
+        PREFILL_PINS.len(),
+        live.len() * 2,
+        "PREFILL_PINS holds {} rows for {} cells x 2 shapes — a stale row pins nothing",
+        PREFILL_PINS.len(),
+        live.len()
+    );
+}
+
 /// Driving the same spelling twice gives the same bytes.
 ///
 /// Without this, every assertion above could be pinning a value that is not
@@ -1345,6 +1731,30 @@ fn a_cell_is_reproducible() {
             );
         }
     }
+    for quant in materialising_spellings() {
+        for shape in shapes_for(quant) {
+            let a = drive_prefill(quant, shape);
+            let b = drive_prefill(quant, shape);
+            assert_eq!(
+                a.store_after_exit_prefill, b.store_after_exit_prefill,
+                "{quant} @ kv_h={} head_dim={}: the bulk-encoded store differs between two \
+                 identical prefill drives",
+                shape.0, shape.1
+            );
+            assert_eq!(
+                a.rows, b.rows,
+                "{quant} @ kv_h={} head_dim={}: the first decode step's rows differ between \
+                 two identical prefill drives",
+                shape.0, shape.1
+            );
+            assert_eq!(
+                a.resident_bytes, b.resident_bytes,
+                "{quant} @ kv_h={} head_dim={}: resident_bytes after exit_prefill differs \
+                 between two identical prefill drives",
+                shape.0, shape.1
+            );
+        }
+    }
 }
 
 /// How many spellings a served digest cannot judge, derived rather than
@@ -1358,22 +1768,43 @@ fn a_cell_is_reproducible() {
 /// table learns it owes the cell a row.
 const DECODE_INERT_SPELLINGS: usize = 18;
 
-/// The spellings a served capture cannot judge are the ones this file is the
-/// only oracle for.
+/// The complement: spellings whose `exit_prefill` arm runs and whose bytes a
+/// served decode reads. [`PREFILL_PINS`] is their pin table.
+const MATERIALISING_SPELLINGS: usize = 10;
+
+/// The two populations partition every spelling, and each names what covers it.
+///
+/// The inert side is what a served capture cannot judge: its store is empty
+/// past `exit_prefill`, so the pin table above is its only oracle. The
+/// materialising side runs a live bulk-encode arm, and the prefill pin table
+/// is that arm's only oracle. The split is derived from the disposition
+/// predicate, so a codec crossing it turns a cell red here instead of quietly
+/// changing what the real-model run is worth.
 #[test]
-fn the_decode_inert_spellings_are_the_population_this_file_exists_for() {
-    let inert: Vec<String> = ALL_KV_QUANTS
+fn the_two_populations_partition_every_spelling() {
+    let (live, inert): (Vec<KvQuant>, Vec<KvQuant>) = ALL_KV_QUANTS
         .iter()
         .copied()
-        .filter(|q| !q.materialises_packed_store())
-        .map(|q| q.to_string())
-        .collect();
+        .partition(KvQuant::materialises_packed_store);
+    let inert: Vec<String> = inert.iter().map(ToString::to_string).collect();
+    let live: Vec<String> = live.iter().map(ToString::to_string).collect();
     assert_eq!(
         inert.len(),
         DECODE_INERT_SPELLINGS,
         "the set of spellings whose packed store no served capture can read moved: {inert:?}. \
          A spelling that left the class owes the real-model table a row; one that entered it \
          owes this file the only coverage it has"
+    );
+    assert_eq!(
+        live.len(),
+        MATERIALISING_SPELLINGS,
+        "the set of spellings whose exit_prefill arm runs moved: {live:?}. The prefill pin \
+         table is that arm's only oracle, and it sweeps this population"
+    );
+    assert_eq!(
+        inert.len() + live.len(),
+        SPELLING_COUNT,
+        "the two populations no longer cover every spelling"
     );
 }
 

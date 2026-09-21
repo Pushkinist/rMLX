@@ -42,6 +42,11 @@ The populations, each carrying its own root and its own pairing rule (see
   collapse the population is the per-arch ``hydrate`` bodies, after it the
   short ``from_hydrated`` constructors. ``hydrate_from_ssd`` is a third name
   and stays out.
+* ``update-bodies`` — every ``update_``-prefixed fn of the update file, one
+  family. The prefix is the whole rule, so the shared entries the dispatch
+  reaches (``update_and_sdpa_*``, ``update_decode_fp16*``,
+  ``update_prefill_raw``) are counted beside the per-variant bodies; the label
+  says what the prefix finds rather than claiming a narrower population.
 
 Neither rotor population is a literal file or fn list: both are a glob plus a
 name rule, so the same command measures a tree that still carries the twins
@@ -110,11 +115,14 @@ TURBO_UPDATE_FN_PATTERN = r"(^|_)tsym(\d|_|$)"
 # suffix, and a digit-bearing pattern would find nothing and report the
 # population unavailable rather than a measured 0.
 TURBO_SSD_FN_PATTERN = r"(turbo|tsym)"
-# Every per-variant update body of the update file, whatever family it belongs
+# Every `update_`-prefixed fn of the update file, whatever family it belongs
 # to. The three family patterns above each read one codec's twins; this one
-# reads the whole per-variant population, which is what the "one update body
-# per store shape" step has to shrink. An anchored prefix, because a per-variant
-# body is what the dispatch enters and every one of them is spelled `update_`.
+# reads the whole prefixed population, which is what the "one update body per
+# store shape" step has to shrink. The prefix admits the shared entries the
+# dispatch reaches as well as the per-variant bodies — `update_and_sdpa_*`,
+# `update_decode_fp16*`, `update_prefill_raw` — and they are counted, because
+# any rule that dropped them would be a hand-drawn boundary over which body is
+# "per-variant" enough, and the label says what the prefix finds.
 UPDATE_FN_PATTERN = r"^update_"
 MODELS_SOURCE_DIR = "crates/rmlx-models/src"
 SSD_HYDRATE_FN_NAMES = ("from_hydrated", "hydrate")
@@ -611,12 +619,12 @@ MATCHED_LINES_POPULATIONS = {
     ),
     "ssd-hydrate": Population("ssd hydrate twins", MODELS_SOURCE_DIR, ssd_hydrate_items),
     # Every pair, not `width_pair_key`: the claim this figure measures is that
-    # the per-variant bodies share one sequence whatever codec they belong to,
-    # so a key that only compares two widths of one family would report a 0
+    # the update file's bodies share one sequence whatever codec they belong
+    # to, so a key that only compares two widths of one family would report a 0
     # the moment the widths collapsed and say nothing about the shape the
     # restructure writes once.
     "update-bodies": Population(
-        "per-variant update bodies",
+        "update_-prefixed fns of the update file",
         KV_UPDATE_FILE,
         functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=UPDATE_FN_PATTERN),
     ),

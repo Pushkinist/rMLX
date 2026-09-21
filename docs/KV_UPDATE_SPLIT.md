@@ -28,8 +28,8 @@ the commit before the rotor, iso and turbo twin collapses landed.
 
 | Row | Claimed | Before the collapses | Today | Verdict |
 |---|---|---|---|---|
-| `update.rs` lines | 8105 | 8116 | 7148 | Confirmed. The collapses took 968 lines. |
-| Lines in per-variant `update_*` bodies | 2898 | 2539 over 33 bodies | 1440 over 25 bodies | Moved. The claimed figure does not reproduce under the body rule used here (brace to brace, signature excluded). |
+| `update.rs` lines | 8105 | 8116 | 7151 | Confirmed. The collapses took 968 lines; the interim `LOC-exempt` marker added 3. |
+| Lines in `update_`-prefixed fn bodies | 2898 | 2539 over 33 bodies | 1440 over 25 bodies | Moved. The claimed figure does not reproduce under the body rule used here (brace to brace, signature excluded). |
 | `match` blocks of 26–27 arms in `update.rs` | 6 | 6 | 6 | Confirmed, and none of the six moved. |
 | The same in `storage/kv_storage.rs` | 3 | 4 | 4 | Confirmed for `KvStorage` (3); a fourth site there matches over `KvQuant`. |
 | The same in `kvcache/helpers.rs` | 2, of 23 arms | 3, of 9 / 8 / 27 arms | 3 | Does not reproduce as stated. Three sites name all 27 variants; two of them do it with or-patterns, so their **arm** count is 9 and 8 while their **variant** count is 27. |
@@ -39,6 +39,15 @@ the commit before the rotor, iso and turbo twin collapses landed.
 
 Two rows moved because the collapses moved them, and one row — the
 `helpers.rs` one — never held as stated.
+
+**What the body row counts.** Every fn of the update file whose name starts
+`update_`, and nothing else. The prefix admits the shared entries the dispatch
+reaches as well as the per-variant bodies — `update_and_sdpa_k8v4_flash` and
+its inner and no-lock siblings, `update_decode_fp16` and its two variants,
+`update_prefill_raw` — about 470 of the 1440 lines. They are counted on
+purpose: any rule that dropped them would be a hand-drawn boundary over which
+body is "per-variant" enough, and the shared entries are part of what the
+restructure has to shrink. The label says what the prefix finds.
 
 ### Variant shapes
 
@@ -87,6 +96,17 @@ on CPU, and it is five columns per spelling per shape:
 `crates/rmlx-kv-quant/src/kvcache/store_bytes_tests.rs` is the one file that
 pins them.
 
+Two spellings hold the store column constant across all three of its
+readings, and the pin table shows the same digest three times for them. That
+is the cell, not a gap:
+
+* **`none`** holds no store at all. Its buffers live on the parent `KvCache`,
+  so the column is one tag and the rows and `resident_bytes()` carry the cell.
+* **`planar_k`** writes its K store once, at the chunk append. The decode
+  steps route through the warm-TTFT bf16 K seed and the truncate plan does not
+  reach a 24-position store, so neither moves a byte. The bulk-append reading
+  carries the store claim; the rows and `resident_bytes()` carry the rest.
+
 ### Coverage audit
 
 Before this work, three family files pinned 20 of the 28 spellings in
@@ -119,10 +139,18 @@ each row by `(spelling, kv_h, head_dim)`, and compare the five values. The
 result was 44 rows present, 0 values moved, 16 rows added.
 
 The three family files keep only what is about their family: the
-geometry-follows-bit-width tests, the width-twin controls, the TCQ byte
-identity, the K-side scope anchor, and the GPU-resident mirror check. Test code
-in the four files went from 2611 lines to 1829 while pinned cells went from 44
-to 60.
+geometry-follows-bit-width tests, their own width-twin pair lists, the TCQ byte
+identity, the K-side scope anchor, and the GPU-resident mirror check. The
+width-twin control itself is one fn in the oracle — `assert_width_twins_differ`
+— that the three call with their pairs; the three
+`*_store_geometry_follows_the_codec_bit_width` tests stay apart, because each
+restates a different codec's published layout arithmetic and one body cannot
+carry three.
+
+Counted the same way on both sides (`wc -l`, whole file, doc comments
+included): test code across the files went from 2611 lines over three files to
+2762 over four, while pinned cells went from 44 to 60 store-bytes cells plus 20
+prefill cells.
 
 ### What the oracle cannot drive, and what covers it
 
@@ -139,28 +167,52 @@ to 60.
 * **The mixed pair's rows column** is the attention output, not the K and V
   rows, because the cache refuses `update` for them. It moves on the same
   defects, one step further downstream.
+* **The `exit_prefill` arms of the 18 decode-inert spellings.** The gate
+  returns before them, so no CPU route runs them at all. They are kept as the
+  re-enable path for a codec that grows a decode kernel over its own store,
+  and the guard named above is what holds them to the predicate.
 * **Every GPU path** — MSL encode dispatch, resident rings, fused flash-decode
   arms, the hydrated-init upload branch. `make gpu-test` is the gate.
 
-### What a served digest cannot see
+### Two populations, two drives
 
-18 of the 28 spellings report `materialises_packed_store() == false`.
-`exit_prefill` returns at that gate before every bulk-encode arm and clears
-whatever payload the cache arrived with, so for those 18 a served prefill
-writes no packed store and decode runs off the bf16 seed. A served temp-0
-capture against an empty store and against a correct store emits the same
-tokens. **Their store bytes are observable in the oracle and nowhere else.**
+`exit_prefill` returns at its `materialises_packed_store()` gate, before every
+bulk-encode arm, and clears whatever payload the cache arrived with. That gate
+splits the 28 spellings in two, and each half needs a drive of its own. The
+split is derived from the predicate and pinned in the oracle
+(`the_two_populations_partition_every_spelling`), so a codec crossing it turns
+a cell red instead of quietly changing what the real-model run is worth.
 
-The figure is derived and pinned in the oracle
-(`the_decode_inert_spellings_are_the_population_this_file_exists_for`), so a
-codec entering or leaving the class turns a cell red instead of quietly
-changing what the real-model run is worth.
+**18 spellings report `false`.** A served prefill writes them no packed store
+and decode runs off the bf16 seed, so a served temp-0 capture against an empty
+store and against a correct store emits the same tokens. **Their store bytes
+are observable in the oracle and nowhere else.** Their `exit_prefill` arms are
+dead code under every CPU route — the gate returns first — and that the gate
+keeps them empty is already pinned by
+`warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`,
+which asserts a zero store after prefill, a zero store after one decode step,
+and a residency equal to the bf16 baseline, for all 18. The five columns for
+these spellings come from the decode-dispatch drive, which is the one CPU route
+on which they write a store at all.
+
+**10 report `true`** — `mixed_k8g64_v4g64`, `rot_k_v8g64`, `iso3_sym`,
+`iso4_sym`, `k_iso3`, `k_iso4`, `rotor3_sym`, `rotor4_sym`, `k_rotor3`,
+`k_rotor4`. Their `exit_prefill` arms run, and the bytes those arms bulk-encode
+are what a served decode then reads. The decode-dispatch drive never reaches
+those arms, and the guard above reads only whether the store is non-empty, so
+before this work **nothing in the tree read a byte any live `exit_prefill` arm
+wrote**. Measured: scaling `k_f32` by 1.01 inside the `Rotor3Sym` arm left the
+whole crate green, 576 tests passed. A second drive closes it —
+`drive_prefill` brackets the chunk with `enter_prefill` / `exit_prefill` and
+pins, per spelling per shape, the store the arm wrote, `resident_bytes()`, and
+the rows of the first decode step after the bracket. 20 cells, the population
+derived from the predicate rather than listed. The same mutation now turns
+exactly one test red, `rotor3_sym @ kv_h=1 head_dim=128`.
 
 ### The oracle, falsified
 
-Five engine mutations, one per observed column and spanning four families. Each
-was applied to a snapshot, run, and restored by file copy with a digest check —
-never by `git checkout`. The control run, with no mutation, is green.
+Seven engine mutations, spanning every observed column and four families. The
+control run, with no mutation, is green.
 
 | Mutation | First cell red | Column |
 |---|---|---|
@@ -169,10 +221,28 @@ never by `git checkout`. The control run, with no mutation, is green.
 | one planar rotation angle off by 0.001 rad | `planar @ kv_h=1 head_dim=128` | store bytes after the bulk append |
 | one iso quaternion component off in the seventh digit | `iso3 @ kv_h=1 head_dim=128` | store bytes after the bulk append |
 | one TurboQuant 2-bit centroid off by 0.01 | `k8vturbo2 @ kv_h=1 head_dim=128` | store bytes after the bulk append |
+| per-block planar V scales scaled by 1.01 in `QuantPlanarV::append` | `planar @ kv_h=1 head_dim=128` | store bytes after the bulk append |
+| `k_f32` scaled by 1.01 in the `Rotor3Sym` `exit_prefill` arm | `rotor3_sym @ kv_h=1 head_dim=128` | store bytes after `exit_prefill` |
 
-The planar mutation is the one that matters most for the coverage audit: before
-this work, **no test in the tree turned red on it**, because no planar spelling
-had a store-bytes pin.
+The rotation-angle mutation is **not** the coverage argument. Measured, it
+turns five pre-existing tests red on its own:
+`planarquant::tests::cb4_rotation_codebook_bit_exact`,
+`planar_flash_decode_msl::tests::hdr_probe_snapshot_matches_builder`, and
+`hdr_probe_snapshots_match_builders` in `planar_fused_qk_msl`,
+`planarquant_msl` and `sparse_attn`. It moves the codebook the probe snapshots
+are built from, so it never needed a store-bytes pin to be caught.
+(`rate_distortion_tests::pinned_budgets_sit_one_slack_above_the_measurement`
+stays green at 0.001 rad.)
+
+The mutation that does carry the coverage argument is the per-block scale one:
+multiplying the per-block scales `planar_quantize` returns by 1.01 inside
+`QuantPlanarV::append`. It never touches the rotation codebook, so no probe
+snapshot and no codebook test can see it. Measured, it turns **one** test red —
+this oracle — and before this work it would have turned none.
+
+The last row is the second drive's: it moves a byte no other column in this
+table can reach. Every mutation here was applied to a snapshot, run, and
+restored by file copy with a digest check — never by `git checkout`.
 
 ---
 
@@ -211,7 +281,7 @@ The target of 3 or fewer is about the six sites in `update.rs`, which the split
 owns. The nine in `quant.rs` are the enum's own `Display`, `FromStr` and
 disposition predicates; they are not this restructure's to remove.
 
-**Recall.** `scripts/kv_update_census_selftest.sh`, 27 cases over planted
+**Recall.** `scripts/kv_update_census_selftest.sh`, 35 cases over planted
 trees, run by `make kv-update-census-selftest` and by `make ci`. A site in a
 file the producer was never told about is found; a collapsed site drops the
 count; a catch-all arm keeps the site and drops the forcing count; a match
@@ -219,13 +289,22 @@ under the bar is not a site; `match` inside a comment or a string literal is
 not a site; a missing directory, a missing enum, an unreadable file and an
 empty population each read `unavailable` with their own reason, never `0`.
 
+Two of those cases hold the rules a threshold override would hide. The bar is
+read with no `--threshold` at all, on a four-variant fixture carrying a site
+that names exactly two: the bar reads 2 and the site is in. A fifth variant
+then moves the bar to 3 and that site drops out, so the bar and the count move
+together — replacing the derivation with a constant turns four cases red. A
+wide `match` planted in a `*_tests.rs` file is not counted, and is counted
+under `--include-tests`, so disabling the test-file exclusion turns one case
+red. Both were measured by applying each mutation and re-running.
+
 ### File size
 
 `make file-size-report`, `rmlx-kv-quant` only, before the split:
 
 | Lines | File | `LOC-exempt` |
 |---|---|---|
-| 7148 | `kvcache/update.rs` | added by this change, interim |
+| 7151 | `kvcache/update.rs` | added by this change, interim |
 | 2877 | `kvcache/sdpa.rs` | no |
 | 1952 | `quant.rs` | no |
 | 1881 | `storage/kv_storage.rs` | yes |
@@ -240,10 +319,14 @@ are outside this work.
 ### Duplication
 
 `python3 scripts/lib/debt_report.py --matched-lines update-bodies` is an
-eleventh `debt-report` population: every fn of the update file whose name
-starts `update_`, paired every item with every other. The three family
-populations each read one codec's twins and go blind the moment those widths
-collapse; this one reads the shape the restructure writes once.
+eleventh `debt-report` population: every `update_`-prefixed fn of the update
+file, paired every item with every other. The three family populations each
+read one codec's twins and go blind the moment those widths collapse; this one
+reads the shape the restructure writes once.
+
+One producer, not two. The census and this population print the same two
+numbers, so both read fns through `lib/debt_report.py`'s `extract_fns`;
+`lib/rust_scan.py` reads enums and `match` arms only.
 
 **Before:** 3585 matched lines over 1440 body lines, 25 items, 300 pairs.
 (Before the three collapses: 12122 over 2539, 33 items, 528 pairs.)
@@ -315,13 +398,19 @@ Grep before touching any of it.
   name.
 * **The GPU shader-validation census**, `scripts/gpu_validation_census.txt`:
   one entry per (kernel, kind, crate, originating test).
-* **The trace target the update path emits on.** It has no `target =`
-  override, so the target is the module path —
-  `rmlx_kv_quant::kvcache::update`. [`PERF_BASELINE.md`](PERF_BASELINE.md)
+* **The trace target the update path emits on.** All but one event in
+  `update.rs` carries no `target =` override, so its target is the module path
+  — `rmlx_kv_quant::kvcache::update`. [`PERF_BASELINE.md`](PERF_BASELINE.md)
   names that string and the phases under it (`iso3_encode`,
   `iso3_dequant_cpu`, `iso3_vec_to_array`). Moving a body to another module
   moves its target. A chunk that moves an instrumented body updates that doc
   in the same commit, or keeps the target explicit.
+* **The one `target =` override in the file.** The PlanarK warm-TTFT bypass
+  emits on `rmlx_kv_quant::warm_ttft` with `path = "warm_ttft_bypass"`. Three
+  readers name that string: `crates/rmlx-cli/tests/e2e/runner.rs`,
+  `crates/rmlx-models/tests/niah_long_context.rs` and
+  [`KV_QUANT.md`](KV_QUANT.md). The override travels with the body, so moving
+  it changes nothing — dropping or renaming it breaks all three.
 * **The `kv_bytes` request-boundary event.** `scripts/bench/tri_engine_summarize.py`
   reads it out of a run's stderr; the whole cross-engine comparison rests on
   that column.

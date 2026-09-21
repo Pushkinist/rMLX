@@ -1,10 +1,13 @@
-"""Small Rust source reader shared by the KV structural-metric producers.
+"""Enum and `match` reader for the KV structural-metric producers.
 
-It blanks comments and literals, finds an `enum` body, walks `match`
-expressions arm by arm, and finds a `fn` body brace to brace. It is not a Rust
-parser. It reads the shapes this tree writes and refuses, loudly, on a shape it
-cannot read back — a scan that silently drops a site reports a smaller number
-than the truth, which is the failure mode every producer here exists to avoid.
+It blanks comments and literals, finds an `enum` body, and walks `match`
+expressions arm by arm. It is not a Rust parser. It reads the shapes this tree
+writes and refuses, loudly, on a shape it cannot read back — a scan that
+silently drops a site reports a smaller number than the truth, which is the
+failure mode every producer here exists to avoid.
+
+`fn` bodies are **not** read here. `lib/debt_report.py` owns that scan, and
+both producers of the update-body figure call it, so the two cannot drift.
 """
 
 from __future__ import annotations
@@ -222,21 +225,3 @@ def _arms(blanked: str, start: int, stop: int) -> list[MatchArm]:
             continue
         i += 1
     return arms
-
-
-def fn_bodies(blanked: str, src: str) -> list[tuple[str, int, int, str]]:
-    """`(name, line, body line count, body)` for every `fn` with a block body.
-
-    The body is brace to brace, so the signature lines above it are not
-    counted.
-    """
-    out: list[tuple[str, int, int, str]] = []
-    for m in re.finditer(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)", blanked):
-        brace = blanked.find("{", m.end())
-        semi = blanked.find(";", m.end())
-        if brace < 0 or (0 <= semi < brace):
-            continue
-        end = block_end(blanked, brace)
-        body = src[brace : end]
-        out.append((m.group(1), line_of(blanked, m.start()), body.count("\n") + 1, body))
-    return out

@@ -806,11 +806,11 @@ check_exit "matched_lines_ssd_hydrate_after_exit" \
 
 rm -rf "$HYDRATE_WORK"
 
-# ---- --matched-lines: the per-variant update bodies -----------------------
+# ---- --matched-lines: the update_-prefixed fns of the update file ---------
 #
 # The three family populations above each read one codec's twins. This one
-# reads every per-variant body of the update file, which is the population the
-# "one update body per store shape" step has to shrink. Its pattern is the
+# reads every `update_`-prefixed fn of the update file, which is the population
+# the "one update body per store shape" step has to shrink. Its pattern is the
 # anchored `update_` prefix, so it holds the fns the three family patterns
 # select **and** the ones that belong to no family — which is the point: a
 # family-keyed counter cannot see a body shared across families.
@@ -820,7 +820,7 @@ UPDATE_BODIES_STATUS=$?
 
 check "matched_lines_update_bodies_before" \
     "every fn of the update file whose name starts update_, paired with every other: the rotor, iso and turbo per-variant bodies plus update_affine, which belongs to no family and which all three family patterns miss — the iso population's own iso_v_update / iso_sym_update do not carry the prefix, and an unanchored pattern would read 16 item(s)" \
-    contains "per-variant update bodies (crates/rmlx-kv-quant/src/kvcache/update.rs): 248 matched lines over 63 body lines (14 item(s), 91 pair(s))" \
+    contains "update_-prefixed fns of the update file (crates/rmlx-kv-quant/src/kvcache/update.rs): 248 matched lines over 63 body lines (14 item(s), 91 pair(s))" \
     UPDATE_BODIES_ML
 
 check_exit "matched_lines_update_bodies_before_exit" \
@@ -852,7 +852,7 @@ UPDATE_COLLAPSED_STATUS=$?
 
 check "matched_lines_update_bodies_after" \
     "one body left and so no pair: a measured 0 with the population still found, which the restructure's second step is judged on" \
-    contains "per-variant update bodies (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 4 body lines (1 item(s), 0 pair(s))" \
+    contains "update_-prefixed fns of the update file (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 4 body lines (1 item(s), 0 pair(s))" \
     UPDATE_COLLAPSED_ML
 
 check_exit "matched_lines_update_bodies_after_exit" \

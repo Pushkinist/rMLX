@@ -8,8 +8,8 @@ Four modes, each printing one figure the restructure is judged on:
 * `match-sites` — every `match` over `KvStorage` or `KvQuant` that enumerates
   the codec surface, per file, and the count. This is the "match sites a new
   codec must touch" figure.
-* `update-bodies` — the per-variant `update_*` fns of the update file, with the
-  lines their bodies hold.
+* `update-bodies` — every `update_`-prefixed fn of the update file, with the
+  lines its body holds.
 * `refs` — `KvStorage::` / `KvQuant::` variant references in one file.
 
 The figures are derived from the tree on every run. None of them is a hand
@@ -31,11 +31,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
+from debt_report import extract_fns, is_test_path  # noqa: E402
 from rust_scan import (  # noqa: E402
     ScanError,
     blank_text,
     enum_variants,
-    fn_bodies,
     match_sites,
 )
 
@@ -46,18 +46,12 @@ QUANT_ENUM_FILE = "crates/rmlx-kv-quant/src/quant.rs"
 UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
 CRATES_DIR = "crates"
 
-#: Name of a per-variant update body. The restructure's own population.
+#: Every `update_`-prefixed fn of the update file. Not only the per-variant
+#: bodies: the shared entries the dispatch reaches (`update_and_sdpa_*`,
+#: `update_decode_fp16*`, `update_prefill_raw`) carry the prefix and are
+#: counted with them. The prefix is the rule, so no hand-drawn boundary
+#: decides which body is "per-variant" enough to count.
 UPDATE_FN_PATTERN = re.compile(r"^update_")
-
-
-def is_test_path(rel: Path) -> bool:
-    name = rel.name
-    return (
-        name == "tests.rs"
-        or name.endswith("_tests.rs")
-        or "tests" in rel.parts[:-1]
-        or "fixtures" in rel.parts
-    )
 
 
 def fail(reason: str) -> None:
@@ -233,12 +227,13 @@ def mode_update_bodies(root: Path) -> None:
     path = root / UPDATE_FILE
     if not path.is_file():
         fail(f"{UPDATE_FILE} is not a file under {root}")
-    src, blanked = read_blanked(path)
-    try:
-        fns = fn_bodies(blanked, src)
-    except ScanError as exc:
-        fail(f"{UPDATE_FILE}: {exc}")
-    bodies = [(name, line, lines) for name, line, lines, _body in fns if UPDATE_FN_PATTERN.search(name)]
+    src, _blanked = read_blanked(path)
+    fns, _skipped = extract_fns(src)
+    bodies = [
+        (fn.name, fn.line, fn.body.count("\n") + 1)
+        for fn in fns
+        if UPDATE_FN_PATTERN.search(fn.name)
+    ]
     if not bodies:
         fail(f"{UPDATE_FILE} holds no update_* fn")
     for name, line, lines in bodies:

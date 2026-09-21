@@ -52,7 +52,9 @@
 //! * **`exit_prefill`.** The drive appends with `in_prefill` false, the only
 //!   CPU route on which all six spellings write a store — but it is not the
 //!   route production takes, and on this family `exit_prefill` is also
-//!   what *clears* every one of these stores.
+//!   what *clears* every one of these stores. Every turbo spelling is
+//!   decode-inert, so its bulk-encode arm is behind the gate and no drive
+//!   anywhere runs it.
 //! * **The fused flash-decode arms** and the turbo K fused-QK kernels
 //!   (`turbo_k3_fused_qk` / `turbo_k4_fused_qk`). Gated on `Device::Gpu`; a CPU
 //!   drive never reaches them.
@@ -71,7 +73,7 @@
 
 use super::core::KvCache;
 use super::store_bytes_tests::{
-    drive, shapes_for, CHUNK_SEQ, SHAPE_A, TEST_LAYER_IDX, TEST_MAX_SEQ,
+    assert_width_twins_differ, drive, shapes_for, CHUNK_SEQ, SHAPE_A, TEST_LAYER_IDX, TEST_MAX_SEQ,
 };
 use crate::storage::KvStorage;
 use crate::test_utils::{env_lock, f32_arr, lcg_data, TEST_SEED};
@@ -273,40 +275,24 @@ const fn expected_code_bytes(values: usize, bits: u8) -> usize {
     (values * bits as usize).div_ceil(8)
 }
 
-/// Width twins hold different stores.
+/// The turbo width pairs, handed to the shared control.
 ///
-/// The positive control for the pin table: a unification that collapsed two
-/// widths onto one instantiation would leave every assertion above satisfied
-/// by a re-baseline, and this one red.
+/// The pair list is the only part of the claim that is about the turbo codec;
+/// the drive, the columns and the assertions are the oracle's, in
+/// `store_bytes_tests.rs`.
 ///
 /// The two encoder pairs — `k8vturbo3` against `k8vturbo3tcq`, and the 2-bit
 /// pair — are deliberately **not** here. They write the same bytes today, and
 /// the test below is what says so and why.
 #[test]
 fn turbo_width_twins_hold_different_stores() {
-    let _guard = env_lock();
-    let pairs: [(KvQuant, KvQuant); 2] = [
-        (KvQuant::TurboSym3, KvQuant::TurboSym4),
-        (KvQuant::K8VTurbo3, KvQuant::K8VTurbo2),
-    ];
-    for (left, right) in pairs {
-        for shape in shapes_for(left) {
-            let a = drive(left, shape);
-            let b = drive(right, shape);
-            assert_ne!(
-                a.store_after_chunk, b.store_after_chunk,
-                "{left} and {right} @ kv_h={} head_dim={}: the two wrote the same store \
-                 bytes — one codec setting is not being applied",
-                shape.0, shape.1
-            );
-            assert_ne!(
-                a.store_after_decode, b.store_after_decode,
-                "{left} and {right} @ kv_h={} head_dim={}: the two wrote the same store \
-                 bytes after decode",
-                shape.0, shape.1
-            );
-        }
-    }
+    assert_width_twins_differ(
+        &[
+            (KvQuant::TurboSym3, KvQuant::TurboSym4),
+            (KvQuant::K8VTurbo3, KvQuant::K8VTurbo2),
+        ],
+        "one codec setting",
+    );
 }
 
 /// The TCQ encoder writes the same bytes as nearest-centroid assignment.

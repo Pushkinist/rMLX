@@ -207,11 +207,38 @@ pub fn dispatch(s: &KvStorage) -> usize {
 EOF
 check "a one-variant match is under the bar" "${T}" 0 "^match-sites 2$" match-sites --threshold 2
 
-# 5 — the bar is derived from the enum, not fixed: at a bar of 3 the update
-# file's own two-variant arm pattern still names three variants across the
-# match and stays in, while the clean tree measured at 5 finds nothing.
+# 5 — the bar is derived from the enum, not fixed. Each of the three planted
+# sites names all four variants, so it is in at a bar of 3 and out at a bar of
+# 5.
 T="${WORK}/bar"; build_tree "${T}"
+check "a bar at three keeps the four-variant sites" "${T}" 0 "^match-sites 3$" match-sites --threshold 3
 check "a bar above the enum finds nothing" "${T}" 0 "^match-sites 0$" match-sites --threshold 5
+
+# 5a — the derived bar itself, with no --threshold to supply one. Four variants
+# per enum, so the bar is 2, and a site naming exactly two is at it. Without
+# this case the derivation could be replaced by any constant at or below 2 and
+# every other case here would stay green.
+T="${WORK}/derived"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn pair(s: &KvStorage) -> usize {
+    match s {
+        KvStorage::Alpha { .. } => 1,
+        KvStorage::Beta { .. } => 2,
+        _ => 0,
+    }
+}
+EOF
+check "the derived bar is half the storage enum" "${T}" 0 "^enum KvStorage variants=4 threshold=2$" match-sites
+check "the derived bar is half the quant enum" "${T}" 0 "^enum KvQuant variants=4 threshold=2$" match-sites
+check "a two-variant site sits at the derived bar" "${T}" 0 "^match-sites 4$" match-sites
+
+# 5b — a fifth variant moves the bar to 3, and the two-variant site drops out
+# with it. The bar and the count move together, which a fixed bar cannot do.
+sed -i.bak 's/    Delta { state: MixedKvState, max_seq: i32 },/    Delta { state: MixedKvState, max_seq: i32 },\n    Epsilon { k: Option<QuantK>, max_seq: i32 },/' \
+    "${T}/${STORAGE_REL}"
+check "a fifth variant moves the derived bar" "${T}" 0 "^enum KvStorage variants=5 threshold=3$" match-sites
+check "the two-variant site drops below the moved bar" "${T}" 0 "^match-sites 3$" match-sites
 
 # 6 — `match` inside a comment and inside a string literal is text, not a site.
 T="${WORK}/text"; build_tree "${T}"
@@ -296,6 +323,24 @@ check "variant references are counted" "${T}" 0 "KvStorage=4 distinct=4" refs --
 T="${WORK}/norefs"; build_tree "${T}"
 printf 'pub fn nothing() -> usize { 1 }\n' >"${T}/${UPDATE_REL}"
 check "a file naming no variant is a refusal" "${T}" 2 "unavailable: .*names no" refs --file "${UPDATE_REL}"
+
+# 18 — a wide match planted in a test file. The producer measures production
+# source, so it is not counted; `--include-tests` is the one way to see it.
+# Without this case the test-file exclusion could be disabled and every other
+# case here would stay green.
+T="${WORK}/testfile"; build_tree "${T}"
+cat >"${T}/crates/rmlx-kv-quant/src/kvcache/update_tests.rs" <<'EOF'
+fn probe(s: &KvStorage) -> usize {
+    match s {
+        KvStorage::Alpha { .. } => 1,
+        KvStorage::Beta { .. } => 2,
+        KvStorage::Gamma { .. } => 3,
+        KvStorage::Delta { .. } => 4,
+    }
+}
+EOF
+check "a site in a test file is not counted" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+check "--include-tests counts the test file's site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2 --include-tests
 
 if [ "${failures}" -gt 0 ]; then
     echo >&2

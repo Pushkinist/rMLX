@@ -38,12 +38,11 @@
 //! Named so a reader knows where the iso coverage stops. No assertion here or
 //! in the shared oracle can turn red on a defect in any of it.
 //!
-//! * **The `exit_prefill` bulk-encode arms** (`kvcache/update.rs`, the `Iso*`
-//!   arms of the `exit_prefill` match). The drive appends with `in_prefill`
-//!   false, the only CPU route on which all six spellings write a store — but
-//!   it is not the route production takes. For the four spellings
-//!   that read their store at decode, the store a served request reads is the
-//!   one those arms bulk-encode.
+//! * **The `exit_prefill` bulk-encode arms of `iso3` and `iso4`**
+//!   (`kvcache/update.rs`, the `Iso*` arms of the `exit_prefill` match). The
+//!   gate returns before those two, so no CPU route runs them. The other four
+//!   — `iso3_sym`, `iso4_sym`, `k_iso3`, `k_iso4` — do run theirs, and the
+//!   shared oracle's second drive is what pins the bytes those arms write.
 //! * **The fused flash-decode arms.** `update_and_sdpa`'s iso K-only and iso
 //!   symmetric arms are gated on `device == Device::Gpu`, `q_seq == 1` and
 //!   `iso_flash_shape_ok` — which requires `b == 1`, `head_dim % 4 == 0`,
@@ -82,7 +81,9 @@
 //! post-truncate store bytes are a pinned column.
 
 use super::core::KvCache;
-use super::store_bytes_tests::{drive, shapes_for, CHUNK_SEQ, TEST_LAYER_IDX, TEST_MAX_SEQ};
+use super::store_bytes_tests::{
+    assert_width_twins_differ, shapes_for, CHUNK_SEQ, TEST_LAYER_IDX, TEST_MAX_SEQ,
+};
 use crate::storage::KvStorage;
 use crate::test_utils::{env_lock, f32_arr, lcg_data, TEST_SEED};
 use crate::{KvQuant, ALL_KV_QUANTS};
@@ -242,37 +243,21 @@ fn iso_store_geometry_follows_the_codec_bit_width() {
     }
 }
 
-/// The 3-bit and 4-bit members of each twin pair are not the same store.
+/// The iso width pairs, handed to the shared control.
 ///
-/// The positive control for the pin table: a unification that collapsed both
-/// widths onto one instantiation would leave every assertion above satisfied by
-/// a re-baseline, and this one red.
+/// The pair list is the only part of the claim that is about the iso codec;
+/// the drive, the columns and the assertions are the oracle's, in
+/// `store_bytes_tests.rs`.
 #[test]
 fn three_and_four_bit_twins_hold_different_stores() {
-    let _guard = env_lock();
-    let pairs: [(KvQuant, KvQuant); 3] = [
-        (KvQuant::Iso3, KvQuant::Iso4),
-        (KvQuant::Iso3Sym, KvQuant::Iso4Sym),
-        (KvQuant::IsoKOnly3, KvQuant::IsoKOnly4),
-    ];
-    for (three, four) in pairs {
-        for shape in shapes_for(three) {
-            let a = drive(three, shape);
-            let b = drive(four, shape);
-            assert_ne!(
-                a.store_after_chunk, b.store_after_chunk,
-                "{three} and {four} @ kv_h={} head_dim={}: the two widths wrote the same \
-                 store bytes — one width is not being applied",
-                shape.0, shape.1
-            );
-            assert_ne!(
-                a.store_after_decode, b.store_after_decode,
-                "{three} and {four} @ kv_h={} head_dim={}: the two widths wrote the same \
-                 store bytes after decode",
-                shape.0, shape.1
-            );
-        }
-    }
+    assert_width_twins_differ(
+        &[
+            (KvQuant::Iso3, KvQuant::Iso4),
+            (KvQuant::Iso3Sym, KvQuant::Iso4Sym),
+            (KvQuant::IsoKOnly3, KvQuant::IsoKOnly4),
+        ],
+        "one width",
+    );
 }
 
 /// The GPU-resident iso V mirror writes no byte in production.
