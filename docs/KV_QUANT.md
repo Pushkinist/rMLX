@@ -1529,8 +1529,8 @@ TurboQuant 4-bit MSL kernel (`turboquant_msl::turbo_quantize_v4_gpu` /
 take a flat f32 buffer plus a 4-D shape and produce flat codes/scales —
 so the K side and V side share dispatch, **no kernel fork** (shared dispatch).
 
-The K and V buffers are kept as **independent types** (`QuantKTurbo4` and
-`QuantV`), not a renamed wrapper, so the two append paths stay decoupled
+The K and V buffers are kept as **independent types** (`QuantKTurbo<4>`,
+spelled `QuantKTurbo4`, and `QuantV`), so the two append paths stay decoupled
 inside `KvStorage::TurboSym4 { k, v, max_seq }`. Layout tag (single source
 of truth for the SSD geometry header):
 
@@ -1591,8 +1591,10 @@ layout tag below names the Lloyd-Max codebook the encoder does apply. See §"The
 turbo family's missing rotation — what it is worth, and where" for what the
 absent transform would buy and on which axis.
 
-The K buffer is `QuantKTurbo3` (independent type from `QuantK` and
-`QuantKTurbo4`), decoupled from V to keep append paths separate.
+The K buffer is `QuantKTurbo<3>`, spelled `QuantKTurbo3` — the same
+const-generic store the 4-bit spelling instantiates at its own width, and a
+type of its own against `QuantK` and `QuantV`, so the append paths stay
+separate.
 Layout tag (single source of truth for SSD geometry header):
 
 ```

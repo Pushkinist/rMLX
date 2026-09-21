@@ -65,6 +65,28 @@ impl Cache {
         self.seq * 2
     }
 
+    fn update_tsym3(&mut self, n: usize) -> usize {
+        let scaled = n * 3;
+        self.seq += scaled;
+        self.seq
+    }
+
+    fn update_tsym4(&mut self, n: usize) -> usize {
+        let scaled = n * 4;
+        self.seq += scaled;
+        self.seq
+    }
+
+    fn update_k8vturbo3(&mut self, n: usize) -> usize {
+        self.seq += n;
+        self.seq * 3
+    }
+
+    fn update_k8vturbo2(&mut self, n: usize) -> usize {
+        self.seq += n;
+        self.seq * 2
+    }
+
     fn update_affine(&mut self, n: usize) -> usize {
         self.seq += n;
         self.seq
