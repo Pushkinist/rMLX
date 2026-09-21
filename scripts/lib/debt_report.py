@@ -110,6 +110,12 @@ TURBO_UPDATE_FN_PATTERN = r"(^|_)tsym(\d|_|$)"
 # suffix, and a digit-bearing pattern would find nothing and report the
 # population unavailable rather than a measured 0.
 TURBO_SSD_FN_PATTERN = r"(turbo|tsym)"
+# Every per-variant update body of the update file, whatever family it belongs
+# to. The three family patterns above each read one codec's twins; this one
+# reads the whole per-variant population, which is what the "one update body
+# per store shape" step has to shrink. An anchored prefix, because a per-variant
+# body is what the dispatch enters and every one of them is spelled `update_`.
+UPDATE_FN_PATTERN = r"^update_"
 MODELS_SOURCE_DIR = "crates/rmlx-models/src"
 SSD_HYDRATE_FN_NAMES = ("from_hydrated", "hydrate")
 WORKSPACE_SOURCE_DIR = "crates"
@@ -604,6 +610,16 @@ MATCHED_LINES_POPULATIONS = {
         width_pair_key,
     ),
     "ssd-hydrate": Population("ssd hydrate twins", MODELS_SOURCE_DIR, ssd_hydrate_items),
+    # Every pair, not `width_pair_key`: the claim this figure measures is that
+    # the per-variant bodies share one sequence whatever codec they belong to,
+    # so a key that only compares two widths of one family would report a 0
+    # the moment the widths collapsed and say nothing about the shape the
+    # restructure writes once.
+    "update-bodies": Population(
+        "per-variant update bodies",
+        KV_UPDATE_FILE,
+        functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=UPDATE_FN_PATTERN),
+    ),
 }
 
 

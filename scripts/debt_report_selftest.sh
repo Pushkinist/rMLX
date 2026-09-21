@@ -806,6 +806,88 @@ check_exit "matched_lines_ssd_hydrate_after_exit" \
 
 rm -rf "$HYDRATE_WORK"
 
+# ---- --matched-lines: the per-variant update bodies -----------------------
+#
+# The three family populations above each read one codec's twins. This one
+# reads every per-variant body of the update file, which is the population the
+# "one update body per store shape" step has to shrink. Its pattern is the
+# anchored `update_` prefix, so it holds the fns the three family patterns
+# select **and** the ones that belong to no family — which is the point: a
+# family-keyed counter cannot see a body shared across families.
+
+UPDATE_BODIES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines update-bodies 2>&1)
+UPDATE_BODIES_STATUS=$?
+
+check "matched_lines_update_bodies_before" \
+    "every fn of the update file whose name starts update_, paired with every other: the rotor, iso and turbo per-variant bodies plus update_affine, which belongs to no family and which all three family patterns miss — the iso population's own iso_v_update / iso_sym_update do not carry the prefix, and an unanchored pattern would read 16 item(s)" \
+    contains "per-variant update bodies (crates/rmlx-kv-quant/src/kvcache/update.rs): 248 matched lines over 63 body lines (14 item(s), 91 pair(s))" \
+    UPDATE_BODIES_ML
+
+check_exit "matched_lines_update_bodies_before_exit" \
+    "a population with members is a measurement, exit 0" \
+    0 "$UPDATE_BODIES_STATUS"
+
+# One body per store shape, the step's end state: the per-variant bodies are
+# gone and one shared body is left. The figure must fall to a measured 0 with
+# the population still found, which is a different answer from unavailable.
+UPDATE_COLLAPSED_WORK="$(mktemp -d)"
+cp -R "$BASE" "$UPDATE_COLLAPSED_WORK/base"
+python3 - "$UPDATE_COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+# Every per-variant body but the first goes; the dispatch enters the one that
+# is left. This is the shape the restructure's second step lands.
+names = re.findall(r"\n    fn (update_\w+)\(", text)
+for name in names[1:]:
+    text = re.sub(r"\n    fn " + name + r"\(.*?\n    \}\n", "\n", text, flags=re.S)
+path.write_text(text)
+EOF
+
+UPDATE_COLLAPSED_ML=$(python3 "$TOOL" --root "$UPDATE_COLLAPSED_WORK/base" --matched-lines update-bodies 2>&1)
+UPDATE_COLLAPSED_STATUS=$?
+
+check "matched_lines_update_bodies_after" \
+    "one body left and so no pair: a measured 0 with the population still found, which the restructure's second step is judged on" \
+    contains "per-variant update bodies (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 4 body lines (1 item(s), 0 pair(s))" \
+    UPDATE_COLLAPSED_ML
+
+check_exit "matched_lines_update_bodies_after_exit" \
+    "a collapsed population is a measured 0, exit 0" \
+    0 "$UPDATE_COLLAPSED_STATUS"
+
+rm -rf "$UPDATE_COLLAPSED_WORK"
+
+# The population emptied: no fn of the file carries the prefix at all. Renaming
+# a body out of the prefix is how this differs from collapsing one, and the two
+# must not print the same thing.
+UPDATE_EMPTY_WORK="$(mktemp -d)"
+cp -R "$BASE" "$UPDATE_EMPTY_WORK/base"
+python3 - "$UPDATE_EMPTY_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_text(path.read_text().replace("fn update_", "fn apply_"))
+EOF
+
+UPDATE_EMPTY_ML=$(python3 "$TOOL" --root "$UPDATE_EMPTY_WORK/base" --matched-lines update-bodies 2>&1)
+UPDATE_EMPTY_STATUS=$?
+
+check "matched_lines_update_bodies_empty_unavailable" \
+    "renaming every body out of the prefix empties the population: unavailable, not the 0 a collapsed population reads" \
+    contains "debt-report --matched-lines update-bodies: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs: population is empty)" \
+    UPDATE_EMPTY_ML
+
+check_exit "matched_lines_update_bodies_empty_exit" \
+    "an unavailable population exits 1" \
+    1 "$UPDATE_EMPTY_STATUS"
+
+rm -rf "$UPDATE_EMPTY_WORK"
+
 # ---- absent: zero members, and a missing root, are unavailable not 0 ------
 
 ABSENT_WORK="$(mktemp -d)"
