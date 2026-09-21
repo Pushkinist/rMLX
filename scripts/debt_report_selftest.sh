@@ -492,6 +492,64 @@ check "matched_lines_update_bodies_split_unchanged" \
 
 rm -rf "$SPLIT_WORK"
 
+# ---- orientation: an asymmetric pair, measured the same whichever way -----
+#
+# `difflib.SequenceMatcher` is not symmetric: it anchors on the longest match
+# it finds in its first argument. The two bodies below share four lines read
+# one way and three the other, and they are the only pair in this file that
+# does — every other planted body is too short or too uniform for the
+# asymmetry to show, which is why a producer that measured one way round and
+# ordered its pairs by the file layout passed all of them.
+#
+# Two arrangements, because one alone cannot hold both rules. The bodies are
+# the same; which name carries which decides whether the name order reaches
+# the larger reading or the smaller one.
+
+orient_tree() { # orient_tree ROOT FIRST_BODY SECOND_BODY
+    local root="$1" first="$2" second="$3"
+    rm -rf "$root"
+    cp -R "$BASE" "$root"
+    local dir="$root/crates/rmlx-kv-quant/src/kvcache"
+    printf 'impl KvCache {\n    fn update_zz(&mut self) {\n%b    }\n}\n' "$first" >"$dir/update.rs"
+    printf 'impl KvCache {\n    fn update_aa(&mut self) {\n%b    }\n}\n' "$second" >"$dir/update_rotor.rs"
+}
+
+# `b a c a` read against `a a a b` matches three lines; the other way round,
+# four.
+ORIENT_BAC="        b();\n        a();\n        c();\n        a();\n"
+ORIENT_AAB="        a();\n        a();\n        a();\n        b();\n"
+ORIENT_EXPECTED="update_-prefixed fns of the update files (crates/rmlx-kv-quant/src/kvcache/update*.rs): 4 matched lines over 12 body lines (2 item(s), 1 pair(s))"
+
+ORIENT_WORK="$(mktemp -d)"
+
+# The first name carries the body that reads the smaller count when it is
+# measured first. Only measuring both ways round reaches 4 here.
+orient_tree "$ORIENT_WORK/base" "$ORIENT_AAB" "$ORIENT_BAC"
+ORIENT_ML=$(python3 "$TOOL" --root "$ORIENT_WORK/base" --matched-lines update-bodies 2>&1)
+ORIENT_STATUS=$?
+
+check "matched_lines_orientation_both_ways" \
+    "the pair shares four lines one way and three the other, and the name order reaches the three: a one-directional measure reads 3 here, so this case is what holds the measure to the larger of the two" \
+    contains "$ORIENT_EXPECTED" \
+    ORIENT_ML
+
+check_exit "matched_lines_orientation_both_ways_exit" \
+    "a measured population exits 0" \
+    0 "$ORIENT_STATUS"
+
+# The same two bodies with the names swapped. Here the name order reaches the
+# larger count on its own, so this case is the one that fails if the pair list
+# is left in collector order while the measure is one-directional.
+orient_tree "$ORIENT_WORK/base" "$ORIENT_BAC" "$ORIENT_AAB"
+ORIENT_NAMED_ML=$(python3 "$TOOL" --root "$ORIENT_WORK/base" --matched-lines update-bodies 2>&1)
+
+check "matched_lines_orientation_name_order" \
+    "swapping which name carries which body leaves the figure where it was — with the pair list in collector order and a one-directional measure this reads 3" \
+    contains "$ORIENT_EXPECTED" \
+    ORIENT_NAMED_ML
+
+rm -rf "$ORIENT_WORK"
+
 # ---- collapsed: the width twin is gone, the population is still found -----
 
 COLLAPSED_WORK="$(mktemp -d)"

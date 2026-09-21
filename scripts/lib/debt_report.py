@@ -396,11 +396,23 @@ def matched_lines(a: str, b: str) -> int:
     between `a` and `b`, over the same digit-folded, `autojunk=False` lines
     `similarity()` compares — a line count, not a ratio. This is the figure
     the round-loop migration chunks reported by hand; `--matched-lines` is
-    its one producer now."""
+    its one producer now.
+
+    Measured both ways round and reported as the larger. `SequenceMatcher` is
+    not symmetric: it anchors on the longest match it finds in `a` and can
+    reach a smaller total with the arguments swapped. A one-directional
+    measure would therefore move when a body changed file, or was renamed, or
+    when a population gained an item that re-ordered it — with no line of any
+    body changing. The larger of the two is the count of lines the pair
+    genuinely shares, and it depends on the pair alone."""
     a_lines = normalize(a).splitlines()
     b_lines = normalize(b).splitlines()
-    sm = difflib.SequenceMatcher(None, a_lines, b_lines, autojunk=False)
-    return sum(block.size for block in sm.get_matching_blocks())
+    forward = difflib.SequenceMatcher(None, a_lines, b_lines, autojunk=False)
+    reverse = difflib.SequenceMatcher(None, b_lines, a_lines, autojunk=False)
+    return max(
+        sum(block.size for block in forward.get_matching_blocks()),
+        sum(block.size for block in reverse.get_matching_blocks()),
+    )
 
 
 @dataclass
@@ -560,11 +572,7 @@ def glob_fn_items(root: Path, *, directory: str, glob: str, pattern: str) -> lis
     for path in paths:
         fns, _skipped = fns_in_file(root, path)
         items.extend(fn for fn in fns if matches(fn.name))
-    # Name-sorted, not file-then-line. `difflib`'s matching-block sum is not
-    # symmetric, so a pairing order that followed the file layout would move
-    # the figure when a body changed file with no line of it changing — the
-    # one event this population exists to measure across.
-    return sorted(items, key=lambda fn: (fn.name, fn.file, fn.line))
+    return items
 
 
 def ssd_hydrate_items(root: Path) -> list[FnInfo]:
@@ -668,8 +676,9 @@ MATCHED_LINES_POPULATIONS = {
     ),
     "ssd-hydrate": Population("ssd hydrate twins", MODELS_SOURCE_DIR, ssd_hydrate_items),
     # Every pair, not `width_pair_key`: the claim this figure measures is that
-    # the update bodies share one sequence whatever codec they belong to, so a key that only compares two widths of one family would report a 0
-    # the moment the widths collapsed and say nothing about the shape the
+    # the update bodies share one sequence whatever codec they belong to, so a
+    # key that only compares two widths of one family would report a 0 the
+    # moment the widths collapsed and say nothing about the shape the
     # restructure writes once.
     "update-bodies": Population(
         "update_-prefixed fns of the update files",
@@ -687,6 +696,17 @@ MATCHED_LINES_POPULATIONS = {
 def population_pairs(
     items: list[FnInfo], pair_key: Callable[[FnInfo], str] | None
 ) -> list[tuple[FnInfo, FnInfo]]:
+    """Every pair a population contributes, in one order whatever order its
+    collector walked the tree in.
+
+    One sort here rather than one per collector: a collector's walk order is
+    the file layout, and three of them (the glob over the update files, the
+    hydrate scan over the model tree, the `impl RoundDrafter` scan) return a
+    population whose order a move or a rename changes. `matched_lines` is
+    measured both ways round, so no figure depends on this order any more;
+    what the sort buys is that the pair list is a function of the population
+    and not of the filesystem walk."""
+    items = sorted(items, key=lambda fn: (fn.name, fn.file, fn.line))
     if pair_key is None:
         return list(itertools.combinations(items, 2))
     groups: dict[str, list[FnInfo]] = {}

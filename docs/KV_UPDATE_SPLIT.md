@@ -353,34 +353,52 @@ numbers, so both read fns through `lib/debt_report.py`'s `extract_fns`;
 **Before:** 3585 matched lines over 1440 body lines, 25 items, 300 pairs.
 (Before the three collapses: 12122 over 2539, 33 items, 528 pairs.)
 
-**The root is a glob, and the pairing is name-sorted.** Chunk (a) re-rooted the
-four update populations from the one file onto
+**The root is a glob, and the measure is orientation-free.** Chunk (a)
+re-rooted the four update populations from the one file onto
 `crates/rmlx-kv-quant/src/kvcache/update*.rs` — the dispatch file plus one file
 per codec family — through one collector given its directory, glob and name
-pattern at the registration site. The pairing order changed with it: the items
-are sorted by name before they are paired, because `difflib`'s matching-block
-sum is not symmetric and a file-layout order moved `update-bodies` by 21 lines
-when the same 25 bodies were regrouped across seven files with no line of any
-of them changing. Under the name-sorted rule the figure is the same on the
-commit before chunk (a) and on the tree after it:
+pattern at the registration site.
+
+The measure had to change with it. `difflib.SequenceMatcher` anchors on the
+longest match it finds in its first argument, so its matching-block sum is not
+symmetric: measured one way round, the figure moved by 21 lines when the same
+25 bodies were regrouped across seven files with no line of any of them
+changing. It would have moved again on a rename, and again when a population
+gained an item that re-ordered it. `matched_lines` now measures each pair both
+ways round and reports the larger — the count of lines the pair genuinely
+shares, which depends on the pair alone. `population_pairs` sorts the
+population by name first, so the pair list is a function of the population and
+not of the filesystem walk; no figure depends on that order any more.
+
+Under the orientation-free measure the figure is the same on the commit before
+chunk (a) and on the tree after it:
 
 | Population | Before chunk (a) | After chunk (a) |
 |---|---|---|
 | `rotor-updates` | 0 over 105 (4 items, 0 pairs) | same |
-| `iso-updates` | 870 over 625 (21 items, 210 pairs) | same |
+| `iso-updates` | 878 over 625 (21 items, 210 pairs) | same |
 | `turbo-updates` | 0 over 91 (2 items, 0 pairs) | same |
-| `update-bodies` | 3565 over 1440 (25 items, 300 pairs) | same |
+| `update-bodies` | 3610 over 1440 (25 items, 300 pairs) | same |
 
-The `iso-updates` and `update-bodies` rows read 875 and 3585 under the old
-file-order pairing; both are the same bodies measured under a rule that no
-longer depends on which file holds one.
+Three figures in the tree moved when the measure did, on both arms alike, with
+no body changing: `iso-updates` 875 → 878, `update-bodies` 3585 → 3610, and
+`impls` 919 → 936 ([`SPEC_ROUND_SKELETON.md`](SPEC_ROUND_SKELETON.md) records
+that one). The eight other populations are unchanged; each of them either
+forms no pair or holds pairs `difflib` reads the same either way.
 
-Recall: nine cases in `scripts/debt_report_selftest.sh` — the planted population
-held to its figure and its item and pair count, one body left reading a
-measured `0` with the population still found, every body renamed out of the
-prefix reading `unavailable`, a glob that matches no file named apart from a
-root whose files hold no matching fn, and three sym bodies moved into a family
-file of their own leaving every figure where it was.
+Recall: twelve cases in `scripts/debt_report_selftest.sh` — the planted
+population held to its figure and its item and pair count, one body left
+reading a measured `0` with the population still found, every body renamed out
+of the prefix reading `unavailable`, a glob that matches no file named apart
+from a root whose files hold no matching fn, three sym bodies moved into a
+family file of their own leaving every figure where it was, and one planted
+pair that shares four lines read one way and three read the other, in both
+arrangements of its two names. That pair is the only one in the fixture tree
+whose figure the orientation rule can move — every other planted body is too
+short or too uniform for the asymmetry to show, which is why a one-directional
+producer passed every case in the file before it was planted. Measured: with
+the pair present, reverting `matched_lines` to one direction turns one case
+red; reverting it and dropping the sort together turns the other red.
 
 ---
 
