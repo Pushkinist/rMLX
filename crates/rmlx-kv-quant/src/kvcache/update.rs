@@ -1,18 +1,13 @@
-// LOC-exempt: the per-family bodies now live beside their storage family in
-// the sibling `update_*.rs` modules. What stays is the dispatch itself — the
-// `KvStorage` and `KvQuant` matches, the prefill and decode capacity
-// bookkeeping, the bf16 decode mirror and the helpers more than one family
-// calls — and it is still over the guideline. Writing one update body per
-// store shape is what removes the rest; docs/KV_UPDATE_SPLIT.md holds the
-// plan.
+// LOC-exempt: the per-family decode bodies now live beside their storage
+// family in the sibling `update_*.rs` modules. Two thirds of what is left is
+// `exit_prefill` — 1258 of 3192 lines, 39 % of the file — whose arms are the
+// per-family bulk-encode bodies. They read locals the enclosing fn builds, so
+// moving one is an extraction and not a move, and they are extracted in the
+// chunk that rewrites them. The rest is the dispatch itself: the `KvStorage`
+// and `KvQuant` matches, the prefill and decode capacity bookkeeping, the
+// bf16 decode mirror, and the helpers more than one family calls.
+// docs/KV_UPDATE_SPLIT.md holds the plan.
 //! Update paths: `update`, prefill, GPU state management, and storage-specific appenders.
-#![allow(
-    clippy::cognitive_complexity,
-    clippy::items_after_statements,
-    clippy::manual_let_else,
-    clippy::match_same_arms,
-    clippy::too_many_lines
-)]
 
 use std::sync::OnceLock;
 
@@ -113,14 +108,16 @@ pub(super) fn collapse_group_norms_to_token(
 }
 
 /// Advance a rotor K store's accumulated `shape` by one appended chunk,
-/// matching the `QuantRotorK{3,4}::append` bookkeeping. Shared by the
-/// block-pushing and ring-only append paths so `shape[2]` advances identically
-/// whether or not a CPU block is materialised.
+/// matching the `QuantRotorK{3,4}::append` bookkeeping. The iso K and V
+/// appenders keep the same bookkeeping, so the name says what the helper does
+/// and not which family first needed it. Shared by the block-pushing and
+/// ring-only append paths so `shape[2]` advances identically whether or not a
+/// CPU block is materialised.
 #[allow(
     clippy::indexing_slicing,
     reason = "shape rank-4 guard above each indexing site; new_shape rank validated by upstream encoder helper"
 )]
-pub(super) fn bump_rotor_k_shape(shape: &mut Vec<i32>, new_shape: &[i32]) {
+pub(super) fn bump_ring_k_shape(shape: &mut Vec<i32>, new_shape: &[i32]) {
     if shape.len() != 4 || shape[0] == 0 {
         *shape = new_shape.to_vec();
     } else {

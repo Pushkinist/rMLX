@@ -5,13 +5,6 @@
 //! the chunk appenders and the materialise-tail path. The `KvStorage`
 //! dispatch and the helpers with more than one family caller stay in
 //! [`super::update`].
-#![allow(
-    clippy::cognitive_complexity,
-    clippy::items_after_statements,
-    clippy::manual_let_else,
-    clippy::match_same_arms,
-    clippy::too_many_lines
-)]
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
@@ -20,7 +13,7 @@ use crate::storage::{iso_n_groups_for, IsoBlocks, KvStorage, QuantIsoK, QuantIso
 
 use super::helpers::{array_to_f32_vec, f32_vec_to_array, storage_variant_name};
 use super::update::{
-    accumulated_seq, b_kv_h_new_seq, bump_rotor_k_shape, collapse_group_norms_to_token,
+    accumulated_seq, b_kv_h_new_seq, bump_ring_k_shape, collapse_group_norms_to_token,
     head_dim_from_shape, is_ring_only_append, packed_k_chunk_seq_major, storage_mismatch,
     PackedKEncodedGpu, RingFeed,
 };
@@ -83,7 +76,7 @@ pub(super) fn iso_gpu_append_into_k_blocks<const BITS: u8>(
             max_seq,
             device,
         )?;
-        bump_rotor_k_shape(&mut ks.shape, new_shape);
+        bump_ring_k_shape(&mut ks.shape, new_shape);
         return Ok(());
     }
     // Block path: prefill / non-fused decode (Maintain) and the K-side of the
@@ -431,7 +424,7 @@ pub(super) fn iso_gpu_append_into_v_blocks<const BITS: u8>(
             max_seq,
             device,
         )?;
-        bump_rotor_k_shape(&mut vs.shape, new_shape);
+        bump_ring_k_shape(&mut vs.shape, new_shape);
         return Ok(());
     }
     vs.reconcile_ring(device, crate::storage::RingDisposition::Keep)?;
@@ -443,7 +436,7 @@ pub(super) fn iso_gpu_append_into_v_blocks<const BITS: u8>(
     let (block, gpu) = iso_gpu_encode_block_retaining(&seq_major, new_shape, BITS)?;
     iso_v_sync_ring(vs, &gpu, block_feed, new_shape, head_dim, max_seq, device)?;
     vs.blocks.push(block);
-    bump_rotor_k_shape(&mut vs.shape, new_shape);
+    bump_ring_k_shape(&mut vs.shape, new_shape);
     Ok(())
 }
 /// Test seam onto the iso V append, at the width and feed the caller states.

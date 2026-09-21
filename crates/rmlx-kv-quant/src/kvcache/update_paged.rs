@@ -3,13 +3,6 @@
 //! Holds the one update-side body that only the paged storage uses. The
 //! `KvStorage` dispatch and the helpers with more than one family caller stay
 //! in [`super::update`].
-#![allow(
-    clippy::cognitive_complexity,
-    clippy::items_after_statements,
-    clippy::manual_let_else,
-    clippy::match_same_arms,
-    clippy::too_many_lines
-)]
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};

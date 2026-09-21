@@ -37,6 +37,10 @@
 //! - `docs/KV_CACHE.md` — subsystem spec.
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
 #![allow(unsafe_code)]
+// The update path is a per-codec dispatch over a 27-variant enum, and these
+// five fire on the shape that dispatch has rather than on a defect. An inner
+// attribute on a module file governs every descendant, so this is the whole
+// module's one copy: the per-family update files carry none.
 #![allow(
     clippy::cognitive_complexity,
     clippy::items_after_statements,
