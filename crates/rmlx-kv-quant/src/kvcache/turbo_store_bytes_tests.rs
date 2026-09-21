@@ -1,89 +1,57 @@
-//! Byte-level lock on the TurboQuant storage layer, at the deepest seam a
-//! caller can reach on CPU.
+//! What the turbo family claims about its own stores, beyond what the shared
+//! store-bytes oracle pins.
 //!
-//! Sibling of `rotor_store_bytes_tests.rs` and `iso_store_bytes_tests.rs`. The
-//! method is the same and is not restated here; `docs/KV_ROTOR_TWINS.md` holds
-//! it. This file states what the turbo family pins and where it stops, and
-//! `docs/KV_TURBO_TWINS.md` holds the decisions it is the oracle for.
+//! The pin table, the drive and the census live in `store_bytes_tests.rs` and
+//! cover every spelling `ALL_KV_QUANTS` holds. This file holds the five claims
+//! that are about the TurboQuant codec and about nothing else: that exactly two
+//! spellings build the K-side store, that the store geometry follows the
+//! spelling's own bit width, that the widths write different stores, that the
+//! TCQ spellings set the Viterbi flag and still write the plain bytes, and that
+//! every turbo spelling is decode-inert.
 //!
-//! # What cannot move
+//! # Why a served digest cannot judge this family
 //!
-//! Every turbo spelling that exists before the K-storage unification exists
-//! after it, and for each spelling, at each shape:
-//!
-//! * the **packed store bytes** are identical — every `codes` byte, every
-//!   `scales` float, the block boundaries, the per-block bit tag, the
-//!   accumulated shape, the GPU-buffer bookkeeping and the affine q8_0
-//!   companion plane on the asymmetric spellings;
-//! * the **K and V rows the attention receives** from that store are
-//!   identical, bit for bit, at the chunk append and at every decode step;
-//! * `resident_bytes()` is identical;
-//! * and the served temp-0 token stream is identical.
-//!
-//! There is no named exception on this axis. The collapse's one intended
-//! observable change is on the SSD hydrate path, outside this file:
-//! `crates/rmlx-kv-ssd/src/block_io_turbo_hydrate_tests.rs` holds it.
-//!
-//! Two pairs of pin rows are identical and are meant to be: a TCQ spelling
-//! writes the same bytes as its plain sibling, for a structural reason the
-//! last-but-one test states and measures. That is a property of the TCQ
-//! encoder, not of this collapse.
-//!
-//! # Why the served digest is not the oracle
-//!
-//! Stronger here than on any other family. All six turbo spellings report
-//! `decode_reads_packed_store() == false`, `feeds_bf16_k_at_decode(false)`
-//! and `feeds_bf16_v_at_decode(false)`, so `materialises_packed_store()` is
-//! false for every one of them, and the form that takes is stronger than "the
-//! store stops being read". `exit_prefill` returns at its
-//! `materialises_packed_store()` gate, **before** every arm that would bulk
-//! encode one, and clears whatever payload the cache arrived carrying. A
+//! Stronger here than on any other. All six turbo spellings report
+//! `decode_reads_packed_store() == false`, `feeds_bf16_k_at_decode(false)` and
+//! `feeds_bf16_v_at_decode(false)`, so `materialises_packed_store()` is false
+//! for every one of them. `exit_prefill` returns at its
+//! `materialises_packed_store()` gate **before** every arm that would bulk
+//! encode a store, and clears whatever payload the cache arrived carrying. A
 //! served prefill therefore writes no turbo store at all, and the decode
 //! entries short-circuit to `update_decode_fp16` while the bf16 seed is live.
 //! **No served capture can read a single turbo store byte**, at any width, on
-//! any model: a run against an empty store and a run against a correct one
-//! emit the same tokens. The store bytes are observable here and nowhere
-//! else, which is why this file drives `update` with `in_prefill` false and no
-//! bf16 seed — that is the one CPU route on which all six codecs write their
-//! store.
+//! any model.
+//!
+//! Two pairs of the oracle's pin rows are identical and are meant to be: a TCQ
+//! spelling writes the same bytes as its plain sibling, for a structural reason
+//! the TCQ test below states and measures. That is a property of the encoder,
+//! not of any collapse.
 //!
 //! # Shapes
 //!
-//! Two, the same pair the rotor and iso pins use, so a reviewer reading the
-//! three files side by side compares like with like:
+//! The oracle's two:
 //!
 //! | shape | `kv_h` | `head_dim` | why |
 //! |---|---|---|---|
 //! | A | 1 | 128 | single KV head (shared-KV arch); power-of-two `head_dim` |
 //! | B | 4 | 96 | `kv_h > 1`; non-power-of-two `head_dim` |
 //!
-//! **No turbo shape has a ragged group.** The codec groups `GROUP_SIZE` (32)
-//! elements over the last axis, and both `head_dim` values divide by 32
-//! exactly, so the padded-last-group case cannot occur here and there is no
-//! third shape to add for it.
+//! # What this file cannot see
 //!
-//! The other axis of each spelling sets the floor: the q8_0 K side of the four
-//! asymmetric spellings needs `B * kv_h * seq * head_dim % 128 == 0` on
-//! **every** chunk including a one-token step. Shape A gives 3072 and 128;
-//! shape B gives 9216 and 384. All four are multiples of 128.
-//!
-//! # What this pin cannot see
-//!
-//! Named so the collapse's reviewer knows where this file stops. Every item is
-//! inside, or reached from, the files the collapse unifies, and no assertion
-//! here can turn red on a defect in it.
+//! Named so a reader knows where the turbo coverage stops. No assertion here
+//! or in the shared oracle can turn red on a defect in any of it.
 //!
 //! * **The V-axis device split.** `tsym_update` resolves the V device from
 //!   `BITS` — `Device::Cpu` at 3, the caller's device at 4. On a CPU drive the
-//!   two are the same routing, so **nothing in this file can tell a body that
+//!   two are the same routing, so **nothing on this path can tell a body that
 //!   keeps the rule from one that lost it.** The rule is
 //!   load-bearing: `QuantV::append` enters its GPU branch on `device ==
 //!   Device::Gpu` with no bit-width guard and then returns `Error::Quant` for
 //!   `bits != 4`, so a 3-bit V handed `Device::Gpu` fails the append. The gate
 //!   over it is `make gpu-test` and the served capture.
-//! * **`exit_prefill`.** This file drives `update` with `in_prefill` false,
-//!   the only CPU route on which all six spellings write a store — but it is
-//!   not the route production takes, and on this family `exit_prefill` is also
+//! * **`exit_prefill`.** The drive appends with `in_prefill` false, the only
+//!   CPU route on which all six spellings write a store — but it is not the
+//!   route production takes, and on this family `exit_prefill` is also
 //!   what *clears* every one of these stores.
 //! * **The fused flash-decode arms** and the turbo K fused-QK kernels
 //!   (`turbo_k3_fused_qk` / `turbo_k4_fused_qk`). Gated on `Device::Gpu`; a CPU
@@ -96,70 +64,19 @@
 //! * **`from_cpu_blocks` and `try_deep_clone`** — the SSD-hydrate and
 //!   branch-clone constructors. Never called on this path. The hydrate half is
 //!   pinned in `rmlx-kv-ssd`.
-//! * **`max_seq`.** Deliberately not a digest field. Both K stores carry one,
-//!   neither ever reads it — `append` sizes its buffer from its own `max_seq`
-//!   parameter — so pinning it here would force a re-baseline over a field no
-//!   decode path reads. Where it is *not* inert is the hydrate constructor,
+//! * **`max_seq`.** Deliberately not a digest field. Both K stores carry one
+//!   and neither ever reads it — `append` sizes its buffer from its own
+//!   `max_seq` parameter. Where it is *not* inert is the hydrate constructor,
 //!   and that is where it is pinned.
-//! * **Bit-exactness under a different toolchain.** The pins are f32 results
-//!   from this host's codegen. They judge one change on one toolchain; they
-//!   are not a portable golden.
-//!
-//! `truncate_to` **is** covered — the drive rolls back into the bulk chunk
-//! after the decode steps, so both halves of the truncate plan run and the
-//! post-truncate store bytes are a pinned column.
 
 use super::core::KvCache;
-use crate::storage::KvStorage;
-use crate::test_utils::{
-    array_bytes, env_lock, f32_arr, fnv1a64, lcg_data, push_quant_k, StoreBytes, TEST_SEED,
+use super::store_bytes_tests::{
+    drive, shapes_for, CHUNK_SEQ, SHAPE_A, TEST_LAYER_IDX, TEST_MAX_SEQ,
 };
+use crate::storage::KvStorage;
+use crate::test_utils::{env_lock, f32_arr, lcg_data, TEST_SEED};
 use crate::{KvQuant, ALL_KV_QUANTS};
 use rmlx_mlx::Device;
-
-/// Layer index every cell is built at. No turbo store seeds anything from it
-/// today; the cells are built at a fixed one so a change that starts to would
-/// move the pin rather than pass quietly.
-const TEST_LAYER_IDX: usize = 3;
-/// Storage capacity. Larger than the driven length so no ring wrap is in play.
-const TEST_MAX_SEQ: i32 = 512;
-/// Positions in the single bulk append.
-const CHUNK_SEQ: i32 = 24;
-/// One-token appends driven after the chunk.
-const DECODE_STEPS: usize = 3;
-
-/// `(kv_h, head_dim)` — see the shape table in the module doc.
-const SHAPE_A: (i32, i32) = (1, 128);
-const SHAPE_B: (i32, i32) = (4, 96);
-
-/// Serialise a TurboQuant block store — the K twin and `QuantV` carry the same
-/// payload type (`TurboBlocks`) and the same header fields, so one body covers
-/// both axes.
-///
-/// A macro, not a fn: the K store is `QuantKTurbo<BITS>` and the V store is
-/// `QuantV`, two unrelated types, so one fn cannot take both. The two K widths
-/// are one type since the K-storage collapse and need no arm of their own.
-macro_rules! push_turbo {
-    ($out:expr, $side:expr, $store:expr) => {{
-        let s = $store;
-        $out.tag($side);
-        $out.i32s("shape", &s.shape);
-        $out.u8_("bits", s.bits);
-        $out.u8_("gpu_codes_live", u8::from(s.gpu_codes_buf.is_some()));
-        $out.u8_("gpu_scales_live", u8::from(s.gpu_scales_buf.is_some()));
-        $out.usize_("gpu_words_per_step", s.gpu_words_per_step as usize);
-        $out.usize_("gpu_scales_per_step", s.gpu_scales_per_step as usize);
-        $out.usize_("gpu_capacity", s.gpu_capacity as usize);
-        $out.usize_("n_blocks", s.blocks.len());
-        for (i, b) in s.blocks.iter().enumerate() {
-            $out.usize_("block", i);
-            $out.u8s("codes", &b.codes);
-            $out.f32s("scales", &b.scales);
-            $out.i32s("original_shape", &b.original_shape);
-            $out.u8_("block_bits", b.bits);
-        }
-    }};
-}
 
 /// `(bits, code bytes, scales)` summed over a store's blocks.
 ///
@@ -173,130 +90,6 @@ macro_rules! turbo_geometry {
             s.blocks.iter().map(|b| b.scales.len()).sum::<usize>(),
         )
     }};
-}
-
-/// Every byte of the storage a turbo spelling holds, in one digest.
-///
-/// A store the spelling did not populate serialises as its own `absent` tag,
-/// so "empty" and "one empty block" are different digests.
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "construction-time invariant: the storage variant is the one the KvQuant selected; any other is a construction bug, and the explicit panic names it sooner than a wrong digest would"
-)]
-fn store_digest(storage: &KvStorage) -> u64 {
-    let mut out = StoreBytes::default();
-    macro_rules! opt_q8 {
-        ($slot:expr) => {
-            match $slot {
-                Some(s) => push_quant_k(&mut out, "k_q8", s),
-                None => out.tag("k_q8_absent"),
-            }
-        };
-    }
-    macro_rules! opt_turbo {
-        ($slot:expr, $name:expr) => {
-            match $slot {
-                Some(s) => push_turbo!(out, $name, s),
-                None => out.tag(concat!($name, "_absent")),
-            }
-        };
-    }
-    match storage {
-        KvStorage::K8VTurbo3 { k, v, .. }
-        | KvStorage::K8VTurbo3Tcq { k, v, .. }
-        | KvStorage::K8VTurbo2 { k, v, .. }
-        | KvStorage::K8VTurbo2Tcq { k, v, .. } => {
-            opt_q8!(k.as_ref());
-            opt_turbo!(v.as_ref(), "v_turbo");
-        }
-        KvStorage::TurboSym3 { k, v, .. } => {
-            opt_turbo!(k.as_ref(), "k_turbo");
-            opt_turbo!(v.as_ref(), "v_turbo");
-        }
-        KvStorage::TurboSym4 { k, v, .. } => {
-            opt_turbo!(k.as_ref(), "k_turbo");
-            opt_turbo!(v.as_ref(), "v_turbo");
-        }
-        other => panic!(
-            "not a turbo storage variant: {}",
-            super::helpers::storage_variant_name(other)
-        ),
-    }
-    out.digest()
-}
-
-/// What one cell observes.
-struct CellObservation {
-    /// Store digest after the bulk chunk.
-    store_after_chunk: u64,
-    /// Store digest after the last decode step.
-    store_after_decode: u64,
-    /// Store digest after truncating back into the bulk chunk.
-    ///
-    /// `truncate_to` is inside the files the collapse unifies and is reached by
-    /// no other assertion in the tree — the block-truncate suite states that it
-    /// covers the plan, not the turbo stores' calls to it.
-    store_after_truncate: u64,
-    /// Digest of the K/V rows the attention received, chunk and every step.
-    rows: u64,
-    /// `KvCache::resident_bytes` after the last decode step.
-    resident_bytes: u64,
-}
-
-/// Drive one spelling at one shape with `in_prefill` false throughout.
-///
-/// The prefill bracket is deliberately absent. `exit_prefill` clears the
-/// payload of every spelling whose `materialises_packed_store()` is false —
-/// which on this family is all six — so a prefill-bracketed drive would pin
-/// six empty stores and read as a clean scan. Appending straight into the
-/// decode dispatch is the one CPU route on which all six write their store.
-#[allow(
-    clippy::expect_used,
-    reason = "test driver: every append here is on a shape the spelling accepts, so a failure is the defect under test and the panic names it"
-)]
-fn drive(quant: KvQuant, shape: (i32, i32)) -> CellObservation {
-    let (kv_h, head_dim) = shape;
-    let device = Device::Cpu;
-    let mut cache = KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ).with_layer_idx(TEST_LAYER_IDX);
-
-    let mut rows = Vec::new();
-
-    let chunk_shape = [1_i32, kv_h, CHUNK_SEQ, head_dim];
-    let n_chunk: usize = chunk_shape.iter().map(|&d| d as usize).product();
-    let k = f32_arr(&lcg_data(n_chunk, TEST_SEED), &chunk_shape);
-    let v = f32_arr(&lcg_data(n_chunk, TEST_SEED ^ 0x5a5a), &chunk_shape);
-    let (k_out, v_out) = cache.update(&k, &v, device).expect("bulk append");
-    rows.extend_from_slice(&array_bytes(&k_out));
-    rows.extend_from_slice(&array_bytes(&v_out));
-    let store_after_chunk = store_digest(&cache.storage);
-
-    let step_shape = [1_i32, kv_h, 1, head_dim];
-    let n_step: usize = step_shape.iter().map(|&d| d as usize).product();
-    for step in 0..DECODE_STEPS {
-        let seed = TEST_SEED.wrapping_add(step as u64 + 1);
-        let ks = f32_arr(&lcg_data(n_step, seed), &step_shape);
-        let vs = f32_arr(&lcg_data(n_step, seed ^ 0x5a5a), &step_shape);
-        let (ko, vo) = cache.update(&ks, &vs, device).expect("decode step");
-        rows.extend_from_slice(&array_bytes(&ko));
-        rows.extend_from_slice(&array_bytes(&vo));
-    }
-
-    let store_after_decode = store_digest(&cache.storage);
-    let resident_bytes = cache.resident_bytes();
-
-    // Roll back into the bulk chunk: drops whole decode blocks and splits the
-    // chunk block, so both halves of the truncate plan run.
-    cache
-        .truncate_to(CHUNK_SEQ + 1)
-        .expect("truncate into the bulk chunk");
-
-    CellObservation {
-        store_after_chunk,
-        store_after_decode,
-        store_after_truncate: store_digest(&cache.storage),
-        rows: fnv1a64(&rows),
-        resident_bytes,
-    }
 }
 
 /// Every turbo spelling the enum can spell, in `ALL_KV_QUANTS` order.
@@ -324,246 +117,8 @@ fn turbo_spellings() -> Vec<KvQuant> {
         .collect()
 }
 
-/// Turbo spellings `ALL_KV_QUANTS` holds today.
-const TURBO_SPELLING_COUNT: usize = 6;
-
 /// Turbo spellings whose K side is the store the collapse unifies.
 const TURBO_K_TWIN_COUNT: usize = 2;
-
-/// One pinned cell: `(spelling, kv_h, head_dim, store_after_chunk,
-/// store_after_decode, store_after_truncate, rows, resident_bytes)`.
-type Pin = (&'static str, i32, i32, u64, u64, u64, u64, u64);
-
-/// The "before" side of the oracle, captured on the tree the unification
-/// starts from. Any generic type that produces a different byte anywhere in a
-/// turbo store, hands attention a different row, or changes a cell's residency
-/// turns one of these red and names the cell.
-///
-/// Every row is held at both widths. The collapse has no licence to move one:
-/// its single intended observable change is on the hydrate path, which no cell
-/// here reaches.
-const PINS: &[Pin] = &[
-    (
-        "k8vturbo3",
-        1,
-        128,
-        0xc978cd9e3b6ea997,
-        0xfa7a4a48703d1920,
-        0xa1c0014511d8877f,
-        0x57e3f8e7c5855aa4,
-        5292,
-    ),
-    (
-        "k8vturbo3",
-        4,
-        96,
-        0xa84500cd0c4668c2,
-        0x96c636db7c2c1998,
-        0x12f25db93bf7bed7,
-        0x0553295cb8aa3448,
-        15876,
-    ),
-    (
-        "k8vturbo3tcq",
-        1,
-        128,
-        0xc978cd9e3b6ea997,
-        0xfa7a4a48703d1920,
-        0xa1c0014511d8877f,
-        0x57e3f8e7c5855aa4,
-        5292,
-    ),
-    (
-        "k8vturbo3tcq",
-        4,
-        96,
-        0xa84500cd0c4668c2,
-        0x96c636db7c2c1998,
-        0x12f25db93bf7bed7,
-        0x0553295cb8aa3448,
-        15876,
-    ),
-    (
-        "k8vturbo2",
-        1,
-        128,
-        0xb114acd71150baba,
-        0x01f6d9cf70840ce3,
-        0x87f9d45c75d9b483,
-        0x223b929dc161c235,
-        4860,
-    ),
-    (
-        "k8vturbo2",
-        4,
-        96,
-        0x8086b874eb46762d,
-        0x04490d83c3d191be,
-        0x64eb0d6ccff312e3,
-        0x6be14156bf61667d,
-        14580,
-    ),
-    (
-        "k8vturbo2tcq",
-        1,
-        128,
-        0xb114acd71150baba,
-        0x01f6d9cf70840ce3,
-        0x87f9d45c75d9b483,
-        0x223b929dc161c235,
-        4860,
-    ),
-    (
-        "k8vturbo2tcq",
-        4,
-        96,
-        0x8086b874eb46762d,
-        0x04490d83c3d191be,
-        0x64eb0d6ccff312e3,
-        0x6be14156bf61667d,
-        14580,
-    ),
-    (
-        "tsym3",
-        1,
-        128,
-        0xe525e0e0bd6a6469,
-        0x6acf7a24385304ed,
-        0x474959ce87b2ab24,
-        0x6629bbeb17efad1b,
-        3456,
-    ),
-    (
-        "tsym3",
-        4,
-        96,
-        0xfbf1bdba9a24db2d,
-        0xd6a38b537d602e9d,
-        0x9f9f0b549f2f131e,
-        0xa488a46c89e0f7ef,
-        10368,
-    ),
-    (
-        "tsym4",
-        1,
-        128,
-        0xc5f5b4175ed98e1a,
-        0x820b35f80bbe0988,
-        0x3ca45144c3e90aa5,
-        0x3b93983043ab2f90,
-        4320,
-    ),
-    (
-        "tsym4",
-        4,
-        96,
-        0x2ce01a190745e393,
-        0x82815b7647065d1a,
-        0xb697676213e4fce8,
-        0x08eb6752f2e72a9d,
-        12960,
-    ),
-];
-
-/// Look a pin up by spelling and shape.
-fn pin_for(name: &str, shape: (i32, i32)) -> Option<&'static Pin> {
-    PINS.iter()
-        .find(|p| p.0 == name && p.1 == shape.0 && p.2 == shape.1)
-}
-
-/// Every turbo spelling, at both shapes, holds the bytes it held before.
-#[test]
-fn turbo_store_bytes_are_pinned_per_spelling_and_shape() {
-    let _guard = env_lock();
-    let mut missing = Vec::new();
-    let mut observed = Vec::new();
-    for quant in turbo_spellings() {
-        let name = quant.to_string();
-        for shape in [SHAPE_A, SHAPE_B] {
-            let obs = drive(quant, shape);
-            observed.push(format!(
-                "    (\"{}\", {}, {}, {:#018x}, {:#018x}, {:#018x}, {:#018x}, {}),",
-                name,
-                shape.0,
-                shape.1,
-                obs.store_after_chunk,
-                obs.store_after_decode,
-                obs.store_after_truncate,
-                obs.rows,
-                obs.resident_bytes
-            ));
-            let Some(pin) = pin_for(&name, shape) else {
-                missing.push(format!("{name} @ kv_h={} head_dim={}", shape.0, shape.1));
-                continue;
-            };
-            assert_eq!(
-                obs.store_after_chunk, pin.3,
-                "{name} @ kv_h={} head_dim={}: packed store bytes after the bulk append moved",
-                shape.0, shape.1
-            );
-            assert_eq!(
-                obs.store_after_decode, pin.4,
-                "{name} @ kv_h={} head_dim={}: packed store bytes after {DECODE_STEPS} decode \
-                 steps moved",
-                shape.0, shape.1
-            );
-            assert_eq!(
-                obs.store_after_truncate, pin.5,
-                "{name} @ kv_h={} head_dim={}: packed store bytes after truncate_to moved",
-                shape.0, shape.1
-            );
-            assert_eq!(
-                obs.rows, pin.6,
-                "{name} @ kv_h={} head_dim={}: the K/V rows attention receives moved",
-                shape.0, shape.1
-            );
-            assert_eq!(
-                obs.resident_bytes, pin.7,
-                "{name} @ kv_h={} head_dim={}: resident_bytes moved",
-                shape.0, shape.1
-            );
-        }
-    }
-    assert!(
-        missing.is_empty(),
-        "no pin for {} cell(s): {missing:?}\nobserved table:\n{}",
-        missing.len(),
-        observed.join("\n")
-    );
-}
-
-/// The pin table names every turbo spelling the enum can spell, at both
-/// shapes — and nothing else.
-///
-/// Without this, a turbo spelling added to `ALL_KV_QUANTS` and left out of
-/// `PINS` would be unpinned and the suite would still be green.
-#[test]
-fn every_turbo_spelling_is_pinned_at_both_shapes() {
-    let want: Vec<String> = turbo_spellings().iter().map(ToString::to_string).collect();
-    assert_eq!(
-        want.len(),
-        TURBO_SPELLING_COUNT,
-        "turbo spelling census moved — a turbo variant was added to or removed from \
-         ALL_KV_QUANTS and this file's pins did not follow: {want:?}"
-    );
-    for name in &want {
-        for shape in [SHAPE_A, SHAPE_B] {
-            assert!(
-                pin_for(name, shape).is_some(),
-                "{name} @ kv_h={} head_dim={} has no pin",
-                shape.0,
-                shape.1
-            );
-        }
-    }
-    assert_eq!(
-        PINS.len(),
-        want.len() * 2,
-        "PINS holds {} rows for {} spellings x 2 shapes — a stale row pins nothing",
-        PINS.len(),
-        want.len()
-    );
-}
 
 /// The K-side store the collapse unifies is built by exactly two spellings,
 /// and the scope of the whole change rests on that.
@@ -633,7 +188,7 @@ fn turbo_store_geometry_follows_the_codec_bit_width() {
     let _guard = env_lock();
     for quant in turbo_spellings() {
         let name = quant.to_string();
-        for (kv_h, head_dim) in [SHAPE_A, SHAPE_B] {
+        for (kv_h, head_dim) in shapes_for(quant) {
             let device = Device::Cpu;
             let mut cache =
                 KvCache::with_quant_max_seq(quant, TEST_MAX_SEQ).with_layer_idx(TEST_LAYER_IDX);
@@ -735,7 +290,7 @@ fn turbo_width_twins_hold_different_stores() {
         (KvQuant::K8VTurbo3, KvQuant::K8VTurbo2),
     ];
     for (left, right) in pairs {
-        for shape in [SHAPE_A, SHAPE_B] {
+        for shape in shapes_for(left) {
             let a = drive(left, shape);
             let b = drive(right, shape);
             assert_ne!(
@@ -748,49 +303,6 @@ fn turbo_width_twins_hold_different_stores() {
                 a.store_after_decode, b.store_after_decode,
                 "{left} and {right} @ kv_h={} head_dim={}: the two wrote the same store \
                  bytes after decode",
-                shape.0, shape.1
-            );
-        }
-    }
-}
-
-/// Driving the same spelling twice gives the same bytes.
-///
-/// Without this, every assertion above could be pinning a value that is not
-/// reproducible, and a red cell would be read as flake rather than defect.
-///
-/// It drives both arms itself rather than reusing the pin test's observations.
-/// Borrowing them would make this test's verdict depend on that test having
-/// run, and a test whose outcome depends on which other tests ran is a shape
-/// this crate has removed elsewhere. The cost is one extra drive per cell.
-#[test]
-fn a_turbo_cell_is_reproducible() {
-    let _guard = env_lock();
-    for quant in turbo_spellings() {
-        for shape in [SHAPE_A, SHAPE_B] {
-            let a = drive(quant, shape);
-            let b = drive(quant, shape);
-            assert_eq!(
-                a.store_after_truncate, b.store_after_truncate,
-                "{quant} @ kv_h={} head_dim={}: post-truncate store bytes differ between two \
-                 identical drives",
-                shape.0, shape.1
-            );
-            assert_eq!(
-                a.store_after_decode, b.store_after_decode,
-                "{quant} @ kv_h={} head_dim={}: store bytes differ between two identical drives",
-                shape.0, shape.1
-            );
-            assert_eq!(
-                a.rows, b.rows,
-                "{quant} @ kv_h={} head_dim={}: attention rows differ between two identical \
-                 drives",
-                shape.0, shape.1
-            );
-            assert_eq!(
-                a.resident_bytes, b.resident_bytes,
-                "{quant} @ kv_h={} head_dim={}: resident_bytes differs between two identical \
-                 drives",
                 shape.0, shape.1
             );
         }
@@ -857,7 +369,7 @@ fn the_tcq_spellings_set_the_flag_and_still_write_the_plain_bytes() {
                  spelling selects"
             );
         }
-        for shape in [SHAPE_A, SHAPE_B] {
+        for shape in shapes_for(plain) {
             let a = drive(plain, shape);
             let b = drive(tcq, shape);
             assert_eq!(

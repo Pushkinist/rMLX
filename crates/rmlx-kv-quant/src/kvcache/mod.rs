@@ -109,6 +109,14 @@ mod windowed_ring_sizing_tests;
 #[path = "rotor_flash_dispatch_tests.rs"]
 mod rotor_flash_dispatch_tests;
 
+// Byte-level pin on the storage layer for every spelling ALL_KV_QUANTS holds:
+// what each writes into its packed store, what the attention reads back from
+// it, and what it leaves resident. The three family files below hold only the
+// claims that are about their own family.
+#[cfg(test)]
+#[path = "store_bytes_tests.rs"]
+mod store_bytes_tests;
+
 // Byte-level pin on the rotor storage layer: what every rotor spelling writes
 // into its packed store, and what the attention reads back from it.
 #[cfg(test)]
