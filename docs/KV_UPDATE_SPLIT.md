@@ -1,8 +1,12 @@
 # Splitting the KV update path
 
-`crates/rmlx-kv-quant/src/kvcache/update.rs` holds every codec's update path in
-one file. This document is the plan to split it, and the record of what was
-measured before the split starts.
+`crates/rmlx-kv-quant/src/kvcache/update.rs` held every codec's update path in
+one file. This document is the plan to split it, the record of what was
+measured before the split started, and the record of each chunk as it lands.
+Chunk (a) has landed: the per-family bodies now sit in
+`kvcache/update_{rotor,iso,turbo,affine,planar,paged}.rs` and `update.rs` is
+the dispatcher over them. Every figure below that says "today" was measured
+before chunk (a); §4 carries the after.
 
 Method comes from the three twin-collapse documents and is not restated here:
 [`KV_ROTOR_TWINS.md`](KV_ROTOR_TWINS.md), [`KV_ISO_TWINS.md`](KV_ISO_TWINS.md),
@@ -281,7 +285,7 @@ The target of 3 or fewer is about the six sites in `update.rs`, which the split
 owns. The nine in `quant.rs` are the enum's own `Display`, `FromStr` and
 disposition predicates; they are not this restructure's to remove.
 
-**Recall.** `scripts/kv_update_census_selftest.sh`, 35 cases over planted
+**Recall.** `scripts/kv_update_census_selftest.sh`, 40 cases over planted
 trees, run by `make kv-update-census-selftest` and by `make ci`. A site in a
 file the producer was never told about is found; a collapsed site drops the
 count; a catch-all arm keeps the site and drops the forcing count; a match
@@ -298,6 +302,10 @@ wide `match` planted in a `*_tests.rs` file is not counted, and is counted
 under `--include-tests`, so disabling the test-file exclusion turns one case
 red. Both were measured by applying each mutation and re-running.
 
+**After chunk (a):** 26 sites, all 26 forcing, and the same six in `update.rs`.
+The split moved bodies, not `match` arms, so no figure in the table above
+moved. The target of 3 or fewer is chunk (b)'s.
+
 ### File size
 
 `make file-size-report`, `rmlx-kv-quant` only, before the split:
@@ -312,15 +320,29 @@ red. Both were measured by applying each mutation and re-running.
 | 1066 | `rotorquant.rs` | no |
 
 **The rule the split must satisfy:** every file it produces is at or under 1000
-lines, or carries a `LOC-exempt` marker whose text says why. The interim marker
-on `update.rs` goes with the split. The four other oversized files in the crate
-are outside this work.
+lines, or carries a `LOC-exempt` marker whose text says why. The four other
+oversized files in the crate are outside this work.
+
+After chunk (a), the same command over the files the split produced:
+
+| Lines | File | `LOC-exempt` |
+|---|---|---|
+| 3195 | `kvcache/update.rs` | yes — the dispatch, the capacity bookkeeping and the shared helpers are still over the guideline; chunk (b) is what removes the rest |
+| 1242 | `kvcache/update_rotor.rs` | yes — four storage spellings, each with its own encode, ring sync and materialise-tail path |
+| 963 | `kvcache/update_iso.rs` | no |
+| 857 | `kvcache/update_affine.rs` | no |
+| 578 | `kvcache/update_turbo.rs` | no |
+| 229 | `kvcache/update_paged.rs` | no |
+| 202 | `kvcache/update_planar.rs` | no |
+
+The interim marker on `update.rs` did not go; its text was rewritten to say
+what is left, which is what the rule asks of a marker that stays.
 
 ### Duplication
 
 `python3 scripts/lib/debt_report.py --matched-lines update-bodies` is an
 eleventh `debt-report` population: every `update_`-prefixed fn of the update
-file, paired every item with every other. The three family populations each
+files, paired every item with every other. The three family populations each
 read one codec's twins and go blind the moment those widths collapse; this one
 reads the shape the restructure writes once.
 
@@ -331,10 +353,34 @@ numbers, so both read fns through `lib/debt_report.py`'s `extract_fns`;
 **Before:** 3585 matched lines over 1440 body lines, 25 items, 300 pairs.
 (Before the three collapses: 12122 over 2539, 33 items, 528 pairs.)
 
-Recall: six cases in `scripts/debt_report_selftest.sh` — the planted population
+**The root is a glob, and the pairing is name-sorted.** Chunk (a) re-rooted the
+four update populations from the one file onto
+`crates/rmlx-kv-quant/src/kvcache/update*.rs` — the dispatch file plus one file
+per codec family — through one collector given its directory, glob and name
+pattern at the registration site. The pairing order changed with it: the items
+are sorted by name before they are paired, because `difflib`'s matching-block
+sum is not symmetric and a file-layout order moved `update-bodies` by 21 lines
+when the same 25 bodies were regrouped across seven files with no line of any
+of them changing. Under the name-sorted rule the figure is the same on the
+commit before chunk (a) and on the tree after it:
+
+| Population | Before chunk (a) | After chunk (a) |
+|---|---|---|
+| `rotor-updates` | 0 over 105 (4 items, 0 pairs) | same |
+| `iso-updates` | 870 over 625 (21 items, 210 pairs) | same |
+| `turbo-updates` | 0 over 91 (2 items, 0 pairs) | same |
+| `update-bodies` | 3565 over 1440 (25 items, 300 pairs) | same |
+
+The `iso-updates` and `update-bodies` rows read 875 and 3585 under the old
+file-order pairing; both are the same bodies measured under a rule that no
+longer depends on which file holds one.
+
+Recall: nine cases in `scripts/debt_report_selftest.sh` — the planted population
 held to its figure and its item and pair count, one body left reading a
-measured `0` with the population still found, and every body renamed out of the
-prefix reading `unavailable`.
+measured `0` with the population still found, every body renamed out of the
+prefix reading `unavailable`, a glob that matches no file named apart from a
+root whose files hold no matching fn, and three sym bodies moved into a family
+file of their own leaving every figure where it was.
 
 ---
 
@@ -343,19 +389,61 @@ prefix reading `unavailable`.
 One branch, one pull request, chunks as commits. Each chunk names its own
 removals.
 
-### Chunk (a) — split by codec family
+### Chunk (a) — split by codec family — landed
 
-Move each family's update path next to its storage type: the rotor bodies with
-the rotor storage, the same for iso, turbo, planar, affine and paged. The file
-stops being "every codec's update" and becomes a dispatcher over per-family
-modules.
+Each family's update path moved out of `update.rs` into a file of its own:
+`kvcache/update_{rotor,iso,turbo,affine,planar,paged}.rs`. 67 fns moved — the
+per-variant `update_*` entries, the width-parametric bodies they enter, the GPU
+encode, ring-sync, materialise-tail and chunk-append helpers, and the two
+rotor feed constants. `update.rs` keeps the `KvStorage` and `KvQuant`
+dispatch, the prefill and decode capacity bookkeeping, the bf16 decode mirror,
+and every helper with two or more family callers.
 
-Removes: the moved bodies from `update.rs`; the interim `LOC-exempt` marker on
-any file that ends at or under 1000 lines; any helper in `update.rs` left with
-no caller after the move.
+**Why `kvcache/` and not `storage/`.** The issue asks for the bodies "next to
+the storage type". Most of them are `impl KvCache` methods, and they read
+`KvCache` fields that are `pub(super)` in `kvcache::core` — visible inside
+`crate::kvcache` and nowhere else. `crate::storage` is not a descendant of
+`crate::kvcache`, so that placement would have to widen about twenty private
+fields to `pub(crate)`, which is a change to the cache's encapsulation and not
+a move. It would also invert the crate's layering, where `storage` is a leaf
+of `kvcache`. The family files therefore sit beside `update.rs`, one per
+family, matching the flat module layout `kvcache/` already uses.
+
+**Pure move.** Every moved body is byte-identical to its body before the move
+once leading whitespace, blank lines, `use` lines and a leading visibility
+keyword are normalised away. `update_planar_k` carries the one `target =`
+override in the file, and the override travelled with the body, so the three
+readers of `warm_ttft_bypass` see no change.
+
+Removed: the moved bodies from `update.rs`; the `use` items and storage-type
+imports the move left without a caller there; the `ring_feed_routing_tests`
+module declaration, which moved to `update_rotor.rs` with the two constants it
+reads.
+
+Kept, with its text rewritten: the `LOC-exempt` marker on `update.rs`, which is
+still 3195 lines. `update_rotor.rs` is 1242 and carries a marker of its own.
+The five other family files are under the guideline.
 
 Judged by: the oracle green with no re-baselined pin; the match-site count per
-file; `make file-size-report`.
+file, unchanged at 26 with six in `update.rs`; `make file-size-report`; the
+four duplication figures, unchanged under the re-rooted producer.
+
+**The move, falsified.** Four mutations, one per family and one in an
+`exit_prefill` arm of a materialising spelling. Each scales the K values a
+body hands its store by 1.01, on the CPU route the oracle drives. The control
+is the green suite above.
+
+| Mutation | File | First cell red | Column |
+|---|---|---|---|
+| `tsym_update` K values ×1.01 | `update_turbo.rs` | `tsym3 @ kv_h=1 head_dim=128` | store bytes after the bulk append |
+| `iso_v_update` K values ×1.01 | `update_iso.rs` | `iso3 @ kv_h=1 head_dim=128` | store bytes after the bulk append |
+| `rotor_sym_update` K values ×1.01 | `update_rotor.rs` | `rotor3_sym @ kv_h=1 head_dim=128` | store bytes after the bulk append, and the rows after `exit_prefill` |
+| `Rotor3Sym` `exit_prefill` arm K values ×1.01 | `update.rs` | `rotor3_sym @ kv_h=1 head_dim=128` | store bytes after `exit_prefill` |
+
+The last one is the second drive's, and its arm did not move: the
+`exit_prefill` arms stayed with the dispatcher (see below). Every mutation was
+applied to a file copy, run, and restored by `cp` with a digest check on both
+sides — never by `git checkout`.
 
 ### Chunk (b) — one update body per store shape
 
@@ -401,10 +489,14 @@ Grep before touching any of it.
 * **The trace target the update path emits on.** All but one event in
   `update.rs` carries no `target =` override, so its target is the module path
   — `rmlx_kv_quant::kvcache::update`. [`PERF_BASELINE.md`](PERF_BASELINE.md)
-  names that string and the phases under it (`iso3_encode`,
-  `iso3_dequant_cpu`, `iso3_vec_to_array`). Moving a body to another module
+  names that string and the phases under it. Moving a body to another module
   moves its target. A chunk that moves an instrumented body updates that doc
-  in the same commit, or keeps the target explicit.
+  in the same commit, or keeps the target explicit. Chunk (a) took the first
+  option: the four iso decode phases (`iso_encode`, `iso_dequant_gpu`,
+  `iso_dequant_cpu`, `iso_vec_to_array`) now emit on
+  `rmlx_kv_quant::kvcache::update_iso`, `iso3_encode` stays on the old target
+  with the `exit_prefill` arm that raises it, and `PERF_BASELINE.md` names both.
+  No other moved event's target is read by name anywhere in the tree.
 * **The one `target =` override in the file.** The PlanarK warm-TTFT bypass
   emits on `rmlx_kv_quant::warm_ttft` with `path = "warm_ttft_bypass"`. Three
   readers name that string: `crates/rmlx-cli/tests/e2e/runner.rs`,

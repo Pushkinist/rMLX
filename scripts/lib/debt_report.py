@@ -24,14 +24,14 @@ The populations, each carrying its own root and its own pairing rule (see
   ``quant_rotor_v4`` -> ``quant_rotor_v``): same axis, different width. A
   group of one contributes an item and no pair, so a collapsed axis reads 0
   matched lines with the population still found.
-* ``rotor-updates`` — the ``update_rotor*`` fns of
-  ``crates/rmlx-kv-quant/src/kvcache/update.rs``, paired by the same
-  digit-stripped-name rule (``update_rotor_k_only_3`` and ``_4`` ->
-  ``update_rotor_k_only_``).
+* ``rotor-updates`` — the ``update_rotor*`` fns of the update files
+  (``crates/rmlx-kv-quant/src/kvcache/update*.rs``: the dispatch file plus one
+  file per codec family), paired by the same digit-stripped-name rule
+  (``update_rotor_k_only_3`` and ``_4`` -> ``update_rotor_k_only_``).
 * ``turbo-storage`` — the non-test ``quant_k_turbo*.rs`` files under the same
   storage directory, same digit-stripped-stem pairing.
-* ``turbo-updates`` — the ``update_tsym*`` fns of the update file, same
-  pairing. Anchored on the symmetric entries: the same file carries two other
+* ``turbo-updates`` — the ``update_tsym*`` fns of the update files, same
+  pairing. Anchored on the symmetric entries: the same family carries two other
   turbo width pairs that belong to a different collapse.
 * ``turbo-ssd`` — the turbo helper fns of
   ``crates/rmlx-kv-ssd/src/block_io.rs``, same pairing. A population of its
@@ -42,16 +42,17 @@ The populations, each carrying its own root and its own pairing rule (see
   collapse the population is the per-arch ``hydrate`` bodies, after it the
   short ``from_hydrated`` constructors. ``hydrate_from_ssd`` is a third name
   and stays out.
-* ``update-bodies`` — every ``update_``-prefixed fn of the update file, one
+* ``update-bodies`` — every ``update_``-prefixed fn of the update files, one
   family. The prefix is the whole rule, so the shared entries the dispatch
   reaches (``update_and_sdpa_*``, ``update_decode_fp16*``,
   ``update_prefill_raw``) are counted beside the per-variant bodies; the label
   says what the prefix finds rather than claiming a narrower population.
 
-Neither rotor population is a literal file or fn list: both are a glob plus a
-name rule, so the same command measures a tree that still carries the twins
-and one that does not. ``ssd-hydrate`` is a glob plus a name rule for the
-same reason.
+No population is a literal file or fn list: each is a glob plus a name rule,
+so the same command measures a tree that still carries the twins and one that
+does not, and a tree that held every family's update path in one file and one
+that split them out. ``ssd-hydrate`` is a glob plus a name rule for the same
+reason.
 
 Deterministic for a given tree: every collection is name-sorted before it is
 printed, and the "twin" measure is the normalised-diff idea that found the
@@ -89,7 +90,12 @@ KV_STORAGE_DIR = "crates/rmlx-kv-quant/src/storage"
 ROTOR_STORAGE_GLOB = "quant_rotor_*.rs"
 ISO_STORAGE_GLOB = "quant_iso_*.rs"
 TURBO_STORAGE_GLOB = "quant_k_turbo*.rs"
-KV_UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
+KV_UPDATE_DIR = "crates/rmlx-kv-quant/src/kvcache"
+# The update path is one dispatch file plus one file per codec family. A glob,
+# never a file list, so one command measures the tree that held every family in
+# `update.rs` and the tree that split them out.
+KV_UPDATE_GLOB = "update*.rs"
+KV_UPDATE_ROOT = f"{KV_UPDATE_DIR}/{KV_UPDATE_GLOB}"
 KV_SSD_BLOCK_IO_FILE = "crates/rmlx-kv-ssd/src/block_io.rs"
 # Name patterns, not prefixes: a family is a shape, and the iso one outgrew a
 # prefix when its entries (`update_iso_*`) and the bodies they enter
@@ -115,7 +121,7 @@ TURBO_UPDATE_FN_PATTERN = r"(^|_)tsym(\d|_|$)"
 # suffix, and a digit-bearing pattern would find nothing and report the
 # population unavailable rather than a measured 0.
 TURBO_SSD_FN_PATTERN = r"(turbo|tsym)"
-# Every `update_`-prefixed fn of the update file, whatever family it belongs
+# Every `update_`-prefixed fn of the update files, whatever family it belongs
 # to. The three family patterns above each read one codec's twins; this one
 # reads the whole prefixed population, which is what the "one update body per
 # store shape" step has to shrink. The prefix admits the shared entries the
@@ -533,6 +539,34 @@ def file_fn_items(root: Path, *, file: str, pattern: str) -> list[FnInfo]:
     return [fn for fn in fns if matches(fn.name)]
 
 
+def glob_fn_items(root: Path, *, directory: str, glob: str, pattern: str) -> list[FnInfo]:
+    """Every fn matching `pattern` in every non-test file of `directory` that
+    matches `glob`, body only — [`file_fn_items`] widened from one file to a
+    glob over a directory.
+
+    `directory`, `glob` and `pattern` arrive from the registration site, for
+    the reason [`storage_file_items`] gives for its glob. A glob that matches
+    no file raises its own reason rather than an empty population: a root that
+    is not there and a root whose files hold no matching fn are different
+    answers."""
+    base = root / directory
+    if not base.is_dir():
+        raise RuntimeError(f"{directory} is not a directory")
+    paths = [p for p in sorted(base.glob(glob)) if not is_test_path(p.relative_to(root))]
+    if not paths:
+        raise RuntimeError(f"{directory}/{glob} matches no file")
+    matches = re.compile(pattern).search
+    items: list[FnInfo] = []
+    for path in paths:
+        fns, _skipped = fns_in_file(root, path)
+        items.extend(fn for fn in fns if matches(fn.name))
+    # Name-sorted, not file-then-line. `difflib`'s matching-block sum is not
+    # symmetric, so a pairing order that followed the file layout would move
+    # the figure when a body changed file with no line of it changing — the
+    # one event this population exists to measure across.
+    return sorted(items, key=lambda fn: (fn.name, fn.file, fn.line))
+
+
 def ssd_hydrate_items(root: Path) -> list[FnInfo]:
     """Every non-test fn under MODELS_SOURCE_DIR whose name is one of
     SSD_HYDRATE_FN_NAMES, body only — a glob plus a name rule, never a file
@@ -572,12 +606,17 @@ MATCHED_LINES_POPULATIONS = {
     # Every pair, not `width_pair_key`: the iso update family's live
     # duplication is between same-width bodies of different entries, and a
     # width key puts those in two groups and compares them never — a counter
-    # that cannot move off 0 whatever the file holds. The width-twin question
+    # that cannot move off 0 whatever the files hold. The width-twin question
     # for this family is `iso-storage`'s.
     "iso-updates": Population(
         "iso update fns",
-        KV_UPDATE_FILE,
-        functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=ISO_UPDATE_FN_PATTERN),
+        KV_UPDATE_ROOT,
+        functools.partial(
+            glob_fn_items,
+            directory=KV_UPDATE_DIR,
+            glob=KV_UPDATE_GLOB,
+            pattern=ISO_UPDATE_FN_PATTERN,
+        ),
     ),
     "turbo-storage": Population(
         "turbo storage twins",
@@ -587,13 +626,18 @@ MATCHED_LINES_POPULATIONS = {
     ),
     "turbo-updates": Population(
         "turbo update twins",
-        KV_UPDATE_FILE,
-        functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=TURBO_UPDATE_FN_PATTERN),
+        KV_UPDATE_ROOT,
+        functools.partial(
+            glob_fn_items,
+            directory=KV_UPDATE_DIR,
+            glob=KV_UPDATE_GLOB,
+            pattern=TURBO_UPDATE_FN_PATTERN,
+        ),
         width_pair_key,
     ),
     # Its own population rather than a widened `turbo-storage` glob, for two
     # reasons. `storage_file_items` reads whole files under one directory of
-    # one crate and these are fns inside one file of another, so no glob
+    # one crate and these are fns inside one file of another, so neither glob
     # reaches them. And a figure prints the root it was measured over, so
     # folding them in would print the kv-quant storage directory beside a
     # number measured partly in kv-ssd.
@@ -613,20 +657,29 @@ MATCHED_LINES_POPULATIONS = {
     ),
     "rotor-updates": Population(
         "rotor update twins",
-        KV_UPDATE_FILE,
-        functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=ROTOR_UPDATE_FN_PATTERN),
+        KV_UPDATE_ROOT,
+        functools.partial(
+            glob_fn_items,
+            directory=KV_UPDATE_DIR,
+            glob=KV_UPDATE_GLOB,
+            pattern=ROTOR_UPDATE_FN_PATTERN,
+        ),
         width_pair_key,
     ),
     "ssd-hydrate": Population("ssd hydrate twins", MODELS_SOURCE_DIR, ssd_hydrate_items),
     # Every pair, not `width_pair_key`: the claim this figure measures is that
-    # the update file's bodies share one sequence whatever codec they belong
-    # to, so a key that only compares two widths of one family would report a 0
+    # the update bodies share one sequence whatever codec they belong to, so a key that only compares two widths of one family would report a 0
     # the moment the widths collapsed and say nothing about the shape the
     # restructure writes once.
     "update-bodies": Population(
-        "update_-prefixed fns of the update file",
-        KV_UPDATE_FILE,
-        functools.partial(file_fn_items, file=KV_UPDATE_FILE, pattern=UPDATE_FN_PATTERN),
+        "update_-prefixed fns of the update files",
+        KV_UPDATE_ROOT,
+        functools.partial(
+            glob_fn_items,
+            directory=KV_UPDATE_DIR,
+            glob=KV_UPDATE_GLOB,
+            pattern=UPDATE_FN_PATTERN,
+        ),
     ),
 }
 

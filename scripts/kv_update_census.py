@@ -8,8 +8,8 @@ Four modes, each printing one figure the restructure is judged on:
 * `match-sites` — every `match` over `KvStorage` or `KvQuant` that enumerates
   the codec surface, per file, and the count. This is the "match sites a new
   codec must touch" figure.
-* `update-bodies` — every `update_`-prefixed fn of the update file, with the
-  lines its body holds.
+* `update-bodies` — every `update_`-prefixed fn of the update files, with the
+  file it sits in and the lines its body holds.
 * `refs` — `KvStorage::` / `KvQuant::` variant references in one file.
 
 The figures are derived from the tree on every run. None of them is a hand
@@ -43,10 +43,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 STORAGE_ENUM_FILE = "crates/rmlx-kv-quant/src/storage/kv_storage.rs"
 QUANT_ENUM_FILE = "crates/rmlx-kv-quant/src/quant.rs"
-UPDATE_FILE = "crates/rmlx-kv-quant/src/kvcache/update.rs"
+UPDATE_DIR = "crates/rmlx-kv-quant/src/kvcache"
+#: The update path is one dispatch file plus one file per codec family. A glob,
+#: never a file list, so one command reads the tree that held every family in
+#: `update.rs` and the tree that split them out.
+UPDATE_GLOB = "update*.rs"
 CRATES_DIR = "crates"
 
-#: Every `update_`-prefixed fn of the update file. Not only the per-variant
+#: Every `update_`-prefixed fn of the update files. Not only the per-variant
 #: bodies: the shared entries the dispatch reaches (`update_and_sdpa_*`,
 #: `update_decode_fp16*`, `update_prefill_raw`) carry the prefix and are
 #: counted with them. The prefix is the rule, so no hand-drawn boundary
@@ -223,24 +227,36 @@ def mode_match_sites(root: Path, threshold: int | None, include_tests: bool) -> 
     print(f"forcing-sites {forcing}")
 
 
+def update_files(root: Path) -> list[Path]:
+    base = root / UPDATE_DIR
+    if not base.is_dir():
+        fail(f"{UPDATE_DIR} is not a directory under {root}")
+    paths = [p for p in sorted(base.glob(UPDATE_GLOB)) if not is_test_path(p.relative_to(root))]
+    if not paths:
+        fail(f"{UPDATE_DIR}/{UPDATE_GLOB} matches no file under {root}")
+    return paths
+
+
 def mode_update_bodies(root: Path) -> None:
-    path = root / UPDATE_FILE
-    if not path.is_file():
-        fail(f"{UPDATE_FILE} is not a file under {root}")
-    src, _blanked = read_blanked(path)
-    fns, _skipped = extract_fns(src)
-    bodies = [
-        (fn.name, fn.line, fn.body.count("\n") + 1)
-        for fn in fns
-        if UPDATE_FN_PATTERN.search(fn.name)
-    ]
+    bodies: list[tuple[str, str, int, int]] = []
+    file_lines = 0
+    for path in update_files(root):
+        src, _blanked = read_blanked(path)
+        file_lines += len(src.splitlines())
+        rel = str(path.relative_to(root))
+        fns, _skipped = extract_fns(src)
+        bodies.extend(
+            (rel, fn.name, fn.line, fn.body.count("\n") + 1)
+            for fn in fns
+            if UPDATE_FN_PATTERN.search(fn.name)
+        )
     if not bodies:
-        fail(f"{UPDATE_FILE} holds no update_* fn")
-    for name, line, lines in bodies:
-        print(f"body {name} line={line} lines={lines}")
-    print(f"file-lines {len(src.splitlines())}")
+        fail(f"{UPDATE_DIR}/{UPDATE_GLOB} holds no update_* fn")
+    for rel, name, line, lines in bodies:
+        print(f"body {name} file={rel} line={line} lines={lines}")
+    print(f"file-lines {file_lines}")
     print(f"update-bodies {len(bodies)}")
-    print(f"update-body-lines {sum(lines for _n, _l, lines in bodies)}")
+    print(f"update-body-lines {sum(lines for _r, _n, _l, lines in bodies)}")
 
 
 def mode_refs(root: Path, rel: str) -> None:

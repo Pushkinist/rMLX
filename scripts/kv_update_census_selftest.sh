@@ -295,7 +295,8 @@ check "a state field leaves the shared shape" "${T}" 0 "^shape store_slots_total
 # them is not counted.
 T="${WORK}/bodies"; build_tree "${T}"
 check "update bodies are counted" "${T}" 0 "^update-bodies 3$" update-bodies
-check "a body's lines are its braces, not its signature" "${T}" 0 "^body update_gamma line=[0-9]+ lines=3$" update-bodies
+check "a body's lines are its braces, not its signature" "${T}" 0 \
+    "^body update_gamma file=${UPDATE_REL} line=[0-9]+ lines=3$" update-bodies
 
 # 14 — a declaration with no body is not a body.
 T="${WORK}/decl"; build_tree "${T}"
@@ -312,12 +313,37 @@ T="${WORK}/nobodies"; build_tree "${T}"
 printf 'pub fn dispatch() -> usize { 1 }\n' >"${T}/${UPDATE_REL}"
 check "no update body is a refusal" "${T}" 2 "unavailable: .*update_\\* fn" update-bodies
 
-# 16 — the update file is gone.
+# 16 — a codec family's own update file joins the population. The bodies are
+# the same bodies wherever they sit, so splitting one out must not move the
+# count or the line total.
+T="${WORK}/family"; build_tree "${T}"
+python3 - "${T}/${UPDATE_REL}" "${T}/$(dirname "${UPDATE_REL}")/update_gamma.rs" <<'PYEOF'
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+body = "fn update_gamma() -> usize {\n    2\n}\n"
+text = open(src).read()
+assert body in text
+open(src, "w").write(text.replace(body + "\n", ""))
+open(dst, "w").write(body)
+PYEOF
+check "a family file's bodies join the population" "${T}" 0 "^update-bodies 3$" update-bodies
+check "a moved body keeps the line total" "${T}" 0 "^update-body-lines 10$" update-bodies
+check "a moved body names the file it sits in" "${T}" 0 \
+    "^body update_gamma file=.*update_gamma\\.rs line=[0-9]+ lines=3$" update-bodies
+
+# 17 — every update file is gone. The directory is there, so the refusal names
+# the glob and not the directory.
 T="${WORK}/nofile"; build_tree "${T}"
 rm -f "${T}/${UPDATE_REL}"
-check "a missing update file is a refusal" "${T}" 2 "unavailable: .*is not a file" update-bodies
+check "a glob that matches no file is a refusal" "${T}" 2 "unavailable: .*matches no file" update-bodies
 
-# 17 — the reference count, both ways.
+# 18 — the whole update directory is gone.
+T="${WORK}/nodir"; build_tree "${T}"
+rm -rf "${T}/$(dirname "${UPDATE_REL}")"
+check "a missing update directory is a refusal" "${T}" 2 "unavailable: .*is not a directory" update-bodies
+
+# 19 — the reference count, both ways.
 T="${WORK}/refs"; build_tree "${T}"
 check "variant references are counted" "${T}" 0 "KvStorage=4 distinct=4" refs --file "${UPDATE_REL}"
 T="${WORK}/norefs"; build_tree "${T}"

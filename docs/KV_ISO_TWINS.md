@@ -469,9 +469,10 @@ place of them, each a glob plus a name rule:
   `crates/rmlx-kv-quant/src/storage`, paired inside a group sharing the filename
   stem with every digit run removed (`quant_iso_v` and `quant_iso_v4` ->
   `quant_iso_v`).
-* **`iso-updates`** — every fn of
-  `crates/rmlx-kv-quant/src/kvcache/update.rs` whose name carries the codec
-  token `iso`, **every pair compared**. Two departures from the rotor entry,
+* **`iso-updates`** — every fn of the update files
+  (`crates/rmlx-kv-quant/src/kvcache/update*.rs`: the dispatch file plus one
+  file per codec family) whose name carries the codec token `iso`, **every
+  pair compared**. Two departures from the rotor entry,
   each for a stated reason.
 
   A name **pattern**, not a prefix: the collapse split the family into entries
