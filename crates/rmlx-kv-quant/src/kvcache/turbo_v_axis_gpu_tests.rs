@@ -137,8 +137,8 @@ fn drive_on_gpu(quant: KvQuant) -> StoreDisposition {
 
 /// The 3-bit V axis stays on the CPU when the caller drives Metal.
 #[test]
-#[ignore = "GPU Metal context — run via `make gpu-test CRATE=rmlx-kv-quant FILTER=turbo_v_axis`"]
-fn tsym3_keeps_the_v_axis_on_the_cpu_under_a_metal_drive() {
+#[ignore = "GPU Metal context — run via `make gpu-test CRATE=rmlx-kv-quant FILTER=turbo`"]
+fn turbo_sym3_v_axis_stays_on_the_cpu_under_a_metal_drive() {
     if skip_if_no_gpu_env() {
         return;
     }
@@ -161,8 +161,8 @@ fn tsym3_keeps_the_v_axis_on_the_cpu_under_a_metal_drive() {
 
 /// The 4-bit V axis follows the caller onto Metal.
 #[test]
-#[ignore = "GPU Metal context — run via `make gpu-test CRATE=rmlx-kv-quant FILTER=turbo_v_axis`"]
-fn tsym4_takes_the_v_axis_to_the_gpu_under_a_metal_drive() {
+#[ignore = "GPU Metal context — run via `make gpu-test CRATE=rmlx-kv-quant FILTER=turbo`"]
+fn turbo_sym4_v_axis_follows_the_caller_to_the_gpu() {
     if skip_if_no_gpu_env() {
         return;
     }

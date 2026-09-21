@@ -415,11 +415,13 @@ owes:
 
 ## 4. Mutations
 
-Every mutation below was applied to the tree by hand, run, and reverted from a
-snapshot whose sha256 of the **working** file was compared before and after —
+Every mutation below was applied to the tree, run, and reverted from a snapshot
+whose sha256 of the **working** file was compared before and after —
 `git checkout --` is not used; it would revert uncommitted work. Each row names
-the assertion that caught it, not just that something failed. Sixteen of
-nineteen red.
+the assertion that caught it, not just that something failed.
+
+**The table is the branch-point run**, sixteen of nineteen red. The collapsed
+tree was re-run against the same list and §4.1 holds the result.
 
 | # | Edit | Caught by |
 |---|---|---|
@@ -449,6 +451,69 @@ M6, M7 and M8b each by exactly one **column** — truncate, rows, resident_bytes
 and store_after_decode. With M1 and M3 on the chunk column, **all five columns
 are load-bearing** rather than redundant. M6 fires at one shape only, which is
 what says both shapes are.
+
+### 4.1 The same list, re-run on the collapsed tree
+
+Seventeen of eighteen runnable rows red. Two rows changed shape, for reasons
+that belong to the collapse and are stated rather than folded in.
+
+| # | On the collapsed tree | Result |
+|---|---|---|
+| M1 | the one CPU append encodes at the literal `3` instead of `self.bits` | RED — the pin and the geometry test |
+| M2 | the one CPU append drops the last code byte | RED — 4 tests |
+| M3 | `GROUP_SIZE` 32 -> 64 | RED — 5 tests |
+| M4 | one `CODEBOOK_3BIT` centroid to the next representable f32 | RED — the pin only |
+| M5 | `truncate_to` keeps `(n - 1).max(0)` | RED — the pin only |
+| M6 | `dequantize_choice` drops `transpose_chunked_seq_heads` | RED — the pin only |
+| M7 | `byte_size` drops the CPU-blocks term | RED — the pin only |
+| M8 | the CPU append coalesces a one-token block into its predecessor | RED — the pin only |
+| M8b | the CPU append zeroes the first scale of a one-token block | RED — the pin only |
+| M9 | `TurboSym4` removed from `ALL_KV_QUANTS` | RED — the census and the scope anchor |
+| M10 | `TurboSym3` into the store-reading arm | RED — `every_turbo_spelling_is_decode_inert` |
+| M11 | the decode-path `use_tcq: false` in `update_k8vturbo3_tcq` | RED — `the_tcq_spellings_set_the_flag_and_still_write_the_plain_bytes` |
+| M12 | `read_quant_k_turbo` passes `0` instead of the geometry's `max_seq` | RED — all three SSD cells, at **both** widths now, because there is one reader |
+| M13 | `read_quant_k_turbo` drops both `.eval()` calls | **GREEN**, as at the branch point. This is divergence 4's measurement, and it is why that decision is stated as convention |
+| M14 | `write_quant_k_turbo` scales the serialised scale plane by 2 | RED — both payload cells |
+| M15 | `tsym_update` routes the V axis to the caller's `device` at both widths | **GREEN under every CPU gate.** See §4.2 |
+| M16 | not expressible. It added the `.eval()` calls to the reader that lacked them; there is one reader and it calls them. M13 is the live half | — |
+| U1 | `from_cpu_blocks` hard-codes `max_seq: 0` again | RED — both window cells **and** the rewritten control's second assertion |
+| U2 | `from_cpu_blocks` claims a `gpu_capacity` of 7 | RED — the GPU-bookkeeping assertion at both widths |
+| U3 | `K8VTurbo2Tcq` spells itself `lloyd2tcq` and builds the K-side turbo store | RED — the scope anchor by name, the census, and the TCQ identity |
+
+Two harness findings, recorded because each first read as a missed detection:
+
+* The branch-point M4 edit `-1.343_908_5` -> `-1.343_908_6` is a **no-op**. Both
+  literals round to the same `f32`: the ULP at that magnitude is ~1.19e-7 and
+  the edit is 1e-7. The row above uses the next representable value,
+  `-1.343_908_67`.
+* An M11 anchor of `use_tcq: true` at the decode arms' indentation also matches
+  the `exit_prefill` arms' deeper-indented line as a substring, and a
+  first-match replace lands there. Those arms execute for no turbo spelling, so
+  the edit was invisible. The row above anchors on the whole `QuantV` literal.
+
+### 4.2 M15, and the drive that does catch it
+
+**M15 is green under every CPU gate**, and after the collapse it is worse than
+before: the edit that used to break one width now breaks the shared body, and
+every CPU cell is still green. The CPU pin drives `Device::Cpu`, where the
+caller's device is the answer the rule forces, so the drive cannot tell "CPU
+because the body resolved it from the width" from "CPU because the caller
+asked".
+
+`crates/rmlx-kv-quant/src/kvcache/turbo_v_axis_gpu_tests.rs` is the drive that
+can, and the pair was run under it, in both directions:
+
+| Edit | Result on Metal |
+|---|---|
+| M15 — `let v_device = device;` | **RED**, `turbo_sym3_v_axis_stays_on_the_cpu_under_a_metal_drive` |
+| M15r — `let v_device = Device::Cpu;` | **RED**, `turbo_sym4_v_axis_follows_the_caller_to_the_gpu` |
+
+Both cells are `#[ignore]`-gated, so **no `make ci` run executes them**. A
+reviewer of this collapse must read a `make gpu-test` result, and the one on
+record is `OK: 29 GPU tests passed across 1 workspace member(s)` for
+`make gpu-test CRATE=rmlx-kv-quant FILTER=turbo`. Neither new cell produced a
+shader-validation hit, so neither owes an entry in
+`scripts/gpu_validation_census.txt`.
 
 ### U3's control, and why the scope anchor sweeps the enum
 
@@ -749,6 +814,30 @@ number.
 | `make check-doc-source-citations` | OK, 311 cited paths resolve |
 | `make check-kv-codec-disposition` | OK — the verdict per codec is unchanged |
 | `make debt-report-selftest` | OK, 114 cases |
+
+The implementing chunk ran the collapse, the merged tests, the GPU pair, the
+second mutation run (§4.1) and the after arm of §5.
+
+| Gate | Result |
+|---|---|
+| `cargo test -p rmlx-kv-quant --lib turbo_store_bytes` | 8 passed, no assertion edited |
+| `cargo test -p rmlx-kv-ssd --lib block_io_turbo_hydrate` | 3 passed, one expectation constant changed |
+| `cargo test -p rmlx-kv-quant --lib iso_store_bytes` | 6 passed, untouched |
+| `cargo test -p rmlx-kv-quant --lib rotor_store_bytes` | 5 passed, untouched |
+| `cargo test -p rmlx-kv-quant` | 586 passed, 262 ignored |
+| `cargo test -p rmlx-kv-ssd` | 121 passed, 12 ignored |
+| `cargo fmt` | clean |
+| `make lint` | clean, `-D warnings` across the workspace |
+| `make check-no-inline-tests` | OK |
+| `make check-gpu-tests-ignored` | OK, 356 files across 12 workspace members |
+| `make check-gpu-tests-ignored-fixtures` | OK, 39 cases |
+| `make check-doc-source-citations` | OK, 320 cited paths resolve |
+| `make check-kv-codec-disposition` | OK, 28 codecs (17 inert) — unchanged |
+| `make check-kv-layer-quants` | OK |
+| `make check-metal-compiles` | SKIP — the Metal Toolchain component is not installed on this host |
+| `make debt-report-selftest` | OK, 114 cases |
+| `make gpu-runner-selftest` | OK |
+| `make gpu-test CRATE=rmlx-kv-quant FILTER=turbo` | OK, 29 GPU tests passed across 1 workspace member |
 
 `make ci` belongs to the orchestrator and `make ci-perf` to the integration
 window, which also owns the served capture in §6.
