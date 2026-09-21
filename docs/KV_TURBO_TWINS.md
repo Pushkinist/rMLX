@@ -85,8 +85,8 @@ none is extra.**
 of every non-test reference to the two types, and asserted at runtime off the
 live storage variant by
 `only_the_symmetric_spellings_build_the_k_side_turbo_store`. The four
-construction sites are `kvcache/update.rs` (two `exit_prefill` arms, two decode
-arms), plus the SSD hydrate constructors.
+construction sites are `kvcache/update_turbo.rs` (two prefill bulk-encode
+bodies, two decode bodies), plus the SSD hydrate constructors.
 
 **Every turbo spelling is decode-inert, and more strongly than the issue
 states.** All six return `false` from `decode_reads_packed_store()`, and all

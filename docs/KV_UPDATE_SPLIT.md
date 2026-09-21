@@ -3,10 +3,11 @@
 `crates/rmlx-kv-quant/src/kvcache/update.rs` held every codec's update path in
 one file. This document is the plan to split it, the record of what was
 measured before the split started, and the record of each chunk as it lands.
-Chunk (a) has landed: the per-family bodies now sit in
-`kvcache/update_{rotor,iso,turbo,affine,planar,paged}.rs` and `update.rs` is
-the dispatcher over them. Every figure below that says "today" was measured
-before chunk (a); §4 carries the after.
+Chunks (a) and (b1) have landed: the per-family decode bodies, and then the
+per-family prefill bulk-encode bodies, now sit in
+`kvcache/update_{rotor,iso,turbo,affine,planar,paged,mixed}.rs` and
+`update.rs` is the dispatcher over them. Every figure below that says "today"
+was measured before chunk (a); §4 carries the after.
 
 Method comes from the three twin-collapse documents and is not restated here:
 [`KV_ROTOR_TWINS.md`](KV_ROTOR_TWINS.md), [`KV_ISO_TWINS.md`](KV_ISO_TWINS.md),
@@ -174,7 +175,9 @@ prefill cells.
 * **The `exit_prefill` arms of the 18 decode-inert spellings.** The gate
   returns before them, so no CPU route runs them at all. They are kept as the
   re-enable path for a codec that grows a decode kernel over its own store,
-  and the guard named above is what holds them to the predicate.
+  and the guard named above is what holds them to the predicate. Chunk (b1)
+  moved them into the family files with the live ones; being unreachable is
+  not a reason to leave a body in the dispatch file.
 * **Every GPU path** — MSL encode dispatch, resident rings, fused flash-decode
   arms, the hydrated-init upload branch. `make gpu-test` is the gate.
 
@@ -338,6 +341,24 @@ After chunk (a), the same command over the files the split produced:
 The interim marker on `update.rs` did not go; its text was rewritten to say
 what is left, which is what the rule asks of a marker that stays.
 
+After chunk (b1), the same command:
+
+| Lines | File | `LOC-exempt` |
+|---|---|---|
+| 2198 | `kvcache/update.rs` | yes — rewritten again: `exit_prefill` is down to 276 body lines of 2198, and what is left is the dispatch, the capacity bookkeeping, the bf16 mirror and the GPU-state walks |
+| 1638 | `kvcache/update_rotor.rs` | yes — rewritten: the family's eight prefill bulk-encode bodies joined its four decode paths |
+| 1272 | `kvcache/update_iso.rs` | yes — new marker: six prefill bodies took the file over the guideline |
+| 998 | `kvcache/update_turbo.rs` | no |
+| 984 | `kvcache/update_affine.rs` | no |
+| 311 | `kvcache/update_planar.rs` | no |
+| 222 | `kvcache/update_paged.rs` | no |
+| 58 | `kvcache/update_mixed.rs` | no |
+
+The chunk takes one file over the guideline and gives it a marker, and takes
+`update.rs` 994 lines closer to it. The count of oversized files with no
+marker anywhere in the tree is 22 on both sides, measured with
+`make debt-report`.
+
 ### Duplication
 
 `python3 scripts/lib/debt_report.py --matched-lines update-bodies` is an
@@ -373,12 +394,22 @@ not of the filesystem walk; no figure depends on that order any more.
 Under the orientation-free measure the figure is the same on the commit before
 chunk (a) and on the tree after it:
 
-| Population | Before chunk (a) | After chunk (a) |
-|---|---|---|
-| `rotor-updates` | 0 over 105 (4 items, 0 pairs) | same |
-| `iso-updates` | 878 over 625 (21 items, 210 pairs) | same |
-| `turbo-updates` | 0 over 91 (2 items, 0 pairs) | same |
-| `update-bodies` | 3610 over 1440 (25 items, 300 pairs) | same |
+| Population | Before chunk (a) | After chunk (a) | After chunk (b1) |
+|---|---|---|---|
+| `rotor-updates` | 0 over 105 (4 items, 0 pairs) | same | same |
+| `iso-updates` | 878 over 625 (21 items, 210 pairs) | same | 1545 over 837 (27 items, 351 pairs) |
+| `turbo-updates` | 0 over 91 (2 items, 0 pairs) | same | same |
+| `update-bodies` | 3610 over 1440 (25 items, 300 pairs) | same | same |
+
+Three of the four do not move on chunk (b1), and that is the naming rule
+working rather than a chunk that changed nothing: `update-bodies` is keyed on
+the `update_` prefix, `rotor-updates` on `^update_rotor` and `turbo-updates`
+on the `tsym` token, and an `exit_prefill_*` fn carries none of the three.
+`iso-updates` is keyed on the `iso` token wherever it sits in the name — that
+is what lets it read the family's entries and the bodies they enter under one
+rule — so the six iso prefill bodies join it and its figure moves. The moved
+bodies duplicate each other exactly as much inside the family file as they did
+inside the `match`; the figure records six more items, not six new twins.
 
 Three figures in the tree moved when the measure did, on both arms alike, with
 no body changing: `iso-updates` 875 → 878, `update-bodies` 3585 → 3610, and
@@ -463,6 +494,145 @@ The last one is the second drive's, and its arm did not move: the
 applied to a file copy, run, and restored by `cp` with a digest check on both
 sides — never by `git checkout`.
 
+### Chunk (b1) — extract the `exit_prefill` arms — landed
+
+Chunk (a) left the `exit_prefill` arms where they were. They read locals the
+enclosing fn builds, so moving one is an extraction and not a move. This chunk
+does the extraction. 25 of the 26 arms of the one `match self.quant` are now a
+fn in their family's file, and the arm that selected them is one call.
+`exit_prefill` keeps the rotating and paged early returns, the raw-buffer
+slice, the compact bf16 seed, the `KvStorage::None` guard, the
+`materialises_packed_store()` gate, the dispatch and the warm-TTFT epilogue:
+276 body lines, down from 1258.
+
+| Family | Arms | File |
+|---|---|---|
+| rotor | 8 | `kvcache/update_rotor.rs` |
+| iso | 6 | `kvcache/update_iso.rs` |
+| turbo | 6 | `kvcache/update_turbo.rs` |
+| affine | 2 | `kvcache/update_affine.rs` |
+| planar | 2 | `kvcache/update_planar.rs` |
+| mixed | 1 | `kvcache/update_mixed.rs` — new file |
+
+`KvQuant::None` is the one arm that stays. It holds no codec store: it
+promotes the raw prefill buffers into the bf16 decode mirror that `update.rs`
+owns, beside `update_none` and `update_decode_fp16`. There is no `None` family
+file and this chunk does not make one. `KvStorage::Paged` has no arm at all —
+its seed is an early return above the gate, not a bulk encode — so
+`update_paged.rs` is untouched.
+
+`update_mixed.rs` is new because `Mixed` had no family file: its decode path
+is not in the update file at all (`KvCache::update` refuses a Mixed cache, and
+the per-step append is `update_and_sdpa_mixed` in `sdpa.rs`), so chunk (a) had
+nothing to move. Its one prefill body could have gone into the affine file —
+`MixedKvState` is affine K8 and affine V plus a rotation — but a file named
+for the affine spellings is not where a reader looks for `Mixed`, and the
+issue names mixed as a family of its own.
+
+**One fn per arm, not one per family.** A fn per family needs a second
+`match self.quant` inside it, with a wildcard arm that every new codec of that
+family has to touch — the opposite of what this restructure is measured on.
+The one dispatch stays one dispatch: 26 arms, 25 of them a single call, no new
+`match` anywhere. A per-arm fn is also the unit chunk (b) deletes, since that
+chunk writes one body per store shape and a per-arm fn is what such a body
+replaces.
+
+**Naming.** `exit_prefill_<spelling>`, the `KvQuant` variant in snake case.
+The prefix is load-bearing for the metrics: `update-bodies`, `rotor-updates`
+and `turbo-updates` are keyed on `update_`, `^update_rotor` and the `tsym`
+token, so a chunk that adds no update body moves none of them. `iso-updates`
+is keyed on the `iso` token wherever it sits in the name, so the six iso
+prefill bodies do join it. §3 records the figure.
+
+**The 18 decode-inert spellings' arms moved too.** The gate returns before
+them and no CPU route runs them, so they are dead code under every drive but
+the oracle's. They are not deleted: they are the re-enable path for a codec
+that grows a decode kernel over its own store, and that is what the comment at
+the gate says. Deleting them would be a codec retirement wearing a
+housekeeping hat. Their guard,
+`warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`,
+is unchanged and still green.
+
+**Extraction, proven.** Every extracted arm is statement-identical to the arm
+it replaces, and the proof is a script rather than a reading. It takes the old
+arm body from the base commit, applies the declared parameter binding, wraps
+it in the new fn's own signature inside an `impl KvCache` block, runs
+`rustfmt`, and compares the result byte for byte with the fn that now sits in
+the family file. Running `rustfmt` on both sides is what removes the reflow a
+dedent of eight columns causes, so no rule in the script has to describe that
+reflow and no rule can hide a real change behind it. **25 arms compared, 0
+differing**, at the per-family counts in the table above.
+
+Three declared changes, and nothing else:
+
+* the parameter binding — `&k_full` becomes `k_full` and `&v_full` becomes
+  `v_full`, because the parameter is already a reference;
+* the trailing `Ok(())` — the arm fell through to the epilogue, the fn
+  returns;
+* five comments whose "above" or "below" named a line of the enclosing fn.
+  Each names `decode_fp16_pair`, which the caller still builds, so each now
+  says "the caller's". The script lists them one by one.
+
+The parameter list is derived per arm from the arm's own body, not chosen:
+`k_full` and `device` always, `v_full` where the arm encodes a V axis,
+`total_seq` where the arm's `tracing::debug!` names it, and `policy` in the
+one arm that hands it to `MixedKvState::bulk_init_from_fp16`.
+
+**Trace targets.** No event in a moved arm carried a `target =` override, so
+each one's target was the module path `rmlx_kv_quant::kvcache::update` and is
+now its family module's. One of them is read by name: the `iso3_encode` phase
+of the `Iso3` arm, which [`PERF_BASELINE.md`](PERF_BASELINE.md) names beside
+its target. This chunk takes the option chunk (a) took — correct the reader in
+the same change, rather than pin the event with an explicit `target =`, which
+would be a statement the old arm did not have and would fail the identity
+proof. `iso3_encode` now emits on `rmlx_kv_quant::kvcache::update_iso` beside
+the four iso decode phases, one target where the doc used to list two, and its
+`site = "exit_prefill"` field is unchanged. A grep of the tree for
+`kvcache::update` finds no other reader.
+
+Removed: the 25 arm bodies from `update.rs`; the eight storage-type imports
+and the two f32-conversion helper imports the move left without a caller
+there; and two of `exit_prefill`'s three `#[allow]` attributes,
+`clippy::unreachable` and `clippy::wildcard_enum_match_arm`, which no
+statement left in the fn raises. The two were found rather than guessed: every
+attribute the chunk touches was written as `#[expect]` first, which reports an
+attribute nothing fires under, and only the ones clippy confirmed were kept.
+That is also how each moved body's own allow list was cut — 75 candidates, 20
+of them unfulfilled, 55 kept.
+
+**The move, falsified.** Six mutations: one live arm of each materialising
+family that has one, and two arms of decode-inert spellings. Each scales by
+1.01 the K values the body hands its store. The control is the green suite
+above.
+
+| Mutation | File | Reachable | First cell red | Column |
+|---|---|---|---|---|
+| `exit_prefill_rotor3_sym` K values ×1.01 | `update_rotor.rs` | yes | `rotor3_sym @ kv_h=1 head_dim=128` | store bytes after `exit_prefill` |
+| `exit_prefill_iso3_sym` K values ×1.01 | `update_iso.rs` | yes | `iso3_sym @ kv_h=1 head_dim=128` | store bytes after `exit_prefill` |
+| `exit_prefill_rotor_k_only3` K values ×1.01 | `update_rotor.rs` | yes | `k_rotor3 @ kv_h=1 head_dim=128` | store bytes after `exit_prefill` |
+| `exit_prefill_mixed` K array ×1.01 | `update_mixed.rs` | yes | `mixed_k8g64_v4g64 @ kv_h=1 head_dim=128` | store bytes after `exit_prefill` |
+| `exit_prefill_turbo_sym3` K values ×1.01 | `update_turbo.rs` | **no** | none — 578 passed | none |
+| `exit_prefill_k8v4` K values ×1.01 | `update_affine.rs` | **no** | none — 578 passed | none |
+
+Every red cell is the second drive's, `exit_prefill_bulk_encode_bytes_are_pinned_per_spelling_and_shape`,
+and each names its own spelling. The control run is 578 passed, 0 failed.
+
+The turbo file has no reachable row to offer. All six turbo spellings report
+`false` from `decode_reads_packed_store()`, so the gate returns before every
+one of their arms; the turbo mutation above is therefore a second dead-arm
+row, not a live one.
+
+The last two rows are the point of the exercise. The `k8v4` and `turbo_sym3`
+arms are two of the 18 the gate returns before, so no CPU route reaches it and no assertion in the tree
+can observe what either writes — the guard pins their store at zero bytes, and
+a zero-byte store is what an unreachable arm and a mutated unreachable arm
+both produce. **Those two mutations are green, and they must be**: a red cell
+there would mean the gate had stopped gating. The evidence for those arms is that they
+compile, that the guard holds them at zero, and that the extraction is
+statement-identical — not a test that runs them, because none does. Every
+mutation was applied to a file copy, run, and restored by `cp` with a digest
+check on both sides — never by `git checkout`.
+
 ### Chunk (b) — one update body per store shape
 
 24 of the 27 variants carry the same store-slot shape and their bodies are the
@@ -510,11 +680,13 @@ Grep before touching any of it.
   names that string and the phases under it. Moving a body to another module
   moves its target. A chunk that moves an instrumented body updates that doc
   in the same commit, or keeps the target explicit. Chunk (a) took the first
-  option: the four iso decode phases (`iso_encode`, `iso_dequant_gpu`,
-  `iso_dequant_cpu`, `iso_vec_to_array`) now emit on
-  `rmlx_kv_quant::kvcache::update_iso`, `iso3_encode` stays on the old target
-  with the `exit_prefill` arm that raises it, and `PERF_BASELINE.md` names both.
-  No other moved event's target is read by name anywhere in the tree.
+  option, and so did chunk (b1): the four iso decode phases (`iso_encode`,
+  `iso_dequant_gpu`, `iso_dequant_cpu`, `iso_vec_to_array`) and the
+  `iso3_encode` prefill phase all emit on
+  `rmlx_kv_quant::kvcache::update_iso`, and `PERF_BASELINE.md` names that one
+  target. No other moved event's target is read by name anywhere in the tree —
+  a grep for `kvcache::update` finds that doc table, this document, and one
+  `use` path.
 * **The one `target =` override in the file.** The PlanarK warm-TTFT bypass
   emits on `rmlx_kv_quant::warm_ttft` with `path = "warm_ttft_bypass"`. Three
   readers name that string: `crates/rmlx-cli/tests/e2e/runner.rs`,

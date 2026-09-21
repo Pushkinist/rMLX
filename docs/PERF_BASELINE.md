@@ -2347,15 +2347,16 @@ development branch, self-hosted Apple Silicon runner only).
 ## iso3 hot-path diagnostic (2026-06-02)
 
 Per-phase trace instrumentation landed for the iso decode sites and for the
-`KvQuant::Iso3` arm of `exit_prefill` (prefill site). All events emit at
+`KvQuant::Iso3` prefill bulk-encode (`exit_prefill_iso3`). All events emit at
 `trace!` level — off by default, opt in with `--log verbose` or
-`RUST_LOG=rmlx_kv_quant=trace`. Two targets, because the decode sites moved
-to the iso family module when the update path was split by codec family:
+`RUST_LOG=rmlx_kv_quant=trace`. One target: the decode sites moved to the iso
+family module when the update path was split by codec family, and the prefill
+site followed them when the `exit_prefill` arms were extracted.
 
 | Site | File | Target | Phases |
 |---|---|---|---|
 | decode | `crates/rmlx-kv-quant/src/kvcache/update_iso.rs` | `rmlx_kv_quant::kvcache::update_iso` | `iso_encode`, `iso_dequant_gpu`, `iso_dequant_cpu`, `iso_vec_to_array` |
-| prefill | `crates/rmlx-kv-quant/src/kvcache/update.rs` | `rmlx_kv_quant::kvcache::update` | `iso3_encode` |
+| prefill | `crates/rmlx-kv-quant/src/kvcache/update_iso.rs` | `rmlx_kv_quant::kvcache::update_iso` | `iso3_encode` |
 
 The decode phases lost their width digit when the iso 3/4-bit update twins
 collapsed onto one width-parametric body. Structured fields: `phase`, `ms`,
