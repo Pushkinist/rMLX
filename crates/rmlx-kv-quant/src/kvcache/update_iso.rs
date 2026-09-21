@@ -1,17 +1,25 @@
+// LOC-exempt: the iso family carries three storage spellings — V, symmetric
+// and K-only — at two code widths, and each needs its own GPU encode, ring
+// sync and prefill bulk-encode path. The six prefill bodies joined the decode
+// bodies here when the `exit_prefill` arms were extracted. Splitting the file
+// by verb instead would put a ring sync in a different file from the appender
+// that maintains it, which is the drift the family grouping exists to prevent.
 //! Iso KV update path.
 //!
 //! Holds every update-side body that only the iso storage types use: the
-//! per-variant `update_iso_*` entries, the GPU encode and ring-sync helpers,
-//! the chunk appenders and the materialise-tail path. The `KvStorage`
-//! dispatch and the helpers with more than one family caller stay in
-//! [`super::update`].
+//! per-variant `update_iso_*` decode entries, the `exit_prefill_iso*` prefill
+//! bulk-encode bodies, the GPU encode and ring-sync helpers, the chunk
+//! appenders and the materialise-tail path. The `KvStorage` dispatch and the
+//! helpers with more than one family caller stay in [`super::update`].
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
-use crate::storage::{iso_n_groups_for, IsoBlocks, KvStorage, QuantIsoK, QuantIsoV, QuantK};
+use crate::storage::{
+    iso_n_groups_for, IsoBlocks, KvStorage, QuantIsoK, QuantIsoV, QuantIsoV3, QuantIsoV4, QuantK,
+};
 
-use super::helpers::{array_to_f32_vec, f32_vec_to_array, storage_variant_name};
+use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array, storage_variant_name};
 use super::update::{
     accumulated_seq, b_kv_h_new_seq, bump_ring_k_shape, collapse_group_norms_to_token,
     head_dim_from_shape, is_ring_only_append, packed_k_chunk_seq_major, storage_mismatch,
@@ -952,5 +960,313 @@ impl KvCache {
         // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
         let v_full = self.update_decode_fp16_v_only(new_v, max_seq, device)?;
         Ok((k_full, v_full))
+    }
+
+    // Iso4 — bulk-quantize K (affine q8_0) + V (IsoQuant 4-bit, CPU only).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_iso4(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill Iso4: bulk-quantizing K (q8_0) + V (iso4 CPU)"
+        );
+        let max_seq =
+            match &self.storage {
+                KvStorage::IsoV4 { max_seq, .. } => *max_seq,
+                _ => return Err(Error::Mlx(
+                    "Iso4 exit_prefill: storage mismatch (KvQuant::Iso4 but storage is not IsoV4)"
+                        .into(),
+                )),
+            };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+
+        let KvStorage::IsoV4 { k, v, .. } = &mut self.storage else {
+            return Err(Error::Mlx("Iso4 exit_prefill: storage mismatch".into()));
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = QuantK {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape.clone(),
+            max_seq,
+        };
+        let mut qv = QuantIsoV4::new(init_shape);
+        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+        qv.append(&v_f32, &new_shape)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
+    }
+
+    // Iso3 — bulk-quantize K (affine q8_0) + V (IsoQuant 3-bit, CPU only).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_iso3(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill Iso3: bulk-quantizing K (q8_0) + V (iso3 CPU)"
+        );
+        let max_seq =
+            match &self.storage {
+                KvStorage::IsoV3 { max_seq, .. } => *max_seq,
+                _ => return Err(Error::Mlx(
+                    "Iso3 exit_prefill: storage mismatch (KvQuant::Iso3 but storage is not IsoV3)"
+                        .into(),
+                )),
+            };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+
+        let KvStorage::IsoV3 { k, v, .. } = &mut self.storage else {
+            return Err(Error::Mlx("Iso3 exit_prefill: storage mismatch".into()));
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = QuantK {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape.clone(),
+            max_seq,
+        };
+        let mut qv = QuantIsoV3::new(init_shape);
+        // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
+        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+        // V-side: CPU IsoQuant 3-bit (no GPU path until T11d).
+        //
+        // Per-phase trace instrumentation for the iso3 V
+        // exit_prefill encode (where the V-side codec actually runs
+        // in the current build — decode hot-path is shadowed by the
+        // bf16 warm-TTFT seed, see docs/PERF_BASELINE.md).
+        let kv_h = new_shape[1];
+        let head_dim = new_shape[3];
+        let t_enc = std::time::Instant::now();
+        qv.append(&v_f32, &new_shape)?;
+        tracing::trace!(
+            phase = "iso3_encode",
+            ms = t_enc.elapsed().as_secs_f64() * 1e3,
+            s_total = new_shape[2],
+            kv_h,
+            head_dim,
+            site = "exit_prefill",
+            "iso3 hot-path"
+        );
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
+    }
+
+    // Iso3Sym — bulk-quantize K (iso3, CPU) + V (iso3, CPU).
+    // The codec is axis-agnostic; only the role on the SDPA path differs.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_iso3_sym(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill Iso3Sym: bulk-quantizing K + V (both iso3 CPU)"
+        );
+        let max_seq = match &self.storage {
+            KvStorage::IsoSym3 { max_seq, .. } => *max_seq,
+            _ => {
+                return Err(Error::Mlx(
+                    "Iso3Sym exit_prefill: storage mismatch (KvQuant::Iso3Sym but storage is not IsoSym3)".into()
+                ))
+            }
+        };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+
+        let KvStorage::IsoSym3 { k, v, .. } = &mut self.storage else {
+            return Err(Error::Mlx("Iso3Sym exit_prefill: storage mismatch".into()));
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = crate::storage::QuantIsoK3::new(init_shape.clone(), max_seq);
+        let mut qv = QuantIsoV3::new(init_shape);
+        qk.append(&k_f32, &new_shape)?;
+        qv.append(&v_f32, &new_shape)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
+    }
+
+    // Iso4Sym — bulk-quantize K (iso4) + V (iso4).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_iso4_sym(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill Iso4Sym: bulk-quantizing K + V (both iso4 CPU)"
+        );
+        let max_seq = match &self.storage {
+            KvStorage::IsoSym4 { max_seq, .. } => *max_seq,
+            _ => {
+                return Err(Error::Mlx(
+                    "Iso4Sym exit_prefill: storage mismatch (KvQuant::Iso4Sym but storage is not IsoSym4)".into()
+                ))
+            }
+        };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+
+        let KvStorage::IsoSym4 { k, v, .. } = &mut self.storage else {
+            return Err(Error::Mlx("Iso4Sym exit_prefill: storage mismatch".into()));
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = crate::storage::QuantIsoK4::new(init_shape.clone(), max_seq);
+        let mut qv = QuantIsoV4::new(init_shape);
+        qk.append(&k_f32, &new_shape)?;
+        qv.append(&v_f32, &new_shape)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
+    }
+
+    // IsoKOnly3 — bulk-quantize K (iso3, CPU); V stays bf16
+    // (materialised by the caller's `decode_fp16_pair`, same machinery as PlanarK).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_iso_k_only3(
+        &mut self,
+        k_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill IsoKOnly3: bulk-quantizing K (iso3 CPU); V stays bf16"
+        );
+        let max_seq = match &self.storage {
+            KvStorage::IsoKOnly3 { max_seq, .. } => *max_seq,
+            _ => {
+                return Err(Error::Mlx(
+                    "IsoKOnly3 exit_prefill: storage mismatch (KvQuant::IsoKOnly3 but storage is not IsoKOnly3)".into()
+                ))
+            }
+        };
+        let new_shape = k_full.shape();
+        let k_f32 = array_to_f32_vec(k_full, device)?;
+
+        let KvStorage::IsoKOnly3 { k, .. } = &mut self.storage else {
+            return Err(Error::Mlx(
+                "IsoKOnly3 exit_prefill: storage mismatch".into(),
+            ));
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = crate::storage::QuantIsoK3::new(init_shape, max_seq);
+        qk.append(&k_f32, &new_shape)?;
+        *k = Some(qk);
+        // V-side: bf16 — materialised by the caller's decode_fp16_pair.
+        Ok(())
+    }
+
+    // IsoKOnly4 — bulk-quantize K (iso4 CPU); V stays bf16.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_iso_k_only4(
+        &mut self,
+        k_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill IsoKOnly4: bulk-quantizing K (iso4 CPU); V stays bf16"
+        );
+        let max_seq = match &self.storage {
+            KvStorage::IsoKOnly4 { max_seq, .. } => *max_seq,
+            _ => {
+                return Err(Error::Mlx(
+                    "IsoKOnly4 exit_prefill: storage mismatch (KvQuant::IsoKOnly4 but storage is not IsoKOnly4)".into()
+                ))
+            }
+        };
+        let new_shape = k_full.shape();
+        let k_f32 = array_to_f32_vec(k_full, device)?;
+
+        let KvStorage::IsoKOnly4 { k, .. } = &mut self.storage else {
+            return Err(Error::Mlx(
+                "IsoKOnly4 exit_prefill: storage mismatch".into(),
+            ));
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = crate::storage::QuantIsoK4::new(init_shape, max_seq);
+        qk.append(&k_f32, &new_shape)?;
+        *k = Some(qk);
+        Ok(())
     }
 }

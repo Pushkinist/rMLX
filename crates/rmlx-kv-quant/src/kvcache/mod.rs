@@ -58,6 +58,7 @@ mod shared_kv;
 mod update;
 mod update_affine;
 mod update_iso;
+mod update_mixed;
 mod update_paged;
 mod update_planar;
 mod update_rotor;

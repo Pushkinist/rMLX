@@ -1,16 +1,19 @@
 //! TurboQuant KV update path.
 //!
 //! Holds every update-side body that only the TurboQuant storage types use:
-//! the per-variant `update_k8vturbo*` and `update_tsym` entries and the
-//! width-parametric symmetric body they enter. The `KvStorage` dispatch and
-//! the helpers with more than one family caller stay in [`super::update`].
+//! the per-variant `update_k8vturbo*` and `update_tsym` decode entries, the
+//! width-parametric symmetric body they enter, and the `exit_prefill_*`
+//! prefill bulk-encode bodies. The `KvStorage` dispatch and the helpers with
+//! more than one family caller stay in [`super::update`].
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
-use crate::storage::{KvStorage, QuantK, QuantKTurbo, QuantV, TURBO_K4_BITS};
+use crate::storage::{
+    KvStorage, QuantK, QuantKTurbo, QuantKTurbo3, QuantKTurbo4, QuantV, TURBO_K4_BITS,
+};
 
-use super::helpers::{array_to_f32_vec, f32_vec_to_array, storage_variant_name};
+use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array, storage_variant_name};
 use super::update::storage_mismatch;
 use super::KvCache;
 
@@ -567,5 +570,430 @@ impl KvCache {
         let v_full = f32_vec_to_array(&v_recon_f32, &v_shape)?;
 
         Ok((k_full, v_full))
+    }
+
+    // K8VTurbo3 — bulk-quantize K (affine q8_0) + V (TurboQuant 3-bit).
+    // CPU dequant only: no GPU path for 3-bit V (no MSL kernel this pass).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::unreachable,
+        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_k8vturbo3(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill K8VTurbo3: bulk-quantizing K (q8_0) + V (turbo3)"
+        );
+        let max_seq = match &self.storage {
+            KvStorage::K8VTurbo3 { max_seq, .. } => *max_seq,
+            _ => unreachable!("KvQuant::K8VTurbo3 but storage is not K8VTurbo3"),
+        };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+
+        let KvStorage::K8VTurbo3 { k, v, .. } = &mut self.storage else {
+            unreachable!("KvQuant::K8VTurbo3 but storage is not K8VTurbo3");
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = QuantK {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape.clone(),
+            max_seq,
+        };
+        let mut qv = QuantV {
+            blocks: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            bits: 3,
+            max_seq,
+            high_precision_indices: None,
+            value_codebook: None,
+            value_codebook_gpu: None,
+            use_tcq: false,
+        };
+        // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
+        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+        // V-side: CPU TurboQuant 3-bit (GPU path not yet available for bits=3).
+        qv.append(&v_f32, &new_shape, v_full, Device::Cpu, max_seq)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
+    }
+
+    // TurboSym3 — symmetric 3-bit Lloyd-Max K + turbo3 V.
+    // K side uses the GPU turbo3 MSL kernel (Decision B); V side forced CPU
+    // (K8VTurbo3 precedent: GPU V-side dispatch regressed −2% TPS gate).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::unreachable,
+        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_turbo_sym3(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill TurboSym3: bulk-quantizing K (turbo3/GPU) + V (turbo3/CPU)"
+        );
+        let max_seq = match &self.storage {
+            KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
+            _ => unreachable!("KvQuant::TurboSym3 but storage is not TurboSym3"),
+        };
+        let new_shape = k_full.shape();
+        // K GPU-capable; V CPU-forced.
+        let k_f32 = if device == Device::Gpu {
+            Vec::new()
+        } else {
+            array_to_f32_vec(k_full, device)?
+        };
+        let v_f32 = array_to_f32_vec(v_full, Device::Cpu)?;
+
+        let KvStorage::TurboSym3 { k, v, .. } = &mut self.storage else {
+            unreachable!("KvQuant::TurboSym3 but storage is not TurboSym3");
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = QuantKTurbo3::new(init_shape.clone(), max_seq);
+        let mut qv = QuantV {
+            blocks: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            bits: 3,
+            max_seq,
+            high_precision_indices: None,
+            value_codebook: None,
+            value_codebook_gpu: None,
+            use_tcq: false,
+        };
+        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+        // V-side: force CPU path for 3-bit (GPU kernel wired but disabled;
+        // see update_k8vturbo3 doc-comment for the −2% gate fail).
+        qv.append(&v_f32, &new_shape, v_full, Device::Cpu, max_seq)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
+    }
+
+    // TurboSym4 — symmetric 4-bit Lloyd-Max K + tq4 V. Both axes are
+    // bulk-quantized via the same MSL kernel (axis-agnostic).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::unreachable,
+        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_turbo_sym4(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill TurboSym4: bulk-quantizing K (tq4) + V (tq4)"
+        );
+        let max_seq = match &self.storage {
+            KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
+            _ => unreachable!("KvQuant::TurboSym4 but storage is not TurboSym4"),
+        };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = if device == Device::Gpu {
+            (Vec::new(), Vec::new())
+        } else {
+            arrays_to_f32(k_full, v_full, device)?
+        };
+
+        let KvStorage::TurboSym4 { k, v, .. } = &mut self.storage else {
+            unreachable!("KvQuant::TurboSym4 but storage is not TurboSym4");
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = QuantKTurbo4::new(init_shape.clone(), max_seq);
+        let mut qv = QuantV {
+            blocks: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            bits: 4,
+            max_seq,
+            high_precision_indices: None,
+            value_codebook: None,
+            value_codebook_gpu: None,
+            use_tcq: false,
+        };
+        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+        qv.append(&v_f32, &new_shape, v_full, device, max_seq)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
+    }
+
+    // K8VTurbo2 — same shape as K8VTurbo3 with bits=2.
+    // CPU dequant only (the turbo2 MSL kernel is a future-reference
+    // hook, mirroring K8VTurbo3; see `turbo2_v_msl.rs`).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_k8vturbo2(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill K8VTurbo2: bulk-quantizing K (q8_0) + V (turbo2)"
+        );
+        let max_seq = match &self.storage {
+            KvStorage::K8VTurbo2 { max_seq, .. } => *max_seq,
+            _ => return Err(Error::Mlx(
+                "K8VTurbo2 exit_prefill: storage mismatch (KvQuant::K8VTurbo2 but storage is not K8VTurbo2)".into()
+            )),
+        };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+
+        let KvStorage::K8VTurbo2 { k, v, .. } = &mut self.storage else {
+            return Err(Error::Mlx(
+                "K8VTurbo2 exit_prefill: storage mismatch (KvQuant::K8VTurbo2 but storage is not K8VTurbo2)".into()
+            ));
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = QuantK {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape.clone(),
+            max_seq,
+        };
+        let mut qv = QuantV {
+            blocks: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            bits: 2,
+            max_seq,
+            high_precision_indices: None,
+            value_codebook: None,
+            value_codebook_gpu: None,
+            use_tcq: false,
+        };
+        // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
+        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+        // V-side: CPU TurboQuant 2-bit (GPU path not wired on hot path).
+        qv.append(&v_f32, &new_shape, v_full, Device::Cpu, max_seq)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
+    }
+
+    // K8VTurbo3Tcq — bulk-quantize K (affine q8_0) + V
+    // (TurboQuant 3-bit with Viterbi assignment). Mirrors the K8VTurbo3
+    // arm with `use_tcq = true` on the V slot so the encode dispatch in
+    // QuantV::append picks the Viterbi path.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::unreachable,
+        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_k8vturbo3_tcq(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill K8VTurbo3Tcq: bulk-quantizing K (q8_0) + V (turbo3 + Viterbi)"
+        );
+        let max_seq = match &self.storage {
+            KvStorage::K8VTurbo3Tcq { max_seq, .. } => *max_seq,
+            _ => unreachable!("KvQuant::K8VTurbo3Tcq but storage is not K8VTurbo3Tcq"),
+        };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+
+        let KvStorage::K8VTurbo3Tcq { k, v, .. } = &mut self.storage else {
+            unreachable!("KvQuant::K8VTurbo3Tcq but storage is not K8VTurbo3Tcq");
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = QuantK {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape.clone(),
+            max_seq,
+        };
+        let mut qv = QuantV {
+            blocks: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            bits: 3,
+            max_seq,
+            high_precision_indices: None,
+            value_codebook: None,
+            value_codebook_gpu: None,
+            use_tcq: true,
+        };
+        // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
+        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+        // V-side: CPU TurboQuant 3-bit with Viterbi assignment.
+        qv.append(&v_f32, &new_shape, v_full, Device::Cpu, max_seq)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
+    }
+
+    // K8VTurbo2Tcq — bulk-quantize K (affine q8_0) + V
+    // (TurboQuant 2-bit with Viterbi assignment). Mirrors K8VTurbo3Tcq
+    // with bits=2 and the `turbo2_tcq` max_compression preset.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::unreachable,
+        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_k8vturbo2_tcq(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        tracing::debug!(
+            total_seq,
+            "exit_prefill K8VTurbo2Tcq: bulk-quantizing K (q8_0) + V (turbo2 + Viterbi)"
+        );
+        let max_seq = match &self.storage {
+            KvStorage::K8VTurbo2Tcq { max_seq, .. } => *max_seq,
+            _ => unreachable!("KvQuant::K8VTurbo2Tcq but storage is not K8VTurbo2Tcq"),
+        };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+
+        let KvStorage::K8VTurbo2Tcq { k, v, .. } = &mut self.storage else {
+            unreachable!("KvQuant::K8VTurbo2Tcq but storage is not K8VTurbo2Tcq");
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = QuantK {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape.clone(),
+            max_seq,
+        };
+        let mut qv = QuantV {
+            blocks: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            bits: 2,
+            max_seq,
+            high_precision_indices: None,
+            value_codebook: None,
+            value_codebook_gpu: None,
+            use_tcq: true,
+        };
+        // K-side: GPU affine q8_0 (same path as K8V4/K8V8).
+        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+        // V-side: CPU TurboQuant 2-bit with Viterbi assignment.
+        qv.append(&v_f32, &new_shape, v_full, Device::Cpu, max_seq)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
     }
 }

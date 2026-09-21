@@ -1,8 +1,9 @@
 //! Affine (q8 K, affine V) KV update path.
 //!
 //! Holds every update-side body that only the affine storage types use: the
-//! `update_k8v4` / `update_k8v8` entries, the TurboFlash head-major K8V4
-//! buffers and their allocate, grow and append helpers. The `KvStorage`
+//! `update_k8v4` / `update_k8v8` decode entries, the `exit_prefill_k8v4` /
+//! `exit_prefill_k8v8` prefill bulk-encode bodies, the TurboFlash head-major
+//! K8V4 buffers and their allocate, grow and append helpers. The `KvStorage`
 //! dispatch and the helpers with more than one family caller stay in
 //! [`super::update`].
 
@@ -13,7 +14,7 @@ use crate::storage::{KvStorage, QuantK, QuantV};
 use crate::turbo_flash_msl::{turbo_flash_sdpa, turbo_flash_should_run};
 use crate::KvQuant;
 
-use super::helpers::{arrays_to_f32, f32_vec_to_array};
+use super::helpers::{arrays_to_f32, f32_vec_to_array, storage_variant_name};
 use super::KvCache;
 
 impl KvCache {
@@ -846,5 +847,139 @@ impl KvCache {
         };
 
         Ok((k_full, v_full))
+    }
+
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_k8v8(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+    ) -> Result<()> {
+        let max_seq = match &self.storage {
+            KvStorage::K8V8 { max_seq, .. } => *max_seq,
+            _ => {
+                return Err(Error::KvStorageMismatch {
+                    expected: "K8V8",
+                    got: storage_variant_name(&self.storage),
+                })
+            }
+        };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = if device == Device::Gpu {
+            (Vec::new(), Vec::new())
+        } else {
+            arrays_to_f32(k_full, v_full, device)?
+        };
+
+        let KvStorage::K8V8 { k, v, .. } = &mut self.storage else {
+            return Err(Error::KvStorageMismatch {
+                expected: "K8V8",
+                got: storage_variant_name(&self.storage),
+            });
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = QuantK {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape.clone(),
+            max_seq,
+        };
+        let mut qv = QuantK {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            max_seq,
+        };
+        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+        qv.append(&v_f32, &new_shape, v_full, device, max_seq)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
+    }
+
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+    )]
+    #[allow(
+        clippy::unreachable,
+        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+    )]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
+    )]
+    pub(super) fn exit_prefill_k8v4(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+    ) -> Result<()> {
+        let max_seq = match &self.storage {
+            KvStorage::K8V4 { max_seq, .. } => *max_seq,
+            _ => unreachable!(),
+        };
+        let new_shape = k_full.shape();
+        let (k_f32, v_f32) = if device == Device::Gpu {
+            (Vec::new(), Vec::new())
+        } else {
+            arrays_to_f32(k_full, v_full, device)?
+        };
+
+        let KvStorage::K8V4 { k, v, .. } = &mut self.storage else {
+            unreachable!("KvQuant::K8V4 but storage is not K8V4");
+        };
+        let mut init_shape = new_shape.clone();
+        init_shape[2] = 0;
+        let mut qk = QuantK {
+            codes: Vec::new(),
+            scales: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape.clone(),
+            max_seq,
+        };
+        let mut qv = QuantV {
+            blocks: Vec::new(),
+            gpu_codes_buf: None,
+            gpu_scales_buf: None,
+            gpu_words_per_step: 0,
+            gpu_scales_per_step: 0,
+            gpu_capacity: 0,
+            shape: init_shape,
+            bits: 4,
+            max_seq,
+            high_precision_indices: None,
+            value_codebook: None,
+            value_codebook_gpu: None,
+            use_tcq: false,
+        };
+        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+        qv.append(&v_f32, &new_shape, v_full, device, max_seq)?;
+        *k = Some(qk);
+        *v = Some(qv);
+        Ok(())
     }
 }
