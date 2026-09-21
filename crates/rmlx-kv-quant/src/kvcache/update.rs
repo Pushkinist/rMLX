@@ -1,3 +1,6 @@
+// LOC-exempt: one file holds every codec's update path. The split by codec
+// family, and the one update body per store shape that follows it, are
+// planned in docs/KV_UPDATE_SPLIT.md; this marker goes when the split lands.
 //! Update paths: `update`, prefill, GPU state management, and storage-specific appenders.
 #![allow(
     clippy::cognitive_complexity,

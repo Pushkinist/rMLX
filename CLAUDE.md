@@ -46,6 +46,7 @@ areas before touching code:
 | [`docs/WEIGHT_QUANTS.md`](docs/WEIGHT_QUANTS.md) | Weight quantization formats (mxfp, affine, TurboQuant, PlanarQuant, ParoQuant) |
 | [`docs/KV_QUANT.md`](docs/KV_QUANT.md) | KV-cache quantization variants (K8V4, K8V8, Mixed, Planar, Paged, rot_k) |
 | [`docs/KV_CACHE.md`](docs/KV_CACHE.md) | KV cache architecture (block alignment, ring buffer, SWA snapshot, chunked prefill) |
+| [`docs/KV_UPDATE_SPLIT.md`](docs/KV_UPDATE_SPLIT.md) | Splitting the KV update path: the re-measured premise, the store-bytes oracle over every spelling, the match-site and duplication metrics, the chunk plan and what cannot move |
 | [`docs/KV_ROTOR_TWINS.md`](docs/KV_ROTOR_TWINS.md) | Rotor 3/4-bit storage + update twins: measured premise, the store-bytes oracle, mutations, removals |
 | [`docs/KV_ISO_TWINS.md`](docs/KV_ISO_TWINS.md) | Iso 3/4-bit storage + update twins: the drift, the GPU-decode decision, the fidelity bound, mutations, removals. Method lives in `KV_ROTOR_TWINS.md` |
 | [`docs/KV_TURBO_TWINS.md`](docs/KV_TURBO_TWINS.md) | TurboQuant 3/4-bit K storage + update twins: the five divergences and the decision each forces, the decode-inert oracle argument, the SSD hydrate pin, mutations, removals. Method lives in `KV_ROTOR_TWINS.md` |
