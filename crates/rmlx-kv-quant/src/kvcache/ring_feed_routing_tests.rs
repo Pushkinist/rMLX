@@ -26,7 +26,8 @@
 //! If a call site is changed to bypass its constant, this file stays green and
 //! the matching pair goes red.
 
-use super::{is_ring_only_append, RingFeed, LEGACY_ROTOR_K_ONLY_FEED, LEGACY_ROTOR_SYM_FEED};
+use super::super::update::{is_ring_only_append, RingFeed};
+use super::{LEGACY_ROTOR_K_ONLY_FEED, LEGACY_ROTOR_SYM_FEED};
 
 /// The arm is chosen by `feed` and `b` only — never by chunk length.
 ///

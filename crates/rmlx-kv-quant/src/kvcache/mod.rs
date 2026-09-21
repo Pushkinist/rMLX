@@ -52,6 +52,12 @@ mod helpers;
 mod sdpa;
 mod shared_kv;
 mod update;
+mod update_affine;
+mod update_iso;
+mod update_paged;
+mod update_planar;
+mod update_rotor;
+mod update_turbo;
 
 // The GPU ring of the ring-backed K codecs is counted in resident_bytes.
 #[cfg(test)]
