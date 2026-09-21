@@ -156,6 +156,24 @@ The figure is derived and pinned in the oracle
 codec entering or leaving the class turns a cell red instead of quietly
 changing what the real-model run is worth.
 
+### The oracle, falsified
+
+Five engine mutations, one per observed column and spanning four families. Each
+was applied to a snapshot, run, and restored by file copy with a digest check —
+never by `git checkout`. The control run, with no mutation, is green.
+
+| Mutation | First cell red | Column |
+|---|---|---|
+| `resident_bytes` over-counts by one byte | `none @ kv_h=1 head_dim=128` | `resident_bytes` |
+| `KvStorage::truncate_to` keeps one position too few | `k8v4 @ kv_h=1 head_dim=128` | store bytes after truncate |
+| one planar rotation angle off by 0.001 rad | `planar @ kv_h=1 head_dim=128` | store bytes after the bulk append |
+| one iso quaternion component off in the seventh digit | `iso3 @ kv_h=1 head_dim=128` | store bytes after the bulk append |
+| one TurboQuant 2-bit centroid off by 0.01 | `k8vturbo2 @ kv_h=1 head_dim=128` | store bytes after the bulk append |
+
+The planar mutation is the one that matters most for the coverage audit: before
+this work, **no test in the tree turned red on it**, because no planar spelling
+had a store-bytes pin.
+
 ---
 
 ## 3. The structural metric
