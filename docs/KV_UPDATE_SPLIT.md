@@ -990,7 +990,11 @@ construction-time defect that used to fail loudly would pass silently.
 own side width, from `KvQuant::approx_code_bits`, against the width the entry
 resolved, and warns. Deliberately not an assert, because the storage is the
 authority both halves already follow. Nothing asserts on that warning, so a
-mutation that inverts the comparison is not caught either.
+mutation that inverts the comparison is not caught either. The diagnostic is
+reached by 3 of its 17 sites under the CPU oracle today (`iso3_sym`,
+`k_iso3`, `k_rotor3`); the other 14 sit behind the
+`materialises_packed_store()` gate and are inert. The no-false-warning
+conclusion holds by construction, not by measurement.
 
 #### The figures
 

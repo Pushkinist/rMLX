@@ -60,7 +60,7 @@ pub(super) fn tsym_update<const BITS: u8>(
     let v_f32 = if v_device == Device::Gpu {
         Vec::new()
     } else {
-        array_to_f32_vec(new_v, Device::Cpu)?
+        array_to_f32_vec(new_v, v_device)?
     };
 
     if k.is_none() {
@@ -298,17 +298,18 @@ pub(super) fn tsym_bulk_encode<const BITS: u8>(
     device: Device,
     total_seq: i32,
 ) -> Result<()> {
-    tracing::debug!(
-        total_seq,
-        bits = BITS,
-        "exit_prefill turbo symmetric: bulk-quantizing K + V (both turbo)"
-    );
-    let new_shape = k_full.shape();
     let v_device = if BITS == TURBO_K4_BITS {
         device
     } else {
         Device::Cpu
     };
+    tracing::debug!(
+        total_seq,
+        bits = BITS,
+        v_device = ?v_device,
+        "exit_prefill turbo symmetric: bulk-quantizing K + V (both turbo)"
+    );
+    let new_shape = k_full.shape();
     let k_f32 = if device == Device::Gpu {
         Vec::new()
     } else {
@@ -317,7 +318,7 @@ pub(super) fn tsym_bulk_encode<const BITS: u8>(
     let v_f32 = if v_device == Device::Gpu {
         Vec::new()
     } else {
-        array_to_f32_vec(v_full, Device::Cpu)?
+        array_to_f32_vec(v_full, v_device)?
     };
     let mut init_shape = new_shape.clone();
     init_shape[2] = 0;
