@@ -345,17 +345,17 @@ After chunk (b1), the same command:
 
 | Lines | File | `LOC-exempt` |
 |---|---|---|
-| 2198 | `kvcache/update.rs` | yes — rewritten again: `exit_prefill` is down to 276 body lines of 2198, and what is left is the dispatch, the capacity bookkeeping, the bf16 mirror and the GPU-state walks |
-| 1638 | `kvcache/update_rotor.rs` | yes — rewritten: the family's eight prefill bulk-encode bodies joined its four decode paths |
-| 1272 | `kvcache/update_iso.rs` | yes — new marker: six prefill bodies took the file over the guideline |
-| 998 | `kvcache/update_turbo.rs` | no |
-| 984 | `kvcache/update_affine.rs` | no |
-| 311 | `kvcache/update_planar.rs` | no |
+| 2193 | `kvcache/update.rs` | yes — rewritten again: `exit_prefill` is down to 276 body lines of 2193, and what is left is the dispatch, the capacity bookkeeping, the bf16 mirror and the GPU-state walks |
+| 1614 | `kvcache/update_rotor.rs` | yes — rewritten: the family's eight prefill bulk-encode bodies joined its four decode paths |
+| 1260 | `kvcache/update_iso.rs` | yes — new marker: six prefill bodies took the file over the guideline |
+| 995 | `kvcache/update_turbo.rs` | no — five lines under the guideline, so the next body added to this family needs a marker or a split |
+| 968 | `kvcache/update_affine.rs` | no |
+| 313 | `kvcache/update_planar.rs` | no |
 | 222 | `kvcache/update_paged.rs` | no |
 | 58 | `kvcache/update_mixed.rs` | no |
 
 The chunk takes one file over the guideline and gives it a marker, and takes
-`update.rs` 994 lines closer to it. The count of oversized files with no
+`update.rs` 999 lines closer to it. The count of oversized files with no
 marker anywhere in the tree is 22 on both sides, measured with
 `make debt-report`.
 
@@ -394,22 +394,41 @@ not of the filesystem walk; no figure depends on that order any more.
 Under the orientation-free measure the figure is the same on the commit before
 chunk (a) and on the tree after it:
 
-| Population | Before chunk (a) | After chunk (a) | After chunk (b1) |
-|---|---|---|---|
-| `rotor-updates` | 0 over 105 (4 items, 0 pairs) | same | same |
-| `iso-updates` | 878 over 625 (21 items, 210 pairs) | same | 1545 over 837 (27 items, 351 pairs) |
-| `turbo-updates` | 0 over 91 (2 items, 0 pairs) | same | same |
-| `update-bodies` | 3610 over 1440 (25 items, 300 pairs) | same | same |
+Chunk (b1) widened two of the four rules, so the `rotor-updates` and
+`turbo-updates` rows below are re-measured on both arms under the widened one.
+`iso-updates` and `update-bodies` are unchanged rules.
 
-Three of the four do not move on chunk (b1), and that is the naming rule
-working rather than a chunk that changed nothing: `update-bodies` is keyed on
-the `update_` prefix, `rotor-updates` on `^update_rotor` and `turbo-updates`
-on the `tsym` token, and an `exit_prefill_*` fn carries none of the three.
-`iso-updates` is keyed on the `iso` token wherever it sits in the name — that
-is what lets it read the family's entries and the bodies they enter under one
-rule — so the six iso prefill bodies join it and its figure moves. The moved
-bodies duplicate each other exactly as much inside the family file as they did
-inside the `match`; the figure records six more items, not six new twins.
+| Population | Before chunk (b1) | After chunk (b1) |
+|---|---|---|
+| `rotor-updates` | 0 over 776 (27 items, 0 pairs) | 138 over 1052 (35 items, 4 pairs) |
+| `iso-updates` | 878 over 625 (21 items, 210 pairs) | 1545 over 837 (27 items, 351 pairs) |
+| `turbo-updates` | 0 over 91 (2 items, 0 pairs) | 37 over 181 (4 items, 1 pair) |
+| `update-bodies` | 3610 over 1440 (25 items, 300 pairs) | same |
+
+`update-bodies` does not move, and that is its rule working rather than a
+chunk that changed nothing: it is keyed on the `update_` prefix and an
+`exit_prefill_*` fn does not carry it. The other three are keyed on a codec
+token matched as a whole segment wherever it sits in the name, so each reads
+its family's prefill bulk-encode bodies beside the decode ones.
+
+**Two of those rules could not, before this chunk.** `rotor-updates` was
+`^update_rotor`, an anchored prefix, and `turbo-updates` named only the `tsym`
+spelling while the prefill bodies spell the same token `turbo_sym`. Both read
+a measured `0` over a population that had just gained four and one exact pair
+respectively — a counter that cannot fail. Measured: deleting
+`exit_prefill_rotor4` from the tree left `rotor-updates` reading
+`0 matched lines over 105 body lines (4 item(s), 0 pair(s))` before and after
+under the anchored rule. Under the widened rule the same deletion reads
+`138 over 1052 (35 items, 4 pairs)` before and `98 over 1012 (34 items, 3
+pairs)` after, and deleting `exit_prefill_turbo_sym4` takes `turbo-updates`
+from `37 over 181 (4 items, 1 pair)` to `0 over 138 (3 items, 0 pairs)`. The
+four rotor pairs and the one turbo pair the widened rules now see are the
+width twins chunk (b2) collapses; the counter has to be able to move when it
+does.
+
+The moved bodies duplicate each other exactly as much inside the family file
+as they did inside the `match`. The figures record more items, not new twins —
+what changed is that three of the four counters can now see them.
 
 Three figures in the tree moved when the measure did, on both arms alike, with
 no body changing: `iso-updates` 875 → 878, `update-bodies` 3585 → 3610, and
@@ -514,10 +533,18 @@ slice, the compact bf16 seed, the `KvStorage::None` guard, the
 | planar | 2 | `kvcache/update_planar.rs` |
 | mixed | 1 | `kvcache/update_mixed.rs` — new file |
 
-`KvQuant::None` is the one arm that stays. It holds no codec store: it
-promotes the raw prefill buffers into the bf16 decode mirror that `update.rs`
-owns, beside `update_none` and `update_decode_fp16`. There is no `None` family
-file and this chunk does not make one. `KvStorage::Paged` has no arm at all —
+`KvQuant::None` is the one arm that stays, and the reason is structural
+before it is editorial. It is the only arm that reads `raw_k` / `raw_v` — the
+owned buffers the enclosing fn took out of `self`, which every other arm sees
+only through the `k_full` / `v_full` slices — and the only one whose body
+carries a successful early `return Ok(())` rather than falling through to the
+warm-TTFT epilogue. Both facts are derived from the 26 arm bodies at the base
+commit, not asserted: no other arm names either buffer or returns `Ok`. Extracting it would mean handing a fn two more owned buffers and
+giving it a way to say "skip the epilogue", which is a change to the
+dispatch's shape and not a move. It also holds no codec store: it promotes
+those buffers into the bf16 decode mirror that `update.rs` owns, beside
+`update_none` and `update_decode_fp16`. There is no `None` family file and
+this chunk does not make one. `KvStorage::Paged` has no arm at all —
 its seed is an early return above the gate, not a bulk encode — so
 `update_paged.rs` is untouched.
 
@@ -549,9 +576,18 @@ them and no CPU route runs them, so they are dead code under every drive but
 the oracle's. They are not deleted: they are the re-enable path for a codec
 that grows a decode kernel over its own store, and that is what the comment at
 the gate says. Deleting them would be a codec retirement wearing a
-housekeeping hat. Their guard,
-`warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`,
-is unchanged and still green.
+housekeeping hat.
+
+Two tests hold them, and they hold different things.
+`warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`
+holds the **classification**: it sweeps every variant and fails when a codec's
+arm and its `materialises_packed_store()` answer disagree. It does not read a
+byte of the 18 inert bodies, because after the gate there is nothing to read.
+What a gate regression trips first is
+`store_bytes_tests::the_two_populations_partition_every_spelling`, which
+derives the 18/10 split from the predicate itself, so a spelling crossing the
+line turns a cell red rather than quietly changing what a served run is worth.
+Both are unchanged and green.
 
 **Extraction, proven.** Every extracted arm is statement-identical to the arm
 it replaces, and the proof is a script rather than a reading. It takes the old
@@ -615,7 +651,9 @@ above.
 | `exit_prefill_k8v4` K values ×1.01 | `update_affine.rs` | **no** | none — 578 passed | none |
 
 Every red cell is the second drive's, `exit_prefill_bulk_encode_bytes_are_pinned_per_spelling_and_shape`,
-and each names its own spelling. The control run is 578 passed, 0 failed.
+and each names its own spelling. The control run is 578 passed, 0 failed —
+the lib suite, which is the population every row above is counted against.
+The whole crate, lib plus integration binaries, is 584 passed, 0 failed.
 
 The turbo file has no reachable row to offer. All six turbo spellings report
 `false` from `decode_reads_packed_store()`, so the gate returns before every

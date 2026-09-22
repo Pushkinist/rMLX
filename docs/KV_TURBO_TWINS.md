@@ -84,9 +84,12 @@ none is extra.**
 **Only `TurboSym3` and `TurboSym4` construct the K twin** — confirmed by a scan
 of every non-test reference to the two types, and asserted at runtime off the
 live storage variant by
-`only_the_symmetric_spellings_build_the_k_side_turbo_store`. The four
-construction sites are `kvcache/update_turbo.rs` (two prefill bulk-encode
-bodies, two decode bodies), plus the SSD hydrate constructors.
+`only_the_symmetric_spellings_build_the_k_side_turbo_store`. The three
+construction sites are all in `kvcache/update_turbo.rs` — one per prefill
+bulk-encode body, `exit_prefill_turbo_sym3` and `exit_prefill_turbo_sym4`,
+and one in `tsym_update<BITS>`, the single width-parametric decode body the
+two decode entries share — plus the SSD hydrate constructors. The decode side
+reads two before the width collapse and one after it.
 
 **Every turbo spelling is decode-inert, and more strongly than the issue
 states.** All six return `false` from `decode_reads_packed_store()`, and all
