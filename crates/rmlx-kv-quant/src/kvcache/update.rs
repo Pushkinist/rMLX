@@ -1060,8 +1060,9 @@ impl KvCache {
             KvQuant::K8VTurbo2 => {
                 self.exit_prefill_k8vturbo2(&k_full, &v_full, device, total_seq)?;
             }
-            KvQuant::Iso4 => self.exit_prefill_iso4(&k_full, &v_full, device, total_seq)?,
-            KvQuant::Iso3 => self.exit_prefill_iso3(&k_full, &v_full, device, total_seq)?,
+            KvQuant::Iso3 | KvQuant::Iso4 => {
+                self.exit_prefill_iso_v(&k_full, &v_full, device, total_seq)?;
+            }
             KvQuant::Rotor3 | KvQuant::Rotor4 => {
                 self.exit_prefill_rotor_v(&k_full, &v_full, device, total_seq)?;
             }
@@ -1071,10 +1072,12 @@ impl KvCache {
             KvQuant::K8VTurbo2Tcq => {
                 self.exit_prefill_k8vturbo2_tcq(&k_full, &v_full, device, total_seq)?;
             }
-            KvQuant::Iso3Sym => self.exit_prefill_iso3_sym(&k_full, &v_full, device, total_seq)?,
-            KvQuant::Iso4Sym => self.exit_prefill_iso4_sym(&k_full, &v_full, device, total_seq)?,
-            KvQuant::IsoKOnly3 => self.exit_prefill_iso_k_only3(&k_full, device, total_seq)?,
-            KvQuant::IsoKOnly4 => self.exit_prefill_iso_k_only4(&k_full, device, total_seq)?,
+            KvQuant::Iso3Sym | KvQuant::Iso4Sym => {
+                self.exit_prefill_iso_sym(&k_full, &v_full, device, total_seq)?;
+            }
+            KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4 => {
+                self.exit_prefill_iso_k_only(&k_full, device, total_seq)?;
+            }
             KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => {
                 self.exit_prefill_rotor_sym(&k_full, &v_full, device, total_seq)?;
             }
