@@ -21,11 +21,11 @@ use crate::storage::{
     KvStorage, QuantK, QuantRotorK, QuantRotorV, QuantV, RotorBlocks, RotorKBlocks,
 };
 
-use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array, storage_variant_name};
+use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array};
 use super::update::{
     accumulated_seq, b_kv_h_new_seq, bump_ring_k_shape, collapse_group_norms_to_token,
     head_dim_from_shape, is_ring_only_append, layer_idx_u32, packed_k_chunk_seq_major,
-    storage_mismatch, PackedKEncodedGpu, RingFeed,
+    storage_mismatch, warn_if_width_disagrees, PackedKEncodedGpu, RingFeed,
 };
 use super::KvCache;
 
@@ -552,10 +552,10 @@ pub(super) fn rotor_k_only_gpu_append(
     let (KvStorage::RotorKOnly3 { max_seq, .. } | KvStorage::RotorKOnly4 { max_seq, .. }) =
         &cache.storage
     else {
-        return Err(Error::KvStorageMismatch {
-            expected: "RotorKOnly3 | RotorKOnly4",
-            got: storage_variant_name(&cache.storage),
-        });
+        return Err(storage_mismatch(
+            "RotorKOnly3 | RotorKOnly4",
+            &cache.storage,
+        ));
     };
     let max_seq = *max_seq;
 
@@ -581,10 +581,10 @@ pub(super) fn rotor_k_only_gpu_append(
         )
     } else {
         // Unreachable: the width read above accepted no other variant.
-        Err(Error::KvStorageMismatch {
-            expected: "RotorKOnly3 | RotorKOnly4",
-            got: storage_variant_name(&cache.storage),
-        })
+        Err(storage_mismatch(
+            "RotorKOnly3 | RotorKOnly4",
+            &cache.storage,
+        ))
     }
 }
 /// Drop a rotor K store's CPU blocks once its GPU ring is live — the ring is
@@ -684,10 +684,7 @@ pub(super) fn rotor_sym_gpu_append(
     let (KvStorage::RotorSym3 { max_seq, .. } | KvStorage::RotorSym4 { max_seq, .. }) =
         &cache.storage
     else {
-        return Err(Error::KvStorageMismatch {
-            expected: "RotorSym3 | RotorSym4",
-            got: storage_variant_name(&cache.storage),
-        });
+        return Err(storage_mismatch("RotorSym3 | RotorSym4", &cache.storage));
     };
     let max_seq = *max_seq;
 
@@ -717,10 +714,7 @@ pub(super) fn rotor_sym_gpu_append(
         )
     } else {
         // Unreachable: the width read above accepted no other variant.
-        Err(Error::KvStorageMismatch {
-            expected: "RotorSym3 | RotorSym4",
-            got: storage_variant_name(&cache.storage),
-        })
+        Err(storage_mismatch("RotorSym3 | RotorSym4", &cache.storage))
     }
 }
 /// Decode update for `RotorV3` / `RotorV4`: K = affine q8_0, V = rotor at
@@ -1277,10 +1271,7 @@ impl KvCache {
         let (KvStorage::RotorKOnly3 { max_seq, .. } | KvStorage::RotorKOnly4 { max_seq, .. }) =
             &self.storage
         else {
-            return Err(Error::KvStorageMismatch {
-                expected: "RotorKOnly3 | RotorKOnly4",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("RotorKOnly3 | RotorKOnly4", &self.storage));
         };
         let max_seq = *max_seq;
 
@@ -1290,10 +1281,7 @@ impl KvCache {
             rotor_k_only_k_side::<4>(k, max_seq, layer_idx, "RotorKOnly4", new_k, device)?
         } else {
             // Unreachable: the width read above accepted no other variant.
-            return Err(Error::KvStorageMismatch {
-                expected: "RotorKOnly3 | RotorKOnly4",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("RotorKOnly3 | RotorKOnly4", &self.storage));
         };
 
         // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
@@ -1337,10 +1325,7 @@ impl KvCache {
             max_seq, v_bits, ..
         }) = &self.storage
         else {
-            return Err(Error::KvStorageMismatch {
-                expected: "RotorKAsym3 | RotorKAsym4",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("RotorKAsym3 | RotorKAsym4", &self.storage));
         };
         let max_seq = *max_seq;
         let v_bits = *v_bits;
@@ -1355,10 +1340,7 @@ impl KvCache {
             rotor_k_asym_update::<4>(k, v, max_seq, v_bits, layer_idx, new_k, new_v, device)
         } else {
             // Unreachable: the width read above accepted no other variant.
-            Err(Error::KvStorageMismatch {
-                expected: "RotorKAsym3 | RotorKAsym4",
-                got: storage_variant_name(&self.storage),
-            })
+            Err(storage_mismatch("RotorKAsym3 | RotorKAsym4", &self.storage))
         }
     }
 
@@ -1373,16 +1355,16 @@ impl KvCache {
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
+        let quant_bits = self.quant.approx_code_bits().1;
         let layer_idx = layer_idx_u32(self.layer_idx);
         if let KvStorage::RotorV3 { k, v, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 3);
             rotor_v_bulk_encode::<3>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
         } else if let KvStorage::RotorV4 { k, v, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 4);
             rotor_v_bulk_encode::<4>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
         } else {
-            Err(Error::KvStorageMismatch {
-                expected: "RotorV3 | RotorV4",
-                got: storage_variant_name(&self.storage),
-            })
+            Err(storage_mismatch("RotorV3 | RotorV4", &self.storage))
         }
     }
 
@@ -1396,16 +1378,16 @@ impl KvCache {
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
+        let quant_bits = self.quant.approx_code_bits().0;
         let layer_idx = layer_idx_u32(self.layer_idx);
         if let KvStorage::RotorSym3 { k, v, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 3);
             rotor_sym_bulk_encode::<3>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
         } else if let KvStorage::RotorSym4 { k, v, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 4);
             rotor_sym_bulk_encode::<4>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
         } else {
-            Err(Error::KvStorageMismatch {
-                expected: "RotorSym3 | RotorSym4",
-                got: storage_variant_name(&self.storage),
-            })
+            Err(storage_mismatch("RotorSym3 | RotorSym4", &self.storage))
         }
     }
 
@@ -1419,16 +1401,16 @@ impl KvCache {
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
+        let quant_bits = self.quant.approx_code_bits().0;
         let layer_idx = layer_idx_u32(self.layer_idx);
         if let KvStorage::RotorKOnly3 { k, .. } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 3);
             rotor_k_only_bulk_encode::<3>(k, layer_idx, k_full, device, total_seq)
         } else if let KvStorage::RotorKOnly4 { k, .. } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 4);
             rotor_k_only_bulk_encode::<4>(k, layer_idx, k_full, device, total_seq)
         } else {
-            Err(Error::KvStorageMismatch {
-                expected: "RotorKOnly3 | RotorKOnly4",
-                got: storage_variant_name(&self.storage),
-            })
+            Err(storage_mismatch("RotorKOnly3 | RotorKOnly4", &self.storage))
         }
     }
 
@@ -1443,6 +1425,7 @@ impl KvCache {
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
+        let quant_bits = self.quant.approx_code_bits().0;
         let layer_idx = layer_idx_u32(self.layer_idx);
         if let KvStorage::RotorKAsym3 {
             k,
@@ -1452,6 +1435,7 @@ impl KvCache {
             v_group_size,
         } = &mut self.storage
         {
+            warn_if_width_disagrees(self.quant, quant_bits, 3);
             rotor_k_asym_bulk_encode::<3>(
                 k,
                 v,
@@ -1472,6 +1456,7 @@ impl KvCache {
             v_group_size,
         } = &mut self.storage
         {
+            warn_if_width_disagrees(self.quant, quant_bits, 4);
             rotor_k_asym_bulk_encode::<4>(
                 k,
                 v,
@@ -1485,10 +1470,7 @@ impl KvCache {
                 total_seq,
             )
         } else {
-            Err(Error::KvStorageMismatch {
-                expected: "RotorKAsym3 | RotorKAsym4",
-                got: storage_variant_name(&self.storage),
-            })
+            Err(storage_mismatch("RotorKAsym3 | RotorKAsym4", &self.storage))
         }
     }
 }

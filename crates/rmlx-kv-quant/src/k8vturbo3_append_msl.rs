@@ -54,7 +54,7 @@
 //! GPU kernel into the K8VTurbo3 V-side update path regresses decode TPS
 //! by 3.5% (e4b) and 6.9% (26b) vs the `Mixed{v_bits:3}` affine baseline —
 //! both fail the −2% gate. The CPU dequant path is therefore kept
-//! as the canonical K8VTurbo3 V-side path (`update_k8vturbo3` in
+//! as the canonical K8VTurbo3 V-side path (`k8_turbo_v_update` in
 //! `kvcache.rs`). This module is retained as a future-reference hook,
 //! with full unit-test coverage of bit-exact CPU↔GPU equivalence so that
 //! re-wiring it later (e.g. once Gemma4-arch PPL coverage exists) is a

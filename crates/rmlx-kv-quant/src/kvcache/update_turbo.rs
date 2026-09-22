@@ -1,20 +1,18 @@
 //! TurboQuant KV update path.
 //!
 //! Holds every update-side body that only the TurboQuant storage types use:
-//! the per-variant `update_k8vturbo*` and `update_tsym` decode entries, the
-//! width-parametric symmetric body they enter, and the `exit_prefill_*`
-//! prefill bulk-encode bodies. The `KvStorage` dispatch and the helpers with
-//! more than one family caller stay in [`super::update`].
+//! the two decode entries and the two prefill entries, the width-parametric
+//! symmetric bodies they enter, and the affine-K / turbo-V bodies the four
+//! `K8VTurbo*` spellings share. The `KvStorage` dispatch and the helpers
+//! with more than one family caller stay in [`super::update`].
 
 use rmlx_core::error::{Error, Result};
 use rmlx_mlx::{Array, Device};
 
-use crate::storage::{
-    KvStorage, QuantK, QuantKTurbo, QuantKTurbo3, QuantKTurbo4, QuantV, TURBO_K4_BITS,
-};
+use crate::storage::{KvStorage, QuantK, QuantKTurbo, QuantV, TURBO_K4_BITS};
 
-use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array, storage_variant_name};
-use super::update::storage_mismatch;
+use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array};
+use super::update::{storage_max_seq, storage_mismatch, warn_if_width_disagrees};
 use super::KvCache;
 
 /// Decode update for `TurboSym3` / `TurboSym4`: K is [`QuantKTurbo`] at
@@ -278,53 +276,132 @@ pub(super) fn k8_turbo_v_bulk_encode(
     Ok(())
 }
 
+/// Symmetric TurboQuant prefill bulk encode: K is [`QuantKTurbo`] at `BITS`,
+/// V is [`QuantV`] at the same width.
+///
+/// The V-axis device is the one thing the two widths do not share, and the
+/// rule is [`tsym_update`]'s: the V axis takes the caller's device at 4 bits
+/// and is pinned to `Device::Cpu` at 3, because [`QuantV::append`] enters its
+/// GPU branch on the device alone and then refuses `bits != 4`. The host
+/// vector for an axis is materialised exactly when that axis resolves to the
+/// CPU.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+)]
+pub(super) fn tsym_bulk_encode<const BITS: u8>(
+    k: &mut Option<QuantKTurbo<BITS>>,
+    v: &mut Option<QuantV>,
+    max_seq: i32,
+    k_full: &Array,
+    v_full: &Array,
+    device: Device,
+    total_seq: i32,
+) -> Result<()> {
+    tracing::debug!(
+        total_seq,
+        bits = BITS,
+        "exit_prefill turbo symmetric: bulk-quantizing K + V (both turbo)"
+    );
+    let new_shape = k_full.shape();
+    let v_device = if BITS == TURBO_K4_BITS {
+        device
+    } else {
+        Device::Cpu
+    };
+    let k_f32 = if device == Device::Gpu {
+        Vec::new()
+    } else {
+        array_to_f32_vec(k_full, device)?
+    };
+    let v_f32 = if v_device == Device::Gpu {
+        Vec::new()
+    } else {
+        array_to_f32_vec(v_full, Device::Cpu)?
+    };
+    let mut init_shape = new_shape.clone();
+    init_shape[2] = 0;
+    let mut qk = QuantKTurbo::<BITS>::new(init_shape.clone(), max_seq);
+    let mut qv = QuantV {
+        blocks: Vec::new(),
+        gpu_codes_buf: None,
+        gpu_scales_buf: None,
+        gpu_words_per_step: 0,
+        gpu_scales_per_step: 0,
+        gpu_capacity: 0,
+        shape: init_shape,
+        bits: BITS,
+        max_seq,
+        high_precision_indices: None,
+        value_codebook: None,
+        value_codebook_gpu: None,
+        use_tcq: false,
+    };
+    qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+    qv.append(&v_f32, &new_shape, v_full, v_device, max_seq)?;
+    *k = Some(qk);
+    *v = Some(qv);
+    Ok(())
+}
+
+/// The V code width, the TCQ flag and the spelling for the four affine-K /
+/// TurboQuant-V storage variants.
+///
+/// One table, read by both [`KvCache::update_k8_turbo_v`] and
+/// [`KvCache::exit_prefill_k8_turbo_v`]. Written twice, the two entries could
+/// disagree about which spelling is which, and the prefill half of such a
+/// disagreement is unobservable: its arms sit behind the
+/// `materialises_packed_store()` gate, so only the decode half would turn a
+/// cell red.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "the table answers for four variants and `None` for the rest; a per-variant `None` arm for the other 23 would say nothing the fall-through does not"
+)]
+fn k8_turbo_v_knobs(storage: &KvStorage) -> Option<(u8, bool, &'static str)> {
+    match storage {
+        KvStorage::K8VTurbo3 { .. } => Some((3, false, "K8VTurbo3")),
+        KvStorage::K8VTurbo2 { .. } => Some((2, false, "K8VTurbo2")),
+        KvStorage::K8VTurbo3Tcq { .. } => Some((3, true, "K8VTurbo3Tcq")),
+        KvStorage::K8VTurbo2Tcq { .. } => Some((2, true, "K8VTurbo2Tcq")),
+        _ => None,
+    }
+}
+
 impl KvCache {
     /// Decode update for the four affine-K / TurboQuant-V spellings. The body
-    /// is [`k8_turbo_v_update`] at the V width and TCQ flag the active storage
-    /// variant carries; this entry resolves the variant and takes the
-    /// warm-TTFT bf16 shortcut.
+    /// is [`k8_turbo_v_update`] at the V width and TCQ flag
+    /// [`k8_turbo_v_knobs`] resolves; this entry takes the warm-TTFT bf16
+    /// shortcut and hands the body its stores.
     pub(super) fn update_k8_turbo_v(
         &mut self,
         new_k: &Array,
         new_v: &Array,
         device: Device,
     ) -> Result<(Array, Array)> {
-        let (KvStorage::K8VTurbo3 { max_seq, .. }
-        | KvStorage::K8VTurbo2 { max_seq, .. }
-        | KvStorage::K8VTurbo3Tcq { max_seq, .. }
-        | KvStorage::K8VTurbo2Tcq { max_seq, .. }) = &self.storage
-        else {
-            return Err(Error::KvStorageMismatch {
-                expected: K8_TURBO_V_VARIANTS,
-                got: storage_variant_name(&self.storage),
-            });
+        let Some((v_bits, use_tcq, variant)) = k8_turbo_v_knobs(&self.storage) else {
+            return Err(storage_mismatch(K8_TURBO_V_VARIANTS, &self.storage));
         };
-        let max_seq = *max_seq;
+        let max_seq = storage_max_seq(&self.storage);
 
         if self.decode_fp16_k.is_some() {
             return self.update_decode_fp16(new_k, new_v, max_seq, device);
         }
 
-        if let KvStorage::K8VTurbo3 { k, v, .. } = &mut self.storage {
-            k8_turbo_v_update(k, v, max_seq, 3, false, "K8VTurbo3", new_k, new_v, device)
-        } else if let KvStorage::K8VTurbo2 { k, v, .. } = &mut self.storage {
-            k8_turbo_v_update(k, v, max_seq, 2, false, "K8VTurbo2", new_k, new_v, device)
-        } else if let KvStorage::K8VTurbo3Tcq { k, v, .. } = &mut self.storage {
-            k8_turbo_v_update(k, v, max_seq, 3, true, "K8VTurbo3Tcq", new_k, new_v, device)
-        } else if let KvStorage::K8VTurbo2Tcq { k, v, .. } = &mut self.storage {
-            k8_turbo_v_update(k, v, max_seq, 2, true, "K8VTurbo2Tcq", new_k, new_v, device)
-        } else {
-            // Unreachable: the read above accepted no other variant.
-            Err(Error::KvStorageMismatch {
-                expected: K8_TURBO_V_VARIANTS,
-                got: storage_variant_name(&self.storage),
-            })
-        }
+        let (KvStorage::K8VTurbo3 { k, v, .. }
+        | KvStorage::K8VTurbo2 { k, v, .. }
+        | KvStorage::K8VTurbo3Tcq { k, v, .. }
+        | KvStorage::K8VTurbo2Tcq { k, v, .. }) = &mut self.storage
+        else {
+            return Err(storage_mismatch(K8_TURBO_V_VARIANTS, &self.storage));
+        };
+        k8_turbo_v_update(
+            k, v, max_seq, v_bits, use_tcq, variant, new_k, new_v, device,
+        )
     }
 
     /// Prefill bulk encode for the four affine-K / TurboQuant-V spellings. The
-    /// body is [`k8_turbo_v_bulk_encode`]; this entry resolves the storage
-    /// variant.
+    /// body is [`k8_turbo_v_bulk_encode`] at the V width and TCQ flag
+    /// [`k8_turbo_v_knobs`] resolves — the same table the decode entry reads.
     pub(super) fn exit_prefill_k8_turbo_v(
         &mut self,
         k_full: &Array,
@@ -332,22 +409,21 @@ impl KvCache {
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
-        if let KvStorage::K8VTurbo3 { k, v, max_seq } = &mut self.storage {
-            k8_turbo_v_bulk_encode(k, v, *max_seq, 3, false, k_full, v_full, device, total_seq)
-        } else if let KvStorage::K8VTurbo2 { k, v, max_seq } = &mut self.storage {
-            k8_turbo_v_bulk_encode(k, v, *max_seq, 2, false, k_full, v_full, device, total_seq)
-        } else if let KvStorage::K8VTurbo3Tcq { k, v, max_seq } = &mut self.storage {
-            k8_turbo_v_bulk_encode(k, v, *max_seq, 3, true, k_full, v_full, device, total_seq)
-        } else if let KvStorage::K8VTurbo2Tcq { k, v, max_seq } = &mut self.storage {
-            k8_turbo_v_bulk_encode(k, v, *max_seq, 2, true, k_full, v_full, device, total_seq)
-        } else {
-            Err(Error::KvStorageMismatch {
-                expected: K8_TURBO_V_VARIANTS,
-                got: storage_variant_name(&self.storage),
-            })
-        }
+        let Some((v_bits, use_tcq, _variant)) = k8_turbo_v_knobs(&self.storage) else {
+            return Err(storage_mismatch(K8_TURBO_V_VARIANTS, &self.storage));
+        };
+        warn_if_width_disagrees(self.quant, self.quant.approx_code_bits().1, v_bits);
+        let (KvStorage::K8VTurbo3 { k, v, max_seq }
+        | KvStorage::K8VTurbo2 { k, v, max_seq }
+        | KvStorage::K8VTurbo3Tcq { k, v, max_seq }
+        | KvStorage::K8VTurbo2Tcq { k, v, max_seq }) = &mut self.storage
+        else {
+            return Err(storage_mismatch(K8_TURBO_V_VARIANTS, &self.storage));
+        };
+        k8_turbo_v_bulk_encode(
+            k, v, *max_seq, v_bits, use_tcq, k_full, v_full, device, total_seq,
+        )
     }
-
     /// Symmetric TurboQuant decode update, both code widths.
     ///
     /// K is [`QuantKTurbo`] at the width the active storage variant carries
@@ -387,144 +463,25 @@ impl KvCache {
             other => Err(storage_mismatch("TurboSym3 | TurboSym4", other)),
         }
     }
-    // TurboSym3 — symmetric 3-bit Lloyd-Max K + turbo3 V.
-    // K side uses the GPU turbo3 MSL kernel (Decision B); V side forced CPU
-    // (K8VTurbo3 precedent: GPU V-side dispatch regressed −2% TPS gate).
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
-    )]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
-    )]
-    pub(super) fn exit_prefill_turbo_sym3(
+    /// Symmetric TurboQuant prefill bulk encode at the width the active
+    /// storage variant carries (`TurboSym3` is 3 bits, `TurboSym4` is 4). The
+    /// body is [`tsym_bulk_encode`]; this entry resolves the storage variant.
+    pub(super) fn exit_prefill_turbo_sym(
         &mut self,
         k_full: &Array,
         v_full: &Array,
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
-        tracing::debug!(
-            total_seq,
-            "exit_prefill TurboSym3: bulk-quantizing K (turbo3/GPU) + V (turbo3/CPU)"
-        );
-        let max_seq = match &self.storage {
-            KvStorage::TurboSym3 { max_seq, .. } => *max_seq,
-            _ => {
-                return Err(Error::KvStorageMismatch {
-                    expected: "TurboSym3",
-                    got: storage_variant_name(&self.storage),
-                })
-            }
-        };
-        let new_shape = k_full.shape();
-        // K GPU-capable; V CPU-forced.
-        let k_f32 = if device == Device::Gpu {
-            Vec::new()
+        let quant_bits = self.quant.approx_code_bits().0;
+        if let KvStorage::TurboSym3 { k, v, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 3);
+            tsym_bulk_encode::<3>(k, v, *max_seq, k_full, v_full, device, total_seq)
+        } else if let KvStorage::TurboSym4 { k, v, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 4);
+            tsym_bulk_encode::<4>(k, v, *max_seq, k_full, v_full, device, total_seq)
         } else {
-            array_to_f32_vec(k_full, device)?
-        };
-        let v_f32 = array_to_f32_vec(v_full, Device::Cpu)?;
-
-        let KvStorage::TurboSym3 { k, v, .. } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "TurboSym3",
-                got: storage_variant_name(&self.storage),
-            });
-        };
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        let mut qk = QuantKTurbo3::new(init_shape.clone(), max_seq);
-        let mut qv = QuantV {
-            blocks: Vec::new(),
-            gpu_codes_buf: None,
-            gpu_scales_buf: None,
-            gpu_words_per_step: 0,
-            gpu_scales_per_step: 0,
-            gpu_capacity: 0,
-            shape: init_shape,
-            bits: 3,
-            max_seq,
-            high_precision_indices: None,
-            value_codebook: None,
-            value_codebook_gpu: None,
-            use_tcq: false,
-        };
-        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
-        // V-side: force CPU path for 3-bit (GPU kernel wired but disabled;
-        // see update_k8vturbo3 doc-comment for the −2% gate fail).
-        qv.append(&v_f32, &new_shape, v_full, Device::Cpu, max_seq)?;
-        *k = Some(qk);
-        *v = Some(qv);
-        Ok(())
-    }
-
-    // TurboSym4 — symmetric 4-bit Lloyd-Max K + tq4 V. Both axes are
-    // bulk-quantized via the same MSL kernel (axis-agnostic).
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
-    )]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
-    )]
-    pub(super) fn exit_prefill_turbo_sym4(
-        &mut self,
-        k_full: &Array,
-        v_full: &Array,
-        device: Device,
-        total_seq: i32,
-    ) -> Result<()> {
-        tracing::debug!(
-            total_seq,
-            "exit_prefill TurboSym4: bulk-quantizing K (tq4) + V (tq4)"
-        );
-        let max_seq = match &self.storage {
-            KvStorage::TurboSym4 { max_seq, .. } => *max_seq,
-            _ => {
-                return Err(Error::KvStorageMismatch {
-                    expected: "TurboSym4",
-                    got: storage_variant_name(&self.storage),
-                })
-            }
-        };
-        let new_shape = k_full.shape();
-        let (k_f32, v_f32) = if device == Device::Gpu {
-            (Vec::new(), Vec::new())
-        } else {
-            arrays_to_f32(k_full, v_full, device)?
-        };
-
-        let KvStorage::TurboSym4 { k, v, .. } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "TurboSym4",
-                got: storage_variant_name(&self.storage),
-            });
-        };
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        let mut qk = QuantKTurbo4::new(init_shape.clone(), max_seq);
-        let mut qv = QuantV {
-            blocks: Vec::new(),
-            gpu_codes_buf: None,
-            gpu_scales_buf: None,
-            gpu_words_per_step: 0,
-            gpu_scales_per_step: 0,
-            gpu_capacity: 0,
-            shape: init_shape,
-            bits: 4,
-            max_seq,
-            high_precision_indices: None,
-            value_codebook: None,
-            value_codebook_gpu: None,
-            use_tcq: false,
-        };
-        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
-        qv.append(&v_f32, &new_shape, v_full, device, max_seq)?;
-        *k = Some(qk);
-        *v = Some(qv);
-        Ok(())
+            Err(storage_mismatch("TurboSym3 | TurboSym4", &self.storage))
+        }
     }
 }

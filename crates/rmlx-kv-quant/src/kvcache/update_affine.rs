@@ -14,7 +14,8 @@ use crate::storage::{KvStorage, QuantK, QuantV};
 use crate::turbo_flash_msl::{turbo_flash_sdpa, turbo_flash_should_run};
 use crate::KvQuant;
 
-use super::helpers::{arrays_to_f32, f32_vec_to_array, storage_variant_name};
+use super::helpers::{arrays_to_f32, f32_vec_to_array};
+use super::update::storage_mismatch;
 use super::KvCache;
 
 impl KvCache {
@@ -848,12 +849,7 @@ impl KvCache {
     ) -> Result<()> {
         let max_seq = match &self.storage {
             KvStorage::K8V8 { max_seq, .. } => *max_seq,
-            _ => {
-                return Err(Error::KvStorageMismatch {
-                    expected: "K8V8",
-                    got: storage_variant_name(&self.storage),
-                })
-            }
+            _ => return Err(storage_mismatch("K8V8", &self.storage)),
         };
         let new_shape = k_full.shape();
         let (k_f32, v_f32) = if device == Device::Gpu {
@@ -863,10 +859,7 @@ impl KvCache {
         };
 
         let KvStorage::K8V8 { k, v, .. } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "K8V8",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("K8V8", &self.storage));
         };
         let mut init_shape = new_shape.clone();
         init_shape[2] = 0;
@@ -915,12 +908,7 @@ impl KvCache {
     ) -> Result<()> {
         let max_seq = match &self.storage {
             KvStorage::K8V4 { max_seq, .. } => *max_seq,
-            _ => {
-                return Err(Error::KvStorageMismatch {
-                    expected: "K8V4",
-                    got: storage_variant_name(&self.storage),
-                })
-            }
+            _ => return Err(storage_mismatch("K8V4", &self.storage)),
         };
         let new_shape = k_full.shape();
         let (k_f32, v_f32) = if device == Device::Gpu {
@@ -930,10 +918,7 @@ impl KvCache {
         };
 
         let KvStorage::K8V4 { k, v, .. } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "K8V4",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("K8V4", &self.storage));
         };
         let mut init_shape = new_shape.clone();
         init_shape[2] = 0;

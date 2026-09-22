@@ -1049,11 +1049,8 @@ impl KvCache {
             | KvQuant::K8VTurbo2Tcq => {
                 self.exit_prefill_k8_turbo_v(&k_full, &v_full, device, total_seq)?;
             }
-            KvQuant::TurboSym3 => {
-                self.exit_prefill_turbo_sym3(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::TurboSym4 => {
-                self.exit_prefill_turbo_sym4(&k_full, &v_full, device, total_seq)?;
+            KvQuant::TurboSym3 | KvQuant::TurboSym4 => {
+                self.exit_prefill_turbo_sym(&k_full, &v_full, device, total_seq)?;
             }
             KvQuant::PlanarK => self.exit_prefill_planar_k(&k_full, device, total_seq)?,
             KvQuant::Iso3 | KvQuant::Iso4 => {
@@ -2024,18 +2021,41 @@ impl KvCache {
 // arithmetic both widths of a family share, with the width as the store's
 // `BITS`.
 
-/// The `storage mismatch` error a decode entry returns when the dispatch hands
-/// it a variant outside its family. `expected` names both widths of that
-/// family, since one entry now serves both.
+/// The `storage mismatch` error a cache path returns when the dispatch hands
+/// it a variant outside the family it serves. `expected` names every variant
+/// that family accepts, since one entry now serves the whole shape.
 ///
-/// Called by the four entries whose mismatch is an [`Error::Mlx`] — the rotor
-/// V and symmetric entries and the iso V and symmetric ones. The K-only and
-/// asym entries return [`Error::KvStorageMismatch`] instead.
+/// [`Error::KvStorageMismatch`] rather than [`Error::Mlx`] because the
+/// condition is a construction-time defect: the cache was built for one
+/// `KvQuant` and is being driven as another. `Error::Mlx` is the transient
+/// class the server's retry envelope replays, and replaying this one is
+/// futile — the second attempt builds the same wrong cache.
 pub(super) fn storage_mismatch(expected: &'static str, storage: &KvStorage) -> Error {
-    Error::Mlx(format!(
-        "storage mismatch: expected {expected}, got {}",
-        storage_variant_name(storage)
-    ))
+    Error::KvStorageMismatch {
+        expected,
+        got: storage_variant_name(storage),
+    }
+}
+
+/// Warn when the `--kv-quant` spelling names one code width and the storage
+/// the cache was built with carries another.
+///
+/// The prefill entries resolve the width from `KvStorage`, which is what the
+/// decode path has always done. A disagreement therefore encodes at the
+/// storage's width instead of failing, where a per-spelling entry used to
+/// return a mismatch. It is a construction-time defect either way; this is
+/// what makes it visible. Deliberately not an assert: the storage is the
+/// authority both halves of the cache already follow.
+pub(super) fn warn_if_width_disagrees(quant: KvQuant, quant_bits: u32, storage_bits: u8) {
+    if quant_bits != u32::from(storage_bits) {
+        tracing::warn!(
+            quant = %quant,
+            quant_bits,
+            storage_bits,
+            "exit_prefill: the quant spelling and the storage disagree on the \
+             code width; encoding at the storage's width"
+        );
+    }
 }
 
 // ── KV hard-cap helpers ──────────────────────────────────────────────────────

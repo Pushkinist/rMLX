@@ -8,13 +8,13 @@
 //! `KvStorage` dispatch and the helpers with more than one family caller stay
 //! in [`super::update`].
 
-use rmlx_core::error::{Error, Result};
+use rmlx_core::error::Result;
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device};
 
 use crate::storage::KvStorage;
 
-use super::helpers::storage_variant_name;
+use super::update::storage_mismatch;
 use super::KvCache;
 
 impl KvCache {
@@ -35,10 +35,7 @@ impl KvCache {
             "exit_prefill Mixed/RotK: bulk-quantizing fp16 prefill K/V"
         );
         let KvStorage::Mixed { state, .. } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "Mixed",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("Mixed", &self.storage));
         };
         // Reset so bulk_init_from_fp16 starts clean. reset() preserves
         // `k_rotation` so RotK keeps rotating K post-prefill.

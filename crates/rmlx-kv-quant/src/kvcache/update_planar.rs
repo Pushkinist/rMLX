@@ -12,7 +12,8 @@ use rmlx_mlx::{Array, Device};
 
 use crate::storage::{KvStorage, QuantK, QuantPlanarK, QuantPlanarV};
 
-use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array, storage_variant_name};
+use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array};
+use super::update::storage_mismatch;
 use super::KvCache;
 
 impl KvCache {
@@ -138,10 +139,7 @@ impl KvCache {
         device: Device,
     ) -> Result<(Array, Array)> {
         let KvStorage::PlanarK { k, max_seq } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "PlanarK",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("PlanarK", &self.storage));
         };
         let max_seq = *max_seq;
 
@@ -211,12 +209,7 @@ impl KvCache {
     ) -> Result<()> {
         let (max_seq, v_bits) = match &self.storage {
             KvStorage::Planar { max_seq, bits, .. } => (*max_seq, *bits),
-            _ => {
-                return Err(Error::KvStorageMismatch {
-                    expected: "Planar",
-                    got: storage_variant_name(&self.storage),
-                })
-            }
+            _ => return Err(storage_mismatch("Planar", &self.storage)),
         };
         let new_shape = k_full.shape();
         let (k_f32, v_f32) = if device == Device::Gpu {
@@ -226,10 +219,7 @@ impl KvCache {
         };
 
         let KvStorage::Planar { k, v, .. } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "Planar",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("Planar", &self.storage));
         };
         let mut init_shape = new_shape.clone();
         init_shape[2] = 0;
@@ -286,12 +276,7 @@ impl KvCache {
         );
         let max_seq = match &self.storage {
             KvStorage::PlanarK { max_seq, .. } => *max_seq,
-            _ => {
-                return Err(Error::KvStorageMismatch {
-                    expected: "PlanarK",
-                    got: storage_variant_name(&self.storage),
-                })
-            }
+            _ => return Err(storage_mismatch("PlanarK", &self.storage)),
         };
         let new_shape = k_full.shape();
         let k_f32 = if device == Device::Gpu {
@@ -301,10 +286,7 @@ impl KvCache {
         };
 
         let KvStorage::PlanarK { k, .. } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "PlanarK",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("PlanarK", &self.storage));
         };
         let mut init_shape = new_shape.clone();
         init_shape[2] = 0;

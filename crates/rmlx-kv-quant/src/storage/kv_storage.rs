@@ -645,7 +645,8 @@ impl KvStorage {
             },
             // K8VTurbo3Tcq — same layout as K8VTurbo3 with Viterbi encode-side
             // assignment. The `use_tcq` flag is set on the `QuantV` slot lazily
-            // at first `append` (see `update_k8vturbo3_tcq` in `kvcache/update.rs`).
+            // at first `append` (see `k8_turbo_v_knobs` in
+            // `kvcache/update_turbo.rs`, which is where the flag is set).
             KvQuant::K8VTurbo3Tcq => Self::K8VTurbo3Tcq {
                 k: None,
                 v: None,
@@ -653,7 +654,8 @@ impl KvStorage {
             },
             // K8VTurbo2Tcq — same layout as K8VTurbo2 with Viterbi encode-side
             // assignment. The `use_tcq` flag is set on the `QuantV` slot lazily
-            // at first `append` (see `update_k8vturbo2_tcq` in `kvcache/update.rs`).
+            // at first `append` (see `k8_turbo_v_knobs` in
+            // `kvcache/update_turbo.rs`, which is where the flag is set).
             KvQuant::K8VTurbo2Tcq => Self::K8VTurbo2Tcq {
                 k: None,
                 v: None,

@@ -17,11 +17,11 @@ use rmlx_mlx::{Array, Device};
 
 use crate::storage::{iso_n_groups_for, IsoBlocks, KvStorage, QuantIsoK, QuantIsoV, QuantK};
 
-use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array, storage_variant_name};
+use super::helpers::{array_to_f32_vec, arrays_to_f32, f32_vec_to_array};
 use super::update::{
     accumulated_seq, b_kv_h_new_seq, bump_ring_k_shape, collapse_group_norms_to_token,
     head_dim_from_shape, is_ring_only_append, packed_k_chunk_seq_major, storage_mismatch,
-    PackedKEncodedGpu, RingFeed,
+    warn_if_width_disagrees, PackedKEncodedGpu, RingFeed,
 };
 use super::KvCache;
 
@@ -271,10 +271,7 @@ pub(super) fn iso_k_only_gpu_append(
     let (KvStorage::IsoKOnly3 { max_seq, .. } | KvStorage::IsoKOnly4 { max_seq, .. }) =
         &cache.storage
     else {
-        return Err(Error::KvStorageMismatch {
-            expected: "IsoKOnly3 | IsoKOnly4",
-            got: storage_variant_name(&cache.storage),
-        });
+        return Err(storage_mismatch("IsoKOnly3 | IsoKOnly4", &cache.storage));
     };
     let max_seq = *max_seq;
 
@@ -284,10 +281,7 @@ pub(super) fn iso_k_only_gpu_append(
         iso_k_only_gpu_append_at::<4>(k, max_seq, "IsoKOnly4", new_k, new_shape, device)
     } else {
         // Unreachable: the width read above accepted no other variant.
-        Err(Error::KvStorageMismatch {
-            expected: "IsoKOnly3 | IsoKOnly4",
-            got: storage_variant_name(&cache.storage),
-        })
+        Err(storage_mismatch("IsoKOnly3 | IsoKOnly4", &cache.storage))
     }
 }
 /// Append `new_k` / `new_v` into a live iso symmetric store's GPU rings
@@ -365,10 +359,7 @@ pub(super) fn iso_sym_gpu_append(
 ) -> Result<()> {
     let (KvStorage::IsoSym3 { max_seq, .. } | KvStorage::IsoSym4 { max_seq, .. }) = &cache.storage
     else {
-        return Err(Error::KvStorageMismatch {
-            expected: "IsoSym3 | IsoSym4",
-            got: storage_variant_name(&cache.storage),
-        });
+        return Err(storage_mismatch("IsoSym3 | IsoSym4", &cache.storage));
     };
     let max_seq = *max_seq;
 
@@ -378,10 +369,7 @@ pub(super) fn iso_sym_gpu_append(
         iso_sym_gpu_append_at::<4>(k, v, max_seq, "IsoSym4", new_k, new_v, new_shape, device)
     } else {
         // Unreachable: the width read above accepted no other variant.
-        Err(Error::KvStorageMismatch {
-            expected: "IsoSym3 | IsoSym4",
-            got: storage_variant_name(&cache.storage),
-        })
+        Err(storage_mismatch("IsoSym3 | IsoSym4", &cache.storage))
     }
 }
 /// Drop an iso K store's CPU blocks once its GPU ring is live — the ring is then
@@ -961,11 +949,6 @@ pub(super) fn iso_k_only_bulk_encode<const BITS: u8>(
 }
 
 impl KvCache {
-    /// Iso3 decode update — K = affine q8_0, V = IsoQuant 3-bit
-    /// (quaternion SO(4) rotation + Lloyd-Max codebook).
-    ///
-    /// Mirrors [`Self::update_k8vturbo3`] with the V side replaced by
-    /// [`QuantIsoV3`].
     /// Iso V decode update — K = affine q8_0, V = IsoQuant (quaternion SO(4)
     /// rotation + Lloyd-Max codebook) at the code width the active storage
     /// variant carries: `IsoV3` is 3 bits, `IsoV4` is 4.
@@ -1051,10 +1034,7 @@ impl KvCache {
         let (KvStorage::IsoKOnly3 { max_seq, .. } | KvStorage::IsoKOnly4 { max_seq, .. }) =
             &self.storage
         else {
-            return Err(Error::KvStorageMismatch {
-                expected: "IsoKOnly3 | IsoKOnly4",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("IsoKOnly3 | IsoKOnly4", &self.storage));
         };
         let max_seq = *max_seq;
 
@@ -1064,10 +1044,7 @@ impl KvCache {
             iso_k_only_k_side::<4>(k, max_seq, "IsoKOnly4", new_k, device)?
         } else {
             // Unreachable: the width read above accepted no other variant.
-            return Err(Error::KvStorageMismatch {
-                expected: "IsoKOnly3 | IsoKOnly4",
-                got: storage_variant_name(&self.storage),
-            });
+            return Err(storage_mismatch("IsoKOnly3 | IsoKOnly4", &self.storage));
         };
 
         // V-side: bf16 via the V-only helper (must NOT touch decode_fp16_k).
@@ -1086,15 +1063,15 @@ impl KvCache {
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
+        let quant_bits = self.quant.approx_code_bits().1;
         if let KvStorage::IsoV3 { k, v, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 3);
             iso_v_bulk_encode::<3>(k, v, *max_seq, k_full, v_full, device, total_seq)
         } else if let KvStorage::IsoV4 { k, v, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 4);
             iso_v_bulk_encode::<4>(k, v, *max_seq, k_full, v_full, device, total_seq)
         } else {
-            Err(Error::KvStorageMismatch {
-                expected: "IsoV3 | IsoV4",
-                got: storage_variant_name(&self.storage),
-            })
+            Err(storage_mismatch("IsoV3 | IsoV4", &self.storage))
         }
     }
 
@@ -1108,15 +1085,15 @@ impl KvCache {
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
+        let quant_bits = self.quant.approx_code_bits().0;
         if let KvStorage::IsoSym3 { k, v, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 3);
             iso_sym_bulk_encode::<3>(k, v, *max_seq, k_full, v_full, device, total_seq)
         } else if let KvStorage::IsoSym4 { k, v, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 4);
             iso_sym_bulk_encode::<4>(k, v, *max_seq, k_full, v_full, device, total_seq)
         } else {
-            Err(Error::KvStorageMismatch {
-                expected: "IsoSym3 | IsoSym4",
-                got: storage_variant_name(&self.storage),
-            })
+            Err(storage_mismatch("IsoSym3 | IsoSym4", &self.storage))
         }
     }
 
@@ -1130,15 +1107,15 @@ impl KvCache {
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
+        let quant_bits = self.quant.approx_code_bits().0;
         if let KvStorage::IsoKOnly3 { k, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 3);
             iso_k_only_bulk_encode::<3>(k, *max_seq, k_full, device, total_seq)
         } else if let KvStorage::IsoKOnly4 { k, max_seq } = &mut self.storage {
+            warn_if_width_disagrees(self.quant, quant_bits, 4);
             iso_k_only_bulk_encode::<4>(k, *max_seq, k_full, device, total_seq)
         } else {
-            Err(Error::KvStorageMismatch {
-                expected: "IsoKOnly3 | IsoKOnly4",
-                got: storage_variant_name(&self.storage),
-            })
+            Err(storage_mismatch("IsoKOnly3 | IsoKOnly4", &self.storage))
         }
     }
 }

@@ -57,7 +57,7 @@
 //! # Dispatch status
 //!
 //! The hot K8VTurbo2 V-side update path forces `Device::Cpu` in
-//! `update_k8vturbo2` (`kvcache/update.rs`), mirroring the K8VTurbo3
+//! `k8_turbo_v_update` (`kvcache/update_turbo.rs`), mirroring the K8VTurbo3
 //! decision (Metal 3-bit kernel showed −3.5% to −6.9% TPS, failing the −2%
 //! gate). This module ships the kernels with full unit-test coverage of
 //! bit-exact CPU↔GPU equivalence so that re-wiring it later (e.g. once a
