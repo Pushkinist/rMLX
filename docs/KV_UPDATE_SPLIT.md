@@ -883,7 +883,7 @@ Duplication, `scripts/lib/debt_report.py --matched-lines`:
 
 | Population | Before chunk (b2) | After chunk (b2) |
 |---|---|---|
-| `update-bodies` | 3610 over 1440 (25 items, 300 pairs) | 1994 over 1150 (22 items, 231 pairs) |
+| `update-bodies` | 3610 over 1440 (25 items, 300 pairs) | 1987 over 1150 (22 items, 231 pairs) |
 | `rotor-updates` | 138 over 1052 (35 items, 4 pairs) | 0 over 949 (35 items, 0 pairs) |
 | `turbo-updates` | 37 over 181 (4 items, 1 pair) | 45 over 197 (4 items, 1 pair) |
 | `iso-updates` | 1545 over 837 (27 items, 351 pairs) | 1270 over 738 (27 items, 351 pairs) |
