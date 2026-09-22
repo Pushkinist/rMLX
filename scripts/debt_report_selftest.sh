@@ -15,11 +15,15 @@
 #   driver) beside seven that carry the signature alone, and two planted impl
 #   RoundDrafter bodies for the matched-lines figure, two same-axis rotor
 #   storage files (a three-member V group, a two-member K group, plus a test
-#   file matching the same glob) and five update_rotor* fns beside one
-#   update_affine, for the two rotor populations, the same shape at two
+#   file matching the same glob) and five update_rotor* fns plus an
+#   exit_prefill_rotor3 / exit_prefill_rotor4 prefill pair, which carries the
+#   codec token off the front and which an anchored prefix cannot see, beside
+#   one update_affine, for the two rotor populations, the same shape at two
 #   members per group in quant_iso_*.rs and update_iso* — plus an
 #   iso_v_update / iso_sym_update pair that only an unanchored name pattern
-#   reaches — for the two iso populations, and two per-arch hydrate
+#   reaches — for the two iso populations, two update_tsym* entries beside an
+#   exit_prefill_turbo_sym3 / exit_prefill_turbo_sym4 pair, the same token in
+#   the other of its two spellings, for the turbo update population, and two per-arch hydrate
 #   bodies beside a hydrate_from_ssd and a test-path copy, for the
 #   ssd-hydrate population. A group of three is what
 #   separates every-pair-in-a-group from consecutive-only pairing; a width
@@ -433,8 +437,8 @@ ROTOR_UPDATES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines ro
 ROTOR_UPDATES_STATUS=$?
 
 check "matched_lines_rotor_updates_pairs" \
-    "the five planted update_rotor* fns are a two-member plain family and a three-member sym family, 1 + 3 = 4 pairs; update_rotor_5_sym spells its width as its own segment and still joins the sym group, which a key that left the doubled separator behind would split off (2 pairs, 7 matched); update_affine in the same impl is outside the prefix — widening the prefix to update_ would read 6 item(s)" \
-    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 15 matched lines over 23 body lines (5 item(s), 4 pair(s))" \
+    "the seven planted rotor fns are a two-member plain family, a three-member sym family and a two-member prefill bulk-encode family, 1 + 3 + 1 = 5 pairs; update_rotor_5_sym spells its width as its own segment and still joins the sym group, which a key that left the doubled separator behind would split off; exit_prefill_rotor3 / exit_prefill_rotor4 carry the token off the front, so the anchored ^update_rotor pattern this replaces reads 5 item(s), 4 pair(s), 15 matched and cannot see that pair at all; update_affine in the same impl carries no rotor token — widening the rule to update_ would read 8 item(s)" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 19 matched lines over 33 body lines (7 item(s), 5 pair(s))" \
     ROTOR_UPDATES_ML
 
 check_exit "matched_lines_rotor_updates_exit" \
@@ -442,9 +446,113 @@ check_exit "matched_lines_rotor_updates_exit" \
     0 "$ROTOR_UPDATES_STATUS"
 
 check "matched_lines_rotor_updates_label_own_root" \
-    "a population root can be a single file, and it is the one printed" \
-    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs):" \
+    "a population root can be a glob over several files, and it is the one printed" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs):" \
     ROTOR_UPDATES_ML
+
+# ---- split: a family's bodies move to their own file, the figure holds -----
+#
+# The population is a glob over the update files, so a body that changes file
+# without changing a line must leave every figure where it was. A file list, or
+# a pairing order that followed the file layout, would move one.
+
+SPLIT_WORK="$(mktemp -d)"
+cp -R "$BASE" "$SPLIT_WORK/base"
+python3 - "$SPLIT_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" \
+    "$SPLIT_WORK/base/crates/rmlx-kv-quant/src/kvcache/update_rotor.rs" <<'EOF'
+import re
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+moved = []
+for name in ("update_rotor3_sym", "update_rotor4_sym", "update_rotor_5_sym"):
+    match = re.search(r"\n    fn " + name + r"\(.*?\n    \}\n", text, flags=re.S)
+    assert match, name
+    moved.append(match.group(0))
+    text = text[: match.start()] + "\n" + text[match.end() :]
+open(src, "w").write(text)
+open(dst, "w").write("impl KvCache {" + "".join(moved) + "}\n")
+EOF
+
+SPLIT_UPDATES_ML=$(python3 "$TOOL" --root "$SPLIT_WORK/base" --matched-lines rotor-updates 2>&1)
+SPLIT_UPDATES_STATUS=$?
+
+check "matched_lines_rotor_updates_split_unchanged" \
+    "moving the three sym bodies into a family file of their own leaves the figure, the item count and the pair count exactly where they were — the glob finds them, and the name-sorted pairing does not care which file holds a body" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 19 matched lines over 33 body lines (7 item(s), 5 pair(s))" \
+    SPLIT_UPDATES_ML
+
+check_exit "matched_lines_rotor_updates_split_exit" \
+    "a split population is still a measurement, exit 0" \
+    0 "$SPLIT_UPDATES_STATUS"
+
+SPLIT_BODIES_ML=$(python3 "$TOOL" --root "$SPLIT_WORK/base" --matched-lines update-bodies 2>&1)
+
+check "matched_lines_update_bodies_split_unchanged" \
+    "the whole-prefix population holds too: the same 14 bodies over two files read the same figure they read over one" \
+    contains "update_-prefixed fns of the update files (crates/rmlx-kv-quant/src/kvcache/update*.rs): 248 matched lines over 63 body lines (14 item(s), 91 pair(s))" \
+    SPLIT_BODIES_ML
+
+rm -rf "$SPLIT_WORK"
+
+# ---- orientation: an asymmetric pair, measured the same whichever way -----
+#
+# `difflib.SequenceMatcher` is not symmetric: it anchors on the longest match
+# it finds in its first argument. The two bodies below share four lines read
+# one way and three the other, and they are the only pair in this file that
+# does — every other planted body is too short or too uniform for the
+# asymmetry to show, which is why a producer that measured one way round and
+# ordered its pairs by the file layout passed all of them.
+#
+# Two arrangements, because one alone cannot hold both rules. The bodies are
+# the same; which name carries which decides whether the name order reaches
+# the larger reading or the smaller one.
+
+orient_tree() { # orient_tree ROOT FIRST_BODY SECOND_BODY
+    local root="$1" first="$2" second="$3"
+    rm -rf "$root"
+    cp -R "$BASE" "$root"
+    local dir="$root/crates/rmlx-kv-quant/src/kvcache"
+    printf 'impl KvCache {\n    fn update_zz(&mut self) {\n%b    }\n}\n' "$first" >"$dir/update.rs"
+    printf 'impl KvCache {\n    fn update_aa(&mut self) {\n%b    }\n}\n' "$second" >"$dir/update_rotor.rs"
+}
+
+# `b a c a` read against `a a a b` matches three lines; the other way round,
+# four.
+ORIENT_BAC="        b();\n        a();\n        c();\n        a();\n"
+ORIENT_AAB="        a();\n        a();\n        a();\n        b();\n"
+ORIENT_EXPECTED="update_-prefixed fns of the update files (crates/rmlx-kv-quant/src/kvcache/update*.rs): 4 matched lines over 12 body lines (2 item(s), 1 pair(s))"
+
+ORIENT_WORK="$(mktemp -d)"
+
+# The first name carries the body that reads the smaller count when it is
+# measured first. Only measuring both ways round reaches 4 here.
+orient_tree "$ORIENT_WORK/base" "$ORIENT_AAB" "$ORIENT_BAC"
+ORIENT_ML=$(python3 "$TOOL" --root "$ORIENT_WORK/base" --matched-lines update-bodies 2>&1)
+ORIENT_STATUS=$?
+
+check "matched_lines_orientation_both_ways" \
+    "the pair shares four lines one way and three the other, and the name order reaches the three: a one-directional measure reads 3 here, so this case is what holds the measure to the larger of the two" \
+    contains "$ORIENT_EXPECTED" \
+    ORIENT_ML
+
+check_exit "matched_lines_orientation_both_ways_exit" \
+    "a measured population exits 0" \
+    0 "$ORIENT_STATUS"
+
+# The same two bodies with the names swapped. Here the name order reaches the
+# larger count on its own, so this case is the one that fails if the pair list
+# is left in collector order while the measure is one-directional.
+orient_tree "$ORIENT_WORK/base" "$ORIENT_BAC" "$ORIENT_AAB"
+ORIENT_NAMED_ML=$(python3 "$TOOL" --root "$ORIENT_WORK/base" --matched-lines update-bodies 2>&1)
+
+check "matched_lines_orientation_name_order" \
+    "swapping which name carries which body leaves the figure where it was — with the pair list in collector order and a one-directional measure this reads 3" \
+    contains "$ORIENT_EXPECTED" \
+    ORIENT_NAMED_ML
+
+rm -rf "$ORIENT_WORK"
 
 # ---- collapsed: the width twin is gone, the population is still found -----
 
@@ -459,8 +567,11 @@ import sys
 
 path = sys.argv[1]
 text = open(path).read()
-# Drop the two 4-bit entries the way the collapse did — the 3-bit ones stay.
-for name in ("update_rotor4", "update_rotor4_sym", "update_rotor_5_sym"):
+# Drop the 4-bit entries the way the collapse did — the 3-bit ones stay. The
+# prefill bulk-encode twin collapses with them: it is the same width pair one
+# verb further along, and leaving it would hold the figure above 0 on its own.
+for name in ("update_rotor4", "update_rotor4_sym", "update_rotor_5_sym",
+             "exit_prefill_rotor4"):
     text = re.sub(r"\n    fn " + name + r"\(.*?\n    \}\n", "\n", text, flags=re.S)
 open(path, "w").write(text)
 EOF
@@ -481,8 +592,8 @@ COLLAPSED_UPDATES_ML=$(python3 "$TOOL" --root "$COLLAPSED_WORK/base" --matched-l
 COLLAPSED_UPDATES_STATUS=$?
 
 check "matched_lines_rotor_updates_collapsed_zero" \
-    "deleting the two 4-bit entries leaves one body per family: 0 matched lines over the 9 body lines that remain, population still found" \
-    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 9 body lines (2 item(s), 0 pair(s))" \
+    "deleting the 4-bit entries, the prefill bulk-encode twin among them, leaves one body per family: 0 matched lines over the 14 body lines that remain, population still found. Leaving the prefill twin behind would hold the figure above 0 on its own, which is what makes this case read the widened rule rather than the anchored one" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 0 matched lines over 14 body lines (3 item(s), 0 pair(s))" \
     COLLAPSED_UPDATES_ML
 
 check_exit "matched_lines_rotor_updates_collapsed_exit" \
@@ -520,7 +631,7 @@ ISO_UPDATES_STATUS=$?
 
 check "matched_lines_iso_updates_pairs" \
     "the six planted iso fns are the four update_iso* ones plus iso_v_update / iso_sym_update, which an anchored ^update_iso pattern misses entirely — that reads 4 item(s); this population pairs every item with every other, so 6 items give 15 pairs, and a width key would give 2 pairs and never compare the same-width bodies at all; the update_rotor* fns carry no iso token and would read 11 item(s) if the pattern widened to update_, while a token pattern that did not admit a glued width digit would drop update_iso3 / update_iso4 and read 4" \
-    contains "iso update fns (crates/rmlx-kv-quant/src/kvcache/update.rs): 41 matched lines over 28 body lines (6 item(s), 15 pair(s))" \
+    contains "iso update fns (crates/rmlx-kv-quant/src/kvcache/update*.rs): 41 matched lines over 28 body lines (6 item(s), 15 pair(s))" \
     ISO_UPDATES_ML
 
 check_exit "matched_lines_iso_updates_exit" \
@@ -562,7 +673,7 @@ ISO_COLLAPSED_UPDATES_STATUS=$?
 
 check "matched_lines_iso_updates_collapsed_width_twin" \
     "deleting the two 4-bit entries drops the figure from 41 over 6 items to 17 over 4, population still found — a width collapse moves this counter even though it is not keyed on width" \
-    contains "iso update fns (crates/rmlx-kv-quant/src/kvcache/update.rs): 17 matched lines over 19 body lines (4 item(s), 6 pair(s))" \
+    contains "iso update fns (crates/rmlx-kv-quant/src/kvcache/update*.rs): 17 matched lines over 19 body lines (4 item(s), 6 pair(s))" \
     ISO_COLLAPSED_UPDATES_ML
 
 check_exit "matched_lines_iso_updates_collapsed_exit" \
@@ -597,7 +708,7 @@ ISO_SAMEWIDTH_STATUS=$?
 
 check "matched_lines_iso_updates_same_width_twin_drops" \
     "collapsing the planted same-width twin drops the figure from 41 over 6 items to 27 over 5 — the duplication a width key is blind to by construction is one this population reports" \
-    contains "iso update fns (crates/rmlx-kv-quant/src/kvcache/update.rs): 27 matched lines over 23 body lines (5 item(s), 10 pair(s))" \
+    contains "iso update fns (crates/rmlx-kv-quant/src/kvcache/update*.rs): 27 matched lines over 23 body lines (5 item(s), 10 pair(s))" \
     ISO_SAMEWIDTH_ML
 
 check_exit "matched_lines_iso_updates_same_width_exit" \
@@ -634,8 +745,8 @@ TURBO_UPDATES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines tu
 TURBO_UPDATES_STATUS=$?
 
 check "matched_lines_turbo_updates_pairs" \
-    "the pattern is anchored on the symmetric entries, so the two planted update_tsym* fns are the whole population: 2 item(s), 1 pair. The planted update_k8vturbo3 / update_k8vturbo2 are the same file's other turbo width pair and belong to a different collapse — a (turbo|tsym) pattern reads 4 item(s) and 2 pair(s) and would never reach a measured 0 for this one" \
-    contains "turbo update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 4 matched lines over 10 body lines (2 item(s), 1 pair(s))" \
+    "the population names the symmetric token in both its spellings: the two update_tsym* decode entries and the two exit_prefill_turbo_sym* prefill bodies, 4 item(s) and one pair per spelling. A tsym-only pattern reads 2 item(s), 1 pair, 4 matched and cannot see the prefill pair. The planted update_k8vturbo3 / update_k8vturbo2 are the same file's other turbo width pair and belong to a different collapse — a bare turbo pattern would fold them in, read 6 item(s) and 3 pair(s), and never reach a measured 0 for this one" \
+    contains "turbo update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 8 matched lines over 20 body lines (4 item(s), 2 pair(s))" \
     TURBO_UPDATES_ML
 
 check_exit "matched_lines_turbo_updates_exit" \
@@ -682,8 +793,11 @@ import sys
 update_path, block_io_path = sys.argv[1], sys.argv[2]
 
 text = open(update_path).read()
-# Drop the 4-bit entry the way the collapse does — the 3-bit one stays.
-text = re.sub(r"\n    fn update_tsym4\(.*?\n    \}\n", "\n", text, flags=re.S)
+# Drop the 4-bit entries the way the collapse does — the 3-bit ones stay. The
+# prefill bulk-encode twin, which spells the token `turbo_sym`, collapses with
+# the decode entry that spells it `tsym`.
+for name in ("update_tsym4", "exit_prefill_turbo_sym4"):
+    text = re.sub(r"\n    fn " + name + r"\(.*?\n    \}\n", "\n", text, flags=re.S)
 open(update_path, "w").write(text)
 
 text = open(block_io_path).read()
@@ -717,8 +831,8 @@ TURBO_COLLAPSED_UPDATES_ML=$(python3 "$TOOL" --root "$TURBO_COLLAPSED_WORK/base"
 TURBO_COLLAPSED_UPDATES_STATUS=$?
 
 check "matched_lines_turbo_updates_collapsed_zero" \
-    "deleting the 4-bit entry leaves one body: 0 matched lines over the 5 that remain, population still found — and the other turbo width pair in the same file, which this population deliberately does not name, cannot hold the figure above 0" \
-    contains "turbo update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 5 body lines (1 item(s), 0 pair(s))" \
+    "deleting the 4-bit entry and the 4-bit prefill body leaves one of each: 0 matched lines over the 10 that remain, population still found — and the other turbo width pair in the same file, which this population deliberately does not name, cannot hold the figure above 0" \
+    contains "turbo update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 0 matched lines over 10 body lines (2 item(s), 0 pair(s))" \
     TURBO_COLLAPSED_UPDATES_ML
 
 check_exit "matched_lines_turbo_updates_collapsed_exit" \
@@ -806,6 +920,88 @@ check_exit "matched_lines_ssd_hydrate_after_exit" \
 
 rm -rf "$HYDRATE_WORK"
 
+# ---- --matched-lines: the update_-prefixed fns of the update file ---------
+#
+# The three family populations above each read one codec's twins. This one
+# reads every `update_`-prefixed fn of the update file, which is the population
+# the "one update body per store shape" step has to shrink. Its pattern is the
+# anchored `update_` prefix, so it holds the fns the three family patterns
+# select **and** the ones that belong to no family — which is the point: a
+# family-keyed counter cannot see a body shared across families.
+
+UPDATE_BODIES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines update-bodies 2>&1)
+UPDATE_BODIES_STATUS=$?
+
+check "matched_lines_update_bodies_before" \
+    "every fn of the update file whose name starts update_, paired with every other: the rotor, iso and turbo per-variant bodies plus update_affine, which belongs to no family and which all three family patterns miss — the iso population's own iso_v_update / iso_sym_update do not carry the prefix, and an unanchored pattern would read 16 item(s)" \
+    contains "update_-prefixed fns of the update files (crates/rmlx-kv-quant/src/kvcache/update*.rs): 248 matched lines over 63 body lines (14 item(s), 91 pair(s))" \
+    UPDATE_BODIES_ML
+
+check_exit "matched_lines_update_bodies_before_exit" \
+    "a population with members is a measurement, exit 0" \
+    0 "$UPDATE_BODIES_STATUS"
+
+# One body per store shape, the step's end state: the per-variant bodies are
+# gone and one shared body is left. The figure must fall to a measured 0 with
+# the population still found, which is a different answer from unavailable.
+UPDATE_COLLAPSED_WORK="$(mktemp -d)"
+cp -R "$BASE" "$UPDATE_COLLAPSED_WORK/base"
+python3 - "$UPDATE_COLLAPSED_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+# Every per-variant body but the first goes; the dispatch enters the one that
+# is left. This is the shape the restructure's second step lands.
+names = re.findall(r"\n    fn (update_\w+)\(", text)
+for name in names[1:]:
+    text = re.sub(r"\n    fn " + name + r"\(.*?\n    \}\n", "\n", text, flags=re.S)
+path.write_text(text)
+EOF
+
+UPDATE_COLLAPSED_ML=$(python3 "$TOOL" --root "$UPDATE_COLLAPSED_WORK/base" --matched-lines update-bodies 2>&1)
+UPDATE_COLLAPSED_STATUS=$?
+
+check "matched_lines_update_bodies_after" \
+    "one body left and so no pair: a measured 0 with the population still found, which the restructure's second step is judged on" \
+    contains "update_-prefixed fns of the update files (crates/rmlx-kv-quant/src/kvcache/update*.rs): 0 matched lines over 4 body lines (1 item(s), 0 pair(s))" \
+    UPDATE_COLLAPSED_ML
+
+check_exit "matched_lines_update_bodies_after_exit" \
+    "a collapsed population is a measured 0, exit 0" \
+    0 "$UPDATE_COLLAPSED_STATUS"
+
+rm -rf "$UPDATE_COLLAPSED_WORK"
+
+# The population emptied: no fn of the file carries the prefix at all. Renaming
+# a body out of the prefix is how this differs from collapsing one, and the two
+# must not print the same thing.
+UPDATE_EMPTY_WORK="$(mktemp -d)"
+cp -R "$BASE" "$UPDATE_EMPTY_WORK/base"
+python3 - "$UPDATE_EMPTY_WORK/base/crates/rmlx-kv-quant/src/kvcache/update.rs" <<'EOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_text(path.read_text().replace("fn update_", "fn apply_"))
+EOF
+
+UPDATE_EMPTY_ML=$(python3 "$TOOL" --root "$UPDATE_EMPTY_WORK/base" --matched-lines update-bodies 2>&1)
+UPDATE_EMPTY_STATUS=$?
+
+check "matched_lines_update_bodies_empty_unavailable" \
+    "renaming every body out of the prefix empties the population: unavailable, not the 0 a collapsed population reads" \
+    contains "debt-report --matched-lines update-bodies: unavailable (crates/rmlx-kv-quant/src/kvcache/update*.rs: population is empty)" \
+    UPDATE_EMPTY_ML
+
+check_exit "matched_lines_update_bodies_empty_exit" \
+    "an unavailable population exits 1" \
+    1 "$UPDATE_EMPTY_STATUS"
+
+rm -rf "$UPDATE_EMPTY_WORK"
+
 # ---- absent: zero members, and a missing root, are unavailable not 0 ------
 
 ABSENT_WORK="$(mktemp -d)"
@@ -819,7 +1015,11 @@ import sys
 
 update_path, block_io_path = sys.argv[1], sys.argv[2]
 
-text = open(update_path).read().replace("fn update_rotor", "fn update_affine_rotor")
+# The rotor pattern keys on the codec token as a whole segment and not on a
+# prefix, so emptying that population means removing the token, not moving it
+# off the front.
+text = open(update_path).read().replace("fn update_rotor", "fn update_gyre")
+text = text.replace("fn exit_prefill_rotor", "fn exit_prefill_gyre")
 # The iso pattern is unanchored and keys on the codec token, so emptying that
 # population means removing the token, not moving it off the front.
 text = text.replace("fn update_iso", "fn update_quat")
@@ -827,6 +1027,7 @@ text = text.replace("fn iso_", "fn quat_")
 # The turbo update pattern keys on the codec token as a whole segment and not
 # on a prefix, so emptying that population means removing the token.
 text = text.replace("fn update_tsym", "fn update_sym_lloyd")
+text = text.replace("fn exit_prefill_turbo_sym", "fn exit_prefill_lloyd")
 open(update_path, "w").write(text)
 
 # The SSD pattern keys on the codec token and admits no width digit, so
@@ -852,8 +1053,8 @@ EMPTY_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines ro
 EMPTY_UPDATES_STATUS=$?
 
 check "matched_lines_rotor_updates_empty_unavailable" \
-    "renaming every update_rotor* fn out of the prefix empties the population: unavailable, not 0" \
-    contains "debt-report --matched-lines rotor-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs: population is empty)" \
+    "renaming the codec token out of every rotor fn empties the population: unavailable, not 0 — moving it off the front would not, since the pattern matches the token wherever in the name it sits" \
+    contains "debt-report --matched-lines rotor-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update*.rs: population is empty)" \
     EMPTY_UPDATES_ML
 
 check_exit "matched_lines_rotor_updates_empty_exit" \
@@ -877,7 +1078,7 @@ ISO_EMPTY_UPDATES_STATUS=$?
 
 check "matched_lines_iso_updates_empty_unavailable" \
     "renaming the codec token out of every iso fn empties the population: unavailable, not 0" \
-    contains "debt-report --matched-lines iso-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs: population is empty)" \
+    contains "debt-report --matched-lines iso-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update*.rs: population is empty)" \
     ISO_EMPTY_UPDATES_ML
 
 check_exit "matched_lines_iso_updates_empty_exit" \
@@ -901,7 +1102,7 @@ TURBO_EMPTY_UPDATES_STATUS=$?
 
 check "matched_lines_turbo_updates_empty_unavailable" \
     "renaming the codec token out of every update_tsym* fn empties the population: unavailable, not 0 — moving it off the front would not, since the pattern matches the token wherever in the name it sits" \
-    contains "debt-report --matched-lines turbo-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs: population is empty)" \
+    contains "debt-report --matched-lines turbo-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update*.rs: population is empty)" \
     TURBO_EMPTY_UPDATES_ML
 
 check_exit "matched_lines_turbo_updates_empty_exit" \
@@ -940,8 +1141,8 @@ MISSING_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines 
 MISSING_UPDATES_STATUS=$?
 
 check "matched_lines_rotor_updates_missing_root" \
-    "a missing single-file root names itself too" \
-    contains "debt-report --matched-lines rotor-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs is not a file)" \
+    "a glob root that matches no file names itself, and is told apart from a root whose files hold no matching fn" \
+    contains "debt-report --matched-lines rotor-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update*.rs matches no file)" \
     MISSING_UPDATES_ML
 
 check_exit "matched_lines_rotor_updates_missing_exit" \
@@ -964,8 +1165,8 @@ ISO_MISSING_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-li
 ISO_MISSING_UPDATES_STATUS=$?
 
 check "matched_lines_iso_updates_missing_root" \
-    "a missing single-file root names itself too" \
-    contains "debt-report --matched-lines iso-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update.rs is not a file)" \
+    "a glob root that matches no file names itself, and is told apart from a root whose files hold no matching fn" \
+    contains "debt-report --matched-lines iso-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update*.rs matches no file)" \
     ISO_MISSING_UPDATES_ML
 
 check_exit "matched_lines_iso_updates_missing_exit" \

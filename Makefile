@@ -111,6 +111,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         smoke-codec-matrix \
         e2e \
         file-size-report debt-report debt-report-selftest \
+        kv-update-census kv-update-census-selftest \
         check-no-inline-tests check-no-scalar-f32-leak \
         check-doc-source-citations \
         check-kv-layer-quants check-kv-codec-disposition \
@@ -452,6 +453,12 @@ debt-report: ## advisory: sibling similarity, debt counters, add/remove ratio, o
 debt-report-selftest: ## CI gate: recall test for debt-report over synthetic fixtures — a planted twin, a non-twin, the round-loop group, and a two-commit ratio repo
 	@bash scripts/debt_report_selftest.sh
 
+kv-update-census: ## advisory: the KV structural figures — variant shapes, match sites a new codec must touch, per-variant update bodies (non-failing)
+	@python3 scripts/kv_update_census.py all
+
+kv-update-census-selftest: ## CI gate: recall test for the KV structural figures over planted fixtures — a hidden site, a collapsed one, and a tree that cannot be measured
+	@bash scripts/kv_update_census_selftest.sh
+
 check-no-inline-tests: ## CI gate: fail if any non-test.rs file has inline #[cfg(test)] mod tests { ... }
 	@bash scripts/check_no_inline_tests.sh
 
@@ -601,6 +608,7 @@ check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
 	@bash scripts/debt_report_selftest.sh
+	@bash scripts/kv_update_census_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
 	@bash scripts/check_kv_layer_quants.sh

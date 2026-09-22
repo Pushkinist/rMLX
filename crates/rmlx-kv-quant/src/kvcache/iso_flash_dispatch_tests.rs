@@ -220,7 +220,7 @@ fn batched_ring_feed_is_skipped(quant: KvQuant, bits_label: &str) {
         &shape,
     );
 
-    let res = super::update::iso_k_only_gpu_append(&mut cache, &k, &shape, device);
+    let res = super::update_iso::iso_k_only_gpu_append(&mut cache, &k, &shape, device);
     res.unwrap_or_else(|e| {
         panic!("{bits_label}: batched GPU append must not error, got: {e}");
     });
@@ -273,7 +273,7 @@ fn cpu_append_drops_a_live_ring(quant: KvQuant, bits_label: &str) {
     let k = f32_array(&lcg_data(n, 11), &shape);
 
     // 1. GPU append -> ring live.
-    super::update::iso_k_only_gpu_append(&mut cache, &k, &shape, device)
+    super::update_iso::iso_k_only_gpu_append(&mut cache, &k, &shape, device)
         .unwrap_or_else(|e| panic!("{bits_label}: gpu_append: {e}"));
     assert!(
         ring_live(&cache),
@@ -364,8 +364,14 @@ fn iso4_v_gpu_append_matches_cpu_append_at_kv_h_gt_1() {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let arr = Array::from_bytes(&bytes, &shape, Dtype::F32).expect("chunk array");
         let mut gpu = crate::storage::QuantIsoV4::new(init);
-        super::update::iso_v_gpu_append_for_test::<4>(&mut gpu, &arr, &shape, Device::Gpu, MAX_SEQ)
-            .expect("gpu append");
+        super::update_iso::iso_v_gpu_append_for_test::<4>(
+            &mut gpu,
+            &arr,
+            &shape,
+            Device::Gpu,
+            MAX_SEQ,
+        )
+        .expect("gpu append");
         let got = gpu.dequant().expect("gpu-appended dequant");
 
         assert_eq!(got.len(), oracle.len(), "length at kv_h={kv_h} seq={seq}");

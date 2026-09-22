@@ -644,16 +644,18 @@ impl KvStorage {
                 max_seq,
             },
             // K8VTurbo3Tcq — same layout as K8VTurbo3 with Viterbi encode-side
-            // assignment. The `use_tcq` flag is set on the `QuantV` slot lazily
-            // at first `append` (see `update_k8vturbo3_tcq` in `kvcache/update.rs`).
+            // assignment. The `use_tcq` flag is resolved by `k8_turbo_v_knobs`
+            // and written by `k8_turbo_v_update` / `k8_turbo_v_bulk_encode`,
+            // all in `kvcache/update_turbo.rs`.
             KvQuant::K8VTurbo3Tcq => Self::K8VTurbo3Tcq {
                 k: None,
                 v: None,
                 max_seq,
             },
             // K8VTurbo2Tcq — same layout as K8VTurbo2 with Viterbi encode-side
-            // assignment. The `use_tcq` flag is set on the `QuantV` slot lazily
-            // at first `append` (see `update_k8vturbo2_tcq` in `kvcache/update.rs`).
+            // assignment. The `use_tcq` flag is resolved by `k8_turbo_v_knobs`
+            // and written by `k8_turbo_v_update` / `k8_turbo_v_bulk_encode`,
+            // all in `kvcache/update_turbo.rs`.
             KvQuant::K8VTurbo2Tcq => Self::K8VTurbo2Tcq {
                 k: None,
                 v: None,

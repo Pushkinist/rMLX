@@ -91,4 +91,28 @@ impl Cache {
         self.seq += n;
         self.seq
     }
+
+    fn exit_prefill_rotor3(&mut self, n: usize) -> usize {
+        let bulk = n * 3;
+        self.seq = bulk;
+        self.seq
+    }
+
+    fn exit_prefill_rotor4(&mut self, n: usize) -> usize {
+        let bulk = n * 4;
+        self.seq = bulk;
+        self.seq
+    }
+
+    fn exit_prefill_turbo_sym3(&mut self, n: usize) -> usize {
+        let packed = n / 3;
+        self.seq = packed;
+        self.seq
+    }
+
+    fn exit_prefill_turbo_sym4(&mut self, n: usize) -> usize {
+        let packed = n / 4;
+        self.seq = packed;
+        self.seq
+    }
 }

@@ -1658,7 +1658,7 @@ impl KvCache {
         // below and the bf16 V mirror further down are capped by the storage
         // `max_seq`, so it has to cover `prev_seq + new_seq` first.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
-        super::update::rotor_k_only_gpu_append(self, new_k, &new_shape, device)?;
+        super::update_rotor::rotor_k_only_gpu_append(self, new_k, &new_shape, device)?;
 
         // CRITICAL: advance `self.offset` BEFORE `update_decode_fp16_v_only` —
         // the V-only helper computes its write window as
@@ -1930,7 +1930,7 @@ impl KvCache {
         // it crosses that bound — on both axes here, since neither has a bf16
         // mirror to fall back to.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
-        super::update::rotor_sym_gpu_append(self, new_k, new_v, &new_shape, device)?;
+        super::update_rotor::rotor_sym_gpu_append(self, new_k, new_v, &new_shape, device)?;
         self.offset = prev_seq + new_seq;
 
         // Take `kv_seq` from the store the rings were written from, not from
@@ -2186,7 +2186,7 @@ impl KvCache {
         // below and the bf16 V mirror further down are capped by the storage
         // `max_seq`, so it has to cover `prev_seq + new_seq` first.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
-        super::update::iso_k_only_gpu_append(self, new_k, &new_shape, device)?;
+        super::update_iso::iso_k_only_gpu_append(self, new_k, &new_shape, device)?;
 
         // CRITICAL: advance `self.offset` BEFORE `update_decode_fp16_v_only` —
         // the V-only helper computes its write window as
@@ -2433,7 +2433,7 @@ impl KvCache {
         // capped by the storage `max_seq`, so it has to cover `prev_seq + new_seq`
         // before either append runs.
         self.ensure_decode_capacity(prev_seq + new_seq)?;
-        super::update::iso_sym_gpu_append(self, new_k, new_v, &new_shape, device)?;
+        super::update_iso::iso_sym_gpu_append(self, new_k, new_v, &new_shape, device)?;
         self.offset = prev_seq + new_seq;
 
         // Take `kv_seq` from the store the rings were written from, not from

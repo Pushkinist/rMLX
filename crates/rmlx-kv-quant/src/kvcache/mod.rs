@@ -37,6 +37,10 @@
 //! - `docs/KV_CACHE.md` — subsystem spec.
 // unsafe_code: mlx-rs Array zero-copy view — slice::from_raw_parts byte-reinterpret for Array::from_bytes
 #![allow(unsafe_code)]
+// The update path is a per-codec dispatch over a 27-variant enum, and these
+// five fire on the shape that dispatch has rather than on a defect. An inner
+// attribute on a module file governs every descendant, so this is the whole
+// module's one copy: the per-family update files carry none.
 #![allow(
     clippy::cognitive_complexity,
     clippy::items_after_statements,
@@ -52,6 +56,13 @@ mod helpers;
 mod sdpa;
 mod shared_kv;
 mod update;
+mod update_affine;
+mod update_iso;
+mod update_mixed;
+mod update_paged;
+mod update_planar;
+mod update_rotor;
+mod update_turbo;
 
 // The GPU ring of the ring-backed K codecs is counted in resident_bytes.
 #[cfg(test)]
@@ -108,6 +119,14 @@ mod windowed_ring_sizing_tests;
 #[cfg(test)]
 #[path = "rotor_flash_dispatch_tests.rs"]
 mod rotor_flash_dispatch_tests;
+
+// Byte-level pin on the storage layer for every spelling ALL_KV_QUANTS holds:
+// what each writes into its packed store, what the attention reads back from
+// it, and what it leaves resident. The three family files below hold only the
+// claims that are about their own family.
+#[cfg(test)]
+#[path = "store_bytes_tests.rs"]
+mod store_bytes_tests;
 
 // Byte-level pin on the rotor storage layer: what every rotor spelling writes
 // into its packed store, and what the attention reads back from it.

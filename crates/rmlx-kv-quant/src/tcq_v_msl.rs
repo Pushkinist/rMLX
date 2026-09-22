@@ -35,7 +35,8 @@
 //!
 //! Ships as a future-reference hook (mirrors `turbo2_v_msl.rs` /
 //! `k8vturbo3_append_msl.rs`). The hot `K8VTurbo3Tcq` V-side update path forces
-//! `Device::Cpu` in [`crate::kvcache::KvCache::update_k8vturbo3_tcq`] — the
+//! `Device::Cpu` in `KvCache::update_k8_turbo_v` (`kvcache/update_turbo.rs`)
+//! — the
 //! sequential per-thread Viterbi loop is bandwidth-bound and the prior
 //! K8VTurbo3 / K8VTurbo2 MSL hooks both regressed −2 % decode TPS gates. The
 //! kernel is parity-tested CPU↔GPU (see `tcq_v_msl_tests.rs`) so re-wiring
