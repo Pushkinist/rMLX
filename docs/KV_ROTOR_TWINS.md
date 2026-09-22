@@ -193,8 +193,16 @@ branch point, so the tool is one version and the tree is the other:
 
 ```
 rotor storage twins (crates/rmlx-kv-quant/src/storage): 814 matched lines over 2244 body lines (4 item(s), 2 pair(s))
-rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 293 matched lines over 610 body lines (8 item(s), 4 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 293 matched lines over 610 body lines (8 item(s), 4 pair(s))
 ```
+
+(The `rotor-updates` label names the producer's root, which is a property of
+the producer and not of the tree: it reads
+`crates/rmlx-kv-quant/src/kvcache/update*.rs` since the update path was split
+by codec family, so every transcript in this document is shown under that
+name. The figures are the ones each commit measured. `matched_lines` also
+began measuring each pair both ways round, which moves no figure here — this
+population is width-keyed and its groups are of one, so no pair is formed.)
 
 Per pair, storage: `quant_rotor_k3` <-> `quant_rotor_k4` 401 (70.0 %),
 `quant_rotor_v3` <-> `quant_rotor_v4` 413 (75.2 %). Updates:
@@ -205,7 +213,7 @@ Per pair, storage: `quant_rotor_k3` <-> `quant_rotor_k4` 401 (70.0 %),
 
 ```
 rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
-rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 69 matched lines over 146 body lines (8 item(s), 4 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 69 matched lines over 146 body lines (8 item(s), 4 pair(s))
 ```
 
 The storage axis was closed there; the update axis was not — the eight
@@ -215,7 +223,7 @@ entries survived as width dispatchers. They are now four.
 
 ```
 rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
-rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 111 body lines (4 item(s), 0 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 0 matched lines over 105 body lines (4 item(s), 0 pair(s))
 ```
 
 Both axes now read a measured `0` with the population still found: four
@@ -508,12 +516,16 @@ reconciles them against what was measured by hand here first.
 
 ```
 rotor storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 1404 body lines (2 item(s), 0 pair(s))
-rotor update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 111 body lines (4 item(s), 0 pair(s))
+rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 0 matched lines over 105 body lines (4 item(s), 0 pair(s))
 ```
+
+The `111 body lines` this section recorded by hand never reproduced: the
+producer counts 105 over the same four bodies, and did so before this branch
+too. The figure that carries the claim is the `0`, and it is unchanged.
 
 `--matched-lines rotor-updates` is a **width-twin detector**: it pairs only
 inside a group whose names agree once every digit run is removed, and its glob
-is the `update_rotor*` fns of one file, so the `*_gpu_append` entries are
+is the `update_rotor*` fns of the update files, so the `*_gpu_append` entries are
 outside it entirely. Its `0` says no two entries differ only in a width digit;
 it does not say there is no duplication left. The width-resolution idiom — read
 the family's `max_seq`, then an `if let` per width — now appears six times

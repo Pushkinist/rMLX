@@ -433,7 +433,7 @@ comparable:
 $ bash scripts/debt_report.sh --matched-lines iso-storage     # before
 iso storage twins (crates/rmlx-kv-quant/src/storage): 651 matched lines over 2984 body lines (4 item(s), 2 pair(s))
 $ bash scripts/debt_report.sh --matched-lines iso-updates     # before
-iso update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 162 matched lines over 532 body lines (6 item(s), 3 pair(s))
+iso update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 162 matched lines over 532 body lines (6 item(s), 3 pair(s))
   (the "before" arm is read with the rule this chunk started from — the prefix
    `update_iso`, paired on width — and the "after" arm with the rule below: the
    codec token, every pair compared. The two are not one series. What the
@@ -444,8 +444,23 @@ iso update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 162 matched lines
 $ bash scripts/debt_report.sh --matched-lines iso-storage     # after
 iso storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 2234 body lines (2 item(s), 0 pair(s))
 $ bash scripts/debt_report.sh --matched-lines iso-updates     # after
-iso update fns (crates/rmlx-kv-quant/src/kvcache/update.rs): 875 matched lines over 625 body lines (21 item(s), 210 pair(s))
+iso update fns (crates/rmlx-kv-quant/src/kvcache/update*.rs): 875 matched lines over 625 body lines (21 item(s), 210 pair(s))
 ```
+
+The label names the producer's root, which is a property of the producer and
+not of the tree: it reads `crates/rmlx-kv-quant/src/kvcache/update*.rs` since
+the update path was split by codec family, so both transcripts above are shown
+under that name. The `875` is what the producer printed at this commit;
+`matched_lines` has since begun measuring each pair both ways round and
+reporting the larger, which moves the figure without moving a body. Re-run on
+either tree the same population now reads:
+
+```
+iso update fns (crates/rmlx-kv-quant/src/kvcache/update*.rs): 878 matched lines over 625 body lines (21 item(s), 210 pair(s))
+```
+
+The item count, the pair count and the body-line total are the ones recorded
+here. See [`KV_UPDATE_SPLIT.md`](KV_UPDATE_SPLIT.md) §3.
 
 The "before" arm is the tool run with `--root` pointing at a worktree of the
 commit before the collapse, so the same code produces both figures. A measured
@@ -469,9 +484,10 @@ place of them, each a glob plus a name rule:
   `crates/rmlx-kv-quant/src/storage`, paired inside a group sharing the filename
   stem with every digit run removed (`quant_iso_v` and `quant_iso_v4` ->
   `quant_iso_v`).
-* **`iso-updates`** — every fn of
-  `crates/rmlx-kv-quant/src/kvcache/update.rs` whose name carries the codec
-  token `iso`, **every pair compared**. Two departures from the rotor entry,
+* **`iso-updates`** — every fn of the update files
+  (`crates/rmlx-kv-quant/src/kvcache/update*.rs`: the dispatch file plus one
+  file per codec family) whose name carries the codec token `iso`, **every
+  pair compared**. Two departures from the rotor entry,
   each for a stated reason.
 
   A name **pattern**, not a prefix: the collapse split the family into entries

@@ -84,9 +84,12 @@ none is extra.**
 **Only `TurboSym3` and `TurboSym4` construct the K twin** — confirmed by a scan
 of every non-test reference to the two types, and asserted at runtime off the
 live storage variant by
-`only_the_symmetric_spellings_build_the_k_side_turbo_store`. The four
-construction sites are `kvcache/update.rs` (two `exit_prefill` arms, two decode
-arms), plus the SSD hydrate constructors.
+`only_the_symmetric_spellings_build_the_k_side_turbo_store`. The three
+construction sites are all in `kvcache/update_turbo.rs` — one per prefill
+bulk-encode body, `exit_prefill_turbo_sym3` and `exit_prefill_turbo_sym4`,
+and one in `tsym_update<BITS>`, the single width-parametric decode body the
+two decode entries share — plus the SSD hydrate constructors. The decode side
+reads two before the width collapse and one after it.
 
 **Every turbo spelling is decode-inert, and more strongly than the issue
 states.** All six return `false` from `decode_reads_packed_store()`, and all
@@ -579,10 +582,16 @@ them. Measured on the branch point:
 $ bash scripts/debt_report.sh --matched-lines turbo-storage
 turbo storage twins (crates/rmlx-kv-quant/src/storage): 412 matched lines over 1012 body lines (2 item(s), 1 pair(s))
 $ bash scripts/debt_report.sh --matched-lines turbo-updates
-turbo update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 59 matched lines over 154 body lines (2 item(s), 1 pair(s))
+turbo update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 59 matched lines over 154 body lines (2 item(s), 1 pair(s))
 $ bash scripts/debt_report.sh --matched-lines turbo-ssd
 turbo ssd helper twins (crates/rmlx-kv-ssd/src/block_io.rs): 60 matched lines over 129 body lines (8 item(s), 4 pair(s))
 ```
+
+(The `turbo-updates` label names the producer's root, which is a property of
+the producer and not of the tree: it reads
+`crates/rmlx-kv-quant/src/kvcache/update*.rs` since the update path was split
+by codec family, so both transcripts below are shown under that name. The
+figures are the ones each commit measured.)
 
 Per-pair, for the record: `write_quant_k_turbo3` against `_4` 36 lines of 36
 (byte-identical bodies), `read_quant_k_turbo3` against `_4` 13 of 16,
@@ -593,7 +602,7 @@ After the collapse, on the same three commands:
 
 ```
 turbo storage twins (crates/rmlx-kv-quant/src/storage): 0 matched lines over 608 body lines (1 item(s), 0 pair(s))
-turbo update twins (crates/rmlx-kv-quant/src/kvcache/update.rs): 0 matched lines over 91 body lines (2 item(s), 0 pair(s))
+turbo update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 0 matched lines over 91 body lines (2 item(s), 0 pair(s))
 turbo ssd helper twins (crates/rmlx-kv-ssd/src/block_io.rs): 0 matched lines over 82 body lines (4 item(s), 0 pair(s))
 ```
 

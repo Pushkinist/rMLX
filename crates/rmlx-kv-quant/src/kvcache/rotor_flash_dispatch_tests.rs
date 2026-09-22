@@ -306,7 +306,7 @@ fn batched_ring_feed_is_skipped(quant: KvQuant, bits_label: &str) {
         &shape,
     );
 
-    let res = super::update::rotor_k_only_gpu_append(&mut cache, &k, &shape, device);
+    let res = super::update_rotor::rotor_k_only_gpu_append(&mut cache, &k, &shape, device);
     res.unwrap_or_else(|e| {
         panic!("{bits_label}: batched GPU append must not error, got: {e}");
     });

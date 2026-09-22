@@ -1630,3 +1630,16 @@ over 282 body lines (1 item(s), 0 pair(s))` for `drivers` — `run_rounds`
 alone, nothing to pair it against — and `919 matched lines over 1090 body
 lines (6 item(s), 15 pair(s))` for `impls`, agreeing with the measured
 figures above on both counts.
+
+`matched_lines` has since changed, and the `impls` figure with it.
+`difflib.SequenceMatcher` anchors on the longest match it finds in its first
+argument, so its matching-block sum is not symmetric, and the figure moved
+when the population's walk order moved — on a rename, or on a file moving —
+with no body changing. It now measures each pair both ways round and reports
+the larger. On the same six bodies that reads `936 matched lines over 1090
+body lines (6 item(s), 15 pair(s))`: the item count, the pair count and the
+body-line total are the ones recorded above, and the 17 extra matched lines
+are the pairs `difflib` read short in one direction. Every per-pair figure in
+this section was taken one-directionally at the commit it names and is left as
+recorded; the endpoints of each chunk were measured the same way at both ends,
+which is the comparison those numbers carry.
