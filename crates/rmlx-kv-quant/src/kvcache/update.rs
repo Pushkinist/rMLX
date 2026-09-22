@@ -1062,8 +1062,9 @@ impl KvCache {
             }
             KvQuant::Iso4 => self.exit_prefill_iso4(&k_full, &v_full, device, total_seq)?,
             KvQuant::Iso3 => self.exit_prefill_iso3(&k_full, &v_full, device, total_seq)?,
-            KvQuant::Rotor3 => self.exit_prefill_rotor3(&k_full, &v_full, device, total_seq)?,
-            KvQuant::Rotor4 => self.exit_prefill_rotor4(&k_full, &v_full, device, total_seq)?,
+            KvQuant::Rotor3 | KvQuant::Rotor4 => {
+                self.exit_prefill_rotor_v(&k_full, &v_full, device, total_seq)?;
+            }
             KvQuant::K8VTurbo3Tcq => {
                 self.exit_prefill_k8vturbo3_tcq(&k_full, &v_full, device, total_seq)?;
             }
@@ -1074,19 +1075,14 @@ impl KvCache {
             KvQuant::Iso4Sym => self.exit_prefill_iso4_sym(&k_full, &v_full, device, total_seq)?,
             KvQuant::IsoKOnly3 => self.exit_prefill_iso_k_only3(&k_full, device, total_seq)?,
             KvQuant::IsoKOnly4 => self.exit_prefill_iso_k_only4(&k_full, device, total_seq)?,
-            KvQuant::Rotor3Sym => {
-                self.exit_prefill_rotor3_sym(&k_full, &v_full, device, total_seq)?;
+            KvQuant::Rotor3Sym | KvQuant::Rotor4Sym => {
+                self.exit_prefill_rotor_sym(&k_full, &v_full, device, total_seq)?;
             }
-            KvQuant::Rotor4Sym => {
-                self.exit_prefill_rotor4_sym(&k_full, &v_full, device, total_seq)?;
+            KvQuant::RotorKOnly3 | KvQuant::RotorKOnly4 => {
+                self.exit_prefill_rotor_k_only(&k_full, device, total_seq)?;
             }
-            KvQuant::RotorKOnly3 => self.exit_prefill_rotor_k_only3(&k_full, device, total_seq)?,
-            KvQuant::RotorKOnly4 => self.exit_prefill_rotor_k_only4(&k_full, device, total_seq)?,
-            KvQuant::RotorK3Asym { .. } => {
-                self.exit_prefill_rotor_k3_asym(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::RotorK4Asym { .. } => {
-                self.exit_prefill_rotor_k4_asym(&k_full, &v_full, device, total_seq)?;
+            KvQuant::RotorK3Asym { .. } | KvQuant::RotorK4Asym { .. } => {
+                self.exit_prefill_rotor_k_asym(&k_full, &v_full, device, total_seq)?;
             }
         }
 

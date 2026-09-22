@@ -1032,6 +1032,160 @@ pub(super) fn rotor_k_asym_update<const BITS: u8>(
     Ok((k_full, v_full))
 }
 
+// ── Rotor prefill bulk-encode bodies, one per store shape over both widths ───
+//
+// The four `KvCache::exit_prefill_rotor_*` entries below resolve their storage
+// variant to a code width and hand the stores here; a body below is the one
+// bulk encode both widths of a family share, with the width as the store's
+// `BITS`.
+
+/// Rotor V prefill bulk encode: K affine q8_0, V rotor at `BITS`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+)]
+pub(super) fn rotor_v_bulk_encode<const BITS: u8>(
+    k: &mut Option<QuantK>,
+    v: &mut Option<QuantRotorV<BITS>>,
+    max_seq: i32,
+    layer_idx: u32,
+    k_full: &Array,
+    v_full: &Array,
+    device: Device,
+    total_seq: i32,
+) -> Result<()> {
+    tracing::debug!(
+        total_seq,
+        bits = BITS,
+        "exit_prefill rotor V: bulk-quantizing K (q8_0) + V (rotor CPU)"
+    );
+    let new_shape = k_full.shape();
+    let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+    let mut init_shape = new_shape.clone();
+    init_shape[2] = 0;
+    let mut qk = QuantK {
+        codes: Vec::new(),
+        scales: Vec::new(),
+        gpu_codes_buf: None,
+        gpu_scales_buf: None,
+        gpu_words_per_step: 0,
+        gpu_scales_per_step: 0,
+        gpu_capacity: 0,
+        shape: init_shape.clone(),
+        max_seq,
+    };
+    let mut qv = QuantRotorV::<BITS>::new(init_shape, max_seq, layer_idx);
+    qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
+    qv.append(&v_f32, &new_shape)?;
+    *k = Some(qk);
+    *v = Some(qv);
+    Ok(())
+}
+
+/// Rotor symmetric prefill bulk encode: K and V both rotor at `BITS`. The K
+/// side carries the optional 1-bit QJL residual sideband.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+)]
+pub(super) fn rotor_sym_bulk_encode<const BITS: u8>(
+    k: &mut Option<QuantRotorK<BITS>>,
+    v: &mut Option<QuantRotorV<BITS>>,
+    max_seq: i32,
+    layer_idx: u32,
+    k_full: &Array,
+    v_full: &Array,
+    device: Device,
+    total_seq: i32,
+) -> Result<()> {
+    tracing::debug!(
+        total_seq,
+        bits = BITS,
+        "exit_prefill rotor symmetric: bulk-quantizing K + V (both rotor CPU)"
+    );
+    let new_shape = k_full.shape();
+    let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+    let mut init_shape = new_shape.clone();
+    init_shape[2] = 0;
+    let mut qk = QuantRotorK::<BITS>::new(init_shape.clone(), layer_idx);
+    let mut qv = QuantRotorV::<BITS>::new(init_shape, max_seq, layer_idx);
+    qk.append(&k_f32, &new_shape)?;
+    qv.append(&v_f32, &new_shape)?;
+    *k = Some(qk);
+    *v = Some(qv);
+    Ok(())
+}
+
+/// Rotor K-only prefill bulk encode: K rotor at `BITS`; V stays bf16 on the
+/// caller's `decode_fp16_pair`.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+)]
+pub(super) fn rotor_k_only_bulk_encode<const BITS: u8>(
+    k: &mut Option<QuantRotorK<BITS>>,
+    layer_idx: u32,
+    k_full: &Array,
+    device: Device,
+    total_seq: i32,
+) -> Result<()> {
+    tracing::debug!(
+        total_seq,
+        bits = BITS,
+        "exit_prefill rotor K-only: bulk-quantizing K (rotor CPU); V stays bf16"
+    );
+    let new_shape = k_full.shape();
+    let k_f32 = array_to_f32_vec(k_full, device)?;
+    let mut init_shape = new_shape.clone();
+    init_shape[2] = 0;
+    let mut qk = QuantRotorK::<BITS>::new(init_shape, layer_idx);
+    qk.append(&k_f32, &new_shape)?;
+    *k = Some(qk);
+    Ok(())
+}
+
+/// Rotor asymmetric prefill bulk encode: K rotor at `BITS`, V affine
+/// `v_bits` through the shared [`QuantV`] path.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
+)]
+pub(super) fn rotor_k_asym_bulk_encode<const BITS: u8>(
+    k: &mut Option<QuantRotorK<BITS>>,
+    v: &mut Option<QuantV>,
+    max_seq: i32,
+    v_bits: u8,
+    v_group_size: u16,
+    layer_idx: u32,
+    k_full: &Array,
+    v_full: &Array,
+    device: Device,
+    total_seq: i32,
+) -> Result<()> {
+    tracing::debug!(
+        total_seq,
+        bits = BITS,
+        v_bits,
+        v_group_size,
+        "exit_prefill rotor asymmetric: bulk-quantizing K (rotor CPU) + V (affine)"
+    );
+    let new_shape = k_full.shape();
+    let (k_f32, v_f32) = if device == Device::Gpu {
+        (array_to_f32_vec(k_full, device)?, Vec::new())
+    } else {
+        arrays_to_f32(k_full, v_full, device)?
+    };
+    let mut init_shape = new_shape.clone();
+    init_shape[2] = 0;
+    let mut qk = QuantRotorK::<BITS>::new(init_shape.clone(), layer_idx);
+    let mut qv = QuantV::new_affine_decode(init_shape, v_bits, max_seq);
+    qk.append(&k_f32, &new_shape)?;
+    qv.append(&v_f32, &new_shape, v_full, device, max_seq)?;
+    *k = Some(qk);
+    *v = Some(qv);
+    Ok(())
+}
+
 impl KvCache {
     /// Rotor V decode update — K = affine q8_0, V = rotor (Cl(3,0) Clifford
     /// rotor sandwich + Lloyd-Max codebook) at the code width the active
@@ -1208,404 +1362,134 @@ impl KvCache {
         }
     }
 
-    // Rotor3 — bulk-quantize K (affine q8_0) + V (rotor3, CPU only).
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
-    )]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
-    )]
-    pub(super) fn exit_prefill_rotor3(
+    /// Rotor V prefill bulk encode — K affine q8_0, V rotor at the code width
+    /// the active storage variant carries (`RotorV3` is 3 bits, `RotorV4` is
+    /// 4). The body is [`rotor_v_bulk_encode`] at that width; this entry
+    /// resolves the storage variant.
+    pub(super) fn exit_prefill_rotor_v(
         &mut self,
         k_full: &Array,
         v_full: &Array,
         device: Device,
         total_seq: i32,
     ) -> Result<()> {
-        tracing::debug!(
-            total_seq,
-            "exit_prefill Rotor3: bulk-quantizing K (q8_0) + V (rotor3 CPU)"
-        );
-        let max_seq = match &self.storage {
-            KvStorage::RotorV3 { max_seq, .. } => *max_seq,
-            _ => {
-                return Err(Error::Mlx(
-                    "Rotor3 exit_prefill: storage mismatch (KvQuant::Rotor3 but storage is not RotorV3)".into()
-                ))
-            }
-        };
-        let new_shape = k_full.shape();
-        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
+        let layer_idx = layer_idx_u32(self.layer_idx);
+        if let KvStorage::RotorV3 { k, v, max_seq } = &mut self.storage {
+            rotor_v_bulk_encode::<3>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
+        } else if let KvStorage::RotorV4 { k, v, max_seq } = &mut self.storage {
+            rotor_v_bulk_encode::<4>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
+        } else {
+            Err(Error::KvStorageMismatch {
+                expected: "RotorV3 | RotorV4",
+                got: storage_variant_name(&self.storage),
+            })
+        }
+    }
 
-        let KvStorage::RotorV3 { k, v, .. } = &mut self.storage else {
-            return Err(Error::Mlx("Rotor3 exit_prefill: storage mismatch".into()));
-        };
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        let mut qk = QuantK {
-            codes: Vec::new(),
-            scales: Vec::new(),
-            gpu_codes_buf: None,
-            gpu_scales_buf: None,
-            gpu_words_per_step: 0,
-            gpu_scales_per_step: 0,
-            gpu_capacity: 0,
-            shape: init_shape.clone(),
+    /// Rotor symmetric prefill bulk encode at the width the active storage
+    /// variant carries (`RotorSym3` is 3 bits, `RotorSym4` is 4). The body is
+    /// [`rotor_sym_bulk_encode`]; this entry resolves the storage variant.
+    pub(super) fn exit_prefill_rotor_sym(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
+        if let KvStorage::RotorSym3 { k, v, max_seq } = &mut self.storage {
+            rotor_sym_bulk_encode::<3>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
+        } else if let KvStorage::RotorSym4 { k, v, max_seq } = &mut self.storage {
+            rotor_sym_bulk_encode::<4>(k, v, *max_seq, layer_idx, k_full, v_full, device, total_seq)
+        } else {
+            Err(Error::KvStorageMismatch {
+                expected: "RotorSym3 | RotorSym4",
+                got: storage_variant_name(&self.storage),
+            })
+        }
+    }
+
+    /// Rotor K-only prefill bulk encode at the width the active storage
+    /// variant carries (`RotorKOnly3` is 3 bits, `RotorKOnly4` is 4); V stays
+    /// bf16 on the caller's `decode_fp16_pair`. The body is
+    /// [`rotor_k_only_bulk_encode`]; this entry resolves the storage variant.
+    pub(super) fn exit_prefill_rotor_k_only(
+        &mut self,
+        k_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
+        if let KvStorage::RotorKOnly3 { k, .. } = &mut self.storage {
+            rotor_k_only_bulk_encode::<3>(k, layer_idx, k_full, device, total_seq)
+        } else if let KvStorage::RotorKOnly4 { k, .. } = &mut self.storage {
+            rotor_k_only_bulk_encode::<4>(k, layer_idx, k_full, device, total_seq)
+        } else {
+            Err(Error::KvStorageMismatch {
+                expected: "RotorKOnly3 | RotorKOnly4",
+                got: storage_variant_name(&self.storage),
+            })
+        }
+    }
+
+    /// Rotor asymmetric prefill bulk encode at the width the active storage
+    /// variant carries (`RotorKAsym3` is 3 bits, `RotorKAsym4` is 4); V is
+    /// affine `v_bits`. The body is [`rotor_k_asym_bulk_encode`]; this entry
+    /// resolves the storage variant.
+    pub(super) fn exit_prefill_rotor_k_asym(
+        &mut self,
+        k_full: &Array,
+        v_full: &Array,
+        device: Device,
+        total_seq: i32,
+    ) -> Result<()> {
+        let layer_idx = layer_idx_u32(self.layer_idx);
+        if let KvStorage::RotorKAsym3 {
+            k,
+            v,
             max_seq,
-        };
-        let mut qv =
-            crate::storage::QuantRotorV3::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
-        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
-        qv.append(&v_f32, &new_shape)?;
-        *k = Some(qk);
-        *v = Some(qv);
-        Ok(())
-    }
-
-    // Rotor4 — bulk-quantize K (affine q8_0) + V (rotor4, CPU only).
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
-    )]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
-    )]
-    pub(super) fn exit_prefill_rotor4(
-        &mut self,
-        k_full: &Array,
-        v_full: &Array,
-        device: Device,
-        total_seq: i32,
-    ) -> Result<()> {
-        tracing::debug!(
-            total_seq,
-            "exit_prefill Rotor4: bulk-quantizing K (q8_0) + V (rotor4 CPU)"
-        );
-        let max_seq = match &self.storage {
-            KvStorage::RotorV4 { max_seq, .. } => *max_seq,
-            _ => {
-                return Err(Error::Mlx(
-                    "Rotor4 exit_prefill: storage mismatch (KvQuant::Rotor4 but storage is not RotorV4)".into()
-                ))
-            }
-        };
-        let new_shape = k_full.shape();
-        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
-
-        let KvStorage::RotorV4 { k, v, .. } = &mut self.storage else {
-            return Err(Error::Mlx("Rotor4 exit_prefill: storage mismatch".into()));
-        };
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        let mut qk = QuantK {
-            codes: Vec::new(),
-            scales: Vec::new(),
-            gpu_codes_buf: None,
-            gpu_scales_buf: None,
-            gpu_words_per_step: 0,
-            gpu_scales_per_step: 0,
-            gpu_capacity: 0,
-            shape: init_shape.clone(),
-            max_seq,
-        };
-        let mut qv =
-            crate::storage::QuantRotorV4::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
-        qk.append(&k_f32, &new_shape, k_full, device, max_seq)?;
-        qv.append(&v_f32, &new_shape)?;
-        *k = Some(qk);
-        *v = Some(qv);
-        Ok(())
-    }
-
-    // Rotor3Sym — bulk-quantize K (rotor3 CPU, optional QJL)
-    // + V (rotor3 CPU). Mirrors `KvQuant::Iso3Sym` with rotor3 codecs.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
-    )]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
-    )]
-    pub(super) fn exit_prefill_rotor3_sym(
-        &mut self,
-        k_full: &Array,
-        v_full: &Array,
-        device: Device,
-        total_seq: i32,
-    ) -> Result<()> {
-        tracing::debug!(
-            total_seq,
-            "exit_prefill Rotor3Sym: bulk-quantizing K + V (both rotor3 CPU)"
-        );
-        let max_seq = match &self.storage {
-            KvStorage::RotorSym3 { max_seq, .. } => *max_seq,
-            _ => {
-                return Err(Error::Mlx(
-                    "Rotor3Sym exit_prefill: storage mismatch (KvQuant::Rotor3Sym but storage is not RotorSym3)".into()
-                ))
-            }
-        };
-        let new_shape = k_full.shape();
-        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
-
-        let KvStorage::RotorSym3 { k, v, .. } = &mut self.storage else {
-            return Err(Error::Mlx(
-                "Rotor3Sym exit_prefill: storage mismatch".into(),
-            ));
-        };
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        let mut qk =
-            crate::storage::QuantRotorK3::new(init_shape.clone(), layer_idx_u32(self.layer_idx));
-        let mut qv =
-            crate::storage::QuantRotorV3::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
-        qk.append(&k_f32, &new_shape)?;
-        qv.append(&v_f32, &new_shape)?;
-        *k = Some(qk);
-        *v = Some(qv);
-        Ok(())
-    }
-
-    // Rotor4Sym — bulk-quantize K (rotor4 CPU, optional QJL)
-    // + V (rotor4 CPU). Mirrors `KvQuant::Iso4Sym`.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
-    )]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
-    )]
-    pub(super) fn exit_prefill_rotor4_sym(
-        &mut self,
-        k_full: &Array,
-        v_full: &Array,
-        device: Device,
-        total_seq: i32,
-    ) -> Result<()> {
-        tracing::debug!(
-            total_seq,
-            "exit_prefill Rotor4Sym: bulk-quantizing K + V (both rotor4 CPU)"
-        );
-        let max_seq = match &self.storage {
-            KvStorage::RotorSym4 { max_seq, .. } => *max_seq,
-            _ => {
-                return Err(Error::Mlx(
-                    "Rotor4Sym exit_prefill: storage mismatch (KvQuant::Rotor4Sym but storage is not RotorSym4)".into()
-                ))
-            }
-        };
-        let new_shape = k_full.shape();
-        let (k_f32, v_f32) = arrays_to_f32(k_full, v_full, device)?;
-
-        let KvStorage::RotorSym4 { k, v, .. } = &mut self.storage else {
-            return Err(Error::Mlx(
-                "Rotor4Sym exit_prefill: storage mismatch".into(),
-            ));
-        };
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        let mut qk =
-            crate::storage::QuantRotorK4::new(init_shape.clone(), layer_idx_u32(self.layer_idx));
-        let mut qv =
-            crate::storage::QuantRotorV4::new(init_shape, max_seq, layer_idx_u32(self.layer_idx));
-        qk.append(&k_f32, &new_shape)?;
-        qv.append(&v_f32, &new_shape)?;
-        *k = Some(qk);
-        *v = Some(qv);
-        Ok(())
-    }
-
-    // RotorKOnly3 — bulk-quantize K (rotor3 CPU, optional QJL);
-    // V stays bf16 on `decode_fp16_v`.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
-    )]
-    pub(super) fn exit_prefill_rotor_k_only3(
-        &mut self,
-        k_full: &Array,
-        device: Device,
-        total_seq: i32,
-    ) -> Result<()> {
-        tracing::debug!(
-            total_seq,
-            "exit_prefill RotorKOnly3: bulk-quantizing K (rotor3 CPU); V stays bf16"
-        );
-        let new_shape = k_full.shape();
-        let k_f32 = array_to_f32_vec(k_full, device)?;
-
-        let KvStorage::RotorKOnly3 { k, .. } = &mut self.storage else {
-            return Err(Error::Mlx(
-                "RotorKOnly3 exit_prefill: storage mismatch".into(),
-            ));
-        };
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        let mut qk = crate::storage::QuantRotorK3::new(init_shape, layer_idx_u32(self.layer_idx));
-        qk.append(&k_f32, &new_shape)?;
-        *k = Some(qk);
-        Ok(())
-    }
-
-    // RotorKOnly4 — bulk-quantize K (rotor4 CPU, optional QJL);
-    // V stays bf16.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
-    )]
-    pub(super) fn exit_prefill_rotor_k_only4(
-        &mut self,
-        k_full: &Array,
-        device: Device,
-        total_seq: i32,
-    ) -> Result<()> {
-        tracing::debug!(
-            total_seq,
-            "exit_prefill RotorKOnly4: bulk-quantizing K (rotor4 CPU); V stays bf16"
-        );
-        let new_shape = k_full.shape();
-        let k_f32 = array_to_f32_vec(k_full, device)?;
-
-        let KvStorage::RotorKOnly4 { k, .. } = &mut self.storage else {
-            return Err(Error::Mlx(
-                "RotorKOnly4 exit_prefill: storage mismatch".into(),
-            ));
-        };
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        let mut qk = crate::storage::QuantRotorK4::new(init_shape, layer_idx_u32(self.layer_idx));
-        qk.append(&k_f32, &new_shape)?;
-        *k = Some(qk);
-        Ok(())
-    }
-
-    // RotorK3Asym — bulk-quantize K (rotor3 CPU, optional QJL)
-    // and V (affine `v_bits` / `v_group_size` via the existing QuantV
-    // path). Mirrors the RotorKOnly3 K side + the K8V4 V side.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
-    )]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
-    )]
-    pub(super) fn exit_prefill_rotor_k3_asym(
-        &mut self,
-        k_full: &Array,
-        v_full: &Array,
-        device: Device,
-        total_seq: i32,
-    ) -> Result<()> {
-        let (max_seq, v_bits, v_group_size) = match &self.storage {
-            KvStorage::RotorKAsym3 {
-                max_seq,
-                v_bits,
-                v_group_size,
-                ..
-            } => (*max_seq, *v_bits, *v_group_size),
-            _ => {
-                return Err(Error::Mlx(
-                    "RotorK3Asym exit_prefill: storage mismatch (KvQuant::RotorK3Asym but storage is not RotorKAsym3)".into()
-                ))
-            }
-        };
-        tracing::debug!(
-            total_seq,
             v_bits,
             v_group_size,
-            "exit_prefill RotorK3Asym: bulk-quantizing K (rotor3 CPU) + V (affine)"
-        );
-        let new_shape = k_full.shape();
-        let (k_f32, v_f32) = if device == Device::Gpu {
-            (array_to_f32_vec(k_full, device)?, Vec::new())
-        } else {
-            arrays_to_f32(k_full, v_full, device)?
-        };
-
-        let KvStorage::RotorKAsym3 { k, v, .. } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "RotorKAsym3",
-                got: storage_variant_name(&self.storage),
-            });
-        };
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        let mut qk =
-            crate::storage::QuantRotorK3::new(init_shape.clone(), layer_idx_u32(self.layer_idx));
-        let mut qv = QuantV::new_affine_decode(init_shape, v_bits, max_seq);
-        qk.append(&k_f32, &new_shape)?;
-        qv.append(&v_f32, &new_shape, v_full, device, max_seq)?;
-        *k = Some(qk);
-        *v = Some(qv);
-        let _ = v_group_size;
-        Ok(())
-    }
-
-    // RotorK4Asym — mirror of RotorK3Asym with rotor4 K.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
-    )]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
-    )]
-    pub(super) fn exit_prefill_rotor_k4_asym(
-        &mut self,
-        k_full: &Array,
-        v_full: &Array,
-        device: Device,
-        total_seq: i32,
-    ) -> Result<()> {
-        let (max_seq, v_bits, v_group_size) = match &self.storage {
-            KvStorage::RotorKAsym4 {
-                max_seq,
-                v_bits,
-                v_group_size,
-                ..
-            } => (*max_seq, *v_bits, *v_group_size),
-            _ => {
-                return Err(Error::Mlx(
-                    "RotorK4Asym exit_prefill: storage mismatch (KvQuant::RotorK4Asym but storage is not RotorKAsym4)".into()
-                ))
-            }
-        };
-        tracing::debug!(
-            total_seq,
+        } = &mut self.storage
+        {
+            rotor_k_asym_bulk_encode::<3>(
+                k,
+                v,
+                *max_seq,
+                *v_bits,
+                *v_group_size,
+                layer_idx,
+                k_full,
+                v_full,
+                device,
+                total_seq,
+            )
+        } else if let KvStorage::RotorKAsym4 {
+            k,
+            v,
+            max_seq,
             v_bits,
             v_group_size,
-            "exit_prefill RotorK4Asym: bulk-quantizing K (rotor4 CPU) + V (affine)"
-        );
-        let new_shape = k_full.shape();
-        let (k_f32, v_f32) = if device == Device::Gpu {
-            (array_to_f32_vec(k_full, device)?, Vec::new())
+        } = &mut self.storage
+        {
+            rotor_k_asym_bulk_encode::<4>(
+                k,
+                v,
+                *max_seq,
+                *v_bits,
+                *v_group_size,
+                layer_idx,
+                k_full,
+                v_full,
+                device,
+                total_seq,
+            )
         } else {
-            arrays_to_f32(k_full, v_full, device)?
-        };
-
-        let KvStorage::RotorKAsym4 { k, v, .. } = &mut self.storage else {
-            return Err(Error::KvStorageMismatch {
-                expected: "RotorKAsym4",
+            Err(Error::KvStorageMismatch {
+                expected: "RotorKAsym3 | RotorKAsym4",
                 got: storage_variant_name(&self.storage),
-            });
-        };
-        let mut init_shape = new_shape.clone();
-        init_shape[2] = 0;
-        let mut qk =
-            crate::storage::QuantRotorK4::new(init_shape.clone(), layer_idx_u32(self.layer_idx));
-        let mut qv = QuantV::new_affine_decode(init_shape, v_bits, max_seq);
-        qk.append(&k_f32, &new_shape)?;
-        qv.append(&v_f32, &new_shape, v_full, device, max_seq)?;
-        *k = Some(qk);
-        *v = Some(qv);
-        let _ = v_group_size;
-        Ok(())
+            })
+        }
     }
 }
 
