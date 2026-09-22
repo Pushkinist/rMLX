@@ -308,8 +308,12 @@ impl KvCache {
                      in an inconsistent state."
                     .into(),
             )),
-            // K8VTurbo3 decode update — same structure as K8V4 but bits=3 on V.
-            KvStorage::K8VTurbo3 { .. } => self.update_k8vturbo3(new_k, new_v, device),
+            // Affine-K / turbo-V decode update at the variant's V width and
+            // TCQ flag, one entry over all four spellings.
+            KvStorage::K8VTurbo3 { .. }
+            | KvStorage::K8VTurbo2 { .. }
+            | KvStorage::K8VTurbo3Tcq { .. }
+            | KvStorage::K8VTurbo2Tcq { .. } => self.update_k8_turbo_v(new_k, new_v, device),
             // TurboSym3 / TurboSym4 decode update — symmetric Lloyd-Max K + V
             // at the variant's code width, one entry over both.
             KvStorage::TurboSym3 { .. } | KvStorage::TurboSym4 { .. } => {
@@ -317,8 +321,6 @@ impl KvCache {
             }
             // PlanarK decode update — K is PlanarQuant 4-bit, V bf16.
             KvStorage::PlanarK { .. } => self.update_planar_k(new_k, new_v, device),
-            // K8VTurbo2 decode update — same structure as K8V4 but bits=2 on V.
-            KvStorage::K8VTurbo2 { .. } => self.update_k8vturbo2(new_k, new_v, device),
             // IsoV3 / IsoV4 decode update — K = affine q8_0, V = IsoQuant at
             // the variant's code width.
             KvStorage::IsoV3 { .. } | KvStorage::IsoV4 { .. } => {
@@ -329,12 +331,6 @@ impl KvCache {
             KvStorage::RotorV3 { .. } | KvStorage::RotorV4 { .. } => {
                 self.update_rotor_v(new_k, new_v, device)
             }
-            // K8VTurbo3Tcq decode update — same code path as
-            // K8VTurbo3 but with Viterbi trellis encode-side assignment.
-            KvStorage::K8VTurbo3Tcq { .. } => self.update_k8vturbo3_tcq(new_k, new_v, device),
-            // K8VTurbo2Tcq decode update — same code path as
-            // K8VTurbo2 but with Viterbi trellis encode-side assignment.
-            KvStorage::K8VTurbo2Tcq { .. } => self.update_k8vturbo2_tcq(new_k, new_v, device),
             // Iso symmetric / K-only decode updates, one entry per family over
             // both code widths.
             KvStorage::IsoSym3 { .. } | KvStorage::IsoSym4 { .. } => {
@@ -1047,8 +1043,11 @@ impl KvCache {
             KvQuant::Mixed { .. } | KvQuant::RotK { .. } => {
                 self.exit_prefill_mixed(&k_full, &v_full, device, total_seq, policy)?;
             }
-            KvQuant::K8VTurbo3 => {
-                self.exit_prefill_k8vturbo3(&k_full, &v_full, device, total_seq)?;
+            KvQuant::K8VTurbo3
+            | KvQuant::K8VTurbo2
+            | KvQuant::K8VTurbo3Tcq
+            | KvQuant::K8VTurbo2Tcq => {
+                self.exit_prefill_k8_turbo_v(&k_full, &v_full, device, total_seq)?;
             }
             KvQuant::TurboSym3 => {
                 self.exit_prefill_turbo_sym3(&k_full, &v_full, device, total_seq)?;
@@ -1057,20 +1056,11 @@ impl KvCache {
                 self.exit_prefill_turbo_sym4(&k_full, &v_full, device, total_seq)?;
             }
             KvQuant::PlanarK => self.exit_prefill_planar_k(&k_full, device, total_seq)?,
-            KvQuant::K8VTurbo2 => {
-                self.exit_prefill_k8vturbo2(&k_full, &v_full, device, total_seq)?;
-            }
             KvQuant::Iso3 | KvQuant::Iso4 => {
                 self.exit_prefill_iso_v(&k_full, &v_full, device, total_seq)?;
             }
             KvQuant::Rotor3 | KvQuant::Rotor4 => {
                 self.exit_prefill_rotor_v(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::K8VTurbo3Tcq => {
-                self.exit_prefill_k8vturbo3_tcq(&k_full, &v_full, device, total_seq)?;
-            }
-            KvQuant::K8VTurbo2Tcq => {
-                self.exit_prefill_k8vturbo2_tcq(&k_full, &v_full, device, total_seq)?;
             }
             KvQuant::Iso3Sym | KvQuant::Iso4Sym => {
                 self.exit_prefill_iso_sym(&k_full, &v_full, device, total_seq)?;
