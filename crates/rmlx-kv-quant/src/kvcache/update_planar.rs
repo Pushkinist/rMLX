@@ -201,7 +201,7 @@ impl KvCache {
     )]
     #[allow(
         clippy::unreachable,
-        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+        reason = "`exit_prefill` is the only caller and reaches this fn only under the matching `KvQuant`; a mismatch is a construction-time BUG, not a runtime condition"
     )]
     #[allow(
         clippy::wildcard_enum_match_arm,

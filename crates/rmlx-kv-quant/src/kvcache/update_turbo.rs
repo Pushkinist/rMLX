@@ -470,10 +470,6 @@ impl KvCache {
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
     )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-    )]
     pub(super) fn update_k8vturbo2(
         &mut self,
         new_k: &Array,
@@ -580,7 +576,7 @@ impl KvCache {
     )]
     #[allow(
         clippy::unreachable,
-        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+        reason = "`exit_prefill` is the only caller and reaches this fn only under the matching `KvQuant`; a mismatch is a construction-time BUG, not a runtime condition"
     )]
     #[allow(
         clippy::wildcard_enum_match_arm,
@@ -653,7 +649,7 @@ impl KvCache {
     )]
     #[allow(
         clippy::unreachable,
-        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+        reason = "`exit_prefill` is the only caller and reaches this fn only under the matching `KvQuant`; a mismatch is a construction-time BUG, not a runtime condition"
     )]
     #[allow(
         clippy::wildcard_enum_match_arm,
@@ -721,7 +717,7 @@ impl KvCache {
     )]
     #[allow(
         clippy::unreachable,
-        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+        reason = "`exit_prefill` is the only caller and reaches this fn only under the matching `KvQuant`; a mismatch is a construction-time BUG, not a runtime condition"
     )]
     #[allow(
         clippy::wildcard_enum_match_arm,
@@ -860,7 +856,7 @@ impl KvCache {
     )]
     #[allow(
         clippy::unreachable,
-        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+        reason = "`exit_prefill` is the only caller and reaches this fn only under the matching `KvQuant`; a mismatch is a construction-time BUG, not a runtime condition"
     )]
     #[allow(
         clippy::wildcard_enum_match_arm,
@@ -933,7 +929,7 @@ impl KvCache {
     )]
     #[allow(
         clippy::unreachable,
-        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+        reason = "`exit_prefill` is the only caller and reaches this fn only under the matching `KvQuant`; a mismatch is a construction-time BUG, not a runtime condition"
     )]
     #[allow(
         clippy::wildcard_enum_match_arm,

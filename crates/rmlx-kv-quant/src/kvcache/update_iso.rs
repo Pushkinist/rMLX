@@ -298,12 +298,6 @@ pub(super) fn iso_k_only_gpu_append(
 /// flash-decode SDPA path reaches this through [`iso_sym_gpu_append`].
 /// `variant` is the storage spelling the caller resolved, used only in the
 /// "buffer absent after init" diagnostics.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the fused append carries both stores, the ring geometry and the \
-              width the caller resolved; a parameter struct would exist for \
-              this one call"
-)]
 pub(super) fn iso_sym_gpu_append_at<const BITS: u8>(
     k: &mut Option<QuantIsoK<BITS>>,
     v: &mut Option<QuantIsoV<BITS>>,
@@ -701,12 +695,6 @@ pub(super) fn iso_v_update<const BITS: u8>(
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the iso update bodies carry both stores, the ring geometry and the \
-              width the caller resolved; a parameter struct would exist for \
-              this one call"
 )]
 pub(super) fn iso_sym_update<const BITS: u8>(
     k: &mut Option<QuantIsoK<BITS>>,

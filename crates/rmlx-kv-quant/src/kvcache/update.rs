@@ -403,10 +403,6 @@ impl KvCache {
     /// payload shape and produce a shape assert or silent truncation in
     /// `exit_prefill`. The guard below detects payload presence and fails
     /// loudly with a typed error instead.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "internal helper; carries the prefill shape derived from new_k/new_v in the caller"
-    )]
     fn ensure_prefill_capacity(
         &mut self,
         needed_seq: i32,
@@ -839,8 +835,8 @@ impl KvCache {
     )]
     /// Finalize prefill: quantize the accumulated raw K/V into the storage buffers.
     pub fn exit_prefill(&mut self, device: Device) -> Result<()> {
-        // Snapshot before the storage borrows below; the bulk-quantize arms
-        // hand it to the K encoders.
+        // Snapshot before the storage borrows below; one arm forwards it to
+        // `MixedKvState::bulk_init_from_fp16`.
         let policy = self.policy;
         if self.rotating.is_some() {
             // No-op: rotating prefill writes go straight into the ring buffer.
@@ -1907,7 +1903,6 @@ impl KvCache {
     ///
     /// Callers that are NOT K8V4 pay only the `is_k8v4()` bool check and
     /// immediately get `Ok(None)` — zero overhead for other quant modes.
-    #[allow(clippy::too_many_arguments)]
     pub fn sdpa_dispatch(
         &mut self,
         queries: &Array,

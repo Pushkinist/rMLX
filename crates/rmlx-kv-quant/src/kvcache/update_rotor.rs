@@ -608,12 +608,6 @@ pub(super) fn drop_blocks_when_ring_live_rotor_v<const BITS: u8>(vs: &mut QuantR
 /// dequant on either axis. Both axes maintain their ring: the quant-V kernel
 /// reads K's *and* V's. `variant` is the storage spelling the caller resolved,
 /// used only in the "buffer absent after init" diagnostics.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the fused append carries both stores, the ring geometry and the \
-              width the caller resolved; a parameter struct would exist for \
-              this one call"
-)]
 pub(super) fn rotor_sym_gpu_append_at<const BITS: u8>(
     k: &mut Option<QuantRotorK<BITS>>,
     v: &mut Option<QuantRotorV<BITS>>,
@@ -742,12 +736,6 @@ pub(super) fn rotor_sym_gpu_append(
     clippy::unwrap_used,
     reason = "Option is Some by construction immediately above this fn body's assignments"
 )]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the rotor update bodies carry both stores, the ring geometry and the \
-              width the caller resolved; a parameter struct would exist for \
-              this one call"
-)]
 pub(super) fn rotor_v_update<const BITS: u8>(
     k: &mut Option<QuantK>,
     v: &mut Option<QuantRotorV<BITS>>,
@@ -829,12 +817,6 @@ pub(super) fn rotor_v_update<const BITS: u8>(
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the rotor update bodies carry both stores, the ring geometry and the \
-              width the caller resolved; a parameter struct would exist for \
-              this one call"
 )]
 pub(super) fn rotor_sym_update<const BITS: u8>(
     k: &mut Option<QuantRotorK<BITS>>,
@@ -980,12 +962,6 @@ pub(super) fn rotor_k_only_k_side<const BITS: u8>(
 #[allow(
     clippy::unwrap_used,
     reason = "Option is Some by construction immediately above this fn body's assignments"
-)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the rotor update bodies carry both stores, the ring geometry and the \
-              width the caller resolved; a parameter struct would exist for \
-              this one call"
 )]
 pub(super) fn rotor_k_asym_update<const BITS: u8>(
     k: &mut Option<QuantRotorK<BITS>>,

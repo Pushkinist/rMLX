@@ -141,18 +141,6 @@ impl KvCache {
     /// garbage-token corruption (it crashes the server). Stays default-OFF.
     /// Setting `DispatchPolicy::turbo_flash` will crash on that cell. See
     /// `docs/reports/B1-turboflash-m5-validation.md`.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
-    #[allow(
-        clippy::unwrap_used,
-        reason = "Mutex critical section is panic-free, so PoisonError is structurally unreachable; remaining Option/Result unwrap is on values established by construction earlier in this fn"
-    )]
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
-    )]
     pub fn update_and_sdpa_k8v4_flash(
         &mut self,
         queries: &Array,
@@ -210,7 +198,6 @@ impl KvCache {
         clippy::wildcard_enum_match_arm,
         reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
     )]
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn update_and_sdpa_k8v4_flash_inner(
         &mut self,
         queries: &Array,
@@ -465,10 +452,6 @@ impl KvCache {
     /// arch) and lock-state agnostic — under `turbo_flash_lock` the flash
     /// buffers are the sole K/V store, so copying them (rather than re-seeding
     /// from the frozen bf16 mirror) is what preserves the decode tail.
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"
-    )]
     #[allow(
         clippy::unwrap_used,
         reason = "the four flash buffers are Some by the caller's is_none() guard; the grow path only runs after a first dispatch allocated them"
@@ -922,7 +905,7 @@ impl KvCache {
     )]
     #[allow(
         clippy::unreachable,
-        reason = "the storage variant is fixed by the `match self.quant` that selects this arm; a mismatch is a construction-time BUG, not a runtime condition"
+        reason = "`exit_prefill` is the only caller and reaches this fn only under the matching `KvQuant`; a mismatch is a construction-time BUG, not a runtime condition"
     )]
     #[allow(
         clippy::wildcard_enum_match_arm,
