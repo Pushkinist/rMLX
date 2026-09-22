@@ -200,10 +200,6 @@ impl KvCache {
         reason = "bounds established by construction: the prefill shape is rank-4 and `init_shape` is its clone"
     )]
     #[allow(
-        clippy::unreachable,
-        reason = "`exit_prefill` is the only caller and reaches this fn only under the matching `KvQuant`; a mismatch is a construction-time BUG, not a runtime condition"
-    )]
-    #[allow(
         clippy::wildcard_enum_match_arm,
         reason = "the arm reads one storage variant; every other is the same construction-time mismatch and needs no per-variant spelling"
     )]
@@ -215,7 +211,12 @@ impl KvCache {
     ) -> Result<()> {
         let (max_seq, v_bits) = match &self.storage {
             KvStorage::Planar { max_seq, bits, .. } => (*max_seq, *bits),
-            _ => unreachable!(),
+            _ => {
+                return Err(Error::KvStorageMismatch {
+                    expected: "Planar",
+                    got: storage_variant_name(&self.storage),
+                })
+            }
         };
         let new_shape = k_full.shape();
         let (k_f32, v_f32) = if device == Device::Gpu {
@@ -225,7 +226,10 @@ impl KvCache {
         };
 
         let KvStorage::Planar { k, v, .. } = &mut self.storage else {
-            unreachable!("KvQuant::Planar/Planar3 but storage is not Planar");
+            return Err(Error::KvStorageMismatch {
+                expected: "Planar",
+                got: storage_variant_name(&self.storage),
+            });
         };
         let mut init_shape = new_shape.clone();
         init_shape[2] = 0;
