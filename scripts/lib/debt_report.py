@@ -24,15 +24,17 @@ The populations, each carrying its own root and its own pairing rule (see
   ``quant_rotor_v4`` -> ``quant_rotor_v``): same axis, different width. A
   group of one contributes an item and no pair, so a collapsed axis reads 0
   matched lines with the population still found.
-* ``rotor-updates`` — the ``update_rotor*`` fns of the update files
+* ``rotor-updates`` — every fn of the update files
   (``crates/rmlx-kv-quant/src/kvcache/update*.rs``: the dispatch file plus one
-  file per codec family), paired by the same digit-stripped-name rule
-  (``update_rotor_k_only_3`` and ``_4`` -> ``update_rotor_k_only_``).
+  file per codec family) carrying the ``rotor`` token as a whole segment,
+  paired by the same digit-stripped-name rule (``update_rotor_k_only_3`` and
+  ``_4`` -> ``update_rotor_k_only_``).
 * ``turbo-storage`` — the non-test ``quant_k_turbo*.rs`` files under the same
   storage directory, same digit-stripped-stem pairing.
-* ``turbo-updates`` — the ``update_tsym*`` fns of the update files, same
-  pairing. Anchored on the symmetric entries: the same family carries two other
-  turbo width pairs that belong to a different collapse.
+* ``turbo-updates`` — the fns of the update files carrying the symmetric turbo
+  token, spelled ``tsym`` on the decode side and ``turbo_sym`` on the prefill
+  side, same pairing. Only the symmetric ones: the same family carries two
+  other turbo width pairs that belong to a different collapse.
 * ``turbo-ssd`` — the turbo helper fns of
   ``crates/rmlx-kv-ssd/src/block_io.rs``, same pairing. A population of its
   own because its root is a file in another crate.
@@ -97,26 +99,29 @@ KV_UPDATE_DIR = "crates/rmlx-kv-quant/src/kvcache"
 KV_UPDATE_GLOB = "update*.rs"
 KV_UPDATE_ROOT = f"{KV_UPDATE_DIR}/{KV_UPDATE_GLOB}"
 KV_SSD_BLOCK_IO_FILE = "crates/rmlx-kv-ssd/src/block_io.rs"
-# Name patterns, not prefixes: a family is a shape, and the iso one outgrew a
-# prefix when its entries (`update_iso_*`) and the bodies they enter
-# (`iso_*_update`, `iso_k_only_k_side`) stopped sharing one. `^update_rotor` is
-# the rotor prefix written as an anchored pattern, so that population is
-# unchanged; `iso` is every fn of the update file whose name says which codec
-# it belongs to.
-ROTOR_UPDATE_FN_PATTERN = r"^update_rotor"
+# Name patterns, not prefixes: a family is a shape, and a prefix reads only the
+# fns that happen to lead with it. Each pattern is the codec's own token,
+# matched as a whole segment wherever it sits in the name, so one rule reaches
+# a family's entries (`update_rotor_*`), the bodies they enter (`rotor_*_update`,
+# `iso_k_only_k_side`) and its prefill bulk-encode bodies (`exit_prefill_rotor*`)
+# alike. The anchored `^update_rotor` this replaces could not: it found four fns
+# and read a measured 0 whatever the eight rotor prefill bodies beside them
+# held, so deleting one of an exact pair moved no figure.
+ROTOR_UPDATE_FN_PATTERN = r"(^|_)rotor(\d|_|$)"
 ISO_UPDATE_FN_PATTERN = r"(^|_)iso(\d|_|$)"
-# The symmetric turbo entries and the bodies they enter, and nothing else. The
-# same file carries two further width pairs — `update_k8vturbo3` /
-# `update_k8vturbo2` and their TCQ siblings — that a `(turbo|tsym)` pattern
-# would fold in; those are a different family's twins and are not what the
-# turbo K-storage collapse removes, so the population that has to read a
-# measured 0 after it names only the `tsym` token. The token is matched as a
-# whole segment rather than as a prefix, because the collapsed entry
-# (`update_tsym`) and the width-parametric body it enters (`tsym_update`) spell
-# it on opposite sides of the name: an anchored `^update_tsym` would see the
-# entry and not the body, and a re-split of that body into two width bodies
-# would then be invisible to this counter.
-TURBO_UPDATE_FN_PATTERN = r"(^|_)tsym(\d|_|$)"
+# The symmetric turbo entries, the bodies they enter and their prefill
+# bulk-encode bodies, and nothing else. The same file carries two further width
+# pairs — `update_k8vturbo3` / `update_k8vturbo2` and their TCQ siblings — that
+# a bare `turbo` pattern would fold in; those are a different family's twins
+# and are not what the turbo K-storage collapse removes, so this population
+# names only the symmetric token. It has two spellings: the decode side writes
+# it `tsym` and the prefill bodies write it `turbo_sym`, so `urbo_` is optional
+# and the whole token is matched as a segment rather than as a prefix. The
+# collapsed entry (`update_tsym`) and the width-parametric body it enters
+# (`tsym_update`) spell it on opposite sides of the name, so an anchored
+# `^update_tsym` would see the entry and not the body, and a re-split of that
+# body into two width bodies would then be invisible to this counter.
+TURBO_UPDATE_FN_PATTERN = r"(^|_)t(urbo_)?sym(\d|_|$)"
 # No digit in the pattern: after the collapse the SSD helpers lose their width
 # suffix, and a digit-bearing pattern would find nothing and report the
 # population unavailable rather than a measured 0.

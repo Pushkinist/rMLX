@@ -15,11 +15,15 @@
 #   driver) beside seven that carry the signature alone, and two planted impl
 #   RoundDrafter bodies for the matched-lines figure, two same-axis rotor
 #   storage files (a three-member V group, a two-member K group, plus a test
-#   file matching the same glob) and five update_rotor* fns beside one
-#   update_affine, for the two rotor populations, the same shape at two
+#   file matching the same glob) and five update_rotor* fns plus an
+#   exit_prefill_rotor3 / exit_prefill_rotor4 prefill pair, which carries the
+#   codec token off the front and which an anchored prefix cannot see, beside
+#   one update_affine, for the two rotor populations, the same shape at two
 #   members per group in quant_iso_*.rs and update_iso* — plus an
 #   iso_v_update / iso_sym_update pair that only an unanchored name pattern
-#   reaches — for the two iso populations, and two per-arch hydrate
+#   reaches — for the two iso populations, two update_tsym* entries beside an
+#   exit_prefill_turbo_sym3 / exit_prefill_turbo_sym4 pair, the same token in
+#   the other of its two spellings, for the turbo update population, and two per-arch hydrate
 #   bodies beside a hydrate_from_ssd and a test-path copy, for the
 #   ssd-hydrate population. A group of three is what
 #   separates every-pair-in-a-group from consecutive-only pairing; a width
@@ -433,8 +437,8 @@ ROTOR_UPDATES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines ro
 ROTOR_UPDATES_STATUS=$?
 
 check "matched_lines_rotor_updates_pairs" \
-    "the five planted update_rotor* fns are a two-member plain family and a three-member sym family, 1 + 3 = 4 pairs; update_rotor_5_sym spells its width as its own segment and still joins the sym group, which a key that left the doubled separator behind would split off (2 pairs, 7 matched); update_affine in the same impl is outside the prefix — widening the prefix to update_ would read 6 item(s)" \
-    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 15 matched lines over 23 body lines (5 item(s), 4 pair(s))" \
+    "the seven planted rotor fns are a two-member plain family, a three-member sym family and a two-member prefill bulk-encode family, 1 + 3 + 1 = 5 pairs; update_rotor_5_sym spells its width as its own segment and still joins the sym group, which a key that left the doubled separator behind would split off; exit_prefill_rotor3 / exit_prefill_rotor4 carry the token off the front, so the anchored ^update_rotor pattern this replaces reads 5 item(s), 4 pair(s), 15 matched and cannot see that pair at all; update_affine in the same impl carries no rotor token — widening the rule to update_ would read 8 item(s)" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 19 matched lines over 33 body lines (7 item(s), 5 pair(s))" \
     ROTOR_UPDATES_ML
 
 check_exit "matched_lines_rotor_updates_exit" \
@@ -476,7 +480,7 @@ SPLIT_UPDATES_STATUS=$?
 
 check "matched_lines_rotor_updates_split_unchanged" \
     "moving the three sym bodies into a family file of their own leaves the figure, the item count and the pair count exactly where they were — the glob finds them, and the name-sorted pairing does not care which file holds a body" \
-    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 15 matched lines over 23 body lines (5 item(s), 4 pair(s))" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 19 matched lines over 33 body lines (7 item(s), 5 pair(s))" \
     SPLIT_UPDATES_ML
 
 check_exit "matched_lines_rotor_updates_split_exit" \
@@ -563,8 +567,11 @@ import sys
 
 path = sys.argv[1]
 text = open(path).read()
-# Drop the two 4-bit entries the way the collapse did — the 3-bit ones stay.
-for name in ("update_rotor4", "update_rotor4_sym", "update_rotor_5_sym"):
+# Drop the 4-bit entries the way the collapse did — the 3-bit ones stay. The
+# prefill bulk-encode twin collapses with them: it is the same width pair one
+# verb further along, and leaving it would hold the figure above 0 on its own.
+for name in ("update_rotor4", "update_rotor4_sym", "update_rotor_5_sym",
+             "exit_prefill_rotor4"):
     text = re.sub(r"\n    fn " + name + r"\(.*?\n    \}\n", "\n", text, flags=re.S)
 open(path, "w").write(text)
 EOF
@@ -585,8 +592,8 @@ COLLAPSED_UPDATES_ML=$(python3 "$TOOL" --root "$COLLAPSED_WORK/base" --matched-l
 COLLAPSED_UPDATES_STATUS=$?
 
 check "matched_lines_rotor_updates_collapsed_zero" \
-    "deleting the two 4-bit entries leaves one body per family: 0 matched lines over the 9 body lines that remain, population still found" \
-    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 0 matched lines over 9 body lines (2 item(s), 0 pair(s))" \
+    "deleting the 4-bit entries, the prefill bulk-encode twin among them, leaves one body per family: 0 matched lines over the 14 body lines that remain, population still found. Leaving the prefill twin behind would hold the figure above 0 on its own, which is what makes this case read the widened rule rather than the anchored one" \
+    contains "rotor update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 0 matched lines over 14 body lines (3 item(s), 0 pair(s))" \
     COLLAPSED_UPDATES_ML
 
 check_exit "matched_lines_rotor_updates_collapsed_exit" \
@@ -738,8 +745,8 @@ TURBO_UPDATES_ML=$(python3 "$TOOL" --root "$STATIC_WORK/base" --matched-lines tu
 TURBO_UPDATES_STATUS=$?
 
 check "matched_lines_turbo_updates_pairs" \
-    "the pattern is anchored on the symmetric entries, so the two planted update_tsym* fns are the whole population: 2 item(s), 1 pair. The planted update_k8vturbo3 / update_k8vturbo2 are the same file's other turbo width pair and belong to a different collapse — a (turbo|tsym) pattern reads 4 item(s) and 2 pair(s) and would never reach a measured 0 for this one" \
-    contains "turbo update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 4 matched lines over 10 body lines (2 item(s), 1 pair(s))" \
+    "the population names the symmetric token in both its spellings: the two update_tsym* decode entries and the two exit_prefill_turbo_sym* prefill bodies, 4 item(s) and one pair per spelling. A tsym-only pattern reads 2 item(s), 1 pair, 4 matched and cannot see the prefill pair. The planted update_k8vturbo3 / update_k8vturbo2 are the same file's other turbo width pair and belong to a different collapse — a bare turbo pattern would fold them in, read 6 item(s) and 3 pair(s), and never reach a measured 0 for this one" \
+    contains "turbo update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 8 matched lines over 20 body lines (4 item(s), 2 pair(s))" \
     TURBO_UPDATES_ML
 
 check_exit "matched_lines_turbo_updates_exit" \
@@ -786,8 +793,11 @@ import sys
 update_path, block_io_path = sys.argv[1], sys.argv[2]
 
 text = open(update_path).read()
-# Drop the 4-bit entry the way the collapse does — the 3-bit one stays.
-text = re.sub(r"\n    fn update_tsym4\(.*?\n    \}\n", "\n", text, flags=re.S)
+# Drop the 4-bit entries the way the collapse does — the 3-bit ones stay. The
+# prefill bulk-encode twin, which spells the token `turbo_sym`, collapses with
+# the decode entry that spells it `tsym`.
+for name in ("update_tsym4", "exit_prefill_turbo_sym4"):
+    text = re.sub(r"\n    fn " + name + r"\(.*?\n    \}\n", "\n", text, flags=re.S)
 open(update_path, "w").write(text)
 
 text = open(block_io_path).read()
@@ -821,8 +831,8 @@ TURBO_COLLAPSED_UPDATES_ML=$(python3 "$TOOL" --root "$TURBO_COLLAPSED_WORK/base"
 TURBO_COLLAPSED_UPDATES_STATUS=$?
 
 check "matched_lines_turbo_updates_collapsed_zero" \
-    "deleting the 4-bit entry leaves one body: 0 matched lines over the 5 that remain, population still found — and the other turbo width pair in the same file, which this population deliberately does not name, cannot hold the figure above 0" \
-    contains "turbo update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 0 matched lines over 5 body lines (1 item(s), 0 pair(s))" \
+    "deleting the 4-bit entry and the 4-bit prefill body leaves one of each: 0 matched lines over the 10 that remain, population still found — and the other turbo width pair in the same file, which this population deliberately does not name, cannot hold the figure above 0" \
+    contains "turbo update twins (crates/rmlx-kv-quant/src/kvcache/update*.rs): 0 matched lines over 10 body lines (2 item(s), 0 pair(s))" \
     TURBO_COLLAPSED_UPDATES_ML
 
 check_exit "matched_lines_turbo_updates_collapsed_exit" \
@@ -1005,7 +1015,11 @@ import sys
 
 update_path, block_io_path = sys.argv[1], sys.argv[2]
 
-text = open(update_path).read().replace("fn update_rotor", "fn update_affine_rotor")
+# The rotor pattern keys on the codec token as a whole segment and not on a
+# prefix, so emptying that population means removing the token, not moving it
+# off the front.
+text = open(update_path).read().replace("fn update_rotor", "fn update_gyre")
+text = text.replace("fn exit_prefill_rotor", "fn exit_prefill_gyre")
 # The iso pattern is unanchored and keys on the codec token, so emptying that
 # population means removing the token, not moving it off the front.
 text = text.replace("fn update_iso", "fn update_quat")
@@ -1013,6 +1027,7 @@ text = text.replace("fn iso_", "fn quat_")
 # The turbo update pattern keys on the codec token as a whole segment and not
 # on a prefix, so emptying that population means removing the token.
 text = text.replace("fn update_tsym", "fn update_sym_lloyd")
+text = text.replace("fn exit_prefill_turbo_sym", "fn exit_prefill_lloyd")
 open(update_path, "w").write(text)
 
 # The SSD pattern keys on the codec token and admits no width digit, so
@@ -1038,7 +1053,7 @@ EMPTY_UPDATES_ML=$(python3 "$TOOL" --root "$ABSENT_WORK/base" --matched-lines ro
 EMPTY_UPDATES_STATUS=$?
 
 check "matched_lines_rotor_updates_empty_unavailable" \
-    "renaming every update_rotor* fn out of the prefix empties the population: unavailable, not 0" \
+    "renaming the codec token out of every rotor fn empties the population: unavailable, not 0 — moving it off the front would not, since the pattern matches the token wherever in the name it sits" \
     contains "debt-report --matched-lines rotor-updates: unavailable (crates/rmlx-kv-quant/src/kvcache/update*.rs: population is empty)" \
     EMPTY_UPDATES_ML
 
