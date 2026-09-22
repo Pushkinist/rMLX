@@ -314,7 +314,7 @@ impl KvCache {
         } else if let KvStorage::K8VTurbo2Tcq { k, v, .. } = &mut self.storage {
             k8_turbo_v_update(k, v, max_seq, 2, true, "K8VTurbo2Tcq", new_k, new_v, device)
         } else {
-            // Unreachable: the width read above accepted no other variant.
+            // Unreachable: the read above accepted no other variant.
             Err(Error::KvStorageMismatch {
                 expected: K8_TURBO_V_VARIANTS,
                 got: storage_variant_name(&self.storage),

@@ -3,10 +3,11 @@
 `crates/rmlx-kv-quant/src/kvcache/update.rs` held every codec's update path in
 one file. This document is the plan to split it, the record of what was
 measured before the split started, and the record of each chunk as it lands.
-Chunks (a) and (b1) have landed: the per-family decode bodies, and then the
+Chunks (a), (b1) and (b2) have landed: the per-family decode bodies, then the
 per-family prefill bulk-encode bodies, now sit in
 `kvcache/update_{rotor,iso,turbo,affine,planar,paged,mixed}.rs` and
-`update.rs` is the dispatcher over them. Every figure below that says "today"
+`update.rs` is the dispatcher over them; chunk (b2) then wrote one body per
+store shape instead of one per spelling. Every figure below that says "today"
 was measured before chunk (a); §4 carries the after.
 
 Method comes from the three twin-collapse documents and is not restated here:
@@ -307,7 +308,12 @@ red. Both were measured by applying each mutation and re-running.
 
 **After chunk (a):** 26 sites, all 26 forcing, and the same six in `update.rs`.
 The split moved bodies, not `match` arms, so no figure in the table above
-moved. The target of 3 or fewer is chunk (b)'s.
+moved.
+
+**After chunk (b2):** still 26 sites, all 26 forcing, still six in
+`update.rs`. That chunk collapsed arms and not sites, and the target of 3 or
+fewer is **not met** — §4 names the three accessors whose move would meet it
+for `update.rs` while leaving the tree-wide count where it is.
 
 ### File size
 
@@ -358,6 +364,9 @@ The chunk takes one file over the guideline and gives it a marker, and takes
 `update.rs` 999 lines closer to it. The count of oversized files with no
 marker anywhere in the tree is 22 on both sides, measured with
 `make debt-report`.
+
+Chunk (b2)'s reading of the same command is in §4, beside the pairs it
+deleted. Its largest single move is `update_turbo.rs`, 995 to 530.
 
 ### Duplication
 
@@ -429,6 +438,9 @@ does.
 The moved bodies duplicate each other exactly as much inside the family file
 as they did inside the `match`. The figures record more items, not new twins —
 what changed is that three of the four counters can now see them.
+
+Chunk (b2) is what moved them. §4 carries all four figures on both arms, the
+largest remaining pair in each population, and the reason each survivor stays.
 
 Three figures in the tree moved when the measure did, on both arms alike, with
 no body changing: `iso-updates` 875 → 878, `update-bodies` 3585 → 3610, and
@@ -671,21 +683,266 @@ statement-identical — not a test that runs them, because none does. Every
 mutation was applied to a file copy, run, and restored by `cp` with a digest
 check on both sides — never by `git checkout`.
 
-### Chunk (b) — one update body per store shape
+### Chunk (b2) — one body per store shape — landed
 
 24 of the 27 variants carry the same store-slot shape and their bodies are the
 same sequence: cast to bf16, ensure the store, append K, append V, dequant or
-read the mirror, run SDPA. Write that sequence once.
+read the mirror, run SDPA. This chunk writes that sequence once per shape, on
+the prefill side for every family and on the decode side for the one family
+that still held copies. It also normalises the storage-mismatch spelling
+across every prefill body.
 
-Removes: every per-variant body the shared one replaces. The chunk's commit
-message names each one.
+#### The mechanism, and why it is not a trait
 
-Judged by: the same oracle, plus the `update-bodies` duplication figure, which
-must fall and must stay a measured figure rather than an empty population.
+Three mechanisms were on the table: a store-side trait pair, a const-generic
+width, and plain fns taking the K and V stores. Two of the three are used and
+the trait is not, and the reason is measured rather than stylistic.
+
+**What varies across the 25 prefill bodies** is four things: the `KvStorage`
+variant they destructure, the store *types* in the two slots, the scalar
+knobs those stores are built with (`bits`, `use_tcq`, `v_bits`), and the
+device rule for each axis. A shared body can absorb the last two — they are
+values — and a const-generic can absorb a store type that is already generic
+over its width. It cannot absorb the variant, because a `match` arm binding
+`Option<QuantRotorV<3>>` and one binding `Option<QuantRotorV<4>>` have
+different types and one `match` cannot return both.
+
+So every shape is an **entry plus a body**. The entry destructures its
+variants and hands the two store slots to the body; the body is a free fn
+taking `&mut Option<KStore>` and `&mut Option<VStore>` and nothing else of the
+cache. That is the shape the `update_rotor_*` and `update_iso_*` decode
+entries already had, so the prefill side now reads like the decode side.
+
+Where the two bodies of a shape differ only in the code width, the body is
+`<const BITS: u8>` and the entry resolves the width — the mechanism the three
+storage collapses established. Where they differ only in a scalar, the body is
+a plain fn and the scalar is a parameter.
+
+**A store-side trait pair would be needed for one thing only**: the three
+bodies whose slots hold different store *types* at the same shape —
+`update_k8v4` (`QuantV`), `update_k8v8` (`QuantK`) and `update_planar`
+(`QuantPlanarV`), and their prefill counterparts. Measured, the trait it would
+take is not small: the five V-side constructors in play are
+`QuantV { bits, use_tcq, … }`, `QuantK { … }`, `QuantPlanarV { bits, … }`,
+`QuantRotorV::new(shape, max_seq, layer_idx)` and `QuantIsoV::new(shape)`, and
+the two `append` signatures differ in arity — `(vals, shape, src, device,
+max_seq)` against `(vals, shape)`. One trait method over that set either takes
+a configuration struct or hands three impls parameters they ignore. Both are
+the trait tower constraint 1 forbids, to delete two copies of a 70-line body.
+The three stay apart and §3 records the pair figure each one keeps.
+
+#### What the chunk deletes
+
+**Prefill: 25 bodies to 15.** Eight shared bodies replace 18 copies, and
+seven bodies stay as they are.
+
+| Shared body | Deletes |
+|---|---|
+| `rotor_v_bulk_encode<BITS>` | `exit_prefill_rotor3`, `exit_prefill_rotor4` |
+| `rotor_sym_bulk_encode<BITS>` | `exit_prefill_rotor3_sym`, `exit_prefill_rotor4_sym` |
+| `rotor_k_only_bulk_encode<BITS>` | `exit_prefill_rotor_k_only3`, `exit_prefill_rotor_k_only4` |
+| `rotor_k_asym_bulk_encode<BITS>` | `exit_prefill_rotor_k3_asym`, `exit_prefill_rotor_k4_asym` |
+| `iso_v_bulk_encode<BITS>` | `exit_prefill_iso3`, `exit_prefill_iso4` |
+| `iso_sym_bulk_encode<BITS>` | `exit_prefill_iso3_sym`, `exit_prefill_iso4_sym` |
+| `iso_k_only_bulk_encode<BITS>` | `exit_prefill_iso_k_only3`, `exit_prefill_iso_k_only4` |
+| `k8_turbo_v_bulk_encode` | `exit_prefill_k8vturbo3`, `exit_prefill_k8vturbo2`, `exit_prefill_k8vturbo3_tcq`, `exit_prefill_k8vturbo2_tcq` |
+
+Eight entries carry them: `exit_prefill_rotor_v`, `exit_prefill_rotor_sym`,
+`exit_prefill_rotor_k_only`, `exit_prefill_rotor_k_asym`,
+`exit_prefill_iso_v`, `exit_prefill_iso_sym`, `exit_prefill_iso_k_only`,
+`exit_prefill_k8_turbo_v`.
+
+**Decode: 1 shared body replaces 4 copies.** `k8_turbo_v_update` deletes
+`update_k8vturbo3`, `update_k8vturbo2`, `update_k8vturbo3_tcq` and
+`update_k8vturbo2_tcq`; `update_k8_turbo_v` is its entry. Measured on the
+arm before this chunk, those four were the tree's largest duplication pairs —
+`update_k8vturbo2_tcq` against `update_k8vturbo3_tcq` at 73 matched lines,
+`update_k8vturbo2` against `update_k8vturbo3` at 72. The rotor and iso decode
+paths were already one body per shape, from the storage collapses.
+
+**Also deleted**: `QuantIsoV3` and `QuantIsoV4`, which lost their last caller
+in `update_iso.rs`; two `clippy::wildcard_enum_match_arm` allows the rotor
+per-variant matches needed; eight `clippy::unreachable` allows; two
+`clippy::unwrap_used` allows the four deleted turbo decode bodies needed,
+because the shared body reads its store back with `let Some(..) else`, the
+shape `iso_v_update` and `tsym_update` already use. The `#[allow(` count over
+`kvcache/update*.rs` goes 110 to 67.
+
+#### The pairs that stay, and why
+
+Three shapes keep two bodies. Each is a difference the brief names as a
+keep-apart reason, and each carries its measured figure.
+
+| Pair | Matched lines | Why it stays |
+|---|---|---|
+| `exit_prefill_turbo_sym3` / `exit_prefill_turbo_sym4` | 45 | A CPU-forced V axis. `QuantKTurbo` is const-generic over the width, so the width alone would collapse, but the 3-bit body appends V on `Device::Cpu` and materialises its f32 vec unconditionally, while the 4-bit body appends V on the request's device and materialises neither vec on GPU. A shared body is a `BITS == 3` test on every interesting line. |
+| `update_k8v4` / `update_k8v8` | 64 | A different V store type — `Option<QuantV>` against `Option<QuantK>`. Needs the trait argued against above. Pre-existing and unmoved: 64 on both arms. |
+| `update_k8v4` / `update_planar` | 62 | The same, with `Option<QuantPlanarV>`. Also 62 on both arms. |
+
+The largest pair in `iso-updates` after the chunk is `iso_k_only_k_side`
+against `iso_v_encode_decode` at 50 matched lines, unchanged on both arms.
+Those two are different axes with different ring policies, not a width pair,
+and this chunk did not touch either.
+
+#### One storage-mismatch spelling
+
+The prefill bodies said "the storage does not match the quant" three ways,
+with three different consequences for the same construction-time defect: a
+panic, an untyped `Error::Mlx` string, and the typed
+`Error::KvStorageMismatch { expected, got }`. Every prefill body now returns
+the typed one. Measured over the `exit_prefill_*` bodies of
+`kvcache/update*.rs`: **47 sites in 25 bodies before — 15 `unreachable!`, 26
+`Error::Mlx`, 6 structured — and 21 sites in 15 bodies after, all
+structured**, no `unreachable!` and no `Error::Mlx` left. All eight
+`clippy::unreachable` allows are gone with them. `update_mixed.rs` now
+carries no `#[allow]` at all.
+
+Out of scope and left alone: the four decode bodies that still say
+`unreachable!` — `update_k8v4`, `update_k8v8`, `update_planar` and
+`update_paged`. This chunk normalises the prefill population only.
+
+#### The collapse, falsified
+
+Fifteen mutations on the collapsed tree, plus a control. Every one was applied
+to a file copy, run, and restored by `cp` with a digest check on both sides —
+never by `git checkout`. The control is 578 passed, 0 failed, the lib suite.
+
+| Mutation | Result | First cell red |
+|---|---|---|
+| control, no mutation | green, 578 passed | — |
+| `rotor_sym_bulk_encode` K ×1.01 | red | `rotor3_sym @ kv_h=1 head_dim=128` |
+| the same, guarded to `BITS == 4` | red | `rotor4_sym @ kv_h=1 head_dim=128` |
+| `iso_sym_bulk_encode` K ×1.01 | red | `iso3_sym @ kv_h=1 head_dim=128` |
+| `rotor_k_only_bulk_encode` K ×1.01 | red | `k_rotor3 @ kv_h=1 head_dim=128` |
+| `iso_k_only_bulk_encode` K ×1.01 | red | `k_iso3 @ kv_h=1 head_dim=128` |
+| the same, guarded to `BITS == 4` | red | `k_iso4 @ kv_h=1 head_dim=128` |
+| `iso_v_bulk_encode` K ×1.01 (dead arm) | **green**, 578 passed | none |
+| `k8_turbo_v_bulk_encode` K ×1.01 (dead arm) | **green**, 578 passed | none |
+| `exit_prefill_k8_turbo_v` TCQ flag `true` → `false` (dead arm) | **green**, 578 passed | none |
+| `k8_turbo_v_update` K ×1.01 | red | `k8vturbo3 @ kv_h=1 head_dim=128` |
+| `iso_v_update` K ×1.01 | red | `iso3 @ kv_h=1 head_dim=128` |
+| `tsym_update` K ×1.01 | red | `tsym3 @ kv_h=1 head_dim=128` |
+| `exit_prefill_rotor_v` resolves `RotorV3` to `::<4>` | **compile error** `E0308` | — |
+| `update_k8_turbo_v` passes `v_bits = 2` for `K8VTurbo3` | red, 4 tests | `k8vturbo3 @ kv_h=1 head_dim=128` |
+
+Three rows carry the argument.
+
+**A mis-resolved width is a compile error, not a red cell.** The entry hands
+the body a slot whose type names the width — `&mut Option<QuantRotorV<3>>`
+against a `&mut Option<QuantRotorV<4>>` parameter — so `::<3>` and `::<4>`
+are not interchangeable and `rustc` rejects the swap. That holds for all seven
+const-generic bodies. It does **not** hold for `k8_turbo_v_update`, whose
+width is the runtime `v_bits` field of a `QuantV`: there a wrong argument
+compiles, and the last row is the oracle catching it — four cells, not one.
+
+**Both widths of a shared body are driven.** The two guarded mutations are the
+converse of the collapse's risk: a shared body that only its 3-bit
+instantiation ever reached would leave the 4-bit cell testing nothing. Scaling
+K only when `BITS == 4` turns `rotor4_sym` and `k_iso4` red and leaves the
+3-bit cells green, so both instantiations reach a pinned cell.
+
+**The three green rows are the gate working, not a gap.** All six turbo
+spellings and both plain iso spellings report `false` from
+`decode_reads_packed_store()`, so `exit_prefill` returns before their arms and
+no CPU route runs them. A red cell there would mean the gate had stopped
+gating. §2 records this population and the guard that holds it to the
+predicate.
+
+#### What this chunk could not prove
+
+The last green row is the chunk's own blind spot, and it is new. The four
+turbo spellings' `(v_bits, use_tcq)` pairs used to be literals inside four
+bodies; they are now four arguments at two call sites. On the decode side the
+oracle reads them — the `v_bits = 2` row above. On the prefill side it cannot:
+those four arms are behind the gate, the prefill drive covers only the ten
+materialising spellings, and none of them is a turbo one. Measured: flipping
+`use_tcq` from `true` to `false` in the `K8VTurbo3Tcq` prefill arm leaves the
+whole crate green, 578 passed. The prefill mapping for those four spellings
+rests on reading the entry, and on the decode entry beside it naming the same
+constants.
+
+#### The figures
+
+Match sites: 26 before, 26 after, six of them in `update.rs`, all 26 forcing.
+The chunk collapsed `match` **arms**, not sites — the `KvStorage` dispatch
+went 19 arms to 16 and the `KvQuant` `exit_prefill` dispatch 26 to 16, each
+still naming every variant with no catch-all, so a new codec still has to
+touch both. **The issue's target of 3 or fewer is not met and this chunk
+cannot meet it.** Its six sites are the two dispatches plus
+`storage_has_materialised_payload`, `eval_gpu_state`, `storage_max_seq` and
+`set_storage_max_seq`. The last three are `KvStorage` accessors that belong on
+`KvStorage` itself; moving them to `storage/kv_storage.rs` would take
+`update.rs` to three sites but would **move** sites rather than remove them,
+leaving the tree-wide count at 26. That is a different change from writing one
+body per shape, and this chunk deliberately did not start it.
+
+Update bodies, `make kv-update-census`: 25 bodies over 1440 lines before, 22
+over 1150 after. `file-lines` over the update files 7623 to 6918.
+
+Duplication, `scripts/lib/debt_report.py --matched-lines`:
+
+| Population | Before chunk (b2) | After chunk (b2) |
+|---|---|---|
+| `update-bodies` | 3610 over 1440 (25 items, 300 pairs) | 1994 over 1150 (22 items, 231 pairs) |
+| `rotor-updates` | 138 over 1052 (35 items, 4 pairs) | 0 over 949 (35 items, 0 pairs) |
+| `turbo-updates` | 37 over 181 (4 items, 1 pair) | 45 over 197 (4 items, 1 pair) |
+| `iso-updates` | 1545 over 837 (27 items, 351 pairs) | 1270 over 738 (27 items, 351 pairs) |
+
+`rotor-updates` reads a measured `0` with its 35 items still found — the four
+width pairs chunk (b1)'s widened rule had just made visible are the four this
+chunk collapsed, and the counter moved when it did. That is the shape the
+storage collapses left behind too, and it is not `unavailable`: a population
+that resolved to nothing would exit 1.
+
+`turbo-updates` went **up**, from 37 to 45, and that is the error-spelling
+normalisation rather than a new twin. Its one pair is
+`exit_prefill_turbo_sym3` / `exit_prefill_turbo_sym4`, which stays for the
+reason above; both bodies gained the same two four-line structured-error
+blocks, so the lines they share grew by eight. Nothing else in the pair moved.
+
+`iso-updates` holds its item count at 27 by coincidence — six prefill bodies
+left and three shared bodies plus three entries arrived — while the lines the
+population shares fell by 275.
+
+File sizes, `make file-size-report`:
+
+| File | Before | After | `LOC-exempt` |
+|---|---|---|---|
+| `kvcache/update.rs` | 2193 | 2182 | yes — the dispatch, the capacity bookkeeping, the bf16 mirror and the GPU-state walks |
+| `kvcache/update_rotor.rs` | 1614 | 1498 | yes — four storage shapes at two widths, each with its own GPU encode, ring sync and materialise-tail path |
+| `kvcache/update_iso.rs` | 1260 | 1144 | yes |
+| `kvcache/update_affine.rs` | 968 | 972 | no |
+| `kvcache/update_turbo.rs` | 995 | 530 | no — the file had been five lines under the guideline; the collapse took 465 lines out of it |
+| `kvcache/update_planar.rs` | 313 | 317 | no |
+| `kvcache/update_paged.rs` | 222 | 222 | no |
+| `kvcache/update_mixed.rs` | 58 | 53 | no |
+
+`update_affine.rs` and `update_planar.rs` grew by 4 lines each: the structured
+error is longer than the `unreachable!` it replaced. `update_mixed.rs` lost 5,
+because its `match` over one variant became a `let`-else and its two allows
+went. No file crosses the guideline in either direction, and the three markers
+that were already there stay.
+
+**Trace targets.** No body changed module in this chunk, so no event changed
+target. The one target read by name is still the one
+[`PERF_BASELINE.md`](PERF_BASELINE.md) records:
+`rmlx_kv_quant::kvcache::update_iso` for the four iso decode phases and the
+`iso3_encode` prefill phase. That phase is the one place a width pair is not
+exact — the 3-bit V encode is timed and the 4-bit one has no pinned phase — so
+the shared body keeps it behind a `BITS == 3` guard rather than renaming it or
+adding an `iso4_encode` the doc does not name. The PlanarK `warm_ttft_bypass`
+override is in `update_planar.rs` and untouched; its three readers see no
+change.
+
+**Nothing retired.** Every `KvQuant` spelling, every `KvStorage` variant, every
+`Display` / `FromStr` arm, every CLI name, every `LAYOUT_TAG` and every
+`.metal` kernel is untouched: the diff is seven files, all
+`crates/rmlx-kv-quant/src/kvcache/update*.rs`, 707 insertions and 1412
+deletions. The SSD layout-key salt was not bumped and was not read.
 
 ### Constraints
 
-These are the orchestrator's, and they bind chunk (b) hardest.
+These are the orchestrator's, and they bound chunk (b2) hardest.
 
 1. **Readability first.** No trait tower. No premature generics.
 2. **A generic body is justified only where it deletes two or more real
