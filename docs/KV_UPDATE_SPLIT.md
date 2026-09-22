@@ -721,20 +721,32 @@ a plain fn and the scalar is a parameter.
 **A store-side trait pair would be needed for one thing only**: the three
 bodies whose slots hold different store *types* at the same shape —
 `update_k8v4` (`QuantV`), `update_k8v8` (`QuantK`) and `update_planar`
-(`QuantPlanarV`), and their prefill counterparts. Measured, the trait it would
-take is not small: the five V-side constructors in play are
-`QuantV { bits, use_tcq, … }`, `QuantK { … }`, `QuantPlanarV { bits, … }`,
+(`QuantPlanarV`), and their prefill counterparts.
+
+Measured over that population alone, the trait is **two methods, three impls
+and no constructor**: all three V stores take the same `append(vals, shape,
+src, device, max_seq)` and the same `dequantize_choice(device, dtype)`. What
+they do not share is how they are *built* — `QuantV` needs `bits` and
+`use_tcq`, `QuantPlanarV` needs `bits`, `QuantK` needs neither — and building
+is what the entry does. So the reason these three stay apart is not that a
+trait would be large: it is that the difference is in the construction, and
+the entry is where construction lives.
+
+That makes the two-method trait a **candidate for a later chunk**, not a shape
+this one rejects on principle. The figure it would move is 64 matched lines
+between `update_k8v4` and `update_k8v8` and 62 between `update_k8v4` and
+`update_planar` — both 64 and 62 on the arm before this chunk as well, so
+neither is this chunk's to claim. A trait over the *whole* 24-variant shape is
+a different proposition and is the one constraint 1 forbids: the five V-side
+constructors in play there are `QuantV`, `QuantK`, `QuantPlanarV`,
 `QuantRotorV::new(shape, max_seq, layer_idx)` and `QuantIsoV::new(shape)`, and
-the two `append` signatures differ in arity — `(vals, shape, src, device,
-max_seq)` against `(vals, shape)`. One trait method over that set either takes
-a configuration struct or hands three impls parameters they ignore. Both are
-the trait tower constraint 1 forbids, to delete two copies of a 70-line body.
-The three stay apart and §3 records the pair figure each one keeps.
+the rotor and iso `append`s take `(vals, shape)` — a different arity from the
+other three.
 
 #### What the chunk deletes
 
-**Prefill: 25 bodies to 15.** Eight shared bodies replace 18 copies, and
-seven bodies stay as they are.
+**Prefill: 25 bodies to 14.** Nine shared bodies replace 20 copies, and five
+bodies stay as they are.
 
 | Shared body | Deletes |
 |---|---|
@@ -746,11 +758,21 @@ seven bodies stay as they are.
 | `iso_sym_bulk_encode<BITS>` | `exit_prefill_iso3_sym`, `exit_prefill_iso4_sym` |
 | `iso_k_only_bulk_encode<BITS>` | `exit_prefill_iso_k_only3`, `exit_prefill_iso_k_only4` |
 | `k8_turbo_v_bulk_encode` | `exit_prefill_k8vturbo3`, `exit_prefill_k8vturbo2`, `exit_prefill_k8vturbo3_tcq`, `exit_prefill_k8vturbo2_tcq` |
+| `tsym_bulk_encode<BITS>` | `exit_prefill_turbo_sym3`, `exit_prefill_turbo_sym4` |
 
-Eight entries carry them: `exit_prefill_rotor_v`, `exit_prefill_rotor_sym`,
+Nine entries carry them: `exit_prefill_rotor_v`, `exit_prefill_rotor_sym`,
 `exit_prefill_rotor_k_only`, `exit_prefill_rotor_k_asym`,
 `exit_prefill_iso_v`, `exit_prefill_iso_sym`, `exit_prefill_iso_k_only`,
-`exit_prefill_k8_turbo_v`.
+`exit_prefill_k8_turbo_v`, `exit_prefill_turbo_sym`.
+
+The symmetric turbo pair was kept apart in the first pass of this chunk, for a
+CPU-forced V axis. Review found that reading wrong: the V device is one
+expression, and [`tsym_update`] already carries it —
+`if BITS == TURBO_K4_BITS { device } else { Device::Cpu }` — while
+`arrays_to_f32` is two `array_to_f32_vec` calls, so the f32 rule follows the
+resolved device per axis rather than the two widths. The pair collapsed with
+no other change. §"What this chunk could not prove" carries the evidence,
+which is not a red cell.
 
 **Decode: 1 shared body replaces 4 copies.** `k8_turbo_v_update` deletes
 `update_k8vturbo3`, `update_k8vturbo2`, `update_k8vturbo3_tcq` and
@@ -760,24 +782,32 @@ arm before this chunk, those four were the tree's largest duplication pairs —
 `update_k8vturbo2` against `update_k8vturbo3` at 72. The rotor and iso decode
 paths were already one body per shape, from the storage collapses.
 
-**Also deleted**: `QuantIsoV3` and `QuantIsoV4`, which lost their last caller
-in `update_iso.rs`; two `clippy::wildcard_enum_match_arm` allows the rotor
+**Also deleted**: the `use` import of `QuantIsoV3` and `QuantIsoV4` from
+`update_iso.rs`, whose shared bodies name `QuantIsoV<BITS>` instead. The two
+aliases themselves stay — they are declared in `storage/quant_iso_v.rs` and
+are the field types of four `KvStorage` variants. two `clippy::wildcard_enum_match_arm` allows the rotor
 per-variant matches needed; eight `clippy::unreachable` allows; two
 `clippy::unwrap_used` allows the four deleted turbo decode bodies needed,
 because the shared body reads its store back with `let Some(..) else`, the
-shape `iso_v_update` and `tsym_update` already use. The `#[allow(` count over
-`kvcache/update*.rs` goes 110 to 67.
+shape `iso_v_update` and `tsym_update` already use. One allow came back —
+`clippy::wildcard_enum_match_arm` on `k8_turbo_v_knobs`, whose `_ => None`
+answers for the 23 variants the table is not about. The `#[allow(` count over
+`kvcache/update*.rs` goes 110 to 65.
 
 #### The pairs that stay, and why
 
-Three shapes keep two bodies. Each is a difference the brief names as a
-keep-apart reason, and each carries its measured figure.
+Two shapes keep two bodies, and both for the same reason: a different V store
+*type*, which is the one difference an entry cannot absorb.
 
 | Pair | Matched lines | Why it stays |
 |---|---|---|
-| `exit_prefill_turbo_sym3` / `exit_prefill_turbo_sym4` | 45 | A CPU-forced V axis. `QuantKTurbo` is const-generic over the width, so the width alone would collapse, but the 3-bit body appends V on `Device::Cpu` and materialises its f32 vec unconditionally, while the 4-bit body appends V on the request's device and materialises neither vec on GPU. A shared body is a `BITS == 3` test on every interesting line. |
-| `update_k8v4` / `update_k8v8` | 64 | A different V store type — `Option<QuantV>` against `Option<QuantK>`. Needs the trait argued against above. Pre-existing and unmoved: 64 on both arms. |
+| `update_k8v4` / `update_k8v8` | 64 | `Option<QuantV>` against `Option<QuantK>`. Needs the two-method trait argued about above. Pre-existing and unmoved: 64 on both arms. |
 | `update_k8v4` / `update_planar` | 62 | The same, with `Option<QuantPlanarV>`. Also 62 on both arms. |
+
+A third pair was on this list and is not any more:
+`exit_prefill_turbo_sym3` / `exit_prefill_turbo_sym4`, at 45 matched lines.
+Its stated reason — a CPU-forced V axis — did not survive review, and the
+collapse above took it to a measured `0`.
 
 The largest pair in `iso-updates` after the chunk is `iso_k_only_k_side`
 against `iso_v_encode_decode` at 50 matched lines, unchanged on both arms.
@@ -797,15 +827,32 @@ structured**, no `unreachable!` and no `Error::Mlx` left. All eight
 `clippy::unreachable` allows are gone with them. `update_mixed.rs` now
 carries no `#[allow]` at all.
 
-Out of scope and left alone: the four decode bodies that still say
-`unreachable!` — `update_k8v4`, `update_k8v8`, `update_planar` and
-`update_paged`. This chunk normalises the prefill population only.
+One producer, not 21 literals. `storage_mismatch` in `update.rs` is the one
+place that builds the error, and every prefill and decode path calls it.
+Review found it still building an `Error::Mlx` while the prefill bodies it
+sits beside had moved to `Error::KvStorageMismatch` — the same defect in two
+retry classes at once.
+
+**That is a retry-envelope move, and it is the point of the change.**
+`Error::is_migratable` reports `Error::Mlx` as transient, and
+`rmlx-server`'s retry envelope replays a transient failure on another engine.
+A storage mismatch is not transient: the cache was built for one `KvQuant`
+and is being driven as another, so the replay builds the same wrong cache.
+Ten decode callers used to say "transient, replay may succeed" about a
+condition the prefill callers already called "permanent, replay futile".
+Permanent is the right class for both, and that is what they all report now.
+
+Left alone, and the one place the spelling is still not uniform: the four
+decode bodies that say `unreachable!` — `update_k8v4`, `update_k8v8`,
+`update_planar` and `update_paged`. They panic where every other path returns.
 
 #### The collapse, falsified
 
-Fifteen mutations on the collapsed tree, plus a control. Every one was applied
-to a file copy, run, and restored by `cp` with a digest check on both sides —
-never by `git checkout`. The control is 578 passed, 0 failed, the lib suite.
+Twenty-one mutations on the collapsed tree, plus a control. Every one was
+applied to a file copy, run, and restored by `cp` with a digest check on both
+sides — never by `git checkout`. The control is 578 passed, 0 failed, the lib
+suite. The first fifteen are the first pass of this chunk; the last six were
+added when review reopened the symmetric turbo pair and the knob table.
 
 | Mutation | Result | First cell red |
 |---|---|---|
@@ -824,6 +871,13 @@ never by `git checkout`. The control is 578 passed, 0 failed, the lib suite.
 | `tsym_update` K ×1.01 | red | `tsym3 @ kv_h=1 head_dim=128` |
 | `exit_prefill_rotor_v` resolves `RotorV3` to `::<4>` | **compile error** `E0308` | — |
 | `update_k8_turbo_v` passes `v_bits = 2` for `K8VTurbo3` | red, 4 tests | `k8vturbo3 @ kv_h=1 head_dim=128` |
+| `tsym_update` K ×1.01, guarded to `BITS == 4` | red | `tsym4 @ kv_h=1 head_dim=128` |
+| `tsym_update` V-device rule inverted | **green**, 578 passed | none |
+| `tsym_bulk_encode` K ×1.01 (dead arm) | **green**, 578 passed | none |
+| the same, guarded to `BITS == 4` (dead arm) | **green**, 578 passed | none |
+| `tsym_bulk_encode` V-device rule inverted (dead arm) | **green**, 578 passed | none |
+| `k8_turbo_v_knobs` `K8VTurbo3Tcq` `use_tcq` `true` → `false` | red | `the_tcq_spellings_set_the_flag_and_still_write_the_plain_bytes` |
+| `k8_turbo_v_knobs` `K8VTurbo3` `v_bits` `3` → `2` | red, 4 tests | `k8vturbo3 @ kv_h=1 head_dim=128` |
 
 Three rows carry the argument.
 
@@ -835,31 +889,108 @@ const-generic bodies. It does **not** hold for `k8_turbo_v_update`, whose
 width is the runtime `v_bits` field of a `QuantV`: there a wrong argument
 compiles, and the last row is the oracle catching it — four cells, not one.
 
-**Both widths of a shared body are driven.** The two guarded mutations are the
-converse of the collapse's risk: a shared body that only its 3-bit
+**Both widths of a shared body are driven.** The three guarded mutations are
+the converse of the collapse's risk: a shared body that only its 3-bit
 instantiation ever reached would leave the 4-bit cell testing nothing. Scaling
-K only when `BITS == 4` turns `rotor4_sym` and `k_iso4` red and leaves the
-3-bit cells green, so both instantiations reach a pinned cell.
+K only when `BITS == 4` turns `rotor4_sym`, `k_iso4` and `tsym4` red and
+leaves the 3-bit cells green, so both instantiations reach a pinned cell.
 
-**The three green rows are the gate working, not a gap.** All six turbo
+**Six of the seven green rows are the gate working, not a gap.** All six turbo
 spellings and both plain iso spellings report `false` from
 `decode_reads_packed_store()`, so `exit_prefill` returns before their arms and
 no CPU route runs them. A red cell there would mean the gate had stopped
 gating. §2 records this population and the guard that holds it to the
 predicate.
 
-#### What this chunk could not prove
+**The seventh green row is a different blindness, and it is the oracle's.**
+Inverting the V-device rule in `tsym_update` — the reachable decode body —
+is green as well, and the reason is that the rule only distinguishes anything
+when `device == Device::Gpu`. Every drive in this oracle is CPU, so
+`if BITS == TURBO_K4_BITS { device } else { Device::Cpu }` and its inverse
+both evaluate to `Device::Cpu` at every cell. The rule is a GPU-path choice
+and no CPU pin can see it, on the decode side or the prefill side. Its gate is
+`make gpu-test`, which is owed and not run here. That is also why the
+symmetric prefill collapse's evidence below is a construction argument rather
+than a mutation: the one line the two widths did not share is the one line
+this oracle is blind to.
 
-The last green row is the chunk's own blind spot, and it is new. The four
-turbo spellings' `(v_bits, use_tcq)` pairs used to be literals inside four
-bodies; they are now four arguments at two call sites. On the decode side the
-oracle reads them — the `v_bits = 2` row above. On the prefill side it cannot:
-those four arms are behind the gate, the prefill drive covers only the ten
-materialising spellings, and none of them is a turbo one. Measured: flipping
-`use_tcq` from `true` to `false` in the `K8VTurbo3Tcq` prefill arm leaves the
-whole crate green, 578 passed. The prefill mapping for those four spellings
-rests on reading the entry, and on the decode entry beside it naming the same
-constants.
+#### The blind spot this chunk opened, and closed
+
+The first pass of this chunk moved the four turbo spellings'
+`(v_bits, use_tcq)` pairs out of four bodies and into **two** call sites, one
+in the decode entry and one in the prefill entry. That was a decision table
+written twice, and the prefill copy was unobservable: those four arms sit
+behind the `materialises_packed_store()` gate, the prefill drive covers only
+the ten materialising spellings, and none of them is a turbo one. Measured at
+that point: flipping `use_tcq` from `true` to `false` in the `K8VTurbo3Tcq`
+prefill arm left the whole crate green, 578 passed.
+
+`k8_turbo_v_knobs` is now the one table and both entries read it. There is
+nothing left to mutate at the prefill entry — it carries no constant — and
+mutating the table instead is caught by the decode drive, which reads the same
+four rows. Measured on the collapsed tree:
+
+| Mutation of the one table | Result | First cell red |
+|---|---|---|
+| `K8VTurbo3Tcq` `use_tcq` `true` → `false` | red, 1 test | `the_tcq_spellings_set_the_flag_and_still_write_the_plain_bytes` |
+| `K8VTurbo3` `v_bits` `3` → `2` | red, 4 tests | `k8vturbo3 @ kv_h=1 head_dim=128` |
+
+The first of those is the exact mutation that was green before the table was
+merged. Each entry still binds its stores with a four-variant or-pattern, but
+that pattern carries no constants: every arm hands the body the same triple,
+so a wrong arm cannot mis-configure a store.
+
+#### What this chunk still cannot prove
+
+**The symmetric turbo prefill collapse has no red cell to offer.** All six
+turbo spellings report `false` from `decode_reads_packed_store()`, so
+`exit_prefill` returns before both `tsym_bulk_encode` instantiations and no
+CPU route runs either. Measured: scaling the K values the body hands its store
+by 1.01 leaves the crate green at 578 passed, and so does the same mutation
+guarded to `BITS == 4`. **Those greens are the gate working** — the same
+result §4 already records for `exit_prefill_turbo_sym3` under chunk (b1) — and
+a red cell there would mean the gate had stopped gating.
+
+The evidence for that one collapse is therefore not a test. It is three
+things:
+
+1. **The width binds at compile time.** The entry hands the body a
+   `&mut Option<QuantKTurbo<3>>` or a `&mut Option<QuantKTurbo<4>>`, so
+   `::<3>` and `::<4>` are not interchangeable.
+2. **The V-device rule is `tsym_update`'s, unchanged, and that body is
+   reachable at both widths.** Scaling K in `tsym_update` turns `tsym3` red,
+   and the same mutation guarded to `BITS == 4` turns `tsym4` red. The rule
+   itself is outside this oracle on both sides — inverting it in either body
+   is green, because it selects nothing until `device == Device::Gpu` and
+   every drive here is CPU. What the collapse did was reuse the rule the
+   decode path already carries, rather than write a second copy of it.
+3. **The four cases agree by construction.** `arrays_to_f32(k, v, d)` is
+   `(array_to_f32_vec(k, d), array_to_f32_vec(v, d))`, so each old body and
+   the new one produce the same three values at every `(BITS, device)`:
+
+| `BITS` | `device` | `k_f32` | `v_f32` | V append device |
+|---|---|---|---|---|
+| 3 | `Cpu` | `array_to_f32_vec(k, Cpu)` | `array_to_f32_vec(v, Cpu)` | `Cpu` |
+| 3 | `Gpu` | empty | `array_to_f32_vec(v, Cpu)` | `Cpu` |
+| 4 | `Cpu` | `array_to_f32_vec(k, Cpu)` | `array_to_f32_vec(v, Cpu)` | `Cpu` |
+| 4 | `Gpu` | empty | empty | `Gpu` |
+
+The store constructors carry over unchanged: `QuantKTurbo3` and
+`QuantKTurbo4` are aliases for `QuantKTurbo<3>` and `QuantKTurbo<4>`, and the
+V store's `bits: 3` / `bits: 4` become `bits: BITS`.
+
+**A merged prefill entry no longer refuses a quant/storage width
+disagreement.** Before this chunk, `KvQuant::Iso3` on a `KvStorage::IsoV4`
+cache reached the `Iso3`-only entry and returned a mismatch. The merged entry
+resolves the width from the storage and encodes at 4 bits. That direction is
+right — decode has always dispatched on the storage, so the two halves of the
+cache now agree where they used to disagree — but the guard is gone, and a
+construction-time defect that used to fail loudly would pass silently.
+`warn_if_width_disagrees` is what makes it visible: it compares the quant's
+own side width, from `KvQuant::approx_code_bits`, against the width the entry
+resolved, and warns. Deliberately not an assert, because the storage is the
+authority both halves already follow. Nothing asserts on that warning, so a
+mutation that inverts the comparison is not caught either.
 
 #### The figures
 
@@ -877,16 +1008,16 @@ leaving the tree-wide count at 26. That is a different change from writing one
 body per shape, and this chunk deliberately did not start it.
 
 Update bodies, `make kv-update-census`: 25 bodies over 1440 lines before, 22
-over 1150 after. `file-lines` over the update files 7623 to 6918.
+over 1117 after. `file-lines` over the update files 7623 to 6818.
 
 Duplication, `scripts/lib/debt_report.py --matched-lines`:
 
 | Population | Before chunk (b2) | After chunk (b2) |
 |---|---|---|
-| `update-bodies` | 3610 over 1440 (25 items, 300 pairs) | 1987 over 1150 (22 items, 231 pairs) |
-| `rotor-updates` | 138 over 1052 (35 items, 4 pairs) | 0 over 949 (35 items, 0 pairs) |
-| `turbo-updates` | 37 over 181 (4 items, 1 pair) | 45 over 197 (4 items, 1 pair) |
-| `iso-updates` | 1545 over 837 (27 items, 351 pairs) | 1270 over 738 (27 items, 351 pairs) |
+| `update-bodies` | 3610 over 1440 (25 items, 300 pairs) | 1897 over 1117 (22 items, 231 pairs) |
+| `rotor-updates` | 138 over 1052 (35 items, 4 pairs) | 0 over 931 (35 items, 0 pairs) |
+| `turbo-updates` | 37 over 181 (4 items, 1 pair) | 0 over 149 (4 items, 0 pairs) |
+| `iso-updates` | 1545 over 837 (27 items, 351 pairs) | 1261 over 720 (27 items, 351 pairs) |
 
 `rotor-updates` reads a measured `0` with its 35 items still found — the four
 width pairs chunk (b1)'s widened rule had just made visible are the four this
@@ -894,11 +1025,12 @@ chunk collapsed, and the counter moved when it did. That is the shape the
 storage collapses left behind too, and it is not `unavailable`: a population
 that resolved to nothing would exit 1.
 
-`turbo-updates` went **up**, from 37 to 45, and that is the error-spelling
-normalisation rather than a new twin. Its one pair is
-`exit_prefill_turbo_sym3` / `exit_prefill_turbo_sym4`, which stays for the
-reason above; both bodies gained the same two four-line structured-error
-blocks, so the lines they share grew by eight. Nothing else in the pair moved.
+`turbo-updates` reads a measured `0` over its 4 items. It went the other way
+first: the error-spelling normalisation took its one pair from 37 to 45,
+because both bodies of `exit_prefill_turbo_sym3` / `exit_prefill_turbo_sym4`
+gained the same structured-error blocks. Collapsing that pair then took the
+figure to zero. Both readings are on the same rule, the one chunk (b1)
+widened onto the codec token.
 
 `iso-updates` holds its item count at 27 by coincidence — six prefill bodies
 left and three shared bodies plus three entries arrived — while the lines the
@@ -908,20 +1040,20 @@ File sizes, `make file-size-report`:
 
 | File | Before | After | `LOC-exempt` |
 |---|---|---|---|
-| `kvcache/update.rs` | 2193 | 2182 | yes — the dispatch, the capacity bookkeeping, the bf16 mirror and the GPU-state walks |
-| `kvcache/update_rotor.rs` | 1614 | 1498 | yes — four storage shapes at two widths, each with its own GPU encode, ring sync and materialise-tail path |
-| `kvcache/update_iso.rs` | 1260 | 1144 | yes |
-| `kvcache/update_affine.rs` | 968 | 972 | no |
-| `kvcache/update_turbo.rs` | 995 | 530 | no — the file had been five lines under the guideline; the collapse took 465 lines out of it |
-| `kvcache/update_planar.rs` | 313 | 317 | no |
+| `kvcache/update.rs` | 2193 | 2202 | yes — the dispatch, the capacity bookkeeping, the bf16 mirror and the GPU-state walks |
+| `kvcache/update_rotor.rs` | 1614 | 1480 | yes — four storage shapes at two widths, each with its own GPU encode, ring sync and materialise-tail path |
+| `kvcache/update_iso.rs` | 1260 | 1121 | yes |
+| `kvcache/update_affine.rs` | 968 | 957 | no |
+| `kvcache/update_turbo.rs` | 995 | 487 | no — the file had been five lines under the guideline; the collapses took 508 lines out of it |
+| `kvcache/update_planar.rs` | 313 | 299 | no |
 | `kvcache/update_paged.rs` | 222 | 222 | no |
-| `kvcache/update_mixed.rs` | 58 | 53 | no |
+| `kvcache/update_mixed.rs` | 58 | 50 | no |
 
-`update_affine.rs` and `update_planar.rs` grew by 4 lines each: the structured
-error is longer than the `unreachable!` it replaced. `update_mixed.rs` lost 5,
-because its `match` over one variant became a `let`-else and its two allows
-went. No file crosses the guideline in either direction, and the three markers
-that were already there stay.
+Every family file shrank. `update.rs` grew by 9: it gained
+`warn_if_width_disagrees`, and `storage_mismatch` is longer as a typed
+constructor with a doc comment that states the retry class. No file crosses
+the guideline in either direction, and the three markers that were already
+there stay.
 
 **Trace targets.** No body changed module in this chunk, so no event changed
 target. The one target read by name is still the one
