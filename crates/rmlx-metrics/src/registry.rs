@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(
     clippy::exhaustive_enums,
-    reason = "closed enum — exactly two metric directions from the METRICS_DB spec; adding a direction requires updating the registry and all comparison logic"
+    reason = "closed enum — exactly two metric directions from docs/METRICS_SCHEMA.md §4; adding a direction requires updating the registry and all comparison logic"
 )]
 /// Metric optimization direction per docs/METRICS_SCHEMA.md §4.
 pub enum Direction {
