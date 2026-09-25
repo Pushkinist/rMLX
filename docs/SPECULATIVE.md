@@ -259,8 +259,8 @@ loud error rather than becoming a half-cut store. What changed is that
 path checks that its payload decodes to exactly `prod(shape)` and errors with
 `"refusing to zero-pad / truncate"` otherwise. Previously the turbo stores
 zero-padded (`out.resize(total, 0.0)`) and the planar stores panicked on an
-out-of-range index. See `docs/KV_QUANT.md` § "Scope — every CPU-side store
-cuts, and every one of them is loud".
+out-of-range index. See `docs/KV_QUANT.md` § "Every store cuts its own
+payload".
 
 ### Where a round's time goes
 

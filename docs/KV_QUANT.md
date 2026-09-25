@@ -120,9 +120,8 @@ the store.
 
 - **bf16-mirror family** (`K8V4`, `K8V8`, `Planar*`, `PlanarK`, `K8VTurbo*`,
   `TurboSym*`, `Iso3/4`, `Rotor3/4`, `RotorK*Asym`). No decode path reads the
-  store, so `exit_prefill` does not build it (`docs/KV_CACHE.md` §9.6 F3). The
-  resident KV is the two bf16 mirrors. This is the same byte count as
-  `--kv-quant none`.
+  store, so `exit_prefill` does not build it. The resident KV is the two bf16
+  mirrors. This is the same byte count as `--kv-quant none`.
 - **`Mixed` / `RotK`.** Their decode reads the affine 3-tuples. They keep the
   mirrors only when the layer shares K/V across layers (`KvCache::shares_kv`,
   set by the arch builder). Gemma4 shares; Qwen3 and Qwen3.5-MoE do not. On a
@@ -174,14 +173,15 @@ cadence against the store's own encoder at `head_dim` 64, 128 and 256. The
 estimate does not model page rounding, the static per-layer rotation tables, or
 GPU/CPU residual coexistence.
 
-The estimate runs **low** for `k_iso*` and `iso*_sym`. It sizes an iso side
-from the GPU ring. But `exit_prefill` encodes into CPU `IsoBlocks`, which are
-3.98× the ring at `head_dim = 128`. The first fused decode step frees the
-blocks (`drop_blocks_when_ring_live_iso_*`) on a layer the fused path serves.
-The fused path's shape gate rejects batch > 1 and a `head_dim` that is not a
-power of two at most 512 (`head_dim = 80` is one example). On such a layer,
-`update_and_sdpa_iso_k_fused` returns before any mutation, the ring is not
-allocated, and the layer keeps the blocks for the whole request.
+The estimate runs **low** for `k_iso*` and `iso*_sym`. It sizes an iso side from
+the GPU ring. But `exit_prefill` encodes into CPU `IsoBlocks`. For iso3 at
+`head_dim = 128` they are 6.07× the ring: 43.25 against 7.125 bits per value.
+The first fused decode step frees the blocks (`drop_blocks_when_ring_live_iso_*`) on
+a layer the fused path serves. The fused path's shape gate rejects batch > 1 and
+a `head_dim` that is not a power of two at most 512 (`head_dim = 80` is one
+example). On such a layer, `update_and_sdpa_iso_k_fused` returns before any
+mutation, the ring is not allocated, and the layer keeps the blocks for the
+whole request.
 
 The estimate is model-agnostic. It uses only layer geometry (`head_dim`,
 `kv_heads`, `window`), the layer topology (`shares_kv`) and codec attributes:
@@ -296,9 +296,9 @@ The last column is the V-side cosine gate on the unit-test fixture.
 | `K8V4` | rMLX MSL q8_0 | 128 | TurboQuant 4-bit | 32 | `QuantK` + `QuantV` | 0.9937 |
 | `Planar` (bits=4) | rMLX MSL q8_0 | 128 | PlanarQuant 4-bit | 32 | `QuantK` + `QuantPlanarV` | 0.9942 |
 | `Planar` (bits=3) | rMLX MSL q8_0 | 128 | PlanarQuant 3-bit | 32 | `QuantK` + `QuantPlanarV` | 0.9989 |
-| `Mixed` | MLX affine `k_bits` | `k_group` | MLX affine `v_bits` | `v_group` | `MixedKvState` | 0.9937 (V4); 0.9990 (V8); 0.9000 (V2) |
+| `Mixed` | MLX affine `k_bits` | `k_group` | MLX affine `v_bits` | `v_group` | `MixedKvState` | 0.9937 (V4 g64); 0.9990 (V8 g128); 0.9000 (V2 g32) |
 | `Paged` | q8_0 per page | 128 | tq4 / q8_0 / planar per page | 32/128/32 | `PagedKStorage` + paged V | — |
-| `TurboSym3` | TurboQuant 3-bit | 32 | TurboQuant 3-bit | 32 | `QuantKTurbo3` + `QuantV{bits:3}` | 0.9807 (K empirical floor) |
+| `TurboSym3` | TurboQuant 3-bit | 32 | TurboQuant 3-bit | 32 | `QuantKTurbo3` + `QuantV{bits:3}` | 0.9807 |
 
 ---
 
@@ -2533,7 +2533,7 @@ There is no flag and no environment variable. The kernel runs when all of
 these conditions are true:
 
 - The cache is not a sliding-window ring. `update_and_sdpa` sends a rotating
-  cache to the legacy bf16 path first.
+  cache to `KvCache::update` and bf16 SDPA first.
 - The device is GPU.
 - The storage is `RotorKOnly3` or `RotorKOnly4`.
 - The store carries no QJL sideband.
@@ -2541,8 +2541,8 @@ these conditions are true:
 - `b == 1`.
 - `head_dim` is a power of two and at most `ROTOR_FLASH_HEAD_DIM_MAX` (512).
 
-On any other miss the legacy entry dequantizes the K prefix on the CPU and
-runs bf16 SDPA.
+On any other miss the non-fused fallback (`KvCache::update`, then SDPA)
+dequantizes the K prefix on the CPU and runs bf16 SDPA.
 
 **QJL.** `--rotor-qjl on` adds a 1-bit QJL residual to K. Its decode is a
 per-token product with a dense `[head_dim, head_dim]` matrix, which the flash
@@ -2561,21 +2561,21 @@ global toggle. The default is `--rotor-qjl off`.
 | `RotorSym{3,4}` | NO | Decodes through `rotor_flash_decode_symv`, which reads V from its own ring. |
 | `RotorKAsym{3,4}` | NO | V is a TurboQuant store (`QuantV`), not rotor. Its only GPU decode kernel is `rotor_fused_qk`, with `--fused-qk on` (§"Fused-QK head-major K storage"). |
 
-### Ring eligibility is passed down, not inferred
+### The caller of the encode chooses the ring feed (`RingFeed`)
 
 The caller of the rotor or iso GPU encode decides whether the ring is fed. It
 passes a `RingFeed`:
 
-- **`Maintain`** — feed the ring and push a CPU block. The legacy rotor K-only
-  entries use it, because they dequantize the whole prefix on the same step.
+- **`Maintain`** — feed the ring and push a CPU block. The non-fused rotor
+  K-only `update_*` entries use it (`LEGACY_ROTOR_K_ONLY_FEED`), because they
+  dequantize the whole prefix on the same step.
 - **`MaintainRingOnly`** — feed the ring and push no CPU block. This is a
   ring-only tail. The fused decode entries use it. `shape[2]` still advances.
-- **`Skip`** — drop the ring. The legacy rotor symmetric and asymmetric
-  entries and the legacy iso entries use it.
+- **`Skip`** — drop the ring. The non-fused rotor symmetric and asymmetric
+  entries (`LEGACY_ROTOR_SYM_FEED`) and the non-fused iso entries use it.
 
 A ring-only feed at `b > 1` takes the block path instead
-(`is_ring_only_append`). A ring grows with the context:
-`ring_bits_per_value` gives its bits per value.
+(`is_ring_only_append`).
 
 After a fused decode step the entry drops the CPU blocks
 (`drop_blocks_when_ring_live_*`). The ring is then the only resident copy.
@@ -2596,123 +2596,11 @@ stay a contiguous prefix. The fused entry requires `q_seq == 1`, so a
 multi-token append on a warm cache takes the block path. A speculative verify
 chunk is such an append.
 
-`truncate_to` keeps the ring. It lowers `shape[2]` to `n`, and the next append
-writes the ring from `n`. So a speculative rollback keeps a ring-only tail up
-to `n`.
-
 A store whose blocks fall short of `shape[2]` with no ring to supply the rest
 is an error, never a zero-padded read. `synced_rotor_k_blocks` refuses it at
 the codec. `ensure_rotor_k_blocks_cover_shape` refuses it at SSD
 serialization. Both return `Err` and are not `debug_assert`s, so they hold
 under `release-perf`.
-
-**Row vs. sequence units.** A rotor or iso block's `n_tokens` counts rows
-(`b * kv_h * seq_of_block`). `truncate_to(n)` takes a sequence position. So
-the planner compares cumulative rows with `n * b * kv_h`.
-
-**A cut inside a block splits it.** A block spans one append. A speculative
-partial accept cuts inside the verifier's `K + 1`-token chunk. The planner
-splits the trailing block and cuts every per-row buffer to the kept rows:
-codes, per-group scales, per-group quaternions, per-token norms and the QJL
-sideband.
-
-**The split is `b == 1` only.** A block's rows run `[B, S_block, kv_h, D]`.
-So at `b > 1` a row prefix is not a sequence prefix. There the planner drops
-the block, and the reconciliation guard reports the gap.
-`quant_rotor_v3_truncate_at_b_gt_1_stays_loud` pins this. A block whose row
-count is not a whole number of sequence positions stops the walk too.
-
-**Multi-block decode at `b > 1`.** Each CPU store with a block list reorders
-every block at its own sequence offset
-(`seq_layout::transpose_chunked_seq_heads`). The iso GPU readers
-(`QuantIsoK::dequant_gpu`, `QuantIsoV::dequant_gpu`) put each token row at its
-head-major position through `iso_kernel_inputs_head_major`. The
-`*_two_block_decode_matches_one_block_at_b_gt_1` tests, one per store, pin
-this over `(b, kv_h) ∈ {1,2} × {1,2}`.
-
-**Readers that refuse `b != 1`.** Two readers refuse `b != 1` with `S > 1`
-instead of reordering:
-
-* The flat GPU buffers of the turbo, planar and q8 stores (`QuantV`,
-  `QuantKTurbo3/4`, `QuantPlanarK/V`, `QuantK`). Their prefix records no
-  chunk boundary.
-* `QuantK`'s CPU `codes` / `scales`, one flat pair with no per-append
-  boundary. It refuses even a single-append `b > 1` store.
-
-The eight rotor and iso K and V stores share one planner, `truncate_plan` in
-`crates/rmlx-kv-quant/src/storage/mod.rs`, with one `BlockRows` implementation
-per block type. Tests: `storage/truncate_plan_tests.rs`, and one store-level
-round trip per block type in `quant_rotor_k_tests.rs`, `quant_rotor_v_tests.rs`
-and `quant_iso_v_tests.rs`.
-
-**Scope — every CPU-side store cuts, and every one of them is loud.** The same
-planner drives the turbo and planar blocks (`TurboBlocks`, `PlanarBlocks`).
-`QuantV`, `QuantKTurbo3/4`, `QuantPlanarK` and `QuantPlanarV` implement
-`truncate_to`. `QuantK` cuts its flat `codes` / `scales` pair to the first `n`
-positions. Every arm of `KvStorage::truncate_to` and `KvStorage::reset`
-delegates to the store's own `truncate_to` or `reset`. So no arm lowers
-`shape[2]` and leaves the payload in place.
-
-Every CPU dequant path checks that its blocks decode to `prod(shape)`
-elements. On a mismatch in either direction it returns an error:
-`"CPU blocks decode to N elems but shape [...] implies M — refusing to
-zero-pad / truncate"`. The stores refuse some cuts, and this check reports
-each one. They refuse a cut at `b > 1` and a block that is not a whole number
-of positions. `QuantK` also refuses a target inside a 128-element q8 group.
-
-`TurboBlocks` and `PlanarBlocks` carry no `n_tokens`. Their row count is the
-product of the first three axes of `original_shape` (`storage::block_rows`).
-The CPU append and the SSD hydrate write those axes in different orders, and
-the product is the same for both. A split writes `[1, 1, rows, width]`.
-`cpu_block_truncate_tests::quant_v_truncate_reads_rows_from_the_shape_product`
-pins it.
-
-**When a cut changes an answer.** A Class 2 codec builds no packed store on a
-cache that went through a prefill bracket (§"Class 2"). Its decode reads the
-bf16 mirror. So a served request cannot tell a correct cut from a no-op. Its
-store is read only on a cache with no mirror. That is an SSD hydrate
-(`KvCache::from_storage` leaves `decode_fp16_k` at `None`), or a cache that
-never went through a prefill bracket. The device does not change this. For
-the store-reading codecs, two more readers see the store: the SSD spill
-(`block_io::write_layer`) and the prompt-cache snapshot (`try_deep_clone`).
-
-**Truncation is monotone-decreasing.** The turbo, planar and q8 stores
-clamp the target to their own `shape[2]` (`storage::clamp_truncate_target`). A
-target past `shape[2]` is reachable. A store-backed codec that also keeps a
-bf16 mirror advances `KvCache::offset` on paths that the store does not
-follow. A `shape[2]` raised to meet the target would claim tokens that no
-payload holds.
-
-The rotor and iso stores do not clamp. A ring-only tail lies below
-`shape[2]`, and the ring readback returns `Err` on an over-long target. So for
-`n > shape[2]` the mixed arms leave the two axes of one codec at different
-lengths. These are `IsoV3`, `IsoV4`, `RotorV3` and `RotorV4`, where the q8 K
-(`QuantK`) clamps. They are also `RotorKAsym3/4`, where the TurboQuant V
-(`QuantV`) clamps. The guard on the
-unclamped side reports it at spill.
-
-**The `Mixed` arm truncates to its fill marker.** `MixedKvState` is a capacity
-buffer that grows in `STEP` increments, with `offset` as its fill marker.
-`truncate_to(n)` sets the marker to `n`, and the next append writes over the
-rows from `n`. The bf16 mirror of a shared-KV producer follows the same offset.
-For `n > offset` the state keeps its fill and emits an `error!` that names
-both numbers. `offset` is the coverage, so there is nothing to clamp down to.
-`kvcache/shared_source_tests.rs::mixed_truncate_to_keeps_the_prefix_it_was_told_to_keep`
-compares the cut cache with a cache prefilled to the kept length.
-
-Tests: `storage/cpu_block_truncate_tests.rs` covers the partial-accept round
-trip per store and the `b > 1` and q8-group refusals. It also covers the zero,
-exact and past-the-end targets, `KvStorage::reset`, and the
-`KvStorage::truncate_to` dispatch. Each oracle is a reference store built from
-the kept tokens only. `crates/rmlx-kv-ssd/src/hydrate_truncate_tests.rs`
-truncates a hydrated cache inside a block, appends a correction and checks the
-decoded V.
-
-In production, `KvCache::truncate_to` is called by the prompt-cache prefix
-trim (`PromptCacheEntry::truncate_kv_to`) and by the speculative
-partial-accept rollback. `truncate_plan` has no arch or head-count branch.
-`kv_cache_truncate_iso3_kv_h_gt_1_path` (`rmlx-models/src/kv_cache/tests.rs`)
-drives the full `KvCache` dispatch at `kv_h = 4`.
 
 ### Arch reachability
 
@@ -2771,13 +2659,12 @@ blocks the host on the GPU once per layer per decode step.
 
 This kernel and `iso_flash_decode_symv` bind a per-token `norms` array. MLX's
 custom-kernel builder can bind a small input in the `constant` address space.
-The shared decode helpers declare `norms` in the `device` address space, and
-that mismatch fails the MSL compile at the first dispatch. So both
-dispatchers call `flash_decode_common::pad_norms_to_device_floor`. It
+The shared decode helpers declare `norms` in the `device` address space. On
+an MLX build that binds it as `constant`, that mismatch fails the MSL compile.
+So both dispatchers call `flash_decode_common::pad_norms_to_device_floor`. It
 zero-pads `norms` to `NORMS_DEVICE_MIN` (16) elements when
 `b * kv_h * kv_seq` is below it. The kernel loop stops at the real `kv_seq`,
-so no pad element is read. On the pinned MLX the compile does not fail without
-the pad. The pad stays because the compile can fail on another MLX build.
+so no pad element is read.
 
 `iso_sym_short_kv_seq_kv_h1_stays_on_gpu`,
 `iso_sym_transition_across_ring_norms_floor` and
@@ -2843,8 +2730,8 @@ is an `Err`.
 There is no flag and no environment variable. The kernel runs when all of
 these conditions are true:
 
-- The cache is not a sliding-window ring. A rotating cache takes the legacy
-  bf16 path first.
+- The cache is not a sliding-window ring. A rotating cache takes
+  `KvCache::update` and bf16 SDPA first.
 - The device is GPU.
 - The storage is `IsoKOnly3` or `IsoKOnly4`.
 - `q_seq == 1`.
@@ -2852,9 +2739,9 @@ these conditions are true:
 - `head_dim` is a power of two, a multiple of 4, and at most
   `ISO_FLASH_HEAD_DIM_MAX` (512).
 
-On any other miss the legacy entry dequantizes the K prefix and runs bf16
-SDPA. On a GPU device it dequantizes on the GPU (`dequant_gpu`). On a CPU
-device it dequantizes on the CPU.
+On any other miss the non-fused fallback (`KvCache::update`, then SDPA)
+dequantizes the K prefix and runs bf16 SDPA. On a GPU device it dequantizes on
+the GPU (`dequant_gpu`). On a CPU device it dequantizes on the CPU.
 
 The iso codecs have no QJL residual. So `k_iso3` and `k_iso4` reach the kernel
 at the default flags.
@@ -3042,8 +2929,8 @@ contiguous, so the flatten copies on each step (see KV_CACHE.md §9.5
 
 `KvCache::try_fused_qk_dispatch` in
 `crates/rmlx-kv-quant/src/kvcache/fused_qk_dispatch.rs` is called from
-`update_and_sdpa` after the K8V4 TurboFlash branch and before the legacy bf16
-SDPA fallback. `try_dispatch_shared_bf16` calls it on the cross-layer-KV
+`update_and_sdpa` after the K8V4 TurboFlash branch and before the non-fused
+bf16 SDPA fallback. `try_dispatch_shared_bf16` calls it on the cross-layer-KV
 producer path. Its gates, in order:
 
 1. `DispatchPolicy::fused_qk` is set. `--fused-qk on|off|auto` sets it. `auto`
@@ -3240,6 +3127,115 @@ over the query heads of a GQA group and over the prompts.
 
 ---
 
+## Store truncation (`truncate_to`)
+
+`KvCache::truncate_to(n)` rolls a cache back to its first `n` positions. Each
+store cuts its own payload; the limits are below.
+
+The rotor and iso `truncate_to` keeps the ring. It lowers `shape[2]` to `n`, and
+the next append writes the ring from `n`. So a speculative rollback keeps a
+ring-only tail up to `n`.
+
+**Row vs. sequence units.** A rotor or iso block's `n_tokens` counts rows
+(`b * kv_h * seq_of_block`). `truncate_to(n)` takes a sequence position. So
+the planner compares cumulative rows with `n * b * kv_h`.
+
+**A cut inside a block splits it.** A block spans one append. A speculative
+partial accept cuts inside the verifier's `K + 1`-token chunk. The planner
+splits the trailing block and cuts every per-row buffer to the kept rows:
+codes, per-group scales, per-group quaternions, per-token norms and the QJL
+sideband.
+
+**The split is `b == 1` only.** A block's rows run `[B, S_block, kv_h, D]`.
+So at `b > 1` a row prefix is not a sequence prefix. There the planner drops
+the block, and the reconciliation guard reports the gap.
+`quant_rotor_v3_truncate_at_b_gt_1_stays_loud` pins this. A block whose row
+count is not a whole number of sequence positions stops the walk too.
+
+**Multi-block decode at `b > 1`.** Each CPU store with a block list reorders
+every block at its own sequence offset
+(`seq_layout::transpose_chunked_seq_heads`). The iso GPU readers
+(`QuantIsoK::dequant_gpu`, `QuantIsoV::dequant_gpu`) put each token row at its
+head-major position through `iso_kernel_inputs_head_major`. The
+`*_two_block_decode_matches_one_block_at_b_gt_1` tests, one per store, pin
+this over `(b, kv_h) ∈ {1,2} × {1,2}`.
+
+**Readers that refuse `b != 1`.** Two readers refuse `b != 1` with `S > 1`
+instead of reordering:
+
+* The flat GPU buffers of the turbo, planar and q8 stores (`QuantV`,
+  `QuantKTurbo3/4`, `QuantPlanarK/V`, `QuantK`). Their prefix records no
+  chunk boundary.
+* `QuantK`'s CPU `codes` / `scales`, one flat pair with no per-append
+  boundary. It refuses even a single-append `b > 1` store.
+
+The eight rotor and iso K and V stores share one planner, `truncate_plan` in
+`crates/rmlx-kv-quant/src/storage/mod.rs`, with one `BlockRows` implementation
+per block type. Tests: `storage/truncate_plan_tests.rs`, and one store-level
+round trip per block type in `quant_rotor_k_tests.rs`, `quant_rotor_v_tests.rs`
+and `quant_iso_v_tests.rs`.
+
+**Every store cuts its own payload.** The same planner drives the turbo and
+planar blocks (`TurboBlocks`, `PlanarBlocks`). `QuantV`, `QuantKTurbo3/4`,
+`QuantPlanarK` and `QuantPlanarV` implement `truncate_to`. `QuantK` cuts its
+flat `codes` / `scales` pair to the first `n` positions. Every arm of
+`KvStorage::truncate_to` and `KvStorage::reset` delegates to the store's own
+`truncate_to` or `reset`. So no arm lowers `shape[2]` and leaves the payload in
+place.
+
+**Every CPU dequant checks its length.** Each path checks that its blocks decode
+to `prod(shape)` elements. On a mismatch in either direction it returns an
+error: `"CPU blocks decode to N elems but shape [...] implies M — refusing to
+zero-pad / truncate"`. The stores refuse some cuts, and this check reports each
+one. They refuse a cut at `b > 1` and a block that is not a whole number of
+positions. `QuantK` also refuses a target inside a 128-element q8 group.
+
+`TurboBlocks` and `PlanarBlocks` carry no `n_tokens`. Their row count is the
+product of the first three axes of `original_shape` (`storage::block_rows`).
+The CPU append and the SSD hydrate write those axes in different orders, and
+the product is the same for both. A split writes `[1, 1, rows, width]`.
+`cpu_block_truncate_tests::quant_v_truncate_reads_rows_from_the_shape_product`
+pins it.
+
+**Only the turbo, planar and q8 stores clamp the target.** They clamp it to
+their own `shape[2]` (`storage::clamp_truncate_target`). A target past
+`shape[2]` is reachable. A store-backed codec that also keeps a bf16 mirror
+advances `KvCache::offset` on paths that the store does not follow. A `shape[2]`
+raised to meet the target would claim tokens that no payload holds.
+
+The rotor and iso stores do not clamp: they set `shape[2]` to the target. A
+ring-only tail lies below `shape[2]`, and the ring readback returns `Err` on an
+over-long target. So for `n > shape[2]` the mixed arms leave the two axes of one
+codec at different lengths. These are `IsoV3`, `IsoV4`, `RotorV3` and `RotorV4`,
+where the q8 K (`QuantK`) clamps. They are also `RotorKAsym3/4`, where the
+TurboQuant V (`QuantV`) clamps. The guard on the unclamped side reports it at
+spill.
+
+**The `Mixed` arm truncates to its fill marker.** `MixedKvState` is a capacity
+buffer that grows in `STEP` increments, with `offset` as its fill marker.
+`truncate_to(n)` sets the marker to `n`, and the next append writes over the
+rows from `n`. The bf16 mirror of a shared-KV producer follows the same offset.
+For `n > offset` the state keeps its fill and emits an `error!` that names
+both numbers. `offset` is the coverage, so there is nothing to clamp down to.
+`kvcache/shared_source_tests.rs::mixed_truncate_to_keeps_the_prefix_it_was_told_to_keep`
+compares the cut cache with a cache prefilled to the kept length.
+
+Tests: `storage/cpu_block_truncate_tests.rs` covers the partial-accept round
+trip per store and the `b > 1` and q8-group refusals. It also covers the zero,
+exact and past-the-end targets, `KvStorage::reset`, and the
+`KvStorage::truncate_to` dispatch. Each oracle is a reference store built from
+the kept tokens only. `crates/rmlx-kv-ssd/src/hydrate_truncate_tests.rs`
+truncates a hydrated cache inside a block, appends a correction and checks the
+decoded V.
+
+In production, `KvCache::truncate_to` is called by the prompt-cache prefix
+trim (`PromptCacheEntry::truncate_kv_to`) and by the speculative
+partial-accept rollback. `truncate_plan` has no arch or head-count branch.
+`kv_cache_truncate_iso3_kv_h_gt_1_path` (`rmlx-models/src/kv_cache/tests.rs`)
+drives the full `KvCache` dispatch at `kv_h = 4`.
+
+---
+
 ## Qwen MoE rejects low-bit K codecs
 
 `validate_resolved` (`crates/rmlx-models/src/kv_cache/cache_type.rs`) rejects
@@ -3257,8 +3253,8 @@ these codecs when the arch class is `Qwen3_5MoeForConditionalGeneration` or
 
 Every other codec stores K at 8 bits or wider and passes. On any other arch
 class `validate_resolved` rejects nothing.
-`qwen_moe_low_k_bits_rejected_post_decompose`
-(`crates/rmlx-models/src/kv_cache/cache_type_tests.rs`) tests the rejection.
+`crates/rmlx-models/src/kv_cache/cache_type_tests.rs` tests each row of the
+table.
 
 ### What the guard keys off
 
@@ -3274,30 +3270,34 @@ loader selects dense or sparse MoE per layer from the tensor witness
 The enforcing check is therefore keyed on the **resolved** architecture:
 
 - `Architecture::arch_class()` reports what the loader built. For the Qwen3.5
-  variant it asks `has_sparse_moe_layers()`.
+  variant it asks `has_sparse_moe_layers()`. Qwen3-VL has no registered dense
+  arch string. So an all-dense Qwen3-VL checkpoint reports the MoE class and
+  is refused these codecs too.
 - `Architecture::validate_kv_quant()` runs `validate_resolved` against that
   class, before any KV cache exists.
 - `load_model` emits a `warn!` naming `declared_arch` and `resolved_arch` when
-  they differ. A deliberate alias (`registry::is_declared_arch_alias`, today
-  only Gemma4-unified) logs at `debug!` instead.
+  they differ. A deliberate alias (`registry::is_declared_arch_alias`, only
+  Gemma4-unified) logs at `debug!` instead.
 
-The check sits on every path that builds a KV cache. There are two families,
-and they do not share a call graph:
+The check covers the cache of the model that serves the request, or of the
+verifier on a speculative path. There are two production families, and they do
+not share a call graph:
 
 | Path | Cache built by | Enforced at |
 |---|---|---|
-| Non-speculative | per-arch `generate_greedy` (`gemma4`, `gemma3`, `qwen2`, `qwen3`, `qwen3_5_moe`, `qwen3_vl_moe`, `laguna`, `bitnet`), reached only from `Architecture::generate_greedy` / `generate_image` | those two methods, and `ArchGenerator::from_snapshot_with_id` at startup |
+| Non-speculative | per-arch `generate_greedy` (`gemma4`, `gemma3`, `qwen2`, `qwen3`, `qwen3_5_moe`, `qwen3_vl_moe`, `laguna`, `bitnet`), reached on production paths from `Architecture::generate_greedy` / `generate_image` | those two methods, and `ArchGenerator::from_snapshot_with_id` at startup |
 | Speculative | `speculative::round_common::cache_stack` builds the verifier's caches; `Architecture::generate_greedy` is never called | `SpeculativeGenerator::from_snapshots_with_id` at startup, and its per-request `generate` |
 
 The MTP and Eagle3 drafter caches use `KvQuant::None`, which every arch
 accepts. The two-model paths build the draft model's stack with the verifier's
 codec, and only the verifier is checked.
 
-The startup resolvers (`rmlx-cli` `resolve_kv_quant`, the server's
-`resolve_kv_quant_for_load`) read `architectures[0]`, because they run before
-the model loads. The CLI resolver exits 78 on a rejected `--kv-quant`. The
-per-request checks are the enforcing copy. A request's `kv_quant` field
-arrives after startup, and `resolve_kv_quant_for_load` does not validate it.
+The CLI resolver (`rmlx-cli` `resolve_kv_quant`) reads `architectures[0]`,
+because it runs before the model loads. It exits 78 on a rejected
+`--kv-quant`. The server's `resolve_kv_quant_for_load` validates nothing. The
+server's startup check is `ArchGenerator::from_snapshot_with_id` (or its
+speculative counterpart), on the loaded model. The per-request checks cover a
+request's `kv_quant` field, which arrives after startup.
 
 `crates/rmlx-models/tests/resolved_arch_class.rs` relabels a MoE snapshot as
 dense and asserts that the guard still fires. It is `#[ignore]` and needs the
@@ -3319,8 +3319,9 @@ The incoherence of a row is `mu = sqrt(d)·max|x_i|/||x||_2`. It is 1 for a
 flat row and `sqrt(d)` for a one-hot row.
 
 The per-codec cosine gates run on the i.i.d.-uniform LCG fixture. For i.i.d.
-data `mu` is the expected maximum of `d` samples in sigma units. At
-`head_dim = 128` that is about 1.71 for uniform and 2.83 for Gaussian. A
+data `mu` is near `max|x_i|` in sigma units. At `head_dim = 128` that is
+about 1.72 for uniform on [-1, 1] (`max|x_i|` near 1, sigma `1/sqrt(3)`) and
+about 2.8 for Gaussian. A
 Hadamard pushes uniform toward Gaussian and so raises `mu`. **The LCG cosine
 gates therefore carry no information about rotation quality: an identity
 rotation passes every one of them.**
@@ -3366,11 +3367,10 @@ defect in them**: they buy packing efficiency, a different axis. The iso
 quaternion keeps `phi/sqrt(5) = 0.72` of a lone large coordinate, hence about
 1.38x.
 
-`rot_k` end to end, against the same `affine q8 group=64` quantizer without
-the Hadamard:
-`rot_k_hadamard_buys_bits_on_outlier_data_and_costs_them_on_iid_data` asserts
-at least 1.5 bits of SQNR gained on the outlier fixture and a loss on the
-i.i.d. uniform one.
+`rot_k_hadamard_buys_bits_on_outlier_data_and_costs_them_on_iid_data`
+compares `rot_k` with the same `affine q8 group=64` quantizer without the
+Hadamard. It asserts at least 1.5 bits of SQNR gained on the outlier fixture.
+It also asserts a loss on the i.i.d. uniform fixture.
 
 The gain is exactly `log2(peak_plain / peak_rotated)` over the affine group.
 The block ceiling bounds the same quantity: a block-`b` transform can buy at
@@ -3409,8 +3409,8 @@ Turbo is primarily a **V** codec. So a rotation would pay on the smaller half
 of the family, and at the narrow widths. The V side would also need an inverse
 transform after the SV accumulation in the flash and dequant kernels.
 
-These figures come from a **model** of K-cache structure, not from a K/V
-tensor captured in a forward pass. For a real checkpoint they are an estimate.
+These gates run on a **model** of K-cache structure, not on a K/V tensor
+captured in a forward pass. For a real checkpoint they are an estimate.
 
 ### Rate-distortion — is the bit width delivering
 
@@ -3445,9 +3445,9 @@ Each cell's budget in `CELLS` is its pin plus 0.10 bits.
 `pinned_budgets_sit_one_slack_above_the_measurement` fails a budget more than
 0.105 bits above the measurement.
 
-**The small-group scale is not a loss.** Deriving the scale from the maximum of
-3 or 4 samples presents the codebook with data of standard deviation ≈ 1.47,
-not 1. Yet the small groups come out *ahead* of the anchor. The group maximum is
+**The small-group scale is not a loss.** iso, rotor and planar derive the
+scale from the maximum of 3 or 4 samples. Yet these small groups come out
+*ahead* of the anchor. The group maximum is
 a strong conditioning statistic and is reconstructed near-exactly. The two or
 three remaining elements are then known to be smaller than it. The shortfall
 is at the other end: large groups at low bit widths. `turbo` and `tcq` at 2
