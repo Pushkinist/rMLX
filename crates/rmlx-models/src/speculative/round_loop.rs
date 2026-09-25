@@ -200,7 +200,8 @@ pub(crate) struct RoundCfg<'a> {
 /// The verifier, its caches and the draw a round reads them through.
 ///
 /// [`RoundDrafter::rollback`] and [`RoundDrafter::condition`] take this
-/// immutably, so only `prefill` and `verify` can advance the caches or the draw.
+/// immutably, so only `prefill`, `propose` and `verify` can advance the caches
+/// or the draw.
 #[allow(missing_debug_implementations)]
 pub(crate) struct RoundCtx<'a> {
     /// The model a round verifies against.

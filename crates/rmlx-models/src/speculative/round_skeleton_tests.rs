@@ -413,7 +413,7 @@ const SHARED_LOOP_PATTERN: &str = "SPEWGRIP";
 
 /// What each round loop declares at its edges, and the file that holds it.
 ///
-/// Five facts per loop: which exit skips the resident-KV report, how the loop
+/// Three facts per loop: which exit skips the resident-KV report, how the loop
 /// refuses an empty proposal chain, and which read of the verifier's offset its
 /// round line reports. This table is the statement; the two tests below are
 /// readings of it against today's source. It is data rather than seven assertions because it is what

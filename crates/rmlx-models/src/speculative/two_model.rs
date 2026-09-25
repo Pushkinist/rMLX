@@ -54,7 +54,7 @@ use rmlx_kv_quant::{KvCache, LinearAttnCache};
 
 /// How a round decides which of its proposals the verifier stands behind.
 ///
-/// The one thing the two two-model paths do not share; see
+/// The one thing this drafter's two rules do not share; see
 /// `docs/SPEC_ROUND_SKELETON.md` § "The acceptance rule". The greedy walk
 /// compares tokens, and the stochastic one compares the two distributions each
 /// position was drawn from. Both commit the same shape — an accepted prefix and
