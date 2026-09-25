@@ -127,21 +127,11 @@ server docs (2026-06); capabilities evolve — corrections welcome.</sub>
 
 ## Performance
 
-Decode throughput is competitive with `mlx-lm` across both lead families,
-measured on an independent cross-backend harness (Apple M5 Max, batch=1,
-temp=0; per-family grids under [`docs/models/`](docs/models)):
-
-- **Qwen 3.6 35B-A3B** — rMLX leads decode at **every context (4k→128k)**,
-  ≈ +12–15 % over `mlx-lm-turboquant` in our runs.
-- **Gemma 4 (e2b / e4b / 26b)** — matches `mlx-lm` within run-to-run noise;
-  decode there is weight-bandwidth-bound, so KV quant buys little. (31b dense
-  trails slightly — bandwidth physics.)
-
-**Prefill / time-to-first-token** is at parity with `mlx-lm`: a direct
-`mlx-lm` run on the same 35B-A3B snapshot measures ≈ 2.7k–3.6k prompt tok/s,
-versus rMLX's ≈ 3.0k — both bandwidth-bound at roughly the same level. (An
-earlier draft cited a ~40–50× prefill deficit; that came from a non-physical
-baseline and has been retracted after a direct measurement.)
+The decode anchors of the three test-target models, with the build and the
+command that measured them, are in
+[`docs/PERF_BASELINE.md`](docs/PERF_BASELINE.md). The same doc names the
+scripts that measure a build against them and that run one cell against
+`mlx-lm`, oMLX, ParoQuant or llama.cpp.
 
 ## Requirements
 

@@ -53,6 +53,9 @@ it needs an unreleased MLX kernel. See `docs/WEIGHT_QUANTS.md` §4.4.
 
 **KV codec.** `auto` is unquantised bf16 on every architecture
 (`DEFAULT_KV_QUANT`); see `docs/KV_QUANT.md` § "The auto default". The
+decode anchors of the three test-target snapshots at that default, and the
+command that measures them, are in `docs/PERF_BASELINE.md`
+§ "Canary anchors". The
 per-codec invariants that refuse a codec on a given shape are in
 `docs/KV_CACHE.md` §5.
 
@@ -140,6 +143,11 @@ are kept. The paper defaults (32, 1) apply only when the config declares no
 No speculative seams. The `head_budget` and `softmax_mass` recipes of
 `rmlx kv-calibrate` accept only this architecture.
 
+Snapshot in use: `prism-ml__Ternary-Bonsai-8B-mlx-2bit`. Its `config.json`
+declares 36 layers, 32 query and 8 KV heads at `head_dim` 128, and full
+attention on every layer (`sliding_window` is null). Its
+`max_position_embeddings` is 65536, so no 128k prompt fits.
+
 ---
 
 ## Qwen3.5
@@ -188,7 +196,8 @@ float, so uint8 E8M0 microscaling scales stay verbatim. See
 `docs/KV_LAYER_POLICY.md` "Qwen3.6 MoE KV is bf16 at `--kv-quant none`".
 
 `prism-ml__Bonsai-27B-mlx-1bit` declares `quantization.bits = 1` and is
-refused by the preflight. Its 2-bit sibling loads.
+refused by the preflight. Its 2-bit sibling,
+`prism-ml__Ternary-Bonsai-27B-mlx-2bit`, loads.
 
 **KV.** The Qwen MoE guard (`validate_resolved`) refuses every codec with
 K below 8 bits on the MoE class. The dense class keeps them. See
@@ -198,8 +207,23 @@ K below 8 bits on the MoE class. The dense class keeps them. See
 every drafter kind; see
 [Speculative verifier seams](#speculative-verifier-seams).
 
-Snapshots in use: `mlx-community__Qwen3.6-35B-A3B-8bit` (MoE),
-`mlx-community__Qwen3.8-27B-mxfp8` (dense), `z-lab__Qwen3.6-27B-PARO`.
+**Snapshots in use.** Read from each snapshot's `config.json`. Every one
+has `full_attention_interval` 4, `head_dim` 256 and a
+`max_position_embeddings` of 262144.
+
+| Snapshot | Class | Layers (full / GDN) | Heads (q / KV) | Weights |
+|---|---|---|---|---|
+| `mlx-community__Qwen3.6-35B-A3B-8bit` | MoE, 256 experts, top 8 | 40 (10 / 30) | 16 / 2 | affine g64 b8 |
+| `mlx-community__Qwen3.8-27B-mxfp8` | dense | 64 (16 / 48) | 24 / 4 | mxfp8 |
+| `z-lab__Qwen3.6-27B-PARO` | dense | 64 (16 / 48) | 24 / 4 | ParoQuant 4-bit |
+| `prism-ml__Ternary-Bonsai-27B-mlx-2bit` | dense | 64 (16 / 48) | 24 / 4 | affine g128 b2 |
+
+The Bonsai-27B config declares one MTP layer, but the snapshot ships no
+`mtp.*` tensors.
+
+The Qwen3.6-35B-A3B drafters: `mlx-community__Qwen3.6-35B-A3B-MTP-5bit`
+(`mtp`), `z-lab__Qwen3.6-35B-A3B-DFlash` (`dflash`) and
+`Dogacel__specdrift-qwen3.6-35b-a3b-eagle3` (`eagle3`).
 
 ---
 
@@ -279,15 +303,19 @@ checkpoints take `gemma4::load_from_path`.
 
 Read from each snapshot's `config.json`:
 
-| Snapshot | Layers | Hidden | Shared-KV layers | `attention_k_eq_v` | MoE | Window | Input |
-|---|---|---|---|---|---|---|---|
-| `gemma-4-e2b-it-mxfp8` | 35 | 1536 | 20 | no | no | 512 | text, image, audio |
-| `gemma-4-e4b-it-mxfp8` | 42 | 2560 | 18 | no | no | 512 | text, image, audio |
-| `gemma-4-26b-a4b-it-mxfp8` | 30 | 2816 | 0 | yes | yes (128) | 1024 | text, image |
-| `gemma-4-31b-it-mxfp8` | 60 | 5376 | 0 | yes | no | 1024 | text, image |
-| `gemma-4-12B-it-*` (Unified) | 48 | 3840 | 0 | yes | no | 1024 | text, image, audio |
+| Snapshot | Layers | Hidden | Shared-KV layers | `attention_k_eq_v` | MoE | Window | Context | Input |
+|---|---|---|---|---|---|---|---|---|
+| `gemma-4-e2b-it-mxfp8` | 35 | 1536 | 20 | no | no | 512 | 131072 | text, image, audio |
+| `gemma-4-e4b-it-mxfp8` | 42 | 2560 | 18 | no | no | 512 | 131072 | text, image, audio |
+| `gemma-4-26b-a4b-it-mxfp8` | 30 | 2816 | 0 | yes | yes (128) | 1024 | 262144 | text, image |
+| `gemma-4-31b-it-mxfp8` | 60 | 5376 | 0 | yes | no | 1024 | 262144 | text, image |
+| `gemma-4-12B-it-*` (Unified) | 48 | 3840 | 0 | yes | no | 1024 | 262144 | text, image, audio |
 
-`head_dim` is 256 and `global_head_dim` 512 on every size.
+`head_dim` is 256 and `global_head_dim` 512 on every size. Context is
+`max_position_embeddings`.
+
+Each mxfp8 size has a drafter snapshot, `gemma-4-<size>-it-assistant-bf16`
+(E2B, E4B, 26B-A4B, 31B); see Speculative decoding below.
 
 ### Layers
 
