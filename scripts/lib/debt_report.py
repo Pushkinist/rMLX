@@ -63,7 +63,8 @@ any digit run touching a letter, underscore or hyphen.
 
 ``--check-doc-size`` is the third mode, a gate: it measures the same docs as
 the fourth section and exits 1 naming every doc over the cap, every stale
-entry in ``DOC_SIZE_TEMPORARY_EXCEPTIONS`` and every doc carrying a
+entry in ``DOC_SIZE_TEMPORARY_EXCEPTIONS`` (grown past its recorded size,
+within the cap, or gone) and every doc carrying a
 ``size-exempt:`` marker, and exits 2 when the docs cannot be measured.
 
 Advisory (the four-section report only): this module never raises for
@@ -90,12 +91,14 @@ from pathlib import Path
 SIM_THRESHOLD = 0.60
 DOC_SIZE_THRESHOLD_KIB = 40
 DOC_SIZE_CAP_BYTES = DOC_SIZE_THRESHOLD_KIB * 1024
-# No doc exempts itself: a line-leading marker in any doc fails the gate.
-SIZE_EXEMPT_MARKER = re.compile(r"^\s*(?:<!--\s*)?size-exempt:", re.M)
-# The one doc over the cap until it is split. The gate fails once the doc is
-# within the cap or gone, so the entry cannot outlive the split.
+# No doc exempts itself: a marker at the start of any line fails the gate,
+# after any Markdown leader (comment, list item, quote, heading).
+SIZE_EXEMPT_MARKER = re.compile(r"^[ \t]*(?:(?:<!--|[-*+>]|#+|\d+\.)[ \t]*)*size-exempt:", re.M)
+# The one doc over the cap until it is split, with its size when the entry was
+# made. The gate fails if the doc grows past that size, and once it is within
+# the cap or gone, so the entry cannot outlive the split.
 DOC_SIZE_TEMPORARY_EXCEPTIONS = {
-    "docs/METRICS_DB.md": "split into per-topic docs pending",
+    "docs/METRICS_DB.md": (66397, "split into per-topic docs pending"),
 }
 LOC_THRESHOLD = 1000
 
@@ -1008,6 +1011,7 @@ class DocSizes:
     excepted: list[tuple[str, int, str]]
     stale_exceptions: list[tuple[str, str]]
     marked: list[str]
+    grown: list[tuple[str, int, int]]
 
 
 def measure_doc_sizes(root: Path) -> DocSizes:
@@ -1016,7 +1020,11 @@ def measure_doc_sizes(root: Path) -> DocSizes:
     docs_dir = root / "docs"
     if not docs_dir.is_dir():
         raise DocSizeUnavailable(f"{docs_dir} is not a directory")
-    found = sorted(f.relative_to(root).as_posix() for f in docs_dir.rglob("*.md"))
+    found = sorted(
+        f.relative_to(root).as_posix()
+        for f in docs_dir.rglob("*")
+        if f.is_file() and f.suffix.lower() == ".md"
+    )
     try:
         ignored = git_ignored(root, found)
     except RuntimeError as err:
@@ -1024,20 +1032,22 @@ def measure_doc_sizes(root: Path) -> DocSizes:
     docs = [name for name in found if name not in ignored]
     if not docs:
         raise DocSizeUnavailable(f"no docs/**/*.md under {root} to measure")
-    sizes = DocSizes(len(docs), [], [], [], [])
+    sizes = DocSizes(len(docs), [], [], [], [], [])
     for name in docs:
         size = (root / name).stat().st_size
-        reason = DOC_SIZE_TEMPORARY_EXCEPTIONS.get(name)
+        ceiling, reason = DOC_SIZE_TEMPORARY_EXCEPTIONS.get(name, (None, None))
         if size > DOC_SIZE_CAP_BYTES:
             if reason is None:
                 sizes.over.append((name, size))
             else:
                 sizes.excepted.append((name, size, reason))
+                if size > ceiling:
+                    sizes.grown.append((name, size, ceiling))
         elif reason is not None:
             sizes.stale_exceptions.append((name, f"{size} B is within the cap"))
         if SIZE_EXEMPT_MARKER.search((root / name).read_text(errors="replace")):
             sizes.marked.append(name)
-    for name, reason in sorted(DOC_SIZE_TEMPORARY_EXCEPTIONS.items()):
+    for name in sorted(DOC_SIZE_TEMPORARY_EXCEPTIONS):
         if name not in docs:
             sizes.stale_exceptions.append((name, "the doc is gone"))
     return sizes
@@ -1051,6 +1061,10 @@ def doc_size_failures(sizes: DocSizes) -> list[str]:
     failures += [
         f"{name}  stale temporary exception ({why}): remove it from DOC_SIZE_TEMPORARY_EXCEPTIONS"
         for name, why in sizes.stale_exceptions
+    ]
+    failures += [
+        f"{name}  {size} B grew past its temporary exception's {ceiling} B; shrink it"
+        for name, size, ceiling in sizes.grown
     ]
     failures += [
         f"{name}  carries a size-exempt marker; no doc may exempt itself from the cap"

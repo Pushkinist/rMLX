@@ -105,6 +105,21 @@ case_run marker_does_not_exempt_size "the marker does not lift the cap: the doc 
 case_run marker_over_cap_also_named "and the marker is named as a failure of its own" \
     1 "FAIL docs/BIG_MARKED.md  carries a size-exempt marker" "$root"
 
+n=0
+for leader in "- " "> " "* " "## " "1. " "<!-- - "; do
+    n=$((n + 1))
+    tag="$n"
+    root=$(fresh "marker_leader_$tag")
+    printf '# Doc\n\n%ssize-exempt: long on purpose\n' "$leader" >"$root/docs/LEAD.md"
+    case_run "marker_after_leader_${tag}" "a marker after the Markdown leader '${leader}' still fails" \
+        1 "FAIL docs/LEAD.md  carries a size-exempt marker" "$root"
+done
+
+root=$(fresh upper_case_suffix)
+bytes "$root/docs/SHOUT.MD" 45000
+case_run upper_case_suffix_measured "a doc spelled .MD is measured like .md" \
+    1 "FAIL docs/SHOUT.MD" "$root"
+
 root=$(fresh marker_in_prose)
 printf '# Prose\n\nThe gate refuses a `size-exempt:` line in any doc.\n' >"$root/docs/PROSE.md"
 case_run marker_mid_line_is_prose "a mid-line mention is prose, not a marker" \
@@ -119,6 +134,16 @@ case_run marker_in_script_not_scanned "the marker in a selftest script is outsid
 root=$(fresh exception_over)
 case_run exception_over_cap_passes "the one temporary exception over the cap passes and is printed" \
     0 "check-doc-size: docs/METRICS_DB.md 64.5 KiB, temporary exception:" "$root"
+
+root=$(fresh exception_at_ceiling)
+bytes "$root/docs/METRICS_DB.md" 66397
+case_run exception_at_ceiling_passes "the exception at its recorded size passes" \
+    0 "temporary exception:" "$root"
+
+root=$(fresh exception_grown)
+bytes "$root/docs/METRICS_DB.md" 66398
+case_run exception_grown_fails "the exception one byte past its recorded size fails" \
+    1 "FAIL docs/METRICS_DB.md  66398 B grew past its temporary exception's 66397 B" "$root"
 
 root=$(fresh exception_within)
 bytes "$root/docs/METRICS_DB.md" 40960
