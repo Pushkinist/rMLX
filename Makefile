@@ -111,6 +111,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         smoke-codec-matrix \
         e2e \
         file-size-report debt-report debt-report-selftest \
+        check-doc-size check-doc-size-selftest \
         kv-update-census kv-update-census-selftest \
         check-no-inline-tests check-no-scalar-f32-leak \
         check-doc-source-citations \
@@ -453,6 +454,12 @@ debt-report: ## advisory: sibling similarity, debt counters, add/remove ratio, o
 debt-report-selftest: ## CI gate: recall test for debt-report over synthetic fixtures — a planted twin, a non-twin, the round-loop group, and a two-commit ratio repo
 	@bash scripts/debt_report_selftest.sh
 
+check-doc-size: ## CI gate: fail naming every docs/**/*.md over 40 KiB, a stale temporary exception or a size-exempt marker (exit 2: cannot measure)
+	@python3 scripts/lib/debt_report.py --check-doc-size
+
+check-doc-size-selftest: ## CI gate: recall test for check-doc-size over throwaway git trees, each case asserting its exit code and reason
+	@bash scripts/check_doc_size_selftest.sh
+
 kv-update-census: ## advisory: the KV structural figures — variant shapes, match sites a new codec must touch, per-variant update bodies (non-failing)
 	@python3 scripts/kv_update_census.py all
 
@@ -625,6 +632,8 @@ check-metal-format: ## CI gate: every .metal kernel is clang-format clean (skips
 # ---- one-shot CI gate -------------------------------------------------
 ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gate: fmt + clippy + test + feature-gated capture tests + deny + audit + metrics-sanity + inline-test + A/B-harness + MSL gates
 	@bash scripts/debt_report_selftest.sh
+	@bash scripts/check_doc_size_selftest.sh
+	@python3 scripts/lib/debt_report.py --check-doc-size
 	@bash scripts/kv_update_census_selftest.sh
 	@bash scripts/check_no_inline_tests.sh
 	@bash scripts/check_no_scalar_f32_leak.sh
