@@ -2060,9 +2060,8 @@ fn integration_qwen3_5_moe_35b() {
 ///    decode output differs from a crafted different-tail cold run, NOT from the
 ///    warm run).
 ///
-/// Run:
+/// Run (the snapshot resolves by slug under `RMLX_O_MODELS_ROOT`):
 /// ```sh
-/// RMLX_KV_TEST_MODEL=/path/to/Qwen3.6-35B-A3B-8bit \
 /// cargo test -p rmlx-models hydrated_tail_produces_identical_output \
 ///     -- --ignored --nocapture
 /// ```

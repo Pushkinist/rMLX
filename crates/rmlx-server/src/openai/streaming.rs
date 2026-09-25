@@ -318,11 +318,11 @@ pub(crate) fn handle_streaming_token(
                 if !crate::constraint_json::schema::is_only_fence_or_whitespace(pre) {
                     tracing::debug!(
                         pre_text = %pre,
-                        "A6.5: streaming json_object_mode: non-fence pre-text before JSON; kept"
+                        "streaming json_object_mode: non-fence pre-text before JSON; kept"
                     );
                 } else if !pre.is_empty() {
                     tracing::debug!(
-                        "A6.5: streaming json_object_mode: suppressed fence/whitespace prefix"
+                        "streaming json_object_mode: suppressed fence/whitespace prefix"
                     );
                 }
                 // Take only from idx onward.

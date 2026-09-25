@@ -525,7 +525,7 @@ pub async fn admit_request(
     if max_queue_depth > 0 && pending.load(Ordering::Acquire) >= max_queue_depth {
         tracing::warn!(
             max_queue_depth,
-            "C5: admission rejected — server queue full (429)"
+            "admission rejected — server queue full (429)"
         );
         return Admission::QueueFull;
     }
@@ -544,7 +544,7 @@ pub async fn admit_request(
     } else {
         // Semaphore closed (shutdown). Balance the fetch_add and reject.
         pending.fetch_sub(1, Ordering::AcqRel);
-        tracing::warn!("C5: gpu_queue semaphore closed during acquire — rejecting");
+        tracing::warn!("gpu_queue semaphore closed during acquire — rejecting");
         Admission::QueueFull
     }
 }
@@ -563,7 +563,7 @@ impl Drop for GpuAdmission {
             .unwrap_or(0);
         tracing::trace!(
             gpu_pending_after = prev.saturating_sub(1),
-            "C5: GpuAdmission dropped — permit released, pending decremented"
+            "GpuAdmission dropped — permit released, pending decremented"
         );
     }
 }

@@ -903,7 +903,7 @@ impl AppState {
         // is never served. Default-OFF (require_smoke_probe=false) keeps the
         // zero-overhead path unchanged.
         if self.require_smoke_probe {
-            tracing::info!(model_id, path = %entry.abs_path.display(), "B5: running smoke probe before first load");
+            tracing::info!(model_id, path = %entry.abs_path.display(), "running smoke probe before first load");
 
             // Render the smoke seed through the model's real chat template so the
             // probe exercises production-shaped, turn-structured input. When no
@@ -926,7 +926,7 @@ impl AppState {
             use rmlx_models::SmokeVerdict;
             match &verdict {
                 SmokeVerdict::Ok | SmokeVerdict::Inconclusive { .. } => {
-                    tracing::info!(model_id, ?verdict, "B5: smoke probe passed");
+                    tracing::info!(model_id, ?verdict, "smoke probe passed");
                 }
                 SmokeVerdict::BrokenPunctLoop {
                     dominant_piece,
@@ -936,7 +936,7 @@ impl AppState {
                         model_id,
                         dominant_piece,
                         distinct_ids,
-                        "B5: smoke probe FAILED — BrokenPunctLoop; refusing to serve"
+                        "smoke probe FAILED — BrokenPunctLoop; refusing to serve"
                     );
                     return Err(rmlx_core::error::Error::SmokeProbe(format!(
                         "smoke probe failed for '{model_id}': broken_punct_loop \
@@ -947,7 +947,7 @@ impl AppState {
                     tracing::error!(
                         model_id,
                         at_step,
-                        "B5: smoke probe FAILED — BrokenNan; refusing to serve"
+                        "smoke probe FAILED — BrokenNan; refusing to serve"
                     );
                     return Err(rmlx_core::error::Error::SmokeProbe(format!(
                         "smoke probe failed for '{model_id}': broken_nan at step {at_step}"

@@ -416,11 +416,9 @@ const SHARED_LOOP_PATTERN: &str = "SPEWGRIP";
 /// Three facts per loop: which exit skips the resident-KV report, how the loop
 /// refuses an empty proposal chain, and which read of the verifier's offset its
 /// round line reports. This table is the statement; the two tests below are
-/// readings of it against today's source. It is data rather than seven assertions because it is what
-/// survives the collapse: the resident-KV disposition is a [`RoundDrafter`]
-/// declaration for a migrated loop, read here against its constant, and each
-/// migration drops its own file from [`LOOP_SOURCES`] and names
-/// [`SHARED_LOOP`] in its row instead, while these rows stay as they are. See
+/// readings of it against the source. The resident-KV disposition is a
+/// [`RoundDrafter`] declaration, read here against its constant; a row whose
+/// loop is the shared one names [`SHARED_LOOP`]. See
 /// `docs/SPEC_ROUND_SKELETON.md`.
 const DISPOSITIONS: [(
     SpecLoop,

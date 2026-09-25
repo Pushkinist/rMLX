@@ -320,7 +320,7 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
         first_kernel_ready_ms,
         total_load_ms,
         arch = arch_str,
-        "arch::load_model: load-time phases (N17)"
+        "arch::load_model: load-time phases"
     );
     {
         let mut guard = LAST_LOAD_PHASES

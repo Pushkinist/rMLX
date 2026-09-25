@@ -626,7 +626,7 @@ impl CodePredictor {
 
 // ── Codec decoder ─────────────────────────────────────────────────────────────
 
-/// Single VQ codebook. Embedding = embedding_sum / max(cluster_usage, 1).
+/// Single VQ codebook. Embedding = embedding_sum / max(cluster_usage, 1e-5).
 struct VqCodebook {
     embed: Array, // [2048, 256] f32 — pre-normalized embedding table
 }

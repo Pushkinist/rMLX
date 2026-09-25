@@ -1177,7 +1177,7 @@ impl Generator for SpeculativeGenerator {
                         tracing::info!(
                             model_id = %model_id_for_log,
                             metal_peak_alloc_mb = peak_mb,
-                            "generate: metal peak alloc speculative (C7)"
+                            "generate: metal peak alloc speculative"
                         );
                         if let Some(ref drainer) = metrics_drainer {
                             use crate::metrics_drainer::{MetricEvent, MetricKind};

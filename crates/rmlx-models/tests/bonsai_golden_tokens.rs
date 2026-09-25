@@ -5,8 +5,8 @@
 //! `Qwen3ForCausalLM` backbone on its production Mixed KV path.
 //!
 //! Model: `prism-ml__Ternary-Bonsai-8B-mlx-2bit`.
-//! KV quant: Mixed{ K=8, V=4, group=64 } — the resolver default for Qwen3
-//! dense 2-bit, feeding the quantized 3-tuple straight into SDPA.
+//! KV quant: Mixed{ K=8, V=4, group=64 }, pinned by the test (`auto` resolves
+//! to bf16); it feeds the quantized 3-tuple straight into SDPA.
 //!
 //! The snapshot resolves from `RMLX_O_MODELS_ROOT` by slug, so no per-run
 //! variable is needed on a machine holding it (see `tests/common/mod.rs`).

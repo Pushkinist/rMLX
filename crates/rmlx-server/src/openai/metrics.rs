@@ -132,7 +132,7 @@ pub(crate) fn gather_metrics(state: &AppState) -> MetricsSnapshot {
                         evictions = stats.evictions,
                         bytes = stats.bytes,
                         kv_cache_bytes,
-                        "gather_metrics: prompt-cache (N19) + kv-cache (N16)"
+                        "gather_metrics: prompt-cache + kv-cache"
                     );
                     ModelMetrics {
                         model_id,

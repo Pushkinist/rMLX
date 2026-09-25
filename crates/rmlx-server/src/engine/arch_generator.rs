@@ -250,7 +250,7 @@ impl ArchGenerator {
         tracing::debug!(
             model_id = %model_id,
             ?tokenizer_kind,
-            "ArchGenerator: classified detokenizer family (A10)"
+            "ArchGenerator: classified detokenizer family"
         );
 
         // Resolve the context bounds through the single resolver, so the
@@ -643,7 +643,7 @@ impl Generator for ArchGenerator {
         // is identical to pre-A6.2 — see `generate_greedy` decode loops.
         let mut constraint = req.constraint;
         if constraint.is_some() {
-            tracing::debug!(model_id = %req.model_id, "generate: constraint engine active (A6.2)");
+            tracing::debug!(model_id = %req.model_id, "generate: constraint engine active");
         }
         // Optional `X-Session-Id` header; `None` for most clients — the request
         // correlation id comes from the inherited `request` span, not from here.
@@ -691,7 +691,7 @@ impl Generator for ArchGenerator {
                 presence_penalty = penalty_cfg.presence_penalty,
                 frequency_penalty = penalty_cfg.frequency_penalty,
                 logit_bias_len = penalty_cfg.logit_bias.len(),
-                "generate: logit penalties active (A7.3)"
+                "generate: logit penalties active"
             );
         }
         // Handle for the step_fn closure to push `is_thinking` into
@@ -1191,7 +1191,7 @@ impl Generator for ArchGenerator {
                         prompt_cache_misses = cs.misses,
                         prompt_cache_bytes = cs.bytes,
                         prompt_cache_hit_rate = hit_rate,
-                        "generate: prompt-cache stats (N19)"
+                        "generate: prompt-cache stats"
                     );
                     // Route prompt-cache stats to SQLite via SPSC drainer.
                     if let Some(ref drainer) = metrics_drainer {
@@ -1319,7 +1319,7 @@ impl Generator for ArchGenerator {
                         model_id = %model_id_for_log,
                         quant_mode = quant_mode_owned.as_str(),
                         kv_cache_bytes = kv_bytes,
-                        "generate: kv-cache bytes (N16)"
+                        "generate: kv-cache bytes"
                     );
                     // Route kv_cache_bytes to SQLite via SPSC drainer.
                     if let Some(ref drainer) = metrics_drainer {
@@ -1359,7 +1359,7 @@ impl Generator for ArchGenerator {
                     tracing::info!(
                         model_id = %model_id_for_log,
                         metal_peak_alloc_mb = peak_mb,
-                        "generate: metal peak alloc (C7)"
+                        "generate: metal peak alloc"
                     );
                     if let Some(ref drainer) = metrics_drainer {
                         use crate::metrics_drainer::{MetricEvent, MetricKind};

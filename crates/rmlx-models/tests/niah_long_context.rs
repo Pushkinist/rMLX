@@ -9,8 +9,9 @@
 //! # Models
 //!
 //! Each model is gated by its `RMLX_TEST_MODEL_*` env var (see
-//! `docs/TESTING.md`). When the env var is unset, that model's tests skip
-//! silently — the suite is green on machines without snapshots.
+//! `docs/TESTING.md`). When the env var is unset, each of that model's cells
+//! prints `[niah] SKIP` and returns — the suite is green on machines without
+//! snapshots.
 //!
 //! Covered models (one `#[test]` per (model, ctx_len, depth) cell):
 //!

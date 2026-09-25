@@ -327,7 +327,7 @@ pub(crate) async fn messages(
     if !jinja_tools.is_empty() && tool_format.is_none() {
         tracing::debug!(
             model_id = %req.model,
-            "A5.5: tools requested but no parser for this arch; passthrough"
+            "tools requested but no parser for this arch; passthrough"
         );
     }
 
@@ -545,14 +545,14 @@ pub(crate) async fn messages(
         top_p = sampling.top_p,
         top_p_source = top_p_src.as_str(),
         top_k = sampling.top_k,
-        "messages: resolved sampling params (A7.1)"
+        "messages: resolved sampling params"
     );
 
     tracing::debug!(
         model_id = %req.model,
         tool_count = norm_tools.as_ref().map_or(0, Vec::len),
         tool_choice = ?norm_tool_choice,
-        "messages: tools parsed (A5.1), injected into template (A5.2)"
+        "messages: tools parsed, injected into template"
     );
 
     let mut gen_req = GenerationRequest {

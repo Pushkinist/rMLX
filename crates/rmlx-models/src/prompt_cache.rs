@@ -71,10 +71,9 @@ use rmlx_kv_ssd::{SpillJob, SsdHydrator, SsdSpiller};
 pub(crate) use rmlx_kv_ssd::{
     chained_block_hashes_seeded, SsdHydrate, BLOCK_TOKENS, FNV_OFFSET, FNV_PRIME,
 };
-// `chained_block_hashes` (the un-seeded form) is no longer used by this module
-// directly — `find_best_prefix` now always salts with a caller-supplied seed.
-// It is still consumed by sibling `#[path]` test modules and by
-// `gemma4::prompt_cache`, which import it directly from `rmlx_kv_ssd`.
+// `chained_block_hashes` (the un-seeded form) is not used by this module:
+// `find_best_prefix` always salts with a caller-supplied seed. Only test
+// modules import it, directly from `rmlx_kv_ssd`.
 
 /// Stable per-model identity, folded into the prompt-cache key by
 /// [`cache_seed`].
@@ -367,8 +366,8 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// Block-aligned truncation: trim KV caches to `block_count` full blocks.
     ///
     /// Default delegation to `truncate_kv_to(block_count * BLOCK_TOKENS)`.
-    /// The live caller is the gemma4 partial-prefix `CacheLookup::Prefix` path
-    /// (`gemma4/generate.rs`), gated on `Gemma4Entry::can_truncate_to_block`
+    /// The live caller is the gemma4 prefix-reuse path (`Consumed::Reuse` in
+    /// `gemma4/generate/mod.rs`), gated on `Gemma4Entry::can_truncate_to_block`
     /// (every layer cache trimmable — no wrapped-SWA desync). Qwen3.5-MoE never
     /// calls it: its recurrent GDN `lin_caches` cannot be reconstructed from a
     /// block-truncated KV, so MoE is gated to full-token-equality (Exact) reuse.
@@ -1071,9 +1070,9 @@ pub(crate) enum Consumed<E> {
     /// Prefix reuse: the cloned entry covers a leading prefix of the request
     /// prompt; the arch re-prefills the remaining tail on top of it.
     ///
-    /// Only constructed for `Partial`-policy arches and the SSD-hydrated
-    /// strict-prefix case; the dense ExactOnly arch never produces it, so it
-    /// reads as dead until a prefix-reusing arch is routed through the engine.
+    /// Only constructed for `Partial`-policy arches (Gemma4 matches it) and
+    /// the SSD-hydrated strict-prefix case; an ExactOnly arch never produces
+    /// it.
     #[allow(dead_code)]
     Reuse { entry: E, kind: ReuseKind },
     /// No usable entry — re-prefill from scratch, for the reason given.
@@ -1154,12 +1153,11 @@ pub(crate) struct AttachParams {
     pub(crate) device: rmlx_mlx::Device,
 }
 
-/// unified per-arch wrapper around `PromptCache<E>`.
+/// Unified per-arch wrapper around `PromptCache<E>`.
 ///
-/// Collapses the duplicated static state that every arch's `prompt_cache.rs`
-/// used to keep (its `Mutex<Option<PromptCache<E>>>`, `Mutex<Option<Attach…>>`,
-/// plus the matching `ensure` / `attach` / `read_stats` boilerplate) into one
-/// generic type. Each arch keeps a single
+/// Holds the static state every arch's prompt cache needs (its
+/// `Mutex<Option<PromptCache<E>>>`, `Mutex<Option<Attach…>>`, plus the
+/// matching `ensure` / `attach` / `read_stats`) in one generic type. Each arch keeps a single
 /// `static PROMPT_CACHE: ArchPromptCache<MyEntry> = ArchPromptCache::new(…)`.
 ///
 /// The resident-KV byte counter is deliberately NOT here: it is per model
@@ -1168,14 +1166,14 @@ pub(crate) struct AttachParams {
 /// cross-attribute each other's byte totals.
 ///
 /// The genuinely per-arch parts that stay outside this struct:
-/// - the `Entry` struct (Gemma4 = KV only, Qwen3 = KV only, Qwen3.5-MoE =
-///   KV + LinearAttn);
+/// - the `Entry` struct (for example Gemma4 and Qwen3 = KV only, Qwen3.5-MoE
+///   = KV + LinearAttn);
 /// - the `impl HydratedEntry for Entry` block, which states what a restored
 ///   block becomes and what topology the arch reads. The probe itself is the
 ///   blanket `impl SsdHydrate<E> for SsdHydrator` in `rmlx-kv-ssd`, and the
 ///   spill side is the blanket `impl SpillSink<E> for SsdSpiller` above; both
 ///   are shared by every arch.
-/// - the in-`generate.rs` `CacheLookup` match (Exact / Prefix / Miss), which
+/// - the arch's match on the [`Consumed`] outcome (Exact / Reuse / Miss), which
 ///   queries [`ArchPromptCache::policy`] to enforce [`ReusePolicy::ExactOnly`]
 ///   as a hard runtime check.
 ///

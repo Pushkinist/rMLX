@@ -426,7 +426,7 @@ pub(crate) async fn chat_completions(
             tracing::warn!(
                 model_id = %req.model,
                 tool_count = jinja_tools.len(),
-                "A9: template does not support tools — disabling tool injection for this request"
+                "template does not support tools — disabling tool injection for this request"
             );
             jinja_tools.clear();
         }
@@ -455,7 +455,7 @@ pub(crate) async fn chat_completions(
     if !jinja_tools.is_empty() && tool_format.is_none() {
         tracing::debug!(
             model_id = %req.model,
-            "A5.4: tools requested but no parser for this arch; passthrough"
+            "tools requested but no parser for this arch; passthrough"
         );
     }
 
@@ -913,7 +913,7 @@ pub(crate) async fn chat_completions(
                             strict,
                             vocab_size = tk.get_vocab_size(true),
                             eos_ids = ?eos_ids,
-                            "A6.4: building SchemaConstraint (TokenBytesMap precompute)"
+                            "building SchemaConstraint (TokenBytesMap precompute)"
                         );
                         match crate::constraint_json::SchemaConstraint::new(
                             tk, eos_ids, schema, *strict, None,
@@ -954,7 +954,7 @@ pub(crate) async fn chat_completions(
                             request_id = %rid,
                             vocab_size = tk.get_vocab_size(true),
                             eos_ids = ?eos_ids,
-                            "A6.3: building JsonObjectConstraint (TokenBytesMap precompute)"
+                            "building JsonObjectConstraint (TokenBytesMap precompute)"
                         );
                         let c = crate::constraint_json::JsonObjectConstraint::new(tk, eos_ids);
                         let handle = c.is_thinking_handle();
@@ -966,7 +966,7 @@ pub(crate) async fn chat_completions(
                 } else {
                     tracing::warn!(
                         model_id = %req.model,
-                        "A6.3/A6.4: response_format requested but tokenizer/path \
+                        "response_format requested but tokenizer/path \
                          missing — falling back to NoOpConstraint"
                     );
                     (Some(Box::new(rmlx_models::NoOpConstraint::new())), None)

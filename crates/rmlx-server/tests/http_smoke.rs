@@ -531,7 +531,7 @@ async fn anthropic_messages_with_empty_tools_is_accepted() {
     let payload =
         r#"{"model":"x","max_tokens":10,"messages":[{"role":"user","content":"hi"}],"tools":[]}"#;
     let (status, _body) = http(port, "POST", "/v1/messages", Some(payload)).await;
-    assert_ne!(status, 400, "tools=[] must not return 400 (A5.1)");
+    assert_ne!(status, 400, "tools=[] must not return 400");
 }
 
 // ── max_tokens cap enforcement (configurable, HTTP 400) ──────────────────
@@ -1070,7 +1070,7 @@ async fn openai_tools_payload_is_accepted() {
     // Must NOT be 400; unknown model gives 404.
     assert_ne!(
         status, 400,
-        "tools payload must not be rejected (A5.1), body: {body}"
+        "tools payload must not be rejected, body: {body}"
     );
     assert_eq!(status, 404, "unknown model should give 404, body: {body}");
 }
@@ -1098,7 +1098,7 @@ async fn anthropic_tools_payload_is_accepted() {
     let (status, body) = http(port, "POST", "/v1/messages", Some(payload)).await;
     assert_ne!(
         status, 400,
-        "tools payload must not be rejected (A5.1), body: {body}"
+        "tools payload must not be rejected, body: {body}"
     );
     assert_eq!(status, 404, "unknown model should give 404, body: {body}");
 }
@@ -1343,7 +1343,7 @@ async fn openai_sampling_params_all_fields_accepted() {
     let (status, body) = http(port, "POST", "/v1/chat/completions", Some(payload)).await;
     assert_ne!(
         status, 400,
-        "sampling params must not return 400 (A7.1), body: {body}"
+        "sampling params must not return 400, body: {body}"
     );
     // Unknown model → 404; the sampling fields did not cause a rejection.
     assert_eq!(status, 404, "unknown model must return 404, body: {body}");

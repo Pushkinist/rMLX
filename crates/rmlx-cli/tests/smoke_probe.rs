@@ -108,7 +108,7 @@ fn smoke_probe_gemma4_mxfp8_is_clean() {
             1,   // smoke probe: single-slot cache
             &[], // smoke probe: no EOS-stop, force full 8 steps
             &mut |_| None,
-            None, // A6.2: no sampler constraint in smoke probe.
+            None, // No sampler constraint in smoke probe.
             &smoke_sampler_cfg,
             &mut smoke_rng,
             &smoke_penalty_cfg,

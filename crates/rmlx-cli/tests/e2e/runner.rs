@@ -1091,10 +1091,9 @@ fn pick_port(case: &Case) -> u16 {
 /// via the OpenAI logprobs `bytes` field) at temp=0 greedy and compare it to a
 /// recorded golden file under `tests/e2e/golden/<case_id>.json`.
 ///
-/// * Golden file ABSENT (and not in regen mode) → `Skip` with "no golden
-///   recorded" — we do NOT silently downgrade to a substring check.
-/// * `RMLX_E2E_REGEN_GOLDEN=1` or first run with the file absent → WRITE the
-///   golden and `Pass`.
+/// * `RMLX_E2E_REGEN_GOLDEN=1`, or a run with the file absent → WRITE the
+///   golden and `Pass`. An absent golden therefore passes; it never
+///   downgrades to a substring check.
 /// * Golden present → byte-for-byte compare; any divergence is `Fail` with the
 ///   first mismatching position.
 ///
@@ -1472,8 +1471,9 @@ fn assert_thinking(port: u16, id: &str, mk: &dyn Fn(Verdict, String) -> CaseResu
             format!("reasoning_content empty; content={:?}", trunc(&content)),
         );
     }
-    // budget enforced: thinking_budget=64 → reasoning should not be runaway.
-    // answer correct: 17*4 = 68 should appear in content or reasoning.
+    // The budget itself is not asserted: this checks only that reasoning is
+    // non-empty and that the answer (17*4 = 68) appears in content or
+    // reasoning.
     let answered = content.contains("68") || reasoning.contains("68");
     if answered {
         mk(
