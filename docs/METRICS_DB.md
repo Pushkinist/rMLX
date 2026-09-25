@@ -24,14 +24,13 @@ query. `BENCHMARK_CHAMPIONS.md` is generated from `bests` (§9).
 - **Git**: `.rmlx/` and `metrics/` are git-ignored. Never commit the DB.
 - **Other repos** reach the same file through `--db`, `RMLX_METRICS_DB` or a
   symlink. There is one DB, not one per repo.
-- **Connection**: every open sets `journal_mode=WAL`, `synchronous=NORMAL`,
-  `foreign_keys=ON` and `busy_timeout=5000` (`schema::apply_pragmas`).
+- **Connection**: every open through `rmlx_metrics::schema` sets
+  `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON` and
+  `busy_timeout=5000` (`schema::apply_pragmas`).
 - **Sub-tree** under `<RMLX_HOME>/metrics/`:
   - `buffer/pending/`: the ingest queue (§8.4).
   - `buffer/failed/`: records that `--replay-pending` rejected.
   - `backups/`: `backup` and `restore` snapshots (§10.1).
-  - `legacy/`: read-only archive of files from before the DB. No tool reads
-    it.
 - Take a snapshot with `rmlx metrics backup` before any bulk operation.
 
 ---
@@ -737,8 +736,8 @@ drop that codec's rows at ingest.
 `identity::canonicalize_kv_quant` trims and lowercases the value and maps
 `bf16` and `f16` to `none`, and `rotor_v_3` / `rotor_v_4` to `rotor3` /
 `rotor4`. Any other value passes through. `RunRecordBuilder::rmlx` and the
-legacy importer (§7) apply it; a JSON record is stored as it spells the
-field.
+JSONL pass of the legacy importer (§7) apply it. A JSON record is stored as
+it spells the field.
 
 ### 5.4 `backend` whitelist
 
@@ -817,7 +816,11 @@ the `backend_version` check (§8.5.1). Archive rows have no version to state.
 It is idempotent. Each imported row carries `legacy_run_key=<hex>` at the
 start of `notes`, and a row whose key is already present is skipped.
 
-It drops archive entries that write `0.0` for an unmeasured column (§4.1).
+It drops every archive value outside its §4.1 bounds and counts the drops
+as `metrics_dropped_implausible`. The CSV pass also drops
+`task_pass_at_1 = 0`, which CBB writes when it ran no quality probe. The CSV
+and Markdown passes store `kv_quant` through the importer's own
+`normalize_kv_quant`.
 
 ### 7.1 Sources
 
@@ -866,10 +869,11 @@ Scripts in other languages shell out to it and never write the DB directly.
 ### 8.1 Who writes `observations`
 
 - `rmlx metrics record`, from a buffer file, an argument or stdin.
-- `rmlx baseline --record` and `rmlx eval ppl`. Each writes a buffer file,
-  then records it in-process (§8.4).
-- The server's metrics drainer (`crates/rmlx-server/src/metrics_drainer.rs`),
-  through `RunRecordBuilder::rmlx`.
+- `rmlx baseline --record`, and `rmlx eval ppl` when given `--corpus`. Each
+  writes a buffer file, then records it in-process (§8.4).
+- The server's metrics drainer (`crates/rmlx-server/src/metrics_drainer.rs`).
+  It builds records with `RunRecordBuilder::rmlx` and inserts them directly,
+  with no buffer file.
 - `rmlx metrics migrate`, for archives only (§7).
 
 The `events` table is written only by `EventRecorder` in the running binary
@@ -881,19 +885,22 @@ The `events` table is written only by `EventRecorder` in the running binary
 TPS and `kv_cache_bytes` over repeated runs of one cell. It prints medians
 with the observed range and **writes nothing**: no buffer file and no row.
 `observations` is append-only, and `bench` exists to establish a number and
-its spread, including the runs that get thrown away. `rmlx baseline --record`
+its spread, including runs that the operator throws away. `rmlx baseline --record`
 writes a figure worth keeping.
 
-`bench` refuses five things: a run served from the prompt cache, a KV-byte
-figure the run did not report, a metric that trended, runs that decoded
-different tokens, and `--runs 1`. A recording path that measures the same
-quantities refuses on the same conditions.
+`bench` refuses a figure it cannot attribute to the measured run. Examples
+are a run served from the prompt cache or the SSD tier, a KV-byte count the
+run did not report, and a metric that trended. The full set is in
+`crates/rmlx-cli/src/commands/bench.rs`. A recording path that measures the
+same quantities refuses on the same conditions.
 
-The two paths that write `kv_cache_bytes` hold that rule: `rmlx baseline
---record` and the server's speculative-decode request boundary. Each samples
+The three paths that write `kv_cache_bytes` hold that rule: `rmlx baseline
+--record`, the server's plain generation path
+(`crates/rmlx-server/src/engine/arch_generator.rs`) and its speculative
+request boundary (`engine/speculative.rs`). Each samples
 `kv_cache_bytes_sample()` before and after the generation. When the store
-sequence did not advance, the figure belongs to an earlier generation. Both
-paths then `warn!` and omit the row.
+sequence did not advance, the figure belongs to an earlier generation. Each
+path then `warn!`s and omits the row.
 
 ### 8.2 Subcommands
 
@@ -917,7 +924,7 @@ unless the table says otherwise.
 | `timeseries --metric M [--bucket day\|week]` | Mean per day or week for one cell and metric. |
 | `champions [--backend B] [--jsonl]` | One row per model, weight quant and KV quant, with one column per metric. |
 | `regress --model <substring> --metric M [--kv K] [--threshold-pct P]` | Latest observation against the champion. Exits 0 within `P` % (default 1.0), 1 on a regression, 125 with no champion or no observation. |
-| `deltas --since-sha <sha> [--threshold-pct P] [--exit-code false]` | Per cell and metric: the best after the SHA's first row (else the champion) against the best up to it. Prints the moves beyond `P` % (default 5.0) and the cells with no value up to it. Exits 1 on a regression, 125 when no printed cell has a value up to it. `--exit-code false` always exits 0. A SHA with no rows is an error. |
+| `deltas --since-sha <sha> [--threshold-pct P] [--exit-code false]` | Per cell and metric: the best after the SHA's first row (else the champion) against the best up to it. Prints the moves beyond `P` % (default 5.0) and the cells with no value up to it. Exits 1 on a regression. Exits 125 when it prints cells and none has a value up to it, and 0 when it prints nothing. `--exit-code false` always exits 0. A SHA with no rows is an error. |
 | `describe --observation-id N \| --run-id R --text T` | Sets `description` (§6). |
 | `query "<SELECT …>"` | Runs one statement that starts with `SELECT` and prints TSV with a header. |
 | `open [--readonly]` | Starts `sqlite3` on the DB; `--readonly` passes `-readonly`. |
@@ -1060,9 +1067,11 @@ is ignored. **Required keys**, and what `RunRecord::validate` checks:
 - `{ "sha256": "<64 hex>" }` names a registered prompt. The recorder refuses
   a hash that is not in `prompts`.
 
-`rmlx metrics record` also accepts two older buffer shapes, converted by
-`legacy_ingest::try_parse_legacy` and `legacy_ingest::try_parse_cbb`. New
-emitters write the shape above.
+`rmlx metrics record` also accepts two older buffer shapes. The legacy
+bench-script shape (`model_name`, `max_ctx`, `observations`) is converted by
+`legacy_ingest::try_parse_legacy`. The CBB runner shape (compound
+`weight_quant`, display backend names) is converted by
+`legacy_ingest::try_parse_cbb`. New emitters write the shape above.
 
 ### 8.5.1 Run identity (hard rule)
 
@@ -1098,15 +1107,17 @@ carry.
 
 - An `rmlx` record needs a semver-shaped `backend_version`: `MAJOR.MINOR.PATCH`
   with an optional `-pre` or `+build` suffix. A missing, empty or other value
-  is refused and exits 1, and the buffer file stays for triage.
+  is refused. `record` exits 1 and leaves the file in place;
+  `--replay-pending` moves it to `buffer/failed/` and exits 2.
 - Other backends keep `backend_version` optional and free-form.
 - `git_sha` is never required.
 
 The check proves the shape, not the source. A hand-written buffer file can
 carry any semver-shaped version. `RunRecord` is `#[non_exhaustive]`, and its
-identity fields are `pub(crate)` behind getters. Rust code outside the crate
-therefore builds one only through `RunRecordBuilder` and cannot change one
-after it is built.
+identity fields are `pub(crate)` behind getters. Its other fields are `pub`.
+Rust code outside the crate gets a `RunRecord` from `RunRecordBuilder` or by
+deserializing JSON (`serde_json::from_value`, as `rmlx baseline` and `rmlx
+eval` do). Either way it cannot change the identity fields afterwards.
 
 **Identity is stamped at emit time, into the buffer file, never at ingest
 time.** A buffer replayed by a newer binary keeps the identity of the build
@@ -1130,7 +1141,7 @@ It runs `RunRecord::validate`, the recorder's own check, and prints one `ok`
 line or exits 1. There is no separate JSON Schema file; a second copy of the
 contract would drift. Two things pass here and can still fail in `record`: a
 `sha256` prompt that is not registered, and a transaction error. `validate`
-does not try the older shapes that `record` converts.
+does not try the legacy and CBB shapes that `record` converts.
 
 ### 8.7 Prompt ownership — rMLX is the source-of-truth
 
@@ -1241,9 +1252,10 @@ telemetry, and are not gated.
 
 ### 10.2 Retention policy
 
-- `observations` is append-only. No command deletes a row. Two commands
-  update one: `describe` sets `description`, and `doctor --fix` corrects
-  `unit` and `direction` from the registry.
+- `observations` is append-only. No command deletes a row. Three things
+  update one: `describe` sets `description`; `doctor --fix` corrects `unit`
+  and `direction` from the registry; the post-hooks of migrations 6, 7 and 8
+  rewrite `decode_config` (`migrate::schema_runner`).
 - `bests` is a view and holds no rows.
 - `prompts` rows stay; `observations.prompt_id` references them. A changed
   prompt body is a new row.
@@ -1273,8 +1285,10 @@ do not fail it.
    `weight_quant` against their §5 lists, and `metric` against the registry.
    Error, naming the value and a row id. The `kv_quant` sweep cannot fail,
    because the field is free-form (§5.3).
-5. `direction` against the registry. Error; `--fix` corrects it.
-6. `unit` against the registry. Error; `--fix` corrects it.
+5. `direction` against the registry. Error; `--fix` corrects it, and the
+   run that corrects it still exits 1.
+6. `unit` against the registry. Error; `--fix` corrects it, and the run that
+   corrects it still exits 1.
 6b. Values outside their §4.1 bounds, per metric, with a count and the first
     row id. Warning, never repaired: the rows cannot be corrected, only
     re-measured.
@@ -1312,8 +1326,7 @@ change to what `bests` publishes, such as a §4.1 bounds change.
 
 ## 13. Operating rules (instruction summary)
 
-1. **The DB is the source of truth.** `metrics/legacy/` is an archive; never
-   read or extend it.
+1. **The DB is the source of truth.**
 2. **Path**: `<RMLX_HOME>/metrics/runs.db`, git-ignored (§2). Back up before
    bulk operations.
 3. **Tables**: `prompts`, `observations` and `events`, the `bests` view, and
@@ -1334,14 +1347,15 @@ change to what `bests` publishes, such as a §4.1 bounds change.
 11. **`BENCHMARK_CHAMPIONS.md` is generated** with `make metrics-export`,
     never hand-edited (§9).
 12. **`hardware_tag` is run context**, not cell identity (§5.5).
-13. **WAL and `foreign_keys=ON`** are set on every connection. Never disable
-    them.
+13. **WAL and `foreign_keys=ON`** are set on every connection opened through
+    `rmlx_metrics::schema`. Never disable them.
 14. **All tooling is `rmlx metrics …`.** Other languages shell out and never
     write the DB directly.
 15. **Every backend emits the §8.5 shape.** One run is one record and one
     transaction.
 16. **Prompts live in `prompts/*.json`** and are content-addressed (§8.7).
-17. **Buffer every record** (§8.4). Replay with `--replay-pending`.
+17. **Buffer every record** (§8.4). Replay with `--replay-pending`. The
+    server's metrics drainer is the one writer that inserts directly.
 18. **Every row carries `inserted_by`.**
 19. **Run `rmlx metrics doctor`** after migrations and before any operation
     on a DB in a suspect state (§10.4).
