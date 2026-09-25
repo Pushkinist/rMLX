@@ -3240,151 +3240,70 @@ over the query heads of a GQA group and over the prompts.
 
 ---
 
-## Retired: the per-arch default table (composite-score audit)
+## Qwen MoE rejects low-bit K codecs
 
-Between 2026-05 and this change, `auto` resolved through a per-arch table
-scored by a 3-term composite (0.571 x decode TPS + 0.286 x cosine + 0.143 x
-1/mem_bits). The table and the audit behind it are **gone**: `auto` is
-unquantised bf16 on every arch (see "The auto default").
+`validate_resolved` (`crates/rmlx-models/src/kv_cache/cache_type.rs`) rejects
+these codecs when the arch class is `Qwen3_5MoeForConditionalGeneration` or
+`Qwen3VLMoeForConditionalGeneration`:
 
-The audit is not merely superseded, it was scoring a quantity that no longer
-exists. Its `mem_norm` term ranked codecs by packed-store bit width, and the
-bf16-mirror codecs it ranked build no packed store - their resident KV is
-bf16's, byte for byte. Its `decode_tps` term was recorded before the store
-elision and the f32-leak fixes moved both arms. Re-running it would not restore
-a table; it would have to be designed against what the codecs cost today.
+| Codec | Error |
+|---|---|
+| `Mixed` with `k_bits < 8` | `QwenMoeKBitsTooLow(k_bits)` |
+| `PlanarK` | `QwenMoePlanarKRejected` |
+| `Iso3Sym`, `Iso4Sym`, `IsoKOnly3`, `IsoKOnly4` | `QwenMoeIsoKRejected` |
+| `Rotor3Sym`, `Rotor4Sym`, `RotorKOnly3`, `RotorKOnly4`, `RotorK3Asym`, `RotorK4Asym` | `QwenMoeRotorKRejected` |
+| `TurboSym3` | `QwenMoeTurboKRejected` |
+| `TurboSym4` | `QwenMoeKBitsTooLow(4)` |
 
-**Operator-visible consequence.** An operator who passed no `--kv-quant` and
-relied on the table now gets bf16. Output is byte-identical at temp=0 for every
-arch whose table entry was a bf16-mirror codec (`K8V8`, `K8V4`, `Planar`),
-because those codecs already decoded off the bf16 mirror. It is **not**
-byte-identical for the one entry that read its store - `Qwen3ForCausalLM` at
-`weight_bits == 2`, which defaulted to `Mixed{k8g64,v4g64}` - where the old
-default was lossy and bf16 is the reference. Pass
-`--kv-quant mixed_k8g64_v4g64` to reproduce the old bits. `k8vturbo3`, which
-the table briefly selected for Gemma4 small, is likewise still available by
-name and simply never automatic.
+Every other codec stores K at 8 bits or wider and passes. On any other arch
+class `validate_resolved` rejects nothing.
+`qwen_moe_low_k_bits_rejected_post_decompose`
+(`crates/rmlx-models/src/kv_cache/cache_type_tests.rs`) tests the rejection.
 
-The Qwen-MoE K-width rejection table below is independent of all this and
-still stands.
+### What the guard keys off
 
----
-
-### A.y guard re-verification
-
-`validate_resolved` (in `crates/rmlx-models/src/kv_cache/cache_type.rs`) was
-inspected and confirmed to reject K-side ≤4-bit codecs on Qwen MoE arches:
-
-- `TurboSym4` → `QwenMoeKBitsTooLow(4)`
-- `PlanarK` → `PlanarKOnQwenMoe`
-- `Iso3Sym`, `Iso4Sym`, `IsoKOnly3`, `IsoKOnly4` → `IsoKOnQwenMoe`
-- `Rotor3Sym`, `Rotor4Sym`, `RotorKOnly3`, `RotorKOnly4` → `RotorKOnQwenMoe`
-- `TurboSym3` → `TurboSym3KOnQwenMoe`
-
-None of these K-side codecs is ever selected by `auto`, on Qwen MoE or
-anywhere else - `auto` is bf16. The rejection table itself has not been
-weakened by the codec adds.
-
-#### What the guard keys off
-
-`validate_resolved` takes an architecture *string*, and which string it is
-handed decides whether the guard can fire at all.
+`validate_resolved` takes an architecture *string*. Which string it is handed
+decides whether the guard can fire.
 
 Both Qwen3.5 arch strings (`Qwen3_5MoeForConditionalGeneration` and the dense
-`Qwen3_5ForConditionalGeneration`) load through one loader into one
-`Architecture` variant. The loader does **not** believe the declaration: it
-selects dense-vs-sparse-MoE per layer from the tensor witness
-`mlp.switch_mlp.gate_proj.weight`. So `architectures[0]` and the model that
-actually gets built can disagree, and a checkpoint declaring the dense name
-while shipping MoE tensors used to run every codec in the list above to
-completion — no error, only wrong output.
+`Qwen3_5ForConditionalGeneration`) load into one `Architecture` variant. The
+loader selects dense or sparse MoE per layer from the tensor witness
+`mlp.switch_mlp.gate_proj.weight`, not from the declaration. So
+`architectures[0]` and the built model can disagree.
 
 The enforcing check is therefore keyed on the **resolved** architecture:
 
 - `Architecture::arch_class()` reports what the loader built. For the Qwen3.5
-  variant it asks `has_sparse_moe_layers()` rather than echoing a fixed string.
-- `Architecture::validate_kv_quant()` re-runs the table against that resolved
-  class, after load and before any KV cache exists.
+  variant it asks `has_sparse_moe_layers()`.
+- `Architecture::validate_kv_quant()` runs `validate_resolved` against that
+  class, before any KV cache exists.
 - `load_model` emits a `warn!` naming `declared_arch` and `resolved_arch` when
-  they differ, because that mismatch invalidates every predicate still keyed on
-  the declared name. Deliberate aliases (`registry::is_declared_arch_alias` —
-  today only Gemma4-unified) are exempt and log at `debug!`, so the warning
-  stays meaningful.
+  they differ. A deliberate alias (`registry::is_declared_arch_alias`, today
+  only Gemma4-unified) logs at `debug!` instead.
 
-The enforcement has to sit on **every path that builds a KV cache**, not on the
-one that reads the architecture. There are two such families, and they do not
-share a call graph:
+The check sits on every path that builds a KV cache. There are two families,
+and they do not share a call graph:
 
 | Path | Cache built by | Enforced at |
 |---|---|---|
-| Non-speculative | per-arch `generate_greedy` (`gemma4`, `gemma3`, `qwen2`, `qwen3`, `qwen3_5_moe`, `qwen3_vl_moe`, `laguna`, `bitnet`), reached only from `Architecture::generate_greedy` / `generate_image` | those two methods, plus `ArchGenerator::new` at startup |
-| Speculative | `speculative::{mtp,dflash,eagle3,gemma4_assistant,mod}` build the verifier's caches directly — they never call `Architecture::generate_greedy` | `SpeculativeGenerator::new` at startup, and the per-request seam in its `generate` |
+| Non-speculative | per-arch `generate_greedy` (`gemma4`, `gemma3`, `qwen2`, `qwen3`, `qwen3_5_moe`, `qwen3_vl_moe`, `laguna`, `bitnet`), reached only from `Architecture::generate_greedy` / `generate_image` | those two methods, and `ArchGenerator::from_snapshot_with_id` at startup |
+| Speculative | `speculative::round_common::cache_stack` builds the verifier's caches; `Architecture::generate_greedy` is never called | `SpeculativeGenerator::from_snapshots_with_id` at startup, and its per-request `generate` |
 
-Drafter-side caches are constructed with a hardcoded `KvQuant::None`, which
-passes every arch invariant by construction and needs no check.
-
-Startup checks are the fast-feedback copy (`exit 78` / a failed load rather than
-a per-request failure after a successful launch); the per-request checks are the
-enforcing copy, because a `kv_quant` field on a request arrives after startup and
-the server's resolver does not validate it.
+The MTP and Eagle3 drafter caches use `KvQuant::None`, which every arch
+accepts. The two-model paths build the draft model's stack with the verifier's
+codec, and only the verifier is checked.
 
 The startup resolvers (`rmlx-cli` `resolve_kv_quant`, the server's
-`resolve_kv_quant_for_load`) still read `architectures[0]` — they run before
-the model is loaded, so it is the only value available. They stay as the
-fast-feedback path (`exit 78` at launch); they are no longer the only check.
+`resolve_kv_quant_for_load`) read `architectures[0]`, because they run before
+the model loads. The CLI resolver exits 78 on a rejected `--kv-quant`. The
+per-request checks are the enforcing copy. A request's `kv_quant` field
+arrives after startup, and `resolve_kv_quant_for_load` does not validate it.
 
-Empirical positive test: `qwen_moe_low_k_bits_rejected_post_decompose`
-in `crates/rmlx-models/src/kv_cache/cache_type_tests.rs` verifies the
-runtime rejection path. The declared-vs-resolved bypass is covered by
-`crates/rmlx-models/tests/resolved_arch_class.rs`, which builds a snapshot
-that declares dense while shipping MoE tensors and asserts the guard fires.
-
-#### The guard's stated premise does not reproduce on 8:1 GQA
-
-The K-side bit floor is justified upstream by a claim that GQA *amplifies*
-K-side quantization error — one K head serving many query heads, so its error
-is said to compound with the ratio. That prediction was tested directly, as a
-needle-in-a-haystack retrieval screen across the rotation-based K codecs at two
-architectures (an 8:1 shared-KV Gemma4 and a 4:1 dense Qwen3), two contexts and
-five needle depths, against a criterion declared before any cell ran.
-
-**It does not fire.** Retrieval is perfect in every treatment cell, on both
-ratios, and the precondition arm (`none`) passed, so the run is valid rather
-than void. The 8:1 arm was in fact *less* perturbed than the 4:1 arm by greedy
-digest — the opposite of the amplification prediction, and the direction the
-rotation predicts, since these codecs decorrelate before quantizing. That is
-reported as direction only: the two arms are not coverage-matched and their
-head widths differ, so it is not a ratio.
-
-Codec liveness was confirmed on device rather than inferred from the enum —
-`decode_reads_packed_store` true for the K-only iso variant, no bf16 K seed
-allocated, and per-cell dispatch counters equal to decode steps × the arch's
-quantized-layer count exactly, against zero for `none` and `k8v8`.
-
-**No guard was added and none is warranted**: a geometry-keyed screen built on
-this would gate a variable with no measured effect. The upstream perplexity
-figure behind the bit floor remains an unbacked external claim, and byte-exact
-needle retrieval at 8:1 is incompatible with catastrophic degradation. The
-floor itself stays — this measurement removes a *rationale*, not a rejection
-rule, and re-litigating the rule needs a perplexity cell, which NIAH is not.
-
-One limit, stated because it bounds the claim: NIAH excludes catastrophic
-degradation outright but cannot resolve *subtle* degradation on the shared-KV
-arch, where the greedy digest separated in too few cells to carry a null.
-The verdict rests on retrieval rate and the dispatch counter, never on digest
-divergence — the digest was not leaned on where it was measured blind.
-
-**Two premises this section used to imply are false.** Sliding layers
-short-circuit to bf16 before any K-codec arm, so **only full-attention layers
-carry the codec** on a Gemma4 stack, and boundary promotion protects none of
-the long-range ones — it lands on cacheless consumers and sliding layers. The
-treatment on those layers is therefore total, not diluted; an argument that
-reasons from a whole-stack layer count will get the dilution backwards. And
-digest identity does not imply a void cell: see §"Class 3" for the same trap
-measured from the other side.
+`crates/rmlx-models/tests/resolved_arch_class.rs` relabels a MoE snapshot as
+dense and asserts that the guard still fires. It is `#[ignore]` and needs the
+`mlx-community__Qwen3.6-35B-A3B-8bit` snapshot (or `RMLX_TEST_MODEL_QWEN36`).
 
 ---
-
 
 ## Codec fidelity — measured
 
@@ -3396,212 +3315,171 @@ the GPU. See `docs/TESTING.md` for how to run them and for the helper list.
 
 `crates/rmlx-kv-quant/src/rotation_fidelity_tests.rs`.
 
-The per-codec cosine gates all run on the i.i.d.-uniform LCG fixture, which is
-already close to maximally incoherent (mean `mu = sqrt(d)·max|x_i|/||x||_2` of
-1.72 at `head_dim = 128`, against a minimum of 1). A decorrelating rotation
-cannot improve that and in fact makes it slightly worse — the Hadamard pushes
-uniform toward Gaussian, whose `mu` is 2.87. **The LCG cosine gates therefore
-carry no information about rotation quality: an identity rotation passes every
-one of them.**
+The incoherence of a row is `mu = sqrt(d)·max|x_i|/||x||_2`. It is 1 for a
+flat row and `sqrt(d)` for a one-hot row.
 
-The outlier fixture is i.i.d. Gaussian with 4 of 128 channels scaled 20x, a
-model of the persistent per-channel Key outliers reported by KIVI
-(arXiv:2402.02750) and KVQuant (arXiv:2401.18079) at the magnitude ratio
-reported for emergent outlier features (arXiv:2208.07339). Mean `mu` = 8.37
-(p99 10.72).
+The per-codec cosine gates run on the i.i.d.-uniform LCG fixture. For i.i.d.
+data `mu` is the expected maximum of `d` samples in sigma units. At
+`head_dim = 128` that is about 1.71 for uniform and 2.83 for Gaussian. A
+Hadamard pushes uniform toward Gaussian and so raises `mu`. **The LCG cosine
+gates therefore carry no information about rotation quality: an identity
+rotation passes every one of them.**
 
-The channel **count** is not from the literature — 4 of 128 is 3.1%, some 30x
-denser than the reported emergent-outlier fraction. It is chosen so that every
-affine group of 64 contains an outlier, the condition under which a
-full-dimension rotation has something to recover across the whole row. Both
-fixture parameters are swept rather than asserted: `mu` against the ratio is
-monotone, and `mu` against the channel count rises, peaks near 2 channels, then
-decays back to exactly the i.i.d. value once every channel is scaled (a pure
-change of units, which `mu` is invariant to).
+The outlier fixture is i.i.d. Gaussian with 4 of 128 channels scaled 20x. It
+models the per-channel Key outliers reported by KIVI (arXiv:2402.02750) and
+KVQuant (arXiv:2401.18079). The ratio is the magnitude reported for emergent
+outlier features (arXiv:2208.07339).
+`outlier_fixture_is_adversarial_and_iid_fixtures_are_not`
+(`test_utils_tests.rs`) asserts a mean `mu` of at least 5.0 for it. The
+i.i.d. fixtures stay under 5.0.
 
-A block-`b` orthogonal transform can reduce `mu` by at most `sqrt(b)`: the peak
-coordinate's block preserves its L2 norm, and a `b`-vector's max is at least
-its norm over `sqrt(b)`. Measured on the outlier fixture at `head_dim = 128`:
+The channel **count** is not from the literature. 4 of 128 is denser than the
+reported outlier fraction. It puts an outlier in every affine group of 64,
+where `rot_k` sets its scale. Tests sweep both fixture parameters. `mu` rises
+monotonically with the ratio. Against the channel count it rises, peaks, then
+returns exactly to the i.i.d. value once every channel is scaled.
 
-| Family | Transform | Block | `mu` ceiling | `mu` reduction |
+A block-`b` orthogonal transform can reduce `mu` by at most `sqrt(b)`. The
+peak coordinate's block keeps its L2 norm, and a `b`-vector's maximum is at
+least its norm over `sqrt(b)`. On the outlier fixture at `head_dim = 128`:
+
+| Family | Transform | Block | `mu` ceiling | Gate |
 |---|---|---|---:|---:|
-| `rot_k` / `RotK` | Walsh-Hadamard, full `head_dim` | 128 | 11.31x | **3.89x** |
-| `iso3` / `iso4` | isoclinic SO(4), fixed quaternion | 4 | 2.00x | 1.38x |
-| `planar3` | Givens, 16-entry codebook, per-pair search | 2 | 1.41x | 1.19x |
-| `planar4` | Givens, 16-entry codebook, per-pair search | 2 | 1.41x | 1.15x |
-| `rotor3` / `rotor4` | Cl(3,0) rotor sandwich, static per (layer, head) | 3 | 1.73x | 1.08–1.21x |
+| `rot_k` / `RotK` | Walsh-Hadamard, full `head_dim` | 128 | 11.31x | ≥ 3.0x |
+| `iso3` / `iso4` | isoclinic SO(4), fixed quaternion | 4 | 2.00x | pinned 1.3846x |
+| `planar3` | Givens, 16-entry codebook, per-pair search | 2 | 1.41x | pinned 1.1910x |
+| `planar4` | Givens, 16-entry codebook, per-pair search | 2 | 1.41x | pinned 1.1518x |
+| `rotor3` / `rotor4` | Cl(3,0) rotor sandwich, static per (layer, head) | 3 | 1.73x | pinned 1.0815x |
 
-The rotor row is a range, not a point. Only the groups holding outlier channels
-move `mu` — four rotors of 43 at `head_dim = 128` — so a single `(layer, head)`
-table is a four-sample estimate. Across eight draws the reduction spans
-1.0815x–1.2089x; the gate pins the weakest, so it describes the family rather
-than one layer.
+A pinned family must stay under its ceiling and above its pin minus 0.05. The
+`rot_k` gate at 3.0x needs an effective block of at least 9. No block-local
+family and no block-4 truncation of the Hadamard can reach it.
 
-Only `rot_k` applies a full-dimension transform. The block-local families
-deliver between 1.15x and 1.38x, well under their own ceilings, because their
-rotations are fixed (iso, rotor) or fitted to reconstruction error rather than
-to incoherence (planar). **This is not a defect in them** — they buy packing
-efficiency, a different axis — but the "rotation" naming implies a capability
-only one family has.
+The rotor pin is the weakest of eight `(layer, head)` rotor tables. Only the
+groups that hold an outlier channel move `mu`, four of 43, so one table is a
+four-sample estimate.
 
-`rot_k` end to end, against the identical `affine q8 group=64` quantizer with
-the Hadamard deleted:
+Only `rot_k` applies a full-dimension transform. The block-local families stay
+well under their ceilings. Their rotations are fixed (iso, rotor) or fitted to
+reconstruction error rather than to incoherence (planar). **This is not a
+defect in them**: they buy packing efficiency, a different axis. The iso
+quaternion keeps `phi/sqrt(5) = 0.72` of a lone large coordinate, hence about
+1.38x.
 
-| Fixture | rotated | unrotated | delta |
-|---|---:|---:|---:|
-| outlier channels | 46.95 dB | 36.06 dB | **+1.81 bits** |
-| i.i.d. uniform (LCG) | 44.53 dB | 48.30 dB | **−0.63 bits** |
+`rot_k` end to end, against the same `affine q8 group=64` quantizer without
+the Hadamard:
+`rot_k_hadamard_buys_bits_on_outlier_data_and_costs_them_on_iid_data` asserts
+at least 1.5 bits of SQNR gained on the outlier fixture and a loss on the
+i.i.d. uniform one.
 
-The rotation is worth most of two bits where it matters and costs two thirds of
-a bit where it does not. Both directions are gated.
-
-The gain is exactly `log2(peak_plain / peak_rotated)` over the affine group,
-which is the same quantity the block ceiling bounds: a block-`b` transform can
-buy at most `0.5·log2(b)` bits. That is what makes the 1.5-bit gate a
-separation rather than a fitted number — it demands an effective block of 8 or
-more. Substitutes measure 0.91 bits (the same Hadamard truncated to blocks of
-4) and 0.47 (the iso quaternion), both rejected.
+The gain is exactly `log2(peak_plain / peak_rotated)` over the affine group.
+The block ceiling bounds the same quantity: a block-`b` transform can buy at
+most `0.5·log2(b)` bits. So the 1.5-bit gate demands an effective block of 8
+or more. `non_full_dimension_rotations_fail_the_rot_k_gain_gate` checks that
+the block-4 Hadamard and the iso quaternion stay under it.
 
 ### The turbo family's missing rotation — what it is worth, and where
 
 TurboQuant is named for a rotation this tree does not apply. The shipped codec
 quantizes raw KV against a Lloyd-Max codebook with no decorrelating transform,
-at any width, on either axis: `crates/rmlx-kv-quant/src/turboquant.rs` contains
-no Hadamard or Walsh-Hadamard code at all. The on-disk layout tags say so too:
-`TURBOSYM3_LAYOUT_TAG` / `TURBOSYM4_LAYOUT_TAG` are `tsym3_lloyd_3_3` /
-`tsym4_lloyd_4_4`, naming the codebook the encoder applies. Because hydrate
-dispatches on exact string equality, a tag is a stored format and any change to
-one needs a `SCHEMA_VERSION` bump.
+at any width, on either axis. `crates/rmlx-kv-quant/src/turboquant.rs` has no
+Hadamard code. The layout tags `TURBOSYM3_LAYOUT_TAG` / `TURBOSYM4_LAYOUT_TAG`
+are `tsym3_lloyd_3_3` / `tsym4_lloyd_4_4` and name the codebook. SSD hydrate
+dispatches on exact tag equality, so a tag is a stored format. Changing one
+needs a `SCHEMA_VERSION` bump.
 
-Whether adding the transform is worth its implementation cost was measured
-*before* any transform code was written, by
-`crates/rmlx-kv-quant/src/turbo_rotation_fidelity_tests.rs`. It holds the turbo
-codec, the width and the group size fixed and moves only a full-`head_dim`
-normalized FWHT in and out around the shipped CPU encoder. A test-side reference
-rotation is a controlled ablation and needs no codec change — which is why the
-gate could precede the implementation, and why "there cannot be an ablation
-until the rotation exists" was wrong.
+`crates/rmlx-kv-quant/src/turbo_rotation_fidelity_tests.rs` measures what the
+transform would be worth. It holds the codec, the width and the group size
+fixed. It moves only a full-`head_dim` normalized FWHT in and out around the
+shipped CPU encoder.
 
-**The result inverts the family's cost structure.** Run the gate for the
-figures; the ordering is what matters here:
+What its gates assert, at every width the codebook accepts (1 to 4 bits):
 
-| data shape | rotation is worth | implementing it costs |
-|---|---|---|
-| K-shaped (outlier channels) | order of a bit to two bits | reuses `maybe_pre_rotate_q_gpu` — close to wiring |
-| V-shaped (i.i.d. Gaussian) | order of a hundredth of a bit | an explicit inverse transform after SV accumulation: the P2 kernel, four dequant kernels, both fused-QK kernels |
+- **K-shaped data** (outlier fixture): the full Hadamard beats a block-4
+  Hadamard, which beats no transform. The gain shrinks as the codebook widens.
+  It clears the 1.5-bit `ROT_K_MIN_OUTLIER_GAIN_BITS` threshold at 1, 2 and 3
+  bits, and misses it at 4 bits.
+- **V-shaped data** (i.i.d. Gaussian): the gain stays under 0.1 bits. An
+  isotropic Gaussian is rotation-invariant, so there is nothing to recover.
+- **i.i.d. uniform**: the transform loses bits.
+- Against `iso` at the same width, the missing rotation is more than half of
+  turbo's cosine gap on the outlier fixture. Scale cadence is the smaller term.
 
-Turbo is primarily a **V** codec. So the measured payoff lands on the smaller
-half of the family, and the expensive half is the half where the measurement
-says there is nothing to recover. The payoff also shrinks monotonically as the
-codebook widens, which puts what value there is at the *narrow* spellings, not
-the wide ones. Anyone scoping the transform should read that as: K axis, narrow
-widths, and a separate justification demanded for the V-side kernel work.
+Turbo is primarily a **V** codec. So a rotation would pay on the smaller half
+of the family, and at the narrow widths. The V side would also need an inverse
+transform after the SV accumulation in the flash and dequant kernels.
 
-This also settles a confound the older per-codec cosine comparison could not:
-holding group size fixed, the absent rotation — not the difference in scale
-cadence — is the dominant term in turbo's reconstruction-error deficit against
-a rotated sibling at the same width.
-
-Scope it honestly: this is measured on a **model** of K-cache structure, not on
-a K/V tensor captured from a forward pass. Read it as an estimate for a real
-checkpoint; the honest check is a serving cell and has not been run. The
-threshold is imported from `ROT_K_MIN_OUTLIER_GAIN_BITS` rather than retyped,
-and the gate carries its own mutation check.
-
-**Read the gate's verdict, not only its magnitudes.** It records a FAIL of the
-magnitude criterion together with a PASS of the ordering, and both halves are
-the result: the rotation helps on exactly the data it was predicted to help on,
-and by less than the imported threshold at the widest codebook. An earlier draft
-reported PASS from these same numbers by moving the verdict into a friendlier
-bucket with the threshold untouched. Committing the criterion first protects the
-numbers; it does not protect the conclusion.
+These figures come from a **model** of K-cache structure, not from a K/V
+tensor captured in a forward pass. For a real checkpoint they are an estimate.
 
 ### Rate-distortion — is the bit width delivering
 
 `crates/rmlx-kv-quant/src/rate_distortion_tests.rs`.
 
-Measured against the fixed-rate Lloyd-Max SQNR for the standard normal (Max
-1960, Table I): 4.396 / 9.300 / 14.616 / 20.224 dB at 1–4 bits. That anchor is
-**not** the rate-distortion bound (`6.02·b` dB) and assumes a quantizer matched
-to the source, spending no rate on its scale. Every codec here stores a
-per-group scale, so it can legitimately land above the anchor; the rate column
-is what makes the dB interpretable. i.i.d. Gaussian fixture, 256 x 128:
+The anchor is the fixed-rate Lloyd-Max SQNR for the standard normal (Max 1960,
+Table I): 4.396 / 9.300 / 14.616 / 20.224 dB at 1–4 bits. It is **not** the
+rate-distortion bound (`6.02·b` dB). It assumes a quantizer matched to the
+source that spends no rate on its scale. Every codec here stores a per-group
+scale, so it can land above the anchor. The stored rate of each codec is under
+§"Memory and bit-rate summary".
 
-| Codec | bits | measured | anchor | wasted bits | stored bits/value |
-|---|---:|---:|---:|---:|---:|
-| turbo | 2 | 7.232 dB | 9.300 dB | +0.344 | 3.00 |
-| turbo | 3 | 14.956 dB | 14.616 dB | −0.056 | 4.00 |
-| turbo | 4 | 21.630 dB | 20.224 dB | −0.233 | 5.00 |
-| tcq | 2 | 7.232 dB | 9.300 dB | +0.344 | 3.00 |
-| tcq | 3 | 14.956 dB | 14.616 dB | −0.056 | 4.00 |
-| planar | 3 | 40.604 dB | 14.616 dB | −4.316 | 22.00 |
-| planar | 4 | 36.724 dB | 20.224 dB | −2.741 | 22.00 |
-| iso | 3 | 19.292 dB | 14.616 dB | −0.777 | 43.25 † |
-| iso | 4 | 25.391 dB | 20.224 dB | −0.858 | 44.25 † |
-| rotor | 3 | 20.432 dB | 14.616 dB | −0.966 | 8.75 |
-| rotor | 4 | 26.551 dB | 20.224 dB | −1.051 | 9.75 |
+Wasted bits are `(anchor − measured) / 6.02`; negative is ahead of the anchor.
+On the i.i.d. Gaussian fixture, 256 x 128, each cell is pinned:
 
-No shipped cell is short of its anchor by more than 0.35 bits.
+| Codec | bits | anchor | wasted bits (pinned) |
+|---|---:|---:|---:|
+| turbo | 2 | 9.300 dB | +0.34 |
+| turbo | 3 | 14.616 dB | −0.06 |
+| turbo | 4 | 20.224 dB | −0.23 |
+| tcq | 2 | 9.300 dB | +0.34 |
+| tcq | 3 | 14.616 dB | −0.06 |
+| planar | 3 | 14.616 dB | −4.32 |
+| planar | 4 | 20.224 dB | −2.74 |
+| iso | 3 | 14.616 dB | −0.78 |
+| iso | 4 | 20.224 dB | −0.86 |
+| rotor | 3 | 14.616 dB | −0.97 |
+| rotor | 4 | 20.224 dB | −1.05 |
 
-† **The iso rate is path-specific, and neither path is resident today.** 43.25
-(iso3) / 44.25 (iso4) is the CPU `IsoBlocks` figure, which carries a per-group
-quaternion sideband at `f32`. It
-is the rate the V-only `iso3` / `iso4` stores *would* cost — those codecs decode
-from the bf16 mirror, so `exit_prefill` builds them no store at all and they
-measure byte-identical to `none` (§"Codec disposition", Class 2). `k_iso3/4` and
-`iso3_sym/4_sym` do build a store: a GPU ring that does not carry the quaternion
-— it is the constant `FIXED_QUAT` replicated per group, not data — and they sit
-at **7.125** (iso3) / **8.125** (iso4) bits/value. See § iso3 "Memory truth".
-Read against rotor's 8.75 without that distinction the table inverts the
-comparison: on the ring path iso is the cheaper of the two. Distortion is
-identical on both paths, so only the rate column is affected.
+Each cell's budget in `CELLS` is its pin plus 0.10 bits.
+`scalar_codebook_rate_distortion_report` fails a cell past its budget, and
+`pinned_budgets_sit_one_slack_above_the_measurement` fails a budget more than
+0.105 bits above the measurement.
 
-**The small-group-scale mismatch is not a loss.** Deriving the scale from the
-maximum of 3 or 4 samples presents the codebook with data of standard deviation
-≈ 1.47 rather than 1, but the small groups come out *ahead* of the anchor, not
-behind it: the group maximum is a strong conditioning statistic, it is
-reconstructed near-exactly by construction, and the two or three remaining
-elements are then known to be smaller than it. The shortfall is at the other
-end of the range — large groups at low bit widths (`turbo`/`tcq` at 2 bits,
-one f32 scale per 32 values, +0.34 bits).
+**The small-group scale is not a loss.** Deriving the scale from the maximum of
+3 or 4 samples presents the codebook with data of standard deviation ≈ 1.47,
+not 1. Yet the small groups come out *ahead* of the anchor. The group maximum is
+a strong conditioning statistic and is reconstructed near-exactly. The two or
+three remaining elements are then known to be smaller than it. The shortfall
+is at the other end: large groups at low bit widths. `turbo` and `tcq` at 2
+bits spend one f32 scale per 32 values and lose 0.34 bits.
 
-**The 3-bit and 4-bit widths of iso, rotor and planar cost byte-identical
-storage** — already stated for iso under § iso3 "Memory truth" and for rotor in
-the `rotorquant` module docs; what is new here is the consequence. All three
-pack under the shared `32 / bits` vals-per-word convention, and at every shipped group size the word count is the same for
-`bits = 3` and `bits = 4`. Each family therefore has one strictly dominated
-width — same bytes, worse quality:
+**Planar's 3-bit and 4-bit widths cost byte-identical storage.** A 32-value
+planar block takes 4 words at either width, under the `32 / bits`
+vals-per-word convention. A width is dominated when it costs the same bytes
+as the other width and loses quality. Each family therefore has one strictly
+dominated width only if its two widths cost the same bytes. Planar is the only
+such family: `planar4` loses about 3.9 dB against `planar3`.
 
-| Family | 3-bit | 4-bit | Dominated |
-|---|---:|---:|---|
-| iso | 19.29 dB | 25.40 dB | `iso3` loses 6.10 dB for nothing |
-| rotor | 20.43 dB | 26.56 dB | `rotor3` loses 6.12 dB for nothing |
-| planar | 40.60 dB | 36.72 dB | **`planar4` loses 3.88 dB for nothing** |
+Per pair, planar pins the larger element to the outermost centroid. The smaller
+lands on the grid `centroid / max_centroid`. Its outermost gap is
+`(2.152 − 1.344)/2.152 = 0.375` at 3 bits and `(2.718 − 2.052)/2.718 = 0.245`
+at 4 bits. That is only 1.5x finer, while the 16-angle Givens search that must
+land *both* elements on centroids gets no larger. The extra bit does not pay
+for itself.
 
-The planar direction is the surprising one, and it reproduces on the LCG
-fixture: measured mean cosine 0.999956 for planar3 against 0.999901 for
-planar4. Do **not** read the committed cosine floors (`planar_v3` 0.9989 against
-`planar_v4` 0.9942) as corroboration — they are not commensurable. The v3 floor
-is a local measurement minus 0.001; the v4 floor is an upstream README anchor
-minus 0.001 and is not a measurement of this code at all. The real signal is the
-5.5e-5 gap between the measured means, not the 4.7e-3 gap between those floors.
-Per pair the larger element is pinned to the outermost
-centroid, leaving the smaller on the grid `centroid / max_centroid`, whose
-outermost gap is `(2.152 − 1.344)/2.152 = 0.375` at 3 bits and
-`(2.718 − 2.052)/2.718 = 0.245` at 4 bits — only 1.5x finer, while the 16-angle
-Givens search that must land *both* elements on centroids gets no larger. The
-extra bit does not pay for itself. All three are pinned by
-`byte_identical_bit_widths_leave_one_width_dominated`; fixing the packing or
-the codebook is a separate change.
+iso and rotor pack their codes into the dense code plane, where a code costs
+`bits`. Their 4-bit width costs one more bit per stored code and wins on
+quality. `planar_widths_are_byte_identical_and_the_others_pay_for_their_bits`
+pins all three families.
 
 **TCQ's claw-back measures 0.000 dB.** See the trellis degeneracy note under
-`K8VTurbo3Tcq` below.
+§"`KvStorage::K8VTurbo3Tcq` — q8_0 K, TurboQuant 3-bit V with Viterbi trellis".
 
 ---
 
 ## See also
 
-- `docs/KV_CACHE.md` — flag surface, Qwen MoE PPL disaster, codec matrix.
+- `docs/KV_CACHE.md` — flag surface, supported types, hard invariants.
 - `docs/WEIGHT_QUANTS.md` — weight quantization families (separate from KV).
 - `docs/SSD_TIER.md` — SSD spill / hydrate for long-context eviction.
 - `docs/TESTING.md` — cosine, incoherence and rate-distortion gates; helpers.
