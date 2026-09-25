@@ -9,7 +9,7 @@
 
 ## What it pins, and what it does not
 
-Each round loop closes every round with one `tracing` event. The manifest pins
+The round loop closes every round with one `tracing` event. The manifest pins
 the **whole sequence of those events** for one run of each of the six pairs
 over each of the six prompts — 36 cells, 3862 rounds — in the timing-free form
 the run writes beside the full stream: the same JSON objects with every
@@ -22,12 +22,9 @@ it accepted, how many proposals it accepted them from and how many tokens the
 request has emitted by the end of it, and carries no wall-clock field. A file of
 well-formed JSON that is not a round stream is refused rather than digested.
 
-The emitted total is the fourth for a reason worth stating: a round whose phase
-timers do not partition it emits an `error!` beside its own line, and that
-report names the round's index, its accepted count and its proposals so a reader
-can act on it. Three fields would let that report into the stream, moving the
-cell and doubling one round for everything that counts them. It carries no
-running emitted total, and that is what keeps it out.
+A round whose phase timers do not partition it also emits an `error!` naming
+its index, accepted count and proposals. That report carries no emitted total,
+which is what keeps it out of the stream.
 
 This is the observable the equivalence pairs cannot supply. They read the
 answer, and greedy verification emits the verifier's own argmax at every
@@ -41,20 +38,19 @@ because a capture that enabled `rmlx::spec::phase` at TRACE would be measuring a
 different, slower run. `make check-spec-charge` is what covers that instead.
 
 **It is one run, not a distribution.** Two runs of one engine agree here
-exactly — measured — so a cell that moved is a change, not noise. A cell that
+exactly, so a cell that moved is a change, not noise. A cell that
 moved for a legitimate reason is re-blessed by regenerating the line and saying
 in the commit message which loop changed and why.
 
 ## Reproducing a cell
 
-One pair at a time, with the machine to itself. Snapshots resolve by slug from
-`RMLX_O_MODELS_ROOT` (see `docs/TESTING.md`); every pair but the assistant one
-also needs `RMLX_DRAFT_TEST_MODEL` set, which is what selects it.
+One pair at a time, with the machine to itself. Verifier and drafter resolve by
+slug from `RMLX_O_MODELS_ROOT` (see `docs/TESTING.md`).
+`RMLX_DRAFT_TEST_MODEL` overrides the drafter only where the root lacks it.
 
 ```sh
 RMLX_HOME=<a scratch dir> \
 RMLX_O_MODELS_ROOT=<models root> \
-RMLX_DRAFT_TEST_MODEL=<models root>/<the pair's drafter slug> \
   cargo test -p rmlx-models --test spec_greedy_equivalence -- \
     --ignored --exact <test name> --nocapture --test-threads=1
 ```
