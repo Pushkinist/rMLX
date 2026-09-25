@@ -105,97 +105,55 @@ rMLX stores K and V tensors for each attention layer in a `KvCache` struct.
 On each decode step the hot path appends the new K/V slice, then runs scaled
 dot-product attention (SDPA) over the full accumulated prefix.
 
-The active codec is controlled by two orthogonal enums:
+Two enums control the codec:
 
-- `KvQuant` — the logical quantization mode. Set at construction time, stays
-  fixed for the lifetime of the request.
-- `KvStorage` — the on-device buffer variant that actually holds the data.
-  Dispatch inside `KvCache::update_and_sdpa` matches `&self.storage`, not
-  `self.quant`. The storage variant is the canonical dispatch axis.
+- `KvQuant` — the logical quantization mode. It is set at construction time
+  and does not change for the request.
+- `KvStorage` — the buffer variant that holds the data. `KvCache::update`
+  matches `&self.storage`, not `self.quant`. See § "Dispatch axis".
 
-Sliding-window attention (SWA) layers are exempt from quantization regardless
-of the active `KvQuant`: they use `RotatingState` (a ring-buffer bf16 path
-ported from mlx-lm's `RotatingKVCache`). `mlx-lm.to_quantized` raises
-`NotImplementedError` for rotating caches; rMLX matches that behaviour.
+`--kv-quant auto` resolves to `none` (bf16) on every arch
+(`DEFAULT_KV_QUANT`). Every other codec is opt-in.
+
+Sliding-window attention (SWA) layers do not use the codec. They use
+`RotatingState`, a bf16 ring buffer, for every `KvQuant`.
 
 ### Per-layer net-benefit decision + net-negative warn
 
-Because SWA layers already run the bf16 ring (above), the per-layer
-quantization decision is implicit: **windowed layers are bf16, global
-(full-attention) layers are quantized**. The codec is a no-op on windowed
-layers and can never make them larger — the "skip quant on tiny windowed
-layers" condition is therefore already satisfied by the rotating-ring
-exemption, not by an extra gate.
+SWA layers always run the bf16 ring. Thus windowed layers are bf16 and global
+(full-attention) layers carry the codec. The codec cannot make a windowed layer
+larger.
 
-The residual net-negative is on the **global** layers, and only for the codecs
-that keep a packed store *and* a bf16 mirror. A quantized global layer may keep
-a warm-TTFT bf16 decode seed (`decode_fp16_k` / `decode_fp16_v`, gated by
-[`KvQuant::feeds_bf16_k_at_decode`]); when the codec also builds a packed store,
-the codes + scales are pure overhead on top of a buffer the same size as bf16
-and the codec is strictly larger than `--kv-quant none`.
+A codec can make a global layer larger than bf16. This occurs when the layer
+keeps a packed store **and** a bf16 mirror (`decode_fp16_k` / `decode_fp16_v`).
+Two predicates decide the mirrors: `KvQuant::feeds_bf16_k_at_decode` and
+`KvQuant::feeds_bf16_v_at_decode`. `KvQuant::materialises_packed_store` decides
+the store.
 
-`Mixed` / `RotK` are that shape **only on an architecture whose layers share
-K/V**. Their own decode reads the affine 3-tuples and never touches a mirror;
-the sole consumer is the `want_kv` arm of `update_and_sdpa_mixed_inner`, which
-`KvCache::update_and_sdpa_shared_source` reaches for a cross-layer-KV producer
-(Gemma4), plus the `SharedKv::Bf16` pair a drafter clones. So the two mirror
-predicates take the layer's own topology — `KvCache::shares_kv`, set by the arch
-builder — and where nothing shares, `exit_prefill` builds no mirror and the
-resident KV is the packed store alone. Measured `kv_cache_bytes` against `none`
-at a 3 770-token prompt on Ternary-Bonsai-8B: `mixed_k8g64_v4g64` 1.305x before,
-**0.589x** after; `rot_k_v4g64` 1.308x before, **0.589x** after. On Gemma4-e4b,
-which does share, both are byte-identical to before (1.327x / 1.374x): the
-mirror there is the share and is still built.
+- **bf16-mirror family** (`K8V4`, `K8V8`, `Planar*`, `PlanarK`, `K8VTurbo*`,
+  `TurboSym*`, `Iso3/4`, `Rotor3/4`, `RotorK*Asym`). No decode path reads the
+  store, so `exit_prefill` does not build it (`docs/KV_CACHE.md` §9.6 F3). The
+  resident KV is the two bf16 mirrors. This is the same byte count as
+  `--kv-quant none`.
+- **`Mixed` / `RotK`.** Their decode reads the affine 3-tuples. They keep the
+  mirrors only when the layer shares K/V across layers (`KvCache::shares_kv`,
+  set by the arch builder). Gemma4 shares; Qwen3 and Qwen3.5-MoE do not. On a
+  layer that does not share, the resident KV is the packed store alone.
+  `boundary_floor` keeps a promoted `Mixed` / `RotK` boundary layer in its own
+  family. See § "Which codec the floor is".
+- **Store-reading families** (`IsoKOnly*`, `RotorKOnly*`, `Iso*Sym`,
+  `Rotor*Sym`). They keep the packed store. The K-only codecs also keep a bf16
+  V mirror.
 
-Two properties of that saving matter to a reader sizing a cache:
+Size a Gemma4 layer from its **class**. Windowed layers are `head_dim` ×
+`num_key_value_heads`. Global layers are `global_head_dim` ×
+`num_global_key_value_heads`, which is a different shape (see
+docs/MODELS.md, "Attention geometry splits by layer class").
+`gemma4/generate/mod.rs` builds the per-layer `KvLayerShape` vector from these
+two pairs.
 
-* **It is prompt-sized, not context-sized.** `KvCache::update` refuses a
-  `Mixed` storage outright, so `update_decode_fp16` never runs on these codecs
-  and the mirror — when there is one — is frozen at the length `exit_prefill`
-  set. Eliding it therefore removes bytes proportional to the *prefill* length,
-  not to the final offset. Bonsai-8B with a 25-token prompt and 512 generated
-  tokens moves only 47 849 728 → 45 187 328 bytes (0.944x), against 0.451x at a
-  3 770-token prompt.
-* **It used to be diluted by the per-layer codec vector.** `kv_layer_quants`
-  promotes the first `LAYER_ADAPTIVE_HEAD_N` and last `LAYER_ADAPTIVE_TAIL_N`
-  layers — 10 of 36 on Bonsai-8B — and while that promotion landed on `K8V8`,
-  a mirror-family codec that keeps its mirror regardless, only 26/36 of the
-  bf16 mirror was ever available to elide. `boundary_floor` now raises a
-  parametric base inside its own family, so a promoted `Mixed` / `RotK` layer
-  is still `Mixed` / `RotK` and the elision reaches all 36 — **on a stack that
-  has an elision to reach.** This whole saving is the mirror-free case; a
-  shared-KV stack keeps both mirrors on every `Mixed` / `RotK` layer, boundary
-  or not, and the promotion there stays on `K8V8`. See
-  § "Which codec the floor is".
-
-For the **bf16-mirror family** (`K8V4`, `K8V8`, `Planar*`, `PlanarK`,
-`K8VTurbo*`, `TurboSym*`, `Iso3/4`, `Rotor3/4`, `RotorK*Asym`) that overhead is
-gone: no decode path reads their store, so `exit_prefill` does not build one
-(`KvQuant::materialises_packed_store()`, see `docs/KV_CACHE.md` §9.6 F3). Their
-resident KV is exactly the two bf16 mirrors — the same bytes as
-`--kv-quant none`, at every context and every geometry — and the warn never
-fires for them. It still fires for the K-only re-quantise families'
-sideband-heavy K store, and for `Mixed` / `RotK` **on a shared-KV
-architecture**, where both mirrors are retained beside the packed 3-tuples.
-On a dense architecture those two now report a net *saving* and the warn does
-not fire; the estimate takes the same `shares_kv` the allocation does, so the
-two cannot disagree.
-
-Historical note: before that change, measured on Gemma4 e2b at a 4096-token
-prompt, `k8v4` reported a larger `kv_cache_bytes` than `none` — all of the
-excess on the global layers, zero delta on the windowed ones. Those two
-numbers are equal now.
-
-Size a Gemma4 layer from the **class** it is in. Windowed layers are
-`head_dim` × `num_key_value_heads`; global layers are `global_head_dim` ×
-`num_global_key_value_heads`, which is a different and wider shape (see
-docs/MODELS.md, "Attention geometry splits by layer class"). Both figures come
-off the snapshot's `text_config`, and `gemma4/generate/mod.rs` builds the
-per-layer `KvLayerShape` vector from exactly that pair — read it there rather
-than assuming one width for the stack.
-
-rMLX emits one structured `warn!` at request build time when the resolved codec
-is estimated to increase resident KV vs bf16 on the active layer mix:
+At request build time, rMLX emits one structured `warn!` when the resolved
+codec is estimated to hold more resident KV than bf16 on the active layer mix:
 
 ```
 WARN KV codec increases resident KV vs bf16 on this layer mix — the
@@ -206,231 +164,137 @@ holds the CPU blocks the prefill encode built — until the first fused decode
 step drops them, or for the whole request on a layer the fused path's shape gate
 rejects (batch > 1, or a head_dim that is not a power of two at most 512), where
 they are never dropped. Consider --kv-quant none if memory is the goal.
-  kv_quant=mixed_k8g64_v8g64 eff_seq=8192 n_global=7 n_windowed=28 est_extra_bytes=31195136
+  kv_quant=<codec> eff_seq=<tokens> n_global=<n> n_windowed=<n> est_extra_bytes=<bytes>
 ```
 
-`n_global` and `n_windowed` are the two layer classes; `est_extra_bytes` is
-`estimated_resident_bytes_per_layer` summed over the mix, so the per-class
-per-layer figures behind it are recomputed rather than recorded here. To see
-them for a codec, run `rmlx info --list-cache-types`.
+`n_global` and `n_windowed` are the two layer classes. `est_extra_bytes` is
+`estimated_net_saving_per_layer` summed over the mix, with the sign flipped. To
+see the per-layer figures for a codec, run `rmlx info --list-cache-types`.
 
-Only the **sign** of that number is exact; size nothing from its magnitude.
+Only the **sign** of that number is exact. Do not size a buffer from its
+magnitude.
 
-Each side is now sized byte-for-byte against the store it writes — every
-`SideStore` cadence is measured against that store's own encoder by
-`every_codec_byte_model_matches_the_store_it_writes`, at `head_dim` 64, 128 and
-256, with no declared ratio and no tolerance. What the estimate still does not
-model is page rounding, the static per-layer rotation tables, and GPU/CPU
-residual coexistence.
+The estimate sizes each side byte-for-byte against the store it writes.
+`every_codec_byte_model_matches_the_store_it_writes` checks each `SideStore`
+cadence against the store's own encoder at `head_dim` 64, 128 and 256. The
+estimate does not model page rounding, the static per-layer rotation tables, or
+GPU/CPU residual coexistence.
 
-One error remains, and it runs **low**, for `k_iso*` / `iso*_sym`. The estimator
-sizes an iso side from the GPU ring, which is what a served request settles at;
-but `exit_prefill` bulk-encodes into CPU `IsoBlocks` 3.98× the ring (the
-quaternion sideband, and three host planes at `f32` where the ring holds two of
-them at `KV_SIDEBAND_DTYPE`). Those are
-freed on the first fused decode step (`drop_blocks_when_ring_live_iso_*`) — on a
-layer the fused path serves. On a layer whose shape its gate rejects (batch > 1,
-or a `head_dim` that is not a power of two at most 512 — `head_dim = 80`
-qualifies), `update_and_sdpa_iso_k_fused` returns before any mutation, the ring
-is never allocated, the drop is a no-op, and the blocks are what that layer
-holds for the whole request. That case is a property of the model's geometry,
-not a startup window: it does not end.
+The estimate runs **low** for `k_iso*` and `iso*_sym`. It sizes an iso side
+from the GPU ring. But `exit_prefill` encodes into CPU `IsoBlocks`, which are
+3.98× the ring at `head_dim = 128`. The first fused decode step frees the
+blocks (`drop_blocks_when_ring_live_iso_*`) on a layer the fused path serves.
+The fused path's shape gate rejects batch > 1 and a `head_dim` that is not a
+power of two at most 512 (`head_dim = 80` is one example). On such a layer,
+`update_and_sdpa_iso_k_fused` returns before any mutation, the ring is not
+allocated, and the layer keeps the blocks for the whole request.
 
-The estimate is model-agnostic — keyed only on layer geometry (`head_dim`,
-`kv_heads`, `window`) and codec attributes (the per-side store layout from
-`KvQuant::side_stores`, the codebook width from `KvQuant::approx_code_bits`,
-whether the codec retains a bf16 seed, and whether it materialises a packed
-store at all). The decision lives in:
+The estimate is model-agnostic. It uses only layer geometry (`head_dim`,
+`kv_heads`, `window`), the layer topology (`shares_kv`) and codec attributes:
+`KvQuant::side_stores`, `KvQuant::approx_code_bits`, the two mirror predicates
+and `KvQuant::materialises_packed_store`. The code is:
 
 - `rmlx_kv_quant::KvQuant::estimated_resident_bytes_per_layer` /
-  `estimated_net_saving_per_layer` (codec layer — the per-side byte model;
+  `estimated_net_saving_per_layer` (codec layer; the per-side byte model;
   windowed layers return saving 0).
 - `rmlx_models::kv_cache::kv_codec_net_saving_total` /
-  `warn_if_kv_codec_net_negative` (policy layer — sums the layer mix and emits
-  the warn). Wired into the Gemma4, Qwen3 and Qwen3.5-MoE `generate` paths; any
-  arch interleaving windowed + global attention can call it with its own
-  `KvLayerShape` vector.
+  `warn_if_kv_codec_net_negative` (policy layer; sums the layer mix and emits
+  the warn). The Gemma4, Qwen3 and Qwen3.5-MoE `generate` paths call it.
 
-The warn is **advisory only** — the codec is not changed. Keeping the resolved
-codec is the operator's explicit choice (and forcing bf16 globally would change
-numerics); the warn just surfaces the byte math so `--kv-quant none` is an
-informed option when memory is the goal. Seed-free codecs (the K-only
-re-quantize families, `feeds_bf16_k_at_decode == false`) cross over to
-net-positive at large context and do not warn.
+The warn is **advisory only**. It does not change the codec.
 
 ### Gemma4 global `--kv-quant none` KV is bf16 (was f32)
 
-On the mxfp8 path Gemma4 previously ran its whole attention + FFN stream in
-f32, so the global (full-attention) `--kv-quant none` K **and** V were resident
-as f32 (4 B/elem) — roughly **2× the bf16 expectation**. Only the global layers
-grow KV with context (windowed layers are ring-bounded, already bf16), so this
-dominated KV residency on long prompts.
-
-Root cause was **model-dtype discipline**, not the codec, the RoPE freqs table,
-or RMSNorm: strong-F32 scalar constants meeting bf16 activations promoted the
-residual stream to f32, which then propagated through the Q/K/V projections,
-attention, and the global KV cache. Three sources, all matching mlx-lm's
-weak-typed Python floats now:
+The Gemma4 residual stream is bf16 end-to-end, so the global `--kv-quant none`
+K and V store as bf16. Three sites keep it bf16:
 
 - the embed-scale (`hidden_size**0.5`) constant,
 - the per-layer-input scales (embed / proj / inv-sqrt2),
-- the fused GeGLU / PLI-GeGLU activations, whose internal `gelu_tanh`
-  arithmetic constants are f32 and silently widen a bf16 gate.
+- the fused GeGLU / PLI-GeGLU activations.
 
-The scale constants now adopt the operand dtype, and the fused activation
-closures restore the gate dtype on their output (the cast folds into the
-compiled program, no extra launch). The stream is bf16 end-to-end, so **both**
-global K and V store as bf16.
-
-Measured (e4b mxfp8, `--kv-quant none`, ~18.5 k context): `kv_cache_bytes`
-≈ 325 MB, exactly half the prior f32 ≈ 649 MB. Decode TPS is unchanged-to-faster
-(no mixed-dtype SDPA). A unit-level dtype-lock regression test pins the fused
-activations and scale sites at bf16, so a future re-promotion of the Gemma4
-stream to f32 fails CI.
+The scale constants adopt the operand dtype. The fused activation closures
+restore the gate dtype on their output. Three unit tests in
+`gemma4/layers/kernels_tests.rs` pin these sites at bf16:
+`geglu_fused_bf16_gate_stays_bf16`, `pli_gelu_fused_bf16_gate_stays_bf16` and
+`dtype_adopted_scale_keeps_bf16_operand_bf16`.
 
 ### Qwen3 dense `--kv-quant none` KV is bf16 (was f32)
 
-The same class hit the dense Qwen3 arch (`Qwen3ForCausalLM`). Some snapshots
-ship norm weights and quant scales/biases at **fp16** (e.g. Bonsai-8B-2bit).
-rMLX runs the residual stream in **bf16** (the embedding dequant is forced to
-bf16). When `rms_norm` mixes a bf16 activation with an fp16 norm weight — and
-when `quantized_matmul` mixes a bf16 activation with fp16 scales/biases — MLX
-promotes the result to **f32**. That f32 carried through the Q/K/V projections,
-attention, and the global `--kv-quant none` KV cache, which then stored K and V
-at f32 (4 B/elem) — roughly **2× the bf16 expectation**. (The YARN mscale scalar
-is *not* the cause: q/k/v arrive at the YARN branch already f32 from the
-projection.)
+The dense Qwen3 arch (`Qwen3ForCausalLM`) casts every float model parameter to
+bf16 at load (`load_util::bf16_param`). This includes norm weights, quant
+scales and biases, and embedding scales and biases. Some snapshots ship these
+at fp16 (for example Bonsai-8B-2bit). Without the cast, MLX promotes a bf16
+activation mixed with an fp16 parameter to f32, and K and V store at 4 B/elem.
+The YARN mscale scalar is also stored as bf16 at load. Three unit tests in
+`qwen3_tests.rs` pin the cast: `rms_norm_bf16_weight_keeps_output_bf16`,
+`bf16_param_casts_fp16_to_bf16` and `yarn_mscale_dtype_adopted_keeps_bf16`.
 
-Fix — one float dtype for the whole model, adopted at load: every float model
-parameter — norm weights, quant scales/biases, and embedding scales/biases —
-takes the bf16 activation dtype. The
-projection and norm outputs then stay bf16, so K and V store as bf16. The YARN
-mscale scalar is also stored as bf16 at load (defense-in-depth; the scalar was
-never the root cause, but prebuilding it as bf16 is cheaper than a per-step
-cast and keeps the multiply unambiguous. Two unit-level dtype-lock tests pin
-the `rms_norm` and `bf16_param` call paths.
+**The chosen dtype is bf16. The reference does not do this.** mlx-lm applies
+the same one-dtype rule but takes the dtype from the checkpoint. On
+`prism-ml__Ternary-Bonsai-8B-mlx-2bit`, mlx-lm loads the float params as
+float16 and keeps float16 logits and KV. bf16 has 3 fewer mantissa bits than
+fp16, so rMLX decodes this checkpoint coarser than the weights on disk and the
+reference. This can flip tokens at near-tie logits. Do not describe this cast
+as matching mlx-lm.
 
-Measured (Bonsai-8B-2bit, `--kv-quant none`): decode-time K/V resident dtype
-flips f32→bf16 (4→2 B/elem), halving KV residency. Decode TPS gains widen with
-context as KV bandwidth dominates: ~+34 % at 4 k, ~+73 % at 16 k, ~+100 % at
-64 k — recovering the prior loss vs the mlx-lm champion on this model.
+### Qwen3.6 MoE `--kv-quant none` KV is bf16
 
-**The chosen dtype is bf16, and that is not what the reference does.** mlx-lm
-applies the same one-dtype rule but takes it from the checkpoint: measured with
-mlx-lm 0.31.2 on `prism-ml__Ternary-Bonsai-8B-mlx-2bit`, all 653 float params
-load as **float16**, the forward returns float16 logits, and the KV cache is
-float16. bf16 has 3 fewer mantissa bits than fp16, so rMLX decodes this
-checkpoint coarser than both the weights on disk and the reference. It is a
-deliberate trade for the numbers above — bf16 is what this engine's kernels and
-KV codecs are built around — and it has a measurable price: it flips tokens at
-near-tie logits. `bonsai_8b_mixed_k8g64_v4g64.golden.txt` predates this cast and
-is **stale at index 18** because of exactly one such flip: the two candidates
-tie exactly in rMLX (both `-0.74530375`) where the reference sees a 0.0859
-margin. That fixture has **not** been regenerated — a mismatch at index 18 is
-the expected consequence of this cast, not a new regression, and the bisect that
-identified it is recorded in the issue history. Do not restate this cast as
-matching mlx-lm.
+The Qwen3.5-MoE arch (`Qwen3_5MoeForConditionalGeneration`) uses the same
+load-time cast. The `qwen3_5_moe` loader calls `load_util::bf16_param` on every
+float param: FullAttention (q/k-norm weights, quant scales and biases,
+embedding scales and biases) and the GDN recurrent layers (`conv1d_weight`,
+`norm_weight`). Thus an fp16 repack also stays bf16 in compute. Two CPU tests
+pin this: `moe_stream_stays_bf16_with_bf16_params` and
+`bf16_param_casts_fp16_to_bf16` (both in `qwen3_5_moe/moe_tests.rs`).
 
-### Qwen3.6 MoE `--kv-quant none` KV is bf16 — audited clean AND hardened
+### KV byte accounting
 
-The Qwen3.5-MoE arch (`Qwen3_5MoeForConditionalGeneration`) was audited for the
-same f32-KV leak class. **Verdict: clean AND structurally hardened.** The
-`qwen3_5_moe` loader casts every float param to bf16 at load via
-`load_util::bf16_param`, covering FullAttention (q/k-norm weights, quant
-scales/biases, embedding scales/biases) and GDN recurrent layers (`conv1d_weight`
-and `norm_weight`). This is identical to the dense Qwen3 loader — so **any future
-Qwen3.6 snapshot, including an fp16 repack, stays bf16-clean in compute**. The
-compute stream is bf16 end-to-end: `rms_norm` and `quantized_matmul` stay bf16
-(no fp16→f32 promotion), the MoE router `softmax(bf16 logits)` keeps
-`routing_weights` bf16 (no Gemma4-MoE-class router leak — the router gate is a
-plain quantized `Linear`, not a strong-f32-scaled RMSNorm), GDN
-`conv1d(bf16 qkv, bf16 conv1d_weight)` stays bf16 through `v4`/`y_bf16`, and
-`rms_norm(&y_bf16, bf16 norm_weight)` stays bf16 at the GDN RMSNormGated site.
-This arch's attention has no YARN mscale on the q/k path.
+`KvCache::resident_bytes()` reports the KV-cache size. It reads the real
+`Array` shape × `dtype.itemsize()` of every GPU buffer and the length of every
+CPU codec block. This covers packed codes, scales, zero-points, rotation and
+residual buffers, the GPU rings of the ring-backed K codecs, and the bf16
+mirrors. It backs the `kv_cache_bytes` observations, the `kv_bytes` event,
+prompt-cache eviction and `rmlx baseline`. **Cost is O(blocks).** Call it at
+request boundaries, not per layer per decode step.
 
-Decisive measurement: at `--kv-quant none`, every K/V tensor arrives at the
-cache-store boundary as **bf16 (400+/400+ prefill+decode store calls, zero f32)**
-— so the compute is genuinely clean, not merely capped by the model-agnostic
-`cast_store_bf16` floor. Two CPU dtype-lock tests pin this:
-`moe_stream_stays_bf16_with_bf16_params` (q/k-norm + router promotion semantics)
-and `bf16_param_casts_fp16_to_bf16` (helper-contract gate — RED if `bf16_param`
-stops casting fp16→bf16; loader call sites verified by real-model load proof).
+Each figure comes from the store that owns the buffers
+(`KvStorage::resident_bytes` → per-codec `byte_size`). There is no second
+bits-per-element formula. A nominal bit width is not the memory of a cache.
 
-**Byte accounting.** One method reports KV-cache size:
+**One sample point on every arch: post-decode.** rMLX records
+`kv_cache_bytes` after the decode loop, when every resident KV allocation
+exists, including the decode-time GPU ring. A run that returns before the
+decode loop (the first sampled token is EOS) does not refresh
+`kv_cache_bytes`. Such a run allocates no ring, so the value it does not write
+equals the prefill snapshot. A NaN prefill stops the request with an error.
 
-- `KvCache::resident_bytes()` — actual on-device allocation: reads the real
-  `Array` shape × `dtype.itemsize()` for every GPU buffer, and `Vec.len()`
-  for CPU codec blocks. Covers packed codes, scales, zero-points, optional
-  rotation/residual buffers, the GPU rings behind the ring-backed K codecs,
-  and the warm-TTFT bf16 mirrors. It backs `kv_cache_bytes` observations, the
-  `kv_bytes` event, prompt-cache eviction, and `rmlx baseline`. **Cost is
-  O(blocks)** — call it at request boundaries, not per-layer per-decode-step.
-
-Each figure is delegated to the store that owns the buffers
-(`KvStorage::resident_bytes` → per-codec `byte_size`), so it is derived from
-the allocations themselves. There is deliberately **no** second, per-codec
-bits-per-element formula: one existed (`approx_bytes`) and drifted, reporting
-byte-identical totals for `k_iso3` and `k_rotor3` — two codecs with entirely
-different storage — while missing their GPU rings outright. A nominal
-bit-width is not a cache's memory.
-
-**One sample point across every arch: post-decode.** `kv_cache_bytes` is
-recorded at a single lifecycle position — after the decode loop, when every
-resident KV allocation exists, including the decode-time GPU ring of a
-ring-backed codec. It means the same thing in every row of the matrix,
-regardless of arch or of whether the prompt cache hit. "One lifecycle point"
-means **post-decode, and only when a decode actually ran**: a run that returns
-before the decode loop — immediate-EOS, i.e. the first sampled token is EOS —
-does **not** refresh `kv_cache_bytes` and leaves the prior value in place. That
-is uniform across every arch now (the exact-hit paths and gemma4 / gemma3 /
-qwen3.5-moe always behaved this way), and it loses no ring information: with
-zero decode steps no ring is ever allocated, so the value that is *not* written
-would equal the prefill snapshot.
-
-A NaN prefill is **not** in that category: it aborts the whole request with an
-error, so there is no run to attribute a byte count to at all. It used to return
-`Ok` with one junk token, which is what made the stale-value case reachable from
-a fault rather than only from an ordinary early stop.
-
-The store takes a `PostDecode` witness minted only by a completed decode loop
-(`pipelined_decode` and the per-arch `decode_loop` / `decode_from` helpers) and
-required by `KvBytesCounter::store`. This **raises the bar and documents the
-requirement**: the naive re-drift — co-locating the store back at the prefill
-snapshot, reusing the loop's witness — is a compile error, because that witness
-is not yet in scope there, and the witness parameter makes a wrong lifecycle
-obvious in review. It is **not** an unforgeable compile-time guarantee: `seal()`
-is `pub(crate)` (each per-arch decode helper has to mint its own), so a new arch
-*could* mint a fresh witness at the prefill point and compile. The backstop for
-that is review plus the `#[ignore]`d GPU re-drift test
-(`kv_bytes_hit_equals_miss`), which goes red if a path samples pre-decode — it
-runs on a manual GPU pass, not in `make ci`. Keyed off the decode lifecycle,
-never an arch.
-
-Earlier this differed per arch: gemma4 / qwen3.5-moe / gemma3 sampled after
-decode, while the qwen3-miss / qwen2 / laguna / bitnet / qwen3-vl-moe paths
-sampled at the prefill snapshot (before the ring existed), and qwen3 recorded
-either figure depending on whether the prompt cache hit. Ring-backed cells of
-those pre-decode arches were a lower bound; they now include the ring. The
-prompt-cache snapshot is still cloned at the prefill point (it stores the
-prompt's KV, not decode KV) — only the *metric* moved to post-decode.
+`KvBytesCounter::store` requires a `PostDecode` witness. Only a completed
+decode loop mints one: `pipelined_decode`, the per-arch decode loops and the
+speculative round loop. If a change moves the store back to the prefill point
+and reuses the loop's witness, the build fails, because that witness is not in
+scope there. This is not an unforgeable guarantee: `PostDecode::seal()` is
+`pub(crate)`, so a new arch can mint a witness at the prefill point. Review
+and the `#[ignore]`d GPU test `kv_bytes_hit_equals_miss` are the backstop.
+`make ci` does not run that test. The prompt-cache snapshot is
+still cloned at the prefill point, because it stores the prompt's KV.
 
 ### Per-request hot-swap
 
-The `KvQuant` for a request is **not** tied to the model load. A running
-`rmlx serve` accepts a per-request `kv_quant` field (OpenAI route) that selects
-the codec for that one request — weights stay resident, only the KV cache is
-rebuilt. This means one resident model can serve `none`, `k8v4`, `k8v8`, … back
-to back with no reload. The override threads down to the same per-request cache
-builder the per-ctx `auto` policy already used; absent → launch `--kv-quant`.
+The `KvQuant` of a request is not tied to the model load. A running
+`rmlx serve` accepts a per-request `kv_quant` field (OpenAI route). The field
+selects the codec for that request. The weights stay resident; only the KV
+cache is rebuilt. If the field is absent, the launch `--kv-quant` applies.
 
-The prompt/prefix cache is **partitioned by codec** so a switch can never serve
-mismatched cached K/V — `KvQuant::cache_key_salt()` is XOR'd into the
-block-hash seed alongside the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
+The prompt and prefix cache is **partitioned by codec**, so a switch cannot
+serve mismatched cached K/V. `KvQuant::cache_key_salt()` is XOR'd into the
+block-hash seed with the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
 § "Codec namespacing" and `docs/SERVER.md` § "Per-request KV-config hot-swap".
 
 ---
 
 ## Storage variants — summary table
+
+The last column is the V-side cosine gate on the unit-test fixture.
 
 | `KvStorage` variant | K codec | K group | V codec | V group | Dispatch path | Cosine gate (V mean ≥) |
 |---|---|---|---|---|---|---|
@@ -447,115 +311,81 @@ block-hash seed alongside the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
 
 ## Metal-vs-CPU hot path + load-time MSL precompile
 
-Two orthogonal codec attributes drive startup behaviour. Both are exhaustive
-matches on `KvQuant` (`crates/rmlx-kv-quant/src/quant.rs`) — a new variant must
-be classified or the build fails.
+Two codec attributes control startup behaviour. Both are exhaustive matches on
+`KvQuant` (`crates/rmlx-kv-quant/src/quant.rs`). A new variant must be
+classified, or the build fails.
 
-* **`KvQuant::carries_msl()`** — `true` when the codec dispatches at least one
-  custom Metal (MSL) kernel on its hot path (every codec except `none`, whose K
-  is q8_0 MSL or MLX-affine `mx.quantize`). MSL kernels in this crate compile
-  **lazily** — `MetalKernel::new` only registers; MLX compiles the pipeline on
-  the *first* `apply()` dispatch (see `docs/FFI.md` § `MetalKernel`). For a
-  shader-heavy codec that first dispatch lands inside the first user request, so
-  the first long-prompt forward pays a one-time shader cold-compile (a 1-token
-  `"hi"` warmup does not trigger it — the codec kernel only fires on a real
-  prefill encode).
+* **`KvQuant::carries_msl()`** is `true` for every codec except `none`. It
+  means the codec can dispatch at least one custom Metal (MSL) kernel. MSL
+  kernels compile **lazily**: `MetalKernel::new` only registers, and MLX
+  compiles the pipeline on the first `apply()` dispatch (see `docs/FFI.md`
+  § `MetalKernel`).
 
-* **`KvQuant::cpu_hot_path_reason()`** — `Some(reason)` when the codec's KV
-  encode + dequant run on the **CPU** on the default hot path. Grounded in the
-  actual decode/prefill dispatch in `crates/rmlx-kv-quant/src/kvcache/update.rs`,
-  not in assumptions (CLAUDE.md hard rule 7):
+* **`KvQuant::cpu_hot_path_reason()`** is `Some(reason)` when the codec's
+  encode and dequant run on the **CPU** on the default path:
 
-  * **V-only iso / rotor** (`iso3/4(/sym)`, `rotor3/4(/sym)`,
-    `rotor_k_*_asym_*`) → **`Some`**. At decode, `update_iso_{v,sym}` /
-    `update_rotor_{v,sym,k_asym}`
-    early-return to the warm-TTFT bf16 decode seed (`decode_fp16_k.is_some()`),
-    so the GPU iso/rotor branch is shadowed; the codec encode that runs (at
-    prefill) is CPU. The rotor family's GPU fused-QK encoder is gated OFF by
-    default (`--fused-qk`).
-  * **K-only iso** (`k_iso3` / `k_iso4`) → **`None`** (Metal). No bf16
-    early-return: `update_and_sdpa_iso_k_fused` GPU-encodes the step into the
-    packed ring and `iso_flash_decode` reads that ring directly, so **both**
-    sides are GPU-resident and nothing restages through the host. Before the
-    flash-decode kernel this was a hybrid — the per-step dequant restaged the
-    growing prefix host-side and re-uploaded it via `Array::from_bytes` — which
-    is what held these codecs at single-digit TPS.
-  * **K-only rotor** (`k_rotor3` / `k_rotor4`) → **QJL-dependent, default
-    off**. No bf16 early-return; `update_rotor_k_only` gates the GPU K
-    encode on the store's sticky `use_qjl()` flag — fixed at first append, the
-    same source the sdpa fast path reads, so a later env toggle cannot
-    reinterpret bytes already written. QJL **off** (default) →
-    `rotor{3,4}_gpu_append_into_k_blocks` Metal MSL encode (`None`), and the
-    **decode** side is fused too (see § `rotor_flash_decode` below), so the
-    default path is fully GPU-resident. QJL **on** (opt-in `--rotor-qjl on`) →
-    CPU (`Some`): the 1-bit residual has no MSL kernel, so it forces the K
-    append + dequant onto the host every decode step (single-digit TPS). The
-    residual bought no measured accuracy in a two-arch context sweep — identical
-    temp=0 output and needle retrieval on vs off — so off is the default and on
-    is the fidelity / ablation knob.
+  * `iso3` / `iso4`, `rotor3` / `rotor4`, `rotor_k_*_asym_*` → `Some`. Their
+    `update_*` functions return early to the bf16 mirror at decode, so the GPU
+    branch is shadowed. The encode that exists is CPU.
+  * `iso3_sym` / `iso4_sym`, `k_iso3` / `k_iso4` → `None`. Decode is the iso
+    flash-decode kernel over the packed ring (`iso_flash_decode`,
+    `iso_flash_decode_symv`). Nothing restages through the host.
+  * `rotor3_sym` / `rotor4_sym`, `k_rotor3` / `k_rotor4` → depends on QJL.
+    The default is off (`--rotor-qjl off`). With QJL off, the K encode is the
+    rotor MSL kernel (`rotor_gpu_append_into_k_blocks`) and decode is fused
+    (see § `rotor_flash_decode` below), so the verdict is `None`. With QJL on,
+    the 1-bit residual has no MSL kernel and forces the K path onto the CPU
+    every decode step, so the verdict is `Some`. `update_rotor_k_only` reads
+    the store's sticky `use_qjl()` flag, which is fixed at the first append.
+  * Every other codec → `None`.
 
-  The `Some` cases are the source of the 30–60× first-forward slowdown and the
-  monotonic decode decay as KV grows.
+For the bf16-mirror family, a seeded cache never reaches the path that this
+verdict describes: the codec is INERT (see § "Codec disposition — what every
+codec in the tree is for").
 
 ### Per-codec verdict
 
-| Codec family | Hot-path verdict | Notes |
+| Codec family | `cpu_hot_path_reason()` | Notes |
 |---|---|---|
-| `none` | bf16, no kernel | nothing to compile |
-| `k8v4` / `k8v8` / `planar` / `planar3` / `planar_k` | **Metal** | q8_0 K + tq4 / planar V GPU kernels |
-| `mixed_*` / `rot_k_v*` | **Metal** | MLX-affine `mx.quantize` K + affine V (compiled Metal ops) |
-| `k8vturbo3` / `k8vturbo2` / `*tcq` / `tsym3` / `tsym4` | **Metal K**, CPU V (bounded) | K=q8_0 GPU; V CPU-forced by the −1 %/−2 % TPS gate, cost small |
-| `iso3` / `iso4` | **CPU** | bf16 decode seed shadows the GPU iso branch; prefill V-encode on host |
-| `iso3_sym` / `iso4_sym` | **fully Metal** | both axes iso-quantized; decode is `iso_flash_decode_symv` over both packed rings (no bf16 mirror). Ring-as-sole-store. `cpu_hot_path_reason() == None` |
-| `k_iso3` / `k_iso4` | **fully Metal** | iso K MSL encode into the packed ring + `iso_flash_decode` fused decode over that ring. No host restaging. `cpu_hot_path_reason() == None` |
-| `rotor3` / `rotor4` / `rotor*_sym` / `rotor_k_*_asym_*` | **CPU** | bf16 decode seed shadows the GPU branch; GPU fused-QK encoder is `--fused-qk`-only |
-| `k_rotor3` / `k_rotor4` | **QJL-dependent (default off)** | QJL off (default) → **fully Metal**: rotor K MSL encode + `rotor_flash_decode` fused decode; QJL on (`--rotor-qjl on`) → CPU. Gate reads the store's sticky `use_qjl()` |
+| `none` | `None` | bf16, no kernel |
+| `k8v4` / `k8v8` / `planar` / `planar3` / `planar_k` | `None` | q8_0 K + tq4 / planar V GPU kernels; INERT on a seeded cache |
+| `mixed_*` / `rot_k_v*` | `None` | MLX-affine `mx.quantize` K and V (compiled Metal ops) |
+| `k8vturbo3` / `k8vturbo2` / `*tcq` / `tsym3` / `tsym4` | `None` | q8_0 or turbo K on GPU; 2-bit and 3-bit turbo V is CPU-forced; INERT on a seeded cache |
+| `iso3` / `iso4` | `Some` | bf16 mirror shadows the GPU iso branch; INERT on a seeded cache |
+| `iso3_sym` / `iso4_sym` | `None` | `iso_flash_decode_symv` over both packed rings; no bf16 mirror |
+| `k_iso3` / `k_iso4` | `None` | iso K MSL encode into the packed ring + `iso_flash_decode` |
+| `rotor3` / `rotor4` / `rotor_k_*_asym_*` | `Some` | bf16 mirror shadows the GPU branch; INERT on a seeded cache |
+| `rotor3_sym` / `rotor4_sym` / `k_rotor3` / `k_rotor4` | `None` with QJL off (default); `Some` with `--rotor-qjl on` | QJL off: rotor K MSL encode + `rotor_flash_decode` |
 
 ### Load-time precompile
 
 `rmlx_kv_quant::precompile::precompile_kv_codec_msl(kq, head_dim, kv_heads,
-device)` warms the kernels a codec carries with one representative GPU dispatch
-during model load (the eager-preload window), so the first user request is
-steady-state instead of paying a cold compile. It is **general per-codec**
-(keyed off `carries_msl()`, never an arch name): a no-op on CPU device, when
-`head_dim` is unknown (`0`), for `none`, for the CPU-hot-path V-only iso/rotor
-families (nothing to warm), and for the K-only iso/rotor families
-(`is_k_only_iso_rotor()`) — those are Metal on the hot path but their K kernel is
-the iso/rotor MSL kernel, **not** the shared q8_0 K kernel this warm compiles, so
-warming q8 for them would compile the wrong shader; their K kernel compiles
-lazily on first prefill. It warms the shared q8_0 K-side kernels for every q8-K
-MSL codec, plus the tq4 / planar V kernel for `k8v4` / `planar`.
-Best-effort — a warm failure logs
-`warn!` and proceeds (the kernel then compiles lazily on first use, the
-previous lazy-compile behaviour). Wired into `ArchGenerator::from_snapshot_with_id` (the
-single server-side generator factory all archs route through).
+device)` warms the kernels of a codec with one small GPU dispatch during model
+load. Thus the first user request does not pay a cold compile. It is keyed off
+codec attributes, never an arch name. It does nothing in these cases:
+
+- the device is not the GPU,
+- `head_dim` is unknown (`0`),
+- `carries_msl()` is `false` (`none`),
+- `cpu_hot_path_reason()` is `Some`,
+- `is_k_only_iso_rotor()` is `true`. The K kernel of these codecs is the
+  iso/rotor MSL kernel, not the q8_0 K kernel that this function warms. It
+  compiles lazily on the first prefill.
+
+Otherwise it warms the q8_0 K kernels, plus the V kernel for `k8v4` (tq4),
+`planar` (planar 4-bit) and `planar3` (planar 3-bit). A warm failure logs a
+`warn!` and load continues; the kernel then compiles lazily on first use.
+`ArchGenerator::from_snapshot_with_id`, the server-side generator factory for
+every arch, calls it.
 
 ### CPU-codec classification at resolve time
 
 `rmlx_models::kv_cache::validate_resolved` (alias `validate_resolved_kv_quant`)
-runs the arch-agnostic Metal-vs-CPU check after the Qwen-MoE guards. When the
-resolved codec is CPU-hot-path (`cpu_hot_path_reason()` is `Some`) it emits a
-loud structured `warn!` naming the codec + reason so the cost is never silent.
-These codecs still produce correct output — the classifier is warn-and-proceed
-only. The K-only iso (`k_iso3/4`) and QJL-off rotor (`k_rotor3/4`) codecs have
-`cpu_hot_path_reason() == None` (Metal on the hot path) and are unaffected by the
-warn.
-
----
-
-The `KvQuant::RotK { v_bits, v_group_size }` variant uses `KvStorage::Mixed`
-(same `MixedKvState` machinery) with the `rotate_k=true` flag set. It is
-listed under Mixed below.
-
-`KvQuant::K8VTurbo3` is available via `--kv-quant k8vturbo3`. It is no longer
-the auto default for Gemma4 small (reverted to K8V8 per the composite-score
-audit). It reuses the `K8V4` storage path with `bits=3` for the
-V side. See the per-variant section below.
-
-`KvQuant::K8VTurbo2` is the native 2-bit Lloyd-Max V codec; it reuses the
-`K8V4` storage path with `bits=2` for the V side. Ships **naïve** (no
-outlier-mask); outlier-mask wiring is deferred. See per-variant section below for
-the gap-vs-mtq quantification.
+runs the arch-agnostic Metal-vs-CPU check after the Qwen-MoE guards. When
+`cpu_hot_path_reason()` is `Some`, it emits a structured `warn!` that names the
+codec and the reason. It also warns when the codec is INERT
+(`materialises_packed_store()` is `false`). Each warn fires once per codec. The
+codec is not rejected.
 
 ---
 
@@ -563,66 +393,43 @@ the gap-vs-mtq quantification.
 
 ### `KvStorage::None` — unquantized bf16
 
-**K codec**: stored as bf16, shape `[B, kv_h, max_seq, head_dim]`.
+**K codec**: bf16, shape `[B, kv_h, max_seq, head_dim]`.
 **V codec**: same.
 
-Buffers live in `KvCache::decode_fp16_k` and `decode_fp16_v`, not inside a
-`KvStorage` sub-struct. This reuses the same machinery as the warm-TTFT
-fp16 seed path used by quantized variants during prefill. `KvStorage::None`
-records only `max_seq`; the actual arrays are owned by `KvCache` directly.
+The buffers are `KvCache::decode_fp16_k` and `decode_fp16_v`, not a
+`KvStorage` sub-struct. This is the same machinery as the bf16 mirror of the
+quantized codecs. `KvStorage::None` records only `max_seq`.
 
 `update()` calls `update_decode_fp16`, which issues a `slice_update` at the
-current token offset into the pre-allocated buffer. SDPA uses
-`scaled_dot_product_attention` on the raw bf16 arrays.
+current token offset. SDPA runs `scaled_dot_product_attention` on the bf16
+arrays.
 
-**Cache-boundary bf16 floor (model-agnostic f32-KV guard).** The store boundary
-casts incoming K/V to bf16 **independent of the inbound dtype**, so the resident
-buffer is bf16 regardless of what the model's attention stream produced. Both
-store sites that funnel into `decode_fp16_k/v` apply the floor:
+**Cache-boundary bf16 floor (model-agnostic f32-KV guard).** The store
+boundary casts incoming K/V to bf16 (`cast_store_bf16`), whatever the inbound
+dtype. Two store sites apply the floor:
 
-- `update_prefill_raw` (the warm-TTFT seed buffer that `exit_prefill` slices
-  into the decode mirror), and
+- `update_prefill_raw` (the prefill buffer that `exit_prefill` slices into the
+  decode mirror), and
 - `update_decode_fp16` (the per-step decode append; the cast also sizes the
-  resident `zeros(...)` allocation in bf16).
+  `zeros(...)` allocation in bf16).
 
-The K-only / V-only decode helper `update_decode_fp16_v_only` (used by the
-IsoKOnly and RotorKOnly asymmetric codecs to write their bf16 V mirror without
-disturbing the quantized K store) writes V in whatever dtype the codec provides,
-which is bf16 by codec contract — it is **not** floored here because it is a
-quantized-codec path, not the `KvQuant::None` / warm-TTFT path, and touching it
-would violate the hard rule that the floor must not reach into quantized codec
-internals.
+`update_decode_fp16_v_only` does not apply the floor. The K-only iso and rotor
+codecs use it to write their bf16 V mirror, and the codec supplies bf16.
 
-The cast is **idempotent** — a cheap `dtype == Bf16` check returns the input
-untouched (no `astype` launch) in the steady state that the per-arch source
-fixes already produce, so it is pure insurance with negligible hot-path cost.
-This is **defense-in-depth, not a substitute for the per-arch fix**: it caps the
-*memory* damage of an upstream f32 leak (it cannot store f32) but does not fix
-the *compute* slowdown — any upstream f32 arithmetic (RoPE / SDPA) stays f32.
-The per-arch source fixes (Gemma4 §"Gemma4 global `--kv-quant none` KV is bf16",
-Qwen3 §"Qwen3 dense `--kv-quant none` KV is bf16") remain the real fix; this
-floor is the structural guard that makes the leak class impossible to re-create
-silently.
+The cast is a no-op when the input is already bf16. The floor limits the
+*memory* cost of an upstream f32 leak. It does not remove the *compute* cost:
+upstream f32 arithmetic stays f32. The per-arch casts (Gemma4
+§"Gemma4 global `--kv-quant none` KV is bf16",
+Qwen3 §"Qwen3 dense `--kv-quant none` KV is bf16") are the fix; the floor is
+the guard.
 
-The detector is a bytes-per-element invariant in
-`crates/rmlx-kv-quant/src/kvcache/resident_bytes_tests.rs`: an f32 K/V fed
-through the prefill-seed and decode-store paths must land as bf16 (2 B/elem). It
-is wired into `make model-check` (which now runs `-p rmlx-kv-quant`), so a future
-arch that leaks f32 into the unquantised KV store trips CI at integration instead
-of being found months later in a bench.
+`crates/rmlx-kv-quant/src/kvcache/resident_bytes_tests.rs` holds the
+detector: an f32 K/V fed through the prefill and decode store paths must land
+as bf16 (2 B/elem). `make model-check` runs it.
 
-**Memory cost**: `2 · B · kv_h · max_seq · head_dim · 2 bytes` per layer.
-At 128K context on a 35B-A3B model this is tens of gigabytes. Reserve for
-short-context parity benches only.
+**Memory cost**: `2 · B · kv_h · max_seq · head_dim · 2` bytes per layer.
 
 **CLI**: `--kv-quant none` (aliases: `bf16`, `f16`).
-
-**Arch defaults**: none. `auto` is bf16 on every arch, so this is what
-`Qwen3VLMoeForConditionalGeneration` gets — which matters there beyond
-uniformity, because quantized KV produces incoherent output on that
-checkpoint.
-
-**Smoke-probe status**: validated across all primary test-target families.
 
 ---
 
@@ -633,71 +440,41 @@ checkpoint.
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**K codec**: rMLX MSL `q8_0` — symmetric affine, `group_size=128`. Per-group
-scale equals `max(|x|) / 127`; no bias term.
-**V codec**: identical codec to K.
+**K codec**: rMLX MSL `q8_0`, symmetric, `group_size=128`. The per-group
+scale is `max(|x|) / 127`. There is no bias term.
+**V codec**: the same codec as K.
 
-Both sides use the `QuantK` struct. `QuantK` maintains two parallel storage
-paths:
+Both sides use `QuantK`. `QuantK` has two storage paths:
 
-- **CPU path**: `Vec<u8>` codes + `Vec<f32>` scales, filled by scalar Rust
-  `q8_quantize` / `q8_dequantize`.
-- **GPU path**: pre-allocated 1-D `Array` pair (`gpu_codes_buf` u32,
-  `gpu_scales_buf` f32). Sized in multiples of `KV_PAGE_SIZE = 256` tokens,
-  growing by one page when the filled sequence would exceed current capacity
-  (paged growth path). Each step issues `q8_quantize_gpu` on the new slice
-  then a `slice_update` into the buffer at the current offset. This avoids
-  the `O(n²)` lazy-concat tree that `concatenate` would produce.
+- **CPU path**: `Vec<u8>` codes + `Vec<f32>` scales (`q8_quantize` /
+  `q8_dequantize`).
+- **GPU path**: a pre-allocated 1-D `Array` pair (`gpu_codes_buf` u32,
+  `gpu_scales_buf` f32). The capacity grows in steps of `KV_PAGE_SIZE = 256`
+  tokens. Each step quantizes the new slice and writes it with `slice_update`.
 
-**Buffer layout (sequence-major).** The flat `QuantK` buffer (both the GPU
-`Array` pair and the CPU `Vec`s) stores the filled prefix **sequence-major**:
-the logical `[B, kv_h, S, D]` cache is laid out as `[B, S, kv_h, D]`, so for a
-given token all heads are contiguous, and chunk `n` occupies
-`[prev_seq * words_per_seq .. (prev_seq + new_seq) * words_per_seq]` with
-`words_per_seq = B * kv_h * D / 4`. The per-step write places one chunk at a
-sequence offset, so this is the only ordering under which appending in *any*
-number of chunks keeps the active prefix readable as one contiguous slice.
+**Buffer layout (sequence-major).** `QuantK` stores the filled prefix
+**sequence-major**: the logical `[B, kv_h, S, D]` cache is laid out as
+`[B, S, kv_h, D]`. For each token, all heads are contiguous. Chunk `n` occupies
+`[prev_seq * words_per_seq .. (prev_seq + new_seq) * words_per_seq]`, with
+`words_per_seq = B * kv_h * D / 4`. Only this order keeps the active prefix
+one contiguous slice after appends in any number of chunks.
 
-`QuantK::append` therefore transposes the incoming head-major chunk
-(`[B, kv_h, new_seq, D]`) to `[B, new_seq, kv_h, D]` before quantizing, and
-`QuantK::dequantize_choice` reshapes the flat active prefix to `[B, S, kv_h, D]`
-and transposes heads↔seq back to the logical `[B, kv_h, S, D]`. For a
-single-chunk cold prefill (`prev_seq == 0`) the two transposes cancel at the
-logical-mapping level, so the common path stays correct. The cold output is
-**byte-identical** to the pre-fix head-major grouping only when
-`head_dim % 128 == 0` (every q8 group of 128 stays inside one head) — which
-holds for every current QuantK-routed target arch (Qwen3.5-MoE linear
-`head_dim=128`, Gemma3 text KV `head_dim=256`, Gemma4 text KV `head_dim=256`
-on SWA layers and `512` on full-attention layers), so the cold path is
-byte-identical in practice. When `head_dim` is not a multiple of 128 (no current
-target arch, but exercised directly by the `d=64` cross-head round-trip test) a
-q8 group of 128 spans a (head,token) boundary and its per-group `abs_max` scale
-differs from the old grouping, so the cold path is logically correct and within
-q8 noise but not bit-identical to the base commit. Without this transpose, a head-major chunk written at a
-sequence offset and read with a `[B, kv_h, S, D]` reshape transposed one head's
-new-token slot onto another head's prefix whenever `kv_h > 1` and the cache was
-appended in more than one chunk (the multi-append-after-SSD-hydrate decode
-path) — silent K corruption. The spill / hydrate / paged-grow paths copy the
-contiguous active prefix `[0 .. filled]` and are layout-agnostic, so they
-remain correct and the on-disk `.kvb` payload is unchanged by this ordering.
+`QuantK::append` transposes the incoming head-major chunk to
+`[B, new_seq, kv_h, D]` before it quantizes. `QuantK::dequantize_choice`
+reshapes the prefix to `[B, S, kv_h, D]` and transposes back. When
+`head_dim % 128 == 0`, every q8 group stays inside one head. When `head_dim` is
+not a multiple of 128, a q8 group spans a (head, token) boundary. The spill,
+hydrate and paged-grow paths copy the contiguous prefix `[0 .. filled]`, so
+they do not depend on the layout.
 
-`update_and_sdpa` path:
-1. `QuantK::append` — quantize new K, write into GPU buffer.
+Store-backed `update_and_sdpa` path:
+1. `QuantK::append` — quantize new K, write into the GPU buffer.
 2. `QuantK::append` — same for V.
-3. `QuantK::dequantize_choice` — dequantize full K prefix to bf16.
+3. `QuantK::dequantize_choice` — dequantize the full K prefix to bf16.
 4. `QuantK::dequantize_choice` — same for V.
-5. `scaled_dot_product_attention` on the recovered bf16 arrays.
-
-**Perf characterization**: Fastest path for full-attention MoE models
-(`Qwen3_5MoeForConditionalGeneration`). The per-step dequantize is bounded by
-memory bandwidth; on GQA-light archs (25% FA layers) the overhead is small
-relative to routing computation.
-
-**Arch defaults**: none. `auto` is bf16 on every arch; K8V8 is opt-in.
+5. `scaled_dot_product_attention` on the bf16 arrays.
 
 **CLI**: `--kv-quant k8v8`.
-
-**Smoke-probe status**: green on all 11 Open Models at 4K context.
 
 ---
 
@@ -708,282 +485,93 @@ relative to routing computation.
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**K codec**: rMLX MSL `q8_0`, `group_size=128` (identical to K8V8 K-side).
+**K codec**: rMLX MSL `q8_0`, `group_size=128` (the same as the K8V8 K side).
 **V codec**: TurboQuant 4-bit Lloyd-Max N(0,1) codebook, `group_size=32`.
 
-This is an asymmetric split — K and V use different codecs. The split is
-per-axis (K versus V tensor), not per-layer-index. The Python fork's
-`"8,4"` flag applies different widths by layer; rMLX applies them by axis.
+The split is per axis (K versus V), not per layer.
 
-The V side uses `QuantV { bits: 4 }`. Layout:
+The V side uses `QuantV { bits: 4 }`:
 
-- CPU path: `Vec<TurboBlocks>` — each block holds 4-bit packed codes (`Vec<u8>`)
-  and per-group f32 scales (`Vec<f32>`), one block per group of 32 elements.
-- GPU path: pre-allocated 1-D u32 codes buffer and f32 scales buffer.
+- CPU path: `Vec<TurboBlocks>`. Each block holds 4-bit packed codes
+  (`Vec<u8>`) and f32 scales (`Vec<f32>`), one block per group of 32 elements.
+- GPU path: a pre-allocated 1-D u32 codes buffer and an f32 scales buffer.
   `words_per_step = B * kv_h * D * 4 / GROUP_SIZE` (four u32 words per group
-  of 32 at 4 bits = 128 bits = 4 u32). Paged growth as in K8V8.
+  of 32 at 4 bits). The capacity grows as in K8V8.
 
-**Buffer layout (sequence-major).** Like `QuantK`, the `QuantV` buffer stores
-the filled prefix **sequence-major** (`[B, S, kv_h, D]`) on both backends:
-`append` reorders the head-major chunk heads↔seq before quantizing (GPU
-`transpose` + `contiguous` so the raw-linear-index TurboQuant MSL kernel sees
-the permuted bytes; CPU reorders `f32_data` and passes the seq-major shape to
-the positional `turbo_quantize_v` / TCQ codec), and `dequantize_choice`
-reshapes the prefix seq-major then transposes back to the logical
-`[B, kv_h, S, D]` (GPU output `contiguous` for raw byte-readers / SSD spill).
-Single-chunk cold prefill is the identity; byte-identical at `head_dim % 32 ==
-0` (every TurboQuant group of 32 stays inside one head). Without this reorder,
-a head-major store read with a `[B, kv_h, S, D]` reshape transposed heads
-whenever `kv_h > 1` and the cache was appended in more than one chunk (the
-post-SSD-hydrate decode-append path) — silent V corruption. The same
-sequence-major ordering applies to the K-side `QuantKTurbo3` / `QuantKTurbo4`
-structs (`TurboSym3` / `TurboSym4`) and to the paged K/V handoff in
-`update_paged` (which reorders `new_k`/`new_v` to seq-major before quantizing,
-since the page slabs are physically token-major).
+**Buffer layout (sequence-major).** `QuantV` also stores the prefix
+sequence-major (`[B, S, kv_h, D]`) on both backends. `append` reorders the
+head-major chunk before it quantizes. On the GPU this is `transpose` +
+`contiguous`, because the TurboQuant MSL kernel reads raw linear indices.
+`dequantize_choice` reshapes the prefix sequence-major and transposes back.
+The same order applies to the K-side `QuantKTurbo3` / `QuantKTurbo4` stores
+(`TurboSym3` / `TurboSym4`) and to `update_paged`, which reorders `new_k` /
+`new_v` before it quantizes.
 
-`update_and_sdpa` path (without TurboFlash):
+Store-backed `update_and_sdpa` path (without TurboFlash):
 1. Append K via `QuantK::append`.
-2. Append V via `QuantV::append` (calls `turbo_quantize_v4_gpu` on GPU).
-3. Dequantize full K prefix via `QuantK::dequantize_choice`.
-4. Dequantize full V prefix via `QuantV::dequantize_choice` (calls
-   `turbo_dequantize_v4_gpu`).
+2. Append V via `QuantV::append` (`turbo_quantize_v4_gpu` on GPU).
+3. Dequantize the full K prefix via `QuantK::dequantize_choice`.
+4. Dequantize the full V prefix via `QuantV::dequantize_choice`
+   (`turbo_dequantize_v4_gpu`).
 5. `scaled_dot_product_attention` on bf16 arrays.
 
-**TurboFlash path** (`KvCache::update_and_sdpa_k8v4_flash`): maintains a
-parallel set of head-major buffers (`flash_k_codes`, `flash_k_scales`,
-`flash_v_codes`, `flash_v_scales`) shaped `[B, kv_h, max_seq, D/.]`. These
-are seeded once from the prefill bf16 prefix on the first decode step, then
-appended per-token via 4-D `slice_update`. The `turbo_flash_sdpa` Metal
-kernel reads these buffers directly — no dequantize round-trip. Enabled by
-`DispatchPolicy::turbo_flash` (or `turbo_flash_lock`) on the cache's policy.
+**TurboFlash path** (`KvCache::update_and_sdpa_k8v4_flash`). This path keeps
+its own head-major buffers (`flash_k_codes`, `flash_k_scales`,
+`flash_v_codes`, `flash_v_scales`), shaped `[B, kv_h, max_seq, D/.]`. The
+first decode step seeds them from the bf16 prefix. Each later step appends
+with a 4-D `slice_update`. The `turbo_flash_sdpa` Metal kernel reads these
+buffers directly. `turbo_flash_should_run` allows the kernel when all of these
+are true: `DispatchPolicy::turbo_flash` is set, `q_seq == 1`, and
+`kv_seq > turbo_flash_min_kv_seq` (default 4096). The kernel supports
+`head_dim ∈ {128, 256}`. The flash buffers are resident in addition to the
+bf16 mirror.
 
 **TurboFlash default-OFF policy (HOLD)**: `--turbo-flash` accepts
-`{on, off, auto}` with `auto` as the default, and `auto` resolves **OFF on
-every host**. The kernel passes its crash and fidelity gates and fails its
-throughput one: everywhere it fires it decodes several times slower than the
-generic K8V4 path. It also changes the generated tokens — because it is the
-only `k8v4` configuration in which the 4-bit V codec runs at decode at all, not
-because the kernel is wrong; see "What the digest difference is, and is not"
-below.
+`{on, off, auto}`. The default is `auto`, and `auto` resolves **OFF on every
+host**. The kernel passes its crash and fidelity gates. It fails its
+throughput gate: it decodes slower than the generic K8V4 path, and the loss
+grows with `kv_seq`. It also changes the generated tokens. The cause is the
+codec, not the kernel: TurboFlash is the only `k8v4` configuration in which the
+4-bit V codec runs at decode. With the gate off, `k8v4` decodes from the bf16
+mirror.
 
-Measured with `rmlx bench` (n=3 + warmup, one process per cell, medians,
-settle gate enforced) on a quiet host — same binary, temp=0, `--turbo-flash`
-the only difference:
+- `--turbo-flash on` turns the kernel on (ablation and re-measurement).
+- `--turbo-flash off` is a hard override. An exported `RMLX_TURBO_FLASH=1`
+  does not survive it.
+- `auto` honours `RMLX_TURBO_FLASH=1`. In that case the kernel runs while the
+  flag reads `auto`, and rMLX logs a `warn!` that names the cost.
+- `--turbo-flash` is a **global** flag. Every subcommand resolves it the same
+  way, so `rmlx bench` and `rmlx baseline` measure the configuration that
+  `rmlx serve` runs.
 
-| cell | on vs off | token digest |
-|---|---|---|
-| Bonsai-8B `k8v4` @~1.7k (`RMLX_TURBO_FLASH_MIN=0`) | 1.93× slower | — |
-| Bonsai-8B `k8v4` @8k | 2.74× slower | **differs** |
-| Bonsai-8B `k8v4` @16k | 3.48× slower | identical |
-| Bonsai-8B `k8v4` @32k (63.25 → 14.89 TPS) | 4.25× slower | **differs** |
-| Bonsai-27B `k8v4` @16k | 1.98× slower | identical |
+Lifting the HOLD needs a decode throughput measurement.
 
-The loss scales with `kv_seq` rather than being a fixed per-request penalty.
-Every cell above settled on both sides with zero settle-gate refusals (32k
-ranges: 1.14% off, 3.42% on). Dispatch was proven by counter, not inferred:
-1638 kernel dispatches in the ON arm against 0 in the OFF arm. Shrinking the
-ring 4× recovers part of the gap but not the bulk, so this is not a
-`--max-ctx` sizing artefact. The `on` arm also holds 722 468 864 B more
-resident KV at 16k — the persistent head-major flash buffers sit *on top of*
-the bf16 mirror and the packed store rather than replacing either.
-
-**What the digest difference is, and is not.** An earlier revision of this
-section claimed a byte-identical token digest in both arms; that held on one
-cell and was generalised from it. It is not byte-identical — but the reason has
-been wrong twice, in two different ways, and both are now measured.
-
-First: *the comparison baseline is not a reference.* Turning the gate off does
-not turn the codec off. With `--turbo-flash off`, `k8v4` decode shortcuts to the
-bf16 mirror and the 4-bit V store is never read — `decode_reads_packed_store` is
-`false` for `K8V4`, and a GPU capture of the OFF arm contains no
-`custom_kernel_rmlx_*` at all, only `sdpa_vector_2pass_2_bfloat16_t_128`. The
-ON arm is the **only** `k8v4` configuration in which the codec participates in
-decode. So "the kernel is not bit-exact" was measured against a bf16 attention,
-which **any** correct tq4-V kernel must also differ from, and the kernel's own
-error had never been tested.
-
-Second: *half the observed divergence was a dtype promotion.* When these cells
-were measured, 8k and 32k both diverged while 16k and Bonsai-27B@16k matched.
-The 32k divergence was the f32 promotion described below and is gone with the
-dtype fix — see the digest table further down, where 32k now reproduces the
-bf16 reference exactly. The 8k divergence survives.
-
-**The kernel's own numerics, measured.** `turbo_flash_reference_sdpa`
+**The kernel's own numerics.** `turbo_flash_reference_sdpa`
 (`turbo_flash_msl.rs`, `#[cfg(test)]`) is a dequantize-then-SDPA arm over the
-*identical* `flash_k_codes` / `flash_k_scales` / `flash_v_codes` /
-`flash_v_scales` buffers, unpacked with the same two codecs the kernel unpacks
-inline and computed at the kernel's own f32 working precision. Every
-quantization error is common to both arms and cancels; what is left is the
-kernel's block tiling, its online softmax and its two-pass rescale. Measured at
-the attention geometry of each architecture the kernel actually dispatches on,
-plus a masked cell, on a ring whose stride is wider than its fill and whose
-last block is partial:
-
-| cell | `head_dim` | `kv_h` × heads/kv | cosine | worst per-row diff |
-|---|---:|---:|---:|---:|
-| Ternary-Bonsai-8B-2bit | 128 | 8 × 4 | 1.0 | 0.056 bf16 ULP |
-| Qwen3.6-35B-A3B-8bit | 256 | 2 × 8 | 1.0 | **bit-identical** |
-| Bonsai-8B + additive mask | 128 | 8 × 4 | 1.0 | **bit-identical** |
-
-The gate is cosine ≥ 0.999999 and ≤ 0.5 bf16 ULP per row — the bound quoted
-here is the gate's, not the measurement's, so a drift toward it cannot leave
-this page true and CI green at the same time.
-
-The kernel is therefore accurate **for its codec**, and the ≈0.997 SDPA cosine
-against bf16 is the tq4-V codec's own floor — which at temp=0 flips greedy
-argmax ties prompt-dependently. Guards:
-`turbo_flash_matches_its_codec_reference_at_{bonsai_8b,qwen36_35b}_geometry`
-and `..._with_an_additive_mask` (`#[ignore]`, GPU).
-Mutation-checked: feeding the kernel `t_active` where `t_stride` belongs drops
-the cosine to −0.04 / 0.65, and dropping a single tail KV token drops it to
-0.995 (19–28 ULP) — the latter is *below* the 0.997 codec floor, which is why a
-bf16-referenced gate at that floor would have passed that bug and a
-codec-referenced one does not. The reference arm is also asserted not to move
-the dispatch counter, so it cannot quietly become a second call into the thing
-it is checking.
-
-**Two things the reference had to be taught, both found by cells that did not
-exist at first.** It validated `n_q_heads % n_kv_heads` when the *kernel* did
-not — see "GQA divisibility" below — and it handed the kernel's f32 mask
-straight to MLX SDPA, which refuses a mask that does not promote to the bf16
-output. A reference is only a reference where it accepts and refuses exactly
-what it references.
+same `flash_*` buffers. It uses the same two codecs and the kernel's f32
+working precision. Thus every quantization error cancels. What remains is the
+kernel's block tiling, online softmax and two-pass rescale. The gate is cosine
+≥ 0.999999 and ≤ 0.5 bf16 ULP per row (`KERNEL_VS_REFERENCE_MAX_ULPS`), on a
+ring whose stride is wider than its fill and whose last block is partial.
+Guards: `turbo_flash_matches_its_codec_reference_at_{bonsai_8b,qwen36_35b}_geometry`
+and `..._with_an_additive_mask` (`#[ignore]`, GPU). Any comparison against a
+bf16 attention measures the tq4-V codec, not the kernel.
 
 ### GQA divisibility — a kernel-entry gap the reference exposed
 
-`turbo_flash_sdpa` computed `n_repeats = n_q_heads / n_kv_heads` in integer
-arithmetic with no divisibility check, and the MSL maps
-`kv_head = q_head / n_repeats`. For `(n_q_heads, n_kv_heads) = (3, 2)` that
-truncates to `n_repeats = 1`, so `q_head = 2` reads `kv_head = 2` against a
-two-head store — past that batch's KV base, silently, with a plausible-looking
-answer. `n_kv_heads == 0` divided by zero. The rule now lives in
-`validate_flash_shapes`, which both arms call, and is covered by the GQA cells
-in `reference_and_kernel_refuse_the_same_shapes_for_the_same_reason`. No
-in-tree caller passes a non-multiple — `update_and_sdpa_k8v4_flash_inner`
-derives both counts from the cache's own shapes — so this is entry-validation
-hardening, not a live-path fix.
+The MSL maps `kv_head = q_head / n_repeats`, with
+`n_repeats = n_q_heads / n_kv_heads`. A count that does not divide would read
+past the KV base of the batch. `validate_flash_shapes` rejects such shapes,
+and a zero `n_kv_heads`. The kernel and the reference arm both call it.
+`reference_and_kernel_refuse_the_same_shapes_for_the_same_reason` covers the
+GQA cells. `update_and_sdpa_k8v4_flash_inner` derives both counts from the
+cache's own shapes, so no in-tree caller passes a non-multiple.
 
-**Consequence for the HOLD.** The correctness half is discharged: it asked for
-something no bf16 baseline could ever supply, and the reference arm supplies it.
-What remains is throughput (see #340 for the P1 grid's per-query-head KV
-re-read). The rows below are the pre-fix measurement, kept because the TPS and
-residency figures still come from it. Reproduce it on Bonsai-8B at 8k with `rmlx bench --kv-quant k8v4
---max-ctx 16384 --prompt-tokens 8192 --max-tokens 64 --runs 2 --warmup 1`:
-
-| arm | decode TPS | token digest | `kv_cache_bytes` |
-|---|---:|---|---:|
-| gate OFF | 110.80 | `0xb0273cf32cb9b715` | 1 668 005 888 |
-| gate ON (`--turbo-flash on`) | 42.05 | `0x75a6992e38913e64` | 2 029 240 320 |
-
-TurboFlash is therefore a decode loss that also applies a codec the generic
-path skips — not pure cost, and not a kernel-accuracy problem.
-
-**Every cell in the two tables above was measured while the kernel promoted the
-decode graph to f32.** `turbo_flash_sdpa` declared f32 kernel outputs and
-returned them without restoring the query dtype, so with the gate ON the
-residual stream, the next layer's RMSNorm, its weight GEMV, its elementwise ops
-and the sampler all re-instantiated at f32 — visible in a GPU capture as
-`affine_qmv_fast_float_*` replacing `affine_qmv_fast_bfloat16_t_*`, plus
-`rmsfloat32`, `vv_Addfloat32`, `vs_Multiplyfloat32` and `argmax_float32`. The
-dispatcher now casts back (`turbo_flash_msl.rs`), and those f32 instantiations
-are gone from the capture. Read the ratios above as an **upper bound on the
-kernel's own cost**: part of what they measured was the promotion, not the
-kernel. The gate posture is unchanged — the ON arm is still slower than the
-generic path in the same direction on both cells re-run after the fix — and the
-cells are due a re-measurement on a quiescent host before the numbers are
-restated.
-
-The digest picture changes too, and only at one of three contexts. Bonsai-8B
-`k8v4`, temp=0, 32 generated tokens, `RMLX_TURBO_FLASH_MIN=0`, one process per
-cell, digest over the emitted token ids:
-
-| prompt | gate OFF | gate ON, before the dtype fix | gate ON, after |
-|---|---|---|---|
-| 4k | `587c5a59` | `587c5a59` | `587c5a59` |
-| 8k | `a098059c` | `10323b3d` | `10323b3d` |
-| 32k | `3466374f` | `163882de` | `3466374f` |
-
-At 32k the ON arm now reproduces the bf16 reference exactly — that divergence
-was the promoted graph, not the codec. At 8k it does not, and that one survives
-the fix: it is the tq4-V codec floor the section above describes. Which is the
-point of removing the confound — a digest difference is now attributable to the
-codec, because both arms finally run at the same dtype. That 8k cell also pins
-the extra resident KV to 361 234 432 B — exactly half the 16k figure, so the
-flash buffers scale linearly with the ring.
-
-Re-confirmed at the **production** threshold (no `RMLX_TURBO_FLASH_MIN`
-override), temp=0, 32 tokens, `kv_bytes` as the dispatch witness:
-
-| arch | prompt | `kv_bytes` OFF → ON | digest |
-|---|---:|---|---|
-| Ternary-Bonsai-8B-2bit | 8192 | 1 145 733 120 → 1 506 967 552 | **differs** |
-| Ternary-Bonsai-8B-2bit | 32768 | 4 657 250 304 → 6 102 188 032 | identical |
-| Qwen3.6-35B-A3B-8bit | 8192 | 227 840 000 → 283 414 528 | identical |
-| gemma-4-e2b-mxfp8 | 8192 | 58 601 472 → 58 601 472 (0 B) | identical — did not fire |
-
-Two things follow. **Qwen3.6-35B-A3B is a second *firing* architecture whose
-digest does not move** (`head_dim` 256, MoE): a kernel that computed the wrong
-thing would not be selective by prompt. And the 8k Bonsai ON digest is
-**byte-identical** to the digest the `rot_k_tq4v` codec produced at the
-same shape (measured before that codec was retired in this same change, so it
-is not reproducible on this tree) — a completely different decode path (dequant-then-SDPA, and a
-*different* K codec) whose only thing in common with this one is that it applies
-TurboQuant-4 V at decode. Two independent implementations of the same V codec
-landing on the same 32 token ids is what a codec floor looks like; it is not
-what a kernel defect looks like.
-
-**gemma-4-e2b is a null control, not a second architecture.** On that
-shared-KV / windowed arch (`kv_h=1`, `head_dim=256`, SWA 512) the ±0.3% A/B at
-`k8v4`@4k is inside the 1.3% noise floor — but the reason is that the kernel
-never runs: `kv_cache_bytes` is bit-identical across both arms
-(156 850 176 B), which proves the persistent flash buffers are never even
-allocated and the `kv_seq > 4096` gate stops every dispatch. That is evidence
-the gate holds, not evidence about where the kernel pays. The second *firing*
-architecture is **Bonsai-27B** (`Qwen3_5ForConditionalGeneration`,
-`head_dim=256`, `kv_h=4`), which loses 1.98× at 16k. Both supported head_dims
-lose, so there is no arch where the kernel currently pays.
-
-This supersedes the previous per-family default-ON policy. The validations that
-policy rested on are unaffected and still stand — they were crash/fidelity
-clearances, never throughput ones: 32k NIAH × 3 models on Apple ≤9
-(commit fcb2e894ccc4, 100% needle retrieval at 5 depths × 3 ctx tiers), and the
-Apple10 `head_dim = 256` hazard re-drive on M5 Max via
-`crates/rmlx-kv-quant/tests/apple10_head_dim_256.rs` (no SIGSEGV, dispatch
-fired, cosine min 0.997 vs bf16). Lifting the HOLD needs a decode measurement,
-not another one of those.
-
-`--turbo-flash on` is an explicit force-ON — the opt-in for ablation and for
-the re-measurement that would lift the HOLD. `--turbo-flash off` is a hard
-override that a stale shell `RMLX_TURBO_FLASH=1` does not survive; `auto`
-honours that variable, so an operator who opted in keeps the kernel. That
-last combination — flag resolving OFF while the kernel actually runs — logs at
-`warn!` and names the cost, so a variable exported once in a shell or a CI job
-cannot carry the regression silently.
-
-`--turbo-flash` is a **global** flag: it resolves in `main` before subcommand
-dispatch, so `rmlx bench` / `rmlx baseline` measure the same kernel
-configuration `rmlx serve` runs. Until that was fixed the two disagreed on this
-very gate, and the measurement commands were the ones reading OFF.
-
-**head_dim coverage (TurboFlash kernel)**: `head_dim ∈ {128, 256}`. The
-P1 kernel's register arrays (`q_vals`, `o_state`, `v_decoded`) are sized
-for the larger dim (8 entries = 256/32). `head_dim = 256` is
-hw-validated on Apple10 (M5 Max) — historical SIGSEGV
-hazard at this size does not reproduce.
-
-**Qwen MoE note**: K8V4 is safe for Qwen MoE because K stays 8-bit. Running
-K below 8-bit on a 7:1 GQA model amplifies quantization error through
-softmax and produces catastrophic PPL degradation (218 → 8641 observed).
-The K-side codec is the safeguard — not the variant name.
-
-**Arch defaults**: none. `auto` is bf16 on every arch and at every context;
-K8V4 is opt-in. It was the default for `Qwen3_5ForConditionalGeneration` (PARO
-checkpoints) and `Gemma4ForConditionalGeneration` (small + PARO), and the
-per-context policy picked it at ≤8192 tokens, until both were retired.
+**Qwen MoE note**: K8V4 is safe for Qwen MoE because K stays 8-bit. K below
+8 bits on a 7:1 GQA model amplifies quantization error through softmax (PPL
+218 → 8641 observed). The K-side codec is the safeguard, not the variant name.
 
 **CLI**: `--kv-quant k8v4`; or `--ctk q8_g128 --ctv tq4`.
-
-**Smoke-probe status**: green on all primary test-target families.
 
 ---
 
@@ -994,75 +582,41 @@ per-context policy picked it at ≤8192 tokens, until both were retired.
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**K codec**: rMLX MSL `q8_0`, `group_size=128` (same as K8V8 / K8V4).
+**K codec**: rMLX MSL `q8_0`, `group_size=128` (the same as K8V8 / K8V4).
 **V codec**: PlanarQuant 4-bit with per-pair Givens rotation, `group_size=32`.
 
-PlanarQuant stores three parallel buffers per V side:
+`QuantPlanarV` keeps three GPU buffers:
 
 - `gpu_codes_buf` (u32): four u32 words per group of 32 elements.
-- `gpu_scales_buf` (f32): one f32 scale per pair of elements — 16 per group
-  (16× more fine-grained than TurboQuant's one scale per group of 32).
-- `gpu_rotations_buf` (u32): two u32 words per group, encoding eight 4-bit
-  Givens rotation indices per word.
+- `gpu_scales_buf` (f32): one f32 scale per pair of elements, 16 per group.
+- `gpu_rotations_buf` (u32): two u32 words per group, eight 4-bit Givens
+  rotation indices per word.
 
 The Givens rotation operates on pairs of V values before 4-bit quantization.
-This per-pair micro-rotation decorrelates adjacent channels and reduces
-per-element reconstruction error versus TurboQuant V4 on Gaussian-distributed
-KV vectors by approximately 2–3×.
-
-Storage struct: `QuantPlanarV`. CPU path uses scalar `planar_quantize` /
-`planar_dequantize` from `rmlx_quant::planarquant`. GPU path calls
+The CPU path uses `planar_quantize` / `planar_dequantize` from
+`rmlx_kv_quant::planarquant`. The GPU path uses the
 `planar_quantize_v4_gpu` / `planar_dequantize_v4_gpu` MSL kernels.
 
-`update_and_sdpa` path:
-1. `QuantK::append` for K (identical to K8V8).
-2. `QuantPlanarV::append` — calls `planar_quantize_v4_gpu` on GPU.
+Store-backed `update_and_sdpa` path:
+1. `QuantK::append` for K (as in K8V8).
+2. `QuantPlanarV::append` (`planar_quantize_v4_gpu` on GPU).
 3. `QuantK::dequantize_choice` for K.
-4. `QuantPlanarV::dequantize_choice` — calls `planar_dequantize_v4_gpu`,
-   passing all three buffer arrays (codes, scales, rotations).
+4. `QuantPlanarV::dequantize_choice` (`planar_dequantize_v4_gpu`, with the
+   codes, scales and rotations buffers).
 5. `scaled_dot_product_attention`.
 
-**Perf characterization**: wins TPS outright vs K8V8 at long context (≥32K)
-on dense full-attention archs. Verified at 64K context on Qwen3.6-35B-A3B
-(71.53 TPS Planar vs 65.2 TPS K8V8). The per-pair scale buffers give PlanarQuant
-V ≈4.4× the resident memory of tq4 V at head\_dim=128 (≈352 B vs ≈80 B per
-token per kv\_head: codes 64 B + 16 scales/group × 4 B × 4 groups = 256 B +
-rotations 32 B). The quality gain from finer scales and per-pair rotation
-justifies this for dense full-attention archs at long context.
+**The planar V store is larger than bf16.** The store spends **22.00 bits per
+value**, against 16.0 for bf16, at every `head_dim` and at both bit widths
+(planar3 and planar4 have the same storage). The split is codes 4.0 +
+**per-pair scales 16.0** + rotation indices 2.0. `kv_rate_tests.rs` reads the
+bytes that `planar_quantize` produces. `SideStore::Planar` models the same
+22.0.
 
-**Memory truth — the planar V side is larger than bf16.** Those 352 B carry 128
-values, so the store spends **22.00 bits per value against bf16's 16.0**, at
-every `head_dim` and at both bit widths (planar3 and planar4 occupy
-byte-identical storage). The split is codes 4.0 + **per-pair scales 16.0** +
-rotation indices 2.0: one `f32` per 2 elements is a whole bf16 value's worth of
-sideband before a single code bit is spent, so the code width is not what sets
-the rate. Measured, not modelled — `kv_rate_tests.rs` reads the bytes
-`planar_quantize` actually produced. Two consequences:
-
-- The perf win above is real and is **not** a memory win on the V axis; it buys
-  TPS and quality with resident bytes.
-- The rate above is the **store's** rate, and on a seeded cache `Planar` no
-  longer keeps a store: nothing reads it at decode, so `exit_prefill` does not
-  build it (`docs/KV_CACHE.md` §9.6 F3) and the layer's resident V is the bf16
-  mirror at 16.0 bits per value. `KvQuant::estimated_resident_bytes_per_layer`
-  reports that directly. The 22.0-bit rate still governs a store-backed planar
-  cache: a seedless one (hydrated, or never through a prefill bracket), and the
-  resident bytes of any future decode path that reads the store. The estimator
-  now models it at 22.0 (`SideStore::Planar`), so the day a planar decode kernel
-  flips `decode_reads_packed_store` the advisory is right the same day. It used
-  to model 5.0 — off by 4.4× and wrong in the codec's favour, i.e. it would have
-  called a store *larger* than bf16 a memory win. That arm is latent, so nothing
-  observable would have caught it; `every_codec_byte_model_matches_the_store_it_writes`
-  reaches it directly for that reason.
-
-**Arch defaults**: none. `auto` is bf16 on every arch and at every context;
-Planar is opt-in. It was the default for `Gemma3ForConditionalGeneration` and
-dense `Gemma4ForConditionalGeneration` (`hidden_size` ≥ 5376), and the
-per-context policy picked it above 32K tokens, until both were retired.
+On a seeded cache `Planar` keeps no store, so the resident V is the bf16 mirror
+at 16.0 bits per value. The 22.0-bit rate applies to a store-backed planar
+cache: a hydrated cache, or a cache that did not go through a prefill bracket.
 
 **CLI**: `--kv-quant planar`; or `--ctk q8_g128 --ctv planar4`.
-
-**Smoke-probe status**: green on primary test targets.
 
 ---
 
@@ -1073,44 +627,37 @@ per-context policy picked it above 32K tokens, until both were retired.
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**KvQuant variant**: `KvQuant::Planar3`. Routes to `KvStorage::Planar { bits: 3 }` — no new storage variant.
+**KvQuant variant**: `KvQuant::Planar3`. It uses `KvStorage::Planar { bits: 3 }`.
 
-**Algorithm**: same Givens-rotation + per-pair scale as the 4-bit codec. Diverges at quantization:
-- **Codebook**: 3-bit Lloyd-Max N(0,1) — 8 centroids (from `CODEBOOK_3BIT` in `turboquant.rs`).
-- **Pack format**: 10 vals/u32 (3 × 10 = 30 bits used, 2 wasted per u32). With GROUP_SIZE=32:
-  `ceil(32/10) = 4` u32 words per group — **identical word count** to the 4-bit codec (8 vals/u32 × 4).
-  ForgeAttention-compatible buffer shape.
-- **Decision boundaries**: 7 midpoints (vs 15 for 4-bit).
-- **Mask**: `0x7u` (3 bits, vs `0xFu` for 4-bit).
+**Algorithm**: the same Givens rotation and per-pair scale as the 4-bit codec.
+The differences:
+- **Codebook**: 3-bit Lloyd-Max N(0,1), 8 centroids (`CODEBOOK_3BIT` in
+  `turboquant.rs`).
+- **Pack format**: 10 values per u32 (30 bits used, 2 unused). With
+  GROUP_SIZE=32, `ceil(32/10) = 4` u32 words per group. This is the same word
+  count as the 4-bit codec (8 values per u32 × 4).
+- **Decision boundaries**: 7 midpoints (15 for 4-bit).
+- **Mask**: `0x7u` (`0xFu` for 4-bit).
 
-**Path-independent byte stream.** Both the CPU codec and the MSL kernels pack
-codes in this same word convention (`word = elem / (32/bits)`,
-`shift = (elem % (32/bits)) * bits`, little-endian u32 words), so the code bytes
-round-trip across the CPU/GPU boundary unchanged — required for SSD spill (CPU
-encode) → hydrate (GPU read). For `bits=4` (8 vals/u32) the word convention is
-byte-identical to a dense LSB-first stream; for `bits=3` (10 vals/u32) it is
-**not** dense. A dense 3-bit layout (12 bytes/group) would be misread by the GPU
-as 4 u32 words (16 bytes/group) and silently corrupt the V cache. iso3 and
-rotor3 share this convention; PlanarQuant 3-bit now does too.
+**Path-independent byte stream.** The CPU codec and the MSL kernels pack codes
+in the same word convention: `word = elem / (32/bits)`,
+`shift = (elem % (32/bits)) * bits`, little-endian u32 words. Thus the code
+bytes cross the CPU/GPU boundary unchanged. SSD spill (CPU encode) → hydrate
+(GPU read) needs this. For `bits=4` the convention equals a dense LSB-first
+stream. For `bits=3` it is **not** dense: a dense 3-bit layout (12 bytes per
+group) would be misread as 4 u32 words (16 bytes per group). iso3 and rotor3
+use the same convention.
 
-The GPU kernels are `planar_quantize_v3_gpu` / `planar_dequantize_v3_gpu` in `planarquant_msl.rs`;
-CPU path uses `planar_quantize(bits=3)` / `planar_dequantize` from `planarquant.rs`.
+The GPU kernels are `planar_quantize_v3_gpu` / `planar_dequantize_v3_gpu` in
+`planarquant_msl.rs`. The CPU path is `planar_quantize(bits=3)` /
+`planar_dequantize` in `planarquant.rs`. The load-time precompile warms
+`planar_quantize_v3_gpu` (`precompile::warm_v_side`). The GPU round-trip test
+is `planar_v3_msl_roundtrip_within_tolerance` (`#[ignore]`, GPU).
 
-**Cosine gate**: mean cosine ≥ 0.9989 on LCG fixture (measured 0.999956 — very high
-because per-pair rotation+scale compresses correlated pairs extremely well even at 3 bits).
+**Cosine gate**: mean cosine ≥ 0.9989 on the LCG fixture.
 
-**Memory**: same codes buffer size as 4-bit (4 words/group), with per-pair scales and rotation arrays.
-
-**CLI**: `--kv-quant planar3`; or `--ctk q8_g128 --ctv planar_3`; or `--kv-preset planar3`.
-
-**Smoke-probe status**: CPU codec verified; the V3 **quantize** kernel
-(`planar_quantize_v3_gpu`) is **precompiled at load** via
-`precompile::warm_v_side`, so a first `--kv-quant planar3` request pays no
-Metal cold-compile stall on the prefill V-encode path (the separate
-`planar_dequantize_v3_gpu` kernel still cold-compiles lazily on first cache
-read). The GPU round-trip test `planar_v3_msl_roundtrip_within_tolerance`
-exists and passes but is `#[ignore]`-gated (needs a local Metal context — run
-with `cargo test -p rmlx-kv-quant --release -- --ignored`).
+**CLI**: `--kv-quant planar3`; or `--ctk q8_g128 --ctv planar_3`; or
+`--kv-preset planar3`.
 
 ---
 
@@ -1119,209 +666,117 @@ with `cargo test -p rmlx-kv-quant --release -- --ignored`).
 **K codec**: `mx.quantize(mode="affine", bits=k_bits, group_size=k_group_size)`.
 **V codec**: `mx.quantize(mode="affine", bits=v_bits, group_size=v_group_size)`.
 
-Default parameters: `k_bits=8, v_bits=4, k_group_size=64, v_group_size=64`.
-These match `mlx-lm-turboquant`'s `MixedQuantKVCache` defaults exactly.
+The affine codec stores a 3-tuple `(codes_u32, scales, biases)` per side.
+Reconstruction is `x = scale * code + bias`. rMLX MSL `q8_0` is symmetric, has
+no bias term and uses `Q8_GROUP_SIZE=128`. The two codecs are not
+interchangeable.
 
-The affine codec stores a 3-tuple `(codes_u32, scales_f32, biases_f32)` per
-side. Reconstruction: `x = scale * code + bias`. This differs from rMLX MSL
-`q8_0` (symmetric, no bias term; `Q8_GROUP_SIZE=128`) despite both being
-nominally "8-bit affine". The two codecs are not interchangeable.
+`MixedKvState` (`mixed_quant/state.rs`) owns the state. Its buffers grow in
+`STEP=256` token increments. Each decode step:
+1. `MixedKvState::update_and_fetch` calls `mx.quantize` on the new K and V
+   slices, writes them with `slice_update`, and returns views of the filled
+   prefix as two `MixedTuple` structs.
+2. `mixed_quantized_sdpa` runs two `mx.quantized_matmul` calls (queries @ K,
+   then probs @ V) on the stored 3-tuples, with no dequantize step.
 
-State is owned by `MixedKvState` in `mixed_quant.rs`. Six pre-allocated
-`[B, kv_h, max_seq, D/.]` buffers grow in `STEP=256` token increments. Each
-decode step:
-1. `MixedKvState::update_and_fetch` — calls `mx.quantize` on new K and V
-   slices, writes into the six buffers via `slice_update`, returns views of
-   the filled prefix as two `MixedTuple` structs.
-2. `mixed_quantized_sdpa` — runs two `mx.quantized_matmul` calls (queries @ K
-   then probs @ V) directly on the stored 3-tuples without a dequantize
-   round-trip.
+Prefill: the cache accumulates raw bf16. Then `exit_prefill` calls
+`bulk_init_from_fp16`, which issues one batched `mx.quantize` per side.
 
-Prefill bulk path (`exit_prefill`): accumulates raw bf16 during prefill, then
-`bulk_init_from_fp16` issues a single batched `mx.quantize` per side (no
-per-step quantize overhead during prompt processing).
+`KvCache::update_and_sdpa` selects this path on `self.quant`
+(`KvQuant::uses_mixed_path`). `KvCache::update` refuses a `Mixed` storage.
 
-**Key distinction vs K8V4/K8V8**: Mixed uses the portable MLX affine
-quantizer with `(scale, bias)` per group. The K8V4/K8V8/Planar K-side uses
-rMLX MSL q8_0 with symmetric `scale = max(|x|)/127` and no bias.
+**`KvQuant::RotK`** uses `KvStorage::Mixed` with `rotate_k=true` on
+`MixedKvState` (`MixedKvState::new_rotated`). K is fixed at 8 bits and
+group_size 64. The state applies a Hadamard rotation to K before it
+quantizes. `mixed_quantized_sdpa` applies the same rotation to Q before the
+score matmul, so the rotations cancel. See rot_k below.
 
-**`KvQuant::RotK`**: reuses `KvStorage::Mixed` with `rotate_k=true` on
-`MixedKvState`. K bits are fixed at 8, group_size fixed at 64. The storage
-and SDPA machinery is identical to plain Mixed; the only difference is that
-`MixedKvState::update_and_fetch` applies a Hadamard rotation to K before
-quantization, and `mixed_quantized_sdpa` applies the same rotation to Q
-before the score matmul so the rotations cancel. See rot_k below.
-
-**Perf characterization**: +24% decode TPS vs K8V4 on Bonsai (36/36
-full-attention layers), because `quantized_matmul` eliminates the per-step
-full dequantize that dominates the rMLX K8V4 hot path at long sequences.
-On GQA-light MoE archs (25% FA layers) Mixed K8V4 regresses by 11–28% vs
-K8V8 — the `quantize` + `quantized_matmul` overhead amortises poorly when
-most layers are not full-attention.
-
-**Arch defaults**: none. `auto` is bf16 on every arch; Mixed is opt-in. It
-was the default for `Qwen3ForCausalLM` at `weight_bits=2` (Bonsai ternary)
-until the per-arch table was retired.
-
-**CLI**: `--kv-quant mixed_k<kb>g<kg>_v<vb>g<vg>` (e.g.
-`mixed_k8g64_v4g64`). The `RotK` variant is reached via `--ctk rot_k` (see
+**CLI**: `--kv-quant mixed_k<kb>g<kg>_v<vb>g<vg>` (for example
+`mixed_k8g64_v4g64`). `--ctk rot_k --ctv <affine-tag>` selects `RotK` (see the
 CLI flags section below).
-
-**Smoke-probe status**: green on Bonsai (Qwen3ForCausalLM, bits=2).
 
 ---
 
 ### rot_k — K-side Hadamard rotation
 
-**Math**: attention scores are `Q · Kᵀ`. Insert orthogonal rotation `R`
+**Math**: attention scores are `Q · Kᵀ`. Insert an orthogonal rotation `R`
 (`Rᵀ R = I`) into the K basis and pre-rotate Q by the same `R`:
 
 ```
 (Q Rᵀ) · (K Rᵀ)ᵀ = (Q Rᵀ) · (R Kᵀ) = Q (Rᵀ R) Kᵀ = Q Kᵀ
 ```
 
-Storing rotated K (`K_rot = K Rᵀ`) and pre-rotating queries (`Q_rot = Q Rᵀ`)
-before the score matmul leaves attention scores identical to the unrotated
-computation up to quantization error on `K_rot`. A Hadamard rotation
-decorrelates K channels and equalizes their dynamic range, reducing affine
-quantization error in the rotated basis — **but only when the channels were
-unequal to begin with**. Measured against the identical unrotated quantizer:
-**+1.81 bits** on outlier-channel data and **−0.63 bits** on i.i.d. uniform
-data, where the transform raises the peak-to-RMS ratio the group scale is set
-by. See "Codec fidelity — measured" below.
+The scores stay equal to the unrotated scores, up to the quantization error
+on `K_rot = K Rᵀ`. A Hadamard rotation decorrelates K channels and makes their
+dynamic range equal. This reduces affine quantization error **only when the
+channels were unequal**. On i.i.d. uniform data the transform raises the
+peak-to-RMS ratio that sets the group scale, and the rotation loses bits. See
+"Codec fidelity — measured" below.
 
-K is never inverse-rotated — the rotation cancels algebraically. This
-distinguishes rot_k from V-side rotation schemes (PlanarQuant, TurboQuant)
-where the output must be un-rotated back to the value basis.
+K is never inverse-rotated; the rotation cancels. V-side rotation schemes
+(PlanarQuant, TurboQuant) must un-rotate the output back to the value basis.
 
 `R` is the normalized Walsh–Hadamard matrix `H_D / sqrt(D)`. It is orthogonal
-and symmetric (`R = Rᵀ`), so the same matrix rotates both K and Q.
-Construction requires a power-of-two head_dim (Sylvester recurrence).
+and symmetric (`R = Rᵀ`), so the same matrix rotates K and Q. The construction
+needs a power-of-two `head_dim` (Sylvester recurrence).
 
-**v1 path** (`rot_k.rs`): plain MLX `matmul` against a precomputed `[D, D]`
-matrix. Correct and coherent; O(D²) arithmetic per step.
+**v1 path** (`rot_k.rs`): MLX `matmul` against a precomputed `[D, D]` matrix.
+O(D²) arithmetic per step.
 
-**Fused FWHT kernel** (`rot_k_msl.rs`, opt-in via `--rot-k-fused on` /
-`RMLX_ROT_K_FUSED=1` → `DispatchPolicy::rot_k_fused`):
-Fast Walsh-Hadamard Transform in Metal threadgroup shared memory, fused with
-affine-8-bit quantize in a single kernel pass. O(D log₂ D) arithmetic and no
-intermediate DRAM allocation for `K_rot`. For D=128 (Bonsai): 896 arithmetic
-ops vs 16 384 for the matmul (~18×). Output *format* matches
-`mx.quantize(mode="affine", bits=8, group_size=64)` — same shapes, same dtypes
-— so it feeds directly into `mixed_quantized_sdpa` unchanged. It is not
-bit-exact with it, and not for a width reason — MLX's `affine_quantize` also
-loads into `float` and reduces in `float`, casting only at the store
-(`mlx/backend/metal/kernels/quantized.h:2460-2489` in 0.31.2). The difference
-is the affine parameterisation. MLX initialises `w_max = 0` (so an all-negative
-group still spans up to zero), takes `scale = max((w_max - w_min)/n_bins, eps)`,
-flips its sign to whichever end is larger in magnitude, then snaps the
-zero-point: `q0 = round(edge/scale)`, `scale = edge/q0`, `bias = at_zero ? 0 :
-edge`. `metal/rot_k_fwht_quantize_d128.metal:58-59` uses the plain unsigned
-form, `scale = (gmax - gmin)/255` with `bias = gmin`. Same width, different
-grid: a value can land one level apart between the two arms before the
-FWHT-versus-matmul rotation difference enters at all.
+**Fused FWHT kernel** (`rot_k_msl.rs`; opt-in with `--rot-k-fused on` /
+`RMLX_ROT_K_FUSED=1` → `DispatchPolicy::rot_k_fused`). A Fast Walsh-Hadamard
+Transform in threadgroup shared memory, fused with the affine 8-bit quantize
+in one kernel pass. O(D log₂ D) arithmetic and no DRAM allocation for
+`K_rot`. The output *format* matches
+`mx.quantize(mode="affine", bits=8, group_size=64)`: same shapes and same
+dtypes. Thus it feeds `mixed_quantized_sdpa` unchanged. The scales and biases
+come back at K's dtype, as with `mx.quantize`.
 
-That dtype match is load-bearing and was missing until 2026-08: the kernel
-returned its scales and biases as the f32 it computed them in, while
-`mx.quantize` returns them at K's dtype. `quantized_matmul` and `dequantize`
-take their operand width from the scales, so with `--rot-k-fused on` a bf16
-model decoded the whole layer stack in f32 — attention output, residual add,
-next layer's norm and weight GEMV — for as long as the flag was set, and the
-fused and non-fused arms of one codec silently ran at different widths.
-Narrowing the scales moves the reconstruction by at most 0.0156 against the
-`mx.quantize` reference — measured and gated at that value, not merely printed
-(`fwht_quantize_types_scales_like_mx_quantize`) — and it does move greedy
-output: on Bonsai-8B at 8k the fused arm's token digest changes from matching
-the non-fused arm to differing from it.
+It is not bit-exact with `mx.quantize`. The cause is the affine
+parameterisation, not a width. MLX's `affine_quantize` loads and reduces in
+`float` and casts only at the store
+(`mlx/backend/metal/kernels/quantized.h:2460-2489` in 0.31.2). MLX starts from
+`w_max = 0`, takes `scale = max((w_max - w_min)/n_bins, eps)`, flips its sign
+toward the larger end, then snaps the zero-point: `q0 = round(edge/scale)`,
+`scale = edge/q0`, `bias = at_zero ? 0 : edge`.
+`metal/rot_k_fwht_quantize_d128.metal:58-59` uses the plain unsigned form,
+`scale = (gmax - gmin)/255` with `bias = gmin`. Thus a value can land one
+level apart between the two arms.
 
-Fidelity was measured rather than assumed: against the unquantized rotated K,
-`mx.quantize` reconstructs at cosine 0.999969 and the fused arm at 0.999965 —
-4e-6 apart, both gated in the same test. Narrowing the scales did not move the
-codec's accuracy in either direction to any degree this shape can resolve.
+Storing the scales at bf16 moves the reconstruction by at most 0.0156 against the
+`mx.quantize` reference on the test fixture. `fwht_quantize_types_scales_like_mx_quantize`
+gates it at 0.02 and asserts that the scale and bias dtypes match
+`mx.quantize`.
 
-What the digest A/B does **not** establish is why it moved. The pre-fix arm had f32 scales
-*and* an f32 decode graph, and the post-fix arm has neither, so the two
-variables moved together; "the wider graph was masking the quantizer's own
-rounding" is a plausible reading of it and not a measured one. Isolating it
-would need a third arm — bf16 scales with the promotion forced back on — which
-nothing needs today.
+A matching `rot_k_fwht_rotate_gpu` kernel applies the same FWHT to Q. It
+replaces the `rotate_last_axis` matmul when the fused path is active.
 
-A matching `rot_k_fwht_rotate_gpu` kernel applies the same FWHT to Q,
-replacing the `rotate_last_axis` matmul when the fused path is active.
+**Storage**: `KvStorage::Mixed`. `MixedKvState` carries a
+`k_rotation: Option<Array>` field with the precomputed `R` matrix.
 
-**Storage**: `KvStorage::Mixed`.
-`MixedKvState` carries a `k_rotation: Option<Array>` field with the
-precomputed `R` matrix.
+**Requirements**: power-of-two `head_dim`. V must be an affine codec
+(`q*_g*`).
 
-**Requirements**: power-of-two `head_dim`. Pair with any affine V codec
-(default V = `q4_g64`).
+**CLI**: `--ctk rot_k --ctv <affine-tag>`, or
+`--kv-quant rot_k_v<vb>g<vg>`.
 
-**CLI**: `--ctk rot_k [--ctv <affine-tag>]`.
-
-**Cosine gate**: K-side cosine similarity ≥ 0.9970 (mean), ≥ 0.9990 (min)
-on LCG fixture data (head_dim=64, 8-bit affine group_size=64).
-Test: `rot_k_hadamard_8bit_cosine_gate` in `rot_k_tests.rs`. That gate
-measures the quantizer, not the rotation — deleting the Hadamard leaves cosine
-at 0.999881 against 0.999989, inside its 0.001 slack, so it passes.
-The rotation is gated by `rot_k_hadamard_buys_bits_on_outlier_data_and_costs_them_on_iid_data`
-and `hadamard_incoherence_ratio_beats_every_block_local_rotation` in
-`rotation_fidelity_tests.rs`.
+**Cosine gate**: K-side cosine ≥ 0.9970 (mean) and ≥ 0.9990 (min) on the LCG
+fixture (head_dim=64, 8-bit affine, group_size=64). Test:
+`rot_k_hadamard_8bit_cosine_gate` in `rot_k_tests.rs`. That gate measures the
+quantizer, not the rotation: it passes with the Hadamard removed. Two tests in
+`rotation_fidelity_tests.rs` gate the rotation:
+`rot_k_hadamard_buys_bits_on_outlier_data_and_costs_them_on_iid_data` (at
+least 1.5 bits gained on outlier data, a loss on i.i.d. data) and
+`hadamard_incoherence_ratio_beats_every_block_local_rotation`.
 
 ---
 
 ### Retired: `rot_k_tq4v` (rotated K + TurboQuant 4-bit V)
 
-Withdrawn. `--kv-quant rot_k_tq4v` is rejected at parse and
-`--ctk rot_k --ctv tq4` at resolve (`combo_to_kv_quant`); each error names
-`rot_k_v4g64`, which is the same rotated affine 8-bit K with an MLX-affine
-4-bit V. Recorded here so the design is not re-derived.
-
-It was a dequant-then-SDPA path: every decode step appended to its packed store
-and then rebuilt a **full bf16 K and a full bf16 V of the whole prefix** before
-running an ordinary `scaled_dot_product_attention` over them. `mx.quantized_matmul`
-cannot consume a Lloyd-Max codebook, so the affine-V pairing's fused route was
-never available to it, and the one kernel in tree that reads TurboQuant-4 V at
-decode (`turbo_flash`) is `auto`-OFF on every host and measured slower than the
-generic path. There was no third option.
-
-Measured against its affine-V sibling `rot_k_v4g64` at the same shape
-(`kv_bytes` from the `kv cache bytes` debug event; digests over 32 greedy token
-ids at temp=0; TPS sequential n=1 on a host that could not pass its quiescence
-gate, so read the ratios as direction and the residency and digests as exact):
-
-| arch | ctx | resident KV vs `rot_k_v4g64` | resident KV vs `none` | decode TPS vs `rot_k_v4g64` | digest |
-|---|---:|---:|---:|---:|---|
-| Ternary-Bonsai-8B-2bit | 4096 | +0.49% | +31.4% | ×0.75 | matches |
-| Ternary-Bonsai-8B-2bit | 8192 | +0.83% | +31.1% | ×0.63 | **differs** |
-| Ternary-Bonsai-8B-2bit | 32768 | +0.86% | +30.6% | ×0.42 | matches |
-| gemma-4-e2b-mxfp8 | 4096 | +0.46% | +44.9% | ×0.97 | **differs** |
-| gemma-4-e2b-mxfp8 | 8192 | +0.74% | +43.6% | ×0.97 | **differs** |
-| gemma-4-e2b-mxfp8 | 32768 | +1.0% | +42.6% | ×0.94 | **differs** |
-
-Two things in that table are worth keeping.
-
-**The memory claim was true and misattributed.** The codec did hold 27–45% more
-resident KV than `--kv-quant none`, exactly as reported — but so does its affine
-sibling, to within one percent. That excess is the whole `Mixed` / `RotK`
-family's: those codecs read their packed store at decode *and* `exit_prefill`
-still materialises both bf16 mirrors for them. `tq4` V versus affine-4 V is the
-0.5–1% column, not the 30–45% one. Retiring `rot_k_tq4v` therefore does not put
-any codec below `none`; that is a separate, family-wide defect.
-
-**The decode loss was real and was the tq4 V.** On the dense `kv_h > 1` arch the
-loss grows monotonically with context (×0.75 → ×0.63 → ×0.42 against the affine
-sibling at 4k/8k/32k) — the signature of a per-step cost proportional to prefix
-length, which is the double materialisation. On gemma-4-e2b it is small because
-28 of 35 layers are SWA and leave `update_and_sdpa` on the bf16 rotating ring
-before any codec branch is reached.
-
-Fidelity was worse too: at temp=0 it is the only codec of the four measured that
-never reproduces its affine sibling's token ids on the shared-KV arch, and the
-e2e manifest already carried it as DEGRADED on Bonsai-2bit.
-
-A correctness reference for TurboQuant-4 V at decode still exists in tree —
-`turbo_flash_reference_sdpa`, in the TurboFlash section above — so retiring the
-codec does not retire the ability to check that codec's numerics.
+`--kv-quant rot_k_tq4v` is rejected at parse. `--ctk rot_k --ctv tq4` is
+rejected at resolve (`combo_to_kv_quant`). Each error names the replacement:
+`rot_k_v4g64` (`--ctv q4_g64`), the same rotated affine 8-bit K with an
+MLX-affine 4-bit V.
 
 ---
 
@@ -1332,37 +787,15 @@ codec does not retire the ability to check that codec's numerics.
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**Status**: opt-in on every arch — `auto` is bf16 and never selects it. It was
-briefly the auto default for Gemma4 small, then reverted to K8V8 by the
-composite-score audit, and both of those tables are now retired (see "Retired:
-the per-arch default table" below). Available via `--kv-quant k8vturbo3`.
-
-**K codec**: rMLX MSL q8_0, `group_size=128` (same as K8V8 K-side).
+**K codec**: rMLX MSL q8_0, `group_size=128` (the same as the K8V8 K side).
 **V codec**: TurboQuant 3-bit Lloyd-Max N(0,1) codebook, `group_size=32`.
 
-The 3-bit codebook has 8 centroids. Pack format: 32 × 3 bits = 96 bits = three
-u32 words per group. This gives 3/4 the memory of 4-bit V versus approximately
-the same decode complexity.
+The 3-bit codebook has 8 centroids. Pack format: 32 × 3 bits = 96 bits =
+three u32 words per group. The V encode and dequant run on the CPU: `QuantV`
+refuses a GPU dispatch at 2 and 3 bits. `k8vturbo3_append_msl.rs` holds the
+3-bit MSL kernels. The `TurboSym3` K side and the fused-QK path use them.
 
-**Promotion bench** (canary shape 4096 prompt tokens, release-perf binary):
-
-| Model | K8V4 median TPS | K8VTurbo3 median TPS | Delta |
-|---|---:|---:|---:|
-| Gemma4-e4b | 74.670 | 74.370 | −0.40% |
-| Qwen3.6-35B | 97.869 | 95.958 | −1.95% (opt-in only) |
-| Bonsai 8B | 91.235 | 99.055 | +8.6% (not arch target) |
-
-Gemma4-e4b −0.40% is within the <1% promote gate. Cosine gate ≥ 0.9807
-passes. Smoke probe green on all 3 models.
-
-An earlier bench at 17K context showed −3.5% (e4b) vs `Mixed{v_bits:3}`,
-which failed the −2% gate. That shape had thermal crosstalk between back-to-back
-long-prefill runs. The canary 4K shape shows the codec is within noise.
-
-The CPU dequant path is canonical; the MSL module (`k8vturbo3_append_msl.rs`)
-is retained as a future-reference hook.
-
-**CLI**: `--kv-quant k8vturbo3`.
+**CLI**: `--kv-quant k8vturbo3`. There is no `--ctk` / `--ctv` spelling.
 
 ---
 
@@ -1373,85 +806,53 @@ is retained as a future-reference hook.
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**Status**: opt-in via `--kv-quant k8vturbo3tcq`. Never an auto baseline.
-Turbo3-equivalent quality (same Lloyd-Max codebook, degenerate trellis — see
-note below).
-
-**K codec**: rMLX MSL q8_0, `group_size=128` (same K-side as K8VTurbo3).
+**K codec**: rMLX MSL q8_0, `group_size=128` (the same K side as K8VTurbo3).
 **V codec**: TurboQuant 3-bit Lloyd-Max N(0,1) codebook, `group_size=32`. The
-**codebook is unchanged from plain K8VTurbo3** — quality comes purely from
-smarter encode-side assignment: a 4-state Viterbi trellis (rate-1/2
-convolutional code, `TCQ_NUM_STATES = 4`) replaces nearest-centroid.
+**codebook is the same as plain K8VTurbo3**. Only the encode-side assignment
+changes: a 4-state Viterbi trellis (`TCQ_NUM_STATES = 4`) replaces the
+nearest-centroid choice.
 
 Transition rule: `next_state = ((state << 1) | (level & 1)) mod NUM_STATES`.
-Per-block forward + back-trace runs over the 32-element group; back-pointer
-table is `32 × 4 × 2 bytes` per block.
+The forward pass and back-trace run over each 32-element group.
 
-The **decoder is bit-identical to plain `turbo_dequantize`** — TCQ output is
-byte-for-byte indistinguishable from a `K8VTurbo3` pack at the codes / scales
-level. The two codecs share `k8vturbo3_append_msl::turbo_dequantize_v3_gpu`.
-Only the `KvQuant` discriminator and the SSD layout-key tag
-(`K8VTURBO3_TCQ_LAYOUT_TAG = "k8vturbo3tcq"`) distinguish them on disk; the
-SSD layer hard-rejects cross-codec hydrate to prevent a TCQ payload from
-silently being treated as plain turbo3 (and then mixed with
-nearest-centroid indices on the next decode append).
+The **decoder is plain `turbo_dequantize`**. At the codes and scales level, a
+TCQ pack has the same format as a `K8VTurbo3` pack. Only the `KvQuant`
+discriminator and the SSD layout-key tag
+(`K8VTURBO3_TCQ_LAYOUT_TAG = "k8vturbo3tcq"`) tell them apart on disk. The SSD
+layer rejects a cross-codec hydrate, so a TCQ payload is never read as plain
+turbo3.
 
-**Cosine target**: ≥ 0.9807 on the canonical LCG fixture (mtq `turbo3_tcq`
-row 0.9817 − 0.001 empirical floor). The load-bearing quality test in
-`tcq_tests.rs` asserts TCQ ≥ plain turbo3 cosine on a non-Gaussian
-(sinusoidal) fixture — a non-regression gate satisfied trivially by equality,
-not a demonstration of a strict quality win.
-
-**Trellis degeneracy note.** The per-step Viterbi cost is
-`dist(value, codebook[level])`, which depends only on the chosen level, not
-on the trellis state. Because every level is reachable from every state and
-the codebook is state-independent, the minimum-cost Viterbi path equals the
-greedy nearest-centroid assignment. TCQ output is therefore bit-identical to
-plain turbo3 on unstructured data with the same codebook. A state-dependent
-(grade-aware) codebook would be required to obtain a shaping gain; that
-follow-up is deferred. The `>=` quality gate in `tcq_tests.rs` is satisfied
-by equality and does not demonstrate a strict improvement over plain turbo3.
+**Trellis degeneracy.** The per-step Viterbi cost is
+`dist(value, codebook[level])`. It depends only on the level, not on the
+trellis state. Every level is reachable from every state, and the codebook
+does not depend on the state. Thus the minimum-cost path equals the greedy
+nearest-centroid assignment. A state-dependent codebook is necessary for a
+shaping gain.
 
 **Measured claw-back: 0.000 dB**, at both shipped widths, on i.i.d. Gaussian
-(codes byte-identical to plain turbo) *and* on a dim-axis sweep (codes differ
-by tie-breaking, distortion identical to four decimals — the stronger
-statement, and the one the non-strict cosine gate cannot make). Pinned by
-`trellis_coded_quantization_claws_back_nothing` in `rate_distortion_tests.rs`,
-as an equality, so giving the trellis a real constraint turns it red.
+data (codes identical to plain turbo) and on a dim-axis sweep (codes differ by
+tie-breaking; distortion identical to four decimals).
+`trellis_coded_quantization_claws_back_nothing` in `rate_distortion_tests.rs`
+pins this as an equality, so a trellis with a real constraint turns it red.
 
-**Bench** (canary shape 4096 prompt, 100 decode tokens, release-perf binary, 3-run mean):
-
-| Model | k8vturbo3 (TPS) | k8vturbo3tcq (TPS) | Delta |
-|---|---:|---:|---:|
-| Bonsai 8B | 98.95 | 95.11 | −3.9% |
-| Gemma4-e4b | 73.16 | 73.54 | +0.5% |
-| Qwen3.6-35B | 97.17 | 94.57 | −2.7% |
-
-All three within the −10% gate. The Bonsai overhead reflects the
-sequential per-token Viterbi loop (4 states × 8 levels × 32 dims per block);
-Gemma4 wider attention amortises it.
+**Cosine target**: ≥ 0.9807 on the LCG fixture. `tcq_tests.rs` also asserts
+TCQ ≥ plain turbo3 cosine on a sinusoidal fixture. Equality satisfies that
+gate.
 
 **Calibration recipe**: `--recipe turbo3_tcq` in `rmlx kv-calibrate` maps to
-the internal `turboquant35` recipe (same as plain `turbo3` / `turbo4`):
-emits `high_precision_indices` only; **no codebook override** is written
-because TCQ reuses the standard Lloyd-Max codebook. Calibration runtime is
-identical to plain `turbo3` (~30 s on a 7B model).
+the internal `turboquant35` recipe (the same as `turbo3` / `turbo4`). It emits
+`high_precision_indices` only. It writes no codebook override.
 
-**Implementation scope**: CPU Viterbi encode + CPU dequant on the hot
-path. The MSL Viterbi kernel
+**Implementation scope**: CPU Viterbi encode and CPU dequant. The MSL Viterbi
+kernel
 ([`tcq_v_msl::tcq_quantize_v3_gpu`](../crates/rmlx-kv-quant/src/tcq_v_msl.rs))
-is parity-tested CPU↔GPU (bit-identical codes + scales) but ships as a
-future-reference hook (precedent: K8VTurbo3 / K8VTurbo2 MSL hooks both
-regressed the −2 % TPS gate when wired on the hot path).
+has a CPU↔GPU parity test. No production path dispatches it.
 
-**V-side only**: TCQ is V-side only. K stays `q8_0` (group=128, no Viterbi).
-The Viterbi trellis is not applied to `QuantK`. `K8VTurbo3Tcq` therefore keeps
-the asymmetric K8/V3.25 shape and is never rejected by the Qwen MoE K-bits
-guard (K = 8 ≥ 8).
+**V-side only**: K stays `q8_0` (group=128). Thus the Qwen MoE K-bits guard
+does not reject `K8VTurbo3Tcq` (K = 8).
 
-**CLI**: `--kv-quant k8vturbo3tcq` (also surfaced as `CacheType::Turbo3Tcq`
-with canonical tag `k8v_turbo_3_tcq`, alias `turbo3_tcq` in
-`--ctv turbo3_tcq`).
+**CLI**: `--kv-quant k8vturbo3tcq`; or `--ctv turbo3_tcq`
+(`CacheType::Turbo3Tcq`, canonical tag `k8v_turbo_3_tcq`).
 
 ---
 
@@ -1462,50 +863,29 @@ with canonical tag `k8v_turbo_3_tcq`, alias `turbo3_tcq` in
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**Status**: opt-in via `--kv-quant k8vturbo2tcq`. Never an auto baseline.
-Turbo2-equivalent quality (same Lloyd-Max codebook, degenerate trellis — same
-caveat as K8VTurbo3Tcq above).
-
-**K codec**: rMLX MSL q8_0, `group_size=128` (same K-side as K8VTurbo2).
+**K codec**: rMLX MSL q8_0, `group_size=128` (the same K side as K8VTurbo2).
 **V codec**: TurboQuant 2-bit Lloyd-Max N(0,1) codebook (`CODEBOOK_2BIT`,
-4 centroids), `group_size=32`. **Codebook unchanged from plain K8VTurbo2** —
-quality comes from Viterbi-optimal encode assignment (same 4-state trellis as
-K8VTurbo3Tcq, but over 4 centroids instead of 8).
+4 centroids), `group_size=32`. The codebook is the same as plain K8VTurbo2.
+The encode uses the same 4-state trellis as K8VTurbo3Tcq, over 4 centroids.
+The same degeneracy applies.
 
 Pack format: 2-bit indices, 16 values per u32 (2 u32 words per 32-element
-block = 64 bits) — identical to plain `turbo_quantize_v` at `bits=2`. The
-decoder is `turbo_dequantize` with no TCQ-specific path.
+group). This is the same as plain `turbo_quantize_v` at `bits=2`. The decoder
+is plain `turbo_dequantize`. The SSD layout-key tag
+`K8VTURBO2_TCQ_LAYOUT_TAG = "k8vturbo2tcq"` prevents a cross-codec hydrate.
 
-The **decoder is bit-identical to plain `turbo_dequantize`** — TCQ output at
-2-bit is byte-for-byte indistinguishable from a `K8VTurbo2` pack. The SSD
-layout-key tag `K8VTURBO2_TCQ_LAYOUT_TAG = "k8vturbo2tcq"` prevents silent
-cross-codec hydrate (TCQ payload must not be treated as plain turbo2 and then
-mixed with nearest-centroid indices on the next decode append).
+**Cosine target**: ≥ 0.957 on the LCG fixture. `tcq_tests.rs` also asserts
+TCQ V2 ≥ plain turbo2 cosine on the sinusoidal fixture.
 
-**Cosine target**: ≥ 0.957 on the canonical LCG fixture (empirical measured
-value ~0.9579; floor = measured − 0.001 ≈ 0.957). The load-bearing quality
-test in `tcq_tests.rs` further asserts TCQ V2 ≥ plain turbo2 cosine on the
-sinusoidal fixture.
-
-**V-side only**: TCQ is V-side only. K stays `q8_0` (group=128, no Viterbi).
-`K8VTurbo2Tcq` therefore keeps the asymmetric K8/V2.25 shape.
-
-**Outlier-mask deferred**: The `high_precision_indices` outlier-mask wiring
-(present in the 3-bit path) is deferred. Ships the naïve Viterbi path over
-the unmasked 2-bit codebook.
-
-**MSL hook**: removed — the parked GPU Viterbi kernel had no production
-dispatch path and rotted (kernel-load failure, never caught because its
-tests were `#[ignore]`d). The hot path forces `Device::Cpu`; a GPU kernel
-can be re-added later with a real dispatch caller from day one.
+**V-side only**: K stays `q8_0` (group=128). There is no outlier mask. The
+V encode runs on the CPU. There is no GPU Viterbi kernel for 2 bits.
 
 **Calibration recipe**: `--recipe turbo2_tcq` in `rmlx kv-calibrate` maps to
-the internal `turboquant25` recipe (same as plain `turbo2`). No codebook
-override written.
+the internal `turboquant25` recipe (the same as `turbo2`). It writes no
+codebook override.
 
-**CLI**: `--kv-quant k8vturbo2tcq` (also surfaced as `CacheType::Turbo2Tcq`
-with canonical tag `k8v_turbo_2_tcq`, alias `turbo2_tcq` in
-`--ctv turbo2_tcq`).
+**CLI**: `--kv-quant k8vturbo2tcq`; or `--ctv turbo2_tcq`
+(`CacheType::Turbo2Tcq`, canonical tag `k8v_turbo_2_tcq`).
 
 ---
 
@@ -1516,48 +896,34 @@ with canonical tag `k8v_turbo_2_tcq`, alias `turbo2_tcq` in
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**Status**: opt-in via `--kv-quant tsym4` (or the `quality` preset). Never an
-auto baseline.
+**K codec**: TurboQuant 4-bit Lloyd-Max N(0,1) codebook, `group_size=32`.
+**V codec**: the same.
 
-**K codec**: TurboQuant 4-bit Lloyd-Max N(0,1) codebook, `group_size=32`
-(K-axis use of the axis-agnostic V codec).
-**V codec**: same — TurboQuant 4-bit Lloyd-Max N(0,1) codebook, `group_size=32`.
+This is the symmetric form of `K8V4`. Both axes use the same TurboQuant 4-bit
+MSL kernels (`turboquant_msl::turbo_quantize_v4_gpu` /
+`turbo_dequantize_v4_gpu`). The CPU and MSL codecs take a flat f32 buffer and
+a 4-D shape, so K and V share the dispatch.
 
-This is the symmetric counterpart of `K8V4`: both axes use the **same**
-TurboQuant 4-bit MSL kernel (`turboquant_msl::turbo_quantize_v4_gpu` /
-`turbo_dequantize_v4_gpu`). The CPU + MSL codecs are axis-agnostic — they
-take a flat f32 buffer plus a 4-D shape and produce flat codes/scales —
-so the K side and V side share dispatch, **no kernel fork** (shared dispatch).
-
-The K and V buffers are kept as **independent types** (`QuantKTurbo<4>`,
-spelled `QuantKTurbo4`, and `QuantV`), so the two append paths stay decoupled
-inside `KvStorage::TurboSym4 { k, v, max_seq }`. Layout tag (single source
-of truth for the SSD geometry header):
+K and V are **separate types** (`QuantKTurbo<4>`, spelled `QuantKTurbo4`, and
+`QuantV`) inside `KvStorage::TurboSym4 { k, v, max_seq }`. The SSD layout tag
+is:
 
 ```
 const TURBOSYM4_LAYOUT_TAG: &str = "tsym4_lloyd_4_4";
 ```
 
-**Arch guard (CLAUDE.md hard rule 6)** — symmetric 4-bit K is the PPL-218→8641
-disaster path on Qwen MoE. `--kv-quant tsym4` on a
-`Qwen3_5MoeForConditionalGeneration` checkpoint is rejected at resolve-time
-by `validate_resolved` with `ResolveError::QwenMoeKBitsTooLow(4)` (exit 78,
-same surface as the existing Mixed K<8 rejection). The helper
-`KvQuant::k_below_8bit()` returns `true` for this variant — extend the
-helper when adding any future sub-8-bit-K codec.
+**Arch guard** — symmetric 4-bit K is the PPL-218→8641 path on Qwen MoE.
+`validate_resolved` rejects `--kv-quant tsym4` on
+`Qwen3_5MoeForConditionalGeneration` and `Qwen3VLMoeForConditionalGeneration`
+with `ResolveError::QwenMoeKBitsTooLow(4)` (exit 78). `KvQuant::k_below_8bit()`
+is `true` for this variant.
 
-It is never the auto default; `auto` resolves to bf16 for every arch.
+**Paged routing**: `KvStorage::new(KvQuant::TurboSym4, max_seq)` returns the
+non-paged `TurboSym4` storage when `--paged-kv` is set. `PagedKStorage` is
+q8-only.
 
-**Paged routing**: `PagedKStorage` is q8-only; adding a TurboQuant-K paged
-variant requires a separate page allocator and gather kernel.
-`KvStorage::new(KvQuant::TurboSym4, max_seq)` therefore returns the
-**non-paged** `TurboSym4` storage even when `--paged-kv` is set.
-
-**Tail/head adaptive fallback** — `kv_quant_for_layer` falls back to `K8V8`
-(8-bit K) on the head / tail layers. `TurboSym4` is **not** added to the
-tail/head candidate set; the fallback to `K8V8` is the correct safety net.
-
-**Closes** the asymmetric-K8V4 gap for mtq's `quality` / `agents_*` presets.
+**Head/tail layers** — `boundary_floor` promotes the head and tail layers to
+`K8V8`.
 
 **CLI**: `--kv-quant tsym4` (or `--kv-preset quality`).
 
@@ -1570,53 +936,38 @@ tail/head candidate set; the fallback to `K8V8` is the correct safety net.
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**Status**: opt-in via `--kv-quant tsym3` (or `--kv-preset speed`).
-Never an auto baseline.
+**K codec**: TurboQuant 3-bit Lloyd-Max N(0,1) codebook (8 centroids),
+`group_size=32`. On GPU: `turbo_quantize_v3_gpu` / `turbo_dequantize_v3_gpu`
+from `k8vturbo3_append_msl.rs`. On CPU: `turbo_quantize_v(bits=3)`.
 
-**K codec**: TurboQuant 3-bit Lloyd-Max N(0,1) 8-centroid codebook, `group_size=32`.
-On GPU: `turbo_quantize_v3_gpu` / `turbo_dequantize_v3_gpu` MSL kernel from
-`k8vturbo3_append_msl.rs` (same kernel as V-side turbo3 — axis-agnostic,
-no fork needed). On CPU: `turbo_quantize_v(bits=3)`.
+**V codec**: the same codebook, `group_size=32`, through `QuantV { bits: 3 }`
+as in `K8VTurbo3`. The V side runs on the CPU.
 
-**V codec**: TurboQuant 3-bit Lloyd-Max N(0,1) 8-centroid codebook,
-`group_size=32` — same codec as V in `K8VTurbo3`, dispatched via `QuantV { bits:3 }`.
-V-side is CPU-forced (same as K8VTurbo3 precedent — GPU V-side dispatch
-regressed −2% TPS; see K8VTurbo3 finding).
-
-Both K and V use the **same codebook** — the symmetric designation is
-literal: the codec treats K and V identically.
-
-**No rotation is applied on either axis**, despite the family's name. The
-layout tag below names the Lloyd-Max codebook the encoder does apply. See §"The
+**No rotation is applied on either axis**, although the family has the name
+TurboQuant. The layout tag names the Lloyd-Max codebook. See §"The
 turbo family's missing rotation — what it is worth, and where" for what the
-absent transform would buy and on which axis.
+transform would buy and on which axis.
 
-The K buffer is `QuantKTurbo<3>`, spelled `QuantKTurbo3` — the same
-const-generic store the 4-bit spelling instantiates at its own width, and a
-type of its own against `QuantK` and `QuantV`, so the append paths stay
-separate.
-Layout tag (single source of truth for SSD geometry header):
+The K buffer is `QuantKTurbo<3>`, spelled `QuantKTurbo3`: the same
+const-generic store as the 4-bit spelling. The SSD layout tag is:
 
 ```
 const TURBOSYM3_LAYOUT_TAG: &str = "tsym3_lloyd_3_3";
 ```
 
-**Arch guard (Contract A.y — mandatory)** — K-side 3-bit on Qwen MoE is the
-PPL-disaster zone. `--kv-quant tsym3` and `--kv-preset speed` on
-`Qwen3_5MoeForConditionalGeneration` or `Qwen3VLMoeForConditionalGeneration`
-are rejected at resolve-time by `validate_resolved` with the dedicated
-`ResolveError::QwenMoeTurboKRejected { variant: "tsym3" }`.
+**Arch guard** — K-side 3-bit on Qwen MoE is the PPL-disaster zone.
+`validate_resolved` rejects `--kv-quant tsym3` and `--kv-preset speed` on
+`Qwen3_5MoeForConditionalGeneration` and `Qwen3VLMoeForConditionalGeneration`
+with `ResolveError::QwenMoeTurboKRejected { variant: "tsym3" }`.
 
-**Paged routing**: `KvStorage::new(KvQuant::TurboSym3, max_seq)` returns
-non-paged `TurboSym3` storage even when `--paged-kv` is set.
+**Paged routing**: `KvStorage::new(KvQuant::TurboSym3, max_seq)` returns the
+non-paged `TurboSym3` storage when `--paged-kv` is set.
 
-**Tail/head adaptive fallback** — `kv_quant_for_layer` falls back to `K8V8`
-on head/tail layers. `TurboSym3` is not added to the tail/head candidate set.
+**Head/tail layers** — `boundary_floor` promotes the head and tail layers to
+`K8V8`.
 
-**Matches** mtq `speed` preset (`TurboSym3` = `turbo3_symm` in paroquant
-nomenclature).
-
-**CLI**: `--kv-quant tsym3` (or `--kv-preset speed`).
+**CLI**: `--kv-quant tsym3`; or `--ctk tsym3 --ctv tsym3`; or
+`--kv-preset speed`.
 
 ---
 
@@ -1627,77 +978,55 @@ nomenclature).
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**Status**: opt-in via `--kv-quant planar_k` (or the `k_only_planar` preset).
-Never an auto baseline.
-
 **K codec**: PlanarQuant 4-bit Givens-rotation codec (16-entry rotation
-codebook + 4-bit code, per-pair scales) — the same scalar
-`planarquant::planar_quantize` and the same MSL kernel
-(`planarquant_msl::planar_quantize_v4_gpu` / `planar_dequantize_v4_gpu`)
-already used by `KvStorage::Planar` on the V side. PlanarQuant is
-axis-agnostic at the kernel input level (flat `[B, kv_h, S, D]` with
-`D % 32 == 0`), so the K side and V side **share dispatch** — shared kernel, no fork.
-**V codec**: unquantised bf16 (lives on `KvCache::decode_fp16_v`, same
-machinery as `KvStorage::None` for the V buffer).
+codebook, 4-bit code, per-pair scales). It uses the same
+`planarquant::planar_quantize` and the same MSL kernels
+(`planarquant_msl::planar_quantize_v4_gpu` / `planar_dequantize_v4_gpu`) as the
+V side of `KvStorage::Planar`. The kernels take a flat `[B, kv_h, S, D]` input
+with `D % 32 == 0`, so K and V share the dispatch.
+**V codec**: bf16 in `KvCache::decode_fp16_v` (the same machinery as
+`KvStorage::None`).
 
-**Buffer layout (sequence-major).** Like every other flat-buffer quantized KV
-storage, the `QuantPlanarK` (and `QuantPlanarV`) buffer stores the filled
-prefix **sequence-major** (`[B, S, kv_h, D]` element order): per token, all
-heads are contiguous. `append` reorders the incoming head-major chunk heads↔seq
-before quantizing (GPU: `transpose` then `Array::contiguous`, since the
-raw-linear-index MSL kernel ignores lazy-transpose strides; CPU: the
-`transpose_heads_seq` mirror), and `dequantize_choice` reshapes the prefix
-`[B, S, kv_h, D]` and transposes back to the logical `[B, kv_h, S, D]`. For a
-single decode token the transpose is the identity (hot path byte-unchanged);
-for a single cold-prefill chunk the two transposes cancel. PlanarQuant is
-layout-agnostic (group-by-group over the flat stream, `head_dim % 32 == 0`, so
-no group spans a (head, token) boundary), so the reorder is **bit-exact** —
-planar3 / planar4 packing untouched. This closes the multi-append head-scramble
-class (the SSD-hydrate-then-reprefill path) for the whole codec family.
+**Buffer layout (sequence-major).** `QuantPlanarK` and `QuantPlanarV` store
+the prefix sequence-major (`[B, S, kv_h, D]`). `append` reorders the
+head-major chunk before it quantizes (GPU: `transpose` then
+`Array::contiguous`; CPU: `transpose_heads_seq`). `dequantize_choice` reshapes
+the prefix and transposes back. With `head_dim % 32 == 0`, no group spans a
+(head, token) boundary, so the reorder is bit-exact.
 
-Because `QuantPlanarK` also feeds its packed codes to the GPU kernels via
-`gpu_packed_view`, those kernels index K **sequence-major** to match:
-`planar_fused_qk`, `planar_flash_decode` (P1), and the sparse-attn phase-1/2
-score kernels compute the K token base as
-`kv_tok = (b * kv_seq + s) * kv_h + kv_h_idx`. The V offset in the flash /
-sparse kernels stays head-major — V is the separate bf16 decode mirror, not the
-planar-packed buffer.
+`QuantPlanarK` gives its packed codes to the GPU kernels through
+`gpu_packed_view`. These kernels index K **sequence-major**: `planar_fused_qk`,
+`planar_flash_decode` (P1) and the sparse-attention phase-1/2 score kernels
+compute the K token base as `kv_tok = (b * kv_seq + s) * kv_h + kv_h_idx`. The
+V offset in the flash and sparse kernels stays head-major, because V is the
+separate bf16 mirror.
 
-The K buffer is kept as an independent type (`QuantPlanarK`, layout-identical
-to `QuantPlanarV` but distinct so K and V append paths stay decoupled)
-inside `KvStorage::PlanarK { k, max_seq }`. Layout tag (single source of
-truth for the SSD geometry header):
+The K buffer is its own type (`QuantPlanarK`), with the same layout as
+`QuantPlanarV`, inside `KvStorage::PlanarK { k, max_seq }`. The SSD layout tag
+is:
 
 ```
 const PLANARK4_LAYOUT_TAG: &str = "planar_k_4";
 ```
 
-**Arch guard (Contract A.y — mandatory, CLAUDE.md hard rule 6)** — K-side
-4-bit on Qwen MoE is the PPL-218→8641 disaster path (7:1 GQA amplifies
-K-head error through softmax). `--kv-quant planar_k` and
-`--ctk planar_k4 --ctv bf16` on `Qwen3_5MoeForConditionalGeneration` or
-`Qwen3VLMoeForConditionalGeneration` are rejected at resolve-time by
-`validate_resolved` with the dedicated `ResolveError::QwenMoePlanarKRejected`
-(distinct from `QwenMoeKBitsTooLow` so the K-side disaster surface is
-preserved in the diagnostic). The helper `KvQuant::k_below_8bit()`
-returns `true` for this variant — extend the helper when adding any future
-sub-8-bit-K codec.
-
-It is never the auto default; `auto` resolves to bf16 for every arch.
+**Arch guard** — K-side 4-bit on Qwen MoE is the PPL-218→8641 path (7:1 GQA
+amplifies K-head error through softmax). `validate_resolved` rejects
+`--kv-quant planar_k` and `--ctk planar_k4 --ctv bf16` on
+`Qwen3_5MoeForConditionalGeneration` and `Qwen3VLMoeForConditionalGeneration`
+with `ResolveError::QwenMoePlanarKRejected`.
 
 **Paged routing**: there is no `PagedPlanarKStorage`.
 `KvStorage::new(KvQuant::PlanarK, max_seq)` returns the non-paged `PlanarK`
-storage even when `--paged-kv` is set.
+storage when `--paged-kv` is set.
 
-**Tail/head adaptive fallback** — `kv_quant_for_layer` falls back to `K8V8`
-on the head / tail layers. `PlanarK` is **not** added to the tail/head
-candidate set; the fallback to `K8V8` is the correct safety net.
-
-**Mirrors** mtq's `k_only_planar` preset
-(`../multi-turboquant/multi_turboquant/presets.py`).
+**Head/tail layers** — `boundary_floor` promotes the head and tail layers to
+`K8V8`.
 
 **CLI**: `--kv-quant planar_k` or `--ctk planar_k4 --ctv bf16`
 (or `--kv-preset k_only_planar`).
+
+---
+
 ### `KvStorage::K8VTurbo2` — q8_0 K, TurboQuant 2-bit V
 
 > **INERT on this build** — `k8vturbo2` decodes from the bf16 mirror on both
@@ -1705,128 +1034,123 @@ candidate set; the fallback to `K8V8` is the correct safety net.
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**Status**: native 2-bit V codec, ships **naïve** (no outlier-mask). Not a
-production default for any arch.
-
-**K codec**: rMLX MSL q8_0, `group_size=128` (same as K8V8 K-side).
+**K codec**: rMLX MSL q8_0, `group_size=128` (the same as the K8V8 K side).
 **V codec**: TurboQuant 2-bit Lloyd-Max N(0,1) codebook, `group_size=32`.
 
 The 2-bit codebook has 4 centroids. Pack format: 32 × 2 bits = 64 bits = two
-u32 words per group. This gives 1/2 the memory of 4-bit V versus approximately
-the same decode complexity — same compression target as multi-turboquant's
-`turbo2` row (~5.8–7× over bf16 V when combined with q8_0 K).
+u32 words per group. The V encode runs on the CPU. `turbo2_v_msl.rs` holds a
+2-bit MSL kernel with a CPU↔GPU equivalence test. No production path
+dispatches it.
 
-A Metal kernel (`turbo2_v_msl.rs`) is wired as a future-reference hook,
-mirroring `k8vturbo3_append_msl.rs`. Following the K8VTurbo3 finding (Metal
-3-bit kernel regressed Gemma4-e4b/26b by 3.5%/6.9%, failing the −2% gate),
-the V-side is kept on CPU on the hot update path. The MSL module is
-unit-tested for bit-exact CPU↔GPU equivalence so that re-wiring it later
-(once a bench shows a TPS win) is a one-line dispatch-site change.
+**Naïve 2-bit codec**: there is no outlier mask. The unit-test cosine gate on
+the LCG-seeded uniform fixture is mean ≥ 0.956 and min ≥ 0.925
+(`turbo2_v_msl_tests.rs::tq2_cosine_naive_baseline_floor`). The fixture is
+uniform, not real V tensors.
 
-**Naïve 2-bit caveat**: ships the **naïve** Lloyd-Max 2-bit codec without
-outlier-mask. multi-turboquant's published GPU cosine (`README.md` method row
-1: 0.9420, 5.8× compression) is *with* its `build_outlier_masks` + offline
-calibration. rMLX empirical cosine on the LCG-seeded uniform fixture is mean =
-0.9579, min = 0.9269 (n_rows = 512; see
-`turbo2_v_msl_tests.rs::tq2_cosine_naive_baseline_floor`) — but the fixture is
-uniform, not real V tensors, so the numbers are not directly comparable to
-mtq's bench. The expected production gap on real model V tensors comes from the
-missing heavy-tail residual that outlier-mask handles. Outlier-mask + calibration
-wiring is a deferred follow-up.
-
-**Deferred outlier-mask plan**:
-
-- Port `build_outlier_masks` from `multi-turboquant/multi_turboquant/methods/turboquant.py`.
-- Wire calibration-derived per-channel outlier masks through the QuantV bits=2
-  encode + dequant paths.
-- Re-measure cosine against the calibrated fixture; lift the cosine floor
-  in `tq2_cosine_naive_baseline_floor` once the gap closes.
-
-**CLI**: `--kv-quant k8vturbo2`. Like K8VTurbo3 the codec has **no**
-`--ctk`/`--ctv` axis entry: it is accessible only via the preset flag.
-This matches the K8VTurbo3 convention (a single `KvQuant` enum variant
-without a `CacheType` registration), keeping the per-side axis reserved
-for standard affine + rotation codecs.
+**CLI**: `--kv-quant k8vturbo2`. There is no `--ctk` / `--ctv` spelling.
 
 ---
 
 ### `KvStorage::Paged` — vLLM-style block-table KV
 
-PagedAttention allocation (opt-in via `--paged-kv` flag; default OFF).
+PagedAttention allocation. It is opt-in with `--paged-kv` (default off).
 
-Instead of a single contiguous buffer grown in `KV_PAGE_SIZE=256` token
-increments (contiguous-growth path), `Paged` maintains:
+With `--paged-kv`, `KvStorage::new` routes `K8V4`, `K8V8`, `Planar` and
+`Planar3` to `Paged`. Other codecs keep their own storage. `--paged-kv` with a
+resolved `none` codec (which includes `--kv-quant auto`) is refused at startup,
+because bf16 has no packed store to page.
 
-1. A page pool — pre-allocated slab of N fixed-size GPU arrays, controlled by
-   `RMLX_KV_PAGE_SIZE` (default 32 tokens per page).
-2. A per-sequence block table — `Vec<usize>` mapping logical page index to
-   physical page ID in the pool.
-3. Scatter/gather — writes land into `pool[phys_id][token_slot]`; reads
+`Paged` keeps:
+
+1. A page pool of fixed-size GPU slabs. `--paged-kv-page-tokens` sets the
+   page size (default 32 tokens).
+2. A per-sequence block table (`Vec<usize>`) that maps a logical page index to
+   a physical page ID.
+3. Scatter/gather: writes go to `pool[phys_id][token_slot]`, and reads
    concatenate the active pages in order.
 
-For single-request decoding the block table is monotonically appended (no
-sharing, no eviction), degenerating to contiguous-growth behaviour with the same
-peak memory and TPS. The value is future continuous-batching support where
-different requests can share a pool and return pages on completion.
-
-V codec is determined by the base `KvQuant`:
+V storage follows the base `KvQuant`:
 - `K8V4` → `PagedVStorage` (TurboQuant 4-bit).
-- `K8V8` → `PagedVStorage` (q8_0 codes, same struct, `bits=8`).
+- `K8V8` → `PagedVStorage` (q8_0 codes, `bits=8`).
 - `Planar` → `PagedPlanarVStorage`.
 
-Page size must be a multiple of the quantizer group size (32 for TurboQuant,
-128 for q8_0 K) to avoid straddled groups at page boundaries.
+`update_paged` has no `Planar3` arm. A paged `Planar3` cache with no bf16
+mirror returns an error at its first update.
 
-**Restrictions**: `--paged-kv` is rejected for `KvQuant::None` (bf16 paged
-is not implemented) and for `RotK` (rotation codecs are not
-paged-compatible).
+The page size must be a multiple of the quantizer group size (32 for
+TurboQuant, 128 for q8_0 K), so that no group crosses a page boundary.
 
-**CLI**: `--paged-kv [--kv-quant <k8v4|k8v8|planar>]`.
+`exit_prefill` seeds the bf16 mirror, and `update_paged` returns early to the
+mirror while it is live. Thus a seeded paged cache decodes from the bf16
+mirror, as the non-paged forms of these codecs do.
+
+**CLI**: `--paged-kv --kv-quant <k8v4|k8v8|planar>`.
 
 ---
 
 ## Dispatch axis
 
-`KvCache::update_and_sdpa` matches `&self.storage`:
+`KvCache::update_and_sdpa` tries these paths in order:
+
+1. SWA ring (`self.rotating`): `update()` then SDPA.
+2. `Mixed` / `RotK` (`self.quant.uses_mixed_path()`):
+   `update_and_sdpa_mixed`.
+3. The fused fast paths, each of which returns `None` when not eligible:
+   `PlanarK` fused QK, rotor K-only flash decode, iso K-only flash decode, iso
+   symmetric flash decode, rotor symmetric flash decode, K8V4 TurboFlash, and
+   the head-major fused-QK path.
+4. The fallback: `update()` then `scaled_dot_product_attention`.
+
+`KvCache::update` matches `&self.storage`:
 
 ```rust
 match &self.storage {
-    KvStorage::None { .. }      => update_none / update_decode_fp16
-    KvStorage::K8V8 { .. }      => update_k8v8
-    KvStorage::K8V4 { .. }      => update_k8v4 / update_and_sdpa_k8v4_flash
-    KvStorage::Planar { .. }    => update_planar
-    KvStorage::Mixed { state }  => update_and_sdpa_mixed (MixedKvState)
-    KvStorage::Paged { .. }     => update_paged
+    KvStorage::K8V4 { .. }                                   => update_k8v4
+    KvStorage::K8V8 { .. }                                   => update_k8v8
+    KvStorage::Planar { .. }                                 => update_planar
+    KvStorage::None { .. }                                   => update_none
+    KvStorage::Paged { .. }                                  => update_paged
+    KvStorage::Mixed { .. }                                  => Err (contract violation)
+    KvStorage::K8VTurbo3 | K8VTurbo2 | K8VTurbo3Tcq | K8VTurbo2Tcq => update_k8_turbo_v
+    KvStorage::TurboSym3 | TurboSym4                         => update_tsym
+    KvStorage::PlanarK { .. }                                => update_planar_k
+    KvStorage::IsoV3 | IsoV4                                 => update_iso_v
+    KvStorage::RotorV3 | RotorV4                             => update_rotor_v
+    KvStorage::IsoSym3 | IsoSym4                             => update_iso_sym
+    KvStorage::IsoKOnly3 | IsoKOnly4                         => update_iso_k_only
+    KvStorage::RotorSym3 | RotorSym4                         => update_rotor_sym
+    KvStorage::RotorKOnly3 | RotorKOnly4                     => update_rotor_k_only
+    KvStorage::RotorKAsym3 | RotorKAsym4                     => update_rotor_k_asym
 }
 ```
 
-`self.quant` is the construction-time parameter; `self.storage` is the
-canonical dispatch key. The two are normally consistent, but code that needs
-to branch on codec must match `storage`, not `quant`. Matching on the
-storage axis prevents silent misrouting when a cache is reconstructed from
-an SSD spill.
+`self.quant` is the construction-time parameter. `self.storage` is the
+dispatch key. Code that branches on the codec must match `storage`, not
+`quant`. A cache rebuilt from an SSD spill can hold a storage that differs from
+its `quant`: an SWA layer hydrates as `KvStorage::None` while `quant` is the
+model's global codec.
 
-Prefill is handled separately: `enter_prefill` switches to raw bf16 accumulation
-regardless of the active codec; `exit_prefill` bulk-quantizes the accumulated
-prefix into the correct storage variant. Each `KvStorage` arm of `exit_prefill`
-is the codec-specific bulk-init path.
+Prefill is separate. `enter_prefill` switches to raw bf16 accumulation for
+every codec. `exit_prefill` encodes the accumulated prefix into the storage
+variant, when `KvQuant::materialises_packed_store()` is `true`. Each
+`KvStorage` arm of `exit_prefill` is the bulk-init path of that codec.
 
-`exit_prefill` runs on the request's `spawn_blocking` worker thread — the same
-thread the prefill forward built its graph on. That co-location matters because
-MLX ≥0.31 streams are thread-local: a cross-thread `Array::eval()` throws
+`exit_prefill` runs on the request's `spawn_blocking` worker thread, the same
+thread on which the prefill forward built its graph. MLX ≥0.31 streams are
+thread-local: an `Array::eval()` on another thread throws
 `There is no Stream(cpu, N) in current thread.` The generate entry points call
-`rmlx_mlx::ensure_cpu_default_stream()` to register the worker's own streams up
-front. See `docs/KV_CACHE.md` §5.7.5 for the mechanism, the guard, and its
+`rmlx_mlx::ensure_cpu_default_stream()` to register the worker's own streams.
+See `docs/KV_CACHE.md` §5.7.5 for the mechanism, the guard, and its
 limitation.
 
-**Warm-TTFT decode contract.** `exit_prefill` also seeds a bf16 K+V
-decode mirror (`decode_fp16_k`/`decode_fp16_v`). Every quantized
-`update_<codec>` early-returns to `update_decode_fp16` while that seed is live
-(always, post-prefill), so decode-phase K **and** V are bf16 and the codec is
-quiescent — it runs only at `exit_prefill`. The K-only family (`IsoKOnly*`,
-`RotorKOnly*`) is the deliberate exception: it keeps K quantized at decode and
-mirrors only V. Full per-codec audit table + the keep-universal decision (with
-real-model parity numbers) live in `docs/KV_CACHE.md` §9.6.
+**Warm-TTFT decode contract.** `exit_prefill` also seeds a bf16 K+V decode
+mirror (`decode_fp16_k` / `decode_fp16_v`) for each axis whose decode reads it.
+Every `update_<codec>` of the bf16-mirror family returns early to
+`update_decode_fp16` while that mirror is live. Thus decode-phase K **and** V
+are bf16 for those codecs. The K-only family (`IsoKOnly*`, `RotorKOnly*`) keeps
+K quantized at decode and mirrors only V. The fused symmetric family
+(`Iso*Sym`, `Rotor*Sym`) mirrors neither axis. `docs/KV_CACHE.md` §9.6 has the
+per-codec table.
 
 ---
 
