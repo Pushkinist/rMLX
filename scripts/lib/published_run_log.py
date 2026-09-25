@@ -57,9 +57,9 @@ import server_sampling  # noqa: E402
 import spec_round_log  # noqa: E402
 
 TTFT_MARKER = "generate_streaming: TTFT"
-# Anchored, not a substring test: the speculative path writes
-# "spec generate: ITL stats (M30)", which contains this one.
-ITL_MESSAGE = "generate: ITL stats (M30)"
+# Anchored, not a substring test, so no other event whose message contains
+# this one is counted.
+ITL_MESSAGE = "generate: ITL stats"
 SAMPLER_MARKER = server_sampling.MARKER
 # The fields the engine says it resolved for a request. `seed` is on the list
 # because the request sends none and the engine substitutes a fixed default, so

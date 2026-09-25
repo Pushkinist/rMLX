@@ -327,11 +327,7 @@ pub(super) async fn generate_streaming(
             // TTFT captured immediately when the first token arrives from
             // the decode thread — before SSE serialisation or TCP flush.
             let ttft_ms = request_start.elapsed().as_millis() as u64;
-            tracing::info!(
-                model_id,
-                ttft_ms,
-                "generate_streaming (anthropic): TTFT (L6)"
-            );
+            tracing::info!(model_id, ttft_ms, "generate_streaming (anthropic): TTFT");
             {
                 use crate::openai::{TtftSample, TTFT_RING_CAPACITY};
                 let mut ring = state.ttft_store.lock();

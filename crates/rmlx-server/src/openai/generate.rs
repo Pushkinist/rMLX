@@ -732,7 +732,7 @@ pub(super) async fn generate_streaming(
             // leaves the blocking decode loop and reaches the async layer —
             // before SSE serialisation, JSON encoding, or TCP flush.
             let ttft_ms = request_start.elapsed().as_millis() as u64;
-            tracing::info!(model_id, ttft_ms, "generate_streaming: TTFT (L6)");
+            tracing::info!(model_id, ttft_ms, "generate_streaming: TTFT");
             // Append to the rolling ring-buffer; evict oldest when full.
             {
                 let mut ring = state.ttft_store.lock();

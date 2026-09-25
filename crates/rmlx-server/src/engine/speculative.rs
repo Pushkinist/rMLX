@@ -1023,7 +1023,7 @@ impl Generator for SpeculativeGenerator {
                         p99_ms = p99,
                         mean_ms = mean,
                         itl_spikes = spikes,
-                        "spec generate: ITL stats (M30)"
+                        "speculative: ITL stats"
                     );
                     if let Some(ref store) = itl_store {
                         let mut ring = store.lock();

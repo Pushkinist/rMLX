@@ -671,7 +671,7 @@ impl Generator for ArchGenerator {
                 top_k = sampler_cfg.top_k,
                 min_p = sampler_cfg.min_p,
                 seed = sampler_cfg.seed_or_default(),
-                "generate: host categorical sampler active (A7.2)"
+                "generate: host categorical sampler active"
             );
         }
         // Logit-penalty config from per-request sampling params.
@@ -1391,7 +1391,7 @@ impl Generator for ArchGenerator {
                         p99_ms = p99,
                         mean_ms = mean,
                         itl_spikes = spikes,
-                        "generate: ITL stats (M30)"
+                        "generate: ITL stats"
                     );
                     // Write to the ITL ring buffer for /metrics/cache.
                     if let Some(ref store) = itl_store {
