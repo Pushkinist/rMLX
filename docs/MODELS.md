@@ -63,7 +63,8 @@ returns `0` has no capacity to enforce.
 
 **Decode loop.** Qwen3, Qwen3.5, Gemma3 and Gemma4 decode through the shared
 `rmlx_models::decode_loop` (`pipelined_decode`, `chunked_prefill`,
-`choose_token`). Qwen2, Laguna, Qwen3-VL MoE and BitNet keep their own loops.
+`choose_token`). Qwen3-VL MoE prefills through `chunked_prefill` and keeps its
+own decode loop. Qwen2, Laguna and BitNet keep their own loops.
 The per-arch prefill chunk is in `docs/KV_CACHE.md` § "Chunked prefill".
 
 ---
@@ -89,7 +90,7 @@ The per-arch prefill chunk is in `docs/KV_CACHE.md` § "Chunked prefill".
 Audio on Gemma4 depends on the snapshot; see Gemma4.
 
 Only Gemma4 and Qwen3.5 implement the verifier seams. Speculative decoding on
-any other architecture fails with `not yet wired`; there is no fallback.
+any other architecture is refused with an error; there is no fallback.
 
 ---
 
@@ -302,10 +303,11 @@ and the KV head count switch with the layer class:
 | head width | `head_dim` | `global_head_dim` |
 | KV heads | `num_key_value_heads` | `num_global_key_value_heads` |
 
-`gemma4/loader.rs` selects the width and `gemma4/generate/mod.rs` builds the
-per-layer `KvLayerShape` from the same pair. Without
-`num_global_key_value_heads` (e2b, e4b) the full-attention count falls back to
-`num_key_value_heads`. Sizing a global layer from `head_dim` or
+`gemma4/loader.rs` selects the width by layer class. It takes
+`num_global_key_value_heads` for a full-attention layer when `attention_k_eq_v`
+is set. `gemma4/generate/mod.rs` sizes every full-attention `KvLayerShape` from
+`num_global_key_value_heads`. Without that field (e2b, e4b) the config falls
+back to `num_key_value_heads`. Sizing a global layer from `head_dim` or
 `num_key_value_heads` reads the SWA geometry. Partial rotary applies to
 `global_head_dim`. No layer is 128 wide, so none reaches MLX's fused attention
 kernel; see `docs/FFI.md` §`scaled_dot_product_attention`.
@@ -349,26 +351,23 @@ templated (`docs/CLI.md` `info`).
 **Vision.** A SigLIP-style ViT, a pooler and a soft-token scatter. The
 per-image block (`<boi>`, the soft tokens, `<eoi>`) is spliced inside the last
 user turn, right after the opener `<|turn>user\n` (`[105, 2364, 107]`), as the
-HF processor does. Without that opener it falls back to after BOS.
+HF processor does; placed before the turn, the model often ignores the image.
+Without that opener it falls back to after BOS.
 
 **Audio.** e2b and e4b ship a Conformer `audio_tower`: SSCP subsampling,
 Macaron FFW blocks, chunked local attention, an optional output projection.
 `input_audio` parts are decoded to 16 kHz mono, run through the USM log-mel
 front end and the tower, and scattered at the `<|audio|>` positions. The
 soft-token count follows the SSCP downsample. A model without an audio tower
-refuses `input_audio` with "no audio tower". See `docs/SERVER.md`
+refuses `input_audio` with "no audio tower". A request carrying both an image
+and audio is refused on every Gemma4 model. See `docs/SERVER.md`
 § "Multimodal content parts".
 
 #### e4b QAT checkpoints — complex-image vision quality
 
-The e4b QAT snapshots (`*-qat-bf16`, `*-qat-mxfp4`, `*-qat-nvfp4`,
-`*-qat-4bit`) share the vision tower and the clipped-linear bounds of
-`e4b-it-mxfp8`. Only the language weights and the multimodal projection
-differ. On simple images they transcribe correctly. On dense, high-patch-count
-images every QAT variant hallucinates, `qat-bf16` included, while
-`e4b-it-mxfp8` reads them. The `mlx_vlm` reference fails the same way. It is a
-checkpoint property, not a codec defect. Use `e4b-it-mxfp8` for complex-image
-OCR.
+Use `e4b-it-mxfp8`, not an e4b QAT snapshot, for dense or high-detail images.
+Every e4b QAT variant, `qat-bf16` included, misreads them, and the `mlx_vlm`
+reference fails the same way.
 
 ### Unified (encoder-free) vision
 
@@ -413,7 +412,6 @@ The snapshot carries only `embed_audio.embedding_projection` (640 → 3840).
 4. Scatter at the `<|audio|>` run (`build_unified_audio_inputs_embeds`).
 
 The loader checks `output_proj_dims` against the projection's input width.
-A request carrying both an image and audio is refused.
 
 ### Speculative decoding
 
@@ -435,6 +433,9 @@ no MTP head: it drafts as `two_model`, and `--draft-kind mtp` refuses it. See
 - `num_attention_heads_per_layer` may set a per-layer head count.
 - `layer_types` sets SWA or full attention; without it, every layer is full.
 - Per-head q/k norms. Partial RoPE on full-attention layers.
+- A YaRN `rope_type` in `rope_parameters.full_attention` is not applied:
+  full-attention RoPE runs at scale 1.0. The Laguna-XS.2 snapshot declares
+  YaRN (factor 32 over 4096).
 - Attention output is gated per head by `softplus(g_proj(x))`.
 - `max_position_embeddings()` returns `0`, so `--max-ctx` is unbounded here.
 - No speculative seams.
@@ -564,9 +565,8 @@ audio file with a sibling `*.transcript.vtt` in the git-ignored
 Silero VAD v4 (16 kHz branch) is vendored as
 `crates/rmlx-audio/assets/silero_vad_16k.safetensors`, converted by
 `scripts/convert_silero_vad.py` (licence: `crates/rmlx-audio/assets/NOTICE`).
-`rmlx_audio::transcript` uses it to split long audio into voiced chunks. No
-server route and no CLI command calls that module; both use the 30 s window
-walk above.
+It is exported as `rmlx_audio::vad`, and nothing calls it: the server and the
+CLI use the 30 s window walk above.
 
 ---
 

@@ -25,9 +25,11 @@ The crate root re-exports these. It depends on `rmlx-core`, `rmlx-mlx`,
 `rmlx-kv-quant` and `rmlx-metrics`, never on `rmlx-models`.
 
 `rmlx-models` keeps what is per-arch. `ssd_tier::attach_at_load` dispatches on
-the resolved class to each arch's `PROMPT_CACHE` static. The per-arch
-`SpillSink<Entry>` and `HydratedEntry` impls live beside those entries. The RAM
-cache re-exports the `hashing` items, so both tiers hash with one formula.
+the resolved class to each arch's `PROMPT_CACHE` static. The spill side is one
+blanket `impl<E: PromptCacheEntry> SpillSink<E> for SsdSpiller` in
+`prompt_cache.rs`. The hydrate side is one `HydratedEntry` impl per arch entry.
+The RAM cache re-exports the `hashing` items, so both tiers hash with one
+formula.
 
 **The five hooks.** `set_ssd_event_recorder` installs the `EventRecorder` that
 receives `SsdSpillEvent` and `SsdHydrateEvent` rows. `set_ssd_spill_prom_hook`,
@@ -64,7 +66,7 @@ loads. A second call returns `Error::SsdTierAlreadyInstalled`.
 | `per_namespace_budget_bytes` | `--kv-ssd-cache-gb`, in bytes |
 | `global_budget_bytes` | `--kv-ssd-global-gb`, in bytes; `0` is no pool cap |
 | `default_namespace` | `--project`, or `None` for the model id |
-| `per_project_budgets` | budgets from `projects.toml` sections |
+| `per_project_budgets` | filled by `serve` from `projects.toml`; read by nothing |
 
 Both budgets `0` store `None`: the tier is off, and no spiller or hydrator is
 installed. `install_config` then:
@@ -72,9 +74,9 @@ installed. `install_config` then:
 1. runs the stale-schema wipe, whether the tier is on or off;
 2. when `global_budget_bytes > 0`, runs `evict_pool_lru_until` on the pool.
 
-`effective_namespace_budget` gives the ceiling a namespace is held to: the
-per-namespace budget alone, the global one alone, or the smaller of the two.
-It is `0` only when the tier is off.
+`effective_namespace_budget` gives the ceiling every namespace is held to:
+the per-namespace budget alone, the global one alone, or the smaller of the
+two. It is `0` only when the tier is off.
 
 `projects.toml` resolution (flag, then project section, then global section)
 happens in `serve` before `install_config`; see `docs/PROJECTS_CONFIG.md`.
@@ -175,14 +177,14 @@ digests = chained_block_hashes_seeded(ids, seed)
 spill key and the hydrate probe all read that one value. A probe seeded
 differently never hits and reports no error.
 
-**Nothing identity-bearing is stored on the hydrator.** One `SsdHydrator` is
-installed per architecture and outlives the model that attached it:
+**The hydrator holds no model or codec identity.** One `SsdHydrator` is
+installed per architecture and outlives the model that attached it.
 `--max-loaded-models` can keep several models of one arch resident. A
-remembered `model_sig` or `kv_quant` would mis-seed every other model's and
-every hot-swapped request's probe. The hydrator holds only the index, the
-directory and the `layout_key`. `layout_key` carries no model identity, and
-`--project` can put several models in one namespace. The seed's `model_sig`
-term is what keeps their blocks apart.
+remembered `model_sig` would mis-seed every other model's probe. A remembered
+`kv_quant` would mis-seed every hot-swapped request. The hydrator holds the
+index, the directory, the namespace, the `layout_key` and the device.
+`layout_key` carries no model identity, and `--project` can put several models
+in one namespace. The seed's `model_sig` term keeps their blocks apart.
 
 **Blocks under an older seed.** A changed seed term leaves old rows that no
 probe asks for. Nothing can tell them from rows whose prompt has not returned,
@@ -209,9 +211,9 @@ On a RAM miss it runs on the request thread:
 
 1. **Lookup.** `chained_block_hashes_seeded(prompt_ids, seed)`, then
    `SsdKvIndex::lookup_longest_prefix(digests, layout_key)`. No row is a miss.
-2. **Read.** `block_io::read_caches` checks the `model_id` and `kv_quant`
-   metadata before reading tensors. Every rebuilt `KvCache` takes the
-   request's `DispatchPolicy`.
+2. **Read.** `block_io::read_caches` checks the block's `model_id` (the
+   namespace) and `kv_quant` metadata before reading tensors. Every rebuilt
+   `KvCache` takes the request's `DispatchPolicy`.
 3. **Touch.** `index.touch(hash, layout_key)` updates `last_used`.
 
 It returns a `HydratedBlock`: the matched block-aligned token prefix, the
@@ -305,7 +307,8 @@ and exits, and spill is off for that namespace.
 CPU blocks (`drop_blocks_when_ring_live_*`); the ring is then the only copy.
 The store's `try_deep_clone` rebuilds complete CPU blocks from the ring, and
 `block_io` writes those blocks. The writer refuses an iso or rotor store whose
-blocks cover less than `shape[2]` (`BlockIoError::TruncatedStore`).
+blocks hold a token count other than the product of `shape[0..3]`
+(`BlockIoError::TruncatedStore`).
 
 ### Evict-to-budget (runtime)
 
@@ -345,6 +348,10 @@ With `global_budget_bytes > 0`, `install_config` bounds the whole pool:
 It logs one `ssd_pool_lru_eviction` event and returns an `EvictionReport`
 (`bytes_freed`, `blocks_evicted`, `namespaces_touched`).
 
+The sweep runs only in `install_config`. While a server runs, each namespace is
+held to its own ceiling and nothing bounds the pool as a whole. Several
+namespaces can therefore exceed the global budget until the next start.
+
 ## Attach and maintenance
 
 At each model load, `attach_at_load` expands the layer vector and calls
@@ -370,7 +377,7 @@ A `.kvb` is a safetensors file. Its `__metadata__`:
 
 | Key | Value |
 |---|---|
-| `model_id` | the model identity |
+| `model_id` | the namespace: `--project`, or the model id |
 | `kv_quant` | `KvQuant` Display string |
 | `n_layers` | attention layers serialised |
 | `seq_len` | tokens at serialisation |
@@ -390,12 +397,13 @@ A reader whose `model_id` or `kv_quant` differs fails with
   `l{i}.v.bf16` under the tag `none_bf16`;
 - a layer with neither writes geometry only, tag `none`, and re-prefills on
   reuse;
-- a GDN layer writes `l{i}.conv_state` and `l{i}.delta_state` whole.
+- a GDN layer writes `lin{i}.conv_state` and `lin{i}.delta_state` whole.
 
 The `none_bf16` case covers `--kv-quant none` and every mirror-fed codec,
 whose `exit_prefill` builds no store (`docs/KV_CACHE.md` §9.6). The writer
-refuses a mirror longer than the cache `offset`, failing the whole block: a
-decode-grown buffer is zero past `offset`. `Array::to_bytes` reads a strided
+refuses a mirror whose length differs from the cache `offset`, failing the
+whole block: a decode-grown buffer is zero past `offset`, and a short one would
+claim rows it does not hold. `Array::to_bytes` reads a strided
 view in logical order (`docs/FFI.md` §"Data readback"). On hydrate the reader
 re-seeds the pair with `KvCache::with_decode_fp16_seed`, so a disk hit decodes
 from the bytes a RAM hit would. Codes and bf16 round-trip bit for bit.
@@ -415,12 +423,12 @@ re-prefill. A RAM-resident entry always passes.
 
 ## Adding a codec
 
-`KvBlockWriter::write_caches` and `KvBlockReader::read_caches` each match every
-`KvStorage` variant, keyed on the per-layer geometry tag. A new codec:
+`block_io::write_layer` matches every `KvStorage` variant and writes its
+geometry tag. `block_io::read_layer` matches every geometry tag. A new codec:
 
 1. adds its `KvQuant` and `KvStorage` variants in `rmlx-kv-quant`;
-2. adds its write arm and geometry tag in `write_caches`;
-3. adds the matching read arm in `read_caches`;
+2. adds its arm and geometry tag in `write_layer`;
+3. adds the matching arm in `read_layer`;
 4. adds a round-trip test in `block_io_tests.rs`.
 
 A change to an existing codec's stored bytes or tag also bumps
