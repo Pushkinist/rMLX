@@ -145,8 +145,9 @@ No speculative seams. The `head_budget` and `softmax_mass` recipes of
 
 Snapshot in use: `prism-ml__Ternary-Bonsai-8B-mlx-2bit`. Its `config.json`
 declares 36 layers, 32 query and 8 KV heads at `head_dim` 128, and full
-attention on every layer (`sliding_window` is null). Its
-`max_position_embeddings` is 65536, so no 128k prompt fits.
+attention on every layer (`sliding_window` is null). At its own YaRN
+scaling (factor 4 over 16384) the capacity is 65536. A larger
+`--yarn-factor` raises it, with a warning.
 
 ---
 
@@ -218,8 +219,9 @@ has `full_attention_interval` 4, `head_dim` 256 and a
 | `z-lab__Qwen3.6-27B-PARO` | dense | 64 (16 / 48) | 24 / 4 | ParoQuant 4-bit |
 | `prism-ml__Ternary-Bonsai-27B-mlx-2bit` | dense | 64 (16 / 48) | 24 / 4 | affine g128 b2 |
 
-The Bonsai-27B config declares one MTP layer, but the snapshot ships no
-`mtp.*` tensors.
+All four configs declare one MTP layer (`mtp_num_hidden_layers` 1), and
+none of the four snapshots ships an `mtp.*` tensor. The `mtp` drafter is a
+separate sidecar snapshot, such as the one below.
 
 The Qwen3.6-35B-A3B drafters: `mlx-community__Qwen3.6-35B-A3B-MTP-5bit`
 (`mtp`), `z-lab__Qwen3.6-35B-A3B-DFlash` (`dflash`) and
@@ -314,8 +316,9 @@ Read from each snapshot's `config.json`:
 `head_dim` is 256 and `global_head_dim` 512 on every size. Context is
 `max_position_embeddings`.
 
-Each mxfp8 size has a drafter snapshot, `gemma-4-<size>-it-assistant-bf16`
-(E2B, E4B, 26B-A4B, 31B); see Speculative decoding below.
+E2B, E4B, 26B-A4B and 31B each have a drafter snapshot,
+`gemma-4-<size>-it-assistant-bf16`; see Speculative decoding below. The 12B
+has no assistant snapshot.
 
 ### Layers
 
