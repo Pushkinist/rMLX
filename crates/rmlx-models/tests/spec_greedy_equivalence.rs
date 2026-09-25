@@ -109,7 +109,7 @@
 //! two token streams — and is refused. Which position the loop was at is the
 //! only thing that separates them, so the loop reports it per emitted token
 //! rather than the gate inferring it from the answer. [`Restriction`] carries
-//! the rule; `docs/SPEC_ANSWER_EQUIVALENCE.md` carries the measurements and
+//! the rule; each constant's doc comment carries the readings that set it, and
 //! `scripts/spec_broken_engine.sh` takes them again.
 //!
 //! # Pairs
