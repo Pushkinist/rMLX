@@ -6,9 +6,10 @@ version: the crates are `publish = false`, and `deny.toml` sets
 `allow-wildcard-paths = true`.
 
 Hosted CI (`.github/workflows/ci.yml`) runs formatting, the source gates,
-the MSL compile, clippy and a release build. It runs no test: the hosted
-macOS runners have no usable Metal device. Release artifacts are built on
-a local Apple Silicon machine with `brew install mlx-c`.
+the MSL compile, clippy and a release build. It runs the scripts' self-tests
+but no `cargo test`: the hosted macOS runners have no usable Metal device.
+Release artifacts are built on a local Apple Silicon machine with
+`brew install mlx-c`.
 
 ## Setup
 
@@ -30,8 +31,9 @@ the MLX that Homebrew links on the user's machine at run time.
 
 ## Branch model
 
-- **`main` holds released state.** Its history is linear. A commit reaches
-  it only by a release or hotfix fast-forward. Tags live on `main`.
+- **`main` holds the released state.** Its history is linear and tags live
+  on it. It takes the release and hotfix fast-forwards, and PRs merged by
+  rebase: the formula PR of step 9 and every Dependabot PR target `main`.
 - **`next/<name>` accumulates the next release.** Each issue lands as one
   squash-merged PR, one commit. The day-to-day flow is in `CONTRIBUTING.md`
   §Workflow.
@@ -45,8 +47,9 @@ The GitHub rulesets enforce this:
 | `main` | Pull request, rebase merge only; checks `rustfmt` and `build + clippy`, branch up to date; linear history; no force-push, no deletion, no direct update |
 | `next/*` | Pull request, squash merge only; the same two checks, branch up to date; no force-push, no deletion |
 
-Repository admins and maintainers bypass both rulesets. That bypass is what
-lets the fast-forward push below reach `main`.
+So `main` accepts a PR merged by rebase, or a fast-forward push by a
+repository admin or maintainer. Admins and maintainers bypass both rulesets;
+that bypass is what lets the fast-forward push below reach `main`.
 
 ## Cut a release
 
@@ -56,8 +59,8 @@ lets the fast-forward push below reach `main`.
    (Keep a Changelog format) and the matching `[<version>]:` link at the
    bottom. It is the source of the release body. `README.md` carries no
    version and is not edited for a release.
-3. **Gate.** `make ci` green on `next/<name>`, plus the real-model
-   regression smoke. A codec-layer or `.metal` change also needs
+3. **Gate.** `make ci` and the whole `make ci-perf` green on `next/<name>`,
+   plus the real-model regression smoke. Every merge to `main` runs the whole
    `make ci-perf`.
 4. **Release PR and fast-forward.** Open a PR `next/<name>` → `main` for the
    checks, then push:
@@ -73,7 +76,7 @@ lets the fast-forward push below reach `main`.
    `Cargo.toml`. Push it: `git push origin v<version>`.
 6. **Package.** `make release-package` builds
    `dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz` and its `.sha256`.
-   The tarball holds `rmlx`, both licences and `README.md`.
+   The tarball holds `rmlx`, both licenses and `README.md`.
 7. **GitHub Release**, with the changelog section as the body:
    ```sh
    gh release create v<version> \
@@ -94,7 +97,7 @@ lets the fast-forward push below reach `main`.
    - GitHub builds the archive on first access. Fetch it two or three more
      times and check that the digest is stable.
    - Check that `url` and `sha256` both name the new version, then open a
-     PR with the formula change.
+     PR with the formula change against `main`.
 10. **Tap.** `make tap-sync` copies the formula into
     `Pushkinist/homebrew-rmlx` as `Formula/rmlx.rb` and pushes it.
 
@@ -113,7 +116,8 @@ A hotfix fixes a bug already released on `main`.
 
 1. Branch `hotfix/<issue>` from `main`.
 2. Squash the fix to one commit.
-3. Open a PR `hotfix/<issue>` → `main` for the checks.
+3. Open a PR `hotfix/<issue>` → `main` for the checks, and run `make ci`
+   and the whole `make ci-perf` on it.
 4. Fast-forward `main`:
    ```sh
    git fetch origin
@@ -126,9 +130,10 @@ A hotfix fixes a bug already released on `main`.
 ## Dependabot PRs
 
 `.github/dependabot.yml` sets no target branch, so Dependabot opens its PRs
-against `main`. Hosted CI runs no test, so a green check does not prove the
-bump. Gate each bump locally with `make ci`. A runtime dependency, such as
-the allocator or the tokenizer, also needs a real-model smoke.
+against `main`. Hosted CI runs no `cargo test`, so a green check does not
+prove the bump. Gate each bump locally with `make ci` and, since it merges
+into `main`, the whole `make ci-perf`. A runtime dependency, such as the
+allocator or the tokenizer, also needs a real-model smoke.
 
 Dependabot edits only the manifest. A major bump that needs a source change
 stays red until that change is pushed to the PR branch:
