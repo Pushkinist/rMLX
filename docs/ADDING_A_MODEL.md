@@ -18,8 +18,8 @@ under `layers/`.
    - Attention goes through `KvCache::update_and_sdpa` (`rmlx-kv-quant`).
    - Masks come from `layers/mask.rs`: `build_chunked_prefill_mask`,
      `build_swa_prefill_mask`, `pick_attn_mask_mode`.
-   - `layers/` also holds shared `Linear`, `Embedding`, `RmsNorm`, `Mlp` and
-     `MoeBlock` types. An arch whose layer differs keeps its own type.
+   - `layers/` also holds shared `Linear`, `Embedding`, `RmsNorm` and `Mlp`
+     types. An arch whose layer differs keeps its own type.
    - The model struct carries `kv_bytes: KvBytesCounter` and
      `model_sig: u64`, per instance, never static. The loader sets both.
      The generate path folds `model_sig` into `cache_seed`. That keeps the
@@ -34,9 +34,11 @@ under `layers/`.
    - Build the per-layer codec vector with
      `kv_cache::kv_layer_quants(n_layers, kv_quant, shares_kv)`. The SSD
      `layout_key` and `cache_seed` describe that vector.
-   - `make check-kv-layer-quants` fails on a `kv_quant_for_layer` call
-     outside `kv_cache/`. A deliberately uniform stack carries a
-     `// kv-layer-quants: uniform — <reason>` marker instead.
+   - `make check-kv-layer-quants` fails on a `kv_quant_for_layer` or
+     `active_kv_boundary` call outside `kv_cache/`. It also fails a non-test
+     file that builds `KvCache::with_quant_max_seq[_window]` with no
+     `kv_layer_quants(` call and no
+     `// kv-layer-quants: uniform — <reason>` marker.
    - Every prefill path calls `reject_nan_prefill` on its logit row before
      it picks a token (see below).
 5. **Prompt cache** (optional), `<arch>/prompt_cache.rs`. Write an `Entry`
