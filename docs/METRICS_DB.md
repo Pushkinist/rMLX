@@ -72,7 +72,8 @@ CREATE TABLE schema_meta (
 );
 ```
 
-Migration 1 seeds five rows with `INSERT OR IGNORE`: `schema_version` = `1`,
+The migration-1 post-hook `seed_schema_meta` inserts five rows with
+`INSERT OR IGNORE`: `schema_version` = `1`,
 `created_utc`, `created_by` = `rmlx-metrics@<semver>`, `hardware_tag` =
 `m5_max_128gb` and `default_namespace` = `mlx-community`. No code reads them
 back, and no later migration updates `schema_version`.
@@ -216,7 +217,7 @@ is the surrogate `id`.
 | `notes`           | Machine-written by the emitter. |
 | `description`     | Written by a person or an agent: why the run exists and what changed (§6). |
 | `inserted_utc`    | When the row was written. |
-| `inserted_by`     | `<tool>@<semver>`, e.g. `rmlx-cli@0.2.8`. |
+| `inserted_by`     | `<tool>@<semver>`, e.g. `rmlx-cli@<semver>`. |
 
 **`decode_config` is cell identity, not context.** It names every engine
 setting that a run moved off its default. A drafter arm and a plain arm of one
@@ -322,7 +323,8 @@ SELECT * FROM ranked WHERE rn = 1
 ```
 
 The partition is `cell::partition_columns`. Equal values resolve to the
-newest `ts_utc`. The champion row carries every `observations` column.
+newest `ts_utc`. The champion row carries every `observations` column,
+plus `rn`.
 
 The `WHERE` is generated from the §4 registry: `bests_view::plausible_sql`
 renders one branch per metric from the `Bounds` that ingest enforces.
@@ -357,9 +359,8 @@ sends `null` for it and the recorder writes nothing. A row never carries a
 placeholder value. Pivot queries read a missing row as `NULL` through
 `MAX(CASE WHEN metric = …)`.
 
-The champion export (§9) renders a missing cell as blank, not `0` or `N/A`.
-`N/A` means the backend does not support the configuration, and is set
-through `description`.
+The champion export (§9) renders a missing cell as `-`, not `0`. It renders
+`N/A` only for a backend that the scope file lists under `unsupported`.
 
 ### 3.5 Why no triggers / no UPSERT
 
@@ -417,9 +418,10 @@ could not be inspected. The value is free-form text, not an enum. Rows
 written before migration 004 hold `NULL`.
 
 **`stage` / `op`.** Each writer sets its own strings. The server writes
-per-request timings with `stage = 'request'` and `op` set to a §4 metric
+per-request figures with `stage = 'request'` and `op` set to a §4 metric
 name: `ttft_cold_ms` or `ttft_warm_ms`, `prefill_duration_ms`, `itl_p50_ms`,
-`itl_p95_ms`, `itl_p99_ms` and `tpot_p50_ms` to `tpot_p99_ms`. Other
+`itl_p95_ms`, `itl_p99_ms` and `tpot_p50_ms` to `tpot_p99_ms` (unit `ms`),
+and `kv_cache_bytes` (unit `bytes`). Other
 writers use `baseline`, `stage0`, `stage1`, `audio`, `tts`, `mm_cache` and
 `ssd_tier`.
 
@@ -429,7 +431,7 @@ controller tick with `stage = 'admission_ctrl'`:
 | `op` | When written |
 |---|---|
 | `admission_insufficient_data` | The regressor holds fewer than 4 points. No depth change. |
-| `admission_no_change` | ITL estimate inside the deadband, or above target for fewer than 3 ticks. |
+| `admission_no_change` | ITL estimate inside the deadband, above target for fewer than 3 ticks, or the depth already at its bound (1 or 256). |
 | `admission_scale_down` | ITL estimate above target for 3 consecutive ticks. Depth decremented. |
 | `admission_scale_up` | ITL estimate below 80% of target. Depth incremented. |
 
@@ -555,7 +557,7 @@ measurement. The families differ in whether `0` itself is one:
 | Durations (`ms`) | `0` included | `3.6e6` (1 h) | A sub-ms span rounds to 0. A span past an hour is a hung run. |
 | Counters (`count`) | `0` included | `1e12` | Zero cache hits is real. |
 | Gauges (`mb`, `bytes`) | `0` included, except `peak_rss_mb` and `peak_phys_footprint_mb` | `1e9` MB, `1e13` B | A live process always has RSS. A run can allocate no Metal. |
-| Ratios (`ratio`) | `0` included | `1.0`; `accepted_per_step` and `tokens_per_round` `1e3` | Acceptance can be zero. A per-round count is not a fraction. |
+| Ratios (`ratio`, except `tps_per_gb_ram`) | `0` included | `1.0`; `accepted_per_step` and `tokens_per_round` `1e3` | Acceptance can be zero. A per-round count is not a fraction. |
 | Perplexity (`ppl`, `nat`) | `ppl`: `0` excluded; `nat`: `0` included | `ppl` `1e6`, `nat` `1e3` | Perplexity is at least 1. |
 
 Ceilings are loose. They reject fabrications, not fast machines.
@@ -587,15 +589,11 @@ those entries instead of failing the run, and counts them as
 
 `observations` is append-only, so rows that an older producer wrote wrong
 stay in the DB. Current producers and ingest write no new rows of these
-kinds. Rows outside a bound already drop out of `bests` and
-`doctor` reports them. The populations below are inside their bounds, so a
-predicate names each. A re-measurement outranks one only if it lands in the
-same cell and wins on value.
+kinds. The rows are inside their bounds, so a predicate names each.
 
 - **`decode_tps_warm` with prefill in its window.** Older `spec_bench.sh`
-  runs, `scripts/perf-iter/bench_decode_tps.sh` and deleted campaign drivers
-  divided by a window that started before prefill. Current producers take
-  the rate from the engine and write `decode_window=` in `notes`
+  runs divided by a window that started before prefill. Current producers
+  take the rate from the engine and write `decode_window=` in `notes`
   (`engine_round_loop` or `engine_itl`). `rmlx baseline`-driven producers and
   `llama-bench` rows exclude prefill at the source and carry no marker, so
   the predicate is scoped to `spec_bench`:
@@ -606,12 +604,9 @@ same cell and wins on value.
     AND (notes IS NULL OR notes NOT LIKE '%decode_window=%')
     AND description LIKE 'spec_bench%';
   ```
-
-  The `perf-iter` and campaign rows carry no `description`; nothing in the
-  row identifies them.
 - **`spec_bench.sh` rows labelled `kv_quant = 'k8v8'` with
-  `prompt_tokens = 14`.** The same script wrote both as constants. The script
-  now reads the codec from the `cache-type resolved` event and the length from
+  `prompt_tokens = 14`.** The script wrote both as constants. It now reads
+  the codec from the `cache-type resolved` event and the length from
   `usage.prompt_tokens`, and refuses a run that reports neither.
 
   ```sql
@@ -620,58 +615,6 @@ same cell and wins on value.
     AND kv_quant = 'k8v8'
     AND prompt_tokens = 14
     AND (notes IS NULL OR notes NOT LIKE '%decode_window=%');
-  ```
-- **`ppl_wikitext2` rows from the cache-bearing scorer.** They belong under
-  `ppl_wikitext2_cached`, and no row says which scorer ran.
-
-  ```sql
-  SELECT * FROM observations
-  WHERE metric = 'ppl_wikitext2'
-    AND ts_utc >= '2026-09-03'
-    AND prompt_id IN (SELECT id FROM prompts WHERE name LIKE 'wikitext-2_ctx2048%');
-  ```
-- **`ppl_*` rows on `Ternary-Bonsai-8B-mlx-2bit` that skipped one position
-  per window boundary.** A non-BOS scorer began scoring one slot late when
-  `stride < ctx_window`. The Gemma4 scorer prepends BOS and was not affected.
-  At `stride == ctx_window` the scored sets are identical. `git_sha` names
-  the affected binaries; `COALESCE` keeps rows with `NULL` notes.
-
-  ```sql
-  SELECT * FROM observations
-  WHERE metric LIKE 'ppl_%'
-    AND model = 'Ternary-Bonsai-8B-mlx-2bit'
-    AND COALESCE(notes, '') NOT LIKE
-        '%ctx_window=' || ctx_max || ' stride=' || ctx_max || '%'
-    AND git_sha IN ('2bcf206', '2bcf206-dirty', '6eeb4ae-dirty', 'a71d88b-dirty');
-  ```
-- **`dflash/*` rows on `Qwen3.8-27B-4bit`.** They measure the DFlash 1
-  drafter built from a DFlash 2 checkpoint, without the tensors DFlash 1 does
-  not read. DFlash 2 now loads as its own drafter and records as
-  `dflash2/…`.
-
-  ```sql
-  SELECT * FROM observations
-  WHERE decode_config LIKE 'dflash/%'
-    AND model = 'Qwen3.8-27B-4bit';
-  ```
-- **Two synthetic rows from an ingest-refusal probe.** They carry a
-  placeholder `kv_cache_bytes` of `123456` in a real cell. `RunRecord::validate`
-  now refuses a record whose `notes` or `description` carries
-  `rmlx_metrics::ingest::SYNTHETIC_MARKER` (`synthetic=true`). A probe that
-  only needs a verdict uses `rmlx metrics record --dry-run`, which validates
-  and commits nothing.
-
-  ```sql
-  SELECT * FROM observations WHERE id IN (124693, 124694);
-  ```
-- **`perf_ab.sh` rows whose `notes` say `ABBA` for an inverted leg.** Only
-  that word is wrong; the values are per leg. The ingester now copies the
-  result file's `pattern`, or writes `pattern-unrecorded`. `ABBA` is also
-  what a straight leg says, so the predicate is the id list:
-
-  ```sql
-  SELECT * FROM observations
-  WHERE id IN (124477, 124478, 124479, 124480, 124553, 124554, 124555, 124556);
   ```
 - **Speculative rows with `decode_config IS NULL`.** Migration 006 fills
   `decode_config` from the drafter that `notes` names
@@ -733,10 +676,10 @@ it and no recording path is wired. The other `rmlx` entries of
 token, ITL, speculative, SSD, `prefill_duration_ms` and `tpot_*` metrics. The
 `ppl_*` metrics and `peak_phys_footprint_mb` have no coverage entry.
 
-The server writes `kv_cache_bytes`, `ttft_warm_ms`, `itl_p50_ms`,
-`itl_p95_ms` and `step_ms_mean` to `observations` through its metrics
-drainer. It also writes the per-request timings to `events` (§3.6), where
-cold and warm TTFT are told apart.
+The server's metrics drainer writes `observations`; its
+`event_kind_to_metrics` (`crates/rmlx-server/src/metrics_drainer.rs`) is the
+list of metrics it records. It records every TTFT as `ttft_warm_ms`. The
+per-request figures in `events` (§3.6) tell cold and warm TTFT apart.
 
 Rules:
 

@@ -1076,8 +1076,7 @@ of `--inline`, `--file`, `--stdin`, or `--replay-pending` must be provided.
 A record whose `notes` or `description` contains `synthetic=true` is refused,
 whatever else is right about it. `observations` is append-only, so a record
 built to exercise a refusal and accepted by mistake lands a placeholder in a
-live cell and wins it; the marker lets such a record say so. Two rows reached
-the DB before it existed — see `docs/METRICS_DB.md`, "Known-bad rows".
+live cell and wins it; the marker lets such a record say so.
 
 #### `metrics identity`
 
