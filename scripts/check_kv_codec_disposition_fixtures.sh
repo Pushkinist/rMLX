@@ -2,7 +2,7 @@
 # scripts/check_kv_codec_disposition_fixtures.sh — recall test for
 # `check_kv_codec_disposition.sh`.
 #
-# That gate has nine rules and two exit codes, and every one of them is one regex
+# That gate has eleven rules and two exit codes, and every one of them is one regex
 # edit away from matching nothing and going permanently green. This repo has
 # shipped three gates that were each individually unable to fail, so a gate's
 # detection power is measured here rather than assumed.
@@ -16,7 +16,7 @@
 #   only the manifest's source differs from a production run.
 #
 # WHY THE EXPECTED MESSAGE IS CHECKED, NOT JUST THE EXIT CODE
-#   All nine rules exit 1, so a corpus that asserts only the exit code cannot
+#   Every violation exits 1, so a corpus that asserts only the exit code cannot
 #   tell "RULE 3 fired" from "RULE 3 is dead and the fixture happened to trip
 #   RULE 1" — which is how a gate gets redder for the wrong reason and still
 #   looks like it works. The two manifest cases assert
@@ -129,6 +129,30 @@ OTHER
             # No decimal point. `2x bf16` is a ratio and reads as one.
             edit "$dir/main.rs" 's/^      fixlive\.";$/      fixlive, at 2x the baseline.";/'
             ;;
+        rule10_banner_in_an_unlisted_doc)
+            # fixinert2's section moves to a doc the gate does not list. Its
+            # banner still exists; no rule would read it.
+            sed -n '/^### fixinert2$/,/^More pack-format prose\.$/p' \
+                "$dir/KV_QUANT.md" >"$dir/OTHER.md"
+            edit "$dir/KV_QUANT.md" '/^### fixinert2$/,/^More pack-format prose\.$/d'
+            ;;
+        rule10_banner_in_an_unlisted_nested_doc)
+            # The unlisted doc sits in a subdirectory of docs/.
+            mkdir -p "$dir/models"
+            sed -n '/^### fixinert2$/,/^More pack-format prose\.$/p' \
+                "$dir/KV_QUANT.md" >"$dir/models/NOTES.md"
+            edit "$dir/KV_QUANT.md" '/^### fixinert2$/,/^More pack-format prose\.$/d'
+            ;;
+        rule10_listed_doc_missing)
+            rm -f "$dir/KV_QUANT.md"
+            ;;
+        rule11_codec_in_two_banners)
+            # A second section carries a second banner for fixinert.
+            sed -n '/^### fixinert$/,/^exactly the paragraph/p' \
+                "$dir/KV_QUANT.md" >"$dir/dup.md"
+            cat "$dir/dup.md" >>"$dir/KV_QUANT.md"
+            rm -f "$dir/dup.md"
+            ;;
         manifest_truncated)
             # One codec line lost; the END sentinel still claims four.
             edit "$dir/manifest.raw" '/	fixlive	/d'
@@ -162,6 +186,10 @@ CASES=(
     "rule8_help_reference_without_a_readable_const|1|RULE 8|clap help the gate cannot read is caught"
     "rule7_ratio_in_a_constant_from_another_module|1|RULE 7|a ratio in a help constant from a second module is caught"
     "rule9_listing_pointer_without_call_site|1|RULE 9|the help's --list-cache-types pointer with no call site is caught"
+    "rule10_banner_in_an_unlisted_doc|1|RULE 10  |a banner moved to a doc the gate does not list is caught"
+    "rule10_banner_in_an_unlisted_nested_doc|1|models/NOTES.md|a banner in a subdirectory of docs/ is caught"
+    "rule10_listed_doc_missing|2|a doc BANNER_DOCS lists|a listed doc that is gone is an environment error"
+    "rule11_codec_in_two_banners|1|RULE 11  'fixinert' is named in 2|a second banner for one codec is caught"
 
     "manifest_truncated|2|manifest truncated|a short manifest is an environment error, not a violation"
     "manifest_unknown_class|2|unknown disposition class|a class the gate cannot read is an environment error"
