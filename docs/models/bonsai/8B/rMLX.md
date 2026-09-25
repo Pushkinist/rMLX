@@ -34,8 +34,7 @@ discarded. Bar (§3): WIN / TIE-on-noise / LOSS.
 > digest, KV bytes and TTFT: Bonsai `iso3_sym` 19.09 → **55.15** @4k,
 > 11.00 → **19.01** @16k, 7.67 → **10.44** @32k; `k_iso3` 14.90 → **24.37**
 > @16k; `rotor3_sym` 10.13 → **16.03** @16k; `k_rotor3` 13.73 → **21.59** @16k.
-> The `none` control moved −1.9…+1.2% across six cells. Full table in
-> `docs/PERF_BASELINE.md` § "The iso / rotor Bonsai anchors above are stale".
+> The `none` control moved −1.9…+1.2% across six cells.
 >
 > One conclusion in §0 is therefore **withdrawn**: that the `_sym` penalty is a
 > V-side dequant cost inside the symv kernel. It was the dispatcher, and the

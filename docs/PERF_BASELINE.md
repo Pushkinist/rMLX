@@ -1,468 +1,83 @@
 # Perf Baseline
 
-## Caveat: Homebrew MLX no-nax bottle degraded prefill numbers (~2026-07-13 onward)
-
-Homebrew's `mlx` 0.32.0 bottle silently ships **zero**
-`steel_gemm_fused_nax_*` GEMM kernels on the `arm64_tahoe` build target — a
-Homebrew formula defect, not an MLX or rMLX bug. On Neural-Accelerator-class
-hardware (M5-family and later) this costs ~3.8x GPU-matmul throughput and
-2.2-3.7x slower **prefill**; decode is bandwidth-bound and unaffected, which
-is exactly why it went unnoticed. Full root-cause, evidence, and the
-Homebrew-side fix options: `.rmlx/mlx-homebrew-nax-regression.md`.
-
-**Any prefill number in this file recorded while the dev box had `mlx`
-0.32.0 installed (roughly 2026-07-13, when that bottle was poured, through
-the pin back to 0.31.2 on 2026-07-17) is suspect** — it may read 2-3.7x
-slower than a nax-capable run of the same cell. Decode-TPS and KV-MB figures
-in the same window are unaffected and remain trustworthy. This is exactly
-what falsified the GDN sequential-in-T root-cause theory for the Bonsai-27B
-prefill regression (rMLX issue #216): the real cause was the missing-nax
-bottle, not model code.
-
-This file is **not** retroactively edited to mark individual affected rows —
-there is no reliable way to tell, after the fact, which historical bench
-invocation ran against which `mlx` build without re-running it. Going
-forward, `events.mlx_nax` (`"present"` / `"absent"` / `"unknown"`, migration
-`004_events_mlx_nax.sql`) records this per run in `runs.db`, so future rows
-are self-describing; see `docs/METRICS_DB.md` §3.6. Historical `runs.db`
-rows are likewise not backfilled — that table is append-only.
-
-## Caveat: the sidecar loop's `verifier_ms` changed meaning (2026-09)
-
-The MTP sidecar loop used to close its verify span on an unevaluated forward
-and then re-derive the LM head one position at a time in the acceptance walk,
-so most of the verify forward's cost fell into the residual. It now reads the
-block's argmax back inside the verify span, which is where the gemma4-assistant
-loop always read its own.
-
-Both figures are ingested. **`verifier_ms` and `loop_ms_per_round` rows written
-before and after that change are not comparable**, on the sidecar loop only:
-measured on Qwen3.8-27B-4bit at block 3, `verify_ms_per_round` moved 32.2 →
-41.5 and `loop_ms_per_round` 20.1 → 10.2 for the same work. `decode_tps`,
-`accept_rate` and `tokens_per_round` are unaffected and stay comparable, and
-the gemma4-assistant loop's rows are unaffected in every column. The two loops'
-residuals became comparable with each other at the same commit; before it they
-were produced by different instruments.
-
-Every speculative `done` line also now carries `charged`. A `true` there means
-the request ran with its phases forced at each boundary — a slower, differently
-scheduled engine — so its `verifier_ms`, `loop_ms_per_round` and `decode_tps`
-describe that run and not a normal one. `scripts/spec_bench.sh` reads the flag
-back, records it in the row's `notes`, and refuses to file the row when it is
-`true`: `observations` is append-only and `bests` is a view over it, so no such
-row should ever be in the store to begin with. It is reachable from an ambient
-`RUST_LOG` — that takes precedence over the `--log info` the bench script
-passes — so unset `RUST_LOG` before benching. See `docs/SPECULATIVE.md` §
-"Where a round's time goes".
-
-## Baseline KV-cache reuse
-
-**Verdict: CORRECT-reuse.** The `rmlx baseline` decode loop appends one new
-token per step against a growing per-layer `KvCache`. It does NOT re-encode the
-full prompt+generated prefix each step. The stale comment at
-`crates/rmlx-cli/src/commands/baseline.rs:190-192`
-("Without KV cache all steps re-encode the full prefix … we divide total time
-by step count") describes a long-superseded implementation and is factually
-wrong about the current code.
-
-### Evidence (code read)
-
-Decode is `prefill (chunked) → single-token decode steps`, identical in shape
-across all three test-target arches.
-
-- **Qwen3 / Bonsai** (`crates/rmlx-models/src/qwen3.rs`):
-  - Cache-miss path prefills the prompt in chunks via
-    `forward_seq_with_cache(chunk, …)` (`qwen3.rs:1714`), then runs the decode
-    loop `for step_idx in 1..n_tokens` (`qwen3.rs:1904`) calling
-    `model.forward_arr(&y, 1, Some(&mut caches), device)` (`qwen3.rs:1907`).
-  - `y` is a **single-element** `[1]` Array built from the previous token id
-    (`qwen3.rs:1895-1899`); after each step `y` is replaced by the next single
-    sampled token (`qwen3.rs:1617`). The `1` argument is `seq` (the sequence
-    length), so each decode forward processes exactly one token.
-  - `forward_arr` (`qwen3.rs:1251-1293`) reshapes the input to `[1, seq, hidden]`
-    with `seq=1`, derives `base_offset` from the cache's current length
-    (`caches.first().offset()`, `qwen3.rs:1258-1262`) — the offset **grows** each
-    step — and writes the new K/V into the existing per-layer cache
-    (`layer.forward(&h, base_offset, Some(&mut cs[i]), …)`, `qwen3.rs:1278`).
-  - The exact-hit cache path mirrors this (`forward_arr(&y, 1, …)`,
-    `qwen3.rs:1487`).
-  - The function doc itself states "Greedy autoregressive generation using
-    **KV-cache prefill + decode**" (`qwen3.rs:1336`).
-
-- **Qwen3.6 MoE** (`crates/rmlx-models/src/qwen3_5_moe/generate.rs`): decode loop
-  `for step_idx in 1..n_tokens` (line 195 / 591) calls
-  `model.forward_arr(&y, 1, Some(&mut kv_caches), Some(&mut lin_caches), …)`
-  (line 197 / 595); prefill via `forward_seq_with_cache` (line 413).
-
-- **Gemma4** (`crates/rmlx-models/src/gemma4/generate/mod.rs`): decode loop
-  `for step_idx in 1..n_tokens` (line 375 / 970) calls
-  `model.forward_arr(&y, 1, Some(&mut caches), device)` (line 379 / 973);
-  prefill via `forward_seq_with_cache` (line 755).
-
-### Implication
-
-The 16-50x decode-TPS gap is **NOT** a baseline re-encode defect. The decode
-path reuses the KV cache correctly and matches the production `serve` path
-(same `forward_arr` single-token call). Therefore the "16-50x gap" analysis
-does not re-scope into "fix a broken baseline decode loop".
-
-However, TPS is still **prefill-contaminated**: `baseline.rs:166`
-(`ts_generate_start`) starts the clock before `generate_greedy`, so the reported
-`tps = n_generated / (prefill + decode)`. Removing the fixed prefill cost from
-the denominator can only raise the reported TPS. Proceed to split prefill and decode timing, and report decode-only TPS + measured TTFT.
-
-### Empirical confirmation
-
-Not run. The code read is unambiguous (single-token `seq=1` forward against a
-growing cache, identical across all three arches), so a wall-clock run was not
-needed to settle CORRECT-vs-DEFECT. The GPU was not touched, leaving the
-single-MLX claim untouched. (If desired, a per-step timing run would show flat
-per-step wall-clock — characteristic of cache reuse — but it is not required for
-this determination.)
-
-## Decode-only re-baseline
-
-After `rmlx baseline` was updated to report **decode-only** TPS (prefill
-excluded), the 4 test-target models were re-baselined at the standard test
-shape (`--prompt-tokens 4096 --max-tokens 100 --max-ctx 8192`), `auto`
-KV-quant cell, 1 warmup discarded + 3 measured, **median** decode_tps
-reported. Hardware: M5 Max, bandwidth ceiling **614 GB/s**. Date: 2026-05-21.
-
-`combined_tps_old` = the prefill-contaminated `overall_tps` observed at THIS
-shape (max-tokens 100); the historical matrix numbers (Bonsai 15.88,
-Gemma4-e4b 27.50, Gemma4-26b 3.47, Qwen3.6 4.46) were taken at a shorter
-generation window (max-tokens 32) where the fixed prefill cost dominated even
-harder, so they were even lower.
-
-| model | git_sha | kv_quant_resolved | decode_tps | combined_tps_old | ratio_vs_ceiling | date |
-|---|---|---|---:|---:|---:|---|
-| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 877da73 | mixed_k8g64_v4g64 | 115.21 | 38.20 | 2.23x (vs 256.3) | 2026-05-21 |
-| mlx-community__gemma-4-e4b-it-mxfp8 | 877da73 | k8v8 | 72.92 | 47.31 | 1.69x (vs 123.5) | 2026-05-21 |
-| mlx-community__gemma-4-26b-a4b-it-mxfp8 | 877da73 | k8v8 | 72.19 | 9.57 | 2.00x (vs 144.4) | 2026-05-21 |
-| mlx-community__Qwen3.6-35B-A3B-8bit | 877da73 | k8v8 | 94.96 | 12.59 | 2.01x (vs 191.1) | 2026-05-21 |
-
-The ceilings are a **tensor census**, not nameplate arithmetic — see H2 for the
-method, the per-model breakdown and the exact `scripts/perf_ceiling.py`
-invocations. A ceiling is a property of `(model, context, KV codec)`, so each
-one here is evaluated at this table's own shape (`--ctx 4096 --max-ctx 8192`)
-and at the `kv_quant_resolved` in column 3; a ceiling quoted without those is
-not comparable to one quoted with different ones.
-
-### Finding: the "16-48x gap" was almost entirely prefill contamination
-
-The historical matrix divided `n_generated` by `(prefill + decode)`. For the
-MoE/dense-26b models the 4k-token prefill takes 8-10 s (TTFT) while 99 decode
-steps take ~1.4 s — so the combined number was buried by prefill. Once prefill
-is excluded:
-
-- **Gemma4-26b MoE**: 3.47 → **72.19** decode_tps. The combined number at
-  max-tokens 100 was 9.57; decode-only is ~7.5x higher than that combined
-  value. Ratio vs ceiling collapses from ~50x to **2.00x**.
-- **Qwen3.6 35B MoE**: 4.46 → **94.96** decode_tps. Ratio ~40x → **2.01x**.
-- **Bonsai 8B 2bit**: 15.88 → **115.21**. Ratio ~19x → **2.23x**.
-- **Gemma4-e4b dense**: 27.50 → **72.92**. Ratio ~5.6x → **1.69x**.
-
-All four now sit in the **1.7x–2.3x** band. The dramatic "MoE is 40-50x slow"
-signal was a **bench-harness measurement artifact** (prefill in the TPS
-denominator), not an inference-path defect.
-
-That band was previously described here as "at or near the healthy 1.5-2x
-ceiling-vs-realized envelope llama.cpp / mlx-lm hit on dense models". **Do not
-use ratio-vs-ceiling to compare runtimes across models of different size** —
-`ratio = 1 + overhead/ideal_ms`, so the same fixed per-step cost reads larger on
-a smaller model. Measured locally, llama.cpp's absolute per-step overhead
-overlaps rMLX's; the ratio gap is dominated by bytes/step. See the H2 addendum.
-The residual ~2x is plausibly real bandwidth/dispatch overhead; flamegraph
-profiling can still characterize it, but the alarm that motivated the 16-48x
-framing is resolved.
-
----
-
-## Per-codec × per-model cells
-
-Schema for `.rmlx/bench/codec_cells.csv` (gitignored — local-machine recording):
-
-| Column | Type | Meaning |
-|---|---|---|
-| timestamp | ISO-8601 | When the row was recorded |
-| codec | string | KvQuant variant name (e.g. `k8vturbo3`, `iso3_sym`, `rotor3_sym`, `tsym3`) |
-| model | string | Snapshot directory basename |
-| prompt_len | int | Prompt length in tokens |
-| max_tokens | int | --max-tokens arg |
-| run_idx | int | 1, 2, or 3 (3 measured runs per invocation; warmup discarded) |
-| decode_tps | float | Decode tokens per second |
-| prefill_tps | float | Prefill tokens per second |
-| git_sha | string | Repository tip at bench time (first 12 chars) |
-
-Recorded per `(codec, model)` cell. A.y-excluded combos (e.g. K8VTurbo3 K-side × Qwen MoE) NOT recorded — guard rejects at runtime.
-
-**Tolerance semantics**:
-- ±1% recorded-best update threshold (within band → keep recorded value; outside → update if better).
-- 3% regression-fail gate (via `scripts/regression_gate.sh` / `make canary-gate`). Distinct from recorded-best update threshold.
-
-**Cell table** (decode TPS, `release-perf` binary, standard bench shape):
-
-| Codec | Gemma4-e4b | Qwen3.6-MoE | Bonsai-2bit |
-|---|---|---|---|
-| TurboSym4 | — | SKIP (A.y) | — |
-| PlanarK | — | SKIP (A.y) | — |
-| planar3 V | — | — | — |
-| iso3 V | — | — | — |
-| iso4 V | — | — | — |
-| rotor3 V | — | — | — |
-| rotor4 V | — | — | — |
-| turbo3 V (promoted) | — | — | — |
-| turbo2 V | — | — | — |
-| turbo3_tcq | 73.54 | 94.57 | 95.11 |
-| turbo2_tcq | 73.97 | 97.52 | 94.29 |
-| iso3_sym | 80.12 | SKIP (A.y) | 142.64 |
-| iso4_sym | 77.91 | SKIP (A.y) | 140.90 |
-| k_iso3 | 68.17 | SKIP (A.y) | 59.06 |
-| k_iso4 | 66.87 | SKIP (A.y) | 46.27 |
-| rotor3_sym | 81.53 | SKIP (A.y) | 145.49 |
-| rotor4_sym | 81.77 | SKIP (A.y) | 145.21 |
-| k_rotor3 | 64.25 | SKIP (A.y) | 45.47 |
-| k_rotor4 | 63.90 | SKIP (A.y) | 45.65 |
-| tsym3 | 79.93 | SKIP (A.y) | 143.20 |
-| planar_fused_qk (on) | 79.118 | — | 26.4 (short-ctx artifact) |
-
-`—` = cell not measured yet. SKIP marks A.y-rejected combos.
-
-**The iso / rotor Bonsai anchors above are stale — do not gate on them.** They
-were recorded before the flash-decode-over-quant kernels
-(`iso_flash_decode_sdpa`, `iso_flash_decode_symv_sdpa`, and the rotor pair) and
-before `--rotor-qjl` flipped to default `off`, and they encode a causal story
-that no longer holds. The paragraph they carried claimed the K-only variants
-trail their `*_sym` siblings because the K side had no GPU-resident code mirror
-and paid a CPU `dequant()` of the whole prefix per step. Both halves are false:
-the K-only stores keep a GPU ring the kernel reads directly, and neither the
-K-only nor the `_sym` tier is CPU-bound at decode.
-
-The successor claim — that the `_sym` tier is the slower one *because
-quantizing V puts a second dequant inside the decode kernel* — is also wrong,
-and the reason it read that way was a dispatcher defect, not the V axis. Every
-iso / rotor flash-decode dispatcher forced `Array::eval()` on its kernel inputs
-immediately before dispatch, blocking the host on the GPU once per attention
-layer per decode step. Removing it (the graph is left lazy; MLX's
-`ensure_row_contiguous` already supplies the layout guarantee the raw-linear
-kernels need) is worth **1.17–2.89×** decode across the family, with the token
-digest, the KV bytes and TTFT all unchanged. Measured `rmlx bench`, n=3 per
-cell, `release-perf`, one binary pair:
-
-| model | ctx | `iso3_sym` | `k_iso3` | `rotor3_sym` | `k_rotor3` | `none` (control) |
-|---|---|---|---|---|---|---|
-| Bonsai-8B | 4k | 19.09 → **55.15** | — → 56.98 | — | — | 138.5 → 139.2 (+0.5%) |
-| Bonsai-8B | 16k | 11.00 → **19.01** | 14.90 → **24.37** | 10.13 → **16.03** | 13.73 → **21.59** | 93.7 → 93.3 (−0.5%) |
-| Bonsai-8B | 32k | 7.67 → **10.44** | 9.81 → **13.53** | — | — | 65.1 → 63.9 (−1.9%) |
-| gemma-4-e2b | 4k | 65.57 → **100.20** | 76.33 → **107.09** | — | — | 129.1 → 128.1 (−0.7%) |
-| gemma-4-e2b | 16k | 42.42 → **57.04** | 53.73 → **66.64** | 35.15 → **44.52** | 47.70 → **58.07** | 119.4 → 120.8 (+1.2%) |
-| gemma-4-e2b | 32k | 29.56 → **35.58** | 37.76 → **44.34** | — | — | 112.9 → 113.9 (+0.9%) |
-
-`none` is the null control: it reaches none of the four changed dispatchers, and
-its six cells bound the session's measurement noise at ±1.9%. The Bonsai
-`k_iso3` 4k base cell is absent because `rmlx bench` refused it — the pre-fix
-binary scattered 19.65 / 24.71 / 19.76 TPS (25.6% of median) at that cell, over
-the 15% settle ceiling. Narrower run-to-run spread after the fix is a
-consistent second-order effect: a host-side GPU wait per layer makes the cell
-sensitive to host scheduling (e2b `iso3_sym` @4k: 7.41% range → 0.77%).
-
-**Every absolute decode-TPS number in the family recorded before this change
-measures the dispatcher, not the kernel** — re-record before use. Live numbers
-per (codec, context) live in `docs/models/bonsai/8B/rMLX.md` §2.
-
-**Marginal-cost figures (ms per 1k KV tokens) are not invalidated.** The eval was
-a fixed cost per decode step — one host↔GPU round trip per attention layer,
-independent of KV length — so it lands entirely in the intercept of
-`ms/step = a + b × (KV tokens/1000)` and a slope cancels it by construction.
-Fitted across this binary pair: `a` 41.14 → **7.01 ms/step (−83%)**, `b` 2.437 →
-**2.449 ms/1k KV tokens (+0.5%)**. The ≈34 ms/step recovered is ≈0.16 ms per
-eval over the layer count, a textbook round trip. A published ms/1k table stays
-valid; do not discard one on the strength of this fix.
-
-**Neither tier competes with `none` on throughput; the memory half of this
-claim is superseded.** When these rows were recorded the whole iso/rotor family
-stored one `u32` code word plus one **`f32`** scale per group, so no member was
-ever smaller than bf16. The scale and norm planes have since been narrowed to
-`KV_SIDEBAND_DTYPE` and the codes packed densely across a row's groups:
-**iso3 stores 7.125 bits/value at head\_dim=128, iso4 8.125, rotor3 8.750 and
-rotor4 9.750**, all under bf16's 16.0 (see `docs/KV_ROTATION_CODECS.md` "Iso memory truth").
-Decode is still several times `none`'s for every member, which is the part that
-has not moved. Bench them for kernel work and quality study; both tiers are
-memory candidates, neither is a throughput one.
-
-**A denser store would not rescue them either.** Post-fix marginal cost puts the
-hand-written flash-decode shell at 4–14% of MLX `sdpa_vector`'s per-byte
-throughput, measured on both `kv_h = 8` and `kv_h = 1`, so break-even needs a
-store of 0.7–2.2 bits per value per axis — denser than anything in the tree or
-on the roadmap. The arithmetic, the two-architecture measurement and the grid
-geometry that causes it are in `docs/KV_QUANT.md` § "Fused flash-decode over a
-quant store — the break-even condition". Do not spend kernel effort on this
-family expecting a decode win without first moving that number.
-
-#### K-only family, re-recorded after the dispatcher fix
-
-The table above left the K-only family incomplete: `k_iso4` / `k_rotor4` were
-never re-recorded, and the Bonsai `k_iso3` 4k cell was refused pre-fix. These
-are the completed cells on the post-fix tree, `rmlx bench` n=3 + 1 warmup,
-`release-perf`, scratch `RMLX_HOME`, `--metrics off`. Prompt lengths are the
-tokenized fixtures: Bonsai 3770 / 15629 / 31553, e2b 4117 / 17148 / 34355.
-Run-to-run range was ≤2.1% in every cell and the token digest was identical
-across the runs of a cell.
-
-| model | codec | 4k | 16k | 32k | KV bytes @32k | × `none` |
-|---|---|---|---|---|---|---|
-| Bonsai-8B | `none` (control) | 140.32 | 95.74 | 67.40 | 5,341,839,360 | 1.000 |
-| Bonsai-8B | `k_iso3` | **60.28** | 26.17 | 14.36 | 5,371,658,240 | 1.006 |
-| Bonsai-8B | `k_iso4` | **60.56** | — | — | — | — |
-| Bonsai-8B | `k_rotor3` | **54.24** | 22.41 | 12.33 | 5,952,718,304 | 1.114 |
-| Bonsai-8B | `k_rotor4` | **54.10** | — | — | — | — |
-| gemma-4-e2b | `none` (control) | 126.82 | 119.29 | 112.55 | 218,148,864 | 1.000 |
-| gemma-4-e2b | `k_iso3` | **107.15** | 66.74 | 44.44 | 218,803,200 | 1.003 |
-| gemma-4-e2b | `k_iso4` | **107.97** | — | — | — | — |
-| gemma-4-e2b | `k_rotor3` | **101.58** | 58.34 | 37.12 | 254,477,328 | 1.167 |
-| gemma-4-e2b | `k_rotor4` | **100.73** | — | — | — | — |
-
-The KV-bytes column is the reason to stop optimizing this family for
-throughput: `k_iso3/4` measured **1.003–1.006×** `none` and `k_rotor3/4`
-**1.11–1.17×** on the store these rows were recorded at. Both families are
-smaller than bf16 now (see the re-measured table below), so a bandwidth prize
-exists in principle — but the decode shell, not the store, is what sets these
-rows, and the shell has not moved.
-
-**The KV-bytes column predates both the sideband narrowing and the dense code
-plane.** Re-measured on the current tree at bench-scale prompts
-(`scripts/bench/codec_inertness_probe.sh`, `kv_cache_bytes` from
-`rmlx baseline`, `--max-tokens 200`):
-
-| model | ctx | `k_iso3` ÷ `none` | `iso3_sym` ÷ `none` | `k_rotor3` ÷ `none` |
-|---|---|---:|---:|---:|
-| Bonsai-8B | 4k | 0.805× | **0.610×** | 0.843× |
-| Bonsai-8B | 32k | 0.801× | **0.602×** | 0.838× |
-| gemma-4-e2b | 4k | 0.775× | **0.550×** | 0.811× |
-| gemma-4-e2b | 32k | 0.728× | **0.456×** | 0.771× |
-
-An earlier restatement of this paragraph quoted 0.980× / 0.962× (Bonsai-8B) and
-0.937× / 0.876× (e2b) from a **928-token** `rmlx serve` prompt. Those are that
-prompt's numbers, not the codecs': at 928 tokens the per-layer allocation floors
-and the ring's grow-step rounding are a large fraction of a small cache, so the
-ratio is pushed toward 1. Read the table above instead.
-
-The throughput conclusion above is unchanged and is still the binding one; the
-memory conclusion is not — both families are under bf16, and the remaining gap
-between the whole-cache ratio and the ring rate is the boundary-layer `K8V8`
-promotion, not the codec. On Bonsai-8B that gap is 7.9% of
-the cache at 32k; on e2b it is zero, because `num_kv_shared_layers = 20` leaves
-no promoted layer that owns a cache. See `docs/KV_LAYER_POLICY.md` §Layer-adaptive
-overrides.
-
-**`none` was not bf16 on Bonsai when these rows were recorded — read the ratios
-accordingly.** `kv_quant_for_layer` then promoted the first 2 and last 8 layers
-to `K8V8` under every base mode, `KvQuant::None` included, so the `none`
-control on a 36-layer dense arch was a 26-bf16 / 10-K8V8 mixture. `None` is
-exempt from the promotion now, so a `none` row re-measured today is true bf16
-and needs no restatement; every row on this page predates that change. See
-`docs/KV_LAYER_POLICY.md` §Layer-adaptive overrides for the mechanism and the
-measured per-arch factors. The table below restates this one against true
-bf16. That denominator is
-derived, not separately measured, but it is checkable: at
-`S = 31 553 + 128 − 1 = 31 680`
-(the fixture length above, `rmlx bench --max-tokens` default 128) the
-`filled_seq_bytes` identity for a `KvStorage::None` layer gives
-`36 × 4096 B/token × 31 680 = 4 671 406 080`, and adding the 10 promoted
-layers' q8_0 stores at `2112 B/token × 31 744` (capacity page-rounded to
-`KV_PAGE_SIZE = 256`) reproduces the recorded `none` figure 5 341 839 360 to
-the byte:
-
-| model | `none` ÷ true bf16 | `k_iso3` ÷ true bf16 | `k_rotor3` ÷ true bf16 |
-|---|---|---|---|
-| Bonsai-8B | **1.144×** (at 32k) | **1.150×** | **1.274×** |
-| gemma-4-e2b | 1.000× | 1.003× | 1.167× |
-
-Bonsai's `none` ÷ bf16 drifts slightly with context, which is why
-`docs/KV_QUANT.md` quotes 1.145× and this table 1.144×: the bf16 term scales
-with filled length while the promoted layers' q8_0 term scales with
-`KV_PAGE_SIZE`-rounded *capacity*, so the ratio is 1.1447 at `S = 3801`,
-1.1435 here at `S = 31 680`, and tends to 1.1432 as the rounding washes out.
-Treat it as 1.14× and read the exact figure at the context you care about.
-
-gemma-4-e2b is unaffected because none of its promoted layers owns a
-quantizable cache — layers 0 and 1 are sliding (bf16 rotating ring regardless
-of the flag) and the last 8 are shared-KV consumers with no cache slot of their
-own. The correction is a Bonsai-side factor, not a table-wide one, which is
-itself the point: a "vs `none`" ratio is not comparable across architectures.
-
-Marginal cost over the replicated 16k→32k segment (`itl_p50` ms per 1k KV
-tokens) is unchanged by the dispatcher fix, as predicted — the fix moved the
-intercept, not the slope:
-
-| model | `none` | `k_iso3` | `k_rotor3` |
-|---|---|---|---|
-| Bonsai-8B | 0.261 | 1.799 (6.9×) | 2.178 (8.3×) |
-| gemma-4-e2b | 0.025 | 0.432 | 0.567 |
-
-Read e2b's ratio-to-`none` with care: only its global layers grow, so the
-`none` denominator is near zero and the ratio inflates. Compare the absolute
-ms/1k across models instead. Counted from the per-dispatch `trace!` under
-`--log verbose`, the flash-decode kernel fires once per full-attention layer
-per decode step and is handed the full prefix — 26 of 36 layers on Bonsai (the
-first 2 and last 8 **were** promoted to K8V8 when this was recorded; the codec
-here is a quantizing one, so that promotion still applies today — it is only
-`none` that is now exempt), 7 of 35 on e2b. Those 7 e2b
-dispatches read only **3** distinct caches. `num_kv_shared_layers = 20` leaves
-layers 15+ without a cache of their own, and `build_previous_kvs`
-(`gemma4/loader.rs`) points each of them at the **last** non-shared layer of
-its attention type — layer 14 for full-attention. So layers 19, 24, 29 and 34
-all attend over layer 14's cache, while layers 4 and 9 serve one dispatch
-each: three caches, seven dispatches, five of them on layer 14. What remains
-is per-KV-token work inside the kernel, not data movement.
-
-Each new codec: invoke `scripts/bench_codec_cell.sh --kv-quant <codec> --model <model>` per cell (3 cells per codec, A.y-excluded skipped), then append to this table.
-
-**Champions regen**: regenerate `BENCHMARK_CHAMPIONS.md` via `rmlx metrics export --markdown` after each cell lands. If that command is unavailable, manual fallback: hand-edit `BENCHMARK_CHAMPIONS.md` with cell + recorded TPS, cite source CSV row.
-
----
+This doc holds the decode-throughput anchors of the three test-target models.
+It also names the tools that measure a build against them. No program reads an
+anchor from this doc. `scripts/regression_gate.sh` takes the anchor as
+arguments, and `make canary-gate` reads `runs.db`.
 
 ## Canary anchors (release-perf)
 
-`make canary` records each canary run into `runs.db` via
-`rmlx baseline --record` in addition to the legacy CSV.
+Each anchor is the median `decode_tps` of `make canary` at the `auto` KV
+default. `auto` is unquantised bf16 on every architecture (`docs/KV_QUANT.md`
+"The auto default"). Hardware: M5 Max, bandwidth ceiling 614 GB/s.
+`scripts/perf_ceiling.py` divides by that bandwidth; `--bandwidth-gbs`
+overrides it for another host.
 
-**Canary flow:**
-- `make canary` — builds release-perf binary, runs `scripts/perf_canary.sh`
-  (1 warmup + 3 measured per model), appends to both the legacy CSV and runs.db.
-- `make canary-gate SHA=<last-green-sha>` — gates regressions by querying
-  `runs.db` via `rmlx metrics deltas --since-sha <SHA> --threshold-pct 3`.
-  Exit codes: 0=clean, 1=regression detected, 125=no-baseline-skip (git bisect safe).
+| model | kv_quant | decode_tps | stddev |
+|---|---|---:|---:|
+| prism-ml__Ternary-Bonsai-8B-mlx-2bit | `none` (bf16) | 142.33 | 2.91 |
+| mlx-community__gemma-4-e4b-it-mxfp8 | `none` (bf16) | 79.57 | 1.01 |
+| mlx-community__Qwen3.6-35B-A3B-8bit | `none` (bf16) | 100.53 | 0.34 |
 
-**Legacy CSV** (`$RMLX_HOME/bench/perf_canary.csv`) is preserved as a fallback for
-one release. Use `make canary-gate` (DB-backed) for new regression gates.
-`scripts/regression_gate.sh` (CSV-backed) is also preserved as a legacy fallback.
+An anchor is a floor for the next run of the same instrument on the same
+host. Absolute decode TPS drifts between runs on a busy host. Only an
+interleaved A/B run supports a direction between two builds.
 
-**The `kv_quant` column changed spelling, not meaning.** Rows written before
-2026-09 carry the Rust `Debug` rendering of the codec — `None`, `K8V8`,
-`Mixed { k_bits: 8, … }` — because the canary scraped it off a log line that was
-formatted that way and then translated it with a chain of `sed` rules. The
-engine now writes that field through `Display`, so the column holds the
-canonical name the `--kv-quant` flag accepts and `runs.db` records (`none`,
-`k8v8`, `mixed_k8g64_v4g64`) and the canary reads it verbatim. A CSV history
-spanning the changeover therefore has two spellings of the same codec; the
-tables below quote the Debug form because that is what those rows say.
+**Canary protocol.** `make canary` builds the `release-perf` binary and runs
+`scripts/perf_canary.sh`:
+
+- Models: the three above; `--include-26b` adds
+  `mlx-community__gemma-4-26b-a4b-it-mxfp8`.
+- Shape: `rmlx baseline --prompt-tokens 4096 --max-tokens 100
+  --max-ctx 8192`, with no `--kv-quant`.
+- Runs: 1 warmup discarded, 3 measured; median and sample stddev.
+- `decode_tps` is `(n_generated - 1)` over the time between the first and the
+  last token callback. Prefill is outside that window
+  (`crates/rmlx-cli/src/commands/baseline.rs`).
+- CSV: one row per model in `$RMLX_HOME/bench/perf_canary.csv`, with columns
+  `ts_utc,git_sha,model,kv_quant,prompt_tokens,decode_tps,stddev,build_profile`.
+  `kv_quant` is the codec name the run's own log states.
+- `runs.db`: one further run per model with `rmlx baseline --record`.
+- A `k8vturbo3` arm follows each model: 1 warmup, 3 measured, CSV row only.
+
+**Gating.** Two gates read what the canary wrote:
+
+- `make canary-gate SHA=<last-green-sha>` runs `rmlx metrics deltas
+  --since-sha <SHA> --threshold-pct 3 --exit-code true` against `runs.db`.
+  `CANARY_THRESHOLD_PCT` sets the threshold. Exit 0 is clean, 1 a
+  regression, 125 no baseline (a `git bisect` skip).
+- `scripts/regression_gate.sh <model> <baseline_tps> <baseline_stddev>
+  [--tolerance PCT]` compares the last CSV row naming the model with the
+  anchor given as arguments. The tolerance defaults to 3%. It widens to 5%
+  when that row's stddev exceeds half the tolerance band. Exit codes match
+  `canary-gate`.
+
+The last CSV row for a model is its `k8vturbo3` arm, because the canary
+appends that row after the `auto` row. `regression_gate.sh` therefore
+compares the `k8vturbo3` median with the anchor.
+
+**The canary decodes greedily.** `rmlx baseline` samples at temperature 0, on
+the GPU-argmax path. A served request that omits sampling fields takes its
+temperature from `generation_config.json`, else 1.0. That request takes the
+host-sampling path, which no canary run observes. Measure it with
+`rmlx bench --temperature / --top-p / --top-k / --repetition-penalty`
+(`docs/SAMPLING.md` § "Cost of the host path").
+
+**The canary is a short-context instrument.** Its pinned shape is a 4096-token
+prompt. A defect that engages only at longer contexts cannot move an anchor.
+Read a green canary as "no short-context regression". Put a long-context claim
+on a cell that runs long.
 
 **The canary tracks one build over time. It cannot compare two.** All of a
-model's measured runs happen together, so when it is pointed at two builds in
-turn, whichever ran second wears any drift — and on a contended host that drift
-is large. Calibration, 2026-08-16, gemma-4-e2b at 4 k on a desktop with
-WindowServer sustained around 50 % of a core: two arms that were *the same
-binary with the same flags* came out with medians 1.75 % apart (114.51 vs
-116.51 tok/s). Three blocked runs per arm would have called that a 1.75 % win.
-The interleaved harness reported no difference — the arms' per-slot ranges
-overlapped — and refused the run outright as `TAINTED`, naming the contending
-process. For any two-arm question, use `--ab`.
+model's measured runs happen together. When it is pointed at two builds in
+turn, whichever ran second wears any drift. For any two-arm question, use
+`--ab`.
 
 ## A/B comparison: `perf_canary.sh --ab` (`scripts/perf_ab.sh`)
 
-Interleaved comparison of two arms, where an arm is a (binary, extra
-`rmlx baseline` arguments) pair.
+Interleaved comparison of two arms. An arm is a binary plus extra
+`rmlx baseline` arguments. `make canary-ab ARGS='…'` builds `release-perf`
+and runs the same harness.
 
 ```bash
 # two builds, same flags
@@ -478,44 +93,30 @@ bash scripts/perf_canary.sh --ab \
   --allow-token-divergence
 ```
 
-**Protocol.** Per model: one untimed warmup per arm (which also records that
-arm's correctness reference), then `--slots` measured slots (default 12) in a
-balanced `ABBA BAAB ABBA` schedule. Both arms therefore occupy the same mean
-slot position, so a drift that is monotone across the run cancels. `--invert`
-complements the pattern; running once each way cancels any residual positional
-bias. `--slots` must be a multiple of 4 — a partial block would give the arms
-different mean positions and put the confound back.
-
-**The verdict and the taint are separate lines, and separate facts.** `VERDICT:`
-always carries the rank test's answer — `SEPARATED` or `INCONCLUSIVE` — and a
-contaminated run adds a `TAINTED:` line beside it and exits 125. Taint used to
-*replace* the verdict, which discarded the one thing the run had computed for
-precisely the runs a reader most needs to re-read, and made any gate on the
-verdict silently a gate on host quiescence.
+**Protocol.** The shape defaults to the canary's. Per model, each arm gets one
+untimed warmup, which also records its reference token ids. Then `--slots`
+measured slots (default 12) run in a balanced `ABBA BAAB ABBA` schedule. Both
+arms occupy the same mean slot position, so a monotone drift cancels.
+`--invert` complements the pattern. `--slots` must be a multiple of 4.
 
 **Criterion, fixed before the run.** The arms are **SEPARATED** if and only if
-their per-slot `decode_tps` ranges are disjoint. Under the null that the arms
-are exchangeable, `P(disjoint) = 2 / C(slots, slots/2)` — `2/924 = 0.00216` at
-the default 12. Anything else is **INCONCLUSIVE**, which means *no measured
-effect*, not *a small one*. The reported ratio under INCONCLUSIVE is the gap
-between two point estimates drawn from overlapping spreads and is not evidence.
+their per-slot `decode_tps` ranges are disjoint. Anything else is
+**INCONCLUSIVE**: no measured effect, not a small one. Under the null that the
+arms are exchangeable, `P(disjoint) = 2 / C(slots, slots/2)`. That is
+`2/924 = 0.00216` at 12 slots. A slot count whose null probability exceeds
+0.05 is refused, so the floor is 8.
 
-That probability is **per comparison**, and a run emits one independent verdict
-per model. The header states the family size and computes `1-(1-p)^m`: three
-canary models give ≈ 0.0065, and pairing a run with `--invert` doubles the
-family again. Read a single SEPARATED against the family figure.
+The probability is per comparison, and a run emits one verdict per model. The
+header states the family size and computes `1-(1-p)^m`. Read a single
+SEPARATED against that family figure.
 
-`--slots` below 8 is refused, not warned about. At 4 the null probability is
-`2/C(4,2) = 0.333`, and the harness would print the same word `SEPARATED` for a
-one-in-three coin flip as for a one-in-462 result — and the word is what gets
-pasted into a report.
+The header also computes the relative standard error of a sample stddev,
+`~1/sqrt(2(n-1))`, from `n = slots/2` per arm. No confidence interval and no
+other p-value is computed. Read none into the ratio.
 
-**What the statistics license.** `n = slots/2` per arm — 6 by default. The
-median is a point estimate; the relative standard error of a sample stddev is
-`~1/sqrt(2(n-1))`, which the header **computes** from the actual `n` (32 % at
-n=6, 41 % at n=4, 71 % at n=2) rather than quoting a fixed figure beside an
-interpolated count. No confidence interval and no p-value beyond the rank test
-above are computed, and none should be read into the ratio.
+**The verdict and the taint are separate lines.** `VERDICT:` always carries
+the rank test's answer. A contaminated run adds a `TAINTED:` line beside it and
+exits 125.
 
 **Guards.** Each refuses rather than producing a number that looks fine:
 
@@ -535,245 +136,100 @@ above are computed, and none should be read into the ratio.
 | A slot reports `metal_peak_mb=0` — the bracket measured nothing | exit 125 | none |
 | A slot generates fewer tokens than `--max-tokens` | exit 125 | none |
 
-Four of those rows read the machine — host quiescence, per-slot and
-whole-comparison interference, and the Metal-exclusivity check — as does the
-load average recorded beside them as context. Every other row reads the arms.
-That split is what `--synthetic-arms` acts on, below.
+Four of those rows read the machine: host quiescence, per-slot and
+whole-comparison interference, and the Metal-exclusivity check. The load
+average is recorded beside them as context. Every other row reads the arms.
 
-`--metrics` is refused in arm arguments because it is declared `global = true`:
-an occurrence after the subcommand overrides the leading `--metrics off` and the
-slot opens the real append-only `runs.db`. Verified against the built binary,
-including on a failure path where the model never loaded.
+`--metrics` is refused in arm arguments because it is declared
+`global = true`. An occurrence after the subcommand overrides the leading
+`--metrics off`, and the slot would open the real `runs.db`.
 
 **`--synthetic-arms` is not an escape hatch — it says the run is not a
-measurement.** Only a machine-reading guard can change its answer between two
-runs of identical inputs, and that is exactly wrong for a caller driving stub
-binaries to check this script's own logic. `--synthetic-arms` declares the arms
-are stubs, and the machine is then not consulted at all: no quiescence probe,
-no interference sampling, no exclusivity check, and no load average — that last
-one feeds no gate, but a run claiming it consulted nothing must not file a
-number it read off this host. The run says so in its header, on every slot line,
-and in `waivers.synthetic_arms` — and `perf_ab_ingest.py` refuses such a result
-with no waiver, because there is no measurement in it to accept. The arm-reading
-guards are untouched by it.
+measurement.** It declares the arms are stubs, for a caller that checks this
+script's own logic. The machine is then not consulted: no quiescence probe, no
+interference sampling, no exclusivity check and no load average. The run says
+so in its header, on every slot line and in `waivers.synthetic_arms`.
+`scripts/ingest/perf_ab_ingest.py` refuses such a result with no waiver. The
+arm-reading guards still apply.
 
-The boundary itself lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok`
-and `window_not_sampled`, and `scripts/bench_llama_ab.sh` takes the same
-`--synthetic-arms` flag through it rather than restating the rule. A window
-there is `not-sampled` for the same reason and by the same marker, its result
-file carries `synthetic_arms`, and `ingest/llama_ab_ingest.py` refuses that
-result with no waiver.
+The boundary lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok` and
+`window_not_sampled`. `scripts/bench_llama_ab.sh` takes the same
+`--synthetic-arms` flag through it. Its result file carries `synthetic_arms`,
+and `scripts/ingest/llama_ab_ingest.py` refuses that result with no waiver.
 
-**Interference measurement, and what it cannot see.** The figure is the change
-in a process's cumulative CPU time across a known window, taken per slot and
-across the whole comparison. Two things that look like they would do the job do
-not: `ps -o pcpu` on macOS is a stale decayed figure that does not move while a
-process pins a core (a 100 %-CPU spinner reads back as ~11 % and stays there),
-and load average sits at 3–5 on an idle developer desktop. Only processes
-present in the closing snapshot are scored, so a process that both starts and
-exits inside one window contributes nothing — sustained contention is caught,
-a burst that fits entirely inside one slot is not. A window that could not be
-sampled at all (empty or failed `ps`, or a window below the CPU counter's
-10 ms resolution) reports `unmeasured` and taints; it is never folded into
-"nothing was running".
+**Interference measurement.** The figure is the change in a process's
+cumulative CPU time across a known window, per slot and across the whole
+comparison. `ps -o pcpu` does not serve: on macOS it is a decayed figure that
+lags a process pinning a core. Load average does not serve either: it sits at
+3–5 on an idle desktop. Only processes in the closing snapshot are scored. A
+process that starts and exits inside one window contributes nothing. A window
+that could not be sampled reports `unmeasured` and taints.
 
-**Correctness is folded in.** Every slot emits `--emit-token-ids` and its exact
-`Vec<u32>` is compared against its arm's warmup reference, and the two arms'
-references against each other. An arm that is fast and wrong fails the
-invocation that made it look fast.
+**Correctness is folded in.** Every slot runs with `--emit-token-ids`. Its
+token ids are compared with its arm's warmup reference, and the two references
+with each other.
 
-**Residency is reported next to throughput.** Decode TPS alone cannot express a
-KV-codec question: a codec that costs memory and buys no speed reads as a null
-result if throughput is the only column. Each slot therefore contributes two
-memory figures, and they answer different questions.
-`metal_gen_alloc_mb` is the generation-scoped allocator peak — the prefill
-working set, not the cache, can be what sets it, and then a real KV delta shows
-there as `+0.0 MB`. Measured both ways in the cells below: at a 4 096-token
-prompt it reads `+0.0 MB` on Ternary-Bonsai-8B and on Qwen3.8-27B against
-cache deltas of +28.7 % and +21.9 %, while the same Bonsai pair at 32 768 does
-resolve it (+2 500 MB). Whether the cache is the allocator peak is an
-arch-and-shape question, not a property of the instrument.
-`kv_cache_bytes` is `KvCache::resident_bytes` off the
-`baseline` summary line and is the cache itself. Where a slot's KV accounting
-refused, the column reads `n/a` for that whole arm — never `0`, which would
-divide into a residency ratio as a cache of no bytes.
+**Residency is reported next to throughput.** Each slot contributes two memory
+figures. `metal_gen_alloc_mb` is the generation-scoped allocator peak. The
+prefill working set, not the cache, can set that peak, and then a real KV delta
+reads `+0.0 MB` there. `kv_cache_bytes` is `KvCache::resident_bytes` off the
+`baseline` summary line: the cache itself. Where a slot's KV accounting
+refused, the column reads `n/a` for that whole arm, never `0`.
 
 **Never writes `runs.db`.** Every slot runs `--metrics off`, so the file is
-never opened, and `--metrics` is refused in arm arguments so it cannot be
-turned back on. An A/B run exercises arms built to be thrown away; a row in the
-append-only store cannot be taken back out. Promoting an accepted comparison is
-a separate, explicit step: `scripts/ingest/perf_ab_ingest.py` turns one result
-file into two `docs/METRICS_DB.md` §8.5 RunRecords (`decode_tps_warm`, `kv_cache_bytes`), refuses a
-TAINTED run unless told otherwise, and carries the taint text into `notes`.
+never opened. Promoting an accepted comparison is a separate step:
+`scripts/ingest/perf_ab_ingest.py` turns one result file into two
+`docs/METRICS_DB.md` §8.5 RunRecords (`decode_tps_warm`, `kv_cache_bytes`). It
+refuses a TAINTED run unless told otherwise, and carries the taint text into
+`notes`.
 
-It does write elsewhere. The result lands in
-`$RMLX_HOME/bench/perf_ab/<timestamp>.json` alongside the recorded host
-conditions, the computed statistics and the binary digests. Separately, each
-slot is a full `rmlx` process and writes its own
-`$RMLX_HOME/logs/<run-id>.jsonl` regardless of `--metrics off` — a default
-three-model run is 42 of them, and each launch runs the log size-cap rotation,
-which can evict unrelated run logs. Point `RMLX_HOME` at a scratch directory
-when that matters.
+The result lands in `$RMLX_HOME/bench/perf_ab/<timestamp>.json`, with the
+host conditions, the statistics and the binary digests. Each slot is a full
+`rmlx` process that writes its own `$RMLX_HOME/logs/<run-id>.jsonl`. A default
+three-model run writes 42 of them, and each launch runs the log size-cap
+rotation. Point `RMLX_HOME` at a scratch directory when that matters.
 
-**Cost.** `2 + slots` process launches per model (14 at the default), against
-the canary's ~10.
+**Cost.** `2 + slots` process launches per model: 14 at the default.
 
-**Scope — what this is not.** Each slot is a separate process, so this is a
-two-*process* comparison. Alternating two *kernel dispatch paths* inside one
-process needs a threaded dispatch-policy value, which does not exist: the five
-kernel selections are latched in `OnceLock` at first read, so a process can
-only ever exercise one of them. Interleaving still removes the ordering and
-drift confounds, because those act at slot granularity — but an in-process
-arm is out of reach until the policy value lands, at which point it becomes
-just another `--arm-a` / `--arm-b` argument and the harness does not change.
+**Scope.** Each slot is a separate process, so this is a two-process
+comparison. Kernel selections are latched in `OnceLock` at first read, so one
+process exercises one dispatch path.
 
-`bash scripts/perf_ab_selftest.sh` (also run by `make ci`, and as
-`make canary-ab-selftest`) mutation-checks the harness against stub binaries
-with planted differences: it must report a planted ratio exactly, and must
-report nothing for two arms that are the same. It needs no GPU, no model and no
-metrics DB.
+**Selftests.** `make canary-ab-selftest` (`scripts/perf_ab_selftest.sh`, also
+in `make ci`) mutation-checks the harness against stub binaries with planted
+differences. It must report a planted ratio exactly, and nothing for two equal
+arms. Every case passes `--synthetic-arms`. The cases that test host gating
+supply the machine as `ps` and `pgrep` shims on `PATH`. Every run counts the
+cases that took each route; a case that could reach this machine fails the
+suite. `scripts/bench_llama_ab_selftest.sh` carries the same boundary, with
+`ps` as its whole host surface.
 
-**The selftest measures nothing, so it reads nothing.** Every case passes
-`--synthetic-arms`, and the machine is then not consulted at all. Without that
-the suite inherited the harness's runtime preconditions for a property that has
-nothing to do with runtime: an `rmlx serve` left running on a developer machine
-failed 27 of the 48 cases it then had, and a `make ci` whose answer depends on
-what else the host is doing teaches everyone to re-run it until it goes green —
-the same damage as a gate that cannot fail, inverted. The cases whose subject *is* the
-host gating supply the whole machine as `ps` and `pgrep` shims on PATH, which
-the suite enforces rather than trusts. Every run prints how many cases took each
-route, **counted** — a case that could reach this machine is tallied and fails
-the suite, rather than the disposition line asserting a hand-typed zero.
-`bench_llama_ab_selftest.sh` carries the same boundary and the same tally;
-there `ps` is the whole host surface (that harness has no exclusivity gate), and
-the shim hands `ps -o rss= -p <pid>` back to the real `ps`, because that form is
-the harness measuring its own arm rather than the host.
+`make canary-ab-host-gate-fixtures` (`scripts/perf_ab_host_gate_fixtures.sh`,
+also in `make ci`) pins that boundary from both sides. The quiescence and
+Metal-exclusivity gates still refuse a shimmed hostile host. A hostile and a
+quiet host give the same verdict text under `--synthetic-arms`. The flag
+waives no arm-reading guard.
 
-`bash scripts/perf_ab_host_gate_fixtures.sh` (`make canary-ab-host-gate-fixtures`,
-also in `make ci`) pins that boundary from both sides: the quiescence and
-Metal-exclusivity gates still refuse a shimmed hostile host, a hostile and a
-quiet host produce the *same* verdict under `--synthetic-arms` — compared as
-text, not merely asserted green — and the flag waives no arm-reading guard.
+## Per-codec × per-model cells
 
-**Canary protocol**:
-- Profile: `release-perf` (debug-assertions=false, overflow-checks=false, stripped)
-- Shape: `--prompt-tokens 4096 --max-tokens 100 --max-ctx 8192`, `kv_quant=auto`
-- Warmup 1 discarded, 3 measured runs; median decode_tps + sample stddev reported in CSV
-- DB record: one `rmlx baseline --record` call per model after the measured runs
+`make bench-codec-cell CODEC=<codec> MODEL=<snapshot>` runs
+`scripts/bench_codec_cell.sh`. It runs `rmlx baseline --kv-quant <codec>`, 1
+warmup and 3 measured runs, at `--prompt-len 4096` and `--max-tokens 100` by
+default. The binary is `$RMLX_BINARY`, else `target/release-perf/rmlx`, else
+`target/release/rmlx`. It appends three rows to
+`$RMLX_HOME/bench/codec_cells.csv` and gates nothing.
 
-**The canary decodes greedily, and that is a scope limit, not a detail.**
-`rmlx baseline` has no sampler knobs, so every canary and A/B number in this
-file is the GPU-argmax path. It is also *not* the served default: a
-`/v1/chat/completions` request that omits sampling fields resolves temperature
-from `generation_config.json` or a hard-coded `1.0`, and several snapshots ship
-`top_p` and `top_k` alongside it, so ordinary served traffic takes the
-host-selection path on every token. Measured at 4k, that path costs 9–14 % of
-decode throughput at temperature alone, 5–12 % at a repetition penalty alone,
-and about a quarter of it once a nucleus filter is on. No canary run can observe
-any of it; use `rmlx bench --temperature / --top-p / --top-k /
---repetition-penalty` and the `sampler_profile` event. See § *Host-sampler cost*
-below and `docs/SAMPLING.md`.
-
-Those figures are from gemma-4-**e2b**, Ternary-Bonsai-8B and Qwen3.6-35B-A3B.
-Only two of the three are canary models — the canary's Gemma4 is **e4b**, and no
-sampled cell was taken on it.
-
-**Per-model kv_quant resolved by arch resolver (auto) AT THE TIME THESE ROWS
-WERE RECORDED:**
-- Bonsai (Qwen3ForCausalLM, 2bit): `mixed_k8g64_v4g64`
-- Gemma4-e4b (mxfp8): `k8v8`
-- Qwen3.6-35B-A3B (8bit MoE): `k8v8`
-
-**`auto` no longer resolves to any of those.** The per-arch table is retired;
-`--kv-quant auto` is unquantised bf16 on every architecture
-(`docs/KV_QUANT.md` "The auto default"). Consequence for these anchors, by
-model:
-
-- **Gemma4-e4b and Qwen3.6-35B-A3B rows still describe the auto cell.** `k8v8`
-  is a bf16-mirror codec: it builds no packed store and decodes off the same
-  bf16 mirror `none` does. Two instruments, and each covers what it covers:
-  the *residency + token-id* comparison (one process per arm, pre-change binary
-  vs post-change binary) ran on gemma-4-e2b and Qwen3.6-35B-A3B at 4k / 8k /
-  32k and returned byte-identical `kv_cache_bytes` and identical token ids at
-  every point; the *decode-TPS* comparison (`perf_ab.sh`, ABBA, 8 slots) ran on
-  gemma-4-e2b at 4k / 8k / 32k and on Qwen3.6-35B-A3B at 4k / 32k only, and
-  returned INCONCLUSIVE at every cell with `kv_cache_bytes` ratio exactly
-  1.0000. There is no 8k ABBA cell on Qwen3.6-35B-A3B.
-- **The Bonsai row is now a different cell from `auto`.** `mixed_k8g64_v4g64`
-  reads its packed store and is a real codec; `auto` is bf16. Re-read that row
-  as a `mixed_k8g64_v4g64` anchor, not as an auto anchor. `scripts/perf_canary.sh`
-  passes no `--kv-quant`, so it no longer measures that cell at all.
-
-Re-anchored below rather than left to drift.
-
-### Canary anchors at the bf16 auto default (2026-08-21)
-
-Same instrument and same shape as the 2026-05-21 table above
-(`bash scripts/perf_canary.sh`, `release-perf`, `--prompt-tokens 4096
---max-tokens 100 --max-ctx 8192`, 1 warmup discarded + 3 measured, median +
-sample stddev), taken at `2f4cafd3` — the branch tree, which differs from the
-merged commit only in doc comments. `kv_quant` is what the binary resolved, not
-a flag: `perf_canary.sh` passes no `--kv-quant`.
-
-| model | git_sha | kv_quant | decode_tps | stddev | CoV | profile | date |
-|---|---|---|---:|---:|---:|---|---|
-| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 2f4cafd3 | `None` (bf16) | 142.33 | 2.91 | 2.0% | release-perf | 2026-08-21 |
-| mlx-community__gemma-4-e4b-it-mxfp8 | 2f4cafd3 | `None` (bf16) | 79.57 | 1.01 | 1.3% | release-perf | 2026-08-21 |
-| mlx-community__Qwen3.6-35B-A3B-8bit | 2f4cafd3 | `None` (bf16) | 100.53 | 0.34 | 0.3% | release-perf | 2026-08-21 |
-
-**These are new anchors, not a measured improvement over the 2026-05-21 rows,
-and must not be subtracted from them.** Three independent reasons: the codec
-differs on the Bonsai row; three months of unrelated decode work sit between the
-two dates (the Qwen3 bf16-stream cast, the layer-adaptive `none` exemption, the
-packed-store elision, the f32 dispatcher-output fix); and **cross-run absolute
-decode TPS is not reliable on this host** — the same binary with the same flags
-has read 54.89 and 49.27 TPS thirty minutes apart. Only within-a-single-ABBA-run
-ratios support a direction. What these rows are good for is what a canary is
-for: a floor for the *next* run of the same instrument on the same host.
-
-**Host conditions, disclosed rather than claimed clean.** `perf_canary.sh` has
-no quiescence gate (unlike `perf_ab.sh`). At launch the 1/5/15 load averages
-were 8.60 / 6.74 / 4.32 and the busiest foreign process sampled was 8.8% of one
-core; nothing was above the 25% bar `perf_ab.sh` would have enforced, and the
-per-model CoV (2.0% / 1.3% / 0.3%) is consistent with that. Treat the Bonsai
-row's 2.0% as the noise floor of this anchor, not as precision.
-
-The `k8vturbo3` comparison arm the canary also runs came back at 142.62 / 79.17
-/ 100.47 — within one stddev of the bf16 arm on all three models, sequential
-(not ABBA) and therefore not a comparison, only a sanity check that the opt-in
-codec still serves.
-
-Captured by `bash scripts/perf_canary.sh` under `release-perf` profile
-(debug-assertions=false, overflow-checks=false, stripped debug).
-Shape: `--prompt-tokens 4096 --max-tokens 100 --max-ctx 8192`.
-Warmup 1 discarded, 3 measured runs, median decode_tps + sample stddev.
-Date: 2026-05-21. Hardware: M5 Max.
-
-| model | git_sha | kv_quant | decode_tps | stddev | profile | date |
-|---|---|---|---:|---:|---|---|
-| prism-ml__Ternary-Bonsai-8B-mlx-2bit | 848d4785 | mixed_k8g64_v4g64 | 109.86 | 0.92 | release-perf | 2026-05-21 |
-| mlx-community__gemma-4-e4b-it-mxfp8 | 848d4785 | k8v8 | 74.22 | 0.08 | release-perf | 2026-05-21 |
-| mlx-community__Qwen3.6-35B-A3B-8bit | 848d4785 | k8v8 | 96.64 | 2.00 | release-perf | 2026-05-21 |
-| mlx-community__bitnet-b1.58-2B-4T | fa2ec73 | k8v8 | 31.61 | 0.17 | release | 2026-05-28 |
-
-**The canary is a short-context instrument, and that is a coverage limit.** The
-pinned shape tops out around 3 900 context tokens, so nothing keyed to a longer
-context is observable in these anchors — every one of them is a measurement of
-the model's short-context behaviour and says nothing about its long-context
-behaviour. A per-step defect on the Mixed V path that only engaged past 8 192
-tokens sat behind these numbers for months without moving them: it could not,
-because the canary never reaches the shape where it engages. Read a green canary
-as "no short-context regression", never as "no regression", and put long-context
-claims on a cell that actually runs long.
-
-**Qwen3-dense bf16-stream fix (2026-06-24).** Casting Qwen3 norm weights and
-quant scales/biases to bf16 at load (they ship fp16 on Bonsai) stops the
-residual stream — and the `--kv-quant none` KV cache — from widening to f32. The
-fix also lifts the Bonsai canary default (`mixed_k8g64_v4g64`) from ~110 to ~129
-decode_tps (the bf16 q/k/v compute is cheaper than the prior f32 path); Gemma4
-and Qwen3.6 (separate arch files) are unchanged. On the `none` path the gain
-widens with context as KV bandwidth dominates: Bonsai `none` decode_tps
-~101→~135 at 4 k, ~48→~83 at 16 k, ~19→~38 at 64 k.
+| Column | Type | Meaning |
+|---|---|---|
+| timestamp | ISO-8601 | When the row was recorded |
+| codec | string | The `--kv-quant` value |
+| model | string | Snapshot directory basename |
+| prompt_len | int | `--prompt-tokens` value |
+| max_tokens | int | `--max-tokens` value |
+| run_idx | int | 1, 2 or 3 |
+| decode_tps | float | Decode tokens per second |
+| prefill_tps | float | Prefill tokens per second |
+| git_sha | string | `HEAD` at bench time, first 12 characters |
 
 ## Codec cells across context — `none` vs `mixed_k8g64_v4g64`, **8-bit K** (2026-08-21)
 
