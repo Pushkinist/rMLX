@@ -611,7 +611,7 @@ Where a variable has a flag, the flag wins.
 | `RMLX_TURBO_FLASH_MIN` | — | `DispatchPolicy::from_env` | TurboFlash runs only above this `kv_seq`. Default `4096`; a negative value is `0`, an unparseable one warns and keeps the default. |
 | `RMLX_FUSED_QK_MIN` | — | `DispatchPolicy::from_env` | Minimum `kv_seq` for fused-QK. Default `512`; an unparseable value warns and keeps it. |
 | `RMLX_ROTOR_QJL` | `--rotor-qjl` | `rmlx_kv_quant::rotor_qjl` | Only for an embedder that never installs the flag; `rmlx` always does. `1`, `on`, `true` or `yes` turns QJL on. |
-| `RMLX_PREFILL_CHUNK`, `RMLX_PREFILL_CHUNK_<ARCH>` | — | `rmlx_models::prefill_chunk` | Prefill chunk in tokens; the per-architecture form wins. See [`PROFILING.md`](PROFILING.md) §10. |
+| `RMLX_PREFILL_CHUNK`, `RMLX_PREFILL_CHUNK_<ARCH>` | — | `rmlx_models::prefill_chunk` | Prefill chunk in tokens; the per-architecture form wins. See [`KV_CACHE.md`](KV_CACHE.md) § "Chunked prefill". |
 | `RMLX_KV_MAX_SEQ_HARD_CAP` | — | `rmlx_kv_quant::kvcache::update` | Refuses a KV extension past this many tokens. Unset: no cap. |
 | `RMLX_EAGLE3_NO_FCS` | — | `speculative::eagle3` | Set to any value to skip the Eagle3 drafter's per-slice `fcs` norms. |
 | `MTL_CAPTURE_ENABLED` | — | Metal | Must be `1` at launch for `--gpu-capture`. |
