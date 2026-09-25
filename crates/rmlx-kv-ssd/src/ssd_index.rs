@@ -11,7 +11,7 @@
 //! The path is always resolved through `rmlx_core::paths` — never a
 //! hard-coded or CWD-relative string.
 //!
-//! # Schema (v3)
+//! # Schema (version `SCHEMA_VERSION`)
 //!
 //! ```text
 //! kv_blocks (
