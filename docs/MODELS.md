@@ -64,7 +64,7 @@ returns `0` has no capacity to enforce.
 **Decode loop.** Qwen3, Qwen3.5, Gemma3 and Gemma4 decode through the shared
 `rmlx_models::decode_loop` (`pipelined_decode`, `chunked_prefill`,
 `choose_token`). Qwen2, Laguna, Qwen3-VL MoE and BitNet keep their own loops.
-The per-arch prefill chunk is in `docs/KV_CACHE.md` §3.
+The per-arch prefill chunk is in `docs/KV_CACHE.md` § "Chunked prefill".
 
 ---
 
