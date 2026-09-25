@@ -68,7 +68,7 @@ request reproduces one sequence.
 
 **What a sampled sidecar request costs.** An argmax is one device reduction over
 the verified block. A draw is a host round trip and a full-vocabulary softmax at
-every position, rejected positions included. This cost has not been measured.
+every position, rejected positions included.
 
 **EAGLE-3's restricted read-back is sound at temperature 0 and only there.** An
 argmax over the drafter's reduced vocabulary equals the full argmax whenever the
@@ -86,7 +86,10 @@ vocabulary (`restricted_read_back` is false).
 - **Constrained decoding.** A request that carries a constraint engine is
   refused: `response_format` with `json_object` or `json_schema`, and
   `tool_choice` set to required or to a named tool. The error names
-  `speculative_decode_with_response_format_unsupported`.
+  `speculative_decode_with_response_format_unsupported`, and the server
+  answers HTTP 503 `service_unavailable`.
+- **Logprobs.** The speculative path returns no logprobs and logs no warning
+  when a request asks for them.
 
 ## Drafters
 
@@ -120,8 +123,8 @@ refuses it in two cases, naming both sides:
 
 The `two_model` row is an inference from the model registry, not a marker in
 the snapshot. Any other flag outranks it: `--draft-kind mtp` on a full model
-goes to the `mtp` router below, which refuses a full model before any weight is
-read.
+goes to the `mtp` router below. The router refuses it before any draft weight
+is read; the verifier is already loaded by then.
 
 ### `mtp` dispatch (arch-family routing)
 
@@ -245,7 +248,8 @@ builds the table at load, and a test pins `mscale` and frequency values against
 the mlx-lm reference.
 
 **Adaptive block.** `dflash_next_block_size` starts from the round's block
-ceiling and moves the block from the last eight rounds that drafted:
+ceiling. It takes the last eight rounds, drops those that drafted nothing, and
+moves the block from the rest:
 
 - accept rate below 0.30, or mean accepted below 2.0: halve (when the block is
   at least 8) or subtract 2;
@@ -304,7 +308,8 @@ nothing: a missing key is a refusal naming the key. It also refuses:
 - `mask_token_id` outside the vocabulary;
 - `selector_top_k` below 2 or above the vocabulary;
 - `block_size` below 2 or above `MAX_BLOCK_SIZE` (1024);
-- `sliding_window` below 2 or wider than an `i32`.
+- `sliding_window` below 2 or wider than an `i32`;
+- `rope_parameters.rope_type` other than `"default"`.
 
 **Acceptance.** The drafter is greedy. Above temperature 0 the sidecar sampled
 rule applies. The reference's candidate-restricted rejection sampling is not
@@ -319,8 +324,8 @@ EAGLE-3 drafts autoregressively with one decoder layer
 (`Eagle3FirstLayer`) conditioned on a fused multi-layer hidden.
 
 - **Feature fusion.** The drafter reads three layers named by
-  `eagle_aux_hidden_state_layer_ids`. The capture takes each one position
-  earlier (`id - 1`), following mlx-vlm. The slices are concatenated and
+  `eagle_aux_hidden_state_layer_ids`. The capture takes each one layer
+  earlier (`max(id - 1, 0)`), following mlx-vlm. The slices are concatenated and
   projected through `fc`. A checkpoint that ships `fcs.{0,1,2}` gets a
   per-slice RMSNorm before the concatenation. `RMLX_EAGLE3_NO_FCS=1` forces the
   raw concatenation.
@@ -401,7 +406,8 @@ still emit, lets the drafter propose, verifies the carry token and the
 proposals in one forward, walks the acceptance, commits, and rolls back. The
 verifier's cache stack is built by `round_common::verifier_cache_stack`:
 
-- The codec is the request's `--kv-quant`, or the default.
+- The codec is the request's own `kv_quant`, then the launch `--kv-quant`,
+  then the default.
 - The ceiling comes from `context::resolve_context` over the verifier's limits.
   A `--max-ctx` above the verifier's positional capacity is refused there, as on
   the plain path (`docs/CLI.md` § "Context ceiling").
@@ -458,6 +464,10 @@ already-normed hidden.
 
 ## Reading a run
 
+Accept rate and decode rate depend on the pair and on the prompt.
+`scripts/spec_bench.sh` measures them and files rows in `runs.db`; this doc
+records none.
+
 ### The request record
 
 Every entry closes a request with one `done` line at `info`, including a request
@@ -468,6 +478,7 @@ derivation and the log site.
 
 | Field | Meaning |
 |---|---|
+| `loop_kind` | which entry ran the request |
 | `rounds`, `total_draft`, `total_accept` | rounds run, tokens proposed, proposals accepted |
 | `emitted` | tokens the request committed, seed included |
 | `seed_emitted` | tokens committed before the first round |
@@ -502,8 +513,8 @@ The engine logs an `error!` when the counts do not add up:
 
 ### The round event
 
-Every round logs one `speculative round` event, target `rmlx::spec::phase`, at
-`debug`, through `round_stats::log_round`:
+Every round that does not stop on a stop token logs one `speculative round`
+event, target `rmlx::spec::phase`, at `debug`, through `round_stats::log_round`:
 
 ```
 loop_kind round accept num_draft n_committed emitted_total
@@ -601,9 +612,11 @@ different:
   `crates/rmlx-models/tests/spec_greedy_equivalence.rs` holds the pairs. The
   two-model stochastic path runs only above temperature 0 and has no pair.
 
-The per-round event stream of `the_assistant_round_loop_reproduces_plain_greedy`
-is pinned against
-`crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256`.
+The per-round event streams of all six pairs over their six prompts are pinned,
+timing fields dropped, in
+`crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256`. Every
+pinned run is uncharged. The fixture's `README.md` says what the digests pin
+and what they do not.
 
 ## CLI
 
