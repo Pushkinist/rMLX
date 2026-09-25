@@ -1,55 +1,35 @@
 # Prompt Cache / Automatic Prefix Caching
 
-Reference for the in-process prompt cache layer: how blocks are hashed, how
-per-arch caches are structured, how the block manager works, and how the SSD
-spill tier integrates.
+The in-process prompt cache: block hashing, the per-arch caches, the consume
+engine, eviction, the prefix index and the SSD handoff. The SSD tier itself is
+in `docs/SSD_TIER.md`.
 
 ---
 
 ## Overview
 
-rMLX implements automatic prefix caching (APC) entirely in Rust, inside the
-inference process. When two requests share a common prefix longer than 256
-tokens, the second request reuses the KV tensors computed during the first
-instead of re-prefilling from scratch.
+A request whose prompt shares at least one whole 256-token block with a cached
+prompt reuses that prompt's post-prefill K/V instead of prefilling it again.
 
-The design has three layers:
-
-1. **Per-arch `PromptCache<E>`** — multi-slot LRU cache in RAM. Each slot
-   holds a post-prefill snapshot keyed by a chained block-hash fingerprint.
-   Evicted slots are offered to the SSD tier (when enabled) before being
-   dropped.
-
-2. **SSD tier** — evicted entries are written to `.kvb` safetensors files on
-   NVMe. On a RAM miss the hydrator reads the longest matching prefix block
-   back into RAM. Documented separately in `docs/SSD_TIER.md`.
-
-3. **KVBM block manager** (logical layer, currently unwired in production) — a
-   port of NVIDIA Dynamo's `kvbm-logical` providing TinyLFU + multi-tier LRU
-   eviction for fine-grained per-block management. Available as a building
-   block for the per-arch swap follow-up.
+- **`PromptCache<E>`** — a multi-slot LRU cache in RAM, one per architecture.
+  Each slot holds a post-prefill snapshot keyed by chained block digests.
+- **SSD tier** — when enabled, evicted slots are spilled to `.kvb` files and a
+  RAM miss is retried against them. See `docs/SSD_TIER.md`.
 
 ---
 
 ## Block alignment
 
-All prefix matching is aligned to blocks of **256 tokens** (`BLOCK_TOKENS`).
-Only complete 256-token blocks are stored and matched; a trailing partial block
-is never cached and is always re-prefilled.
-
-The 256-token floor matches oMLX's `prefix_cache.py` and represents the
-empirical break-even point where the prefill savings outweigh the overhead of
-a cache lookup and a tail re-prefill.
-
-A match of `k` blocks reuses the first `k * 256` tokens of the prompt. The
-caller then re-prefills tokens `[k*256 .. len)` on top of the restored
-snapshot.
+Matching is aligned to blocks of **256 tokens** (`BLOCK_TOKENS` in
+`rmlx_kv_ssd::hashing`). Only whole blocks are stored and matched. A trailing
+partial block is never cached and is always prefilled. A match of `k` blocks
+reuses the first `k * 256` tokens; the caller prefills the rest on top.
 
 ---
 
 ## Block hashing
 
-Block fingerprints use **chained FNV-1a-64**.
+Block digests are **chained FNV-1a-64**:
 
 ```
 offset_basis = 0xcbf29ce484222325  (FNV_OFFSET)
@@ -64,220 +44,177 @@ for each 256-token block b (0-indexed):
     prev_hash  = h
 ```
 
-Because each block's digest folds in the previous block's digest as its seed,
-comparing `digest[k]` proves the entire `(k+1)*256`-token prefix is
-byte-identical — no per-token rescan is needed at lookup time.
+Each digest folds in the one before it. So equal `digest[k]` proves the whole
+`(k+1) * 256`-token prefix is identical, with no per-token rescan.
 
 ### The seed: `cache_seed`
 
-The starting seed is not written out at any call site. It is built by one
-function, `rmlx_kv_ssd::hashing::cache_seed`:
+The first block's seed comes from one function,
+`rmlx_kv_ssd::hashing::cache_seed`:
 
 ```
-seed = FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
+h = FNV_OFFSET ^ layout_key ^ kv_quant.cache_key_salt() ^ model_sig
+for each per-layer codec q:
+    h ^= q.cache_key_salt()
+    h  = h * FNV_PRIME
+seed = h
 ```
 
-Four places have to produce the same digest stream — the RAM push, the
-`find_best_prefix` query, the SSD spill key, and the SSD hydrate probe — and a
-push seeded differently from the query does not surface as a wrong answer. It
-surfaces as a cache that silently never hits. So `cache_seed` lives in
-`rmlx-kv-ssd`, the deepest crate all four can call (`rmlx-kv-ssd` must never
-depend on `rmlx-models`; `prompt_cache.rs` re-exports it). Do not re-derive the
-formula anywhere.
+Four callers must produce the same digest stream: the RAM push, the
+`find_best_prefix` query, the SSD spill key and the SSD hydrate probe. A push
+seeded differently from its query is not a wrong answer. It is a cache that
+never hits. So `cache_seed` lives in `rmlx-kv-ssd`, the deepest crate all four
+can call. Do not re-derive the formula anywhere.
 
-**Computed once per request, then passed down.** `ArchPromptCache::consume`
-evaluates `cache_seed` and hands the resulting `u64` to `find_best_prefix` and
-to `hydrate_from_ssd`, which forwards it to the SSD source; the source probes
-the index with it and recomputes the promoted entry's block hashes from it. One
-variable, not four evaluations that have to keep agreeing. In particular the SSD
-source must never seed from state of its own — it is installed per *arch* and
-shared by every resident model of that arch, so anything it remembered belongs
-to whichever model attached last. See `docs/SSD_TIER.md`.
+`ArchPromptCache::consume` computes the seed once per request through
+`prompt_cache::request_cache_seed`. It hands the value to `find_best_prefix`
+and to `hydrate_from_ssd`. The SSD source never seeds from state of its own:
+one source serves every resident model of an arch.
 
-The three terms:
+The terms:
 
-- **`model_sig`** — which model produced this K/V. The prompt cache is one
-  static per *architecture*, so two models of the same arch resident at once
-  (multi-model `--registry`, or a speculative pair) share it, and the `Exact`
-  arm's token-id equality cannot separate them: the tokens really are equal.
-  Derived from the snapshot directory's own name, so it survives a restart for
-  the SSD tier. On the SSD side it matters for one more reason — `--project`
-  collapses several models onto one namespace directory, so the directory is not
-  a per-model partition either.
-- **`layout_key`** — a stable FNV-1a-64 hash over
-  `(arch, layer_quants, n_kv_heads, head_dim, kv_quant)` from
-  `ssd_tier::compute_layout_key`, or `0` when the SSD tier is off, where
-  `layer_quants` is the effective per-layer codec vector the caches are built
-  from. It ensures two snapshots of the same prompt at different KV layouts
-  (e.g. `k8v8` vs `k8v4`, or the same base codec under two different
-  boundary-promotion policies) cannot share cache blocks. It is a *shape* key and carries no model
-  identity, which is why `model_sig` is a separate term.
-- **`kv_quant`** — the codec the stored K/V is packed under, plus the per-layer
-  mixture that codec resolves to under the current layer policy
-  (`prompt_cache::request_cache_seed` expands `n_layers` through
-  `kv_layer_quants`). The mixture is folded here, per request, rather than only
-  into `layout_key`, because the key is fixed at attach from the launch codec
-  while a request may run a different one. See "Codec namespacing" below.
+- **`model_sig`** — which model produced the K/V. The cache is one static per
+  architecture, so two resident models of one arch share it (a multi-model
+  registry, or a speculative pair). Token-id equality cannot separate them.
+  It is derived from the snapshot directory name, so it survives a restart.
+  On disk, `--project` puts several models in one namespace, so the directory
+  is not a per-model partition either.
+- **`layout_key`** — the SSD tier's shape key from
+  `ssd_tier::compute_layout_key`, over the arch, the per-layer codec vector,
+  `n_kv_heads`, `head_dim` and the codec. It is `0` when the SSD tier is off.
+  It carries no model identity.
+- **`kv_quant`** — the codec the stored K/V is packed under.
+- **the per-layer codec vector** — what that codec resolves to under the
+  current layer policy (`kv_layer_quants`). It is folded per request because
+  `layout_key` is fixed at attach from the launch codec, and a request may run
+  another codec. See "Codec namespacing" below.
 
-The seeded variant is `chained_block_hashes_seeded(ids, seed)`. The un-seeded
-convenience wrapper `chained_block_hashes(ids)` calls it with the bare
-`FNV_OFFSET`. All production callers pass a `cache_seed`; the bare wrapper
-is retained for tests and for backward-compat verification.
+All production callers pass a `cache_seed`. `chained_block_hashes(ids)` seeds
+with the bare `FNV_OFFSET`; only tests call it.
 
-The SSD index also stores `(hash, layout_key)` as a composite primary key,
-providing defence-in-depth against hash collisions across layouts.
+The SSD index keys rows by `(hash, layout_key)`, so digests from two layouts
+cannot collide there.
 
 ### Codec namespacing
 
-A single resident model can serve requests under **different KV codecs**
-(per-request `kv_quant` hot-swap, no weight reload — see `docs/SERVER.md`).
-Because cached K/V bytes are codec-specific, a prefix cached under `none` (bf16)
-**must not** serve a `k8v4` request. That is the `kv_quant.cache_key_salt()`
-term of [`cache_seed`](#the-seed-cache_seed).
+One resident model can serve requests under different KV codecs (a per-request
+`kv_quant`, no weight reload; see `docs/SERVER.md`). Cached K/V bytes are
+codec-specific, so a prefix cached under `none` must not serve a `k8v4`
+request. That is the `kv_quant.cache_key_salt()` term of
+[`cache_seed`](#the-seed-cache_seed).
 
-`KvQuant::cache_key_salt()` is a stable FNV-1a-64 hash over the codec's
-canonical `Display` string (`"none"`, `"k8v4"`, `"mixed_k8g64_v4g64"`, …), so it
-covers every variant including payload-bearing ones (`Mixed`, `RotK`,
-`RotorK*Asym`). The push side (storing a slot), the
-[`find_best_prefix`](#find_best_prefix-lookup) query side and the SSD hydrate
-probe all salt with the request's codec — the hydrate probe is handed it rather
-than remembering the launch codec, or a hot-swapped request would probe the
-wrong digest stream and then reject its own stored rows as header mismatches —
-so two requests with identical tokens but different codecs produce
-**disjoint digest streams** and occupy **distinct cache slots**. A codec switch
-is a clean cross-codec miss — the other codec's slot survives and is reusable
-again under its own codec, rather than being thrash-evicted.
+`KvQuant::cache_key_salt()` is an FNV-1a-64 hash of the codec's canonical
+`Display` string (`"none"`, `"k8v4"`, `"mixed_k8g64_v4g64"`, …). It covers
+every variant, payload-bearing ones included. The push, the
+[`find_best_prefix`](#find_best_prefix-lookup) query and the SSD hydrate probe
+all salt with the request's codec. The probe is handed the codec rather than
+remembering the launch codec. Otherwise a request on another codec would probe
+the wrong digest stream and reject its own stored rows.
 
-On a single-codec RAM-only run (`layout_key = 0`, constant codec) the salt is a
-constant XOR for every request, so hit/miss behaviour is identical to the legacy
-stream for that codec — zero regression.
+Two requests with the same tokens and different codecs therefore produce
+disjoint digest streams and occupy distinct slots. A codec switch is a clean
+miss; the other codec's slot survives and stays reusable under its own codec.
 
-> The SSD `layout_key` already mixes `kv_quant` into its hash, so on an
-> SSD-active run the codec is salted twice (`layout_key` *and*
-> `cache_key_salt`); the extra XOR is harmless (still a deterministic salt) and
-> keeps the RAM-only path correct, where `layout_key = 0` would otherwise leave
-> the codec un-partitioned.
+With the SSD tier on, `layout_key` also folds the launch codec. The extra salt
+is harmless, and it keeps a RAM-only run, where `layout_key = 0`, partitioned
+by codec.
 
 ---
 
 ## Per-arch caches
 
-Each architecture owns a process-global `static` of type
+Each architecture owns one process-global `static` of type
 `ArchPromptCache<E>`:
 
 | Arch | Static | Entry type | Reuse policy |
 |---|---|---|---|
 | `Gemma4ForConditionalGeneration` | `gemma4::prompt_cache::PROMPT_CACHE` | `Gemma4Entry` | `Partial` |
+| `Gemma3ForConditionalGeneration` | `gemma3::prompt_cache::PROMPT_CACHE` | `Gemma3Entry` | `ExactOnly` |
 | `Qwen3_5MoeForConditionalGeneration` | `qwen3_5_moe::prompt_cache::PROMPT_CACHE` | `Qwen35MoeEntry` | `ExactOnly` |
+| `Qwen3VLMoeForConditionalGeneration` | `qwen3_vl_moe::prompt_cache::PROMPT_CACHE` | `Qwen3VlMoeEntry` | `ExactOnly` |
 | `Qwen3ForCausalLM` | `QWEN3_PROMPT_CACHE` (in `qwen3.rs`) | `Qwen3Entry` | `ExactOnly` |
+| `Qwen2ForCausalLM` | `qwen2::prompt_cache::PROMPT_CACHE` | `Qwen2Entry` | `ExactOnly` |
+| `LagunaForCausalLM` | `laguna::prompt_cache::PROMPT_CACHE` | `LagunaEntry` | `ExactOnly` |
+| `BitNetForCausalLM` | `bitnet::prompt_cache::PROMPT_CACHE` | `BitNetEntry` | `ExactOnly` |
 
 ### Entry types
 
-**`Gemma4Entry`** — pure-attention arch. Holds:
-- `prompt_token_ids: Vec<u32>` — full prompt used to build this snapshot.
-- `block_hashes: Vec<u64>` — chained block digests computed at construction.
-- `kv_caches: Vec<KvCache>` — post-prefill KV tensors for all decoder layers.
-- `first_id / first_piece` — argmax token from the first decode step (used by
-  the Exact fast path to skip one decode round).
-- `kv_quant: Option<KvQuant>` — KV codec in effect when the snapshot was taken.
-  A mismatch between the stored value and the runtime `KvQuant` triggers
-  `evict_slot` and a fall-through to full re-prefill.
+Every entry holds the full prompt token ids, the chained block digests, the
+post-prefill `kv_caches`, the first decode token, and the `KvQuant` in effect
+when the snapshot was taken.
 
-**`Qwen35MoeEntry`** — hybrid GDN arch. Same fields as `Gemma4Entry` plus:
-- `lin_caches: Vec<LinearAttnCache>` — GatedDeltaNet recurrent states. Not
-  truncatable: `truncate_kv_to_block` trims only `kv_caches` and deliberately
-  leaves `lin_caches` intact, because recurrent state cannot be reconstructed
-  from a block-truncated KV prefix. This is the direct cause of `ExactOnly`.
+- **`Qwen35MoeEntry`** also holds `lin_caches`, the GatedDeltaNet recurrent
+  states. They are never truncated: recurrent state cannot be rebuilt from a
+  block-truncated prefix. That is why the arch is `ExactOnly`.
+- **`Qwen3Entry`** also holds `first_logprobs`.
 
-**`Qwen3Entry`** — pure-attention dense arch (Bonsai). Identical shape to
-`Gemma4Entry` minus the SWA helpers, plus a `first_logprobs:
-Option<TokenLogprobs>` field. Uses `ExactOnly` for simplicity (the dominant
-workload is identical-prompt warm-TTFT, which is an Exact hit).
-
-**First-token logprob on Exact hit.** The cached `first_id` token is
-replayed on a hit without re-running the prefix's last-position logits, so its
-logprob is not otherwise recomputable. To keep the OpenAI contract (exactly one
-`logprobs.content` entry per emitted token), `Qwen3Entry` carries
-`first_logprobs`: the prefill token's top-k logprobs captured from the raw
-prefill logits at store time, at the OpenAI `top_logprobs` ceiling (20),
-independent of the storing request's `top_logprobs_k`. On an Exact hit with
-`logprobs` enabled the engine replays this record truncated to the replaying
-request's `top_logprobs_k`, yielding the SAME `token_logprob` the Miss path
-would emit (true value, not a placeholder). The `lp_k == 0` path emits `None`
-so the zero-overhead decode stays byte-identical. SSD-hydrated entries store no
-first decode token, so their `first_logprobs` is `None`.
+**First-token logprob on Exact hit.** An Exact hit replays the cached first
+token without recomputing the prefix's last-position logits. To keep the
+OpenAI contract of one `logprobs.content` entry per emitted token,
+`Qwen3Entry` stores the first token's top `PROMPT_CACHE_LOGPROBS_K` (20)
+logprobs at store time, whatever the storing request asked for. A
+hit replays the record truncated to the replaying request's `top_logprobs`, so
+it emits the same `token_logprob` a Miss would. With logprobs off it emits
+`None`. An SSD-hydrated entry stores no first token and has no
+`first_logprobs`.
 
 ### `PromptCacheEntry` trait contract
 
-Every entry type implements:
-
 | Method | Purpose |
 |---|---|
-| `prompt_token_ids() -> &[u32]` | Full token sequence; used for Exact-path verification and token-identity gate. |
-| `block_hashes() -> &[u64]` | Chained 256-token block digests; used by `find_best_prefix`. |
-| `deep_clone() -> Result<Self>` | Refcount-increment clone of all MLX arrays (copy-on-write; no tensor data copied). |
-| `truncate_kv_to(prefix_len)` | Trim KV caches to `prefix_len` positions in-place. |
-| `truncate_kv_to_block(block_count)` | Block-aligned variant: equivalent to `truncate_kv_to(block_count * 256)`. |
-| `kv_bytes() -> u64` | Best-effort RAM estimate for eviction budget. |
+| `prompt_token_ids()` | Full token sequence; the Exact arm compares it with the request. |
+| `block_hashes()` | Chained 256-token block digests; read by `find_best_prefix`. |
+| `deep_clone()` | Refcount clone of every MLX array; no tensor data is copied. |
+| `kv_caches()` / `kv_caches_mut()` | The attention KV caches. |
+| `lin_caches()` | Recurrent caches; `&[]` for pure-attention arches. Required. |
+| `kv_quant()` | Codec of the snapshot; tags each spilled block. Required. |
+| `is_ssd_hydrated()` | True for an entry rebuilt from the SSD tier. |
+| `truncate_kv_to(len)` / `truncate_kv_to_block(n)` | Trim the KV caches; never touches `lin_caches`. |
+| `kv_bytes()` | RAM estimate for the eviction budget. |
+| `is_hydrate_complete()` | False when a hydrated entry lacks payload for an attended layer. |
+| `is_reusable_prefix_of(..)` | Whether and how a cached prefix may be reused; default `None`. |
+| `prepare_reuse(kind)` | Clone, and trim when the kind requires it. |
 
-### `ArchPromptCache<E>` generic shell
+### `ArchPromptCache<E>`
 
-`ArchPromptCache<E>` collapses all per-arch boilerplate into one type:
+The per-arch shell holds the arch name, its `ReusePolicy`, its cross-layer-KV
+topology (it feeds the seed's per-layer vector), the cache itself (`None`
+until the first request), and the SSD attach parameters (namespace,
+`layout_key`, device). The attach parameters survive a cache rebuild.
 
-- `inner: Mutex<Option<PromptCache<E>>>` — the actual cache; `None` until
-  `ensure` initialises it for the first request.
-- `attach: Mutex<Option<AttachParams>>` — SSD tier attachment parameters
-  (namespace, `kv_quant`, `layout_key`, device). Recorded so they survive a
-  capacity-change cache re-creation.
-- `policy: ReusePolicy` — read by the generate loop; enforced at runtime, not
-  by a comment.
+The resident-KV byte counter is **not** here. It is per model instance
+(`kv_bytes::KvBytesCounter`, a field on each arch's model struct). Two models
+of one arch share this shell and would mix their byte totals in the `events`
+table. See the `kv_cache_bytes` row of `docs/METRICS_DB.md` §4.
 
-The resident-KV byte counter is **not** here. It is per model *instance*
-(`kv_bytes::KvBytesCounter`, a field on each arch's model struct) because this
-shell is per arch *type*: two models of the same architecture sharing it would
-cross-attribute each other's byte totals into the append-only `events` table.
-See the `kv_cache_bytes` row of `docs/METRICS_DB.md` §4.
-
-`ArchPromptCache::ensure(capacity)` is a no-op when the existing cache already
-has the correct capacity. If the capacity changes (e.g. `--prompt-cache-slots`
-changes between model loads), the cache is rebuilt and the SSD sinks are
-re-installed from the recorded `attach` params.
-
-`ensure` runs once per generation on every arch, so the comparison is against
-what the cache actually stores and holds for every value, `0` included. A
-capacity that never compares equal to itself would rebuild on every request —
-discarding snapshots, resetting the hit/miss counters and re-installing the SSD
-sinks each time. That reads as "caching is off" from the outside, and it zeroes
-any measurement taken as `after - before` around a generation.
+`ArchPromptCache::ensure(capacity)` runs once per generation. It is a no-op
+when the cache already has that capacity, `0` included. Otherwise it rebuilds
+the cache and reinstalls the SSD sinks. A capacity that never compared equal
+would rebuild on every request: the snapshots and counters would be dropped
+each time, and caching would look off.
 
 ### Zero slots
 
-`--prompt-cache-slots 0` disables the cache as a real state. The cache object is
-still built and still counts its misses, but `push` refuses every entry, so
-`slots` stays empty, `find_best_prefix` can only miss, and every request runs a
-full prefill. Nothing is clamped to one slot.
+`--prompt-cache-slots 0` disables the cache as a real state. The cache object
+is still built and counts its misses, but `push` refuses every entry. `slots`
+stays empty, `find_best_prefix` can only miss, and every request prefills.
+Nothing is clamped to one slot.
 
-The SSD tier is disabled with it: `hydrate_from_ssd` returns before querying the
-source, because a hydrated entry could only be refused admission. So a zero-slot
-server keeps `ssd_hits` at 0 and does no `.kvb` reads — the "every request runs a
-full prefill" above holds literally, not just for the RAM tier.
+The SSD tier is disabled with it: `hydrate_from_ssd` returns before querying
+the source, because a hydrated entry could only be refused. A zero-slot server
+keeps `ssd_hits` at 0 and reads no `.kvb`.
 
-A request carrying an `X-Session-Id` header does not change this. Session
-KV-reuse widens the configured slot count by one slot per active session
-(`session_cache::effective_prompt_cache_slots`), and a configured `0` is left
-alone: a header must not switch on a cache the operator switched off, and
-alternating capacities would rebuild the cache on every request.
+An `X-Session-Id` header does not change this. Session reuse widens the slot
+count by one per active session
+(`session_cache::effective_prompt_cache_slots`), and leaves a configured `0`
+alone.
 
-To make a *single* request miss without changing the configuration, use
-`ArchPromptCache::clear()` (`Architecture::clear_prompt_cache`), which empties
-the slots and resets the counters while keeping the capacity and the installed
-SSD sinks. That is what `rmlx bench` does: measuring a zero-slot cache would
-time a cache no operator runs.
-
-For `clear()` — unlike zero slots — a RAM miss is still not the same as a
-prefill: it leaves the SSD source attached, so the next request can be served
-from a `.kvb` and recorded as `ssd_hits`. A caller that needs a real prefill
-checks `hits == 0 && ssd_hits == 0` rather than trusting the clear.
+To make one request miss without changing the configuration, use
+`ArchPromptCache::clear()` (`Architecture::clear_prompt_cache`). It empties
+the slots and resets the counters, and keeps the capacity and the SSD sinks.
+`rmlx bench` does this. After `clear()`, a RAM miss can still be served from a
+`.kvb` and counted in `ssd_hits`. A caller that needs a real prefill checks
+`hits == 0 && ssd_hits == 0`.
 
 ---
 
@@ -287,403 +224,250 @@ checks `hits == 0 && ssd_hits == 0` rather than trusting the clear.
 find_best_prefix(prompt_ids, seed) -> Option<(slot_index, matched_blocks)>
 ```
 
-The `seed` is the [`cache_seed`](#the-seed-cache_seed) the caller also uses on
-the push side, so the query digest stream partitions by `(model, layout,
-codec)` — a slot stored by a different model, under a different KV codec, or at
-a different SSD layout never matches. Pass the bare `FNV_OFFSET` for the legacy
-un-salted stream (tests only).
+The `seed` is the [`cache_seed`](#the-seed-cache_seed) the push side uses. A
+slot stored by another model, under another codec or at another layout never
+matches.
 
-1. Compute chained block hashes for `prompt_ids` using `seed`.
-2. Scan all slots (Linear path) or query the radix tree (Radix path).
-3. For each slot count how many leading block digests match.
-4. Return `Some((best_slot_index, best_block_count))` where
-   `best_block_count >= 1`. Return `None` if no slot shares at least one
-   full block.
-5. On a hit, advance the winning slot's `last_used_seq` (MRU stamp).
+1. Compute the chained block digests of `prompt_ids` from `seed`.
+2. Scan every slot (linear index) or query the radix tree (radix index).
+3. Return the slot with the most leading equal digests, if it has at least
+   one; otherwise `None`.
+4. On a hit, stamp the slot most recently used.
 
-Block-count statistics are accumulated: `block_hits`, `block_misses`,
-`partial_hits` (hit where `best_blocks < want_blocks`).
+It counts `hits`, `misses`, `block_hits`, `block_misses` and `partial_hits` (a
+hit that matched fewer blocks than the prompt has). It never evicts.
 
-Eviction is never triggered inside `find_best_prefix`. The caller calls
-`push` after the lookup to store the new snapshot.
+---
+
+## The consume engine
+
+`ArchPromptCache::consume` makes the whole per-request decision and never
+pushes. It returns `Consumed::Exact(entry)`, `Consumed::Reuse { entry, kind }`
+or `Consumed::Miss(reason)`:
+
+1. An image prompt misses at once (`has_image`). Its K/V depends on vision
+   features, not on token ids alone.
+2. Compute the seed (see above).
+3. `find_best_prefix`; on a miss, `hydrate_from_ssd` and look again.
+4. A stored codec that differs from the request's evicts the slot and misses
+   (`quant_mismatch`).
+5. **Exact**: an entry that is not SSD-hydrated and whose prompt equals the
+   request is cloned and returned.
+6. **Reuse**: a hydrated entry may be reused under any policy if it is
+   complete; a RAM entry only under `Partial`. The entry's
+   `is_reusable_prefix_of` picks the `ReuseKind`, and `prepare_reuse` clones
+   (and trims).
+7. Anything else misses.
+
+Every miss carries a `MissReason` and logs one `debug!` event whose `branch`
+field is the reason's label: `has_image`, `no_cache`, `no_match`,
+`quant_mismatch`, `deep_clone_err`, `incomplete_hydrate`, `non_reusable`,
+`hydrated_declined_to_exact`.
+
+`ReuseKind` is `StrictPrefix { prefix_len }` (reuse the whole cached prefix,
+prefill the rest) or `BlockTruncate { effective_blocks }` (trim to a block
+boundary, prefill the rest).
 
 ---
 
 ## ReusePolicy
 
-`ReusePolicy` is a hard runtime gate (not a comment) on the generate loop's
-`CacheLookup` arm:
+`ReusePolicy` is a runtime gate on the consume engine's reuse arm:
 
 ```rust
 pub(crate) enum ReusePolicy {
-    Partial,    // Gemma4: block-aligned partial-prefix reuse allowed
-    ExactOnly,  // Qwen3 / Qwen3.5-MoE: full-token-equality only
+    Partial,    // block-aligned partial-prefix reuse allowed
+    ExactOnly,  // full-token-equality reuse only
 }
 ```
 
-**`Partial`** (Gemma4): a block-aligned partial hit (`best_blocks <
-want_blocks`) may be taken. The generate loop deep-clones the slot, calls
-`truncate_kv_to_block(best_blocks)`, and re-prefills the tail. There is an
-additional per-slot gate: `Gemma4Entry::can_truncate_to_block` checks whether
-every layer cache can reach the block boundary
-(`KvCache::can_truncate_to(block_count * BLOCK_TOKENS)`). A SWA
-`RotatingKvCache` whose ring buffer has wrapped cannot give back a whole block;
-in that case the partial path falls back to Miss.
+**`Partial`** (Gemma4): a RAM entry may be reused as a prefix. See the
+Gemma4 section below.
 
-**`ExactOnly`** (Qwen3, Qwen3.5-MoE): any block-level match that is not a
-full-token-equality Exact hit is routed to `CacheLookup::Miss` and triggers a
-full re-prefill. The Exact path verifies token identity by comparing
-`entry.prompt_token_ids()` byte-for-byte with the incoming prompt.
+**`ExactOnly`** (every other arch): a RAM entry is reused only on an Exact
+hit; any partial match misses. A hydrated entry is still reused as a strict
+prefix where the arch's hook allows it. `Qwen35MoeEntry` allows it when the
+stored tokens are a strict prefix of the request.
 
 ### Judging a resume arm
 
-**A resume arm cannot be judged by byte equality against a cold baseline, and a
-warm arm that agrees with one has not necessarily run.** Two things make the
-obvious oracle wrong, and both have been measured on
-`Qwen3.6-35B-A3B-8bit` at `KvQuant::None`:
+**A resume arm cannot be judged by byte equality against a cold baseline, and
+a warm arm that agrees with one has not necessarily run.**
 
 - *A resume is not a re-prefill.* Restoring at a block boundary and forwarding
-  the tail is the same arithmetic a single-shot prefill runs, chunked
-  differently, so the rows agree to bf16 noise but not, in general, bit for bit.
-  Over a 248K-wide vocabulary a row can hold an exact tie: on a 512-token prefix
-  extended to 520, the two paths pick the same id at all eight tail positions
-  and differ by at most **0.77**, and one decode step on, two ids sit at 10.125
-  apiece. The argmax breaks that toward the lower id, and six greedy tokens
-  later the two streams share nothing. A stream comparison reports it as
-  corruption.
+  the tail is the same arithmetic as a single-shot prefill, chunked
+  differently. The rows agree to bf16 noise, not bit for bit. Over a wide
+  vocabulary a row can hold an exact tie, and one flipped argmax decodes an
+  unrelated stream. A stream comparison reports that as corruption.
 
-  Four numbers set the oracle, all measured on that pair at `KvQuant::None`:
-  reassociation moves a logit by **0.77**; the tolerance is **2.0**, the literal
-  `tests/qwen3_5_moe_forward_seq_last_k.rs` uses; a tail written at the wrong
-  rows moves one by **3.47**; a tail never written moves one by **7.87**. Both
-  mutations also flip an argmax inside the eight tail positions, which is the
-  primary check — the tolerance is the secondary one.
+  Judge the tail logits instead: the argmax at every tail position first, and
+  a per-logit bound second. The bound is `TAIL_LOGIT_NOISE_BOUND` (2.0) in
+  `crates/rmlx-models/src/qwen3_5_moe/tests.rs`, whose doc comment records
+  what it separates. `tests/qwen3_5_moe_forward_seq_last_k.rs` repeats it as a
+  literal.
 
-  The decoded stream can still be compared token for token, but only against a
-  cold prefill **split where the resume splits** (`set_prefill_chunk`). That
-  pair is byte-identical, logits included, and it is the only baseline that
-  reaches what the tail leaves behind: the recurrent state after the tail, and
-  the first KV append on a resumed offset.
-- *A Miss agrees with the cold baseline for free.* It re-prefills the same
+  The decoded stream can be compared token for token only against a cold
+  prefill **split where the resume splits** (`set_prefill_chunk`). That pair
+  is byte-identical, logits included. It is the only baseline that reaches
+  what the tail leaves behind: the recurrent state after the tail, and the
+  first KV append on a resumed offset.
+- *A Miss agrees with the cold baseline for free.* It prefills the same
   prompt. A test that pushes an entry by hand must seed its block digests with
-  `request_cache_seed` — the seed `consume` queries with — or the entry is
-  invisible, every warm arm is a Miss, and the comparison passes while
-  exercising nothing. Assert the branch the engine reached, and where that
-  branch is itself `Miss`, show first that the entry was findable.
+  `request_cache_seed`, the seed `consume` queries with. Otherwise the entry
+  is invisible, every warm arm is a Miss, and the comparison passes while
+  exercising nothing. Assert the branch the engine reached. Where that branch
+  is `Miss`, first show that the entry was findable.
+
+---
+
+## Gemma4 prefix reuse
+
+Gemma4 mixes full-attention layers and sliding-window (SWA) layers. An SWA
+layer is a `RotatingKvCache` ring of the last `sliding_window` tokens.
+`Gemma4Entry::is_reusable_prefix_of` tries two kinds, in this order.
+
+**Strict prefix** (`is_strict_prefix_of`): the cached prompt is at least
+`BLOCK_TOKENS` long, shorter than the request, and equal to the request's
+first tokens. The snapshot is reused whole and only the new tail is
+prefilled. Nothing is truncated, so this is correct even when an SWA ring has
+wrapped: the snapshot already holds what the tail attends to.
+
+**Block truncate**: otherwise take the matched blocks, less the last one when
+they cover the whole block-aligned prompt, since the prefilled tail must not
+be empty. Reuse them only if `can_truncate_to_block` holds: every layer that
+holds anything passes `KvCache::can_truncate_to(blocks * BLOCK_TOKENS)`. A
+ring past its wrap cannot give a position back, so the reuse misses instead
+of desyncing the layers. A ring that still holds the window the shorter
+prefix attends over may be rolled back; that rollback is lossless by the rule
+in `docs/KV_CACHE.md` § "Rolling the SWA ring back".
+`gemma4_kv_cache_equivalence.rs` checks that the reused prefix reproduces a
+full prefill.
+
+Gemma4's SWA rings are not written to the SSD tier. A hydrated entry with a
+payload-less attended layer fails `is_hydrate_complete` and misses.
 
 ---
 
 ## LRU eviction
 
-`PromptCache<E>` maintains a monotonic `seq: u64` counter (no syscall). Every
-`find_best_prefix` hit and every `push` advance it. Each slot carries a
-`last_used_seq` stamped at its last access.
+`PromptCache<E>` keeps a monotonic `seq` counter. Every hit and every `push`
+advance it, and each slot carries the `seq` of its last use.
 
-`push` runs an admission guard, then two eviction passes, before appending the
-new entry:
+`push` runs, in order:
 
-0. **Zero-capacity guard**: a cache configured with no slots stores nothing —
-   `push` returns `None`. See "Zero slots" above.
-1. **Over-cap admission guard**: if the incoming entry's KV alone exceeds
-   `max_bytes`, the entry is **not admitted** — `push` returns `None` without
-   evicting any existing slot. See "Over-cap admission" below.
-2. **RAM cap**: while `total_kv_bytes + new_entry_bytes > max_bytes`, evict
-   the slot with the smallest `last_used_seq`.
-3. **Slot count cap**: if `slots.len() == capacity`, evict the slot with the
-   smallest `last_used_seq`.
+1. **Zero capacity**: a cache with no slots stores nothing; `push` returns
+   `None`. See "Zero slots" above.
+2. **Over-cap admission**: an entry whose KV alone exceeds `max_bytes` is not
+   admitted and nothing is evicted; `push` returns `None`.
+3. **RAM cap**: while the stored bytes plus the new entry exceed `max_bytes`,
+   evict the least recently used slot.
+4. **Slot count**: if the cache is full, evict the least recently used slot.
 
-Either cap triggers independently; the smaller cap wins. Each eviction
-increments `stats.evictions` and calls `spill_evicted` (the SSD sink
-hook, if attached). `push` returns `Some(slot_index)` when the entry is stored
-and `None` when the admission guard rejects it.
+Each eviction increments `evictions` and offers the entry to the SSD spill
+sink, if one is attached. `push` returns `Some(slot_index)` when it stores.
 
 ### Over-cap admission
 
-A single snapshot whose resident KV alone exceeds `max_bytes` is **refused
-admission** rather than stored above the cap. Without this guard, an empty (or
-near-empty) cache would happily store one entry many times larger than the cap —
-the RAM-cap eviction loop only evicts *other* slots and never refuses the
-incoming entry — silently violating the documented cap.
+An oversized snapshot is refused rather than stored over the cap. The RAM-cap
+loop evicts only other slots, so without the refusal an empty cache would
+store one entry far over the cap. Reusing such an entry is also harmful: an
+Exact hit clones the snapshot, and the first decode append copies the whole
+KV on write, a second full-size copy. At long context that can exceed physical
+RAM and stall decode. With the refusal the repeat request prefills like the
+cold one.
 
-The refusal is not just bookkeeping hygiene: admitting an over-cap snapshot is
-what caused the large-KV **warm-cache decode stall**. The next identical (warm)
-request takes the Exact path, which `deep_clone`s the stored snapshot
-(refcount-shared, no copy) and then, on the first decode append, triggers MLX
-copy-on-write of the whole KV — a *second* full-size residency. For a
-bf16-mirror KV codec at long context (tens of GB), that doubling pushes total
-residency past physical RAM and stalls decode with a single multi-hundred-second
-pause (steady-state `itl` stays healthy; only the aggregate craters).
+The guard compares `entry.kv_bytes()` with the cap and names no arch or
+codec. It keeps the existing slots. An SSD hydrate whose rebuilt entry is over
+the cap is a miss.
 
-Refusing admission bounds peak residency to one live copy: the repeat request
-re-prefills exactly like the cold request instead of reusing an over-cap slot,
-so warm decode ≈ cold decode. The guard is model- and codec-agnostic — it keys
-off `entry.kv_bytes()` versus the cap, never an arch or codec name. Existing
-(smaller, valid) slots are left intact; the guard never evicts to make room for
-something that still could not fit. An SSD hydrate whose reconstructed block is
-over-cap is likewise treated as a miss (the caller re-prefills).
+### RAM cap
 
-The RAM cap is set once at process start:
+| Mechanism | Detail |
+|---|---|
+| CLI flag | `--prompt-cache-ram-gb <f64>`, in GiB; a negative or non-finite value falls back to the default. |
+| Default | 2 GiB (`DEFAULT_MAX_BYTES`). |
+| Scope | Process-global `OnceLock`, set by `install_ram_cap` from `rmlx serve` before any model loads. A second call with another value is dropped with a `warn!`. |
 
-- CLI `--prompt-cache-ram-gb` (takes precedence).
-- Env `RMLX_PROMPT_CACHE_MAX_BYTES` (bytes, decimal; silent fallback).
-- Default: 2 GiB.
-
-`install_ram_cap(cli_gib)` is called once from `rmlx serve` before any model
-loads. A second call with a different value is dropped with a `warn!`
-(idempotent — matches the `ssd_tier::install_config` pattern).
-
----
-
-## KVBM block manager
-
-The `block_manager` module (`crates/rmlx-models/src/block_manager/`) is a
-port of NVIDIA Dynamo's `kvbm-logical` layer, providing fine-grained per-block
-management as a building block for the per-arch swap follow-up. It is compiled
-and unit-tested but not yet wired into production inference paths.
-
-### Layers
-
-**TinyLFU** (`tinylfu`): 4-bit Count-Min Sketch with halving-decay aging.
-Four independent FNV-1a-64 hash streams (derived from four stable `u64` seeds)
-replace the reference's xxh3 with 192-byte secrets. Same algorithmic
-properties: 4 independent CMS slots, 4-bit ceiling, `decay_threshold =
-capacity * 10` increments, decay mask `0x7777_7777_7777_7777`.
-
-**MultiLruBackend** (`multi_lru`): 4-tier LRU keyed by TinyLFU bin.
-Default bin thresholds `[3, 8, 15]` map TinyLFU counts to pools 0–3 (0 =
-coldest). Eviction drains pool 0 first, then 1, 2, 3. Match lookups walk all
-four pools. Each pool is a `VecDeque<BlockHash>`; `touch` moves a block to the
-back of its current (or re-binned) pool. Single-threaded by the surrounding
-store mutex.
-
-**BlockStore** (`store`): single-mutex store + slot state machine.
-
-Slot lifecycle:
-
-```
-Reset ──allocate──> Mutable ──register──> Staged ──commit──> Primary
-│
-└─dup─> Duplicate
-Primary ──refcount=0──> Inactive ──reuse──> Primary
-│
-└──evict──> Reset  (payload offered to OverflowSink)
-```
-
-States:
-- `Reset` — free, in the reset pool.
-- `Mutable` — allocated, no hash assigned; writable.
-- `Staged` — hash assigned but not committed to `active_by_hash`.
-- `Primary` — committed, live references outstanding.
-- `Duplicate` — same hash as a Primary; lives parallel until refcount drops.
-- `Inactive` — refcount 0; eligible for resurrection or eviction.
-
-**`EventReleaseHandle`**: RAII `Arc`-backed token. The `Remove` event fires
-exactly once when the last clone drops, matching the reference's
-`Arc<Inner> + Drop` semantics. Multiple `ImmutableBlock`s cloning the same
-registration share one handle.
-
-**`PowerOfTwoPolicy`**: filters event batches keeping only blocks at
-power-of-two positions (1-indexed: 1, 2, 4, 8, …), keeping event volume
-O(log N) per batch.
-
-**`OverflowSink`**: trait called when the inactive index evicts a block from
-tier 0. The production implementation wraps `SsdSpiller` and translates the
-payload to a spill job. `offer_evicted` must not block the decode thread.
-
-**`BlockManager`** (`manager`): public facade over `BlockStore`. Provides
-`allocate_blocks`, `register_blocks`, `match_blocks`, and `scan_matches`.
-
-**Hash family**: FNV-1a-64 with `layout_key` mixing (`FNV_OFFSET ^
-layout_key`). Same hash family as the prompt cache, **not** the same key: this
-is `CacheKey::chained_seed`, which folds an optional `lora_salt` and `mm_hash`
-and carries no model or codec term, so its digests are not interchangeable with
-`cache_seed`'s and cannot address `.kvb` rows. The reference uses xxh3; rMLX
-uses FNV to avoid adding a new dependency.
-
-**Lock order**: `attachments → store`, never reversed. The store mutex is
-never held while calling into an `OverflowSink` (non-blocking `try_send`).
+The RAM cap and the slot count (`--prompt-cache-slots`) are independent.
+Either can evict first on a given `push`.
 
 ---
 
 ## PrefixIndex (linear / radix)
 
-`PrefixIndex` is a pluggable longest-prefix index over chained block hashes.
-The active strategy is a process-global set once at serve startup via
-`--prefix-index {linear|radix}` (default: `linear`).
+`PrefixIndex` is the longest-prefix index over chained block digests. The
+strategy is process-global, set once at serve startup by
+`--prefix-index {linear|radix}` (default `linear`). The prompt cache keeps the
+index in step with its slots on every push and eviction. It passes
+`layout_key = 0`, since the seed already partitions by layout.
 
-### LinearScan (default)
+**LinearScan** (default): `find_best_prefix` walks `slots` directly. The index
+is kept only so the two strategies can be compared.
 
-O(slots × n_blocks) walk. Maintains a parallel `Vec<LinearEntry>` mirroring
-every `(chained_hashes, layout_key)` in `PromptCache::slots`. On
-`find_best_prefix` the linear path ignores this index and walks `slots`
-directly — the index is maintained in lockstep for differential-testing parity
-with the Radix path, not for the lookup itself.
+**PositionalRadixTree** (`--prefix-index radix`): a port of NVIDIA Dynamo's
+`PositionalRadixTree`. Each node stores `(block_hash, layout_key)` and the
+`(slot_id, leaf_depth)` of every entry whose path passes through it. A lookup
+walks one block at a time and stops at the first mismatch; the deepest node
+with an entry wins. Removal prunes empty nodes; the node vector is
+append-only until `clear`. If the tree returns a slot id no slot carries, the
+lookup warns and falls back to a linear scan.
 
-### PositionalRadixTree (`--prefix-index radix`)
-
-Port of NVIDIA Dynamo's `PositionalRadixTree`. Arena-allocated node vector;
-children are `Vec<NodeId>` (small `u32`). Each node stores `(block_hash,
-layout_key)` and a list of `(slot_id, leaf_depth)` tuples for every entry
-whose chained-hash path passes through it.
-
-Lookup (`match_best`): walk one block at a time, descending to the child
-matching `(next_block_hash, layout_key)`. The deepest visited node with a
-tuple wins. Stops on the first mismatch.
-
-Complexity: O(n_blocks · avg_fanout · avg_entries_per_node). Fanout stays
-small in practice (bounded by the number of distinct continuations under any
-shared prefix).
-
-Insert: walk or create nodes along the chained-hash sequence, stamp
-`(slot_id, leaf_depth)` at every node. Overwrite at the same key with a
-different `slot_id` first removes the prior path tuples (`evict_slot_path`)
-then inserts the new ones — mirrors LinearScan's overwrite contract.
-
-Remove: walk the path leaf-to-root, remove the `(slot_id, leaf_depth)` tuple
-from each node, prune payload-less child-less nodes. The node vector is
-append-only (orphaned nodes leak until `clear`), bounded by the working set.
-
-Layout disambiguation: entries with the same `chained_hashes` but different
-`layout_key` are stored on separate branches — the same composite PK rule as
-the SQLite SSD index.
-
-The Radix tree is verified against LinearScan by a 1 000-random-prompt
-differential test that asserts Some/None parity, `n_matched_blocks` equality,
-and (when the prefix is unambiguous) `slot_id` identity.
+`differential_linear_vs_radix_1000_prompts` checks the two against each other
+over 1000 random prompts.
 
 ---
 
-## SWA snapshot/restore (Gemma4)
+## KVBM block manager
 
-Gemma4 mixes full-attention and sliding-window attention (SWA) layers. SWA
-layers use `RotatingKvCache`, which is a ring buffer of the last
-`sliding_window` K/V tokens.
+`crates/rmlx-models/src/block_manager/` ports NVIDIA Dynamo's `kvbm-logical`
+layer. It is compiled and unit-tested. No production path calls it.
 
-**`can_truncate_to_block(block_count)`**: returns true iff every layer cache
-that holds anything (`offset() > 0` — the KV-shared tail never does, and the
-truncation skips it too) passes
-`KvCache::can_truncate_to(block_count * BLOCK_TOKENS)`. A cached entry has taken
-decode steps, so its SWA ring is in rotated order; past the wrap that ring cannot
-give a position back and `truncate_kv_to_block` would fail on the SWA layers
-after trimming the full-attention ones, desyncing the caches. When
-`can_truncate_to_block` returns false, the partial prefix hit degrades to Miss
-and the request falls back to full re-prefill.
+- **TinyLFU** (`tinylfu`): a 4-bit Count-Min Sketch with halving decay, over
+  four FNV-1a-64 streams (the reference uses xxh3; FNV adds no dependency).
+  It decays every `capacity * 10` increments with mask
+  `0x7777_7777_7777_7777`.
+- **MultiLruBackend** (`multi_lru`): four LRU pools keyed by TinyLFU bin,
+  thresholds `[3, 8, 15]`; eviction drains the coldest pool first.
+- **BlockStore** (`store`): one mutex over the slots and their state
+  machine: `Reset → Mutable → Staged → Primary`; `Duplicate` beside a
+  `Primary` of the same hash; `Inactive` at refcount 0; evicted to `Reset`.
+- **Events** (`events`): `EventReleaseHandle` fires `Remove` once, when the
+  last clone drops. `PowerOfTwoPolicy` keeps events for blocks at
+  power-of-two positions only.
+- **`OverflowSink`** (`overflow`): called when tier 0 evicts a block; must
+  not block.
+- **`BlockManager`** (`manager`): the facade — `allocate_blocks`,
+  `register_blocks`, `match_blocks`, `scan_matches`.
 
-The predicate is exact rather than conservative, which widens the path slightly:
-where the old `is_trimmable` refused every ring past its wrap, a ring still
-holding the window the shorter prefix attends over — a prefill-only entry, whose
-chunked prefill leaves it `window - 1 + chunk` long and in temporal order — is
-now allowed. That rollback is lossless by the rule in `docs/KV_CACHE.md`
-§ "Rolling the SWA ring back", and `gemma4_kv_cache_equivalence.rs` is what shows
-the reused prefix reproduces a full prefill.
-
-**`is_strict_prefix_of(prompt_ids)`**: returns true iff this entry's full
-token sequence is a strict prefix of `prompt_ids` (i.e. the new prompt
-extends the cached prompt by at least one token). Requirements:
-- `cached_len >= BLOCK_TOKENS` (256-token worthwhile floor).
-- `cached_len < prompt_ids.len()` (strict extension, not equal-length).
-- `cached_tokens[..cached_len] == prompt_ids[..cached_len]` (byte-identical).
-
-When `is_strict_prefix_of` is true the generate loop takes the B1 strict-prefix
-path: deep-clone the slot, do not truncate, re-prefill only the tail
-`prompt_ids[cached_len..]`. This path is correct for wrapped-SWA because the
-snapshot already holds the last `sliding_window` K/V tokens of the cached
-prefix — exactly what the tail attends to — and no truncation is performed.
-
----
-
-## Partial-prefix hit / `truncate_kv_to_block`
-
-When `find_best_prefix` returns `(slot_idx, k)` where `k < want_blocks` and
-the arch policy is `Partial`:
-
-1. Call `deep_clone` on the winning slot's entry (refcount-increment, no tensor
-   copy).
-2. Gate on `can_truncate_to_block(k)` (Gemma4 only; fails if any SWA ring is
-   wrapped).
-3. Call `truncate_kv_to_block(k)` on the clone — trims all KV caches to
-   `k * 256` sequence positions. For Qwen3.5-MoE, `lin_caches` are NOT
-   trimmed; but the `ExactOnly` policy means this method is never called in
-   production for that arch.
-4. Re-prefill tokens `[k*256 .. len)` on top of the trimmed clone.
-5. After the request completes, `push` the new full snapshot into the cache.
+Its seed is `CacheKey::chained_seed`, which folds `layout_key` and an
+optional `lora_salt` and `mm_hash`, and no model or codec term. Its digests
+are not `cache_seed`'s and cannot address `.kvb` rows. Lock order is
+`attachments → store`, never reversed.
 
 ---
 
 ## SSD handoff
 
-The SSD tier adds two hooks to `PromptCache<E>`:
+The SSD tier adds two hooks to `PromptCache<E>`. One blanket impl of each
+serves every arch.
 
-- `SpillSink<E>` — called when a slot is evicted (RAM-cap or slot-count). The
-  production implementation (`SsdSpiller`) refcount-clones the evicted caches,
-  materializes GPU buffers on the inference thread (`eval_for_spill`), and
-  `try_send`s a `SpillJob` onto a bounded channel. A dedicated drain thread
-  serializes the job to a `.kvb` safetensors file and records the block in
-  `SsdKvIndex`. Back-pressure drops the job with a `warn!`; eviction from RAM
-  always proceeds regardless.
+- **`SpillSink<E>`** (`impl SpillSink<E> for SsdSpiller` in
+  `prompt_cache.rs`) — called on every eviction. It refcount-clones the
+  entry's `kv_caches` and `lin_caches`, evaluates them on the inference
+  thread, and `try_send`s a job to a drain thread that writes the `.kvb` and
+  its index row. A full channel drops the job with a `warn!`; eviction always
+  proceeds.
+- **`SsdHydrate<E>`** (`impl SsdHydrate<E> for SsdHydrator` in
+  `rmlx-kv-ssd`) — called on a RAM miss. It finds the longest matching block
+  prefix in the index, reads the `.kvb`, checks its metadata, and rebuilds
+  the entry under the request's seed, codec and `DispatchPolicy`. An arch
+  states only what a restored block becomes, as `HydratedEntry`
+  (`docs/SSD_TIER.md` § "The per-arch entry impls"). Corruption deletes the
+  file and row, logs a `warn!` and reads as a miss.
 
-- `SsdHydrate<E>` — called by `hydrate_from_ssd` on a RAM-cache miss. Queries
-  the `SsdKvIndex` for the longest matching block-hash prefix, reads the `.kvb`
-  file, verifies `model_id` and `kv_quant` metadata, and reconstructs the arch
-  entry under the caller's `DispatchPolicy` (per-request like `seed` and
-  `kv_quant`, never read off the source). One blanket impl in `rmlx-kv-ssd`
-  serves every arch; an arch states only what a restored block becomes, as
-  `HydratedEntry` (`docs/SSD_TIER.md` § "The per-arch entry impls"). Corruption (bad read, metadata mismatch, missing file) is handled
-  internally (delete + `warn!`) and surfaces as `Ok(None)` — the caller falls
-  through to full re-prefill.
+The sinks are attached at model load by `ssd_tier::attach_at_load` when
+`--kv-ssd-cache-gb` is set. Without them an evicted entry is dropped.
+`ensure` reinstalls them whenever it rebuilds the cache.
 
-Both sinks are arch-specific because the spill job differs:
-- Gemma4 / Qwen3: `SpillJob { kv_caches, lin_caches: vec![] }`.
-- Qwen3.5-MoE: `SpillJob { kv_caches, lin_caches }` (both fields populated).
-
-The sinks are attached at model load by `ssd_tier::attach_at_load` → per-arch
-`attach_ssd_tier`, gated by `--kv-ssd-cache-gb`. When not attached, eviction
-drops entries silently (the pre-SSD behavior).
-
-`ArchPromptCache::ensure` reinstalls the sinks from the recorded `AttachParams`
-whenever the cache is rebuilt (capacity change), so a capacity bump never
-silently drops the tier.
-
-### `ssd_cache_restart` smoke test
-
-`crates/rmlx-server/tests/ssd_cache_restart.rs` is an end-to-end integration
-test (`#[ignore]`, env-gated on `RMLX_TEST_MODEL`) that proves the full
-spill → restart → hydrate chain:
-
-1. Start `rmlx serve` with `--kv-ssd-cache-gb 1 --prompt-cache-slots 1`.
-2. Send a long prompt A; confirm the response is coherent.
-3. Send a second request to force eviction of A to SSD.
-4. Kill the server, clear the Metal claim file.
-5. Restart with the same `--kv-ssd-cache-gb` and same `RMLX_HOME`.
-6. Send prompt A again; assert the response is byte-identical (SSD hydration).
-
-Each run uses a fresh `RMLX_HOME` tempdir for hermeticity.
-
----
-
-## RAM cap
-
-| Mechanism | Detail |
-|---|---|
-| CLI flag | `--prompt-cache-ram-gb <f64>` — value in GiB, converted to bytes. |
-| Env fallback | `RMLX_PROMPT_CACHE_MAX_BYTES` — bytes, decimal (undocumented compat). |
-| Default | 2 GiB. |
-| Scope | Process-global `OnceLock`; first call to `install_ram_cap` wins. |
-| Admission guard | `push`: an entry whose KV alone exceeds `max_bytes` is refused (`push` → `None`), no eviction. See "Over-cap admission". |
-| Eviction trigger | `push`: evicts LRU slots until `total_kv_bytes + new_entry_bytes <= max_bytes`. |
-
-The RAM cap and the slot count cap (`--prompt-cache-slots`) are independent.
-Either can trigger eviction first on a given `push`. The over-cap admission
-guard runs first: a snapshot larger than the whole cap is never stored (it would
-both violate the cap and cause the warm-cache decode stall on reuse).
-
----
-
-## See also
-
-- `docs/KV_CACHE.md` — KV quantization codec reference (`--kv-quant`,
-  `--cache-type-k` / `--cache-type-v`).
-- `docs/SSD_TIER.md` — SSD cache tier: `.kvb` file format, `SsdKvIndex`
-  schema, eviction budget, namespace layout.
-- `docs/MODELS.md` — per-arch generate loop, `CacheLookup` match arms,
-  prefill / decode pipeline.
+`crates/rmlx-server/tests/ssd_cache_restart.rs` drives spill, server restart
+and hydrate end to end against a real `rmlx serve`.
