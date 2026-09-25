@@ -1,10 +1,11 @@
 """Enum and `match` reader for the KV structural-metric producers.
 
 It blanks comments and literals, finds an `enum` body, walks `match`
-expressions arm by arm, and reads the pattern of each `matches!` call. It is
-not a Rust parser. It reads the shapes this tree writes and refuses, loudly, on a shape it cannot read back — a scan that
-silently drops a site reports a smaller number than the truth, which is the
-failure mode every producer here exists to avoid.
+expressions arm by arm, and reads the pattern of each `matches!` call and
+each `let`. It is not a Rust parser. It reads the shapes this tree writes and
+refuses, loudly, on a shape it cannot read back — a scan that silently drops
+a site reports a smaller number than the truth, which is the failure mode
+every producer here exists to avoid.
 
 `fn` bodies are **not** read here. `lib/debt_report.py` owns that scan, and
 both producers of the update-body figure call it, so the two cannot drift.
@@ -180,17 +181,54 @@ def match_sites(blanked: str) -> list[MatchSite]:
     """
     sites: list[MatchSite] = []
     for m in re.finditer(r"\bmatch\b", blanked):
-        brace = blanked.find("{", m.end())
-        if brace < 0:
-            raise ScanError(f"match at line {line_of(blanked, m.start())} opens no block")
         try:
-            end = block_end(blanked, brace)
+            brace, end = _arm_block(blanked, m.end())
         except ScanError as exc:
             raise ScanError(f"match at line {line_of(blanked, m.start())}: {exc}") from exc
         site = MatchSite(line=line_of(blanked, m.start()), start=m.start())
         site.arms = _arms(blanked, brace + 1, end - 1)
         sites.append(site)
     return sites
+
+
+def _top_level_arrow(text: str) -> bool:
+    depth = 0
+    for i, c in enumerate(text):
+        if c in "{([":
+            depth += 1
+        elif c in "})]":
+            depth -= 1
+        elif depth == 0 and text.startswith("=>", i):
+            return True
+    return False
+
+
+def _arm_block(blanked: str, start: int) -> tuple[int, int]:
+    """`(open, end)` of the block that holds the arms of a `match`.
+
+    The scrutinee can hold a block too (a closure body, `unsafe { .. }`), so
+    the arm block is the first block outside brackets that holds a top-level
+    `=>` or is empty.
+    """
+    depth = 0
+    i = start
+    while i < len(blanked):
+        c = blanked[i]
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif c == "{":
+            end = block_end(blanked, i)
+            inner = blanked[i + 1 : end - 1]
+            if depth == 0 and (not inner.strip() or _top_level_arrow(inner)):
+                return i, end
+            i = end
+            continue
+        elif c == ";" and depth == 0:
+            break
+        i += 1
+    raise ScanError("no block holds its arms")
 
 
 def _arms(blanked: str, start: int, stop: int) -> list[MatchArm]:
@@ -257,4 +295,31 @@ def matches_macros(blanked: str) -> list[MatchSite]:
                 break
         else:
             raise ScanError(f"matches! at line {line_of(blanked, m.start())} has no pattern")
+    return out
+
+
+def let_patterns(blanked: str) -> list[MatchSite]:
+    """The pattern of every `let` — plain, `if let`, `while let` and
+    `let … else` — as a site whose one arm is the pattern.
+
+    A `let` with no initialiser has no `=` before its `;` and is left out.
+    """
+    out: list[MatchSite] = []
+    for m in re.finditer(r"\blet\b", blanked):
+        depth = 0
+        for i in range(m.end(), len(blanked)):
+            c = blanked[i]
+            if c in "{([":
+                depth += 1
+            elif c in "})]":
+                depth -= 1
+                if depth < 0:
+                    break
+            elif depth == 0 and c == ";":
+                break
+            elif depth == 0 and c == "=" and blanked[i + 1 : i + 2] not in ("=", ">") and blanked[i - 1] not in "=!<>.":
+                line = line_of(blanked, m.start())
+                pattern = blanked[m.end() : i].strip()
+                out.append(MatchSite(line=line, start=m.start(), arms=[MatchArm(pattern=pattern, line=line)]))
+                break
     return out

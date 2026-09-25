@@ -12,8 +12,8 @@
 #   would pass against a producer that had stopped finding any site at all.
 #
 #   The fixtures are their own trees, and each case states the number its own
-#   planted source implies. The last cases pin the real tree's site figures,
-#   so a change that moves one re-pins it in the same change.
+#   planted source implies. The last case pins the real tree's four site
+#   figures exactly, so a change that moves one re-pins it in the same change.
 #
 # EXIT CODES
 #   0  every case produced the expected exit code and output
@@ -354,7 +354,7 @@ T="${WORK}/norefs"; build_tree "${T}"
 printf 'pub fn nothing() -> usize { 1 }\n' >"${T}/${UPDATE_REL}"
 check "a file naming no variant is a refusal" "${T}" 2 "unavailable: .*names no" refs --file "${UPDATE_REL}"
 
-# 18 — a wide match planted in a test file. The producer measures production
+# 19a — a wide match planted in a test file. The producer measures production
 # source, so it is not counted; `--include-tests` is the one way to see it.
 # Without this case the test-file exclusion could be disabled and every other
 # case here would stay green.
@@ -675,13 +675,265 @@ check "a glob-imported None variant counts toward the bar" "${T}" 0 \
 check "Option's None beside Some(..) is not a storage variant" "${T}" 0 "^match-sites 5$" match-sites
 check "the Option<KvQuant> match counts once and forces a touch" "${T}" 0 "^forcing-sites 4$" match-sites
 
-# 34 — the real tree, pinned. A change that moves a figure re-pins it in the
-# same change, so a restructure states its reduction here, and a new subset
-# or table site cannot land unnoticed.
-check "real tree: match sites" "${REPO_ROOT}" 0 "^match-sites 29$" match-sites
-check "real tree: forcing sites" "${REPO_ROOT}" 0 "^forcing-sites 29$" match-sites
-check "real tree: subset sites" "${REPO_ROOT}" 0 "^subset-sites 64$" match-sites
-check "real tree: table sites" "${REPO_ROOT}" 0 "^table-sites 2$" match-sites
+# 34 — negative control for the table-key rule: a match over a non-codec
+# enum whose arms return every quant variant. Its keys are enum paths, not
+# string literals or constants, so it is not a spelling table.
+T="${WORK}/enumtable"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn quant_of(o: Other) -> KvQuant {
+    match o {
+        Other::Alpha => KvQuant::One,
+        Other::Beta => KvQuant::Two,
+        Other::Gamma => KvQuant::Three,
+        Other::Delta => KvQuant::Four,
+    }
+}
+EOF
+check "a non-codec match returning every variant is not a table site" "${T}" 0 "^table-sites 0$" match-sites --threshold 2
+
+# 35 — a block in the scrutinee, here a closure body. The arm block is the
+# next block, and the site is still found.
+T="${WORK}/scrutineeblock"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn picked(q: Option<KvQuant>) -> usize {
+    match q.unwrap_or_else(|| {
+        KvQuant::One
+    }) {
+        KvQuant::One => 1,
+        KvQuant::Two => 2,
+        KvQuant::Three => 3,
+        KvQuant::Four => 4,
+    }
+}
+EOF
+check "a match whose scrutinee holds a block is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 36 — a `match` whose arm block the reader cannot find is a refusal, never a
+# site dropped in silence.
+T="${WORK}/noarms"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn broken(q: Option<KvQuant>) -> usize {
+    let n = match q.map(|v| { v });
+    n
+}
+EOF
+check "a match with no arm block is a refusal" "${T}" 2 "unavailable: .*update.rs: match at line [0-9]+: no block holds its arms" \
+    match-sites --threshold 2
+
+# 37 — `ref` and `mut` bindings are catch-alls. The site stays, and it no
+# longer forces a touch.
+T="${WORK}/refbinding"; build_tree "${T}"
+cat >"${T}/${UPDATE_REL}" <<'EOF'
+pub fn dispatch(s: &KvStorage) -> usize {
+    match s {
+        KvStorage::Alpha { .. } => 1,
+        KvStorage::Beta { .. } => 2,
+        ref other => fallback(other),
+    }
+}
+
+pub fn owned(s: KvStorage) -> usize {
+    match s {
+        KvStorage::Alpha { .. } => 1,
+        KvStorage::Beta { .. } => 2,
+        mut other => fallback(&mut other),
+    }
+}
+
+fn update_alpha() -> usize {
+    1
+}
+EOF
+check "a ref binding is a catch-all" "${T}" 0 \
+    "^site ${UPDATE_REL}:2 enum=KvStorage variants=2 arms=3 catch_all=yes$" match-sites --threshold 2
+check "a mut binding is a catch-all" "${T}" 0 \
+    "^site ${UPDATE_REL}:10 enum=KvStorage variants=2 arms=3 catch_all=yes$" match-sites --threshold 2
+
+# 38 — a tuple of catch-alls is a catch-all, so a tuple match under the bar
+# is a subset site. A tuple that holds a variant is not a catch-all.
+T="${WORK}/tuplewild"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn pair(q: KvQuant, flag: bool) -> usize {
+    match (q, flag) {
+        (KvQuant::One, _) => 1,
+        (_, _) => 0,
+    }
+}
+EOF
+check "a tuple of catch-alls makes a subset site" "${T}" 0 \
+    "^subset ${UPDATE_REL}:[0-9]+ kind=wildcard enum=KvQuant variants=1$" match-sites --threshold 2
+check "the tuple match is the one subset site" "${T}" 0 "^subset-sites 1$" match-sites --threshold 2
+
+# 39 — a variant named only in an arm guard is not an arm of the match. The
+# `matches!` in the guard is one subset site; the bool match is not a second.
+T="${WORK}/guard"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn gated(flag: bool, q: KvQuant) -> usize {
+    match flag {
+        true if matches!(q, KvQuant::One) => 1,
+        _ => 0,
+    }
+}
+EOF
+check "a variant in a guard is not an arm" "${T}" 0 "^subset-sites 1$" match-sites --threshold 2
+check "the guard's matches! is the subset site" "${T}" 0 \
+    "^subset ${UPDATE_REL}:[0-9]+ kind=matches enum=KvQuant variants=1$" match-sites --threshold 2
+
+# 40 — variants imported by name, `use KvQuant::{One, Two, Three, Four}`.
+T="${WORK}/namedimport"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+use crate::quant::KvQuant::{One, Two, Three, Four};
+
+pub fn bare(q: KvQuant) -> usize {
+    match q {
+        One => 1,
+        Two => 2,
+        Three => 3,
+        Four => 4,
+    }
+}
+EOF
+check "a match over variants imported by name is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 41 — a `type` alias, and `self as` inside a use tree, both name the enum.
+T="${WORK}/typealias"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+type S = crate::storage::KvStorage;
+use crate::quant::KvQuant::{self as Q, *};
+
+pub fn aliased(s: &S) -> usize {
+    match s {
+        S::Alpha { .. } => 1,
+        S::Beta { .. } => 2,
+        S::Gamma { .. } => 3,
+        S::Delta { .. } => 4,
+    }
+}
+
+pub fn quant(q: Q) -> usize {
+    match q {
+        Q::One => 1,
+        Q::Two => 2,
+        Q::Three => 3,
+        Q::Four => 4,
+    }
+}
+EOF
+check "a type alias and a use-tree self alias are sites" "${T}" 0 "^match-sites 5$" match-sites --threshold 2
+
+# 42 — negative control: a `type` alias of an unrelated enum.
+T="${WORK}/othertype"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+type S = OtherEnum;
+
+pub fn aliased(s: &S) -> usize {
+    match s {
+        S::Alpha => 1,
+        S::Beta => 2,
+        S::Gamma => 3,
+        S::Delta => 4,
+    }
+}
+EOF
+check "a type alias of an unrelated enum is not a site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+
+# 43 — `if let`, `while let` and `let … else` over a codec variant are subset
+# sites: a new codec compiles there and takes the other branch.
+T="${WORK}/iflet"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn lets(q: KvQuant, s: &KvStorage, mut it: Iter) -> usize {
+    if let KvQuant::One = q {
+        return 1;
+    }
+    while let Some(KvStorage::Beta { .. }) = it.next() {}
+    let KvStorage::Gamma { .. } = s else {
+        return 0;
+    };
+    let plain = 3;
+    if let Some(x) = it.next() {
+        return x;
+    }
+    plain
+}
+EOF
+check "if let, while let and let-else are subset sites" "${T}" 0 "^subset-sites 3$" match-sites --threshold 2
+check "a let-else is a subset site of its own kind" "${T}" 0 \
+    "^subset ${UPDATE_REL}:31 kind=iflet enum=KvStorage variants=1$" match-sites --threshold 2
+
+# 44 — the rewrite from `matches!` (case 25) to `if let` keeps the figure.
+T="${WORK}/rewrite"; build_tree "${T}"
+cat >"${T}/${QUANT_REL}" <<'EOF'
+pub enum KvQuant {
+    One,
+    Two,
+    Three,
+    Four,
+}
+
+pub fn low(q: KvQuant) -> bool {
+    if let KvQuant::One | KvQuant::Two = q { true } else { false }
+}
+EOF
+check "a matches! rewritten as if let keeps the subset figure" "${T}" 0 "^subset-sites 1$" match-sites --threshold 2
+
+# 45 — negative control: `if let` over a non-codec enum.
+T="${WORK}/otherlet"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn other(o: Other) -> usize {
+    if let Other::Alpha = o {
+        return 1;
+    }
+    0
+}
+EOF
+check "an if let over a non-codec enum is not a subset site" "${T}" 0 "^subset-sites 0$" match-sites --threshold 2
+
+# 46 — the real tree, pinned exactly. One run, all four figures compared, and
+# each failure prints the figure beside its pin and what to do.
+REAL_PINS="match-sites=29 forcing-sites=29 subset-sites=157 table-sites=2"
+pin_advice() { # pin_advice NAME
+    local list="python3 scripts/kv_update_census.py match-sites | grep"
+    case "$1" in
+    match-sites | forcing-sites)
+        echo "A new codec must touch N sites; a change that moves N states the new N in its commit message. List them: ${list} '^site'. Set the pin in the real-tree case of scripts/kv_update_census_selftest.sh."
+        ;;
+    subset-sites)
+        echo "A subset site is a matches!, if-let or catch-all match over a codec enum; a new codec compiles there and silently takes false or the catch-all arm. List them: ${list} '^subset'. If the change is correct, set the pin in the real-tree case of scripts/kv_update_census_selftest.sh and name the site you added or removed in the commit message; if not, write an exhaustive match with no \`_\` arm."
+        ;;
+    table-sites)
+        echo "A table site is a match keyed by string literals or constants whose arms name the codec variants; a new codec compiles there and cannot be parsed. List them: ${list} '^table'. If the change is correct, set the pin in the real-tree case of scripts/kv_update_census_selftest.sh and name the site you added or removed in the commit message."
+        ;;
+    esac
+}
+real_out="$(run "${REPO_ROOT}" match-sites)"
+real_rc=$?
+for pin in ${REAL_PINS}; do
+    name="${pin%%=*}"
+    want="${pin#*=}"
+    if [ "${real_rc}" -ne 0 ]; then
+        echo "FAIL  real tree: the census exited ${real_rc}, so ${name} is unmeasured, pinned ${want}." >&2
+        echo "${real_out}" | tail -3 >&2
+        failures=$((failures + 1))
+        continue
+    fi
+    got="$(sed -n "s/^${name} \([0-9][0-9]*\)$/\1/p" <<<"${real_out}")"
+    if [ "${got}" != "${want}" ]; then
+        echo "FAIL  real tree: ${name} is ${got:-missing}, pinned ${want}. $(pin_advice "${name}")" >&2
+        failures=$((failures + 1))
+        continue
+    fi
+    echo "ok    real tree: ${name} ${got}  (pinned)"
+done
 
 if [ "${failures}" -gt 0 ]; then
     echo >&2

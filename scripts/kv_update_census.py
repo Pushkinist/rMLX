@@ -8,13 +8,21 @@ Four modes, each printing one figure the restructure is judged on:
 * `match-sites` — every `match` over a codec enum that enumerates the codec
   surface, per file, and the count. This is the "match sites a new codec must
   touch" figure. The codec enums are `KvStorage`, `KvQuant` and every enum a
-  `KvStorage` field holds. A variant is found through its enum's path, an
-  alias of it, `Self` inside an `impl` of it, or a glob import of it. Two more
-  figures count what a new codec does not break at compile time:
-  `subset-sites` (a `matches!` naming a codec variant, and a `match` under the
-  bar with a catch-all arm) and `table-sites` (a `match` keyed by string
-  literals or constants whose arm bodies name at least half of one codec
-  enum).
+  `KvStorage` field holds. The held set takes every capitalised type name in
+  the `KvStorage` body that names an enum in the tree, transitively, so a
+  future field that holds a non-codec enum makes that enum's matches count
+  too. A variant is found through its enum's path, a `use … as` or `type`
+  alias, `Self` inside an `impl` of the enum, a glob import, or a `use
+  E::{A, B}` import. Two more figures count what a new codec does not break
+  at compile time: `subset-sites` (a `matches!`, an `if let`, `while let` or
+  `let … else` pattern naming a codec variant, and a `match` under the bar
+  with a catch-all arm) and `table-sites` (a `match` keyed by string literals
+  or constants whose arm bodies name at least half of one codec enum).
+
+  Known false positives: a `use` inside one fn applies to the whole file, so
+  a glob import there makes a same-named variant elsewhere in the file count;
+  and an `impl Other` nested inside `impl KvStorage` reads its `Self` as
+  `KvStorage`.
 * `update-bodies` — every `update_`-prefixed fn of the update files, with the
   file it sits in and the lines its body holds.
 * `refs` — `KvStorage::` / `KvQuant::` variant references in one file.
@@ -47,6 +55,7 @@ from rust_scan import (  # noqa: E402
     block_end,
     enum_body,
     enum_variants,
+    let_patterns,
     match_sites,
     matches_macros,
 )
@@ -145,7 +154,7 @@ USE_STMT = re.compile(r"\buse\b[^;]*;")
 #: brought an enum holding it into scope.
 BARE_NAME = re.compile(r"(?<![\w:])([A-Z][A-Za-z0-9_]*)\b(?!\s*::)")
 SOME_ARM = re.compile(r"\bSome\s*\(")
-CATCH_ALL = re.compile(r"^(?:_|[a-z_][A-Za-z0-9_]*)$")
+BINDING = re.compile(r"^(?:ref\s+)?(?:mut\s+)?(?:_|[a-z_][A-Za-z0-9_]*)$")
 #: A table key: a string literal (blanked to spaces) or a `SCREAMING_CASE`
 #: constant, bare or behind a path.
 TABLE_KEY = re.compile(r'^(?:b?"[^"]*"|(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Z0-9_]*)$')
@@ -231,11 +240,13 @@ def impl_self_type(header: str) -> str:
 @dataclass
 class Scope:
     """How one file spells the codec enums: path prefixes (each enum's name
-    and its `use … as` aliases), glob-imported enums, and the spans of the
-    `impl` blocks where `Self` is one of them."""
+    and its `use … as` and `type` aliases), glob-imported enums, variants
+    imported by name (`use E::{A, B}`), and the spans of the `impl` blocks
+    where `Self` is one of them."""
 
     prefixes: dict[str, str]
     globs: list[str]
+    bare: dict[str, tuple[str, str]]
     impls: list[tuple[int, int, str]]
 
     def self_at(self, pos: int) -> str | None:
@@ -243,7 +254,7 @@ class Scope:
         return max(inner)[1] if inner else None
 
     def names_a_variant(self, blanked: str) -> bool:
-        return bool(self.globs or self.impls) or any(
+        return bool(self.globs or self.bare or self.impls) or any(
             re.search(rf"\b{re.escape(p)}\s*::", blanked) for p in self.prefixes
         )
 
@@ -251,12 +262,23 @@ class Scope:
 def file_scope(blanked: str, enums: dict[str, list[str]]) -> Scope:
     prefixes = {name: name for name in enums}
     globs: list[str] = []
+    bare: dict[str, tuple[str, str]] = {}
     for stmt in USE_STMT.finditer(blanked):
         for name in enums:
             for alias in re.findall(rf"\b{name}\s+as\s+([A-Za-z_]\w*)", stmt.group(0)):
                 prefixes[alias] = name
-            if re.search(rf"\b{name}\s*::\s*\*", stmt.group(0)) and name not in globs:
+            items = [i.strip() for g in re.findall(rf"\b{name}\s*::\s*\{{([^{{}}]*)\}}", stmt.group(0)) for i in g.split(",")]
+            if re.search(rf"\b{name}\s*::\s*\*", stmt.group(0)) or "*" in items:
                 globs.append(name)
+            for item in items:
+                m = re.fullmatch(r"(\w+)(?:\s+as\s+([A-Za-z_]\w*))?", item)
+                if m and m.group(1) == "self" and m.group(2):
+                    prefixes[m.group(2)] = name
+                elif m and m.group(1) in enums[name]:
+                    bare[m.group(2) or m.group(1)] = (name, m.group(1))
+    for name in enums:
+        for alias in re.findall(rf"\btype\s+([A-Za-z_]\w*)\s*=\s*(?:\w+\s*::\s*)*{name}\s*;", blanked):
+            prefixes[alias] = name
     impls: list[tuple[int, int, str]] = []
     for m in re.finditer(r"\bimpl\b", blanked):
         brace = blanked.find("{", m.end())
@@ -266,7 +288,7 @@ def file_scope(blanked: str, enums: dict[str, list[str]]) -> Scope:
         name = prefixes.get(impl_self_type(blanked[m.end() : brace]))
         if name:
             impls.append((brace, block_end(blanked, brace), name))
-    return Scope(prefixes, globs, impls)
+    return Scope(prefixes, list(dict.fromkeys(globs)), bare, impls)
 
 
 def named(text: str, pos: int, scope: Scope, enums: dict[str, list[str]]) -> dict[str, set[str]]:
@@ -288,6 +310,9 @@ def named(text: str, pos: int, scope: Scope, enums: dict[str, list[str]]) -> dic
     for v in BARE_NAME.findall(text):
         if option and v == "None":
             continue
+        if v in scope.bare:
+            name, variant = scope.bare[v]
+            out[name].add(variant)
         for name in scope.globs:
             if v in enums[name]:
                 out[name].add(v)
@@ -309,8 +334,36 @@ def most_named(counts: dict[str, set[str]]) -> tuple[str, int]:
     return name, len(counts[name])
 
 
+def split_top(text: str, sep: str) -> list[str]:
+    """`text` split at every `sep` outside brackets."""
+    parts: list[str] = []
+    depth = start = 0
+    for i, c in enumerate(text):
+        if c in "{([":
+            depth += 1
+        elif c in "})]":
+            depth -= 1
+        elif c == sep and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    return parts + [text[start:]]
+
+
+def unguarded(pattern: str) -> str:
+    return re.split(r"\sif\s", pattern, maxsplit=1)[0]
+
+
 def alternatives(pattern: str) -> list[str]:
-    return [alt.strip().rstrip("@").strip() for alt in pattern.split(" if ", 1)[0].split("|")]
+    return [alt.strip().rstrip("@").strip() for alt in split_top(unguarded(pattern), "|")]
+
+
+def is_catch_all(alt: str) -> bool:
+    """`_`, a binding (`x`, `ref x`, `mut x`), or a tuple of catch-alls."""
+    alt = alt.strip()
+    if alt.startswith("(") and alt.endswith(")"):
+        parts = [p.strip() for p in split_top(alt[1:-1], ",") if p.strip()]
+        return all(p == ".." or is_catch_all(p) for p in parts)
+    return alt not in ("true", "false") and BINDING.match(alt) is not None
 
 
 def is_table(arms: list[MatchArm]) -> bool:
@@ -318,7 +371,7 @@ def is_table(arms: list[MatchArm]) -> bool:
     keyed = False
     for arm in arms:
         for alt in alternatives(arm.pattern):
-            if CATCH_ALL.match(alt):
+            if is_catch_all(alt):
                 continue
             if not TABLE_KEY.match(alt):
                 return False
@@ -348,12 +401,13 @@ def mode_match_sites(root: Path, threshold: int | None, include_tests: bool) -> 
         try:
             sites = match_sites(blanked)
             macros = matches_macros(blanked)
+            lets = let_patterns(blanked)
         except ScanError as exc:
             fail(f"{rel}: {exc}")
             raise
         for site in sites:
-            counts = named(" | ".join(arm.pattern for arm in site.arms), site.start, scope, enums)
-            catch_all = any(CATCH_ALL.match(alt) for arm in site.arms for alt in alternatives(arm.pattern))
+            counts = named(" | ".join(unguarded(arm.pattern) for arm in site.arms), site.start, scope, enums)
+            catch_all = any(is_catch_all(alt) for arm in site.arms for alt in alternatives(arm.pattern))
             hit = widest(counts, bars)
             if hit:
                 total += 1
@@ -375,11 +429,12 @@ def mode_match_sites(root: Path, threshold: int | None, include_tests: bool) -> 
             if hit:
                 tables += 1
                 print(f"table {rel}:{site.line} enum={hit[0]} variants={hit[1]} arms={len(site.arms)}")
-        for macro in macros:
-            name, n = most_named(named(macro.arms[0].pattern, macro.start, scope, enums))
-            if n:
-                subsets += 1
-                print(f"subset {rel}:{macro.line} kind=matches enum={name} variants={n}")
+        for kind, found in (("matches", macros), ("iflet", lets)):
+            for one in found:
+                name, n = most_named(named(unguarded(one.arms[0].pattern), one.start, scope, enums))
+                if n:
+                    subsets += 1
+                    print(f"subset {rel}:{one.line} kind={kind} enum={name} variants={n}")
     if not candidates:
         fail(f"no source file under {CRATES_DIR} names a KvStorage or KvQuant variant")
     for rel in sorted(per_file):
