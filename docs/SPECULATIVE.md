@@ -658,8 +658,7 @@ rmlx serve --model /path/to/Qwen3.6-35B-A3B-8bit \
 - `docs/SPEC_ROUND_SKELETON.md` — the `RoundDrafter` interface and what the
   shared loop requires of a drafter.
 - `docs/SPEC_ANSWER_EQUIVALENCE.md` — the equivalence oracle and its coverage.
-- `docs/KV_CACHE.md` — `KvCache`, `truncate_to`, the sliding-window ring and
-  `LinearAttnCache`.
+- `docs/KV_CACHE.md` — `KvCache`, `truncate_to` and the sliding-window ring.
 - `docs/MODELS.md` — the verifier-side seams (`forward_verify_capture`,
   `forward_hidden_states_multi`, `embed_tokens_raw`,
   `hot_logits_from_final_hidden`).

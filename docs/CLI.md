@@ -127,7 +127,7 @@ starts with an empty registry. The KV codec flags above apply too.
 | `--paged-kv-page-tokens` | i32 | `32` | Tokens per page; must be positive. Requires `--paged-kv`. |
 | `--draft-model` | path | — | Drafter snapshot for speculative decoding: a sidecar head or a smaller model of the verifier's family. Must differ from `--model`. See [`SPECULATIVE.md`](SPECULATIVE.md) § "Which drafter a snapshot is". |
 | `--draft-kind` | `mtp \| dflash \| dflash2 \| eagle3 \| two_model` | from the snapshot | Drafter kind for a snapshot whose `config.json` names none. Refused when it contradicts the snapshot. Requires `--draft-model`. Env: `MLX_VLM_DRAFT_KIND`. |
-| `--draft-block-size` | usize | `5`, capped by the drafter's declared depth | Tokens the verifier scores per round, its own included. Refused below 2 or above 1024. A DFlash checkpoint's `block_size` also caps it. Env: `MLX_VLM_DRAFT_BLOCK_SIZE`. |
+| `--draft-block-size` | usize | `5`, capped by the drafter's declared depth | Tokens the verifier scores per round, its own included. Refused below 2 or above 1024. A DFlash 1, DFlash 2 or EAGLE-3 checkpoint's `block_size` also caps it. Env: `MLX_VLM_DRAFT_BLOCK_SIZE`. |
 | `--max-tokens-cap` | u32 | `1048576` | Per-request `max_tokens` ceiling; a request above it gets HTTP 400. |
 | `--max-timeout-secs` | u64 | `600` | Per-request wall-clock cap in seconds. `X-Request-Timeout-Seconds` can lower it. `0` disables it. |
 | `--max-loaded-models` | usize | `1` | Models held resident; the least recently used one is evicted past the cap. |
