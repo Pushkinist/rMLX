@@ -2059,7 +2059,7 @@ async fn stale_ttl_fire_after_warm_reset_does_not_unload() {
     // spawned timer task cannot distinguish T1 from T2.
     assert_ne!(
         lease_before_reset, lease_after_reset,
-        "warm-reset must swap the slot's decode_lease Arc "
+        "warm-reset must swap the slot's decode_lease Arc"
     );
 
     // Part 2: even if T1 somehow won an abort race and ran to completion

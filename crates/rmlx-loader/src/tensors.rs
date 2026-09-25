@@ -59,8 +59,9 @@ pub struct ParoQuantParams {
 
 /// Model-level ParoQuant state: per-layer params keyed by base tensor name.
 ///
-/// Accessible from the loader API so that graph integration
-/// can wire rotation params into the forward pass without re-parsing.
+/// Its only consumer is `rmlx info` (`resolve_paro` in
+/// `crates/rmlx-cli/src/commands/info.rs`). The forward pass builds its PARO
+/// params through `rmlx_models::load_util`, not from this state.
 #[allow(
     clippy::exhaustive_structs,
     reason = "internal closed loader struct — fields are the complete model-level PARO state contract; adding a field requires updating resolve_paro and all PARO consumers"

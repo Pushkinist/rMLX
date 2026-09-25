@@ -382,13 +382,12 @@ fn prompt_cache_fifo_eviction() {
 /// Regression: an identical-prompt repeat
 /// must be detected as a true EXACT hit, NOT misrouted into the partial path.
 ///
-/// An earlier version shipped with the callsite Exact test written as
-/// `block_count * BLOCK_TOKENS == prompt_ids.len()`. That is essentially never
-/// true (only when len % 256 == 0), so an identical re-request of a
-/// non-block-aligned prompt fell into the block-truncate + tail-reprefill
-/// Prefix path. For qwen3_5_moe that path leaves the recurrent GDN
-/// `lin_caches` untouched while truncating KV, corrupting state → the model
-/// emitted EOS after 9 tokens instead of the correct 258 (cold value).
+/// A callsite Exact test written as `block_count * BLOCK_TOKENS ==
+/// prompt_ids.len()` is essentially never true (only when len % 256 == 0), so
+/// an identical re-request of a non-block-aligned prompt would fall into the
+/// block-truncate + tail-reprefill Prefix path. For qwen3_5_moe that path
+/// leaves the recurrent GDN `lin_caches` untouched while truncating KV, which
+/// corrupts state.
 ///
 /// The fixed callsite predicate is `entry.prompt_token_ids() == prompt_ids`
 /// (full token equality). This test asserts that predicate behaves correctly

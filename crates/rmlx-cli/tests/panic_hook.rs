@@ -57,7 +57,7 @@ fn panic_hook_writes_sidecar_and_logs() {
 
     // Trigger a panic on a background thread (unwinds without killing the process).
     let result = std::panic::catch_unwind(|| {
-        panic!("deliberate test panic — deliberate");
+        panic!("deliberate test panic");
     });
 
     // The panic must have unwound (not abort).

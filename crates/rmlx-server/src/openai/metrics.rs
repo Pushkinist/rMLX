@@ -708,7 +708,7 @@ pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
     if tier_active {
         out.push_str("# HELP rmlx_ssd_spill_us Per-spill duration in microseconds.\n");
         out.push_str("# TYPE rmlx_ssd_spill_us histogram\n");
-        // use `ssd.spill.count` (not `count + count_inf_overflow`) for
+        // Use `ssd.spill.count` (not `count + count_inf_overflow`) for
         // both the +Inf bucket and _count. Every call to `observe` increments
         // `count` exactly once, including observations beyond the last finite
         // bucket. `count_inf_overflow` is a diagnostic-only field and must NOT
@@ -733,7 +733,7 @@ pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
     if ssd.hydrate.count > 0 {
         out.push_str("# HELP rmlx_ssd_hydrate_us Per-hydrate duration in microseconds.\n");
         out.push_str("# TYPE rmlx_ssd_hydrate_us histogram\n");
-        // same rationale as spill — use `count` directly, not `count +
+        // Same rationale as spill — use `count` directly, not `count +
         // count_inf_overflow`.
         let total_count = ssd.hydrate.count;
         for (i, &le) in HIST_BUCKETS_US.iter().enumerate() {

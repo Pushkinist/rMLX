@@ -245,8 +245,8 @@ fn quantized_matmul_packed(
 ) -> Result<Array> {
     install_error_handler();
 
-    // biases is optional — use the cached null sentinel when absent.
-    // Previously: mlx_array_new() + mlx_array_free() per call.
+    // biases is optional — use the cached null sentinel when absent, not an
+    // mlx_array_new() + mlx_array_free() per call.
     let biases_arr = match biases {
         Some(b) => b.inner,
         None => null_sentinel(),

@@ -2189,7 +2189,7 @@ pub fn generate_greedy<'a>(
             // the clone, which shares the same buffers — so materializing here makes that eval a no-op.
             match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
                 Ok(()) => {
-                    // salt chained walk with the active layout_key + KV codec
+                    // Salt the chained walk with the active layout_key + KV codec.
                     // When tier is OFF and the codec is constant,
                     // this is the legacy stream for that codec.
                     let lk = qwen3_active_layout_key();

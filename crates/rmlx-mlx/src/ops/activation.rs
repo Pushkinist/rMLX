@@ -85,9 +85,9 @@ pub fn gelu_tanh(x: &Array, device: Device) -> Result<Array> {
     // Constants: sqrt(2/pi) ≈ 0.7978845608028654, 3/sqrt(2*pi) * 0.044715 ≈ 0.0356774
     // kCoeff = 0.044715, kAlpha = sqrt(2/pi)
     //
-    // Constants are cached as process-global OnceLock<Array>.
-    // Each scalar_f32 call was mlx_array_new_float + mlx_array_free per invocation;
-    // caching removes 4 alloc/free pairs per FFN layer per decode step.
+    // Constants are cached as process-global OnceLock<Array>, so no
+    // mlx_array_new_float + mlx_array_free pair runs per FFN layer per decode
+    // step.
 
     // Step 1: x^2
     let x2 = multiply(x, x, device)?;

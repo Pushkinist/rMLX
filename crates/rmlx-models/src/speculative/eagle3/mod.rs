@@ -346,10 +346,10 @@ impl Eagle3Drafter {
     /// (with `input_norm == None`, the default for this checkpoint). `concat_hidden`
     /// is `[1, n, 3*H]`; returns `[1, n, H]`.
     ///
-    /// When `fcs` is present (speculators checkpoint + `RMLX_EAGLE3_FCS=1`), each
-    /// aux slice is RMSNorm'd by `fcs.{0,1,2}` before re-concatenation — an
-    /// in-progress numeric-alignment hypothesis for the Dogacel accept gap (see
-    /// module docs). Default OFF (raw concat) matches the mlx-vlm reference.
+    /// When `fcs` is present (found by tensor presence in a speculators
+    /// checkpoint, unless `RMLX_EAGLE3_NO_FCS` is set), each aux slice is
+    /// RMSNorm'd by `fcs.{0,1,2}` before re-concatenation (see module docs).
+    /// Without `fcs` the raw concat matches the mlx-vlm reference.
     #[allow(
         clippy::indexing_slicing,
         reason = "bounds established by construction: buffer sized at init, loop indices bounded by slice length, or layer index validated before call"

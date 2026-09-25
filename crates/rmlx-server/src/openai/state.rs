@@ -769,7 +769,7 @@ impl AppState {
     /// Returns `usize::MAX` when the model is not resident (cold-start race)
     /// or when the generator does not participate in KV-cache sizing — the
     /// existing 503 path then catches real runtime overflows. Used by the
-    /// The `context_length_exceeded` guard in the chat routes.
+    /// `context_length_exceeded` guard in the chat routes.
     pub fn effective_max_ctx_for(&self, model_id: &str) -> usize {
         self.slots
             .read()

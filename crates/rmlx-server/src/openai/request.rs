@@ -13,8 +13,9 @@ use crate::chat_template::ChatMessageTpl;
 
 /// `content` field for a chat message.
 ///
-/// OpenAI allows a plain string or an array of content parts. Both are
-/// accepted; only the string representation is stored.
+/// OpenAI allows a plain string or an array of content parts. Both are kept:
+/// `Text` as the string, `Parts` as the raw array. `as_text` joins the text
+/// parts; the image and audio extractors read the other parts.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(untagged)]
 #[allow(
