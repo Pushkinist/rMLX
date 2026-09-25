@@ -300,7 +300,7 @@ baseline: model=<name>  load=<ms>  ttft_ms=<ms>  decode_tps=<n>  overall_tps=<n>
   start. Only `metal_gen_alloc_mb` compares between two runs. Both read `0`
   with no Metal allocator.
 - `kv_cache_bytes` is the filled prefix of the KV cache
-  (`KvCache::resident_bytes`, [`METRICS_DB.md`](METRICS_DB.md) §4), not an
+  (`KvCache::resident_bytes`, [`METRICS_SCHEMA.md`](METRICS_SCHEMA.md) §4), not an
   allocator peak. When the reported count is zero it reads `n/a`, and the
   record omits the column; the timing row stands.
   `scripts/perf_ab.sh` parses it.
@@ -472,8 +472,9 @@ Exit `0` all green, `1` any red, `2` internal error.
 ### `metrics`
 
 Every `metrics` subcommand takes `--db <path>`. Without it the DB is
-`RMLX_METRICS_DB`, else `<RMLX_HOME>/metrics/runs.db`. The schema, the record
-shape and the rules are in [`METRICS_DB.md`](METRICS_DB.md).
+`RMLX_METRICS_DB`, else `<RMLX_HOME>/metrics/runs.db`. The schema is in
+[`METRICS_SCHEMA.md`](METRICS_SCHEMA.md); the record shape and the rules are in
+[`METRICS_DB.md`](METRICS_DB.md).
 
 `query`, `best`, `rank`, `compare`, `history`, `timeseries`, `regress`,
 `deltas`, `describe`, `export` and `prompts list|get` never migrate. They
@@ -483,7 +484,7 @@ refuse a missing DB, and a DB whose `bests` view is stale, naming
 | Subcommand | Flags | Description |
 |---|---|---|
 | `init` | — | Creates the schema. Refuses an existing file. |
-| `doctor` | `--fix` | Checks schema version, integrity, foreign keys, whitelists, units, directions and the [`METRICS_DB.md`](METRICS_DB.md) §4.1 bounds. `--fix` rebuilds a stale `bests` view; it never edits a value. |
+| `doctor` | `--fix` | Checks schema version, integrity, foreign keys, whitelists, units, directions and the [`METRICS_SCHEMA.md`](METRICS_SCHEMA.md) §4.1 bounds. `--fix` rebuilds a stale `bests` view; it never edits a value. |
 | `backup` | `--out <path>`, `--keep <N>` | WAL-checkpointed copy; `--keep` prunes older backups. |
 | `restore` | `--from <path>` (required) | Replaces the DB from a backup after snapshotting the current one. |
 | `record` | `--inline <json>` \| `--file <path>` \| `--stdin` \| `--replay-pending`; `--dry-run` | Ingests one `METRICS_DB.md` §8.5 record. `--replay-pending` ingests every file in `metrics/buffer/pending/` and moves failures to `failed/`. `--dry-run` writes nothing. |
@@ -656,8 +657,9 @@ Other rules:
 
 ## See also
 
-- [`METRICS_DB.md`](METRICS_DB.md): schema, record shape, `metrics`
-  subcommands, operating rules.
+- [`METRICS_SCHEMA.md`](METRICS_SCHEMA.md): tables, metric registry, bounds.
+- [`METRICS_DB.md`](METRICS_DB.md): record shape, `metrics` subcommands,
+  operating rules.
 - [`PROJECTS_CONFIG.md`](PROJECTS_CONFIG.md): per-project SSD caps in
   `projects.toml`.
 - [`PROFILING.md`](PROFILING.md): samply, Instruments, dhat and GPU capture.

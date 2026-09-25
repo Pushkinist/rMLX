@@ -21,8 +21,8 @@ use crate::{bests_view, error::Result, schema::MIGRATIONS, time_util::now_iso860
 /// and nothing repopulates the cell. After migration 001 the `schema_meta` seed
 /// rows are inserted (idempotent via `INSERT OR IGNORE`).
 ///
-/// Finally, [`bests_view::ensure`] brings the `bests` view in line with the §4
-/// registry — see that module for why the view is generated rather than
+/// Finally, [`bests_view::ensure`] brings the `bests` view in line with the
+/// `docs/METRICS_SCHEMA.md` §4 registry — see that module for why the view is generated rather than
 /// pinned to a migration.
 ///
 /// Returns the number of migrations applied (0 when already up to date).
@@ -61,8 +61,8 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
         applied += 1;
     }
 
-    // The `bests` view is generated from the §4 registry, not pinned to a
-    // migration number: a bounds change has to reach existing DBs too, and a
+    // The `bests` view is generated from the `docs/METRICS_SCHEMA.md` §4
+    // registry, not pinned to a migration number: a bounds change has to reach existing DBs too, and a
     // view carries no data to migrate. Cheap no-op when already current.
     bests_view::ensure(conn)?;
 
@@ -80,7 +80,7 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
 ///
 /// This writes no measurement: it classifies a row from that row's own fields
 /// into a column that was NULL for want of existing. `notes` that say nothing
-/// either way stay NULL and are named in docs/METRICS_DB.md.
+/// either way stay NULL and are named in docs/METRICS_SCHEMA.md.
 ///
 /// The rule itself is [`crate::cell::decode_config_from_notes`] — one parser,
 /// not a second spelling in SQL.
@@ -121,7 +121,7 @@ fn backfill_decode_config(conn: &Connection) -> Result<usize> {
 
 /// Replace a `decode_config` that spells the engine's own defaults with NULL.
 ///
-/// §3.2 makes `NULL` the engine at its defaults, so a row spelling them out is
+/// `docs/METRICS_SCHEMA.md` §3.2 makes `NULL` the engine at its defaults, so a row spelling them out is
 /// a second spelling of one configuration — and two spellings are two cells
 /// that never rank against each other. `RunRecord::validate` refuses such a
 /// record now; this brings the rows written before it did into the same cell

@@ -188,7 +188,7 @@ until the first request), and the SSD attach parameters (namespace,
 The resident-KV byte counter is **not** here. It is per model instance
 (`kv_bytes::KvBytesCounter`, a field on each arch's model struct). Two models
 of one arch share this shell and would mix their byte totals in the `events`
-table. See the `kv_cache_bytes` row of `docs/METRICS_DB.md` §4.
+table. See the `kv_cache_bytes` row of `docs/METRICS_SCHEMA.md` §4.
 
 `ArchPromptCache::ensure(capacity)` runs once per generation. It is a no-op
 when the cache already has that capacity, `0` included. Otherwise it rebuilds

@@ -106,7 +106,7 @@ impl LegacyRunRecord {
         // "no KV quantization". The §5.3 canonical value is "none".
         let kv_quant = map_kv_quant(&self.kv_quant);
 
-        // Map short metric names to §4 canonical names.
+        // Map short metric names to `docs/METRICS_SCHEMA.md` §4 canonical names.
         let metrics: Vec<MetricEntry> = self
             .observations
             .into_iter()
@@ -190,7 +190,7 @@ impl LegacyRunRecord {
     }
 }
 
-/// Map legacy short metric names to §4 canonical names.
+/// Map legacy short metric names to `docs/METRICS_SCHEMA.md` §4 canonical names.
 fn map_metric_name(name: &str) -> String {
     match name {
         "decode_tps" => "decode_tps_warm",

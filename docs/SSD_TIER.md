@@ -441,5 +441,6 @@ A change to an existing codec's stored bytes or tag also bumps
 - `docs/PROMPT_CACHE.md` — the RAM prompt cache and its consume engine.
 - `docs/KV_CACHE.md`, `docs/KV_CODECS.md` — the stores a block carries.
 - `docs/PROJECTS_CONFIG.md` — `projects.toml`.
-- `docs/METRICS_DB.md` — where `SsdSpillEvent` and `SsdHydrateEvent` land.
+- `docs/METRICS_SCHEMA.md` §3.6 — the `events` table where `SsdSpillEvent` and
+  `SsdHydrateEvent` land.
 - `docs/SSD_CANARY.md` — the cross-restart probe.

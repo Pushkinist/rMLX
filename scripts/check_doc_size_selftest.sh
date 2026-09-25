@@ -24,14 +24,12 @@ bytes() {
     python3 -c 'import sys; open(sys.argv[1], "w").write("x" * (int(sys.argv[2]) - 1) + "\n")' "$1" "$2"
 }
 
-# fresh <name>: a git work tree whose docs/ holds one small doc and, as the
-# real tree does, the one temporary exception over the cap.
+# fresh <name>: a git work tree whose docs/ holds one small doc.
 fresh() {
     local root="$WORK/$1"
     mkdir -p "$root/docs"
     git -C "$root" init -q || exit 1
     printf '# Small\n\nShort doc.\n' >"$root/docs/SMALL.md"
-    bytes "$root/docs/METRICS_DB.md" 66000
     printf '%s' "$root"
 }
 
@@ -55,12 +53,12 @@ case_run() {
 
 root=$(fresh clean)
 case_run clean_tree "every doc within the cap passes" \
-    0 "check-doc-size: ok (2 docs measured" "$root"
+    0 "check-doc-size: ok (1 docs measured" "$root"
 
 root=$(fresh boundary_at_cap)
 bytes "$root/docs/AT_CAP.md" 40960
 case_run boundary_at_cap_passes "a doc of exactly 40,960 B is at the cap, not over it" \
-    0 "check-doc-size: ok (3 docs measured" "$root"
+    0 "check-doc-size: ok (2 docs measured" "$root"
 
 root=$(fresh boundary_over_cap)
 bytes "$root/docs/OVER_CAP.md" 40961
@@ -91,7 +89,7 @@ mkdir -p "$root/docs/private"
 printf 'docs/private/\n' >"$root/.gitignore"
 bytes "$root/docs/private/HIDDEN.md" 50000
 case_run ignored_doc_skipped "a git-ignored doc over the cap is not measured" \
-    0 "check-doc-size: ok (2 docs measured" "$root"
+    0 "check-doc-size: ok (1 docs measured" "$root"
 
 root=$(fresh marker_under_cap)
 printf '<!-- size-exempt: it is long on purpose -->\n# Marked\n' >"$root/docs/MARKED.md"
@@ -130,30 +128,6 @@ mkdir -p "$root/scripts"
 printf '# size-exempt: planted by a selftest\n' >"$root/scripts/x_selftest.sh"
 case_run marker_in_script_not_scanned "the marker in a selftest script is outside the scanned docs" \
     0 "check-doc-size: ok" "$root"
-
-root=$(fresh exception_over)
-case_run exception_over_cap_passes "the one temporary exception over the cap passes and is printed" \
-    0 "check-doc-size: docs/METRICS_DB.md 64.5 KiB, temporary exception:" "$root"
-
-root=$(fresh exception_at_ceiling)
-bytes "$root/docs/METRICS_DB.md" 66397
-case_run exception_at_ceiling_passes "the exception at its recorded size passes" \
-    0 "temporary exception:" "$root"
-
-root=$(fresh exception_grown)
-bytes "$root/docs/METRICS_DB.md" 66398
-case_run exception_grown_fails "the exception one byte past its recorded size fails" \
-    1 "FAIL docs/METRICS_DB.md  66398 B grew past its temporary exception's 66397 B" "$root"
-
-root=$(fresh exception_within)
-bytes "$root/docs/METRICS_DB.md" 40960
-case_run exception_within_cap_is_stale "an exception whose doc is within the cap fails until removed" \
-    1 "FAIL docs/METRICS_DB.md  stale temporary exception (40960 B is within the cap)" "$root"
-
-root=$(fresh exception_gone)
-rm -f "$root/docs/METRICS_DB.md"
-case_run exception_gone_is_stale "an exception whose doc is gone fails until removed" \
-    1 "FAIL docs/METRICS_DB.md  stale temporary exception (the doc is gone)" "$root"
 
 root="$WORK/no_docs"
 mkdir -p "$root"

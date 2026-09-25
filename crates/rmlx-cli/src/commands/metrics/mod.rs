@@ -26,7 +26,8 @@
 //!
 //! # See also
 //!
-//! - `docs/METRICS_DB.md` — schema, §8.2 API contract, §8.5 ingest shape.
+//! - `docs/METRICS_SCHEMA.md` — schema.
+//! - `docs/METRICS_DB.md` — §8.2 API contract, §8.5 ingest shape.
 
 #![allow(
     clippy::assigning_clones,

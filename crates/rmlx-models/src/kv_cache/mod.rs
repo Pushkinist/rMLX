@@ -530,7 +530,7 @@ impl KvBoundary {
         Ok(Self { head_n, tail_n })
     }
 
-    /// The `docs/METRICS_DB.md` §3.2 `decode_config` terms for this boundary,
+    /// The `docs/METRICS_SCHEMA.md` §3.2 `decode_config` terms for this boundary,
     /// or `None` when it is the shipped default.
     ///
     /// `None` is what keeps a default run's cell identical to every row

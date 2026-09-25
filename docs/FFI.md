@@ -138,7 +138,7 @@ resolved: `MLX_PREFIX` or `DYLD_LIBRARY_PATH` can bypass the symlinks.
 the same runtime scan, once per process. `rmlx-cli`'s `main` forwards it to
 `rmlx_metrics::identity::set_mlx_nax`, so every `events` row records whether
 that run had the kernels. `unknown` means the metallib could not be
-inspected. See `docs/METRICS_DB.md` §3.6.
+inspected. See `docs/METRICS_SCHEMA.md` §3.6.
 
 mlx's version comes from `include/mlx/version.h`. mlx-c ships no version
 header; its identity is the keg directory name, the only place the revision

@@ -225,7 +225,7 @@ const MLX_BUILD_VERSION: &str = env!("RMLX_MLX_BUILD_VERSION");
 /// install, which `rmlx-metrics` must not need), so `rmlx-cli::main()` — the
 /// one binary that links both — calls this and forwards it to
 /// `rmlx_metrics::identity::set_mlx_nax` once at startup, before any metrics
-/// recording. See `docs/METRICS_DB.md`.
+/// recording. See `docs/METRICS_SCHEMA.md` §3.6.
 #[must_use]
 pub fn nax_capability() -> &'static str {
     nax::loaded_nax_capability()

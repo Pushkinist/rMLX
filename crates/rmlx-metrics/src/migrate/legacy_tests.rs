@@ -213,7 +213,7 @@ fn migrate_one_csv_row_inserts_multiple_metrics() {
     // "not measured" placeholders and neither may become an observation:
     // `task_pass_at_1=0.0` (dropped at the parse site — the value alone is a
     // valid score, only the column convention says otherwise) and
-    // `peak_rss_mb=0.0` (dropped by the §4.1 bounds — a live process has RSS).
+    // `peak_rss_mb=0.0` (dropped by the `docs/METRICS_SCHEMA.md` §4.1 bounds — a live process has RSS).
     // Exact counts, not `>=`: a `>=` here passes whether 0 or 3 entries were
     // dropped, which is the whole thing under test.
     let names: Vec<String> = {
@@ -242,8 +242,8 @@ fn migrate_one_csv_row_inserts_multiple_metrics() {
     );
 }
 
-/// CBB writes `0.0` in `task_pass_at_1` when it ran no quality probe. The §4.1
-/// bounds cannot catch it — `0.0` pass@1 is a legitimate score for a model that
+/// CBB writes `0.0` in `task_pass_at_1` when it ran no quality probe. The
+/// `docs/METRICS_SCHEMA.md` §4.1 bounds cannot catch it — `0.0` pass@1 is a legitimate score for a model that
 /// failed every task — so the parse site must, or the placeholder wins every
 /// all-zero partition in `bests` exactly like the rate zeros do.
 #[test]

@@ -1,4 +1,4 @@
-//! Metric registry per `docs/METRICS_DB.md` §4.
+//! Metric registry per `docs/METRICS_SCHEMA.md` §4.
 //!
 //! Maps metric names to `(unit, direction, bounds)` triples. The registry is
 //! the authoritative source for what constitutes a valid metric name, how to
@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
     clippy::exhaustive_enums,
     reason = "closed enum — exactly two metric directions from the METRICS_DB spec; adding a direction requires updating the registry and all comparison logic"
 )]
-/// Metric optimization direction per docs/METRICS_DB.md §4.
+/// Metric optimization direction per docs/METRICS_SCHEMA.md §4.
 pub enum Direction {
     /// A larger value is better (e.g. tokens per second).
     HigherBetter,
@@ -178,7 +178,7 @@ pub const SPEC_METRICS: &[(&str, SpecRole)] = &[
 ];
 
 /// Canonical metric name → (unit, direction, plausible bounds).
-/// Add new metrics here AND in §4.
+/// Add new metrics here AND in `docs/METRICS_SCHEMA.md` §4.
 pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
     (
         "decode_tps_warm",
@@ -639,9 +639,9 @@ pub fn bounds(name: &str) -> Result<Bounds> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(
     clippy::exhaustive_enums,
-    reason = "closed enum — four coverage states from spec §4; adding a state requires updating the coverage matrix and doctor logic"
+    reason = "closed enum — four coverage states from docs/METRICS_SCHEMA.md §4; adding a state requires updating the coverage matrix and doctor logic"
 )]
-/// Backend coverage state for a given metric (see docs/METRICS_DB.md §4).
+/// Backend coverage state for a given metric (see docs/METRICS_SCHEMA.md §4).
 pub enum Coverage {
     /// Backend measures and records this metric.
     Yes,
@@ -690,7 +690,8 @@ pub const BACKENDS_WITHOUT_COVERAGE: &[&str] = &[
     "vllm",
 ];
 
-/// (backend, metric, coverage). Listed in spec §4 backend coverage matrix.
+/// (backend, metric, coverage). Listed in the `docs/METRICS_SCHEMA.md` §4
+/// backend coverage matrix.
 /// Used by `rmlx metrics doctor` to flag suspicious gaps.
 ///
 /// Every backend in [`crate::identity::BACKEND_WHITELIST`] must appear here for

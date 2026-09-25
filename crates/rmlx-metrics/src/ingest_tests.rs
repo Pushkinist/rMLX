@@ -490,7 +490,7 @@ fn record_with_model_id_alias_ingests() {
     r.validate().unwrap();
 }
 
-// ── §4 value plausibility ─────────────────────────────────────────────────
+// ── docs/METRICS_SCHEMA.md §4 value plausibility ──────────────────────────
 
 #[test]
 fn zero_rate_rejected() {

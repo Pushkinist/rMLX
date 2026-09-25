@@ -454,7 +454,7 @@ debt-report: ## advisory: sibling similarity, debt counters, add/remove ratio, o
 debt-report-selftest: ## CI gate: recall test for debt-report over synthetic fixtures — a planted twin, a non-twin, the round-loop group, and a two-commit ratio repo
 	@bash scripts/debt_report_selftest.sh
 
-check-doc-size: ## CI gate: fail naming every docs/**/*.md over 40 KiB, a stale temporary exception or a size-exempt marker (exit 2: cannot measure)
+check-doc-size: ## CI gate: fail naming every docs/**/*.md over 40 KiB or carrying a size-exempt marker (exit 2: cannot measure)
 	@python3 scripts/lib/debt_report.py --check-doc-size
 
 check-doc-size-selftest: ## CI gate: recall test for check-doc-size over throwaway git trees, each case asserting its exit code and reason

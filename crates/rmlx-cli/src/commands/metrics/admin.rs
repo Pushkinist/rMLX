@@ -97,8 +97,8 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
 
     // ── Check 3b: bests view matches the registry ─────────────────────────────
     //
-    // The view is generated from the §4 registry, not pinned to a migration
-    // number, so a DB already at the latest schema version can still carry a
+    // The view is generated from the `docs/METRICS_SCHEMA.md` §4 registry, not
+    // pinned to a migration number, so a DB already at the latest schema version can still carry a
     // definition built from an older registry — including one with no
     // plausibility filter at all. Checking `user_version` cannot see that.
     //
@@ -108,18 +108,22 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
     {
         if fix {
             if bests_view::ensure(&conn).context("rebuild bests view")? {
-                println!("[fix] bests view: rebuilt from the §4 metric registry");
+                println!(
+                    "[fix] bests view: rebuilt from the docs/METRICS_SCHEMA.md §4 metric registry"
+                );
             } else {
-                println!("[ok] bests view: definition matches the §4 metric registry");
+                println!("[ok] bests view: definition matches the docs/METRICS_SCHEMA.md §4 metric registry");
             }
         } else if bests_view::is_stale(&conn).context("check bests view")? {
             eprintln!(
                 "[WARN] bests view: built from a different metric registry than this binary's — \
-                 champion reads do not match §4.1 until `rmlx metrics doctor --fix` rebuilds it"
+                 champion reads do not match docs/METRICS_SCHEMA.md §4.1 until `rmlx metrics doctor --fix` rebuilds it"
             );
             warnings += 1;
         } else {
-            println!("[ok] bests view: definition matches the §4 metric registry");
+            println!(
+                "[ok] bests view: definition matches the docs/METRICS_SCHEMA.md §4 metric registry"
+            );
         }
     }
 

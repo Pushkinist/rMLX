@@ -858,8 +858,8 @@ def prefill_anchor(db: Path, model_basename: str) -> dict | None:
     measurements, and the view carries one champion row per cell, which would
     make the roofline anchor on a best-ever value instead of a typical one.
     That means this query has to carry the plausibility bound itself, so it is
-    kept identical to METRICS_DB.md §4.1 for `prefill_tps` -- `Bounds::positive(1e5)`,
-    i.e. `value > 0 AND value <= 1e5`. Do not "tighten" it here; change §4.1 and
+    kept identical to METRICS_SCHEMA.md §4.1 for `prefill_tps` -- `Bounds::positive(1e5)`,
+    i.e. `value > 0 AND value <= 1e5`. Do not "tighten" it here; change METRICS_SCHEMA.md §4.1 and
     the registry, then mirror it.
 
     Also filters backend=rmlx and ts_utc >= PREFILL_ANCHOR_MIN_TS. Picks the
@@ -875,7 +875,7 @@ def prefill_anchor(db: Path, model_basename: str) -> dict | None:
         rows = con.execute(
             "SELECT prompt_tokens, value, hardware_tag FROM observations "
             "WHERE metric='prefill_tps' AND backend='rmlx' AND model=? "
-            "AND value>0 AND value<=1e5 AND ts_utc>=?",  # §4.1 Bounds::positive(1e5)
+            "AND value>0 AND value<=1e5 AND ts_utc>=?",  # METRICS_SCHEMA.md §4.1 Bounds::positive(1e5)
             (model_basename, PREFILL_ANCHOR_MIN_TS),
         ).fetchall()
     except sqlite3.Error:

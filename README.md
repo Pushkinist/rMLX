@@ -225,7 +225,8 @@ See [`docs/CLI.md`](docs/CLI.md) for the full subcommand / flag reference.
 | [`docs/PROMPT_CACHE.md`](docs/PROMPT_CACHE.md) | Prompt + automatic prefix caching |
 | [`docs/SAMPLING.md`](docs/SAMPLING.md) | Per-token sampling + constrained decoding |
 | [`docs/FFI.md`](docs/FFI.md) | rmlx-mlx ↔ mlx-c FFI bridge |
-| [`docs/METRICS_DB.md`](docs/METRICS_DB.md) | Metrics DB schema + `rmlx metrics` |
+| [`docs/METRICS_DB.md`](docs/METRICS_DB.md) | Metrics DB: ingest, identity + `rmlx metrics` |
+| [`docs/METRICS_SCHEMA.md`](docs/METRICS_SCHEMA.md) | Metrics DB schema + metric registry |
 
 `CLAUDE.md` carries the architecture overview and the workspace crate graph.
 

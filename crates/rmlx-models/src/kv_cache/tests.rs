@@ -2357,7 +2357,7 @@ mod tests {
 
     /// The default boundary carries no `decode_config`, so a default run's cell
     /// is the same cell every pre-flag row was written into. Anything else gets
-    /// a cell of its own, spelled in the §3.2 grammar and ordered by key.
+    /// a cell of its own, spelled in the `docs/METRICS_SCHEMA.md` §3.2 grammar and ordered by key.
     #[test]
     fn boundary_decode_config_is_none_at_the_default() {
         assert_eq!(KvBoundary::default().decode_config(), None);

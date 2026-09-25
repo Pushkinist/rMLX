@@ -21,7 +21,7 @@
 -- `migrate::schema_runner::backfill_decode_config`, the post-hook for this
 -- version. One parser, shared with anything else that has to read a row's arm
 -- back out of it. A row whose notes say nothing either way stays NULL and is
--- named in docs/METRICS_DB.md under "Known-bad rows already in the DB".
+-- named in docs/METRICS_SCHEMA.md under "Known-bad rows already in the DB".
 --
 -- The index is what this file contributes directly: `decode_config` is now part
 -- of the cell key and of the predicates that identify those remaining rows.

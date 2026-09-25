@@ -540,7 +540,7 @@ obj = {
     # `decode_window` names where this row's decode_tps_warm came from, so rows
     # written while the script derived a prefill-inclusive rate of its own stay
     # tellable apart from rows that carry the measured window
-    # (docs/METRICS_DB.md, "Known-bad rows already in the DB").
+    # (docs/METRICS_SCHEMA.md, "Known-bad rows already in the DB").
     "notes": (
         f"config={config} draft_kind=none{tag_suffix} decode_window=engine_itl "
         f"answer_check={answer_check} answer={answer}"

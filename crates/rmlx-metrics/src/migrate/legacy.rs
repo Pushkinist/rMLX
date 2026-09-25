@@ -82,8 +82,8 @@ pub struct MigrateReport {
     /// Number of `BENCHMARK_RECORDS.md` table cells successfully ingested.
     pub records_md_cells_added: usize,
 
-    /// Metric entries dropped because the archive carried a placeholder the §4
-    /// bounds cannot read as a measurement (a `0.0` in a column the exporting
+    /// Metric entries dropped because the archive carried a placeholder the
+    /// `docs/METRICS_SCHEMA.md` §4 bounds cannot read as a measurement (a `0.0` in a column the exporting
     /// tool never measured). Counted, not silent.
     pub metrics_dropped_implausible: usize,
 
@@ -610,8 +610,8 @@ fn migrate_cbb_csv(
         }
         // CBB writes `0.0` in this column when it ran no quality probe at all.
         // The number alone cannot tell that apart from a graded run that scored
-        // zero — both are a legitimate `task_pass_at_1` value, so the §4.1
-        // bounds cannot drop it and must not. The column convention is only
+        // zero — both are a legitimate `task_pass_at_1` value, so the
+        // `docs/METRICS_SCHEMA.md` §4.1 bounds cannot drop it and must not. The column convention is only
         // known here, at the parse site, so the decision stays here.
         if let Some(v) = parse_f64(ci_task_pass).filter(|v| *v != 0.0) {
             metrics.push(MetricEntry {
@@ -658,7 +658,7 @@ fn migrate_cbb_csv(
         };
 
         // The exporter also writes `0.0` in rate columns it never measured.
-        // Those the §4.1 bounds *can* identify — a rate of zero is not a
+        // Those the `docs/METRICS_SCHEMA.md` §4.1 bounds *can* identify — a rate of zero is not a
         // measurement of anything — so they are dropped generically here,
         // unlike `task_pass_at_1` above whose zero is a real score.
         report.metrics_dropped_implausible += run.drop_implausible_metrics();

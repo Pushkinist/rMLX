@@ -87,7 +87,7 @@ pub fn open_migrated(path: &std::path::Path) -> Result<Connection> {
 ///   are reachable through `--db`.
 ///
 /// So staleness is reported instead of silently repaired: if the stored
-/// `bests` definition does not match the §4 registry, the caller is told to
+/// `bests` definition does not match the `docs/METRICS_SCHEMA.md` §4 registry, the caller is told to
 /// run `rmlx metrics doctor --fix`.
 ///
 /// The connection is opened read-write rather than with `open_readonly` on
@@ -108,7 +108,7 @@ pub fn open_checked(path: &std::path::Path) -> Result<Connection> {
     if crate::bests_view::is_stale(&conn)? {
         return Err(Error::Schema(format!(
             "the `bests` view in {} was built from a different metric registry than this \
-             binary's, so a champion read here would not match §4.1 — run \
+             binary's, so a champion read here would not match docs/METRICS_SCHEMA.md §4.1 — run \
              `rmlx metrics doctor --fix` to rebuild it",
             path.display()
         )));
