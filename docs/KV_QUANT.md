@@ -7,94 +7,24 @@
 > `cache_type::*`) lives in **`rmlx-models::kv_cache`**. See § "Public API"
 > below for the import paths.
 
-This doc gives the KV quantization contract: the public API and import
-paths, the storage summary, the Metal-vs-CPU hot path, the CLI flags and
-presets, the auto default, the memory and bit-rate summary, and the break-even
-condition with the disposition of each codec.
+This doc gives the KV quantization contract: the CLI flags and presets, the
+auto default, the memory and bit-rate summary, KV byte accounting, per-request
+hot-swap, the storage summary, the Metal-vs-CPU hot path, the break-even
+condition with the disposition of each codec, and the public API and import
+paths.
 
 The other KV quantization docs: [`KV_LAYER_POLICY.md`](KV_LAYER_POLICY.md)
 (which codec each layer gets); [`KV_CODECS.md`](KV_CODECS.md) (storage per
 `KvStorage` variant, TurboQuant calibration);
 [`KV_ROTATION_CODECS.md`](KV_ROTATION_CODECS.md) (the iso and rotor codecs);
 [`KV_FUSED_KERNELS.md`](KV_FUSED_KERNELS.md) (fused-QK, fused flash-decode,
-sparse attention); [`KV_STORE_TRUNCATION.md`](KV_STORE_TRUNCATION.md)
-(`truncate_to` per store); [`KV_CODEC_FIDELITY.md`](KV_CODEC_FIDELITY.md)
-(measured codec fidelity).
+the dispatch axis, sparse attention);
+[`KV_STORE_TRUNCATION.md`](KV_STORE_TRUNCATION.md) (`truncate_to` per store);
+[`KV_CODEC_FIDELITY.md`](KV_CODEC_FIDELITY.md) (measured codec fidelity).
 
 For the flag-surface overview and per-command usage see `docs/KV_CACHE.md`.
 For weight quantization see `docs/WEIGHT_QUANTS.md`. For the SSD spill tier
 see `docs/SSD_TIER.md`.
-
----
-
-## Public API
-
-The `rmlx-kv-quant` crate owns these public items:
-
-| Item                                       | Source                                       |
-|--------------------------------------------|----------------------------------------------|
-| `KvQuant`, `KvQuantParseError`             | `rmlx_kv_quant::quant`                       |
-| `KV_MAX_SEQ_DEFAULT`                       | `rmlx_kv_quant::quant`                       |
-| `KvCache`                                  | `rmlx_kv_quant::kvcache`                     |
-| `LinearAttnCache`, `GdnTape`, `GdnTapeSegment` | `rmlx_kv_quant::linear_attn`             |
-| `KvStorage`, `QuantK`, `QuantV`, `QuantPlanarV` | `rmlx_kv_quant::storage`                |
-| `MixedKvState`, `MixedTuple`               | `rmlx_kv_quant::mixed_quant`                 |
-| `PagedKStorage`, `PagedVStorage`, `PagedPlanarVStorage`, `install_paged_kv`, `resolve_paged_kv`, `resolve_paged_kv_page_tokens` | `rmlx_kv_quant::paged` |
-| `q8_quantize`, `q8_dequantize`, `Q8_GROUP_SIZE` | `rmlx_kv_quant::q8`                     |
-| `turboquant::{TurboBlocks, turbo_quantize_v, turbo_dequantize, GROUP_SIZE, …}` | `rmlx_kv_quant::turboquant` |
-| `planarquant::{PlanarBlocks, planar_quantize, planar_dequantize, …}`           | `rmlx_kv_quant::planarquant` |
-| MSL wrappers: `q8_msl::*`, `turboquant_msl::*`, `planarquant_msl::*`, `turbo_flash_msl::*`, `rot_k_msl::*`, `k8vturbo3_append_msl::*` | `rmlx_kv_quant::*` |
-| SWA ring buffer: `rotating::*` | `rmlx_kv_quant::rotating` |
-
-The `rmlx-kv-ssd` crate owns the SSD tier: `block_io`, `spill`, `hydrate`,
-`ssd_index`, `ssd_tier`, and the hooks `set_ssd_event_recorder`,
-`set_ssd_spill_prom_hook`, `set_ssd_hydrate_prom_hook`,
-`set_ssd_bytes_used_hook`, `set_ssd_evict_total_hook`.
-
-The policy / builder layer is in `rmlx-models::kv_cache`:
-
-* `KvCacheBuilder`, `kv_quant_for_layer`, `DEFAULT_KV_QUANT`
-* `LAYER_ADAPTIVE_TAIL_N`, `LAYER_ADAPTIVE_HEAD_N`
-* `cache_type::*`
-
-## Import paths
-
-The import path of each public symbol:
-
-```rust
-// Codec layer — rmlx-kv-quant root + module re-exports:
-use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};
-use rmlx_kv_quant::storage::{KvStorage, QuantK, QuantV, QuantPlanarV};
-use rmlx_kv_quant::mixed_quant::{MixedKvState, MixedTuple};
-use rmlx_kv_quant::paged::{PagedKStorage, PagedVStorage, PagedPlanarVStorage};
-use rmlx_kv_quant::turboquant::{TurboBlocks, turbo_quantize_v, turbo_dequantize, GROUP_SIZE};
-use rmlx_kv_quant::planarquant::{PlanarBlocks, planar_quantize, planar_dequantize};
-use rmlx_kv_quant::{q8_msl, turboquant_msl, planarquant_msl, turbo_flash_msl};
-
-// SSD-tier layer — rmlx-kv-ssd root + module re-exports:
-use rmlx_kv_ssd::{
-    write_caches, BlockIoError, KvBlockReader, KvBlockWriter, SsdKvIndex,
-    SsdSpiller, SsdHydrator, SpillJob, HydratedBlock,
-    set_ssd_event_recorder, set_ssd_spill_prom_hook, set_ssd_hydrate_prom_hook,
-    set_ssd_bytes_used_hook, set_ssd_evict_total_hook,
-};
-use rmlx_kv_ssd::ssd_tier::{install_config, active, compute_layout_key, SsdTierConfig};
-use rmlx_kv_ssd::{block_io, hydrate, spill, ssd_index};
-
-// Builder / policy (rmlx-models):
-use rmlx_models::kv_cache::{
-    KvCacheBuilder,
-    kv_quant_for_layer, DEFAULT_KV_QUANT,
-    LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
-    cache_type, CacheType, CacheTypeSpec,
-    parse_cache_type_str, resolve_cache_type, validate_resolved_kv_quant,
-    ResolverContext,
-};
-
-// Arch dispatch (Gemma4 / Qwen3 / Qwen3.5-MoE attach_at_load) stays in
-// rmlx-models because its trait impls live there:
-use rmlx_models::ssd_tier::attach_at_load;
-```
 
 ---
 
@@ -109,118 +39,13 @@ Two enums control the codec:
 - `KvQuant` — the logical quantization mode. It is set at construction time
   and does not change for the request.
 - `KvStorage` — the buffer variant that holds the data. `KvCache::update`
-  matches `&self.storage`, not `self.quant`. See `docs/KV_LAYER_POLICY.md` § "Dispatch axis".
+  matches `&self.storage`, not `self.quant`. See `docs/KV_FUSED_KERNELS.md` § "Dispatch axis".
 
 `--kv-quant auto` resolves to `none` (bf16) on every arch
 (`DEFAULT_KV_QUANT`). Every other codec is opt-in.
 
 Sliding-window attention (SWA) layers do not use the codec. They use
 `RotatingState`, a bf16 ring buffer, for every `KvQuant`.
-
----
-
-## Storage variants — summary table
-
-The last column is the V-side cosine gate on the unit-test fixture.
-
-| `KvStorage` variant | K codec | K group | V codec | V group | Dispatch path | Cosine gate (V mean ≥) |
-|---|---|---|---|---|---|---|
-| `None` | bf16 (no quant) | — | bf16 (no quant) | — | `decode_fp16_k/v` buffers | — |
-| `K8V8` | rMLX MSL q8_0 | 128 | rMLX MSL q8_0 | 128 | `QuantK` + `QuantK` | 0.9990 |
-| `K8V4` | rMLX MSL q8_0 | 128 | TurboQuant 4-bit | 32 | `QuantK` + `QuantV` | 0.9937 |
-| `Planar` (bits=4) | rMLX MSL q8_0 | 128 | PlanarQuant 4-bit | 32 | `QuantK` + `QuantPlanarV` | 0.9942 |
-| `Planar` (bits=3) | rMLX MSL q8_0 | 128 | PlanarQuant 3-bit | 32 | `QuantK` + `QuantPlanarV` | 0.9989 |
-| `Mixed` | MLX affine `k_bits` | `k_group` | MLX affine `v_bits` | `v_group` | `MixedKvState` | 0.9937 (V4 g64); 0.9990 (V8 g128); 0.9000 (V2 g32) |
-| `Paged` | q8_0 per page | 128 | tq4 / q8_0 / planar per page | 32/128/32 | `PagedKStorage` + paged V | — |
-| `TurboSym3` | TurboQuant 3-bit | 32 | TurboQuant 3-bit | 32 | `QuantKTurbo3` + `QuantV{bits:3}` | 0.9807 |
-
----
-
-## Metal-vs-CPU hot path + load-time MSL precompile
-
-Two codec attributes control startup behaviour. Both are exhaustive matches on
-`KvQuant` (`crates/rmlx-kv-quant/src/quant.rs`). A new variant must be
-classified, or the build fails.
-
-* **`KvQuant::carries_msl()`** is `true` for every codec except `none`. For
-  `Mixed` / `RotK` the kernel is MLX's own `mx.quantize`, a compiled Metal op,
-  not a custom kernel. Every other codec can dispatch at least one custom Metal
-  (MSL) kernel. MSL
-  kernels compile **lazily**: `MetalKernel::new` only registers, and MLX
-  compiles the pipeline on the first `apply()` dispatch (see `docs/FFI.md`
-  § `MetalKernel`).
-
-* **`KvQuant::cpu_hot_path_reason()`** is `Some(reason)` when the codec's
-  encode and dequant run on the **CPU** on the default path:
-
-  * `iso3` / `iso4`, `rotor3` / `rotor4`, `rotor_k_*_asym_*` → `Some`. Their
-    `update_*` functions return early to the bf16 mirror at decode, so the GPU
-    branch is shadowed. The encode that exists is CPU.
-  * `iso3_sym` / `iso4_sym`, `k_iso3` / `k_iso4` → `None`. Decode is the iso
-    flash-decode kernel over the packed ring (`iso_flash_decode`,
-    `iso_flash_decode_symv`). Nothing restages through the host.
-  * `rotor3_sym` / `rotor4_sym`, `k_rotor3` / `k_rotor4` → depends on QJL.
-    The default is off (`--rotor-qjl off`). With QJL off, the K encode is the
-    rotor MSL kernel (`rotor_gpu_append_into_k_blocks`) and decode is fused
-    (see `docs/KV_FUSED_KERNELS.md` § `rotor_flash_decode`), so the verdict is `None`. With QJL on,
-    the 1-bit residual has no MSL kernel, so the verdict is `Some`. It forces
-    the K append of `k_rotor*` onto the CPU every decode step, and it forces
-    both K and V of `rotor*_sym` onto the CPU encode and dequant path. `update_rotor_k_only` reads
-    the store's sticky `use_qjl()` flag, which is fixed at the first append.
-  * Every other codec → `None`.
-
-For the bf16-mirror family, a seeded cache never reaches the path that this
-verdict describes: the codec is INERT (see § "Codec disposition — what every
-codec in the tree is for").
-
-### Per-codec verdict
-
-| Codec family | `cpu_hot_path_reason()` | Notes |
-|---|---|---|
-| `none` | `None` | bf16, no kernel |
-| `k8v4` / `k8v8` / `planar` / `planar3` / `planar_k` | `None` | q8_0 K + tq4 / planar V GPU kernels; INERT on a seeded cache |
-| `mixed_*` / `rot_k_v*` | `None` | MLX-affine `mx.quantize` K and V (compiled Metal ops) |
-| `k8vturbo3` / `k8vturbo2` / `*tcq` / `tsym3` / `tsym4` | `None` | q8_0 or turbo K on GPU; 2-bit and 3-bit turbo V is CPU-forced; INERT on a seeded cache |
-| `iso3` / `iso4` | `Some` | bf16 mirror shadows the GPU iso branch; INERT on a seeded cache |
-| `iso3_sym` / `iso4_sym` | `None` | `iso_flash_decode_symv` over both packed rings; no bf16 mirror |
-| `k_iso3` / `k_iso4` | `None` | iso K MSL encode into the packed ring + `iso_flash_decode` |
-| `rotor3` / `rotor4` / `rotor_k_*_asym_*` | `Some` | bf16 mirror shadows the GPU branch; INERT on a seeded cache |
-| `rotor3_sym` / `rotor4_sym` / `k_rotor3` / `k_rotor4` | `None` with QJL off (default); `Some` with `--rotor-qjl on` | QJL off: rotor K MSL encode + `rotor_flash_decode` |
-
-### Load-time precompile
-
-`rmlx_kv_quant::precompile::precompile_kv_codec_msl(kq, head_dim, kv_heads,
-device)` warms the kernels of a codec with one small GPU dispatch during model
-load. Thus the first user request does not pay a cold compile. It is keyed off
-codec attributes, never an arch name. It does nothing in these cases:
-
-- the device is not the GPU,
-- `head_dim` is unknown (`0`),
-- `carries_msl()` is `false` (`none`),
-- `cpu_hot_path_reason()` is `Some`,
-- `is_k_only_iso_rotor()` is `true`. The K kernel of these codecs is the
-  iso/rotor MSL kernel, not the q8_0 K kernel that this function warms. It
-  compiles lazily on the first prefill.
-- no small warm shape makes `kv_heads × head_dim × tokens` a multiple of the
-  q8_0 group (128).
-
-Otherwise it warms the q8_0 K kernels, plus the V kernel for `k8v4` (tq4),
-`planar` (planar 4-bit) and `planar3` (planar 3-bit). A warm failure logs a
-`warn!` and load continues; the kernel then compiles lazily on first use.
-`ArchGenerator::from_snapshot_with_id`, the server-side generator factory for
-every arch, calls it.
-
-### CPU-codec classification at resolve time
-
-`rmlx_models::kv_cache::validate_resolved` (alias `validate_resolved_kv_quant`)
-runs the arch-agnostic Metal-vs-CPU check after the Qwen-MoE guards. When
-`cpu_hot_path_reason()` is `Some`, it emits a structured `warn!` that names the
-codec and the reason. It also warns when the codec is INERT
-(`materialises_packed_store()` is `false`). Both warns go through
-`warn_once_per_codec`, which uses one key, `(arch, codec)`, for both. Thus at
-most one of the two warns fires for a pair. For `iso3`, `iso4`, `rotor3`,
-`rotor4` and `rotor_k_*_asym_*`, both conditions are true: the CPU warn fires
-and the INERT warn does not. The codec is not rejected.
 
 ---
 
@@ -487,6 +312,158 @@ layer-adaptive boundary, which gives some layers another codec
 
 ---
 
+## KV byte accounting
+
+`KvCache::resident_bytes()` reports the KV-cache size. It reads the real
+`Array` shape × `dtype.itemsize()` of every GPU buffer and the length of every
+CPU codec block. This covers packed codes, scales, zero-points, rotation and
+residual buffers, the GPU rings of the ring-backed K codecs, and the bf16
+mirrors. It backs the `kv_cache_bytes` observations, the `kv_bytes` event,
+prompt-cache eviction and `rmlx baseline`. **Cost is O(blocks).** Call it at
+request boundaries, not per layer per decode step.
+
+Each figure comes from the store that owns the buffers
+(`KvStorage::resident_bytes` → per-codec `byte_size`). There is no second
+bits-per-element formula. A nominal bit width is not the memory of a cache.
+
+**One sample point on every arch: post-decode.** rMLX records
+`kv_cache_bytes` after the decode loop, when every resident KV allocation
+exists, including the decode-time GPU ring. A run that returns before the
+decode loop (the first sampled token is EOS) does not refresh
+`kv_cache_bytes`. Such a run allocates no ring, so the value it does not write
+equals the prefill snapshot. A NaN prefill stops the request with an error.
+
+`KvBytesCounter::store` requires a `PostDecode` witness. Only a completed
+decode loop mints one: `pipelined_decode`, the per-arch decode loops and the
+speculative round loop. If a change moves the store back to the prefill point
+and reuses the loop's witness, the build fails, because that witness is not in
+scope there. This is not an unforgeable guarantee: `PostDecode::seal()` is
+`pub(crate)`, so a new arch can mint a witness at the prefill point. Review
+and the `#[ignore]`d GPU test `kv_bytes_hit_equals_miss` are the backstop.
+`make ci` does not run that test. The prompt-cache snapshot is
+still cloned at the prefill point, because it stores the prompt's KV.
+
+---
+
+## Per-request hot-swap
+
+The `KvQuant` of a request is not tied to the model load. A running
+`rmlx serve` accepts a per-request `kv_quant` field (OpenAI route). The field
+selects the codec for that request. The weights stay resident; only the KV
+cache is rebuilt. If the field is absent, the launch `--kv-quant` applies.
+
+The prompt and prefix cache is **partitioned by codec**, so a switch cannot
+serve mismatched cached K/V. `KvQuant::cache_key_salt()` is XOR'd into the
+block-hash seed with the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
+§ "Codec namespacing" and `docs/SERVER.md` § "Per-request KV-config hot-swap".
+
+---
+
+## Storage variants — summary table
+
+The last column is the V-side cosine gate on the unit-test fixture.
+
+| `KvStorage` variant | K codec | K group | V codec | V group | Dispatch path | Cosine gate (V mean ≥) |
+|---|---|---|---|---|---|---|
+| `None` | bf16 (no quant) | — | bf16 (no quant) | — | `decode_fp16_k/v` buffers | — |
+| `K8V8` | rMLX MSL q8_0 | 128 | rMLX MSL q8_0 | 128 | `QuantK` + `QuantK` | 0.9990 |
+| `K8V4` | rMLX MSL q8_0 | 128 | TurboQuant 4-bit | 32 | `QuantK` + `QuantV` | 0.9937 |
+| `Planar` (bits=4) | rMLX MSL q8_0 | 128 | PlanarQuant 4-bit | 32 | `QuantK` + `QuantPlanarV` | 0.9942 |
+| `Planar` (bits=3) | rMLX MSL q8_0 | 128 | PlanarQuant 3-bit | 32 | `QuantK` + `QuantPlanarV` | 0.9989 |
+| `Mixed` | MLX affine `k_bits` | `k_group` | MLX affine `v_bits` | `v_group` | `MixedKvState` | 0.9937 (V4 g64); 0.9990 (V8 g128); 0.9000 (V2 g32) |
+| `Paged` | q8_0 per page | 128 | tq4 / q8_0 / planar per page | 32/128/32 | `PagedKStorage` + paged V | — |
+| `TurboSym3` | TurboQuant 3-bit | 32 | TurboQuant 3-bit | 32 | `QuantKTurbo3` + `QuantV{bits:3}` | 0.9807 |
+
+---
+
+## Metal-vs-CPU hot path + load-time MSL precompile
+
+Two codec attributes control startup behaviour. Both are exhaustive matches on
+`KvQuant` (`crates/rmlx-kv-quant/src/quant.rs`). A new variant must be
+classified, or the build fails.
+
+* **`KvQuant::carries_msl()`** is `true` for every codec except `none`. For
+  `Mixed` / `RotK` the kernel is MLX's own `mx.quantize`, a compiled Metal op,
+  not a custom kernel. Every other codec can dispatch at least one custom Metal
+  (MSL) kernel. MSL
+  kernels compile **lazily**: `MetalKernel::new` only registers, and MLX
+  compiles the pipeline on the first `apply()` dispatch (see `docs/FFI.md`
+  § `MetalKernel`).
+
+* **`KvQuant::cpu_hot_path_reason()`** is `Some(reason)` when the codec's
+  encode and dequant run on the **CPU** on the default path:
+
+  * `iso3` / `iso4`, `rotor3` / `rotor4`, `rotor_k_*_asym_*` → `Some`. Their
+    `update_*` functions return early to the bf16 mirror at decode, so the GPU
+    branch is shadowed. The encode that exists is CPU.
+  * `iso3_sym` / `iso4_sym`, `k_iso3` / `k_iso4` → `None`. Decode is the iso
+    flash-decode kernel over the packed ring (`iso_flash_decode`,
+    `iso_flash_decode_symv`). Nothing restages through the host.
+  * `rotor3_sym` / `rotor4_sym`, `k_rotor3` / `k_rotor4` → depends on QJL.
+    The default is off (`--rotor-qjl off`). With QJL off, the K encode is the
+    rotor MSL kernel (`rotor_gpu_append_into_k_blocks`) and decode is fused
+    (see `docs/KV_FUSED_KERNELS.md` § `rotor_flash_decode`), so the verdict is `None`. With QJL on,
+    the 1-bit residual has no MSL kernel, so the verdict is `Some`. It forces
+    the K append of `k_rotor*` onto the CPU every decode step, and it forces
+    both K and V of `rotor*_sym` onto the CPU encode and dequant path. `update_rotor_k_only` reads
+    the store's sticky `use_qjl()` flag, which is fixed at the first append.
+  * Every other codec → `None`.
+
+For the bf16-mirror family, a seeded cache never reaches the path that this
+verdict describes: the codec is INERT (see § "Codec disposition — what every
+codec in the tree is for").
+
+### Per-codec verdict
+
+| Codec family | `cpu_hot_path_reason()` | Notes |
+|---|---|---|
+| `none` | `None` | bf16, no kernel |
+| `k8v4` / `k8v8` / `planar` / `planar3` / `planar_k` | `None` | q8_0 K + tq4 / planar V GPU kernels; INERT on a seeded cache |
+| `mixed_*` / `rot_k_v*` | `None` | MLX-affine `mx.quantize` K and V (compiled Metal ops) |
+| `k8vturbo3` / `k8vturbo2` / `*tcq` / `tsym3` / `tsym4` | `None` | q8_0 or turbo K on GPU; 2-bit and 3-bit turbo V is CPU-forced; INERT on a seeded cache |
+| `iso3` / `iso4` | `Some` | bf16 mirror shadows the GPU iso branch; INERT on a seeded cache |
+| `iso3_sym` / `iso4_sym` | `None` | `iso_flash_decode_symv` over both packed rings; no bf16 mirror |
+| `k_iso3` / `k_iso4` | `None` | iso K MSL encode into the packed ring + `iso_flash_decode` |
+| `rotor3` / `rotor4` / `rotor_k_*_asym_*` | `Some` | bf16 mirror shadows the GPU branch; INERT on a seeded cache |
+| `rotor3_sym` / `rotor4_sym` / `k_rotor3` / `k_rotor4` | `None` with QJL off (default); `Some` with `--rotor-qjl on` | QJL off: rotor K MSL encode + `rotor_flash_decode` |
+
+### Load-time precompile
+
+`rmlx_kv_quant::precompile::precompile_kv_codec_msl(kq, head_dim, kv_heads,
+device)` warms the kernels of a codec with one small GPU dispatch during model
+load. Thus the first user request does not pay a cold compile. It is keyed off
+codec attributes, never an arch name. It does nothing in these cases:
+
+- the device is not the GPU,
+- `head_dim` is unknown (`0`),
+- `carries_msl()` is `false` (`none`),
+- `cpu_hot_path_reason()` is `Some`,
+- `is_k_only_iso_rotor()` is `true`. The K kernel of these codecs is the
+  iso/rotor MSL kernel, not the q8_0 K kernel that this function warms. It
+  compiles lazily on the first prefill.
+- no small warm shape makes `kv_heads × head_dim × tokens` a multiple of the
+  q8_0 group (128).
+
+Otherwise it warms the q8_0 K kernels, plus the V kernel for `k8v4` (tq4),
+`planar` (planar 4-bit) and `planar3` (planar 3-bit). A warm failure logs a
+`warn!` and load continues; the kernel then compiles lazily on first use.
+`ArchGenerator::from_snapshot_with_id`, the server-side generator factory for
+every arch, calls it.
+
+### CPU-codec classification at resolve time
+
+`rmlx_models::kv_cache::validate_resolved` (alias `validate_resolved_kv_quant`)
+runs the arch-agnostic Metal-vs-CPU check after the Qwen-MoE guards. When
+`cpu_hot_path_reason()` is `Some`, it emits a structured `warn!` that names the
+codec and the reason. It also warns when the codec is INERT
+(`materialises_packed_store()` is `false`). Both warns go through
+`warn_once_per_codec`, which uses one key, `(arch, codec)`, for both. Thus at
+most one of the two warns fires for a pair. For `iso3`, `iso4`, `rotor3`,
+`rotor4` and `rotor_k_*_asym_*`, both conditions are true: the CPU warn fires
+and the INERT warn does not. The codec is not rejected.
+
+---
+
 ## Fused flash-decode over a quant store — the break-even condition
 
 The fused flash-decode kernels in `docs/KV_FUSED_KERNELS.md` read a packed KV store at
@@ -669,6 +646,79 @@ width sets the bytes of the store: `kb + 32/kg` bits per value for `mixed_*`.
 `kv_frac`, from `scripts/perf_ceiling.py --kv-quant <codec>`, bounds the share
 of a decode step those bytes can change. Both depend on the model and the
 context. So state the codec, its K bit width and `kv_frac` with every cell.
+
+---
+
+## Public API
+
+The `rmlx-kv-quant` crate owns these public items:
+
+| Item                                       | Source                                       |
+|--------------------------------------------|----------------------------------------------|
+| `KvQuant`, `KvQuantParseError`             | `rmlx_kv_quant::quant`                       |
+| `KV_MAX_SEQ_DEFAULT`                       | `rmlx_kv_quant::quant`                       |
+| `KvCache`                                  | `rmlx_kv_quant::kvcache`                     |
+| `LinearAttnCache`, `GdnTape`, `GdnTapeSegment` | `rmlx_kv_quant::linear_attn`             |
+| `KvStorage`, `QuantK`, `QuantV`, `QuantPlanarV` | `rmlx_kv_quant::storage`                |
+| `MixedKvState`, `MixedTuple`               | `rmlx_kv_quant::mixed_quant`                 |
+| `PagedKStorage`, `PagedVStorage`, `PagedPlanarVStorage`, `install_paged_kv`, `resolve_paged_kv`, `resolve_paged_kv_page_tokens` | `rmlx_kv_quant::paged` |
+| `q8_quantize`, `q8_dequantize`, `Q8_GROUP_SIZE` | `rmlx_kv_quant::q8`                     |
+| `turboquant::{TurboBlocks, turbo_quantize_v, turbo_dequantize, GROUP_SIZE, …}` | `rmlx_kv_quant::turboquant` |
+| `planarquant::{PlanarBlocks, planar_quantize, planar_dequantize, …}`           | `rmlx_kv_quant::planarquant` |
+| MSL wrappers: `q8_msl::*`, `turboquant_msl::*`, `planarquant_msl::*`, `turbo_flash_msl::*`, `rot_k_msl::*`, `k8vturbo3_append_msl::*` | `rmlx_kv_quant::*` |
+| SWA ring buffer: `rotating::*` | `rmlx_kv_quant::rotating` |
+
+The `rmlx-kv-ssd` crate owns the SSD tier: `block_io`, `spill`, `hydrate`,
+`ssd_index`, `ssd_tier`, and the hooks `set_ssd_event_recorder`,
+`set_ssd_spill_prom_hook`, `set_ssd_hydrate_prom_hook`,
+`set_ssd_bytes_used_hook`, `set_ssd_evict_total_hook`.
+
+The policy / builder layer is in `rmlx-models::kv_cache`:
+
+* `KvCacheBuilder`, `kv_quant_for_layer`, `DEFAULT_KV_QUANT`
+* `LAYER_ADAPTIVE_TAIL_N`, `LAYER_ADAPTIVE_HEAD_N`
+* `cache_type::*`
+
+---
+
+## Import paths
+
+The import path of each public symbol:
+
+```rust
+// Codec layer — rmlx-kv-quant root + module re-exports:
+use rmlx_kv_quant::{KvCache, KvQuant, LinearAttnCache, KV_MAX_SEQ_DEFAULT};
+use rmlx_kv_quant::storage::{KvStorage, QuantK, QuantV, QuantPlanarV};
+use rmlx_kv_quant::mixed_quant::{MixedKvState, MixedTuple};
+use rmlx_kv_quant::paged::{PagedKStorage, PagedVStorage, PagedPlanarVStorage};
+use rmlx_kv_quant::turboquant::{TurboBlocks, turbo_quantize_v, turbo_dequantize, GROUP_SIZE};
+use rmlx_kv_quant::planarquant::{PlanarBlocks, planar_quantize, planar_dequantize};
+use rmlx_kv_quant::{q8_msl, turboquant_msl, planarquant_msl, turbo_flash_msl};
+
+// SSD-tier layer — rmlx-kv-ssd root + module re-exports:
+use rmlx_kv_ssd::{
+    write_caches, BlockIoError, KvBlockReader, KvBlockWriter, SsdKvIndex,
+    SsdSpiller, SsdHydrator, SpillJob, HydratedBlock,
+    set_ssd_event_recorder, set_ssd_spill_prom_hook, set_ssd_hydrate_prom_hook,
+    set_ssd_bytes_used_hook, set_ssd_evict_total_hook,
+};
+use rmlx_kv_ssd::ssd_tier::{install_config, active, compute_layout_key, SsdTierConfig};
+use rmlx_kv_ssd::{block_io, hydrate, spill, ssd_index};
+
+// Builder / policy (rmlx-models):
+use rmlx_models::kv_cache::{
+    KvCacheBuilder,
+    kv_quant_for_layer, DEFAULT_KV_QUANT,
+    LAYER_ADAPTIVE_HEAD_N, LAYER_ADAPTIVE_TAIL_N,
+    cache_type, CacheType, CacheTypeSpec,
+    parse_cache_type_str, resolve_cache_type, validate_resolved_kv_quant,
+    ResolverContext,
+};
+
+// Arch dispatch (Gemma4 / Qwen3 / Qwen3.5-MoE attach_at_load) stays in
+// rmlx-models because its trait impls live there:
+use rmlx_models::ssd_tier::attach_at_load;
+```
 
 ---
 

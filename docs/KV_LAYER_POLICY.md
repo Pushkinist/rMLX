@@ -1,16 +1,16 @@
 # KV codec per layer
 
 This doc tells which KV codec each layer gets: the per-layer net-benefit
-decision, bf16 at `--kv-quant none`, byte accounting, hot-swap, the dispatch
-axis, the layer-adaptive overrides and the Qwen MoE rejection of low-bit K
-codecs.
+decision, bf16 at `--kv-quant none`, the layer-adaptive overrides and the Qwen
+MoE rejection of low-bit K codecs.
 
 The other KV quantization docs: [`KV_QUANT.md`](KV_QUANT.md) (the contract:
-API, CLI flags, the auto default, bit rates, codec disposition);
-[`KV_CODECS.md`](KV_CODECS.md) (storage per `KvStorage` variant, TurboQuant
-calibration); [`KV_ROTATION_CODECS.md`](KV_ROTATION_CODECS.md) (the iso and
-rotor codecs); [`KV_FUSED_KERNELS.md`](KV_FUSED_KERNELS.md) (fused-QK, fused
-flash-decode, sparse attention);
+CLI flags, the auto default, bit rates, byte accounting, hot-swap, codec
+disposition, public API); [`KV_CODECS.md`](KV_CODECS.md) (storage per
+`KvStorage` variant, TurboQuant calibration);
+[`KV_ROTATION_CODECS.md`](KV_ROTATION_CODECS.md) (the iso and rotor codecs);
+[`KV_FUSED_KERNELS.md`](KV_FUSED_KERNELS.md) (fused-QK, fused flash-decode,
+the dispatch axis, sparse attention);
 [`KV_STORE_TRUNCATION.md`](KV_STORE_TRUNCATION.md) (`truncate_to` per store);
 [`KV_CODEC_FIDELITY.md`](KV_CODEC_FIDELITY.md) (measured codec fidelity).
 
@@ -149,115 +149,6 @@ embedding scales and biases) and the GDN recurrent layers (`conv1d_weight`,
 `norm_weight`). Thus an fp16 repack also stays bf16 in compute. Two CPU tests
 pin this: `moe_stream_stays_bf16_with_bf16_params` and
 `bf16_param_casts_fp16_to_bf16` (both in `qwen3_5_moe/moe_tests.rs`).
-
-## KV byte accounting
-
-`KvCache::resident_bytes()` reports the KV-cache size. It reads the real
-`Array` shape × `dtype.itemsize()` of every GPU buffer and the length of every
-CPU codec block. This covers packed codes, scales, zero-points, rotation and
-residual buffers, the GPU rings of the ring-backed K codecs, and the bf16
-mirrors. It backs the `kv_cache_bytes` observations, the `kv_bytes` event,
-prompt-cache eviction and `rmlx baseline`. **Cost is O(blocks).** Call it at
-request boundaries, not per layer per decode step.
-
-Each figure comes from the store that owns the buffers
-(`KvStorage::resident_bytes` → per-codec `byte_size`). There is no second
-bits-per-element formula. A nominal bit width is not the memory of a cache.
-
-**One sample point on every arch: post-decode.** rMLX records
-`kv_cache_bytes` after the decode loop, when every resident KV allocation
-exists, including the decode-time GPU ring. A run that returns before the
-decode loop (the first sampled token is EOS) does not refresh
-`kv_cache_bytes`. Such a run allocates no ring, so the value it does not write
-equals the prefill snapshot. A NaN prefill stops the request with an error.
-
-`KvBytesCounter::store` requires a `PostDecode` witness. Only a completed
-decode loop mints one: `pipelined_decode`, the per-arch decode loops and the
-speculative round loop. If a change moves the store back to the prefill point
-and reuses the loop's witness, the build fails, because that witness is not in
-scope there. This is not an unforgeable guarantee: `PostDecode::seal()` is
-`pub(crate)`, so a new arch can mint a witness at the prefill point. Review
-and the `#[ignore]`d GPU test `kv_bytes_hit_equals_miss` are the backstop.
-`make ci` does not run that test. The prompt-cache snapshot is
-still cloned at the prefill point, because it stores the prompt's KV.
-
-## Per-request hot-swap
-
-The `KvQuant` of a request is not tied to the model load. A running
-`rmlx serve` accepts a per-request `kv_quant` field (OpenAI route). The field
-selects the codec for that request. The weights stay resident; only the KV
-cache is rebuilt. If the field is absent, the launch `--kv-quant` applies.
-
-The prompt and prefix cache is **partitioned by codec**, so a switch cannot
-serve mismatched cached K/V. `KvQuant::cache_key_salt()` is XOR'd into the
-block-hash seed with the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
-§ "Codec namespacing" and `docs/SERVER.md` § "Per-request KV-config hot-swap".
-
----
-
-## Dispatch axis
-
-`KvCache::update_and_sdpa` tries these paths in order:
-
-1. SWA ring (`self.rotating`): `update()` then SDPA.
-2. `Mixed` / `RotK` (`self.quant.uses_mixed_path()`):
-   `update_and_sdpa_mixed`.
-3. The fused fast paths, each of which returns `None` when not eligible:
-   `PlanarK` fused QK, rotor K-only flash decode, iso K-only flash decode, iso
-   symmetric flash decode, rotor symmetric flash decode, K8V4 TurboFlash, and
-   the head-major fused-QK path.
-4. The fallback: `update()` then `scaled_dot_product_attention`.
-
-`KvCache::update` matches `&self.storage`:
-
-```rust
-match &self.storage {
-    KvStorage::K8V4 { .. }                                   => update_k8v4
-    KvStorage::K8V8 { .. }                                   => update_k8v8
-    KvStorage::Planar { .. }                                 => update_planar
-    KvStorage::None { .. }                                   => update_none
-    KvStorage::Paged { .. }                                  => update_paged
-    KvStorage::Mixed { .. }                                  => Err (contract violation)
-    KvStorage::K8VTurbo3 | K8VTurbo2 | K8VTurbo3Tcq | K8VTurbo2Tcq => update_k8_turbo_v
-    KvStorage::TurboSym3 | TurboSym4                         => update_tsym
-    KvStorage::PlanarK { .. }                                => update_planar_k
-    KvStorage::IsoV3 | IsoV4                                 => update_iso_v
-    KvStorage::RotorV3 | RotorV4                             => update_rotor_v
-    KvStorage::IsoSym3 | IsoSym4                             => update_iso_sym
-    KvStorage::IsoKOnly3 | IsoKOnly4                         => update_iso_k_only
-    KvStorage::RotorSym3 | RotorSym4                         => update_rotor_sym
-    KvStorage::RotorKOnly3 | RotorKOnly4                     => update_rotor_k_only
-    KvStorage::RotorKAsym3 | RotorKAsym4                     => update_rotor_k_asym
-}
-```
-
-`self.quant` is the construction-time parameter. `self.storage` is the
-dispatch key. Code that branches on the codec must match `storage`, not
-`quant`. A cache rebuilt from an SSD spill can hold a storage that differs from
-its `quant`: an SWA layer hydrates as `KvStorage::None` while `quant` is the
-model's global codec.
-
-Prefill is separate. `enter_prefill` switches to raw bf16 accumulation for
-every codec. `exit_prefill` encodes the accumulated prefix into the storage
-variant, when `KvQuant::materialises_packed_store()` is `true`. Each
-`KvStorage` arm of `exit_prefill` is the bulk-init path of that codec.
-
-`exit_prefill` runs on the request's `spawn_blocking` worker thread, the same
-thread on which the prefill forward built its graph. MLX ≥0.31 streams are
-thread-local: an `Array::eval()` on another thread throws
-`There is no Stream(cpu, N) in current thread.` The generate entry points call
-`rmlx_mlx::ensure_cpu_default_stream()` to register the worker's own streams.
-See `docs/KV_CACHE.md` §5.7.5 for the mechanism, the guard, and its
-limitation.
-
-**Warm-TTFT decode contract.** `exit_prefill` also seeds a bf16 K+V decode
-mirror (`decode_fp16_k` / `decode_fp16_v`) for each axis whose decode reads it.
-Every `update_<codec>` of the bf16-mirror family returns early to
-`update_decode_fp16` while that mirror is live. Thus decode-phase K **and** V
-are bf16 for those codecs. The K-only family (`IsoKOnly*`, `RotorKOnly*`) keeps
-K quantized at decode and mirrors only V. The fused symmetric family
-(`Iso*Sym`, `Rotor*Sym`) mirrors neither axis. `docs/KV_CACHE.md` §9.6 has the
-per-codec table.
 
 ---
 

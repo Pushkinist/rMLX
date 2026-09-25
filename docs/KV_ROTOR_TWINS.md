@@ -363,7 +363,7 @@ Not deleted, and stated so the list is not read as covering them:
   disposition predicates, which are untouched.
 * No `.metal` kernel. `rotorquant_{quantize,dequantize}_rotor{3,4}.metal`
   remain four files; the issue puts them out of scope.
-* No `docs/KV_QUANT.md` section. The rotor sections describe codecs, not
+* No `docs/KV_ROTATION_CODECS.md` section. The rotor sections describe codecs, not
   storage types; the paths and type names they cite that moved are corrected in
   the same commit rather than appended to.
 * `scripts/lib/debt_report.py` keeps every population it had. The two rotor

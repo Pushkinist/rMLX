@@ -4,12 +4,13 @@ This doc tells how `KvCache::truncate_to` rolls each KV store back to a
 sequence position.
 
 The other KV quantization docs: [`KV_QUANT.md`](KV_QUANT.md) (the contract:
-API, CLI flags, the auto default, bit rates, codec disposition);
-[`KV_LAYER_POLICY.md`](KV_LAYER_POLICY.md) (which codec each layer gets);
-[`KV_CODECS.md`](KV_CODECS.md) (storage per `KvStorage` variant, TurboQuant
-calibration); [`KV_ROTATION_CODECS.md`](KV_ROTATION_CODECS.md) (the iso and
-rotor codecs); [`KV_FUSED_KERNELS.md`](KV_FUSED_KERNELS.md) (fused-QK, fused
-flash-decode, sparse attention);
+CLI flags, the auto default, bit rates, byte accounting, hot-swap, codec
+disposition, public API); [`KV_LAYER_POLICY.md`](KV_LAYER_POLICY.md) (which
+codec each layer gets); [`KV_CODECS.md`](KV_CODECS.md) (storage per
+`KvStorage` variant, TurboQuant calibration);
+[`KV_ROTATION_CODECS.md`](KV_ROTATION_CODECS.md) (the iso and rotor codecs);
+[`KV_FUSED_KERNELS.md`](KV_FUSED_KERNELS.md) (fused-QK, fused flash-decode,
+the dispatch axis, sparse attention);
 [`KV_CODEC_FIDELITY.md`](KV_CODEC_FIDELITY.md) (measured codec fidelity).
 
 ---
