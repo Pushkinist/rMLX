@@ -585,7 +585,8 @@ fn marks_line(line: &str, mark: char, needle: &str) -> bool {
 /// to what it claims is between "the call is written here" and "the call runs
 /// and reports the verifier's caches": a report at the declared position inside
 /// a branch that never executes reads identical, and so does one handed the
-/// drafter's stack. See the mutation table in `docs/SPEC_ROUND_SKELETON.md`.
+/// drafter's stack. See `docs/SPEC_ROUND_SKELETON.md` § "What no runtime check
+/// sees".
 ///
 /// Mutation: move any loop's `report_verifier_kv_bytes` call above its early
 /// return, or below the head of its round loop, or delete it.
@@ -693,8 +694,9 @@ fn every_loop_reports_the_verifiers_resident_kv_at_the_exit_it_declares() {
 /// left is the source: the refusal deleted from the loop, which reads zero
 /// against a wanted one, and the refusal stated twice, which reads two. Those
 /// are the mutations this test is for from here, and neither is hypothetical —
-/// the first is the "empty-chain refusal lost" row of the mutation table in
-/// `docs/SPEC_ROUND_SKELETON.md`, which nothing at runtime covers.
+/// the first is the "empty-chain refusal lost" row of
+/// `docs/SPEC_ROUND_SKELETON.md` § "What no runtime check sees", which nothing
+/// at runtime covers.
 ///
 /// Mutation: delete `draft_tokens.is_empty()` from the loop; state it twice.
 #[test]
