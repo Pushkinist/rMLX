@@ -113,15 +113,14 @@
 # 1174 `b_8`.
 #
 # DERIVED ON a host holding every snapshot the suite resolves by slug, with the
-# per-architecture `RMLX_TEST_MODEL_*` family unset. Thirteen cells stood down
-# for want of one: `RMLX_TEST_MODEL_QWEN36_PARO` (5), `RMLX_TEST_MODEL_QWEN36`
-# (4), `RMLX_TEST_MODEL_BONSAI` (2), `RMLX_TEST_MODEL_GEMMA4_E2B` (1), and one
-# `rmlx-audio` cell whose codec path was absent. Arming them MOVES this census
-# and the entries have to be re-derived with them set: `QWEN36` arms a fourth
-# Qwen3.5-MoE cell on the same `shared_expert_gate`, and `BONSAI` puts
-# `Ternary-Bonsai-8B-mlx-2bit` — `lm_head` and `model.embed_tokens` at
-# N = 151669, unaligned — on a path that would report a `b_2` kernel no entry
-# below names.
+# per-architecture `RMLX_TEST_MODEL_*` family unset, while thirteen
+# per-architecture cells still stood down for want of those variables.
+# `crates/rmlx-models/src/test_snapshot.rs` now resolves those cells by slug,
+# so a full host arms them and this pin is stale for them: the next full
+# `make ci-perf` reports `not pinned` and `count moved up` deltas (for example
+# a fourth Qwen3.5-MoE cell on the same `shared_expert_gate`, and a `b_2`
+# kernel from `Ternary-Bonsai-8B-mlx-2bit`'s unaligned N = 151669 `lm_head`
+# and `model.embed_tokens`) until the pin is derived again.
 #
 # Both of the fourth test's hybrids were present. On a host holding one of them,
 # that test still runs and the absent one's entry reports `no longer fires`:

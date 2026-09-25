@@ -1,4 +1,4 @@
-# rMLX E2E feature-proof manifest — Phase 1 (Bonsai run-1).
+# rMLX E2E feature-proof manifest.
 #
 # One [[case]] per feature × sub-feature. The runner
 # (`tests/e2e/runner.rs`) parses this, drives the real `rmlx` binary, and
@@ -14,7 +14,9 @@
 #   request     named request fixture (see runner::request_fixture)
 #   kv_quant    --kv-quant preset for serve cases
 #   assert      { kind, expect, min_cosine }
-#   tags        ["run1","quant",...]; "phase2" rows are stubbed, never executed
+#   tags        ["run1","quant",...]; "phase2" rows are stubs that record
+#               PENDING and never execute (the live `spec_decode` and `image`
+#               rows cover the first two)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. CLI surface (no / low GPU)
@@ -480,9 +482,8 @@ assert = { kind = "cosine_vs_bf16", min_cosine = 0.99 }
 tags = ["run1", "quant"]
 
 # --- rot_k (RotK, K rotated 8-bit + V affine 4/g64) ---
-# NOTE: the RotK Display form `rot_k_v4g64` does NOT round-trip through
-# `--kv-quant` FromStr (the valid list omits it). RotK is reachable only via the
-# compose form `--ctk rot_k --ctv q4_g64`. See E2E findings + docs/CLI.md.
+# These cases use the compose form `--ctk rot_k --ctv q4_g64`; `--kv-quant
+# rot_k_v4g64` parses to the same codec.
 [[case]]
 id = "quant_rotk_coherent"
 feature = "quant_matrix"

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # regression_gate.sh — compare a committed baseline against the latest canary row.
 #
-# LEGACY: This script reads the CSV-based canary flow. The authoritative
-# regression gate is now `make canary-gate SHA=<sha>` which calls
-# `rmlx metrics deltas` against runs.db. This script is preserved as a fallback
-# for one release; prefer `make canary-gate` for new workflows.
+# This script reads the canary CSV: the LAST row naming the model, which is the
+# `k8vturbo3` arm, not the `auto` one. It takes `<baseline_stddev>` and does not
+# read it. `make canary-gate SHA=<sha>` gates from runs.db instead.
 #
 # Usage:
 #   scripts/regression_gate.sh <model> <baseline_tps> <baseline_stddev> [--tolerance PCT]

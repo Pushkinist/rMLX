@@ -4,8 +4,10 @@
 #        bash scripts/perf_canary.sh --ab [perf_ab.sh options]
 #
 # Runs 1 warmup + 3 measured baseline calls per model, prints median decode_tps
-# ± sample stddev, appends one CSV row per model to .rmlx/bench/perf_canary.csv,
-# and records the median run into runs.db via `rmlx baseline --record`.
+# ± sample stddev, appends one CSV row per model to
+# <RMLX_HOME>/bench/perf_canary.csv, and records one further run into runs.db
+# via `rmlx baseline --record`. Each model also gets an explicit `k8vturbo3`
+# arm, which appends its own CSV row after the `auto` row.
 #
 # The default mode measures ONE build. All of its measured runs for a model
 # happen together, which is fine for tracking one build over time but not for
@@ -15,12 +17,9 @@
 #
 # Column order (CSV): ts_utc,git_sha,model,kv_quant,prompt_tokens,decode_tps,stddev,build_profile
 #
-# MIGRATION NOTE: The CSV (.rmlx/bench/perf_canary.csv) is now a LEGACY
-# fallback. The authoritative source-of-truth for canary TPS is runs.db (via
-# `rmlx baseline --record`). Use `make canary-gate SHA=<sha>` (which calls
-# `rmlx metrics deltas`) to gate regressions from the DB. The CSV append below
-# is preserved for one release as a compatibility aid; it will be removed once
-# `make canary-gate` is the primary regression gate.
+# The source of truth for canary TPS is runs.db. `make canary-gate SHA=<sha>`
+# (which calls `rmlx metrics deltas`) gates regressions from the DB, and
+# `scripts/regression_gate.sh` reads the CSV.
 
 set -euo pipefail
 
@@ -246,8 +245,8 @@ for entry in "${MODELS[@]}"; do
     # Print result
     printf "%s  decode_tps=%.2f ± %.2f\n" "${short_name}" "${med}" "${sd}"
 
-    # K8VTurbo3 informational column (1 warmup + 3 measured, explicit --kv-quant).
-    # Gemma4 small uses K8VTurbo3 as auto default; this column tracks it explicitly for all models.
+    # K8VTurbo3 informational column (1 warmup + 3 measured, explicit --kv-quant)
+    # for every model; `auto` resolves to bf16.
     echo "  [k8vturbo3] warmup..." >&2
     run_once "${model_path}" --kv-quant k8vturbo3 > /dev/null
     turbo3_values=()

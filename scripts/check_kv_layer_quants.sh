@@ -19,7 +19,7 @@
 #   `kv_quant_for_layer(` and `active_kv_boundary(` may only be called inside
 #   crates/rmlx-models/src/kv_cache/ — the function, its producer
 #   `kv_layer_quants`, and their unit tests. Everywhere else, including tests,
-#   calls `kv_layer_quants(n_layers, base)`: an arch test that mirrors
+#   calls `kv_layer_quants(n_layers, base, shares_kv)`: an arch test that mirrors
 #   production construction has to mirror it through the same producer or it
 #   stops being a mirror.
 #

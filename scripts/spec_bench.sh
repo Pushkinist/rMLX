@@ -16,7 +16,7 @@
 #   - Two RunRecord JSON files written + ingested into runs.db
 #   - Final comparison table printed to stdout
 #
-# Measurement basis (docs/SPECULATIVE.md):
+# Measurement basis (docs/SPECULATIVE.md § "Benching an arm"):
 #   Both arms report the decode rate the engine measured, over the window from
 #   the first emitted token to the last, prefill excluded — so the two rows mean
 #   the same thing and the delta between them is a decode-rate delta. The

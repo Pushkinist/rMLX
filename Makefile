@@ -252,12 +252,9 @@ CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMP
 # ci-perf runs the GPU/Metal suite after `test-perf`, and it is the only shared
 # gate that does. `make ci` cannot: the GPU tests need the Metal context to
 # themselves (hard rule 8) and take minutes, which is the wrong price on every
-# commit. This is a real new cost for `ci-perf` and not a free one — the target
-# used to be a single `cargo test --workspace`, runnable next to a live
-# `rmlx serve`, and now it refuses to start unless the GPU is idle. It is simply
-# the cheapest place in the tree to pay it: `ci-perf` is already the long,
-# pre-merge-only target, and the preflight line below makes the new precondition
-# fail in milliseconds instead of after the release-perf half.
+# commit. So `ci-perf` refuses to start unless the GPU is idle: it is already
+# the long, pre-merge-only target, and the preflight line below makes that
+# precondition fail in milliseconds instead of after the release-perf half.
 #
 # Three lines, in this order, for two different reasons:
 #
@@ -265,7 +262,7 @@ CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMP
 #     only the things that cost nothing to check — RMLX_SKIP_GPU unset, no
 #     competing MLX process, a non-empty classification — and those are the most
 #     likely way this gate fails in daily use. Discovering a live `rmlx serve`
-#     after `test-perf` has run throws away the ~16 min it took.
+#     after `test-perf` has run throws away the time it took.
 #   * `test-perf` before the tests themselves because it covers the whole
 #     workspace, so a compile error anywhere shows up there, whereas the GPU run
 #     visits five crates and holds the GPU while it does. Fail on the broad,
@@ -298,16 +295,16 @@ CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMP
 # wrapper. The last line is what makes that harmless.
 #
 # The two halves run under different profiles on purpose. The GPU run builds
-# under `dev`, where debug assertions are live — 61 `debug_assert!` sites in
-# rmlx-kv-quant alone — and those are correctness guards on correctness tests.
+# under `dev`, where debug assertions are live, and those are correctness
+# guards on correctness tests.
 # `test-perf` is the one that must be release-perf, because that is the codegen a
 # perf-sensitive change ships under. The consequence is in hard rule 9: no gate
 # runs a GPU test with debug-assertions off, so a defect that only appears there
 # has to be reproduced by hand.
 #
-# Cost: the GPU suite is 383 tests, serialized, under Metal shader validation,
-# and one measured whole run of it took 279 min on a host holding every
-# snapshot — which is what HALF exists for. The dev profile is not shared with
+# Cost: the GPU suite runs serialized, under Metal shader validation, and a
+# whole run on a host holding every snapshot takes hours — which is what HALF
+# exists for. The dev profile is not shared with
 # `test-perf` and is what `make target-gc` prunes first, so a run after a GC
 # pays a cold opt-level-0 build on top. See docs/GPU_TESTS.md.
 ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (HALF=codec|rest runs one side of the partition; separate from make ci)
@@ -324,10 +321,9 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 
 # gpu-test: the execution step for the tests `check-gpu-tests-ignored` mandates.
 # Every test reaching Device::Gpu must carry #[ignore] (a shared Metal context
-# driven from parallel cargo-test threads aborts the whole binary), and until
-# this target existed nothing ran them: `make test` passes no --ignored and the
-# hosted CI has no Metal. GPU decode correctness for every KV codec sits in that
-# category, and tests in it have gone red on main and stayed red undetected.
+# driven from parallel cargo-test threads aborts the whole binary), and nothing
+# else runs them: `make test` passes no --ignored and the hosted CI has no
+# Metal. GPU decode correctness for every KV codec sits in that category.
 #
 # It is NOT part of `make ci`: it needs exclusive access to the Metal context and
 # is far too slow to block every commit. `ci-perf` runs the same suite as its
@@ -413,7 +409,8 @@ model-check-full: ## run model-logic crates + golden-token integration tests (MO
 
 # e2e: the feature-proof harness — drives the REAL rmlx binary per manifest case
 # (CLI subprocess or `rmlx serve` + HTTP), asserts on real output, writes the
-# PASS/FAIL grid to <RMLX_HOME>/e2e/report.{json,md}. Single-MLX discipline:
+# PASS/FAIL grid to <temp_dir>/rmlx_e2e_<pid>/e2e/report.{json,md} (the
+# harness pins its own RMLX_HOME there). Single-MLX discipline:
 # --test-threads=1 is mandatory. Model-gated cases skip when no Bonsai snapshot
 # resolves (RMLX_E2E_MODEL_BONSAI / RMLX_TEST_MODEL_BONSAI / RMLX_O_MODELS_ROOT).
 # See docs/E2E_TEST_PLAN.md.
@@ -603,7 +600,7 @@ gpu-runner-selftest: ## CI gate: the GPU runner reports a failing test and a sha
 check-named-skip-notices: ## CI gate: a classified GPU test that announces its own stand-down names itself, so the runner can attribute it
 	@bash scripts/check_named_skip_notices.sh
 
-check-named-skip-notices-fixtures: ## CI gate: recall test for the above, 13 synthetic roots, each asserting the reason as well as the exit code
+check-named-skip-notices-fixtures: ## CI gate: recall test for the above, 23 cases, each asserting the reason as well as the exit code
 	@bash scripts/check_named_skip_notices_fixtures.sh
 
 check-no-kernel-input-eval: ## CI gate: fail if a Metal-kernel dispatcher blocks on Array::eval() (serialises host vs GPU once per layer per decode step)
@@ -814,19 +811,22 @@ perf-iter:       ## run 3-model regression bench in series (appends to metrics/p
 # ---- canary TPS gate (DB-backed, release-perf binary) -----------------
 #
 # `make canary`      — runs perf_canary.sh (1 warmup + 3 measured per model),
-#                      appends rows to both the LEGACY .rmlx/bench/perf_canary.csv
-#                      AND (authoritative) runs.db via `rmlx baseline --record`.
+#                      appends rows to <RMLX_HOME>/bench/perf_canary.csv and
+#                      records one run per model into runs.db via
+#                      `rmlx baseline --record` (the source of truth).
 #                      Requires the release-perf binary; build with `make build-perf`.
 #
 # `make canary-gate` — gates regressions by querying runs.db.
 #                      Requires SHA=<last-green-sha> to compare against.
 #                      Uses `rmlx metrics deltas --since-sha <SHA> --threshold-pct 3`.
-#                      Exit codes: 0=clean, 1=regression, 125=no-baseline-skip.
+#                      Exit codes: 0=clean, 1=regression. A SHA with no rows
+#                      also exits 0, so a clean exit does not prove the SHA
+#                      was measured.
 #                      For the simulated-regression test, use CANARY_DB=/tmp/... to point at
 #                      a temp DB so real runs.db is not polluted with fake rows.
 #
 # Protocol: --prompt-tokens 4096, --max-tokens 100, --max-ctx 8192, kv_quant=auto
-# (arch resolver picks best-known quant: Bonsai→mixed_k8g64_v4g64, Gemma4-e4b→k8v8, Qwen3.6→k8v8)
+# (bf16 on every arch), plus an explicit k8vturbo3 arm per model.
 
 CANARY_THRESHOLD_PCT ?= 3
 # SHA to compare against for canary-gate; required — no default.

@@ -23,9 +23,10 @@
 #       cp packaging/homebrew/rmlx.rb \
 #         "$(brew --repository)/Library/Taps/pushkinist/homebrew-rmlx/Formula/rmlx.rb"
 #       HOMEBREW_NO_INSTALL_FROM_API=1 brew install --build-bottle pushkinist/rmlx/rmlx
-#     See docs/RELEASING.md for the full ordered flow.
+#     No release step runs this script (docs/RELEASING.md § "No Homebrew
+#     bottle").
 #   - A published GitHub Release for the current version tag must already
-#     exist (step 6 in docs/RELEASING.md) so the root_url is valid at
+#     exist (step 7 in docs/RELEASING.md) so the root_url is valid at
 #     install time.
 #   - `brew` and `jq` available in PATH.
 #
@@ -154,4 +155,4 @@ echo ""
 echo "==> then commit the updated formula and sync the tap:"
 echo "  make tap-sync"
 echo ""
-echo "See docs/RELEASING.md for the full bottle release flow."
+echo "The formula has no bottle block: see docs/RELEASING.md \"No Homebrew bottle\"."

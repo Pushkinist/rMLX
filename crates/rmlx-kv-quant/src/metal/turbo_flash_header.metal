@@ -1,12 +1,11 @@
 
 // TurboFlash — rMLX split-K FlashAttention.
 //
-// History: TheTom's original TurboFlash is default-OFF on Apple10 (M5+) due
-// to corruption (commit `67f076f2e`). rMLX's adaptation uses different
-// dequantization arithmetic but the same split-K pattern. The initial B1
-// validation (2026-05) reproduced a SIGSEGV at head_dim=256, 32k on M5 Max;
-// a 2026-06 re-validation on M5 Max showed the failure did not reproduce.
-// CLI default: --turbo-flash auto resolves OFF on every host (throughput HOLD).
+// Adapted from TheTom's TurboFlash (default-OFF upstream on Apple10 / M5+):
+// different dequantization arithmetic, same split-K pattern. The Apple10
+// head_dim=256 configuration is covered by tests/apple10_head_dim_256.rs.
+// CLI default: --turbo-flash auto resolves OFF on every host (the kernel
+// decodes slower than the generic path).
 // --turbo-flash on is the explicit opt-in; --turbo-flash off is a hard override.
 //
 // K format: rMLX q8_0 (group_size=128, f32 scale, i8 codes packed 4/u32).

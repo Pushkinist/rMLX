@@ -14,9 +14,8 @@
 #   names nothing. The runner counts it — it will not attribute it to whichever
 #   test was nearby — so the run is marked INCOMPLETE with a number and no list,
 #   and the reader is told that something stood down without being told what.
-#   That is the state `make ci-perf` ends in today on a host holding every
-#   snapshot, and no number of snapshots fixes it: the notice cannot be
-#   attributed at any point after it is printed.
+#   No number of snapshots fixes that: the notice cannot be attributed at any
+#   point after it is printed.
 #
 #   So the rule is enforced where it can be fixed — at the source line. This
 #   scan is the recall half of the runner's report: the runner says how many
