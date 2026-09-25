@@ -2042,15 +2042,12 @@ is fixed.
 
 ### Why bf16
 
-- The 17 Class 2 codecs build no packed store. Their decode reads the bf16
-  mirror, so their resident KV and their greedy token ids equal `none`'s
-  (§"Codec disposition", Class 2).
-- No Class 3 codec decodes faster than bf16 on every architecture and context
-  (§"Fused flash-decode over a quant store"). A 4-bit-K `mixed_*` codec wins
-  on a dense stack and loses on others (§"The null was a bit-width result, not
-  a context result").
+- The 17 Class 2 codecs build no packed store under the default flags. Their
+  decode reads the bf16 mirror, so their resident KV and their greedy token
+  ids equal `none`'s (§"Codec disposition", Class 2).
 - A Class 3 codec that holds less resident KV than bf16 is an opt-in memory
-  setting. The iso and rotor codecs among them decode slower than bf16.
+  setting. At `heads_per_kv ≥ 4`, the iso and rotor codecs cannot beat bf16
+  at decode (§"Why ε is small — grid geometry").
 
 ---
 
@@ -2060,7 +2057,11 @@ Resident KV depends on the codec class and on the cache topology. The figures
 below are stored bits per value per axis at `head_dim = 128`; bf16 is 16.0.
 
 - **`none` and every Class 2 codec**, on a cache that went through a prefill
-  bracket: 16.0 on both axes. `exit_prefill` builds no packed store.
+  bracket: 16.0 on both axes. `exit_prefill` builds no packed store. Two flags
+  add a buffer beside the mirror. `--fused-qk on` gives `k8v4`, `k8v8`,
+  `tsym3`, `tsym4` and `rotor_k_*_asym` a head-major K shadow
+  (§"Fused-QK head-major K storage"). `--turbo-flash on` gives `k8v4` the
+  TurboFlash buffers. Both flags default to `auto`, which resolves OFF.
 - **A store-backed cache of any codec** holds its packed store. This is an SSD
   hydrate, or a cache that did not go through a prefill bracket. The rate of
   each store family is in the table under §"Crate-wide rate ceiling".
@@ -2075,8 +2076,11 @@ below are stored bits per value per axis at `head_dim = 128`; bf16 is 16.0.
 | `mixed_k<kb>g<kg>_v<vb>g<vg>` | `kb + 32/kg` | `vb + 32/vg` |
 | `rot_k_v<vb>g<vg>` | 8.5 | `vb + 32/vg` |
 
-The iso and rotor rates are the GPU ring after the first fused decode step
-(§"Iso memory truth"). The rotor rates are with `--rotor-qjl off`. An MLX
+The iso and rotor rates are the GPU ring after the first fused decode step.
+The ring exists only inside the fused shape gate: batch 1 and a power-of-two
+`head_dim` of at most 512. Outside the gate the CPU block form stays: iso
+holds 43.25 bits per value there (§"Iso memory truth"). The rotor rates are
+with `--rotor-qjl off`. An MLX
 affine group spends 32 bits on its scale and bias, hence the `32/group` term.
 
 `mixed_*` and `rot_k_*` also keep a bf16 K and V mirror on a stack whose layers
@@ -2085,18 +2089,20 @@ codec holds more than `none`. On a stack without shared KV they hold the store
 alone. `global_layer_store_plus_mirror_codec_sign_follows_shared_kv`
 (`crates/rmlx-kv-quant/src/quant_tests.rs`) pins both signs.
 
-The layer-adaptive boundary gives some layers a different codec
-(§"Layer-adaptive overrides"). `rmlx info --list-cache-types` prints the
-whole-stack figure per codec and per topology. Its producer is
-`KvQuant::estimated_resident_bytes_per_layer`.
+`rmlx info --list-cache-types` prints the resident KV of each codec on one
+global layer at `head_dim` 128, for a dense and a shared-KV stack. Its producer
+is `KvQuant::estimated_resident_bytes_per_layer`. It does not count the
+layer-adaptive boundary, which gives some layers another codec
+(§"Layer-adaptive overrides").
 
 ---
 
 ## TurboQuant calibration (`kv_calib.json`)
 
 `rmlx kv-calibrate` writes a set of high-precision channel indices per KV head
-to `kv_calib.json`. `rmlx serve` reads the file at model load. **No codec reads
-it**: every codec encodes and decodes the same with or without the file.
+to `kv_calib.json`. `rmlx serve` reads the file at model load. **No codec
+applies the loaded calibration.** Every codec encodes and decodes the same with
+or without the file.
 
 ### Generation
 
@@ -2106,11 +2112,16 @@ rmlx kv-calibrate /path/to/model --recipe turbo3
 ```
 
 `--recipe` defaults to `turbo3`. `--out` sets another output path. The
-command reads the K/V projection weight tensors (F32, BF16 or F16). It
+weight-norm recipes (`turbo2`, `turbo2_tcq`, `turbo3`, `turbo3_tcq`, `turbo4`)
+read the K/V projection weights. Float weights (F32, BF16, F16) are read as
+they are. Quantized weights are dequantized to f32 first. The command
 computes the L2 norm of each head across the input dimension. It keeps the
-top-K indices per head, sorted ascending, as a `Vec<u32>`. The command runs on
-the CPU and takes no Metal claim. The `head_budget`, `softmax_mass` and
-`k_norm_proxy` recipes write `head_budgets.json` instead (§"Sparse attention").
+top-K indices per head, sorted ascending, as a `Vec<u32>`. These recipes run on
+the CPU and take no Metal claim.
+
+The `head_budget`, `softmax_mass` and `k_norm_proxy` recipes write
+`head_budgets.json` instead (§"Sparse attention"). `head_budget` loads the
+model on the GPU and needs the Metal claim.
 
 ### Recipe → outlier count
 
@@ -2142,15 +2153,20 @@ construct them through the writer or from JSON.
 
 ### Runtime lifecycle
 
-1. **Discover.** When `<model>/kv_calib.json` exists, the `rmlx serve` loader
-   reads `head_dim` from `config.json` and calls
-   `rmlx_loader::discover_kv_calibration(model_dir, head_dim)`. It logs a
-   `warn!` and continues without calibration in four cases: the file does not
-   parse, `version != 1`, `head_size` differs from the model's `head_dim`, or
-   `config.json` gives no `head_dim`.
-2. **Attach.** The result goes on `ModelLoadConfig::calibration`. A
+1. **Discover.** When `<model>/kv_calib.json` exists, the `rmlx serve`
+   loader reads `head_dim` from `config.json`. It then calls
+   `rmlx_loader::discover_kv_calibration(model_dir, head_dim)`.
+2. **Reject.** The loader logs a `warn!` and continues without calibration in
+   five cases:
+   - `config.json` does not load;
+   - `config.json` gives no `head_dim`;
+   - the file does not parse;
+   - `version != 1`;
+   - `head_size` differs from the model's `head_dim`.
+3. **Attach.** The result goes on `ModelLoadConfig::calibration`. A
    `head_budgets.json` beside it attaches as `KvCalibration::head_budgets`.
-3. **Not consumed.** `KvCacheBuilder::with_calibration` and
+4. **Not applied.** Nothing reads `ModelLoadConfig::calibration` except two
+   log fields in `rmlx serve`. `KvCacheBuilder::with_calibration` and
    `rmlx_models::kv_cache::lookup_layer_calibration` have no in-tree caller.
    No codec reads `QuantV::high_precision_indices`.
 
@@ -2197,17 +2213,23 @@ if let Some(calib) = &builder.calibration {
 }
 ```
 
-| Field | Semantics |
-|---|---|
-| `codebook.value` | V-side codebook for the layer: `2^bits` centroids in **strictly ascending order**, shared by every KV head of the layer. |
-| `codebook` absent or `null` | The built-in Lloyd-Max N(0,1) codebook. |
-| `codebook.value = []` | Parses, and returns `Error::Quant` at the first encode for the layer. |
+`codebook.value` holds `2^bits` V-side centroids in **strictly ascending
+order**, shared by every KV head of the layer. An absent or `null` codebook
+parses to `None`.
 
-No production path copies the override into the codec. `QuantV` honours a
-codebook only when `QuantV::value_codebook` is set:
+**No production path copies the override into the codec**, so every codec uses
+its built-in Lloyd-Max N(0,1) codebook. The rest of this section applies only
+when a caller sets `QuantV::value_codebook`:
+
+| `value_codebook` | Semantics |
+|---|---|
+| `None` | The built-in Lloyd-Max N(0,1) codebook. |
+| Empty | `Error::Quant` at the first encode. |
+| `2^bits` centroids | Replaces the built-in codebook for the V encode. |
 
 - The CPU encode passes it to `turbo_quantize_v_with_codebook`. 3-bit TCQ
-  honours it; 2-bit TCQ always uses the built-in 2-bit codebook.
+  passes it to `tcq_quantize_v3_with_codebook`. 2-bit TCQ always uses the
+  built-in 2-bit codebook.
 - The GPU encode supports `bits == 4` only. With a codebook it uploads the 16
   centroids once into `QuantV::value_codebook_gpu`. It then dispatches
   `rmlx_tq4_quantize_codebook_buffer` and `rmlx_tq4_dequantize_codebook_buffer`.
@@ -2221,15 +2243,19 @@ codebook only when `QuantV::value_codebook` is set:
 
 ## Fused-QK kernels
 
-The default decode path dequantizes K to bf16, then runs
-`scaled_dot_product_attention` over it. A fused-QK kernel instead reads the
-packed K (codes, scales, rotation indices) directly. It writes pre-softmax
-scores `[B, n_q_heads, 1, S_kv]`, so no dequantized K is written to memory.
-After the softmax, V takes the split path: a matmul with the bf16 V.
+A fused-QK kernel reads a packed K (codes, scales, rotation indices)
+directly. It writes pre-softmax scores `[B, n_q_heads, 1, S_kv]`, so no
+dequantized K is written to memory. After the softmax, V takes the split path:
+a matmul with the bf16 V. Without a fused kernel, a Class 2 codec decodes off
+the bf16 K mirror, with no dequant.
+
+The q8, TurboSym and rotor-asym fused-QK kernels read a head-major K shadow
+that is re-encoded from the bf16 mirror (§"Fused-QK head-major K storage").
 
 ### PlanarK fused-QK scope
 
-`KvStorage::PlanarK` is the only storage with a fused-QK kernel.
+`KvStorage::PlanarK` is the only storage whose own packed store a fused-QK
+kernel reads.
 
 - `crates/rmlx-kv-quant/src/planar_fused_qk_msl.rs`: the kernel and its
   dispatcher. The kernel reads the PlanarQuant `(codes, scales, rot32)`
@@ -2281,8 +2307,8 @@ start-up into a process-wide `OnceLock`. There is no environment variable.
 
 The fused flash-decode kernels in the sections below read a packed KV store at
 decode instead of a bf16 mirror. So does TurboFlash
-(§"TurboFlash is off by default"). A smaller store moves fewer bytes per decode step. This section
-states when that pays.
+(§"TurboFlash is off by default"). A smaller store moves fewer bytes per
+decode step. This section states when that pays.
 
 ### The condition
 
@@ -2298,17 +2324,6 @@ A fused decode beats bf16 only when **ρ < ε**. ε is a property of the kernel
 shell and ρ of the store, so a good codec and a good kernel can still lose as
 a pair. The store must hold fewer than `16·ε` bits per value per axis.
 
-### Measured ε
-
-| kernel | arch | `heads_per_kv` | ρ | slope ratio | ε | ceiling `1/heads_per_kv` |
-|---|---|---|---|---|---|---|
-| TurboFlash (`k8v4`) | Bonsai-8B | 4 | 0.262 | 6.37× | **0.041** | 0.250 |
-
-At ε = 0.041 the store must hold fewer than 0.66 bits per value per axis. The
-densest store in the tree is `tsym3` at 4.00 bits per value per axis
-(ρ = 0.25), and no kernel decodes over it. Decode through these kernels is
-**not bandwidth-bound**, so a smaller store does not buy time.
-
 ### Why ε is small — grid geometry
 
 Each P1 kernel indexes its grid by **query** head and reads the KV head
@@ -2319,24 +2334,20 @@ Each P1 kernel indexes its grid by **query** head and reads the KV head
 same KV bytes. That caps the shell at **ε ≤ 1/heads_per_kv** before any cost in
 the kernel body.
 
-At `heads_per_kv ≥ 4` this ceiling is at or below ρ = 0.25, the densest store
-in the tree. So on such an arch no fused decode over a current store can beat
-bf16, even with a perfect kernel body.
-
-The ceiling is necessary, not sufficient. The one kernel with limiter
-counters, `turbo_flash_p1`, is **issue-bound, not memory-bound**: Integer and Conditional
-Limiter 50.45% and Instruction Throughput 45.66%, against Last Level Cache
-10.66%. The bf16 `sdpa_vector` encoders in the same capture show LLC 42.16%.
-A grid indexed by KV head would read each KV byte once. It removes no issue
-cost, so it does not reach parity (§"The decode ceiling").
+The densest store in the tree is `tsym3` at 4.00 bits per value per axis
+(§"Crate-wide rate ceiling"). So its ρ is 0.25, and no kernel decodes over it. The
+iso and rotor rings have ρ between 0.445 (`iso3_sym`, 7.125 / 16) and 0.80
+(`k_rotor4`). At `heads_per_kv ≥ 4` the ceiling is 0.25 or less. So on such an
+arch no fused decode over a current store can beat bf16, even with a perfect
+kernel body.
 
 ### The decode ceiling — deleting the codec's arithmetic does not reach bf16
 
-A fused packed-store kernel with **all** per-step decode math and all K-store
-reads removed still decodes well short of `none`. Most of the gap is the
-kernel shell: dispatch, grid geometry, barriers and the fixed per-layer cost of
-a custom kernel. So no change to the decode math reaches parity: not a rotation
-hoist, a narrower K store or a better codebook, alone or together.
+The ceiling `1/heads_per_kv` comes from the grid, not from the decode math. A
+change to the math cannot lift ε above it: not a rotation hoist, a narrower K
+store or a better codebook. At `heads_per_kv ≥ 4` the kernels would not beat
+bf16 with no decode math at all, because ρ ≥ 0.25 for every current store. Only
+a grid that reads each KV byte once per KV head removes this ceiling.
 
 ### Codec disposition — what every codec in the tree is for
 
@@ -2374,7 +2385,11 @@ Decode reads the bf16 mirror on both axes. So `exit_prefill` builds no packed
 store, and the codec math does not run on a cache that went through a prefill
 bracket. `exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`
 (`crates/rmlx-kv-quant/src/kvcache/warm_ttft_cross_codec_tests.rs`) pins this.
-Resident KV and greedy token ids equal `none`'s. The store is still the
+With `--fused-qk` and `--turbo-flash` at their `auto` default (OFF),
+resident KV and greedy token ids equal `none`'s. With `--fused-qk on`, the
+q8, TurboSym and rotor-asym codecs build a head-major K shadow
+(§"Fused-QK head-major K storage"). With `--turbo-flash on`, `k8v4` holds the
+TurboFlash buffers and decodes its 4-bit V. The store is still the
 authority for a cache with no mirror: an SSD hydrate, or a cache that did not
 go through a prefill bracket.
 
@@ -2420,15 +2435,19 @@ These are the only codecs whose quantization a served request uses:
 
 Residency (§"Memory and bit-rate summary"):
 
-- The eight iso and rotor codecs hold less than bf16 on every topology and at
-  every `head_dim`. Their `feeds_bf16_*` arms are constants that do not read
-  `shares_kv`. `iso_and_rotor_k_codecs_are_under_the_floor_at_every_geometry`
-  pins the sign.
+- The eight iso and rotor codecs hold less than bf16 inside the fused shape
+  gate: batch 1 and a power-of-two `head_dim` of at most 512. There the ring
+  is the only resident copy after the first decode step. Outside the gate the
+  CPU block form stays, and iso holds 43.25 bits per value
+  (§"Iso memory truth"). The result does not depend on the topology, because
+  their `feeds_bf16_*` arms are constants that do not read `shares_kv`.
+  `iso_and_rotor_k_codecs_are_under_the_floor_at_every_geometry` pins the ring
+  rates under bf16.
 - `mixed_*` and `rot_k_*` hold less than bf16 on a stack without shared KV.
   They hold more on a shared-KV stack, where the bf16 mirror stays.
 
-Decode: no codec in this class decodes faster than bf16 on every architecture
-and context (§"Fused flash-decode over a quant store").
+Decode: at `heads_per_kv ≥ 4` no iso or rotor codec can beat bf16
+(§"Why ε is small — grid geometry").
 
 **Disposition: keep.** Each is a memory setting where it holds less than bf16.
 They are also the only codecs that decode over a packed store, so any
@@ -2444,9 +2463,9 @@ index and runs no model. `make check-kv-byte-model-parity` holds its KV byte
 model to the engine's.
 
 **It is a property of the (model, context) pair, not of the context.** At a
-4 096-token prompt the script gives 0.010 for Qwen3.8-27B-mxfp8 and 0.221 for
-Ternary-Bonsai-8B-2bit. So "measured at 4k" does not mean "measured where the
-codec axis is near zero".
+4 096-token prompt with `--kv-quant none`, the script gives 0.010 for
+Qwen3.8-27B-mxfp8 and 0.221 for Ternary-Bonsai-8B-2bit. So "measured at 4k"
+does not mean "measured where the codec axis is near zero".
 
 A large `kv_frac` is necessary, not sufficient. ε decides how much of the
 bound a fused kernel collects. State `kv_frac` and the **K bit width** next to
@@ -2460,19 +2479,11 @@ unless `--allow-truncate` or `--max-prompt-tokens` is given.
 
 #### The null was a bit-width result, not a context result
 
-At 8-bit K, `mixed_k8g64_v4g64` does not decode faster than `none`, even at
-the highest `kv_frac` of the release set. On Qwen3.8-27B at a 130 848-token
-prompt it decodes slower. At 4-bit K, `mixed_k4g64_v4g64` decodes faster than
-`none` on Ternary-Bonsai-8B at 32k and 63k prompts, with disjoint per-slot
-ranges.
-
-- The win is on the `Mixed` path, through MLX `quantized_matmul`. It does not
-  transfer to a fused flash-decode kernel over the iso, rotor or planar ring
-  (§"The decode ceiling").
-- It is not a long-context effect: it holds at 32k and at 63k.
-- On a low-`kv_frac` model the `Mixed` path loses at 4-bit K too, and it loses
-  more at longer context. So a per-step cost that grows with `kv_seq` sits on
-  that path and does not shrink with the store. No code site for it is known.
+A decode result for one K bit width is not a result for another. The K bit
+width sets the bytes of the store: `kb + 32/kg` bits per value for `mixed_*`.
+`kv_frac`, from `scripts/perf_ceiling.py --kv-quant <codec>`, bounds the share
+of a decode step those bytes can change. Both depend on the model and the
+context. So state the codec, its K bit width and `kv_frac` with every cell.
 
 ---
 
