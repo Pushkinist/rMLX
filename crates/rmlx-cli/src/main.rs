@@ -1,6 +1,6 @@
 //! rMLX binary entry.
 //!
-//! Parses subcommands, sets up tracing to `logs/<run-id>.jsonl`, prints version.
+//! Parses subcommands, sets up tracing to `<RMLX_HOME>/logs/<run-id>.jsonl`, prints version.
 
 // CLI binary: user-facing output. tracing not appropriate for command results.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -121,13 +121,12 @@ fn parse_draft_block_size(s: &str) -> Result<usize, String> {
 
 /// CLI value-enum wrapper for [`rmlx_models::prefix_index::PrefixIndexKind`].
 ///
-/// review MEDIUM-3: lets clap reject garbage values at parse-time
-/// (`possible values: linear, radix` usage error) rather than after the
-/// downstream `String::parse()` returns an anyhow. The model crate carries no
-/// clap dep, so the `ValueEnum` impl lives here.
+/// Lets clap reject an unknown value at parse time (`possible values: linear,
+/// radix`). The model crate carries no clap dep, so the `ValueEnum` impl lives
+/// here.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum PrefixIndexKindArg {
-    /// O(slots × n_blocks) linear scan; byte-identical to pre-.
+    /// O(slots × n_blocks) linear scan over the resident slots.
     #[default]
     Linear,
     /// NVIDIA Dynamo positional radix tree.
@@ -155,8 +154,8 @@ use commands::{
 };
 
 /// Long-help body shared by `--cache-type-k` / `--cache-type-v` on every
-/// subcommand. Mirrors the §D1 table at a high level; full set is in
-/// `docs/KV_CACHE.md` and `rmlx info --list-cache-types`.
+/// subcommand. The full set is in `docs/KV_CACHE.md` and
+/// `rmlx info --list-cache-types`.
 const CACHE_TYPE_K_LONG_HELP: &str = "\
 Per-side KV cache codec for the K (key) tensor (`--cache-type-k` / `--ctk`).
 
@@ -210,8 +209,7 @@ one of them is a smaller cache.
 
 Special value:
   auto      -- the same codec `--kv-quant auto` resolves to (unquantised bf16).
-               It does not inspect the hardware: the memory-pressure selector
-               that used to live here returned a preset that saves no bytes.
+               It does not inspect the hardware.
 
 Presets:
   fp16          -- bf16 both sides (unquantised; KvQuant::None)
@@ -222,17 +220,16 @@ Presets:
   planar3       -- PlanarQuant 3-bit V-side (KvQuant::Planar3)
   k_only_planar -- PlanarQuant K-side, V bf16 (KvQuant::PlanarK; rejected on Qwen MoE)
 
-*Arch guard: --kv-preset quality resolves to TurboSym4 (symmetric 4-bit Lloyd-Max K+V), rejected on \
-Qwen MoE (PPL disaster path). --kv-preset speed resolves to TurboSym3 (symmetric 3-bit Lloyd-Max K+V), \
-also rejected on Qwen MoE (K-side 3-bit PPL disaster). \
-See docs/KV_QUANT.md sections \"Preset semantics\" and \"Codec disposition\".";
+*Arch guard: --kv-preset quality resolves to TurboSym4 (symmetric 4-bit Lloyd-Max K+V) and \
+--kv-preset speed to TurboSym3 (symmetric 3-bit Lloyd-Max K+V). Qwen MoE rejects both: it \
+refuses every codec that stores K below 8 bits. \
+See docs/KV_QUANT.md section \"Preset semantics\" and docs/KV_QUANT.md section \"Codec disposition\".";
 
 /// Short help for `--kv-quant`, shared by every subcommand that takes it.
 ///
 /// Names no codec and quotes no ratio on purpose. A name in a one-line help
 /// cannot carry its disposition, and a ratio typed into a help string is a
-/// second copy of a number the engine already computes — the one this line used
-/// to carry named two codec families as the only ones under bf16 when six are.
+/// second copy of a number the engine already computes.
 const KV_QUANT_HELP: &str = "\
 KV cache quantization codec. Default \"auto\" = unquantised bf16 on every arch. \
 Which codecs hold less resident KV than bf16 depends on the architecture — \
@@ -396,12 +393,11 @@ struct Cli {
     )]
     log_cap_mb: u64,
     /// Toggle the K-side 1-bit QJL residual for the rotor3_sym /
-    /// rotor4_sym / k_rotor3 / k_rotor4 codecs. Default `off`: QJL has no Metal
-    /// kernel, so turning it on forces the rotor K path onto CPU (single-digit
-    /// TPS) with no measured accuracy gain; off routes the rotor K encode
-    /// through the Metal fused-decode kernel. Pass `--rotor-qjl on` to opt into
-    /// the residual for ablation / fidelity study.
-    /// Env fallback `RMLX_ROTOR_QJL=1` honored when this flag is absent.
+    /// rotor4_sym / k_rotor3 / k_rotor4 / rotor_k_{3,4}_asym_* codecs.
+    /// Default `off`. QJL has no Metal kernel, so `on` runs the rotor K encode
+    /// and decode on the CPU; `off` keeps the rotor K path on the Metal
+    /// fused-decode kernel. The binary always installs this value, so
+    /// `RMLX_ROTOR_QJL` has no effect on it.
     #[arg(long, value_enum, global = true, default_value_t = RotorQjlArg::Off)]
     rotor_qjl: RotorQjlArg,
     /// Route pre-softmax QK over PlanarQuant-packed K through the fused MSL
@@ -410,12 +406,10 @@ struct Cli {
     /// `KvStorage::PlanarK` caches.  No env fallback — CLI-only.
     #[arg(long, value_enum, global = true, default_value_t = PlanarFusedQkArg::On)]
     planar_fused_qk: PlanarFusedQkArg,
-    /// Generalized fused-QK kernels for q8 / turbo3 / turbo4 / iso / rotor
-    /// K-packed caches.  Default `auto`.
+    /// Fused-QK kernels over a head-major K shadow for the K8V4, K8V8,
+    /// TurboSym3/4 and rotor-asym 3/4 K codecs. Default `auto`.
     ///
-    /// `auto` (default): HOLD — kernel stubs present but not dispatching.
-    /// Auto stays OFF until codec implementations land and NIAH gates pass;
-    /// a pre-existing `RMLX_FUSED_QK=1` is still honoured.
+    /// `auto` (default): off, unless `RMLX_FUSED_QK=1` is set.
     /// `on`: resolve the gate on.
     /// `off`: HARD override — resolves off even with `RMLX_FUSED_QK=1` set.
     #[arg(long, value_enum, global = true, default_value_t = FusedQkMode::Auto)]
@@ -423,36 +417,27 @@ struct Cli {
     /// Two-phase sparse-attention dispatch (phase1_score +
     /// phase2_sparse_attend).  Default `auto`.
     ///
-    /// `auto` (default): HOLD — warm-TTFT dormant by design on normal generate
-    /// flows. Auto stays OFF until seedless workloads demonstrate measurable
-    /// speedup; a pre-existing `RMLX_SPARSE_ATTN=1` is still honoured.
+    /// No production path calls the sparse-attention dispatcher, so no value
+    /// changes the output.
+    ///
+    /// `auto` (default): off, unless `RMLX_SPARSE_ATTN=1` is set.
     /// `on`: resolve the gate on.
     /// `off`: HARD override — resolves off even with `RMLX_SPARSE_ATTN=1` set.
     #[arg(long, value_enum, global = true, default_value_t = SparseAttnMode::Auto)]
     sparse_attn: SparseAttnMode,
     /// TurboFlash MSL attention kernel. Default `auto`.
     ///
-    /// `auto` (default): resolves OFF on every host. On the one storage it
-    /// serves (K8V4, `kv_seq > 4096`) the kernel decodes 2.0–4.25× slower than
-    /// the generic path — the loss grows with `kv_seq` — and holds ~722 MB more
-    /// resident KV.
+    /// `auto` (default): off, unless `RMLX_TURBO_FLASH=1` is set; that case
+    /// logs a `warn!`, because the kernel then runs while the flag reads
+    /// `auto`. The kernel serves K8V4 at `kv_seq > 4096` and decodes slower
+    /// than the generic path there.
     ///
-    /// It also changes the generated tokens, for a reason that is not a kernel
-    /// defect: it is the only K8V4 configuration in which the 4-bit V codec
-    /// runs at decode at all (the generic path reads the bf16 mirror), so the
-    /// difference is that codec's ≈0.997 fidelity floor. Against a
-    /// dequant-then-SDPA reference over its *own* packed buffers the kernel
-    /// agrees to ≤2 bf16 ULP.
-    ///
-    /// That ratio predates the dtype fix: the dispatcher used to return its f32
-    /// kernel output uncast, which promoted the whole decode graph while the
-    /// gate was on. Read it as an upper bound on the kernel's own cost. The
-    /// direction, and this default, are unchanged. HOLD until a decode
-    /// re-measurement clears it; a pre-existing
-    /// `RMLX_TURBO_FLASH=1` is still honoured, and logs a `warn!` naming the
-    /// cost because the kernel then runs while the flag reads `auto`.
-    /// `on`: resolve the gate on (ablation, and the escape hatch for that
-    /// re-measurement).
+    /// It also changes the generated tokens, and that is the codec, not the
+    /// kernel: it is the only K8V4 configuration in which the 4-bit V codec
+    /// runs at decode (the generic path reads the bf16 mirror). Against a
+    /// dequant-then-SDPA reference over its own packed buffers the kernel is
+    /// gated at 0.5 bf16 ULP per row.
+    /// `on`: resolve the gate on.
     /// `off`: hard override — resolves off even with `RMLX_TURBO_FLASH=1` set.
     ///
     /// Global: every subcommand resolves this the same way, so `rmlx bench`
@@ -470,10 +455,9 @@ struct Cli {
     turbo_flash_lock: bool,
     /// PlanarQuant flash-decode MSL kernel. Default `auto`.
     ///
-    /// `auto` (default): OFF on every host — the warm-TTFT bf16-K seed shadows
-    /// the kernel on the normal generate flow, so there is no measurable TPS
-    /// win to flip Auto for; a pre-existing `RMLX_PLANAR_FLASH_DECODE=1` is
-    /// still honoured.
+    /// `auto` (default): off, unless `RMLX_PLANAR_FLASH_DECODE=1` is set. A
+    /// cache that went through prefill holds a bf16 K seed and never reaches
+    /// the kernel, whatever this flag says.
     /// `on`: resolve the gate on.
     /// `off`: HARD override — resolves off even with
     /// `RMLX_PLANAR_FLASH_DECODE=1` set.
