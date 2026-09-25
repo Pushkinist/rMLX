@@ -195,7 +195,7 @@ them at once; the tier rebuilds it.
 ## Live reconfiguration
 
 A request can override its KV codec and context ceiling (`docs/SERVER.md`
-§ "Per-request KV-config hot-swap"). The SSD tier is not part of that surface.
+§ "Per-request KV config"). The SSD tier is not part of that surface.
 It is attached once per model, at load, by `attach_at_load`, and its budgets
 are fixed at launch. There is no route to change them or to detach the tier.
 

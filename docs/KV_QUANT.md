@@ -355,7 +355,7 @@ cache is rebuilt. If the field is absent, the launch `--kv-quant` applies.
 The prompt and prefix cache is **partitioned by codec**, so a switch cannot
 serve mismatched cached K/V. `KvQuant::cache_key_salt()` is XOR'd into the
 block-hash seed with the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
-§ "Codec namespacing" and `docs/SERVER.md` § "Per-request KV-config hot-swap".
+§ "Codec namespacing" and `docs/SERVER.md` § "Per-request KV config".
 
 ---
 

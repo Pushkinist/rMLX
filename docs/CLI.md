@@ -147,7 +147,7 @@ starts with an empty registry. The KV codec flags above apply too.
 | `--tts-tokenizer-path` | path | — | Qwen3-TTS speech-tokenizer snapshot; `/v1/audio/speech` needs both TTS paths. Env: `RMLX_TTS_TOKENIZER_PATH`. |
 
 `--kv-quant` and `--max-ctx` are launch defaults. A request can override both
-for itself; see [`SERVER.md`](SERVER.md) § "Per-request KV-config hot-swap".
+for itself; see [`SERVER.md`](SERVER.md) § "Per-request KV config".
 The SSD budgets are fixed at launch and enforced for the life of the process;
 see [`SSD_TIER.md`](SSD_TIER.md) § "Evict-to-budget (runtime)".
 

@@ -226,7 +226,7 @@ The OpenAI route accepts an optional `max_ctx` field. It overrides the launch
 `--max-ctx` for that request, through the same `resolve_context`, so it is
 refused with the same message. With the per-request `kv_quant` field, one
 resident model can sweep codec × context cells without a reload. See
-`docs/SERVER.md` § "Per-request KV-config hot-swap".
+`docs/SERVER.md` § "Per-request KV config".
 
 ## 5. Hard invariants
 
