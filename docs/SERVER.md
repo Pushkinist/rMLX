@@ -21,21 +21,8 @@ schema: field names, SSE event types and block shape.
 
 ## Architecture
 
-### Stack
-
-```
-tokio (multi-thread runtime)
-  └─ axum 0.8 Router            build_router(state) in lib.rs
-       ├─ DefaultBodyLimit       26 MiB
-       ├─ CatchUnwindLayer       a handler panic → HTTP 500
-       ├─ timeout_mw             per-request wall-clock timeout
-       └─ handlers               openai/, anthropic/, embeddings.rs, audio.rs
-```
-
-`serve(state, host, port)` binds the listener and sets `TCP_NODELAY` on every
-accepted socket, so small SSE frames are not held back by Nagle's algorithm.
-SIGINT and SIGTERM shut the server down gracefully, so the caller's
-`MetalClaim` guard drops and removes the claim file.
+SIGINT and SIGTERM shut the server down gracefully, so the claim file is
+removed. A handler panic returns 500. The request body limit is 26 MiB.
 
 ### Compute placement
 
@@ -64,8 +51,9 @@ Metal context each.
 when `max_queue_depth` is non-zero and `gpu_pending` has reached it. Otherwise
 it counts the request and waits for the permit. `--max-queue-depth` defaults
 to 64. An RAII guard releases the permit on every exit path: success, error,
-timeout and stream abort. Chat, messages and audio requests all pass this
-gate.
+timeout and stream abort. Chat, messages and audio requests pass this gate.
+`/v1/embeddings` does not: it never returns 429, and it waits instead on the
+`gpu_gate` mutex that a running generation also holds.
 
 ### Adaptive admission controller
 
@@ -87,8 +75,8 @@ gate.
    `events` table, with the `DecisionReason` as `op`.
 5. **Adaptive prefill chunk.** `--adaptive-prefill-chunk` also moves the
    process-wide prefill chunk with the same deadband, within `[32, 2048]`
-   tokens. Its reasons are `prefill_chunk_raise`, `prefill_chunk_lower` and
-   `prefill_chunk_hold`.
+   tokens. Its reasons (`prefill_chunk_raise`, `prefill_chunk_lower`,
+   `prefill_chunk_hold`) go to the log only, not to the `events` table.
 
 The tick task lives in `AppState::admission_handle` and is aborted when the
 last `AppState` clone drops. With the controller off, the FIFO gate above is
@@ -122,8 +110,10 @@ gets HTTP 408 `timeout`.
 
 `X-Request-Id`, when present, becomes the request's correlation id (trimmed,
 printable ASCII, at most 128 characters). Otherwise the server makes a
-`req-<uuid>`. The id is the response `id`, the `X-Request-Id` response header,
-and a field on the request's tracing span.
+`req-<uuid>`. It is returned in the `X-Request-Id` response header and tagged
+on the request's tracing span. The response `id` is built from it:
+`chatcmpl-<request-id>` on the OpenAI route, `msg_<request-id>` on
+`/v1/messages`.
 
 ---
 
@@ -142,7 +132,7 @@ and a field on the request's tracing span.
 | `repetition_penalty`, `frequency_penalty`, `presence_penalty` | f32 | Same. |
 | `logit_bias` | object | Token id (string key) → finite bias. A bad key or a non-finite value is 400. |
 | `seed` | u64 | |
-| `max_tokens` | u32 | Capped at `--max-tokens-cap`, itself bounded by 1 048 576. Over the cap is 400, never clamped. |
+| `max_tokens` | u32 | Default 512. Capped at `--max-tokens-cap`, itself bounded by 1 048 576. Over the cap is 400, never clamped. |
 | `stop` | string or array | Stop sequences. |
 | `tools` | array | OpenAI function specs. |
 | `tool_choice` | string or object | `"auto"`, `"none"`, `"required"` or `{type:"function",function:{name:…}}`. |
@@ -221,7 +211,7 @@ positions.
 
 ```json
 {
-  "id": "chatcmpl-<hex>",
+  "id": "chatcmpl-<request-id>",
   "object": "chat.completion",
   "created": 1234567890,
   "model": "my-model",
@@ -409,20 +399,17 @@ Errors use the OpenAI envelope:
 | 404 | `not_found_error` | Chat or embeddings model not in the registry (`model_not_found` on the lifecycle routes). |
 | 408 | `timeout` | The request timeout expired. |
 | 429 | `rate_limit_error` | The GPU admission queue is full. |
-| 500 | `internal_error` | A `SmokeProbe` error raised during generation, or a handler panic. |
+| 500 | `internal_error` | A handler panic, a prompt-pipeline task panic, or an embeddings preprocessor or compute failure. The audio routes send 500 as `{"error":"…"}`. |
 | 502 | `constraint_not_engaged` | A non-streaming `response_format` request whose grammar never engaged. |
-| 503 | `service_unavailable` | Any load failure, the smoke probe's included, or any other engine error. Counter: `upstream`. |
+| 503 | `service_unavailable` | Any load failure, OOM while loading included, and any other engine error. With `--require-smoke-probe` (off by default) a failed smoke probe at load lands here too. Counter: `upstream`. |
 | 503 | `admission_sla_exceeded` | The adaptive controller's anticipatory rejection, with `Retry-After: 5`. Counter: `admission_sla_503`. |
-| 503 | `oom_mid_stream` | OOM during generation. No `Retry-After`: the KV cache is corrupt past the failure. |
-| 507 | `oom_during_load` | OOM loading weights, with `Retry-After: 5`. |
-| 507 | `oom_kv_cache` | OOM allocating the KV cache, with `Retry-After: 5`. |
 
-The OOM bodies add `peak_alloc_mb`, `requested_bytes`, `process_rss_mb`,
-`phys_footprint_mb` and `compressed_mb`; a value that could not be read is
-`null`. `/v1/messages` uses the same codes with its own type strings:
-`invalid_request_error`, `not_found_error`, `rate_limit_error`,
-`internal_server_error` and `service_unavailable_error`. `GET /metrics/cache`
-exposes a process-lifetime counter per category under `error_counts`.
+`/v1/messages` sends the same statuses. `context_length_exceeded`,
+`admission_sla_exceeded`, `timeout`, `invalid_request_error`,
+`not_found_error` and `rate_limit_error` keep the OpenAI strings; 500 is
+`internal_server_error` and 503 is `service_unavailable_error`.
+`GET /metrics/cache` exposes a process-lifetime counter per category under
+`error_counts`.
 
 ### `X-Session-Id` header
 
@@ -455,7 +442,7 @@ generator. See [Session cache](#session-cache).
 
 ```json
 {
-  "id": "msg-<hex>",
+  "id": "msg_<request-id>",
   "type": "message",
   "role": "assistant",
   "content": [
@@ -565,70 +552,29 @@ The `SchemaConstraint` runs with `EngagePolicy::Immediate`, so masking starts
 at the first token. The output has no `<tool_call>` wrapper, so the marker
 parser is bypassed: `bare_json_to_tool_call` turns the text into the
 `tool_calls` envelope. Streaming buffers the JSON and emits one `tool_calls`
-delta at the end.
+delta at the end. If the constraint cannot be built, for example because the
+named tool is not in `tools`, the request runs unconstrained and returns no
+error.
 
 ### EOF recovery
 
-`ToolCallStreamParser::allow_eof_recovery` stays `false` while streaming, so
-a partial token never completes a call. The non-streaming path calls
-`finalize()` once all tokens are in; it sets the flag and runs
-`run_eof_recovery()` once.
+Streaming never completes a partial call. On the non-streaming path, a
+Bonsai-style JSON call cut off mid-body (for example at `max_tokens`) is
+repaired by closing its open strings and brackets; a truncated Gemma call is
+dropped.
 
-- `Qwen3JsonToolCall`: a call cut off mid-body (for example at `max_tokens`)
-  is repaired by `balance_truncated_json`, which closes open strings, braces
-  and brackets, then parsed.
-- `Qwen3XmlFunction`: `finalize_current_call` closes the pending call.
-- `GemmaToolCall`: a truncated block is dropped.
-
-### Tool normalization
-
-OpenAI `tools` (`parameters`) and Anthropic `tools` (`input_schema`) are
-normalized to `NormalizedTool` before rendering.
+OpenAI `parameters` and Anthropic `input_schema` tools render identically.
 
 ---
 
 ## Chat Templates
 
-### Rendering
-
-`ChatTemplate` wraps a minijinja environment compiled once per model from
-`<snapshot>/chat_template.jinja`. `ChatTemplate::render(messages, opts)`
-takes `ChatMessageTpl` messages (`role`, `content`, optional `tool_calls`,
-`tool_call_id`, `name`) and `RenderOpts` (`bos_token`, `eos_token`,
-`add_generation_prompt`, `tools`, `enable_thinking`). The HuggingFace
-`{% generation %}` / `{% endgeneration %}` markers are stripped before
-compiling, since minijinja rejects unknown statements.
-
-### Python-compatible JSON serialisation
-
-Templates pass tool specs through `| tojson`. minijinja's filter writes
-compact JSON; Python's `json.dumps` writes `": "` and `", "`.
-`PythonCompatFormatter` replaces the filter, so rendered tool specs match
-HuggingFace `apply_chat_template` byte for byte.
-
-### Thinking mode
-
-`enable_thinking` in `RenderOpts` controls the Qwen3-family `<think>` block:
-
-- `Some(false)` sets `enable_thinking = false` in the Jinja context, which
-  selects the template's no-think branch.
-- `None` or `Some(true)` leaves it undefined, so the template default runs.
-  Templates test `enable_thinking is defined and enable_thinking is false`,
-  so defining it as `true` would change nothing.
-
-The request field wins over `--enable-thinking`, which wins over the template
-default. A template may ignore the flag: Ternary-Bonsai's prefills a closed
-`<think>\n\n</think>\n\n` every time. So the server reads the channel off the
-rendered prompt instead; see `docs/SAMPLING.md` § "Thinking-budget
-enforcement".
-
-### Detokenizer and UTF-8 healing
-
-`StreamingDetokenizer` (`detokenizer.rs`) decodes the growing token prefix at
-each step and diffs it against the previous decode. Byte-level BPE can end a
-decode on U+FFFD when a code point spans two tokens. The detokenizer holds
-back a delta that ends there until the code point completes. `finalize()`
-flushes the rest, lossily, at the end of the stream.
+Each model's `chat_template.jinja` renders every request. Tool specs render
+byte for byte as HuggingFace `apply_chat_template` does. A request's
+`enable_thinking` wins over `--enable-thinking`, which wins over the template
+default. A template may ignore the flag, so the server reads the thinking
+channel off the rendered prompt; see `docs/SAMPLING.md` § "Thinking-budget
+enforcement". Streamed deltas never split a UTF-8 code point.
 
 ---
 
@@ -708,24 +654,9 @@ through `RmlxError::is_migratable` (`crates/rmlx-core/src/error.rs`):
 The match has no wildcard arm and lives in `rmlx-core`, where `RmlxError` is
 defined. A new variant fails the build until it is classified.
 
-**The axis is determinism, not severity.** An empty prompt raises
-`Error::Model`, which is `Fatal`: every replay would fail the same way
-(`chunked_prefill_rejects_empty_prompt` pins it). A NaN logit row at prefill
-(`reject_nan_prefill`) raises `Error::Other`, which is `Migratable`: the
-fault is intermittent, so a replay at `temperature = 0` can complete. A
-deterministic NaN, such as corrupt weights, costs two extra attempts and
-surfaces with the same message.
-
-The NaN guard fires before the offending token reaches `step_fn`. At a
-prefill site nothing has been delivered, so the replay starts clean. At a
-mid-decode site the delivered tokens are healthy, and at `temperature = 0` the
-replay reproduces them. `make check-no-decode-swallow` RULE 4 fails the build
-if a `step_fn` call precedes the propagation at a NaN-detection site.
-
-`Error::Other` has no HTTP mapping of its own. It reaches the client as 503
-`service_unavailable` under the `upstream` counter, like `Error::Mlx`. To see
-the NaN fault, alert on its structured log event (`nan_count`,
-`max_abs_logit`, `prompt_len`), not on the HTTP category.
+A NaN logit row at prefill is `Other`, so it is replayed; a deterministic one
+surfaces after three attempts as 503 `service_unavailable`. An empty prompt is
+`Model`, so it fails at once.
 
 ### Skip conditions
 
