@@ -64,9 +64,8 @@ open, or check open PRs for the name).
    merge `next/<name>` into the branch, and never open a second PR for the
    same issue.
 5. `make ci` green locally on every chunk you push, plus `make ci-perf` when
-   the change touches what §Build & test names. `make ci-perf` and the
-   real-model regression smoke run once more on `next/<name>` before the
-   release PR.
+   the change touches what §Build & test names. Every merge to `main` runs
+   the whole `make ci-perf`.
 6. Open a PR into `next/<name>`. The hosted checks
    (`.github/workflows/ci.yml`) run on every PR into `main` and into
    `next/<name>`, as the branch rulesets require. Fill in the PR template,
@@ -75,9 +74,9 @@ open, or check open PRs for the name).
 Both `main` and `next/<name>` are protected: changes land via PR with the
 required checks green. Only a maintainer pushes to them directly, through the
 ruleset bypass: the release fast-forward of `next/<name>` onto `main`, and the
-rebase of `next/<name>` after a hotfix. See `docs/RELEASING.md`. A fix for a bug already released on
-`main` branches from `main` directly as `hotfix/<issue>`; see the Hotfix
-procedure in `docs/RELEASING.md`.
+rebase of `next/<name>` after a hotfix. A fix for a bug already released on
+`main` branches from `main` directly as `hotfix/<issue>`. Both procedures are
+in `docs/RELEASING.md`.
 
 ### No twins
 
