@@ -409,9 +409,9 @@ Errors use the OpenAI envelope:
 | 404 | `not_found_error` | Chat or embeddings model not in the registry (`model_not_found` on the lifecycle routes). |
 | 408 | `timeout` | The request timeout expired. |
 | 429 | `rate_limit_error` | The GPU admission queue is full. |
-| 500 | `internal_error` | An engine `SmokeProbe` error, or a handler panic. |
+| 500 | `internal_error` | A `SmokeProbe` error raised during generation, or a handler panic. |
 | 502 | `constraint_not_engaged` | A non-streaming `response_format` request whose grammar never engaged. |
-| 503 | `service_unavailable` | A load failure, or any other engine error. Counter: `upstream`. |
+| 503 | `service_unavailable` | Any load failure, the smoke probe's included, or any other engine error. Counter: `upstream`. |
 | 503 | `admission_sla_exceeded` | The adaptive controller's anticipatory rejection, with `Retry-After: 5`. Counter: `admission_sla_503`. |
 | 503 | `oom_mid_stream` | OOM during generation. No `Retry-After`: the KV cache is corrupt past the failure. |
 | 507 | `oom_during_load` | OOM loading weights, with `Retry-After: 5`. |
