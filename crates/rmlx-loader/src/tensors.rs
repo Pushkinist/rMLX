@@ -6,7 +6,6 @@
 //! `<base>.biases` — per-group zero-point/bias (affine only; absent for mxfp*/nvfp4)
 //!
 //! A tensor is quantized iff `<base>.scales` is present in the weight_map.
-//! (Canonical rule from `docs/03-mlx-safetensors-format.md`.)
 //!
 //! ## ParoQuant extension
 //!

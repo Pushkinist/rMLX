@@ -537,18 +537,17 @@ impl SpeculativeDispatcher {
         prompt_cache_slots: usize,
         eos_ids: &[u32],
         step_fn: &mut dyn FnMut(&ProbeStep) -> Option<u32>,
-        // A6.2: speculative does not yet integrate the sampler constraint
+        // Speculative decoding does not integrate the sampler constraint
         // engine. Per-round verifier argmax produces K+1 tokens in one
         // dispatch, but `ConstraintEngine::step_mask` returns one mask for
-        // one position — there is no acceptance-aware mask threading yet.
+        // one position — there is no acceptance-aware mask threading.
         // Calls with `Some(_)` are rejected with `Error::Model` so route
         // handlers that mix `response_format` with speculative decoding fail
         // fast rather than silently ignoring the constraint. The standalone
         // arch path (`Architecture::generate_greedy`) handles the constraint
         // correctly; only the SpeculativeGenerator route is gated.
         constraint: Option<&mut dyn crate::ConstraintEngine>,
-        // `temperature == 0` runs the greedy cached path (byte-identical
-        // to before). `temperature > 0` runs Leviathan stochastic acceptance:
+        // `temperature == 0` runs the greedy cached path. `temperature > 0` runs Leviathan stochastic acceptance:
         // the draft samples from its post-sampling distribution `q`, the
         // verifier scores each position's post-sampling distribution `p`, and
         // each draft token is accepted with prob `min(1, p(x)/q(x))` vs a
@@ -571,10 +570,10 @@ impl SpeculativeDispatcher {
         }
         if constraint.is_some() {
             return Err(Error::Model(
-                "spec_generate_greedy: A6.2 — sampler constraint engine not \
+                "spec_generate_greedy: sampler constraint engine not \
                  supported on the speculative-decoding path. Use the \
                  single-arch path (ArchGenerator) for response_format \
-                 requests, or wait for A6.3."
+                 requests."
                     .into(),
             ));
         }
@@ -597,7 +596,7 @@ impl SpeculativeDispatcher {
                 sampler_cfg,
             )
         } else {
-            // Greedy (temperature == 0) — byte-identical to before .
+            // Greedy (temperature == 0).
             self.spec_generate_greedy_cached(
                 tokenizer,
                 prompt_ids,

@@ -1,4 +1,4 @@
-//! A6.2 — sampler-side constraint engine.
+//! Sampler-side constraint engine.
 //!
 //! `ConstraintEngine` is a per-request decoding constraint. It produces a
 //! boolean allow-mask over the vocabulary for each sampling step; the sampler

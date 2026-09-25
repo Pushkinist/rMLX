@@ -24,8 +24,8 @@ fn const_sb(rows: usize, groups_per_row: usize, val: f32) -> Vec<u8> {
 
 /// Documents the bias sign convention used by rMLX: ADDITIVE.
 ///
-/// Ground truth: docs/03-mlx-safetensors-format.md §Affine:
-/// `w_fp = s * x_q + b`
+/// Ground truth: `docs/WEIGHT_QUANTS.md` § "Dequant formula":
+/// `w_fp = scale × code + bias`
 ///
 /// With scale=1.0, code=3, bias=0.5 → expected 3.5.
 /// If the convention were subtractive (s*x_q - b), result would be 2.5.

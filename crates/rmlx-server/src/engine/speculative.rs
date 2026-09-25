@@ -29,12 +29,12 @@ use super::types::{GenerationRequest, GenerationToken, ModelLoadConfig};
 /// Which drafter loader an `--draft-kind mtp` draft model routes to, decided by
 /// the draft's detected architecture family (never a substring leak).
 ///
-/// `--draft-kind mtp` historically fronted two structurally different loaders:
-/// the Qwen3.5-MoE MTP sidecar head (`MtpDrafter`) and the Gemma4 assistant
-/// drafter (`Gemma4AssistantDrafter`). A draft whose family backs neither must
-/// be rejected at load — see issue #23: a plain `Gemma4ForConditionalGeneration`
-/// snapshot used to fall through to the Qwen3.5 sidecar loader and leak a
-/// confusing `text_config missing num_experts` error.
+/// `--draft-kind mtp` fronts two structurally different loaders: the
+/// Qwen3.5-MoE MTP sidecar head (`MtpDrafter`) and the Gemma4 assistant
+/// drafter (`Gemma4AssistantDrafter`). A draft whose family backs neither is
+/// rejected at load with a typed error, so a plain
+/// `Gemma4ForConditionalGeneration` snapshot does not fall through to the
+/// Qwen3.5 sidecar loader and fail on a missing `num_experts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MtpDraftFamily {
     /// Dedicated Gemma4 assistant drafter snapshot (`gemma4_assistant`).
@@ -54,8 +54,8 @@ enum MtpDraftFamily {
 /// sidecars (e.g. `mlx-community/Qwen3.6-35B-A3B-MTP-5bit`) carry
 /// `model_type=qwen3_5_mtp` but an absent `architectures` array — the downstream
 /// `MtpDrafter::load` (mtp.rs:~288) only warns on a mismatch and proceeds by
-/// tensor names. The issue #23 fix targets *populated* foreign families
-/// (e.g. `Gemma4ForConditionalGeneration`), not blanks.
+/// tensor names. The rejection targets *populated* foreign families (e.g.
+/// `Gemma4ForConditionalGeneration`), not blanks.
 fn classify_mtp_draft(arch: &str, model_type: &str) -> MtpDraftFamily {
     if model_type == "gemma4_assistant" || arch.contains("Gemma4Assistant") {
         MtpDraftFamily::Gemma4Assistant
@@ -176,7 +176,7 @@ fn decide_draft_kind(
         // The inference yields to the flag, but not into a loader that would
         // materialise the whole verifier first and then die on a tensor name.
         // `mtp` is not listed: its own family router refuses a full model
-        // before any weight is read.
+        // before any draft weight is read (the verifier is loaded first).
         (
             Some(f @ (DraftKind::Eagle3 | DraftKind::DFlash | DraftKind::DFlash2)),
             Declared::FullModel,
@@ -678,23 +678,19 @@ impl Generator for SpeculativeGenerator {
         // per-event DB recorder (TTFT is written by the HTTP handler
         // layer off-runtime; only ITL/kv_cache_bytes are written here).
         let event_recorder = req.event_recorder;
-        // C5 Slice A: hold the FIFO admission guard for the lifetime of the
+        // Hold the FIFO admission guard for the lifetime of the
         // blocking decode (mirrors ArchGenerator). Released on completion.
         let gpu_admission = req.gpu_admission;
-        // A6.3 Option SK: speculative decode cannot honor a stateful
-        // grammar — the K+1 verifier argmax has no per-token mask hook
-        // that aligns with `ConstraintEngine::step_mask`. Rather than
-        // silently dropping the engine (the A6.2 behaviour, safe only
-        // for NoOp), refuse the request with a clear 503 so callers can
-        // either drop `response_format` or use the single-arch generator.
-        // Future work: sequential-mask integration (Option SQ in the
-        // A6.3 spec) would re-evaluate each accepted draft token
-        // through the constraint with rollback on rejection.
+        // Speculative decode cannot honor a stateful grammar: the K+1
+        // verifier argmax has no per-token mask hook that aligns with
+        // `ConstraintEngine::step_mask`. The request is refused, not run
+        // unconstrained. The refusal is an `Error::Other`, which both routes
+        // map to HTTP 503.
         if req.constraint.is_some() {
             tracing::warn!(
                 model_id = %req.model_id,
                 "SpeculativeGenerator: refusing request — response_format \
-                 + speculative decode not supported (A6.3 Option SK)"
+                 + speculative decode not supported"
             );
             return Box::pin(stream::once(async {
                 Err(Error::Other(
@@ -786,7 +782,7 @@ impl Generator for SpeculativeGenerator {
                 }
             };
 
-            // C5 Slice A: hold the FIFO admission guard for the whole decode
+            // Hold the FIFO admission guard for the whole decode
             // (mirrors ArchGenerator). Released on closure exit.
             let _gpu_admission = gpu_admission;
 
