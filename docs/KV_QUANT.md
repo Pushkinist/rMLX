@@ -639,7 +639,7 @@ Before you design a long-context cell, check the model's positional capacity:
 On `--device gpu` it also refuses a prompt longer than the context ceiling,
 unless `--allow-truncate` or `--max-prompt-tokens` is given.
 
-#### The null was a bit-width result, not a context result
+#### A decode result holds for one K bit width
 
 A decode result for one K bit width is not a result for another. The K bit
 width sets the bytes of the store: `kb + 32/kg` bits per value for `mixed_*`.
