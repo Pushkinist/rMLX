@@ -22,8 +22,11 @@ dimension comes from `config.json`. The mel filterbank matches its `n_mels`:
 audio bytes → WavDecoder (mono f32, native rate) → resample_to_16k
 → per 30 s window: MelExtractor → encode_mel → greedy decode in timestamp mode
 → timestamp tokens → segments with cumulative times
-→ seek to the last timestamp; previous text fed back after <|startofprev|>
+→ seek to the last timestamp
 ```
+
+With `condition_on_previous_text` set, the previous window's text is fed back
+after `<|startofprev|>`. The server and `rmlx transcribe` always set it.
 
 Each window decodes with the openai-whisper logit filters (`DecodeFilters`).
 Temperature is 0, so one input gives one output. A segment that opens in the
@@ -100,9 +103,11 @@ A Qwen3 transformer over the `talker.*` weights. Its dimensions come from
 ### CodePredictor
 
 A 5-layer Qwen3 stack that predicts codec groups 1 to 15 from the talker's
-last hidden state and group 0. Its hidden size and layer count come from
-`config.json`. Heads (16), KV heads (8), head dim (128) and MLP width (3072)
-are constants in `load_talker_weights`. Its KV cache resets every step.
+last hidden state and group 0. None of its dimensions comes from the
+snapshot. Hidden size (1024) and layer count (5) are serde defaults of flat
+`talker_config` keys; the nested `code_predictor_config` block is not read.
+Heads (16), KV heads (8), head dim (128) and MLP width (3072) are constants in
+`load_talker_weights`. Its KV cache resets every step.
 
 ### Codec decoder
 

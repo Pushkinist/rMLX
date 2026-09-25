@@ -1,7 +1,7 @@
 # rMLX — agent guide
 
-Rust-native, single-binary MLX inference + conversion backend for Apple
-Silicon. Goal: the fastest fully-featured **native, no-Python** backend for
+Rust-native, single-binary MLX inference backend for Apple Silicon.
+MLX→MLX conversion is in scope, not yet implemented. Goal: the fastest fully-featured **native, no-Python** backend for
 MLX-format models.
 
 ## Local-only machine paths
@@ -26,7 +26,10 @@ One `cargo build --release` binary that:
    (TurboQuant, IsoQuant, PlanarQuant, RotorQuant). ParoQuant is supported
    too, on the **weight** side — it is not a KV method (see
    `docs/WEIGHT_QUANTS.md` §7).
-4. Multi-model lifecycle (load on demand, unload on idle), but enforces a
+4. **Converts** models between quant formats / layouts (re-quantize, KV-quant
+   repack) — MLX in, MLX out. A 0.1.0 target, not yet implemented: there is
+   no `rmlx convert` today.
+5. Multi-model lifecycle (load on demand, unload on idle), but enforces a
    **single MLX process at a time** (Apple Silicon Metal context is exclusive
    per process).
 
@@ -128,8 +131,8 @@ coverage grows.
 1. **Apple Silicon only**. Metal first. No CUDA, no ROCm, no x86 SIMD.
 2. **Single binary**. `cargo build --release` is the artifact. No bundled
    Python, no runtime data files (weights + chat templates are model-side).
-3. **MLX-format only**. GGUF is out of scope. rMLX can re-quantize / convert
-   MLX↔MLX itself; it never reads GGUF.
+3. **MLX-format only**. GGUF is out of scope. MLX↔MLX re-quantize / convert
+   is in scope, not yet implemented; rMLX never reads GGUF.
 4. **No training**. No fine-tune / fuse / lora-merge. Quant and format
    conversion is allowed and in scope.
 5. **Asymmetric K/V is real**, not a fake single-bit-width flag. See docs/KV_CACHE.md.
@@ -235,8 +238,9 @@ Hard rules:
   `make gpu-test` is the only step that executes them — `make test` passes no
   `--ignored` and the hosted CI has no Metal. The same suite runs as the last
   step of **`make ci-perf`** (invoked directly, so `CRATE=`/`VALIDATE=` cannot
-  narrow or disarm the gate), which is why `ci-perf` requires an idle GPU. It is deliberately not in `make ci`, which would
-  then need the Metal context to itself on every commit. A guard
+  narrow or disarm the gate), which is why `ci-perf` requires an idle GPU.
+  It is deliberately not in `make ci`, which would then need the Metal context
+  to itself on every commit. A guard
   that only exercises a check the dispatcher rejects **before** touching a
   device-parameterized op is not a GPU test: pass `Device::Cpu` and leave it
   un-ignored — ignoring a CPU test silently stops running it. The CI gate
@@ -317,7 +321,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make deny` | `cargo deny --all-features check` (licenses, bans, sources, advisories). |
 | `make precommit` | `pre-commit run --all-files`. |
 | `make hooks` | Install the git `pre-commit` hook. |
-| `make ci` | Pre-merge gate: `fmt-check`, `lint`, `test`, `test-capture`, `deny`, `audit`, `ci-metrics`, then every row below marked "in `make ci`", then the advisory reports. |
+| `make ci` | Pre-merge gate. The `Makefile` `ci:` recipe is the full list: `fmt-check`, `lint`, `test`, `test-capture`, `deny`, `audit`, `ci-metrics`, then the CI gates, then the advisory reports. Not every gate in it has a row here. |
 | `make ci-perf` | `test-perf` under `release-perf` + the serialized GPU/Metal suite. Requires an idle GPU. The run ends `ci-perf INCOMPLETE` rather than `ci-perf ok` whenever a selected GPU test did not run — a missing snapshot, or a cell gated on a variable the host did not set (`RMLX_KV_TEST_MODEL`, `RMLX_VL_TEST_MODEL`, `RMLX_PROMPT_CACHE_TEST_MODEL_*`; see `docs/GPU_TESTS.md`) — or a stand-down notice named no test; pinned entries it could not count are reported as not enforced in full rather than failing. Run before merging perf-sensitive or codec-layer changes. A PR runs `make ci-perf HALF=codec` when its diff touches only crates below the model layer, only `crates/rmlx-models/src/`, or only integration binaries that select a KV codec; `HALF=rest` when it touches only the binaries that do not. Anything else, and every merge to `main`, runs the whole `make ci-perf`. `HALF` must be exactly `codec` or `rest` — an empty one is refused, not waved through — and an accidentally exported one is ignored (`$(origin HALF)`), which closes the stale-export case and nothing more. The defence that does hold is the last line: a half-run reads `ci-perf <half>-half ok — NOT the whole gate` and never the string `ci-perf ok`. What a half cannot catch is a codec change that passes the codec half and breaks a golden or an equivalence pair in the rest half — `main` runs the whole gate, so that is found one merge later than it would have been. |
 | `make check-kv-layer-quants` | CI gate (in `make ci`): the per-layer KV codec vector has one producer (`kv_layer_quants`) — no second `kv_quant_for_layer` loop, and every per-layer cache stack either uses it or declares itself uniform. |
 | `make check-kv-codec-disposition` | CI gate (in `make ci`): the `--kv-quant` / `--kv-bits` help and the INERT banners agree with each codec's runtime disposition, derived from `ALL_KV_QUANTS` + `decode_reads_packed_store` / `feeds_bf16_{k,v}_at_decode`. The banners are read from a fixed list of docs (`BANNER_DOCS`); a banner in any other doc fails, a listed doc that is missing, an empty list and a doc listed twice are exit 2, and each inert codec is named in exactly one banner. |
@@ -345,8 +349,8 @@ hand — keeps the CI gate and the local gate identical.
 | `make check-doc-consumers` | Every reader of doc text in one run: `check-doc-refs`, `check-doc-source-citations`, `check-kv-codec-disposition` (the INERT banners), `check-kv-boundary-default-parity` (the `docs/CLI.md` rows) and `check-published-table` (the generated table). A doc deletion is safe when this passes; whether the kept text is true is the reviewer's check. |
 | `make debt-report` | Advisory (non-failing): sibling-file/fn similarity ("twins") in `crates/rmlx-kv-quant` and `crates/rmlx-models` — printing the speculative round-loop drivers as a named group regardless of threshold. The group is *discovered*, not a literal name list, and its rule has one producer: it is `scripts/check_spec_charge.sh`'s population (a) — the driver signature plus a constructed `RoundTotals` — read from `check_spec_charge.sh --list-drivers` (`file`, `fn`, `line`) and joined one to one, with a listed fn the report cannot resolve counted and named rather than dropped, and a lost population or a missing directory reported as `unavailable`, never as zero drivers. Today that is one fn, `run_rounds`. `scripts/debt_report.sh --matched-lines <population>` is the one producer of every duplication figure: summed `difflib` matching-block lines over digit-folded bodies, pairwise over the named population. Eleven populations, each a record carrying its own root, its own collector and its own pairing rule — the root is what the label prints, so no figure names a directory it was not measured over. `drivers`, `impls` and `iso-updates` (the round-loop drivers, the `impl RoundDrafter` bodies, every fn of the KV update files carrying the codec token `iso`) are one family and pair every item with every other — the last because no two of those fns share a digit-stripped name, so a width key would report `0` whatever the files held; `rotor-storage`, `iso-storage` and `turbo-storage` (the non-test `quant_rotor_*.rs` / `quant_iso_*.rs` / `quant_k_turbo*.rs` files under `crates/rmlx-kv-quant/src/storage`), `rotor-updates` and `turbo-updates` (the `update_rotor*` fns and the fns carrying the `tsym` token as a whole segment, both over `crates/rmlx-kv-quant/src/kvcache/update*.rs` — the dispatch file plus one file per codec family, a glob so that a body moving between them cannot move a figure — the turbo one keys on the token rather than a prefix because the entry `update_tsym` and the body it enters, `tsym_update`, spell it on opposite sides of the name, and an anchored prefix would measure the entry and never the body) and `turbo-ssd` (the turbo helper fns of `crates/rmlx-kv-ssd/src/block_io.rs`, a population of its own because its root is a file in another crate and a figure prints the root it was measured over) pair only inside a group sharing the name with every digit run removed — same axis, different width — so a collapsed axis reads a measured `0` with the population still found. The seven KV populations share three collectors, given their glob, their directory or their name pattern at the registration site through `functools.partial`, because a `glob` field on the record would be one the others never read. Every pair is measured both ways round and reported as the larger: `difflib.SequenceMatcher` anchors on the longest match in its first argument, so a one-directional figure moves when a body changes file or name, or when a new item re-orders the population, with no line of any body changing. `population_pairs` also name-sorts every population, so the pair list is a function of the population and not of the filesystem walk. `ssd-hydrate` (the non-test fns under `crates/rmlx-models/src` named exactly `hydrate` or exactly `from_hydrated`) is one family again, and carries two names so one command measures both the per-arch `hydrate` bodies and the short `from_hydrated` entry constructors. `update-bodies` (every `update_`-prefixed fn of the KV update files — the per-variant bodies of every family at once plus the shared entries the dispatch reaches, paired every item with every other, because a width key goes blind the moment the widths collapse) is one family too; the prefix is the whole rule, so the label says what it finds rather than claiming a narrower population. Those nine are a glob plus a name rule, never a file or fn list, which is what lets one command measure a tree that carries the twins and the tree that collapsed them; a population resolving to zero members is `unavailable` and exits 1, never a `0` indistinguishable from a collapsed one. Four debt counters (`#[allow(` sites, debt-marker comments, `check-*` Make targets, oversized files without `LOC-exempt`, each stating its own file population), the churn (summed over commits, not a net diff) since the last tag, and `docs/**/*.md` files over 40 KiB (git-ignored files skipped; outside a git work tree the section reads `unavailable`). Also runs at the end of `make ci` (advisory, non-blocking). |
 | `make debt-report-selftest` | CI gate (in `make ci` and hosted CI): the above over synthetic fixtures, 133 cases — a planted twin pair is reported and a same-naming-shape pair just under the threshold is not, the round-loop group is the charge gate's population (a) (signature plus `RoundTotals`, one driver; the seven signature-only fns beside it are excluded; removing the one `RoundTotals` reports `unavailable`, not zero; a renamed driver is found under its new name, count unchanged; two same-named drivers in one file count two, not four; a listed driver the scan cannot resolve prints `1 listed, 0 resolved` and its name; a dead producer prints `unavailable` and no count line), `--matched-lines` is asserted over all eleven populations (0 matched over one driver; a planted impl pair at 7 matched lines that drops to 6 under a body edit; five planted rotor storage files at 51 matched lines over 63 and five planted `update_rotor*` fns at 15 over 23, each with its item and pair count. Both populations carry a **three-member group** beside a two-member one, which is what tells every-pair-in-a-group from consecutive-only pairing — with two-member groups only, the two are the same function. One planted fn spells its width as its own segment (`update_rotor_5_sym`) and must still join its family, which a key that left the doubled separator behind would split off. So an all-pairs population, consecutive-only pairing, a widened glob, a widened fn prefix, a separator-sensitive key or a reverted label all read wrong; each rotor population is then measured at `0` with the population still found once the width twin is deleted, and reported `unavailable` — reason and exit code both — separately for a root that is missing and a root that is there with nothing in it. The empty-population rule is a population rule, not a rotor one, and is asserted on `impls` too. The two iso populations carry the same four shapes at two members per group — four planted `quant_iso_*.rs` files at 23 matched lines over 48 and four planted `update_iso*` fns at 7 over 18, each collapsing to a measured `0` with the population found, then `unavailable` for an empty root and for a missing one — and they share their directory with the rotor storage files and their file with the `update_rotor*` fns, so a widened glob or a widened prefix reads 9 item(s) on one of the two. The four update populations are asserted on both layouts of one planted fixture: moving three `update_rotor*` bodies into a codec family's own `update_rotor.rs` leaves `rotor-updates` and `update-bodies` at the figure, the item count and the pair count they read over one file, so a file list or a glob that missed the family files reads wrong. One further pair is planted for the orientation rule — two bodies that share four lines read one way and three read the other, in both arrangements of their two names, which is the only pair in the fixture tree whose figure that rule can move; reverting `matched_lines` to one direction turns one of the two red, and reverting it together with the sort turns the other. `ssd-hydrate` is asserted on both tree shapes from one planted fixture — two per-arch `hydrate` bodies at 13 matched lines over 28, then the same two arches carrying only the short `from_hydrated` constructors at 8 over 16 — so dropping either name from the rule turns one of the two red, the first by count and the second by going `unavailable`; a `hydrate_from_ssd` beside them and a `hydrate` in a `_tests.rs` file are each outside the population, and counting either would read 3 item(s)), two named `fn …: NN.N% shared` lines are asserted from the twin pair, all four debt counters are asserted against planted fixtures (one `#[allow(`, one debt comment in source and one in a `_tests.rs` file, a Makefile with two `check-*:` targets, an oversized file and its `LOC-exempt`-marked twin), and a synthetic two-commit, one-tag git repo (plus a top-level `README.md` alongside a `docs/*.md` file) proves the churn figure and its "*.md" pathspec are both exercised. Asserts what each case found, not just that the tool ran. |
-| `make check-doc-size` | CI gate (in `make ci` and hosted CI): every `docs/**/*.md` git does not ignore is at most 40 KiB. It fails naming each doc over the cap, a stale temporary exception and any doc carrying a `size-exempt:` marker; no doc exempts itself. The one temporary exception, `docs/METRICS_DB.md`, fails the gate once its split lands. Exit 2 when it cannot measure. One producer: `scripts/lib/debt_report.py`. Do not raise the cap; split the doc. |
-| `make check-doc-size-selftest` | CI gate (in `make ci` and hosted CI): recall test for the above over throwaway git trees, 20 cases, each asserting the exit code and the reason. |
+| `make check-doc-size` | CI gate (in `make ci` and hosted CI): every `docs/**/*.md` git does not ignore (`.md` in any case) is at most 40 KiB. It fails naming each doc over the cap, a stale temporary exception and any doc carrying a line-leading `size-exempt:` marker, after any Markdown leader; no doc exempts itself. The one temporary exception, `docs/METRICS_DB.md`, fails if it grows past its recorded size and once its split lands. Exit 2 when it cannot measure. One producer: `scripts/lib/debt_report.py`. Do not raise the cap; split the doc. |
+| `make check-doc-size-selftest` | CI gate (in `make ci` and hosted CI): recall test for the above over throwaway git trees, 29 cases, each asserting the exit code and the reason. |
 | `make kv-update-census` | Advisory (non-failing): the KV structural figures, all derived from the tree on every run — the `KvStorage` variant shapes and how many carry the two store slots and `max_seq` one update body can serve; every `match` over `KvStorage` or `KvQuant` naming at least half the enum's variants, per file, with the count and the sub-count that force a touch (no catch-all arm); every `update_`-prefixed fn of the update files (`crates/rmlx-kv-quant/src/kvcache/update*.rs`) with the file it sits in and the lines its body holds — the prefix is the whole rule, and `debt-report --matched-lines update-bodies` reads the same population through the same fn scanner (`scripts/lib/debt_report.py`), so the two figures cannot drift. Exits 2 with `unavailable: <reason>` rather than print a `0` for a tree it could not read. |
 | `make kv-update-census-selftest` | CI gate (in `make ci`): recall test for the above over planted trees, 39 cases, each asserting the exit code and the figure or reason — a site in a file the producer was never told about, a collapsed site, a catch-all arm, a match under the bar, a `match` inside a comment and inside a string literal, a variant that grows a state field, a bodiless declaration, a body moved into a codec family's own update file, and every way the tree can be unmeasurable. The derived bar is read with no `--threshold`: it must be half the enum, and a fifth variant moves it and drops a two-variant site with it, so replacing the derivation with a constant turns four cases red. A wide `match` planted in a `*_tests.rs` file is counted only under `--include-tests`, so disabling the test-file exclusion turns one case red. |
 | `make check-eval-lock` | CI gate (in `make ci`): every MLX eval FFI call is made under the process-wide evaluation lock (25-symbol reach-set). |
@@ -418,6 +422,7 @@ Standard sub-tree:
   logs/                 per-run JSON logs (rotated by total-size cap)
   metrics/
     runs.db             SQLite metrics DB (source of truth)
+    baseline.csv        one row per `rmlx baseline` run
     backups/            `rmlx metrics backup` snapshots
     buffer/pending/     ingest queue
     buffer/failed/      records a replay rejected
@@ -477,9 +482,11 @@ speed, KV-cache size, memory residency, smoke-probe pass/fail) in
   <path>` ingests and deletes it. Every backend emits that shape.
 - **`BENCHMARK_CHAMPIONS.md`** is generated by `make metrics-export`, is
   git-ignored and is never hand-edited.
+- **Prompts** are owned by `prompts/*.json`, content-addressed.
 - `rmlx metrics …` targets another DB with `--db <path>` or `RMLX_METRICS_DB`.
 
-A new table is a new migration. Never write the DB from non-Rust code.
+Do not add tables, hand-edit `BENCHMARK_CHAMPIONS.md`, or write directly to the
+DB from non-Rust code.
 
 ## Regression-bench discipline (hard rule)
 
@@ -505,9 +512,13 @@ baseline calls per model (Bonsai, Gemma4-e4b, Qwen3.6). It prints decode-only
 TPS, appends one CSV row per model to `<RMLX_HOME>/bench/perf_canary.csv` and
 records one further run in `runs.db`. The anchors in `docs/PERF_BASELINE.md`
 are at the bf16 `auto` default (Bonsai ~142, Gemma4-e4b ~80, Qwen3.6 ~101
-TPS). For automated gates use `make canary-gate SHA=<sha>` against `runs.db`,
-or `scripts/regression_gate.sh <model> <baseline_tps> <baseline_stddev>`:
-exit 125 = `git bisect skip`, exit 1 = regression. Two `Cargo.toml` perf profiles are
+TPS). Its limit: the `canary` target deletes every `/tmp/rmlx.*.claim` file
+before it runs, which bypasses the claim (hard rule 8); check for another MLX
+process first. For automated gates use `make canary-gate SHA=<sha>` against
+`runs.db`, or `scripts/regression_gate.sh <model> <baseline_tps>
+<baseline_stddev>`: exit 125 = `git bisect skip`, exit 1 = regression.
+`canary-gate` exits 0 when the SHA has no rows, so a clean exit does not prove
+the SHA was measured. Two `Cargo.toml` perf profiles are
 in play: `release-perf` (`debug-assertions=false`, `overflow-checks=false`,
 stripped debug, `panic=unwind` kept for `MetalClaim::Drop` RAII — see Hard
 rule 9) is the canary / bench profile and the profile of `make ci-perf`'s

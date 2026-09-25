@@ -1330,7 +1330,7 @@ change to what `bests` publishes, such as a §4.1 bounds change.
 2. **Path**: `<RMLX_HOME>/metrics/runs.db`, git-ignored (§2). Back up before
    bulk operations.
 3. **Tables**: `prompts`, `observations` and `events`, the `bests` view, and
-   `schema_meta` (§3). A new table is a new migration and a §3 section.
+   `schema_meta` (§3). Do not add tables.
 4. **`observations` is the ground truth**: every measurement, append-only.
    `bests` derives the champion per cell. No triggers, no UPSERT.
 5. **One row per measured (cell, metric) per run.** A metric the run did not
