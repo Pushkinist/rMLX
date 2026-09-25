@@ -16,10 +16,9 @@ row is worth recording, and it is right to be absolute. This gate answers what
 byte equality cannot: whether a difference is a near-tie the arithmetic
 permits or a defect in the round loop.
 
-The constants below are set against measured populations. Each constant's doc
-comment in the test file holds the readings that set it.
-`scripts/spec_broken_engine.sh` applies each deliberately broken engine by
-name, so the readings can be taken again.
+The thresholds below are set from runs of the gate against the shipped
+engine and against deliberately broken ones. `scripts/spec_broken_engine.sh`
+applies each broken engine by name; take the readings with it.
 
 ## What it runs
 
@@ -37,7 +36,8 @@ Each pair runs every prompt in `PROMPTS`:
 
 Both halves resolve by slug from `RMLX_O_MODELS_ROOT`, so every pair runs
 under `make gpu-test` wherever its snapshots are. `RMLX_KV_TEST_MODEL`
-overrides the verifier. `RMLX_DRAFT_TEST_MODEL` overrides a drafter only where
+overrides the verifier only when it names an architecture the pair covers.
+`RMLX_DRAFT_TEST_MODEL` overrides a drafter only where
 the models root does not hold its slug. One variable cannot name several
 drafters, which is why the slug outranks it.
 
