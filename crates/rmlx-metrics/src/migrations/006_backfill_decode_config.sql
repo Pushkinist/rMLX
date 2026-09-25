@@ -3,11 +3,9 @@
 -- Migration 005 added the column and left every existing row NULL, which is the
 -- value ordinary decode carries — so a speculative row from before the column
 -- kept sharing a cell with the plain row it should be ranked apart from, and
--- kept winning it. On `gemma-4-e4b-it-mxfp8 / none / 16384` that is a drafter's
--- 160.32 tok/s published as the model's decode throughput against the 83.70 a
--- request without one gets, with nothing in the row to say which it was.
+-- kept winning it, with no column in the row to say which it was.
 --
--- Except there is: the bench scripts have recorded `draft_kind=` and
+-- The notes say it: the bench scripts have recorded `draft_kind=` and
 -- `block_size=` in `notes` since long before there was a column for them. This
 -- migration reads that back. **It writes no measurement.** `decode_config` is a
 -- classification of a row, derived from that row's own fields, into a column

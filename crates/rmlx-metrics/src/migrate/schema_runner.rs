@@ -53,7 +53,7 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
             }
             _ => {}
         }
-        // Mirror schema_meta.schema_version in the SQLite header. Last inside
+        // Record the applied migration in the SQLite header. Last inside
         // the transaction: the version is what says the hook above ran.
         tx.execute_batch(&format!("PRAGMA user_version = {target_version};"))?;
         tx.commit()?;

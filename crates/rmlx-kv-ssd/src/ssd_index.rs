@@ -26,7 +26,7 @@
 //! )
 //!
 //! schema_version (
-//! version INTEGER PRIMARY KEY NOT NULL -- 3
+//! version INTEGER PRIMARY KEY NOT NULL -- SCHEMA_VERSION
 //! )
 //!
 //! INDEX kv_blocks_last_used ON kv_blocks (last_used) -- LRU eviction order

@@ -5,11 +5,9 @@
 -- A speculative-decode arm and a plain-decode arm of the same model at the
 -- same quant and prompt therefore land in one partition, and the view's rule
 -- — largest `higher_better` value wins — publishes the drafter's rate as that
--- model's champion decode throughput. On gemma-4-e2b-it-mxfp8 that is 276
--- tok/s standing in for the 142 a request without a drafter gets. Neither
--- number is wrong; they are answers to different questions, and ranking them
--- against each other is a category error the bound in
--- docs/METRICS_SCHEMA.md §4.1 cannot see.
+-- model's champion decode throughput. Neither rate is wrong; they are answers
+-- to different questions, and ranking them against each other is a category
+-- error the bound in docs/METRICS_SCHEMA.md §4.1 cannot see.
 --
 -- `decode_config` names the non-default engine configuration: NULL (or absent)
 -- is every setting at its default, a speculative arm records its drafter and
