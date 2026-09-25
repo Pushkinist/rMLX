@@ -13,7 +13,7 @@
 //! ([`planar_quantize_v4_gpu`](crate::planarquant_msl::planar_quantize_v4_gpu)
 //! / [`planar_dequantize_v4_gpu`](crate::planarquant_msl::planar_dequantize_v4_gpu))
 //! — PlanarQuant operates on flat `[B, kv_h, S, D]` and is axis-agnostic; only
-//! the dispatch side (K vs V) differs. See `docs/KV_QUANT.md` §PlanarK.
+//! the dispatch side (K vs V) differs. See `docs/KV_FUSED_KERNELS.md` §PlanarK.
 #![allow(clippy::too_many_lines)]
 
 use rmlx_core::error::Result;

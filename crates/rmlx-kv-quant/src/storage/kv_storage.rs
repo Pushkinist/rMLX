@@ -384,7 +384,7 @@ pub enum KvStorage {
     ///
     /// Decode reads the packed K store directly via the rotor flash-decode MSL
     /// kernel when the store carries no QJL sideband; a QJL store keeps the CPU
-    /// dequant path. See `docs/KV_QUANT.md` § `rotor_flash_decode`.
+    /// dequant path. See `docs/KV_FUSED_KERNELS.md` § `rotor_flash_decode`.
     ///
     /// Layout tag: [`ROTOR_K_ONLY_3_LAYOUT_TAG`] or
     /// [`ROTOR_K_ONLY_3_QJL_LAYOUT_TAG`].
@@ -587,7 +587,7 @@ impl KvStorage {
             },
             // TurboSym3 — symmetric 3-bit Lloyd-Max K+V. Never routes through
             // the paged path: PagedKStorage is q8-only and there is no paged
-            // TurboQuant-K3 variant. Deviation documented in docs/KV_QUANT.md.
+            // TurboQuant-K3 variant. Deviation documented in docs/KV_CODECS.md.
             KvQuant::TurboSym3 => Self::TurboSym3 {
                 k: None,
                 v: None,
@@ -596,7 +596,7 @@ impl KvStorage {
             // TurboSym4 — symmetric 4-bit Lloyd-Max K+V. Never routes through
             // the paged path: PagedKStorage is q8-only and adding a TurboQuant-K
             // paged variant is out of scope; deviation documented in
-            // docs/KV_QUANT.md.
+            // docs/KV_CODECS.md.
             KvQuant::TurboSym4 => Self::TurboSym4 {
                 k: None,
                 v: None,
@@ -604,7 +604,7 @@ impl KvStorage {
             },
             // PlanarK — K-axis PlanarQuant 4-bit; V is bf16 on the parent KvCache.
             // Never routes through paged: PagedKStorage is q8-only and there is no
-            // paged PlanarQuant-K variant; deviation documented in docs/KV_QUANT.md.
+            // paged PlanarQuant-K variant; deviation documented in docs/KV_CODECS.md.
             KvQuant::PlanarK => Self::PlanarK { k: None, max_seq },
             // K8VTurbo2 — same layout as K8V4 but QuantV bits=2.
             KvQuant::K8VTurbo2 => Self::K8VTurbo2 {

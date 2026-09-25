@@ -122,7 +122,7 @@ fn v2_pack_unpack_round_trip() {
 ///
 /// Empirical floor: rMLX naïve 2-bit Lloyd-Max on a TEST_SEED-pinned fixture.
 /// Threshold is the measured value minus 0.001 (measured-minus-0.001 policy).
-/// The gap-vs-mtq is documented in `docs/KV_QUANT.md`: mtq's `turbo2` ships
+/// The gap-vs-mtq is documented in `docs/KV_CODECS.md`: mtq's `turbo2` ships
 /// with outlier-mask (cosine 0.9420 on their GPU bench) — rMLX ships naïve so
 /// a drop is expected. Outlier-mask is deferred pending calibration loader.
 ///
@@ -156,11 +156,11 @@ fn tq2_cosine_naive_baseline_floor() {
     // not apples-to-apples; it captures only the intrinsic Lloyd-Max
     // quantization noise, not the heavy-tail residual that outlier-mask handles
     // on real V tensors. The outlier-mask path to close the production PPL gap
-    // is deferred pending the calibration loader. See `docs/KV_QUANT.md` § "KvStorage::K8VTurbo2".
+    // is deferred pending the calibration loader. See `docs/KV_CODECS.md` § "KvStorage::K8VTurbo2".
     assert!(
         stats.mean >= 0.956,
         "K8VTurbo2 naive 2-bit cosine mean {:.6} fell below empirical floor 0.956 \
-         (n_rows={}); gap-vs-mtq + outlier-mask plan in docs/KV_QUANT.md",
+         (n_rows={}); gap-vs-mtq + outlier-mask plan in docs/KV_CODECS.md",
         stats.mean,
         stats.n_rows
     );

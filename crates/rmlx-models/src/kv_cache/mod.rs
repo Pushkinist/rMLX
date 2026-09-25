@@ -34,10 +34,10 @@
 //! promotion used to fire under `None` too, which made `none` a bf16/K8V8
 //! mixture measuring up to 1.16× true bf16 (gemma-4-26b at 32k). Historical
 //! "vs `none`" numbers recorded before that fix carry a per-arch correction
-//! factor; see `docs/KV_QUANT.md` §Layer-adaptive overrides.
+//! factor; see `docs/KV_LAYER_POLICY.md` §Layer-adaptive overrides.
 //!
 //! `KvQuant::K8V4` is the recorded baseline for Qwen MoE PPL recovery
-//! (`docs/KV_QUANT.md` §"Qwen MoE note"). It is opt-in, never automatic:
+//! (`docs/KV_CODECS.md` §"Qwen MoE note"). It is opt-in, never automatic:
 //! - K uses affine q8_0 (symmetric 8-bit, `group_size=128`).
 //! - V uses TurboQuant 4-bit Lloyd-Max N(0,1) codebook.
 //! - The split is per-axis (K vs V), NOT per layer-index — the Python fork
@@ -93,7 +93,7 @@ mod tests;
 /// are evidence for *how many* layers the exemption should span, not for what
 /// an 8-bit boundary layer costs in quality. The counts are carried over
 /// unchanged; the quality of the in-family 8-bit target has not been re-derived
-/// to that standard. See `docs/KV_QUANT.md` §Layer-adaptive overrides.
+/// to that standard. See `docs/KV_LAYER_POLICY.md` §Layer-adaptive overrides.
 ///
 /// The value itself lives in `rmlx_core::kv_boundary` so `rmlx-metrics` can
 /// recognise a `decode_config` that spells it out without a second copy; the
@@ -185,7 +185,7 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = rmlx_core::kv_boundary::DEFAULT_BOUNDAR
 /// checkpoints whose `num_kv_shared_layers` is 0 — every layer owns a cache
 /// there while `shares_kv` is still true for the stack, which is exactly the
 /// case the argument above exists for. Per-arch counts and the measured byte
-/// ratios are in `docs/KV_QUANT.md` §Layer-adaptive overrides.
+/// ratios are in `docs/KV_LAYER_POLICY.md` §Layer-adaptive overrides.
 ///
 /// When `head_n == 0` and `tail_n == 0`, `base_quant` is always returned.
 pub fn kv_quant_for_layer(
@@ -275,7 +275,7 @@ pub fn kv_quant_for_layer(
 /// `RotorKOnly{3,4}`) are at 16.25, already above bf16, so their boundary
 /// layers are byte-**favourable** — measured at −1.3% of `rotor3_sym`'s cache
 /// at 4k and −0.6% at 32k. Neither group is diverted by the arm below — they do
-/// not mirror both axes — and the trade is recorded in `docs/KV_QUANT.md`
+/// not mirror both axes — and the trade is recorded in `docs/KV_LAYER_POLICY.md`
 /// §Layer-adaptive overrides.
 ///
 /// How many layers this reaches is a property of the model, not of the policy:

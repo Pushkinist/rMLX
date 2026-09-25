@@ -873,7 +873,7 @@ enum Disposition {
     /// token ids measure identical (4 cells, 2 architectures); decode
     /// throughput against it is INCONCLUSIVE at all five recorded ABBA cells.
     /// An earlier draft called this class dominated, on the strength of a
-    /// per-layer dispatch cost that `docs/KV_QUANT.md` § "`--kv-quant none` is
+    /// per-layer dispatch cost that `docs/KV_LAYER_POLICY.md` § "`--kv-quant none` is
     /// a bf16 control" records as no longer reproducing. There is no axis left
     /// with a measured difference in either direction.
     InertMirrorFed,
@@ -1211,7 +1211,7 @@ fn rot_k_and_mixed_accept_the_same_v_side() {
 
 // ── The disposition manifest the user-facing surfaces are checked against ────
 
-/// The token a user-facing surface (CLI help, `docs/KV_QUANT.md`) can be
+/// The token a user-facing surface (CLI help, the INERT banners) can be
 /// searched for to find this codec.
 ///
 /// For a non-parametric codec that is its `Display` form. For the four
@@ -1256,7 +1256,8 @@ fn surface_stem(q: KvQuant) -> String {
 
 /// Print one line per codec, classified by the runtime's own predicates, for
 /// `scripts/check_kv_codec_disposition.sh` to check the CLI help and
-/// `docs/KV_QUANT.md` against.
+/// the INERT banners in `docs/KV_CODECS.md` and `docs/KV_ROTATION_CODECS.md`
+/// against.
 ///
 /// The sweep is [`ALL_KV_QUANTS`], whose completeness
 /// `variant_index_has_one_arm_per_listed_codec` pins against the

@@ -352,7 +352,7 @@ memory conclusion is not — both families are under bf16, and the remaining gap
 between the whole-cache ratio and the ring rate is the boundary-layer `K8V8`
 promotion, not the codec. On Bonsai-8B that gap is 7.9% of
 the cache at 32k; on e2b it is zero, because `num_kv_shared_layers = 20` leaves
-no promoted layer that owns a cache. See `docs/KV_QUANT.md` §Layer-adaptive
+no promoted layer that owns a cache. See `docs/KV_LAYER_POLICY.md` §Layer-adaptive
 overrides.
 
 **`none` was not bf16 on Bonsai when these rows were recorded — read the ratios
@@ -361,7 +361,7 @@ to `K8V8` under every base mode, `KvQuant::None` included, so the `none`
 control on a 36-layer dense arch was a 26-bf16 / 10-K8V8 mixture. `None` is
 exempt from the promotion now, so a `none` row re-measured today is true bf16
 and needs no restatement; every row on this page predates that change. See
-`docs/KV_QUANT.md` §Layer-adaptive overrides for the mechanism and the
+`docs/KV_LAYER_POLICY.md` §Layer-adaptive overrides for the mechanism and the
 measured per-arch factors. The table below restates this one against true
 bf16. That denominator is
 derived, not separately measured, but it is checkable: at
@@ -1251,7 +1251,7 @@ matching '--ctk iso_k_*' selector) is rejected for Qwen3.5/3.6 MoE. Use
 iso3' / '--kv-quant iso4').
 ```
 
-Equivalent diagnostic emitted for `iso4_sym`, `k_iso3`, `k_iso4`. The codec smoke matrix MUST skip Qwen MoE rows for these four variants — see `docs/KV_QUANT.md` § "iso K-side variants" for the arch-guard spec.
+Equivalent diagnostic emitted for `iso4_sym`, `k_iso3`, `k_iso4`. The codec smoke matrix MUST skip Qwen MoE rows for these four variants — see `docs/KV_ROTATION_CODECS.md` § "iso K-side variants" for the arch-guard spec.
 
 | variant | model | mean decode_tps (n=3) |
 |---|---|---:|
@@ -1273,7 +1273,7 @@ Equivalent diagnostic emitted for `iso4_sym`, `k_iso3`, `k_iso4`. The codec smok
 ## TurboSym3 (turbo-3 K + turbo-3 V) decode-TPS anchor (2026-05-31)
 
 **Binary**: `target/release/rmlx` (debug-assertions on — ship-quality builds use release-perf, these numbers are the ceiling, not the floor).
-**Codec**: TurboSym3 (3-bit K + 3-bit V, symmetric). Both K and V sides use the same Lloyd-Max 3-bit codebook path. **No rotation is applied on either axis** — the family's name implies one the encoder does not have; see docs/KV_QUANT.md, "The turbo family's missing rotation".
+**Codec**: TurboSym3 (3-bit K + 3-bit V, symmetric). Both K and V sides use the same Lloyd-Max 3-bit codebook path. **No rotation is applied on either axis** — the family's name implies one the encoder does not have; see docs/KV_CODEC_FIDELITY.md, "The turbo family's missing rotation".
 **Shape**: 2-token prompt ("Hello world") + `--max-tokens 100`. Single-MLX preflight between each run. Hardware: M5 Max.
 **Protocol**: 3 measured runs per model. Mean decode TPS reported. No warmup run (short prompt; all runs included).
 
@@ -1313,7 +1313,7 @@ for Qwen3.5/3.6 MoE. Use '--kv-quant k8v8' (K stays 8-bit) or a V-only rotor
 variant ('--kv-quant rotor3' / '--kv-quant rotor4').
 ```
 
-Identical diagnostic for all four variants with variant name substituted. The codec smoke matrix MUST skip Qwen MoE rows for these four variants — see `docs/KV_QUANT.md` § "rotor K-side variants" for the arch-guard spec.
+Identical diagnostic for all four variants with variant name substituted. The codec smoke matrix MUST skip Qwen MoE rows for these four variants — see `docs/KV_ROTATION_CODECS.md` § "rotor K-side variants" for the arch-guard spec.
 
 | variant | model | mean decode_tps (n=3) |
 |---|---|---:|

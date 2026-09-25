@@ -356,7 +356,7 @@ fn run_one(
 /// false: `update_and_sdpa_shared_source` reaches the TurboFlash, fused-QK,
 /// planar and rotor arms exactly as `update_and_sdpa` does, and a producer that
 /// runs a fused arm hands consumers `SharedKv::Store` rather than materialising
-/// bf16 (see `docs/KV_QUANT.md`). The measured reason per `Dormant` cell:
+/// bf16 (see `docs/KV_FUSED_KERNELS.md`). The measured reason per `Dormant` cell:
 ///
 /// * **Gemma4 + Turbo** — TurboFlash requires `head_dim ∈ {128, 256}`; Gemma4's
 ///   global layers are `head_dim=512`, so the kernel's own shape gate rejects

@@ -471,7 +471,7 @@ check-kv-layer-quants: ## CI gate: fail if kv_quant_for_layer is called outside 
 check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or the INERT banner docs contradict a codec's runtime disposition
 	@bash scripts/check_kv_codec_disposition.sh
 
-check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — 22 synthetic scan roots, each asserting which rule fired
+check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — 23 synthetic scan roots, each asserting which rule fired
 	@bash scripts/check_kv_codec_disposition_fixtures.sh
 
 check-kv-byte-model-parity: ## CI gate: fail if scripts/perf_ceiling.py's KV byte model disagrees with the engine's

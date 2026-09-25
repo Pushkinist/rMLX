@@ -1099,7 +1099,8 @@ Grep before touching any of it.
   `K8VTURBO*_TCQ`). A layout tag is written into the SSD index.
 * **The `KvQuant` spellings, their `Display` and `FromStr`**, and the CLI names
   built from them. `make check-kv-codec-disposition` reads the help text and
-  the `docs/KV_QUANT.md` banners against the runtime disposition.
+  the INERT banners in `docs/KV_CODECS.md` and
+  `docs/KV_ROTATION_CODECS.md` against the runtime disposition.
 * **The `.metal` kernels** and their `probes/kernels.manifest` entries.
   `make check-metal-compiles` fails on a `.metal` file its manifest does not
   name.
@@ -1122,7 +1123,7 @@ Grep before touching any of it.
   emits on `rmlx_kv_quant::warm_ttft` with `path = "warm_ttft_bypass"`. Three
   readers name that string: `crates/rmlx-cli/tests/e2e/runner.rs`,
   `crates/rmlx-models/tests/niah_long_context.rs` and
-  [`KV_QUANT.md`](KV_QUANT.md). The override travels with the body, so moving
+  [`KV_FUSED_KERNELS.md`](KV_FUSED_KERNELS.md). The override travels with the body, so moving
   it changes nothing — dropping or renaming it breaks all three.
 * **The `kv_bytes` request-boundary event.** `scripts/bench/tri_engine_summarize.py`
   reads it out of a run's stderr; the whole cross-engine comparison rests on

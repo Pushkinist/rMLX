@@ -1294,7 +1294,7 @@ with the Metal function signature and buffer declarations automatically:
   `device` binding. See `rmlx_kv_quant::flash_decode_common::pad_norms_to_device_floor`
   (floor 16, 2× the measured 8-element trip point for margin) — the general
   fix shared by `iso_flash_decode_symv_sdpa` and `rotor_flash_decode_symv_sdpa`,
-  documented per-codec in `docs/KV_QUANT.md`.
+  documented per-codec in `docs/KV_FUSED_KERNELS.md`.
 - Output buffers: `device T* <name>`.
 - Built-ins: `thread_position_in_grid` (uint3),
   `threadgroup_position_in_grid` (uint3),
@@ -1571,5 +1571,5 @@ body.
   families.
 - `docs/WEIGHT_QUANTS.md` — weight quantization formats and how
   `quantized_matmul` / `dequantize` / `gather_qmm` interact with them.
-- `docs/KV_QUANT.md` — KV quantization format details; how the MSL kernels
+- `docs/KV_CODECS.md` — KV quantization format details; how the MSL kernels
   in `rmlx-kv-quant/src/*_msl.rs` map to each codec.

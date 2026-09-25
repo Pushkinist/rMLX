@@ -270,7 +270,7 @@ declares no `rope_scaling` at all. The resulting window is the capacity
   model-dtype discipline). Some snapshots ship these at fp16 (e.g. Bonsai); a
   bf16 activation mixed with an fp16 param promotes to f32 and propagates through
   Q/K/V, attention, and the `--kv-quant none` KV cache (doubling its residency).
-  Casting at load keeps K/V bf16. See `docs/KV_QUANT.md` "Qwen3 dense
+  Casting at load keeps K/V bf16. See `docs/KV_LAYER_POLICY.md` "Qwen3 dense
   KV is bf16 at `--kv-quant none`".
 
 ### Known limitations
@@ -314,7 +314,7 @@ so a dense snapshot is labelled `Qwen3_5ForConditionalGeneration` in tracing,
 bench headers and metrics rows rather than being reported as MoE. `load_model`
 warns with `declared_arch` + `resolved_arch` when they differ. Safety
 predicates — the Qwen-MoE K-side codec guard above all — must use the resolved
-class; see `docs/KV_QUANT.md` § "What the guard keys off".
+class; see `docs/KV_LAYER_POLICY.md` § "What the guard keys off".
 
 ### Config schema
 
@@ -864,7 +864,7 @@ constants that could promote the stream — the embed-scale, the per-layer-input
 scales, and the fused GeGLU / PLI-GeGLU activations (whose `gelu_tanh` constants
 are f32) — adopt / restore the operand dtype, mirroring mlx-lm's weak-typed
 Python floats. A unit-level dtype-lock test guards this against regression; see
-docs/KV_QUANT.md "Gemma4 global KV is bf16 at `--kv-quant none`".
+docs/KV_LAYER_POLICY.md "Gemma4 global KV is bf16 at `--kv-quant none`".
 
 **Image-prompt placement (inside the user turn).** The per-image block
 (`<boi>` + N × `<image_soft_token>` + `<eoi>`) is spliced **inside** the user

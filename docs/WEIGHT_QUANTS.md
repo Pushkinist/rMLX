@@ -327,7 +327,7 @@ axis, and the V-side implementation is the expensive one — it needs an explici
 inverse transform after the SV accumulation, across the P2 kernel, four dequant
 kernels and both fused-QK kernels — the value and the cost are inverted with
 respect to each other. Full account, including the scope limits:
-docs/KV_QUANT.md, "The turbo family's missing rotation — what it is worth, and
+docs/KV_CODEC_FIDELITY.md, "The turbo family's missing rotation — what it is worth, and
 where".
 
 ### 5.1 Codebook

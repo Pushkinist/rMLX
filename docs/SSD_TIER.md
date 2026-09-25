@@ -822,7 +822,7 @@ exceeded), the spill hook receives the evicted entry. The spiller:
    / `k_rotor4`) this is also the point where a **ring-only decode tail** is
    reconciled: the fused decode path keeps the CPU `blocks` frozen at the
    prefill prefix while the GPU ring carries the decode tail (see
-   `docs/KV_QUANT.md` § "The caller of the encode chooses the ring feed (`RingFeed`)"), so the clone materialises the tail
+   `docs/KV_FUSED_KERNELS.md` § "The caller of the encode chooses the ring feed (`RingFeed`)"), so the clone materialises the tail
    back into complete CPU blocks from the ring. `block_io::write_quant_rotor_k{3,4}`
    serialize `blocks`, so without this the spill would persist a store truncated
    at the last CPU block. The serializer additionally refuses to write any rotor
@@ -1321,7 +1321,7 @@ Adding a new codec MUST:
 
 - `docs/KV_CACHE.md` — KV quantization variants and storage types (K8V4, K8V8,
   Planar, Mixed, RotK, Paged).
-- `docs/KV_QUANT.md` — per-quant codec details and byte sizes.
+- `docs/KV_CODECS.md` — per-quant codec details and byte sizes.
 - `docs/PROJECTS_CONFIG.md` — `projects.toml` reference (per-project budget
   overrides, precedence chain).
 - `docs/METRICS_DB.md` — metrics persistence; SSD-tier events land in the

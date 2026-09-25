@@ -344,7 +344,7 @@ fn run_head_budget(
         .map_or(0, Vec::len);
     // Schema label identifies the *concept* (per-(layer, head) cumulative mass
     // coverage); the K-norm² proxy lives behind this recipe arm. See
-    // `docs/KV_QUANT.md` "Sparse attention" for the gap discussion.
+    // `docs/KV_FUSED_KERNELS.md` "Sparse attention" for the gap discussion.
     let calibration = HeadBudgetCalibration::new(
         "softmax_mass".to_string(),
         prompt_set_sha256,
@@ -692,7 +692,7 @@ struct HeadBudgetMeasurement {
 /// Proxy method note: the K-norm² ranking is a well-known stand-in for softmax
 /// mass under randomly-projected queries (H2O, StreamingLLM). The production
 /// sparse-attn dispatch is HOLD, so the proxy vs true-softmax delta has no
-/// live operational impact — see KV_QUANT.md "Sparse attention".
+/// live operational impact — see KV_FUSED_KERNELS.md "Sparse attention".
 #[allow(
     clippy::indexing_slicing,
     reason = "bounds established by construction: row_off + head_dim is within the n_kv_heads * S_buf * head_dim slab; budgets indices match the table shape allocated above"

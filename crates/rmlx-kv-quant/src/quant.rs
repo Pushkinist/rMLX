@@ -123,7 +123,7 @@ pub enum KvQuant {
     /// **Arch guard (Contract A.y — mandatory)**: must NEVER run on Qwen MoE
     /// (`Qwen3_5MoeForConditionalGeneration`). Symmetric 3-bit K is the
     /// PPL-disaster path on Qwen MoE (7:1 GQA amplifies K-head error through
-    /// softmax; see the 218->8641 baseline in `docs/KV_QUANT.md`). The auto default
+    /// softmax; see the 218->8641 baseline in `docs/KV_LAYER_POLICY.md`). The auto default
     /// never returns `TurboSym3` for Qwen MoE; explicit `--kv-quant tsym3` on
     /// Qwen MoE is rejected at resolve-time via `QwenMoeTurboKRejected`.
     ///
@@ -172,7 +172,7 @@ pub enum KvQuant {
     /// `Qwen3_5MoeForConditionalGeneration` / `Qwen3VLMoeForConditionalGeneration`,
     /// and `cache_type::validate_resolved` rejects it. Opt-in only via
     /// `--kv-quant planar_k`. Requires `head_dim % 32 == 0`. MSL kernel is
-    /// shared with `Planar` (PlanarQuant is axis-agnostic). See `docs/KV_QUANT.md`.
+    /// shared with `Planar` (PlanarQuant is axis-agnostic). See `docs/KV_CODECS.md`.
     PlanarK,
     /// K = affine q8_0 (group_size=128), V = TurboQuant **2-bit**
     /// Lloyd-Max N(0,1) codebook (group=32).

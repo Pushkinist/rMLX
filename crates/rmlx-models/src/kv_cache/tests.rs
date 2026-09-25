@@ -428,7 +428,7 @@ mod tests {
     /// sequence position (block boundaries align with truncate targets).
     /// This is the same production path SWA-context-slide, speculative-decode
     /// rollback, and prompt-cache partial-prefix trim all drive — see
-    /// `docs/KV_QUANT.md` for the reachability audit per arch (Bonsai-8B
+    /// `docs/KV_STORE_TRUNCATION.md` for the reachability audit per arch (Bonsai-8B
     /// currently has no live serve trigger; Gemma4's prompt-cache `Partial`
     /// reuse policy does).
     #[test]
@@ -865,7 +865,7 @@ mod tests {
         /// is 12.125 bits per value, so the iso four pay a 1.32x byte
         /// regression for it; `SideStore::Rotor` is 16.25, above bf16, so the
         /// rotor four are neutral-to-favourable. Recorded in
-        /// `docs/KV_QUANT.md` §Layer-adaptive overrides.
+        /// `docs/KV_LAYER_POLICY.md` §Layer-adaptive overrides.
         const FALLBACK_BY_DESIGN: &[KvQuant] = &[
             KvQuant::Iso3Sym,
             KvQuant::Iso4Sym,

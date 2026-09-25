@@ -405,7 +405,7 @@ fn fwht_quantize_types_scales_like_mx_quantize() {
     assert!(
         max_err < 0.02,
         "bf16 scales moved the reconstruction to {max_err} (measured 0.0156 when \
-         this was written); the documented figure in docs/KV_QUANT.md \"moves the reconstruction by at \
+         this was written); the documented figure in docs/KV_CODECS.md \"moves the reconstruction by at \
          most 0.0156\" is stale or the codec changed"
     );
 

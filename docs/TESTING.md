@@ -2202,7 +2202,7 @@ cargo test -p rmlx-kv-quant --lib rotation_fidelity -- --nocapture
 
 Measured on `outlier_fixture()` — i.i.d. Gaussian with 4 of 128 channels at
 20x, modelling the persistent per-channel Key outliers the KV-quantization
-literature reports. Numbers and their derivation live in `docs/KV_QUANT.md`
+literature reports. Numbers and their derivation live in `docs/KV_CODEC_FIDELITY.md`
 § "Codec fidelity — measured".
 
 | Gate | Asserts |
@@ -2240,7 +2240,7 @@ cargo test -p rmlx-kv-quant --lib rate_distortion -- --nocapture
 Every scalar-codebook codec at every shipped bit width, encoded and decoded on
 an i.i.d. Gaussian fixture, reported as SQNR against the fixed-rate Lloyd-Max
 Gaussian anchor for that width and converted to wasted bits. The full table is
-in `docs/KV_QUANT.md` § "Codec fidelity — measured".
+in `docs/KV_CODEC_FIDELITY.md` § "Codec fidelity — measured".
 
 Two thresholds, both stated in bits:
 

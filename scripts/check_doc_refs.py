@@ -49,7 +49,8 @@ failure messages cite the doc and the phrase that states the figure
 doc the same way, or no gate sees a cut that deletes its figure.
 
 Readers of doc text that this script does not parse have their own gates:
-the INERT banners of docs/KV_QUANT.md (check_kv_codec_disposition.sh), the
+the INERT banners of docs/KV_CODECS.md and docs/KV_ROTATION_CODECS.md
+(check_kv_codec_disposition.sh), the
 `--kv-boundary-layers` rows of docs/CLI.md (check_kv_boundary_default_parity.sh),
 the generated docs/PUBLISHED_PROTOCOL.md (make check-published-table), and the
 `crates/...` citations in every doc (check_doc_source_citations.sh).

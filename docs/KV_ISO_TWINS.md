@@ -108,7 +108,7 @@ So: hard rule 10 is satisfied at both widths **on the shapes the gate accepts**;
 on any other shape the 4-bit width CPU-decodes the prefix every step today, and
 the collapse is what fixes it. The two proof models are both gate-accepted —
 Ternary-Bonsai-8B is `head_dim = 128` and `gemma-4-e2b` is `head_dim = 256`
-(`docs/KV_QUANT.md` § `iso_flash_decode`) — so **no served 4-bit cell in §6 is
+(`docs/KV_FUSED_KERNELS.md` § `iso_flash_decode`) — so **no served 4-bit cell in §6 is
 expected to move**, and a cell that does is a finding, not the intended change.
 
 `exit_prefill` is symmetric too: its `Iso3Sym`/`Iso4Sym` and
@@ -204,7 +204,7 @@ serves — `Device::Gpu`, non-fused. Nothing on the CPU route may move, which is
 why the CPU pins in §3 are held at both widths.
 
 The bound is documented and the 3-bit path is already held to it. From
-`docs/KV_QUANT.md`, on the 3-bit GPU dequant:
+`docs/KV_ROTATION_CODECS.md`, on the 3-bit GPU dequant:
 
 > Parity verified by `iso_v3_dequant_gpu_matches_dequant_cpu` and
 > `iso_k3_dequant_gpu_matches_dequant_cpu` in
@@ -228,7 +228,7 @@ The codec's own quality floors are unchanged by the collapse and are restated
 here only so the two kinds of bound are not confused: `iso3_cosine_gate` gates
 V-side cosine at mean 0.994 / min 0.993, `iso4_cosine_gate` at mean 0.998638 /
 min 0.998092, and the K-side floors are 0.97 for `iso_k_3` and 0.99 for
-`iso_k_4` (`docs/KV_QUANT.md`). Those are CPU-codec gates; they say nothing
+`iso_k_4` (`docs/KV_ROTATION_CODECS.md`). Those are CPU-codec gates; they say nothing
 about CPU-versus-GPU agreement, which is what §(b) is about.
 
 ## 3. The oracle

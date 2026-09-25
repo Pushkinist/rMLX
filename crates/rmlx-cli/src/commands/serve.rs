@@ -286,7 +286,7 @@ impl std::fmt::Display for PlanarFlashDecodeMode {
 ///   online per-tile softmax sums in a different order. At the dtype the
 ///   dispatcher returns, that survives in 4 of 6 measured cells and vanishes
 ///   in 2, so a one-cell check will confirm byte-identity about a third of the
-///   time. See `docs/KV_QUANT.md` § "Numerical relationship to the split
+///   time. See `docs/KV_FUSED_KERNELS.md` § "Numerical relationship to the split
 ///   chain" for the cell-by-cell table.
 fn resolve_planar_flash_decode(mode: PlanarFlashDecodeMode, env: &DispatchPolicy) -> bool {
     let resolved_on = match mode {

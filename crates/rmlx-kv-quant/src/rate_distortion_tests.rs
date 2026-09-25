@@ -153,7 +153,7 @@ fn ring_bytes(
 /// the GPU ring those decode from does not carry the quaternion — it is the
 /// constant `FIXED_QUAT` replicated per group, not data — and it holds the
 /// scale and norm planes at the stored sideband dtype, so they sit at
-/// ≈12.125 bits/value. See `docs/KV_QUANT.md` § iso3 "Memory truth". Quoting
+/// ≈12.125 bits/value. See `docs/KV_ROTATION_CODECS.md` § iso3 "Memory truth". Quoting
 /// 48.25 against `rotor`'s ring rate without that distinction inverts the
 /// comparison: on the ring path iso is much the cheaper of the two.
 ///
@@ -544,7 +544,7 @@ fn planar_widths_are_byte_identical_and_the_others_pay_for_their_bits() {
     assert!(
         three_db > four_db,
         "planar4 {four_db:.2} dB now beats planar3 {three_db:.2} dB at the same rate. The \
-         documented dominance has flipped — update docs/KV_QUANT.md \"Each family therefore \
+         documented dominance has flipped — update docs/KV_CODEC_FIDELITY.md \"Each family therefore \
          has one strictly dominated width\" and this test rather than deleting it"
     );
 
@@ -634,7 +634,7 @@ fn trellis_coded_quantization_claws_back_nothing() {
                 gain.abs() < 1e-3,
                 "the trellis moved distortion by {gain:+.4} dB at bits={bits} on {label}. \
                  It is documented as degenerate and measured at 0.000 dB — if it now does \
-                 something, update docs/KV_QUANT.md \"Measured claw-back: 0.000 dB\" and re-point \
+                 something, update docs/KV_CODECS.md \"Measured claw-back: 0.000 dB\" and re-point \
                  this test"
             );
         }

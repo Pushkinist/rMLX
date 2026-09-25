@@ -799,7 +799,7 @@ tags = ["run2c", "gemma4", "text"]
 # only full-attention layers are quantized. K8V4 at head_dim=256 needs the
 # TurboFlash kernel — force it ON explicitly (`--turbo-flash on`) so the cell
 # is deterministic across host families (auto resolves ON on Apple10+ but we
-# do not depend on the host family here). niah@8k + cosine≥0.99 per docs/KV_QUANT.md.
+# do not depend on the host family here). niah@8k + cosine≥0.99 per docs/KV_CODECS.md.
 
 # --- K8V8 ---
 [[case]]

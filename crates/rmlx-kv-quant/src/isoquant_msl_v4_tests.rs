@@ -220,7 +220,7 @@ fn assert_dequant_parity(cpu: &[f32], gpu: &[f32], axis: &str) {
         max_abs <= 1e-6_f32,
         "{axis} dequant_gpu strict bound broken: max|cpu-gpu| = {max_abs}; expected ≤ 1e-6. \
          If the new observation is intentional, update \
-         docs/KV_QUANT.md \"strict max|cpu-gpu| ≤ 1e-6\" to the new bound."
+         docs/KV_ROTATION_CODECS.md \"strict max|cpu-gpu| ≤ 1e-6\" to the new bound."
     );
 }
 

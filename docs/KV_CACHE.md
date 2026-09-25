@@ -680,7 +680,7 @@ check, no `astype` on the already-bf16 hot path) so it is pure insurance. It is
 The bytes-per-element detector (an f32 input must store as 2 B/elem) lives in
 `resident_bytes_tests.rs` and runs under `make model-check` (now `-p
 rmlx-kv-quant`), so a future arch leak trips CI. Full reference:
-`docs/KV_QUANT.md` §`KvStorage::None`.
+`docs/KV_CODECS.md` §`KvStorage::None`.
 
 ### 5.7.5 `exit_prefill` runs on a worker thread — MLX stream affinity
 
@@ -1022,7 +1022,7 @@ the shadow so the legacy SDPA fallback remains the safety net. Reset on
 buffer reallocation — only the `filled` cursor moves; rotating caches
 never allocate a shadow, gated by `storage_max_seq_for_fused_qk`).
 Per-codec shape details and the dispatch wire-in: see
-`docs/KV_QUANT.md` § "Fused-QK head-major K storage".
+`docs/KV_FUSED_KERNELS.md` § "Fused-QK head-major K storage".
 
 **Per-step cost framing.** The shadow stores data head-major, but the
 kernel input is built by slicing `[B, kv_h, max_seq, payload]` down to

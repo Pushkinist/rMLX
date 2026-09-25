@@ -935,7 +935,7 @@ pub(crate) fn rotor_k_encode_at(
 /// gives the same *expected* score as the Python score-time formula, with
 /// variance shrinking as `O(||r||^2 / m)`. Cosine on the final SDPA output
 /// (output-logit-lift on real models) is the meaningful gate; documented in
-/// `docs/KV_QUANT.md`.
+/// `docs/KV_ROTATION_CODECS.md`.
 ///
 /// # Layout contract
 ///

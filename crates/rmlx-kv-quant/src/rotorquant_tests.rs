@@ -410,7 +410,7 @@ fn l2_normalize_rows(buf: &mut [f32], d: usize) {
 /// Note on "lift": on unit-normalized LCG fixtures the rotor3 codec is
 /// already near-unbiased (off-bias ≈ 1e-4), so a per-test `|bias_on| <
 /// |bias_off|` gate is statistically noisy. The real-model output-logit
-/// cosine lift is documented in `docs/KV_QUANT.md`.
+/// cosine lift is documented in `docs/KV_ROTATION_CODECS.md`.
 #[test]
 fn qjl_correction_score_estimator_unbiased_rotor3() {
     let head_dim = 128_usize;

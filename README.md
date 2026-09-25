@@ -305,7 +305,7 @@ See [`docs/CLI.md`](docs/CLI.md) for the full subcommand / flag reference.
 | [`docs/SERVER.md`](docs/SERVER.md) | HTTP server: OpenAI / Anthropic compat, routes, tool calling |
 | [`docs/MODELS.md`](docs/MODELS.md) | Per-architecture model reference |
 | [`docs/WEIGHT_QUANTS.md`](docs/WEIGHT_QUANTS.md) | Weight quantization formats |
-| [`docs/KV_QUANT.md`](docs/KV_QUANT.md) | KV-cache quantization variants |
+| [`docs/KV_QUANT.md`](docs/KV_QUANT.md) | KV-cache quantization contract; links the per-topic KV docs |
 | [`docs/KV_CACHE.md`](docs/KV_CACHE.md) | KV cache architecture |
 | [`docs/SPECULATIVE.md`](docs/SPECULATIVE.md) | Speculative decoding (MTP / DFlash / Eagle3) |
 | [`docs/PROMPT_CACHE.md`](docs/PROMPT_CACHE.md) | Prompt + automatic prefix caching |

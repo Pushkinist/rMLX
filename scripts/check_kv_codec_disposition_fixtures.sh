@@ -9,8 +9,10 @@
 #
 # HOW
 #   `scripts/fixtures/kv_codec_disposition/base/` is a synthetic scan root — a
-#   stand-in `main.rs`, a stand-in `KV_QUANT.md`, and a pre-captured
-#   `manifest.raw` — that the gate passes clean. Each case copies it and makes
+#   stand-in `main.rs`, stand-ins for the two docs the gate lists
+#   (`KV_CODECS.md`, `KV_ROTATION_CODECS.md`) and for one doc it does not
+#   (`KV_QUANT.md`), and a pre-captured `manifest.raw` — that the gate passes
+#   clean. Each case copies it and makes
 #   exactly ONE edit, so the rule that fires is attributable to that edit and
 #   nothing else. The gate reads the scan root through its normal code path;
 #   only the manifest's source differs from a production run.
@@ -31,7 +33,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$ROOT/scripts/check_kv_codec_disposition.sh"
 BASE="$ROOT/scripts/fixtures/kv_codec_disposition/base"
 
-for f in main.rs KV_QUANT.md manifest.raw; do
+BASE_FILES=(main.rs KV_CODECS.md KV_ROTATION_CODECS.md KV_QUANT.md manifest.raw)
+for f in "${BASE_FILES[@]}"; do
     [ -f "$BASE/$f" ] || {
         echo "check-kv-codec-disposition fixtures: missing $BASE/$f" >&2
         exit 1
@@ -51,7 +54,9 @@ edit() {
 build_case() {
     local name="$1" dir="$2"
     mkdir -p "$dir"
-    cp -f "$BASE/main.rs" "$BASE/KV_QUANT.md" "$BASE/manifest.raw" "$dir/"
+    for f in "${BASE_FILES[@]}"; do
+        cp -f "$BASE/$f" "$dir/"
+    done
 
     case "$name" in
         clean) ;;
@@ -64,14 +69,14 @@ build_case() {
             edit "$dir/main.rs" 's/^      fixinert, fixinert2\.$/      fixinert, fixinert2, fixlive./'
             ;;
         rule3_inert_without_a_banner)
-            edit "$dir/KV_QUANT.md" '/^> \*\*INERT on this build\*\* — `fixinert2`/d'
+            edit "$dir/KV_ROTATION_CODECS.md" '/^> \*\*INERT on this build\*\* — `fixinert2`/d'
             ;;
         rule4_live_named_in_a_banner)
-            edit "$dir/KV_QUANT.md" \
+            edit "$dir/KV_CODECS.md" \
                 's/^\(> \*\*INERT on this build\*\* — `fixinert`.*\)$/\1 So does fixlive./'
             ;;
         rule5_banner_buried_in_the_section)
-            edit "$dir/KV_QUANT.md" \
+            edit "$dir/KV_CODECS.md" \
                 's/^### fixinert$/### fixinert\n\nOne paragraph of prose.\n\nA second paragraph, pushing the banner past the third line./'
             ;;
         rule6_kv_quant_inline_help)
@@ -130,28 +135,31 @@ OTHER
             edit "$dir/main.rs" 's/^      fixlive\.";$/      fixlive, at 2x the baseline.";/'
             ;;
         rule10_banner_in_an_unlisted_doc)
-            # fixinert2's section moves to a doc the gate does not list. Its
-            # banner still exists; no rule would read it.
-            sed -n '/^### fixinert2$/,/^More pack-format prose\.$/p' \
-                "$dir/KV_QUANT.md" >"$dir/OTHER.md"
-            edit "$dir/KV_QUANT.md" '/^### fixinert2$/,/^More pack-format prose\.$/d'
+            # fixinert2's section moves to KV_QUANT.md, a doc the gate does not
+            # list. Its banner still exists; no rule would read it.
+            sed -n '/^### fixinert2$/,$p' "$dir/KV_ROTATION_CODECS.md" >>"$dir/KV_QUANT.md"
+            edit "$dir/KV_ROTATION_CODECS.md" '/^### fixinert2$/,$d'
             ;;
         rule10_banner_in_an_unlisted_nested_doc)
             # The unlisted doc sits in a subdirectory of docs/.
             mkdir -p "$dir/models"
-            sed -n '/^### fixinert2$/,/^More pack-format prose\.$/p' \
-                "$dir/KV_QUANT.md" >"$dir/models/NOTES.md"
-            edit "$dir/KV_QUANT.md" '/^### fixinert2$/,/^More pack-format prose\.$/d'
+            sed -n '/^### fixinert2$/,$p' "$dir/KV_ROTATION_CODECS.md" >"$dir/models/NOTES.md"
+            edit "$dir/KV_ROTATION_CODECS.md" '/^### fixinert2$/,$d'
             ;;
         rule10_listed_doc_missing)
-            rm -f "$dir/KV_QUANT.md"
+            rm -f "$dir/KV_ROTATION_CODECS.md"
             ;;
-        rule11_codec_in_two_banners)
-            # A second section carries a second banner for fixinert.
-            sed -n '/^### fixinert$/,/^exactly the paragraph/p' \
-                "$dir/KV_QUANT.md" >"$dir/dup.md"
-            cat "$dir/dup.md" >>"$dir/KV_QUANT.md"
-            rm -f "$dir/dup.md"
+        rule11_codec_in_two_listed_docs)
+            # fixinert's section is copied into the second listed doc.
+            sed -n '/^### fixinert$/,/^exactly the paragraph/p' "$dir/KV_CODECS.md" \
+                >>"$dir/KV_ROTATION_CODECS.md"
+            ;;
+        banner_moved_between_listed_docs)
+            # fixinert's section moves to the other listed doc. The list, not
+            # one doc, is the surface: this passes.
+            sed -n '/^### fixinert$/,/^exactly the paragraph/p' "$dir/KV_CODECS.md" \
+                >>"$dir/KV_ROTATION_CODECS.md"
+            edit "$dir/KV_CODECS.md" '/^### fixinert$/,/^exactly the paragraph/d'
             ;;
         manifest_truncated)
             # One codec line lost; the END sentinel still claims four.
@@ -186,10 +194,11 @@ CASES=(
     "rule8_help_reference_without_a_readable_const|1|RULE 8|clap help the gate cannot read is caught"
     "rule7_ratio_in_a_constant_from_another_module|1|RULE 7|a ratio in a help constant from a second module is caught"
     "rule9_listing_pointer_without_call_site|1|RULE 9|the help's --list-cache-types pointer with no call site is caught"
-    "rule10_banner_in_an_unlisted_doc|1|RULE 10  |a banner moved to a doc the gate does not list is caught"
+    "rule10_banner_in_an_unlisted_doc|1|KV_QUANT.md|a banner moved to a doc the gate does not list is caught"
     "rule10_banner_in_an_unlisted_nested_doc|1|models/NOTES.md|a banner in a subdirectory of docs/ is caught"
     "rule10_listed_doc_missing|2|a doc BANNER_DOCS lists|a listed doc that is gone is an environment error"
-    "rule11_codec_in_two_banners|1|RULE 11  'fixinert' is named in 2|a second banner for one codec is caught"
+    "rule11_codec_in_two_listed_docs|1|RULE 11  'fixinert' is named in 2|a second banner for one codec, in the other listed doc, is caught"
+    "banner_moved_between_listed_docs|0|OK: 4 KV codecs classified|a banner moved from one listed doc to the other passes"
 
     "manifest_truncated|2|manifest truncated|a short manifest is an environment error, not a violation"
     "manifest_unknown_class|2|unknown disposition class|a class the gate cannot read is an environment error"

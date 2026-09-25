@@ -145,7 +145,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCAN_ROOT="${1:-}"
 
 # The docs that carry the INERT banners, as paths under docs/ (RULE 10).
-BANNER_DOCS=(KV_QUANT.md)
+BANNER_DOCS=(KV_CODECS.md KV_ROTATION_CODECS.md)
 
 if [ -n "${SCAN_ROOT}" ]; then
     CLI_MAIN="${SCAN_ROOT}/main.rs"
