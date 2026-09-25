@@ -381,7 +381,7 @@ fn run_cell(model_path: &Path, ctx: usize, depth: f32, routing: FlashRouting) {
     run_cell_kind(model_path, ctx, depth, routing, FlashKind::Turbo);
 }
 
-/// Phase 4 entry point for planar_flash_decode cells. Same retrieval +
+/// Entry point for planar_flash_decode cells. Same retrieval +
 /// dispatch-counter contract as the TurboFlash cells, but consults the
 /// `planar_flash_decode` OnceLock + counter and forces `KvQuant::PlanarK`.
 fn run_pflash_cell(model_path: &Path, ctx: usize, depth: f32, routing: FlashRouting) {

@@ -36,7 +36,7 @@ use super::streaming::{handle_streaming_token, StreamState};
 
 // ── JSON extraction helpers ───────────────────────────────────────────────────
 
-/// A6.3/A6.5 helper: locate the first JSON value in `text` (skipping any
+/// Helper: locate the first JSON value in `text` (skipping any
 /// leading whitespace and/or a markdown code-fence header like ` ```json\n `),
 /// then extract the complete value and return it as an owned `String`.
 ///
@@ -334,7 +334,7 @@ pub(super) async fn generate_blocking(
             }
             Ok(tok) => {
                 // Capture TTFT on the very first token (completion_tokens == 0).
-                // F1a + : capture TTFT on the very first token and
+                // Capture TTFT on the very first token and
                 // immediately persist to the events table off the tokio worker
                 // (spawn_blocking) so SQLite I/O never stalls the executor.
                 // Hoisted here (not post-loop) so TTFT survives mid-stream errors.

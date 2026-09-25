@@ -978,11 +978,9 @@ impl Architecture {
         prompt_cache_slots: usize,
         eos_ids: &'a [u32],
         step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
-        // Optional sampler constraint. `None` = unmasked argmax (the
-        // hot path; identical to pre-A6.2 behaviour). `Some(_)` enables the
-        // masked branch in each arch's `argmax` call sites; in A6.2 the only
-        // impl is `NoOpConstraint` (all-allow), so it is plumbing-only and
-        // produces byte-identical output at temp=0.
+        // Optional sampler constraint. `None` = unmasked argmax (the hot
+        // path). `Some(_)` enables the masked branch in each arch's `argmax`
+        // call sites (the route's json_object or json_schema grammar).
         //
         // The per-request borrows share `'a`: the shared decode loop stores them
         // together in one `DecodeCtx<'a>` for the duration of the call. `'a`

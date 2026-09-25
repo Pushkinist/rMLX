@@ -292,7 +292,7 @@ async fn f9_itl_p99_and_spikes_round_trip() {
 // ── ItlStats metric mapping ──────────────────────────────────────────────
 
 /// `ItlStats` must produce exactly three `MetricEntry` rows with the
-/// correct names and values (M30 — itl_p50_ms, itl_p95_ms, step_ms_mean).
+/// correct names and values (itl_p50_ms, itl_p95_ms, step_ms_mean).
 #[test]
 fn itl_stats_produces_three_metrics_with_correct_names() {
     let m = event_kind_to_metrics(&MetricKind::ItlStats {

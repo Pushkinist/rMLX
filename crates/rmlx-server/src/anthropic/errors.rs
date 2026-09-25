@@ -1,7 +1,7 @@
 //! Anthropic-specific HTTP error response helpers.
 //!
 //! Error type strings differ from OpenAI: `invalid_request_error`,
-//! `service_unavailable_error`, `internal_server_error`, plus the J3 typed-OOM
+//! `service_unavailable_error`, `internal_server_error`, plus the typed-OOM
 //! surface (`oom_during_load`, `oom_kv_cache`, `oom_mid_stream`).
 
 #![allow(unreachable_pub)]
@@ -45,7 +45,7 @@ pub(super) fn internal_error(message: &str) -> Response {
 ///
 /// Mirrors the OpenAI mapping: same `type` strings (`oom_during_load`,
 /// `oom_kv_cache`, `oom_mid_stream`), same 507 / 503 + `Retry-After` per
-/// phase, same best-effort J4 memory fields.
+/// phase, same best-effort process-memory fields.
 #[allow(
     clippy::expect_used,
     reason = "structural invariant: value present by construction in calling context; .expect() message documents the invariant"

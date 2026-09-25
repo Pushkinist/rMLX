@@ -536,7 +536,7 @@ pub(crate) async fn messages(
         Vec::new(), // logit_bias — Anthropic API does not expose this
         None,       // seed — Anthropic API does not expose this
         gen_defaults.as_deref(),
-        state.default_temperature, // G4: --default-temperature server flag
+        state.default_temperature, // --default-temperature server flag
     );
     tracing::debug!(
         model_id = %req.model,
@@ -598,7 +598,7 @@ pub(crate) async fn messages(
         thinking_end_token: None,
         // Set below, after FIFO admission acquires the permit.
         gpu_admission: None,
-        // Issue #26: the Anthropic Messages surface does not expose per-request
+        // The Anthropic Messages surface does not expose per-request
         // KV-config overrides (stricter wire spec); always launch default here.
         kv_quant_override: None,
         max_ctx_override: None,
@@ -647,13 +647,13 @@ pub(crate) async fn messages(
 
     // Only pass the parser format when both tools[] was supplied AND
     // the arch has a known parser. Otherwise the decode loop bypasses the
-    // parser entirely (same code path as pre-A5.5).
+    // parser entirely.
     let parser_format: Option<ToolCallFormat> = tools_enabled.then_some(()).and(tool_format);
 
     // Anticipatory 503 — same logic as the OpenAI route.
     if let Some(ref ctrl) = state.admission_controller {
         let n_prompt = gen_req.prompt_tokens.len() as u64;
-        // M1: only read kv_cache_bytes when a single model is loaded (same as
+        // Only read kv_cache_bytes when a single model is loaded (same as
         // the OpenAI route). Skip in the multi-model case to avoid reading the
         // wrong slot's footprint.
         let current_kv_bytes: u64 = {

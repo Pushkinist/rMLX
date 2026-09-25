@@ -9,8 +9,6 @@
 //! `w_fp = scale × code + bias` with `bias = -zero_point × scale`, so the net
 //! effect is identical to `s*(x_q - zp)` — but the stored bf16 bias
 //! already encodes the sign. rMLX stores and applies it as-is (additive).
-//!
-//! Stage 1.
 
 use std::sync::OnceLock;
 

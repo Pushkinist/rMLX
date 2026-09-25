@@ -145,7 +145,7 @@ impl QuantPlanarV {
                 self.gpu_scales_per_step = scales_per_step as i32;
                 self.gpu_rotations_words_per_step = rotations_words_per_step as i32;
                 self.max_seq = max_seq;
-                // C2 fix: allocate enough for prev_seq + new chunk when hydrating
+                // Allocate enough for prev_seq + new chunk when hydrating
                 // (prev_seq > 0). Without this the grow path tries to copy
                 // prev_seq words from an old_codes buffer sized for only one page
                 // (e.g. 256) while prev_seq may be larger (e.g. 300), producing

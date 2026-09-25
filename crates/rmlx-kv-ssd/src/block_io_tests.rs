@@ -2130,15 +2130,15 @@ fn wrong_model_id_rejected() {
     let _ = std::fs::remove_file(&path);
 }
 
-// ── C3 + C1 + C2: GPU hydrate round-trips (require Metal) ─────────────────
+// ── GPU hydrate round-trips (require Metal) ───────────────────────────────
 
-/// C3 + C1: K8V4 write (GPU) → read → hydrate → one-step decode, no panic.
+/// K8V4 write (GPU) → read → hydrate → one-step decode, no panic.
 ///
-/// Without C3 fix: writer dumps full GPU paged capacity (≥512 words for
+/// Without the trim to the filled prefix, the writer dumps full GPU paged capacity (≥512 words for
 /// 300-token sequence) → on-disk tensor too large → hydrate reader OOB on
 /// `slice_update`.
 ///
-/// Without C1 fix: QuantV allocates zero GPU buffers on hydration → V is
+/// Without the GPU upload on hydration, QuantV allocates zero GPU buffers on hydration → V is
 /// all-zeros across history → silent attention corruption.
 ///
 /// Requires Metal / Apple-Silicon GPU.
@@ -2187,13 +2187,13 @@ fn c3_k8v4_hydrate_round_trip_no_panic() {
     let one_k = arr(&lcg(n1, 0xAABB), &[1, 2, 1, 128]);
     let one_v = arr(&lcg(n1, 0xCCDD), &[1, 2, 1, 128]);
     let (k_out, _) = cache.update(&one_k, &one_v, device).unwrap();
-    assert_eq!(k_out.shape()[2], 301, "C3/K8V4: seq should advance to 301");
+    assert_eq!(k_out.shape()[2], 301, "K8V4: seq should advance to 301");
     let _ = std::fs::remove_file(&path);
 }
 
-/// C2 + C3: Planar write (GPU) → read → hydrate → one-step decode, no panic.
+/// Planar write (GPU) → read → hydrate → one-step decode, no panic.
 ///
-/// Without C2 fix: QuantPlanarV init_cap = KV_PAGE_SIZE (256) < prev_seq
+/// Without the hydration capacity sizing, QuantPlanarV init_cap = KV_PAGE_SIZE (256) < prev_seq
 /// (300) → grow path tries to copy 300 words from a 256-word buffer → OOB
 /// slice_update → broadcast error / panic.
 ///
@@ -2240,11 +2240,7 @@ fn c2_planar_hydrate_round_trip_no_panic() {
     let one_k = arr(&lcg(n1, 0xEEFF), &[1, 2, 1, 128]);
     let one_v = arr(&lcg(n1, 0x1122), &[1, 2, 1, 128]);
     let (k_out, _) = cache.update(&one_k, &one_v, device).unwrap();
-    assert_eq!(
-        k_out.shape()[2],
-        301,
-        "C2/Planar: seq should advance to 301"
-    );
+    assert_eq!(k_out.shape()[2], 301, "Planar: seq should advance to 301");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -2441,9 +2437,9 @@ fn planar3_v_gpu_spill_cpu_hydrate_cross_path() {
     let _ = std::fs::remove_file(&path);
 }
 
-// ── H4 + H5: SWA offset reset on hydration (CPU-runnable) ─────────────────
+// ── SWA offset reset on hydration (CPU-runnable) ──────────────────────────
 
-/// H4 + H5: KvStorage::None (SWA) layer with offset > max_seq must reset
+/// KvStorage::None (SWA) layer with offset > max_seq must reset
 /// gracefully on first decode step without OOB panic.
 ///
 /// The reset path also emits a tracing::warn! event.

@@ -19,7 +19,7 @@ fn loop8(id: u32, piece: &str) -> Vec<ProbeStep> {
     (0..8).map(|_| step(id, piece)).collect()
 }
 
-// (a) Regression: repeated ASCII punct ×8 → BrokenPunctLoop (B5 behaviour).
+// (a) Regression: repeated ASCII punct ×8 → BrokenPunctLoop.
 #[test]
 #[allow(
     clippy::wildcard_enum_match_arm,
@@ -39,9 +39,9 @@ fn ascii_punct_loop_is_broken() {
     }
 }
 
-// (b) The B5b fix: repeated NON-punct token id ×8 (simulate `로`).
-// Token id 237323 with a multi-byte CJK word-piece — B5 returned Ok here
-// (false negative on the safety gate); B5b must flag it.
+// (b) Repeated NON-punct token id ×8 (simulate `로`): token id 237323 with a
+// multi-byte CJK word-piece. A punctuation-only rule returns Ok here (a false
+// negative on the safety gate); the classifier must flag it.
 #[test]
 #[allow(
     clippy::wildcard_enum_match_arm,
@@ -147,7 +147,7 @@ fn broken_verdicts_map_to_refuse() {
         )
     }
     assert!(is_broken(&classify_smoke(&loop8(999, "!")))); // punct
-    assert!(is_broken(&classify_smoke(&loop8(237323, "로")))); // non-punct (B5b)
+    assert!(is_broken(&classify_smoke(&loop8(237323, "로")))); // non-punct
     let mut nan = loop8(1, " ok");
     nan[0].nan_count = 1;
     assert!(is_broken(&classify_smoke(&nan))); // NaN

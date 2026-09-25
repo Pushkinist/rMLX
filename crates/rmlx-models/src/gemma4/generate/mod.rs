@@ -91,7 +91,7 @@ pub fn generate_greedy<'a>(
     // reborrow is invariant and cannot be re-unified once split).
     step_fn: &'a mut dyn FnMut(&ProbeStep) -> Option<u32>,
     // Optional sampler constraint. `None` = unmasked argmax (the hot
-    // path; identical to pre-A6.2 behaviour). `Some(_)` enables the masked
+    // path). `Some(_)` enables the masked
     // branch at every argmax call site below.
     mut constraint: Option<&'a mut dyn ConstraintEngine>,
     // Sampling config + per-request RNG. `temperature <= 0.0` keeps the
@@ -193,7 +193,7 @@ pub fn generate_greedy<'a>(
             );
             exact_hit = Some((cloned.kv_caches, cloned.first_id, cloned.first_piece));
         }
-        // B1 SWA snapshot/restore: restore the cloned snapshot verbatim at
+        // SWA snapshot/restore: restore the cloned snapshot verbatim at
         // absolute position `prefix_len == cached_len` and tail-forward only
         // `prompt_ids[prefix_len..]`. No truncation → no wrapped-SWA desync.
         Consumed::Reuse {
@@ -229,7 +229,7 @@ pub fn generate_greedy<'a>(
         Consumed::Miss(_) => {}
     }
 
-    // Derive the initial ring size and the virtual ceiling (issue #25):
+    // Derive the initial ring size and the virtual ceiling:
     // `--max-ctx` is a ceiling the ring grows lazily up to, not an eager
     // allocation. `initial_max_seq` is the small lazy start; `max_seq_ceiling`
     // caps growth and rejects over-long prompts.
@@ -338,7 +338,7 @@ pub fn generate_greedy<'a>(
     let sliding_window_i32 = model.cfg.sliding_window as i32;
     let n_layers = model.cfg.num_hidden_layers;
 
-    // Issue #34: advise once if the resolved codec is estimated to increase
+    // Advise once if the resolved codec is estimated to increase
     // resident KV vs bf16 on this windowed+global layer mix. Windowed (SWA)
     // layers already run the bf16 rotating ring and are a no-op for the codec;
     // the warn fires when the per-global-layer warm-TTFT bf16 seed + codec
@@ -503,7 +503,7 @@ pub fn generate_greedy<'a>(
             )
         })?
     } else if is_prefix {
-        // Prefix (B1): per-arch tail re-prefill. The cloned snapshot is already
+        // Prefix: per-arch tail re-prefill. The cloned snapshot is already
         // post-prefill quantized (offset == prefix_len), so the tail appends
         // via decode-mode `update` — do NOT enter the raw-BF16 prefill
         // scaffolding (it would route the tail into the empty prefill_raw
@@ -661,7 +661,7 @@ pub fn generate_greedy<'a>(
                             // layout_key)` row the hydrator will reconstruct. When
                             // the SSD tier is OFF, `active_layout_key()` returns 0 and the
                             // seed collapses to `FNV_OFFSET` — legacy un-salted digests.
-                            // Issue #26: salt the stored digest stream by the
+                            // Salt the stored digest stream by the
                             // active KV codec too, so the push seed matches the
                             // codec-partitioned query seed in `find_best_prefix`
                             // above. Stacks with `layout_key` (XOR) exactly like

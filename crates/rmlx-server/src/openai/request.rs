@@ -13,8 +13,8 @@ use crate::chat_template::ChatMessageTpl;
 
 /// `content` field for a chat message.
 ///
-/// OpenAI allows a plain string or an array of content parts. For Stage 1
-/// we accept both but only store the string representation.
+/// OpenAI allows a plain string or an array of content parts. Both are
+/// accepted; only the string representation is stored.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(untagged)]
 #[allow(
@@ -507,7 +507,7 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     pub kv_quant: Option<String>,
     /// Per-request max-context ceiling override (KV ring grows lazily up to this
-    /// ceiling, #25). `None` (omitted) uses the server's launch `--max-ctx`.
+    /// ceiling). `None` (omitted) uses the server's launch `--max-ctx`.
     #[serde(default)]
     pub max_ctx: Option<i32>,
 
@@ -521,7 +521,7 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     pub image_max_tokens: Option<u32>,
 
-    // Stage 2+ features — accepted & ignored with a debug log.
+    // Unsupported features — accepted & ignored with a debug log.
     // Explicitly reject only fields that indicate unsafe injection intent.
     /// Catch-all for unknown request fields; debug-logged and ignored.
     #[serde(flatten)]

@@ -245,7 +245,7 @@ fn quantized_matmul_packed(
 ) -> Result<Array> {
     install_error_handler();
 
-    // biases is optional — use the cached null sentinel when absent (ch-18 F1).
+    // biases is optional — use the cached null sentinel when absent.
     // Previously: mlx_array_new() + mlx_array_free() per call.
     let biases_arr = match biases {
         Some(b) => b.inner,
@@ -307,7 +307,7 @@ pub fn dequantize(
 ) -> Result<Array> {
     install_error_handler();
 
-    // Null sentinel for absent biases and global_scale (ch-18 F1).
+    // Null sentinel for absent biases and global_scale.
     let biases_arr = match biases {
         Some(b) => b.inner,
         None => null_sentinel(),
@@ -508,7 +508,7 @@ pub fn gather_qmm(
     device: Device,
 ) -> Result<Array> {
     install_error_handler();
-    // Use cached null sentinel for absent biases and lhs_indices (ch-18 F1).
+    // Use cached null sentinel for absent biases and lhs_indices.
     let biases_arr = match biases {
         Some(b) => b.inner,
         None => null_sentinel(),

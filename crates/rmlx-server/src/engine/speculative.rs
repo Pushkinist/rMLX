@@ -1207,7 +1207,7 @@ impl Generator for SpeculativeGenerator {
                             Ok(_) => {}
                             Err(e) => tracing::debug!(
                                 error = ?e,
-                                "A10 detok.finalize error, dropping tail"
+                                "detok.finalize error, dropping tail"
                             ),
                         }
                     }

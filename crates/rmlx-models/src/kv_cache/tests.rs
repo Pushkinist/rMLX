@@ -417,7 +417,7 @@ mod tests {
         }
     }
 
-    /// Falsifies #284 at the real production entry point: `KvCache::update` →
+    /// At the real production entry point: `KvCache::update` →
     /// dispatch → `QuantIsoV3::append`, then `KvCache::truncate_to` → dispatch
     /// → `QuantIsoV3::truncate_to`, at `kv_h = 4` (`kv_h == 1` is the masked
     /// case that hides the bug — see `kv_cache_truncate_k8v8_path` above,
@@ -475,16 +475,16 @@ mod tests {
                 assert_eq!(
                     vs.blocks.len(),
                     keep as usize,
-                    "must keep exactly `keep` blocks, not floor(keep / kv_h) (#284)"
+                    "must keep exactly `keep` blocks, not floor(keep / kv_h)"
                 );
                 let kept_rows: usize = vs.blocks.iter().map(|b| b.n_tokens).sum();
                 assert_eq!(
                     kept_rows,
                     keep as usize * kv_h as usize,
-                    "kept rows must equal keep * kv_h, not keep (#284)"
+                    "kept rows must equal keep * kv_h, not keep"
                 );
                 vs.dequant()
-                    .expect("dequant must succeed after truncate at kv_h>1 (#284)");
+                    .expect("dequant must succeed after truncate at kv_h>1");
             }
             _ => panic!("expected IsoV3 storage"),
         }
@@ -1992,7 +1992,7 @@ mod tests {
         );
     }
 
-    // ── Issue #34: KV-codec net-benefit decision (policy layer) ───────────────
+    // ── KV-codec net-benefit decision (policy layer) ───────────────────────────
 
     /// Build the Gemma4 e2b layer mix: 7 global (head_dim=256, 1 kv head) +
     /// 28 windowed (window=512). Model-agnostic helper — keyed on geometry.

@@ -27,12 +27,12 @@ const LOOP_K: usize = 6;
 /// a pipelined arch is still undetected. Do not read a green smoke probe as
 /// evidence that no NaN occurred — read the `error = %e` / `nan_count` event.
 ///
-/// Heuristic (from CLAUDE.md "mxfp8 broken-snapshot hazard"; B5b widened):
+/// Heuristic:
 /// - `BrokenNan`: any step had `nan_count > 0`.
 /// - `BrokenPunctLoop` (variant name kept for stable exit-code / HTTP / test
 ///   mapping — it now covers any degenerate repeat, not only ASCII punct):
 /// - `≤ 2` distinct token ids AND the dominant piece is a single-char
-///   punctuation token (the original B5 signature), OR
+///   punctuation token, OR
 /// - `≥ LOOP_K` consecutive identical token ids anywhere in the window
 ///   (catches the gemma-4-26b-a4b `로` bare-BOS loop and any word-piece
 ///   loop, not just punctuation), OR
@@ -86,7 +86,7 @@ pub fn classify_smoke(steps: &[ProbeStep]) -> SmokeVerdict {
         }
     }
 
-    // --- (ii) Original B5 rule: ≤ 2 distinct ids + single-char punct piece ---
+    // --- (ii) Punctuation rule: ≤ 2 distinct ids + single-char punct piece ---
     let distinct_ids = count_distinct_ids(steps);
     if distinct_ids <= 2 {
         // Find the modal piece.
@@ -108,7 +108,7 @@ pub fn classify_smoke(steps: &[ProbeStep]) -> SmokeVerdict {
         }
     }
 
-    // --- (iii) B5b extension: single-char piece (any category) dominant ≥ LOOP_K ---
+    // --- (iii) Single-char piece (any category) dominant ≥ LOOP_K ---
     // Count how many steps have a single-char piece.
     let mut piece_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();

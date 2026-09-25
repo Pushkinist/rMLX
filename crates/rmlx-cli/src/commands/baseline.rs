@@ -512,7 +512,7 @@ pub(crate) fn run_baseline(
             1,   // baseline bench: single-slot cache
             &[], // baseline bench: no EOS-stop, force full max_tokens steps
             &mut step_timing,
-            None, // A6.2: baseline never uses sampler constraints.
+            None, // Baseline never uses sampler constraints.
             &baseline_sampler_cfg,
             &mut baseline_rng,
             &baseline_penalty_cfg,

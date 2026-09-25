@@ -510,7 +510,7 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
     // Each SQLite observation row carries one raw sample; real percentiles come
     // from the Prometheus histogram (rmlx_ssd_spill_us_bucket / rmlx_ssd_hydrate_us_bucket).
     // reason: a single-sample distribution has no meaningful p50 or p99 —
-    // emitting the same dur_ms value as both is misleading; removed in H2 fix.
+    // emitting the same dur_ms value as both would mislead, so neither is emitted.
     (
         "ssd_spill_ms",
         "ms",

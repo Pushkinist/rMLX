@@ -491,7 +491,7 @@ impl SchemaGrammar {
         }
         // A top-level bare scalar has no follower byte to close it (the
         // stream just ends / EOS). Treat a fully-formed open top-level
-        // number or literal as complete — mirrors A6.3
+        // number or literal as complete — mirrors `JsonObjectConstraint`
         // `JsonGrammar::is_done` for `InNumber` at top level.
         if !self.stack.is_empty() {
             return false;
@@ -1172,7 +1172,7 @@ impl SchemaGrammar {
                 Ok(())
             }
             SchemaNode::Any => {
-                // Free-form JSON value (delegate to A6.3's flat grammar by
+                // Free-form JSON value (delegate to the flat json_object grammar by
                 // value-class on the first byte).
                 self.enter_any(byte, done_to)
             }
@@ -1193,7 +1193,7 @@ impl SchemaGrammar {
 
     /// `Any` node: classify the first byte and drive a permissive JSON
     /// value via a sub-`SchemaGrammar` is overkill — instead reuse the
-    /// flat A6.3 semantics by mapping to leaf states with `Any` recursion.
+    /// flat json_object semantics by mapping to leaf states with `Any` recursion.
     fn enter_any(&mut self, byte: u8, done_to: AfterTarget) -> Result<(), ()> {
         match byte {
             b'{' => {

@@ -206,7 +206,7 @@ impl PromptCacheEntry for Gemma4Entry {
         Gemma4Entry::is_hydrate_complete(self)
     }
 
-    /// B1 (strict-prefix SWA snapshot/restore) is checked FIRST; only when it
+    /// Strict-prefix SWA snapshot/restore is checked FIRST; only when it
     /// declines does the block-truncate path run. This precedence preserves the
     /// live arm order: the strict-prefix snapshot supersedes block-truncate for
     /// the wrapped-SWA multi-turn case (where truncation would desync the SWA
@@ -229,7 +229,7 @@ impl PromptCacheEntry for Gemma4Entry {
         _is_ssd_hydrated: bool,
         matched_blocks: usize,
     ) -> Option<ReuseKind> {
-        // B1 precedence — strict prefix supersedes block-truncate.
+        // Strict prefix supersedes block-truncate.
         if self.is_strict_prefix_of(prompt_ids) {
             return Some(ReuseKind::StrictPrefix {
                 prefix_len: self.prompt_token_ids.len(),
@@ -361,7 +361,7 @@ pub fn read_cache_stats() -> Option<CacheStats> {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — C1 partial-prefix trimmability gate + KvQuant mismatch eviction.
+// Tests — partial-prefix trimmability gate + KvQuant mismatch eviction.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

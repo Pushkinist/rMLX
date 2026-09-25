@@ -138,7 +138,7 @@ fn main() -> anyhow::Result<()> {
         1,   // diag binary: single-slot cache
         &[], // diag binary: no EOS-stop, force full n_gen steps
         &mut step_fn,
-        None, // A6.2: no sampler constraint in diag.
+        None, // No sampler constraint in diag.
         &diag_sampler_cfg,
         &mut diag_rng,
         &diag_penalty_cfg,

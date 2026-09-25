@@ -156,7 +156,7 @@ pub struct ModelLoadConfig {
 #[derive(Debug, Clone)]
 #[allow(
     clippy::exhaustive_enums,
-    reason = "internal closed enum — three response format modes from OpenAI spec; adding a mode requires reviewing A6.x constraint wiring"
+    reason = "internal closed enum — three response format modes from OpenAI spec; adding a mode requires reviewing the constraint wiring"
 )]
 pub enum NormalizedResponseFormat {
     /// Client explicitly requested plain text (`{"type":"text"}`).
@@ -280,7 +280,7 @@ pub struct GenerationRequest {
     ///
     /// When present, the engine uses this to reserve a PromptCache slot for
     /// the session so FIFO eviction does not clobber it between turns.
-    /// Absence falls back to the N1 prompt-cache path with no reservation.
+    /// Absence falls back to the plain prompt-cache path with no reservation.
     pub session_id: Option<String>,
     /// Effective prompt-cache slot count computed by the route handler.
     ///
@@ -409,7 +409,7 @@ pub struct GenerationRequest {
     /// unit-test / non-route paths that never went through admission.
     pub gpu_admission: Option<GpuAdmission>,
 
-    /// Issue #26: per-request KV-quant codec override. `Some(q)` switches the
+    /// Per-request KV-quant codec override. `Some(q)` switches the
     /// per-request cache builder to codec `q` on the resident model (no weight
     /// reload); `None` falls through to the generator's launch default
     /// (`--kv-quant`, or the auto per-ctx policy). The prefix/prompt cache key
@@ -417,9 +417,9 @@ pub struct GenerationRequest {
     /// quantized-KV request and vice-versa.
     pub kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
 
-    /// Issue #26: per-request max-context ceiling override. `Some(n)` re-sizes
+    /// Per-request max-context ceiling override. `Some(n)` re-sizes
     /// the KV-ring virtual ceiling for this request only (the ring still grows
-    /// lazily, #25); `None` uses the generator's launch `--max-ctx`. No weight
+    /// lazily); `None` uses the generator's launch `--max-ctx`. No weight
     /// touch — a ring realloc only.
     pub max_ctx_override: Option<i32>,
 

@@ -1,4 +1,4 @@
-//! SPSC async metrics drainer — F6 / L18.
+//! SPSC async metrics drainer.
 //!
 //! Per-request metrics (kv_cache_bytes, ttft_ms, prompt_cache_hits/misses/bytes,
 //! load_phases) are emitted from the decode hot-path via `DrainerHandle::try_emit`.
@@ -624,7 +624,7 @@ fn event_kind_to_metrics(kind: &MetricKind) -> Vec<MetricEntry> {
         // Real percentiles (p50, p99) come from the Prometheus histogram
         // (`rmlx_ssd_spill_us_bucket{le=...}` in `openai.rs`); the registry row
         // here provides SQLite queryability of the raw duration. Emitting the
-        // same value as both p50 and p99 (H2 fix) was misleading — a single-sample
+        // same value as both p50 and p99 would mislead — a single-sample
         // distribution has no meaningful percentile breakdown.
         MetricKind::SsdSpillUs { dur_us, bytes } => {
             let dur_ms = *dur_us as f64 / 1000.0;

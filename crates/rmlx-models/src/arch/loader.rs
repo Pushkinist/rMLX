@@ -481,7 +481,7 @@ fn gdn_warmup(b: i32, t: i32, hk: i32, hv: i32, dk: i32, dv: i32) -> Result<()> 
 
 /// Fixed, deterministic seed prompt for the smoke probe.
 ///
-/// B5 fed the probe bare BOS (no prompt). That produced *false* degeneration on
+/// Feeding the probe bare BOS (no prompt) produces *false* degeneration on
 /// some healthy snapshots: `gemma-4-26b-a4b-it-mxfp8` answers
 /// "The capital of France is Paris." for a real prompt yet loops the Korean
 /// token `로` from bare BOS. Seeding with a tiny fixed instruction makes healthy

@@ -100,7 +100,7 @@ pub(super) async fn generate_blocking(
                 return engine_error_response(&e);
             }
             Ok(tok) => {
-                // F1a + : capture TTFT on the very first token and
+                // Capture TTFT on the very first token and
                 // immediately persist to the events table off the tokio worker
                 // so TTFT survives mid-stream errors.
                 if output_tokens == 0 {
@@ -289,7 +289,7 @@ pub(super) async fn generate_blocking(
     // response body and the X-Request-Id header always agree.
     let id = format!("msg_{request_id}");
 
-    // A3+A5.5: emit thinking block first (if any), then text block (if any),
+    // Emit thinking block first (if any), then text block (if any),
     // then a tool_use block per parsed call. The text block is suppressed
     // when empty AND there is at least one tool_use block, so a pure
     // tool-call response is not padded with an empty `text` block.
@@ -298,7 +298,7 @@ pub(super) async fn generate_blocking(
         content.push(ContentBlock::Thinking { thinking });
     }
     if !text.is_empty() || !any_tool_use {
-        // Preserve pre-A5.5 behaviour: when no tool_use is present, always
+        // When no tool_use is present, always
         // emit the (possibly empty) text block. With tool_use, only emit it
         // when non-empty.
         content.push(ContentBlock::Text { text });

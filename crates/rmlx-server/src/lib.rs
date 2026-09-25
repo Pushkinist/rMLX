@@ -1,7 +1,7 @@
 //! HTTP server with two chat-compatible surfaces.
 //!
 //! Both paths share one token stream. Schemas differ only in field names.
-//! Stage 3.5: multi-model registry, load/unload/swap, idle eviction.
+//! Multi-model registry, load/unload/swap, idle eviction.
 
 #![cfg_attr(
     test,

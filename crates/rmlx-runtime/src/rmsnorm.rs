@@ -14,7 +14,7 @@
 //!
 //! Lifted verbatim from `crates/rmlx-models/src/gemma3/layers.rs`. The
 //! gemma3 module currently keeps a private copy of this type (with `pub(super)`
-//! fields) — Stage 1 of the runtime extraction adds this version alongside,
+//! fields) — the runtime extraction adds this version alongside,
 //! and migrates gemma3 to it. Other archs that adopt Gemma2/3-style norms in
 //! the future can use this directly.
 

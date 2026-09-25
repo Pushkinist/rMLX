@@ -1047,7 +1047,7 @@ else
     echo "  WARN: ssd_bytes_used after POPULATE is 0" >&2
 fi
 
-# C4b: REVISIT total_ssd_hits >= 1 (FAIL — the fix's load-bearing assertion).
+# C4b: REVISIT total_ssd_hits >= 1 (FAIL — the load-bearing assertion).
 # Without the kvcache.rs dispatch fix, the server deadlocks on the hydrated SWA
 # layer and ssd_hits never increments. >= 1 total means at least one revisited
 # prompt was served from the SSD tier end-to-end (hydrate + generate completed).

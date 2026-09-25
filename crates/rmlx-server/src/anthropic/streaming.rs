@@ -853,7 +853,7 @@ pub(super) async fn generate_streaming(
                     // `content_block_stop` — the message is already well-
                     // formed.
                     //
-                    // The pre-A5.5 safety-open only fires when no block was
+                    // The safety-open only fires when no block was
                     // ever opened (the model produced only empty pieces —
                     // exotic edge case). Detect that by checking
                     // `current_index == 0 && current_block.is_none()`.

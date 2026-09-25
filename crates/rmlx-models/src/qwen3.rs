@@ -2024,7 +2024,7 @@ pub fn generate_greedy<'a>(
     // Path B (Miss): full re-prefill from scratch.
     let prefill_t0 = Instant::now();
 
-    // Derive initial ring size + virtual ceiling (issue #25): `--max-ctx` is a
+    // Derive initial ring size + virtual ceiling: `--max-ctx` is a
     // ceiling the ring grows lazily up to, not an eager allocation.
     // `initial_max_seq` is the small lazy start; `max_seq_ceiling` caps growth
     // and rejects over-long prompts.
@@ -2190,7 +2190,7 @@ pub fn generate_greedy<'a>(
             match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
                 Ok(()) => {
                     // salt chained walk with the active layout_key + KV codec
-                    // (issue #26). When tier is OFF and the codec is constant,
+                    // When tier is OFF and the codec is constant,
                     // this is the legacy stream for that codec.
                     let lk = qwen3_active_layout_key();
                     let block_hashes = chained_block_hashes_seeded(

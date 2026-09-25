@@ -11,7 +11,7 @@ use crate::{check_status, install_error_handler, sys, with_stream, Array, Device
 use super::arith::{add, multiply, scalar_f32};
 
 // ---------------------------------------------------------------------------
-// Cached gelu_tanh constants (ch-18 F2)
+// Cached gelu_tanh constants
 // ---------------------------------------------------------------------------
 //
 // gelu_tanh calls scalar_f32 four times per invocation — once for each of the
@@ -85,7 +85,7 @@ pub fn gelu_tanh(x: &Array, device: Device) -> Result<Array> {
     // Constants: sqrt(2/pi) ≈ 0.7978845608028654, 3/sqrt(2*pi) * 0.044715 ≈ 0.0356774
     // kCoeff = 0.044715, kAlpha = sqrt(2/pi)
     //
-    // Constants are cached as process-global OnceLock<Array> (ch-18 F2).
+    // Constants are cached as process-global OnceLock<Array>.
     // Each scalar_f32 call was mlx_array_new_float + mlx_array_free per invocation;
     // caching removes 4 alloc/free pairs per FFN layer per decode step.
 

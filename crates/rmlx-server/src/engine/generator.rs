@@ -77,7 +77,7 @@ pub trait Generator: Send + Sync {
 
 // ── NotReadyGenerator ────────────────────────────────────────────────────────
 
-/// Stage-1 placeholder. Returns a single `Err(Error::Other("generator not
+/// Placeholder generator. Returns a single `Err(Error::Other("generator not
 /// ready"))` item; the route layer translates this to 503.
 #[derive(Debug)]
 #[allow(

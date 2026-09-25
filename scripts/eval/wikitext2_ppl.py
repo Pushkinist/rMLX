@@ -6,10 +6,9 @@ invokes ``rmlx eval ppl`` to compute sliding-window perplexity using the
 native scorer in ``rmlx_models::ppl``.
 
 Why a CLI wrapper, not an HTTP call:
-    Option A (HTTP ``echo``+``logprobs`` with ``max_tokens=0``) would require
-    exposing per-prompt-position logits across every architecture's forward
-    path — engine refactor out of scope — so this uses Option B: a standalone
-    ``rmlx eval ppl`` subcommand.
+    The chat route refuses ``echo``+``logprobs`` with ``max_tokens=0``: it
+    would need per-prompt-position logits across every architecture's forward
+    path. So this uses the standalone ``rmlx eval ppl`` subcommand.
 
 Dependencies:
     Python 3.9+ standard library only (``urllib``, ``zipfile``, ``json``,

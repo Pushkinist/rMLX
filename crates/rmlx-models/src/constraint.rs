@@ -63,8 +63,8 @@ pub trait ConstraintEngine: Send + Sync + std::fmt::Debug {
     /// stop decoding (treated like EOS).
     ///
     /// Returning `false` always is safe; `NoOpConstraint` does exactly that.
-    /// Real grammars (A6.3+) flip this to `true` when the JSON / schema
-    /// parse completes.
+    /// The JSON grammars flip this to `true` when the JSON / schema parse
+    /// completes.
     fn finished(&self) -> bool;
 
     /// True when the engine wants the sampler to apply its mask.
@@ -120,10 +120,8 @@ pub trait ConstraintThinkSignal {
 
 /// No-op constraint: every token is allowed at every step, never finishes.
 ///
-/// Used by A6.2 as the gate impl for `response_format = json_object | json_schema`
-/// — the plumbing path is wired end-to-end so A6.3 only needs to swap the
-/// engine, not the decode loops. Output is byte-identical to the
-/// no-`response_format` path at `temp=0` because every logit is preserved.
+/// Output is byte-identical to the unconstrained path at `temp=0` because
+/// every logit is preserved.
 ///
 /// The internal mask buffer is lazily-sized: the first call to
 /// [`step_mask`](ConstraintEngine::step_mask) records the vocab size and

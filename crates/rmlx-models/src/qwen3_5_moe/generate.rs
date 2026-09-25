@@ -468,7 +468,7 @@ pub fn generate_greedy<'a>(
         return Ok(steps);
     }
 
-    // Issue #25: `--max-ctx` is a virtual ceiling the KV ring grows lazily up
+    // `--max-ctx` is a virtual ceiling the KV ring grows lazily up
     // to, not an eager allocation. `initial_max_seq` is the lazy start;
     // `max_seq_ceiling` caps growth and rejects over-long prompts.
     let resolved_ctx = crate::context::resolve_context(&model.cfg.context, max_ctx_override)?;

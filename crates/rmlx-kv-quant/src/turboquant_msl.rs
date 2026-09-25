@@ -162,8 +162,7 @@ const DEQUANTIZE_SOURCE: &str = include_str!("metal/turboquant_dequantize.metal"
 /// # Why a separate kernel
 ///
 /// The hardwired-codebook path stays as [`QUANTIZE_SOURCE`] (zero buffer-load
-/// overhead on the default Lloyd-Max path; decision D1 during codebook-buffer
-/// design). This
+/// overhead on the default Lloyd-Max path). This
 /// variant only runs when [`crate::storage::quant_v::QuantV::value_codebook`]
 /// is `Some`.
 ///

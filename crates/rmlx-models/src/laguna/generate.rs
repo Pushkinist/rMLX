@@ -341,7 +341,7 @@ pub fn generate_greedy(
         prompt_ids.len(),
     )?;
 
-    // A6.2 masked-argmax fork (first emit).
+    // Masked-argmax fork (first emit).
     let mask_active = constraint.as_ref().is_some_and(|c| c.wants_mask());
     // Temp<=0 keeps the exact greedy block below; temp>0 host-samples.
     let sampling_active = sampler_cfg.sampling_active();

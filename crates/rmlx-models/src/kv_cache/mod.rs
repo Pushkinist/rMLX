@@ -773,7 +773,7 @@ pub fn kv_codec_net_saving_total(
     (total_saving, n_global, n_windowed)
 }
 
-// The `--max-ctx` virtual ceiling (issue #25) is resolved by
+// The `--max-ctx` virtual ceiling is resolved by
 // [`crate::context::resolve_context`], the one producer of every context
 // bound in the tree. `initial_max_seq` is the small lazy start
 // ([`rmlx_kv_quant::KV_MAX_SEQ_DEFAULT`], capped by the ceiling); the codec's

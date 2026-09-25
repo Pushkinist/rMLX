@@ -168,7 +168,7 @@ fn update_prefill_raw_rejects_grow_on_resumed_cache() {
     );
 }
 
-/// Issue #25: a large `max_seq_ceiling` does NOT pre-allocate the ring.
+/// A large `max_seq_ceiling` does NOT pre-allocate the ring.
 ///
 /// The ring must start at its small initial `max_seq` and grow lazily up to
 /// the ceiling. Build a cache with a tiny initial `max_seq=128` and a large
@@ -203,7 +203,7 @@ fn ceiling_does_not_pre_allocate_ring() {
     cache.exit_prefill(device).expect("exit_prefill");
 }
 
-/// Issue #25: lazy grow is clamped to the ceiling, never past it.
+/// Lazy grow is clamped to the ceiling, never past it.
 ///
 /// With initial `max_seq=128` and ceiling=200, a 192-token prefill would
 /// normally double to 256, but the ceiling clamps the allocation to exactly
@@ -233,7 +233,7 @@ fn grow_clamps_to_ceiling() {
     cache.exit_prefill(device).expect("exit_prefill");
 }
 
-/// Issue #25: a prefill that exceeds the ceiling is rejected with a typed
+/// A prefill that exceeds the ceiling is rejected with a typed
 /// error before any allocation past the ceiling.
 ///
 /// Initial `max_seq=128`, ceiling=150. A single 200-token chunk needs more

@@ -579,7 +579,7 @@ fn multi_tool_use_blocks_each_independent() {
 
 fn event_data_string(ev: &Event) -> String {
     // axum's `Event` is opaque; rely on Debug rendering to access the
-    // serialised data field, the same trick A5.4 used in openai tests.
+    // serialised data field, the same trick the openai tests use.
     format!("{ev:?}")
 }
 

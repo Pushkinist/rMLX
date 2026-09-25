@@ -161,7 +161,7 @@ pub struct StreamingDetokenizer {
     /// metrics; this is the detokenizer's authoritative list).
     ids: Vec<u32>,
     /// The longest `�`-free decoded prefix emitted so far. Never advanced to
-    /// a `�`-terminated string (that is the bug A10 fixes).
+    /// a `�`-terminated string (which this type prevents).
     decoded: String,
     /// True until the first non-empty segment is emitted (for the
     /// strict-SPM first-segment leading-space rule).

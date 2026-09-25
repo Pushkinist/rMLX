@@ -335,7 +335,7 @@ pub fn generate_greedy(
         prompt_ids.len(),
     )?;
 
-    // A6.2 masked-argmax fork (first emit).
+    // Masked-argmax fork (first emit).
     // Temp<=0 keeps the exact greedy match below; temp>0 host-samples.
     let sampling_active = sampler_cfg.sampling_active();
     let penalties_active = penalty_cfg.penalties_active();

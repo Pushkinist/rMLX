@@ -525,7 +525,7 @@ pub(crate) fn run_info(
                 1,   // smoke probe uses single-slot cache (no multi-slot needed)
                 &[], // smoke probe: no EOS-stop, force full 8 steps
                 &mut |_| None,
-                None, // A6.2: smoke probe never uses sampler constraints.
+                None, // The smoke probe never uses sampler constraints.
                 &smoke_sampler_cfg,
                 &mut smoke_rng,
                 &smoke_penalty_cfg,

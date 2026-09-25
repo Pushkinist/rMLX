@@ -109,7 +109,7 @@ mod rotor3_layer_idx_tests;
 #[path = "resident_bytes_tests.rs"]
 mod resident_bytes_tests;
 
-// Windowed (SWA) ring sizing diagnostic — issue #35 falsification.
+// Windowed (SWA) ring sizing diagnostic.
 #[cfg(test)]
 #[path = "windowed_ring_sizing_tests.rs"]
 mod windowed_ring_sizing_tests;

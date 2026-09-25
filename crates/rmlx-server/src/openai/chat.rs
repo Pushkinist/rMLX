@@ -212,7 +212,7 @@ pub(crate) async fn chat_completions(
             return bad_request("presence_penalty must be in [-2.0, 2.0]");
         }
     }
-    // Issue #26: per-request KV-cache config hot-swap. Parse `kv_quant` /
+    // Per-request KV-cache config hot-swap. Parse `kv_quant` /
     // `max_ctx` overrides up front so a malformed codec string rejects with a
     // clean 400 before any tokenization or model-load work. `None` (omitted)
     // → fall through to the generator's launch default (zero regression).
@@ -237,7 +237,7 @@ pub(crate) async fn chat_completions(
         tracing::info!(
             kv_quant = ?req_kv_quant_override,
             max_ctx = ?req_max_ctx_override,
-            "chat_completions: per-request KV-config override (issue #26)"
+            "chat_completions: per-request KV-config override"
         );
     }
     // per-request image-token budget. Reject a zero budget with a clean 400;
@@ -406,7 +406,7 @@ pub(crate) async fn chat_completions(
 
     // Convert normalised tools to OpenAI-shaped JSON values for Jinja.
     // Note: tool_choice:"none" still injects tools here — hard suppression of
-    // the tools block on tool_choice:none is a v1.x polish item (A5.4+).
+    // the tools block on tool_choice:none is not done.
     let mut jinja_tools: Vec<Value> = norm_tools
         .as_deref()
         .unwrap_or(&[])
@@ -692,7 +692,7 @@ pub(crate) async fn chat_completions(
 
     // ── Session KV-reuse ───────────────────────────────────────────────────
     // Extract optional `X-Session-Id` header. Presence is purely opt-in;
-    // absence falls back to the N1 prompt-cache path unchanged.
+    // absence falls back to the plain prompt-cache path.
     let session_id: Option<String> = headers
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
@@ -1065,7 +1065,7 @@ pub(crate) async fn chat_completions(
         thinking_end_token,
         // Set below, after FIFO admission acquires the permit.
         gpu_admission: None,
-        // Issue #26: per-request KV-config overrides threaded to the cache
+        // Per-request KV-config overrides threaded to the cache
         // builder (None = launch default).
         kv_quant_override: req_kv_quant_override,
         max_ctx_override: req_max_ctx_override,
@@ -1106,7 +1106,7 @@ pub(crate) async fn chat_completions(
     // Slot=None (cold-start race) or NotReadyGenerator default → usize::MAX,
     // letting the existing 503 path catch real runtime overflows there.
     {
-        // A per-request `max_ctx` override (issue #26) re-sizes the KV-ring
+        // A per-request `max_ctx` override re-sizes the KV-ring
         // ceiling for this one request, so it becomes the guard's ceiling —
         // but only after the same resolution the launch flag goes through
         // refuses one above the model's positional capacity. Refusing here
@@ -1146,7 +1146,7 @@ pub(crate) async fn chat_completions(
 
     // Only pass the parser format when both tools[] was supplied AND
     // the arch has a known parser. Otherwise the decode loop bypasses the
-    // parser entirely (same code path as pre-A5.4).
+    // parser entirely.
     //
     // In bare_json_tool_call_mode (tool_choice=required/named) the
     // constraint drives output; the marker-based parser is bypassed entirely
@@ -1181,7 +1181,7 @@ pub(crate) async fn chat_completions(
     // When the controller is absent (default OFF) this block is a no-op.
     if let Some(ref ctrl) = state.admission_controller {
         let n_prompt = gen_req.prompt_tokens.len() as u64;
-        // M1: only read kv_cache_bytes when a single model is loaded; with
+        // Only read kv_cache_bytes when a single model is loaded; with
         // multiple resident models `slots.first()` would read the wrong model's
         // KV footprint, biasing the admission estimate. Skip when multi-model
         // (0 is a safe conservative fallback — less accurate, never over-rejects).

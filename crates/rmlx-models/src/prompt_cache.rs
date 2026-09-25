@@ -256,12 +256,12 @@ pub(crate) trait PromptCacheEntry: Sized {
     /// The full prompt token IDs that produced this snapshot.
     ///
     /// Used at both arch callsites to confirm a true full-token-equality
-    /// Exact hit (identical-prompt repeat). C1's block-hash matching narrows
+    /// Exact hit (identical-prompt repeat). Block-hash matching narrows
     /// the candidate slot via `find_best_prefix`; this method then verifies
     /// the FULL token sequence is byte-identical before the no-truncate,
     /// no-reprefill Exact fast path is taken. Block-floored equality is
     /// insufficient (it misroutes identical prompts into the unsafe partial
-    /// path). Also required by C2/C3 (SSD persistence rehydrate + re-verify).
+    /// path). The SSD rehydrate + re-verify path needs it too.
     fn prompt_token_ids(&self) -> &[u32];
 
     /// Deep clone of all MLX arrays inside the entry.

@@ -1009,7 +1009,7 @@ impl Gemma4Text {
     ///
     /// Per-position is required for KV-cache equivalence: the K/V cached
     /// during prefill must match the K/V at the same positions in a
-    /// full-sequence forward pass. The earlier Stage-1 simplification
+    /// full-sequence forward pass. An earlier simplification
     /// (last-token broadcast over all positions) made cached K differ from
     /// fresh K and broke prefill+decode.
     #[allow(

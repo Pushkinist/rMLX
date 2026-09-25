@@ -7,7 +7,7 @@ fn parse(json: &str) -> Result<ChatCompletionsRequest, serde_json::Error> {
 // ── Typed OOM mapping ────────────────────────────────────────────────
 //
 // Each `OomPhase` → asserted (HTTP status, `type` string, `Retry-After`
-// presence/absence, body carries the J4 process-memory fields). Built by
+// presence/absence, body carries the process-memory fields). Built by
 // unit-constructing the `Error::Oom` variant and routing it through
 // `engine_error_response` — no real OOM is forced (machine stability >
 // a real-OOM e2e, per task constraints).
@@ -78,12 +78,12 @@ async fn engine_error_type_matches_response() {
 }
 
 fn assert_mem_fields(err: &Value) {
-    // J4 fields must always be present (value may be null if read_proc_mem
+    // Process-memory fields must always be present (value may be null if read_proc_mem
     // failed, but the key must exist). On macOS CI they are real numbers.
     for k in ["process_rss_mb", "phys_footprint_mb", "compressed_mb"] {
         assert!(err.get(k).is_some(), "missing mem field {k}: {err}");
     }
-    // peak_alloc_mb / requested_bytes present, null until F3 / call-site sets them.
+    // peak_alloc_mb / requested_bytes present, null unless a call site sets them.
     assert!(err.get("peak_alloc_mb").is_some(), "missing peak_alloc_mb");
     assert_eq!(err["peak_alloc_mb"], Value::Null);
     assert!(
@@ -331,7 +331,7 @@ fn openai_tools_absent_is_none() {
 
 use crate::generation_config_io::GenerationConfig;
 
-/// Convenience wrapper for tests: call resolve with all-None A7.1 / G4 fields.
+/// Convenience wrapper for tests: call resolve with all-None extended sampling and server-default fields.
 fn rsp(
     temp: Option<f32>,
     top_p: Option<f32>,
@@ -953,7 +953,7 @@ fn response_format_invalid_type_is_serde_error() {
 
 /// Without a parser (tools disabled), `handle_streaming_token` produces
 /// exactly one content chunk per non-empty piece plus a terminal chunk
-/// — matching the pre-A5.4 behaviour.
+/// — the plain-text behaviour.
 #[test]
 fn streaming_without_parser_passes_through_unchanged() {
     let mut state = StreamState {
@@ -1313,7 +1313,7 @@ fn usage_stream_state(prompt_tokens: u32, include_usage: bool) -> StreamState {
     }
 }
 
-/// H3 proxy: feed N non-done tokens + 1 done token through
+/// Proxy: feed N non-done tokens + 1 done token through
 /// `handle_streaming_token` and verify `state.completion_tokens` is exact.
 #[test]
 fn h3_completion_tokens_counter_exact() {
@@ -1352,7 +1352,7 @@ fn h3_completion_tokens_counter_exact() {
     );
 }
 
-/// H3 proxy: completion_tokens accumulates correctly with
+/// Proxy: completion_tokens accumulates correctly with
 /// `max_tokens` = 2 (only 2 non-done tokens + 1 done).
 #[test]
 fn h3_completion_tokens_two_tokens() {
@@ -1595,7 +1595,7 @@ fn h4_chunk_usage_present_when_some() {
 /// streaming path increments them at the done-token boundary via
 /// `handle_streaming_token`.
 ///
-/// Drives `handle_streaming_token` directly (same path as H3/H4) and
+/// Drives `handle_streaming_token` directly (same path as the usage tests) and
 /// verifies the shared Arc counters are incremented exactly once per request.
 #[test]
 fn f14_lifetime_counters_incremented_at_done_boundary() {

@@ -18,9 +18,9 @@ use serde_json::Value;
 ///
 /// Anthropic encodes block kinds as a tagged JSON object where the text
 /// field key varies by kind: `text` blocks carry `text`, extended-
-/// thinking blocks carry `thinking`. A3 surfaces reasoning-capable
+/// thinking blocks carry `thinking`. Reasoning-capable
 /// architectures' `<think>...</think>` output as a leading `thinking`
-/// block followed by the normal `text` block. A5.5 adds `tool_use`
+/// block followed by the normal `text` block, and `tool_use`
 /// blocks emitted when the model produces a parsed `<tool_call>`.
 ///
 /// Per-variant `rename` is used instead of `rename_all = "lowercase"`

@@ -1,7 +1,7 @@
 //! Model registry: a small in-process catalog of known snapshot directories.
 //!
-//! Stage 1 supports a single `--model` flag; the registry has 0 or 1 entries.
-//! Stage 3.5 adds `--registry <PATH>` which reads a JSON file:
+//! `--model` gives a registry of 0 or 1 entries; `--registry <PATH>` reads a
+//! JSON file:
 //!
 //! ```json
 //! {
@@ -103,7 +103,7 @@ pub struct ModelEntry {
     ///
     /// Probed once at registry build by rendering a 1-dummy-tool context.
     /// When `false`, the route handler skips tool injection and proceeds
-    /// tool-less (warns instead of 500-ing) — see A9 guard.
+    /// tool-less (warns instead of 500-ing) — see the tool-support guard.
     ///
     /// `false` also when `chat_template` is `None` (no template = no tools).
     pub tools_supported: bool,
@@ -145,7 +145,7 @@ impl std::fmt::Debug for ModelEntry {
 /// `false` on any error (template has no `{% if tools %}` branch, or the
 /// template raises an exception when `tools` is passed).
 ///
-/// This is the A9 runtime guard: called once at registry build, result cached
+/// This is the runtime tool-support guard: called once at registry build, result cached
 /// in `ModelEntry::tools_supported`. The render is intentionally cheap
 /// (minimal message, minimal tool schema) and does NOT compare to HF output —
 /// correctness is tested by the fixture round-trip suite.

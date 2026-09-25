@@ -2,7 +2,7 @@
 //!
 //! # Status
 //!
-//! Stage 1 of the runtime extraction surfaces *types* and *small helpers*
+//! The runtime extraction surfaces *types* and *small helpers*
 //! that callers of `generate_greedy` use repeatedly. The full outer-loop
 //! refactor (chunked prefill + decode + decode-profile timers) is deferred
 //! until at least three archs have migrated to the runtime helpers

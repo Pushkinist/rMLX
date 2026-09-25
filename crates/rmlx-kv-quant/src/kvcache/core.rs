@@ -526,7 +526,7 @@ impl KvCache {
     }
 
     /// Test-only accessor: the `max_seq` currently recorded on the active
-    /// storage variant (the allocated ring capacity). Used by the issue-#25
+    /// storage variant (the allocated ring capacity). Used by the lazy-grow
     /// lazy-grow / ceiling tests to assert the ring grew lazily rather than
     /// pre-allocating to the ceiling.
     #[cfg(test)]

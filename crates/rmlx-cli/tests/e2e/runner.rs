@@ -753,7 +753,7 @@ pub fn run_manifest(manifest_toml: &str) -> Report {
         if !only.is_empty() && !only.iter().any(|id| id == &case.id) {
             continue;
         }
-        // Phase 2 rows are declarative-only: record PENDING, never execute.
+        // `phase2`-tagged rows are declarative-only: record PENDING, never execute.
         if case.tags.iter().any(|t| t == "phase2") {
             report.push(CaseResult {
                 id: case.id.clone(),
@@ -1495,7 +1495,7 @@ fn assert_thinking(port: u16, id: &str, mk: &dyn Fn(Verdict, String) -> CaseResu
     }
 }
 
-// ── Phase 2a: SSD cross-restart + prompt-cache reuse ─────────────────────────
+// ── SSD cross-restart + prompt-cache reuse ──────────────────────────────────
 
 /// A long, prefix-stable prompt that forms at least one full 256-token
 /// prompt-cache block so both the SSD spill (whole-block-only) and the
@@ -1951,7 +1951,7 @@ fn assert_cache_hit_equivalence(
     )
 }
 
-// ── Phase 2b: multi-model lifecycle ──────────────────────────────────────────
+// ── Multi-model lifecycle ─────────────────────────────────────────────────────
 
 /// Spawn `rmlx serve --registry <json> --max-loaded-models <cap> --port <port>`
 /// and block until `/health` is green. Mirrors `spawn_serve` but uses the
@@ -2364,7 +2364,7 @@ fn fail_lc(
     mk(Verdict::Fail, detail)
 }
 
-// ── Phase 2b: attention dispatch_fired (log scrape) ──────────────────────────
+// ── Attention dispatch_fired (log scrape) ────────────────────────────────────
 
 /// Spawn `rmlx serve --model <path> --kv-quant <kv> --log verbose --port <port>`
 /// WITHOUT pinning `RUST_LOG` (so `--log verbose` drives the EnvFilter and the

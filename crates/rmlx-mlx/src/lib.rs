@@ -619,7 +619,7 @@ pub(crate) fn mode_to_cstr(
 }
 
 // ---------------------------------------------------------------------------
-// Null-handle sentinel for optional FFI arguments (ch-18 F1)
+// Null-handle sentinel for optional FFI arguments
 // ---------------------------------------------------------------------------
 //
 // Several mlx-c wrappers accept optional Array arguments (biases, freqs,
@@ -684,7 +684,7 @@ pub enum Device {
     Gpu,
 }
 
-/// Element dtype subset. Extend in S1.4b as needed.
+/// Element dtype subset.
 #[allow(
     clippy::exhaustive_enums,
     reason = "closed dtype enum — six MLX element types (Bf16/F16/F32/U8/U32/I32); adding a dtype requires updating to_sys(), from_sys(), and all Dtype match arms across the codebase"

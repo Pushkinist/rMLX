@@ -217,7 +217,7 @@ pub(crate) fn enforce_max_tokens_cap(
 /// Build the typed-OOM error response (OpenAI error-spec compatible).
 ///
 /// `type` is the stable automation key; `message` is human. Memory fields are
-/// best-effort from J4 `read_proc_mem()` — on read failure they serialize as
+/// best-effort from `read_proc_mem()` — on read failure they serialize as
 /// `null`, the error path never fails because telemetry failed.
 ///
 /// Status / `Retry-After` per phase:

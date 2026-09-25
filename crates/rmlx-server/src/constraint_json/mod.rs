@@ -1,4 +1,4 @@
-//! A6 — tokenizer-aware JSON-syntax + JSON-Schema constraint engine for
+//! Tokenizer-aware JSON-syntax + JSON-Schema constraint engine for
 //! `response_format: {"type":"json_object"}` and
 //! `response_format: {"type":"json_schema", "json_schema":{…}}`.
 //!
@@ -26,7 +26,7 @@
 //! membership test, ~1 ms on Qwen3.6. The hot UNCONSTRAINED path never
 //! reaches this file.
 //!
-//! # A6 SUPPORTED / DEGRADED matrix
+//! # SUPPORTED / DEGRADED matrix
 //!
 //! ## SUPPORTED (fully enforced)
 //!
@@ -46,7 +46,7 @@
 //! | Scalar-root `Immediate` engage | Scalar-root schemas engage at the **first post-think token** regardless of its bytes; no waiting for `{`/`[` that never come. |
 //! | Markdown-fence suppression | Leading ` ```json\n ` wrapper stripped from `content` in both blocking and streaming paths. |
 //!
-//! ## A6.4 schema keyword coverage — see [`schema`] module docs for the
+//! ## Schema keyword coverage — see [`schema`] module docs for the
 //! full gap table (every keyword × status × strict-mode decision).
 //!
 //! Newly enforced: local `$ref` → `#/$defs/…` / `#/definitions/…`

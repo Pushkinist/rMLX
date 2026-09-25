@@ -77,8 +77,8 @@
 //!
 //! # Reference
 //!
-//! TheTom `ggml-metal.metal:8843` (p1), `:9034` (p2). N69 §1.
-//! Commit `67f076f2e` disables it on Apple10. N73 §3.
+//! TheTom `ggml-metal.metal:8843` (p1), `:9034` (p2).
+//! Commit `67f076f2e` disables it on Apple10.
 //!
 //! # Single-process GPU claim
 //!

@@ -130,8 +130,7 @@ impl ArchGenerator {
     /// Load weights, tokenizer, and derive `model_id` from the snapshot
     /// directory basename.
     ///
-    /// `device = Device::Cpu` is the safe default until the S1.8
-    /// thread-exhaustion bug on Metal is resolved (Stage 2).
+    /// The device comes from `cfg`.
     pub fn from_snapshot(
         model_dir: &Path,
         cfg: &ModelLoadConfig,
@@ -800,7 +799,7 @@ impl Generator for ArchGenerator {
             // `gpu_pending`, on every exit path (return, panic-unwind, normal
             // completion). With the 1-permit semaphore upstream only one
             // request is ever in this closure, so the `try_lock` above always
-            // succeeds — the gpu_gate stays as C4 cross-model defense.
+            // succeeds — the gpu_gate stays as the cross-model defense.
             let _gpu_admission = gpu_admission;
 
             tracing::debug!(model_id = %model_id_for_log, "generate: blocking thread started");
@@ -1409,7 +1408,7 @@ impl Generator for ArchGenerator {
                         });
                     }
                     // Emit SPSC event carrying all five aggregates (p50/p95/mean in
-                    // ItlStats; p99 and spikes as separate F9 events at same boundary).
+                    // ItlStats; p99 and spikes as separate events at same boundary).
                     if let Some(ref drainer) = metrics_drainer {
                         use crate::metrics_drainer::{MetricEvent, MetricKind};
                         let ts = spsc_ts();
@@ -1489,8 +1488,8 @@ impl Generator for ArchGenerator {
                 Ok(steps) => {
                     // finish_reason = "stop" when generation halted on
                     // EOS (last emitted token id is in the configured eos set);
-                    // "length" when we hit max_tokens. Stop-string matching is
-                    // still Stage 2.
+                    // "length" when we hit max_tokens. Stop strings are not
+                    // matched here.
                     let last_id = steps.last().map_or(0, |s| s.token_id);
                     let finish_reason = if eos_ids.contains(&last_id) {
                         "stop".to_owned()
@@ -1520,7 +1519,7 @@ impl Generator for ArchGenerator {
                             Ok(_) => {}
                             Err(e) => tracing::debug!(
                                 error = ?e,
-                                "A10 detok.finalize error, dropping tail"
+                                "detok.finalize error, dropping tail"
                             ),
                         }
                     }

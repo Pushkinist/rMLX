@@ -233,7 +233,7 @@ impl RotatingState {
     /// Deep (refcount) clone of the ring.
     ///
     /// Implemented as `snapshot` followed by a `restore` into a fresh state so
-    /// the SWA prompt-cache reuse path (B1) and the existing entry deep-clone
+    /// the SWA prompt-cache reuse path and the existing entry deep-clone
     /// share ONE snapshot/restore implementation — `snapshot`/`restore` are
     /// the single source of truth for ring state transfer (no parallel copy
     /// logic to drift out of sync).
@@ -550,7 +550,7 @@ impl RotatingState {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — snapshot/restore round-trip exactness (B1)
+// Tests — snapshot/restore round-trip exactness
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

@@ -93,7 +93,7 @@ _CTV_EFF="${CTV:-}"
 [ "$_CTK_EFF" = "auto" ] && _CTK_EFF=""
 [ "$_CTV_EFF" = "auto" ] && _CTV_EFF=""
 
-# Collision check (per D2): if user sets CTK/CTV AND KV_QUANT positional is
+# Collision check: if user sets CTK/CTV AND KV_QUANT positional is
 # a real preset (not the "kv-flag-replaced" placeholder), refuse.
 if { [ -n "$_CTK_EFF" ] || [ -n "$_CTV_EFF" ]; } \
    && [ "$KV_QUANT" != "kv-flag-replaced" ] \

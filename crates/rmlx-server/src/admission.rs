@@ -47,7 +47,7 @@ use serde_json;
 
 /// Default step-target SLA value in milliseconds (Dynamo default: 500 ms).
 ///
-/// M2: this field is the end-to-end admission→final-token wall-clock target,
+/// This field is the end-to-end admission→final-token wall-clock target,
 /// not TTFT per se. The anticipatory-503 gate fires when the OLS prediction
 /// exceeds `TTFT_REJECT_MULT × step_target_ms` (2×). Renamed from
 /// `DEFAULT_TTFT_TARGET_MS`; the CLI flag `--ttft-target-ms` is kept as a
@@ -323,7 +323,7 @@ impl Default for Regressor {
 pub struct ControllerConfig {
     /// End-to-end step SLA target in ms (`--step-target-ms`, default 500).
     ///
-    /// M2: this is the admission→final-token wall-clock target. The anticipatory
+    /// This is the admission→final-token wall-clock target. The anticipatory
     /// 503 fires when the OLS prediction exceeds `2 × step_target_ms`. Renamed
     /// from `ttft_target_ms`; the CLI flag `--ttft-target-ms` is a hidden alias.
     pub step_target_ms: u64,
@@ -471,7 +471,7 @@ impl ControllerHandle {
         let est_step_ms = g
             .regressor
             .predict_step_ms(prompt_tokens, current_kv_bytes)?;
-        // M2: compare end-to-end step prediction against 2× step_target_ms.
+        // Compare end-to-end step prediction against 2× step_target_ms.
         // Renamed from ttft_threshold; semantics are "est wall-clock step exceeds
         // 2× step-target", not TTFT per se.
         let step_threshold = g.config.step_target_ms as f64 * TTFT_REJECT_MULT;
@@ -661,7 +661,7 @@ impl ControllerHandle {
 
     /// Force a controller tick, bypassing the `TICK_INTERVAL` guard.
     ///
-    /// L2: test-only hook. Resets `last_tick` to the epoch and calls `tick()`
+    /// Test-only hook. Resets `last_tick` to the epoch and calls `tick()`
     /// so tests do not need the fragile `Instant::now().checked_sub(...)` trick
     /// (which inverts intent on systems where `Instant::now()` is very small).
     #[cfg(test)]

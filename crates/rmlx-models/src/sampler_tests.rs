@@ -966,7 +966,7 @@ fn penalties_all_noop_leaves_slice_unchanged() {
 
 // ── Spec-mandated named integration tests ─────────────────────────
 
-/// A7.4 spec cell (b): `top_k=1` with any `temperature > 0` must collapse
+/// Sampling cell (b): `top_k=1` with any `temperature > 0` must collapse
 /// to the greedy argmax index — i.e. the same token that `temp=0` would
 /// have selected.
 ///
@@ -1008,7 +1008,7 @@ fn top_k_one_collapses_to_greedy() {
     );
 }
 
-/// A7.4 spec cell (g): `repetition_penalty > 1.0` on a repetitive prompt
+/// Sampling cell (g): `repetition_penalty > 1.0` on a repetitive prompt
 /// must prevent the decode loop from degenerating into a single-token
 /// infinite repeat.
 ///

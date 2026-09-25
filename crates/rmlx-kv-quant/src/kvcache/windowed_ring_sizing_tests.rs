@@ -1,24 +1,20 @@
-//! Windowed-layer (SWA) KV-ring sizing diagnostic — issue #35.
+//! Windowed-layer (SWA) KV-ring sizing.
 //!
-//! Issue #35 alleges that KV for sliding-window-attention (SWA / windowed)
-//! layers is allocated to the FULL context length rather than the attention
-//! window, so windowed-layer KV memory scales with context. These tests are the
-//! falsification harness: they drive a windowed (`rotating`) cache and a global
+//! These tests check that KV for sliding-window-attention (SWA / windowed)
+//! layers is bounded by the attention window, not allocated to the full
+//! context length. They drive a windowed (`rotating`) cache and a global
 //! (full-attention) cache through prefills at growing context (4k / 16k / 64k)
-//! and read [`KvCache::resident_bytes`] — the actual on-device byte accounting
-//! added in issue #33 — to settle the claim.
+//! and read [`KvCache::resident_bytes`], the on-device byte accounting.
 //!
 //! All tests run on `Device::Cpu` (no GPU / no model snapshot required); the
 //! rotating ring path is device-agnostic, so the byte arithmetic is identical
-//! to the on-device Gemma4 SWA path. Real-model proof at 64k is a separate
-//! later step.
+//! to the on-device Gemma4 SWA path.
 //!
 //! Verdict pinned by these tests:
 //!
 //! 1. `windowed_ring_stays_bounded_while_global_grows` — at 4k/16k/64k the
 //!    windowed ring's `resident_bytes` is FLAT at `window + chunk` per side,
 //!    while the global cache grows linearly with context (64× larger at 64k).
-//!    This directly falsifies the #35 claim for the rotating SWA path.
 //! 2. `windowed_ring_retains_full_swa_window` — correctness guard: across a
 //!    chunked prefill longer than the window AND multiple decode steps, the
 //!    physical ring is bounded to `[window, window + chunk]` rows (never the
@@ -150,9 +146,9 @@ fn global_bytes_after_prefill(ctx: i32) -> u64 {
     cache.resident_bytes()
 }
 
-/// #35 falsification: windowed-layer ring bytes are FLAT across context while
-/// the global-layer cache grows linearly. If the ticket were correct the
-/// windowed bytes would track the global bytes (both ∝ ctx).
+/// Windowed-layer ring bytes are FLAT across context while the global-layer
+/// cache grows linearly. An over-allocating ring would track the global bytes
+/// (both ∝ ctx).
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -175,16 +171,16 @@ fn windowed_ring_stays_bounded_while_global_grows() {
         let w = windowed_bytes_after_prefill(ctx);
         let g = global_bytes_after_prefill(ctx);
         eprintln!(
-            "[#35] ctx={ctx:>6}  windowed={w:>12}  global={g:>12}  \
+            "[swa-ring] ctx={ctx:>6}  windowed={w:>12}  global={g:>12}  \
              window_cap={window_cap_bytes}"
         );
 
         // Windowed ring never exceeds the window capacity (K+V × window tokens),
-        // regardless of context length. This is the core #35 claim, falsified.
+        // regardless of context length.
         assert!(
             w <= window_cap_bytes,
             "windowed ring bytes ({w}) must stay <= window cap ({window_cap_bytes}) at ctx={ctx} \
-             — over-allocation would confirm #35"
+             — the ring over-allocates"
         );
 
         // Global cache grows strictly with context (sanity: the harness is

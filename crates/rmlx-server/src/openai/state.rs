@@ -133,7 +133,7 @@ pub(crate) struct SsdHistogram {
     pub(crate) buckets: [u64; HIST_BUCKETS_US.len()],
     /// Count of observations that fell beyond the last finite bucket (overflow
     /// diagnostic only — NOT added to `count` or `+Inf` exposition to avoid
-    /// double-counting; see H1 fix comment at the exposition sites).
+    /// double-counting; see the comment at the exposition sites).
     pub(crate) count_inf_overflow: u64,
     /// Sum of all observed durations in µs.
     pub(crate) sum_us: u64,
@@ -337,7 +337,7 @@ pub enum ApiErrorCategory {
     /// HTTP 400 `invalid_request_error` — bad request field, out-of-range
     /// param, unsupported field, etc.
     BadRequest,
-    /// HTTP 400 `context_length_exceeded` — A2 prompt-length guard.
+    /// HTTP 400 `context_length_exceeded` — prompt-length guard.
     ContextOverflow,
     /// HTTP 404 `not_found_error` / `model_not_found` — model absent from
     /// registry.
@@ -348,14 +348,14 @@ pub enum ApiErrorCategory {
     OomKvCache,
     /// HTTP 503 `oom_mid_stream` — mid-decode OOM.
     OomMidStream,
-    /// HTTP 408 `timeout` — A8 per-request wall-clock timeout.
+    /// HTTP 408 `timeout` — per-request wall-clock timeout.
     Timeout,
     /// HTTP 503 `service_unavailable` — loader failure, missing pipeline,
     /// engine catch-all (non-OOM).
     Upstream,
     /// HTTP 500 `internal_error` — NaN logits / smoke probe / task panic.
     Internal,
-    /// HTTP 429 `rate_limit_error` — C5 admission-queue full.
+    /// HTTP 429 `rate_limit_error` — admission-queue full.
     RateLimit,
     /// HTTP 503 `admission_sla_exceeded` — anticipatory SLA rejection.
     ///
@@ -390,7 +390,7 @@ impl ApiErrorCategory {
 /// and incremented at every HTTP error-response emission site. Exposed as
 /// `error_counts` in `GET /metrics/cache`.
 ///
-/// Storage layout mirrors F14 (`tokens_in` / `tokens_out`): plain
+/// Storage layout mirrors `tokens_in` / `tokens_out`: plain
 /// `Arc<AtomicU64>` fields, constructed with `AtomicU64::new(0)`.
 #[derive(Clone, Debug)]
 #[allow(
@@ -769,7 +769,7 @@ impl AppState {
     /// Returns `usize::MAX` when the model is not resident (cold-start race)
     /// or when the generator does not participate in KV-cache sizing — the
     /// existing 503 path then catches real runtime overflows. Used by the
-    /// A2 `context_length_exceeded` guard in the chat routes.
+    /// The `context_length_exceeded` guard in the chat routes.
     pub fn effective_max_ctx_for(&self, model_id: &str) -> usize {
         self.slots
             .read()
@@ -1015,10 +1015,10 @@ impl AppState {
     /// without `block_on`), this becomes a no-op so tests don't crash —
     /// real production always runs inside `rt.block_on`.
     ///
-    /// H2 contract: the caller controls whether the slot's
+    /// Contract: the caller controls whether the slot's
     /// `decode_lease` Arc is swapped before this call. The swap MUST happen
     /// at request-triggered reset sites (`ensure_loaded` warm branch and
-    /// `reset_keep_alive`) so the H1 identity check in the spawned task can
+    /// `reset_keep_alive`) so the identity check in the spawned task can
     /// also detect warm-reset races. The swap MUST NOT happen at the
     /// internal busy re-arm tail (this function's own re-entry after the
     /// busy check) — that path inherits the slot's current lease so
@@ -1067,7 +1067,7 @@ impl AppState {
         let lease_clone = Arc::clone(decode_lease);
         let handle_slot_clone = Arc::clone(handle_slot);
         let ttl_secs = policy.ttl_secs_for_log();
-        // H1+H2: identity token captured at spawn time. After
+        // Identity token captured at spawn time. After
         // `sleep().await` returns we must verify the slot we were spawned
         // for is still the same slot — otherwise a freshly-reset model
         // would be torn down by a stale TTL fire that won its abort race
@@ -1098,7 +1098,7 @@ impl AppState {
         // unwinds and never reaches the unload logic — that is the intended
         // cancel path. But if the abort lands AFTER the sleep has resolved,
         // the task continues to completion and `prev.abort()` is a no-op.
-        // The H1 identity check below guards that exact window: we re-check
+        // The identity check below guards that exact window: we re-check
         // under the write lock that the slot we were spawned for has not been
         // reset (Arc pointer of decode_lease unchanged) before tearing down.
         let jh = rt_handle.spawn(async move {

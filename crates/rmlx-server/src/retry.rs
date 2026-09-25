@@ -229,9 +229,9 @@ pub struct RequestPlan {
     pub images: Vec<String>,
     /// Base64-encoded audio payloads attached to this request.
     pub audio_b64: Vec<String>,
-    /// Issue #26: per-request KV-quant codec override (`None` = launch default).
+    /// Per-request KV-quant codec override (`None` = launch default).
     pub kv_quant_override: Option<rmlx_kv_quant::KvQuant>,
-    /// Issue #26: per-request max-ctx ceiling override (`None` = launch default).
+    /// Per-request max-ctx ceiling override (`None` = launch default).
     pub max_ctx_override: Option<i32>,
     /// Per-request image-token budget override (`None` = launch default).
     pub image_max_tokens: Option<usize>,

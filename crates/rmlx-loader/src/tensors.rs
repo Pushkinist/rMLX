@@ -59,7 +59,7 @@ pub struct ParoQuantParams {
 
 /// Model-level ParoQuant state: per-layer params keyed by base tensor name.
 ///
-/// Accessible from the loader API so that Stage-2 graph integration (#103)
+/// Accessible from the loader API so that graph integration
 /// can wire rotation params into the forward pass without re-parsing.
 #[allow(
     clippy::exhaustive_structs,

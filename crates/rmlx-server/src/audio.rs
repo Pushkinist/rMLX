@@ -212,7 +212,7 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
             .into_response();
     };
 
-    // 4. C5 admission gate — audio holds the GPU; go through the same FIFO
+    // 4. Admission gate — audio holds the GPU; go through the same FIFO
     //    semaphore as LLM chat routes for fairness + 429 backpressure.
     let guard =
         match admit_request(&state.gpu_queue, &state.gpu_pending, state.max_queue_depth).await {
