@@ -444,8 +444,6 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
       * reads-mirror -- everything else, streaming the full bf16 warm-TTFT seed.
 
     Do NOT infer the bucket from feeds_bf16_* alone; see the caution above it.
-    docs/PERF_BASELINE.md "every mode reads bf16 K+V" generalises a
-    three-cell table into a universal and is false for Mixed / RotK.
 
     KNOWN GAPS, both of which make this an optimistic lower bound on divergence:
 

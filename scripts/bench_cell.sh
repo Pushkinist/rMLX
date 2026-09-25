@@ -592,7 +592,8 @@ case "$BACKEND" in
     # GGUF arms. MODEL_PATH is a .gguf file here, not an MLX snapshot dir --
     # no file exists that both families can load, so a cell against an MLX
     # backend rests on a stated quant-equivalence assumption (see
-    # docs/PERF_BASELINE.md H2 addendum). The fork-vs-upstream pair does not.
+    # docs/PERF_BASELINE.md § "Cross-backend cells"). The fork-vs-upstream
+    # pair does not.
     #
     # KV_QUANT is the ggml cache type for both sides; `none` means f16, which
     # is what upstream calls unquantised KV. `turbo2|turbo3|turbo4` exist only
