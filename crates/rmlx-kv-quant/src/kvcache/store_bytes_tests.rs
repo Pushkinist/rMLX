@@ -42,10 +42,10 @@
 //! **The 10 that report `true`.** Their `exit_prefill` arms run, and the bytes
 //! those arms bulk-encode are what a served decode reads. [`drive`] never
 //! reaches those arms, and the guard above reads only whether the store is
-//! non-empty, so this table is what reads the bytes they write. [`drive_prefill`] brackets the chunk and pins three columns per
-//! spelling per shape: the store the arm bulk-encoded, `resident_bytes()` at
-//! the same point, and the rows the first decode step after the bracket hands
-//! back.
+//! non-empty, so this table is what reads the bytes they write.
+//! [`drive_prefill`] brackets the chunk and pins three columns per spelling per
+//! shape: the store the arm bulk-encoded, `resident_bytes()` at the same point,
+//! and the rows the first decode step after the bracket hands back.
 //!
 //! Both counts are derived from the predicate and asserted below rather than
 //! written into prose, so they move when the dispositions move.

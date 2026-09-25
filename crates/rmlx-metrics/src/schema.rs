@@ -86,9 +86,9 @@ pub fn open_migrated(path: &std::path::Path) -> Result<Connection> {
 ///   declared read-only archive material and `backups/` holds snapshots; both
 ///   are reachable through `--db`.
 ///
-/// So staleness is reported instead of silently repaired: if the stored
-/// `bests` definition does not match the `docs/METRICS_SCHEMA.md` §4 registry, the caller is told to
-/// run `rmlx metrics doctor --fix`.
+/// So staleness is reported instead of silently repaired: if the stored `bests`
+/// definition does not match the `docs/METRICS_SCHEMA.md` §4 registry, the
+/// caller is told to run `rmlx metrics doctor --fix`.
 ///
 /// The connection is opened read-write rather than with `open_readonly` on
 /// purpose. A read-only connection to a DB with a non-empty `-wal` must create

@@ -547,8 +547,8 @@ impl SpeculativeDispatcher {
         // arch path (`Architecture::generate_greedy`) handles the constraint
         // correctly; only the SpeculativeGenerator route is gated.
         constraint: Option<&mut dyn crate::ConstraintEngine>,
-        // `temperature == 0` runs the greedy cached path. `temperature > 0` runs Leviathan stochastic acceptance:
-        // the draft samples from its post-sampling distribution `q`, the
+        // `temperature == 0` runs the greedy cached path. `temperature > 0`
+        // runs Leviathan stochastic acceptance: the draft samples from its post-sampling distribution `q`, the
         // verifier scores each position's post-sampling distribution `p`, and
         // each draft token is accepted with prob `min(1, p(x)/q(x))` vs a
         // uniform draw; on first reject a correction is sampled from the

@@ -61,9 +61,9 @@ pub fn run_pending(conn: &mut Connection) -> Result<u32> {
         applied += 1;
     }
 
-    // The `bests` view is generated from the `docs/METRICS_SCHEMA.md` §4
-    // registry, not pinned to a migration number: a bounds change has to reach existing DBs too, and a
-    // view carries no data to migrate. Cheap no-op when already current.
+    // The `bests` view is generated from the `docs/METRICS_SCHEMA.md` §4 registry,
+    // not pinned to a migration number: a bounds change has to reach existing DBs
+    // too, and a view carries no data to migrate. Cheap no-op when already current.
     bests_view::ensure(conn)?;
 
     Ok(applied)
@@ -121,11 +121,11 @@ fn backfill_decode_config(conn: &Connection) -> Result<usize> {
 
 /// Replace a `decode_config` that spells the engine's own defaults with NULL.
 ///
-/// `docs/METRICS_SCHEMA.md` §3.2 makes `NULL` the engine at its defaults, so a row spelling them out is
-/// a second spelling of one configuration — and two spellings are two cells
-/// that never rank against each other. `RunRecord::validate` refuses such a
-/// record now; this brings the rows written before it did into the same cell
-/// they always belonged in.
+/// `docs/METRICS_SCHEMA.md` §3.2 makes `NULL` the engine at its defaults, so a
+/// row spelling them out is a second spelling of one configuration — and two
+/// spellings are two cells that never rank against each other.
+/// `RunRecord::validate` refuses such a record now; this brings the rows
+/// written before it did into the same cell they always belonged in.
 ///
 /// Writes no measurement: it rewrites how a row says the engine was configured,
 /// on rows whose configuration was the default. The predicate is

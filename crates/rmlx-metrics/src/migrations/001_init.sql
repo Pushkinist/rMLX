@@ -76,7 +76,8 @@ CREATE INDEX IF NOT EXISTS obs_inserted_idx  ON observations(inserted_utc);
 -- docs/METRICS_SCHEMA.md §3.3 bests VIEW — champion per cell.
 -- Not created here: the definition is generated from the
 -- docs/METRICS_SCHEMA.md §4 metric registry
--- (it carries the docs/METRICS_SCHEMA.md §4.1 plausibility filter, which this file cannot know), and
+-- (it carries the docs/METRICS_SCHEMA.md §4.1 plausibility filter, which
+-- this file cannot know), and
 -- `migrate::run_pending` installs it via `bests_view::ensure` after the last
 -- migration. Edit `bests_view::create_sql`.
 -- Must remain a VIEW; do NOT convert to a base table

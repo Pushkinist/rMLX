@@ -1140,7 +1140,8 @@ async fn openai_tool_choice_named_is_accepted() {
 
 // ── response_format schema ─────────────────────────────────────────────
 
-/// OpenAI: `response_format: {"type":"json_object"}` is a parsed field — must NOT return 400. With an unknown model it returns 404;
+/// OpenAI: `response_format: {"type":"json_object"}` is a parsed field —
+/// must NOT return 400. With an unknown model it returns 404;
 /// with a registered model + NotReadyGenerator it returns 503.
 ///
 /// This test uses an unknown model to avoid needing the snapshot on disk.

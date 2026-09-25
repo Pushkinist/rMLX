@@ -39,9 +39,10 @@
 //!
 //! # Qwen MoE guard
 //!
-//! `TurboSym3` stores K at 3 bits, so Qwen MoE rejects it. The guard lives in [`rmlx_models::kv_cache::cache_type::validate_resolved`]
-//! and rejects `Qwen3_5MoeForConditionalGeneration + TurboSym3` at session
-//! start — the kernel does not re-check.
+//! `TurboSym3` stores K at 3 bits, so Qwen MoE rejects it. The guard lives in
+//! [`rmlx_models::kv_cache::cache_type::validate_resolved`] and rejects
+//! `Qwen3_5MoeForConditionalGeneration + TurboSym3` at session start — the
+//! kernel does not re-check.
 //!
 //! # Reference
 //!
