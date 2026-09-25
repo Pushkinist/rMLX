@@ -155,8 +155,11 @@ OpenAI contract of one `logprobs.content` entry per emitted token,
 logprobs at store time, whatever the storing request asked for. A
 hit replays the record truncated to the replaying request's `top_logprobs`, so
 it emits the same `token_logprob` a Miss would. With logprobs off it emits
-`None`. An SSD-hydrated entry stores no first token and has no
-`first_logprobs`.
+`None`. An SSD-hydrated entry stores placeholder id 0 as its first token and
+has no `first_logprobs`.
+
+On Gemma4, Gemma3, Qwen3.5-MoE and BitNet an Exact hit emits no logprob for
+the replayed token, while a Miss emits the prefill logprobs.
 
 ### `PromptCacheEntry` trait contract
 
@@ -384,8 +387,9 @@ the cap is a miss.
 
 | Mechanism | Detail |
 |---|---|
-| CLI flag | `--prompt-cache-ram-gb <f64>`, in GiB; a negative or non-finite value falls back to the default. |
-| Default | 2 GiB (`DEFAULT_MAX_BYTES`). |
+| CLI flag | `--prompt-cache-ram-gb <f64>`, in GiB. A negative or non-finite value is refused at startup. |
+| Config file | `ram_prompt_cache_gb` under `[global]` in `<RMLX_HOME>/projects.toml`, used when the flag is absent. |
+| Default | 2 GiB (`DEFAULT_MAX_BYTES`), when neither is set. |
 | Scope | Process-global `OnceLock`, set by `install_ram_cap` from `rmlx serve` before any model loads. A second call with another value is dropped with a `warn!`. |
 
 The RAM cap and the slot count (`--prompt-cache-slots`) are independent.
