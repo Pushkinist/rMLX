@@ -1,26 +1,22 @@
 //! `KvQuant` — closed enum tagging the active KV codec.
 //!
-//! Moved from `rmlx-models::kv_cache::mod`. The enum, its
-//! `Display` / `FromStr` impls, and the `KV_MAX_SEQ_DEFAULT` constant live
-//! here because every codec module in this crate (`storage`, `kvcache`,
-//! `mixed_quant`) carries `KvQuant` as a tag.
+//! The enum, its `Display` / `FromStr` impls, and the `KV_MAX_SEQ_DEFAULT`
+//! constant live here because every codec module in this crate (`storage`,
+//! `kvcache`, `mixed_quant`) carries `KvQuant` as a tag.
 //!
-//! Policy wrappers (`KvCacheBuilder`, `kv_quant_for_layer`,
-//! `DEFAULT_KV_QUANT`) remain in `rmlx-models::kv_cache`
-//! and are re-exported there alongside `pub use rmlx_kv_quant::KvQuant`.
+//! The policy wrappers (`KvCacheBuilder`, `kv_quant_for_layer`,
+//! `DEFAULT_KV_QUANT`) live in `rmlx-models::kv_cache`.
 
 /// Default maximum sequence length for the pre-allocated KV buffer.
 ///
 /// Arch loaders should pass the model's `max_position_embeddings` via
 /// `KvCache::with_quant_max_seq`. If absent or >4096, this cap applies.
-/// Stage-1/2 smoke prompts are ≤1024 tokens, so 4096 comfortably covers
-/// all current development runs.
 pub const KV_MAX_SEQ_DEFAULT: i32 = 4096;
 
 /// Quantization mode for the KV cache.
 ///
-/// See [`rmlx_models::kv_cache`] module docs for the Qwen MoE PPL disaster
-/// rationale.
+/// Qwen MoE rejects every variant that stores K below 8 bits
+/// (`rmlx_models::kv_cache::validate_resolved`).
 #[allow(
     clippy::exhaustive_enums,
     reason = "closed registry enum — KV codec variants; adding a variant requires updating KvCacheBuilder, all dispatch match arms, and CLAUDE.md asymmetric-K/V invariants"
@@ -29,10 +25,9 @@ pub const KV_MAX_SEQ_DEFAULT: i32 = 4096;
 pub enum KvQuant {
     /// Asymmetric: K = affine q8_0 (group_size=128), V = TurboQuant 4-bit.
     ///
-    /// The recorded safe choice for Qwen MoE when a quantised cache is wanted —
-    /// symmetric Q4 on K is the PPL-218->8641 disaster. Opt-in, not automatic.
-    /// Per-axis split is real (CLAUDE.md hard rule 5) — K and V are quantized
-    /// independently, not by layer index like the Python fork's fake `8,4` flag.
+    /// K stays 8-bit, so Qwen MoE accepts it. Opt-in, not automatic.
+    /// The per-axis split is real (CLAUDE.md hard rule 5): K and V are
+    /// quantized independently, not by layer index.
     K8V4,
     /// K = q8_0, V = q8_0 (symmetric 8-bit). Opt-in; `auto` is bf16.
     K8V8,
@@ -40,11 +35,10 @@ pub enum KvQuant {
     ///
     /// PlanarQuant applies a Givens-rotation (16-entry codebook) per pair of V
     /// values before 4-bit quantization, using per-pair scales. This reduces
-    /// per-element error ~2-3× compared to TurboQuant V4 on Gaussian-distributed
-    /// KV vectors. rMLX-first on Apple Silicon (S3.4 — 2026-05).
+    /// per-element error compared to TurboQuant V4 on Gaussian-distributed KV
+    /// vectors.
     ///
-    /// Opt-in via `--kv-quant planar`. Not the default for any arch until
-    /// baseline comparison is complete.
+    /// Opt-in via `--kv-quant planar`. Never an auto default.
     Planar,
     /// Unquantised KV cache (bf16 / model dtype, full max_seq buffer).
     ///
@@ -63,14 +57,11 @@ pub enum KvQuant {
     /// K=8, V=4, group=64 — exact byte-for-byte port of
     /// `mlx_lm.models.mixed_quant_cache.MixedQuantKVCache`.
     ///
-    /// Decode SDPA goes through two `mx.quantized_matmul` calls instead of
-    /// the bf16-dequantize-then-fast-SDPA pipeline used by `K8V4`/`K8V8`.
-    /// Eliminates the per-step full dequantize that dominates the rMLX k8v4
-    /// hot path (decode-step audit).
+    /// Decode SDPA goes through two `mx.quantized_matmul` calls over the
+    /// stored 3-tuples, with no per-step full dequantize.
     ///
     /// The codec is arch-agnostic. It is opt-in on every arch — `auto` resolves
-    /// to bf16 and never selects it. It was the auto default for
-    /// `Qwen3ForCausalLM` (Bonsai-2bit) until the per-arch table was retired.
+    /// to bf16 and never selects it.
     Mixed {
         /// K quantization bit-width.
         k_bits: u8,
@@ -90,9 +81,9 @@ pub enum KvQuant {
     /// (`(Q Rᵀ)(K Rᵀ)ᵀ = Q Kᵀ`) and K is never inverse-rotated. See
     /// [`crate::rot_k`] for the math and `docs/KV_CACHE.md` §5.3.
     ///
-    /// K stays 8-bit because rotation is a PPL win *over* affine-K quantization,
-    /// not a way to drop K below 8-bit (rotation does not rescue 2-bit K — see
-    /// hard rule 6). Opt-in **only** via `--ctk rot_k`; never an auto default.
+    /// K stays 8-bit: rotation improves affine-K quantization, it is not a way
+    /// to drop K below 8 bits. Opt-in **only** via `--ctk rot_k`; never an auto
+    /// default.
     RotK {
         /// V quantization bit-width (K is always 8-bit rotated affine).
         /// Validated by [`validate_mixed_side`] — the V slot is `Mixed`'s.
@@ -103,35 +94,24 @@ pub enum KvQuant {
     /// K = affine q8_0 (group_size=128),
     /// V = TurboQuant **3-bit** Lloyd-Max N(0,1) codebook (group=32).
     ///
-    /// Opt-in on every arch — `auto` resolves to bf16 and never selects it. It
-    /// was the auto default for Gemma4 small (non-MoE, `hidden_size` ≤ 2560,
-    /// non-paroquant) until the per-arch table was retired.
-    /// Validated on Gemma4-e4b: −0.40% vs K8V4 at canary shape (within the
-    /// <1% promote gate). Cosine gate ≥ 0.9807 passes.
-    ///
-    /// Implementation scope: **CPU dequant only** — no MSL kernel for 3-bit
-    /// TurboQuant (deferred). The GPU path falls through to dequant-then-SDPA,
-    /// same as K8V4 without TurboFlash.
-    ///
-    /// Also available via `--kv-quant k8vturbo3` on any arch.
+    /// Opt-in on every arch via `--kv-quant k8vturbo3` — `auto` resolves to bf16
+    /// and never selects it. Its decode reads the bf16 mirror, so a cache that went
+    /// through prefill builds no packed store (`docs/KV_QUANT.md` § "Codec
+    /// disposition", Class 2).
     K8VTurbo3,
     /// Symmetric TurboQuant 3-bit — K = `QuantKTurbo3`,
     /// V = `QuantV` (bits=3). Both axes use the **Lloyd-Max N(0,1) 3-bit
     /// codebook** (axis-agnostic CPU + same MSL kernel as the V-side
     /// `K8VTurbo3` path). Maps to the `speed` mtq preset.
     ///
-    /// **Arch guard (Contract A.y — mandatory)**: must NEVER run on Qwen MoE
-    /// (`Qwen3_5MoeForConditionalGeneration`). Symmetric 3-bit K is the
-    /// PPL-disaster path on Qwen MoE (7:1 GQA amplifies K-head error through
-    /// softmax; see the 218->8641 baseline in `docs/KV_LAYER_POLICY.md`). The auto default
-    /// never returns `TurboSym3` for Qwen MoE; explicit `--kv-quant tsym3` on
-    /// Qwen MoE is rejected at resolve-time via `QwenMoeTurboKRejected`.
+    /// **Arch guard**: 3-bit K, so explicit `--kv-quant tsym3` on Qwen MoE is
+    /// rejected at resolve time via `QwenMoeTurboKRejected`.
     ///
-    /// **V-side GPU dispatch**: V side forced CPU path (same as asymmetric
-    /// `K8VTurbo3` precedent — GPU V-side dispatch regressed −2% TPS gate on
-    /// K8VTurbo3). K side uses the GPU turbo3 MSL kernel when `Device::Gpu`.
+    /// Its decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no packed store (`docs/KV_QUANT.md` § "Codec disposition",
+    /// Class 2).
     ///
-    /// Opt-in via `--kv-quant tsym3`. Also auto-selected by `--kv-preset speed`.
+    /// Opt-in via `--kv-quant tsym3`. Also selected by `--kv-preset speed`.
     TurboSym3,
     /// Symmetric TurboQuant 4-bit: K = `QuantKTurbo4`,
     /// V = `QuantV` (bits=4). Both axes use the **Lloyd-Max N(0,1) 4-bit
@@ -139,11 +119,11 @@ pub enum KvQuant {
     /// `K8V4` path). Closes the asymmetric K8V4 gap for the `quality` /
     /// `agents_*` mtq presets.
     ///
-    /// **Arch guard (CLAUDE.md mandate)**: must NEVER run on Qwen MoE
-    /// (`Qwen3_5MoeForConditionalGeneration`). Symmetric 4-bit K is the
-    /// PPL-218→8641 disaster path. `--kv-quant tsym4` on Qwen MoE is rejected
-    /// at resolve-time by `rmlx_models::kv_cache::validate_resolved`; this
-    /// variant is **never** an auto baseline.
+    /// **Arch guard**: 4-bit K, so `--kv-quant tsym4` on Qwen MoE is rejected at
+    /// resolve time by `rmlx_models::kv_cache::validate_resolved`. This variant is
+    /// **never** an auto baseline. Its decode reads the bf16 mirror, so a cache
+    /// that went through prefill builds no packed store (`docs/KV_QUANT.md` §
+    /// "Codec disposition", Class 2).
     ///
     /// Opt-in only via `--kv-quant tsym4` (or `--kv-preset quality`).
     TurboSym4,
@@ -156,7 +136,7 @@ pub enum KvQuant {
     ///
     /// Storage: routes to `KvStorage::Planar { bits: 3 }` — no new `KvStorage` variant.
     /// CPU path: scalar `planar_quantize(bits=3)`. GPU: `planar_quantize_v3_gpu`.
-    /// Cosine gate: measured on LCG fixture (see `planarquant_tests.rs`).
+    /// Cosine gate: `planarquant_tests.rs`.
     ///
     /// Opt-in via `--kv-quant planar3`. Never an auto default.
     Planar3,
@@ -166,11 +146,8 @@ pub enum KvQuant {
     /// the **K** axis; V stays unquantised (bf16, lives on
     /// `KvCache::decode_fp16_v`).
     ///
-    /// **Arch guard (Contract A.y — mandatory)**: K-side 4-bit on Qwen MoE is
-    /// the PPL-disaster (218→8641; 7:1 GQA amplifies K-head error through
-    /// softmax). The auto default never returns `PlanarK` for
-    /// `Qwen3_5MoeForConditionalGeneration` / `Qwen3VLMoeForConditionalGeneration`,
-    /// and `cache_type::validate_resolved` rejects it. Opt-in only via
+    /// **Arch guard**: stores K below 8 bits, so
+    /// `rmlx_models::kv_cache::validate_resolved` rejects it on Qwen MoE. Opt-in only via
     /// `--kv-quant planar_k`. Requires `head_dim % 32 == 0`. MSL kernel is
     /// shared with `Planar` (PlanarQuant is axis-agnostic). See `docs/KV_CODECS.md`.
     PlanarK,
@@ -181,16 +158,13 @@ pub enum KvQuant {
     /// (~7× compression). rMLX's only sub-3-bit native V codec — the existing
     /// `Mixed{v_bits:2}` path is MLX affine 2-bit (different algorithm).
     ///
-    /// Ships **naïve** Lloyd-Max 2-bit (no outlier-mask). The
-    /// outlier-mask machinery is non-trivial; deferred pending the calibration
-    /// loader. Expect a cosine drop vs the published mtq number due to the
-    /// missing outlier handling.
+    /// Ships **naïve** Lloyd-Max 2-bit (no outlier mask), so expect a cosine
+    /// drop against the published mtq number.
     ///
-    /// Implementation scope: structurally identical to [`K8VTurbo3`](KvQuant::K8VTurbo3)
-    /// but with `bits=2` in the [`QuantV`](crate::storage::QuantV) slot. CPU
-    /// dequant only — the MSL kernel (`turbo2_v_msl.rs`) is wired as a
-    /// future-reference hook (parity-tested CPU↔GPU but not dispatched on the
-    /// hot update path).
+    /// Structurally identical to [`K8VTurbo3`](KvQuant::K8VTurbo3) but with
+    /// `bits=2` in the [`QuantV`](crate::storage::QuantV) slot. Its decode reads
+    /// the bf16 mirror, so a cache that went through prefill builds no packed store
+    /// (`docs/KV_QUANT.md` § "Codec disposition", Class 2).
     ///
     /// Opt-in **only** via `--kv-quant k8vturbo2`; never an auto default.
     K8VTurbo2,
@@ -201,10 +175,10 @@ pub enum KvQuant {
     /// quaternion (`FIXED_QUAT`) is applied per group of 4 elements before 3-bit
     /// Lloyd-Max quantization — see [`crate::isoquant`] for the algorithm.
     ///
-    /// **Implementation scope**: CPU codec only. SDPA falls through to the
-    /// dequant-then-SDPA legacy fallback path. Opt-in only via
-    /// `--kv-quant iso3`. Requires `head_dim % 4 == 0` (quaternion block
-    /// alignment).
+    /// Its decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no packed store (`docs/KV_QUANT.md` § "Codec disposition",
+    /// Class 2). Opt-in only via `--kv-quant iso3`. Requires
+    /// `head_dim % 4 == 0` (quaternion block alignment).
     Iso3,
     /// K = affine q8_0 (group_size=128), V = IsoQuant 4-bit
     /// (quaternion SO(4) rotation + Lloyd-Max 4-bit codebook).
@@ -214,36 +188,30 @@ pub enum KvQuant {
     /// pack (vs iso3's 10 vals/u32). Higher fidelity than iso3 at the cost of
     /// one extra bit per value.
     ///
-    /// **Implementation scope**: CPU codec only. SDPA falls through to the
-    /// dequant-then-SDPA legacy fallback path. The existing iso3 MSL kernel is
-    /// hard-coded for `bits=3`; an iso4 MSL variant is deferred. Opt-in only
-    /// via `--kv-quant iso4`. Requires `head_dim % 4 == 0` (quaternion block
-    /// alignment).
+    /// Its decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no packed store (`docs/KV_QUANT.md` § "Codec disposition",
+    /// Class 2). Opt-in only via `--kv-quant iso4`. Requires
+    /// `head_dim % 4 == 0` (quaternion block alignment).
     Iso4,
     /// Symmetric IsoQuant 3-bit — K = IsoQuant 3-bit, V = IsoQuant 3-bit
     /// (axis-agnostic quaternion SO(4) + 3-bit Lloyd-Max codebook).
     ///
     /// Mirrors the existing V-only [`Iso3`](KvQuant::Iso3) on both axes.
     ///
-    /// **Arch guard (Contract A.y — mandatory)**: K-side ≤4-bit on Qwen MoE
-    /// is the PPL-disaster zone (218→8641 on Q4_K_M baseline; 7:1 GQA
-    /// amplifies K-head error through softmax). The auto default
-    /// never returns `Iso3Sym` for Qwen MoE; explicit `--kv-quant iso3_sym`
-    /// on Qwen MoE is rejected at resolve-time by
-    /// `rmlx_models::kv_cache::validate_resolved`. Opt-in only via
-    /// `--kv-quant iso3_sym`. Requires `head_dim % 4 == 0`.
+    /// **Arch guard**: stores K below 8 bits, so
+    /// `rmlx_models::kv_cache::validate_resolved` rejects it on Qwen MoE. Opt-in
+    /// only via `--kv-quant iso3_sym`. Requires `head_dim % 4 == 0`.
     Iso3Sym,
     /// Symmetric IsoQuant 4-bit — same arch guard rationale as
-    /// [`Iso3Sym`](KvQuant::Iso3Sym); K-side 4-bit on Qwen MoE is the
-    /// PPL-disaster path. Opt-in only via `--kv-quant iso4_sym`.
+    /// [`Iso3Sym`](KvQuant::Iso3Sym). Opt-in only via `--kv-quant iso4_sym`.
     Iso4Sym,
     /// K-only IsoQuant 3-bit — K = IsoQuant 3-bit; V stays bf16
     /// (lives on `KvCache::decode_fp16_v`, same machinery as
     /// [`PlanarK`](KvQuant::PlanarK)).
     ///
-    /// **Arch guard (Contract A.y — mandatory)**: rejected on Qwen MoE for
-    /// the same reason as [`Iso3Sym`](KvQuant::Iso3Sym). Opt-in only via
-    /// `--kv-quant k_iso3`. Requires `head_dim % 4 == 0`.
+    /// **Arch guard**: stores K below 8 bits, so
+    /// `rmlx_models::kv_cache::validate_resolved` rejects it on Qwen MoE. Opt-in
+    /// only via `--kv-quant k_iso3`. Requires `head_dim % 4 == 0`.
     IsoKOnly3,
     /// K-only IsoQuant 4-bit — same shape as
     /// [`IsoKOnly3`](KvQuant::IsoKOnly3) with the dense 4-bit codebook on K.
@@ -260,12 +228,12 @@ pub enum KvQuant {
     /// Lloyd-Max N(0,1) codebook. Pack format: 10 vals/u32 (planar3 / iso3
     /// convention).
     ///
-    /// **Implementation scope**: CPU codec only. SDPA falls through to the
-    /// dequant-then-SDPA legacy fallback path. No MSL kernel (deferred).
+    /// Its decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no packed store (`docs/KV_QUANT.md` § "Codec disposition",
+    /// Class 2).
     /// Single-codebook simplification: 8 multivector components share one
-    /// codebook (Python reference splits into vector vs trivector grades; rMLX
-    /// defers grade-aware). No QJL residual (K-only stage, out of scope for V
-    /// codec).
+    /// codebook (the Python reference splits vector and trivector grades). No
+    /// QJL residual on the V side.
     ///
     /// Opt-in only via `--kv-quant rotor3` (alias `rotor_v_3`). Requires
     /// `head_dim > 0`; tail-padded for `head_dim % 3 != 0`.
@@ -280,10 +248,11 @@ pub enum KvQuant {
     /// [`crate::storage::KV_SIDEBAND_DTYPE`]. The per-group scale is 5.375 of
     /// those bits; see `crate::rotorquant` § "Effective bpe".
     ///
-    /// **Implementation scope**: CPU codec only. SDPA falls through to the
-    /// dequant-then-SDPA legacy fallback path. No MSL kernel (deferred). Single-
-    /// codebook: all 8 multivector components share the 16-centroid codebook
-    /// (grade-aware deferred). No QJL residual.
+    /// Its decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no packed store (`docs/KV_QUANT.md` § "Codec disposition",
+    /// Class 2).
+    /// Single-codebook: all 8 multivector components share the 16-centroid
+    /// codebook. No QJL residual.
     ///
     /// Opt-in only via `--kv-quant rotor4` (alias `rotor_v_4`). Requires
     /// `head_dim > 0`; tail-padded for `head_dim % 3 != 0`.
@@ -304,10 +273,11 @@ pub enum KvQuant {
     /// → `turboquant35` — same `high_precision_indices` as `turbo3`; no
     /// codebook override since TCQ reuses the standard Lloyd-Max codebook).
     ///
-    /// **Implementation scope**: CPU Viterbi encode + CPU dequant on the hot
-    /// path; the MSL Viterbi kernel ([`crate::tcq_v_msl`](crate::tcq_v_msl))
-    /// ships as a future-reference hook (K8VTurbo3 / K8VTurbo2 MSL hooks both
-    /// regressed the −2 % TPS gate when dispatched on the hot path).
+    /// Its decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no packed store (`docs/KV_QUANT.md` § "Codec disposition",
+    /// Class 2). The MSL Viterbi kernel
+    /// ([`crate::tcq_v_msl`](crate::tcq_v_msl)) is not dispatched on the
+    /// update path.
     ///
     /// Opt-in **only** via `--kv-quant k8vturbo3tcq`; never an auto default.
     K8VTurbo3Tcq,
@@ -318,12 +288,9 @@ pub enum KvQuant {
     /// **off by default**, because the sideband has no MSL kernel and forces the
     /// whole rotor K path onto the CPU (see [`crate::rotor_qjl`]).
     ///
-    /// **Arch guard (Contract A.y — mandatory)**: K-side ≤4-bit on Qwen MoE
-    /// is the PPL-disaster zone (218→8641 on Q4_K_M baseline; 7:1 GQA
-    /// amplifies K-head error through softmax). The auto default
-    /// never returns `Rotor3Sym` for Qwen MoE; explicit `--kv-quant rotor3_sym`
-    /// on Qwen MoE is rejected at resolve-time. Opt-in only via
-    /// `--kv-quant rotor3_sym`. Requires `head_dim > 0`.
+    /// **Arch guard**: stores K below 8 bits, so
+    /// `rmlx_models::kv_cache::validate_resolved` rejects it on Qwen MoE. Opt-in
+    /// only via `--kv-quant rotor3_sym`. Requires `head_dim > 0`.
     Rotor3Sym,
     /// Symmetric rotor4 — same arch guard rationale as
     /// [`Rotor3Sym`](KvQuant::Rotor3Sym) with the 16-centroid 4-bit Lloyd-Max
@@ -334,40 +301,42 @@ pub enum KvQuant {
     /// V stays bf16 (lives on `KvCache::decode_fp16_v`, same machinery as
     /// [`PlanarK`](KvQuant::PlanarK) / [`IsoKOnly3`](KvQuant::IsoKOnly3)).
     ///
-    /// **Arch guard (Contract A.y — mandatory)**: rejected on Qwen MoE for
-    /// the same reason as [`Rotor3Sym`](KvQuant::Rotor3Sym). Opt-in only via
-    /// `--kv-quant k_rotor3`. Requires `head_dim > 0`.
+    /// **Arch guard**: stores K below 8 bits, so
+    /// `rmlx_models::kv_cache::validate_resolved` rejects it on Qwen MoE. Opt-in
+    /// only via `--kv-quant k_rotor3`. Requires `head_dim > 0`.
     RotorKOnly3,
     /// K-only rotor4 — same shape as
     /// [`RotorKOnly3`](KvQuant::RotorKOnly3) with the dense 4-bit codebook
     /// on K. Opt-in only via `--kv-quant k_rotor4`. Arch-guarded against
     /// Qwen MoE.
     RotorKOnly4,
-    /// Asymmetric rotor3 K + affine V — K is rotor3 (Cl(3,0)
-    /// Clifford rotor sandwich + 3-bit Lloyd-Max codebook, optional QJL
-    /// residual); V is MLX-affine `v_bits` / `v_group_size`.
+    /// Asymmetric rotor3 K + TurboQuant V — K is rotor3 (Cl(3,0) Clifford
+    /// rotor sandwich + 3-bit Lloyd-Max codebook, optional QJL residual); V is
+    /// `QuantV`, the TurboQuant N(0,1) Lloyd-Max codec at a fixed 32-element
+    /// group. The V spelling borrows the affine tags (`q4_g128`, `q4_g64`,
+    /// `q4_g32`, `q3_g64`, `q2_g64`, see [`validate_rotor_k_asym_v`]);
+    /// `v_group_size` is carried only into the layout tag.
     ///
-    /// Closes the gap between [`Rotor3Sym`](KvQuant::Rotor3Sym) (rotor V) and
-    /// [`RotorKOnly3`](KvQuant::RotorKOnly3) (bf16 V): any of the standard MLX
-    /// affine V codecs (Q8G128, Q8G64, Q4G128, Q4G64, Q3G64, Q2G64) can be
-    /// paired with rotor3 K. Storage routes to
-    /// [`KvStorage::RotorKAsym3`](crate::storage::KvStorage::RotorKAsym3); SDPA
-    /// reuses the [`RotorKOnly3`](KvQuant::RotorKOnly3) dequant-then-SDPA path
-    /// for K and the existing affine V encode/decode for V.
+    /// Storage routes to
+    /// [`KvStorage::RotorKAsym3`](crate::storage::KvStorage::RotorKAsym3). Its
+    /// decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no packed store (`docs/KV_QUANT.md` § "Codec disposition",
+    /// Class 2).
     ///
-    /// **Arch guard (Contract A.y — mandatory)**: rejected on Qwen MoE for
-    /// the same reason as [`Rotor3Sym`](KvQuant::Rotor3Sym). Opt-in only via
-    /// the compose-form `--ctk rotor3 --ctv q{v_bits}_g{v_group_size}` (e.g.
-    /// `--ctv q8_g128`). Display form: `rotor_k_3_asym_v{v_bits}_g{v_group_size}`.
+    /// **Arch guard**: stores K below 8 bits, so
+    /// `rmlx_models::kv_cache::validate_resolved` rejects it on Qwen MoE.
+    /// Opt-in only via the compose form `--ctk rotor_k_3 --ctv q{v_bits}_g{v_group_size}`
+    /// (e.g. `--ctv q4_g64`). Display form:
+    /// `rotor_k_3_asym_v{v_bits}_g{v_group_size}`.
     RotorK3Asym {
-        /// V quantization bit-width (affine).
+        /// V quantization bit-width.
         v_bits: u8,
-        /// V affine group size.
+        /// V group size as the spelling carries it (layout tag only).
         v_group_size: u16,
     },
-    /// Asymmetric rotor4 K + affine V — same shape as
+    /// Asymmetric rotor4 K + TurboQuant V — same shape as
     /// [`RotorK3Asym`](KvQuant::RotorK3Asym) with the 16-centroid 4-bit rotor
-    /// codebook on K. Opt-in only via `--ctk rotor4 --ctv q{v_bits}_g{v_group_size}`.
+    /// codebook on K. Opt-in only via `--ctk rotor_k_4 --ctv q{v_bits}_g{v_group_size}`.
     /// Arch-guarded against Qwen MoE.
     RotorK4Asym {
         /// V quantization bit-width (affine).
@@ -391,14 +360,13 @@ pub enum KvQuant {
     /// TCQ reuses the standard Lloyd-Max codebook). Maps to the `max_compression`
     /// preset in `multi-turboquant/presets.py`.
     ///
-    /// **Outlier-mask decision**: `high_precision_indices` attachment is
-    /// deferred. This port ships naïve (mirrors the plain turbo2 path with no
-    /// outlier masking). The calibration surface (`QuantV::high_precision_indices`)
-    /// is already present in `QuantV`; wiring it for 2-bit TCQ is a follow-up.
+    /// No outlier masking: `QuantV::high_precision_indices` is not attached
+    /// for 2-bit TCQ, as on the plain turbo2 path.
     ///
-    /// **Implementation scope**: CPU Viterbi encode + CPU dequant on the hot
-    /// path. A GPU Viterbi kernel is not currently wired — the previous
-    /// parked hook had no production dispatch caller and was removed.
+    /// Its decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no packed store (`docs/KV_QUANT.md` § "Codec disposition",
+    /// Class 2). The Viterbi encode runs on the CPU; no GPU Viterbi kernel is
+    /// wired.
     ///
     /// Opt-in **only** via `--kv-quant k8vturbo2tcq`; never an auto default.
     K8VTurbo2Tcq,
@@ -551,7 +519,7 @@ enum SideStore {
     /// and then drops them, so the ring is the sole resident copy from the first
     /// fused decode step onward.
     ///
-    /// Two shapes hold the blocks instead and cost 3.98× this, so the estimate
+    /// Two shapes hold the blocks instead and cost 6.07× this for iso3, so the estimate
     /// runs low for them. Both are observable:
     ///
     /// * **transient** — the window between `exit_prefill`, which bulk-encodes
@@ -779,10 +747,8 @@ impl KvQuant {
         matches!(self, KvQuant::Mixed { .. } | KvQuant::RotK { .. })
     }
 
-    /// True for KV codecs that store K below 8 bits. Sub-8-bit K is
-    /// catastrophic on high-GQA architectures (measured: Qwen MoE PPL
-    /// 218 → 8641). `validate_resolved` in `rmlx-models` decides which
-    /// archs reject these codecs — this predicate only names the codec
+    /// True for KV codecs that store K below 8 bits. `validate_resolved` in
+    /// `rmlx-models` decides which archs reject these codecs — this predicate only names the codec
     /// property. `K8V4` / `K8V8` / `Planar` / `K8VTurbo3` keep K at
     /// 8-bit and are NOT included.
     ///
@@ -1072,10 +1038,11 @@ impl KvQuant {
     /// and by the resolve-time readiness logic to widen the first-serve window
     /// only for shader-heavy codecs.
     ///
-    /// **Important:** "carries MSL" is *not* the same as "runs entirely on
-    /// Metal". The iso / rotor families also return `true` here (their K-side is
-    /// q8_0 MSL and they ship V/K GPU encoders), yet their production V encode +
-    /// dequant run on **CPU** — see [`cpu_hot_path_reason`](Self::cpu_hot_path_reason).
+    /// **Important:** "carries MSL" is *not* the same as "runs on Metal on the
+    /// hot path". The V-only iso / rotor families also return `true` here (their
+    /// K-side is q8_0 MSL and they ship V/K GPU encoders), yet no kernel runs
+    /// their store on the default flow — see
+    /// [`cpu_hot_path_reason`](Self::cpu_hot_path_reason).
     /// The only codec with no MSL at all is `None` (raw bf16, `slice_update`).
     ///
     /// Exhaustive on purpose (no wildcard) so a new variant must be classified.
@@ -1117,21 +1084,21 @@ impl KvQuant {
         }
     }
 
-    /// `Some(reason)` when this codec runs its V (and, for the K-only
-    /// / symmetric variants, K) **encode + dequant on the CPU** on the default
-    /// production hot path — i.e. it falls through to the dequant-then-SDPA
-    /// legacy path with a host-side scalar codec rather than a Metal kernel.
+    /// `Some(reason)` when no Metal kernel runs this codec's store on the
+    /// default production hot path.
     ///
-    /// This is the honest Metal-vs-CPU verdict (CLAUDE.md hard rule 7),
-    /// grounded in the actual decode/prefill dispatch in
-    /// [`crate::kvcache`]'s `update_*` functions — not in assumptions:
+    /// The verdict per family, read from [`crate::kvcache`]'s `update_*`
+    /// functions:
     ///
-    /// - **V-only iso / rotor** (`Iso3/4(/Sym)`, `Rotor3/4(/Sym)`,
-    ///   `RotorK{3,4}Asym`): `update_iso3*` / `update_rotor_{v,sym,k_asym}`
-    ///   early-return to
-    ///   the warm-TTFT bf16 decode seed (`decode_fp16_k.is_some()`) at decode,
-    ///   so the GPU iso/rotor branch is shadowed and the codec encode that does
-    ///   run (at prefill) is CPU → `Some(reason)`.
+    /// - **V-only iso / rotor and rotor-K-asym** (`Iso3/4`, `Rotor3/4`,
+    ///   `RotorK{3,4}Asym`): decode early-returns to the bf16 mirror
+    ///   (`decode_fp16_k.is_some()`) and `exit_prefill` builds no packed store,
+    ///   so the codec does not run on a cache that went through prefill →
+    ///   `Some(reason)`. On a cache with no mirror, the GPU path encodes
+    ///   through the iso / rotor MSL kernel.
+    /// - **Symmetric iso / rotor** (`Iso3Sym/4Sym`, `Rotor3Sym/4Sym`): decode is
+    ///   the flash kernel over both packed rings → `None`, except rotor with
+    ///   QJL on → `Some`.
     /// - **K-only iso** (`IsoKOnly3/4`): NO bf16 early-return — the iso K MSL
     ///   kernel dispatches every decode step on GPU → `None` (Metal, and
     ///   GPU-resident end to end: the flash-decode kernel reads the packed ring
@@ -1145,10 +1112,8 @@ impl KvQuant {
     ///   only before the store is built (it is the value the store takes at
     ///   first append), so the verdict tracks the dispatcher on any live cache.
     ///
-    /// The `Some(reason)` cases are the source of the 30–60× first-forward
-    /// slowdown and the monotonic decode decay as KV grows. A `None` here MUST
-    /// mean a Metal kernel demonstrably dispatches on the hot path — never an
-    /// assumption.
+    /// A `None` here must mean a Metal kernel dispatches on the hot path, or
+    /// that the codec is bf16.
     ///
     /// Returns `None` for codecs whose hot path is genuinely Metal (q8_0 K +
     /// tq4/planar/affine V, the Turbo/Mixed/RotK families, plus the K-only iso /
@@ -1161,15 +1126,12 @@ impl KvQuant {
     )]
     pub fn cpu_hot_path_reason(&self) -> Option<&'static str> {
         match self {
-            // V-only iso variants: the K side is GPU affine q8_0 and a GPU iso
-            // V encode/dequant branch EXISTS, but at the decode hot path
-            // `update_iso3*` early-returns to the warm-TTFT bf16 decode seed
-            // (`decode_fp16_k.is_some()`), so the GPU iso branch is shadowed;
-            // the iso V-encode that does run (at prefill) is CPU.
+            // V-only iso variants: decode early-returns to the bf16 mirror and
+            // `exit_prefill` builds no store, so the iso V codec does not run on
+            // a cache that went through prefill.
             KvQuant::Iso3 | KvQuant::Iso4 => Some(
-                "IsoQuant (quaternion SO(4)) V-only: a GPU iso encode/dequant branch \
-                 exists but is shadowed by the bf16 decode seed; prefill V-encode runs \
-                 on CPU",
+                "IsoQuant (quaternion SO(4)) V-only: decode reads the bf16 mirror, so \
+                 the iso V codec does not run on a cache that went through prefill",
             ),
             // Symmetric iso variants: NO bf16 decode-seed early-return — decode
             // is the quant-V flash kernel over both packed iso rings. Iso carries
@@ -1186,15 +1148,15 @@ impl KvQuant {
             // boundary, never from a decode step. Metal hot path, no host stage.
             KvQuant::IsoKOnly3 | KvQuant::IsoKOnly4 => None,
             // V-only rotor variants and the rotor-K-asym variants early-return to
-            // the bf16 decode seed at decode (`decode_fp16_k.is_some()`), so the
-            // rotor K codec only fires at prefill on CPU; the GPU fused-QK encoder
-            // is opt-in (`--fused-qk`) and does not fire on the standard flow.
+            // the bf16 mirror at decode (`decode_fp16_k.is_some()`) and
+            // `exit_prefill` builds no store; the GPU fused-QK encoder is opt-in
+            // (`--fused-qk`).
             KvQuant::Rotor3
             | KvQuant::Rotor4
             | KvQuant::RotorK3Asym { .. }
             | KvQuant::RotorK4Asym { .. } => Some(
-                "RotorQuant (Clifford Cl(3,0)) encode + dequant run on CPU on the \
-                 default hot path (the bf16 decode seed shadows the GPU branch); the \
+                "RotorQuant (Clifford Cl(3,0)): decode reads the bf16 mirror, so the \
+                 rotor codec does not run on a cache that went through prefill; the \
                  GPU fused-QK encoder is opt-in (--fused-qk)",
             ),
             // Symmetric rotor variants: NO bf16 decode-seed early-return — decode
@@ -1272,8 +1234,7 @@ impl KvQuant {
     /// The `(k_bits, v_bits, k_group_size, v_group_size)` the Mixed state should
     /// be built with for this quant, or `None` for non-Mixed-path variants.
     ///
-    /// RotK fixes K at 8-bit/group=64 (rotation is a PPL win over affine-K, not
-    /// a sub-8-bit-K enabler) and carries V's bits/group from the tag.
+    /// RotK fixes K at 8-bit/group=64 and carries V's bits/group from the tag.
     #[allow(
         clippy::wildcard_enum_match_arm,
         reason = "wildcard arm is the correct fallthrough for unsupported arch/quant variants; exhaustive expansion would require updating on every new variant"
@@ -1376,7 +1337,7 @@ impl KvQuant {
     ///   the GPU ring and their fused append drops the CPU blocks once it is
     ///   live, so they are [`SideStore::IsoRing`]. `Iso3` / `Iso4` have no ring
     ///   path — their decode early-returns to the bf16 mirror — so the store
-    ///   they would hold is [`SideStore::IsoBlocks`], 3.98× larger. Collapsing
+    ///   they would hold is [`SideStore::IsoBlocks`], 6.07× larger for iso3. Collapsing
     ///   the two would mis-size one family or the other by that factor.
     /// * **`RotorK{3,4}Asym`'s V is not affine.** Its name and its storage
     ///   field say `QuantV`, and `QuantV::new_affine_decode` is a misnomer: the
@@ -1464,7 +1425,7 @@ impl KvQuant {
     ///   Every cadence in [`SideStore`] is measured against the store's own
     ///   encoder, so there is no rounding term to remember. The exception is
     ///   iso, whose side is sized from the GPU ring: a cache holding the CPU
-    ///   blocks `exit_prefill` built holds 3.98× that on the iso axis. That is
+    ///   blocks `exit_prefill` built holds 6.07× that on the iso3 axis. That is
     ///   a transient window on a layer the fused decode path serves, and a
     ///   permanent under-report on a layer whose shape that path's gate rejects
     ///   (batch > 1, or a `head_dim` that is not a power of two at most 512).
@@ -1828,9 +1789,8 @@ impl std::str::FromStr for KvQuant {
             // RotK's V slot *is* Mixed's V slot: `KvStorage::new` builds it
             // with `MixedKvState::new_rotated`, which hands (bits, group_size)
             // to the same MLX affine quantizer. Validating it with the same
-            // function keeps the two from accepting different sets — the arm
-            // used to accept every `u8` / `u16` pair, so `rot_k_v99g7` parsed
-            // into a codec whose first encode would ask for a 99-bit quantize.
+            // function keeps the two from accepting different sets, so
+            // `rot_k_v99g7` fails here and not at its first 99-bit quantize.
             validate_mixed_side('v', v_bits, v_group_size).map_err(mk_err)?;
             return Ok(KvQuant::RotK {
                 v_bits,
@@ -1905,7 +1865,7 @@ impl std::str::FromStr for KvQuant {
 /// The Display form uses an underscore between the bits and group-size
 /// components (e.g. `v4_g128`), unlike the `mixed_*` Display form
 /// (`v4g128`). This dedicated parser handles the underscore-separated
-/// shape; [`parse_kv_side`] is preserved for the legacy `mixed_*` syntax.
+/// shape; [`parse_kv_side`] parses the `mixed_*` syntax.
 fn parse_rotor_k_asym_v_suffix(
     rest: &str,
     full_input: &str,

@@ -159,8 +159,8 @@ fn dense_qwen3_5_snapshot_resolves_to_the_dense_class() {
 
 /// The bypass: MoE tensors, dense declaration. The guard must still fire.
 ///
-/// Keyed on `architectures[0]` this run completes normally on the measured
-/// PPL-disaster path.
+/// Keyed on `architectures[0]`, this run would complete normally with a
+/// low-bit K codec the guard exists to reject.
 #[test]
 #[ignore = "loads a real multi-GB snapshot"]
 fn mislabelled_moe_snapshot_cannot_bypass_the_k_side_guard() {

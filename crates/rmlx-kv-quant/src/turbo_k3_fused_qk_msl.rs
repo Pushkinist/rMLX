@@ -37,10 +37,9 @@
 //! Identical to the q8 path: `n_q_heads = kv_h * heads_per_kv`; thread
 //! group maps `(b, hq) -> kv_h_idx = hq / heads_per_kv` to share K.
 //!
-//! # A.y guard
+//! # Qwen MoE guard
 //!
-//! `TurboSym3` is K-side 3-bit, the Qwen-MoE 218->8641 PPL disaster applies.
-//! The guard lives in [`rmlx_models::kv_cache::cache_type::validate_resolved`]
+//! `TurboSym3` stores K at 3 bits, so Qwen MoE rejects it. The guard lives in [`rmlx_models::kv_cache::cache_type::validate_resolved`]
 //! and rejects `Qwen3_5MoeForConditionalGeneration + TurboSym3` at session
 //! start — the kernel does not re-check.
 //!

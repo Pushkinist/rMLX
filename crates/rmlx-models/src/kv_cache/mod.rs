@@ -13,49 +13,35 @@
 //! The generator allocates one `Vec<KvCache>` (one entry per layer) and resets
 //! all on every new request via `KvCache::reset`.
 //!
-//! # Quantization modes (S2.4)
+//! # Quantization modes
 //!
-//! Default KV caches are quantized (K8V4, K8V8, Planar). The unquantised
-//! `KvQuant::None` path (removed then restored) is opt-in via `--kv-quant
-//! none` (alias `bf16`), as the closest available comparison against mlx-lm's
-//! bf16-KV champion. It holds a `[B, kv_h, S, D]` bf16 K and V buffer per
-//! layer. On the arches that adopted the lazy ring — gemma4, qwen3,
-//! qwen3_5_moe, qwen3_vl_moe, the ones that call `context::resolve_context` and
-//! `with_max_seq_ceiling` — that buffer starts small and grows toward the
-//! `--max-ctx` ceiling instead of being allocated at it. laguna, gemma3,
-//! qwen2 and bitnet still construct at the resolved `--max-ctx`
+//! `auto` resolves to [`DEFAULT_KV_QUANT`], unquantised bf16, on every arch.
+//! Every quantised codec is opt-in. `KvQuant::None` (`--kv-quant none`, alias
+//! `bf16`) holds a `[B, kv_h, S, D]` bf16 K and V buffer per layer. On the
+//! arches that call `context::resolve_context` and `with_max_seq_ceiling` —
+//! gemma4, qwen3, qwen3_5_moe, qwen3_vl_moe — that buffer starts small and
+//! grows toward the `--max-ctx` ceiling. laguna, gemma3, qwen2 and bitnet
+//! construct at the resolved `--max-ctx`
 //! (`max_ctx_override.unwrap_or(KV_MAX_SEQ_DEFAULT)`, no ceiling set), so a
-//! large `--max-ctx` is an eager allocation there. Auto-resolver default is
-//! unchanged (still K8V8).
+//! large `--max-ctx` is an eager allocation there.
 //!
 //! `none` is a pure-bf16 control on every arch: [`kv_quant_for_layer`]'s
 //! boundary promotion applies only to a base mode that quantizes, so no layer
-//! of a `none` run holds a packed store. This was not always true — the
-//! promotion used to fire under `None` too, which made `none` a bf16/K8V8
-//! mixture measuring up to 1.16× true bf16 (gemma-4-26b at 32k). Historical
-//! "vs `none`" numbers recorded before that fix carry a per-arch correction
-//! factor; see `docs/KV_LAYER_POLICY.md` §Layer-adaptive overrides.
+//! of a `none` run holds a packed store.
 //!
-//! `KvQuant::K8V4` is the recorded baseline for Qwen MoE PPL recovery
-//! (`docs/KV_CODECS.md` §"Qwen MoE note"). It is opt-in, never automatic:
-//! - K uses affine q8_0 (symmetric 8-bit, `group_size=128`).
-//! - V uses TurboQuant 4-bit Lloyd-Max N(0,1) codebook.
-//! - The split is per-axis (K vs V), NOT per layer-index — the Python fork
-//!   uses a fake `8,4` flag where both K and V are the same width, split
-//!   only by layer index. rMLX implements real asymmetric K/V.
+//! `KvQuant::K8V4` stores K as affine q8_0 (symmetric 8-bit,
+//! `group_size=128`) and V with the TurboQuant 4-bit Lloyd-Max N(0,1)
+//! codebook. The split is per axis (K vs V), not per layer index.
 //!
-//! `KvQuant::K8V8` stores both K and V with affine q8_0 — verified coherent on
-//! all 11 Open Models with the SWA per-layer mask dispatch fix. It is opt-in:
-//! `auto` resolves to [`DEFAULT_KV_QUANT`] (bf16) on every arch.
+//! `KvQuant::K8V8` stores both K and V with affine q8_0.
 //!
-//! `KvQuant::Planar` is K = q8_0, V = PlanarQuant 4-bit (S3.4 — 2026-05).
+//! `KvQuant::Planar` is K = q8_0, V = PlanarQuant 4-bit.
 //!
-//! # Qwen MoE catastrophe (CLAUDE.md mandate)
+//! # Qwen MoE
 //!
-//! Symmetric TurboQuant on Qwen2.5/Qwen3 + Q4_K_M weights causes PPL
-//! degradation from 218 to 8641 (catastrophic). The 7:1 GQA ratio amplifies
-//! K-head quantization error through softmax. K8V8 (or K8V4) is required;
-//! never run Qwen MoE with a 4-bit-K cache.
+//! Qwen MoE rejects every codec that stores K below 8 bits
+//! ([`cache_type::validate_resolved`]; `docs/KV_LAYER_POLICY.md` § "Qwen MoE
+//! rejects low-bit K codecs"). K8V8 and K8V4 keep K at 8 bits and pass.
 
 #![allow(clippy::match_same_arms, clippy::trivially_copy_pass_by_ref)]
 pub mod attention_dispatch;
@@ -63,8 +49,7 @@ pub mod cache_type;
 
 use rmlx_kv_quant::KvQuant;
 
-// The `pub use rmlx_kv_quant::*` and `pub use rmlx_kv_ssd::*` shim
-// re-exports were dropped. All callers import the codec layer
+// Callers import the codec layer
 // (`KvCache`, `LinearAttnCache`, `KvQuant`, `storage`, `paged`, `mixed_quant`,
 // `rot_k`, `rotating`, `q8`, etc.) directly from `rmlx_kv_quant::*`, and the
 // SSD-tier layer (`KvBlockReader`, `KvBlockWriter`, `SsdKvIndex`, `SsdSpiller`,
@@ -76,24 +61,12 @@ mod tests;
 
 // ── Public constant ───────────────────────────────────────────────────────────
 
-// `KV_MAX_SEQ_DEFAULT` lives in `rmlx_kv_quant::quant`.
-// The re-export shim was dropped; import directly from
+// `KV_MAX_SEQ_DEFAULT` lives in `rmlx_kv_quant::quant`; import it from
 // `rmlx_kv_quant::KV_MAX_SEQ_DEFAULT`.
 
 /// Default number of tail layers forced to the boundary floor
-/// ([`boundary_floor`]) by [`kv_quant_for_layer`]. Matches the N70 reference
-/// experiment.
-///
-/// **What that experiment measured.** The N70 sweep, and the head-layer sweep
-/// on [`LAYER_ADAPTIVE_HEAD_N`], were both recorded when the promotion target
-/// was `KvQuant::K8V8` for every base — and `K8V8` materialises no packed store
-/// (`KvQuant::decode_reads_packed_store` is false, both `feeds_bf16_*` true),
-/// so a layer holding it decodes at model dtype. Those sweeps therefore measured
-/// **bf16 boundary layers**, not q8_0 ones, and the quality figures they produced
-/// are evidence for *how many* layers the exemption should span, not for what
-/// an 8-bit boundary layer costs in quality. The counts are carried over
-/// unchanged; the quality of the in-family 8-bit target has not been re-derived
-/// to that standard. See `docs/KV_LAYER_POLICY.md` §Layer-adaptive overrides.
+/// ([`boundary_floor`]) by [`kv_quant_for_layer`]. A setting, not a measured
+/// optimum; see `docs/KV_LAYER_POLICY.md` § "Layer-adaptive overrides".
 ///
 /// The value itself lives in `rmlx_core::kv_boundary` so `rmlx-metrics` can
 /// recognise a `decode_config` that spells it out without a second copy; the
@@ -101,18 +74,8 @@ mod tests;
 pub const LAYER_ADAPTIVE_TAIL_N: usize = rmlx_core::kv_boundary::DEFAULT_BOUNDARY_TAIL_N;
 
 /// Default number of head layers forced to the boundary floor
-/// ([`boundary_floor`]) by [`kv_quant_for_layer`], at every context length.
-///
-/// Bench findings show first-layer KV vectors carry the highest absolute magnitudes
-/// (embedding residual is large before deep normalisation) and that exempting
-/// the first 2 layers recovers 37–91% of turbo2 quality loss at ≥32K
-/// context. That sweep is the evidence for the constant, not a gate on it:
-/// [`kv_quant_for_layer`] is never handed a context length.
-///
-/// The sweep was reported as "q8_0 on the first 2 layers", but the treatment it
-/// ran was `KvQuant::K8V8`, which stores nothing and decodes bf16 — see the
-/// provenance note on [`LAYER_ADAPTIVE_TAIL_N`]. Read it as evidence for the
-/// count, not for the width.
+/// ([`boundary_floor`]) by [`kv_quant_for_layer`], at every context length. A
+/// setting, not a measured optimum, like [`LAYER_ADAPTIVE_TAIL_N`].
 ///
 /// The value lives in `rmlx_core::kv_boundary`, for the reason given on
 /// [`LAYER_ADAPTIVE_TAIL_N`].
@@ -127,15 +90,8 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = rmlx_core::kv_boundary::DEFAULT_BOUNDAR
 /// Returns `base_quant` for all other layers, and for every layer when
 /// `base_quant` quantizes neither side.
 ///
-/// Rationale:
-/// - **Tail**: last-layer K/V vectors carry the highest per-token information.
-///   Forcing 8-bit for the tail recovers PPL quality lost to aggressive
-///   V-quant (turbo3/planar).
-/// - **Head**: first-layer K/V vectors carry large absolute magnitudes
-///   (embedding residual before deep normalisation). Exempting the first 2
-///   layers was measured to recover 37–91% of turbo2 quality degradation at
-///   ≥32K ctx — with a bf16 boundary layer, which is the treatment that sweep
-///   ran; see [`LAYER_ADAPTIVE_HEAD_N`]. The promotion itself is unconditional.
+/// The counts are a setting, not a measured optimum. The promotion is
+/// unconditional: it does not read the context length.
 ///
 /// # Usage
 ///
@@ -184,8 +140,8 @@ pub const LAYER_ADAPTIVE_HEAD_N: usize = rmlx_core::kv_boundary::DEFAULT_BOUNDAR
 /// no cache to promote. Note that the second cancels nothing on the Gemma4
 /// checkpoints whose `num_kv_shared_layers` is 0 — every layer owns a cache
 /// there while `shares_kv` is still true for the stack, which is exactly the
-/// case the argument above exists for. Per-arch counts and the measured byte
-/// ratios are in `docs/KV_LAYER_POLICY.md` §Layer-adaptive overrides.
+/// case the argument above exists for. See `docs/KV_LAYER_POLICY.md`
+/// § "Which codec the floor is".
 ///
 /// When `head_n == 0` and `tail_n == 0`, `base_quant` is always returned.
 pub fn kv_quant_for_layer(
@@ -211,8 +167,7 @@ pub fn kv_quant_for_layer(
 /// whose widths are parameters carries its own 8-bit form, so the floor is
 /// applied inside its family: same store, same group geometry, same K rotation,
 /// both axes raised to 8 bits. A base whose width is baked into its variant has
-/// no such form to raise to and falls back to [`KvQuant::K8V8`], which is what
-/// every base used to get.
+/// no such form to raise to and falls back to [`KvQuant::K8V8`].
 ///
 /// # The mirror is a floor of its own
 ///
@@ -251,32 +206,23 @@ pub fn kv_quant_for_layer(
 ///
 /// # The floor is never free — it is cheaper in-family
 ///
-/// The in-family target is not delivered "from bytes the layer already spends":
-/// it is a wider store than the base, and the extra width is paid for. Measured
-/// on `Ternary-Bonsai-8B` (36 full-attention layers, 10 promoted) at
-/// `mixed_k4g64_v4g64`, the promotion is **19.80% of the whole cache** at both
-/// 4k and 32k — the boundary layers hold 8.50 bits per value where the base
-/// holds 4.50. What in-family buys is the comparison against the fallback: the
-/// same ten layers at `K8V8` would be 16.00 bits per value, a whole-cache ratio
-/// of 0.484x against the in-family 0.356x, so the family is worth about 27% of
-/// the cache. Cheaper, not free.
+/// The in-family target is a wider store than the base, and the extra width is
+/// paid for: at `mixed_k4g64_v4g64` a boundary layer holds 8.50 bits per value
+/// where the base holds 4.50. What in-family buys is the comparison against
+/// the fallback, which would hold 16.00 bits per value on the same layer.
 ///
 /// # What the fallback costs
 ///
 /// Ten codecs materialise a packed store and eight of them take the `K8V8`
 /// fallback, so for those eight the floor is paid at the full bf16 rate — the
 /// promoted layer materialises no store at all and holds two bf16 buffers. The
-/// price splits by side store. The `SideStore::IsoRing` four (`Iso{3,4}Sym`,
-/// `IsoKOnly{3,4}`) sit at 12.125 bits per value, so `K8V8`'s 16.00 is a 1.32x
-/// byte regression on their boundary layers, bought deliberately: an
-/// SO(4)-rotated 3-/4-bit ring has no 8-bit form, and the alternative to paying
-/// for the floor is not having one. On Bonsai-8B that is +7.2% of `iso3_sym`'s
-/// cache at 4k and +7.9% at 32k. The `SideStore::Rotor` four (`Rotor{3,4}Sym`,
-/// `RotorKOnly{3,4}`) are at 16.25, already above bf16, so their boundary
-/// layers are byte-**favourable** — measured at −1.3% of `rotor3_sym`'s cache
-/// at 4k and −0.6% at 32k. Neither group is diverted by the arm below — they do
-/// not mirror both axes — and the trade is recorded in `docs/KV_LAYER_POLICY.md`
-/// §Layer-adaptive overrides.
+/// `SideStore::IsoRing` four (`Iso{3,4}Sym`, `IsoKOnly{3,4}`) store 7.125 /
+/// 8.125 bits per value on the ring at `head_dim = 128`, and the
+/// `SideStore::Rotor` four (`Rotor{3,4}Sym`, `RotorKOnly{3,4}`) 8.75 / 9.75, so
+/// `K8V8`'s 16.00 roughly doubles the bytes of their boundary layers. The cost
+/// is bought deliberately: an SO(4)-rotated or rotor 3-/4-bit ring has no 8-bit
+/// form, and the alternative to paying for the floor is not having one.
+/// Neither group is diverted by the arm below — they do not mirror both axes.
 ///
 /// How many layers this reaches is a property of the model, not of the policy:
 /// a windowed layer runs the bf16 rotating ring whatever it is handed and a
@@ -299,7 +245,7 @@ pub fn kv_quant_for_layer(
 /// before the crate compiles. Listing is not deciding, though — a new
 /// parametric variant added to the fallback arm compiles cleanly and inherits
 /// `K8V8`. What catches that is
-/// `parametric_boundary_promotion_stays_under_bf16`, which sweeps every base in
+/// `store_bearing_boundary_promotion_never_costs_more`, which sweeps every base in
 /// `ALL_KV_QUANTS` that materialises a packed store, names the eight that take
 /// the fallback deliberately, and fails on any other store-bearing base that
 /// lands there.
@@ -328,7 +274,7 @@ fn boundary_floor(base_quant: KvQuant, shares_kv: bool) -> KvQuant {
             v_group_size,
         },
         // Widths baked into the variant: no 8-bit form of their own family to
-        // raise to, so the floor is `K8V8` — what every base used to get.
+        // raise to, so the floor is `K8V8`.
         KvQuant::None
         | KvQuant::K8V4
         | KvQuant::K8V8
@@ -757,8 +703,8 @@ pub struct KvLayerShape {
 /// fused decode step that drops the blocks; it is **permanent** on a layer
 /// whose shape that path's gate rejects (batch > 1, or a `head_dim` that is not
 /// a power of two at most 512 — `head_dim = 80` qualifies), because the ring is
-/// then never allocated and there is nothing to drop. The blocks are 3.98x the
-/// ring at `head_dim = 128` — 48.25 bits per value against the ring's 12.125 —
+/// then never allocated and there is nothing to drop. The blocks are 6.07x the
+/// ring at `head_dim = 128` — 43.25 bits per value against the ring's 7.125 —
 /// because the blocks are a host `Vec` form that carries an `f32` scale, a
 /// replicated `f32` quaternion per group and an `f32` norm, none of which the
 /// ring stores. The sign is what the warning is for; a reader must not size a
@@ -853,41 +799,20 @@ pub fn kv_codec_net_saving_total(
 ///
 /// # Why bf16 and not a quantised codec
 ///
-/// Measured on the current tree, not inherited:
-///
 /// * **The bf16-mirror codecs cost bytes they do not save.** `K8V8`, `K8V4`,
 ///   `Planar`, `Planar3`, `PlanarK`, the turbo and iso/rotor asymmetric
 ///   families all decode off the bf16 mirror `exit_prefill` materialises and
-///   never read their packed store, so that store is no longer built
+///   never read their packed store, so that store is not built
 ///   ([`rmlx_kv_quant::KvQuant::materialises_packed_store`]). Their resident KV
-///   is therefore *equal* to bf16's — byte-identical, measured — and so is
-///   their output at temp=0. They are the same cache under another name.
-/// * **The one store-reading codec a default ever picked loses on both axes.**
-///   Ten variants read their packed store at decode
-///   ([`rmlx_kv_quant::KvQuant::decode_reads_packed_store`]); `Mixed` is the
-///   only one the retired per-arch table selected, on 2-bit Qwen3 dense. It
-///   holds that store *beside* a bf16 mirror, so it is bf16 plus a store:
-///   measured resident KV ratio `none`/`Mixed` of 0.777 / 0.775 / 0.774 at
-///   4k / 8k / 32k on Ternary-Bonsai-8B, with lossy output (token ids part from
-///   bf16 at id 57 / 56 / 35 of 100) and no throughput to show for it — `none`
-///   is +3.00% and +2.58% SEPARATED at 4k and 8k and INCONCLUSIVE at 32k.
+///   is therefore equal to bf16's, and so is their output at temp=0.
+/// * **A store-reading codec does not beat bf16 at decode.** At
+///   `heads_per_kv ≥ 4` no fused decode over a current store can beat the bf16
+///   `sdpa_vector` path; see `docs/KV_QUANT.md` § "Fused flash-decode over a
+///   quant store — the break-even condition". A codec that holds less
+///   resident KV is an opt-in memory setting.
 ///
-/// So the codec axis has no cell that beats bf16 on memory, and none that beats
-/// it on decode. A default that picks one is charging the operator for a label.
-///
-/// # What this does not say
-///
-/// It does not say quantised KV cannot pay. It says these implementations do
-/// not, on this hardware, today: the byte saving inside a packed path converts
-/// to time at an efficiency far below 1, which is what cancels it. The measured
-/// break-even condition and the epsilon values behind that live in
-/// `docs/KV_QUANT.md` §"Fused flash-decode over a quant store"; no single
-/// summary percentage is quoted here because none is recorded.
 /// Every codec stays selectable with an explicit `--kv-quant` / `--cache-type-*`
-/// / `--kv-preset`; only what `auto` resolves to is fixed here. When the
-/// fused-decode-over-quantised-store work lands, this constant is the one place
-/// that has to change — and it must change on a fresh measurement, not by
-/// restoring a table.
+/// / `--kv-preset`; only what `auto` resolves to is fixed here.
 ///
 /// See `docs/KV_QUANT.md` § "The auto default".
 pub const DEFAULT_KV_QUANT: KvQuant = KvQuant::None;
@@ -988,9 +913,9 @@ impl KvCacheBuilder {
 // The SSD-tier process-global event recorder + 5 Prometheus observation hook
 // globals (`set_ssd_event_recorder`,
 // `set_ssd_{spill_prom,hydrate_prom,bytes_used,evict_total}_hook`, plus the
-// internal `call_*` accessors) live in `rmlx_kv_ssd::hooks`. The re-export
-// shim was dropped; cross-crate callers in `rmlx-server` / `rmlx-cli` import
-// directly from `rmlx_kv_ssd::set_ssd_*_hook`.
+// internal `call_*` accessors) live in `rmlx_kv_ssd::hooks`. Cross-crate
+// callers in `rmlx-server` / `rmlx-cli` import them from
+// `rmlx_kv_ssd::set_ssd_*_hook`.
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 

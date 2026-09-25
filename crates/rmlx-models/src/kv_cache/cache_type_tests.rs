@@ -45,7 +45,7 @@ fn q2_g64_round_trip_and_params() {
 fn kv_bitwidth_matrix_resolves() {
     // DoD: every supported V-side bit-width (2/3/3.5/4) resolves to a
     // concrete KvQuant when paired with an 8-bit K, given a head_dim that
-    // satisfies that codec's MLX bit-packing rule (§D6.2: head_dim % (32/bits)).
+    // satisfies that codec's MLX bit-packing rule (head_dim % (32/bits)).
     //
     // Document-the-truth: the rungs do NOT all resolve at the same head_dim.
     // - 2-bit packs 16 vals/u32 → head_dim % 16 == 0 (Bonsai's 128 OK).
@@ -90,7 +90,7 @@ fn kv_bitwidth_matrix_resolves() {
     .expect("q4_g64 V must resolve at head_dim=128");
     assert!(matches!(kq4, KvQuant::Mixed { v_bits: 4, .. }));
 
-    // 3-bit V at a 3-bit-friendly head_dim=320 (128 violates §D6.2 for 3-bit).
+    // 3-bit V at a 3-bit-friendly head_dim=320 (128 violates the MLX bit-packing rule for 3-bit).
     let kq3 = resolve(
         spec(CacheType::Q8G64, CacheType::Q3G64),
         ctx(arch, Some(320)),
@@ -758,10 +758,7 @@ fn named_q8_g64_k_with_tq4_v_rejected_no_silent_coercion() {
     // otherwise get a 128-wide one without being told.
     //
     // Only an `Auto` side is filled by the resolver, and it is filled with the
-    // canonical partner (see `a_lone_quantised_v_pairs_with_q8_g128_k`). This
-    // test previously reached the same rejection through `--ctk auto` and a
-    // per-arch `Mixed` base; that base no longer exists, so the case is now
-    // written the way an operator would actually hit it.
+    // canonical partner (see `a_lone_quantised_v_pairs_with_q8_g128_k`).
     let err = resolve(
         spec(CacheType::Q8G64, CacheType::Tq4),
         ctx("Qwen3ForCausalLM", Some(128)),
@@ -819,7 +816,7 @@ fn qwen_moe_all_auto_k8v8_accepted() {
 )]
 fn qwen_moe_low_k_bits_rejected_post_decompose() {
     // Hypothetical auto: Mixed{k_bits:4, v_bits:4, group=64}. This proves
-    // the post-decompose §D6.4 re-check fires even if the auto default
+    // the post-decompose Qwen MoE re-check fires even if the auto default
     // ever returned a bad value.
     let bad_auto = KvQuant::Mixed {
         k_bits: 4,
@@ -1013,7 +1010,7 @@ fn validate_resolved_gemma4_k8v8_passes() {
 )]
 fn validate_resolved_qwen_moe_tsym4_rejected() {
     // Arch guard: TurboSym4 (symmetric 4-bit Lloyd-Max K + tq4 V) on Qwen MoE
-    // is the PPL-218→8641 disaster path (CLAUDE.md hard rule 6). Rejected by
+    // stores K below 8 bits. Rejected by
     // `validate_resolved` with `QwenMoeKBitsTooLow(4)` (same error class as
     // the existing Mixed K<8 rejection — uniform exit code + hint surface).
     let err =
@@ -1029,7 +1026,7 @@ fn validate_resolved_qwen_moe_tsym4_rejected() {
 fn validate_resolved_qwen3vl_moe_tsym4_rejected() {
     // Qwen3VLMoeForConditionalGeneration is also a
     // Qwen sparse-MoE and must be covered by the is_qwen_moe guard.
-    // TurboSym4 on VL-MoE is the same PPL-disaster path as on text-only MoE.
+    // TurboSym4 on VL-MoE is rejected as on text-only MoE.
     let err =
         validate_resolved("Qwen3VLMoeForConditionalGeneration", &KvQuant::TurboSym4).unwrap_err();
     assert_eq!(err, ResolveError::QwenMoeKBitsTooLow(4));
@@ -1047,7 +1044,7 @@ fn validate_resolved_gemma4_tsym4_passes() {
     validate_resolved("Qwen3ForCausalLM", &KvQuant::TurboSym4).unwrap();
 }
 
-// Contract A.y — PlanarK is K-side 4-bit rotation and MUST be
+// PlanarK is K-side 4-bit rotation and MUST be
 // rejected on Qwen MoE. Covers BOTH text-only (`Qwen3_5MoeForConditionalGeneration`)
 // and vision-language (`Qwen3VLMoeForConditionalGeneration`) MoE arch strings.
 #[test]
@@ -1205,7 +1202,7 @@ fn rotor4_non_q8g128_k_rejected() {
 
 // ── K-side IsoQuant tests ─────────────────────────────────────────────────────
 
-/// Iso3Sym on Qwen MoE must fire the A.y guard
+/// Iso3Sym on Qwen MoE must fire the Qwen MoE low-K guard
 /// (QwenMoeIsoKRejected with the offending variant name).
 #[test]
 #[allow(
@@ -1231,7 +1228,7 @@ fn validate_resolved_qwen_moe_iso3_sym_rejected() {
     assert!(matches!(err, ResolveError::QwenMoeIsoKRejected { .. }));
 }
 
-/// Iso4Sym / IsoKOnly3 / IsoKOnly4 — same A.y guard fires.
+/// Iso4Sym / IsoKOnly3 / IsoKOnly4 — same Qwen MoE low-K guard fires.
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -1253,7 +1250,7 @@ fn validate_resolved_qwen_moe_all_iso_k_side_rejected() {
 }
 
 /// Non-MoE archs (Gemma4, Bonsai) accept all four iso K-side
-/// variants (A.y guard does not fire).
+/// variants (Qwen MoE low-K guard does not fire).
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -1386,7 +1383,7 @@ fn kv_quant_parse_iso_variants() {
 
 // ── Rotor K-side cache_type tests ────────────────────────────────────────────
 
-/// A.y Qwen MoE guard for every rotor K-side KvQuant variant.
+/// Qwen MoE low-K guard for every rotor K-side KvQuant variant.
 /// Asserts BOTH discriminator AND `variant` payload string (LOW-bug guard: must match both).
 #[test]
 #[allow(
@@ -1417,7 +1414,7 @@ fn validate_resolved_qwen_moe_all_rotor_k_side_rejected() {
     assert!(matches!(err, ResolveError::QwenMoeRotorKRejected { .. }));
 }
 
-/// A.y guard for the 2 internal CacheType K-side variants
+/// Qwen MoE low-K guard for the 2 internal CacheType K-side variants
 /// (RotorK3 / RotorK4) via combo_to_kv_quant → validate_resolved pipeline.
 /// Asserts both error discriminator and variant payload.
 #[test]
@@ -1475,8 +1472,8 @@ fn validate_resolved_non_moe_rotor_k_side_passes() {
         validate_resolved("Gemma4ForConditionalGeneration", &kq).unwrap();
         validate_resolved("Qwen3ForCausalLM", &kq).unwrap();
         // Dense Qwen3.5 shares a loader and an `Architecture` variant with the
-        // sparse-MoE path, so this string is a value `arch_class()` can now
-        // return. The measured PPL disaster is a sparse-MoE result; a dense
+        // sparse-MoE path, so this string is a value `arch_class()` can
+        // return. The guard covers the sparse-MoE strings only; a dense
         // model keeps these codecs.
         validate_resolved("Qwen3_5ForConditionalGeneration", &kq).unwrap();
     }
@@ -1617,7 +1614,7 @@ fn combo_to_kv_quant_tsym3_wrong_k_rejected() {
     assert!(matches!(err, ResolveError::UnsupportedCombo(_)));
 }
 
-/// A.y Qwen MoE guard for TurboSym3 (K-side 3-bit disaster).
+/// Qwen MoE low-K guard for TurboSym3 (K-side 3-bit disaster).
 /// Asserts BOTH discriminator AND `variant` payload string (LOW-bug guard: must match both).
 #[test]
 #[allow(
@@ -1677,16 +1674,16 @@ fn tsym3_in_all_and_tag() {
     );
 }
 
-// ── A.y guard verification for all fused-QK K-side KvQuant ──────────────────
+// ── Qwen MoE low-K guard verification for all fused-QK K-side KvQuant ──────────────────
 //
 // Every K-side ≤4-bit KvQuant that has a fused-QK kernel must be rejected on
 // Qwen MoE (`Qwen3_5MoeForConditionalGeneration`) by `validate_resolved`.
 //
-// Verifies the A.y guard contract that the kernel dispatch table assumes:
+// Verifies the Qwen MoE low-K guard contract that the kernel dispatch table assumes:
 // callers rely on `validate_resolved` having fired at session start to ensure
 // no K-side ≤4-bit codec reaches the Qwen MoE forward pass.
 
-/// A.y guard — TurboSym3 on Qwen MoE → QwenMoeTurboKRejected.
+/// Qwen MoE low-K guard — TurboSym3 on Qwen MoE → QwenMoeTurboKRejected.
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -1707,7 +1704,7 @@ fn validate_resolved_fused_qk_ay_guard_turbosym3() {
     }
 }
 
-/// A.y guard — TurboSym4 on Qwen MoE → QwenMoeKBitsTooLow(4).
+/// Qwen MoE low-K guard — TurboSym4 on Qwen MoE → QwenMoeKBitsTooLow(4).
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -1722,7 +1719,7 @@ fn validate_resolved_fused_qk_ay_guard_turbosym4() {
     );
 }
 
-/// A.y guard — IsoSym3 and IsoSym4 on Qwen MoE → QwenMoeIsoKRejected.
+/// Qwen MoE low-K guard — IsoSym3 and IsoSym4 on Qwen MoE → QwenMoeIsoKRejected.
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -1748,7 +1745,7 @@ fn validate_resolved_fused_qk_ay_guard_iso_sym() {
     }
 }
 
-/// A.y guard — RotorSym3 and RotorSym4 on Qwen MoE → QwenMoeRotorKRejected.
+/// Qwen MoE low-K guard — RotorSym3 and RotorSym4 on Qwen MoE → QwenMoeRotorKRejected.
 #[test]
 #[allow(
     clippy::unwrap_used,
@@ -1917,7 +1914,7 @@ fn combo_to_kv_quant_rotor_k4_asym_q4_g64() {
     );
 }
 
-/// RotorK*Asym variants are A.y-guarded on Qwen MoE (rejected with
+/// RotorK*Asym variants are low-K-guarded on Qwen MoE (rejected with
 /// the same `QwenMoeRotorKRejected` error string as the sym/k-only siblings).
 #[test]
 #[allow(

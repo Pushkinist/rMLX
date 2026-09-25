@@ -839,13 +839,12 @@ mod tests {
 
     /// A boundary layer must never cost more than the `K8V8` it replaces.
     ///
-    /// This is the property the promotion target has to have and the one it
-    /// lost twice over. `K8V8` materialises no packed store, so a layer
-    /// promoted to it holds two full bf16 mirrors — byte-identical to `none`,
-    /// 16 bits per value — and promoting a codec that stores 6.50 there was a
-    /// 2.46x increase, not a floor. Promoting it in-family on a stack that
-    /// *keeps* the mirror is the inverse error: the store is charged on top of
-    /// the two mirrors, 24.50 bits per value, 1.53x the fallback.
+    /// `K8V8` materialises no packed store, so a layer promoted to it holds
+    /// two full bf16 mirrors — byte-identical to `none`, 16 bits per value —
+    /// and promoting a codec that stores 6.50 there would be a 2.46x increase,
+    /// not a floor. Promoting it in-family on a stack that *keeps* the mirror
+    /// is the inverse error: the store is charged on top of the two mirrors,
+    /// 24.50 bits per value, 1.53x the fallback.
     ///
     /// Swept over every base in `ALL_KV_QUANTS` that materialises a packed
     /// store — the population for which the promotion is a byte question at all
@@ -862,10 +861,9 @@ mod tests {
         /// SO(4)-rotated or rotor 3-/4-bit ring cannot be widened to 8 without
         /// leaving the family, so their floor is bought at the fallback rather
         /// than delivered from bytes they already spend. `SideStore::IsoRing`
-        /// is 12.125 bits per value, so the iso four pay a 1.32x byte
-        /// regression for it; `SideStore::Rotor` is 16.25, above bf16, so the
-        /// rotor four are neutral-to-favourable. Recorded in
-        /// `docs/KV_LAYER_POLICY.md` §Layer-adaptive overrides.
+        /// is 7.125 / 8.125 bits per value and `SideStore::Rotor` 8.75 / 9.75,
+        /// so the fallback's 16.00 costs them more bytes on the boundary
+        /// layers. See `docs/KV_LAYER_POLICY.md` § "Which codec the floor is".
         const FALLBACK_BY_DESIGN: &[KvQuant] = &[
             KvQuant::Iso3Sym,
             KvQuant::Iso4Sym,

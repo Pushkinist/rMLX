@@ -131,20 +131,20 @@ pub const ROTOR_K_ONLY_4_LAYOUT_TAG: &str = "rotor_k_only_4";
 /// K-only rotor4 layout tag with QJL residual ON.
 pub const ROTOR_K_ONLY_4_QJL_LAYOUT_TAG: &str = "rotor_k_only_4_qjl";
 
-/// Asymmetric rotor3 K + affine V layout tag prefix
+/// Asymmetric rotor3 K + `QuantV` V layout tag prefix
 /// (QJL OFF). The full tag carries the V (bits, group) tuple appended as
-/// `_v{v_bits}g{v_group_size}` so the SSD reader can pick the affine V
-/// codec on hydrate. Distinct from [`ROTOR_K_ONLY_3_LAYOUT_TAG`] because
-/// V-side payload differs (affine 3-tuple vs bf16-on-parent).
+/// `_v{v_bits}g{v_group_size}` so the SSD reader can pick the V codec on
+/// hydrate. Distinct from [`ROTOR_K_ONLY_3_LAYOUT_TAG`] because the V-side
+/// payload differs (`QuantV` store vs bf16-on-parent).
 pub const ROTOR_K_ASYM_3_LAYOUT_PREFIX: &str = "rotor_k_asym_3";
 
-/// Asymmetric rotor3 K + affine V layout tag prefix (QJL residual ON).
+/// Asymmetric rotor3 K + `QuantV` V layout tag prefix (QJL residual ON).
 pub const ROTOR_K_ASYM_3_QJL_LAYOUT_PREFIX: &str = "rotor_k_asym_3_qjl";
 
-/// Asymmetric rotor4 K + affine V layout tag prefix (QJL OFF).
+/// Asymmetric rotor4 K + `QuantV` V layout tag prefix (QJL OFF).
 pub const ROTOR_K_ASYM_4_LAYOUT_PREFIX: &str = "rotor_k_asym_4";
 
-/// Asymmetric rotor4 K + affine V layout tag prefix (QJL residual ON).
+/// Asymmetric rotor4 K + `QuantV` V layout tag prefix (QJL residual ON).
 pub const ROTOR_K_ASYM_4_QJL_LAYOUT_PREFIX: &str = "rotor_k_asym_4_qjl";
 
 /// Layout tag for K8VTurbo3Tcq (Viterbi trellis 3-bit V).
@@ -171,9 +171,8 @@ pub const K8VTURBO2_TCQ_LAYOUT_TAG: &str = "k8vturbo2tcq";
 
 /// Internal storage: quantized byte buffers per K/V scheme.
 ///
-/// The unquantised `Full` variant was removed and later restored as `None`
-/// — opt-in only for bf16-KV parity benching.
-/// Auto-resolver still picks K8V8 / K8V4 / Planar by default.
+/// `auto` resolves to [`None`](KvStorage::None) (bf16) on every arch; every
+/// other variant is opt-in.
 pub enum KvStorage {
     /// K = affine q8_0, V = TurboQuant 4-bit.
     K8V4 {
@@ -187,18 +186,17 @@ pub enum KvStorage {
         v: Option<QuantK>,
         max_seq: i32,
     },
-    /// K = affine q8_0, V = PlanarQuant N-bit (S3.4).
+    /// K = affine q8_0, V = PlanarQuant N-bit.
     ///
     /// `bits ∈ {3, 4}`: 4 = original Planar codec (`KvQuant::Planar`);
-    /// 3 = new 3.25-bit variant (`KvQuant::Planar3`).
+    /// 3 = 3.25-bit variant (`KvQuant::Planar3`).
     ///
     /// Opt-in via `--kv-quant planar` (4-bit) or `--kv-quant planar3` (3-bit).
-    /// Default arch selection unchanged (auto = Planar 4-bit on eligible archs).
     Planar {
         k: Option<QuantK>,
         v: Option<QuantPlanarV>,
         max_seq: i32,
-        /// Bit-width for the V codec: 3 (Planar3) or 4 (legacy default).
+        /// Bit-width for the V codec: 3 (Planar3) or 4 (Planar).
         bits: u8,
     },
     /// Unquantised bf16 cache. The actual `Array` buffers live in
@@ -223,8 +221,8 @@ pub enum KvStorage {
     /// - Planar → PagedPlanarVStorage.
     ///
     /// For single-request decoding this degenerates to contiguous behaviour.
-    /// The block table is monotonically appended (no sharing/eviction) in this
-    /// phase. Real cross-request sharing arrives in continuous batching.
+    /// The block table is only appended to: no cross-request sharing and no
+    /// eviction.
     Paged {
         quant: KvQuant,
         k: Option<PagedKStorage>,
@@ -232,11 +230,13 @@ pub enum KvStorage {
         v_planar: Option<Box<PagedPlanarVStorage>>,
         max_seq: i32,
     },
-    /// bench prototype: K = affine q8_0 (group_size=128),
+    /// K = affine q8_0 (group_size=128),
     /// V = TurboQuant 3-bit Lloyd-Max N(0,1) codebook (group=32).
     ///
     /// Structurally identical to [`K8V4`](KvStorage::K8V4) but with `bits=3`
-    /// in the [`QuantV`] slot. No MSL kernel for 3-bit — CPU dequant only.
+    /// in the [`QuantV`] slot.
+    /// Decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no store (`docs/KV_QUANT.md` § "Codec disposition", Class 2).
     K8VTurbo3 {
         k: Option<QuantK>,
         v: Option<QuantV>,
@@ -251,11 +251,11 @@ pub enum KvStorage {
     ///
     /// **Arch guard**: never resolved automatically for Qwen MoE — explicit
     /// `--kv-quant tsym3` on Qwen MoE is rejected by the post-resolve invariant
-    /// check in `rmlx_models::kv_cache::validate_resolved_kv_quant` (symmetric
-    /// 3-bit K is the PPL-disaster path on Qwen MoE, same as 4-bit symmetric).
+    /// check in `rmlx_models::kv_cache::validate_resolved_kv_quant` (K below
+    /// 8 bits).
     ///
-    /// **V-side GPU dispatch**: V side is forced CPU path (same as the asymmetric
-    /// `K8VTurbo3` precedent — GPU V-side dispatch regressed −2% on K8VTurbo3).
+    /// **V-side device**: the 3-bit V axis is pinned to the CPU, because
+    /// `QuantV::append`'s GPU branch refuses `bits != 4` (see `tsym_update`).
     /// K side uses the GPU turbo3 MSL kernel when `Device::Gpu` is in effect.
     TurboSym3 {
         k: Option<QuantKTurbo3>,
@@ -271,8 +271,8 @@ pub enum KvStorage {
     ///
     /// **Arch guard**: never resolved automatically for Qwen MoE — explicit
     /// `--kv-quant tsym4` on Qwen MoE is rejected by the post-resolve invariant
-    /// check in `rmlx_models::kv_cache::validate_resolved_kv_quant`
-    /// — symmetric 4-bit K is the PPL-218→8641 disaster path.
+    /// check in `rmlx_models::kv_cache::validate_resolved_kv_quant` (K below
+    /// 8 bits).
     TurboSym4 {
         k: Option<QuantKTurbo4>,
         v: Option<QuantV>,
@@ -283,7 +283,7 @@ pub enum KvStorage {
     /// Opposite of [`Planar`](KvStorage::Planar): Givens-rotation 4-bit codec on
     /// the **K** axis; V stays full-precision bf16 (lives on the parent
     /// `KvCache::decode_fp16_v`, same machinery as [`None`](KvStorage::None)
-    /// for V). PlanarK is a PPL-disaster on Qwen MoE — see arch guard in
+    /// for V). Qwen MoE rejects PlanarK (K below 8 bits) — see
     /// `cache_type::validate_resolved`. `head_dim % 32 == 0` is required
     /// (PlanarQuant block constraint).
     ///
@@ -296,9 +296,9 @@ pub enum KvStorage {
     /// V = TurboQuant **2-bit** Lloyd-Max N(0,1) codebook (group=32).
     ///
     /// Structurally identical to [`K8V4`](KvStorage::K8V4) but with `bits=2`
-    /// in the [`QuantV`] slot. Native 2.25-bit V codec; ships naïve (no
-    /// outlier-mask); outlier-mask deferred pending calibration loader.
-    /// CPU dequant only on the hot path; MSL kernel exists as future-ref hook.
+    /// in the [`QuantV`] slot. Native 2.25-bit V codec with no outlier mask.
+    /// Decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no store (`docs/KV_QUANT.md` § "Codec disposition", Class 2).
     K8VTurbo2 {
         k: Option<QuantK>,
         v: Option<QuantV>,
@@ -307,9 +307,8 @@ pub enum KvStorage {
     /// K = affine q8_0 (group_size=128),
     /// V = IsoQuant 3-bit (quaternion SO(4) rotation + Lloyd-Max codebook).
     ///
-    /// CPU-only — the V codec dispatches via [`QuantIsoV3::dequant`] and falls
-    /// through to the dequant-then-SDPA legacy path. SSD spill/hydrate and the
-    /// MSL kernel are deferred.
+    /// Decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no store (`docs/KV_QUANT.md` § "Codec disposition", Class 2).
     IsoV3 {
         k: Option<QuantK>,
         v: Option<QuantIsoV3>,
@@ -319,8 +318,9 @@ pub enum KvStorage {
     /// V = IsoQuant 4-bit (quaternion SO(4) rotation + Lloyd-Max 4-bit codebook).
     ///
     /// Same machinery as [`IsoV3`](KvStorage::IsoV3) with `bits=4` and the
-    /// dense code plane at 4 bits per code. CPU-only — the existing MSL kernel is
-    /// hard-coded for `bits=3`; an iso4 MSL kernel is deferred.
+    /// dense code plane at 4 bits per code.
+    /// Decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no store (`docs/KV_QUANT.md` § "Codec disposition", Class 2).
     IsoV4 {
         k: Option<QuantK>,
         v: Option<QuantIsoV4>,
@@ -329,8 +329,9 @@ pub enum KvStorage {
     /// Symmetric IsoQuant 3-bit — both K and V use the same
     /// quaternion SO(4) + 3-bit Lloyd-Max codebook (axis-agnostic codec).
     ///
-    /// K is stored in `QuantIsoK3`; V in `QuantIsoV3`. SDPA falls through to
-    /// the dequant-then-SDPA legacy path (same as `IsoV3`). CPU-only.
+    /// K is stored in `QuantIsoK3`; V in `QuantIsoV3`.
+    /// Decode runs the flash kernel over both packed rings
+    /// (`docs/KV_FUSED_KERNELS.md`).
     /// Layout tag: [`ISO_SYM_3_LAYOUT_TAG`].
     IsoSym3 {
         k: Option<QuantIsoK3>,
@@ -340,7 +341,9 @@ pub enum KvStorage {
     /// Symmetric IsoQuant 4-bit — both K and V use the same
     /// quaternion SO(4) + 4-bit Lloyd-Max codebook, 4 bits per code in the plane.
     ///
-    /// Layout tag: [`ISO_SYM_4_LAYOUT_TAG`]. CPU-only.
+    /// Decode runs the flash kernel over both packed rings
+    /// (`docs/KV_FUSED_KERNELS.md`).
+    /// Layout tag: [`ISO_SYM_4_LAYOUT_TAG`].
     IsoSym4 {
         k: Option<QuantIsoK4>,
         v: Option<QuantIsoV4>,
@@ -363,7 +366,9 @@ pub enum KvStorage {
     /// element (`QuantRotorK3::qjl_s_matrix.is_some()`).
     ///
     /// Layout tag: [`ROTOR_SYM_3_LAYOUT_TAG`] or [`ROTOR_SYM_3_QJL_LAYOUT_TAG`].
-    /// CPU-only on both axes. SDPA falls through the dequant-then-SDPA path.
+    /// Decode runs the flash kernel over both packed rings
+    /// (`docs/KV_FUSED_KERNELS.md`). A QJL store keeps the CPU dequant path
+    /// on both axes.
     RotorSym3 {
         k: Option<QuantRotorK3>,
         v: Option<QuantRotorV3>,
@@ -401,25 +406,25 @@ pub enum KvStorage {
         k: Option<QuantRotorK4>,
         max_seq: i32,
     },
-    /// Asymmetric rotor3 K + affine V — K is rotor3 (CPU; optional
-    /// QJL residual sideband); V is MLX-affine `QuantV` at `v_bits` /
-    /// `v_group_size` (reuses the existing affine V encode/decode path).
+    /// Asymmetric rotor3 K + `QuantV` V — K is rotor3 (optional QJL residual
+    /// sideband); V is `QuantV`, the TurboQuant N(0,1) Lloyd-Max codec at a
+    /// fixed 32-element group, despite the `v_bits` / `v_group_size` names.
     ///
     /// Layout key prefix: [`ROTOR_K_ASYM_3_LAYOUT_PREFIX`] /
     /// [`ROTOR_K_ASYM_3_QJL_LAYOUT_PREFIX`]; the full SSD layout key suffixes
-    /// `_v{v_bits}g{v_group_size}` so hydrate can pick the affine V codec.
-    /// SDPA falls through to the legacy dequant-then-SDPA path (K rotor3 +
-    /// affine V both dequant to bf16 before `scaled_dot_product_attention`).
+    /// `_v{v_bits}g{v_group_size}` so hydrate can pick the V codec.
+    /// Decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no store (`docs/KV_QUANT.md` § "Codec disposition", Class 2).
     RotorKAsym3 {
         k: Option<QuantRotorK3>,
         v: Option<QuantV>,
         max_seq: i32,
-        /// V quantization bit-width (affine).
+        /// V quantization bit-width.
         v_bits: u8,
-        /// V affine group size.
+        /// V group size as the codec spelling carries it.
         v_group_size: u16,
     },
-    /// Asymmetric rotor4 K + affine V — same shape as
+    /// Asymmetric rotor4 K + `QuantV` V — same shape as
     /// `RotorKAsym3` with the dense 4-bit rotor codebook on K.
     ///
     /// Layout key prefix: [`ROTOR_K_ASYM_4_LAYOUT_PREFIX`] /
@@ -428,18 +433,18 @@ pub enum KvStorage {
         k: Option<QuantRotorK4>,
         v: Option<QuantV>,
         max_seq: i32,
-        /// V quantization bit-width (affine).
+        /// V quantization bit-width.
         v_bits: u8,
-        /// V affine group size.
+        /// V group size as the codec spelling carries it.
         v_group_size: u16,
     },
     /// K = affine q8_0 (group_size=128),
     /// V = rotor3 (Cl(3,0) Clifford rotor sandwich + 3-bit Lloyd-Max codebook).
     ///
     /// Static per-layer rotor table on the V side (lazily generated on first
-    /// append; never per-token). CPU-only — MSL kernel deferred (single-bit
-    /// pack convention matches planar3 / iso3 for future kernel reuse).
-    /// SDPA falls through to the dequant-then-SDPA legacy fallback path.
+    /// append; never per-token).
+    /// Decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no store (`docs/KV_QUANT.md` § "Codec disposition", Class 2).
     RotorV3 {
         k: Option<QuantK>,
         v: Option<QuantRotorV3>,
@@ -458,10 +463,11 @@ pub enum KvStorage {
     /// `head_dim = 128`. See `crate::rotorquant` § "Effective bpe".
     ///
     /// Static per-layer rotor table on the V side (lazily generated on first
-    /// append). CPU-only — MSL kernel deferred per rotor3 / iso4 precedent.
-    /// SDPA falls through to the dequant-then-SDPA legacy fallback path.
+    /// append).
+    /// Decode reads the bf16 mirror, so a cache that went through prefill
+    /// builds no store (`docs/KV_QUANT.md` § "Codec disposition", Class 2).
     ///
-    /// Paged route: falls through (same paged-KV gate deferral as rotor3).
+    /// `--paged-kv` does not route it: it keeps this storage.
     RotorV4 {
         k: Option<QuantK>,
         v: Option<QuantRotorV4>,
