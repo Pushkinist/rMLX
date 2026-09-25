@@ -108,19 +108,11 @@ quantization surface in a single process.
 ³ affine 2–8 bit, fp8, mxfp/nvfp4, **plus** four rotation-KV families
 (TurboQuant, IsoQuant, PlanarQuant, RotorQuant) no other MLX server
 ships. ParoQuant is a weight quantizer, not a KV codec, and is counted in the
-weight column. Widest *matrix*, and — as of the current tree — a narrow memory
-win: **17 of the 28 build no packed store at all** and decode byte-identically
-to bf16, bf16 itself is the 18th, and of the remaining 10 some now hold **fewer**
-resident bytes than plain bf16. Measured with `rmlx serve` at a 928-token prompt:
-`mixed_k8g64_v4g64` is **0.519×** `none` on Ternary-Bonsai-8B and `rot_k_v8g64`
-**0.641×** (both need an architecture whose layers do *not* share K/V — on
-shared-KV Gemma4 they are *larger*), while `iso3_sym` / `iso4_sym` are
-**0.876×** on gemma-4-e2b and **0.962×** on Bonsai-8B. The iso and rotor
-families pay for it in decode — 0.58–0.97× `none`'s TPS, worst on Bonsai-8B
-(iso 0.64–0.69, rotor 0.58–0.62) and mildest on the 27B/12B models. Every other
-codec is at or above bf16's bytes. The honest per-codec disposition, the measured ratios,
-and why the families are kept anyway are in
-[`docs/KV_QUANT.md` § Codec disposition](docs/KV_QUANT.md). ⁴ oMLX has a tiered RAM+SSD KV cache, not KV-bit quantization.
+weight column. Widest *matrix*, not the smallest cache: most codecs build
+no packed store and decode from a bf16 mirror. `mixed_*` and `rot_k_*` hold
+fewer bytes than bf16 only where layers do not share K/V, so not on Gemma4.
+The per-codec disposition, and why the families are kept, are in
+[`docs/KV_QUANT.md` § Codec disposition](docs/KV_QUANT.md#codec-disposition--what-every-codec-in-the-tree-is-for). ⁴ oMLX has a tiered RAM+SSD KV cache, not KV-bit quantization.
 ⁵ `llama.cpp` offers per-tensor block KV types (`q8_0`…`q5_1`) but no
 rotation-KV families. Competitor cells verified against each project's README /
 server docs (2026-06); capabilities evolve — corrections welcome.</sub>
@@ -154,19 +146,19 @@ export MLX_PREFIX="$(brew --prefix mlx)"
 
 rMLX is validated against one MLX / mlx-c pair, declared in
 `crates/rmlx-mlx/mlx-pin.txt`. If your installed MLX differs, or if it is
-missing the fast GEMM kernels that some Homebrew bottles omit (a known bottle
-regression that costs ~3.8× GPU matmul throughput), the build prints a warning
-naming the fix. It is a warning, not an error — the build still succeeds. See
+missing the fast GEMM kernels that some Homebrew bottles omit, the build
+prints a warning naming the fix. It is a warning, not an error — the build
+still succeeds. See
 [`docs/FFI.md`](docs/FFI.md#pinned-mlx--mlx-c-pair).
 
 ### On M5 and later: the Neural Accelerator kernels
 
 M5 introduced the Neural Accelerator (NAX). Some Homebrew MLX bottles are built
-in a way that silently omits the NAX kernels, which costs roughly **2–3.7× on
-prefill / time-to-first-token** while leaving decode untouched — output stays
-correct and only TTFT regresses, so the loss is easy to misread as a model-code
-problem. On M1–M4 there is no NAX and nothing to check: those bottles
-legitimately contain no NAX kernels, at every MLX version.
+in a way that silently omits the NAX kernels. That slows prefill and
+time-to-first-token and leaves decode untouched. Output stays correct, so the
+loss is easy to misread as a model-code problem. On M1–M4 there is no NAX
+and nothing to check: those bottles legitimately contain no NAX kernels, at
+every MLX version.
 
 **rMLX checks this for you.** On startup it scans the `mlx.metallib` of the MLX
 it actually loaded, and warns only when the host has a Neural Accelerator *and*
