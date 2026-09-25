@@ -166,7 +166,7 @@ The issue left one decision open: does the 4-bit iso path get the GPU mirror?
 `QuantIsoK<BITS>` one type each, `dequant_gpu` and `dequant_on` are one body
 each and both widths have them. Leaving the 4-bit width without them would have
 meant keeping two types, which is the thing being removed. This is the
-behaviour change, and §"What may move" below states its bound.
+behaviour change, and §"(b) What may move, and how far" below states its bound.
 
 **The GPU-resident *mirror*: it came along, and it changes nothing.** The
 mirror write in `append_gpu` is behind a `false` constant in production, so

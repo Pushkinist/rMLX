@@ -40,15 +40,19 @@ The null was a bit-width result, not a context result.
 
 The auto default is bf16 on every arch.
 
+## Retry Envelope policy
+
+The old policy text.
+
 ## Retry Envelope
 
 A retried request carries the same id.
 
-## `MetalKernel` handles
+## `MetalKernel` — handles
 
 One handle per kernel.
 
-## Known-bad rows already in the DB
+## Known-bad rows — already in the DB
 
 Two rows.
 
@@ -71,6 +75,7 @@ Notes that nothing reads.
 ## Pointers
 
 The retry cap is in § "Retry budget".
+Both `B.md` or §"Retry budget" hold it. The table § below lists them.
 EOF
 cat >"${BASE}/docs/B.md" <<'EOF'
 # B
@@ -81,8 +86,11 @@ See [the contract](A.md#2-contract), [the map](../CLAUDE.md) and
 Host cost: `docs/A.md` § *Cost of the host path*.
 Eviction: `docs/A.md` §
 > "Evict-to-budget (runtime)".
+Readback: `docs/A.md`
+§ "Evict-to-budget (runtime)".
 EOF
 printf '# Guide\n' >"${BASE}/docs/GUIDE.md"
+printf '# Out\n\nSee `docs/NOWHERE.md`.\n' >"${BASE}/docs/OUT.md"
 cat >"${BASE}/CLAUDE.md" <<'EOF'
 # guide
 
@@ -91,6 +99,7 @@ cat >"${BASE}/CLAUDE.md" <<'EOF'
 | [`docs/A.md`](docs/A.md) | A |
 | [`docs/B.md`](docs/B.md) | B |
 | [`docs/GUIDE.md`](docs/GUIDE.md) | Guide |
+| [`docs/OUT.md`](docs/OUT.md) | Out |
 EOF
 cat >"${BASE}/CHANGELOG.md" <<'EOF'
 - Recorded in `docs/A.md` § "Old story".
@@ -101,6 +110,7 @@ cat >"${BASE}/crates/c/src/lib.rs" <<'EOF'
 //! Auto: `docs/A.md` "The auto default".
 //! Kernels: `docs/A.md` § `MetalKernel`.
 //! Stale: `docs/GONE.md`.
+//! Missing: `docs/GUIDE.md` § "Nothing here"; planned: `docs/LATER.md` § "Plan".
 //!
 //! [`docs/B.md`]: ../../../docs/B.md
 EOF
@@ -109,6 +119,15 @@ fn f() {
     panic!("update docs/A.md \"Host sampling costs one \
             millisecond\" first");
 }
+EOF
+cat >"${BASE}/crates/c/src/wrap.rs" <<'EOF'
+/// Wrapped: see `docs/A.md`
+/// § "Evict-to-budget (runtime)".
+fn a() {}
+const RAW: &str = r#"docs/A.md
+§ "Evict-to-budget""#;
+const ESC: &str = "docs/A.md \
+    § \"Evict-to-budget (runtime)\"";
 EOF
 cat >"${BASE}/crates/c/m.sql" <<'EOF'
 -- Cost: docs/A.md under "Cost of the host path".
@@ -119,6 +138,8 @@ cat >"${BASE}/scripts/s.py" <<'EOF'
 # Envelope: docs/A.md § "Retry Envelope"
 # Rows: docs/A.md, section "Known-bad rows"
 # Guide: GUIDE.md
+# Wrapped: docs/A.md
+# § "Evict-to-budget (runtime)"
 EOF
 cat >"${BASE}/scripts/fx_selftest.sh" <<'EOF'
 # doc-refs: fixture
@@ -214,6 +235,11 @@ add_marked_doc() {
         append CLAUDE.md $'| [`docs/C.md`](docs/C.md) | C |\n'
 }
 
+create_later_doc() {
+    printf '# Later\n' >docs/LATER.md &&
+        append CLAUDE.md $'| [`docs/LATER.md`](docs/LATER.md) | Later |\n'
+}
+
 noop() { :; }
 
 echo "check_doc_refs selftest:"
@@ -222,7 +248,7 @@ case_ clean 0 "OK: " \
     "an unedited tree passes" noop
 case_ base_is_printed 0 "base: HEAD (" \
     "the run prints the base it compared with" noop
-case_ carried_is_noted 0 "note: 1 reference(s) already broken at the base, carried:" \
+case_ carried_is_noted 0 "note: 5 reference(s) already broken at the base, carried:" \
     "a reference already broken at the base is carried, not failed" noop
 case_ unconsumed_prose_deleted 0 "OK: " \
     "deleting a section nothing reads passes" \
@@ -268,14 +294,14 @@ case_ section_words_deleted 1 "SECTION docs/A.md 'Defaults' — resolves to noth
     "deleting a heading cited as an unquoted name after § fails" \
     edit docs/A.md $'### 2.1 Defaults\n' ''
 case_ section_quoted_shared_word 1 "scripts/s.py:3: SECTION docs/A.md 'Retry Envelope' — resolves to nothing" \
-    "deleting a heading cited as § \"Phrase\" fails, though an earlier heading shares its first word" \
+    "deleting a heading cited as § \"Phrase\" fails, though an earlier heading starts with its title" \
     edit docs/A.md $'## Retry Envelope\n' ''
 case_ section_ident_deleted 1 "SECTION docs/A.md 'MetalKernel' — resolves to nothing" \
     "deleting a heading cited as § and a backticked identifier fails" \
-    edit docs/A.md $'## `MetalKernel` handles\n' ''
+    edit docs/A.md $'## `MetalKernel` — handles\n' ''
 case_ section_named_in_prose_deleted 1 "SECTION docs/A.md 'Known-bad rows' — resolves to nothing" \
     "deleting a heading cited as section \"Phrase\" fails" \
-    edit docs/A.md $'## Known-bad rows already in the DB\n' ''
+    edit docs/A.md $'## Known-bad rows — already in the DB\n' ''
 case_ section_under_deleted 1 "crates/c/m.sql:1: SECTION docs/A.md 'Cost of the host path' — resolves to nothing" \
     "deleting a heading cited as under \"Phrase\" fails" \
     edit docs/A.md $'## Cost of the host path\n' ''
@@ -285,9 +311,39 @@ case_ section_italic_deleted 1 "docs/B.md:6: SECTION docs/A.md 'Cost of the host
 case_ section_after_line_break_deleted 1 "SECTION docs/A.md 'Evict-to-budget (runtime)' — resolves to nothing" \
     "deleting a heading cited by a phrase on the line after § fails" \
     edit docs/A.md $'## Evict-to-budget (runtime)\n' ''
-case_ same_doc_section_deleted 1 "docs/A.md:51: SECTION docs/A.md 'Retry budget' — resolves to nothing" \
+case_ same_doc_section_deleted 1 "docs/A.md:55: SECTION docs/A.md 'Retry budget' — resolves to nothing" \
     "deleting a heading that a § with no doc name cites from the same doc fails" \
     edit docs/A.md $'## Retry budget\n' ''
+case_ same_doc_section_after_unparsed_doc_name 1 "docs/A.md:56: SECTION docs/A.md 'Retry budget' — resolves to nothing" \
+    "a § right after a doc name whose own parse found nothing still cites the same doc" \
+    edit docs/A.md $'## Retry budget\n' ''
+case_ wrapped_rust_doc_comment 1 "crates/c/src/wrap.rs:1: SECTION docs/A.md 'Evict-to-budget (runtime)' — resolves to nothing" \
+    "a doc name on one /// line and § \"Phrase\" on the next is one citation" \
+    edit docs/A.md $'## Evict-to-budget (runtime)\n' ''
+case_ wrapped_raw_string 1 "crates/c/src/wrap.rs:4: SECTION docs/A.md 'Evict-to-budget' — resolves to nothing" \
+    "a doc name and § on the next line of a raw string are one citation" \
+    edit docs/A.md $'## Evict-to-budget (runtime)\n' ''
+case_ wrapped_escaped_quotes 1 "crates/c/src/wrap.rs:6: SECTION docs/A.md 'Evict-to-budget (runtime)' — resolves to nothing" \
+    "a doc name, a string continuation, and § with escaped quotes are one citation" \
+    edit docs/A.md $'## Evict-to-budget (runtime)\n' ''
+case_ wrapped_hash_comment 1 "scripts/s.py:6: SECTION docs/A.md 'Evict-to-budget (runtime)' — resolves to nothing" \
+    "a doc name on one # line and § on the next is one citation" \
+    edit docs/A.md $'## Evict-to-budget (runtime)\n' ''
+case_ wrapped_markdown_line 1 "docs/B.md:9: SECTION docs/A.md 'Evict-to-budget (runtime)' — resolves to nothing" \
+    "a doc name ending one Markdown line and § starting the next is one citation" \
+    edit docs/A.md $'## Evict-to-budget (runtime)\n' ''
+case_ duplicate_title_refused 1 "names 'Retry budget', which 2 headings carry; make the heading unique" \
+    "a citation to a title that two headings carry fails" \
+    append docs/A.md $'\n## Retry budget\n\nAgain.\n'
+case_ edited_doc_carries_nothing_in 1 "SECTION docs/GUIDE.md 'Nothing here' — resolves to nothing; this change edits that doc, so fix it here" \
+    "a change that edits a doc must fix every broken reference into it" \
+    append docs/GUIDE.md $'\nMore text.\n'
+case_ edited_doc_carries_nothing_out 1 "docs/OUT.md:3: PATH docs/NOWHERE.md — resolves to nothing; this change edits that doc, so fix it here" \
+    "a change that edits a doc must fix every broken reference out of it" \
+    append docs/OUT.md $'\nMore text.\n'
+case_ created_doc_carries_nothing 1 "SECTION docs/LATER.md 'Plan' — resolves to nothing; this change edits that doc, so fix it here" \
+    "a doc created since the base is never in the carried set" \
+    create_later_doc
 case_ bare_anchor_deleted 1 "ANCHOR docs/A.md 'retry-envelope' — resolves to nothing" \
     "deleting a heading a bare doc#anchor names fails" \
     edit docs/A.md $'## Retry Envelope\n' $'## Retries\n'
@@ -332,7 +388,7 @@ case_ map_row_wrong_target 1 "MAPROW docs/B.md 'docs/A.md' — resolves to nothi
 case_ new_citation_to_nothing 1 "SECTION docs/A.md '9' — resolves to nothing" \
     "a new citation to a section that never existed fails" \
     append crates/c/src/lib.rs $'//! More: `docs/A.md` §9.\n'
-case_ carried_reference_moved 0 "note: 1 reference(s) already broken at the base, carried:" \
+case_ carried_reference_moved 0 "note: 5 reference(s) already broken at the base, carried:" \
     "moving an already-broken reference to another file carries it" \
     move_gone_citation_to_script
 case_ carried_reference_copied 1 "PATH docs/GONE.md — resolves to nothing" \
@@ -341,6 +397,17 @@ case_ carried_reference_copied 1 "PATH docs/GONE.md — resolves to nothing" \
 case_ changelog_never_fails 0 "note: 1 broken reference(s) in CHANGELOG.md (released history; never fails):" \
     "a CHANGELOG reference broken by a cut is printed and does not fail" \
     edit docs/A.md $'## Old story\n\nA dated measurement that only the changelog cites.\n\n' ''
+
+list_out="$(python3 "${TOOL}" --root "${BASE}" --list 2>&1)"
+verdict prose_pointer_is_not_a_section 0 "SECTION	docs/A.md:56	docs/A.md	Retry budget" \
+    "the --list inventory holds the real same-doc citation" 0 "${list_out}"
+if printf '%s' "${list_out}" | grep -qE $'\tbelow\t|\tabove\t'; then
+    verdict prose_below_is_not_a_section 0 "no SECTION keyed on below or above" \
+        "§ below / § above are prose, not a section name" 1 "${list_out}"
+else
+    verdict prose_below_is_not_a_section 0 "absent" \
+        "§ below / § above are prose, not a section name" 0 "absent"
+fi
 
 run_exit absolute_mode_fails_on_an_old_break 1 "PATH docs/GONE.md — resolves to nothing" \
     "without a base, a reference broken since the base is a failure" --root "${BASE}"
@@ -374,6 +441,27 @@ run_exit auto_skips_a_ref_holding_head 0 "base: origin/main (merge-base ${c0:0:1
 git -C "${AUTO}" update-ref refs/remotes/origin/main "$(git -C "${AUTO}" rev-parse HEAD)"
 run_exit auto_falls_back_to_head 0 "base: HEAD (merge-base" \
     "--base auto compares with HEAD when every ref contains it" --root "${AUTO}" --base auto
+
+# A hotfix on main that next/ lacks: main no longer contains next/, and next/
+# does not contain main.
+HOTFIX="${WORK}/hotfix"
+cp -R "${BASE}" "${HOTFIX}"
+h0=$(git -C "${HOTFIX}" rev-parse HEAD)
+printf 'next\n' >"${HOTFIX}/next.txt" && commit_all "${HOTFIX}" next
+next_tip=$(git -C "${HOTFIX}" rev-parse HEAD)
+git -C "${HOTFIX}" checkout -q -b hotfix "${h0}"
+printf 'fix\n' >"${HOTFIX}/fix.txt" && commit_all "${HOTFIX}" hotfix
+main_tip=$(git -C "${HOTFIX}" rev-parse HEAD)
+git -C "${HOTFIX}" update-ref refs/remotes/origin/main "${main_tip}"
+git -C "${HOTFIX}" update-ref refs/remotes/origin/next/x "${next_tip}"
+git -C "${HOTFIX}" checkout -q --detach "${next_tip}"
+run_exit auto_on_next_tip_uses_main 0 "base: origin/main (merge-base ${h0:0:12})" \
+    "HEAD at a next/ tip that main does not contain compares with the merge-base with main" \
+    --root "${HOTFIX}" --base auto
+git -C "${HOTFIX}" checkout -q --detach "${main_tip}"
+run_exit auto_on_main_uses_next 0 "base: origin/next/x (merge-base ${h0:0:12})" \
+    "HEAD at the main tip compares with the merge-base with the next/ ref" \
+    --root "${HOTFIX}" --base auto
 
 echo "check_doc_refs selftest: ${PASSED} passed, ${FAILED} failed"
 [ "${FAILED}" -eq 0 ]

@@ -76,7 +76,7 @@ width-named wrappers stay as the public spelling.
 generic over the store's `BITS`, and the eight entries above them become four
 as well, each resolving the width from the storage variant it was dispatched
 on. The `KvStorage` variants stay eight — a variant is a spelling, and no
-spelling is removed (issue §Sequencing).
+spelling is removed (the issue's Sequencing section).
 
 Rule 1 of the simplicity rules still governs: the generic is introduced
 because there are two instantiations of every item, not to admit a third.

@@ -38,7 +38,7 @@ acceptance rule it runs, and that follows from what the drafter can supply.
   proposal is scored against the drafter's own distribution — accepted with
   probability `min(1, p(x)/q(x))` against a uniform draw, and on the first
   rejection a correction is drawn from `normalize((p - q)+)` (Leviathan et al.,
-  §2.3). `p` and `q` are built through the same post-temperature / top-p /
+  section 2.3). `p` and `q` are built through the same post-temperature / top-p /
   top-k / min-p pipeline, so the output distribution is the verifier's exactly.
 - **Sidecar, sampled** (`temperature > 0`): the drafter proposes an argmax,
   which is a point mass, and the rule above with a point-mass proposal needs no
@@ -315,8 +315,8 @@ request has handed the sink, **the seed included**. The five sidecar loops
 argmax one token out of the prefill forward and emit it before the first round,
 so on those this figure is one above the tokens the rounds produced.
 **It is not the `emitted_total` `scripts/lib/spec_round_log.py` prints**, which
-sums `emitted_in_rounds` over a run's done records and excludes the seed for the
-reason § "A round's tokens are the ones a round produced" gives — so the two
+sums `emitted_in_rounds` over a run's done records and excludes the seed,
+because a round's tokens are the ones that round produced — so the two
 differ by `seed_emitted` on every sidecar loop, permanently, and a reader
 comparing one against the other is comparing two definitions. Renaming either
 moves every digest in the pinned round-stream baseline, so the collision is
@@ -1167,7 +1167,7 @@ partial-accept rollback section above.
 
 Speculative decoding is activated on `rmlx serve` only, by supplying
 `--draft-model`. `rmlx chat` has no draft flags. A `profiles.toml` profile can
-carry `draft_model` too (`docs/CLI.md` § Profiles), and runs the same way.
+carry `draft_model` too (`docs/CLI.md` § `profile list`), and runs the same way.
 
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|

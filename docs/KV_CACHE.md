@@ -1268,7 +1268,7 @@ in parentheses. `ttft_ms` is the warm-prefill TTFT for the median run.
 
 Combo column lists the (`--ctk` / `--ctv`) primitive pair; the `kv_quant`
 column shows the canonical preset string the resolver picks for that pair
-(see §4.4 and §6). Preset-form rows (e.g. `k8v8`) test the `--kv-quant`
+(see §4 and §6). Preset-form rows (e.g. `k8v8`) test the `--kv-quant`
 spelling — they share `kv_quant` with the equivalent primitive-form row.
 
 Status legend:

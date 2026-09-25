@@ -771,7 +771,7 @@ expression, and [`tsym_update`] already carries it —
 `if BITS == TURBO_K4_BITS { device } else { Device::Cpu }` — while
 `arrays_to_f32` is two `array_to_f32_vec` calls, so the f32 rule follows the
 resolved device per axis rather than the two widths. The pair collapsed with
-no other change. §"What this chunk could not prove" carries the evidence,
+no other change. §"What this chunk still cannot prove" carries the evidence,
 which is not a red cell.
 
 **Decode: 1 shared body replaces 4 copies.** `k8_turbo_v_update` deletes

@@ -603,7 +603,7 @@ never opened, and `--metrics` is refused in arm arguments so it cannot be
 turned back on. An A/B run exercises arms built to be thrown away; a row in the
 append-only store cannot be taken back out. Promoting an accepted comparison is
 a separate, explicit step: `scripts/ingest/perf_ab_ingest.py` turns one result
-file into two §8.5 RunRecords (`decode_tps_warm`, `kv_cache_bytes`), refuses a
+file into two `docs/METRICS_DB.md` §8.5 RunRecords (`decode_tps_warm`, `kv_cache_bytes`), refuses a
 TAINTED run unless told otherwise, and carries the taint text into `notes`.
 
 It does write elsewhere. The result lands in
@@ -1993,7 +1993,7 @@ anchor convention as the canary baseline.
 | Qwen3.6-35B-A3B-8bit | TBD | TBD | K8V4 default; large model, dispatch-overhead-dominated |
 
 Rows are populated by the regression-bench cycle after the `--paged-kv` commit
-lands; CLAUDE.md hard rule §"Regression-bench discipline" requires touched
+lands; the CLAUDE.md hard rule "Regression-bench discipline" requires touched
 models to bench at their best-known KV quant — the `--paged-kv` toggle is
 orthogonal to the kv-quant preset, so each family appears in both columns
 at the same preset.

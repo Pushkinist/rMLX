@@ -236,7 +236,7 @@ The resident-KV byte counter is **not** here. It is per model *instance*
 (`kv_bytes::KvBytesCounter`, a field on each arch's model struct) because this
 shell is per arch *type*: two models of the same architecture sharing it would
 cross-attribute each other's byte totals into the append-only `events` table.
-See `docs/METRICS_DB.md` §`kv_cache_bytes`.
+See the `kv_cache_bytes` row of `docs/METRICS_DB.md` §4.
 
 `ArchPromptCache::ensure(capacity)` is a no-op when the existing cache already
 has the correct capacity. If the capacity changes (e.g. `--prompt-cache-slots`

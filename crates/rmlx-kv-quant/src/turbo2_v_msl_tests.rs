@@ -156,7 +156,7 @@ fn tq2_cosine_naive_baseline_floor() {
     // not apples-to-apples; it captures only the intrinsic Lloyd-Max
     // quantization noise, not the heavy-tail residual that outlier-mask handles
     // on real V tensors. The outlier-mask path to close the production PPL gap
-    // is deferred pending the calibration loader. See `docs/KV_QUANT.md` § K8VTurbo2.
+    // is deferred pending the calibration loader. See `docs/KV_QUANT.md` § "KvStorage::K8VTurbo2".
     assert!(
         stats.mean >= 0.956,
         "K8VTurbo2 naive 2-bit cosine mean {:.6} fell below empirical floor 0.956 \

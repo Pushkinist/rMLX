@@ -15,7 +15,7 @@ known limitations for every architecture the server can load.
 - [Architecture support table](#architecture-support-table)
 - [Qwen2](#qwen2-qwen2forcausallm)
 - [Qwen3](#qwen3-qwen3forcausallm)
-- [Qwen3.5 MoE](#qwen35-moe-qwen3_5moeforconditionalgeneration)
+- [Qwen3.5 MoE](#qwen35-qwen3_5moeforconditionalgeneration--qwen3_5forconditionalgeneration)
 - [Qwen3-VL MoE](#qwen3-vl-moe-qwen3vlmoeforconditionalgeneration)
 - [Gemma3](#gemma3-gemma3forconditionalgeneration)
 - [Gemma4](#gemma4-gemma4forconditionalgeneration)
@@ -24,7 +24,7 @@ known limitations for every architecture the server can load.
 - [Jina V4](#jina-v4-jinaembeddingsv4model)
 - [Whisper (audio STT)](#whisper-audio-stt)
 - [Silero VAD (long-audio chunking)](#silero-vad-long-audio-chunking)
-- [Qwen3-TTS (text-to-speech)](#qwen3-tts-text-to-speechase-4b-pending)
+- [Qwen3-TTS (text-to-speech)](#qwen3-tts-text-to-speech)
 - [Speculative drafters](#speculative-drafters)
 - [KV layout matrix](#kv-layout-matrix)
 - [Modality summary](#modality-summary)
@@ -903,7 +903,7 @@ the **assistant drafter** (`Gemma4AssistantDrafter`), selected with
 `--draft-kind mtp` and a dedicated `*-it-assistant-bf16` draft snapshot. A plain
 `Gemma4ForConditionalGeneration` model is **not** a valid `--draft-kind mtp`
 draft (no MTP sidecar head) and is rejected at load — see `docs/SPECULATIVE.md`
-§"`--draft-kind mtp` dispatch" and issue #23.
+§"`mtp` dispatch" and issue #23.
 
 ### Weight quantization
 
@@ -1216,7 +1216,7 @@ magnitude of the non-zero trits. rMLX multiplies the scale in at load time,
 writing a BF16 `[N, K]` matrix. Inference uses plain BF16 matmul — no
 custom quantized kernel required.
 
-See [WEIGHT_QUANTS.md § Ternary / BitLinear](WEIGHT_QUANTS.md#ternary--bitlinear-bitnetforcausallm) for the full encoding spec.
+See [WEIGHT_QUANTS.md § Ternary / BitLinear](WEIGHT_QUANTS.md#9-ternary--bitlinear-bitnetforcausallm) for the full encoding spec.
 
 ### Architecture specifics
 

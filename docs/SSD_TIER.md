@@ -822,7 +822,7 @@ exceeded), the spill hook receives the evicted entry. The spiller:
    / `k_rotor4`) this is also the point where a **ring-only decode tail** is
    reconciled: the fused decode path keeps the CPU `blocks` frozen at the
    prefill prefix while the GPU ring carries the decode tail (see
-   `docs/KV_QUANT.md` § "Ring eligibility"), so the clone materialises the tail
+   `docs/KV_QUANT.md` § "Ring eligibility is passed down, not inferred"), so the clone materialises the tail
    back into complete CPU blocks from the ring. `block_io::write_quant_rotor_k{3,4}`
    serialize `blocks`, so without this the spill would persist a store truncated
    at the last CPU block. The serializer additionally refuses to write any rotor

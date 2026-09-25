@@ -90,9 +90,9 @@ mutually exclusive.
 | `--host` | string | `127.0.0.1` | Host or IP to bind. |
 | `--device` | `cpu \| gpu` | `gpu` | Inference device. |
 | `--kv-quant` | string | `auto` | KV cache quantization preset: `auto` (unquantised bf16 on every arch and every context — see `docs/KV_QUANT.md` "The auto default"), `bf16` / `none` (unquantized), `k8v4`, `k8v8`, `planar`, `planar3` (3-bit V PlanarQuant), `k8vturbo3` (q8_0 K + TurboQuant 3-bit Lloyd-Max V; opt-in on every arch), `tsym4` (symmetric 4-bit Lloyd-Max K + tq4 V; rejected on Qwen MoE arch with exit 78), `planar_k` (K-axis PlanarQuant 4-bit, V=bf16; rejected on Qwen MoE arch via `QwenMoePlanarKRejected`), `tsym3` (3-bit Lloyd-Max K + V, symmetric; rejected on Qwen MoE arch). Mutually exclusive with `--cache-type-k`/`--cache-type-v`. |
-| `--kv-preset` | string | — | Named KV-cache preset. Resolves to a `KvQuant` by name. Mutually exclusive with `--kv-quant`, `--cache-type-k`, `--cache-type-v`, `--kv-bits`. See `docs/KV_QUANT.md §Presets`. Available: `auto`, `fp16`, `q8`, `speed`, `quality`, `planar`, `planar3`, `k_only_planar`. No non-`fp16` preset reduces resident KV. |
+| `--kv-preset` | string | — | Named KV-cache preset. Resolves to a `KvQuant` by name. Mutually exclusive with `--kv-quant`, `--cache-type-k`, `--cache-type-v`, `--kv-bits`. See `docs/KV_QUANT.md` § "Preset interface". Available: `auto`, `fp16`, `q8`, `speed`, `quality`, `planar`, `planar3`, `k_only_planar`. No non-`fp16` preset reduces resident KV. |
 | `--kv-quant` | string | `auto` | KV cache quantization preset: `auto` (unquantised bf16 on every arch and every context — see `docs/KV_QUANT.md` "The auto default"), `bf16` / `none` (unquantized), `k8v4`, `k8v8`, `planar`, `planar3`, `k8vturbo3`, `k8vturbo3tcq` (Viterbi trellis 3-bit V; reuses turbo3 Lloyd-Max codebook with 4-state Viterbi-optimal trellis assignment instead of nearest-centroid; decoder bit-identical to plain turbo3; CPU encode on hot path; MSL kernel parity-tested but parked as future-reference hook; distinct SSD layout tag prevents cross-codec hydrate; `--ctv` alias: `turbo3_tcq`), `k8vturbo2` (native 2-bit V, ships naïve — no outlier-mask, see `docs/KV_QUANT.md`), `k8vturbo2tcq` (Viterbi trellis 2-bit V; same 4-state trellis over the 2-bit Lloyd-Max codebook; decoder bit-identical to plain turbo2; CPU encode on hot path; MSL kernel parity-tested but parked as future-reference hook; distinct SSD layout tag prevents cross-codec hydrate; outlier-mask deferred; `--ctv` alias: `turbo2_tcq`), `iso3` (IsoQuant quaternion SO(4) 3-bit V; requires `head_dim % 4 == 0`; CPU-only V dequant), `iso4` (IsoQuant quaternion SO(4) 4-bit V; requires `head_dim % 4 == 0`; CPU-only — no MSL kernel; pairs only with K=`q8_g128`; alias: `--ctv iso4`), `rotor3` (Cl(3,0) Clifford rotor sandwich + 3-bit V; static per-(layer, head) rotor table loaded once + per-token codes/scales/norm; pairs with K=`q8_g128`; no head_dim divisibility constraint — `head_dim % 3` is tail-padded; CPU-only; alias `--ctv rotor3` or `--ctv rotor_v_3`), `rotor4` (Cl(3,0) Clifford rotor sandwich + 4-bit V; same structure as `rotor3` with the 16-centroid Lloyd-Max codebook; the store spends three codes per group in the dense code plane plus a `KV_SIDEBAND_DTYPE` scale per group, so 9.75 bits/value reach memory — see the iso/rotor memory note below; CPU-only; alias `--ctv rotor4` or `--ctv rotor_v_4`), `iso3_sym` (symmetric IsoQuant 3-bit on **both** K and V; quaternion SO(4) rotation + 3-bit Lloyd-Max codebook applied identically per axis; CPU-only; rejected on Qwen3.5/3.6 MoE with `QwenMoeIsoKRejected`), `iso4_sym` (symmetric IsoQuant 4-bit K+V; same Qwen MoE arch guard as `iso3_sym`), `k_iso3` (K-only IsoQuant 3-bit; V stays bf16; pairs `--ctk iso_k_3 --ctv bf16`; same Qwen MoE guard), `k_iso4` (K-only IsoQuant 4-bit; V bf16; same arch guard), `rotor3_sym` (symmetric Clifford rotor3 K+V; K side carries optional 1-bit QJL residual sideband when `--rotor-qjl on`, off by default; rejected on Qwen MoE with `QwenMoeRotorKRejected`), `rotor4_sym` (symmetric Clifford rotor4 K+V; same QJL toggle + Qwen MoE guard), `k_rotor3` (K-only rotor3; V stays bf16; optional QJL; same Qwen MoE guard), `k_rotor4` (K-only rotor4; V bf16; optional QJL; same arch guard), `rotor_k_3_asym_v<vb>_g<vg>` (payload-bearing asymmetric: rotor3 K + TurboQuant V at `(v_bits, v_group_size)`; accepted V tuples: `(4,128)`, `(4,64)`, `(4,32)`, `(3,64)`, `(2,64)` (v_group_size is layout-tag-only — TurboQuant V uses GROUP_SIZE=32 regardless); compose via `--ctk k_rotor3 --ctv q4_g64` (or other affine `q*_g*`); same Qwen MoE guard), `rotor_k_4_asym_v<vb>_g<vg>` (rotor4 K + TurboQuant V; same compose / guard rules), `tsym3` (TurboSym3: 3-bit Lloyd-Max K + V, symmetric; storage `TurboSym3 { k: QuantKTurbo3, v: QuantVBits3 }`; 3 bits on both K and V sides using the Lloyd-Max codebook; CPU-only; rejected for Qwen3.5/3.6 MoE with `QwenMoeTurboSymKRejected`; opt-in only, never an auto baseline), `mixed_k<kb>g<kg>_v<vb>g<vg>`. Mutually exclusive with `--cache-type-k`/`--cache-type-v`. |
-| `--kv-preset` | string | — | Named KV-cache preset. Resolves to a `KvQuant` by name. Mutually exclusive with `--kv-quant`, `--cache-type-k`, `--cache-type-v`, `--kv-bits`. See `docs/KV_QUANT.md §Presets`. Available: `auto`, `fp16`, `q8`, `speed`, `quality`, `planar`, `planar3`, `k_only_planar`. No non-`fp16` preset reduces resident KV. |
+| `--kv-preset` | string | — | Named KV-cache preset. Resolves to a `KvQuant` by name. Mutually exclusive with `--kv-quant`, `--cache-type-k`, `--cache-type-v`, `--kv-bits`. See `docs/KV_QUANT.md` § "Preset interface". Available: `auto`, `fp16`, `q8`, `speed`, `quality`, `planar`, `planar3`, `k_only_planar`. No non-`fp16` preset reduces resident KV. |
 | `--cache-type-k` / `--ctk` | string | — | Per-side codec for the K (key) tensor. See `rmlx info --list-cache-types` for the full codec table. Mutually exclusive with `--kv-quant`. |
 | `--cache-type-v` / `--ctv` | string | — | Per-side codec for the V (value) tensor. Mutually exclusive with `--kv-quant`. |
 | `--kv-bits` | float | — | Bit-width alias (integer or fractional, e.g. `4`, `3.5`). Mutually exclusive with `--kv-quant` and `--cache-type-*`. See KV-bits mapping below. |
@@ -389,7 +389,7 @@ rmlx info --model /path/to/snapshot --probe-smoke
 | `--kv-bits` | float | — | Bit-width alias. Mutually exclusive with `--kv-quant` and `--cache-type-*`. |
 | `--kv-group-size` | usize | 64 | Group size for `--kv-bits`. |
 | `--max-ctx` | u32 | (from model) | **Virtual ceiling** on context length, in tokens (not an eager allocation): the KV ring grows lazily up to it, prompts over it are rejected. See `docs/KV_CACHE.md` §4.6. Must be ≥ 256 when set. |
-| `--list-cache-types` | bool flag | off | Print the full §D1 KV codec table and exit. No model load. |
+| `--list-cache-types` | bool flag | off | Print the full KV codec table and exit. No model load. |
 
 The smoke probe renders its fixed seed prompt through the snapshot's
 `chat_template.jinja` when present, so an instruction-tuned model is exercised
@@ -432,7 +432,7 @@ rmlx baseline --model /path/to/snapshot --prompt-tokens 4096 --label "8k-bench"
 | `--max-prompt-tokens` | usize | (resolved context ceiling) | Cap on the tokenized prompt length. Defaults to the run's resolved `--max-ctx` ceiling, so raising the ceiling is what admits a longer prompt. See "Prompt-length cap" below — behavior differs by `--device`. Must be ≥ 1 when set. |
 | `--allow-truncate` | bool flag | off | Opt into silently truncating a too-long prompt to the prompt cap on `--device gpu` instead of erroring. No effect on `--device cpu` (always truncates) or when `--max-prompt-tokens` is passed explicitly (that is itself an opt-in). |
 | `--label` | string | — | Free-form campaign label stamped into the metrics record's `notes` column. |
-| `--record` | bool flag | off | Emit a §8.5 `RunRecord` to the metrics buffer and ingest into `runs.db` in-process. |
+| `--record` | bool flag | off | Emit a `METRICS_DB.md` §8.5 `RunRecord` to the metrics buffer and ingest into `runs.db` in-process. |
 | `--git-sha` | string | — | Commit SHA to stamp on the emitted record's `git_sha` column (only meaningful with `--record`). Provenance the caller supplies — the binary does not and cannot determine the commit it was built from. Absent by default (`git_sha` is `NULL`). |
 | `--emit-token-ids` | bool flag | off | Print the exact generated token-id sequence as a second `baseline: token_ids=<comma-separated>` line. For A/B harnesses that must prove two arms produced the same tokens — decoded text cannot, since different id sequences can decode to the same string. |
 
@@ -1062,13 +1062,13 @@ Replace the DB from a backup, snapshotting the current DB first.
 
 #### `metrics record`
 
-Ingest one §8.5 `RunRecord` JSON into the `observations` table. Exactly one
+Ingest one `METRICS_DB.md` §8.5 `RunRecord` JSON into the `observations` table. Exactly one
 of `--inline`, `--file`, `--stdin`, or `--replay-pending` must be provided.
 
 | Flag | Default | Description |
 |---|---|---|
 | `--inline <JSON>` | — | Inline JSON object. |
-| `--file <path>` | — | Read JSON from file (preferred; follows the §8.4 buffer pattern). |
+| `--file <path>` | — | Read JSON from file (preferred; follows the `METRICS_DB.md` §8.4 buffer pattern). |
 | `--stdin` | off | Read JSON from stdin. |
 | `--dry-run` | off | Validate and show what would be written without committing. Runs the whole of `RunRecord::validate`, then returns before the transaction — the row count and the `--file` buffer are both untouched. This is the route for a probe that only needs to know whether a record would be accepted. |
 | `--replay-pending` | off | Walk `metrics/buffer/pending/`, ingest each file, move failures to `failed/`. |
@@ -1081,7 +1081,7 @@ the DB before it existed — see `docs/METRICS_DB.md`, "Known-bad rows".
 
 #### `metrics identity`
 
-Print the §8.5 run-identity block of *this* binary: `backend`, `backend_version`,
+Print the `METRICS_DB.md` §8.5 run-identity block of *this* binary: `backend`, `backend_version`,
 `build_profile`, `hardware_tag`. Deliberately does not include `git_sha` — the
 binary cannot honestly know the commit it was built from, so `git_sha` is not
 part of run identity at all; it is caller-supplied provenance (see
@@ -1089,7 +1089,7 @@ part of run identity at all; it is caller-supplied provenance (see
 `--git-sha` on `rmlx baseline` / `rmlx eval ppl`.
 
 This is how a non-Rust emitter learns who the measured binary is. Bench scripts
-merge the JSON block into their §8.5 record instead of hard-coding a version or
+merge the JSON block into their `METRICS_DB.md` §8.5 record instead of hard-coding a version or
 guessing a build profile — see `scripts/lib/identity.sh`.
 
 ```bash
@@ -1109,7 +1109,7 @@ rmlx metrics identity          # human-readable
 
 #### `metrics validate`
 
-Validate a §8.5 record and write nothing. Runs the *same* `RunRecord::validate`
+Validate a `METRICS_DB.md` §8.5 record and write nothing. Runs the *same* `RunRecord::validate`
 the recorder runs, so a record that passes here will ingest. Exit 1 on rejection.
 
 ```bash
@@ -1292,7 +1292,7 @@ Prints one JSON line to stdout:
 {"ppl":..,"mean_nll":..,"scored_tokens":..,"windows":..}
 ```
 
-When `--corpus` is non-empty, also ingests one §8.5 `RunRecord` into
+When `--corpus` is non-empty, also ingests one `METRICS_DB.md` §8.5 `RunRecord` into
 `<RMLX_HOME>/metrics/runs.db` under op `ppl_wikitext2`.
 
 ```bash
@@ -1635,8 +1635,8 @@ rmlx healthcheck --model /path/to/snapshot --full
 
 ## See also
 
-- `docs/METRICS_DB.md` — full metrics database schema, §8.2 query API contract, §8.5 ingest JSON shape, and operating rules.
+- `docs/METRICS_DB.md` — full metrics database schema, the query API contract (`METRICS_DB.md` §8.2), the ingest JSON shape (`METRICS_DB.md` §8.5), and operating rules.
 - `docs/PROJECTS_CONFIG.md` — `projects.toml` format for per-project SSD prompt-cache caps.
 - `docs/PROFILING.md` — `dhat-heap` feature build, samply flamegraph workflow, `release-debug` profile.
 - `docs/TESTING.md` — integration test setup, `make model-check`, `make model-check-full`, golden-token fixtures.
-- `docs/KV_CACHE.md` — full §D1 codec table, KV quantization families (TurboQuant, PlanarQuant, RotK), and combination rules.
+- `docs/KV_CACHE.md` — the KV codec table, KV quantization families (TurboQuant, PlanarQuant, RotK), and combination rules.

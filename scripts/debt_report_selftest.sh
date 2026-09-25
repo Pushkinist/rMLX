@@ -85,7 +85,7 @@ for f in \
     crates/rmlx-models/src/hydrate_alpha/prompt_cache_tests.rs \
     crates/rmlx-models/src/hydrate_beta/prompt_cache.rs \
     crates/rmlx-models/src/hydrate_gamma/prompt_cache.rs \
-    docs/SMALL.md
+    ./docs/SMALL.md
 do
     [ -f "$BASE/$f" ] || {
         echo "debt-report selftest: missing $BASE/$f" >&2
@@ -125,6 +125,8 @@ check_exit() {
 
 STATIC_WORK="$(mktemp -d)"
 cp -R "$BASE" "$STATIC_WORK/base"
+# The doc-size scan asks git which docs are ignored, so the root is a work tree.
+git -C "$STATIC_WORK/base" init -q || exit 1
 
 python3 - "$STATIC_WORK/base/docs" <<'EOF'
 import sys
@@ -1206,7 +1208,7 @@ rm -rf "$ABSENT_WORK"
 
 check "doc_over_threshold_listed" \
     "BIG.md, generated over the 40 KiB threshold, is listed" \
-    contains "docs/BIG.md" \
+    contains "/BIG.md  " \
     BASE_OUT
 
 check "doc_under_threshold_absent" \
@@ -1264,6 +1266,7 @@ check "counter_oversized" \
 
 RENAME_WORK="$(mktemp -d)"
 cp -R "$BASE" "$RENAME_WORK/base"
+git -C "$RENAME_WORK/base" init -q || exit 1
 sed -i.bak 's/pub fn mtp_generate(/pub fn zzz_renamed_driver(/' \
     "$RENAME_WORK/base/crates/rmlx-models/src/speculative/mtp.rs"
 rm -f "$RENAME_WORK/base/crates/rmlx-models/src/speculative/mtp.rs.bak"
@@ -1316,7 +1319,8 @@ printf 'line1\nline2\nline3\nline4\nline5\n' >"$RATIO_WORK/crates/fixture-crate/
 printf 'docline1\ndocline2\ndocline3\ndocline4\n' >"$RATIO_WORK/docs/A.md"
 # A top-level *.md file, outside docs/ — proves the churn section's combined
 # pathspec still covers it; dropping the "*.md" half of that call would go
-# unnoticed if only docs/A.md (already covered by "docs") ever changed.
+# unnoticed if only the fixture doc under docs/ (already covered by "docs")
+# ever changed.
 printf 'r1\nr2\nr3\n' >"$RATIO_WORK/README.md"
 
 git_ratio add -A || exit 1
@@ -1326,7 +1330,7 @@ git_ratio commit -q -m "initial" || {
 }
 git_ratio tag v0.0.1 || exit 1
 
-# +4/-2 in the source file, +3/-1 in docs/A.md, +2/-1 in README.md — unique
+# +4/-2 in the source file, +3/-1 in the fixture doc, +2/-1 in README.md — unique
 # lines on both sides of each edit so the diff is unambiguous, not just
 # plausible.
 printf 'line1\nline2\nline3\nline6\nline7\nline8\nline9\n' >"$RATIO_WORK/crates/fixture-crate/src/lib.rs"
@@ -1351,7 +1355,7 @@ check "ratio_source_computed" \
     RATIO_OUT
 
 check "ratio_docs_computed" \
-    "docs/A.md and the top-level README.md are both in the combined figure (+3/-1 and +2/-1), not double-counted" \
+    "the fixture doc under docs/ and the top-level README.md are both in the combined figure (+3/-1 and +2/-1), not double-counted" \
     contains "docs (docs/, *.md): +5 / -2  (ratio 2.50x)" \
     RATIO_OUT
 
@@ -1370,6 +1374,22 @@ printf 'docs/private/\n' >"$RATIO_WORK/.gitignore"
 python3 -c 'import sys; open(sys.argv[1], "w").write("x" * 50000)' "$RATIO_WORK/docs/private/HIDDEN.md"
 python3 -c 'import sys; open(sys.argv[1], "w").write("x" * 50000)' "$RATIO_WORK/docs/SHOWN.md"
 IGNORED_OUT=$(python3 "$TOOL" --root "$RATIO_WORK")
+
+NOT_GIT_WORK="$(mktemp -d)"
+mkdir -p "$NOT_GIT_WORK/docs"
+python3 -c 'import sys; open(sys.argv[1], "w").write("x" * 50000)' "$NOT_GIT_WORK/docs/LARGE.md"
+NOT_GIT_OUT=$(python3 "$TOOL" --root "$NOT_GIT_WORK")
+rm -rf "$NOT_GIT_WORK"
+
+check "doc_size_unavailable_outside_git" \
+    "outside a git work tree the doc-size section says unavailable, not a clean list" \
+    contains "unavailable (git check-ignore exit 128" \
+    NOT_GIT_OUT
+
+check "doc_size_unavailable_lists_nothing" \
+    "an unavailable doc-size section lists no doc" \
+    absent "LARGE.md" \
+    NOT_GIT_OUT
 
 check "doc_size_skips_ignored" \
     "a gitignored doc over the threshold is not listed" \

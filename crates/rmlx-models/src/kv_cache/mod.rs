@@ -37,7 +37,7 @@
 //! factor; see `docs/KV_QUANT.md` §Layer-adaptive overrides.
 //!
 //! `KvQuant::K8V4` is the recorded baseline for Qwen MoE PPL recovery
-//! (`docs/KV_QUANT.md` §"Qwen MoE catastrophe"). It is opt-in, never automatic:
+//! (`docs/KV_QUANT.md` §"Qwen MoE note"). It is opt-in, never automatic:
 //! - K uses affine q8_0 (symmetric 8-bit, `group_size=128`).
 //! - V uses TurboQuant 4-bit Lloyd-Max N(0,1) codebook.
 //! - The split is per-axis (K vs V), NOT per layer-index — the Python fork

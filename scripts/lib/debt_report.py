@@ -966,7 +966,9 @@ def report_add_remove_ratio(root: Path, since: str | None, lines: list[str]) -> 
 
 
 def git_ignored(root: Path, paths: list[str]) -> set[str]:
-    """The paths git ignores under `root`; none when `root` is not a git tree."""
+    """The paths git ignores under `root`. Raises when git cannot tell: exit 0
+    is some ignored, 1 is none ignored, anything else (128: not a work tree) is
+    a question git did not answer."""
     proc = subprocess.run(
         ["git", "-C", str(root), "check-ignore", "--stdin"],
         input="\n".join(paths),
@@ -974,7 +976,11 @@ def git_ignored(root: Path, paths: list[str]) -> set[str]:
         text=True,
         check=False,
     )
-    return set(proc.stdout.split()) if proc.returncode == 0 else set()
+    if proc.returncode == 0:
+        return set(proc.stdout.split())
+    if proc.returncode == 1:
+        return set()
+    raise RuntimeError(f"git check-ignore exit {proc.returncode}: {proc.stderr.strip()}")
 
 
 def report_doc_sizes(root: Path, lines: list[str]) -> None:
@@ -982,7 +988,11 @@ def report_doc_sizes(root: Path, lines: list[str]) -> None:
     lines.append(f"=== docs over {DOC_SIZE_THRESHOLD_KIB} KiB ===")
     docs_dir = root / "docs"
     docs = sorted(f.relative_to(root).as_posix() for f in docs_dir.rglob("*.md")) if docs_dir.is_dir() else []
-    ignored = git_ignored(root, docs)
+    try:
+        ignored = git_ignored(root, docs)
+    except RuntimeError as err:
+        lines.append(f"  unavailable ({err})")
+        return
     over = []
     for name in docs:
         size_kib = (root / name).stat().st_size / 1024

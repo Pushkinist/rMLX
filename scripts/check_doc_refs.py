@@ -2,30 +2,38 @@
 """Every reference into docs/ resolves, and a doc edit re-points none of them.
 
 A reference is text in a tracked file that names a doc under `docs/`, and
-maybe something inside it:
+maybe something inside it. A doc is named by its `docs/` path, by a bare
+top-level doc name (`KV_QUANT.md`), or, inside a doc, by a name relative to
+that doc. At most one line break may sit between the name and what it cites,
+with the comment leader (`//`, `///`, `#`, `*`) or string continuation (a trailing
+backslash) the break carries.
 
-  PATH     a doc path (`docs/<path>.md`) or a bare top-level doc name
-           (`KV_QUANT.md`); the file must exist
+  PATH     the doc must exist
   LINK     a Markdown link or link definition whose target is under docs/, or
            any relative link written in a docs/ file; a `#anchor` must be a
            heading slug or an explicit id in the target
   ANCHOR   `<DOC>.md#anchor`; the anchor must exist
-  SECTION  `<DOC>.md §N` must name a heading numbered N. `<DOC>.md` followed by
-           `§ "Phrase"`, § and a backticked identifier, `section "Phrase"`,
-           `under "Phrase"` or `§ Some Words` must name a heading that starts
-           with the phrase; an unquoted run of words may also run on past the
-           heading title
-  QUOTE    `<DOC>.md "Phrase"`: a phrase that names a heading must keep naming
-           a heading; any other phrase must occur in the doc
-           Inside a doc, a `§` with no doc name before it cites that doc.
+  SECTION  `<DOC>.md §N` must name a heading numbered N. `§ "Phrase"`,
+           § and a backticked identifier, `§ *Phrase*`, `section "Phrase"`
+           and `under "Phrase"` must name a heading exactly (see below). An
+           unquoted `§ Some Words` may also run on into the sentence past a
+           heading title, or stop short of one. Inside a doc, a `§` that no doc
+           name before it claims cites that doc. `§ below`, `§ above` and
+           `§ line N` are prose, not citations.
+  QUOTE    `<DOC>.md "Phrase"`: a phrase that names a heading exactly must keep
+           naming a heading; any other phrase must occur in the doc
   LINE     `<DOC>.md:NNN` must be a line of the doc; a quoted phrase after it
            is checked as a QUOTE too
   MAP      every top-level docs/*.md has a `CLAUDE.md` documentation-map row
            whose label and link name the same file (MAPROW: a row whose label
            and link differ)
 
-Phrases compare with backticks, asterisks and runs of whitespace removed, and
-section phrases compare without case.
+A heading is a Markdown `#` heading or a run-in heading, a paragraph that
+opens `**Title.**`. A phrase names a heading exactly when it equals the
+title, the title before its first ` — `, or either without a trailing
+parenthetical. Phrases compare without backticks, asterisks, case and runs of
+whitespace. A citation to a title, or a section number, that two headings
+carry fails: make the heading unique.
 
 Readers it does parse, and so holds a cut to: every citation above in code,
 scripts, docs, `README.md` and `CLAUDE.md`; the section names in CLI help
@@ -50,11 +58,20 @@ HEAD and REF, "the base". A reference fails if it resolved at the base and
 does not resolve now, or if it now resolves to a different target: a heading
 with another title, a cited line with other text, a heading phrase that is
 now only body text. A reference already broken at the base is carried: it is
-printed and does not fail. Carried references are counted per target, so
-moving a broken citation with its code passes and a second copy of one fails.
+printed and does not fail, within two limits. Carried references are counted
+per target (kind, doc, key, and whether the name was unquoted, since an
+unquoted name resolves more loosely), so the count never rises: moving a
+broken citation with its code passes, and a second copy of one fails. A doc
+that this change edits, creates or deletes carries nothing: every broken
+reference into it or out of it fails, so a cut fixes the broken citations of
+the docs it touches.
+
 `--base auto` picks the nearest of origin/main and origin/next/*: the ref
 whose merge-base leaves the fewest commits on HEAD, among refs that do not
-already contain HEAD; with none, HEAD itself. Every run prints its base.
+already contain HEAD; with none, HEAD itself. On a next/* tip that main does
+not contain (main carries a hotfix), that is the merge-base with main. On the
+main tip, it is the merge-base with the next/* ref, because main contains
+itself. Every run prints its base.
 
 `CHANGELOG.md` is released history and is never edited for a doc cut. Its
 references are scanned and a broken one is printed, but it never fails.
@@ -86,8 +103,11 @@ TEXT_SUFFIXES = {".md", ".rs", ".sh", ".py", ".toml", ".txt", ".yml", ".yaml", "
 TEXT_NAMES = {"Makefile"}
 RELEASED_HISTORY = "CHANGELOG.md"
 
-DOC_MENTION = re.compile(r"(?<![\w/.-])((?:\.\./)*docs/[\w./-]+?\.md|[A-Z][A-Z0-9_]+\.md)")
-LEAD = r"`?\)?,? ?"
+MD_MENTION = re.compile(r"(?<![\w/.-])((?:\.\./)*\w[\w./-]*?\.md)(?![\w-])")
+# What may sit between a doc name and what it cites: a closing backtick or
+# parenthesis, a comma, and at most one line break, with the comment leader or
+# string continuation that the break carries.
+LEAD = r"`?\)?,?[ \t]*(?:\\?\n[ \t]*(?://[/!]?|#|\*|>|--)?[ \t]*)?"
 # A phrase in double quotes; the quotes may be escaped, as inside a string literal.
 QUOTED = r'\\?"([A-Za-z`](?:[^"\\]|\\\n){2,240})\\?"'
 AFTER_ANCHOR = re.compile(r"#([A-Za-z0-9_-]+)")
@@ -100,6 +120,8 @@ AFTER_SECTION_PHRASE = re.compile(
     r"(?:" + QUOTED + r"|`([^`\n]+)`|\*([A-Za-z`][^*]{2,240})\*)"
 )
 AFTER_SECTION_WORDS = re.compile(LEAD + SECTION_MARK + r"([A-Za-z][\w:-]*(?: [A-Za-z0-9][\w:-]*)*)")
+# `§ below`, `§ above`, `§ line 206`: prose that points, not a section name.
+NOT_A_SECTION_NAME = {"above", "below", "line", "lines"}
 AFTER_QUOTE = re.compile(LEAD + QUOTED)
 INLINE_LINK = re.compile(r"\]\(\s*<?([^()\s<>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 LINK_DEF = re.compile(r"^\s*(?://[/!]?\s*|#\s*)?\[[^\]]+\]:\s*<?(\S+?)>?(?:\s|$)", re.M)
@@ -107,6 +129,8 @@ MAP_ROW = re.compile(r"^\| \[`([^`]+)`\]\(([^)]+)\)", re.M)
 COMMENT_LEADER = re.compile(r"\\?\n\s*(?://[/!]?|#|\*|>|--)?\s*")
 FIXTURE_PATH = re.compile(r"^scripts/[^/]+_(?:selftest|fixtures)\.sh$")
 FIXTURE_MARKER = re.compile(r"^\s*(?:#|//)\s*doc-refs: fixture\b", re.M)
+# A run-in heading: a paragraph that opens with a bold title, `**Title.** Text`.
+RUN_IN = re.compile(r"^\*\*([^*\n]+?)\.?\*\*")
 EXPLICIT_ID = re.compile(r"""<a\s+(?:id|name)=["']([^"']+)["']""")
 
 
@@ -207,30 +231,48 @@ def heading_words(title: str) -> tuple[str, str]:
     return (m.group(1), m.group(2)) if m else ("", text)
 
 
+def short_names(title: str) -> set[str]:
+    """A heading title, the part before its first ` — `, and each of those
+    without a trailing parenthetical: `Foo — bar (x)` answers to all four."""
+    names = {title, title.split(" — ")[0]}
+    return names | {re.sub(r"\s*\([^()]*\)$", "", n) for n in names}
+
+
 @dataclass
 class Doc:
     lines: list[str]
     headings: list[str]
+    run_ins: list[str]
     anchors: set[str]
     flat: str
 
     def heading_named(self, phrase: str, runs_on: bool = False) -> str | None:
-        """The first heading that starts with the phrase. With `runs_on` (an
-        unquoted name, which may run on into the sentence), else the longest
-        heading the phrase starts with."""
+        """The heading that a short name of carries the phrase (see
+        `short_names`). An unquoted name (`runs_on`) may also run on into the sentence
+        past a title, or stop short of one; the longest title it runs past
+        wins, then the first title it starts."""
         want = phrase.lower()
-        titles = [(heading_words(t)[1].lower(), t) for t in self.headings]
+        titles = [(heading_words(t)[1].lower(), t) for t in self.headings + self.run_ins]
         for name, title in titles:
-            if name.startswith(want):
+            if want in short_names(name):
                 return title
         if not runs_on:
             return None
         inside = [(len(name), title) for name, title in titles if name and (want + " ").startswith(name + " ")]
-        return max(inside)[1] if inside else None
+        if inside:
+            return max(inside)[1]
+        return next((title for name, title in titles if name.startswith(want)), None)
+
+    def headings_like(self, title: str, by_number: bool) -> int:
+        """How many headings carry this title's section number, or its name."""
+        number, name = heading_words(title)
+        if by_number:
+            return sum(1 for t in self.headings if heading_words(t)[0] == number)
+        return sum(1 for t in self.headings + self.run_ins if heading_words(t)[1].lower() == name.lower())
 
 
 def parse_doc(text: str) -> Doc:
-    headings, anchors, seen = [], set(), Counter()
+    headings, run_ins, anchors, seen = [], [], set(), Counter()
     for line in unfenced(text).split("\n"):
         m = re.match(r"(#{1,6})\s+(.*?)\s*#*\s*$", line)
         if m:
@@ -239,8 +281,10 @@ def parse_doc(text: str) -> Doc:
             base = slug(title)
             anchors.add(base if seen[base] == 0 else f"{base}-{seen[base]}")
             seen[base] += 1
+        elif r := RUN_IN.match(line):
+            run_ins.append(r.group(1))
         anchors.update(EXPLICIT_ID.findall(line))
-    return Doc(text.split("\n"), headings, anchors, plain(text))
+    return Doc(text.split("\n"), headings, run_ins, anchors, plain(text))
 
 
 class Tree:
@@ -263,8 +307,8 @@ class Ref:
     runs_on: bool = False
 
     @property
-    def target(self) -> tuple[str, str, str]:
-        return (self.kind, self.doc, self.key)
+    def target(self) -> tuple[str, str, str, bool]:
+        return (self.kind, self.doc, self.key, self.runs_on)
 
 
 def resolve(ref: Ref, tree: Tree) -> str | None:
@@ -300,13 +344,18 @@ def resolve(ref: Ref, tree: Tree) -> str | None:
     raise AssertionError(ref.kind)
 
 
-def doc_path_of(name: str, doc_names: set[str]) -> str | None:
-    while name.startswith("../"):
-        name = name[3:]
-    if name.startswith("docs/"):
-        return name
-    candidate = f"docs/{name}"
-    return candidate if candidate in doc_names else None
+def doc_path_of(name: str, citing: str, doc_names: set[str]) -> str | None:
+    """The doc a mention names: a `docs/` path, a top-level doc name, or a
+    name relative to the doc that holds it."""
+    bare = name
+    while bare.startswith("../"):
+        bare = bare[3:]
+    if bare.startswith("docs/"):
+        return bare
+    for candidate in (f"docs/{bare}", normalise(name, citing) if citing.startswith("docs/") else ""):
+        if candidate in doc_names:
+            return candidate
+    return None
 
 
 def normalise(target: str, citing: str) -> str:
@@ -330,25 +379,28 @@ def quoted(m: re.Match) -> str | None:
     return plain(phrase) if phrase.count("\n") <= 2 else None
 
 
-def refs_after(tail: str) -> list[tuple[str, str, bool]]:
-    """(kind, key, runs_on) for what follows a doc name."""
+def refs_after(tail: str) -> tuple[list[tuple[str, str, bool]], int]:
+    """(kind, key, runs_on) for what follows a doc name, and the length of the
+    tail that a section citation consumed (0 for none)."""
     if a := AFTER_ANCHOR.match(tail):
-        return [("ANCHOR", a.group(1), False)]
+        return [("ANCHOR", a.group(1), False)], 0
     if a := AFTER_LINE.match(tail):
         found = [("LINE", a.group(1), False)]
         if (q := QUOTE_AFTER_LINE.match(tail, a.end())) and (phrase := quoted(q)):
             found.append(("QUOTE", phrase, False))
-        return found
+        return found, 0
     if a := AFTER_SECTION_NUMBER.match(tail):
-        return [("SECTION", a.group(1), False)]
+        return [("SECTION", a.group(1), False)], a.end()
     for pattern, kind, runs_on in (
         (AFTER_SECTION_PHRASE, "SECTION", False),
         (AFTER_SECTION_WORDS, "SECTION", True),
         (AFTER_QUOTE, "QUOTE", False),
     ):
         if (a := pattern.match(tail)) and (phrase := quoted(a)):
-            return [(kind, phrase, runs_on)]
-    return []
+            if runs_on and phrase.split()[0].lower() in NOT_A_SECTION_NAME:
+                return [], a.end()
+            return [(kind, phrase, runs_on)], a.end() if kind == "SECTION" else 0
+    return [], 0
 
 
 def collect(tree: Tree, doc_names: set[str]) -> list[tuple[Ref, int]]:
@@ -371,20 +423,25 @@ def collect(tree: Tree, doc_names: set[str]) -> list[tuple[Ref, int]]:
             if anchor and not resolved.endswith(".md"):
                 anchor = ""
             refs.append((Ref(citing, "LINK", resolved, anchor), line_of(text, pos)))
-        if in_docs and citing.endswith(".md"):
-            for m in re.finditer("§", link_text):
-                if ".md" in link_text[max(0, m.start() - 8) : m.start()]:
-                    continue
-                for kind, key, runs_on in refs_after(link_text[m.start() : m.start() + 400]):
-                    refs.append((Ref(citing, kind, citing, key, runs_on), line_of(text, m.start())))
-        for m in DOC_MENTION.finditer(text):
-            doc = doc_path_of(m.group(1), doc_names)
+        cited_elsewhere: set[int] = set()
+        for m in MD_MENTION.finditer(text):
+            found, consumed = refs_after(text[m.end() : m.end() + 400])
+            section_mark = text.find("§", m.end(), m.end() + consumed) if consumed else -1
+            if section_mark >= 0:
+                cited_elsewhere.add(section_mark)
+            doc = doc_path_of(m.group(1), citing, doc_names)
             if doc is None:
                 continue
             line = line_of(text, m.start())
             refs.append((Ref(citing, "PATH", doc, ""), line))
-            for kind, key, runs_on in refs_after(text[m.end() : m.end() + 400]):
+            for kind, key, runs_on in found:
                 refs.append((Ref(citing, kind, doc, key, runs_on), line))
+        if in_docs and citing.endswith(".md"):
+            for m in re.finditer("§", link_text):
+                if m.start() in cited_elsewhere:
+                    continue
+                for kind, key, runs_on in refs_after(link_text[m.start() : m.start() + 400])[0]:
+                    refs.append((Ref(citing, kind, citing, key, runs_on), line_of(text, m.start())))
     if "CLAUDE.md" in tree.files:
         text = tree.files["CLAUDE.md"]
         for m in MAP_ROW.finditer(text):
@@ -438,18 +495,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{ref.kind}\t{ref.citing}:{line}\t{ref.doc}\t{ref.key}\t{shown}")
         return 0
 
-    base_broken: Counter[tuple[str, str, str]] = Counter()
+    base_broken: Counter[tuple[str, str, str, bool]] = Counter()
+    edited: set[str] = set()
     if base:
         for ref, _ in collect(base, names):
             if resolve(ref, base) is None:
                 base_broken[ref.target] += 1
+        edited = {d for d in names if head.files.get(d) != base.files.get(d)}
 
     failures, carried, history = [], [], []
     if base:
         for name in head.fixtures:
             if name in base.files and name not in base.fixtures:
                 failures.append(f"  {name}: gained the 'doc-refs: fixture' marker, which hides its references")
-    seen: Counter[tuple[str, str, str]] = Counter()
+    seen: Counter[tuple[str, str, str, bool]] = Counter()
     for ref, line in head_refs:
         got = resolve(ref, head)
         before = resolve(ref, base) if base else None
@@ -457,6 +516,12 @@ def main(argv: list[str] | None = None) -> int:
             problem = "resolves to nothing"
         elif before is not None and before != got:
             problem = f"re-pointed: was {squash(before)[:70]!r}, now {squash(got)[:70]!r}"
+        elif ref.kind in ("SECTION", "QUOTE") and got != "body text":
+            title = got.removeprefix("heading: ")
+            carriers = head.docs[ref.doc].headings_like(title, ref.key[0].isdigit())
+            if carriers < 2:
+                continue
+            problem = f"names {title!r}, which {carriers} headings carry; make the heading unique"
         else:
             continue
         if ref.citing == RELEASED_HISTORY:
@@ -465,7 +530,10 @@ def main(argv: list[str] | None = None) -> int:
         if got is None:
             seen[ref.target] += 1
             if seen[ref.target] <= base_broken[ref.target]:
-                carried.append(f"  {describe(ref, line)}")
+                if ref.doc in edited or ref.citing in edited:
+                    failures.append(f"  {describe(ref, line)} — {problem}; this change edits that doc, so fix it here")
+                else:
+                    carried.append(f"  {describe(ref, line)}")
                 continue
         failures.append(f"  {describe(ref, line)} — {problem}")
 

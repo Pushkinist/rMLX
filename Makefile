@@ -555,8 +555,9 @@ published-table-selftest: ## CI gate: mutation check for the published-protocol 
 check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited in docs/ does not exist
 	@bash scripts/check_doc_source_citations.sh
 
-# The base is a make variable, never read from the environment: only a
-# command-line DOC_REFS_BASE=<ref> counts. `auto` is the nearest of origin/main
+# The base is a make variable, never read from the environment: only
+# DOC_REFS_BASE=<ref> on the make command line counts, which in make includes
+# the same assignment passed in MAKEFLAGS. `auto` is the nearest of origin/main
 # and origin/next/* that does not already contain HEAD (see check_doc_refs.py).
 DOC_REFS_BASE_ARG := $(if $(filter command line,$(origin DOC_REFS_BASE)),$(DOC_REFS_BASE),auto)
 

@@ -3314,7 +3314,7 @@ current tree rather than inherited:
   `Planar*`, `PlanarK`, the `K8VTurbo*` / `TurboSym*` families and the
   `Iso3/4` / `Rotor3/4` / `RotorK*Asym` asymmetric families all decode off the
   bf16 mirror and never read their packed store, so no store is built
-  (§"Per-layer net-benefit decision" above). Their resident KV equals bf16's
+  (§"Per-layer net-benefit decision + net-negative warn" above). Their resident KV equals bf16's
   **byte for byte**, and so does their output at temp=0.
 * **The one store-reading codec a default ever picked does not win on
   speed.** `Mixed` really does read its packed 3-tuples at decode. The rows
@@ -3329,7 +3329,7 @@ current tree rather than inherited:
 
   **The memory half of that row no longer holds on a dense architecture.** The
   mirror is now built only where a cross-layer-KV consumer reads it
-  (§"Per-layer net-benefit decision"), so on Bonsai-8B `mixed_k8g64_v4g64` is
+  (§"Per-layer net-benefit decision + net-negative warn"), so on Bonsai-8B `mixed_k8g64_v4g64` is
   **0.589x** `none` at a 3 770-token prompt, 0.575x at 16k and 0.573x at 32k,
   and on Qwen3.6-35B-A3B 0.748x at 4k. The speed half is unchanged and was
   re-measured across that change: ABBA-paired, same host, decode-TPS ratio
@@ -3426,8 +3426,8 @@ measurement, not by restoring a table.
 Approximate bytes per KV pair (`B=1, 1 layer, 1 head, D elements`). These are
 **packed-store** rates — what a codec's codes and scales occupy. They are not
 resident KV for the bf16-mirror family, which builds no store: those codecs sit
-at the `None` row, 4·D, measured byte-identical (§"Per-layer net-benefit
-decision"). Which rows are live and which are hypothetical is stated under the
+at the `None` row, 4·D, measured byte-identical (§"Per-layer net-benefit decision + net-negative
+warn"). Which rows are live and which are hypothetical is stated under the
 table.
 
 | Mode | K bytes/tok | V bytes/tok | Total bytes/tok |

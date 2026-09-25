@@ -544,8 +544,8 @@ fn planar_widths_are_byte_identical_and_the_others_pay_for_their_bits() {
     assert!(
         three_db > four_db,
         "planar4 {four_db:.2} dB now beats planar3 {three_db:.2} dB at the same rate. The \
-         documented dominance has flipped — update docs/TESTING.md \"a strictly dominated width\" \
-         and this test rather than deleting it"
+         documented dominance has flipped — update docs/KV_QUANT.md \"Each family therefore \
+         has one strictly dominated width\" and this test rather than deleting it"
     );
 
     // iso and rotor: the dense code plane charges for the extra bit, one per
