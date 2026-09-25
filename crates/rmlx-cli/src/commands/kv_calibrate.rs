@@ -10,7 +10,7 @@
 )]
 //! `rmlx kv-calibrate` — KV calibration passes.
 //!
-//! Two recipes:
+//! Two recipe families:
 //!
 //! * **Weight-norm recipes** (`turbo2`, `turbo2_tcq`, `turbo3`, `turbo3_tcq`,
 //!   `turbo4`) — CPU-only walks safetensors weight shards to compute per-head
@@ -25,12 +25,13 @@
 //!   Detection is structural — the sibling `<base>.scales` tensor is present —
 //!   so no flag is required.
 //!
-//! * **Head-budget recipe** (`head_budget`) — loads the model on GPU, prefills
-//!   each calibration prompt, walks each layer's KV cache for the accumulated
-//!   bf16 K buffer, computes per-(layer, head) k-budgets that cover the
-//!   requested cumulative softmax-mass threshold under a K-norm² proxy, and
-//!   writes `head_budgets.json` per the `rmlx-loader::head_budgets` schema.
-//!   Requires the Metal claim (single-MLX rule).
+//! * **Head-budget recipes** (`head_budget`, `k_norm_proxy`, `softmax_mass`)
+//!   — Qwen3 only. Load the model on the GPU, prefill each calibration prompt
+//!   and compute per-(layer, head) k-budgets that cover the requested
+//!   cumulative softmax-mass threshold. `head_budget` and its alias
+//!   `k_norm_proxy` use a K-norm² proxy over the bf16 K buffer and write a
+//!   v1 `head_budgets.json`; `softmax_mass` measures the real softmax mass and
+//!   writes v2. The Metal claim is held only while the model loads.
 //!
 //! # Public API
 //!
@@ -54,12 +55,11 @@ const DEFAULT_HEAD_BUDGET_MASS_THRESHOLD: f32 = 0.95;
 
 /// Default per-(layer, head) floor for the `softmax_mass` recipe. Must match
 /// the `default_value_t` for `KvCalibrate::target_mass_budget_floor` in
-/// `crates/rmlx-cli/src/main.rs`; the LOW-2 warn compares against this so the
-/// silent-no-op gate only fires when the operator explicitly overrode it.
+/// `crates/rmlx-cli/src/main.rs`; the warn for a recipe that ignores the
+/// floor compares against it, so it fires only on an explicit override.
 const DEFAULT_TARGET_MASS_BUDGET_FLOOR: u32 = 16;
 
-/// Per-prompt token cap. Heuristic: keeps calibration under ~2 min on 7B-class
-/// models even with long-context prompts (8k).
+/// Per-prompt token cap for the K-norm² proxy recipes.
 const HEAD_BUDGET_MAX_TOKENS_PER_PROMPT: usize = 768;
 
 /// Wider per-prompt cap for the true softmax-mass recipe. Long-context
@@ -69,15 +69,16 @@ const SOFTMAX_MASS_MAX_TOKENS_PER_PROMPT: usize = 8192;
 /// Run the KV calibration pass.
 ///
 /// - `model_dir`: path to the MLX model snapshot (contains `config.json` + safetensors).
-/// - `recipe`: one of `turbo2`, `turbo2_tcq`, `turbo3`, `turbo3_tcq`, `turbo4`,
-///   or `head_budget` (softmax-mass per-(layer, head) budgets).
-/// - `out`: output path for `kv_calib.json` (or `head_budgets.json` when the
-///   `head_budget` recipe is selected); defaults to `<model_dir>/<filename>`.
-/// - `prompts`: optional override prompt set for the `head_budget` recipe.
+/// - `recipe`: one of `turbo2`, `turbo2_tcq`, `turbo3`, `turbo3_tcq`, `turbo4`
+///   (weight-norm), or `head_budget`, `k_norm_proxy`, `softmax_mass`
+///   (per-(layer, head) budgets).
+/// - `out`: output path for `kv_calib.json` (or `head_budgets.json` for a
+///   head-budget recipe); defaults to `<model_dir>/<filename>`.
+/// - `prompts`: optional override prompt set for the head-budget recipes.
 ///   Ignored for weight-norm recipes. When `None`, defaults to
 ///   `prompts/calibration_default.json` from the workspace.
-/// - `mass_threshold`: softmax-mass coverage target for the `head_budget`
-///   recipe (default 0.95). Ignored for weight-norm recipes.
+/// - `mass_threshold`: softmax-mass coverage target for the head-budget
+///   recipes (default 0.95). Ignored for weight-norm recipes.
 pub(crate) fn run_kv_calibrate(
     model_dir: &Path,
     recipe: &str,
@@ -93,7 +94,7 @@ pub(crate) fn run_kv_calibrate(
         warn!(
             value = target_mass_budget_floor,
             recipe = recipe,
-            "RMLX_TARGET_MASS_BUDGET_FLOOR: ignored for non-softmax_mass recipe"
+            "--target-mass-budget-floor: ignored for non-softmax_mass recipe"
         );
     }
     match recipe {
@@ -185,7 +186,7 @@ fn default_prompts_path(model_dir: &Path) -> Option<PathBuf> {
     resolve_prompts_path(model_dir, "calibration_default.json")
 }
 
-/// Long-context calibration prompt set; falls back to the legacy
+/// Long-context calibration prompt set; falls back to
 /// `calibration_default.json` when the long-context file is absent.
 fn softmax_mass_default_prompts_path(model_dir: &Path) -> Option<PathBuf> {
     resolve_prompts_path(model_dir, "calibration_long_context.json")
@@ -271,9 +272,8 @@ fn run_head_budget(
     let arch_name = cfg.architectures.first().cloned().unwrap_or_default();
     if arch_name != "Qwen3ForCausalLM" {
         anyhow::bail!(
-            "kv-calibrate --recipe head_budget: architecture '{arch_name}' is not yet wired \
-             (Qwen3ForCausalLM only — Bonsai smoke target). \
-             Adding Gemma4 / Qwen3.5MoE / Qwen3VL is follow-up work."
+            "kv-calibrate --recipe head_budget: architecture '{arch_name}' is not supported \
+             (Qwen3ForCausalLM only)."
         );
     }
 
@@ -470,9 +470,8 @@ fn run_softmax_mass(
     let arch_name = cfg.architectures.first().cloned().unwrap_or_default();
     if arch_name != "Qwen3ForCausalLM" {
         anyhow::bail!(
-            "kv-calibrate --recipe softmax_mass: architecture '{arch_name}' is not yet wired \
-             (Qwen3ForCausalLM only — Bonsai smoke target). \
-             Adding Gemma4 / Qwen3.5MoE / Qwen3VL is follow-up work."
+            "kv-calibrate --recipe softmax_mass: architecture '{arch_name}' is not supported \
+             (Qwen3ForCausalLM only)."
         );
     }
 
@@ -648,11 +647,9 @@ use rmlx_models::arch;
 use rmlx_models::arch::Architecture;
 use rmlx_models::qwen3::Qwen3Text;
 
-/// Load the Qwen3 model on GPU. Acquires the single-MLX claim transiently.
+/// Load the Qwen3 model on GPU. Holds the claim on port 0 only for the load:
+/// the claim drops when this function returns, before any measurement runs.
 fn load_qwen3_for_calibration(model_dir: &Path) -> anyhow::Result<Qwen3Text> {
-    // Single-MLX claim — port 0 = default kv-calibrate runtime slot.
-    // Re-uses the runtime claim that `serve` would own; if a serve is live
-    // the calibration must wait or the operator must stop it (hard rule 8).
     let device = Device::Gpu;
     let _claim = crate::commands::parse::acquire_claim_for_device(device, 0)?;
 

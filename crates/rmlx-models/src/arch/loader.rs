@@ -38,8 +38,8 @@ pub struct LoadOpts {
 /// Load a model snapshot from `model_dir`.
 ///
 /// Reads `config.json`, dispatches on `architectures[0]`:
-/// - `"Gemma4ForConditionalGeneration"` -> Architecture::Gemma4(...)
-/// - Anything else -> Error::Model("architecture '...' not yet supported (v0.0.1)")
+/// - an architecture in `KNOWN_ARCHS` -> its `Architecture` variant
+/// - anything else -> `Error::Model("architecture '...' not yet supported")`
 ///
 /// Captures per-phase timing (`mmap_ms`, `dequant_ms`, `gpu_residency_ms`,
 /// `first_kernel_ready_ms`, `total_load_ms`) into `LAST_LOAD_PHASES`.
@@ -47,7 +47,7 @@ pub struct LoadOpts {
 ///
 /// `opts` carries optional runtime overrides (e.g. YARN RoPE for Qwen3).
 /// Pass `&LoadOpts::default()` (or `Default::default()`) when no overrides
-/// are needed — this is byte-identical to the no-opts behaviour.
+/// are needed.
 ///
 /// # Errors
 /// Returns `Error::Config` if `config.json` cannot be read or parsed.
@@ -77,10 +77,10 @@ pub fn load_model(model_dir: &Path, _device: Device, opts: &LoadOpts) -> Result<
         tracing::error!(
             arch = arch_str,
             model_dir = %model_dir.display(),
-            "arch::load_model: architecture not yet supported in v0.0.1"
+            "arch::load_model: architecture not yet supported"
         );
         return Err(Error::Model(format!(
-            "architecture '{arch_str}' not yet supported in v0.0.1; see arch.rs for how to add it"
+            "architecture '{arch_str}' not yet supported; see docs/ADDING_A_MODEL.md for how to add it"
         )));
     }
 

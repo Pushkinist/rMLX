@@ -45,67 +45,20 @@ use tracing::{info, warn};
 
 /// `--turbo-flash` tri-state. Default `Auto` resolves **OFF** on every host.
 ///
-/// The kernel is cleared on crash and fidelity and fails on throughput.
 /// TurboFlash is the only consumer of the K8V4 flash path
 /// (`turbo_flash_should_run`: K8V4 storage, `q_seq == 1`, `kv_seq > 4096`,
-/// `head_dim ∈ {128, 256}`), and everywhere it engages it decodes several
-/// times slower than the generic path it replaces. Measured with `rmlx bench`
-/// (n=3 + warmup, one process per cell, medians, settle gate enforced) on a
-/// quiet host — same binary, temp=0, `--turbo-flash` the only difference:
+/// `head_dim ∈ {128, 256}`). Where it engages it decodes slower than the
+/// generic path, and its persistent head-major flash buffers sit on top of the
+/// bf16 mirror and the packed store.
 ///
-/// | cell | on vs off | token digest |
-/// |---|---|---|
-/// | Bonsai-8B k8v4 @~1.7k (`RMLX_TURBO_FLASH_MIN=0`) | 1.93× slower | — |
-/// | Bonsai-8B k8v4 @8k | 2.74× slower | **differs** |
-/// | Bonsai-8B k8v4 @16k | 3.48× slower | identical |
-/// | Bonsai-8B k8v4 @32k (63.25 → 14.89 TPS) | 4.25× slower | **differs** |
-/// | Bonsai-27B k8v4 @16k | 1.98× slower | identical |
+/// The output differs from the OFF arm, and that is the codec, not the kernel.
+/// On `K8V4` the generic decode path reads the bf16 mirror and never touches
+/// the 4-bit V store (`KvQuant::decode_reads_packed_store` is `false` for it),
+/// so the OFF arm is a bf16 attention. Against `turbo_flash_reference_sdpa`, a
+/// dequantize-then-SDPA over the same `flash_*` buffers, the kernel is gated
+/// at cosine ≥ 0.999999 and ≤ 0.5 bf16 ULP per row.
 ///
-/// The loss scales with `kv_seq` rather than being a fixed per-request
-/// penalty. Dispatch was proven by counter, not inferred: 1638 kernel
-/// dispatches in the ON arm against 0 in the OFF arm. The ON arm also holds
-/// 722 468 864 B more resident KV at 16k — the persistent head-major flash
-/// buffers sit *on top of* the bf16 mirror and the packed store rather than
-/// replacing either. Tightening the ring 4× recovers part of the gap but not
-/// the bulk, so it is not a `--max-ctx` sizing artefact.
-///
-/// **The output is not identical, and that is the codec, not the kernel.**
-/// Turning the gate off does not turn the codec off: on `K8V4` the generic
-/// decode path reads the bf16 mirror and never touches the 4-bit V store
-/// (`KvQuant::decode_reads_packed_store` is `false` for it), so the OFF arm is
-/// a bf16 attention and **any** correct tq4-V kernel must differ from it by the
-/// codec's own quantization error. Measuring the kernel against that arm
-/// charges it for the codec.
-///
-/// Measured against a reference that *does* run the codec —
-/// `turbo_flash_reference_sdpa`, a dequantize-then-SDPA over the identical
-/// `flash_*` buffers at the kernel's own f32 working precision — the kernel is
-/// gated at **cosine ≥ 0.999999 and ≤ 0.5 bf16 ULP per row** and measures 0.056
-/// ULP at worst, two of three cells bit-identical. The cells are the two
-/// dispatching geometries plus an additive-mask cell, on a ring whose stride is
-/// wider than its fill and whose last block is partial — i.e. decode as
-/// production drives it, at `q_seq = 1`. The kernel is
-/// therefore accurate *for its codec*; the ≈0.997 SDPA cosine against bf16 is
-/// the tq4-V codec floor, and at temp=0 that floor flips greedy argmax ties
-/// prompt-dependently. So this is a decode loss plus a codec-fidelity cost —
-/// not a kernel defect.
-///
-/// `gemma-4-e2b` (`kv_h=1`, `head_dim=256`, SWA 512) is a **null control**,
-/// not a second architecture: at 4k its `kv_cache_bytes` is bit-identical
-/// across both arms (156 850 176 B), which proves the flash buffers are never
-/// allocated and the kernel never dispatches there — the `kv_seq > 4096` gate
-/// stops it. Its ±0.3% is evidence that the gate holds, not evidence about
-/// where the kernel pays. The second *firing* architecture is Bonsai-27B
-/// (`Qwen3_5ForConditionalGeneration`, `head_dim=256`, `kv_h=4`), and it loses
-/// too: both supported head_dims lose.
-///
-/// `Auto` therefore holds OFF — the same HOLD posture
-/// [`PlanarFlashDecodeMode`] already takes for the same reason. `on` remains
-/// the explicit opt-in for ablation and for the re-validation that would lift
-/// the HOLD. Nothing else changes: the kernel, its tests, and the
-/// `head_dim = 256` hazard re-validation
-/// (`docs/reports/apple10-head-dim-256-revalidation.md`, a *crash/fidelity*
-/// clearance, never a throughput one) all stand.
+/// `on` is the explicit opt-in for ablation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum TurboFlashMode {
     /// Force the TurboFlash MSL kernel on.
@@ -113,11 +66,8 @@ pub(crate) enum TurboFlashMode {
     /// Force the TurboFlash MSL kernel off. A hard override: an exported
     /// `RMLX_TURBO_FLASH=1` does not survive it.
     Off,
-    /// Resolves to OFF on every host: the kernel is a measured 2.0–4.25×
-    /// decode loss on the one codec it serves. Its numerics are cleared for
-    /// decode as production drives it — it matches a dequant-then-SDPA
-    /// reference over its own packed buffers within a 0.5 bf16 ULP gate — so
-    /// throughput is the whole of the remaining HOLD.
+    /// Resolves to OFF on every host: the kernel decodes slower than the
+    /// generic path on the one codec it serves.
     #[default]
     Auto,
 }
@@ -140,16 +90,13 @@ impl std::fmt::Display for TurboFlashMode {
 /// - [`TurboFlashMode::Off`] → off. A hard override: an
 ///   `RMLX_TURBO_FLASH=1` exported in the shell does not survive an explicit
 ///   `off`.
-/// - [`TurboFlashMode::Auto`] → resolves OFF on every host (see
-///   [`TurboFlashMode`] for the measurements). The Apple family is still
-///   probed and logged so an operator can see which host the HOLD applied to.
-///   `Auto` is the only mode that honours a pre-existing `RMLX_TURBO_FLASH=1`
-///   (back-compat path), so a shell that opts in still gets the kernel. That
-///   case logs at `warn!`, because the flag then reads OFF while the kernel is
-///   in fact ON and costing 2.0-4.25x decode.
+/// - [`TurboFlashMode::Auto`] → OFF on every host (see [`TurboFlashMode`]),
+///   unless `RMLX_TURBO_FLASH=1` is set. The Apple family is probed and
+///   logged. The env case logs at `warn!`, because the flag then reads `auto`
+///   while the kernel runs.
 ///
-/// `turbo_flash_lock` is unchanged: the flag forces lock-on, and without it a
-/// pre-existing `RMLX_TURBO_FLASH_LOCK=1` is still honoured.
+/// `turbo_flash_lock`: the flag forces lock-on; without it,
+/// `RMLX_TURBO_FLASH_LOCK=1` also resolves lock-on.
 ///
 /// `env` carries the environment-derived fallbacks — pass the
 /// [`DispatchPolicy::from_env`] value so the `auto` arms see the same
@@ -162,25 +109,13 @@ fn resolve_turbo_flash(
     let resolved_on = match turbo_flash {
         TurboFlashMode::On => true,
         TurboFlashMode::Off => false,
-        // Auto is a HOLD on every host. On the one storage it serves (K8V4,
-        // kv_seq > 4096) the kernel decodes 2.0-4.25x slower than the path it
-        // replaces and carries several hundred MB of extra resident KV for the
-        // privilege. It also changes the generated tokens, because it is the
-        // only K8V4 configuration in which the 4-bit V codec participates in
-        // decode at all — that is the codec's error, not the kernel's, which
-        // matches a reference over its own packed buffers inside a 0.5 bf16 ULP
-        // gate.
-        // Defaulting a measured decode loss ON is worse than shipping no kernel
-        // at all, so Auto stays OFF until a throughput re-measurement clears
-        // it. See `TurboFlashMode` for the cells. The family is still probed so
-        // the log names the host the HOLD applied to.
         TurboFlashMode::Auto => {
             if let Some(family) = rmlx_core::apple_gpu::apple_silicon_generation() {
                 tracing::info!(
                     family,
-                    "--turbo-flash=auto on Apple{family} — resolved OFF (HOLD: the \
-                     kernel decodes 2.0-4.25x slower than the generic K8V4 path \
-                     at kv_seq > 4096; it also applies the 4-bit V codec the \
+                    "--turbo-flash=auto on Apple{family} — resolved OFF (the \
+                     kernel decodes slower than the generic K8V4 path at \
+                     kv_seq > 4096; it also applies the 4-bit V codec the \
                      generic path skips, which changes the output). Use \
                      --turbo-flash on to override."
                 );
@@ -205,15 +140,13 @@ fn resolve_turbo_flash(
         tracing::info!(mode = %turbo_flash, "--turbo-flash resolved OFF");
     }
     if turbo_flash == TurboFlashMode::Auto && env.turbo_flash {
-        // Auto does not clear an operator's opt-in, so the effective state
-        // here is ON even though the flag reads OFF. Say so at warn level: a
-        // variable exported once in a shell, a CI job or a profile would
-        // otherwise carry a known decode regression silently.
+        // A variable exported once in a shell, a CI job or a profile would
+        // otherwise carry a known decode loss silently.
         tracing::warn!(
             mode = %turbo_flash,
             "--turbo-flash is auto and RMLX_TURBO_FLASH=1 is set in the \
              environment — the kernel stays ON (auto honours an explicit \
-             opt-in). That is a 2.0-4.25x decode loss on K8V4 at kv_seq > 4096. \
+             opt-in). The kernel decodes slower on K8V4 at kv_seq > 4096. \
              Unset the variable or pass --turbo-flash off."
         );
     }
@@ -225,14 +158,8 @@ fn resolve_turbo_flash(
 }
 
 /// `--planar-flash-decode` tri-state. Default `Auto` resolves **OFF** on every
-/// host — a HOLD, not a hardware gate. It shares the resolution pattern and
-/// the HOLD posture with [`TurboFlashMode`], but not any per-family policy:
-/// neither flag has one.
-///
-/// Added with the planar_flash_decode MSL kernel (2026-05). Defaults OFF;
-/// validation found no measurable speedup (-0.19% at 4k canary) and NIAH was
-/// blocked by a pre-existing bug. The `Auto` variant doc below carries the
-/// current posture in full.
+/// host. It shares the resolution pattern with [`TurboFlashMode`]; neither
+/// flag has a per-family policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum PlanarFlashDecodeMode {
     /// Force the planar_flash_decode kernel on.
@@ -240,7 +167,7 @@ pub(crate) enum PlanarFlashDecodeMode {
     /// Force the planar_flash_decode kernel off. A hard override: an exported
     /// `RMLX_PLANAR_FLASH_DECODE=1` does not survive it.
     Off,
-    /// Resolves to OFF on every host. Validation complete: HOLD.
+    /// Resolves to OFF on every host.
     #[default]
     Auto,
 }
@@ -262,51 +189,28 @@ impl std::fmt::Display for PlanarFlashDecodeMode {
 /// - [`PlanarFlashDecodeMode::On`] → on.
 /// - [`PlanarFlashDecodeMode::Off`] → off; a hard override, an exported
 ///   `RMLX_PLANAR_FLASH_DECODE=1` does not survive it.
-/// - [`PlanarFlashDecodeMode::Auto`] → currently resolves to OFF on every
-///   host. The warm-TTFT bf16-K shortcut (see
-///   `docs/reports/planar-chunked-prefill-fix.md`) unblocked the NIAH
-///   correctness anchor but as a side effect: when the prefill bf16 K seed is
-///   live (the normal post-`exit_prefill` decode flow) the PlanarK fused-QK /
-///   flash-decode kernels intentionally do NOT fire — the dispatcher falls
-///   through to bf16 SDPA so PlanarK matches the warm-TTFT semantics of
-///   K8V4/K8V8/Planar/Mixed/K8VTurbo*/Iso*/Rotor*/TurboSym*. As a consequence
-///   the planar-flash-decode kernel does not contribute to TPS in normal
-///   generate flows, and the ≥10% Auto-flip gate cannot be met from a routine
-///   prompt-cache miss. Auto therefore stays OFF until either (a) a seedless
-///   workload (PPL eval / future prompt-cache hits that skip `exit_prefill`)
-///   demonstrates a measurable speedup, or (b) the kernel is rewired to seed
-///   itself from `decode_fp16_k` (mirroring TurboFlash).
-///   Pre-existing `RMLX_PLANAR_FLASH_DECODE=1` in the shell is honoured for
-///   back-compat.
+/// - [`PlanarFlashDecodeMode::Auto`] → OFF on every host, unless
+///   `RMLX_PLANAR_FLASH_DECODE=1` is set. After `exit_prefill` the PlanarK
+///   cache holds a bf16 K seed, and the dispatcher then falls through to bf16
+///   SDPA, so the kernel does not fire on the normal generate flow.
 ///
 ///   Flipping this flag on a normal generate flow changes nothing observable,
 ///   and that is not evidence the two paths agree: neither arm dispatches the
-///   kernel, so the identical output is the warm-TTFT bypass in both. Where
-///   the kernel does run, it is **not** bit-exact with the split chain — the
-///   online per-tile softmax sums in a different order. At the dtype the
-///   dispatcher returns, that survives in 4 of 6 measured cells and vanishes
-///   in 2, so a one-cell check will confirm byte-identity about a third of the
-///   time. See `docs/KV_FUSED_KERNELS.md` § "Numerical relationship to the split
-///   chain" for the cell-by-cell table.
+///   kernel. Where the kernel does run, it is **not** bit-exact with the split
+///   chain — the online per-tile softmax sums in a different order, and
+///   whether that survives the output cast depends on the data. See
+///   `docs/KV_FUSED_KERNELS.md` § "Numerical relationship to the split chain".
 fn resolve_planar_flash_decode(mode: PlanarFlashDecodeMode, env: &DispatchPolicy) -> bool {
     let resolved_on = match mode {
         PlanarFlashDecodeMode::On => true,
         PlanarFlashDecodeMode::Off => false,
         PlanarFlashDecodeMode::Auto => {
-            // Auto stays OFF on every host. The warm-TTFT bf16-K shortcut
-            // added by the PlanarK chunked-prefill fix bypasses the
-            // planar-flash-decode kernel in the normal generate flow (the
-            // bf16 prefill K seed is live for every post-`exit_prefill`
-            // decode step, and the dispatcher honours it). The kernel still
-            // works on seedless caches but no production flow currently
-            // exercises that path, so there is no measurable TPS win to flip
-            // Auto for.
             match rmlx_core::apple_gpu::apple_silicon_generation() {
                 Some(family) => {
                     tracing::info!(
                         family,
                         "--planar-flash-decode=auto on Apple{family} — \
-                         resolved OFF (no measurable speedup at canary shape). \
+                         resolved OFF (the bf16 K seed bypasses the kernel after prefill). \
                          Use --planar-flash-decode on to override."
                     );
                 }
@@ -328,15 +232,11 @@ fn resolve_planar_flash_decode(mode: PlanarFlashDecodeMode, env: &DispatchPolicy
     resolved_on
 }
 
-/// `--fused-qk` tri-state. Default `Auto` resolves OFF on every host
-/// (HOLD pattern — kernels ship as stubs; codec implementations fill in
-/// and flip `Auto` once the NIAH gate passes per codec).
+/// `--fused-qk` tri-state. Default `Auto` resolves OFF on every host.
 ///
-/// Mirrors [`PlanarFlashDecodeMode`] exactly — same resolution pattern, same
-/// Auto-HOLD rationale.
-///
-/// Added with the fused-QK kernel skeleton (2026-05).
-/// Auto stays OFF until all five codec kernels pass their NIAH gates.
+/// When on, the fused-QK kernels dispatch for the K8V4, K8V8, TurboSym3/4 and
+/// RotorKAsym3/4 K codecs (`rmlx_kv_quant::kvcache::fused_qk_dispatch`). Same
+/// resolution pattern as [`PlanarFlashDecodeMode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum FusedQkMode {
     /// Force the fused-QK kernels on.
@@ -344,9 +244,7 @@ pub(crate) enum FusedQkMode {
     /// Force the fused-QK kernels off. A hard override: an exported
     /// `RMLX_FUSED_QK=1` does not survive it.
     Off,
-    /// Resolves to OFF on every host. HOLD: kernel stubs not yet
-    /// dispatching. Auto flips once codec implementations land and NIAH
-    /// gates pass per codec.
+    /// Resolves to OFF on every host.
     #[default]
     Auto,
 }
@@ -367,21 +265,18 @@ impl std::fmt::Display for FusedQkMode {
 /// - [`FusedQkMode::On`] → on.
 /// - [`FusedQkMode::Off`] → off; a hard override, an exported
 ///   `RMLX_FUSED_QK=1` does not survive it.
-/// - [`FusedQkMode::Auto`] → currently resolves to OFF on every host.
-///   Pre-existing `RMLX_FUSED_QK=1` in the shell is honoured for back-compat.
+/// - [`FusedQkMode::Auto`] → OFF on every host, unless `RMLX_FUSED_QK=1` is
+///   set.
 fn resolve_fused_qk(mode: FusedQkMode, env: &DispatchPolicy) -> bool {
     let resolved_on = match mode {
         FusedQkMode::On => true,
         FusedQkMode::Off => false,
         FusedQkMode::Auto => {
-            // HOLD — Auto stays OFF on every host until each codec passes its
-            // NIAH gate.
             match rmlx_core::apple_gpu::apple_silicon_generation() {
                 Some(family) => {
                     tracing::info!(
                         family,
-                        "--fused-qk=auto on Apple{family} — resolved OFF \
-                         (HOLD: kernel stubs not yet dispatching). \
+                        "--fused-qk=auto on Apple{family} — resolved OFF. \
                          Use --fused-qk on to override."
                     );
                 }
@@ -400,26 +295,11 @@ fn resolve_fused_qk(mode: FusedQkMode, env: &DispatchPolicy) -> bool {
 
 /// `--sparse-attn` tri-state. Default `Auto` resolves OFF on every host.
 ///
-/// The `phase1_score` and `phase2_sparse_attend` MSL kernels shipped with
-/// cosine parity ≥0.9997 vs the dense reference (3 configs). The
-/// `--recipe head_budget` calibration writer has been validated on Bonsai.
-///
-/// **Audit verdict (2026-06)**: sparse-attn is **warm-TTFT dormant by
-/// design** (Path C). The two-phase kernels operate over PlanarQuant-K
-/// packed buffers; every production decode path uses the warm-TTFT bf16-K
-/// seed materialised by `exit_prefill` (see
-/// `docs/reports/planar-chunked-prefill-fix.md`), so the
-/// sparse-attn dispatcher does not fire on the normal generate flow. The
-/// kernels are reserved for **seedless** workloads (synthetic PlanarK
-/// caches, PPL eval, future prompt-cache hits that skip prefill). This
-/// matches the PlanarFlashDecode posture and is a generalisation of the
-/// warm-TTFT cross-codec audit. Auto therefore stays OFF on every host —
-/// same posture as `PlanarFlashDecodeMode::Auto`.
-///
-/// Mirrors [`FusedQkMode`] exactly — same resolution pattern.
-/// The dispatch counter aggregator (`sparse_attn_total_dispatch_count`),
-/// dormancy invariant tests, and the seedless dispatch test are in
-/// `crates/rmlx-kv-quant/src/sparse_attn*.rs`.
+/// The flag sets `DispatchPolicy::sparse_attn`, but no production path calls
+/// the sparse-attention dispatcher
+/// (`rmlx_models::kv_cache::attention_dispatch::sparse_attn_dispatch_if_enabled`),
+/// so no value changes the output. Same resolution pattern as
+/// [`FusedQkMode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum SparseAttnMode {
     /// Force the two-phase sparse-attention dispatch on.
@@ -427,11 +307,7 @@ pub(crate) enum SparseAttnMode {
     /// Force the sparse-attention dispatch off. A hard override: an exported
     /// `RMLX_SPARSE_ATTN=1` does not survive it.
     Off,
-    /// Resolves to OFF on every host. Sparse-attn is warm-TTFT dormant by
-    /// design (Path C): the production `update_and_sdpa` path always
-    /// shortcuts through the bf16-K seed, so the two-phase kernels are
-    /// reserved for seedless workloads. Same posture as
-    /// `PlanarFlashDecodeMode::Auto`.
+    /// Resolves to OFF on every host.
     #[default]
     Auto,
 }
@@ -452,35 +328,23 @@ impl std::fmt::Display for SparseAttnMode {
 /// - [`SparseAttnMode::On`] → on.
 /// - [`SparseAttnMode::Off`] → off; a hard override, an exported
 ///   `RMLX_SPARSE_ATTN=1` does not survive it.
-/// - [`SparseAttnMode::Auto`] → currently resolves to OFF on every host.
-///   Pre-existing `RMLX_SPARSE_ATTN=1` in the shell is honoured for
-///   back-compat.
+/// - [`SparseAttnMode::Auto`] → OFF on every host, unless
+///   `RMLX_SPARSE_ATTN=1` is set.
 fn resolve_sparse_attn(mode: SparseAttnMode, env: &DispatchPolicy) -> bool {
     let resolved_on = match mode {
         SparseAttnMode::On => true,
         SparseAttnMode::Off => false,
         SparseAttnMode::Auto => {
-            // Sparse-attn is warm-TTFT dormant by design. The production
-            // decode path shortcuts through the bf16-K seed, so the two-phase
-            // kernels stay reserved for seedless workloads (PPL eval, future
-            // prompt-cache hits). Auto resolves OFF on every host — same
-            // posture as PlanarFlashDecodeMode::Auto. The On override still
-            // reaches callers that exercise the kernels directly (the
-            // calibration runner, seedless integration tests).
             match rmlx_core::apple_gpu::apple_silicon_generation() {
                 Some(family) => {
                     tracing::info!(
                         family,
                         "--sparse-attn=auto on Apple{family} — resolved OFF \
-                         (warm-TTFT dormant by design). \
-                         Use --sparse-attn on for seedless workloads."
+                         (no production path calls the sparse-attention dispatcher)."
                     );
                 }
                 None => {
-                    tracing::warn!(
-                        "--sparse-attn=auto on unknown host — \
-                         defaulting OFF (conservative; warm-TTFT dormant)."
-                    );
+                    tracing::warn!("--sparse-attn=auto on unknown host — defaulting OFF.");
                 }
             }
             env.sparse_attn
@@ -503,8 +367,8 @@ pub(crate) enum RotKFusedMode {
     /// Force the fused FWHT kernel off; a hard override that also ignores
     /// `RMLX_ROT_K_FUSED=1`.
     Off,
-    /// Resolves OFF on every host — the matmul path is the validated one.
-    /// A pre-existing `RMLX_ROT_K_FUSED=1` is honoured for back-compat.
+    /// Resolves OFF (rotate-by-matmul) on every host, unless
+    /// `RMLX_ROT_K_FUSED=1` is set.
     #[default]
     Auto,
 }
@@ -577,7 +441,7 @@ pub(crate) fn resolve_dispatch_policy(
 
 /// Start the HTTP server synchronously (builds its own tokio runtime).
 ///
-/// - `--model` → single-snapshot mode (Stage-1 behavior preserved).
+/// - `--model` → single-snapshot mode.
 /// - `--registry` → multi-model JSON config.
 /// - Neither → empty registry, diagnostics only.
 ///
@@ -825,7 +689,7 @@ pub(crate) fn run_serve(
         );
         Arc::new(ModelRegistry::from_config(&cfg))
     } else if let Some(p) = model {
-        // B3: early architecture validation — fail fast before registry/chat-template
+        // Early architecture validation — fail fast before registry/chat-template
         // setup can mask the error. Reads config.json, checks architectures[0]
         // against KNOWN_ARCHS, and exits non-zero if unsupported.
         let model_cfg = load_config(p).map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
@@ -837,11 +701,11 @@ pub(crate) fn run_serve(
             tracing::error!(
                 arch = arch_name,
                 model = %p.display(),
-                "architecture '{}' not yet supported in v0.0.1; \
-                 see crates/rmlx-models/src/arch.rs for how to add it",
+                "architecture '{}' not yet supported; \
+                 see docs/ADDING_A_MODEL.md for how to add it",
                 arch_name
             );
-            eprintln!("error: architecture '{arch_name}' not yet supported in v0.0.1");
+            eprintln!("error: architecture '{arch_name}' not yet supported");
             std::process::exit(1);
         }
         Arc::new(ModelRegistry::from_paths(&[p.to_path_buf()]))
@@ -884,10 +748,9 @@ pub(crate) fn run_serve(
     };
     let draft_path: Option<std::path::PathBuf> = draft_model.map(Path::to_path_buf);
     // capture draft_kind + draft_block_size for the loader closure.
-    // /14/15 loaders will branch on kind to select the right drafter.
     let loader_draft_kind = draft_kind;
     let loader_draft_block_size = draft_block_size;
-    // C4: one process-wide GPU serialisation gate. A clone is injected into
+    // One process-wide GPU serialisation gate. A clone is injected into
     // every generator the loader builds so the existing try_lock/warn/lock
     // critical section in `Generator::generate` serialises across ALL
     // resident models (single Metal context per process).
@@ -1009,7 +872,7 @@ pub(crate) fn run_serve(
         }
     });
 
-    // Open a shared metrics sink for the server (JSONL / CSV legacy path).
+    // Open the server's runtime event recorder (the `events` table of runs.db).
     let run_id_serve = make_run_id();
     let serve_sink = EventRecorder::open(&run_id_serve)
         .map_err(|e| anyhow::anyhow!("metrics open for serve: {e}"))?;
@@ -1065,11 +928,11 @@ pub(crate) fn run_serve(
     // the drainer itself — serve does not assemble it.
     let drainer_db_path = rmlx_core::paths::metrics_db_path();
 
-    // F6/L18: SPSC async drainer db path for per-request SQLite metrics.
-    // Spawned inside the tokio runtime below so `tokio::spawn` is available.
+    // The SPSC drainer for per-request SQLite metrics is spawned inside the
+    // tokio runtime below, so `tokio::spawn` is available.
 
-    // Cap worker threads to 4. On M5 Max the default (num_cpus ≈ 16)
-    // wastes cores that MLX needs for CPU dispatch during prefill/decode.
+    // Cap worker threads to 4. The default (one per core) takes cores that
+    // MLX needs for CPU dispatch during prefill/decode.
     // HTTP + SSE + idle-eviction never saturate more than 4 async workers;
     // blocking inference runs in the separate blocking-thread pool regardless.
     //
@@ -1082,8 +945,8 @@ pub(crate) fn run_serve(
     // blocking pool has no cap and idle-reaps threads after 10s by default;
     // under sporadic load that would create an unbounded, ever-growing set of
     // distinct worker threads over long serve uptime, each leaking its own
-    // stream(s) — eventually exhausting the ~2048 per-process pthread ceiling
-    // (`docs/FFI.md`). Bounding `max_blocking_threads` caps the worst-case
+    // stream(s) — eventually exhausting the per-task thread ceiling.
+    // Bounding `max_blocking_threads` caps the worst-case
     // cumulative leak; a `thread_keep_alive` far longer than any realistic
     // idle gap between requests keeps that bounded set of workers alive
     // (reused, not reaped-and-replaced) so the cap is actually load-bearing.
@@ -1099,7 +962,7 @@ pub(crate) fn run_serve(
         .build()
         .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
     rt.block_on(async {
-        // F6/L18: spawn the SPSC metrics drainer task.
+        // Spawn the SPSC metrics drainer task.
         // Must be inside block_on so tokio::spawn is available.
         let drainer_handle = spawn_drainer(drainer_db_path);
 
@@ -1111,7 +974,7 @@ pub(crate) fn run_serve(
             // /v1/embeddings (jina-v4) path can reach it.
             mm_cache: Arc::clone(&mm_cache),
             gpu_gate,
-            // C5 Slice A: 1-permit semaphore = FIFO single-GPU serialisation.
+            // 1-permit semaphore = FIFO single-GPU serialisation.
             gpu_queue: Arc::new(tokio::sync::Semaphore::new(1)),
             gpu_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_queue_depth,
@@ -1120,7 +983,7 @@ pub(crate) fn run_serve(
             metrics: Some(serve_sink),
             idle_policy,
             max_tokens_cap,
-            // A8: per-request HTTP timeout cap (seconds). 0 = disabled.
+            // Per-request HTTP timeout cap (seconds). 0 = disabled.
             max_timeout_secs,
             session_cache: Arc::new(parking_lot::Mutex::new(rmlx_server::SessionCache::new(
                 session_cache_max_sessions,
@@ -1128,15 +991,15 @@ pub(crate) fn run_serve(
             // The configured base the session path widens (and, at 0, must not
             // re-enable).
             prompt_cache_slots,
-            // L6: TTFT ring-buffer — empty at startup, populated on first request.
+            // TTFT ring-buffer — empty at startup, populated on first request.
             ttft_store: TtftStore::default(),
-            // M30: ITL ring-buffer — empty at startup, populated after first decode.
+            // ITL ring-buffer — empty at startup, populated after first decode.
             itl_store: rmlx_server::ItlStore::default(),
-            // F6/L18: SPSC drainer for per-request SQLite metrics.
+            // SPSC drainer for per-request SQLite metrics.
             metrics_drainer: Some(drainer_handle),
-            // B5: --require-smoke-probe gate (default-OFF).
+            // --require-smoke-probe gate (default-OFF).
             require_smoke_probe,
-            // G4: --default-temperature (None = absent = unchanged behaviour).
+            // --default-temperature (None = absent = model default, then 1.0).
             default_temperature,
             // --enable-thinking (None = absent = thinking enabled by template default).
             default_enable_thinking: enable_thinking,
@@ -1253,7 +1116,7 @@ pub(crate) fn run_serve(
                 .to_owned();
             let ctrl = rmlx_server::ControllerHandle::new(
                 rmlx_server::ControllerConfig::new(
-                    ttft_target_ms, // M2: flag --ttft-target-ms maps to step_target_ms
+                    ttft_target_ms, // --step-target-ms (alias --ttft-target-ms)
                     itl_target_ms,
                     max_queue_depth.max(1),
                     prefill_arch,
