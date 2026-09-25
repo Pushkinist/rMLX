@@ -133,13 +133,13 @@ check() { # check LABEL ROOT WANT_EXIT WANT_PATTERN MODE [EXTRA...]
     echo "ok    ${label}  (exit ${rc}, output matched)"
 }
 
-# A pending case states a figure the producer cannot report yet. It stays out
-# of the failure count while the producer misses it, and fails the run the day
-# the producer reports it, so the case is promoted to `check` in the same
-# change that teaches the producer.
+# A pending case states a figure the producer cannot report yet, and the
+# figure it reports today. Today's figure keeps the case in the run; the
+# wanted figure fails the run, so the change that teaches the producer promotes
+# the case to `check`. Any third output, an exit 2 included, fails the run.
 pending=0
-pending_check() { # pending_check LABEL ROOT WANT_EXIT WANT_PATTERN MODE [EXTRA...]
-    local label="$1" root="$2" want_exit="$3" want_pat="$4"; shift 4
+pending_check() { # pending_check LABEL ROOT WANT_EXIT WANT_PATTERN NOW_EXIT NOW_PATTERN MODE [EXTRA...]
+    local label="$1" root="$2" want_exit="$3" want_pat="$4" now_exit="$5" now_pat="$6"; shift 6
     local out rc
     out="$(run "${root}" "$@")"
     rc=$?
@@ -148,7 +148,13 @@ pending_check() { # pending_check LABEL ROOT WANT_EXIT WANT_PATTERN MODE [EXTRA.
         failures=$((failures + 1))
         return
     fi
-    echo "PEND  ${label}  (the producer does not report /${want_pat}/ yet)"
+    if [ "${rc}" -ne "${now_exit}" ] || ! grep -qE -- "${now_pat}" <<<"${out}"; then
+        echo "FAIL  ${label}: exit ${rc}, expected today's exit ${now_exit} and /${now_pat}/" >&2
+        echo "${out}" | head -5 >&2
+        failures=$((failures + 1))
+        return
+    fi
+    echo "PEND  ${label}  (reports /${now_pat}/ today; /${want_pat}/ is pending)"
     pending=$((pending + 1))
 }
 
@@ -436,7 +442,7 @@ impl KvQuant {
     }
 }
 EOF
-pending_check "Self:: arms in both impls are two more sites" "${T}" 0 "^match-sites 5$" match-sites --threshold 2
+pending_check "Self:: arms in both impls are two more sites" "${T}" 0 "^match-sites 5$" 0 "^match-sites 3$" match-sites --threshold 2
 
 # 22 — an alias import. `S::Alpha` is `KvStorage::Alpha` to the compiler.
 T="${WORK}/alias"; build_tree "${T}"
@@ -453,7 +459,7 @@ pub fn aliased(s: &S) -> usize {
     }
 }
 EOF
-pending_check "an alias-path match is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+pending_check "an alias-path match is a site" "${T}" 0 "^match-sites 4$" 0 "^match-sites 3$" match-sites --threshold 2
 
 # 23 — a glob import. The arms name bare variants.
 T="${WORK}/glob"; build_tree "${T}"
@@ -470,7 +476,7 @@ pub fn bare(q: KvQuant) -> usize {
     }
 }
 EOF
-pending_check "a glob-import match is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+pending_check "a glob-import match is a site" "${T}" 0 "^match-sites 4$" 0 "^match-sites 3$" match-sites --threshold 2
 
 # 24 — the per-codec dispatch moved one level down, into an enum a KvStorage
 # variant holds. A new codec with a new store still forces a touch there, so a
@@ -496,7 +502,7 @@ pub fn slot_bytes(k: &KSlot) -> usize {
     }
 }
 EOF
-pending_check "a match over an enum a KvStorage field holds is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+pending_check "a match over an enum a KvStorage field holds is a site" "${T}" 0 "^match-sites 4$" 0 "^match-sites 3$" match-sites --threshold 2
 
 # 25 — a forcing site rewritten as a `matches!` subset. The count drops and a
 # new codec now defaults to `false` there with no compile error. The producer
@@ -515,7 +521,7 @@ pub fn low(q: KvQuant) -> bool {
 }
 EOF
 check "a matches! subset is not a match site" "${T}" 0 "^match-sites 2$" match-sites --threshold 2
-pending_check "a matches! subset is reported as a subset site" "${T}" 0 "^subset-sites 1$" match-sites --threshold 2
+pending_check "a matches! subset is reported as a subset site" "${T}" 0 "^subset-sites 1$" 0 "^match-sites 2$" match-sites --threshold 2
 
 # 26 — a string spelling table. Its patterns are string literals and its arm
 # bodies name every variant. A new codec that is missing here compiles and
@@ -534,7 +540,7 @@ pub fn parse(s: &str) -> Option<KvQuant> {
 }
 EOF
 check "a spelling table is not a match site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
-pending_check "a spelling table is reported as a table site" "${T}" 0 "^table-sites 1$" match-sites --threshold 2
+pending_check "a spelling table is reported as a table site" "${T}" 0 "^table-sites 1$" 0 "^match-sites 3$" match-sites --threshold 2
 
 if [ "${failures}" -gt 0 ]; then
     echo >&2
