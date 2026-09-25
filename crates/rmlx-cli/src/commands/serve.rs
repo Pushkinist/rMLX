@@ -1077,7 +1077,7 @@ pub(crate) fn run_serve(
     // closure that touches MLX (generate, embeddings, image, audio,
     // transcribe, speculative) registers a per-thread default CPU/GPU stream
     // via `ensure_cpu_default_stream` / `ensure_gpu_default_stream`
-    // (`docs/FFI.md` § stream context) — deliberately leaked for the thread's
+    // (`docs/FFI.md` § "Per-thread GPU stream context") — deliberately leaked for the thread's
     // lifetime, each backed by its own MLX-internal OS thread. Tokio's
     // blocking pool has no cap and idle-reaps threads after 10s by default;
     // under sporadic load that would create an unbounded, ever-growing set of
