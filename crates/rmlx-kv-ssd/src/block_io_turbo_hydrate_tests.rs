@@ -21,7 +21,7 @@
 //!    dropped it, because its `from_cpu_blocks` took no such argument. The
 //!    K-storage collapse resolved it the 3-bit way, so both widths now restore
 //!    the window that was written, and the 4-bit constant below moved from `0`
-//!    to it. `docs/KV_TURBO_TWINS.md` records the decision.
+//!    to it. `docs/KV_UPDATE_PATH.md` § "TurboQuant" states the rule.
 //!
 //! Field-by-field rather than one digest: a digest names the store, and these
 //! assertions name the field, which is what a reviewer of a collapse needs.

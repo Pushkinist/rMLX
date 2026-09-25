@@ -1,12 +1,8 @@
-// LOC-exempt: the per-family decode and prefill bodies now live beside their
-// storage family in the sibling `update_*.rs` modules. `exit_prefill` is down
-// to 276 lines of 2198, 13 % of the file: its gate, its shared prologue and
-// epilogue, and one call per codec family. What is left is the dispatch
-// itself — the `KvStorage` and `KvQuant` matches, the prefill and decode
-// capacity bookkeeping, the bf16 decode mirror, the GPU-state and residency
-// walks, and the helpers more than one family calls. The chunk that writes
-// one update body per store shape is what removes the rest.
-// docs/KV_UPDATE_SPLIT.md holds the plan.
+// LOC-exempt: the dispatch itself — the `KvStorage` and `KvQuant` matches, the
+// prefill and decode capacity bookkeeping, the bf16 decode mirror, the
+// GPU-state and residency walks, and the helpers more than one codec family
+// calls. The per-family bodies live in the sibling `update_*.rs` modules;
+// docs/KV_UPDATE_PATH.md describes the layout.
 //! Update paths: `update`, prefill, GPU state management, and storage-specific appenders.
 
 use std::sync::OnceLock;
