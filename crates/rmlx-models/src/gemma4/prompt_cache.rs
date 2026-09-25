@@ -54,9 +54,10 @@ pub(crate) struct Gemma4Entry {
     pub(crate) first_id: u32,
     /// Decoded piece for `first_id`.
     pub(crate) first_piece: String,
-    /// Runtime `KvQuant` discriminant in effect when this snapshot was written
-    /// (Plan §D8 / Task 11.5). See the original commit comments for the
-    /// `Option<None>` legacy-sentinel rationale.
+    /// Runtime `KvQuant` discriminant in effect when this snapshot was
+    /// written. A lookup evicts a slot whose stored codec differs from the
+    /// runtime one. `None` means the codec is unknown: the SSD spill skips
+    /// such an entry, because it cannot tag the blocks.
     pub(crate) kv_quant: Option<KvQuant>,
     /// True when this entry was reconstructed from the SSD tier and therefore
     /// stores only the block-aligned prefix KV — `first_id` / `first_piece` are

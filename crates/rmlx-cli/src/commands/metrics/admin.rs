@@ -469,12 +469,10 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
 
     // ── Check 9: refract-unvalidated kv_quant champion warning ───────────────
     //
-    // The refract CI gate validates token-fidelity only for the
-    // "plain" KV-quant set: none, k8v8, k4v4. Rotation-based and exotic
-    // families (k8v4, turbo4, turbo8, planar, …) have no defined PPL
-    // semantics under refract — the gate does not cover them. A champion row
-    // whose kv_quant falls outside this validated set is NOT wrong, but its
-    // fidelity/PPL is unverified by the CI gate. Emit one [warn] line per
+    // `REFRACT_VALIDATED` is the plain KV-quant set (none, k8v8, k4v4) whose
+    // token fidelity the refract harness covers; no gate in this tree checks
+    // any other codec. A champion row whose kv_quant falls outside this set
+    // is NOT wrong, but its fidelity/PPL is unverified. Emit one [warn] line per
     // distinct (model_namespace, model, weight_quant, kv_quant) cell so the
     // operator knows to hand-validate before trusting that cell as a champion.
     //
@@ -512,8 +510,8 @@ pub(super) fn cmd_doctor(db_path: &Path, fix: bool) -> anyhow::Result<()> {
             for (ns, model, wq, kq) in &cells {
                 eprintln!(
                     "[warn] refract-unvalidated kv_quant: model_namespace='{ns}' model='{model}' \
-                     weight_quant='{wq}' kv_quant='{kq}' — fidelity/PPL unverified by refract CI; \
-                     hand-validate before trusting as champion (see docs/research/F17-refract-fidelity-scope.md)"
+                     weight_quant='{wq}' kv_quant='{kq}' — fidelity/PPL unverified; \
+                     hand-validate before trusting as champion"
                 );
             }
             let n = cells.len() as u32;

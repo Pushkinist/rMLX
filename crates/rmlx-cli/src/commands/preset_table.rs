@@ -76,7 +76,7 @@ pub(crate) enum PresetError {
 /// |---|---|---|
 /// | `fp16` | `KvQuant::None` | bf16 both sides (alias: "fp16", "bf16", "none" via `--kv-quant`) |
 /// | `q8` | `KvQuant::K8V8` | symmetric 8-bit K+V |
-/// | `speed` | `KvQuant::TurboSym3` | Symmetric 3-bit Lloyd-Max K+V; matches mtq `speed` exactly; rejected on Qwen MoE (K-side 3-bit PPL-disaster) |
+/// | `speed` | `KvQuant::TurboSym3` | Symmetric 3-bit Lloyd-Max K+V; matches mtq `speed` exactly; rejected on Qwen MoE (3-bit K) |
 /// | `quality` | `KvQuant::TurboSym4` | symmetric 4-bit Lloyd-Max K + tq4 V; rejected on Qwen MoE |
 /// | `planar` | `KvQuant::Planar` | PlanarQuant V-side |
 /// | `planar3` | `KvQuant::Planar3` | PlanarQuant 3-bit V-side |
@@ -122,7 +122,7 @@ static PRESETS: &[(&str, PresetSpec)] = &[
     (
         // `quality` resolves to `KvQuant::TurboSym4` (symmetric 4-bit Lloyd-Max K + tq4 V),
         // matching mtq's `quality` definition byte-for-byte on Apple Silicon.
-        // Arch guard: rejected at resolve-time on Qwen MoE (PPL-218→8641 disaster).
+        // Arch guard: rejected at resolve-time on Qwen MoE (K below 8 bits).
         "quality",
         PresetSpec {
             kv_quant: KvQuant::TurboSym4,
@@ -132,11 +132,9 @@ static PRESETS: &[(&str, PresetSpec)] = &[
     ),
     (
         // `speed` resolves to TurboSym3 (symmetric 3-bit Lloyd-Max K+V), matching mtq's
-        // `speed` preset definition. Symmetric turbo3 saves ~4-bit of K storage
-        // vs K8VTurbo3; the K-side 3-bit codebook matches the V-side codebook exactly.
-        // Cosine gate ≥ 0.9807 (K-side empirical floor).
-        // Arch guard (Contract A.y): rejected on Qwen MoE (K-side 3-bit is the
-        // PPL-disaster zone).
+        // `speed` preset definition. The K-side 3-bit codebook matches the
+        // V-side codebook exactly.
+        // Arch guard: rejected on Qwen MoE (K below 8 bits).
         "speed",
         PresetSpec {
             kv_quant: KvQuant::TurboSym3,
@@ -147,8 +145,7 @@ static PRESETS: &[(&str, PresetSpec)] = &[
     (
         // `k_only_planar` resolves to `KvQuant::PlanarK` (K-axis PlanarQuant
         // 4-bit; V stays bf16). Mirrors mtq's `k_only_planar` preset.
-        // Arch guard (Contract A.y): rejected at resolve-time on Qwen MoE
-        // (K-side 4-bit is the PPL-218→8641 disaster).
+        // Arch guard: rejected at resolve-time on Qwen MoE (K below 8 bits).
         "k_only_planar",
         PresetSpec {
             kv_quant: KvQuant::PlanarK,

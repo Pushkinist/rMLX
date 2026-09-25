@@ -98,14 +98,10 @@ fn rotor3_encode_determinism() {
 /// `head_dim ≥ 64`.
 ///
 /// Published mtq number is 0.9780 (multi-turboquant `rotor3`). The rMLX
-/// LCG-fixture measurement is recorded inline via `println!`.
-///
-/// **History note:** the earlier `gp_rotor_mv` × 2 encode/decode path was a
-/// silent no-op (`R̃ * (R * mv) = mv`); the previous 0.9955 / 0.9941 numbers
-/// were measuring an unrotated codec. After fixing the sandwich to apply
-/// `R * mv * R̃` (via [`crate::clifford::rotor_sandwich`]) the LCG-fixture
-/// numbers settled at mean = 0.9956, min = 0.9947 (slightly higher because
-/// the rotation decorrelates the residual coordinates).
+/// LCG-fixture measurement is recorded inline via `println!`. The encode
+/// applies the sandwich `R * mv * R̃` (via [`crate::clifford::rotor_sandwich`]);
+/// applying `R` and then `R̃` to one side would be a silent no-op
+/// (`R̃ * (R * mv) = mv`).
 #[test]
 fn rotor3_cosine_gate() {
     let n_tokens = 32;
@@ -120,11 +116,8 @@ fn rotor3_cosine_gate() {
 
     let stats = cosine_similarity_per_row(&data, &decoded, head_dim);
 
-    // Empirical floor — measured on the LCG fixture (TEST_SEED, n_tokens=32,
-    // head_dim=128, group_size=3, bits=3) AFTER fixing the rotor sandwich
-    // (the earlier `gp_rotor_mv` × 2 path was a no-op).
-    //   Mean = 0.995601, Min = 0.994737.
-    // Threshold = measured − 0.001 (regression margin, iso3 / iso4 pattern).
+    // Empirical floor on the LCG fixture (TEST_SEED, n_tokens=32,
+    // head_dim=128, group_size=3, bits=3): measured − 0.001.
     let threshold_mean = 0.994_6_f32;
     let threshold_min = 0.993_7_f32;
 

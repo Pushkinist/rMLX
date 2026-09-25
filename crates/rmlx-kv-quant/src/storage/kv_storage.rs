@@ -456,11 +456,8 @@ pub enum KvStorage {
     /// 4.25-bit V codec — same Clifford sandwich as rotor3 with the
     /// 16-centroid Lloyd-Max N(0,1) codebook, 4 bits per code in the plane
     /// (iso4 convention). Higher fidelity than rotor3 at the cost of one extra
-    /// bit per value in the codes (~10.7 bpe at bits=4). Storage is unaffected:
-    /// both widths spend one `u32` code word plus one
-    /// [`crate::storage::KV_SIDEBAND_DTYPE`] scale per group, so rotor3 and
-    /// rotor4 occupy byte-identical bytes — 16.25 bits per value at
-    /// `head_dim = 128`. See `crate::rotorquant` § "Effective bpe".
+    /// bit per code: 9.75 bits per value at `head_dim = 128` against rotor3's
+    /// 8.75. See `crate::rotorquant` § "Effective bpe".
     ///
     /// Static per-layer rotor table on the V side (lazily generated on first
     /// append).

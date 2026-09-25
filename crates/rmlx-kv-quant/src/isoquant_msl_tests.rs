@@ -179,7 +179,6 @@ fn iso_v3_dequant_gpu_matches_dequant_cpu() {
         max_abs <= 1e-6_f32,
         "V3 dequant_gpu strict bound broken: max|cpu-gpu| = {max_abs}; expected ≤ 1e-6 \
          (observed ≈ 2.4e-7). If the new observation is intentional, update \
-         docs/PERF_BASELINE.md \"Observed max|cpu-gpu| ≤ 2.4e-7 on the LCG fixture\" and \
          docs/KV_ROTATION_CODECS.md \"Observed max|cpu-gpu| ≤ 2.4e-7 on the LCG fixture\" to the new bound."
     );
 }
@@ -241,7 +240,6 @@ fn iso_k3_dequant_gpu_matches_dequant_cpu() {
         max_abs <= 1e-6_f32,
         "K3 dequant_gpu strict bound broken: max|cpu-gpu| = {max_abs}; expected ≤ 1e-6 \
          (observed ≈ 2.4e-7). If the new observation is intentional, update \
-         docs/PERF_BASELINE.md \"Observed max|cpu-gpu| ≤ 2.4e-7 on the LCG fixture\" and \
          docs/KV_ROTATION_CODECS.md \"Observed max|cpu-gpu| ≤ 2.4e-7 on the LCG fixture\" to the new bound."
     );
 }

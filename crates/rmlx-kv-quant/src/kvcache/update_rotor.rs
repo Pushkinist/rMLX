@@ -743,9 +743,9 @@ pub(super) fn rotor_v_update<const BITS: u8>(
 
     // K-side: GPU-capable affine q8_0 (same as iso3 / iso4 / K8V4).
     // V-side: routes encode through the rotor MSL kernel when
-    // `device == Device::Gpu`; CPU encode remains the fallback. This
-    // hot path is shadowed by the warm-TTFT bf16 seed: the GPU encode
-    // fires once at exit_prefill (large `new_v` slice), not per decode step.
+    // `device == Device::Gpu`; CPU encode remains the fallback. A cache that
+    // went through prefill never reaches this body: `exit_prefill` builds no
+    // rotor V store and decode reads the bf16 mirror.
     let k_f32 = if device == Device::Gpu {
         Vec::new()
     } else {

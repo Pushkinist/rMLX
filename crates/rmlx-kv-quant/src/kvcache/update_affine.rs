@@ -133,15 +133,10 @@ impl KvCache {
     /// - GPU buffers not yet populated (first call, before alloc).
     /// - head_dim ∉ {128, 256} (kernel register-array sizing constraint).
     ///
-    /// **CAVEAT**: TheTom's original TurboFlash is default-OFF on Apple10 (M5+)
-    /// due to corruption (commit `67f076f2e`, a default-flip — no upstream
-    /// kernel fix exists). Empirically reproduced the M5 Max failure on rMLX's
-    /// adaptation: a hard `SIGSEGV`/`KERN_INVALID_ADDRESS` (null
-    /// `Buffer::raw_ptr()` in the kernel-output `to_bytes`) at 32k ctx on
-    /// Qwen3.6-35B-A3B-8bit (head_dim=256) — worse than TheTom's
-    /// garbage-token corruption (it crashes the server). Stays default-OFF.
-    /// Setting `DispatchPolicy::turbo_flash` will crash on that cell. See
-    /// `docs/reports/B1-turboflash-m5-validation.md`.
+    /// Default-OFF: `--turbo-flash auto` resolves off on every host because
+    /// the kernel decodes slower than the generic path. The Apple10
+    /// `head_dim = 256` configuration is covered by
+    /// `tests/apple10_head_dim_256.rs`.
     pub fn update_and_sdpa_k8v4_flash(
         &mut self,
         queries: &Array,

@@ -2231,7 +2231,7 @@ fn main() -> Result<()> {
                     eprintln!(
                         "error: --cache-type-k/--cache-type-v requires --model (not --registry)"
                     );
-                    eprintln!("see docs/KV_CACHE.md for supported codecs and combinations");
+                    eprintln!("see docs/KV_QUANT.md for supported codecs and combinations");
                     std::process::exit(78);
                 }
                 (dev, kv_quant_opt, max_ctx_override)

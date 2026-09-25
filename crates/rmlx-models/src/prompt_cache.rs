@@ -965,7 +965,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     /// Evict the slot at `idx` and bump `stats.evictions`.
     ///
     /// Used by call-site lookup logic that detects an entry mismatch (e.g.
-    /// stored `KvQuant` differs from the runtime `KvQuant` — Plan §D8) and
+    /// stored `KvQuant` differs from the runtime `KvQuant`) and
     /// needs to drop the unusable slot before falling back to a Miss. Uses
     /// `swap_remove` so it is O(1); slot order is not meaningful for any
     /// other cache invariant.

@@ -563,12 +563,10 @@ fn estimator_matches_actual_iso_rotor_encode_bytes() {
         2 * (rotor_side_actual + seed)
     );
 
-    // Net-saving is POSITIVE for iso at head_dim=128: the ring is 12.125 bits
-    // per value against bf16's 16.0. Dropping the quaternion got it to 16.25 —
-    // still above the floor — and narrowing the scale and norm planes to the
-    // stored sideband dtype is what took it under. Anchored against the two
-    // measured ring payloads so the number moves with the store, not with a
-    // restated constant.
+    // Net-saving is POSITIVE for iso at head_dim=128: the ring is 7.125 bits
+    // per value against bf16's 16.0. Anchored against the two measured ring
+    // payloads so the number moves with the store, not with a restated
+    // constant.
     let saving = KvQuant::Iso3Sym.estimated_net_saving_per_layer(
         seq,
         head_dim as u64,

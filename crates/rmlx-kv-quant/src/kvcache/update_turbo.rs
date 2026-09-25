@@ -24,8 +24,7 @@ use super::KvCache;
 /// and is pinned to `Device::Cpu` at 3, and that is load-bearing rather than a
 /// tuning choice: [`QuantV::append`] enters its GPU branch on the device alone
 /// and then refuses `bits != 4`, so handing a 3-bit V store the caller's
-/// device returns `Error::Quant` on every GPU append. The 3-bit V GPU dispatch
-/// also failed the −2% TPS gate on `K8VTurbo3`. The host vector `v_f32` is
+/// device returns `Error::Quant` on every GPU append. The host vector `v_f32` is
 /// materialised exactly when the resolved V device is the CPU, and the GPU
 /// `Array` the dequant returns is taken when it returns one — rebuilding those
 /// rows from the host vector instead costs one device-to-host copy per step.
@@ -121,12 +120,10 @@ const K8_TURBO_V_VARIANTS: &str = "K8VTurbo3 | K8VTurbo2 | K8VTurbo3Tcq | K8VTur
 /// `K8VTurbo3`, `K8VTurbo2` and their two TCQ siblings.
 ///
 /// K is affine q8_0 and GPU-capable, the same path `update_k8v4` takes. V is
-/// [`QuantV`] at `v_bits`, and its axis is forced onto the CPU: the 3-bit
-/// Metal kernel regressed Gemma4-e4b by ~3.5 % and Gemma4-26b by ~6.9 %
-/// against the `Mixed{v_bits:3}` affine baseline, so the GPU dispatch was
-/// reverted and the kernel source stays a future-reference hook in
-/// `k8vturbo3_append_msl.rs` — see `docs/research/turboquant_v3_vs_affine_v3.md`
-/// "Second pass". The 2-bit and TCQ kernels never had a hot-path dispatch.
+/// [`QuantV`] at `v_bits`, and its axis is forced onto the CPU: the GPU branch
+/// of [`QuantV::append`] refuses `bits != 4`. The 3-bit kernel in
+/// `k8vturbo3_append_msl.rs` has no production dispatch; neither do the 2-bit
+/// and TCQ kernels.
 ///
 /// `use_tcq` selects the encoder inside [`QuantV::append`]: Viterbi over the
 /// trellis when set, nearest-centroid otherwise. The decoder is shared —

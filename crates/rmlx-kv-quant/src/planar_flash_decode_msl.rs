@@ -73,8 +73,9 @@ static PLANAR_FLASH_DECODE_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the process-lifetime count of planar_flash_decode P1 dispatches.
 ///
-/// NIAH harness asserts `delta > 0` on ON cells and `delta == 0` on OFF
-/// cells.  Production code does not consult this counter.
+/// Tests and the NIAH harness read it. A cache that went through prefill holds
+/// a bf16 K seed and never reaches the kernel, so the NIAH cells assert
+/// `delta == 0`. Production code does not consult this counter.
 pub fn planar_flash_decode_dispatch_count() -> u64 {
     PLANAR_FLASH_DECODE_DISPATCHES.load(Ordering::Relaxed)
 }

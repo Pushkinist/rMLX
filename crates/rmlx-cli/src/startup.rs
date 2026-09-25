@@ -192,7 +192,7 @@ pub(crate) fn rotate_logs(dir: &std::path::Path, cap_mb: u64) {
 // print_cache_type_table
 // ---------------------------------------------------------------------------
 
-/// Print the full §D1 KV cache codec table to stdout.
+/// Print the full KV cache codec table to stdout.
 ///
 /// Self-contained: no external file dependency. Columns: tag, codec, bits,
 /// group, sides. Triggered by `rmlx info --list-cache-types`.
@@ -254,8 +254,8 @@ pub(crate) fn print_cache_type_table() {
             Some(g) => format!("{g}"),
             None => "—".to_string(),
         };
-        // §D6.3 — rotation codecs are V-only; bf16 + Q8G128 + Auto + MLX-affine
-        // codecs cover both sides (subject to §D6 invariants on the V side).
+        // Rotation codecs are V-only; bf16 + Q8G128 + Auto + MLX-affine codecs
+        // cover both sides (subject to the resolver's invariants on the V side).
         #[allow(
             clippy::match_same_arms,
             reason = "TurboSym3 listed explicitly for documentation clarity; \

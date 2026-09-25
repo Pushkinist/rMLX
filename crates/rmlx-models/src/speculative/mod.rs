@@ -23,13 +23,10 @@
 //!   persistent verifier + draft KV caches and `KvCache::truncate_to`-based
 //!   rollback on partial acceptance. Mirrors mlx-lm's
 //!   `speculative_generate_step`. Per-round verifier cost is O(K), not
-//!   O(prompt_len) — 24+ TPS on `gemma-4-31b-mxfp8` at 4k context, against a
-//!   0.45 TPS structural ceiling for per-round full re-prefill.
+//!   O(prompt_len).
 //!
 //! An architecture whose `forward_seq_last_k_with_cache` is unwired surfaces
 //! that error; there is no re-prefill fallback path.
-//!
-//! Design and measurement reports are in `docs/reports/`.
 
 #![allow(
     clippy::cognitive_complexity,

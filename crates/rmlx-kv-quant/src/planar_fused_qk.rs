@@ -1,16 +1,13 @@
 //! Process-global toggle for the PlanarQuant fused-QK MSL kernel.
 //!
-//! Mirrors [`rotor_qjl_enabled`](crate::rotor_qjl::rotor_qjl_enabled) precedent:
-//! CLI > env > default. Default is **on**; the toggle is the ablation / bench
-//! knob. The dispatch site reads it from the SDPA hot path on every (b, hq, s)
-//! score, so it must be cheap.
+//! Precedence: installed CLI value > default **on**; there is no env var (see
+//! below). The toggle is the ablation / bench knob. The dispatch site reads it
+//! from the SDPA hot path on every (b, hq, s) score, so it must be cheap.
 //!
 //! # Why a runtime toggle
 //!
-//! The kernel + dispatch land as a non-default-changing perf lever. Defaulting
-//! **on** delivers the speedup; the **off** path is the regression probe —
-//! `--planar-fused-qk off` reverts to the dequant+SDPA legacy path and lets
-//! benches diff the win cleanly.
+//! `--planar-fused-qk off` selects the dequant+SDPA path, so a bench can
+//! compare the two.
 //!
 //! # No env-var
 //!

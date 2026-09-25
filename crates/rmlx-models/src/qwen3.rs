@@ -127,7 +127,7 @@ pub(crate) struct Qwen3Entry {
     /// hit. `None` only on SSD-hydrated entries (no first decode token).
     pub(crate) first_logprobs: Option<TokenLogprobs>,
     /// Runtime `KvQuant` discriminant in effect when this snapshot was
-    /// written (Plan §D8 / Task 11.5). See `Gemma4Entry::kv_quant`.
+    /// written. See `Gemma4Entry::kv_quant`.
     pub(crate) kv_quant: Option<KvQuant>,
     /// True when this entry was reconstructed from the SSD tier and therefore
     /// stores only the block-aligned prefix KV — `first_id` / `first_piece` are
@@ -321,7 +321,7 @@ impl Linear {
 // FusedQkvProjection — Q+K+V weights stacked into one quantized tensor
 // ---------------------------------------------------------------------------
 //
-// L33: fuse the three separate quantized_matmul calls (q_proj, k_proj, v_proj)
+// Fuse the three separate quantized_matmul calls (q_proj, k_proj, v_proj)
 // into a single `quantized_matmul` dispatch. At load time we concatenate:
 //
 // weight_fused : [q_out + k_out + v_out, in // pack_factor] (axis 0)
@@ -875,7 +875,7 @@ impl RmsNorm {
 ///
 /// Same for k; v has no norm.
 ///
-/// L33: when all three of q/k/v are quantized, `qkv_proj` holds the fused
+/// When all three of q/k/v are quantized, `qkv_proj` holds the fused
 /// stacked weight; `q_proj`/`k_proj`/`v_proj` are still stored for the
 /// fallback Plain path but are not used in the hot decode path.
 #[allow(missing_debug_implementations)]
@@ -935,29 +935,17 @@ impl Attention {
 
         // Q + K + V projections.
         //
-        // L33: when a fused QKV projection is available (all three weights are
+        // When a fused QKV projection is available (all three weights are
         // quantized), dispatch one quantized_matmul on the stacked weight
         // [q_out+k_out+v_out, in] and slice the output into q/k/v parts.
         // Saves 2 Metal kernel launches per layer per decode step vs. 3
         // separate calls. Falls back to three-call path for plain weights.
         //
-        // A wider `qk_norm_rope_fused` variant extending the closure to include
-        // transpose + RoPE via `mlx_fast_rope_dynamic` was implemented but on
-        // Bonsai-2bit k8v4 measured -0.65% vs the `qk_norm_fused` baseline
-        // (104.14 vs 104.82 TPS, 4 runs).
-        //
-        // Re-tested under the queue-depth model on both Bonsai k8v4 and
-        // Qwen3.6-35B k8v8, hypothesising 5-10us queue-stall savings per saved
-        // Metal launch × 5 launches/layer × 36-60 layers. Measured: Bonsai
-        // +0.22% (best, mean ~0%), Qwen35B +0.87% best / +0.40% mean. Both
-        // below the +1 TPS DoD floor — reverted again. Implication: saved-launch
-        // value is ~0.3us per launch on these decode steps, not 5us, because
-        // the GPU is the bottleneck and host-side queue refill is already
-        // shadowed by kernel work. See docs/reports/ for full measurements.
-        // `qk_norm_rope_fused` retained as #[allow(dead_code)] scaffolding
-        // for future experiments (prefill-only paths, ParaQ kernel batches).
+        // `qk_norm_rope_fused` (the closure extended with transpose + RoPE via
+        // `mlx_fast_rope_dynamic`) is not on this path; it is kept as
+        // #[allow(dead_code)].
         let (q, k, v) = if let Some(ref fused) = self.qkv_proj {
-            // Fused path (L33): 1 qmm + 3 CPU-side slice view ops.
+            // Fused path: 1 qmm + 3 CPU-side slice view ops.
             let (q_flat, k_flat, v_flat) = fused.forward(x, device)?;
             let q = q_flat.reshape(
                 &[batch, seq, self.n_heads as i32, self.head_dim as i32],
@@ -2472,7 +2460,7 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
         let k_proj = lin(&format!("{a}.k_proj"))?;
         let v_proj = lin(&format!("{a}.v_proj"))?;
 
-        // L33: attempt to fuse Q+K+V into a single stacked weight at load time.
+        // Attempt to fuse Q+K+V into a single stacked weight at load time.
         // FusedQkvProjection::try_from_separate returns None for plain weights;
         // the separate q/k/v projections are kept for the fallback path.
         // Concatenation happens on Device::Cpu at load time (weights are host
@@ -2480,7 +2468,7 @@ pub fn load_from_path(model_dir: &Path, yarn_override: Option<&YarnOverride>) ->
         let qkv_proj =
             FusedQkvProjection::try_from_separate(&q_proj, &k_proj, &v_proj, Device::Cpu)?;
         if qkv_proj.is_some() {
-            debug!(layer = i, "qwen3: fused QKV projection built (L33)");
+            debug!(layer = i, "qwen3: fused QKV projection built");
         }
 
         let yarn_freqs = yarn_freqs_proto

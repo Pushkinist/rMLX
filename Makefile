@@ -1057,12 +1057,12 @@ asm:             ## cargo asm --release -p rmlx-quant $(ASM_SYM)  (codegen inspe
 	@command -v cargo-asm >/dev/null 2>&1 || { echo "install: cargo install cargo-asm"; exit 1; }
 	cargo asm --rust --release -p rmlx-quant "$(ASM_SYM)"
 
-# ---- J10: TheTom upstream kernel-fix watch (weekly; docs/research/J10-upstream-watch.md)
-# After triaging the printed commits, bump LAST_REVIEWED_SHA below + in the doc.
+# ---- Upstream TurboFlash kernel-fix watch (TheTom llama-cpp-turboquant)
+# After triaging the printed commits, bump LAST_REVIEWED_SHA below.
 UPSTREAM_REPO ?= ../llama-cpp-turboquant
 UPSTREAM_BRANCH ?= feature/turboquant-kv-cache
 LAST_REVIEWED_SHA ?= 2b61ea24e
-upstream-check:  ## J10: print TheTom commits since LAST_REVIEWED_SHA on the watched branch
+upstream-check:  ## print TheTom commits since LAST_REVIEWED_SHA on the watched branch
 	@test -d "$(UPSTREAM_REPO)/.git" || { echo "upstream repo absent: $(UPSTREAM_REPO)"; exit 1; }
 	@git -C "$(UPSTREAM_REPO)" fetch --quiet origin "$(UPSTREAM_BRANCH)" 2>/dev/null || git -C "$(UPSTREAM_REPO)" fetch --quiet 2>/dev/null || true
 	@echo "new commits on $(UPSTREAM_BRANCH) since $(LAST_REVIEWED_SHA):"

@@ -147,15 +147,15 @@ fn ring_bytes(
 /// iso, at the **CPU `IsoBlocks` rate**, not the ring-resident one.
 ///
 /// The byte count includes the per-group quaternion array and holds all three
-/// host planes at `f32`, so it reports ≈48.25 bits/value at `head_dim = 128`.
+/// host planes at `f32`, so it reports ≈43.25 bits/value at `head_dim = 128`.
 /// That is the honest figure for the V-only `iso3` / `iso4` stores, which keep
 /// `IsoBlocks`. It is **not** the figure for `k_iso3/4` and `iso3_sym/4_sym`:
 /// the GPU ring those decode from does not carry the quaternion — it is the
 /// constant `FIXED_QUAT` replicated per group, not data — and it holds the
 /// scale and norm planes at the stored sideband dtype, so they sit at
-/// ≈12.125 bits/value. See `docs/KV_ROTATION_CODECS.md` § iso3 "Memory truth". Quoting
-/// 48.25 against `rotor`'s ring rate without that distinction inverts the
-/// comparison: on the ring path iso is much the cheaper of the two.
+/// 7.125 bits/value for iso3. See `docs/KV_ROTATION_CODECS.md` § "Iso memory
+/// truth". Quoting 43.25 against `rotor`'s ring rate without that distinction
+/// inverts the comparison: on the ring path iso is the cheaper of the two.
 ///
 /// The distortion is identical on both paths — the quaternion is a sideband,
 /// not an input to reconstruction — so only the rate column is affected.
@@ -544,8 +544,8 @@ fn planar_widths_are_byte_identical_and_the_others_pay_for_their_bits() {
     assert!(
         three_db > four_db,
         "planar4 {four_db:.2} dB now beats planar3 {three_db:.2} dB at the same rate. The \
-         documented dominance has flipped — update docs/KV_CODEC_FIDELITY.md \"Each family therefore \
-         has one strictly dominated width\" and this test rather than deleting it"
+         documented dominance has flipped — update docs/KV_CODEC_FIDELITY.md \"Planar is the only \
+         family with a strictly dominated width\" and this test rather than deleting it"
     );
 
     // iso and rotor: the dense code plane charges for the extra bit, one per

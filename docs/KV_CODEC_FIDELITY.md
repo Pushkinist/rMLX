@@ -166,9 +166,8 @@ bits spend one f32 scale per 32 values and lose 0.34 bits.
 **Planar's 3-bit and 4-bit widths cost byte-identical storage.** A 32-value
 planar block takes 4 words at either width, under the `32 / bits`
 vals-per-word convention. A width is dominated when it costs the same bytes
-as the other width and loses quality. Each family therefore has one strictly
-dominated width only if its two widths cost the same bytes. Planar is the only
-such family: `planar4` loses about 3.9 dB against `planar3`.
+as the other width and loses quality. Planar is the only family with a
+strictly dominated width: `planar4` loses about 3.9 dB against `planar3`.
 
 Per pair, planar pins the larger element to the outermost centroid. The smaller
 lands on the grid `centroid / max_centroid`. Its outermost gap is

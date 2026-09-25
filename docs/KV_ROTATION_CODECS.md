@@ -149,7 +149,7 @@ at the store is bf16 (`cast_store_bf16` floors it at the store boundary), and
 cadence the grid accepts (`q8_g32`, 9.00). `parse_kv_side` output goes through
 `validate_mixed_side` (2/3/4/5/6/8 bits, group 32/64/128), so this table has a
 rate for every spelling that parses.
-`mixed_grammar_no_longer_admits_unbounded_affine_rates` pins this.
+`mixed_grammar_admits_only_bounded_affine_rates` pins this.
 
 **`head_dim % 4 == 0` constraint.** iso3 uses groups of 4. The encoder and the
 decoder reject a `head_dim` that is not a multiple of 4 with

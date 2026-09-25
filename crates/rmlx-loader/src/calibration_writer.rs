@@ -106,8 +106,8 @@ pub fn outlier_count_for(head_dim: u32, internal_recipe: &str) -> Result<u32> {
 
 /// Per-layer codebook override (rMLX schema v1.1).
 ///
-/// When present, the V-side TurboQuant CPU encoder uses these centroids instead
-/// of the built-in Lloyd-Max N(0,1) codebook. The K side is unaffected.
+/// When present, the V-side TurboQuant encoder uses these centroids instead of
+/// the built-in Lloyd-Max N(0,1) codebook. The K side is unaffected.
 ///
 /// ## Field semantics
 ///
@@ -119,10 +119,9 @@ pub fn outlier_count_for(head_dim: u32, internal_recipe: &str) -> Result<u32> {
 ///
 /// ## GPU dispatch
 ///
-/// When `value` is `Some`, the V-side encode is forced to the CPU scalar path
-/// for that layer (the MSL kernel has the Lloyd-Max codebook hardwired). CPU
-/// scalar encode is materially slower than the MSL kernel; T19b will close
-/// the gap. Exact factor TBD pending benchmark.
+/// At `bits == 4` the GPU encode kernel takes the override
+/// (`turbo_quantize_v4_codebook_buf_gpu`, fed from `QuantV::value_codebook_gpu`
+/// on first GPU append); the other widths encode on the CPU.
 // SCHEMA-COMPAT (rMLX v1.x): do NOT add #[serde(deny_unknown_fields)] — forward-compat
 // between point versions depends on the serde default. The `key` field may be added
 // additively in a future version; omit it here until it is consumed by a codec.
