@@ -94,7 +94,7 @@ drop that codec's rows at ingest.
 `identity::canonicalize_kv_quant` trims and lowercases the value and maps
 `bf16` and `f16` to `none`, and `rotor_v_3` / `rotor_v_4` to `rotor3` /
 `rotor4`. Any other value passes through. `RunRecordBuilder::rmlx` and the
-JSONL pass of the legacy importer (§7) apply it. A JSON record is stored as
+JSONL pass of the legacy importer (§ "Legacy import") apply it. A JSON record is stored as
 it spells the field.
 
 ### 5.4 `backend` whitelist
@@ -161,7 +161,7 @@ Rules:
 
 ---
 
-## 7. Migration plan
+## 7. Legacy import (`rmlx metrics migrate`)
 
 `rmlx metrics migrate` (`migrate::legacy::migrate_all`) imports archives
 written before the DB existed. It applies pending schema migrations first
@@ -232,7 +232,7 @@ Scripts in other languages shell out to it and never write the DB directly.
 - The server's metrics drainer (`crates/rmlx-server/src/metrics_drainer.rs`).
   It builds records with `RunRecordBuilder::rmlx` and inserts them directly,
   with no buffer file.
-- `rmlx metrics migrate`, for archives only (§7).
+- `rmlx metrics migrate`, for archives only (§ "Legacy import").
 
 The `events` table is written only by `EventRecorder` in the running binary
 (`METRICS_SCHEMA.md` §3.6).
@@ -288,7 +288,7 @@ unless the table says otherwise.
 | `open [--readonly]` | Starts `sqlite3` on the DB; `--readonly` passes `-readonly`. |
 | `export --markdown \| --json \| --csv \| --jsonl [--scope <toml>]` | Prints `bests` (§9). |
 | `prompts list \| get --name N \| add --file F \| sync` | The prompt registry (§8.7). |
-| `migrate` | Imports archives (§7). |
+| `migrate` | Imports archives (§ "Legacy import"). |
 
 `best`, `history` and `timeseries` take the whole cell: `--backend`,
 `--namespace`, `--model`, `--weight-quant`, `--kv-quant`, `--ctx-max`

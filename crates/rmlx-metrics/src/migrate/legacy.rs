@@ -1,4 +1,4 @@
-// ── §2 Legacy-data ingester (docs/METRICS_DB.md §7) ─────────────────────────
+// ── Legacy-data ingester (docs/METRICS_DB.md § "Legacy import") ──────────────
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -97,7 +97,7 @@ pub struct MigrateReport {
 
 /// Replay legacy JSONL + CSV + optional MD records into `conn`.
 ///
-/// Per docs/METRICS_DB.md §7. Idempotent: rows already present (identified
+/// Per docs/METRICS_DB.md § "Legacy import". Idempotent: rows already present (identified
 /// by the `legacy_run_key=<hex>` prefix in `observations.notes`) are skipped.
 pub fn migrate_all(conn: &mut Connection, opts: &MigrateOptions) -> Result<MigrateReport> {
     let mut report = MigrateReport::default();
@@ -295,7 +295,7 @@ fn ingest_jsonl_row(
     // KV quant canonicalization (parser-based, accepts `mixed_*`).
     let kv_quant = identity::canonicalize_kv_quant(&row.kv_quant)?;
 
-    // Build legacy_run_key for idempotency (§7.5).
+    // Build legacy_run_key for idempotency (docs/METRICS_DB.md § "Legacy import").
     let legacy_key = legacy_run_key_jsonl(
         &row.model_path,
         &kv_quant,
