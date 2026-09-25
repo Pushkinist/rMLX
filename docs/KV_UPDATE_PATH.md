@@ -41,16 +41,19 @@ the function owns and returns early, promoting them into the bf16 mirror.
 
 ## One body per store shape
 
-24 of the 27 `KvStorage` variants hold a K slot, a V slot and `max_seq`.
-`None` holds no store, `Mixed` holds a `MixedKvState`, and `Paged` holds a
-block table. `make kv-update-census` prints this classification from the enum.
+24 of the 27 `KvStorage` variants hold store slots and `max_seq`. 19 hold a K
+slot and a V slot; `Planar`, `RotorKAsym3` and `RotorKAsym4` also carry a
+scalar knob. 5 hold a K slot only, with V as bf16 on the parent cache:
+`PlanarK`, `IsoKOnly3`, `IsoKOnly4`, `RotorKOnly3`, `RotorKOnly4`. `None` holds
+no store, `Mixed` holds a `MixedKvState`, and `Paged` holds a block table.
+`make kv-update-census` prints this classification from the enum.
 
 Each shape is an entry plus a body. The entry destructures its `KvStorage`
-variants and hands the two store slots to the body. The body is a free function
-over `&mut Option<KStore>` and `&mut Option<VStore>` and nothing else of the
-cache. Where two variants differ only in code width, the body is
-`<const BITS: u8>` and the entry resolves the width from the storage variant.
-Where they differ in a scalar, the scalar is a parameter.
+variants and hands the store slots to the body. The body is a free function over
+`&mut Option<KStore>`, plus `&mut Option<VStore>` where the shape has a V slot,
+and nothing else of the cache. Where two variants differ only in code width, the
+body is `<const BITS: u8>` and the entry resolves the width from the storage
+variant. Where they differ in a scalar, the scalar is a parameter.
 
 | Family | Decode entry → body | Prefill entry → body |
 |---|---|---|
@@ -68,12 +71,13 @@ The fused-append entries follow the same shape: `rotor_k_only_gpu_append`,
 `rotor_sym_gpu_append`, `iso_k_only_gpu_append` and `iso_sym_gpu_append`, each
 over a width-generic body.
 
-**A mis-resolved width does not compile.** The slot's type names the width, so
-handing a `QuantRotorV<3>` slot to `rotor_v_update::<4>` is a type error. This
-holds for every const-generic body. It does not hold for `k8_turbo_v_update`,
-whose width is the runtime `v_bits` of a `QuantV`. Its four spellings read
-`(v_bits, use_tcq)` from one table, `k8_turbo_v_knobs`, which both entries
-share.
+**A mis-resolved width does not compile** where the slot's type carries
+`BITS`: handing a `QuantRotorV<3>` slot to `rotor_v_update::<4>` is a type
+error. A `QuantV` slot carries its width at runtime, in `bits`, so a wrong
+width there compiles. That covers the V axis of `tsym_update`, of
+`rotor_k_asym_update` and of `k8_turbo_v_update`. The four K8 + turbo V
+spellings read `(v_bits, use_tcq)` from one table, `k8_turbo_v_knobs`, which
+both entries share.
 
 **The width comes from the storage.** A prefill entry encodes at the storage's
 width even when the `KvQuant` spelling names another. Decode dispatches on the
@@ -101,8 +105,8 @@ are 3 and 4.
 **The width guard.** `QuantIsoV`, `QuantIsoK` and `QuantKTurbo` carry the
 associated const `WIDTH_IS_A_SHIPPED_ONE`, an `assert!` over `BITS`. `NAME`,
 `new` and `from_cpu_blocks` read it, and so do `QuantKTurbo`'s two MSL width
-selectors.
-A third width fails at monomorphisation, so `cargo build` and `cargo test`
+selectors and every other width-dependent method of `QuantKTurbo`. A third
+width fails at monomorphisation, so `cargo build` and `cargo test`
 catch it; `cargo check` and `cargo clippy` do not. The rotor stores carry no
 guard. They stay crate-internal under their generic names, and callers outside
 `rmlx-kv-quant` name the aliases.
@@ -175,9 +179,11 @@ spellings are one codec; that is open.
 ## The store-bytes oracle
 
 `crates/rmlx-kv-quant/src/kvcache/store_bytes_tests.rs` pins every spelling in
-`ALL_KV_QUANTS` at two shapes: `(kv_h, head_dim)` of `(1, 128)` and `(4, 96)`.
-Its module doc is the full statement; this is the summary. Per spelling and
-shape it pins:
+`ALL_KV_QUANTS` at two shapes, `(kv_h, head_dim)`: `(1, 128)` and `(4, 96)`.
+A spelling whose own group size does not divide 96 takes `(4, 128)` as its
+second shape instead (`shapes_for`); today that is the mixed pair,
+`mixed_k8g64_v4g64` and `rot_k_v8g64`. Its module doc is the full statement;
+this is the summary. Per spelling and shape it pins:
 
 | Column | What moves it |
 |---|---|
@@ -215,7 +221,8 @@ A served digest there judges the dispatch, never the store.
 - `KvStorage::Paged`: no spelling builds it in a test process.
   `no_spelling_builds_the_paged_storage_in_this_process` fails if one starts
   to. The paged suite is `crate::paged`.
-- The mixed pair's second shape is `(4, 128)`: `MixedKvState` groups by 64.
+- The mixed pair at a non-power-of-two `head_dim`: its second shape is
+  `(4, 128)`, because `MixedKvState` groups by 64.
 - The `exit_prefill` arms of the decode-inert spellings: no CPU route reaches
   them.
 - Every GPU path: MSL encode dispatch, the resident rings, `gpu_append`,
