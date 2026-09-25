@@ -67,6 +67,10 @@ A dated measurement that only the changelog cites.
 ## Scratch
 
 Notes that nothing reads.
+
+## Pointers
+
+The retry cap is in § "Retry budget".
 EOF
 cat >"${BASE}/docs/B.md" <<'EOF'
 # B
@@ -281,6 +285,9 @@ case_ section_italic_deleted 1 "docs/B.md:6: SECTION docs/A.md 'Cost of the host
 case_ section_after_line_break_deleted 1 "SECTION docs/A.md 'Evict-to-budget (runtime)' — resolves to nothing" \
     "deleting a heading cited by a phrase on the line after § fails" \
     edit docs/A.md $'## Evict-to-budget (runtime)\n' ''
+case_ same_doc_section_deleted 1 "docs/A.md:51: SECTION docs/A.md 'Retry budget' — resolves to nothing" \
+    "deleting a heading that a § with no doc name cites from the same doc fails" \
+    edit docs/A.md $'## Retry budget\n' ''
 case_ bare_anchor_deleted 1 "ANCHOR docs/A.md 'retry-envelope' — resolves to nothing" \
     "deleting a heading a bare doc#anchor names fails" \
     edit docs/A.md $'## Retry Envelope\n' $'## Retries\n'

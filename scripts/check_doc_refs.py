@@ -17,6 +17,7 @@ maybe something inside it:
            heading title
   QUOTE    `<DOC>.md "Phrase"`: a phrase that names a heading must keep naming
            a heading; any other phrase must occur in the doc
+           Inside a doc, a `§` with no doc name before it cites that doc.
   LINE     `<DOC>.md:NNN` must be a line of the doc; a quoted phrase after it
            is checked as a QUOTE too
   MAP      every top-level docs/*.md has a `CLAUDE.md` documentation-map row
@@ -370,6 +371,12 @@ def collect(tree: Tree, doc_names: set[str]) -> list[tuple[Ref, int]]:
             if anchor and not resolved.endswith(".md"):
                 anchor = ""
             refs.append((Ref(citing, "LINK", resolved, anchor), line_of(text, pos)))
+        if in_docs and citing.endswith(".md"):
+            for m in re.finditer("§", link_text):
+                if ".md" in link_text[max(0, m.start() - 8) : m.start()]:
+                    continue
+                for kind, key, runs_on in refs_after(link_text[m.start() : m.start() + 400]):
+                    refs.append((Ref(citing, kind, citing, key, runs_on), line_of(text, m.start())))
         for m in DOC_MENTION.finditer(text):
             doc = doc_path_of(m.group(1), doc_names)
             if doc is None:
