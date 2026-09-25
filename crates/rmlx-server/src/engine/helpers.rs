@@ -307,3 +307,7 @@ pub(crate) fn kv_quant_label(kv: Option<rmlx_kv_quant::KvQuant>) -> String {
 #[cfg(test)]
 #[path = "helpers_tests.rs"]
 mod helpers_tests;
+
+#[cfg(test)]
+#[path = "kv_quant_label_tests.rs"]
+mod kv_quant_label_tests;

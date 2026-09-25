@@ -13,47 +13,16 @@ use super::{KvQuant, ALL_KV_QUANTS};
 use crate::mixed_quant::MixedTuple;
 use rmlx_mlx::{quantize, Array, Device, Dtype};
 
-/// Construct one representative instance of every `KvQuant` variant and assert
-/// `KvQuant::from_str(&q.to_string()) == Ok(q)`.
+/// Every spelling `Display` emits parses back to the codec that emitted it.
 ///
-/// Parametric variants (`Mixed`, `RotK`, `RotorK3Asym`, `RotorK4Asym`) are
-/// exercised with multiple sample parameter sets to guard against partial
-/// parse regressions (e.g. "parses 4-bit but not 8-bit").
+/// The sweep is [`ALL_KV_QUANTS`], so a codec whose `FromStr` arm is missing
+/// fails here. The four parametric variants (`Mixed`, `RotK`, `RotorK3Asym`,
+/// `RotorK4Asym`) are also swept at the other parameter sets below, because
+/// `ALL_KV_QUANTS` holds one set each and a parser can accept one width and
+/// reject another.
 #[test]
 fn all_variants_display_fromstr_roundtrip() {
-    let cases: &[KvQuant] = &[
-        // ── simple unit variants ─────────────────────────────────────────────
-        KvQuant::None,
-        KvQuant::K8V4,
-        KvQuant::K8V8,
-        KvQuant::Planar,
-        KvQuant::Planar3,
-        KvQuant::PlanarK,
-        KvQuant::K8VTurbo3,
-        KvQuant::K8VTurbo3Tcq,
-        KvQuant::K8VTurbo2,
-        KvQuant::K8VTurbo2Tcq,
-        KvQuant::TurboSym3,
-        KvQuant::TurboSym4,
-        KvQuant::Iso3,
-        KvQuant::Iso4,
-        KvQuant::Iso3Sym,
-        KvQuant::Iso4Sym,
-        KvQuant::IsoKOnly3,
-        KvQuant::IsoKOnly4,
-        KvQuant::Rotor3,
-        KvQuant::Rotor4,
-        KvQuant::Rotor3Sym,
-        KvQuant::Rotor4Sym,
-        KvQuant::RotorKOnly3,
-        KvQuant::RotorKOnly4,
-        // ── Mixed — multiple param sets ──────────────────────────────────────
-        KvQuant::Mixed {
-            k_bits: 8,
-            v_bits: 4,
-            k_group_size: 64,
-            v_group_size: 64,
-        },
+    let other_parameter_sets: &[KvQuant] = &[
         KvQuant::Mixed {
             k_bits: 8,
             v_bits: 8,
@@ -66,7 +35,6 @@ fn all_variants_display_fromstr_roundtrip() {
             k_group_size: 32,
             v_group_size: 32,
         },
-        // ── RotK — multiple param sets ───────────────────────────────────────
         KvQuant::RotK {
             v_bits: 4,
             v_group_size: 64,
@@ -79,14 +47,9 @@ fn all_variants_display_fromstr_roundtrip() {
             v_bits: 2,
             v_group_size: 32,
         },
-        // ── RotorK3Asym — multiple valid V codecs ────────────────────────────
         KvQuant::RotorK3Asym {
             v_bits: 4,
             v_group_size: 128,
-        },
-        KvQuant::RotorK3Asym {
-            v_bits: 4,
-            v_group_size: 64,
         },
         KvQuant::RotorK3Asym {
             v_bits: 3,
@@ -96,7 +59,6 @@ fn all_variants_display_fromstr_roundtrip() {
             v_bits: 2,
             v_group_size: 64,
         },
-        // ── RotorK4Asym — multiple valid V codecs ────────────────────────────
         KvQuant::RotorK4Asym {
             v_bits: 4,
             v_group_size: 32,
@@ -111,7 +73,7 @@ fn all_variants_display_fromstr_roundtrip() {
         },
     ];
 
-    for &q in cases {
+    for &q in ALL_KV_QUANTS.iter().chain(other_parameter_sets) {
         let displayed = q.to_string();
         let parsed = KvQuant::from_str(&displayed).unwrap_or_else(|e| {
             panic!("{q:?} Display='{displayed}' failed to parse back: {e}");
@@ -123,19 +85,31 @@ fn all_variants_display_fromstr_roundtrip() {
     }
 }
 
-/// Spot-check a few known aliases that should parse to their canonical variant
-/// but may Display differently (one-way only, not a round-trip failure).
+/// The inputs `FromStr` accepts that `Display` never emits, and the retired
+/// names it refuses by name.
 ///
-/// These are inputs that are valid CLI shortcuts but not the canonical Display
-/// form — they do not violate the round-trip invariant.
+/// An alias parses one way only, so the round trip above cannot see it. A
+/// retired name must keep its error and its successor: an alias in its place
+/// would let a saved CLI line run a codec it does not name.
 #[test]
 fn aliases_parse_correctly() {
-    // "bf16" and "f16" are accepted synonyms for None; Display emits "none".
-    assert_eq!(KvQuant::from_str("bf16").unwrap(), KvQuant::None);
-    assert_eq!(KvQuant::from_str("f16").unwrap(), KvQuant::None);
-    // "rotor_v_3" / "rotor_v_4" are alternate names for Rotor3 / Rotor4.
-    assert_eq!(KvQuant::from_str("rotor_v_3").unwrap(), KvQuant::Rotor3);
-    assert_eq!(KvQuant::from_str("rotor_v_4").unwrap(), KvQuant::Rotor4);
+    let aliases = [
+        ("bf16", KvQuant::None),
+        ("f16", KvQuant::None),
+        ("rotor_v_3", KvQuant::Rotor3),
+        ("rotor_v_4", KvQuant::Rotor4),
+    ];
+    for (alias, want) in aliases {
+        assert_eq!(KvQuant::from_str(alias), Ok(want), "alias {alias}");
+    }
+    assert_eq!(
+        KvQuant::from_str("rot_k_tq4v"),
+        Err(super::KvQuantParseError::Retired {
+            input: "rot_k_tq4v".to_string(),
+            replacement: "rot_k_v4g64",
+        }),
+        "the retired rot_k_tq4v must name its successor"
+    );
 }
 
 /// Confirm that the previously-broken RotK `Display`/`FromStr` form now

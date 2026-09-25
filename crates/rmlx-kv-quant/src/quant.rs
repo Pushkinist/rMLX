@@ -1950,3 +1950,7 @@ fn parse_kv_side(spec: &str, expected_prefix: char) -> Result<(u8, u16), String>
 #[cfg(test)]
 #[path = "quant_tests.rs"]
 mod quant_tests;
+
+#[cfg(test)]
+#[path = "codec_facts_tests.rs"]
+pub(crate) mod codec_facts_tests;

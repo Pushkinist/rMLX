@@ -355,7 +355,7 @@ fn push_mixed(out: &mut StoreBytes, s: &crate::mixed_quant::MixedKvState) {
 /// The `match` is exhaustive and names no wildcard on purpose: a storage
 /// variant added to the enum then fails to compile here, which is how a new
 /// codec is made to bring its pin rows with it.
-fn store_digest(storage: &KvStorage) -> u64 {
+pub(super) fn store_digest(storage: &KvStorage) -> u64 {
     let mut out = StoreBytes::default();
     macro_rules! opt_q8 {
         ($slot:expr, $name:expr) => {
@@ -507,7 +507,7 @@ const TEST_SCALE: f32 = 0.125;
     clippy::expect_used,
     reason = "test driver: every append here is on a shape the spelling accepts, so a failure is the defect under test and the panic names it"
 )]
-fn append(
+pub(super) fn append(
     cache: &mut KvCache,
     quant: KvQuant,
     k: &rmlx_mlx::Array,
