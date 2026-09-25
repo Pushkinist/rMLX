@@ -69,7 +69,8 @@ areas before touching code:
 | [`docs/PUBLISHED_PROTOCOL.md`](docs/PUBLISHED_PROTOCOL.md) | Generated: published-protocol results (MT-Bench / MATH-500 / HumanEval, fixed prompt) with every number beside the bound it cannot pass |
 | [`docs/PROFILING.md`](docs/PROFILING.md) | samply / Instruments flamegraph workflow |
 | [`docs/PROJECTS_CONFIG.md`](docs/PROJECTS_CONFIG.md) | Per-project cap defaults via `<RMLX_HOME>/projects.toml` |
-| [`docs/TESTING.md`](docs/TESTING.md) | RMLX_TEST_MODEL_* env vars + RMLX_O_MODELS_ROOT for test snapshot resolution |
+| [`docs/TESTING.md`](docs/TESTING.md) | Test snapshot resolution (RMLX_O_MODELS_ROOT, RMLX_TEST_MODEL_*), test variables, golden-token fixtures, CPU numeric gates, NIAH and codec smoke matrix |
+| [`docs/GPU_TESTS.md`](docs/GPU_TESTS.md) | GPU/Metal tests: the `#[ignore]` rule and its gate, `make gpu-test`, stand-downs, halves, `make ci-perf`, shader validation, census pin |
 | [`docs/E2E_TEST_PLAN.md`](docs/E2E_TEST_PLAN.md) | End-to-end feature-proof harness: modality, tool-calling and speculative-decoding cases |
 | [`docs/RELEASING.md`](docs/RELEASING.md) | Release flow: single-source version, `make tag` / `release-package` / `tap-sync`, Homebrew formula + tap, `CHANGELOG.md`, branch model (`next/*`, hotfix, fast-forward release) |
 
@@ -279,7 +280,7 @@ Hard rules:
   non-brace delimiter, remain outside the fail-closed net — neither exists in
   the tree. `make check-gpu-tests-ignored-fixtures` pins the gate's recall in
   both directions, asserting each case's failure *reason* and not just its exit
-  code. See `docs/TESTING.md`.
+  code. See `docs/GPU_TESTS.md`.
 - **Advisory: `make file-size-report`** prints files >1000 LOC. Non-failing.
   Also runs at the end of `make ci` (advisory, non-blocking).
 - **Advisory: `make target-size-report`** prints `target/` size and, past a
@@ -316,7 +317,7 @@ hand — keeps the CI gate and the local gate identical.
 | `make build` | `cargo build --workspace --release`. |
 | `make check` | `cargo check --workspace --all-targets` (fast). |
 | `make test` | `cargo test --workspace` — **skips every `#[ignore]` GPU test**. |
-| `make gpu-test` | Run the GPU/Metal `#[ignore]` tests, `--test-threads=1` (`CRATE=` / `FILTER=` narrow). Needs exclusive machine access. Under Metal shader validation (`--nocapture`, so the tests' own skip notices reach the scan): the hits it observes are diffed against `scripts/gpu_validation_census.txt`, which pins one count per (kernel, kind, crate, originating test) — a test that loads two checkpoints can carry two entries; the expectation is the sum over the tests that ran, an exact match passes and prints what it accepted, any deviation fails naming the delta. A cell that stood down is listed with the reason its `SKIP <test>: <why>` notice gave; one whose notice omitted the test name is counted but not attributable; either way the final line reads INCOMPLETE — a test that could not run is not a test that passed, and libtest reports both as `ok`. A test that notes a missing checkpoint and still asserts on the ones it found prints a `note`, not a `SKIP`, so its entries stay expected. A change that adds a GPU test, or makes one perform a load it did not perform before, derives its own pin entry in the same change (`docs/TESTING.md`). `HALF=codec\|rest` runs one side of the partition `scripts/gpu_test_halves.sh` computes — that producer is the only place the partition is computed, and a classified test it places in no half is a refusal naming the test, not a note. A half's census expectation is its own slice of the one pin, keyed on (crate, test); a stand-down inside a half still ends it INCOMPLETE; the final line names the half. Part of `make ci-perf`, not `make ci`. |
+| `make gpu-test` | Run the GPU/Metal `#[ignore]` tests, `--test-threads=1` (`CRATE=` / `FILTER=` narrow). Needs exclusive machine access. Under Metal shader validation (`--nocapture`, so the tests' own skip notices reach the scan): the hits it observes are diffed against `scripts/gpu_validation_census.txt`, which pins one count per (kernel, kind, crate, originating test) — a test that loads two checkpoints can carry two entries; the expectation is the sum over the tests that ran, an exact match passes and prints what it accepted, any deviation fails naming the delta. A cell that stood down is listed with the reason its `SKIP <test>: <why>` notice gave; one whose notice omitted the test name is counted but not attributable; either way the final line reads INCOMPLETE — a test that could not run is not a test that passed, and libtest reports both as `ok`. A test that notes a missing checkpoint and still asserts on the ones it found prints a `note`, not a `SKIP`, so its entries stay expected. A change that adds a GPU test, or makes one perform a load it did not perform before, derives its own pin entry in the same change (`docs/GPU_TESTS.md`). `HALF=codec\|rest` runs one side of the partition `scripts/gpu_test_halves.sh` computes — that producer is the only place the partition is computed, and a classified test it places in no half is a refusal naming the test, not a note. A half's census expectation is its own slice of the one pin, keyed on (crate, test); a stand-down inside a half still ends it INCOMPLETE; the final line names the half. Part of `make ci-perf`, not `make ci`. |
 | `make fmt` / `make fmt-check` | Write / check `cargo fmt`. |
 | `make lint` | `cargo clippy -D warnings`. |
 | `make audit` | `cargo audit` with RustSec ignores from `deny.toml`. |

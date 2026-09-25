@@ -127,8 +127,8 @@
 # that test still runs and the absent one's entry reports `no longer fires`:
 # the entry key has no room for which checkpoint produced the count, and a red
 # that names the missing model is the intended outcome there.
-affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_5_moe_forward_seq_last_k_equals_reference | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
-affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 80 | rmlx-models | thinking_budget_exact_hit_qwen3_5_moe | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
-affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_moe_golden_tokens_k8v8 | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
-affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 1014 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
-affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 2496 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/TESTING.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_5_moe_forward_seq_last_k_equals_reference | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 80 | rmlx-models | thinking_budget_exact_hit_qwen3_5_moe | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 40 | rmlx-models | qwen3_moe_golden_tokens_k8v8 | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_8_alN_false | device load | 1014 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438
+affine_qmm_t_splitk_bfloat16_t_gs_64_b_4_alN_false | device load | 2496 | rmlx-models | a_round_tape_refolds_to_what_the_replay_produced | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/438

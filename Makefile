@@ -308,7 +308,7 @@ CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMP
 # and one measured whole run of it took 279 min on a host holding every
 # snapshot — which is what HALF exists for. The dev profile is not shared with
 # `test-perf` and is what `make target-gc` prunes first, so a run after a GC
-# pays a cold opt-level-0 build on top. See docs/TESTING.md.
+# pays a cold opt-level-0 build on top. See docs/GPU_TESTS.md.
 ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal suite (HALF=codec|rest runs one side of the partition; separate from make ci)
 	@bash scripts/run_gpu_tests.sh --preflight
 	$(MAKE) test-perf
