@@ -2489,927 +2489,443 @@ context. So state the codec, its K bit width and `kv_frac` with every cell.
 
 ## `rotor_flash_decode` — fused MSL flash-decode over rotor-quant K
 
-Fused flash-decode for `KvStorage::RotorKOnly3` / `RotorKOnly4`: QK over the
-packed rotor K store + online softmax + bf16-V SV, in two Metal dispatches per
-decode step. The rotor codec's Cl(3,0) K-decode runs **inside** the attention
-inner loop, so no bf16 / f32 K is materialised and nothing restages through the
-host.
-
-**What it replaced.** `update_rotor_k_only` called
-`QuantRotorK{3,4}::dequant()` on every decode step — a full-prefix **CPU** rotor
-decode into a `Vec<f32>` plus a re-upload. That is O(seq) host work per token
-with the GPU idle, and it is what pinned the K-only rotor family in the
-"Tier 3 — CPU-bound" bucket (0.05–8.8 TPS, see `docs/models/bonsai/27B/rMLX.md`).
-The store is now GPU-resident (`storage::QuantKGpuRing`) and the kernel reads it
-directly.
+This is the decode kernel for `k_rotor3` and `k_rotor4`
+(`KvStorage::RotorKOnly3` / `RotorKOnly4`). It computes QK over the packed
+rotor K ring, an online softmax, and SV over the bf16 V mirror, in two Metal
+dispatches per decode step. The Cl(3,0) K decode runs inside the attention
+loop. So no bf16 or f32 K is built, and no K data goes through the host.
 
 ### Files
 
 * `crates/rmlx-kv-quant/src/rotor_flash_decode_msl.rs` — Rust dispatcher,
   header builder, dispatch counters.
-* `crates/rmlx-kv-quant/src/metal/rotor_flash_decode_p1.metal` — pass-1 body
-  (one body for **both** bit widths).
-* `crates/rmlx-kv-quant/src/metal/flash_decode_merge_p2.metal` — codec-agnostic
-  pass-2 log-sum-exp merge, shared with `planar_flash_decode`.
-* `crates/rmlx-kv-quant/src/storage/quant_k_gpu_ring.rs` — `QuantKGpuRing`, the
-  GPU-resident packed ring (codes / per-group scales / per-token L2 norms) with
-  paged growth and CPU-prefix seeding. Codec-agnostic: it is told `n_groups`
-  rather than deriving it, and is shared with the iso K stores.
+* `crates/rmlx-kv-quant/src/metal/rotor_flash_decode_p1.metal` — pass-1 body,
+  one body for both bit widths.
+* `crates/rmlx-kv-quant/src/metal/flash_decode_merge_p2.metal` — pass-2
+  log-sum-exp merge. It is codec-agnostic. Every flash-decode kernel in this
+  document uses it.
+* `crates/rmlx-kv-quant/src/storage/quant_k_gpu_ring.rs` — `QuantKGpuRing`,
+  the GPU-resident packed ring. Per token and KV head it holds the row's dense
+  code plane, one bf16 scale per group and one bf16 L2 norm. It grows in pages
+  and can be seeded from CPU blocks. The caller gives it `n_groups`, so the
+  rotor and iso stores share it.
 * `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_rotor_k_fused` —
   dispatch site.
 
 ### Bit width is a header parameter
 
-`bits ∈ {3, 4}` arrives via the header (`RF_BITS` / `RF_MASK`) alongside the
-matching Lloyd-Max codebook, so one `.metal` body serves both variants — the
-3-bit codes unpack at `shift = e*3, mask = 0x7`, the 4-bit at `e*4, 0xF`,
-matching `rotorquant::{unpack_group, unpack_group_4bit}`. Selection is explicit;
-any other `bits` is an `Err`, never a silent fallback to the wrong unpack width.
+The header carries `bits ∈ {3, 4}` as `RF_BITS` / `RF_MASK`, with the matching
+Lloyd-Max codebook. So one `.metal` body serves both widths. The dispatcher
+takes the width from the storage variant. Any other width is an `Err`.
 
 ### Reusable K-decode half
 
-The per-lane rotor decode is emitted into the **header** as the MSL function
-`rf_decode_k_lane(codes, scales, norms, rotors, tok_idx, n_groups, lane)` rather
-than inlined into the body. A quantized-V flash kernel needs the identical
-K-side decode and can call it unchanged. (Bodies in this repo are statement
-sequences spliced inside a generated kernel signature, so a body cannot define
-functions — the header is the only place a shared function can live.)
+The header emits the rotor decode as two MSL functions. `rf_decode_k_group`
+decodes one Cl(3,0) group, and `rf_decode_k_lane` is a per-lane wrapper over
+it. In each pass-1 body, lane 0 of a group decodes the group and writes its
+lanes to threadgroup memory. So the decode runs once per group, not once per
+lane. A body is a statement sequence inside a generated kernel signature, and
+it cannot define a function. So a shared function must live in the header.
 
 ### Gate
 
-No env var and no CLI flag: the path is on whenever it is applicable. Gates, in
-order — device is GPU, storage is a rotor K-only variant, the store does **not**
-carry QJL, `q_seq == 1`, `b == 1`, `head_dim` is a power of two and
-`<= ROTOR_FLASH_HEAD_DIM_MAX` (512). Any miss falls through to the legacy CPU
-dequant path.
+There is no flag and no environment variable. The kernel runs when all of
+these conditions are true. Otherwise the step takes the CPU dequant path.
 
-**QJL.** The optional 1-bit QJL residual (`--rotor-qjl on`, opt-in) is a
-per-token back-projection through a dense `[head_dim, head_dim]` matrix.
-Reproducing it in the flash inner loop would mean reading that whole matrix per
-token per threadgroup — far more bandwidth than the kernel saves — so a
-QJL-carrying store keeps the CPU dequant path. **`--rotor-qjl off` is required
-to reach the kernel.** The gate reads the *store's* sticky QJL decision
-(`use_qjl()`), not the live global toggle: the codec fixes QJL at first append
-and never adds or drops the sideband mid-stream, so a toggle flipped afterwards
-must not change how existing bytes are read.
+- The cache is not a sliding-window ring. `update_and_sdpa` sends a rotating
+  cache to the legacy bf16 path first.
+- The device is GPU.
+- The storage is `RotorKOnly3` or `RotorKOnly4`.
+- The store carries no QJL sideband.
+- `q_seq == 1`.
+- `b == 1`.
+- `head_dim` is a power of two and at most `ROTOR_FLASH_HEAD_DIM_MAX` (512).
+
+**QJL.** `--rotor-qjl on` adds a 1-bit QJL residual to K. Its decode is a
+per-token product with a dense `[head_dim, head_dim]` matrix, which the flash
+loop does not reproduce. So a store with QJL keeps the CPU dequant path. The
+gate reads the store's own decision (`use_qjl()`), not the global toggle. The
+store fixes QJL at its first append. Before that append, the gate reads the
+global toggle. The default is `--rotor-qjl off`.
 
 ### Storage applicability
 
 | Variant | Eligible? | Notes |
 |---|---|---|
-| `KvStorage::RotorKOnly3` / `RotorKOnly4`, QJL off, `b == 1` | **YES** | GPU ring + `rotor_flash_decode_sdpa`. |
-| `KvStorage::RotorKOnly{3,4}`, QJL on | NO | Kernel cannot reproduce the QJL residual. |
-| `KvStorage::RotorKOnly{3,4}`, `b > 1` | NO | Ring stride does not interleave batch — see below. |
-| `Rotor{3,4}Sym` | NO (this kernel) | Both axes are rotor-quantized; they decode through the all-quant sibling `rotor_flash_decode_symv` instead (see below), which reads V from its own packed ring rather than a bf16 mirror. |
-| `RotorK{3,4}Asym` | NO | V is affine-quantized (TurboQuant), not rotor; no fused kernel yet, so it keeps the bf16 decode path. |
+| `RotorKOnly3` / `RotorKOnly4`, QJL off, `b == 1` | **YES** | GPU ring + `rotor_flash_decode_sdpa`. |
+| `RotorKOnly{3,4}`, QJL on | NO | The kernel does not reproduce the QJL residual. |
+| `RotorKOnly{3,4}`, `b > 1` | NO | The ring stride does not interleave batch. |
+| `Rotor{3,4}Sym` | NO | Decodes through `rotor_flash_decode_symv`, which reads V from its own ring. |
+| `RotorK{3,4}Asym` | NO | V is TurboQuant, not rotor. Its only GPU decode kernel is `rotor_fused_qk`, with `--fused-qk on` (§"Fused-QK head-major K storage"). |
 
 ### Ring eligibility is passed down, not inferred
 
-`QuantKGpuRing` is only built for the codecs that can actually read it. The rotor K
-GPU encode takes a `RingFeed` from its caller, one of three modes:
+The caller of the rotor or iso GPU encode decides whether the ring is fed. It
+passes a `RingFeed`:
 
-- **`Maintain`** — feed the ring **and** push a CPU block. Used by prefill
-  (`update_rotor_k_only`) and the non-fused decode fallback, which `dequant()`
-  the whole prefix on the same step and so need the block immediately.
-- **`MaintainRingOnly`** — feed the ring **without** pushing a CPU block: a
-  **ring-only tail**. Used by the fused decode entry
-  (`rotor_k_only_gpu_append`). The flash kernel reads the ring, never the
-  block, so skipping the per-step host download (`rotor_gpu_outputs_to_cpu`) is
-  the win; `shape[2]` still advances so the ring and the attention length stay
-  in lockstep.
-- **`Skip`** — clear the ring. Used by the sym/asym mirrors, and as the `b > 1`
-  fallback of a ring-only feed (which reverts to the block path).
+- **`Maintain`** — feed the ring and push a CPU block. The legacy rotor K-only
+  entries use it, because they dequantize the whole prefix on the same step.
+- **`MaintainRingOnly`** — feed the ring and push no CPU block. This is a
+  ring-only tail. The fused decode entries use it. `shape[2]` still advances.
+- **`Skip`** — drop the ring. The legacy rotor symmetric and asymmetric
+  entries and the legacy iso entries use it.
 
-A ring for a non-eligible codec is not free — one `u32` code word plus one
-`KV_SIDEBAND_DTYPE` scale per group and one such norm per token, so
-`capacity * kv_h * (n_groups * (4 + sideband) + sideband)` bytes per layer,
-growing with context (order of a few hundred MB across a 36-layer model at 4k)
-— and nothing would ever read it.
+A ring-only feed at `b > 1` takes the block path instead
+(`is_ring_only_append`). A ring grows with the context:
+`ring_bits_per_value` gives its bits per value.
 
-**Invariant: the CPU `blocks` track `shape[2]` exactly, or the GPU ring holds
-the tail and the blocks are rebuilt from it on demand — never a silent gap.**
-Two regimes satisfy it:
+After a fused decode step the entry drops the CPU blocks
+(`drop_blocks_when_ring_live_*`). The ring is then the only resident copy.
 
-- *Blocks-authoritative* (Maintain / CPU `append` / SSD hydrate): `blocks` cover
-  the full `shape[2]`; the ring, when live, mirrors them and re-seeds from
-  `blocks` (`seed_from_cpu`) after a drop (`reset()`, a CPU `append()`).
-- *Ring-only tail* (fused decode): `blocks` freeze at the prefill prefix while
-  the ring carries the decode tail, so `blocks` trail `shape[2]`. The blocks are
-  rebuilt from the ring on demand — `synced_rotor_k_blocks` reconciles them at
-  every consumer boundary (`dequant`, and the SSD-spill / prompt-cache clone
-  `try_deep_clone`).
+**Invariant: the CPU `blocks` cover `shape[2]`, or the GPU ring holds the
+rest.** A store is in one of two states:
 
-`truncate_to` **keeps** the ring (it does not `clear()`): it lowers `shape[2]`
-to `n` and leaves the ring's `[n, prev)` capacity to be overwritten by the next
-append, exactly like the flat GPU-buffer codecs (`QuantK` / K8V4 just lower
-`shape[2]`). This preserves a ring-only decode tail up to `n` across the
-speculative-decode partial-accept rollback; clearing it there would discard the
-tail (the only copy of `[frozen_prefix, n)`) and abort the next `dequant`. Both
-mutators reconcile: the block-path append (`materialize_*_ring_tail`)
-materialises any pre-existing ring-only tail into `blocks` before pushing, so
-`blocks` stay a contiguous prefix. That block path is **live at `b == 1`**, not
-just a `b > 1` fallback: the fused decode entry is gated on `q_seq == 1`, so any
-multi-token append on a cache that has already run a fused decode step — a
-speculative verify chunk, or a continuation turn's prompt tokens against a warm
-cache — falls through to the legacy `update_*` entries, which pass
-`Maintain` / `Skip`. The readback it pays is not additive: every block-path call
-site dequantizes the whole prefix on the same step, so `dequant` would take the
-identical readback if `blocks` were left short.
+- *The blocks cover `shape[2]`*, after `Maintain`, a CPU `append` or an SSD
+  hydrate. A live ring mirrors them.
+- *Ring-only tail*, after a fused decode step. `synced_rotor_k_blocks`,
+  `synced_rotor_v_blocks` and `synced_iso_v_blocks` rebuild the blocks from
+  the ring at each consumer: `dequant`, the SSD spill and the prompt-cache
+  clone (`try_deep_clone`).
 
-**How reachable is the divergence?** Narrowly, and it is worth knowing why
-before writing a repro. The state needs a cache whose ring is live *and* whose
-CPU blocks were dropped — which only the fused decode path creates — followed by
-a decode-mode `update()` with `q_seq > 1` on **that same cache**. A warm
-prompt-cache continuation looks like it should qualify (gemma4's `is_prefix`
-flush appends the tail through decode-mode `update` with no enter/exit
-brackets), but it does not: that tail runs against a prompt-cache *clone*, and
-`try_deep_clone` materialises any ring-only tail into blocks and hands back a
-store with no ring at all, so there is nothing to diverge. What does qualify is a
-speculative verify chunk — a multi-token decode step on a live cache. So the
-codec can serve a normal single-request generate loop indefinitely without
-meeting it, which is why it surfaced from a truncation proof matrix rather than
-from serving, and why the guards above are the gate rather than a serve-time
-smoke test.
+A block push onto a store with a ring-only tail first moves that tail into
+the blocks (`materialize_rotor_k_ring_tail`, `reconcile_ring`). So the blocks
+stay a contiguous prefix. The fused entry requires `q_seq == 1`, so a
+multi-token append on a warm cache takes the block path. A speculative verify
+chunk is such an append.
 
-**Every block push reconciles, and every reader derives its count from the same
-place.** Two holes in that used to be reachable and are now closed. The iso-V
-GPU-encode append (`QuantIsoV::append_gpu`, the V side of the legacy
-`update_iso_v` / `update_iso_sym` entries) pushed a CPU block without touching a
-live ring, leaving the ring stale *and* the blocks short — it now calls
-`QuantIsoV::reconcile_ring(device, RingDisposition::Drop)`, which takes the
-ring's prefix back and then drops the ring, matching what the CPU `append` does
-by clearing. That is one body, shared with the `kvcache` append helpers, which
-pass `RingDisposition::Keep` because their `sync_ring` decides the
-ring's fate immediately after — the disposition is a parameter precisely because
-it is the only thing the two callers disagree on. The 4-bit V
-side had the same hole in a separate ring-unaware helper; it went with the
-storage collapse, and the fused 4-bit caller now goes through the ring-aware
-`iso_gpu_append_into_v_blocks` (it also stored its block head-major, unlike
-every other iso append). On the read side `QuantIsoK::dequant_gpu` and
-`QuantIsoV::dequant_gpu` counted `self.blocks` directly while their CPU siblings
-counted the ring-reconciled list, so a legitimate ring-only tail was rejected as
-a blocks-vs-shape disagreement (`dequant_gpu: actual_total=... !=
-declared_total=...`); both now start from `synced_iso_v_blocks`, which borrows
-(costs nothing) whenever the blocks already cover `shape[2]`.
+`truncate_to` keeps the ring. It lowers `shape[2]` to `n`, and the next append
+writes the ring from `n`. So a speculative rollback keeps a ring-only tail up
+to `n`.
 
-**Row vs. sequence units.** Every rotor/iso K and V store's per-append
-`RotorBlocks` / `IsoBlocks` carries `n_tokens` counting **rows**
-(`b * kv_h * seq_of_block`), not sequence positions, but `truncate_to(n)`
-takes `n` as a **sequence** target. Deciding which leading blocks to keep must
-therefore compare cumulative `n_tokens` against `n * b * kv_h`, not against
-`n` directly — at `kv_h > 1` (or `b > 1`) a raw comparison undercounts and
-drops blocks that should have been kept, landing the store in exactly the
-forbidden gap described below. This was invisible at `b * kv_h == 1` (rows and
-sequence positions coincide), which is how the bug shipped and how it stayed
-latent until a `kv_h > 1` truncation path was exercised (#284).
+A store whose blocks fall short of `shape[2]` with no ring to supply the rest
+is an error, never a zero-padded read. `synced_rotor_k_blocks` refuses it at
+the codec. `ensure_rotor_k_blocks_cover_shape` refuses it at SSD
+serialization. Both return `Err` and are not `debug_assert`s, so they hold
+under `release-perf`.
 
-**Blocks are not a truncation alignment.** A block spans one whole append, and a
-speculative partial accept cuts *inside* the verifier's `K + 1`-token chunk.
-Keeping only the blocks that fit whole throws the accepted prefix away with the
-rejected tail and leaves `blocks` covering fewer rows than `shape[2]` — the
-forbidden gap below, recoverable only when a ring happens to hold the same
-prefix. It is not recoverable on the CPU append path (a QJL-carrying rotor K
-store, or a `Device::Cpu` run) nor after a `Skip` feed cleared the ring, which is
-what `update_rotor{3,4}_sym` and the asym entries do on every append; the store
-then aborts the request with
-`"rotor K store: CPU blocks cover N tokens but shape[2] needs M"`. The planner
-therefore **splits** the trailing block, cutting every per-row buffer — codes,
-per-group scales, per-group quaternions, per-token norms, and the rotor QJL
-sideband — to the accepted row count.
+**Row vs. sequence units.** A rotor or iso block's `n_tokens` counts rows
+(`b * kv_h * seq_of_block`). `truncate_to(n)` takes a sequence position. So
+the planner compares cumulative rows with `n * b * kv_h`.
 
-**The split is `b == 1` only, and that is a correctness bound.** The bound is
-*inside* one block. A block's rows run `[B, S_block, kv_h, D]`, so batch element
-1's rows all sit after batch element 0's, and `BlockRows::retain_rows` keeps a
-**row prefix**. At `b > 1` a row prefix is not a sequence prefix: a cut to
-`keep_seq` positions would keep every one of batch 0's rows and none of batch
-1's, silently dropping one batch element's tail instead of cutting both at the
-same position. So the planner drops the block there and lets the reconciliation
-guard report the gap. `sdpa::rotor_flash_shape_ok` refuses `b != 1` separately,
-because the GPU ring's per-step stride does not interleave batch — which is also
-why a `b > 1` store never has a ring to rebuild from. Pinned by
-`quant_rotor_v_tests::quant_rotor_v3_truncate_at_b_gt_1_stays_loud`.
+**A cut inside a block splits it.** A block spans one append. A speculative
+partial accept cuts inside the verifier's `K + 1`-token chunk. The planner
+splits the trailing block and cuts every per-row buffer to the kept rows:
+codes, per-group scales, per-group quaternions, per-token norms and the QJL
+sideband.
 
-Reading the *concatenation* of the blocks used to be a second, independent bound
-and is no longer one. Every store ended `dequant` with
-`seq_layout::transpose_seq_heads` over the concatenation, reading it as one
-`[B, S_total, kv_h, D]` run — but each block is only `[B, S_block, kv_h, D]`, so
-at `b > 1` the concatenation interleaves batch elements and any store holding
-more than one block decoded scrambled (measured on the `b = 2`, `kv_h = 2`,
-`head_dim = 96`, 5-position fixture: **960 of 1920 elements** disagreed with a
-one-block store, while the `b = 1` control matched to the last bit). Every
-block-accumulating CPU store now calls
-`seq_layout::transpose_chunked_seq_heads`, which reorders each block at its own
-sequence offset and is exactly the old whole-buffer reorder when `B == 1`. The
-per-store proof is `*_two_block_decode_matches_one_block_at_b_gt_1` — one per
-store, all thirteen, each over `(b, kv_h) ∈ {1,2} × {1,2}` — with the index-math
-oracle in `seq_layout_tests`.
+**The split is `b == 1` only.** A block's rows run `[B, S_block, kv_h, D]`, so
+at `b > 1` a row prefix is not a sequence prefix. At `b > 1` the planner drops
+the block, and the reconciliation guard reports the gap.
+`quant_rotor_v3_truncate_at_b_gt_1_stays_loud` pins this. A block whose row
+count is not a whole number of sequence positions stops the walk too.
 
-The **GPU** readers took the same reorder on the way in rather than the way out.
-`QuantIsoV3::dequant_gpu` / `QuantIsoK3::dequant_gpu` had the identical defect
-(they reshaped the kernel's flat output as one `[B, S, kv_h, D]` run), and it is
-the multi-block case that reaches them: every `*_sync_ring` clears the ring at
-`b != 1`, so `synced_iso_v_blocks` returns a borrowed multi-block list there.
-Both now build their kernel inputs through `iso_kernel_inputs_head_major`, which
-places each token row at its head-major position via
-`seq_layout::head_major_token_order`; the iso dequant kernel is per-token
-positional, so the flat result is already `[B, kv_h, S, D]` and the trailing
-reshape/transpose is gone.
+**Multi-block decode at `b > 1`.** Each CPU store with a block list reorders
+every block at its own sequence offset
+(`seq_layout::transpose_chunked_seq_heads`). The iso GPU readers
+(`QuantIsoK::dequant_gpu`, `QuantIsoV::dequant_gpu`) put each token row at its
+head-major position through `iso_kernel_inputs_head_major`. The
+`*_two_block_decode_matches_one_block_at_b_gt_1` tests, one per store, pin
+this over `(b, kv_h) ∈ {1,2} × {1,2}`.
 
-**Where the bound still stands.** Two readers refuse `b != 1` (with `S > 1`)
-rather than reorder:
+**Readers that refuse `b != 1`.** Two readers refuse `b != 1` with `S > 1`
+instead of reordering:
 
-* The **flat GPU buffers** of the turbo / planar / affine stores (`QuantV`,
-  `QuantKTurbo3/4`, `QuantPlanarK/V`, `QuantK`) and the gated `QuantIsoV3` GPU
-  mirror. Each is a run of `[B, S_chunk, kv_h, D]` chunks written at
-  `prev_seq * words_per_step` with `b` folded into the stride, so the prefix
-  carries no chunk boundary to partition on.
-* `QuantK`'s **CPU** `codes` / `scales`, which are one flat append-only pair with
-  no per-append boundary recorded. The refusal is deliberately wider than the
-  defect — a single-append `b > 1` store would read correctly and is refused
-  anyway — because `b > 1` reaches no production path today and the boundaries
-  are not recoverable after the fact. Lifting it needs a recorded per-append
-  sequence length on the store.
+* The flat GPU buffers of the turbo, planar and affine stores (`QuantV`,
+  `QuantKTurbo3/4`, `QuantPlanarK/V`, `QuantK`). Their prefix records no
+  chunk boundary.
+* `QuantK`'s CPU `codes` / `scales`, one flat pair with no per-append
+  boundary. It refuses even a single-append `b > 1` store.
 
-All eight rotor/iso K and V codecs share one crate-internal planner,
-`truncate_plan` in `rmlx-kv-quant/src/storage/mod.rs`, plus a `BlockRows`
-implementation per block type, so the unit conversion and the split are defined
-once rather than re-derived per codec. Tests: `storage/truncate_plan_tests.rs`
-(planner + a payload-carrying fake block, including the `b > 1` refusal and the
-non-row-divisible refusal), and one store-level round trip per block type in
-`quant_rotor_k_tests.rs` (`RotorKBlocks`, QJL sideband on),
-`quant_rotor_v_tests.rs` (`RotorBlocks`) and `quant_iso_v_tests.rs`
-(`IsoBlocks`, quaternion sideband).
+The eight rotor and iso K and V stores share one planner, `truncate_plan` in
+`crates/rmlx-kv-quant/src/storage/mod.rs`, with one `BlockRows` implementation
+per block type. Tests: `storage/truncate_plan_tests.rs`, and one store-level
+round trip per block type in `quant_rotor_k_tests.rs`, `quant_rotor_v_tests.rs`
+and `quant_iso_v_tests.rs`.
 
-**Scope — every CPU-side store now cuts, and every one of them is loud.** The
-same planner drives the turbo, planar and affine stores. `TurboBlocks` and
-`PlanarBlocks` gained `BlockRows` implementations, `QuantV`, `QuantKTurbo3/4`,
-`QuantPlanarK` and `QuantPlanarV` gained `truncate_to`, and `QuantK` — whose CPU
-payload is one flat append-only `codes`/`scales` pair, not a block list — cuts
-that buffer to the leading `n` sequence positions. `KvStorage::truncate_to` no
-longer contains a bare `shape[2] = n` in any arm: `K8V4`, `K8V8`, `Planar`,
-`PlanarK`, `TurboSym3/4`, `K8VTurbo2/3`, `K8VTurbo3Tcq`, `K8VTurbo2Tcq`,
-`IsoV3/4`, `RotorV3/4` and both axes of `RotorKAsym3/4` all delegate to a
-store-level `truncate_to`, so a codec no longer truncates its two axes with
-different semantics.
+**Scope — every CPU-side store cuts, and every one of them is loud.** The same
+planner drives the turbo and planar blocks (`TurboBlocks`, `PlanarBlocks`).
+`QuantV`, `QuantKTurbo3/4`, `QuantPlanarK` and `QuantPlanarV` implement
+`truncate_to`. `QuantK` cuts its flat `codes` / `scales` pair to the first `n`
+positions. Every arm of `KvStorage::truncate_to` and `KvStorage::reset`
+delegates to the store's own `truncate_to` or `reset`. So no arm lowers
+`shape[2]` and leaves the payload in place.
 
-Before that, those stores' blocks **over**-covered `shape[2]` after a
-truncation, the next append stacked on top, and
-`QuantV::dequantize_choice`'s `out.resize(total, 0.0)` (and
-`QuantPlanarK::dequantize_choice` via `transpose_seq_heads`, which reads only the
-first `b * s * kv_h * d` elements) silently kept the **rejected** speculative
-tokens while discarding the correction — wrong attention, no error.
+Every CPU dequant path checks that its blocks decode to `prod(shape)`
+elements. On a mismatch in either direction it returns `"CPU blocks decode to
+N elems but shape [...] implies M — refusing to zero-pad / truncate"`. The
+stores refuse some cuts, and this check reports each one. They refuse a cut
+at `b > 1`, a block that is not a whole number of positions, and, for
+`QuantK`, a target inside a 128-element q8 group.
 
-Those silent fix-ups are gone. Every CPU dequant path now compares what its
-blocks decoded to against `prod(shape)` and returns
-`"CPU blocks decode to N elems but shape [...] implies M — refusing to zero-pad /
-truncate"` on any mismatch, in **both** directions. That was not optional: the
-planner deliberately refuses some cuts (`b > 1`, a block whose row count is not a
-whole number of sequence positions, and for `QuantK` a target landing inside a
-128-element q8 group, where one scale covers the whole group and the f32 source is
-gone), and each refusal leaves the store deliberately inconsistent. Without the
-check, a refusal on the turbo stores would have zero-padded and on the planar
-stores would have panicked with an out-of-range index inside
-`seq_layout::transpose_seq_heads`.
+`TurboBlocks` and `PlanarBlocks` carry no `n_tokens`. Their row count is the
+product of the first three axes of `original_shape` (`storage::block_rows`).
+The CPU append and the SSD hydrate write those axes in different orders, and
+the product is the same for both. A split writes `[1, 1, rows, width]`.
+`cpu_block_truncate_tests::quant_v_truncate_reads_rows_from_the_shape_product`
+pins it.
 
-**Where this is actually observable — the bf16 decode seed gates it.** Two
-independent things have to be true for the cut to change an answer, and getting
-only the first one right leads to the wrong conclusion.
+**When a cut changes an answer.** A Class 2 codec builds no packed store on a
+cache that went through a prefill bracket (§"Class 2"). Its decode reads the
+bf16 mirror, so a served request cannot tell a correct cut from a no-op. Its
+store is read only on a cache with no mirror: an SSD hydrate
+(`KvCache::from_storage` leaves `decode_fp16_k` at `None`), or a cache that
+never went through a prefill bracket. The device does not change this. The
+store-reading codecs also have their store read by the SSD spill
+(`write_quant_k` / `write_quant_v`) and the prompt-cache snapshot
+(`try_deep_clone`).
 
-*First*, the store's CPU payload has to be live rather than its flat GPU mirror.
-The GPU half needs no cut and gets none: its dequant slices `[0, shape[2])` and
-its next `append` writes at `prev_seq == shape[2]`, so lowering `shape[2]`
-already makes the rejected region overwritable.
+**Truncation is monotone-decreasing.** The turbo, planar and affine stores
+clamp the target to their own `shape[2]` (`storage::clamp_truncate_target`). A
+target past `shape[2]` is reachable. A store-backed codec that also keeps a
+bf16 mirror advances `KvCache::offset` on paths that the store does not
+follow. A `shape[2]` raised to meet the target would claim tokens that no
+payload holds.
 
-*Second — and this is the binding constraint — the codec store has to **exist and
-be read** after the truncate.* On a normal serve it does neither. `exit_prefill`
-materialises the bf16 `decode_fp16_{k,v}` seed for every quant whose
-`feeds_bf16_k_at_decode()` is true (`quant.rs`), which covers `K8V4`, `K8V8`,
-`Planar`, `Planar3`, `PlanarK`, `K8VTurbo2/3`, both TCQ variants and
-`TurboSym3/4` — i.e. every store this section is about. From then on each
-quantized `update_<codec>` early-returns into `update_decode_fp16` at its first
-line, so the store is not consulted at decode-read time; and because it is not,
-`exit_prefill` no longer builds it at all for those codecs
-(`KvQuant::materialises_packed_store()`, `docs/KV_CACHE.md` §9.6 F3). A plain
-GPU serve therefore **cannot distinguish a correct cut from a no-op cut** —
-there is nothing there to cut — including with `--kv-quant k8vturbo3`, whose
-forced-CPU `QuantV::append` sits below that same early return.
+The rotor and iso stores do not clamp. A ring-only tail lies below
+`shape[2]`, and the ring readback returns `Err` on an over-long target. So for
+`n > shape[2]` the mixed arms leave the two axes of one codec at different
+lengths. These are `IsoV3`, `IsoV4`, `RotorV3` and `RotorV4`, where the affine
+K clamps, and `RotorKAsym3/4`, where the affine V clamps. The guard on the
+unclamped side reports it at spill.
 
-So the live paths are the ones with **no** bf16 seed:
+**The `Mixed` arm truncates to its fill marker.** `MixedKvState` is a capacity
+buffer that grows in `STEP` increments, with `offset` as its fill marker.
+`truncate_to(n)` sets the marker to `n`, and the next append writes over the
+rows from `n`. The bf16 mirror of a shared-KV producer follows the same offset.
+For `n > offset` the state keeps its fill and emits an `error!` that names
+both numbers. `offset` is the coverage, so there is nothing to clamp down to.
+`kvcache/shared_source_tests.rs::mixed_truncate_to_keeps_the_prefix_it_was_told_to_keep`
+compares the cut cache with a cache prefilled to the kept length.
 
-- **A hydrated cache.** `KvCache::from_storage` leaves `decode_fp16_k: None`, so
-  the codec arm runs on every decode step — the store's blocks *are* the cache.
-  The hydrated prefix arrives as a single block, so any trim inside it is a
-  mid-block cut. This is the path the round-trip tests in
-  `rmlx-kv-ssd/src/hydrate_tests.rs` drive.
-- **Any cache that never bracketed a prefill**, and so never reached
-  `exit_prefill` to be seeded.
+Tests: `storage/cpu_block_truncate_tests.rs` covers the partial-accept round
+trip per store, the `b > 1` and q8-group refusals, the zero, exact and
+past-the-end targets, `KvStorage::reset`, and the `KvStorage::truncate_to`
+dispatch. Each oracle is a reference store built from the kept tokens only.
+`crates/rmlx-kv-ssd/src/hydrate_truncate_tests.rs` truncates a hydrated cache
+inside a block, appends a correction and checks the decoded V.
 
-The device is not one of them. The `exit_prefill` gate has no device arm and
-neither do the `feeds_bf16_*` predicates, so a `Device::Cpu` run that brackets a
-prefill lands on the same mirrors and the same absent store as a GPU one — which
-is what the CPU-device sweep in
-`warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`
-asserts over every codec.
-
-The store is also still read *without* a decode step in two places, and they
-matter for the codecs that still have one — the K-only and fused-symmetric
-families, `Mixed` / `RotK`, and any hydrated store-backed cache: the
-SSD spill (`write_quant_k` / `write_quant_v` serialise `blocks` and report
-`shape[2]`) and the prompt-cache snapshot (`try_deep_clone`). An uncut store
-spills a header claiming more tokens than its bytes hold, which is how the defect
-propagates from a serve into the hydrated cache that later reads it. For the
-bf16-mirror family that route is closed at the source: there is no store on the
-seeded path to spill.
-
-An earlier revision of this section named `--kv-quant k8vturbo3` on a plain serve
-as the cheapest observable cell. That was wrong for the reason above — device
-routing is not the same question as whether the store is read — and is corrected
-here rather than left for a reader to re-derive.
-
-`TurboBlocks` and `PlanarBlocks` carry no `n_tokens`, so their row count comes
-from `original_shape` — and that field's axis order is **not** consistent across
-producers: the CPU append paths record the sequence-major chunk shape
-`[B, S_block, kv_h, D]` while the SSD hydrate paths record the store's head-major
-`[B, kv_h, S, D]` over the same sequence-major bytes. Only the product is ever
-read back (`turbo_dequantize` / `planar_dequantize` use it purely as an element
-count), so `storage::block_rows` multiplies the leading three axes rather than
-naming one, and a split records the geometry it actually produced —
-`[1, 1, rows, width]` — instead of guessing which axis the caller meant. Pinned
-by `cpu_block_truncate_tests::quant_v_truncate_reads_rows_from_the_shape_product`.
-
-**Truncation is monotone-decreasing.** All six clamp the target to the store's
-current `shape[2]` (`storage::clamp_truncate_target`). `n > shape[2]` is
-reachable, not hypothetical: a store-backed cache whose codec also keeps a bf16
-mirror (`Mixed` and the K-only families) advances `KvCache::offset` on paths the
-store does not follow, so a speculative rollback into the decode window arrives
-with a target past the store's own fill. Raising `shape[2]` to meet it invents coverage no payload
-backs — the dequant reads past the blocks and the SSD spill persists a header
-claiming more tokens than its bytes hold.
-
-The rotor / iso stores deliberately do **not** clamp, and the reason is that they
-do not need to, not that clamping would cost them anything: a ring-only tail
-spans `[blocks_coverage, shape[2])`, strictly below `shape[2]`, so a
-`min(n, shape[2])` could never discard it. What makes the asymmetry safe is that
-those stores already abort loudly on an over-long target —
-`synced_rotor_v_blocks` / `synced_iso_v_blocks` size their ring readback from
-`shape[2]` and return `Err` when the ring cannot cover it. These six have no ring
-and no such guard, so the clamp is the only reading that keeps
-`shape[2] == payload coverage` true.
-
-One consequence, named rather than hidden: for `n > shape[2]` the mixed arms now
-leave the two axes of one codec at different lengths — `IsoV3`, `IsoV4`,
-`RotorV3`, `RotorV4` (affine K clamps, codec V does not) and `RotorKAsym3/4`
-(rotor K does not, affine V does). It surfaces on spill, where the layer geometry
-comes from the K shape while the V payload is written raw; the reconciliation
-guard on the unclamped side is what reports it.
-
-`KvStorage::reset` carried the same defect one screen above `truncate_to` — a
-bare `shape[2] = 0` on exactly these six store types, leaving the payload
-covering the sequence just discarded. Every arm now delegates to the store's own
-`truncate_to(0)` / `reset()`; the GPU buffers are still kept for reuse.
-
-**The `Mixed` arm truncates, it no longer resets.** `Mixed` was the one storage
-whose `truncate_to` arm answered by dropping the whole quant state
-(`state.reset()`), on the reading that mlx-lm-tq's `is_trimmable` returns
-`False` for it. That is not the same contract: `KvCache::truncate_to` goes on to
-set `self.offset = n`, so the cache reported `n` positions and held none. The
-store does not need the reset — it is a capacity buffer that grows in `STEP`
-increments, with `MixedKvState::offset` as the fill marker
-(`update_and_fetch` writes the new rows at `[offset .. offset + seq)` via
-`write_at` and hands back `slice_seq_to(offset)`), so rolling the marker back to
-`n` **is** the truncation: rows `[n..]` become dead capacity the next append
-overwrites. The bf16 K/V mirror a shared-KV producer keeps
-(`decode_fp16_{k,v}`) is capacity-allocated against the same offset and follows
-for free.
-
-The reset surfaced two ways, and only one of them was loud. A multi-token
-forward — a speculative verify block — attends `seq` keys against a mask the
-caller sized from the reported offset, which is the opaque
-`add: [broadcast_shapes] Shapes (1,kv,rep,seq,seq) and (1,1,seq,n+seq) cannot be
-broadcast` that Gemma4-assistant MTP hit under `--kv-quant mixed_k8g64_v4g64` on
-its first partial-accept round. A single-token decode needs no mask, so it
-silently attended the current token alone with no error anywhere. Pinned by
-`kvcache/shared_source_tests.rs::mixed_truncate_to_keeps_the_prefix_it_was_told_to_keep`,
-which asserts through the store (an additive mask sized to the kept prefix) and
-not through the surfaced share — the bf16 mirror is rebuilt from
-`KvCache::offset` and spans the kept prefix either way, so an assertion on it
-cannot tell the two behaviours apart. Its oracle is a second cache prefilled to
-exactly the kept length and never over-filled: the two must decode the next token
-to the same output. Every prefix row carries a distinct position-dependent value,
-so a store that kept the right *number* of rows with the wrong contents fails it
-too — with a constant fill the same defect moves the output by 2.4e-7, at the
-f32 noise floor, against 9.7e-4 with the ramp.
-
-**And an over-long target is loud.** `n > offset` is the same defect in the other
-direction and this store cannot absorb it: `offset` *is* the coverage, so unlike
-the turbo / planar / affine stores there is no larger `shape[2]` to clamp down to.
-`KvCache::truncate_to` sets `offset = n` regardless of what the store did, and its
-`debug_assert` is compiled out of `release-perf`, so accepting it quietly would
-leave the cache reporting positions no payload backs. `MixedKvState::truncate_to`
-keeps its fill and emits an `error!` naming both numbers — loud like the rotor /
-iso stores, but at the truncate rather than at the next read, because nothing
-downstream of it would notice.
-
-Tests: `storage/cpu_block_truncate_tests.rs` — the partial-accept round trip per
-store (`QuantV`, `QuantKTurbo3`, `QuantKTurbo4`, `QuantPlanarK`, `QuantPlanarV`,
-`QuantK`) at `kv_h` 1 and 3; the `b > 1` and q8-group refusals; the zero,
-exact-length and past-the-end targets; `KvStorage::reset`; and a five-arm
-`KvStorage::truncate_to` dispatch case (`K8V4`,
-`TurboSym3`, `TurboSym4`, `Planar`, `PlanarK`) that decodes both axes and
-compares against reference stores.
-
-Enum-arm coverage is **partial and stated as such**. Those five arms cover all
-six *store types*, so a regression in any store's `truncate_to` is caught — but
-ten arms are unpinned because nothing in the workspace drives
-`KvStorage::truncate_to` on them: `K8V8`, `K8VTurbo2`, `K8VTurbo3Tcq`,
-`K8VTurbo2Tcq`, the K axis of `IsoV3` / `IsoV4` / `RotorV3` / `RotorV4`, and the
-V axis of `RotorKAsym3` / `RotorKAsym4`. `reset` is thinner still: only its
-`K8V4` arm is pinned, out of 28 (one per `KvStorage` variant). Reverting any of the rest to a bare `shape[2] = n` leaves
-the suite green; catching that is review's job, not the suite's.
-
-Every oracle is a reference store
-built from only the retained tokens, sharing no arithmetic with the truncation
-logic — deliberately not a recomputation of the cut via `block_rows`, which
-would pass any mutation scaling the cut and the reading together.
-
-End-to-end on the live path: `rmlx-kv-ssd/src/hydrate_tests.rs` spills a
-256-token cache, hydrates it, truncates to 200 (mid-block), appends a 2-token
-correction and checks the decoded V — for `K8VTurbo3` and `Planar`, at `kv_h` 1
-and 2. It asserts as a **premise** that the hydrated cache carries no bf16 decode
-seed, so it cannot pass vacuously on the frozen-store path. The retained prefix
-is compared against a decode of the same store taken before the cut; the
-correction against its own raw f32 source.
-
-**Real-serve reachability audit (per #284).** `KvCache::truncate_to` has three
-production callers: prompt-cache partial-prefix trim
-(`PromptCacheEntry::truncate_kv_to`), SWA context handling, and
-speculative-decode partial-accept rollback (MTP / DFlash / Eagle3 / the
-gemma4-assistant self-speculative path). Whether any of them can reach a
-`kv_h > 1` rotor/iso store depends on the arch:
-- **Bonsai (`Qwen3ForCausalLM`, `kv_h = 8`)** — **reachable.** Its prompt-cache
-  `ReusePolicy` is `ExactOnly`, so the partial-prefix trim never fires, but the
-  speculative path does. Two reasons, both arch-generic:
-  1. `SpeculativeGenerator::from_snapshots_with_id` takes the `two_model`
-     branch — `SpeculativeDispatcher::load_speculative` — for any
-     `--draft-model` whose `config.json` declares a registered architecture
-     (`docs/SPECULATIVE.md` § "Which drafter a snapshot is"), so a bare
-     `--draft-model <full model>` or a `profiles.toml` `draft_model` reaches
-     it. That branch calls plain `load_model` on both sides and
-     `spec_generate_greedy_cached` builds caches from `num_hidden_layers()`
-     with **no arch check**, rolling back through `KvCache::truncate_to`.
-  2. No drafter gates the **verifier** arch at all. The
-     `"Qwen3_5MoeForConditionalGeneration"` strings in `speculative/mtp.rs` and
-     `speculative/dflash/mod.rs` are error-message text, not architecture
-     guards. The KV-quant fallback those sites take when `kv_quant_override`
-     is `None` is `DEFAULT_KV_QUANT`, which consults no arch at all.
-- **Gemma4 (e.g. e4b, `kv_h = 2`)** — reachable twice over: its
-  `ReusePolicy::Partial` performs the trim on a real partial-prefix cache hit,
-  and gemma4-assistant self-speculative decode also rolls back via
-  `truncate_to`.
-
-The fix is proven at the codec level (all eight `*_tests.rs` files, `kv_h`
-values 1 and 4) and at the full `KvCache::update` / `KvCache::truncate_to`
-dispatch level (`kv_cache_truncate_iso3_kv_h_gt_1_path` in
-`rmlx-models/src/kv_cache/tests.rs`, `kv_h = 4`) rather than via a live HTTP
-trigger. `truncate_plan` reads `shape[1]` directly with no per-arch or
-hardcoded head-count branch, so `kv_h = 4` and Bonsai's real `kv_h = 8`
-exercise the identical code path — no arch-specific behavior exists to miss.
-
-The mid-block split has a **wider** reachability than the unit-conversion bug it
-sits next to: it fires at `kv_h == 1` too, since a cut inside a block is about
-block boundaries, not head counts. Any rotor or iso codec with speculative
-decoding on reaches it on the first partial accept — including the Bonsai cell
-above, where a `--kv-quant rotor3_sym` verifier takes the `Skip`-feed legacy
-append (no ring to rebuild from) on every `q_seq > 1` verifier forward.
-
-The forbidden state is `blocks` short of `shape[2]` with **no** ring to supply
-the tail: `dequant()` would zero-pad the gap (silently wrong attention) and an
-SSD spill would persist a truncated store. That state is rejected **loudly**
-(an `Error`, never a `debug_assert` — those compile out under `release-perf`):
-`synced_rotor_k_blocks` at the codec and `ensure_rotor_k_blocks_cover_shape` at
-the SSD serialization boundary both refuse it rather than fabricate zeros.
-
-**`b > 1` skips.** The ring's per-step stride is `kv_h * n_groups` and does not
-interleave batch, so a batched chunk cannot be laid into it (the encode carries
-`b` × the span). A `MaintainRingOnly` feed with `b > 1` therefore falls back to
-the block path (which handles `b > 1` correctly and keeps the CPU blocks the
-source of truth) — it must not error, since a batched rotor cache worked before
-this kernel existed. Per request the batch dim is fixed, so a `b > 1` cache
-never builds a ring-only tail to lose. Both the append (`rotor{3,4}_sync_ring`)
-and the dispatcher (`rotor_flash_shape_ok`) gate on it.
+In production, `KvCache::truncate_to` is called by the prompt-cache prefix
+trim (`PromptCacheEntry::truncate_kv_to`) and by the speculative
+partial-accept rollback. `truncate_plan` has no arch or head-count branch.
+`kv_cache_truncate_iso3_kv_h_gt_1_path` (`rmlx-models/src/kv_cache/tests.rs`)
+drives the full `KvCache` dispatch at `kv_h = 4`.
 
 ### Arch reachability
 
-Keyed off codec + shape (`head_dim`, `kv_heads`, `bits`), never an arch name —
-so any arch that routes a rotor K-only cache through `KvCache::update_and_sdpa`
-reaches it.
-
-| Arch | Routing | Reachable? | Why |
-|---|---|---|---|
-| Bonsai (`Qwen3ForCausalLM`) | `update_and_sdpa` | **YES** | head_dim 128. Measured 78 dispatches / 8 tokens. |
-| medgemma (`Gemma3ForConditionalGeneration`) | `update_and_sdpa` | **YES** | head_dim 256, no cross-layer KV share. Measured 28 dispatches / 8 tokens. |
-| Qwen2 / Laguna / bitnet / Qwen3-VL-MoE | `update_and_sdpa` | **YES** (by shape) | Same entry point; subject to the shape gates. |
-| Any arch with cross-layer KV sharing (e.g. `Gemma4ForConditionalGeneration`) | `update_and_sdpa_shared_source` (cross-layer KV share) | **YES** | The producer runs the same fused arm a non-sharing model runs and reports `SharedKv::Store`; each consumer layer re-enters the same kernel over that store via `KvCache::sdpa_shared`. No bf16 K is materialised. Previously this path had no fused arm at all and every shared-KV model fell back to the O(seq) CPU dequant. |
-| Qwen3.6 (`Qwen3_5MoeForConditionalGeneration`) | rejected at `cache_type::validate_resolved` | NO | Contract A.y — sub-4-bit K on Qwen MoE is a PPL disaster; the cache is never built. |
-
-### Performance posture
-
-4k prompt, `release-perf`, `--rotor-qjl off`, decode TPS (median of 3+ runs).
-"Before" is the same binary minus this change, so the delta is the kernel alone
-(the QJL flag is held constant across the pair).
-
-| Model | Codec | Before | After | Gain |
-|---|---|---|---|---|
-| Bonsai-8B (Qwen3, D=128) | `k_rotor3` | 1.34 | **17.0** | 12.7× |
-| Bonsai-8B | `k_rotor4` | 1.36 | **15.9** | 11.7× |
-| medgemma-4B (Gemma3, D=256) | `k_rotor3` | 7.37 | **51.8** | 7.0× |
-| medgemma-4B | `k_rotor4` | 7.34 | **52.1** | 7.1× |
-
-Against the `--rotor-qjl on` baseline — which was the default when these cells
-were taken and is now opt-in — the same cells move 0.66 → 17.0 (Bonsai, 26×)
-and 2.35 → 51.8 (medgemma, 22×).
-
-Bonsai is a noisy measurement target at this prompt size (k_rotor4 spans
-14.0–17.1 across 5 runs); medgemma is stable to ~±3%. Treat a single Bonsai run
-as indicative only.
-
-The QJL-on path is unchanged (medgemma `k_rotor3`: 2.37–2.40 before,
-2.34–2.36 after — the kernel is dormant and adds no work), as is Gemma4, where
-the kernel does not fire.
-
-This makes the K-only rotor family **usable** rather than fast: it is still
-below `none` (Bonsai bf16 ≈ 110 TPS). The rotor sandwich is ~64 FMAs per group
-per lane and each of a group's 3 lanes redoes it, so the inner loop is
-compute-bound, not KV-bandwidth-bound. Narrowing that gap (sparse geometric
-product, one decode per group instead of per lane) is future work.
+The gate keys off codec and shape, never an arch name. Any arch that calls
+`KvCache::update_and_sdpa` or `update_and_sdpa_shared_source` reaches the
+kernel. On a shared-KV arch the producer layer runs the kernel and reports
+`SharedKv::Store`. Each consumer layer runs the same kernel over that store
+through `KvCache::sdpa_shared`. Sliding-window layers stay bf16 (see Gate).
+On a Qwen MoE arch, `validate_resolved` rejects every rotor and iso codec that
+quantizes K (`QwenMoeRotorKRejected`, `QwenMoeIsoKRejected`), so no such cache
+is built.
 
 ---
 
 ## `rotor_flash_decode_symv` — fused flash-decode over rotor-quant K **and** V
 
-The all-quant sibling of `rotor_flash_decode`, for `KvStorage::RotorSym3` /
-`RotorSym4`. It reads **both** axes straight from their packed rotor rings —
-there is no bf16 K or V mirror at all — so the symmetric rotor codecs finally
-carry only their advertised ~3-bits-per-axis cost.
-
-**What it replaced.** `Rotor{3,4}Sym` quantized both axes at `exit_prefill` and
-then decoded from a full bf16 K+V mirror (`decode_fp16_k` / `decode_fp16_v`),
-which `update_rotor{3,4}_sym` short-circuited to on its first line: the packed
-store was written and never read. The codec was dormant, and a codec advertising
-~3 bits/axis actually carried bf16 K + bf16 V *plus* its codes — i.e. **more**
-resident KV than plain bf16. Dropping the mirror turns the advertised
-compression into a real resident-byte win (measured ≈ −34% resident KV: Bonsai-8B
-590.0 → 390.8 MB, gemma-4-e2b 36.1 → 23.5 MB on a 1838-token prompt).
+This is the decode kernel for `rotor3_sym` and `rotor4_sym`
+(`KvStorage::RotorSym3` / `RotorSym4`). It reads both axes from their packed
+rotor rings and keeps no bf16 K or V mirror. `feeds_bf16_k_at_decode` and
+`feeds_bf16_v_at_decode` are both false for these variants. So `exit_prefill`
+builds neither mirror, and the resident-byte estimate reads the same two
+predicates.
 
 ### Reuse of the K-decode half
 
-The header ([`build_rotor_flash_header`], shared verbatim with the bf16-V
-sibling) emits the Cl(3,0) block decode as the MSL function `rf_decode_k_group`.
-This kernel calls it **twice per token** — once over the K ring, once over the
-V ring — because the rotor codec is axis-agnostic (`rotor{3,4}_encode` (V) and
-`rotor{3,4}_k_encode` (K) are the same function; the K fork only adds the
-optional QJL sideband, and the dispatcher fires only with QJL off). Both axes
-share one bit width by construction, so a single `RF_BITS` covers the K and the
-V unpack, and both probe against the existing header snapshots. Following the
-one-decode-per-group shell, each block's leader stages its group's grade-1 lanes
-into threadgroup memory (separate `k_shared` / `v_shared`) so the ~64-FMA
-sandwich runs once per Cl(3,0) block per axis rather than once per lane.
+The kernel uses the header of `rotor_flash_decode`
+(`build_rotor_flash_header`). The body calls `rf_decode_k_group` twice per
+token, once on the K ring and once on the V ring. It stages each axis in its
+own threadgroup array (`k_shared`, `v_shared`). The two rings share one
+encoder (`rotor_gpu_encode_arrays`) and one bit width, so one `RF_BITS` serves
+both.
 
 ### Files
 
-* `crates/rmlx-kv-quant/src/rotor_flash_decode_symv_msl.rs` — dispatcher +
-  counters; reuses the sibling's header builder.
+* `crates/rmlx-kv-quant/src/rotor_flash_decode_symv_msl.rs` — dispatcher and
+  counters.
 * `crates/rmlx-kv-quant/src/metal/rotor_flash_decode_symv_p1.metal` — pass-1
-  body (one body for both bit widths). Pass-2 is the shared LSE merge.
-* `crates/rmlx-kv-quant/src/storage/quant_rotor_v.rs` — the V store gains
-  the same `QuantKGpuRing` the K stores carry, fed via `RingFeed::Maintain` from
-  the symmetric append.
-* `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_rotor_sym_fused` —
-  dispatch site (main + shared-KV producer + consumer paths).
+  body for both widths. Pass 2 is the shared merge.
+* `crates/rmlx-kv-quant/src/storage/quant_rotor_v.rs` — the V store, with its
+  own `QuantKGpuRing`. The fused entry feeds both rings with
+  `RingFeed::MaintainRingOnly`.
+* `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_rotor_sym_fused`
+  — dispatch site for the plain path and the shared-KV producer and consumer
+  paths.
 
 ### Gate
 
-Same shape as the K-only path: device is GPU, storage is `RotorSym{3,4}`, the
-store does **not** carry QJL, `q_seq == 1`, `b == 1`, `head_dim` a power of two
-`<= 512`. A QJL-carrying store keeps the CPU dequant path on both axes (the QJL
-residual is not reproducible in the flash inner loop). `feeds_bf16_k_at_decode`
-**and** `feeds_bf16_v_at_decode` are both false for these variants, so
-`exit_prefill` allocates neither seed and the resident-byte estimate reads the
-same two predicates — it cannot drift from what is materialised.
+The gate is the `rotor_flash_decode` gate, with `RotorSym3` or `RotorSym4` as
+the storage. A store with QJL keeps the CPU dequant path on both axes.
 
-### Speed vs. the mirror (honest)
+No flash-decode dispatcher calls `Array::eval()` on its inputs. Such a call
+blocks the host on the GPU once per layer per decode step.
+`make check-no-kernel-input-eval` fails the build on one.
 
-Dropping the mirror is **neither** a memory win nor a decode-speed win. It is
-not a memory win because the mirror is not what the decode reads (see
-"Memory truth" above — the store is 8.75 bits/value for rotor3 and 7.125 for
-iso3, and dropping the mirror moves neither), so there is no bandwidth prize to
-collect at the decode. It is
-not a speed win because the two-pass flash-decode shell — a per-token
-threadgroup barrier pair with a thread-0-only softmax section, one threadgroup
-per *query* head (so `heads_per_kv` threadgroups re-read the same KV stream),
-and an f32 `partial_o` round trip between P1 and P2 — costs more per token than
-MLX's bf16 flash attention over the same bytes.
+### The `norms` device floor
 
-What is **no longer** part of that gap: until the dispatchers were made lazy,
-every one of these kernels forced `Array::eval()` on its inputs immediately
-before dispatch, which blocked the host on the GPU once per attention layer per
-decode step. That alone was worth 1.2–2.9× decode across iso and rotor, K-only
-and `_sym`, on both `kv_h = 8` and `kv_h = 1` architectures — the `_sym` pair at
-a 4k prompt on Ternary-Bonsai-8B went 19.1 → 55.1 TPS with an unchanged token
-digest.
+This kernel and `iso_flash_decode_symv` bind a per-token `norms` array. MLX's
+custom-kernel builder can bind a small input in the `constant` address space.
+The shared decode helpers declare `norms` in the `device` address space, and
+that mismatch fails the MSL compile at the first dispatch. So both
+dispatchers call `flash_decode_common::pad_norms_to_device_floor`. It
+zero-pads `norms` to `NORMS_DEVICE_MIN` (16) elements when
+`b * kv_h * kv_seq` is below it. The kernel loop stops at the real `kv_seq`,
+so no pad element is read. On the pinned MLX the compile does not fail without
+the pad. The pad stays as a guard against another MLX build.
 
-**What that invalidates, and what it does not.** The eval was a *fixed* cost per
-decode step — one host↔GPU round trip per attention layer, the same count
-whatever the KV length. It therefore moves the **intercept** of per-step decode
-time and leaves the **slope** alone. Fitting `ms/step = a + b × (KV tokens/1000)`
-across the binary pair: `a` 41.14 → **7.01 ms/step (−83%)**, `b` 2.437 → **2.449
-ms/1k KV tokens (+0.5%)** — ≈34 ms/step recovered, which over the layer count is
-≈0.16 ms per eval, a textbook round trip.
-
-So: every **absolute decode-TPS** cell for these codecs recorded before this
-change measures the dispatcher and must be re-recorded — including the tables in
-`docs/models/bonsai/8B/rMLX.md` §2 and issue #292. **Marginal-cost figures
-(ms/1k KV tokens) survive**: a slope cancels a fixed per-step cost by
-construction, so a published ms/1k table is still valid and should not be
-discarded. `make check-no-kernel-input-eval` keeps the defect from coming back.
-
-So these codecs remain opt-in (`--kv-quant rotor3_sym` / `rotor4_sym`, and the
-iso pair), and remain research codecs for quality experiments and kernel work —
-not memory or throughput candidates. Closing the remaining speed gap needs a
-flash-decode shell that stops re-reading KV once per query head, drops the f32
-P1→P2 partial round trip, and stops serialising the online softmax on one lane;
-closing the memory gap needs a repacked store, which is a redesign, not a kernel
-change. Neither alone is enough — see "Fused flash-decode over a quant store —
-the break-even condition" above for the measured `ρ < ε` arithmetic and why the
-shell, not the store, is the binding constraint.
-
-### Short-prompt abort at `kv_h == 1` — small-`norms`-buffer device floor
-
-Both symv kernels — this one and `iso_flash_decode_symv` below — bind a
-per-token `norms` array as a kernel input. MLX's custom-kernel builder binds
-a small input array's outer-kernel parameter in the **`constant`** address
-space instead of `device` (an internal size heuristic — see
-`docs/FFI.md` § "MSL source conventions"), but the shared decode helpers each
-kernel calls (`if_decode_k_lane` for iso, `rf_decode_k_group` for rotor)
-declare their `norms` parameter `device const float*` — an address-space
-mismatch that fails the MSL compile at first dispatch
-(`cannot pass pointer to address space 'constant' as a pointer to address
-space 'device'`). Measured trip point: `b * kv_h * kv_seq < 8` aborts, `>= 8`
-does not, for every `head_dim`.
-
-This is reachable on a **normal short chat prompt** against a single-KV-head
-model — Gemma4 global layers are `kv_h == 1`, so a 2-token prompt reaches
-`kv_seq == 2` on the very first decode step, well below the trip point.
-
-**Fix (general, both codecs).**
-`rmlx_kv_quant::flash_decode_common::pad_norms_to_device_floor` zero-pads the
-flat `norms` array up to `NORMS_DEVICE_MIN` (16, a 2× margin over the
-measured 8-element trip point) before dispatch whenever
-`b * kv_h * kv_seq` is below it. Both kernels' per-tile decode loop is
-bounded by the real `kv_seq` carried in their `dims` buffer, not by the
-`norms` buffer's allocated length, so the padding is allocated but never
-read — correctness is unaffected. `iso_flash_decode_symv_sdpa` and
-`rotor_flash_decode_symv_sdpa` both call this one shared helper; there is no
-per-codec copy. This keeps both fused kernels on the GPU at **every**
-`kv_seq >= 1` with **no CPU dequant fallback** (hard rule 10) — an earlier,
-superseded version of this fix routed small-`kv_seq` steps to a CPU dequant
-SDPA (`RING_NORMS_DEVICE_MIN` gate + `iso_sym_cpu_sdpa_fallback`); that gate
-and fallback function are gone, replaced by the padding above.
-
-Regression coverage (hard rule 6): `iso_sym_short_kv_seq_kv_h1_stays_on_gpu`
-and the continuity tests `iso_sym_transition_across_ring_norms_floor` /
-`rotor_sym_transition_across_ring_norms_floor` in
-`crates/rmlx-kv-ssd/src/block_io_tests.rs` drive `kv_h == 1` decode across
-and through the padding floor, on both codecs, checked against an
-**independent** `KvStorage::None` (bf16/f32) reference cache fed the
-identical per-step tokens — not a scalar reference rebuilt from the same
-ring the kernel just read, which a ring corruption both reads see
-identically would pass silently. Mutation: disabling
-`pad_norms_to_device_floor` reproduces the `kv_seq == 2` abort on both
-codecs (`if_decode_k_lane` / `rf_decode_k_group`, `constant` vs `device`).
+`iso_sym_short_kv_seq_kv_h1_stays_on_gpu`,
+`iso_sym_transition_across_ring_norms_floor` and
+`rotor_sym_transition_across_ring_norms_floor`
+(`crates/rmlx-kv-ssd/src/block_io_tests.rs`) decode at `kv_h == 1` across the
+floor. They compare the result with a `KvStorage::None` cache fed the same
+tokens.
 
 ---
 
 ## `iso_flash_decode` — fused MSL flash-decode over iso-quant K
 
-Sibling of `rotor_flash_decode` for `KvStorage::IsoKOnly3` / `IsoKOnly4`: QK over
-the packed iso K store + online softmax + bf16-V SV, in two Metal dispatches per
-decode step. Same two-pass shell, same shared
-`metal/flash_decode_merge_p2.metal`; only the K-decode differs.
-
-**What it replaced.** `update_iso_k_only` called `QuantIsoK::dequant()`
-on every decode step — a full-prefix **CPU** iso decode into a `Vec<f32>` plus a
-re-upload. That is O(seq) host work per token with the GPU idle, and it is what
-pinned the K-only iso family in the "Tier 3 — CPU-bound" bucket. The store is now
-GPU-resident (`storage::QuantKGpuRing`, shared with rotor) and the kernel reads
-it directly.
+This is the decode kernel for `k_iso3` and `k_iso4`
+(`KvStorage::IsoKOnly3` / `IsoKOnly4`). It has the same two-pass shell as
+`rotor_flash_decode` and uses the shared merge. Only the K decode is
+different.
 
 ### Files
 
-* `crates/rmlx-kv-quant/src/iso_flash_decode_msl.rs` — Rust dispatcher, header
-  builder, dispatch counters, `assert_fixed_quat_blocks`.
-* `crates/rmlx-kv-quant/src/metal/iso_flash_decode_p1.metal` — pass-1 body (one
-  body for **both** bit widths).
-* `crates/rmlx-kv-quant/src/metal/flash_decode_merge_p2.metal` — codec-agnostic
-  pass-2 log-sum-exp merge, shared with `rotor_flash_decode` / `planar_flash_decode`.
+* `crates/rmlx-kv-quant/src/iso_flash_decode_msl.rs` — Rust dispatcher,
+  header builder, dispatch counters.
+* `crates/rmlx-kv-quant/src/metal/iso_flash_decode_p1.metal` — pass-1 body for
+  both bit widths.
+* `crates/rmlx-kv-quant/src/metal/flash_decode_merge_p2.metal` — the shared
+  pass-2 merge.
 * `crates/rmlx-kv-quant/src/storage/quant_iso_k.rs` — the iso K store
-  (`QuantIsoK<BITS>`), embedding a `QuantKGpuRing`.
+  (`QuantIsoK<BITS>`), with a `QuantKGpuRing`.
 * `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_iso_k_fused` —
-  dispatch site (plus `try_dispatch_shared_store` / `sdpa_shared` for shared-KV
-  models).
+  dispatch site. `try_dispatch_shared_store` and `sdpa_shared` serve
+  shared-KV models.
 
 ### Decode: one left Hamilton product, not a sandwich
 
-The iso codec encodes `r = q * v_unit` with the single fixed golden-ratio unit
-quaternion `FIXED_QUAT`, so the decode is `q̄ * r` — **one** left Hamilton
-product. Do not carry the rotor codec's `R̃ * mv * R` sandwich across; they are
-different algebras. This is also why iso's inner loop is much cheaper than
-rotor's: ~16 FMAs per group, not ~64.
+The iso codec encodes `r = q * v_unit` with one fixed golden-ratio unit
+quaternion, `FIXED_QUAT`. So the decode is `q̄ * r`, one left Hamilton
+product. The rotor codec's `R̃ * mv * R` sandwich is a different algebra. Do
+not carry it across.
 
-The decode is **self-contained per lane** — a group's four codes all live in one
-u32, so `if_decode_k_lane` unpacks them and runs the Hamilton product in
-registers with no threadgroup staging and no barrier — a barrier per token
-inside a flash inner loop would serialise the tile.
+`if_decode_k_lane` decodes one lane. It reads the four codes of the lane's
+group from the row's dense code plane and computes the product in registers.
+It uses no threadgroup memory and no barrier.
 
 ### Fixed quaternion is baked into the header
 
-`iso_encode_fast` writes the one `FIXED_QUAT` constant into every slot of its
-per-group `quaternions` array, so the kernel bakes `q̄` in and the ring does not
-carry the quaternion table at all — storing `n_tokens * n_groups * 4` copies of
-one constant would be pure bandwidth.
-
-That is a real coupling, not an assumption. If the encoder ever emits per-group
-quaternions (its own docs float that as future work) this kernel would be
-silently wrong rather than merely stale, so `assert_fixed_quat_blocks` rejects a
-store whose quaternions are not `FIXED_QUAT`.
+The iso encoder uses `FIXED_QUAT` for every group. The header bakes `q̄` in,
+and the ring carries no quaternion table. A store with per-group quaternions
+would decode wrongly through this kernel. `assert_fixed_quat_blocks` checks a
+quaternion table against `FIXED_QUAT`, but no dispatch path calls it.
 
 ### Bit width is a header parameter
 
-`bits ∈ {3, 4}` arrives via the header (`IF_BITS` / `IF_MASK`) alongside the
-matching Lloyd-Max codebook, so one `.metal` body serves both variants. Both
-widths pack one group of 4 into a single u32
-(`words_per_group = ceil(4 / (32 / BITS)) = 1`); element `e` sits at
-`[e*BITS, e*BITS + BITS)`. Selection is explicit; any other `bits` is an `Err`,
-never a silent fallback to the wrong unpack width.
+The header carries `bits ∈ {3, 4}` as `IF_BITS` / `IF_MASK`, with the matching
+Lloyd-Max codebook. So one `.metal` body serves both widths. Any other width
+is an `Err`.
 
 ### Reusable K-decode half
 
-The per-lane iso decode is emitted into the **header** as the MSL function
-`if_decode_k_lane(codes, scales, norms, tok_idx, n_groups, lane)` rather than
-inlined into the body. A quantized-V flash kernel (the `iso*_sym` follow-up)
-needs the identical decode against the V store's `(codes, scales, norms)` triple
-and can call it unchanged.
+`if_decode_k_lane` is a header function, so another kernel body can call it.
+`iso_flash_decode_symv` calls it on the K ring and on the V ring.
 
 ### Gate
 
-No env var and no CLI flag: the path is on whenever it is applicable. Gates, in
-order — device is GPU, storage is an iso K-only variant, `q_seq == 1`, `b == 1`,
-`head_dim` is a power of two, a multiple of the quaternion block size (4), and
-`<= ISO_FLASH_HEAD_DIM_MAX` (512). Any miss falls through to the legacy CPU
-dequant path.
+There is no flag and no environment variable. The kernel runs when all of
+these conditions are true. Otherwise the step takes the CPU dequant path.
 
-**No QJL analogue.** The 1-bit QJL residual is rotor-only, so unlike
-`k_rotor*` — which needs `--rotor-qjl off` to reach its kernel at all — `k_iso3`
-/ `k_iso4` reach this kernel at **stock defaults**.
+- The cache is not a sliding-window ring.
+- The device is GPU.
+- The storage is `IsoKOnly3` or `IsoKOnly4`.
+- `q_seq == 1`.
+- `b == 1`.
+- `head_dim` is a power of two, a multiple of 4, and at most
+  `ISO_FLASH_HEAD_DIM_MAX` (512).
+
+The iso codecs have no QJL residual. So `k_iso3` and `k_iso4` reach the kernel
+at the default flags.
 
 ### Storage applicability
 
 | Variant | Eligible? | Notes |
 |---|---|---|
-| `KvStorage::IsoKOnly3` / `IsoKOnly4`, `b == 1` | **YES** | GPU ring + `iso_flash_decode_sdpa`. |
-| `KvStorage::IsoKOnly{3,4}`, `b > 1` | NO | Ring stride does not interleave batch. |
-| `Iso{3,4}Sym` | NO (this kernel) | Both axes are iso-quantized; they decode through the all-quant sibling `iso_flash_decode_symv` instead, which reads V from its own packed ring rather than a bf16 mirror (ring-as-sole-store). Shares the per-lane K-decode half (`if_decode_k_lane`). |
+| `IsoKOnly3` / `IsoKOnly4`, `b == 1` | **YES** | GPU ring + `iso_flash_decode_sdpa`. |
+| `IsoKOnly{3,4}`, `b > 1` | NO | The ring stride does not interleave batch. |
+| `Iso{3,4}Sym` | NO (this kernel) | Decodes through `iso_flash_decode_symv` (`iso_flash_decode_symv_msl.rs`, `metal/iso_flash_decode_symv_p1.metal`), which reads V from its own ring. Its gate is this gate, with `IsoSym3` or `IsoSym4` as the storage. |
 
-### Measured
-
-`release-perf`, M-series, decode TPS, 3 measured runs per cell, median. Both A/B
-binaries verified by kernel-name string (`main` = 0 hits, `fix` = 1) and distinct
-sha256. Every `after` cell carries a positive dispatch witness
-(`rmlx_iso_flash_decode_p1_b{3,4}` in the log); every `before` cell has none.
-
-| Model | Codec | ctx (real tok) | Before | After | Gain |
-|---|---|---|---|---|---|
-| Bonsai-8B (Qwen3, D=128) | `k_iso3` | 4k (4085) | 4.24 | **18.9–19.9** | ~4.5× |
-| Bonsai-8B | `k_iso4` | 4k (4085) | 1.89 | **17.8–19.9** | ~9.9× |
-| Bonsai-8B | `k_iso3` | 16k (16913) | 0.96 | **10.59** | 11.0× |
-| Bonsai-8B | `k_iso3` | 32k (33612) | 0.59 | **6.63** | 11.2× |
-| gemma-4-e2b (Gemma4, D=256, shared-KV) | `k_iso3` | 4k | 44.65 | **64.80** | 1.45× |
-| medgemma-4B (Gemma3, D=256) | `k_iso3` | 4k | 21.96 | **51.96** | 2.4× |
-
-Bonsai at 4k is a noisy target (individual runs span 15.4–20.1 across repeats of
-the same binary), so its 4k cells are given as a range over two independent
-3-run medians; the 16k/32k cells and the other two models are stable to a few
-percent. Treat a single Bonsai 4k run as indicative only.
-
-The gain grows with context because the cost removed is O(seq) host work per
-token. Fitting `itl = a + b·kv_seq` over Bonsai `k_iso3` at 4k/16k/32k:
-
-| path | `a` (fixed) | `b` (per KV token) |
-|---|---|---|
-| before — CPU dequant | 101 ms | **48.5 µs** |
-| after — `iso_flash_decode` | 37 ms | **3.40 µs** |
-
-`b` is what decides whether a codec can win at long context, and it drops 14.3×.
-
-`gemma-4-e2b` gains least because only its global layers are iso-quantized (its
-SWA layers stay bf16), so the CPU dequant removed was a smaller share of the
-step. It dispatches via the shared-KV **store** path; without that wiring the
-kernel would be dead on every shared-KV model.
-
-This makes the K-only iso family **usable** rather than fast: Bonsai is still
-below `none` (bf16 ≈ 110 TPS). The residual 3.40 µs/KV-token is the flash-decode
-*shell*, not the iso decode — a barrier-tree reduction per token with most lanes
-idle. That is shared with `rotor_flash_decode` and is where further work belongs.
-
-**Memory.** The GPU ring is additional resident memory on top of the CPU blocks
-(~8.1 MB/layer vs 23.9 MB of blocks at Bonsai 4k — ~34% on top of the blocks).
-It **is** counted: `KvStorage::resident_bytes` delegates to
-`QuantIsoK3::byte_size`, which sums the CPU blocks and the ring. Same for rotor.
-
-This was not always so. The byte total used to route through a per-codec
-bits-per-element formula that never read the store, so the ring was invisible
-and `k_iso3` and `k_rotor3` reported byte-identical KV. Measured on Bonsai-8B at
-4k, the decode-time `kv_bytes` for `k_iso3` went from 25.3 MB/layer to
-42.9 MB/layer once the total was derived from the allocations — the old figure
-accounted for only 60% of the process's RSS growth, the new one for 99%.
+`KvStorage::resident_bytes` counts the CPU blocks and the ring of each iso and
+rotor store (`byte_size`).
 
 ---
 
-## `planar_flash_decode` — single-pass MSL flash-decode for PlanarK
+## `planar_flash_decode` — fused MSL flash-decode for PlanarK
 
-Single-pass MSL flash-decode for `KvStorage::PlanarK`: keeps QK + softmax
-+ SV in one threadgroup over the decode-step (q_seq == 1) PlanarK K and
-bf16 V buffers. Two-pass tile structure mirrors TurboFlash
-(`turbo_flash_msl::TILE_SIZE = 64`).
+This is a decode kernel for `planar_k` (`KvStorage::PlanarK`). Pass 1 computes
+QK, an online softmax and SV for each 64-token tile. Pass 2 is the shared
+merge. K is read from the `QuantPlanarK` packed buffers, and V from the bf16
+mirror.
 
 ### Files
 
-* `crates/rmlx-kv-quant/src/planar_flash_decode_msl.rs` — MSL kernel,
-  Rust dispatcher, dispatch counter for NIAH.
-* `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_planar_k_fused`
-  — dispatch site (when the cache's `DispatchPolicy::planar_flash_decode` is
-  set, replaces the split fused-QK chain).
-* `crates/rmlx-cli/src/commands/serve.rs::resolve_planar_flash_decode`
-  — `--planar-flash-decode {on|off|auto}` CLI flag. Auto resolves OFF on
-  every host (see below).
+* `crates/rmlx-kv-quant/src/planar_flash_decode_msl.rs` — dispatcher, header
+  builder, dispatch counter.
+* `crates/rmlx-kv-quant/src/metal/planar_flash_decode_p1.metal` — pass-1 body.
+* `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::planar_k_flash_over_store` —
+  dispatch site. It selects this kernel or the split fused-QK chain.
+* `crates/rmlx-cli/src/commands/serve.rs::resolve_planar_flash_decode` —
+  resolves `--planar-flash-decode`.
 
 ### Gate
 
-`DispatchPolicy::planar_flash_decode` enables the kernel. CLI flag
-`--planar-flash-decode {on|off|auto}` (default `auto`) is the production
-switch; `RMLX_PLANAR_FLASH_DECODE=1` is the `auto` fallback. Default OFF on
-every host as of 2026-05-31 — see "Auto-flip status" below.
+`--planar-flash-decode on|off|auto` sets `DispatchPolicy::planar_flash_decode`.
+The default, `auto`, resolves OFF unless `RMLX_PLANAR_FLASH_DECODE=1` is set.
+`off` overrides that variable. The kernel runs only when all of these
+conditions are true:
 
-### Storage applicability
+- The cache is not a sliding-window ring.
+- The storage is `PlanarK`.
+- `--planar-fused-qk` is on, which is the default.
+- The device is GPU.
+- `q_seq == 1`.
+- The cache holds no bf16 K seed (`decode_fp16_k` is `None`).
+- The packed K is on the GPU.
+- `DispatchPolicy::planar_flash_decode` is set.
+- `head_dim` is a power of two.
 
-| Variant | Eligible? | Notes |
-|---|---|---|
-| `KvStorage::PlanarK { k: QuantPlanarK, .. }` | **YES** | Sole route through `update_and_sdpa_planar_k_fused` → `planar_flash_decode_sdpa`. Requires power-of-two `head_dim`. |
-| Any other `KvStorage` variant | NO | Routed through `mixed_quantized_sdpa` or `update_and_sdpa_shared_source`. |
+When only the last two conditions fail, the step runs the split fused-QK
+chain (§"Fused-QK kernels").
 
 ### Arch reachability
 
-| Arch | Routing | Reachable? | Why |
-|---|---|---|---|
-| Bonsai (`Qwen3ForCausalLM`) | `update_and_sdpa` → `sdpa_dispatch` → `update_and_sdpa_planar_k_fused` | **YES** | The only arch that both (a) routes through the fused-QK chain and (b) does not reject PlanarK at validate_resolved. |
-| Qwen3.6 (`Qwen3_5MoeForConditionalGeneration`) | rejected at `cache_type::validate_resolved` | NO | Contract A.y `QwenMoePlanarKRejected` — pre-existing PPL-disaster guard. The cache is never built; the kernel can never dispatch. |
-| Any arch with cross-layer KV sharing (e.g. `Gemma4ForConditionalGeneration`) | `update_and_sdpa_shared_source` (cross-layer KV share) | YES | The shared-source chain mirrors `update_and_sdpa` arm for arm, so `sdpa_dispatch` is reached exactly as on a non-sharing model. |
+The gate keys off codec and shape. The shared-KV path reaches the same arm.
+On a Qwen MoE arch, `validate_resolved` rejects `planar_k`
+(`QwenMoePlanarKRejected`).
 
-NIAH cells covering all three routes ship in
-`crates/rmlx-models/tests/niah_long_context.rs` (`niah_pflash_*`) and
-assert `dispatch_delta > 0` on Reachable+ON cells and `== 0` on Unreachable
-or OFF cells.
-
-### Performance posture (Bonsai canary)
-
-| Shape | OFF (split chain) | ON (flash kernel) | Delta | StdDev OFF | StdDev ON |
-|---|---:|---:|---:|---:|---:|
-| 4k prompt × 100 decode | 96.648 TPS | 96.460 TPS | -0.19% | 1.764 | 0.278 |
-| 8k prompt × 100 decode (smoke) | 75.833 | 75.060 | -1.0% | n=1 | n=1 |
-
-The flash-decode kernel shows **6× lower stddev** at the 4k canary shape but
-does not beat the split-chain mean at this decode-token budget. The fused
-single-kernel save is balanced by the loss of the upstream MLX flash kernel's
-tuning. See `docs/PERF_BASELINE.md` for full data.
+The `niah_pflash_*` cells in `crates/rmlx-models/tests/niah_long_context.rs`
+force `planar_k`, count dispatches and require the needle. With the policy on
+and a live bf16 K seed, they assert zero dispatches.
 
 ### Numerical relationship to the split chain — measured, not bit-exact
 
 The kernel is **not** byte-identical to the split chain. Both arms decode the
-same packed K, but the flash kernel folds the softmax into a per-tile online
-log-sum-exp reduction while the split chain materialises the whole score row
-and calls `softmax_precise`; the summation orders differ, so the f32
-accumulators differ in the low mantissa bits.
+same packed K. The flash kernel folds the softmax into a per-tile online
+log-sum-exp. The split chain builds the whole score row and calls
+`softmax_precise`. The summation orders differ, so the f32 accumulators differ
+in the low mantissa bits.
 
-Whether that survives the closing `astype(queries.dtype())` — the bf16 both
-arms actually return — depends on how close each exact value sits to a bf16
-rounding boundary, which is a property of the data. So **some cells are clean
-and some are not**, and a single-cell check proves nothing either way.
+Whether a difference survives the closing cast to the query dtype depends on
+how near each value is to a bf16 rounding boundary. That is a property of the
+data. So some cells are clean and some are not, and one cell proves nothing.
 
-Measured by `planar_flash_decode_is_not_bit_exact_vs_split_chain`
-(`crates/rmlx-kv-quant/src/planar_flash_decode_msl_tests.rs`), running both
-arms over one packed store with production dtypes throughout — bf16 Q as the
-model streams it, bf16 V, and the output cast the dispatcher applies to both
-returns:
+`planar_flash_decode_is_not_bit_exact_vs_split_chain`
+(`crates/rmlx-kv-quant/src/planar_flash_decode_msl_tests.rs`) runs both arms
+over one packed store, with bf16 Q, bf16 V and the dispatcher's output cast.
+Its fixtures are seeded. It prints these counts:
 
 | `kv_h` × `heads_per_kv` | `head_dim` | `kv_seq` | f32 accumulator differs | max abs err | **bf16 output differs** |
 |---|---:|---:|---:|---:|---:|
@@ -3420,125 +2936,48 @@ returns:
 | 1 × 8 | 256 | 512 | 2048 / 2048 | 3.55e-5 | **280 / 2048** |
 | 1 × 8 | 256 | 4096 | 2048 / 2048 | 1.46e-5 | **298 / 2048** |
 
-Read the last column: the two arms are observably different to a caller in
-4 of 6 cells, and identical in 2. The clean pair is exactly
-`head_dim=128, kv_seq<=512` — so a check run only at the Bonsai shape and a
-short context would have "confirmed" byte-identity outright. That is the same
-failure the TurboFlash claim was retracted for.
+The bf16 outputs differ in 4 of 6 cells and agree in 2. The clean cells are
+`head_dim = 128` with `kv_seq <= 512`. So a check at one short Bonsai-shaped
+cell would wrongly confirm byte-identity. The f32 errors stay inside a bf16
+ULP at these magnitudes, which is what a summation-order difference gives.
+The kernel computes the same attention, but it is not lossless.
 
-The f32 spread (~2e-8 at `head_dim=128`, ~1.2e-4 at `head_dim=256`) stays well
-inside a bf16 ULP at these output magnitudes, and the fraction of elements that
-flip after rounding tracks the ratio of that error to the ULP — consistent with
-summation order alone, not a correctness defect. The kernel is a faithful
-implementation of the same attention; it is simply not lossless, and must not
-be described as such.
+The test asserts three things. At least one cell differs at bf16, which is the
+claim. At least one cell differs at f32, which shows that both arms ran. Every
+cell's f32 error is below 1e-3, which separates rounding from a defect.
 
-**Measure at the dtype the dispatcher returns.** Comparing the f32
-accumulators alone overstates the difference — it reports thousands of
-differing elements in cells where the shipped bf16 is bit-identical. Comparing
-only the bf16 understates it — two arms that never ran would also agree. The
-test asserts both: at least one cell differs at bf16 (the claim), and every
-cell differs at f32 (the null control that both arms ran).
+### The bf16 K seed bypasses the PlanarK kernels
 
-**The serve-path A/B cannot settle this.** `--planar-flash-decode on|off` on a
-normal generate flow compares two runs in which the kernel never dispatches at
-all: the warm-TTFT bf16-K seed is live for the whole post-prefill decode window
-and the PlanarK dispatcher bypasses both the fused-QK chain and the flash
-kernel (see "Correctness gap" below). Measured on Ternary-Bonsai-8B,
-`--kv-quant planar_k`, 4096-token prompt, 32 generated, 1 warmup + 2 measured
-runs, `--log verbose`:
-
-| Arm | `planar_flash_decode_sdpa: dispatch` | `planar_fused_qk: dispatch` | `warm_ttft_bypass` | token digest |
-|---|---:|---:|---:|---|
-| `--planar-flash-decode on` | 0 | 0 | 2418 | `0x8d52921f8217bb27` |
-| `--planar-flash-decode off` | 0 | 0 | 2418 | `0x8d52921f8217bb27` |
-
-The digests match because both arms took the same branch. An A/B in which
-neither arm dispatches the kernel under test confirms any equivalence put to
-it; count the per-dispatch `trace!` events before drawing a conclusion from
-one.
-
-### Correctness gap — RESOLVED (warm-TTFT bf16-K shortcut)
-
-The initial NIAH tests reported retrieval failures on every Bonsai PlanarK
-cell, OFF and ON alike (both producing the same incoherent decoded output
-`"9. The secret. The grass. ..."`). Investigation found the bug was NOT in
-PlanarK's chunked-prefill broadcast or in the GPU codec at scale — both
-`planar_v4_msl_roundtrip_8k_bonsai_shape` and
-`quant_planar_k_single_append_8k_bonsai_shape` confirmed the codec
-is bit-exact at 8k Bonsai shape, and
-`quant_planar_k_oneshot_vs_chunked_append_parity` confirmed
-one-shot vs chunked append are byte-identical.
-
-The real root cause: `KvCache::update_planar_k` was the **only**
-quantised `update_<arch>` that lacked the warm-TTFT bf16-K seed
-shortcut. Every other codec (K8V4 / K8V8 / Planar / Mixed / K8VTurbo* /
-Iso* / Rotor* / TurboSym*) returns early to `update_decode_fp16` when
-`decode_fp16_k` is `Some(_)` (set by `exit_prefill`), so the bf16
-prefill K is reused for the whole post-prefill decode window. PlanarK
-uniquely re-encoded K through the lossy 4-bit Lloyd-Max + Givens
-rotation kernel on every decode step. The resulting per-position drift
-compounded across the 8k softmax tail and broke needle retrieval — the
-K8V4 reference cell `niah_bonsai_8k_d50` "passes" because it silently
-ran bf16 K, not because K8V4's codec was somehow more faithful.
-
-Fix landed in `KvCache::update_planar_k`
-(`crates/rmlx-kv-quant/src/kvcache/update.rs`) + the fused-QK dispatcher
-gate at `crates/rmlx-kv-quant/src/kvcache/sdpa.rs`. Both now route through
-bf16 SDPA whenever `decode_fp16_k.is_some()`, matching every other quant.
-Side effects:
-
-* `niah_pflash_bonsai_{8k,16k}_d{10,30,50,70,90}` now retrieve
-  `AX7-PURPLE-FOX-9421` correctly under both `RMLX_PLANAR_FLASH_DECODE=0`
-  and `=1`.
-* The PlanarK fused-QK and `planar_flash_decode` kernels intentionally do NOT
-  fire during a request's post-prefill decode loop (the bf16 seed is live).
-  Both remain reachable on a fresh `KvCache` with no seed (e.g. PPL eval
-  fixtures that bypass `exit_prefill`), so the kernels are not dead code, just
-  dormant for normal generate flows.
-* Decode TPS on Bonsai PlanarK improves: 4k canary mean 101.19 TPS
-  (vs flash-decode baseline 96.65, +4.7%); 8k smoke 77.17 TPS (vs 75.83,
-  +1.8%). The fused-QK kernels' theoretical wins were balanced by the
-  loss of MLX's tuned `scaled_dot_product_attention`; routing through
-  bf16 SDPA wins back the upstream kernel's tuning.
-
-### Auto-flip status: OFF (HOLD)
-
-The brief gated the Auto-on flip on a clean Bonsai NIAH **and** ≥10% TPS
-gain. Neither lands:
-
-- **NIAH correctness**: blocked by the pre-existing PlanarK +
-  chunked-prefill bug (see "Correctness gap" above) — not a flash-decode defect.
-- **Perf gain**: -0.19% at the 4k canary (well below 10% gate).
-
-`PlanarFlashDecodeMode::Auto` therefore resolves OFF on every host. The
-existing `--planar-flash-decode on` opt-in is preserved for ablation
-benches.
+`exit_prefill` builds a bf16 K seed (`decode_fp16_k`) for `planar_k`. While
+the seed is live, `update_and_sdpa` sends a PlanarK decode step to bf16 SDPA.
+It skips both the fused-QK chain and `planar_flash_decode`, and it logs
+`warm_ttft_bypass` at `debug!` (target `rmlx_kv_quant::warm_ttft`). So an A/B
+of `--planar-flash-decode on|off` on a normal generate flow runs the same
+branch twice. Count the per-dispatch `trace!` events before you use such an
+A/B. The kernels run on a cache with no seed: an SSD hydrate, or a cache that
+never went through a prefill bracket.
 
 ---
 
 ## Fused-QK head-major K storage
 
-The fused-QK MSL kernels compute pre-softmax `QK` straight off a head-major
-packed K shadow, skipping the K dequant round-trip. They are reached from the
-production decode path by q8 (`K8V4` / `K8V8`), `TurboSym3`, `TurboSym4`, and
-the two rotor-asym codecs (`RotorK3Asym` / `RotorK4Asym`).
+The fused-QK MSL kernels compute pre-softmax `QK` from a head-major packed K
+shadow, with no K dequant. These codecs reach them from the production
+decode path: q8 (`K8V4` / `K8V8`), `TurboSym3`, `TurboSym4`, and the two
+rotor-asym codecs (`RotorK3Asym` / `RotorK4Asym`).
 
 ### Which codecs can reach this path, and why the rest cannot
 
-The shadow is built by **re-encoding the bf16 K mirror** (`decode_fp16_k`)
-that `exit_prefill` materialises. `exit_prefill` only materialises that mirror
-for codecs whose `KvQuant::feeds_bf16_k_at_decode()` is true. Eight codecs
-return false there — `Iso3Sym`, `Iso4Sym`, `IsoKOnly3`, `IsoKOnly4`,
-`Rotor3Sym`, `Rotor4Sym`, `RotorKOnly3`, `RotorKOnly4` — because each decodes
-through its own flash-decode-over-quant kernel reading the packed ring
-directly, which is the point of not keeping a second bf16 copy of K.
+The shadow is built by re-encoding the bf16 K mirror (`decode_fp16_k`) that
+`exit_prefill` builds. `exit_prefill` builds that mirror only for a codec whose
+`KvQuant::feeds_bf16_k_at_decode()` is true. Eight codecs return false:
+`Iso3Sym`, `Iso4Sym`, `IsoKOnly3`, `IsoKOnly4`, `Rotor3Sym`, `Rotor4Sym`,
+`RotorKOnly3` and `RotorKOnly4`. Each of them decodes through its own
+flash-decode kernel over the packed ring.
 
-So those eight can **never** reach the fused-QK path: not at any `head_dim`,
-not at any batch size, not on any architecture. It is a codec property, not an
-arm-ordering accident. They were listed in the dispatch table anyway until the
-tables were pruned to the reachable set; the iso fused-QK kernel, whose only
-possible callers were four of those eight, was retired with them.
+So those eight never reach the fused-QK path, at any `head_dim`, batch size or
+architecture. `fused_qk_table_matches_the_bf16_k_mirror_contract` pins the
+kernel table to the codecs that keep the mirror.
 
 Decode routing for the rotation-KV families, at `b = 1`:
 
@@ -3550,40 +2989,27 @@ Decode routing for the rotation-KV families, at `b = 1`:
 | `RotorKOnly3` / `RotorKOnly4` | `rotor_flash_decode` | `update_and_sdpa` rotor-K-only arm |
 | `RotorK3Asym` / `RotorK4Asym` | `rotor_fused_qk` | fused-QK shadow path — **no flash arm exists**, so this is its only GPU decode kernel |
 
-The rotor-asym pair therefore depends on `--fused-qk on`. With the shipped
-default (`auto`, which resolves OFF) their decode serves from the warm bf16
-mirror instead — correct output, no rotor kernel. Pinned by
-`crates/rmlx-kv-quant/tests/rotor_fused_qk_dispatch.rs`, which asserts for
-each rotor codec both that the expected kernel fired and that the other two
-did not.
+So the rotor-asym pair needs `--fused-qk on`. At the default (`auto`, which
+resolves OFF) its decode reads the bf16 mirror, with correct output and no
+rotor kernel. `crates/rmlx-kv-quant/tests/rotor_fused_qk_dispatch.rs` checks,
+for each rotor codec, that the expected kernel ran and the other two did not.
 
 ### `head_dim` reachability — why fused-QK never fires on a Gemma4 model
 
-The kernel shims are hard-gated on `head_dim ∈ {128, 256}`. That excludes
-**every Gemma4 model**, at every size, with every fused-QK codec.
+The kernel shims accept `head_dim` 128 or 256 only. Gemma4 quantizes only its
+global layers, and its sliding-window layers stay bf16. The global layers use
+`global_head_dim`, which is 512 in every Gemma4 snapshot under test. So
+`try_fused_qk_dispatch` rejects each Gemma4 decode step at the `head_dim`
+gate. The rotor and iso flash-decode kernels accept `head_dim` up to 512, so
+Gemma4 reaches those.
 
-Gemma4 quantises only its full-attention (global) layers — the SWA layers stay
-bf16 — and the global layers use `global_head_dim = 512`, not the
-`head_dim = 256` the SWA layers use. 512 is outside the shims' supported set,
-so `try_fused_qk_dispatch` rejects at gate 4 on every decode step. Measured on
-gemma-4-e2b with `--ctk rotor_k_3 --ctv q4_g64 --fused-qk on`: zero
-`rotor_fused_qk_sdpa: dispatch` events, and 63 `fused_qk: skipped` events
-carrying `reason = "head_dim not in {128, 256}"` with `head_dim = 512`.
-
-This is not a defect and not a Gemma4-specific gate — it is the kernel's shape
-support meeting the arch's shape. The rotor and iso **flash-decode** kernels
-accept `head_dim` up to 512, so Gemma4 does reach those: the same model on
-`--ctk rotor_k_3 --ctv bf16` dispatches `rotor_flash_decode` 147 times over
-the same workload. If you want a GPU-side quantised K decode on Gemma4, that
-is the family to use.
-
-To confirm it on your own model, run with `--log verbose` and search the run's
-`<RMLX_HOME>/logs/*.jsonl` for `fused_qk: skipped`; the `reason` field names
-the gate and the `head_dim` field carries the value that was rejected.
+To check a model, run it with `--log verbose` and search the run's
+`<RMLX_HOME>/logs/*.jsonl` for `fused_qk: skipped`. The `reason` field names
+the gate. The `head_dim` field carries the rejected value.
 
 ### Storage shape
 
-Added on `KvCache` as `fused_qk_shadow: Option<FusedQkShadow>`:
+`KvCache` holds the shadow as `fused_qk_shadow: Option<FusedQkShadow>`:
 
 | Buffer | Shape | Per-token payload |
 |---|---|---|
@@ -3592,119 +3018,133 @@ Added on `KvCache` as `fused_qk_shadow: Option<FusedQkShadow>`:
 | `sideband_norms` | `f32 [B, kv_h, max_seq, 1]` | per-token L2 norm (rotor only) |
 | `sideband_rotor_table` | `f32 [n_groups * 4]` | static per-layer rotor table (rotor only) |
 
-The per-codec layout is computed by
 `FusedQkLayout::for_codec(KvQuant, head_dim) -> Result<Option<Self>>` in
-`crates/rmlx-kv-quant/src/kvcache/fused_qk_shadow.rs`:
+`crates/rmlx-kv-quant/src/kvcache/fused_qk_shadow.rs` computes the per-codec
+layout:
 
 | `KvQuant` | `codes_per_token` (u32) | `scales_per_token` (f32) | sidebands |
 |---|---|---|---|
 | K8V4, K8V8 | `head_dim/4` | `head_dim/128` | — |
 | TurboSym3 | `head_dim*3/32` | `head_dim/32` | — |
 | TurboSym4 | `head_dim/8` | `head_dim/32` | — |
-| RotorK3Asym, RotorK4Asym | `ceil(head_dim/3)` | `ceil(head_dim/3)` | per-token norm + rotor table |
-| any codec with no bf16 K mirror | — | — | `for_codec` returns `Ok(None)` — unreachable, see above |
+| RotorK3Asym, RotorK4Asym | `row_words_for(head_dim, bits)`: `ceil(3 * ceil(head_dim/3) * bits / 32)` | `ceil(head_dim/3)` | per-token norm + rotor table |
+| any other codec | — | — | `for_codec` returns `Ok(None)` |
 
-The kernel shims read the codes / scales buffers as flat 1-D inputs of length
-`tok_count * payload_per_token` where `tok_count = B * kv_h * kv_seq`. The
-shadow is sliced `[B, kv_h, max_seq, payload] → [B, kv_h, kv_seq, payload]`
-and flattened on every dispatch — the dim-2 slice is non-contiguous, so the
-flatten forces a per-step materialisation (see KV_CACHE.md §9.5 "Per-step cost
-framing").
+`for_codec` returns an error when `head_dim` is not a multiple of the q8 group
+(128) or of the turbo group (32).
+
+The kernel shims read the codes and scales as flat 1-D inputs of length
+`tok_count * payload_per_token`, where `tok_count = B * kv_h * kv_seq`. Each
+dispatch slices the shadow from `[B, kv_h, max_seq, payload]` to
+`[B, kv_h, kv_seq, payload]` and flattens it. The dim-2 slice is not
+contiguous, so the flatten copies on each step (see KV_CACHE.md §9.5
+"Per-step cost framing").
 
 ### Dispatch wire-in
 
 `KvCache::try_fused_qk_dispatch` in
 `crates/rmlx-kv-quant/src/kvcache/fused_qk_dispatch.rs` is called from
-`update_and_sdpa` right after the K8V4-TurboFlash branch and before the legacy
-bf16 SDPA fallback, and from `try_dispatch_shared_bf16` on the cross-layer-KV
-producer path. Gates (in order):
+`update_and_sdpa` after the K8V4 TurboFlash branch and before the legacy bf16
+SDPA fallback. `try_dispatch_shared_bf16` calls it on the cross-layer-KV
+producer path. Its gates, in order:
 
-1. `DispatchPolicy::fused_qk` on the cache's policy (CLI flag
-   `--fused-qk on|off|auto`, `auto` fallback `RMLX_FUSED_QK=1`).
-2. `Device::Gpu`.
-3. `q_seq == 1` (decode-only).
-4. `head_dim ∈ {128, 256}` (kernel hard gate).
-5. `kv_seq ≥ DispatchPolicy::fused_qk_min_kv_seq` (default 512, override
-   `RMLX_FUSED_QK_MIN`; sub-threshold caches go to bf16 SDPA where the launch
-   overhead is not amortised).
-6. Codec is in the `lookup_fused_qk_kernel` table. This is the only such
-   table: `rmlx-models` used to carry a public mirror of it with no caller,
-   which was removed rather than hand-synced against the one that runs.
-7. The codec has a GPU encoder wired in (`codec_has_gpu_encoder`).
-8. Rotor only: `--rotor-qjl` is off (the kernel does not reproduce the 1-bit
-   K-side residual).
+1. `DispatchPolicy::fused_qk` is set. `--fused-qk on|off|auto` sets it. `auto`
+   resolves OFF unless `RMLX_FUSED_QK=1` is set.
+2. The device is `Device::Gpu`.
+3. `q_seq == 1` and `new_k` has rank 4.
+4. `head_dim ∈ {128, 256}` (kernel limit).
+5. `offset + new_seq >= DispatchPolicy::fused_qk_min_kv_seq`. The default is
+   512, and `RMLX_FUSED_QK_MIN` overrides it. A shorter cache goes to bf16
+   SDPA.
+6. The codec is in the `lookup_fused_qk_kernel` table.
+7. The codec has a GPU encoder (`codec_has_gpu_encoder`).
+8. For a rotor codec, the global `--rotor-qjl` toggle is off.
 9. `decode_fp16_k` is seeded.
-10. The storage variant carries a `max_seq`
-    (`storage_max_seq_for_fused_qk`).
-11. The step does not overflow it (`prev_offset + new_seq <= max_seq`) — the
-    shadow populate path has no out-of-range clamp, so an overflowing step
-    falls back rather than encoding a 0-length chunk.
+10. The storage variant carries a `max_seq` (`storage_max_seq_for_fused_qk`).
+11. The step does not overflow it (`prev_offset + new_seq <= max_seq`). The
+    shadow populate path has no out-of-range clamp.
 
-Every fall-through emits `fused_qk: skipped` at `trace!` with a `reason`
-field naming the gate, so `--log verbose` distinguishes "gate rejected" from
-"codec has no kernel" without reading the dispatcher. The `head_dim` gate also
-logs the observed value; the overflow gate additionally raises a one-shot
-`warn!`, and the per-step trace is what shows the fall-through continuing
-after that single warning.
+Each fall-through emits `fused_qk: skipped` at `trace!`, with a `reason` field
+that names the gate. The `head_dim` gate also logs the value. The overflow
+gate also raises a one-shot `warn!`.
 
-Gate 1 is traced like the rest on purpose. `--fused-qk` resolves OFF by
-default, so it is the rejection an operator hits first — a dispatcher that
-logged nothing there would answer "why doesn't the kernel fire?" with an empty
-log, which reads as "the dispatcher was never called".
-
-The shadow is allocated lazily on the first dispatch (seeded by quantising the
-prefill bf16 prefix in `decode_fp16_k`) then appended head-major every
-subsequent decode step via 4-D `slice_update` at
-`[:, :, prev_offset:prev_offset+new_seq, :]`. Bf16 `decode_fp16_k/v` stay
-maintained as the fallback path.
+The first dispatch allocates the shadow and seeds it from the bf16 prefix in
+`decode_fp16_k`. Each later decode step appends to it head-major with a 4-D
+`slice_update` at `[:, :, prev_offset:prev_offset+new_seq, :]`. The bf16
+`decode_fp16_k/v` mirror stays up to date, and the SV product reads its V.
 
 ### Codec coverage
 
-| Codec family | GPU encoder | Status |
+| Codec family | GPU encoder | Test floor |
 |---|---|---|
-| q8 (K8V4, K8V8) | `q8_quantize_gpu` | Wired — cosine ≥ 0.999 vs bf16; dispatch delta proven |
-| TurboSym3 | `turbo_quantize_v3_gpu` (axis-agnostic) | Wired — cosine ≥ 0.998 vs bf16 |
-| TurboSym4 | `turbo_quantize_v4_gpu` (axis-agnostic) | Wired — cosine ≥ 0.999 vs bf16 |
-| RotorK3Asym / RotorK4Asym | `rotor_quantize_v3_gpu` / `rotor_quantize_v4_gpu` | Wired — sole GPU decode path for these codecs |
+| q8 (K8V4, K8V8) | `q8_quantize_gpu` | cosine ≥ 0.99 against bf16 SDPA |
+| TurboSym3 | `turbo_quantize_v3_gpu` | cosine ≥ 0.95 against bf16 SDPA |
+| TurboSym4 | `turbo_quantize_v4_gpu` | cosine ≥ 0.99 against bf16 SDPA |
+| RotorK3Asym / RotorK4Asym | `rotor_quantize_v3_gpu` / `rotor_quantize_v4_gpu` | routing only (`rotor_fused_qk_dispatch.rs`) |
+
+`crates/rmlx-kv-quant/tests/fused_qk_dispatch.rs` holds the cosine floors. When
+the dispatch counter does not move, it skips the cosine check, unless
+`RMLX_FUSED_QK_STRICT=1` is set.
 
 ### Dispatch counter and trace
 
-`rmlx_kv_quant::kvcache::fused_qk_total_dispatch_count()` aggregates the
-per-family counters; in-process tests use `delta = after - before > 0`. That
-counter has no caller outside tests and is unreachable from a shipped binary —
-from a real run, count the per-dispatch `trace!` events instead
+`rmlx_kv_quant::kvcache::fused_qk_total_dispatch_count()` adds the per-family
+counters. In-process tests read it as `after - before > 0`. Only tests call
+it. For a real run, count the per-dispatch `trace!` events
 (`q8_fused_qk_sdpa: dispatch`, `turbo_k{3,4}_fused_qk_sdpa: dispatch`,
-`rotor_fused_qk_sdpa: dispatch`) in the run's `<RMLX_HOME>/logs/*.jsonl`
-under `--log verbose`.
+`rotor_fused_qk_sdpa: dispatch`) in the run's `<RMLX_HOME>/logs/*.jsonl`,
+with `--log verbose`.
 
 ### See also
 
 * `crates/rmlx-kv-quant/tests/fused_qk_dispatch.rs` — GPU integration
-  tests for q8 + TurboSym3 + TurboSym4.
-* `crates/rmlx-kv-quant/tests/rotor_fused_qk_dispatch.rs` — the rotor
-  routing contract (which kernel each rotor codec reaches, and which it
-  must not).
+  tests for q8, TurboSym3 and TurboSym4.
+* `crates/rmlx-kv-quant/tests/rotor_fused_qk_dispatch.rs` — the rotor routing
+  contract: which kernel each rotor codec reaches, and which it must not.
 
 ---
 
 ## Sparse attention
 
-Two-phase MSL kernel pair in `crates/rmlx-kv-quant/src/sparse_attn/`:
+A two-phase MSL kernel pair in `crates/rmlx-kv-quant/src/sparse_attn/`. It
+reads a PlanarQuant-packed K and a bf16 V.
 
 | Kernel | Role |
 |---|---|
-| `phase1_score_msl::phase1_score` | Per-(q, head) cheap-inner-product score against every KV slot; emits sorted partial top-K (`TOP_PER_TILE` slots per tile). |
-| `phase2_sparse_attend_msl::phase2_sparse_attend` | Runs SDPA only on the phase-1 selected slots; per-tile partials are LSE-merged into the final attention output. |
+| `phase1_score_msl::phase1_score` | Scores every KV slot per (query, head) and keeps the top `TOP_PER_TILE` (4) scores per tile. |
+| `phase2_sparse_attend_msl::phase2_sparse_attend` | Attends only the slots at or above each head's threshold and writes per-tile partials. |
+| `phase2_sparse_attend_msl::phase2_lse_merge` | Merges the per-tile partials by log-sum-exp into the attention output. |
 
-Dispatcher: `rmlx_models::kv_cache::attention_dispatch::sparse_attn_dispatch_if_enabled`.
-Gate: `DispatchPolicy::sparse_attn`, passed to the dispatcher by its caller.
-CLI flag: `--sparse-attn {auto|on|off}` (default `auto` → OFF on every host;
-`auto` fallback `RMLX_SPARSE_ATTN=1`; see `docs/CLI.md`).
+Between the phases the host reads the per-tile top scores and computes each
+head's threshold from its budget (`compute_head_threshold`).
+
+The dispatcher is
+`rmlx_models::kv_cache::attention_dispatch::sparse_attn_dispatch_if_enabled`.
+It returns `None` unless `DispatchPolicy::sparse_attn` is set and head budgets
+are given. An inner error logs a `warn!` and returns `None`.
+
+**No production path calls the dispatcher.** `--sparse-attn {auto|on|off}`
+sets `DispatchPolicy::sparse_attn`. The default, `auto`, resolves OFF unless
+`RMLX_SPARSE_ATTN=1` is set. No decode path reads the policy, so
+`--sparse-attn on` does not change a served output. Only tests reach the
+kernels, through `sparse_attn_dispatch`.
+
+`rmlx_kv_quant::sparse_attn::sparse_attn_total_dispatch_count` returns the
+sum of the P1 and P2 dispatch counts. One `sparse_attn_dispatch` call adds 2.
+
+Tests, in `crates/rmlx-models/tests/sparse_attn_dispatch.rs`:
+
+* `sparse_attn_dormant_on_warm_ttft_update_and_sdpa` — `update_and_sdpa` on
+  a warm PlanarK cache, under a `sparse_attn: true` policy, leaves the counter
+  unchanged.
+* `sparse_attn_dispatches_on_seedless_planar_k` — `sparse_attn_dispatch` over
+  a seedless PlanarQuant-packed buffer adds exactly 2 to the counter. Its
+  cosine against dense `planar_flash_decode_sdpa` is at least 0.99.
 
 ### Head budgets (`head_budgets.json`)
 
-The per-(layer, head) k-budget table consumed by phase-2 lives in
-`<MODEL>/head_budgets.json`. Two schema versions are supported.
+The per-(layer, head) k-budget table for phase 2 is
+`<MODEL>/head_budgets.json`. The reader accepts two schema versions.
 
 **Schema v1** (K-norm² proxy):
 
@@ -3725,8 +3165,8 @@ The per-(layer, head) k-budget table consumed by phase-2 lives in
 }
 ```
 
-**Schema v2** (true softmax-mass) adds four optional fields to
-`calibration` and bumps `version` to `2`:
+**Schema v2** (true softmax-mass) adds four optional fields to `calibration`
+and sets `version` to `2`:
 
 ```json
 {
@@ -3749,111 +3189,53 @@ The per-(layer, head) k-budget table consumed by phase-2 lives in
 }
 ```
 
-- `recipe` — `"softmax_mass"` (current default) or `"k_norm_proxy"`
-  (legacy K-norm² alias).
-- `target_mass` — cumulative softmax-mass coverage target.
-- `target_mass_budget_floor` — minimum per-(layer, head) budget; guards
-  against pathological single-mass distributions producing a 1-slot
-  budget.
-- `prompts_provenance` — basenames of calibration prompt files.
+- `recipe` — the measurement recipe. The writer sets `"softmax_mass"`.
+- `target_mass` — the cumulative softmax-mass target.
+- `target_mass_budget_floor` — the minimum per-(layer, head) budget. It stops
+  a single dominant key from giving a 1-slot budget.
+- `prompts_provenance` — the basenames of the calibration prompt files.
 
-See [`crates/rmlx-loader/src/head_budgets.rs`](../crates/rmlx-loader/src/head_budgets.rs)
-for the canonical struct, validator, reader (`load_head_budgets`), and
-writer (`write_head_budgets`). Both ends fail on shape mismatch
-(`num_layers` vs row count, `num_heads` vs column count) or zero budgets
-(every (layer, head) must attend to ≥1 slot). The reader accepts both
-versions; a v1 load emits a `tracing::warn!` advising softmax-mass
-re-calibration.
+[`crates/rmlx-loader/src/head_budgets.rs`](../crates/rmlx-loader/src/head_budgets.rs)
+holds the struct, the validator, the reader (`load_head_budgets`) and the
+writer (`write_head_budgets`). Both ends fail on a version other than 1 or 2,
+on a shape mismatch (`num_layers` against the row count, `num_heads` against
+the column count), and on a zero budget. A v1 load logs a `warn!` that advises
+re-calibration with `softmax_mass`.
 
-`head_budgets.json` is loaded at model-load time alongside
-`kv_calib.json` — see the `discover_kv_calibration` site in
-`crates/rmlx-cli/src/commands/serve.rs`. A snapshot without the file is
-the common case; consumers treat missing budgets as "no sparse path
-enabled for this snapshot".
+`rmlx serve` loads `head_budgets.json` from the snapshot and attaches it to
+the loaded `kv_calib.json` (`crates/rmlx-cli/src/commands/serve.rs`). Without
+a `kv_calib.json` it logs a `warn!` and ignores the budgets. A snapshot with no
+`head_budgets.json` is the common case. No decode path reads the attached
+budgets.
 
 ### Calibration recipes
 
-CLI: see `docs/CLI.md`.
+CLI: see `docs/CLI.md`. Three `rmlx kv-calibrate --recipe` values write head
+budgets. Each loads the model on the GPU and holds the Metal claim. Each
+accepts only a snapshot that loads as `Architecture::Qwen3`.
 
-Three head-budget family recipes are supported:
+| Recipe | Schema | Measurement |
+|---|---|---|
+| `head_budget` | v1 | K-norm² proxy (the H2O / StreamingLLM stand-in) |
+| `k_norm_proxy` | v1 | Same as `head_budget` |
+| `softmax_mass` | v2 | True Q@K^T → softmax → cumulative-mass top-k |
 
-| Recipe | Schema | Measurement | Default |
-|---|---|---|---|
-| `head_budget` | v1 | K-norm² proxy (H2O / StreamingLLM stand-in) | legacy |
-| `k_norm_proxy` | v1 | Explicit alias for the K-norm² proxy | — |
-| `softmax_mass` | v2 | True Q@K^T → softmax → cumulative-mass top-K | **current default** |
+The v1 recipes write `method: "softmax_mass"`, the name of the target concept,
+but they measure the K-norm² proxy. v2 adds the `recipe` field so that a file
+names what was measured.
+
+`--mass-threshold` sets the mass target, in [0.50, 1.00], with a default of
+0.95. `--target-mass-budget-floor` sets the floor, with a default of 16. Only
+`softmax_mass` uses the floor.
 
 #### True softmax-mass calibration
 
-Algorithm: load model → for each calibration prompt → fresh bf16 KV
-cache (`KvQuant::None`) → run `forward_seq_with_cache_calibrated` with a
-`SoftmaxMassSink` → at each layer's post-RoPE / pre-SDPA boundary, the
-sink reads the last-position Q (mean-folded over the q_per_kv group for
-GQA) and the full accumulated K → computes per-kv-head softmax scores →
-finds smallest top-K covering `target_mass` → max-aggregates across
-prompts. GQA-expands the per-kv-head budget table to per-q-head rows
-for the v2 schema.
-
-Per-prompt host-side cost is O(n_layers × n_kv_heads × S_kv × head_dim)
-in pure-Rust f32 arithmetic (no extra Metal kernels). On a 36-layer
-Bonsai-2bit run with 15 prompts × ~400-600 tokens, calibration
-completes in ~2.5 s on M2 Max.
-
-#### Legacy — K-norm² proxy
-
-`multi-turboquant`'s reference calibration writes
-`calibration.num_prompts: 0` and stamps `method = "weight_norm"` — it
-ships a *placeholder* head_budget hint rather than a real measurement.
-rMLX's `head_budget` / `k_norm_proxy` recipes replace this with a real,
-prompt-driven measurement under the K-norm² ranking proxy (H2O,
-StreamingLLM). The schema's `method = "softmax_mass"` label named the concept
-(per-(layer, head) cumulative mass coverage); the v1 implementation used
-K-norm² as a stand-in. v2 lifts the recipe to true softmax-mass and adds
-`recipe` as an explicit field. v1 files are still loaded transparently; the
-runtime dispatcher consumes both shapes identically.
-
-### Production dispatch — warm-TTFT dormant by design
-
-Sparse-attn is intentionally dormant on the normal generate flow. Every
-quantised KV codec routes its decode-window through the bf16-K seed
-materialised by `exit_prefill` (`decode_fp16_k`), so
-`KvCache::update_and_sdpa` never reaches the PlanarK fused-QK /
-flash-decode / sparse-attn kernels when the seed is live (warm-TTFT shortcut
-at `crates/rmlx-kv-quant/src/kvcache/sdpa.rs:617-655`). The kernels remain
-reachable for **seedless workloads** (synthetic PlanarK caches in tests, PPL
-eval, future prompt-cache hits that skip prefill) via the public production
-entry point
-`rmlx_models::kv_cache::attention_dispatch::sparse_attn_dispatch`.
-
-Aggregated dispatch counter
-[`rmlx_kv_quant::sparse_attn::sparse_attn_total_dispatch_count`]
-returns the process-lifetime sum of P1 + P2 enqueues; one
-`sparse_attn_dispatch` call increments the counter by exactly 2.
-
-Auto-policy: `resolve_sparse_attn` on `Auto` resolves OFF on every host
-(same posture as `PlanarFlashDecodeMode::Auto`). The On override sets
-`DispatchPolicy::sparse_attn` but does NOT cause the kernels to fire on a
-warm-TTFT decode — that contract is structural, not gated.
-
-Invariant tests:
-
-* `crates/rmlx-models/tests/sparse_attn_dispatch.rs::sparse_attn_dormant_on_warm_ttft_update_and_sdpa`
-  — warm PlanarK cache through `update_and_sdpa` under a `sparse_attn: true` policy keeps the counter flat.
-* `crates/rmlx-models/tests/sparse_attn_dispatch.rs::sparse_attn_dispatches_on_seedless_planar_k`
-  — seedless PlanarQuant-packed buffer through `sparse_attn_dispatch` increments the counter by exactly 2 and cosine ≥ 0.99 vs dense `planar_flash_decode_sdpa`.
-
-**GPU-resident iso/rotor V mirror — dormant by design:** the GPU-resident
-iso/rotor V mirror is hardcoded OFF on the normal decode path for the same
-structural reason: every iso and rotor update path short-circuits at
-`decode_fp16_k.is_some()` (warm-TTFT bf16 seed) before reaching the
-GPU-resident mirror branch. The 7-codec phase-2 extension (iso3 K, iso4 V/K,
-rotor3/4 V/K) was evaluated and declined. A/B bench on Bonsai 8B
-(8k prompt, `--ctk q8_g128 --ctv iso_v_3`, 3 runs per arm) showed Δ decode-TPS
-= −0.73% and Δ TTFT = −0.46% (both inside ±2σ noise). The gate
-(`gpu_resident_iso_enabled()`) is hardcoded `false` in production; it is only
-controllable in tests. Re-open condition: a production path where
-`decode_fp16_k.is_none()` during steady-state decode. Full numbers:
-`docs/PERF_BASELINE.md`.
+For each calibration prompt, the recipe builds a fresh bf16 KV cache
+(`KvQuant::None`) and runs `forward_seq_with_cache_calibrated` with a
+`SoftmaxMassSink`. At each layer the sink scores the full K against the
+last-position query of each query head, and applies the softmax. It then
+finds the smallest top-k that covers `target_mass`. The budget is the maximum
+over the query heads of a GQA group and over the prompts.
 
 ---
 

@@ -245,7 +245,7 @@ delegate to a store-level `truncate_to`, so no codec truncates its two axes with
 different semantics any more. `Mixed` no longer drops its store either: it rolls
 the fill marker back instead, which is what makes a partial-accept rollback
 under `--kv-quant mixed_*` keep the prefix it was told to keep. See
-`docs/KV_QUANT.md` § "The `Mixed` arm truncates, it no longer resets". `KvStorage::reset` had the identical defect and is
+`docs/KV_QUANT.md` § "The `Mixed` arm truncates to its fill marker". `KvStorage::reset` had the identical defect and is
 rewired the same way. Truncation is also clamped to be monotone-decreasing on
 these six stores: a rollback into the decode window arrives with a target past
 the frozen store's fill, and raising `shape[2]` to meet it would invent coverage
@@ -259,7 +259,7 @@ loud error rather than becoming a half-cut store. What changed is that
 path checks that its payload decodes to exactly `prod(shape)` and errors with
 `"refusing to zero-pad / truncate"` otherwise. Previously the turbo stores
 zero-padded (`out.resize(total, 0.0)`) and the planar stores panicked on an
-out-of-range index. See `docs/KV_QUANT.md` § "Scope — every CPU-side store now
+out-of-range index. See `docs/KV_QUANT.md` § "Scope — every CPU-side store
 cuts, and every one of them is loud".
 
 ### Where a round's time goes
