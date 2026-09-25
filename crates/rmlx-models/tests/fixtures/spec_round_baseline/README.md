@@ -78,11 +78,11 @@ python3 scripts/spec_round_stream_compare.py compare <dir-a> <dir-b>
 A change that renames, adds or drops a field makes two captures incomparable
 line for line while the round's arithmetic is still comparable. `--fields` names
 what to hold them to; an entry spelled `a|b` reads the first of the two a line
-carries, which is how a field that was renamed is still compared:
+carries:
 
 ```sh
 python3 scripts/spec_round_stream_compare.py compare <dir-a> <dir-b> \
-  --fields round,accept,num_draft,n_committed|emitted_round
+  --fields round,accept,num_draft,n_committed,emitted_total
 ```
 
 A field present on one side and not the other is a difference; a field on
