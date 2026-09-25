@@ -286,10 +286,10 @@ and `docs/SSD_CANARY.md`.
 When `PromptCache::push` evicts an entry:
 
 1. **Request thread.** An entry with no full block, or no known codec, is not
-   spilled. Otherwise the spill sink deep-clones the caches, evaluates the
-   clones (`eval_for_spill`) while the Metal context is its own, builds a
-   `SpillJob` and `try_send`s it on a bounded channel of depth 16. A full
-   channel drops the job with a `warn!`; decode never waits.
+   spilled. Otherwise the spill sink deep-clones the caches and evaluates the
+   clones (`eval_for_spill`) while the Metal context is its own. It then
+   `try_send`s a `SpillJob` on a bounded channel of depth 16. A full channel
+   drops the job with a `warn!`; decode never waits.
 2. **Drain thread (`rmlx-kv-spill`).** `block_io::write_caches` serialises the
    job to `<namespace>/<hash>.kvb` and `index.record` adds the row. On error
    it logs, removes any partial file and drops the job. After a recorded block
