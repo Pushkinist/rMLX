@@ -133,6 +133,25 @@ check() { # check LABEL ROOT WANT_EXIT WANT_PATTERN MODE [EXTRA...]
     echo "ok    ${label}  (exit ${rc}, output matched)"
 }
 
+# A pending case states a figure the producer cannot report yet. It stays out
+# of the failure count while the producer misses it, and fails the run the day
+# the producer reports it, so the case is promoted to `check` in the same
+# change that teaches the producer.
+pending=0
+pending_check() { # pending_check LABEL ROOT WANT_EXIT WANT_PATTERN MODE [EXTRA...]
+    local label="$1" root="$2" want_exit="$3" want_pat="$4"; shift 4
+    local out rc
+    out="$(run "${root}" "$@")"
+    rc=$?
+    if [ "${rc}" -eq "${want_exit}" ] && grep -qE -- "${want_pat}" <<<"${out}"; then
+        echo "FAIL  ${label}: pending case now passes; promote it to check" >&2
+        failures=$((failures + 1))
+        return
+    fi
+    echo "PEND  ${label}  (the producer does not report /${want_pat}/ yet)"
+    pending=$((pending + 1))
+}
+
 T="${WORK}/clean"
 build_tree "${T}"
 
@@ -368,9 +387,161 @@ EOF
 check "a site in a test file is not counted" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
 check "--include-tests counts the test file's site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2 --include-tests
 
+# 20 — a match over `Option<KvQuant>` names the variants inside `Some(..)`, and
+# its `None` arm is a variant of `Option`, not a catch-all. It forces a touch.
+T="${WORK}/option"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn label_of(q: Option<KvQuant>) -> usize {
+    match q {
+        Some(KvQuant::One) => 1,
+        Some(KvQuant::Two) => 2,
+        Some(KvQuant::Three) => 3,
+        Some(KvQuant::Four) => 4,
+        None => 0,
+    }
+}
+EOF
+check "a match over Option<KvQuant> is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+check "its None arm is not a catch-all" "${T}" 0 "^forcing-sites 4$" match-sites --threshold 2
+
+# 21 — the `Self::` spelling inside `impl KvStorage` and `impl KvQuant`. The
+# compiler forces a touch on each of these exactly as on a `KvStorage::` arm.
+# Two enums, so a producer that resolves `Self` to one fixed enum fails one of
+# the two.
+T="${WORK}/selfpath"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+
+impl KvStorage {
+    pub fn reset(&mut self) -> usize {
+        match self {
+            Self::Alpha { .. } => 1,
+            Self::Beta { .. } => 2,
+            Self::Gamma { .. } => 3,
+            Self::Delta { .. } => 4,
+        }
+    }
+}
+EOF
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+
+impl KvQuant {
+    pub fn index(&self) -> usize {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Three => 3,
+            Self::Four => 4,
+        }
+    }
+}
+EOF
+pending_check "Self:: arms in both impls are two more sites" "${T}" 0 "^match-sites 5$" match-sites --threshold 2
+
+# 22 — an alias import. `S::Alpha` is `KvStorage::Alpha` to the compiler.
+T="${WORK}/alias"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+use KvStorage as S;
+
+pub fn aliased(s: &S) -> usize {
+    match s {
+        S::Alpha { .. } => 1,
+        S::Beta { .. } => 2,
+        S::Gamma { .. } => 3,
+        S::Delta { .. } => 4,
+    }
+}
+EOF
+pending_check "an alias-path match is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 23 — a glob import. The arms name bare variants.
+T="${WORK}/glob"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+use KvQuant::*;
+
+pub fn bare(q: KvQuant) -> usize {
+    match q {
+        One => 1,
+        Two => 2,
+        Three => 3,
+        Four => 4,
+    }
+}
+EOF
+pending_check "a glob-import match is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 24 — the per-codec dispatch moved one level down, into an enum a KvStorage
+# variant holds. A new codec with a new store still forces a touch there, so a
+# restructure that only moves the sites must not read as a reduction.
+T="${WORK}/slotenum"; build_tree "${T}"
+sed -i.bak 's/    Alpha { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32 },/    Alpha { k: KSlot, v: Option<QuantV>, max_seq: i32 },/' \
+    "${T}/${STORAGE_REL}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+
+pub enum KSlot {
+    Q8(QuantK),
+    Turbo(QuantKTurbo),
+    Iso(QuantIso),
+    Rotor(QuantRotor),
+}
+
+pub fn slot_bytes(k: &KSlot) -> usize {
+    match k {
+        KSlot::Q8(_) => 1,
+        KSlot::Turbo(_) => 2,
+        KSlot::Iso(_) => 3,
+        KSlot::Rotor(_) => 4,
+    }
+}
+EOF
+pending_check "a match over an enum a KvStorage field holds is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
+
+# 25 — a forcing site rewritten as a `matches!` subset. The count drops and a
+# new codec now defaults to `false` there with no compile error. The producer
+# must report the subset, so the drop cannot read as a reduction.
+T="${WORK}/matchesmacro"; build_tree "${T}"
+cat >"${T}/${QUANT_REL}" <<'EOF'
+pub enum KvQuant {
+    One,
+    Two,
+    Three,
+    Four,
+}
+
+pub fn low(q: KvQuant) -> bool {
+    matches!(q, KvQuant::One | KvQuant::Two)
+}
+EOF
+check "a matches! subset is not a match site" "${T}" 0 "^match-sites 2$" match-sites --threshold 2
+pending_check "a matches! subset is reported as a subset site" "${T}" 0 "^subset-sites 1$" match-sites --threshold 2
+
+# 26 — a string spelling table. Its patterns are string literals and its arm
+# bodies name every variant. A new codec that is missing here compiles and
+# cannot be parsed.
+T="${WORK}/spelling"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+
+pub fn parse(s: &str) -> Option<KvQuant> {
+    match s {
+        "one" => Some(KvQuant::One),
+        "two" => Some(KvQuant::Two),
+        "three" => Some(KvQuant::Three),
+        "four" => Some(KvQuant::Four),
+        _ => None,
+    }
+}
+EOF
+check "a spelling table is not a match site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+pending_check "a spelling table is reported as a table site" "${T}" 0 "^table-sites 1$" match-sites --threshold 2
+
 if [ "${failures}" -gt 0 ]; then
     echo >&2
     echo "ERROR: ${failures} case(s) did not reproduce the expected behaviour." >&2
     exit 1
+fi
+if [ "${pending}" -gt 0 ]; then
+    echo "note: ${pending} pending case(s) state figures the census does not report yet."
 fi
 echo "OK: the KV update census reports every planted figure, and refuses every tree it cannot measure."

@@ -285,12 +285,21 @@ touch.
 | `crates/rmlx-models/src/kv_cache/mod.rs` | 1 |
 | `crates/rmlx-server/src/engine/helpers.rs` | 1 |
 
-The target of 3 or fewer is about the six sites in `update.rs`, which the split
-owns. The nine in `quant.rs` are the enum's own `Display`, `FromStr` and
-disposition predicates; they are not this restructure's to remove.
+The target of 3 or fewer is tree-wide: every site in every crate counts.
+This split does not meet it; the site reduction has its own plan.
 
-**Recall.** `scripts/kv_update_census_selftest.sh`, 40 cases over planted
-trees, run by `make kv-update-census-selftest` and by `make ci`. A site in a
+**The census undercounts.** The compiler is the ground truth: plant one
+variant in each enum and count the `E0004` errors. It reads 29 production
+sites, not 26: 25 in `rmlx-kv-quant` and 4 downstream. The three the census
+misses are the `Self::` matches in `impl KvStorage` (`reset`, `truncate_to`,
+`try_deep_clone`). The census also cannot see an alias or glob import, a match
+over an enum a `KvStorage` field holds, a `matches!` subset, or a string
+spelling table such as `FromStr` or the SSD `read_layer` tag dispatch.
+
+**Recall.** `scripts/kv_update_census_selftest.sh`, 49 cases over planted
+trees, run by `make kv-update-census-selftest` and by `make ci`. Six of them
+are pending: each states a figure for one blind spot above that the census
+does not report yet, and fails the run the day the census reports it. A site in a
 file the producer was never told about is found; a collapsed site drops the
 count; a catch-all arm keeps the site and drops the forcing count; a match
 under the bar is not a site; `match` inside a comment or a string literal is
