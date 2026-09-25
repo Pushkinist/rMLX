@@ -134,7 +134,7 @@ fn every_codec_states_the_facts_its_row_holds() {
 /// environment variable while no CLI value is latched, which is the state of
 /// this test binary.
 #[test]
-#[allow(unsafe_code)]
+#[allow(unsafe_code, reason = "env write under env_lock")]
 fn every_codec_states_the_cpu_hot_path_class_its_row_holds() {
     let _guard = crate::test_utils::env_lock();
     assert!(

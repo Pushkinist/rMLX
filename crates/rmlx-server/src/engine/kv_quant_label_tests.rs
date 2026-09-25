@@ -1,6 +1,7 @@
 //! The metrics label of every codec, held against the literal codec table of
 //! `rmlx-kv-quant`. The label bytes are what the metrics DB groups rows by, so
 //! they must not move when the label table moves into the codec crate.
+//! The `include!` goes when the label producer moves into `rmlx-kv-quant`.
 
 use super::kv_quant_label;
 use rmlx_kv_quant::ALL_KV_QUANTS;

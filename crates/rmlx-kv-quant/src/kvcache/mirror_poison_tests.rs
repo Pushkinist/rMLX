@@ -2,8 +2,9 @@
 //!
 //! The predicates `feeds_bf16_{k,v}_at_decode` and `decode_reads_packed_store`
 //! state which buffer a decode step reads. This probe does not read them. It
-//! prefills a cache, poisons one buffer, runs one decode step and compares the
-//! output with the output of an unpoisoned twin:
+//! prefills a cache, runs one clean decode step, poisons one buffer, runs a
+//! second step and compares that step's output with the second step of an
+//! unpoisoned twin:
 //!
 //! * the bf16 mirror of one axis, filled with a sentinel;
 //! * the packed store of one axis, swapped for a store of the same codec that
@@ -23,8 +24,10 @@
 //!
 //! The store poison puts a store in place even where `exit_prefill` built none,
 //! so a codec that decodes off its mirror is shown to ignore a store that is
-//! there. The mirror poison needs a mirror: a codec with none on an axis has no
-//! mirror to ignore, and that cell is decided by what `exit_prefill` built.
+//! there. The mirror poison needs a mirror, so on an axis whose row says decode
+//! does not read one, the probe asserts that no mirror is there after either
+//! step. The clean first step is what lets a mirror that decode builds lazily
+//! turn such a cell red.
 //!
 //! The decode entry is the one a model layer calls: `update_and_sdpa`, and
 //! `update_and_sdpa_shared_source` for a cache that shares its K/V. On the CPU
@@ -203,8 +206,8 @@ fn poison_store(storage: &mut KvStorage, donor: &mut KvStorage, axis: Axis) -> b
     }
 }
 
-/// A cache of the same codec whose store holds other rows at the prefill
-/// length. It is filled on the decode route, the one CPU route on which every
+/// A cache of the same codec whose store holds other rows at the length the
+/// probed cache has after its first decode step. It is filled on the decode route, the one CPU route on which every
 /// codec writes its store, so it has a store where the prefilled cache may
 /// have none.
 #[allow(
@@ -213,7 +216,7 @@ fn poison_store(storage: &mut KvStorage, donor: &mut KvStorage, axis: Axis) -> b
 )]
 fn donor(quant: KvQuant) -> KvStorage {
     let mut cache = KvCache::with_quant_max_seq(quant, MAX_SEQ);
-    let shape = [1_i32, KV_H, PREFILL_SEQ, HEAD_DIM];
+    let shape = [1_i32, KV_H, PREFILL_SEQ + 1, HEAD_DIM];
     let n: usize = shape.iter().map(|&d| d as usize).product();
     let k = f32_arr(&lcg_data(n, DONOR_SEED), &shape);
     let v = f32_arr(&lcg_data(n, DONOR_SEED ^ 0x5a5a), &shape);
@@ -227,17 +230,18 @@ fn donor(quant: KvQuant) -> KvStorage {
     cache.storage
 }
 
-/// One decode step through the entry a model layer calls. The digest covers
+/// Decode step `step` (1 or 2) through the entry a model layer calls. The
+/// digest covers
 /// the attention output and, for a cache that shares its K/V, the pair it hands
 /// on. An error is an observation too: a decode that cannot run without a
 /// buffer read that buffer.
-fn decode_digest(cache: &mut KvCache, shares_kv: bool) -> Result<u64, String> {
-    let step = [1_i32, KV_H, 1, HEAD_DIM];
-    let n: usize = step.iter().map(|&d| d as usize).product();
-    let seed = TEST_SEED.wrapping_add(1);
-    let q = f32_arr(&lcg_data(n, seed ^ 0x3c3c), &step);
-    let k = f32_arr(&lcg_data(n, seed), &step);
-    let v = f32_arr(&lcg_data(n, seed ^ 0x5a5a), &step);
+fn decode_digest(cache: &mut KvCache, shares_kv: bool, step: u64) -> Result<u64, String> {
+    let shape = [1_i32, KV_H, 1, HEAD_DIM];
+    let n: usize = shape.iter().map(|&d| d as usize).product();
+    let seed = TEST_SEED.wrapping_add(step);
+    let q = f32_arr(&lcg_data(n, seed ^ 0x3c3c), &shape);
+    let k = f32_arr(&lcg_data(n, seed), &shape);
+    let v = f32_arr(&lcg_data(n, seed ^ 0x5a5a), &shape);
     let mut bytes = Vec::new();
     if shares_kv {
         let (out, shared) = cache
@@ -263,8 +267,8 @@ fn decode_digest(cache: &mut KvCache, shares_kv: bool) -> Result<u64, String> {
 /// What the literal row says about one poison: whether the poisoned buffer is
 /// there after the poison, and whether it moves the decode output.
 ///
-/// A mirror is there exactly when decode reads it, because `exit_prefill`
-/// builds no mirror that decode does not read. A store is there whenever the
+/// A mirror is there exactly when decode reads it:
+/// [`assert_no_unread_mirror`] holds the other half. A store is there whenever the
 /// row names one on that axis, because the donor puts one in place.
 fn row_expects(quant: KvQuant, shares_kv: bool, poison: Poison) -> (bool, bool) {
     let spelling = quant.to_string();
@@ -287,6 +291,26 @@ fn row_expects(quant: KvQuant, shares_kv: bool, poison: Poison) -> (bool, bool) 
     }
 }
 
+/// On each axis whose row says decode does not read a mirror, no mirror is
+/// there. `when` names the point in the drive.
+fn assert_no_unread_mirror(cache: &KvCache, quant: KvQuant, shares_kv: bool, when: &str) {
+    let spelling = quant.to_string();
+    let Some(row) = facts_for(&spelling) else {
+        panic!("{spelling}: no row in codec_facts_table.rs")
+    };
+    let i = usize::from(shares_kv);
+    for (axis, feeds, mirror) in [
+        (Axis::K, row.feeds_bf16_k[i], &cache.decode_fp16_k),
+        (Axis::V, row.feeds_bf16_v[i], &cache.decode_fp16_v),
+    ] {
+        assert!(
+            feeds || mirror.is_none(),
+            "{spelling} shares_kv={shares_kv}: a {axis:?} mirror is there {when}, but the row \
+             says decode does not read one"
+        );
+    }
+}
+
 const POISONS: [Poison; 4] = [
     Poison::Mirror(Axis::K),
     Poison::Mirror(Axis::V),
@@ -302,14 +326,26 @@ fn decode_reads_exactly_the_buffers_each_row_names() {
     for &quant in ALL_KV_QUANTS {
         for shares_kv in [false, true] {
             let cell = format!("{quant} shares_kv={shares_kv}");
-            let baseline = decode_digest(&mut prefilled(quant, shares_kv), shares_kv);
+            let mut twin = prefilled(quant, shares_kv);
+            let first = decode_digest(&mut twin, shares_kv, 1);
+            assert!(
+                first.is_ok(),
+                "{cell}: the clean first step failed: {first:?}"
+            );
+            let baseline = decode_digest(&mut twin, shares_kv, 2);
             assert!(
                 baseline.is_ok(),
-                "{cell}: the unpoisoned decode step failed: {baseline:?}"
+                "{cell}: the unpoisoned second step failed: {baseline:?}"
             );
             for poison in POISONS {
                 let (expect_present, expect_moves) = row_expects(quant, shares_kv, poison);
                 let mut cache = prefilled(quant, shares_kv);
+                assert_eq!(
+                    decode_digest(&mut cache, shares_kv, 1),
+                    first,
+                    "{cell}: two clean first steps differ"
+                );
+                assert_no_unread_mirror(&cache, quant, shares_kv, "after the first step");
                 let present = match poison {
                     Poison::Mirror(axis) => poison_mirror(&mut cache, axis),
                     Poison::Store(axis) => {
@@ -324,7 +360,8 @@ fn decode_reads_exactly_the_buffers_each_row_names() {
                     if present { "" } else { "not " },
                     if expect_present { "" } else { "not " },
                 );
-                let moved = decode_digest(&mut cache, shares_kv) != baseline;
+                let moved = decode_digest(&mut cache, shares_kv, 2) != baseline;
+                assert_no_unread_mirror(&cache, quant, shares_kv, "after the second step");
                 assert_eq!(
                     moved,
                     expect_moves,
