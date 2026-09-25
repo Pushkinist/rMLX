@@ -14,7 +14,7 @@ each one reaches a matmul. KV-cache codecs are a separate axis; see
 | `mxfp8` | 8 | 32 | E8M0, 1 B | — | MLX `quantized_matmul`, mode `mxfp8` |
 | `mxfp4` | 4 | 32 | E8M0, 1 B | — | MLX `quantized_matmul`, mode `mxfp4` |
 | `nvfp4` | 4 | 16 | E4M3, 1 B | — | MLX `quantized_matmul`, mode `nvfp4` |
-| affine `qN_gG` | 2, 3, 4, 5, 6, 8 | 32, 64, 128 | bf16 | bf16 (additive) | MLX `quantized_matmul`, mode `affine` |
+| affine `qN_gG` | 2, 3, 4, 5, 6, 8 | 32, 64, 128 | float (bf16 or f16 on disk), cast to bf16 | same as scale (additive) | MLX `quantized_matmul`, mode `affine` |
 | ternary (BitLinear) | 2 per trit | tensor-wide | bf16 scalar | — | unpacked to bf16 at load, plain matmul |
 | ParoQuant | 4 (affine) | per checkpoint | f16 | f16 | activation rotation, then `quantized_matmul` |
 
@@ -290,8 +290,8 @@ rows:
 ```
 x[c] = x[c] × channel_scales[c]        for every channel c in the group
 for round in 0..krot:
-    (i, j) = packed_pairs[round]
-    (x[i], x[j]) = (x[i] × cos + x[j] × sin, x[j] × cos - x[i] × sin)
+    for each pair (i, j) of the group in packed_pairs[round]:
+        (x[i], x[j]) = (x[i] × cos + x[j] × sin, x[j] × cos - x[i] × sin)
 ```
 
 The rotated activations then go through `quantized_matmul` with group size,
@@ -320,7 +320,7 @@ Bytes on disk per weight element:
 | mxfp8 | 1.00 | 1 B / 32 elements |
 | mxfp4 | 0.50 | 1 B / 32 elements |
 | nvfp4 | 0.50 | 1 B / 16 elements |
-| affine N-bit, group G | N / 8 | 4 B / G elements (bf16 scale + bias) |
+| affine N-bit, group G | N / 8 | 4 B / G elements (16-bit scale + bias) |
 | ternary | 0.25 | one bf16 scalar per tensor |
 
 ---
