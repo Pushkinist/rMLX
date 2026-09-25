@@ -544,8 +544,8 @@ fn planar_widths_are_byte_identical_and_the_others_pay_for_their_bits() {
     assert!(
         three_db > four_db,
         "planar4 {four_db:.2} dB now beats planar3 {three_db:.2} dB at the same rate. The \
-         documented dominance has flipped — update docs/KV_QUANT.md and this test rather \
-         than deleting it"
+         documented dominance has flipped — update docs/TESTING.md \"a strictly dominated width\" \
+         and this test rather than deleting it"
     );
 
     // iso and rotor: the dense code plane charges for the extra bit, one per
@@ -634,7 +634,8 @@ fn trellis_coded_quantization_claws_back_nothing() {
                 gain.abs() < 1e-3,
                 "the trellis moved distortion by {gain:+.4} dB at bits={bits} on {label}. \
                  It is documented as degenerate and measured at 0.000 dB — if it now does \
-                 something, update docs/KV_QUANT.md and re-point this test"
+                 something, update docs/KV_QUANT.md \"Measured claw-back: 0.000 dB\" and re-point \
+                 this test"
             );
         }
     }

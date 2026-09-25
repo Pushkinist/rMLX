@@ -83,7 +83,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SIM_THRESHOLD = 0.60
-DOC_SIZE_THRESHOLD_KB = 40
+DOC_SIZE_THRESHOLD_KIB = 40
 LOC_THRESHOLD = 1000
 
 SIBLING_DIRS = ("crates/rmlx-kv-quant", "crates/rmlx-models")
@@ -965,20 +965,33 @@ def report_add_remove_ratio(root: Path, since: str | None, lines: list[str]) -> 
 # ---- section 4: doc sizes ---------------------------------------------------
 
 
+def git_ignored(root: Path, paths: list[str]) -> set[str]:
+    """The paths git ignores under `root`; none when `root` is not a git tree."""
+    proc = subprocess.run(
+        ["git", "-C", str(root), "check-ignore", "--stdin"],
+        input="\n".join(paths),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return set(proc.stdout.split()) if proc.returncode == 0 else set()
+
+
 def report_doc_sizes(root: Path, lines: list[str]) -> None:
     lines.append("")
-    lines.append(f"=== docs over {DOC_SIZE_THRESHOLD_KB} KB ===")
+    lines.append(f"=== docs over {DOC_SIZE_THRESHOLD_KIB} KiB ===")
     docs_dir = root / "docs"
+    docs = sorted(f.relative_to(root).as_posix() for f in docs_dir.rglob("*.md")) if docs_dir.is_dir() else []
+    ignored = git_ignored(root, docs)
     over = []
-    if docs_dir.is_dir():
-        for f in sorted(docs_dir.glob("*.md")):
-            size_kb = f.stat().st_size / 1024
-            if size_kb > DOC_SIZE_THRESHOLD_KB:
-                over.append((f.name, size_kb))
+    for name in docs:
+        size_kib = (root / name).stat().st_size / 1024
+        if name not in ignored and size_kib > DOC_SIZE_THRESHOLD_KIB:
+            over.append((name, size_kib))
     if not over:
-        lines.append(f"  no docs/*.md file exceeds the {DOC_SIZE_THRESHOLD_KB} KB threshold")
-    for name, size_kb in over:
-        lines.append(f"  docs/{name}  {size_kb:.1f} KB")
+        lines.append(f"  no docs/**/*.md file exceeds the {DOC_SIZE_THRESHOLD_KIB} KiB threshold")
+    for name, size_kib in over:
+        lines.append(f"  {name}  {size_kib:.1f} KiB")
 
 
 def main(argv: list[str] | None = None) -> int:

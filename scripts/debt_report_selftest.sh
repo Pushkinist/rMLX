@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # scripts/debt_report_selftest.sh — fixture test for scripts/lib/debt_report.py.
-# doc-refs: fixture — the docs/ paths below belong to the synthetic scan roots.
 #
 # WHY
 #   The report always exits 0 (advisory) — see scripts/debt_report.sh — so its
@@ -31,9 +30,9 @@
 #   spelled as its own segment (update_rotor_5_sym) is what separates a
 #   separator-collapsing key from one that leaves a doubled separator behind.
 #   The two size-critical
-#   docs (over/under the 40 KB threshold) are generated into a throwaway copy
+#   docs (over/under the 40 KiB threshold) are generated into a throwaway copy
 #   of the fixture at run time rather than committed, so this test does not
-#   carry ~250 KB of filler into the tree's own churn count. The churn section
+#   carry ~165 KB of filler into the tree's own churn count. The churn section
 #   needs real git history, which the base fixture does not have on its own
 #   (it is a subtree of this repo's working copy) — it builds its own
 #   throwaway two-commit, one-tag repo in a temp dir instead.
@@ -131,9 +130,14 @@ python3 - "$STATIC_WORK/base/docs" <<'EOF'
 import sys
 docs = sys.argv[1]
 big = ("This is a filler line documenting a codec variant in detail.\n" * 700)
-open(f"{docs}/BIG.md", "w").write("# Big doc\n\n" + big)  # ~42 KB, over the 40 KB threshold
+open(f"{docs}/BIG.md", "w").write("# Big doc\n\n" + big)  # 42,711 B, over the 40 KiB threshold
 almost = ("This is a filler line documenting a codec variant in detail.\n" * 650)
-open(f"{docs}/ALMOST.md", "w").write("# Almost doc\n\n" + almost)  # ~39 KB, under the threshold
+open(f"{docs}/ALMOST.md", "w").write("# Almost doc\n\n" + almost)  # 39,664 B, under the threshold
+# 40,500 B: over 40 KB, under 40 KiB. A report that counted in KB would list it.
+open(f"{docs}/EDGE.md", "w").write("x" * 40499 + "\n")
+import os
+os.makedirs(f"{docs}/models/deep")
+open(f"{docs}/models/deep/NESTED.md", "w").write("# Nested doc\n\n" + big)
 EOF
 
 BASE_OUT=$(python3 "$TOOL" --root "$STATIC_WORK/base" --since HEAD)
@@ -1201,7 +1205,7 @@ check_exit "matched_lines_turbo_ssd_missing_exit" \
 rm -rf "$ABSENT_WORK"
 
 check "doc_over_threshold_listed" \
-    "BIG.md, generated over the 40 KB threshold, is listed" \
+    "BIG.md, generated over the 40 KiB threshold, is listed" \
     contains "docs/BIG.md" \
     BASE_OUT
 
@@ -1213,6 +1217,21 @@ check "doc_under_threshold_absent" \
 check "doc_just_under_threshold_absent" \
     "ALMOST.md, generated just under the threshold, is not listed" \
     absent "ALMOST.md" \
+    BASE_OUT
+
+check "doc_size_unit_is_kib" \
+    "EDGE.md, 40,500 B, is over 40 KB and under 40 KiB, and is not listed" \
+    absent "EDGE.md" \
+    BASE_OUT
+
+check "doc_size_label_is_kib" \
+    "the section names its unit as KiB" \
+    contains "=== docs over 40 KiB ===" \
+    BASE_OUT
+
+check "doc_nested_over_threshold_listed" \
+    "a doc below docs/ in a subdirectory is scanned too" \
+    contains "models/deep/NESTED.md" \
     BASE_OUT
 
 check "dead_path_not_attempted" \
@@ -1343,6 +1362,24 @@ check "ratio_unavailable_on_bad_ref" \
     "an unresolvable --since is reported as unavailable, not read as zero churn" \
     contains "unavailable (" \
     UNAVAILABLE_OUT
+
+# The doc-size scan skips what git ignores: a local, untracked doc is not a
+# public doc, however large.
+mkdir -p "$RATIO_WORK/docs/private"
+printf 'docs/private/\n' >"$RATIO_WORK/.gitignore"
+python3 -c 'import sys; open(sys.argv[1], "w").write("x" * 50000)' "$RATIO_WORK/docs/private/HIDDEN.md"
+python3 -c 'import sys; open(sys.argv[1], "w").write("x" * 50000)' "$RATIO_WORK/docs/SHOWN.md"
+IGNORED_OUT=$(python3 "$TOOL" --root "$RATIO_WORK")
+
+check "doc_size_skips_ignored" \
+    "a gitignored doc over the threshold is not listed" \
+    absent "HIDDEN.md" \
+    IGNORED_OUT
+
+check "doc_size_keeps_untracked" \
+    "an untracked doc git does not ignore is listed" \
+    contains "SHOWN.md" \
+    IGNORED_OUT
 
 if [ "$FAILED" -ne 0 ]; then
     echo "debt-report selftest: FAIL ($FAILED of $((PASSED + FAILED)))" >&2
