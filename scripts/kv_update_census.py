@@ -5,9 +5,16 @@ Four modes, each printing one figure the restructure is judged on:
 
 * `variants` — every `KvStorage` variant with its field shape, and the census
   of how many carry the store-slot shape the restructure writes one body for.
-* `match-sites` — every `match` over `KvStorage` or `KvQuant` that enumerates
-  the codec surface, per file, and the count. This is the "match sites a new
-  codec must touch" figure.
+* `match-sites` — every `match` over a codec enum that enumerates the codec
+  surface, per file, and the count. This is the "match sites a new codec must
+  touch" figure. The codec enums are `KvStorage`, `KvQuant` and every enum a
+  `KvStorage` field holds. A variant is found through its enum's path, an
+  alias of it, `Self` inside an `impl` of it, or a glob import of it. Two more
+  figures count what a new codec does not break at compile time:
+  `subset-sites` (a `matches!` naming a codec variant, and a `match` under the
+  bar with a catch-all arm) and `table-sites` (a `match` keyed by string
+  literals or constants whose arm bodies name at least half of one codec
+  enum).
 * `update-bodies` — every `update_`-prefixed fn of the update files, with the
   file it sits in and the lines its body holds.
 * `refs` — `KvStorage::` / `KvQuant::` variant references in one file.
@@ -27,16 +34,21 @@ import argparse
 import math
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 from debt_report import extract_fns, is_test_path  # noqa: E402
 from rust_scan import (  # noqa: E402
+    MatchArm,
     ScanError,
     blank_text,
+    block_end,
+    enum_body,
     enum_variants,
     match_sites,
+    matches_macros,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -125,106 +137,257 @@ def mode_variants(root: Path) -> None:
     print(f"shape store_slots_total {sum(counts.get(k, 0) for k in ('kv_slots', 'kv_slots_plus', 'k_only'))}")
 
 
-def enum_variant_count(root: Path, rel: str, name: str) -> int:
-    path = root / rel
-    if not path.is_file():
-        fail(f"{rel} is not a file under {root}")
-    _src, blanked = read_blanked(path)
-    try:
-        variants = enum_variants(blanked, name)
-    except ScanError as exc:
-        fail(f"{rel}: {exc}")
-        raise
-    if not variants:
-        fail(f"enum {name} holds no variant")
-    return len(variants)
+BASE_ENUMS = (("KvStorage", STORAGE_ENUM_FILE), ("KvQuant", QUANT_ENUM_FILE))
+TYPE_NAME = re.compile(r"\b[A-Z][A-Za-z0-9_]*\b")
+ENUM_DEF = re.compile(r"\benum\s+([A-Z][A-Za-z0-9_]*)\b")
+USE_STMT = re.compile(r"\buse\b[^;]*;")
+#: A capitalised name that is not a path segment: a variant, if a glob import
+#: brought an enum holding it into scope.
+BARE_NAME = re.compile(r"(?<![\w:])([A-Z][A-Za-z0-9_]*)\b(?!\s*::)")
+SOME_ARM = re.compile(r"\bSome\s*\(")
+CATCH_ALL = re.compile(r"^(?:_|[a-z_][A-Za-z0-9_]*)$")
+#: A table key: a string literal (blanked to spaces) or a `SCREAMING_CASE`
+#: constant, bare or behind a path.
+TABLE_KEY = re.compile(r'^(?:b?"[^"]*"|(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Z0-9_]*)$')
 
 
-def candidate_files(root: Path, include_tests: bool) -> list[Path]:
+def source_files(root: Path, include_tests: bool) -> dict[str, str]:
+    """Blanked text of every Rust file under `crates`, keyed by its path."""
     base = root / CRATES_DIR
     if not base.is_dir():
         fail(f"{CRATES_DIR} is not a directory under {root}")
-    out: list[Path] = []
+    out: dict[str, str] = {}
     for path in sorted(base.rglob("*.rs")):
         rel = path.relative_to(root)
         if "target" in rel.parts:
             continue
         if not include_tests and is_test_path(rel):
             continue
-        text = path.read_text(errors="ignore")
-        if "KvStorage::" in text or "KvQuant::" in text:
-            out.append(path)
+        _src, out[str(rel)] = read_blanked(path)
     return out
 
 
-CATCH_ALL = re.compile(r"^(?:_|[a-z_][A-Za-z0-9_]*)$")
+def enum_in(rel: str, blanked: str, name: str) -> tuple[list[str], set[str]]:
+    """Variant names of `enum <name>`, and the type names its fields hold."""
+    try:
+        variants = [v for v, _fields in enum_variants(blanked, name)]
+        body = enum_body(blanked, name)
+    except ScanError as exc:
+        fail(f"{rel}: {exc}")
+        raise
+    if not variants:
+        fail(f"enum {name} holds no variant")
+    return variants, set(TYPE_NAME.findall(body)) - set(variants)
 
 
-def arm_variants(pattern: str) -> tuple[set[str], set[str], bool]:
-    """`(KvStorage names, KvQuant names, is catch-all)` for one arm pattern."""
-    guard = pattern.split(" if ", 1)[0].strip()
-    storage = set(re.findall(r"\bKvStorage::([A-Za-z0-9_]+)", guard))
-    quant = set(re.findall(r"\bKvQuant::([A-Za-z0-9_]+)", guard))
-    catch_all = False
-    for alt in guard.split("|"):
-        alt = alt.strip().rstrip("@").strip()
-        if CATCH_ALL.match(alt):
-            catch_all = True
-    return storage, quant, catch_all
+def codec_enums(root: Path, sources: dict[str, str]) -> dict[str, list[str]]:
+    """Variant names of `KvStorage`, `KvQuant`, and every enum a `KvStorage`
+    field holds.
+
+    The held set is closed transitively, so a dispatch moved into an enum
+    below `KvStorage` stays a site and does not read as a reduction.
+    """
+    enums: dict[str, list[str]] = {}
+    held: list[str] = []
+    for name, rel in BASE_ENUMS:
+        if rel not in sources:
+            fail(f"{rel} is not a file under {root}")
+        enums[name], types = enum_in(rel, sources[rel], name)
+        if name == "KvStorage":
+            held = sorted(types)
+    defs: dict[str, list[str]] = {}
+    for rel, blanked in sources.items():
+        for m in ENUM_DEF.finditer(blanked):
+            defs.setdefault(m.group(1), []).append(rel)
+    while held:
+        name = held.pop(0)
+        if name in enums or name not in defs:
+            continue
+        if len(defs[name]) > 1:
+            fail(f"enum {name}, held by a KvStorage field, is defined in {len(defs[name])} files")
+        enums[name], types = enum_in(defs[name][0], sources[defs[name][0]], name)
+        held.extend(sorted(types))
+    return enums
+
+
+def impl_self_type(header: str) -> str:
+    """The last path segment of the type an `impl` header is for."""
+    head = re.split(r"\bwhere\b", header)[0]
+    if re.search(r"\bfor\b", head):
+        head = re.split(r"\bfor\b", head)[-1]
+    else:
+        head = head.strip()
+        if head.startswith("<"):
+            depth = 0
+            for i, c in enumerate(head):
+                depth += (c == "<") - (c == ">")
+                if depth == 0:
+                    head = head[i + 1 :]
+                    break
+    m = re.match(r"\s*([A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)", head)
+    return re.split(r"\s*::\s*", m.group(1))[-1] if m else ""
+
+
+@dataclass
+class Scope:
+    """How one file spells the codec enums: path prefixes (each enum's name
+    and its `use … as` aliases), glob-imported enums, and the spans of the
+    `impl` blocks where `Self` is one of them."""
+
+    prefixes: dict[str, str]
+    globs: list[str]
+    impls: list[tuple[int, int, str]]
+
+    def self_at(self, pos: int) -> str | None:
+        inner = [(start, name) for start, end, name in self.impls if start <= pos < end]
+        return max(inner)[1] if inner else None
+
+    def names_a_variant(self, blanked: str) -> bool:
+        return bool(self.globs or self.impls) or any(
+            re.search(rf"\b{re.escape(p)}\s*::", blanked) for p in self.prefixes
+        )
+
+
+def file_scope(blanked: str, enums: dict[str, list[str]]) -> Scope:
+    prefixes = {name: name for name in enums}
+    globs: list[str] = []
+    for stmt in USE_STMT.finditer(blanked):
+        for name in enums:
+            for alias in re.findall(rf"\b{name}\s+as\s+([A-Za-z_]\w*)", stmt.group(0)):
+                prefixes[alias] = name
+            if re.search(rf"\b{name}\s*::\s*\*", stmt.group(0)) and name not in globs:
+                globs.append(name)
+    impls: list[tuple[int, int, str]] = []
+    for m in re.finditer(r"\bimpl\b", blanked):
+        brace = blanked.find("{", m.end())
+        semi = blanked.find(";", m.end())
+        if brace < 0 or 0 <= semi < brace:
+            continue
+        name = prefixes.get(impl_self_type(blanked[m.end() : brace]))
+        if name:
+            impls.append((brace, block_end(blanked, brace), name))
+    return Scope(prefixes, globs, impls)
+
+
+def named(text: str, pos: int, scope: Scope, enums: dict[str, list[str]]) -> dict[str, set[str]]:
+    """The codec variants `text` names, per enum. `pos` places `Self`.
+
+    Where `text` also holds a `Some(..)`, a bare `None` is `Option`'s, not a
+    glob-imported variant.
+    """
+    out: dict[str, set[str]] = {name: set() for name in enums}
+    prefixes = dict(scope.prefixes)
+    self_ty = scope.self_at(pos)
+    if self_ty:
+        prefixes["Self"] = self_ty
+    for prefix, name in prefixes.items():
+        for v in re.findall(rf"\b{re.escape(prefix)}\s*::\s*([A-Za-z_]\w*)", text):
+            if v in enums[name]:
+                out[name].add(v)
+    option = SOME_ARM.search(text) is not None
+    for v in BARE_NAME.findall(text):
+        if option and v == "None":
+            continue
+        for name in scope.globs:
+            if v in enums[name]:
+                out[name].add(v)
+    return out
+
+
+def widest(counts: dict[str, set[str]], bars: dict[str, int]) -> tuple[str, int] | None:
+    """The enum naming the most variants among those named at or over their bar."""
+    best: tuple[str, int] | None = None
+    for name, bar in bars.items():
+        n = len(counts[name])
+        if n >= max(bar, 1) and (best is None or n > best[1]):
+            best = (name, n)
+    return best
+
+
+def most_named(counts: dict[str, set[str]]) -> tuple[str, int]:
+    name = max(counts, key=lambda k: len(counts[k]))
+    return name, len(counts[name])
+
+
+def alternatives(pattern: str) -> list[str]:
+    return [alt.strip().rstrip("@").strip() for alt in pattern.split(" if ", 1)[0].split("|")]
+
+
+def is_table(arms: list[MatchArm]) -> bool:
+    """Every arm is keyed by a string literal or a constant, or is a catch-all."""
+    keyed = False
+    for arm in arms:
+        for alt in alternatives(arm.pattern):
+            if CATCH_ALL.match(alt):
+                continue
+            if not TABLE_KEY.match(alt):
+                return False
+            keyed = True
+    return keyed
 
 
 def mode_match_sites(root: Path, threshold: int | None, include_tests: bool) -> None:
-    storage_total = enum_variant_count(root, STORAGE_ENUM_FILE, "KvStorage")
-    quant_total = enum_variant_count(root, QUANT_ENUM_FILE, "KvQuant")
-    files = candidate_files(root, include_tests)
-    if not files:
-        fail(f"no source file under {CRATES_DIR} names a KvStorage or KvQuant variant")
+    sources = source_files(root, include_tests)
+    enums = codec_enums(root, sources)
 
     # A site naming fewer than half the enum's variants is a case analysis over
     # a subset; at half or more it enumerates the codec surface, which is the
     # population the restructure has to shrink. Derived from the enum rather
     # than fixed, so a codec added or retired moves the bar with it.
-    bar_storage = threshold if threshold is not None else math.ceil(storage_total / 2)
-    bar_quant = threshold if threshold is not None else math.ceil(quant_total / 2)
-    print(f"enum KvStorage variants={storage_total} threshold={bar_storage}")
-    print(f"enum KvQuant variants={quant_total} threshold={bar_quant}")
+    bars = {name: threshold if threshold is not None else math.ceil(len(v) / 2) for name, v in enums.items()}
+    for name, variants in enums.items():
+        print(f"enum {name} variants={len(variants)} threshold={bars[name]}")
 
     per_file: dict[str, int] = {}
-    forcing = 0
-    total = 0
-    for path in files:
-        rel = str(path.relative_to(root))
+    total = forcing = subsets = tables = candidates = 0
+    for rel, blanked in sources.items():
+        scope = file_scope(blanked, enums)
+        if not scope.names_a_variant(blanked):
+            continue
+        candidates += 1
         try:
-            _src, blanked = read_blanked(path)
             sites = match_sites(blanked)
+            macros = matches_macros(blanked)
         except ScanError as exc:
             fail(f"{rel}: {exc}")
+            raise
         for site in sites:
-            storage: set[str] = set()
-            quant: set[str] = set()
-            catch_all = False
-            for arm in site.arms:
-                s, q, c = arm_variants(arm.pattern)
-                storage |= s
-                quant |= q
-                catch_all = catch_all or c
-            over = storage if len(storage) >= len(quant) else quant
-            which = "KvStorage" if over is storage else "KvQuant"
-            bar = bar_storage if which == "KvStorage" else bar_quant
-            if len(over) < bar:
+            counts = named(" | ".join(arm.pattern for arm in site.arms), site.start, scope, enums)
+            catch_all = any(CATCH_ALL.match(alt) for arm in site.arms for alt in alternatives(arm.pattern))
+            hit = widest(counts, bars)
+            if hit:
+                total += 1
+                per_file[rel] = per_file.get(rel, 0) + 1
+                forcing += not catch_all
+                print(
+                    f"site {rel}:{site.line} enum={hit[0]} variants={hit[1]} "
+                    f"arms={len(site.arms)} catch_all={'yes' if catch_all else 'no'}"
+                )
                 continue
-            total += 1
-            per_file[rel] = per_file.get(rel, 0) + 1
-            if not catch_all:
-                forcing += 1
-            print(
-                f"site {rel}:{site.line} enum={which} variants={len(over)} "
-                f"arms={len(site.arms)} catch_all={'yes' if catch_all else 'no'}"
-            )
+            name, n = most_named(counts)
+            if n and catch_all:
+                subsets += 1
+                print(f"subset {rel}:{site.line} kind=wildcard enum={name} variants={n}")
+                continue
+            if n or not is_table(site.arms):
+                continue
+            hit = widest(named(" ".join(arm.body for arm in site.arms), site.start, scope, enums), bars)
+            if hit:
+                tables += 1
+                print(f"table {rel}:{site.line} enum={hit[0]} variants={hit[1]} arms={len(site.arms)}")
+        for macro in macros:
+            name, n = most_named(named(macro.arms[0].pattern, macro.start, scope, enums))
+            if n:
+                subsets += 1
+                print(f"subset {rel}:{macro.line} kind=matches enum={name} variants={n}")
+    if not candidates:
+        fail(f"no source file under {CRATES_DIR} names a KvStorage or KvQuant variant")
     for rel in sorted(per_file):
         print(f"file {rel} {per_file[rel]}")
     print(f"match-sites {total}")
     print(f"forcing-sites {forcing}")
+    print(f"subset-sites {subsets}")
+    print(f"table-sites {tables}")
 
 
 def update_files(root: Path) -> list[Path]:

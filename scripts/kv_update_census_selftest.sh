@@ -11,9 +11,9 @@
 #   finished on the day the scan broke. A case that asserted only "non-zero"
 #   would pass against a producer that had stopped finding any site at all.
 #
-#   Nothing here hard-codes a figure the producer derives from the real tree:
-#   the fixtures are their own trees, and each case states the number its own
-#   planted source implies.
+#   The fixtures are their own trees, and each case states the number its own
+#   planted source implies. The last cases pin the real tree's site figures,
+#   so a change that moves one re-pins it in the same change.
 #
 # EXIT CODES
 #   0  every case produced the expected exit code and output
@@ -133,31 +133,6 @@ check() { # check LABEL ROOT WANT_EXIT WANT_PATTERN MODE [EXTRA...]
     echo "ok    ${label}  (exit ${rc}, output matched)"
 }
 
-# A pending case states a figure the producer cannot report yet, and the
-# figure it reports today. Today's figure keeps the case in the run; the
-# wanted figure fails the run, so the change that teaches the producer promotes
-# the case to `check`. Any third output, an exit 2 included, fails the run.
-pending=0
-pending_check() { # pending_check LABEL ROOT WANT_EXIT WANT_PATTERN NOW_EXIT NOW_PATTERN MODE [EXTRA...]
-    local label="$1" root="$2" want_exit="$3" want_pat="$4" now_exit="$5" now_pat="$6"; shift 6
-    local out rc
-    out="$(run "${root}" "$@")"
-    rc=$?
-    if [ "${rc}" -eq "${want_exit}" ] && grep -qE -- "${want_pat}" <<<"${out}"; then
-        echo "FAIL  ${label}: pending case now passes; promote it to check" >&2
-        failures=$((failures + 1))
-        return
-    fi
-    if [ "${rc}" -ne "${now_exit}" ] || ! grep -qE -- "${now_pat}" <<<"${out}"; then
-        echo "FAIL  ${label}: exit ${rc}, expected today's exit ${now_exit} and /${now_pat}/" >&2
-        echo "${out}" | head -5 >&2
-        failures=$((failures + 1))
-        return
-    fi
-    echo "PEND  ${label}  (reports /${now_pat}/ today; /${want_pat}/ is pending)"
-    pending=$((pending + 1))
-}
-
 T="${WORK}/clean"
 build_tree "${T}"
 
@@ -167,6 +142,8 @@ build_tree "${T}"
 check "clean tree counts its sites" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
 check "clean tree: all three force a touch" "${T}" 0 "^forcing-sites 3$" match-sites --threshold 2
 check "clean tree: per-file count" "${T}" 0 "^file ${UPDATE_REL} 1$" match-sites --threshold 2
+check "clean tree: no subset site" "${T}" 0 "^subset-sites 0$" match-sites --threshold 2
+check "clean tree: no table site" "${T}" 0 "^table-sites 0$" match-sites --threshold 2
 
 # 1 — a fourth site planted in a file the producer was not told about. A
 # hand-written file list would miss it.
@@ -231,6 +208,8 @@ pub fn dispatch(s: &KvStorage) -> usize {
 }
 EOF
 check "a one-variant match is under the bar" "${T}" 0 "^match-sites 2$" match-sites --threshold 2
+check "a catch-all match under the bar is a subset site" "${T}" 0 \
+    "^subset ${UPDATE_REL}:2 kind=wildcard enum=KvStorage variants=1$" match-sites --threshold 2
 
 # 5 — the bar is derived from the enum, not fixed. Each of the three planted
 # sites names all four variants, so it is in at a bar of 3 and out at a bar of
@@ -442,7 +421,9 @@ impl KvQuant {
     }
 }
 EOF
-pending_check "Self:: arms in both impls are two more sites" "${T}" 0 "^match-sites 5$" 0 "^match-sites 3$" match-sites --threshold 2
+check "Self:: arms in both impls are two more sites" "${T}" 0 "^match-sites 5$" match-sites --threshold 2
+check "the storage impl's Self:: site is its file's second" "${T}" 0 "^file ${STORAGE_REL} 2$" match-sites --threshold 2
+check "the quant impl's Self:: site is its file's second" "${T}" 0 "^file ${QUANT_REL} 2$" match-sites --threshold 2
 
 # 22 — an alias import. `S::Alpha` is `KvStorage::Alpha` to the compiler.
 T="${WORK}/alias"; build_tree "${T}"
@@ -459,7 +440,7 @@ pub fn aliased(s: &S) -> usize {
     }
 }
 EOF
-pending_check "an alias-path match is a site" "${T}" 0 "^match-sites 4$" 0 "^match-sites 3$" match-sites --threshold 2
+check "an alias-path match is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
 
 # 23 — a glob import. The arms name bare variants.
 T="${WORK}/glob"; build_tree "${T}"
@@ -476,7 +457,7 @@ pub fn bare(q: KvQuant) -> usize {
     }
 }
 EOF
-pending_check "a glob-import match is a site" "${T}" 0 "^match-sites 4$" 0 "^match-sites 3$" match-sites --threshold 2
+check "a glob-import match is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
 
 # 24 — the per-codec dispatch moved one level down, into an enum a KvStorage
 # variant holds. A new codec with a new store still forces a touch there, so a
@@ -502,7 +483,8 @@ pub fn slot_bytes(k: &KSlot) -> usize {
     }
 }
 EOF
-pending_check "a match over an enum a KvStorage field holds is a site" "${T}" 0 "^match-sites 4$" 0 "^match-sites 3$" match-sites --threshold 2
+check "an enum a KvStorage field holds joins the codec enums" "${T}" 0 "^enum KSlot variants=4 threshold=2$" match-sites --threshold 2
+check "a match over an enum a KvStorage field holds is a site" "${T}" 0 "^match-sites 4$" match-sites --threshold 2
 
 # 25 — a forcing site rewritten as a `matches!` subset. The count drops and a
 # new codec now defaults to `false` there with no compile error. The producer
@@ -521,7 +503,7 @@ pub fn low(q: KvQuant) -> bool {
 }
 EOF
 check "a matches! subset is not a match site" "${T}" 0 "^match-sites 2$" match-sites --threshold 2
-pending_check "a matches! subset is reported as a subset site" "${T}" 0 "^subset-sites 1$" 0 "^match-sites 2$" match-sites --threshold 2
+check "a matches! subset is reported as a subset site" "${T}" 0 "^subset-sites 1$" match-sites --threshold 2
 
 # 26 — a string spelling table. Its patterns are string literals and its arm
 # bodies name every variant. A new codec that is missing here compiles and
@@ -540,14 +522,170 @@ pub fn parse(s: &str) -> Option<KvQuant> {
 }
 EOF
 check "a spelling table is not a match site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
-pending_check "a spelling table is reported as a table site" "${T}" 0 "^table-sites 1$" 0 "^match-sites 3$" match-sites --threshold 2
+check "a spelling table is reported as a table site" "${T}" 0 "^table-sites 1$" match-sites --threshold 2
+
+# 27 — negative control for case 21: `Self::` arms inside `impl OtherEnum`,
+# whose variant names are the same as the storage enum's. `Self` is
+# `OtherEnum` there, so the match is not a site.
+T="${WORK}/otherimpl"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub enum OtherEnum {
+    Alpha,
+    Beta,
+    Gamma,
+    Delta,
+}
+
+impl OtherEnum {
+    pub fn index(&self) -> usize {
+        match self {
+            Self::Alpha => 1,
+            Self::Beta => 2,
+            Self::Gamma => 3,
+            Self::Delta => 4,
+        }
+    }
+}
+EOF
+check "Self:: arms in an impl of another enum are not a site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+
+# 28 — negative control for case 22: an alias of an unrelated enum, spelling
+# the storage enum's variant names.
+T="${WORK}/otheralias"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+use OtherEnum as S;
+
+pub fn aliased(s: &S) -> usize {
+    match s {
+        S::Alpha => 1,
+        S::Beta => 2,
+        S::Gamma => 3,
+        S::Delta => 4,
+    }
+}
+EOF
+check "an alias of an unrelated enum is not a site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+
+# 29 — negative control for case 24: the same slot enum and the same match,
+# but no KvStorage field holds the enum. Only a held enum joins the codec
+# enums, so a producer that counted every enum in the tree fails here.
+T="${WORK}/freeenum"; build_tree "${T}"
+cat >>"${T}/${STORAGE_REL}" <<'EOF'
+
+pub enum KSlot {
+    Q8(QuantK),
+    Turbo(QuantKTurbo),
+    Iso(QuantIso),
+    Rotor(QuantRotor),
+}
+
+pub fn slot_bytes(k: &KSlot) -> usize {
+    match k {
+        KSlot::Q8(_) => 1,
+        KSlot::Turbo(_) => 2,
+        KSlot::Iso(_) => 3,
+        KSlot::Rotor(_) => 4,
+    }
+}
+EOF
+check "an enum no KvStorage field holds is not a site" "${T}" 0 "^match-sites 3$" match-sites --threshold 2
+
+# 30 — a held enum that two files define. The producer cannot tell which one
+# the field holds, and says so rather than pick one.
+T="${WORK}/twoslots"; build_tree "${T}"
+sed -i.bak 's/    Alpha { k: Option<QuantK>, v: Option<QuantV>, max_seq: i32 },/    Alpha { k: KSlot, v: Option<QuantV>, max_seq: i32 },/' \
+    "${T}/${STORAGE_REL}"
+printf 'pub enum KSlot { Q8(QuantK), Turbo(QuantKTurbo) }\n' >>"${T}/${STORAGE_REL}"
+printf 'pub enum KSlot { Iso(QuantIso) }\n' >>"${T}/${UPDATE_REL}"
+check "a held enum defined twice is a refusal" "${T}" 2 "unavailable: enum KSlot, held by a KvStorage field, is defined in 2 files" \
+    match-sites --threshold 2
+
+# 31 — negative control for case 25: a `matches!` over an enum that is not a
+# codec enum is not a subset site.
+T="${WORK}/othermatches"; build_tree "${T}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+pub fn low(o: Other) -> bool {
+    matches!(o, Other::Alpha | Other::Beta)
+}
+EOF
+check "a matches! over a non-codec enum is not a subset site" "${T}" 0 "^subset-sites 0$" match-sites --threshold 2
+
+# 32 — negative control for case 26: a string table whose bodies name one of
+# the four variants, under the bar. It is a lookup, not a spelling table.
+T="${WORK}/shorttable"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+
+pub fn parse_one(s: &str) -> Option<KvQuant> {
+    match s {
+        "one" => Some(KvQuant::One),
+        "uno" => Some(KvQuant::One),
+        _ => None,
+    }
+}
+EOF
+check "a string table under the bar is not a table site" "${T}" 0 "^table-sites 0$" match-sites --threshold 2
+
+# 33 — a storage enum with a `None` variant, a glob import of it, and a match
+# over `Option<..>` with a `None =>` arm, in one file. The bare-variant match
+# reaches the bar of 3 only through its `None` arm, so the glob must resolve
+# that `None` to the storage enum. The `Option<KvQuant>` match is one site, not
+# one per enum. The `Option<KvStorage>` match names two variants inside
+# `Some(..)`; its `None` is `Option`'s, and reads as a third variant only in a
+# producer that ignores the `Some(..)` beside it.
+T="${WORK}/globnone"; build_tree "${T}"
+sed -i.bak 's/    Delta { state: MixedKvState, max_seq: i32 },/    Delta { state: MixedKvState, max_seq: i32 },\n    None { max_seq: i32 },/' \
+    "${T}/${STORAGE_REL}"
+cat >>"${T}/${UPDATE_REL}" <<'EOF'
+
+use KvStorage::*;
+
+pub fn bare(s: &KvStorage) -> usize {
+    match s {
+        Alpha { .. } => 1,
+        Beta { .. } => 2,
+        None { .. } => 0,
+        _ => 9,
+    }
+}
+
+pub fn label_of(q: Option<KvQuant>) -> usize {
+    match q {
+        Some(KvQuant::One) => 1,
+        Some(KvQuant::Two) => 2,
+        Some(KvQuant::Three) => 3,
+        Some(KvQuant::Four) => 4,
+        None => 0,
+    }
+}
+
+pub fn maybe(s: Option<&KvStorage>) -> usize {
+    match s {
+        Some(Alpha { .. }) => 1,
+        Some(Beta { .. }) => 2,
+        Some(_) => 3,
+        None => 0,
+    }
+}
+EOF
+check "a glob-imported None variant counts toward the bar" "${T}" 0 \
+    "^site ${UPDATE_REL}:[0-9]+ enum=KvStorage variants=3 arms=4 catch_all=yes$" match-sites
+check "Option's None beside Some(..) is not a storage variant" "${T}" 0 "^match-sites 5$" match-sites
+check "the Option<KvQuant> match counts once and forces a touch" "${T}" 0 "^forcing-sites 4$" match-sites
+
+# 34 — the real tree, pinned. A change that moves a figure re-pins it in the
+# same change, so a restructure states its reduction here, and a new subset
+# or table site cannot land unnoticed.
+check "real tree: match sites" "${REPO_ROOT}" 0 "^match-sites 29$" match-sites
+check "real tree: forcing sites" "${REPO_ROOT}" 0 "^forcing-sites 29$" match-sites
+check "real tree: subset sites" "${REPO_ROOT}" 0 "^subset-sites 64$" match-sites
+check "real tree: table sites" "${REPO_ROOT}" 0 "^table-sites 2$" match-sites
 
 if [ "${failures}" -gt 0 ]; then
     echo >&2
     echo "ERROR: ${failures} case(s) did not reproduce the expected behaviour." >&2
     exit 1
-fi
-if [ "${pending}" -gt 0 ]; then
-    echo "note: ${pending} pending case(s) state figures the census does not report yet."
 fi
 echo "OK: the KV update census reports every planted figure, and refuses every tree it cannot measure."

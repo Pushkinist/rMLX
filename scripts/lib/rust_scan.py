@@ -1,8 +1,8 @@
 """Enum and `match` reader for the KV structural-metric producers.
 
-It blanks comments and literals, finds an `enum` body, and walks `match`
-expressions arm by arm. It is not a Rust parser. It reads the shapes this tree
-writes and refuses, loudly, on a shape it cannot read back — a scan that
+It blanks comments and literals, finds an `enum` body, walks `match`
+expressions arm by arm, and reads the pattern of each `matches!` call. It is
+not a Rust parser. It reads the shapes this tree writes and refuses, loudly, on a shape it cannot read back — a scan that
 silently drops a site reports a smaller number than the truth, which is the
 failure mode every producer here exists to avoid.
 
@@ -100,18 +100,28 @@ def line_of(src: str, pos: int) -> int:
     return src.count("\n", 0, pos) + 1
 
 
-def block_end(blanked: str, open_brace: int) -> int:
-    """Index just past the `}` closing the `{` at `open_brace`."""
+def block_end(blanked: str, open_at: int) -> int:
+    """Index just past the bracket closing the `{`, `(` or `[` at `open_at`."""
     depth = 0
-    for i in range(open_brace, len(blanked)):
+    for i in range(open_at, len(blanked)):
         c = blanked[i]
-        if c == "{":
+        if c in "{([":
             depth += 1
-        elif c == "}":
+        elif c in "})]":
             depth -= 1
             if depth == 0:
                 return i + 1
-    raise ScanError(f"unterminated block opened at line {line_of(blanked, open_brace)}")
+    raise ScanError(f"unterminated block opened at line {line_of(blanked, open_at)}")
+
+
+def enum_body(blanked: str, name: str) -> str:
+    """The text between the braces of `enum <name>`."""
+    m = re.search(rf"\benum\s+{re.escape(name)}\b[^{{]*{{", blanked)
+    if not m:
+        raise ScanError(f"enum {name} not found")
+    start = m.end() - 1
+    end = block_end(blanked, start)
+    return blanked[start + 1 : end - 1]
 
 
 def enum_variants(blanked: str, name: str) -> list[tuple[str, list[str]]]:
@@ -121,12 +131,7 @@ def enum_variants(blanked: str, name: str) -> list[tuple[str, list[str]]]:
     and inventing positional names would put a shape in the census that the
     source does not carry.
     """
-    m = re.search(rf"\benum\s+{re.escape(name)}\b[^{{]*{{", blanked)
-    if not m:
-        raise ScanError(f"enum {name} not found")
-    start = m.end() - 1
-    end = block_end(blanked, start)
-    body = blanked[start + 1 : end - 1]
+    body = enum_body(blanked, name)
     out: list[tuple[str, list[str]]] = []
     i = 0
     while i < len(body):
@@ -157,11 +162,13 @@ def enum_variants(blanked: str, name: str) -> list[tuple[str, list[str]]]:
 class MatchArm:
     pattern: str
     line: int
+    body: str = ""
 
 
 @dataclass
 class MatchSite:
     line: int
+    start: int
     arms: list[MatchArm] = field(default_factory=list)
 
 
@@ -180,7 +187,7 @@ def match_sites(blanked: str) -> list[MatchSite]:
             end = block_end(blanked, brace)
         except ScanError as exc:
             raise ScanError(f"match at line {line_of(blanked, m.start())}: {exc}") from exc
-        site = MatchSite(line=line_of(blanked, m.start()))
+        site = MatchSite(line=line_of(blanked, m.start()), start=m.start())
         site.arms = _arms(blanked, brace + 1, end - 1)
         sites.append(site)
     return sites
@@ -202,11 +209,12 @@ def _arms(blanked: str, start: int, stop: int) -> list[MatchArm]:
             i += 1
             continue
         if depth == 0 and blanked.startswith("=>", i):
-            pattern = blanked[pat_start:i]
-            arms.append(MatchArm(pattern=pattern.strip(), line=line_of(blanked, pat_start)))
+            arm = MatchArm(pattern=blanked[pat_start:i].strip(), line=line_of(blanked, pat_start))
+            arms.append(arm)
             i += 2
             while i < stop and blanked[i].isspace():
                 i += 1
+            body_start = i
             if i < stop and blanked[i] == "{":
                 i = block_end(blanked, i)
             else:
@@ -219,9 +227,34 @@ def _arms(blanked: str, start: int, stop: int) -> list[MatchArm]:
                     elif blanked[i] == "," and d == 0:
                         break
                     i += 1
+            arm.body = blanked[body_start:i]
             while i < stop and blanked[i] in ", \t\r\n":
                 i += 1
             pat_start = i
             continue
         i += 1
     return arms
+
+
+def matches_macros(blanked: str) -> list[MatchSite]:
+    """Every `matches!(expr, pattern)` call, as a site whose one arm is the
+    pattern, guard included."""
+    out: list[MatchSite] = []
+    for m in re.finditer(r"\bmatches!\s*[\(\[\{]", blanked):
+        open_at = m.end() - 1
+        close = block_end(blanked, open_at) - 1
+        depth = 0
+        for i in range(open_at + 1, close):
+            c = blanked[i]
+            if c in "{([":
+                depth += 1
+            elif c in "})]":
+                depth -= 1
+            elif c == "," and depth == 0:
+                pattern = blanked[i + 1 : close].strip().rstrip(",").strip()
+                line = line_of(blanked, m.start())
+                out.append(MatchSite(line=line, start=m.start(), arms=[MatchArm(pattern=pattern, line=line)]))
+                break
+        else:
+            raise ScanError(f"matches! at line {line_of(blanked, m.start())} has no pattern")
+    return out
