@@ -1461,28 +1461,29 @@ rmlx serve --model <path> --paged-kv --kv-quant k8v4
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**Algorithm — Quaternion SO(4) isoclinic rotation.**
-
-iso3 applies a left-isoclinic SO(4) rotation to groups of 4 elements in the
-V tensor before 3-bit quantization:
+**Algorithm — quaternion SO(4) isoclinic rotation.** iso3 applies a
+left-isoclinic SO(4) rotation to each group of 4 elements, then quantizes to 3
+bits:
 
 ```
-T(v) = q_L * v     (fast mode — 3 DOF, one quaternion per group)
+T(v) = q_L * v     (one quaternion per group)
 ```
 
-where `*` is the **Hamilton product** and `v ∈ ℝ⁴` is treated as a quaternion
-`v = (v₀, v₁, v₂, v₃)`. Inverse: `T⁻¹(r) = q̄_L * r` (conjugate multiply).
+`*` is the **Hamilton product**, and `v ∈ ℝ⁴` is a quaternion
+`v = (v₀, v₁, v₂, v₃)`. The inverse is `T⁻¹(r) = q̄_L * r`.
 
-**Pipeline (per token):**
+**Encode (per token):**
 
-1. L2-normalise the full vector; store the scalar norm.
-2. Reshape into `head_dim / group_size` quaternion groups.
-3. Apply `r = q_L * v` via scalar Hamilton product.
-4. Per-group scale: `max(|r_i|) / max_centroid`.
-5. 3-bit Lloyd-Max nearest-centroid lookup.
-6. Pack 10 codes per u32 (30 bits used, 2 wasted) — same Planar3 pack convention.
+1. Compute the L2 norm of the vector and store it. Divide the vector by it.
+2. Split the vector into `head_dim / 4` quaternion groups.
+3. Apply `r = q_L * v` with the scalar Hamilton product.
+4. Compute a per-group scale: `max(|r_i|) / max_centroid`.
+5. Find the nearest centroid of the 3-bit Lloyd-Max codebook.
+6. Write the codes into the dense code plane of the row, 3 bits each
+   (`crate::code_plane`).
 
-**Dequantize:** unpack → centroid lookup → rescale → inverse rotate → renorm.
+**Decode:** unpack → centroid lookup → rescale → inverse rotation → multiply by
+the norm.
 
 **Iso memory truth.** iso spends, per 4-element group, four codes in the row's
 dense code plane (`bits` each — see `crate::code_plane`) **and** one scale at
@@ -1490,95 +1491,66 @@ the ring's sideband dtype (`bf16`), plus one `bf16` norm per token. At
 head_dim=128 that is 114 B per token per kv_head for iso3 against bf16's 256 B
 (**7.125 bits per value, 0.445× bf16**) and 130 B for iso4 (**8.125**, 0.508×).
 
-The rate moves with head dim; the *sign* does not. Reading it off the
-allocation — `ceil(D·bits/32)·4 B` codes + `(D/4)·2 B` scales + `2 B` norm —
-gives
+The rate changes with `head_dim`. The allocation is
+`ceil(D·bits/32)·4 B` codes + `(D/4)·2 B` scales + `2 B` norm, thus:
 
 ```
 iso stored bits/value = bits + 4 + 16/head_dim
 ```
 
-so 7.125 at D=128, 7.0625 at D=256, 7.03125 at D=512 for iso3, approaching 7.0
-**from above**. This is a derivation from `QuantKGpuRing::alloc` (`Dtype::U32`
-codes, `KV_SIDEBAND_DTYPE` scales and norms, one scale per group and one norm
-per token per KV head); it is measured against the allocation itself by
-`ring_bytes_match_independent_geometry` and `kv_rate_tests`.
+For iso3 this is 7.125 at D=128, 7.0625 at D=256 and 7.03125 at D=512. It comes
+from `QuantKGpuRing::alloc` (`Dtype::U32` codes, `KV_SIDEBAND_DTYPE` scales and
+norms, one scale per group and one norm per token per KV head).
+`ring_bytes_match_independent_geometry` and `kv_rate_tests` measure it against
+the allocation.
 
-**Past the code plane the scale is the dominant term** — 4.000 bits per value,
-against 3.000 of codes at iso3. Cutting it further is a scale-cadence change,
-not a code one. A scale and an L2
-norm are each a single positive magnitude that the decode kernels reconstruct
-straight into a `float` accumulator, so bf16's 8 mantissa bits are the whole of
-what any reader consumes. Measured fidelity cost of the narrowing, same fixture
-and seed, CPU encode → decode: iso3 cosine 0.994098 → 0.994090, iso4 0.998638 →
-0.998639, and SQNR iso4 25.395 → 25.391 dB. The CPU encoders round each scale
-and norm to the stored width *before* choosing codes against it, so the encoder
-and the store agree exactly and a ring seeded from CPU blocks decodes bit-identically
-to the blocks it was seeded from.
+**The scale is the largest term after the codes:** 4.000 bits per value,
+against 3.000 bits of codes at iso3. The CPU encoders round each scale and norm
+to the stored width before they select the codes. Thus the encoder and the
+store agree, and a ring seeded from CPU blocks decodes the same bits as those
+blocks.
 
-The CPU `IsoBlocks` form adds a 4×f32 quaternion per group on top, and holds
-its scale and norm planes at `f32`, taking the same token to ≈692 B
-(≈43.25 bits per value, 2.7× bf16 and 6.07× the ring). That sideband is the
-constant `FIXED_QUAT` replicated per group, not data, and the GPU ring the
-K-only and symmetric codecs decode from does not carry it. **That figure is
-not what a served request settles at, but it is not hypothetical either.**
-Three cases, and they differ:
+The CPU `IsoBlocks` form adds a 4×f32 quaternion per group and holds its scale
+and norm planes at `f32`. This makes ≈692 B per token (≈43.25 bits per value,
+2.7× bf16). The quaternion is the constant `FIXED_QUAT` repeated per group, not
+data. The GPU ring that the K-only and symmetric codecs decode from does not
+hold it. Three cases:
 
-- The V-only `iso3` / `iso4` codecs decode from the bf16 mirror, so
-  `exit_prefill` builds them no store at all and they measure byte-identical to
-  `none` (§"Codec disposition", Class 2). 43.25 is the rate they would cost the
-  day a decode kernel reads their store.
-- The store-reading members — `k_iso3/4` and `iso3_sym/4_sym` — **do** pay it,
-  for one window: `exit_prefill` bulk-encodes them on the CPU, into blocks. The
+- The V-only `iso3` / `iso4` codecs decode from the bf16 mirror. `exit_prefill`
+  builds no store for them, and they measure the same bytes as `none`
+  (§"Codec disposition", Class 2).
+- The store-reading members, `k_iso3/4` and `iso3_sym/4_sym`, hold the block
+  form for one window: `exit_prefill` encodes them on the CPU, into blocks. The
   first fused decode step seeds the ring from those blocks and frees them
-  (`drop_blocks_when_ring_live_iso_*` in `kvcache/update.rs`), after which the
-  ring is the sole resident copy.
-- From there they hold the ring layout above. §"Codec disposition", Class 3
-  carries the measured whole-cache figures for both archs at two contexts.
+  (`drop_blocks_when_ring_live_iso_*` in `kvcache/update_iso.rs`).
+- After that step, the ring is the only resident copy.
 
-The per-group figures are the store density and are unaffected by which of the
-three a cache is in.
+`estimated_resident_bytes_per_layer` sizes the four store-reading members from
+the ring. The estimate is low in two cases: between `exit_prefill` and the first
+fused decode step, and for the full request on a layer whose shape the fused
+path rejects (batch > 1, or a `head_dim` that is not a power of two at most
+512). In the second case the ring is never allocated and the blocks stay.
 
 **Both rings are under bf16 at every head_dim, and iso is under it by more.**
-The code plane costs `bits` per value for iso and `bits·⌈D/3⌉·3/D` for rotor —
-3.000 and 3.250 at `bits = 3`, `D = 128`. What separates the two families is the
-sideband: one scale per group at `KV_SIDEBAND_DTYPE` is 4.000 bits per value
-where the group is 4 values and 5.375 where it is 3. Both signs are
-pinned, from real encoder bytes, by
-`every_store_family_is_at_or_below_the_bf16_floor_or_exempt` and its
-reverse-direction guard `exempt_families_actually_exceed_the_floor`
-(`crates/rmlx-kv-quant/src/kv_rate_tests.rs`), which between them refuse both a
-family that drifts over the floor and an exemption for a family that no longer
-exceeds it. The operator sees the same sign through the resolve-time
-net-negative warn, which the Gemma4, Qwen3 and Qwen3.5-MoE generate paths call
-(the remaining arches do not call it yet), and as a computed figure from `rmlx
-info --list-cache-types`.
-`estimated_resident_bytes_per_layer` models the group layout directly (never
-the codebook width) and sizes the four store-reading members from the **ring**,
-which is what a served request holds: their fused append seeds the ring from the
-prefill CPU blocks and then drops the blocks
-(`drop_blocks_when_ring_live_iso_*`). The block form above is what `iso3` /
-`iso4` would hold if a kernel ever read their store, and what a store-reading
-member holds in the two cases where the estimate runs low rather than high: the
-window between `exit_prefill` and the first fused decode step, and — for the
-whole request — a layer whose shape the fused path's gate rejects (batch > 1, or
-a `head_dim` that is not a power of two at most 512), where the ring is never
-allocated and the drop is a no-op.
+The code plane costs `bits` per value for iso and `bits·⌈D/3⌉·3/D` for rotor:
+3.000 and 3.250 at `bits = 3`, `D = 128`. The sideband makes the difference:
+one scale per group at `KV_SIDEBAND_DTYPE` is 4.000 bits per value for a group
+of 4 values, and 5.375 for a group of 3.
+`every_store_family_is_at_or_below_the_bf16_floor_or_exempt` and
+`exempt_families_actually_exceed_the_floor`
+(`crates/rmlx-kv-quant/src/kv_rate_tests.rs`) pin both signs from real encoder
+bytes. The operator sees the same sign in the resolve-time net-negative warn
+(§"Per-layer net-benefit decision + net-negative warn") and in
+`rmlx info --list-cache-types`.
 
-**Crate-wide rate ceiling.** `crates/rmlx-kv-quant/src/kv_rate_tests.rs` reports
-every store family's bits per value and fails any family above bf16's 16.0 that
-does not carry a written exemption. An exemption is itself checked: a family
-listed as exempt must actually measure above the floor, so a fixed codec turns
-its own exemption red instead of silently keeping it.
-
-Completeness is partial and stated as such. The `KvQuant` → family map is an
-exhaustive `match`, so a new variant does not **compile** until someone writes
-down where its bytes go — that much is mechanical. The list of measured
-representatives is hand-maintained and nothing forces it to grow, so a variant
-that declares its families and never gets a representative is unmeasured and the
-gate stays green; catching that is review's job. Closing it mechanically needs
-enum iteration (a `strum`-style derive), which is a dependency decision.
-Table at `head_dim = 128`:
+**Crate-wide rate ceiling.** `crates/rmlx-kv-quant/src/kv_rate_tests.rs`
+reports the bits per value of each store family. It fails a family above
+bf16's 16.0 that has no written exemption. It also fails an exempt family that
+does not measure above the floor. The `KvQuant` → family map is an exhaustive
+`match`, so a new variant does not compile until it names its families. The
+list of measured representatives is kept by hand: a variant with no
+representative is not measured, and the gate stays green. Review must catch
+this. Table at `head_dim = 128`:
 
 | Family | Stored bits / value | Provenance | Verdict |
 |---|---|---|---|
@@ -1594,144 +1566,80 @@ Table at `head_dim = 128`:
 | bf16 | 16.00 | by definition | the floor |
 | **planar3 / planar4** | **22.00** | measured | exempt |
 
-Iso and rotor cleared the floor in two steps. Narrowing the ring's scale and
-norm planes from `f32` to `KV_SIDEBAND_DTYPE` took 4.125 bits per value off iso
-and 5.5 off rotor; packing the codes densely across a row's groups — instead of
-one whole `u32` per group whatever the width — took another 5 off iso3 and 7.5
-off rotor3, and is what took rotor under bf16. What remains is the per-group
-scale: 4.000 bits per value for iso, 5.375 for rotor, both above their own code
-planes. Planar is exempt for that reason and not a code one — its scale is per
-*pair*.
-The `IsoBlocks` host form keeps the same dense code plane but holds its scale,
-norm and replicated-quaternion sideband at `f32`, so it measures 43.25 — no
-served request settles there.
+Planar is exempt because its scale is per *pair*. The `IsoBlocks` host form
+measures 43.25; no served request stays in that form.
 
-"Measured" means the byte total the shipped store reports for the buffers that
-family's own encoder produced over a shared fixture. For iso and rotor that is
-`QuantKGpuRing::byte_size`, read off a real seeded ring rather than a `4 *
-len()` written in the test: the constant is exactly the thing that goes stale
-when a plane's stored width changes, and a rate gate that restates it is
-measuring its own arithmetic. The two remaining rows have no CPU
-encoder in this crate: bf16 is two bytes per value by definition, and MLX affine
-is `bits + 32/group` — code bits plus one scale and one bias per group, each at
-the KV stream's dtype. **That sideband is 32 bits, measured**, not 64: the
-stream reaching the store is bf16 (`cast_store_bf16` floors it at the store
-boundary) and `mx.quantize(mode = "affine")` emits both scalars at the input
-dtype. `affine_sideband_is_thirty_two_bits_per_group`
-(`crates/rmlx-kv-quant/src/quant_tests.rs`) reads the figure off a real
-`MixedTuple` rather than restating it.
+"Measured" means the byte total that the store reports for the buffers its own
+encoder made from a shared fixture. For iso and rotor that is
+`QuantKGpuRing::byte_size`, read from a real seeded ring. bf16 and MLX affine
+have no CPU encoder in this crate. bf16 is two bytes per value. MLX affine is
+`bits + 32/group`: the code bits plus one scale and one bias per group, each at
+the dtype of the KV stream. **That sideband is 32 bits, measured**: the stream
+at the store is bf16 (`cast_store_bf16` floors it at the store boundary), and
+`mx.quantize(mode = "affine")` writes both scalars at the input dtype.
+`affine_sideband_is_thirty_two_bits_per_group`
+(`crates/rmlx-kv-quant/src/quant_tests.rs`) reads the figure from a real
+`MixedTuple`.
 
-**The affine row covers the whole `mixed_*` grammar.** It is evaluated at the
-widest cadence the accepted grid reaches (`q8_g32`, 9.00), and `parse_kv_side`
-now validates both sides against MLX's affine grid (`validate_mixed_side`:
-2/3/4/5/6/8 bits, group 32/64/128), so every parseable spelling has a rate this
-table enumerates. Before that floor the group size was a bare `u16`, and
-`mixed_k8g4_v8g4` parsed at `8 + 32/4 = 16` bits per value with nothing bounding
-it below that group. Pinned by
-`mixed_grammar_no_longer_admits_unbounded_affine_rates`.
+**The affine row covers the whole `mixed_*` grammar.** The row uses the widest
+cadence the grid accepts (`q8_g32`, 9.00). `parse_kv_side` output goes through
+`validate_mixed_side` (2/3/4/5/6/8 bits, group 32/64/128), so this table has a
+rate for every spelling that parses.
+`mixed_grammar_no_longer_admits_unbounded_affine_rates` pins this.
 
-**`head_dim % 4 == 0` constraint.** iso3 operates in groups of 4. Any
-`head_dim` not divisible by 4 is rejected at encode/decode time with
+**`head_dim % 4 == 0` constraint.** iso3 uses groups of 4. The encoder and the
+decoder reject a `head_dim` that is not a multiple of 4 with
 `IsoQuantError::HeadDimNotMultipleOf4`.
 
-**Fixed quaternion.** The current CPU implementation uses the golden-ratio
-unit quaternion `q = (1, φ, φ−1, 1) / ‖(1, φ, φ−1, 1)‖` (where `φ = (1+√5)/2`)
-applied uniformly to every group. This matches `multi_turboquant/methods/isoquant.py`
-and provides good channel decorrelation without calibration. A follow-up will add
-per-group optimised quaternions.
+**Fixed quaternion.** The codec applies the golden-ratio unit quaternion
+`q = (1, φ, φ−1, 1) / ‖(1, φ, φ−1, 1)‖` (`φ = (1+√5)/2`) to every group
+(`FIXED_QUAT`). This is the quaternion of `multi_turboquant/methods/isoquant.py`.
+It needs no calibration.
 
-**Codebook divergence — rMLX Gaussian Lloyd vs Python Beta Lloyd.**
+**Codebook — Gaussian Lloyd-Max, not Beta Lloyd-Max.** The Python references
+(`rotorquant/turboquant/lloyd_max.py`) derive a Lloyd-Max codebook for the Beta
+distribution that a random rotation of a unit vector gives. rMLX uses
+`turboquant::lloyd_gaussian_codebook(3)` (Lloyd-Max for N(0,1)), the same
+codebook family as TurboQuant and PlanarQuant. For `head_dim ≥ 64`, Beta(d) →
+N(0, 1/d), and the per-group scale normalizes to N(0,1) before the centroid
+lookup.
 
-The Python references (`rotorquant/turboquant/lloyd_max.py`) derive a
-Lloyd-Max codebook for the **Beta distribution** that arises after random
-rotation of a unit vector. rMLX reuses `turboquant::lloyd_gaussian_codebook(3)`
-(Lloyd-Max for N(0,1)) to stay consistent with TurboQuant and PlanarQuant
-and avoid a new codebook solver.
+**GPU dispatch.** When `device == Device::Gpu`, `update_iso_v`,
+`update_iso_sym` and `update_iso_k_only` send the encode and the dequant through
+`isoquant_msl_dispatch`, which selects the kernel from the `BITS` of the store.
+`QuantIsoV::dequant_gpu` / `QuantIsoK::dequant_gpu` put the CPU block payloads
+(codes, scales, quaternions, per-token norms) into single byte buffers, upload
+them once with `Array::from_bytes`, run the dequant kernel and reshape the
+output to `[B, kv_h, S, D]`. On `Device::Cpu`, the CPU codec runs. The
+GPU-resident `QuantIsoV` mirror is off in production:
+`gpu_resident_iso_enabled()` returns `false`.
 
-For `head_dim ≥ 64`, Beta(d) → N(0, 1/d), and the per-group scale step
-normalises to N(0,1) before the centroid lookup regardless of the source
-distribution. The quality gap in practice is below measurement noise on LCG
-fixtures. Published Python mtq cosine (0.9783, realistic KV vectors) is
-a different measurement condition; rMLX LCG fixture measures mean ≈ 0.994
-(group_size=4, 32 tokens × 128-dim).
-
-**Wire-up status:**
-
-| Component | Status |
-|---|---|
-| CPU encode/decode (`isoquant.rs`) | Done |
-| `KvStorage::IsoV3` variant | Done |
-| `KvQuant::Iso3` + `CacheType::Iso3` | Done |
-| `KvCache::update_iso_v` decode dispatch | Done (one entry over both widths) |
-| SDPA dispatch wiring | Done (dequant-then-SDPA legacy fallback; iso3 has no fused fast path, mirrors K8VTurbo3) |
-| `KvBlockWriter`/`Reader` integration | Done (layout tag `iso_v_3`; K via `write_quant_k`; V via `write_quant_iso_v3` / `read_quant_iso_v3`) |
-| SSD tier integration | Done |
-| MSL kernel hook (`isoquant_msl.rs`) | Done |
-| **MSL encode dispatch + on-demand `Array::from_bytes` dequant** | **Done — `update_iso_v` / `update_iso_sym` / `update_iso_k_only` route encode and dequant through the width the storage variant carries when `device == Device::Gpu`; `QuantIsoV::dequant_gpu` / `QuantIsoK::dequant_gpu` rebuild GPU Arrays directly from CPU blocks via `Array::from_bytes` (no intermediate `Vec<f32>`)** |
-| **GPU-resident `QuantIsoV` mirror** | **Landed; hardcoded OFF (bench decision — bench showed no measurable benefit on the warm-TTFT path where the bf16 seed absorbs the dequant). `QuantIsoV::append_gpu` retains the mirror infrastructure for future seedless workloads but the gate `gpu_resident_iso_enabled()` returns `false` unconditionally in production. CPU blocks are still populated for SSD spill (`.kvb` on-disk format unchanged). See `docs/PERF_BASELINE.md` for the bench rationale.** |
-| `--kv-quant iso3` CLI flag | Done |
-
-The GPU dispatch is on: when `device == Device::Gpu`, `update_iso_v` /
-`update_iso_sym` / `update_iso_k_only` route encode and dequant through
-`isoquant_msl_dispatch`, which selects the kernel module from the store's own
-`BITS`, and the store entries are `QuantIsoV::dequant_gpu` /
-`QuantIsoK::dequant_gpu`. The dequant methods concatenate per-block CPU
-payload (codes / scales / quaternions / per-token-norm-expanded-to-per-group)
-into single byte buffers, upload them to the GPU **once** via
-`Array::from_bytes`, dispatch the dequant kernel `isoquant_msl_dispatch`
-selects for the store's width, then reshape the flat
-f32 output to `[B, kv_h, S, D]`. No intermediate `Vec<f32>` is materialised
-on the CPU side. CPU path remains intact and is the fallback for `Device::Cpu`.
-
-**Warm-TTFT caveat:** the per-decode-step iso codec is shadowed by
-the warm-TTFT bf16 seed when `KvCache::decode_fp16_k.is_some()`, which is
-the case for all current arch wirings (Bonsai 8B, Gemma4, Qwen3.6). The
-GPU dispatch therefore fires once at `exit_prefill` and on cold cache
-misses, not per step. Parity verified by
-`iso_v3_dequant_gpu_matches_dequant_cpu` and
+**CPU ↔ GPU parity.** `iso_v3_dequant_gpu_matches_dequant_cpu` and
 `iso_k3_dequant_gpu_matches_dequant_cpu` in
 `crates/rmlx-kv-quant/src/isoquant_msl_tests.rs` (`#[ignore]`-gated).
-Observed `max|cpu-gpu| ≤ 2.4e-7` on the LCG fixture (a few f32 ULPs from
-different summation order between CPU `iso_decode_fast` and the MSL
-kernel — not a real codec divergence). The parity test gates at 5e-3
-(codebook tolerance) and additionally enforces a strict ≤ 1e-6 bound.
+Observed `max|cpu-gpu| ≤ 2.4e-7` on the LCG fixture
+(a few f32 ULPs from a different summation order between CPU `iso_decode_fast`
+and the MSL kernel). The tests assert 5e-3 per element (codebook tolerance)
+and a strict ≤ 1e-6 bound.
 
-**Cosine quality (LCG fixture, group_size=4, head_dim=128, bits=3):**
-mean = 0.994, min = 0.993. Test: `iso3_cosine_gate`
-in `crates/rmlx-kv-quant/src/isoquant_tests.rs`. `QuantIsoV3` round-trip
-matches `iso_decode_fast` reference within `max_abs_err < 1e-3`
-(`quant_iso_v_roundtrip_dequant`).
+**Cosine gates.** `iso3_cosine_gate` in
+`crates/rmlx-kv-quant/src/isoquant_tests.rs`. `quant_iso_v_roundtrip_dequant`
+asserts that the `QuantIsoV3` round-trip matches `iso_decode_fast` within
+`max_abs_err < 1e-3`.
 
-**Smoke probes:** validated end-to-end on Bonsai-8B-2bit (head_dim=128),
-Gemma4-e4b-mxfp8 (head_dim=512), and Qwen3.6-35B-A3B-8bit (head_dim=128).
-No NaN/Inf, no infinite loops, 8-token generations complete. Decode TPS
-reflects CPU-heavy V dequant on the initial version; GPU encode path reduces
-overhead.
-
-**Sequence-major buffer layout (whole Iso / Rotor family).** Every `Vec<Blocks>`
-rotation-KV codec — `QuantIsoV<BITS>` (`QuantIsoV3` / `QuantIsoV4`),
-`QuantIsoK<BITS>` (`QuantIsoK3` / `QuantIsoK4`),
-`QuantRotorV<BITS>` (`QuantRotorV3` / `QuantRotorV4`), `QuantRotorK<BITS>`
-(`QuantRotorK3` / `QuantRotorK4`) — accumulates
-one `*Blocks` entry per `append` and concatenates them on `dequant`. Because
-the caller reshapes the concatenation head-major `[B, kv_h, S, D]`, a head-major
-per-block store transposes per-head values across a multi-append GQA cache
-(`kv_h > 1`, e.g. the post-SSD-hydrate decode-append path) — the same head
-scramble fixed for `QuantK` / `QuantV`. Each `append` now reorders the
-head-major chunk heads↔seq (`[B, new_seq, kv_h, D]`) before encoding, and
-`dequant` reorders **each block back at its own sequence offset**
-(`seq_layout::transpose_chunked_seq_heads`) — reordering the whole concatenation
-in one pass is only equivalent at `B == 1`; see the `b > 1` note under the
-truncation planner. Single-chunk cold prefill is the identity. The codec is
-per-token-row positional, so the sidebands stay correctly associated: Iso
-per-(token, group) scale/norm and the constant `FIXED_QUAT` quaternion permute
-with the rows; the Rotor static rotor table and QJL projection are
-group/projection-keyed (untouched) while the per-token QJL `qjl_codes` /
-`qjl_norms` permute with the rows. `QuantIsoV3` is the only GPU-resident member
-and adds `Array::contiguous` after the heads↔seq transpose before its
-raw-linear-index MSL encode kernel. The `.kvb` SSD format is byte-stable (only
-the token-row order within a block changes). GPU round-trip verified on
-`QuantIsoV3` (two-append GQA vs single-shot). See `docs/KV_CACHE.md` §5.7.3.
+**Sequence-major buffer layout (all Iso / Rotor block stores).**
+`QuantIsoV<BITS>`, `QuantIsoK<BITS>`, `QuantRotorV<BITS>` and `QuantRotorK<BITS>`
+add one `*Blocks` entry per `append` and concatenate them on `dequant`. The
+caller reshapes the concatenation head-major `[B, kv_h, S, D]`. Thus each
+`append` reorders the head-major chunk heads↔seq (`[B, new_seq, kv_h, D]`)
+before it encodes, and `dequant` reorders **each block back at its own sequence
+offset** (`seq_layout::transpose_chunked_seq_heads`). The codec is positional
+per token row, so the sidebands stay with their rows: the Iso per-(token,
+group) scale and norm and the constant `FIXED_QUAT` move with the rows; the
+Rotor static rotor table and the QJL projection are keyed by group or
+projection and do not move; the per-token QJL `qjl_codes` / `qjl_norms` move
+with the rows. The `.kvb` SSD format does not change (only the order of token
+rows inside a block). See `docs/KV_CACHE.md` §5.7.3.
 
 ---
 
@@ -1742,91 +1650,58 @@ the token-row order within a block changes). GPU round-trip verified on
 > codec math never runs. Resident KV and generated tokens measure identical to
 > bf16. See § "Codec disposition — what every codec in the tree is for".
 
-**Algorithm — Quaternion SO(4) isoclinic rotation, 4-bit codebook.**
+**Algorithm — quaternion SO(4) isoclinic rotation, 4-bit codebook.**
 
-iso4 is the natural 4-bit extension of [iso3](#iso3-codec).
-Same rotation, same group geometry, same fixed quaternion — the only
-differences are the codebook (16 centroids vs 8) and the pack density
-(8 vals/u32 vs 10 vals/u32).
+iso4 is the 4-bit form of [iso3](#iso3-codec). The rotation, the group
+geometry and the fixed quaternion are the same. The differences are the
+codebook (16 centroids, not 8) and the code width (4 bits, not 3).
 
 | Property | iso3 | iso4 |
 |---|---|---|
 | Code bits / element | 3 | 4 |
-| Delivered bits / element, ring-resident (`k_iso*`, `*_sym`) | **7.125** (114 B/token at head\_dim=128 — see Memory truth in iso3 section) | **8.125** (130 B/token) — one bit per code more than iso3, which the dense code plane charges for |
-| Delivered bits / element, CPU-blocks form (`iso3` / `iso4`) — **not resident on a settled cache** | ≈43.25 (≈692 B/token at head\_dim=128, incl. the constant quaternion sideband). These two codecs decode from the bf16 mirror, so `exit_prefill` builds them no store and they measure byte-identical to `none` (§"Codec disposition", Class 2); this is the rate they would cost once a kernel reads one. The ring-backed members do pay it between `exit_prefill` and the first fused decode step, which frees the blocks | ≈44.25 — same sideband, one bit more per code |
+| Delivered bits / element, ring-resident (`k_iso*`, `*_sym`) | **7.125** (114 B/token at head\_dim=128, see "Iso memory truth" in the iso3 section) | **8.125** (130 B/token) |
+| Delivered bits / element, CPU-blocks form | ≈43.25 (≈692 B/token at head\_dim=128, with the constant quaternion sideband). The ring-backed members hold it between `exit_prefill` and the first fused decode step. `iso3` / `iso4` build no store (§"Codec disposition", Class 2) | ≈44.25 |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids) | `lloyd_gaussian_codebook(4)` (16 centroids) |
 | Pack density | dense code plane, 3 bits per code | dense code plane, 4 bits per code |
-| Rotation | Golden-ratio fixed quaternion (`FIXED_QUAT`) | Same |
-| Group size | 4 elements (one quaternion block) | Same |
-| `head_dim` constraint | `% 4 == 0` | Same |
-| MSL kernel | **Yes** — `iso_quantize_v3_gpu` / `iso_dequantize_v3_gpu` in `crates/rmlx-kv-quant/src/isoquant_msl.rs` | **Yes** — `iso_quantize_v4_gpu` / `iso_dequantize_v4_gpu` in `crates/rmlx-kv-quant/src/isoquant_msl_v4.rs`. Both widths reach their kernels through `isoquant_msl_dispatch` from the one set of entries (`update_iso_v` / `update_iso_sym` / `update_iso_k_only`, `QuantIsoV::dequant_gpu` / `QuantIsoK::dequant_gpu`) when `device == Device::Gpu` |
+| Rotation | golden-ratio fixed quaternion (`FIXED_QUAT`) | same |
+| Group size | 4 elements (one quaternion block) | same |
+| `head_dim` constraint | `% 4 == 0` | same |
+| MSL kernel | `iso_quantize_v3_gpu` / `iso_dequantize_v3_gpu` in `crates/rmlx-kv-quant/src/isoquant_msl.rs` | `iso_quantize_v4_gpu` / `iso_dequantize_v4_gpu` in `crates/rmlx-kv-quant/src/isoquant_msl_v4.rs` |
+| SSD layout tag (V-only / symmetric) | `iso_v_3` / `iso_sym_3` | `iso_v_4_v2` / `iso_sym_4_v2` |
 
-**Codebook divergence — same as iso3.** rMLX uses Gaussian Lloyd-Max
-(N(0,1)) `lloyd_gaussian_codebook(4)`; Python references use Beta Lloyd.
-The published multi-turboquant `iso4` cosine is 0.9951; rMLX LCG fixture
-measures mean = 0.998638, min = 0.998092 (group_size=4, 32 tokens × 128-dim,
-4-bit). Higher than the published number because rMLX's LCG fixture has
-lower dynamic range than calibrated real KV (see iso3 note above).
+**Codebook** — the same as iso3: Gaussian Lloyd-Max `lloyd_gaussian_codebook(4)`,
+not Beta Lloyd-Max.
 
-**MSL kernel.** `crates/rmlx-kv-quant/src/isoquant_msl_v4.rs`
-dispatches the sibling 4-bit kernel pair `iso_quantize_v4_gpu` /
-`iso_dequantize_v4_gpu`, with the per-(token, group) thread layout, atomic-OR
-pack via `(idx & 0xF) << shift`, and a dense 8-vals/u32 boundary table (15
-mid-points derived from `lloyd_gaussian_codebook(4)`). The bodies live in
+**MSL kernel.** `crates/rmlx-kv-quant/src/isoquant_msl_v4.rs` dispatches the
+4-bit kernel pair `iso_quantize_v4_gpu` / `iso_dequantize_v4_gpu`: one thread
+per (token, group), atomic-OR pack with `(idx & 0xF) << shift`, and a boundary
+table of 15 mid-points from `lloyd_gaussian_codebook(4)`. The bodies are in
 `src/metal/isoquant_quantize_iso4.metal` and
-`src/metal/isoquant_dequantize_iso4.metal`, gated by `make check-metal-compiles`
-against the captured header snapshot `src/metal/probes/isoquant_iso4.hdr.metal`.
-Both the encode and the decode side are wired into the three iso update
-entries (`update_iso_v`, `update_iso_sym`, `update_iso_k_only`) under
-`device == Device::Gpu`, which reach this width through
-`isoquant_msl_dispatch`; the CPU codec remains the fallback.
-
-**Warm-TTFT caveat.** The iso V hot path is shadowed by the bf16 exit-prefill
-seed: the GPU encode fires **once at exit_prefill**, not per decode step. The
-measured benefit lands on TTFT (large prefill chunk) rather than steady-state
-decode TPS.
+`src/metal/isoquant_dequantize_iso4.metal`. `make check-metal-compiles` compiles
+them against the header snapshot `src/metal/probes/isoquant_iso4.hdr.metal`.
+The three iso update entries reach this width through `isoquant_msl_dispatch`
+when `device == Device::Gpu`. The CPU codec runs on `Device::Cpu`.
 
 **CPU ↔ GPU parity.** Three tests in
-`crates/rmlx-kv-quant/src/isoquant_msl_v4_tests.rs`, all `#[ignore]`-gated
-(run via
+`crates/rmlx-kv-quant/src/isoquant_msl_v4_tests.rs`, all `#[ignore]`-gated (run
 `cargo test -p rmlx-kv-quant -- --ignored isoquant_msl_v4 --test-threads=1`).
-`iso_v4_msl_matches_cpu_within_eps` asserts CPU (`iso_encode_fast` +
-`iso_decode_fast`, `bits=4`) ↔ MSL agreement within 5e-3 on a 32×128 LCG
-fixture, on the kernels. `iso_v4_dequant_gpu_matches_dequant_cpu` and
-`iso_k4_dequant_gpu_matches_dequant_cpu` assert the same on the store entries
-a decode step calls, at the 3-bit pair's two bounds: 5e-3 per element and a
-strict `max|cpu-gpu| ≤ 1e-6`.
+`iso_v4_msl_matches_cpu_within_eps` asserts that the CPU codec
+(`iso_encode_fast` + `iso_decode_fast`, `bits=4`) and the MSL kernels agree
+within 5e-3 on a 32×128 LCG fixture. `iso_v4_dequant_gpu_matches_dequant_cpu`
+and `iso_k4_dequant_gpu_matches_dequant_cpu` assert the same on the store
+entries that a decode step calls, at the two bounds of the 3-bit pair: 5e-3 per
+element and a strict `max|cpu-gpu| ≤ 1e-6`.
 
-**Wire-up status:**
+**Cosine gate.** `iso4_cosine_gate` in
+`crates/rmlx-kv-quant/src/isoquant_tests.rs`. SSD round-trip: `roundtrip_iso4`
+in `crates/rmlx-kv-ssd/src/block_io_tests.rs` asserts that all four V buffers
+(codes_packed, scales, quaternions, norms) are bit-identical after hydrate.
 
-| Component | Status |
-|---|---|
-| CPU encode/decode (parameterized `iso_encode_fast` / `iso_decode_fast`) | Done (bits ∈ {3, 4}) |
-| `KvStorage::IsoV4` variant + `QuantIsoV4` storage alias | Done (`QuantIsoV<4>`) |
-| `KvQuant::Iso4` + `CacheType::Iso4` | Done |
-| `KvCache::update_iso_v` decode dispatch | Done (one entry over both widths) |
-| SDPA dispatch wiring | Done (dequant-then-SDPA legacy fallback, mirrors iso3) |
-| `KvBlockWriter`/`Reader` integration | Done (layout tag `iso_v_4`; V via `write_quant_iso_v4` / `read_quant_iso_v4`) |
-| SSD tier integration | Done |
-| MSL kernel hook | Done (`isoquant_msl_v4.rs`, reached from the three iso entries through `isoquant_msl_dispatch`) |
-| `--kv-quant iso4` / `--ctv iso4` CLI flags | Done |
-
-**Cosine quality (LCG fixture, group_size=4, head_dim=128, bits=4):**
-mean = 0.998638, min = 0.998092. Test: `iso4_cosine_gate`
-in `crates/rmlx-kv-quant/src/isoquant_tests.rs`. SSD round-trip:
-`roundtrip_iso4` in `crates/rmlx-kv-ssd/src/block_io_tests.rs` —
-all four V buffers (codes_packed, scales, quaternions, norms)
-bit-identical post-hydrate.
-
-**Parameterize, not fork.**
-The encode/decode CPU functions are parameterized over `bits ∈ {3, 4}` (the
-shared dense code plane, `crate::code_plane`), and so is the storage struct:
-one `QuantIsoV<BITS>` and one `QuantIsoK<BITS>`, with `QuantIsoV3` /
-`QuantIsoV4` / `QuantIsoK3` / `QuantIsoK4` as type aliases, so every caller
-outside the crate keeps its spelling. `IsoBlocks` is shared (codes:
-`Vec<u32>` is bits-agnostic). The stores were forked until the collapse
-recorded in `docs/KV_ISO_TWINS.md`; the fork is what left the 4-bit width
-without a `dequant_gpu`.
+**One store type, two widths.** The CPU encode and decode functions take
+`bits ∈ {3, 4}` (the shared dense code plane, `crate::code_plane`), and so does
+the storage struct: one `QuantIsoV<BITS>` and one `QuantIsoK<BITS>`, with
+`QuantIsoV3` / `QuantIsoV4` / `QuantIsoK3` / `QuantIsoK4` as type aliases.
+`IsoBlocks` is shared.
 
 ---
 
@@ -1839,131 +1714,82 @@ without a `dequant_gpu`.
 
 **Algorithm — Cl(3,0) Clifford rotor sandwich, 3-bit codebook.**
 
-rotor3 is the first member of the **Clifford rotation family** of KV codecs.
-Each `head_dim`-element V-vector is embedded into Cl(3,0) (the 8-dimensional
-multivector algebra of 3D Euclidean space) in groups of 3 grade-1 elements,
-sandwiched by a per-(layer, head)-static rotor `R_g`, and 3-bit-quantised
-against the Lloyd-Max N(0,1) codebook. The static rotor is stored once and
-amortises across every token in the layer.
+rotor3 is the 3-bit member of the Clifford rotation family of KV codecs. The
+codec puts each `head_dim`-element V vector into Cl(3,0) (the 8-dimensional
+multivector algebra of 3D Euclidean space) in groups of 3 grade-1 elements. It
+applies a per-(layer, head) static rotor `R_g` as a sandwich, then quantizes to
+3 bits with the Lloyd-Max N(0,1) codebook. The codec stores the static rotor
+once per layer, for all tokens.
 
 | Property | rotor3 |
 |---|---|
-| Delivered bits / element | **8.75** at head\_dim=128 (140 B/token/kv\_head vs bf16's 256 B, **0.547× bf16**), split **3.25 codes + 5.375 scales + 0.125 norm**. 43 groups cover a 128-element row; each stores its three grade-1 codes in the row's dense code plane and spends one scale at `KV_SIDEBAND_DTYPE`. Read off the same allocation, `rotor stored bits/value = (32·⌈⌈D/3⌉·3·bits/32⌉ + 16·⌈D/3⌉ + 16) / D` — 8.75 at D=128, 8.5625 at D=256 for rotor3. A derivation from `QuantKGpuRing::alloc`, measured against a seeded ring by `rotor_rate_splits_into_documented_code_scale_and_norm_bits`. **The scale is now the dominant term**, at 5.375 bits per value against the codes' 3.25: rotor shares one scale across 3 values where iso shares one across 4, which is what keeps rotor the wider of the two families at every width and every head\_dim (`iso_and_rotor_k_codecs_are_under_the_floor_at_every_geometry`). The 3.25 bpe target reported by the Python `rotorquant` reference is gated on the grade-aware codebook follow-up (deferred — see below). |
-| Dead code budget | **Nil — only the 3 grade-1 codes per group are stored.** A rotor sandwich is grade-preserving, so embedding 3 values as the grade-1 part leaves the scalar, three bivector and pseudoscalar slots algebraically zero on encode; on decode the inverse sandwich keeps every non-grade-1 part out of the reconstructed vector, so quantising those slots injected no error either — only bits. Pinned by `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` (encode side) and `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1` (decode side). |
-| Codebook | `lloyd_gaussian_codebook(3)` (8 centroids), shared across all 8 mv components (single-codebook simplification) |
+| Delivered bits / element | **8.75** at head\_dim=128 (140 B/token/kv\_head against bf16's 256 B, **0.547× bf16**): **3.25 codes + 5.375 scales + 0.125 norm**. 43 groups cover a 128-element row. Each group stores its three grade-1 codes in the dense code plane of the row and one scale at `KV_SIDEBAND_DTYPE`. From the same allocation, `rotor stored bits/value = (32·⌈⌈D/3⌉·3·bits/32⌉ + 16·⌈D/3⌉ + 16) / D`: 8.75 at D=128, 8.5625 at D=256. This comes from `QuantKGpuRing::alloc`; `rotor_rate_splits_into_documented_code_scale_and_norm_bits` measures it against a seeded ring. **The scale is the largest term**: rotor shares one scale across 3 values, iso across 4. Thus rotor is the wider of the two families at every width and every head\_dim (`iso_and_rotor_k_codecs_are_under_the_floor_at_every_geometry`). |
+| Code budget | **Only the 3 grade-1 codes per group are stored.** A rotor sandwich keeps the grade. Thus 3 values put in as the grade-1 part leave the scalar, the three bivector and the pseudoscalar slots at zero on encode. On decode, the inverse sandwich keeps every part that is not grade 1 out of the vector. `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` (encode side) and `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1` (decode side) pin this. |
+| Codebook | `lloyd_gaussian_codebook(3)` (8 centroids), one codebook for all 8 multivector components |
 | Pack density | dense code plane, 3 bits per code, 3 codes per group |
-| Rotation | Static per-(layer, head) rotor table `[n_groups, 4]` in `[s, b12, b13, b23]` form, seeded from `ROTORQUANT_GLOBAL_SEED ^ (layer << 32) ^ (head << 16) + group` (see [`crate::clifford`]) |
-| Group size | 3 elements (one Cl(3,0) grade-1 group; output multivector has all 8 components) |
-| `head_dim` constraint | None — `head_dim % 3 != 0` is tail-padded with zeros at encode, masked off at decode |
-| MSL kernel | **Yes** — `rotorquant_msl.rs`, V-side encode + K-side when QJL disabled |
+| Rotation | static per-(layer, head) rotor table `[n_groups, 4]` in `[s, b12, b13, b23]` form, seeded from `ROTORQUANT_GLOBAL_SEED ^ (layer << 32) ^ (head << 16) + group` (`crate::clifford::rotor_seed`) |
+| Group size | 3 elements (one Cl(3,0) grade-1 group) |
+| `head_dim` constraint | none: the encoder pads a `head_dim % 3 != 0` tail with zeros and the decoder masks it off |
+| MSL kernel | `rotorquant_msl.rs`: V-side encode, and K-side when QJL is off |
+| SSD layout tag | `rotor_v_3` |
 
-**Single-codebook simplification.** The Python reference
-(`rotorquant/turboquant/rotorquant.py`) ships a grade-aware codebook split
-(separate `vector` and `trivector` codebooks at different bit budgets). rMLX
-ships a **single 8-centroid codebook** for all 8 mv components; the
-grade-aware variant is a deferred follow-up (cosine gate measured
-empirically — see below).
+**One codebook.** The Python reference (`rotorquant/turboquant/rotorquant.py`)
+uses a grade-aware codebook split (separate `vector` and `trivector` codebooks
+at different bit budgets). rMLX uses **one 8-centroid codebook** for all 8
+multivector components.
 
-**Per-layer rotor tables.** `KvCache` now carries a `layer_idx: usize` field,
-set at construction by each arch builder via
-`KvCache::with_quant_max_seq(…).with_layer_idx(i)`. The rotor3/rotor4 codec
-constructors (`QuantRotorV3::new`, `QuantRotorV4::new`, `QuantRotorK3::new`,
-`QuantRotorK4::new`) receive `self.layer_idx as u32` at every `exit_prefill`
-and decode-time creation site. The `(layer << 32)` mixing term in
-[`crate::clifford::rotor_seed`] is active, giving each layer a distinct
-rotor table and restoring the cross-layer decorrelation that the algorithm
-relies on.
+**Per-layer rotor tables.** `KvCache` has a `layer_idx: usize` field. Each arch
+builder sets it with `KvCache::with_quant_max_seq(…).with_layer_idx(i)`. The
+rotor3/rotor4 codec constructors (`QuantRotorV3::new`, `QuantRotorV4::new`,
+`QuantRotorK3::new`, `QuantRotorK4::new`) get `self.layer_idx as u32` at each
+`exit_prefill` and decode-time creation site. The `(layer << 32)` term in
+`crate::clifford::rotor_seed` gives each layer a different rotor table.
 
-**No QJL residual (V-only codec).** The Python reference includes an optional
-1-bit QJL sign-quantization residual stage for unbiased inner-product recovery
-on the K side. The base rotor3 codec is V-side only — QJL is not applied here
-(see K-side rotor variants below).
+**No QJL residual (V-only codec).** The Python reference has an optional 1-bit
+QJL sign-quantization residual on the K side. The V-only rotor3 codec does not
+apply it (see § "rotor K-side variants").
 
-**Sign-error correction.** The Python `clifford.py::geometric_product` and
-the `rotor_fused.metal::gp_rotor_mv` kernel both have sign errors in the
-grade-2 and grade-3 component formulas (e.g. `e23 * e1 = +e123` per the
-Cl(3,0) multiplication table, but the Python formula yields `-e123`). The
-Rust port uses a table-driven dense geometric product computed at compile
-time from the algebra rules — these signs are correct by construction and
-validated by the algebra tests in `clifford_tests.rs` (known-answer 90°
-rotation, unit rotor identity, sandwich-of-grade-1-stays-grade-1). See
-[CLAUDE.md hard rule 7][hr7] ("Document the truth, not the docstring").
+**Sign errors in the references.** The Python `clifford.py::geometric_product`
+and the `rotor_fused.metal::gp_rotor_mv` kernel have sign errors in the grade-2
+and grade-3 component formulas (for example, `e23 * e1 = +e123` in the Cl(3,0)
+multiplication table, but the Python formula gives `-e123`). The Rust port
+computes a table-driven dense geometric product at compile time from the
+algebra rules. The algebra tests in `clifford_tests.rs` (known-answer 90°
+rotation, unit rotor identity, sandwich of grade 1 stays grade 1) validate it.
 
-[hr7]: ../CLAUDE.md
+**MSL kernel.** `crates/rmlx-kv-quant/src/rotorquant_msl.rs` has GPU encode and
+decode kernels for rotor3 and rotor4. The kernel applies the Cl(3,0) sandwich
+as a closed-form 3×3 SO(3) rotation matrix `M(R)` from `R * mv * R̃` (for
+grade-1 input the grade-2 and grade-3 components cancel). The per-(layer, head,
+group) rotor table is a buffer argument (`rotors_in : f32 [n_groups, 4]`).
+`update_rotor_v`, `update_rotor_sym`, `update_rotor_k_only` and
+`update_rotor_k_asym` (one entry per family for both code widths) dispatch it
+when `device == Device::Gpu`. The CPU encoder runs on `Device::Cpu`.
 
-**MSL kernel.** `crates/rmlx-kv-quant/src/rotorquant_msl.rs`
-ships GPU encode + decode kernels for both rotor3 and rotor4. The kernel
-applies the Cl(3,0) sandwich as a closed-form 3×3 SO(3) rotation matrix
-`M(R)` derived from `R * mv * R̃` (the grade-2 and grade-3 components
-cancel identically for grade-1 input — verified algebraically). The
-per-(layer, head, group) rotor table is passed as a buffer argument
-(`rotors_in : f32 [n_groups, 4]`); kernels do not hardcode the table.
-Dispatch is wired into `update_rotor_v` / `update_rotor_sym` /
-`update_rotor_k_only` / `update_rotor_k_asym` — one entry per family over both
-code widths — and fires when
-`device == Device::Gpu`. The CPU encoder remains the fallback. The V-side hot
-path is shadowed by the warm-TTFT bf16 seed — the GPU encode fires once at
-`exit_prefill` (large prefill slice), not per decode step; the speedup shows
-up in TTFT, not decode TPS.
+**K-side QJL.** The K-side rotor codecs can carry a 1-bit QJL residual that
+needs the JL projection matrix `S` at dequant. The GPU dequant kernels in
+`rotorquant_msl.rs` do not implement QJL. When
+`crate::rotor_qjl::rotor_qjl_enabled()` is `true` (`--rotor-qjl on`), the K-side
+append and decode use the CPU `rotor3_k_encode` / `rotor3_k_decode` path. With
+QJL off (**the default**), the GPU K-side kernel runs.
 
-**K-side QJL caveat.** The K-side rotor codecs may carry a
-1-bit QJL residual correction that needs the JL projection matrix `S` at
-dequant time. The GPU dequant kernels in `rotorquant_msl.rs` do NOT
-replicate QJL — when `crate::rotor_qjl::rotor_qjl_enabled()` is `true`
-(opt-in `--rotor-qjl on`), the K-side append/decode falls back to the CPU
-`rotor3_k_encode` / `rotor3_k_decode` path. With QJL off (**the default**), the
-GPU K-side kernel is engaged (TTFT drop measured on Bonsai 8B at ~10.8k
-prompt tokens: 28.3 s → 11.5 s vs CPU K-encode).
-
-**CPU↔GPU parity tests.** `crates/rmlx-kv-quant/src/rotorquant_msl_tests.rs`
-asserts max-abs-error ≤ 5e-3 between CPU `rotor3_encode`/`rotor4_encode`
-round-trip and the MSL round-trip (same per-codec tolerance policy as
-iso3 / iso4). Tests are `#[ignore]`-gated:
+**CPU ↔ GPU parity tests.** `crates/rmlx-kv-quant/src/rotorquant_msl_tests.rs`
+asserts max-abs-error ≤ 5e-3 between the CPU `rotor3_encode` / `rotor4_encode`
+round-trip and the MSL round-trip (the same tolerance as iso3 / iso4). The tests
+are `#[ignore]`-gated:
 `cargo test -p rmlx-kv-quant -- --ignored rotorquant_msl --test-threads=1`.
 
-**Wire-up status:**
+**Cosine gate.** `rotor3_cosine_gate` in
+`crates/rmlx-kv-quant/src/rotorquant_tests.rs`.
 
-| Component | Status |
-|---|---|
-| Clifford module (`crate::clifford`) | Done (compile-time `MUL_TABLE`, sandwich, random rotor table) |
-| CPU encode/decode (`crate::rotorquant`) | Done (single-codebook, planar3 / iso3 pack convention) |
-| `KvStorage::RotorV3` variant + `QuantRotorV3` storage struct (`QuantRotorV<3>`) | Done (static rotors + per-token blocks; rotors counted once in `byte_size`) |
-| `KvQuant::Rotor3` + `CacheType::Rotor3` | Done (with `rotor3` / `rotor_v_3` dual-spelling parse) |
-| `KvCache::update_rotor_v` decode dispatch, 3-bit arm | Done |
-| SDPA dispatch wiring | Done (dequant-then-SDPA legacy fallback, mirrors iso3) |
-| `KvBlockWriter`/`Reader` integration | Done (layout tag `rotor_v_3`; V via `write_quant_rotor_v3` / `read_quant_rotor_v3`; rotor table persisted on disk) |
-| SSD tier integration | Done — round-trip parity in `roundtrip_rotor3` |
-| MSL kernel | Done (`rotorquant_msl.rs`, V + K-no-QJL encode/decode; parity tests in `rotorquant_msl_tests.rs`) |
-| `--kv-quant rotor3` / `--ctv rotor3` CLI flags | Done |
+**SSD round-trip.** `roundtrip_rotor3` in
+`crates/rmlx-kv-ssd/src/block_io_tests.rs` asserts that all four V buffers
+(`codes_packed`, `scales`, `norms`, `rotors`) are bit-identical after hydrate.
+The block stores the rotor table with the per-token payload, so a change to
+`ROTORQUANT_GLOBAL_SEED` does not change a hydrated cache.
 
-**Cosine quality (LCG fixture, head_dim=128, n_tokens=32, bits=3):**
-mean = 0.995601, min = 0.994737 (post rotor-sandwich fix — original version
-shipped a silent no-op sandwich — see [`crate::rotorquant`] history note).
-Test: `rotor3_cosine_gate` in `crates/rmlx-kv-quant/src/rotorquant_tests.rs`.
-The published Beta-codebook multi-turboquant `rotor3` number is 0.9780;
-rMLX's Gaussian-codebook LCG measurement exceeds it (same effect documented
-for iso3 / iso4 — Beta(d) converges to N(0, 1/d) for `head_dim ≥ 64`).
-
-**SSD round-trip:** `roundtrip_rotor3` in
-`crates/rmlx-kv-ssd/src/block_io_tests.rs` — all four V buffers
-(`codes_packed`, `scales`, `norms`, `rotors`) bit-identical post-hydrate.
-The rotor table is persisted alongside the per-token payload so
-cross-restart identity is preserved independent of any change to
-`ROTORQUANT_GLOBAL_SEED`.
-
-**Paged-KV routing:** rotor3 does NOT route through the PagedAttention
-block-table path. `PagedKStorage` is q8-only and `PagedPlanarVStorage` is
-PlanarQuant-only; a paged rotor3 variant would need its own per-token
-container plus a static rotor table inside the paged arena. Deferred per
-the iso3 / iso4 precedent (opt-in codec, never an auto baseline).
-
-**Smoke probes (16384 max_ctx, greedy decode):**
-
-| Model | Decode TPS | Coherence |
-|---|---|---|
-| `prism-ml__Ternary-Bonsai-8B-mlx-2bit` | 53.3 (10867 prompt tokens, 50 gen) / 134.4 (16 prompt) | yes — replies "4." to "What is 2+2?" |
-| `mlx-community__gemma-4-e4b-it-mxfp8` | 67.3 (10808 prompt, 50 gen) | yes — replies "Paris." to "Capital of France?" |
-| `mlx-community__Qwen3.6-35B-A3B-8bit` | 91.7 (11032 prompt, 50 gen) | yes — coherent reasoning chain in `reasoning_content` (thinking-model) |
+**Paged-KV routing.** rotor3 does not use the PagedAttention block-table path.
+`PagedKStorage` is q8 only and `PagedPlanarVStorage` is PlanarQuant only.
 
 ---
 
@@ -1976,125 +1802,74 @@ the iso3 / iso4 precedent (opt-in codec, never an auto baseline).
 
 **Algorithm — Cl(3,0) Clifford rotor sandwich, 4-bit codebook.**
 
-rotor4 is the 4-bit member of the Clifford rotation family. The algebra and
-rotor-sandwich structure are identical to rotor3; the only difference is the
-codebook and packing:
+rotor4 is the 4-bit member of the Clifford rotation family. The algebra and the
+rotor sandwich are the same as rotor3. Only the codebook and the code width are
+different:
 
 | Property | rotor4 |
 |---|---|
-| Delivered bits / element | **9.75** at head\_dim=128 (156 B/token/kv\_head, **0.609× bf16**) — one bit per stored code more than rotor3, which the dense code plane charges for: 4.25 codes + 5.375 scales + 0.125 norm. Same grade-aware split deferral as rotor3. |
-| Codebook | `lloyd_gaussian_codebook(4)` (16 centroids), shared across all 8 mv components (single-codebook simplification, same as rotor3) |
+| Delivered bits / element | **9.75** at head\_dim=128 (156 B/token/kv\_head, **0.609× bf16**): 4.25 codes + 5.375 scales + 0.125 norm |
+| Codebook | `lloyd_gaussian_codebook(4)` (16 centroids), one codebook for all 8 multivector components |
 | Pack density | dense code plane, 4 bits per code, 3 codes per group |
-| Rotation | Same static per-(layer, head) rotor table as rotor3 (`[n_groups, 4]`); seeded from the same `ROTORQUANT_GLOBAL_SEED` formula |
-| Group size | 3 elements (same Cl(3,0) grade-1 group as rotor3) |
-| `head_dim` constraint | None — same tail-padding as rotor3 |
-| MSL kernel | **Yes** — `rotorquant_msl.rs`, shared with rotor3 via `rotor_quantize_v{3,4}_gpu` / `rotor_dequantize_v{3,4}_gpu` |
+| Rotation | the same static per-(layer, head) rotor table as rotor3 (`[n_groups, 4]`), from the same `ROTORQUANT_GLOBAL_SEED` formula |
+| Group size | 3 elements (the same Cl(3,0) grade-1 group as rotor3) |
+| `head_dim` constraint | none: the same tail padding as rotor3 |
+| MSL kernel | `rotorquant_msl.rs`, shared with rotor3 through `rotor_quantize_v{3,4}_gpu` / `rotor_dequantize_v{3,4}_gpu` |
+| SSD layout tag | `rotor_v_4` |
 
 **One type, two widths.** `QuantRotorV4` and `QuantRotorV3` are aliases of
 `QuantRotorV<4>` and `QuantRotorV<3>`: one const-generic store that encodes and
 decodes through `rotor_encode` / `rotor_decode` at its own `BITS`. `RotorBlocks`
-is bits-agnostic and shared. The code width is the only thing that differs
-between the two spellings.
+is shared.
 
-**Wire-up status:**
+**Tests.** `rotor4_cosine_gate` in
+`crates/rmlx-kv-quant/src/rotorquant_tests.rs`;
+`rotorquant_msl_tests.rs::rotor_v4_msl_matches_cpu_within_eps`;
+`roundtrip_rotor4` in `crates/rmlx-kv-ssd/src/block_io_tests.rs` (all four V
+buffers bit-identical after hydrate, rotor table stored with the payload).
 
-| Component | Status |
-|---|---|
-| CPU encode/decode (`crate::rotorquant`) | Done (`rotor4_encode` / `rotor4_decode` with 4-bit pack and 16-centroid codebook) |
-| `KvStorage::RotorV4` variant + `QuantRotorV4` storage struct | Done (`QuantRotorV<4>`, the same store as RotorV3 at 4 bits; rotors counted once in `byte_size`) |
-| `KvQuant::Rotor4` + `CacheType::Rotor4` | Done (with `rotor4` / `rotor_v_4` dual-spelling parse) |
-| `KvCache::update_rotor_v` decode dispatch, 4-bit arm | Done |
-| SDPA dispatch wiring | Done (dequant-then-SDPA legacy fallback, mirrors rotor3) |
-| `KvBlockWriter`/`Reader` integration | Done (layout tag `rotor_v_4`; V via `write_quant_rotor_v4` / `read_quant_rotor_v4`; rotor table persisted on disk) |
-| SSD tier integration | Done — round-trip parity in `roundtrip_rotor4` |
-| MSL kernel | Done (shared with rotor3; parity tests in `rotorquant_msl_tests.rs::rotor_v4_msl_matches_cpu_within_eps`) |
-| `--kv-quant rotor4` / `--ctv rotor4` CLI flags | Done |
-
-**Cosine quality (LCG fixture, head_dim=96, n_tokens=32, bits=4):**
-mean = 0.998884, min = 0.998250.
-Thresholds: mean ≥ 0.9978, min ≥ 0.9972.
-Test: `rotor4_cosine_gate` in `crates/rmlx-kv-quant/src/rotorquant_tests.rs`.
-
-**SSD round-trip:** `roundtrip_rotor4` in
-`crates/rmlx-kv-ssd/src/block_io_tests.rs` — all four V buffers
-(`codes_packed`, `scales`, `norms`, `rotors`) bit-identical post-hydrate.
-The rotor table is persisted alongside the per-token payload so cross-restart
-identity is preserved independent of any change to `ROTORQUANT_GLOBAL_SEED`.
-
-**Smoke probes:** pending (requires live model run; not yet run).
-
-**Paged-KV routing:** same deferral as rotor3 — RotorV4 does not route through
-PagedAttention.
+**Paged-KV routing:** the same as rotor3. `RotorV4` does not use PagedAttention.
 
 ---
 
 ### iso K-side variants
 
-Four variants mirror the V-side iso3 / iso4 codecs to the K axis. The
-IsoQuant codec (`iso_encode_fast` / `iso_decode_fast`) is **axis-agnostic**
-— the encoder consumes a flat `[B, kv_h, S, D]` row buffer and a per-row
-`head_dim`; the K vs V distinction lives only in the role on
-the SDPA path and the SSD writer/reader tensor names (`l{idx}.k.*` vs
-`l{idx}.v.*`).
+Four variants apply the iso3 / iso4 codec to the K axis. The IsoQuant codec
+(`iso_encode_fast` / `iso_decode_fast`) is **axis-agnostic**: the encoder takes
+a flat `[B, kv_h, S, D]` row buffer and a per-row `head_dim`. Only the role on
+the SDPA path and the SSD tensor names (`l{idx}.k.*` against `l{idx}.v.*`) make
+it K or V.
 
 | `KvQuant` | K codec | V codec | CacheType pair (`(K, V)`) | SSD layout tag |
 |---|---|---|---|---|
 | `Iso3Sym` | iso3 (3-bit quaternion SO(4)) | iso3 (3-bit) | `(IsoK3, Iso3)` | `iso_sym_3` |
-| `Iso4Sym` | iso4 (4-bit quaternion SO(4)) | iso4 (4-bit) | `(IsoK4, Iso4)` | `iso_sym_4` |
+| `Iso4Sym` | iso4 (4-bit quaternion SO(4)) | iso4 (4-bit) | `(IsoK4, Iso4)` | `iso_sym_4_v2` |
 | `IsoKOnly3` | iso3 (3-bit) | **bf16** (parent `decode_fp16_v`) | `(IsoK3, Bf16)` | `iso_k_only_3` |
 | `IsoKOnly4` | iso4 (4-bit) | **bf16** | `(IsoK4, Bf16)` | `iso_k_only_4` |
 
-**A.y Qwen MoE arch guard (mandatory).** K-side ≤4-bit on Qwen MoE is the
-PPL-disaster zone (218 → 8641 on Q4_K_M baseline; 7:1 GQA amplifies K-head
-error through softmax). All four variants are flagged by `KvQuant::k_below_8bit()`
-and `cache_type::validate_resolved` routes them through the dedicated
-`ResolveError::QwenMoeIsoKRejected { variant }` error, which quotes the
-offending variant by name. `auto` never returns any of the four variants on
-any arch (they are opt-in only — no auto path).
+**Qwen MoE arch guard.** `cache_type::validate_resolved` rejects all four
+variants on Qwen MoE with `ResolveError::QwenMoeIsoKRejected { variant }`. The
+error names the variant, and the process exits with code 78. `auto` never
+selects any of the four on any arch.
 
-Smoke runs on `mlx-community__Qwen3.6-35B-A3B-8bit` are expected
-to error with `exit 78` and the diagnostic
-`"K-side ≤4-bit on Qwen MoE is PPL-disaster: --kv-quant <variant> …
-rejected for Qwen3.5/3.6 MoE."` (positive guard test).
+**IsoKOnly bf16-V layout.** The V buffer is the parent
+`KvCache::decode_fp16_v`, as for `KvStorage::None` and `KvStorage::PlanarK`.
+The SSD writer writes only the K-side tensors
+(`l{idx}.k.codes_packed/scales/quaternions/norms`).
 
-**IsoKOnly bf16-V layout.** The V buffer lives on the parent
-`KvCache::decode_fp16_v` — same machinery as `KvStorage::None` and
-`KvStorage::PlanarK` for V. The SSD writer emits only K-side tensors
-(`l{idx}.k.codes_packed/scales/quaternions/norms`); the reader restores
-the K side and the V side is rebuilt transparently from the live request's
-bf16 buffer on first decode step.
+**Status.** GPU-resident on the hot path. `QuantIsoK3` / `QuantIsoK4` each hold
+a `QuantKGpuRing`. The K encode writes the packed ring on the GPU, and
+`iso_flash_decode` reads that ring (see § `iso_flash_decode`).
 
-**Status.** GPU-resident on the hot path. `QuantIsoK3` / `QuantIsoK4` each embed
-a `QuantKGpuRing`; the K encode writes the packed ring on-GPU and
-`iso_flash_decode` reads that ring directly — see § `iso_flash_decode` below.
-
-**Decode-cost caveat (historical — fixed).** These stores used to have no
-GPU-resident mirror on the live decode path: the CPU `dequant()` re-materialised
-every accumulated block each step and re-uploaded the reconstructed K prefix via
-`Array::from_bytes` — an O(kv_seq) per-step cost that grew monotonically with
-context. Short-prompt anchors (warm-TTFT masks the cost after step 1) hid it;
-long-prompt decode showed it. Measured on Bonsai-8B `k_iso3`, that cost was
-~48.5 µs per KV token, taking decode to 0.96 TPS at 16k and 0.59 at 32k. The
-flash-decode kernel removes it (16k: 0.96 → 10.6; 32k: 0.59 → 6.6). Kept here
-because the shape of the bug — an O(seq) host restage hidden behind a warm bf16
-seed — recurs across codecs.
-
-**Cosine empirical floors.** Measured on the LCG fixture at
-`head_dim=128, n_rows=16, TEST_SEED` (see `quant_iso_k{,4}_tests.rs`):
-
-| Variant | Measured cosine (min) | Gate |
-|---|---|---|
-| `iso_k_3` codec | ≥ 0.98 | 0.97 |
-| `iso_k_4` codec | ≥ 0.99 | 0.99 |
-
-The full symmetric / K-only KvQuant cosine is downstream of these K-side
-floors plus the existing V-side iso{3,4} floors.
+**Cosine gates.** On the LCG fixture at `head_dim=128, n_rows=16, TEST_SEED`
+(`quant_iso_k{,4}_tests.rs`): `iso_k_3` gates at 0.97, `iso_k_4` at 0.99
+(minimum cosine).
 
 **SSD round-trip tests.** Four tests in
-`crates/rmlx-kv-ssd/src/block_io_tests.rs`:
-`roundtrip_iso_sym_3`, `roundtrip_iso_sym_4`, `roundtrip_iso_k_only_3`,
-`roundtrip_iso_k_only_4` — assert K-side codes bit-identical post-hydrate
-and K dequant matches within 1e-3.
+`crates/rmlx-kv-ssd/src/block_io_tests.rs`: `roundtrip_iso_sym_3`,
+`roundtrip_iso_sym_4`, `roundtrip_iso_k_only_3` and `roundtrip_iso_k_only_4`.
+They assert that the K-side codes are bit-identical after hydrate and that the
+K dequant matches within 1e-3.
 
 ### rotor K-side variants
 
@@ -2106,172 +1881,109 @@ and K dequant matches within 1e-3.
 > not in that class. See § "Codec disposition — what every codec in the tree
 > is for".
 
-Four variants mirror the V-side rotor3 / rotor4 codecs to the K axis. They
-add an **optional 1-bit QJL residual sideband** (Johnson–
-Lindenstrauss sketch of the post-rotor MSE residual) under
-`--rotor-qjl on`, which is **not** the default — QJL has no MSL kernel, so
-enabling it moves the rotor K encode + dequant onto the CPU. The storage format
-is controlled by a global toggle ([`rotor_qjl_enabled()`] in
-`rmlx-kv-quant::rotor_qjl`), whose default is `false`.
+Six variants apply the rotor3 / rotor4 codec to the K axis. They can add a
+**1-bit QJL residual sideband** (a Johnson–Lindenstrauss sketch of the
+post-rotor MSE residual) with `--rotor-qjl on`. QJL is **off** by default. QJL
+has no MSL kernel, so QJL on moves the rotor K encode and dequant to the CPU.
+`rotor_qjl_enabled()` in `rmlx-kv-quant::rotor_qjl` holds the toggle.
 
 | `KvQuant` | K codec | V codec | CacheType pair (`(K, V)`) | SSD tag (QJL off / on) |
 |---|---|---|---|---|
-| `Rotor3Sym` | rotor3 + QJL | rotor3 | `(RotorK3, Rotor3)` | `rotor_sym_3` / `rotor_sym_3_qjl` |
-| `Rotor4Sym` | rotor4 + QJL | rotor4 | `(RotorK4, Rotor4)` | `rotor_sym_4` / `rotor_sym_4_qjl` |
-| `RotorKOnly3` | rotor3 + QJL | **bf16** (parent `decode_fp16_v`) | `(RotorK3, Bf16)` | `rotor_k_only_3` / `rotor_k_only_3_qjl` |
-| `RotorKOnly4` | rotor4 + QJL | **bf16** | `(RotorK4, Bf16)` | `rotor_k_only_4` / `rotor_k_only_4_qjl` |
-| `RotorK3Asym { v_bits, v_group_size }` | rotor3 + QJL | **TurboQuant V** at `v_bits` (reuses K8V4 / K8VTurbo3 / K8VTurbo2 V codec; `v_group_size` is layout-tag-only — TurboQuant V uses GROUP_SIZE=32 regardless) | `(RotorK3, Q*G*)` for affine V tag | `rotor_k_asym_3_v{vb}_g{vg}` / `rotor_k_asym_3_qjl_v{vb}_g{vg}` |
-| `RotorK4Asym { v_bits, v_group_size }` | rotor4 + QJL | **TurboQuant V** at `v_bits` (`v_group_size` is layout-tag-only — TurboQuant V uses GROUP_SIZE=32 regardless) | `(RotorK4, Q*G*)` | `rotor_k_asym_4_v{vb}_g{vg}` / `rotor_k_asym_4_qjl_v{vb}_g{vg}` |
+| `Rotor3Sym` | rotor3 (+ QJL) | rotor3 | `(RotorK3, Rotor3)` | `rotor_sym_3` / `rotor_sym_3_qjl` |
+| `Rotor4Sym` | rotor4 (+ QJL) | rotor4 | `(RotorK4, Rotor4)` | `rotor_sym_4` / `rotor_sym_4_qjl` |
+| `RotorKOnly3` | rotor3 (+ QJL) | **bf16** (parent `decode_fp16_v`) | `(RotorK3, Bf16)` | `rotor_k_only_3` / `rotor_k_only_3_qjl` |
+| `RotorKOnly4` | rotor4 (+ QJL) | **bf16** | `(RotorK4, Bf16)` | `rotor_k_only_4` / `rotor_k_only_4_qjl` |
+| `RotorK3Asym { v_bits, v_group_size }` | rotor3 (+ QJL) | **TurboQuant V** at `v_bits` (the K8V4 / K8VTurbo3 / K8VTurbo2 V codec) | `(RotorK3, Q*G*)` | `rotor_k_asym_3_v{vb}_g{vg}` / `rotor_k_asym_3_qjl_v{vb}_g{vg}` |
+| `RotorK4Asym { v_bits, v_group_size }` | rotor4 (+ QJL) | **TurboQuant V** at `v_bits` | `(RotorK4, Q*G*)` | `rotor_k_asym_4_v{vb}_g{vg}` / `rotor_k_asym_4_qjl_v{vb}_g{vg}` |
 
-**Asymmetric rotor-K variants.** The two
-`RotorK{3,4}Asym` arms close the gap between `Rotor{3,4}Sym` (rotor V) and
-`RotorKOnly{3,4}` (bf16 V) by carrying a TurboQuant V codec at `v_bits ∈
-{2, 3, 4}`. The V slot routes through the same `QuantV` codec already used by
-`K8V4` / `K8VTurbo3` / `K8VTurbo2` (Lloyd-Max N(0,1) codebook, fixed internal
-group=32; the `v_group_size` field is carried through to the SSD layout key
-for round-trip determinism, but the underlying codec keeps its 32-element
-group). `(8, *)` tuples are rejected at compose / parse time because
-TurboQuant has no 8-bit path — pair `--ctk k_rotor3` / `--ctk k_rotor4` with
-`--ctv bf16` for the K-only path (`RotorKOnly{3,4}`) or with `--ctv
-rotor_v_{3,4}` for the symmetric path (`Rotor{3,4}Sym`) instead.
+**Asymmetric rotor-K variants.** `RotorK{3,4}Asym` carry a TurboQuant V codec at
+`v_bits ∈ {2, 3, 4}`. The V slot uses the `QuantV` codec of `K8V4` /
+`K8VTurbo3` / `K8VTurbo2` (Lloyd-Max N(0,1) codebook, fixed internal group of
+32). The `v_group_size` field goes into the SSD layout key only. The parser and
+the composer reject `v_bits = 8`, because TurboQuant has no 8-bit path. For
+bf16 V use `--ctv bf16` (`RotorKOnly{3,4}`); for rotor V use
+`--ctv rotor_v_{3,4}` (`Rotor{3,4}Sym`).
 
-Display form: `rotor_k_3_asym_v{v_bits}_g{v_group_size}` (similarly for `_4_`).
+Display form: `rotor_k_3_asym_v{v_bits}_g{v_group_size}` (and `_4_`).
 Compose forms:
+
 - `--ctk k_rotor3 --ctv q4_g64` → `RotorK3Asym { v_bits: 4, v_group_size: 64 }`
 - `--ctk k_rotor3 --ctv q4_g128` → `RotorK3Asym { v_bits: 4, v_group_size: 128 }`
 - `--ctk k_rotor4 --ctv q3_g64` → `RotorK4Asym { v_bits: 3, v_group_size: 64 }`
 - `--ctk k_rotor4 --ctv q2_g64` → `RotorK4Asym { v_bits: 2, v_group_size: 64 }`
+- `--ctk k_rotor3 --ctv rotor_v_3` → `Rotor3Sym`
+- `--ctk k_rotor3 --ctv bf16` → `RotorKOnly3`
 
-Symmetric and K-only compose forms:
-- `--ctk k_rotor3 --ctv rotor_v_3` → `Rotor3Sym`.
-- `--ctk k_rotor3 --ctv bf16` → `RotorKOnly3`.
+**Qwen MoE arch guard.** `cache_type::validate_resolved` rejects all six
+variants on Qwen MoE with `ResolveError::QwenMoeRotorKRejected { variant }`.
+The `variant` field holds the full Display form (for example
+`rotor_k_3_asym_v4_g64`). The process exits with code 78.
 
-**Arch guard (Contract A.y)**: all `RotorK{3,4}Asym` variants are rejected on
-Qwen MoE via the same `QwenMoeRotorKRejected` error as the sym / K-only
-siblings (K-side ≤4-bit on Qwen MoE is the PPL-disaster path). The error's
-`variant` field carries the full Display form (e.g.
-`rotor_k_3_asym_v4_g64`) so the diagnostic is unambiguous.
+**Decode cost with QJL on.** With `--rotor-qjl on`, the rotor K-side codecs
+have no GPU-resident code mirror. Each decode step decodes the full K prefix on
+the CPU, applies an O(head_dim²) QJL score correction per cached token, and
+uploads the K prefix again. This cost grows with `kv_seq`. With QJL off, the
+rotor K encode and `rotor_flash_decode` run on Metal.
 
-**SDPA**: the K rotor codec dequants to bf16 (existing `RotorKOnly{3,4}` K
-path); the affine V codec dequants to bf16 (existing `K8V4` V path); then
-`scaled_dot_product_attention` runs.
+**Fused-QK.** The head-major fused-QK path has kernels for `RotorK3Asym` and
+`RotorK4Asym` only. It runs when `--fused-qk on`, the device is GPU, `head_dim`
+is 128 or 256 and QJL is off (the kernel does not use the QJL residual).
+`--fused-qk` is off by default. See § "Fused-QK head-major K storage".
 
-**Decode-cost caveat — opt-in only.** With `--rotor-qjl on` the rotor K-side
-codecs have no GPU-resident code mirror: each decode step re-decodes the full K
-prefix on the CPU (and re-encodes the newly appended token), applies an
-O(head_dim²)-per-cached-token QJL score correction, then re-uploads the K
-prefix — an O(kv_seq) per-step cost that the short-prompt anchors mask but
-long-prompt decode exposes. That is why QJL is **off** by default: the default
-path runs the rotor K encode and `rotor_flash_decode` on Metal. The fused-QK
-fast path (which would avoid the per-step marshaling) also needs
-`--rotor-qjl off` and is separately default-OFF; see the Fused-QK status
-below.
-
-**Fused-QK status:** the 6 rotor variants (`Rotor3Sym`, `Rotor4Sym`,
-`RotorKOnly3`, `RotorKOnly4`, `RotorK3Asym`, `RotorK4Asym`) are wired into
-the fused-QK fast path via the shadow split (`FusedQkShadow` carries per-token
-codes/scales/norms + a static `[n_groups * 4]` rotor table). Gated by
-`--fused-qk on` AND `--rotor-qjl off` (the kernel does not consume the QJL
-residual). Default-OFF (the auto/HOLD `--fused-qk` mode keeps the legacy bf16
-SDPA path live). Bonsai bench (`--ctk k_rotor3 --ctv rotor_v_3 --rotor-qjl
-off --fused-qk on`) regresses 63.5 → 12.3 decode TPS at 8k context because
-the per-decode-step `concatenate([scales, norms, rotor_table])` marshaling cost
-swamps the kernel's compute savings; the kernel is reachable and the A.y guard
-is preserved, but the perf win remains a follow-up. See
-`docs/PERF_BASELINE.md` for the full bench numbers and analysis.
-
-**QJL residual — storage format.** When QJL is enabled at first `append`,
-one extra 1-bit sign per `head_dim` element per token is stored alongside the
-rotor codes. Wire format: packed `u8` row-major, shape
+**QJL residual — storage format.** When QJL is on at the first `append`, the
+codec stores one extra sign bit per `head_dim` element per token with the rotor
+codes. Wire format: packed `u8`, row-major, shape
 `[B, kv_h, max_seq, ceil(head_dim/8)]`. Bit order: LSB = element 0, MSB =
-element 7 (matches Python `rotorquant/turboquant/rotorquant.py` reference).
-The QJL projection matrix `S` (`[head_dim, head_dim]` f32, row-major) is
-generated once per layer/head on first append and persisted to the SSD block
-(`l{idx}.k.qjl_s`). The layout tag (`*_qjl`) distinguishes QJL-ON blocks
-from QJL-OFF blocks so the reader can hydrate the projection matrix.
+element 7 (the same as the Python `rotorquant/turboquant/rotorquant.py`
+reference). The QJL projection matrix `S` (`[head_dim, head_dim]` f32,
+row-major) is made once at the first append and written to the SSD block
+(`l{idx}.k.qjl_s`). The layout tag (`*_qjl`) tells the reader to hydrate the
+projection matrix.
 
-**QJL toggle.** CLI: `--rotor-qjl on|off` (default `off`). Env fallback:
-`RMLX_ROTOR_QJL=1` enables. The toggle is read per-construction (not cached)
-so env changes between tests still propagate.
+**QJL toggle.** CLI: `--rotor-qjl on|off` (default `off`). The `rmlx` binary
+always installs the flag value at startup, so the environment variable
+`RMLX_ROTOR_QJL` has no effect on it. `RMLX_ROTOR_QJL=1` (or `on`, `true`,
+`yes`) enables QJL only in a process that does not install the flag, for
+example a test binary. The toggle is read at each construction (not cached).
 
-**Score-time QJL correction.** The QJL correction is
-applied **at decode time** inside `apply_qjl_correction` (called from
-`rotor3_k_decode` / `rotor4_k_decode`) as a per-token K-side residual-add:
+**Score-time QJL correction.** `apply_qjl_correction` (called from
+`rotor3_k_decode` / `rotor4_k_decode`) applies the correction **at decode time**
+as a per-token K-side residual-add:
 
 ```
 Δk[t, j] = ||r_t|| · sqrt(π/2)/m · sum_i ( S[i, j] · signs[t, i] )
 K_corrected[t] = K_rotor[t] + Δk[t]
 ```
 
-The downstream `Q · K_corrected` equals the Python reference's score-time
-`term1 + term2` (`RotorQuantProd.inner_product` in
-`rotorquant/turboquant/rotorquant.py:246-263`) because `term2` is linear in
-`Q`. This lets the correction live entirely inside `rmlx-kv-quant`
-(boundary contract preserved — no `rmlx-models`/`rmlx-runtime` reach-back)
-and removes the need for any engine-side SDPA refactor: every existing
-caller of `rotor3_k_decode`/`rotor4_k_decode` (CPU dequant path on
-`Rotor3Sym`, `Rotor4Sym`, `RotorKOnly3`, `RotorKOnly4`, `RotorKAsym3/4`)
-gets the correction for free.
+The result `Q · K_corrected` is equal to the score-time `term1 + term2` of the
+Python reference (`RotorQuantProd.inner_product` in
+`rotorquant/turboquant/rotorquant.py:246-263`), because `term2` is linear in
+`Q`. Thus the correction stays inside `rmlx-kv-quant`, and every caller of
+`rotor3_k_decode` / `rotor4_k_decode` gets it.
 
-Validation:
-- **Math gate — bias-mean** (per-fixture, runs in `make ci`):
-  `qjl_correction_score_estimator_unbiased` in
-  `crates/rmlx-kv-quant/src/rotorquant_tests.rs` — reproduces the Python
-  ref's `test_inner_product_unbiased` (n=1024 unit-normalized pairs,
-  asserts `|bias| < 0.05` for both QJL on and off through the live
-  `apply_qjl_correction` path).
-- **Math gate — bit-equivalence linearity** (runs in `make ci`):
-  `qjl_residual_add_matches_score_time_correction` in the same file —
-  per-token, asserts `Q · K_on == Q · K_off + Python_term2` to within 1e-4
-  absolute (f32 reorder noise; measured max_abs_err ≈ 6.7e-8, max_rel_err ≈
-  4.1e-7 on head_dim=64 unit-normalized fixture). What this proves: the
-  dequant-side residual-add is algebraically identical to the Python
-  reference's score-time `term2` for every (Q, K, layer, head) given the same
-  rotor MSE codes. Empirical real-model lift remains a deferred gate.
-- **Per-K cosine** drops slightly on the LCG fixture (~0.002 at
-  head_dim=128) — by design. Per-K cosine measures `cos(K_corrected, K_true)`
-  and is not the relevant SDPA quality metric; the JL sketch trades a tiny
-  per-element variance gain for an unbiased inner-product estimate, which is
-  what attention scores actually consume.
-- **Bonsai TPS regression bench** (see `docs/PERF_BASELINE.md`): decode TPS
-  regression −0.06% (78.16 → 78.21 tok/s on Bonsai 4k prompt, 3 measured
-  runs; well below the 15% ceiling).
-- **Real-model output-logit lift** — deferred. The bit-equivalence linearity
-  gate above supersedes the empirical 32-step cosine-lift gate as a stronger
-  offline proof.
+Validation (both in `crates/rmlx-kv-quant/src/rotorquant_tests.rs`, run by
+`make ci`):
 
-**GPU fused-QK kernels** (`rotor_fused_qk_msl.rs`) currently bypass QJL —
-they only fire when `codec_has_gpu_encoder(codec) == true`
-(q8/turbo3/turbo4 today; rotor is HOLD). When the rotor GPU
-encoder lands, the kernel MUST either replicate the residual-add in MSL or
-fall back to the CPU dequant path when `qjl_s_matrix.is_some()`.
+- `qjl_correction_score_estimator_unbiased_rotor3` and `_rotor4` reproduce the
+  Python
+  `test_inner_product_unbiased` (n=1024 unit-normalized pairs). They assert
+  `|bias| < 0.05` with QJL on and off, through `apply_qjl_correction`.
+- `qjl_residual_add_matches_score_time_correction` asserts, per token,
+  `Q · K_on == Q · K_off + Python_term2` within 1e-4 absolute. This proves that
+  the dequant-side residual-add is the same as the score-time `term2` of the
+  reference for the same rotor MSE codes.
 
-**Storage round-trip** (carries the QJL sideband across SSD spill / hydrate)
-is validated; the QJL wiring did not change the storage shape.
-
-**A.y Qwen MoE arch guard (mandatory).** K-side ≤4-bit on Qwen MoE is the
-PPL-disaster zone (218 → 8641 on Q4_K_M baseline; 7:1 GQA amplifies K-head
-error through softmax). All four variants are flagged by `KvQuant::k_below_8bit()`
-and `cache_type::validate_resolved` routes them through
-`ResolveError::QwenMoeRotorKRejected { variant }`, which quotes the offending
-variant by name. Error message verbatim:
-`"K-side ≤4-bit on Qwen MoE is PPL-disaster: --kv-quant <variant> is rejected
-for Qwen3.5/3.6 MoE. Use '--kv-quant k8v8' (K stays 8-bit) or a V-only rotor
-variant ('--kv-quant rotor3' / '--kv-quant rotor4')."` Smoke runs on Qwen MoE
-rows for all four rotor K-side variants are expected to error with `exit 78`
-(positive guard test only).
-
-**MSL status.** CPU-only on the hot path. GPU axis-agnostic dispatch is a
-deferred follow-up.
+Per-K cosine on the LCG fixture is slightly lower with QJL on. This is
+expected: the JL sketch gives an unbiased inner product, not a closer K vector.
 
 **SSD round-trip tests.** Eight tests in
 `crates/rmlx-kv-ssd/src/block_io_tests.rs`:
 `roundtrip_rotor_sym_3_{qjl,no_qjl}`,
 `roundtrip_rotor_sym_4_{qjl,no_qjl}`,
-`roundtrip_rotor_k_only_{3,4}_{qjl,no_qjl}` — each asserts K codes
-bit-identical post-hydrate and the `use_qjl()` flag matches the tag. Tests
-use `ROTOR_QJL_ENV_LOCK` (process-wide mutex) to prevent env-var races under
-parallel `cargo test`.
+`roundtrip_rotor_k_only_{3,4}_{qjl,no_qjl}`. Each asserts that the K codes are
+bit-identical after hydrate and that the `use_qjl()` flag matches the tag. The
+tests hold `ROTOR_QJL_ENV_LOCK` (a process-wide mutex) to prevent env-var races
+under parallel `cargo test`.
 
 ---
 
