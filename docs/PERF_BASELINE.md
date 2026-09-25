@@ -9,9 +9,11 @@ arguments, and `make canary-gate` reads `runs.db`.
 
 Each anchor is the median `decode_tps` of `make canary` at the `auto` KV
 default. `auto` is unquantised bf16 on every architecture (`docs/KV_QUANT.md`
-"The auto default"). Hardware: M5 Max, bandwidth ceiling 614 GB/s.
-`scripts/perf_ceiling.py` divides by that bandwidth; `--bandwidth-gbs`
-overrides it for another host.
+"The auto default"). The anchors were measured at `bd729e36` on 2026-08-21,
+with the `release-perf` profile, by `make canary`.
+
+Hardware: M5 Max, bandwidth ceiling 614 GB/s. That is the host constant
+`scripts/perf_ceiling.py` divides by; `--bandwidth-gbs` overrides it.
 
 | model | kv_quant | decode_tps | stddev |
 |---|---|---:|---:|
@@ -26,7 +28,7 @@ interleaved A/B run supports a direction between two builds.
 **Canary protocol.** `make canary` builds the `release-perf` binary and runs
 `scripts/perf_canary.sh`:
 
-- Models: the three above; `--include-26b` adds
+- Models: the three above. `bash scripts/perf_canary.sh --include-26b` adds
   `mlx-community__gemma-4-26b-a4b-it-mxfp8`.
 - Shape: `rmlx baseline --prompt-tokens 4096 --max-tokens 100
   --max-ctx 8192`, with no `--kv-quant`.
@@ -36,32 +38,35 @@ interleaved A/B run supports a direction between two builds.
   (`crates/rmlx-cli/src/commands/baseline.rs`).
 - CSV: one row per model in `$RMLX_HOME/bench/perf_canary.csv`, with columns
   `ts_utc,git_sha,model,kv_quant,prompt_tokens,decode_tps,stddev,build_profile`.
-  `kv_quant` is the codec name the run's own log states.
-- `runs.db`: one further run per model with `rmlx baseline --record`.
+  `kv_quant` is the codec name the run's own log states, or `auto` if that
+  probe fails.
+- `runs.db`: one further run per model with `rmlx baseline --record`. A
+  failed record is a warning; the CSV row is still written.
 - A `k8vturbo3` arm follows each model: 1 warmup, 3 measured, CSV row only.
 
 **Gating.** Two gates read what the canary wrote:
 
 - `make canary-gate SHA=<last-green-sha>` runs `rmlx metrics deltas
   --since-sha <SHA> --threshold-pct 3 --exit-code true` against `runs.db`.
-  `CANARY_THRESHOLD_PCT` sets the threshold. Exit 0 is clean, 1 a
-  regression, 125 no baseline (a `git bisect` skip).
+  `CANARY_THRESHOLD_PCT` sets the threshold. Exit 0 is clean and 1 a
+  regression. Exit 125 (a `git bisect` skip) means no `runs.db`, or no
+  returned row with a baseline. A SHA that returns no rows exits 0.
 - `scripts/regression_gate.sh <model> <baseline_tps> <baseline_stddev>
   [--tolerance PCT]` compares the last CSV row naming the model with the
   anchor given as arguments. The tolerance defaults to 3%. It widens to 5%
-  when that row's stddev exceeds half the tolerance band. Exit codes match
-  `canary-gate`.
+  when that row's stddev exceeds half the tolerance band. Exit 0 is within
+  tolerance, 1 a regression, 125 a failed precondition (arguments, binary,
+  CSV, or a missing or unparseable row).
 
 The last CSV row for a model is its `k8vturbo3` arm, because the canary
 appends that row after the `auto` row. `regression_gate.sh` therefore
 compares the `k8vturbo3` median with the anchor.
 
 **The canary decodes greedily.** `rmlx baseline` samples at temperature 0, on
-the GPU-argmax path. A served request that omits sampling fields takes its
-temperature from `generation_config.json`, else 1.0. That request takes the
-host-sampling path, which no canary run observes. Measure it with
-`rmlx bench --temperature / --top-p / --top-k / --repetition-penalty`
-(`docs/SAMPLING.md` § "Cost of the host path").
+the GPU-argmax path. A served request resolves its temperature in the order
+`docs/SAMPLING.md` § "Cost of the host path" gives. A resolved temperature
+above 0 takes the host-sampling path, which no canary run observes. Measure
+it with `rmlx bench --temperature / --top-p / --top-k / --repetition-penalty`.
 
 **The canary is a short-context instrument.** Its pinned shape is a 4096-token
 prompt. A defect that engages only at longer contexts cannot move an anchor.
