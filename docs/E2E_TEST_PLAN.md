@@ -4,7 +4,8 @@ The harness drives the real `rmlx` binary, case by case, and asserts on its
 real output. It is a correctness gate, not a performance gate.
 
 It writes a PASS/FAIL grid (feature × sub-feature) to
-`<RMLX_HOME>/e2e/report.{json,md}`.
+`report.{json,md}` under `<temp_dir>/rmlx_e2e_<pid>/e2e/`, a per-run home
+outside the checkout, and prints the path at the end of the run.
 
 ## Form
 
@@ -31,7 +32,7 @@ It writes a PASS/FAIL grid (feature × sub-feature) to
 |---|---|---|
 | `golden` | The per-token chosen bytes (OpenAI non-stream logprobs `bytes`) at temperature 0 equal the recorded golden. A missing golden, or `RMLX_E2E_REGEN_GOLDEN=1`, records one and passes. | text core, OpenAI non-stream |
 | `contains_coherent` | The output is coherent and contains `expect`. | streaming, Anthropic `/v1/messages` |
-| `coherent` | The output is coherent: at least two words of mean length above one, no word over 60% of three or more words, not NaN; it contains `expect` when one is given. | K-only and symmetric codecs, short context |
+| `coherent` | The output is coherent: at least 3 distinct alphanumeric characters, at least two words of mean length above one, no word over 60% of three or more words, not NaN; it contains `expect` when one is given. | K-only and symmetric codecs, short context |
 | `niah_retrieval` | The needle is recovered from a haystack of about 8k tokens at temperature 0. | quantized KV at long context |
 | `cosine_vs_bf16` | The mean cosine of the per-position top-k logprob distributions against the model's own `none` run is at least `min_cosine` (default 0.99), over positions where the chosen ids agree. A chosen-id divergence in the first 8 tokens fails. | quantized KV fidelity |
 | `thinking` | `reasoning_content` is non-empty and the answer (68) appears in the content or the reasoning. | thinking mode |
@@ -45,7 +46,7 @@ It writes a PASS/FAIL grid (feature × sub-feature) to
 | `cache_hit_equivalence` | A multi-block prompt sent twice returns the same `content`, and `/metrics/cache` `block_hits` rises between the two. | prompt cache |
 | `image` | The bundled solid-red PNG (`tests/e2e/fixtures/vtest_red.png`) with a colour question gets an answer naming `expect` (default "red"). | image input |
 | `tool_call` | The `tool_weather` fixture returns `finish_reason == "tool_calls"` and a call named `expect` (default `get_weather`). | tool calling |
-| `spec_decode` | Served with `--draft-model` (and `--draft-kind` when the row names one) under `--log verbose`, one generation logs a `*_generate: done` summary with `accept_rate > 0`, and `expect` appears in `content` or `reasoning_content`. An absent drafter skips. | speculative decoding |
+| `spec_decode` | Served with `--draft-model` (and `--draft-kind` when the row names one) under `--log verbose`, one generation logs a `*_generate: done` summary with `accept_rate > 0`, and `expect` appears in `content` or `reasoning_content`. An absent drafter skips. The two-model loop logs `spec_generate_greedy_cached: done`, which this scrape does not match, so the two-model rows fail whenever both models resolve. | speculative decoding |
 
 The dispatch counters of the specialised attention kernels are
 process-internal atomics with no HTTP surface. The in-crate dispatch tests
@@ -77,7 +78,7 @@ The manifest's `feature` column groups the rows:
 | `broader_models` | Gemma4-e4b, Qwen3.6-35B-A3B, gemma-4-26b-a4b and gemma-4-31b: `golden`, stream and Anthropic coherence, `niah_retrieval` and `cosine_vs_bf16` on a subset of legal codecs, a sliding-window-crossing NIAH on Gemma4, the Qwen3.6 KV refusals (`q4_g128` K, `tsym3`) and Qwen3.6 thinking |
 | `ssd_kv_tier`, `prompt_cache` | `byte_identical_restart`, `cache_hit_equivalence` on Bonsai |
 | `multi_model`, `attention` | `model_lifecycle`, `dispatch_fired` (k8v4) on Bonsai |
-| `speculative` | Qwen3.6 with its DFlash and MTP drafters, Gemma4-e4b drafted by Gemma4-e2b, Qwen3.8-27B drafted by ornith-1.0-9b, all `spec_decode` |
+| `speculative` | Qwen3.6 with its DFlash and MTP drafters, Gemma4-e4b drafted by Gemma4-e2b, Qwen3.8-27B drafted by ornith-1.0-9b, all `spec_decode` (the two two-model rows fail, see the kind); `p2_speculative_decode` is a `phase2` row and records PENDING |
 | `modalities`, `agent` | Gemma4-e4b `image`; Qwen3.6 and Bonsai `tool_call` |
 
 The K-only and symmetric codecs re-quantize K at every decode step. On
@@ -112,8 +113,9 @@ A new model therefore needs only a manifest row carrying its slug, or, for one
 run, `RMLX_E2E_MODEL_<SLUG>=<path>`. When a model does not resolve, its cases
 record `SKIP` and the suite stays green.
 
-### Single-MLX claim discipline
+### Preflight
 
 Every model-touching case runs a preflight first and tears down the `rmlx
-serve` it spawned afterwards. The preflight kills stray `rmlx serve` processes
-and removes every `/tmp/rmlx.*.claim` file.
+serve` it spawned afterwards. The preflight runs `pkill -f` on `rmlx serve`,
+`mlx_lm`, `paroquant` and `omlx`, whoever started them, and removes every
+`/tmp/rmlx.*.claim` file.
