@@ -9,11 +9,11 @@ earlier process spilled to SSD, and that startup eviction holds the budget.
 ```bash
 make build-perf
 VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh \
-  [--port 62265] [--ssd-gb 100] [--tag ssd-canary] [--dry-run]
+  [--port 62265] [--ssd-gb 100] [--dry-run]
 ```
 
 `make ssd-canary` builds `release-perf` and runs the script with
-`--tag ssd-canary --ssd-gb ${SSD_GB:-100}`. The script uses
+`--ssd-gb ${SSD_GB:-100}`. The script uses
 `target/release-perf/rmlx` and exits 125 when that binary is missing.
 
 | Flag or variable | Default | Meaning |
@@ -21,17 +21,20 @@ VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh \
 | `VERIFIER_MODEL` | required | Snapshot directory to serve |
 | `--port`, `PORT` | `62265` | Server port |
 | `--ssd-gb`, `SSD_GB` | `100` | `--kv-ssd-cache-gb` for POPULATE and REVISIT |
-| `--tag` | `ssd-canary` | Tag prefix of the `runs.db` rows |
-| `--dry-run` | off | Keeps the data root, skips the ingest and the `events` checks |
+| `--tag` | — | Parsed and never read; it changes nothing |
+| `--dry-run` | off | Keeps the data root; skips the ingest and the `events` and `observations` checks |
 | `RMLX_HOME` | `.rmlx/proofs/step3-canary/` | Data root of every server process |
 | `RMLX_HARDWARE_TAG` | script default | Hardware label of the `runs.db` rows |
 
-The script deletes its data root before the run, except under `--dry-run`.
-An `RMLX_HOME` exported in the shell is that data root.
+The script deletes its data root whole before the run, except under
+`--dry-run`. An `RMLX_HOME` exported in the shell is that data root, so an
+exported `RMLX_HOME=$PWD/.rmlx` loses `metrics/runs.db`, `metrics/backups/`,
+`cache/` and `logs/`. Unset `RMLX_HOME` before the run.
 
 Before each phase the script kills every `rmlx serve`, `mlx_lm`, `paroquant`
 and `omlx` process and removes every `/tmp/rmlx.*.claim` file. The make
-target does the same before it starts.
+target first kills every `rmlx serve` and `mlx_lm` process and removes every
+claim file.
 
 ## Phases
 
@@ -63,12 +66,14 @@ The run exits 1 when any FAIL check fails. WARN checks only print a note.
 | `ssd_evict_total` is above 0 after EVICT startup (or at the end of EVICT) | FAIL |
 | The EVICT index holds no more bytes than the budget right after startup | FAIL |
 | `events` has at least one `ssd_spill` row and one `ssd_hydrate` row | WARN |
-| `observations` has one row per phase tag | WARN |
+| `observations` has at least one row per phase tag | WARN |
 | `ssd_bytes_used` after POPULATE is above 0 | WARN |
 
-Each phase files one `RunRecord` with the tag `<tag>-populate`, `-revisit` or
-`-evict` through `rmlx metrics record`. The record carries SSD hits, bytes
-used, evictions, and mean spill and hydrate time and rate.
+Each phase files one `RunRecord` through `rmlx metrics record`, tagged
+`ssd-canary-populate`, `ssd-canary-revisit` or `ssd-canary-evict` whatever
+`--tag` says. The POPULATE and REVISIT records carry SSD hits, bytes used,
+evictions, and mean spill and hydrate time and rate. The EVICT record carries
+bytes used and evictions only.
 
 ## Output
 
@@ -86,8 +91,9 @@ Under the data root:
 exits 125 without `SHA=` or without the DB.
 
 `CANARY_DB` defaults to `$RMLX_HOME/metrics/runs.db`, with `RMLX_HOME`
-defaulting to `.rmlx`. That is not the DB the canary writes. The canary's
-own DB holds one run, since the script deletes its data root first.
+defaulting to `.rmlx`. With `RMLX_HOME` unset, that is not the DB the canary
+writes. Either way the canary's DB holds one run, since the script deletes its
+data root first.
 
 `docs/METRICS_DB.md` describes `runs.db`. The cross-restart integration test,
 one spill and one hydrate, is `crates/rmlx-server/tests/ssd_cache_restart.rs`.
