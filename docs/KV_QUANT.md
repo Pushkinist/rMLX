@@ -1170,9 +1170,8 @@ The rule uses only the layer index. It does not use the context length, the
 architecture name or the codec name. A codec that quantizes neither side gets
 no floor (see § "`--kv-quant none` is a bf16 control").
 
-The default counts come from sweeps that ran with bf16 boundary layers. No
-measurement derives them for the current floor. Use them as a setting, not as a
-measured optimum.
+No measurement derives the default counts for this floor. They are a setting,
+not a measured optimum.
 
 **Set the counts.** `--kv-boundary-layers <head>,<tail>` (default `2,8`) sets
 the counts on `rmlx serve`, `baseline`, `bench` and `eval ppl`. `0,0` turns the
@@ -1180,6 +1179,10 @@ promotion off. `eval ppl` refuses the flag when no KV codec is set, because its
 default scorer has no per-layer cache. A run at a value that is not the default
 records `decode_config = 'kv_boundary/head=<h>,kv_boundary/tail=<t>'`, so it
 ranks as its own cell.
+
+**Judge a codec by perplexity, not by a token digest.** A greedy token digest
+shows whether a codec changes the output. It does not rank two codecs that both
+change it. Use perplexity for that.
 
 ### Which codec the floor is
 
@@ -1206,10 +1209,11 @@ returns `K8V8`.
 **A `K8V8` boundary layer is a bf16 layer.** `K8V8` builds no packed store. Its
 decode reads the bf16 mirror on both axes. Thus a layer that falls back to
 `K8V8` holds two bf16 buffers: 16.00 bits per value, the same bytes as `none`.
-Ten codecs read their own packed store. Eight of them take this fallback:
-`iso3_sym`, `iso4_sym`, `k_iso3`, `k_iso4`, `rotor3_sym`, `rotor4_sym`,
-`k_rotor3` and `k_rotor4`. On those eight, each promoted layer costs the
-difference between the bf16 rate and the codec rate. An SO(4)-rotated or rotor
+Ten codecs read their own packed store. Eight of them always take this
+fallback: `iso3_sym`, `iso4_sym`, `k_iso3`, `k_iso4`, `rotor3_sym`,
+`rotor4_sym`, `k_rotor3` and `k_rotor4`. On a shared-KV stack, `Mixed` and
+`RotK` also take it, so all ten do. On those codecs, each promoted layer costs
+the difference between the bf16 rate and the codec rate. An SO(4)-rotated or rotor
 3-bit or 4-bit ring has no 8-bit form, so the only other choice is no floor on
 those layers.
 
@@ -1425,14 +1429,20 @@ becomes `q8_g128`.
 
 The resolver rejects:
 
+- any spec when the model config gives no `head_dim` (`HeadDimUnknown`);
+- the llama.cpp tags `q8_0`, `q4_0`, `q4_1`, `q5_0`, `q5_1` and `iq4_nl`, by
+  name, with the nearest rMLX tag in the error;
 - a V-only codec on K, a K-only codec on V, and `rot_k` on V;
 - `q2_g64` on K (2-bit K makes attention incoherent);
 - `bf16` on one side and a quantized codec on the other, except the K-only
   pairs above;
 - a V rotation codec (`tq4`, `planar*`, `iso_v_*`, `rotor_v_*`, TCQ) with a K
-  that is not `q8_g128`;
-- `tq4` when `head_dim` is not 128 or 256, `rot_k` when `head_dim` is not a
-  power of two, and an affine group that does not divide `head_dim`.
+  that is not `q8_g128`. There are two exceptions: `iso_v_N` with `iso_k_N`
+  gives `isoN_sym`, and `rotor_v_N` with `rotor_k_N` gives `rotorN_sym`;
+- `tq4` when `head_dim` is not 128 or 256, and `rot_k` when `head_dim` is not
+  a power of two;
+- an affine tag whose group does not divide `head_dim`, or whose `bits` pack
+  does not divide it (`head_dim % (32 / bits) != 0`).
 
 Notes:
 
@@ -1526,10 +1536,11 @@ hold it. Three cases:
 - After that step, the ring is the only resident copy.
 
 `estimated_resident_bytes_per_layer` sizes the four store-reading members from
-the ring. The estimate is low in two cases: between `exit_prefill` and the first
-fused decode step, and for the full request on a layer whose shape the fused
-path rejects (batch > 1, or a `head_dim` that is not a power of two at most
-512). In the second case the ring is never allocated and the blocks stay.
+the ring. The estimate is low in two cases. The first case is the window
+between `exit_prefill` and the first fused decode step. The second case is the
+full request on a layer whose shape the fused path rejects: batch > 1, or a
+`head_dim` that is not a power of two at most 512. In the second case the ring
+is never allocated and the blocks stay.
 
 **Both rings are under bf16 at every head_dim, and iso is under it by more.**
 The code plane costs `bits` per value for iso and `bits·⌈D/3⌉·3/D` for rotor:
@@ -1632,14 +1643,20 @@ asserts that the `QuantIsoV3` round-trip matches `iso_decode_fast` within
 add one `*Blocks` entry per `append` and concatenate them on `dequant`. The
 caller reshapes the concatenation head-major `[B, kv_h, S, D]`. Thus each
 `append` reorders the head-major chunk heads↔seq (`[B, new_seq, kv_h, D]`)
-before it encodes, and `dequant` reorders **each block back at its own sequence
-offset** (`seq_layout::transpose_chunked_seq_heads`). The codec is positional
-per token row, so the sidebands stay with their rows: the Iso per-(token,
-group) scale and norm and the constant `FIXED_QUAT` move with the rows; the
-Rotor static rotor table and the QJL projection are keyed by group or
-projection and do not move; the per-token QJL `qjl_codes` / `qjl_norms` move
-with the rows. The `.kvb` SSD format does not change (only the order of token
-rows inside a block). See `docs/KV_CACHE.md` §5.7.3.
+before it encodes. `dequant` reorders **each block back at its own sequence
+offset** (`seq_layout::transpose_chunked_seq_heads`). One reorder over the
+whole concatenation gives the same result only at `B == 1`.
+
+The codec is positional per token row, so the sidebands stay with their rows:
+
+- The Iso per-(token, group) scale and norm and the constant `FIXED_QUAT` move
+  with the rows.
+- The Rotor static rotor table and the QJL projection are keyed by group or
+  projection. They do not move.
+- The per-token QJL `qjl_codes` / `qjl_norms` move with the rows.
+
+A `.kvb` SSD block stores its token rows in this sequence-major order. See
+`docs/KV_CACHE.md` §5.7.3.
 
 ---
 
@@ -1723,7 +1740,7 @@ once per layer, for all tokens.
 
 | Property | rotor3 |
 |---|---|
-| Delivered bits / element | **8.75** at head\_dim=128 (140 B/token/kv\_head against bf16's 256 B, **0.547× bf16**): **3.25 codes + 5.375 scales + 0.125 norm**. 43 groups cover a 128-element row. Each group stores its three grade-1 codes in the dense code plane of the row and one scale at `KV_SIDEBAND_DTYPE`. From the same allocation, `rotor stored bits/value = (32·⌈⌈D/3⌉·3·bits/32⌉ + 16·⌈D/3⌉ + 16) / D`: 8.75 at D=128, 8.5625 at D=256. This comes from `QuantKGpuRing::alloc`; `rotor_rate_splits_into_documented_code_scale_and_norm_bits` measures it against a seeded ring. **The scale is the largest term**: rotor shares one scale across 3 values, iso across 4. Thus rotor is the wider of the two families at every width and every head\_dim (`iso_and_rotor_k_codecs_are_under_the_floor_at_every_geometry`). |
+| Delivered bits / element | **8.75** at head\_dim=128: 140 B/token/kv\_head against 256 B for bf16 (**0.547× bf16**). The split is **3.25 codes + 5.375 scales + 0.125 norm**. 43 groups cover a 128-element row. Each group stores its three grade-1 codes in the dense code plane of the row. Each group also stores one scale at `KV_SIDEBAND_DTYPE`. The allocation gives `rotor stored bits/value = (32·⌈⌈D/3⌉·3·bits/32⌉ + 16·⌈D/3⌉ + 16) / D`: 8.75 at D=128, 8.5625 at D=256. This comes from `QuantKGpuRing::alloc`. `rotor_rate_splits_into_documented_code_scale_and_norm_bits` measures it against a seeded ring. **The scale is the largest term.** Rotor shares one scale across 3 values, iso across 4. Thus rotor is the wider of the two families at every width and every head\_dim (`iso_and_rotor_k_codecs_are_under_the_floor_at_every_geometry`). |
 | Code budget | **Only the 3 grade-1 codes per group are stored.** A rotor sandwich keeps the grade. Thus 3 values put in as the grade-1 part leave the scalar, the three bivector and the pseudoscalar slots at zero on encode. On decode, the inverse sandwich keeps every part that is not grade 1 out of the vector. `clifford_tests::sandwich_of_grade1_in_3d_stays_grade1` (encode side) and `clifford_tests::inverse_sandwich_of_non_grade1_leaks_nothing_into_grade1` (decode side) pin this. |
 | Codebook | `lloyd_gaussian_codebook(3)` (8 centroids), one codebook for all 8 multivector components |
 | Pack density | dense code plane, 3 bits per code, 3 codes per group |
@@ -1862,7 +1879,7 @@ a `QuantKGpuRing`. The K encode writes the packed ring on the GPU, and
 `iso_flash_decode` reads that ring (see § `iso_flash_decode`).
 
 **Cosine gates.** On the LCG fixture at `head_dim=128, n_rows=16, TEST_SEED`
-(`quant_iso_k{,4}_tests.rs`): `iso_k_3` gates at 0.97, `iso_k_4` at 0.99
+(`storage/quant_iso_k_tests.rs`): `iso_k_3` gates at 0.97, `iso_k_4` at 0.99
 (minimum cosine).
 
 **SSD round-trip tests.** Four tests in
@@ -1925,10 +1942,23 @@ the CPU, applies an O(head_dim²) QJL score correction per cached token, and
 uploads the K prefix again. This cost grows with `kv_seq`. With QJL off, the
 rotor K encode and `rotor_flash_decode` run on Metal.
 
-**Fused-QK.** The head-major fused-QK path has kernels for `RotorK3Asym` and
-`RotorK4Asym` only. It runs when `--fused-qk on`, the device is GPU, `head_dim`
-is 128 or 256 and QJL is off (the kernel does not use the QJL residual).
-`--fused-qk` is off by default. See § "Fused-QK head-major K storage".
+**Fused-QK.** Of the rotor codecs, the head-major fused-QK path has kernels
+for `RotorK3Asym` and `RotorK4Asym` only. `--fused-qk` is off by default. The
+path runs only when all of these conditions are true
+(`try_fused_qk_dispatch`):
+
+- `--fused-qk on`;
+- the device is GPU;
+- the step is a decode step (`q_seq == 1`) and `new_k` has rank 4;
+- `head_dim` is 128 or 256;
+- `kv_seq` is at least `fused_qk_min_kv_seq` (default 512, env
+  `RMLX_FUSED_QK_MIN`);
+- the codec has a fused-QK kernel and a GPU K encoder;
+- QJL is off (the kernel does not use the QJL residual);
+- the bf16 K mirror is live to seed the shadow;
+- the storage variant carries a `max_seq`, and the step does not overflow it.
+
+See § "Fused-QK head-major K storage".
 
 **QJL residual — storage format.** When QJL is on at the first `append`, the
 codec stores one extra sign bit per `head_dim` element per token with the rotor
