@@ -65,6 +65,7 @@ areas before touching code:
 | [`docs/PROJECTS_CONFIG.md`](docs/PROJECTS_CONFIG.md) | Per-project cap defaults via `<RMLX_HOME>/projects.toml` |
 | [`docs/TESTING.md`](docs/TESTING.md) | RMLX_TEST_MODEL_* env vars + RMLX_O_MODELS_ROOT for test snapshot resolution |
 | [`docs/RELEASING.md`](docs/RELEASING.md) | Release flow: single-source version, `make tag` / `release-package` / `tap-sync`, Homebrew formula + tap, `CHANGELOG.md`, branch model (`next/*`, hotfix, fast-forward release) |
+| [`docs/DOC_SPLIT.md`](docs/DOC_SPLIT.md) | Cutting the reference docs to current truth: the rule, the readers of doc text that constrain a cut, the oracle (`make check-doc-consumers`), the size cap, the mutation list, the cut plan |
 
 Subdir `docs/superpowers/` holds process artifacts — not a subsystem reference.
 
