@@ -289,7 +289,7 @@ impl Regressor {
 
         // Cramer's rule: β = adj(XᵀX)ᵀ · Xᵀy / det
         // Cofactor matrix of XᵀX (symmetric, so adjugate = cofactor transposed = cofactor).
-        // C10==c01, c20==c02, c21==c12 by symmetry — use the canonical names directly.
+        // c10==c01, c20==c02, c21==c12 by symmetry — use the canonical names directly.
         let c00 = s11 * s22 - s12 * s12;
         let c01 = -(s1 * s22 - s12 * s2);
         let c02 = s1 * s12 - s11 * s2;

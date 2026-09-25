@@ -3,13 +3,12 @@
 //! `ConstraintEngine` is a per-request decoding constraint. It produces a
 //! boolean allow-mask over the vocabulary for each sampling step; the sampler
 //! consults the mask to suppress disallowed token ids by adding
-//! `f32::NEG_INFINITY` to their logits before `argmax` (and, once temperature
-//! sampling lands in A7, before softmax).
+//! `f32::NEG_INFINITY` to their logits before `argmax` or, when sampling,
+//! before softmax.
 //!
-//! **A6.2 scope**: plumbing only. The only impl is `NoOpConstraint` whose
-//! mask is all-`true`. Wiring this end-to-end is the gate that lets A6.3 land
-//! the first real grammar (`json_object`) without touching the decode loops
-//! again.
+//! This crate defines the trait and `NoOpConstraint` (mask all-`true`). The
+//! real grammars (`JsonObjectConstraint`, `SchemaConstraint`) live in
+//! `rmlx-server`'s `constraint_json`.
 //!
 //! # Hot-path cost
 //!

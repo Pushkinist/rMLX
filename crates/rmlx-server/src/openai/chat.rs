@@ -164,7 +164,7 @@ pub(crate) async fn chat_completions(
         if req.extra.contains_key(*key) {
             state.error_counts.increment(ApiErrorCategory::BadRequest);
             return bad_request(&format!(
-                "field `{key}` is not supported (Stage 2+); remove it from your request"
+                "field `{key}` is not supported; remove it from your request"
             ));
         }
     }
@@ -771,8 +771,8 @@ pub(crate) async fn chat_completions(
         "chat_completions: tools parsed, injected into template"
     );
 
-    // Normalise response_format → NormalizedResponseFormat.
-    // No enforcement yet; the field is metadata for A6.2+ (logit masking).
+    // Normalise response_format → NormalizedResponseFormat. The grammar that
+    // enforces it is built below and passed as the request's `constraint`.
     let norm_response_format: Option<NormalizedResponseFormat> =
         req.response_format.as_ref().map(|rf| match rf {
             super::request::ResponseFormat::Text => NormalizedResponseFormat::Text,
@@ -1036,7 +1036,7 @@ pub(crate) async fn chat_completions(
         tool_choice: norm_tool_choice,
         // Normalised response format (the grammar is passed as `constraint`).
         response_format: norm_response_format,
-        // Sampler constraint plumbed end-to-end (real json_object grammar in A6.3).
+        // Sampler constraint: the json_object / json_schema grammar, or None.
         constraint,
         // Handle the route uses to signal `is_thinking` into the constraint.
         // Suppress thinking-channel routing when tool_choice=required/named.

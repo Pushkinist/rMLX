@@ -1614,7 +1614,7 @@ fn combo_to_kv_quant_tsym3_wrong_k_rejected() {
     assert!(matches!(err, ResolveError::UnsupportedCombo(_)));
 }
 
-/// Qwen MoE low-K guard for TurboSym3 (K-side 3-bit disaster).
+/// Qwen MoE low-K guard for TurboSym3 (K stored at 3 bits).
 /// Asserts BOTH discriminator AND `variant` payload string (LOW-bug guard: must match both).
 #[test]
 #[allow(

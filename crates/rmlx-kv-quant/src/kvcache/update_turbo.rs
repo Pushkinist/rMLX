@@ -122,8 +122,9 @@ const K8_TURBO_V_VARIANTS: &str = "K8VTurbo3 | K8VTurbo2 | K8VTurbo3Tcq | K8VTur
 /// K is affine q8_0 and GPU-capable, the same path `update_k8v4` takes. V is
 /// [`QuantV`] at `v_bits`, and its axis is forced onto the CPU: the GPU branch
 /// of [`QuantV::append`] refuses `bits != 4`. The 3-bit kernel in
-/// `k8vturbo3_append_msl.rs` has no production dispatch; neither do the 2-bit
-/// and TCQ kernels.
+/// `k8vturbo3_append_msl.rs` serves the 3-bit K store and the TurboSym3
+/// fused-QK encode, not this V axis; the 2-bit and TCQ kernels have no
+/// production dispatch.
 ///
 /// `use_tcq` selects the encoder inside [`QuantV::append`]: Viterbi over the
 /// trellis when set, nearest-centroid otherwise. The decoder is shared —

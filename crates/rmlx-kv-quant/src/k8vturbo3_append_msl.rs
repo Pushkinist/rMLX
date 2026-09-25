@@ -50,12 +50,13 @@
 //!
 //! # Dispatch status
 //!
-//! No production path dispatches this kernel. The K8VTurbo3 V axis is pinned
-//! to the CPU (`k8_turbo_v_update` in `kvcache/update_turbo.rs`), because
+//! Two production paths dispatch these kernels: the 3-bit K store
+//! (`QuantKTurbo<3>` GPU append and dequant in `storage/quant_k_turbo.rs`) and
+//! the TurboSym3 fused-QK encode (`kvcache/fused_qk_dispatch.rs`). The
+//! K8VTurbo3 **V** axis does not: it is pinned to the CPU
+//! (`k8_turbo_v_update` in `kvcache/update_turbo.rs`), because
 //! `QuantV::append`'s GPU branch refuses `bits != 4`. Unit tests hold the
 //! kernel bit-exact against the CPU encode.
-
-#![allow(dead_code)] // No production dispatch; see module-level "Dispatch status".
 
 use crate::turboquant::GROUP_SIZE;
 use rmlx_core::error::Result;

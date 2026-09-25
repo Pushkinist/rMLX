@@ -215,7 +215,7 @@ fn run_head_budget_non_qwen3_arch_err() {
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(
-        msg.contains("Qwen3ForCausalLM only") || msg.contains("not yet wired"),
+        msg.contains("Qwen3ForCausalLM only"),
         "unexpected error: {msg}"
     );
 }

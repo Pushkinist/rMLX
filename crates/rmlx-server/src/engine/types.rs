@@ -149,10 +149,10 @@ pub struct ModelLoadConfig {
 /// Route-agnostic representation of the requested output format.
 ///
 /// OpenAI sends this via the `response_format` field. Anthropic JSON mode is
-/// done via prompt + `stop_sequences` and does not set this field (A6 is
-/// OpenAI-only). The field is currently a no-op — the generator ignores it
-/// and the model relies on the prompt to comply. A6.2..A6.5 will wire logit
-/// masking and grammar enforcement.
+/// done via prompt + `stop_sequences` and does not set this field. The route
+/// builds a grammar from it (`JsonObjectConstraint` / `SchemaConstraint`) and
+/// passes that as the request's `constraint`; the generator reads the
+/// constraint, not this field.
 #[derive(Debug, Clone)]
 #[allow(
     clippy::exhaustive_enums,
@@ -188,14 +188,12 @@ pub enum NormalizedResponseFormat {
 ///
 /// Resolution is performed by `resolve_sampling_params` in `openai.rs`.
 ///
-/// **Greedy no-op:** The decode loop in every architecture still calls
-/// `generate_greedy`, which ignores all sampling fields. Real sampling
-/// (temperature, top_k / top_p / min_p nucleus, penalties, logit_bias) lands
-/// in A7.2 (core) and A7.3 (penalties + logit_bias).
+/// The decode loops sample with these fields: temperature, top_k / top_p /
+/// min_p, penalties and logit_bias (see `rmlx_models::sampler`).
 #[derive(Debug, Clone)]
 #[allow(
     clippy::exhaustive_structs,
-    reason = "internal closed struct — complete A7.x sampling contract; adding a field requires reviewing resolve_sampling_params and all generation sites"
+    reason = "internal closed struct — complete sampling contract; adding a field requires reviewing resolve_sampling_params and all generation sites"
 )]
 pub struct SamplingParams {
     /// Resolved temperature. Hard-coded default: `1.0`.
@@ -215,7 +213,7 @@ pub struct SamplingParams {
     /// Token-id → logit bias pairs. Empty = no biases.
     ///
     /// Keys are pre-parsed from the JSON string-keyed map (`"1234"` → `1234u32`).
-    /// Out-of-vocab ids are kept here; A7.3 will clamp/skip at apply time.
+    /// Out-of-vocab ids are kept here; the sampler skips them at apply time.
     pub logit_bias: Vec<(u32, f32)>,
     /// Optional RNG seed. `None` = entropy-seeded (model default).
     pub seed: Option<u64>,
@@ -260,13 +258,12 @@ impl Default for SamplingParams {
 pub struct GenerationRequest {
     /// Registry model id identifying which generator to dispatch to.
     pub model_id: String,
-    /// Pre-tokenized prompt. Empty until Stage 1.7 wires tokenization.
+    /// Pre-tokenized prompt.
     pub prompt_tokens: Vec<u32>,
     /// Maximum new tokens to generate before stopping.
     pub max_tokens: u32,
     /// Fully resolved sampling parameters.
     ///
-    /// Decode stays greedy (A7.1 schema-only). Real sampling lands in A7.2/A7.3.
     pub sampling: SamplingParams,
     /// Stop strings; generation halts on the first match.
     pub stop: Vec<String>,

@@ -928,8 +928,9 @@ enum Cmd {
         #[arg(long, env = "RMLX_YARN_ORIGINAL_MAX", value_name = "U32")]
         yarn_original_max: Option<u32>,
     },
-    /// Resolve the KV flags for a model, take the Metal claim, print one
-    /// line and exit. Runs no generation.
+    /// Resolve the KV flags for a model, take the Metal claim (GPU only;
+    /// `--device cpu` takes none), print one line and exit. Runs no
+    /// generation.
     Chat {
         #[arg(long)]
         model: PathBuf,

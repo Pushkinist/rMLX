@@ -204,7 +204,7 @@ const KERNEL_HEADER: &str = include_str!("metal/turbo_flash_header.metal");
 // 3. v_codes: u32 [B × n_kv_heads × T_stride × (head_dim/8)] — turbo4 codes, 8/u32
 // 4. v_scales: f32 [B × n_kv_heads × T_stride × (head_dim/32)] — turbo4 scales
 // 5. mask_flat: f32 [B × n_q_heads × T_active] or empty if no mask
-// 6. 6. params_p1: u32 [11] — {B, n_q_heads, n_kv_heads, n_repeats, T_active,
+// 6. params_p1: u32 [11] — {B, n_q_heads, n_kv_heads, n_repeats, T_active,
 //    head_dim, n_blocks, has_mask, q8_words_per_tok, tq4_words_per_tok,
 //    T_stride}
 //

@@ -325,10 +325,8 @@ or 4. `iso3_encode` carries `phase`, `ms`, `s_total`, `kv_h`, `head_dim` and
 `iso_k3_dequant_gpu_matches_dequant_cpu`
 (`crates/rmlx-kv-quant/src/isoquant_msl_tests.rs`, GPU, `#[ignore]`) compare
 the 3-bit iso GPU dequant with the CPU one. They assert 5e-3 per element and
-a strict max|cpu-gpu| ≤ 1e-6. They print the maximum and do not assert it.
-Their failure message cites this line, which records one printed run:
-Observed max|cpu-gpu| ≤ 2.4e-7 on the LCG fixture.
-`docs/KV_ROTATION_CODECS.md` states the same figure.
+a strict max|cpu-gpu| ≤ 1e-6, and print the maximum. Their failure message
+cites the observed figure in `docs/KV_ROTATION_CODECS.md`.
 
 ## Prefix-index bench
 

@@ -69,9 +69,9 @@
 //! `LlamaForCausalLMEagle3` model nor the mlx-vlm `Eagle3DraftModel` reference
 //! defines (mlx-vlm `sanitize` silently drops them; it cannot load this variant
 //! faithfully). The trained behavior is to RMSNorm each of the 3 aux hidden
-//! states by `fcs.{0,1,2}` *before* the `fc` concat-projection. Applying them
-//! Auto-detected
-//! by tensor presence; `RMLX_EAGLE3_NO_FCS=1` forces the raw-concat fallback.
+//! states by `fcs.{0,1,2}` *before* the `fc` concat-projection, and rMLX
+//! applies them. The path is auto-detected by tensor presence;
+//! `RMLX_EAGLE3_NO_FCS=1` forces the raw-concat fallback.
 //!
 //! **Seed token.** The drafter's hidden at the seed position is its *output*
 //! for the seed token, not an input for a new one. `accept_and_reseed` and

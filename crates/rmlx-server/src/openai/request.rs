@@ -279,8 +279,8 @@ pub struct JsonSchemaSpec {
 /// - `json_object` — model is expected to produce any valid JSON object.
 /// - `json_schema` — model is expected to produce JSON conforming to `json_schema`.
 ///
-/// Constraint enforcement (logit masking, grammar) is not wired yet; this is
-/// parsed and normalised for A6.2+. The enum is closed — unknown type strings
+/// The route builds a grammar from it (`JsonObjectConstraint` /
+/// `SchemaConstraint`) that masks the logits at decode. The enum is closed — unknown type strings
 /// produce a serde error (HTTP 422).
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -411,8 +411,8 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     pub tool_choice: Option<ToolChoice>,
 
-    // Response format — parsed and normalised; constraint enforcement
-    // follows in A6.2..A6.5. `None` is equivalent to `Text` (plain text).
+    // Response format — parsed and normalised; the route builds the grammar
+    // that enforces it. `None` is equivalent to `Text` (plain text).
     /// Desired output format; `None` is plain text.
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,

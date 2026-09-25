@@ -638,9 +638,9 @@ impl Generator for ArchGenerator {
         // `gpu_pending` — exactly when generation finishes (success/error).
         // `None` for non-route callers (unit tests, internal probes).
         let gpu_admission = req.gpu_admission;
-        // Optional sampler constraint engine (NoOp in A6.2, real
-        // json_object grammar in A6.3+). `None` means the hot decode path
-        // is identical to pre-A6.2 — see `generate_greedy` decode loops.
+        // Optional sampler constraint engine (the route's json_object or
+        // json_schema grammar). `None` skips the mask entirely in the
+        // `generate_greedy` decode loops.
         let mut constraint = req.constraint;
         if constraint.is_some() {
             tracing::debug!(model_id = %req.model_id, "generate: constraint engine active");
@@ -788,7 +788,7 @@ impl Generator for ArchGenerator {
                     tracing::warn!(
                         model_id = %model_id_for_log,
                         "ArchGenerator: concurrent generation — waiting for lock \
-                         (Stage 1 allows only one inflight generation at a time)"
+                         (one inflight generation at a time)"
                     );
                     lock.lock()
                 }
