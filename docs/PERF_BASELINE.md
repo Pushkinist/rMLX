@@ -64,7 +64,7 @@ compares the `k8vturbo3` median with the anchor.
 
 **The canary decodes greedily.** `rmlx baseline` samples at temperature 0, on
 the GPU-argmax path. A served request resolves its temperature in the order
-`docs/SAMPLING.md` § "Cost of the host path" gives. A resolved temperature
+`docs/SAMPLING.md` § "Defaults and resolution order" gives. A resolved temperature
 above 0 takes the host-sampling path, which no canary run observes. Measure
 it with `rmlx bench --temperature / --top-p / --top-k / --repetition-penalty`.
 

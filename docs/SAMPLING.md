@@ -242,8 +242,8 @@ The host path is not a cheap variant of greedy. Per token it moves a
 pipelining: greedy returns a lazy GPU argmax and dispatches the next step
 while the GPU is busy, but the host path cannot dispatch until it has chosen
 a token. The served default is a host-path shape (see the table above).
-`top_p` and `top_k` are the dearest stages, because they order the whole
-vocabulary.
+`top_p` sorts the whole vocabulary; `top_k` partitions it with
+`select_nth_unstable`.
 
 ### The instrument
 
@@ -288,12 +288,6 @@ So a stream at `temperature = 1e-4` can diverge from the greedy stream at the
 first tied row, and both paths are correct. A matching window shows only that
 no tie fell inside it. `top_logprobs: 2` shows the top-2 gap at a step (see
 Logprobs).
-
-A future fused GPU sampler therefore needs two gates. On the greedy path:
-exact token identity against the device `argmax`, lowest-id ties included. On
-the sampling path: exact identity against the CPU path given the same `Pcg32`
-draws. A GPU RNG must reproduce `Pcg32` bit for bit, or the kernel ships
-behind a dispatch policy with the CPU path kept as the oracle.
 
 ## Special tokens
 

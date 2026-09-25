@@ -353,7 +353,7 @@ let reading = bracket.close();
 | `headroom_bytes()` | `peak - live_at_open`: what the region needed on top of what was resident. Compare this across runs. |
 | `transient_bytes()` | `peak - live_at_close`: allocated inside and released again. A scratch buffer smaller than the surviving buffers hides under the peak, so zero does not prove no scratch. |
 | `observed_allocation()` | `headroom_bytes() > 0`. Assert this first. `peak_bytes > 0` is no test: MLX sets `peak = max(peak, active)` over the whole live count, so one allocation anywhere lifts it to the full resident total. |
-| `measurable()` | The peak mark was zeroed at `open()`. When `false`, every accessor above returns 0. |
+| `measurable()` | The peak mark was zeroed at `open()`. When `false`, `headroom_bytes()` and `transient_bytes()` read 0 and `observed_allocation()` reads `false`, while the raw `peak_bytes` field holds the whole-process peak. |
 
 Rules the pooling allocator imposes:
 
