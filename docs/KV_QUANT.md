@@ -2019,213 +2019,84 @@ under parallel `cargo test`.
 
 ## The auto default
 
-`--kv-quant auto` — the value when no codec flag is given — resolves to
-**unquantised bf16** (`KvQuant::None`), for every architecture, every
-checkpoint and every prompt length. One constant,
-`rmlx_models::kv_cache::DEFAULT_KV_QUANT`, is the only producer; the CLI, the
-server load path, the image branch, the arch dispatcher and
-`speculative::round_common::verifier_cache_stack`
-(`crates/rmlx-models/src/speculative/round_common.rs`) read it and nothing
-else. That last is the only reader on the speculative side: every round loop's
-verifier stack comes from it, and the two-model loops' draft stacks from the
-same builder. There is no per-arch table and no per-context re-selection behind
-it.
+`--kv-quant auto` is the value when no codec flag is given. It resolves to
+**unquantised bf16** (`KvQuant::None`) on every architecture, checkpoint and
+prompt length. `rmlx_models::kv_cache::DEFAULT_KV_QUANT` is the only producer.
+These read it and nothing else:
 
-Two things this replaced, both removed rather than retuned:
+- the CLI resolver (`crates/rmlx-cli/src/commands/parse.rs`);
+- the server engine (`crates/rmlx-server/src/engine/helpers.rs`);
+- the arch dispatcher, text and image entries
+  (`crates/rmlx-models/src/arch/mod.rs`);
+- `speculative::round_common::verifier_cache_stack`
+  (`crates/rmlx-models/src/speculative/round_common.rs`).
 
-* a **per-arch table** that returned `K8V8`, `K8V4`, `Planar` or
-  `Mixed{k8g64,v4g64}` depending on arch class, `hidden_size`, the MoE flag,
-  the PARO flag and `quantization.bits`; and
-* a **per-prompt-length server policy** that re-picked a codec per request,
-  overriding whatever the table had chosen at load. Three of its four bands
-  quantised, including the longest one — where a wrong codec costs most.
+Every speculative verifier stack comes from `verifier_cache_stack`. The
+two-model draft stack uses the codec that the verifier resolved. No per-arch
+table and no per-context selection sits behind the constant.
+`--kv-preset auto` resolves to the same constant (§"`--kv-preset auto`").
 
-  Its reach was narrower than the description suggests, and the qualifier
-  belongs with the claim: on `rmlx serve --model` it never fired, because the
-  CLI resolves `auto` before `run_serve` and passes a concrete codec down, which
-  the server treats as operator-supplied. It was live under `--registry`, where
-  nothing pre-resolves. Measured on the pre-change binary in registry mode, one
-  gemma-4-e2b served `K8V4` / `K8V4` / `None` / `K8V8` across four requests at
-  110 / 3 010 / 9 010 / 30 010 prompt tokens.
+Every codec stays selectable by name: `--kv-quant`, `--cache-type-k` /
+`--cache-type-v`, `--kv-bits` and `--kv-preset`. Only what `auto` resolves to
+is fixed.
 
 ### Why bf16
 
-Neither half of the codec axis pays, and both halves were re-measured on the
-current tree rather than inherited:
-
-* **The bf16-mirror family costs bytes it does not save.** `K8V8`, `K8V4`,
-  `Planar*`, `PlanarK`, the `K8VTurbo*` / `TurboSym*` families and the
-  `Iso3/4` / `Rotor3/4` / `RotorK*Asym` asymmetric families all decode off the
-  bf16 mirror and never read their packed store, so no store is built
-  (§"Per-layer net-benefit decision + net-negative warn" above). Their resident KV equals bf16's
-  **byte for byte**, and so does their output at temp=0.
-* **The one store-reading codec a default ever picked does not win on
-  speed.** `Mixed` really does read its packed 3-tuples at decode. The rows
-  below were recorded while it also held a bf16 mirror beside them on every
-  architecture — 1.29x / 1.29x / 1.29x the resident KV of `none` at 4k / 8k /
-  32k on Ternary-Bonsai-8B — and `none` was faster at 4k and 8k (SEPARATED) and
-  indistinguishable at 32k. Note the *decode* gap narrows with context in that
-  series rather than widening — the growing-with-context loss recorded for this
-  trade is a different cell, Qwen3.8-27B at 130 848 tokens (§"Fused
-  flash-decode over a quant store"), and is not what the Bonsai rows below
-  show.
-
-  **The memory half of that row no longer holds on a dense architecture.** The
-  mirror is now built only where a cross-layer-KV consumer reads it
-  (§"Per-layer net-benefit decision + net-negative warn"), so on Bonsai-8B `mixed_k8g64_v4g64` is
-  **0.589x** `none` at a 3 770-token prompt, 0.575x at 16k and 0.573x at 32k,
-  and on Qwen3.6-35B-A3B 0.748x at 4k. The speed half is unchanged and was
-  re-measured across that change: ABBA-paired, same host, decode-TPS ratio
-  0.9957 (n=3, sd 0.0028) at a 32 768-token prompt against a same-code-path
-  `--kv-quant none` control band of 1.0061 (n=3, sd 0.0152) — the codec band
-  lies inside the control band, so the change is INCONCLUSIVE on throughput.
-  Greedy token ids are byte-identical across it on three architectures.
-
-So on every cell measured here — the bf16-mirror family and `Mixed`, three
-architectures, 4k to 32k — nothing is faster than bf16. A default that picked
-one of those was charging for a label on speed; on memory, `mixed_*` and
-`rot_k_*` on a dense architecture are now the exception.
-
-That is a claim about the codecs a default could plausibly have picked, **not**
-about the whole codec axis. The fully symmetric families (`Iso3Sym`, `Iso4Sym`,
-`Rotor3Sym`, `Rotor4Sym`) return `false` from both `feeds_bf16_k_at_decode` and
-`feeds_bf16_v_at_decode`, so they keep no mirror on either axis and their
-resident KV is structurally *below* bf16. None of them was ever an auto default,
-none is measured in the table below, and each carries its own arch guards and a
-CPU-bound V path — so they are out of scope for this decision, not evidence
-against it. Making one of them the default is a different question with a
-different burden of proof.
-
-### Measured
-
-Every row below is one `scripts/perf_ab.sh` run: ABBA-interleaved, 8 slots
-(4 per arm), both arms the same binary and differing only in `--kv-quant`,
-`release-perf`, M5 Max. Host quiescent for every row -- none carries the
-harness's TAINTED verdict, and the busiest foreign process during each
-comparison was 7.2-7.4% of one core. `INCONCLUSIVE` means the two arms' per-slot
-ranges overlap: the percentage beside it is the gap between two point estimates
-and is **not** a measured difference. Only `SEPARATED` rows license a direction.
-
-Arm A is the codec `auto` used to pick for that model; arm B is `none`.
-
-The `bin` column is the sha256 prefix `perf_ab.sh` printed for that run's
-binary, because "one binary" is a claim and not a given: a build finishing in
-the background has already replaced `target/release-perf/rmlx` mid-campaign
-here. `f2f889b9` is the pre-change tree, `cae129bc` the branch; the arms within
-any single row share one binary, which is what the comparison needs. `run`
-distinguishes the two gemma-4-e2b 4 096 rows, which are the same cell measured
-in two separate sessions and are a deliberate repeat, not a transcription slip.
-
-| model | ctx | arm A | bin | run | resident KV B/A | token ids | decode B/A | verdict |
-|---|---:|---|---|---|---:|---|---:|---|
-| gemma-4-e2b | 4 096 | `k8v8` | `f2f889b9` | 1 | **1.0000** | identical | 0.9985 | INCONCLUSIVE |
-| gemma-4-e2b | 4 096 | `k8v8` | `cae129bc` | 2 | **1.0000** | identical | 1.0018 | INCONCLUSIVE |
-| gemma-4-e2b | 8 192 | `k8v8` | `f2f889b9` | 1 | **1.0000** | identical | 1.0013 | INCONCLUSIVE |
-| gemma-4-e2b | 32 768 | `k8v8` | `f2f889b9` | 1 | **1.0000** | identical | 0.9912 | INCONCLUSIVE |
-| Ternary-Bonsai-8B | 4 096 | `k8v8` | `cae129bc` | 2 | **1.0000** | identical | 1.0045 | INCONCLUSIVE |
-| Ternary-Bonsai-8B | 32 768 | `k8v8` | `cae129bc` | 2 | **1.0000** | identical | 1.0013 | INCONCLUSIVE |
-| Qwen3.6-35B-A3B | 4 096 | `k8v8` | `cae129bc` | 2 | **1.0000** | identical | 1.0541 | INCONCLUSIVE |
-| Qwen3.6-35B-A3B | 32 768 | `k8v8` | `cae129bc` | 2 | **1.0000** | identical | 1.0019 | INCONCLUSIVE |
-| Ternary-Bonsai-8B | 4 096 | `mixed_k8g64_v4g64` | `cae129bc` | 2 | **0.7771** | diverge at id 57 | 1.0300 | SEPARATED |
-| Ternary-Bonsai-8B | 8 192 | `mixed_k8g64_v4g64` | `cae129bc` | 2 | **0.7751** | diverge at id 56 | 1.0258 | SEPARATED |
-| Ternary-Bonsai-8B | 32 768 | `mixed_k8g64_v4g64` | `cae129bc` | 2 | **0.7736** | diverge at id 35 | 0.9994 | INCONCLUSIVE |
-
-The two binaries are not a confound: a codec-vs-codec comparison never crosses
-a row, and the repeated gemma-4-e2b 4 096 cell -- the one point measured on
-both -- returns the same verdict and the same 1.0000 residency on each.
-
-Two things to read off it. The eight `k8v8` rows are a *null* result by
-construction -- same bytes, same bits, no measurable time -- across three
-architectures and two KV shapes (`kv_h = 1` shared-KV/SWA at `head_dim` 256/512,
-and `kv_h = 8` dense at 128). The three `mixed` rows are the only place the
-default's behaviour actually changes, and every axis moves toward `none`.
-
-The same comparison run once per branch of the retired per-arch table that the
-release set reaches (4 096-token prompt, 32 tokens, temp=0, resident KV and token-id digest
-only) closes the branch table: `gemma-4-e2b` (`K8V8`), `gemma-4-12B` unified
-(`K8V8`), `gemma-4-26b-a4b` MoE (`K8V8`), `gemma-4-31b` (`Planar`), `medgemma`
-(`Gemma3`, `Planar`), `Qwen3.6-35B-A3B` (`K8V8`), `Qwen3.8-27B` (`K8V8`),
-`Qwen3.6-27B-PARO` (`K8V4`) -- all eight byte-identical in `kv_cache_bytes` and
-identical in token ids against `none`. `Ternary-Bonsai-8B` (`Mixed`) is the
-ninth and the only one that moves.
-
-### What stays
-
-Every codec remains selectable by name — `--kv-quant`, `--cache-type-k` /
-`--cache-type-v`, `--kv-bits`, `--kv-preset`. Nothing is deprecated or removed
-by this; only what `auto` resolves to is fixed. `--kv-preset auto` resolves to
-the same constant (§"`--kv-preset auto`"); the hardware-aware selector it used
-to run has since been removed, because every preset it could return holds
-resident KV byte-identical to bf16.
-
-`DEFAULT_KV_QUANT` is where a future answer changes. When fused decode over a
-quantised store becomes profitable, that constant moves — on a fresh
-measurement, not by restoring a table.
+- The 17 Class 2 codecs build no packed store. Their decode reads the bf16
+  mirror, so their resident KV and their greedy token ids equal `none`'s
+  (§"Codec disposition", Class 2).
+- No Class 3 codec decodes faster than bf16 on every architecture and context
+  (§"Fused flash-decode over a quant store"). A 4-bit-K `mixed_*` codec wins
+  on a dense stack and loses on others (§"The null was a bit-width result, not
+  a context result").
+- A Class 3 codec that holds less resident KV than bf16 is an opt-in memory
+  setting. The iso and rotor codecs among them decode slower than bf16.
 
 ---
 
 ## Memory and bit-rate summary
 
-Approximate bytes per KV pair (`B=1, 1 layer, 1 head, D elements`). These are
-**packed-store** rates — what a codec's codes and scales occupy. They are not
-resident KV for the bf16-mirror family, which builds no store: those codecs sit
-at the `None` row, 4·D, measured byte-identical (§"Per-layer net-benefit decision + net-negative
-warn"). Which rows are live and which are hypothetical is stated under the
-table.
+Resident KV depends on the codec class and on the cache topology. The figures
+below are stored bits per value per axis at `head_dim = 128`; bf16 is 16.0.
 
-| Mode | K bytes/tok | V bytes/tok | Total bytes/tok |
-|---|---|---|---|
-| `None` (bf16) | 2·D | 2·D | 4·D |
-| `K8V8` | 1·D + D/128·4 | 1·D + D/128·4 | ~2.06·D |
-| `K8V4` | 1·D + D/128·4 | 0.5·D + D/32·4 | ~1.65·D |
-| `Planar` | 1·D + D/128·4 | 2.75·D (measured) | ~3.78·D |
-| `Mixed{k8g64,v4g64}` | 1·D + 2·D/64·4 | 0.5·D + 2·D/64·4 | ~1.75·D |
-| `K8VTurbo3` | 1·D + D/128·4 | 0.375·D + D/32·4 | ~1.51·D |
-| `K8VTurbo2` | 1·D + D/128·4 | 0.25·D + D/32·4 | ~1.38·D |
-| `k_iso3` / `k_iso4` | 2·D + 4 | 2·D (bf16) | ~4·D + 4 |
-| `iso3_sym` / `iso4_sym` | 2·D + 4 | 2·D + 4 | ~4·D + 8 |
-| `k_rotor3` / `k_rotor4` | 8·⌈D/3⌉ + 4 | 2·D (bf16) | ~4.67·D + 4 |
-| `rotor3_sym` / `rotor4_sym` | 8·⌈D/3⌉ + 4 | 8·⌈D/3⌉ + 4 | ~5.33·D + 8 |
+- **`none` and every Class 2 codec**, on a cache that went through a prefill
+  bracket: 16.0 on both axes. `exit_prefill` builds no packed store.
+- **A store-backed cache of any codec** holds its packed store. This is an SSD
+  hydrate, or a cache that did not go through a prefill bracket. The rate of
+  each store family is in the table under §"Crate-wide rate ceiling".
+- **Class 3 codecs** hold their packed store on the axes their decode reads:
 
-PlanarQuant's V row is **measured**, not a layout formula, and it is the one
-row an earlier revision of this table got wrong (`~2.13·D`, from a per-group
-sideband cadence the codec does not use). Its scale is per **pair** — one `f32`
-per 2 elements — which is 16 bits per value before a single code bit, so the
-store is **22.00 bits per value at every head_dim and at both bit widths**
-(`planar3` and `planar4` are byte-identical). That is the widest rate in the
-crate's rate gate, well above rotor4's 9.75, and it is why `planar3` / `planar4` /
-`planar_k4` carry a written exemption in
-`crates/rmlx-kv-quant/src/kv_rate_tests.rs` rather than a fix: a scale-cadence
-change is a format change. The quality improvement is what it buys on dense
-full-attention archs.
+| Codec | K | V |
+|---|---:|---:|
+| `iso3_sym` / `iso4_sym` | 7.125 / 8.125 | 7.125 / 8.125 |
+| `k_iso3` / `k_iso4` | 7.125 / 8.125 | 16.0 |
+| `rotor3_sym` / `rotor4_sym` | 8.75 / 9.75 | 8.75 / 9.75 |
+| `k_rotor3` / `k_rotor4` | 8.75 / 9.75 | 16.0 |
+| `mixed_k<kb>g<kg>_v<vb>g<vg>` | `kb + 32/kg` | `vb + 32/vg` |
+| `rot_k_v<vb>g<vg>` | 8.5 | `vb + 32/vg` |
 
-Two groups of rows here have a decode that reads the store they describe, so
-their rates are live rather than hypothetical: the `Mixed{k8g64,v4g64}` row and
-the four ring rows (§"Codec disposition", Class 3). Every other row is a rate
-its codec would cost the day a kernel reads its store. Of all of them, only the
-four ring rows are **above** the `None` row *on rate*; `Planar` is the closest
-of the rest at 3.78·D against 4·D, i.e. a 5% saving for a 4-bit name. `Mixed` is
-below the `None` row here and still measures larger resident, because it keeps
-both bf16 seeds beside its store — a residency fact this table does not carry.
+The iso and rotor rates are the GPU ring after the first fused decode step
+(§"Iso memory truth"). The rotor rates are with `--rotor-qjl off`. An MLX
+affine group spends 32 bits on its scale and bias, hence the `32/group` term.
 
-Each ring side spends one `u32` code word and one `KV_SIDEBAND_DTYPE` scale per
-group whatever the codebook width, so the nominal
-3-/4-bit label never reaches the store: iso is `12 + 16/head_dim` bits per
-value and rotor floors at `48/3` = 16.0, so iso is below bf16's 16.0 at every
-finite head dim and rotor is above it at every finite one (§ iso3 "Memory
-truth", § rotor3). At the `f32` sideband those read `16 + 32/head_dim` and a
-floor of `64/3` = 21.33 respectively. The rate is a property
-of the ring layout, not of the algorithms; a layout that packs its scale plane
-separately is unbuilt and is the open question § "What this disposition does not
-decide" names.
+`mixed_*` and `rot_k_*` also keep a bf16 K and V mirror on a stack whose layers
+share KV (`KvCache::shares_kv`). There the mirror adds 16.0 per axis, and the
+codec holds more than `none`. On a stack without shared KV they hold the store
+alone. `global_layer_store_plus_mirror_codec_sign_follows_shared_kv`
+(`crates/rmlx-kv-quant/src/quant_tests.rs`) pins both signs.
+
+The layer-adaptive boundary gives some layers a different codec
+(§"Layer-adaptive overrides"). `rmlx info --list-cache-types` prints the
+whole-stack figure per codec and per topology. Its producer is
+`KvQuant::estimated_resident_bytes_per_layer`.
 
 ---
 
 ## TurboQuant calibration (`kv_calib.json`)
 
-TurboQuant variants (K8V4-TQ, K8V8-TQ) require a `kv_calib.json` calibration
-file that specifies per-head high-precision index sets. The file is generated
-by `rmlx kv-calibrate` and consumed by the TurboQuant KV codec at runtime.
+`rmlx kv-calibrate` writes a set of high-precision channel indices per KV head
+to `kv_calib.json`. `rmlx serve` reads the file at model load. **No codec reads
+it**: every codec encodes and decodes the same with or without the file.
 
 ### Generation
 
@@ -2234,11 +2105,12 @@ rmlx kv-calibrate /path/to/model --recipe turbo3
 # Writes /path/to/model/kv_calib.json
 ```
 
-Internally, the command walks K/V projection weight tensors (dtype F32, BF16,
-or F16), computes per-head L2 norms across the input dimension, and selects
-the top-K highest-norm indices per head. These indices are stored as sorted
-ascending `Vec<u32>` per head. The operation is CPU-only and acquires no
-Metal claim.
+`--recipe` defaults to `turbo3`. `--out` sets another output path. The
+command reads the K/V projection weight tensors (F32, BF16 or F16). It
+computes the L2 norm of each head across the input dimension. It keeps the
+top-K indices per head, sorted ascending, as a `Vec<u32>`. The command runs on
+the CPU and takes no Metal claim. The `head_budget`, `softmax_mass` and
+`k_norm_proxy` recipes write `head_budgets.json` instead (§"Sparse attention").
 
 ### Recipe → outlier count
 
@@ -2247,84 +2119,45 @@ Metal claim.
 | `turbo2`, `turbo2_tcq` | `turboquant25` | 25% | 16 | 32 |
 | `turbo3`, `turbo3_tcq`, `turbo4` | `turboquant35` | 50% | 32 | 64 |
 
-Outlier count = `round(head_dim * ratio / 16) * 16` (GROUP_ALIGNMENT = 16,
-round-half-away-from-zero). For standard head_dims (64/128/256) this matches
-mtq exactly; rare divergence with Python's banker's rounding is possible only
-at exact midpoints with non-standard head_dims.
+Outlier count = `round(head_dim * ratio / 16) * 16`, where `round` rounds half
+away from zero (`outlier_count_for`). For head_dim 64, 128 and 256 this equals
+mtq. Python rounds half to even, so the two can differ only at an exact
+midpoint on another head_dim. A count of 0, or a count of `head_dim` or more,
+is an error.
 
-### Schema compatibility
+### Schema
 
-The `version` field is always `1`. rMLX extends the schema additively:
+`version` is always `1`. The top-level keys are `version`, `recipe` (the
+internal name), `head_size` (the `head_dim` from `config.json`), `model_name`,
+`transform_version`, `codebook_version`, `layers` and `calibration`
+(provenance). `layers` is a `BTreeMap<String, LayerCalib>`. Its key is the
+attention module path, for example `"model.layers.0.self_attn"`.
 
-| Schema label | `version` | Extra fields |
-|---|---|---|
-| mtq v1 | `1` | *(baseline)* |
-| rMLX v1.1 | `1` | `LayerCalib::codebook` (per-layer codebook override, optional) |
-
-Key top-level fields:
-
-| Field | Value |
-|---|---|
-| `version` | Always `1` |
-| `recipe` | Internal recipe (`"turboquant25"` or `"turboquant35"`) |
-| `head_size` | `head_dim` from `config.json` |
-| `layers` | `BTreeMap<String, LayerCalib>` keyed by attention prefix |
-
-The layer key is the attention module path up to and including the attention
-block name, e.g. `"model.layers.0.self_attn"`.
-
-**Backwards-compatibility**: v1 files (no `codebook` field) parse cleanly
-into `codebook = None` via `#[serde(default)]`. Forward-compatibility:
-v1.1 files with `codebook = Some(...)` are silently ignored by any reader
-built against the plain v1 struct.
+`LayerCalib` holds `key_high_precision_indices`,
+`value_high_precision_indices` and an optional `codebook`. A file without
+`codebook` parses to `codebook = None` (`#[serde(default)]`). No struct sets
+`deny_unknown_fields`, so a reader ignores fields it does not know.
+`KvCalibration`, `LayerCalib` and `CodebookOverride` are `#[non_exhaustive]`:
+construct them through the writer or from JSON.
 
 ### Runtime lifecycle
 
-At model-load time the server automatically discovers and wires the calibration
-file. No CLI flag is needed. The lifecycle is:
+1. **Discover.** When `<model>/kv_calib.json` exists, the `rmlx serve` loader
+   reads `head_dim` from `config.json` and calls
+   `rmlx_loader::discover_kv_calibration(model_dir, head_dim)`. It logs a
+   `warn!` and continues without calibration in four cases: the file does not
+   parse, `version != 1`, `head_size` differs from the model's `head_dim`, or
+   `config.json` gives no `head_dim`.
+2. **Attach.** The result goes on `ModelLoadConfig::calibration`. A
+   `head_budgets.json` beside it attaches as `KvCalibration::head_budgets`.
+3. **Not consumed.** `KvCacheBuilder::with_calibration` and
+   `rmlx_models::kv_cache::lookup_layer_calibration` have no in-tree caller.
+   No codec reads `QuantV::high_precision_indices`.
 
-1. **Discover** — `rmlx_loader::discover_kv_calibration(model_dir, expected_head_size)`
-   probes `<model_dir>/kv_calib.json`. Returns `None` silently if the file is
-   absent; emits `tracing::warn!` (and returns `None`) if the file is malformed,
-   `version != 1`, or `head_size` mismatches the model's `config.json`.
-
-2. **Validate** — Checked by `discover_kv_calibration`:
-   - `version` must be `1`.
-   - `head_size` must equal `ModelConfig::head_dim()` for the target model.
-   Missing file or mismatch leaves the server fully functional with the default
-   (uncalibrated) codec path — backwards-compatible.
-
-3. **Attach** — `calibration: Option<KvCalibration>` is stored on
-   `ModelLoadConfig` and forwarded through `KvCacheBuilder::with_calibration()`.
-   The `KvCacheBuilder` makes the calibration available to per-arch construction.
-   Per-arch wiring (calling `KvCacheBuilder::with_calibration` inside each arch's
-   generator constructor) and codec-side consumption are deferred until calibrated
-   codec paths are wired. No in-tree caller of `with_calibration` exists yet.
-
-4. **Layer lookup** — `rmlx_models::kv_cache::lookup_layer_calibration(calib, layer_key)`
-   resolves a layer's `LayerCalib` from the `BTreeMap`. Matching is:
-   - **Fast path**: exact `BTreeMap` key lookup.
-   - **Fuzzy path**: case-insensitive 3-component dotted-prefix match, e.g.
-     `"model.layers.0.self_attn.k_proj"` matches key `"model.layers.0.self_attn"`.
-     A 3-component query (e.g. `"model.layers.0"`) also matches via this path.
-   Returns `None` if no entry matches. No in-tree caller exists yet.
-
-5. **Consume** (deferred — per-layer `LayerCalib::value_high_precision_indices`
-   will be passed to the TurboQuant codec to steer which V-projection dimensions
-   receive high-precision treatment. `QuantV::high_precision_indices` stores the
-   index sets; not read by any codec yet.
-
-6. **Codebook consume** (wired on both CPU and GPU paths) —
-   `LayerCalib::codebook.value` (if `Some`) is stored on `QuantV::value_codebook`.
-   The CPU V-encode path passes it to `turbo_quantize_v_with_codebook`; the GPU
-   V-encode path at `bits == 4` uploads it once into `value_codebook_gpu` and
-   dispatches `turbo_quantize_v4_codebook_buf_gpu` (encode) and
-   `turbo_dequantize_v4_codebook_buf_gpu` (decode). For `bits != 4` the GPU codec
-   is not wired and the existing `KvStorage::K8VTurbo*` callers stay on the CPU
-   path.
-
-**Fallback**: if `kv_calib.json` is absent or fails validation, behaviour is
-identical to uncalibrated operation. No error, no performance change.
+`lookup_layer_calibration(calib, layer_key)` tries an exact key first. Then it
+compares the first three dot-separated components, without case. So
+`"model.layers.0.self_attn.k_proj"` and `"model.layers.0"` both match the key
+`"model.layers.0.self_attn"`. It returns `None` when nothing matches.
 
 ### Rust API
 
@@ -2335,11 +2168,9 @@ use rmlx_loader::{
     KvCalibration, LayerCalib,
 };
 
-// Automatic discovery at load time:
 let calib: Option<KvCalibration> =
     discover_kv_calibration(model_dir, head_dim as u32);
 
-// Layer lookup inside per-arch construction:
 use rmlx_models::kv_cache::lookup_layer_calibration;
 if let Some(calib) = &builder.calibration {
     if let Some(layer) = lookup_layer_calibration(calib, "model.layers.0.self_attn") {
@@ -2348,12 +2179,9 @@ if let Some(calib) = &builder.calibration {
 }
 ```
 
-`KvCalibration` and `LayerCalib` are `#[non_exhaustive]`; construct via the
-writer or deserialize from JSON.
+### Per-layer codebook override
 
-### Per-layer codebook override (rMLX v1.1)
-
-`LayerCalib::codebook` is an optional `CodebookOverride` struct:
+`LayerCalib::codebook` is an optional `CodebookOverride`:
 
 ```json
 {
@@ -2371,620 +2199,170 @@ writer or deserialize from JSON.
 
 | Field | Semantics |
 |---|---|
-| `codebook.value` | Per-layer V-side codebook. `2^bits` centroids in **strictly ascending order**. |
-| `codebook` absent | Omitted → `codebook = None` → built-in Lloyd-Max N(0,1) codebook used. |
-| `codebook.value = []` | Empty vec deserializes cleanly but returns `Error::Quant` at first encode for that layer. |
+| `codebook.value` | V-side codebook for the layer: `2^bits` centroids in **strictly ascending order**, shared by every KV head of the layer. |
+| `codebook` absent or `null` | The built-in Lloyd-Max N(0,1) codebook. |
+| `codebook.value = []` | Parses, and returns `Error::Quant` at the first encode for the layer. |
 
-**Semantics per layer:**
-- `codebook = None` (absent from JSON or `null`) — use built-in Lloyd-Max. Zero behavior
-  change; identical to uncalibrated behavior.
-- `codebook.value = Some(cb)` — replace the 16-centroid Lloyd-Max with `cb` for V-side
-  CPU encode on this layer. Length must equal `2^bits` (e.g. 16 for 4-bit). Centroids
-  are per-layer and shared across all KV heads on that layer.
+No production path copies the override into the codec. `QuantV` honours a
+codebook only when `QuantV::value_codebook` is set:
 
-**GPU dispatch:**
-The default MSL kernel (`rmlx_tq4_quantize`, `rmlx_tq4_dequantize`) has the
-Lloyd-Max codebook hardwired in Metal source. The codebook-buffer variants
-(`rmlx_tq4_quantize_codebook_buffer`, `rmlx_tq4_dequantize_codebook_buffer`)
-take the 16 centroids as a kernel buffer argument and compute the 15 decision
-midpoints `(cb[i]+cb[i+1])*0.5f` at runtime. `QuantV::append_inner` and
-`QuantV::dequantize_choice` dispatch the codebook-buffer variants whenever
-`value_codebook.is_some() && bits == 4`. The upload is cached on
-`QuantV::value_codebook_gpu` (an `Array` of shape `[16]` f32, built once per
-layer on the first GPU call). For `bits != 4` the per-layer override stays on
-the CPU encode path because no GPU 2-bit / 3-bit codec is wired yet.
+- The CPU encode passes it to `turbo_quantize_v_with_codebook`. 3-bit TCQ
+  honours it; 2-bit TCQ always uses the built-in 2-bit codebook.
+- The GPU encode supports `bits == 4` only. With a codebook it uploads the 16
+  centroids once into `QuantV::value_codebook_gpu`. It then dispatches
+  `rmlx_tq4_quantize_codebook_buffer` and `rmlx_tq4_dequantize_codebook_buffer`.
+  These kernels compute the 15 decision midpoints `(cb[i]+cb[i+1])*0.5f` at
+  run time. Without a codebook it dispatches `rmlx_tq4_quantize` and
+  `rmlx_tq4_dequantize`, which hold the Lloyd-Max codebook in the Metal source.
+- The 2-bit and 3-bit V codecs dispatch on the CPU. A GPU append with
+  `bits != 4` returns `Error::Quant`.
 
 ---
 
 ## Fused-QK kernels
 
-The default decode path runs in two stages: K is **dequantized** from its
-packed buffer back to bf16, then `scaled_dot_product_attention` runs the
-full QKV/softmax/SV fused kernel against the bf16 K. That dequant is the
-single largest decode-step bandwidth consumer on memory-bound models with
-PlanarQuant-packed K.
-
-The **fused-QK contract** lets a KV codec opt into a custom MSL kernel that
-consumes the packed K (codes / scales / rotation indices) directly and emits
-pre-softmax scores `[B, n_q_heads, 1, S_kv]` — no intermediate dequantized K
-ever lives in HBM. Post-softmax, the legacy SV path (dequant V + matmul)
-runs unchanged. Two follow-up work items complete the story:
-
-* **Flash-decode kernel** — fuse the SV path too via a flash-decode kernel
-  that keeps K, V, and online softmax all inside one threadgroup (mirrors
-  mtq's `PLANAR_FLASH_DECODE_KERNEL` shape). Eliminates the V dequant +
-  matmul ops and recovers the SDPA-internal fusion the split path gives up.
-* **Codec generalisation** — generalise the fused-QK contract to other codecs
-  (rotor, iso), so any codec that ships a packed K representation can ship an
-  MSL kernel matching the same `(query, codes, scales, rot32 / sideband, dims)
-  → scores` signature.
+The default decode path dequantizes K to bf16, then runs
+`scaled_dot_product_attention` over it. A fused-QK kernel instead reads the
+packed K (codes, scales, rotation indices) directly. It writes pre-softmax
+scores `[B, n_q_heads, 1, S_kv]`, so no dequantized K is written to memory.
+After the softmax, V takes the split path: a matmul with the bf16 V.
 
 ### PlanarK fused-QK scope
 
-Implemented:
-* `crates/rmlx-kv-quant/src/planar_fused_qk_msl.rs` — MSL kernel + Rust
-  dispatcher. Reads PlanarQuant `(codes, scales, rot32)` triple, performs
-  per-pair centroid lookup + inverse Givens rotation in registers, computes
-  QK dot via per-thread multiply + threadgroup tree-reduction. Bit-exact
-  with `planar_dequantize_v4_gpu` followed by reference matmul (tested in
-  `planar_fused_qk_msl_tests.rs`, max abs error ≤ 1e-3 for both 4-bit and
-  3-bit). One threadgroup per `(b, hq, s_kv)`; `head_dim` threads.
-* `crates/rmlx-kv-quant/src/planar_fused_qk.rs` — CLI toggle (process-wide
-  OnceLock, default `true`).
-* `crates/rmlx-kv-quant/src/storage/quant_planar_k.rs::gpu_packed_view`
-  — returns the sliced GPU codes/scales/rot32 for the accumulated `S`
-  tokens, without dequantizing.
-* `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_planar_k_fused`
-  — appends K (packed), updates V (bf16), runs fused QK, adds the
-  additive mask, precise softmax, GQA-broadcast matmul with V. Dispatch
-  guard is **decode-step only** (`q_seq == 1`) — prefill chunks fall
-  through to the legacy dequant+SDPA path so the cache state is not
-  double-mutated.
+`KvStorage::PlanarK` is the only storage with a fused-QK kernel.
+
+- `crates/rmlx-kv-quant/src/planar_fused_qk_msl.rs`: the kernel and its
+  dispatcher. The kernel reads the PlanarQuant `(codes, scales, rot32)`
+  triple. It does the per-pair centroid lookup and the inverse Givens rotation
+  in registers. The grid is `(S_kv, B * n_q_heads, 1)`, and each threadgroup
+  is `head_dim` threads that reduce one score. `planar_fused_qk_msl_tests.rs`
+  checks it against `planar_dequantize_v4_gpu` followed by a reference matmul.
+- `crates/rmlx-kv-quant/src/planar_fused_qk.rs`: the process-wide toggle.
+- `crates/rmlx-kv-quant/src/storage/quant_planar_k.rs::gpu_packed_view`: the
+  GPU codes, scales and `rot32` for the `S` tokens held, not dequantized.
+- `crates/rmlx-kv-quant/src/kvcache/sdpa.rs::update_and_sdpa_planar_k_fused`:
+  appends K to the packed store and V to the bf16 V buffer, then runs
+  `planar_k_flash_over_store`. That function runs `planar_flash_decode` when
+  the policy allows it and `head_dim` is a power of two. Otherwise it runs the
+  fused-QK kernel, the additive mask, a precise softmax and a GQA-broadcast
+  matmul with V.
+
+The dispatcher takes this path only when **all** of these are true:
+
+- the storage is `KvStorage::PlanarK`;
+- `--planar-fused-qk` is `on`;
+- the device is the GPU;
+- the step is a decode step (`q_seq == 1`);
+- no bf16 K seed is live (`decode_fp16_k` is `None`).
+
+A cache that went through a prefill bracket holds a bf16 K seed, so it takes
+the bf16 path. This is the warm-TTFT contract, and it is why `planar_k` is a
+Class 2 codec. A cache with no seed takes the fused path. The dispatcher
+also falls back to the bf16 path when the GPU packed view is not there.
+`planar_k` needs `head_dim % 32 == 0` and is rejected on Qwen MoE
+(`QwenMoePlanarKRejected`).
 
 ### Storage applicability
 
-| Variant | K codec | Eligible? | Notes |
-|---|---|---|---|
-| `KvStorage::PlanarK { k: QuantPlanarK, .. }` | PlanarQuant 4-bit | **YES** | The only path that goes through the fused-QK kernel today. K is `head_dim % 32 == 0`. Arch-guarded against Qwen MoE (PPL disaster — pre-existing). |
-| `KvStorage::Planar { k: QuantK, v: QuantPlanarV, .. }` | q8_0 | NO | Planar is on the V axis. K is q8_0 (affine), not Planar-packed — the kernel does not apply. Future K-side ports (rotor, iso) would route via the same contract. |
-| `KvStorage::Planar { bits: 3, .. }` (i.e. `KvQuant::Planar3`) | q8_0 | NO | Same as above — `Planar3` is the **V-side** 3-bit codec; K is still q8_0. |
-
-### Performance posture (PlanarK fused-QK)
-
-On Gemma4-e4b (only Planar-K-eligible test target — Bonsai's PlanarK
-NIAH-retrieval gap was fixed by the warm-TTFT bf16-K shortcut; see
-"Correctness gap" below — and Qwen3.6 MoE rejects PlanarK by arch guard)
-decode TPS is within measurement noise of the legacy path (`+1%` over a 3-run
-mean, 3-run stddev ≈ 1 TPS). The fused-QK path is approximately neutral
-because the legacy `scaled_dot_product_attention` is already a single fused
-flash kernel; the K-dequant cost saved is partly given back by the split SDPA
-ops (softmax + matmul) the fused-QK requires. The real win lands with the
-flash-decode kernel, which keeps QK + softmax + SV in one threadgroup and
-restores the fused-kernel-vs-split trade-off — see anchors in
-`docs/PERF_BASELINE.md`.
+| Variant | K codec | Fused-QK? |
+|---|---|---|
+| `KvStorage::PlanarK` | PlanarQuant 4-bit | **Yes**, under the conditions above. |
+| `KvStorage::Planar` (`planar`, `planar3`) | q8_0 | No. PlanarQuant is on the V axis; K is not Planar-packed. |
 
 ### CLI toggle
 
-`--planar-fused-qk on|off` (default `on`). Process-wide OnceLock; the flag
-is resolved at startup once. No env var fallback — keeps tests
-env-lock-free, unlike `--rotor-qjl`'s `RMLX_ROTOR_QJL`. To bench the win
-in isolation, run the same model with `on` and `off` (decode-step
-sensitive — see `.rmlx/bench/perf_canary.csv` rows tagged
-`planar-fused-qk-on` / `-off`).
+`--planar-fused-qk on|off` (default `on`). The CLI installs the value once at
+start-up into a process-wide `OnceLock`. There is no environment variable.
+`off` sends every PlanarK decode step through the dequant + SDPA path.
 
 ---
 
 ## Fused flash-decode over a quant store — the break-even condition
 
-The four sections that follow — plus TurboFlash, whose posture and measured
-cells live on `rmlx_cli::commands::serve::TurboFlashMode` — each describe a
-hand-written MSL kernel that reads a packed KV store directly at decode instead
-of a bf16 mirror. They all exist for one reason: a smaller store means fewer
-bytes moved per decode step. This section states the condition under which that
-trade actually pays, and records what it measures on this tree. Read it before
-concluding that a new fused kernel — or a denser store — will make some codec
-win.
+The fused flash-decode kernels in the sections below read a packed KV store at
+decode instead of a bf16 mirror. So does TurboFlash
+(§"TurboFlash is off by default"). A smaller store moves fewer bytes per decode step. This section
+states when that pays.
 
 ### The condition
 
 Two quantities, both measurable with `rmlx bench`:
 
-* **ρ** — bytes the fused kernel reads, over bytes MLX `sdpa_vector` reads from
-  the bf16 mirror for the same cell. Measured as the codec's resident KV in
-  excess of `none`'s.
-* **ε** — the fraction of MLX `sdpa_vector`'s per-byte throughput the
-  hand-written kernel achieves: `ε = ρ / (marginal-slope ratio vs none)`, where
-  the slope is `b` in `ms/step = a + b·(KV tokens/1000)`.
+* **ρ**: the bytes the fused kernel reads, over the bytes MLX `sdpa_vector`
+  reads from the bf16 mirror for the same cell.
+* **ε**: the fraction of `sdpa_vector`'s per-byte throughput that the kernel
+  achieves. `ε = ρ / (marginal-slope ratio against none)`, where the slope is
+  `b` in `ms/step = a + b·(KV tokens/1000)`.
 
-A fused decode beats bf16 iff **ρ < ε**. Note that ε is a property of the
-*kernel shell*, not of the codec, and ρ is a property of the *store*, not of the
-kernel — so a codec and a kernel can each be reasonable and the pair still lose.
+A fused decode beats bf16 only when **ρ < ε**. ε is a property of the kernel
+shell and ρ of the store, so a good codec and a good kernel can still lose as
+a pair. The store must hold fewer than `16·ε` bits per value per axis.
 
-### Measured (`d8a6169`, release-perf, M5 Max, n=3, contended host)
+### Measured ε
 
-| kernel | arch | `heads_per_kv` | ρ | slope ratio | ε |
-|---|---|---|---|---|---|
-| TurboFlash (`k8v4`) | Bonsai-8B | 4 | 0.262 | 6.37× | **0.041** |
-| `iso_flash_decode_symv` (`iso3_sym`) | Bonsai-8B | 4 | 1.013 | 7.51× | **0.135** |
-| `iso_flash_decode_symv` (`iso3_sym`) | gemma-4-e2b | 8 | ~1.01 | 19.2× | **0.052** |
+| kernel | arch | `heads_per_kv` | ρ | slope ratio | ε | ceiling `1/heads_per_kv` |
+|---|---|---|---|---|---|---|
+| TurboFlash (`k8v4`) | Bonsai-8B | 4 | 0.262 | 6.37× | **0.041** | 0.250 |
 
-The TurboFlash row is the sharpest statement available: at 32k on Bonsai-8B the
-fused path reads **3.8× fewer bytes** and costs **6.4× more time per KV token**.
-Decode through these kernels is **not bandwidth-bound**, so a smaller store does
-not buy time.
-
-Dispatch was witnessed, not inferred. `--turbo-flash on` at a 4k prompt (below
-the kernel's own `kv_seq > 4096` gate) is bit-identical to `off` in resident
-bytes and within noise on TPS; dropping the gate at the *same* prompt moves
-resident KV by +180 MB and decode 129.8 → 65.9 TPS. The 16k/32k byte deltas
-(+722 MB / +1445 MB, exactly linear in `kv_seq`) are the kernel engaging.
-
-### Cross-backend calibration — ε is a platform number, not an rMLX number (TAINTED host)
-
-The three rows above are all rMLX kernels, so on their own they cannot separate
-"fused decode over a quant store is hard on this GPU" from "our kernels are
-bad". A second, independent implementation now answers that.
-
-`llama-cpp-turboquant` implements the same idea in a different framework with
-hand-written Metal: TurboQuant K/V blocks read directly inside
-`flash_attn_ext_vec_kturbo*_vturbo*_dk{128,256}_dv{128,256}`, with the WHT
-applied to `q` once per query as a graph op. It was measured against **its own
-upstream merge-base** (`7fc1c4ef7`) at f16 KV — same GGUF file, same graph, same
-build flags, so within one cell the only variable is the codec and its kernels.
-Both models are `n_q_heads/n_kv_heads = 32/8` → `heads_per_kv = 4`, the same
-ratio as Bonsai-8B.
-
-**Measurement conditions.** Every cell ran `--allow-busy-host` and came back
-**TAINTED** — entry gate 25.6–55.0% of one core, measured windows 29–56%
-(`WindowServer`; `syspolicyd` steady at 32.2–32.5%), and two slots of the 7 722
-run with a `node` process at 139.9%/159.8%. ABBA cancels a *steady* load and the
-arm ranges below are disjoint by far more than the interference, so the
-**separation verdicts survive**; the **absolute TPS does not** and is not quoted
-across runs. Per-slot windows are in each result JSON.
-
-| model | prompt tok | n/arm | fork turbo3 / upstream f16 decode | ms/step ratio | KV MiB f16 → turbo3 | peak RSS B/A |
-|---|---:|---:|---:|---:|---|---:|
-| Qwen3-8B-Q8_0 | 3 753 | 4 | 0.733x | 1.364 | 648.00 → 126.69 | 0.945x |
-| Qwen3-8B-Q8_0 | 7 722 | 4 | 0.705x | 1.419 | 2 304.00 → 450.13 | 0.830x |
-| Qwen3-8B-Q8_0 | 31 536 | 4 | 0.690x | 1.449 | 5 760.00 → 1 125.13 | 0.677x |
-| Llama-3.1-8B-Instruct-Q8_0 | 61 709 | **2** | 0.653x | 1.532 | 8 192.00 → 1 600.13 | 0.607x |
-
-Arm ranges are disjoint in all four cells. **The 61 709 row is n=2/arm**
-(`--pairs 2`), not 4 — it is simultaneously the most extreme ratio, the only
-second-architecture point, and the least-replicated cell. Nothing below is
-derived from it alone. Its stored result JSON records the verdict as
-`SEPARATED`; the harness now labels a disjoint pair at n=2 `SEPARATED-WEAK`, and
-refuses `--pairs 1` outright, because two single-point "ranges" cannot overlap.
-
-`ρ` is exact here and needs no inference: llama.cpp keeps no bf16 mirror, so the
-reported KV buffer *is* what the kernel reads. Across all four cells and both
-models **ρ = 0.1953 ± 0.0002** (0.195509 / 0.195369 / 0.195335 / 0.195328) — a
-1.8e-4 spread, which is the codec's block layout reproducing itself exactly.
-
-**ε is derived from the Qwen3-8B series alone.** The `ms/step = a + b·x`
-monotonicity argument is only valid within one `(a, b)` pair, i.e. within one
-model; extending it across the model boundary to the Llama-3.1 row would not be
-a bound at all. Two derivations, both same-model:
-
-* **Drift-free upper bound.** The within-run ms/step ratios rise 1.364 → 1.419 →
-  1.449 and are still climbing, so the marginal slope ratio is at least 1.449 and
-  **ε ≤ 0.135**. This uses only within-run ratios, so host drift cancels.
-* **Two-endpoint slope regression.** Fitting `b` per arm from the 3 753 and
-  31 536 cells gives `b = 0.330`, `b' = 0.536`, slope ratio **1.63** and
-  **ε ≈ 0.120**. This one reads absolute ms across two runs, so it carries the
-  drift caveat.
-
-So ε ∈ **[0.120, 0.135]** for the fork's kernel, and the upper bound is *exactly*
-rMLX's own best measured shell:
-
-| kernel | `heads_per_kv` | geometric ceiling | ε | % of ceiling |
-|---|---|---|---|---|
-| rMLX `iso_flash_decode_symv`, Bonsai-8B | 4 | 0.250 | 0.135 | 54% |
-| `llama-cpp-turboquant` vec-turbo FA, Qwen3-8B | 4 | 0.250 | 0.120–0.135 | 48–54% |
-
-**Two independently written Metal kernels, two frameworks, land on the same ε at
-the same `heads_per_kv`.** And for the same structural reason: the fork's vec
-dispatch is `dispatch_threadgroups(…, (ne01 + nqptg - 1)/nqptg, ne02, ne03, …)`
-with `ne02` the **query**-head count (`ggml-metal-ops.cpp`), so its
-`heads_per_kv` threadgroups re-read the identical KV bytes exactly as ours do.
-The ceiling in the next section is not an rMLX artifact.
-
-Consequences, and they are the load-bearing part of this whole section:
-
-* **ρ = 0.1953 > ε ≤ 0.135, so the fork loses too** — by 1.45x on ms/step at
-  31 536, which is the 0.690x decode ratio measured. rMLX's `turbo_flash` being
-  slower than its generic path is a *degree* of the same result, not a different
-  kind of result. Its ε = 0.041 says our TurboFlash *shell* is ~3x off what is
-  achievable; even a perfect fix of that shell reaches ε ≈ 0.135 and still loses
-  at ρ = 0.1953.
-* **The trend runs the wrong way**, and this is established on the three
-  **same-model** Qwen3-8B points alone: 0.733 → 0.705 → 0.690 as context grows
-  8.4x. A codec whose store is 5x smaller should gain as KV's share of
-  bytes/step rises; it does not, because the per-step dequant work scales with
-  the same `t_seq`. "Measure it at longer context and it will pay" is falsified
-  on the reference implementation, not only on ours. The Llama-3.1 point at
-  0.653x is *consistent* with the trend but cannot extend it — it changes model
-  and context simultaneously, and there is no short-context Llama-3.1 cell to
-  separate "ratio falls with context" from "Llama-3.1 is worse for this codec".
-* **What the fork does deliver is the memory axis**, and it is monotone with
-  context rather than flat: peak process memory **0.945x / 0.830x / 0.677x /
-  0.607x** at 3 753 / 7 722 / 31 536 / 61 709, against a flat 0.1953x KV buffer.
-  The campaign declared a `≤0.85x` peak-memory criterion in advance; **at 3 753
-  tokens the fork does not clear it** (0.945x), because the KV saving is small
-  beside 8.3 GB of weights until context grows. The trade is real from ~8k up and
-  absent below it.
-* **Coherence was observed only where it was captured, and no quality axis was
-  measured.** Output capture was added to the harness after the 7 722 and 31 536
-  runs, so every slot of those two carries `output_first_64: null`. Where
-  captured (3 753, 61 709, and the confound control) both arms produce fluent,
-  on-topic English. At 61 709 the two arms visibly disagree on extracted facts,
-  which is expected of a lossy KV codec and is *not* evidence either way about
-  quality — no perplexity or task score was run.
-* Its own deepest fusion (`TurboFlash`, a two-pass fused kernel) is **disabled by
-  default because it emits garbage on Apple10**, reproduced here on this host.
-  Two independent projects disabling their deepest Metal fusion on this GPU
-  family is a platform signal.
-
-**Scope of the confound control.** "The only variable is the codec" is licensed
-by a `fork @ f16` vs `merge-base @ f16` cell that returned INCONCLUSIVE with
-fully overlapping ranges (1.013x, n=4/arm) — but that control ran at **one
-context (7 722) on one model (Qwen3-8B)**. The 61 709 Llama-3.1 cell has no
-control of its own, so a long-context-specific or Llama-specific regression among
-the fork's 211 non-upstream commits is unmeasured there.
-
-Method, raw slots and the fork-side detail: `scripts/bench_llama_ab.sh`,
-`scripts/ingest/llama_ab_ingest.py`, results under `$RMLX_HOME/bench/llama_ab/`.
+At ε = 0.041 the store must hold fewer than 0.66 bits per value per axis. The
+densest store in the tree is `tsym3` at 4.00 bits per value per axis
+(ρ = 0.25), and no kernel decodes over it. Decode through these kernels is
+**not bandwidth-bound**, so a smaller store does not buy time.
 
 ### Why ε is small — grid geometry
 
-Every P1 kernel here indexes its grid by **query** head (`n_bh = b · n_q_heads`)
-and addresses KV with `kv_h_idx = hq / heads_per_kv`. So `heads_per_kv`
-threadgroups each stream the identical KV bytes. That caps the shell at
-**ε ≤ 1/heads_per_kv** before any kernel-body cost:
+Each P1 kernel indexes its grid by **query** head and reads the KV head
+`hq / heads_per_kv`: `turbo_flash_p1.metal`, `iso_flash_decode_p1.metal`,
+`iso_flash_decode_symv_p1.metal`, `rotor_flash_decode_p1.metal`,
+`rotor_flash_decode_symv_p1.metal` and `planar_flash_decode_p1.metal` under
+`crates/rmlx-kv-quant/src/metal/`. So `heads_per_kv` threadgroups read the
+same KV bytes. That caps the shell at **ε ≤ 1/heads_per_kv** before any cost in
+the kernel body.
 
-| arch | `heads_per_kv` | geometric ceiling | measured ε |
-|---|---|---|---|
-| Bonsai-8B | 4 | 0.250 | 0.135 (54% of ceiling) |
-| gemma-4-e2b | 8 | 0.125 | 0.052 (42% of ceiling) |
+At `heads_per_kv ≥ 4` this ceiling is at or below ρ = 0.25, the densest store
+in the tree. So on such an arch no fused decode over a current store can beat
+bf16, even with a perfect kernel body.
 
-Measured ε differs between the two archs by 2.6×; `heads_per_kv` alone predicts
-2.0×. The residual ≈2× is **unattributed**, and the two constructs it is easiest
-to blame are not available to blame in general:
-
-* `turbo_flash_p1.metal` contains **zero** `threadgroup_barrier` and no thread-0
-  serial section — its online softmax is per-lane with a `simd_sum` at `:106`,
-  and its only `lane == 0` is the epilogue store at `:153`. It has no
-  `partial_o` either; its P1→P2 buffers are `partial_out` / `partial_ms`. Both
-  constructs live in `turbo_flash_p2.metal` (barrier `:37`, `tid == 0u` `:20`),
-  which measures **3.66%** of GPU time, so eliminating it entirely recovers at
-  most that.
-* The iso and rotor P1 kernels do carry both constructs inside the per-KV-token
-  loop (`iso_flash_decode_symv_p1.metal:84` between barriers at `:81` / `:107`;
-  same shape in `iso_flash_decode_p1`, `rotor_flash_decode_p1`,
-  `rotor_flash_decode_symv_p1`). Their **magnitude has never been measured** —
-  every counter and timing measurement to date is of `turbo_flash_p1`.
-
-Where the residual went on the one kernel that was profiled: `turbo_flash_p1`
-is **issue-bound, not memory-bound** — Integer and Conditional Limiter 50.45%,
-Instruction Throughput 45.66%, Control Flow 28.92%, against LLC 10.66% and L1
-3.31%, at 22.24% occupancy with 94 allocated registers and 0 spilled bytes. The
-bf16 `sdpa_vector` encoders in the same capture are the opposite: LLC 42.16%,
-occupancy 52.93%, 56 registers. See "Lifting ε does not pay" below.
-
-**Corollary for `kv_h == 1` architectures.** e2b's geometric ceiling (0.125) is
-*below* the densest store in the tree (`tsym3`, ρ = 0.158). On such an arch no
-fused decode over any store that exists or has been proposed can beat bf16 **even
-with a perfect kernel body**, while the grid re-reads KV per query head. That is
-a necessary condition, not a sufficient one — lifting it is measured below and
-does not produce a win either.
-
-### What ρ would have to be
-
-| kernel efficiency | break-even store (bf16 = 32 bits per K+V pair) |
-|---|---|
-| ε = 0.135 (best measured) | 4.3 bits/pair = **2.2 bits per value per axis** |
-| ε = 0.052 (e2b) | 1.7 bits/pair = **0.83 bits per value per axis** |
-| ε = 0.041 (TurboFlash) | 1.3 bits/pair = **0.66 bits per value per axis** |
-
-Against what exists or has been specced:
-
-| store | bits/value | ρ | clears ε = 0.135? |
-|---|---|---|---|
-| `tsym3` — densest store in the tree | 2.5 | 0.158 | no, 1.2× over |
-| iso3 / rotor3 as stored today (dense code plane) | 7.125 / 8.75 | 0.445 / 0.547 | yes, both |
-
-**The binding constraint is ε, not ρ.** Repacking a store is necessary for some
-of these codecs to stop costing memory, but it is not sufficient to make a fused
-decode win, and on `kv_h == 1` it is not even close. Judge a store repack on its
-memory merits, not on an expected decode win — and read the next section before
-funding kernel-shell work on the expectation that lifting ε collects the
-difference.
-
-### Lifting ε does not pay — answered negative
-
-Two proposals rested on the arithmetic above. Both are answered **no** from
-evidence already in the tree, with no new measurement. Neither is a throughput
-lever; do not sequence a codec change behind either.
-
-**What was asked.**
-
-* *Re-index the P1 grid by KV head* — carry `heads_per_kv` query vectors and
-  their online-softmax state in registers so each KV byte is read once per
-  threadgroup instead of `heads_per_kv` times. Predicted ceiling lift 4× at
-  `heads_per_kv = 4`, 8× at 8; success criterion ε on `iso3_sym` at Bonsai-8B
-  rising from 0.135 toward 0.25.
-* *Close the mirror→packed bandwidth cliff in `mixed_*`* — the `Mixed` decode
-  path streams its packed KV at 227.8 GB/s where the bf16 path moves the same
-  layers' KV at 533.9 GB/s on the same host, shape and context segment. Pass
-  criterion: those layers reach ≥ 400 GB/s, 65% of the 614 GB/s host ceiling.
-
-**The re-index's mechanism is true; its consequence is not.** The grid really is
-indexed by query head — `turbo_flash_p1.metal:17,20,27` (`bh_idx` flat over
-`B * n_q_heads`, `kv_head = q_head / n_repeats`) and `:29-32` in each of
-`iso_flash_decode_p1`, `iso_flash_decode_symv_p1`, `rotor_flash_decode_p1`,
-`rotor_flash_decode_symv_p1` (`kv_h_idx = hq / heads_per_kv`) — so
-`heads_per_kv` threadgroups do stream identical bytes, and `ε ≤ 1/heads_per_kv`
-is a correct analytic cap. What fails is the step from that cap to a win. A
-`1/heads_per_kv` cap binds only if the kernel is waiting on memory, and it is
-not.
-
-1. **The headroom ladder.** `.rmlx/analysis/kv-campaign/P12/03_headroom_calc.txt`
-   (Bonsai-8B `k8v4` @32k, `--turbo-flash off|on`, ABBA, 12 slots): removing the
-   **entire** query-head class — an upper bound on the re-index, since that class
-   also holds irreducible per-query-head arithmetic — moves the ON arm from
-   0.231× of the generic path to **0.311×**. End-to-end that is a 1.348×
-   speedup on a kernel 4.33× behind, i.e. perfect execution still lands 3.21×
-   slower than not running the codec at all. Reaching parity needs the *bytes*
-   class to run ~3× better as well (0.701×), and only full per-byte parity with
-   MLX `sdpa_vector` clears 1.0 (1.283×).
-2. **The kernel is issue-bound, so a bandwidth fix has little to recover.**
-   Xcode Metal Debugger counter export, Bonsai-8B `k8v4` @8192, Serial
-   execution mode / Maximum performance state: `turbo_flash_p1` reads Integer
-   and Conditional Limiter **50.45%**, Instruction Throughput 45.66%, Control
-   Flow 28.92%, against LLC **10.66%** and L1 3.31%. The bf16 `sdpa_vector`
-   encoders in the same capture invert it — LLC 42.16%, Integer and Conditional
-   9.50%. Every memory limiter on the fused kernel is small; the byte savings
-   are real and have nothing to convert into. *Serial execution mode makes
-   absolute wall-clock and absolute bandwidth non-production numbers; limiters,
-   occupancy, register counts and the P1:P2 ratio are the precise half, and are
-   what is quoted here.*
-3. **The redesign costs registers — but not obviously more than this GPU
-   schedules.** *Derivation* from the declared per-lane arrays in
-   `turbo_flash_p1.metal` — `q_vals[8]` (`:38`), `o_state[8]` (`:47`), `m_state`
-   / `l_state` (`:45,:46`) are per query context and would replicate
-   `heads_per_kv` times; `v_decoded[8]` (`:116`) is shared. 18 f32 per query
-   context: today 18 + 8 = 26, after the re-index 18·`heads_per_kv` + 8 — **+54
-   at `heads_per_kv` 4** and **+126 at 8**.
-
-   **This argument is weaker than an earlier revision of this section claimed,
-   and the measurement is why.** That revision anchored on `turbo_flash_p1`'s
-   94 allocated registers at 22.24% occupancy and concluded the re-index had no
-   room. But the kernel #340 would actually rebuild is
-   `iso_flash_decode_symv_p1`, and the Xcode Shaders tab for
-   `.rmlx/traces/…iso4_sym-8192tok-20260823-104642.gputrace` measures it at
-   **60 allocated registers, 0 spilled** — with `affine_qmv_fast_bfloat16_t_gs_128_b_2`
-   running in the same capture at **115 allocated, 0 spilled**. 60 + 54 ≈ 114 is
-   therefore a shape this GPU demonstrably schedules. Register pressure is a
-   cost to price, not a wall. The verdict below does not rest on it.
-4. **The one store whose ρ clears a lifted ceiling is inert.** `tsym3` (ρ =
-   0.158) is the only spelling that would clear 0.25. It encodes nothing today:
-   in `.rmlx/analysis/kv-disposition-416/inertness_base.csv` it is
-   **byte-identical and token-identical to `none`** at 4 096 and 32 768 tokens on
-   both gemma-4-e2b and Ternary-Bonsai-8B (e.g. Bonsai @32 768: 4 667 277 312 B
-   and ids `eafa8d9dd4d4a507` on both). ρ = 0.158 is a specification, not a
-   store, and it has no symv-family kernel either.
-5. **No codec that does exist turns a lifted ε into a win.** `iso4_sym` at 32 768
-   tokens on Bonsai-8B decodes at **0.170×** of `none` (10.703 vs 62.936 TPS)
-   while holding **1.3% more** resident KV than bf16
-   (`.rmlx/analysis/kv-disposition-416/inertness_fix.csv`). A 4× ceiling lift
-   applied to the whole gap does not reach 1.0 from there, and there is no
-   bandwidth prize to collect at ρ > 1.
-
-**Cross-backend control.** `llama-cpp-turboquant`'s independently written fused
-decode dispatches over the same query-head grid (`ne02` is the query-head count,
-see "Cross-backend calibration" above) and loses 0.653–0.733× against its own
-f16 baseline, worsening with context. The geometry is shared by both
-implementations, so it is not what separates a winning fused decode from a
-losing one.
-
-**The packed-store proposal's motivation survives; its fix targets do not.**
-The byte→time conversion really is where the loss lives — that is the same
-finding, from the other side. But:
-
-* *Fix target 1* was to determine whether the GQA `expand_dims(-3)` broadcast in
-  `crates/rmlx-kv-quant/src/mixed_quant/sdpa.rs` materialises or is re-read per
-  repeat group. It does neither, and there is nothing in rMLX to change: MLX's
-  quantized-matmul batch addressing accumulates `pos_in_dim * stride` per axis
-  (`elem_to_loc_broadcast`, `mlx/backend/metal/kernels/steel/utils.h:7-22`, via
-  `adjust_matrix_offsets` in `quantized.h`), so a stride-0 axis contributes zero
-  and every repeat group resolves to the same base pointer. *This is a reading
-  of the installed MLX kernel headers; MLX's C++ `eval_gpu` is not on this
-  machine to confirm no copy precedes dispatch.* The measurement agrees
-  independently: a "K re-read r times" model needs r = 3.06 to explain `k8v4`
-  and r = 4.15 to explain `k4v4`, i.e. it does not fit.
-* *Fix target 2* is inside MLX's `affine_qmv_*` / `affine_qvm_split_k_*`
-  kernels, not in rMLX code.
-* The **≥ 400 GB/s pass criterion presumes a bandwidth bound the counters
-  contradict**, and would fail work that did everything right — the same defect
-  as the ≤ 4× criterion on the re-index, which is unreachable because the whole
-  query-head class measures 29.9% ± 4.1% of the loss.
-* There are also no users to collect for: the auto default is bf16 on every arch
-  (`DEFAULT_KV_QUANT = KvQuant::None`,
-  `crates/rmlx-models/src/kv_cache/mod.rs:461`), the codec holds 21.9–34.9% more
-  resident KV than `none` across the four cells measured, and the long cell went
-  the other way — Qwen3.8-27B at 130 848 tokens, ABBA n=4, is **23.7% slower**
-  with disjoint ranges where the byte model predicted +14.9% faster
-  (`docs/PERF_BASELINE.md`, "Codec cells across context").
-
-**The open cell, now closed.** Every *counter* measurement in this argument is
-of `turbo_flash_p1` (ε = 0.041); the best kernel in the tree,
-`iso_flash_decode_symv_p1` (ε = 0.135, 3.3× better), was unprofiled when the
-disposition was written. It has since been captured —
-`.rmlx/traces/prism-ml__Ternary-Bonsai-8B-mlx-2bit-iso4_sym-8192tok-20260823-104642.gputrace`,
-Bonsai-8B `iso4_sym` @8192, `--skip 32 --steps 8` — and read from the Xcode
-Metal Debugger **Shaders** tab:
-
-| kernel | cost | allocated registers | spilled |
-|---|---:|---:|---:|
-| `custom_kernel_rmlx_iso_flash_decode_symv_p1_b4` | **67.84%** | 60 | 0 |
-| `affine_qmv_fast_bfloat16_t_gs_128_b_2_batch_0` | 18.53% | 115 | 0 |
-| `custom_kernel_rmlx_iso_flash_decode_symv_p2` | 6.86% | 24 | 0 |
-
-The fused decode kernel is **two thirds of all GPU time**, confirming it is the
-decode bottleneck rather than a contributor to one. Its register count retires
-argument 3 above as a wall (see the correction there); it does not disturb
-arguments 1, 2, 4 or 5, and the headroom ladder — the load-bearing one — is
-independent of every counter.
-
-**Read the Shaders tab, not the Counters CSV, for anything per-kernel.** A
-Counters export is per *encoder*, and one encoder in this capture holds **51
-commands** spanning a dozen pipelines, so a counter column cannot be attributed
-to a named kernel from it. An earlier revision of this section inferred a
-kernel's limiter split by clustering that CSV; the inference was unfounded and
-has been withdrawn. Pipeline names, cost share, register counts and spilled
-bytes all come from the Shaders tab, which carries them directly.
-
-The LLC-limiter decision rule that stood here is therefore retired unfired: the
-per-kernel limiter split it asked for is not what the Counters export provides,
-and the disposition no longer depends on it.
+The ceiling is necessary, not sufficient. The one kernel with limiter
+counters, `turbo_flash_p1`, is **issue-bound, not memory-bound**: Integer and Conditional
+Limiter 50.45% and Instruction Throughput 45.66%, against Last Level Cache
+10.66%. The bf16 `sdpa_vector` encoders in the same capture show LLC 42.16%.
+A grid indexed by KV head would read each KV byte once. It removes no issue
+cost, so it does not reach parity (§"The decode ceiling").
 
 ### The decode ceiling — deleting the codec's arithmetic does not reach bf16
 
-The section above answers "is lifting ε worth funding?" from evidence gathered
-for other purposes. The question was then put directly, with an **ablation
-ladder**: one serving cell, one packed-store codec, four binaries that
-progressively *delete* decode work rather than optimise it, each rung
-ABBA-interleaved against the same baseline arm.
-
-| rung | what it deletes | output |
-|---|---|---|
-| (a) | nothing — the shipped codec | correct |
-| (b) | **all** per-step decode math and all K-store traffic | deliberately wrong |
-| (c) | the rotation only | deliberately wrong |
-| (d) | the V-slab copy only | bit-identical to (a) |
-
-Rungs (b) and (c) compute the wrong answer on purpose. They are cost probes: no
-number taken from them describes a working configuration. Rung (b) is the
-load-bearing one, because it is an **upper bound on every decode-math item
-combined** — a rotation hoist, a narrower K store, a better codebook, vector
-loads on the code plane, and anything not yet proposed. Whatever the codec could
-compute more cheaply, (b) has already deleted.
-
-**Rung (b) does not reach `none`, and it is not close.** With 100% of the decode
-math and the whole K-store read gone, the codec is still far short of bf16, and
-the majority of the per-step gap survives into the rung that computes nothing.
-That surviving majority is the **kernel shell** — dispatch, grid geometry,
-barriers, the fixed per-layer cost of running a custom kernel at all — not codec
-arithmetic.
-
-Three consequences, and they are what this result is for:
-
-1. **Every decode-math proposal shares one ceiling, and the ceiling is below
-   parity.** They cannot be justified individually against a parity target,
-   because their *sum* does not reach it. "The codec is slow because of what it
-   computes" is retired as a fundable theory.
-2. **The next measurement is a shell variant** — tokens per iteration, barrier
-   count, dispatches per layer — not another decode-math one. The ladder shows
-   where the cost is; it does **not** show that a shell rewrite would collect
-   it, and nothing here licenses that assumption.
-3. **Rung (d) is the exception, and it shipped.** A bounded fix, output
-   bit-identical to the baseline, no stored-format change, covering the three
-   dispatchers that shared the defect (`iso_flash_decode_msl.rs`,
-   `rotor_flash_decode_msl.rs`, `planar_flash_decode_msl.rs`). Its anchors,
-   command line and control cell are in docs/PERF_BASELINE.md, "V-mirror
-   stride".
-
-**No figure from the ladder is transcribed here.** Three of its four arms are
-instrumented throwaway binaries not reproducible from any committed ref, so
-nothing was ingested into `runs.db` and a ratio written into this page would
-have no producer to check it against. The raw transcripts, the per-slot result
-JSONs and the three variant patches are in `.rmlx/analysis/r4-ceiling-ladder/`
-(gitignored scratch); the *ordering* of the rungs, which is the durable result,
-is what this section carries.
-
-This supersedes argument 1's headroom ladder in scope rather than contradicting
-it: that one deletes the query-head class, this one deletes the whole
-decode-math class, and the two agree in direction.
+A fused packed-store kernel with **all** per-step decode math and all K-store
+reads removed still decodes well short of `none`. Most of the gap is the
+kernel shell: dispatch, grid geometry, barriers and the fixed per-layer cost of
+a custom kernel. So no change to the decode math reaches parity: not a rotation
+hoist, a narrower K store or a better codebook, alone or together.
 
 ### Codec disposition — what every codec in the tree is for
 
-The KV enum spells **28 codecs**. This section gives each one an explicit
-disposition and the evidence behind it. "Nobody selects it" is not a
-disposition; the classes below are.
+The KV enum spells **28 codecs**, all listed in `ALL_KV_QUANTS`. Each has one
+of the three dispositions below. `KvQuant::decode_reads_packed_store` decides
+the class. The tests that hold it, all in
+`crates/rmlx-kv-quant/src/quant_tests.rs`:
 
-The classification is not prose. `KvQuant::materialises_packed_store` is the
-predicate the runtime dispatches on, `quant_tests.rs::DISPOSITIONS` names all
-28 by hand, and `every_codec_carries_a_disposition` fails when the two
-disagree. A variant added to the enum cannot reach `ALL_KV_QUANTS` without
-being classified.
+- `DISPOSITIONS` writes the class of each codec by hand.
+  `every_codec_carries_a_disposition` fails when a row and the predicate
+  disagree.
+- `disposition_table_covers_every_variant_once` fails when a codec in
+  `ALL_KV_QUANTS` has no row, or two rows.
+- `disposition_is_a_property_of_the_family_not_its_parameters` pins that the
+  four parameterised families keep their class at every parameter set.
 
-#### The measurement
-
-`scripts/bench/codec_inertness_probe.sh`, one `rmlx baseline` per codec at
-temperature 0, `--max-tokens 100`: 27 codec spellings × 2 architectures × 2
-contexts, 108 runs, all exit 0. Two architectures on purpose — gemma-4-e2b is
-`kv_h == 1` with shared-KV and sliding-window layers, Ternary-Bonsai-8B is
-`kv_h == 8` dense — because a KV result at one shape is not a result at the
-other.
-
-27 spellings, not 28 variants: the four parameterised families are driven at
-one representative parameter set each, and `rotor_k_3_asym_v*_g*` is left to
-`disposition_is_a_property_of_the_family_not_its_parameters`, which pins that
-the classification cannot move with the parameters. Every unit-variant codec
-was served.
-
-Both reported quantities are load-independent: `kv_cache_bytes` is a byte
-count and the digest is over token **ids**, not text. No throughput claim is
-made here; the probe's `decode_tps` column is single unpaired runs on a shared
-host and is not comparable row to row (see `docs/PERF_BASELINE.md` for the
-conditions on this machine).
-
-| | gemma-4-e2b 4k | gemma-4-e2b 32k | Bonsai-8B 4k | Bonsai-8B 32k |
-|---|---:|---:|---:|---:|
-| `none` resident KV (B) | 32 194 560 | 217 976 832 | 570 507 264 | 4 667 277 312 |
-| codec spellings byte-identical **and** id-identical to `none` (incl. `none`) | 17 | 17 | 17 | 17 |
-| codec spellings larger than `none` | 10 | 10 | 10 | 10 |
-| codec spellings **smaller** than `none` | **0** | **0** | **0** | **0** |
-
-**No codec in the tree reduces resident KV, on either architecture, at either
-context.** That is the finding the dispositions follow from.
-
-> **Superseded on the store-materialising half of the table.** The four cells
-> above were recorded while `Mixed` / `RotK` held a full bf16 mirror beside
-> their packed store on *every* architecture, and while the iso/rotor ring's
-> scale and norm planes were `f32`. Both are gone. Re-measured with
-> `rmlx serve` at a 928-token prompt (`kv_cache_bytes`, the server's own N16
-> event), the "smaller than `none`" count is no longer 0:
->
-> | model | smaller than `none` | best cell |
-> |---|---|---|
-> | Ternary-Bonsai-8B | 6 of 10 | `mixed_k8g64_v4g64` **0.519×** |
-> | Ternary-Bonsai-27B | 6 of 10 | `mixed_k8g64_v4g64` 0.843× |
-> | Qwen3.8-27B | 6 of 10 | `mixed_k8g64_v4g64` 0.838× |
-> | Qwen3.6-35B-A3B | 2 of 2 permitted | `mixed_k8g64_v4g64` 0.876× |
-> | gemma-4-e2b | 4 of 10 | `iso3_sym` **0.876×** |
-> | gemma-4-12B | 5 of 10 | `iso3_sym` 0.980× |
->
-> The **inert half is unchanged and re-verified**: all 17 store-less codecs
-> served Ternary-Bonsai-8B at `kv_cache_bytes` 151 584 768 — byte-identical to
-> `none` — with greedy token digest `4f26f49e2b3529f6`, also byte-identical.
-> 18/18 cells, both axes. The dispositions below follow from *that* half, which
-> is why they still stand.
->
-> Two qualifiers, both load-bearing. `mixed_*` / `rot_k_*` win only where layers
-> do **not** share K/V — on shared-KV gemma-4 they are larger (1.02–1.56×). And
-> the iso family buys its bytes with decode: **0.64–0.69×** `none`'s TPS on
-> Bonsai-8B, 0.77–0.86× on gemma-4-e2b, 0.85–0.97× on the 27B/12B models
-> (rotor is worse on every one: 0.58–0.96×). Nothing here is both smaller and
-> faster than bf16.
+`scripts/bench/codec_inertness_probe.sh` measures `kv_cache_bytes` and a greedy
+token-id digest for each codec against `none`. Generate at least 200 tokens:
+at 32 tokens, codecs that differ can give the same digest.
 
 #### Class 1 — the baseline (1 codec)
 
-`none`. bf16 both sides, the resolved `auto` default, the smallest resident KV
-measured, and the reference every other row is compared against.
+`none`: bf16 on both axes, the `auto` default, and the reference for the other
+classes. `exactly_one_codec_is_the_baseline` keeps it the only one.
 
-**Disposition: keep.** Nothing else is in this class, and
-`exactly_one_codec_is_the_baseline` keeps it that way.
+**Disposition: keep.**
 
 #### Class 2 — inert, mirror-fed (17 codecs)
 
@@ -2992,444 +2370,109 @@ measured, and the reference every other row is compared against.
 `k8vturbo2`, `k8vturbo2tcq`, `tsym3`, `tsym4`, `iso3`, `iso4`, `rotor3`,
 `rotor4`, `rotor_k_3_asym_v*_g*`, `rotor_k_4_asym_v*_g*`.
 
-Decode reads the bf16 mirror on both axes, so `exit_prefill` skips the packed
-store and prefill never encodes one either — the codec math does not execute at
-all on a prefill-bracketed flow. That is a property of
-`KvQuant::decode_reads_packed_store`, checked by
-`exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`. In all four
-cells every one of these reports the identical `kv_cache_bytes` and the
-identical 100-token id digest as `none`.
+Decode reads the bf16 mirror on both axes. So `exit_prefill` builds no packed
+store, and the codec math does not run on a cache that went through a prefill
+bracket. `exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`
+(`crates/rmlx-kv-quant/src/kvcache/warm_ttft_cross_codec_tests.rs`) pins this.
+Resident KV and greedy token ids equal `none`'s. The store is still the
+authority for a cache with no mirror: an SSD hydrate, or a cache that did not
+go through a prefill bracket.
 
-Every codec in this class carries an INERT banner at the head of its
-per-variant section above, and the `--kv-quant` / `--kv-bits` help says the same
-thing. Neither is maintained by review: `make check-kv-codec-disposition`
-derives the class from `ALL_KV_QUANTS` and the three decode predicates and fails
-on a banner a codec no longer earns, or a codec that earns one and does not have
-it. `make check-kv-codec-disposition-fixtures` measures that gate's own recall,
-one synthetic scan root per rule, asserting which rule fires rather than the
-exit code alone.
+Every codec here carries an INERT banner at the head of its section above. The
+`--kv-quant`, `--kv-bits` and `--kv-preset` help says the same.
+`make check-kv-codec-disposition` derives the class from `ALL_KV_QUANTS` and the
+three decode predicates. It fails on a banner or a help entry that disagrees
+with the class. `make check-kv-codec-disposition-fixtures` measures that gate's
+recall. At resolve time, `validate_resolved` logs a `warn!` for every codec
+other than `none` whose packed store is never built.
 
-The probe's `store_skipped` column corroborates and does **not** classify: it
-is set when *any* layer-cache in the run logged the skip, and the layer-adaptive
-head/tail promotion types some layers `K8V8`, so a store-*reading* codec sets it
-too — `mixed_k8g64_v4g64` does, on Ternary-Bonsai-8B, where 10 of 36 layers are
-promoted. Bytes and the id digest are the deciding columns.
+`k8vturbo3tcq` and `k8vturbo3` share one decoder, `turbo_dequantize`. Only the
+encode differs, and the encode does not run on a cache with a mirror. The same
+holds for `k8vturbo2tcq` and `k8vturbo2`.
 
-**These are equivalent to `none`, and unselected — not dominated.** The first
-draft of this section said "dominated, strictly better on one axis (it does not
-carry a quantised layer type through dispatch)". That axis does not survive
-measurement: the ~0.041 ms/layer/step figure it rests on was re-measured after
-the packed-store elision and is **INCONCLUSIVE at all five ABBA cells** — see
-"`--kv-quant none` is a bf16 control", which states in the same words that with
-the store gone "a `K8V8` layer is a `None` layer under another name". Nothing in
-this class costs anything a measurement here can see, and nothing in it buys
-anything either.
+**Disposition: keep parseable and selectable.** The reasons:
 
-So the honest reading, axis by axis: resident KV identical (4 cells, exact
-bytes); output token ids identical (4 cells); decode throughput INCONCLUSIVE
-(5 ABBA cells); TTFT INCONCLUSIVE (the mirror family's own spread at Bonsai-8B
-32 768 is 18 320–20 582 ms, wider than any gap inside it). An operator who
-passes `--kv-quant iso3` gets bf16 KV under another name — no better, no worse,
-just not what the name says — which is why `validate_resolved` says so at
-`warn!` and why no `--kv-preset` row is described as a memory setting any more.
+1. **The store is the re-enable path.** A codec that gains a decode kernel over
+   its own store changes its arm in `decode_reads_packed_store`. `exit_prefill`
+   then builds the store that the kernel reads.
+2. **Recorded rows must stay readable.** `observations` is append-only, and
+   its rows name these codecs.
+3. **The widest-matrix goal.** `CLAUDE.md` names the rotation KV families as a
+   differentiator.
 
-##### Retirement policy: a preservation branch, never a plain delete
-
-An inert codec that is removed from the mainline is **retired, not deleted.**
-Removal only lands together with a **preservation branch** that keeps the codec
-intact — its encoder/decoder, its MSL kernels, its storage variant, its tests
-and its docs section — at a commit where it still builds and still passes its
-own suite. The point is revival: these families are research ports, and the
-reason a codec is inert today (no fused decode kernel over its own store, a
-sideband that eats the code width, a grid geometry that caps the shell) is a
-reason that a future kernel or layout change can remove. A codec deleted with no
-branch behind it cannot be re-measured against the change that would have made
-it viable.
-
-Rules:
-
-* **One preservation branch per family**, named `preserve/kv-<family>` and
-  pushed. Its tip must build and pass `make ci`.
-* **The removal PR names the branch and its tip SHA** in its description, and
-  the retired codec's row here is replaced by a line saying where it went.
-* **The retired CLI name keeps failing.** `KvQuant::FromStr` already has the
-  `Retired` arm used for `rot_k_tq4v` — a retired name must return that error
-  and name its successor (or say "retired, see `preserve/kv-<family>`"), never
-  become an alias and never silently parse. A recorded bench cell or a saved CLI
-  line must not keep running under a codec it does not name.
-* **Deletion has zero behavioural blast radius** — an inert codec's math never
-  executes on a prefill-bracketed flow, and the measurement above proves both
-  axes — but it is **not a small diff**. Each family touches 5–9 files of
-  exhaustive `match` arms (`quant.rs`, `storage/kv_storage.rs`, the `kvcache`
-  update/sdpa dispatchers, the SSD `layout_key`, the CLI parse + preset table,
-  and the disposition gate's expectations).
-
-To find a retired codec: `git branch -a --list 'preserve/kv-*'`.
-
-**What this does to the dominated-vs-unused split.** The word belongs to
-Class 3, not here. On the axes anything is measured on, `none` is strictly
-smaller than `mixed` and `rot_k` (1.339×–1.541×) and not slower than anything,
-but the eight iso and rotor codecs are all smaller than it — 0.456×–0.866× —
-so what dominates them is decode speed, not bytes; Class 2 merely ties it. The two classes
-are still kept for different reasons — see each disposition — but the reason is
-not that one is beaten and the other is not.
-
-**Disposition: keep parseable and selectable; stop advertising.** Not deleted,
-for three reasons, in descending order of force:
-
-1. **The store is the re-enable path.** `exit_prefill` keeps a bulk-encode arm
-   for each of them behind the predicate. A codec that grows a decode kernel
-   over its own store flips one arm in `decode_reads_packed_store` and the arm
-   fills the buffer that kernel reads. Deleting the codec deletes the landing
-   site, and the algorithm is not what failed — see "the tension", below.
-2. **Recorded rows must stay readable.** `observations` is append-only and
-   metrics labels are free-form; a name that has been recorded has to keep
-   parsing after it stops being recommended.
-3. **The widest-matrix goal.** CLAUDE.md names the rotation KV families as a
-   differentiator. Removing them would narrow the matrix without making
-   anything true.
-
-Two pairs inside this class are *exact duplicates* of each other rather than
-merely equivalent to `none`: the decoder of `k8vturbo3tcq` is bit-for-bit the
-plain `k8vturbo3` decoder and only the encode-time assignment differs, so while
-the encode never runs the two names are one behaviour; likewise `k8vturbo2tcq`
-and `k8vturbo2`. They are fold candidates the day a turbo decode kernel lands,
-and indistinguishable today.
+A withdrawn codec name keeps failing. `KvQuant::from_str` returns
+`KvQuantParseError::Retired`, which names the replacement. It is never an
+alias (§"`rot_k_tq4v` is rejected").
 
 #### Class 3 — reads its own packed store (10 codecs)
 
 `mixed_k<kb>g<kg>_v<vb>g<vg>`, `rot_k_v<vb>g<vg>`, `iso3_sym`, `iso4_sym`,
 `k_iso3`, `k_iso4`, `rotor3_sym`, `rotor4_sym`, `k_rotor3`, `k_rotor4`.
 
-These are the only codecs whose quantization a served request touches. **The
-iso and rotor families are both smaller than bf16 on every architecture, iso by
-more at every width; `mixed` / `rot_k` are smaller on one topology and larger on
-the other, because their bf16 mirror is retained exactly where a consumer layer
-reads it.**
+These are the only codecs whose quantization a served request uses:
 
-Measured as `kv_cache_bytes` from `rmlx baseline`, one harness on one host
-(`scripts/bench/codec_inertness_probe.sh`, `--max-tokens 200`). Residency is
-deterministic — every cell reproduced byte-for-byte across runs and across two
-independently built binaries — so these are exact, not medians. Each width has
-its own row: the dense code plane charges for the codebook bit, so a family's
-3-bit and 4-bit members no longer occupy the same bytes.
+- `mixed_*` and `rot_k_*` append to the MLX affine 3-tuples and read them at
+  every decode step (`mixed_quantized_sdpa`).
+- The K-only family (`k_iso*`, `k_rotor*`) appends K to the packed store at
+  every step, and the flash-decode arm reads it back.
+- The symmetric family (`iso*_sym`, `rotor*_sym`) decodes with a flash kernel
+  over both packed rings.
 
-| codec | e2b 4k | e2b 32k | Bonsai 4k | Bonsai 32k |
-|---|---:|---:|---:|---:|
-| `iso3_sym` | **0.550×** | **0.456×** | **0.610×** | **0.602×** |
-| `iso4_sym` | **0.601×** | **0.516×** | **0.656×** | **0.647×** |
-| `k_iso3` | **0.775×** | **0.728×** | **0.805×** | **0.801×** |
-| `k_iso4` | **0.800×** | **0.758×** | **0.828×** | **0.824×** |
-| `rotor3_sym` | **0.622×** | **0.541×** | **0.685×** | **0.676×** |
-| `rotor4_sym` | **0.673×** | **0.602×** | **0.732×** | **0.721×** |
-| `k_rotor3` | **0.811×** | **0.771×** | **0.843×** | **0.838×** |
-| `k_rotor4` | **0.836×** | **0.801×** | **0.866×** | **0.861×** |
-| `mixed_k8g64_v4g64` | 1.339× | 1.396× | in `runs.db`† | in `runs.db`† |
-| `rot_k_v8g64` | 1.541× | 1.533× | in `runs.db`† | in `runs.db`† |
+Residency (§"Memory and bit-rate summary"):
 
-A cell is above its store rate by the layer-adaptive boundary promotion, which
-takes ten of Bonsai's 36 layers out of the codec and charges bf16 for them; e2b
-has no promoted layer that owns a cache, which is why its column sits closest
-to the store figure (`iso3_sym` at 0.456× against a 0.445× store).
+- The eight iso and rotor codecs hold less than bf16 on every topology and at
+  every `head_dim`. Their `feeds_bf16_*` arms are constants that do not read
+  `shares_kv`. `iso_and_rotor_k_codecs_are_under_the_floor_at_every_geometry`
+  pins the sign.
+- `mixed_*` and `rot_k_*` hold less than bf16 on a stack without shared KV.
+  They hold more on a shared-KV stack, where the bf16 mirror stays.
 
-† The two Bonsai cells for `mixed` / `rot_k` were first measured on a binary
-that built the bf16 K/V mirror on **every** architecture. `exit_prefill` now
-builds each mirror only where a decode path reads it, and
-`feeds_bf16_{k,v}_at_decode` answers the cache's own `shares_kv` for exactly
-these two variants — so on a stack whose layers do not share K/V nothing reads
-the mirror and it is not allocated. Bonsai is such a stack; gemma-4-e2b is not,
-which is why its two columns stand and are the *reason* the mirror is kept at
-all.
+Decode: no codec in this class decodes faster than bf16 on every architecture
+and context (§"Fused flash-decode over a quant store").
 
-Those cells have since been re-measured on a dense stack. They are **not**
-re-typed here — both arms are rows in `runs.db`, which is where to read them:
-
-```bash
-rmlx metrics query "SELECT model, prompt_tokens, kv_quant, value \
-  FROM observations WHERE id BETWEEN 122793 AND 122804 \
-    AND metric = 'kv_cache_bytes' \
-  ORDER BY model, prompt_tokens, kv_quant"
-```
-
-Both architectures, both contexts, `--max-tokens 200`. `kv_cache_bytes` is
-`KvCache::resident_bytes` — a sum over live allocations, not the estimator — and
-residency is deterministic for a given (model, offset, codec), so one row per
-cell is the whole measurement. The result is the **sign flip**: on the dense
-stack these two now hold materially *less* than `none`; on the shared-KV stack
-they still hold more. One codec, two answers, exactly as
-`global_layer_store_plus_mirror_codec_sign_follows_shared_kv` predicts. For a
-codec outside that query, `rmlx info --list-cache-types` computes the
-per-topology figure and `mixed_layer_stack_delivered_bits_per_value`
-(`crates/rmlx-models/src/kv_cache/tests.rs`) pins the whole-stack rate from
-`LAYER_ADAPTIVE_HEAD_N` / `LAYER_ADAPTIVE_TAIL_N` rather than restating it.
-
-**The mirror elision is not the whole cause; the earlier attribution was
-wrong.** Walking one dense cell across the two commits shows the elision moves
-part of the distance and the later **in-family boundary floor** moves the rest.
-Read "the mirror elision inverted `mixed` on dense stacks" as an overstatement
-of a two-step change. Across the elision alone the token ids are bit-identical
-and `store_skipped` is unchanged — it moved bytes and nothing else — and its
-decode-neutrality, asserted when it landed, has since been measured
-INCONCLUSIVE against a pre-elision arm, i.e. no difference resolvable at that
-design's power.
-
-**The elision is not over-broad**, and this is measured rather than read off the
-`shares_kv` condition: gemma-4-e2b is byte-identical *and*
-greedy-digest-identical across the commit's parent, the commit, and main — all
-three codecs, both contexts, both generation lengths. The e2b columns above also
-reproduced on the post-elision binary, which is the instrument check on the arm
-that did not move.
-
-**Do not certify a codec inert from a short generation.** At `--max-tokens 32`
-these cells give `mixed` and `rot_k` the same greedy digest on Bonsai at 4k, and
-`rot_k` reproduces `none`'s digest exactly at 32k; at 200 tokens all three
-separate. A digest match at 32 tokens is not evidence of an inert codec, and
-`scripts/bench/codec_inertness_probe.sh` is wrong on main where it says `mixed_*`
-sets `store_skipped` on Bonsai — the in-family floor promotes it to a
-store-reading variant.
-
-The iso / rotor rows are the ring-layout result restated on real serving. Both
-families spend one whole `u32` code word per group; iso's group is 4 head-dim
-slots and rotor's is 3, so before any sideband iso stores 8 bits per value and
-rotor 10.67. Halving the two sideband planes took 4.125 bits per value off iso
-and 5.5 off rotor, which is enough to put iso under bf16's 16.0 at every
-geometry and not enough to put rotor under it at any. The rotor rows moved by
-20% and stayed on the wrong side of 1.0, which is the shape of the conclusion:
-**the rotor overrun is a code cadence, and a sideband change cannot fix one.**
-
-Decode speed did not pay for the bytes. ABBA-interleaved,
-`scripts/perf_ab.sh`, 12 slots (8 at 32k), `--max-tokens 100`, the two binaries
-verified distinct by sha256 and by a symbol: Bonsai `iso3_sym` 4k **+2.23%
-(SEPARATED)**; Bonsai `rotor3_sym` 4k +0.71%, Bonsai `iso3_sym` 32k +0.31%,
-e2b `iso3_sym` 4k +0.27%, e2b `k_rotor3` 4k +0.02% — all four INCONCLUSIVE,
-i.e. slot ranges overlap and the point estimate is not evidence of a
-difference. No cell regressed. The e2b `k_rotor3` cell also generated
-**identical token ids** in every one of its 12 slots.
-
-The `mixed` / `rot_k` seed elision has landed, and it is topology-conditional
-rather than unconditional: the bf16 K/V mirror is what a cross-layer-KV
-architecture's consumer layers read, so it is retained there and elided
-everywhere else. Their **decode** result does not depend on which side of that
-they fall — returning an unread seed frees memory, it does not speed a
-quantized-matmul decode — and is measured at 0.763× of `none` at 130 848 tokens
-with the arms' ranges disjoint. That claim is asserted from the mechanism, not
-measured against a pre-elision arm; the decode cell that would settle it is
-open.
-
-**Disposition: keep. The four iso rows are memory levers on every
-architecture; `mixed` / `rot_k` are one on a dense architecture and the
-opposite on a shared-KV one; the rotor rows are neither.** `k_iso3/4` and
-`iso3_sym/4_sym` hold 0.76–0.92× `none`'s resident KV in all four cells at no
-measured decode cost, and they hold it unconditionally: their `feeds_bf16_*`
-arms are constants and never consult `shares_kv`. `mixed` / `rot_k` hold their
-packed store alone where nothing reads the mirror and the store *plus* two full
-bf16 buffers where something does — one codec, two answers, and the sign of
-each is pinned by `global_layer_store_plus_mirror_codec_sign_follows_shared_kv`
-(`crates/rmlx-kv-quant/src/quant_tests.rs`). The rotor rows are above `none` on
-every topology, and `mixed` is also slower at long context (0.763× at 130 848
-tokens, ranges disjoint). The dominated ones are kept anyway, and the reason is
-not that they are competitive: they are the only other codecs in the tree that
-decode over a packed store at all, so they are the substrate any fused-decode
-work has to stand on, and a dominated codec with a function is not the same
-object as a beaten one with none.
-
-Being dominated today is a statement about the ring layout and about ε (the
-byte-to-time conversion efficiency, ≈0.04–0.135 on every path measured, and
-shared with a non-MLX runtime on the same hardware), not about the codecs.
-
-Four **within-family** dominations are measured here, and they are exact:
-`iso3_sym` and `iso4_sym` are byte-identical in all four cells, as are
-`k_iso3`/`k_iso4`, `rotor3_sym`/`rotor4_sym` and `k_rotor3`/`k_rotor4`. The
-3-bit member of each pair therefore buys nothing over the 4-bit member and
-carries measurably worse distortion. They are the tree's only strictly
-dominated-by-a-sibling codecs and the first fold candidates, tracked
-separately; the pairing is recorded here because the probe shows it at four
-cells rather than at a fixture.
-
-#### The tension with the widest-matrix goal
-
-CLAUDE.md sets out to ship "the widest weight × KV quantization matrix MLX can
-express, including rotation-based KV families no other MLX server ships". A
-disposition that retired codecs would be in direct tension with that, and the
-tension is not resolved by preferring one side.
-
-What the evidence indicts is **the ring layout and the byte-to-time
-conversion**, not the algorithms. The scale-beside-the-word layout is what puts
-iso/rotor above 16 bits per value; a layout that packs scales separately is
-unbuilt and open. ε is a platform property — an independent runtime's fused
-decode over a quantised KV store loses ~30% on the same hardware, and its
-efficiency is statistically the same as this tree's best kernel — so "our codec
-implementation is bad" is not what the numbers say. Deleting a codec would
-remove a differentiator on evidence that convicts something else.
-
-So the matrix stays whole, and what changes is the **claim**: rMLX ships 28 KV
-codecs, 17 of which are presently inert and 10 of which are presently larger
-than bf16, and it says so in `--help`, in a resolve-time `warn!`, and here.
-That is the honest form of the same capability. A codec matrix nobody can be
-misled by is worth more than one name fewer.
-
-#### What this disposition does not decide
-
-* **Whether any codec should eventually be deleted.** That turns on whether the
-  re-enable path can be made to pay. It is decided by a fused decode kernel over
-  a packed store that beats bf16 at a context this tree can serve — not by
-  another residency measurement. The residency axis is **settled, not
-  saturated**: iso is under bf16 on every topology, `mixed` / `rot_k` are under
-  it on a dense stack and over it on a shared-KV one, and rotor is over it
-  everywhere. An earlier revision of this bullet read "saturated at *no codec is
-  smaller*", which the table above already contradicted.
-  What that kernel has to beat is now bounded from the other side too — see
-  "The decode ceiling", which measures the shell rather than the codec
-  arithmetic as the majority of the gap.
-* **Whether a better ring layout clears 16 bits/value for iso/rotor.** Nothing
-  measured here touches it; the layout, not the algorithm, is what fails.
-* **Which member of a byte-identical 3-bit/4-bit pair survives a fold.** The
-  bytes are settled (identical); the distortion comparison that would pick a
-  survivor is a fidelity question, not a residency one.
+**Disposition: keep.** Each is a memory setting where it holds less than bf16.
+They are also the only codecs that decode over a packed store, so any
+fused-decode work builds on them.
 
 ### `kv_frac` bounds a codec claim — and is not a statement about context
 
-`kv_frac` is the KV share of a decode step's byte stream,
-`kv_bytes_step / (weight_bytes_step + kv_bytes_step)`. It is the ceiling on how
-much of decode any KV-codec change can possibly touch, and
-`scripts/perf_ceiling.py` prints it in the last column of every row.
+`kv_frac` is the KV share of the bytes a decode step reads:
+`kv_bytes_step / (weight_bytes_step + kv_bytes_step)`. It is the ceiling on the
+part of decode that a KV codec can change. `scripts/perf_ceiling.py` prints it
+in the last column of every row. It reads `config.json` and the safetensors
+index and runs no model. `make check-kv-byte-model-parity` holds its KV byte
+model to the engine's.
 
 **It is a property of the (model, context) pair, not of the context.** At a
-4096-token prompt it spans 22× across the release set. This table is a **static
-prediction** — `perf_ceiling.py` over `config.json` plus the safetensors index,
-no model launched — unlike the measured cells below it:
+4 096-token prompt the script gives 0.010 for Qwen3.8-27B-mxfp8 and 0.221 for
+Ternary-Bonsai-8B-2bit. So "measured at 4k" does not mean "measured where the
+codec axis is near zero".
 
-| model | 4 096 | 8 192 | 32 768 | 131 072 |
-|---|---:|---:|---:|---:|
-| Qwen3.8-27B-mxfp8 (26.4 GB/step of weights) | 0.010 | 0.020 | 0.075 | 0.245 |
-| Qwen3.6-35B-A3B-8bit (MoE, 3.1 GB/step) | 0.026 | 0.051 | 0.177 | 0.462 |
-| gemma-4-e2b-mxfp8 (SWA on most layers) | 0.030 | 0.053 | 0.170 | 0.445 |
-| Ternary-Bonsai-8B-2bit (2.1 GB/step) | **0.221** | **0.362** | **0.694** | 0.901 ‡ |
+A large `kv_frac` is necessary, not sufficient. ε decides how much of the
+bound a fused kernel collects. State `kv_frac` and the **K bit width** next to
+every codec cell. Do not infer an effect from `kv_frac` alone.
 
-‡ Arithmetic only. Bonsai-8B's `max_position_embeddings` is below 131 072 and
-the engine refuses a prompt past it with no override, so no cell at that column
-can be run on this model — the projection is not a target anyone can measure.
-Check the ceiling in the snapshot's `config.json` before designing a
-long-context cell around a model; a second, independent cap
-(`--max-prompt-tokens`) hard-errors on the GPU path and is easy to hit first.
-
-So "measured at 4k" and "measured where the codec axis is near-zero" are not
-the same qualifier, and a claim scoped by the first is not scoped by the
-second. A 2-bit 8B model at a 4k prompt already puts 22% of its decode bytes on
-the codec axis; a dense 27B at 131k puts 25%.
-
-**A large `kv_frac` is necessary, not sufficient — at 8-bit K.** Every cell in
-this table is `mixed_k8g64_v4g64`, so every conclusion drawn from it is scoped
-to a **K side of 8 bits**. That scope turned out to be load-bearing; see "The
-null was a bit-width result" below before generalising any of it. Measured on
-this tree, `none` vs `mixed_k8g64_v4g64` ABBA-paired (`scripts/perf_ab.sh`, n=4/arm; the
-two Qwen3.8 cells untainted at 7.0–7.3 % foreign CPU, the two Bonsai cells
-tainted only by a monitoring process at their entry gate — see
-docs/PERF_BASELINE.md for per-cell conditions and spreads):
-
-| model | prompt tok | `kv_frac` | predicted ceiling B/A | measured decode B/A | measured resident B/A |
-|---|---:|---:|---:|---|---:|
-| Ternary-Bonsai-8B | 3 770 | 0.211 | 1.099 | 0.975 ranges disjoint | withdrawn† |
-| Ternary-Bonsai-8B | 31 553 | **0.687** | **1.419** | 1.002 INCONCLUSIVE | withdrawn† |
-| Qwen3.8-27B | 3 892 | 0.010 | 1.004 | 0.977 SEPARATED | withdrawn† |
-| Qwen3.8-27B | 130 848 | 0.245 | 1.149 | **0.763 SEPARATED** | withdrawn† |
-
-† All four are dense stacks, and arm B's resident figures were measured before
-the `Mixed` / `RotK` mirror became conditional on `shares_kv`. Every one of them
-was a measurement of two bf16 buffers a dense arch no longer allocates, so they
-are withdrawn rather than corrected in place. The Bonsai cells have since been
-re-measured post-elision — read them from `runs.db` via the query in
-§"Class 3", not from prose. The Qwen3.8 cells have not been re-measured and no
-substitute figure is offered for them. The `kv_frac` and `predicted ceiling B/A`
-columns are arm A (`none`) and arm B respectively, from
-`scripts/perf_ceiling.py` at the measured cache offset (`prompt_tokens +
-max_tokens - 1`); arm A is unaffected, arm B's prediction came from the same
-pre-elision byte model and reads **low** — `make check-kv-byte-model-parity`
-now binds that model to the engine's, so the re-derivation is a re-run of the
-script rather than a re-typing. The decode columns, which are the argument this
-table carries, are untouched by any of it.
-
-Two rows carry the argument. The Bonsai **31 553** row is the high-`kv_frac`
-end: at 0.687 — the largest any release-set model reaches *at a context this
-tree can serve* — a codec that cuts the decode KV stream to 0.571× and is
-predicted +42% moves decode by +0.3%, inside the noise: a null with the power
-to have seen a 1% effect, since the arm spreads there are 0.04% and 0.15%. The
-Qwen3.8 **130 848** row is the long-context end: `kv_frac` 0.245, predicted
-+14.9%, measured **−23.7% with the arms' per-slot ranges disjoint in the losing
-direction**. Both rows' resident columns are withdrawn per † and neither
-conclusion rests on one.
-
-**Scope on arm B.** It is `mixed_k8g64_v4g64` measured while it retained both
-bf16 seeds on every architecture. It still materialises a packed store — that
-family's decode reads it, so `materialises_packed_store()` is invariant for it —
-but the seeds are now built only where `shares_kv`, and none of these four cells
-is such an arch. Its **resident** figures are therefore pre-elision and are
-withdrawn above. Its **decode** figures need no post-elision arm — returning an
-unread seed frees memory, it does not speed a quantized-matmul decode — so the
-throughput result stands for the family either way. That last step is reasoning
-from the mechanism, not a measurement: no decode cell has been run against a
-pre-elision Mixed arm.
-
-The byte model is not what is wrong. At those offsets `perf_ceiling.py` puts
-arm A's resident KV at 4 667.3 MB against 4 667.3 MB measured on Bonsai, and on
-Qwen3.8 it is exact once the codec-independent GDN recurrent state that arch
-carries (a flat ~152–154 MB, identical on both arms at both contexts) is added
-back. What fails is the conversion of bytes into time — the ε of the section
-above, ≈0.04–0.135 on every path measured — and at the Qwen3.8 long cell the
-packed path does not merely fail to convert: its non-bandwidth per-step cost
-grows 12.0 → 44.2 ms between 3 892 and 130 848 tokens while `none`'s stays flat
-at 10.5 → 14.7, so halving the byte stream still loses.
+Before you design a long-context cell, check the model's positional capacity:
+`max_position_embeddings`, extended by a `rope_scaling` in `config.json` or by
+`--yarn-factor`. `rmlx baseline` refuses a `--max-ctx` above that capacity.
+On `--device gpu` it also refuses a prompt longer than the context ceiling,
+unless `--allow-truncate` or `--max-prompt-tokens` is given.
 
 #### The null was a bit-width result, not a context result
 
-Every cell above holds K at 8 bits. The same harness, the same model and the
-same ABBA design were later run with **K at 4 bits** (`mixed_k4g64_v4g64`), and
-the sign changes: on the dense 8B target the 4-bit-K arm beats `none` with the
-arms' per-slot ranges disjoint, at a 32k prompt and again at a 63k one — where
-the 8-bit-K arm at the identical shapes returns INCONCLUSIVE.
+At 8-bit K, `mixed_k8g64_v4g64` does not decode faster than `none`, even at
+the highest `kv_frac` of the release set. On Qwen3.8-27B at a 130 848-token
+prompt it decodes slower. At 4-bit K, `mixed_k4g64_v4g64` decodes faster than
+`none` on Ternary-Bonsai-8B at 32k and 63k prompts, with disjoint per-slot
+ranges.
 
-The earlier null is **sound, and was not a measurement error.** One of the new
-cells independently reproduces this table's Bonsai 31 553 row — same model,
-same context, same shape, a different session — and lands on the same verdict.
-It was measured at the wrong K width. No 4-bit-K cell existed anywhere in this
-tree until then.
-
-Read the consequence narrowly, because it is narrower than "quantized KV wins":
-
-* **"Quantized KV always loses at decode" is retired.** That was a statement
-  about 8-bit K which had been reading as a statement about codecs.
-* **The win is on the `Mixed` path, through MLX's `quantized_matmul`** — not on
-  a fused flash-decode kernel over a packed store. It does not transfer to the
-  iso / rotor / planar ring, and it is neither evidence for nor against §"The
-  decode ceiling".
-* **It is not a long-context effect.** It holds at 32k as well as 63k. On a
-  low-`kv_frac` substrate the 8→4 bit change moves decode by a rounding error
-  while cutting the store substantially, so the gain is not bandwidth being
-  converted. On that same substrate the `Mixed` path *loses*, and loses harder
-  at longer context — which localises a per-step cost that grows with `kv_seq`
-  and does **not** shrink when the store shrinks. That cost is inferred from the
-  pairing, not localised in code; localising it is the open item, not
-  re-encoding the codec.
-
-Cells, arms, per-slot values and byte counts:
-
-```bash
-rmlx metrics query "SELECT id, model, prompt_tokens, kv_quant, metric, value \
-  FROM observations WHERE id BETWEEN 122807 AND 122836 \
-  ORDER BY model, prompt_tokens, kv_quant, metric, id"
-```
-
-One binary for both arms of every comparison, `--kv-quant` and `--max-ctx`
-explicit per slot, arm A `none`, six measured slots per arm after one untimed
-warmup. Two of the comparisons deliberately returned INCONCLUSIVE on a clean
-host, which is the negative control: the harness is not merely emitting
-SEPARATED.
-
-Read together with the ε table: **`kv_frac` bounds the prize, ε decides how much
-of it is collectable, and ε is the binding term on the fused-kernel path.**
-State `kv_frac` next to a codec cell so a reader can see the bound; do not infer
-an effect from it — and state the **K bit width** too, since a cell that omits
-it cannot be compared with one that chose differently.
+- The win is on the `Mixed` path, through MLX `quantized_matmul`. It does not
+  transfer to a fused flash-decode kernel over the iso, rotor or planar ring
+  (§"The decode ceiling").
+- It is not a long-context effect: it holds at 32k and at 63k.
+- On a low-`kv_frac` model the `Mixed` path loses at 4-bit K too, and it loses
+  more at longer context. So a per-step cost that grows with `kv_seq` sits on
+  that path and does not shrink with the store. No code site for it is known.
 
 ---
 

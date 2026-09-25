@@ -968,8 +968,8 @@ The table above is the measured basis for a proposal to lift the `mixed_*`
 decode path from 227.8 GB/s to ≥ 400 GB/s on its own layers, alongside a
 proposal to re-index the fused flash-decode grid by KV head. **Both are
 answered negative and neither should be scheduled as a throughput lever.** The
-argument, its artifacts and the one cell that stays open are in
-`docs/KV_QUANT.md` § "Lifting ε does not pay — answered negative". In summary,
+grid geometry and the issue-bound profile behind it are in
+`docs/KV_QUANT.md` § "Why ε is small — grid geometry". In summary,
 against this section's numbers:
 
 * The ≥ 400 GB/s pass criterion presumes a bandwidth bound. GPU counters on the
