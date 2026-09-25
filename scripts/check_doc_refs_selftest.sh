@@ -76,6 +76,17 @@ Notes that nothing reads.
 
 The retry cap is in § "Retry budget".
 Both `B.md` or §"Retry budget" hold it. The table § below lists them.
+The cap is § line 3 of the table.
+
+**Budget rule.** Two retries at most.
+
+## Scope — the long form
+
+The long form.
+
+## Scope
+
+The short form.
 EOF
 cat >"${BASE}/docs/B.md" <<'EOF'
 # B
@@ -89,7 +100,7 @@ Eviction: `docs/A.md` §
 Readback: `docs/A.md`
 § "Evict-to-budget (runtime)".
 EOF
-printf '# Guide\n' >"${BASE}/docs/GUIDE.md"
+printf '# Guide\n\nSome text.\n**Glued.** Not a paragraph start.\n\n**Binary** has no period.\n' >"${BASE}/docs/GUIDE.md"
 printf '# Out\n\nSee `docs/NOWHERE.md`.\n' >"${BASE}/docs/OUT.md"
 cat >"${BASE}/CLAUDE.md" <<'EOF'
 # guide
@@ -128,6 +139,12 @@ const RAW: &str = r#"docs/A.md
 § "Evict-to-budget""#;
 const ESC: &str = "docs/A.md \
     § \"Evict-to-budget (runtime)\"";
+EOF
+cat >"${BASE}/crates/c/src/more.rs" <<'EOF'
+//! Rule: `docs/A.md` § "Budget rule".
+//! Scope: `docs/A.md` § "Scope".
+//! Moved: `docs/GUIDE.md` § Zeta.
+//! Glued: `docs/GUIDE.md` § "Glued"; binary: `docs/GUIDE.md` § "Binary".
 EOF
 cat >"${BASE}/crates/c/m.sql" <<'EOF'
 -- Cost: docs/A.md under "Cost of the host path".
@@ -240,6 +257,11 @@ create_later_doc() {
         append CLAUDE.md $'| [`docs/LATER.md`](docs/LATER.md) | Later |\n'
 }
 
+cite_ambiguous_memo() {
+    append docs/A.md $'\n## Memo — first\n\nOne.\n\n## Memo — second\n\nTwo.\n' &&
+        append crates/c/src/more.rs $'//! Memo: `docs/A.md` § "Memo".\n'
+}
+
 noop() { :; }
 
 echo "check_doc_refs selftest:"
@@ -248,7 +270,7 @@ case_ clean 0 "OK: " \
     "an unedited tree passes" noop
 case_ base_is_printed 0 "base: HEAD (" \
     "the run prints the base it compared with" noop
-case_ carried_is_noted 0 "note: 5 reference(s) already broken at the base, carried:" \
+case_ carried_is_noted 0 "note: 8 reference(s) already broken at the base, carried:" \
     "a reference already broken at the base is carried, not failed" noop
 case_ unconsumed_prose_deleted 0 "OK: " \
     "deleting a section nothing reads passes" \
@@ -332,9 +354,15 @@ case_ wrapped_hash_comment 1 "scripts/s.py:6: SECTION docs/A.md 'Evict-to-budget
 case_ wrapped_markdown_line 1 "docs/B.md:9: SECTION docs/A.md 'Evict-to-budget (runtime)' — resolves to nothing" \
     "a doc name ending one Markdown line and § starting the next is one citation" \
     edit docs/A.md $'## Evict-to-budget (runtime)\n' ''
-case_ duplicate_title_refused 1 "names 'Retry budget', which 2 headings carry; make the heading unique" \
+case_ duplicate_title_refused 1 "names 'Retry budget', and 2 headings answer to it; make the heading unique" \
     "a citation to a title that two headings carry fails" \
     append docs/A.md $'\n## Retry budget\n\nAgain.\n'
+case_ short_name_ambiguity_refused 1 "names 'Memo — first', and 2 headings answer to it; make the heading unique" \
+    "a phrase that two titles answer by short name, with no exact title, fails" \
+    cite_ambiguous_memo
+case_ unquoted_name_is_its_own_carry_key 1 "crates/c/src/more.rs:3: SECTION docs/GUIDE.md 'Zeta' — resolves to nothing" \
+    "a carried unquoted citation that turns quoted is a new citation, not the carried one" \
+    edit crates/c/src/more.rs '§ Zeta.' '§ "Zeta".'
 case_ edited_doc_carries_nothing_in 1 "SECTION docs/GUIDE.md 'Nothing here' — resolves to nothing; this change edits that doc, so fix it here" \
     "a change that edits a doc must fix every broken reference into it" \
     append docs/GUIDE.md $'\nMore text.\n'
@@ -388,7 +416,7 @@ case_ map_row_wrong_target 1 "MAPROW docs/B.md 'docs/A.md' — resolves to nothi
 case_ new_citation_to_nothing 1 "SECTION docs/A.md '9' — resolves to nothing" \
     "a new citation to a section that never existed fails" \
     append crates/c/src/lib.rs $'//! More: `docs/A.md` §9.\n'
-case_ carried_reference_moved 0 "note: 5 reference(s) already broken at the base, carried:" \
+case_ carried_reference_moved 0 "note: 8 reference(s) already broken at the base, carried:" \
     "moving an already-broken reference to another file carries it" \
     move_gone_citation_to_script
 case_ carried_reference_copied 1 "PATH docs/GONE.md — resolves to nothing" \
@@ -399,15 +427,37 @@ case_ changelog_never_fails 0 "note: 1 broken reference(s) in CHANGELOG.md (rele
     edit docs/A.md $'## Old story\n\nA dated measurement that only the changelog cites.\n\n' ''
 
 list_out="$(python3 "${TOOL}" --root "${BASE}" --list 2>&1)"
-verdict prose_pointer_is_not_a_section 0 "SECTION	docs/A.md:56	docs/A.md	Retry budget" \
-    "the --list inventory holds the real same-doc citation" 0 "${list_out}"
-if printf '%s' "${list_out}" | grep -qE $'\tbelow\t|\tabove\t'; then
-    verdict prose_below_is_not_a_section 0 "no SECTION keyed on below or above" \
-        "§ below / § above are prose, not a section name" 1 "${list_out}"
-else
-    verdict prose_below_is_not_a_section 0 "absent" \
-        "§ below / § above are prose, not a section name" 0 "absent"
-fi
+# list_case <name> <present|absent> <extended regex over --list lines> <what it proves>
+list_case() {
+    local name="$1" mode="$2" pattern="$3" what="$4" got=absent
+    printf '%s\n' "${list_out}" | grep -qE -- "${pattern}" && got=present
+    if [ "${got}" = "${mode}" ]; then
+        PASSED=$((PASSED + 1))
+        printf '  ok   %-38s — %s\n' "${name}" "${what}"
+    else
+        FAILED=$((FAILED + 1))
+        printf '  FAIL %-38s (want %s: %q) — %s\n' "${name}" "${mode}" "${pattern}" "${what}"
+    fi
+}
+T=$'\t'
+list_case same_doc_citation_listed present "^SECTION${T}docs/A.md:56${T}docs/A.md${T}Retry budget${T}Retry budget$" \
+    "the --list inventory holds the same-doc citation and what it resolves to"
+list_case run_in_heading_resolves present "^SECTION${T}crates/c/src/more.rs:1${T}docs/A.md${T}Budget rule${T}Budget rule$" \
+    "a **Title.** paragraph opening is a heading"
+list_case run_in_needs_paragraph_start present "^SECTION${T}crates/c/src/more.rs:4${T}docs/GUIDE.md${T}Glued${T}BROKEN$" \
+    "a bold opening that does not start a paragraph is not a heading"
+list_case run_in_needs_period_or_colon present "^SECTION${T}crates/c/src/more.rs:4${T}docs/GUIDE.md${T}Binary${T}BROKEN$" \
+    "a bold opening with no period inside and no colon after is not a heading"
+list_case exact_title_beats_short_name present "^SECTION${T}crates/c/src/more.rs:2${T}docs/A.md${T}Scope${T}Scope$" \
+    "an exact title wins over an earlier heading that has the phrase as its short name"
+list_case dash_short_name_resolves present "^SECTION${T}scripts/s.py:4${T}docs/A.md${T}Known-bad rows${T}Known-bad rows — already in the DB$" \
+    "the part of a title before ' — ' names the heading"
+list_case paren_short_name_resolves present "^SECTION${T}crates/c/src/wrap.rs:4${T}docs/A.md${T}Evict-to-budget${T}Evict-to-budget \(runtime\)$" \
+    "a title without its trailing parenthetical names the heading"
+list_case prose_below_is_not_a_section absent "^SECTION${T}[^${T}]*${T}[^${T}]*${T}(below|above)( [^${T}]*)?${T}" \
+    "§ below and § above are prose, not a section name"
+list_case prose_line_is_not_a_section absent "^SECTION${T}[^${T}]*${T}[^${T}]*${T}lines?( [^${T}]*)?${T}" \
+    "§ line N is prose, not a section name"
 
 run_exit absolute_mode_fails_on_an_old_break 1 "PATH docs/GONE.md — resolves to nothing" \
     "without a base, a reference broken since the base is a failure" --root "${BASE}"

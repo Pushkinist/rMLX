@@ -28,12 +28,15 @@ backslash) the break carries.
            whose label and link name the same file (MAPROW: a row whose label
            and link differ)
 
-A heading is a Markdown `#` heading or a run-in heading, a paragraph that
-opens `**Title.**`. A phrase names a heading exactly when it equals the
-title, the title before its first ` — `, or either without a trailing
-parenthetical. Phrases compare without backticks, asterisks, case and runs of
-whitespace. A citation to a title, or a section number, that two headings
-carry fails: make the heading unique.
+A heading is a Markdown `#` heading or a run-in heading: a paragraph (after a
+blank line) that opens with a bold title ending in a period inside the bold,
+`**Title.**`, or in a colon after it, `**Title**:`. A phrase names a heading
+by its exact title (section number removed) first, across both kinds; only
+when no title is exact does it name one by a short name: the title before its
+first ` — `, or either without a trailing parenthetical. Phrases compare
+without backticks, asterisks, case and runs of whitespace. A citation that
+two headings answer at the same step, or a section number two headings carry,
+fails: make the heading unique.
 
 Readers it does parse, and so holds a cut to: every citation above in code,
 scripts, docs, `README.md` and `CLAUDE.md`; the section names in CLI help
@@ -130,7 +133,9 @@ COMMENT_LEADER = re.compile(r"\\?\n\s*(?://[/!]?|#|\*|>|--)?\s*")
 FIXTURE_PATH = re.compile(r"^scripts/[^/]+_(?:selftest|fixtures)\.sh$")
 FIXTURE_MARKER = re.compile(r"^\s*(?:#|//)\s*doc-refs: fixture\b", re.M)
 # A run-in heading: a paragraph that opens with a bold title, `**Title.** Text`.
-RUN_IN = re.compile(r"^\*\*([^*\n]+?)\.?\*\*")
+# A run-in heading opens a paragraph with a bold title that ends in a period
+# inside the bold, `**Title.** Text`, or in a colon after it, `**Title**: Text`.
+RUN_IN = re.compile(r"^\*\*([^*\n]+?)(?:\.\*\*|\*\*:)")
 EXPLICIT_ID = re.compile(r"""<a\s+(?:id|name)=["']([^"']+)["']""")
 
 
@@ -242,49 +247,58 @@ def short_names(title: str) -> set[str]:
 class Doc:
     lines: list[str]
     headings: list[str]
-    run_ins: list[str]
+    named: list[str]
     anchors: set[str]
     flat: str
 
-    def heading_named(self, phrase: str, runs_on: bool = False) -> str | None:
-        """The heading that a short name of carries the phrase (see
-        `short_names`). An unquoted name (`runs_on`) may also run on into the sentence
-        past a title, or stop short of one; the longest title it runs past
-        wins, then the first title it starts."""
+    def heading_candidates(self, phrase: str, runs_on: bool = False) -> list[str]:
+        """The headings a phrase names, in doc order, from the first tier that
+        answers: the exact title (section number removed), then a short name
+        (see `short_names`). An unquoted name (`runs_on`) may then run on into
+        the sentence past a title (the longest wins) or stop short of one (the
+        first wins). More than one candidate is an ambiguous citation."""
         want = phrase.lower()
-        titles = [(heading_words(t)[1].lower(), t) for t in self.headings + self.run_ins]
-        for name, title in titles:
-            if want in short_names(name):
-                return title
-        if not runs_on:
-            return None
-        inside = [(len(name), title) for name, title in titles if name and (want + " ").startswith(name + " ")]
+        titles = [(heading_words(t)[1].lower(), t) for t in self.named]
+        exact = [t for name, t in titles if name == want]
+        if exact:
+            return exact
+        short = [t for name, t in titles if want in short_names(name)]
+        if short or not runs_on:
+            return short
+        inside = [(len(name), t) for name, t in titles if name and (want + " ").startswith(name + " ")]
         if inside:
-            return max(inside)[1]
-        return next((title for name, title in titles if name.startswith(want)), None)
+            return [max(inside)[1]]
+        return [t for name, t in titles if name.startswith(want)][:1]
 
-    def headings_like(self, title: str, by_number: bool) -> int:
-        """How many headings carry this title's section number, or its name."""
-        number, name = heading_words(title)
-        if by_number:
-            return sum(1 for t in self.headings if heading_words(t)[0] == number)
-        return sum(1 for t in self.headings + self.run_ins if heading_words(t)[1].lower() == name.lower())
+    def heading_named(self, phrase: str, runs_on: bool = False) -> str | None:
+        found = self.heading_candidates(phrase, runs_on)
+        return found[0] if found else None
+
+    def carriers(self, ref: "Ref") -> int:
+        """How many headings the reference could mean: headings with its
+        section number, or candidates for its phrase."""
+        if ref.key[0].isdigit():
+            return sum(1 for t in self.headings if heading_words(t)[0] == ref.key)
+        return len(self.heading_candidates(ref.key, ref.runs_on))
 
 
 def parse_doc(text: str) -> Doc:
-    headings, run_ins, anchors, seen = [], [], set(), Counter()
+    headings, named, anchors, seen = [], [], set(), Counter()
+    previous = ""
     for line in unfenced(text).split("\n"):
         m = re.match(r"(#{1,6})\s+(.*?)\s*#*\s*$", line)
         if m:
             title = m.group(2)
             headings.append(title)
+            named.append(title)
             base = slug(title)
             anchors.add(base if seen[base] == 0 else f"{base}-{seen[base]}")
             seen[base] += 1
-        elif r := RUN_IN.match(line):
-            run_ins.append(r.group(1))
+        elif not previous.strip() and (r := RUN_IN.match(line)):
+            named.append(r.group(1))
         anchors.update(EXPLICIT_ID.findall(line))
-    return Doc(text.split("\n"), headings, run_ins, anchors, plain(text))
+        previous = line
+    return Doc(text.split("\n"), headings, named, anchors, plain(text))
 
 
 class Tree:
@@ -518,10 +532,10 @@ def main(argv: list[str] | None = None) -> int:
             problem = f"re-pointed: was {squash(before)[:70]!r}, now {squash(got)[:70]!r}"
         elif ref.kind in ("SECTION", "QUOTE") and got != "body text":
             title = got.removeprefix("heading: ")
-            carriers = head.docs[ref.doc].headings_like(title, ref.key[0].isdigit())
+            carriers = head.docs[ref.doc].carriers(ref)
             if carriers < 2:
                 continue
-            problem = f"names {title!r}, which {carriers} headings carry; make the heading unique"
+            problem = f"names {title!r}, and {carriers} headings answer to it; make the heading unique"
         else:
             continue
         if ref.citing == RELEASED_HISTORY:

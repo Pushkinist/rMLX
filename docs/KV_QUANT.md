@@ -2483,7 +2483,7 @@ where `*` is the **Hamilton product** and `v ∈ ℝ⁴` is treated as a quatern
 
 **Dequantize:** unpack → centroid lookup → rescale → inverse rotate → renorm.
 
-**Memory truth.** iso spends, per 4-element group, four codes in the row's
+**Iso memory truth.** iso spends, per 4-element group, four codes in the row's
 dense code plane (`bits` each — see `crate::code_plane`) **and** one scale at
 the ring's sideband dtype (`bf16`), plus one `bf16` norm per token. At
 head_dim=128 that is 114 B per token per kv_head for iso3 against bf16's 256 B

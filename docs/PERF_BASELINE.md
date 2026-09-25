@@ -285,7 +285,7 @@ stored one `u32` code word plus one **`f32`** scale per group, so no member was
 ever smaller than bf16. The scale and norm planes have since been narrowed to
 `KV_SIDEBAND_DTYPE` and the codes packed densely across a row's groups:
 **iso3 stores 7.125 bits/value at head\_dim=128, iso4 8.125, rotor3 8.750 and
-rotor4 9.750**, all under bf16's 16.0 (see `docs/KV_QUANT.md` "Memory truth").
+rotor4 9.750**, all under bf16's 16.0 (see `docs/KV_QUANT.md` "Iso memory truth").
 Decode is still several times `none`'s for every member, which is the part that
 has not moved. Bench them for kernel work and quality study; both tiers are
 memory candidates, neither is a throughput one.

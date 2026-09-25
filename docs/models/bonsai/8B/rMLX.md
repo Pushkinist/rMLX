@@ -108,7 +108,7 @@ discarded. Bar (§3): WIN / TIE-on-noise / LOSS.
   length it exists to serve.
 - **A mid/long-context regression was reported across 11 codecs (−6…−34% at
   16k–64k) and filed as issue #293. Re-measurement retracts most of it — see
-  §4.2.** Two things were wrong. (a) The grouping label "non-kernel-dispatching
+  §4 item 2.** Two things were wrong. (a) The grouping label "non-kernel-dispatching
   codecs" is not what the code says: `KvQuant::carries_msl()` is `true` for all
   eleven (only `none` carries no MSL at all), and
   `KvQuant::cpu_hot_path_reason()` returns `None` — Metal on the hot path — for
@@ -244,7 +244,7 @@ win — the first sub-bf16 KV store in the tree. rotor stores **16.25** and is
 still above the floor, because a sideband change cannot fix a code cadence: one
 `u32` per 3 slots is 10.67 bits per value before any sideband at all. The 3-bit
 and 4-bit member of each family still measure byte-identical. See
-`docs/KV_QUANT.md` § "Memory truth" for the per-family table.
+`docs/KV_QUANT.md` § "Iso memory truth" for the per-family table.
 
 `k_rotor3/4`'s 1.54× was a **defect, not the layout**: the K-only rotor append
 never dropped its CPU blocks once the ring was live, so the prefill prefix
@@ -460,7 +460,7 @@ Ranked by impact:
    configuration provably did not change read 99.0 then 106.2). Most of the
    retracted table sits inside that last band.
 
-   **What the re-measurement did surface.** §4.4 below used to attribute
+   **What the re-measurement did surface.** §4 item 4 below used to attribute
    `k8v4`'s crater from 8k up to "an inherently costly generic-path V-4bit
    dequant on this arch". It is not the codec — it is the **TurboFlash MSL
    kernel**, which `--turbo-flash=auto` enabled on every recognised Apple
@@ -509,7 +509,7 @@ Ranked by impact:
    not the codec. With the gate off, `k8v4` decodes **88.8 TPS @16k and 61.8
    @32k** (`rmlx bench`, n=3), i.e. within a few percent of `none` — and, since
    the kernel is not bit-exact, on a token stream that is the generic path's
-   rather than the kernel's (see §4.2). `auto` now holds OFF (see
+   rather than the kernel's (see §4 item 2). `auto` now holds OFF (see
    `docs/KV_QUANT.md` §TurboFlash), so this is the shipped behaviour. `rot_k_tq4v` is untouched by
    the gate — TurboFlash only serves K8V4 storage — and its mild −7…−12% drift
    at longer ctx stands as previously described.
@@ -525,12 +525,12 @@ Ranked by impact:
 - **Every decode cell in §2 was measured through `rmlx serve` with
   `--turbo-flash=auto`, which resolved ON.** For `k8v4` — the only storage
   TurboFlash serves — that means §2's cells are kernel-on numbers and read
-  2.7–4.25× low from 8k up (the loss grows with `kv_seq`); see §4.4. Every
+  2.7–4.25× low from 8k up (the loss grows with `kv_seq`); see §4 item 4. Every
   other codec is unaffected by the gate. Cells re-measured with `rmlx bench`
-  are labelled as such in §4.2.
+  are labelled as such in §4 item 2.
 - **64k is n=1 measured** — point estimate, same caveat as 0.2.5. A single
   unguarded measurement is now known to be worth less than it looks on this
-  host: see the noise-floor figures in §4.2 (up to 7.3% across sessions).
+  host: see the noise-floor figures in §4 item 2 (up to 7.3% across sessions).
 - **`rmlx baseline --prompt-tokens` used to tokenize the raw JSON fixture**
   **file text** (envelope + syntax), not just message content — a real,
   separate finding from this pass, since fixed. For `longctx_64k.json` that
@@ -556,7 +556,7 @@ Ranked by impact:
   only** (source: `cpu_hot_path_reason()`, `crates/rmlx-kv-quant/src/quant.rs`) — not a decode-time
   regression driver, and not new since 0.2.5.
 - **No MTP / speculative** — Bonsai ships no drafter snapshot.
-- **No §6 weight-quant sweep** — one on-disk 2-bit snapshot; no QAT siblings.
+- **No weight-quant sweep** — one on-disk 2-bit snapshot; no QAT siblings.
 - **SSD tier not benched** — not triggered at 256-token single-stream (§2c).
 - Full campaign checkpoint (127 rows: 125 main-matrix cells + 2 supplementary
   `--rotor-qjl on` ablation rows) audited complete via a real CSV parser —

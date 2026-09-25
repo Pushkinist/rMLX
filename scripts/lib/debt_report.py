@@ -977,7 +977,7 @@ def git_ignored(root: Path, paths: list[str]) -> set[str]:
         check=False,
     )
     if proc.returncode == 0:
-        return set(proc.stdout.split())
+        return set(proc.stdout.splitlines())
     if proc.returncode == 1:
         return set()
     raise RuntimeError(f"git check-ignore exit {proc.returncode}: {proc.stderr.strip()}")
