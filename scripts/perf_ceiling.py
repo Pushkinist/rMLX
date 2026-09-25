@@ -17,8 +17,8 @@ Provenance of every constant (verify before trusting; see "rule zero")
 
 HOST_BW_BYTES_PER_S = 614e9
     Measured unified-memory bandwidth ceiling for the M5 Max 128 GB dev host.
-    Source: docs/PERF_BASELINE.md:101 ("Hardware: M5 Max, bandwidth ceiling
-    614 GB/s"). Override with --bandwidth-gbs for another host.
+    Source: docs/PERF_BASELINE.md "Hardware: M5 Max, bandwidth ceiling
+    614 GB/s". Override with --bandwidth-gbs for another host.
 
 KV byte accounting mirrors the engine, not a re-invention:
     crates/rmlx-kv-quant/src/quant.rs  KvQuant::estimated_resident_bytes_per_layer
@@ -88,7 +88,7 @@ from pathlib import Path
 
 # ── Host constants ───────────────────────────────────────────────────────────
 
-HOST_BW_BYTES_PER_S = 614e9  # docs/PERF_BASELINE.md:101
+HOST_BW_BYTES_PER_S = 614e9  # docs/PERF_BASELINE.md "bandwidth ceiling 614 GB/s"
 # The host that constant was measured on, in the §5.1 spelling a bench result
 # records. It travels with the number so a caller can check the two agree
 # before dividing a measurement by a ceiling belonging to another machine.
@@ -444,7 +444,7 @@ def decode_read_bytes_per_layer(c: Codec, seq: int, head_dim: int,
       * reads-mirror -- everything else, streaming the full bf16 warm-TTFT seed.
 
     Do NOT infer the bucket from feeds_bf16_* alone; see the caution above it.
-    docs/PERF_BASELINE.md:1003 ("every mode reads bf16 K+V") generalises a
+    docs/PERF_BASELINE.md "every mode reads bf16 K+V" generalises a
     three-cell table into a universal and is false for Mixed / RotK.
 
     KNOWN GAPS, both of which make this an optimistic lower bound on divergence:
@@ -992,7 +992,7 @@ def print_table(res: dict) -> None:
     print(f"model      : {r0['model']}  ({r0['arch']})")
     print(f"kv_quant   : {r0['kv_quant']}")
     print(f"bandwidth  : {res['host_bandwidth_gbs']:.0f} GB/s "
-          "(docs/PERF_BASELINE.md:101)")
+          '(docs/PERF_BASELINE.md "bandwidth ceiling 614 GB/s")')
     print(f"weights    : {r0['weight_bytes_step'] / 1e9:.3f} GB/step, "
           f"{res['active_params_step'] / 1e9:.2f}e9 active params")
     print(f"resident   : {r0['resident_weight_bytes'] / 1e9:.3f} GB of weights "
