@@ -73,6 +73,7 @@
 #   The banners are read from BANNER_DOCS, a fixed list of docs, not a glob. A
 #   banner in any other doc under docs/ fails: it is a banner no rule reads. A
 #   listed doc that is missing is exit 2: the list names a surface that is gone.
+#   An empty list, or a doc listed twice, is exit 2 too: the list is config.
 #
 # RULE 11 (docs, one banner per codec)
 #   Each inert codec is named in exactly one banner across BANNER_DOCS. A
@@ -113,8 +114,8 @@
 # RULE 7 (no ratio is written into the help)
 #   No resident-KV ratio may appear in any of these constants, in any spelling
 #   this tree uses: `0.44x`, `1.406x`, `2x`, and the same three with the Unicode
-#   multiplication sign `×`, which is what docs/KV_QUANT.md's own ratio
-#   tables are written with. Keyed on the SHAPE of such a figure, not on a list
+#   multiplication sign `×`, which is what the ratio rows of
+#   docs/KV_ROTATION_CODECS.md are written with. Keyed on the SHAPE of such a figure, not on a list
 #   of the ones that were there -- a corrected number is the same defect as a
 #   stale one, and a pattern that matches one spelling is a gate that a reviewer
 #   can walk past by typing the other.
@@ -152,19 +153,18 @@ if [ -n "${SCAN_ROOT}" ]; then
     CLI_SRC="${SCAN_ROOT}"
     DOCS_DIR="${SCAN_ROOT}"
     MANIFEST_SRC="${SCAN_ROOT}/manifest.raw"
+    # The scan root stands in for docs/, so a message names the doc the same
+    # way in both modes.
+    DOCS_LABEL="docs"
 else
     CLI_MAIN="${REPO_ROOT}/crates/rmlx-cli/src/main.rs"
     # The whole crate, not one file: a help constant is wherever its module is.
     CLI_SRC="${REPO_ROOT}/crates/rmlx-cli/src"
     DOCS_DIR="${REPO_ROOT}/docs"
+    DOCS_LABEL="docs"
     MANIFEST_SRC=""
 fi
 CLI_LABEL="${CLI_MAIN#"${REPO_ROOT}/"}"
-DOCS_LABEL="${DOCS_DIR#"${REPO_ROOT}/"}"
-DOC_LIST_LABEL=""
-for d in "${BANNER_DOCS[@]}"; do
-    DOC_LIST_LABEL="${DOC_LIST_LABEL:+${DOC_LIST_LABEL}, }${DOCS_LABEL}/${d}"
-done
 
 BANNER_MARKER='[*][*]INERT on this build[*][*]'
 HELP_INERT_MARKER='^[[:space:]]*INERT[[:space:]]*—'
@@ -180,6 +180,17 @@ die_violation() {
 
 for f in "${CLI_MAIN}" ${MANIFEST_SRC:+"${MANIFEST_SRC}"}; do
     [ -f "$f" ] || die_env "missing ${f#"${REPO_ROOT}/"}"
+done
+# `${#BANNER_DOCS[@]}` is safe under `set -u` on an empty array in bash 3.2;
+# `"${BANNER_DOCS[@]}"` is not, so the count is read first.
+[ "${#BANNER_DOCS[@]}" -gt 0 ] ||
+    die_env "BANNER_DOCS is empty: the gate would read no INERT banner (RULE 10)"
+duplicate=$(printf '%s\n' "${BANNER_DOCS[@]}" | sort | uniq -d | head -1)
+[ -z "${duplicate}" ] ||
+    die_env "BANNER_DOCS lists ${duplicate} twice (RULE 10)"
+DOC_LIST_LABEL=""
+for d in "${BANNER_DOCS[@]}"; do
+    DOC_LIST_LABEL="${DOC_LIST_LABEL:+${DOC_LIST_LABEL}, }${DOCS_LABEL}/${d}"
 done
 for d in "${BANNER_DOCS[@]}"; do
     [ -f "${DOCS_DIR}/${d}" ] ||

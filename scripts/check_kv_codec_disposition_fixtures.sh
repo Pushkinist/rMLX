@@ -98,7 +98,7 @@ build_case() {
             edit "$dir/main.rs" 's/^      fixlive\.";$/      fixlive, at 1.05x the baseline.";/'
             ;;
         rule7_ratio_with_multiplication_sign)
-            # The spelling docs/KV_QUANT.md's own ratio tables use. A pattern
+            # The spelling the ratio rows of docs/KV_ROTATION_CODECS.md use. A pattern
             # keyed on `x` alone is a gate a reviewer walks past by typing this.
             edit "$dir/main.rs" 's/^      fixlive\.";$/      fixlive, at 1.05× the baseline.";/'
             ;;
@@ -145,6 +145,14 @@ OTHER
             mkdir -p "$dir/models"
             sed -n '/^### fixinert2$/,$p' "$dir/KV_ROTATION_CODECS.md" >"$dir/models/NOTES.md"
             edit "$dir/KV_ROTATION_CODECS.md" '/^### fixinert2$/,$d'
+            ;;
+        rule10_empty_list)
+            # The list is config inside the gate, so this case runs an edited
+            # copy of the gate.
+            sed 's/^BANNER_DOCS=(.*)$/BANNER_DOCS=()/' "$GATE" >"$dir/gate.sh"
+            ;;
+        rule10_duplicate_list_entry)
+            sed 's/^BANNER_DOCS=(\(.*\))$/BANNER_DOCS=(\1 KV_CODECS.md)/' "$GATE" >"$dir/gate.sh"
             ;;
         rule10_listed_doc_missing)
             rm -f "$dir/KV_ROTATION_CODECS.md"
@@ -194,8 +202,10 @@ CASES=(
     "rule8_help_reference_without_a_readable_const|1|RULE 8|clap help the gate cannot read is caught"
     "rule7_ratio_in_a_constant_from_another_module|1|RULE 7|a ratio in a help constant from a second module is caught"
     "rule9_listing_pointer_without_call_site|1|RULE 9|the help's --list-cache-types pointer with no call site is caught"
-    "rule10_banner_in_an_unlisted_doc|1|KV_QUANT.md|a banner moved to a doc the gate does not list is caught"
-    "rule10_banner_in_an_unlisted_nested_doc|1|models/NOTES.md|a banner in a subdirectory of docs/ is caught"
+    "rule10_banner_in_an_unlisted_doc|1|RULE 10  docs/KV_QUANT.md|a banner moved to a doc the gate does not list is caught"
+    "rule10_banner_in_an_unlisted_nested_doc|1|RULE 10  docs/models/NOTES|a banner in a subdirectory of docs/ is caught"
+    "rule10_empty_list|2|BANNER_DOCS is empty|an empty banner-doc list is a config error, not a pass"
+    "rule10_duplicate_list_entry|2|BANNER_DOCS lists KV_CODECS.md twice|a doc listed twice is a config error"
     "rule10_listed_doc_missing|2|a doc BANNER_DOCS lists|a listed doc that is gone is an environment error"
     "rule11_codec_in_two_listed_docs|1|RULE 11  'fixinert' is named in 2|a second banner for one codec, in the other listed doc, is caught"
     "banner_moved_between_listed_docs|0|OK: 4 KV codecs classified|a banner moved from one listed doc to the other passes"
@@ -214,7 +224,11 @@ for case in "${CASES[@]}"; do
         FAILED=$((FAILED + 1))
         continue
     fi
-    out=$("$GATE" "$dir" 2>&1)
+    gate="$GATE"
+    if [ -f "$dir/gate.sh" ]; then
+        gate="$dir/gate.sh"
+    fi
+    out=$(bash "$gate" "$dir" 2>&1)
     got=$?
 
     if [ "$got" -eq "$want_exit" ] && printf '%s' "$out" | grep -qF -- "$want_msg"; then
