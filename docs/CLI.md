@@ -39,7 +39,7 @@ Every global flag works before or after the subcommand name, so
 | `--log-cap-mb` | u64 | `100` | Size cap for `<RMLX_HOME>/logs/` in MB. At startup the oldest `.jsonl` files are deleted until the total fits. `0` turns rotation off. Env: `RMLX_LOG_CAP_MB`. |
 | `--metrics` | `off \| events \| full` | `full` | `off` writes nothing and never opens or creates `runs.db`. `events` keeps the event stream and records no observations. Reads work in every mode. See [`METRICS_DB.md`](METRICS_DB.md) §10.1.1. |
 | `--turbo-flash` | `on \| off \| auto` | `auto` | TurboFlash attention kernel for `k8v4`. `auto` honours `RMLX_TURBO_FLASH=1` and is off otherwise; `off` ignores the variable. See [`KV_CODECS.md`](KV_CODECS.md) § "TurboFlash is off by default". |
-| `--turbo-flash-lock` | bool flag | off | TurboFlash lock variant: skips bf16 K/V maintenance once the flash buffers are seeded. No effect unless TurboFlash is on. Absent, `RMLX_TURBO_FLASH_LOCK=1` turns it on; there is no `off` arm. |
+| `--turbo-flash-lock` | bool flag | off | TurboFlash lock variant: skips bf16 K/V maintenance once the flash buffers are seeded. No effect unless TurboFlash is on. When the flag is absent, `RMLX_TURBO_FLASH_LOCK=1` turns it on; there is no `off` arm. |
 | `--fused-qk` | `on \| off \| auto` | `auto` | Fused-QK kernels over a head-major K shadow for the q8, TurboSym and rotor-asym K codecs. `auto` honours `RMLX_FUSED_QK=1` and is off otherwise. See [`KV_FUSED_KERNELS.md`](KV_FUSED_KERNELS.md) § "Fused-QK head-major K storage". |
 | `--planar-flash-decode` | `on \| off \| auto` | `auto` | `planar_flash_decode` kernel for `planar_k` caches. `auto` honours `RMLX_PLANAR_FLASH_DECODE=1` and is off otherwise. A cache that went through prefill holds a bf16 K seed and never reaches the kernel. See [`KV_FUSED_KERNELS.md`](KV_FUSED_KERNELS.md) § "`planar_flash_decode`". |
 | `--planar-fused-qk` | `on \| off` | `on` | `planar_fused_qk` kernel for `planar_k` decode steps with no bf16 K seed. `off` uses dequant + SDPA. No environment variable. See [`KV_FUSED_KERNELS.md`](KV_FUSED_KERNELS.md) § "Fused-QK kernels". |
@@ -71,9 +71,9 @@ What each codec does, and which ones are accepted but change nothing, is in
 |---|---|---|---|
 | `--kv-quant` | string | `auto` | KV codec. `auto` is unquantised bf16 on every architecture; see [`KV_QUANT.md`](KV_QUANT.md) § "The auto default". `bf16` and `none` are aliases. Conflicts with `--kv-preset`, `--cache-type-*` and `--kv-bits`. |
 | `--kv-preset` | name | — | Named preset: `auto`, `fp16`, `q8`, `speed`, `quality`, `planar`, `planar3`, `k_only_planar`. No preset holds less resident KV than `fp16`. Conflicts with `--kv-quant`, `--cache-type-*`, `--kv-bits`. See [`KV_QUANT.md`](KV_QUANT.md) § "Named preset interface". |
-| `--cache-type-k` / `--ctk` | tag | — | Per-side K codec, e.g. `q8_g128`, `bf16`. Conflicts with `--kv-quant`. Refused with `--registry` (exit 78). |
-| `--cache-type-v` / `--ctv` | tag | — | Per-side V codec, e.g. `q4_g64`, `tq4`, `planar4`. Conflicts with `--kv-quant`. Refused with `--registry` (exit 78). |
-| `--kv-bits` | float | — | mlx-lm bit-width alias; see the mapping below. Conflicts with `--kv-quant` and `--cache-type-*`. |
+| `--cache-type-k` / `--ctk` | tag | — | Per-side K codec, e.g. `q8_g128`, `bf16`. Conflicts with `--kv-quant`, `--kv-preset` and `--kv-bits`. Refused with `--registry` (exit 78). |
+| `--cache-type-v` / `--ctv` | tag | — | Per-side V codec, e.g. `q4_g64`, `tq4`, `planar4`. Conflicts with `--kv-quant`, `--kv-preset` and `--kv-bits`. Refused with `--registry` (exit 78). |
+| `--kv-bits` | float | — | mlx-lm bit-width alias; see the mapping below. Conflicts with `--kv-quant`, `--kv-preset` and `--cache-type-*`. |
 | `--kv-group-size` | usize | `64` | Group size for `--kv-bits`: `32`, `64` or `128`. Requires `--kv-bits`. |
 | `--kv-boundary-layers` | `HEAD,TAIL` | `2,8` | Leading and trailing layers held at the boundary floor. `0,0` turns the promotion off. Windowed and shared-KV consumer layers are unaffected, so the effect depends on the model. A non-default value is recorded in `decode_config`. See [`KV_LAYER_POLICY.md`](KV_LAYER_POLICY.md) § "Layer-adaptive overrides". |
 
@@ -123,7 +123,7 @@ starts with an empty registry. The KV codec flags above apply too.
 | `--kv-ssd-cache-gb` | f64 | `0` | SSD prompt-cache budget per namespace, in GiB. Blocks go to `<RMLX_HOME>/cache/kv/<namespace>/`. See [`SSD_TIER.md`](SSD_TIER.md). |
 | `--kv-ssd-global-gb` | f64 | `0` | SSD budget across all namespaces, in GiB. The tier is on when either budget is above `0`. With both set, the tighter one binds a namespace. |
 | `--project` | name | model id | SSD namespace. Refused unless `--kv-ssd-cache-gb` is above `0`. |
-| `--paged-kv` | bool flag | off | Routes K8V4, K8V8 and Planar caches through paged block storage. Refused when the resolved codec is bf16 (so `auto` needs an explicit `--kv-quant`) and with `--cache-type-k rot_k*`. |
+| `--paged-kv` | bool flag | off | Routes K8V4, K8V8 and Planar caches through paged block storage. Refused (exit 1) when the resolved codec is bf16, so `auto` needs an explicit `--kv-quant`, and with `--cache-type-k rot_k*`. |
 | `--paged-kv-page-tokens` | i32 | `32` | Tokens per page; must be positive. Requires `--paged-kv`. |
 | `--draft-model` | path | — | Drafter snapshot for speculative decoding: a sidecar head or a smaller model of the verifier's family. Must differ from `--model`. See [`SPECULATIVE.md`](SPECULATIVE.md) § "Which drafter a snapshot is". |
 | `--draft-kind` | `mtp \| dflash \| dflash2 \| eagle3 \| two_model` | from the snapshot | Drafter kind for a snapshot whose `config.json` names none. Refused when it contradicts the snapshot. Requires `--draft-model`. Env: `MLX_VLM_DRAFT_KIND`. |
@@ -301,13 +301,13 @@ baseline: model=<name>  load=<ms>  ttft_ms=<ms>  decode_tps=<n>  overall_tps=<n>
   with no Metal allocator.
 - `kv_cache_bytes` is the filled prefix of the KV cache
   (`KvCache::resident_bytes`, [`METRICS_DB.md`](METRICS_DB.md) §4), not an
-  allocator peak. It reads `n/a` when the byte count is zero.
+  allocator peak. When the reported count is zero it reads `n/a`, and the
+  record omits the column; the timing row stands.
   `scripts/perf_ab.sh` parses it.
 
 **Refusals.** If the model's KV byte counter did not advance, the generation
 ended early without an error. `baseline` then prints no summary, writes no
-record and exits non-zero. A reported count of zero only omits the
-`kv_cache_bytes` column.
+record and exits non-zero.
 
 #### Prompt files
 
@@ -438,8 +438,9 @@ rounded to a multiple of 16.
 `Qwen3ForCausalLM` snapshot on the GPU. Each prompt is capped at 768 tokens.
 `softmax_mass` measures softmax mass from real Q·Kᵀ and writes
 `head_budgets.json` schema v2. `head_budget` and its alias `k_norm_proxy` use
-K-norm² as a stand-in and write schema v1. The output feeds the
-sparse-attention kernels; see
+K-norm² as a stand-in and write schema v1. `serve` loads a
+`head_budgets.json` it finds in the snapshot, but no production path reads it
+for attention; see
 [`KV_FUSED_KERNELS.md`](KV_FUSED_KERNELS.md) § "Sparse attention".
 
 ---
@@ -474,9 +475,10 @@ Every `metrics` subcommand takes `--db <path>`. Without it the DB is
 `RMLX_METRICS_DB`, else `<RMLX_HOME>/metrics/runs.db`. The schema, the record
 shape and the rules are in [`METRICS_DB.md`](METRICS_DB.md).
 
-The read commands (`query`, `best`, `rank`, `history`, `timeseries`,
-`champions`, `export`, `prompts list|get`) never migrate. They refuse a
-missing DB, and a DB whose `bests` view is stale, naming `doctor --fix`.
+`query`, `best`, `rank`, `compare`, `history`, `timeseries`, `regress`,
+`deltas`, `describe`, `export` and `prompts list|get` never migrate. They
+refuse a missing DB, and a DB whose `bests` view is stale, naming
+`doctor --fix`. `champions` migrates the DB before it reads.
 
 | Subcommand | Flags | Description |
 |---|---|---|
@@ -493,11 +495,11 @@ missing DB, and a DB whose `bests` view is stale, naming `doctor --fix`.
 | `history` | the `best` cell flags; `--metric`, `--since <date>` optional | Every observation of one cell, oldest first. |
 | `timeseries` | the `best` flags; `--since`, `--bucket day\|week` (`day`) | Mean per bucket for one cell and metric. |
 | `regress` | `--model <substring>`, `--metric` (required); `--kv`, `--threshold-pct` (`1.0`) | Latest observation against the champion. Exit `0` within tolerance, `1` regressed, `125` nothing to compare. |
-| `deltas` | `--since-sha` (required), `--threshold-pct` (`5.0`), `--exit-code` (`true`) | Changes per cell and metric since a commit. With `--exit-code true` a regression exits 1; a SHA with no rows exits 0. |
+| `deltas` | `--since-sha` (required), `--threshold-pct` (`5.0`), `--exit-code` (`true`) | Changes per cell and metric since a commit. A SHA with no observations is an error (exit 1). With `--exit-code true`: `1` when a row regressed past the threshold, `125` when no row has a baseline, `0` otherwise. |
 | `describe` | `--observation-id` \| `--run-id`; `--text` (required) | Sets the `description` of one observation or of every observation in a run. |
 | `query` | `<SQL>` | Runs one `SELECT`; TSV output. |
 | `open` | `--readonly` | Opens the DB in `sqlite3`. |
-| `export` | `--markdown`, `--json`, `--csv`, `--jsonl` (at least one); `--scope <path>` | Prints the `bests` view to stdout. `--scope` filters and orders `--markdown`. |
+| `export` | exactly one of `--markdown`, `--json`, `--csv`, `--jsonl`; `--scope <path>` | Prints the `bests` view to stdout. `--scope` filters and orders `--markdown` and is refused with any other format. |
 | `champions` | `--backend`, `--jsonl` | One row per (namespace, model, weight quant, KV quant) with one column per metric. |
 | `prompts` | `list`; `get --name`; `add --file [--name] [--notes]`; `sync` | Prompt registry. `sync` registers every `*.json` under `prompts/` in `RMLX_REPO_ROOT`, else the working directory. |
 | `migrate` | `--rmlx-glob`, `--cbb-csv`, `--records-md`, `--hardware-tag` (`m5_max_128gb`) | Idempotent import of legacy JSONL, CSV and Markdown. |
@@ -528,7 +530,7 @@ rmlx eval ppl --model /path/to/snapshot --text-file wiki.txt \
 | `--text-file` | path | required | UTF-8 corpus. |
 | `--ctx-window` | usize | `4096` | Tokens per window. |
 | `--stride` | usize | `2048` | Stride between windows. |
-| `--corpus` | string | `""` | Corpus name. A non-empty value ingests one `METRICS_DB.md` §8.5 record into `runs.db`. |
+| `--corpus` | string | `""` | Corpus name. A non-empty value ingests one `METRICS_DB.md` §8.5 record into `runs.db` |
 | `--device` | `cpu \| gpu` | `gpu` | Device. |
 | `--max-tokens` | usize | `0` | Tokens scored; `0` is the whole corpus. |
 | `--git-sha` | string | — | Commit SHA for the record's `git_sha`. |
@@ -544,7 +546,8 @@ way a codec can move the number. Qwen3.5 refuses a KV codec flag, since its
 GatedDeltaNet layers carry state no codec touches.
 
 The record's metric is `ppl_<corpus>` without a cache and `ppl_<corpus>_cached`
-with one. They are different metrics; compare each only with its own kind.
+with one; hyphens are dropped (`wikitext-2` → `ppl_wikitext2`). They are
+different metrics; compare each only with its own kind.
 
 ---
 
@@ -589,7 +592,8 @@ Where a variable has a flag, the flag wins.
 
 | Variable | Flag | Read by | Effect |
 |---|---|---|---|
-| `RMLX_HOME` | — | `rmlx_core::paths` | Root of all on-disk state. Absolute. Else `<workspace>/.rmlx/` (nearest `Cargo.lock` upward), else `$HOME/.rmlx/`. |
+| `RMLX_HOME` | — | `rmlx_core::paths` | Root of all on-disk state. A relative path is ignored with a `warn!`. Else `<workspace>/.rmlx/` (nearest `Cargo.lock` upward), else `$HOME/.rmlx/`. |
+| `RUST_BACKTRACE` | — | `main` | Set to `full` at startup when unset. |
 | `RUST_LOG` | `--log` | the tracing filter | Overrides `--log` when set, e.g. `RUST_LOG=debug,rmlx=trace`. |
 | `RMLX_LOG_CAP_MB` | `--log-cap-mb` | clap | Log directory cap. |
 | `RMLX_METRICS_DB` | `--db` | `rmlx metrics`, `rmlx healthcheck` | DB path. The event recorder and in-process ingest always use `<RMLX_HOME>/metrics/runs.db`. |
@@ -602,7 +606,8 @@ Where a variable has a flag, the flag wins.
 | `RMLX_WHISPER_MODEL_PATH`, `RMLX_WHISPER_TOKENIZER_PATH` | `--whisper-*`, `transcribe --model` / `--tokenizer` | clap | Whisper paths. |
 | `RMLX_TTS_MODEL_PATH`, `RMLX_TTS_TOKENIZER_PATH` | `--tts-*` | clap | Qwen3-TTS paths. |
 | `MLX_VLM_DRAFT_KIND`, `MLX_VLM_DRAFT_BLOCK_SIZE` | `--draft-kind`, `--draft-block-size` | clap | `serve`. |
-| `RMLX_TURBO_FLASH`, `RMLX_TURBO_FLASH_LOCK`, `RMLX_FUSED_QK`, `RMLX_SPARSE_ATTN`, `RMLX_PLANAR_FLASH_DECODE`, `RMLX_ROT_K_FUSED` | the matching gate | `DispatchPolicy::from_env` | `=1` turns the gate on under `auto`. |
+| `RMLX_TURBO_FLASH`, `RMLX_FUSED_QK`, `RMLX_SPARSE_ATTN`, `RMLX_PLANAR_FLASH_DECODE`, `RMLX_ROT_K_FUSED` | the matching gate | `DispatchPolicy::from_env` | `=1` turns the gate on under `auto`. |
+| `RMLX_TURBO_FLASH_LOCK` | `--turbo-flash-lock` | `DispatchPolicy::from_env` | `=1` turns the lock on when the flag is absent. |
 | `RMLX_TURBO_FLASH_MIN` | — | `DispatchPolicy::from_env` | TurboFlash runs only above this `kv_seq`. Default `4096`; a negative value is `0`, an unparseable one warns and keeps the default. |
 | `RMLX_FUSED_QK_MIN` | — | `DispatchPolicy::from_env` | Minimum `kv_seq` for fused-QK. Default `512`; an unparseable value warns and keeps it. |
 | `RMLX_ROTOR_QJL` | `--rotor-qjl` | `rmlx_kv_quant::rotor_qjl` | Only for an embedder that never installs the flag; `rmlx` always does. `1`, `on`, `true` or `yes` turns QJL on. |
@@ -615,8 +620,8 @@ Where a variable has a flag, the flag wins.
 
 ## Claim file
 
-Metal allows one GPU context per process, and rMLX holds a claim file to keep
-one MLX process on the GPU. The file is `/tmp/rmlx.<port>.claim`, locked with
+Metal allows one GPU context per process. rMLX takes a claim file before it
+uses the GPU. The file is `/tmp/rmlx.<port>.claim`, locked with
 `flock` and holding the owner's PID. Internals are in
 [`SERVER.md`](SERVER.md) § "Claim file".
 
@@ -624,17 +629,27 @@ one MLX process on the GPU. The file is `/tmp/rmlx.<port>.claim`, locked with
 |---|---|
 | `serve` | `--port` |
 | `chat`, `transcribe`, `baseline`, `bench`, `eval ppl`, `info --probe-forward`/`--probe-smoke` | `51966` (`0xCAFE`) |
-| `kv-calibrate` head-budget recipes, during the model load | `0` |
+| `kv-calibrate` head-budget recipes, during the model load only | `0` |
+| `healthcheck --full` (runs the smoke probe on the GPU) | none |
+
+A claim refuses only a second holder of the same port. That process names the
+PID and exits with code `11`. So these pairs can hold the GPU together:
+
+- a `serve` and any one-shot command;
+- two `serve` processes on different ports;
+- a one-shot command and a `kv-calibrate` model load;
+- `healthcheck --full` and anything;
+- a `kv-calibrate` measurement, which runs after the claim is released, and
+  anything.
+
+Other rules:
 
 - `--device cpu` takes no claim.
-- A live holder is never displaced. The new process names the PID and exits
-  with code `11`.
 - A claim whose PID is dead is reclaimed with a `warn!`; nothing needs
   removing by hand.
 - Normal exit removes the file; `serve` also removes it on `SIGINT` and
-  `SIGTERM`.
-- The lock is per port, so two holders on different ports do not see each
-  other.
+  `SIGTERM`. `info --probe-smoke` with a non-zero verdict exits without
+  removing it, and the next holder reclaims it.
 - `rmlx healthcheck --port <N>` checks the file without taking it.
 
 ---
