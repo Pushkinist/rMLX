@@ -259,64 +259,88 @@ per head dimension. The engine is the oracle.
 **Compare models on overhead, not on ratio.** The ratio of measured to ideal
 step time is `1 + overhead_ms / ideal_ms`. The same fixed per-step cost reads
 large on a small model and small on a large one. Across models of different
-size, compare the absolute overhead:
+size, compare the absolute overhead. With `--json`, each row's
+`ms_per_token_floor` is the ideal step time:
 
 ```
-overhead_ms = 1000 / measured_tps - 1000 * bytes_per_step_gb / bandwidth_gbs
+overhead_ms = 1000 / measured_tps - ms_per_token_floor
 ```
 
 Within one model, the ratio is valid.
 
-**What the census cannot size.** BitNet checkpoints store packed ternary `u8`
-weights. The loader dequantizes every weight to bf16 at load
+**What the census cannot size.** BitNet checkpoints store every packed
+ternary linear weight as `u8`. The loader dequantizes each one to bf16 at load
 (`dequant_trit_u8` in `crates/rmlx-models/src/bitnet/loader.rs`). The census
-reads the packed header dtype, so it undercounts what a BitNet decode step
-streams.
+counts the packed byte size from the header, so it undercounts what a BitNet
+decode step streams.
 
 ## Cross-backend cells
 
-`scripts/bench_cell.sh` runs llama.cpp arms on GGUF files. No file loads in
-both families: rMLX reads MLX safetensors, llama.cpp reads GGUF. A cell that
-sets a GGUF arm against an MLX backend compares near-equivalent weight quants,
-such as `q8_0` against `mxfp8`, not identical ones. State that assumption
-beside every such cell. A pair of two llama.cpp builds on one GGUF file does
-not carry it.
+`scripts/bench_cell.sh` drives one bench cell on one backend: `rmlx`,
+`mlx-lm`, `omlx`, `paroquant` or llama.cpp. Its llama.cpp arms load GGUF
+files. No file loads in both families: the MLX backends read MLX safetensors,
+llama.cpp reads GGUF. A llama.cpp cell set against an MLX backend compares
+near-equivalent weight quants, such as `q8_0` against `mxfp8`, not identical
+ones. State that assumption beside every such cell. A pair of two llama.cpp
+builds on one GGUF file does not carry it.
 
 ## Iso trace phases
 
 The iso update paths time their encode and dequant steps at `trace!` level.
 Turn them on with `--log verbose` or `RUST_LOG=rmlx_kv_quant=trace`. No
-event sets `target =`, so each event's target is its module path.
+event sets `target =`, so each event's target is its module path,
+`rmlx_kv_quant::kvcache::update_iso`. All of them live in
+`crates/rmlx-kv-quant/src/kvcache/update_iso.rs`.
 
-| Site | Function | Target | Phases |
-|---|---|---|---|
-| decode | `iso_v_encode_decode`, `iso_k_only_k_side` | `rmlx_kv_quant::kvcache::update_iso` | `iso_encode`, `iso_dequant_gpu`, `iso_dequant_cpu`, `iso_vec_to_array` |
-| prefill | `iso_v_bulk_encode` | `rmlx_kv_quant::kvcache::update_iso` | `iso3_encode` |
+| Function | Codecs | Phases |
+|---|---|---|
+| `iso_v_encode_decode` | `iso3`, `iso4`, `iso3_sym`, `iso4_sym` | `iso_encode`, `iso_dequant_gpu`, `iso_dequant_cpu`, `iso_vec_to_array` |
+| `iso_k_only_k_side` | `k_iso3`, `k_iso4` | the same four |
+| `iso_v_bulk_encode` | `iso3` | `iso3_encode` |
 
-All four decode phases carry `phase`, `bits`, `ms`, `s_total`, `kv_h` and
-`head_dim`; the V path adds `variant`. The prefill phase fires only at 3
-bits and carries `phase`, `ms`, `s_total`, `kv_h`, `head_dim` and
-`site = "exit_prefill"`. The 4-bit V encode has no timed phase. All of them
-live in `crates/rmlx-kv-quant/src/kvcache/update_iso.rs`.
+Every decode phase carries `phase`, `bits`, `ms`, `s_total`, `kv_h` and
+`head_dim`; the V path adds `variant`. Each width emits them, with `bits` 3
+or 4. `iso3_encode` carries `phase`, `ms`, `s_total`, `kv_h`, `head_dim` and
+`site = "exit_prefill"`. It has no 4-bit counterpart.
+
+**Where each phase is reachable.** None of them fires on the fast paths:
+
+- `iso3_encode` does not fire in a served run. `iso_v_bulk_encode` runs only
+  from `exit_prefill_iso_v`, and `exit_prefill` returns before it for `iso3`
+  and `iso4`: those codecs build no packed store
+  (`KvQuant::materialises_packed_store`).
+- The `iso3` / `iso4` decode phases need a cache with no bf16 K seed.
+  `exit_prefill` sets that seed for these codecs, and `update_iso_v` then
+  decodes through the bf16 mirror.
+- The `*_sym` and `k_iso*` decode phases fire only when the fused iso
+  flash-decode path declines the step. That path takes every single-query GPU
+  step at a supported shape: batch 1, and `head_dim` a power of two, a
+  multiple of 4 and at most 512 (`crates/rmlx-kv-quant/src/kvcache/sdpa.rs`).
+  The phases fire on the CPU device, on a step with more than one query, and
+  at any other shape.
 
 ## Iso GPU dequant parity
 
 `iso_v3_dequant_gpu_matches_dequant_cpu` and
 `iso_k3_dequant_gpu_matches_dequant_cpu`
 (`crates/rmlx-kv-quant/src/isoquant_msl_tests.rs`, GPU, `#[ignore]`) compare
-the 3-bit iso GPU dequant with the CPU one. Observed max|cpu-gpu| ≤ 2.4e-7 on
-the LCG fixture. The tests assert 5e-3 per element and a strict ≤ 1e-6 bound.
+the 3-bit iso GPU dequant with the CPU one. They assert 5e-3 per element and
+a strict max|cpu-gpu| ≤ 1e-6. They print the maximum and do not assert it.
+Their failure message cites this line, which records one printed run:
+Observed max|cpu-gpu| ≤ 2.4e-7 on the LCG fixture.
 `docs/KV_ROTATION_CODECS.md` states the same figure.
 
 ## Prefix-index bench
 
 `cargo bench -p rmlx-models --bench prefix_index_bench` compares the two
-`PrefixIndex` implementations in `crates/rmlx-models/src/prefix_index/mod.rs`:
-`LinearScan` and `RadixTree`. For each entry count N in 1, 4, 16, 64 and 256,
-it fills a fresh index with N synthetic 8-block entries. It then drives 10 000
-random lookups, half hits and half misses. Criterion reports `ns/op`; each
-run also appends one row per strategy and N to
-`$RMLX_HOME/bench/prefix_index.csv`, with an estimate of resident bytes.
+`PrefixIndex` implementations under `crates/rmlx-models/src/prefix_index/`:
+`LinearScan` (`linear.rs`) and `RadixTree` (`radix.rs`). For each entry count
+N in 1, 4, 16, 64 and 256, it fills a fresh index with N synthetic 8-block
+entries. One iteration is a pass of 10 000 random lookups, half hits and half
+misses. Criterion times that pass and reports lookups per second. Each run
+also times one pass per strategy and N and appends a row to
+`$RMLX_HOME/bench/prefix_index.csv`. The row holds ns per lookup and an
+estimate of resident bytes.
 
 `--prefix-index {linear|radix}` selects the strategy a prompt cache uses. The
 default is `linear`; `radix` is opt-in.
