@@ -25,10 +25,10 @@ default suite green.
 (`mlx-community__gemma-4-e4b-it-mxfp8`). A bare `cargo test` sees it only if
 the shell exports it.
 
-Every `make` target exports it. The precedence is: command-line variable,
-then environment, then `.env`, then the repo-local `models/` directory. The
-`models/` fallback is exported only when it exists. The two commands below
-mean the same:
+Every `make` target exports a root that an operator names. The precedence is:
+command-line variable, then environment, then `.env`. With none of them set,
+make exports the repo-local `models/` directory only when it exists. The two
+commands below mean the same:
 
 ```bash
 RMLX_O_MODELS_ROOT=/tmp/empty make gpu-test CRATE=rmlx-models
@@ -42,9 +42,10 @@ Each test resolves its snapshot by one of these rules:
 | Rule | Code | Order | A set but wrong value |
 |---|---|---|---|
 | golden | `common::model_for` | `RMLX_KV_TEST_MODEL` if it serves the test's architecture, then the slug | fails |
-| slug first | `common::slug_or_override` | the slug, then the variable the test names | fails |
+| slug first | `common::slug_or_override` | the slug, then the variable the test names | fails when the slug is absent; ignored when it is present |
 | slug first, in `src/` | `rmlx_models::test_snapshot::snapshot` | the slug, then a `RMLX_TEST_MODEL_*` variable | skips |
 | variable first | `tests/resolved_arch_class.rs`, `crates/rmlx-cli/src/commands/kv_calibrate_tests.rs` | a `RMLX_TEST_MODEL_*` variable, then the slug | falls through to the slug |
+| variable first, drafter | `resolve_drafter` in `tests/spec_sampled_distribution.rs` | `RMLX_DRAFT_TEST_MODEL`, then the slug; a directory with a `config.json` is enough | fails |
 | variable only | every other test that names a variable | the variable | skips |
 
 `common` is `crates/rmlx-models/tests/common/mod.rs`. Its two rules share one
@@ -79,16 +80,17 @@ half-written one. The probe reads it as absent, and the test skips.
 | `RMLX_TEST_MODEL_ORNITH_9B` | `sahilchachra__ornith-1.0-9b-mxfp8-mlx` | `Qwen3_5ForConditionalGeneration` |
 | `RMLX_TEST_MODEL_BONSAI` | `prism-ml__Ternary-Bonsai-8B-mlx-2bit` | `Qwen3ForCausalLM` |
 | `RMLX_TEST_MODEL_DR_VENUS` | a `z-lab__DR-Venus-*` snapshot | `Qwen3ForCausalLM` |
-| `RMLX_TEST_MODEL_JINA_V4` | `jinaai__jina-embeddings-v4` | `JinaVLForEmbedding` |
+| `RMLX_TEST_MODEL_JINA_V4` | `jinaai__jina-embeddings-v4` | `JinaEmbeddingsV4Model` |
 | `RMLX_TEST_MODEL_LAGUNA` | a `z-lab__Laguna-*` snapshot | `LagunaForCausalLM` |
 | `RMLX_TEST_MODEL_READERLM_V2` | `mlx-community__jinaai-ReaderLM-v2` | `Qwen2ForCausalLM` |
-| `RMLX_TEST_MODEL_QWEN3_VL_30B` | a `mlx-community__Qwen3-VL-30B-Instruct-*` snapshot | `Qwen3VLForConditionalGeneration` |
+| `RMLX_TEST_MODEL_QWEN3_VL_30B` | a `mlx-community__Qwen3-VL-30B-Instruct-*` snapshot | `Qwen3VLMoeForConditionalGeneration` |
 
-The architecture column is the resolved class, `Architecture::arch_class()`.
-For the Qwen3.5 family it follows the checkpoint's tensors, not its
-`architectures[0]`. `tests/resolved_arch_class.rs` pins that. It builds a
-snapshot that declares dense and ships MoE tensors, with symlinked weights. The
-Qwen-MoE K-side codec guard must still reject a codec on it.
+The architecture column is the resolved class, `Architecture::arch_class()`. The
+Jina encoder has no `Architecture` variant; its column is the declared
+`architectures[0]`. For the Qwen3.5 family it follows the checkpoint's tensors,
+not its `architectures[0]`. `tests/resolved_arch_class.rs` pins that. It builds
+a snapshot that declares dense and ships MoE tensors, with symlinked weights.
+The Qwen-MoE K-side codec guard must still reject a codec on it.
 
 `cache_type_tests.rs` covers the guard's table without weights. Whether
 `Architecture::generate_greedy`, `generate_image`, the `ArchGenerator` and
@@ -100,9 +102,10 @@ it, only snapshot-gated tests check. Deleting one of those calls leaves
 
 | Variable | Read by | Rule |
 |---|---|---|
-| `RMLX_KV_TEST_MODEL` | the golden-token suites, `bitnet_logprobs.rs`, the verifiers of the alignment suites, `spec_conditioning_residual.rs`, `spec_greedy_equivalence.rs` and `spec_sampled_distribution.rs` | golden |
+| `RMLX_KV_TEST_MODEL` | the golden-token suites, `bitnet_logprobs.rs`, `qwen3_5_moe_forward_seq_last_k.rs`, the verifiers of the alignment suites, `spec_conditioning_residual.rs`, `spec_greedy_equivalence.rs` and `spec_sampled_distribution.rs` | golden |
 | `RMLX_KV_TEST_MODEL` | `gemma4_kv_cache_equivalence.rs`, `kv_bytes_sample_point.rs`, `cli_flags_e2e.rs`, `projects_toml_e2e.rs` | variable only |
-| `RMLX_DRAFT_TEST_MODEL` | the drafters of the alignment suites, `spec_conditioning_residual.rs`, `spec_greedy_equivalence.rs` and `spec_sampled_distribution.rs` | slug first |
+| `RMLX_DRAFT_TEST_MODEL` | the drafters of the alignment suites, `spec_conditioning_residual.rs` and `spec_greedy_equivalence.rs` | slug first |
+| `RMLX_DRAFT_TEST_MODEL` | the drafter of `spec_sampled_distribution.rs` | variable first, drafter |
 | `RMLX_VL_TEST_MODEL` | `qwen3_vl_moe_text_parity.rs` | variable only |
 | `RMLX_PROMPT_CACHE_TEST_MODEL_A`, `_B` | `prompt_cache_cross_model.rs` | variable only |
 | `RMLX_TEST_MODEL` | `crates/rmlx-server/tests/ssd_cache_restart.rs` | variable only |
@@ -123,9 +126,10 @@ sibling `*.transcript.vtt` from the git-ignored
 ## Speculative-decoding suites
 
 Every suite below names its verifier and its drafter by slug, as constants in
-the test file. The verifier resolves by the golden rule and the drafter by
-the slug-first rule. A machine that holds both snapshots runs the suite with no
-variable set.
+the test file. The verifier resolves by the golden rule. The drafter resolves
+by the slug-first rule, except in `spec_sampled_distribution.rs`, where the
+variable comes first. A machine that holds both snapshots runs the suite with
+no variable set.
 
 | File | What it asserts |
 |---|---|
@@ -203,7 +207,8 @@ comparing it:
    margin.
 
 A change in token count is refused at any margin. So is a margin it cannot
-measure. The written fixture records the margin. Passing this gate does not
+measure. The margin is printed on the `WROTE` line on stderr; the fixture does
+not record it. Passing this gate does not
 make the new output correct. It shows only that the flip sat at a tie.
 
 ## E2E harness model specs
@@ -224,7 +229,7 @@ These change how a test runs and need no snapshot. Only test code reads them.
 
 | Variable | Values | Effect |
 |---|---|---|
-| `RMLX_SKIP_GPU` | `1` | GPU tests return at once, `--ignored` or not |
+| `RMLX_SKIP_GPU` | `1` | the GPU tests that check it return at once, `--ignored` or not |
 | `RMLX_REGEN_GOLDENS` | any | the golden-token suites write their fixtures |
 | `RMLX_E2E_REGEN_GOLDEN` | `1` | the E2E harness writes its golden snapshots |
 | `RMLX_E2E_ONLY` | case ids, comma-separated | the E2E harness runs only those cases |
@@ -238,14 +243,16 @@ These change how a test runs and need no snapshot. Only test code reads them.
 ### `RMLX_SKIP_GPU` opt-out
 
 `test_utils::skip_if_no_gpu_env()` in `rmlx-kv-quant` returns true only for
-the value `1`. The GPU tests of that crate call it first and return.
-`crates/rmlx-models/tests/sparse_attn_dispatch.rs` has its own copy.
+the value `1`. Most GPU tests in that crate's `src/` call it first and
+return. Several integration tests under `crates/rmlx-kv-quant/tests/`, and
+`crates/rmlx-models/tests/sparse_attn_dispatch.rs`, read the variable with the
+same rule through a private copy. Other GPU tests do not check it.
 
 ```bash
 RMLX_SKIP_GPU=1 cargo test -p rmlx-kv-quant -- --include-ignored
 ```
 
-No test writes `RMLX_SKIP_GPU`. The GPU tests read it without the env lock, so
+No test writes `RMLX_SKIP_GPU`. The tests read it without the env lock, so
 a write could skip a live test. The value rule is the pure function
 `skip_value_means_skip()`, which is tested directly.
 
@@ -267,8 +274,9 @@ a concurrent `getenv` of any key.
 also while unwinding from a failed assertion. It is the only key the guard
 manages. `RMLX_ROTOR_QJL` is read again at every store construction.
 
-The kernel gates (`RMLX_TURBO_FLASH`, `RMLX_FUSED_QK`, `RMLX_SPARSE_ATTN`,
-`RMLX_PLANAR_FLASH_DECODE`, `RMLX_ROT_K_FUSED`) seed a
+The kernel gates (`RMLX_TURBO_FLASH`, `RMLX_TURBO_FLASH_LOCK`,
+`RMLX_TURBO_FLASH_MIN`, `RMLX_FUSED_QK`, `RMLX_FUSED_QK_MIN`,
+`RMLX_SPARSE_ATTN`, `RMLX_PLANAR_FLASH_DECODE`, `RMLX_ROT_K_FUSED`) seed a
 [`DispatchPolicy`](../crates/rmlx-core/src/dispatch_policy.rs). Each `KvCache`
 captures one at construction. A test builds its cache with
 `.with_dispatch_policy(…)` and takes no lock. The variable still sets the
@@ -349,7 +357,9 @@ gates below cover rotation.
 - `TEST_SEED`: the seed, `0x0000_00C0_FFEE_BEEF`.
 - `vectorized_parity_check(cpu_path, msl_path, input, tol, name)`: runs both
   paths and fails when the max absolute error exceeds `tol`, naming the first
-  index past it. Each GPU parity test passes its codec's tolerance.
+  index past it. Each caller passes its codec's tolerance; most compare a
+  CPU and an MSL path, and two in `planarquant_tests.rs` compare two CPU
+  paths.
 
 ## Rotation-quality gates
 
@@ -423,12 +433,18 @@ A cell reads its model from `RMLX_TEST_MODEL_BONSAI`,
 fallback. Unset, the cell skips. `RMLX_NIAH_KV_QUANT` replaces the forced
 codec.
 
-Every cell asserts that the decode recovers the needle. It also reads the
-kernel's dispatch counter around the decode, under the process-default
-dispatch policy. With the kernel on and the cell marked `Reachable`, a
-TurboFlash cell asserts that the kernel ran. A planar cell asserts that it did
-not: the live bf16 K seed keeps it dormant. Every other cell asserts no
-dispatch.
+A cell that reaches its decode asserts that the decode recovers the needle.
+It also reads the kernel's dispatch counter around the decode, under the
+process-default dispatch policy. With the kernel on and the cell marked
+`Reachable`, a TurboFlash cell asserts that the kernel ran. A planar cell
+asserts that it did not: the live bf16 K seed keeps it dormant. Every other
+cell asserts no dispatch.
+
+The three `niah_pflash_qwen36_32k_*` cells never reach their asserts.
+`validate_resolved` rejects `PlanarK` on Qwen3.6 MoE, so with
+`RMLX_TEST_MODEL_QWEN36` set they panic in `generate_greedy`. Unless
+`RMLX_NIAH_KV_QUANT` replaces the codec, every driver run that selects them
+fails, the default `--mode turbo` run included.
 
 `scripts/release_e2e/stage6_perf/niah_long_context.sh` runs the cells in two
 fresh processes, with the kernel off and then on:
@@ -448,9 +464,9 @@ and writes each pass's log to `/tmp/niah-<family>-<label>.log`.
 
 The `#[ignore]` rule holds on the two macro bodies:
 `make check-gpu-tests-ignored` fails if either loses the attribute. The cells
-are not in `make gpu-test`. A macro cell has no name before expansion, so no
-libtest filter selects it. Each cell also loads a snapshot and prefills up to
-32k tokens. The NIAH driver and `make smoke-codec-matrix` run them.
+are not in `make gpu-test`. A macro cell has no name in the source, so the gate
+cannot derive a filter for it. Each cell also loads a snapshot and prefills up
+to 32k tokens. The NIAH driver and `make smoke-codec-matrix` run them.
 
 ## Codec smoke + NIAH matrix
 
