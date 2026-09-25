@@ -1,19 +1,11 @@
 # KV Cache Quantization Reference
 
-> The codec impl lives in **`rmlx-kv-quant`**
-> (storage enums, MSL kernels, per-layer `KvCache`, paged-KV, mixed/rot-K
-> codecs). The policy / builder layer (`KvQuant` resolution, `KvCacheBuilder`,
-> `kv_quant_for_layer`, the SSD spill/hydrate plumbing) and the per-arch
-> entry points live in **`rmlx-models::kv_cache`**. See the `## Public API`
-> section below for the canonical import paths.
->
-> The `rmlx_models::kv_cache::*` re-export shim
-> for codec-layer items (`KvCache`, `KvQuant`, `LinearAttnCache`, …) and
-> for SSD-tier items (`write_caches`, `set_ssd_*_hook`, …) was dropped.
-> Callers now import directly from `rmlx_kv_quant::*` / `rmlx_kv_ssd::*`.
-> Only the **policy / builder** items (`KvCacheBuilder`,
+> The codec code lives in **`rmlx-kv-quant`** (storage enums, MSL kernels,
+> per-layer `KvCache`, paged KV, mixed / rot-K codecs). The SSD tier lives in
+> **`rmlx-kv-ssd`**. The policy / builder layer (`KvCacheBuilder`,
 > `kv_quant_for_layer`, `DEFAULT_KV_QUANT`, `LAYER_ADAPTIVE_*`,
-> `cache_type::*`) remain under `rmlx_models::kv_cache::*`.
+> `cache_type::*`) lives in **`rmlx-models::kv_cache`**. See § "Public API"
+> below for the import paths.
 
 Codec-level reference for every KV quantization variant in rMLX. Covers
 storage layout, dispatch path, the auto default, and CLI flag surface.
@@ -26,9 +18,7 @@ see `docs/SSD_TIER.md`.
 
 ## Public API
 
-The `rmlx-kv-quant` crate owns these public items.
-The `rmlx_models::kv_cache::*` re-export shim was
-dropped; callers import the items directly from `rmlx_kv_quant`:
+The `rmlx-kv-quant` crate owns these public items:
 
 | Item                                       | Source                                       |
 |--------------------------------------------|----------------------------------------------|
@@ -43,24 +33,22 @@ dropped; callers import the items directly from `rmlx_kv_quant`:
 | `turboquant::{TurboBlocks, turbo_quantize_v, turbo_dequantize, GROUP_SIZE, …}` | `rmlx_kv_quant::turboquant` |
 | `planarquant::{PlanarBlocks, planar_quantize, planar_dequantize, …}`           | `rmlx_kv_quant::planarquant` |
 | MSL wrappers: `q8_msl::*`, `turboquant_msl::*`, `planarquant_msl::*`, `turbo_flash_msl::*`, `rot_k_msl::*`, `k8vturbo3_append_msl::*` | `rmlx_kv_quant::*` |
-| Rotation helpers: `rot_k::{hadamard_rotation, rotate_last_axis, …}` | `rmlx_kv_quant::rot_k` |
 | SWA ring buffer: `rotating::*` | `rmlx_kv_quant::rotating` |
 
-The policy / builder layer stays in `rmlx-models::kv_cache`:
+The `rmlx-kv-ssd` crate owns the SSD tier: `block_io`, `spill`, `hydrate`,
+`ssd_index`, `ssd_tier`, and the hooks `set_ssd_event_recorder`,
+`set_ssd_spill_prom_hook`, `set_ssd_hydrate_prom_hook`,
+`set_ssd_bytes_used_hook`, `set_ssd_evict_total_hook`.
 
-* `kv_quant_for_layer`, `DEFAULT_KV_QUANT`
+The policy / builder layer is in `rmlx-models::kv_cache`:
+
+* `KvCacheBuilder`, `kv_quant_for_layer`, `DEFAULT_KV_QUANT`
 * `LAYER_ADAPTIVE_TAIL_N`, `LAYER_ADAPTIVE_HEAD_N`
-* SSD: `block_io::*`, `spill::*`, `hydrate::*`, `ssd_index::*`,
-  `set_ssd_event_recorder`, `set_ssd_spill_prom_hook`,
-  `set_ssd_hydrate_prom_hook`, `set_ssd_bytes_used_hook`,
-  `set_ssd_evict_total_hook`
 * `cache_type::*`
 
 ## Import paths
 
-Canonical import per public symbol. The
-`rmlx_models::kv_cache::*` shim re-exports were dropped — every caller
-imports directly from the owning crate:
+The import path of each public symbol:
 
 ```rust
 // Codec layer — rmlx-kv-quant root + module re-exports:
@@ -82,7 +70,7 @@ use rmlx_kv_ssd::{
 use rmlx_kv_ssd::ssd_tier::{install_config, active, compute_layout_key, SsdTierConfig};
 use rmlx_kv_ssd::{block_io, hydrate, spill, ssd_index};
 
-// Builder / policy stay on the rmlx-models side:
+// Builder / policy (rmlx-models):
 use rmlx_models::kv_cache::{
     KvCacheBuilder,
     kv_quant_for_layer, DEFAULT_KV_QUANT,
@@ -138,9 +126,15 @@ the store.
 - **`Mixed` / `RotK`.** Their decode reads the affine 3-tuples. They keep the
   mirrors only when the layer shares K/V across layers (`KvCache::shares_kv`,
   set by the arch builder). Gemma4 shares; Qwen3 and Qwen3.5-MoE do not. On a
-  layer that does not share, the resident KV is the packed store alone.
-  `boundary_floor` keeps a promoted `Mixed` / `RotK` boundary layer in its own
-  family. See § "Which codec the floor is".
+  layer that does not share, the resident KV is the packed store alone. On a
+  shared-KV arch, only the producer layer of a shared pair
+  (`update_and_sdpa_shared_source`) appends to the mirror at decode. On every
+  other layer the mirror stays at the prompt length, because `KvCache::update`
+  refuses a `Mixed` storage and `update_decode_fp16` does not run.
+  `boundary_floor` raises a promoted `Mixed` / `RotK` boundary layer to 8 bits
+  in its own family when the layer does not share K/V. On a shared-KV layer
+  the raised codec still reads both mirrors, so the result is `K8V8`. See
+  § "Which codec the floor is".
 - **Store-reading families** (`IsoKOnly*`, `RotorKOnly*`, `Iso*Sym`,
   `Rotor*Sym`). They keep the packed store. The K-only codecs also keep a bf16
   V mirror.
@@ -234,8 +228,7 @@ the same one-dtype rule but takes the dtype from the checkpoint. On
 `prism-ml__Ternary-Bonsai-8B-mlx-2bit`, mlx-lm loads the float params as
 float16 and keeps float16 logits and KV. bf16 has 3 fewer mantissa bits than
 fp16, so rMLX decodes this checkpoint coarser than the weights on disk and the
-reference. This can flip tokens at near-tie logits. Do not describe this cast
-as matching mlx-lm.
+reference. This can flip tokens at near-tie logits.
 
 ### Qwen3.6 MoE KV is bf16 at `--kv-quant none`
 
@@ -315,8 +308,10 @@ Two codec attributes control startup behaviour. Both are exhaustive matches on
 `KvQuant` (`crates/rmlx-kv-quant/src/quant.rs`). A new variant must be
 classified, or the build fails.
 
-* **`KvQuant::carries_msl()`** is `true` for every codec except `none`. It
-  means the codec can dispatch at least one custom Metal (MSL) kernel. MSL
+* **`KvQuant::carries_msl()`** is `true` for every codec except `none`. For
+  `Mixed` / `RotK` the kernel is MLX's own `mx.quantize`, a compiled Metal op,
+  not a custom kernel. Every other codec can dispatch at least one custom Metal
+  (MSL) kernel. MSL
   kernels compile **lazily**: `MetalKernel::new` only registers, and MLX
   compiles the pipeline on the first `apply()` dispatch (see `docs/FFI.md`
   § `MetalKernel`).
@@ -334,8 +329,9 @@ classified, or the build fails.
     The default is off (`--rotor-qjl off`). With QJL off, the K encode is the
     rotor MSL kernel (`rotor_gpu_append_into_k_blocks`) and decode is fused
     (see § `rotor_flash_decode` below), so the verdict is `None`. With QJL on,
-    the 1-bit residual has no MSL kernel and forces the K path onto the CPU
-    every decode step, so the verdict is `Some`. `update_rotor_k_only` reads
+    the 1-bit residual has no MSL kernel, so the verdict is `Some`. It forces
+    the K append of `k_rotor*` onto the CPU every decode step, and it forces
+    both K and V of `rotor*_sym` onto the CPU encode and dequant path. `update_rotor_k_only` reads
     the store's sticky `use_qjl()` flag, which is fixed at the first append.
   * Every other codec → `None`.
 
@@ -371,6 +367,8 @@ codec attributes, never an arch name. It does nothing in these cases:
 - `is_k_only_iso_rotor()` is `true`. The K kernel of these codecs is the
   iso/rotor MSL kernel, not the q8_0 K kernel that this function warms. It
   compiles lazily on the first prefill.
+- no small warm shape makes `kv_heads × head_dim × tokens` a multiple of the
+  q8_0 group (128).
 
 Otherwise it warms the q8_0 K kernels, plus the V kernel for `k8v4` (tq4),
 `planar` (planar 4-bit) and `planar3` (planar 3-bit). A warm failure logs a
@@ -384,8 +382,11 @@ every arch, calls it.
 runs the arch-agnostic Metal-vs-CPU check after the Qwen-MoE guards. When
 `cpu_hot_path_reason()` is `Some`, it emits a structured `warn!` that names the
 codec and the reason. It also warns when the codec is INERT
-(`materialises_packed_store()` is `false`). Each warn fires once per codec. The
-codec is not rejected.
+(`materialises_packed_store()` is `false`). Both warns go through
+`warn_once_per_codec`, which uses one key, `(arch, codec)`, for both. Thus at
+most one of the two warns fires for a pair. For `iso3`, `iso4`, `rotor3`,
+`rotor4` and `rotor_k_*_asym_*`, both conditions are true: the CPU warn fires
+and the INERT warn does not. The codec is not rejected.
 
 ---
 
@@ -518,24 +519,25 @@ Store-backed `update_and_sdpa` path (without TurboFlash):
 **TurboFlash path** (`KvCache::update_and_sdpa_k8v4_flash`). This path keeps
 its own head-major buffers (`flash_k_codes`, `flash_k_scales`,
 `flash_v_codes`, `flash_v_scales`), shaped `[B, kv_h, max_seq, D/.]`. The
-first decode step seeds them from the bf16 prefix. Each later step appends
-with a 4-D `slice_update`. The `turbo_flash_sdpa` Metal kernel reads these
-buffers directly. `turbo_flash_should_run` allows the kernel when all of these
-are true: `DispatchPolicy::turbo_flash` is set, `q_seq == 1`, and
-`kv_seq > turbo_flash_min_kv_seq` (default 4096). The kernel supports
-`head_dim ∈ {128, 256}`. The flash buffers are resident in addition to the
+first TurboFlash dispatch seeds them from the bf16 prefix. Each later
+dispatch appends with a 4-D `slice_update` and also appends to the bf16
+mirror. The `turbo_flash_sdpa` Metal kernel reads the flash buffers directly.
+`turbo_flash_should_run` allows the kernel when all of these are true:
+`DispatchPolicy::turbo_flash` is set, the smoke probe has not forced a
+fallback (`turbo_flash_corrupted()` is `false`), `q_seq == 1`, and
+`kv_seq > turbo_flash_min_kv_seq`. The minimum defaults to 4096;
+`RMLX_TURBO_FLASH_MIN` sets it. The kernel supports `head_dim ∈ {128, 256}`
+on the GPU. The flash buffers are resident in addition to the
 bf16 mirror.
 
-**TurboFlash default-OFF policy (HOLD)**: `--turbo-flash` accepts
+**TurboFlash is off by default.** `--turbo-flash` accepts
 `{on, off, auto}`. The default is `auto`, and `auto` resolves **OFF on every
-host**. The kernel passes its crash and fidelity gates. It fails its
-throughput gate: it decodes slower than the generic K8V4 path, and the loss
-grows with `kv_seq`. It also changes the generated tokens. The cause is the
-codec, not the kernel: TurboFlash is the only `k8v4` configuration in which the
-4-bit V codec runs at decode. With the gate off, `k8v4` decodes from the bf16
-mirror.
+host**. The kernel decodes slower than the generic K8V4 path. It can also
+change the generated tokens. The cause is the codec, not the kernel:
+TurboFlash is the only `k8v4` configuration in which the 4-bit V codec runs at
+decode. With the gate off, `k8v4` decodes from the bf16 mirror.
 
-- `--turbo-flash on` turns the kernel on (ablation and re-measurement).
+- `--turbo-flash on` turns the kernel on.
 - `--turbo-flash off` is a hard override. An exported `RMLX_TURBO_FLASH=1`
   does not survive it.
 - `auto` honours `RMLX_TURBO_FLASH=1`. In that case the kernel runs while the
@@ -543,8 +545,6 @@ mirror.
 - `--turbo-flash` is a **global** flag. Every subcommand resolves it the same
   way, so `rmlx bench` and `rmlx baseline` measure the configuration that
   `rmlx serve` runs.
-
-Lifting the HOLD needs a decode throughput measurement.
 
 **The kernel's own numerics.** `turbo_flash_reference_sdpa`
 (`turbo_flash_msl.rs`, `#[cfg(test)]`) is a dequantize-then-SDPA arm over the
@@ -557,7 +557,7 @@ Guards: `turbo_flash_matches_its_codec_reference_at_{bonsai_8b,qwen36_35b}_geome
 and `..._with_an_additive_mask` (`#[ignore]`, GPU). Any comparison against a
 bf16 attention measures the tq4-V codec, not the kernel.
 
-### GQA divisibility — a kernel-entry gap the reference exposed
+### GQA divisibility at the TurboFlash kernel entry
 
 The MSL maps `kv_head = q_head / n_repeats`, with
 `n_repeats = n_q_heads / n_kv_heads`. A count that does not divide would read
@@ -567,9 +567,10 @@ and a zero `n_kv_heads`. The kernel and the reference arm both call it.
 GQA cells. `update_and_sdpa_k8v4_flash_inner` derives both counts from the
 cache's own shapes, so no in-tree caller passes a non-multiple.
 
-**Qwen MoE note**: K8V4 is safe for Qwen MoE because K stays 8-bit. K below
-8 bits on a 7:1 GQA model amplifies quantization error through softmax (PPL
-218 → 8641 observed). The K-side codec is the safeguard, not the variant name.
+**Qwen MoE note**: K8V4 passes the Qwen MoE guard because K stays 8-bit.
+`validate_resolved` rejects a codec with K below 8 bits on
+`Qwen3_5MoeForConditionalGeneration` and `Qwen3VLMoeForConditionalGeneration`.
+The guard keys off the K-side codec, not the variant name.
 
 **CLI**: `--kv-quant k8v4`; or `--ctk q8_g128 --ctv tq4`.
 
@@ -720,7 +721,7 @@ K is never inverse-rotated; the rotation cancels. V-side rotation schemes
 and symmetric (`R = Rᵀ`), so the same matrix rotates K and Q. The construction
 needs a power-of-two `head_dim` (Sylvester recurrence).
 
-**v1 path** (`rot_k.rs`): MLX `matmul` against a precomputed `[D, D]` matrix.
+**Matmul path** (`rot_k.rs`): MLX `matmul` against a precomputed `[D, D]` matrix.
 O(D²) arithmetic per step.
 
 **Fused FWHT kernel** (`rot_k_msl.rs`; opt-in with `--rot-k-fused on` /
@@ -771,7 +772,7 @@ least 1.5 bits gained on outlier data, a loss on i.i.d. data) and
 
 ---
 
-### Retired: `rot_k_tq4v` (rotated K + TurboQuant 4-bit V)
+### `rot_k_tq4v` is rejected
 
 `--kv-quant rot_k_tq4v` is rejected at parse. `--ctk rot_k --ctv tq4` is
 rejected at resolve (`combo_to_kv_quant`). Each error names the replacement:
@@ -830,8 +831,7 @@ nearest-centroid assignment. A state-dependent codebook is necessary for a
 shaping gain.
 
 **Measured claw-back: 0.000 dB**, at both shipped widths, on i.i.d. Gaussian
-data (codes identical to plain turbo) and on a dim-axis sweep (codes differ by
-tie-breaking; distortion identical to four decimals).
+data and on a dim-axis sweep.
 `trellis_coded_quantization_claws_back_nothing` in `rate_distortion_tests.rs`
 pins this as an equality, so a trellis with a real constraint turns it red.
 
@@ -912,8 +912,7 @@ is:
 const TURBOSYM4_LAYOUT_TAG: &str = "tsym4_lloyd_4_4";
 ```
 
-**Arch guard** — symmetric 4-bit K is the PPL-218→8641 path on Qwen MoE.
-`validate_resolved` rejects `--kv-quant tsym4` on
+**Arch guard** — `validate_resolved` rejects `--kv-quant tsym4` on
 `Qwen3_5MoeForConditionalGeneration` and `Qwen3VLMoeForConditionalGeneration`
 with `ResolveError::QwenMoeKBitsTooLow(4)` (exit 78). `KvQuant::k_below_8bit()`
 is `true` for this variant.
@@ -955,8 +954,7 @@ const-generic store as the 4-bit spelling. The SSD layout tag is:
 const TURBOSYM3_LAYOUT_TAG: &str = "tsym3_lloyd_3_3";
 ```
 
-**Arch guard** — K-side 3-bit on Qwen MoE is the PPL-disaster zone.
-`validate_resolved` rejects `--kv-quant tsym3` and `--kv-preset speed` on
+**Arch guard** — `validate_resolved` rejects `--kv-quant tsym3` and `--kv-preset speed` on
 `Qwen3_5MoeForConditionalGeneration` and `Qwen3VLMoeForConditionalGeneration`
 with `ResolveError::QwenMoeTurboKRejected { variant: "tsym3" }`.
 
@@ -1009,8 +1007,7 @@ is:
 const PLANARK4_LAYOUT_TAG: &str = "planar_k_4";
 ```
 
-**Arch guard** — K-side 4-bit on Qwen MoE is the PPL-218→8641 path (7:1 GQA
-amplifies K-head error through softmax). `validate_resolved` rejects
+**Arch guard** — `validate_resolved` rejects
 `--kv-quant planar_k` and `--ctk planar_k4 --ctv bf16` on
 `Qwen3_5MoeForConditionalGeneration` and `Qwen3VLMoeForConditionalGeneration`
 with `ResolveError::QwenMoePlanarKRejected`.
@@ -1058,12 +1055,14 @@ PagedAttention allocation. It is opt-in with `--paged-kv` (default off).
 With `--paged-kv`, `KvStorage::new` routes `K8V4`, `K8V8`, `Planar` and
 `Planar3` to `Paged`. Other codecs keep their own storage. `--paged-kv` with a
 resolved `none` codec (which includes `--kv-quant auto`) is refused at startup,
-because bf16 has no packed store to page.
+because bf16 has no packed store to page. `--paged-kv` with a
+`--cache-type-k rot_k*` is also refused at startup.
 
 `Paged` keeps:
 
 1. A page pool of fixed-size GPU slabs. `--paged-kv-page-tokens` sets the
-   page size (default 32 tokens).
+   page size (default 32 tokens). The value must be a positive integer; no
+   other check applies.
 2. A per-sequence block table (`Vec<usize>`) that maps a logical page index to
    a physical page ID.
 3. Scatter/gather: writes go to `pool[phys_id][token_slot]`, and reads
@@ -1074,17 +1073,18 @@ V storage follows the base `KvQuant`:
 - `K8V8` → `PagedVStorage` (q8_0 codes, `bits=8`).
 - `Planar` → `PagedPlanarVStorage`.
 
-`update_paged` has no `Planar3` arm. A paged `Planar3` cache with no bf16
-mirror returns an error at its first update.
-
-The page size must be a multiple of the quantizer group size (32 for
-TurboQuant, 128 for q8_0 K), so that no group crosses a page boundary.
+`update_paged` has no `Planar3` arm. On the GPU, a paged `Planar3` cache with
+no bf16 mirror appends the new K page and then returns an error for V. By then
+`KvCache::update` has already advanced the offset. Thus the cache is left
+inconsistent, not only refused. On the CPU the same cache falls back to the
+bf16 mirror path.
 
 `exit_prefill` seeds the bf16 mirror, and `update_paged` returns early to the
 mirror while it is live. Thus a seeded paged cache decodes from the bf16
 mirror, as the non-paged forms of these codecs do.
 
-**CLI**: `--paged-kv --kv-quant <k8v4|k8v8|planar>`.
+**CLI**: `--paged-kv --kv-quant <k8v4|k8v8|planar|planar3>`. The routing
+accepts all four. `planar3` reaches the defect above.
 
 ---
 

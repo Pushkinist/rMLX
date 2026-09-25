@@ -490,7 +490,7 @@ Ranked by impact:
    each arm. The 32k divergence was later shown to be the f32 promotion the
    TurboFlash dispatcher leaked rather than the codec, and it is gone with that
    fix (32k ON now reproduces the bf16 digest); 8k still diverges and is the
-   codec floor. See `docs/KV_QUANT.md` § TurboFlash. Reproduced here at 8k (`rmlx bench --kv-quant k8v4 --max-ctx 16384
+   codec floor. See `docs/KV_QUANT.md` § "TurboFlash is off by default". Reproduced here at 8k (`rmlx bench --kv-quant k8v4 --max-ctx 16384
    --prompt-tokens 8192 --max-tokens 64 --runs 2 --warmup 1`): gate OFF gives
    110.80 TPS / digest `0xb0273cf32cb9b715` / 1 668 005 888 B KV, gate ON gives
    42.05 TPS / digest `0x75a6992e38913e64` / 2 029 240 320 B. The kernel is a
@@ -510,7 +510,7 @@ Ranked by impact:
    @32k** (`rmlx bench`, n=3), i.e. within a few percent of `none` — and, since
    the kernel is not bit-exact, on a token stream that is the generic path's
    rather than the kernel's (see §4 item 2). `auto` now holds OFF (see
-   `docs/KV_QUANT.md` §TurboFlash), so this is the shipped behaviour. `rot_k_tq4v` is untouched by
+   `docs/KV_QUANT.md` § "TurboFlash is off by default"), so this is the shipped behaviour. `rot_k_tq4v` is untouched by
    the gate — TurboFlash only serves K8V4 storage — and its mild −7…−12% drift
    at longer ctx stands as previously described.
 5. **`*_sym` / `*tcq` prefill remains the heaviest cost family** — unchanged

@@ -78,7 +78,7 @@ the suite. A `PASS` on an `xfail` case means the gap was fixed → drop the tag.
 3. **rot_k_tq4v degraded on Bonsai-2bit**: dropped the answer token at temp=0
    ("The capital of France." — no "Paris") and was incoherent at 8k NIAH.
    That codec has since been retired (see `docs/KV_QUANT.md`
-   § "Retired: `rot_k_tq4v`"); its case is gone from the manifest.
+   § "`rot_k_tq4v` is rejected"); its case is gone from the manifest.
 4. **Prompt-cache hit omitted first token from logprobs — RESOLVED**: previously,
    on the exact cache-hit path the cached `first_id` token was replayed without
    live logits (`qwen3.rs` Path A), so it was OMITTED from the OpenAI
