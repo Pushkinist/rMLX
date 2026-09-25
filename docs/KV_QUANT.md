@@ -203,7 +203,7 @@ and `KvQuant::materialises_packed_store`. The code is:
 
 The warn is **advisory only**. It does not change the codec.
 
-### Gemma4 global `--kv-quant none` KV is bf16 (was f32)
+### Gemma4 global KV is bf16 at `--kv-quant none`
 
 The Gemma4 residual stream is bf16 end-to-end, so the global `--kv-quant none`
 K and V store as bf16. Three sites keep it bf16:
@@ -218,7 +218,7 @@ restore the gate dtype on their output. Three unit tests in
 `geglu_fused_bf16_gate_stays_bf16`, `pli_gelu_fused_bf16_gate_stays_bf16` and
 `dtype_adopted_scale_keeps_bf16_operand_bf16`.
 
-### Qwen3 dense `--kv-quant none` KV is bf16 (was f32)
+### Qwen3 dense KV is bf16 at `--kv-quant none`
 
 The dense Qwen3 arch (`Qwen3ForCausalLM`) casts every float model parameter to
 bf16 at load (`load_util::bf16_param`). This includes norm weights, quant
@@ -237,7 +237,7 @@ fp16, so rMLX decodes this checkpoint coarser than the weights on disk and the
 reference. This can flip tokens at near-tie logits. Do not describe this cast
 as matching mlx-lm.
 
-### Qwen3.6 MoE `--kv-quant none` KV is bf16
+### Qwen3.6 MoE KV is bf16 at `--kv-quant none`
 
 The Qwen3.5-MoE arch (`Qwen3_5MoeForConditionalGeneration`) uses the same
 load-time cast. The `qwen3_5_moe` loader calls `load_util::bf16_param` on every
@@ -418,9 +418,9 @@ codecs use it to write their bf16 V mirror, and the codec supplies bf16.
 
 The cast is a no-op when the input is already bf16. The floor limits the
 *memory* cost of an upstream f32 leak. It does not remove the *compute* cost:
-upstream f32 arithmetic stays f32. The per-arch casts (Gemma4
-§"Gemma4 global `--kv-quant none` KV is bf16",
-Qwen3 §"Qwen3 dense `--kv-quant none` KV is bf16") are the fix; the floor is
+upstream f32 arithmetic stays f32. The per-arch casts
+(§"Gemma4 global KV is bf16 at `--kv-quant none`",
+§"Qwen3 dense KV is bf16 at `--kv-quant none`") are the fix; the floor is
 the guard.
 
 `crates/rmlx-kv-quant/src/kvcache/resident_bytes_tests.rs` holds the

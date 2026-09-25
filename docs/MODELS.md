@@ -271,7 +271,7 @@ declares no `rope_scaling` at all. The resulting window is the capacity
   bf16 activation mixed with an fp16 param promotes to f32 and propagates through
   Q/K/V, attention, and the `--kv-quant none` KV cache (doubling its residency).
   Casting at load keeps K/V bf16. See `docs/KV_QUANT.md` "Qwen3 dense
-  `--kv-quant none` KV is bf16".
+  KV is bf16 at `--kv-quant none`".
 
 ### Known limitations
 
@@ -864,7 +864,7 @@ constants that could promote the stream — the embed-scale, the per-layer-input
 scales, and the fused GeGLU / PLI-GeGLU activations (whose `gelu_tanh` constants
 are f32) — adopt / restore the operand dtype, mirroring mlx-lm's weak-typed
 Python floats. A unit-level dtype-lock test guards this against regression; see
-docs/KV_QUANT.md "Gemma4 global `--kv-quant none` KV is bf16".
+docs/KV_QUANT.md "Gemma4 global KV is bf16 at `--kv-quant none`".
 
 **Image-prompt placement (inside the user turn).** The per-image block
 (`<boi>` + N × `<image_soft_token>` + `<eoi>`) is spliced **inside** the user
