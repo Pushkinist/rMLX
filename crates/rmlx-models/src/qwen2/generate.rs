@@ -113,12 +113,12 @@ pub fn generate_greedy(
     prompt_cache_slots: usize,
     eos_ids: &[u32],
     step_fn: &mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
-    // A6.2: optional sampler constraint. See gemma4::generate_greedy.
+    // Optional sampler constraint. See gemma4::generate_greedy.
     mut constraint: Option<&mut dyn ConstraintEngine>,
-    // A7.2: sampling config + per-request RNG. See gemma3::generate_greedy.
+    // Sampling config + per-request RNG. See gemma3::generate_greedy.
     sampler_cfg: &crate::sampler::SamplerConfig,
     rng: &mut crate::sampler::Pcg32,
-    // A7.3: logit-penalty configuration + per-request token history.
+    // Logit-penalty configuration + per-request token history.
     penalty_cfg: &crate::sampler::PenaltyConfig,
     token_history: &mut Vec<u32>,
 ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
@@ -336,10 +336,10 @@ pub fn generate_greedy(
     )?;
 
     // A6.2 masked-argmax fork (first emit).
-    // A7.2: temp<=0 keeps the exact greedy match below; temp>0 host-samples.
+    // Temp<=0 keeps the exact greedy match below; temp>0 host-samples.
     let sampling_active = sampler_cfg.sampling_active();
     let penalties_active = penalty_cfg.penalties_active();
-    // A7.3: trailing-20 window (empty at prefill step 0).
+    // Trailing-20 window (empty at prefill step 0).
     let win_start = token_history.len().saturating_sub(20);
     let recent = &token_history[win_start..];
     let top = if sampling_active {
@@ -380,11 +380,11 @@ pub fn generate_greedy(
     top.eval()?;
     let top_bytes = top.to_bytes()?;
     let last_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-    // A6.2: advance constraint with emitted id.
+    // Advance constraint with emitted id.
     if let Some(c) = constraint.as_mut() {
         c.advance(last_id);
     }
-    // A7.3: push prefill token into history.
+    // Push prefill token into history.
     token_history.push(last_id);
     let prefill_total_ns = prefill_t0.elapsed().as_nanos();
 
@@ -590,18 +590,18 @@ fn decode_loop(
         };
 
         let logits_flat = decode_logits.reshape(&[1, vocab], device)?;
-        // A6.3: only run the masked pre-drain pipeline when the engine is
+        // Only run the masked pre-drain pipeline when the engine is
         // actively masking (wants_mask=true). During warm-up the engine
         // is inert; we fall through to the unconstrained pipeline so
         // argmax dtype + pipelining are bit-identical to the no-constraint
         // path. `advance()` is still called from the post-drain branch so
         // warm-up engagement detection works.
         let mask_active = constraint.as_deref().is_some_and(|c| c.wants_mask());
-        // A7.2: temp>0 reads logits to host each step (no async pipelining
+        // Temp>0 reads logits to host each step (no async pipelining
         // benefit), so it shares the masked branch's pre-drain. temp<=0
         // keeps the exact `mask_active`-gated pipelined path byte-for-byte.
         let sampling_active = sampler_cfg.sampling_active();
-        // A7.3: penalties also require logits on host → fold into drain_now.
+        // Penalties also require logits on host → fold into drain_now.
         let penalties_active = penalty_cfg.penalties_active();
         let drain_now = mask_active || sampling_active || penalties_active;
         // Force eager eval of logits on the masked path to prevent stale GPU data.
@@ -618,7 +618,7 @@ fn decode_loop(
                 if let Some(c) = constraint.as_deref_mut() {
                     c.advance(next_id);
                 }
-                // A7.3: accumulate emitted token into history.
+                // Accumulate emitted token into history.
                 token_history.push(next_id);
                 let piece = tokenizer
                     .id_to_token(next_id)
@@ -652,7 +652,7 @@ fn decode_loop(
             );
             break;
         }
-        // A7.3: trailing-20 window for penalty context.
+        // Trailing-20 window for penalty context.
         let win_start = token_history.len().saturating_sub(20);
         let recent = &token_history[win_start..];
         let next_y = if sampling_active {
@@ -706,7 +706,7 @@ fn decode_loop(
                 if let Some(c) = constraint.as_deref_mut() {
                     c.advance(next_id);
                 }
-                // A7.3: accumulate pipelined token into history.
+                // Accumulate pipelined token into history.
                 token_history.push(next_id);
                 let piece = tokenizer
                     .id_to_token(next_id)
@@ -763,7 +763,7 @@ fn decode_loop(
             if let Some(c) = constraint.as_mut() {
                 c.advance(next_id);
             }
-            // A7.3: final drain token into history.
+            // Final drain token into history.
             token_history.push(next_id);
             let piece = tokenizer
                 .id_to_token(next_id)

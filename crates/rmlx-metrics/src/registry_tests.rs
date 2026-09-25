@@ -37,13 +37,13 @@ fn every_spec_metric_present() {
         "load_gpu_residency_ms",
         "load_first_kernel_ready_ms",
         "load_total_ms",
-        // C5 Slice A: admission-queue metrics.
+        // Admission-queue metrics.
         "queue_wait_ms",
         "queue_depth",
-        // F1b: per-request live token counts.
+        // Per-request live token counts.
         "prompt_tokens_live",
         "completion_tokens_live",
-        // F9: extended ITL stats.
+        // Extended ITL stats.
         "itl_p99_ms",
         "itl_spikes",
         // Speculative-decoding metrics.

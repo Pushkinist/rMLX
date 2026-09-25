@@ -659,7 +659,7 @@ impl Architecture {
     }
 
     /// Whether this architecture emits `<think>...</think>` reasoning tokens
-    /// that the server should surface on a separate output channel (A3).
+    /// that the server should surface on a separate output channel.
     ///
     /// `true` only for the Qwen3 family (Qwen3 dense + Qwen3.5 MoE). It says
     /// the architecture *can* produce `<think>...</think>` — nothing more.
@@ -978,7 +978,7 @@ impl Architecture {
         prompt_cache_slots: usize,
         eos_ids: &'a [u32],
         step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
-        // A6.2: optional sampler constraint. `None` = unmasked argmax (the
+        // Optional sampler constraint. `None` = unmasked argmax (the
         // hot path; identical to pre-A6.2 behaviour). `Some(_)` enables the
         // masked branch in each arch's `argmax` call sites; in A6.2 the only
         // impl is `NoOpConstraint` (all-allow), so it is plumbing-only and
@@ -989,13 +989,13 @@ impl Architecture {
         // appears only in parameter position, so callers are not over-constrained
         // — they pass all of these from a single request frame.
         constraint: Option<&'a mut dyn crate::ConstraintEngine>,
-        // A7.2: sampling config + per-request RNG. `sampler_cfg.temperature
+        // Sampling config + per-request RNG. `sampler_cfg.temperature
         // <= 0.0` keeps the untouched greedy GPU argmax path byte-for-byte;
         // `> 0.0` routes to the host categorical sampler. The route handler
         // constructs both from `GenerationRequest.sampling`.
         sampler_cfg: &'a crate::sampler::SamplerConfig,
         rng: &'a mut crate::sampler::Pcg32,
-        // A7.3: logit-penalty configuration. `penalty_cfg.penalties_active() ==
+        // Logit-penalty configuration. `penalty_cfg.penalties_active() ==
         // false` keeps the temp=0 pure-GPU argmax path byte-for-byte untouched.
         // `token_history` accumulates every emitted token id; the arch trims it
         // to the trailing-20 window before each `apply_penalties` call.

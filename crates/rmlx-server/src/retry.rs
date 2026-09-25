@@ -140,9 +140,9 @@ pub fn classify(err: &RmlxError) -> RetryClass {
 /// - `has_guided_decoding` — the FSM resets on every request; replaying would
 ///   restart the grammar and produce malformed or duplicated JSON.
 ///
-/// The `n > 1` check (OpenAI `n` field) is evaluated at the call site where
-/// the raw request value is still in scope; pass `false` for `n_choices_ok`
-/// when the request set `n > 1`.
+/// `n_choices_ok = false` disables replay. Neither route parses the OpenAI
+/// `n` field, so both callers pass `true` and the parameter never disables
+/// anything today.
 pub fn is_replayable(req: &GenerationRequest, n_choices_ok: bool) -> bool {
     if req.sampling.temperature > 0.0 {
         return false;

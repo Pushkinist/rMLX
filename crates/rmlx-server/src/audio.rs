@@ -1,5 +1,5 @@
 //! Audio API endpoints: POST /v1/audio/transcriptions, /v1/audio/translations,
-//! and POST /v1/audio/speech (TTS — Phase 4b pending).
+//! and POST /v1/audio/speech (Qwen3-TTS).
 //!
 //! ## API shape (OpenAI-compatible)
 //!
@@ -549,7 +549,7 @@ fn build_response(
     }
 }
 
-// ── POST /v1/audio/speech (TTS — Phase 4b) ────────────────────────────────────
+// ── POST /v1/audio/speech (TTS) ───────────────────────────────────────────────
 //
 // Accepted body fields:
 //   model          — model identifier (e.g. "qwen3-tts", "tts-1")

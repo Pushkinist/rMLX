@@ -41,7 +41,7 @@ pub(super) fn internal_error(message: &str) -> Response {
     )
 }
 
-/// J3: typed-OOM error response (Anthropic error-type strings).
+/// Typed-OOM error response (Anthropic error-type strings).
 ///
 /// Mirrors the OpenAI mapping: same `type` strings (`oom_during_load`,
 /// `oom_kv_cache`, `oom_mid_stream`), same 507 / 503 + `Retry-After` per
@@ -64,7 +64,7 @@ pub(super) fn oom_response(
         OomPhase::Generation => (StatusCode::SERVICE_UNAVAILABLE, "oom_mid_stream", false),
     };
 
-    // Best-effort process-memory snapshot (J4). Never fail the error path.
+    // Best-effort process-memory snapshot. Never fail the error path.
     let mem = rmlx_core::mach_mem::read_proc_mem().ok();
     let to_mb = |b: u64| b / (1024 * 1024);
     let process_rss_mb = mem
@@ -101,7 +101,7 @@ pub(super) fn oom_response(
 /// Map an `rmlx_core::Error` to an HTTP error response (Anthropic error types).
 ///
 /// `SmokeProbe` (NaN logits) → 500 internal_server_error.
-/// `Oom` (J3) → 507 / 503 typed body with `Retry-After` per phase.
+/// `Oom` → 507 / 503 typed body with `Retry-After` per phase.
 /// Everything else → 503 service_unavailable_error.
 #[allow(
     clippy::wildcard_enum_match_arm,

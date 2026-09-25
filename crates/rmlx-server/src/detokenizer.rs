@@ -1,4 +1,4 @@
-//! Streaming detokenizer with UTF-8 token-healing (A10).
+//! Streaming detokenizer with UTF-8 token-healing.
 //!
 //! ## Problem
 //!

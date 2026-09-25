@@ -1876,15 +1876,15 @@ pub fn generate_greedy<'a>(
     prompt_cache_slots: usize,
     eos_ids: &'a [u32],
     step_fn: &'a mut dyn FnMut(&crate::decode_loop::ProbeStep) -> Option<u32>,
-    // A6.2: optional sampler constraint. See gemma4::generate_greedy.
+    // Optional sampler constraint. See gemma4::generate_greedy.
     // The shared `DecodeCtx` bundles every per-request borrow under one
     // lifetime, so these references share `'a` (a `&mut dyn` trait-object
     // reborrow is invariant and cannot be re-unified once split).
     mut constraint: Option<&'a mut dyn ConstraintEngine>,
-    // A7.2: sampling config + per-request RNG. See gemma3::generate_greedy.
+    // Sampling config + per-request RNG. See gemma3::generate_greedy.
     sampler_cfg: &'a crate::sampler::SamplerConfig,
     rng: &'a mut crate::sampler::Pcg32,
-    // A7.3: logit-penalty configuration + per-request token history.
+    // Logit-penalty configuration + per-request token history.
     penalty_cfg: &'a crate::sampler::PenaltyConfig,
     token_history: &'a mut Vec<u32>,
 ) -> Result<Vec<crate::decode_loop::ProbeStep>> {
@@ -2128,11 +2128,11 @@ pub fn generate_greedy<'a>(
     top.eval()?;
     let top_bytes = top.to_bytes()?;
     let last_id = i32::from_le_bytes(top_bytes[..4].try_into().unwrap()) as u32;
-    // A6.3: advance constraint regardless of mask state (warm-up scans).
+    // Advance constraint regardless of mask state (warm-up scans).
     if let Some(c) = ctx.constraint.as_mut() {
         c.advance(last_id);
     }
-    // A7.3: push prefill token into history.
+    // Push prefill token into history.
     ctx.token_history.push(last_id);
     let prefill_total_ns = prefill_t0.elapsed().as_nanos();
 

@@ -34,7 +34,7 @@ fn panic_hook_writes_sidecar_and_logs() {
     let tmp = std::env::temp_dir().join(format!("rmlx_panic_test_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("create temp logs dir");
 
-    // Install the same hook logic as main.rs (J7.1), but write to tmp/.
+    // Install the same hook logic as main.rs, but write to tmp/.
     let tmp_clone = tmp.clone();
     let hook_fired = Arc::new(AtomicBool::new(false));
     let hook_fired_clone = hook_fired.clone();

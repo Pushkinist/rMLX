@@ -498,7 +498,7 @@ impl ChatTemplate {
         // the think block, same as `None`. The undefined path is the contract;
         // only `Some(false)` changes the rendered output.
 
-        // A5.2: convert the (possibly empty) tools slice into a minijinja
+        // Convert the (possibly empty) tools slice into a minijinja
         // Value. An empty slice serialises as an empty JSON array, which
         // Jinja evaluates as falsy — so `{% if tools %}` is false when no
         // tools are present and renders byte-identically to pre-A5.2 output.

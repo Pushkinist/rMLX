@@ -452,7 +452,7 @@ pub(crate) fn run_baseline(
     // last callbacks so prefill cost is timed SEPARATELY from decode, without
     // changing `generate_greedy`'s signature (serve/chat/info paths untouched).
 
-    // A7.2: baseline bench is always greedy (temperature 0.0) — keeps the
+    // Baseline bench is always greedy (temperature 0.0) — keeps the
     // untouched GPU argmax path. Fresh per-call sampler config + rng.
     let baseline_sampler_cfg = rmlx_models::SamplerConfig {
         temperature: 0.0,

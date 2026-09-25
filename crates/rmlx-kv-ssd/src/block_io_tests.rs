@@ -2446,7 +2446,7 @@ fn planar3_v_gpu_spill_cpu_hydrate_cross_path() {
 /// H4 + H5: KvStorage::None (SWA) layer with offset > max_seq must reset
 /// gracefully on first decode step without OOB panic.
 ///
-/// The reset path (H5) also emits a tracing::warn! event.
+/// The reset path also emits a tracing::warn! event.
 /// This test runs on CPU (no GPU required).
 #[test]
 fn h4_swa_prev_offset_exceeds_max_seq_reset_no_panic() {

@@ -35,7 +35,7 @@
     clippy::needless_pass_by_value
 )]
 
-// ── K8V4 variant (S2.4) ────────────────────────────────────────────────────────
+// ── K8V4 variant ────────────────────────────────────────────────────────
 //
 // With KvQuant::K8V4 the quantization is lossy. We cannot require argmax
 // equality to the full-precision run. Instead we verify:
@@ -138,7 +138,7 @@ fn kv_cache_k8v4_prefill_decode_sane() {
     );
 }
 
-// ── Planar variant (S3.4) ─────────────────────────────────────────────────────
+// ── Planar variant ─────────────────────────────────────────────────────
 //
 // Same sanity criteria as the K8V4 test: quantization is lossy so we only
 // require NaN-free output and bounded max logit. No argmax-equality required.

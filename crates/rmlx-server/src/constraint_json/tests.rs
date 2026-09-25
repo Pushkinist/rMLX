@@ -281,7 +281,7 @@ fn warm_up_blocks_engagement_during_thinking() {
     assert!(c.engaged, "engagement must fire after thinking ends");
 }
 
-// ── A6.5: fence suppression tests ───────────────────────────────────────
+// ── Fence suppression tests ───────────────────────────────────────
 
 /// Pre-engagement text that is only ` ```json\n ` must be flagged as a
 /// fence so the handler knows to discard it.

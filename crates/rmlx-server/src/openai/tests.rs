@@ -4,7 +4,7 @@ fn parse(json: &str) -> Result<ChatCompletionsRequest, serde_json::Error> {
     serde_json::from_str(json)
 }
 
-// ── J3: typed OOM mapping ────────────────────────────────────────────────
+// ── Typed OOM mapping ────────────────────────────────────────────────
 //
 // Each `OomPhase` → asserted (HTTP status, `type` string, `Retry-After`
 // presence/absence, body carries the J4 process-memory fields). Built by
@@ -234,7 +234,7 @@ fn echo_false_parses() {
     assert_eq!(req.echo, Some(false));
 }
 
-// ── A5.1: tool-calling schema parse ──────────────────────────────────────
+// ── Tool-calling schema parse ──────────────────────────────────────
 
 /// Full tools + tool_choice=auto payload parses correctly.
 #[test]
@@ -408,7 +408,7 @@ fn resolve_mixes_sources_independently() {
     assert_eq!(p_src, SamplingSource::ModelDefaults);
 }
 
-// ── A7.1: sampling fields parse + validation ──────────────────────────────
+// ── Sampling fields parse + validation ──────────────────────────────
 
 /// All six new sampling fields deserialise from a full payload.
 #[test]
@@ -594,9 +594,9 @@ fn a7_repetition_penalty_falls_back_to_model_defaults() {
     );
 }
 
-// ── G4: server default temperature ──────────────────────────────────────
+// ── Server default temperature ──────────────────────────────────────
 
-/// G4: server_default_temperature wins over model_defaults when request omits
+/// server_default_temperature wins over model_defaults when request omits
 /// temperature.
 #[test]
 fn g4_server_default_beats_model_defaults() {
@@ -624,7 +624,7 @@ fn g4_server_default_beats_model_defaults() {
     assert_eq!(src, SamplingSource::ServerDefault);
 }
 
-/// G4: explicit request temperature beats server_default_temperature.
+/// Explicit request temperature beats server_default_temperature.
 #[test]
 fn g4_request_beats_server_default() {
     let (sp, src, _) = resolve_sampling_params(
@@ -644,7 +644,7 @@ fn g4_request_beats_server_default() {
     assert_eq!(src, SamplingSource::Request);
 }
 
-/// G4: when server_default absent (None), falls through to model_defaults as before.
+/// When server_default absent (None), falls through to model_defaults as before.
 #[test]
 fn g4_absent_server_default_falls_through_to_model_defaults() {
     let defaults = GenerationConfig {
@@ -668,7 +668,7 @@ fn g4_absent_server_default_falls_through_to_model_defaults() {
     assert_eq!(src, SamplingSource::ModelDefaults);
 }
 
-// ── A5.4: tool_calls emission ────────────────────────────────────────────
+// ── tool_calls emission ────────────────────────────────────────────
 
 use serde_json::Map as JsonMap;
 
@@ -794,7 +794,7 @@ fn multi_tool_call_indexes_are_monotonic() {
     assert_eq!(calls[1].index, 1);
 }
 
-// ── A5.4: streaming-event helper coverage ────────────────────────────────
+// ── Streaming-event helper coverage ────────────────────────────────
 
 /// Drive `handle_streaming_token` over a scripted token sequence containing
 /// a complete `<tool_call>` and assert: passthrough chunk first, then a
@@ -890,7 +890,7 @@ fn streaming_emits_tool_calls_delta_and_upgrades_finish() {
     );
 }
 
-// ── A6.1: response_format parsing ─────────────────────────────────────────
+// ── response_format parsing ─────────────────────────────────────────
 
 #[test]
 fn response_format_json_object_deserialises() {
@@ -1018,7 +1018,7 @@ fn streaming_without_parser_passes_through_unchanged() {
     );
 }
 
-// ── A8: compute_effective_timeout unit tests ──────────────────────────────
+// ── compute_effective_timeout unit tests ──────────────────────────────
 
 fn headers_with(key: &str, val: &str) -> HeaderMap {
     let mut h = HeaderMap::new();
@@ -1087,7 +1087,7 @@ fn timeout_max_zero_disables_timeout() {
     assert_eq!(result2, None);
 }
 
-// ── C4: multi-model slot-vec semantics ───────────────────────────────────
+// ── Multi-model slot-vec semantics ───────────────────────────────────
 
 use crate::engine::NotReadyGenerator;
 
@@ -1278,7 +1278,7 @@ fn slots_max_one_evicts_single_entry_parity() {
     assert_eq!(resident_ids(&state), vec!["m1".to_owned()]);
 }
 
-// ── H3/H4: usage accounting in streaming path ────────────────────────────
+// ── Usage accounting in streaming path ────────────────────────────
 
 /// Build a minimal `StreamState` with the given usage-tracking fields.
 fn usage_stream_state(prompt_tokens: u32, include_usage: bool) -> StreamState {
@@ -1384,7 +1384,7 @@ fn h3_completion_tokens_two_tokens() {
     assert_eq!(state.completion_tokens, 3);
 }
 
-/// H4: when `include_usage = true`, the `done` token produces TWO SSE
+/// When `include_usage = true`, the `done` token produces TWO SSE
 /// events: the finish chunk (with `finish_reason`) followed by a usage
 /// summary chunk (with `choices: []` and a populated `usage`).
 #[test]
@@ -1458,7 +1458,7 @@ fn h4_usage_chunk_emitted_when_include_usage_true() {
     );
 }
 
-/// H4: when `include_usage = false`, the `done` token produces exactly ONE
+/// When `include_usage = false`, the `done` token produces exactly ONE
 /// SSE event (the finish chunk), and that event must NOT contain `usage`.
 #[test]
 fn h4_no_usage_chunk_when_include_usage_false() {
@@ -1506,7 +1506,7 @@ fn h4_no_usage_chunk_when_include_usage_false() {
     );
 }
 
-/// H4: `stream_options` field on `ChatCompletionsRequest` parses correctly
+/// `stream_options` field on `ChatCompletionsRequest` parses correctly
 /// for both present-and-true and absent cases.
 #[test]
 fn h4_stream_options_deserialises() {
@@ -1546,7 +1546,7 @@ fn h4_stream_options_deserialises() {
     );
 }
 
-/// H4: Usage serialisation — when `usage` is None, the field is absent
+/// Usage serialisation — when `usage` is None, the field is absent
 /// from the JSON (not `null`) because of `skip_serializing_if`.
 #[test]
 fn h4_chunk_usage_absent_when_none() {
@@ -1565,7 +1565,7 @@ fn h4_chunk_usage_absent_when_none() {
     );
 }
 
-/// H4: Usage serialisation — when `usage` is Some, the JSON contains
+/// Usage serialisation — when `usage` is Some, the JSON contains
 /// the triple with exact values.
 #[test]
 fn h4_chunk_usage_present_when_some() {
@@ -1589,9 +1589,9 @@ fn h4_chunk_usage_present_when_some() {
     assert_eq!(v["choices"].as_array().unwrap().len(), 0);
 }
 
-// ── F14: lifetime token counters ─────────────────────────────────────────
+// ── Lifetime token counters ─────────────────────────────────────────
 
-/// F14: `tokens_in` / `tokens_out` on AppState start at zero, and the
+/// `tokens_in` / `tokens_out` on AppState start at zero, and the
 /// streaming path increments them at the done-token boundary via
 /// `handle_streaming_token`.
 ///
@@ -1683,7 +1683,7 @@ fn f14_lifetime_counters_incremented_at_done_boundary() {
     );
 }
 
-/// F14: `metrics_cache` handler response body includes `tokens_in` and
+/// `metrics_cache` handler response body includes `tokens_in` and
 /// `tokens_out` fields with the correct accumulated values.
 ///
 /// Calls the handler directly using axum's `axum::extract::State` extractor
@@ -1737,9 +1737,9 @@ fn effective_max_ctx_for_resident_and_absent() {
     );
 }
 
-// ── F10: resolve_request_id unit tests ───────────────────────────────────
+// ── resolve_request_id unit tests ───────────────────────────────────
 
-/// F10: absent header → a fresh generated id is returned (non-empty, starts
+/// Absent header → a fresh generated id is returned (non-empty, starts
 /// with "req-").
 #[test]
 fn f10_absent_header_generates_id() {
@@ -1755,7 +1755,7 @@ fn f10_absent_header_generates_id() {
     );
 }
 
-/// F10: two calls without a header return distinct ids (probabilistic — two
+/// Two calls without a header return distinct ids (probabilistic — two
 /// UUID v4s are distinct with overwhelming probability).
 #[test]
 fn f10_absent_header_generates_unique_ids() {
@@ -1765,7 +1765,7 @@ fn f10_absent_header_generates_unique_ids() {
     assert_ne!(a, b, "two generated ids must be distinct");
 }
 
-/// F10: present `X-Request-Id` header is echoed verbatim.
+/// Present `X-Request-Id` header is echoed verbatim.
 #[test]
 fn f10_inbound_header_is_echoed() {
     let h = headers_with("x-request-id", "test-corr-123");
@@ -1773,7 +1773,7 @@ fn f10_inbound_header_is_echoed() {
     assert_eq!(rid, "test-corr-123");
 }
 
-/// F10: header value longer than 128 chars is truncated to exactly 128.
+/// Header value longer than 128 chars is truncated to exactly 128.
 #[test]
 fn f10_header_capped_at_128_chars() {
     let long: String = "a".repeat(200);
@@ -1783,7 +1783,7 @@ fn f10_header_capped_at_128_chars() {
     assert!(rid.chars().all(|c| c == 'a'));
 }
 
-/// F10: non-ASCII bytes in the header value are skipped (sanitizer retains
+/// Non-ASCII bytes in the header value are skipped (sanitizer retains
 /// only printable ASCII). The http crate rejects genuine control bytes at
 /// header-value construction, so this tests the high-bit path using a
 /// `to_str()` that would fail, which resolves_request_id handles by falling
@@ -1809,7 +1809,7 @@ fn f10_non_utf8_header_falls_back_to_generated() {
     );
 }
 
-/// F10: whitespace-only header value falls back to generating an id.
+/// Whitespace-only header value falls back to generating an id.
 #[test]
 fn f10_whitespace_only_falls_back_to_generated() {
     let h = headers_with("x-request-id", "   ");
@@ -1820,9 +1820,9 @@ fn f10_whitespace_only_falls_back_to_generated() {
     );
 }
 
-// ── F8: API error-category lifetime counters ─────────────────────────────
+// ── API error-category lifetime counters ─────────────────────────────
 
-/// F8: each `ApiErrorCategory` variant increments exactly its own counter
+/// Each `ApiErrorCategory` variant increments exactly its own counter
 /// and no other.
 #[test]
 fn f8_each_category_increments_only_its_counter() {
@@ -1900,7 +1900,7 @@ fn f8_each_category_increments_only_its_counter() {
     }
 }
 
-/// F8: a successful (non-error) streaming path does NOT increment any
+/// A successful (non-error) streaming path does NOT increment any
 /// error counter. Drive `handle_streaming_token` with only success tokens.
 #[test]
 fn f8_successful_streaming_path_increments_no_error_counter() {
@@ -1981,7 +1981,7 @@ fn f8_successful_streaming_path_increments_no_error_counter() {
     }
 }
 
-/// F8: an engine error token increments the correct category counter in the
+/// An engine error token increments the correct category counter in the
 /// streaming path and terminates the stream with an error event + `[DONE]`.
 #[test]
 fn f8_engine_error_in_streaming_increments_counter() {
@@ -2071,7 +2071,7 @@ fn f8_engine_error_in_streaming_increments_counter() {
     }
 }
 
-/// F8: `metrics_cache` handler includes `error_counts` object with all
+/// `metrics_cache` handler includes `error_counts` object with all
 /// category keys present and correct values.
 #[tokio::test]
 async fn f8_metrics_cache_has_error_counts() {
@@ -2113,7 +2113,7 @@ async fn f8_metrics_cache_has_error_counts() {
     }
 }
 
-/// F8: a successful request does not bump any error counter end-to-end
+/// A successful request does not bump any error counter end-to-end
 /// (verified via `slot_test_state` + direct counter check).
 #[test]
 fn f8_successful_request_increments_no_counter() {
@@ -2138,7 +2138,7 @@ fn f8_successful_request_increments_no_counter() {
     }
 }
 
-// ── F5: Prometheus /metrics endpoint ─────────────────────────────────────
+// ── Prometheus /metrics endpoint ─────────────────────────────────────
 
 /// Build a `MetricsSnapshot` with known values and verify `render_prometheus`
 /// produces valid Prometheus text exposition.
@@ -2558,7 +2558,7 @@ fn mixed_parts_as_text_returns_text_only() {
     assert_eq!(imgs, vec!["https://example.com/x.jpg"]);
 }
 
-// ── H1: SsdHistogram +Inf double-count regression ────────────────────────
+// ── SsdHistogram +Inf double-count regression ────────────────────────
 //
 // A single observation beyond the last finite bucket (> 1_000_000 µs) must
 // produce _count == 1 and bucket{le="+Inf"} == 1. Before the fix,

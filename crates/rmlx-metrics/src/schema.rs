@@ -1,7 +1,7 @@
 //! DB connection factory with mandatory PRAGMAs.
 //!
-//! Every open path (`open`, `open_memory`, `open_readonly`) applies the same
-//! PRAGMA set from docs/METRICS_DB.md §8.2 / §10.5.
+//! Every open path applies the same PRAGMA set (`docs/METRICS_DB.md` §2,
+//! §10.5).
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -129,8 +129,8 @@ pub fn open_memory() -> Result<Connection> {
 
 /// Open an existing DB at `path` in read-only mode.
 ///
-/// Used by CLI read commands (`best`, `rank`, `query`, `export`) so they
-/// cannot accidentally mutate the DB while a writer is active.
+/// No CLI command uses it: the read commands (`best`, `rank`, `query`,
+/// `export`) open through [`open_checked`].
 pub fn open_readonly(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     apply_pragmas(&conn)?;

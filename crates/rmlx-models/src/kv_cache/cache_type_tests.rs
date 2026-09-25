@@ -873,7 +873,7 @@ fn head_dim_80_q4_g64_rejected_d6_1() {
 )]
 fn mlx_bit_packing_violation_q3_g64_on_unfriendly_head_dim() {
     // q3_g64: bits=3, group=64. MLX bit-packing: head_dim % (32/3 = 10) == 0.
-    // group_size=64 must also divide head_dim (D6.1).
+    // group_size=64 must also divide head_dim.
     // Pick head_dim=64: 64 % 64 == 0 (D6.1 OK), 64 % 10 == 4 → D6.2 fires.
     let err = resolve(
         spec(CacheType::Auto, CacheType::Q3G64),

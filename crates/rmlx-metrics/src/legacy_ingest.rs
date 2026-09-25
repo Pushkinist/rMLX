@@ -10,7 +10,7 @@
 //!    (e.g. `"mxfp8 g32 + kv-k8v8"`) and non-canonical backend names
 //!    (e.g. `"mlx-lm-turboquant"`).
 //!
-//! The dispatcher in `crates/rmlx-cli/src/commands/metrics.rs` tries parsers in
+//! The dispatcher in `crates/rmlx-cli/src/commands/metrics/record.rs` tries parsers in
 //! order:
 //! canonical §8.5 → try_parse_legacy → try_parse_cbb (CBB May-10)
 //!

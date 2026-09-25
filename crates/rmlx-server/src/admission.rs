@@ -31,7 +31,6 @@
 //!
 //! ## References
 //!
-//! - Local research notes — port verdict and algorithm map.
 //! - Dynamo `components/src/dynamo/planner/core/load_scaling.py:91` — deadband.
 //! - Dynamo `components/src/dynamo/planner/monitoring/planner_metrics.py:8-30` — reasons.
 
@@ -125,7 +124,9 @@ pub enum DecisionReason {
 }
 
 impl DecisionReason {
-    /// Stable snake_case string used as `events.op` and tracing field value.
+    /// Stable snake_case string used as the tracing field value, and as
+    /// `events.op` for the reasons that reach `events`. The anticipatory 503
+    /// and the three `prefill_chunk_*` reasons are never written to `events`.
     pub fn as_str(self) -> &'static str {
         match self {
             DecisionReason::Disabled => "admission_disabled",
@@ -288,7 +289,7 @@ impl Regressor {
 
         // Cramer's rule: β = adj(XᵀX)ᵀ · Xᵀy / det
         // Cofactor matrix of XᵀX (symmetric, so adjugate = cofactor transposed = cofactor).
-        // L4: c10==c01, c20==c02, c21==c12 by symmetry — use the canonical names directly.
+        // C10==c01, c20==c02, c21==c12 by symmetry — use the canonical names directly.
         let c00 = s11 * s22 - s12 * s12;
         let c01 = -(s1 * s22 - s12 * s2);
         let c02 = s1 * s12 - s11 * s2;
@@ -374,7 +375,7 @@ impl ControllerConfig {
 
 // ── Internal mutable state ───────────────────────────────────────────────────
 
-// N1: EventRecorder implements Debug (manual impl in rmlx_metrics::events),
+// EventRecorder implements Debug (manual impl in rmlx_metrics::events),
 // so all fields implement Debug — derive is sufficient.
 #[derive(Debug)]
 struct Inner {
@@ -519,7 +520,7 @@ impl ControllerHandle {
                 "admission_ctrl tick: insufficient_data — no adjustment"
             );
             let reason = DecisionReason::InsufficientData;
-            // H1: snapshot needed data, drop guard before writing to DB.
+            // Snapshot needed data, drop guard before writing to DB.
             let rec_opt = g.recorder.clone();
             let depth_snap = g.current_depth;
             let window_len = g.regressor.len();
@@ -586,7 +587,7 @@ impl ControllerHandle {
         // Publish the new depth to the atomic (hot-path lock-free reads).
         self.current_depth.store(g.current_depth, Ordering::Release);
 
-        // H1: snapshot needed data, drop guard before writing to DB.
+        // Snapshot needed data, drop guard before writing to DB.
         let rec_opt = g.recorder.clone();
         let depth_snap = g.current_depth;
         let window_len = g.regressor.len();
@@ -745,7 +746,7 @@ fn window_means(window: &VecDeque<(f64, f64, f64)>) -> (f64, f64, f64) {
 
 /// Write a tick event to the DB without holding `Inner`'s Mutex.
 ///
-/// H1: caller must snapshot the needed fields and drop the `Inner` guard before
+/// Caller must snapshot the needed fields and drop the `Inner` guard before
 /// calling this. `EventRecorder::record` acquires its own mutex + does a sync
 /// SQLite INSERT; executing that while holding `Inner`'s lock would stall the
 /// hot admission path (`check_admission`, `record_step`) for the full DB round-trip.
@@ -758,7 +759,7 @@ fn write_tick_event_unlocked(
     itl_target: f64,
 ) {
     if let Some(rec) = rec_opt {
-        // N2: sanitise non-finite floats — JSON does not allow NaN/Infinity.
+        // Sanitise non-finite floats — JSON does not allow NaN/Infinity.
         let safe_itl = if est_itl.is_finite() { est_itl } else { 0.0 };
         let safe_target = if itl_target.is_finite() {
             itl_target

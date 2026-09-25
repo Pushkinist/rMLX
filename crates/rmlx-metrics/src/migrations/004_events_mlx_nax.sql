@@ -2,9 +2,8 @@
 --
 -- The `mlx` bottle a run loads sometimes ships zero
 -- `steel_gemm_fused_nax*` kernels in `lib/mlx.metallib` (see
--- `crates/rmlx-mlx/src/nax.rs` and `.rmlx/mlx-homebrew-nax-regression.md`) —
--- on Neural-Accelerator-class hardware (M5-family and later) that costs
--- ~3.8x GPU-matmul throughput and 2.2-3.7x slower prefill; decode is
+-- `crates/rmlx-mlx/src/nax.rs`) — on Neural-Accelerator-class hardware
+-- (M5-family and later) that slows GPU matmul and prefill; decode is
 -- bandwidth-bound and looks normal. Without this column a bench row gives no
 -- way to tell whether it ran against a nax-capable build.
 --
@@ -15,7 +14,7 @@
 -- baked in at compile time describes the wrong machine.
 -- Free-form TEXT, not an enum/CHECK constraint: identity columns in this
 -- schema are recorded strings, never validated against a closed set (see
--- `canonicalize_kv_quant`'s doc in `rmlx-metrics::identity` and #214).
+-- `canonicalize_kv_quant`'s doc in `rmlx-metrics::identity`).
 --
 -- Nullable: rows written before this migration keep NULL. Append-only table
 -- — no backfill, no UPDATE. Cost is ~10 bytes/row.

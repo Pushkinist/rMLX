@@ -41,7 +41,7 @@ pub enum ContentBlock {
         /// Reasoning text emitted inside `<think>...</think>`.
         thinking: String,
     },
-    /// A5.5: tool_use block. `input` is a JSON object (NOT a JSON-stringified
+    /// tool_use block. `input` is a JSON object (NOT a JSON-stringified
     /// string — that's OpenAI's `arguments` shape). The Anthropic public ID
     /// prefix is `toolu_`, but reusing the parser's `call_<hex>` ID is
     /// acceptable for v1 — clients treat the field as an opaque string.

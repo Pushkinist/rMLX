@@ -1743,7 +1743,7 @@ fn integration_paro_generate_greedy() {
         println!("{}", line.trim());
         None
     };
-    // A7.2: greedy (temperature 0.0) — untouched argmax path.
+    // Greedy (temperature 0.0) — untouched argmax path.
     let test_sampler_cfg = crate::sampler::SamplerConfig {
         temperature: 0.0,
         top_p: 1.0,

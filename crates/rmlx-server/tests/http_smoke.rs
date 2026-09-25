@@ -522,7 +522,7 @@ async fn anthropic_messages_missing_max_tokens_returns_400() {
     );
 }
 
-// A5.1: tools field is now accepted — old 400 test updated.
+// Tools field is now accepted — old 400 test updated.
 // tools=[] is treated same as absent (empty normalises to None), so the
 // request reaches the generator which returns 404 (unknown model "x").
 #[tokio::test]
@@ -534,7 +534,7 @@ async fn anthropic_messages_with_empty_tools_is_accepted() {
     assert_ne!(status, 400, "tools=[] must not return 400 (A5.1)");
 }
 
-// ── A1: max_tokens cap enforcement (configurable, HTTP 400) ──────────────────
+// ── max_tokens cap enforcement (configurable, HTTP 400) ──────────────────
 
 /// OpenAI: requesting `max_tokens` above the server cap returns HTTP 400
 /// `invalid_request_error` with the requested and cap values in the message.
@@ -928,7 +928,7 @@ async fn models_report_context_numbers_only_when_capacity_is_known() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
-// ── A2: context_length_exceeded guard (HTTP 400) ─────────────────────────────
+// ── context_length_exceeded guard (HTTP 400) ─────────────────────────────
 
 /// OpenAI: a prompt longer than the loaded model's `effective_max_ctx`
 /// returns HTTP 400 `context_length_exceeded` with both numbers in the
@@ -1041,7 +1041,7 @@ async fn short_prompt_passes_ctx_guard_openai() {
     );
 }
 
-// ── A5.1: tools + tool_choice schema (no execution) ──────────────────────────
+// ── Tools + tool_choice schema (no execution) ──────────────────────────
 
 /// OpenAI route: a request with a full `tools` + `tool_choice: "auto"` payload
 /// reaches the generator (404 for unknown model) — not rejected with 400.
@@ -1138,10 +1138,9 @@ async fn openai_tool_choice_named_is_accepted() {
     );
 }
 
-// ── A6.1: response_format schema (no enforcement) ────────────────────────────
+// ── response_format schema ─────────────────────────────────────────────
 
-/// OpenAI: `response_format: {"type":"json_object"}` is now a first-class
-/// parsed field — must NOT return 400. With an unknown model it returns 404;
+/// OpenAI: `response_format: {"type":"json_object"}` is a parsed field — must NOT return 400. With an unknown model it returns 404;
 /// with a registered model + NotReadyGenerator it returns 503.
 ///
 /// This test uses an unknown model to avoid needing the snapshot on disk.
@@ -1195,9 +1194,9 @@ async fn openai_response_format_json_schema_is_accepted() {
     assert_eq!(status, 404, "unknown model must return 404, body: {body}");
 }
 
-// ── A7.1: sampling params schema (no enforcement) ─────────────────────────────
+// ── Sampling params schema ──────────────────────────────────────────────
 
-// ── A8: timeout middleware integration test ───────────────────────────────────
+// ── Timeout middleware integration test ───────────────────────────────────
 
 /// Build a test router with a `/slow` handler (sleeps 5 s) and `max_timeout_secs`
 /// set to 1, so the timeout middleware fires before the handler returns.
@@ -1271,7 +1270,7 @@ async fn start_timeout_test_server(max_timeout_secs: u64) -> u16 {
     port
 }
 
-/// A8: request to a slow handler with max_timeout_secs=1 must return 408
+/// Request to a slow handler with max_timeout_secs=1 must return 408
 /// with an OpenAI-shaped error body containing `"type":"timeout"`.
 #[tokio::test]
 async fn a8_slow_handler_times_out_with_408() {
@@ -1296,7 +1295,7 @@ async fn a8_slow_handler_times_out_with_408() {
     );
 }
 
-/// A8: bad header value → 400 invalid_request_error.
+/// Bad header value → 400 invalid_request_error.
 #[tokio::test]
 async fn a8_bad_timeout_header_returns_400() {
     let port = start_server(ModelRegistry::default()).await;
@@ -1350,7 +1349,7 @@ async fn openai_sampling_params_all_fields_accepted() {
     assert_eq!(status, 404, "unknown model must return 404, body: {body}");
 }
 
-// ── A9: tools-supported guard ─────────────────────────────────────────────────
+// ── Tools-supported guard ─────────────────────────────────────────────────
 
 /// Build a `ModelRegistry` with a single synthetic snapshot whose chat
 /// template raises an exception when `tools` is non-empty. The snapshot
@@ -1434,7 +1433,7 @@ async fn a9_tools_unsupported_snapshot_returns_no_500() {
     );
 }
 
-// ── H3/H4: usage chunk in streaming path ────────────────────────────────────
+// ── Usage chunk in streaming path ────────────────────────────────────
 //
 // These tests require the primary snapshot and ~30 s wall-clock (CPU).
 // Run manually:
@@ -1461,7 +1460,7 @@ fn parse_sse_events(raw: &str) -> Vec<serde_json::Value> {
     events
 }
 
-/// H3: OpenAI non-streaming response has a correct `usage` triple for two
+/// OpenAI non-streaming response has a correct `usage` triple for two
 /// different `max_tokens` values. Verifies that `total_tokens ==
 /// prompt_tokens + completion_tokens` and both token counts are positive.
 #[ignore = "requires primary snapshot + ~30s wall-clock (CPU, no KV cache)"]
@@ -1540,7 +1539,7 @@ async fn h3_non_streaming_usage_triple_exact() {
     tracing::info!(pt2, ct2, tt2, "H3 max_tokens=8: OK");
 }
 
-/// H4: streaming with `stream_options.include_usage=true` — the penultimate
+/// Streaming with `stream_options.include_usage=true` — the penultimate
 /// SSE event must be a usage chunk with `choices: []` and exact triple; the
 /// final event must be `[DONE]`.
 #[ignore = "requires primary snapshot + ~30s wall-clock (CPU, no KV cache)"]
@@ -1629,7 +1628,7 @@ async fn h4_streaming_include_usage_true_emits_usage_chunk() {
     );
 }
 
-/// H4: streaming with `stream_options.include_usage=false` (or absent) — NO
+/// Streaming with `stream_options.include_usage=false` (or absent) — NO
 /// chunk in the stream may contain a `usage` key.
 #[ignore = "requires primary snapshot + ~30s wall-clock (CPU, no KV cache)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

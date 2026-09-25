@@ -1668,7 +1668,7 @@ impl KvCache {
         // buffer, reset prev_offset/new_offset relative to 0. The SWA cache
         // effectively starts fresh — the phantom prefix tokens were never spilled.
         if needs_expand && self.decode_fp16_k.is_none() && prev_offset >= max_seq {
-            // H5: tracing event for SWA hydration offset reset (emit before mutation).
+            // Tracing event for SWA hydration offset reset (emit before mutation).
             tracing::warn!(
                 layer_max_seq = max_seq,
                 old_offset = prev_offset,

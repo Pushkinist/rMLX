@@ -11,10 +11,10 @@
 //! - `init` — create or migrate the DB schema.
 //! - `doctor` — check schema integrity; `--fix` applies repairs.
 //! - `record` — ingest one universal §8.5 JSON payload into `observations`.
-//! - `record-replay` — re-ingest all pending buffer files.
+//! - `record --replay-pending` — re-ingest all pending buffer files.
 //! - `best` — print the best-known measurement per metric × model × backend.
 //! - `rank` / `compare` — leaderboard and pairwise diff views.
-//! - `export` — write `BENCHMARK_CHAMPIONS.md` from current bests.
+//! - `export` — print the current bests (the `BENCHMARK_CHAMPIONS.md` source).
 //! - `backup` / `restore` — `VACUUM INTO` snapshots and restore from one.
 //! - `prompts` — manage the content-addressed prompt registry.
 //!
@@ -55,7 +55,7 @@ pub(crate) struct MetricsCmd {
     #[command(subcommand)]
     pub action: MetricsAction,
 
-    /// Path to the metrics DB (defaults to env RMLX_METRICS_DB or metrics/runs.db).
+    /// Path to the metrics DB (defaults to env RMLX_METRICS_DB or `<RMLX_HOME>/metrics/runs.db`).
     #[arg(long, global = true)]
     pub db: Option<PathBuf>,
 }
@@ -99,8 +99,8 @@ pub(crate) enum MetricsAction {
         #[arg(long, default_value_t = false, conflicts_with_all = ["inline", "file", "stdin"])]
         replay_pending: bool,
     },
-    /// Print this binary's §8.5 run-identity block (backend, version, git sha,
-    /// build profile, hardware tag). Shell emitters merge this instead of
+    /// Print this binary's §8.5 run-identity block (backend, version, build
+    /// profile, hardware tag). Shell emitters merge this instead of
     /// hand-rolling or hard-coding the fields.
     Identity {
         /// Emit as a single JSON object (the form bench scripts consume).
@@ -533,7 +533,7 @@ pub(crate) fn dispatch(cmd: MetricsCmd) -> anyhow::Result<()> {
 /// Resolve the DB path from (in priority order):
 ///   1. `--db` flag value
 ///   2. `RMLX_METRICS_DB` env var
-///   3. `metrics/runs.db` (relative to cwd at invocation)
+///   3. `rmlx_core::paths::metrics_db_path()` (`<RMLX_HOME>/metrics/runs.db`)
 ///
 /// Creates the parent directory if it does not exist.
 fn resolve_db_path(flag: Option<PathBuf>) -> anyhow::Result<PathBuf> {

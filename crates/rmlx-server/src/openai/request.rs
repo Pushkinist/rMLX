@@ -251,7 +251,7 @@ impl StopSequences {
     }
 }
 
-// ── A6.1: response_format request types (schema only; no enforcement yet) ────
+// ── response_format request types ───────────────────────────────────────
 
 /// Specification object carried inside `response_format` when `type = "json_schema"`.
 #[derive(Deserialize, Debug, Clone)]
@@ -300,7 +300,7 @@ pub enum ResponseFormat {
     },
 }
 
-// ── A5.1: tool-calling request types (schema only; no execution yet) ─────────
+// ── Tool-calling request types (schema only; no execution yet) ─────────
 
 /// OpenAI `tools[].function` sub-object.
 #[derive(Deserialize, Debug, Clone)]
@@ -403,7 +403,7 @@ pub struct ChatCompletionsRequest {
     /// Stop string(s); generation halts on the first match.
     pub stop: Option<StopSequences>,
 
-    // A5.1: tool-calling fields — parsed and normalised, not yet executed.
+    // Tool-calling fields — parsed and normalised; the client executes tools.
     /// Tool definitions available to the model.
     #[serde(default)]
     pub tools: Option<Vec<Tool>>,
@@ -411,13 +411,13 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     pub tool_choice: Option<ToolChoice>,
 
-    // A6.1: response format — parsed and normalised; constraint enforcement
+    // Response format — parsed and normalised; constraint enforcement
     // follows in A6.2..A6.5. `None` is equivalent to `Text` (plain text).
     /// Desired output format; `None` is plain text.
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
 
-    // A7.1: extended sampling fields (schema + plumb; decode stays greedy until A7.2/A7.3).
+    // Extended sampling fields.
     /// Top-k sampling cutoff; must be `>= 1` when set.
     #[serde(default)]
     pub top_k: Option<u32>,
@@ -439,7 +439,7 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     pub logit_bias: Option<HashMap<String, f32>>,
 
-    // H4: stream_options — lifted from the extra catch-all so include_usage
+    // stream_options — lifted from the extra catch-all so include_usage
     // is accessible by name. Only meaningful when stream=true; ignored for
     // non-streaming requests per the OpenAI spec.
     /// Stream output options; only meaningful when `stream = true`.
@@ -457,18 +457,12 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     pub top_logprobs: Option<u32>,
 
-    // OpenAI `echo` flag. When paired with `max_tokens=0` and
-    // `logprobs:true`, asks the server to return per-token logprobs over the
-    // PROMPT (no generation). Used by the wikitext-2 PPL harness.
-    //
-    // Status: the schema is parsed and validated; the runtime path that
-    // computes per-prompt-position logprobs is deferred (fell back to
-    // the standalone `rmlx eval ppl` CLI subcommand because exposing
-    // per-position prefill logits across every architecture required engine
-    // refactor outside this ticket's scope). Requests with `echo:true` are
-    // rejected with HTTP 501 and a "use `rmlx eval ppl`" hint until the
-    // follow-up lands. // TODO: wire per-arch forward-all-logits path and accept echo+max_tokens=0 here.
-    /// When `true` (with `max_tokens=0` + `logprobs:true`), return prompt logprobs instead of generating.
+    // OpenAI `echo` flag: with `max_tokens=0` and `logprobs:true`, OpenAI
+    // returns per-token logprobs over the PROMPT (no generation). rMLX parses
+    // and validates the field, but no route computes per-prompt-position
+    // logprobs: a request with `echo:true` gets HTTP 400 with a
+    // "use `rmlx eval ppl`" hint.
+    /// Parsed for OpenAI wire compatibility; `true` is refused with HTTP 400.
     #[serde(default)]
     pub echo: Option<bool>,
 
@@ -534,7 +528,7 @@ pub struct ChatCompletionsRequest {
     pub extra: HashMap<String, Value>,
 }
 
-/// H4: `stream_options` request field.
+/// `stream_options` request field.
 ///
 /// Currently only `include_usage` is used. The struct is kept open for
 /// future additions (e.g. `include_logprobs`) without changing the wire

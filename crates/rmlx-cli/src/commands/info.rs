@@ -502,7 +502,7 @@ pub(crate) fn run_info(
             seed = arch::SMOKE_PROMPT,
             "smoke_probe: running 8-token greedy generation from seeded prompt"
         );
-        // A7.2: smoke probe is always greedy (temperature 0.0).
+        // Smoke probe is always greedy (temperature 0.0).
         let smoke_sampler_cfg = rmlx_models::SamplerConfig {
             temperature: 0.0,
             top_p: 1.0,

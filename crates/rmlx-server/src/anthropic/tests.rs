@@ -4,7 +4,7 @@ fn parse(json: &str) -> Result<MessagesRequest, serde_json::Error> {
     serde_json::from_str(json)
 }
 
-// ── J3: typed OOM mapping (Anthropic error types) ────────────────────────
+// ── Typed OOM mapping (Anthropic error types) ────────────────────────
 
 async fn oom_parts(e: &rmlx_core::Error) -> (StatusCode, Option<String>, Value) {
     let resp = engine_error_response(e);
@@ -276,9 +276,9 @@ fn empty_messages_flag() {
     assert!(req.messages.is_empty()); // handler rejects this
 }
 
-// ── A5.1: tools + tool_choice are now first-class fields ─────────────────
+// ── Tools + tool_choice are parsed fields ──────────────────────────
 
-/// A5.1: tools=[] deserialises to an empty Vec (not extra).
+/// `tools=[]` deserialises to an empty Vec (not extra).
 #[test]
 fn tools_empty_array_parsed_as_field() {
     let req = parse(
@@ -290,7 +290,7 @@ fn tools_empty_array_parsed_as_field() {
     assert!(req.tools.as_ref().is_none_or(Vec::is_empty));
 }
 
-/// A5.1: full tools payload parses all fields correctly.
+/// Full tools payload parses all fields correctly.
 #[test]
 fn anthropic_tools_full_parse() {
     let req = parse(
@@ -316,7 +316,7 @@ fn anthropic_tools_full_parse() {
     assert!(tc.name.is_none());
 }
 
-/// A5.1: tool_choice with type="tool" parses name correctly.
+/// tool_choice with type="tool" parses name correctly.
 #[test]
 fn anthropic_tool_choice_named_parse() {
     let req = parse(
@@ -333,7 +333,7 @@ fn anthropic_tool_choice_named_parse() {
     assert_eq!(tc.name.as_deref(), Some("get_weather"));
 }
 
-/// A5.1: tool_choice is no longer in extra.
+/// `tool_choice` is not in extra.
 #[test]
 fn tool_choice_not_in_extra() {
     let req = parse(
@@ -444,7 +444,7 @@ fn stop_sequence_match_path_is_independent_of_map_stop_reason() {
     assert_eq!(matched.as_deref(), Some("<END>"));
 }
 
-// ── A5.5: tool_use serialisation + stop_reason upgrade ───────────────────
+// ── tool_use serialisation + stop_reason upgrade ───────────────────
 
 use serde_json::Map as JsonMap;
 
@@ -575,7 +575,7 @@ fn multi_tool_use_blocks_each_independent() {
     assert_eq!(arr[2]["input"]["tz"], "UTC");
 }
 
-// ── A5.5: streaming-side helper coverage ─────────────────────────────────
+// ── Streaming-side helper coverage ─────────────────────────────────
 
 fn event_data_string(ev: &Event) -> String {
     // axum's `Event` is opaque; rely on Debug rendering to access the
@@ -687,7 +687,7 @@ fn streaming_tool_use_closes_prior_text_block() {
     assert!(current_block.is_none());
 }
 
-// ── A7.1: Anthropic sampling schema ──────────────────────────────────────
+// ── Anthropic sampling schema ──────────────────────────────────────
 
 /// Anthropic MessagesRequest accepts `top_k`; OpenAI-only knobs
 /// (min_p, repetition_penalty, frequency_penalty, presence_penalty, logit_bias)

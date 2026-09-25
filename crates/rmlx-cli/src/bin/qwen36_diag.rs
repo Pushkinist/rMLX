@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
         ids.push(s.token_id);
         None
     };
-    // A7.2: diag binary is greedy (temperature 0.0).
+    // Diag binary is greedy (temperature 0.0).
     let diag_sampler_cfg = rmlx_models::SamplerConfig {
         temperature: 0.0,
         top_p: 1.0,

@@ -181,7 +181,7 @@ pub(crate) fn enqueue_tool_use_block(
 
 /// Streaming-side state machine. Lazily opens a content block on the
 /// first visible token, transitions blocks when `is_thinking` flips, and
-/// (A5.5) interleaves tool_use blocks with text/thinking blocks. Emits the
+/// interleaves tool_use blocks with text/thinking blocks. Emits the
 /// final `content_block_stop` + `message_delta` + `message_stop` triplet on
 /// stream end.
 ///
@@ -193,7 +193,7 @@ pub(crate) fn enqueue_tool_use_block(
 enum AnthropicState {
     Streaming {
         token_stream: futures::stream::BoxStream<'static, rmlx_core::Result<GenerationToken>>,
-        /// A5.5: parser when tools are enabled for this request.
+        /// Parser when tools are enabled for this request.
         parser: Option<ToolCallStreamParser>,
         output_tokens: u32,
         finish_reason: Option<String>,
@@ -203,26 +203,26 @@ enum AnthropicState {
         /// Index of the currently-open block (0 for the first block,
         /// increments on every transition or tool_use close).
         current_index: u32,
-        /// A5.5: tracks whether any tool_use block has been emitted, used
+        /// Tracks whether any tool_use block has been emitted, used
         /// to upgrade the terminal `stop_reason`.
         any_tool_use: bool,
         /// Pending events queued by the most recent step (e.g. a
         /// block transition emits 3 events: stop-old, start-new,
         /// delta-on-new). Drained before pulling the next token.
         pending: std::collections::VecDeque<Result<Event, std::convert::Infallible>>,
-        /// F1b: drainer handle for PromptTokens/CompletionTokens emit at epilogue.
+        /// Drainer handle for PromptTokens/CompletionTokens emit at epilogue.
         drainer: Option<crate::metrics_drainer::DrainerHandle>,
-        /// F1b: snapshot basename for MetricEvent.model_id.
+        /// Snapshot basename for MetricEvent.model_id.
         metrics_model_id: String,
-        /// F1b: prompt token count from request (before generate consumed it).
+        /// Prompt token count from request (before generate consumed it).
         input_token_count: u32,
-        /// F1b/F2: effective_max_ctx for MetricEvent.ctx_max.
+        /// effective_max_ctx for MetricEvent.ctx_max.
         metrics_ctx_max: i64,
-        /// F14: process-lifetime prompt-token counter shared with AppState.
+        /// Process-lifetime prompt-token counter shared with AppState.
         lifetime_tokens_in: Arc<std::sync::atomic::AtomicU64>,
-        /// F14: process-lifetime completion-token counter shared with AppState.
+        /// Process-lifetime completion-token counter shared with AppState.
         lifetime_tokens_out: Arc<std::sync::atomic::AtomicU64>,
-        /// F8: per-category error counters shared with AppState.
+        /// Per-category error counters shared with AppState.
         error_counts: crate::openai::ApiErrorCounters,
         /// process-lifetime completed-request counter shared with AppState.
         lifetime_requests_completed: Arc<std::sync::atomic::AtomicU64>,
@@ -266,7 +266,7 @@ enum AnthropicState {
 /// 6. `message_delta`
 /// 7. `message_stop`
 ///
-/// L6: `request_start` is the `Instant` captured at handler entry. TTFT is
+/// `request_start` is the `Instant` captured at handler entry. TTFT is
 /// computed when the first token arrives from the decode thread.
 #[allow(
     clippy::unwrap_used,
@@ -282,9 +282,9 @@ pub(super) async fn generate_streaming(
     request_start: Instant,
     state: &AppState,
     parser_format: Option<ToolCallFormat>,
-    // F1/F2: server effective_max_ctx for drainer MetricEvent.ctx_max.
+    // Server effective_max_ctx for drainer MetricEvent.ctx_max.
     ctx_max_for_metrics: i64,
-    // F10: correlation id resolved at handler entry.
+    // Correlation id resolved at handler entry.
     request_id: &str,
     // cold/warm flag for TTFT metric name selection.
     is_cold_request: bool,
@@ -295,7 +295,7 @@ pub(super) async fn generate_streaming(
     // disconnects.
     decode_lease: Option<crate::keep_alive::DecodeLeaseGuard>,
 ) -> Response {
-    // F1b: capture input token count before generator consumes the request.
+    // Capture input token count before generator consumes the request.
     let input_token_count = req.prompt_tokens.len() as u32;
     // Capture stop sequences before `req` is moved into the generator.
     let stop_sequences = req.stop.clone();
@@ -324,7 +324,7 @@ pub(super) async fn generate_streaming(
             return engine_error_response(&e);
         }
         Some(Ok(tok)) => {
-            // L6: TTFT captured immediately when the first token arrives from
+            // TTFT captured immediately when the first token arrives from
             // the decode thread — before SSE serialisation or TCP flush.
             let ttft_ms = request_start.elapsed().as_millis() as u64;
             tracing::info!(
@@ -343,7 +343,7 @@ pub(super) async fn generate_streaming(
                     ttft_ms,
                 });
             }
-            // F1a: emit TtftMs to SQLite via SPSC drainer (single emit per request).
+            // Emit TtftMs to SQLite via SPSC drainer (single emit per request).
             if let Some(ref drainer) = state.metrics_drainer {
                 use crate::metrics_drainer::{MetricEvent, MetricKind};
                 drainer.try_emit(MetricEvent {
@@ -378,7 +378,7 @@ pub(super) async fn generate_streaming(
         }
     };
 
-    // F10: use the correlation id resolved at handler entry so that the id
+    // Use the correlation id resolved at handler entry so that the id
     // embedded in every SSE event matches the X-Request-Id response header.
     let id = format!("msg_{request_id}");
     let model = model_id.to_owned();
@@ -420,10 +420,10 @@ pub(super) async fn generate_streaming(
                 .boxed(),
         };
 
-    // A5.5: instantiate parser when the caller supplied a format.
+    // Instantiate parser when the caller supplied a format.
     let parser_init: Option<ToolCallStreamParser> = parser_format.map(ToolCallStreamParser::new);
 
-    // F1b: clone drainer + capture context for PromptTokens/CompletionTokens
+    // Clone drainer + capture context for PromptTokens/CompletionTokens
     // emit at the epilogue boundary (inside the `unfold` async closure).
     let drainer_for_stream = state.metrics_drainer.clone();
     let model_id_for_stream = model_id.to_owned();
@@ -442,10 +442,10 @@ pub(super) async fn generate_streaming(
             metrics_model_id: model_id_for_stream,
             input_token_count,
             metrics_ctx_max: ctx_max_for_metrics,
-            // F14: share process-lifetime counters from AppState.
+            // Share process-lifetime counters from AppState.
             lifetime_tokens_in: Arc::clone(&state.tokens_in),
             lifetime_tokens_out: Arc::clone(&state.tokens_out),
-            // F8: share per-category error counters from AppState.
+            // Share per-category error counters from AppState.
             error_counts: state.error_counts.clone(),
             // share request lifecycle counters from AppState.
             lifetime_requests_completed: Arc::clone(&state.requests_completed),
@@ -544,7 +544,7 @@ pub(super) async fn generate_streaming(
                                 if tok.done {
                                     finish_reason.clone_from(&tok.finish_reason);
                                 }
-                                // A3: skip empty pieces — they would
+                                // Skip empty pieces — they would
                                 // produce an empty delta, which Anthropic
                                 // clients should never see.
                                 if tok.piece.is_empty() {
@@ -555,7 +555,7 @@ pub(super) async fn generate_streaming(
                                     continue;
                                 }
 
-                                // A5.5 / A5.6: feed the parser regardless of
+                                // Feed the parser regardless of
                                 // think state. A reasoning model may emit the
                                 // tool call without closing `</think>`
                                 // (`Ternary-Bonsai`); a thinking-only bypass
@@ -733,7 +733,7 @@ pub(super) async fn generate_streaming(
                                 ));
                             }
                             Some(Err(e)) => {
-                                // F8: mid-stream engine error — count even
+                                // Mid-stream engine error — count even
                                 // though HTTP 200 is already sent.
                                 error_counts.increment(engine_error_category(&e));
                                 // count mid-stream failures as failed requests.
@@ -845,7 +845,7 @@ pub(super) async fn generate_streaming(
                         }
                     }
 
-                    // A5.5: when the previous block was a tool_use, it has
+                    // When the previous block was a tool_use, it has
                     // already been closed by `enqueue_tool_use_block` and
                     // `current_block` was reset to `None` with `current_index`
                     // already advanced past the closed block. In that case
@@ -894,7 +894,7 @@ pub(super) async fn generate_streaming(
                     events.push_back(Ok(sse_event("message_delta", &msg_delta)));
                     events.push_back(Ok(sse_event("message_stop", &msg_stop)));
 
-                    // F1b: emit PromptTokens + CompletionTokens to SQLite via
+                    // Emit PromptTokens + CompletionTokens to SQLite via
                     // the SPSC drainer at epilogue boundary — same token counts
                     // that populate the Anthropic `usage` response body.
                     // Single-source, single emit per completed request.
@@ -916,7 +916,7 @@ pub(super) async fn generate_streaming(
                             kind: MetricKind::CompletionTokens(output_tokens),
                         });
                     }
-                    // F14: increment process-lifetime token counters (single
+                    // Increment process-lifetime token counters (single
                     // source: same values as the SPSC drainer emit above).
                     lifetime_tokens_in.fetch_add(
                         u64::from(input_token_count),
@@ -956,7 +956,7 @@ pub(super) async fn generate_streaming(
         },
     );
 
-    // F10: add the correlation id as a response header on the SSE response.
+    // Add the correlation id as a response header on the SSE response.
     // Wrap the composed SSE stream in a GuardedStream so the
     // decode-lease guard drops when the stream is fully consumed or the
     // client disconnects. Box::pin the composed stream so the wrapper meets

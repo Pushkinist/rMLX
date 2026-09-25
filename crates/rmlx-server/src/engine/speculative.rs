@@ -312,7 +312,7 @@ pub struct SpeculativeGenerator {
     /// The verifier's context limits. A per-request `max_ctx` override is
     /// resolved against these by the route layer.
     context_limits: rmlx_models::context::ContextLimits,
-    /// A10: detokenization family from the verifier's `tokenizer.json`.
+    /// Detokenization family from the verifier's `tokenizer.json`.
     tokenizer_kind: crate::detokenizer::TokenizerKind,
     /// The drafter, and with it the round loop. Never implicit: inferred from
     /// the draft snapshot's declaration, or named by `--draft-kind`.
@@ -500,7 +500,7 @@ impl SpeculativeGenerator {
         let tokenizer = tokenizers::Tokenizer::from_file(&tk_path)
             .map_err(|e| Error::Other(format!("load tokenizer: {e}")))?;
 
-        // A10: classify detokenizer family from the verifier tokenizer.json.
+        // Classify detokenizer family from the verifier tokenizer.json.
         let tokenizer_kind = match std::fs::read(&tk_path)
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -549,7 +549,7 @@ impl SpeculativeGenerator {
             tokenizer: Arc::new(tokenizer),
             device,
             model_id,
-            // C4: shared process-wide GPU gate (see ArchGenerator above).
+            // Shared process-wide GPU gate (see ArchGenerator above).
             _lock: gpu_gate,
             kv_quant_override: kv_quant_resolved,
             max_ctx_override,
@@ -635,7 +635,7 @@ impl Generator for SpeculativeGenerator {
         let drafter = self.drafter.clone();
         let block_size = self.block_size;
         let tokenizer = Arc::clone(&self.tokenizer);
-        // A10: detokenizer family for the streaming UTF-8 token-healer.
+        // Detokenizer family for the streaming UTF-8 token-healer.
         let tokenizer_kind = self.tokenizer_kind;
         let prompt_tokens = req.prompt_tokens.clone();
         let n_tokens = req.max_tokens as usize;
@@ -663,17 +663,17 @@ impl Generator for SpeculativeGenerator {
         }
         // Per-request max-ctx ceiling override (the lazy-grow path).
         let max_ctx_override = req.max_ctx_override.or(self.max_ctx_override);
-        // F2: capture effective_max_ctx for drainer MetricEvent.ctx_max field.
+        // Capture effective_max_ctx for drainer MetricEvent.ctx_max field.
         let effective_max_ctx_val = self.effective_max_ctx as i64;
-        // N2: use effective_prompt_cache_slots override if set by route handler.
+        // Use effective_prompt_cache_slots override if set by route handler.
         let prompt_cache_slots = req
             .effective_prompt_cache_slots
             .unwrap_or(self.prompt_cache_slots);
         let eos_ids = Arc::clone(&self.eos_ids);
         let model_id_for_log = self.model_id.clone();
-        // F6/L18: drainer handle for non-blocking SQLite metric emission.
+        // Drainer handle for non-blocking SQLite metric emission.
         let metrics_drainer = req.metrics_drainer;
-        // M30: ITL ring-buffer handle for per-request latency aggregates.
+        // ITL ring-buffer handle for per-request latency aggregates.
         let itl_store = req.itl_store;
         // per-event DB recorder (TTFT is written by the HTTP handler
         // layer off-runtime; only ITL/kv_cache_bytes are written here).
@@ -762,7 +762,7 @@ impl Generator for SpeculativeGenerator {
         } else {
             None
         };
-        // A5.6: reconstruct suppressed tool-protocol markers (see
+        // Reconstruct suppressed tool-protocol markers (see
         // ArchGenerator site for rationale).
         let emit_tool_markers = req.emit_tool_markers;
 
@@ -809,15 +809,15 @@ impl Generator for SpeculativeGenerator {
             // transparently — each ProbeStep call appends one id and
             // re-decodes the full prefix.
             //
-            // A10: owned by `StreamingDetokenizer` (UTF-8 token-healing —
+            // Owned by `StreamingDetokenizer` (UTF-8 token-healing —
             // see ArchGenerator site). A multi-byte codepoint split by a
             // speculative round boundary is held until the next ProbeStep
             // completes it.
             let mut detok = crate::detokenizer::StreamingDetokenizer::new(tokenizer_kind);
-            // M30: pre-allocated per-step timestamps for ITL computation.
+            // Pre-allocated per-step timestamps for ITL computation.
             let mut step_timestamps: Vec<Instant> = Vec::with_capacity(n_tokens);
             let mut cancelled = false;
-            // A3: same shape as ArchGenerator — `None` for non-reasoning archs.
+            // Same shape as ArchGenerator — `None` for non-reasoning archs.
             let mut think_splitter = think_splitter;
             let tx_ref = &tx;
             let cancelled_ref = &mut cancelled;
@@ -830,7 +830,7 @@ impl Generator for SpeculativeGenerator {
             // Every speculative loop discards it (see `emit_step`), so a
             // thinking budget's force-close is inert here.
             let mut step_fn = |s: &rmlx_models::ProbeStep| -> Option<u32> {
-                // M30: record step arrival time for ITL computation.
+                // Record step arrival time for ITL computation.
                 timestamps_ref.push(Instant::now());
                 if *cancelled_ref {
                     return None;
@@ -846,7 +846,7 @@ impl Generator for SpeculativeGenerator {
                         String::new()
                     }
                 };
-                // A5.6: reconstruct suppressed Gemma tool markers (see
+                // Reconstruct suppressed Gemma tool markers (see
                 // ArchGenerator site for the full rationale).
                 if emit_tool_markers && text.is_empty() {
                     if let Some(surface) = tokenizer_ref.id_to_token(s.token_id) {
@@ -855,7 +855,7 @@ impl Generator for SpeculativeGenerator {
                         }
                     }
                 }
-                // A3: route through the think-splitter when present.
+                // Route through the think-splitter when present.
                 let (visible, is_thinking) = match think_splitter_ref.as_mut() {
                     Some(sm) => sm.step(&text),
                     None => (text, false),
@@ -1010,7 +1010,7 @@ impl Generator for SpeculativeGenerator {
                 return;
             }
 
-            // M30: compute ITL stats from step timestamps and emit (same as ArchGenerator).
+            // Compute ITL stats from step timestamps and emit (same as ArchGenerator).
             {
                 let itl_opt = compute_itl_stats(&step_timestamps);
                 if let Some((p50, p95, p99, mean, spikes)) = itl_opt {
@@ -1053,7 +1053,7 @@ impl Generator for SpeculativeGenerator {
                                 step_count,
                             },
                         });
-                        // F9: p99 and spike count as separate metric events.
+                        // P99 and spike count as separate metric events.
                         drainer.try_emit(MetricEvent {
                             model_id: model_id_for_log.clone(),
                             kv_quant: kv_quant_label(kv_quant_override),
@@ -1104,7 +1104,7 @@ impl Generator for SpeculativeGenerator {
                     } else {
                         "length".to_owned()
                     };
-                    // F6/L18: emit KV-cache bytes to the SPSC drainer, read off
+                    // Emit KV-cache bytes to the SPSC drainer, read off
                     // the verifier instance's own counter (see `kv_before`).
                     {
                         // Attribute the byte count to this generation before
@@ -1171,7 +1171,7 @@ impl Generator for SpeculativeGenerator {
                             }
                         }
                     }
-                    // C7: emit Metal allocator high-water at the same boundary.
+                    // Emit Metal allocator high-water at the same boundary.
                     if let Some(peak_bytes) = rmlx_mlx::mlx_peak_memory_bytes() {
                         let peak_mb = peak_bytes / 1_048_576;
                         tracing::info!(
@@ -1190,7 +1190,7 @@ impl Generator for SpeculativeGenerator {
                             });
                         }
                     }
-                    // A10: flush any withheld multi-byte tail (see
+                    // Flush any withheld multi-byte tail (see
                     // ArchGenerator site for rationale).
                     if !cancelled {
                         match detok.finalize(&tokenizer) {
@@ -1216,7 +1216,7 @@ impl Generator for SpeculativeGenerator {
                         piece: String::new(),
                         done: true,
                         finish_reason: Some(finish_reason),
-                        // A3: see ArchGenerator done-token comment.
+                        // See ArchGenerator done-token comment.
                         is_thinking: false,
                         logprobs: None,
                     };

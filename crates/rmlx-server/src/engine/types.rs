@@ -31,7 +31,7 @@ pub enum Phase {
     Decode,
 }
 
-// ── A5.1: route-agnostic tool normalisation ───────────────────────────────────
+// ── Route-agnostic tool normalisation ───────────────────────────────────
 
 /// A single tool in a normalised, route-agnostic form.
 ///
@@ -69,7 +69,7 @@ pub enum NormalizedToolChoice {
     Named(String),
 }
 
-/// A5.2: Convert a `NormalizedTool` to the OpenAI-shaped `serde_json::Value`
+/// Convert a `NormalizedTool` to the OpenAI-shaped `serde_json::Value`
 /// that chat templates expect in their `tools` context variable.
 ///
 /// Shape:
@@ -144,7 +144,7 @@ pub struct ModelLoadConfig {
     pub image_max_tokens: Option<usize>,
 }
 
-// ── A6.1: route-agnostic response-format normalisation ───────────────────────
+// ── Route-agnostic response-format normalisation ───────────────────────
 
 /// Route-agnostic representation of the requested output format.
 ///
@@ -179,16 +179,16 @@ pub enum NormalizedResponseFormat {
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
-// ── A7.1: SamplingParams ──────────────────────────────────────────────────────
+// ── SamplingParams ──────────────────────────────────────────────────────
 
 /// Fully resolved sampling parameters for one generation request.
 ///
 /// All fields carry their effective value after the three-tier fallback:
-/// **request > model `generation_defaults` (A4) > hard-coded default**.
+/// **request > model `generation_defaults` > hard-coded default**.
 ///
 /// Resolution is performed by `resolve_sampling_params` in `openai.rs`.
 ///
-/// **Greedy no-op (A7.1):** The decode loop in every architecture still calls
+/// **Greedy no-op:** The decode loop in every architecture still calls
 /// `generate_greedy`, which ignores all sampling fields. Real sampling
 /// (temperature, top_k / top_p / min_p nucleus, penalties, logit_bias) lands
 /// in A7.2 (core) and A7.3 (penalties + logit_bias).
@@ -247,7 +247,7 @@ impl Default for SamplingParams {
 
 /// One token-generation request, fully parsed/validated.
 ///
-/// A6.2: dropped the `Clone` derive because `constraint` carries a
+/// Dropped the `Clone` derive because `constraint` carries a
 /// `Box<dyn ConstraintEngine>` trait object that has no clone impl.
 /// No production callsite ever clones a `GenerationRequest`; the route
 /// handlers move the value into `Generator::generate` and the engine
@@ -264,7 +264,7 @@ pub struct GenerationRequest {
     pub prompt_tokens: Vec<u32>,
     /// Maximum new tokens to generate before stopping.
     pub max_tokens: u32,
-    /// A7.1: fully resolved sampling parameters.
+    /// Fully resolved sampling parameters.
     ///
     /// Decode stays greedy (A7.1 schema-only). Real sampling lands in A7.2/A7.3.
     pub sampling: SamplingParams,
@@ -279,24 +279,24 @@ pub struct GenerationRequest {
     /// the prompt-message list so the engine receives one canonical form.
     /// Anthropic format has `system` as a top-level field, which maps directly.
     pub system: Option<String>,
-    /// Optional session identifier from `X-Session-Id` header (N2).
+    /// Optional session identifier from `X-Session-Id` header.
     ///
     /// When present, the engine uses this to reserve a PromptCache slot for
     /// the session so FIFO eviction does not clobber it between turns.
     /// Absence falls back to the N1 prompt-cache path with no reservation.
     pub session_id: Option<String>,
-    /// Effective prompt-cache slot count computed by the route handler (N2).
+    /// Effective prompt-cache slot count computed by the route handler.
     ///
     /// Set to `base_slots + session_cache.active_count()` when a session ID
     /// is present. `None` means use the generator's default `prompt_cache_slots`.
     pub effective_prompt_cache_slots: Option<usize>,
-    /// F6/L18: SPSC drainer handle for per-request SQLite metric emission.
+    /// SPSC drainer handle for per-request SQLite metric emission.
     ///
     /// Injected by the route handler from `AppState::metrics_drainer`. `None`
     /// in unit-test paths that do not wire the drainer. The blocking thread
     /// calls `try_emit` (non-blocking) after each post-generation stat read.
     pub metrics_drainer: Option<DrainerHandle>,
-    /// M30: ring-buffer for ITL aggregate samples.
+    /// Ring-buffer for ITL aggregate samples.
     ///
     /// Injected by the route handler from `AppState::itl_store`. The blocking
     /// thread writes one `ItlSample` after all decode steps complete so the
@@ -312,9 +312,9 @@ pub struct GenerationRequest {
     /// `None` in unit-test paths that do not wire the recorder.
     pub event_recorder: Option<Arc<EventRecorder>>,
 
-    // A5.1: tool-calling fields (parsed + normalised; not yet consumed).
-    // A5.2 (chat-template injection), A5.3 (output parser), A5.4/A5.5
-    // (response emission) will read these. The decode loop currently ignores them.
+    // Tool-calling fields (parsed + normalised). The decode loop does not read
+    // them: the route injects the tools into the chat template and parses tool
+    // calls out of the output.
     /// Normalised tools from `tools` array. `None` when the request omitted
     /// `tools` or supplied an empty array.
     pub tools: Option<Vec<NormalizedTool>>,
@@ -322,20 +322,19 @@ pub struct GenerationRequest {
     /// `tool_choice` was present in the request.
     pub tool_choice: Option<NormalizedToolChoice>,
 
-    /// A6.1: response-format (parsed + normalised; not yet consumed).
-    ///
-    /// A6.2..A6.5 will wire logit masking / grammar enforcement.
+    /// Response-format (parsed + normalised). The decode loop does not read
+    /// it: the route builds the grammar from it and passes it as `constraint`.
     /// `None` is equivalent to `Text` — plain text output, no constraint.
     pub response_format: Option<NormalizedResponseFormat>,
 
-    /// A6.2: optional sampler constraint engine, instantiated by the route
+    /// Optional sampler constraint engine, instantiated by the route
     /// handler when `response_format ∈ {JsonObject, JsonSchema}`. Threaded
     /// into the per-arch decode loops via `Architecture::generate_greedy`.
     /// `None` for plain-text requests — the decode loop pays only an
     /// `Option::as_mut()` discriminant check on the hot path.
     pub constraint: Option<Box<dyn rmlx_models::ConstraintEngine>>,
 
-    /// A6.3: shared `is_thinking` flag, updated by the route's step_fn
+    /// Shared `is_thinking` flag, updated by the route's step_fn
     /// after the think-splitter classifies each emitted token. The
     /// `JsonObjectConstraint` reads this on every `advance` to defer
     /// engagement while the model is in its reasoning channel. `None`
@@ -367,7 +366,7 @@ pub struct GenerationRequest {
     /// channel and, through it, the constraint engine's `is_thinking` gate.
     pub prompt_think_open: bool,
 
-    /// A5.6: reconstruct tool-protocol special-token markers into the
+    /// Reconstruct tool-protocol special-token markers into the
     /// decoded piece stream so the response tool-call parser can see them.
     ///
     /// The Gemma-4 tool markers (`<|tool_call>`, `<tool_call|>`, `<|"|>`,
@@ -401,7 +400,7 @@ pub struct GenerationRequest {
     /// the budget correctly.
     pub thinking_end_token: Option<String>,
 
-    /// C5 Slice A: the FIFO admission guard for this request.
+    /// The FIFO admission guard for this request.
     ///
     /// The route handler acquires the single `AppState::gpu_queue` permit
     /// (FIFO order) and an RAII pending-count decrement, packs both into a
@@ -447,7 +446,7 @@ pub struct GenerationRequest {
     pub image_max_tokens: Option<usize>,
 }
 
-/// C5 Slice A: RAII admission guard moved into [`GenerationRequest`].
+/// RAII admission guard moved into [`GenerationRequest`].
 ///
 /// Holds the single owned FIFO permit from `AppState::gpu_queue` plus a
 /// clone of `AppState::gpu_pending`. Dropping it (when the spawned decode
@@ -480,7 +479,7 @@ impl GpuAdmission {
     }
 }
 
-/// C5 Slice A: result of an admission attempt.
+/// Result of an admission attempt.
 ///
 /// `Admitted` carries the FIFO guard the caller must move into the
 /// `GenerationRequest`. `QueueFull` means the depth check rejected the
@@ -506,7 +505,7 @@ pub enum Admission {
     QueueFull,
 }
 
-/// C5 Slice A: bounded-depth FIFO admission over the single-GPU permit.
+/// Bounded-depth FIFO admission over the single-GPU permit.
 ///
 /// 1. If `max_queue_depth > 0` and `gpu_pending >= max_queue_depth`, reject
 ///    the request immediately.
@@ -584,7 +583,7 @@ pub struct GenerationToken {
     pub done: bool,
     /// `"stop"` | `"length"` | `None` (only set when `done == true`)
     pub finish_reason: Option<String>,
-    /// A3: whether the visible `piece` text was emitted from inside a
+    /// Whether the visible `piece` text was emitted from inside a
     /// `<think>...</think>` reasoning block. Always `false` for
     /// architectures whose `Architecture::supports_thinking()` returns
     /// `false`. Also `false` for the terminal `done` token (empty piece).

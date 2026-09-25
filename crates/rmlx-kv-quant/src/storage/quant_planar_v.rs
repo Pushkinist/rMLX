@@ -234,7 +234,7 @@ impl QuantPlanarV {
                         &[1],
                         device,
                     )?;
-                    // H7: tracing event for hydrated QuantPlanarV GPU init.
+                    // Tracing event for hydrated QuantPlanarV GPU init.
                     tracing::debug!(
                         prev_seq,
                         init_cap,

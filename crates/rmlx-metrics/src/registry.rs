@@ -279,7 +279,7 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
         Direction::HigherBetter,
         Bounds::non_negative(1.0),
     ),
-    // N19: prompt-cache hit/miss/bytes counters.
+    // Prompt-cache hit/miss/bytes counters.
     (
         "prompt_cache_hits",
         "count",
@@ -298,7 +298,7 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
         Direction::LowerBetter,
         Bounds::non_negative(BYTES_CEILING),
     ),
-    // C6: block-level prompt-cache counters (monotonic).
+    // Block-level prompt-cache counters (monotonic).
     (
         "prompt_cache_block_hits",
         "count",
@@ -370,7 +370,7 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
         Direction::LowerBetter,
         Bounds::non_negative(MS_CEILING),
     ),
-    // C5 Slice A: FIFO admission-queue observability (rmlx-only).
+    // FIFO admission-queue observability (rmlx-only).
     (
         "queue_wait_ms",
         "ms",
@@ -383,7 +383,7 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
         Direction::LowerBetter,
         Bounds::non_negative(COUNT_CEILING),
     ),
-    // F1b: per-request token counts from live HTTP handler (rmlx-only).
+    // Per-request token counts from live HTTP handler (rmlx-only).
     // Suffixed `_live` to distinguish from the bench-config `prompt_tokens` /
     // `completion_tokens` columns on `observations` (those are bench metadata;
     // these are per-request telemetry metrics).
@@ -399,7 +399,7 @@ pub const METRICS: &[(&str, &str, Direction, Bounds)] = &[
         Direction::LowerBetter,
         Bounds::non_negative(COUNT_CEILING),
     ),
-    // F9: extended ITL percentile and spike counter (rmlx-only).
+    // Extended ITL percentile and spike counter (rmlx-only).
     // `itl_p99_ms` — 99th-percentile inter-token latency; emitted alongside
     // the existing itl_p50_ms/itl_p95_ms from `ItlStats`.
     // `itl_spikes` — count of intervals > 3×median per request; diagnostic for
@@ -714,11 +714,11 @@ pub const COVERAGE_MATRIX: &[(&str, &str, Coverage)] = &[
     ("rmlx", "kv_cache_bytes", Coverage::Yes),
     ("rmlx", "tps_per_gb_ram", Coverage::Yes),
     ("rmlx", "task_pass_at_1", Coverage::No),
-    // N19: prompt-cache counters — rmlx-only (other backends don't expose this).
+    // Prompt-cache counters — rmlx-only (other backends don't expose this).
     ("rmlx", "prompt_cache_hits", Coverage::Yes),
     ("rmlx", "prompt_cache_misses", Coverage::Yes),
     ("rmlx", "prompt_cache_bytes", Coverage::Yes),
-    // C6: block-level counters — rmlx-only.
+    // Block-level counters — rmlx-only.
     ("rmlx", "prompt_cache_block_hits", Coverage::Yes),
     ("rmlx", "prompt_cache_block_misses", Coverage::Yes),
     ("rmlx", "prompt_cache_partial_hits", Coverage::Yes),
@@ -732,16 +732,16 @@ pub const COVERAGE_MATRIX: &[(&str, &str, Coverage)] = &[
     ("rmlx", "load_gpu_residency_ms", Coverage::Yes),
     ("rmlx", "load_first_kernel_ready_ms", Coverage::Yes),
     ("rmlx", "load_total_ms", Coverage::Yes),
-    // C5 Slice A: admission-queue metrics — rmlx-only (other backends have
+    // Admission-queue metrics — rmlx-only (other backends have
     // no in-process admission queue to observe).
     ("rmlx", "queue_wait_ms", Coverage::Yes),
     ("rmlx", "queue_depth", Coverage::Yes),
-    // F1b: per-request live token counts — rmlx-only (emitted from the HTTP
+    // Per-request live token counts — rmlx-only (emitted from the HTTP
     // handler after each completed request; other backends do not flow through
     // this drainer path).
     ("rmlx", "prompt_tokens_live", Coverage::Yes),
     ("rmlx", "completion_tokens_live", Coverage::Yes),
-    // F9: extended ITL stats — rmlx-only (emitted from engine decode path;
+    // Extended ITL stats — rmlx-only (emitted from engine decode path;
     // other backends do not have access to per-step Instant timestamps).
     ("rmlx", "itl_p99_ms", Coverage::Yes),
     ("rmlx", "itl_spikes", Coverage::Yes),

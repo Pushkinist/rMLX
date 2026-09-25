@@ -856,7 +856,7 @@ fn over_cap_refusal_preserves_existing_slots() {
     );
 }
 
-/// C1: long-prompt block-aligned partial hit.
+/// Long-prompt block-aligned partial hit.
 ///
 /// Cache a 4096-token prompt (16 full 256-tok blocks). Query with a
 /// prompt that shares the first 3840 tokens (15 blocks) then has 256
@@ -906,7 +906,7 @@ fn long_prompt_block_aligned_partial_hit() {
     assert_eq!(stats.misses, 0);
 }
 
-/// C6: block-level counters — partial hit, full block hit, and total miss.
+/// Block-level counters — partial hit, full block hit, and total miss.
 ///
 /// Cache a 16-block (4096-token) prompt.
 ///

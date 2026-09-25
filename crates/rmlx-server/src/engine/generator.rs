@@ -27,7 +27,7 @@ pub trait Generator: Send + Sync {
     /// Return the KV-cache bytes from the last completed request for this generator.
     ///
     /// Reads the counter on the model instance this generator serves, written
-    /// by `generate_greedy` at request boundary (N16). Returns 0 when no
+    /// by `generate_greedy` at request boundary. Returns 0 when no
     /// request has completed yet or the arch does not track KV-cache bytes.
     ///
     /// This is a **display** surface: it hands back the last-known count with
@@ -39,7 +39,7 @@ pub trait Generator: Send + Sync {
         0
     }
 
-    /// Return the load-phase timing from the most recent `load_model` call (N17).
+    /// Return the load-phase timing from the most recent `load_model` call.
     ///
     /// Returns `None` when no model has been loaded yet or the generator does
     /// not participate in arch-dispatch load (e.g. `NotReadyGenerator`).

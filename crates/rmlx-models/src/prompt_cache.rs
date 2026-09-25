@@ -33,7 +33,7 @@
 //! It is updated on every `find_best_prefix` call (hit/miss) and every
 //! evicting `push`. Reset via `clear()`.
 //!
-//! ## LRU policy (M29)
+//! ## LRU policy
 //!
 //! Each slot carries a `last_used_seq: u64` counter (monotonically increasing,
 //! no syscall). On every `find_best_prefix` hit the winning slot's counter is

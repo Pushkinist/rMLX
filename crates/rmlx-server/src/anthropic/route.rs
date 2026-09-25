@@ -40,9 +40,8 @@ use super::request::{AnthropicContent, MessagesRequest};
 use super::response::ContentBlock;
 use super::streaming::generate_streaming;
 
-// A5.1: no fields in the Anthropic extra-rejection list — tools + tool_choice
-// are now first-class parsed fields. Retain the section header so future
-// fields (e.g. computer_use, A6-style response_format) have a home.
+// No fields in the Anthropic extra-rejection list — tools + tool_choice are
+// parsed fields.
 
 /// Emit one metric record; silently drops on error or absent sink.
 pub(super) fn record_metric(
@@ -110,7 +109,7 @@ pub(crate) fn map_stop_reason(finish_reason: Option<&str>) -> String {
     }
 }
 
-/// A5.5: select the wire `stop_reason` after consuming the full token stream.
+/// Select the wire `stop_reason` after consuming the full token stream.
 ///
 /// Per the Anthropic spec, when any tool_use block was emitted, the response
 /// carries `stop_reason="tool_use"` regardless of the natural model finish
@@ -123,7 +122,7 @@ pub(crate) fn select_anthropic_stop_reason(any_tool_use: bool, terminal: String)
     }
 }
 
-/// A5.5: convert a `ParsedToolCall` into the Anthropic `tool_use` content block.
+/// Convert a `ParsedToolCall` into the Anthropic `tool_use` content block.
 ///
 /// Note: Anthropic's `input` is a JSON object, NOT a JSON-stringified string
 /// (that's the OpenAI `arguments` shape).
@@ -150,10 +149,10 @@ pub(crate) async fn messages(
     headers: HeaderMap,
     LoggedJson(req): LoggedJson<MessagesRequest>,
 ) -> Response {
-    // L6: wall-clock anchor for TTFT. Captured immediately after header parse.
+    // Wall-clock anchor for TTFT. Captured immediately after header parse.
     let request_start = Instant::now();
 
-    // F10: resolve correlation id; the span is attached to each generate call
+    // Resolve correlation id; the span is attached to each generate call
     // via .instrument() so all tracing inside generate_blocking / generate_streaming
     // automatically carry request_id.
     let rid = resolve_request_id(&headers);
@@ -255,9 +254,9 @@ pub(crate) async fn messages(
 
     let system: Option<String> = req.system.as_ref().map(|s| s.as_text().into_owned());
 
-    // A5.1: normalise Anthropic tools → route-agnostic NormalizedTool.
+    // Normalise Anthropic tools → route-agnostic NormalizedTool.
     // Moved before the prompt pipeline so `jinja_tools` is available for
-    // injection into RenderOpts (A5.2). Empty array treated same as absent.
+    // injection into RenderOpts. Empty array treated same as absent.
     let norm_tools: Option<Vec<NormalizedTool>> =
         req.tools.filter(|v| !v.is_empty()).map(|tools| {
             tools
@@ -295,7 +294,7 @@ pub(crate) async fn messages(
         },
     };
 
-    // A5.2: convert normalised tools to OpenAI-shaped JSON values for Jinja.
+    // Convert normalised tools to OpenAI-shaped JSON values for Jinja.
     // Note: tool_choice:"none" / Anthropic does not have a "none" variant, so
     // tools are always injected when present. Hard suppression is a v1.x item.
     let jinja_tools: Vec<Value> = norm_tools
@@ -314,7 +313,7 @@ pub(crate) async fn messages(
         );
     }
 
-    // A5.5: resolve the tool-call output format from the model's
+    // Resolve the tool-call output format from the model's
     // chat_template source (the same arch emits different tool conventions
     // per snapshot), falling back to the coarse arch map. Parser is
     // instantiated downstream only when tools are present AND a format is
@@ -332,7 +331,7 @@ pub(crate) async fn messages(
         );
     }
 
-    // ── Prompt pipeline (S1.7) ────────────────────────────────────────────────
+    // ── Prompt pipeline ────────────────────────────────────────────────
     let (prompt_tokens, prompt_think_open): (Vec<u32>, bool) = match state.registry.get(&req.model)
     {
         None => {
@@ -473,7 +472,7 @@ pub(crate) async fn messages(
     };
     // ─────────────────────────────────────────────────────────────────────────
 
-    // A1: per-request `max_tokens` ceiling is now configurable via
+    // Per-request `max_tokens` ceiling is now configurable via
     // `--max-tokens-cap` (default `u32::MAX` = no cap). Requests exceeding
     // the cap return HTTP 400 explicitly rather than being silently clamped.
     let max_tokens = match enforce_max_tokens_cap(req.max_tokens, state.max_tokens_cap, &req.model)
@@ -485,7 +484,7 @@ pub(crate) async fn messages(
         }
     };
 
-    // ── N2: session KV-reuse ───────────────────────────────────────────────────
+    // ── Session KV-reuse ───────────────────────────────────────────────────
     // Same logic as the OpenAI route: extract X-Session-Id, touch session cache,
     // compute effective prompt_cache_slots.
     let session_id: Option<String> = headers
@@ -519,7 +518,7 @@ pub(crate) async fn messages(
     };
     // ─────────────────────────────────────────────────────────────────────────
 
-    // A4/A7.1/G4: resolve all sampling params via request > server_default > model_defaults > hard_coded.
+    // Resolve all sampling params via request > server_default > model_defaults > hard_coded.
     // Anthropic API supports temperature, top_p, top_k only; the remaining
     // OpenAI-only knobs (min_p, penalties, logit_bias) default to neutral values.
     let gen_defaults = state
@@ -560,27 +559,27 @@ pub(crate) async fn messages(
         model_id: req.model.clone(),
         prompt_tokens,
         max_tokens,
-        // A7.1: fully resolved sampling params.
+        // Fully resolved sampling params.
         sampling,
         stop: req.stop_sequences.unwrap_or_default(),
         stream: req.stream,
         system,
         session_id,
         effective_prompt_cache_slots,
-        // F6/L18: pass the drainer handle so the blocking thread can emit
+        // Pass the drainer handle so the blocking thread can emit
         // per-request metrics to SQLite without blocking the decode loop.
         metrics_drainer: state.metrics_drainer.clone(),
-        // M30: pass the ITL ring-buffer so the blocking thread can write
+        // Pass the ITL ring-buffer so the blocking thread can write
         // per-request ITL aggregates readable by /metrics/cache.
         itl_store: Some(Arc::clone(&state.itl_store)),
         // event_recorder wired below after ensure_loaded.
         event_recorder: None,
-        // A5.1: normalised tool-calling fields (not yet consumed by engine).
+        // Normalised tool-calling fields (the decode loop does not read them).
         tools: norm_tools,
         tool_choice: norm_tool_choice,
-        // A6.1: Anthropic route has no response_format field — always None here.
+        // Anthropic route has no response_format field — always None here.
         response_format: None,
-        // A6.2: Anthropic route never sets response_format, so no constraint
+        // Anthropic route never sets response_format, so no constraint
         // engine is instantiated. Anthropic JSON mode is done via prompt +
         // `stop_sequences`, not via sampler masking.
         constraint: None,
@@ -590,14 +589,14 @@ pub(crate) async fn messages(
         thinking_end_token_id: None,
         // ThinkSplitter init channel, read off the rendered prompt above.
         prompt_think_open,
-        // A5.6: reconstruct tool-protocol special-token markers into the
+        // Reconstruct tool-protocol special-token markers into the
         // decoded stream only when a tool-call parser is active (Gemma
         // markers are suppressed by `skip_special`).
         emit_tool_markers: tools_enabled,
         // Anthropic route has no per-request delimiter overrides — always None.
         thinking_start_token: None,
         thinking_end_token: None,
-        // C5 Slice A: set below, after FIFO admission acquires the permit.
+        // Set below, after FIFO admission acquires the permit.
         gpu_admission: None,
         // Issue #26: the Anthropic Messages surface does not expose per-request
         // KV-config overrides (stricter wire spec); always launch default here.
@@ -627,7 +626,7 @@ pub(crate) async fn messages(
     // Anthropic-route traffic.
     gen_req.event_recorder = state.metrics.clone();
 
-    // A2: enforce per-request prompt length ceiling. Mirror of the OpenAI
+    // Enforce per-request prompt length ceiling. Mirror of the OpenAI
     // route guard — see `openai.rs` for full rationale. Slot=None or a
     // generator that does not override `effective_max_ctx` returns usize::MAX,
     // letting the existing 503 path catch real runtime overflows.
@@ -646,7 +645,7 @@ pub(crate) async fn messages(
         }
     }
 
-    // A5.5: only pass the parser format when both tools[] was supplied AND
+    // Only pass the parser format when both tools[] was supplied AND
     // the arch has a known parser. Otherwise the decode loop bypasses the
     // parser entirely (same code path as pre-A5.5).
     let parser_format: Option<ToolCallFormat> = tools_enabled.then_some(()).and(tool_format);
@@ -692,7 +691,7 @@ pub(crate) async fn messages(
         }
     }
 
-    // C5 Slice A: FIFO admission over the single-GPU permit (mirror of the
+    // FIFO admission over the single-GPU permit (mirror of the
     // OpenAI route). Bounded-depth 429 + FIFO + queue metrics. Acquired
     // here (async, before spawn_blocking) so the 429 status can be returned.
     //
@@ -731,7 +730,7 @@ pub(crate) async fn messages(
             if let Some(ref drainer) = state.metrics_drainer {
                 use crate::metrics_drainer::{MetricEvent, MetricKind};
                 let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-                // F2: real ctx_max from the resident generator (clamped to i64 range).
+                // Real ctx_max from the resident generator (clamped to i64 range).
                 let ctx_max_val = state.effective_max_ctx_for(&req.model).min(1_048_576) as i64;
                 drainer.try_emit(MetricEvent {
                     model_id: req.model.clone(),
@@ -752,7 +751,7 @@ pub(crate) async fn messages(
         }
     }
 
-    // F2: resolve ctx_max once for both paths.
+    // Resolve ctx_max once for both paths.
     let ctx_max_for_metrics = state.effective_max_ctx_for(&req.model).min(1_048_576) as i64;
 
     // evaluate token-replay eligibility. Anthropic does not expose `n`;

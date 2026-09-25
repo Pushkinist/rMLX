@@ -35,9 +35,8 @@ use super::request::{
 };
 use super::state::{ApiErrorCategory, AppState};
 
-// A5.1: "tools" and "tool_choice" removed — now first-class parsed fields.
-// A6.1: "response_format" removed — now a first-class parsed field.
-// "functions" (legacy v0 OpenAI) still rejected — out of scope for A6.
+// "tools", "tool_choice" and "response_format" are parsed fields, not extras.
+// "functions" (the legacy OpenAI function-calling field) is rejected.
 const REJECTED_EXTRA: &[&str] = &["functions"];
 
 // ── tool_choice=required/named schema synthesis ───────────────────────────────
@@ -149,11 +148,11 @@ pub(crate) async fn chat_completions(
     headers: HeaderMap,
     LoggedJson(req): LoggedJson<ChatCompletionsRequest>,
 ) -> Response {
-    // L6: wall-clock anchor for TTFT. Captured immediately after header parse,
+    // Wall-clock anchor for TTFT. Captured immediately after header parse,
     // before any tokenization or model-load work.
     let request_start = Instant::now();
 
-    // F10: resolve correlation id; the span is attached to each generate call
+    // Resolve correlation id; the span is attached to each generate call
     // via .instrument() so all tracing inside generate_blocking / generate_streaming
     // automatically carry request_id.
     let rid = resolve_request_id(&headers);
@@ -187,7 +186,7 @@ pub(crate) async fn chat_completions(
             return bad_request("top_p must be in [0.0, 1.0]");
         }
     }
-    // A7.1: extended sampling field validation.
+    // Extended sampling field validation.
     // top_k: any u32 is valid (0 = disabled). No upper bound check needed.
     if let Some(p) = req.min_p {
         if !(0.0..=1.0).contains(&p) {
@@ -277,20 +276,19 @@ pub(crate) async fn chat_completions(
     } else {
         0
     };
-    // `echo:true` (per-prompt-position logprobs) is parsed for OpenAI
-    // wire compatibility but the runtime path is deferred -- see the field
-    // comment on `ChatCompletionsRequest::echo`. Reject the request with a
-    // 501-style HTTP 400 + clear hint so clients can fall back to the
-    // standalone scorer.
+    // `echo:true` (per-prompt-position logprobs) is parsed for OpenAI wire
+    // compatibility but no route computes it — see the field comment on
+    // `ChatCompletionsRequest::echo`. Reject with HTTP 400 and a hint that
+    // names the standalone scorer.
     if req.echo.unwrap_or(false) {
         state.error_counts.increment(ApiErrorCategory::BadRequest);
         return bad_request(
-            "echo=true is not yet wired into the chat endpoint; \
+            "echo=true is not supported on the chat endpoint; \
              use the `rmlx eval ppl` CLI subcommand for per-prompt-position \
-             logprobs; a future release will land the HTTP path.",
+             logprobs.",
         );
     }
-    // A7.1: parse logit_bias string-keyed map → Vec<(u32, f32)>.
+    // Parse logit_bias string-keyed map → Vec<(u32, f32)>.
     let logit_bias_parsed = match parse_logit_bias(req.logit_bias.as_ref()) {
         Ok(v) => v,
         Err(msg) => {
@@ -383,7 +381,7 @@ pub(crate) async fn chat_completions(
         .find(|m| m.role == "system")
         .map(|m| m.content_text().into_owned());
 
-    // A5.1: normalise OpenAI tools → route-agnostic NormalizedTool.
+    // Normalise OpenAI tools → route-agnostic NormalizedTool.
     // Moved before the prompt pipeline so `jinja_tools` is available for
     // injection into RenderOpts inside spawn_blocking.
     // Empty array treated same as absent (skip alloc).
@@ -406,7 +404,7 @@ pub(crate) async fn chat_completions(
         ToolChoice::Named(n) => NormalizedToolChoice::Named(n.function.name),
     });
 
-    // A5.2: convert normalised tools to OpenAI-shaped JSON values for Jinja.
+    // Convert normalised tools to OpenAI-shaped JSON values for Jinja.
     // Note: tool_choice:"none" still injects tools here — hard suppression of
     // the tools block on tool_choice:none is a v1.x polish item (A5.4+).
     let mut jinja_tools: Vec<Value> = norm_tools
@@ -416,7 +414,7 @@ pub(crate) async fn chat_completions(
         .map(normalized_to_jinja_tool)
         .collect();
 
-    // A9: runtime guard — if the loaded model's template cannot render a tool
+    // Runtime guard — if the loaded model's template cannot render a tool
     // context, suppress tool injection and warn once. The request proceeds
     // tool-less (normal content response) instead of 500-ing.
     if !jinja_tools.is_empty() {
@@ -443,7 +441,7 @@ pub(crate) async fn chat_completions(
         );
     }
 
-    // A5.4: resolve the tool-call output format from the model's
+    // Resolve the tool-call output format from the model's
     // chat_template source (the same arch emits different tool conventions
     // per snapshot), falling back to the coarse arch map. Parser is
     // instantiated downstream only when tools are present AND a format is
@@ -498,7 +496,7 @@ pub(crate) async fn chat_completions(
         id
     });
 
-    // ── Prompt pipeline (S1.7) ────────────────────────────────────────────────
+    // ── Prompt pipeline ────────────────────────────────────────────────
     // Look up the model entry and run: render chat template → tokenize.
     // Best-effort: if the entry or pipeline is missing, fall through with
     // empty prompt_tokens and emit a metric + 503 note (generator is still
@@ -560,7 +558,7 @@ pub(crate) async fn chat_completions(
                 let bos = entry.bos_token.clone().unwrap_or_default();
                 let eos = entry.eos_token.clone().unwrap_or_default();
                 let model_id_log = req.model.clone();
-                // A5.2: capture jinja_tools for injection into RenderOpts.
+                // Capture jinja_tools for injection into RenderOpts.
                 // Vec<serde_json::Value> is Send + 'static.
                 let jinja_tools_capture = jinja_tools.clone();
                 // effective enable_thinking resolved at the outer scope
@@ -679,7 +677,7 @@ pub(crate) async fn chat_completions(
     };
     // ─────────────────────────────────────────────────────────────────────────
 
-    // A1: per-request `max_tokens` ceiling is now configurable via
+    // Per-request `max_tokens` ceiling is now configurable via
     // `--max-tokens-cap` (default `u32::MAX` = no cap). Requests exceeding
     // the cap return HTTP 400 explicitly rather than being silently clamped.
     let raw_max_tokens = req.max_tokens.unwrap_or(512);
@@ -692,7 +690,7 @@ pub(crate) async fn chat_completions(
         }
     };
 
-    // ── N2: session KV-reuse ───────────────────────────────────────────────────
+    // ── Session KV-reuse ───────────────────────────────────────────────────
     // Extract optional `X-Session-Id` header. Presence is purely opt-in;
     // absence falls back to the N1 prompt-cache path unchanged.
     let session_id: Option<String> = headers
@@ -731,7 +729,7 @@ pub(crate) async fn chat_completions(
     };
     // ─────────────────────────────────────────────────────────────────────────
 
-    // A4/A7.1/G4: resolve all sampling params via request > server_default > model_defaults > hard_coded.
+    // Resolve all sampling params via request > server_default > model_defaults > hard_coded.
     let gen_defaults = state
         .registry
         .get(&req.model)
@@ -763,17 +761,17 @@ pub(crate) async fn chat_completions(
         frequency_penalty = sampling.frequency_penalty,
         presence_penalty = sampling.presence_penalty,
         logit_bias_count = sampling.logit_bias.len(),
-        "chat_completions: resolved sampling params (A7.1/G4)"
+        "chat_completions: resolved sampling params"
     );
 
     tracing::debug!(
         model_id = %req.model,
         tool_count = norm_tools.as_ref().map_or(0, Vec::len),
         tool_choice = ?norm_tool_choice,
-        "chat_completions: tools parsed (A5.1), injected into template (A5.2)"
+        "chat_completions: tools parsed, injected into template"
     );
 
-    // A6.1: normalise response_format → NormalizedResponseFormat.
+    // Normalise response_format → NormalizedResponseFormat.
     // No enforcement yet; the field is metadata for A6.2+ (logit masking).
     let norm_response_format: Option<NormalizedResponseFormat> =
         req.response_format.as_ref().map(|rf| match rf {
@@ -791,12 +789,12 @@ pub(crate) async fn chat_completions(
         match rf {
             NormalizedResponseFormat::JsonObject => {
                 tracing::debug!(model_id = %req.model, response_format = "json_object",
-                    "chat_completions: response_format parsed (A6.1, no enforcement yet)");
+                    "chat_completions: response_format parsed");
             }
             NormalizedResponseFormat::JsonSchema { name, .. } => {
                 tracing::debug!(model_id = %req.model, response_format = "json_schema",
                     schema_name = %name,
-                    "chat_completions: response_format parsed (A6.1, no enforcement yet)");
+                    "chat_completions: response_format parsed");
             }
             NormalizedResponseFormat::Text => {
                 tracing::debug!(model_id = %req.model, response_format = "text",
@@ -820,7 +818,7 @@ pub(crate) async fn chat_completions(
     });
     let bare_json_tool_call_mode = tool_choice_schema.is_some();
 
-    // A6.3: instantiate a real sampler constraint engine when the request
+    // Instantiate a real sampler constraint engine when the request
     // asks for structured output. JsonObject (and JsonSchema, for now)
     // → tokenizer-aware JSON syntax constraint. The construction cost
     // (~600 ms on Qwen3.6 vocab to precompute the token-bytes map) is
@@ -901,7 +899,7 @@ pub(crate) async fn chat_completions(
                     let eos_ids: Vec<u32> = rmlx_loader::load_config(&p)
                         .map(|c| c.eos_token_ids())
                         .unwrap_or_default();
-                    // A6.4: schema-driven constraint.
+                    // Schema-driven constraint.
                     if let Some(NormalizedResponseFormat::JsonSchema {
                         name,
                         strict,
@@ -950,7 +948,7 @@ pub(crate) async fn chat_completions(
                             }
                         }
                     } else {
-                        // A6.3: schema-less json_object syntax constraint.
+                        // Schema-less json_object syntax constraint.
                         tracing::info!(
                             model_id = %req.model,
                             request_id = %rid,
@@ -1017,30 +1015,30 @@ pub(crate) async fn chat_completions(
         model_id: req.model.clone(),
         prompt_tokens,
         max_tokens,
-        // A7.1: fully resolved sampling params (all fields; decode stays greedy until A7.2).
+        // Fully resolved sampling params.
         sampling,
         stop: req.stop.map(StopSequences::into_vec).unwrap_or_default(),
         stream: req.stream,
         system,
         session_id,
         effective_prompt_cache_slots,
-        // F6/L18: pass the drainer handle so the blocking thread can emit
+        // Pass the drainer handle so the blocking thread can emit
         // per-request metrics to SQLite without blocking the decode loop.
         metrics_drainer: state.metrics_drainer.clone(),
-        // M30: pass the ITL ring-buffer so the blocking thread can write
+        // Pass the ITL ring-buffer so the blocking thread can write
         // per-request ITL aggregates readable by /metrics/cache.
         itl_store: Some(Arc::clone(&state.itl_store)),
         // event_recorder for engine-side ITL/kv_cache writes.
         // TTFT (cold vs warm) is emitted by the handler layer off-runtime.
         event_recorder: state.metrics.clone(),
-        // A5.1: normalised tool-calling fields (not yet consumed by engine).
+        // Normalised tool-calling fields (the decode loop does not read them).
         tools: norm_tools,
         tool_choice: norm_tool_choice,
-        // A6.1: normalised response format (not yet consumed by engine).
+        // Normalised response format (the grammar is passed as `constraint`).
         response_format: norm_response_format,
-        // A6.2: sampler constraint plumbed end-to-end (real json_object grammar in A6.3).
+        // Sampler constraint plumbed end-to-end (real json_object grammar in A6.3).
         constraint,
-        // A6.3: handle the route uses to signal `is_thinking` into the constraint.
+        // Handle the route uses to signal `is_thinking` into the constraint.
         // Suppress thinking-channel routing when tool_choice=required/named.
         // In bare_json_tool_call_mode the constraint must engage immediately at
         // token 1 (EngagePolicy::Immediate); if the engine stores `is_thinking=true`
@@ -1058,14 +1056,14 @@ pub(crate) async fn chat_completions(
         thinking_end_token_id,
         // ThinkSplitter init channel, read off the rendered prompt above.
         prompt_think_open,
-        // A5.6: reconstruct tool-protocol special-token markers into the
+        // Reconstruct tool-protocol special-token markers into the
         // decoded stream only when a tool-call parser is active for this
         // request (Gemma markers are suppressed by `skip_special`).
         emit_tool_markers: tools_enabled,
         // per-request delimiter overrides (None = keep defaults).
         thinking_start_token,
         thinking_end_token,
-        // C5 Slice A: set below, after FIFO admission acquires the permit.
+        // Set below, after FIFO admission acquires the permit.
         gpu_admission: None,
         // Issue #26: per-request KV-config overrides threaded to the cache
         // builder (None = launch default).
@@ -1146,7 +1144,7 @@ pub(crate) async fn chat_completions(
         }
     }
 
-    // A5.4: only pass the parser format when both tools[] was supplied AND
+    // Only pass the parser format when both tools[] was supplied AND
     // the arch has a known parser. Otherwise the decode loop bypasses the
     // parser entirely (same code path as pre-A5.4).
     //
@@ -1159,7 +1157,7 @@ pub(crate) async fn chat_completions(
         tools_enabled.then_some(()).and(tool_format)
     };
 
-    // A6.3: detect json_object mode for the response post-processor — even
+    // Detect json_object mode for the response post-processor — even
     // with constraint masking, the model may emit a markdown fence wrapper
     // (` ```json ... ``` `) DURING the warm-up phase. The grammar guarantees
     // bytes from the engagement `{` through the matched closing `}` form a
@@ -1225,7 +1223,7 @@ pub(crate) async fn chat_completions(
         }
     }
 
-    // C5 Slice A: FIFO admission over the single-GPU permit. Bounded-depth
+    // FIFO admission over the single-GPU permit. Bounded-depth
     // 429 reject + FIFO fairness + queue-wait/depth metrics. Acquired here
     // (async, before spawn_blocking) so HTTP status can be returned; the
     // guard is moved into `gen_req` and lives until the decode finishes.
@@ -1272,7 +1270,7 @@ pub(crate) async fn chat_completions(
             if let Some(ref drainer) = state.metrics_drainer {
                 use crate::metrics_drainer::{MetricEvent, MetricKind};
                 let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-                // F2: real ctx_max from the resident generator (clamped to i64 range).
+                // Real ctx_max from the resident generator (clamped to i64 range).
                 let ctx_max_val = state.effective_max_ctx_for(&req.model).min(1_048_576) as i64;
                 drainer.try_emit(MetricEvent {
                     model_id: req.model.clone(),
@@ -1293,12 +1291,12 @@ pub(crate) async fn chat_completions(
         }
     }
 
-    // H4: capture prompt length before gen_req is consumed by the generator.
+    // Capture prompt length before gen_req is consumed by the generator.
     // Used for the usage-summary chunk in the streaming path.
     let prompt_token_count = gen_req.prompt_tokens.len() as u32;
     let include_usage = req.stream_options.as_ref().is_some_and(|o| o.include_usage);
 
-    // F2: resolve ctx_max once for both paths (non-streaming needs it for drainer).
+    // Resolve ctx_max once for both paths (non-streaming needs it for drainer).
     let ctx_max_for_metrics = state.effective_max_ctx_for(&req.model).min(1_048_576) as i64;
 
     // evaluate token-replay eligibility. Replay is only legal at

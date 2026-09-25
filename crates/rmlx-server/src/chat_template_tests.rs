@@ -396,7 +396,7 @@ fn gemma4_render_matches_hf_reference_byte_for_byte() {
     );
 }
 
-// ── A5.2: tool injection tests ────────────────────────────────────────────
+// ── Tool injection tests ────────────────────────────────────────────
 
 /// Empty tools slice must NOT produce a `<tools>` block.
 ///

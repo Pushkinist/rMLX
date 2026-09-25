@@ -479,7 +479,7 @@ fn gdn_warmup(b: i32, t: i32, hk: i32, hv: i32, dk: i32, dv: i32) -> Result<()> 
 // Smoke-probe seed prompt
 // ---------------------------------------------------------------------------
 
-/// Fixed, deterministic seed prompt for the smoke probe (B5b).
+/// Fixed, deterministic seed prompt for the smoke probe.
 ///
 /// B5 fed the probe bare BOS (no prompt). That produced *false* degeneration on
 /// some healthy snapshots: `gemma-4-26b-a4b-it-mxfp8` answers
@@ -518,7 +518,7 @@ pub fn smoke_prompt_ids(tokenizer: &tokenizers::Tokenizer, bos_id: u32) -> Resul
 ///
 /// Loads the model via `load_model`, resolves the BOS token from
 /// `tokenizer_config.json`, runs greedy generation for 8 steps, and returns
-/// a `SmokeVerdict`. Used by the server's `--require-smoke-probe` gate (B5).
+/// a `SmokeVerdict`. Used by the server's `--require-smoke-probe` gate.
 ///
 /// `prompt_ids_override` lets a caller that owns the chat-template engine
 /// (e.g. `rmlx-server`) feed a production-shaped, turn-structured prompt so the

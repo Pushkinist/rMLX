@@ -32,7 +32,7 @@ pub(crate) struct StreamState {
     pub(crate) id: String,
     pub(crate) model: String,
     pub(crate) created: u64,
-    /// A6.5: when `true` (json_object / json_schema mode), pre-JSON tokens
+    /// When `true` (json_object / json_schema mode), pre-JSON tokens
     /// are buffered here and discarded if they form a markdown-fence prefix.
     /// Once the first JSON value byte is seen, `json_fence_buf_done` is set
     /// and all subsequent pieces flow directly to content.
@@ -41,13 +41,13 @@ pub(crate) struct StreamState {
     pub(crate) json_fence_buf: String,
     /// Set once the fence-buffer phase is complete (first JSON byte seen).
     pub(crate) json_fence_buf_done: bool,
-    /// H4: prompt token count captured before `generator.generate` consumes
+    /// Prompt token count captured before `generator.generate` consumes
     /// the `GenerationRequest`. Used for the usage-summary chunk.
     pub(crate) prompt_tokens: u32,
-    /// H4: running tally of decode steps (incremented once per non-done
+    /// Running tally of decode steps (incremented once per non-done
     /// token, including thinking tokens — mirrors the non-streaming counter).
     pub(crate) completion_tokens: u32,
-    /// H4: whether to emit a usage-summary chunk before `[DONE]`.
+    /// Whether to emit a usage-summary chunk before `[DONE]`.
     pub(crate) include_usage: bool,
     /// When true (tool_choice=required/named), the model is constrained
     /// to emit bare JSON. At stream-end, the accumulated JSON is converted
@@ -56,21 +56,21 @@ pub(crate) struct StreamState {
     /// Accumulated content for bare_json_tool_call_mode. All non-empty
     /// content pieces are appended here; converted at done-token boundary.
     pub(crate) bare_json_accum: String,
-    /// F1b: SPSC drainer handle for emitting PromptTokens/CompletionTokens
+    /// SPSC drainer handle for emitting PromptTokens/CompletionTokens
     /// once per request at the `done` token boundary. `None` in tests.
     pub(crate) metrics_drainer: Option<DrainerHandle>,
-    /// F1b/F2: model snapshot basename (for MetricEvent.model_id).
+    /// Model snapshot basename (for MetricEvent.model_id).
     pub(crate) metrics_model_id: String,
-    /// F1b/F2: server effective_max_ctx clamped to i64 range.
+    /// Server effective_max_ctx clamped to i64 range.
     pub(crate) metrics_ctx_max: i64,
-    /// F14: process-lifetime prompt-token counter shared with AppState.
+    /// Process-lifetime prompt-token counter shared with AppState.
     ///
     /// Incremented once at the done-token boundary (same as the SPSC drainer
     /// emit) so there is exactly one source of truth per request.
     pub(crate) lifetime_tokens_in: Arc<std::sync::atomic::AtomicU64>,
-    /// F14: process-lifetime completion-token counter shared with AppState.
+    /// Process-lifetime completion-token counter shared with AppState.
     pub(crate) lifetime_tokens_out: Arc<std::sync::atomic::AtomicU64>,
-    /// F8: per-category error counters shared with AppState.
+    /// Per-category error counters shared with AppState.
     ///
     /// Incremented when an engine error terminates the SSE stream.
     pub(crate) error_counts: ApiErrorCounters,
@@ -197,7 +197,7 @@ pub(crate) fn handle_streaming_token(
 ) -> Vec<Result<Event, std::convert::Infallible>> {
     let tok = match item {
         Err(e) => {
-            // F8: count mid-stream engine errors even though the HTTP status
+            // Count mid-stream engine errors even though the HTTP status
             // is already 200 (SSE stream has started). The category is
             // derived from the same classification as the blocking path.
             state.error_counts.increment(engine_error_category(&e));
@@ -237,7 +237,7 @@ pub(crate) fn handle_streaming_token(
         "sse: handling token"
     );
 
-    // H4: count every token (including thinking tokens and the done marker)
+    // Count every token (including thinking tokens and the done marker)
     // to mirror the non-streaming counter in `generate_blocking`.
     state.completion_tokens += 1;
 
@@ -253,7 +253,7 @@ pub(crate) fn handle_streaming_token(
             state.bare_json_accum.push_str(&piece);
         }
     } else if is_thinking {
-        // A5.6: reasoning-channel text. A reasoning model may emit the tool
+        // Reasoning-channel text. A reasoning model may emit the tool
         // call WITHOUT closing `</think>` (e.g. `Ternary-Bonsai`), so the
         // parser must still scan thinking pieces — otherwise the
         // `<tool_call>` block leaks into `reasoning_content` and no
@@ -299,7 +299,7 @@ pub(crate) fn handle_streaming_token(
             out.push(Ok(chunk_to_event(&chunk)));
         }
     } else {
-        // A6.5: fence suppression for streaming. When in json_object/json_schema
+        // Fence suppression for streaming. When in json_object/json_schema
         // mode and we have not yet seen the first JSON value byte, buffer the
         // piece. Once a JSON-value-starter byte appears, discard everything
         // before it (the fence) and emit only from that byte onward.
@@ -407,7 +407,7 @@ pub(crate) fn handle_streaming_token(
     }
 
     if done {
-        // A5.4: on the terminal token, drain any final passthrough + tool_calls
+        // On the terminal token, drain any final passthrough + tool_calls
         // from the parser, then emit one finish chunk with the upgraded reason.
         let (final_text, final_calls): (Option<String>, Vec<ParsedToolCall>) =
             match state.parser.as_mut() {
@@ -497,7 +497,7 @@ pub(crate) fn handle_streaming_token(
         let chunk = make_content_chunk(state, None, None, true, upgraded, None);
         out.push(Ok(chunk_to_event(&chunk)));
 
-        // H4: when `stream_options.include_usage=true`, emit a final summary
+        // When `stream_options.include_usage=true`, emit a final summary
         // chunk with `choices: []` and a fully-populated `usage` object.
         // Order: final-delta(finish_reason) → usage-chunk → then [DONE] from
         // the outer `sse_stream` compose.
@@ -518,7 +518,7 @@ pub(crate) fn handle_streaming_token(
             out.push(Ok(chunk_to_event(&usage_chunk)));
         }
 
-        // F1b: emit PromptTokens + CompletionTokens to SQLite via the SPSC
+        // Emit PromptTokens + CompletionTokens to SQLite via the SPSC
         // drainer once per completed request. Single-source: the same counters
         // that populate the usage chunk / non-streaming Usage body.
         // Emitted regardless of `include_usage` — DB telemetry is always on.
@@ -540,7 +540,7 @@ pub(crate) fn handle_streaming_token(
                 kind: MetricKind::CompletionTokens(state.completion_tokens),
             });
         }
-        // F14: increment process-lifetime token counters (single source: same
+        // Increment process-lifetime token counters (single source: same
         // values as the SPSC drainer emit above; no double-count possible).
         state.lifetime_tokens_in.fetch_add(
             u64::from(state.prompt_tokens),

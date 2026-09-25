@@ -1,7 +1,7 @@
 //! Schema-driven JSON byte state machine and supporting utilities.
 //!
 //! Contains:
-//! - `is_only_fence_or_whitespace` — markdown-fence detection helper (A6.5)
+//! - `is_only_fence_or_whitespace` — markdown-fence detection helper
 //! - `literal_bytes` / `union_literals` — literal serialization helpers
 //! - `LiteralTrie` — byte-level literal match tracker for `enum`/`const`/`oneOf`
 //! - `FreeKeyNext` / `free_key_step` — additional-property key parser

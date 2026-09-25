@@ -1,6 +1,6 @@
 //! Metrics snapshot gathering and HTTP endpoints:
-//! - `GET /metrics/cache` (N19) — JSON
-//! - `GET /metrics` (F5) — Prometheus text exposition
+//! - `GET /metrics/cache` — JSON
+//! - `GET /metrics` — Prometheus text exposition
 //! - `GET /v1/metrics` — rolling request-level JSON summary
 
 use std::fmt::Write as _;
@@ -33,9 +33,9 @@ pub(crate) struct ModelMetrics {
     pub partial_hits: Option<u64>,
     /// SSD-tier hydrate hits (RAM misses served from the `.kvb` tier).
     pub ssd_hits: Option<u64>,
-    /// Last-request KV-cache allocation size (N16).
+    /// Last-request KV-cache allocation size.
     pub kv_cache_bytes: u64,
-    /// Metal allocator peak (C7).
+    /// Metal allocator peak.
     pub metal_peak_alloc_bytes: Option<u64>,
 }
 
@@ -52,11 +52,11 @@ pub(crate) struct MetricsSnapshot {
     /// ITL aggregate samples from the ring (oldest first). Each entry
     /// already carries pre-computed `p50_ms`, `p95_ms`, `mean_ms`.
     pub itl_samples: Vec<ItlSample>,
-    /// F14: lifetime prompt-token counter.
+    /// Lifetime prompt-token counter.
     pub tokens_in: u64,
-    /// F14: lifetime completion-token counter.
+    /// Lifetime completion-token counter.
     pub tokens_out: u64,
-    /// F8: per-category error counts keyed by `ApiErrorCategory::as_str()`.
+    /// Per-category error counts keyed by `ApiErrorCategory::as_str()`.
     pub error_counts: Vec<(&'static str, u64)>,
     /// J4 process memory (None if the kernel call failed).
     pub proc_mem: Option<rmlx_core::mach_mem::ProcMem>,
@@ -152,13 +152,13 @@ pub(crate) fn gather_metrics(state: &AppState) -> MetricsSnapshot {
         })
         .collect();
 
-    // L6: snapshot TTFT ring (brief lock).
+    // Snapshot TTFT ring (brief lock).
     let ttft_samples: Vec<TtftSample> = {
         let ring = state.ttft_store.lock();
         ring.iter().cloned().collect()
     };
 
-    // M30: snapshot ITL ring (brief lock).
+    // Snapshot ITL ring (brief lock).
     let itl_samples: Vec<ItlSample> = {
         let ring = state.itl_store.lock();
         ring.iter().cloned().collect()
@@ -250,7 +250,7 @@ pub(crate) fn gather_metrics(state: &AppState) -> MetricsSnapshot {
     }
 }
 
-// ── Route: GET /metrics/cache (N19) ──────────────────────────────────────────
+// ── Route: GET /metrics/cache ──────────────────────────────────────────
 
 /// Prompt-cache hit/miss/bytes stats + TTFT samples + load-phase spans for
 /// the currently-loaded model.
@@ -391,7 +391,7 @@ pub(crate) async fn metrics_cache(State(state): State<AppState>) -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }
 
-// ── Route: GET /metrics (F5) — Prometheus text exposition ────────────────────
+// ── Route: GET /metrics — Prometheus text exposition ────────────────────
 
 /// Prometheus text-format exposition of the same metrics as `/metrics/cache`.
 ///
@@ -487,7 +487,7 @@ pub(crate) async fn metrics_v1_summary(State(state): State<AppState>) -> Json<Va
 pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
     let mut out = String::with_capacity(2048);
 
-    // ── F14: lifetime token counters (counter) ────────────────────────────────
+    // ── Lifetime token counters (counter) ────────────────────────────────
     out.push_str(
         "# HELP rmlx_lifetime_tokens_total Lifetime cumulative token count since server start.\n",
     );
@@ -504,7 +504,7 @@ pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
         snap.tokens_out
     );
 
-    // ── F8: per-category API error counters (counter) ─────────────────────────
+    // ── Per-category API error counters (counter) ─────────────────────────
     out.push_str(
         "# HELP rmlx_api_errors_total Lifetime API error count by category since server start.\n",
     );
@@ -513,7 +513,7 @@ pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
         let _ = write!(out, "rmlx_api_errors_total{{category=\"{cat}\"}} {n}\n");
     }
 
-    // ── N19: prompt-cache hit / miss (counter) ────────────────────────────────
+    // ── Prompt-cache hit / miss (counter) ────────────────────────────────
     out.push_str("# HELP rmlx_prompt_cache_total Lifetime prompt-cache result count.\n");
     out.push_str("# TYPE rmlx_prompt_cache_total counter\n");
     for m in &snap.models {
@@ -546,7 +546,7 @@ pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
         }
     }
 
-    // ── N19: prompt-cache bytes (gauge) ──────────────────────────────────────
+    // ── Prompt-cache bytes (gauge) ──────────────────────────────────────
     out.push_str("# HELP rmlx_prompt_cache_bytes Current prompt-cache memory usage in bytes.\n");
     out.push_str("# TYPE rmlx_prompt_cache_bytes gauge\n");
     for m in &snap.models {
@@ -559,7 +559,7 @@ pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
         }
     }
 
-    // ── N16: KV-cache bytes (gauge) ───────────────────────────────────────────
+    // ── KV-cache bytes (gauge) ───────────────────────────────────────────
     out.push_str("# HELP rmlx_kv_cache_bytes Last-request KV-cache allocation in bytes.\n");
     out.push_str("# TYPE rmlx_kv_cache_bytes gauge\n");
     for m in &snap.models {
@@ -572,7 +572,7 @@ pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
         }
     }
 
-    // ── C7: Metal peak allocator bytes (gauge) ────────────────────────────────
+    // ── Metal peak allocator bytes (gauge) ────────────────────────────────
     out.push_str("# HELP rmlx_metal_peak_alloc_bytes Metal allocator peak allocation in bytes.\n");
     out.push_str("# TYPE rmlx_metal_peak_alloc_bytes gauge\n");
     for m in &snap.models {
@@ -585,7 +585,7 @@ pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
         }
     }
 
-    // ── L6: TTFT percentiles from ring (gauge) ────────────────────────────────
+    // ── TTFT percentiles from ring (gauge) ────────────────────────────────
     // Derive p50/p95/p99 from the raw ring samples.
     if !snap.ttft_samples.is_empty() {
         let mut vals: Vec<u64> = snap.ttft_samples.iter().map(|s| s.ttft_ms).collect();
@@ -602,7 +602,7 @@ pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
         let _ = write!(out, "rmlx_ttft_ms{{quantile=\"0.99\"}} {p99}\n");
     }
 
-    // ── M30: ITL percentiles from ring (gauge) ────────────────────────────────
+    // ── ITL percentiles from ring (gauge) ────────────────────────────────
     // Use the last sample's pre-computed percentiles (most recent request).
     if let Some(last) = snap.itl_samples.last() {
         out.push_str("# HELP rmlx_itl_ms Inter-token latency in milliseconds (last request).\n");
@@ -611,7 +611,7 @@ pub(crate) fn render_prometheus(snap: &MetricsSnapshot) -> String {
         let _ = write!(out, "rmlx_itl_ms{{quantile=\"0.95\"}} {}\n", last.p95_ms);
     }
 
-    // ── J4: process memory (gauge) ────────────────────────────────────────────
+    // ── Process memory (gauge) ────────────────────────────────────────────
     if let Some(mem) = &snap.proc_mem {
         out.push_str("# HELP rmlx_process_rss_bytes Process resident set size in bytes.\n");
         out.push_str("# TYPE rmlx_process_rss_bytes gauge\n");

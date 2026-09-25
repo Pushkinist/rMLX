@@ -281,7 +281,7 @@ impl ModelRegistry {
                 }
             };
 
-            // A9: probe whether tools can be injected into the template.
+            // Probe whether tools can be injected into the template.
             let tools_supported = chat_template.as_deref().is_some_and(probe_tools_supported);
             if !tools_supported {
                 tracing::debug!(

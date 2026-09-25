@@ -366,7 +366,7 @@ impl QuantV {
                         &[1],
                         device,
                     )?;
-                    // H7: tracing event for hydrated QuantV GPU init.
+                    // Tracing event for hydrated QuantV GPU init.
                     tracing::debug!(
                         prev_seq,
                         init_cap,
