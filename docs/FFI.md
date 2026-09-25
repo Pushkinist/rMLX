@@ -76,7 +76,7 @@ The pin buys NAX **GEMM**, which every model's matmuls use. NAX
 | Prefill attention, `head_dim` 64 or 128, Q not f32 | yes, `steel_attention_<dtype>_bq64_…` | MLX's `sdpa_full` takes the NAX branch unless `head_dim == 80` or Q is f32 without TF32. An 80-wide head takes the `bq32` steel path. |
 | Prefill attention, `head_dim` 256 or 512 | no | MLX has no fused prefill kernel at either width; see [Head-dim dispatch](#head-dim-dispatch-and-the-unfused-fallback). |
 | Decode attention, any `head_dim`, any codec | no | `bq64` is a 64-query tile and decode is `q_seq = 1`. At `head_dim` ≤ 256 MLX routes `q_seq <= 8` to `sdpa_vector`, which has no NAX variant; at 512 decode falls to the composite path. |
-| Our own `.metal` kernels | no | All are `q_seq = 1` decode kernels. Decode attention streams the KV cache at O(1) FLOPs per byte, so more arithmetic throughput cannot help. |
+| Our own KV decode-attention kernels | no | They run at `q_seq = 1` and stream the KV cache at O(1) FLOPs per byte, so more arithmetic throughput cannot help. No production rMLX kernel uses `mpp::tensor_ops`; only the JIT probe does. |
 
 So no decode path on any codec reaches NAX; only prefill at a 64- or
 128-wide head does. The shipped NAX tile is `<M=16, N=32, K=16>`, a property
@@ -164,8 +164,7 @@ cargo clean -p rmlx-mlx
   `brew list --pinned --versions`.
 - **`cargo clean -p rmlx-mlx` is required.** Moving to an older keg does not
   re-run `build.rs`, so the crate would keep bindings from the wrong headers
-  and a stale `RMLX_MLX_BUILD_VERSION`. Touching `mlx-pin.txt` forces the
-  re-run too.
+  and a stale `RMLX_MLX_BUILD_VERSION`.
 
 #### Un-pinning when the bottle is fixed
 
@@ -318,8 +317,9 @@ never reach a function that frees or materialises it. Uses: `weight` in
 ### Mode string cache
 
 `mode_to_cstr` returns a `Cow<'static, CStr>` for a mode string. The fixed
-set (`affine`, `mxfp8`, `mxfp4`, `nvfp4`, the SDPA mask modes) is cached in
-`OnceLock<CString>`s. Any other string is allocated per call.
+set (`affine`, `mxfp8`, `mxfp4`, `nvfp4`, the SDPA mask modes, the `constant`
+pad mode) is cached in `OnceLock<CString>`s. Any other string is allocated
+per call.
 
 ---
 
@@ -763,9 +763,11 @@ see `CLAUDE.md` hard rule 10.
 
 ### MSL gates (`make ci`, enforced in CI)
 
-`scripts/metal_dirs.sh` lists the three kernel directories. Both gates source
-it, and the `check-metal-format` pre-commit hook's trigger covers it. A crate
-that starts shipping MSL must be added there; nothing else discovers it.
+`scripts/metal_dirs.sh` lists the three kernel directories, and both gates
+source it. The `check-metal-format` pre-commit hook triggers on any
+`crates/*/src/metal/*.metal` file but checks only the listed directories. A
+crate that starts shipping MSL must be added to the list; nothing else
+discovers it.
 
 | Target | Tool | Checks |
 |---|---|---|

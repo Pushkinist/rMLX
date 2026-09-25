@@ -87,16 +87,19 @@ The affine and bf16 tags:
 |---|---|---:|---:|---|
 | `auto` | engine default (§6) | — | — | K, V |
 | `bf16` (`f16`, `none`) | unquantized | 16 | — | K, V |
-| `q8_g128` | rMLX MSL q8_0, symmetric, no bias | 8 | 128 | K, V |
+| `q8_g128` | rMLX MSL q8_0 or MLX affine (see below) | 8 | 128 | K, V |
 | `q8_g64`, `q8_g32` | MLX affine (scale + bias) | 8 | 64 / 32 | K, V |
 | `q6_g64`, `q5_g64` | MLX affine | 6 / 5 | 64 | K, V |
 | `q4_g128`, `q4_g64`, `q4_g32` | MLX affine | 4 | 128 / 64 / 32 | K, V |
 | `q3_g64` | MLX affine | 3 | 64 | K, V |
 | `q2_g64` | MLX affine | 2 | 64 | V |
 
-The two 8-bit codecs are different codecs. `q8_g128` is the K side of
-`k8v8`, `k8v4` and `planar`. `q8_g64` and `q8_g32` resolve to `Mixed`, the MLX
-`mx.quantize` 3-tuple path. `q2_g64` is V-only (§5.10).
+`q8_g128` names two codecs, chosen by its partner. Paired with `q8_g128`,
+`tq4`, `planar*`, `iso_v_*`, `rotor_v_*` or a TCQ tag, it is the rMLX MSL q8_0
+codec (symmetric, no bias), the K side of `k8v8`, `k8v4` and `planar`. Paired
+with another affine V it is the K side of `Mixed`, MLX's `mx.quantize` 3-tuple
+with scale and bias: `--ctk q8_g128 --ctv q4_g64` is `mixed_k8g128_v4g64`.
+`q8_g64` and `q8_g32` always resolve to `Mixed`. `q2_g64` is V-only (§5.10).
 
 A side left `auto` beside a quantized side becomes `q8_g128`. Both sides
 `auto` give `DEFAULT_KV_QUANT`.
@@ -119,7 +122,8 @@ chunk needs more than the storage's `max_seq`, it:
    buffers to match.
 
 A grow is legal only before the first `exit_prefill`. On a cache whose
-quantized payload already exists, it fails with a typed error. A resumed,
+quantized payload already exists, it fails with
+`Error::Mlx("grow not legal after exit_prefill …")`. A resumed,
 hydrated or branched cache must be built large enough for its prompt.
 
 `RMLX_KV_MAX_SEQ_HARD_CAP` is an optional upper bound, read once per process.
@@ -131,9 +135,10 @@ there is no cap beyond the ceiling and unified memory.
 
 `--max-ctx N` is a ceiling, not an allocation. The Qwen3, Qwen3.5/3.6,
 Qwen3-VL and Gemma4 generate paths start each layer's cache at
-`KV_MAX_SEQ_DEFAULT` (4096), capped at the ceiling. The buffer then grows by powers of two up to the ceiling as the
-prompt fills. A short request on a server launched with a large `--max-ctx`
-holds only what it fills. Each doubling costs one realloc and copy.
+`KV_MAX_SEQ_DEFAULT` (4096), capped at the ceiling. The buffer then grows by
+powers of two up to the ceiling as the prompt fills. A short request on a
+server launched with a large `--max-ctx` holds only what it fills. Each
+doubling costs one realloc and copy.
 
 The speculative round loop is the exception: `round_common::cache_stack`
 builds its stacks with `max_seq` at the ceiling.
@@ -274,9 +279,10 @@ On `Qwen3_5MoeForConditionalGeneration` and
 `Qwen3VLMoeForConditionalGeneration`, `validate_resolved` rejects every codec
 whose K side is below 8 bits: `Mixed` with `k_bits < 8`
 (`QwenMoeKBitsTooLow`), `planar_k` (`QwenMoePlanarKRejected`), the iso K
-codecs (`QwenMoeIsoKRejected`), the rotor K codecs (`QwenMoeRotorKRejected`)
-and `tsym3` (`QwenMoeTurboKRejected`). It runs after `auto` is filled in and
-on the `--kv-quant` path too, so no spelling bypasses it.
+codecs (`QwenMoeIsoKRejected`), the rotor K codecs (`QwenMoeRotorKRejected`),
+`tsym3` (`QwenMoeTurboKRejected`) and `tsym4` (`QwenMoeKBitsTooLow`). It runs
+after `auto` is filled in and on the `--kv-quant` path too, so no spelling
+bypasses it.
 
 ### 5.5 `tq4` requires `head_dim ∈ {128, 256}`
 
@@ -291,10 +297,12 @@ At decode, `ensure_decode_capacity` grows the storage window past a
 power-of-two boundary. The TurboFlash path calls it before appending, and
 `grow_flash_buffers` re-sizes its own head-major buffers to match.
 
-### 5.6 `planar4` requires `head_dim % 32 == 0`
+### 5.6 The planar encoder needs `head_dim % 32 == 0`
 
-PlanarQuant groups are 32 wide, for every planar codec. The resolver does not check this;
-`planarquant` returns an error when it encodes a row of another width.
+PlanarQuant groups are 32 wide. The resolver does not check the width.
+`planarquant` refuses a row of another width when it encodes. `planar`,
+`planar3` and `planar_k` decode off the bf16 mirror (§9.6), so the encoder
+runs only on a cache with no mirror.
 
 ### 5.7 SWA layers always bf16
 
@@ -380,12 +388,8 @@ The generation entry points call `rmlx_mlx::ensure_cpu_default_stream()` and
 streams. `k8v8_q8_quantize_eval_on_worker_thread` (`rmlx-kv-quant`) covers the
 `exit_prefill` quantize on a worker.
 
-Limitation: under MLX 0.32.0 the encoder map is thread-local, and a
-cross-thread eval of a lazy array throws
-`There is no Stream(cpu, N) in current thread.`. The guards register the
-worker's own streams, so they do not help there. An array shared across
-threads must then be evaluated on the thread that built it. See `docs/FFI.md`
-§ "Per-thread CPU stream context — `ensure_cpu_default_stream`".
+The limitation under MLX 0.32.0, where a cross-thread eval throws, is in
+`docs/FFI.md` § "Per-thread CPU stream context — `ensure_cpu_default_stream`".
 
 ### 5.8 `head_dim` must be declarable
 
@@ -594,9 +598,6 @@ No production path calls the sparse-attention dispatcher
   <https://github.com/ggml-org/llama.cpp/pull/5932>
 - MLX `mx.quantize`:
   <https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.quantize.html>
-- ParoQuant (z-lab): <https://github.com/z-lab/paroquant>. A **weight**
-  quantizer (pairwise-rotation INT4); its upstream repo has no KV-cache
-  surface.
 - IsoQuant (ParaMind2025): <https://github.com/ParaMind2025/isoquant>. SO(4)
   isoclinic rotation, stage-1 quantize/dequantize only. No cache and no decode
   path upstream, so rMLX's `iso*` KV codecs have no counterpart to port.
