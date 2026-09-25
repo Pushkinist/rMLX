@@ -555,6 +555,20 @@ published-table-selftest: ## CI gate: mutation check for the published-protocol 
 check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited in docs/ does not exist
 	@bash scripts/check_doc_source_citations.sh
 
+.PHONY: check-doc-refs
+check-doc-refs: ## fail if a doc edit since the merge-base with origin/main broke or re-pointed a reference into docs/
+	@base=$$(git merge-base HEAD origin/main) || { \
+		echo "ERROR (could not run): no merge-base with origin/main; run scripts/check_doc_refs.py --base <ref>" >&2; \
+		exit 2; } && \
+	python3 scripts/check_doc_refs.py --base "$$base"
+
+.PHONY: check-doc-refs-selftest
+check-doc-refs-selftest: ## CI gate: recall test for check_doc_refs.py over a synthetic repo, each case asserting its reason
+	@bash scripts/check_doc_refs_selftest.sh
+
+.PHONY: check-doc-consumers
+check-doc-consumers: check-doc-refs check-doc-source-citations check-kv-codec-disposition check-kv-boundary-default-parity check-published-table ## every reader of doc text still finds what it reads
+
 check-no-decode-swallow: ## CI gate: fail if a decode-step failure breaks instead of propagating (would report as finish_reason="length")
 	@bash scripts/check_no_decode_swallow.sh
 
@@ -626,6 +640,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@python3 scripts/published_samples.py verify
 	@bash scripts/check_published_samples_fixtures.sh
 	@bash scripts/check_doc_source_citations.sh
+	@bash scripts/check_doc_refs_selftest.sh
 	@bash scripts/check_no_decode_swallow.sh
 	@bash scripts/check_eval_lock.sh
 	@bash scripts/check_eval_lock_fixtures.sh

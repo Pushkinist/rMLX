@@ -83,7 +83,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SIM_THRESHOLD = 0.60
-DOC_SIZE_THRESHOLD_KB = 200
+DOC_SIZE_THRESHOLD_KB = 40
 LOC_THRESHOLD = 1000
 
 SIBLING_DIRS = ("crates/rmlx-kv-quant", "crates/rmlx-models")

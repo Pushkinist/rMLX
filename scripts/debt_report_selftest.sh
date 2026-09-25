@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # scripts/debt_report_selftest.sh — fixture test for scripts/lib/debt_report.py.
+# doc-refs: fixture — the docs/ paths below belong to the synthetic scan roots.
 #
 # WHY
 #   The report always exits 0 (advisory) — see scripts/debt_report.sh — so its
@@ -30,7 +31,7 @@
 #   spelled as its own segment (update_rotor_5_sym) is what separates a
 #   separator-collapsing key from one that leaves a doubled separator behind.
 #   The two size-critical
-#   docs (over/under the 200 KB threshold) are generated into a throwaway copy
+#   docs (over/under the 40 KB threshold) are generated into a throwaway copy
 #   of the fixture at run time rather than committed, so this test does not
 #   carry ~250 KB of filler into the tree's own churn count. The churn section
 #   needs real git history, which the base fixture does not have on its own
@@ -129,10 +130,10 @@ cp -R "$BASE" "$STATIC_WORK/base"
 python3 - "$STATIC_WORK/base/docs" <<'EOF'
 import sys
 docs = sys.argv[1]
-big = ("This is a filler line documenting a codec variant in detail.\n" * 4300)
-open(f"{docs}/BIG.md", "w").write("# Big doc\n\n" + big)  # ~257 KB, over the 200 KB threshold
-almost = ("This is a filler line documenting a codec variant in detail.\n" * 3200)
-open(f"{docs}/ALMOST.md", "w").write("# Almost doc\n\n" + almost)  # ~191 KB, under the threshold
+big = ("This is a filler line documenting a codec variant in detail.\n" * 700)
+open(f"{docs}/BIG.md", "w").write("# Big doc\n\n" + big)  # ~42 KB, over the 40 KB threshold
+almost = ("This is a filler line documenting a codec variant in detail.\n" * 650)
+open(f"{docs}/ALMOST.md", "w").write("# Almost doc\n\n" + almost)  # ~39 KB, under the threshold
 EOF
 
 BASE_OUT=$(python3 "$TOOL" --root "$STATIC_WORK/base" --since HEAD)
@@ -1200,7 +1201,7 @@ check_exit "matched_lines_turbo_ssd_missing_exit" \
 rm -rf "$ABSENT_WORK"
 
 check "doc_over_threshold_listed" \
-    "BIG.md, generated over the 200 KB threshold, is listed" \
+    "BIG.md, generated over the 40 KB threshold, is listed" \
     contains "docs/BIG.md" \
     BASE_OUT
 
