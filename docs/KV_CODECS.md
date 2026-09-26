@@ -23,7 +23,7 @@ fused flash-decode, the dispatch axis, sparse attention);
 
 The buffers are `KvCache::decode_fp16_k` and `decode_fp16_v`, not a
 `KvStorage` sub-struct. This is the same machinery as the bf16 mirror of the
-quantized codecs. `KvStorage::None` records only `max_seq`.
+quantized codecs. `KvStorage::None` holds no field.
 
 `update()` calls `update_decode_fp16`, which issues a `slice_update` at the
 current token offset. SDPA runs `scaled_dot_product_attention` on the bf16
@@ -529,7 +529,7 @@ MSL kernels (`turboquant_msl::turbo_quantize_v4_gpu` /
 a 4-D shape, so K and V share the dispatch.
 
 K and V are **separate types** (`QuantKTurbo<4>`, spelled `QuantKTurbo4`, and
-`QuantV`) inside `KvStorage::TurboSym4 { k, v, max_seq }`. The SSD layout tag
+`QuantV`) inside `KvStorage::TurboSym4 { k, v }`. The SSD layout tag
 is:
 
 ```
@@ -541,7 +541,7 @@ const TURBOSYM4_LAYOUT_TAG: &str = "tsym4_lloyd_4_4";
 with `ResolveError::QwenMoeKBitsTooLow(4)` (exit 78). `KvQuant::k_below_8bit()`
 is `true` for this variant.
 
-**Paged routing**: `KvStorage::new(KvQuant::TurboSym4, max_seq)` returns the
+**Paged routing**: `KvStorage::new(KvQuant::TurboSym4)` returns the
 non-paged `TurboSym4` storage when `--paged-kv` is set. `PagedKStorage` is
 q8-only.
 
@@ -582,7 +582,7 @@ const TURBOSYM3_LAYOUT_TAG: &str = "tsym3_lloyd_3_3";
 `Qwen3_5MoeForConditionalGeneration` and `Qwen3VLMoeForConditionalGeneration`
 with `ResolveError::QwenMoeTurboKRejected { variant: "tsym3" }`.
 
-**Paged routing**: `KvStorage::new(KvQuant::TurboSym3, max_seq)` returns the
+**Paged routing**: `KvStorage::new(KvQuant::TurboSym3)` returns the
 non-paged `TurboSym3` storage when `--paged-kv` is set.
 
 **Head/tail layers** — `boundary_floor` promotes the head and tail layers to
@@ -624,7 +624,7 @@ V offset in the flash and sparse kernels stays head-major, because V is the
 separate bf16 mirror.
 
 The K buffer is its own type (`QuantPlanarK`), with the same layout as
-`QuantPlanarV`, inside `KvStorage::PlanarK { k, max_seq }`. The SSD layout tag
+`QuantPlanarV`, inside `KvStorage::PlanarK { k }`. The SSD layout tag
 is:
 
 ```
@@ -637,7 +637,7 @@ const PLANARK4_LAYOUT_TAG: &str = "planar_k_4";
 with `ResolveError::QwenMoePlanarKRejected`.
 
 **Paged routing**: there is no `PagedPlanarKStorage`.
-`KvStorage::new(KvQuant::PlanarK, max_seq)` returns the non-paged `PlanarK`
+`KvStorage::new(KvQuant::PlanarK)` returns the non-paged `PlanarK`
 storage when `--paged-kv` is set.
 
 **Head/tail layers** — `boundary_floor` promotes the head and tail layers to

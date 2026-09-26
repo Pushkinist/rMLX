@@ -387,8 +387,18 @@ A `.kvb` is a safetensors file. Its `__metadata__`:
 A reader whose `model_id` or `kv_quant` differs fails with
 `BlockIoError::ModelIdMismatch` or `KvQuantMismatch` before any tensor read.
 
+Each hydrated layer gets the codec the arch builder gives that layer
+(`ArchPromptCache::layer_quants`: `kv_layer_quants`, or the base codec on
+every layer for an arch declared `with_uniform_layers`), not the block's base
+codec. The caller passes that vector
+to `SsdHydrator::lookup`, and a vector whose length is not the block's layer
+count is an error, which the tier treats as a corrupt block. A boundary layer
+holds the boundary floor, not the base codec
+(`docs/KV_LAYER_POLICY.md` § "Layer-adaptive overrides"), and decode reads its
+widths from the codec.
+
 **What a layer writes follows what it holds.**
-`KvStorage::geometry_only_max_seq()` decides:
+`KvStorage::is_geometry_only()` decides:
 
 - a layer with a packed store writes its codec's tensors under
   `l{i}.k.*` / `l{i}.v.*` (codes, scales, and per codec biases, norms,

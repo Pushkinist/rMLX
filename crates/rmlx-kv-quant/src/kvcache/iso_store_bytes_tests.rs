@@ -208,10 +208,7 @@ fn iso_store_geometry_follows_the_codec_bit_width() {
                         let s = k.as_ref().expect("iso K store");
                         iso_geometry!(s)
                     }
-                    other => panic!(
-                        "{name}: not an iso storage variant: {}",
-                        super::helpers::storage_variant_name(other)
-                    ),
+                    other => panic!("{name}: not an iso storage variant: {}", other.view().name),
                 };
 
             let want_bits = if name.contains('3') { 3_u8 } else { 4_u8 };

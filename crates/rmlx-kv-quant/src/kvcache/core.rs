@@ -40,6 +40,11 @@ use crate::KV_MAX_SEQ_DEFAULT;
 #[allow(missing_debug_implementations)]
 pub struct KvCache {
     pub storage: KvStorage,
+    /// Provisioned sequence capacity in tokens: the cap every store append and
+    /// the bf16 mirrors read. The two capacity paths
+    /// (`ensure_prefill_capacity`, `ensure_decode_capacity`) are its only
+    /// writers after construction.
+    pub(super) max_seq: i32,
     pub(super) offset: i32,
     pub(super) quant: KvQuant,
     /// Model-side layer index (0-based). Set at construction by the arch
@@ -279,6 +284,8 @@ impl KvCache {
     /// file, and this wraps each one as a decode-ready `KvCache` whose
     /// `offset`/`quant` match the spilled snapshot.
     ///
+    /// `max_seq` is the provisioned capacity the block geometry recorded.
+    ///
     /// `offset` is the filled sequence length recorded in the block header
     /// (`seq_len`). SWA / rotating layers are not spilled (their bf16 ring
     /// lives off-storage and `KvBlockWriter` records them as geometry-only
@@ -317,6 +324,7 @@ impl KvCache {
     /// than serving a zero-filled prefix.
     pub fn from_storage(
         storage: KvStorage,
+        max_seq: i32,
         quant: KvQuant,
         offset: i32,
         layer_idx: usize,
@@ -325,6 +333,7 @@ impl KvCache {
     ) -> Self {
         Self {
             storage,
+            max_seq,
             offset,
             quant,
             layer_idx,
@@ -355,7 +364,8 @@ impl KvCache {
     /// Create a new `KvCache` with the given quantization and an explicit max sequence length.
     pub fn with_quant_max_seq(quant: KvQuant, max_seq: i32) -> Self {
         Self {
-            storage: KvStorage::new(quant, max_seq),
+            storage: KvStorage::new(quant),
+            max_seq,
             offset: 0,
             quant,
             layer_idx: 0,
@@ -479,6 +489,11 @@ impl KvCache {
                 .is_none_or(|rot| rot.can_trim(self.offset - n))
     }
 
+    /// Provisioned sequence capacity in tokens.
+    pub fn max_seq(&self) -> i32 {
+        self.max_seq
+    }
+
     /// Current fill offset in tokens (number of tokens appended so far).
     pub fn offset(&self) -> i32 {
         self.offset
@@ -523,15 +538,6 @@ impl KvCache {
     #[cfg(test)]
     pub fn decode_fp16_k_for_test(&self) -> Option<&Array> {
         self.decode_fp16_k.as_ref()
-    }
-
-    /// Test-only accessor: the `max_seq` currently recorded on the active
-    /// storage variant (the allocated ring capacity). Used by the lazy-grow
-    /// / ceiling tests to assert the ring grew lazily rather than
-    /// pre-allocating to the ceiling.
-    #[cfg(test)]
-    pub fn storage_max_seq_for_test(&self) -> i32 {
-        super::update::storage_max_seq(&self.storage)
     }
 
     /// Test-only mutator: plant pre-allocated bf16 decode K/V buffers (sized to

@@ -174,6 +174,7 @@ fn hydrated_truncate_keeps_prefix_and_correction(quant: KvQuant, kv_h: i32) {
             &prompt_ids,
             cache_seed(TEST_LAYOUT_KEY, quant, &[quant], TEST_MODEL_SIG),
             quant,
+            &[quant],
             DispatchPolicy::default(),
             false,
         )

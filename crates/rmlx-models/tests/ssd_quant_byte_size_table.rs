@@ -374,7 +374,7 @@ fn index_row_matches_the_file_it_describes() {
 /// so it could not fail for the one case it existed to catch — and it had
 /// already drifted 21 variants behind the enum while still printing a
 /// "N/N variants covered" line. Driving it off `ALL_KV_QUANTS`, which lives
-/// beside the enum and is pinned exhaustive by `variant_index`, means a new
+/// beside the enum and is pinned exhaustive by the codec descriptor, means a new
 /// codec lands here as an unclassified name on the next run.
 #[test]
 fn every_kv_quant_is_tested_or_explicitly_excluded() {

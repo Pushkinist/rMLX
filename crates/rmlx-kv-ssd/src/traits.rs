@@ -38,23 +38,24 @@ use crate::hydrate::{HydratedBlock, SsdHydrator};
 /// reconstructs the arch entry. It returns:
 /// - `Ok(Some(entry))` — an SSD hit; the cache promotes it into RAM.
 /// - `Ok(None)` — a true SSD miss (no indexed prefix).
-/// - `Err(_)` — never returned by the production impl: corruption
-///   (bad read / metadata mismatch / missing file) is handled inside the impl
-///   (delete file + index row, `warn!`) and surfaces as `Ok(None)` so the
-///   caller falls through to a full prefill. The signature keeps `Result`
-///   only so the impl can use `?` on the index calls and map any residual
-///   error to `None`.
+/// - `Err(_)` — a caller-contract error: a `layer_quants` whose length is not
+///   the block's layer count. The block is kept. Corruption (bad read /
+///   metadata mismatch / missing file) is not an `Err`: it is handled inside
+///   the impl (delete file + index row, `warn!`) and surfaces as `Ok(None)` so
+///   the caller falls through to a full prefill.
 ///
 /// Must not panic.
 pub trait SsdHydrate<E>: Send {
     /// Attempt to reconstruct an entry for `prompt_ids` from the SSD tier
-    /// under the requesting model's `seed`, the request's `kv_quant`, and the
-    /// `policy` its caches dispatch under.
+    /// under the requesting model's `seed`, the request's `kv_quant`, the codec
+    /// the arch builder gives each layer at that `kv_quant` (`layer_quants`),
+    /// and the `policy` its caches dispatch under.
     fn hydrate(
         &self,
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         policy: DispatchPolicy,
     ) -> Result<Option<E>>;
 }
@@ -106,10 +107,17 @@ impl<E: HydratedEntry> SsdHydrate<E> for SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         policy: DispatchPolicy,
     ) -> Result<Option<E>> {
-        let Some((block, block_hashes)) =
-            self.lookup_seeded(prompt_ids, seed, kv_quant, policy, E::SHARES_KV)?
+        let Some((block, block_hashes)) = self.lookup_seeded(
+            prompt_ids,
+            seed,
+            kv_quant,
+            layer_quants,
+            policy,
+            E::SHARES_KV,
+        )?
         else {
             return Ok(None);
         };

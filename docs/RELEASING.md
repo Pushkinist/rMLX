@@ -312,12 +312,14 @@ The checklist:
    ```sh
    git diff -U0 "$PREV" "$NEW" -- 'crates/rmlx-cli/*.rs' | grep -E '^\+.*#\[arg\('
    git diff -U0 "$PREV" "$NEW" -- crates/rmlx-kv-quant/src/quant.rs \
+       crates/rmlx-kv-quant/src/quant_descriptor.rs \
        crates/rmlx-cli/src/commands/preset_table.rs |
-     grep -E '^\+[[:space:]]*\|?[[:space:]]*"[a-z0-9_]+"'
+     grep -E '^\+[[:space:]]*(\|[[:space:]]*|\(|spelling: Fixed\()?"[a-z0-9_]+"'
    ```
-   The second command finds fixed spellings, aliases and preset names. The
-   parser also accepts parametric families such as `mixed_*` and
-   `rot_k_v*`, so read its diff when it changed.
+   The second command finds fixed spellings (the `spelling: Fixed(..)` rows
+   of the codec descriptor), aliases (`KV_QUANT_ALIASES` in `quant.rs`) and
+   preset names. The parser also accepts parametric families such as
+   `mixed_*` and `rot_k_v*`, so read its diff when it changed.
 8. **One paragraph.** Name the pattern that this release repeated and the
    generalisation that would have prevented it. It goes in the retrospective
    comment on the release PR, not in `CHANGELOG.md`.

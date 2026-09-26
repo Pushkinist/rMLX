@@ -18,7 +18,7 @@
 //! It is the codec whose ring reports the overflow **loudly** (`QuantKGpuRing::
 //! append_encoded` errors), so a regression here is unambiguous rather than a
 //! silently short attention prefix. The growth itself is model-agnostic and
-//! lives on the shared storage `max_seq`, not in this codec.
+//! lives on the shared cache `max_seq`, not in this codec.
 //!
 //! # Coverage boundary
 //!
@@ -87,7 +87,6 @@ fn seeded_cache(quant: KvQuant, max_seq: i32, ceiling: Option<i32>) -> KvCache {
                 shape,
                 0,
             )),
-            max_seq,
         }
     } else {
         KvStorage::RotorKOnly3 {
@@ -98,10 +97,17 @@ fn seeded_cache(quant: KvQuant, max_seq: i32, ceiling: Option<i32>) -> KvCache {
                 shape,
                 0,
             )),
-            max_seq,
         }
     };
-    let cache = KvCache::from_storage(storage, quant, 0, 0, DispatchPolicy::default(), false);
+    let cache = KvCache::from_storage(
+        storage,
+        max_seq,
+        quant,
+        0,
+        0,
+        DispatchPolicy::default(),
+        false,
+    );
     match ceiling {
         Some(c) => cache.with_max_seq_ceiling(c),
         None => cache,

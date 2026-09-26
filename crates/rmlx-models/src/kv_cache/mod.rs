@@ -240,11 +240,9 @@ pub fn kv_quant_for_layer(
 /// Raising to 8 never lowers a side either — 8 is the widest width either
 /// validator accepts.
 ///
-/// The match is **exhaustive on purpose** (no wildcard), same reasoning as the
-/// decode predicates on [`KvQuant`]: a new variant has to be *listed* here
-/// before the crate compiles. Listing is not deciding, though — a new
-/// parametric variant added to the fallback arm compiles cleanly and inherits
-/// `K8V8`. What catches that is
+/// Only `Mixed` and `RotK` are named. Every other codec, a new one too, takes
+/// the `K8V8` fallback. What catches a new store-bearing codec that lands
+/// there by mistake is
 /// `store_bearing_boundary_promotion_never_costs_more`, which sweeps every base in
 /// `ALL_KV_QUANTS` that materialises a packed store, names the eight that take
 /// the fallback deliberately, and fails on any other store-bearing base that
@@ -252,58 +250,36 @@ pub fn kv_quant_for_layer(
 fn boundary_floor(base_quant: KvQuant, shares_kv: bool) -> KvQuant {
     /// The width the boundary promotion floors both axes to.
     const FLOOR_BITS: u8 = 8;
-    let target = match base_quant {
+    let target = if let KvQuant::Mixed {
+        k_bits,
+        v_bits,
+        k_group_size,
+        v_group_size,
+    } = base_quant
+    {
         KvQuant::Mixed {
-            k_bits,
-            v_bits,
-            k_group_size,
-            v_group_size,
-        } => KvQuant::Mixed {
             k_bits: k_bits.max(FLOOR_BITS),
             v_bits: v_bits.max(FLOOR_BITS),
             k_group_size,
             v_group_size,
-        },
+        }
+    } else if let KvQuant::RotK {
+        v_bits,
+        v_group_size,
+    } = base_quant
+    {
         // `RotK`'s K is fixed at 8-bit/group-64 by `MixedKvState::new_rotated`
         // and is already at the floor; only its V carries a width.
         KvQuant::RotK {
-            v_bits,
-            v_group_size,
-        } => KvQuant::RotK {
             v_bits: v_bits.max(FLOOR_BITS),
             v_group_size,
-        },
+        }
+    } else {
         // Widths baked into the variant: no 8-bit form of their own family to
-        // raise to, so the floor is `K8V8`.
-        KvQuant::None
-        | KvQuant::K8V4
-        | KvQuant::K8V8
-        | KvQuant::Planar
-        | KvQuant::Planar3
-        | KvQuant::PlanarK
-        | KvQuant::K8VTurbo3
-        | KvQuant::K8VTurbo3Tcq
-        | KvQuant::K8VTurbo2
-        | KvQuant::K8VTurbo2Tcq
-        | KvQuant::TurboSym3
-        | KvQuant::TurboSym4
-        | KvQuant::Iso3
-        | KvQuant::Iso4
-        | KvQuant::Iso3Sym
-        | KvQuant::Iso4Sym
-        | KvQuant::IsoKOnly3
-        | KvQuant::IsoKOnly4
-        | KvQuant::Rotor3
-        | KvQuant::Rotor4
-        | KvQuant::Rotor3Sym
-        | KvQuant::Rotor4Sym
-        | KvQuant::RotorKOnly3
-        | KvQuant::RotorKOnly4
-        // The `RotorK*Asym` V width is a parameter, but its K is a 3-/4-bit
-        // rotor that has no 8-bit form, so raising V alone would leave the
-        // layer below the floor on K. It takes the fallback.
-        | KvQuant::RotorK3Asym { .. }
-        | KvQuant::RotorK4Asym { .. } => KvQuant::K8V8,
+        // raise to, so the floor is `K8V8`. The `RotorK*Asym` V width is a
+        // parameter, but its K is a 3-/4-bit rotor that has no 8-bit form, so
+        // raising V alone would leave the layer below the floor on K.
+        KvQuant::K8V8
     };
     // A target that still reads a bf16 mirror on *both* axes decodes at model
     // dtype whatever its packed store holds, so the store buys no floor and is

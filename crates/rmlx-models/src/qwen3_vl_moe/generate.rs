@@ -29,13 +29,15 @@
 
 // kv-layer-quants: uniform — this arch builds every layer at the requested
 // codec and does not apply the boundary promotion, unlike the seven arches
-// that do. Pre-existing and left alone deliberately: changing it would move
-// this arch's KV mixture (memory and, on a quantizing codec, output), which is
-// a behaviour change that needs its own proof. Consequence to know: the SSD
-// `layout_key` folds the NOMINAL vector, so for this arch it over-describes
-// what is built. That is safe in the direction that matters — the key still
-// moves whenever the policy or the shape moves — but it will invalidate this
-// arch's blocks on a policy change that cannot affect them.
+// that do. Changing it would move this arch's KV mixture (memory and, on a
+// quantizing codec, output), which needs its own proof. The one producer of
+// the built vector is `PROMPT_CACHE.layer_quants`, declared uniform by
+// `with_uniform_layers`; the cache stacks below and the SSD hydrate both read
+// it. The SSD `layout_key` and the prompt-cache seed fold the NOMINAL vector,
+// so for this arch they over-describe what is built. That is safe in the
+// direction that matters — the key still moves whenever the policy or the
+// shape moves — but it invalidates this arch's blocks on a policy change that
+// cannot affect them.
 
 use rmlx_core::error::Result;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -44,7 +46,7 @@ use rmlx_runtime::{count_nan_in_bytes, max_abs_from_bytes};
 use crate::constraint::ConstraintEngine;
 use crate::context::{resolve_context, ResolvedContext};
 use crate::decode_loop::{reject_nan_prefill, ProbeStep};
-use crate::prompt_cache::{chained_block_hashes_seeded, Consumed, ReusePolicy};
+use crate::prompt_cache::{chained_block_hashes_seeded, snapshot_clone, Consumed, ReusePolicy};
 use crate::sampler::{apply_mask_argmax, sample_token_array, Pcg32, PenaltyConfig, SamplerConfig};
 use rmlx_kv_quant::{KvCache, KvQuant};
 
@@ -152,6 +154,21 @@ fn resolved_context(
 /// Emit one decode step (token id + piece). Logit stats are left at defaults —
 /// the smoke classifier only needs ids + pieces, and the hot loop avoids the
 /// extra GPU→host transfer of the full logit row.
+/// The per-layer cache stack for one request, each layer at the codec
+/// `PROMPT_CACHE.layer_quants` gives it and sized from the resolved context.
+fn kv_stack(n_layers: usize, kv_quant: KvQuant, ctx: &ResolvedContext) -> Vec<KvCache> {
+    PROMPT_CACHE
+        .layer_quants(n_layers, kv_quant)
+        .into_iter()
+        .enumerate()
+        .map(|(i, q)| {
+            KvCache::with_quant_max_seq(q, ctx.initial_max_seq)
+                .with_max_seq_ceiling(ctx.ceiling)
+                .with_layer_idx(i)
+        })
+        .collect()
+}
+
 fn make_step(token_id: u32, tokenizer: &tokenizers::Tokenizer) -> ProbeStep {
     ProbeStep {
         token_id,
@@ -280,14 +297,7 @@ pub fn generate_greedy(
     // single-shot forward over a multi-thousand-token prompt trips it. Mirrors
     // the other arch text paths (qwen3_5_moe / gemma4).
     let ctx = resolved_context(model, max_ctx_override)?;
-    let (initial_max_seq, max_seq_ceiling) = (ctx.initial_max_seq, ctx.ceiling);
-    let mut kv: Vec<KvCache> = (0..n_layers)
-        .map(|i| {
-            KvCache::with_quant_max_seq(kv_quant, initial_max_seq)
-                .with_max_seq_ceiling(max_seq_ceiling)
-                .with_layer_idx(i)
-        })
-        .collect();
+    let mut kv = kv_stack(n_layers, kv_quant, &ctx);
 
     let prefill_chunk = crate::prefill_chunk::resolve("qwen3_vl_moe");
     let logits = crate::decode_loop::chunked_prefill(
@@ -322,8 +332,8 @@ pub fn generate_greedy(
     // for every request (text and image), at the same lifecycle point as the
     // exact-hit path.
     if !has_image {
-        let cloned_caches: Result<Vec<KvCache>> = kv.iter().map(|c| c.try_deep_clone()).collect();
-        if let Ok(kv_snapshot) = cloned_caches {
+        let arch = PROMPT_CACHE.arch_name();
+        if let Some(kv_snapshot) = snapshot_clone(arch, &kv, KvCache::try_deep_clone) {
             match kv_snapshot.iter().try_for_each(|c| c.eval_for_spill()) {
                 Ok(()) => {
                     // Salt the chained block-hash walk with the active layout_key
@@ -532,22 +542,15 @@ pub fn generate_image(
     // The augmented image prompt is long (thousands of image soft tokens for
     // native Qwen3-VL tiling — e.g. a 2560×2560 image → ~6400 soft tokens),
     // far above the lazy KV_MAX_SEQ_DEFAULT=4096 start. Size the KV ring from
-    // the effective `--max-ctx`: `initial_max_seq` is the lazy start and
-    // `max_seq_ceiling` caps lazy growth and rejects an over-cap prompt with a
+    // the effective `--max-ctx`: `ctx.initial_max_seq` is the lazy start and
+    // `ctx.ceiling` caps lazy growth and rejects an over-cap prompt with a
     // clean `KvCeilingExceeded` (→ context_overflow) instead of a cryptic
     // `slice_update` broadcast. Bracketing the chunked forward with
     // enter_prefill()/exit_prefill() routes the prefill through the lazy-grow
     // raw buffer (mirrors the Gemma4 image path) so it grows to fit.
     let ctx = resolved_context(model, max_ctx_override)?;
-    let (initial_max_seq, max_seq_ceiling) = (ctx.initial_max_seq, ctx.ceiling);
     let n_layers = model.cfg.num_hidden_layers;
-    let mut kv: Vec<KvCache> = (0..n_layers)
-        .map(|i| {
-            KvCache::with_quant_max_seq(kv_quant, initial_max_seq)
-                .with_max_seq_ceiling(max_seq_ceiling)
-                .with_layer_idx(i)
-        })
-        .collect();
+    let mut kv = kv_stack(n_layers, kv_quant, &ctx);
     for c in &mut kv {
         c.enter_prefill();
     }

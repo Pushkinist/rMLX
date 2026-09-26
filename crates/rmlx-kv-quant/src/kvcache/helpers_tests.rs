@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::KvStorage;
 use crate::KvQuant;
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device, Dtype};
@@ -39,7 +40,8 @@ fn hydrate_none_storage_k8v8_quant_update_no_panic() {
     // Simulate a hydrated SWA layer: from_storage sets quant=K8V8 but the
     // on-disk tag was "none" → storage=KvStorage::None.
     let mut cache = KvCache::from_storage(
-        KvStorage::None { max_seq: 4096 },
+        KvStorage::None {},
+        4096,
         KvQuant::K8V8,
         256, // offset: 256 tokens already "cached"
         0,   // layer_idx: 0 for this test helper,
@@ -76,7 +78,8 @@ fn hydrate_none_storage_k8v4_and_planar_quant_update_no_panic() {
 
     for quant in [KvQuant::K8V4, KvQuant::Planar] {
         let mut cache = KvCache::from_storage(
-            KvStorage::None { max_seq: 4096 },
+            KvStorage::None {},
+            4096,
             quant,
             256,
             0,
@@ -105,7 +108,8 @@ fn hydrate_none_storage_k8v8_quant_exit_prefill_no_panic() {
     let device = Device::Cpu;
     // Simulate a fresh hydrated SWA layer: offset=0, storage=None, quant=K8V8.
     let mut cache = KvCache::from_storage(
-        KvStorage::None { max_seq: 4096 },
+        KvStorage::None {},
+        4096,
         KvQuant::K8V8,
         0,
         0,
