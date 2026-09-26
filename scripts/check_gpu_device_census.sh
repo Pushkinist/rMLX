@@ -13,8 +13,9 @@
 #   gpu-device    `Device::Gpu` (spaces around `::` allowed, any path prefix).
 #                 Exactly one such site passes; zero or two or more fail.
 #   device-alias  a `use` of the `Device` variants (`Device::*`,
-#                 `Device::{…}`) or a rename (`Device as …`): each lets the
-#                 GPU device be named without the token this gate counts.
+#                 `Device::{…}`), a rename (`Device as …`) or a type alias
+#                 (`type X = [path::]Device;`): each lets the GPU device be
+#                 named without the token this gate counts.
 #
 # Scope: every `.rs` file under the scan root except `*_tests.rs`, `tests.rs`
 # and the `bin/` directory. The programs under `bin/` are separate binaries
@@ -22,7 +23,12 @@
 #
 # What it cannot see: MLX's default device is the GPU, so a call that passes
 # no device, or runs on a default-device stream, reaches Metal with no
-# `Device::Gpu` anywhere; and nothing outside the scan root is counted.
+# `Device::Gpu` anywhere; and nothing outside the scan root is counted. Library
+# code that names the GPU itself is outside it and runs under `--device cpu`
+# with no claim: the BitNet loader (crates/rmlx-models/src/bitnet/loader.rs)
+# transposes its weights on the GPU whatever device the caller passed; the
+# Qwen3-TTS codec and synthesis (crates/rmlx-audio/src/tts.rs) and the server's
+# transcription handler (crates/rmlx-server/src/audio.rs) run on the GPU.
 #
 # Usage: check_gpu_device_census.sh [<rmlx-cli-src-dir>]
 #        (default: crates/rmlx-cli/src)
@@ -61,7 +67,8 @@ IFS= read -r -d '' AWK_RULES <<'EOF'
         print "gpu-device: " file ":" FNR ": " $0
         rest = substr(rest, RSTART + RLENGTH)
     }
-    if (code ~ /Device[ \t]*::[ \t]*([*]|[{])/ || code ~ /(^|[^A-Za-z0-9_])Device[ \t]+as[ \t]/)
+    if (code ~ /Device[ \t]*::[ \t]*([*]|[{])/ || code ~ /(^|[^A-Za-z0-9_])Device[ \t]+as[ \t]/ ||
+        code ~ /(^|[^A-Za-z0-9_])type[ \t]+[A-Za-z0-9_]+[ \t]*=[ \t]*([A-Za-z0-9_]+[ \t]*::[ \t]*)*Device[ \t]*;/)
         print "device-alias: " file ":" FNR ": " $0
 }
 EOF
