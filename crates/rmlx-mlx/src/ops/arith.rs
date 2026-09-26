@@ -29,7 +29,7 @@ pub fn add(a: &Array, b: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
     let status =
-        unsafe { with_stream(device, |s| sys::mlx_add(&raw mut res, a.inner, b.inner, s)) };
+        unsafe { with_stream(device, |s| sys::mlx_add(&raw mut res, a.inner, b.inner, s)) }?;
     unsafe { check_status(status, "add") }?;
     Ok(Array { inner: res })
 }
@@ -42,7 +42,7 @@ pub fn multiply(a: &Array, b: &Array, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_multiply(&raw mut res, a.inner, b.inner, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "multiply") }?;
     Ok(Array { inner: res })
 }
@@ -55,7 +55,7 @@ pub fn divide(a: &Array, b: &Array, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_divide(&raw mut res, a.inner, b.inner, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "divide") }?;
     Ok(Array { inner: res })
 }
@@ -69,7 +69,7 @@ pub fn floor_divide(a: &Array, b: &Array, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_floor_divide(&raw mut res, a.inner, b.inner, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "floor_divide") }?;
     Ok(Array { inner: res })
 }
@@ -82,7 +82,7 @@ pub fn subtract(a: &Array, b: &Array, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_subtract(&raw mut res, a.inner, b.inner, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "subtract") }?;
     Ok(Array { inner: res })
 }
@@ -91,7 +91,7 @@ pub fn subtract(a: &Array, b: &Array, device: Device) -> Result<Array> {
 pub fn negative(a: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
-    let status = unsafe { with_stream(device, |s| sys::mlx_negative(&raw mut res, a.inner, s)) };
+    let status = unsafe { with_stream(device, |s| sys::mlx_negative(&raw mut res, a.inner, s)) }?;
     unsafe { check_status(status, "negative") }?;
     Ok(Array { inner: res })
 }
@@ -108,7 +108,7 @@ pub fn clip(a: &Array, a_min: &Array, a_max: &Array, device: Device) -> Result<A
         with_stream(device, |s| {
             sys::mlx_clip(&raw mut res, a.inner, a_min.inner, a_max.inner, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "clip") }?;
     Ok(Array { inner: res })
 }
@@ -127,7 +127,7 @@ pub fn greater_equal(a: &Array, b: &Array, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_greater_equal(&raw mut res, a.inner, b.inner, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "greater_equal") }?;
     Ok(Array { inner: res })
 }
@@ -142,7 +142,7 @@ pub fn where_cond(cond: &Array, x: &Array, y: &Array, device: Device) -> Result<
         with_stream(device, |s| {
             sys::mlx_where(&raw mut res, cond.inner, x.inner, y.inner, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "where_cond") }?;
     Ok(Array { inner: res })
 }
@@ -156,7 +156,7 @@ pub fn repeat_axis(a: &Array, repeats: i32, axis: i32, device: Device) -> Result
         with_stream(device, |s| {
             sys::mlx_repeat_axis(&raw mut res, a.inner, repeats, axis, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "repeat_axis") }?;
     Ok(Array { inner: res })
 }
@@ -172,7 +172,7 @@ pub fn stack_axis(arrays: &[&Array], axis: i32, device: Device) -> Result<Array>
         with_stream(device, |s| {
             sys::mlx_stack_axis(&raw mut res, vec_arr, axis, s)
         })
-    };
+    }?;
     let _ = unsafe { sys::mlx_vector_array_free(vec_arr) };
     unsafe { check_status(status, "stack_axis") }?;
     Ok(Array { inner: res })
@@ -182,7 +182,7 @@ pub fn stack_axis(arrays: &[&Array], axis: i32, device: Device) -> Result<Array>
 pub fn log1p(a: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
-    let status = unsafe { with_stream(device, |s| sys::mlx_log1p(&raw mut res, a.inner, s)) };
+    let status = unsafe { with_stream(device, |s| sys::mlx_log1p(&raw mut res, a.inner, s)) }?;
     unsafe { check_status(status, "log1p") }?;
     Ok(Array { inner: res })
 }
@@ -191,7 +191,7 @@ pub fn log1p(a: &Array, device: Device) -> Result<Array> {
 pub fn log(a: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
-    let status = unsafe { with_stream(device, |s| sys::mlx_log(&raw mut res, a.inner, s)) };
+    let status = unsafe { with_stream(device, |s| sys::mlx_log(&raw mut res, a.inner, s)) }?;
     unsafe { check_status(status, "log") }?;
     Ok(Array { inner: res })
 }
@@ -200,7 +200,7 @@ pub fn log(a: &Array, device: Device) -> Result<Array> {
 pub fn exp(a: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
-    let status = unsafe { with_stream(device, |s| sys::mlx_exp(&raw mut res, a.inner, s)) };
+    let status = unsafe { with_stream(device, |s| sys::mlx_exp(&raw mut res, a.inner, s)) }?;
     unsafe { check_status(status, "exp") }?;
     Ok(Array { inner: res })
 }
@@ -214,7 +214,7 @@ pub fn exp(a: &Array, device: Device) -> Result<Array> {
 pub fn sqrt(a: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
-    let status = unsafe { with_stream(device, |s| sys::mlx_sqrt(&raw mut res, a.inner, s)) };
+    let status = unsafe { with_stream(device, |s| sys::mlx_sqrt(&raw mut res, a.inner, s)) }?;
     unsafe { check_status(status, "sqrt") }?;
     Ok(Array { inner: res })
 }
@@ -223,7 +223,7 @@ pub fn sqrt(a: &Array, device: Device) -> Result<Array> {
 pub fn sigmoid(a: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
-    let status = unsafe { with_stream(device, |s| sys::mlx_sigmoid(&raw mut res, a.inner, s)) };
+    let status = unsafe { with_stream(device, |s| sys::mlx_sigmoid(&raw mut res, a.inner, s)) }?;
     unsafe { check_status(status, "sigmoid") }?;
     Ok(Array { inner: res })
 }
@@ -236,7 +236,7 @@ pub fn sum_axis(a: &Array, axis: i32, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_sum_axis(&raw mut res, a.inner, axis, false, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "sum_axis") }?;
     Ok(Array { inner: res })
 }
@@ -252,7 +252,7 @@ pub fn concatenate(arrays: &[&Array], axis: i32, device: Device) -> Result<Array
         with_stream(device, |s| {
             sys::mlx_concatenate_axis(&raw mut res, vec_arr, axis, s)
         })
-    };
+    }?;
     unsafe { sys::mlx_vector_array_free(vec_arr) };
     unsafe { check_status(status, "concatenate") }?;
     Ok(Array { inner: res })
@@ -266,7 +266,7 @@ pub fn topk(a: &Array, k: i32, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_topk_axis(&raw mut res, a.inner, k, -1, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "topk") }?;
     Ok(Array { inner: res })
 }
@@ -279,7 +279,7 @@ pub fn argsort(a: &Array, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_argsort_axis(&raw mut res, a.inner, -1, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "argsort") }?;
     Ok(Array { inner: res })
 }
@@ -296,7 +296,7 @@ pub fn argpartition(a: &Array, kth: i32, axis: i32, device: Device) -> Result<Ar
         with_stream(device, |s| {
             sys::mlx_argpartition_axis(&raw mut res, a.inner, kth, axis, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "argpartition") }?;
     Ok(Array { inner: res })
 }
@@ -311,7 +311,7 @@ pub fn take_along_axis(a: &Array, indices: &Array, axis: i32, device: Device) ->
         with_stream(device, |s| {
             sys::mlx_take_along_axis(&raw mut res, a.inner, indices.inner, axis, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "take_along_axis") }?;
     Ok(Array { inner: res })
 }
@@ -324,7 +324,7 @@ pub fn zeros(shape: &[i32], dtype: Dtype, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_zeros(&raw mut res, shape.as_ptr(), shape.len(), dtype.to_sys(), s)
         })
-    };
+    }?;
     unsafe { check_status(status, "zeros") }?;
     Ok(Array { inner: res })
 }
@@ -339,7 +339,7 @@ pub fn scatter_add(out: &Array, indices: &Array, values: &Array, device: Device)
         with_stream(device, |s| {
             sys::mlx_scatter_add_axis(&raw mut res, out.inner, indices.inner, values.inner, 0, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "scatter_add") }?;
     Ok(Array { inner: res })
 }
@@ -356,7 +356,7 @@ pub fn argmax(a: &Array, axis: i32, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_argmax_axis(&raw mut res, a.inner, axis, false, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "argmax") }?;
     Ok(Array { inner: res })
 }
@@ -369,7 +369,7 @@ pub fn max_axis(a: &Array, axis: i32, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_max_axis(&raw mut res, a.inner, axis, false, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "max_axis") }?;
     Ok(Array { inner: res })
 }
@@ -386,7 +386,7 @@ pub fn expand_dims(a: &Array, axis: i32, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_expand_dims(&raw mut res, a.inner, axis, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "expand_dims") }?;
     Ok(Array { inner: res })
 }
@@ -399,7 +399,7 @@ pub fn broadcast_to(a: &Array, shape: &[i32], device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_broadcast_to(&raw mut res, a.inner, shape.as_ptr(), shape.len(), s)
         })
-    };
+    }?;
     unsafe { check_status(status, "broadcast_to") }?;
     Ok(Array { inner: res })
 }
@@ -412,7 +412,7 @@ pub fn sum_axis_keepdims(a: &Array, axis: i32, device: Device) -> Result<Array> 
         with_stream(device, |s| {
             sys::mlx_sum_axis(&raw mut res, a.inner, axis, true, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "sum_axis_keepdims") }?;
     Ok(Array { inner: res })
 }

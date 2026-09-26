@@ -101,7 +101,7 @@ pub fn gelu_tanh(x: &Array, device: Device) -> Result<Array> {
     let tanh_val = {
         let mut res = unsafe { sys::mlx_array_new() };
         let status =
-            unsafe { with_stream(device, |s| sys::mlx_tanh(&raw mut res, x_inner.inner, s)) };
+            unsafe { with_stream(device, |s| sys::mlx_tanh(&raw mut res, x_inner.inner, s)) }?;
         unsafe { check_status(status, "tanh in gelu_tanh") }?;
         Array { inner: res }
     };
@@ -145,7 +145,7 @@ pub fn gelu(x: &Array, device: Device) -> Result<Array> {
     let erf_val = {
         let mut res = unsafe { sys::mlx_array_new() };
         let status =
-            unsafe { with_stream(device, |s| sys::mlx_erf(&raw mut res, x_scaled.inner, s)) };
+            unsafe { with_stream(device, |s| sys::mlx_erf(&raw mut res, x_scaled.inner, s)) }?;
         unsafe { check_status(status, "erf in gelu") }?;
         Array { inner: res }
     };
@@ -167,7 +167,8 @@ pub fn silu(x: &Array, device: Device) -> Result<Array> {
     // sigmoid(x)
     let sig = {
         let mut res = unsafe { sys::mlx_array_new() };
-        let status = unsafe { with_stream(device, |s| sys::mlx_sigmoid(&raw mut res, x.inner, s)) };
+        let status =
+            unsafe { with_stream(device, |s| sys::mlx_sigmoid(&raw mut res, x.inner, s)) }?;
         unsafe { check_status(status, "sigmoid in silu") }?;
         Array { inner: res }
     };
@@ -182,7 +183,7 @@ pub fn silu(x: &Array, device: Device) -> Result<Array> {
 pub fn tanh(x: &Array, device: Device) -> Result<Array> {
     install_error_handler();
     let mut res = unsafe { sys::mlx_array_new() };
-    let status = unsafe { with_stream(device, |s| sys::mlx_tanh(&raw mut res, x.inner, s)) };
+    let status = unsafe { with_stream(device, |s| sys::mlx_tanh(&raw mut res, x.inner, s)) }?;
     unsafe { check_status(status, "tanh") }?;
     Ok(Array { inner: res })
 }
@@ -200,7 +201,7 @@ pub fn softmax(a: &Array, axis: i32, device: Device) -> Result<Array> {
             // `precise=false` — fast (bf16-native). Use true for CPU oracle only.
             sys::mlx_softmax_axis(&raw mut res, a.inner, axis, false, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "softmax") }?;
     Ok(Array { inner: res })
 }
@@ -219,7 +220,7 @@ pub fn softmax_precise(a: &Array, axis: i32, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_softmax_axis(&raw mut res, a.inner, axis, true, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "softmax_precise") }?;
     Ok(Array { inner: res })
 }

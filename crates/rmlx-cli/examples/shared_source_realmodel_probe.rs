@@ -85,7 +85,7 @@ fn main() -> anyhow::Result<()> {
     let _claim = rmlx_server::try_claim()?;
 
     rmlx_mlx::ensure_cpu_default_stream();
-    rmlx_mlx::ensure_gpu_default_stream();
+    rmlx_mlx::ensure_gpu_default_stream()?;
 
     eprintln!("loading model...");
     let model = arch::load_model(&model_path, Device::Gpu, &arch::LoadOpts::default())

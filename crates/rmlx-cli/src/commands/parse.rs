@@ -33,6 +33,7 @@
 //!   and combo KV-bit-width string parsers used by baseline / eval.
 
 #![allow(clippy::cognitive_complexity)]
+use rmlx_kv_quant::DeviceRefusesCodec;
 use rmlx_mlx::Device;
 use rmlx_models::kv_cache::KvBoundary;
 use rmlx_server::{try_claim, ClaimError, MetalClaim};
@@ -67,12 +68,30 @@ impl ClaimedDevice {
     pub(crate) fn holds_claim(&self) -> bool {
         self.claim.is_some()
     }
+
+    /// `Ok` when every codec in `quants` can run on this device.
+    ///
+    /// # Errors
+    /// The first codec [`rmlx_kv_quant::KvQuant::admitted_on`] refuses.
+    pub(crate) fn admits(
+        &self,
+        quants: &[rmlx_kv_quant::KvQuant],
+    ) -> Result<(), DeviceRefusesCodec> {
+        quants
+            .iter()
+            .try_for_each(|quant| quant.admitted_on(self.device))
+    }
 }
 
 /// Parse the `--device` flag value. `"gpu"` takes the Metal claim; `"cpu"`
-/// takes none.
+/// takes none and forbids every later GPU stream and Metal call in this
+/// process.
 pub(crate) fn parse_device(s: &str) -> anyhow::Result<ClaimedDevice> {
-    device_from_flag(s, || check_claim(claim_gpu()))
+    let claimed = device_from_flag(s, || check_claim(claim_gpu()))?;
+    if !claimed.holds_claim() {
+        rmlx_mlx::forbid_gpu();
+    }
+    Ok(claimed)
 }
 
 fn device_from_flag(

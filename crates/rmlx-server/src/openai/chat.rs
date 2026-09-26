@@ -226,6 +226,10 @@ pub(crate) async fn chat_completions(
         },
         None => None,
     };
+    if let Some(Err(e)) = req_kv_quant_override.map(|kq| kq.admitted_on(state.device)) {
+        state.error_counts.increment(ApiErrorCategory::BadRequest);
+        return bad_request(&format!("kv_quant: {e}"));
+    }
     if let Some(c) = req.max_ctx {
         if c <= 0 {
             state.error_counts.increment(ApiErrorCategory::BadRequest);

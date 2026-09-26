@@ -55,6 +55,7 @@ pub mod xctrace;
 
 use std::cell::Cell;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rmlx_core::error::{Error, Result};
 
@@ -332,25 +333,69 @@ pub(crate) unsafe fn check_status(status: i32, context: &str) -> Result<()> {
 // running default stream (no new thread); `mlx_stream_free` drops the
 // reference, not the stream or its thread.
 
+// ---------------------------------------------------------------------------
+// The CPU-device latch: once set, nothing in this crate asks for a GPU stream
+// or calls a Metal API.
+// ---------------------------------------------------------------------------
+
+/// Set once, before any model work starts, by the process that decided on the
+/// CPU device; never cleared. Worker threads start after it is set, so a
+/// `Relaxed` load observes it.
+static GPU_FORBIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Refuse every later GPU stream and Metal API call in this process with
+/// [`Error::GpuForbidden`].
+///
+/// Call it once, from the place that makes the process's device decision,
+/// before any model work. There is no way back.
+pub fn forbid_gpu() {
+    GPU_FORBIDDEN.store(true, Ordering::Relaxed);
+    tracing::info!("GPU refused for this process: the device decision is cpu");
+}
+
+/// True once [`forbid_gpu`] has run in this process.
+#[must_use]
+pub fn gpu_forbidden() -> bool {
+    GPU_FORBIDDEN.load(Ordering::Relaxed)
+}
+
+/// `Err(Error::GpuForbidden)` naming `op` once [`forbid_gpu`] has run.
+fn check_gpu_allowed(op: &'static str) -> Result<()> {
+    if gpu_forbidden() {
+        return Err(Error::GpuForbidden { op });
+    }
+    Ok(())
+}
+
 /// Borrow the process-global default stream for `device`, call `f(stream)`,
 /// release the handle, and return the result.
 ///
 /// All ops that need a stream use this helper to avoid repeating the boilerplate.
 ///
+/// # Errors
+/// [`Error::GpuForbidden`] for the GPU device after [`forbid_gpu`]; `f` is not
+/// called and no stream is requested.
+///
 /// # Safety
 /// `f` must not store the stream handle past the duration of the call.
-pub(crate) unsafe fn with_stream<T>(device: Device, f: impl FnOnce(sys::mlx_stream) -> T) -> T {
+pub(crate) unsafe fn with_stream<T>(
+    device: Device,
+    f: impl FnOnce(sys::mlx_stream) -> T,
+) -> Result<T> {
     // Obtain a reference-counted handle to the existing default stream.
     // This does NOT spawn a new thread — the stream already owns its thread.
     let stream = match device {
         Device::Cpu => unsafe { sys::mlx_default_cpu_stream_new() },
-        Device::Gpu => unsafe { sys::mlx_default_gpu_stream_new() },
+        Device::Gpu => {
+            check_gpu_allowed("GPU stream")?;
+            unsafe { sys::mlx_default_gpu_stream_new() }
+        }
     };
     let result = f(stream);
     // Release our ref-count handle. The stream itself stays alive (process lifetime).
     // SAFETY: stream is a valid handle obtained just above.
     unsafe { sys::mlx_stream_free(stream) };
-    result
+    Ok(result)
 }
 
 /// Ensure a GPU stream with a Metal command encoder is registered as the
@@ -376,7 +421,11 @@ pub(crate) unsafe fn with_stream<T>(device: Device, f: impl FnOnce(sys::mlx_stre
 /// Idempotent — subsequent calls from the same thread are no-ops.
 ///
 /// No-op if the GPU device is unavailable.
-pub fn ensure_gpu_default_stream() {
+///
+/// # Errors
+/// [`Error::GpuForbidden`] after [`forbid_gpu`]; no stream is created.
+pub fn ensure_gpu_default_stream() -> Result<()> {
+    check_gpu_allowed("ensure_gpu_default_stream")?;
     // Thread-local storage: init flag + stream handle.
     // The handle is held for the thread's lifetime so the CommandEncoder
     // entry in the thread-local encoders map stays alive.
@@ -396,7 +445,7 @@ pub fn ensure_gpu_default_stream() {
     }
 
     if GPU_STREAM_INIT.with(Cell::get) {
-        return;
+        return Ok(());
     }
 
     // SAFETY:
@@ -417,13 +466,13 @@ pub fn ensure_gpu_default_stream() {
     unsafe {
         let gpu_dev = sys::mlx_device_new_type(sys::mlx_device_type_::MLX_GPU, 0);
         if gpu_dev.ctx.is_null() {
-            return;
+            return Ok(());
         }
         let stream = sys::mlx_stream_new_device(gpu_dev);
         let _ = sys::mlx_device_free(gpu_dev);
 
         if stream.ctx.is_null() {
-            return;
+            return Ok(());
         }
 
         let _ = sys::mlx_set_default_stream(stream);
@@ -432,6 +481,7 @@ pub fn ensure_gpu_default_stream() {
         GPU_STREAM_HANDLE.with(|cell| cell.set(stream));
         GPU_STREAM_INIT.with(|cell| cell.set(true));
     }
+    Ok(())
 }
 
 /// Ensure a CPU stream is registered as the default stream for the **calling
@@ -1110,7 +1160,7 @@ impl Array {
             with_stream(device, |s| {
                 sys::mlx_astype(&raw mut res, self.inner, dtype.to_sys(), s)
             })
-        };
+        }?;
         unsafe { check_status(status, "astype") }?;
         Ok(Array { inner: res })
     }
@@ -1123,7 +1173,7 @@ impl Array {
             with_stream(device, |s| {
                 sys::mlx_reshape(&raw mut res, self.inner, shape.as_ptr(), shape.len(), s)
             })
-        };
+        }?;
         unsafe { check_status(status, "reshape") }?;
         Ok(Array { inner: res })
     }
@@ -1136,7 +1186,7 @@ impl Array {
             with_stream(device, |s| {
                 sys::mlx_transpose_axes(&raw mut res, self.inner, axes.as_ptr(), axes.len(), s)
             })
-        };
+        }?;
         unsafe { check_status(status, "transpose") }?;
         Ok(Array { inner: res })
     }
@@ -1164,7 +1214,7 @@ impl Array {
                 // allow_col_major = false → force row-major layout.
                 sys::mlx_contiguous(&raw mut res, self.inner, false, s)
             })
-        };
+        }?;
         unsafe { check_status(status, "contiguous") }?;
         Ok(Array { inner: res })
     }
@@ -1201,7 +1251,7 @@ impl Array {
                     s,
                 )
             })
-        };
+        }?;
         unsafe { check_status(status, "slice") }?;
         Ok(Array { inner: res })
     }
@@ -1244,7 +1294,7 @@ impl Array {
                     s,
                 )
             })
-        };
+        }?;
         unsafe { check_status(status, "slice_update") }?;
         Ok(Array { inner: res })
     }
@@ -1257,7 +1307,7 @@ impl Array {
             with_stream(device, |s| {
                 sys::mlx_take_axis(&raw mut res, self.inner, indices.inner, axis, s)
             })
-        };
+        }?;
         unsafe { check_status(status, "take") }?;
         Ok(Array { inner: res })
     }
@@ -1489,14 +1539,18 @@ impl PeakReading {
 // the same from `crates/rmlx-cli/src/commands/serve.rs`.
 
 /// Metal-specific helpers: availability check, device info, and wired-memory limit.
+///
+/// Every function here returns [`Error::GpuForbidden`] after
+/// [`super::forbid_gpu`], before any FFI call.
 pub mod metal {
-    use super::{check_status, install_error_handler, sys, Error, Result};
+    use super::{check_gpu_allowed, check_status, install_error_handler, sys, Error, Result};
     use std::ffi::CString;
 
     /// Returns true if a Metal-capable GPU backend is available.
     ///
     /// Mirrors `mlx.core.metal.is_available()`.
     pub fn is_available() -> Result<bool> {
+        check_gpu_allowed("metal::is_available")?;
         install_error_handler();
         let mut avail = false;
         // SAFETY: writing to a stack `bool` we own.
@@ -1515,6 +1569,7 @@ pub mod metal {
         reason = "check_status returns Err when status != 0; .unwrap_err() is infallible because the guard `status != 0` ensures the Result is Err"
     )]
     pub fn device_info_size(key: &str) -> Result<usize> {
+        check_gpu_allowed("metal::device_info_size")?;
         install_error_handler();
         let key_c = CString::new(key).map_err(|e| Error::Mlx(format!("device_info key: {e}")))?;
 
@@ -1569,6 +1624,7 @@ pub mod metal {
     ///
     /// Mirrors `mlx.core.set_wired_limit(limit) -> int`.
     pub fn set_wired_limit(limit: usize) -> Result<usize> {
+        check_gpu_allowed("metal::set_wired_limit")?;
         install_error_handler();
         let mut old: usize = 0;
         // SAFETY: writing to a stack `usize` we own.
@@ -1589,6 +1645,7 @@ pub mod metal {
     /// On non-Metal backends (e.g. CPU-only build), returns `Ok(None)` and
     /// does nothing.
     pub fn set_wired_limit_to_recommended() -> Result<Option<(usize, usize)>> {
+        check_gpu_allowed("metal::set_wired_limit_to_recommended")?;
         if !is_available()? {
             return Ok(None);
         }
@@ -1604,3 +1661,6 @@ pub mod metal {
 
 #[cfg(test)]
 mod lib_tests;
+
+#[cfg(test)]
+mod gpu_latch_tests;

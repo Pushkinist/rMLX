@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
 
     // -- Ensure CPU + GPU streams are registered on this thread --
     rmlx_mlx::ensure_cpu_default_stream();
-    rmlx_mlx::ensure_gpu_default_stream();
+    rmlx_mlx::ensure_gpu_default_stream()?;
 
     // -- Load model --
     eprintln!("loading model...");

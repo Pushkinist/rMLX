@@ -171,6 +171,14 @@ pub enum Error {
         /// correct alternative (e.g. the required assistant snapshot).
         reason: String,
     },
+
+    /// A GPU stream or a Metal API was requested in a process that decided on
+    /// the CPU device. Raised before the FFI call, so no Metal work was done.
+    #[error("{op}: this process runs on --device cpu; GPU work is refused")]
+    GpuForbidden {
+        /// The operation that asked for the GPU.
+        op: &'static str,
+    },
 }
 
 impl Error {
@@ -213,7 +221,8 @@ impl Error {
             | Error::KvHardCapExceeded { .. }
             | Error::KvCeilingExceeded { .. }
             | Error::ContextCeilingExceeded { .. }
-            | Error::SpeculativePairing { .. } => false,
+            | Error::SpeculativePairing { .. }
+            | Error::GpuForbidden { .. } => false,
         }
     }
 }

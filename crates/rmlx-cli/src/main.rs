@@ -2306,6 +2306,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             }
 
             let claimed = parse_device(&device)?;
+            claimed.admits(kv_quant_final.as_slice())?;
             // Build YARN override from CLI flags. None when either flag is absent.
             let yarn_override = yarn_factor.map(|factor| rmlx_models::qwen3::YarnOverride {
                 factor,
@@ -2370,7 +2371,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             //
             // --kv-preset pre-resolution. resolve_preset_arg turns
             // KvPresetArg::Auto into DEFAULT_KV_QUANT.
-            let (_kv_quant_final, _max_ctx_override) = if let Some(preset_arg) = kv_preset {
+            let (kv_quant_final, _max_ctx_override) = if let Some(preset_arg) = kv_preset {
                 let max_ctx_override = parse_max_ctx(max_ctx)?;
                 let cfg = rmlx_loader::load_config(&model)
                     .map_err(|e| anyhow::anyhow!("load_config: {e}"))?;
@@ -2390,7 +2391,8 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     kv_group_size,
                 )?
             };
-            let _claimed = parse_device(&device)?;
+            let claimed = parse_device(&device)?;
+            claimed.admits(&[kv_quant_final])?;
             println!("rmlx chat   model={}  device={device}", model.display());
         }
         Cmd::Transcribe {
@@ -2475,7 +2477,9 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
             // Only a probe runs MLX, so only a probe parses the device and
             // takes the claim.
             let (kv_quant_resolved, probe_device) = if probe_forward || probe_smoke {
-                (Some(kv_quant_final), Some(parse_device(&device)?))
+                let claimed = parse_device(&device)?;
+                claimed.admits(&[kv_quant_final])?;
+                (Some(kv_quant_final), Some(claimed))
             } else {
                 (None, None)
             };
@@ -2591,6 +2595,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 )?
             };
             let claimed = parse_device(&device)?;
+            claimed.admits(&[kv_quant_resolved])?;
 
             // Resolve --prompt-tokens → canonical longctx file when present.
             // The prompts/ dir lives at the workspace root; locate it via the
@@ -2729,6 +2734,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                 )?
             };
             let claimed = parse_device(&device)?;
+            claimed.admits(&[kv_quant_resolved])?;
 
             let prompts_root = resolve_prompts_root(prompts_dir);
             let (prompt_path, prompt_label) =
@@ -2817,6 +2823,7 @@ fn run(cli: Cli, run_id: &str, capture_forces_metrics_off: bool) -> Result<i32> 
                     Some(kq)
                 };
                 let claimed = parse_device(&device)?;
+                claimed.admits(kv_quant_resolved.as_slice())?;
                 run_ppl(
                     &model,
                     &text_file,

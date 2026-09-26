@@ -14,6 +14,121 @@ fn parse_device_cpu_takes_no_claim() {
     assert!(!cpu.holds_claim());
 }
 
+/// Only [`parse_device`] arms the GPU latch: the flag parser and the const CPU
+/// device do not, so an in-process test never forbids the GPU for its binary.
+#[test]
+fn device_from_flag_and_cpu_device_leave_the_latch_unset() {
+    let _from_flag =
+        device_from_flag("cpu", || panic!("--device cpu must not claim")).expect("cpu parses");
+    let _cpu = ClaimedDevice::cpu();
+    assert!(
+        !rmlx_mlx::gpu_forbidden(),
+        "only parse_device arms the latch"
+    );
+    let one = 1.0f32.to_le_bytes();
+    let a = rmlx_mlx::Array::from_bytes(&one, &[1], rmlx_mlx::Dtype::F32).expect("array");
+    let sum = rmlx_mlx::add(&a, &a, Device::Cpu).expect("CPU add");
+    sum.eval().expect("CPU eval");
+    assert_eq!(sum.to_bytes().expect("bytes"), 2.0f32.to_le_bytes());
+}
+
+const CHILD_MARKER: &str = "started-by-a-parse-device-parent-test";
+const CHILD_DONE: &str = "parse-device-child done";
+
+/// `--device cpu` forbids the GPU for the rest of the process. The check runs
+/// in a child of this test binary, because the latch cannot be unset.
+#[test]
+fn cpu_device_forbids_gpu_ops() {
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "commands::parse::tests::cpu_device_forbids_gpu_ops_child",
+            CHILD_MARKER,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("child runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains(CHILD_DONE),
+        "child did not run to its end:\n{stdout}"
+    );
+}
+
+#[test]
+#[ignore = "child process; its parent test starts it with a marker argument"]
+fn cpu_device_forbids_gpu_ops_child() {
+    if !std::env::args().any(|arg| arg == CHILD_MARKER) {
+        return;
+    }
+    let cpu = parse_device("cpu").expect("cpu parses");
+    assert!(!cpu.holds_claim());
+    assert!(rmlx_mlx::gpu_forbidden(), "--device cpu arms the latch");
+    match rmlx_mlx::ensure_gpu_default_stream() {
+        Err(rmlx_core::error::Error::GpuForbidden { .. }) => {}
+        other => panic!("a GPU stream under --device cpu: {other:?}"),
+    }
+    println!("{CHILD_DONE}");
+}
+
+// ── ClaimedDevice::admits ────────────────────────────────────────────────
+
+#[test]
+fn cpu_refuses_every_msl_codec() {
+    let cpu = ClaimedDevice::cpu();
+    let admitted: Vec<rmlx_kv_quant::KvQuant> = rmlx_kv_quant::ALL_KV_QUANTS
+        .iter()
+        .copied()
+        .filter(|&quant| cpu.admits(&[quant]).is_ok())
+        .collect();
+    assert_eq!(admitted, [rmlx_kv_quant::KvQuant::None]);
+    for &quant in rmlx_kv_quant::ALL_KV_QUANTS {
+        assert_eq!(
+            cpu.admits(&[quant]).is_ok(),
+            !quant.carries_msl(),
+            "{quant}"
+        );
+    }
+    let refused = rmlx_kv_quant::KvQuant::K8V8;
+    let err = cpu
+        .admits(&[rmlx_kv_quant::KvQuant::None, refused])
+        .expect_err("k8v8 carries MSL");
+    assert_eq!(err.codec, refused);
+    let msg = err.to_string();
+    assert!(msg.contains(&refused.to_string()), "{msg}");
+    assert!(
+        msg.contains("--device gpu") && msg.contains("--kv-quant none"),
+        "{msg}"
+    );
+}
+
+/// `auto` resolves to `none`, and no layer of a `none` stack is promoted to a
+/// codec the CPU device refuses.
+#[test]
+fn auto_under_cpu_is_none() {
+    let cpu = ClaimedDevice::cpu();
+    assert_eq!(parse_kv_quant("auto").expect("auto parses"), None);
+    let auto = resolve_preset_arg(KvPresetArg::Auto);
+    assert_eq!(auto, rmlx_kv_quant::KvQuant::None);
+    for n_layers in 1..=64 {
+        for shares_kv in [false, true] {
+            let layers = rmlx_models::kv_cache::kv_layer_quants(n_layers, auto, shares_kv);
+            assert!(
+                cpu.admits(&layers).is_ok(),
+                "{n_layers} layers, shares_kv={shares_kv}"
+            );
+        }
+    }
+}
+
 #[test]
 fn parse_device_gpu_goes_through_the_claim() {
     let mut claimed = false;

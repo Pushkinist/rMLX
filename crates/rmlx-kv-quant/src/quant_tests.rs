@@ -2188,3 +2188,19 @@ fn only_the_mixed_machinery_reads_shares_kv() {
         }
     }
 }
+
+/// Every codec runs on the GPU device; the CPU device admits exactly the
+/// codecs that carry no MSL.
+// gpu-test-gate: exempt  the device is a value `admitted_on` branches on; nothing dispatches.
+#[test]
+fn admitted_on_gpu_admits_every_codec_and_cpu_only_the_msl_free_ones() {
+    for &quant in ALL_KV_QUANTS {
+        assert_eq!(quant.admitted_on(Device::Gpu), Ok(()), "{quant}");
+        let on_cpu = quant.admitted_on(Device::Cpu);
+        if quant.carries_msl() {
+            assert_eq!(on_cpu, Err(super::DeviceRefusesCodec { codec: quant }));
+        } else {
+            assert_eq!(on_cpu, Ok(()), "{quant}");
+        }
+    }
+}

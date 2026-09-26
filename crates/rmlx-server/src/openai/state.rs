@@ -500,6 +500,9 @@ impl Default for ApiErrorCounters {
     reason = "OpenAI server AppState — internal type constructed only in run_serve; adding a field requires updating the single construction site"
 )]
 pub struct AppState {
+    /// The device this server decided on at startup. Every model the server
+    /// runs, and every per-request KV codec it admits, runs on it.
+    pub device: rmlx_mlx::Device,
     /// Registry of all known model snapshots and their metadata.
     pub registry: Arc<ModelRegistry>,
     /// Resident model slots. Length ≤ `max_loaded_models`. An empty Vec =
@@ -749,6 +752,7 @@ pub struct AppState {
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
+            .field("device", &self.device)
             .field("registry_len", &self.registry.list().len())
             .field("ttft_samples", &self.ttft_store.lock().len())
             .field("itl_samples", &self.itl_store.lock().len())

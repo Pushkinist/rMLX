@@ -174,6 +174,13 @@ impl MetalKernel {
 
         // Free input vector (we own the handle; arrays are ref-counted by MLX).
         unsafe { sys::mlx_vector_array_free(in_vec) };
+        let status = match status {
+            Ok(status) => status,
+            Err(refused) => {
+                unsafe { sys::mlx_vector_array_free(out_vec) };
+                return Err(refused);
+            }
+        };
 
         // Check error *before* extracting outputs to avoid leaking on error.
         // SAFETY: called on the same thread immediately after the C call.

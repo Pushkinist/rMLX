@@ -7,6 +7,8 @@
 //! The policy wrappers (`KvCacheBuilder`, `kv_quant_for_layer`,
 //! `DEFAULT_KV_QUANT`) live in `rmlx-models::kv_cache`.
 
+use rmlx_mlx::Device;
+
 /// Default maximum sequence length for the pre-allocated KV buffer.
 ///
 /// Arch loaders should pass the model's `max_position_embeddings` via
@@ -1084,6 +1086,21 @@ impl KvQuant {
         }
     }
 
+    /// `Ok` when this codec can run on `device`.
+    ///
+    /// A codec that [carries MSL](Self::carries_msl) has a Metal-only write
+    /// path, so the CPU device admits `none` alone. `auto` resolves to `none`
+    /// and is therefore admitted too.
+    ///
+    /// # Errors
+    /// [`DeviceRefusesCodec`] for an MSL codec on the CPU device.
+    pub fn admitted_on(self, device: Device) -> Result<(), DeviceRefusesCodec> {
+        match device {
+            Device::Cpu if self.carries_msl() => Err(DeviceRefusesCodec { codec: self }),
+            Device::Cpu | Device::Gpu => Ok(()),
+        }
+    }
+
     /// `Some(reason)` when no Metal kernel runs this codec's store on the
     /// default production hot path.
     ///
@@ -1552,6 +1569,18 @@ impl KvQuant {
         // saving = bf16 - codec; negative when the codec is bigger.
         i64::try_from(bf16).unwrap_or(i64::MAX) - i64::try_from(codec).unwrap_or(i64::MAX)
     }
+}
+
+/// A KV codec refused on the CPU device by [`KvQuant::admitted_on`].
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "KV codec '{codec}' runs Metal kernels and cannot run on --device cpu; \
+     use --device gpu or --kv-quant none"
+)]
+pub struct DeviceRefusesCodec {
+    /// The refused codec.
+    pub codec: KvQuant,
 }
 
 // ── KvQuant Display / FromStr ────────────────────────────────────────────────

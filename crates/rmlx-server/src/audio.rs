@@ -270,7 +270,7 @@ async fn handle_audio(state: AppState, mut multipart: Multipart, task: WhisperTa
         // 0.31/0.32) so a CPU-scheduled op does not fault on this worker thread.
         rmlx_mlx::ensure_cpu_default_stream();
         if device == Device::Gpu {
-            rmlx_mlx::ensure_gpu_default_stream();
+            rmlx_mlx::ensure_gpu_default_stream().map_err(|e| e.to_string())?;
         }
 
         // Resolve model + tokenizer from cache, loading on first call.

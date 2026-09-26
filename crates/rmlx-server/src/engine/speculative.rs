@@ -798,7 +798,10 @@ impl Generator for SpeculativeGenerator {
             // since MLX 0.31/0.32) so a CPU-scheduled op does not fault here.
             rmlx_mlx::ensure_cpu_default_stream();
             if dispatcher.device() == rmlx_mlx::Device::Gpu {
-                rmlx_mlx::ensure_gpu_default_stream();
+                if let Err(e) = rmlx_mlx::ensure_gpu_default_stream() {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
             }
 
             tracing::debug!(model_id = %model_id_for_log, block_size, "spec generate: blocking thread started");

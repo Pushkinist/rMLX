@@ -77,9 +77,9 @@ fn gpu_default_stream_guard_idempotent_on_worker_thread() {
     let handle = std::thread::spawn(|| {
         // Establish the GPU default stream for THIS thread, exactly as the
         // blocking-thread generate entry points do before any materialisation.
-        ensure_gpu_default_stream();
+        ensure_gpu_default_stream().unwrap();
         // Idempotent: a second call from the same thread is a no-op.
-        ensure_gpu_default_stream();
+        ensure_gpu_default_stream().unwrap();
 
         let input: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
         let bytes = f32_as_bytes(&input);

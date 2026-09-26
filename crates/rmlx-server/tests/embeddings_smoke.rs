@@ -45,6 +45,7 @@ fn state(registry: ModelRegistry) -> AppState {
     let loader: ModelLoader =
         Arc::new(|_p, _i| Ok(Box::new(NotReadyGenerator) as Box<dyn Generator>));
     AppState {
+        device: rmlx_mlx::Device::Cpu,
         registry: Arc::new(registry),
         slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
         embed_slot: Arc::new(parking_lot::RwLock::new(None)),

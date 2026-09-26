@@ -606,7 +606,7 @@ fn compute_embeddings(
     // 0.31/0.32) so a CPU-scheduled op does not fault on this worker thread.
     rmlx_mlx::ensure_cpu_default_stream();
     if device == rmlx_mlx::Device::Gpu {
-        rmlx_mlx::ensure_gpu_default_stream();
+        rmlx_mlx::ensure_gpu_default_stream().map_err(|e| EmbedError::Compute(e.to_string()))?;
     }
 
     // Build (single_vec | multi_vec) per item with a uniform serializer so

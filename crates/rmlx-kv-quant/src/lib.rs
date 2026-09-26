@@ -122,8 +122,8 @@ pub use flash_decode_common::VMirror;
 pub use kvcache::{KvCache, SharedKv};
 pub use linear_attn::{GdnTape, GdnTapeSegment, LinearAttnCache};
 pub use quant::{
-    validate_mixed_side, validate_rotor_k_asym_v, KvQuant, KvQuantParseError, ALL_KV_QUANTS,
-    KV_MAX_SEQ_DEFAULT,
+    validate_mixed_side, validate_rotor_k_asym_v, DeviceRefusesCodec, KvQuant, KvQuantParseError,
+    ALL_KV_QUANTS, KV_MAX_SEQ_DEFAULT,
 };
 
 // ── Kernel-path selection ────────────────────────────────────────────────────

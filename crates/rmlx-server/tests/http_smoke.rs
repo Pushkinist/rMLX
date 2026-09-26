@@ -46,6 +46,7 @@ fn not_ready_state(registry: ModelRegistry) -> AppState {
     let loader: ModelLoader =
         Arc::new(|_path, _id| Ok(Box::new(NotReadyGenerator) as Box<dyn Generator>));
     AppState {
+        device: rmlx_mlx::Device::Cpu,
         registry: Arc::new(registry),
         slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
         embed_slot: Arc::new(parking_lot::RwLock::new(None)),
@@ -199,6 +200,7 @@ async fn start_server_with_gemma4(gen: ArchGenerator) -> u16 {
     });
 
     let state = AppState {
+        device: rmlx_mlx::Device::Cpu,
         registry: Arc::new(reg),
         slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
         embed_slot: Arc::new(parking_lot::RwLock::new(None)),
@@ -395,6 +397,23 @@ async fn chat_completions_unknown_model_returns_404() {
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(v["error"]["message"].is_string());
     assert_eq!(v["error"]["type"], "not_found_error");
+}
+
+/// A server on the CPU device refuses a per-request KV codec that carries MSL
+/// before any model lookup, and lets `none` through to it.
+#[tokio::test]
+async fn request_kv_quant_refused_on_cpu_server() {
+    let port = start_server(ModelRegistry::default()).await;
+    let refused = r#"{"model":"no-such-model","messages":[{"role":"user","content":"hello"}],"kv_quant":"k8v8"}"#;
+    let (status, body) = http(port, "POST", "/v1/chat/completions", Some(refused)).await;
+    assert_eq!(status, 400, "body: {body}");
+    assert!(
+        body.contains("k8v8") && body.contains("--device cpu"),
+        "body: {body}"
+    );
+    let admitted = r#"{"model":"no-such-model","messages":[{"role":"user","content":"hello"}],"kv_quant":"none"}"#;
+    let (status, body) = http(port, "POST", "/v1/chat/completions", Some(admitted)).await;
+    assert_eq!(status, 404, "none reaches the model lookup, body: {body}");
 }
 
 #[tokio::test]
@@ -1210,6 +1229,7 @@ async fn start_timeout_test_server(max_timeout_secs: u64) -> u16 {
         Arc::new(|_path, _id| Ok(Box::new(NotReadyGenerator) as Box<dyn Generator>));
 
     let state = AppState {
+        device: rmlx_mlx::Device::Cpu,
         registry: Arc::new(reg),
         slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
         embed_slot: Arc::new(parking_lot::RwLock::new(None)),

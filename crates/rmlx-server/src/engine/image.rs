@@ -397,7 +397,7 @@ pub(crate) fn run_qwen3vl_image(
     // The CPU stream is registered unconditionally (thread-local since MLX 0.31/0.32).
     rmlx_mlx::ensure_cpu_default_stream();
     if device == rmlx_mlx::Device::Gpu {
-        rmlx_mlx::ensure_gpu_default_stream();
+        rmlx_mlx::ensure_gpu_default_stream()?;
     }
 
     let (vision, processor) = match vb {

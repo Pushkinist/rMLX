@@ -39,9 +39,11 @@ fn main() -> anyhow::Result<()> {
         .into();
     let dev_str = args.next().unwrap_or_else(|| "cpu".to_owned());
     // The claim is held until `main` returns, after the last GPU call.
-    let (device, _claim) = match dev_str.as_str() {
-        "gpu" => (Device::Gpu, Some(rmlx_server::try_claim()?)),
-        _ => (Device::Cpu, None),
+    let (device, _claim) = if dev_str == "gpu" {
+        (Device::Gpu, Some(rmlx_server::try_claim()?))
+    } else {
+        rmlx_mlx::forbid_gpu();
+        (Device::Cpu, None)
     };
     let n_gen: usize = args
         .next()

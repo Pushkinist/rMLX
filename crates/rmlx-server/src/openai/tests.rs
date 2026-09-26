@@ -1120,6 +1120,7 @@ fn slot_test_state(registry: ModelRegistry, max_loaded_models: usize) -> AppStat
     let loader: ModelLoader =
         Arc::new(|_path, _id| Ok(Box::new(NotReadyGenerator) as Box<dyn Generator>));
     AppState {
+        device: rmlx_mlx::Device::Cpu,
         registry: Arc::new(registry),
         slots: Arc::new(PLRwLock::new(Vec::new())),
         embed_slot: Arc::new(PLRwLock::new(None)),

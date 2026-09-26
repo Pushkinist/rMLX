@@ -956,6 +956,7 @@ pub(crate) fn run_serve(
         let drainer_handle = spawn_drainer(drainer_db_path);
 
         let mut state = AppState {
+            device,
             registry,
             slots: Arc::new(parking_lot::RwLock::new(Vec::new())),
             embed_slot: Arc::new(parking_lot::RwLock::new(None)),

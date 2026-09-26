@@ -17,7 +17,7 @@ pub fn matmul(a: &Array, b: &Array, device: Device) -> Result<Array> {
         with_stream(device, |s| {
             sys::mlx_matmul(&raw mut res, a.inner, b.inner, s)
         })
-    };
+    }?;
     unsafe { check_status(status, "matmul") }?;
     Ok(Array { inner: res })
 }
@@ -279,7 +279,7 @@ fn quantized_matmul_packed(
                 s,
             )
         })
-    };
+    }?;
 
     // Do NOT free biases_arr when biases.is_none() — it is the cached null sentinel.
 
@@ -348,7 +348,7 @@ pub fn dequantize(
                 s,
             )
         })
-    };
+    }?;
 
     // Do NOT free biases_arr or global_scale — both are the cached null sentinel.
 
@@ -431,7 +431,7 @@ pub fn quantize_mode(
                 s,
             )
         })
-    };
+    }?;
     // Do NOT free global_scale — it is the cached null sentinel.
 
     // Check status before reading from vec_res.
@@ -546,7 +546,7 @@ pub fn gather_qmm(
                 s,
             )
         })
-    };
+    }?;
     // Do NOT free biases_arr or lhs_arr — they are the cached null sentinel.
     unsafe { check_status(status, "gather_qmm") }?;
     Ok(Array { inner: res })
