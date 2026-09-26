@@ -303,6 +303,8 @@ struct Spilled {
     prompt_ids: Vec<u32>,
     /// The digest seed the probe has to run under.
     seed: u64,
+    /// The per-layer codec vector the seed folds, one entry per spilled layer.
+    layer_quants: Vec<KvQuant>,
     /// Per-layer digests of the caches as they went in.
     kv_digests: Vec<u64>,
     /// Per-layer digests of the recurrent state as it went in.
@@ -346,6 +348,7 @@ fn spill(
     Spilled {
         prompt_ids: prompt_ids.to_vec(),
         seed,
+        layer_quants,
         kv_digests,
         lin_digests,
     }
@@ -393,11 +396,11 @@ where
         clippy::expect_used,
         reason = "test: a hydrate that misses where the fixture just spilled is the failure under test and must abort loudly"
     )]
-    fn hydrate_or_panic<E>(h: &SsdHydrator, req: &[u32], seed: u64) -> E
+    fn hydrate_or_panic<E>(h: &SsdHydrator, req: &[u32], seed: u64, layer_quants: &[KvQuant]) -> E
     where
         SsdHydrator: SsdHydrate<E>,
     {
-        h.hydrate(req, seed, QUANT, DispatchPolicy::default())
+        h.hydrate(req, seed, QUANT, layer_quants, DispatchPolicy::default())
             .expect("hydrate must not error")
             .expect("the block the fixture spilled must be found")
     }
@@ -416,6 +419,7 @@ where
         &hydrator(&ns, LAYOUT_KEY),
         &request_longer_than(&stored),
         s.seed,
+        &s.layer_quants,
     );
 
     assert_eq!(
@@ -508,6 +512,7 @@ fn qwen3_5_moe_entry_restores_the_linear_state_beside_the_kv() {
             &request_longer_than(&stored),
             s.seed,
             QUANT,
+            &s.layer_quants,
             DispatchPolicy::default(),
         )
         .expect("hydrate must not error")
@@ -567,7 +572,13 @@ fn each_arch_hydrates_under_its_own_cross_layer_kv_topology() {
         &[],
     );
     let gemma: Gemma4Entry = hydrator(&gemma_ns, LAYOUT_KEY)
-        .hydrate(&prompt, g.seed, QUANT, DispatchPolicy::default())
+        .hydrate(
+            &prompt,
+            g.seed,
+            QUANT,
+            &g.layer_quants,
+            DispatchPolicy::default(),
+        )
         .expect("hydrate must not error")
         .expect("the block the fixture spilled must be found");
     assert_eq!(
@@ -591,7 +602,13 @@ fn each_arch_hydrates_under_its_own_cross_layer_kv_topology() {
         &[],
     );
     let laguna: LagunaEntry = hydrator(&laguna_ns, LAYOUT_KEY)
-        .hydrate(&prompt, l.seed, QUANT, DispatchPolicy::default())
+        .hydrate(
+            &prompt,
+            l.seed,
+            QUANT,
+            &l.layer_quants,
+            DispatchPolicy::default(),
+        )
         .expect("hydrate must not error")
         .expect("the block the fixture spilled must be found");
     assert_eq!(
@@ -637,6 +654,7 @@ fn the_entry_carries_the_blocks_tokens_not_the_requests() {
             &request_longer_than(&stored),
             s.seed,
             QUANT,
+            &s.layer_quants,
             DispatchPolicy::default(),
         )
         .expect("hydrate must not error")
@@ -998,7 +1016,13 @@ fn a_prompt_the_tier_never_saw_is_a_miss() {
 
     let other: Vec<u32> = (9_000..9_000 + BLOCK_TOKENS as u32).collect();
     let miss: Option<LagunaEntry> = hydrator(&ns, LAYOUT_KEY)
-        .hydrate(&other, s.seed, QUANT, DispatchPolicy::default())
+        .hydrate(
+            &other,
+            s.seed,
+            QUANT,
+            &s.layer_quants,
+            DispatchPolicy::default(),
+        )
         .expect("a miss is Ok(None), never Err");
     assert!(
         miss.is_none(),
@@ -1034,6 +1058,7 @@ fn a_multi_block_prefix_comes_back_whole() {
             &request_longer_than(&stored),
             s.seed,
             QUANT,
+            &s.layer_quants,
             DispatchPolicy::default(),
         )
         .expect("hydrate must not error")
@@ -1082,7 +1107,13 @@ fn a_block_does_not_hydrate_under_a_different_layout_key() {
     );
 
     let hit: Option<LagunaEntry> = hydrator(&ns, LAYOUT_KEY)
-        .hydrate(&prompt, s.seed, QUANT, DispatchPolicy::default())
+        .hydrate(
+            &prompt,
+            s.seed,
+            QUANT,
+            &s.layer_quants,
+            DispatchPolicy::default(),
+        )
         .expect("hydrate must not error");
     assert!(
         hit.is_some(),
@@ -1095,7 +1126,13 @@ fn a_block_does_not_hydrate_under_a_different_layout_key() {
     // re-seeded probe would miss on the digest alone, and the index clause
     // that matches the key could be deleted with this test still green.
     let miss: Option<LagunaEntry> = hydrator(&ns, LAYOUT_KEY ^ 1)
-        .hydrate(&prompt, s.seed, QUANT, DispatchPolicy::default())
+        .hydrate(
+            &prompt,
+            s.seed,
+            QUANT,
+            &s.layer_quants,
+            DispatchPolicy::default(),
+        )
         .expect("hydrate must not error");
     assert!(
         miss.is_none(),

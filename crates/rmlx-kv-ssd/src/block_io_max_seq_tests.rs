@@ -66,6 +66,7 @@ fn hydrate_restores_the_max_seq_each_layer_spilled() {
         device,
         MODEL_ID,
         QUANT,
+        &[QUANT; 2],
         DispatchPolicy::default(),
         false,
     )

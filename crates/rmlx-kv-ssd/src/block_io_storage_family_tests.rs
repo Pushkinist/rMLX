@@ -1,19 +1,17 @@
 //! A hydrated layer holds `None` storage or the same storage variant its own
 //! codec builds.
 //!
-//! `read_caches` hands every hydrated layer the block's `kv_quant`, except a
-//! `Mixed` store, which gets the codec its own geometry records.
-//! `KvCache::update` takes its entry from the storage and `exit_prefill` from
-//! the codec. The two keys agree when a non-`None` hydrated storage has the
-//! same storage variant `KvStorage::new` builds for that codec. The test
-//! compares the variant only, not the widths or parameters it carries. A layer
-//! whose codec builds no packed store spills geometry only and comes back as
-//! `None`.
+//! Each hydrated layer gets the codec the arch builder gives that layer
+//! (`kv_layer_quants`), not the block's base codec. `KvCache::update` takes its
+//! entry from the storage and `exit_prefill` from the codec. The two keys agree
+//! when a non-`None` hydrated storage has the same storage variant
+//! `KvStorage::new` builds for that codec. The test compares the variant only,
+//! not the widths or parameters it carries. A layer whose codec builds no packed
+//! store spills geometry only and comes back as `None`.
 //!
-//! This test holds that for a layer spilled under its own codec. Which codec a
-//! boundary layer gets beside its base is policy in `rmlx-models`, and
-//! `kv_cache::tests::a_boundary_layer_that_builds_a_store_keeps_the_base_storage`
-//! holds that half.
+//! This test holds that for a layer spilled and hydrated under its own codec.
+//! `ssd_boundary_codec_tests` in `rmlx-models` holds it for a boundary layer
+//! whose codec differs from the base.
 
 use super::block_io_tests::{arr, lcg};
 use super::{read_caches, write_caches};
@@ -67,6 +65,7 @@ fn a_hydrated_layer_holds_none_or_the_storage_of_its_codec() {
             device,
             MODEL_ID,
             quant,
+            &[quant],
             DispatchPolicy::default(),
             false,
         )

@@ -48,13 +48,15 @@ use crate::hydrate::{HydratedBlock, SsdHydrator};
 /// Must not panic.
 pub trait SsdHydrate<E>: Send {
     /// Attempt to reconstruct an entry for `prompt_ids` from the SSD tier
-    /// under the requesting model's `seed`, the request's `kv_quant`, and the
-    /// `policy` its caches dispatch under.
+    /// under the requesting model's `seed`, the request's `kv_quant`, the codec
+    /// the arch builder gives each layer at that `kv_quant` (`layer_quants`),
+    /// and the `policy` its caches dispatch under.
     fn hydrate(
         &self,
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         policy: DispatchPolicy,
     ) -> Result<Option<E>>;
 }
@@ -106,10 +108,17 @@ impl<E: HydratedEntry> SsdHydrate<E> for SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         policy: DispatchPolicy,
     ) -> Result<Option<E>> {
-        let Some((block, block_hashes)) =
-            self.lookup_seeded(prompt_ids, seed, kv_quant, policy, E::SHARES_KV)?
+        let Some((block, block_hashes)) = self.lookup_seeded(
+            prompt_ids,
+            seed,
+            kv_quant,
+            layer_quants,
+            policy,
+            E::SHARES_KV,
+        )?
         else {
             return Ok(None);
         };

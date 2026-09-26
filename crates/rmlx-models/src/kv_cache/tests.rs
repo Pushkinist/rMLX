@@ -976,12 +976,10 @@ mod tests {
     /// packed store or builds the same storage variant as the base. The test
     /// compares the variant only, not the widths or parameters it carries.
     ///
-    /// The SSD tier hydrates every layer of a block with the base codec, except
-    /// a `Mixed` store, which gets the codec its own geometry records. A layer
-    /// whose codec builds no packed store comes back as `None` storage
-    /// (`block_io_storage_family_tests` in `rmlx-kv-ssd`). `KvCache::update`
-    /// takes its entry from the storage and `exit_prefill` from the codec, so
-    /// the two agree after a hydrate only if this holds.
+    /// Each hydrated layer gets the codec the arch builder gives that layer
+    /// (`kv_layer_quants`), not the block's base codec. A layer whose codec
+    /// builds no packed store comes back as `None` storage
+    /// (`block_io_storage_family_tests` in `rmlx-kv-ssd`).
     #[test]
     fn a_boundary_layer_that_builds_a_store_keeps_the_base_storage() {
         use std::mem::discriminant;

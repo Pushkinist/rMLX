@@ -170,10 +170,13 @@ impl SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         policy: DispatchPolicy,
         shares_kv: bool,
     ) -> rmlx_core::error::Result<Option<(HydratedBlock, Vec<u64>)>> {
-        let Some(block) = self.lookup(prompt_ids, seed, kv_quant, policy, shares_kv)? else {
+        let Some(block) =
+            self.lookup(prompt_ids, seed, kv_quant, layer_quants, policy, shares_kv)?
+        else {
             return Ok(None);
         };
         let hashes = chained_block_hashes_seeded(&block.prompt_ids, seed);
@@ -185,10 +188,12 @@ impl SsdHydrator {
     /// miss **or** on corruption (after deleting the bad file + row + `warn!`).
     ///
     /// `seed` is the requesting model's prompt-cache seed, `kv_quant` the
-    /// codec the request is running, `policy` the kernel paths its caches
-    /// dispatch through, and `shares_kv` the model's cross-layer-KV topology
-    /// (see [`rmlx_kv_quant::KvCache::shares_kv`]); all four come from the
-    /// caller, never from this struct — see the type docs for why. A hydrated
+    /// codec the request is running, `layer_quants` the codec the arch builder
+    /// gives each layer at that `kv_quant` (`kv_layer_quants` in `rmlx-models`),
+    /// `policy` the kernel paths its caches dispatch through, and `shares_kv`
+    /// the model's cross-layer-KV topology (see
+    /// [`rmlx_kv_quant::KvCache::shares_kv`]); all five come from the caller,
+    /// never from this struct — see the type docs for why. A hydrated
     /// cache can be tail-extended, which re-runs the `exit_prefill` gate that
     /// `shares_kv` decides, so guessing it here would drop a mirror the
     /// requesting architecture needs.
@@ -201,10 +206,19 @@ impl SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         policy: DispatchPolicy,
         shares_kv: bool,
     ) -> rmlx_core::error::Result<Option<HydratedBlock>> {
-        self.lookup_inner(prompt_ids, seed, kv_quant, policy, shares_kv, None)
+        self.lookup_inner(
+            prompt_ids,
+            seed,
+            kv_quant,
+            layer_quants,
+            policy,
+            shares_kv,
+            None,
+        )
     }
 
     /// Test-only: like [`lookup`] but uses an explicit `EventRecorder` for
@@ -215,6 +229,7 @@ impl SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         policy: DispatchPolicy,
         shares_kv: bool,
         recorder: &EventRecorder,
@@ -223,6 +238,7 @@ impl SsdHydrator {
             prompt_ids,
             seed,
             kv_quant,
+            layer_quants,
             policy,
             shares_kv,
             Some(recorder),
@@ -251,6 +267,7 @@ impl SsdHydrator {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         policy: DispatchPolicy,
         shares_kv: bool,
         test_recorder: Option<&EventRecorder>,
@@ -290,6 +307,7 @@ impl SsdHydrator {
             self.device,
             &self.model_id,
             kv_quant,
+            layer_quants,
             policy,
             shares_kv,
         ) {

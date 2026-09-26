@@ -284,6 +284,7 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
             prompt_ids: &[u32],
             _seed: u64,
             _kv_quant: KvQuant,
+            _layer_quants: &[KvQuant],
             _policy: DispatchPolicy,
         ) -> Result<Option<Qwen3Entry>> {
             self.calls
@@ -324,6 +325,7 @@ fn qwen3_ssd_hydrate_promotes_entry_into_ram() {
         &prompt_ids,
         FNV_OFFSET,
         KvQuant::K8V8,
+        &[KvQuant::K8V8],
         DispatchPolicy::default(),
     );
     assert!(

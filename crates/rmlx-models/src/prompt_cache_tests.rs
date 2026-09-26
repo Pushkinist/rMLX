@@ -1185,6 +1185,7 @@ impl SsdHydrate<TestEntry> for MockSource {
         prompt_ids: &[u32],
         _seed: u64,
         _kv_quant: KvQuant,
+        _layer_quants: &[KvQuant],
         _policy: DispatchPolicy,
     ) -> Result<Option<TestEntry>> {
         self.calls
@@ -1221,7 +1222,13 @@ fn ssd_hydrate_populates_ram_and_bumps_counter() {
     assert_eq!(cache.stats().ssd_hits, 0);
 
     // Hydrate from SSD → promoted into RAM, counter bumped.
-    let slot = cache.hydrate_from_ssd(&prompt, FNV_OFFSET, TEST_QUANT, DispatchPolicy::default());
+    let slot = cache.hydrate_from_ssd(
+        &prompt,
+        FNV_OFFSET,
+        TEST_QUANT,
+        &[TEST_QUANT],
+        DispatchPolicy::default(),
+    );
     assert!(slot.is_some(), "SSD hit must populate a RAM slot");
     assert_eq!(cache.stats().ssd_hits, 1, "ssd_hits must increment on hit");
     assert_eq!(cache.slots.len(), 1, "one slot now populated");
@@ -1255,7 +1262,13 @@ fn zero_slots_never_reads_the_ssd_source() {
 
     assert!(
         cache
-            .hydrate_from_ssd(&prompt, FNV_OFFSET, TEST_QUANT, DispatchPolicy::default())
+            .hydrate_from_ssd(
+                &prompt,
+                FNV_OFFSET,
+                TEST_QUANT,
+                &[TEST_QUANT],
+                DispatchPolicy::default()
+            )
             .is_none(),
         "a zero-slot cache cannot admit a hydrated entry"
     );
@@ -1278,7 +1291,13 @@ fn no_ssd_source_is_inert() {
     assert!(cache.find_best_prefix(&prompt, FNV_OFFSET).is_none());
     assert!(
         cache
-            .hydrate_from_ssd(&prompt, FNV_OFFSET, TEST_QUANT, DispatchPolicy::default())
+            .hydrate_from_ssd(
+                &prompt,
+                FNV_OFFSET,
+                TEST_QUANT,
+                &[TEST_QUANT],
+                DispatchPolicy::default()
+            )
             .is_none(),
         "no SSD source → always a miss"
     );
@@ -1304,7 +1323,13 @@ fn ssd_miss_leaves_ram_untouched() {
     }));
     assert!(
         cache
-            .hydrate_from_ssd(&short, FNV_OFFSET, TEST_QUANT, DispatchPolicy::default())
+            .hydrate_from_ssd(
+                &short,
+                FNV_OFFSET,
+                TEST_QUANT,
+                &[TEST_QUANT],
+                DispatchPolicy::default()
+            )
             .is_none(),
         "SSD miss"
     );
@@ -1334,7 +1359,13 @@ fn ssd_hydrate_over_cap_entry_is_not_counted_as_hit() {
         calls: calls.clone(),
     }));
 
-    let slot = cache.hydrate_from_ssd(&prompt, FNV_OFFSET, TEST_QUANT, DispatchPolicy::default());
+    let slot = cache.hydrate_from_ssd(
+        &prompt,
+        FNV_OFFSET,
+        TEST_QUANT,
+        &[TEST_QUANT],
+        DispatchPolicy::default(),
+    );
     assert!(
         slot.is_none(),
         "an over-cap reconstructed block must surface as a miss"
@@ -1663,6 +1694,7 @@ impl SsdHydrate<TestEntry> for MockHydrateFromSeed {
         _prompt_ids: &[u32],
         seed: u64,
         _kv_quant: KvQuant,
+        _layer_quants: &[KvQuant],
         _policy: DispatchPolicy,
     ) -> rmlx_core::error::Result<Option<TestEntry>> {
         let hashes = chained_block_hashes_seeded(&self.ids, seed);
@@ -1692,6 +1724,7 @@ impl SsdHydrate<TestEntry> for MockHydrateSelfSeeded {
         _prompt_ids: &[u32],
         _seed: u64,
         _kv_quant: KvQuant,
+        _layer_quants: &[KvQuant],
         _policy: DispatchPolicy,
     ) -> rmlx_core::error::Result<Option<TestEntry>> {
         let hashes = chained_block_hashes_seeded(&self.ids, self.stale_seed);
@@ -1749,8 +1782,13 @@ fn hydrated_entry_is_findable_only_when_seeded_from_the_query() {
             .is_none(),
         "RAM empty before hydrate"
     );
-    let promoted =
-        cache_correct.hydrate_from_ssd(&prompt_ids, seed_a, codec_a, DispatchPolicy::default());
+    let promoted = cache_correct.hydrate_from_ssd(
+        &prompt_ids,
+        seed_a,
+        codec_a,
+        &[codec_a],
+        DispatchPolicy::default(),
+    );
     assert!(promoted.is_some(), "mock SSD source must hydrate");
     let after = cache_correct.find_best_prefix(&prompt_ids, seed_a);
     assert!(
@@ -1767,7 +1805,13 @@ fn hydrated_entry_is_findable_only_when_seeded_from_the_query() {
         ids: prompt_ids.clone(),
         stale_seed: seed_other_model,
     }));
-    cache_broken.hydrate_from_ssd(&prompt_ids, seed_a, codec_a, DispatchPolicy::default());
+    cache_broken.hydrate_from_ssd(
+        &prompt_ids,
+        seed_a,
+        codec_a,
+        &[codec_a],
+        DispatchPolicy::default(),
+    );
     assert!(
         cache_broken.find_best_prefix(&prompt_ids, seed_a).is_none(),
         "an entry seeded from the source's own state is unfindable by the query \
@@ -1818,6 +1862,7 @@ impl SsdHydrate<TestEntry> for SeedKeyedStore {
         _prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        _layer_quants: &[KvQuant],
         _policy: DispatchPolicy,
     ) -> rmlx_core::error::Result<Option<TestEntry>> {
         self.probed
@@ -2602,6 +2647,7 @@ impl SsdHydrate<TestEntry> for SsdHydrator {
         _prompt_ids: &[u32],
         _seed: u64,
         _kv_quant: KvQuant,
+        _layer_quants: &[KvQuant],
         _policy: DispatchPolicy,
     ) -> Result<Option<TestEntry>> {
         Ok(None)

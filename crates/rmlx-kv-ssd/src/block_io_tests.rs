@@ -1597,6 +1597,7 @@ fn roundtrip_none_bf16_payload_via_spill_hydrate() {
         device,
         MODEL_ID,
         KvQuant::None,
+        &[KvQuant::None; 2],
         DispatchPolicy::default(),
         false,
     )
@@ -1675,6 +1676,7 @@ fn roundtrip_mirror_codec_spills_and_hydrates_as_bf16() {
             device,
             MODEL_ID,
             quant,
+            &[quant],
             DispatchPolicy::default(),
             false,
         )
@@ -1784,6 +1786,7 @@ fn tail_extended_store_backed_cache_does_not_spill_a_short_block() {
         device,
         MODEL_ID,
         KvQuant::K8V8,
+        &[KvQuant::K8V8],
         DispatchPolicy::default(),
         false,
     )
@@ -2020,8 +2023,16 @@ fn hydrate_carries_the_callers_dispatch_policy() {
 
     let path = tmp_path("hydrate_policy");
     write_caches(&path, device, MODEL_ID, KvQuant::None, &kv_caches, &[]).unwrap();
-    let (hydrated, _lin) =
-        read_caches(&path, device, MODEL_ID, KvQuant::None, requested, false).unwrap();
+    let (hydrated, _lin) = read_caches(
+        &path,
+        device,
+        MODEL_ID,
+        KvQuant::None,
+        &[KvQuant::None; 2],
+        requested,
+        false,
+    )
+    .unwrap();
 
     assert_eq!(hydrated.len(), 2, "layer count");
     for (layer, cache) in hydrated.iter().enumerate() {
@@ -2362,6 +2373,7 @@ fn planar3_prefilled_gpu_spill_hydrate_is_bf16_and_exact() {
         device,
         MODEL_ID,
         KvQuant::Planar3,
+        &[KvQuant::Planar3],
         DispatchPolicy::default(),
         false,
     )
@@ -3260,6 +3272,7 @@ fn ssd_roundtrip_preserves_layer_idx_positional() {
         device,
         MODEL_ID,
         KvQuant::Rotor3,
+        &vec![KvQuant::Rotor3; caches.len()],
         DispatchPolicy::default(),
         false,
     )
@@ -3463,6 +3476,7 @@ fn rotor_k_only_ring_only_tail_ssd_round_trip() {
         device,
         MODEL_ID,
         KvQuant::RotorKOnly3,
+        &[KvQuant::RotorKOnly3],
         DispatchPolicy::default(),
         false,
     )
@@ -3678,6 +3692,7 @@ fn rotor_sym_ring_only_tail_ssd_round_trip() {
         device,
         MODEL_ID,
         KvQuant::Rotor3Sym,
+        &[KvQuant::Rotor3Sym],
         DispatchPolicy::default(),
         false,
     )
@@ -4280,6 +4295,7 @@ fn iso_sym_ring_only_tail_ssd_round_trip() {
         device,
         MODEL_ID,
         KvQuant::Iso3Sym,
+        &[KvQuant::Iso3Sym],
         DispatchPolicy::default(),
         false,
     )

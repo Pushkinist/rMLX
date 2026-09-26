@@ -387,10 +387,11 @@ A `.kvb` is a safetensors file. Its `__metadata__`:
 A reader whose `model_id` or `kv_quant` differs fails with
 `BlockIoError::ModelIdMismatch` or `KvQuantMismatch` before any tensor read.
 
-A hydrated layer gets the block's `kv_quant`, except a `Mixed` store. Its
-geometry records `k_bits`, `v_bits`, the group sizes and `rotate_k`, and the
-layer gets the `Mixed` or `RotK` codec they give. A boundary layer of a `Mixed`
-or `RotK` block holds the 8-bit form of that codec
+Each hydrated layer gets the codec the arch builder gives that layer
+(`kv_layer_quants`), not the block's base codec. The caller passes that vector
+to `SsdHydrator::lookup`, and a vector whose length is not the block's layer
+count is an error, which the tier treats as a corrupt block. A boundary layer
+holds the boundary floor, not the base codec
 (`docs/KV_LAYER_POLICY.md` § "Layer-adaptive overrides"), and decode reads its
 widths from the codec.
 

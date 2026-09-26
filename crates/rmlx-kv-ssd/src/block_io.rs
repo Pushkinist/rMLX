@@ -426,9 +426,12 @@ pub(crate) fn write_caches_timed(
 /// Opens `path`, verifies the header (`model_id` + `kv_quant`) against the
 /// model being hydrated, reconstructs each layer's [`KvStorage`] via
 /// [`KvBlockReader::hydrate`], and wraps each one as a decode-ready
-/// [`KvCache`] with `offset` set to the recorded `seq_len`. Returns
+/// [`KvCache`] with `offset` set to the recorded `seq_len`. Layer `i` gets
+/// `layer_quants[i]`, the codec the arch builder gives that layer, not the
+/// block's base `kv_quant`. Returns
 /// `Err(BlockIoError::ModelIdMismatch | KvQuantMismatch)` on a metadata
-/// mismatch and any deserialize error otherwise — the caller treats every
+/// mismatch, `Err` when `layer_quants` and the block's layer count differ, and
+/// any deserialize error otherwise — the caller treats every
 /// `Err` as a corrupt block (delete file + index row, fall through to
 /// prefill). Host-materialization (`to_bytes`) happens here, so call this off
 /// the hot path.
@@ -437,12 +440,20 @@ pub(crate) fn read_caches(
     device: Device,
     model_id: &str,
     kv_quant: KvQuant,
+    layer_quants: &[KvQuant],
     policy: DispatchPolicy,
     shares_kv: bool,
 ) -> Result<(Vec<KvCache>, Vec<LinearAttnCache>)> {
-    let (kv_caches, lin_caches, _, _, _, _) =
-        read_caches_inner(path, device, model_id, kv_quant, policy, shares_kv)?
-            .ok_or_else(|| Error::Mlx(format!("KV block read: {} not found", path.display())))?;
+    let (kv_caches, lin_caches, _, _, _, _) = read_caches_inner(
+        path,
+        device,
+        model_id,
+        kv_quant,
+        layer_quants,
+        policy,
+        shares_kv,
+    )?
+    .ok_or_else(|| Error::Mlx(format!("KV block read: {} not found", path.display())))?;
     Ok((kv_caches, lin_caches))
 }
 
@@ -470,10 +481,19 @@ pub(crate) fn read_caches_timed(
     device: Device,
     model_id: &str,
     kv_quant: KvQuant,
+    layer_quants: &[KvQuant],
     policy: DispatchPolicy,
     shares_kv: bool,
 ) -> Result<Option<TimedCaches>> {
-    read_caches_inner(path, device, model_id, kv_quant, policy, shares_kv)
+    read_caches_inner(
+        path,
+        device,
+        model_id,
+        kv_quant,
+        layer_quants,
+        policy,
+        shares_kv,
+    )
 }
 
 /// Shared core for [`read_caches`] and [`read_caches_timed`].
@@ -486,6 +506,7 @@ fn read_caches_inner(
     device: Device,
     model_id: &str,
     kv_quant: KvQuant,
+    layer_quants: &[KvQuant],
     policy: DispatchPolicy,
     shares_kv: bool,
 ) -> Result<Option<TimedCaches>> {
@@ -501,6 +522,13 @@ fn read_caches_inner(
 
     let t_dequant = Instant::now();
     let (layers, lin_caches) = reader.hydrate(model_id, kv_quant, device)?;
+    if layers.len() != layer_quants.len() {
+        return Err(Error::Mlx(format!(
+            "KV block read: {} layers in the block, {} layer codecs given",
+            layers.len(),
+            layer_quants.len()
+        )));
+    }
     let offset = reader.seq_len()?;
     let dur_dequant_us = t_dequant.elapsed().as_micros() as u64;
 
@@ -509,19 +537,19 @@ fn read_caches_inner(
     // layer-ordered at spill — see `write_caches` contract. A `None`-storage
     // layer that carried an off-storage bf16 prefix re-seeds the decode buffers
     // so an exact-hit replay reads the real K/V instead of zeros.
-    let kv_caches = layers
+    let kv_caches: Vec<KvCache> = layers
         .into_iter()
+        .zip(layer_quants)
         .enumerate()
-        .map(|(layer_idx, (s, max_seq, bf16))| {
-            let quant = spilled_codec(&s, kv_quant)?;
+        .map(|(layer_idx, ((s, max_seq, bf16), &quant))| {
             let cache =
                 KvCache::from_storage(s, max_seq, quant, offset, layer_idx, policy, shares_kv);
-            Ok(match bf16 {
+            match bf16 {
                 Some((k, v)) => cache.with_decode_fp16_seed(k, v),
                 None => cache,
-            })
+            }
         })
-        .collect::<Result<Vec<KvCache>>>()?;
+        .collect();
     let dur_finalize_us = t_finalize.elapsed().as_micros() as u64;
 
     Ok(Some((
@@ -532,35 +560,6 @@ fn read_caches_inner(
         dur_dequant_us,
         dur_finalize_us,
     )))
-}
-
-/// The codec a hydrated layer was spilled with.
-///
-/// A boundary layer of a `Mixed` or `RotK` block holds the 8-bit form of the
-/// block's codec, so a `Mixed` store gives its own widths, group sizes and K
-/// rotation. Every other store holds the block's codec `block_quant`.
-fn spilled_codec(storage: &KvStorage, block_quant: KvQuant) -> Result<KvQuant> {
-    let KvStorage::Mixed { state } = storage else {
-        return Ok(block_quant);
-    };
-    let bits =
-        |x: i32| u8::try_from(x).map_err(|_| Error::Mlx(format!("KV block read: Mixed bits {x}")));
-    let group = |x: i32| {
-        u16::try_from(x).map_err(|_| Error::Mlx(format!("KV block read: Mixed group size {x}")))
-    };
-    Ok(if state.rotate_k {
-        KvQuant::RotK {
-            v_bits: bits(state.v_bits)?,
-            v_group_size: group(state.v_group_size)?,
-        }
-    } else {
-        KvQuant::Mixed {
-            k_bits: bits(state.k_bits)?,
-            v_bits: bits(state.v_bits)?,
-            k_group_size: group(state.k_group_size)?,
-            v_group_size: group(state.v_group_size)?,
-        }
-    })
 }
 
 /// Shared serialization core over an owned-slice of storages.

@@ -114,6 +114,7 @@ fn prefilled_cache_spills_through_the_bf16_route_not_the_store() {
         device,
         MODEL_ID,
         QUANT,
+        &[QUANT],
         DispatchPolicy::default(),
         false,
     )
@@ -186,6 +187,7 @@ fn ssd_hit_reconstructs_block_within_tolerance() {
             &prompt_ids,
             cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
+            &[QUANT],
             DispatchPolicy::default(),
             false,
         )
@@ -266,6 +268,7 @@ fn salted_keyed_block_is_found_by_probe() {
             &prompt_ids,
             cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
+            &[QUANT],
             DispatchPolicy::default(),
             false,
         )
@@ -357,6 +360,7 @@ fn probe_finds_own_models_block_and_not_another_models() {
             &prompt_ids,
             cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
+            &[QUANT],
             DispatchPolicy::default(),
             false,
         )
@@ -372,6 +376,7 @@ fn probe_finds_own_models_block_and_not_another_models() {
                 &prompt_ids,
                 cache_seed(LK, QUANT, &[QUANT], OTHER_MODEL_SIG),
                 QUANT,
+                &[QUANT],
                 DispatchPolicy::default(),
                 false
             )
@@ -388,6 +393,7 @@ fn probe_finds_own_models_block_and_not_another_models() {
                 &prompt_ids,
                 cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
                 QUANT,
+                &[QUANT],
                 DispatchPolicy::default(),
                 false
             )
@@ -470,6 +476,7 @@ fn lookup_seeded_matches_arch_recompute() {
             &input_ids,
             cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
+            &[QUANT],
             DispatchPolicy::default(),
             false,
         )
@@ -549,6 +556,7 @@ fn corrupt_block_deletes_file_and_row_returns_miss() {
             &prompt_ids,
             cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
+            &[QUANT],
             DispatchPolicy::default(),
             false,
         )
@@ -619,6 +627,7 @@ fn metadata_mismatch_treated_as_corrupt() {
                 TEST_MODEL_SIG
             ),
             KvQuant::K8V4,
+            &[KvQuant::K8V4],
             DispatchPolicy::default(),
             false,
         )
@@ -657,6 +666,7 @@ fn no_indexed_prefix_is_miss() {
             &prompt_ids,
             cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
+            &[QUANT],
             DispatchPolicy::default(),
             false,
         )
@@ -687,6 +697,7 @@ fn short_prompt_never_queried() {
             &short,
             cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
+            &[QUANT],
             DispatchPolicy::default(),
             false,
         )
@@ -758,6 +769,7 @@ fn ssd_hit_lookup_emits_hydrate_event() {
             &prompt_ids,
             cache_seed(TEST_LAYOUT_KEY, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
+            &[QUANT],
             DispatchPolicy::default(),
             false,
             &rec,
@@ -836,6 +848,21 @@ fn ssd_hit_lookup_emits_hydrate_event() {
 /// namespace, the budget pass shrinking it, and a request thread hydrating. The
 /// pre-race pass pins that the content check can pass on real data, so a run in
 /// which the race produced only misses cannot pass vacuously.
+/// One lookup of `prompt` under the race namespace's key and codec.
+fn race_lookup(
+    hydrator: &SsdHydrator,
+    prompt: &[u32],
+) -> rmlx_core::error::Result<Option<HydratedBlock>> {
+    hydrator.lookup(
+        prompt,
+        cache_seed(RACE_LK, QUANT, &[QUANT], TEST_MODEL_SIG),
+        QUANT,
+        &[QUANT],
+        DispatchPolicy::default(),
+        false,
+    )
+}
+
 #[test]
 #[allow(
     clippy::expect_used,
@@ -892,14 +919,7 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
             SsdKvIndex::open_at(&db).unwrap(),
         );
         for i in 0..RACE_PROMPTS {
-            let block = hydrator
-                .lookup(
-                    &fx.prompts[i],
-                    cache_seed(RACE_LK, QUANT, &[QUANT], TEST_MODEL_SIG),
-                    QUANT,
-                    DispatchPolicy::default(),
-                    false,
-                )
+            let block = race_lookup(&hydrator, &fx.prompts[i])
                 .unwrap()
                 .expect("quiet-state lookup must hit");
             assert_own_block(&block, &fx, i, device, "quiet-state");
@@ -982,13 +1002,7 @@ fn budget_enforcement_racing_hydrates_never_serves_a_foreign_block() {
             let (mut hits, mut misses) = (0u64, 0u64);
             for _ in 0..RACE_PASSES {
                 for i in 0..RACE_PROMPTS {
-                    match hydrator.lookup(
-                        &fx.prompts[i],
-                        cache_seed(RACE_LK, QUANT, &[QUANT], TEST_MODEL_SIG),
-                        QUANT,
-                        DispatchPolicy::default(),
-                        false,
-                    ) {
+                    match race_lookup(&hydrator, &fx.prompts[i]) {
                         Ok(Some(block)) => {
                             hits += 1;
                             assert_own_block(&block, &fx, i, device, "racing");
@@ -1241,6 +1255,7 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
                 &prompt_ids,
                 cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
                 QUANT,
+                &[QUANT],
                 DispatchPolicy::default(),
                 false
             )
@@ -1263,6 +1278,7 @@ fn hydrate_of_a_row_whose_file_vanished_is_a_miss_and_leaves_the_tier_usable() {
             &prompt_ids,
             cache_seed(LK, QUANT, &[QUANT], TEST_MODEL_SIG),
             QUANT,
+            &[QUANT],
             DispatchPolicy::default(),
             false,
         )

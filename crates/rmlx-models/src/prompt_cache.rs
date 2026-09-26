@@ -673,9 +673,10 @@ impl<E: PromptCacheEntry> PromptCache<E> {
     /// that value and recomputes the promoted entry's block hashes from it, so
     /// the retried `find_best_prefix` matches what was just hydrated. `kv_quant`
     /// is the request's codec, used to verify the block header and tag the
-    /// reconstructed entry, and `dispatch_policy` is the kernel-path policy the
-    /// reconstructed caches must carry — the source holds none of the three
-    /// itself, because it is shared by every model of the arch and every
+    /// reconstructed entry, `layer_quants` the codec the arch builder gives each
+    /// layer at that `kv_quant` ([`kv_layer_quants`]), and `dispatch_policy` the
+    /// kernel-path policy the reconstructed caches must carry — the source
+    /// holds none of the four itself, because it is shared by every model of the arch and every
     /// hot-swapped codec.
     ///
     /// Corruption (bad read / metadata mismatch / missing file) is handled
@@ -688,6 +689,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         prompt_ids: &[u32],
         seed: u64,
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         dispatch_policy: DispatchPolicy,
     ) -> Option<usize> {
         // A zero-slot cache can admit nothing, so hydrating would read a `.kvb`
@@ -701,7 +703,7 @@ impl<E: PromptCacheEntry> PromptCache<E> {
         // Take the source out so the `&self` borrow during `hydrate` does not
         // conflict with the `&mut self` `push` below; put it back after.
         let source = self.ssd.take()?;
-        let result = source.hydrate(prompt_ids, seed, kv_quant, dispatch_policy);
+        let result = source.hydrate(prompt_ids, seed, kv_quant, layer_quants, dispatch_policy);
         self.ssd = Some(source);
         match result {
             Ok(Some(entry)) => {
@@ -1467,6 +1469,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
             self.shares_kv,
             model_sig,
         );
+        let layer_quants = kv_layer_quants(n_layers, kv_quant, self.shares_kv);
         let policy = self.policy;
         let arch = self.arch_name;
         // Kernel-path policy for the caches a hydrate would reconstruct. The
@@ -1494,6 +1497,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
                 cache,
                 prompt_ids,
                 kv_quant,
+                &layer_quants,
                 seed,
                 dispatch_policy,
             )
@@ -1520,6 +1524,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         cache: &mut PromptCache<E>,
         prompt_ids: &[u32],
         kv_quant: KvQuant,
+        layer_quants: &[KvQuant],
         seed: u64,
         dispatch_policy: DispatchPolicy,
     ) -> Consumed<E> {
@@ -1529,7 +1534,7 @@ impl<E: PromptCacheEntry> ArchPromptCache<E> {
         let mut raw_match = cache.find_best_prefix(prompt_ids, seed);
         if raw_match.is_none()
             && cache
-                .hydrate_from_ssd(prompt_ids, seed, kv_quant, dispatch_policy)
+                .hydrate_from_ssd(prompt_ids, seed, kv_quant, layer_quants, dispatch_policy)
                 .is_some()
         {
             raw_match = cache.find_best_prefix(prompt_ids, seed);
