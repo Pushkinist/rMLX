@@ -75,6 +75,14 @@ CASES=(
     "type_alias|commands/f2.rs|pub type Dev = rmlx_mlx::Device;|1|device-alias: commands/f2.rs:2:"
     "bare_type_alias|commands/f3.rs|type Dev = Device;|1|device-alias: commands/f3.rs:2:"
     "other_type_alias|commands/f4.rs|type DeviceList = Vec<Device>;|0|ok (1 site"
+    "rooted_type_alias|commands/f5.rs|type Dev = ::rmlx_mlx::Device;|1|device-alias: commands/f5.rs:2:"
+    "generic_type_alias|commands/f6.rs|type Dev<T> = Device;|1|device-alias: commands/f6.rs:2:"
+    "drop_parse_device|commands/m.rs|    let d = parse_device(&device)?.device();|1|claim-dropped: commands/m.rs:2:"
+    "drop_claim_gpu|commands/n.rs|    let d = claim_gpu()?.device();|1|claim-dropped: commands/n.rs:2:"
+    "drop_check_claim|commands/o.rs|    let d = check_claim(claim_gpu())?.device();|1|claim-dropped: commands/o.rs:2:"
+    "drop_by_path|commands/p.rs|    let d = parse_device(&s).map(ClaimedDevice::device)?;|1|claim-dropped: commands/p.rs:2:"
+    "bound_then_device|commands/r.rs|    let claimed = parse_device(&s)?; let d = claimed.device();|0|ok (1 site"
+    "device_in_comment|commands/s.rs|    let claimed = parse_device(&s)?; // not .device()|0|ok (1 site"
     "line_comment|commands/g.rs|// Device::Gpu is named only in claim_gpu|0|ok (1 site"
     "doc_comment|commands/h.rs|/// Returns \`Device::Gpu\` with the claim.|0|ok (1 site"
     "string_literal|commands/i.rs|    let s = \"Device::Gpu\";|0|ok (1 site"
@@ -91,6 +99,16 @@ for c in "${CASES[@]}"; do
     plant "$root" "$rel" "$line"
     case_run "$name" "$rel" "$want" "$needle" "$root"
 done
+
+# A chain split over two lines is one statement.
+root="$(fresh drop_split_lines)"
+mkdir -p "$root/commands"
+printf '// header\nlet d = parse_device(&device)?\n    .device();\n' >"$root/commands/t.rs"
+case_run "drop_split_lines" "commands/t.rs" 1 "claim-dropped: commands/t.rs:3:" "$root"
+
+root="$(fresh drop_in_closure)"
+printf '// header\nlet d = parse_device(&s).map(|c| c.device())?;\n' >"$root/commands/q.rs"
+case_run "drop_in_closure" "commands/q.rs" 1 "claim-dropped: commands/q.rs:2:" "$root"
 
 case_run "one_site" "the legitimate site alone passes" 0 \
     "gpu-device: commands/parse.rs:3:" "$(fresh one_site)"

@@ -14,8 +14,14 @@
 #                 Exactly one such site passes; zero or two or more fail.
 #   device-alias  a `use` of the `Device` variants (`Device::*`,
 #                 `Device::{…}`), a rename (`Device as …`) or a type alias
-#                 (`type X = [path::]Device;`): each lets the GPU device be
-#                 named without the token this gate counts.
+#                 (`type X[<…>] = [::][path::]Device;`): each lets the GPU
+#                 device be named without the token this gate counts.
+#   claim-dropped a statement that calls `parse_device`, `claim_gpu` or
+#                 `check_claim` and takes `.device()` (or
+#                 `ClaimedDevice::device`) from the result. `Device` is `Copy`,
+#                 so the claim-carrying value is a temporary and the claim is
+#                 released at the end of the statement. A statement is the code
+#                 up to a `;`, `{` or `}`, across lines.
 #
 # Scope: every `.rs` file under the scan root except `*_tests.rs`, `tests.rs`
 # and the `bin/` directory. The programs under `bin/` are separate binaries
@@ -32,7 +38,7 @@
 #
 # Usage: check_gpu_device_census.sh [<rmlx-cli-src-dir>]
 #        (default: crates/rmlx-cli/src)
-# Exit 0 = exactly one site, no alias. 1 = a rule failed. 2 = cannot scan (the
+# Exit 0 = exactly one site, no alias, no dropped claim. 1 = a rule failed. 2 = cannot scan (the
 # root is not a directory, or it holds no in-scope file).
 
 set -uo pipefail
@@ -68,8 +74,18 @@ IFS= read -r -d '' AWK_RULES <<'EOF'
         rest = substr(rest, RSTART + RLENGTH)
     }
     if (code ~ /Device[ \t]*::[ \t]*([*]|[{])/ || code ~ /(^|[^A-Za-z0-9_])Device[ \t]+as[ \t]/ ||
-        code ~ /(^|[^A-Za-z0-9_])type[ \t]+[A-Za-z0-9_]+[ \t]*=[ \t]*([A-Za-z0-9_]+[ \t]*::[ \t]*)*Device[ \t]*;/)
+        code ~ /(^|[^A-Za-z0-9_])type[ \t]+[A-Za-z0-9_]+[ \t]*(<[^=]*>)?[ \t]*=[ \t]*(::[ \t]*)?([A-Za-z0-9_]+[ \t]*::[ \t]*)*Device[ \t]*;/)
         print "device-alias: " file ":" FNR ": " $0
+    rest = code
+    while (match(rest, /[;{}]/)) {
+        stmt = stmt " " substr(rest, 1, RSTART - 1)
+        if (stmt ~ /(^|[^A-Za-z0-9_])(parse_device|claim_gpu|check_claim)[ \t]*\(/ &&
+            stmt ~ /([.][ \t]*device[ \t]*\(|ClaimedDevice[ \t]*::[ \t]*device([^A-Za-z0-9_]|$))/)
+            print "claim-dropped: " file ":" FNR ": " $0
+        stmt = ""
+        rest = substr(rest, RSTART + 1)
+    }
+    stmt = stmt " " rest
 }
 EOF
 
@@ -81,12 +97,18 @@ done <<<"$files"
 
 sites="$(grep -c '^gpu-device: ' <<<"$hits")"
 aliases="$(grep -c '^device-alias: ' <<<"$hits")"
+dropped="$(grep -c '^claim-dropped: ' <<<"$hits")"
 nfiles="$(wc -l <<<"$files" | tr -d ' ')"
 
 status=0
 if [ "$aliases" -gt 0 ]; then
     grep '^device-alias: ' <<<"$hits"
     echo "check-gpu-device-census: FAIL: $aliases Device alias(es); name the GPU device only as Device::Gpu, in claim_gpu" >&2
+    status=1
+fi
+if [ "$dropped" -gt 0 ]; then
+    grep '^claim-dropped: ' <<<"$hits"
+    echo "check-gpu-device-census: FAIL: $dropped statement(s) take .device() from a fresh claim, which is released at the semicolon; bind the ClaimedDevice and pass it by reference" >&2
     status=1
 fi
 if [ "$sites" -eq 0 ]; then
