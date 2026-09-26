@@ -37,27 +37,38 @@ signature each:
   does not use. `exit_prefill_mixed` reads the dispatch policy from the cache.
 
 The caller copies the entry out of the view, drops the view, then calls the
-entry. A decode step pays one view build (one match, no allocation) and one
-indirect call.
+entry.
 
-The key is the storage variant, not `KvQuant`. After an SSD hydrate, an SWA
-layer holds `KvStorage::None` while its `quant` is the model's codec. `Paged`
-comes from a process-global switch. `entry_routing_tests.rs` drives both
-shapes. After a hydrate, a non-`None` storage is the variant its codec builds:
-`block_io_storage_family_tests.rs` in `rmlx-kv-ssd` holds this for one codec,
-and `a_boundary_layer_that_builds_a_store_keeps_the_base_storage` in
-`rmlx-models` holds it for the boundary-layer policy.
+**`update` is keyed on the storage.** It reads the entry of the storage the
+cache holds. After an SSD hydrate, an SWA layer holds `KvStorage::None` while
+its `quant` is the model's codec, and `Paged` comes from a process-global
+switch; both must take their own storage's entry. A decode step pays one view
+build (one match, no allocation) and one indirect call.
+`entry_routing_tests.rs` drives both shapes.
+
+**`exit_prefill` is keyed on the codec.** It reads the entry of
+`KvStorage::new(self.quant)`, the same key its `materialises_packed_store()`
+gate reads. Building that storage allocates nothing (every slot is `None`),
+and it runs once per layer per prefill. A storage of another family than the
+codec reaches a body that returns `KvStorageMismatch`. A width disagreement
+inside one family only warns (`warn_if_width_disagrees`).
 
 `exit_prefill` has three guards before the entry. `None` storage returns with
-the bf16 seeds as its storage. `Paged` returns with its compact seed. The
-`materialises_packed_store()` gate reads `self.quant`, returns before any bulk
-encode for a codec whose decode reads only the bf16 mirror, and clears any
-payload the cache arrived with. The `exit_prefill` entry of `None` and `Paged`
-is `exit_prefill_behind_guard`, which refuses. The entries of the mirror family
-are unreachable today and stay as the re-enable path for a codec that grows a
-decode kernel over its own store. The entry comes from the storage and the gate
-from the codec, and this test fails when they disagree:
+the bf16 seeds as its storage. `Paged` returns with its compact seed. The gate
+returns before any bulk encode for a codec whose decode reads only the bf16
+mirror, and clears any payload the cache arrived with. The `exit_prefill` entry
+of `None` and `Paged` is `exit_prefill_behind_guard`, which refuses. The entries
+of the mirror family are unreachable through `exit_prefill` today and stay as
+the re-enable path for a codec that grows a decode kernel over its own store.
+`every_exit_prefill_entry_builds_a_store_on_its_own_storage` calls each entry
+directly. This test fails when an entry and the gate disagree:
 `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`.
+
+After a hydrate, a non-`None` storage has the same storage variant as the one
+its codec builds: `block_io_storage_family_tests.rs` in `rmlx-kv-ssd` holds this
+for one codec, and `a_boundary_layer_that_builds_a_store_keeps_the_base_storage`
+in `rmlx-models` holds it for the boundary-layer policy. Both compare the
+variant only, not the widths or parameters it carries.
 
 The `update` entry of `Mixed` is `update_mixed`, which refuses. The `Mixed`
 per-step append is `update_and_sdpa_mixed` in `sdpa.rs`.

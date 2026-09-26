@@ -1,3 +1,4 @@
+// LOC-exempt: one closed-enum match per view; splitting it separates the arms from their variants.
 // Promoted: types/fields/methods below were `pub(crate)` / `pub(super)`
 // inside `rmlx-models::kv_cache` and are promoted to `pub` here so the SSD
 // modules (block_io/hydrate/spill — which stay in `rmlx-models`) can still
@@ -1043,9 +1044,11 @@ impl KvStorage {
     /// `exit_prefill` entries. `reset`, `truncate_to` and `clear_payload` go
     /// through the slots.
     ///
-    /// The entries are keyed on the storage variant and not on the cache's
-    /// `KvQuant`: a hydrated SWA layer holds `None` storage beside the model's
-    /// codec, and `Paged` comes from a process-global switch.
+    /// `KvCache::update` reads the `update` entry of the storage it holds: a
+    /// hydrated SWA layer holds `None` storage beside the model's codec, and
+    /// `Paged` comes from a process-global switch. `KvCache::exit_prefill`
+    /// reads the `exit_prefill` entry of the storage its codec builds, the key
+    /// its store gate reads.
     ///
     /// The same binding rule as [`Self::view`]: every arm binds every field and
     /// has no `..`, and the KV census refuses a `..` in this fn.
@@ -1230,6 +1233,7 @@ pub(crate) struct StorageViewMut<'a> {
     pub(crate) slots: [Option<&'a mut dyn KvSlot>; 3],
     /// The entry [`KvCache::update`] calls after the prefill check.
     pub(crate) update: UpdateEntry,
-    /// The entry [`KvCache::exit_prefill`] calls after its guards.
+    /// The entry [`KvCache::exit_prefill`] calls after its guards, read from
+    /// the storage the cache's codec builds.
     pub(crate) exit_prefill: ExitPrefillEntry,
 }

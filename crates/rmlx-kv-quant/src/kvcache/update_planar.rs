@@ -19,8 +19,7 @@ use super::KvCache;
 impl KvCache {
     #[allow(
         clippy::unreachable,
-        reason = "storage variant is guaranteed by the `match &self.storage` dispatch in \
-                  KvCache::update() (KvStorage::Planar arm); \
+        reason = "storage variant is guaranteed by the KvStorage::view_mut arm that names this entry (KvStorage::Planar); \
                   mismatch is a construction-time BUG"
     )]
     #[allow(

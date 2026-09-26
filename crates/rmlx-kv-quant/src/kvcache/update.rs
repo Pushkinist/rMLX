@@ -858,8 +858,8 @@ impl KvCache {
         // SWA layers that were hydrated from the SSD tier (they are stored as
         // tag "none" since the rotating bf16 ring cannot be serialised, but
         // from_storage() sets self.quant to the model's global KvQuant) — take
-        // the bf16 path regardless of self.quant. The gate below reads
-        // self.quant, and the `None` entry refuses.
+        // the bf16 path regardless of self.quant. The gate and the entry below
+        // read self.quant, and a codec's entry refuses `None` storage.
         if matches!(self.storage, KvStorage::None { .. }) {
             if let Some((k_seed, v_seed)) = decode_fp16_pair {
                 // `is_bf16_storage` is true on this path, so both clones above
@@ -903,14 +903,7 @@ impl KvCache {
             return Ok(());
         }
 
-        // Only the entries of codecs whose `materialises_packed_store()` is
-        // true run past the gate above. The bf16-mirror family's entries are
-        // kept as the re-enable path for a codec that grows a decode kernel over
-        // its own store (`docs/KV_CACHE.md` §9.6). The entry comes from the
-        // storage variant and the gate from `self.quant`; the pairing guard
-        // `warm_ttft_cross_codec_tests::exit_prefill_builds_a_store_exactly_when_the_predicate_says_so`
-        // fails when the two disagree.
-        let entry = self.storage.view_mut().exit_prefill;
+        let entry = KvStorage::new(self.quant).view_mut().exit_prefill;
         entry(self, &k_full, &v_full, device, total_seq)?;
 
         // Warm-TTFT seed: the shortcut quant arms get the bf16 K+V decode

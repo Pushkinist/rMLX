@@ -1,10 +1,13 @@
-//! A hydrated layer holds `None` storage or the storage of its own codec.
+//! A hydrated layer holds `None` storage or the same storage variant its own
+//! codec builds.
 //!
-//! `read_caches` hands every hydrated layer the block's `kv_quant`, and
-//! `KvCache::update` / `exit_prefill` take their entry from the storage
-//! variant. The two keys agree when a non-`None` hydrated storage is the
-//! variant `KvStorage::new` builds for that codec. A layer whose codec builds
-//! no packed store spills geometry only and comes back as `None`.
+//! `read_caches` hands every hydrated layer the block's `kv_quant`.
+//! `KvCache::update` takes its entry from the storage and `exit_prefill` from
+//! the codec. The two keys agree when a non-`None` hydrated storage has the
+//! same storage variant `KvStorage::new` builds for that codec. The test
+//! compares the variant only, not the widths or parameters it carries. A layer
+//! whose codec builds no packed store spills geometry only and comes back as
+//! `None`.
 //!
 //! This test holds that for a layer spilled under its own codec. Which codec a
 //! boundary layer gets beside its base is policy in `rmlx-models`, and
@@ -80,7 +83,7 @@ fn a_hydrated_layer_holds_none_or_the_storage_of_its_codec() {
         if !is_none {
             assert!(
                 discriminant(storage) == discriminant(&KvStorage::new(quant)),
-                "{quant}: the hydrated storage is not the variant this codec builds"
+                "{quant}: the hydrated storage is not the same storage variant this codec builds"
             );
         }
     }

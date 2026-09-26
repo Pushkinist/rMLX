@@ -1,19 +1,21 @@
-//! `update` and `exit_prefill` take their entry from the storage variant, not
-//! from the cache's `KvQuant`.
+//! `update` takes its entry from the storage variant. `exit_prefill` takes its
+//! entry from the codec, the same key its `materialises_packed_store` gate
+//! reads.
 //!
-//! Two shapes make the two keys disagree in production: an SSD-hydrated SWA
-//! layer holds `KvStorage::None` while its `quant` is the model's codec, and
-//! `KvStorage::Paged` comes from a process-global switch. Each test drives a
-//! cache of that shape and a reference cache whose storage and `quant` agree
-//! through the same prefill and decode steps, and compares what they return
-//! and hold. An entry keyed on `quant` reaches a body that expects another
-//! storage and fails.
+//! Two shapes make the storage and the codec disagree in production: an
+//! SSD-hydrated SWA layer holds `KvStorage::None` while its `quant` is the
+//! model's codec, and `KvStorage::Paged` comes from a process-global switch.
+//! The routing tests drive a cache of that shape and a reference cache whose
+//! storage and `quant` agree through the same prefill and decode steps, and
+//! compare what they return and hold. An `update` entry keyed on `quant`
+//! reaches a body that expects another storage and fails. `exit_prefill`
+//! finishes both shapes at its guards, before the entry.
 
 use super::core::KvCache;
 use crate::storage::KvStorage;
 use crate::test_utils::{array_bytes, env_lock, f32_arr, fnv1a64, lcg_data, TEST_SEED};
-use crate::KvQuant;
-use rmlx_core::error::Result;
+use crate::{KvQuant, ALL_KV_QUANTS};
+use rmlx_core::error::{Error, Result};
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::Device;
 
@@ -168,4 +170,73 @@ fn the_entries_behind_a_guard_refuse_a_direct_call() {
         MAX_SEQ,
     );
     assert!(mixed.update(&a, &a, device).is_err());
+}
+
+/// `exit_prefill` takes its entry from the codec, so a storage of another
+/// family is refused as a mismatch. Here a K8V8 storage sits beside `Iso3Sym`,
+/// whose gate says to build a store: the `Iso3Sym` entry finds K8V8 storage
+/// and returns `KvStorageMismatch`. An entry keyed on the storage would build a
+/// K8V8 store instead.
+#[test]
+#[allow(
+    clippy::expect_used,
+    reason = "test driver: the prefill chunk is a raw append every storage accepts"
+)]
+fn exit_prefill_refuses_a_storage_of_another_family_than_the_codec() {
+    let _guard = env_lock();
+    let device = Device::Cpu;
+    let storage = KvStorage::K8V8 { k: None, v: None };
+    let mut cache = hydrated(storage, KvQuant::Iso3Sym);
+    let chunk = [1_i32, KV_H, PREFILL_SEQ, HEAD_DIM];
+    let n: usize = chunk.iter().map(|&d| d as usize).product();
+    cache.enter_prefill();
+    cache
+        .update(
+            &f32_arr(&lcg_data(n, TEST_SEED), &chunk),
+            &f32_arr(&lcg_data(n, TEST_SEED ^ 0x5a5a), &chunk),
+            device,
+        )
+        .expect("prefill chunk");
+    let got = cache.exit_prefill(device);
+    assert!(
+        matches!(
+            got,
+            Err(Error::KvStorageMismatch {
+                expected: "IsoSym3 | IsoSym4",
+                got: "K8V8",
+            })
+        ),
+        "exit_prefill on K8V8 storage beside Iso3Sym: {got:?}"
+    );
+}
+
+/// Every `exit_prefill` entry `view_mut` names builds a store when it is
+/// called directly on the storage its codec builds. The gate in
+/// `exit_prefill` hides the mirror-family entries, so only a direct call
+/// reaches them. `None` storage has no store, and its entry refuses.
+#[test]
+fn every_exit_prefill_entry_builds_a_store_on_its_own_storage() {
+    let _guard = env_lock();
+    let device = Device::Cpu;
+    let chunk = [1_i32, KV_H, PREFILL_SEQ, HEAD_DIM];
+    let n: usize = chunk.iter().map(|&d| d as usize).product();
+    let k = f32_arr(&lcg_data(n, TEST_SEED), &chunk);
+    let v = f32_arr(&lcg_data(n, TEST_SEED ^ 0x5a5a), &chunk);
+    for &quant in ALL_KV_QUANTS {
+        let mut cache = KvCache::with_quant_max_seq(quant, MAX_SEQ);
+        let entry = cache.storage.view_mut().exit_prefill;
+        let got = entry(&mut cache, &k, &v, device, PREFILL_SEQ);
+        if quant == KvQuant::None {
+            assert!(got.is_err(), "the None exit_prefill entry must refuse");
+            continue;
+        }
+        assert!(
+            got.is_ok(),
+            "{quant}: the exit_prefill entry failed: {got:?}"
+        );
+        assert!(
+            !cache.storage.is_geometry_only(),
+            "{quant}: the exit_prefill entry built no store"
+        );
+    }
 }

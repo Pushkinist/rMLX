@@ -17,8 +17,12 @@ use super::KvCache;
 impl KvCache {
     /// The decode entry of a Mixed cache. It refuses: the append must go
     /// through `update_and_sdpa`.
+    #[allow(
+        clippy::unused_self,
+        reason = "an update entry: it has the signature every storage variant's entry has"
+    )]
     pub(crate) fn update_mixed(
-        _cache: &mut Self,
+        &mut self,
         _new_k: &Array,
         _new_v: &Array,
         _device: Device,
