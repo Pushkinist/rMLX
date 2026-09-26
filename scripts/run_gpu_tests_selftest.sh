@@ -102,6 +102,9 @@ STUB
 #!/usr/bin/env bash
 set -u
 printf '%s\n' "\$@" >>"${root}/cargo_argv"
+for a in "\$@"; do
+    [ "\$a" = "--no-run" ] && exit 0
+done
 crate=""
 prev=""
 for a in "\$@"; do
@@ -510,6 +513,37 @@ expect_report "Metal shader validation reported"
 expect_report "under-matched (1/3 executed)"
 
 # ---------------------------------------------------------------------------
+# The run holds the Metal claim and every process it starts inherits it, so the
+# binaries are compiled outside it. `--build` compiles what the same options
+# would run and runs nothing.
+new_case build_compiles_and_runs_nothing || exit 1
+classify "${CASE_ROOT}" rmlx-kv-quant kv_gpu_alpha
+classify "${CASE_ROOT}" rmlx-models models_gpu_alpha
+run_case "${CASE_ROOT}" --build --crate rmlx-models
+expect_status 0
+expect_out "build OK: 1 crate(s) compiled"
+expect_ran "--no-run"
+expect_ran "rmlx-models"
+expect_ran "shader-validation-canary"
+expect_did_not_run "--ignored"
+expect_did_not_run "models_gpu_alpha"
+
+# ...and a run that had to compile did so under the claim, which is a failure
+# naming the crate rather than a pass.
+new_case compiled_under_the_claim_fails || exit 1
+classify "${CASE_ROOT}" rmlx-models models_gpu_alpha
+crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
+   Compiling rmlx-models v0.4.1 (/src/crates/rmlx-models)
+Metal GPU Validation Enabled
+running 1 test
+test models::gpu_alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "rmlx-models: compiled under the Metal claim (run --build first)"
+
+# ---------------------------------------------------------------------------
 # So must the third kind: a crate that produced no validation banner ran
 # uninstrumented (usually it failed to build), while another crate reported hits.
 new_case uninstrumented_with_hit || exit 1
@@ -571,7 +605,7 @@ census_log() {
         echo 'Metal GPU Validation Enabled'
         echo "running ${passed} tests"
         [ -n "${note}" ] && echo "note ${note}: one of its snapshots is not on this machine"
-        [ -n "${skip}" ] && echo "test kv::gpu_alpha ... SKIP ${skip}: no snapshot on this machine"
+        [ -n "${skip}" ] && echo "test kv::${skip} ... SKIP ${skip}: no snapshot on this machine"
         echo "test kv::gpu_alpha ... ok${line}"
         echo "test result: ok. ${passed} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s"
     } | crate_log "${root}" "${crate}" 0
@@ -889,7 +923,7 @@ classify "${CASE_ROOT}" rmlx-models spec_alpha spec_beta
 crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
 Metal GPU Validation Enabled
 running 2 tests
-test spec::alpha ... SKIP spec_alpha: RMLX_DRAFT_TEST_MODEL is unset and this pair's drafter is not resolved by slug
+test spec::spec_alpha ... SKIP spec_alpha: RMLX_DRAFT_TEST_MODEL is unset and this pair's drafter is not resolved by slug
 ok
 test spec::beta ... ok
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
@@ -911,7 +945,7 @@ classify "${CASE_ROOT}" rmlx-models spec_alpha spec_beta
 crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
 Metal GPU Validation Enabled
 running 2 tests
-test spec::alpha ... SKIP spec_alpha: RMLX_O_MODELS_ROOT does not hold a runnable snapshot
+test spec::spec_alpha ... SKIP spec_alpha: RMLX_O_MODELS_ROOT does not hold a runnable snapshot
 ok
 test spec::beta ... ok
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
@@ -944,7 +978,7 @@ new_case stand_down_survives_uninstrumented || exit 1
 classify "${CASE_ROOT}" rmlx-models spec_alpha
 crate_log "${CASE_ROOT}" rmlx-models 0 <<'LOG'
 running 1 test
-test spec::alpha ... SKIP spec_alpha: RMLX_DRAFT_TEST_MODEL is unset
+test spec::spec_alpha ... SKIP spec_alpha: RMLX_DRAFT_TEST_MODEL is unset
 ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
 LOG
@@ -996,6 +1030,25 @@ LOG
 run_case "${CASE_ROOT}"
 expect_status 1
 expect_report "rmlx-server: ran uninstrumented (no validation banner)"
+
+# ...and a notice speaks only for the test whose output it is in. A cell that
+# prints its sibling's name as well as its own does not stand the sibling down
+# while the sibling runs, and cannot excuse the banner for it.
+new_case sibling_notice_is_not_attributed || exit 1
+classify "${CASE_ROOT}" rmlx-server embed_alpha embed_beta
+crate_log "${CASE_ROOT}" rmlx-server 0 <<'LOG'
+running 2 tests
+test embed_alpha ... SKIP embed_alpha: RMLX_TEST_MODEL_JINA_V4 not set
+SKIP embed_beta: RMLX_TEST_MODEL_JINA_V4 not set
+ok
+test embed_beta ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+LOG
+run_case "${CASE_ROOT}"
+expect_status 1
+expect_report "rmlx-server: ran uninstrumented (no validation banner)"
+expect_no_out "rmlx-server embed_beta:"
+expect_out "1 further stand-down notice(s)"
 
 # ...and a stand-down notice that names no test attributes nothing, so it cannot
 # excuse the banner either.

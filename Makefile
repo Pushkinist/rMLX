@@ -257,7 +257,9 @@ CI_PERF_INCOMPLETE := $(if $(GPU_HALF_NAME),ci-perf $(GPU_HALF_NAME)-half INCOMP
 # for its whole run, and a claim another process holds refuses it with exit 11
 # and names the holder. The binary is this checkout's, built here and called by
 # path. Nothing the suite runs may start `rmlx` itself, since the nested claim
-# would be refused.
+# would be refused. Every process the suite starts inherits the claim, so the
+# test binaries are compiled first, outside it (`--build`); the run under the
+# claim compiles nothing and fails if it has to.
 CLAIM_RMLX := target/debug/rmlx
 claim-rmlx:      ## build the rmlx binary the GPU suite takes the Metal claim with
 	cargo build -p rmlx-cli --bin rmlx
@@ -327,6 +329,7 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 	$(MAKE) claim-rmlx
 	@$(CLAIM_RMLX) claim run -- true
 	$(MAKE) test-perf
+	@bash scripts/run_gpu_tests.sh --build $(GPU_HALF_ARG)
 	@log="$$(mktemp)"; rc="$$(mktemp)"; \
 	{ $(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG); echo $$? >"$$rc"; } | tee "$$log"; \
 	code="$$(cat "$$rc")"; rm -f "$$rc"; \
@@ -364,9 +367,11 @@ ci-perf:         ## pre-push gate under release-perf + the serialized GPU/Metal 
 # or any store fails and names the delta. That is what keeps a standing
 # diagnostic from a kernel we do not own out of the exit code, where it would
 # train everyone to read a red run as noise.
+GPU_TEST_ARGS = $(GPU_HALF_ARG) $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
+	$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
 gpu-test: claim-rmlx ## run the GPU/Metal #[ignore] tests serialized under Metal shader validation, holding the Metal claim (HALF=codec|rest, CRATE= FILTER= to narrow, VALIDATE=0 to skip instrumentation)
-	@$(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_HALF_ARG) $(if $(CRATE),--crate '$(CRATE)',) $(if $(FILTER),--filter '$(FILTER)',) \
-		$(if $(filter 0,$(VALIDATE)),--no-shader-validation,)
+	@bash scripts/run_gpu_tests.sh --build $(GPU_TEST_ARGS)
+	@$(CLAIM_RMLX) claim run -- bash scripts/run_gpu_tests.sh $(GPU_TEST_ARGS)
 
 # model-check: run only the model-logic crates (rmlx-models, rmlx-runtime,
 # rmlx-quant) plus the KV-codec crate (rmlx-kv-quant). Excludes server, CLI, and

@@ -166,6 +166,7 @@ usage() {
 Usage: run_gpu_tests.sh [--crate <name>] [--filter <substring>]
                         [--half codec|rest]
                         [--shader-validation | --no-shader-validation]
+       run_gpu_tests.sh --build [narrowing options as for the run]
        run_gpu_tests.sh --preflight
 
   --crate <name>          restrict to one workspace member (e.g. rmlx-kv-quant)
@@ -175,6 +176,9 @@ Usage: run_gpu_tests.sh [--crate <name>] [--filter <substring>]
   --shader-validation     instrument every Metal pipeline and fail on an invalid
                           memory access (default)
   --no-shader-validation  run the tests uninstrumented
+  --build                 compile every test binary the same options would
+                          run, and run none; the run that follows compiles
+                          nothing, and fails if it has to
   --preflight             check only the environment preconditions (no GPU
                           skip variable set, a non-empty classification) and
                           exit; runs no tests
@@ -186,6 +190,7 @@ FILTER=""
 HALF=""
 SHADER_VALIDATION=1
 PREFLIGHT=0
+BUILD_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --crate)  ONLY_CRATE="${2:?--crate needs a value}"; shift 2 ;;
@@ -194,6 +199,7 @@ while [ $# -gt 0 ]; do
         --shader-validation)    SHADER_VALIDATION=1; shift ;;
         --no-shader-validation) SHADER_VALIDATION=0; shift ;;
         --preflight) PREFLIGHT=1; shift ;;
+        --build) BUILD_ONLY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument '$1'" >&2; usage >&2; exit 1 ;;
     esac
@@ -462,6 +468,42 @@ if [ ${#crates[@]} -eq 0 ]; then
     exit 1
 fi
 
+# `env` prefix, not `export`: the validation settings apply to the test process
+# and nothing else, and the empty-valued DISABLE_PIPELINES entry overrides a
+# stale export rather than merging with it. The prefix keeps a bare `env` when
+# validation is off, because expanding an empty array is an unbound-variable
+# error under `set -u` on the bash 3.2 that `/usr/bin/env bash` resolves to
+# here.
+validation_prefix=(env)
+[ "${SHADER_VALIDATION}" = "1" ] &&
+    validation_prefix=(env ${mtl_unset[@]+"${mtl_unset[@]}"} "${mtl_validation_env[@]}")
+
+# The run holds the machine-wide Metal claim, and every process it starts
+# inherits it. A compiler, a build script or a daemon one of them starts (a
+# compiler cache server) would hold the claim for as long as it lives, so every
+# binary is compiled here, outside the claim, under the same environment and
+# flags the run uses; the run then only fingerprint-checks and executes.
+if [ "${BUILD_ONLY}" = "1" ]; then
+    build_failed=""
+    if [ "${SHADER_VALIDATION}" = "1" ]; then
+        "${validation_prefix_canary[@]}" cargo test --no-run -p rmlx-kv-quant \
+            --features shader-validation-canary --lib || build_failed="${build_failed} canary"
+    fi
+    for crate in "${crates[@]}"; do
+        "${validation_prefix[@]}" cargo test --no-run -p "${crate}" --tests ||
+            build_failed="${build_failed} ${crate}"
+    done
+    if [ -n "${build_failed}" ]; then
+        echo "ERROR: the GPU test binaries did not build:${build_failed}" >&2
+        exit 1
+    fi
+    echo "build OK: ${#crates[@]} crate(s) compiled; the run compiles nothing."
+    exit 0
+fi
+
+# Cargo prints this status line for every crate it compiles.
+COMPILED_LINE='^[[:space:]]*Compiling [A-Za-z0-9_-]+ v'
+
 failed_crates=""
 total_passed=0
 total_failed=0
@@ -488,6 +530,11 @@ if [ "${SHADER_VALIDATION}" = "1" ]; then
     "${validation_prefix_canary[@]}" cargo test --no-fail-fast -p rmlx-kv-quant \
         --features shader-validation-canary --lib -- \
         --ignored --test-threads=1 "${CANARY_TEST}" >"${canary_log}" 2>&1
+    if grep -Eq "${COMPILED_LINE}" "${canary_log}"; then
+        echo "ERROR: the canary compiled under the Metal claim; run with --build first." >&2
+        echo "  Log: ${canary_log}" >&2
+        exit 1
+    fi
     if ! grep -Eq "${VALIDATION_DIAGNOSTIC}" "${canary_log}"; then
         echo "ERROR: the out-of-bounds canary produced no diagnostic this scan would" >&2
         echo "  match, so a clean scan proves nothing. Either the canary did not run" >&2
@@ -547,15 +594,6 @@ for crate in "${crates[@]}"; do
     # after the first test binary that fails, so every later binary in the crate
     # silently never runs and the coverage shortfall reports as "a filter
     # stopped matching" when the real cause was an earlier failure.
-    # `env` prefix, not `export`: the validation settings apply to the test
-    # process and nothing else, and the empty-valued DISABLE_PIPELINES entry
-    # overrides a stale export rather than merging with it. The prefix keeps a
-    # bare `env` when validation is off, because expanding an empty array is an
-    # unbound-variable error under `set -u` on the bash 3.2 that
-    # `/usr/bin/env bash` resolves to here.
-    validation_prefix=(env)
-    [ "${SHADER_VALIDATION}" = "1" ] &&
-        validation_prefix=(env ${mtl_unset[@]+"${mtl_unset[@]}"} "${mtl_validation_env[@]}")
     # `--nocapture` because this gate reads the tests' own words. libtest
     # discards a passing test's output, and a model-gated cell that skips is a
     # passing test — so without it the `SKIP <name>:` notice the census
@@ -564,6 +602,9 @@ for crate in "${crates[@]}"; do
     "${validation_prefix[@]}" cargo test --no-fail-fast -p "${crate}" --tests -- \
         --ignored --test-threads=1 --nocapture "${filters[@]}" 2>&1 | tee "${log}"
     rc=${PIPESTATUS[0]}
+    if grep -Eq "${COMPILED_LINE}" "${log}"; then
+        failed_crates="${failed_crates}  ${crate}: compiled under the Metal claim (run --build first)"$'\n'
+    fi
 
     counts="$(awk '
         /^test result:/ {
@@ -624,8 +665,21 @@ for crate in "${crates[@]}"; do
     # with libtest's `test <name> ... ` prefix under --nocapture, so this is not
     # line-anchored; a validation diagnostic can land appended to it, so the
     # reason is cut there rather than carrying a second event's text.
-    crate_skips="$(grep -Eo "${NAMED_SKIP}.*" "${log}" \
-        | sed -E 's/Invalid (device|threadgroup).*$//; s/[[:space:]]+$//' | sort -u)"
+    #
+    # A notice speaks for the test whose output it is in: the one whose
+    # `test <path> ... ` line came last, with --test-threads=1. A notice naming
+    # any other test is not an attribution, however that test is spelled, or a
+    # cell that printed its sibling's name would stand the sibling down while
+    # the sibling ran.
+    crate_notices="$(awk -v named="${NAMED_SKIP}" '
+        /^test [^ ]+ \.\.\. / { cur = $2; sub(/.*::/, "", cur) }
+        match($0, named) {
+            notice = substr($0, RSTART)
+            name = substr($0, RSTART + 5, RLENGTH - 6)
+            print (name == cur ? "A" : "U") "\t" notice
+        }' "${log}" | sed -E 's/Invalid (device|threadgroup).*$//; s/[[:space:]]+$//')"
+    n_unattributed=$((n_unattributed + $(printf '%s\n' "${crate_notices}" | grep -c $'^U\t')))
+    crate_skips="$(printf '%s\n' "${crate_notices}" | sed -n $'s/^A\t//p' | sort -u)"
     crate_stood_down=""
     while IFS= read -r notice; do
         [ -z "${notice}" ] && continue

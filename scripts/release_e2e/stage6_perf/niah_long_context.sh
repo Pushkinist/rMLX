@@ -80,9 +80,13 @@ case "$MODE" in
     *) echo "ERROR: --mode must be one of {turbo,pflash,both}, got: $MODE" >&2; exit 2 ;;
 esac
 
-# The binary the passes take the Metal claim with: this checkout's, built once.
-CLAIM_RMLX="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/target/debug/rmlx"
-cargo build -p rmlx-cli --bin rmlx || exit 1
+# The binary the passes take the Metal claim with is this checkout's.
+CLAIM_RMLX="${REPO_ROOT}/target/debug/rmlx"
+# Every process a pass starts under the claim inherits it, so everything the
+# passes run is compiled here, outside it; a pass that still compiles fails.
+cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" -p rmlx-cli --bin rmlx || exit 1
+cargo test --manifest-path "${REPO_ROOT}/Cargo.toml" --no-run --profile release-perf \
+    -p rmlx-models --test niah_long_context || exit 1
 
 # Run a single pass for one family (turbo|pflash) × one mode label (off|on).
 # Sets the corresponding env var and applies a default filter when none is
@@ -122,7 +126,8 @@ run_pass() {
     # `--test-threads=1`: only one MLX context at a time.
     # `--ignored`: cells are `#[ignore]` by default.
     # `--nocapture`: surface the per-cell prompt_len/decoded lines.
-    local args=(test --profile release-perf -p rmlx-models --test niah_long_context)
+    local args=(test --manifest-path "${REPO_ROOT}/Cargo.toml" --profile release-perf
+        -p rmlx-models --test niah_long_context)
     if [[ -n "$effective_filter" ]]; then
         args+=("--" "--ignored" "--test-threads=1" "--nocapture" "$effective_filter")
     else
@@ -134,6 +139,10 @@ run_pass() {
     env "${env_var}=${val}" timeout 1800 "${CLAIM_RMLX}" claim run -- cargo "${args[@]}" 2>&1 \
         | tee "/tmp/niah-${family}-${label}.log"
     local rc=${PIPESTATUS[0]}
+    if grep -Eq '^[[:space:]]*Compiling [A-Za-z0-9_-]+ v' "/tmp/niah-${family}-${label}.log"; then
+        echo "ERROR: the pass compiled under the Metal claim." >&2
+        rc=1
+    fi
     echo ""
     echo "exit=$rc  log=/tmp/niah-${family}-${label}.log"
     return $rc
