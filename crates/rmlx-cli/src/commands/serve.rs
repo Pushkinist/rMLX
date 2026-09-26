@@ -4,7 +4,7 @@
 //!
 //! [`run_serve`] is the single entry point. It:
 //! 1. Resolves project caps from `projects.toml` (CLI flags override file).
-//! 2. Acquires the single-MLX-process claim file via [`rmlx_server::try_claim`].
+//! 2. On `--device gpu`, takes the machine-wide Metal claim via [`rmlx_server::try_claim`].
 //! 3. Loads the model (or a multi-model registry) and warms prompt-cache slots.
 //! 4. Launches the Axum HTTP server, then drives the idle-eviction loop until
 //!    the process is signalled.

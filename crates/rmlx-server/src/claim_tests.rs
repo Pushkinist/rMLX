@@ -260,28 +260,34 @@ fn hard_link_at_claim_path_is_refused() {
     );
 }
 
+/// Without the regular-file check a FIFO still fails, at the flock, and a
+/// directory still fails, at the link count; only the reason tells the check
+/// ran.
+fn assert_not_regular<T: std::fmt::Debug>(result: &Result<T, ClaimError>) {
+    let Err(ClaimError::Io { source, .. }) = result else {
+        panic!("a path that is not a regular file must be refused, got {result:?}");
+    };
+    assert!(
+        source.to_string().contains("not a regular file"),
+        "refused for another reason: {source}"
+    );
+}
+
 #[test]
 fn fifo_at_claim_path_is_refused() {
     let dir = TempDir::new().expect("temp dir");
     let lock = lock_in(&dir);
     make_fifo(&lock);
-    let result = claim_at(&lock);
-    assert!(is_io(&result), "a FIFO must be refused, got {result:?}");
+    assert_not_regular(&claim_at(&lock));
 }
 
-/// A directory opens read-only and takes a flock, so only the regular-file
-/// check keeps the probe from reporting it as a free claim.
 #[test]
 fn directory_at_claim_path_is_refused_by_the_probe() {
     let legacy = TempDir::new().expect("legacy dir");
     let dir = TempDir::new().expect("temp dir");
     let lock = lock_in(&dir);
     std::fs::create_dir(&lock).expect("plant a directory");
-    let result = probe_in(legacy.path(), &lock);
-    assert!(
-        is_io(&result),
-        "a directory must be refused, got {result:?}"
-    );
+    assert_not_regular(&probe_in(legacy.path(), &lock));
 }
 
 #[test]

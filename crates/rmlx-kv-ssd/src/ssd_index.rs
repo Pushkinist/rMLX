@@ -886,9 +886,9 @@ static LAST_STAMP_US: AtomicU64 = AtomicU64::new(0);
 /// here, and [`adopt_persisted_stamps`] carries that across a restart.
 ///
 /// It is **not** a total order over a namespace shared by two processes: the
-/// Metal claim file is keyed by port, so two servers on different ports can
-/// each write the same pool, and two writes in the same microsecond from
-/// different processes still tie. The pool sweep's `(namespace, hash)`
+/// Metal claim admits one GPU process per machine, but a `--device cpu` run
+/// takes no claim, so two processes can each write the same pool, and two
+/// writes in the same microsecond from different processes still tie. The pool sweep's `(namespace, hash)`
 /// tiebreak is what keeps that case deterministic.
 ///
 /// It stays a wall-clock value rather than a plain counter because the
