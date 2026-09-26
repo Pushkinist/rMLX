@@ -898,9 +898,83 @@ pub fn other(o: Other) -> usize {
 EOF
 check "an if let over a non-codec enum is not a subset site" "${T}" 0 "^subset-sites 0$" match-sites --threshold 2
 
-# 46 — the real tree, pinned exactly. One run, all four figures compared, and
+# 46 — a codec descriptor row built from a struct-update base is refused (exit
+# 1), and the reason names the line of the `..`. The row compiles and inherits
+# every fact it does not state; the site figure is the same with or without it.
+T="${WORK}/descbase"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+pub struct Facts { a: u8, b: u8 }
+const BASE: Facts = Facts { a: 0, b: 0 };
+impl KvQuant {
+    fn descriptor(&self) -> Facts {
+        match self {
+            KvQuant::One => Facts { a: 1, b: 1 },
+            KvQuant::Two => Facts { a: 2, b: 2 },
+            KvQuant::Three => Facts { a: 3, ..BASE },
+            KvQuant::Four => Facts { a: 4, b: 4 },
+        }
+    }
+}
+EOF
+check "a struct-update base in the descriptor is refused, with its line" "${T}" 1 \
+    "^refused: ${QUANT_REL}:23 a struct-update base \(\`\.\.<expr>\`\) in KvQuant::descriptor" match-sites
+
+# 47 — the same refusal when the base copies another codec's row on a line of
+# its own.
+T="${WORK}/descrow"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+pub struct Facts { a: u8, b: u8 }
+impl KvQuant {
+    fn descriptor(&self) -> Facts {
+        match self {
+            KvQuant::One => Facts { a: 1, b: 1 },
+            KvQuant::Two => Facts { a: 2, b: 2 },
+            KvQuant::Three => Facts {
+                a: 3,
+                ..KvQuant::One.descriptor()
+            },
+            KvQuant::Four => Facts { a: 4, b: 4 },
+        }
+    }
+}
+EOF
+check "a descriptor row copied from another codec's row is refused" "${T}" 1 \
+    "^refused: ${QUANT_REL}:24 a struct-update base" match-sites
+
+# 48 — negative control: rest patterns and a commented-out base inside the
+# descriptor, and struct-update bases in an `impl Other` descriptor and in a
+# free fn, are not refused. The descriptor is one more site.
+T="${WORK}/descok"; build_tree "${T}"
+cat >>"${T}/${QUANT_REL}" <<'EOF'
+pub struct Facts { a: u8, b: u8 }
+const BASE: Facts = Facts { a: 0, b: 0 };
+impl KvQuant {
+    fn descriptor(&self) -> Facts {
+        let (first, ..) = (1u8, 2u8, 3u8);
+        match self {
+            KvQuant::One => Facts { a: first, b: 1 },
+            KvQuant::Two => Facts { a: 2, b: 2 },
+            // Not `Facts { a: 3, ..BASE }`: each row states each fact.
+            KvQuant::Three => Facts { a: 3, b: 3 },
+            KvQuant::Four => Facts { a: 4, b: 4 },
+        }
+    }
+}
+impl Other {
+    fn descriptor(&self) -> Facts {
+        Facts { a: 0, ..BASE }
+    }
+}
+pub fn not_the_descriptor() -> Facts {
+    Facts { a: 9, ..BASE }
+}
+EOF
+check "rest patterns, comments and bases outside the descriptor are not refused" "${T}" 0 \
+    "^match-sites 4$" match-sites --threshold 2
+
+# 49 — the real tree, pinned exactly. One run, all four figures compared, and
 # each failure prints the figure beside its pin and what to do.
-REAL_PINS="match-sites=29 forcing-sites=29 subset-sites=157 table-sites=2"
+REAL_PINS="match-sites=22 forcing-sites=22 subset-sites=153 table-sites=2"
 pin_advice() { # pin_advice NAME
     local list="python3 scripts/kv_update_census.py match-sites | grep"
     case "$1" in

@@ -2165,7 +2165,7 @@ mod tests {
     /// does not fail, it just prices a codec at a rate the allocation never had.
     ///
     /// The sweep is [`rmlx_kv_quant::ALL_KV_QUANTS`], whose completeness against
-    /// the compiler-checked `variant_index` is pinned in `rmlx-kv-quant`, so a
+    /// the compiler-checked codec descriptor is pinned in `rmlx-kv-quant`, so a
     /// new codec reaches this manifest without anyone adding it to a list. Both
     /// topologies are emitted because `shares_kv` moves `Mixed` / `RotK` by two
     /// whole mirrors, on the per-codec estimate and on the boundary floor alike.

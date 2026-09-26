@@ -447,9 +447,10 @@ block-hash seed alongside the SSD `layout_key`. See `docs/PROMPT_CACHE.md`
 
 ## Metal-vs-CPU hot path + load-time MSL precompile
 
-Two orthogonal codec attributes drive startup behaviour. Both are exhaustive
-matches on `KvQuant` (`crates/rmlx-kv-quant/src/quant.rs`) — a new variant must
-be classified or the build fails.
+Two orthogonal codec attributes drive startup behaviour. Both read the codec's
+row in the one exhaustive descriptor match on `KvQuant`
+(`crates/rmlx-kv-quant/src/quant_descriptor.rs`) — a new variant must be
+classified or the build fails.
 
 * **`KvQuant::carries_msl()`** — `true` when the codec dispatches at least one
   custom Metal (MSL) kernel on its hot path (every codec except `none`, whose K

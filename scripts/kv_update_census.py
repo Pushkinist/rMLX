@@ -19,6 +19,10 @@ Four modes, each printing one figure the restructure is judged on:
   with a catch-all arm) and `table-sites` (a `match` keyed by string literals
   or constants whose arm bodies name at least half of one codec enum).
 
+  The mode exits 1 when `KvQuant::descriptor` builds a row from a
+  struct-update base (`..<expr>`): that row inherits facts nobody stated, and
+  the site figure cannot see it.
+
   Known false positives: a `use` inside one fn applies to the whole file, so
   a glob import there makes a same-named variant elsewhere in the file count;
   and an `impl Other` nested inside `impl KvStorage` reads its `Self` as
@@ -379,9 +383,46 @@ def is_table(arms: list[MatchArm]) -> bool:
     return keyed
 
 
+#: The codec descriptor: `fn descriptor` in an `impl KvQuant`. Each of its arms
+#: states every fact as a literal.
+DESCRIPTOR_FN = re.compile(r"\bfn\s+descriptor\s*\(")
+#: A struct-update base: `..` after `{` or `,` and before an expression. A rest
+#: pattern (`{ a, .. }`, `(a, ..)`) is followed by a closing bracket instead.
+STRUCT_UPDATE_BASE = re.compile(r"[{,]\s*\.\.(?!=)\s*[^\s})\]]")
+
+
+def refuse_descriptor_base(sources: dict[str, str], enums: dict[str, list[str]]) -> None:
+    """Exit 1 when the codec descriptor builds a row from a struct-update base.
+
+    A row written `CodecDescriptor { index: 3, ..KvQuant::K8V4.descriptor() }`
+    compiles, and inherits every fact it does not state from another codec.
+    The census then still counts one site, so the figure cannot see it.
+    """
+    for rel, blanked in sources.items():
+        scope = file_scope(blanked, enums)
+        for fn in DESCRIPTOR_FN.finditer(blanked):
+            if scope.self_at(fn.start()) != "KvQuant":
+                continue
+            brace = blanked.find("{", fn.end())
+            if brace < 0:
+                continue
+            body = blanked[brace : block_end(blanked, brace)]
+            base = STRUCT_UPDATE_BASE.search(body)
+            if base:
+                dots = brace + base.start() + base.group(0).index("..")
+                line = blanked.count("\n", 0, dots) + 1
+                print(
+                    f"refused: {rel}:{line} a struct-update base (`..<expr>`) in KvQuant::descriptor; "
+                    "each arm must state every fact as a literal",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+
+
 def mode_match_sites(root: Path, threshold: int | None, include_tests: bool) -> None:
     sources = source_files(root, include_tests)
     enums = codec_enums(root, sources)
+    refuse_descriptor_base(sources, enums)
 
     # A site naming fewer than half the enum's variants is a case analysis over
     # a subset; at half or more it enumerates the codec surface, which is the

@@ -715,12 +715,12 @@ fn every_parseable_mixed_quantizes_a_side() {
 
 /// [`ALL_KV_QUANTS`] indexes densely from zero and repeats no variant.
 ///
-/// Pairs with `variant_index_has_one_arm_per_listed_codec`, which supplies the
+/// Pairs with `descriptor_has_one_arm_per_listed_codec`, which supplies the
 /// count this test cannot: both sides of the comparison here are derived from
 /// the list, so this one sees a duplicate or a re-used index and nothing else.
 #[test]
 fn all_kv_quants_indexes_densely_with_no_repeats() {
-    let mut seen: Vec<usize> = ALL_KV_QUANTS.iter().map(KvQuant::variant_index).collect();
+    let mut seen: Vec<usize> = ALL_KV_QUANTS.iter().map(|q| q.descriptor().index).collect();
     seen.sort_unstable();
     let n = seen.len();
     seen.dedup();
@@ -740,7 +740,7 @@ fn all_kv_quants_indexes_densely_with_no_repeats() {
 /// [`ALL_KV_QUANTS`] names every variant — including one no value in the test
 /// binary can construct.
 ///
-/// The oracle is `variant_index`, whose `match` the compiler checks, but the
+/// The oracle is the codec descriptor, whose `match` the compiler checks, but the
 /// coupling has to be read out of the *source*: a variant wired into that match
 /// and forgotten in the list produces no value anywhere in this crate, so no
 /// test that sweeps the list can observe it. `ALL_KV_QUANTS.len()` and
@@ -749,26 +749,27 @@ fn all_kv_quants_indexes_densely_with_no_repeats() {
 ///
 /// The count is `=>` occurrences inside the fn body, so a rustfmt-wrapped arm
 /// still counts once. Anything the scan cannot read back — a renamed fn, a
-/// comment carrying `=>` — fails loudly rather than passing.
+/// comment carrying `=>` — fails loudly rather than passing. Each arm states
+/// its own dense `index`, so no arm can cover two variants.
 #[test]
-fn variant_index_has_one_arm_per_listed_codec() {
-    const SRC: &str = include_str!("quant.rs");
-    const OPEN: &str = "pub fn variant_index(&self) -> usize {";
+fn descriptor_has_one_arm_per_listed_codec() {
+    const SRC: &str = include_str!("quant_descriptor.rs");
+    const OPEN: &str = "pub(super) fn descriptor(self) -> CodecDescriptor {";
 
     let Some((_, after_open)) = SRC.split_once(OPEN) else {
-        panic!("quant.rs no longer declares `{OPEN}` — this test reads that fn's arms")
+        panic!("quant_descriptor.rs no longer declares `{OPEN}` — this test reads that fn's arms")
     };
     // The fn body ends at the first line that closes an item at impl-block
     // indentation; everything before it is the `match self { ... }` arms.
     let Some((body, _)) = after_open.split_once("\n    }\n") else {
-        panic!("could not find the end of `variant_index` in quant.rs")
+        panic!("could not find the end of `descriptor` in quant_descriptor.rs")
     };
     let arms = body.lines().filter(|line| line.contains("=>")).count();
 
     assert_eq!(
         arms,
         ALL_KV_QUANTS.len(),
-        "`variant_index` has {arms} arms but ALL_KV_QUANTS lists {} codecs. \
+        "`descriptor` has {arms} arms but ALL_KV_QUANTS lists {} codecs. \
          A variant added to the enum reaches the match by compiler error; it \
          reaches the list, every sweep below, and the disposition manifest only \
          if someone adds it there too.",
@@ -886,7 +887,7 @@ fn disposition_of(q: KvQuant) -> Disposition {
 ///
 /// This exists so "nobody picks it" can never be an answer: a variant added to
 /// the enum reaches [`ALL_KV_QUANTS`] (pinned by
-/// `variant_index_has_one_arm_per_listed_codec`) and then has to be classified here
+/// `descriptor_has_one_arm_per_listed_codec`) and then has to be classified here
 /// or the sweep below fails on it. Writing the
 /// class by hand rather than deriving it is the point — the derivation is what
 /// is being checked.
@@ -1233,8 +1234,8 @@ fn surface_stem(q: KvQuant) -> String {
 /// `docs/KV_QUANT.md` against.
 ///
 /// The sweep is [`ALL_KV_QUANTS`], whose completeness
-/// `variant_index_has_one_arm_per_listed_codec` pins against the
-/// compiler-checked `variant_index` — so a codec cannot reach the CLI without
+/// `descriptor_has_one_arm_per_listed_codec` pins against the
+/// compiler-checked codec descriptor — so a codec cannot reach the CLI without
 /// reaching this manifest, and the gate cannot go stale by omission.
 ///
 /// `INERT` is [`KvQuant::materialises_packed_store`] returning false, which is
@@ -1270,7 +1271,7 @@ fn emit_kv_codec_disposition_manifest() {
         };
         println!(
             "KVQUANT-DISPOSITION\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            q.variant_index(),
+            q.descriptor().index,
             q,
             stem,
             mode,
@@ -2044,7 +2045,7 @@ fn side_stores_agree_with_approx_code_bits() {
 
 /// [`codec_side_layouts`] names every variant, one arm each.
 ///
-/// Same oracle and same reason as `variant_index_has_one_arm_per_listed_codec`:
+/// Same oracle and same reason as `descriptor_has_one_arm_per_listed_codec`:
 /// the `match` is exhaustive so a new variant cannot be forgotten, but a variant
 /// folded into a neighbour's arm with a `|` would be swept by
 /// [`every_codec_byte_model_matches_the_store_it_writes`] under the neighbour's

@@ -438,7 +438,7 @@ tree was re-run against the same list and §4.1 holds the result.
 | M8 | `QuantKTurbo3::append` — coalesce a one-token block into its predecessor | 3 tests, again at the driver's append rather than at a column: the block bookkeeping the codec relies on breaks outright |
 | M8b | `QuantKTurbo3::append` — zero the first scale of the **last** decode block only | the pin's **store_after_decode** column only (`tsym3 @ kv_h=1 head_dim=128: packed store bytes after 3 decode steps moved`). The chunk column cannot see a decode block and the truncate column drops it |
 | M9 | `quant.rs` — `KvQuant::TurboSym4` removed from `ALL_KV_QUANTS` | 2 tests: the census (`turbo spelling census moved`) **and** the scope anchor (`the set of spellings backed by the K-side turbo store moved: ["tsym3"]`) |
-| M10 | `quant.rs` — `TurboSym3` moved into the store-reading arm of `decode_reads_packed_store` | `every_turbo_spelling_is_decode_inert`. This is the premise the whole oracle rests on, so it is asserted rather than assumed |
+| M10 | `quant_descriptor.rs` — `TurboSym3` given `reads_packed_store: true` | `every_turbo_spelling_is_decode_inert`. This is the premise the whole oracle rests on, so it is asserted rather than assumed |
 | M11 | `update_k8vturbo3_tcq` — `use_tcq: false` | `the_tcq_spellings_set_the_flag_and_still_write_the_plain_bytes` (`the Viterbi assignment flag on the V store is not what the spelling selects`) |
 | M12 | `read_quant_k_turbo3` — pass `0` instead of the geometry's `max_seq` | the SSD pin's 3-bit window cell. This is divergence 2 resolved the other way, and it is loud |
 | M13 | `read_quant_k_turbo4` — remove both `.eval()` calls | **uncaught** — 3 passed, exit 0 |
